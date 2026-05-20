@@ -23,7 +23,7 @@ type command struct {
 var rootCommands = []command{
 	{name: "init", summary: "initialize local Gitmoot state", run: runInit},
 	{name: "doctor", summary: "check local Gitmoot prerequisites", run: runDoctor},
-	{name: "daemon", summary: "run the local PR watcher", run: notImplemented("daemon")},
+	{name: "daemon", summary: "run the local PR watcher", run: runDaemon},
 	{name: "agent", summary: "manage registered agents", run: runAgent},
 	{name: "status", summary: "show local workflow status", run: notImplemented("status")},
 	{name: "goal", summary: "import or inspect goals", run: notImplemented("goal")},

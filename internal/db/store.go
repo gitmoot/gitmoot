@@ -264,6 +264,25 @@ func (s *Store) MarkCommentSeen(ctx context.Context, comment Comment) error {
 	return err
 }
 
+func (s *Store) HasCommentSeen(ctx context.Context, repoFullName string, commentID int64) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM seen_comments WHERE repo_full_name = ? AND comment_id = ?`, repoFullName, commentID).Scan(&count)
+	return count > 0, err
+}
+
+func (s *Store) MarkCommentSeenIfNew(ctx context.Context, comment Comment) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO seen_comments(repo_full_name, comment_id, pull_request, body)
+		VALUES (?, ?, ?, ?)`, comment.RepoFullName, comment.CommentID, comment.PullRequest, comment.Body)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
+}
+
 func (s *Store) CreateJob(ctx context.Context, job Job) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, updated_at)
 		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`, job.ID, job.Agent, job.Type, job.State, job.Payload)
