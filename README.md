@@ -19,18 +19,31 @@ The core primitive is a runtime-neutral Gitmoot agent, not a Codex-specific
 session. Codex and Claude Code are adapters behind the same internal runtime
 contract.
 
-## Planned Commands
+## Current Command Surface
 
 ```text
 gitmoot init
-gitmoot doctor
-gitmoot daemon start
-gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id>
+gitmoot doctor --repo .
+gitmoot daemon start --repo owner/repo --poll 30s
+gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
 gitmoot agent list
+gitmoot agent doctor <name>
+gitmoot agent remove <name>
+```
+
+The goal and task commands are planned but not implemented in this checkout:
+
+```text
 gitmoot status
 gitmoot goal import --file <path>
 gitmoot task run <id>
 ```
+
+## Documentation
+
+- [Local workflow walkthrough](docs/local-workflow.md)
+- [Runtime adapter authoring](docs/adapters.md)
+- [Troubleshooting](docs/troubleshooting.md)
 
 ## Development
 
