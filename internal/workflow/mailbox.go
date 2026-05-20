@@ -24,8 +24,12 @@ type JobRequest struct {
 	Repo         string
 	Branch       string
 	PullRequest  int
+	GoalID       string
 	TaskID       string
 	TaskTitle    string
+	LeadAgent    string
+	Reviewers    []string
+	ReviewRound  string
 	Sender       string
 	Instructions string
 	Constraints  []string
@@ -35,8 +39,12 @@ type JobPayload struct {
 	Repo         string       `json:"repo"`
 	Branch       string       `json:"branch"`
 	PullRequest  int          `json:"pull_request"`
+	GoalID       string       `json:"goal_id,omitempty"`
 	TaskID       string       `json:"task_id"`
 	TaskTitle    string       `json:"task_title"`
+	LeadAgent    string       `json:"lead_agent,omitempty"`
+	Reviewers    []string     `json:"reviewers,omitempty"`
+	ReviewRound  string       `json:"review_round,omitempty"`
 	Sender       string       `json:"sender"`
 	Instructions string       `json:"instructions"`
 	Constraints  []string     `json:"constraints"`
@@ -60,8 +68,12 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		Repo:         request.Repo,
 		Branch:       request.Branch,
 		PullRequest:  request.PullRequest,
+		GoalID:       request.GoalID,
 		TaskID:       request.TaskID,
 		TaskTitle:    request.TaskTitle,
+		LeadAgent:    request.LeadAgent,
+		Reviewers:    compactStrings(request.Reviewers),
+		ReviewRound:  request.ReviewRound,
 		Sender:       request.Sender,
 		Instructions: request.Instructions,
 		Constraints:  compactStrings(request.Constraints),

@@ -80,15 +80,22 @@ func TestRepositoryMethods(t *testing.T) {
 	if err := store.UpsertTask(ctx, Task{ID: "task-1", GoalID: "goal-2", Title: "Bootstrap", State: "planned"}); err != nil {
 		t.Fatalf("second UpsertTask returned error: %v", err)
 	}
-	var goalID string
-	if err := store.db.QueryRowContext(ctx, `SELECT goal_id FROM tasks WHERE id = ?`, "task-1").Scan(&goalID); err != nil {
-		t.Fatalf("query task goal_id: %v", err)
+	task, err := store.GetTask(ctx, "task-1")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
 	}
-	if goalID != "goal-2" {
-		t.Fatalf("goal_id = %q, want goal-2", goalID)
+	if task.GoalID != "goal-2" {
+		t.Fatalf("task goal_id = %q, want goal-2", task.GoalID)
 	}
-	if err := store.UpsertPullRequest(ctx, PullRequest{RepoFullName: "jerryfane/gitmoot", Number: 1, URL: "https://github.com/jerryfane/gitmoot/pull/1", HeadBranch: "task", BaseBranch: "main", State: "open"}); err != nil {
+	if err := store.UpsertPullRequest(ctx, PullRequest{RepoFullName: "jerryfane/gitmoot", Number: 1, URL: "https://github.com/jerryfane/gitmoot/pull/1", HeadBranch: "task", BaseBranch: "main", HeadSHA: "abc123", State: "open"}); err != nil {
 		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	pr, err := store.GetPullRequest(ctx, "jerryfane/gitmoot", 1)
+	if err != nil {
+		t.Fatalf("GetPullRequest returned error: %v", err)
+	}
+	if pr.HeadSHA != "abc123" {
+		t.Fatalf("pull request head sha = %q, want abc123", pr.HeadSHA)
 	}
 	if err := store.MarkCommentSeen(ctx, Comment{RepoFullName: "jerryfane/gitmoot", CommentID: 100, PullRequest: 1, Body: "/gitmoot audit review"}); err != nil {
 		t.Fatalf("MarkCommentSeen returned error: %v", err)
@@ -123,6 +130,13 @@ func TestRepositoryMethods(t *testing.T) {
 	}
 	if job.State != "queued" {
 		t.Fatalf("job state = %q, want queued", job.State)
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].ID != "job-1" {
+		t.Fatalf("jobs = %+v", jobs)
 	}
 	if err := store.UpdateJobState(ctx, "job-1", "running"); err != nil {
 		t.Fatalf("UpdateJobState returned error: %v", err)
@@ -208,6 +222,13 @@ func TestRepositoryMethods(t *testing.T) {
 	}
 	if !acquired {
 		t.Fatal("same-owner AcquireLock did not return acquired")
+	}
+	lock, err := store.GetBranchLock(ctx, "jerryfane/gitmoot", "task")
+	if err != nil {
+		t.Fatalf("GetBranchLock returned error: %v", err)
+	}
+	if lock.Owner != "lead" {
+		t.Fatalf("lock owner = %q, want lead", lock.Owner)
 	}
 	acquired, err = store.AcquireLock(ctx, BranchLock{RepoFullName: "jerryfane/gitmoot", Branch: "task", Owner: "other"})
 	if err != nil {

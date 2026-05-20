@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -22,6 +23,7 @@ type Daemon struct {
 	PollInterval time.Duration
 	Store        *db.Store
 	GitHub       github.Client
+	Workflow     *workflow.Engine
 	Sleep        func(context.Context, time.Duration) error
 }
 
@@ -53,13 +55,28 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 		return err
 	}
 
+	var firstErr error
 	pulls, err := d.GitHub.ListPullRequests(ctx, d.Repo, "open")
 	if err != nil {
 		return err
 	}
 	for _, pull := range pulls {
-		if err := d.recordPullRequest(ctx, pull); err != nil {
+		changed, err := d.pullRequestChanged(ctx, pull)
+		if err != nil {
 			return err
+		}
+		if changed {
+			if err := d.handlePullRequestWorkflow(ctx, pull); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				changed = false
+			}
+		}
+		if changed {
+			if err := d.recordPullRequest(ctx, pull); err != nil {
+				return err
+			}
 		}
 		comments, err := d.GitHub.ListIssueComments(ctx, d.Repo, pull.Number)
 		if err != nil {
@@ -71,7 +88,7 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 			}
 		}
 	}
-	return nil
+	return firstErr
 }
 
 func (d Daemon) validate() error {
@@ -87,6 +104,53 @@ func (d Daemon) validate() error {
 	return nil
 }
 
+func (d Daemon) pullRequestChanged(ctx context.Context, pull github.PullRequest) (bool, error) {
+	previous, err := d.Store.GetPullRequest(ctx, d.Repo.FullName(), pull.Number)
+	switch {
+	case err == nil:
+		if strings.TrimSpace(previous.HeadSHA) == "" {
+			routed, err := d.pullRequestWorkflowRouted(ctx, pull)
+			if err != nil {
+				return false, err
+			}
+			if routed {
+				return false, d.recordPullRequest(ctx, pull)
+			}
+			return true, nil
+		}
+		return previous.HeadSHA != pull.HeadSHA, nil
+	case errors.Is(err, sql.ErrNoRows):
+		return true, nil
+	default:
+		return false, err
+	}
+}
+
+func (d Daemon) pullRequestWorkflowRouted(ctx context.Context, pull github.PullRequest) (bool, error) {
+	jobs, err := d.Store.ListJobs(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, job := range jobs {
+		if job.Type != "review" {
+			continue
+		}
+		var payload workflow.JobPayload
+		if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+			return false, fmt.Errorf("parse job payload %q: %w", job.ID, err)
+		}
+		if payload.Repo == d.Repo.FullName() &&
+			payload.PullRequest == int(pull.Number) &&
+			payload.Branch == pull.HeadRef &&
+			strings.TrimSpace(payload.LeadAgent) != "" &&
+			strings.TrimSpace(payload.ReviewRound) != "" &&
+			len(payload.Reviewers) > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (d Daemon) recordPullRequest(ctx context.Context, pull github.PullRequest) error {
 	return d.Store.UpsertPullRequest(ctx, db.PullRequest{
 		RepoFullName: d.Repo.FullName(),
@@ -94,8 +158,81 @@ func (d Daemon) recordPullRequest(ctx context.Context, pull github.PullRequest) 
 		URL:          pull.URL,
 		HeadBranch:   pull.HeadRef,
 		BaseBranch:   pull.BaseRef,
+		HeadSHA:      pull.HeadSHA,
 		State:        pull.State,
 	})
+}
+
+func (d Daemon) handlePullRequestWorkflow(ctx context.Context, pull github.PullRequest) error {
+	if d.Workflow == nil {
+		return nil
+	}
+	lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	ref := workflowTaskRef{
+		id:     pull.HeadRef,
+		title:  pull.Title,
+		branch: pull.HeadRef,
+	}
+	if task, err := d.lookupPullRequestTask(ctx, pull.HeadRef); err == nil {
+		ref.id = task.ID
+		ref.goalID = task.GoalID
+		ref.title = task.Title
+		if task.Branch != "" {
+			ref.branch = task.Branch
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	reviewers, err := d.workflowReviewers(ctx)
+	if err != nil {
+		return err
+	}
+	return d.Workflow.HandlePullRequestOpened(ctx, workflow.PullRequestEvent{
+		Repo:              d.Repo.FullName(),
+		Branch:            ref.branch,
+		PullRequest:       int(pull.Number),
+		HeadSHA:           pull.HeadSHA,
+		GoalID:            ref.goalID,
+		TaskID:            ref.id,
+		TaskTitle:         ref.title,
+		LeadAgent:         lock.Owner,
+		Sender:            "github",
+		RequiredReviewers: reviewers,
+	})
+}
+
+func (d Daemon) lookupPullRequestTask(ctx context.Context, branch string) (db.Task, error) {
+	task, err := d.Store.GetTaskByBranch(ctx, branch)
+	if err == nil {
+		return task, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return db.Task{}, err
+	}
+	return d.Store.GetTask(ctx, branch)
+}
+
+func (d Daemon) workflowReviewers(ctx context.Context) ([]string, error) {
+	if d.Workflow != nil && len(d.Workflow.RequiredReviewers) > 0 {
+		return append([]string{}, d.Workflow.RequiredReviewers...), nil
+	}
+	agents, err := d.Store.ListAgents(ctx)
+	if err != nil {
+		return nil, err
+	}
+	reviewers := []string{}
+	for _, agent := range agents {
+		if agent.RepoScope == d.Repo.FullName() && hasCapability(agent.Capabilities, "review") {
+			reviewers = append(reviewers, agent.Name)
+		}
+	}
+	return reviewers, nil
 }
 
 func (d Daemon) handleComment(ctx context.Context, pull github.PullRequest, comment github.IssueComment) error {
@@ -244,6 +381,13 @@ func (d Daemon) sleep(ctx context.Context, duration time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+type workflowTaskRef struct {
+	id     string
+	goalID string
+	title  string
+	branch string
 }
 
 func hasCapability(capabilities []string, target string) bool {

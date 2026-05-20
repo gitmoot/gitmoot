@@ -54,6 +54,7 @@ type PullRequest struct {
 	URL          string
 	HeadBranch   string
 	BaseBranch   string
+	HeadSHA      string
 	State        string
 }
 
@@ -245,17 +246,47 @@ func (s *Store) UpsertTask(ctx context.Context, task Task) error {
 	return err
 }
 
+func (s *Store) GetTask(ctx context.Context, id string) (Task, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, goal_id, title, state, branch FROM tasks WHERE id = ?`, id)
+	var task Task
+	if err := row.Scan(&task.ID, &task.GoalID, &task.Title, &task.State, &task.Branch); err != nil {
+		return Task{}, err
+	}
+	return task, nil
+}
+
+func (s *Store) GetTaskByBranch(ctx context.Context, branch string) (Task, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, goal_id, title, state, branch
+		FROM tasks WHERE branch = ? ORDER BY updated_at DESC, id LIMIT 1`, branch)
+	var task Task
+	if err := row.Scan(&task.ID, &task.GoalID, &task.Title, &task.State, &task.Branch); err != nil {
+		return Task{}, err
+	}
+	return task, nil
+}
+
 func (s *Store) UpsertPullRequest(ctx context.Context, pr PullRequest) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO pull_requests(repo_full_name, number, url, head_branch, base_branch, state, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO pull_requests(repo_full_name, number, url, head_branch, base_branch, head_sha, state, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(repo_full_name, number) DO UPDATE SET
 			url = excluded.url,
 			head_branch = excluded.head_branch,
 			base_branch = excluded.base_branch,
+			head_sha = excluded.head_sha,
 			state = excluded.state,
 			updated_at = CURRENT_TIMESTAMP`,
-		pr.RepoFullName, pr.Number, pr.URL, pr.HeadBranch, pr.BaseBranch, pr.State)
+		pr.RepoFullName, pr.Number, pr.URL, pr.HeadBranch, pr.BaseBranch, pr.HeadSHA, pr.State)
 	return err
+}
+
+func (s *Store) GetPullRequest(ctx context.Context, repoFullName string, number int64) (PullRequest, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT repo_full_name, number, url, head_branch, base_branch, head_sha, state
+		FROM pull_requests WHERE repo_full_name = ? AND number = ?`, repoFullName, number)
+	var pr PullRequest
+	if err := row.Scan(&pr.RepoFullName, &pr.Number, &pr.URL, &pr.HeadBranch, &pr.BaseBranch, &pr.HeadSHA, &pr.State); err != nil {
+		return PullRequest{}, err
+	}
+	return pr, nil
 }
 
 func (s *Store) MarkCommentSeen(ctx context.Context, comment Comment) error {
@@ -316,6 +347,24 @@ func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
 		return Job{}, err
 	}
 	return job, nil
+}
+
+func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload FROM jobs ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []Job
+	for rows.Next() {
+		var job Job
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
 }
 
 func (s *Store) UpdateJobState(ctx context.Context, id string, state string) error {
@@ -440,6 +489,15 @@ func (s *Store) AcquireLock(ctx context.Context, lock BranchLock) (bool, error) 
 		return false, err
 	}
 	return owner == lock.Owner, nil
+}
+
+func (s *Store) GetBranchLock(ctx context.Context, repoFullName string, branch string) (BranchLock, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT repo_full_name, branch, owner FROM branch_locks WHERE repo_full_name = ? AND branch = ?`, repoFullName, branch)
+	var lock BranchLock
+	if err := row.Scan(&lock.RepoFullName, &lock.Branch, &lock.Owner); err != nil {
+		return BranchLock{}, err
+	}
+	return lock, nil
 }
 
 func (s *Store) UpsertMergeGate(ctx context.Context, gate MergeGate) error {
@@ -596,5 +654,8 @@ CREATE TABLE merge_gates (
 	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	UNIQUE(repo_full_name, pull_request)
 );
+`,
+	`
+ALTER TABLE pull_requests ADD COLUMN head_sha TEXT NOT NULL DEFAULT '';
 `,
 }

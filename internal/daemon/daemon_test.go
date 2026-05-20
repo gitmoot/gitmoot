@@ -81,6 +81,428 @@ func TestPollOnceCreatesJobAndAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestPollOnceRoutesPullRequestUpdatesToWorkflow(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "lead",
+		Role:           "lead",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"implement"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent lead returned error: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "audit",
+		Role:           "reviewer",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"review"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent audit returned error: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-007", GoalID: "goal-1", Title: "Task 7", State: string(workflow.TaskPlanned), Branch: "task-7"}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{
+			Number:  7,
+			Title:   "Task 7",
+			State:   "open",
+			URL:     "https://github.com/jerryfane/gitmoot/pull/7",
+			HeadRef: "task-7",
+			BaseRef: "main",
+			HeadSHA: "abc123",
+		}},
+		comments: map[int64][]github.IssueComment{7: {}},
+	}
+	engine := workflow.Engine{
+		Store: store,
+		JobID: func(request workflow.JobRequest) string {
+			parts := []string{request.Action, request.Agent, request.TaskID}
+			if request.ReviewRound != "" {
+				parts = append(parts, request.ReviewRound)
+			}
+			return strings.Join(parts, "-")
+		},
+	}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("first PollOnce returned error: %v", err)
+	}
+	if _, err := store.GetJob(ctx, "review-audit-task-007-review-1"); err != nil {
+		t.Fatalf("GetJob first review round returned error: %v", err)
+	}
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("second PollOnce returned error: %v", err)
+	}
+	if _, err := store.GetJob(ctx, "review-audit-task-007-review-2"); err == nil {
+		t.Fatal("unchanged pull request head created a second review round")
+	}
+
+	client.pulls[0].HeadSHA = "def456"
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("third PollOnce returned error: %v", err)
+	}
+	if _, err := store.GetJob(ctx, "review-audit-task-007-review-2"); err != nil {
+		t.Fatalf("GetJob second review round returned error: %v", err)
+	}
+}
+
+func TestPollOnceRetriesPullRequestWorkflowAfterRoutingFailure(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "lead",
+		Role:           "lead",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"implement"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent lead returned error: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{
+			Number:  7,
+			Title:   "Task 7",
+			State:   "open",
+			URL:     "https://github.com/jerryfane/gitmoot/pull/7",
+			HeadRef: "task-7",
+			BaseRef: "main",
+			HeadSHA: "abc123",
+		}},
+		comments: map[int64][]github.IssueComment{
+			7: {{ID: 707, Body: "/gitmoot lead implement handle manual fallback", Author: "alice"}},
+		},
+	}
+	engine := workflow.Engine{
+		Store:             store,
+		RequiredReviewers: []string{"audit"},
+		JobID: func(request workflow.JobRequest) string {
+			parts := []string{request.Action, request.Agent, request.TaskID}
+			if request.ReviewRound != "" {
+				parts = append(parts, request.ReviewRound)
+			}
+			return strings.Join(parts, "-")
+		},
+	}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	if err := daemon.PollOnce(ctx); err == nil {
+		t.Fatal("PollOnce succeeded despite missing required reviewer")
+	}
+	if _, err := store.GetPullRequest(ctx, repo.FullName(), 7); err == nil {
+		t.Fatal("pull request head was recorded before workflow routing succeeded")
+	}
+	if _, err := store.GetJob(ctx, jobID(repo, 7, 707, 0, "lead", "implement")); err != nil {
+		t.Fatalf("manual comment job was not routed after workflow failure: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "audit",
+		Role:           "reviewer",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"review"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent audit returned error: %v", err)
+	}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("retry PollOnce returned error: %v", err)
+	}
+	if _, err := store.GetJob(ctx, "review-audit-task-7-review-1"); err != nil {
+		t.Fatalf("GetJob retry review round returned error: %v", err)
+	}
+	if pr, err := store.GetPullRequest(ctx, repo.FullName(), 7); err != nil || pr.HeadSHA != "abc123" {
+		t.Fatalf("stored pull request after retry = %+v err=%v", pr, err)
+	}
+}
+
+func TestPollOnceRecordsAlreadyRoutedPullRequestWithoutDuplicateReviewRound(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "lead",
+		Role:           "lead",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"implement"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent lead returned error: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "audit",
+		Role:           "reviewer",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"review"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent audit returned error: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo:        repo.FullName(),
+		Branch:      "task-7",
+		PullRequest: 7,
+		TaskID:      "task-7",
+		LeadAgent:   "lead",
+		Reviewers:   []string{"audit"},
+		ReviewRound: "review-1",
+	})
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID:      "review-audit-task-7-review-1",
+		Agent:   "audit",
+		Type:    "review",
+		State:   string(workflow.JobQueued),
+		Payload: string(payload),
+	}, db.JobEvent{Kind: string(workflow.JobQueued), Message: "already routed by engine"}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(),
+		Number:       7,
+		HeadBranch:   "task-7",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{
+			Number:  7,
+			Title:   "Task 7",
+			State:   "open",
+			URL:     "https://github.com/jerryfane/gitmoot/pull/7",
+			HeadRef: "task-7",
+			BaseRef: "main",
+			HeadSHA: "abc123",
+		}},
+		comments: map[int64][]github.IssueComment{7: {}},
+	}
+	engine := workflow.Engine{
+		Store: store,
+		JobID: func(request workflow.JobRequest) string {
+			parts := []string{request.Action, request.Agent, request.TaskID}
+			if request.ReviewRound != "" {
+				parts = append(parts, request.ReviewRound)
+			}
+			return strings.Join(parts, "-")
+		},
+	}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if _, err := store.GetJob(ctx, "review-audit-task-7-review-2"); err == nil {
+		t.Fatal("already routed pull request created a duplicate review round")
+	}
+	if pr, err := store.GetPullRequest(ctx, repo.FullName(), 7); err != nil || pr.HeadSHA != "abc123" {
+		t.Fatalf("stored pull request = %+v err=%v", pr, err)
+	}
+}
+
+func TestPollOnceRoutesPullRequestWithEmptyStoredHeadSHA(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "lead",
+		Role:           "lead",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"implement"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent lead returned error: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "audit",
+		Role:           "reviewer",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"review"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent audit returned error: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(),
+		Number:       7,
+		HeadBranch:   "task-7",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{
+			Number:  7,
+			Title:   "Task 7",
+			State:   "open",
+			URL:     "https://github.com/jerryfane/gitmoot/pull/7",
+			HeadRef: "task-7",
+			BaseRef: "main",
+			HeadSHA: "abc123",
+		}},
+		comments: map[int64][]github.IssueComment{7: {}},
+	}
+	engine := workflow.Engine{
+		Store: store,
+		JobID: func(request workflow.JobRequest) string {
+			parts := []string{request.Action, request.Agent, request.TaskID}
+			if request.ReviewRound != "" {
+				parts = append(parts, request.ReviewRound)
+			}
+			return strings.Join(parts, "-")
+		},
+	}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if _, err := store.GetJob(ctx, "review-audit-task-7-review-1"); err != nil {
+		t.Fatalf("GetJob review round returned error: %v", err)
+	}
+	if pr, err := store.GetPullRequest(ctx, repo.FullName(), 7); err != nil || pr.HeadSHA != "abc123" {
+		t.Fatalf("stored pull request = %+v err=%v", pr, err)
+	}
+}
+
+func TestPollOnceDoesNotTreatManualReviewJobAsWorkflowRoute(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "lead",
+		Role:           "lead",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"implement"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent lead returned error: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "audit",
+		Role:           "reviewer",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"review"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent audit returned error: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	manualPayload, err := json.Marshal(workflow.JobPayload{
+		Repo:        repo.FullName(),
+		Branch:      "task-7",
+		PullRequest: 7,
+		TaskID:      "task-7",
+		TaskTitle:   "Task 7",
+		Sender:      "alice",
+	})
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID:      "manual-review-job",
+		Agent:   "audit",
+		Type:    "review",
+		State:   string(workflow.JobQueued),
+		Payload: string(manualPayload),
+	}, db.JobEvent{Kind: string(workflow.JobQueued), Message: "manual review"}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(),
+		Number:       7,
+		HeadBranch:   "task-7",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{
+			Number:  7,
+			Title:   "Task 7",
+			State:   "open",
+			URL:     "https://github.com/jerryfane/gitmoot/pull/7",
+			HeadRef: "task-7",
+			BaseRef: "main",
+			HeadSHA: "abc123",
+		}},
+		comments: map[int64][]github.IssueComment{7: {}},
+	}
+	engine := workflow.Engine{
+		Store: store,
+		JobID: func(request workflow.JobRequest) string {
+			parts := []string{request.Action, request.Agent, request.TaskID}
+			if request.ReviewRound != "" {
+				parts = append(parts, request.ReviewRound)
+			}
+			return strings.Join(parts, "-")
+		},
+	}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if _, err := store.GetJob(ctx, "review-audit-task-7-review-2"); err != nil {
+		t.Fatalf("GetJob workflow review round returned error: %v", err)
+	}
+	if pr, err := store.GetPullRequest(ctx, repo.FullName(), 7); err != nil || pr.HeadSHA != "abc123" {
+		t.Fatalf("stored pull request = %+v err=%v", pr, err)
+	}
+}
+
 func TestPollOnceDedupesSeenComments(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)

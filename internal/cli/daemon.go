@@ -14,6 +14,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/github"
+	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
 func runDaemon(args []string, stdout, stderr io.Writer) int {
@@ -64,12 +65,14 @@ func runDaemonStart(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 
 	err = withStore(*home, func(store *db.Store) error {
+		engine := workflow.Engine{Store: store}
 		fmt.Fprintf(stdout, "watching %s every %s\n", repo.FullName(), poll.String())
 		return (daemon.Daemon{
 			Repo:         repo,
 			PollInterval: *poll,
 			Store:        store,
 			GitHub:       github.NewClient("."),
+			Workflow:     &engine,
 		}).Run(ctx)
 	})
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
