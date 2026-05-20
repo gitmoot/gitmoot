@@ -1,13 +1,501 @@
 package github
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jerryfane/gitmoot/internal/subprocess"
+)
 
 type Client interface {
 	Ping(ctx context.Context) error
+	ListPullRequests(ctx context.Context, repo Repository, state string) ([]PullRequest, error)
+	CreatePullRequest(ctx context.Context, input CreatePullRequestInput) (PullRequest, error)
+	ListIssueComments(ctx context.Context, repo Repository, issueNumber int64) ([]IssueComment, error)
+	PostIssueComment(ctx context.Context, repo Repository, issueNumber int64, body string) (IssueComment, error)
+	MergePullRequest(ctx context.Context, input MergePullRequestInput) (MergeResult, error)
+	GetCombinedStatus(ctx context.Context, repo Repository, ref string) (CombinedStatus, error)
+	ListPullRequestChecks(ctx context.Context, repo Repository, number int64) ([]PullRequestCheck, error)
+	CreateCommitStatus(ctx context.Context, input CommitStatusInput) (CommitStatus, error)
+	ListPullRequestFiles(ctx context.Context, repo Repository, number int64) ([]PullRequestFile, error)
+	ListPullRequestCommits(ctx context.Context, repo Repository, number int64) ([]PullRequestCommit, error)
+}
+
+type Repository struct {
+	Owner string
+	Name  string
+}
+
+func (r Repository) FullName() string {
+	if r.Owner == "" || r.Name == "" {
+		return ""
+	}
+	return r.Owner + "/" + r.Name
+}
+
+type PullRequest struct {
+	Number    int64  `json:"number"`
+	Title     string `json:"title"`
+	State     string `json:"state"`
+	URL       string `json:"html_url"`
+	HeadRef   string
+	BaseRef   string
+	HeadSHA   string
+	Mergeable *bool `json:"mergeable"`
+}
+
+func (p *PullRequest) UnmarshalJSON(data []byte) error {
+	type wire struct {
+		Number    int64  `json:"number"`
+		Title     string `json:"title"`
+		State     string `json:"state"`
+		URL       string `json:"html_url"`
+		Mergeable *bool  `json:"mergeable"`
+		Head      struct {
+			Ref string `json:"ref"`
+			SHA string `json:"sha"`
+		} `json:"head"`
+		Base struct {
+			Ref string `json:"ref"`
+		} `json:"base"`
+	}
+	var decoded wire
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	p.Number = decoded.Number
+	p.Title = decoded.Title
+	p.State = decoded.State
+	p.URL = decoded.URL
+	p.Mergeable = decoded.Mergeable
+	p.HeadRef = decoded.Head.Ref
+	p.HeadSHA = decoded.Head.SHA
+	p.BaseRef = decoded.Base.Ref
+	return nil
+}
+
+type IssueComment struct {
+	ID        int64  `json:"id"`
+	Body      string `json:"body"`
+	URL       string `json:"html_url"`
+	Author    string
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+func (c *IssueComment) UnmarshalJSON(data []byte) error {
+	type wire struct {
+		ID        int64  `json:"id"`
+		Body      string `json:"body"`
+		URL       string `json:"html_url"`
+		CreatedAt string `json:"created_at"`
+		UpdatedAt string `json:"updated_at"`
+		User      struct {
+			Login string `json:"login"`
+		} `json:"user"`
+	}
+	var decoded wire
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	c.ID = decoded.ID
+	c.Body = decoded.Body
+	c.URL = decoded.URL
+	c.Author = decoded.User.Login
+	c.CreatedAt = decoded.CreatedAt
+	c.UpdatedAt = decoded.UpdatedAt
+	return nil
+}
+
+type CreatePullRequestInput struct {
+	Repo  Repository
+	Title string
+	Body  string
+	Head  string
+	Base  string
+	Draft bool
+}
+
+type MergePullRequestInput struct {
+	Repo            Repository
+	Number          int64
+	Method          string
+	Subject         string
+	Body            string
+	MatchHeadCommit string
+	DeleteBranch    bool
+}
+
+type MergeResult struct {
+	SHA     string `json:"sha"`
+	Merged  bool   `json:"merged"`
+	Message string `json:"message"`
+}
+
+type CombinedStatus struct {
+	State    string         `json:"state"`
+	Statuses []CommitStatus `json:"statuses"`
+}
+
+type CommitStatusInput struct {
+	Repo        Repository
+	SHA         string
+	State       string
+	Context     string
+	Description string
+	TargetURL   string
+}
+
+type CommitStatus struct {
+	ID          int64  `json:"id"`
+	State       string `json:"state"`
+	Context     string `json:"context"`
+	Description string `json:"description"`
+	TargetURL   string `json:"target_url"`
+	URL         string `json:"url"`
+}
+
+type PullRequestCheck struct {
+	Name        string `json:"name"`
+	State       string `json:"state"`
+	Bucket      string `json:"bucket"`
+	Link        string `json:"link"`
+	Workflow    string `json:"workflow"`
+	CompletedAt string `json:"completedAt"`
+}
+
+type PullRequestFile struct {
+	Filename string `json:"filename"`
+	Status   string `json:"status"`
+	SHA      string `json:"sha"`
+	Patch    string `json:"patch"`
+}
+
+type PullRequestCommit struct {
+	SHA string `json:"sha"`
+}
+
+type GhClient struct {
+	Runner     subprocess.Runner
+	Dir        string
+	Sleep      func(context.Context, time.Duration) error
+	MaxRetries int
+
+	mutateMu sync.Mutex
+}
+
+func NewClient(dir string) *GhClient {
+	return &GhClient{Dir: dir}
+}
+
+func (c *GhClient) Ping(ctx context.Context) error {
+	_, err := c.run(ctx, false, "repo", "view", "--json", "nameWithOwner")
+	return err
+}
+
+func (c *GhClient) ListPullRequests(ctx context.Context, repo Repository, state string) ([]PullRequest, error) {
+	if state == "" {
+		state = "open"
+	}
+	return apiPaginatedJSON[PullRequest](ctx, c, "-X", "GET", endpoint(repo, "pulls"), "-f", "state="+state)
+}
+
+func (c *GhClient) CreatePullRequest(ctx context.Context, input CreatePullRequestInput) (PullRequest, error) {
+	args := []string{"pr", "create", "--repo", input.Repo.FullName(), "--title", input.Title, "--body", input.Body, "--head", input.Head, "--base", input.Base}
+	if input.Draft {
+		args = append(args, "--draft")
+	}
+	result, err := c.run(ctx, true, args...)
+	if err != nil {
+		return PullRequest{}, err
+	}
+	ref, err := ParsePullRequestURL(firstLine(result.Stdout))
+	if err != nil {
+		return PullRequest{}, err
+	}
+	pr, err := c.getPullRequest(ctx, input.Repo, int64(ref.Number))
+	if err != nil {
+		return PullRequest{}, err
+	}
+	return pr, nil
+}
+
+func (c *GhClient) ListIssueComments(ctx context.Context, repo Repository, issueNumber int64) ([]IssueComment, error) {
+	comments, err := apiPaginatedJSON[IssueComment](ctx, c, endpoint(repo, "issues", issueNumber, "comments"))
+	return dedupeComments(comments), err
+}
+
+func (c *GhClient) PostIssueComment(ctx context.Context, repo Repository, issueNumber int64, body string) (IssueComment, error) {
+	var comment IssueComment
+	err := c.apiJSON(ctx, true, &comment, endpoint(repo, "issues", issueNumber, "comments"), "-f", "body="+body)
+	return comment, err
+}
+
+func (c *GhClient) MergePullRequest(ctx context.Context, input MergePullRequestInput) (MergeResult, error) {
+	method := input.Method
+	if method == "" {
+		method = "squash"
+	}
+	args := []string{"pr", "merge", strconv.FormatInt(input.Number, 10), "--repo", input.Repo.FullName()}
+	switch method {
+	case "merge":
+		args = append(args, "--merge")
+	case "rebase":
+		args = append(args, "--rebase")
+	case "squash":
+		args = append(args, "--squash")
+	default:
+		return MergeResult{}, fmt.Errorf("unsupported merge method: %s", method)
+	}
+	if input.Subject != "" {
+		args = append(args, "--subject", input.Subject)
+	}
+	if input.Body != "" {
+		args = append(args, "--body", input.Body)
+	}
+	if input.MatchHeadCommit != "" {
+		args = append(args, "--match-head-commit", input.MatchHeadCommit)
+	}
+	if input.DeleteBranch {
+		args = append(args, "--delete-branch")
+	}
+	if _, err := c.run(ctx, true, args...); err != nil {
+		return MergeResult{}, err
+	}
+	return MergeResult{Merged: true}, nil
+}
+
+func (c *GhClient) GetCombinedStatus(ctx context.Context, repo Repository, ref string) (CombinedStatus, error) {
+	var status CombinedStatus
+	err := c.apiJSON(ctx, false, &status, endpoint(repo, "commits", ref, "status"))
+	return status, err
+}
+
+func (c *GhClient) ListPullRequestChecks(ctx context.Context, repo Repository, number int64) ([]PullRequestCheck, error) {
+	result, err := c.run(ctx, false,
+		"pr", "checks", strconv.FormatInt(number, 10),
+		"--repo", repo.FullName(),
+		"--json", "name,state,bucket,link,workflow,completedAt",
+	)
+	if err != nil && strings.TrimSpace(result.Stdout) == "" {
+		if isNoChecks(result) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var checks []PullRequestCheck
+	if decodeErr := json.Unmarshal([]byte(result.Stdout), &checks); decodeErr != nil {
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("decode gh pr checks response: %w", decodeErr)
+	}
+	return checks, nil
+}
+
+func (c *GhClient) CreateCommitStatus(ctx context.Context, input CommitStatusInput) (CommitStatus, error) {
+	var status CommitStatus
+	args := []string{
+		endpoint(input.Repo, "statuses", input.SHA),
+		"-f", "state=" + input.State,
+		"-f", "context=" + input.Context,
+	}
+	if input.Description != "" {
+		args = append(args, "-f", "description="+input.Description)
+	}
+	if input.TargetURL != "" {
+		args = append(args, "-f", "target_url="+input.TargetURL)
+	}
+	err := c.apiJSON(ctx, true, &status, args...)
+	return status, err
+}
+
+func (c *GhClient) ListPullRequestFiles(ctx context.Context, repo Repository, number int64) ([]PullRequestFile, error) {
+	return apiPaginatedJSON[PullRequestFile](ctx, c, endpoint(repo, "pulls", number, "files"))
+}
+
+func (c *GhClient) ListPullRequestCommits(ctx context.Context, repo Repository, number int64) ([]PullRequestCommit, error) {
+	return apiPaginatedJSON[PullRequestCommit](ctx, c, endpoint(repo, "pulls", number, "commits"))
+}
+
+func (c *GhClient) getPullRequest(ctx context.Context, repo Repository, number int64) (PullRequest, error) {
+	var pr PullRequest
+	err := c.apiJSON(ctx, false, &pr, endpoint(repo, "pulls", number))
+	return pr, err
+}
+
+func (c *GhClient) apiJSON(ctx context.Context, mutate bool, output any, args ...string) error {
+	result, err := c.run(ctx, mutate, append([]string{"api"}, args...)...)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal([]byte(result.Stdout), output); err != nil {
+		return fmt.Errorf("decode gh api response: %w", err)
+	}
+	return nil
+}
+
+func apiPaginatedJSON[T any](ctx context.Context, c *GhClient, args ...string) ([]T, error) {
+	result, err := c.run(ctx, false, append([]string{"api", "--paginate", "--slurp"}, args...)...)
+	if err != nil {
+		return nil, err
+	}
+	var pages [][]T
+	if err := json.Unmarshal([]byte(result.Stdout), &pages); err != nil {
+		return nil, fmt.Errorf("decode paginated gh api response: %w", err)
+	}
+	var values []T
+	for _, page := range pages {
+		values = append(values, page...)
+	}
+	return values, nil
+}
+
+func (c *GhClient) run(ctx context.Context, mutate bool, args ...string) (subprocess.Result, error) {
+	if mutate {
+		c.mutateMu.Lock()
+		defer c.mutateMu.Unlock()
+	}
+
+	runner := c.Runner
+	if runner == nil {
+		runner = subprocess.ExecRunner{}
+	}
+	retries := c.MaxRetries
+	if retries == 0 {
+		retries = 2
+	}
+	var result subprocess.Result
+	var err error
+	for attempt := 0; attempt <= retries; attempt++ {
+		result, err = runner.Run(ctx, c.Dir, "gh", args...)
+		if err == nil || !isRateLimit(result) || attempt == retries {
+			break
+		}
+		if sleepErr := c.sleep(ctx, time.Duration(attempt+1)*time.Second); sleepErr != nil {
+			return result, sleepErr
+		}
+	}
+	if err != nil {
+		return result, commandError(result, err)
+	}
+	return result, nil
+}
+
+func (c *GhClient) sleep(ctx context.Context, d time.Duration) error {
+	if c.Sleep != nil {
+		return c.Sleep(ctx, d)
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func commandError(result subprocess.Result, err error) error {
+	detail := strings.TrimSpace(result.Stderr)
+	if detail == "" {
+		detail = strings.TrimSpace(result.Stdout)
+	}
+	if detail == "" {
+		return err
+	}
+	return fmt.Errorf("%s: %w", detail, err)
+}
+
+func isRateLimit(result subprocess.Result) bool {
+	text := strings.ToLower(result.Stdout + "\n" + result.Stderr)
+	return strings.Contains(text, "rate limit") || strings.Contains(text, "retry-after") || strings.Contains(text, "http 429")
+}
+
+func isNoChecks(result subprocess.Result) bool {
+	text := strings.ToLower(result.Stdout + "\n" + result.Stderr)
+	return strings.Contains(text, "no checks reported")
+}
+
+func endpoint(repo Repository, parts ...any) string {
+	values := []string{"repos", repo.Owner, repo.Name}
+	for _, part := range parts {
+		values = append(values, fmt.Sprint(part))
+	}
+	return strings.Join(values, "/")
+}
+
+func dedupeComments(comments []IssueComment) []IssueComment {
+	seen := make(map[int64]struct{}, len(comments))
+	unique := make([]IssueComment, 0, len(comments))
+	for _, comment := range comments {
+		if _, ok := seen[comment.ID]; ok {
+			continue
+		}
+		seen[comment.ID] = struct{}{}
+		unique = append(unique, comment)
+	}
+	return unique
+}
+
+func firstLine(value string) string {
+	for _, line := range strings.Split(value, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line
+		}
+	}
+	return ""
 }
 
 type NoopClient struct{}
 
 func (NoopClient) Ping(context.Context) error {
 	return nil
+}
+
+func (NoopClient) ListPullRequests(context.Context, Repository, string) ([]PullRequest, error) {
+	return nil, errors.ErrUnsupported
+}
+
+func (NoopClient) CreatePullRequest(context.Context, CreatePullRequestInput) (PullRequest, error) {
+	return PullRequest{}, errors.ErrUnsupported
+}
+
+func (NoopClient) ListIssueComments(context.Context, Repository, int64) ([]IssueComment, error) {
+	return nil, errors.ErrUnsupported
+}
+
+func (NoopClient) PostIssueComment(context.Context, Repository, int64, string) (IssueComment, error) {
+	return IssueComment{}, errors.ErrUnsupported
+}
+
+func (NoopClient) MergePullRequest(context.Context, MergePullRequestInput) (MergeResult, error) {
+	return MergeResult{}, errors.ErrUnsupported
+}
+
+func (NoopClient) GetCombinedStatus(context.Context, Repository, string) (CombinedStatus, error) {
+	return CombinedStatus{}, errors.ErrUnsupported
+}
+
+func (NoopClient) ListPullRequestChecks(context.Context, Repository, int64) ([]PullRequestCheck, error) {
+	return nil, errors.ErrUnsupported
+}
+
+func (NoopClient) CreateCommitStatus(context.Context, CommitStatusInput) (CommitStatus, error) {
+	return CommitStatus{}, errors.ErrUnsupported
+}
+
+func (NoopClient) ListPullRequestFiles(context.Context, Repository, int64) ([]PullRequestFile, error) {
+	return nil, errors.ErrUnsupported
+}
+
+func (NoopClient) ListPullRequestCommits(context.Context, Repository, int64) ([]PullRequestCommit, error) {
+	return nil, errors.ErrUnsupported
 }
