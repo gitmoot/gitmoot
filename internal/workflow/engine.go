@@ -165,6 +165,7 @@ func (e Engine) HandlePullRequestReadyToMerge(ctx context.Context, event PullReq
 		TaskID:      event.TaskID,
 		TaskTitle:   event.TaskTitle,
 		LeadAgent:   event.LeadAgent,
+		Reviewers:   compactStrings(append([]string{}, event.RequiredReviewers...)),
 	}, ref)
 	return err
 }

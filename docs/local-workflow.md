@@ -9,7 +9,8 @@ statuses, and merges only after the merge gate passes.
 ## What Exists Today
 
 The current CLI supports local state initialization, prerequisite checks, agent
-registration, agent health checks, and the daemon:
+registration, agent health checks, plan import, task branch startup, status,
+and the daemon:
 
 ```sh
 gitmoot init
@@ -17,14 +18,14 @@ gitmoot doctor --repo .
 gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
 gitmoot agent list
 gitmoot agent doctor <name>
+gitmoot goal import --file GOAL.md --repo owner/repo
+gitmoot task run task-001 --repo owner/repo --owner lead --base main
+gitmoot status --repo owner/repo
 gitmoot daemon start --repo owner/repo --poll 30s
 ```
 
-Goal import, task run, and status commands are planned surfaces. Until those
-commands are implemented, a realistic demo imports the plan by keeping it in the
-repository, opening task PRs manually or through an agent session, and letting
-the daemon coordinate comments, reviews, retries, and merge gates for the PRs it
-can observe.
+Goal import turns Markdown headings shaped like `### Task N: Title` into local
+planned tasks. `task run` starts one task branch and records its branch lock.
 
 ## End-To-End Demo Path
 
@@ -38,18 +39,14 @@ can observe.
    gh auth status
    ```
 
-2. Write the plan in the repository.
+2. Write and import the plan.
 
    Keep the implementation plan in a tracked file such as `GOAL.md`. The future
    command shape is:
 
    ```sh
-   gitmoot goal import --file GOAL.md
+   gitmoot goal import --file GOAL.md --repo owner/project
    ```
-
-   In this checkout that command is not implemented yet, so the first agent
-   should read the plan file directly and open the task PRs using the normal
-   task-by-task workflow.
 
 3. Start persistent agent sessions on the same machine.
 
@@ -81,7 +78,11 @@ can observe.
    The daemon validates that the current checkout's `origin` remote matches
    `--repo`. Keep it running while the workflow is active.
 
-6. Open the first task PR.
+6. Start and open the first task PR.
+
+   ```sh
+   gitmoot task run task-001 --repo owner/project --owner lead --base main
+   ```
 
    The lead agent or the human creates the task branch, implements the task,
    pushes it, and opens a PR. The PR comments become the public audit trail.
@@ -112,8 +113,8 @@ can observe.
 
    By default Gitmoot merges with a squash merge guarded by the current head SHA.
    After merge it records the merged commit, releases the branch lock, updates
-   the local base branch, and can enqueue the next task once that queueing
-   surface is wired in.
+   the local base branch, and can enqueue the next task once the task queueing
+   policy selects it.
 
 ## Local-Only Limits
 

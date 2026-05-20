@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
@@ -25,9 +24,9 @@ var rootCommands = []command{
 	{name: "doctor", summary: "check local Gitmoot prerequisites", run: runDoctor},
 	{name: "daemon", summary: "run the local PR watcher", run: runDaemon},
 	{name: "agent", summary: "manage registered agents", run: runAgent},
-	{name: "status", summary: "show local workflow status", run: notImplemented("status")},
-	{name: "goal", summary: "import or inspect goals", run: notImplemented("goal")},
-	{name: "task", summary: "run or inspect tasks", run: notImplemented("task")},
+	{name: "status", summary: "show local workflow status", run: runStatus},
+	{name: "goal", summary: "import or inspect goals", run: runGoal},
+	{name: "task", summary: "run or inspect tasks", run: runTask},
 }
 
 func Run(args []string, stdout, stderr io.Writer) int {
@@ -130,18 +129,4 @@ func pathsFromFlag(home string) (config.Paths, error) {
 		return config.PathsForHome(home), nil
 	}
 	return config.DefaultPaths()
-}
-
-func notImplemented(name string) func(args []string, stdout, stderr io.Writer) int {
-	return func(args []string, stdout, stderr io.Writer) int {
-		if len(args) > 0 && (args[0] == "-h" || args[0] == "--help") {
-			fmt.Fprintf(stdout, "Usage:\n  gitmoot %s [flags]\n", name)
-			return 0
-		}
-		fmt.Fprintf(stderr, "gitmoot %s is not implemented yet\n", name)
-		if len(args) > 0 {
-			fmt.Fprintf(stderr, "received args: %s\n", strings.Join(args, " "))
-		}
-		return 1
-	}
 }

@@ -99,6 +99,10 @@ type Pinger interface {
 	Ping(ctx context.Context) error
 }
 
+type sqlExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -235,8 +239,45 @@ func (s *Store) InsertGoal(ctx context.Context, goal Goal) error {
 	return err
 }
 
+func (s *Store) UpsertGoal(ctx context.Context, goal Goal) error {
+	return upsertGoal(ctx, s.db, goal)
+}
+
+func upsertGoal(ctx context.Context, execer sqlExecer, goal Goal) error {
+	_, err := execer.ExecContext(ctx, `INSERT INTO goals(id, title, source, status, updated_at)
+		VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(id) DO UPDATE SET
+			title = excluded.title,
+			source = excluded.source,
+			status = excluded.status,
+			updated_at = CURRENT_TIMESTAMP`,
+		goal.ID, goal.Title, goal.Source, goal.Status)
+	return err
+}
+
+func (s *Store) ListGoals(ctx context.Context) ([]Goal, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, title, source, status FROM goals ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	goals := []Goal{}
+	for rows.Next() {
+		var goal Goal
+		if err := rows.Scan(&goal.ID, &goal.Title, &goal.Source, &goal.Status); err != nil {
+			return nil, err
+		}
+		goals = append(goals, goal)
+	}
+	return goals, rows.Err()
+}
+
 func (s *Store) UpsertTask(ctx context.Context, task Task) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, updated_at)
+	return upsertTask(ctx, s.db, task)
+}
+
+func upsertTask(ctx context.Context, execer sqlExecer, task Task) error {
+	_, err := execer.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
 			repo_full_name = excluded.repo_full_name,
@@ -244,6 +285,41 @@ func (s *Store) UpsertTask(ctx context.Context, task Task) error {
 			title = excluded.title,
 			state = excluded.state,
 			branch = excluded.branch,
+			updated_at = CURRENT_TIMESTAMP`,
+		task.ID, task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch)
+	return err
+}
+
+func (s *Store) UpsertGoalWithTasks(ctx context.Context, goal Goal, tasks []Task) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := upsertGoal(ctx, tx, goal); err != nil {
+		return err
+	}
+	for _, task := range tasks {
+		if err := upsertImportedTask(ctx, tx, task); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func upsertImportedTask(ctx context.Context, execer sqlExecer, task Task) error {
+	_, err := execer.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+			ON CONFLICT(id) DO UPDATE SET
+				repo_full_name = CASE
+					WHEN excluded.repo_full_name <> '' THEN excluded.repo_full_name
+					ELSE tasks.repo_full_name
+				END,
+				goal_id = excluded.goal_id,
+				title = excluded.title,
+				state = tasks.state,
+			branch = tasks.branch,
 			updated_at = CURRENT_TIMESTAMP`,
 		task.ID, task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch)
 	return err
@@ -271,6 +347,43 @@ func (s *Store) GetTaskByRepoBranch(ctx context.Context, repoFullName string, br
 		ORDER BY CASE WHEN repo_full_name = ? THEN 0 ELSE 1 END, updated_at DESC, id
 		LIMIT 1`, branch, repoFullName, repoFullName)
 	return scanTask(row)
+}
+
+func (s *Store) ListTasks(ctx context.Context) ([]Task, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, repo_full_name, goal_id, title, state, branch FROM tasks ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	tasks := []Task{}
+	for rows.Next() {
+		task, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, task)
+	}
+	return tasks, rows.Err()
+}
+
+func (s *Store) ListTasksByRepo(ctx context.Context, repoFullName string) ([]Task, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, repo_full_name, goal_id, title, state, branch
+		FROM tasks
+		WHERE repo_full_name = ? OR repo_full_name = ''
+		ORDER BY CASE WHEN repo_full_name = ? THEN 0 ELSE 1 END, id`, repoFullName, repoFullName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	tasks := []Task{}
+	for rows.Next() {
+		task, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, task)
+	}
+	return tasks, rows.Err()
 }
 
 func (s *Store) ListTasksByRepoState(ctx context.Context, repoFullName string, state string) ([]Task, error) {
@@ -334,6 +447,30 @@ func (s *Store) GetPullRequestByRepoBranch(ctx context.Context, repoFullName str
 		return PullRequest{}, err
 	}
 	return pr, nil
+}
+
+func (s *Store) ListPullRequests(ctx context.Context, repoFullName string) ([]PullRequest, error) {
+	query := `SELECT repo_full_name, number, url, head_branch, base_branch, head_sha, merge_commit_sha, state FROM pull_requests`
+	args := []any{}
+	if strings.TrimSpace(repoFullName) != "" {
+		query += ` WHERE repo_full_name = ?`
+		args = append(args, repoFullName)
+	}
+	query += ` ORDER BY repo_full_name, number`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	prs := []PullRequest{}
+	for rows.Next() {
+		var pr PullRequest
+		if err := rows.Scan(&pr.RepoFullName, &pr.Number, &pr.URL, &pr.HeadBranch, &pr.BaseBranch, &pr.HeadSHA, &pr.MergeCommitSHA, &pr.State); err != nil {
+			return nil, err
+		}
+		prs = append(prs, pr)
+	}
+	return prs, rows.Err()
 }
 
 func (s *Store) MarkCommentSeen(ctx context.Context, comment Comment) error {
@@ -579,6 +716,17 @@ func (s *Store) UpsertMergeGate(ctx context.Context, gate MergeGate) error {
 			updated_at = CURRENT_TIMESTAMP`,
 		gate.RepoFullName, gate.PullRequest, gate.State, gate.Reason)
 	return err
+}
+
+func (s *Store) GetMergeGate(ctx context.Context, repoFullName string, pullRequest int64) (MergeGate, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT repo_full_name, pull_request, state, reason
+		FROM merge_gates WHERE repo_full_name = ? AND pull_request = ?`,
+		repoFullName, pullRequest)
+	var gate MergeGate
+	if err := row.Scan(&gate.RepoFullName, &gate.PullRequest, &gate.State, &gate.Reason); err != nil {
+		return MergeGate{}, err
+	}
+	return gate, nil
 }
 
 func (s *Store) HasTable(ctx context.Context, name string) (bool, error) {

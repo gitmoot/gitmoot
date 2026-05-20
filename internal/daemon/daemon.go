@@ -417,8 +417,11 @@ func (d Daemon) handleCommand(ctx context.Context, pull github.PullRequest, comm
 	if err := command.Validate(); err != nil {
 		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not route comment %d: %v.", comment.ID, err))
 	}
-	if command.Action == "status" || command.Action == "merge" {
-		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot recognized `/gitmoot %s`, but that command is not implemented in this task yet.", command.Action))
+	switch command.Action {
+	case "status":
+		return d.handleStatusCommand(ctx, pull, comment)
+	case "merge":
+		return d.handleMergeCommand(ctx, pull, comment)
 	}
 
 	agent, err := d.Store.GetAgent(ctx, command.Agent)
@@ -480,6 +483,163 @@ func (d Daemon) handleCommand(ctx context.Context, pull github.PullRequest, comm
 		}
 	}
 	return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot queued `%s` job `%s` for `%s`.", command.Action, job.ID, agent.Name))
+}
+
+func (d Daemon) handleStatusCommand(ctx context.Context, pull github.PullRequest, comment github.IssueComment) error {
+	ref, err := d.commentTaskRef(ctx, pull, comment)
+	if err != nil {
+		return err
+	}
+	statusTaskID := ""
+	lines := []string{fmt.Sprintf("Gitmoot status for PR #%d:", pull.Number)}
+	if task, err := d.Store.GetTask(ctx, ref.id); err == nil {
+		statusTaskID = task.ID
+		lines = append(lines, fmt.Sprintf("- task: `%s` `%s`", task.ID, task.State))
+		if strings.TrimSpace(task.Branch) != "" {
+			lines = append(lines, fmt.Sprintf("- branch: `%s`", task.Branch))
+		}
+	} else if errors.Is(err, sql.ErrNoRows) {
+		lines = append(lines, fmt.Sprintf("- task: `%s` not registered", ref.id))
+	} else {
+		return err
+	}
+	if strings.TrimSpace(pull.HeadSHA) != "" {
+		lines = append(lines, fmt.Sprintf("- head: `%s`", pull.HeadSHA))
+	}
+	if lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef); err == nil {
+		lines = append(lines, fmt.Sprintf("- branch_lock: `%s`", lock.Owner))
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	counts, err := d.jobStateCounts(ctx, pull, statusTaskID)
+	if err != nil {
+		return err
+	}
+	lines = append(lines, "- jobs: "+formatJobCounts(counts))
+	if gate, err := d.Store.GetMergeGate(ctx, d.Repo.FullName(), pull.Number); err == nil {
+		lines = append(lines, fmt.Sprintf("- merge_gate: `%s` %s", gate.State, strings.TrimSpace(gate.Reason)))
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	return d.ack(ctx, pull.Number, strings.Join(lines, "\n"))
+}
+
+func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest, comment github.IssueComment) error {
+	if d.Workflow == nil {
+		return d.ack(ctx, pull.Number, "Gitmoot cannot merge this PR because the workflow engine is not configured.")
+	}
+	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot cannot merge PR #%d because branch `%s` is not registered as a task.", pull.Number, pull.HeadRef))
+		}
+		return err
+	}
+	if task.State == string(workflow.TaskMerged) {
+		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot merged PR #%d.", pull.Number))
+	}
+	if task.State != string(workflow.TaskReadyToMerge) {
+		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot cannot merge PR #%d because task `%s` is `%s`, not `%s`.", pull.Number, task.ID, task.State, workflow.TaskReadyToMerge))
+	}
+	leadAgent := "github"
+	if lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef); err == nil && strings.TrimSpace(lock.Owner) != "" {
+		leadAgent = lock.Owner
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	reviewers, err := d.workflowReviewers(ctx)
+	if err != nil {
+		return err
+	}
+	err = d.Workflow.HandlePullRequestReadyToMerge(ctx, workflow.PullRequestEvent{
+		Repo:              d.Repo.FullName(),
+		Branch:            firstNonEmpty(task.Branch, pull.HeadRef),
+		PullRequest:       int(pull.Number),
+		HeadSHA:           pull.HeadSHA,
+		GoalID:            task.GoalID,
+		TaskID:            task.ID,
+		TaskTitle:         task.Title,
+		LeadAgent:         leadAgent,
+		Sender:            comment.Author,
+		RequiredReviewers: reviewers,
+	})
+	if err != nil {
+		var blocked workflow.BlockedError
+		if errors.As(err, &blocked) {
+			return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot merge is blocked: %s.", blocked.Reason))
+		}
+		return err
+	}
+	task, err = d.Store.GetTask(ctx, task.ID)
+	if err != nil {
+		return err
+	}
+	if task.State == string(workflow.TaskMerged) {
+		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot merged PR #%d.", pull.Number))
+	}
+	return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot merge gate ran; task `%s` is `%s`.", task.ID, task.State))
+}
+
+func (d Daemon) jobStateCounts(ctx context.Context, pull github.PullRequest, taskID string) (map[string]int, error) {
+	jobs, err := d.Store.ListJobs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	counts := map[string]int{}
+	for _, job := range jobs {
+		payload, err := workflowPayload(job)
+		if err != nil {
+			return nil, err
+		}
+		if payload.Repo != d.Repo.FullName() || payload.PullRequest != int(pull.Number) {
+			continue
+		}
+		if strings.TrimSpace(taskID) != "" && strings.TrimSpace(payload.TaskID) != "" && payload.TaskID != taskID {
+			continue
+		}
+		state := strings.TrimSpace(job.State)
+		if state == "" {
+			state = "unknown"
+		}
+		counts[state]++
+	}
+	return counts, nil
+}
+
+func workflowPayload(job db.Job) (workflow.JobPayload, error) {
+	var payload workflow.JobPayload
+	if strings.TrimSpace(job.Payload) == "" {
+		return payload, nil
+	}
+	if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+		return workflow.JobPayload{}, fmt.Errorf("parse job payload %q: %w", job.ID, err)
+	}
+	return payload, nil
+}
+
+func formatJobCounts(counts map[string]int) string {
+	states := []string{
+		string(workflow.JobQueued),
+		string(workflow.JobRunning),
+		string(workflow.JobSucceeded),
+		string(workflow.JobFailed),
+		string(workflow.JobBlocked),
+		string(workflow.JobCancelled),
+	}
+	parts := make([]string, 0, len(states))
+	for _, state := range states {
+		parts = append(parts, fmt.Sprintf("%s=%d", state, counts[state]))
+	}
+	return strings.Join(parts, " ")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (d Daemon) commentTaskRef(ctx context.Context, pull github.PullRequest, comment github.IssueComment) (workflowTaskRef, error) {

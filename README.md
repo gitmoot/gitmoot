@@ -31,12 +31,10 @@ gitmoot agent doctor <name>
 gitmoot agent remove <name>
 ```
 
-The goal and task commands are planned but not implemented in this checkout:
-
 ```text
 gitmoot status
 gitmoot goal import --file <path>
-gitmoot task run <id>
+gitmoot task run <id> --repo owner/repo --owner <agent>
 ```
 
 ## Documentation

@@ -1011,6 +1011,210 @@ func TestPollOnceRejectsImplementWithoutBranchLock(t *testing.T) {
 	}
 }
 
+func TestPollOnceReportsStatusCommand(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-010",
+		RepoFullName: repo.FullName(),
+		GoalID:       "goal-1",
+		Title:        "Task 10",
+		State:        string(workflow.TaskReviewing),
+		Branch:       "task-10",
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-10", Owner: "builder"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo:        repo.FullName(),
+		Branch:      "task-10",
+		PullRequest: 10,
+		TaskID:      "task-010",
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "job-1", Agent: "audit", Type: "review", State: string(workflow.JobQueued), Payload: string(payload)}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	if err := store.UpsertMergeGate(ctx, db.MergeGate{RepoFullName: repo.FullName(), PullRequest: 10, State: "pending", Reason: "ci pending"}); err != nil {
+		t.Fatalf("UpsertMergeGate returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{Number: 10, Title: "Task 10", State: "open", HeadRef: "task-10", BaseRef: "main", HeadSHA: "abc123"}},
+		comments: map[int64][]github.IssueComment{
+			10: {{ID: 909, Body: "/gitmoot status", Author: "dana"}},
+		},
+	}
+
+	err = (Daemon{Repo: repo, Store: store, GitHub: client}).PollOnce(ctx)
+
+	if err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.posted) != 1 {
+		t.Fatalf("posted acknowledgements = %+v, want 1", client.posted)
+	}
+	body := client.posted[0].body
+	for _, want := range []string{"Gitmoot status for PR #10", "task: `task-010` `reviewing`", "branch_lock: `builder`", "queued=1", "merge_gate: `pending` ci pending"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("status body missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestPollOnceReportsStatusCommandCountsUnregisteredPRJobs(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo:        repo.FullName(),
+		Branch:      "task-10",
+		PullRequest: 10,
+		TaskID:      "pr-10-comment-111",
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "job-1", Agent: "audit", Type: "review", State: string(workflow.JobQueued), Payload: string(payload)}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{Number: 10, Title: "Task 10", State: "open", HeadRef: "task-10", BaseRef: "main", HeadSHA: "abc123"}},
+		comments: map[int64][]github.IssueComment{
+			10: {{ID: 909, Body: "/gitmoot status", Author: "dana"}},
+		},
+	}
+
+	err = (Daemon{Repo: repo, Store: store, GitHub: client}).PollOnce(ctx)
+
+	if err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.posted) != 1 {
+		t.Fatalf("posted acknowledgements = %+v, want 1", client.posted)
+	}
+	body := client.posted[0].body
+	for _, want := range []string{"task: `pr-10-comment-909` not registered", "queued=1"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("status body missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestPollOnceMergeCommandRunsMergeGate(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-010",
+		RepoFullName: repo.FullName(),
+		GoalID:       "goal-1",
+		Title:        "Task 10",
+		State:        string(workflow.TaskReadyToMerge),
+		Branch:       "task-10",
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-10", Owner: "builder"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "audit",
+		Role:           "reviewer",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"review"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent audit returned error: %v", err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(),
+		Number:       10,
+		HeadBranch:   "task-10",
+		BaseBranch:   "main",
+		HeadSHA:      "abc123",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true, Merged: true, MergeCommitSHA: "merge123"}}
+	engine := workflow.Engine{Store: store, MergeGate: gate}
+	client := &fakeGitHub{}
+	err := (Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}).handleMergeCommand(
+		ctx,
+		github.PullRequest{Number: 10, Title: "Task 10", State: "open", HeadRef: "task-10", BaseRef: "main", HeadSHA: "abc123"},
+		github.IssueComment{ID: 910, Body: "/gitmoot merge", Author: "dana"},
+	)
+
+	if err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(gate.requests) != 1 {
+		t.Fatalf("merge gate requests = %+v, want 1", gate.requests)
+	}
+	request := gate.requests[0]
+	if request.Repo != repo.FullName() || request.Branch != "task-10" || request.PullRequest != 10 || request.TaskID != "task-010" {
+		t.Fatalf("merge request = %+v", request)
+	}
+	if request.ReviewOptional {
+		t.Fatalf("merge request ReviewOptional = true, want false when repo review agents are configured")
+	}
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "Gitmoot merged PR #10") {
+		t.Fatalf("posted acknowledgements = %+v", client.posted)
+	}
+	task, err := store.GetTask(ctx, "task-010")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskMerged) {
+		t.Fatalf("task state = %q, want merged", task.State)
+	}
+}
+
+func TestPollOnceMergeCommandRequiresReadyTask(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-010",
+		RepoFullName: repo.FullName(),
+		GoalID:       "goal-1",
+		Title:        "Task 10",
+		State:        string(workflow.TaskReviewing),
+		Branch:       "task-10",
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-10", Owner: "builder"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true, Merged: true, MergeCommitSHA: "merge123"}}
+	engine := workflow.Engine{Store: store, MergeGate: gate}
+	client := &fakeGitHub{}
+	err := (Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}).handleMergeCommand(
+		ctx,
+		github.PullRequest{Number: 10, Title: "Task 10", State: "open", HeadRef: "task-10", BaseRef: "main", HeadSHA: "abc123"},
+		github.IssueComment{ID: 911, Body: "/gitmoot merge", Author: "dana"},
+	)
+
+	if err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(gate.requests) != 0 {
+		t.Fatalf("merge gate requests = %+v, want none", gate.requests)
+	}
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "not `ready_to_merge`") {
+		t.Fatalf("posted acknowledgements = %+v", client.posted)
+	}
+}
+
 func TestPollOnceQueuesImplementWithBranchLock(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
