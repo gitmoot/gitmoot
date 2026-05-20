@@ -96,8 +96,83 @@ func TestRepositoryMethods(t *testing.T) {
 	if err := store.CreateJob(ctx, Job{ID: "job-1", Agent: "audit", Type: "review", State: "queued"}); err != nil {
 		t.Fatalf("CreateJob returned error: %v", err)
 	}
+	job, err := store.GetJob(ctx, "job-1")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != "queued" {
+		t.Fatalf("job state = %q, want queued", job.State)
+	}
+	if err := store.UpdateJobState(ctx, "job-1", "running"); err != nil {
+		t.Fatalf("UpdateJobState returned error: %v", err)
+	}
+	transitioned, err := store.TransitionJobState(ctx, "job-1", "queued", "running")
+	if err != nil {
+		t.Fatalf("TransitionJobState stale returned error: %v", err)
+	}
+	if transitioned {
+		t.Fatal("TransitionJobState unexpectedly changed a non-matching state")
+	}
+	transitioned, err = store.TransitionJobState(ctx, "job-1", "running", "succeeded")
+	if err != nil {
+		t.Fatalf("TransitionJobState returned error: %v", err)
+	}
+	if !transitioned {
+		t.Fatal("TransitionJobState did not change matching state")
+	}
+	if err := store.CreateJob(ctx, Job{ID: "job-2", Agent: "audit", Type: "review", State: "queued"}); err != nil {
+		t.Fatalf("second CreateJob returned error: %v", err)
+	}
+	transitioned, err = store.TransitionJobStateWithEvent(ctx, "job-2", "queued", "running", JobEvent{Kind: "running", Message: "started"})
+	if err != nil {
+		t.Fatalf("TransitionJobStateWithEvent returned error: %v", err)
+	}
+	if !transitioned {
+		t.Fatal("TransitionJobStateWithEvent did not change matching state")
+	}
+	jobEvents, err := store.ListJobEvents(ctx, "job-2")
+	if err != nil {
+		t.Fatalf("ListJobEvents for job-2 returned error: %v", err)
+	}
+	if len(jobEvents) != 1 || jobEvents[0].Kind != "running" {
+		t.Fatalf("job-2 events = %+v", jobEvents)
+	}
+	if err := store.CreateJobWithEvent(ctx, Job{ID: "job-3", Agent: "audit", Type: "review", State: "queued"}, JobEvent{Kind: "queued", Message: "created"}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	jobEvents, err = store.ListJobEvents(ctx, "job-3")
+	if err != nil {
+		t.Fatalf("ListJobEvents for job-3 returned error: %v", err)
+	}
+	if len(jobEvents) != 1 || jobEvents[0].Kind != "queued" {
+		t.Fatalf("job-3 events = %+v", jobEvents)
+	}
+	transitioned, err = store.TransitionJobStatePayloadWithEvent(ctx, "job-3", "queued", "succeeded", `{"result":{"summary":"ok"}}`, JobEvent{Kind: "succeeded", Message: "done"})
+	if err != nil {
+		t.Fatalf("TransitionJobStatePayloadWithEvent returned error: %v", err)
+	}
+	if !transitioned {
+		t.Fatal("TransitionJobStatePayloadWithEvent did not change matching state")
+	}
+	job, err = store.GetJob(ctx, "job-3")
+	if err != nil {
+		t.Fatalf("GetJob for job-3 returned error: %v", err)
+	}
+	if job.State != "succeeded" || job.Payload != `{"result":{"summary":"ok"}}` {
+		t.Fatalf("job-3 = %+v", job)
+	}
+	if err := store.UpdateJobPayload(ctx, "job-1", `{"raw_outputs":["ok"]}`); err != nil {
+		t.Fatalf("UpdateJobPayload returned error: %v", err)
+	}
 	if err := store.AddJobEvent(ctx, JobEvent{JobID: "job-1", Kind: "queued", Message: "created"}); err != nil {
 		t.Fatalf("AddJobEvent returned error: %v", err)
+	}
+	events, err := store.ListJobEvents(ctx, "job-1")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if len(events) != 1 || events[0].Kind != "queued" {
+		t.Fatalf("events = %+v", events)
 	}
 	acquired, err := store.AcquireLock(ctx, BranchLock{RepoFullName: "jerryfane/gitmoot", Branch: "task", Owner: "lead"})
 	if err != nil {

@@ -270,9 +270,138 @@ func (s *Store) CreateJob(ctx context.Context, job Job) error {
 	return err
 }
 
+func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, updated_at)
+		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`, job.ID, job.Agent, job.Type, job.State, job.Payload); err != nil {
+		return err
+	}
+	if event.JobID == "" {
+		event.JobID = job.ID
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, agent, type, state, payload FROM jobs WHERE id = ?`, id)
+	var job Job
+	if err := row.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload); err != nil {
+		return Job{}, err
+	}
+	return job, nil
+}
+
+func (s *Store) UpdateJobState(ctx context.Context, id string, state string) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, state, id)
+	if err != nil {
+		return err
+	}
+	return requireAffected(result, "job", id)
+}
+
+func (s *Store) TransitionJobState(ctx context.Context, id string, from string, to string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, id, from)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
+}
+
+func (s *Store) TransitionJobStateWithEvent(ctx context.Context, id string, from string, to string, event JobEvent) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, id, from)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, tx.Commit()
+	}
+	if event.JobID == "" {
+		event.JobID = id
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id string, from string, to string, payload string, event JobEvent) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, payload, id, from)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, tx.Commit()
+	}
+	if event.JobID == "" {
+		event.JobID = id
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+func (s *Store) UpdateJobPayload(ctx context.Context, id string, payload string) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, payload, id)
+	if err != nil {
+		return err
+	}
+	return requireAffected(result, "job", id)
+}
+
 func (s *Store) AddJobEvent(ctx context.Context, event JobEvent) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message)
 	return err
+}
+
+func (s *Store) ListJobEvents(ctx context.Context, jobID string) ([]JobEvent, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT job_id, kind, message FROM job_events WHERE job_id = ? ORDER BY id`, jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []JobEvent
+	for rows.Next() {
+		var event JobEvent
+		if err := rows.Scan(&event.JobID, &event.Kind, &event.Message); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
 }
 
 func (s *Store) AcquireLock(ctx context.Context, lock BranchLock) (bool, error) {
@@ -328,6 +457,17 @@ func scanAgent(scanner agentScanner) (Agent, error) {
 		return Agent{}, err
 	}
 	return agent, nil
+}
+
+func requireAffected(result sql.Result, subject string, id string) error {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return fmt.Errorf("%s %q not found", subject, id)
+	}
+	return nil
 }
 
 var migrations = []string{
