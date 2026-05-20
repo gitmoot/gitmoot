@@ -93,6 +93,27 @@ func TestRepositoryMethods(t *testing.T) {
 	if err := store.MarkCommentSeen(ctx, Comment{RepoFullName: "jerryfane/gitmoot", CommentID: 100, PullRequest: 1, Body: "/gitmoot audit review"}); err != nil {
 		t.Fatalf("MarkCommentSeen returned error: %v", err)
 	}
+	seen, err := store.HasCommentSeen(ctx, "jerryfane/gitmoot", 100)
+	if err != nil {
+		t.Fatalf("HasCommentSeen returned error: %v", err)
+	}
+	if !seen {
+		t.Fatal("HasCommentSeen did not find marked comment")
+	}
+	isNew, err := store.MarkCommentSeenIfNew(ctx, Comment{RepoFullName: "jerryfane/gitmoot", CommentID: 101, PullRequest: 1, Body: "/gitmoot audit review again"})
+	if err != nil {
+		t.Fatalf("MarkCommentSeenIfNew returned error: %v", err)
+	}
+	if !isNew {
+		t.Fatal("MarkCommentSeenIfNew did not report new comment")
+	}
+	isNew, err = store.MarkCommentSeenIfNew(ctx, Comment{RepoFullName: "jerryfane/gitmoot", CommentID: 101, PullRequest: 1, Body: "/gitmoot audit review again"})
+	if err != nil {
+		t.Fatalf("duplicate MarkCommentSeenIfNew returned error: %v", err)
+	}
+	if isNew {
+		t.Fatal("MarkCommentSeenIfNew reported duplicate comment as new")
+	}
 	if err := store.CreateJob(ctx, Job{ID: "job-1", Agent: "audit", Type: "review", State: "queued"}); err != nil {
 		t.Fatalf("CreateJob returned error: %v", err)
 	}

@@ -60,6 +60,42 @@ func TestPostIssueCommentUsesIssueCommentsEndpoint(t *testing.T) {
 	runner.wantArgs(t, 0, "api", "repos/jerryfane/gitmoot/issues/2/comments", "-f", "body=done")
 }
 
+func TestGetUserPermissionUsesCollaboratorPermissionEndpoint(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{
+			Stdout: `{"permission": "write", "role_name": "write"}`,
+		}},
+	}
+	client := GhClient{Runner: runner}
+
+	permission, err := client.GetUserPermission(context.Background(), Repository{Owner: "jerryfane", Name: "gitmoot"}, "alice")
+
+	if err != nil {
+		t.Fatalf("GetUserPermission returned error: %v", err)
+	}
+	if permission.Permission != "write" || permission.RoleName != "write" {
+		t.Fatalf("permission = %+v", permission)
+	}
+	runner.wantArgs(t, 0, "api", "repos/jerryfane/gitmoot/collaborators/alice/permission")
+}
+
+func TestGetUserPermissionMapsNotFoundToNone(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{Stderr: "HTTP 404: Not Found"}},
+		errs:    []error{errors.New("exit status 1")},
+	}
+	client := GhClient{Runner: runner}
+
+	permission, err := client.GetUserPermission(context.Background(), Repository{Owner: "jerryfane", Name: "gitmoot"}, "mallory")
+
+	if err != nil {
+		t.Fatalf("GetUserPermission returned error: %v", err)
+	}
+	if permission.Permission != "none" {
+		t.Fatalf("permission = %+v, want none", permission)
+	}
+}
+
 func TestCreateCommitStatusUsesStatusesEndpoint(t *testing.T) {
 	runner := &fakeRunner{
 		results: []subprocess.Result{{

@@ -19,6 +19,7 @@ type Client interface {
 	CreatePullRequest(ctx context.Context, input CreatePullRequestInput) (PullRequest, error)
 	ListIssueComments(ctx context.Context, repo Repository, issueNumber int64) ([]IssueComment, error)
 	PostIssueComment(ctx context.Context, repo Repository, issueNumber int64, body string) (IssueComment, error)
+	GetUserPermission(ctx context.Context, repo Repository, username string) (UserPermission, error)
 	MergePullRequest(ctx context.Context, input MergePullRequestInput) (MergeResult, error)
 	GetCombinedStatus(ctx context.Context, repo Repository, ref string) (CombinedStatus, error)
 	ListPullRequestChecks(ctx context.Context, repo Repository, number int64) ([]PullRequestCheck, error)
@@ -87,6 +88,11 @@ type IssueComment struct {
 	Author    string
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
+}
+
+type UserPermission struct {
+	Permission string `json:"permission"`
+	RoleName   string `json:"role_name"`
 }
 
 func (c *IssueComment) UnmarshalJSON(data []byte) error {
@@ -235,6 +241,21 @@ func (c *GhClient) PostIssueComment(ctx context.Context, repo Repository, issueN
 	var comment IssueComment
 	err := c.apiJSON(ctx, true, &comment, endpoint(repo, "issues", issueNumber, "comments"), "-f", "body="+body)
 	return comment, err
+}
+
+func (c *GhClient) GetUserPermission(ctx context.Context, repo Repository, username string) (UserPermission, error) {
+	var permission UserPermission
+	result, err := c.run(ctx, false, "api", endpoint(repo, "collaborators", username, "permission"))
+	if err != nil {
+		if isNotFound(result) {
+			return UserPermission{Permission: "none"}, nil
+		}
+		return UserPermission{}, err
+	}
+	if err := json.Unmarshal([]byte(result.Stdout), &permission); err != nil {
+		return UserPermission{}, fmt.Errorf("decode gh api response: %w", err)
+	}
+	return permission, nil
 }
 
 func (c *GhClient) MergePullRequest(ctx context.Context, input MergePullRequestInput) (MergeResult, error) {
@@ -418,6 +439,11 @@ func isRateLimit(result subprocess.Result) bool {
 	return strings.Contains(text, "rate limit") || strings.Contains(text, "retry-after") || strings.Contains(text, "http 429")
 }
 
+func isNotFound(result subprocess.Result) bool {
+	text := strings.ToLower(result.Stdout + "\n" + result.Stderr)
+	return strings.Contains(text, "http 404") || strings.Contains(text, "not found")
+}
+
 func isNoChecks(result subprocess.Result) bool {
 	text := strings.ToLower(result.Stdout + "\n" + result.Stderr)
 	return strings.Contains(text, "no checks reported")
@@ -474,6 +500,10 @@ func (NoopClient) ListIssueComments(context.Context, Repository, int64) ([]Issue
 
 func (NoopClient) PostIssueComment(context.Context, Repository, int64, string) (IssueComment, error) {
 	return IssueComment{}, errors.ErrUnsupported
+}
+
+func (NoopClient) GetUserPermission(context.Context, Repository, string) (UserPermission, error) {
+	return UserPermission{}, errors.ErrUnsupported
 }
 
 func (NoopClient) MergePullRequest(context.Context, MergePullRequestInput) (MergeResult, error) {
