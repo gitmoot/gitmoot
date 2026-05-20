@@ -13,6 +13,7 @@ import (
 
 	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
+	gitutil "github.com/jerryfane/gitmoot/internal/git"
 	"github.com/jerryfane/gitmoot/internal/github"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
@@ -65,13 +66,26 @@ func runDaemonStart(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 
 	err = withStore(*home, func(store *db.Store) error {
-		engine := workflow.Engine{Store: store}
+		checkout, err := resolveDaemonCheckout(ctx, repo, gitutil.Client{Dir: "."})
+		if err != nil {
+			return err
+		}
+		gh := github.NewClient(checkout)
+		engine := workflow.Engine{
+			Store: store,
+			MergeGate: workflow.PolicyMergeGate{
+				Store:        store,
+				GitHub:       gh,
+				Git:          gitutil.Client{Dir: checkout},
+				DeleteBranch: true,
+			},
+		}
 		fmt.Fprintf(stdout, "watching %s every %s\n", repo.FullName(), poll.String())
 		return (daemon.Daemon{
 			Repo:         repo,
 			PollInterval: *poll,
 			Store:        store,
-			GitHub:       github.NewClient("."),
+			GitHub:       gh,
 			Workflow:     &engine,
 		}).Run(ctx)
 	})
@@ -83,4 +97,23 @@ func runDaemonStart(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func resolveDaemonCheckout(ctx context.Context, repo github.Repository, client gitutil.Client) (string, error) {
+	root, err := client.Root(ctx)
+	if err != nil {
+		return "", fmt.Errorf("resolve daemon checkout: %w", err)
+	}
+	remote, err := client.OriginRemote(ctx)
+	if err != nil {
+		return "", fmt.Errorf("resolve daemon checkout remote: %w", err)
+	}
+	remoteRepo, err := gitutil.ParseGitHubRemote(remote)
+	if err != nil {
+		return "", err
+	}
+	if remoteRepo.String() != repo.FullName() {
+		return "", fmt.Errorf("current checkout origin is %s, not %s", remoteRepo.String(), repo.FullName())
+	}
+	return root, nil
 }

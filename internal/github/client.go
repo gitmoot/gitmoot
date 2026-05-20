@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,12 +17,14 @@ import (
 type Client interface {
 	Ping(ctx context.Context) error
 	ListPullRequests(ctx context.Context, repo Repository, state string) ([]PullRequest, error)
+	GetPullRequest(ctx context.Context, repo Repository, number int64) (PullRequest, error)
 	CreatePullRequest(ctx context.Context, input CreatePullRequestInput) (PullRequest, error)
 	ListIssueComments(ctx context.Context, repo Repository, issueNumber int64) ([]IssueComment, error)
 	PostIssueComment(ctx context.Context, repo Repository, issueNumber int64, body string) (IssueComment, error)
 	GetUserPermission(ctx context.Context, repo Repository, username string) (UserPermission, error)
 	MergePullRequest(ctx context.Context, input MergePullRequestInput) (MergeResult, error)
 	GetCombinedStatus(ctx context.Context, repo Repository, ref string) (CombinedStatus, error)
+	CompareCommits(ctx context.Context, repo Repository, base string, head string) (CompareResult, error)
 	ListPullRequestChecks(ctx context.Context, repo Repository, number int64) ([]PullRequestCheck, error)
 	CreateCommitStatus(ctx context.Context, input CommitStatusInput) (CommitStatus, error)
 	ListPullRequestFiles(ctx context.Context, repo Repository, number int64) ([]PullRequestFile, error)
@@ -45,9 +48,12 @@ type PullRequest struct {
 	Title     string `json:"title"`
 	State     string `json:"state"`
 	URL       string `json:"html_url"`
+	Merged    bool   `json:"merged"`
 	HeadRef   string
 	BaseRef   string
+	BaseSHA   string
 	HeadSHA   string
+	MergeSHA  string
 	Mergeable *bool `json:"mergeable"`
 }
 
@@ -57,13 +63,16 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 		Title     string `json:"title"`
 		State     string `json:"state"`
 		URL       string `json:"html_url"`
+		Merged    bool   `json:"merged"`
 		Mergeable *bool  `json:"mergeable"`
+		MergeSHA  string `json:"merge_commit_sha"`
 		Head      struct {
 			Ref string `json:"ref"`
 			SHA string `json:"sha"`
 		} `json:"head"`
 		Base struct {
 			Ref string `json:"ref"`
+			SHA string `json:"sha"`
 		} `json:"base"`
 	}
 	var decoded wire
@@ -74,10 +83,13 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 	p.Title = decoded.Title
 	p.State = decoded.State
 	p.URL = decoded.URL
+	p.Merged = decoded.Merged
 	p.Mergeable = decoded.Mergeable
 	p.HeadRef = decoded.Head.Ref
 	p.HeadSHA = decoded.Head.SHA
+	p.MergeSHA = decoded.MergeSHA
 	p.BaseRef = decoded.Base.Ref
+	p.BaseSHA = decoded.Base.SHA
 	return nil
 }
 
@@ -149,6 +161,12 @@ type CombinedStatus struct {
 	Statuses []CommitStatus `json:"statuses"`
 }
 
+type CompareResult struct {
+	Status   string `json:"status"`
+	AheadBy  int    `json:"ahead_by"`
+	BehindBy int    `json:"behind_by"`
+}
+
 type CommitStatusInput struct {
 	Repo        Repository
 	SHA         string
@@ -210,6 +228,10 @@ func (c *GhClient) ListPullRequests(ctx context.Context, repo Repository, state 
 		state = "open"
 	}
 	return apiPaginatedJSON[PullRequest](ctx, c, "-X", "GET", endpoint(repo, "pulls"), "-f", "state="+state)
+}
+
+func (c *GhClient) GetPullRequest(ctx context.Context, repo Repository, number int64) (PullRequest, error) {
+	return c.getPullRequest(ctx, repo, number)
 }
 
 func (c *GhClient) CreatePullRequest(ctx context.Context, input CreatePullRequestInput) (PullRequest, error) {
@@ -289,13 +311,26 @@ func (c *GhClient) MergePullRequest(ctx context.Context, input MergePullRequestI
 	if _, err := c.run(ctx, true, args...); err != nil {
 		return MergeResult{}, err
 	}
-	return MergeResult{Merged: true}, nil
+	pr, err := c.getPullRequest(ctx, input.Repo, input.Number)
+	if err != nil {
+		return MergeResult{}, fmt.Errorf("fetch merged pull request: %w", err)
+	}
+	if !pr.Merged && strings.TrimSpace(pr.State) != "merged" {
+		return MergeResult{Message: fmt.Sprintf("pull request merge is pending; current state is %q", pr.State)}, nil
+	}
+	return MergeResult{SHA: pr.MergeSHA, Merged: true}, nil
 }
 
 func (c *GhClient) GetCombinedStatus(ctx context.Context, repo Repository, ref string) (CombinedStatus, error) {
 	var status CombinedStatus
 	err := c.apiJSON(ctx, false, &status, endpoint(repo, "commits", ref, "status"))
 	return status, err
+}
+
+func (c *GhClient) CompareCommits(ctx context.Context, repo Repository, base string, head string) (CompareResult, error) {
+	var result CompareResult
+	err := c.apiJSON(ctx, false, &result, endpoint(repo, "compare", url.PathEscape(base+"..."+head)))
+	return result, err
 }
 
 func (c *GhClient) ListPullRequestChecks(ctx context.Context, repo Repository, number int64) ([]PullRequestCheck, error) {
@@ -490,6 +525,10 @@ func (NoopClient) ListPullRequests(context.Context, Repository, string) ([]PullR
 	return nil, errors.ErrUnsupported
 }
 
+func (NoopClient) GetPullRequest(context.Context, Repository, int64) (PullRequest, error) {
+	return PullRequest{}, errors.ErrUnsupported
+}
+
 func (NoopClient) CreatePullRequest(context.Context, CreatePullRequestInput) (PullRequest, error) {
 	return PullRequest{}, errors.ErrUnsupported
 }
@@ -512,6 +551,10 @@ func (NoopClient) MergePullRequest(context.Context, MergePullRequestInput) (Merg
 
 func (NoopClient) GetCombinedStatus(context.Context, Repository, string) (CombinedStatus, error) {
 	return CombinedStatus{}, errors.ErrUnsupported
+}
+
+func (NoopClient) CompareCommits(context.Context, Repository, string, string) (CompareResult, error) {
+	return CompareResult{}, errors.ErrUnsupported
 }
 
 func (NoopClient) ListPullRequestChecks(context.Context, Repository, int64) ([]PullRequestCheck, error) {

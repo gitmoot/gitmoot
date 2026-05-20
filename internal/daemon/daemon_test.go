@@ -271,10 +271,11 @@ func TestPollOnceRecordsAlreadyRoutedPullRequestWithoutDuplicateReviewRound(t *t
 	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
 		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
 	}
-	payload, err := json.Marshal(workflow.JobPayload{
+	stalePayload, err := json.Marshal(workflow.JobPayload{
 		Repo:        repo.FullName(),
 		Branch:      "task-7",
 		PullRequest: 7,
+		HeadSHA:     "old123",
 		TaskID:      "task-7",
 		LeadAgent:   "lead",
 		Reviewers:   []string{"audit"},
@@ -288,7 +289,29 @@ func TestPollOnceRecordsAlreadyRoutedPullRequestWithoutDuplicateReviewRound(t *t
 		Agent:   "audit",
 		Type:    "review",
 		State:   string(workflow.JobQueued),
-		Payload: string(payload),
+		Payload: string(stalePayload),
+	}, db.JobEvent{Kind: string(workflow.JobQueued), Message: "old routed review"}); err != nil {
+		t.Fatalf("CreateJobWithEvent stale returned error: %v", err)
+	}
+	currentPayload, err := json.Marshal(workflow.JobPayload{
+		Repo:        repo.FullName(),
+		Branch:      "task-7",
+		PullRequest: 7,
+		HeadSHA:     "abc123",
+		TaskID:      "task-7",
+		LeadAgent:   "lead",
+		Reviewers:   []string{"audit"},
+		ReviewRound: "review-2",
+	})
+	if err != nil {
+		t.Fatalf("Marshal current returned error: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID:      "review-audit-task-7-review-2",
+		Agent:   "audit",
+		Type:    "review",
+		State:   string(workflow.JobQueued),
+		Payload: string(currentPayload),
 	}, db.JobEvent{Kind: string(workflow.JobQueued), Message: "already routed by engine"}); err != nil {
 		t.Fatalf("CreateJobWithEvent returned error: %v", err)
 	}
@@ -296,6 +319,7 @@ func TestPollOnceRecordsAlreadyRoutedPullRequestWithoutDuplicateReviewRound(t *t
 		RepoFullName: repo.FullName(),
 		Number:       7,
 		HeadBranch:   "task-7",
+		HeadSHA:      "abc123",
 		State:        "open",
 	}); err != nil {
 		t.Fatalf("UpsertPullRequest returned error: %v", err)
@@ -327,11 +351,285 @@ func TestPollOnceRecordsAlreadyRoutedPullRequestWithoutDuplicateReviewRound(t *t
 	if err := daemon.PollOnce(ctx); err != nil {
 		t.Fatalf("PollOnce returned error: %v", err)
 	}
-	if _, err := store.GetJob(ctx, "review-audit-task-7-review-2"); err == nil {
+	if _, err := store.GetJob(ctx, "review-audit-task-7-review-3"); err == nil {
 		t.Fatal("already routed pull request created a duplicate review round")
 	}
 	if pr, err := store.GetPullRequest(ctx, repo.FullName(), 7); err != nil || pr.HeadSHA != "abc123" {
 		t.Fatalf("stored pull request = %+v err=%v", pr, err)
+	}
+}
+
+func TestPollOnceReroutesLegacyReviewWithoutHeadSHA(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "lead",
+		Role:           "lead",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"implement"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent lead returned error: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "audit",
+		Role:           "reviewer",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"review"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent audit returned error: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo:        repo.FullName(),
+		Branch:      "task-7",
+		PullRequest: 7,
+		TaskID:      "task-7",
+		LeadAgent:   "lead",
+		Reviewers:   []string{"audit"},
+		ReviewRound: "review-1",
+	})
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID:      "review-audit-task-7-review-1",
+		Agent:   "audit",
+		Type:    "review",
+		State:   string(workflow.JobQueued),
+		Payload: string(payload),
+	}, db.JobEvent{Kind: string(workflow.JobQueued), Message: "legacy review"}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(),
+		Number:       7,
+		HeadBranch:   "task-7",
+		HeadSHA:      "abc123",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{
+			Number:  7,
+			Title:   "Task 7",
+			State:   "open",
+			URL:     "https://github.com/jerryfane/gitmoot/pull/7",
+			HeadRef: "task-7",
+			BaseRef: "main",
+			HeadSHA: "abc123",
+		}},
+		comments: map[int64][]github.IssueComment{7: {}},
+	}
+	engine := workflow.Engine{
+		Store: store,
+		JobID: func(request workflow.JobRequest) string {
+			parts := []string{request.Action, request.Agent, request.TaskID}
+			if request.ReviewRound != "" {
+				parts = append(parts, request.ReviewRound)
+			}
+			return strings.Join(parts, "-")
+		},
+	}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	job, err := store.GetJob(ctx, "review-audit-task-7-review-2")
+	if err != nil {
+		t.Fatalf("GetJob rerouted review returned error: %v", err)
+	}
+	if !strings.Contains(job.Payload, `"head_sha":"abc123"`) {
+		t.Fatalf("rerouted job payload missing head sha: %s", job.Payload)
+	}
+}
+
+func TestPollOnceRetriesReadyToMergePullRequestWithoutHeadChange(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-7",
+		RepoFullName: repo.FullName(),
+		GoalID:       "goal-1",
+		Title:        "Task 7",
+		State:        string(workflow.TaskReadyToMerge),
+		Branch:       "task-7",
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(),
+		Number:       7,
+		URL:          "https://github.com/jerryfane/gitmoot/pull/7",
+		HeadBranch:   "task-7",
+		BaseBranch:   "main",
+		HeadSHA:      "abc123",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{
+			Number:  7,
+			Title:   "Task 7",
+			State:   "open",
+			URL:     "https://github.com/jerryfane/gitmoot/pull/7",
+			HeadRef: "task-7",
+			BaseRef: "main",
+			HeadSHA: "abc123",
+		}},
+		comments: map[int64][]github.IssueComment{7: {}},
+	}
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true, Merged: true}}
+	engine := workflow.Engine{Store: store, MergeGate: gate}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(gate.requests) != 1 || gate.requests[0].PullRequest != 7 || gate.requests[0].HeadSHA != "abc123" {
+		t.Fatalf("merge gate requests = %+v", gate.requests)
+	}
+}
+
+func TestPollOnceRetriesClosedReadyToMergePullRequest(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-7",
+		RepoFullName: repo.FullName(),
+		GoalID:       "goal-1",
+		Title:        "Task 7",
+		State:        string(workflow.TaskReadyToMerge),
+		Branch:       "task-7",
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(),
+		Number:       7,
+		URL:          "https://github.com/jerryfane/gitmoot/pull/7",
+		HeadBranch:   "task-7",
+		BaseBranch:   "main",
+		HeadSHA:      "abc123",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pullsByState: map[string][]github.PullRequest{
+			"open": {},
+			"closed": {{
+				Number:  6,
+				Title:   "Task 7 old",
+				State:   "closed",
+				Merged:  true,
+				URL:     "https://github.com/jerryfane/gitmoot/pull/6",
+				HeadRef: "task-7",
+				BaseRef: "main",
+				HeadSHA: "old123",
+			}, {
+				Number:  7,
+				Title:   "Task 7",
+				State:   "closed",
+				Merged:  true,
+				URL:     "https://github.com/jerryfane/gitmoot/pull/7",
+				HeadRef: "task-7",
+				BaseRef: "main",
+				HeadSHA: "abc123",
+			}},
+		},
+		comments: map[int64][]github.IssueComment{},
+	}
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true, Merged: true}}
+	engine := workflow.Engine{Store: store, MergeGate: gate}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(gate.requests) != 1 || gate.requests[0].PullRequest != 7 || gate.requests[0].HeadSHA != "abc123" {
+		t.Fatalf("merge gate requests = %+v", gate.requests)
+	}
+}
+
+func TestPollOnceDoesNotOverwriteNoReviewerAutoMerge(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "lead",
+		Role:           "lead",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"implement"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent lead returned error: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{
+			Number:  7,
+			Title:   "Task 7",
+			State:   "open",
+			URL:     "https://github.com/jerryfane/gitmoot/pull/7",
+			HeadRef: "task-7",
+			BaseRef: "main",
+			HeadSHA: "abc123",
+		}},
+		comments: map[int64][]github.IssueComment{7: {}},
+	}
+	gate := &fakeWorkflowMergeGate{
+		decision: workflow.MergeDecision{Ready: true, Merged: true, MergeCommitSHA: "merge123"},
+		onEvaluate: func(request workflow.MergeRequest) {
+			if err := store.UpsertPullRequest(ctx, db.PullRequest{
+				RepoFullName:   request.Repo,
+				Number:         int64(request.PullRequest),
+				URL:            "https://github.com/jerryfane/gitmoot/pull/7",
+				HeadBranch:     request.Branch,
+				BaseBranch:     "main",
+				HeadSHA:        request.HeadSHA,
+				MergeCommitSHA: "merge123",
+				State:          "merged",
+			}); err != nil {
+				t.Fatalf("UpsertPullRequest returned error: %v", err)
+			}
+		},
+	}
+	engine := workflow.Engine{Store: store, MergeGate: gate}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	pr, err := store.GetPullRequest(ctx, repo.FullName(), 7)
+	if err != nil {
+		t.Fatalf("GetPullRequest returned error: %v", err)
+	}
+	if pr.State != "merged" || pr.MergeCommitSHA != "merge123" {
+		t.Fatalf("stored pull request = %+v", pr)
 	}
 }
 
@@ -884,6 +1182,7 @@ func testStore(t *testing.T) *db.Store {
 
 type fakeGitHub struct {
 	pulls                 []github.PullRequest
+	pullsByState          map[string][]github.PullRequest
 	comments              map[int64][]github.IssueComment
 	posted                []postedComment
 	permissions           map[string]string
@@ -901,7 +1200,7 @@ func (f *fakeGitHub) Ping(context.Context) error {
 	return nil
 }
 
-func (f *fakeGitHub) ListPullRequests(context.Context, github.Repository, string) ([]github.PullRequest, error) {
+func (f *fakeGitHub) ListPullRequests(_ context.Context, _ github.Repository, state string) ([]github.PullRequest, error) {
 	f.listPullRequestsCalls++
 	if len(f.listPullRequestsErrs) > 0 {
 		err := f.listPullRequestsErrs[0]
@@ -909,6 +1208,9 @@ func (f *fakeGitHub) ListPullRequests(context.Context, github.Repository, string
 		if err != nil {
 			return nil, err
 		}
+	}
+	if f.pullsByState != nil {
+		return append([]github.PullRequest(nil), f.pullsByState[state]...), nil
 	}
 	return append([]github.PullRequest(nil), f.pulls...), nil
 }
@@ -945,8 +1247,16 @@ func (f *fakeGitHub) MergePullRequest(context.Context, github.MergePullRequestIn
 	return github.MergeResult{}, errors.New("not implemented")
 }
 
+func (f *fakeGitHub) GetPullRequest(context.Context, github.Repository, int64) (github.PullRequest, error) {
+	return github.PullRequest{}, errors.New("not implemented")
+}
+
 func (f *fakeGitHub) GetCombinedStatus(context.Context, github.Repository, string) (github.CombinedStatus, error) {
 	return github.CombinedStatus{}, errors.New("not implemented")
+}
+
+func (f *fakeGitHub) CompareCommits(context.Context, github.Repository, string, string) (github.CompareResult, error) {
+	return github.CompareResult{}, errors.New("not implemented")
 }
 
 func (f *fakeGitHub) ListPullRequestChecks(context.Context, github.Repository, int64) ([]github.PullRequestCheck, error) {
@@ -963,4 +1273,18 @@ func (f *fakeGitHub) ListPullRequestFiles(context.Context, github.Repository, in
 
 func (f *fakeGitHub) ListPullRequestCommits(context.Context, github.Repository, int64) ([]github.PullRequestCommit, error) {
 	return nil, errors.New("not implemented")
+}
+
+type fakeWorkflowMergeGate struct {
+	decision   workflow.MergeDecision
+	onEvaluate func(workflow.MergeRequest)
+	requests   []workflow.MergeRequest
+}
+
+func (f *fakeWorkflowMergeGate) Evaluate(_ context.Context, request workflow.MergeRequest) (workflow.MergeDecision, error) {
+	f.requests = append(f.requests, request)
+	if f.onEvaluate != nil {
+		f.onEvaluate(request)
+	}
+	return f.decision, nil
 }

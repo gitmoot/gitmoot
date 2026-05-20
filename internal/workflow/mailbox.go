@@ -24,6 +24,7 @@ type JobRequest struct {
 	Repo         string
 	Branch       string
 	PullRequest  int
+	HeadSHA      string
 	GoalID       string
 	TaskID       string
 	TaskTitle    string
@@ -39,6 +40,7 @@ type JobPayload struct {
 	Repo         string       `json:"repo"`
 	Branch       string       `json:"branch"`
 	PullRequest  int          `json:"pull_request"`
+	HeadSHA      string       `json:"head_sha,omitempty"`
 	GoalID       string       `json:"goal_id,omitempty"`
 	TaskID       string       `json:"task_id"`
 	TaskTitle    string       `json:"task_title"`
@@ -68,6 +70,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		Repo:         request.Repo,
 		Branch:       request.Branch,
 		PullRequest:  request.PullRequest,
+		HeadSHA:      request.HeadSHA,
 		GoalID:       request.GoalID,
 		TaskID:       request.TaskID,
 		TaskTitle:    request.TaskTitle,
