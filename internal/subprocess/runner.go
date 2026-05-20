@@ -13,6 +13,21 @@ type Result struct {
 	Stderr  string
 }
 
+type Runner interface {
+	Run(ctx context.Context, dir string, command string, args ...string) (Result, error)
+	LookPath(file string) (string, error)
+}
+
+type ExecRunner struct{}
+
+func (ExecRunner) Run(ctx context.Context, dir string, command string, args ...string) (Result, error) {
+	return Run(ctx, dir, command, args...)
+}
+
+func (ExecRunner) LookPath(file string) (string, error) {
+	return exec.LookPath(file)
+}
+
 func Run(ctx context.Context, dir string, command string, args ...string) (Result, error) {
 	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Dir = dir
