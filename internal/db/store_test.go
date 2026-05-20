@@ -54,6 +54,20 @@ func TestRepositoryMethods(t *testing.T) {
 	if err := store.UpsertAgent(ctx, Agent{Name: "audit", Role: "reviewer", Runtime: "codex", RuntimeRef: "session", RepoScope: "jerryfane/gitmoot", Capabilities: []string{"review"}, AutonomyPolicy: "auto", HealthStatus: "ok"}); err != nil {
 		t.Fatalf("UpsertAgent returned error: %v", err)
 	}
+	agent, err := store.GetAgent(ctx, "audit")
+	if err != nil {
+		t.Fatalf("GetAgent returned error: %v", err)
+	}
+	if agent.Name != "audit" || agent.Capabilities[0] != "review" {
+		t.Fatalf("agent = %+v", agent)
+	}
+	agents, err := store.ListAgents(ctx)
+	if err != nil {
+		t.Fatalf("ListAgents returned error: %v", err)
+	}
+	if len(agents) != 1 || agents[0].Name != "audit" {
+		t.Fatalf("agents = %+v", agents)
+	}
 	if err := store.InsertGoal(ctx, Goal{ID: "goal-1", Title: "Build Gitmoot", Source: "GOAL.md", Status: "planned"}); err != nil {
 		t.Fatalf("InsertGoal returned error: %v", err)
 	}
@@ -108,5 +122,19 @@ func TestRepositoryMethods(t *testing.T) {
 	}
 	if err := store.UpsertMergeGate(ctx, MergeGate{RepoFullName: "jerryfane/gitmoot", PullRequest: 1, State: "pending", Reason: "waiting"}); err != nil {
 		t.Fatalf("UpsertMergeGate returned error: %v", err)
+	}
+	removed, err := store.RemoveAgent(ctx, "audit")
+	if err != nil {
+		t.Fatalf("RemoveAgent returned error: %v", err)
+	}
+	if !removed {
+		t.Fatal("RemoveAgent did not remove existing agent")
+	}
+	removed, err = store.RemoveAgent(ctx, "audit")
+	if err != nil {
+		t.Fatalf("second RemoveAgent returned error: %v", err)
+	}
+	if removed {
+		t.Fatal("second RemoveAgent removed missing agent")
 	}
 }

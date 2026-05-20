@@ -190,6 +190,43 @@ func (s *Store) UpsertAgent(ctx context.Context, agent Agent) error {
 	return err
 }
 
+func (s *Store) GetAgent(ctx context.Context, name string) (Agent, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, capabilities_json, autonomy_policy, health_status
+		FROM agents WHERE name = ?`, name)
+	return scanAgent(row)
+}
+
+func (s *Store) ListAgents(ctx context.Context) ([]Agent, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, capabilities_json, autonomy_policy, health_status
+		FROM agents ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var agents []Agent
+	for rows.Next() {
+		agent, err := scanAgent(rows)
+		if err != nil {
+			return nil, err
+		}
+		agents = append(agents, agent)
+	}
+	return agents, rows.Err()
+}
+
+func (s *Store) RemoveAgent(ctx context.Context, name string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM agents WHERE name = ?`, name)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
 func (s *Store) InsertGoal(ctx context.Context, goal Goal) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO goals(id, title, source, status) VALUES (?, ?, ?, ?)`, goal.ID, goal.Title, goal.Source, goal.Status)
 	return err
@@ -275,6 +312,22 @@ func (s *Store) HasTable(ctx context.Context, name string) (bool, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&count)
 	return count == 1, err
+}
+
+type agentScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanAgent(scanner agentScanner) (Agent, error) {
+	var agent Agent
+	var capabilities string
+	if err := scanner.Scan(&agent.Name, &agent.Role, &agent.Runtime, &agent.RuntimeRef, &agent.RepoScope, &capabilities, &agent.AutonomyPolicy, &agent.HealthStatus); err != nil {
+		return Agent{}, err
+	}
+	if err := json.Unmarshal([]byte(capabilities), &agent.Capabilities); err != nil {
+		return Agent{}, err
+	}
+	return agent, nil
 }
 
 var migrations = []string{

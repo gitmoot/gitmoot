@@ -24,7 +24,7 @@ var rootCommands = []command{
 	{name: "init", summary: "initialize local Gitmoot state", run: runInit},
 	{name: "doctor", summary: "check local Gitmoot prerequisites", run: runDoctor},
 	{name: "daemon", summary: "run the local PR watcher", run: notImplemented("daemon")},
-	{name: "agent", summary: "manage registered agents", run: notImplemented("agent")},
+	{name: "agent", summary: "manage registered agents", run: runAgent},
 	{name: "status", summary: "show local workflow status", run: notImplemented("status")},
 	{name: "goal", summary: "import or inspect goals", run: notImplemented("goal")},
 	{name: "task", summary: "run or inspect tasks", run: notImplemented("task")},
