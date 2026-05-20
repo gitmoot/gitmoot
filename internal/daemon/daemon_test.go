@@ -677,6 +677,89 @@ func TestPollOnceAcknowledgesMissingCapabilityWithoutJob(t *testing.T) {
 	}
 }
 
+func TestPollOnceRejectsImplementWithoutBranchLock(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "builder",
+		Role:           "builder",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"implement"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{Number: 10, Title: "Task 10", State: "open", HeadRef: "task-10", BaseRef: "main"}},
+		comments: map[int64][]github.IssueComment{
+			10: {{ID: 808, Body: "/gitmoot builder implement", Author: "dana"}},
+		},
+	}
+
+	err := (Daemon{Repo: repo, Store: store, GitHub: client}).PollOnce(ctx)
+
+	if err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "without holding the branch lock") {
+		t.Fatalf("posted acknowledgements = %+v", client.posted)
+	}
+	if _, err := store.GetJob(ctx, jobID(repo, 10, 808, 0, "builder", "implement")); err == nil {
+		t.Fatal("implement job was created without a branch lock")
+	}
+}
+
+func TestPollOnceQueuesImplementWithBranchLock(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "builder",
+		Role:           "builder",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"implement"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-10", Owner: "builder"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-010", GoalID: "goal-1", Title: "Task 10", State: string(workflow.TaskImplementing), Branch: "task-10"}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{Number: 10, Title: "Task 10", State: "open", HeadRef: "task-10", BaseRef: "main"}},
+		comments: map[int64][]github.IssueComment{
+			10: {{ID: 808, Body: "/gitmoot builder implement", Author: "dana"}},
+		},
+	}
+
+	err := (Daemon{Repo: repo, Store: store, GitHub: client}).PollOnce(ctx)
+
+	if err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	job, err := store.GetJob(ctx, jobID(repo, 10, 808, 0, "builder", "implement"))
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	var payload workflow.JobPayload
+	if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+		t.Fatalf("Unmarshal payload returned error: %v", err)
+	}
+	if payload.TaskID != "task-010" || payload.GoalID != "goal-1" {
+		t.Fatalf("payload task context = task %q goal %q, want existing branch task context", payload.TaskID, payload.GoalID)
+	}
+}
+
 func TestPollOnceRetriesUnseenCommentAfterAckFailure(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)

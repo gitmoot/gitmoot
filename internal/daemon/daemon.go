@@ -179,7 +179,7 @@ func (d Daemon) handlePullRequestWorkflow(ctx context.Context, pull github.PullR
 		title:  pull.Title,
 		branch: pull.HeadRef,
 	}
-	if task, err := d.lookupPullRequestTask(ctx, pull.HeadRef); err == nil {
+	if task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef); err == nil {
 		ref.id = task.ID
 		ref.goalID = task.GoalID
 		ref.title = task.Title
@@ -207,15 +207,22 @@ func (d Daemon) handlePullRequestWorkflow(ctx context.Context, pull github.PullR
 	})
 }
 
-func (d Daemon) lookupPullRequestTask(ctx context.Context, branch string) (db.Task, error) {
-	task, err := d.Store.GetTaskByBranch(ctx, branch)
+func (d Daemon) lookupPullRequestTask(ctx context.Context, repoFullName string, branch string) (db.Task, error) {
+	task, err := d.Store.GetTaskByRepoBranch(ctx, repoFullName, branch)
 	if err == nil {
 		return task, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return db.Task{}, err
 	}
-	return d.Store.GetTask(ctx, branch)
+	task, err = d.Store.GetTask(ctx, branch)
+	if err != nil {
+		return db.Task{}, err
+	}
+	if task.RepoFullName != "" && task.RepoFullName != repoFullName {
+		return db.Task{}, sql.ErrNoRows
+	}
+	return task, nil
 }
 
 func (d Daemon) workflowReviewers(ctx context.Context) ([]string, error) {
@@ -289,7 +296,20 @@ func (d Daemon) handleCommand(ctx context.Context, pull github.PullRequest, comm
 	if !hasCapability(agent.Capabilities, command.Action) {
 		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot agent `%s` does not advertise `%s` capability.", agent.Name, command.Action))
 	}
+	if command.Action == "implement" {
+		allowed, err := d.agentOwnsBranchLock(ctx, agent.Name, pull.HeadRef)
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot agent `%s` cannot implement on `%s` without holding the branch lock.", agent.Name, pull.HeadRef))
+		}
+	}
 
+	ref, err := d.commentTaskRef(ctx, pull, comment)
+	if err != nil {
+		return err
+	}
 	job, created, err := d.enqueueJob(ctx, workflow.JobRequest{
 		ID:           jobID(d.Repo, pull.Number, comment.ID, sequence, command.Agent, command.Action),
 		Agent:        agent.Name,
@@ -297,8 +317,9 @@ func (d Daemon) handleCommand(ctx context.Context, pull github.PullRequest, comm
 		Repo:         d.Repo.FullName(),
 		Branch:       pull.HeadRef,
 		PullRequest:  int(pull.Number),
-		TaskID:       fmt.Sprintf("pr-%d-comment-%d", pull.Number, comment.ID),
-		TaskTitle:    pull.Title,
+		GoalID:       ref.goalID,
+		TaskID:       ref.id,
+		TaskTitle:    ref.title,
 		Sender:       comment.Author,
 		Instructions: command.Instructions,
 		Constraints: []string{
@@ -320,6 +341,39 @@ func (d Daemon) handleCommand(ctx context.Context, pull github.PullRequest, comm
 		}
 	}
 	return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot queued `%s` job `%s` for `%s`.", command.Action, job.ID, agent.Name))
+}
+
+func (d Daemon) commentTaskRef(ctx context.Context, pull github.PullRequest, comment github.IssueComment) (workflowTaskRef, error) {
+	ref := workflowTaskRef{
+		id:     fmt.Sprintf("pr-%d-comment-%d", pull.Number, comment.ID),
+		title:  pull.Title,
+		branch: pull.HeadRef,
+	}
+	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ref, nil
+		}
+		return workflowTaskRef{}, err
+	}
+	ref.id = task.ID
+	ref.goalID = task.GoalID
+	ref.title = task.Title
+	if task.Branch != "" {
+		ref.branch = task.Branch
+	}
+	return ref, nil
+}
+
+func (d Daemon) agentOwnsBranchLock(ctx context.Context, agentName string, branch string) (bool, error) {
+	lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), branch)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return lock.Owner == agentName, nil
 }
 
 func (d Daemon) authorizeCommenter(ctx context.Context, author string) (bool, error) {
