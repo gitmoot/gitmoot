@@ -34,16 +34,20 @@ type PullRequestEvent struct {
 }
 
 type MergeRequest struct {
-	Repo        string
-	Branch      string
-	PullRequest int
-	TaskID      string
-	Reviewer    string
+	Repo           string
+	Branch         string
+	PullRequest    int
+	HeadSHA        string
+	TaskID         string
+	Reviewer       string
+	ReviewOptional bool
 }
 
 type MergeDecision struct {
-	Ready  bool
-	Reason string
+	Ready          bool
+	Merged         bool
+	MergeCommitSHA string
+	Reason         string
 }
 
 type MergeGate interface {
@@ -82,16 +86,21 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 		reviewers = compactStrings(append([]string{}, e.RequiredReviewers...))
 	}
 	if len(reviewers) == 0 {
-		if err := e.runMergeGate(ctx, "", JobPayload{
+		decision, err := e.runMergeGate(ctx, "", JobPayload{
 			Repo:        event.Repo,
 			Branch:      event.Branch,
 			PullRequest: event.PullRequest,
+			HeadSHA:     event.HeadSHA,
 			GoalID:      event.GoalID,
 			TaskID:      event.TaskID,
 			TaskTitle:   event.TaskTitle,
 			LeadAgent:   event.LeadAgent,
-		}, ref); err != nil {
+		}, ref)
+		if err != nil {
 			return err
+		}
+		if decision.Merged {
+			return nil
 		}
 		return e.recordPullRequestBaseline(ctx, event)
 	}
@@ -107,6 +116,7 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 			Repo:        event.Repo,
 			Branch:      event.Branch,
 			PullRequest: event.PullRequest,
+			HeadSHA:     event.HeadSHA,
 			GoalID:      event.GoalID,
 			TaskID:      event.TaskID,
 			TaskTitle:   event.TaskTitle,
@@ -136,6 +146,27 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 		return err
 	}
 	return e.recordPullRequestBaseline(ctx, event)
+}
+
+func (e Engine) HandlePullRequestReadyToMerge(ctx context.Context, event PullRequestEvent) error {
+	if err := e.validate(); err != nil {
+		return err
+	}
+	if err := validatePullRequestEvent(event); err != nil {
+		return err
+	}
+	ref := taskRefFromPullRequest(event)
+	_, err := e.runMergeGate(ctx, "", JobPayload{
+		Repo:        event.Repo,
+		Branch:      event.Branch,
+		PullRequest: event.PullRequest,
+		HeadSHA:     event.HeadSHA,
+		GoalID:      event.GoalID,
+		TaskID:      event.TaskID,
+		TaskTitle:   event.TaskTitle,
+		LeadAgent:   event.LeadAgent,
+	}, ref)
+	return err
 }
 
 func (e Engine) RunJob(ctx context.Context, jobID string, agent runtime.Agent, adapter DeliveryAdapter) (AgentResult, error) {
@@ -206,6 +237,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 			Repo:              payload.Repo,
 			Branch:            payload.Branch,
 			PullRequest:       payload.PullRequest,
+			HeadSHA:           payload.HeadSHA,
 			GoalID:            payload.GoalID,
 			TaskID:            payload.TaskID,
 			TaskTitle:         payload.TaskTitle,
@@ -229,7 +261,8 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 			if !ready {
 				return e.setReviewingIfNotChangesRequested(ctx, ref)
 			}
-			return e.runMergeGate(ctx, job.Agent, payload, ref)
+			_, err = e.runMergeGate(ctx, job.Agent, payload, ref)
+			return err
 		}
 	}
 	return nil
@@ -284,6 +317,7 @@ func (e Engine) dispatchFix(ctx context.Context, reviewer string, payload JobPay
 		Repo:        payload.Repo,
 		Branch:      payload.Branch,
 		PullRequest: payload.PullRequest,
+		HeadSHA:     payload.HeadSHA,
 		GoalID:      payload.GoalID,
 		TaskID:      payload.TaskID,
 		TaskTitle:   payload.TaskTitle,
@@ -324,6 +358,7 @@ func (e Engine) dispatchNextAgents(ctx context.Context, payload JobPayload, resu
 			Repo:         payload.Repo,
 			Branch:       payload.Branch,
 			PullRequest:  payload.PullRequest,
+			HeadSHA:      payload.HeadSHA,
 			GoalID:       payload.GoalID,
 			TaskID:       payload.TaskID,
 			TaskTitle:    payload.TaskTitle,
@@ -532,28 +567,60 @@ func (e Engine) ensureBranchLock(ctx context.Context, repo string, branch string
 	return nil
 }
 
-func (e Engine) runMergeGate(ctx context.Context, reviewer string, payload JobPayload, ref taskRef) error {
+func (e Engine) runMergeGate(ctx context.Context, reviewer string, payload JobPayload, ref taskRef) (MergeDecision, error) {
 	if e.MergeGate == nil {
-		return e.setTaskState(ctx, ref, TaskReadyToMerge)
+		return MergeDecision{Ready: true}, e.setTaskState(ctx, ref, TaskReadyToMerge)
+	}
+	reviewRequired, err := e.mergeGateReviewRequired(ctx, payload)
+	if err != nil {
+		return MergeDecision{}, err
 	}
 	decision, err := e.MergeGate.Evaluate(ctx, MergeRequest{
-		Repo:        payload.Repo,
-		Branch:      payload.Branch,
-		PullRequest: payload.PullRequest,
-		TaskID:      payload.TaskID,
-		Reviewer:    reviewer,
+		Repo:           payload.Repo,
+		Branch:         payload.Branch,
+		PullRequest:    payload.PullRequest,
+		HeadSHA:        payload.HeadSHA,
+		TaskID:         payload.TaskID,
+		Reviewer:       reviewer,
+		ReviewOptional: !reviewRequired,
 	})
 	if err != nil {
-		return err
+		return MergeDecision{}, err
 	}
 	if !decision.Ready {
 		reason := strings.TrimSpace(decision.Reason)
 		if reason == "" {
 			reason = "merge gate rejected action"
 		}
-		return e.block(ctx, ref, reason)
+		return decision, e.block(ctx, ref, reason)
 	}
-	return e.setTaskState(ctx, ref, TaskReadyToMerge)
+	if decision.Merged {
+		return decision, e.setTaskState(ctx, ref, TaskMerged)
+	}
+	return decision, e.setTaskState(ctx, ref, TaskReadyToMerge)
+}
+
+func (e Engine) mergeGateReviewRequired(ctx context.Context, payload JobPayload) (bool, error) {
+	if len(e.requiredReviewers(payload)) > 0 {
+		return true, nil
+	}
+	jobs, err := e.Store.ListJobs(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, job := range jobs {
+		if job.Type != "review" {
+			continue
+		}
+		jobPayload, err := unmarshalPayload(job.Payload)
+		if err != nil {
+			return false, err
+		}
+		if sameTask(payload, jobPayload) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (e Engine) recordPullRequestBaseline(ctx context.Context, event PullRequestEvent) error {

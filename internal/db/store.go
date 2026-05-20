@@ -50,13 +50,14 @@ type Task struct {
 }
 
 type PullRequest struct {
-	RepoFullName string
-	Number       int64
-	URL          string
-	HeadBranch   string
-	BaseBranch   string
-	HeadSHA      string
-	State        string
+	RepoFullName   string
+	Number         int64
+	URL            string
+	HeadBranch     string
+	BaseBranch     string
+	HeadSHA        string
+	MergeCommitSHA string
+	State          string
 }
 
 type Comment struct {
@@ -272,6 +273,26 @@ func (s *Store) GetTaskByRepoBranch(ctx context.Context, repoFullName string, br
 	return scanTask(row)
 }
 
+func (s *Store) ListTasksByRepoState(ctx context.Context, repoFullName string, state string) ([]Task, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, repo_full_name, goal_id, title, state, branch
+		FROM tasks
+		WHERE repo_full_name = ? AND state = ?
+		ORDER BY id`, repoFullName, state)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	tasks := []Task{}
+	for rows.Next() {
+		task, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, task)
+	}
+	return tasks, rows.Err()
+}
+
 func scanTask(row interface{ Scan(dest ...any) error }) (Task, error) {
 	var task Task
 	if err := row.Scan(&task.ID, &task.RepoFullName, &task.GoalID, &task.Title, &task.State, &task.Branch); err != nil {
@@ -281,24 +302,35 @@ func scanTask(row interface{ Scan(dest ...any) error }) (Task, error) {
 }
 
 func (s *Store) UpsertPullRequest(ctx context.Context, pr PullRequest) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO pull_requests(repo_full_name, number, url, head_branch, base_branch, head_sha, state, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO pull_requests(repo_full_name, number, url, head_branch, base_branch, head_sha, merge_commit_sha, state, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(repo_full_name, number) DO UPDATE SET
 			url = excluded.url,
 			head_branch = excluded.head_branch,
 			base_branch = excluded.base_branch,
 			head_sha = excluded.head_sha,
+			merge_commit_sha = excluded.merge_commit_sha,
 			state = excluded.state,
 			updated_at = CURRENT_TIMESTAMP`,
-		pr.RepoFullName, pr.Number, pr.URL, pr.HeadBranch, pr.BaseBranch, pr.HeadSHA, pr.State)
+		pr.RepoFullName, pr.Number, pr.URL, pr.HeadBranch, pr.BaseBranch, pr.HeadSHA, pr.MergeCommitSHA, pr.State)
 	return err
 }
 
 func (s *Store) GetPullRequest(ctx context.Context, repoFullName string, number int64) (PullRequest, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT repo_full_name, number, url, head_branch, base_branch, head_sha, state
+	row := s.db.QueryRowContext(ctx, `SELECT repo_full_name, number, url, head_branch, base_branch, head_sha, merge_commit_sha, state
 		FROM pull_requests WHERE repo_full_name = ? AND number = ?`, repoFullName, number)
 	var pr PullRequest
-	if err := row.Scan(&pr.RepoFullName, &pr.Number, &pr.URL, &pr.HeadBranch, &pr.BaseBranch, &pr.HeadSHA, &pr.State); err != nil {
+	if err := row.Scan(&pr.RepoFullName, &pr.Number, &pr.URL, &pr.HeadBranch, &pr.BaseBranch, &pr.HeadSHA, &pr.MergeCommitSHA, &pr.State); err != nil {
+		return PullRequest{}, err
+	}
+	return pr, nil
+}
+
+func (s *Store) GetPullRequestByRepoBranch(ctx context.Context, repoFullName string, branch string) (PullRequest, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT repo_full_name, number, url, head_branch, base_branch, head_sha, merge_commit_sha, state
+		FROM pull_requests WHERE repo_full_name = ? AND head_branch = ? ORDER BY number DESC LIMIT 1`, repoFullName, branch)
+	var pr PullRequest
+	if err := row.Scan(&pr.RepoFullName, &pr.Number, &pr.URL, &pr.HeadBranch, &pr.BaseBranch, &pr.HeadSHA, &pr.MergeCommitSHA, &pr.State); err != nil {
 		return PullRequest{}, err
 	}
 	return pr, nil
@@ -710,5 +742,8 @@ SET branch = ''
 WHERE rowid IN (SELECT task_rowid FROM ranked_tasks WHERE branch_rank > 1);
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_branch_unique ON tasks(repo_full_name, branch) WHERE branch <> '';
+	`,
+	`
+ALTER TABLE pull_requests ADD COLUMN merge_commit_sha TEXT NOT NULL DEFAULT '';
 	`,
 }

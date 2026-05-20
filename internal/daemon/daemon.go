@@ -60,7 +60,9 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	openBranches := map[string]struct{}{}
 	for _, pull := range pulls {
+		openBranches[pull.HeadRef] = struct{}{}
 		changed, err := d.pullRequestChanged(ctx, pull)
 		if err != nil {
 			return err
@@ -71,11 +73,29 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 					firstErr = err
 				}
 				changed = false
+			} else {
+				merged, err := d.pullRequestStoredMerged(ctx, pull)
+				if err != nil {
+					return err
+				}
+				if merged {
+					changed = false
+				}
 			}
 		}
 		if changed {
 			if err := d.recordPullRequest(ctx, pull); err != nil {
 				return err
+			}
+		} else {
+			retry, err := d.pullRequestReadyToMerge(ctx, pull)
+			if err != nil {
+				return err
+			}
+			if retry {
+				if err := d.handleReadyToMergeWorkflow(ctx, pull); err != nil && firstErr == nil {
+					firstErr = err
+				}
 			}
 		}
 		comments, err := d.GitHub.ListIssueComments(ctx, d.Repo, pull.Number)
@@ -87,6 +107,9 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 				return err
 			}
 		}
+	}
+	if err := d.retryClosedReadyToMerge(ctx, openBranches); err != nil && firstErr == nil {
+		firstErr = err
 	}
 	return firstErr
 }
@@ -108,17 +131,14 @@ func (d Daemon) pullRequestChanged(ctx context.Context, pull github.PullRequest)
 	previous, err := d.Store.GetPullRequest(ctx, d.Repo.FullName(), pull.Number)
 	switch {
 	case err == nil:
-		if strings.TrimSpace(previous.HeadSHA) == "" {
-			routed, err := d.pullRequestWorkflowRouted(ctx, pull)
-			if err != nil {
-				return false, err
-			}
-			if routed {
-				return false, d.recordPullRequest(ctx, pull)
-			}
+		if previous.HeadSHA != pull.HeadSHA {
 			return true, nil
 		}
-		return previous.HeadSHA != pull.HeadSHA, nil
+		routing, err := d.pullRequestWorkflowRouting(ctx, pull)
+		if err != nil {
+			return false, err
+		}
+		return routing.stale, nil
 	case errors.Is(err, sql.ErrNoRows):
 		return true, nil
 	default:
@@ -126,18 +146,23 @@ func (d Daemon) pullRequestChanged(ctx context.Context, pull github.PullRequest)
 	}
 }
 
-func (d Daemon) pullRequestWorkflowRouted(ctx context.Context, pull github.PullRequest) (bool, error) {
+type pullRequestRouting struct {
+	stale bool
+}
+
+func (d Daemon) pullRequestWorkflowRouting(ctx context.Context, pull github.PullRequest) (pullRequestRouting, error) {
 	jobs, err := d.Store.ListJobs(ctx)
 	if err != nil {
-		return false, err
+		return pullRequestRouting{}, err
 	}
+	routing := pullRequestRouting{}
 	for _, job := range jobs {
 		if job.Type != "review" {
 			continue
 		}
 		var payload workflow.JobPayload
 		if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
-			return false, fmt.Errorf("parse job payload %q: %w", job.ID, err)
+			return pullRequestRouting{}, fmt.Errorf("parse job payload %q: %w", job.ID, err)
 		}
 		if payload.Repo == d.Repo.FullName() &&
 			payload.PullRequest == int(pull.Number) &&
@@ -145,10 +170,13 @@ func (d Daemon) pullRequestWorkflowRouted(ctx context.Context, pull github.PullR
 			strings.TrimSpace(payload.LeadAgent) != "" &&
 			strings.TrimSpace(payload.ReviewRound) != "" &&
 			len(payload.Reviewers) > 0 {
-			return true, nil
+			if strings.TrimSpace(payload.HeadSHA) == pull.HeadSHA {
+				return pullRequestRouting{}, nil
+			}
+			routing.stale = true
 		}
 	}
-	return false, nil
+	return routing, nil
 }
 
 func (d Daemon) recordPullRequest(ctx context.Context, pull github.PullRequest) error {
@@ -161,6 +189,17 @@ func (d Daemon) recordPullRequest(ctx context.Context, pull github.PullRequest) 
 		HeadSHA:      pull.HeadSHA,
 		State:        pull.State,
 	})
+}
+
+func (d Daemon) pullRequestStoredMerged(ctx context.Context, pull github.PullRequest) (bool, error) {
+	stored, err := d.Store.GetPullRequest(ctx, d.Repo.FullName(), pull.Number)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return strings.TrimSpace(stored.State) == "merged", nil
 }
 
 func (d Daemon) handlePullRequestWorkflow(ctx context.Context, pull github.PullRequest) error {
@@ -205,6 +244,105 @@ func (d Daemon) handlePullRequestWorkflow(ctx context.Context, pull github.PullR
 		Sender:            "github",
 		RequiredReviewers: reviewers,
 	})
+}
+
+func (d Daemon) pullRequestReadyToMerge(ctx context.Context, pull github.PullRequest) (bool, error) {
+	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return task.State == string(workflow.TaskReadyToMerge), nil
+}
+
+func (d Daemon) handleReadyToMergeWorkflow(ctx context.Context, pull github.PullRequest) error {
+	if d.Workflow == nil {
+		return nil
+	}
+	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	if err != nil {
+		return err
+	}
+	lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	leadAgent := strings.TrimSpace(lock.Owner)
+	if leadAgent == "" {
+		leadAgent = "github"
+	}
+	branch := task.Branch
+	if branch == "" {
+		branch = pull.HeadRef
+	}
+	return d.Workflow.HandlePullRequestReadyToMerge(ctx, workflow.PullRequestEvent{
+		Repo:        d.Repo.FullName(),
+		Branch:      branch,
+		PullRequest: int(pull.Number),
+		HeadSHA:     pull.HeadSHA,
+		GoalID:      task.GoalID,
+		TaskID:      task.ID,
+		TaskTitle:   task.Title,
+		LeadAgent:   leadAgent,
+		Sender:      "github",
+	})
+}
+
+func (d Daemon) retryClosedReadyToMerge(ctx context.Context, openBranches map[string]struct{}) error {
+	tasks, err := d.Store.ListTasksByRepoState(ctx, d.Repo.FullName(), string(workflow.TaskReadyToMerge))
+	if err != nil {
+		return err
+	}
+	if len(tasks) == 0 {
+		return nil
+	}
+	type readyPullRequest struct {
+		number  int64
+		headSHA string
+	}
+	readyBranches := map[string]readyPullRequest{}
+	for _, task := range tasks {
+		if task.Branch == "" {
+			continue
+		}
+		if _, open := openBranches[task.Branch]; open {
+			continue
+		}
+		stored, err := d.Store.GetPullRequestByRepoBranch(ctx, d.Repo.FullName(), task.Branch)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return err
+		}
+		readyBranches[task.Branch] = readyPullRequest{number: stored.Number, headSHA: stored.HeadSHA}
+	}
+	if len(readyBranches) == 0 {
+		return nil
+	}
+	closed, err := d.GitHub.ListPullRequests(ctx, d.Repo, "closed")
+	if err != nil {
+		return err
+	}
+	for _, pull := range closed {
+		ready, ok := readyBranches[pull.HeadRef]
+		if !ok {
+			continue
+		}
+		if pull.Number != ready.number {
+			continue
+		}
+		if ready.headSHA != "" && pull.HeadSHA != ready.headSHA {
+			continue
+		}
+		if err := d.handleReadyToMergeWorkflow(ctx, pull); err != nil {
+			return err
+		}
+		delete(readyBranches, pull.HeadRef)
+	}
+	return nil
 }
 
 func (d Daemon) lookupPullRequestTask(ctx context.Context, repoFullName string, branch string) (db.Task, error) {
@@ -317,6 +455,7 @@ func (d Daemon) handleCommand(ctx context.Context, pull github.PullRequest, comm
 		Repo:         d.Repo.FullName(),
 		Branch:       pull.HeadRef,
 		PullRequest:  int(pull.Number),
+		HeadSHA:      pull.HeadSHA,
 		GoalID:       ref.goalID,
 		TaskID:       ref.id,
 		TaskTitle:    ref.title,

@@ -98,6 +98,13 @@ func TestRepositoryMethods(t *testing.T) {
 	if pr.HeadSHA != "abc123" {
 		t.Fatalf("pull request head sha = %q, want abc123", pr.HeadSHA)
 	}
+	byBranch, err := store.GetPullRequestByRepoBranch(ctx, "jerryfane/gitmoot", "task")
+	if err != nil {
+		t.Fatalf("GetPullRequestByRepoBranch returned error: %v", err)
+	}
+	if byBranch.Number != 1 || byBranch.HeadSHA != "abc123" {
+		t.Fatalf("pull request by branch = %+v", byBranch)
+	}
 	if err := store.MarkCommentSeen(ctx, Comment{RepoFullName: "jerryfane/gitmoot", CommentID: 100, PullRequest: 1, Body: "/gitmoot audit review"}); err != nil {
 		t.Fatalf("MarkCommentSeen returned error: %v", err)
 	}

@@ -119,8 +119,55 @@ func TestEngineHandlePullRequestOpenedRunsMergeGateWithoutReviewers(t *testing.T
 		t.Fatalf("error = %v, want merge gate BlockedError", err)
 	}
 	assertTaskState(t, store, "task-7", TaskBlocked)
-	if len(gate.requests) != 1 || gate.requests[0].Reviewer != "" || gate.requests[0].PullRequest != 7 {
+	if len(gate.requests) != 1 || gate.requests[0].Reviewer != "" || gate.requests[0].PullRequest != 7 || !gate.requests[0].ReviewOptional {
 		t.Fatalf("merge gate requests = %+v", gate.requests)
+	}
+}
+
+func TestEngineHandlePullRequestOpenedDoesNotOverwriteNoReviewerMerge(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+	gate := &fakeMergeGate{
+		decision: MergeDecision{Ready: true, Merged: true, MergeCommitSHA: "merge123"},
+		onEvaluate: func(request MergeRequest) {
+			if err := store.UpsertPullRequest(ctx, db.PullRequest{
+				RepoFullName:   request.Repo,
+				Number:         int64(request.PullRequest),
+				URL:            "https://github.com/jerryfane/gitmoot/pull/7",
+				HeadBranch:     request.Branch,
+				BaseBranch:     "main",
+				HeadSHA:        request.HeadSHA,
+				MergeCommitSHA: "merge123",
+				State:          "merged",
+			}); err != nil {
+				t.Fatalf("UpsertPullRequest returned error: %v", err)
+			}
+		},
+	}
+	engine.MergeGate = gate
+
+	err := engine.HandlePullRequestOpened(ctx, PullRequestEvent{
+		Repo:        "jerryfane/gitmoot",
+		Branch:      "task-7",
+		PullRequest: 7,
+		HeadSHA:     "head123",
+		TaskID:      "task-7",
+		TaskTitle:   "Workflow Engine",
+		LeadAgent:   "lead",
+	})
+
+	if err != nil {
+		t.Fatalf("HandlePullRequestOpened returned error: %v", err)
+	}
+	assertTaskState(t, store, "task-7", TaskMerged)
+	pr, err := store.GetPullRequest(ctx, "jerryfane/gitmoot", 7)
+	if err != nil {
+		t.Fatalf("GetPullRequest returned error: %v", err)
+	}
+	if pr.State != "merged" || pr.MergeCommitSHA != "merge123" {
+		t.Fatalf("stored pull request = %+v", pr)
 	}
 }
 
@@ -355,7 +402,7 @@ func TestEngineAdvanceReviewApprovalRunsMergeGate(t *testing.T) {
 		t.Fatalf("AdvanceJob returned error: %v", err)
 	}
 	assertTaskState(t, store, "task-7", TaskReadyToMerge)
-	if len(gate.requests) != 1 || gate.requests[0].Reviewer != "audit" || gate.requests[0].PullRequest != 7 {
+	if len(gate.requests) != 1 || gate.requests[0].Reviewer != "audit" || gate.requests[0].PullRequest != 7 || gate.requests[0].ReviewOptional {
 		t.Fatalf("merge gate requests = %+v", gate.requests)
 	}
 }
@@ -1045,11 +1092,15 @@ func mustJob(t *testing.T, store *db.Store, jobID string) db.Job {
 }
 
 type fakeMergeGate struct {
-	decision MergeDecision
-	requests []MergeRequest
+	decision   MergeDecision
+	onEvaluate func(MergeRequest)
+	requests   []MergeRequest
 }
 
 func (f *fakeMergeGate) Evaluate(_ context.Context, request MergeRequest) (MergeDecision, error) {
 	f.requests = append(f.requests, request)
+	if f.onEvaluate != nil {
+		f.onEvaluate(request)
+	}
 	return f.decision, nil
 }

@@ -14,7 +14,7 @@ import (
 )
 
 func TestClientUsesSharedSubprocessRunner(t *testing.T) {
-	runner := &fakeRunner{results: []subprocess.Result{{}, {Stdout: "task-1\n"}}}
+	runner := &fakeRunner{results: []subprocess.Result{{}, {Stdout: "task-1\n"}, {}, {Stdout: "/repo\n"}, {Stdout: "https://github.com/jerryfane/gitmoot.git\n"}, {}, {}, {}}}
 	client := Client{Runner: runner, Dir: "/repo"}
 
 	if err := client.CreateBranch(context.Background(), "task-1", "main"); err != nil {
@@ -30,10 +30,40 @@ func TestClientUsesSharedSubprocessRunner(t *testing.T) {
 	if err := client.PushBranch(context.Background(), "origin", "task-1"); err != nil {
 		t.Fatalf("PushBranch returned error: %v", err)
 	}
+	root, err := client.Root(context.Background())
+	if err != nil {
+		t.Fatalf("Root returned error: %v", err)
+	}
+	if root != "/repo" {
+		t.Fatalf("root = %q, want /repo", root)
+	}
+	remote, err := client.OriginRemote(context.Background())
+	if err != nil {
+		t.Fatalf("OriginRemote returned error: %v", err)
+	}
+	if remote != "https://github.com/jerryfane/gitmoot.git" {
+		t.Fatalf("remote = %q", remote)
+	}
+	clean, err := client.WorktreeClean(context.Background())
+	if err != nil {
+		t.Fatalf("WorktreeClean returned error: %v", err)
+	}
+	if !clean {
+		t.Fatal("WorktreeClean reported dirty worktree")
+	}
+	if err := client.UpdateBase(context.Background(), "origin", "main"); err != nil {
+		t.Fatalf("UpdateBase returned error: %v", err)
+	}
 
 	runner.wantArgs(t, 0, "git", "switch", "-c", "task-1", "main")
 	runner.wantArgs(t, 1, "git", "branch", "--show-current")
 	runner.wantArgs(t, 2, "git", "push", "-u", "origin", "task-1")
+	runner.wantArgs(t, 3, "git", "rev-parse", "--show-toplevel")
+	runner.wantArgs(t, 4, "git", "remote", "get-url", "origin")
+	runner.wantArgs(t, 5, "git", "status", "--porcelain")
+	runner.wantArgs(t, 6, "git", "fetch", "origin", "main")
+	runner.wantArgs(t, 7, "git", "switch", "main")
+	runner.wantArgs(t, 8, "git", "pull", "--ff-only", "origin", "main")
 }
 
 func TestClientRejectsUnsafeBranchNames(t *testing.T) {
@@ -70,6 +100,40 @@ func TestClientCreateBranchSmoke(t *testing.T) {
 	}
 	if branch != "task-branch" {
 		t.Fatalf("branch = %q, want task-branch", branch)
+	}
+}
+
+func TestClientWorktreeCleanSmoke(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	runGit(t, dir, "init", "-b", "main")
+	runGit(t, dir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, dir, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# smoke\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runGit(t, dir, "add", "README.md")
+	runGit(t, dir, "commit", "-m", "init")
+
+	client := Client{Dir: dir}
+	clean, err := client.WorktreeClean(context.Background())
+	if err != nil {
+		t.Fatalf("WorktreeClean returned error: %v", err)
+	}
+	if !clean {
+		t.Fatal("new repository should be clean")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile dirty returned error: %v", err)
+	}
+	clean, err = client.WorktreeClean(context.Background())
+	if err != nil {
+		t.Fatalf("dirty WorktreeClean returned error: %v", err)
+	}
+	if clean {
+		t.Fatal("WorktreeClean did not report untracked file")
 	}
 }
 

@@ -129,6 +129,44 @@ func TestCreateCommitStatusUsesStatusesEndpoint(t *testing.T) {
 	)
 }
 
+func TestGetPullRequestDecodesBaseSHA(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{
+			Stdout: `{"number": 2, "title": "Task", "state": "open", "html_url": "https://github.com/jerryfane/gitmoot/pull/2", "head": {"ref": "task", "sha": "head123"}, "base": {"ref": "main", "sha": "base123"}}`,
+		}},
+	}
+	client := GhClient{Runner: runner}
+
+	pr, err := client.GetPullRequest(context.Background(), Repository{Owner: "jerryfane", Name: "gitmoot"}, 2)
+
+	if err != nil {
+		t.Fatalf("GetPullRequest returned error: %v", err)
+	}
+	if pr.HeadSHA != "head123" || pr.BaseSHA != "base123" {
+		t.Fatalf("pull request = %+v", pr)
+	}
+	runner.wantArgs(t, 0, "api", "repos/jerryfane/gitmoot/pulls/2")
+}
+
+func TestCompareCommitsUsesEscapedCompareEndpoint(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{
+			Stdout: `{"status": "ahead", "ahead_by": 3, "behind_by": 0}`,
+		}},
+	}
+	client := GhClient{Runner: runner}
+
+	compare, err := client.CompareCommits(context.Background(), Repository{Owner: "jerryfane", Name: "gitmoot"}, "release/1.0", "head123")
+
+	if err != nil {
+		t.Fatalf("CompareCommits returned error: %v", err)
+	}
+	if compare.Status != "ahead" || compare.AheadBy != 3 || compare.BehindBy != 0 {
+		t.Fatalf("compare = %+v", compare)
+	}
+	runner.wantArgs(t, 0, "api", "repos/jerryfane/gitmoot/compare/release%2F1.0...head123")
+}
+
 func TestListPullRequestChecksUsesGhChecksOutput(t *testing.T) {
 	runner := &fakeRunner{
 		results: []subprocess.Result{{
@@ -194,7 +232,10 @@ func TestListPullRequestChecksTreatsNoChecksAsEmpty(t *testing.T) {
 }
 
 func TestMergePullRequestUsesSafeHeadMatch(t *testing.T) {
-	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "merged"}}}
+	runner := &fakeRunner{results: []subprocess.Result{
+		{Stdout: "merged"},
+		{Stdout: `{"number": 2, "title": "Task", "state": "closed", "merged": true, "html_url": "https://github.com/jerryfane/gitmoot/pull/2", "merge_commit_sha": "merge123", "head": {"ref": "task", "sha": "abc123"}, "base": {"ref": "main"}}`},
+	}}
 	client := GhClient{Runner: runner}
 
 	result, err := client.MergePullRequest(context.Background(), MergePullRequestInput{
@@ -209,7 +250,7 @@ func TestMergePullRequestUsesSafeHeadMatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MergePullRequest returned error: %v", err)
 	}
-	if !result.Merged {
+	if !result.Merged || result.SHA != "merge123" {
 		t.Fatalf("merge result = %+v", result)
 	}
 	runner.wantArgs(t, 0,
@@ -220,6 +261,49 @@ func TestMergePullRequestUsesSafeHeadMatch(t *testing.T) {
 		"--match-head-commit", "abc123",
 		"--delete-branch",
 	)
+	runner.wantArgs(t, 1, "api", "repos/jerryfane/gitmoot/pulls/2")
+}
+
+func TestMergePullRequestRequiresConfirmedMergedState(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{
+			{Stdout: "merged"},
+			{Stderr: "HTTP 502"},
+		},
+		errs: []error{nil, errors.New("exit status 1")},
+	}
+	client := GhClient{Runner: runner}
+
+	result, err := client.MergePullRequest(context.Background(), MergePullRequestInput{
+		Repo:            Repository{Owner: "jerryfane", Name: "gitmoot"},
+		Number:          2,
+		MatchHeadCommit: "abc123",
+	})
+
+	if err == nil || !strings.Contains(err.Error(), "fetch merged pull request") {
+		t.Fatalf("error = %v, want fetch confirmation error; result=%+v", err, result)
+	}
+}
+
+func TestMergePullRequestReportsQueuedMergeAsPending(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{
+		{Stdout: "queued"},
+		{Stdout: `{"number": 2, "title": "Task", "state": "open", "html_url": "https://github.com/jerryfane/gitmoot/pull/2", "merge_commit_sha": "synthetic", "head": {"ref": "task", "sha": "abc123"}, "base": {"ref": "main"}}`},
+	}}
+	client := GhClient{Runner: runner}
+
+	result, err := client.MergePullRequest(context.Background(), MergePullRequestInput{
+		Repo:            Repository{Owner: "jerryfane", Name: "gitmoot"},
+		Number:          2,
+		MatchHeadCommit: "abc123",
+	})
+
+	if err != nil {
+		t.Fatalf("MergePullRequest returned error: %v", err)
+	}
+	if result.Merged || !strings.Contains(result.Message, "pending") {
+		t.Fatalf("merge result = %+v", result)
+	}
 }
 
 func TestRateLimitBackoffRetries(t *testing.T) {
