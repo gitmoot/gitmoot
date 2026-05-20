@@ -608,11 +608,12 @@ func (e Engine) setTaskState(ctx context.Context, ref taskRef, state TaskState) 
 		return nil
 	}
 	task := db.Task{
-		ID:     ref.ID,
-		GoalID: ref.GoalID,
-		Title:  ref.Title,
-		State:  string(state),
-		Branch: ref.Branch,
+		ID:           ref.ID,
+		RepoFullName: ref.Repo,
+		GoalID:       ref.GoalID,
+		Title:        ref.Title,
+		State:        string(state),
+		Branch:       ref.Branch,
 	}
 	existing, err := e.Store.GetTask(ctx, ref.ID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -621,6 +622,9 @@ func (e Engine) setTaskState(ctx context.Context, ref taskRef, state TaskState) 
 	if err == nil {
 		if task.GoalID == "" {
 			task.GoalID = existing.GoalID
+		}
+		if task.RepoFullName == "" {
+			task.RepoFullName = existing.RepoFullName
 		}
 		if task.Title == "" {
 			task.Title = existing.Title
@@ -655,6 +659,7 @@ func (e Engine) jobID(request JobRequest) string {
 
 type taskRef struct {
 	ID     string
+	Repo   string
 	GoalID string
 	Title  string
 	Branch string
@@ -663,6 +668,7 @@ type taskRef struct {
 func taskRefFromPullRequest(event PullRequestEvent) taskRef {
 	return taskRef{
 		ID:     event.TaskID,
+		Repo:   event.Repo,
 		GoalID: event.GoalID,
 		Title:  event.TaskTitle,
 		Branch: event.Branch,
@@ -672,6 +678,7 @@ func taskRefFromPullRequest(event PullRequestEvent) taskRef {
 func taskRefFromPayload(payload JobPayload) taskRef {
 	return taskRef{
 		ID:     payload.TaskID,
+		Repo:   payload.Repo,
 		GoalID: payload.GoalID,
 		Title:  payload.TaskTitle,
 		Branch: payload.Branch,

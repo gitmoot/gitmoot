@@ -41,11 +41,12 @@ type Goal struct {
 }
 
 type Task struct {
-	ID     string
-	GoalID string
-	Title  string
-	State  string
-	Branch string
+	ID           string
+	RepoFullName string
+	GoalID       string
+	Title        string
+	State        string
+	Branch       string
 }
 
 type PullRequest struct {
@@ -234,32 +235,46 @@ func (s *Store) InsertGoal(ctx context.Context, goal Goal) error {
 }
 
 func (s *Store) UpsertTask(ctx context.Context, task Task) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO tasks(id, goal_id, title, state, branch, updated_at)
-		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
+			repo_full_name = excluded.repo_full_name,
 			goal_id = excluded.goal_id,
 			title = excluded.title,
 			state = excluded.state,
 			branch = excluded.branch,
 			updated_at = CURRENT_TIMESTAMP`,
-		task.ID, task.GoalID, task.Title, task.State, task.Branch)
+		task.ID, task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch)
 	return err
 }
 
 func (s *Store) GetTask(ctx context.Context, id string) (Task, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, goal_id, title, state, branch FROM tasks WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, repo_full_name, goal_id, title, state, branch FROM tasks WHERE id = ?`, id)
 	var task Task
-	if err := row.Scan(&task.ID, &task.GoalID, &task.Title, &task.State, &task.Branch); err != nil {
+	if err := row.Scan(&task.ID, &task.RepoFullName, &task.GoalID, &task.Title, &task.State, &task.Branch); err != nil {
 		return Task{}, err
 	}
 	return task, nil
 }
 
 func (s *Store) GetTaskByBranch(ctx context.Context, branch string) (Task, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, goal_id, title, state, branch
+	row := s.db.QueryRowContext(ctx, `SELECT id, repo_full_name, goal_id, title, state, branch
 		FROM tasks WHERE branch = ? ORDER BY updated_at DESC, id LIMIT 1`, branch)
+	return scanTask(row)
+}
+
+func (s *Store) GetTaskByRepoBranch(ctx context.Context, repoFullName string, branch string) (Task, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, repo_full_name, goal_id, title, state, branch
+		FROM tasks
+		WHERE branch = ? AND (repo_full_name = ? OR repo_full_name = '')
+		ORDER BY CASE WHEN repo_full_name = ? THEN 0 ELSE 1 END, updated_at DESC, id
+		LIMIT 1`, branch, repoFullName, repoFullName)
+	return scanTask(row)
+}
+
+func scanTask(row interface{ Scan(dest ...any) error }) (Task, error) {
 	var task Task
-	if err := row.Scan(&task.ID, &task.GoalID, &task.Title, &task.State, &task.Branch); err != nil {
+	if err := row.Scan(&task.ID, &task.RepoFullName, &task.GoalID, &task.Title, &task.State, &task.Branch); err != nil {
 		return Task{}, err
 	}
 	return task, nil
@@ -473,14 +488,12 @@ func (s *Store) ListJobEvents(ctx context.Context, jobID string) ([]JobEvent, er
 }
 
 func (s *Store) AcquireLock(ctx context.Context, lock BranchLock) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO branch_locks(repo_full_name, branch, owner, updated_at)
-		VALUES (?, ?, ?, CURRENT_TIMESTAMP)`, lock.RepoFullName, lock.Branch, lock.Owner)
+	created, err := s.CreateLock(ctx, lock)
 	if err != nil {
 		return false, err
 	}
-	affected, err := result.RowsAffected()
-	if err != nil || affected == 1 {
-		return affected == 1, err
+	if created {
+		return true, nil
 	}
 
 	var owner string
@@ -491,6 +504,19 @@ func (s *Store) AcquireLock(ctx context.Context, lock BranchLock) (bool, error) 
 	return owner == lock.Owner, nil
 }
 
+func (s *Store) CreateLock(ctx context.Context, lock BranchLock) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO branch_locks(repo_full_name, branch, owner, updated_at)
+		VALUES (?, ?, ?, CURRENT_TIMESTAMP)`, lock.RepoFullName, lock.Branch, lock.Owner)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
+}
+
 func (s *Store) GetBranchLock(ctx context.Context, repoFullName string, branch string) (BranchLock, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT repo_full_name, branch, owner FROM branch_locks WHERE repo_full_name = ? AND branch = ?`, repoFullName, branch)
 	var lock BranchLock
@@ -498,6 +524,18 @@ func (s *Store) GetBranchLock(ctx context.Context, repoFullName string, branch s
 		return BranchLock{}, err
 	}
 	return lock, nil
+}
+
+func (s *Store) ReleaseLock(ctx context.Context, lock BranchLock) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM branch_locks WHERE repo_full_name = ? AND branch = ? AND owner = ?`, lock.RepoFullName, lock.Branch, lock.Owner)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
 }
 
 func (s *Store) UpsertMergeGate(ctx context.Context, gate MergeGate) error {
@@ -657,5 +695,20 @@ CREATE TABLE merge_gates (
 `,
 	`
 ALTER TABLE pull_requests ADD COLUMN head_sha TEXT NOT NULL DEFAULT '';
-`,
+	`,
+	`
+ALTER TABLE tasks ADD COLUMN repo_full_name TEXT NOT NULL DEFAULT '';
+
+WITH ranked_tasks AS (
+	SELECT rowid AS task_rowid,
+		ROW_NUMBER() OVER (PARTITION BY repo_full_name, branch ORDER BY updated_at DESC, id) AS branch_rank
+	FROM tasks
+	WHERE branch <> ''
+)
+UPDATE tasks
+SET branch = ''
+WHERE rowid IN (SELECT task_rowid FROM ranked_tasks WHERE branch_rank > 1);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_branch_unique ON tasks(repo_full_name, branch) WHERE branch <> '';
+	`,
 }
