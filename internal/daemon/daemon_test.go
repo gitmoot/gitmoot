@@ -1110,6 +1110,244 @@ func TestPollOnceReportsStatusCommand(t *testing.T) {
 	}
 }
 
+func TestPollOnceRetriesJobFromComment(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo:        repo.FullName(),
+		Branch:      "task-10",
+		PullRequest: 10,
+		TaskID:      "task-010",
+		RawOutputs:  []string{"raw"},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-retry", Agent: "audit", Type: "review", State: string(workflow.JobFailed), Payload: string(payload)}, db.JobEvent{
+		Kind:    string(workflow.JobFailed),
+		Message: "failed",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{Number: 10, Title: "Task 10", State: "open", HeadRef: "task-10", BaseRef: "main", HeadSHA: "abc123"}},
+		comments: map[int64][]github.IssueComment{
+			10: {{ID: 920, Body: "/gitmoot retry job-retry", Author: "dana"}},
+		},
+	}
+
+	err = (Daemon{Repo: repo, Store: store, GitHub: client}).PollOnce(ctx)
+
+	if err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	job, err := store.GetJob(ctx, "job-retry")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobQueued) || !strings.Contains(job.Payload, `"raw_outputs":["raw"]`) {
+		t.Fatalf("job after retry = %+v", job)
+	}
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "queued retry for job `job-retry`") {
+		t.Fatalf("posted acknowledgements = %+v", client.posted)
+	}
+}
+
+func TestPollOnceCancelsJobFromComment(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo:        repo.FullName(),
+		Branch:      "task-10",
+		PullRequest: 10,
+		TaskID:      "task-010",
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-cancel", Agent: "audit", Type: "review", State: string(workflow.JobRunning), Payload: string(payload)}, db.JobEvent{
+		Kind:    string(workflow.JobRunning),
+		Message: "running",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{Number: 10, Title: "Task 10", State: "open", HeadRef: "task-10", BaseRef: "main", HeadSHA: "abc123"}},
+		comments: map[int64][]github.IssueComment{
+			10: {{ID: 921, Body: "/gitmoot cancel job-cancel", Author: "dana"}},
+		},
+	}
+
+	err = (Daemon{Repo: repo, Store: store, GitHub: client}).PollOnce(ctx)
+
+	if err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	job, err := store.GetJob(ctx, "job-cancel")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobCancelled) {
+		t.Fatalf("job state = %q, want cancelled", job.State)
+	}
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "cancelled job `job-cancel`") {
+		t.Fatalf("posted acknowledgements = %+v", client.posted)
+	}
+}
+
+func TestPollRecoveryCommandsOnceOnlyHandlesJobRecovery(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo:        repo.FullName(),
+		Branch:      "task-10",
+		PullRequest: 10,
+		TaskID:      "task-010",
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-cancel", Agent: "audit", Type: "review", State: string(workflow.JobRunning), Payload: string(payload)}, db.JobEvent{
+		Kind:    string(workflow.JobRunning),
+		Message: "running",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "audit",
+		Role:           "reviewer",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"review"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{Number: 10, Title: "Task 10", State: "open", HeadRef: "task-10", BaseRef: "main", HeadSHA: "abc123"}},
+		comments: map[int64][]github.IssueComment{
+			10: {
+				{ID: 921, Body: "/gitmoot cancel job-cancel", Author: "dana"},
+				{ID: 922, Body: "/gitmoot audit review later", Author: "dana"},
+			},
+		},
+	}
+
+	err = (Daemon{Repo: repo, Store: store, GitHub: client}).PollRecoveryCommandsOnce(ctx)
+
+	if err != nil {
+		t.Fatalf("PollRecoveryCommandsOnce returned error: %v", err)
+	}
+	job, err := store.GetJob(ctx, "job-cancel")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobCancelled) {
+		t.Fatalf("job state = %q, want cancelled", job.State)
+	}
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "cancelled job `job-cancel`") {
+		t.Fatalf("posted acknowledgements = %+v", client.posted)
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("jobs = %+v, want only recovery target", jobs)
+	}
+}
+
+func TestPollOnceDoesNotRetryRunningJobCancelledInSameComment(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo:        repo.FullName(),
+		Branch:      "task-10",
+		PullRequest: 10,
+		TaskID:      "task-010",
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-cancel-retry", Agent: "audit", Type: "review", State: string(workflow.JobRunning), Payload: string(payload)}, db.JobEvent{
+		Kind:    string(workflow.JobRunning),
+		Message: "running",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{Number: 10, Title: "Task 10", State: "open", HeadRef: "task-10", BaseRef: "main", HeadSHA: "abc123"}},
+		comments: map[int64][]github.IssueComment{
+			10: {{ID: 923, Body: "/gitmoot cancel job-cancel-retry\n/gitmoot retry job-cancel-retry", Author: "dana"}},
+		},
+	}
+
+	err = (Daemon{Repo: repo, Store: store, GitHub: client}).PollOnce(ctx)
+
+	if err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	job, err := store.GetJob(ctx, "job-cancel-retry")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobCancelled) {
+		t.Fatalf("job state = %q, want cancelled", job.State)
+	}
+	if len(client.posted) != 2 || !strings.Contains(client.posted[1].body, "wait for the active worker to settle") {
+		t.Fatalf("posted acknowledgements = %+v", client.posted)
+	}
+}
+
+func TestPollOnceRejectsJobRecoveryForDifferentPullRequest(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo:        repo.FullName(),
+		Branch:      "task-11",
+		PullRequest: 11,
+		TaskID:      "task-011",
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-other", Agent: "audit", Type: "review", State: string(workflow.JobFailed), Payload: string(payload)}, db.JobEvent{
+		Kind:    string(workflow.JobFailed),
+		Message: "failed",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{Number: 10, Title: "Task 10", State: "open", HeadRef: "task-10", BaseRef: "main", HeadSHA: "abc123"}},
+		comments: map[int64][]github.IssueComment{
+			10: {{ID: 922, Body: "/gitmoot retry job-other", Author: "dana"}},
+		},
+	}
+
+	err = (Daemon{Repo: repo, Store: store, GitHub: client}).PollOnce(ctx)
+
+	if err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	job, err := store.GetJob(ctx, "job-other")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobFailed) {
+		t.Fatalf("job state = %q, want failed", job.State)
+	}
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "belongs to jerryfane/gitmoot PR #11") {
+		t.Fatalf("posted acknowledgements = %+v", client.posted)
+	}
+}
+
 func TestPollOnceReportsStatusCommandCountsUnregisteredPRJobs(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)

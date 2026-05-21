@@ -830,6 +830,56 @@ func TestRetryPendingJobCommentsPreservesStoredFailureDiagnostic(t *testing.T) {
 	}
 }
 
+func TestRunQueuedJobsPostsCommentAfterRetryDespitePriorComment(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
+	payload := workflow.JobPayload{Repo: "owner/repo", Branch: "main", PullRequest: 7}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-comment-after-retry", Agent: "audit", Type: "ask", State: string(workflow.JobFailed), Payload: string(encoded)}, db.JobEvent{
+		JobID:   "job-comment-after-retry",
+		Kind:    string(workflow.JobFailed),
+		Message: "job failed",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: "job-comment-after-retry", Kind: "comment_posted", Message: "old result comment"}); err != nil {
+		t.Fatalf("AddJobEvent returned error: %v", err)
+	}
+	if _, err := workflow.RetryJob(ctx, store, "job-comment-after-retry"); err != nil {
+		t.Fatalf("RetryJob returned error: %v", err)
+	}
+	comments := &cliPollFakeGitHub{}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return &cliWorkerFakeAdapter{
+			output: `{"gitmoot_result":{"decision":"approved","summary":"retried","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
+		}, nil
+	}
+	worker.CommenterFactory = func(string) github.Client {
+		return comments
+	}
+
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+
+	if len(comments.posted) != 1 {
+		t.Fatalf("posted comments = %+v, want retried result comment", comments.posted)
+	}
+	if !strings.Contains(comments.posted[0].body, "**Summary:** retried") {
+		t.Fatalf("retried comment body = %s", comments.posted[0].body)
+	}
+}
+
 func TestRunQueuedJobsDrainsBeyondWorkerLimit(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
@@ -1083,8 +1133,8 @@ func TestRunQueuedJobsPreservesCancellationRace(t *testing.T) {
 	adapter := &cliWorkerFakeAdapter{
 		output: `{"gitmoot_result":{"decision":"approved","summary":"late","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
 		onDeliver: func() {
-			if err := store.UpdateJobState(ctx, "job-cancel", string(workflow.JobCancelled)); err != nil {
-				t.Fatalf("UpdateJobState returned error: %v", err)
+			if _, err := workflow.CancelJob(ctx, store, "job-cancel"); err != nil {
+				t.Fatalf("CancelJob returned error: %v", err)
 			}
 		},
 	}
@@ -1113,6 +1163,58 @@ func TestRunQueuedJobsPreservesCancellationRace(t *testing.T) {
 	}
 	if len(comments.posted) != 0 {
 		t.Fatalf("posted comments = %+v, want no comment for cancelled job", comments.posted)
+	}
+	events, err := store.ListJobEvents(ctx, "job-cancel")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !daemonWorkerHasEvent(events, "cancel_settled") {
+		t.Fatalf("events = %+v, want cancel_settled", events)
+	}
+}
+
+func TestRunQueuedJobsCancelsActiveDeliveryContext(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-active-cancel", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
+	adapter := &cliWorkerFakeAdapter{
+		waitForContextCancel: true,
+		onDeliver: func() {
+			if _, err := workflow.CancelJob(ctx, store, "job-active-cancel"); err != nil {
+				t.Fatalf("CancelJob returned error: %v", err)
+			}
+		},
+	}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return t.TempDir(), nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return adapter, nil
+	}
+
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+
+	if !adapter.observedContextCancel() {
+		t.Fatal("adapter did not observe context cancellation")
+	}
+	job, err := store.GetJob(ctx, "job-active-cancel")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobCancelled) {
+		t.Fatalf("job state = %q, want cancelled", job.State)
+	}
+	events, err := store.ListJobEvents(ctx, "job-active-cancel")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !daemonWorkerHasEvent(events, "cancel_settled") {
+		t.Fatalf("events = %+v, want cancel_settled", events)
 	}
 }
 
@@ -1595,6 +1697,32 @@ func TestRetryPendingJobAdvancementsAdvancesFailedStoredResult(t *testing.T) {
 	}
 }
 
+func TestJobNeedsAdvanceRetryResetsAfterJobRetry(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-retry-reset", Agent: "audit", Type: "ask", State: string(workflow.JobFailed), Payload: `{"repo":"owner/repo"}`}, db.JobEvent{
+		JobID:   "job-retry-reset",
+		Kind:    string(workflow.JobFailed),
+		Message: "failed",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: "job-retry-reset", Kind: "advance_retry", Message: "old advance retry"}); err != nil {
+		t.Fatalf("AddJobEvent returned error: %v", err)
+	}
+	if _, err := workflow.RetryJob(ctx, store, "job-retry-reset"); err != nil {
+		t.Fatalf("RetryJob returned error: %v", err)
+	}
+	worker := defaultJobWorker(store, io.Discard)
+	needsRetry, err := worker.jobNeedsAdvanceRetry(ctx, "job-retry-reset")
+	if err != nil {
+		t.Fatalf("jobNeedsAdvanceRetry returned error: %v", err)
+	}
+	if needsRetry {
+		t.Fatal("jobNeedsAdvanceRetry returned true after retry_queued reset")
+	}
+}
+
 func TestRetryPendingJobAdvancementsRefreshesImplementedHeadBeforePreflight(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
@@ -1786,6 +1914,67 @@ func TestRecoverRunningJobsKeepsRecentRunningJobsOnStartup(t *testing.T) {
 	}
 }
 
+func TestRecoverCancelledRunningJobsSettlesAbandonedCancellation(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-cancelled", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
+	if err := store.UpdateJobState(ctx, "job-cancelled", string(workflow.JobRunning)); err != nil {
+		t.Fatalf("UpdateJobState returned error: %v", err)
+	}
+	if _, err := workflow.CancelJob(ctx, store, "job-cancelled"); err != nil {
+		t.Fatalf("CancelJob returned error: %v", err)
+	}
+
+	if err := recoverCancelledRunningJobsForRepo(ctx, store, io.Discard, "owner/repo"); err != nil {
+		t.Fatalf("recoverCancelledRunningJobsForRepo returned error: %v", err)
+	}
+
+	events, err := store.ListJobEvents(ctx, "job-cancelled")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !daemonWorkerHasEvent(events, "cancel_settled") {
+		t.Fatalf("events = %+v, want cancel_settled", events)
+	}
+	if _, err := workflow.RetryJob(ctx, store, "job-cancelled"); err != nil {
+		t.Fatalf("RetryJob after cancelled recovery returned error: %v", err)
+	}
+}
+
+func TestRecoverCancelledRunningJobsForRepoSkipsOtherRepos(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit", Action: "ask", Repo: "owner/repo-a", Branch: "main", PullRequest: 1})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-b", Agent: "audit", Action: "ask", Repo: "owner/repo-b", Branch: "main", PullRequest: 1})
+	for _, id := range []string{"job-a", "job-b"} {
+		if err := store.UpdateJobState(ctx, id, string(workflow.JobRunning)); err != nil {
+			t.Fatalf("UpdateJobState(%s) returned error: %v", id, err)
+		}
+		if _, err := workflow.CancelJob(ctx, store, id); err != nil {
+			t.Fatalf("CancelJob(%s) returned error: %v", id, err)
+		}
+	}
+
+	if err := recoverCancelledRunningJobsForRepo(ctx, store, io.Discard, "owner/repo-a"); err != nil {
+		t.Fatalf("recoverCancelledRunningJobsForRepo returned error: %v", err)
+	}
+
+	eventsA, err := store.ListJobEvents(ctx, "job-a")
+	if err != nil {
+		t.Fatalf("ListJobEvents job-a returned error: %v", err)
+	}
+	eventsB, err := store.ListJobEvents(ctx, "job-b")
+	if err != nil {
+		t.Fatalf("ListJobEvents job-b returned error: %v", err)
+	}
+	if !daemonWorkerHasEvent(eventsA, "cancel_settled") {
+		t.Fatalf("eventsA = %+v, want cancel_settled", eventsA)
+	}
+	if daemonWorkerHasEvent(eventsB, "cancel_settled") {
+		t.Fatalf("eventsB = %+v, want no cancel_settled", eventsB)
+	}
+}
+
 func TestDaemonWorkerTickRechecksStaleRunningJobs(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
@@ -1962,23 +2151,39 @@ func (f *cliPollFakeGitHub) GetUserPermission(context.Context, github.Repository
 }
 
 type cliWorkerFakeAdapter struct {
-	mu        sync.Mutex
-	output    string
-	calls     int
-	delivered []string
-	onDeliver func()
+	mu                   sync.Mutex
+	output               string
+	calls                int
+	delivered            []string
+	onDeliver            func()
+	waitForContextCancel bool
+	contextCancelled     bool
 }
 
-func (f *cliWorkerFakeAdapter) Deliver(_ context.Context, _ runtime.Agent, job runtime.Job) (runtime.Result, error) {
+func (f *cliWorkerFakeAdapter) Deliver(ctx context.Context, _ runtime.Agent, job runtime.Job) (runtime.Result, error) {
 	f.mu.Lock()
 	f.calls++
 	f.delivered = append(f.delivered, job.ID)
 	onDeliver := f.onDeliver
+	waitForContextCancel := f.waitForContextCancel
 	f.mu.Unlock()
 	if onDeliver != nil {
 		onDeliver()
 	}
+	if waitForContextCancel {
+		<-ctx.Done()
+		f.mu.Lock()
+		f.contextCancelled = true
+		f.mu.Unlock()
+		return runtime.Result{}, ctx.Err()
+	}
 	return runtime.Result{Raw: f.output}, nil
+}
+
+func (f *cliWorkerFakeAdapter) observedContextCancel() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.contextCancelled
 }
 
 type cliWorkerFakeMergeGate struct {

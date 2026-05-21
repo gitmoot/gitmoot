@@ -8,6 +8,7 @@ import (
 type Command struct {
 	Action       string
 	Agent        string
+	JobID        string
 	Instructions string
 }
 
@@ -34,6 +35,11 @@ func ParseCommand(line string) (Command, bool) {
 	switch fields[1] {
 	case "status", "merge":
 		return Command{Action: fields[1], Instructions: trailing(fields, 2)}, true
+	case "retry", "cancel":
+		if len(fields) < 3 {
+			return Command{}, false
+		}
+		return Command{Action: fields[1], JobID: fields[2], Instructions: trailing(fields, 3)}, true
 	case "ask":
 		if len(fields) < 3 {
 			return Command{}, false
@@ -49,11 +55,14 @@ func ParseCommand(line string) (Command, bool) {
 
 func (c Command) Validate() error {
 	switch c.Action {
-	case "review", "implement", "ask", "status", "merge":
+	case "review", "implement", "ask", "status", "merge", "retry", "cancel":
 	default:
 		return fmt.Errorf("unsupported command action %q", c.Action)
 	}
-	if c.Action != "status" && c.Action != "merge" && c.Agent == "" {
+	if (c.Action == "retry" || c.Action == "cancel") && c.JobID == "" {
+		return fmt.Errorf("command %q requires a job id", c.Action)
+	}
+	if c.Action != "status" && c.Action != "merge" && c.Action != "retry" && c.Action != "cancel" && c.Agent == "" {
 		return fmt.Errorf("command %q requires an agent", c.Action)
 	}
 	return nil
