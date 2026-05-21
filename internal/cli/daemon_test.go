@@ -611,6 +611,225 @@ func TestRunQueuedJobsUsesMailboxRepairForMalformedOutput(t *testing.T) {
 	}
 }
 
+func TestRunQueuedJobsPostsAttributedResultComment(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-comment", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 7})
+	comments := &cliPollFakeGitHub{}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return &cliWorkerFakeAdapter{
+			output: `{"gitmoot_result":{"decision":"approved","summary":"done with token=ghp_abcdefghijklmnopqrstuvwxyz123456","findings":[{"severity":"low","body":"ok"}],"changes_made":["commented"],"tests_run":["go test ./..."],"needs":["none"],"next_agents":["lead"]}}`,
+		}, nil
+	}
+	worker.CommenterFactory = func(string) github.Client {
+		return comments
+	}
+
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+
+	if len(comments.posted) != 1 {
+		t.Fatalf("posted comments = %+v, want 1", comments.posted)
+	}
+	body := comments.posted[0].body
+	for _, want := range []string{
+		"> Agent: `audit`",
+		"> Runtime: `shell`",
+		"> Job: `job-comment`",
+		"**Decision:** `approved`",
+		"**Summary:** done with token=[REDACTED]",
+		"**Findings**",
+		"**Changes Made**",
+		"**Tests Run**",
+		"**Needs**",
+		"**Next Agents**",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("comment body missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "ghp_abcdefghijklmnopqrstuvwxyz123456") {
+		t.Fatalf("comment leaked token:\n%s", body)
+	}
+	events, err := store.ListJobEvents(ctx, "job-comment")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !daemonWorkerHasEvent(events, "comment_posted") {
+		t.Fatalf("events = %+v, want comment_posted", events)
+	}
+}
+
+func TestRunQueuedJobsPostsMalformedOutputDiagnosticComment(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-malformed", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 7})
+	comments := &cliPollFakeGitHub{}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return &cliWorkerFakeAdapter{output: "not valid json with token=ghp_abcdefghijklmnopqrstuvwxyz123456"}, nil
+	}
+	worker.CommenterFactory = func(string) github.Client {
+		return comments
+	}
+
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+
+	if len(comments.posted) != 1 {
+		t.Fatalf("posted comments = %+v, want 1", comments.posted)
+	}
+	body := comments.posted[0].body
+	if !strings.Contains(body, "> Agent: `audit`") || !strings.Contains(body, "**Decision:** `failed`") || !strings.Contains(body, "**Diagnostics:**") {
+		t.Fatalf("comment body missing failure diagnostics:\n%s", body)
+	}
+	if strings.Contains(body, "not valid json") || strings.Contains(body, "ghp_abcdefghijklmnopqrstuvwxyz123456") {
+		t.Fatalf("comment leaked raw output:\n%s", body)
+	}
+	if !strings.Contains(body, "Raw runtime output was retained in local Gitmoot state") {
+		t.Fatalf("comment did not mention local raw output retention:\n%s", body)
+	}
+}
+
+func TestRunQueuedJobsPostsCheckoutDiagnosticWithoutCheckoutCwd(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", "/missing/gitmoot-checkout")
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-checkout-comment", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 7})
+	comments := &cliPollFakeGitHub{}
+	commenterDir := "unset"
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return "", errors.New("checkout path is missing")
+	}
+	worker.CommenterFactory = func(dir string) github.Client {
+		commenterDir = dir
+		return comments
+	}
+
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+
+	if commenterDir != "" {
+		t.Fatalf("commenter dir = %q, want empty cwd for PR comment posting", commenterDir)
+	}
+	if len(comments.posted) != 1 {
+		t.Fatalf("posted comments = %+v, want checkout diagnostic comment", comments.posted)
+	}
+	body := comments.posted[0].body
+	if !strings.Contains(body, "**Diagnostics:** checkout path is missing") {
+		t.Fatalf("comment body lost checkout diagnostic:\n%s", body)
+	}
+}
+
+func TestDaemonWorkerTickRetriesFailedResultCommentPost(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-comment-retry", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 7})
+	comments := &cliPollFakeGitHub{postErr: errors.New("temporary github error")}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return &cliWorkerFakeAdapter{
+			output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
+		}, nil
+	}
+	worker.CommenterFactory = func(string) github.Client {
+		return comments
+	}
+
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+	if len(comments.posted) != 0 {
+		t.Fatalf("posted comments = %+v, want failed post only", comments.posted)
+	}
+	events, err := store.ListJobEvents(ctx, "job-comment-retry")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !daemonWorkerHasEvent(events, "comment_post_failed") {
+		t.Fatalf("events = %+v, want comment_post_failed", events)
+	}
+
+	comments.postErr = nil
+	if err := retryPendingJobComments(ctx, worker, "owner/repo"); err != nil {
+		t.Fatalf("retryPendingJobComments returned error: %v", err)
+	}
+	if len(comments.posted) != 1 {
+		t.Fatalf("posted comments = %+v, want retry post", comments.posted)
+	}
+	events, err = store.ListJobEvents(ctx, "job-comment-retry")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !daemonWorkerHasEvent(events, "comment_posted") {
+		t.Fatalf("events = %+v, want comment_posted", events)
+	}
+}
+
+func TestRetryPendingJobCommentsPreservesStoredFailureDiagnostic(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
+	payload := workflow.JobPayload{Repo: "owner/repo", Branch: "main", PullRequest: 7}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-comment-diagnostic-retry", Agent: "audit", Type: "ask", State: string(workflow.JobFailed), Payload: string(encoded)}, db.JobEvent{
+		JobID:   "job-comment-diagnostic-retry",
+		Kind:    string(workflow.JobFailed),
+		Message: "checkout validation failed",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: "job-comment-diagnostic-retry", Kind: "comment_post_failed", Message: "temporary github error"}); err != nil {
+		t.Fatalf("AddJobEvent returned error: %v", err)
+	}
+	comments := &cliPollFakeGitHub{}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CommenterFactory = func(string) github.Client {
+		return comments
+	}
+
+	if err := retryPendingJobComments(ctx, worker, "owner/repo"); err != nil {
+		t.Fatalf("retryPendingJobComments returned error: %v", err)
+	}
+
+	if len(comments.posted) != 1 {
+		t.Fatalf("posted comments = %+v, want retry post", comments.posted)
+	}
+	body := comments.posted[0].body
+	if !strings.Contains(body, "**Diagnostics:** checkout validation failed") {
+		t.Fatalf("comment body lost stored failure diagnostic:\n%s", body)
+	}
+}
+
 func TestRunQueuedJobsDrainsBeyondWorkerLimit(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
@@ -869,12 +1088,16 @@ func TestRunQueuedJobsPreservesCancellationRace(t *testing.T) {
 			}
 		},
 	}
+	comments := &cliPollFakeGitHub{}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return t.TempDir(), nil
 	}
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
 		return adapter, nil
+	}
+	worker.CommenterFactory = func(string) github.Client {
+		return comments
 	}
 
 	if err := runQueuedJobs(ctx, worker, 1); err != nil {
@@ -887,6 +1110,9 @@ func TestRunQueuedJobsPreservesCancellationRace(t *testing.T) {
 	}
 	if job.State != string(workflow.JobCancelled) {
 		t.Fatalf("job state = %q, want cancelled", job.State)
+	}
+	if len(comments.posted) != 0 {
+		t.Fatalf("posted comments = %+v, want no comment for cancelled job", comments.posted)
 	}
 }
 
@@ -1701,6 +1927,7 @@ type cliPollFakeGitHub struct {
 	pulls                 []github.PullRequest
 	comments              map[int64][]github.IssueComment
 	listErr               error
+	postErr               error
 	listPullRequestsCalls int
 	posted                []cliPollPostedComment
 }
@@ -1723,6 +1950,9 @@ func (f *cliPollFakeGitHub) ListIssueComments(_ context.Context, _ github.Reposi
 }
 
 func (f *cliPollFakeGitHub) PostIssueComment(_ context.Context, _ github.Repository, issueNumber int64, body string) (github.IssueComment, error) {
+	if f.postErr != nil {
+		return github.IssueComment{}, f.postErr
+	}
 	f.posted = append(f.posted, cliPollPostedComment{issueNumber: issueNumber, body: body})
 	return github.IssueComment{ID: int64(len(f.posted)), Body: body}, nil
 }

@@ -784,6 +784,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 		}
 		poller := defaultRegisteredRepoPoller(store, workers, dryRun, stdout)
 		worker := defaultJobWorker(store, stdout)
+		worker.CommenterFactory = worker.defaultCommenter
 		for {
 			wait, err := pollRegisteredReposWithPoller(ctx, poller, schedule, time.Now().UTC(), poll)
 			if err != nil {
@@ -814,6 +815,7 @@ func runSingleRepoSupervisor(ctx context.Context, d daemon.Daemon, store *db.Sto
 		interval = 30 * time.Second
 	}
 	worker := defaultJobWorker(store, stdout)
+	worker.CommenterFactory = worker.defaultCommenter
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -998,6 +1000,7 @@ type jobWorker struct {
 	AdapterFactory    func(runtime.Agent, string) (workflow.DeliveryAdapter, error)
 	CheckoutValidator func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error)
 	WorkflowFactory   func(string) workflow.Engine
+	CommenterFactory  func(string) github.Client
 }
 
 const daemonRunningJobStaleAfter = 30 * time.Minute
@@ -1083,6 +1086,9 @@ func runDaemonWorkerTick(ctx context.Context, store *db.Store, worker jobWorker,
 	if err := retryPendingJobAdvancements(ctx, worker, repoFilter); err != nil {
 		return err
 	}
+	if err := retryPendingJobComments(ctx, worker, repoFilter); err != nil {
+		return err
+	}
 	return runQueuedJobsForRepo(ctx, worker, workers, repoFilter)
 }
 
@@ -1103,6 +1109,42 @@ func runEnabledRepoWorkerTicks(ctx context.Context, store *db.Store, worker jobW
 }
 
 func jobStateCanRetryAdvancement(state string) bool {
+	switch state {
+	case string(workflow.JobSucceeded), string(workflow.JobFailed), string(workflow.JobBlocked):
+		return true
+	default:
+		return false
+	}
+}
+
+func retryPendingJobComments(ctx context.Context, worker jobWorker, repoFilter string) error {
+	jobs, err := worker.Store.ListJobs(ctx)
+	if err != nil {
+		return err
+	}
+	for _, job := range jobs {
+		if !jobStateCanRetryComment(job.State) || !queuedJobMatchesRepo(job, repoFilter) {
+			continue
+		}
+		needsRetry, err := worker.jobNeedsCommentRetry(ctx, job.ID)
+		if err != nil {
+			return err
+		}
+		if !needsRetry {
+			continue
+		}
+		agent := runtime.Agent{Name: job.Agent}
+		if dbAgent, err := worker.Store.GetAgent(ctx, job.Agent); err == nil {
+			agent = runtimeAgent(dbAgent)
+		}
+		if err := worker.postJobResultComment(ctx, job.ID, agent, "", nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func jobStateCanRetryComment(state string) bool {
 	switch state {
 	case string(workflow.JobSucceeded), string(workflow.JobFailed), string(workflow.JobBlocked):
 		return true
@@ -1188,16 +1230,28 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	dbAgent, err := w.Store.GetAgent(ctx, job.Agent)
 	if err != nil {
-		return w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err)
+		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, "", err)
+		return nil
 	}
 	agent := runtimeAgent(dbAgent)
 	checkout, err := w.CheckoutValidator(ctx, job, payload, agent)
 	if err != nil {
-		return w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err)
+		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
+		return nil
 	}
 	adapter, err := w.AdapterFactory(agent, checkout)
 	if err != nil {
-		return w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err)
+		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
+		return nil
 	}
 	writeLine(w.Stdout, "running job %s for %s in %s", job.ID, agent.Name, payload.Repo)
 	engine := w.WorkflowFactory(checkout)
@@ -1206,9 +1260,11 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		if markErr := w.handleRunJobError(ctx, job.ID, err); markErr != nil {
 			return markErr
 		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		writeLine(w.Stdout, "job %s failed: %v", job.ID, err)
 		return nil
 	}
+	_ = w.postJobResultComment(ctx, job.ID, agent, checkout, nil)
 	writeLine(w.Stdout, "job %s completed", job.ID)
 	return nil
 }
@@ -1309,6 +1365,10 @@ func (w jobWorker) defaultAdapter(agent runtime.Agent, checkout string) (workflo
 
 func (w jobWorker) defaultWorkflow(checkout string) workflow.Engine {
 	return daemonWorkflowEngine(w.Store, github.NewClient(checkout), checkout)
+}
+
+func (w jobWorker) defaultCommenter(_ string) github.Client {
+	return github.NewClient("")
 }
 
 func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string) workflow.Engine {
@@ -1505,6 +1565,117 @@ func (w jobWorker) recordPostDeliveryWorkflowError(ctx context.Context, job db.J
 		Kind:    "advance_retry",
 		Message: "post-delivery workflow error; advancement will retry from stored result: " + cause.Error(),
 	})
+}
+
+func (w jobWorker) postJobResultComment(ctx context.Context, jobID string, agent runtime.Agent, _ string, cause error) error {
+	job, payload, err := daemonWorkerJobPayload(ctx, w.Store, jobID)
+	if err != nil {
+		return err
+	}
+	if job.State == string(workflow.JobCancelled) {
+		return nil
+	}
+	if payload.PullRequest <= 0 || strings.TrimSpace(payload.Repo) == "" {
+		return nil
+	}
+	if w.CommenterFactory == nil {
+		return nil
+	}
+	posted, err := w.jobResultCommentPosted(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if posted {
+		return nil
+	}
+	repo, err := daemon.ParseRepository(payload.Repo)
+	if err != nil {
+		return err
+	}
+	diagnostic := jobResultDiagnostic(cause)
+	if diagnostic == "" && payload.Result == nil {
+		diagnostic = w.storedJobFailureDiagnostic(ctx, job)
+	}
+	body := workflow.RenderJobResultComment(workflow.JobResultComment{
+		AgentName:  firstNonEmpty(agent.Name, job.Agent),
+		Runtime:    agent.Runtime,
+		JobID:      job.ID,
+		JobState:   job.State,
+		Payload:    payload,
+		Result:     payload.Result,
+		Diagnostic: diagnostic,
+	})
+	if _, err := w.CommenterFactory("").PostIssueComment(ctx, repo, int64(payload.PullRequest), body); err != nil {
+		_ = w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "comment_post_failed", Message: err.Error()})
+		return nil
+	}
+	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "comment_posted", Message: "posted attributed PR result comment"})
+}
+
+func (w jobWorker) jobResultCommentPosted(ctx context.Context, jobID string) (bool, error) {
+	events, err := w.Store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	for _, event := range events {
+		if event.Kind == "comment_posted" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (w jobWorker) jobNeedsCommentRetry(ctx context.Context, jobID string) (bool, error) {
+	events, err := w.Store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	needsRetry := false
+	for _, event := range events {
+		switch event.Kind {
+		case "comment_post_failed":
+			needsRetry = true
+		case "comment_posted":
+			needsRetry = false
+		}
+	}
+	return needsRetry, nil
+}
+
+func (w jobWorker) storedJobFailureDiagnostic(ctx context.Context, job db.Job) string {
+	if job.State != string(workflow.JobFailed) && job.State != string(workflow.JobBlocked) {
+		return ""
+	}
+	events, err := w.Store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		return ""
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		event := events[i]
+		if event.Kind == job.State && strings.TrimSpace(event.Message) != "" {
+			return event.Message
+		}
+	}
+	return ""
+}
+
+func daemonWorkerJobPayload(ctx context.Context, store *db.Store, jobID string) (db.Job, workflow.JobPayload, error) {
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		return db.Job{}, workflow.JobPayload{}, err
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		return db.Job{}, workflow.JobPayload{}, err
+	}
+	return job, payload, nil
+}
+
+func jobResultDiagnostic(cause error) string {
+	if cause == nil {
+		return ""
+	}
+	return cause.Error()
 }
 
 func daemonJobPayload(job db.Job) (workflow.JobPayload, error) {
