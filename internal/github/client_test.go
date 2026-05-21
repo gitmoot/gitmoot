@@ -15,13 +15,11 @@ func TestListIssueCommentsDedupesByID(t *testing.T) {
 	runner := &fakeRunner{
 		results: []subprocess.Result{{
 			Stdout: `[
-				[
-					{"id": 11, "body": "first", "html_url": "https://example.com/1", "user": {"login": "alice"}},
-					{"id": 11, "body": "duplicate", "html_url": "https://example.com/1", "user": {"login": "alice"}}
-				],
-				[
-					{"id": 12, "body": "second", "html_url": "https://example.com/2", "user": {"login": "bob"}}
-				]
+				{"id": 11, "body": "first", "html_url": "https://example.com/1", "user": {"login": "alice"}},
+				{"id": 11, "body": "duplicate", "html_url": "https://example.com/1", "user": {"login": "alice"}}
+			]
+			[
+				{"id": 12, "body": "second", "html_url": "https://example.com/2", "user": {"login": "bob"}}
 			]`,
 		}},
 	}
@@ -38,7 +36,7 @@ func TestListIssueCommentsDedupesByID(t *testing.T) {
 	if comments[0].Body != "first" || comments[1].Author != "bob" {
 		t.Fatalf("comments were not decoded in first-seen order: %+v", comments)
 	}
-	runner.wantArgs(t, 0, "api", "--paginate", "--slurp", "repos/jerryfane/gitmoot/issues/2/comments")
+	runner.wantArgs(t, 0, "api", "--paginate", "repos/jerryfane/gitmoot/issues/2/comments")
 }
 
 func TestPostIssueCommentUsesIssueCommentsEndpoint(t *testing.T) {

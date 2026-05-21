@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"strconv"
 	"strings"
@@ -398,19 +399,30 @@ func (c *GhClient) apiJSON(ctx context.Context, mutate bool, output any, args ..
 }
 
 func apiPaginatedJSON[T any](ctx context.Context, c *GhClient, args ...string) ([]T, error) {
-	result, err := c.run(ctx, false, append([]string{"api", "--paginate", "--slurp"}, args...)...)
+	result, err := c.run(ctx, false, append([]string{"api", "--paginate"}, args...)...)
 	if err != nil {
 		return nil, err
 	}
-	var pages [][]T
-	if err := json.Unmarshal([]byte(result.Stdout), &pages); err != nil {
+	values, err := decodePaginatedJSON[T](result.Stdout)
+	if err != nil {
 		return nil, fmt.Errorf("decode paginated gh api response: %w", err)
 	}
+	return values, nil
+}
+
+func decodePaginatedJSON[T any](output string) ([]T, error) {
+	decoder := json.NewDecoder(strings.NewReader(output))
 	var values []T
-	for _, page := range pages {
+	for {
+		var page []T
+		if err := decoder.Decode(&page); err != nil {
+			if errors.Is(err, io.EOF) {
+				return values, nil
+			}
+			return nil, err
+		}
 		values = append(values, page...)
 	}
-	return values, nil
 }
 
 func (c *GhClient) run(ctx context.Context, mutate bool, args ...string) (subprocess.Result, error) {
