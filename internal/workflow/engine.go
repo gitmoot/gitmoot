@@ -18,6 +18,7 @@ type Engine struct {
 	RequiredReviewers []string
 	MergeGate         MergeGate
 	JobID             func(JobRequest) string
+	PayloadRefresher  func(context.Context, db.Job, JobPayload) (JobPayload, error)
 }
 
 type PullRequestEvent struct {
@@ -190,10 +191,34 @@ func (e Engine) RunJob(ctx context.Context, jobID string, agent runtime.Agent, a
 	if err != nil {
 		return result, err
 	}
+	if e.PayloadRefresher != nil {
+		if err := e.refreshJobPayload(ctx, jobID); err != nil {
+			return result, err
+		}
+	}
 	if err := e.AdvanceJob(ctx, jobID); err != nil {
 		return result, err
 	}
+	if err := e.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_completed", Message: "workflow advancement completed"}); err != nil {
+		return result, err
+	}
 	return result, nil
+}
+
+func (e Engine) refreshJobPayload(ctx context.Context, jobID string) error {
+	job, payload, err := e.jobPayload(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	payload, err = e.PayloadRefresher(ctx, job, payload)
+	if err != nil {
+		return err
+	}
+	encoded, err := marshalPayload(payload)
+	if err != nil {
+		return err
+	}
+	return e.Store.UpdateJobPayload(ctx, jobID, encoded)
 }
 
 func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
@@ -220,6 +245,15 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 	}
 	if payload.Result.Decision == "blocked" || payload.Result.Decision == "failed" {
 		return e.block(ctx, ref, payload.Result.Summary)
+	}
+	if job.Type == "review" && payload.Result.Decision == "approved" {
+		done, err := e.reviewApprovalAlreadyAdvanced(ctx, ref)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
 	}
 	if err := e.dispatchNextAgents(ctx, payload, *payload.Result, ref); err != nil {
 		return err
@@ -529,7 +563,63 @@ func (e Engine) enqueue(ctx context.Context, request JobRequest) error {
 		request.ID = e.jobID(request)
 	}
 	_, err := (Mailbox{Store: e.Store}).Enqueue(ctx, request)
+	if err == nil {
+		return nil
+	}
+	matches, matchErr := e.existingJobMatchesRequest(ctx, request)
+	if matchErr != nil {
+		return err
+	}
+	if matches {
+		return nil
+	}
 	return err
+}
+
+func (e Engine) existingJobMatchesRequest(ctx context.Context, request JobRequest) (bool, error) {
+	job, err := e.Store.GetJob(ctx, request.ID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if job.Agent != request.Agent || job.Type != request.Action {
+		return false, nil
+	}
+	payload, err := unmarshalPayload(job.Payload)
+	if err != nil {
+		return false, err
+	}
+	return payloadMatchesRequest(payload, request), nil
+}
+
+func payloadMatchesRequest(payload JobPayload, request JobRequest) bool {
+	return payload.Repo == request.Repo &&
+		payload.Branch == request.Branch &&
+		payload.PullRequest == request.PullRequest &&
+		payload.HeadSHA == request.HeadSHA &&
+		payload.GoalID == request.GoalID &&
+		payload.TaskID == request.TaskID &&
+		payload.TaskTitle == request.TaskTitle &&
+		payload.LeadAgent == request.LeadAgent &&
+		payload.ReviewRound == request.ReviewRound &&
+		payload.Sender == request.Sender &&
+		payload.Instructions == request.Instructions &&
+		equalStrings(payload.Reviewers, compactStrings(request.Reviewers)) &&
+		equalStrings(payload.Constraints, compactStrings(request.Constraints))
+}
+
+func equalStrings(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (e Engine) ensureAgentAllowed(ctx context.Context, request JobRequest, ref taskRef) error {
@@ -648,6 +738,7 @@ func (e Engine) nextReviewRound(ctx context.Context, event PullRequestEvent) (st
 	}
 	current := JobPayload{Repo: event.Repo, PullRequest: event.PullRequest, TaskID: event.TaskID}
 	rounds := map[string]bool{}
+	existingHeadRound := ""
 	for _, job := range jobs {
 		if job.Type != "review" {
 			continue
@@ -663,9 +754,29 @@ func (e Engine) nextReviewRound(ctx context.Context, event PullRequestEvent) (st
 		if round == "" {
 			round = job.ID
 		}
+		if payload.HeadSHA != "" && payload.HeadSHA == event.HeadSHA {
+			existingHeadRound = round
+		}
 		rounds[round] = true
 	}
+	if existingHeadRound != "" {
+		return existingHeadRound, nil
+	}
 	return "review-" + strconv.Itoa(len(rounds)+1), nil
+}
+
+func (e Engine) reviewApprovalAlreadyAdvanced(ctx context.Context, ref taskRef) (bool, error) {
+	if strings.TrimSpace(ref.ID) == "" {
+		return false, nil
+	}
+	task, err := e.Store.GetTask(ctx, ref.ID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return task.State == string(TaskReadyToMerge) || task.State == string(TaskMerged), nil
 }
 
 func (e Engine) block(ctx context.Context, ref taskRef, reason string) error {

@@ -76,6 +76,18 @@ func TestClientRejectsUnsafeBranchNames(t *testing.T) {
 	}
 }
 
+func TestClientHeadSHA(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "abc123\n"}}}
+	sha, err := (Client{Runner: runner, Dir: "/repo"}).HeadSHA(context.Background())
+	if err != nil {
+		t.Fatalf("HeadSHA returned error: %v", err)
+	}
+	if sha != "abc123" {
+		t.Fatalf("sha = %q, want abc123", sha)
+	}
+	runner.wantArgs(t, 0, "git", "rev-parse", "HEAD")
+}
+
 func TestClientCreateBranchSmoke(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")

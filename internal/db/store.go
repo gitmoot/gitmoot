@@ -118,6 +118,8 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	store := &Store{db: db}
 	if err := store.Migrate(context.Background()); err != nil {
@@ -750,6 +752,44 @@ func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
 	return jobs, rows.Err()
 }
 
+func (s *Store) ListQueuedJobs(ctx context.Context) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload
+		FROM jobs WHERE state = ? ORDER BY created_at, rowid`, "queued")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []Job
+	for rows.Next() {
+		var job Job
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+func (s *Store) ListRunningJobsUpdatedBefore(ctx context.Context, before time.Time) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload
+		FROM jobs WHERE state = ? AND updated_at < ? ORDER BY id`, "running", before.UTC().Format("2006-01-02 15:04:05"))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []Job
+	for rows.Next() {
+		var job Job
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
 func (s *Store) UpdateJobState(ctx context.Context, id string, state string) error {
 	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, state, id)
 	if err != nil {
@@ -797,7 +837,7 @@ func (s *Store) TransitionJobStateWithEvent(ctx context.Context, id string, from
 	return true, tx.Commit()
 }
 
-func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id string, from string, to string, payload string, event JobEvent) (bool, error) {
+func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id string, from string, to string, payload string, event JobEvent, extraEvents ...JobEvent) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -820,6 +860,14 @@ func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id strin
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
 		return false, err
+	}
+	for _, extra := range extraEvents {
+		if extra.JobID == "" {
+			extra.JobID = id
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, extra.JobID, extra.Kind, extra.Message); err != nil {
+			return false, err
+		}
 	}
 	return true, tx.Commit()
 }

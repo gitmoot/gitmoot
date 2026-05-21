@@ -344,6 +344,48 @@ func TestEngineAdvanceReviewChangesRequestedDispatchesFix(t *testing.T) {
 	}
 }
 
+func TestEngineAdvanceReviewChangesRequestedReplayIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+	insertCompletedJob(t, store, db.Job{
+		ID:    "review-job",
+		Agent: "audit",
+		Type:  "review",
+	}, JobPayload{
+		Repo:        "jerryfane/gitmoot",
+		Branch:      "task-7",
+		PullRequest: 7,
+		TaskID:      "task-7",
+		TaskTitle:   "Workflow Engine",
+		LeadAgent:   "lead",
+		Result:      &AgentResult{Decision: "changes_requested", Summary: "fix edge case"},
+	})
+
+	if err := engine.AdvanceJob(ctx, "review-job"); err != nil {
+		t.Fatalf("first AdvanceJob returned error: %v", err)
+	}
+	if err := engine.AdvanceJob(ctx, "review-job"); err != nil {
+		t.Fatalf("second AdvanceJob returned error: %v", err)
+	}
+
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	implementJobs := 0
+	for _, job := range jobs {
+		if job.ID == "implement-lead-task-7" {
+			implementJobs++
+		}
+	}
+	if implementJobs != 1 {
+		t.Fatalf("implement job count = %d, want 1", implementJobs)
+	}
+	assertTaskState(t, store, "task-7", TaskChangesRequested)
+}
+
 func TestEngineAdvanceReviewChangesRequestedUsesBranchLockLead(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
