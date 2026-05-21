@@ -123,11 +123,24 @@ Checks:
 
 ```sh
 gitmoot agent list
+gitmoot lock list --repo owner/repo
+gitmoot lock show owner/repo <branch>
 ```
 
-Current V1 does not expose a lock-management CLI. Inspect local state only if
-you understand the schema and have backed up the database. The safer path is to
-finish or merge the owning task so the merge gate releases the lock.
+The safest path is still to finish or merge the owning task so the merge gate
+releases the lock and records the release event. If the task is abandoned, use
+an exact-owner release:
+
+```sh
+gitmoot lock release owner/repo <branch> --owner <agent>
+```
+
+Use `--force` only when the stored owner is stale or the owning session is no
+longer recoverable:
+
+```sh
+gitmoot lock release owner/repo <branch> --force
+```
 
 ## Malformed Agent Output
 

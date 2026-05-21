@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -95,6 +96,14 @@ type BranchLock struct {
 	RepoFullName string
 	Branch       string
 	Owner        string
+}
+
+type BranchLockEvent struct {
+	RepoFullName string
+	Branch       string
+	Owner        string
+	Kind         string
+	Message      string
 }
 
 type MergeGate struct {
@@ -942,6 +951,31 @@ func (s *Store) GetBranchLock(ctx context.Context, repoFullName string, branch s
 	return lock, nil
 }
 
+func (s *Store) ListBranchLocks(ctx context.Context, repoFullName string) ([]BranchLock, error) {
+	query := `SELECT repo_full_name, branch, owner FROM branch_locks`
+	args := []any{}
+	if strings.TrimSpace(repoFullName) != "" {
+		query += ` WHERE repo_full_name = ?`
+		args = append(args, repoFullName)
+	}
+	query += ` ORDER BY repo_full_name, branch`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var locks []BranchLock
+	for rows.Next() {
+		var lock BranchLock
+		if err := rows.Scan(&lock.RepoFullName, &lock.Branch, &lock.Owner); err != nil {
+			return nil, err
+		}
+		locks = append(locks, lock)
+	}
+	return locks, rows.Err()
+}
+
 func (s *Store) ReleaseLock(ctx context.Context, lock BranchLock) (bool, error) {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM branch_locks WHERE repo_full_name = ? AND branch = ? AND owner = ?`, lock.RepoFullName, lock.Branch, lock.Owner)
 	if err != nil {
@@ -952,6 +986,110 @@ func (s *Store) ReleaseLock(ctx context.Context, lock BranchLock) (bool, error) 
 		return false, err
 	}
 	return affected == 1, nil
+}
+
+func (s *Store) ReleaseLockWithEvent(ctx context.Context, lock BranchLock, event BranchLockEvent) (bool, error) {
+	return s.releaseLockWithEvent(ctx, lock, false, event)
+}
+
+func (s *Store) ForceReleaseLockWithEvent(ctx context.Context, repoFullName string, branch string, event BranchLockEvent) (BranchLock, bool, error) {
+	lock, err := s.GetBranchLock(ctx, repoFullName, branch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return BranchLock{}, false, nil
+	}
+	if err != nil {
+		return BranchLock{}, false, err
+	}
+	released, err := s.releaseLockWithEvent(ctx, lock, true, event)
+	if err != nil {
+		return BranchLock{}, false, err
+	}
+	if !released {
+		return BranchLock{}, false, nil
+	}
+	return lock, true, nil
+}
+
+func (s *Store) releaseLockWithEvent(ctx context.Context, lock BranchLock, force bool, event BranchLockEvent) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	current := lock
+	if force || strings.TrimSpace(current.Owner) == "" {
+		row := tx.QueryRowContext(ctx, `SELECT repo_full_name, branch, owner FROM branch_locks WHERE repo_full_name = ? AND branch = ?`, lock.RepoFullName, lock.Branch)
+		if err := row.Scan(&current.RepoFullName, &current.Branch, &current.Owner); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, tx.Commit()
+			}
+			return false, err
+		}
+	}
+
+	query := `DELETE FROM branch_locks WHERE repo_full_name = ? AND branch = ? AND owner = ?`
+	args := []any{current.RepoFullName, current.Branch, current.Owner}
+	if force {
+		query = `DELETE FROM branch_locks WHERE repo_full_name = ? AND branch = ?`
+		args = []any{current.RepoFullName, current.Branch}
+	}
+	result, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, tx.Commit()
+	}
+
+	event.RepoFullName = current.RepoFullName
+	event.Branch = current.Branch
+	event.Owner = current.Owner
+	if strings.TrimSpace(event.Kind) == "" {
+		event.Kind = "released"
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO lock_events(repo_full_name, branch, owner, kind, message)
+		VALUES (?, ?, ?, ?, ?)`, event.RepoFullName, event.Branch, event.Owner, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+func (s *Store) ListBranchLockEvents(ctx context.Context, repoFullName string, branch string) ([]BranchLockEvent, error) {
+	query := `SELECT repo_full_name, branch, owner, kind, message FROM lock_events`
+	args := []any{}
+	conditions := []string{}
+	if strings.TrimSpace(repoFullName) != "" {
+		conditions = append(conditions, "repo_full_name = ?")
+		args = append(args, repoFullName)
+	}
+	if strings.TrimSpace(branch) != "" {
+		conditions = append(conditions, "branch = ?")
+		args = append(args, branch)
+	}
+	if len(conditions) > 0 {
+		query += ` WHERE ` + strings.Join(conditions, ` AND `)
+	}
+	query += ` ORDER BY rowid`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []BranchLockEvent
+	for rows.Next() {
+		var event BranchLockEvent
+		if err := rows.Scan(&event.RepoFullName, &event.Branch, &event.Owner, &event.Kind, &event.Message); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
 }
 
 func (s *Store) UpsertMergeGate(ctx context.Context, gate MergeGate) error {
@@ -1160,5 +1298,16 @@ CREATE TABLE agent_repos (
 
 INSERT OR IGNORE INTO agent_repos(agent_name, repo_full_name)
 SELECT name, repo_scope FROM agents WHERE repo_scope <> '';
+	`,
+	`
+CREATE TABLE IF NOT EXISTS lock_events (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	repo_full_name TEXT NOT NULL,
+	branch TEXT NOT NULL,
+	owner TEXT NOT NULL,
+	kind TEXT NOT NULL,
+	message TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 	`,
 }

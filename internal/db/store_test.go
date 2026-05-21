@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -25,6 +26,7 @@ func TestOpenMigratesSchema(t *testing.T) {
 		"jobs",
 		"job_events",
 		"branch_locks",
+		"lock_events",
 		"merge_gates",
 		"agent_repos",
 	} {
@@ -357,12 +359,29 @@ func TestRepositoryMethods(t *testing.T) {
 	if released {
 		t.Fatal("wrong-owner ReleaseLock released lock")
 	}
-	released, err = store.ReleaseLock(ctx, BranchLock{RepoFullName: "jerryfane/gitmoot", Branch: "task", Owner: "lead"})
+	released, err = store.ReleaseLockWithEvent(ctx, BranchLock{RepoFullName: "jerryfane/gitmoot", Branch: "task", Owner: "lead"}, BranchLockEvent{Kind: "released", Message: "done"})
 	if err != nil {
-		t.Fatalf("ReleaseLock returned error: %v", err)
+		t.Fatalf("ReleaseLockWithEvent returned error: %v", err)
 	}
 	if !released {
 		t.Fatal("ReleaseLock did not release owned lock")
+	}
+	lockEvents, err := store.ListBranchLockEvents(ctx, "jerryfane/gitmoot", "task")
+	if err != nil {
+		t.Fatalf("ListBranchLockEvents returned error: %v", err)
+	}
+	if len(lockEvents) != 1 || lockEvents[0].Kind != "released" || lockEvents[0].Owner != "lead" {
+		t.Fatalf("lock events = %+v", lockEvents)
+	}
+	if acquired, err := store.AcquireLock(ctx, BranchLock{RepoFullName: "jerryfane/gitmoot", Branch: "task-force", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("force lock AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	releasedLock, released, err := store.ForceReleaseLockWithEvent(ctx, "jerryfane/gitmoot", "task-force", BranchLockEvent{Kind: "force_released", Message: "stale"})
+	if err != nil {
+		t.Fatalf("ForceReleaseLockWithEvent returned error: %v", err)
+	}
+	if !released || releasedLock.Owner != "lead" {
+		t.Fatalf("force release returned lock=%+v released=%v", releasedLock, released)
 	}
 	if err := store.UpsertMergeGate(ctx, MergeGate{RepoFullName: "jerryfane/gitmoot", PullRequest: 1, State: "pending", Reason: "waiting"}); err != nil {
 		t.Fatalf("UpsertMergeGate returned error: %v", err)
@@ -399,7 +418,14 @@ func TestMigrateCopiesAgentRepoScopeToAgentRepos(t *testing.T) {
 	store := &Store{db: raw}
 	defer store.Close()
 
-	for version, migration := range migrations[:len(migrations)-1] {
+	agentReposMigration := len(migrations) - 1
+	for i, migration := range migrations {
+		if strings.Contains(migration, "CREATE TABLE agent_repos") {
+			agentReposMigration = i
+			break
+		}
+	}
+	for version, migration := range migrations[:agentReposMigration] {
 		if err := store.applyMigration(ctx, version+1, migration); err != nil {
 			t.Fatalf("applyMigration(%d) returned error: %v", version+1, err)
 		}

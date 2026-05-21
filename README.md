@@ -36,6 +36,7 @@ gitmoot status
 gitmoot goal import --file <path>
 gitmoot task run <id> --repo owner/repo --owner <agent>
 gitmoot job list|show|events|run|retry|cancel
+gitmoot lock list|show|release
 ```
 
 ## Documentation

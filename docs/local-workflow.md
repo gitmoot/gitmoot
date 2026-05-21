@@ -108,6 +108,14 @@ planned tasks. `task run` starts one task branch and records its branch lock.
    are routed through the runtime adapter and must return the `gitmoot_result`
    JSON contract.
 
+   Stale branch locks can be inspected and released locally:
+
+   ```sh
+   gitmoot lock list --repo owner/project
+   gitmoot lock show owner/project <branch>
+   gitmoot lock release owner/project <branch> --owner <agent>
+   ```
+
 8. Let the PR converge.
 
    Agents review, request fixes, and rerun work through comments and job output.

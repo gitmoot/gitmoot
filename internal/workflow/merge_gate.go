@@ -139,7 +139,7 @@ func (g PolicyMergeGate) finishMerged(ctx context.Context, request MergeRequest,
 	postMergeWarnings := []string{}
 	lock, err := g.Store.GetBranchLock(ctx, request.Repo, pr.HeadRef)
 	if err == nil {
-		if _, err := g.Store.ReleaseLock(ctx, lock); err != nil {
+		if _, err := g.Store.ReleaseLockWithEvent(ctx, lock, db.BranchLockEvent{Kind: "released", Message: "released after pull request merge"}); err != nil {
 			postMergeWarnings = append(postMergeWarnings, "release branch lock: "+err.Error())
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {

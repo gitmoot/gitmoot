@@ -67,6 +67,13 @@ func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 	if _, err := store.GetBranchLock(ctx, "jerryfane/gitmoot", "task-9"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("branch lock after merge error = %v, want sql.ErrNoRows", err)
 	}
+	lockEvents, err := store.ListBranchLockEvents(ctx, "jerryfane/gitmoot", "task-9")
+	if err != nil {
+		t.Fatalf("ListBranchLockEvents returned error: %v", err)
+	}
+	if len(lockEvents) != 1 || lockEvents[0].Kind != "released" || lockEvents[0].Owner != "lead" {
+		t.Fatalf("lock events = %+v", lockEvents)
+	}
 	pr, err := store.GetPullRequest(ctx, "jerryfane/gitmoot", 9)
 	if err != nil {
 		t.Fatalf("GetPullRequest returned error: %v", err)
