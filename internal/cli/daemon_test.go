@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	gitutil "github.com/jerryfane/gitmoot/internal/git"
 	"github.com/jerryfane/gitmoot/internal/github"
 	"github.com/jerryfane/gitmoot/internal/subprocess"
+	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
 func TestRunDaemonUsageAndValidation(t *testing.T) {
@@ -349,6 +351,181 @@ func TestPollRegisteredReposHonorsPerRepoIntervals(t *testing.T) {
 	}
 }
 
+func TestPollRegisteredReposRoutesEachRepoWithOwnGitHubClient(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	repoA := github.Repository{Owner: "owner", Name: "repo-a"}
+	repoB := github.Repository{Owner: "owner", Name: "repo-b"}
+	for _, repo := range []db.Repo{
+		{Owner: repoA.Owner, Name: repoA.Name, CheckoutPath: "/tmp/repo-a", PollInterval: "30s"},
+		{Owner: repoB.Owner, Name: repoB.Name, CheckoutPath: "/tmp/repo-b", PollInterval: "30s"},
+	} {
+		if err := store.UpsertRepo(ctx, repo); err != nil {
+			t.Fatalf("UpsertRepo(%s) returned error: %v", repo.FullName(), err)
+		}
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "audit",
+		Role:           "reviewer",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repoA.FullName(),
+		Capabilities:   []string{"review"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+	if err := store.AllowAgentRepo(ctx, "audit", repoB.FullName()); err != nil {
+		t.Fatalf("AllowAgentRepo returned error: %v", err)
+	}
+
+	clients := map[string]*cliPollFakeGitHub{
+		"/tmp/repo-a": {
+			pulls: []github.PullRequest{{Number: 1, Title: "A", State: "open", HeadRef: "task-a", BaseRef: "main", HeadSHA: "sha-a"}},
+			comments: map[int64][]github.IssueComment{
+				1: {{ID: 77, Body: "/gitmoot audit review check repo a", Author: "alice"}},
+			},
+		},
+		"/tmp/repo-b": {
+			pulls: []github.PullRequest{{Number: 1, Title: "B", State: "open", HeadRef: "task-b", BaseRef: "main", HeadSHA: "sha-b"}},
+			comments: map[int64][]github.IssueComment{
+				1: {{ID: 77, Body: "/gitmoot audit review check repo b", Author: "alice"}},
+			},
+		},
+	}
+	poller := defaultRegisteredRepoPoller(store, 2, false, io.Discard)
+	poller.GitHubClient = func(checkout string) github.Client { return clients[checkout] }
+	poller.WorkflowFactory = func(*db.Store, github.Client, string) *workflow.Engine { return nil }
+
+	if _, err := pollRegisteredReposWithPoller(ctx, poller, registeredRepoSchedule{}, time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC), 30*time.Second); err != nil {
+		t.Fatalf("pollRegisteredReposWithPoller returned error: %v", err)
+	}
+
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("jobs = %+v, want two repo-scoped jobs", jobs)
+	}
+	seenRepos := map[string]bool{}
+	for _, job := range jobs {
+		var payload workflow.JobPayload
+		if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+			t.Fatalf("unmarshal job payload %s: %v", job.ID, err)
+		}
+		seenRepos[payload.Repo] = true
+		if payload.Repo == repoA.FullName() && (payload.Branch != "task-a" || payload.Instructions != "check repo a") {
+			t.Fatalf("repo A payload = %+v", payload)
+		}
+		if payload.Repo == repoB.FullName() && (payload.Branch != "task-b" || payload.Instructions != "check repo b") {
+			t.Fatalf("repo B payload = %+v", payload)
+		}
+	}
+	if !seenRepos[repoA.FullName()] || !seenRepos[repoB.FullName()] {
+		t.Fatalf("job payload repos = %+v, want both repos", seenRepos)
+	}
+	for path, client := range clients {
+		if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "queued `review` job") {
+			t.Fatalf("posted acknowledgements for %s = %+v", path, client.posted)
+		}
+	}
+	for _, repo := range []github.Repository{repoA, repoB} {
+		seen, err := store.HasCommentSeen(ctx, repo.FullName(), 77)
+		if err != nil {
+			t.Fatalf("HasCommentSeen(%s) returned error: %v", repo.FullName(), err)
+		}
+		if !seen {
+			t.Fatalf("comment 77 was not marked seen for %s", repo.FullName())
+		}
+	}
+}
+
+func TestPollRegisteredReposBacksOffFailedRepoWithoutStoppingOthers(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	for _, repo := range []db.Repo{
+		{Owner: "owner", Name: "failing", CheckoutPath: "/tmp/failing", PollInterval: "30s"},
+		{Owner: "owner", Name: "healthy", CheckoutPath: "/tmp/healthy", PollInterval: "30s"},
+	} {
+		if err := store.UpsertRepo(ctx, repo); err != nil {
+			t.Fatalf("UpsertRepo(%s) returned error: %v", repo.FullName(), err)
+		}
+	}
+	failing := &cliPollFakeGitHub{listErr: errors.New("rate limited")}
+	healthy := &cliPollFakeGitHub{}
+	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard)
+	poller.GitHubClient = func(checkout string) github.Client {
+		if checkout == "/tmp/failing" {
+			return failing
+		}
+		return healthy
+	}
+	poller.WorkflowFactory = func(*db.Store, github.Client, string) *workflow.Engine { return nil }
+	schedule := registeredRepoSchedule{
+		NextPoll:    map[string]time.Time{},
+		ErrorStreak: map[string]int{},
+	}
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+
+	wait, err := pollRegisteredReposWithPoller(ctx, poller, schedule, now, 30*time.Second)
+	if err != nil {
+		t.Fatalf("first pollRegisteredReposWithPoller returned error: %v", err)
+	}
+	if wait != 30*time.Second {
+		t.Fatalf("wait = %s, want healthy repo interval 30s", wait)
+	}
+	if got := schedule.NextPoll["owner/failing"].Sub(now); got != time.Minute {
+		t.Fatalf("failing repo next poll = %s, want 1m backoff", got)
+	}
+	if got := schedule.NextPoll["owner/healthy"].Sub(now); got != 30*time.Second {
+		t.Fatalf("healthy repo next poll = %s, want 30s", got)
+	}
+	failingRepo, err := store.GetRepo(ctx, "owner/failing")
+	if err != nil {
+		t.Fatalf("GetRepo failing returned error: %v", err)
+	}
+	healthyRepo, err := store.GetRepo(ctx, "owner/healthy")
+	if err != nil {
+		t.Fatalf("GetRepo healthy returned error: %v", err)
+	}
+	if !strings.Contains(failingRepo.LastError, "rate limited") {
+		t.Fatalf("failing repo last_error = %q", failingRepo.LastError)
+	}
+	if healthyRepo.LastError != "" {
+		t.Fatalf("healthy repo last_error = %q, want empty", healthyRepo.LastError)
+	}
+
+	if _, err := pollRegisteredReposWithPoller(ctx, poller, schedule, now.Add(31*time.Second), 30*time.Second); err != nil {
+		t.Fatalf("second pollRegisteredReposWithPoller returned error: %v", err)
+	}
+	if failing.listPullRequestsCalls != 1 {
+		t.Fatalf("failing ListPullRequests calls = %d, want still backed off at 1", failing.listPullRequestsCalls)
+	}
+	if healthy.listPullRequestsCalls != 2 {
+		t.Fatalf("healthy ListPullRequests calls = %d, want 2", healthy.listPullRequestsCalls)
+	}
+}
+
 func TestDaemonLogsEmptyWhenMissing(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer
@@ -429,4 +606,39 @@ func (f *daemonGitRunner) wantArgs(t *testing.T, index int, want ...string) {
 	if !reflect.DeepEqual(f.calls[index], want) {
 		t.Fatalf("call %d = %v, want %v", index, f.calls[index], want)
 	}
+}
+
+type cliPollFakeGitHub struct {
+	github.NoopClient
+	pulls                 []github.PullRequest
+	comments              map[int64][]github.IssueComment
+	listErr               error
+	listPullRequestsCalls int
+	posted                []cliPollPostedComment
+}
+
+type cliPollPostedComment struct {
+	issueNumber int64
+	body        string
+}
+
+func (f *cliPollFakeGitHub) ListPullRequests(context.Context, github.Repository, string) ([]github.PullRequest, error) {
+	f.listPullRequestsCalls++
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return append([]github.PullRequest(nil), f.pulls...), nil
+}
+
+func (f *cliPollFakeGitHub) ListIssueComments(_ context.Context, _ github.Repository, issueNumber int64) ([]github.IssueComment, error) {
+	return append([]github.IssueComment(nil), f.comments[issueNumber]...), nil
+}
+
+func (f *cliPollFakeGitHub) PostIssueComment(_ context.Context, _ github.Repository, issueNumber int64, body string) (github.IssueComment, error) {
+	f.posted = append(f.posted, cliPollPostedComment{issueNumber: issueNumber, body: body})
+	return github.IssueComment{ID: int64(len(f.posted)), Body: body}, nil
+}
+
+func (f *cliPollFakeGitHub) GetUserPermission(context.Context, github.Repository, string) (github.UserPermission, error) {
+	return github.UserPermission{Permission: "write", RoleName: "write"}, nil
 }

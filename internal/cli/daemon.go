@@ -776,9 +776,13 @@ func hasWhitespace(value string) bool {
 
 func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Duration, workers int, dryRun bool, stdout io.Writer) error {
 	return withStore(home, func(store *db.Store) error {
-		nextPoll := map[string]time.Time{}
+		schedule := registeredRepoSchedule{
+			NextPoll:    map[string]time.Time{},
+			ErrorStreak: map[string]int{},
+		}
+		poller := defaultRegisteredRepoPoller(store, workers, dryRun, stdout)
 		for {
-			wait, err := pollRegisteredRepos(ctx, store, workers, dryRun, stdout, nextPoll, time.Now().UTC(), poll)
+			wait, err := pollRegisteredReposWithPoller(ctx, poller, schedule, time.Now().UTC(), poll)
 			if err != nil {
 				return err
 			}
@@ -794,7 +798,57 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 }
 
 func pollRegisteredRepos(ctx context.Context, store *db.Store, workers int, dryRun bool, stdout io.Writer, nextPoll map[string]time.Time, now time.Time, fallbackPoll time.Duration) (time.Duration, error) {
-	repos, err := store.ListRepos(ctx)
+	return pollRegisteredReposWithPoller(ctx, defaultRegisteredRepoPoller(store, workers, dryRun, stdout), registeredRepoSchedule{NextPoll: nextPoll}, now, fallbackPoll)
+}
+
+type registeredRepoSchedule struct {
+	NextPoll    map[string]time.Time
+	ErrorStreak map[string]int
+}
+
+func (s registeredRepoSchedule) ensure() registeredRepoSchedule {
+	if s.NextPoll == nil {
+		s.NextPoll = map[string]time.Time{}
+	}
+	if s.ErrorStreak == nil {
+		s.ErrorStreak = map[string]int{}
+	}
+	return s
+}
+
+type registeredRepoPoller struct {
+	Store           *db.Store
+	Workers         int
+	DryRun          bool
+	Stdout          io.Writer
+	GitHubClient    func(checkout string) github.Client
+	WorkflowFactory func(store *db.Store, gh github.Client, checkout string) *workflow.Engine
+}
+
+func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdout io.Writer) registeredRepoPoller {
+	return registeredRepoPoller{
+		Store:        store,
+		Workers:      workers,
+		DryRun:       dryRun,
+		Stdout:       stdout,
+		GitHubClient: func(checkout string) github.Client { return github.NewClient(checkout) },
+		WorkflowFactory: func(store *db.Store, gh github.Client, checkout string) *workflow.Engine {
+			return &workflow.Engine{
+				Store: store,
+				MergeGate: workflow.PolicyMergeGate{
+					Store:        store,
+					GitHub:       gh,
+					Git:          gitutil.Client{Dir: checkout},
+					DeleteBranch: true,
+				},
+			}
+		},
+	}
+}
+
+func pollRegisteredReposWithPoller(ctx context.Context, poller registeredRepoPoller, schedule registeredRepoSchedule, now time.Time, fallbackPoll time.Duration) (time.Duration, error) {
+	schedule = schedule.ensure()
+	repos, err := poller.Store.ListRepos(ctx)
 	if err != nil {
 		return fallbackPoll, err
 	}
@@ -809,64 +863,86 @@ func pollRegisteredRepos(ctx context.Context, store *db.Store, workers int, dryR
 		enabled++
 		fullName := repoRecord.FullName()
 		interval := repoPollInterval(repoRecord.PollInterval, fallbackPoll)
-		dueAt := nextPoll[fullName]
+		dueAt := schedule.NextPoll[fullName]
 		if !dueAt.IsZero() && dueAt.After(now) {
 			wait = shorterWait(wait, dueAt.Sub(now), &waitSet)
 			continue
 		}
 		polled++
-		nextPoll[fullName] = now.Add(interval)
-		wait = shorterWait(wait, interval, &waitSet)
-		repo, err := daemon.ParseRepository(repoRecord.FullName())
+		lastError, err := poller.pollRepo(ctx, repoRecord, now)
 		if err != nil {
 			return wait, err
 		}
-		lastPollAt := now.Format(time.RFC3339)
-		if strings.TrimSpace(repoRecord.CheckoutPath) == "" {
-			message := "registered repo has no checkout path"
-			writeLine(stdout, "%s: %s", repoRecord.FullName(), message)
-			if err := store.UpdateRepoPollResult(ctx, repoRecord.FullName(), lastPollAt, message); err != nil {
-				return wait, err
-			}
-			continue
+		nextInterval := interval
+		if lastError != "" {
+			schedule.ErrorStreak[fullName]++
+			nextInterval = repoBackoffInterval(interval, schedule.ErrorStreak[fullName])
+		} else {
+			delete(schedule.ErrorStreak, fullName)
 		}
-		writeLine(stdout, "polling %s with %d workers dry_run=%t", repoRecord.FullName(), workers, dryRun)
-		if dryRun {
-			if err := store.UpdateRepoPollResult(ctx, repoRecord.FullName(), lastPollAt, ""); err != nil {
-				return wait, err
-			}
-			continue
-		}
-		gh := github.NewClient(repoRecord.CheckoutPath)
-		engine := workflow.Engine{
-			Store: store,
-			MergeGate: workflow.PolicyMergeGate{
-				Store:        store,
-				GitHub:       gh,
-				Git:          gitutil.Client{Dir: repoRecord.CheckoutPath},
-				DeleteBranch: true,
-			},
-		}
-		err = (daemon.Daemon{
-			Repo:     repo,
-			Store:    store,
-			GitHub:   gh,
-			Workflow: &engine,
-		}).PollOnce(ctx)
-		lastError := ""
-		if err != nil {
-			lastError = err.Error()
-			writeLine(stdout, "%s: %s", repoRecord.FullName(), lastError)
-		}
-		if updateErr := store.UpdateRepoPollResult(ctx, repoRecord.FullName(), lastPollAt, lastError); updateErr != nil {
-			return wait, updateErr
-		}
+		schedule.NextPoll[fullName] = now.Add(nextInterval)
+		wait = shorterWait(wait, nextInterval, &waitSet)
 	}
-	writeLine(stdout, "supervised %d enabled repos, polled %d", enabled, polled)
+	writeLine(poller.Stdout, "supervised %d enabled repos, polled %d", enabled, polled)
 	if wait <= 0 {
 		wait = fallbackPoll
 	}
 	return wait, nil
+}
+
+func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, now time.Time) (string, error) {
+	store := p.Store
+	repo, err := daemon.ParseRepository(repoRecord.FullName())
+	if err != nil {
+		lastError := err.Error()
+		writeLine(p.Stdout, "%s: %s", repoRecord.FullName(), lastError)
+		return lastError, store.UpdateRepoPollResult(ctx, repoRecord.FullName(), now.Format(time.RFC3339), lastError)
+	}
+	lastPollAt := now.Format(time.RFC3339)
+	if strings.TrimSpace(repoRecord.CheckoutPath) == "" {
+		message := "registered repo has no checkout path"
+		writeLine(p.Stdout, "%s: %s", repoRecord.FullName(), message)
+		return message, store.UpdateRepoPollResult(ctx, repoRecord.FullName(), lastPollAt, message)
+	}
+	writeLine(p.Stdout, "polling %s with %d workers dry_run=%t", repoRecord.FullName(), p.Workers, p.DryRun)
+	if p.DryRun {
+		return "", store.UpdateRepoPollResult(ctx, repoRecord.FullName(), lastPollAt, "")
+	}
+	gh := p.GitHubClient(repoRecord.CheckoutPath)
+	engine := p.WorkflowFactory(store, gh, repoRecord.CheckoutPath)
+	err = (daemon.Daemon{
+		Repo:     repo,
+		Store:    store,
+		GitHub:   gh,
+		Workflow: engine,
+	}).PollOnce(ctx)
+	lastError := ""
+	if err != nil {
+		lastError = err.Error()
+		writeLine(p.Stdout, "%s: %s", repoRecord.FullName(), lastError)
+	}
+	return lastError, store.UpdateRepoPollResult(ctx, repoRecord.FullName(), lastPollAt, lastError)
+}
+
+func repoBackoffInterval(base time.Duration, streak int) time.Duration {
+	if streak <= 0 {
+		return base
+	}
+	maxBackoff := base * 8
+	if maxBackoff < 5*time.Minute {
+		maxBackoff = 5 * time.Minute
+	}
+	backoff := base
+	for i := 0; i < streak; i++ {
+		if backoff >= maxBackoff/2 {
+			return maxBackoff
+		}
+		backoff *= 2
+	}
+	if backoff > maxBackoff {
+		return maxBackoff
+	}
+	return backoff
 }
 
 func repoPollInterval(value string, fallback time.Duration) time.Duration {
