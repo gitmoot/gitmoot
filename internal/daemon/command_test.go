@@ -40,6 +40,23 @@ func TestParseCommandsOnlyReturnsGitmootLines(t *testing.T) {
 	}
 }
 
+func TestParseJobRecoveryCommands(t *testing.T) {
+	command, ok := ParseCommand("/gitmoot retry job-123")
+	if !ok {
+		t.Fatal("ParseCommand did not parse retry command")
+	}
+	if command.Action != "retry" || command.JobID != "job-123" {
+		t.Fatalf("retry command = %+v", command)
+	}
+	command, ok = ParseCommand("/gitmoot cancel job-456")
+	if !ok {
+		t.Fatal("ParseCommand did not parse cancel command")
+	}
+	if command.Action != "cancel" || command.JobID != "job-456" {
+		t.Fatalf("cancel command = %+v", command)
+	}
+}
+
 func TestValidateRejectsUnsupportedCommand(t *testing.T) {
 	if err := (Command{Action: "deploy", Agent: "audit"}).Validate(); err == nil {
 		t.Fatal("Validate accepted unsupported action")

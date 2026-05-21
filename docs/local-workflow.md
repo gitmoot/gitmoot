@@ -20,6 +20,10 @@ gitmoot agent list
 gitmoot agent doctor <name>
 gitmoot goal import --file GOAL.md --repo owner/repo
 gitmoot task run task-001 --repo owner/repo --owner lead --base main
+gitmoot job list
+gitmoot job show <job-id>
+gitmoot job retry <job-id>
+gitmoot job cancel <job-id>
 gitmoot status --repo owner/repo
 gitmoot daemon start --repo owner/repo --poll 30s
 ```
@@ -96,6 +100,8 @@ planned tasks. `task run` starts one task branch and records its branch lock.
    ```text
    /gitmoot audit review focus on correctness and missed edge cases
    /gitmoot lead implement fix the review findings without broad refactors
+   /gitmoot retry <job-id>
+   /gitmoot cancel <job-id>
    ```
 
    Implement jobs require the agent to hold the branch lock. Review and ask jobs

@@ -29,6 +29,7 @@ var rootCommands = []command{
 	{name: "status", summary: "show local workflow status", run: runStatus},
 	{name: "goal", summary: "import or inspect goals", run: runGoal},
 	{name: "task", summary: "run or inspect tasks", run: runTask},
+	{name: "job", summary: "inspect and recover jobs", run: runJob},
 }
 
 func Run(args []string, stdout, stderr io.Writer) int {

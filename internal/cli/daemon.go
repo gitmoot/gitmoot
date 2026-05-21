@@ -785,21 +785,35 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 		poller := defaultRegisteredRepoPoller(store, workers, dryRun, stdout)
 		worker := defaultJobWorker(store, stdout)
 		worker.CommenterFactory = worker.defaultCommenter
+		checkoutLocks := &repoCheckoutLocks{}
+		poller.CheckoutLocks = checkoutLocks
+		var workerErr <-chan error
+		if !dryRun {
+			if err := recoverCancelledRunningJobsForEnabledRepos(ctx, store, stdout); err != nil {
+				return err
+			}
+			workerErr = startSupervisorWorkerLoop(ctx, daemonWorkerLoopInterval, func(now time.Time) error {
+				return runEnabledRepoWorkerTicksWithLocks(ctx, store, worker, workers, stdout, now, checkoutLocks)
+			})
+		}
 		for {
+			if err := receiveSupervisorWorkerError(workerErr); err != nil {
+				return err
+			}
 			wait, err := pollRegisteredReposWithPoller(ctx, poller, schedule, time.Now().UTC(), poll)
 			if err != nil {
 				return err
-			}
-			if !dryRun {
-				if err := runEnabledRepoWorkerTicks(ctx, store, worker, workers, stdout, time.Now().UTC()); err != nil {
-					return err
-				}
 			}
 			timer := time.NewTimer(wait)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
 				return ctx.Err()
+			case err := <-workerErr:
+				timer.Stop()
+				if err != nil {
+					return err
+				}
 			case <-timer.C:
 			}
 		}
@@ -810,28 +824,98 @@ func runSingleRepoSupervisor(ctx context.Context, d daemon.Daemon, store *db.Sto
 	if err := recoverRunningJobsForRepo(ctx, store, stdout, d.Repo.FullName()); err != nil {
 		return err
 	}
+	if err := recoverCancelledRunningJobsForRepo(ctx, store, stdout, d.Repo.FullName()); err != nil {
+		return err
+	}
 	interval := d.PollInterval
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
 	worker := defaultJobWorker(store, stdout)
 	worker.CommenterFactory = worker.defaultCommenter
+	var checkoutLock sync.Mutex
+	workerErr := startSupervisorWorkerLoop(ctx, daemonWorkerLoopInterval, func(now time.Time) error {
+		checkoutLock.Lock()
+		defer checkoutLock.Unlock()
+		return runDaemonWorkerTick(ctx, store, worker, workers, false, d.Repo.FullName(), stdout, now)
+	})
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		_ = d.PollOnce(ctx)
-		if err := runDaemonWorkerTick(ctx, store, worker, workers, false, d.Repo.FullName(), stdout, time.Now().UTC()); err != nil {
+		if err := receiveSupervisorWorkerError(workerErr); err != nil {
 			return err
+		}
+		if checkoutLock.TryLock() {
+			_ = d.PollOnce(ctx)
+			checkoutLock.Unlock()
+		} else {
+			_ = d.PollRecoveryCommandsOnce(ctx)
 		}
 		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return ctx.Err()
+		case err := <-workerErr:
+			timer.Stop()
+			if err != nil {
+				return err
+			}
 		case <-timer.C:
 		}
 	}
+}
+
+func startSupervisorWorkerLoop(ctx context.Context, interval time.Duration, run func(time.Time) error) <-chan error {
+	errCh := make(chan error, 1)
+	if interval <= 0 {
+		interval = daemonWorkerLoopInterval
+	}
+	go func() {
+		defer close(errCh)
+		for {
+			if err := ctx.Err(); err != nil {
+				return
+			}
+			if err := run(time.Now().UTC()); err != nil {
+				errCh <- err
+				return
+			}
+			timer := time.NewTimer(interval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+	}()
+	return errCh
+}
+
+func receiveSupervisorWorkerError(errCh <-chan error) error {
+	if errCh == nil {
+		return nil
+	}
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return nil
+	}
+}
+
+type repoCheckoutLocks struct {
+	locks sync.Map
+}
+
+func (l *repoCheckoutLocks) For(repo string) *sync.Mutex {
+	if l == nil {
+		return nil
+	}
+	value, _ := l.locks.LoadOrStore(repo, &sync.Mutex{})
+	return value.(*sync.Mutex)
 }
 
 func pollRegisteredRepos(ctx context.Context, store *db.Store, workers int, dryRun bool, stdout io.Writer, nextPoll map[string]time.Time, now time.Time, fallbackPoll time.Duration) (time.Duration, error) {
@@ -858,6 +942,8 @@ type registeredRepoPoller struct {
 	Workers         int
 	DryRun          bool
 	Stdout          io.Writer
+	RecoveryOnly    bool
+	CheckoutLocks   *repoCheckoutLocks
 	GitHubClient    func(checkout string) github.Client
 	WorkflowFactory func(store *db.Store, gh github.Client, checkout string) *workflow.Engine
 }
@@ -940,12 +1026,25 @@ func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, 
 	}
 	gh := p.GitHubClient(repoRecord.CheckoutPath)
 	engine := p.WorkflowFactory(store, gh, repoRecord.CheckoutPath)
-	err = (daemon.Daemon{
+	recoveryOnly := p.RecoveryOnly
+	if lock := p.CheckoutLocks.For(repoRecord.FullName()); lock != nil {
+		if lock.TryLock() {
+			defer lock.Unlock()
+		} else {
+			recoveryOnly = true
+		}
+	}
+	d := daemon.Daemon{
 		Repo:     repo,
 		Store:    store,
 		GitHub:   gh,
 		Workflow: engine,
-	}).PollOnce(ctx)
+	}
+	if recoveryOnly {
+		err = d.PollRecoveryCommandsOnce(ctx)
+	} else {
+		err = d.PollOnce(ctx)
+	}
 	lastError := ""
 	if err != nil {
 		lastError = err.Error()
@@ -1004,6 +1103,8 @@ type jobWorker struct {
 }
 
 const daemonRunningJobStaleAfter = 30 * time.Minute
+const daemonJobCancelPollInterval = 250 * time.Millisecond
+const daemonWorkerLoopInterval = 1 * time.Second
 
 func defaultJobWorker(store *db.Store, stdout io.Writer) jobWorker {
 	worker := jobWorker{Store: store, Stdout: stdout}
@@ -1023,6 +1124,42 @@ func recoverRunningJobsBefore(ctx context.Context, store *db.Store, stdout io.Wr
 
 func recoverRunningJobsForRepo(ctx context.Context, store *db.Store, stdout io.Writer, repoFilter string) error {
 	return recoverRunningJobsBeforeForRepo(ctx, store, stdout, time.Now().UTC().Add(-daemonRunningJobStaleAfter), repoFilter)
+}
+
+func recoverCancelledRunningJobsForEnabledRepos(ctx context.Context, store *db.Store, stdout io.Writer) error {
+	repos, err := store.ListRepos(ctx)
+	if err != nil {
+		return err
+	}
+	for _, repo := range repos {
+		if !repo.Enabled {
+			continue
+		}
+		if err := recoverCancelledRunningJobsForRepo(ctx, store, stdout, repo.FullName()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func recoverCancelledRunningJobsForRepo(ctx context.Context, store *db.Store, stdout io.Writer, repoFilter string) error {
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		return err
+	}
+	for _, job := range jobs {
+		if job.State != string(workflow.JobCancelled) || !queuedJobMatchesRepo(job, repoFilter) {
+			continue
+		}
+		settled, err := workflow.SettleCancelledRunningJob(ctx, store, job.ID, "cancelled job recovered after daemon restart")
+		if err != nil {
+			return err
+		}
+		if settled {
+			writeLine(stdout, "settled cancelled running job %s", job.ID)
+		}
+	}
+	return nil
 }
 
 func recoverRunningJobsBeforeForRepo(ctx context.Context, store *db.Store, stdout io.Writer, before time.Time, repoFilter string) error {
@@ -1093,6 +1230,10 @@ func runDaemonWorkerTick(ctx context.Context, store *db.Store, worker jobWorker,
 }
 
 func runEnabledRepoWorkerTicks(ctx context.Context, store *db.Store, worker jobWorker, workers int, stdout io.Writer, now time.Time) error {
+	return runEnabledRepoWorkerTicksWithLocks(ctx, store, worker, workers, stdout, now, nil)
+}
+
+func runEnabledRepoWorkerTicksWithLocks(ctx context.Context, store *db.Store, worker jobWorker, workers int, stdout io.Writer, now time.Time, locks *repoCheckoutLocks) error {
 	repos, err := store.ListRepos(ctx)
 	if err != nil {
 		return err
@@ -1101,8 +1242,18 @@ func runEnabledRepoWorkerTicks(ctx context.Context, store *db.Store, worker jobW
 		if !repo.Enabled {
 			continue
 		}
+		lock := locks.For(repo.FullName())
+		if lock != nil {
+			lock.Lock()
+		}
 		if err := runDaemonWorkerTick(ctx, store, worker, workers, false, repo.FullName(), stdout, now); err != nil {
+			if lock != nil {
+				lock.Unlock()
+			}
 			return err
+		}
+		if lock != nil {
+			lock.Unlock()
 		}
 	}
 	return nil
@@ -1255,7 +1406,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	writeLine(w.Stdout, "running job %s for %s in %s", job.ID, agent.Name, payload.Repo)
 	engine := w.WorkflowFactory(checkout)
-	_, err = engine.RunJob(ctx, job.ID, agent, adapter)
+	runCtx, stopRun := w.runningJobContext(ctx, job.ID)
+	defer stopRun()
+	_, err = engine.RunJob(runCtx, job.ID, agent, adapter)
 	if err != nil {
 		if markErr := w.handleRunJobError(ctx, job.ID, err); markErr != nil {
 			return markErr
@@ -1269,6 +1422,32 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	return nil
 }
 
+func (w jobWorker) runningJobContext(ctx context.Context, jobID string) (context.Context, func()) {
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(daemonJobCancelPollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				job, err := w.Store.GetJob(ctx, jobID)
+				if err == nil && job.State == string(workflow.JobCancelled) {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return runCtx, func() {
+		cancel()
+		<-done
+	}
+}
+
 func (w jobWorker) jobNeedsAdvanceRetry(ctx context.Context, jobID string) (bool, error) {
 	events, err := w.Store.ListJobEvents(ctx, jobID)
 	if err != nil {
@@ -1280,6 +1459,8 @@ func (w jobWorker) jobNeedsAdvanceRetry(ctx context.Context, jobID string) (bool
 		case "advance_started", "advance_retry":
 			needsRetry = true
 		case "advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped":
+			needsRetry = false
+		case "retry_queued":
 			needsRetry = false
 		}
 	}
@@ -1540,7 +1721,8 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, cause er
 		return w.finishQueuedJob(ctx, jobID, state, cause)
 	}
 	if latest.State == string(workflow.JobCancelled) {
-		return nil
+		_, err := workflow.SettleCancelledRunningJob(ctx, w.Store, latest.ID, "cancelled job worker settled")
+		return err
 	}
 	payload, payloadErr := daemonJobPayload(latest)
 	if payloadErr == nil && payload.Result != nil {
@@ -1617,12 +1799,16 @@ func (w jobWorker) jobResultCommentPosted(ctx context.Context, jobID string) (bo
 	if err != nil {
 		return false, err
 	}
+	posted := false
 	for _, event := range events {
-		if event.Kind == "comment_posted" {
-			return true, nil
+		switch event.Kind {
+		case "retry_queued":
+			posted = false
+		case "comment_posted":
+			posted = true
 		}
 	}
-	return false, nil
+	return posted, nil
 }
 
 func (w jobWorker) jobNeedsCommentRetry(ctx context.Context, jobID string) (bool, error) {
@@ -1636,6 +1822,8 @@ func (w jobWorker) jobNeedsCommentRetry(ctx context.Context, jobID string) (bool
 		case "comment_post_failed":
 			needsRetry = true
 		case "comment_posted":
+			needsRetry = false
+		case "retry_queued":
 			needsRetry = false
 		}
 	}

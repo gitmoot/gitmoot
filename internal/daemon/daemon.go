@@ -114,6 +114,28 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	return firstErr
 }
 
+func (d Daemon) PollRecoveryCommandsOnce(ctx context.Context) error {
+	if err := d.validate(); err != nil {
+		return err
+	}
+	pulls, err := d.GitHub.ListPullRequests(ctx, d.Repo, "open")
+	if err != nil {
+		return err
+	}
+	for _, pull := range pulls {
+		comments, err := d.GitHub.ListIssueComments(ctx, d.Repo, pull.Number)
+		if err != nil {
+			return err
+		}
+		for _, comment := range comments {
+			if err := d.handleRecoveryComment(ctx, pull, comment); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (d Daemon) validate() error {
 	if d.Store == nil {
 		return errors.New("daemon store is required")
@@ -417,6 +439,48 @@ func (d Daemon) handleComment(ctx context.Context, pull github.PullRequest, comm
 	return d.markCommentSeen(ctx, pull, comment)
 }
 
+func (d Daemon) handleRecoveryComment(ctx context.Context, pull github.PullRequest, comment github.IssueComment) error {
+	commands := ParseCommands(comment.Body)
+	if len(commands) == 0 || !onlyJobRecoveryCommands(commands) {
+		return nil
+	}
+
+	seen, err := d.Store.HasCommentSeen(ctx, d.Repo.FullName(), comment.ID)
+	if err != nil {
+		return err
+	}
+	if seen {
+		return nil
+	}
+
+	authorized, err := d.authorizeCommenter(ctx, comment.Author)
+	if err != nil {
+		return err
+	}
+	if !authorized {
+		if err := d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot ignored comment %d from `%s`: `/gitmoot` commands require write, maintain, or admin repository permission.", comment.ID, comment.Author)); err != nil {
+			return err
+		}
+		return d.markCommentSeen(ctx, pull, comment)
+	}
+
+	for sequence, command := range commands {
+		if err := d.handleCommand(ctx, pull, comment, sequence, command); err != nil {
+			return err
+		}
+	}
+	return d.markCommentSeen(ctx, pull, comment)
+}
+
+func onlyJobRecoveryCommands(commands []Command) bool {
+	for _, command := range commands {
+		if command.Action != "retry" && command.Action != "cancel" {
+			return false
+		}
+	}
+	return true
+}
+
 func (d Daemon) handleCommand(ctx context.Context, pull github.PullRequest, comment github.IssueComment, sequence int, command Command) error {
 	if err := command.Validate(); err != nil {
 		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not route comment %d: %v.", comment.ID, err))
@@ -426,6 +490,10 @@ func (d Daemon) handleCommand(ctx context.Context, pull github.PullRequest, comm
 		return d.handleStatusCommand(ctx, pull, comment)
 	case "merge":
 		return d.handleMergeCommand(ctx, pull, comment)
+	case "retry":
+		return d.handleRetryCommand(ctx, pull, command)
+	case "cancel":
+		return d.handleCancelCommand(ctx, pull, command)
 	}
 
 	agent, err := d.Store.GetAgent(ctx, command.Agent)
@@ -491,6 +559,46 @@ func (d Daemon) handleCommand(ctx context.Context, pull github.PullRequest, comm
 		}
 	}
 	return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot queued `%s` job `%s` for `%s`.", command.Action, job.ID, agent.Name))
+}
+
+func (d Daemon) handleRetryCommand(ctx context.Context, pull github.PullRequest, command Command) error {
+	if err := d.validateJobCommandScope(ctx, pull, command.JobID); err != nil {
+		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not retry job `%s`: %v.", command.JobID, err))
+	}
+	job, err := workflow.RetryJob(ctx, d.Store, command.JobID)
+	if err != nil {
+		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not retry job `%s`: %v.", command.JobID, err))
+	}
+	return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot queued retry for job `%s`.", job.ID))
+}
+
+func (d Daemon) handleCancelCommand(ctx context.Context, pull github.PullRequest, command Command) error {
+	if err := d.validateJobCommandScope(ctx, pull, command.JobID); err != nil {
+		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not cancel job `%s`: %v.", command.JobID, err))
+	}
+	job, err := workflow.CancelJob(ctx, d.Store, command.JobID)
+	if err != nil {
+		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not cancel job `%s`: %v.", command.JobID, err))
+	}
+	return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot cancelled job `%s`.", job.ID))
+}
+
+func (d Daemon) validateJobCommandScope(ctx context.Context, pull github.PullRequest, jobID string) error {
+	job, err := d.Store.GetJob(ctx, jobID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("job not found")
+		}
+		return err
+	}
+	payload, err := workflowPayload(job)
+	if err != nil {
+		return err
+	}
+	if payload.Repo != d.Repo.FullName() || int64(payload.PullRequest) != pull.Number {
+		return fmt.Errorf("job belongs to %s PR #%d", payload.Repo, payload.PullRequest)
+	}
+	return nil
 }
 
 func (d Daemon) handleStatusCommand(ctx context.Context, pull github.PullRequest, comment github.IssueComment) error {
