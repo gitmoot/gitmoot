@@ -226,10 +226,14 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fmt.Errorf("invalid repo: %w", err)
 		}
-		checkout, err := resolveDaemonCheckout(context.Background(), repo, gitutil.Client{Dir: "."})
+		repoRecord, err := repoRecordForCheckout(context.Background(), repo, gitutil.Client{Dir: "."})
 		if err != nil {
 			return err
 		}
+		if err := store.UpsertRepo(context.Background(), repoRecord); err != nil {
+			return err
+		}
+		checkout := repoRecord.CheckoutPath
 		requestBranch := firstNonEmpty(*branch, task.Branch, task.ID)
 		engine := workflow.Engine{Store: store}
 		started, err = engine.StartTaskBranch(context.Background(), workflow.TaskBranchRequest{

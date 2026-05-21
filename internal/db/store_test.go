@@ -49,8 +49,58 @@ func TestRepositoryMethods(t *testing.T) {
 	}
 	defer store.Close()
 
-	if err := store.UpsertRepo(ctx, Repo{Owner: "jerryfane", Name: "gitmoot", DefaultBranch: "main"}); err != nil {
+	if err := store.UpsertRepo(ctx, Repo{Owner: "jerryfane", Name: "gitmoot", DefaultBranch: "main", RemoteURL: "https://github.com/jerryfane/gitmoot.git", CheckoutPath: "/repo/gitmoot"}); err != nil {
 		t.Fatalf("UpsertRepo returned error: %v", err)
+	}
+	repo, err := store.GetRepo(ctx, "jerryfane/gitmoot")
+	if err != nil {
+		t.Fatalf("GetRepo returned error: %v", err)
+	}
+	if repo.FullName() != "jerryfane/gitmoot" || repo.DefaultBranch != "main" || repo.RemoteURL == "" || repo.CheckoutPath != "/repo/gitmoot" || !repo.Enabled || repo.PollInterval != "30s" {
+		t.Fatalf("repo = %+v", repo)
+	}
+	if err := store.UpsertRepo(ctx, Repo{Owner: "jerryfane", Name: "gitmoot", PollInterval: "1m"}); err != nil {
+		t.Fatalf("second UpsertRepo returned error: %v", err)
+	}
+	repo, err = store.GetRepo(ctx, "jerryfane/gitmoot")
+	if err != nil {
+		t.Fatalf("GetRepo after update returned error: %v", err)
+	}
+	if repo.DefaultBranch != "main" || repo.RemoteURL == "" || repo.CheckoutPath != "/repo/gitmoot" || repo.PollInterval != "1m" {
+		t.Fatalf("updated repo lost existing fields: %+v", repo)
+	}
+	if err := store.UpsertRepo(ctx, Repo{Owner: "jerryfane", Name: "gitmoot", RemoteURL: "git@github.com:jerryfane/gitmoot.git"}); err != nil {
+		t.Fatalf("auto UpsertRepo returned error: %v", err)
+	}
+	repo, err = store.GetRepo(ctx, "jerryfane/gitmoot")
+	if err != nil {
+		t.Fatalf("GetRepo after auto update returned error: %v", err)
+	}
+	if repo.RemoteURL != "git@github.com:jerryfane/gitmoot.git" || repo.PollInterval != "1m" {
+		t.Fatalf("auto update did not preserve configured poll interval: %+v", repo)
+	}
+	if err := store.SetRepoEnabled(ctx, "jerryfane/gitmoot", false); err != nil {
+		t.Fatalf("SetRepoEnabled returned error: %v", err)
+	}
+	if err := store.UpdateRepoPollResult(ctx, "jerryfane/gitmoot", "2026-05-21T12:00:00Z", "rate limited"); err != nil {
+		t.Fatalf("UpdateRepoPollResult returned error: %v", err)
+	}
+	repos, err := store.ListRepos(ctx)
+	if err != nil {
+		t.Fatalf("ListRepos returned error: %v", err)
+	}
+	if len(repos) != 1 || repos[0].Enabled || repos[0].LastPollAt == "" || repos[0].LastError != "rate limited" {
+		t.Fatalf("repos = %+v", repos)
+	}
+	removed, err := store.RemoveRepo(ctx, "jerryfane/gitmoot")
+	if err != nil {
+		t.Fatalf("RemoveRepo returned error: %v", err)
+	}
+	if !removed {
+		t.Fatal("RemoveRepo did not remove repo")
+	}
+	if err := store.UpsertRepo(ctx, repo); err != nil {
+		t.Fatalf("restore UpsertRepo returned error: %v", err)
 	}
 	if err := store.UpsertAgent(ctx, Agent{Name: "audit", Role: "reviewer", Runtime: "codex", RuntimeRef: "session", RepoScope: "jerryfane/gitmoot", Capabilities: []string{"review"}, AutonomyPolicy: "auto", HealthStatus: "ok"}); err != nil {
 		t.Fatalf("UpsertAgent returned error: %v", err)
@@ -269,7 +319,7 @@ func TestRepositoryMethods(t *testing.T) {
 	if err := store.UpsertMergeGate(ctx, MergeGate{RepoFullName: "jerryfane/gitmoot", PullRequest: 1, State: "pending", Reason: "waiting"}); err != nil {
 		t.Fatalf("UpsertMergeGate returned error: %v", err)
 	}
-	removed, err := store.RemoveAgent(ctx, "audit")
+	removed, err = store.RemoveAgent(ctx, "audit")
 	if err != nil {
 		t.Fatalf("RemoveAgent returned error: %v", err)
 	}

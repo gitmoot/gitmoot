@@ -337,6 +337,44 @@ func TestRunTaskRunRejectsWrongCheckout(t *testing.T) {
 	}
 }
 
+func TestRunTaskRunRegistersCurrentRepo(t *testing.T) {
+	home := t.TempDir()
+	goalPath := filepath.Join(t.TempDir(), "GOAL.md")
+	writeFile(t, goalPath, "# Build Gitmoot\n\n### Task 1: Bootstrap\n")
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"goal", "import", "--home", home, "--file", goalPath, "--repo", "jerryfane/gitmoot"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("goal import exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/jerryfane/gitmoot.git")
+	withWorkingDirectory(t, repoDir)
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"task", "run", "task-001", "--home", home, "--repo", "jerryfane/gitmoot", "--owner", "lead"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("task run exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+	repo, err := store.GetRepo(context.Background(), "jerryfane/gitmoot")
+	if err != nil {
+		t.Fatalf("GetRepo returned error: %v", err)
+	}
+	if repo.CheckoutPath != repoDir || repo.RemoteURL != "https://github.com/jerryfane/gitmoot.git" {
+		t.Fatalf("repo = %+v", repo)
+	}
+}
+
 func TestTaskBranchNameFallsBackToTaskID(t *testing.T) {
 	if got := taskBranchName("task-001", "!!!"); got != "task-001" {
 		t.Fatalf("taskBranchName returned %q, want task-001", got)

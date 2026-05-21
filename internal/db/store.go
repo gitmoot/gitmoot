@@ -20,6 +20,11 @@ type Repo struct {
 	Name          string
 	DefaultBranch string
 	RemoteURL     string
+	CheckoutPath  string
+	Enabled       bool
+	PollInterval  string
+	LastPollAt    string
+	LastError     string
 }
 
 type Agent struct {
@@ -167,14 +172,94 @@ func (s *Store) applyMigration(ctx context.Context, version int, migration strin
 
 func (s *Store) UpsertRepo(ctx context.Context, repo Repo) error {
 	fullName := repo.Owner + "/" + repo.Name
-	_, err := s.db.ExecContext(ctx, `INSERT INTO repos(owner, name, full_name, default_branch, remote_url, updated_at)
-		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	updatePollInterval := repo.PollInterval
+	insertPollInterval := repo.PollInterval
+	if strings.TrimSpace(insertPollInterval) == "" {
+		insertPollInterval = "30s"
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO repos(owner, name, full_name, default_branch, remote_url, checkout_path, enabled, poll_interval, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, 1, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(full_name) DO UPDATE SET
-			default_branch = excluded.default_branch,
-			remote_url = excluded.remote_url,
+			default_branch = CASE WHEN excluded.default_branch <> '' THEN excluded.default_branch ELSE repos.default_branch END,
+			remote_url = CASE WHEN excluded.remote_url <> '' THEN excluded.remote_url ELSE repos.remote_url END,
+			checkout_path = CASE WHEN excluded.checkout_path <> '' THEN excluded.checkout_path ELSE repos.checkout_path END,
+			poll_interval = CASE WHEN ? <> '' THEN excluded.poll_interval ELSE repos.poll_interval END,
 			updated_at = CURRENT_TIMESTAMP`,
-		repo.Owner, repo.Name, fullName, repo.DefaultBranch, repo.RemoteURL)
+		repo.Owner, repo.Name, fullName, repo.DefaultBranch, repo.RemoteURL, repo.CheckoutPath, insertPollInterval, updatePollInterval)
 	return err
+}
+
+func (s *Store) GetRepo(ctx context.Context, fullName string) (Repo, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT owner, name, default_branch, remote_url, checkout_path, enabled, poll_interval, last_poll_at, last_error
+		FROM repos WHERE full_name = ?`, fullName)
+	return scanRepo(row)
+}
+
+func (s *Store) ListRepos(ctx context.Context) ([]Repo, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT owner, name, default_branch, remote_url, checkout_path, enabled, poll_interval, last_poll_at, last_error
+		FROM repos ORDER BY full_name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	repos := []Repo{}
+	for rows.Next() {
+		repo, err := scanRepo(rows)
+		if err != nil {
+			return nil, err
+		}
+		repos = append(repos, repo)
+	}
+	return repos, rows.Err()
+}
+
+func (s *Store) SetRepoEnabled(ctx context.Context, fullName string, enabled bool) error {
+	value := 0
+	if enabled {
+		value = 1
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE repos SET enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE full_name = ?`, value, fullName)
+	if err != nil {
+		return err
+	}
+	return requireAffected(result, "repo", fullName)
+}
+
+func (s *Store) UpdateRepoPollResult(ctx context.Context, fullName string, lastPollAt string, lastError string) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE repos SET last_poll_at = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE full_name = ?`, lastPollAt, lastError, fullName)
+	if err != nil {
+		return err
+	}
+	return requireAffected(result, "repo", fullName)
+}
+
+func (s *Store) RemoveRepo(ctx context.Context, fullName string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM repos WHERE full_name = ?`, fullName)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
+func scanRepo(row interface{ Scan(dest ...any) error }) (Repo, error) {
+	var repo Repo
+	var enabled int
+	if err := row.Scan(&repo.Owner, &repo.Name, &repo.DefaultBranch, &repo.RemoteURL, &repo.CheckoutPath, &enabled, &repo.PollInterval, &repo.LastPollAt, &repo.LastError); err != nil {
+		return Repo{}, err
+	}
+	repo.Enabled = enabled != 0
+	return repo, nil
+}
+
+func (r Repo) FullName() string {
+	if r.Owner == "" || r.Name == "" {
+		return ""
+	}
+	return r.Owner + "/" + r.Name
 }
 
 func (s *Store) UpsertAgent(ctx context.Context, agent Agent) error {
@@ -893,5 +978,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_branch_unique ON tasks(repo_ful
 	`,
 	`
 ALTER TABLE pull_requests ADD COLUMN merge_commit_sha TEXT NOT NULL DEFAULT '';
+	`,
+	`
+ALTER TABLE repos ADD COLUMN checkout_path TEXT NOT NULL DEFAULT '';
+ALTER TABLE repos ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE repos ADD COLUMN poll_interval TEXT NOT NULL DEFAULT '30s';
+ALTER TABLE repos ADD COLUMN last_poll_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE repos ADD COLUMN last_error TEXT NOT NULL DEFAULT '';
 	`,
 }

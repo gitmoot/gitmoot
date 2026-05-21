@@ -66,10 +66,15 @@ func runDaemonStart(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 
 	err = withStore(*home, func(store *db.Store) error {
-		checkout, err := resolveDaemonCheckout(ctx, repo, gitutil.Client{Dir: "."})
+		repoRecord, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: "."})
 		if err != nil {
 			return err
 		}
+		repoRecord.PollInterval = poll.String()
+		if err := store.UpsertRepo(ctx, repoRecord); err != nil {
+			return err
+		}
+		checkout := repoRecord.CheckoutPath
 		gh := github.NewClient(checkout)
 		engine := workflow.Engine{
 			Store: store,
@@ -100,20 +105,38 @@ func runDaemonStart(args []string, stdout, stderr io.Writer) int {
 }
 
 func resolveDaemonCheckout(ctx context.Context, repo github.Repository, client gitutil.Client) (string, error) {
-	root, err := client.Root(ctx)
-	if err != nil {
-		return "", fmt.Errorf("resolve daemon checkout: %w", err)
-	}
-	remote, err := client.OriginRemote(ctx)
-	if err != nil {
-		return "", fmt.Errorf("resolve daemon checkout remote: %w", err)
-	}
-	remoteRepo, err := gitutil.ParseGitHubRemote(remote)
+	record, err := repoRecordForCheckout(ctx, repo, client)
 	if err != nil {
 		return "", err
 	}
-	if remoteRepo.String() != repo.FullName() {
-		return "", fmt.Errorf("current checkout origin is %s, not %s", remoteRepo.String(), repo.FullName())
+	return record.CheckoutPath, nil
+}
+
+func repoRecordForCheckout(ctx context.Context, repo github.Repository, client gitutil.Client) (db.Repo, error) {
+	root, err := client.Root(ctx)
+	if err != nil {
+		return db.Repo{}, fmt.Errorf("resolve repo checkout: %w", err)
 	}
-	return root, nil
+	remote, err := client.OriginRemote(ctx)
+	if err != nil {
+		return db.Repo{}, fmt.Errorf("resolve repo checkout remote: %w", err)
+	}
+	remoteRepo, err := gitutil.ParseGitHubRemote(remote)
+	if err != nil {
+		return db.Repo{}, err
+	}
+	if remoteRepo.String() != repo.FullName() {
+		return db.Repo{}, fmt.Errorf("current checkout origin is %s, not %s", remoteRepo.String(), repo.FullName())
+	}
+	defaultBranch := ""
+	if branch, err := client.CurrentBranch(ctx); err == nil {
+		defaultBranch = branch
+	}
+	return db.Repo{
+		Owner:         repo.Owner,
+		Name:          repo.Name,
+		DefaultBranch: defaultBranch,
+		RemoteURL:     remote,
+		CheckoutPath:  root,
+	}, nil
 }
