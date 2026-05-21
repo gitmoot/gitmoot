@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/db"
 	gitutil "github.com/jerryfane/gitmoot/internal/git"
 	"github.com/jerryfane/gitmoot/internal/github"
+	"github.com/jerryfane/gitmoot/internal/runtime"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
@@ -190,13 +192,13 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 			},
 		}
 		fmt.Fprintf(stdout, "watching %s every %s\n", repo.FullName(), poll.String())
-		return (daemon.Daemon{
+		return runSingleRepoSupervisor(ctx, daemon.Daemon{
 			Repo:         repo,
 			PollInterval: *poll,
 			Store:        store,
 			GitHub:       gh,
 			Workflow:     &engine,
-		}).Run(ctx)
+		}, store, *workers, stdout)
 	})
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return 0
@@ -781,10 +783,16 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 			ErrorStreak: map[string]int{},
 		}
 		poller := defaultRegisteredRepoPoller(store, workers, dryRun, stdout)
+		worker := defaultJobWorker(store, stdout)
 		for {
 			wait, err := pollRegisteredReposWithPoller(ctx, poller, schedule, time.Now().UTC(), poll)
 			if err != nil {
 				return err
+			}
+			if !dryRun {
+				if err := runEnabledRepoWorkerTicks(ctx, store, worker, workers, stdout, time.Now().UTC()); err != nil {
+					return err
+				}
 			}
 			timer := time.NewTimer(wait)
 			select {
@@ -795,6 +803,33 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 			}
 		}
 	})
+}
+
+func runSingleRepoSupervisor(ctx context.Context, d daemon.Daemon, store *db.Store, workers int, stdout io.Writer) error {
+	if err := recoverRunningJobsForRepo(ctx, store, stdout, d.Repo.FullName()); err != nil {
+		return err
+	}
+	interval := d.PollInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	worker := defaultJobWorker(store, stdout)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		_ = d.PollOnce(ctx)
+		if err := runDaemonWorkerTick(ctx, store, worker, workers, false, d.Repo.FullName(), stdout, time.Now().UTC()); err != nil {
+			return err
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func pollRegisteredRepos(ctx context.Context, store *db.Store, workers int, dryRun bool, stdout io.Writer, nextPoll map[string]time.Time, now time.Time, fallbackPoll time.Duration) (time.Duration, error) {
@@ -833,15 +868,8 @@ func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdo
 		Stdout:       stdout,
 		GitHubClient: func(checkout string) github.Client { return github.NewClient(checkout) },
 		WorkflowFactory: func(store *db.Store, gh github.Client, checkout string) *workflow.Engine {
-			return &workflow.Engine{
-				Store: store,
-				MergeGate: workflow.PolicyMergeGate{
-					Store:        store,
-					GitHub:       gh,
-					Git:          gitutil.Client{Dir: checkout},
-					DeleteBranch: true,
-				},
-			}
+			engine := daemonWorkflowEngine(store, gh, checkout)
+			return &engine
 		},
 	}
 }
@@ -962,6 +990,529 @@ func shorterWait(current time.Duration, candidate time.Duration, set *bool) time
 		return candidate
 	}
 	return current
+}
+
+type jobWorker struct {
+	Store             *db.Store
+	Stdout            io.Writer
+	AdapterFactory    func(runtime.Agent, string) (workflow.DeliveryAdapter, error)
+	CheckoutValidator func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error)
+	WorkflowFactory   func(string) workflow.Engine
+}
+
+const daemonRunningJobStaleAfter = 30 * time.Minute
+
+func defaultJobWorker(store *db.Store, stdout io.Writer) jobWorker {
+	worker := jobWorker{Store: store, Stdout: stdout}
+	worker.AdapterFactory = worker.defaultAdapter
+	worker.CheckoutValidator = worker.defaultCheckout
+	worker.WorkflowFactory = worker.defaultWorkflow
+	return worker
+}
+
+func recoverRunningJobs(ctx context.Context, store *db.Store, stdout io.Writer) error {
+	return recoverRunningJobsBeforeForRepo(ctx, store, stdout, time.Now().UTC().Add(-daemonRunningJobStaleAfter), "")
+}
+
+func recoverRunningJobsBefore(ctx context.Context, store *db.Store, stdout io.Writer, before time.Time) error {
+	return recoverRunningJobsBeforeForRepo(ctx, store, stdout, before, "")
+}
+
+func recoverRunningJobsForRepo(ctx context.Context, store *db.Store, stdout io.Writer, repoFilter string) error {
+	return recoverRunningJobsBeforeForRepo(ctx, store, stdout, time.Now().UTC().Add(-daemonRunningJobStaleAfter), repoFilter)
+}
+
+func recoverRunningJobsBeforeForRepo(ctx context.Context, store *db.Store, stdout io.Writer, before time.Time, repoFilter string) error {
+	jobs, err := store.ListRunningJobsUpdatedBefore(ctx, before)
+	if err != nil {
+		return err
+	}
+	for _, job := range jobs {
+		if !queuedJobMatchesRepo(job, repoFilter) {
+			continue
+		}
+		recovered, err := store.TransitionJobStateWithEvent(ctx, job.ID, string(workflow.JobRunning), string(workflow.JobQueued), db.JobEvent{
+			JobID:   job.ID,
+			Kind:    string(workflow.JobQueued),
+			Message: "recovered stale running job on daemon startup",
+		})
+		if err != nil {
+			return err
+		}
+		if recovered {
+			writeLine(stdout, "requeued stale running job %s", job.ID)
+		}
+	}
+	return nil
+}
+
+func runQueuedJobs(ctx context.Context, worker jobWorker, limit int) error {
+	return runQueuedJobsForRepo(ctx, worker, limit, "")
+}
+
+func retryPendingJobAdvancements(ctx context.Context, worker jobWorker, repoFilter string) error {
+	jobs, err := worker.Store.ListJobs(ctx)
+	if err != nil {
+		return err
+	}
+	for _, job := range jobs {
+		if !jobStateCanRetryAdvancement(job.State) || !queuedJobMatchesRepo(job, repoFilter) {
+			continue
+		}
+		needsRetry, err := worker.jobNeedsAdvanceRetry(ctx, job.ID)
+		if err != nil {
+			return err
+		}
+		if !needsRetry {
+			continue
+		}
+		if err := worker.advanceJob(ctx, job); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func runDaemonWorkerTick(ctx context.Context, store *db.Store, worker jobWorker, workers int, dryRun bool, repoFilter string, stdout io.Writer, now time.Time) error {
+	if dryRun {
+		return nil
+	}
+	if err := recoverRunningJobsBeforeForRepo(ctx, store, stdout, now.Add(-daemonRunningJobStaleAfter), repoFilter); err != nil {
+		return err
+	}
+	if err := retryPendingJobAdvancements(ctx, worker, repoFilter); err != nil {
+		return err
+	}
+	return runQueuedJobsForRepo(ctx, worker, workers, repoFilter)
+}
+
+func runEnabledRepoWorkerTicks(ctx context.Context, store *db.Store, worker jobWorker, workers int, stdout io.Writer, now time.Time) error {
+	repos, err := store.ListRepos(ctx)
+	if err != nil {
+		return err
+	}
+	for _, repo := range repos {
+		if !repo.Enabled {
+			continue
+		}
+		if err := runDaemonWorkerTick(ctx, store, worker, workers, false, repo.FullName(), stdout, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func jobStateCanRetryAdvancement(state string) bool {
+	switch state {
+	case string(workflow.JobSucceeded), string(workflow.JobFailed), string(workflow.JobBlocked):
+		return true
+	default:
+		return false
+	}
+}
+
+func runQueuedJobsForRepo(ctx context.Context, worker jobWorker, limit int, repoFilter string) error {
+	if limit <= 0 {
+		return nil
+	}
+	jobs, err := worker.Store.ListQueuedJobs(ctx)
+	if err != nil {
+		return err
+	}
+	pending := make([]db.Job, 0, len(jobs))
+	for _, job := range jobs {
+		if queuedJobMatchesRepo(job, repoFilter) {
+			pending = append(pending, job)
+		}
+	}
+	for len(pending) > 0 {
+		queued := make([]db.Job, 0, limit)
+		remaining := make([]db.Job, 0, len(pending))
+		selectedCheckouts := map[string]bool{}
+		for _, job := range pending {
+			checkoutKey := queuedJobCheckoutKey(job)
+			if len(queued) == limit || selectedCheckouts[checkoutKey] {
+				remaining = append(remaining, job)
+				continue
+			}
+			queued = append(queued, job)
+			selectedCheckouts[checkoutKey] = true
+		}
+		if len(queued) == 0 {
+			return nil
+		}
+		pending = remaining
+
+		errs := make(chan error, len(queued))
+		var wg sync.WaitGroup
+		for _, job := range queued {
+			job := job
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errs <- worker.run(ctx, job)
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func queuedJobMatchesRepo(job db.Job, repoFilter string) bool {
+	repoFilter = strings.TrimSpace(repoFilter)
+	if repoFilter == "" {
+		return true
+	}
+	payload, err := daemonJobPayload(job)
+	return err == nil && payload.Repo == repoFilter
+}
+
+func queuedJobCheckoutKey(job db.Job) string {
+	payload, err := daemonJobPayload(job)
+	if err != nil || strings.TrimSpace(payload.Repo) == "" {
+		return "job:" + job.ID
+	}
+	return "repo:" + payload.Repo
+}
+
+func (w jobWorker) run(ctx context.Context, job db.Job) error {
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		return w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err)
+	}
+	dbAgent, err := w.Store.GetAgent(ctx, job.Agent)
+	if err != nil {
+		return w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err)
+	}
+	agent := runtimeAgent(dbAgent)
+	checkout, err := w.CheckoutValidator(ctx, job, payload, agent)
+	if err != nil {
+		return w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err)
+	}
+	adapter, err := w.AdapterFactory(agent, checkout)
+	if err != nil {
+		return w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err)
+	}
+	writeLine(w.Stdout, "running job %s for %s in %s", job.ID, agent.Name, payload.Repo)
+	engine := w.WorkflowFactory(checkout)
+	_, err = engine.RunJob(ctx, job.ID, agent, adapter)
+	if err != nil {
+		if markErr := w.handleRunJobError(ctx, job.ID, err); markErr != nil {
+			return markErr
+		}
+		writeLine(w.Stdout, "job %s failed: %v", job.ID, err)
+		return nil
+	}
+	writeLine(w.Stdout, "job %s completed", job.ID)
+	return nil
+}
+
+func (w jobWorker) jobNeedsAdvanceRetry(ctx context.Context, jobID string) (bool, error) {
+	events, err := w.Store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	needsRetry := false
+	for _, event := range events {
+		switch event.Kind {
+		case "advance_started", "advance_retry":
+			needsRetry = true
+		case "advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped":
+			needsRetry = false
+		}
+	}
+	return needsRetry, nil
+}
+
+func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_retry_skipped", Message: err.Error()})
+	}
+	dbAgent, err := w.Store.GetAgent(ctx, job.Agent)
+	if err != nil {
+		return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_retry_skipped", Message: err.Error()})
+	}
+	agent := runtimeAgent(dbAgent)
+	if refreshed, ok, err := w.refreshImplementedPayloadForRetry(ctx, job, payload); err != nil {
+		return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_retry", Message: "post-delivery workflow retry refresh failed: " + err.Error()})
+	} else if ok {
+		payload = refreshed
+	}
+	checkout, err := w.CheckoutValidator(ctx, job, payload, agent)
+	if err != nil {
+		return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_retry", Message: "post-delivery workflow retry preflight failed: " + err.Error()})
+	}
+	engine := w.WorkflowFactory(checkout)
+	if err := engine.AdvanceJob(ctx, job.ID); err != nil {
+		var blocked workflow.BlockedError
+		if errors.As(err, &blocked) {
+			return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_blocked", Message: err.Error()})
+		}
+		return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_retry", Message: "post-delivery workflow retry failed: " + err.Error()})
+	}
+	writeLine(w.Stdout, "job %s advancement retried", job.ID)
+	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_retried", Message: "post-delivery workflow retry completed"})
+}
+
+func (w jobWorker) refreshImplementedPayloadForRetry(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, bool, error) {
+	if job.Type != "implement" || payload.Result == nil || payload.Result.Decision != "implemented" {
+		return payload, false, nil
+	}
+	repoRecord, err := w.Store.GetRepo(ctx, payload.Repo)
+	if err != nil {
+		return workflow.JobPayload{}, false, err
+	}
+	checkout := strings.TrimSpace(repoRecord.CheckoutPath)
+	if checkout == "" {
+		return workflow.JobPayload{}, false, fmt.Errorf("repo %s has no checkout path", payload.Repo)
+	}
+	repo, err := daemon.ParseRepository(payload.Repo)
+	if err != nil {
+		return workflow.JobPayload{}, false, err
+	}
+	if err := preflightDaemonRepoCheckout(ctx, repo, checkout); err != nil {
+		return workflow.JobPayload{}, false, err
+	}
+	payload, err = refreshDaemonJobPayload(ctx, w.Store, checkout, job, payload)
+	if err != nil {
+		return workflow.JobPayload{}, false, err
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return workflow.JobPayload{}, false, err
+	}
+	if err := w.Store.UpdateJobPayload(ctx, job.ID, string(encoded)); err != nil {
+		return workflow.JobPayload{}, false, err
+	}
+	return payload, true, nil
+}
+
+func (w jobWorker) defaultAdapter(agent runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
+	switch agent.Runtime {
+	case runtime.CodexRuntime:
+		return runtime.CodexAdapter{Dir: checkout}, nil
+	case runtime.ClaudeRuntime:
+		return runtime.ClaudeAdapter{Dir: checkout}, nil
+	case runtime.ShellRuntime:
+		return runtime.ShellAdapter{Dir: checkout}, nil
+	default:
+		return nil, fmt.Errorf("unsupported runtime: %s", agent.Runtime)
+	}
+}
+
+func (w jobWorker) defaultWorkflow(checkout string) workflow.Engine {
+	return daemonWorkflowEngine(w.Store, github.NewClient(checkout), checkout)
+}
+
+func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string) workflow.Engine {
+	return workflow.Engine{
+		Store: store,
+		MergeGate: workflow.PolicyMergeGate{
+			Store:        store,
+			GitHub:       gh,
+			Git:          gitutil.Client{Dir: checkout},
+			DeleteBranch: true,
+		},
+		PayloadRefresher: func(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
+			return refreshDaemonJobPayload(ctx, store, checkout, job, payload)
+		},
+	}
+}
+
+func refreshDaemonJobPayload(ctx context.Context, store *db.Store, checkout string, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
+	if job.Type != "implement" || payload.Result == nil || payload.Result.Decision != "implemented" {
+		return payload, nil
+	}
+	head, err := (gitutil.Client{Dir: checkout}).HeadSHA(ctx)
+	if err != nil {
+		return workflow.JobPayload{}, err
+	}
+	payload.HeadSHA = head
+	if len(payload.Reviewers) == 0 {
+		reviewers, err := daemonReviewers(ctx, store, payload.Repo)
+		if err != nil {
+			return workflow.JobPayload{}, err
+		}
+		payload.Reviewers = reviewers
+	}
+	return payload, nil
+}
+
+func daemonReviewers(ctx context.Context, store *db.Store, repo string) ([]string, error) {
+	agents, err := store.ListAgents(ctx)
+	if err != nil {
+		return nil, err
+	}
+	reviewers := []string{}
+	for _, agent := range agents {
+		allowed, err := store.AgentCanAccessRepo(ctx, agent.Name, repo)
+		if err != nil {
+			return nil, err
+		}
+		if allowed && agentHasCapability(agent.Capabilities, "review") {
+			reviewers = append(reviewers, agent.Name)
+		}
+	}
+	return reviewers, nil
+}
+
+func agentHasCapability(capabilities []string, target string) bool {
+	for _, capability := range capabilities {
+		if capability == target {
+			return true
+		}
+	}
+	return false
+}
+
+func (w jobWorker) defaultCheckout(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent) (string, error) {
+	repoRecord, err := w.Store.GetRepo(ctx, payload.Repo)
+	if err != nil {
+		return "", err
+	}
+	checkout := strings.TrimSpace(repoRecord.CheckoutPath)
+	if checkout == "" {
+		return "", fmt.Errorf("repo %s has no checkout path", payload.Repo)
+	}
+	repo, err := daemon.ParseRepository(payload.Repo)
+	if err != nil {
+		return "", err
+	}
+	if err := preflightDaemonRepoCheckout(ctx, repo, checkout); err != nil {
+		return "", err
+	}
+	switch job.Type {
+	case "implement":
+		if err := w.validateTargetCheckout(ctx, payload, checkout); err != nil {
+			return "", err
+		}
+		if err := w.validateImplementationLock(ctx, payload, agent); err != nil {
+			return "", err
+		}
+	case "review":
+		if err := w.validateTargetCheckout(ctx, payload, checkout); err != nil {
+			return "", err
+		}
+	case "ask":
+		if payload.PullRequest > 0 {
+			if err := w.validateTargetCheckout(ctx, payload, checkout); err != nil {
+				return "", err
+			}
+		}
+	}
+	return checkout, nil
+}
+
+func (w jobWorker) validateTargetCheckout(ctx context.Context, payload workflow.JobPayload, checkout string) error {
+	git := gitutil.Client{Dir: checkout}
+	branch, err := git.CurrentBranch(ctx)
+	if err != nil {
+		return err
+	}
+	if branch != payload.Branch {
+		return fmt.Errorf("checkout branch is %s, not job branch %s", branch, payload.Branch)
+	}
+	clean, err := git.WorktreeClean(ctx)
+	if err != nil {
+		return err
+	}
+	if !clean {
+		return fmt.Errorf("checkout %s has uncommitted changes", checkout)
+	}
+	expectedHead := strings.TrimSpace(payload.HeadSHA)
+	if expectedHead == "" {
+		return fmt.Errorf("job for %s has no head SHA", payload.Branch)
+	}
+	head, err := git.HeadSHA(ctx)
+	if err != nil {
+		return err
+	}
+	if head != expectedHead {
+		return fmt.Errorf("checkout head is %s, not job head %s", head, expectedHead)
+	}
+	return nil
+}
+
+func (w jobWorker) validateImplementationLock(ctx context.Context, payload workflow.JobPayload, agent runtime.Agent) error {
+	lock, err := w.Store.GetBranchLock(ctx, payload.Repo, payload.Branch)
+	if err != nil {
+		return err
+	}
+	if lock.Owner != agent.Name {
+		return fmt.Errorf("branch %s is locked by %s, not %s", payload.Branch, lock.Owner, agent.Name)
+	}
+	return nil
+}
+
+func (w jobWorker) finishQueuedJob(ctx context.Context, jobID string, state workflow.JobState, cause error) error {
+	transitioned, err := w.Store.TransitionJobStateWithEvent(ctx, jobID, string(workflow.JobQueued), string(state), db.JobEvent{
+		JobID:   jobID,
+		Kind:    string(state),
+		Message: cause.Error(),
+	})
+	if err != nil {
+		return err
+	}
+	if transitioned {
+		writeLine(w.Stdout, "job %s %s: %v", jobID, state, cause)
+	}
+	return nil
+}
+
+func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, cause error) error {
+	latest, err := w.Store.GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if latest.State == string(workflow.JobQueued) {
+		state := workflow.JobFailed
+		var blocked workflow.BlockedError
+		if errors.As(cause, &blocked) {
+			state = workflow.JobBlocked
+		}
+		return w.finishQueuedJob(ctx, jobID, state, cause)
+	}
+	if latest.State == string(workflow.JobCancelled) {
+		return nil
+	}
+	payload, payloadErr := daemonJobPayload(latest)
+	if payloadErr == nil && payload.Result != nil {
+		var blocked workflow.BlockedError
+		if errors.As(cause, &blocked) {
+			return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: latest.ID, Kind: "advance_blocked", Message: cause.Error()})
+		}
+		if err := w.recordPostDeliveryWorkflowError(ctx, latest, cause); err != nil {
+			return err
+		}
+		return nil
+	}
+	if latest.State == string(workflow.JobFailed) || latest.State == string(workflow.JobBlocked) {
+		return nil
+	}
+	return cause
+}
+
+func (w jobWorker) recordPostDeliveryWorkflowError(ctx context.Context, job db.Job, cause error) error {
+	return w.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   job.ID,
+		Kind:    "advance_retry",
+		Message: "post-delivery workflow error; advancement will retry from stored result: " + cause.Error(),
+	})
+}
+
+func daemonJobPayload(job db.Job) (workflow.JobPayload, error) {
+	var payload workflow.JobPayload
+	if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+		return workflow.JobPayload{}, fmt.Errorf("parse job payload %q: %w", job.ID, err)
+	}
+	return payload, nil
 }
 
 func resolveDaemonCheckout(ctx context.Context, repo github.Repository, client gitutil.Client) (string, error) {

@@ -219,6 +219,10 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 		JobID:   jobID,
 		Kind:    string(state),
 		Message: message,
+	}, db.JobEvent{
+		JobID:   jobID,
+		Kind:    "advance_started",
+		Message: "workflow advancement started",
 	})
 	if err != nil {
 		return err

@@ -81,6 +81,18 @@ func (c Client) WorktreeClean(ctx context.Context) (bool, error) {
 	return strings.TrimSpace(result.Stdout) == "", nil
 }
 
+func (c Client) HeadSHA(ctx context.Context) (string, error) {
+	result, err := c.run(ctx, "rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	sha := strings.TrimSpace(result.Stdout)
+	if sha == "" {
+		return "", errors.New("git HEAD SHA is empty")
+	}
+	return sha, nil
+}
+
 func (c Client) UpdateBase(ctx context.Context, remote string, branch string) error {
 	if strings.TrimSpace(remote) == "" {
 		remote = "origin"
