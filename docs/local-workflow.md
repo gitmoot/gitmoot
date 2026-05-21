@@ -8,14 +8,15 @@ statuses, and merges only after the merge gate passes.
 
 ## What Exists Today
 
-The current CLI supports local state initialization, prerequisite checks, agent
-registration, agent health checks, plan import, task branch startup, status,
-and the daemon:
+The current CLI supports local setup, multi-repo daemon management, agent
+registration, plan import, task branch startup, status, recovery, and updates:
 
 ```sh
-gitmoot init
+gitmoot setup --repo owner/repo --path . --agent lead --runtime codex --session <session-ref> --role lead
 gitmoot doctor --repo .
 gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
+gitmoot agent allow <name> --repo owner/repo
+gitmoot agent repos <name>
 gitmoot agent list
 gitmoot agent doctor <name>
 gitmoot goal import --file GOAL.md --repo owner/repo
@@ -28,6 +29,8 @@ gitmoot status --repo owner/repo
 gitmoot version --json
 gitmoot update --check
 gitmoot daemon start --repo owner/repo --poll 30s
+gitmoot daemon start
+gitmoot daemon status
 ```
 
 Goal import turns Markdown headings shaped like `### Task N: Title` into local
@@ -66,10 +69,8 @@ planned tasks. `task run` starts one task branch and records its branch lock.
 4. Initialize Gitmoot state and subscribe the agents.
 
    ```sh
-   gitmoot setup --repo owner/project --path . --agent lead --runtime codex --session <codex-session-id>
-   gitmoot init
+   gitmoot setup --repo owner/project --path . --agent lead --runtime codex --session <codex-session-id> --role lead
    gitmoot doctor --repo .
-   gitmoot agent subscribe lead --runtime codex --session <codex-session-id> --role lead --repo owner/project --capability implement --capability review --capability ask
    gitmoot agent subscribe audit --runtime claude --session <claude-session-id> --role reviewer --repo owner/project --capability review --capability ask
    gitmoot agent list
    gitmoot agent doctor lead
@@ -90,7 +91,8 @@ planned tasks. `task run` starts one task branch and records its branch lock.
    ```
 
    The daemon validates that the current checkout's `origin` remote matches
-   `--repo`. Keep it running while the workflow is active.
+   `--repo`. Use `gitmoot daemon start` without `--repo` after registering all
+   intended repos if one daemon should supervise the whole Gitmoot home.
 
 6. Start and open the first task PR.
 
@@ -122,6 +124,9 @@ planned tasks. `task run` starts one task branch and records its branch lock.
    Stale branch locks can be inspected and released locally:
 
    ```sh
+   gitmoot job list --repo owner/project
+   gitmoot job show <job-id>
+   gitmoot job events <job-id>
    gitmoot lock list --repo owner/project
    gitmoot lock show owner/project <branch>
    gitmoot lock release owner/project <branch> --owner <agent>
@@ -153,6 +158,37 @@ planned tasks. `task run` starts one task branch and records its branch lock.
   remains the workflow source of truth.
 - There is no hosted dashboard, cloud runner, billing, or remote control plane
   in V1.
+- GitHub comments are authored by the authenticated user. Agent attribution is
+  written in the comment body.
+
+## Multi-Repo Supervision
+
+One daemon can supervise multiple enabled repos for the same Gitmoot home.
+Register each checkout explicitly and grant agents repo access explicitly:
+
+```sh
+cd /path/to/project-a
+gitmoot setup --repo owner/project-a --path . --agent lead --runtime codex --session <session-ref> --role lead
+
+cd /path/to/project-b
+gitmoot setup --repo owner/project-b --path . --agent lead --runtime codex --session <same-session-or-explicit-ref> --role lead
+
+gitmoot agent repos lead
+gitmoot daemon start
+gitmoot status
+```
+
+The PR repository supplies routing context. `/gitmoot lead review` in
+`owner/project-a` queues work for `owner/project-a`; the same command in
+`owner/project-b` queues work for `owner/project-b` if `lead` is allowed there.
+
+## Skill Usage
+
+Agents should read the root [`SKILL.md`](../SKILL.md) before working through
+Gitmoot. The skill documents PR commands, the required `gitmoot_result` JSON
+contract, branch lock rules, repo access, and safe agent behavior. If an agent
+is unsure how Gitmoot expects it to behave, it should reread `SKILL.md`, then
+inspect `/gitmoot help`, `gitmoot status`, and relevant job events.
 
 ## Agent Output Contract
 
