@@ -81,6 +81,50 @@ func TestPollOnceCreatesJobAndAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestPollOnceAcknowledgesAgentWithoutRepoAccess(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "audit",
+		Role:           "reviewer",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		Capabilities:   []string{"review"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{
+			Number:  7,
+			Title:   "Task 7",
+			State:   "open",
+			URL:     "https://github.com/jerryfane/gitmoot/pull/7",
+			HeadRef: "task-7",
+			BaseRef: "main",
+			HeadSHA: "abc123",
+		}},
+		comments: map[int64][]github.IssueComment{
+			7: {{ID: 101, Body: "/gitmoot audit review focus on tests", Author: "alice"}},
+		},
+	}
+
+	err := (Daemon{Repo: repo, Store: store, GitHub: client}).PollOnce(ctx)
+
+	if err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "not allowed") {
+		t.Fatalf("posted acknowledgements = %+v, want not-allowed ack", client.posted)
+	}
+	jobID := jobID(repo, 7, 101, 0, "audit", "review")
+	if _, err := store.GetJob(ctx, jobID); err == nil {
+		t.Fatal("job was queued for agent without repo access")
+	}
+}
+
 func TestPollOnceRoutesPullRequestUpdatesToWorkflow(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)

@@ -947,7 +947,7 @@ func TestEngineAdvanceBlocksWhenNextAgentScopeRejected(t *testing.T) {
 	err := engine.AdvanceJob(ctx, "review-job")
 
 	var blocked BlockedError
-	if !errors.As(err, &blocked) || !strings.Contains(blocked.Reason, "scoped") {
+	if !errors.As(err, &blocked) || !strings.Contains(blocked.Reason, "not allowed") {
 		t.Fatalf("error = %v, want scope BlockedError", err)
 	}
 	assertTaskState(t, store, "task-7", TaskBlocked)

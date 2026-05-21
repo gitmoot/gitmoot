@@ -38,6 +38,11 @@ type Agent struct {
 	HealthStatus   string
 }
 
+type AgentRepo struct {
+	AgentName    string
+	RepoFullName string
+}
+
 type Goal struct {
 	ID     string
 	Title  string
@@ -267,19 +272,32 @@ func (s *Store) UpsertAgent(ctx context.Context, agent Agent) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO agents(name, role, runtime, runtime_ref, repo_scope, capabilities_json, autonomy_policy, health_status, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-		ON CONFLICT(name) DO UPDATE SET
-			role = excluded.role,
-			runtime = excluded.runtime,
-			runtime_ref = excluded.runtime_ref,
-			repo_scope = excluded.repo_scope,
-			capabilities_json = excluded.capabilities_json,
-			autonomy_policy = excluded.autonomy_policy,
-			health_status = excluded.health_status,
-			updated_at = CURRENT_TIMESTAMP`,
-		agent.Name, agent.Role, agent.Runtime, agent.RuntimeRef, agent.RepoScope, string(capabilities), agent.AutonomyPolicy, agent.HealthStatus)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO agents(name, role, runtime, runtime_ref, repo_scope, capabilities_json, autonomy_policy, health_status, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+			ON CONFLICT(name) DO UPDATE SET
+				role = excluded.role,
+				runtime = excluded.runtime,
+				runtime_ref = excluded.runtime_ref,
+				repo_scope = excluded.repo_scope,
+				capabilities_json = excluded.capabilities_json,
+				autonomy_policy = excluded.autonomy_policy,
+				health_status = excluded.health_status,
+				updated_at = CURRENT_TIMESTAMP`,
+		agent.Name, agent.Role, agent.Runtime, agent.RuntimeRef, agent.RepoScope, string(capabilities), agent.AutonomyPolicy, agent.HealthStatus); err != nil {
+		return err
+	}
+	if strings.TrimSpace(agent.RepoScope) != "" {
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO agent_repos(agent_name, repo_full_name, updated_at)
+			VALUES (?, ?, CURRENT_TIMESTAMP)`, agent.Name, agent.RepoScope); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) GetAgent(ctx context.Context, name string) (Agent, error) {
@@ -308,7 +326,15 @@ func (s *Store) ListAgents(ctx context.Context) ([]Agent, error) {
 }
 
 func (s *Store) RemoveAgent(ctx context.Context, name string) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM agents WHERE name = ?`, name)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM agent_repos WHERE agent_name = ?`, name); err != nil {
+		return false, err
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM agents WHERE name = ?`, name)
 	if err != nil {
 		return false, err
 	}
@@ -316,7 +342,95 @@ func (s *Store) RemoveAgent(ctx context.Context, name string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return affected > 0, nil
+	return affected > 0, tx.Commit()
+}
+
+func (s *Store) AllowAgentRepo(ctx context.Context, agentName string, repoFullName string) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE agents
+		SET repo_scope = CASE WHEN repo_scope = '' THEN ? ELSE repo_scope END,
+			updated_at = CURRENT_TIMESTAMP
+		WHERE name = ?`, repoFullName, agentName)
+	if err != nil {
+		return err
+	}
+	if err := requireAffected(result, "agent", agentName); err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO agent_repos(agent_name, repo_full_name, updated_at)
+		VALUES (?, ?, CURRENT_TIMESTAMP)`, agentName, repoFullName)
+	return err
+}
+
+func (s *Store) DenyAgentRepo(ctx context.Context, agentName string, repoFullName string) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `DELETE FROM agent_repos WHERE agent_name = ? AND repo_full_name = ?`, agentName, repoFullName)
+	if err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE agents SET repo_scope = '', updated_at = CURRENT_TIMESTAMP WHERE name = ? AND repo_scope = ?`, agentName, repoFullName); err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, tx.Commit()
+}
+
+func (s *Store) ReplaceAgentRepos(ctx context.Context, agentName string, repoFullNames []string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	repoScope := ""
+	if len(repoFullNames) > 0 {
+		repoScope = repoFullNames[0]
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE agents SET repo_scope = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?`, repoScope, agentName)
+	if err != nil {
+		return err
+	}
+	if err := requireAffected(result, "agent", agentName); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM agent_repos WHERE agent_name = ?`, agentName); err != nil {
+		return err
+	}
+	for _, repo := range repoFullNames {
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO agent_repos(agent_name, repo_full_name, updated_at)
+			VALUES (?, ?, CURRENT_TIMESTAMP)`, agentName, repo); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) ListAgentRepos(ctx context.Context, agentName string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT repo_full_name FROM agent_repos WHERE agent_name = ? ORDER BY repo_full_name`, agentName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	repos := []string{}
+	for rows.Next() {
+		var repo string
+		if err := rows.Scan(&repo); err != nil {
+			return nil, err
+		}
+		repos = append(repos, repo)
+	}
+	return repos, rows.Err()
+}
+
+func (s *Store) AgentCanAccessRepo(ctx context.Context, agentName string, repoFullName string) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_repos WHERE agent_name = ? AND repo_full_name = ?`, agentName, repoFullName).Scan(&count)
+	return count > 0, err
 }
 
 func (s *Store) InsertGoal(ctx context.Context, goal Goal) error {
@@ -985,5 +1099,18 @@ ALTER TABLE repos ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE repos ADD COLUMN poll_interval TEXT NOT NULL DEFAULT '30s';
 ALTER TABLE repos ADD COLUMN last_poll_at TEXT NOT NULL DEFAULT '';
 ALTER TABLE repos ADD COLUMN last_error TEXT NOT NULL DEFAULT '';
+	`,
+	`
+CREATE TABLE agent_repos (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	agent_name TEXT NOT NULL,
+	repo_full_name TEXT NOT NULL,
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE(agent_name, repo_full_name)
+);
+
+INSERT OR IGNORE INTO agent_repos(agent_name, repo_full_name)
+SELECT name, repo_scope FROM agents WHERE repo_scope <> '';
 	`,
 }

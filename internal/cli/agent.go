@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/config"
+	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 )
@@ -27,6 +28,12 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 		return runAgentRemove(args[1:], stdout, stderr)
 	case "doctor":
 		return runAgentDoctor(args[1:], stdout, stderr)
+	case "allow":
+		return runAgentAllow(args[1:], stdout, stderr)
+	case "deny":
+		return runAgentDeny(args[1:], stdout, stderr)
+	case "repos":
+		return runAgentRepos(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown agent command %q\n\n", args[0])
 		printAgentUsage(stderr)
@@ -36,8 +43,11 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 
 func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>")
+	fmt.Fprintln(w, "  gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] --capability <capability>")
 	fmt.Fprintln(w, "    Codex sessions may use a UUID, thread name, or last. Claude sessions may use a UUID or last. Shell sessions are commands.")
+	fmt.Fprintln(w, "  gitmoot agent allow <name> --repo owner/repo")
+	fmt.Fprintln(w, "  gitmoot agent deny <name> --repo owner/repo")
+	fmt.Fprintln(w, "  gitmoot agent repos <name>")
 	fmt.Fprintln(w, "  gitmoot agent list")
 	fmt.Fprintln(w, "  gitmoot agent remove <name>")
 	fmt.Fprintln(w, "  gitmoot agent doctor <name>")
@@ -50,9 +60,10 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, or shell")
 	session := fs.String("session", "", "runtime session reference, last, or shell command")
 	role := fs.String("role", "", "agent role")
-	repo := fs.String("repo", "", "repo scope as owner/repo")
 	policy := fs.String("policy", "auto", "autonomy policy")
+	var repos repeatedFlag
 	var capabilities repeatedFlag
+	fs.Var(&repos, "repo", "allowed repo as owner/repo, repeatable")
 	fs.Var(&capabilities, "capability", "agent capability, repeatable")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fs.Usage()
@@ -74,12 +85,21 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	normalizedRepos, err := normalizeRepoFlags(repos)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid repo: %v\n", err)
+		return 2
+	}
+	repoScope := ""
+	if len(normalizedRepos) > 0 {
+		repoScope = normalizedRepos[0]
+	}
 	agent := runtime.Agent{
 		Name:           name,
 		Role:           *role,
 		Runtime:        *runtimeName,
 		RuntimeRef:     *session,
-		RepoScope:      *repo,
+		RepoScope:      repoScope,
 		Capabilities:   capabilities,
 		AutonomyPolicy: *policy,
 		HealthStatus:   "unknown",
@@ -89,12 +109,19 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if err := withStore(*home, func(store *db.Store) error {
-		return store.UpsertAgent(context.Background(), dbAgent(agent))
+		if err := store.UpsertAgent(context.Background(), dbAgent(agent)); err != nil {
+			return err
+		}
+		return store.ReplaceAgentRepos(context.Background(), agent.Name, normalizedRepos)
 	}); err != nil {
 		fmt.Fprintf(stderr, "subscribe agent: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "subscribed %s (%s) for %s\n", agent.Name, agent.Runtime, agent.RepoScope)
+	if len(normalizedRepos) == 0 {
+		fmt.Fprintf(stdout, "subscribed %s (%s) with no repo access\n", agent.Name, agent.Runtime)
+	} else {
+		fmt.Fprintf(stdout, "subscribed %s (%s) for %s\n", agent.Name, agent.Runtime, strings.Join(normalizedRepos, ","))
+	}
 	return 0
 }
 
@@ -109,16 +136,126 @@ func runAgentList(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	var agents []db.Agent
+	agentRepos := map[string][]string{}
 	if err := withStore(*home, func(store *db.Store) error {
 		var err error
 		agents, err = store.ListAgents(context.Background())
-		return err
+		if err != nil {
+			return err
+		}
+		for _, agent := range agents {
+			repos, err := store.ListAgentRepos(context.Background(), agent.Name)
+			if err != nil {
+				return err
+			}
+			agentRepos[agent.Name] = repos
+		}
+		return nil
 	}); err != nil {
 		fmt.Fprintf(stderr, "list agents: %v\n", err)
 		return 1
 	}
 	for _, agent := range agents {
-		fmt.Fprintf(stdout, "%-16s %-8s %-12s %-20s %s\n", agent.Name, agent.Runtime, agent.Role, agent.RepoScope, strings.Join(agent.Capabilities, ","))
+		fmt.Fprintf(stdout, "%-16s %-8s %-12s %-20s %s\n", agent.Name, agent.Runtime, agent.Role, strings.Join(agentRepos[agent.Name], ","), strings.Join(agent.Capabilities, ","))
+	}
+	return 0
+}
+
+func runAgentAllow(args []string, stdout, stderr io.Writer) int {
+	return runAgentAccessChange("allow", args, stdout, stderr)
+}
+
+func runAgentDeny(args []string, stdout, stderr io.Writer) int {
+	return runAgentAccessChange("deny", args, stdout, stderr)
+}
+
+func runAgentAccessChange(action string, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("agent "+action, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	repoFlag := fs.String("repo", "", "repo scope as owner/repo")
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fs.Usage()
+		if len(args) == 0 {
+			fmt.Fprintf(stderr, "agent %s requires exactly one name\n", action)
+			return 2
+		}
+		return 0
+	}
+	name := args[0]
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "agent %s requires exactly one name\n", action)
+		return 2
+	}
+	repo, err := normalizeRepoFlag(*repoFlag)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid repo: %v\n", err)
+		return 2
+	}
+	if err := withStore(*home, func(store *db.Store) error {
+		if _, err := store.GetAgent(context.Background(), name); err != nil {
+			return err
+		}
+		if action == "allow" {
+			return store.AllowAgentRepo(context.Background(), name, repo)
+		}
+		_, err := store.DenyAgentRepo(context.Background(), name, repo)
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "agent %s: %v\n", action, err)
+		return 1
+	}
+	if action == "allow" {
+		fmt.Fprintf(stdout, "allowed %s on %s\n", name, repo)
+	} else {
+		fmt.Fprintf(stdout, "denied %s on %s\n", name, repo)
+	}
+	return 0
+}
+
+func runAgentRepos(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("agent repos", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fs.Usage()
+		if len(args) == 0 {
+			fmt.Fprintln(stderr, "agent repos requires exactly one name")
+			return 2
+		}
+		return 0
+	}
+	name := args[0]
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "agent repos requires exactly one name")
+		return 2
+	}
+	var repos []string
+	if err := withStore(*home, func(store *db.Store) error {
+		if _, err := store.GetAgent(context.Background(), name); err != nil {
+			return err
+		}
+		var err error
+		repos, err = store.ListAgentRepos(context.Background(), name)
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "agent repos: %v\n", err)
+		return 1
+	}
+	for _, repo := range repos {
+		writeLine(stdout, "%s", repo)
 	}
 	return 0
 }
@@ -270,6 +407,30 @@ func runtimeAgent(agent db.Agent) runtime.Agent {
 		AutonomyPolicy: agent.AutonomyPolicy,
 		HealthStatus:   agent.HealthStatus,
 	}
+}
+
+func normalizeRepoFlags(values []string) ([]string, error) {
+	repos := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		repo, err := normalizeRepoFlag(value)
+		if err != nil {
+			return nil, err
+		}
+		if !seen[repo] {
+			repos = append(repos, repo)
+			seen[repo] = true
+		}
+	}
+	return repos, nil
+}
+
+func normalizeRepoFlag(value string) (string, error) {
+	repo, err := daemon.ParseRepository(value)
+	if err != nil {
+		return "", err
+	}
+	return repo.FullName(), nil
 }
 
 type repeatedFlag []string

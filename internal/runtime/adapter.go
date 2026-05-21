@@ -85,9 +85,7 @@ func ValidateAgent(agent Agent) error {
 		return errors.New("agent runtime is required")
 	case strings.TrimSpace(agent.RuntimeRef) == "":
 		return errors.New("agent runtime reference is required")
-	case strings.TrimSpace(agent.RepoScope) == "":
-		return errors.New("agent repo scope is required")
-	case !validRepoScope(agent.RepoScope):
+	case strings.TrimSpace(agent.RepoScope) != "" && !validRepoScope(agent.RepoScope):
 		return fmt.Errorf("agent repo scope %q must be owner/repo", agent.RepoScope)
 	}
 	if _, err := (Factory{}).Adapter(agent.Runtime); err != nil {

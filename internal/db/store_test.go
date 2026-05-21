@@ -26,6 +26,7 @@ func TestOpenMigratesSchema(t *testing.T) {
 		"job_events",
 		"branch_locks",
 		"merge_gates",
+		"agent_repos",
 	} {
 		ok, err := store.HasTable(ctx, table)
 		if err != nil {
@@ -104,6 +105,53 @@ func TestRepositoryMethods(t *testing.T) {
 	}
 	if err := store.UpsertAgent(ctx, Agent{Name: "audit", Role: "reviewer", Runtime: "codex", RuntimeRef: "session", RepoScope: "jerryfane/gitmoot", Capabilities: []string{"review"}, AutonomyPolicy: "auto", HealthStatus: "ok"}); err != nil {
 		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+	allowed, err := store.AgentCanAccessRepo(ctx, "audit", "jerryfane/gitmoot")
+	if err != nil {
+		t.Fatalf("AgentCanAccessRepo returned error: %v", err)
+	}
+	if !allowed {
+		t.Fatal("agent repo scope was not added as allowed repo")
+	}
+	if err := store.AllowAgentRepo(ctx, "audit", "jerryfane/other"); err != nil {
+		t.Fatalf("AllowAgentRepo returned error: %v", err)
+	}
+	agentRepos, err := store.ListAgentRepos(ctx, "audit")
+	if err != nil {
+		t.Fatalf("ListAgentRepos returned error: %v", err)
+	}
+	if len(agentRepos) != 2 || agentRepos[0] != "jerryfane/gitmoot" || agentRepos[1] != "jerryfane/other" {
+		t.Fatalf("agent repos = %+v", agentRepos)
+	}
+	denied, err := store.DenyAgentRepo(ctx, "audit", "jerryfane/other")
+	if err != nil {
+		t.Fatalf("DenyAgentRepo returned error: %v", err)
+	}
+	if !denied {
+		t.Fatal("DenyAgentRepo did not remove access")
+	}
+	if err := store.ReplaceAgentRepos(ctx, "audit", []string{"jerryfane/second", "jerryfane/third"}); err != nil {
+		t.Fatalf("ReplaceAgentRepos returned error: %v", err)
+	}
+	agentRepos, err = store.ListAgentRepos(ctx, "audit")
+	if err != nil {
+		t.Fatalf("ListAgentRepos after replace returned error: %v", err)
+	}
+	if len(agentRepos) != 2 || agentRepos[0] != "jerryfane/second" || agentRepos[1] != "jerryfane/third" {
+		t.Fatalf("agent repos after replace = %+v", agentRepos)
+	}
+	if err := store.ReplaceAgentRepos(ctx, "audit", nil); err != nil {
+		t.Fatalf("empty ReplaceAgentRepos returned error: %v", err)
+	}
+	allowed, err = store.AgentCanAccessRepo(ctx, "audit", "jerryfane/second")
+	if err != nil {
+		t.Fatalf("AgentCanAccessRepo after empty replace returned error: %v", err)
+	}
+	if allowed {
+		t.Fatal("empty ReplaceAgentRepos left stale access")
+	}
+	if err := store.AllowAgentRepo(ctx, "audit", "jerryfane/gitmoot"); err != nil {
+		t.Fatalf("restore AllowAgentRepo returned error: %v", err)
 	}
 	agent, err := store.GetAgent(ctx, "audit")
 	if err != nil {
@@ -326,12 +374,52 @@ func TestRepositoryMethods(t *testing.T) {
 	if !removed {
 		t.Fatal("RemoveAgent did not remove existing agent")
 	}
+	agentRepos, err = store.ListAgentRepos(ctx, "audit")
+	if err != nil {
+		t.Fatalf("ListAgentRepos after RemoveAgent returned error: %v", err)
+	}
+	if len(agentRepos) != 0 {
+		t.Fatalf("agent repos after RemoveAgent = %+v", agentRepos)
+	}
 	removed, err = store.RemoveAgent(ctx, "audit")
 	if err != nil {
 		t.Fatalf("second RemoveAgent returned error: %v", err)
 	}
 	if removed {
 		t.Fatal("second RemoveAgent removed missing agent")
+	}
+}
+
+func TestMigrateCopiesAgentRepoScopeToAgentRepos(t *testing.T) {
+	ctx := context.Background()
+	raw, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("sql.Open returned error: %v", err)
+	}
+	store := &Store{db: raw}
+	defer store.Close()
+
+	for version, migration := range migrations[:len(migrations)-1] {
+		if err := store.applyMigration(ctx, version+1, migration); err != nil {
+			t.Fatalf("applyMigration(%d) returned error: %v", version+1, err)
+		}
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO agents(name, role, runtime, runtime_ref, repo_scope, capabilities_json, autonomy_policy, health_status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, "audit", "reviewer", "codex", "last", "jerryfane/gitmoot", `["review"]`, "auto", "ok"); err != nil {
+		t.Fatalf("insert legacy agent returned error: %v", err)
+	}
+	if _, err := store.ListAgentRepos(ctx, "audit"); err == nil {
+		t.Fatal("ListAgentRepos succeeded before agent_repos migration")
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+	repos, err := store.ListAgentRepos(ctx, "audit")
+	if err != nil {
+		t.Fatalf("ListAgentRepos returned error: %v", err)
+	}
+	if len(repos) != 1 || repos[0] != "jerryfane/gitmoot" {
+		t.Fatalf("repos = %+v", repos)
 	}
 }
 

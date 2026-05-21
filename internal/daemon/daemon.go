@@ -373,7 +373,11 @@ func (d Daemon) workflowReviewers(ctx context.Context) ([]string, error) {
 	}
 	reviewers := []string{}
 	for _, agent := range agents {
-		if agent.RepoScope == d.Repo.FullName() && hasCapability(agent.Capabilities, "review") {
+		allowed, err := d.Store.AgentCanAccessRepo(ctx, agent.Name, d.Repo.FullName())
+		if err != nil {
+			return nil, err
+		}
+		if allowed && hasCapability(agent.Capabilities, "review") {
 			reviewers = append(reviewers, agent.Name)
 		}
 	}
@@ -431,8 +435,12 @@ func (d Daemon) handleCommand(ctx context.Context, pull github.PullRequest, comm
 		}
 		return err
 	}
-	if agent.RepoScope != d.Repo.FullName() {
-		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot agent `%s` is subscribed for `%s`, not `%s`.", agent.Name, agent.RepoScope, d.Repo.FullName()))
+	allowed, err := d.Store.AgentCanAccessRepo(ctx, agent.Name, d.Repo.FullName())
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot agent `%s` is not allowed on `%s`.", agent.Name, d.Repo.FullName()))
 	}
 	if !hasCapability(agent.Capabilities, command.Action) {
 		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot agent `%s` does not advertise `%s` capability.", agent.Name, command.Action))

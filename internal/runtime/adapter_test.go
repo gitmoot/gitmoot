@@ -17,6 +17,11 @@ func TestValidateAgent(t *testing.T) {
 	if err := ValidateAgent(agent); err != nil {
 		t.Fatalf("ValidateAgent returned error: %v", err)
 	}
+	agent.RepoScope = ""
+	if err := ValidateAgent(agent); err != nil {
+		t.Fatalf("ValidateAgent rejected global agent without repo scope: %v", err)
+	}
+	agent.RepoScope = "jerryfane/gitmoot"
 
 	agent.Runtime = "unknown"
 	if err := ValidateAgent(agent); err == nil {

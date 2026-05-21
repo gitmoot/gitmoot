@@ -540,8 +540,12 @@ func (e Engine) ensureAgentAllowed(ctx context.Context, request JobRequest, ref 
 		}
 		return err
 	}
-	if agent.RepoScope != request.Repo {
-		return e.block(ctx, ref, fmt.Sprintf("agent %q is scoped to %q, not %q", agent.Name, agent.RepoScope, request.Repo))
+	allowed, err := e.Store.AgentCanAccessRepo(ctx, agent.Name, request.Repo)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return e.block(ctx, ref, fmt.Sprintf("agent %q is not allowed on %q", agent.Name, request.Repo))
 	}
 	if !contains(agent.Capabilities, request.Action) {
 		return e.block(ctx, ref, fmt.Sprintf("agent %q lacks %q capability", agent.Name, request.Action))
