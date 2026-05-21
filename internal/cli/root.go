@@ -24,6 +24,7 @@ var rootCommands = []command{
 	{name: "doctor", summary: "check local Gitmoot prerequisites", run: runDoctor},
 	{name: "version", summary: "show Gitmoot version and build metadata", run: runVersion},
 	{name: "config", summary: "show local Gitmoot config paths", run: runConfig},
+	{name: "update", summary: "check for and apply Gitmoot releases", run: runUpdate},
 	{name: "setup", summary: "register a repo and initial agent", run: runSetup},
 	{name: "repo", summary: "manage watched repositories", run: runRepo},
 	{name: "daemon", summary: "run the local PR watcher", run: runDaemon},

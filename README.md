@@ -26,6 +26,9 @@ gitmoot init
 gitmoot setup --repo owner/repo --path . --agent <name> --runtime codex|claude|shell --session <ref>
 gitmoot doctor --repo .
 gitmoot config path|show
+gitmoot version [--json]
+gitmoot update --check
+gitmoot update [--restart-daemon]
 gitmoot daemon start --repo owner/repo --poll 30s
 gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
 gitmoot agent list

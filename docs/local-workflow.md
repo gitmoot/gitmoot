@@ -25,6 +25,8 @@ gitmoot job show <job-id>
 gitmoot job retry <job-id>
 gitmoot job cancel <job-id>
 gitmoot status --repo owner/repo
+gitmoot version --json
+gitmoot update --check
 gitmoot daemon start --repo owner/repo --poll 30s
 ```
 
@@ -72,6 +74,13 @@ planned tasks. `task run` starts one task branch and records its branch lock.
    gitmoot agent list
    gitmoot agent doctor lead
    gitmoot agent doctor audit
+   ```
+
+   To inspect the installed Gitmoot build or check for a beta release:
+
+   ```sh
+   gitmoot version
+   gitmoot update --check
    ```
 
 5. Start the daemon from the repository checkout.
