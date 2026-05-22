@@ -22,6 +22,22 @@ requests. A local `gitmoot daemon` watches PR comments, routes jobs to allowed
 agents, records job state in local SQLite, and posts attributed results back to
 the PR.
 
+## Install Gitmoot
+
+If `gitmoot` is not installed, install the latest beta:
+
+```sh
+curl -fsSL https://gitmoot.io/install.sh | sh
+```
+
+Verify the install and GitHub access before using Gitmoot:
+
+```sh
+gitmoot version
+gitmoot update --check
+gh auth status
+```
+
 ## Core Workflow
 
 Use GitHub PR comments as the public audit trail. Local Gitmoot state is the
