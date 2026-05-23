@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/preset"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
@@ -60,6 +62,7 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, or shell")
 	session := fs.String("session", "", "runtime session reference, last, or shell command")
 	role := fs.String("role", "", "agent role")
+	presetID := fs.String("preset", "", "agent prompt preset")
 	policy := fs.String("policy", "auto", "autonomy policy")
 	var repos repeatedFlag
 	var capabilities repeatedFlag
@@ -94,13 +97,19 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 	if len(normalizedRepos) > 0 {
 		repoScope = normalizedRepos[0]
 	}
+	resolvedRole, resolvedCapabilities, err := resolvePresetDefaults(*presetID, *role, capabilities)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid preset: %v\n", err)
+		return 2
+	}
 	agent := runtime.Agent{
 		Name:           name,
-		Role:           *role,
+		Role:           resolvedRole,
 		Runtime:        *runtimeName,
 		RuntimeRef:     *session,
 		RepoScope:      repoScope,
-		Capabilities:   capabilities,
+		PresetID:       strings.TrimSpace(*presetID),
+		Capabilities:   resolvedCapabilities,
 		AutonomyPolicy: *policy,
 		HealthStatus:   "unknown",
 	}
@@ -109,12 +118,24 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if err := withStore(*home, func(store *db.Store) error {
+		if agent.PresetID != "" {
+			if _, err := store.GetPreset(context.Background(), agent.PresetID); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return fmt.Errorf("preset %s is not installed; run gitmoot preset update %s", agent.PresetID, agent.PresetID)
+				}
+				return err
+			}
+		}
 		if err := store.UpsertAgent(context.Background(), dbAgent(agent)); err != nil {
 			return err
 		}
 		return store.ReplaceAgentRepos(context.Background(), agent.Name, normalizedRepos)
 	}); err != nil {
-		fmt.Fprintf(stderr, "subscribe agent: %v\n", err)
+		if strings.HasPrefix(err.Error(), "preset ") {
+			fmt.Fprintf(stderr, "%v\n", err)
+		} else {
+			fmt.Fprintf(stderr, "subscribe agent: %v\n", err)
+		}
 		return 1
 	}
 	if len(normalizedRepos) == 0 {
@@ -123,6 +144,49 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "subscribed %s (%s) for %s\n", agent.Name, agent.Runtime, strings.Join(normalizedRepos, ","))
 	}
 	return 0
+}
+
+func resolvePresetDefaults(presetID string, role string, capabilities []string) (string, []string, error) {
+	presetID = strings.TrimSpace(presetID)
+	role = strings.TrimSpace(role)
+	resolvedCapabilities := compactValues(capabilities)
+	if presetID == "" {
+		return role, resolvedCapabilities, nil
+	}
+	definition, ok := preset.Lookup(presetID)
+	if !ok {
+		return "", nil, fmt.Errorf("unknown preset %q", presetID)
+	}
+	if role == "" {
+		role = definition.DefaultRole
+	}
+	if len(resolvedCapabilities) == 0 {
+		resolvedCapabilities = append([]string{}, definition.DefaultCapabilities...)
+	}
+	if !definition.Mutation && containsValue(resolvedCapabilities, "implement") {
+		return "", nil, fmt.Errorf("preset %s does not allow implement capability", definition.ID)
+	}
+	return role, resolvedCapabilities, nil
+}
+
+func compactValues(values []string) []string {
+	compacted := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			compacted = append(compacted, value)
+		}
+	}
+	return compacted
+}
+
+func containsValue(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func runAgentList(args []string, stdout, stderr io.Writer) int {

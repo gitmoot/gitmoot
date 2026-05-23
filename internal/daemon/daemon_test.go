@@ -18,12 +18,24 @@ func TestPollOnceCreatesJobAndAcknowledgement(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
 	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertPreset(ctx, db.Preset{
+		ID:             "thermo-nuclear-code-quality-review",
+		Name:           "Thermo-Nuclear Code Quality Review",
+		SourceRepo:     "cursor/plugins",
+		SourceRef:      "main",
+		SourcePath:     "cursor-team-kit/skills/thermo-nuclear-code-quality-review/SKILL.md",
+		ResolvedCommit: "abc123",
+		Content:        "Review deeply.",
+	}); err != nil {
+		t.Fatalf("UpsertPreset returned error: %v", err)
+	}
 	if err := store.UpsertAgent(ctx, db.Agent{
 		Name:           "audit",
 		Role:           "reviewer",
 		Runtime:        "codex",
 		RuntimeRef:     "last",
 		RepoScope:      repo.FullName(),
+		PresetID:       "thermo-nuclear-code-quality-review",
 		Capabilities:   []string{"review"},
 		AutonomyPolicy: "auto",
 		HealthStatus:   "ok",
@@ -71,6 +83,9 @@ func TestPollOnceCreatesJobAndAcknowledgement(t *testing.T) {
 	}
 	if payload.Repo != repo.FullName() || payload.Branch != "task-7" || payload.PullRequest != 7 || payload.Sender != "alice" || payload.Instructions != "focus on tests" {
 		t.Fatalf("payload = %+v", payload)
+	}
+	if payload.PresetID != "thermo-nuclear-code-quality-review" || payload.PresetResolvedCommit != "abc123" || payload.PresetContent != "Review deeply." {
+		t.Fatalf("payload preset snapshot = %+v", payload)
 	}
 	events, err := store.ListJobEvents(ctx, jobID)
 	if err != nil {

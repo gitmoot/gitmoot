@@ -138,6 +138,121 @@ func TestRunAgentAccessCommands(t *testing.T) {
 	}
 }
 
+func TestRunAgentSubscribeAppliesInstalledPresetDefaults(t *testing.T) {
+	home := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
+	}
+	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.UpsertPreset(context.Background(), db.Preset{
+		ID:             "thermo-nuclear-code-quality-review",
+		Name:           "Thermo-Nuclear Code Quality Review",
+		SourceRepo:     "cursor/plugins",
+		SourceRef:      "main",
+		SourcePath:     "cursor-team-kit/skills/thermo-nuclear-code-quality-review/SKILL.md",
+		ResolvedCommit: "abc123",
+		Content:        "Review deeply.",
+	}); err != nil {
+		t.Fatalf("UpsertPreset returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{
+		"agent", "subscribe", "thermo-review",
+		"--home", home,
+		"--runtime", "codex",
+		"--session", "550e8400-e29b-41d4-a716-446655440001",
+		"--repo", "jerryfane/gitmoot",
+		"--preset", "thermo-nuclear-code-quality-review",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("subscribe exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	store, err = db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer store.Close()
+	agent, err := store.GetAgent(context.Background(), "thermo-review")
+	if err != nil {
+		t.Fatalf("GetAgent returned error: %v", err)
+	}
+	if agent.Role != "reviewer" || agent.PresetID != "thermo-nuclear-code-quality-review" || strings.Join(agent.Capabilities, ",") != "ask,review" {
+		t.Fatalf("agent = %+v", agent)
+	}
+}
+
+func TestRunAgentSubscribeRejectsMissingPresetAndImplementCapability(t *testing.T) {
+	home := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "subscribe", "thermo-review",
+		"--home", home,
+		"--runtime", "codex",
+		"--session", "550e8400-e29b-41d4-a716-446655440001",
+		"--repo", "jerryfane/gitmoot",
+		"--preset", "thermo-nuclear-code-quality-review",
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("missing preset exit code = %d, want 1", code)
+	}
+	want := "preset thermo-nuclear-code-quality-review is not installed; run gitmoot preset update thermo-nuclear-code-quality-review"
+	if strings.TrimSpace(stderr.String()) != want {
+		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
+	}
+	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.UpsertPreset(context.Background(), db.Preset{
+		ID:             "thermo-nuclear-code-quality-review",
+		Name:           "Thermo-Nuclear Code Quality Review",
+		SourceRepo:     "cursor/plugins",
+		SourceRef:      "main",
+		SourcePath:     "cursor-team-kit/skills/thermo-nuclear-code-quality-review/SKILL.md",
+		ResolvedCommit: "abc123",
+		Content:        "Review deeply.",
+	}); err != nil {
+		t.Fatalf("UpsertPreset returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"agent", "subscribe", "thermo-review",
+		"--home", home,
+		"--runtime", "codex",
+		"--session", "550e8400-e29b-41d4-a716-446655440001",
+		"--repo", "jerryfane/gitmoot",
+		"--preset", "thermo-nuclear-code-quality-review",
+		"--capability", "implement",
+	}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("implement capability exit code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "does not allow implement capability") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
 func TestRunAgentSubscribeValidatesInput(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{"agent", "subscribe", "bad name", "--runtime", "codex", "--session", "s", "--role", "reviewer", "--repo", "jerryfane/gitmoot"}, &stdout, &stderr)

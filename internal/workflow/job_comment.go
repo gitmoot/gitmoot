@@ -28,6 +28,11 @@ func RenderJobResultComment(comment JobResultComment) string {
 	builder.WriteString("> Runtime: `")
 	builder.WriteString(markdownInline(comment.Runtime))
 	builder.WriteString("`\n")
+	if strings.TrimSpace(comment.Payload.PresetID) != "" {
+		builder.WriteString("> Preset: `")
+		builder.WriteString(markdownInline(comment.Payload.PresetID))
+		builder.WriteString("`\n")
+	}
 	builder.WriteString("> Job: `")
 	builder.WriteString(markdownInline(comment.JobID))
 	builder.WriteString("`\n\n")
