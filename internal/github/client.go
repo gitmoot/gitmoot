@@ -340,6 +340,9 @@ func (c *GhClient) ListPullRequestChecks(ctx context.Context, repo Repository, n
 		"--repo", repo.FullName(),
 		"--json", "name,state,bucket,link,workflow,completedAt",
 	)
+	if err != nil && isUnsupportedJSONFlag(result) {
+		return c.listPullRequestChecksViaView(ctx, repo, number)
+	}
 	if err != nil && strings.TrimSpace(result.Stdout) == "" {
 		if isNoChecks(result) {
 			return nil, nil
@@ -354,6 +357,81 @@ func (c *GhClient) ListPullRequestChecks(ctx context.Context, repo Repository, n
 		return nil, fmt.Errorf("decode gh pr checks response: %w", decodeErr)
 	}
 	return checks, nil
+}
+
+func (c *GhClient) listPullRequestChecksViaView(ctx context.Context, repo Repository, number int64) ([]PullRequestCheck, error) {
+	result, err := c.run(ctx, false,
+		"pr", "view", strconv.FormatInt(number, 10),
+		"--repo", repo.FullName(),
+		"--json", "statusCheckRollup",
+	)
+	if err != nil {
+		return nil, err
+	}
+	var response struct {
+		StatusCheckRollup []statusCheckRollupItem `json:"statusCheckRollup"`
+	}
+	if err := json.Unmarshal([]byte(result.Stdout), &response); err != nil {
+		return nil, fmt.Errorf("decode gh pr view statusCheckRollup response: %w", err)
+	}
+	checks := make([]PullRequestCheck, 0, len(response.StatusCheckRollup))
+	for _, item := range response.StatusCheckRollup {
+		checks = append(checks, item.pullRequestCheck())
+	}
+	return checks, nil
+}
+
+type statusCheckRollupItem struct {
+	Name         string `json:"name"`
+	Context      string `json:"context"`
+	State        string `json:"state"`
+	Status       string `json:"status"`
+	Conclusion   string `json:"conclusion"`
+	DetailsURL   string `json:"detailsUrl"`
+	TargetURL    string `json:"targetUrl"`
+	WorkflowName string `json:"workflowName"`
+}
+
+func (i statusCheckRollupItem) pullRequestCheck() PullRequestCheck {
+	state := firstNonEmpty(i.State, i.Conclusion, i.Status)
+	return PullRequestCheck{
+		Name:     firstNonEmpty(i.Name, i.Context),
+		State:    state,
+		Bucket:   checkBucket(i),
+		Link:     firstNonEmpty(i.DetailsURL, i.TargetURL),
+		Workflow: i.WorkflowName,
+	}
+}
+
+func checkBucket(item statusCheckRollupItem) string {
+	state := strings.ToLower(strings.TrimSpace(item.State))
+	if state != "" {
+		switch state {
+		case "success":
+			return "pass"
+		case "expected", "pending":
+			return "pending"
+		case "failure", "error":
+			return "fail"
+		}
+	}
+	status := strings.ToLower(strings.TrimSpace(item.Status))
+	if status != "" && status != "completed" {
+		return "pending"
+	}
+	switch strings.ToLower(strings.TrimSpace(item.Conclusion)) {
+	case "success", "neutral":
+		return "pass"
+	case "skipped":
+		return "skipping"
+	case "failure", "cancelled", "timed_out", "action_required":
+		return "fail"
+	case "":
+		if status == "completed" {
+			return "pass"
+		}
+	}
+	return ""
 }
 
 func (c *GhClient) CreateCommitStatus(ctx context.Context, input CommitStatusInput) (CommitStatus, error) {
@@ -496,6 +574,11 @@ func isNoChecks(result subprocess.Result) bool {
 	return strings.Contains(text, "no checks reported")
 }
 
+func isUnsupportedJSONFlag(result subprocess.Result) bool {
+	text := strings.ToLower(result.Stdout + "\n" + result.Stderr)
+	return strings.Contains(text, "unknown flag: --json") || strings.Contains(text, "unknown shorthand flag") && strings.Contains(text, "json")
+}
+
 func endpoint(repo Repository, parts ...any) string {
 	values := []string{"repos", repo.Owner, repo.Name}
 	for _, part := range parts {
@@ -522,6 +605,16 @@ func firstLine(value string) string {
 		line = strings.TrimSpace(line)
 		if line != "" {
 			return line
+		}
+	}
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
 		}
 	}
 	return ""

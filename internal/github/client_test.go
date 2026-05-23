@@ -229,6 +229,47 @@ func TestListPullRequestChecksTreatsNoChecksAsEmpty(t *testing.T) {
 	}
 }
 
+func TestListPullRequestChecksFallsBackToStatusCheckRollup(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{
+			{Stderr: "unknown flag: --json"},
+			{Stdout: `{"statusCheckRollup":[
+				{"name":"test","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://example.com/check","workflowName":"ci"},
+				{"name":"lint","status":"IN_PROGRESS","workflowName":"ci"},
+				{"context":"legacy","state":"FAILURE","targetUrl":"https://example.com/status"},
+				{"context":"required","state":"EXPECTED"}
+			]}`},
+		},
+		errs: []error{errors.New("exit status 1"), nil},
+	}
+	client := GhClient{Runner: runner}
+
+	checks, err := client.ListPullRequestChecks(context.Background(), Repository{Owner: "jerryfane", Name: "gitmoot"}, 2)
+
+	if err != nil {
+		t.Fatalf("ListPullRequestChecks returned error: %v", err)
+	}
+	if len(checks) != 4 {
+		t.Fatalf("checks = %+v, want 4", checks)
+	}
+	if checks[0].Bucket != "pass" || checks[1].Bucket != "pending" || checks[2].Bucket != "fail" || checks[3].Bucket != "pending" {
+		t.Fatalf("checks = %+v", checks)
+	}
+	if checks[2].Name != "legacy" || checks[2].Link != "https://example.com/status" {
+		t.Fatalf("legacy status check = %+v", checks[2])
+	}
+	runner.wantArgs(t, 0,
+		"pr", "checks", "2",
+		"--repo", "jerryfane/gitmoot",
+		"--json", "name,state,bucket,link,workflow,completedAt",
+	)
+	runner.wantArgs(t, 1,
+		"pr", "view", "2",
+		"--repo", "jerryfane/gitmoot",
+		"--json", "statusCheckRollup",
+	)
+}
+
 func TestMergePullRequestUsesSafeHeadMatch(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{
 		{Stdout: "merged"},
