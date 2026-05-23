@@ -14,7 +14,10 @@ registration, plan import, task branch startup, status, recovery, and updates:
 ```sh
 gitmoot setup --repo owner/repo --path . --agent lead --runtime codex --session <session-ref> --role lead
 gitmoot doctor --repo .
+gitmoot preset list
+gitmoot preset update thermo-nuclear-code-quality-review
 gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
+gitmoot agent subscribe thermo-review --runtime codex --session <session-id-or-last> --repo owner/repo --preset thermo-nuclear-code-quality-review
 gitmoot agent allow <name> --repo owner/repo
 gitmoot agent repos <name>
 gitmoot agent list
@@ -77,6 +80,28 @@ planned tasks. `task run` starts one task branch and records its branch lock.
    gitmoot agent doctor audit
    ```
 
+   To add the built-in strict review preset, fetch and cache it explicitly,
+   then subscribe a Codex-backed review agent. `--preset` supplies the default
+   reviewer role and `ask,review` capabilities when those flags are omitted.
+
+   ```sh
+   gitmoot preset update thermo-nuclear-code-quality-review
+   gitmoot agent subscribe thermo-review \
+     --runtime codex \
+     --session <session-id-or-last> \
+     --repo owner/project \
+     --preset thermo-nuclear-code-quality-review
+   gitmoot agent doctor thermo-review
+   ```
+
+   Preset updates are explicit and auditable. Diff upstream content before
+   refreshing the local cached copy:
+
+   ```sh
+   gitmoot preset diff thermo-nuclear-code-quality-review
+   gitmoot preset update thermo-nuclear-code-quality-review
+   ```
+
    To inspect the installed Gitmoot build or check for a beta release:
 
    ```sh
@@ -112,6 +137,7 @@ planned tasks. `task run` starts one task branch and records its branch lock.
    ```text
    /gitmoot help
    /gitmoot audit review focus on correctness and missed edge cases
+   /gitmoot thermo-review review
    /gitmoot lead implement fix the review findings without broad refactors
    /gitmoot retry <job-id>
    /gitmoot cancel <job-id>
@@ -160,6 +186,8 @@ planned tasks. `task run` starts one task branch and records its branch lock.
   in V1.
 - GitHub comments are authored by the authenticated user. Agent attribution is
   written in the comment body.
+- Preset content is not fetched at job runtime. Run `gitmoot preset update`
+  intentionally when you want to refresh a cached preset.
 
 ## Multi-Repo Supervision
 

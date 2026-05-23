@@ -47,6 +47,49 @@ Fixes:
 - Confirm `CODEX_HOME` if sessions are stored outside `~/.codex`.
 - Re-subscribe the agent with the correct session reference.
 
+## Presets
+
+Symptoms:
+
+- `gitmoot agent subscribe ... --preset thermo-nuclear-code-quality-review`
+  fails with an install hint.
+- A preset-backed job does not include the expected review instructions.
+- You want to know whether the cached preset differs from upstream.
+
+Checks:
+
+```sh
+gitmoot preset list
+gitmoot preset show thermo-nuclear-code-quality-review
+gitmoot preset diff thermo-nuclear-code-quality-review
+gitmoot agent list
+```
+
+Fixes:
+
+- Install or refresh the preset explicitly:
+
+  ```sh
+  gitmoot preset update thermo-nuclear-code-quality-review
+  ```
+
+- Re-subscribe the agent after the preset is installed:
+
+  ```sh
+  gitmoot agent subscribe thermo-review \
+    --runtime codex \
+    --session <session-id-or-last> \
+    --repo owner/repo \
+    --preset thermo-nuclear-code-quality-review
+  gitmoot agent doctor thermo-review
+  ```
+
+- Preset content is snapshotted when a job is queued. Retry an existing job to
+  reuse its original snapshot; comment again after `preset update` to queue a
+  job with refreshed content.
+- The thermo preset is review-only. Remove `--capability implement` and route
+  implementation work to a separate implementation-capable agent.
+
 ## Claude Code
 
 Symptoms:

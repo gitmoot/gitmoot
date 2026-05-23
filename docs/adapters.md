@@ -38,6 +38,7 @@ type Agent struct {
     Runtime        string
     RuntimeRef     string
     RepoScope      string
+    PresetID       string
     Capabilities   []string
     AutonomyPolicy string
     HealthStatus   string
@@ -46,6 +47,9 @@ type Agent struct {
 
 `RuntimeRef` is runtime-specific. Codex accepts a session UUID, thread name, or
 `last`. Claude accepts a UUID or `last`. Shell uses the configured command.
+`PresetID` is Gitmoot-owned metadata. Adapters do not fetch or interpret preset
+content; Gitmoot snapshots cached preset instructions into the rendered prompt
+before delivery.
 
 ## Job Input
 
@@ -63,8 +67,9 @@ type Job struct {
 ```
 
 The prompt already includes repo, branch, PR number, task label, sender,
-requested action, constraints, and the required `gitmoot_result` JSON shape.
-Adapters should pass the prompt through without rewriting workflow semantics.
+requested action, cached preset instructions when present, constraints, and the
+required `gitmoot_result` JSON shape. Adapters should pass the prompt through
+without rewriting workflow semantics.
 
 ## Result Handling
 
@@ -86,6 +91,29 @@ output must be preserved for parsing and diagnostics.
 Keep runtime-specific command names, flags, JSON modes, session lookup, and
 fallback behavior inside the adapter package. Do not leak Codex or Claude
 assumptions into workflow, daemon, GitHub, database, or merge-gate code.
+
+## Presets
+
+Presets are prompt/profile bundles layered above runtimes. They are not runtime
+adapters and should not create adapter-specific behavior. The built-in
+`thermo-nuclear-code-quality-review` preset is fetched explicitly with:
+
+```sh
+gitmoot preset update thermo-nuclear-code-quality-review
+```
+
+After it is cached, bind it to a normal runtime-backed agent:
+
+```sh
+gitmoot agent subscribe thermo-review \
+  --runtime codex \
+  --session <session-id-or-last> \
+  --repo owner/repo \
+  --preset thermo-nuclear-code-quality-review
+```
+
+The thermo preset is non-mutating. It supplies reviewer defaults and allows
+`ask,review`, but it cannot grant `implement`.
 
 ## Shell Adapter
 

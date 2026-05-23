@@ -74,6 +74,64 @@ Expected signals:
    gitmoot daemon status
    ```
 
+## Thermo Preset Smoke Test
+
+Goal: PR comment -> queued review job -> Codex resume with cached thermo preset
+instructions -> attributed PR result comment. Run this with a Gitmoot build that
+includes `gitmoot preset` commands.
+
+1. Cache the preset and subscribe a Codex review agent.
+
+   ```sh
+   gitmoot preset update thermo-nuclear-code-quality-review
+   gitmoot agent subscribe thermo-review \
+     --runtime codex \
+     --session <session-id-or-last> \
+     --repo owner/project \
+     --preset thermo-nuclear-code-quality-review
+   gitmoot agent doctor thermo-review
+   ```
+
+2. Start the daemon for the test repo.
+
+   ```sh
+   gitmoot daemon start --repo owner/project --poll 10s
+   gitmoot daemon status
+   ```
+
+3. Open a disposable PR, then comment:
+
+   ```text
+   /gitmoot thermo-review review
+   ```
+
+4. Verify the queued job and PR result.
+
+   ```sh
+   gitmoot job list --repo owner/project
+   gh pr view <number> --repo owner/project --comments
+   ```
+
+Expected signals:
+
+- The PR receives a queued-job acknowledgement for `thermo-review`.
+- `gitmoot job list --repo owner/project` shows the review job.
+- The result comment includes preset attribution:
+
+  ```md
+  > Agent: `thermo-review`
+  > Runtime: `codex`
+  > Preset: `thermo-nuclear-code-quality-review`
+  > Job: `...`
+  ```
+
+5. Check or refresh the cached preset only through explicit commands.
+
+   ```sh
+   gitmoot preset diff thermo-nuclear-code-quality-review
+   gitmoot preset update thermo-nuclear-code-quality-review
+   ```
+
 ## Two-Repo Smoke Test
 
 Goal: one daemon -> two registered repos -> same allowed agent -> ask jobs in

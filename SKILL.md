@@ -59,6 +59,35 @@ Common PR commands:
 When unsure which agents or commands are available, ask for `/gitmoot help` or
 run local status commands before acting.
 
+## Thermo Review Preset
+
+Gitmoot can register the built-in `thermo-nuclear-code-quality-review` preset
+as a strict review-only agent. Preset content is updated explicitly and cached
+locally; queued jobs keep the preset snapshot they were created with.
+
+```sh
+gitmoot preset update thermo-nuclear-code-quality-review
+gitmoot agent subscribe thermo-review \
+  --runtime codex \
+  --session <session-id-or-last> \
+  --repo owner/repo \
+  --preset thermo-nuclear-code-quality-review
+gitmoot agent doctor thermo-review
+```
+
+Use it from a PR comment:
+
+```text
+/gitmoot thermo-review review
+```
+
+Check upstream changes before refreshing the cached preset:
+
+```sh
+gitmoot preset diff thermo-nuclear-code-quality-review
+gitmoot preset update thermo-nuclear-code-quality-review
+```
+
 ## Required Result Contract
 
 Every agent job must return a `gitmoot_result` JSON object. Keep it concise and
