@@ -3,6 +3,8 @@ package runtime
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,8 +51,19 @@ type Result struct {
 	Raw      string
 }
 
+type StartRequest struct {
+	Agent  Agent
+	Prompt string
+}
+
+type StartResult struct {
+	RuntimeRef string
+	Raw        string
+}
+
 type Adapter interface {
 	Name() string
+	Start(ctx context.Context, request StartRequest) (StartResult, error)
 	Validate(ctx context.Context, agent Agent) error
 	Deliver(ctx context.Context, agent Agent, job Job) (Result, error)
 	Health(ctx context.Context, agent Agent) error
@@ -75,6 +88,29 @@ func (f Factory) Adapter(name string) (Adapter, error) {
 }
 
 func ValidateAgent(agent Agent) error {
+	if err := validateAgentFields(agent, true); err != nil {
+		return err
+	}
+	if agent.Runtime == ClaudeRuntime && agent.RuntimeRef != LastRef && !isUUID(agent.RuntimeRef) {
+		return fmt.Errorf("claude runtime reference %q must be a UUID or last", agent.RuntimeRef)
+	}
+	return nil
+}
+
+func validateStartRequest(agent Agent, runtimeName string, prompt string) error {
+	if err := validateAgentFields(agent, false); err != nil {
+		return err
+	}
+	if agent.Runtime != runtimeName {
+		return fmt.Errorf("agent runtime %q does not match adapter %q", agent.Runtime, runtimeName)
+	}
+	if strings.TrimSpace(prompt) == "" {
+		return errors.New("start prompt is required")
+	}
+	return nil
+}
+
+func validateAgentFields(agent Agent, requireRuntimeRef bool) error {
 	switch {
 	case strings.TrimSpace(agent.Name) == "":
 		return errors.New("agent name is required")
@@ -84,16 +120,13 @@ func ValidateAgent(agent Agent) error {
 		return errors.New("agent role is required")
 	case strings.TrimSpace(agent.Runtime) == "":
 		return errors.New("agent runtime is required")
-	case strings.TrimSpace(agent.RuntimeRef) == "":
+	case requireRuntimeRef && strings.TrimSpace(agent.RuntimeRef) == "":
 		return errors.New("agent runtime reference is required")
 	case strings.TrimSpace(agent.RepoScope) != "" && !validRepoScope(agent.RepoScope):
 		return fmt.Errorf("agent repo scope %q must be owner/repo", agent.RepoScope)
 	}
 	if _, err := (Factory{}).Adapter(agent.Runtime); err != nil {
 		return err
-	}
-	if agent.Runtime == ClaudeRuntime && agent.RuntimeRef != LastRef && !isUUID(agent.RuntimeRef) {
-		return fmt.Errorf("claude runtime reference %q must be a UUID or last", agent.RuntimeRef)
 	}
 	return nil
 }
@@ -114,6 +147,21 @@ type CodexAdapter struct {
 }
 
 func (a CodexAdapter) Name() string { return CodexRuntime }
+
+func (a CodexAdapter) Start(ctx context.Context, request StartRequest) (StartResult, error) {
+	if err := validateStartRequest(request.Agent, a.Name(), request.Prompt); err != nil {
+		return StartResult{}, err
+	}
+	result, err := a.runner().Run(ctx, a.Dir, "codex", "exec", "--json", "--", request.Prompt)
+	if err != nil {
+		return StartResult{Raw: result.Stdout + result.Stderr}, commandError(result, err)
+	}
+	threadID, err := parseCodexStartedThreadID(result.Stdout)
+	if err != nil {
+		return StartResult{Raw: result.Stdout}, err
+	}
+	return StartResult{RuntimeRef: threadID, Raw: result.Stdout}, nil
+}
 
 func (a CodexAdapter) Validate(_ context.Context, agent Agent) error {
 	return validateRuntime(agent, a.Name())
@@ -181,11 +229,28 @@ func (a CodexAdapter) sessionResolver() CodexSessionResolver {
 }
 
 type ClaudeAdapter struct {
-	Runner subprocess.Runner
-	Dir    string
+	Runner        subprocess.Runner
+	Dir           string
+	NewRuntimeRef func() (string, error)
 }
 
 func (a ClaudeAdapter) Name() string { return ClaudeRuntime }
+
+func (a ClaudeAdapter) Start(ctx context.Context, request StartRequest) (StartResult, error) {
+	if err := validateStartRequest(request.Agent, a.Name(), request.Prompt); err != nil {
+		return StartResult{}, err
+	}
+	runtimeRef, err := a.newRuntimeRef()
+	if err != nil {
+		return StartResult{}, err
+	}
+	args := []string{"--session-id", runtimeRef, "-p", "--output-format", "json", "--", request.Prompt}
+	result, err := a.runner().Run(ctx, a.Dir, "claude", args...)
+	if err != nil {
+		return StartResult{Raw: result.Stdout + result.Stderr}, commandError(result, err)
+	}
+	return StartResult{RuntimeRef: runtimeRef, Raw: result.Stdout}, nil
+}
 
 func (a ClaudeAdapter) Validate(_ context.Context, agent Agent) error {
 	return validateRuntime(agent, a.Name())
@@ -234,12 +299,26 @@ func (a ClaudeAdapter) runner() subprocess.Runner {
 	return subprocess.ExecRunner{}
 }
 
+func (a ClaudeAdapter) newRuntimeRef() (string, error) {
+	if a.NewRuntimeRef != nil {
+		return a.NewRuntimeRef()
+	}
+	return newUUID()
+}
+
 type ShellAdapter struct {
 	Runner subprocess.Runner
 	Dir    string
 }
 
 func (a ShellAdapter) Name() string { return ShellRuntime }
+
+func (a ShellAdapter) Start(ctx context.Context, request StartRequest) (StartResult, error) {
+	if err := validateStartRequest(request.Agent, a.Name(), request.Prompt); err != nil {
+		return StartResult{}, err
+	}
+	return StartResult{}, errors.New("shell runtime does not support agent start; use gitmoot agent subscribe --runtime shell --session <command>")
+}
 
 func (a ShellAdapter) Validate(_ context.Context, agent Agent) error {
 	return validateRuntime(agent, a.Name())
@@ -287,6 +366,43 @@ func commandError(result subprocess.Result, err error) error {
 		return err
 	}
 	return fmt.Errorf("%s: %w", detail, err)
+}
+
+func parseCodexStartedThreadID(output string) (string, error) {
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var event struct {
+			Type     string `json:"type"`
+			ThreadID string `json:"thread_id"`
+		}
+		if json.Unmarshal([]byte(line), &event) != nil {
+			continue
+		}
+		if event.Type == "thread.started" && strings.TrimSpace(event.ThreadID) != "" {
+			return strings.TrimSpace(event.ThreadID), nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("parse codex start output: %w", err)
+	}
+	return "", errors.New("codex start did not emit thread.started thread_id")
+}
+
+func newUUID() (string, error) {
+	var bytes [16]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		return "", err
+	}
+	bytes[6] = (bytes[6] & 0x0f) | 0x40
+	bytes[8] = (bytes[8] & 0x3f) | 0x80
+	encoded := make([]byte, 32)
+	hex.Encode(encoded, bytes[:])
+	return fmt.Sprintf("%s-%s-%s-%s-%s", encoded[0:8], encoded[8:12], encoded[12:16], encoded[16:20], encoded[20:32]), nil
 }
 
 func claudeArgs(agent Agent, prompt string, jsonOutput bool) []string {

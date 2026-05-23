@@ -69,6 +69,33 @@ func TestCodexDeliverCommand(t *testing.T) {
 	runner.want(t, 0, "codex", "exec", "resume", "550e8400-e29b-41d4-a716-446655440001", "--", "review this")
 }
 
+func TestCodexStartCommandParsesThreadID(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "not json\n" + `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440009"}` + "\n"}}}
+	adapter := CodexAdapter{Runner: runner, Dir: "/repo"}
+	agent := Agent{Name: "lead", Role: "implementer", Runtime: CodexRuntime, RepoScope: "jerryfane/gitmoot"}
+
+	result, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "initialize"})
+
+	if err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	if result.RuntimeRef != "550e8400-e29b-41d4-a716-446655440009" {
+		t.Fatalf("runtime ref = %q", result.RuntimeRef)
+	}
+	runner.want(t, 0, "codex", "exec", "--json", "--", "initialize")
+}
+
+func TestCodexStartRejectsMissingThreadID(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"type":"turn.completed"}` + "\n"}}}
+	adapter := CodexAdapter{Runner: runner}
+	agent := Agent{Name: "lead", Role: "implementer", Runtime: CodexRuntime, RepoScope: "jerryfane/gitmoot"}
+
+	if _, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "initialize"}); err == nil {
+		t.Fatal("Start accepted output without thread id")
+	}
+	runner.want(t, 0, "codex", "exec", "--json", "--", "initialize")
+}
+
 func TestCodexDeliverLastSessionCommand(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "done"}}}
 	adapter := CodexAdapter{Runner: runner}
@@ -153,6 +180,47 @@ func TestClaudeDeliverCommand(t *testing.T) {
 	runner.want(t, 0, "claude", "--resume", "550e8400-e29b-41d4-a716-446655440002", "-p", "--output-format", "json", "--", "review")
 }
 
+func TestClaudeStartCommandUsesGeneratedSessionID(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"result":"ready"}`}}}
+	adapter := ClaudeAdapter{
+		Runner: runner,
+		Dir:    "/repo",
+		NewRuntimeRef: func() (string, error) {
+			return "550e8400-e29b-41d4-a716-446655440010", nil
+		},
+	}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime, RepoScope: "jerryfane/gitmoot"}
+
+	result, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "initialize"})
+
+	if err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	if result.RuntimeRef != "550e8400-e29b-41d4-a716-446655440010" {
+		t.Fatalf("runtime ref = %q", result.RuntimeRef)
+	}
+	runner.want(t, 0, "claude", "--session-id", "550e8400-e29b-41d4-a716-446655440010", "-p", "--output-format", "json", "--", "initialize")
+}
+
+func TestClaudeStartDoesNotStoreSessionIDWhenCommandFails(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{Stderr: "failed"}},
+		errs:    []error{errors.New("exit 1")},
+	}
+	adapter := ClaudeAdapter{
+		Runner: runner,
+		NewRuntimeRef: func() (string, error) {
+			return "550e8400-e29b-41d4-a716-446655440010", nil
+		},
+	}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime, RepoScope: "jerryfane/gitmoot"}
+
+	if _, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "initialize"}); err == nil {
+		t.Fatal("Start accepted failed claude command")
+	}
+	runner.want(t, 0, "claude", "--session-id", "550e8400-e29b-41d4-a716-446655440010", "-p", "--output-format", "json", "--", "initialize")
+}
+
 func TestClaudeDeliverLastSessionCommand(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"result":"done"}`}}}
 	adapter := ClaudeAdapter{Runner: runner}
@@ -223,6 +291,15 @@ func TestShellDeliverCommand(t *testing.T) {
 		t.Fatalf("summary = %q", result.Summary)
 	}
 	runner.want(t, 0, "sh", "-c", "printf ok", "gitmoot", "hello")
+}
+
+func TestShellStartUnsupported(t *testing.T) {
+	adapter := ShellAdapter{}
+	agent := Agent{Name: "custom", Role: "reviewer", Runtime: ShellRuntime, RepoScope: "jerryfane/gitmoot"}
+
+	if _, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "initialize"}); err == nil {
+		t.Fatal("Start accepted shell runtime")
+	}
 }
 
 func TestShellHealthRunsProbe(t *testing.T) {
