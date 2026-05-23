@@ -88,6 +88,35 @@ gitmoot preset diff thermo-nuclear-code-quality-review
 gitmoot preset update thermo-nuclear-code-quality-review
 ```
 
+## Custom Prompt Presets
+
+Users can install local prompt files as custom presets. Gitmoot snapshots the
+file content into local SQLite at add/update time; queued jobs use that cached
+snapshot, not the live file.
+
+```sh
+gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
+gitmoot agent start frontend-reviewer \
+  --runtime codex \
+  --repo owner/repo \
+  --preset frontend-reviewer \
+  --role reviewer \
+  --capability ask \
+  --capability review
+```
+
+Use `agent start` to create a new Codex or Claude runtime session. Use
+`agent subscribe` when the runtime session already exists. Custom presets do
+not provide default role or capabilities for subscribed agents, so pass
+`--role` and one or more `--capability` flags.
+
+After editing a local prompt file, refresh the cached snapshot explicitly:
+
+```sh
+gitmoot preset diff frontend-reviewer
+gitmoot preset update frontend-reviewer
+```
+
 ## Required Result Contract
 
 Every agent job must return a `gitmoot_result` JSON object. Keep it concise and

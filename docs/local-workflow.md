@@ -15,6 +15,7 @@ registration, plan import, task branch startup, status, recovery, and updates:
 gitmoot setup --repo owner/repo --path . --agent lead --runtime codex --session <session-ref> --role lead
 gitmoot doctor --repo .
 gitmoot preset list
+gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
 gitmoot preset update thermo-nuclear-code-quality-review
 gitmoot agent start <name> --runtime codex|claude --repo owner/repo --path . --preset thermo-nuclear-code-quality-review --start-daemon
 gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
@@ -102,6 +103,36 @@ planned tasks. `task run` starts one task branch and records its branch lock.
    Add `--update-preset` when you want startup to refresh the cached preset
    before creating the runtime session.
 
+   Custom prompt presets are local files snapshotted into Gitmoot state. Use
+   them when you want a repo- or team-specific agent profile without changing
+   Codex, Claude, or repository agent files.
+
+   ```sh
+   mkdir -p agents
+   printf '%s\n' 'Review frontend changes for correctness and responsive behavior.' > agents/frontend-reviewer.md
+   gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
+   gitmoot agent start frontend-reviewer \
+     --runtime codex \
+     --repo owner/project \
+     --path . \
+     --preset frontend-reviewer \
+     --role reviewer \
+     --capability ask \
+     --capability review
+   ```
+
+   Built-in presets can define default roles and capabilities. Custom presets
+   do not in V1, so pass the role and capabilities you want. `agent start`
+   still keeps the normal fallback defaults if omitted, while
+   `agent subscribe --preset <custom-id>` requires explicit values.
+
+   After editing a custom prompt file, refresh the cached snapshot explicitly:
+
+   ```sh
+   gitmoot preset diff frontend-reviewer
+   gitmoot preset update frontend-reviewer
+   ```
+
    After startup, open a created Codex session later with the session id printed
    by Gitmoot:
 
@@ -122,7 +153,8 @@ planned tasks. `task run` starts one task branch and records its branch lock.
    ```
 
    Preset updates are explicit and auditable. Diff upstream content before
-   refreshing the local cached copy:
+   refreshing the local cached copy. For custom presets, `diff` compares the
+   cached content with the stored local file path.
 
    ```sh
    gitmoot preset diff thermo-nuclear-code-quality-review

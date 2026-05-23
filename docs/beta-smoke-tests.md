@@ -203,6 +203,106 @@ Expected signals:
    /tmp/gitmoot-current daemon status --home "$GITMOOT_SMOKE_HOME"
    ```
 
+## Custom Prompt Preset Smoke Test
+
+Goal: local prompt file -> cached custom preset -> preset-backed Codex agent ->
+queued PR comment job with custom preset metadata.
+
+Prerequisites: a safe test repository, authenticated `gh`, installed Codex, and
+a Gitmoot build that includes `preset add`.
+
+1. Build a local test binary and use an isolated Gitmoot home.
+
+   ```sh
+   GOTOOLCHAIN=go1.26.0 go build -o /tmp/gitmoot-current ./cmd/gitmoot
+   export GITMOOT_SMOKE_HOME=/tmp/gitmoot-custom-preset-smoke
+   rm -rf "$GITMOOT_SMOKE_HOME"
+   /tmp/gitmoot-current init --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+2. From the test repo checkout, create and install a local prompt preset.
+
+   ```sh
+   cd /path/to/project
+   mkdir -p agents
+   printf '%s\n' 'Review only correctness, regressions, and missing tests.' > agents/local-reviewer.md
+   /tmp/gitmoot-current preset add local-reviewer \
+     --home "$GITMOOT_SMOKE_HOME" \
+     --file agents/local-reviewer.md \
+     --name "Local Reviewer"
+   /tmp/gitmoot-current preset show --home "$GITMOOT_SMOKE_HOME" local-reviewer
+   ```
+
+3. Start or subscribe a Codex test agent with the custom preset.
+
+   ```sh
+   /tmp/gitmoot-current agent start local-reviewer \
+     --home "$GITMOOT_SMOKE_HOME" \
+     --runtime codex \
+     --repo owner/project \
+     --path . \
+     --preset local-reviewer \
+     --role reviewer \
+     --capability ask \
+     --capability review \
+     --start-daemon
+   /tmp/gitmoot-current agent doctor local-reviewer --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+   To register an existing session instead, use:
+
+   ```sh
+   /tmp/gitmoot-current agent subscribe local-reviewer \
+     --home "$GITMOOT_SMOKE_HOME" \
+     --runtime codex \
+     --session <session-id-or-last> \
+     --repo owner/project \
+     --preset local-reviewer \
+     --role reviewer \
+     --capability ask \
+     --capability review
+   /tmp/gitmoot-current daemon start \
+     --home "$GITMOOT_SMOKE_HOME" \
+     --repo owner/project \
+     --poll 10s
+   ```
+
+4. Open a disposable PR, then comment:
+
+   ```text
+   /gitmoot local-reviewer review
+   ```
+
+5. Verify the job and metadata.
+
+   ```sh
+   /tmp/gitmoot-current job list --home "$GITMOOT_SMOKE_HOME" --repo owner/project
+   /tmp/gitmoot-current job show <job-id> --home "$GITMOOT_SMOKE_HOME"
+   gh pr view <number> --repo owner/project --comments
+   ```
+
+Expected signals:
+
+- `preset show` displays `source: local@file:` and `resolved commit: sha256:...`.
+- The PR receives a queued-job acknowledgement for `local-reviewer`.
+- The result comment includes `Agent`, `Runtime`, `Preset`, and `Job` metadata.
+- `job show <job-id>` includes the custom preset id and `sha256:` content hash.
+
+6. Edit and refresh the prompt only through explicit preset commands.
+
+   ```sh
+   printf '%s\n' 'Review correctness, regressions, missing tests, and edge cases.' > agents/local-reviewer.md
+   /tmp/gitmoot-current preset diff --home "$GITMOOT_SMOKE_HOME" local-reviewer
+   /tmp/gitmoot-current preset update --home "$GITMOOT_SMOKE_HOME" local-reviewer
+   ```
+
+7. Stop the isolated daemon.
+
+   ```sh
+   /tmp/gitmoot-current daemon stop --home "$GITMOOT_SMOKE_HOME"
+   /tmp/gitmoot-current daemon status --home "$GITMOOT_SMOKE_HOME"
+   ```
+
 ## Two-Repo Smoke Test
 
 Goal: one daemon -> two registered repos -> same allowed agent -> ask jobs in

@@ -135,8 +135,11 @@ assumptions into workflow, daemon, GitHub, database, or merge-gate code.
 ## Presets
 
 Presets are prompt/profile bundles layered above runtimes. They are not runtime
-adapters and should not create adapter-specific behavior. The built-in
-`thermo-nuclear-code-quality-review` preset is fetched explicitly with:
+adapters and should not create adapter-specific behavior. Gitmoot snapshots
+cached preset content into startup and job prompts before invoking an adapter.
+
+The built-in `thermo-nuclear-code-quality-review` preset is fetched explicitly
+with:
 
 ```sh
 gitmoot preset update thermo-nuclear-code-quality-review
@@ -153,6 +156,18 @@ gitmoot agent start thermo-review \
 
 The thermo preset is non-mutating. It supplies reviewer defaults and allows
 `ask,review`, but it cannot grant `implement`.
+
+Local custom presets are installed from files:
+
+```sh
+gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
+```
+
+They store `local@file:<absolute-path>` metadata and a `sha256:<hash>` resolved
+identifier. Adapters should not read those files or decide how presets behave;
+workflow code passes only the rendered prompt. After a prompt file changes, the
+user must run `gitmoot preset update <custom-id>` before new jobs use the new
+content.
 
 ## Shell Adapter
 

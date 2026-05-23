@@ -53,6 +53,9 @@ Symptoms:
 
 - `gitmoot agent subscribe ... --preset thermo-nuclear-code-quality-review`
   fails with an install hint.
+- `gitmoot agent start ... --preset <custom-id>` fails with a `preset add`
+  hint.
+- A custom prompt edit is not reflected in new jobs.
 - A preset-backed job does not include the expected review instructions.
 - You want to know whether the cached preset differs from upstream.
 
@@ -61,7 +64,9 @@ Checks:
 ```sh
 gitmoot preset list
 gitmoot preset show thermo-nuclear-code-quality-review
+gitmoot preset show <custom-id>
 gitmoot preset diff thermo-nuclear-code-quality-review
+gitmoot preset diff <custom-id>
 gitmoot agent list
 ```
 
@@ -71,6 +76,13 @@ Fixes:
 
   ```sh
   gitmoot preset update thermo-nuclear-code-quality-review
+  ```
+
+  For a custom local prompt file:
+
+  ```sh
+  gitmoot preset add <custom-id> --file agents/<custom-id>.md
+  gitmoot preset update <custom-id>
   ```
 
 - Re-subscribe the agent after the preset is installed:
@@ -87,6 +99,9 @@ Fixes:
 - Preset content is snapshotted when a job is queued. Retry an existing job to
   reuse its original snapshot; comment again after `preset update` to queue a
   job with refreshed content.
+- Custom preset files are not read at job runtime. Run
+  `gitmoot preset diff <custom-id>` and `gitmoot preset update <custom-id>`
+  after editing the file.
 - The thermo preset is review-only. Remove `--capability implement` and route
   implementation work to a separate implementation-capable agent.
 

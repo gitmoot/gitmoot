@@ -33,7 +33,8 @@ gitmoot daemon start [--repo owner/repo] [--poll 30s]
 gitmoot daemon run [--repo owner/repo] [--poll 30s]
 gitmoot daemon stop|restart|status|logs
 gitmoot preset list
-gitmoot preset show|update|diff thermo-nuclear-code-quality-review
+gitmoot preset add <preset-id> --file ./agents/<preset-id>.md
+gitmoot preset show|update|diff <preset-id>
 gitmoot agent start <name> --runtime codex|claude --repo owner/repo [--path .] [--preset <preset-id>] [--start-daemon]
 gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
 gitmoot agent start thermo-review --runtime codex --repo owner/repo --preset thermo-nuclear-code-quality-review
@@ -87,6 +88,33 @@ Check upstream changes before refreshing the cached preset:
 ```sh
 gitmoot preset diff thermo-nuclear-code-quality-review
 gitmoot preset update thermo-nuclear-code-quality-review
+```
+
+## Custom Prompt Presets
+
+Custom presets let you keep a local prompt file and bind its snapshotted
+instructions to any Gitmoot agent.
+
+```sh
+mkdir -p agents
+printf '%s\n' 'Review frontend changes for correctness and responsive behavior.' > agents/frontend-reviewer.md
+gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
+gitmoot agent start frontend-reviewer \
+  --runtime codex \
+  --repo owner/repo \
+  --preset frontend-reviewer \
+  --role reviewer \
+  --capability ask \
+  --capability review
+```
+
+Gitmoot copies the file content into local SQLite when you run `preset add` or
+`preset update`. Jobs use that cached snapshot. After editing the prompt file,
+run:
+
+```sh
+gitmoot preset diff frontend-reviewer
+gitmoot preset update frontend-reviewer
 ```
 
 ## Documentation
