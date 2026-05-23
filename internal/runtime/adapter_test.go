@@ -104,6 +104,17 @@ func TestCodexDeliverRejectsMissingNamedSession(t *testing.T) {
 	}
 }
 
+func TestCodexDeliverAllowsMissingUUIDSessionToReachCodex(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "done"}}}
+	adapter := CodexAdapter{Runner: runner, SessionResolver: staticCodexSessions{}}
+	agent := Agent{Name: "lead", Role: "implementer", Runtime: CodexRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440001", RepoScope: "jerryfane/gitmoot"}
+
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	runner.want(t, 0, "codex", "exec", "resume", "550e8400-e29b-41d4-a716-446655440001", "--", "review")
+}
+
 func TestCodexHealthUsesRegisteredSession(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "OK"}}}
 	adapter := CodexAdapter{Runner: runner, SessionResolver: staticCodexSessions{exists: true}}
@@ -241,6 +252,67 @@ func TestCodexSessionIndexFindsIDAndThreadName(t *testing.T) {
 		if !exists {
 			t.Fatalf("Exists(%q) = false, want true", ref)
 		}
+	}
+}
+
+func TestCodexSessionIndexFindsIDFromShellSnapshot(t *testing.T) {
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, "session_index.jsonl"), nil, 0o600); err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+	snapshots := filepath.Join(home, "shell_snapshots")
+	if err := os.MkdirAll(snapshots, 0o700); err != nil {
+		t.Fatalf("mkdir snapshots: %v", err)
+	}
+	sessionID := "550e8400-e29b-41d4-a716-446655440003"
+	snapshot := filepath.Join(snapshots, sessionID+".1779518064381155930.sh")
+	if err := os.WriteFile(snapshot, []byte("# snapshot\n"), 0o600); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	exists, err := (CodexSessionIndex{Home: home}).Exists(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("Exists returned error: %v", err)
+	}
+	if !exists {
+		t.Fatal("Exists returned false for shell snapshot session")
+	}
+}
+
+func TestCodexSessionIndexUsesCodexHomeBeforeDefaultHome(t *testing.T) {
+	codexHome := t.TempDir()
+	sessionID := "550e8400-e29b-41d4-a716-446655440004"
+	content := `{"id":"` + sessionID + `","thread_name":"codex-home-thread","updated_at":"2026-05-20T00:00:00Z"}` + "\n"
+	if err := os.WriteFile(filepath.Join(codexHome, "session_index.jsonl"), []byte(content), 0o600); err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+	t.Setenv("CODEX_HOME", codexHome)
+
+	exists, err := (CodexSessionIndex{}).Exists(context.Background(), "codex-home-thread")
+	if err != nil {
+		t.Fatalf("Exists returned error: %v", err)
+	}
+	if !exists {
+		t.Fatal("Exists returned false for CODEX_HOME thread")
+	}
+}
+
+func TestCodexSessionIndexDoesNotMatchThreadNameFromSnapshot(t *testing.T) {
+	home := t.TempDir()
+	snapshots := filepath.Join(home, "shell_snapshots")
+	if err := os.MkdirAll(snapshots, 0o700); err != nil {
+		t.Fatalf("mkdir snapshots: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(snapshots, "review-thread.1779518064381155930.sh"), []byte("# snapshot\n"), 0o600); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	exists, err := (CodexSessionIndex{Home: home}).Exists(context.Background(), "review-thread")
+	if err != nil {
+		t.Fatalf("Exists returned error: %v", err)
+	}
+	if exists {
+		t.Fatal("Exists returned true for non-UUID snapshot thread name")
 	}
 }
 

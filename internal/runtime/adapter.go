@@ -103,6 +103,7 @@ type CodexSessionResolver interface {
 
 type CodexSessionIndex struct {
 	Path string
+	Home string
 }
 
 type CodexAdapter struct {
@@ -163,6 +164,9 @@ func (a CodexAdapter) verifySession(ctx context.Context, agent Agent) error {
 		return fmt.Errorf("verify codex session: %w", err)
 	}
 	if !exists {
+		if isUUID(agent.RuntimeRef) {
+			return nil
+		}
 		return fmt.Errorf("codex session %q was not found", agent.RuntimeRef)
 	}
 	return nil
@@ -339,10 +343,37 @@ func isUUID(value string) bool {
 }
 
 func (r CodexSessionIndex) Exists(ctx context.Context, ref string) (bool, error) {
-	path, err := r.path()
+	locations, err := r.locations()
 	if err != nil {
 		return false, err
 	}
+	for _, location := range locations {
+		found, err := codexSessionIndexContains(ctx, location.IndexPath, ref)
+		if err != nil {
+			return false, err
+		}
+		if found {
+			return true, nil
+		}
+		if isUUID(ref) {
+			found, err = codexShellSnapshotsContain(ctx, location.SnapshotsDir, ref)
+			if err != nil {
+				return false, err
+			}
+			if found {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+type codexSessionLocation struct {
+	IndexPath    string
+	SnapshotsDir string
+}
+
+func codexSessionIndexContains(ctx context.Context, path string, ref string) (bool, error) {
 	file, err := os.Open(path)
 	if os.IsNotExist(err) {
 		return false, nil
@@ -351,7 +382,6 @@ func (r CodexSessionIndex) Exists(ctx context.Context, ref string) (bool, error)
 		return false, err
 	}
 	defer file.Close()
-
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -374,17 +404,75 @@ func (r CodexSessionIndex) Exists(ctx context.Context, ref string) (bool, error)
 	return false, nil
 }
 
-func (r CodexSessionIndex) path() (string, error) {
-	if r.Path != "" {
-		return r.Path, nil
+func codexShellSnapshotsContain(ctx context.Context, dir string, ref string) (bool, error) {
+	pattern := filepath.Join(dir, ref+".*.sh")
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return false, err
 	}
-	home := strings.TrimSpace(os.Getenv("CODEX_HOME"))
-	if home == "" {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return len(matches) > 0, nil
+}
+
+func (r CodexSessionIndex) locations() ([]codexSessionLocation, error) {
+	if r.Path != "" {
+		return []codexSessionLocation{codexLocationForIndex(r.Path)}, nil
+	}
+	homes := []string{}
+	if home := strings.TrimSpace(r.Home); home != "" {
+		return []codexSessionLocation{codexLocationForHome(home)}, nil
+	}
+	if home := strings.TrimSpace(os.Getenv("CODEX_HOME")); home != "" {
+		homes = append(homes, home)
+	}
+	userHome, err := os.UserHomeDir()
+	if err != nil && len(homes) == 0 {
+		return nil, err
+	}
+	if err == nil {
+		homes = append(homes, filepath.Join(userHome, ".codex"))
+	}
+	locations := make([]codexSessionLocation, 0, len(homes))
+	seen := map[string]bool{}
+	for _, home := range homes {
+		home = filepath.Clean(home)
+		if seen[home] {
+			continue
+		}
+		seen[home] = true
+		locations = append(locations, codexLocationForHome(home))
+	}
+	return locations, nil
+}
+
+func (r CodexSessionIndex) path() (string, error) {
+	locations, err := r.locations()
+	if err != nil {
+		return "", err
+	}
+	if len(locations) == 0 {
 		userHome, err := os.UserHomeDir()
 		if err != nil {
 			return "", err
 		}
-		home = filepath.Join(userHome, ".codex")
+		return filepath.Join(userHome, ".codex", "session_index.jsonl"), nil
 	}
-	return filepath.Join(home, "session_index.jsonl"), nil
+	return locations[0].IndexPath, nil
+}
+
+func codexLocationForIndex(path string) codexSessionLocation {
+	home := filepath.Dir(path)
+	return codexSessionLocation{
+		IndexPath:    path,
+		SnapshotsDir: filepath.Join(home, "shell_snapshots"),
+	}
+}
+
+func codexLocationForHome(home string) codexSessionLocation {
+	return codexSessionLocation{
+		IndexPath:    filepath.Join(home, "session_index.jsonl"),
+		SnapshotsDir: filepath.Join(home, "shell_snapshots"),
+	}
 }
