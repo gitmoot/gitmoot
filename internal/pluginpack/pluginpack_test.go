@@ -134,8 +134,12 @@ func TestBuildRefusesOverwriteWithoutForce(t *testing.T) {
 
 func TestBuildForceReplacesExistingPackage(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "gitmoot")
-	if err := os.MkdirAll(out, 0o755); err != nil {
-		t.Fatal(err)
+	if _, err := Build(BuildOptions{
+		Provider: ProviderCodex,
+		OutDir:   out,
+		SourceFS: validSkillFS(),
+	}); err != nil {
+		t.Fatalf("initial Build() error = %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(out, "stale.txt"), []byte("stale"), 0o644); err != nil {
 		t.Fatal(err)
@@ -154,6 +158,27 @@ func TestBuildForceReplacesExistingPackage(t *testing.T) {
 		t.Fatalf("stale file still exists after force rebuild: %v", err)
 	}
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "SKILL.md"), "Gitmoot")
+}
+
+func TestBuildForceRefusesArbitraryExplicitOutput(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "not-a-plugin")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(out, "important.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Build(BuildOptions{
+		Provider: ProviderCodex,
+		OutDir:   out,
+		Force:    true,
+		SourceFS: validSkillFS(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "refusing forced replacement") {
+		t.Fatalf("Build() error = %v, want refusing forced replacement", err)
+	}
+	assertFileContains(t, filepath.Join(out, "important.txt"), "keep")
 }
 
 func TestBuildValidatesSkillSource(t *testing.T) {

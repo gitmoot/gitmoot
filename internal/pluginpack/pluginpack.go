@@ -66,6 +66,21 @@ func DefaultPackageDir(home string, provider Provider) string {
 	return filepath.Join(home, "plugins", "build", string(provider), PluginName)
 }
 
+func DefaultMarketplaceDir(home string, provider Provider) string {
+	return filepath.Join(home, "plugins", "marketplaces", string(provider))
+}
+
+func ManifestPath(root string, provider Provider) string {
+	switch provider {
+	case ProviderCodex:
+		return filepath.Join(root, ".codex-plugin", "plugin.json")
+	case ProviderClaude:
+		return filepath.Join(root, ".claude-plugin", "plugin.json")
+	default:
+		return filepath.Join(root, "plugin.json")
+	}
+}
+
 func Build(opts BuildOptions) (BuildResult, error) {
 	provider, err := validateProvider(opts.Provider)
 	if err != nil {
@@ -80,11 +95,15 @@ func Build(opts BuildOptions) (BuildResult, error) {
 	}
 
 	outDir := strings.TrimSpace(opts.OutDir)
+	defaultOutDir := ""
+	if strings.TrimSpace(opts.Home) != "" {
+		defaultOutDir = filepath.Clean(DefaultPackageDir(opts.Home, provider))
+	}
 	if outDir == "" {
-		if strings.TrimSpace(opts.Home) == "" {
+		if defaultOutDir == "" {
 			return BuildResult{}, errors.New("home is required when out dir is omitted")
 		}
-		outDir = DefaultPackageDir(opts.Home, provider)
+		outDir = defaultOutDir
 	}
 	outDir = filepath.Clean(outDir)
 	if exists, err := pathExists(outDir); err != nil {
@@ -92,6 +111,9 @@ func Build(opts BuildOptions) (BuildResult, error) {
 	} else if exists {
 		if !opts.Force {
 			return BuildResult{}, fmt.Errorf("%s already exists; pass --force to replace it", outDir)
+		}
+		if outDir != defaultOutDir && !isGeneratedPackageDir(outDir, provider) {
+			return BuildResult{}, fmt.Errorf("%s does not look like a generated %s plugin package; refusing forced replacement", outDir, provider)
 		}
 		if err := os.RemoveAll(outDir); err != nil {
 			return BuildResult{}, fmt.Errorf("remove existing package: %w", err)
@@ -106,7 +128,7 @@ func Build(opts BuildOptions) (BuildResult, error) {
 		return BuildResult{}, err
 	}
 
-	manifestPath := manifestPath(outDir, provider)
+	manifestPath := ManifestPath(outDir, provider)
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
 		return BuildResult{}, fmt.Errorf("create manifest dir: %w", err)
 	}
@@ -193,17 +215,6 @@ func copyDir(source fs.FS, sourceRoot, targetRoot string) error {
 		perm := info.Mode().Perm() | 0o600
 		return os.WriteFile(target, content, perm)
 	})
-}
-
-func manifestPath(root string, provider Provider) string {
-	switch provider {
-	case ProviderCodex:
-		return filepath.Join(root, ".codex-plugin", "plugin.json")
-	case ProviderClaude:
-		return filepath.Join(root, ".claude-plugin", "plugin.json")
-	default:
-		return filepath.Join(root, "plugin.json")
-	}
 }
 
 func manifest(provider Provider, info buildinfo.Info) (any, error) {
@@ -329,4 +340,22 @@ func pathExists(path string) (bool, error) {
 		return false, nil
 	}
 	return false, err
+}
+
+func isGeneratedPackageDir(path string, provider Provider) bool {
+	manifestBytes, err := os.ReadFile(ManifestPath(path, provider))
+	if err != nil {
+		return false
+	}
+	var manifest struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		return false
+	}
+	if manifest.Name != PluginName {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(path, "skills", PluginName, "SKILL.md"))
+	return err == nil && !info.IsDir()
 }
