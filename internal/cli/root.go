@@ -30,6 +30,7 @@ var rootCommands = []command{
 	{name: "daemon", summary: "run the local PR watcher", run: runDaemon},
 	{name: "agent", summary: "manage registered agents", run: runAgent},
 	{name: "preset", summary: "manage agent prompt presets", run: runPreset},
+	{name: "plugin", summary: "build and inspect Gitmoot agent plugins", run: runPlugin},
 	{name: "events", summary: "show local repo events", run: runEvents},
 	{name: "status", summary: "show local workflow status", run: runStatus},
 	{name: "goal", summary: "import or inspect goals", run: runGoal},
