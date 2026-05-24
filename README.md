@@ -53,8 +53,10 @@ gitmoot job list|show|events|run|retry|cancel
 gitmoot lock list|show|release
 ```
 
-Agents should read [SKILL.md](SKILL.md) for the Gitmoot job contract, branch
-lock expectations, and safe behavior rules.
+Agents should read the canonical Agent Skills package at
+[skills/gitmoot/SKILL.md](skills/gitmoot/SKILL.md) for the Gitmoot job contract,
+branch lock expectations, and safe behavior rules. The root [SKILL.md](SKILL.md)
+remains as a raw compatibility entrypoint for agents and `gitmoot.io/SKILL.md`.
 
 ## Thermo Review Preset
 
@@ -119,6 +121,7 @@ gitmoot preset update frontend-reviewer
 
 ## Documentation
 
+- [Agent Skills package](skills/gitmoot/SKILL.md)
 - [Local workflow walkthrough](docs/local-workflow.md)
 - [Beta smoke tests](docs/beta-smoke-tests.md)
 - [Runtime adapter authoring](docs/adapters.md)

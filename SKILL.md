@@ -1,8 +1,12 @@
 ---
-name: gitmoot-agent
-description: Use Gitmoot to coordinate local AI agent sessions through GitHub pull requests, including PR commands, repo access, branch locks, job results, and safe agent behavior.
+name: gitmoot
+description: Use Gitmoot for local-first multi-agent coordination through GitHub PR comments, repo-scoped agent subscriptions, daemon checks, jobs, branch locks, presets, custom prompt agents, and Codex or Claude Code runtime workflows.
 version: 0.1.0
+license: MIT
+compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex or Claude Code.
 metadata:
+  gitmoot-version: "0.1.0"
+  source: "jerryfane/gitmoot"
   openclaw:
     requires:
       bins:
@@ -17,12 +21,27 @@ metadata:
 
 # Gitmoot Agent Skill
 
-Gitmoot is a local-first coordinator for AI agents working through GitHub pull
-requests. A local `gitmoot daemon` watches PR comments, routes jobs to allowed
-agents, records job state in local SQLite, and posts attributed results back to
-the PR.
+This root `SKILL.md` is kept as a raw compatibility entrypoint for agents and
+`gitmoot.io/SKILL.md`. The canonical Agent Skills package lives at
+`skills/gitmoot/`, with deeper reference files under `skills/gitmoot/references/`.
 
-## Install Gitmoot
+Gitmoot is a local-first coordinator for AI agents working through GitHub pull
+requests. Use this skill when the user wants PR-comment agent workflows,
+repo-scoped agent subscriptions, background daemon checks, Codex or Claude Code
+agent startup, preset agents, custom prompt agents, job status, or branch lock
+inspection.
+
+## Before Acting
+
+1. Check whether `gitmoot` is installed with `gitmoot version`.
+2. Confirm GitHub CLI access with `gh auth status` before using PR workflows.
+3. Detect or ask for the target repo before starting daemons, subscribing agents,
+   or routing jobs.
+4. Do not start daemons, create agents, update presets, or change subscriptions
+   unless the user asks or the current task clearly requires it.
+5. Prefer read-only status commands before mutating Gitmoot state.
+
+## Install And Update
 
 If `gitmoot` is not installed, install the latest beta:
 
@@ -38,12 +57,28 @@ gitmoot update --check
 gh auth status
 ```
 
-## Core Workflow
+## Common Local Commands
 
-Use GitHub PR comments as the public audit trail. Local Gitmoot state is the
-workflow source of truth.
+```sh
+gitmoot status --repo owner/repo
+gitmoot events --repo owner/repo
+gitmoot daemon start --repo owner/repo --poll 30s
+gitmoot daemon status
+gitmoot agent list
+gitmoot agent doctor <agent>
+gitmoot job list --repo owner/repo
+gitmoot job show <job-id>
+gitmoot job events <job-id>
+gitmoot lock list --repo owner/repo
+gitmoot lock show owner/repo <branch>
+```
 
-Common PR commands:
+Use `gitmoot daemon start` for the background daemon. Use `gitmoot daemon run`
+only when the user explicitly wants a foreground process.
+
+## PR Comment Commands
+
+Use GitHub PR comments as the public audit trail:
 
 ```text
 /gitmoot help
@@ -56,43 +91,20 @@ Common PR commands:
 /gitmoot merge
 ```
 
-When unsure which agents or commands are available, ask for `/gitmoot help` or
-run local status commands before acting.
+## Preset Agents
 
-## Thermo Review Preset
-
-Gitmoot can register the built-in `thermo-nuclear-code-quality-review` preset
-as a strict review-only agent. Preset content is updated explicitly and cached
-locally; queued jobs keep the preset snapshot they were created with.
+Install or refresh the built-in thermo review preset:
 
 ```sh
 gitmoot preset update thermo-nuclear-code-quality-review
-gitmoot agent subscribe thermo-review \
+gitmoot agent start thermo-review \
   --runtime codex \
-  --session <session-id-or-last> \
   --repo owner/repo \
-  --preset thermo-nuclear-code-quality-review
-gitmoot agent doctor thermo-review
+  --preset thermo-nuclear-code-quality-review \
+  --start-daemon
 ```
 
-Use it from a PR comment:
-
-```text
-/gitmoot thermo-review review
-```
-
-Check upstream changes before refreshing the cached preset:
-
-```sh
-gitmoot preset diff thermo-nuclear-code-quality-review
-gitmoot preset update thermo-nuclear-code-quality-review
-```
-
-## Custom Prompt Presets
-
-Users can install local prompt files as custom presets. Gitmoot snapshots the
-file content into local SQLite at add/update time; queued jobs use that cached
-snapshot, not the live file.
+Create a local custom prompt preset:
 
 ```sh
 gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
@@ -105,22 +117,17 @@ gitmoot agent start frontend-reviewer \
   --capability review
 ```
 
-Use `agent start` to create a new Codex or Claude runtime session. Use
-`agent subscribe` when the runtime session already exists. Custom presets do
-not provide default role or capabilities for subscribed agents, so pass
-`--role` and one or more `--capability` flags.
-
-After editing a local prompt file, refresh the cached snapshot explicitly:
+After editing a local prompt file, refresh Gitmoot's cached snapshot explicitly:
 
 ```sh
 gitmoot preset diff frontend-reviewer
 gitmoot preset update frontend-reviewer
 ```
 
-## Required Result Contract
+## Agent Job Contract
 
-Every agent job must return a `gitmoot_result` JSON object. Keep it concise and
-truthful.
+Every Gitmoot job should return a concise and truthful `gitmoot_result` JSON
+object:
 
 ```json
 {
@@ -137,39 +144,25 @@ truthful.
 ```
 
 Use `blocked` when work cannot continue without human input or external state.
-Use `failed` when the attempted action errored. Do not report tests or changes
-that were not actually run or made.
+Use `failed` when the attempted action errored. Do not report tests, changes, or
+approvals that were not actually verified.
 
-## Repo Access And Locks
+## Safety Rules
 
-Agents are global identities with explicit per-repo access. A PR's repository is
-the routing context for `/gitmoot <agent> ...`.
+Preserve existing behavior unless the job explicitly changes it. Keep work
+scoped to the target repo. Do not commit generated data, caches, logs, secrets,
+session archives, cloned helper repos, or large outputs unless explicitly
+requested. Respect Gitmoot branch locks for implementation jobs.
 
-Implementation jobs must respect branch locks. Do not edit or push an
-implementation branch unless Gitmoot assigned the job and the branch lock is
-held by the assigned agent. Review and ask jobs should inspect and report
-without mutating the branch unless the task explicitly instructs otherwise.
+Implementation jobs must not edit or push an implementation branch unless
+Gitmoot assigned the job and the branch lock is held by the assigned agent.
+Review and ask jobs should inspect and report without mutating branches unless
+the task explicitly instructs otherwise.
 
-Useful local commands:
+Redact secrets from GitHub comments, job summaries, raw examples, and copied
+command output.
 
-```sh
-gitmoot status --repo owner/repo
-gitmoot events --repo owner/repo
-gitmoot job list --repo owner/repo
-gitmoot job show <job-id>
-gitmoot job events <job-id>
-gitmoot lock list --repo owner/repo
-gitmoot lock show owner/repo <branch>
-```
+## When Unsure
 
-## Safe Agent Behavior
-
-- Preserve existing behavior unless the job explicitly changes it.
-- Keep changes scoped to the job and the target repo.
-- Do not commit generated data, caches, logs, secrets, session archives, cloned
-  helper repos, or large outputs unless explicitly requested.
-- Verify external APIs, CLIs, env vars, generated scripts, and service launchers
-  with local commands or official docs before editing.
-- Redact secrets from summaries, comments, and raw examples.
-- If a Gitmoot instruction is unclear, reread this `SKILL.md`, then inspect
-  `/gitmoot help`, `gitmoot status`, and relevant job events.
+Reread this `SKILL.md`, then inspect `/gitmoot help`, `gitmoot status`, and the
+relevant job events before acting.
