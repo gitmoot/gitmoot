@@ -23,6 +23,12 @@ Goal: prove Gitmoot can build runtime plugin packages, register local
 marketplaces in isolated homes, and diagnose the generated packages without
 writing into the real user runtime state.
 
+For the scripted version, run:
+
+```sh
+GO_BIN=/path/to/go1.26 scripts/plugin-smoke.sh
+```
+
 1. Build a local test binary and use an isolated Gitmoot home.
 
    ```sh
