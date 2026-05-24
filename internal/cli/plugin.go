@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,11 +14,14 @@ import (
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/buildinfo"
+	"github.com/jerryfane/gitmoot/internal/plugininstall"
 	"github.com/jerryfane/gitmoot/internal/pluginpack"
+	"github.com/jerryfane/gitmoot/internal/subprocess"
 	"github.com/jerryfane/gitmoot/skills"
 )
 
 var pluginLookPath = exec.LookPath
+var pluginInstallRunner subprocess.Runner = subprocess.ExecRunner{}
 
 type pluginCheck struct {
 	Name     string `json:"name"`
@@ -50,6 +54,8 @@ func runPlugin(args []string, stdout, stderr io.Writer) int {
 		return runPluginPath(args[1:], stdout, stderr)
 	case "doctor":
 		return runPluginDoctor(args[1:], stdout, stderr)
+	case "install":
+		return runPluginInstall(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown plugin command %q\n\n", args[0])
 		printPluginUsage(stderr)
@@ -60,8 +66,76 @@ func runPlugin(args []string, stdout, stderr io.Writer) int {
 func printPluginUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot plugin build codex|claude")
+	fmt.Fprintln(w, "  gitmoot plugin install codex|claude")
 	fmt.Fprintln(w, "  gitmoot plugin path codex|claude")
 	fmt.Fprintln(w, "  gitmoot plugin doctor [codex|claude]")
+}
+
+func runPluginInstall(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("plugin install", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	scope := fs.String("scope", "user", "Claude plugin scope: user, project, or local")
+	force := fs.Bool("force", false, "replace existing generated plugin package")
+	explicitScope := hasFlag(args, "scope")
+	provider, ok, help := parsePluginProviderArg(args, fs, stderr, "plugin install")
+	if help {
+		return 0
+	}
+	if !ok {
+		return 2
+	}
+
+	paths, err := pathsFromFlag(*home)
+	if err != nil {
+		fmt.Fprintf(stderr, "plugin install: %v\n", err)
+		return 1
+	}
+	result, err := plugininstall.Install(context.Background(), plugininstall.Options{
+		Provider: provider,
+		Home:     paths.Home,
+		Scope:    *scope,
+		Force:    *force,
+		Info:     buildinfo.Current(),
+		Runner:   pluginInstallRunner,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "plugin install: %v\n", err)
+		return 1
+	}
+	writeLine(stdout, "package: %s", result.PackagePath)
+	writeLine(stdout, "marketplace: %s", result.MarketplaceRoot)
+	if provider == pluginpack.ProviderCodex && explicitScope {
+		writeLine(stdout, "scope: ignored for codex")
+	}
+	if result.RuntimeMissing {
+		writeLine(stdout, "%s CLI was not found; generated files are ready.", provider)
+		printPluginManualCommands(stdout, result.ManualCommands)
+		return 0
+	}
+	writeLine(stdout, "installed %s plugin", provider)
+	return 0
+}
+
+func hasFlag(args []string, name string) bool {
+	short := "-" + name
+	long := "--" + name
+	for _, arg := range args {
+		if arg == short || arg == long || strings.HasPrefix(arg, short+"=") || strings.HasPrefix(arg, long+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func printPluginManualCommands(w io.Writer, commands []string) {
+	if len(commands) == 0 {
+		return
+	}
+	writeLine(w, "manual install commands:")
+	for _, command := range commands {
+		writeLine(w, "  %s", command)
+	}
 }
 
 func runPluginBuild(args []string, stdout, stderr io.Writer) int {

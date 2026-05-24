@@ -81,6 +81,10 @@ func ManifestPath(root string, provider Provider) string {
 	}
 }
 
+func IsGeneratedPackageDir(path string, provider Provider) bool {
+	return isGeneratedPackageDir(path, provider)
+}
+
 func Build(opts BuildOptions) (BuildResult, error) {
 	provider, err := validateProvider(opts.Provider)
 	if err != nil {
