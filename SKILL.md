@@ -1,11 +1,22 @@
 ---
 name: gitmoot
 description: Use Gitmoot for local-first multi-agent coordination through GitHub PR comments, repo-scoped agent subscriptions, daemon checks, jobs, branch locks, presets, custom prompt agents, and Codex or Claude Code runtime workflows.
+version: 0.1.0
 license: MIT
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex or Claude Code.
 metadata:
   gitmoot-version: "0.1.0"
   source: "jerryfane/gitmoot"
+  openclaw:
+    requires:
+      bins:
+        - gitmoot
+        - git
+        - gh
+    envVars:
+      - name: GH_TOKEN
+        required: false
+        description: Optional GitHub token used by gh when GitHub CLI is not already authenticated.
 ---
 
 # Gitmoot Agent Skill
