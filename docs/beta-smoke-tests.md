@@ -216,6 +216,76 @@ Expected signals:
    gitmoot preset update thermo-nuclear-code-quality-review
    ```
 
+## Planner Preset Smoke Test
+
+Goal: canonical goal template -> cached planner preset -> Gitmoot-managed Codex
+planner agent. This verifies the planning workflow is discoverable before using
+it on a real PR.
+
+1. Build a local test binary and use an isolated Gitmoot home.
+
+   ```sh
+   GOTOOLCHAIN=go1.26.0 go build -o /tmp/gitmoot-current ./cmd/gitmoot
+   export GITMOOT_SMOKE_HOME=/tmp/gitmoot-planner-preset-smoke
+   rm -rf "$GITMOOT_SMOKE_HOME"
+   /tmp/gitmoot-current init --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+2. Confirm the canonical template and planner preset are available.
+
+   ```sh
+   /tmp/gitmoot-current goal template | grep "codex exec review is clean; ready for manual /review."
+   /tmp/gitmoot-current preset list --home "$GITMOOT_SMOKE_HOME" | grep gitmoot-plan-and-goal
+   /tmp/gitmoot-current preset update --home "$GITMOOT_SMOKE_HOME" gitmoot-plan-and-goal
+   /tmp/gitmoot-current preset show --home "$GITMOOT_SMOKE_HOME" gitmoot-plan-and-goal
+   ```
+
+3. From the test repo checkout, start the planner agent.
+
+   ```sh
+   cd /path/to/project
+   /tmp/gitmoot-current agent start planner-smoke \
+     --home "$GITMOOT_SMOKE_HOME" \
+     --runtime codex \
+     --repo owner/project \
+     --path . \
+     --preset gitmoot-plan-and-goal \
+     --start-daemon
+   /tmp/gitmoot-current agent doctor planner-smoke --home "$GITMOOT_SMOKE_HOME"
+   /tmp/gitmoot-current daemon status --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+4. Open a disposable PR, then comment:
+
+   ```text
+   /gitmoot planner-smoke ask Write a task-by-task implementation plan for this feature, then create the goal file prompt.
+   ```
+
+5. Verify the queued job and PR result.
+
+   ```sh
+   /tmp/gitmoot-current job list --home "$GITMOOT_SMOKE_HOME" --repo owner/project
+   /tmp/gitmoot-current events --home "$GITMOOT_SMOKE_HOME" --repo owner/project
+   gh pr view <number> --repo owner/project --comments
+   ```
+
+Expected signals:
+
+- `goal template` prints the canonical PR-per-task prompt.
+- `preset show` displays `default role: planner`, `default capabilities: ask`,
+  and `mutation: true`.
+- `agent doctor planner-smoke` succeeds.
+- The PR result comment includes `Preset: gitmoot-plan-and-goal`.
+- The planner returns a structured plan and, when requested, a
+  `GOAL-<short-slug>.md` path plus `/goal GOAL-<short-slug>.md`.
+
+6. Stop the isolated daemon.
+
+   ```sh
+   /tmp/gitmoot-current daemon stop --home "$GITMOOT_SMOKE_HOME"
+   /tmp/gitmoot-current daemon status --home "$GITMOOT_SMOKE_HOME"
+   ```
+
 ## Agent Start Smoke Test
 
 Goal: prove `gitmoot agent start` can create a Codex session, store the session

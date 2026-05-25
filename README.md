@@ -39,8 +39,11 @@ gitmoot daemon stop|restart|status|logs
 gitmoot preset list
 gitmoot preset add <preset-id> --file ./agents/<preset-id>.md
 gitmoot preset show|update|diff <preset-id>
+gitmoot goal template
+gitmoot goal import --file <path> [--repo owner/repo]
 gitmoot agent start <name> --runtime codex|claude --repo owner/repo [--path .] [--preset <preset-id>] [--start-daemon]
 gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
+gitmoot agent start planner --runtime codex --repo owner/repo --preset gitmoot-plan-and-goal
 gitmoot agent start thermo-review --runtime codex --repo owner/repo --preset thermo-nuclear-code-quality-review
 gitmoot agent allow|deny|repos
 gitmoot agent list
@@ -51,7 +54,6 @@ gitmoot agent remove <name>
 ```text
 gitmoot status
 gitmoot events --repo owner/repo
-gitmoot goal import --file <path>
 gitmoot task run <id> --repo owner/repo --owner <agent>
 gitmoot job list|show|events|run|retry|cancel
 gitmoot lock list|show|release
@@ -78,6 +80,29 @@ The plugins do not run a hosted service or replace the Gitmoot daemon. They
 install the local skill package and point agents back to the `gitmoot` CLI for
 repo setup, daemon status, jobs, locks, and PR-comment workflows. See
 [docs/plugins.md](docs/plugins.md) for install details and troubleshooting.
+
+## Planner Preset
+
+Gitmoot includes `gitmoot-plan-and-goal` for structured implementation planning
+and standard goal-file writing. It uses the canonical goal template from
+`gitmoot goal template`, then writes plan tasks as `### Task N: ...` headings so
+`gitmoot goal import` can track them.
+
+```sh
+gitmoot preset update gitmoot-plan-and-goal
+gitmoot agent start planner \
+  --runtime codex \
+  --repo owner/repo \
+  --path . \
+  --preset gitmoot-plan-and-goal \
+  --start-daemon
+```
+
+Ask it from a PR comment:
+
+```text
+/gitmoot planner ask Write a task-by-task implementation plan for this feature, then create the goal file prompt.
+```
 
 ## Thermo Review Preset
 
