@@ -105,6 +105,18 @@ gitmoot agent start thermo-review \
   --start-daemon
 ```
 
+Install or refresh the built-in planner preset:
+
+```sh
+gitmoot preset update gitmoot-plan-and-goal
+gitmoot agent start planner \
+  --runtime codex \
+  --repo owner/repo \
+  --path . \
+  --preset gitmoot-plan-and-goal \
+  --start-daemon
+```
+
 Create a local custom prompt preset:
 
 ```sh
@@ -123,6 +135,20 @@ After editing a local prompt file, refresh Gitmoot's cached snapshot:
 ```sh
 gitmoot preset diff frontend-reviewer
 gitmoot preset update frontend-reviewer
+```
+
+## Goals
+
+Print the standard Gitmoot goal prompt template:
+
+```sh
+gitmoot goal template
+```
+
+Import a goal file into local Gitmoot state:
+
+```sh
+gitmoot goal import --file GOAL-feature.md --repo owner/repo
 ```
 
 ## PR Comments

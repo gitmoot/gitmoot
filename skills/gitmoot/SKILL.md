@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first multi-agent coordination through GitHub PR comments, repo-scoped agent subscriptions, daemon checks, jobs, branch locks, presets, custom prompt agents, and Codex or Claude Code runtime workflows.
+description: Use Gitmoot for local-first multi-agent coordination through GitHub PR comments, structured implementation plans, standard goal files, repo-scoped agent subscriptions, daemon checks, jobs, branch locks, presets, custom prompt agents, and Codex or Claude Code runtime workflows.
 license: MIT
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex or Claude Code.
 metadata:
@@ -13,8 +13,8 @@ metadata:
 Gitmoot is a local-first coordinator for AI agents working through GitHub pull
 requests. Use this skill when the user wants PR-comment agent workflows,
 repo-scoped agent subscriptions, background daemon checks, Codex or Claude Code
-agent startup, preset agents, custom prompt agents, job status, or branch lock
-inspection.
+agent startup, structured implementation plans, standard goal files, preset
+agents, custom prompt agents, job status, or branch lock inspection.
 
 ## Before Acting
 
@@ -32,10 +32,14 @@ Use `gitmoot status --repo owner/repo` for repo status, `gitmoot daemon status`
 for daemon state, `gitmoot agent list` for registered agents, and
 `gitmoot job list --repo owner/repo` for queued or recent jobs. Use
 `gitmoot plugin doctor` when checking whether Codex or Claude Code can discover
-Gitmoot through an installed runtime plugin.
+Gitmoot through an installed runtime plugin. Use `gitmoot goal template` when
+writing a standard task-by-task goal file.
 
 For complete command examples, read [CLI.md](references/CLI.md).
 For end-to-end workflows, read [WORKFLOWS.md](references/WORKFLOWS.md).
+For the canonical goal prompt template, read
+[GOAL_TEMPLATE.md](references/GOAL_TEMPLATE.md) only when the user asks for a
+goal file.
 
 ## Agent Job Contract
 
