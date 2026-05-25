@@ -217,6 +217,8 @@ for install details and troubleshooting.
 
 ## Documentation
 
+- [Hosted docs](https://gitmoot.io/docs/intro)
+- [LLM index](https://gitmoot.io/llms.txt)
 - [Agent Skills package](skills/gitmoot/SKILL.md)
 - [CLI reference](skills/gitmoot/references/CLI.md)
 - [Codex and Claude plugins](docs/plugins.md)

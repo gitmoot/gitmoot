@@ -1,0 +1,24 @@
+# Gitmoot
+
+Gitmoot is a local-first coordinator for AI agents working across repositories,
+goals, reviews, pull request comments, daemon jobs, branch locks, presets, and
+Codex or Claude Code runtime workflows.
+
+## Start Here
+
+- [Introduction](https://gitmoot.io/docs/intro): What Gitmoot is and when to use it.
+- [Install](https://gitmoot.io/docs/getting-started/install): Install and verify Gitmoot.
+- [Quick Start](https://gitmoot.io/docs/getting-started/quick-start): Register a repo, start a planner, and route work.
+- [PR Comment Workflow](https://gitmoot.io/docs/workflows/pr-comment-workflow): Route auditable work from GitHub comments.
+- [Planner And Goal Workflow](https://gitmoot.io/docs/workflows/planner-goal-workflow): Create structured plans and goal files.
+
+## References
+
+- [CLI Reference](https://gitmoot.io/docs/reference/cli): Common commands and command groups.
+- [Runtime Adapters](https://gitmoot.io/docs/reference/runtime-adapters): Codex, Claude Code, shell, and future runtimes.
+- [Codex And Claude Plugins](https://gitmoot.io/docs/plugins/codex-claude): Plugin discovery and runtime skill setup.
+- [Troubleshooting](https://gitmoot.io/docs/operations/troubleshooting): Diagnose GitHub auth, runtimes, presets, remotes, permissions, and locks.
+- [Raw SKILL.md](https://gitmoot.io/SKILL.md): Agent skill entrypoint.
+- [Full LLM Context](https://gitmoot.io/llms-full.txt): Expanded Markdown context for agents.
+- [GitHub Repository](https://github.com/jerryfane/gitmoot): Source code and releases.
+

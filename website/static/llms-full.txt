@@ -1,0 +1,2619 @@
+# Gitmoot Full LLM Context
+
+This file is generated from canonical Gitmoot Markdown sources. Prefer
+https://gitmoot.io/llms.txt for a concise index and this file when an agent
+needs fuller local workflow, CLI, plugin, safety, and result-contract context.
+
+---
+
+# Source: README.md
+
+<p align="center">
+  <img src="docs/assets/gitmoot-hero.png" alt="Gitmoot coordinates local agent runtimes through GitHub pull request workflows" width="900">
+</p>
+
+# Gitmoot
+
+Local-first multi-agent coordination for GitHub pull request workflows.
+
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-black.svg)](./LICENSE)
+[![GitHub release](https://img.shields.io/github/v/release/jerryfane/gitmoot?include_prereleases&color=black)](https://github.com/jerryfane/gitmoot/releases)
+[![Go module](https://img.shields.io/badge/go-module-black.svg)](./go.mod)
+
+Gitmoot lets humans and AI agents collaborate through the place software teams
+already audit work: GitHub pull requests. It runs on the user's machine, keeps
+workflow state in local SQLite, routes PR comments to registered agent
+runtimes, and writes the agent's work back into the repo and PR discussion.
+
+V1 is intentionally local-only. There is no hosted dashboard, webhook receiver,
+cloud runner, or remote control plane.
+
+## Why Gitmoot
+
+AI agents can already edit code, review diffs, and run local tools. The hard
+part is coordinating that work across sessions without losing the human audit
+trail. Gitmoot makes the repository and its pull requests the shared surface:
+
+- PR comments become agent tasks, review requests, retries, and merge signals.
+- Local SQLite records agents, repos, jobs, goals, tasks, PRs, and branch locks.
+- Runtime adapters keep Codex, Claude Code, and future runtimes behind the same
+  Gitmoot agent model.
+- Presets and job snapshots make agent instructions explicit and reproducible.
+- Humans can follow progress from GitHub while agents keep working locally.
+
+## How It Works
+
+```text
+GitHub PR comments/state
+  -> local gitmoot daemon
+  -> local SQLite state machine and job mailbox
+  -> registered runtime adapter
+  -> Codex, Claude Code, shell, or another agent runtime
+  -> GitHub PR comments, statuses, branches, PRs, and merges
+```
+
+The core primitive is a runtime-neutral Gitmoot agent, not a Codex-specific
+session. Codex and Claude Code are adapters behind the same internal runtime
+contract.
+
+## Install
+
+```sh
+curl -fsSL https://gitmoot.io/install.sh | sh
+gitmoot version
+gh auth status
+```
+
+Install runtime plugin guidance when you want Codex or Claude Code to discover
+Gitmoot's Agent Skill from their plugin systems:
+
+```sh
+gitmoot plugin install codex
+gitmoot plugin install claude
+gitmoot plugin doctor
+```
+
+The plugins are discovery and guidance surfaces. The `gitmoot` CLI and local
+daemon remain the execution path.
+
+## Quick Start
+
+From a project checkout:
+
+```sh
+gitmoot init
+gitmoot repo add owner/repo --path . --poll 30s
+gitmoot doctor --repo .
+```
+
+Start a Gitmoot-managed Codex agent and daemon:
+
+```sh
+gitmoot agent start planner \
+  --runtime codex \
+  --repo owner/repo \
+  --path . \
+  --preset gitmoot-plan-and-goal \
+  --start-daemon
+```
+
+Ask the registered agent directly from a local shell or from a runtime chat that
+can call shell commands:
+
+```sh
+gitmoot agent ask planner --repo owner/repo "Write the implementation plan and goal file."
+```
+
+Route work through PR comments:
+
+```text
+/gitmoot planner ask Write a task-by-task implementation plan for this PR.
+/gitmoot thermo-review review
+/gitmoot retry <job-id>
+```
+
+For the full walkthrough, see [docs/local-workflow.md](docs/local-workflow.md).
+
+## Core Concepts
+
+- **Repo**: a GitHub repository plus local checkout path that Gitmoot is allowed
+  to monitor and mutate.
+- **Daemon**: the local background process that polls GitHub PRs and routes
+  queued jobs.
+- **Agent**: a named Gitmoot identity with repo access, role, capabilities, and
+  a runtime adapter.
+- **Runtime adapter**: the bridge from Gitmoot jobs to Codex, Claude Code,
+  shell commands, or future runtimes.
+- **Preset**: cached prompt content attached to an agent and snapshotted into
+  each job.
+- **Job**: a routed unit of work created from a PR comment, local ask, task run,
+  retry, or merge action.
+- **Goal and task**: Markdown implementation plans imported into local Gitmoot
+  state with `gitmoot goal import`.
+- **Branch lock**: local coordination state that prevents multiple agents from
+  racing on the same branch.
+
+## Common Workflows
+
+### Planner Agent
+
+Gitmoot includes `gitmoot-plan-and-goal` for structured implementation planning
+and standard goal-file writing.
+
+```sh
+gitmoot preset update gitmoot-plan-and-goal
+gitmoot agent start planner \
+  --runtime codex \
+  --repo owner/repo \
+  --path . \
+  --preset gitmoot-plan-and-goal \
+  --start-daemon
+```
+
+### Review Agent
+
+Gitmoot includes `thermo-nuclear-code-quality-review` for strict review-only
+work.
+
+```sh
+gitmoot preset update thermo-nuclear-code-quality-review
+gitmoot agent start thermo-review \
+  --runtime codex \
+  --repo owner/repo \
+  --preset thermo-nuclear-code-quality-review \
+  --start-daemon
+```
+
+Ask it from a PR comment:
+
+```text
+/gitmoot thermo-review review
+```
+
+### Custom Prompt Agents
+
+Custom presets let you keep a local prompt file and bind its snapshotted
+instructions to any Gitmoot agent.
+
+```sh
+mkdir -p agents
+printf '%s\n' 'Review frontend changes for correctness and responsive behavior.' > agents/frontend-reviewer.md
+gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
+gitmoot agent start frontend-reviewer \
+  --runtime codex \
+  --repo owner/repo \
+  --preset frontend-reviewer \
+  --role reviewer \
+  --capability ask \
+  --capability review
+```
+
+After editing the prompt file, refresh the cached snapshot:
+
+```sh
+gitmoot preset diff frontend-reviewer
+gitmoot preset update frontend-reviewer
+```
+
+### Jobs, Locks, And Recovery
+
+```sh
+gitmoot status --repo owner/repo
+gitmoot events --repo owner/repo
+gitmoot job list --repo owner/repo
+gitmoot job show <job-id>
+gitmoot daemon logs
+gitmoot lock list --repo owner/repo
+gitmoot lock release owner/repo <branch> --owner <agent>
+```
+
+Detailed command coverage lives in
+[skills/gitmoot/references/CLI.md](skills/gitmoot/references/CLI.md).
+
+## Plugins
+
+Gitmoot can package its Agent Skill for Codex and Claude Code so the runtime
+can discover Gitmoot guidance from its plugin system.
+
+```sh
+gitmoot plugin install codex
+gitmoot plugin install claude
+gitmoot plugin doctor
+```
+
+Plugins do not start a hosted service, replace the daemon, subscribe agents, or
+mutate repository state by themselves. See [docs/plugins.md](docs/plugins.md)
+for install details and troubleshooting.
+
+## Documentation
+
+- [Hosted docs](https://gitmoot.io/docs/intro)
+- [LLM index](https://gitmoot.io/llms.txt)
+- [Agent Skills package](skills/gitmoot/SKILL.md)
+- [CLI reference](skills/gitmoot/references/CLI.md)
+- [Codex and Claude plugins](docs/plugins.md)
+- [Local workflow walkthrough](docs/local-workflow.md)
+- [Beta smoke tests](docs/beta-smoke-tests.md)
+- [Runtime adapter authoring](docs/adapters.md)
+- [Troubleshooting](docs/troubleshooting.md)
+
+## Status And V1 Limits
+
+- Local-only: no hosted dashboard, GitHub App bot identity, cloud runner, or
+  remote control plane.
+- Polling watches GitHub PRs; there is no webhook receiver in V1.
+- GitHub comments are authored by the authenticated `gh` user. Agent identity
+  appears in the comment body.
+- Local SQLite remains the workflow source of truth.
+
+## Contributing
+
+Gitmoot is early. Keep changes scoped, preserve local-first behavior, and add
+focused tests for runtime, CLI, daemon, plugin, or workflow changes. Before
+opening a PR, run the relevant checks for the files you touched.
+
+## License
+
+Gitmoot is licensed under the [Apache License 2.0](./LICENSE). See
+[NOTICE](./NOTICE) for copyright and attribution details.
+
+## Development
+
+```sh
+go test ./...
+go vet ./...
+```
+
+---
+
+# Source: SKILL.md
+
+---
+name: gitmoot
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, PR comments, daemon jobs, branch locks, presets, custom prompt agents, and Codex or Claude Code runtime workflows.
+version: 0.1.0
+license: Apache-2.0
+compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex or Claude Code.
+metadata:
+  gitmoot-version: "0.1.0"
+  source: "jerryfane/gitmoot"
+  openclaw:
+    requires:
+      bins:
+        - gitmoot
+        - git
+        - gh
+    envVars:
+      - name: GH_TOKEN
+        required: false
+        description: Optional GitHub token used by gh when GitHub CLI is not already authenticated.
+---
+
+# Gitmoot Agent Skill
+
+This root `SKILL.md` is kept as a raw compatibility entrypoint for agents and
+`gitmoot.io/SKILL.md`. The canonical Agent Skills package lives at
+`skills/gitmoot/`, with deeper reference files under `skills/gitmoot/references/`.
+
+Gitmoot is a local-first coordinator for AI agents working across repositories,
+goals, reviews, PR comments, and runtime workflows. Use this skill when the
+user wants PR-comment agent workflows, repo-scoped agent subscriptions,
+background daemon checks, Codex or Claude Code agent startup, preset agents,
+custom prompt agents, job status, or branch lock inspection.
+
+## Before Acting
+
+1. Check whether `gitmoot` is installed with `gitmoot version`.
+2. Confirm GitHub CLI access with `gh auth status` before using PR workflows.
+3. Detect or ask for the target repo before starting daemons, subscribing agents,
+   or routing jobs.
+4. Do not start daemons, create agents, update presets, or change subscriptions
+   unless the user asks or the current task clearly requires it.
+5. Prefer read-only status commands before mutating Gitmoot state.
+
+## Install And Update
+
+If `gitmoot` is not installed, install the latest beta:
+
+```sh
+curl -fsSL https://gitmoot.io/install.sh | sh
+```
+
+Verify the install and GitHub access before using Gitmoot:
+
+```sh
+gitmoot version
+gitmoot update --check
+gh auth status
+```
+
+Install runtime plugin guidance when the user wants Codex or Claude Code to
+discover Gitmoot from its plugin system:
+
+```sh
+gitmoot plugin install codex
+gitmoot plugin install claude
+gitmoot plugin doctor
+```
+
+## Common Local Commands
+
+```sh
+gitmoot status --repo owner/repo
+gitmoot events --repo owner/repo
+gitmoot daemon start --repo owner/repo --poll 30s
+gitmoot daemon status
+gitmoot plugin doctor
+gitmoot agent list
+gitmoot agent doctor <agent>
+gitmoot agent ask <agent> --repo owner/repo "question or instructions"
+gitmoot job list --repo owner/repo
+gitmoot job show <job-id>
+gitmoot job events <job-id>
+gitmoot lock list --repo owner/repo
+gitmoot lock show owner/repo <branch>
+```
+
+Use `gitmoot daemon start` for the background daemon. Use `gitmoot daemon run`
+only when the user explicitly wants a foreground process.
+
+Use `gitmoot agent ask` when the user wants to invoke a registered Gitmoot
+agent from the current local chat. This is the same agent registry and runtime
+adapter path used by PR-comment ask jobs; the plugin only helps the runtime
+discover this skill and does not replace the `gitmoot` CLI.
+
+## PR Comment Commands
+
+Use GitHub PR comments as the public audit trail:
+
+```text
+/gitmoot help
+/gitmoot status
+/gitmoot <agent> review [instructions]
+/gitmoot <agent> implement [instructions]
+/gitmoot ask <agent> [question]
+/gitmoot retry <job-id>
+/gitmoot cancel <job-id>
+/gitmoot merge
+```
+
+## Preset Agents
+
+Install or refresh the built-in thermo review preset:
+
+```sh
+gitmoot preset update thermo-nuclear-code-quality-review
+gitmoot agent start thermo-review \
+  --runtime codex \
+  --repo owner/repo \
+  --preset thermo-nuclear-code-quality-review \
+  --start-daemon
+```
+
+Create a local custom prompt preset:
+
+```sh
+gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
+gitmoot agent start frontend-reviewer \
+  --runtime codex \
+  --repo owner/repo \
+  --preset frontend-reviewer \
+  --role reviewer \
+  --capability ask \
+  --capability review
+```
+
+After editing a local prompt file, refresh Gitmoot's cached snapshot explicitly:
+
+```sh
+gitmoot preset diff frontend-reviewer
+gitmoot preset update frontend-reviewer
+```
+
+## Agent Job Contract
+
+Every Gitmoot job should return a concise and truthful `gitmoot_result` JSON
+object:
+
+```json
+{
+  "gitmoot_result": {
+    "decision": "approved|changes_requested|blocked|implemented|failed",
+    "summary": "Brief outcome.",
+    "findings": [],
+    "changes_made": [],
+    "tests_run": [],
+    "needs": [],
+    "next_agents": []
+  }
+}
+```
+
+Use `blocked` when work cannot continue without human input or external state.
+Use `failed` when the attempted action errored. Do not report tests, changes, or
+approvals that were not actually verified.
+
+## Safety Rules
+
+Preserve existing behavior unless the job explicitly changes it. Keep work
+scoped to the target repo. Do not commit generated data, caches, logs, secrets,
+session archives, cloned helper repos, or large outputs unless explicitly
+requested. Respect Gitmoot branch locks for implementation jobs.
+
+Implementation jobs must not edit or push an implementation branch unless
+Gitmoot assigned the job and the branch lock is held by the assigned agent.
+Review and ask jobs should inspect and report without mutating branches unless
+the task explicitly instructs otherwise.
+
+Redact secrets from GitHub comments, job summaries, raw examples, and copied
+command output.
+
+## When Unsure
+
+Reread this `SKILL.md`, then inspect `/gitmoot help`, `gitmoot status`, and the
+relevant job events before acting.
+
+---
+
+# Source: docs/local-workflow.md
+
+# Local Workflow
+
+Gitmoot V1 runs on one machine. The GitHub repository is the visible audit
+trail, while local SQLite state is the workflow source of truth. The local
+daemon polls GitHub PRs and comments, routes jobs to registered agents, resumes
+their runtime sessions through adapters, records job output, updates PR
+statuses, and merges only after the merge gate passes.
+
+## What Exists Today
+
+The current CLI supports local setup, multi-repo daemon management, agent
+registration, plan import, task branch startup, status, recovery, and updates:
+
+```sh
+gitmoot setup --repo owner/repo --path . --agent lead --runtime codex --session <session-ref> --role lead
+gitmoot doctor --repo .
+gitmoot plugin install codex
+gitmoot plugin install claude
+gitmoot plugin doctor
+gitmoot preset list
+gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
+gitmoot preset update thermo-nuclear-code-quality-review
+gitmoot agent start <name> --runtime codex|claude --repo owner/repo --path . --preset thermo-nuclear-code-quality-review --start-daemon
+gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
+gitmoot agent ask <name> "message" --repo owner/repo
+gitmoot agent start thermo-review --runtime codex --repo owner/repo --preset thermo-nuclear-code-quality-review
+gitmoot agent allow <name> --repo owner/repo
+gitmoot agent repos <name>
+gitmoot agent list
+gitmoot agent doctor <name>
+gitmoot goal import --file GOAL.md --repo owner/repo
+gitmoot task run task-001 --repo owner/repo --owner lead --base main
+gitmoot job list
+gitmoot job show <job-id>
+gitmoot job retry <job-id>
+gitmoot job cancel <job-id>
+gitmoot status --repo owner/repo
+gitmoot version --json
+gitmoot update --check
+gitmoot daemon start --repo owner/repo --poll 30s
+gitmoot daemon start
+gitmoot daemon status
+```
+
+Goal import turns Markdown headings shaped like `### Task N: Title` into local
+planned tasks. `task run` starts one task branch and records its branch lock.
+
+## Runtime Plugin Setup
+
+Install the Codex or Claude plugin when you want the runtime to discover
+Gitmoot's Agent Skill through its plugin system:
+
+```sh
+curl -fsSL https://gitmoot.io/install.sh | sh
+gitmoot plugin install codex
+gitmoot plugin install claude
+gitmoot plugin doctor
+```
+
+The plugins are guidance and discovery surfaces. They do not replace
+`gitmoot daemon start`, agent registration, GitHub CLI authentication, or the
+local SQLite workflow state.
+
+If a Codex or Claude chat wants to invoke a registered Gitmoot agent directly,
+it should run `gitmoot agent ask <agent> --repo owner/repo "..."`. That uses the
+same local agent registry and runtime adapter path as PR-comment ask jobs.
+
+## End-To-End Demo Path
+
+1. Create or choose the project repository.
+
+   ```sh
+   git clone git@github.com:owner/project.git
+   cd project
+   git status --short
+   git remote -v
+   gh auth status
+   ```
+
+2. Write and import the plan.
+
+   Keep the implementation plan in a tracked file such as `GOAL.md`. The future
+   command shape is:
+
+   ```sh
+   gitmoot goal import --file GOAL.md --repo owner/project
+   ```
+
+3. Initialize Gitmoot state and start Gitmoot-managed agents.
+
+   `agent start` creates a new runtime session, stores the returned session
+   reference, grants the repo, and can start the background daemon. For Codex it
+   runs `codex exec --json -- <startup-prompt>` and records the emitted
+   `thread.started.thread_id`. For Claude Code it creates a session id and uses
+   the installed Claude CLI's non-interactive print mode.
+
+   ```sh
+   gitmoot init
+   gitmoot doctor --repo .
+   gitmoot plugin install codex
+   gitmoot plugin doctor codex
+   gitmoot agent start lead \
+     --runtime codex \
+     --repo owner/project \
+     --path . \
+     --role lead \
+     --capability ask \
+     --capability review \
+     --capability implement
+   gitmoot agent list
+   gitmoot agent doctor lead
+   ```
+
+   To add the built-in strict review preset, fetch and cache it explicitly.
+   `--preset` supplies the default reviewer role and `ask,review` capabilities
+   when those flags are omitted.
+
+   ```sh
+   gitmoot preset update thermo-nuclear-code-quality-review
+   gitmoot agent start thermo-review \
+     --runtime codex \
+     --repo owner/project \
+     --preset thermo-nuclear-code-quality-review
+   gitmoot agent doctor thermo-review
+   ```
+
+   If the preset is not cached yet, `agent start --preset ...` fails with the
+   same explicit `gitmoot preset update <preset>` guidance as `agent subscribe`.
+   Add `--update-preset` when you want startup to refresh the cached preset
+   before creating the runtime session.
+
+   Custom prompt presets are local files snapshotted into Gitmoot state. Use
+   them when you want a repo- or team-specific agent profile without changing
+   Codex, Claude, or repository agent files.
+
+   ```sh
+   mkdir -p agents
+   printf '%s\n' 'Review frontend changes for correctness and responsive behavior.' > agents/frontend-reviewer.md
+   gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
+   gitmoot agent start frontend-reviewer \
+     --runtime codex \
+     --repo owner/project \
+     --path . \
+     --preset frontend-reviewer \
+     --role reviewer \
+     --capability ask \
+     --capability review
+   ```
+
+   Built-in presets can define default roles and capabilities. Custom presets
+   do not in V1, so pass the role and capabilities you want. `agent start`
+   still keeps the normal fallback defaults if omitted, while
+   `agent subscribe --preset <custom-id>` requires explicit values.
+
+   After editing a custom prompt file, refresh the cached snapshot explicitly:
+
+   ```sh
+   gitmoot preset diff frontend-reviewer
+   gitmoot preset update frontend-reviewer
+   ```
+
+   After startup, open a created Codex session later with the session id printed
+   by Gitmoot:
+
+   ```sh
+   codex resume <session-id>
+   ```
+
+4. Subscribe existing sessions or shell adapters when needed.
+
+   Use `agent subscribe` when a Codex or Claude session already exists, or when
+   registering a shell command adapter. Using `last` works for quick demos, but
+   explicit ids are safer because the newest session can change.
+
+   ```sh
+   gitmoot agent subscribe audit --runtime claude --session <claude-session-id> --role reviewer --repo owner/project --capability review --capability ask
+   gitmoot agent subscribe shell-smoke --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"ok\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell\"],\"needs\":[],\"next_agents\":[]}}'" --role reviewer --repo owner/project --capability ask
+   gitmoot agent list
+   ```
+
+   Preset updates are explicit and auditable. Diff upstream content before
+   refreshing the local cached copy. For custom presets, `diff` compares the
+   cached content with the stored local file path.
+
+   ```sh
+   gitmoot preset diff thermo-nuclear-code-quality-review
+   gitmoot preset update thermo-nuclear-code-quality-review
+   ```
+
+   To inspect the installed Gitmoot build or check for a beta release:
+
+   ```sh
+   gitmoot version
+   gitmoot update --check
+   ```
+
+5. Start the daemon from the repository checkout.
+
+   ```sh
+   gitmoot daemon start --repo owner/project --poll 30s
+   ```
+
+   The daemon validates that the current checkout's `origin` remote matches
+   `--repo`. `agent start --start-daemon` runs this same background start path
+   for the selected checkout. Use `gitmoot daemon start` without `--repo` after
+   registering all intended repos if one daemon should supervise the whole
+   Gitmoot home.
+
+6. Start and open the first task PR.
+
+   ```sh
+   gitmoot task run task-001 --repo owner/project --owner lead --base main
+   ```
+
+   The lead agent or the human creates the task branch, implements the task,
+   pushes it, and opens a PR. The PR comments become the public audit trail.
+   The local Gitmoot database tracks the task, jobs, branch locks, PR head SHA,
+   and merge gate state.
+
+7. Route other agents through PR comments.
+
+   A repository writer can ask a subscribed agent to work from a PR comment:
+
+   ```text
+   /gitmoot help
+   /gitmoot audit review focus on correctness and missed edge cases
+   /gitmoot thermo-review review
+   /gitmoot lead implement fix the review findings without broad refactors
+   /gitmoot retry <job-id>
+   /gitmoot cancel <job-id>
+   ```
+
+   Implement jobs require the agent to hold the branch lock. Review and ask jobs
+   are routed through the runtime adapter and must return the `gitmoot_result`
+   JSON contract.
+
+   For a local chat ask that should not go through a PR comment, call the same
+   registered agent directly:
+
+   ```sh
+   gitmoot agent ask planner --repo owner/project "Write a task-by-task implementation plan and goal file prompt."
+   gitmoot job show <job-id>
+   ```
+
+   Stale branch locks can be inspected and released locally:
+
+   ```sh
+   gitmoot job list --repo owner/project
+   gitmoot job show <job-id>
+   gitmoot job events <job-id>
+   gitmoot lock list --repo owner/project
+   gitmoot lock show owner/project <branch>
+   gitmoot lock release owner/project <branch> --owner <agent>
+   ```
+
+8. Let the PR converge.
+
+   Agents review, request fixes, and rerun work through comments and job output.
+   When required reviews are approved and the branch is ready, the merge gate
+   checks the current PR head, local worktree cleanliness, branch freshness,
+   Gitmoot statuses, external CI if present, and mergeability.
+
+9. Merge and continue.
+
+   By default Gitmoot merges with a squash merge guarded by the current head SHA.
+   After merge it records the merged commit, releases the branch lock, updates
+   the local base branch, and can enqueue the next task once the task queueing
+   policy selects it.
+
+## Local-Only Limits
+
+- The machine running `gitmoot daemon start` must stay online.
+- Polling is the V1 mechanism; there is no webhook receiver yet.
+- GitHub Checks are best implemented later through GitHub App mode. V1 uses
+  commit statuses and `gh pr checks`.
+- Use explicit session ids for long workflows. `last` is convenient but can
+  point at the wrong session after a new Codex or Claude session starts.
+- GitHub comments are the public audit trail, not canonical state. Local SQLite
+  remains the workflow source of truth.
+- There is no hosted dashboard, cloud runner, billing, or remote control plane
+  in V1.
+- GitHub comments are authored by the authenticated user. Agent attribution is
+  written in the comment body.
+- Preset content is not fetched at job runtime. Run `gitmoot preset update`
+  intentionally when you want to refresh a cached preset.
+
+## Multi-Repo Supervision
+
+One daemon can supervise multiple enabled repos for the same Gitmoot home.
+Register each checkout explicitly and grant agents repo access explicitly:
+
+```sh
+cd /path/to/project-a
+gitmoot setup --repo owner/project-a --path . --agent lead --runtime codex --session <session-ref> --role lead
+
+cd /path/to/project-b
+gitmoot setup --repo owner/project-b --path . --agent lead --runtime codex --session <same-session-or-explicit-ref> --role lead
+
+gitmoot agent repos lead
+gitmoot daemon start
+gitmoot status
+```
+
+The PR repository supplies routing context. `/gitmoot lead review` in
+`owner/project-a` queues work for `owner/project-a`; the same command in
+`owner/project-b` queues work for `owner/project-b` if `lead` is allowed there.
+
+## Skill Usage
+
+Agents should read the root [`SKILL.md`](../SKILL.md) before working through
+Gitmoot. The skill documents PR commands, the required `gitmoot_result` JSON
+contract, branch lock rules, repo access, and safe agent behavior. If an agent
+is unsure how Gitmoot expects it to behave, it should reread `SKILL.md`, then
+inspect `/gitmoot help`, `gitmoot status`, and relevant job events.
+
+## Agent Output Contract
+
+Agents must return exactly one JSON object containing `gitmoot_result`:
+
+```json
+{
+  "gitmoot_result": {
+    "decision": "approved",
+    "summary": "ready",
+    "findings": [],
+    "changes_made": [],
+    "tests_run": [],
+    "needs": [],
+    "next_agents": []
+  }
+}
+```
+
+Valid decisions are `approved`, `changes_requested`, `blocked`, `implemented`,
+and `failed`.
+
+---
+
+# Source: docs/plugins.md
+
+# Codex And Claude Plugins
+
+Gitmoot plugins package the canonical Gitmoot Agent Skill for Codex and Claude
+Code. They make the runtime aware of Gitmoot commands, safety rules, and
+workflow expectations without changing Gitmoot's local-first architecture.
+
+The Gitmoot CLI remains the engine. The daemon still polls GitHub pull
+requests, local SQLite remains the workflow source of truth, and PR comments
+remain the public audit trail.
+
+## What Plugins Do
+
+- Install Gitmoot's agent skill into a local runtime plugin package.
+- Register a local marketplace named `gitmoot-local`.
+- Help Codex or Claude discover Gitmoot workflow instructions.
+- Point agents to the `gitmoot` CLI for status, jobs, locks, and daemon
+  management.
+
+## What Plugins Do Not Do
+
+- They do not start a hosted service, webhook receiver, or cloud runner.
+- They do not replace `gitmoot daemon start`.
+- They do not install Codex, Claude Code, Git, or GitHub CLI.
+- They do not silently subscribe agents or mutate repository state.
+
+## Install Gitmoot
+
+```sh
+curl -fsSL https://gitmoot.io/install.sh | sh
+gitmoot version
+gh auth status
+```
+
+## Install The Codex Plugin
+
+```sh
+gitmoot plugin install codex
+gitmoot plugin doctor codex
+```
+
+`plugin install codex` builds the Codex package under Gitmoot home, writes a
+local Codex marketplace manifest, runs `codex plugin marketplace add`, and runs
+`codex plugin add gitmoot@gitmoot-local` when the `codex` CLI is available.
+
+Use `gitmoot plugin path codex` to print the generated package path.
+
+## Install The Claude Plugin
+
+```sh
+gitmoot plugin install claude
+gitmoot plugin doctor claude
+```
+
+`plugin install claude` builds the Claude package under Gitmoot home, validates
+the package when the `claude` CLI is available, registers the local marketplace,
+refreshes any existing installed copy, and installs
+`gitmoot@gitmoot-local`.
+
+Claude supports installation scopes:
+
+```sh
+gitmoot plugin install claude --scope user
+gitmoot plugin install claude --scope project
+gitmoot plugin install claude --scope local
+```
+
+Use `gitmoot plugin path claude` to print the generated package path.
+
+## Verify
+
+```sh
+gitmoot plugin doctor
+gitmoot plugin doctor codex
+gitmoot plugin doctor claude
+```
+
+Doctor checks the canonical skill, generated package, manifest JSON, copied
+skill, marketplace path, runtime CLI availability, and runtime validation where
+supported.
+
+## Use From Codex
+
+After installing the Codex plugin, ask Codex to use the Gitmoot skill when the
+task involves local PR-comment agent coordination:
+
+```text
+Use the Gitmoot skill. Check gitmoot status for this repo.
+```
+
+The agent should read the bundled skill, verify `gitmoot version`, check
+`gh auth status` before PR workflows, and use read-only Gitmoot status commands
+before mutating daemon, agent, job, or lock state.
+
+When you want the current Codex chat to invoke a registered Gitmoot agent, route
+that request through the CLI:
+
+```text
+$gitmoot:gitmoot agent ask planner --repo owner/repo "Write the implementation plan and goal file."
+```
+
+Without the chat command bridge, ask Codex to run the same shell command:
+
+```sh
+gitmoot agent ask planner --repo owner/repo "Write the implementation plan and goal file."
+```
+
+This keeps local chat asks on the same Gitmoot agent registry, repo access,
+runtime adapter, cached preset, and job history path as PR-comment ask jobs.
+
+## Use From Claude Code
+
+After installing the Claude plugin, ask Claude Code to use the Gitmoot skill for
+the current workflow:
+
+```text
+Use the Gitmoot skill. Check gitmoot status for this repo.
+```
+
+Claude should use the bundled Gitmoot skill content as guidance, then call the
+local `gitmoot` CLI only when the user asks for setup, status, agent
+coordination, or PR-comment workflow help.
+
+For a registered-agent ask from Claude Code, use the same CLI command:
+
+```sh
+gitmoot agent ask planner --repo owner/repo "Write the implementation plan and goal file."
+```
+
+The plugin is discovery and guidance. The `gitmoot` CLI is still the execution
+path.
+
+## Troubleshooting
+
+If the runtime CLI is missing, `gitmoot plugin install` keeps generated files
+and prints manual install commands. Install the missing runtime, then rerun:
+
+```sh
+gitmoot plugin install codex
+gitmoot plugin install claude
+```
+
+If a package looks stale, rebuild and reinstall:
+
+```sh
+gitmoot plugin install codex --force
+gitmoot plugin install claude --force
+```
+
+If Claude validation fails, inspect the generated package and rerun validation
+directly:
+
+```sh
+claude plugin validate "$(gitmoot plugin path claude)"
+```
+
+If Codex or Claude does not show the plugin after install, run:
+
+```sh
+gitmoot plugin doctor
+gitmoot plugin path codex
+gitmoot plugin path claude
+```
+
+Then confirm the runtime uses the same home directory as the shell where
+`gitmoot plugin install` ran.
+
+---
+
+# Source: docs/adapters.md
+
+# Runtime Adapter Authoring
+
+Gitmoot treats Codex, Claude Code, and shell commands as runtime adapters behind
+one interface. Workflow, daemon, and GitHub code should stay runtime-neutral.
+
+## Adapter Contract
+
+An adapter implements `runtime.Adapter`:
+
+```go
+type Adapter interface {
+    Name() string
+    Start(ctx context.Context, request StartRequest) (StartResult, error)
+    Validate(ctx context.Context, agent Agent) error
+    Deliver(ctx context.Context, agent Agent, job Job) (Result, error)
+    Health(ctx context.Context, agent Agent) error
+    Capabilities(ctx context.Context) ([]string, error)
+}
+```
+
+Responsibilities:
+
+- `Name` returns the runtime key used by `gitmoot agent start` and
+  `gitmoot agent subscribe`.
+- `Start` creates a new runtime session for `gitmoot agent start` and returns
+  the runtime reference Gitmoot should store.
+- `Validate` checks the agent record without doing unnecessary work.
+- `Deliver` resumes or invokes the runtime with the rendered job prompt and
+  returns raw output.
+- `Health` performs a small operational check that proves the runtime can accept
+  a job.
+- `Capabilities` advertises actions such as `review`, `implement`, and `ask`.
+
+## Agent Record
+
+Adapters receive a normalized `runtime.Agent`:
+
+```go
+type Agent struct {
+    Name           string
+    Role           string
+    Runtime        string
+    RuntimeRef     string
+    RepoScope      string
+    PresetID       string
+    Capabilities   []string
+    AutonomyPolicy string
+    HealthStatus   string
+}
+```
+
+`RuntimeRef` is runtime-specific. Codex accepts a session UUID, thread name, or
+`last`. Claude accepts a UUID or `last`. Shell uses the configured command.
+`PresetID` is Gitmoot-owned metadata. Adapters do not fetch or interpret preset
+content; Gitmoot snapshots cached preset instructions into the rendered prompt
+before delivery.
+
+## Session Startup
+
+`gitmoot agent start` uses the adapter `Start` method to create a new session
+without leaving an interactive terminal open. The startup prompt tells the
+runtime to initialize only, make no file edits, and reply with a short readiness
+acknowledgment.
+
+Codex startup runs in the repo checkout path:
+
+```sh
+codex exec --json -- '<startup-prompt>'
+```
+
+The adapter parses JSONL stdout and stores the first
+`thread.started.thread_id`. Future jobs resume that session with:
+
+```sh
+codex exec resume <session-id> -- '<job-prompt>'
+```
+
+Claude startup generates a UUID before invocation, then runs:
+
+```sh
+claude --session-id <uuid> -p --output-format json -- '<startup-prompt>'
+```
+
+The UUID is stored only after the command succeeds. Future jobs use the Claude
+adapter's resume path. This depends on the installed Claude Code CLI supporting
+the documented `--session-id`, `-p`, `--output-format json`, and `--resume`
+contract.
+
+Shell adapters do not support `agent start`; register shell commands with
+`agent subscribe`.
+
+## Job Input
+
+Gitmoot sends adapters a `runtime.Job`:
+
+```go
+type Job struct {
+    ID          string
+    AgentName   string
+    Action      string
+    Prompt      string
+    Repository  string
+    PullRequest int
+}
+```
+
+The prompt already includes repo, branch, PR number, task label, sender,
+requested action, cached preset instructions when present, constraints, and the
+required `gitmoot_result` JSON shape. Adapters should pass the prompt through
+without rewriting workflow semantics.
+
+## Result Handling
+
+`Deliver` should return raw runtime output. Gitmoot parses the
+`gitmoot_result` object after delivery. If the runtime returns structured JSON
+with a nested text result, the adapter may also fill `Result.Summary`, but raw
+output must be preserved for parsing and diagnostics.
+
+## Adding A Runtime
+
+1. Add a runtime constant in `internal/runtime/adapter.go`.
+2. Implement an adapter type in `internal/runtime`.
+3. Register it in `runtime.Factory.Adapter`.
+4. Extend `ValidateAgent` only for runtime-specific reference rules.
+5. Implement startup semantics or return a clear unsupported error from
+   `Start`.
+6. Add tests for startup command arguments, validation, delivery command
+   arguments, error handling, health checks, and capability reporting.
+7. Add or update docs for the runtime-specific `--session` and startup values.
+
+Keep runtime-specific command names, flags, JSON modes, session lookup, and
+fallback behavior inside the adapter package. Do not leak Codex or Claude
+assumptions into workflow, daemon, GitHub, database, or merge-gate code.
+
+## Presets
+
+Presets are prompt/profile bundles layered above runtimes. They are not runtime
+adapters and should not create adapter-specific behavior. Gitmoot snapshots
+cached preset content into startup and job prompts before invoking an adapter.
+
+The built-in `thermo-nuclear-code-quality-review` preset is fetched explicitly
+with:
+
+```sh
+gitmoot preset update thermo-nuclear-code-quality-review
+```
+
+After it is cached, bind it to a normal runtime-backed agent:
+
+```sh
+gitmoot agent start thermo-review \
+  --runtime codex \
+  --repo owner/repo \
+  --preset thermo-nuclear-code-quality-review
+```
+
+The thermo preset is non-mutating. It supplies reviewer defaults and allows
+`ask,review`, but it cannot grant `implement`.
+
+Local custom presets are installed from files:
+
+```sh
+gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
+```
+
+They store `local@file:<absolute-path>` metadata and a `sha256:<hash>` resolved
+identifier. Adapters should not read those files or decide how presets behave;
+workflow code passes only the rendered prompt. After a prompt file changes, the
+user must run `gitmoot preset update <custom-id>` before new jobs use the new
+content.
+
+## Shell Adapter
+
+The shell adapter is useful for experiments and contract tests. It invokes:
+
+```sh
+sh -c '<configured command>' gitmoot '<job prompt>'
+```
+
+Health checks invoke:
+
+```sh
+sh -c '<configured command>' gitmoot-health 'Gitmoot health check. Reply OK only.'
+```
+
+The command must print a valid `gitmoot_result` object for normal jobs.
+
+---
+
+# Source: docs/troubleshooting.md
+
+# Troubleshooting
+
+Use `gitmoot doctor --repo .` first. It checks local prerequisites from the
+repository checkout.
+
+## `gh`
+
+Symptoms:
+
+- `gh auth status` fails.
+- PR comments, PR reads, status creation, or merges fail.
+- The daemon reports GitHub API or permission errors.
+
+Checks:
+
+```sh
+gh auth status
+gh repo view owner/repo --json nameWithOwner
+gh pr list --repo owner/repo --state open
+```
+
+Fixes:
+
+- Authenticate `gh` for the account that can read and write the repository.
+- Confirm the `--repo owner/repo` value matches the checkout remote.
+- Retry after GitHub rate limits clear.
+
+## Codex
+
+Symptoms:
+
+- `gitmoot agent doctor <name>` cannot validate a Codex agent.
+- A job cannot resume the intended session.
+- A `last` reference resumes the wrong session.
+
+Checks:
+
+```sh
+codex exec resume --help
+gitmoot agent list
+gitmoot agent doctor <name>
+```
+
+Fixes:
+
+- Prefer an explicit Codex session UUID or thread name over `last`.
+- Confirm `CODEX_HOME` if sessions are stored outside `~/.codex`.
+- Re-subscribe the agent with the correct session reference.
+
+## Presets
+
+Symptoms:
+
+- `gitmoot agent subscribe ... --preset thermo-nuclear-code-quality-review`
+  fails with an install hint.
+- `gitmoot agent start ... --preset <custom-id>` fails with a `preset add`
+  hint.
+- A custom prompt edit is not reflected in new jobs.
+- A preset-backed job does not include the expected review instructions.
+- You want to know whether the cached preset differs from upstream.
+
+Checks:
+
+```sh
+gitmoot preset list
+gitmoot preset show thermo-nuclear-code-quality-review
+gitmoot preset show <custom-id>
+gitmoot preset diff thermo-nuclear-code-quality-review
+gitmoot preset diff <custom-id>
+gitmoot agent list
+```
+
+Fixes:
+
+- Install or refresh the preset explicitly:
+
+  ```sh
+  gitmoot preset update thermo-nuclear-code-quality-review
+  ```
+
+  For a custom local prompt file:
+
+  ```sh
+  gitmoot preset add <custom-id> --file agents/<custom-id>.md
+  gitmoot preset update <custom-id>
+  ```
+
+- Re-subscribe the agent after the preset is installed:
+
+  ```sh
+  gitmoot agent subscribe thermo-review \
+    --runtime codex \
+    --session <session-id-or-last> \
+    --repo owner/repo \
+    --preset thermo-nuclear-code-quality-review
+  gitmoot agent doctor thermo-review
+  ```
+
+- Preset content is snapshotted when a job is queued. Retry an existing job to
+  reuse its original snapshot; comment again after `preset update` to queue a
+  job with refreshed content.
+- Custom preset files are not read at job runtime. Run
+  `gitmoot preset diff <custom-id>` and `gitmoot preset update <custom-id>`
+  after editing the file.
+- The thermo preset is review-only. Remove `--capability implement` and route
+  implementation work to a separate implementation-capable agent.
+
+## Claude Code
+
+Symptoms:
+
+- Claude jobs fail to resume.
+- JSON output mode is unsupported by the installed Claude CLI.
+- `last` points at an unexpected session.
+
+Checks:
+
+```sh
+claude --help
+gitmoot agent doctor <name>
+```
+
+Fixes:
+
+- Use a Claude session UUID for long workflows.
+- Upgrade Claude Code if JSON output mode is needed.
+- If JSON mode is unsupported, the adapter falls back to plain output, but the
+  output still must contain the `gitmoot_result` object.
+
+## Repo Remotes
+
+Symptoms:
+
+- `gitmoot daemon start` reports that the checkout origin is not the requested
+  repo.
+- The daemon reads the wrong repository's PRs.
+
+Checks:
+
+```sh
+git rev-parse --show-toplevel
+git remote get-url origin
+gitmoot daemon start --repo owner/repo --poll 30s
+```
+
+Fixes:
+
+- Start the daemon from the intended checkout.
+- Correct the `origin` remote or pass the matching `--repo`.
+- Avoid running one daemon from a parent folder that contains multiple repos.
+
+## Permissions
+
+Symptoms:
+
+- `/gitmoot ...` comments are ignored.
+- A commenter cannot route jobs.
+- Merge attempts fail.
+
+Checks:
+
+```sh
+gh api repos/owner/repo/collaborators/<user>/permission
+gh pr view <number> --repo owner/repo --json reviewDecision,mergeable
+```
+
+Fixes:
+
+- Comment routing requires write, maintain, or admin permission.
+- Merge requires the authenticated `gh` user to have repository merge rights.
+- Required reviews and branch protection still apply.
+
+## Stale Locks
+
+Symptoms:
+
+- Implement jobs are rejected because another agent owns the branch lock.
+- A branch remains locked after a failed or interrupted run.
+
+Checks:
+
+```sh
+gitmoot agent list
+gitmoot lock list --repo owner/repo
+gitmoot lock show owner/repo <branch>
+```
+
+The safest path is still to finish or merge the owning task so the merge gate
+releases the lock and records the release event. If the task is abandoned, use
+an exact-owner release:
+
+```sh
+gitmoot lock release owner/repo <branch> --owner <agent>
+```
+
+Use `--force` only when the stored owner is stale or the owning session is no
+longer recoverable:
+
+```sh
+gitmoot lock release owner/repo <branch> --force
+```
+
+## Malformed Agent Output
+
+Symptoms:
+
+- A job fails because output is missing `gitmoot_result`.
+- The repair prompt keeps asking for JSON.
+
+Required shape:
+
+```json
+{
+  "gitmoot_result": {
+    "decision": "approved",
+    "summary": "ready",
+    "findings": [],
+    "changes_made": [],
+    "tests_run": [],
+    "needs": [],
+    "next_agents": []
+  }
+}
+```
+
+Fixes:
+
+- Return exactly one JSON object.
+- Use one of the supported decisions: `approved`, `changes_requested`,
+  `blocked`, `implemented`, or `failed`.
+- Keep `summary` non-empty.
+
+## Rate Limits
+
+Symptoms:
+
+- GitHub API calls fail with 429, `retry-after`, or rate-limit messages.
+- Polling works briefly and then stalls.
+
+Fixes:
+
+- Increase `--poll`, for example `--poll 60s`.
+- Reduce the number of active PRs watched by one daemon.
+- Wait for the GitHub rate-limit window to reset.
+
+## Merge Gate
+
+Symptoms:
+
+- The PR remains `ready_to_merge`.
+- `gitmoot/merge-gate` is pending or failing.
+- The daemon retries a queued merge.
+
+Checks:
+
+```sh
+gh pr checks <number> --repo owner/repo
+gh pr view <number> --repo owner/repo --json mergeable,statusCheckRollup,reviewDecision
+git status --short
+```
+
+Fixes:
+
+- Clean the local worktree before the daemon attempts the merge.
+- Update the PR branch if it is behind or diverged from base.
+- Fix failing external CI or Gitmoot statuses.
+- Rerun reviews after the PR head SHA changes.
+
+---
+
+# Source: docs/beta-smoke-tests.md
+
+# Beta Smoke Tests
+
+Use these smoke tests before cutting a beta release. They verify the local V1
+loop without a hosted service or webhook receiver.
+
+## Prerequisites
+
+Run from each repository checkout that will be watched:
+
+```sh
+git status --short
+git remote -v
+gh auth status
+gitmoot doctor --repo .
+```
+
+Use a test repository or a disposable branch. Keep generated logs, cloned
+helper repos, session archives, and large outputs untracked.
+
+## Plugin Package Smoke Test
+
+Goal: prove Gitmoot can build runtime plugin packages, register local
+marketplaces in isolated homes, and diagnose the generated packages without
+writing into the real user runtime state.
+
+For the scripted version, run:
+
+```sh
+GO_BIN=/path/to/go1.26 scripts/plugin-smoke.sh
+```
+
+1. Build a local test binary and use an isolated Gitmoot home.
+
+   ```sh
+   GOTOOLCHAIN=go1.26.0 go build -o /tmp/gitmoot-current ./cmd/gitmoot
+   export GITMOOT_SMOKE_HOME=/tmp/gitmoot-plugin-smoke
+   export GITMOOT_RUNTIME_HOME=/tmp/gitmoot-plugin-runtime-smoke
+   rm -rf "$GITMOOT_SMOKE_HOME"
+   rm -rf "$GITMOOT_RUNTIME_HOME"
+   mkdir -p "$GITMOOT_RUNTIME_HOME"
+   /tmp/gitmoot-current init --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+2. Build both plugin packages.
+
+   ```sh
+   /tmp/gitmoot-current plugin build codex --home "$GITMOOT_SMOKE_HOME"
+   /tmp/gitmoot-current plugin build claude --home "$GITMOOT_SMOKE_HOME"
+   /tmp/gitmoot-current plugin path codex --home "$GITMOOT_SMOKE_HOME"
+   /tmp/gitmoot-current plugin path claude --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+3. Diagnose the built packages.
+
+   ```sh
+   /tmp/gitmoot-current plugin doctor --home "$GITMOOT_SMOKE_HOME" || true
+   /tmp/gitmoot-current plugin doctor codex --home "$GITMOOT_SMOKE_HOME" || true
+   /tmp/gitmoot-current plugin doctor claude --home "$GITMOOT_SMOKE_HOME" || true
+   ```
+
+   Missing runtime CLIs are valid in this smoke path. Continue when doctor
+   reports `runtime-cli` failures for missing `codex` or `claude`.
+
+4. Install with an isolated runtime home.
+
+   ```sh
+   HOME="$GITMOOT_RUNTIME_HOME" /tmp/gitmoot-current plugin install codex --home "$GITMOOT_SMOKE_HOME" --force
+   HOME="$GITMOOT_RUNTIME_HOME" /tmp/gitmoot-current plugin install claude --home "$GITMOOT_SMOKE_HOME" --scope user --force
+   ```
+
+   If `codex` or `claude` is not installed, the command should keep generated
+   files and print manual install commands instead of failing after partial
+   destructive work.
+
+5. Validate diagnostics again after install.
+
+   ```sh
+   /tmp/gitmoot-current plugin doctor --home "$GITMOOT_SMOKE_HOME" || true
+   /tmp/gitmoot-current plugin doctor codex --home "$GITMOOT_SMOKE_HOME" || true
+   /tmp/gitmoot-current plugin doctor claude --home "$GITMOOT_SMOKE_HOME" || true
+   ```
+
+Expected signals:
+
+- `plugin path codex` and `plugin path claude` point under
+  `$GITMOOT_SMOKE_HOME/.gitmoot/plugins/build`.
+- Each generated package contains `skills/gitmoot/SKILL.md`.
+- Doctor reports readable manifests and copied skill files.
+- Runtime marketplace or install state is written under `$GITMOOT_RUNTIME_HOME`,
+  not the real user home.
+- Missing runtime CLIs are reported as diagnostics with next steps, not as
+  corrupt generated packages.
+
+## One-Repo Smoke Test
+
+Goal: PR comment -> queued ask job -> adapter result -> attributed PR comment
+-> local job status update. This intentionally uses `ask`, not `review`, so
+the smoke test cannot approve or merge the PR.
+
+1. Register the repo and a shell smoke agent.
+
+   ```sh
+   gitmoot setup --repo owner/project --path . --agent shell-smoke --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"shell ask smoke passed\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell smoke\"],\"needs\":[],\"next_agents\":[]}}'"
+   gitmoot agent repos shell-smoke
+   ```
+
+2. Start the background daemon.
+
+   ```sh
+   gitmoot daemon start --repo owner/project --poll 30s
+   gitmoot daemon status
+   ```
+
+3. Open a small test PR in `owner/project`, then comment:
+
+   ```text
+   /gitmoot help
+   /gitmoot shell-smoke ask smoke test routing
+   ```
+
+4. Confirm the job was queued and completed.
+
+   ```sh
+   gitmoot job list --repo owner/project
+   gitmoot events --repo owner/project
+   gh pr view <number> --repo owner/project --comments
+   ```
+
+Expected signals:
+
+- The PR receives a Gitmoot queued-job acknowledgement.
+- `gitmoot job list --repo owner/project` shows the job as succeeded.
+- The PR receives a result comment with:
+
+  ```md
+  > Agent: `shell-smoke`
+  > Runtime: `shell`
+  > Job: `...`
+  ```
+
+- `gitmoot events --repo owner/project` shows the queued/running/succeeded
+  job events.
+
+5. Stop the daemon when finished.
+
+   ```sh
+   gitmoot daemon stop
+   gitmoot daemon status
+   ```
+
+## Thermo Preset Smoke Test
+
+Goal: PR comment -> queued review job -> Codex resume with cached thermo preset
+instructions -> attributed PR result comment. Run this with a Gitmoot build that
+includes `gitmoot preset` commands.
+
+1. Cache the preset and start a Gitmoot-managed Codex review agent.
+
+   ```sh
+   gitmoot preset update thermo-nuclear-code-quality-review
+   gitmoot agent start thermo-review \
+     --runtime codex \
+     --repo owner/project \
+     --path . \
+     --preset thermo-nuclear-code-quality-review
+   gitmoot agent doctor thermo-review
+   ```
+
+   Gitmoot prints the created session id. To inspect that Codex thread later:
+
+   ```sh
+   codex resume <session-id>
+   ```
+
+   If you prefer registering an already-open Codex session, use
+   `gitmoot agent subscribe ... --session <session-id-or-last>` instead.
+
+2. Start the daemon for the test repo, or pass `--start-daemon` to
+   `agent start`.
+
+   ```sh
+   gitmoot daemon start --repo owner/project --poll 10s
+   gitmoot daemon status
+   ```
+
+3. Open a disposable PR, then comment:
+
+   ```text
+   /gitmoot thermo-review review
+   ```
+
+4. Verify the queued job and PR result.
+
+   ```sh
+   gitmoot job list --repo owner/project
+   gh pr view <number> --repo owner/project --comments
+   ```
+
+Expected signals:
+
+- The PR receives a queued-job acknowledgement for `thermo-review`.
+- `gitmoot job list --repo owner/project` shows the review job.
+- The result comment includes preset attribution:
+
+  ```md
+  > Agent: `thermo-review`
+  > Runtime: `codex`
+  > Preset: `thermo-nuclear-code-quality-review`
+  > Job: `...`
+  ```
+
+5. Check or refresh the cached preset only through explicit commands.
+
+   ```sh
+   gitmoot preset diff thermo-nuclear-code-quality-review
+   gitmoot preset update thermo-nuclear-code-quality-review
+   ```
+
+## Planner Preset Smoke Test
+
+Goal: canonical goal template -> cached planner preset -> Gitmoot-managed Codex
+planner agent. This verifies the planning workflow is discoverable before using
+it on a real PR.
+
+1. Build a local test binary and use an isolated Gitmoot home.
+
+   ```sh
+   GOTOOLCHAIN=go1.26.0 go build -o /tmp/gitmoot-current ./cmd/gitmoot
+   export GITMOOT_SMOKE_HOME=/tmp/gitmoot-planner-preset-smoke
+   rm -rf "$GITMOOT_SMOKE_HOME"
+   /tmp/gitmoot-current init --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+2. Confirm the canonical template and planner preset are available.
+
+   ```sh
+   /tmp/gitmoot-current goal template | grep "codex exec review is clean; ready for manual /review."
+   /tmp/gitmoot-current preset list --home "$GITMOOT_SMOKE_HOME" | grep gitmoot-plan-and-goal
+   /tmp/gitmoot-current preset update --home "$GITMOOT_SMOKE_HOME" gitmoot-plan-and-goal
+   /tmp/gitmoot-current preset show --home "$GITMOOT_SMOKE_HOME" gitmoot-plan-and-goal
+   ```
+
+3. From the test repo checkout, start the planner agent.
+
+   ```sh
+   cd /path/to/project
+   /tmp/gitmoot-current agent start planner-smoke \
+     --home "$GITMOOT_SMOKE_HOME" \
+     --runtime codex \
+     --repo owner/project \
+     --path . \
+     --preset gitmoot-plan-and-goal \
+     --start-daemon
+   /tmp/gitmoot-current agent doctor planner-smoke --home "$GITMOOT_SMOKE_HOME"
+   /tmp/gitmoot-current daemon status --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+4. Ask the planner directly through the local agent path.
+
+   ```sh
+   /tmp/gitmoot-current agent ask planner-smoke \
+     --home "$GITMOOT_SMOKE_HOME" \
+     --repo owner/project \
+     "Write a task-by-task implementation plan for this feature, then create the goal file prompt."
+   /tmp/gitmoot-current job list --home "$GITMOOT_SMOKE_HOME" --repo owner/project
+   /tmp/gitmoot-current job show <local-ask-job-id> --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+5. Open a disposable PR, then comment:
+
+   ```text
+   /gitmoot planner-smoke ask Write a task-by-task implementation plan for this feature, then create the goal file prompt.
+   ```
+
+6. Verify the queued PR job and PR result.
+
+   ```sh
+   /tmp/gitmoot-current job list --home "$GITMOOT_SMOKE_HOME" --repo owner/project
+   /tmp/gitmoot-current job show <pr-ask-job-id> --home "$GITMOOT_SMOKE_HOME"
+   /tmp/gitmoot-current events --home "$GITMOOT_SMOKE_HOME" --repo owner/project
+   gh pr view <number> --repo owner/project --comments
+   ```
+
+Expected signals:
+
+- `goal template` prints the canonical PR-per-task prompt.
+- `preset show` displays `default role: planner`, `default capabilities: ask`,
+  and `mutation: true`.
+- `agent doctor planner-smoke` succeeds.
+- `agent ask planner-smoke` prints `state: succeeded`, `agent: planner-smoke`,
+  `action: ask`, and a planner summary.
+- `job show <local-ask-job-id>` includes `"sender": "local"`, the cached
+  `gitmoot-plan-and-goal` preset metadata, and the planner result.
+- The PR result comment includes `Preset: gitmoot-plan-and-goal`.
+- The planner returns a structured plan and, when requested, a
+  `GOAL-<short-slug>.md` path plus `/goal GOAL-<short-slug>.md`.
+
+7. Stop the isolated daemon.
+
+   ```sh
+   /tmp/gitmoot-current daemon stop --home "$GITMOOT_SMOKE_HOME"
+   /tmp/gitmoot-current daemon status --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+## Agent Start Smoke Test
+
+Goal: prove `gitmoot agent start` can create a Codex session, store the session
+reference, start the daemon, and route a PR comment job through that new
+session.
+
+1. Build a local test binary and use an isolated Gitmoot home.
+
+   ```sh
+   GOTOOLCHAIN=go1.26.0 go build -o /tmp/gitmoot-current ./cmd/gitmoot
+   export GITMOOT_SMOKE_HOME=/tmp/gitmoot-agent-start-smoke
+   rm -rf "$GITMOOT_SMOKE_HOME"
+   /tmp/gitmoot-current init --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+2. From the test repo checkout, cache the preset and start the agent.
+
+   ```sh
+   cd /path/to/project
+   /tmp/gitmoot-current preset update --home "$GITMOOT_SMOKE_HOME" thermo-nuclear-code-quality-review
+   /tmp/gitmoot-current agent start thermo-start-smoke \
+     --home "$GITMOOT_SMOKE_HOME" \
+     --runtime codex \
+     --repo owner/project \
+     --path . \
+     --preset thermo-nuclear-code-quality-review \
+     --start-daemon
+   /tmp/gitmoot-current agent list --home "$GITMOOT_SMOKE_HOME"
+   /tmp/gitmoot-current daemon status --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+3. Open a disposable PR, then comment:
+
+   ```text
+   /gitmoot thermo-start-smoke review
+   ```
+
+4. Verify the job and PR comments.
+
+   ```sh
+   /tmp/gitmoot-current job list --home "$GITMOOT_SMOKE_HOME" --repo owner/project
+   /tmp/gitmoot-current events --home "$GITMOOT_SMOKE_HOME" --repo owner/project
+   gh pr view <number> --repo owner/project --comments
+   ```
+
+Expected signals:
+
+- `agent list` shows `thermo-start-smoke` with a generated Codex session id.
+- The PR receives a queued-job acknowledgement.
+- The job succeeds and the result comment includes agent, runtime, preset, and
+  job metadata.
+- `codex resume <session-id>` opens the created session if manual inspection is
+  needed.
+
+5. Stop the isolated daemon.
+
+   ```sh
+   /tmp/gitmoot-current daemon stop --home "$GITMOOT_SMOKE_HOME"
+   /tmp/gitmoot-current daemon status --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+## Custom Prompt Preset Smoke Test
+
+Goal: local prompt file -> cached custom preset -> preset-backed Codex agent ->
+queued PR comment job with custom preset metadata.
+
+Prerequisites: a safe test repository, authenticated `gh`, installed Codex, and
+a Gitmoot build that includes `preset add`.
+
+1. Build a local test binary and use an isolated Gitmoot home.
+
+   ```sh
+   GOTOOLCHAIN=go1.26.0 go build -o /tmp/gitmoot-current ./cmd/gitmoot
+   export GITMOOT_SMOKE_HOME=/tmp/gitmoot-custom-preset-smoke
+   rm -rf "$GITMOOT_SMOKE_HOME"
+   /tmp/gitmoot-current init --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+2. From the test repo checkout, create and install a local prompt preset.
+
+   ```sh
+   cd /path/to/project
+   mkdir -p agents
+   printf '%s\n' 'Review only correctness, regressions, and missing tests.' > agents/local-reviewer.md
+   /tmp/gitmoot-current preset add local-reviewer \
+     --home "$GITMOOT_SMOKE_HOME" \
+     --file agents/local-reviewer.md \
+     --name "Local Reviewer"
+   /tmp/gitmoot-current preset show --home "$GITMOOT_SMOKE_HOME" local-reviewer
+   ```
+
+3. Start or subscribe a Codex test agent with the custom preset.
+
+   ```sh
+   /tmp/gitmoot-current agent start local-reviewer \
+     --home "$GITMOOT_SMOKE_HOME" \
+     --runtime codex \
+     --repo owner/project \
+     --path . \
+     --preset local-reviewer \
+     --role reviewer \
+     --capability ask \
+     --capability review \
+     --start-daemon
+   /tmp/gitmoot-current agent doctor local-reviewer --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+   To register an existing session instead, use:
+
+   ```sh
+   /tmp/gitmoot-current agent subscribe local-reviewer \
+     --home "$GITMOOT_SMOKE_HOME" \
+     --runtime codex \
+     --session <session-id-or-last> \
+     --repo owner/project \
+     --preset local-reviewer \
+     --role reviewer \
+     --capability ask \
+     --capability review
+   /tmp/gitmoot-current daemon start \
+     --home "$GITMOOT_SMOKE_HOME" \
+     --repo owner/project \
+     --poll 10s
+   ```
+
+4. Open a disposable PR, then comment:
+
+   ```text
+   /gitmoot local-reviewer review
+   ```
+
+5. Verify the job and metadata.
+
+   ```sh
+   /tmp/gitmoot-current job list --home "$GITMOOT_SMOKE_HOME" --repo owner/project
+   /tmp/gitmoot-current job show <job-id> --home "$GITMOOT_SMOKE_HOME"
+   gh pr view <number> --repo owner/project --comments
+   ```
+
+Expected signals:
+
+- `preset show` displays `source: local@file:` and `resolved commit: sha256:...`.
+- The PR receives a queued-job acknowledgement for `local-reviewer`.
+- The result comment includes `Agent`, `Runtime`, `Preset`, and `Job` metadata.
+- `job show <job-id>` includes the custom preset id and `sha256:` content hash.
+
+6. Edit and refresh the prompt only through explicit preset commands.
+
+   ```sh
+   printf '%s\n' 'Review correctness, regressions, missing tests, and edge cases.' > agents/local-reviewer.md
+   /tmp/gitmoot-current preset diff --home "$GITMOOT_SMOKE_HOME" local-reviewer
+   /tmp/gitmoot-current preset update --home "$GITMOOT_SMOKE_HOME" local-reviewer
+   ```
+
+7. Stop the isolated daemon.
+
+   ```sh
+   /tmp/gitmoot-current daemon stop --home "$GITMOOT_SMOKE_HOME"
+   /tmp/gitmoot-current daemon status --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+## Two-Repo Smoke Test
+
+Goal: one daemon -> two registered repos -> same allowed agent -> ask jobs in
+each repo -> no cross-routing. This intentionally avoids approving reviews.
+
+1. Register both repos with the same agent identity.
+
+   ```sh
+   cd /path/to/project-a
+   gitmoot setup --repo owner/project-a --path . --agent shell-smoke --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"repo ask smoke passed\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell smoke\"],\"needs\":[],\"next_agents\":[]}}'"
+
+   cd /path/to/project-b
+   gitmoot setup --repo owner/project-b --path . --agent shell-smoke --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"repo ask smoke passed\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell smoke\"],\"needs\":[],\"next_agents\":[]}}'"
+
+   gitmoot agent repos shell-smoke
+   ```
+
+2. Start one daemon for all enabled repos.
+
+   ```sh
+   gitmoot daemon start
+   gitmoot daemon status
+   gitmoot status
+   ```
+
+3. Open one test PR in each repo. Comment in each PR:
+
+   ```text
+   /gitmoot shell-smoke ask repo routing smoke
+   ```
+
+4. Verify each repo saw only its own job.
+
+   ```sh
+   gitmoot job list --repo owner/project-a
+   gitmoot job list --repo owner/project-b
+   gitmoot events --repo owner/project-a
+   gitmoot events --repo owner/project-b
+   gh pr view <project-a-pr> --repo owner/project-a --comments
+   gh pr view <project-b-pr> --repo owner/project-b --comments
+   ```
+
+Expected signals:
+
+- Each PR receives exactly the acknowledgement and result for its own comment.
+- `gitmoot job list --repo owner/project-a` does not show project B jobs.
+- `gitmoot job list --repo owner/project-b` does not show project A jobs.
+- The same agent name is allowed on both repos:
+
+  ```sh
+  gitmoot agent repos shell-smoke
+  ```
+
+## Recovery Checks
+
+Run these against one smoke job if you need to verify recovery UX:
+
+```sh
+gitmoot job show <job-id>
+gitmoot job events <job-id>
+gitmoot job retry <job-id>
+gitmoot job cancel <job-id>
+gitmoot lock list --repo owner/project
+gitmoot lock show owner/project <branch>
+```
+
+Only retry failed, blocked, or cancelled jobs. Only cancel queued or running
+jobs. Use `gitmoot lock release owner/project <branch> --owner <agent>` for an
+exact-owner stale lock; use `--force` only when the stored owner is stale.
+
+## Known V1 Limits
+
+- Local-only: the machine running the daemon must stay online.
+- Polling watches GitHub; there is no webhook receiver.
+- GitHub comments are authored by the authenticated `gh` user, not a bot.
+- Agent identity is shown in the comment body.
+- There is no hosted dashboard, GitHub App bot identity, cloud runner, billing,
+  or remote control plane.
+
+---
+
+# Source: skills/gitmoot/SKILL.md
+
+---
+name: gitmoot
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, PR comments, daemon jobs, branch locks, presets, custom prompt agents, and Codex or Claude Code runtime workflows.
+license: Apache-2.0
+compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex or Claude Code.
+metadata:
+  gitmoot-version: "0.1.0"
+  source: "jerryfane/gitmoot"
+---
+
+# Gitmoot Agent Skill
+
+Gitmoot is a local-first coordinator for AI agents working across repositories,
+goals, reviews, PR comments, and runtime workflows. Use this skill when the
+user wants PR-comment agent workflows, repo-scoped agent subscriptions,
+background daemon checks, Codex or Claude Code agent startup, structured
+implementation plans, standard goal files, preset agents, custom prompt agents,
+job status, or branch lock inspection.
+
+## Before Acting
+
+1. Check whether `gitmoot` is installed with `gitmoot version`.
+2. Confirm GitHub CLI access with `gh auth status` before using PR workflows.
+3. Detect or ask for the target repo before starting daemons, subscribing agents,
+   or routing jobs.
+4. Do not start daemons, create agents, update presets, or change subscriptions
+   unless the user asks or the current task clearly requires it.
+5. Prefer read-only status commands before mutating Gitmoot state.
+
+## Common Commands
+
+Use `gitmoot status --repo owner/repo` for repo status, `gitmoot daemon status`
+for daemon state, `gitmoot agent list` for registered agents, and
+`gitmoot agent ask <agent> --repo owner/repo "..."` to invoke a registered
+Gitmoot agent from the current local chat. Use
+`gitmoot job list --repo owner/repo` for queued or recent jobs. Use
+`gitmoot plugin doctor` when checking whether Codex or Claude Code can discover
+Gitmoot through an installed runtime plugin. Use `gitmoot goal template` when
+writing a standard task-by-task goal file.
+
+The plugin is only the runtime discovery surface for this skill. Local agent
+invocation still goes through the `gitmoot` CLI and the same registered agent,
+repo access, runtime adapter, and job history model used by PR-comment jobs.
+
+For complete command examples, read [CLI.md](references/CLI.md).
+For end-to-end workflows, read [WORKFLOWS.md](references/WORKFLOWS.md).
+For the canonical goal prompt template, read
+[GOAL_TEMPLATE.md](references/GOAL_TEMPLATE.md) only when the user asks for a
+goal file.
+
+## Agent Job Contract
+
+Every Gitmoot job should return a concise and truthful `gitmoot_result` JSON
+object. Use `blocked` when work cannot continue without human input or external
+state, and `failed` when an attempted action errored.
+
+For the required result shape and decision meanings, read
+[RESULT_CONTRACT.md](references/RESULT_CONTRACT.md).
+
+## Safety Rules
+
+Preserve existing behavior unless the job explicitly changes it. Keep work
+scoped to the target repo. Do not commit generated data, caches, logs, secrets,
+session archives, cloned helper repos, or large outputs unless explicitly
+requested. Respect Gitmoot branch locks for implementation jobs.
+
+For detailed safety and lock rules, read [SAFETY.md](references/SAFETY.md).
+
+## When Unsure
+
+Reread this `SKILL.md`, then inspect `/gitmoot help`, `gitmoot status`, and the
+relevant job events before acting.
+
+---
+
+# Source: skills/gitmoot/references/CLI.md
+
+# Gitmoot CLI Reference
+
+Use these commands from an agent session only when the user asks for Gitmoot
+setup, status, agent coordination, or PR-comment workflow help.
+
+## Install And Update
+
+```sh
+curl -fsSL https://gitmoot.io/install.sh | sh
+gitmoot version
+gitmoot update --check
+gitmoot update --restart-daemon
+```
+
+Verify GitHub access before PR workflows:
+
+```sh
+gh auth status
+```
+
+## Runtime Plugins
+
+Install Gitmoot's Agent Skill into Codex or Claude Code when the user wants the
+runtime to discover Gitmoot workflow guidance from its plugin system:
+
+```sh
+gitmoot plugin install codex
+gitmoot plugin install claude
+gitmoot plugin doctor
+```
+
+Inspect or build packages without installing:
+
+```sh
+gitmoot plugin build codex
+gitmoot plugin build claude
+gitmoot plugin path codex
+gitmoot plugin path claude
+gitmoot plugin doctor codex
+gitmoot plugin doctor claude
+```
+
+Claude scopes are supported with `--scope user|project|local`. Codex ignores
+`--scope` because the current Codex plugin install command does not use it.
+
+## Repo And Daemon Status
+
+```sh
+gitmoot status --repo owner/repo
+gitmoot events --repo owner/repo
+gitmoot daemon start --repo owner/repo --poll 30s
+gitmoot daemon status
+gitmoot daemon logs
+gitmoot daemon stop
+```
+
+Use `daemon start` for the background daemon. Use `daemon run` only when the
+user explicitly wants a foreground process.
+
+## Agent Setup
+
+Start a new runtime session managed by Gitmoot:
+
+```sh
+gitmoot agent start reviewer \
+  --runtime codex \
+  --repo owner/repo \
+  --path . \
+  --role reviewer \
+  --capability ask \
+  --capability review \
+  --start-daemon
+```
+
+Subscribe an existing runtime session:
+
+```sh
+gitmoot agent subscribe reviewer \
+  --runtime codex \
+  --session <session-id-or-last> \
+  --repo owner/repo \
+  --role reviewer \
+  --capability ask \
+  --capability review
+```
+
+Inspect agents:
+
+```sh
+gitmoot agent list
+gitmoot agent repos reviewer
+gitmoot agent doctor reviewer
+```
+
+Ask a registered agent from the current local chat:
+
+```sh
+gitmoot agent ask planner --repo owner/repo "Write the implementation plan and goal file."
+gitmoot agent ask planner --repo owner/repo --json "Return the plan status."
+```
+
+This uses the same agent registry, repo access grants, cached preset snapshot,
+runtime adapter, and local job history as PR-comment ask jobs. The runtime
+plugin helps Codex or Claude Code discover Gitmoot guidance, but it does not
+replace `gitmoot agent ask`.
+
+## Presets
+
+Install or refresh the built-in thermo review preset:
+
+```sh
+gitmoot preset update thermo-nuclear-code-quality-review
+gitmoot agent start thermo-review \
+  --runtime codex \
+  --repo owner/repo \
+  --preset thermo-nuclear-code-quality-review \
+  --start-daemon
+```
+
+Install or refresh the built-in planner preset:
+
+```sh
+gitmoot preset update gitmoot-plan-and-goal
+gitmoot agent start planner \
+  --runtime codex \
+  --repo owner/repo \
+  --path . \
+  --preset gitmoot-plan-and-goal \
+  --start-daemon
+```
+
+Create a local custom prompt preset:
+
+```sh
+gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
+gitmoot agent start frontend-reviewer \
+  --runtime codex \
+  --repo owner/repo \
+  --preset frontend-reviewer \
+  --role reviewer \
+  --capability ask \
+  --capability review
+```
+
+After editing a local prompt file, refresh Gitmoot's cached snapshot:
+
+```sh
+gitmoot preset diff frontend-reviewer
+gitmoot preset update frontend-reviewer
+```
+
+## Goals
+
+Print the standard Gitmoot goal prompt template:
+
+```sh
+gitmoot goal template
+```
+
+Import a goal file into local Gitmoot state:
+
+```sh
+gitmoot goal import --file GOAL-feature.md --repo owner/repo
+```
+
+## PR Comments
+
+Use GitHub PR comments as the public audit trail:
+
+```text
+/gitmoot help
+/gitmoot status
+/gitmoot <agent> review [instructions]
+/gitmoot <agent> implement [instructions]
+/gitmoot ask <agent> [question]
+/gitmoot retry <job-id>
+/gitmoot cancel <job-id>
+/gitmoot merge
+```
+
+## Jobs And Locks
+
+```sh
+gitmoot job list --repo owner/repo
+gitmoot job show <job-id>
+gitmoot job events <job-id>
+gitmoot job retry <job-id>
+gitmoot job cancel <job-id>
+gitmoot lock list --repo owner/repo
+gitmoot lock show owner/repo <branch>
+```
+
+---
+
+# Source: skills/gitmoot/references/WORKFLOWS.md
+
+# Gitmoot Workflows
+
+## First Repo Setup
+
+1. Confirm the repo identity and GitHub auth.
+2. Start the daemon for the repo.
+3. Start or subscribe at least one agent.
+4. Verify the agent is healthy before asking PR comments to route jobs.
+
+```sh
+gh repo view --json nameWithOwner
+gh auth status
+gitmoot daemon start --repo owner/repo
+gitmoot agent start reviewer --runtime codex --repo owner/repo --role reviewer --capability ask --capability review --start-daemon
+gitmoot agent doctor reviewer
+```
+
+## Review Agent From A PR Comment
+
+1. Register a reviewer agent for the target repo.
+2. Ensure the daemon watches the same repo.
+3. Comment on the PR.
+4. Inspect job status if no result appears.
+
+```text
+/gitmoot reviewer review
+```
+
+```sh
+gitmoot job list --repo owner/repo
+gitmoot job show <job-id>
+gitmoot job events <job-id>
+```
+
+## Built-In Thermo Review Agent
+
+Use the thermo preset for strict review-only work. It should not implement code
+or request implementation capability.
+
+```sh
+gitmoot preset update thermo-nuclear-code-quality-review
+gitmoot agent start thermo-review --runtime codex --repo owner/repo --preset thermo-nuclear-code-quality-review --start-daemon
+```
+
+PR comment:
+
+```text
+/gitmoot thermo-review review
+```
+
+## Custom Prompt Agent
+
+Use custom prompt presets for project-specific reviewers or helpers.
+
+```sh
+mkdir -p agents
+printf '%s\n' 'Review frontend changes for correctness and responsive behavior.' > agents/frontend-reviewer.md
+gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
+gitmoot agent start frontend-reviewer \
+  --runtime codex \
+  --repo owner/repo \
+  --preset frontend-reviewer \
+  --role reviewer \
+  --capability ask \
+  --capability review
+```
+
+Custom preset content is snapshotted into local Gitmoot state. After editing the
+source prompt file, run `gitmoot preset diff <id>` and `gitmoot preset update
+<id>` before expecting new jobs to use the changed prompt.
+
+## Planner And Goal File Agent
+
+Use the planner preset when the user wants a structured implementation plan or a
+standard Gitmoot goal file.
+
+```sh
+gitmoot preset update gitmoot-plan-and-goal
+gitmoot agent start planner \
+  --runtime codex \
+  --repo owner/repo \
+  --path . \
+  --preset gitmoot-plan-and-goal \
+  --start-daemon
+```
+
+Ask from a PR comment:
+
+```text
+/gitmoot planner ask Write a task-by-task implementation plan for this feature, then create the goal file prompt.
+```
+
+Ask directly from a local Codex or Claude Code chat by having the runtime call
+the Gitmoot CLI:
+
+```sh
+gitmoot agent ask planner --repo owner/repo "Write a task-by-task implementation plan for this feature, then create the goal file prompt."
+```
+
+If the Codex plugin exposes a Gitmoot command bridge in chat, the equivalent
+form is `$gitmoot:gitmoot agent ask planner --repo owner/repo "..."`. The
+important part is that the request goes through `gitmoot agent ask`, not a
+separate skill-only planning path.
+
+If the planner writes a goal file and the user wants Gitmoot to track it, import
+it explicitly:
+
+```sh
+gitmoot goal import --file GOAL-feature.md --repo owner/repo
+```
+
+## Multi-Repo Work
+
+Agents are global identities with explicit per-repo access. When working across
+multiple repos, always pass `--repo owner/repo` to status, daemon, job, and event
+commands so jobs are routed in the correct repository context.
+
+```sh
+gitmoot agent allow reviewer --repo owner/project-a
+gitmoot agent allow reviewer --repo owner/project-b
+gitmoot status --repo owner/project-a
+gitmoot status --repo owner/project-b
+```
+
+---
+
+# Source: skills/gitmoot/references/SAFETY.md
+
+# Gitmoot Safety Reference
+
+## Repo Scope
+
+A PR repository is the routing context for `/gitmoot <agent> ...`. Always confirm
+or pass `--repo owner/repo` when the user works across multiple repositories.
+
+## Branch Locks
+
+Implementation jobs must respect Gitmoot branch locks. Do not edit or push an
+implementation branch unless Gitmoot assigned the job and the branch lock is held
+by the assigned agent.
+
+Review and ask jobs should inspect and report without mutating branches unless
+the task explicitly instructs otherwise.
+
+Useful commands:
+
+```sh
+gitmoot lock list --repo owner/repo
+gitmoot lock show owner/repo <branch>
+```
+
+## Files And Secrets
+
+Do not commit generated data, caches, logs, build outputs, session archives,
+cloned helper repos, secrets, credentials, or large artifacts unless the user or
+plan explicitly says they are intended tracked fixtures or release assets.
+
+Redact secrets from GitHub comments, job summaries, raw examples, and copied
+command output.
+
+## External Contracts
+
+If the work depends on external APIs, CLIs, env vars, generated scripts, service
+launchers, installers, deployment behavior, or third-party libraries, verify the
+real contract with local commands and/or official documentation before editing.
+
+## When To Stop
+
+Stop and report `blocked` when the target repo is unclear, GitHub auth is
+missing, the daemon cannot access the repo, branch lock ownership is wrong, or
+continuing would require credentials or destructive operations the user did not
+approve.
+
+---
+
+# Source: skills/gitmoot/references/RESULT_CONTRACT.md
+
+# Gitmoot Result Contract
+
+Every agent job must return a `gitmoot_result` JSON object. Keep it concise,
+truthful, and tied to work that actually happened.
+
+```json
+{
+  "gitmoot_result": {
+    "decision": "approved|changes_requested|blocked|implemented|failed",
+    "summary": "Brief outcome.",
+    "findings": [],
+    "changes_made": [],
+    "tests_run": [],
+    "needs": [],
+    "next_agents": []
+  }
+}
+```
+
+## Decisions
+
+- `approved`: review found no blocking issues.
+- `changes_requested`: review found issues that should be fixed before merge.
+- `blocked`: work cannot continue without human input or an external state change.
+- `implemented`: the requested implementation work was completed.
+- `failed`: the attempted action errored or could not complete.
+
+## Reporting Rules
+
+- Do not claim tests were run unless they were actually run.
+- Do not claim files were changed unless they were actually changed.
+- Use `needs` for missing credentials, unclear scope, unavailable tools, failing
+  external services, or required human decisions.
+- Use `next_agents` only when another named Gitmoot agent should be invoked.
+- Redact secrets from summaries, findings, raw command output, and examples.
+
+---
+
+# Source: skills/gitmoot/references/GOAL_TEMPLATE.md
+
+# <Goal Title>
+
+Implement the plan task by task. Each task must be developed, reviewed, opened
+as its own pull request, merged, and verified before moving on, unless tasks are
+explicitly safe to run in parallel.
+
+Briefly describe the goal here. Include the intended user-facing outcome, the
+main systems touched, and any explicit exclusions.
+
+## Core Rules
+
+- Work one task at a time in the listed order by default.
+- If tasks are independent, have disjoint file ownership, and do not depend on
+  each other's results, they may be done in parallel on separate branches.
+- Do not start dependent work until the prerequisite task has passed checks,
+  passed `codex exec review --uncommitted`, been pushed, opened as a PR, merged,
+  and verified on the target branch.
+- Do not commit generated data, reports, caches, build artifacts, secrets,
+  credentials, session archives, cloned helper repos, local plugin build output,
+  or large outputs unless the plan explicitly says they are intended tracked
+  fixtures/artifacts.
+- Preserve existing behavior unless the current task explicitly changes it.
+- Keep changes clean, scoped, and organized. Avoid broad rewrites.
+- Avoid code duplication. When repeated logic appears, extract small reusable
+  helpers that match existing repo patterns.
+- If implementation depends on external APIs, docs, CLIs, data formats,
+  generated scripts, installers, service launchers, subprocess calls, env vars,
+  config formats, or third-party libraries, verify the real contract with local
+  commands and/or official sources before editing.
+
+## Before Starting
+
+1. Inspect current repo state with:
+   - `git status --short`
+   - current branch
+   - current remote
+2. If the target branch is unclear, the remote looks wrong, or the worktree has
+   unrelated existing changes that make task commits ambiguous, stop and ask
+   before continuing.
+3. Confirm the target base branch from the current repo. If unspecified, use the
+   current branch as the base.
+4. Inspect relevant existing patterns before editing.
+5. Verify PR tooling is available before the first PR:
+   - `gh auth status`
+   - repo remote resolves to the expected GitHub repository
+
+## Per-Task Branch Workflow
+
+1. Confirm the current task's scope.
+2. Create a task branch from the latest target base branch.
+3. Implement only that task.
+4. Add or update focused tests/checks appropriate to the task.
+5. Run focused tests for touched modules.
+6. Run broader checks when the task touches shared behavior, CLI/API surfaces,
+   data/model/evaluation logic, generated scripts, installers, service
+   launchers, docs build systems, or user-facing workflows.
+7. For wrapper, installer, CLI, subprocess, generated-script, env propagation,
+   service-launcher, or deployment changes, include an operational smoke test or
+   direct contract check. Syntax checks alone are not enough.
+8. Identify every repository where files changed. In each changed repo, run:
+   `codex exec review --uncommitted`
+9. Preserve the exact raw review output per repo.
+
+## Review-Fix Loop
+
+1. If review finds issues, do not only patch the literal line.
+2. Identify the underlying invariant/class of bug.
+3. Audit nearby and sibling paths for the same issue.
+4. Write a concise fix plan using:
+
+   ```text
+   Review found these issues: <<PASTE RAW REVIEW RESULTS BY REPO>>.
+   For each issue, identify the underlying invariant/class of bug, audit sibling
+   paths for the same issue, and plan the smallest safe fix. Verify external
+   assumptions with local commands and/or official sources. Preserve repo
+   patterns, avoid unnecessary refactors, and list tests/checks per repo.
+   ```
+
+5. Execute the fix plan.
+6. Re-run focused tests/checks and `codex exec review --uncommitted` in every
+   repo with uncommitted changes.
+7. Repeat until the final raw review output contains no findings, or stop if
+   blocked or if a finding is incorrect after verification.
+
+## Commit Gate
+
+1. Before committing, run `git diff --check` and inspect the final diff.
+2. Commit only the current task's intended tracked changes.
+3. Use the commit message specified by the plan. If the plan does not specify
+   one, use a concise conventional message that describes only the current task.
+4. Push the task branch.
+5. Verify the task branch worktree is clean after push, except for intentionally
+   ignored generated files.
+
+## Pull Request Gate
+
+1. Create one PR for the current task.
+2. The PR title must describe only the current task.
+3. The PR body must include:
+   - WHAT: what was changed
+   - WHY: why the task was needed
+   - CHANGES: concrete implementation changes
+   - RESULTS: tests/checks/review results
+   - RISK: skipped checks, blockers, or residual risk
+4. Include the exact raw final `codex exec review --uncommitted` output for each
+   changed repo in the PR body.
+5. If CI or required checks exist, wait for them and fix failures before merge.
+6. Merge the PR using the repository's configured/preferred merge method. If no
+   preference is discoverable, use squash merge for a clean task-level history.
+7. After merge, update the local target base branch and verify the worktree is
+   clean.
+8. Record the PR number, PR URL, branch name, and merged commit hash.
+9. Delete the task branch after merge only if the repository normally does so or
+   the merge command supports safe branch deletion.
+
+## Parallel Task Rules
+
+- Parallelize only when tasks are independent, have disjoint file ownership, and
+  can be reviewed and merged without order-dependent assumptions.
+- Use a separate branch per task.
+- Clearly assign each branch a task number and file ownership.
+- Do not duplicate work across branches.
+- If parallel branches conflict after one PR merges, rebase or update the
+  remaining branch on the latest target base and re-run its checks/review.
+- If a task becomes dependent on another task, stop treating it as parallel and
+  merge the dependency first.
+
+## Final Response After All Tasks
+
+- List completed tasks.
+- For each task, list branch, PR URL, merge status, and merged commit hash.
+- List tests/checks run.
+- Include exact final raw `codex exec review --uncommitted` output for the last
+  task/repo.
+- Mention skipped checks, blockers, or residual risk.
+- Do not claim interactive `/review` is clean. Say:
+  `codex exec review is clean; ready for manual /review.`
+
+## Implementation Tasks
+
+### Task 1: <Task Title>
+
+Describe the task scope, intended behavior, acceptance criteria, tests, and
+suggested commit message.
+
+### Task 2: <Task Title>
+
+Describe the task scope, intended behavior, acceptance criteria, tests, and
+suggested commit message.
