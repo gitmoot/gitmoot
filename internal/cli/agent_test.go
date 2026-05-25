@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -358,6 +359,250 @@ func TestRunAgentStartAllowsImplementForPlannerPreset(t *testing.T) {
 	if strings.Join(agent.Capabilities, ",") != "ask,implement" {
 		t.Fatalf("capabilities = %+v", agent.Capabilities)
 	}
+}
+
+func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
+	home := t.TempDir()
+	otherHome := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	t.Chdir(repoDir)
+	seedPlannerPreset(t, home)
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"agent", "subscribe", "planner",
+		"--home", home,
+		"--runtime", "codex",
+		"--session", "550e8400-e29b-41d4-a716-446655440021",
+		"--repo", "owner/repo",
+		"--preset", "gitmoot-plan-and-goal",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("subscribe exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"agent", "ask", "planner", "use the isolated state", "--home", otherHome, "--repo", "owner/repo"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("ask with other home exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), `agent "planner" not found`) {
+		t.Fatalf("ask with other home stderr = %q", stderr.String())
+	}
+
+	runner := &agentStartRunner{results: []subprocess.Result{
+		{Stdout: `{"gitmoot_result":{"decision":"approved","summary":"plan ready","findings":[{"title":"clear"}],"changes_made":[],"tests_run":["go test ./internal/cli"],"needs":["ship it"],"next_agents":["thermo-review"]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"approved","summary":"json ready","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+	}}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{"agent", "ask", "planner", "Write a plan", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("ask exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{
+		"job: local-ask-planner-",
+		"state: succeeded",
+		"repo: owner/repo",
+		"agent: planner",
+		"action: ask",
+		"decision: approved",
+		"summary: plan ready",
+		"findings:",
+		`- {"title":"clear"}`,
+		"needs:",
+		"- ship it",
+		"tests_run:",
+		"- go test ./internal/cli",
+		"next_agents:",
+		"- thermo-review",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("ask output missing %q:\n%s", want, stdout.String())
+		}
+	}
+	runner.want(t, 0, repoDir, "codex", "exec", "resume", "550e8400-e29b-41d4-a716-446655440021", "--")
+	if !strings.Contains(runner.calls[0].args[len(runner.calls[0].args)-1], "Write a plan") {
+		t.Fatalf("ask prompt missing message:\n%s", runner.calls[0].args[len(runner.calls[0].args)-1])
+	}
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("jobs = %+v, want one job", jobs)
+	}
+	payload, err := daemonJobPayload(jobs[0])
+	if err != nil {
+		t.Fatalf("daemonJobPayload returned error: %v", err)
+	}
+	if payload.PresetID != "gitmoot-plan-and-goal" || payload.PresetResolvedCommit != "def456" || !strings.Contains(payload.PresetContent, "Plan and write goals.") {
+		t.Fatalf("payload preset snapshot = %+v", payload)
+	}
+	if payload.PullRequest != 0 || payload.Sender != "local" || payload.Instructions != "Write a plan" {
+		t.Fatalf("payload local ask fields = %+v", payload)
+	}
+	if payload.Result == nil || payload.Result.Summary != "plan ready" || len(payload.RawOutputs) != 1 {
+		t.Fatalf("payload result = %+v", payload)
+	}
+	events, err := store.ListJobEvents(context.Background(), jobs[0].ID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !hasCLIJobEvent(events, "advance_completed") {
+		t.Fatalf("events = %+v, want advance_completed", events)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"job", "list", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("job list exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), jobs[0].ID+"\tsucceeded\task\tplanner\towner/repo\t#0") {
+		t.Fatalf("job list output = %q", stdout.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"job", "show", jobs[0].ID, "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("job show exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{`"preset_id": "gitmoot-plan-and-goal"`, "decision: approved", "summary: plan ready"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("job show output missing %q:\n%s", want, stdout.String())
+		}
+	}
+
+	otherStore := openCLIJobStore(t, otherHome)
+	defer otherStore.Close()
+	otherJobs, err := otherStore.ListJobs(context.Background())
+	if err != nil {
+		t.Fatalf("other ListJobs returned error: %v", err)
+	}
+	if len(otherJobs) != 0 {
+		t.Fatalf("other home jobs = %+v, want none", otherJobs)
+	}
+
+	runGit(t, repoDir, "switch", "-c", "feature/local-ask")
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "ask", "planner", "- Write JSON", "--home", home, "--json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("ask --json exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), "gitmoot_result") {
+		t.Fatalf("json output leaked raw runtime output:\n%s", stdout.String())
+	}
+	var decoded agentAskOutput
+	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
+		t.Fatalf("json output did not decode: %v\n%s", err, stdout.String())
+	}
+	if decoded.State != "succeeded" || decoded.Repo != "owner/repo" || decoded.Result == nil || decoded.Result.Summary != "json ready" || decoded.RawOutputCount != 1 {
+		t.Fatalf("decoded output = %+v", decoded)
+	}
+	jsonJob, err := store.GetJob(context.Background(), decoded.JobID)
+	if err != nil {
+		t.Fatalf("GetJob(%s) returned error: %v", decoded.JobID, err)
+	}
+	jsonPayload, err := daemonJobPayload(jsonJob)
+	if err != nil {
+		t.Fatalf("json daemonJobPayload returned error: %v", err)
+	}
+	if jsonPayload.Branch != "feature/local-ask" || jsonPayload.Instructions != "- Write JSON" {
+		t.Fatalf("json ask payload = %+v", jsonPayload)
+	}
+}
+
+func TestRunAgentAskValidatesInputAndAccess(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	t.Chdir(repoDir)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"agent", "ask", "planner", "--home", home}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("missing message exit code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "agent ask requires exactly one agent and one message") {
+		t.Fatalf("missing message stderr = %q", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "ask", "missing", "hello", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("missing agent exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), `agent "missing" not found`) {
+		t.Fatalf("missing agent stderr = %q", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{
+		"agent", "subscribe", "reviewer",
+		"--home", home,
+		"--runtime", "codex",
+		"--session", "550e8400-e29b-41d4-a716-446655440031",
+		"--role", "reviewer",
+		"--repo", "owner/repo",
+		"--capability", "review",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("subscribe reviewer exit code = %d, stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "ask", "reviewer", "hello", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("missing ask capability exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), `agent "reviewer" lacks ask capability`) {
+		t.Fatalf("missing ask capability stderr = %q", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{
+		"agent", "subscribe", "outsider",
+		"--home", home,
+		"--runtime", "codex",
+		"--session", "550e8400-e29b-41d4-a716-446655440032",
+		"--role", "planner",
+		"--repo", "owner/other",
+		"--capability", "ask",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("subscribe outsider exit code = %d, stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "ask", "outsider", "hello", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("disallowed repo exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), `agent "outsider" is not allowed on "owner/repo"`) {
+		t.Fatalf("disallowed repo stderr = %q", stderr.String())
+	}
+}
+
+func hasCLIJobEvent(events []db.JobEvent, kind string) bool {
+	for _, event := range events {
+		if event.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRunAgentStartRejectsMissingPresetBeforeRuntime(t *testing.T) {
