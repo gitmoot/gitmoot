@@ -92,7 +92,7 @@ func TestPresetListShowsAvailableBuiltin(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("preset list exit code = %d, stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "thermo-nuclear-code-quality-review") || !strings.Contains(stdout.String(), "available") {
+	if !strings.Contains(stdout.String(), "thermo-nuclear-code-quality-review") || !strings.Contains(stdout.String(), "gitmoot-plan-and-goal") || !strings.Contains(stdout.String(), "available") {
 		t.Fatalf("stdout = %s", stdout.String())
 	}
 }
