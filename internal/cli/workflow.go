@@ -22,6 +22,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/db"
 	gitutil "github.com/jerryfane/gitmoot/internal/git"
 	"github.com/jerryfane/gitmoot/internal/workflow"
+	"github.com/jerryfane/gitmoot/skills"
 )
 
 var taskHeadingPattern = regexp.MustCompile(`^### Task ([0-9]+):\s*(.+)$`)
@@ -145,17 +146,47 @@ func runGoal(args []string, stdout, stderr io.Writer) int {
 		printGoalUsage(stdout)
 		return 0
 	}
-	if args[0] != "import" {
+	switch args[0] {
+	case "import":
+		return runGoalImport(args[1:], stdout, stderr)
+	case "template":
+		return runGoalTemplate(args[1:], stdout, stderr)
+	default:
 		fmt.Fprintf(stderr, "unknown goal command %q\n\n", args[0])
 		printGoalUsage(stderr)
 		return 2
 	}
-	return runGoalImport(args[1:], stdout, stderr)
 }
 
 func printGoalUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot goal import --file <path> [--repo owner/repo]")
+	fmt.Fprintln(w, "  gitmoot goal template")
+}
+
+func runGoalTemplate(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("goal template", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "goal template does not accept positional arguments")
+		return 2
+	}
+	content, err := skills.FS.ReadFile("gitmoot/references/GOAL_TEMPLATE.md")
+	if err != nil {
+		fmt.Fprintf(stderr, "goal template: %v\n", err)
+		return 1
+	}
+	if _, err := stdout.Write(content); err != nil {
+		fmt.Fprintf(stderr, "goal template: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 func runGoalImport(args []string, stdout, stderr io.Writer) int {

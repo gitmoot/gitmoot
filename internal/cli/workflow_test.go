@@ -89,6 +89,35 @@ Document the workflow.
 	}
 }
 
+func TestRunGoalTemplate(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"goal", "template"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("goal template exit code = %d, stderr=%s", code, stderr.String())
+	}
+	output := stdout.String()
+	for _, want := range []string{
+		"# <Goal Title>",
+		"### Task 1: <Task Title>",
+		"codex exec review is clean; ready for manual /review.",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("goal template output missing %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestRunGoalTemplateValidatesInput(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"goal", "template", "extra"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "goal template does not accept positional arguments") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
 func TestRunGoalImportValidatesInput(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{"goal", "import", "--home", t.TempDir()}, &stdout, &stderr)
