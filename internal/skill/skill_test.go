@@ -46,6 +46,7 @@ func TestCanonicalSkillReferencesExist(t *testing.T) {
 	for _, ref := range []string{
 		"references/CLI.md",
 		"references/WORKFLOWS.md",
+		"references/GOAL_TEMPLATE.md",
 		"references/RESULT_CONTRACT.md",
 		"references/SAFETY.md",
 	} {

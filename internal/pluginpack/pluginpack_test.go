@@ -107,7 +107,9 @@ func TestBuildUsesEmbeddedSkillByDefault(t *testing.T) {
 		t.Fatalf("Build() error = %v", err)
 	}
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "SKILL.md"), "Gitmoot Agent Skill")
+	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "GOAL_TEMPLATE.md"), "codex exec review is clean; ready for manual /review.")
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "RESULT_CONTRACT.md"), "gitmoot_result")
+	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "presets", "gitmoot-plan-and-goal.md"), "Gitmoot Plan And Goal Writer")
 }
 
 func TestBuildRefusesOverwriteWithoutForce(t *testing.T) {
