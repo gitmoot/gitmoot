@@ -3,22 +3,17 @@ package cli
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"strings"
-	"time"
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
-	gitutil "github.com/jerryfane/gitmoot/internal/git"
-	"github.com/jerryfane/gitmoot/internal/github"
 	"github.com/jerryfane/gitmoot/internal/preset"
 	"github.com/jerryfane/gitmoot/internal/runtime"
-	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
 var newRuntimeFactory = func() runtime.Factory {
@@ -78,16 +73,6 @@ type agentAskOptions struct {
 	message    string
 }
 
-type agentAskOutput struct {
-	JobID          string                `json:"job_id"`
-	State          string                `json:"state"`
-	Repo           string                `json:"repo"`
-	Agent          string                `json:"agent"`
-	Action         string                `json:"action"`
-	Result         *workflow.AgentResult `json:"result,omitempty"`
-	RawOutputCount int                   `json:"raw_output_count"`
-}
-
 func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 	options, ok := parseAgentAskOptions(args, stderr)
 	if !ok {
@@ -96,66 +81,16 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 		}
 		return 2
 	}
-	var output agentAskOutput
+	var output localAgentJobOutput
 	if err := withStore(options.home, func(store *db.Store) error {
-		ctx := context.Background()
-		repo, record, err := resolveAgentAskRepo(ctx, store, options.repo)
-		if err != nil {
-			return err
-		}
-		if err := store.UpsertRepo(ctx, record); err != nil {
-			return err
-		}
-		agent, err := store.GetAgent(ctx, options.agent)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("agent %q not found", options.agent)
-			}
-			return err
-		}
-		if err := ensureAgentAskAccess(ctx, store, agent, repo.FullName()); err != nil {
-			return err
-		}
-		adapter, err := runtimeStartAdapter(newRuntimeFactory(), agent.Runtime, record.CheckoutPath)
-		if err != nil {
-			return err
-		}
-		job, err := (workflow.Mailbox{Store: store}).Enqueue(ctx, workflow.JobRequest{
-			ID:           localAskJobID(agent.Name),
-			Agent:        agent.Name,
+		var err error
+		output, err = dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
+			RepoFlag:     options.repo,
+			Agent:        options.agent,
 			Action:       "ask",
-			Repo:         repo.FullName(),
-			Branch:       record.DefaultBranch,
-			Sender:       "local",
 			Instructions: options.message,
 		})
-		if err != nil {
-			return err
-		}
-		if _, err := (workflow.Mailbox{Store: store}).Run(ctx, job.ID, runtimeAgent(agent), adapter); err != nil {
-			return err
-		}
-		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_completed", Message: "workflow advancement completed"}); err != nil {
-			return err
-		}
-		latest, err := store.GetJob(ctx, job.ID)
-		if err != nil {
-			return err
-		}
-		payload, err := daemonJobPayload(latest)
-		if err != nil {
-			return err
-		}
-		output = agentAskOutput{
-			JobID:          latest.ID,
-			State:          latest.State,
-			Repo:           payload.Repo,
-			Agent:          latest.Agent,
-			Action:         latest.Type,
-			Result:         payload.Result,
-			RawOutputCount: len(payload.RawOutputs),
-		}
-		return nil
+		return err
 	}); err != nil {
 		fmt.Fprintf(stderr, "agent ask: %v\n", err)
 		return 1
@@ -167,7 +102,7 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	printAgentAskOutput(stdout, output)
+	printLocalAgentJobOutput(stdout, output)
 	return 0
 }
 
@@ -233,105 +168,6 @@ func containsHelpFlag(args []string) bool {
 func printAgentAskUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--home path] [--json]")
-}
-
-func resolveAgentAskRepo(ctx context.Context, store *db.Store, repoFlag string) (github.Repository, db.Repo, error) {
-	repo, err := agentAskTargetRepo(ctx, repoFlag)
-	if err != nil {
-		return github.Repository{}, db.Repo{}, err
-	}
-	if strings.TrimSpace(repoFlag) == "" {
-		record, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: "."})
-		if err != nil {
-			return github.Repository{}, db.Repo{}, err
-		}
-		return repo, record, nil
-	}
-	if existing, err := store.GetRepo(ctx, repo.FullName()); err == nil && strings.TrimSpace(existing.CheckoutPath) != "" {
-		record, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: existing.CheckoutPath})
-		if err != nil {
-			return github.Repository{}, db.Repo{}, err
-		}
-		record.PollInterval = existing.PollInterval
-		return repo, record, nil
-	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return github.Repository{}, db.Repo{}, err
-	}
-	record, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: "."})
-	if err != nil {
-		return github.Repository{}, db.Repo{}, err
-	}
-	return repo, record, nil
-}
-
-func agentAskTargetRepo(ctx context.Context, repoFlag string) (github.Repository, error) {
-	if strings.TrimSpace(repoFlag) != "" {
-		return daemon.ParseRepository(repoFlag)
-	}
-	remote, err := (gitutil.Client{Dir: "."}).OriginRemote(ctx)
-	if err != nil {
-		return github.Repository{}, fmt.Errorf("infer repo from current checkout: %w", err)
-	}
-	parsed, err := gitutil.ParseGitHubRemote(remote)
-	if err != nil {
-		return github.Repository{}, err
-	}
-	return github.Repository{Owner: parsed.Owner, Name: parsed.Name}, nil
-}
-
-func ensureAgentAskAccess(ctx context.Context, store *db.Store, agent db.Agent, repo string) error {
-	allowed, err := store.AgentCanAccessRepo(ctx, agent.Name, repo)
-	if err != nil {
-		return err
-	}
-	if !allowed {
-		return fmt.Errorf("agent %q is not allowed on %q", agent.Name, repo)
-	}
-	if !agentHasCapability(agent.Capabilities, "ask") {
-		return fmt.Errorf("agent %q lacks ask capability", agent.Name)
-	}
-	return nil
-}
-
-func localAskJobID(agent string) string {
-	return fmt.Sprintf("local-ask-%s-%x", agent, time.Now().UTC().UnixNano())
-}
-
-func printAgentAskOutput(stdout io.Writer, output agentAskOutput) {
-	writeLine(stdout, "job: %s", output.JobID)
-	writeLine(stdout, "state: %s", output.State)
-	writeLine(stdout, "repo: %s", output.Repo)
-	writeLine(stdout, "agent: %s", output.Agent)
-	writeLine(stdout, "action: %s", output.Action)
-	if output.Result == nil {
-		return
-	}
-	writeLine(stdout, "decision: %s", output.Result.Decision)
-	writeLine(stdout, "summary: %s", output.Result.Summary)
-	printRawMessages(stdout, "findings", output.Result.Findings)
-	printStringList(stdout, "needs", output.Result.Needs)
-	printStringList(stdout, "tests_run", output.Result.TestsRun)
-	printStringList(stdout, "next_agents", output.Result.NextAgents)
-}
-
-func printRawMessages(stdout io.Writer, label string, values []json.RawMessage) {
-	if len(values) == 0 {
-		return
-	}
-	writeLine(stdout, "%s:", label)
-	for _, value := range values {
-		writeLine(stdout, "- %s", strings.TrimSpace(string(value)))
-	}
-}
-
-func printStringList(stdout io.Writer, label string, values []string) {
-	if len(values) == 0 {
-		return
-	}
-	writeLine(stdout, "%s:", label)
-	for _, value := range values {
-		writeLine(stdout, "- %s", value)
-	}
 }
 
 func runAgentStart(args []string, stdout, stderr io.Writer) int {

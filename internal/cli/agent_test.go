@@ -502,7 +502,7 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 	if strings.Contains(stdout.String(), "gitmoot_result") {
 		t.Fatalf("json output leaked raw runtime output:\n%s", stdout.String())
 	}
-	var decoded agentAskOutput
+	var decoded localAgentJobOutput
 	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
 		t.Fatalf("json output did not decode: %v\n%s", err, stdout.String())
 	}
