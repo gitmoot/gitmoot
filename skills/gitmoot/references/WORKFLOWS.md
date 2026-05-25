@@ -69,6 +69,40 @@ Custom preset content is snapshotted into local Gitmoot state. After editing the
 source prompt file, run `gitmoot preset diff <id>` and `gitmoot preset update
 <id>` before expecting new jobs to use the changed prompt.
 
+## Planner And Goal File Agent
+
+Use the planner preset when the user wants a structured implementation plan or a
+standard Gitmoot goal file.
+
+```sh
+gitmoot preset update gitmoot-plan-and-goal
+gitmoot agent start planner \
+  --runtime codex \
+  --repo owner/repo \
+  --path . \
+  --preset gitmoot-plan-and-goal \
+  --start-daemon
+```
+
+Ask from a PR comment:
+
+```text
+/gitmoot planner ask Write a task-by-task implementation plan for this feature, then create the goal file prompt.
+```
+
+Ask directly from a Codex plugin session:
+
+```text
+$gitmoot:gitmoot Use the planner workflow to create a plan and goal file for this feature: ...
+```
+
+If the planner writes a goal file and the user wants Gitmoot to track it, import
+it explicitly:
+
+```sh
+gitmoot goal import --file GOAL-feature.md --repo owner/repo
+```
+
 ## Multi-Repo Work
 
 Agents are global identities with explicit per-repo access. When working across
