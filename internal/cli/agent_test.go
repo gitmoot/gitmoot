@@ -286,6 +286,80 @@ func TestRunAgentStartUsesInstalledCustomPreset(t *testing.T) {
 	}
 }
 
+func TestRunAgentStartAppliesPlannerPresetDefaults(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	seedPlannerPreset(t, home)
+	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440032"}` + "\n"}}}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "start", "planner",
+		"--home", home,
+		"--runtime", "codex",
+		"--repo", "owner/repo",
+		"--path", repoDir,
+		"--preset", "gitmoot-plan-and-goal",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("start exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	agent, err := store.GetAgent(context.Background(), "planner")
+	if err != nil {
+		t.Fatalf("GetAgent returned error: %v", err)
+	}
+	if agent.Role != "planner" || agent.PresetID != "gitmoot-plan-and-goal" || strings.Join(agent.Capabilities, ",") != "ask" {
+		t.Fatalf("agent = %+v", agent)
+	}
+	prompt := runner.calls[0].args[len(runner.calls[0].args)-1]
+	if !strings.Contains(prompt, "Preset: gitmoot-plan-and-goal @ def456") || !strings.Contains(prompt, "Plan and write goals.") {
+		t.Fatalf("startup prompt missing planner preset content:\n%s", prompt)
+	}
+}
+
+func TestRunAgentStartAllowsImplementForPlannerPreset(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	seedPlannerPreset(t, home)
+	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440033"}` + "\n"}}}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "start", "planner",
+		"--home", home,
+		"--runtime", "codex",
+		"--repo", "owner/repo",
+		"--path", repoDir,
+		"--preset", "gitmoot-plan-and-goal",
+		"--capability", "ask",
+		"--capability", "implement",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("start exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	agent, err := store.GetAgent(context.Background(), "planner")
+	if err != nil {
+		t.Fatalf("GetAgent returned error: %v", err)
+	}
+	if strings.Join(agent.Capabilities, ",") != "ask,implement" {
+		t.Fatalf("capabilities = %+v", agent.Capabilities)
+	}
+}
+
 func TestRunAgentStartRejectsMissingPresetBeforeRuntime(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()
@@ -699,6 +773,30 @@ func seedThermoPreset(t *testing.T, home string) {
 		SourcePath:     "cursor-team-kit/skills/thermo-nuclear-code-quality-review/SKILL.md",
 		ResolvedCommit: "abc123",
 		Content:        "Review deeply.",
+	}); err != nil {
+		t.Fatalf("UpsertPreset returned error: %v", err)
+	}
+}
+
+func seedPlannerPreset(t *testing.T, home string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
+	}
+	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+	if err := store.UpsertPreset(context.Background(), db.Preset{
+		ID:             "gitmoot-plan-and-goal",
+		Name:           "Gitmoot Plan and Goal Writer",
+		SourceRepo:     "jerryfane/gitmoot",
+		SourceRef:      "main",
+		SourcePath:     "skills/gitmoot/presets/gitmoot-plan-and-goal.md",
+		ResolvedCommit: "def456",
+		Content:        "Plan and write goals.",
 	}); err != nil {
 		t.Fatalf("UpsertPreset returned error: %v", err)
 	}

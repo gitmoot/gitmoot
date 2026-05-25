@@ -19,6 +19,7 @@ import (
 )
 
 const ThermoNuclearCodeQualityReviewID = "thermo-nuclear-code-quality-review"
+const GitmootPlanAndGoalID = "gitmoot-plan-and-goal"
 const LocalSourceRepo = "local"
 const LocalSourceRef = "file"
 const DefaultLocalDescription = "Local custom prompt preset."
@@ -57,6 +58,17 @@ var builtins = []Definition{
 		SourceRepo:          "cursor/plugins",
 		SourceRef:           "main",
 		SourcePath:          "cursor-team-kit/skills/thermo-nuclear-code-quality-review/SKILL.md",
+	},
+	{
+		ID:                  GitmootPlanAndGoalID,
+		Name:                "Gitmoot Plan and Goal Writer",
+		Description:         "Structured planning and standard goal-file preset for Gitmoot workflows.",
+		DefaultRole:         "planner",
+		DefaultCapabilities: []string{"ask"},
+		Mutation:            true,
+		SourceRepo:          "jerryfane/gitmoot",
+		SourceRef:           "main",
+		SourcePath:          "skills/gitmoot/presets/gitmoot-plan-and-goal.md",
 	},
 }
 

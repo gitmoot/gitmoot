@@ -14,17 +14,46 @@ import (
 	"github.com/jerryfane/gitmoot/internal/subprocess"
 )
 
-func TestBuiltinsIncludesOnlyThermoPreset(t *testing.T) {
+func TestBuiltinsIncludesPlannerAndThermoPresets(t *testing.T) {
 	definitions := Builtins()
-	if len(definitions) != 1 {
-		t.Fatalf("builtin count = %d, want 1", len(definitions))
+	if len(definitions) != 2 {
+		t.Fatalf("builtin count = %d, want 2", len(definitions))
 	}
-	definition := definitions[0]
-	if definition.ID != ThermoNuclearCodeQualityReviewID || definition.Mutation {
-		t.Fatalf("definition = %+v", definition)
+	thermo, ok := Lookup(ThermoNuclearCodeQualityReviewID)
+	if !ok {
+		t.Fatal("thermo preset missing")
 	}
-	if !reflect.DeepEqual(definition.DefaultCapabilities, []string{"ask", "review"}) {
-		t.Fatalf("capabilities = %+v", definition.DefaultCapabilities)
+	if thermo.Mutation || !reflect.DeepEqual(thermo.DefaultCapabilities, []string{"ask", "review"}) {
+		t.Fatalf("thermo definition = %+v", thermo)
+	}
+	planner, ok := Lookup(GitmootPlanAndGoalID)
+	if !ok {
+		t.Fatal("planner preset missing")
+	}
+	if !planner.Mutation || planner.DefaultRole != "planner" || !reflect.DeepEqual(planner.DefaultCapabilities, []string{"ask"}) {
+		t.Fatalf("planner definition = %+v", planner)
+	}
+	if planner.SourceRepo != "jerryfane/gitmoot" || planner.SourcePath != "skills/gitmoot/presets/gitmoot-plan-and-goal.md" {
+		t.Fatalf("planner source = %+v", planner)
+	}
+}
+
+func TestUpdatePlannerPreset(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	updated, err := Update(ctx, store, fakeFetcher{commit: "def456", content: "Plan carefully."}, GitmootPlanAndGoalID)
+	if err != nil {
+		t.Fatalf("Update returned error: %v", err)
+	}
+	if updated.ID != GitmootPlanAndGoalID || updated.ResolvedCommit != "def456" || updated.Content != "Plan carefully." {
+		t.Fatalf("updated planner preset = %+v", updated)
+	}
+	if updated.SourceRepo != "jerryfane/gitmoot" || updated.SourcePath != "skills/gitmoot/presets/gitmoot-plan-and-goal.md" {
+		t.Fatalf("updated source = %+v", updated)
 	}
 }
 
@@ -201,4 +230,17 @@ func (f *fakeRunner) Run(_ context.Context, _ string, command string, args ...st
 
 func (f *fakeRunner) LookPath(file string) (string, error) {
 	return file, nil
+}
+
+type fakeFetcher struct {
+	commit  string
+	content string
+}
+
+func (f fakeFetcher) ResolveRef(context.Context, string, string) (string, error) {
+	return f.commit, nil
+}
+
+func (f fakeFetcher) FetchFile(context.Context, string, string, string) (File, error) {
+	return File{Content: f.content}, nil
 }
