@@ -75,6 +75,48 @@ func TestCanonicalSkillDocumentsResultAndRereadGuidance(t *testing.T) {
 	}
 }
 
+func TestCanonicalSkillDocumentsLocalAgentAsk(t *testing.T) {
+	text := readRepoFile(t, "skills", "gitmoot", "SKILL.md")
+	cli := readRepoFile(t, "skills", "gitmoot", "references", "CLI.md")
+	workflows := readRepoFile(t, "skills", "gitmoot", "references", "WORKFLOWS.md")
+	for _, check := range []struct {
+		name string
+		text string
+		want []string
+	}{
+		{
+			name: "skill",
+			text: text,
+			want: []string{
+				"gitmoot agent ask <agent>",
+				"The plugin is only the runtime discovery surface",
+			},
+		},
+		{
+			name: "cli",
+			text: cli,
+			want: []string{
+				"gitmoot agent ask planner --repo owner/repo",
+				"replace `gitmoot agent ask`",
+			},
+		},
+		{
+			name: "workflows",
+			text: workflows,
+			want: []string{
+				"gitmoot agent ask planner --repo owner/repo",
+				"separate skill-only planning path",
+			},
+		},
+	} {
+		for _, want := range check.want {
+			if !strings.Contains(check.text, want) {
+				t.Fatalf("%s missing %q", check.name, want)
+			}
+		}
+	}
+}
+
 func TestRootSkillCompatibilityEntrypoint(t *testing.T) {
 	text := readRepoFile(t, "SKILL.md")
 	frontmatter := parseFrontmatter(t, text)
@@ -104,6 +146,7 @@ func TestRootSkillCompatibilityEntrypoint(t *testing.T) {
 		"gitmoot.io/SKILL.md",
 		"gitmoot_result",
 		"branch locks",
+		"gitmoot agent ask <agent>",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("root SKILL.md missing compatibility content %q", want)

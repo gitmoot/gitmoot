@@ -255,16 +255,28 @@ it on a real PR.
    /tmp/gitmoot-current daemon status --home "$GITMOOT_SMOKE_HOME"
    ```
 
-4. Open a disposable PR, then comment:
+4. Ask the planner directly through the local agent path.
+
+   ```sh
+   /tmp/gitmoot-current agent ask planner-smoke \
+     --home "$GITMOOT_SMOKE_HOME" \
+     --repo owner/project \
+     "Write a task-by-task implementation plan for this feature, then create the goal file prompt."
+   /tmp/gitmoot-current job list --home "$GITMOOT_SMOKE_HOME" --repo owner/project
+   /tmp/gitmoot-current job show <local-ask-job-id> --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+5. Open a disposable PR, then comment:
 
    ```text
    /gitmoot planner-smoke ask Write a task-by-task implementation plan for this feature, then create the goal file prompt.
    ```
 
-5. Verify the queued job and PR result.
+6. Verify the queued PR job and PR result.
 
    ```sh
    /tmp/gitmoot-current job list --home "$GITMOOT_SMOKE_HOME" --repo owner/project
+   /tmp/gitmoot-current job show <pr-ask-job-id> --home "$GITMOOT_SMOKE_HOME"
    /tmp/gitmoot-current events --home "$GITMOOT_SMOKE_HOME" --repo owner/project
    gh pr view <number> --repo owner/project --comments
    ```
@@ -275,11 +287,15 @@ Expected signals:
 - `preset show` displays `default role: planner`, `default capabilities: ask`,
   and `mutation: true`.
 - `agent doctor planner-smoke` succeeds.
+- `agent ask planner-smoke` prints `state: succeeded`, `agent: planner-smoke`,
+  `action: ask`, and a planner summary.
+- `job show <local-ask-job-id>` includes `"sender": "local"`, the cached
+  `gitmoot-plan-and-goal` preset metadata, and the planner result.
 - The PR result comment includes `Preset: gitmoot-plan-and-goal`.
 - The planner returns a structured plan and, when requested, a
   `GOAL-<short-slug>.md` path plus `/goal GOAL-<short-slug>.md`.
 
-6. Stop the isolated daemon.
+7. Stop the isolated daemon.
 
    ```sh
    /tmp/gitmoot-current daemon stop --home "$GITMOOT_SMOKE_HOME"

@@ -107,6 +107,9 @@ func TestBuildUsesEmbeddedSkillByDefault(t *testing.T) {
 		t.Fatalf("Build() error = %v", err)
 	}
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "SKILL.md"), "Gitmoot Agent Skill")
+	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "SKILL.md"), "gitmoot agent ask <agent>")
+	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "CLI.md"), "gitmoot agent ask planner --repo owner/repo")
+	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "WORKFLOWS.md"), "separate skill-only planning path")
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "GOAL_TEMPLATE.md"), "codex exec review is clean; ready for manual /review.")
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "RESULT_CONTRACT.md"), "gitmoot_result")
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "presets", "gitmoot-plan-and-goal.md"), "Gitmoot Plan And Goal Writer")
