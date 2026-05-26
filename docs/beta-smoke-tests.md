@@ -236,8 +236,11 @@ it on a real PR.
    ```sh
    /tmp/gitmoot-current goal template | grep "codex exec review is clean; ready for manual /review."
    /tmp/gitmoot-current preset list --home "$GITMOOT_SMOKE_HOME" | grep gitmoot-plan-and-goal
+   /tmp/gitmoot-current preset list --home "$GITMOOT_SMOKE_HOME" | grep gitmoot-plan-lite
    /tmp/gitmoot-current preset update --home "$GITMOOT_SMOKE_HOME" gitmoot-plan-and-goal
+   /tmp/gitmoot-current preset update --home "$GITMOOT_SMOKE_HOME" gitmoot-plan-lite
    /tmp/gitmoot-current preset show --home "$GITMOOT_SMOKE_HOME" gitmoot-plan-and-goal
+   /tmp/gitmoot-current preset show --home "$GITMOOT_SMOKE_HOME" gitmoot-plan-lite
    ```
 
 3. From the test repo checkout, start the planner agent.
@@ -286,6 +289,8 @@ Expected signals:
 - `goal template` prints the canonical PR-per-task prompt.
 - `preset show` displays `default role: planner`, `default capabilities: ask`,
   and `mutation: true`.
+- `preset show gitmoot-plan-lite` displays `default role: planner`,
+  `default capabilities: ask`, and `mutation: false`.
 - `agent doctor planner-smoke` succeeds.
 - `agent ask planner-smoke` prints `state: succeeded`, `agent: planner-smoke`,
   `action: ask`, and a planner summary.

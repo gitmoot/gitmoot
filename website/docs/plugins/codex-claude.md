@@ -11,17 +11,24 @@ gitmoot plugin doctor
 ```
 
 The plugins do not replace the CLI. Use the CLI for agent registration, daemon
-management, status checks, and direct agent asks.
+management, status checks, and background agent asks.
 
-From a runtime chat that supports command execution:
+For fast planning in the current chat, ask the runtime:
 
 ```text
-$gitmoot:gitmoot agent ask planner --repo owner/repo "Write the implementation plan and goal file."
+Use the Gitmoot planner here. Write the implementation plan.
+```
+
+For registered background-agent work from a runtime chat that supports command
+execution:
+
+```text
+$gitmoot:gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
 ```
 
 Without the command bridge, ask the runtime to run:
 
 ```sh
-gitmoot agent ask planner --repo owner/repo "Write the implementation plan and goal file."
+gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot job watch <job-id>
 ```
-

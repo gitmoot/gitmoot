@@ -61,6 +61,11 @@ The plugins are guidance and discovery surfaces. They do not replace
 `gitmoot daemon start`, agent registration, GitHub CLI authentication, or the
 local SQLite workflow state.
 
+For fast planning in the current Codex or Claude chat, ask the runtime to use
+the Gitmoot planner here. That applies the lightweight `gitmoot-plan-lite`
+instructions directly in the current conversation and avoids the startup cost of
+a background planner job.
+
 If a Codex or Claude chat wants to invoke a registered Gitmoot agent directly,
 it should run `gitmoot agent ask <agent> --repo owner/repo "..."`. That uses the
 same local agent registry and runtime adapter path as PR-comment ask jobs.

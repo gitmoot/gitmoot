@@ -15,6 +15,8 @@ const sources = [
   'docs/troubleshooting.md',
   'docs/beta-smoke-tests.md',
   'skills/gitmoot/SKILL.md',
+  'skills/gitmoot/presets/gitmoot-plan-and-goal.md',
+  'skills/gitmoot/presets/gitmoot-plan-lite.md',
   'skills/gitmoot/references/CLI.md',
   'skills/gitmoot/references/WORKFLOWS.md',
   'skills/gitmoot/references/SAFETY.md',
@@ -39,4 +41,3 @@ for (const source of sources) {
 
 await mkdir(staticDir, {recursive: true});
 await writeFile(path.join(staticDir, 'llms-full.txt'), `${parts.join('')}\n`);
-

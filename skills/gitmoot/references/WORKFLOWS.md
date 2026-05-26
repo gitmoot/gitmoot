@@ -69,10 +69,26 @@ Custom preset content is snapshotted into local Gitmoot state. After editing the
 source prompt file, run `gitmoot preset diff <id>` and `gitmoot preset update
 <id>` before expecting new jobs to use the changed prompt.
 
-## Planner And Goal File Agent
+## Planner Here
+
+Use the lightweight planner in the current Codex or Claude chat when the user
+wants a fast implementation plan and the current session already has the repo
+context. Read the packaged `presets/gitmoot-plan-lite.md` instructions, inspect
+only the relevant files, use web search only for current external contracts or
+best-practice claims, and return the plan directly in chat.
+
+```text
+Use the Gitmoot planner here. Write a task-by-task implementation plan for this feature.
+```
+
+If the user later asks for a standard goal file, read the canonical goal
+template and write the goal file then. Do not create the goal file during the
+lite planning pass unless explicitly requested.
+
+## Background Planner Agent
 
 Use the planner preset when the user wants a structured implementation plan or a
-standard Gitmoot goal file.
+standard Gitmoot goal file to run as a tracked Gitmoot background agent job.
 
 ```sh
 gitmoot preset update gitmoot-plan-and-goal
@@ -91,16 +107,19 @@ Ask from a PR comment:
 ```
 
 Ask directly from a local Codex or Claude Code chat by having the runtime call
-the Gitmoot CLI:
+the Gitmoot CLI when the user explicitly wants a registered background-capable
+agent path:
 
 ```sh
-gitmoot agent ask planner --repo owner/repo "Write a task-by-task implementation plan for this feature, then create the goal file prompt."
+gitmoot agent ask planner --repo owner/repo --background "Write a task-by-task implementation plan for this feature, then create the goal file prompt."
+gitmoot job watch <job-id>
 ```
 
 If the Codex plugin exposes a Gitmoot command bridge in chat, the equivalent
-form is `$gitmoot:gitmoot agent ask planner --repo owner/repo "..."`. The
-important part is that the request goes through `gitmoot agent ask`, not a
-separate skill-only planning path.
+form is `$gitmoot:gitmoot agent ask planner --repo owner/repo --background "..."`. The
+important part is that background planner work goes through `gitmoot agent ask`;
+fast "here" planning stays in the current chat and does not claim to control the
+current chat through a CLI command.
 
 If the planner writes a goal file and the user wants Gitmoot to track it, import
 it explicitly:

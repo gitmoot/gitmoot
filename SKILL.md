@@ -28,8 +28,16 @@ This root `SKILL.md` is kept as a raw compatibility entrypoint for agents and
 Gitmoot is a local-first coordinator for AI agents working across repositories,
 goals, reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
-background daemon checks, Codex or Claude Code agent startup, preset agents,
-custom prompt agents, job status, or branch lock inspection.
+background daemon checks, Codex or Claude Code agent startup, structured
+implementation plans, standard goal files, preset agents, custom prompt agents,
+job status, or branch lock inspection.
+
+For fast planning, "use the Gitmoot planner here" means read and apply the
+repo `skills/gitmoot/presets/gitmoot-plan-lite.md` instructions in this current
+chat. In an installed Gitmoot skill package, use the packaged
+`presets/gitmoot-plan-lite.md` path. Do not route that request through a
+background `gitmoot agent ask` unless the user explicitly asks for background
+execution, PR-comment routing, or job tracking.
 
 ## Before Acting
 
@@ -88,9 +96,10 @@ Use `gitmoot daemon start` for the background daemon. Use `gitmoot daemon run`
 only when the user explicitly wants a foreground process.
 
 Use `gitmoot agent ask` when the user wants to invoke a registered Gitmoot
-agent from the current local chat. This is the same agent registry and runtime
-adapter path used by PR-comment ask jobs; the plugin only helps the runtime
-discover this skill and does not replace the `gitmoot` CLI.
+agent from the current local chat. Add `--background` only when the user wants a
+queued background job. This is the same agent registry and runtime adapter path
+used by PR-comment ask jobs; the plugin only helps the runtime discover this
+skill and does not replace the `gitmoot` CLI.
 
 ## PR Comment Commands
 

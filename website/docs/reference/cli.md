@@ -27,6 +27,7 @@ gitmoot daemon status
 gitmoot agent start <name> --runtime codex --repo owner/repo --preset <preset>
 gitmoot agent subscribe <name> --runtime codex --session <id> --repo owner/repo
 gitmoot agent ask <name> --repo owner/repo "question"
+gitmoot agent ask <name> --repo owner/repo --background "queued task"
 gitmoot agent list
 gitmoot agent doctor <name>
 ```
@@ -49,4 +50,3 @@ gitmoot job show <job-id>
 gitmoot job retry <job-id>
 gitmoot lock list --repo owner/repo
 ```
-

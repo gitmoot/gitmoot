@@ -20,6 +20,7 @@ import (
 
 const ThermoNuclearCodeQualityReviewID = "thermo-nuclear-code-quality-review"
 const GitmootPlanAndGoalID = "gitmoot-plan-and-goal"
+const GitmootPlanLiteID = "gitmoot-plan-lite"
 const LocalSourceRepo = "local"
 const LocalSourceRef = "file"
 const DefaultLocalDescription = "Local custom prompt preset."
@@ -69,6 +70,17 @@ var builtins = []Definition{
 		SourceRepo:          "jerryfane/gitmoot",
 		SourceRef:           "main",
 		SourcePath:          "skills/gitmoot/presets/gitmoot-plan-and-goal.md",
+	},
+	{
+		ID:                  GitmootPlanLiteID,
+		Name:                "Gitmoot Plan Lite",
+		Description:         "Fast structured planning preset for current-chat Gitmoot workflows.",
+		DefaultRole:         "planner",
+		DefaultCapabilities: []string{"ask"},
+		Mutation:            false,
+		SourceRepo:          "jerryfane/gitmoot",
+		SourceRef:           "main",
+		SourcePath:          "skills/gitmoot/presets/gitmoot-plan-lite.md",
 	},
 }
 

@@ -95,7 +95,7 @@ gitmoot agent doctor reviewer
 Ask a registered agent from the current local chat:
 
 ```sh
-gitmoot agent ask planner --repo owner/repo "Write the implementation plan and goal file."
+gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
 gitmoot agent ask planner --repo owner/repo --json "Return the plan status."
 ```
 
@@ -117,7 +117,7 @@ gitmoot agent start thermo-review \
   --start-daemon
 ```
 
-Install or refresh the built-in planner preset:
+Install or refresh the built-in full planner/goal preset:
 
 ```sh
 gitmoot preset update gitmoot-plan-and-goal
@@ -128,6 +128,23 @@ gitmoot agent start planner \
   --preset gitmoot-plan-and-goal \
   --start-daemon
 ```
+
+Install or refresh the lightweight planner preset when you want to run a
+planner as a registered background-capable agent:
+
+```sh
+gitmoot preset update gitmoot-plan-lite
+gitmoot agent start planner-lite \
+  --runtime codex \
+  --repo owner/repo \
+  --path . \
+  --preset gitmoot-plan-lite \
+  --start-daemon
+```
+
+For fast current-chat planning, use the Gitmoot skill with the packaged
+`presets/gitmoot-plan-lite.md` instructions instead of starting a background
+job. The CLI cannot control an already-running Codex or Claude chat.
 
 Create a local custom prompt preset:
 

@@ -16,8 +16,8 @@ import (
 
 func TestBuiltinsIncludesPlannerAndThermoPresets(t *testing.T) {
 	definitions := Builtins()
-	if len(definitions) != 2 {
-		t.Fatalf("builtin count = %d, want 2", len(definitions))
+	if len(definitions) != 3 {
+		t.Fatalf("builtin count = %d, want 3", len(definitions))
 	}
 	thermo, ok := Lookup(ThermoNuclearCodeQualityReviewID)
 	if !ok {
@@ -35,6 +35,16 @@ func TestBuiltinsIncludesPlannerAndThermoPresets(t *testing.T) {
 	}
 	if planner.SourceRepo != "jerryfane/gitmoot" || planner.SourcePath != "skills/gitmoot/presets/gitmoot-plan-and-goal.md" {
 		t.Fatalf("planner source = %+v", planner)
+	}
+	lite, ok := Lookup(GitmootPlanLiteID)
+	if !ok {
+		t.Fatal("lite planner preset missing")
+	}
+	if lite.Mutation || lite.DefaultRole != "planner" || !reflect.DeepEqual(lite.DefaultCapabilities, []string{"ask"}) {
+		t.Fatalf("lite planner definition = %+v", lite)
+	}
+	if lite.SourceRepo != "jerryfane/gitmoot" || lite.SourcePath != "skills/gitmoot/presets/gitmoot-plan-lite.md" {
+		t.Fatalf("lite planner source = %+v", lite)
 	}
 }
 
@@ -54,6 +64,25 @@ func TestUpdatePlannerPreset(t *testing.T) {
 	}
 	if updated.SourceRepo != "jerryfane/gitmoot" || updated.SourcePath != "skills/gitmoot/presets/gitmoot-plan-and-goal.md" {
 		t.Fatalf("updated source = %+v", updated)
+	}
+}
+
+func TestUpdateLitePlannerPreset(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	updated, err := Update(ctx, store, fakeFetcher{commit: "fed789", content: "Plan quickly."}, GitmootPlanLiteID)
+	if err != nil {
+		t.Fatalf("Update returned error: %v", err)
+	}
+	if updated.ID != GitmootPlanLiteID || updated.ResolvedCommit != "fed789" || updated.Content != "Plan quickly." {
+		t.Fatalf("updated lite planner preset = %+v", updated)
+	}
+	if updated.SourceRepo != "jerryfane/gitmoot" || updated.SourcePath != "skills/gitmoot/presets/gitmoot-plan-lite.md" {
+		t.Fatalf("updated lite source = %+v", updated)
 	}
 }
 

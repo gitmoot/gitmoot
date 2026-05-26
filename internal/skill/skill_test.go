@@ -90,6 +90,7 @@ func TestCanonicalSkillDocumentsLocalAgentAsk(t *testing.T) {
 			want: []string{
 				"gitmoot agent ask <agent>",
 				"The plugin is only the runtime discovery surface",
+				"presets/gitmoot-plan-lite.md",
 			},
 		},
 		{
@@ -105,7 +106,7 @@ func TestCanonicalSkillDocumentsLocalAgentAsk(t *testing.T) {
 			text: workflows,
 			want: []string{
 				"gitmoot agent ask planner --repo owner/repo",
-				"separate skill-only planning path",
+				"Planner Here",
 			},
 		},
 	} {
@@ -143,6 +144,7 @@ func TestRootSkillCompatibilityEntrypoint(t *testing.T) {
 	}
 	for _, want := range []string{
 		"skills/gitmoot/",
+		"skills/gitmoot/presets/gitmoot-plan-lite.md",
 		"gitmoot.io/SKILL.md",
 		"gitmoot_result",
 		"branch locks",

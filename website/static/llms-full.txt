@@ -97,11 +97,17 @@ gitmoot agent start planner \
   --start-daemon
 ```
 
-Ask the registered agent directly from a local shell or from a runtime chat that
-can call shell commands:
+For fast planning in the current Codex or Claude chat, ask the runtime:
+
+```text
+Use the Gitmoot planner here. Write the implementation plan.
+```
+
+Ask the registered background planner when you want a queued Gitmoot job:
 
 ```sh
-gitmoot agent ask planner --repo owner/repo "Write the implementation plan and goal file."
+gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot job watch <job-id>
 ```
 
 Route work through PR comments:
@@ -298,8 +304,16 @@ This root `SKILL.md` is kept as a raw compatibility entrypoint for agents and
 Gitmoot is a local-first coordinator for AI agents working across repositories,
 goals, reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
-background daemon checks, Codex or Claude Code agent startup, preset agents,
-custom prompt agents, job status, or branch lock inspection.
+background daemon checks, Codex or Claude Code agent startup, structured
+implementation plans, standard goal files, preset agents, custom prompt agents,
+job status, or branch lock inspection.
+
+For fast planning, "use the Gitmoot planner here" means read and apply the
+repo `skills/gitmoot/presets/gitmoot-plan-lite.md` instructions in this current
+chat. In an installed Gitmoot skill package, use the packaged
+`presets/gitmoot-plan-lite.md` path. Do not route that request through a
+background `gitmoot agent ask` unless the user explicitly asks for background
+execution, PR-comment routing, or job tracking.
 
 ## Before Acting
 
@@ -358,9 +372,10 @@ Use `gitmoot daemon start` for the background daemon. Use `gitmoot daemon run`
 only when the user explicitly wants a foreground process.
 
 Use `gitmoot agent ask` when the user wants to invoke a registered Gitmoot
-agent from the current local chat. This is the same agent registry and runtime
-adapter path used by PR-comment ask jobs; the plugin only helps the runtime
-discover this skill and does not replace the `gitmoot` CLI.
+agent from the current local chat. Add `--background` only when the user wants a
+queued background job. This is the same agent registry and runtime adapter path
+used by PR-comment ask jobs; the plugin only helps the runtime discover this
+skill and does not replace the `gitmoot` CLI.
 
 ## PR Comment Commands
 
@@ -519,6 +534,11 @@ gitmoot plugin doctor
 The plugins are guidance and discovery surfaces. They do not replace
 `gitmoot daemon start`, agent registration, GitHub CLI authentication, or the
 local SQLite workflow state.
+
+For fast planning in the current Codex or Claude chat, ask the runtime to use
+the Gitmoot planner here. That applies the lightweight `gitmoot-plan-lite`
+instructions directly in the current conversation and avoids the startup cost of
+a background planner job.
 
 If a Codex or Claude chat wants to invoke a registered Gitmoot agent directly,
 it should run `gitmoot agent ask <agent> --repo owner/repo "..."`. That uses the
@@ -890,20 +910,32 @@ The agent should read the bundled skill, verify `gitmoot version`, check
 `gh auth status` before PR workflows, and use read-only Gitmoot status commands
 before mutating daemon, agent, job, or lock state.
 
-When you want the current Codex chat to invoke a registered Gitmoot agent, route
-that request through the CLI:
+For fast planning in the current Codex chat, do not route through a background
+planner unless the user asks for a queued job. Ask Codex:
 
 ```text
-$gitmoot:gitmoot agent ask planner --repo owner/repo "Write the implementation plan and goal file."
+Use the Gitmoot planner here. Write the implementation plan.
+```
+
+Codex should apply the packaged `presets/gitmoot-plan-lite.md` instructions,
+inspect the relevant repo files, search only for current external contracts when
+needed, and return the plan directly in the current conversation.
+
+When you want the current Codex chat to invoke a registered background-capable
+Gitmoot agent, route that request through the CLI:
+
+```text
+$gitmoot:gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
 ```
 
 Without the chat command bridge, ask Codex to run the same shell command:
 
 ```sh
-gitmoot agent ask planner --repo owner/repo "Write the implementation plan and goal file."
+gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot job watch <job-id>
 ```
 
-This keeps local chat asks on the same Gitmoot agent registry, repo access,
+This keeps background asks on the same Gitmoot agent registry, repo access,
 runtime adapter, cached preset, and job history path as PR-comment ask jobs.
 
 ## Use From Claude Code
@@ -919,14 +951,19 @@ Claude should use the bundled Gitmoot skill content as guidance, then call the
 local `gitmoot` CLI only when the user asks for setup, status, agent
 coordination, or PR-comment workflow help.
 
-For a registered-agent ask from Claude Code, use the same CLI command:
+For a registered background-agent ask from Claude Code, use the same CLI
+command:
 
 ```sh
-gitmoot agent ask planner --repo owner/repo "Write the implementation plan and goal file."
+gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot job watch <job-id>
 ```
 
 The plugin is discovery and guidance. The `gitmoot` CLI is still the execution
 path.
+
+For fast current-chat planning, ask Claude Code to use the Gitmoot planner here
+instead of starting a background `gitmoot agent ask` job.
 
 ## Troubleshooting
 
@@ -1668,8 +1705,11 @@ it on a real PR.
    ```sh
    /tmp/gitmoot-current goal template | grep "codex exec review is clean; ready for manual /review."
    /tmp/gitmoot-current preset list --home "$GITMOOT_SMOKE_HOME" | grep gitmoot-plan-and-goal
+   /tmp/gitmoot-current preset list --home "$GITMOOT_SMOKE_HOME" | grep gitmoot-plan-lite
    /tmp/gitmoot-current preset update --home "$GITMOOT_SMOKE_HOME" gitmoot-plan-and-goal
+   /tmp/gitmoot-current preset update --home "$GITMOOT_SMOKE_HOME" gitmoot-plan-lite
    /tmp/gitmoot-current preset show --home "$GITMOOT_SMOKE_HOME" gitmoot-plan-and-goal
+   /tmp/gitmoot-current preset show --home "$GITMOOT_SMOKE_HOME" gitmoot-plan-lite
    ```
 
 3. From the test repo checkout, start the planner agent.
@@ -1718,6 +1758,8 @@ Expected signals:
 - `goal template` prints the canonical PR-per-task prompt.
 - `preset show` displays `default role: planner`, `default capabilities: ask`,
   and `mutation: true`.
+- `preset show gitmoot-plan-lite` displays `default role: planner`,
+  `default capabilities: ask`, and `mutation: false`.
 - `agent doctor planner-smoke` succeeds.
 - `agent ask planner-smoke` prints `state: succeeded`, `agent: planner-smoke`,
   `action: ask`, and a planner summary.
@@ -1980,7 +2022,7 @@ exact-owner stale lock; use `--force` only when the stored owner is stale.
 
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, PR comments, daemon jobs, branch locks, presets, custom prompt agents, and Codex or Claude Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, jobs, branch locks, presets, custom prompt agents, and Codex or Claude Code runtime workflows.
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex or Claude Code.
 metadata:
@@ -1997,6 +2039,11 @@ background daemon checks, Codex or Claude Code agent startup, structured
 implementation plans, standard goal files, preset agents, custom prompt agents,
 job status, or branch lock inspection.
 
+For fast planning, "use the Gitmoot planner here" means read and apply the
+packaged `presets/gitmoot-plan-lite.md` instructions in this current chat. Do
+not route that request through a background `gitmoot agent ask` unless the user
+explicitly asks for background execution, PR-comment routing, or job tracking.
+
 ## Before Acting
 
 1. Check whether `gitmoot` is installed with `gitmoot version`.
@@ -2012,11 +2059,11 @@ job status, or branch lock inspection.
 Use `gitmoot status --repo owner/repo` for repo status, `gitmoot daemon status`
 for daemon state, `gitmoot agent list` for registered agents, and
 `gitmoot agent ask <agent> --repo owner/repo "..."` to invoke a registered
-Gitmoot agent from the current local chat. Use
-`gitmoot job list --repo owner/repo` for queued or recent jobs. Use
-`gitmoot plugin doctor` when checking whether Codex or Claude Code can discover
-Gitmoot through an installed runtime plugin. Use `gitmoot goal template` when
-writing a standard task-by-task goal file.
+Gitmoot agent from the current local chat. Add `--background` only when the user
+wants a queued background job. Use `gitmoot job list --repo owner/repo` for
+queued or recent jobs. Use `gitmoot plugin doctor` when checking whether Codex
+or Claude Code can discover Gitmoot through an installed runtime plugin. Use
+`gitmoot goal template` when writing a standard task-by-task goal file.
 
 The plugin is only the runtime discovery surface for this skill. Local agent
 invocation still goes through the `gitmoot` CLI and the same registered agent,
@@ -2050,6 +2097,93 @@ For detailed safety and lock rules, read [SAFETY.md](references/SAFETY.md).
 
 Reread this `SKILL.md`, then inspect `/gitmoot help`, `gitmoot status`, and the
 relevant job events before acting.
+
+---
+
+# Source: skills/gitmoot/presets/gitmoot-plan-and-goal.md
+
+# Gitmoot Plan And Goal Writer
+
+You are a Gitmoot planner agent. Your job is to turn feature requests into
+clean implementation plans and, when asked, write a standard Gitmoot goal file.
+
+## Planning Workflow
+
+1. Inspect the current repo state and relevant existing patterns before writing
+   the plan.
+2. Use web search when the request depends on current external APIs, CLI
+   contracts, docs, standards, package behavior, deployment behavior, or
+   best-practice claims. Prefer official or primary sources.
+3. Ask clarifying questions only for high-impact product decisions that cannot
+   be discovered from the repo or official sources.
+4. Write a decision-complete plan that another engineer or agent can implement
+   without guessing.
+5. Split the plan into tasks. Each task should have a clear scope, PR boundary,
+   acceptance criteria, tests/checks, and suggested commit message.
+6. Keep the plan clean and organized. Preserve existing behavior unless the
+   requested feature explicitly changes it. Avoid broad rewrites.
+7. Avoid code duplication. When repeated logic appears, call out the helper or
+   abstraction that should be reused or extracted.
+
+## Goal File Workflow
+
+When asked to write the goal file:
+
+1. Read the canonical standard template with:
+
+   ```sh
+   gitmoot goal template
+   ```
+
+2. Create a goal file named `GOAL-<short-slug>.md`.
+3. Fill the template with the approved plan.
+4. Ensure each implementation task uses a heading in this exact form:
+
+   ```markdown
+   ### Task N: Task Title
+   ```
+
+5. Return the exact prompt the user should run:
+
+   ```text
+   /goal GOAL-<short-slug>.md
+   ```
+
+Do not implement the planned feature unless the user explicitly asks after the
+plan and goal file are complete.
+
+---
+
+# Source: skills/gitmoot/presets/gitmoot-plan-lite.md
+
+# Gitmoot Plan Lite
+
+You are a Gitmoot planner for fast current-chat planning. Your job is to turn a
+feature request into a clean task-by-task implementation plan. Create a goal
+file only when the user explicitly asks for one after the plan.
+
+## Planning Workflow
+
+1. Inspect the current repo state and only the relevant files needed to plan.
+2. Use web search when the plan depends on current external APIs, CLI
+   contracts, docs, standards, package behavior, deployment behavior, or
+   best-practice claims. Prefer official or primary sources.
+3. Ask clarifying questions only for high-impact decisions that cannot be
+   discovered from the repo or official sources.
+4. Write a decision-complete plan that another engineer or agent can implement
+   without guessing.
+5. Split the plan into tasks. Each task should include scope, acceptance
+   criteria, tests/checks, and a suggested commit message.
+6. Preserve existing behavior unless the request explicitly changes it. Avoid
+   broad rewrites.
+7. Avoid code duplication. When repeated logic appears, call out the helper or
+   abstraction that should be reused or extracted.
+
+## Output
+
+Return the plan directly in the current chat. Keep it concise, but include
+enough detail for safe implementation. Do not start implementation, create a
+branch, open a PR, or write a goal file unless the user explicitly asks.
 
 ---
 
@@ -2152,7 +2286,7 @@ gitmoot agent doctor reviewer
 Ask a registered agent from the current local chat:
 
 ```sh
-gitmoot agent ask planner --repo owner/repo "Write the implementation plan and goal file."
+gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
 gitmoot agent ask planner --repo owner/repo --json "Return the plan status."
 ```
 
@@ -2174,7 +2308,7 @@ gitmoot agent start thermo-review \
   --start-daemon
 ```
 
-Install or refresh the built-in planner preset:
+Install or refresh the built-in full planner/goal preset:
 
 ```sh
 gitmoot preset update gitmoot-plan-and-goal
@@ -2185,6 +2319,23 @@ gitmoot agent start planner \
   --preset gitmoot-plan-and-goal \
   --start-daemon
 ```
+
+Install or refresh the lightweight planner preset when you want to run a
+planner as a registered background-capable agent:
+
+```sh
+gitmoot preset update gitmoot-plan-lite
+gitmoot agent start planner-lite \
+  --runtime codex \
+  --repo owner/repo \
+  --path . \
+  --preset gitmoot-plan-lite \
+  --start-daemon
+```
+
+For fast current-chat planning, use the Gitmoot skill with the packaged
+`presets/gitmoot-plan-lite.md` instructions instead of starting a background
+job. The CLI cannot control an already-running Codex or Claude chat.
 
 Create a local custom prompt preset:
 
@@ -2322,10 +2473,26 @@ Custom preset content is snapshotted into local Gitmoot state. After editing the
 source prompt file, run `gitmoot preset diff <id>` and `gitmoot preset update
 <id>` before expecting new jobs to use the changed prompt.
 
-## Planner And Goal File Agent
+## Planner Here
+
+Use the lightweight planner in the current Codex or Claude chat when the user
+wants a fast implementation plan and the current session already has the repo
+context. Read the packaged `presets/gitmoot-plan-lite.md` instructions, inspect
+only the relevant files, use web search only for current external contracts or
+best-practice claims, and return the plan directly in chat.
+
+```text
+Use the Gitmoot planner here. Write a task-by-task implementation plan for this feature.
+```
+
+If the user later asks for a standard goal file, read the canonical goal
+template and write the goal file then. Do not create the goal file during the
+lite planning pass unless explicitly requested.
+
+## Background Planner Agent
 
 Use the planner preset when the user wants a structured implementation plan or a
-standard Gitmoot goal file.
+standard Gitmoot goal file to run as a tracked Gitmoot background agent job.
 
 ```sh
 gitmoot preset update gitmoot-plan-and-goal
@@ -2344,16 +2511,19 @@ Ask from a PR comment:
 ```
 
 Ask directly from a local Codex or Claude Code chat by having the runtime call
-the Gitmoot CLI:
+the Gitmoot CLI when the user explicitly wants a registered background-capable
+agent path:
 
 ```sh
-gitmoot agent ask planner --repo owner/repo "Write a task-by-task implementation plan for this feature, then create the goal file prompt."
+gitmoot agent ask planner --repo owner/repo --background "Write a task-by-task implementation plan for this feature, then create the goal file prompt."
+gitmoot job watch <job-id>
 ```
 
 If the Codex plugin exposes a Gitmoot command bridge in chat, the equivalent
-form is `$gitmoot:gitmoot agent ask planner --repo owner/repo "..."`. The
-important part is that the request goes through `gitmoot agent ask`, not a
-separate skill-only planning path.
+form is `$gitmoot:gitmoot agent ask planner --repo owner/repo --background "..."`. The
+important part is that background planner work goes through `gitmoot agent ask`;
+fast "here" planning stays in the current chat and does not claim to control the
+current chat through a CLI command.
 
 If the planner writes a goal file and the user wants Gitmoot to track it, import
 it explicitly:

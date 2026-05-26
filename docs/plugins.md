@@ -91,20 +91,32 @@ The agent should read the bundled skill, verify `gitmoot version`, check
 `gh auth status` before PR workflows, and use read-only Gitmoot status commands
 before mutating daemon, agent, job, or lock state.
 
-When you want the current Codex chat to invoke a registered Gitmoot agent, route
-that request through the CLI:
+For fast planning in the current Codex chat, do not route through a background
+planner unless the user asks for a queued job. Ask Codex:
 
 ```text
-$gitmoot:gitmoot agent ask planner --repo owner/repo "Write the implementation plan and goal file."
+Use the Gitmoot planner here. Write the implementation plan.
+```
+
+Codex should apply the packaged `presets/gitmoot-plan-lite.md` instructions,
+inspect the relevant repo files, search only for current external contracts when
+needed, and return the plan directly in the current conversation.
+
+When you want the current Codex chat to invoke a registered background-capable
+Gitmoot agent, route that request through the CLI:
+
+```text
+$gitmoot:gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
 ```
 
 Without the chat command bridge, ask Codex to run the same shell command:
 
 ```sh
-gitmoot agent ask planner --repo owner/repo "Write the implementation plan and goal file."
+gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot job watch <job-id>
 ```
 
-This keeps local chat asks on the same Gitmoot agent registry, repo access,
+This keeps background asks on the same Gitmoot agent registry, repo access,
 runtime adapter, cached preset, and job history path as PR-comment ask jobs.
 
 ## Use From Claude Code
@@ -120,14 +132,19 @@ Claude should use the bundled Gitmoot skill content as guidance, then call the
 local `gitmoot` CLI only when the user asks for setup, status, agent
 coordination, or PR-comment workflow help.
 
-For a registered-agent ask from Claude Code, use the same CLI command:
+For a registered background-agent ask from Claude Code, use the same CLI
+command:
 
 ```sh
-gitmoot agent ask planner --repo owner/repo "Write the implementation plan and goal file."
+gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot job watch <job-id>
 ```
 
 The plugin is discovery and guidance. The `gitmoot` CLI is still the execution
 path.
+
+For fast current-chat planning, ask Claude Code to use the Gitmoot planner here
+instead of starting a background `gitmoot agent ask` job.
 
 ## Troubleshooting
 

@@ -87,11 +87,17 @@ gitmoot agent start planner \
   --start-daemon
 ```
 
-Ask the registered agent directly from a local shell or from a runtime chat that
-can call shell commands:
+For fast planning in the current Codex or Claude chat, ask the runtime:
+
+```text
+Use the Gitmoot planner here. Write the implementation plan.
+```
+
+Ask the registered background planner when you want a queued Gitmoot job:
 
 ```sh
-gitmoot agent ask planner --repo owner/repo "Write the implementation plan and goal file."
+gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot job watch <job-id>
 ```
 
 Route work through PR comments:

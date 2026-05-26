@@ -17,6 +17,11 @@ background daemon checks, Codex or Claude Code agent startup, structured
 implementation plans, standard goal files, preset agents, custom prompt agents,
 job status, or branch lock inspection.
 
+For fast planning, "use the Gitmoot planner here" means read and apply the
+packaged `presets/gitmoot-plan-lite.md` instructions in this current chat. Do
+not route that request through a background `gitmoot agent ask` unless the user
+explicitly asks for background execution, PR-comment routing, or job tracking.
+
 ## Before Acting
 
 1. Check whether `gitmoot` is installed with `gitmoot version`.
@@ -32,11 +37,11 @@ job status, or branch lock inspection.
 Use `gitmoot status --repo owner/repo` for repo status, `gitmoot daemon status`
 for daemon state, `gitmoot agent list` for registered agents, and
 `gitmoot agent ask <agent> --repo owner/repo "..."` to invoke a registered
-Gitmoot agent from the current local chat. Use
-`gitmoot job list --repo owner/repo` for queued or recent jobs. Use
-`gitmoot plugin doctor` when checking whether Codex or Claude Code can discover
-Gitmoot through an installed runtime plugin. Use `gitmoot goal template` when
-writing a standard task-by-task goal file.
+Gitmoot agent from the current local chat. Add `--background` only when the user
+wants a queued background job. Use `gitmoot job list --repo owner/repo` for
+queued or recent jobs. Use `gitmoot plugin doctor` when checking whether Codex
+or Claude Code can discover Gitmoot through an installed runtime plugin. Use
+`gitmoot goal template` when writing a standard task-by-task goal file.
 
 The plugin is only the runtime discovery surface for this skill. Local agent
 invocation still goes through the `gitmoot` CLI and the same registered agent,

@@ -42,6 +42,37 @@ func TestPresetUpdateInstallsThermoPreset(t *testing.T) {
 	}
 }
 
+func TestPresetUpdateInstallsLitePlannerPreset(t *testing.T) {
+	restore := replacePresetFetcher(fakePresetFetcher{
+		commit:  "fed789",
+		content: "Plan quickly.",
+	})
+	defer restore()
+	var stdout, stderr bytes.Buffer
+	home := t.TempDir()
+
+	code := Run([]string{"preset", "update", "--home", home, "gitmoot-plan-lite"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("preset update exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "updated gitmoot-plan-lite at fed789") {
+		t.Fatalf("stdout = %s", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"preset", "show", "--home", home, "gitmoot-plan-lite"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("preset show exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{"name: Gitmoot Plan Lite", "default role: planner", "default capabilities: ask", "mutation: false", "Plan quickly."} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("show output missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
 func TestPresetDiffDoesNotMutateCachedPreset(t *testing.T) {
 	restore := replacePresetFetcher(fakePresetFetcher{
 		commit:  "abc123",
@@ -92,7 +123,7 @@ func TestPresetListShowsAvailableBuiltin(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("preset list exit code = %d, stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "thermo-nuclear-code-quality-review") || !strings.Contains(stdout.String(), "gitmoot-plan-and-goal") || !strings.Contains(stdout.String(), "available") {
+	if !strings.Contains(stdout.String(), "thermo-nuclear-code-quality-review") || !strings.Contains(stdout.String(), "gitmoot-plan-and-goal") || !strings.Contains(stdout.String(), "gitmoot-plan-lite") || !strings.Contains(stdout.String(), "available") {
 		t.Fatalf("stdout = %s", stdout.String())
 	}
 }
