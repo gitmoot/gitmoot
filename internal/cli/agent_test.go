@@ -626,6 +626,473 @@ func TestRunAgentAskBackgroundJSON(t *testing.T) {
 	}
 }
 
+func TestRunAgentTypeSetListShowAndManagedBackgroundAsk(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	t.Chdir(repoDir)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "type", "set", "planner",
+		"--home", home,
+		"--runtime", "codex",
+		"--role", "planner",
+		"--max-background", "1",
+		"--idle-timeout", "20m",
+		"--job-timeout", "5m",
+		"--capability", "ask",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "configured agent type planner") {
+		t.Fatalf("agent type set output = %q", stdout.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "type", "list", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent type list exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "planner\tcodex\t\t1") {
+		t.Fatalf("agent type list output = %q", stdout.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "type", "show", "planner", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent type show exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "max_background: 1") || !strings.Contains(stdout.String(), "capabilities: ask") {
+		t.Fatalf("agent type show output = %q", stdout.String())
+	}
+
+	runner := &agentStartRunner{results: []subprocess.Result{
+		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440111"}` + "\n"},
+	}}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "ask", "planner", "First plan", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("managed background ask exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "state: queued") {
+		t.Fatalf("managed background ask output = %q", stdout.String())
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("runtime start calls = %+v, want one", runner.calls)
+	}
+	runner.want(t, 0, repoDir, "codex", "exec", "--json", "--")
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "ask", "planner", "Second plan", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("second managed background ask exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("runtime start calls after reuse = %+v, want one", runner.calls)
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	instances, err := store.ListAgentInstances(context.Background())
+	if err != nil {
+		t.Fatalf("ListAgentInstances returned error: %v", err)
+	}
+	if len(instances) != 1 || instances[0].Type != "planner" || instances[0].RuntimeRef != "550e8400-e29b-41d4-a716-446655440111" {
+		t.Fatalf("instances = %+v", instances)
+	}
+	config, err := (jobWorker{Store: store, ConfigHome: home}).managedJobConfig(context.Background(), instances[0].Name)
+	if err != nil {
+		t.Fatalf("managedJobConfig returned error: %v", err)
+	}
+	if !config.OK || config.JobTimeout != 5*time.Minute || config.IdleTimeout != 20*time.Minute {
+		t.Fatalf("managedJobConfig = %+v; want 5m job and 20m idle", config)
+	}
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	if len(jobs) != 2 || jobs[0].Agent != instances[0].Name || jobs[1].Agent != instances[0].Name {
+		t.Fatalf("jobs = %+v, instance = %+v", jobs, instances[0])
+	}
+}
+
+func TestRunAgentTypeSetRejectsNonStartableRuntime(t *testing.T) {
+	home := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	code := Run([]string{
+		"agent", "type", "set", "shell-planner",
+		"--home", home,
+		"--runtime", "shell",
+	}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("agent type set shell exit code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "managed agent types support codex or claude") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestRunAgentTypeSetMaxBackgroundCreatesSecondBusyInstance(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	t.Chdir(repoDir)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "type", "set", "planner",
+		"--home", home,
+		"--runtime", "codex",
+		"--max-background", "2",
+		"--capability", "ask",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
+	}
+	runner := &agentStartRunner{results: []subprocess.Result{
+		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440121"}` + "\n"},
+		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440122"}` + "\n"},
+	}}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	for _, prompt := range []string{"First", "Second"} {
+		stdout.Reset()
+		stderr.Reset()
+		code = Run([]string{"agent", "ask", "planner", prompt, "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("managed background ask %q exit code = %d, stderr=%s", prompt, code, stderr.String())
+		}
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("runtime start calls = %+v, want two", runner.calls)
+	}
+}
+
+func TestRunAgentTypeSetMaxBackgroundCapsAcrossRepos(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	otherRepoDir := t.TempDir()
+	runGit(t, otherRepoDir, "init")
+	runGit(t, otherRepoDir, "branch", "-m", "main")
+	runGit(t, otherRepoDir, "remote", "add", "origin", "https://github.com/owner/other.git")
+	t.Chdir(repoDir)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"repo", "add", "owner/other", "--home", home, "--path", otherRepoDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("repo add exit code = %d, stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"agent", "type", "set", "planner",
+		"--home", home,
+		"--runtime", "codex",
+		"--max-background", "1",
+		"--capability", "ask",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
+	}
+	runner := &agentStartRunner{results: []subprocess.Result{
+		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440123"}` + "\n"},
+	}}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "ask", "planner", "First", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("first managed background ask exit code = %d, stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "ask", "planner", "Second", "--home", home, "--repo", "owner/other", "--background"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("second repo managed background ask exit code = %d, want 1; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "reached max_background") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("runtime start calls = %+v, want one", runner.calls)
+	}
+}
+
+func TestRunAgentTypeSetMaxBackgroundUsesOnlyActiveFallback(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	t.Chdir(repoDir)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "type", "set", "planner",
+		"--home", home,
+		"--runtime", "codex",
+		"--max-background", "1",
+		"--capability", "ask",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	now := time.Now().UTC()
+	store := openCLIJobStore(t, home)
+	if err := store.UpsertAgentInstance(context.Background(), db.AgentInstance{
+		Name:         "planner-bg-expired",
+		Type:         "planner",
+		Runtime:      "codex",
+		RuntimeRef:   "550e8400-e29b-41d4-a716-446655440131",
+		RepoFullName: "owner/repo",
+		Role:         "planner",
+		Capabilities: []string{"ask"},
+		State:        "idle",
+		CreatedAt:    now.Add(-time.Hour).Format(time.RFC3339Nano),
+		LastUsedAt:   now.Add(-time.Hour).Format(time.RFC3339Nano),
+		ExpiresAt:    now.Add(-time.Minute).Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatalf("UpsertAgentInstance expired returned error: %v", err)
+	}
+	if err := store.UpsertAgentInstance(context.Background(), db.AgentInstance{
+		Name:         "planner-bg-active",
+		Type:         "planner",
+		Runtime:      "codex",
+		RuntimeRef:   "550e8400-e29b-41d4-a716-446655440132",
+		RepoFullName: "owner/repo",
+		Role:         "planner",
+		Capabilities: []string{"ask"},
+		State:        "idle",
+		CreatedAt:    now.Format(time.RFC3339Nano),
+		LastUsedAt:   now.Format(time.RFC3339Nano),
+		ExpiresAt:    now.Add(time.Hour).Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatalf("UpsertAgentInstance active returned error: %v", err)
+	}
+	if err := store.CreateJob(context.Background(), db.Job{ID: "queued-for-active", Agent: "planner-bg-active", Type: "ask", State: "queued", Payload: "{}"}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	store.Close()
+
+	runner := &agentStartRunner{}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "ask", "planner", "Third", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("managed background ask exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("runtime start calls = %+v, want none", runner.calls)
+	}
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	activeJobs := 0
+	expiredJobs := 0
+	for _, job := range jobs {
+		if job.Agent == "planner-bg-active" {
+			activeJobs++
+		}
+		if job.Agent == "planner-bg-expired" {
+			expiredJobs++
+		}
+	}
+	if len(jobs) != 2 || activeJobs != 2 || expiredJobs != 0 {
+		t.Fatalf("jobs = %+v, want all jobs assigned to active instance", jobs)
+	}
+}
+
+func TestRunAgentTypeSetMaxBackgroundCountsQueuedExpiredInstance(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	t.Chdir(repoDir)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "type", "set", "planner",
+		"--home", home,
+		"--runtime", "codex",
+		"--max-background", "1",
+		"--capability", "ask",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	now := time.Now().UTC()
+	store := openCLIJobStore(t, home)
+	if err := store.UpsertAgentInstance(context.Background(), db.AgentInstance{
+		Name:         "planner-bg-expired",
+		Type:         "planner",
+		Runtime:      "codex",
+		RuntimeRef:   "550e8400-e29b-41d4-a716-446655440141",
+		RepoFullName: "owner/repo",
+		Role:         "planner",
+		Capabilities: []string{"ask"},
+		State:        "idle",
+		CreatedAt:    now.Add(-time.Hour).Format(time.RFC3339Nano),
+		LastUsedAt:   now.Add(-time.Hour).Format(time.RFC3339Nano),
+		ExpiresAt:    now.Add(-time.Minute).Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatalf("UpsertAgentInstance returned error: %v", err)
+	}
+	if err := store.CreateJob(context.Background(), db.Job{ID: "queued-for-expired", Agent: "planner-bg-expired", Type: "ask", State: "queued", Payload: "{}"}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	store.Close()
+
+	runner := &agentStartRunner{}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "ask", "planner", "Second", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("managed background ask exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("runtime start calls = %+v, want none", runner.calls)
+	}
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	expiredJobs := 0
+	for _, job := range jobs {
+		if job.Agent == "planner-bg-expired" {
+			expiredJobs++
+		}
+	}
+	if len(jobs) != 2 || expiredJobs != 2 {
+		t.Fatalf("jobs = %+v, want queued expired instance to retain max slot", jobs)
+	}
+}
+
+func TestRunAgentTypeSetValidatesPreset(t *testing.T) {
+	home := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	code := Run([]string{
+		"agent", "type", "set", "planner",
+		"--home", home,
+		"--runtime", "codex",
+		"--preset", "missing-preset",
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("agent type set missing preset exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "preset missing-preset is not installed") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestRunAgentTypeSetRejectsConfigUnsafeName(t *testing.T) {
+	home := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	code := Run([]string{
+		"agent", "type", "set", "bad#name",
+		"--home", home,
+		"--runtime", "codex",
+	}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("agent type set unsafe name exit code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "invalid agent type") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestRunAgentTypeSetRejectsNonPositiveTimeouts(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		flag string
+		want string
+	}{
+		{name: "idle", flag: "--idle-timeout", want: "idle timeout must be positive"},
+		{name: "job", flag: "--job-timeout", want: "job timeout must be positive"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			var stdout, stderr bytes.Buffer
+
+			code := Run([]string{
+				"agent", "type", "set", "planner",
+				"--home", home,
+				"--runtime", "codex",
+				tc.flag, "0s",
+			}, &stdout, &stderr)
+			if code != 2 {
+				t.Fatalf("agent type set exit code = %d, want 2", code)
+			}
+			if !strings.Contains(stderr.String(), tc.want) {
+				t.Fatalf("stderr = %q, want %q", stderr.String(), tc.want)
+			}
+		})
+	}
+}
+
+func TestRunAgentGCRemovesExpiredManagedInstances(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	now := time.Now().UTC().Add(-time.Hour)
+	if err := store.UpsertAgentInstance(context.Background(), db.AgentInstance{
+		Name:         "planner-bg-expired",
+		Type:         "planner",
+		Runtime:      "codex",
+		RuntimeRef:   "550e8400-e29b-41d4-a716-446655440112",
+		RepoFullName: "owner/repo",
+		Role:         "planner",
+		Capabilities: []string{"ask"},
+		State:        "idle",
+		CreatedAt:    now.Format(time.RFC3339Nano),
+		LastUsedAt:   now.Format(time.RFC3339Nano),
+		ExpiresAt:    now.Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatalf("UpsertAgentInstance returned error: %v", err)
+	}
+	store.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"agent", "gc", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent gc exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "removed 1 expired agent instances") {
+		t.Fatalf("agent gc output = %q", stdout.String())
+	}
+}
+
 func TestRunAgentAskValidatesInputAndAccess(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()

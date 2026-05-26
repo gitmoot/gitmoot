@@ -10,10 +10,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
 	gitutil "github.com/jerryfane/gitmoot/internal/git"
 	"github.com/jerryfane/gitmoot/internal/github"
+	"github.com/jerryfane/gitmoot/internal/runtime"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
@@ -23,6 +25,8 @@ type localAgentDispatchRequest struct {
 	Action       string
 	Instructions string
 	Background   bool
+	Type         string
+	Home         string
 }
 
 type localAgentJobOutput struct {
@@ -45,13 +49,13 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err := store.UpsertRepo(ctx, record); err != nil {
 		return localAgentJobOutput{}, err
 	}
-	agent, err := store.GetAgent(ctx, request.Agent)
+	agent, releaseAgentReservation, err := resolveLocalDispatchAgent(ctx, store, request, repo.FullName(), record)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return localAgentJobOutput{}, fmt.Errorf("agent %q not found", request.Agent)
-		}
 		return localAgentJobOutput{}, err
 	}
+	defer func() {
+		_ = releaseAgentReservation(context.Background())
+	}()
 	if err := ensureLocalAgentAccess(ctx, store, agent, repo.FullName(), request.Action); err != nil {
 		return localAgentJobOutput{}, err
 	}
@@ -121,6 +125,179 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		Result:         payload.Result,
 		RawOutputCount: len(payload.RawOutputs),
 	}, nil
+}
+
+func resolveLocalDispatchAgent(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string, record db.Repo) (db.Agent, func(context.Context) error, error) {
+	forceType := strings.TrimSpace(request.Type)
+	if forceType == "" {
+		agent, err := store.GetAgent(ctx, request.Agent)
+		if err == nil {
+			return agent, noopAgentReservationRelease, nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return db.Agent{}, noopAgentReservationRelease, err
+		}
+	}
+	if !request.Background {
+		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("agent %q not found", request.Agent)
+	}
+	typeName := firstNonEmpty(forceType, request.Agent)
+	return ensureManagedAgentInstance(ctx, store, request.Home, typeName, repo, record)
+}
+
+func noopAgentReservationRelease(context.Context) error {
+	return nil
+}
+
+func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home string, typeName string, repo string, record db.Repo) (db.Agent, func(context.Context) error, error) {
+	types, err := loadAgentTypeConfig(home)
+	if err != nil {
+		return db.Agent{}, noopAgentReservationRelease, err
+	}
+	agentType, ok := types[typeName]
+	if !ok {
+		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("agent %q not found", typeName)
+	}
+	idleTimeout, err := time.ParseDuration(agentType.IdleTimeout)
+	if err != nil {
+		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("agent type %s idle_timeout: %w", typeName, err)
+	}
+	now := time.Now().UTC()
+	releaseTypeLock, acquiredTypeLock, typeLockKey, err := acquireManagedAgentTypeLock(ctx, store, typeName, now, daemonRunningJobStaleAfter)
+	if err != nil {
+		return db.Agent{}, noopAgentReservationRelease, err
+	}
+	if !acquiredTypeLock {
+		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("managed agent type %s is busy reserving %s", typeName, typeLockKey)
+	}
+	releaseOnError := true
+	defer func() {
+		if releaseOnError {
+			_ = releaseTypeLock(context.Background())
+		}
+	}()
+	if instance, ok, err := store.FindReusableAgentInstance(ctx, typeName, repo, now); err != nil {
+		return db.Agent{}, noopAgentReservationRelease, err
+	} else if ok {
+		if err := store.TouchAgentInstance(ctx, instance.Name, now, idleTimeout); err != nil {
+			return db.Agent{}, noopAgentReservationRelease, err
+		}
+		agent, err := store.GetAgent(ctx, instance.Name)
+		if err != nil {
+			return db.Agent{}, noopAgentReservationRelease, err
+		}
+		releaseOnError = false
+		return agent, releaseTypeLock, nil
+	}
+	count, err := store.CountActiveAgentInstances(ctx, typeName, now)
+	if err != nil {
+		return db.Agent{}, noopAgentReservationRelease, err
+	}
+	if count >= agentType.MaxBackground {
+		instance, ok, err := store.FindActiveAgentInstance(ctx, typeName, repo, now)
+		if err != nil {
+			return db.Agent{}, noopAgentReservationRelease, err
+		}
+		if ok {
+			agent, err := store.GetAgent(ctx, instance.Name)
+			if err != nil {
+				return db.Agent{}, noopAgentReservationRelease, err
+			}
+			releaseOnError = false
+			return agent, releaseTypeLock, nil
+		}
+		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("managed agent type %s reached max_background but no active instance is available", typeName)
+	}
+	instanceAgent := runtimeAgentFromType(agentType, repo, managedAgentInstanceName(typeName))
+	var cachedPreset db.Preset
+	if instanceAgent.PresetID != "" {
+		var err error
+		cachedPreset, err = store.GetPreset(ctx, instanceAgent.PresetID)
+		if err != nil {
+			return db.Agent{}, noopAgentReservationRelease, err
+		}
+	}
+	adapter, err := runtimeStartAdapter(newRuntimeFactory(), instanceAgent.Runtime, record.CheckoutPath)
+	if err != nil {
+		return db.Agent{}, noopAgentReservationRelease, err
+	}
+	started, err := adapter.Start(ctx, runtime.StartRequest{Agent: instanceAgent, Prompt: agentStartupPrompt(instanceAgent, cachedPreset)})
+	if err != nil {
+		return db.Agent{}, noopAgentReservationRelease, err
+	}
+	instanceAgent.RuntimeRef = strings.TrimSpace(started.RuntimeRef)
+	if err := runtime.ValidateAgent(instanceAgent); err != nil {
+		return db.Agent{}, noopAgentReservationRelease, err
+	}
+	instance := db.AgentInstance{
+		Name:         instanceAgent.Name,
+		Type:         agentType.Name,
+		Runtime:      instanceAgent.Runtime,
+		RuntimeRef:   instanceAgent.RuntimeRef,
+		RepoFullName: repo,
+		Role:         instanceAgent.Role,
+		PresetID:     instanceAgent.PresetID,
+		Capabilities: instanceAgent.Capabilities,
+		State:        "idle",
+		CreatedAt:    formatManagedAgentTime(now),
+		LastUsedAt:   formatManagedAgentTime(now),
+		ExpiresAt:    formatManagedAgentTime(now.Add(idleTimeout)),
+	}
+	if err := store.UpsertAgentInstance(ctx, instance); err != nil {
+		return db.Agent{}, noopAgentReservationRelease, err
+	}
+	agent, err := store.GetAgent(ctx, instance.Name)
+	if err != nil {
+		return db.Agent{}, noopAgentReservationRelease, err
+	}
+	releaseOnError = false
+	return agent, releaseTypeLock, nil
+}
+
+func acquireManagedAgentTypeLock(ctx context.Context, store *db.Store, typeName string, now time.Time, ttl time.Duration) (func(context.Context) error, bool, string, error) {
+	if ttl <= 0 {
+		return nil, false, "", fmt.Errorf("managed agent type lock ttl must be positive")
+	}
+	key := "agent-type:" + typeName
+	ownerToken, err := newRuntimeLockOwnerToken()
+	if err != nil {
+		return nil, false, key, err
+	}
+	owner := "agent-type:" + typeName
+	acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+		ResourceKey: key,
+		OwnerJobID:  owner,
+		OwnerToken:  ownerToken,
+		ExpiresAt:   now.UTC().Add(ttl).Format(time.RFC3339Nano),
+	}, now)
+	if err != nil || !acquired {
+		return func(context.Context) error { return nil }, acquired, key, err
+	}
+	return func(releaseCtx context.Context) error {
+		_, err := store.ReleaseResourceLock(releaseCtx, key, owner, ownerToken)
+		return err
+	}, true, key, nil
+}
+
+func runtimeAgentFromType(agentType config.AgentType, repo string, name string) runtime.Agent {
+	return runtime.Agent{
+		Name:           name,
+		Role:           agentType.Role,
+		Runtime:        agentType.Runtime,
+		RepoScope:      repo,
+		PresetID:       agentType.Preset,
+		Capabilities:   agentType.Capabilities,
+		AutonomyPolicy: "auto",
+		HealthStatus:   "idle",
+	}
+}
+
+func managedAgentInstanceName(typeName string) string {
+	return fmt.Sprintf("%s-bg-%x", typeName, time.Now().UTC().UnixNano())
+}
+
+func formatManagedAgentTime(value time.Time) string {
+	return value.UTC().Format("2006-01-02T15:04:05.000000000Z")
 }
 
 func resolveLocalAgentRepo(ctx context.Context, store *db.Store, repoFlag string) (github.Repository, db.Repo, error) {

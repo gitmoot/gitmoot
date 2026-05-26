@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -192,7 +193,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 			},
 		}
 		fmt.Fprintf(stdout, "watching %s every %s\n", repo.FullName(), poll.String())
-		return runSingleRepoSupervisor(ctx, daemon.Daemon{
+		return runSingleRepoSupervisor(ctx, *home, daemon.Daemon{
 			Repo:         repo,
 			PollInterval: *poll,
 			Store:        store,
@@ -783,7 +784,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 			ErrorStreak: map[string]int{},
 		}
 		poller := defaultRegisteredRepoPoller(store, workers, dryRun, stdout)
-		worker := defaultJobWorker(store, stdout)
+		worker := defaultJobWorker(store, stdout, home)
 		worker.CommenterFactory = worker.defaultCommenter
 		checkoutLocks := &repoCheckoutLocks{}
 		poller.CheckoutLocks = checkoutLocks
@@ -823,7 +824,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 	})
 }
 
-func runSingleRepoSupervisor(ctx context.Context, d daemon.Daemon, store *db.Store, workers int, stdout io.Writer) error {
+func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, store *db.Store, workers int, stdout io.Writer) error {
 	if err := recoverExpiredRuntimeSessionLocks(ctx, store, stdout, time.Now().UTC()); err != nil {
 		return err
 	}
@@ -837,7 +838,7 @@ func runSingleRepoSupervisor(ctx context.Context, d daemon.Daemon, store *db.Sto
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
-	worker := defaultJobWorker(store, stdout)
+	worker := defaultJobWorker(store, stdout, home)
 	worker.CommenterFactory = worker.defaultCommenter
 	var checkoutLock sync.Mutex
 	workerErr := startSupervisorWorkerLoop(ctx, daemonWorkerLoopInterval, func(now time.Time) error {
@@ -1102,6 +1103,7 @@ func shorterWait(current time.Duration, candidate time.Duration, set *bool) time
 type jobWorker struct {
 	Store             *db.Store
 	Stdout            io.Writer
+	ConfigHome        string
 	AdapterFactory    func(runtime.Agent, string) (workflow.DeliveryAdapter, error)
 	CheckoutValidator func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error)
 	WorkflowFactory   func(string) workflow.Engine
@@ -1114,8 +1116,12 @@ const daemonWorkerLoopInterval = 1 * time.Second
 
 var errRuntimeSessionBusy = errors.New("runtime session is busy")
 
-func defaultJobWorker(store *db.Store, stdout io.Writer) jobWorker {
-	worker := jobWorker{Store: store, Stdout: stdout}
+func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWorker {
+	configHome := ""
+	if len(home) > 0 {
+		configHome = home[0]
+	}
+	worker := jobWorker{Store: store, Stdout: stdout, ConfigHome: configHome}
 	worker.AdapterFactory = worker.defaultAdapter
 	worker.CheckoutValidator = worker.defaultCheckout
 	worker.WorkflowFactory = worker.defaultWorkflow
@@ -1446,7 +1452,19 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
 	}
-	releaseLock, acquired, lockKey, err := acquireRuntimeSessionLock(ctx, w.Store, job.ID, agent, time.Now().UTC(), daemonRunningJobStaleAfter)
+	managed, err := w.managedJobConfig(ctx, agent.Name)
+	if err != nil {
+		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
+		return nil
+	}
+	lockTTL := daemonRunningJobStaleAfter
+	if managed.OK {
+		lockTTL = managed.JobTimeout
+	}
+	releaseLock, acquired, lockKey, err := acquireRuntimeSessionLock(ctx, w.Store, job.ID, agent, time.Now().UTC(), lockTTL)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -1467,10 +1485,29 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			writeLine(w.Stdout, "job %s runtime lock release failed: %v", job.ID, err)
 		}
 	}()
+	if managed.OK {
+		if err := w.Store.MarkAgentInstanceRunning(ctx, agent.Name, time.Now().UTC(), managed.JobTimeout); err != nil {
+			if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+				return finishErr
+			}
+			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
+			return nil
+		}
+		defer func() {
+			if err := w.Store.TouchAgentInstance(context.Background(), agent.Name, time.Now().UTC(), managed.IdleTimeout); err != nil {
+				writeLine(w.Stdout, "job %s managed agent state update failed: %v", job.ID, err)
+			}
+		}()
+	}
 	writeLine(w.Stdout, "running job %s for %s in %s", job.ID, agent.Name, payload.Repo)
 	engine := w.WorkflowFactory(checkout)
 	runCtx, stopRun := w.runningJobContext(ctx, job.ID)
 	defer stopRun()
+	if managed.OK {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(runCtx, managed.JobTimeout)
+		defer cancel()
+	}
 	_, err = engine.RunJob(runCtx, job.ID, agent, adapter)
 	if err != nil {
 		if markErr := w.handleRunJobError(ctx, job.ID, err); markErr != nil {
@@ -1483,6 +1520,45 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	_ = w.postJobResultComment(ctx, job.ID, agent, checkout, nil)
 	writeLine(w.Stdout, "job %s completed", job.ID)
 	return nil
+}
+
+type managedJobRuntimeConfig struct {
+	OK          bool
+	JobTimeout  time.Duration
+	IdleTimeout time.Duration
+}
+
+func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (managedJobRuntimeConfig, error) {
+	instance, err := w.Store.GetAgentInstance(ctx, agentName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return managedJobRuntimeConfig{}, nil
+	}
+	if err != nil {
+		return managedJobRuntimeConfig{}, err
+	}
+	types, err := loadAgentTypeConfig(w.ConfigHome)
+	if err != nil {
+		return managedJobRuntimeConfig{}, err
+	}
+	agentType, ok := types[instance.Type]
+	if !ok {
+		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %q not found for managed instance %s", instance.Type, agentName)
+	}
+	jobTimeout, err := time.ParseDuration(agentType.JobTimeout)
+	if err != nil {
+		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %s job_timeout: %w", instance.Type, err)
+	}
+	if jobTimeout <= 0 {
+		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %s job_timeout must be positive", instance.Type)
+	}
+	idleTimeout, err := time.ParseDuration(agentType.IdleTimeout)
+	if err != nil {
+		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %s idle_timeout: %w", instance.Type, err)
+	}
+	if idleTimeout <= 0 {
+		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %s idle_timeout must be positive", instance.Type)
+	}
+	return managedJobRuntimeConfig{OK: true, JobTimeout: jobTimeout, IdleTimeout: idleTimeout}, nil
 }
 
 func (w jobWorker) runningJobContext(ctx context.Context, jobID string) (context.Context, func()) {
