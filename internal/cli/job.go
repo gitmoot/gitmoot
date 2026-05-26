@@ -10,6 +10,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/workflow"
@@ -27,6 +28,8 @@ func runJob(args []string, stdout, stderr io.Writer) int {
 		return runJobShow(args[1:], stdout, stderr)
 	case "events":
 		return runJobEvents(args[1:], stdout, stderr)
+	case "watch":
+		return runJobWatch(args[1:], stdout, stderr)
 	case "run":
 		return runJobRun(args[1:], stdout, stderr)
 	case "retry":
@@ -45,6 +48,7 @@ func printJobUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot job list [--repo owner/repo] [--state state]")
 	fmt.Fprintln(w, "  gitmoot job show <id>")
 	fmt.Fprintln(w, "  gitmoot job events <id>")
+	fmt.Fprintln(w, "  gitmoot job watch <id> [--poll 1s] [--json]")
 	fmt.Fprintln(w, "  gitmoot job run <id>")
 	fmt.Fprintln(w, "  gitmoot job retry <id>")
 	fmt.Fprintln(w, "  gitmoot job cancel <id>")
@@ -122,6 +126,68 @@ func runJobEvents(args []string, stdout, stderr io.Writer) int {
 	for _, event := range events {
 		fmt.Fprintf(stdout, "%s\t%s\n", event.Kind, event.Message)
 	}
+	return 0
+}
+
+type jobWatchOutput struct {
+	Job    db.Job        `json:"job"`
+	Events []db.JobEvent `json:"events"`
+}
+
+func runJobWatch(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("job watch", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	poll := fs.Duration("poll", time.Second, "poll interval")
+	jsonOutput := fs.Bool("json", false, "print final job and events as JSON")
+	jobID, ok := parseSingleJobID(fs, args, stderr, "job watch")
+	if !ok {
+		return parseSingleJobIDExitCode(args)
+	}
+	if *poll <= 0 {
+		fmt.Fprintln(stderr, "job watch poll interval must be positive")
+		return 2
+	}
+	var output jobWatchOutput
+	if err := withStore(*home, func(store *db.Store) error {
+		nextEvent := 0
+		for {
+			job, err := store.GetJob(context.Background(), jobID)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return fmt.Errorf("job %q not found", jobID)
+				}
+				return err
+			}
+			events, err := store.ListJobEvents(context.Background(), jobID)
+			if err != nil {
+				return err
+			}
+			if !*jsonOutput {
+				for nextEvent < len(events) {
+					event := events[nextEvent]
+					fmt.Fprintf(stdout, "%s\t%s\n", event.Kind, event.Message)
+					nextEvent++
+				}
+			}
+			if jobStateIsTerminal(job.State) {
+				output = jobWatchOutput{Job: job, Events: events}
+				return nil
+			}
+			time.Sleep(*poll)
+		}
+	}); err != nil {
+		fmt.Fprintf(stderr, "job watch: %v\n", err)
+		return 1
+	}
+	if *jsonOutput {
+		if err := writeJSON(stdout, output); err != nil {
+			fmt.Fprintf(stderr, "job watch: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	fmt.Fprintf(stdout, "state: %s\n", output.Job.State)
 	return 0
 }
 
@@ -224,6 +290,15 @@ func parseSingleJobIDExitCode(args []string) int {
 		return 0
 	}
 	return 2
+}
+
+func jobStateIsTerminal(state string) bool {
+	switch state {
+	case string(workflow.JobSucceeded), string(workflow.JobFailed), string(workflow.JobBlocked), string(workflow.JobCancelled):
+		return true
+	default:
+		return false
+	}
 }
 
 func filterJobs(jobs []db.Job, repoFilter string, stateFilter string) []db.Job {

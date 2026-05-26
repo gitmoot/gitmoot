@@ -524,6 +524,108 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 	}
 }
 
+func TestRunAgentAskBackgroundQueuesWithoutRuntimeDelivery(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	t.Chdir(repoDir)
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"agent", "subscribe", "planner",
+		"--home", home,
+		"--runtime", "codex",
+		"--session", "550e8400-e29b-41d4-a716-446655440022",
+		"--role", "planner",
+		"--repo", "owner/repo",
+		"--capability", "ask",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("subscribe exit code = %d, stderr=%s", code, stderr.String())
+	}
+	runner := &agentStartRunner{}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{"agent", "ask", "planner", "Write a plan", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("background ask exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{
+		"job: local-ask-planner-",
+		"state: queued",
+		"repo: owner/repo",
+		"agent: planner",
+		"action: ask",
+		"next: gitmoot job watch local-ask-planner-",
+		"queued: daemon is not running",
+		"process: gitmoot daemon start",
+		"or: gitmoot job run local-ask-planner-",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("background ask output missing %q:\n%s", want, stdout.String())
+		}
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("runtime calls = %+v, want none", runner.calls)
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].State != string(workflow.JobQueued) {
+		t.Fatalf("jobs = %+v, want one queued job", jobs)
+	}
+	payload, err := daemonJobPayload(jobs[0])
+	if err != nil {
+		t.Fatalf("daemonJobPayload returned error: %v", err)
+	}
+	if payload.Instructions != "Write a plan" || payload.Result != nil || len(payload.RawOutputs) != 0 {
+		t.Fatalf("background payload = %+v", payload)
+	}
+}
+
+func TestRunAgentAskBackgroundJSON(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	t.Chdir(repoDir)
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"agent", "subscribe", "planner",
+		"--home", home,
+		"--runtime", "codex",
+		"--session", "550e8400-e29b-41d4-a716-446655440023",
+		"--role", "planner",
+		"--repo", "owner/repo",
+		"--capability", "ask",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("subscribe exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{"agent", "ask", "planner", "Write JSON", "--home", home, "--repo", "owner/repo", "--background", "--json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("background ask --json exit code = %d, stderr=%s", code, stderr.String())
+	}
+	var decoded localAgentJobOutput
+	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
+		t.Fatalf("json output did not decode: %v\n%s", err, stdout.String())
+	}
+	if decoded.State != string(workflow.JobQueued) || decoded.Repo != "owner/repo" || decoded.Result != nil || decoded.WatchCommand == "" || decoded.DaemonRunning {
+		t.Fatalf("decoded background output = %+v", decoded)
+	}
+}
+
 func TestRunAgentAskValidatesInputAndAccess(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()

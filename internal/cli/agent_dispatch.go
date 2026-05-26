@@ -22,6 +22,7 @@ type localAgentDispatchRequest struct {
 	Agent        string
 	Action       string
 	Instructions string
+	Background   bool
 }
 
 type localAgentJobOutput struct {
@@ -32,6 +33,8 @@ type localAgentJobOutput struct {
 	Action         string                `json:"action"`
 	Result         *workflow.AgentResult `json:"result,omitempty"`
 	RawOutputCount int                   `json:"raw_output_count"`
+	WatchCommand   string                `json:"watch_command,omitempty"`
+	DaemonRunning  bool                  `json:"daemon_running,omitempty"`
 }
 
 func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAgentDispatchRequest) (localAgentJobOutput, error) {
@@ -52,10 +55,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err := ensureLocalAgentAccess(ctx, store, agent, repo.FullName(), request.Action); err != nil {
 		return localAgentJobOutput{}, err
 	}
-	adapter, err := runtimeStartAdapter(newRuntimeFactory(), agent.Runtime, record.CheckoutPath)
-	if err != nil {
-		return localAgentJobOutput{}, err
-	}
 	job, err := (workflow.Mailbox{Store: store}).Enqueue(ctx, workflow.JobRequest{
 		ID:           localAgentJobID(request.Action, agent.Name),
 		Agent:        agent.Name,
@@ -65,6 +64,20 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		Sender:       "local",
 		Instructions: request.Instructions,
 	})
+	if err != nil {
+		return localAgentJobOutput{}, err
+	}
+	if request.Background {
+		return localAgentJobOutput{
+			JobID:          job.ID,
+			State:          job.State,
+			Repo:           repo.FullName(),
+			Agent:          job.Agent,
+			Action:         job.Type,
+			RawOutputCount: 0,
+		}, nil
+	}
+	adapter, err := runtimeStartAdapter(newRuntimeFactory(), agent.Runtime, record.CheckoutPath)
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
@@ -178,6 +191,9 @@ func printLocalAgentJobOutput(stdout io.Writer, output localAgentJobOutput) {
 	writeLine(stdout, "repo: %s", output.Repo)
 	writeLine(stdout, "agent: %s", output.Agent)
 	writeLine(stdout, "action: %s", output.Action)
+	if output.WatchCommand != "" {
+		writeLine(stdout, "next: %s", output.WatchCommand)
+	}
 	if output.Result == nil {
 		return
 	}
