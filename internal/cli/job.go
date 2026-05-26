@@ -208,7 +208,7 @@ func runJobRun(args []string, stdout, stderr io.Writer) int {
 		if job.State != string(workflow.JobQueued) {
 			return fmt.Errorf("job %s is %s; run requires queued", job.ID, job.State)
 		}
-		worker := defaultJobWorker(store, stdout)
+		worker := defaultJobWorker(store, stdout, *home)
 		worker.CommenterFactory = worker.defaultCommenter
 		if err := worker.run(context.Background(), job); err != nil {
 			return err

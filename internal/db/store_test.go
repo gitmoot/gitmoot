@@ -225,6 +225,121 @@ func TestResourceLockDoesNotRecoverExpiredRunningOwner(t *testing.T) {
 	}
 }
 
+func TestAgentInstanceMethods(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC)
+	instance := AgentInstance{
+		Name:         "planner-bg-1",
+		Type:         "planner",
+		Runtime:      "codex",
+		RuntimeRef:   "550e8400-e29b-41d4-a716-446655440101",
+		RepoFullName: "owner/repo",
+		Role:         "planner",
+		Capabilities: []string{"ask"},
+		State:        "idle",
+		CreatedAt:    formatResourceLockTime(now),
+		LastUsedAt:   formatResourceLockTime(now),
+		ExpiresAt:    formatResourceLockTime(now.Add(time.Minute)),
+	}
+	if err := store.UpsertAgentInstance(ctx, instance); err != nil {
+		t.Fatalf("UpsertAgentInstance returned error: %v", err)
+	}
+	agent, err := store.GetAgent(ctx, instance.Name)
+	if err != nil {
+		t.Fatalf("GetAgent fallback returned error: %v", err)
+	}
+	if agent.Name != instance.Name || agent.RuntimeRef != instance.RuntimeRef || strings.Join(agent.Capabilities, ",") != "ask" {
+		t.Fatalf("fallback agent = %+v", agent)
+	}
+	allowed, err := store.AgentCanAccessRepo(ctx, instance.Name, "owner/repo")
+	if err != nil {
+		t.Fatalf("AgentCanAccessRepo returned error: %v", err)
+	}
+	if !allowed {
+		t.Fatal("agent instance was not allowed on its repo")
+	}
+	reusable, ok, err := store.FindReusableAgentInstance(ctx, "planner", "owner/repo", now.Add(30*time.Second))
+	if err != nil || !ok {
+		t.Fatalf("FindReusableAgentInstance returned instance=%+v ok=%v err=%v", reusable, ok, err)
+	}
+	count, err := store.CountActiveAgentInstances(ctx, "planner", now.Add(30*time.Second))
+	if err != nil || count != 1 {
+		t.Fatalf("CountActiveAgentInstances = %d err=%v, want 1 nil", count, err)
+	}
+	if err := store.MarkAgentInstanceRunning(ctx, instance.Name, now.Add(time.Minute), 5*time.Minute); err != nil {
+		t.Fatalf("MarkAgentInstanceRunning returned error: %v", err)
+	}
+	if _, ok, err := store.FindReusableAgentInstance(ctx, "planner", "owner/repo", now.Add(30*time.Second)); err != nil || ok {
+		t.Fatalf("running FindReusableAgentInstance ok=%v err=%v, want false nil", ok, err)
+	}
+	if active, ok, err := store.FindActiveAgentInstance(ctx, "planner", "owner/repo", now.Add(30*time.Second)); err != nil || !ok || active.Name != instance.Name {
+		t.Fatalf("FindActiveAgentInstance returned instance=%+v ok=%v err=%v", active, ok, err)
+	}
+	deleted, err := store.DeleteExpiredAgentInstances(ctx, now.Add(4*time.Minute))
+	if err != nil {
+		t.Fatalf("running DeleteExpiredAgentInstances returned error: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("running expired instances deleted = %d, want 0", deleted)
+	}
+	if err := store.TouchAgentInstance(ctx, instance.Name, now.Add(2*time.Minute), time.Minute); err != nil {
+		t.Fatalf("TouchAgentInstance returned error: %v", err)
+	}
+	count, err = store.CountActiveAgentInstances(ctx, "planner", now.Add(4*time.Minute))
+	if err != nil || count != 0 {
+		t.Fatalf("expired idle CountActiveAgentInstances = %d err=%v, want 0 nil", count, err)
+	}
+	if err := store.CreateJob(ctx, Job{ID: "job-planner-1", Agent: instance.Name, Type: "ask", State: "queued", Payload: "{}"}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	count, err = store.CountActiveAgentInstances(ctx, "planner", now.Add(4*time.Minute))
+	if err != nil || count != 1 {
+		t.Fatalf("expired queued CountActiveAgentInstances = %d err=%v, want 1 nil", count, err)
+	}
+	if active, ok, err := store.FindActiveAgentInstance(ctx, "planner", "owner/repo", now.Add(4*time.Minute)); err != nil || !ok || active.Name != instance.Name {
+		t.Fatalf("expired queued FindActiveAgentInstance returned instance=%+v ok=%v err=%v", active, ok, err)
+	}
+	deleted, err = store.DeleteExpiredAgentInstances(ctx, now.Add(4*time.Minute))
+	if err != nil {
+		t.Fatalf("DeleteExpiredAgentInstances returned error: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("expired instance with queued job deleted = %d, want 0", deleted)
+	}
+	if ok, err := store.TransitionJobState(ctx, "job-planner-1", "queued", "done"); err != nil || !ok {
+		t.Fatalf("TransitionJobState returned ok=%v err=%v", ok, err)
+	}
+	if err := store.UpsertAgentInstance(ctx, instance); err != nil {
+		t.Fatalf("UpsertAgentInstance returned error: %v", err)
+	}
+	if err := store.CreateJob(ctx, Job{ID: "job-planner-retryable", Agent: instance.Name, Type: "ask", State: "failed", Payload: "{}"}); err != nil {
+		t.Fatalf("CreateJob retryable returned error: %v", err)
+	}
+	deleted, err = store.DeleteExpiredAgentInstances(ctx, now.Add(4*time.Minute))
+	if err != nil {
+		t.Fatalf("retryable DeleteExpiredAgentInstances returned error: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("expired instance with retryable job deleted = %d, want 0", deleted)
+	}
+	if ok, err := store.TransitionJobState(ctx, "job-planner-retryable", "failed", "done"); err != nil || !ok {
+		t.Fatalf("TransitionJobState retryable returned ok=%v err=%v", ok, err)
+	}
+	deleted, err = store.DeleteExpiredAgentInstances(ctx, now.Add(4*time.Minute))
+	if err != nil {
+		t.Fatalf("DeleteExpiredAgentInstances returned error: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expired instances deleted after queued job completed = %d, want 1", deleted)
+	}
+}
+
 func TestRepositoryMethods(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))

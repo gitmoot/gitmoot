@@ -58,6 +58,21 @@ type AgentRepo struct {
 	RepoFullName string
 }
 
+type AgentInstance struct {
+	Name         string
+	Type         string
+	Runtime      string
+	RuntimeRef   string
+	RepoFullName string
+	Role         string
+	PresetID     string
+	Capabilities []string
+	State        string
+	CreatedAt    string
+	LastUsedAt   string
+	ExpiresAt    string
+}
+
 type Goal struct {
 	ID     string
 	Title  string
@@ -338,7 +353,28 @@ func (s *Store) UpsertAgent(ctx context.Context, agent Agent) error {
 func (s *Store) GetAgent(ctx context.Context, name string) (Agent, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, preset_id, capabilities_json, autonomy_policy, health_status
 		FROM agents WHERE name = ?`, name)
-	return scanAgent(row)
+	agent, err := scanAgent(row)
+	if err == nil {
+		return agent, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Agent{}, err
+	}
+	instance, err := s.GetAgentInstance(ctx, name)
+	if err != nil {
+		return Agent{}, err
+	}
+	return Agent{
+		Name:           instance.Name,
+		Role:           instance.Role,
+		Runtime:        instance.Runtime,
+		RuntimeRef:     instance.RuntimeRef,
+		RepoScope:      instance.RepoFullName,
+		PresetID:       instance.PresetID,
+		Capabilities:   instance.Capabilities,
+		AutonomyPolicy: "auto",
+		HealthStatus:   instance.State,
+	}, nil
 }
 
 func (s *Store) ListAgents(ctx context.Context) ([]Agent, error) {
@@ -505,7 +541,171 @@ func (s *Store) ListPresets(ctx context.Context) ([]Preset, error) {
 func (s *Store) AgentCanAccessRepo(ctx context.Context, agentName string, repoFullName string) (bool, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_repos WHERE agent_name = ? AND repo_full_name = ?`, agentName, repoFullName).Scan(&count)
+	if err != nil || count > 0 {
+		return count > 0, err
+	}
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_instances WHERE name = ? AND repo_full_name = ?`, agentName, repoFullName).Scan(&count)
 	return count > 0, err
+}
+
+func (s *Store) UpsertAgentInstance(ctx context.Context, instance AgentInstance) error {
+	capabilities, err := json.Marshal(instance.Capabilities)
+	if err != nil {
+		return err
+	}
+	instance.CreatedAt = normalizeStoredTime(instance.CreatedAt)
+	instance.LastUsedAt = normalizeStoredTime(instance.LastUsedAt)
+	instance.ExpiresAt = normalizeStoredTime(instance.ExpiresAt)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO agent_instances(name, type, runtime, runtime_ref, repo_full_name, role, preset_id, capabilities_json, state, created_at, last_used_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(name) DO UPDATE SET
+			type = excluded.type,
+			runtime = excluded.runtime,
+			runtime_ref = excluded.runtime_ref,
+			repo_full_name = excluded.repo_full_name,
+			role = excluded.role,
+			preset_id = excluded.preset_id,
+			capabilities_json = excluded.capabilities_json,
+			state = excluded.state,
+			last_used_at = excluded.last_used_at,
+			expires_at = excluded.expires_at`,
+		instance.Name, instance.Type, instance.Runtime, instance.RuntimeRef, instance.RepoFullName, instance.Role, instance.PresetID, string(capabilities), instance.State, instance.CreatedAt, instance.LastUsedAt, instance.ExpiresAt)
+	return err
+}
+
+func (s *Store) GetAgentInstance(ctx context.Context, name string) (AgentInstance, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, preset_id, capabilities_json, state, created_at, last_used_at, expires_at
+		FROM agent_instances WHERE name = ?`, name)
+	return scanAgentInstance(row)
+}
+
+func (s *Store) FindReusableAgentInstance(ctx context.Context, typ string, repo string, now time.Time) (AgentInstance, bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, preset_id, capabilities_json, state, created_at, last_used_at, expires_at
+		FROM agent_instances
+		WHERE type = ? AND repo_full_name = ? AND expires_at > ?
+			AND state = 'idle'
+			AND NOT EXISTS (
+				SELECT 1 FROM jobs
+				WHERE jobs.agent = agent_instances.name
+					AND jobs.state IN ('queued', 'running')
+			)
+		ORDER BY last_used_at DESC, created_at DESC
+		LIMIT 1`, typ, repo, formatResourceLockTime(now))
+	instance, err := scanAgentInstance(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AgentInstance{}, false, nil
+	}
+	if err != nil {
+		return AgentInstance{}, false, err
+	}
+	return instance, true, nil
+}
+
+func (s *Store) CountActiveAgentInstances(ctx context.Context, typ string, now time.Time) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_instances
+		WHERE type = ?
+			AND (
+				expires_at > ?
+				OR EXISTS (
+					SELECT 1 FROM jobs
+					WHERE jobs.agent = agent_instances.name
+						AND jobs.state IN ('queued', 'running')
+				)
+			)`, typ, formatResourceLockTime(now)).Scan(&count)
+	return count, err
+}
+
+func (s *Store) FindActiveAgentInstance(ctx context.Context, typ string, repo string, now time.Time) (AgentInstance, bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, preset_id, capabilities_json, state, created_at, last_used_at, expires_at
+		FROM agent_instances
+		WHERE type = ? AND repo_full_name = ?
+			AND (
+				expires_at > ?
+				OR EXISTS (
+					SELECT 1 FROM jobs
+					WHERE jobs.agent = agent_instances.name
+						AND jobs.state IN ('queued', 'running')
+				)
+			)
+		ORDER BY
+			CASE WHEN expires_at > ? THEN 0 ELSE 1 END,
+			last_used_at DESC,
+			created_at DESC
+		LIMIT 1`, typ, repo, formatResourceLockTime(now), formatResourceLockTime(now))
+	instance, err := scanAgentInstance(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AgentInstance{}, false, nil
+	}
+	if err != nil {
+		return AgentInstance{}, false, err
+	}
+	return instance, true, nil
+}
+
+func (s *Store) ListAgentInstances(ctx context.Context) ([]AgentInstance, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, preset_id, capabilities_json, state, created_at, last_used_at, expires_at
+		FROM agent_instances ORDER BY type, repo_full_name, name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	instances := []AgentInstance{}
+	for rows.Next() {
+		instance, err := scanAgentInstance(rows)
+		if err != nil {
+			return nil, err
+		}
+		instances = append(instances, instance)
+	}
+	return instances, rows.Err()
+}
+
+func (s *Store) TouchAgentInstance(ctx context.Context, name string, now time.Time, idleTimeout time.Duration) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE agent_instances SET state = 'idle', last_used_at = ?, expires_at = ? WHERE name = ?`,
+		formatResourceLockTime(now), formatResourceLockTime(now.Add(idleTimeout)), name)
+	if err != nil {
+		return err
+	}
+	return requireAffected(result, "agent instance", name)
+}
+
+func (s *Store) MarkAgentInstanceRunning(ctx context.Context, name string, now time.Time, jobTimeout time.Duration) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE agent_instances SET state = 'running', last_used_at = ?, expires_at = ? WHERE name = ?`,
+		formatResourceLockTime(now), formatResourceLockTime(now.Add(jobTimeout)), name)
+	if err != nil {
+		return err
+	}
+	return requireAffected(result, "agent instance", name)
+}
+
+func (s *Store) DeleteExpiredAgentInstances(ctx context.Context, now time.Time) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM agent_instances
+		WHERE state = 'idle'
+			AND expires_at <= ?
+			AND NOT EXISTS (
+				SELECT 1 FROM jobs
+				WHERE jobs.agent = agent_instances.name
+					AND jobs.state IN ('queued', 'running', 'failed', 'blocked', 'cancelled')
+			)`, formatResourceLockTime(now))
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+func scanAgentInstance(row interface{ Scan(dest ...any) error }) (AgentInstance, error) {
+	var instance AgentInstance
+	var capabilities string
+	if err := row.Scan(&instance.Name, &instance.Type, &instance.Runtime, &instance.RuntimeRef, &instance.RepoFullName, &instance.Role, &instance.PresetID, &capabilities, &instance.State, &instance.CreatedAt, &instance.LastUsedAt, &instance.ExpiresAt); err != nil {
+		return AgentInstance{}, err
+	}
+	if strings.TrimSpace(capabilities) != "" {
+		if err := json.Unmarshal([]byte(capabilities), &instance.Capabilities); err != nil {
+			return AgentInstance{}, err
+		}
+	}
+	return instance, nil
 }
 
 func (s *Store) InsertGoal(ctx context.Context, goal Goal) error {
@@ -1070,6 +1270,14 @@ func formatResourceLockTime(value time.Time) string {
 	return value.UTC().Format("2006-01-02T15:04:05.000000000Z")
 }
 
+func normalizeStoredTime(value string) string {
+	value = strings.TrimSpace(value)
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return formatResourceLockTime(parsed)
+	}
+	return value
+}
+
 func (s *Store) AcquireLock(ctx context.Context, lock BranchLock) (bool, error) {
 	created, err := s.CreateLock(ctx, lock)
 	if err != nil {
@@ -1507,5 +1715,21 @@ CREATE TABLE resource_locks (
 	`,
 	`
 ALTER TABLE resource_locks ADD COLUMN owner_token TEXT NOT NULL DEFAULT '';
+	`,
+	`
+CREATE TABLE agent_instances (
+	name TEXT PRIMARY KEY,
+	type TEXT NOT NULL,
+	runtime TEXT NOT NULL,
+	runtime_ref TEXT NOT NULL,
+	repo_full_name TEXT NOT NULL,
+	role TEXT NOT NULL,
+	preset_id TEXT NOT NULL DEFAULT '',
+	capabilities_json TEXT NOT NULL DEFAULT '[]',
+	state TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	last_used_at TEXT NOT NULL,
+	expires_at TEXT NOT NULL
+);
 	`,
 }

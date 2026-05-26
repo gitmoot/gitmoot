@@ -7,7 +7,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/daemon"
@@ -30,6 +32,10 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 		return runAgentStart(args[1:], stdout, stderr)
 	case "ask":
 		return runAgentAsk(args[1:], stdout, stderr)
+	case "type":
+		return runAgentType(args[1:], stdout, stderr)
+	case "gc":
+		return runAgentGC(args[1:], stdout, stderr)
 	case "subscribe":
 		return runAgentSubscribe(args[1:], stdout, stderr)
 	case "list":
@@ -55,6 +61,8 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude --repo owner/repo [--path .] [--preset <preset-id>] [--start-daemon]")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
+	fmt.Fprintln(w, "  gitmoot agent gc")
 	fmt.Fprintln(w, "  gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] --capability <capability>")
 	fmt.Fprintln(w, "    Codex sessions may use a UUID, thread name, or last. Claude sessions may use a UUID or last. Shell sessions are commands.")
 	fmt.Fprintln(w, "  gitmoot agent allow <name> --repo owner/repo")
@@ -70,6 +78,7 @@ type agentAskOptions struct {
 	repo       string
 	jsonOutput bool
 	background bool
+	typeName   string
 	agent      string
 	message    string
 }
@@ -91,6 +100,8 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 			Action:       "ask",
 			Instructions: options.message,
 			Background:   options.background,
+			Type:         options.typeName,
+			Home:         options.home,
 		})
 		return err
 	}); err != nil {
@@ -137,6 +148,13 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 		switch {
 		case arg == "--background":
 			options.background = true
+		case arg == "--type":
+			if index+1 >= len(args) {
+				fmt.Fprintln(stderr, "agent ask requires a value for --type")
+				return agentAskOptions{}, false
+			}
+			index++
+			options.typeName = args[index]
 		case arg == "--json":
 			options.jsonOutput = true
 		case arg == "--repo" || arg == "--home":
@@ -154,6 +172,8 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 			options.repo = strings.TrimPrefix(arg, "--repo=")
 		case strings.HasPrefix(arg, "--home="):
 			options.home = strings.TrimPrefix(arg, "--home=")
+		case strings.HasPrefix(arg, "--type="):
+			options.typeName = strings.TrimPrefix(arg, "--type=")
 		case strings.HasPrefix(arg, "-") && len(positionals) >= 2:
 			fmt.Fprintf(stderr, "unknown agent ask flag %q\n", arg)
 			return agentAskOptions{}, false
@@ -185,7 +205,7 @@ func containsHelpFlag(args []string) bool {
 
 func printAgentAskUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--type type] [--home path] [--json]")
 }
 
 func daemonIsRunning(home string) (bool, error) {
@@ -219,6 +239,290 @@ func shellArgs(args []string) string {
 		quoted = append(quoted, shellArg(arg))
 	}
 	return strings.Join(quoted, " ")
+}
+
+func runAgentType(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		printAgentTypeUsage(stdout)
+		return 0
+	}
+	switch args[0] {
+	case "list":
+		return runAgentTypeList(args[1:], stdout, stderr)
+	case "show":
+		return runAgentTypeShow(args[1:], stdout, stderr)
+	case "set":
+		return runAgentTypeSet(args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "unknown agent type command %q\n\n", args[0])
+		printAgentTypeUsage(stderr)
+		return 2
+	}
+}
+
+func printAgentTypeUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  gitmoot agent type list")
+	fmt.Fprintln(w, "  gitmoot agent type show <type>")
+	fmt.Fprintln(w, "  gitmoot agent type set <type> --runtime codex|claude --preset <preset-id> --max-background 2 --idle-timeout 20m")
+}
+
+func runAgentTypeList(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("agent type list", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "agent type list does not accept positional arguments")
+		return 2
+	}
+	types, err := loadAgentTypeConfig(*home)
+	if err != nil {
+		fmt.Fprintf(stderr, "agent type list: %v\n", err)
+		return 1
+	}
+	names := make([]string, 0, len(types))
+	for name := range types {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		entry := types[name]
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%d\n", entry.Name, entry.Runtime, entry.Preset, entry.MaxBackground)
+	}
+	return 0
+}
+
+func runAgentTypeShow(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("agent type show", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fs.Usage()
+		if len(args) == 0 {
+			fmt.Fprintln(stderr, "agent type show requires exactly one type")
+			return 2
+		}
+		return 0
+	}
+	name := args[0]
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "agent type show requires exactly one type")
+		return 2
+	}
+	types, err := loadAgentTypeConfig(*home)
+	if err != nil {
+		fmt.Fprintf(stderr, "agent type show: %v\n", err)
+		return 1
+	}
+	entry, ok := types[strings.TrimSpace(name)]
+	if !ok {
+		fmt.Fprintf(stderr, "agent type %q not found\n", name)
+		return 1
+	}
+	printAgentType(stdout, entry)
+	return 0
+}
+
+func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("agent type set", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	runtimeName := fs.String("runtime", "", "agent runtime: codex or claude")
+	presetID := fs.String("preset", "", "agent prompt preset")
+	role := fs.String("role", "", "agent role")
+	maxBackground := fs.Int("max-background", -1, "maximum managed background instances")
+	idleTimeout := fs.String("idle-timeout", "", "managed instance idle timeout")
+	jobTimeout := fs.String("job-timeout", "", "managed job timeout")
+	var capabilities repeatedFlag
+	fs.Var(&capabilities, "capability", "agent capability, repeatable")
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fs.Usage()
+		if len(args) == 0 {
+			fmt.Fprintln(stderr, "agent type set requires exactly one type")
+			return 2
+		}
+		return 0
+	}
+	name := strings.TrimSpace(args[0])
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "agent type set requires exactly one type")
+		return 2
+	}
+	if !validAgentTypeName(name) {
+		fmt.Fprintf(stderr, "invalid agent type %q\n", name)
+		return 2
+	}
+	paths, types, err := loadAgentTypeConfigWithPaths(*home)
+	if err != nil {
+		fmt.Fprintf(stderr, "agent type set: %v\n", err)
+		return 1
+	}
+	entry := types[name]
+	entry.Name = name
+	if strings.TrimSpace(*runtimeName) != "" {
+		entry.Runtime = strings.TrimSpace(*runtimeName)
+	}
+	if strings.TrimSpace(entry.Runtime) == "" {
+		fmt.Fprintln(stderr, "agent type set requires --runtime for new types")
+		return 2
+	}
+	if _, err := (runtime.Factory{}).Adapter(entry.Runtime); err != nil {
+		fmt.Fprintf(stderr, "invalid runtime: %v\n", err)
+		return 2
+	}
+	if entry.Runtime == runtime.ShellRuntime {
+		fmt.Fprintln(stderr, "invalid runtime: managed agent types support codex or claude")
+		return 2
+	}
+	if strings.TrimSpace(*presetID) != "" {
+		entry.Preset = strings.TrimSpace(*presetID)
+	}
+	if strings.TrimSpace(*role) != "" {
+		entry.Role = strings.TrimSpace(*role)
+	}
+	if *maxBackground == 0 || *maxBackground < -1 {
+		fmt.Fprintln(stderr, "max background must be positive")
+		return 2
+	}
+	if *maxBackground > 0 {
+		entry.MaxBackground = *maxBackground
+	}
+	if strings.TrimSpace(*idleTimeout) != "" {
+		parsed, err := time.ParseDuration(*idleTimeout)
+		if err != nil {
+			fmt.Fprintf(stderr, "invalid idle timeout: %v\n", err)
+			return 2
+		}
+		if parsed <= 0 {
+			fmt.Fprintln(stderr, "idle timeout must be positive")
+			return 2
+		}
+		entry.IdleTimeout = strings.TrimSpace(*idleTimeout)
+	}
+	if strings.TrimSpace(*jobTimeout) != "" {
+		parsed, err := time.ParseDuration(*jobTimeout)
+		if err != nil {
+			fmt.Fprintf(stderr, "invalid job timeout: %v\n", err)
+			return 2
+		}
+		if parsed <= 0 {
+			fmt.Fprintln(stderr, "job timeout must be positive")
+			return 2
+		}
+		entry.JobTimeout = strings.TrimSpace(*jobTimeout)
+	}
+	if len(capabilities) > 0 {
+		entry.Capabilities = compactValues(capabilities)
+	}
+	resolvedRole, resolvedCapabilities, err := resolveAgentDefaults(entry.Preset, entry.Role, entry.Capabilities, name, []string{"ask"})
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid preset: %v\n", err)
+		return 2
+	}
+	entry.Role = resolvedRole
+	entry.Capabilities = resolvedCapabilities
+	if entry.Preset != "" {
+		if err := withStore(*home, func(store *db.Store) error {
+			_, err := loadInstalledPreset(context.Background(), store, entry.Preset)
+			return err
+		}); err != nil {
+			fmt.Fprintf(stderr, "%v\n", err)
+			return 1
+		}
+	}
+	if err := config.SaveAgentType(paths, entry); err != nil {
+		fmt.Fprintf(stderr, "agent type set: %v\n", err)
+		return 1
+	}
+	writeLine(stdout, "configured agent type %s", name)
+	return 0
+}
+
+func validAgentTypeName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, char := range name {
+		switch {
+		case char >= 'a' && char <= 'z':
+		case char >= 'A' && char <= 'Z':
+		case char >= '0' && char <= '9':
+		case char == '-' || char == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func runAgentGC(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("agent gc", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "agent gc does not accept positional arguments")
+		return 2
+	}
+	var deleted int64
+	if err := withStore(*home, func(store *db.Store) error {
+		var err error
+		deleted, err = store.DeleteExpiredAgentInstances(context.Background(), time.Now().UTC())
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "agent gc: %v\n", err)
+		return 1
+	}
+	writeLine(stdout, "removed %d expired agent instances", deleted)
+	return 0
+}
+
+func loadAgentTypeConfig(home string) (map[string]config.AgentType, error) {
+	_, types, err := loadAgentTypeConfigWithPaths(home)
+	return types, err
+}
+
+func loadAgentTypeConfigWithPaths(home string) (config.Paths, map[string]config.AgentType, error) {
+	paths, err := initializedPaths(home)
+	if err != nil {
+		return config.Paths{}, nil, err
+	}
+	types, err := config.LoadAgentTypes(paths)
+	return paths, types, err
+}
+
+func printAgentType(stdout io.Writer, entry config.AgentType) {
+	writeLine(stdout, "name: %s", entry.Name)
+	writeLine(stdout, "runtime: %s", entry.Runtime)
+	writeLine(stdout, "preset: %s", entry.Preset)
+	writeLine(stdout, "role: %s", entry.Role)
+	writeLine(stdout, "capabilities: %s", strings.Join(entry.Capabilities, ","))
+	writeLine(stdout, "max_background: %d", entry.MaxBackground)
+	writeLine(stdout, "idle_timeout: %s", entry.IdleTimeout)
+	writeLine(stdout, "job_timeout: %s", entry.JobTimeout)
 }
 
 func runAgentStart(args []string, stdout, stderr io.Writer) int {
