@@ -83,6 +83,59 @@ func TestRunJobListShowEventsRetryCancel(t *testing.T) {
 	}
 }
 
+func TestRunJobWatchPrintsEventsUntilTerminal(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	seedCLIJob(t, store, db.Job{
+		ID:      "job-watch",
+		Agent:   "audit",
+		Type:    "ask",
+		State:   string(workflow.JobSucceeded),
+		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Branch: "main"}),
+	}, "succeeded")
+	if err := store.AddJobEvent(context.Background(), db.JobEvent{JobID: "job-watch", Kind: "advance_completed", Message: "done"}); err != nil {
+		t.Fatalf("AddJobEvent returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"job", "watch", "job-watch", "--home", home, "--poll", "1ms"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("job watch exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{"succeeded\tsucceeded", "advance_completed\tdone", "state: succeeded"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("job watch output missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
+func TestRunJobWatchJSON(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	seedCLIJob(t, store, db.Job{
+		ID:      "job-watch-json",
+		Agent:   "audit",
+		Type:    "ask",
+		State:   string(workflow.JobFailed),
+		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Branch: "main"}),
+	}, "failed")
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"job", "watch", "job-watch-json", "--home", home, "--json", "--poll", "1ms"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("job watch --json exit code = %d, stderr=%s", code, stderr.String())
+	}
+	var decoded jobWatchOutput
+	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
+		t.Fatalf("json output did not decode: %v\n%s", err, stdout.String())
+	}
+	if decoded.Job.ID != "job-watch-json" || decoded.Job.State != string(workflow.JobFailed) || len(decoded.Events) != 1 || decoded.Events[0].Kind != string(workflow.JobFailed) {
+		t.Fatalf("decoded watch output = %+v", decoded)
+	}
+}
+
 func TestRunJobRunUsesDaemonWorkerInternals(t *testing.T) {
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)

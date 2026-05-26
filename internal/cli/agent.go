@@ -54,7 +54,7 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude --repo owner/repo [--path .] [--preset <preset-id>] [--start-daemon]")
-	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] --capability <capability>")
 	fmt.Fprintln(w, "    Codex sessions may use a UUID, thread name, or last. Claude sessions may use a UUID or last. Shell sessions are commands.")
 	fmt.Fprintln(w, "  gitmoot agent allow <name> --repo owner/repo")
@@ -69,6 +69,7 @@ type agentAskOptions struct {
 	home       string
 	repo       string
 	jsonOutput bool
+	background bool
 	agent      string
 	message    string
 }
@@ -89,11 +90,21 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 			Agent:        options.agent,
 			Action:       "ask",
 			Instructions: options.message,
+			Background:   options.background,
 		})
 		return err
 	}); err != nil {
 		fmt.Fprintf(stderr, "agent ask: %v\n", err)
 		return 1
+	}
+	if options.background {
+		output.WatchCommand = jobWatchCommand(output.JobID, options.home)
+		running, err := daemonIsRunning(options.home)
+		if err != nil {
+			fmt.Fprintf(stderr, "agent ask: %v\n", err)
+			return 1
+		}
+		output.DaemonRunning = running
 	}
 	if options.jsonOutput {
 		if err := writeJSON(stdout, output); err != nil {
@@ -103,6 +114,11 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	printLocalAgentJobOutput(stdout, output)
+	if options.background && !output.DaemonRunning {
+		writeLine(stdout, "queued: daemon is not running")
+		writeLine(stdout, "process: %s", daemonStartHint(options.home, output.Repo))
+		writeLine(stdout, "or: %s", jobRunCommand(output.JobID, options.home))
+	}
 	return 0
 }
 
@@ -119,6 +135,8 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
 		switch {
+		case arg == "--background":
+			options.background = true
 		case arg == "--json":
 			options.jsonOutput = true
 		case arg == "--repo" || arg == "--home":
@@ -167,7 +185,40 @@ func containsHelpFlag(args []string) bool {
 
 func printAgentAskUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--home path] [--json]")
+}
+
+func daemonIsRunning(home string) (bool, error) {
+	paths, err := initializedPaths(home)
+	if err != nil {
+		return false, err
+	}
+	pid, _, err := currentDaemonPID(daemonProcessState(paths))
+	return pid > 0, err
+}
+
+func jobWatchCommand(jobID string, home string) string {
+	args := []string{"gitmoot", "job", "watch", jobID}
+	if strings.TrimSpace(home) != "" {
+		args = append(args, "--home", home)
+	}
+	return shellArgs(args)
+}
+
+func jobRunCommand(jobID string, home string) string {
+	args := []string{"gitmoot", "job", "run", jobID}
+	if strings.TrimSpace(home) != "" {
+		args = append(args, "--home", home)
+	}
+	return shellArgs(args)
+}
+
+func shellArgs(args []string) string {
+	quoted := make([]string, 0, len(args))
+	for _, arg := range args {
+		quoted = append(quoted, shellArg(arg))
+	}
+	return strings.Join(quoted, " ")
 }
 
 func runAgentStart(args []string, stdout, stderr io.Writer) int {
@@ -523,11 +574,7 @@ func daemonStartHint(home string, repo string) string {
 		args = append(args, "--home", home)
 	}
 	args = append(args, "--repo", repo)
-	quoted := make([]string, 0, len(args))
-	for _, arg := range args {
-		quoted = append(quoted, shellArg(arg))
-	}
-	return strings.Join(quoted, " ")
+	return shellArgs(args)
 }
 
 func shellArg(value string) string {
