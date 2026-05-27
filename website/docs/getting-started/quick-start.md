@@ -14,11 +14,11 @@ gitmoot doctor --repo .
 Start a Gitmoot-managed planner agent and the background daemon:
 
 ```sh
-gitmoot agent start planner \
+gitmoot agent start project-planner \
   --runtime codex \
   --repo owner/repo \
   --path . \
-  --preset gitmoot-plan-and-goal \
+  --template planner \
   --start-daemon
 ```
 
@@ -31,7 +31,7 @@ Use the Gitmoot planner here. Write the implementation plan.
 Ask the registered background planner when you want a queued Gitmoot job:
 
 ```sh
-gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
 gitmoot job watch <job-id>
 ```
 

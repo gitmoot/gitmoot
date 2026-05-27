@@ -37,7 +37,7 @@ Use the Gitmoot planner here from the current chat for fast planning, then use
 background asks when you need tracked jobs:
 
 ```sh
-gitmoot agent ask planner --repo owner/project --background "Say OK."
+gitmoot agent ask project-planner --repo owner/project --background "Say OK."
 gitmoot job watch <job-id>
 gitmoot job events <job-id>
 ```

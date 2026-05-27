@@ -30,7 +30,7 @@ func TestCanonicalSkillFrontmatter(t *testing.T) {
 		"daemon checks",
 		"jobs",
 		"branch locks",
-		"presets",
+		"agent-templates",
 		"custom prompt agents",
 		"Codex",
 		"Claude Code",
@@ -92,14 +92,14 @@ func TestCanonicalSkillDocumentsLocalAgentAsk(t *testing.T) {
 			want: []string{
 				"gitmoot agent ask <agent>",
 				"The plugin is only the runtime discovery surface",
-				"presets/gitmoot-plan-lite.md",
+				"agent-templates/planner-here.md",
 			},
 		},
 		{
 			name: "cli",
 			text: cli,
 			want: []string{
-				"gitmoot agent ask planner --repo owner/repo",
+				"gitmoot agent ask project-planner --repo owner/repo",
 				"replace `gitmoot agent ask`",
 				"gitmoot agent type set planner",
 				"gitmoot job watch <job-id>",
@@ -109,7 +109,7 @@ func TestCanonicalSkillDocumentsLocalAgentAsk(t *testing.T) {
 			name: "workflows",
 			text: workflows,
 			want: []string{
-				"gitmoot agent ask planner --repo owner/repo",
+				"gitmoot agent ask project-planner --repo owner/repo",
 				"Planner Here",
 				"Execution Model",
 				"runtime:<runtime>:<runtime_ref>",
@@ -150,7 +150,7 @@ func TestRootSkillCompatibilityEntrypoint(t *testing.T) {
 	}
 	for _, want := range []string{
 		"skills/gitmoot/",
-		"skills/gitmoot/presets/gitmoot-plan-lite.md",
+		"skills/gitmoot/agent-templates/planner-here.md",
 		"gitmoot.io/SKILL.md",
 		"gitmoot_result",
 		"branch locks",

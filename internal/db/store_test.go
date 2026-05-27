@@ -31,7 +31,7 @@ func TestOpenMigratesSchema(t *testing.T) {
 		"resource_locks",
 		"merge_gates",
 		"agent_repos",
-		"presets",
+		"agent_templates",
 	} {
 		ok, err := store.HasTable(ctx, table)
 		if err != nil {
@@ -401,7 +401,7 @@ func TestRepositoryMethods(t *testing.T) {
 	if err := store.UpsertRepo(ctx, repo); err != nil {
 		t.Fatalf("restore UpsertRepo returned error: %v", err)
 	}
-	if err := store.UpsertPreset(ctx, Preset{
+	if err := store.UpsertAgentTemplate(ctx, AgentTemplate{
 		ID:             "thermo",
 		Name:           "Thermo",
 		Description:    "Strict review",
@@ -411,23 +411,23 @@ func TestRepositoryMethods(t *testing.T) {
 		ResolvedCommit: "abc123",
 		Content:        "Review deeply.",
 	}); err != nil {
-		t.Fatalf("UpsertPreset returned error: %v", err)
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
 	}
-	preset, err := store.GetPreset(ctx, "thermo")
+	template, err := store.GetAgentTemplate(ctx, "thermo")
 	if err != nil {
-		t.Fatalf("GetPreset returned error: %v", err)
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
 	}
-	if preset.ResolvedCommit != "abc123" || preset.Content != "Review deeply." || preset.CreatedAt == "" || preset.UpdatedAt == "" {
-		t.Fatalf("preset = %+v", preset)
+	if template.ResolvedCommit != "abc123" || template.Content != "Review deeply." || template.CreatedAt == "" || template.UpdatedAt == "" {
+		t.Fatalf("template = %+v", template)
 	}
-	presets, err := store.ListPresets(ctx)
+	templates, err := store.ListAgentTemplates(ctx)
 	if err != nil {
-		t.Fatalf("ListPresets returned error: %v", err)
+		t.Fatalf("ListAgentTemplates returned error: %v", err)
 	}
-	if len(presets) != 1 || presets[0].ID != "thermo" {
-		t.Fatalf("presets = %+v", presets)
+	if len(templates) != 1 || templates[0].ID != "thermo" {
+		t.Fatalf("templates = %+v", templates)
 	}
-	if err := store.UpsertAgent(ctx, Agent{Name: "audit", Role: "reviewer", Runtime: "codex", RuntimeRef: "session", RepoScope: "jerryfane/gitmoot", PresetID: "thermo", Capabilities: []string{"review"}, AutonomyPolicy: "auto", HealthStatus: "ok"}); err != nil {
+	if err := store.UpsertAgent(ctx, Agent{Name: "audit", Role: "reviewer", Runtime: "codex", RuntimeRef: "session", RepoScope: "jerryfane/gitmoot", TemplateID: "thermo", Capabilities: []string{"review"}, AutonomyPolicy: "auto", HealthStatus: "ok"}); err != nil {
 		t.Fatalf("UpsertAgent returned error: %v", err)
 	}
 	allowed, err := store.AgentCanAccessRepo(ctx, "audit", "jerryfane/gitmoot")
@@ -481,7 +481,7 @@ func TestRepositoryMethods(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAgent returned error: %v", err)
 	}
-	if agent.Name != "audit" || agent.PresetID != "thermo" || agent.Capabilities[0] != "review" {
+	if agent.Name != "audit" || agent.TemplateID != "thermo" || agent.Capabilities[0] != "review" {
 		t.Fatalf("agent = %+v", agent)
 	}
 	agents, err := store.ListAgents(ctx)
@@ -867,5 +867,78 @@ func TestMigrationDeduplicatesExistingTaskBranches(t *testing.T) {
 	}
 	if old.Branch != "" {
 		t.Fatalf("duplicate task branch = %q, want cleared", old.Branch)
+	}
+}
+
+func TestMigrationCopiesPresetsToAgentTemplates(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gitmoot.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open returned error: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `CREATE TABLE schema_migrations (
+		version INTEGER PRIMARY KEY,
+		applied_at TEXT NOT NULL
+	)`); err != nil {
+		t.Fatalf("create schema_migrations returned error: %v", err)
+	}
+	for version, migration := range migrations[:len(migrations)-1] {
+		if _, err := raw.ExecContext(ctx, migration); err != nil {
+			t.Fatalf("apply seed migration %d returned error: %v", version+1, err)
+		}
+		if _, err := raw.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, 'test')`, version+1); err != nil {
+			t.Fatalf("record seed migration %d returned error: %v", version+1, err)
+		}
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO presets(id, name, description, source_repo, source_ref, source_path, resolved_commit, content, created_at, updated_at)
+		VALUES ('legacy-template', 'Legacy Template', 'old description', 'owner/repo', 'main', 'path.md', 'abc123', 'legacy instructions', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')`); err != nil {
+		t.Fatalf("insert legacy preset returned error: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO agents(name, role, runtime, runtime_ref, repo_scope, preset_id, capabilities_json, autonomy_policy, health_status)
+		VALUES ('legacy-agent', 'reviewer', 'codex', 'session-id', 'owner/repo', 'legacy-template', '["review"]', 'auto', 'ok')`); err != nil {
+		t.Fatalf("insert legacy agent returned error: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO agent_instances(name, type, runtime, runtime_ref, repo_full_name, role, preset_id, capabilities_json, state, created_at, last_used_at, expires_at)
+		VALUES ('legacy-instance', 'reviewer', 'codex', 'session-id', 'owner/repo', 'reviewer', 'legacy-template', '["review"]', 'idle', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z')`); err != nil {
+		t.Fatalf("insert legacy agent instance returned error: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw Close returned error: %v", err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	template, err := store.GetAgentTemplate(ctx, "legacy-template")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	if template.Content != "legacy instructions" || template.ResolvedCommit != "abc123" {
+		t.Fatalf("template = %+v", template)
+	}
+	agent, err := store.GetAgent(ctx, "legacy-agent")
+	if err != nil {
+		t.Fatalf("GetAgent returned error: %v", err)
+	}
+	if agent.TemplateID != "legacy-template" {
+		t.Fatalf("agent template id = %q, want legacy-template", agent.TemplateID)
+	}
+	instance, err := store.GetAgentInstance(ctx, "legacy-instance")
+	if err != nil {
+		t.Fatalf("GetAgentInstance returned error: %v", err)
+	}
+	if instance.TemplateID != "legacy-template" {
+		t.Fatalf("agent instance template id = %q, want legacy-template", instance.TemplateID)
+	}
+	hasPresets, err := store.HasTable(ctx, "presets")
+	if err != nil {
+		t.Fatalf("HasTable(presets) returned error: %v", err)
+	}
+	if hasPresets {
+		t.Fatal("legacy presets table still exists")
 	}
 }

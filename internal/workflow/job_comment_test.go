@@ -12,7 +12,7 @@ func TestRenderJobResultCommentIncludesAttributionAndResult(t *testing.T) {
 		Runtime:   "codex",
 		JobID:     "job-123",
 		JobState:  string(JobSucceeded),
-		Payload:   JobPayload{PresetID: "thermo-nuclear-code-quality-review"},
+		Payload:   JobPayload{TemplateID: "thermo-nuclear-code-quality-review"},
 		Result: &AgentResult{
 			Decision:    "changes_requested",
 			Summary:     "fix the edge case",
@@ -27,7 +27,7 @@ func TestRenderJobResultCommentIncludesAttributionAndResult(t *testing.T) {
 	for _, want := range []string{
 		"> Agent: `audit`",
 		"> Runtime: `codex`",
-		"> Preset: `thermo-nuclear-code-quality-review`",
+		"> Template: `thermo-nuclear-code-quality-review`",
 		"> Job: `job-123`",
 		"**Decision:** `changes_requested`",
 		"**Summary:** fix the edge case",

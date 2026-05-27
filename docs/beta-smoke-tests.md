@@ -148,21 +148,21 @@ Expected signals:
    gitmoot daemon status
    ```
 
-## Thermo Preset Smoke Test
+## Thermo Template Smoke Test
 
-Goal: PR comment -> queued review job -> Codex resume with cached thermo preset
+Goal: PR comment -> queued review job -> Codex resume with cached thermo template
 instructions -> attributed PR result comment. Run this with a Gitmoot build that
-includes `gitmoot preset` commands.
+includes `gitmoot agent template` commands.
 
-1. Cache the preset and start a Gitmoot-managed Codex review agent.
+1. Cache the template and start a Gitmoot-managed Codex review agent.
 
    ```sh
-   gitmoot preset update thermo-nuclear-code-quality-review
+   gitmoot agent template update thermo-nuclear-code-quality-review
    gitmoot agent start thermo-review \
      --runtime codex \
      --repo owner/project \
      --path . \
-     --preset thermo-nuclear-code-quality-review
+     --template thermo-nuclear-code-quality-review
    gitmoot agent doctor thermo-review
    ```
 
@@ -200,25 +200,25 @@ Expected signals:
 
 - The PR receives a queued-job acknowledgement for `thermo-review`.
 - `gitmoot job list --repo owner/project` shows the review job.
-- The result comment includes preset attribution:
+- The result comment includes template attribution:
 
   ```md
   > Agent: `thermo-review`
   > Runtime: `codex`
-  > Preset: `thermo-nuclear-code-quality-review`
+  > Template: `thermo-nuclear-code-quality-review`
   > Job: `...`
   ```
 
-5. Check or refresh the cached preset only through explicit commands.
+5. Check or refresh the cached template only through explicit commands.
 
    ```sh
-   gitmoot preset diff thermo-nuclear-code-quality-review
-   gitmoot preset update thermo-nuclear-code-quality-review
+   gitmoot agent template diff thermo-nuclear-code-quality-review
+   gitmoot agent template update thermo-nuclear-code-quality-review
    ```
 
-## Planner Preset Smoke Test
+## Planner Template Smoke Test
 
-Goal: canonical goal template -> cached planner preset -> Gitmoot-managed Codex
+Goal: canonical goal template -> cached planner template -> Gitmoot-managed Codex
 planner agent. This verifies the planning workflow is discoverable before using
 it on a real PR.
 
@@ -226,42 +226,42 @@ it on a real PR.
 
    ```sh
    GOTOOLCHAIN=go1.26.0 go build -o /tmp/gitmoot-current ./cmd/gitmoot
-   export GITMOOT_SMOKE_HOME=/tmp/gitmoot-planner-preset-smoke
+   export GITMOOT_SMOKE_HOME=/tmp/gitmoot-planner-template-smoke
    rm -rf "$GITMOOT_SMOKE_HOME"
    /tmp/gitmoot-current init --home "$GITMOOT_SMOKE_HOME"
    ```
 
-2. Confirm the canonical template and planner preset are available.
+2. Confirm the canonical template and planner template are available.
 
    ```sh
    /tmp/gitmoot-current goal template | grep "codex exec review is clean; ready for manual /review."
-   /tmp/gitmoot-current preset list --home "$GITMOOT_SMOKE_HOME" | grep gitmoot-plan-and-goal
-   /tmp/gitmoot-current preset list --home "$GITMOOT_SMOKE_HOME" | grep gitmoot-plan-lite
-   /tmp/gitmoot-current preset update --home "$GITMOOT_SMOKE_HOME" gitmoot-plan-and-goal
-   /tmp/gitmoot-current preset update --home "$GITMOOT_SMOKE_HOME" gitmoot-plan-lite
-   /tmp/gitmoot-current preset show --home "$GITMOOT_SMOKE_HOME" gitmoot-plan-and-goal
-   /tmp/gitmoot-current preset show --home "$GITMOOT_SMOKE_HOME" gitmoot-plan-lite
+   /tmp/gitmoot-current agent template list --home "$GITMOOT_SMOKE_HOME" | grep planner
+   /tmp/gitmoot-current agent template list --home "$GITMOOT_SMOKE_HOME" | grep planner-here
+   /tmp/gitmoot-current agent template update --home "$GITMOOT_SMOKE_HOME" planner
+   /tmp/gitmoot-current agent template update --home "$GITMOOT_SMOKE_HOME" planner-here
+   /tmp/gitmoot-current agent template show --home "$GITMOOT_SMOKE_HOME" planner
+   /tmp/gitmoot-current agent template show --home "$GITMOOT_SMOKE_HOME" planner-here
    ```
 
 3. From the test repo checkout, start the planner agent.
 
    ```sh
    cd /path/to/project
-   /tmp/gitmoot-current agent start planner-smoke \
+   /tmp/gitmoot-current agent start project-planner-smoke \
      --home "$GITMOOT_SMOKE_HOME" \
      --runtime codex \
      --repo owner/project \
      --path . \
-     --preset gitmoot-plan-and-goal \
+     --template planner \
      --start-daemon
-   /tmp/gitmoot-current agent doctor planner-smoke --home "$GITMOOT_SMOKE_HOME"
+   /tmp/gitmoot-current agent doctor project-planner-smoke --home "$GITMOOT_SMOKE_HOME"
    /tmp/gitmoot-current daemon status --home "$GITMOOT_SMOKE_HOME"
    ```
 
 4. Ask the planner directly through the local agent path.
 
    ```sh
-   /tmp/gitmoot-current agent ask planner-smoke \
+   /tmp/gitmoot-current agent ask project-planner-smoke \
      --home "$GITMOOT_SMOKE_HOME" \
      --repo owner/project \
      "Write a task-by-task implementation plan for this feature, then create the goal file prompt."
@@ -272,7 +272,7 @@ it on a real PR.
 5. Open a disposable PR, then comment:
 
    ```text
-   /gitmoot planner-smoke ask Write a task-by-task implementation plan for this feature, then create the goal file prompt.
+   /gitmoot project-planner-smoke ask Write a task-by-task implementation plan for this feature, then create the goal file prompt.
    ```
 
 6. Verify the queued PR job and PR result.
@@ -287,16 +287,16 @@ it on a real PR.
 Expected signals:
 
 - `goal template` prints the canonical PR-per-task prompt.
-- `preset show` displays `default role: planner`, `default capabilities: ask`,
+- `agent template show` displays `default role: planner`, `default capabilities: ask`,
   and `mutation: true`.
-- `preset show gitmoot-plan-lite` displays `default role: planner`,
+- `agent template show planner-here` displays `default role: planner`,
   `default capabilities: ask`, and `mutation: false`.
-- `agent doctor planner-smoke` succeeds.
-- `agent ask planner-smoke` prints `state: succeeded`, `agent: planner-smoke`,
+- `agent doctor project-planner-smoke` succeeds.
+- `agent ask project-planner-smoke` prints `state: succeeded`, `agent: project-planner-smoke`,
   `action: ask`, and a planner summary.
 - `job show <local-ask-job-id>` includes `"sender": "local"`, the cached
-  `gitmoot-plan-and-goal` preset metadata, and the planner result.
-- The PR result comment includes `Preset: gitmoot-plan-and-goal`.
+  `planner` template metadata, and the planner result.
+- The PR result comment includes `Template: planner`.
 - The planner returns a structured plan and, when requested, a
   `GOAL-<short-slug>.md` path plus `/goal GOAL-<short-slug>.md`.
 
@@ -322,17 +322,17 @@ session.
    /tmp/gitmoot-current init --home "$GITMOOT_SMOKE_HOME"
    ```
 
-2. From the test repo checkout, cache the preset and start the agent.
+2. From the test repo checkout, cache the template and start the agent.
 
    ```sh
    cd /path/to/project
-   /tmp/gitmoot-current preset update --home "$GITMOOT_SMOKE_HOME" thermo-nuclear-code-quality-review
+   /tmp/gitmoot-current agent template update --home "$GITMOOT_SMOKE_HOME" thermo-nuclear-code-quality-review
    /tmp/gitmoot-current agent start thermo-start-smoke \
      --home "$GITMOOT_SMOKE_HOME" \
      --runtime codex \
      --repo owner/project \
      --path . \
-     --preset thermo-nuclear-code-quality-review \
+     --template thermo-nuclear-code-quality-review \
      --start-daemon
    /tmp/gitmoot-current agent list --home "$GITMOOT_SMOKE_HOME"
    /tmp/gitmoot-current daemon status --home "$GITMOOT_SMOKE_HOME"
@@ -356,7 +356,7 @@ Expected signals:
 
 - `agent list` shows `thermo-start-smoke` with a generated Codex session id.
 - The PR receives a queued-job acknowledgement.
-- The job succeeds and the result comment includes agent, runtime, preset, and
+- The job succeeds and the result comment includes agent, runtime, template, and
   job metadata.
 - `codex resume <session-id>` opens the created session if manual inspection is
   needed.
@@ -368,37 +368,37 @@ Expected signals:
    /tmp/gitmoot-current daemon status --home "$GITMOOT_SMOKE_HOME"
    ```
 
-## Custom Prompt Preset Smoke Test
+## Custom Prompt Template Smoke Test
 
-Goal: local prompt file -> cached custom preset -> preset-backed Codex agent ->
-queued PR comment job with custom preset metadata.
+Goal: local prompt file -> cached custom template -> template-backed Codex agent ->
+queued PR comment job with custom template metadata.
 
 Prerequisites: a safe test repository, authenticated `gh`, installed Codex, and
-a Gitmoot build that includes `preset add`.
+a Gitmoot build that includes `agent template add`.
 
 1. Build a local test binary and use an isolated Gitmoot home.
 
    ```sh
    GOTOOLCHAIN=go1.26.0 go build -o /tmp/gitmoot-current ./cmd/gitmoot
-   export GITMOOT_SMOKE_HOME=/tmp/gitmoot-custom-preset-smoke
+   export GITMOOT_SMOKE_HOME=/tmp/gitmoot-custom-template-smoke
    rm -rf "$GITMOOT_SMOKE_HOME"
    /tmp/gitmoot-current init --home "$GITMOOT_SMOKE_HOME"
    ```
 
-2. From the test repo checkout, create and install a local prompt preset.
+2. From the test repo checkout, create and install a local prompt template.
 
    ```sh
    cd /path/to/project
    mkdir -p agents
    printf '%s\n' 'Review only correctness, regressions, and missing tests.' > agents/local-reviewer.md
-   /tmp/gitmoot-current preset add local-reviewer \
+   /tmp/gitmoot-current agent template add local-reviewer \
      --home "$GITMOOT_SMOKE_HOME" \
      --file agents/local-reviewer.md \
      --name "Local Reviewer"
-   /tmp/gitmoot-current preset show --home "$GITMOOT_SMOKE_HOME" local-reviewer
+   /tmp/gitmoot-current agent template show --home "$GITMOOT_SMOKE_HOME" local-reviewer
    ```
 
-3. Start or subscribe a Codex test agent with the custom preset.
+3. Start or subscribe a Codex test agent with the custom template.
 
    ```sh
    /tmp/gitmoot-current agent start local-reviewer \
@@ -406,7 +406,7 @@ a Gitmoot build that includes `preset add`.
      --runtime codex \
      --repo owner/project \
      --path . \
-     --preset local-reviewer \
+     --template local-reviewer \
      --role reviewer \
      --capability ask \
      --capability review \
@@ -422,7 +422,7 @@ a Gitmoot build that includes `preset add`.
      --runtime codex \
      --session <session-id-or-last> \
      --repo owner/project \
-     --preset local-reviewer \
+     --template local-reviewer \
      --role reviewer \
      --capability ask \
      --capability review
@@ -448,17 +448,17 @@ a Gitmoot build that includes `preset add`.
 
 Expected signals:
 
-- `preset show` displays `source: local@file:` and `resolved commit: sha256:...`.
+- `agent template show` displays `source: local@file:` and `resolved commit: sha256:...`.
 - The PR receives a queued-job acknowledgement for `local-reviewer`.
-- The result comment includes `Agent`, `Runtime`, `Preset`, and `Job` metadata.
-- `job show <job-id>` includes the custom preset id and `sha256:` content hash.
+- The result comment includes `Agent`, `Runtime`, `Template`, and `Job` metadata.
+- `job show <job-id>` includes the custom template id and `sha256:` content hash.
 
-6. Edit and refresh the prompt only through explicit preset commands.
+6. Edit and refresh the prompt only through explicit template commands.
 
    ```sh
    printf '%s\n' 'Review correctness, regressions, missing tests, and edge cases.' > agents/local-reviewer.md
-   /tmp/gitmoot-current preset diff --home "$GITMOOT_SMOKE_HOME" local-reviewer
-   /tmp/gitmoot-current preset update --home "$GITMOOT_SMOKE_HOME" local-reviewer
+   /tmp/gitmoot-current agent template diff --home "$GITMOOT_SMOKE_HOME" local-reviewer
+   /tmp/gitmoot-current agent template update --home "$GITMOOT_SMOKE_HOME" local-reviewer
    ```
 
 7. Stop the isolated daemon.
@@ -540,8 +540,8 @@ resource scheduling rules.
 2. Queue two background asks to the same registered Codex or Claude agent.
 
    ```sh
-   gitmoot agent ask planner --repo owner/project --background "Say first OK."
-   gitmoot agent ask planner --repo owner/project --background "Say second OK."
+   gitmoot agent ask project-planner --repo owner/project --background "Say first OK."
+   gitmoot agent ask project-planner --repo owner/project --background "Say second OK."
    gitmoot job watch <first-job-id>
    gitmoot job watch <second-job-id>
    ```
@@ -554,10 +554,10 @@ resource scheduling rules.
 3. Queue background asks that can use independent managed instances.
 
    ```sh
-   gitmoot agent type set planner --runtime codex --preset gitmoot-plan-lite --max-background 2 --idle-timeout 20m
+   gitmoot agent type set project-planner --runtime codex --template planner-here --max-background 2 --idle-timeout 20m
    gitmoot daemon start --repo owner/project --workers 2
-   gitmoot agent ask planner --repo owner/project --background "Say planner A OK."
-   gitmoot agent ask planner --repo owner/project --background "Say planner B OK."
+   gitmoot agent ask project-planner --repo owner/project --background "Say planner A OK."
+   gitmoot agent ask project-planner --repo owner/project --background "Say planner B OK."
    gitmoot job list --repo owner/project
    ```
 

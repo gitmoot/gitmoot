@@ -11,7 +11,7 @@ import (
 type AgentType struct {
 	Name          string
 	Runtime       string
-	Preset        string
+	Template      string
 	Role          string
 	Capabilities  []string
 	MaxBackground int
@@ -94,7 +94,7 @@ func SaveAgentType(paths Paths, entry AgentType) error {
 func applyAgentTypeDefaults(entry *AgentType) {
 	entry.Name = strings.TrimSpace(entry.Name)
 	entry.Runtime = strings.TrimSpace(entry.Runtime)
-	entry.Preset = strings.TrimSpace(entry.Preset)
+	entry.Template = strings.TrimSpace(entry.Template)
 	entry.Role = strings.TrimSpace(entry.Role)
 	if entry.Role == "" {
 		entry.Role = entry.Name
@@ -120,9 +120,9 @@ func applyAgentTypeField(entry *AgentType, key string, value string) error {
 		parsed, err := parseConfigString(value)
 		entry.Runtime = parsed
 		return err
-	case "preset":
+	case "template", "preset":
 		parsed, err := parseConfigString(value)
-		entry.Preset = parsed
+		entry.Template = parsed
 		return err
 	case "role":
 		parsed, err := parseConfigString(value)
@@ -220,9 +220,9 @@ func writeAgentTypeBlock(builder *strings.Builder, entry AgentType) {
 	builder.WriteString("runtime = ")
 	builder.WriteString(strconv.Quote(entry.Runtime))
 	builder.WriteString("\n")
-	if entry.Preset != "" {
-		builder.WriteString("preset = ")
-		builder.WriteString(strconv.Quote(entry.Preset))
+	if entry.Template != "" {
+		builder.WriteString("template = ")
+		builder.WriteString(strconv.Quote(entry.Template))
 		builder.WriteString("\n")
 	}
 	builder.WriteString("role = ")

@@ -34,13 +34,13 @@ job is already using that Codex or Claude session. Wait for it to finish, use a
 different runtime session, or configure a managed agent type with
 `max_background` greater than one.
 
-## Presets
+## Agent Templates
 
 ```sh
-gitmoot preset list
-gitmoot preset show <id>
-gitmoot preset diff <id>
-gitmoot preset update <id>
+gitmoot agent template list
+gitmoot agent template show <id>
+gitmoot agent template diff <id>
+gitmoot agent template update <id>
 ```
 
 ## Branch Locks

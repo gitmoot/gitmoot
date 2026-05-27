@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, jobs, branch locks, presets, custom prompt agents, and Codex or Claude Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, jobs, branch locks, agent-templates, custom prompt agents, and Codex or Claude Code runtime workflows.
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex or Claude Code.
 metadata:
@@ -14,13 +14,15 @@ Gitmoot is a local-first coordinator for AI agents working across repositories,
 goals, reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, Codex or Claude Code agent startup, structured
-implementation plans, standard goal files, preset agents, custom prompt agents,
-job status, or branch lock inspection.
+implementation plans, standard goal files, agent template workflows, custom
+prompt agents, job status, or branch lock inspection.
 
-For fast planning, "use the Gitmoot planner here" means read and apply the
-packaged `presets/gitmoot-plan-lite.md` instructions in this current chat. Do
-not route that request through a background `gitmoot agent ask` unless the user
-explicitly asks for background execution, PR-comment routing, or job tracking.
+For current-chat template import, "use Gitmoot agent template <template-id>
+here" means read and apply the packaged or local template instructions in this
+current chat. The natural phrase "use the Gitmoot planner here" maps to
+`agent-templates/planner-here.md`. Do not route a "here" request through a
+background `gitmoot agent ask` unless the user explicitly asks for background
+execution, PR-comment routing, or job tracking.
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
@@ -34,8 +36,8 @@ sessions or managed agent types with `max_background` greater than one.
 2. Confirm GitHub CLI access with `gh auth status` before using PR workflows.
 3. Detect or ask for the target repo before starting daemons, subscribing agents,
    or routing jobs.
-4. Do not start daemons, create agents, update presets, or change subscriptions
-   unless the user asks or the current task clearly requires it.
+4. Do not start daemons, create agents, update agent templates, or change
+   subscriptions unless the user asks or the current task clearly requires it.
 5. Prefer read-only status commands before mutating Gitmoot state.
 
 ## Common Commands

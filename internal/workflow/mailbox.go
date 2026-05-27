@@ -37,24 +37,24 @@ type JobRequest struct {
 }
 
 type JobPayload struct {
-	Repo                 string       `json:"repo"`
-	Branch               string       `json:"branch"`
-	PullRequest          int          `json:"pull_request"`
-	HeadSHA              string       `json:"head_sha,omitempty"`
-	GoalID               string       `json:"goal_id,omitempty"`
-	TaskID               string       `json:"task_id"`
-	TaskTitle            string       `json:"task_title"`
-	LeadAgent            string       `json:"lead_agent,omitempty"`
-	Reviewers            []string     `json:"reviewers,omitempty"`
-	ReviewRound          string       `json:"review_round,omitempty"`
-	Sender               string       `json:"sender"`
-	Instructions         string       `json:"instructions"`
-	Constraints          []string     `json:"constraints"`
-	PresetID             string       `json:"preset_id,omitempty"`
-	PresetResolvedCommit string       `json:"preset_resolved_commit,omitempty"`
-	PresetContent        string       `json:"preset_content,omitempty"`
-	RawOutputs           []string     `json:"raw_outputs,omitempty"`
-	Result               *AgentResult `json:"result,omitempty"`
+	Repo                   string       `json:"repo"`
+	Branch                 string       `json:"branch"`
+	PullRequest            int          `json:"pull_request"`
+	HeadSHA                string       `json:"head_sha,omitempty"`
+	GoalID                 string       `json:"goal_id,omitempty"`
+	TaskID                 string       `json:"task_id"`
+	TaskTitle              string       `json:"task_title"`
+	LeadAgent              string       `json:"lead_agent,omitempty"`
+	Reviewers              []string     `json:"reviewers,omitempty"`
+	ReviewRound            string       `json:"review_round,omitempty"`
+	Sender                 string       `json:"sender"`
+	Instructions           string       `json:"instructions"`
+	Constraints            []string     `json:"constraints"`
+	TemplateID             string       `json:"template_id,omitempty"`
+	TemplateResolvedCommit string       `json:"template_resolved_commit,omitempty"`
+	TemplateContent        string       `json:"template_content,omitempty"`
+	RawOutputs             []string     `json:"raw_outputs,omitempty"`
+	Result                 *AgentResult `json:"result,omitempty"`
 }
 
 type DeliveryAdapter interface {
@@ -69,28 +69,28 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		return db.Job{}, err
 	}
 
-	snapshot, err := m.presetSnapshot(ctx, request.Agent)
+	snapshot, err := m.templateSnapshot(ctx, request.Agent)
 	if err != nil {
 		return db.Job{}, err
 	}
 
 	payload, err := marshalPayload(JobPayload{
-		Repo:                 request.Repo,
-		Branch:               request.Branch,
-		PullRequest:          request.PullRequest,
-		HeadSHA:              request.HeadSHA,
-		GoalID:               request.GoalID,
-		TaskID:               request.TaskID,
-		TaskTitle:            request.TaskTitle,
-		LeadAgent:            request.LeadAgent,
-		Reviewers:            compactStrings(request.Reviewers),
-		ReviewRound:          request.ReviewRound,
-		Sender:               request.Sender,
-		Instructions:         request.Instructions,
-		Constraints:          compactStrings(request.Constraints),
-		PresetID:             snapshot.ID,
-		PresetResolvedCommit: snapshot.ResolvedCommit,
-		PresetContent:        snapshot.Content,
+		Repo:                   request.Repo,
+		Branch:                 request.Branch,
+		PullRequest:            request.PullRequest,
+		HeadSHA:                request.HeadSHA,
+		GoalID:                 request.GoalID,
+		TaskID:                 request.TaskID,
+		TaskTitle:              request.TaskTitle,
+		LeadAgent:              request.LeadAgent,
+		Reviewers:              compactStrings(request.Reviewers),
+		ReviewRound:            request.ReviewRound,
+		Sender:                 request.Sender,
+		Instructions:           request.Instructions,
+		Constraints:            compactStrings(request.Constraints),
+		TemplateID:             snapshot.ID,
+		TemplateResolvedCommit: snapshot.ResolvedCommit,
+		TemplateContent:        snapshot.Content,
 	})
 	if err != nil {
 		return db.Job{}, err
@@ -109,25 +109,25 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 	return job, nil
 }
 
-func (m Mailbox) presetSnapshot(ctx context.Context, agentName string) (db.Preset, error) {
+func (m Mailbox) templateSnapshot(ctx context.Context, agentName string) (db.AgentTemplate, error) {
 	agent, err := m.Store.GetAgent(ctx, agentName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return db.Preset{}, nil
+			return db.AgentTemplate{}, nil
 		}
-		return db.Preset{}, err
+		return db.AgentTemplate{}, err
 	}
-	if strings.TrimSpace(agent.PresetID) == "" {
-		return db.Preset{}, nil
+	if strings.TrimSpace(agent.TemplateID) == "" {
+		return db.AgentTemplate{}, nil
 	}
-	preset, err := m.Store.GetPreset(ctx, agent.PresetID)
+	template, err := m.Store.GetAgentTemplate(ctx, agent.TemplateID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return db.Preset{}, fmt.Errorf("agent %q references missing preset %q", agent.Name, agent.PresetID)
+			return db.AgentTemplate{}, fmt.Errorf("agent %q references missing template %q", agent.Name, agent.TemplateID)
 		}
-		return db.Preset{}, err
+		return db.AgentTemplate{}, err
 	}
-	return preset, nil
+	return template, nil
 }
 
 func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, adapter DeliveryAdapter) (AgentResult, error) {
@@ -320,17 +320,17 @@ func (m Mailbox) savePayload(ctx context.Context, jobID string, payload JobPaylo
 
 func (p JobPayload) prompt(action string) prompts.JobPrompt {
 	return prompts.JobPrompt{
-		Repo:                 p.Repo,
-		Branch:               p.Branch,
-		PullRequest:          p.PullRequest,
-		Task:                 taskLabel(p.TaskID, p.TaskTitle),
-		Sender:               p.Sender,
-		Action:               action,
-		Instructions:         p.Instructions,
-		Constraints:          p.Constraints,
-		PresetID:             p.PresetID,
-		PresetResolvedCommit: p.PresetResolvedCommit,
-		PresetInstructions:   p.PresetContent,
+		Repo:                   p.Repo,
+		Branch:                 p.Branch,
+		PullRequest:            p.PullRequest,
+		Task:                   taskLabel(p.TaskID, p.TaskTitle),
+		Sender:                 p.Sender,
+		Action:                 action,
+		Instructions:           p.Instructions,
+		Constraints:            p.Constraints,
+		TemplateID:             p.TemplateID,
+		TemplateResolvedCommit: p.TemplateResolvedCommit,
+		TemplateInstructions:   p.TemplateContent,
 	}
 }
 
@@ -360,6 +360,23 @@ func unmarshalPayload(value string) (JobPayload, error) {
 	var payload JobPayload
 	if err := json.Unmarshal([]byte(value), &payload); err != nil {
 		return JobPayload{}, fmt.Errorf("parse job payload: %w", err)
+	}
+	var legacy struct {
+		PresetID             string `json:"preset_id"`
+		PresetResolvedCommit string `json:"preset_resolved_commit"`
+		PresetContent        string `json:"preset_content"`
+	}
+	if err := json.Unmarshal([]byte(value), &legacy); err != nil {
+		return JobPayload{}, fmt.Errorf("parse legacy job payload: %w", err)
+	}
+	if payload.TemplateID == "" {
+		payload.TemplateID = legacy.PresetID
+	}
+	if payload.TemplateResolvedCommit == "" {
+		payload.TemplateResolvedCommit = legacy.PresetResolvedCommit
+	}
+	if payload.TemplateContent == "" {
+		payload.TemplateContent = legacy.PresetContent
 	}
 	return payload, nil
 }

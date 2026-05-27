@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, PR comments, daemon jobs, branch locks, presets, custom prompt agents, and Codex or Claude Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, PR comments, daemon jobs, branch locks, agent templates, custom prompt agents, and Codex or Claude Code runtime workflows.
 version: 0.1.0
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex or Claude Code.
@@ -29,13 +29,13 @@ Gitmoot is a local-first coordinator for AI agents working across repositories,
 goals, reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, Codex or Claude Code agent startup, structured
-implementation plans, standard goal files, preset agents, custom prompt agents,
+implementation plans, standard goal files, agent template workflows, custom prompt agents,
 job status, or branch lock inspection.
 
 For fast planning, "use the Gitmoot planner here" means read and apply the
-repo `skills/gitmoot/presets/gitmoot-plan-lite.md` instructions in this current
+repo `skills/gitmoot/agent-templates/planner-here.md` instructions in this current
 chat. In an installed Gitmoot skill package, use the packaged
-`presets/gitmoot-plan-lite.md` path. Do not route that request through a
+`agent-templates/planner-here.md` path. Do not route that request through a
 background `gitmoot agent ask` unless the user explicitly asks for background
 execution, PR-comment routing, or job tracking.
 
@@ -51,7 +51,7 @@ sessions or managed agent types with `max_background` greater than one.
 2. Confirm GitHub CLI access with `gh auth status` before using PR workflows.
 3. Detect or ask for the target repo before starting daemons, subscribing agents,
    or routing jobs.
-4. Do not start daemons, create agents, update presets, or change subscriptions
+4. Do not start daemons, create agents, update agent templates, or change subscriptions
    unless the user asks or the current task clearly requires it.
 5. Prefer read-only status commands before mutating Gitmoot state.
 
@@ -122,27 +122,27 @@ Use GitHub PR comments as the public audit trail:
 /gitmoot merge
 ```
 
-## Preset Agents
+## Template Agents
 
-Install or refresh the built-in thermo review preset:
+Install or refresh the built-in thermo review template:
 
 ```sh
-gitmoot preset update thermo-nuclear-code-quality-review
+gitmoot agent template update thermo-nuclear-code-quality-review
 gitmoot agent start thermo-review \
   --runtime codex \
   --repo owner/repo \
-  --preset thermo-nuclear-code-quality-review \
+  --template thermo-nuclear-code-quality-review \
   --start-daemon
 ```
 
-Create a local custom prompt preset:
+Create a local custom prompt template:
 
 ```sh
-gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
+gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 gitmoot agent start frontend-reviewer \
   --runtime codex \
   --repo owner/repo \
-  --preset frontend-reviewer \
+  --template frontend-reviewer \
   --role reviewer \
   --capability ask \
   --capability review
@@ -151,8 +151,8 @@ gitmoot agent start frontend-reviewer \
 After editing a local prompt file, refresh Gitmoot's cached snapshot explicitly:
 
 ```sh
-gitmoot preset diff frontend-reviewer
-gitmoot preset update frontend-reviewer
+gitmoot agent template diff frontend-reviewer
+gitmoot agent template update frontend-reviewer
 ```
 
 ## Agent Job Contract

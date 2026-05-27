@@ -28,7 +28,7 @@ trail. Gitmoot makes the repository and its pull requests the shared surface:
 - Local SQLite records agents, repos, jobs, goals, tasks, PRs, and branch locks.
 - Runtime adapters keep Codex, Claude Code, and future runtimes behind the same
   Gitmoot agent model.
-- Presets and job snapshots make agent instructions explicit and reproducible.
+- Agent Templates and job snapshots make agent instructions explicit and reproducible.
 - Humans can follow progress from GitHub while agents keep working locally.
 
 ## How It Works
@@ -79,11 +79,11 @@ gitmoot doctor --repo .
 Start a Gitmoot-managed Codex agent and daemon:
 
 ```sh
-gitmoot agent start planner \
+gitmoot agent start project-planner \
   --runtime codex \
   --repo owner/repo \
   --path . \
-  --preset gitmoot-plan-and-goal \
+  --template planner \
   --start-daemon
 ```
 
@@ -96,7 +96,7 @@ Use the Gitmoot planner here. Write the implementation plan.
 Ask the registered background planner when you want a queued Gitmoot job:
 
 ```sh
-gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
 gitmoot job watch <job-id>
 ```
 
@@ -108,7 +108,7 @@ ownership.
 Route work through PR comments:
 
 ```text
-/gitmoot planner ask Write a task-by-task implementation plan for this PR.
+/gitmoot project-planner ask Write a task-by-task implementation plan for this PR.
 /gitmoot thermo-review review
 /gitmoot retry <job-id>
 ```
@@ -125,7 +125,7 @@ For the full walkthrough, see [docs/local-workflow.md](docs/local-workflow.md).
   a runtime adapter.
 - **Runtime adapter**: the bridge from Gitmoot jobs to Codex, Claude Code,
   shell commands, or future runtimes.
-- **Preset**: cached prompt content attached to an agent and snapshotted into
+- **Template**: cached prompt content attached to an agent and snapshotted into
   each job.
 - **Job**: a routed unit of work created from a PR comment, local ask, task run,
   retry, or merge action.
@@ -138,16 +138,16 @@ For the full walkthrough, see [docs/local-workflow.md](docs/local-workflow.md).
 
 ### Planner Agent
 
-Gitmoot includes `gitmoot-plan-and-goal` for structured implementation planning
+Gitmoot includes `planner` for structured implementation planning
 and standard goal-file writing.
 
 ```sh
-gitmoot preset update gitmoot-plan-and-goal
-gitmoot agent start planner \
+gitmoot agent template update planner
+gitmoot agent start project-planner \
   --runtime codex \
   --repo owner/repo \
   --path . \
-  --preset gitmoot-plan-and-goal \
+  --template planner \
   --start-daemon
 ```
 
@@ -157,11 +157,11 @@ Gitmoot includes `thermo-nuclear-code-quality-review` for strict review-only
 work.
 
 ```sh
-gitmoot preset update thermo-nuclear-code-quality-review
+gitmoot agent template update thermo-nuclear-code-quality-review
 gitmoot agent start thermo-review \
   --runtime codex \
   --repo owner/repo \
-  --preset thermo-nuclear-code-quality-review \
+  --template thermo-nuclear-code-quality-review \
   --start-daemon
 ```
 
@@ -173,17 +173,17 @@ Ask it from a PR comment:
 
 ### Custom Prompt Agents
 
-Custom presets let you keep a local prompt file and bind its snapshotted
+Custom agent templates let you keep a local prompt file and bind its snapshotted
 instructions to any Gitmoot agent.
 
 ```sh
 mkdir -p agents
 printf '%s\n' 'Review frontend changes for correctness and responsive behavior.' > agents/frontend-reviewer.md
-gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
+gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 gitmoot agent start frontend-reviewer \
   --runtime codex \
   --repo owner/repo \
-  --preset frontend-reviewer \
+  --template frontend-reviewer \
   --role reviewer \
   --capability ask \
   --capability review
@@ -192,8 +192,8 @@ gitmoot agent start frontend-reviewer \
 After editing the prompt file, refresh the cached snapshot:
 
 ```sh
-gitmoot preset diff frontend-reviewer
-gitmoot preset update frontend-reviewer
+gitmoot agent template diff frontend-reviewer
+gitmoot agent template update frontend-reviewer
 ```
 
 ### Jobs, Locks, And Recovery

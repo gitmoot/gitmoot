@@ -1,4 +1,4 @@
-package preset
+package agenttemplate
 
 import (
 	"context"
@@ -14,74 +14,74 @@ import (
 	"github.com/jerryfane/gitmoot/internal/subprocess"
 )
 
-func TestBuiltinsIncludesPlannerAndThermoPresets(t *testing.T) {
+func TestBuiltinsIncludesPlannerAndThermoTemplates(t *testing.T) {
 	definitions := Builtins()
 	if len(definitions) != 3 {
 		t.Fatalf("builtin count = %d, want 3", len(definitions))
 	}
 	thermo, ok := Lookup(ThermoNuclearCodeQualityReviewID)
 	if !ok {
-		t.Fatal("thermo preset missing")
+		t.Fatal("thermo template missing")
 	}
 	if thermo.Mutation || !reflect.DeepEqual(thermo.DefaultCapabilities, []string{"ask", "review"}) {
 		t.Fatalf("thermo definition = %+v", thermo)
 	}
-	planner, ok := Lookup(GitmootPlanAndGoalID)
+	planner, ok := Lookup(PlannerTemplateID)
 	if !ok {
-		t.Fatal("planner preset missing")
+		t.Fatal("planner template missing")
 	}
 	if !planner.Mutation || planner.DefaultRole != "planner" || !reflect.DeepEqual(planner.DefaultCapabilities, []string{"ask"}) {
 		t.Fatalf("planner definition = %+v", planner)
 	}
-	if planner.SourceRepo != "jerryfane/gitmoot" || planner.SourcePath != "skills/gitmoot/presets/gitmoot-plan-and-goal.md" {
+	if planner.SourceRepo != "jerryfane/gitmoot" || planner.SourcePath != "skills/gitmoot/agent-templates/planner.md" {
 		t.Fatalf("planner source = %+v", planner)
 	}
-	lite, ok := Lookup(GitmootPlanLiteID)
+	lite, ok := Lookup(PlannerHereTemplateID)
 	if !ok {
-		t.Fatal("lite planner preset missing")
+		t.Fatal("lite planner template missing")
 	}
 	if lite.Mutation || lite.DefaultRole != "planner" || !reflect.DeepEqual(lite.DefaultCapabilities, []string{"ask"}) {
 		t.Fatalf("lite planner definition = %+v", lite)
 	}
-	if lite.SourceRepo != "jerryfane/gitmoot" || lite.SourcePath != "skills/gitmoot/presets/gitmoot-plan-lite.md" {
+	if lite.SourceRepo != "jerryfane/gitmoot" || lite.SourcePath != "skills/gitmoot/agent-templates/planner-here.md" {
 		t.Fatalf("lite planner source = %+v", lite)
 	}
 }
 
-func TestUpdatePlannerPreset(t *testing.T) {
+func TestUpdatePlannerTemplate(t *testing.T) {
 	ctx := context.Background()
 	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
 	defer store.Close()
-	updated, err := Update(ctx, store, fakeFetcher{commit: "def456", content: "Plan carefully."}, GitmootPlanAndGoalID)
+	updated, err := Update(ctx, store, fakeFetcher{commit: "def456", content: "Plan carefully."}, PlannerTemplateID)
 	if err != nil {
 		t.Fatalf("Update returned error: %v", err)
 	}
-	if updated.ID != GitmootPlanAndGoalID || updated.ResolvedCommit != "def456" || updated.Content != "Plan carefully." {
-		t.Fatalf("updated planner preset = %+v", updated)
+	if updated.ID != PlannerTemplateID || updated.ResolvedCommit != "def456" || updated.Content != "Plan carefully." {
+		t.Fatalf("updated planner template = %+v", updated)
 	}
-	if updated.SourceRepo != "jerryfane/gitmoot" || updated.SourcePath != "skills/gitmoot/presets/gitmoot-plan-and-goal.md" {
+	if updated.SourceRepo != "jerryfane/gitmoot" || updated.SourcePath != "skills/gitmoot/agent-templates/planner.md" {
 		t.Fatalf("updated source = %+v", updated)
 	}
 }
 
-func TestUpdateLitePlannerPreset(t *testing.T) {
+func TestUpdatePlannerHereTemplate(t *testing.T) {
 	ctx := context.Background()
 	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
 	defer store.Close()
-	updated, err := Update(ctx, store, fakeFetcher{commit: "fed789", content: "Plan quickly."}, GitmootPlanLiteID)
+	updated, err := Update(ctx, store, fakeFetcher{commit: "fed789", content: "Plan quickly."}, PlannerHereTemplateID)
 	if err != nil {
 		t.Fatalf("Update returned error: %v", err)
 	}
-	if updated.ID != GitmootPlanLiteID || updated.ResolvedCommit != "fed789" || updated.Content != "Plan quickly." {
-		t.Fatalf("updated lite planner preset = %+v", updated)
+	if updated.ID != PlannerHereTemplateID || updated.ResolvedCommit != "fed789" || updated.Content != "Plan quickly." {
+		t.Fatalf("updated lite planner template = %+v", updated)
 	}
-	if updated.SourceRepo != "jerryfane/gitmoot" || updated.SourcePath != "skills/gitmoot/presets/gitmoot-plan-lite.md" {
+	if updated.SourceRepo != "jerryfane/gitmoot" || updated.SourcePath != "skills/gitmoot/agent-templates/planner-here.md" {
 		t.Fatalf("updated lite source = %+v", updated)
 	}
 }
@@ -101,7 +101,7 @@ func TestGHFetcherUsesGitHubAPIAndDecodesContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchFile returned error: %v", err)
 	}
-	if file.Content != "preset body" {
+	if file.Content != "template body" {
 		t.Fatalf("content = %q", file.Content)
 	}
 	if len(runner.calls) != 2 {
@@ -141,7 +141,7 @@ func TestValidateID(t *testing.T) {
 	}
 }
 
-func TestAddLocalInstallsCustomPreset(t *testing.T) {
+func TestAddLocalInstallsCustomTemplate(t *testing.T) {
 	ctx := context.Background()
 	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
@@ -159,13 +159,13 @@ func TestAddLocalInstallsCustomPreset(t *testing.T) {
 	}
 
 	if added.ID != "frontend-reviewer" || added.Name != "frontend-reviewer" || added.Description != DefaultLocalDescription {
-		t.Fatalf("added preset metadata = %+v", added)
+		t.Fatalf("added template metadata = %+v", added)
 	}
 	if added.SourceRepo != LocalSourceRepo || added.SourceRef != LocalSourceRef || !filepath.IsAbs(added.SourcePath) {
-		t.Fatalf("added preset source = %+v", added)
+		t.Fatalf("added template source = %+v", added)
 	}
 	if added.ResolvedCommit != HashContent("Review UI changes.\n") || added.Content != "Review UI changes.\n" {
-		t.Fatalf("added preset content = %+v", added)
+		t.Fatalf("added template content = %+v", added)
 	}
 }
 
@@ -251,7 +251,7 @@ func (f *fakeRunner) Run(_ context.Context, _ string, command string, args ...st
 	case strings.Contains(joined, "/git/ref/heads/main"):
 		return subprocess.Result{Command: command, Args: args, Stdout: "abc123\n"}, nil
 	case strings.Contains(joined, "/contents/"):
-		return subprocess.Result{Command: command, Args: args, Stdout: `{"encoding":"base64","content":"` + base64.StdEncoding.EncodeToString([]byte("preset body")) + `"}`}, nil
+		return subprocess.Result{Command: command, Args: args, Stdout: `{"encoding":"base64","content":"` + base64.StdEncoding.EncodeToString([]byte("template body")) + `"}`}, nil
 	default:
 		return subprocess.Result{Command: command, Args: args, Stderr: "unexpected call"}, errors.New("unexpected call")
 	}

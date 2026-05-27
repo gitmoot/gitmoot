@@ -17,17 +17,17 @@ gitmoot doctor --repo .
 gitmoot plugin install codex
 gitmoot plugin install claude
 gitmoot plugin doctor
-gitmoot preset list
-gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
-gitmoot preset update thermo-nuclear-code-quality-review
-gitmoot agent start <name> --runtime codex|claude --repo owner/repo --path . --preset thermo-nuclear-code-quality-review --start-daemon
+gitmoot agent template list
+gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
+gitmoot agent template update thermo-nuclear-code-quality-review
+gitmoot agent start <name> --runtime codex|claude --repo owner/repo --path . --template thermo-nuclear-code-quality-review --start-daemon
 gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
 gitmoot agent ask <name> "message" --repo owner/repo
 gitmoot agent ask <name> --background --repo owner/repo "message"
 gitmoot agent type list
 gitmoot agent type show planner
 gitmoot agent gc
-gitmoot agent start thermo-review --runtime codex --repo owner/repo --preset thermo-nuclear-code-quality-review
+gitmoot agent start thermo-review --runtime codex --repo owner/repo --template thermo-nuclear-code-quality-review
 gitmoot agent allow <name> --repo owner/repo
 gitmoot agent repos <name>
 gitmoot agent list
@@ -67,7 +67,7 @@ The plugins are guidance and discovery surfaces. They do not replace
 local SQLite workflow state.
 
 For fast planning in the current Codex or Claude chat, ask the runtime to use
-the Gitmoot planner here. That applies the lightweight `gitmoot-plan-lite`
+the Gitmoot planner here. That applies the lightweight `planner-here`
 instructions directly in the current conversation and avoids the startup cost of
 a background planner job.
 
@@ -79,7 +79,7 @@ same local agent registry and runtime adapter path as PR-comment ask jobs.
 
 Gitmoot has two execution paths:
 
-- **Here**: the current Codex or Claude chat reads Gitmoot skill and preset
+- **Here**: the current Codex or Claude chat reads Gitmoot skill and template
   instructions directly. This does not create a Gitmoot job and is the fastest
   path for planning when the current chat already has context.
 - **Background**: Gitmoot creates a job, records events in SQLite, and the
@@ -148,52 +148,52 @@ same checkout remain serialized even when the worker count is higher.
    gitmoot agent doctor lead
    ```
 
-   To add the built-in strict review preset, fetch and cache it explicitly.
-   `--preset` supplies the default reviewer role and `ask,review` capabilities
+   To add the built-in strict review template, fetch and cache it explicitly.
+   `--template` supplies the default reviewer role and `ask,review` capabilities
    when those flags are omitted.
 
    ```sh
-   gitmoot preset update thermo-nuclear-code-quality-review
+   gitmoot agent template update thermo-nuclear-code-quality-review
    gitmoot agent start thermo-review \
      --runtime codex \
      --repo owner/project \
-     --preset thermo-nuclear-code-quality-review
+     --template thermo-nuclear-code-quality-review
    gitmoot agent doctor thermo-review
    ```
 
-   If the preset is not cached yet, `agent start --preset ...` fails with the
-   same explicit `gitmoot preset update <preset>` guidance as `agent subscribe`.
-   Add `--update-preset` when you want startup to refresh the cached preset
+   If the template is not cached yet, `agent start --template ...` fails with the
+   same explicit `gitmoot agent template update <template>` guidance as `agent subscribe`.
+   Add `--update-template` when you want startup to refresh the cached template
    before creating the runtime session.
 
-   Custom prompt presets are local files snapshotted into Gitmoot state. Use
+   Custom prompt agent templates are local files snapshotted into Gitmoot state. Use
    them when you want a repo- or team-specific agent profile without changing
    Codex, Claude, or repository agent files.
 
    ```sh
    mkdir -p agents
    printf '%s\n' 'Review frontend changes for correctness and responsive behavior.' > agents/frontend-reviewer.md
-   gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
+   gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
    gitmoot agent start frontend-reviewer \
      --runtime codex \
      --repo owner/project \
      --path . \
-     --preset frontend-reviewer \
+     --template frontend-reviewer \
      --role reviewer \
      --capability ask \
      --capability review
    ```
 
-   Built-in presets can define default roles and capabilities. Custom presets
+   Built-in agent templates can define default roles and capabilities. Custom agent templates
    do not in V1, so pass the role and capabilities you want. `agent start`
    still keeps the normal fallback defaults if omitted, while
-   `agent subscribe --preset <custom-id>` requires explicit values.
+   `agent subscribe --template <custom-id>` requires explicit values.
 
    After editing a custom prompt file, refresh the cached snapshot explicitly:
 
    ```sh
-   gitmoot preset diff frontend-reviewer
-   gitmoot preset update frontend-reviewer
+   gitmoot agent template diff frontend-reviewer
+   gitmoot agent template update frontend-reviewer
    ```
 
    After startup, open a created Codex session later with the session id printed
@@ -215,13 +215,13 @@ same checkout remain serialized even when the worker count is higher.
    gitmoot agent list
    ```
 
-   Preset updates are explicit and auditable. Diff upstream content before
-   refreshing the local cached copy. For custom presets, `diff` compares the
+   Template updates are explicit and auditable. Diff upstream content before
+   refreshing the local cached copy. For custom agent templates, `diff` compares the
    cached content with the stored local file path.
 
    ```sh
-   gitmoot preset diff thermo-nuclear-code-quality-review
-   gitmoot preset update thermo-nuclear-code-quality-review
+   gitmoot agent template diff thermo-nuclear-code-quality-review
+   gitmoot agent template update thermo-nuclear-code-quality-review
    ```
 
    To inspect the installed Gitmoot build or check for a beta release:
@@ -275,7 +275,7 @@ same checkout remain serialized even when the worker count is higher.
    registered agent directly:
 
    ```sh
-   gitmoot agent ask planner --repo owner/project "Write a task-by-task implementation plan and goal file prompt."
+   gitmoot agent ask project-planner --repo owner/project "Write a task-by-task implementation plan and goal file prompt."
    gitmoot job show <job-id>
    ```
 
@@ -318,8 +318,8 @@ same checkout remain serialized even when the worker count is higher.
   in V1.
 - GitHub comments are authored by the authenticated user. Agent attribution is
   written in the comment body.
-- Preset content is not fetched at job runtime. Run `gitmoot preset update`
-  intentionally when you want to refresh a cached preset.
+- Template content is not fetched at job runtime. Run `gitmoot agent template update`
+  intentionally when you want to refresh a cached template.
 
 ## Multi-Repo Supervision
 

@@ -11,7 +11,7 @@ import (
 func TestRetryJobRequeuesTerminalJobAndPreservesPayload(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	payload := `{"repo":"owner/repo","preset_id":"thermo","preset_resolved_commit":"abc123","preset_content":"Review deeply.","raw_outputs":["raw"],"result":{"decision":"approved","summary":"stale"}}`
+	payload := `{"repo":"owner/repo","template_id":"thermo","template_resolved_commit":"abc123","template_content":"Review deeply.","raw_outputs":["raw"],"result":{"decision":"approved","summary":"stale"}}`
 	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-1", Agent: "audit", Type: "ask", State: string(JobFailed), Payload: payload}, db.JobEvent{
 		Kind:    string(JobFailed),
 		Message: "failed",
@@ -32,7 +32,7 @@ func TestRetryJobRequeuesTerminalJobAndPreservesPayload(t *testing.T) {
 		t.Fatalf("unmarshalPayload returned error: %v", err)
 	}
 	if storedPayload.Result != nil || len(storedPayload.RawOutputs) != 1 || storedPayload.RawOutputs[0] != "raw" ||
-		storedPayload.PresetID != "thermo" || storedPayload.PresetResolvedCommit != "abc123" || storedPayload.PresetContent != "Review deeply." {
+		storedPayload.TemplateID != "thermo" || storedPayload.TemplateResolvedCommit != "abc123" || storedPayload.TemplateContent != "Review deeply." {
 		t.Fatalf("payload after retry = %+v, want stale result cleared and raw output preserved", storedPayload)
 	}
 	events, err := store.ListJobEvents(ctx, "job-1")

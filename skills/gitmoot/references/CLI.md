@@ -97,12 +97,12 @@ gitmoot agent doctor reviewer
 Ask a registered agent from the current local chat:
 
 ```sh
-gitmoot agent ask planner --repo owner/repo "Return the plan status."
-gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot agent ask project-planner --repo owner/repo "Return the plan status."
+gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
 gitmoot job watch <job-id>
 ```
 
-This uses the same agent registry, repo access grants, cached preset snapshot,
+This uses the same agent registry, repo access grants, cached template snapshot,
 runtime adapter, and local job history as PR-comment ask jobs. The runtime
 plugin helps Codex or Claude Code discover Gitmoot guidance, but it does not
 replace `gitmoot agent ask`. Synchronous asks and queued jobs both use the same
@@ -113,60 +113,60 @@ Configure managed background agent types:
 ```sh
 gitmoot agent type list
 gitmoot agent type show planner
-gitmoot agent type set planner --runtime codex --preset gitmoot-plan-lite --max-background 2 --idle-timeout 20m
+gitmoot agent type set planner --runtime codex --template planner-here --max-background 2 --idle-timeout 20m
 gitmoot agent gc
 ```
 
-## Presets
+## Agent Templates
 
-Install or refresh the built-in thermo review preset:
+Install or refresh the built-in thermo review template:
 
 ```sh
-gitmoot preset update thermo-nuclear-code-quality-review
+gitmoot agent template update thermo-nuclear-code-quality-review
 gitmoot agent start thermo-review \
   --runtime codex \
   --repo owner/repo \
-  --preset thermo-nuclear-code-quality-review \
+  --template thermo-nuclear-code-quality-review \
   --start-daemon
 ```
 
-Install or refresh the built-in full planner/goal preset:
+Install or refresh the built-in full planner/goal template:
 
 ```sh
-gitmoot preset update gitmoot-plan-and-goal
-gitmoot agent start planner \
+gitmoot agent template update planner
+gitmoot agent start project-planner \
   --runtime codex \
   --repo owner/repo \
   --path . \
-  --preset gitmoot-plan-and-goal \
+  --template planner \
   --start-daemon
 ```
 
-Install or refresh the lightweight planner preset when you want to run a
+Install or refresh the lightweight planner template when you want to run a
 planner as a registered background-capable agent:
 
 ```sh
-gitmoot preset update gitmoot-plan-lite
-gitmoot agent start planner-lite \
+gitmoot agent template update planner-here
+gitmoot agent start project-planner-lite \
   --runtime codex \
   --repo owner/repo \
   --path . \
-  --preset gitmoot-plan-lite \
+  --template planner-here \
   --start-daemon
 ```
 
 For fast current-chat planning, use the Gitmoot skill with the packaged
-`presets/gitmoot-plan-lite.md` instructions instead of starting a background
+`agent-templates/planner-here.md` instructions instead of starting a background
 job. The CLI cannot control an already-running Codex or Claude chat.
 
-Create a local custom prompt preset:
+Create a local custom prompt template:
 
 ```sh
-gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
+gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 gitmoot agent start frontend-reviewer \
   --runtime codex \
   --repo owner/repo \
-  --preset frontend-reviewer \
+  --template frontend-reviewer \
   --role reviewer \
   --capability ask \
   --capability review
@@ -175,8 +175,8 @@ gitmoot agent start frontend-reviewer \
 After editing a local prompt file, refresh Gitmoot's cached snapshot:
 
 ```sh
-gitmoot preset diff frontend-reviewer
-gitmoot preset update frontend-reviewer
+gitmoot agent template diff frontend-reviewer
+gitmoot agent template update frontend-reviewer
 ```
 
 ## Goals

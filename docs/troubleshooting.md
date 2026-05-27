@@ -47,62 +47,62 @@ Fixes:
 - Confirm `CODEX_HOME` if sessions are stored outside `~/.codex`.
 - Re-subscribe the agent with the correct session reference.
 
-## Presets
+## Agent Templates
 
 Symptoms:
 
-- `gitmoot agent subscribe ... --preset thermo-nuclear-code-quality-review`
+- `gitmoot agent subscribe ... --template thermo-nuclear-code-quality-review`
   fails with an install hint.
-- `gitmoot agent start ... --preset <custom-id>` fails with a `preset add`
+- `gitmoot agent start ... --template <custom-id>` fails with an `agent template add`
   hint.
 - A custom prompt edit is not reflected in new jobs.
-- A preset-backed job does not include the expected review instructions.
-- You want to know whether the cached preset differs from upstream.
+- A template-backed job does not include the expected review instructions.
+- You want to know whether the cached template differs from upstream.
 
 Checks:
 
 ```sh
-gitmoot preset list
-gitmoot preset show thermo-nuclear-code-quality-review
-gitmoot preset show <custom-id>
-gitmoot preset diff thermo-nuclear-code-quality-review
-gitmoot preset diff <custom-id>
+gitmoot agent template list
+gitmoot agent template show thermo-nuclear-code-quality-review
+gitmoot agent template show <custom-id>
+gitmoot agent template diff thermo-nuclear-code-quality-review
+gitmoot agent template diff <custom-id>
 gitmoot agent list
 ```
 
 Fixes:
 
-- Install or refresh the preset explicitly:
+- Install or refresh the template explicitly:
 
   ```sh
-  gitmoot preset update thermo-nuclear-code-quality-review
+  gitmoot agent template update thermo-nuclear-code-quality-review
   ```
 
   For a custom local prompt file:
 
   ```sh
-  gitmoot preset add <custom-id> --file agents/<custom-id>.md
-  gitmoot preset update <custom-id>
+  gitmoot agent template add <custom-id> --file agents/<custom-id>.md
+  gitmoot agent template update <custom-id>
   ```
 
-- Re-subscribe the agent after the preset is installed:
+- Re-subscribe the agent after the template is installed:
 
   ```sh
   gitmoot agent subscribe thermo-review \
     --runtime codex \
     --session <session-id-or-last> \
     --repo owner/repo \
-    --preset thermo-nuclear-code-quality-review
+    --template thermo-nuclear-code-quality-review
   gitmoot agent doctor thermo-review
   ```
 
-- Preset content is snapshotted when a job is queued. Retry an existing job to
-  reuse its original snapshot; comment again after `preset update` to queue a
+- Template content is snapshotted when a job is queued. Retry an existing job to
+  reuse its original snapshot; comment again after `agent template update` to queue a
   job with refreshed content.
-- Custom preset files are not read at job runtime. Run
-  `gitmoot preset diff <custom-id>` and `gitmoot preset update <custom-id>`
+- Custom template files are not read at job runtime. Run
+  `gitmoot agent template diff <custom-id>` and `gitmoot agent template update <custom-id>`
   after editing the file.
-- The thermo preset is review-only. Remove `--capability implement` and route
+- The thermo template is review-only. Remove `--capability implement` and route
   implementation work to a separate implementation-capable agent.
 
 ## Claude Code

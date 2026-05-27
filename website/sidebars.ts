@@ -16,7 +16,7 @@ const sidebars: SidebarsConfig = {
       label: 'Concepts',
       items: [
         'concepts/local-first-coordination',
-        'concepts/agents-presets-jobs-locks',
+        'concepts/agents-templates-jobs-locks',
       ],
     },
     {

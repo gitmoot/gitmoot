@@ -23,12 +23,12 @@ For registered background-agent work from a runtime chat that supports command
 execution:
 
 ```text
-$gitmoot:gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
+$gitmoot:gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
 ```
 
 Without the command bridge, ask the runtime to run:
 
 ```sh
-gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
 gitmoot job watch <job-id>
 ```

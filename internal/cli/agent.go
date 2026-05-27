@@ -11,10 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jerryfane/gitmoot/internal/agenttemplate"
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
-	"github.com/jerryfane/gitmoot/internal/preset"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
@@ -34,6 +34,8 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 		return runAgentAsk(args[1:], stdout, stderr)
 	case "type":
 		return runAgentType(args[1:], stdout, stderr)
+	case "template":
+		return runAgentTemplate(args[1:], stdout, stderr)
 	case "gc":
 		return runAgentGC(args[1:], stdout, stderr)
 	case "subscribe":
@@ -59,9 +61,10 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 
 func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude --repo owner/repo [--path .] [--preset <preset-id>] [--start-daemon]")
+	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude --repo owner/repo [--path .] [--template <template-id>] [--start-daemon]")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
+	fmt.Fprintln(w, "  gitmoot agent template list|show|add|update|diff ...")
 	fmt.Fprintln(w, "  gitmoot agent gc")
 	fmt.Fprintln(w, "  gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] --capability <capability>")
 	fmt.Fprintln(w, "    Codex sessions may use a UUID, thread name, or last. Claude sessions may use a UUID or last. Shell sessions are commands.")
@@ -264,7 +267,7 @@ func printAgentTypeUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent type list")
 	fmt.Fprintln(w, "  gitmoot agent type show <type>")
-	fmt.Fprintln(w, "  gitmoot agent type set <type> --runtime codex|claude --preset <preset-id> --max-background 2 --idle-timeout 20m")
+	fmt.Fprintln(w, "  gitmoot agent type set <type> --runtime codex|claude --template <template-id> --max-background 2 --idle-timeout 20m")
 }
 
 func runAgentTypeList(args []string, stdout, stderr io.Writer) int {
@@ -293,7 +296,7 @@ func runAgentTypeList(args []string, stdout, stderr io.Writer) int {
 	sort.Strings(names)
 	for _, name := range names {
 		entry := types[name]
-		fmt.Fprintf(stdout, "%s\t%s\t%s\t%d\n", entry.Name, entry.Runtime, entry.Preset, entry.MaxBackground)
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%d\n", entry.Name, entry.Runtime, entry.Template, entry.MaxBackground)
 	}
 	return 0
 }
@@ -340,7 +343,7 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	runtimeName := fs.String("runtime", "", "agent runtime: codex or claude")
-	presetID := fs.String("preset", "", "agent prompt preset")
+	templateID := fs.String("template", "", "agent template")
 	role := fs.String("role", "", "agent role")
 	maxBackground := fs.Int("max-background", -1, "maximum managed background instances")
 	idleTimeout := fs.String("idle-timeout", "", "managed instance idle timeout")
@@ -392,8 +395,8 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "invalid runtime: managed agent types support codex or claude")
 		return 2
 	}
-	if strings.TrimSpace(*presetID) != "" {
-		entry.Preset = strings.TrimSpace(*presetID)
+	if strings.TrimSpace(*templateID) != "" {
+		entry.Template = strings.TrimSpace(*templateID)
 	}
 	if strings.TrimSpace(*role) != "" {
 		entry.Role = strings.TrimSpace(*role)
@@ -432,16 +435,16 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 	if len(capabilities) > 0 {
 		entry.Capabilities = compactValues(capabilities)
 	}
-	resolvedRole, resolvedCapabilities, err := resolveAgentDefaults(entry.Preset, entry.Role, entry.Capabilities, name, []string{"ask"})
+	resolvedRole, resolvedCapabilities, err := resolveAgentDefaults(entry.Template, entry.Role, entry.Capabilities, name, []string{"ask"})
 	if err != nil {
-		fmt.Fprintf(stderr, "invalid preset: %v\n", err)
+		fmt.Fprintf(stderr, "invalid template: %v\n", err)
 		return 2
 	}
 	entry.Role = resolvedRole
 	entry.Capabilities = resolvedCapabilities
-	if entry.Preset != "" {
+	if entry.Template != "" {
 		if err := withStore(*home, func(store *db.Store) error {
-			_, err := loadInstalledPreset(context.Background(), store, entry.Preset)
+			_, err := loadInstalledTemplate(context.Background(), store, entry.Template)
 			return err
 		}); err != nil {
 			fmt.Fprintf(stderr, "%v\n", err)
@@ -517,7 +520,7 @@ func loadAgentTypeConfigWithPaths(home string) (config.Paths, map[string]config.
 func printAgentType(stdout io.Writer, entry config.AgentType) {
 	writeLine(stdout, "name: %s", entry.Name)
 	writeLine(stdout, "runtime: %s", entry.Runtime)
-	writeLine(stdout, "preset: %s", entry.Preset)
+	writeLine(stdout, "template: %s", entry.Template)
 	writeLine(stdout, "role: %s", entry.Role)
 	writeLine(stdout, "capabilities: %s", strings.Join(entry.Capabilities, ","))
 	writeLine(stdout, "max_background: %d", entry.MaxBackground)
@@ -533,9 +536,9 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	repoFlag := fs.String("repo", "", "allowed repo as owner/repo")
 	path := fs.String("path", ".", "local checkout path")
 	role := fs.String("role", "", "agent role")
-	presetID := fs.String("preset", "", "agent prompt preset")
+	templateID := fs.String("template", "", "agent template")
 	policy := fs.String("policy", "auto", "autonomy policy")
-	updatePreset := fs.Bool("update-preset", false, "install or refresh the preset before starting")
+	updateTemplate := fs.Bool("update-template", false, "install or refresh the agent template before starting")
 	startDaemon := fs.Bool("start-daemon", false, "start the background daemon after setup")
 	var capabilities repeatedFlag
 	fs.Var(&capabilities, "capability", "agent capability, repeatable")
@@ -566,8 +569,8 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "agent start requires --repo")
 		return 2
 	}
-	if *updatePreset && strings.TrimSpace(*presetID) == "" {
-		fmt.Fprintln(stderr, "agent start --update-preset requires --preset")
+	if *updateTemplate && strings.TrimSpace(*templateID) == "" {
+		fmt.Fprintln(stderr, "agent start --update-template requires --template")
 		return 2
 	}
 	repo, err := daemon.ParseRepository(*repoFlag)
@@ -580,9 +583,9 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "agent start: %v\n", err)
 		return 1
 	}
-	resolvedRole, resolvedCapabilities, err := resolveAgentDefaults(*presetID, *role, capabilities, "agent", []string{"ask", "review", "implement"})
+	resolvedRole, resolvedCapabilities, err := resolveAgentDefaults(*templateID, *role, capabilities, "agent", []string{"ask", "review", "implement"})
 	if err != nil {
-		fmt.Fprintf(stderr, "invalid preset: %v\n", err)
+		fmt.Fprintf(stderr, "invalid template: %v\n", err)
 		return 2
 	}
 	agent := runtime.Agent{
@@ -590,7 +593,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		Role:           resolvedRole,
 		Runtime:        strings.TrimSpace(*runtimeName),
 		RepoScope:      repo.FullName(),
-		PresetID:       strings.TrimSpace(*presetID),
+		TemplateID:     strings.TrimSpace(*templateID),
 		Capabilities:   resolvedCapabilities,
 		AutonomyPolicy: *policy,
 		HealthStatus:   "unknown",
@@ -603,39 +606,39 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "start runtime: shell runtime does not support agent start; use gitmoot agent subscribe --runtime shell --session <command>")
 		return 1
 	}
-	var cachedPreset db.Preset
+	var cachedTemplate db.AgentTemplate
 	if err := withStore(*home, func(store *db.Store) error {
 		if _, err := store.GetAgent(context.Background(), agent.Name); err == nil {
 			return fmt.Errorf("agent %s already exists", agent.Name)
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		if agent.PresetID == "" {
+		if agent.TemplateID == "" {
 			return nil
 		}
-		if *updatePreset {
-			updated, err := updatePresetByID(context.Background(), store, agent.PresetID)
+		if *updateTemplate {
+			updated, err := updateTemplateByID(context.Background(), store, agent.TemplateID)
 			if err != nil {
 				return err
 			}
-			cachedPreset = updated
+			cachedTemplate = updated
 			return nil
 		}
-		installed, err := loadInstalledPreset(context.Background(), store, agent.PresetID)
+		installed, err := loadInstalledTemplate(context.Background(), store, agent.TemplateID)
 		if err != nil {
 			return err
 		}
-		cachedPreset = installed
+		cachedTemplate = installed
 		return nil
 	}); err != nil {
-		if strings.HasPrefix(err.Error(), "preset ") {
+		if strings.HasPrefix(err.Error(), "agent template ") {
 			fmt.Fprintf(stderr, "%v\n", err)
 		} else {
 			fmt.Fprintf(stderr, "agent start: %v\n", err)
 		}
 		return 1
 	}
-	prompt := agentStartupPrompt(agent, cachedPreset)
+	prompt := agentStartupPrompt(agent, cachedTemplate)
 	adapter, err := runtimeStartAdapter(newRuntimeFactory(), agent.Runtime, record.CheckoutPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "load adapter: %v\n", err)
@@ -679,7 +682,7 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, or shell")
 	session := fs.String("session", "", "runtime session reference, last, or shell command")
 	role := fs.String("role", "", "agent role")
-	presetID := fs.String("preset", "", "agent prompt preset")
+	templateID := fs.String("template", "", "agent template")
 	policy := fs.String("policy", "auto", "autonomy policy")
 	var repos repeatedFlag
 	var capabilities repeatedFlag
@@ -714,14 +717,14 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 	if len(normalizedRepos) > 0 {
 		repoScope = normalizedRepos[0]
 	}
-	trimmedPresetID := strings.TrimSpace(*presetID)
-	if trimmedPresetID != "" {
-		if _, ok := preset.Lookup(trimmedPresetID); !ok {
+	trimmedTemplateID := strings.TrimSpace(*templateID)
+	if trimmedTemplateID != "" {
+		if _, ok := agenttemplate.Lookup(trimmedTemplateID); !ok {
 			if err := withStore(*home, func(store *db.Store) error {
-				_, err := loadInstalledPreset(context.Background(), store, trimmedPresetID)
+				_, err := loadInstalledTemplate(context.Background(), store, trimmedTemplateID)
 				return err
 			}); err != nil {
-				if strings.HasPrefix(err.Error(), "preset ") {
+				if strings.HasPrefix(err.Error(), "agent template ") {
 					fmt.Fprintf(stderr, "%v\n", err)
 				} else {
 					fmt.Fprintf(stderr, "subscribe agent: %v\n", err)
@@ -730,9 +733,9 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 			}
 		}
 	}
-	resolvedRole, resolvedCapabilities, err := resolvePresetDefaults(*presetID, *role, capabilities)
+	resolvedRole, resolvedCapabilities, err := resolveTemplateDefaults(*templateID, *role, capabilities)
 	if err != nil {
-		fmt.Fprintf(stderr, "invalid preset: %v\n", err)
+		fmt.Fprintf(stderr, "invalid template: %v\n", err)
 		return 2
 	}
 	agent := runtime.Agent{
@@ -741,7 +744,7 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 		Runtime:        *runtimeName,
 		RuntimeRef:     *session,
 		RepoScope:      repoScope,
-		PresetID:       strings.TrimSpace(*presetID),
+		TemplateID:     strings.TrimSpace(*templateID),
 		Capabilities:   resolvedCapabilities,
 		AutonomyPolicy: *policy,
 		HealthStatus:   "unknown",
@@ -751,14 +754,14 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if err := withStore(*home, func(store *db.Store) error {
-		if agent.PresetID != "" {
-			if _, err := loadInstalledPreset(context.Background(), store, agent.PresetID); err != nil {
+		if agent.TemplateID != "" {
+			if _, err := loadInstalledTemplate(context.Background(), store, agent.TemplateID); err != nil {
 				return err
 			}
 		}
 		return persistAgentSubscription(context.Background(), store, agent, normalizedRepos)
 	}); err != nil {
-		if strings.HasPrefix(err.Error(), "preset ") {
+		if strings.HasPrefix(err.Error(), "agent template ") {
 			fmt.Fprintf(stderr, "%v\n", err)
 		} else {
 			fmt.Fprintf(stderr, "subscribe agent: %v\n", err)
@@ -773,15 +776,15 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func resolvePresetDefaults(presetID string, role string, capabilities []string) (string, []string, error) {
-	return resolveAgentDefaults(presetID, role, capabilities, "", nil)
+func resolveTemplateDefaults(templateID string, role string, capabilities []string) (string, []string, error) {
+	return resolveAgentDefaults(templateID, role, capabilities, "", nil)
 }
 
-func resolveAgentDefaults(presetID string, role string, capabilities []string, fallbackRole string, fallbackCapabilities []string) (string, []string, error) {
-	presetID = strings.TrimSpace(presetID)
+func resolveAgentDefaults(templateID string, role string, capabilities []string, fallbackRole string, fallbackCapabilities []string) (string, []string, error) {
+	templateID = strings.TrimSpace(templateID)
 	role = strings.TrimSpace(role)
 	resolvedCapabilities := compactValues(capabilities)
-	if presetID == "" {
+	if templateID == "" {
 		if role == "" {
 			role = fallbackRole
 		}
@@ -790,20 +793,20 @@ func resolveAgentDefaults(presetID string, role string, capabilities []string, f
 		}
 		return role, resolvedCapabilities, nil
 	}
-	definition, ok := preset.Lookup(presetID)
+	definition, ok := agenttemplate.Lookup(templateID)
 	if !ok {
-		if err := preset.ValidateID(presetID); err != nil {
+		if err := agenttemplate.ValidateID(templateID); err != nil {
 			return "", nil, err
 		}
 		if role == "" {
 			if fallbackRole == "" {
-				return "", nil, fmt.Errorf("preset %s does not define a default role; pass --role", presetID)
+				return "", nil, fmt.Errorf("agent template %s does not define a default role; pass --role", templateID)
 			}
 			role = fallbackRole
 		}
 		if len(resolvedCapabilities) == 0 {
 			if len(fallbackCapabilities) == 0 {
-				return "", nil, fmt.Errorf("preset %s does not define default capabilities; pass --capability", presetID)
+				return "", nil, fmt.Errorf("agent template %s does not define default capabilities; pass --capability", templateID)
 			}
 			resolvedCapabilities = append([]string{}, fallbackCapabilities...)
 		}
@@ -816,18 +819,18 @@ func resolveAgentDefaults(presetID string, role string, capabilities []string, f
 		resolvedCapabilities = append([]string{}, definition.DefaultCapabilities...)
 	}
 	if !definition.Mutation && containsValue(resolvedCapabilities, "implement") {
-		return "", nil, fmt.Errorf("preset %s does not allow implement capability", definition.ID)
+		return "", nil, fmt.Errorf("agent template %s does not allow implement capability", definition.ID)
 	}
 	return role, resolvedCapabilities, nil
 }
 
-func loadInstalledPreset(ctx context.Context, store *db.Store, presetID string) (db.Preset, error) {
-	cached, err := store.GetPreset(ctx, presetID)
+func loadInstalledTemplate(ctx context.Context, store *db.Store, templateID string) (db.AgentTemplate, error) {
+	cached, err := store.GetAgentTemplate(ctx, templateID)
 	if errors.Is(err, sql.ErrNoRows) {
-		if _, ok := preset.Lookup(presetID); !ok {
-			return db.Preset{}, fmt.Errorf("preset %s is not installed; run gitmoot preset add %s --file <path>", presetID, presetID)
+		if _, ok := agenttemplate.Lookup(templateID); !ok {
+			return db.AgentTemplate{}, fmt.Errorf("agent template %s is not installed; run gitmoot agent template add %s --file <path>", templateID, templateID)
 		}
-		return db.Preset{}, fmt.Errorf("preset %s is not installed; run gitmoot preset update %s", presetID, presetID)
+		return db.AgentTemplate{}, fmt.Errorf("agent template %s is not installed; run gitmoot agent template update %s", templateID, templateID)
 	}
 	return cached, err
 }
@@ -839,20 +842,20 @@ func persistAgentSubscription(ctx context.Context, store *db.Store, agent runtim
 	return store.ReplaceAgentRepos(ctx, agent.Name, repos)
 }
 
-func agentStartupPrompt(agent runtime.Agent, cachedPreset db.Preset) string {
+func agentStartupPrompt(agent runtime.Agent, cachedTemplate db.AgentTemplate) string {
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "You are a Gitmoot-managed agent named %s.\n", agent.Name)
 	fmt.Fprintf(&builder, "Runtime: %s\n", agent.Runtime)
 	fmt.Fprintf(&builder, "Allowed repo: %s\n", agent.RepoScope)
 	fmt.Fprintf(&builder, "Role: %s\n", agent.Role)
 	fmt.Fprintf(&builder, "Capabilities: %s\n", strings.Join(agent.Capabilities, ","))
-	if agent.PresetID != "" {
-		fmt.Fprintf(&builder, "Preset: %s", agent.PresetID)
-		if cachedPreset.ResolvedCommit != "" {
-			fmt.Fprintf(&builder, " @ %s", cachedPreset.ResolvedCommit)
+	if agent.TemplateID != "" {
+		fmt.Fprintf(&builder, "Template: %s", agent.TemplateID)
+		if cachedTemplate.ResolvedCommit != "" {
+			fmt.Fprintf(&builder, " @ %s", cachedTemplate.ResolvedCommit)
 		}
-		builder.WriteString("\n\nPreset instructions:\n")
-		builder.WriteString(strings.TrimRight(cachedPreset.Content, "\n"))
+		builder.WriteString("\n\nTemplate instructions:\n")
+		builder.WriteString(strings.TrimRight(cachedTemplate.Content, "\n"))
 		builder.WriteString("\n\n")
 	}
 	builder.WriteString("Initialize this session for future Gitmoot jobs. Do not edit files, run long tasks, create commits, or open pull requests now. Reply with a short readiness acknowledgment only.")
@@ -1183,7 +1186,7 @@ func dbAgent(agent runtime.Agent) db.Agent {
 		Runtime:        agent.Runtime,
 		RuntimeRef:     agent.RuntimeRef,
 		RepoScope:      agent.RepoScope,
-		PresetID:       agent.PresetID,
+		TemplateID:     agent.TemplateID,
 		Capabilities:   agent.Capabilities,
 		AutonomyPolicy: agent.AutonomyPolicy,
 		HealthStatus:   agent.HealthStatus,
@@ -1197,7 +1200,7 @@ func runtimeAgent(agent db.Agent) runtime.Agent {
 		Runtime:        agent.Runtime,
 		RuntimeRef:     agent.RuntimeRef,
 		RepoScope:      agent.RepoScope,
-		PresetID:       agent.PresetID,
+		TemplateID:     agent.TemplateID,
 		Capabilities:   agent.Capabilities,
 		AutonomyPolicy: agent.AutonomyPolicy,
 		HealthStatus:   agent.HealthStatus,

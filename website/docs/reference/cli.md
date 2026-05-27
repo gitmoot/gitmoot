@@ -24,7 +24,7 @@ gitmoot daemon status
 ## Agents
 
 ```sh
-gitmoot agent start <name> --runtime codex --repo owner/repo --preset <preset>
+gitmoot agent start <name> --runtime codex --repo owner/repo --template <template>
 gitmoot agent subscribe <name> --runtime codex --session <id> --repo owner/repo
 gitmoot agent ask <name> --repo owner/repo "question"
 gitmoot agent ask <name> --repo owner/repo --background "queued task"
@@ -34,14 +34,14 @@ gitmoot agent list
 gitmoot agent doctor <name>
 ```
 
-## Presets
+## Agent Templates
 
 ```sh
-gitmoot preset list
-gitmoot preset show <id>
-gitmoot preset update <id>
-gitmoot preset add <id> --file agents/<id>.md
-gitmoot preset diff <id>
+gitmoot agent template list
+gitmoot agent template show <id>
+gitmoot agent template update <id>
+gitmoot agent template add <id> --file agents/<id>.md
+gitmoot agent template diff <id>
 ```
 
 ## Jobs And Locks

@@ -13,7 +13,7 @@ hosted control plane in the current beta.
 - Route PR comments to named local agents.
 - Keep Codex, Claude Code, shell, and future runtimes behind one agent model.
 - Start or subscribe agents with explicit repo access and capabilities.
-- Use presets for reusable planner, review, or custom prompt agents.
+- Use agent templates for reusable planner, review, or custom prompt agents.
 - Track jobs, branch locks, goals, tasks, reviews, and merges locally.
 
 ## How It Works
@@ -30,4 +30,3 @@ GitHub PR comments
 Use the docs here for the human workflow. Agents should also read
 [`SKILL.md`](https://gitmoot.io/SKILL.md) and
 [`llms.txt`](https://gitmoot.io/llms.txt).
-

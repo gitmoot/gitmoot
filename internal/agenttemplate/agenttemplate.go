@@ -1,4 +1,4 @@
-package preset
+package agenttemplate
 
 import (
 	"context"
@@ -19,11 +19,11 @@ import (
 )
 
 const ThermoNuclearCodeQualityReviewID = "thermo-nuclear-code-quality-review"
-const GitmootPlanAndGoalID = "gitmoot-plan-and-goal"
-const GitmootPlanLiteID = "gitmoot-plan-lite"
+const PlannerTemplateID = "planner"
+const PlannerHereTemplateID = "planner-here"
 const LocalSourceRepo = "local"
 const LocalSourceRef = "file"
-const DefaultLocalDescription = "Local custom prompt preset."
+const DefaultLocalDescription = "Local custom prompt agent template."
 
 var idPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`)
 
@@ -52,7 +52,7 @@ var builtins = []Definition{
 	{
 		ID:                  ThermoNuclearCodeQualityReviewID,
 		Name:                "Thermo-Nuclear Code Quality Review",
-		Description:         "Strict review-only preset sourced from Cursor Team Kit.",
+		Description:         "Strict review-only agent template sourced from Cursor Team Kit.",
 		DefaultRole:         "reviewer",
 		DefaultCapabilities: []string{"ask", "review"},
 		Mutation:            false,
@@ -61,26 +61,26 @@ var builtins = []Definition{
 		SourcePath:          "cursor-team-kit/skills/thermo-nuclear-code-quality-review/SKILL.md",
 	},
 	{
-		ID:                  GitmootPlanAndGoalID,
-		Name:                "Gitmoot Plan and Goal Writer",
-		Description:         "Structured planning and standard goal-file preset for Gitmoot workflows.",
+		ID:                  PlannerTemplateID,
+		Name:                "Gitmoot Planner",
+		Description:         "Structured planning and standard goal-file agent template for Gitmoot workflows.",
 		DefaultRole:         "planner",
 		DefaultCapabilities: []string{"ask"},
 		Mutation:            true,
 		SourceRepo:          "jerryfane/gitmoot",
 		SourceRef:           "main",
-		SourcePath:          "skills/gitmoot/presets/gitmoot-plan-and-goal.md",
+		SourcePath:          "skills/gitmoot/agent-templates/planner.md",
 	},
 	{
-		ID:                  GitmootPlanLiteID,
-		Name:                "Gitmoot Plan Lite",
-		Description:         "Fast structured planning preset for current-chat Gitmoot workflows.",
+		ID:                  PlannerHereTemplateID,
+		Name:                "Gitmoot Planner Here",
+		Description:         "Fast structured planning agent template for current-chat Gitmoot workflows.",
 		DefaultRole:         "planner",
 		DefaultCapabilities: []string{"ask"},
 		Mutation:            false,
 		SourceRepo:          "jerryfane/gitmoot",
 		SourceRef:           "main",
-		SourcePath:          "skills/gitmoot/presets/gitmoot-plan-lite.md",
+		SourcePath:          "skills/gitmoot/agent-templates/planner-here.md",
 	},
 }
 
@@ -103,28 +103,28 @@ func Lookup(id string) (Definition, bool) {
 func ValidateID(id string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return errors.New("preset id is required")
+		return errors.New("agent template id is required")
 	}
 	if !idPattern.MatchString(id) {
-		return fmt.Errorf("invalid preset id %q; use lowercase letters, numbers, and single dashes", id)
+		return fmt.Errorf("invalid agent template id %q; use lowercase letters, numbers, and single dashes", id)
 	}
 	return nil
 }
 
-func AddLocal(ctx context.Context, store *db.Store, id string, path string, name string, description string) (db.Preset, error) {
+func AddLocal(ctx context.Context, store *db.Store, id string, path string, name string, description string) (db.AgentTemplate, error) {
 	if store == nil {
-		return db.Preset{}, errors.New("preset store is required")
+		return db.AgentTemplate{}, errors.New("agent template store is required")
 	}
 	id = strings.TrimSpace(id)
 	if err := ValidateID(id); err != nil {
-		return db.Preset{}, err
+		return db.AgentTemplate{}, err
 	}
 	if _, ok := Lookup(id); ok {
-		return db.Preset{}, fmt.Errorf("preset %s is built in and cannot be replaced with a local preset", id)
+		return db.AgentTemplate{}, fmt.Errorf("agent template %s is built in and cannot be replaced with a local template", id)
 	}
 	local, err := readLocal(path)
 	if err != nil {
-		return db.Preset{}, err
+		return db.AgentTemplate{}, err
 	}
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -134,7 +134,7 @@ func AddLocal(ctx context.Context, store *db.Store, id string, path string, name
 	if description == "" {
 		description = DefaultLocalDescription
 	}
-	preset := db.Preset{
+	template := db.AgentTemplate{
 		ID:             id,
 		Name:           name,
 		Description:    description,
@@ -144,22 +144,22 @@ func AddLocal(ctx context.Context, store *db.Store, id string, path string, name
 		ResolvedCommit: HashContent(local.Content),
 		Content:        local.Content,
 	}
-	if err := store.UpsertPreset(ctx, preset); err != nil {
-		return db.Preset{}, err
+	if err := store.UpsertAgentTemplate(ctx, template); err != nil {
+		return db.AgentTemplate{}, err
 	}
-	return store.GetPreset(ctx, preset.ID)
+	return store.GetAgentTemplate(ctx, template.ID)
 }
 
-func UpdateLocal(ctx context.Context, store *db.Store, cached db.Preset) (db.Preset, error) {
+func UpdateLocal(ctx context.Context, store *db.Store, cached db.AgentTemplate) (db.AgentTemplate, error) {
 	if store == nil {
-		return db.Preset{}, errors.New("preset store is required")
+		return db.AgentTemplate{}, errors.New("agent template store is required")
 	}
 	if !IsLocal(cached) {
-		return db.Preset{}, fmt.Errorf("preset %s is not a local custom preset", cached.ID)
+		return db.AgentTemplate{}, fmt.Errorf("agent template %s is not a local custom template", cached.ID)
 	}
 	local, err := readLocal(cached.SourcePath)
 	if err != nil {
-		return db.Preset{}, err
+		return db.AgentTemplate{}, err
 	}
 	updated := cached
 	updated.SourceRepo = LocalSourceRepo
@@ -167,10 +167,10 @@ func UpdateLocal(ctx context.Context, store *db.Store, cached db.Preset) (db.Pre
 	updated.SourcePath = local.Path
 	updated.ResolvedCommit = HashContent(local.Content)
 	updated.Content = local.Content
-	if err := store.UpsertPreset(ctx, updated); err != nil {
-		return db.Preset{}, err
+	if err := store.UpsertAgentTemplate(ctx, updated); err != nil {
+		return db.AgentTemplate{}, err
 	}
-	return store.GetPreset(ctx, updated.ID)
+	return store.GetAgentTemplate(ctx, updated.ID)
 }
 
 func ReadLocalForDiff(path string) (File, string, error) {
@@ -181,8 +181,8 @@ func ReadLocalForDiff(path string) (File, string, error) {
 	return File{Content: local.Content}, HashContent(local.Content), nil
 }
 
-func IsLocal(preset db.Preset) bool {
-	return preset.SourceRepo == LocalSourceRepo && preset.SourceRef == LocalSourceRef
+func IsLocal(template db.AgentTemplate) bool {
+	return template.SourceRepo == LocalSourceRepo && template.SourceRef == LocalSourceRef
 }
 
 func HashContent(content string) string {
@@ -190,26 +190,26 @@ func HashContent(content string) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-func Update(ctx context.Context, store *db.Store, fetcher Fetcher, id string) (db.Preset, error) {
+func Update(ctx context.Context, store *db.Store, fetcher Fetcher, id string) (db.AgentTemplate, error) {
 	if store == nil {
-		return db.Preset{}, errors.New("preset store is required")
+		return db.AgentTemplate{}, errors.New("agent template store is required")
 	}
 	if fetcher == nil {
-		return db.Preset{}, errors.New("preset fetcher is required")
+		return db.AgentTemplate{}, errors.New("agent template fetcher is required")
 	}
 	definition, ok := Lookup(id)
 	if !ok {
-		return db.Preset{}, fmt.Errorf("unknown preset %q", id)
+		return db.AgentTemplate{}, fmt.Errorf("unknown agent template %q", id)
 	}
 	resolvedCommit, err := fetcher.ResolveRef(ctx, definition.SourceRepo, definition.SourceRef)
 	if err != nil {
-		return db.Preset{}, err
+		return db.AgentTemplate{}, err
 	}
 	file, err := fetcher.FetchFile(ctx, definition.SourceRepo, resolvedCommit, definition.SourcePath)
 	if err != nil {
-		return db.Preset{}, err
+		return db.AgentTemplate{}, err
 	}
-	preset := db.Preset{
+	template := db.AgentTemplate{
 		ID:             definition.ID,
 		Name:           definition.Name,
 		Description:    definition.Description,
@@ -219,10 +219,10 @@ func Update(ctx context.Context, store *db.Store, fetcher Fetcher, id string) (d
 		ResolvedCommit: resolvedCommit,
 		Content:        file.Content,
 	}
-	if err := store.UpsertPreset(ctx, preset); err != nil {
-		return db.Preset{}, err
+	if err := store.UpsertAgentTemplate(ctx, template); err != nil {
+		return db.AgentTemplate{}, err
 	}
-	return store.GetPreset(ctx, preset.ID)
+	return store.GetAgentTemplate(ctx, template.ID)
 }
 
 type GHFetcher struct {
@@ -307,27 +307,27 @@ type localFile struct {
 func readLocal(path string) (localFile, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
-		return localFile{}, errors.New("preset file is required")
+		return localFile{}, errors.New("template file is required")
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return localFile{}, fmt.Errorf("resolve preset file path: %w", err)
+		return localFile{}, fmt.Errorf("resolve template file path: %w", err)
 	}
 	abs = filepath.Clean(abs)
 	info, err := os.Stat(abs)
 	if err != nil {
-		return localFile{}, fmt.Errorf("read preset file %s: %w", abs, err)
+		return localFile{}, fmt.Errorf("read template file %s: %w", abs, err)
 	}
 	if info.IsDir() {
-		return localFile{}, fmt.Errorf("preset file %s is a directory", abs)
+		return localFile{}, fmt.Errorf("template file %s is a directory", abs)
 	}
 	data, err := os.ReadFile(abs)
 	if err != nil {
-		return localFile{}, fmt.Errorf("read preset file %s: %w", abs, err)
+		return localFile{}, fmt.Errorf("read template file %s: %w", abs, err)
 	}
 	content := string(data)
 	if strings.TrimSpace(content) == "" {
-		return localFile{}, fmt.Errorf("preset file %s is empty", abs)
+		return localFile{}, fmt.Errorf("template file %s is empty", abs)
 	}
 	return localFile{Path: abs, Content: content}, nil
 }
@@ -344,7 +344,7 @@ func DiffExact(local string, upstream string) string {
 
 func diffLines(local string, upstream string) string {
 	if local == upstream {
-		return "preset content is up to date\n"
+		return "template content is up to date\n"
 	}
 	localLines := strings.Split(local, "\n")
 	upstreamLines := strings.Split(upstream, "\n")

@@ -6,28 +6,28 @@ import (
 )
 
 type JobPrompt struct {
-	Repo                 string
-	Branch               string
-	PullRequest          int
-	Task                 string
-	Sender               string
-	Action               string
-	Instructions         string
-	Constraints          []string
-	PresetID             string
-	PresetResolvedCommit string
-	PresetInstructions   string
+	Repo                   string
+	Branch                 string
+	PullRequest            int
+	Task                   string
+	Sender                 string
+	Action                 string
+	Instructions           string
+	Constraints            []string
+	TemplateID             string
+	TemplateResolvedCommit string
+	TemplateInstructions   string
 }
 
 func RenderJob(prompt JobPrompt) string {
 	var builder strings.Builder
 	builder.WriteString("Gitmoot job\n\n")
 
-	if strings.TrimSpace(prompt.PresetInstructions) != "" {
-		writeField(&builder, "Preset", prompt.PresetID)
-		writeField(&builder, "Preset source commit", prompt.PresetResolvedCommit)
-		builder.WriteString("Preset instructions:\n")
-		builder.WriteString(strings.TrimSpace(prompt.PresetInstructions))
+	if strings.TrimSpace(prompt.TemplateInstructions) != "" {
+		writeField(&builder, "Template", prompt.TemplateID)
+		writeField(&builder, "Template source commit", prompt.TemplateResolvedCommit)
+		builder.WriteString("Template instructions:\n")
+		builder.WriteString(strings.TrimSpace(prompt.TemplateInstructions))
 		builder.WriteString("\n\n")
 	}
 

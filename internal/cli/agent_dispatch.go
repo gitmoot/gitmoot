@@ -209,10 +209,10 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("managed agent type %s reached max_background but no active instance is available", typeName)
 	}
 	instanceAgent := runtimeAgentFromType(agentType, repo, managedAgentInstanceName(typeName))
-	var cachedPreset db.Preset
-	if instanceAgent.PresetID != "" {
+	var cachedTemplate db.AgentTemplate
+	if instanceAgent.TemplateID != "" {
 		var err error
-		cachedPreset, err = store.GetPreset(ctx, instanceAgent.PresetID)
+		cachedTemplate, err = store.GetAgentTemplate(ctx, instanceAgent.TemplateID)
 		if err != nil {
 			return db.Agent{}, noopAgentReservationRelease, err
 		}
@@ -221,7 +221,7 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 	if err != nil {
 		return db.Agent{}, noopAgentReservationRelease, err
 	}
-	started, err := adapter.Start(ctx, runtime.StartRequest{Agent: instanceAgent, Prompt: agentStartupPrompt(instanceAgent, cachedPreset)})
+	started, err := adapter.Start(ctx, runtime.StartRequest{Agent: instanceAgent, Prompt: agentStartupPrompt(instanceAgent, cachedTemplate)})
 	if err != nil {
 		return db.Agent{}, noopAgentReservationRelease, err
 	}
@@ -236,7 +236,7 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 		RuntimeRef:   instanceAgent.RuntimeRef,
 		RepoFullName: repo,
 		Role:         instanceAgent.Role,
-		PresetID:     instanceAgent.PresetID,
+		TemplateID:   instanceAgent.TemplateID,
 		Capabilities: instanceAgent.Capabilities,
 		State:        "idle",
 		CreatedAt:    formatManagedAgentTime(now),
@@ -285,7 +285,7 @@ func runtimeAgentFromType(agentType config.AgentType, repo string, name string) 
 		Role:           agentType.Role,
 		Runtime:        agentType.Runtime,
 		RepoScope:      repo,
-		PresetID:       agentType.Preset,
+		TemplateID:     agentType.Template,
 		Capabilities:   agentType.Capabilities,
 		AutonomyPolicy: "auto",
 		HealthStatus:   "idle",

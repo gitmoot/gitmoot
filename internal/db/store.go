@@ -34,13 +34,13 @@ type Agent struct {
 	Runtime        string
 	RuntimeRef     string
 	RepoScope      string
-	PresetID       string
+	TemplateID     string
 	Capabilities   []string
 	AutonomyPolicy string
 	HealthStatus   string
 }
 
-type Preset struct {
+type AgentTemplate struct {
 	ID             string
 	Name           string
 	Description    string
@@ -65,7 +65,7 @@ type AgentInstance struct {
 	RuntimeRef   string
 	RepoFullName string
 	Role         string
-	PresetID     string
+	TemplateID   string
 	Capabilities []string
 	State        string
 	CreatedAt    string
@@ -326,19 +326,19 @@ func (s *Store) UpsertAgent(ctx context.Context, agent Agent) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO agents(name, role, runtime, runtime_ref, repo_scope, preset_id, capabilities_json, autonomy_policy, health_status, updated_at)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO agents(name, role, runtime, runtime_ref, repo_scope, template_id, capabilities_json, autonomy_policy, health_status, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 			ON CONFLICT(name) DO UPDATE SET
 				role = excluded.role,
 				runtime = excluded.runtime,
 				runtime_ref = excluded.runtime_ref,
 				repo_scope = excluded.repo_scope,
-				preset_id = excluded.preset_id,
+				template_id = excluded.template_id,
 				capabilities_json = excluded.capabilities_json,
 				autonomy_policy = excluded.autonomy_policy,
 				health_status = excluded.health_status,
 				updated_at = CURRENT_TIMESTAMP`,
-		agent.Name, agent.Role, agent.Runtime, agent.RuntimeRef, agent.RepoScope, agent.PresetID, string(capabilities), agent.AutonomyPolicy, agent.HealthStatus); err != nil {
+		agent.Name, agent.Role, agent.Runtime, agent.RuntimeRef, agent.RepoScope, agent.TemplateID, string(capabilities), agent.AutonomyPolicy, agent.HealthStatus); err != nil {
 		return err
 	}
 	if strings.TrimSpace(agent.RepoScope) != "" {
@@ -351,7 +351,7 @@ func (s *Store) UpsertAgent(ctx context.Context, agent Agent) error {
 }
 
 func (s *Store) GetAgent(ctx context.Context, name string) (Agent, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, preset_id, capabilities_json, autonomy_policy, health_status
+	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, capabilities_json, autonomy_policy, health_status
 		FROM agents WHERE name = ?`, name)
 	agent, err := scanAgent(row)
 	if err == nil {
@@ -370,7 +370,7 @@ func (s *Store) GetAgent(ctx context.Context, name string) (Agent, error) {
 		Runtime:        instance.Runtime,
 		RuntimeRef:     instance.RuntimeRef,
 		RepoScope:      instance.RepoFullName,
-		PresetID:       instance.PresetID,
+		TemplateID:     instance.TemplateID,
 		Capabilities:   instance.Capabilities,
 		AutonomyPolicy: "auto",
 		HealthStatus:   instance.State,
@@ -378,7 +378,7 @@ func (s *Store) GetAgent(ctx context.Context, name string) (Agent, error) {
 }
 
 func (s *Store) ListAgents(ctx context.Context) ([]Agent, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, preset_id, capabilities_json, autonomy_policy, health_status
+	rows, err := s.db.QueryContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, capabilities_json, autonomy_policy, health_status
 		FROM agents ORDER BY name`)
 	if err != nil {
 		return nil, err
@@ -498,8 +498,8 @@ func (s *Store) ListAgentRepos(ctx context.Context, agentName string) ([]string,
 	return repos, rows.Err()
 }
 
-func (s *Store) UpsertPreset(ctx context.Context, preset Preset) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO presets(id, name, description, source_repo, source_ref, source_path, resolved_commit, content, updated_at)
+func (s *Store) UpsertAgentTemplate(ctx context.Context, template AgentTemplate) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO agent_templates(id, name, description, source_repo, source_ref, source_path, resolved_commit, content, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
@@ -510,32 +510,32 @@ func (s *Store) UpsertPreset(ctx context.Context, preset Preset) error {
 			resolved_commit = excluded.resolved_commit,
 			content = excluded.content,
 			updated_at = CURRENT_TIMESTAMP`,
-		preset.ID, preset.Name, preset.Description, preset.SourceRepo, preset.SourceRef, preset.SourcePath, preset.ResolvedCommit, preset.Content)
+		template.ID, template.Name, template.Description, template.SourceRepo, template.SourceRef, template.SourcePath, template.ResolvedCommit, template.Content)
 	return err
 }
 
-func (s *Store) GetPreset(ctx context.Context, id string) (Preset, error) {
+func (s *Store) GetAgentTemplate(ctx context.Context, id string) (AgentTemplate, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, name, description, source_repo, source_ref, source_path, resolved_commit, content, created_at, updated_at
-		FROM presets WHERE id = ?`, id)
-	return scanPreset(row)
+		FROM agent_templates WHERE id = ?`, id)
+	return scanAgentTemplate(row)
 }
 
-func (s *Store) ListPresets(ctx context.Context) ([]Preset, error) {
+func (s *Store) ListAgentTemplates(ctx context.Context) ([]AgentTemplate, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, name, description, source_repo, source_ref, source_path, resolved_commit, content, created_at, updated_at
-		FROM presets ORDER BY id`)
+		FROM agent_templates ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	presets := []Preset{}
+	templates := []AgentTemplate{}
 	for rows.Next() {
-		preset, err := scanPreset(rows)
+		template, err := scanAgentTemplate(rows)
 		if err != nil {
 			return nil, err
 		}
-		presets = append(presets, preset)
+		templates = append(templates, template)
 	}
-	return presets, rows.Err()
+	return templates, rows.Err()
 }
 
 func (s *Store) AgentCanAccessRepo(ctx context.Context, agentName string, repoFullName string) (bool, error) {
@@ -556,7 +556,7 @@ func (s *Store) UpsertAgentInstance(ctx context.Context, instance AgentInstance)
 	instance.CreatedAt = normalizeStoredTime(instance.CreatedAt)
 	instance.LastUsedAt = normalizeStoredTime(instance.LastUsedAt)
 	instance.ExpiresAt = normalizeStoredTime(instance.ExpiresAt)
-	_, err = s.db.ExecContext(ctx, `INSERT INTO agent_instances(name, type, runtime, runtime_ref, repo_full_name, role, preset_id, capabilities_json, state, created_at, last_used_at, expires_at)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO agent_instances(name, type, runtime, runtime_ref, repo_full_name, role, template_id, capabilities_json, state, created_at, last_used_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET
 			type = excluded.type,
@@ -564,23 +564,23 @@ func (s *Store) UpsertAgentInstance(ctx context.Context, instance AgentInstance)
 			runtime_ref = excluded.runtime_ref,
 			repo_full_name = excluded.repo_full_name,
 			role = excluded.role,
-			preset_id = excluded.preset_id,
+			template_id = excluded.template_id,
 			capabilities_json = excluded.capabilities_json,
 			state = excluded.state,
 			last_used_at = excluded.last_used_at,
 			expires_at = excluded.expires_at`,
-		instance.Name, instance.Type, instance.Runtime, instance.RuntimeRef, instance.RepoFullName, instance.Role, instance.PresetID, string(capabilities), instance.State, instance.CreatedAt, instance.LastUsedAt, instance.ExpiresAt)
+		instance.Name, instance.Type, instance.Runtime, instance.RuntimeRef, instance.RepoFullName, instance.Role, instance.TemplateID, string(capabilities), instance.State, instance.CreatedAt, instance.LastUsedAt, instance.ExpiresAt)
 	return err
 }
 
 func (s *Store) GetAgentInstance(ctx context.Context, name string) (AgentInstance, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, preset_id, capabilities_json, state, created_at, last_used_at, expires_at
+	row := s.db.QueryRowContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, template_id, capabilities_json, state, created_at, last_used_at, expires_at
 		FROM agent_instances WHERE name = ?`, name)
 	return scanAgentInstance(row)
 }
 
 func (s *Store) FindReusableAgentInstance(ctx context.Context, typ string, repo string, now time.Time) (AgentInstance, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, preset_id, capabilities_json, state, created_at, last_used_at, expires_at
+	row := s.db.QueryRowContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, template_id, capabilities_json, state, created_at, last_used_at, expires_at
 		FROM agent_instances
 		WHERE type = ? AND repo_full_name = ? AND expires_at > ?
 			AND state = 'idle'
@@ -617,7 +617,7 @@ func (s *Store) CountActiveAgentInstances(ctx context.Context, typ string, now t
 }
 
 func (s *Store) FindActiveAgentInstance(ctx context.Context, typ string, repo string, now time.Time) (AgentInstance, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, preset_id, capabilities_json, state, created_at, last_used_at, expires_at
+	row := s.db.QueryRowContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, template_id, capabilities_json, state, created_at, last_used_at, expires_at
 		FROM agent_instances
 		WHERE type = ? AND repo_full_name = ?
 			AND (
@@ -644,7 +644,7 @@ func (s *Store) FindActiveAgentInstance(ctx context.Context, typ string, repo st
 }
 
 func (s *Store) ListAgentInstances(ctx context.Context) ([]AgentInstance, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, preset_id, capabilities_json, state, created_at, last_used_at, expires_at
+	rows, err := s.db.QueryContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, template_id, capabilities_json, state, created_at, last_used_at, expires_at
 		FROM agent_instances ORDER BY type, repo_full_name, name`)
 	if err != nil {
 		return nil, err
@@ -697,7 +697,7 @@ func (s *Store) DeleteExpiredAgentInstances(ctx context.Context, now time.Time) 
 func scanAgentInstance(row interface{ Scan(dest ...any) error }) (AgentInstance, error) {
 	var instance AgentInstance
 	var capabilities string
-	if err := row.Scan(&instance.Name, &instance.Type, &instance.Runtime, &instance.RuntimeRef, &instance.RepoFullName, &instance.Role, &instance.PresetID, &capabilities, &instance.State, &instance.CreatedAt, &instance.LastUsedAt, &instance.ExpiresAt); err != nil {
+	if err := row.Scan(&instance.Name, &instance.Type, &instance.Runtime, &instance.RuntimeRef, &instance.RepoFullName, &instance.Role, &instance.TemplateID, &capabilities, &instance.State, &instance.CreatedAt, &instance.LastUsedAt, &instance.ExpiresAt); err != nil {
 		return AgentInstance{}, err
 	}
 	if strings.TrimSpace(capabilities) != "" {
@@ -1496,7 +1496,7 @@ type agentScanner interface {
 func scanAgent(scanner agentScanner) (Agent, error) {
 	var agent Agent
 	var capabilities string
-	if err := scanner.Scan(&agent.Name, &agent.Role, &agent.Runtime, &agent.RuntimeRef, &agent.RepoScope, &agent.PresetID, &capabilities, &agent.AutonomyPolicy, &agent.HealthStatus); err != nil {
+	if err := scanner.Scan(&agent.Name, &agent.Role, &agent.Runtime, &agent.RuntimeRef, &agent.RepoScope, &agent.TemplateID, &capabilities, &agent.AutonomyPolicy, &agent.HealthStatus); err != nil {
 		return Agent{}, err
 	}
 	if err := json.Unmarshal([]byte(capabilities), &agent.Capabilities); err != nil {
@@ -1505,16 +1505,16 @@ func scanAgent(scanner agentScanner) (Agent, error) {
 	return agent, nil
 }
 
-type presetScanner interface {
+type agentTemplateScanner interface {
 	Scan(dest ...any) error
 }
 
-func scanPreset(scanner presetScanner) (Preset, error) {
-	var preset Preset
-	if err := scanner.Scan(&preset.ID, &preset.Name, &preset.Description, &preset.SourceRepo, &preset.SourceRef, &preset.SourcePath, &preset.ResolvedCommit, &preset.Content, &preset.CreatedAt, &preset.UpdatedAt); err != nil {
-		return Preset{}, err
+func scanAgentTemplate(scanner agentTemplateScanner) (AgentTemplate, error) {
+	var template AgentTemplate
+	if err := scanner.Scan(&template.ID, &template.Name, &template.Description, &template.SourceRepo, &template.SourceRef, &template.SourcePath, &template.ResolvedCommit, &template.Content, &template.CreatedAt, &template.UpdatedAt); err != nil {
+		return AgentTemplate{}, err
 	}
-	return preset, nil
+	return template, nil
 }
 
 func requireAffected(result sql.Result, subject string, id string) error {
@@ -1731,5 +1731,31 @@ CREATE TABLE agent_instances (
 	last_used_at TEXT NOT NULL,
 	expires_at TEXT NOT NULL
 );
+	`,
+	`
+CREATE TABLE agent_templates (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL,
+	description TEXT NOT NULL DEFAULT '',
+	source_repo TEXT NOT NULL,
+	source_ref TEXT NOT NULL,
+	source_path TEXT NOT NULL,
+	resolved_commit TEXT NOT NULL,
+	content TEXT NOT NULL,
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT OR REPLACE INTO agent_templates(id, name, description, source_repo, source_ref, source_path, resolved_commit, content, created_at, updated_at)
+SELECT id, name, description, source_repo, source_ref, source_path, resolved_commit, content, created_at, updated_at
+FROM presets;
+
+DROP TABLE presets;
+
+ALTER TABLE agents ADD COLUMN template_id TEXT NOT NULL DEFAULT '';
+UPDATE agents SET template_id = preset_id WHERE template_id = '' AND preset_id <> '';
+
+ALTER TABLE agent_instances ADD COLUMN template_id TEXT NOT NULL DEFAULT '';
+UPDATE agent_instances SET template_id = preset_id WHERE template_id = '' AND preset_id <> '';
 	`,
 }

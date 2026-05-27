@@ -50,11 +50,11 @@ func TestMailboxEnqueueCreatesQueuedJobAndEvent(t *testing.T) {
 	}
 }
 
-func TestMailboxEnqueueSnapshotsAgentPreset(t *testing.T) {
+func TestMailboxEnqueueSnapshotsAgentTemplate(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	mailbox := Mailbox{Store: store}
-	if err := store.UpsertPreset(ctx, db.Preset{
+	if err := store.UpsertAgentTemplate(ctx, db.AgentTemplate{
 		ID:             "thermo",
 		Name:           "Thermo",
 		SourceRepo:     "cursor/plugins",
@@ -63,7 +63,7 @@ func TestMailboxEnqueueSnapshotsAgentPreset(t *testing.T) {
 		ResolvedCommit: "abc123",
 		Content:        "Review deeply.",
 	}); err != nil {
-		t.Fatalf("UpsertPreset returned error: %v", err)
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
 	}
 	if err := store.UpsertAgent(ctx, db.Agent{
 		Name:         "audit",
@@ -71,7 +71,7 @@ func TestMailboxEnqueueSnapshotsAgentPreset(t *testing.T) {
 		Runtime:      "codex",
 		RuntimeRef:   "last",
 		RepoScope:    "jerryfane/gitmoot",
-		PresetID:     "thermo",
+		TemplateID:   "thermo",
 		Capabilities: []string{"review"},
 	}); err != nil {
 		t.Fatalf("UpsertAgent returned error: %v", err)
@@ -85,7 +85,7 @@ func TestMailboxEnqueueSnapshotsAgentPreset(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Enqueue returned error: %v", err)
 	}
-	if err := store.UpsertPreset(ctx, db.Preset{
+	if err := store.UpsertAgentTemplate(ctx, db.AgentTemplate{
 		ID:             "thermo",
 		Name:           "Thermo",
 		SourceRepo:     "cursor/plugins",
@@ -94,7 +94,7 @@ func TestMailboxEnqueueSnapshotsAgentPreset(t *testing.T) {
 		ResolvedCommit: "def456",
 		Content:        "Updated instructions.",
 	}); err != nil {
-		t.Fatalf("second UpsertPreset returned error: %v", err)
+		t.Fatalf("second UpsertAgentTemplate returned error: %v", err)
 	}
 
 	stored, err := store.GetJob(ctx, "job-1")
@@ -105,12 +105,12 @@ func TestMailboxEnqueueSnapshotsAgentPreset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unmarshalPayload returned error: %v", err)
 	}
-	if payload.PresetID != "thermo" || payload.PresetResolvedCommit != "abc123" || payload.PresetContent != "Review deeply." {
-		t.Fatalf("payload preset snapshot = %+v", payload)
+	if payload.TemplateID != "thermo" || payload.TemplateResolvedCommit != "abc123" || payload.TemplateContent != "Review deeply." {
+		t.Fatalf("payload template snapshot = %+v", payload)
 	}
 }
 
-func TestMailboxRunIncludesPresetSnapshotInPrompt(t *testing.T) {
+func TestMailboxRunIncludesTemplateSnapshotInPrompt(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	mailbox := Mailbox{Store: store}
@@ -119,10 +119,10 @@ func TestMailboxRunIncludesPresetSnapshotInPrompt(t *testing.T) {
 		`{"gitmoot_result":{"decision":"approved","summary":"clean","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
 	}}
 	payload, err := marshalPayload(JobPayload{
-		Repo:                 "jerryfane/gitmoot",
-		PresetID:             "thermo",
-		PresetResolvedCommit: "abc123",
-		PresetContent:        "Review deeply.",
+		Repo:                   "jerryfane/gitmoot",
+		TemplateID:             "thermo",
+		TemplateResolvedCommit: "abc123",
+		TemplateContent:        "Review deeply.",
 	})
 	if err != nil {
 		t.Fatalf("marshalPayload returned error: %v", err)
@@ -134,8 +134,26 @@ func TestMailboxRunIncludesPresetSnapshotInPrompt(t *testing.T) {
 	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	if len(adapter.prompts) != 1 || !strings.Contains(adapter.prompts[0], "Preset instructions:\nReview deeply.") {
+	if len(adapter.prompts) != 1 || !strings.Contains(adapter.prompts[0], "Template instructions:\nReview deeply.") {
 		t.Fatalf("prompt = %+v", adapter.prompts)
+	}
+}
+
+func TestUnmarshalPayloadMapsLegacyPresetSnapshot(t *testing.T) {
+	payload, err := unmarshalPayload(`{"repo":"owner/repo","preset_id":"thermo","preset_resolved_commit":"abc123","preset_content":"Review deeply."}`)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	if payload.TemplateID != "thermo" || payload.TemplateResolvedCommit != "abc123" || payload.TemplateContent != "Review deeply." {
+		t.Fatalf("legacy preset snapshot mapped to %+v", payload)
+	}
+
+	encoded, err := marshalPayload(payload)
+	if err != nil {
+		t.Fatalf("marshalPayload returned error: %v", err)
+	}
+	if strings.Contains(encoded, "preset_") || !strings.Contains(encoded, `"template_id":"thermo"`) {
+		t.Fatalf("payload was not rewritten with template fields: %s", encoded)
 	}
 }
 

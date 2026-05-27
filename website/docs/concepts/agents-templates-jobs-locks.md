@@ -1,26 +1,26 @@
-# Agents, Presets, Jobs, And Locks
+# Agents, Agent Templates, Jobs, And Locks
 
 Gitmoot uses runtime-neutral agent records. A named agent has a runtime, runtime
-reference, repo access, role, capabilities, and optional preset.
+reference, repo access, role, capabilities, and optional template.
 
 ## Agents
 
 Agents can be started by Gitmoot or subscribed from an existing runtime session.
 
 ```sh
-gitmoot agent start planner --runtime codex --repo owner/repo --preset gitmoot-plan-and-goal
+gitmoot agent start project-planner --runtime codex --repo owner/repo --template planner
 gitmoot agent subscribe reviewer --runtime codex --session <session-id> --repo owner/repo --capability review
 ```
 
-## Presets
+## Agent Templates
 
-Presets are reusable prompt/profile bundles. Gitmoot snapshots preset content
+Agent Templates are reusable prompt/profile bundles. Gitmoot snapshots template content
 into each job so the job has reproducible instructions.
 
 ```sh
-gitmoot preset update gitmoot-plan-and-goal
-gitmoot preset update thermo-nuclear-code-quality-review
-gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
+gitmoot agent template update planner
+gitmoot agent template update thermo-nuclear-code-quality-review
+gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 ```
 
 ## Jobs

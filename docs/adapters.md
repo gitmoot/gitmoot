@@ -42,7 +42,7 @@ type Agent struct {
     Runtime        string
     RuntimeRef     string
     RepoScope      string
-    PresetID       string
+    TemplateID       string
     Capabilities   []string
     AutonomyPolicy string
     HealthStatus   string
@@ -51,8 +51,8 @@ type Agent struct {
 
 `RuntimeRef` is runtime-specific. Codex accepts a session UUID, thread name, or
 `last`. Claude accepts a UUID or `last`. Shell uses the configured command.
-`PresetID` is Gitmoot-owned metadata. Adapters do not fetch or interpret preset
-content; Gitmoot snapshots cached preset instructions into the rendered prompt
+`TemplateID` is Gitmoot-owned metadata. Adapters do not fetch or interpret template
+content; Gitmoot snapshots cached template instructions into the rendered prompt
 before delivery.
 
 ## Session Startup
@@ -105,7 +105,7 @@ type Job struct {
 ```
 
 The prompt already includes repo, branch, PR number, task label, sender,
-requested action, cached preset instructions when present, constraints, and the
+requested action, cached template instructions when present, constraints, and the
 required `gitmoot_result` JSON shape. Adapters should pass the prompt through
 without rewriting workflow semantics.
 
@@ -132,17 +132,17 @@ Keep runtime-specific command names, flags, JSON modes, session lookup, and
 fallback behavior inside the adapter package. Do not leak Codex or Claude
 assumptions into workflow, daemon, GitHub, database, or merge-gate code.
 
-## Presets
+## Agent Templates
 
-Presets are prompt/profile bundles layered above runtimes. They are not runtime
+Agent Templates are prompt/profile bundles layered above runtimes. They are not runtime
 adapters and should not create adapter-specific behavior. Gitmoot snapshots
-cached preset content into startup and job prompts before invoking an adapter.
+cached template content into startup and job prompts before invoking an adapter.
 
-The built-in `thermo-nuclear-code-quality-review` preset is fetched explicitly
+The built-in `thermo-nuclear-code-quality-review` template is fetched explicitly
 with:
 
 ```sh
-gitmoot preset update thermo-nuclear-code-quality-review
+gitmoot agent template update thermo-nuclear-code-quality-review
 ```
 
 After it is cached, bind it to a normal runtime-backed agent:
@@ -151,22 +151,22 @@ After it is cached, bind it to a normal runtime-backed agent:
 gitmoot agent start thermo-review \
   --runtime codex \
   --repo owner/repo \
-  --preset thermo-nuclear-code-quality-review
+  --template thermo-nuclear-code-quality-review
 ```
 
-The thermo preset is non-mutating. It supplies reviewer defaults and allows
+The thermo template is non-mutating. It supplies reviewer defaults and allows
 `ask,review`, but it cannot grant `implement`.
 
-Local custom presets are installed from files:
+Local custom agent templates are installed from files:
 
 ```sh
-gitmoot preset add frontend-reviewer --file agents/frontend-reviewer.md
+gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 ```
 
 They store `local@file:<absolute-path>` metadata and a `sha256:<hash>` resolved
-identifier. Adapters should not read those files or decide how presets behave;
+identifier. Adapters should not read those files or decide how agent templates behave;
 workflow code passes only the rendered prompt. After a prompt file changes, the
-user must run `gitmoot preset update <custom-id>` before new jobs use the new
+user must run `gitmoot agent template update <custom-id>` before new jobs use the new
 content.
 
 ## Shell Adapter

@@ -205,12 +205,12 @@ func TestRunAgentStartCreatesCodexSessionAndStoresAgent(t *testing.T) {
 	}
 }
 
-func TestRunAgentStartAppliesInstalledPresetDefaults(t *testing.T) {
+func TestRunAgentStartAppliesInstalledTemplateDefaults(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	seedThermoPreset(t, home)
+	seedThermoTemplate(t, home)
 	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440012"}` + "\n"}}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -222,7 +222,7 @@ func TestRunAgentStartAppliesInstalledPresetDefaults(t *testing.T) {
 		"--runtime", "codex",
 		"--repo", "owner/repo",
 		"--path", repoDir,
-		"--preset", "thermo-nuclear-code-quality-review",
+		"--template", "thermo-nuclear-code-quality-review",
 	}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("start exit code = %d, stderr=%s", code, stderr.String())
@@ -234,16 +234,16 @@ func TestRunAgentStartAppliesInstalledPresetDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAgent returned error: %v", err)
 	}
-	if agent.Role != "reviewer" || agent.PresetID != "thermo-nuclear-code-quality-review" || strings.Join(agent.Capabilities, ",") != "ask,review" {
+	if agent.Role != "reviewer" || agent.TemplateID != "thermo-nuclear-code-quality-review" || strings.Join(agent.Capabilities, ",") != "ask,review" {
 		t.Fatalf("agent = %+v", agent)
 	}
 	prompt := runner.calls[0].args[len(runner.calls[0].args)-1]
-	if !strings.Contains(prompt, "Preset: thermo-nuclear-code-quality-review @ abc123") || !strings.Contains(prompt, "Review deeply.") {
-		t.Fatalf("startup prompt missing preset content:\n%s", prompt)
+	if !strings.Contains(prompt, "Template: thermo-nuclear-code-quality-review @ abc123") || !strings.Contains(prompt, "Review deeply.") {
+		t.Fatalf("startup prompt missing template content:\n%s", prompt)
 	}
 }
 
-func TestRunAgentStartUsesInstalledCustomPreset(t *testing.T) {
+func TestRunAgentStartUsesInstalledCustomTemplate(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -253,8 +253,8 @@ func TestRunAgentStartUsesInstalledCustomPreset(t *testing.T) {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"preset", "add", "frontend-reviewer", "--home", home, "--file", promptPath}, &stdout, &stderr); code != 0 {
-		t.Fatalf("preset add exit code = %d, stderr=%s", code, stderr.String())
+	if code := Run([]string{"agent", "template", "add", "frontend-reviewer", "--home", home, "--file", promptPath}, &stdout, &stderr); code != 0 {
+		t.Fatalf("template add exit code = %d, stderr=%s", code, stderr.String())
 	}
 	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440022"}` + "\n"}}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
@@ -268,7 +268,7 @@ func TestRunAgentStartUsesInstalledCustomPreset(t *testing.T) {
 		"--runtime", "codex",
 		"--repo", "owner/repo",
 		"--path", repoDir,
-		"--preset", "frontend-reviewer",
+		"--template", "frontend-reviewer",
 	}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("start exit code = %d, stderr=%s", code, stderr.String())
@@ -280,21 +280,21 @@ func TestRunAgentStartUsesInstalledCustomPreset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAgent returned error: %v", err)
 	}
-	if agent.Role != "agent" || agent.PresetID != "frontend-reviewer" || strings.Join(agent.Capabilities, ",") != "ask,review,implement" {
+	if agent.Role != "agent" || agent.TemplateID != "frontend-reviewer" || strings.Join(agent.Capabilities, ",") != "ask,review,implement" {
 		t.Fatalf("agent = %+v", agent)
 	}
 	prompt := runner.calls[0].args[len(runner.calls[0].args)-1]
-	if !strings.Contains(prompt, "Preset: frontend-reviewer @ sha256:") || !strings.Contains(prompt, "Review frontend behavior.") {
-		t.Fatalf("startup prompt missing custom preset content:\n%s", prompt)
+	if !strings.Contains(prompt, "Template: frontend-reviewer @ sha256:") || !strings.Contains(prompt, "Review frontend behavior.") {
+		t.Fatalf("startup prompt missing custom template content:\n%s", prompt)
 	}
 }
 
-func TestRunAgentStartAppliesPlannerPresetDefaults(t *testing.T) {
+func TestRunAgentStartAppliesPlannerTemplateDefaults(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	seedPlannerPreset(t, home)
+	seedPlannerTemplate(t, home)
 	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440032"}` + "\n"}}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -306,7 +306,7 @@ func TestRunAgentStartAppliesPlannerPresetDefaults(t *testing.T) {
 		"--runtime", "codex",
 		"--repo", "owner/repo",
 		"--path", repoDir,
-		"--preset", "gitmoot-plan-and-goal",
+		"--template", "planner",
 	}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("start exit code = %d, stderr=%s", code, stderr.String())
@@ -318,21 +318,21 @@ func TestRunAgentStartAppliesPlannerPresetDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAgent returned error: %v", err)
 	}
-	if agent.Role != "planner" || agent.PresetID != "gitmoot-plan-and-goal" || strings.Join(agent.Capabilities, ",") != "ask" {
+	if agent.Role != "planner" || agent.TemplateID != "planner" || strings.Join(agent.Capabilities, ",") != "ask" {
 		t.Fatalf("agent = %+v", agent)
 	}
 	prompt := runner.calls[0].args[len(runner.calls[0].args)-1]
-	if !strings.Contains(prompt, "Preset: gitmoot-plan-and-goal @ def456") || !strings.Contains(prompt, "Plan and write goals.") {
-		t.Fatalf("startup prompt missing planner preset content:\n%s", prompt)
+	if !strings.Contains(prompt, "Template: planner @ def456") || !strings.Contains(prompt, "Plan and write goals.") {
+		t.Fatalf("startup prompt missing planner template content:\n%s", prompt)
 	}
 }
 
-func TestRunAgentStartAllowsImplementForPlannerPreset(t *testing.T) {
+func TestRunAgentStartAllowsImplementForPlannerTemplate(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	seedPlannerPreset(t, home)
+	seedPlannerTemplate(t, home)
 	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440033"}` + "\n"}}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -344,7 +344,7 @@ func TestRunAgentStartAllowsImplementForPlannerPreset(t *testing.T) {
 		"--runtime", "codex",
 		"--repo", "owner/repo",
 		"--path", repoDir,
-		"--preset", "gitmoot-plan-and-goal",
+		"--template", "planner",
 		"--capability", "ask",
 		"--capability", "implement",
 	}, &stdout, &stderr)
@@ -371,7 +371,7 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 	runGit(t, repoDir, "branch", "-m", "main")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
 	t.Chdir(repoDir)
-	seedPlannerPreset(t, home)
+	seedPlannerTemplate(t, home)
 
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{
@@ -380,7 +380,7 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 		"--runtime", "codex",
 		"--session", "550e8400-e29b-41d4-a716-446655440021",
 		"--repo", "owner/repo",
-		"--preset", "gitmoot-plan-and-goal",
+		"--template", "planner",
 	}, &stdout, &stderr); code != 0 {
 		t.Fatalf("subscribe exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -446,8 +446,8 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("daemonJobPayload returned error: %v", err)
 	}
-	if payload.PresetID != "gitmoot-plan-and-goal" || payload.PresetResolvedCommit != "def456" || !strings.Contains(payload.PresetContent, "Plan and write goals.") {
-		t.Fatalf("payload preset snapshot = %+v", payload)
+	if payload.TemplateID != "planner" || payload.TemplateResolvedCommit != "def456" || !strings.Contains(payload.TemplateContent, "Plan and write goals.") {
+		t.Fatalf("payload template snapshot = %+v", payload)
 	}
 	if payload.PullRequest != 0 || payload.Sender != "local" || payload.Instructions != "Write a plan" {
 		t.Fatalf("payload local ask fields = %+v", payload)
@@ -478,7 +478,7 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("job show exit code = %d, stderr=%s", code, stderr.String())
 	}
-	for _, want := range []string{`"preset_id": "gitmoot-plan-and-goal"`, "decision: approved", "summary: plan ready"} {
+	for _, want := range []string{`"template_id": "planner"`, "decision: approved", "summary: plan ready"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("job show output missing %q:\n%s", want, stdout.String())
 		}
@@ -998,7 +998,7 @@ func TestRunAgentTypeSetMaxBackgroundCountsQueuedExpiredInstance(t *testing.T) {
 	}
 }
 
-func TestRunAgentTypeSetValidatesPreset(t *testing.T) {
+func TestRunAgentTypeSetValidatesTemplate(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer
 
@@ -1006,12 +1006,12 @@ func TestRunAgentTypeSetValidatesPreset(t *testing.T) {
 		"agent", "type", "set", "planner",
 		"--home", home,
 		"--runtime", "codex",
-		"--preset", "missing-preset",
+		"--template", "missing-template",
 	}, &stdout, &stderr)
 	if code != 1 {
-		t.Fatalf("agent type set missing preset exit code = %d, want 1", code)
+		t.Fatalf("agent type set missing template exit code = %d, want 1", code)
 	}
-	if !strings.Contains(stderr.String(), "preset missing-preset is not installed") {
+	if !strings.Contains(stderr.String(), "agent template missing-template is not installed") {
 		t.Fatalf("stderr = %q", stderr.String())
 	}
 }
@@ -1244,7 +1244,7 @@ func hasCLIJobEvent(events []db.JobEvent, kind string) bool {
 	return false
 }
 
-func TestRunAgentStartRejectsMissingPresetBeforeRuntime(t *testing.T) {
+func TestRunAgentStartRejectsMissingTemplateBeforeRuntime(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -1260,21 +1260,21 @@ func TestRunAgentStartRejectsMissingPresetBeforeRuntime(t *testing.T) {
 		"--runtime", "codex",
 		"--repo", "owner/repo",
 		"--path", repoDir,
-		"--preset", "thermo-nuclear-code-quality-review",
+		"--template", "thermo-nuclear-code-quality-review",
 	}, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("start exit code = %d, want 1", code)
 	}
-	want := "preset thermo-nuclear-code-quality-review is not installed; run gitmoot preset update thermo-nuclear-code-quality-review"
+	want := "agent template thermo-nuclear-code-quality-review is not installed; run gitmoot agent template update thermo-nuclear-code-quality-review"
 	if strings.TrimSpace(stderr.String()) != want {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
 	}
 	if len(runner.calls) != 0 {
-		t.Fatalf("runtime was started before preset validation: %+v", runner.calls)
+		t.Fatalf("runtime was started before template validation: %+v", runner.calls)
 	}
 }
 
-func TestRunAgentStartRejectsMissingCustomPresetBeforeRuntime(t *testing.T) {
+func TestRunAgentStartRejectsMissingCustomTemplateBeforeRuntime(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -1290,17 +1290,17 @@ func TestRunAgentStartRejectsMissingCustomPresetBeforeRuntime(t *testing.T) {
 		"--runtime", "codex",
 		"--repo", "owner/repo",
 		"--path", repoDir,
-		"--preset", "frontend-reviewer",
+		"--template", "frontend-reviewer",
 	}, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("start exit code = %d, want 1", code)
 	}
-	want := "preset frontend-reviewer is not installed; run gitmoot preset add frontend-reviewer --file <path>"
+	want := "agent template frontend-reviewer is not installed; run gitmoot agent template add frontend-reviewer --file <path>"
 	if strings.TrimSpace(stderr.String()) != want {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
 	}
 	if len(runner.calls) != 0 {
-		t.Fatalf("runtime was started before preset validation: %+v", runner.calls)
+		t.Fatalf("runtime was started before template validation: %+v", runner.calls)
 	}
 }
 
@@ -1331,12 +1331,12 @@ func TestRunAgentStartRejectsExistingAgentBeforeRuntime(t *testing.T) {
 	}
 }
 
-func TestRunAgentStartUpdatePresetInstallsBeforeStart(t *testing.T) {
+func TestRunAgentStartUpdateTemplateInstallsBeforeStart(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	restoreFetcher := replacePresetFetcher(fakePresetFetcher{content: "Updated review instructions."})
+	restoreFetcher := replaceAgentTemplateFetcher(fakeAgentTemplateFetcher{content: "Updated review instructions."})
 	defer restoreFetcher()
 	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440013"}` + "\n"}}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
@@ -1349,24 +1349,24 @@ func TestRunAgentStartUpdatePresetInstallsBeforeStart(t *testing.T) {
 		"--runtime", "codex",
 		"--repo", "owner/repo",
 		"--path", repoDir,
-		"--preset", "thermo-nuclear-code-quality-review",
-		"--update-preset",
+		"--template", "thermo-nuclear-code-quality-review",
+		"--update-template",
 	}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("start exit code = %d, stderr=%s", code, stderr.String())
 	}
 	prompt := runner.calls[0].args[len(runner.calls[0].args)-1]
 	if !strings.Contains(prompt, "Updated review instructions.") {
-		t.Fatalf("startup prompt missing updated preset:\n%s", prompt)
+		t.Fatalf("startup prompt missing updated template:\n%s", prompt)
 	}
 }
 
-func TestRunAgentStartRejectsShellRuntimeBeforePresetUpdate(t *testing.T) {
+func TestRunAgentStartRejectsShellRuntimeBeforeTemplateUpdate(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	restoreFetcher := replacePresetFetcher(fakePresetFetcher{content: "should not fetch"})
+	restoreFetcher := replaceAgentTemplateFetcher(fakeAgentTemplateFetcher{content: "should not fetch"})
 	defer restoreFetcher()
 	runner := &agentStartRunner{}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
@@ -1379,8 +1379,8 @@ func TestRunAgentStartRejectsShellRuntimeBeforePresetUpdate(t *testing.T) {
 		"--runtime", "shell",
 		"--repo", "owner/repo",
 		"--path", repoDir,
-		"--preset", "thermo-nuclear-code-quality-review",
-		"--update-preset",
+		"--template", "thermo-nuclear-code-quality-review",
+		"--update-template",
 	}, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("start exit code = %d, want 1", code)
@@ -1393,12 +1393,12 @@ func TestRunAgentStartRejectsShellRuntimeBeforePresetUpdate(t *testing.T) {
 	}
 	store := openCLIJobStore(t, home)
 	defer store.Close()
-	if _, err := store.GetPreset(context.Background(), "thermo-nuclear-code-quality-review"); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("preset lookup error = %v, want sql.ErrNoRows", err)
+	if _, err := store.GetAgentTemplate(context.Background(), "thermo-nuclear-code-quality-review"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("template lookup error = %v, want sql.ErrNoRows", err)
 	}
 }
 
-func TestRunAgentSubscribeAppliesInstalledPresetDefaults(t *testing.T) {
+func TestRunAgentSubscribeAppliesInstalledTemplateDefaults(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
@@ -1408,7 +1408,7 @@ func TestRunAgentSubscribeAppliesInstalledPresetDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	if err := store.UpsertPreset(context.Background(), db.Preset{
+	if err := store.UpsertAgentTemplate(context.Background(), db.AgentTemplate{
 		ID:             "thermo-nuclear-code-quality-review",
 		Name:           "Thermo-Nuclear Code Quality Review",
 		SourceRepo:     "cursor/plugins",
@@ -1417,7 +1417,7 @@ func TestRunAgentSubscribeAppliesInstalledPresetDefaults(t *testing.T) {
 		ResolvedCommit: "abc123",
 		Content:        "Review deeply.",
 	}); err != nil {
-		t.Fatalf("UpsertPreset returned error: %v", err)
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close returned error: %v", err)
@@ -1431,7 +1431,7 @@ func TestRunAgentSubscribeAppliesInstalledPresetDefaults(t *testing.T) {
 		"--runtime", "codex",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
 		"--repo", "jerryfane/gitmoot",
-		"--preset", "thermo-nuclear-code-quality-review",
+		"--template", "thermo-nuclear-code-quality-review",
 	}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("subscribe exit code = %d, stderr=%s", code, stderr.String())
@@ -1446,20 +1446,20 @@ func TestRunAgentSubscribeAppliesInstalledPresetDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAgent returned error: %v", err)
 	}
-	if agent.Role != "reviewer" || agent.PresetID != "thermo-nuclear-code-quality-review" || strings.Join(agent.Capabilities, ",") != "ask,review" {
+	if agent.Role != "reviewer" || agent.TemplateID != "thermo-nuclear-code-quality-review" || strings.Join(agent.Capabilities, ",") != "ask,review" {
 		t.Fatalf("agent = %+v", agent)
 	}
 }
 
-func TestRunAgentSubscribeUsesInstalledCustomPreset(t *testing.T) {
+func TestRunAgentSubscribeUsesInstalledCustomTemplate(t *testing.T) {
 	home := t.TempDir()
 	promptPath := filepath.Join(t.TempDir(), "frontend.md")
 	if err := os.WriteFile(promptPath, []byte("Review frontend behavior.\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"preset", "add", "frontend-reviewer", "--home", home, "--file", promptPath}, &stdout, &stderr); code != 0 {
-		t.Fatalf("preset add exit code = %d, stderr=%s", code, stderr.String())
+	if code := Run([]string{"agent", "template", "add", "frontend-reviewer", "--home", home, "--file", promptPath}, &stdout, &stderr); code != 0 {
+		t.Fatalf("template add exit code = %d, stderr=%s", code, stderr.String())
 	}
 
 	stdout.Reset()
@@ -1470,7 +1470,7 @@ func TestRunAgentSubscribeUsesInstalledCustomPreset(t *testing.T) {
 		"--runtime", "codex",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
 		"--repo", "jerryfane/gitmoot",
-		"--preset", "frontend-reviewer",
+		"--template", "frontend-reviewer",
 		"--role", "reviewer",
 	}, &stdout, &stderr)
 	if code != 2 {
@@ -1488,7 +1488,7 @@ func TestRunAgentSubscribeUsesInstalledCustomPreset(t *testing.T) {
 		"--runtime", "codex",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
 		"--repo", "jerryfane/gitmoot",
-		"--preset", "frontend-reviewer",
+		"--template", "frontend-reviewer",
 		"--role", "reviewer",
 		"--capability", "ask",
 		"--capability", "review",
@@ -1503,12 +1503,12 @@ func TestRunAgentSubscribeUsesInstalledCustomPreset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAgent returned error: %v", err)
 	}
-	if agent.Role != "reviewer" || agent.PresetID != "frontend-reviewer" || strings.Join(agent.Capabilities, ",") != "ask,review" {
+	if agent.Role != "reviewer" || agent.TemplateID != "frontend-reviewer" || strings.Join(agent.Capabilities, ",") != "ask,review" {
 		t.Fatalf("agent = %+v", agent)
 	}
 }
 
-func TestRunAgentSubscribeRejectsMissingPresetAndImplementCapability(t *testing.T) {
+func TestRunAgentSubscribeRejectsMissingTemplateAndImplementCapability(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
@@ -1517,12 +1517,12 @@ func TestRunAgentSubscribeRejectsMissingPresetAndImplementCapability(t *testing.
 		"--runtime", "codex",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
 		"--repo", "jerryfane/gitmoot",
-		"--preset", "frontend-reviewer",
+		"--template", "frontend-reviewer",
 	}, &stdout, &stderr)
 	if code != 1 {
-		t.Fatalf("missing custom preset exit code = %d, want 1", code)
+		t.Fatalf("missing custom template exit code = %d, want 1", code)
 	}
-	want := "preset frontend-reviewer is not installed; run gitmoot preset add frontend-reviewer --file <path>"
+	want := "agent template frontend-reviewer is not installed; run gitmoot agent template add frontend-reviewer --file <path>"
 	if strings.TrimSpace(stderr.String()) != want {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
 	}
@@ -1535,12 +1535,12 @@ func TestRunAgentSubscribeRejectsMissingPresetAndImplementCapability(t *testing.
 		"--runtime", "codex",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
 		"--repo", "jerryfane/gitmoot",
-		"--preset", "thermo-nuclear-code-quality-review",
+		"--template", "thermo-nuclear-code-quality-review",
 	}, &stdout, &stderr)
 	if code != 1 {
-		t.Fatalf("missing preset exit code = %d, want 1", code)
+		t.Fatalf("missing template exit code = %d, want 1", code)
 	}
-	want = "preset thermo-nuclear-code-quality-review is not installed; run gitmoot preset update thermo-nuclear-code-quality-review"
+	want = "agent template thermo-nuclear-code-quality-review is not installed; run gitmoot agent template update thermo-nuclear-code-quality-review"
 	if strings.TrimSpace(stderr.String()) != want {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
 	}
@@ -1554,7 +1554,7 @@ func TestRunAgentSubscribeRejectsMissingPresetAndImplementCapability(t *testing.
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	if err := store.UpsertPreset(context.Background(), db.Preset{
+	if err := store.UpsertAgentTemplate(context.Background(), db.AgentTemplate{
 		ID:             "thermo-nuclear-code-quality-review",
 		Name:           "Thermo-Nuclear Code Quality Review",
 		SourceRepo:     "cursor/plugins",
@@ -1563,7 +1563,7 @@ func TestRunAgentSubscribeRejectsMissingPresetAndImplementCapability(t *testing.
 		ResolvedCommit: "abc123",
 		Content:        "Review deeply.",
 	}); err != nil {
-		t.Fatalf("UpsertPreset returned error: %v", err)
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close returned error: %v", err)
@@ -1577,7 +1577,7 @@ func TestRunAgentSubscribeRejectsMissingPresetAndImplementCapability(t *testing.
 		"--runtime", "codex",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
 		"--repo", "jerryfane/gitmoot",
-		"--preset", "thermo-nuclear-code-quality-review",
+		"--template", "thermo-nuclear-code-quality-review",
 		"--capability", "implement",
 	}, &stdout, &stderr)
 	if code != 2 {
@@ -1638,7 +1638,7 @@ func TestRunAgentDoctorPersistsHealth(t *testing.T) {
 	}
 }
 
-func seedThermoPreset(t *testing.T, home string) {
+func seedThermoTemplate(t *testing.T, home string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
@@ -1649,7 +1649,7 @@ func seedThermoPreset(t *testing.T, home string) {
 		t.Fatalf("open store: %v", err)
 	}
 	defer store.Close()
-	if err := store.UpsertPreset(context.Background(), db.Preset{
+	if err := store.UpsertAgentTemplate(context.Background(), db.AgentTemplate{
 		ID:             "thermo-nuclear-code-quality-review",
 		Name:           "Thermo-Nuclear Code Quality Review",
 		SourceRepo:     "cursor/plugins",
@@ -1658,11 +1658,11 @@ func seedThermoPreset(t *testing.T, home string) {
 		ResolvedCommit: "abc123",
 		Content:        "Review deeply.",
 	}); err != nil {
-		t.Fatalf("UpsertPreset returned error: %v", err)
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
 	}
 }
 
-func seedPlannerPreset(t *testing.T, home string) {
+func seedPlannerTemplate(t *testing.T, home string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
@@ -1673,16 +1673,16 @@ func seedPlannerPreset(t *testing.T, home string) {
 		t.Fatalf("open store: %v", err)
 	}
 	defer store.Close()
-	if err := store.UpsertPreset(context.Background(), db.Preset{
-		ID:             "gitmoot-plan-and-goal",
+	if err := store.UpsertAgentTemplate(context.Background(), db.AgentTemplate{
+		ID:             "planner",
 		Name:           "Gitmoot Plan and Goal Writer",
 		SourceRepo:     "jerryfane/gitmoot",
 		SourceRef:      "main",
-		SourcePath:     "skills/gitmoot/presets/gitmoot-plan-and-goal.md",
+		SourcePath:     "skills/gitmoot/agent-templates/planner.md",
 		ResolvedCommit: "def456",
 		Content:        "Plan and write goals.",
 	}); err != nil {
-		t.Fatalf("UpsertPreset returned error: %v", err)
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
 	}
 }
 

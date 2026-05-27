@@ -1,7 +1,7 @@
 # Gitmoot
 
 Gitmoot is a local-first coordinator for AI agents working across repositories,
-goals, reviews, pull request comments, daemon jobs, branch locks, presets, and
+goals, reviews, pull request comments, daemon jobs, branch locks, agent templates, and
 Codex or Claude Code runtime workflows.
 
 ## Start Here
@@ -17,7 +17,7 @@ Codex or Claude Code runtime workflows.
 - [CLI Reference](https://gitmoot.io/docs/reference/cli): Common commands and command groups.
 - [Runtime Adapters](https://gitmoot.io/docs/reference/runtime-adapters): Codex, Claude Code, shell, and future runtimes.
 - [Codex And Claude Plugins](https://gitmoot.io/docs/plugins/codex-claude): Plugin discovery and runtime skill setup.
-- [Troubleshooting](https://gitmoot.io/docs/operations/troubleshooting): Diagnose GitHub auth, runtimes, presets, remotes, permissions, and locks.
+- [Troubleshooting](https://gitmoot.io/docs/operations/troubleshooting): Diagnose GitHub auth, runtimes, agent templates, remotes, permissions, and locks.
 - [Raw SKILL.md](https://gitmoot.io/SKILL.md): Agent skill entrypoint.
 - [Full LLM Context](https://gitmoot.io/llms-full.txt): Expanded Markdown context for agents.
 - [GitHub Repository](https://github.com/jerryfane/gitmoot): Source code and releases.

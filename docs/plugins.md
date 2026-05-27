@@ -98,7 +98,7 @@ planner unless the user asks for a queued job. Ask Codex:
 Use the Gitmoot planner here. Write the implementation plan.
 ```
 
-Codex should apply the packaged `presets/gitmoot-plan-lite.md` instructions,
+Codex should apply the packaged `agent-templates/planner-here.md` instructions,
 inspect the relevant repo files, search only for current external contracts when
 needed, and return the plan directly in the current conversation.
 
@@ -106,18 +106,18 @@ When you want the current Codex chat to invoke a registered background-capable
 Gitmoot agent, route that request through the CLI:
 
 ```text
-$gitmoot:gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
+$gitmoot:gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
 ```
 
 Without the chat command bridge, ask Codex to run the same shell command:
 
 ```sh
-gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
 gitmoot job watch <job-id>
 ```
 
 This keeps background asks on the same Gitmoot agent registry, repo access,
-runtime adapter, cached preset, and job history path as PR-comment ask jobs.
+runtime adapter, cached template, and job history path as PR-comment ask jobs.
 
 ## Use From Claude Code
 
@@ -136,7 +136,7 @@ For a registered background-agent ask from Claude Code, use the same CLI
 command:
 
 ```sh
-gitmoot agent ask planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
 gitmoot job watch <job-id>
 ```
 

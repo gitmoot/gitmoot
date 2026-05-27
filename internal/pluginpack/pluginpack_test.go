@@ -114,12 +114,12 @@ func TestBuildUsesEmbeddedSkillByDefault(t *testing.T) {
 	}
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "SKILL.md"), "Gitmoot Agent Skill")
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "SKILL.md"), "gitmoot agent ask <agent>")
-	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "CLI.md"), "gitmoot agent ask planner --repo owner/repo")
+	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "CLI.md"), "gitmoot agent ask project-planner --repo owner/repo")
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "WORKFLOWS.md"), "Planner Here")
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "GOAL_TEMPLATE.md"), "codex exec review is clean; ready for manual /review.")
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "RESULT_CONTRACT.md"), "gitmoot_result")
-	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "presets", "gitmoot-plan-and-goal.md"), "Gitmoot Plan And Goal Writer")
-	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "presets", "gitmoot-plan-lite.md"), "Gitmoot Plan Lite")
+	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "agent-templates", "planner.md"), "Gitmoot Planner")
+	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "agent-templates", "planner-here.md"), "Gitmoot Planner Here")
 }
 
 func TestBuildRefusesOverwriteWithoutForce(t *testing.T) {
