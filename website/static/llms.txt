@@ -12,6 +12,7 @@ workflows.
 - [Quick Start](https://gitmoot.io/docs/getting-started/quick-start): Register a repo, start a planner, and route work.
 - [PR Comment Workflow](https://gitmoot.io/docs/workflows/pr-comment-workflow): Route auditable work from GitHub comments.
 - [Planner And Goal Workflow](https://gitmoot.io/docs/workflows/planner-goal-workflow): Create structured plans and goal files.
+- [Template Capture Workflow](https://gitmoot.io/docs/workflows/template-capture-workflow): Turn a current chat workflow into a reviewed reusable template.
 
 ## References
 

@@ -199,6 +199,32 @@ same checkout remain serialized even when the worker count is higher.
    gitmoot agent template update frontend-reviewer
    ```
 
+   To create a new custom template from a successful current chat, use template
+   capture. The current Codex or Claude chat distills visible conversation,
+   inspected files, commands, corrections, and durable workflow rules into a
+   draft. Gitmoot cannot read hidden model memory, so capture is always
+   draft-first and user-reviewed.
+
+   ```text
+   Use Gitmoot to capture this session as agent template release-planner. Draft only.
+   ```
+
+   A blank scaffold is also available when you want to write the template by
+   hand:
+
+   ```sh
+   gitmoot agent template draft release-planner
+   gitmoot agent template validate .gitmoot/templates/release-planner.md
+   gitmoot agent template add release-planner --file .gitmoot/templates/release-planner.md
+   gitmoot agent prompt release-planner
+   ```
+
+   `agent template draft` creates the structure, current-chat capture fills it
+   from visible context, `agent template validate` performs a structural check,
+   `agent template add` installs a snapshot, `agent prompt` reuses it in the
+   current chat, and `agent start --template` creates a runnable background
+   agent instance.
+
    After startup, open a created Codex session later with the session id printed
    by Gitmoot:
 

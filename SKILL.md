@@ -50,6 +50,10 @@ agent template from this chat" mean read
 current-chat context into a draft template. Gitmoot cannot read hidden model
 memory or runtime internals. Do not install, overwrite, or update a permanent
 template unless the user explicitly approves that step.
+Use `gitmoot agent template draft <id>` for a blank scaffold,
+`gitmoot agent template validate <file>` for a structural check,
+`gitmoot agent template add <id> --file <file>` to install a snapshot, and
+`gitmoot agent prompt <id>` to reuse the installed template in the current chat.
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
@@ -168,6 +172,15 @@ After editing a local prompt file, refresh Gitmoot's cached snapshot explicitly:
 ```sh
 gitmoot agent template diff frontend-reviewer
 gitmoot agent template update frontend-reviewer
+```
+
+Draft and validate a captured template before installing it:
+
+```sh
+gitmoot agent template draft release-planner
+gitmoot agent template validate .gitmoot/templates/release-planner.md
+gitmoot agent template add release-planner --file .gitmoot/templates/release-planner.md
+gitmoot agent prompt release-planner
 ```
 
 ## Agent Job Contract

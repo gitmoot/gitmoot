@@ -14,6 +14,8 @@ hosted control plane in the current beta.
 - Keep Codex, Claude Code, shell, and future runtimes behind one agent model.
 - Start or subscribe agents with explicit repo access and capabilities.
 - Use agent templates for reusable planner, review, or custom prompt agents.
+- Capture a successful current chat as a reviewed, reusable agent template
+  draft.
 - Import a cached agent prompt into the current chat with
   `gitmoot agent prompt <agent-or-template>`.
 - Track jobs, branch locks, goals, tasks, reviews, and merges locally.

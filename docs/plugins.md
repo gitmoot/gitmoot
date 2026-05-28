@@ -112,6 +112,21 @@ gitmoot agent prompt <agent-or-template>
 Then Codex should apply the returned prompt content in the current chat without
 creating a Gitmoot job.
 
+For template capture, keep the work in the current chat. Ask Codex to read the
+Gitmoot template-capture instructions and draft a file from visible context:
+
+```text
+Use Gitmoot to capture this session as agent template release-planner. Draft only.
+```
+
+Codex should not call `gitmoot agent ask`, start a daemon, or install the
+template unless the user explicitly asks. After review, install the draft with:
+
+```sh
+gitmoot agent template validate .gitmoot/templates/release-planner.md
+gitmoot agent template add release-planner --file .gitmoot/templates/release-planner.md
+```
+
 When you want the current Codex chat to invoke a registered background-capable
 Gitmoot agent, route that request through the CLI:
 
@@ -155,6 +170,16 @@ path.
 
 For fast current-chat planning, ask Claude Code to use the Gitmoot planner here
 instead of starting a background `gitmoot agent ask` job.
+
+For current-chat template capture, ask Claude Code:
+
+```text
+Use Gitmoot to capture this session as agent template release-planner. Draft only.
+```
+
+Claude Code should apply the bundled template-capture instructions locally,
+write or return a draft, and wait for explicit approval before validation or
+installation.
 
 ## Troubleshooting
 

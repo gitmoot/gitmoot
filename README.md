@@ -212,6 +212,36 @@ The runtime should load the prompt with:
 gitmoot agent prompt frontend-reviewer
 ```
 
+### Template Capture
+
+Template capture turns a useful current Codex or Claude chat workflow into a
+reusable agent template. Capture happens in the current chat from visible
+conversation context and inspected files; Gitmoot does not read hidden model
+state or runtime memory.
+
+Draft a blank structure when starting from scratch:
+
+```sh
+gitmoot agent template draft release-planner
+```
+
+Or ask the current chat to fill the structure from the visible session:
+
+```text
+Use Gitmoot to capture this session as agent template release-planner. Draft only.
+```
+
+Review the draft before installing it:
+
+```sh
+gitmoot agent template validate .gitmoot/templates/release-planner.md
+gitmoot agent template add release-planner --file .gitmoot/templates/release-planner.md
+gitmoot agent prompt release-planner
+```
+
+Installed custom templates are snapshots. After editing the source file, run
+`gitmoot agent template diff <id>` and `gitmoot agent template update <id>`.
+
 ### Jobs, Locks, And Recovery
 
 ```sh

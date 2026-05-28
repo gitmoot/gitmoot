@@ -160,6 +160,19 @@ This prints the prompt content for the current chat to apply locally. It does
 not create a job, start a daemon, resume a runtime session, or post a PR
 comment.
 
+Draft and validate a captured template before installing it:
+
+```sh
+gitmoot agent template draft release-planner
+gitmoot agent template validate .gitmoot/templates/release-planner.md
+gitmoot agent template add release-planner --file .gitmoot/templates/release-planner.md
+```
+
+`agent template draft` only creates the standard markdown structure. For
+current-chat capture, the active Codex or Claude chat reads
+`references/TEMPLATE_CAPTURE.md` and fills that structure from visible
+conversation context. Gitmoot does not extract hidden runtime memory.
+
 Create a local custom prompt template:
 
 ```sh

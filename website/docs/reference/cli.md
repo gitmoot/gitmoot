@@ -41,6 +41,8 @@ gitmoot agent doctor <name>
 gitmoot agent template list
 gitmoot agent template show <id>
 gitmoot agent template update <id>
+gitmoot agent template draft <id>
+gitmoot agent template validate .gitmoot/templates/<id>.md
 gitmoot agent template add <id> --file agents/<id>.md
 gitmoot agent template diff <id>
 ```

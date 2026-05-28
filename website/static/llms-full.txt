@@ -222,6 +222,36 @@ The runtime should load the prompt with:
 gitmoot agent prompt frontend-reviewer
 ```
 
+### Template Capture
+
+Template capture turns a useful current Codex or Claude chat workflow into a
+reusable agent template. Capture happens in the current chat from visible
+conversation context and inspected files; Gitmoot does not read hidden model
+state or runtime memory.
+
+Draft a blank structure when starting from scratch:
+
+```sh
+gitmoot agent template draft release-planner
+```
+
+Or ask the current chat to fill the structure from the visible session:
+
+```text
+Use Gitmoot to capture this session as agent template release-planner. Draft only.
+```
+
+Review the draft before installing it:
+
+```sh
+gitmoot agent template validate .gitmoot/templates/release-planner.md
+gitmoot agent template add release-planner --file .gitmoot/templates/release-planner.md
+gitmoot agent prompt release-planner
+```
+
+Installed custom templates are snapshots. After editing the source file, run
+`gitmoot agent template diff <id>` and `gitmoot agent template update <id>`.
+
 ### Jobs, Locks, And Recovery
 
 ```sh
@@ -347,6 +377,10 @@ agent template from this chat" mean read
 current-chat context into a draft template. Gitmoot cannot read hidden model
 memory or runtime internals. Do not install, overwrite, or update a permanent
 template unless the user explicitly approves that step.
+Use `gitmoot agent template draft <id>` for a blank scaffold,
+`gitmoot agent template validate <file>` for a structural check,
+`gitmoot agent template add <id> --file <file>` to install a snapshot, and
+`gitmoot agent prompt <id>` to reuse the installed template in the current chat.
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
@@ -465,6 +499,15 @@ After editing a local prompt file, refresh Gitmoot's cached snapshot explicitly:
 ```sh
 gitmoot agent template diff frontend-reviewer
 gitmoot agent template update frontend-reviewer
+```
+
+Draft and validate a captured template before installing it:
+
+```sh
+gitmoot agent template draft release-planner
+gitmoot agent template validate .gitmoot/templates/release-planner.md
+gitmoot agent template add release-planner --file .gitmoot/templates/release-planner.md
+gitmoot agent prompt release-planner
 ```
 
 ## Agent Job Contract
@@ -714,6 +757,32 @@ same checkout remain serialized even when the worker count is higher.
    gitmoot agent template diff frontend-reviewer
    gitmoot agent template update frontend-reviewer
    ```
+
+   To create a new custom template from a successful current chat, use template
+   capture. The current Codex or Claude chat distills visible conversation,
+   inspected files, commands, corrections, and durable workflow rules into a
+   draft. Gitmoot cannot read hidden model memory, so capture is always
+   draft-first and user-reviewed.
+
+   ```text
+   Use Gitmoot to capture this session as agent template release-planner. Draft only.
+   ```
+
+   A blank scaffold is also available when you want to write the template by
+   hand:
+
+   ```sh
+   gitmoot agent template draft release-planner
+   gitmoot agent template validate .gitmoot/templates/release-planner.md
+   gitmoot agent template add release-planner --file .gitmoot/templates/release-planner.md
+   gitmoot agent prompt release-planner
+   ```
+
+   `agent template draft` creates the structure, current-chat capture fills it
+   from visible context, `agent template validate` performs a structural check,
+   `agent template add` installs a snapshot, `agent prompt` reuses it in the
+   current chat, and `agent start --template` creates a runnable background
+   agent instance.
 
    After startup, open a created Codex session later with the session id printed
    by Gitmoot:
@@ -1008,6 +1077,21 @@ gitmoot agent prompt <agent-or-template>
 Then Codex should apply the returned prompt content in the current chat without
 creating a Gitmoot job.
 
+For template capture, keep the work in the current chat. Ask Codex to read the
+Gitmoot template-capture instructions and draft a file from visible context:
+
+```text
+Use Gitmoot to capture this session as agent template release-planner. Draft only.
+```
+
+Codex should not call `gitmoot agent ask`, start a daemon, or install the
+template unless the user explicitly asks. After review, install the draft with:
+
+```sh
+gitmoot agent template validate .gitmoot/templates/release-planner.md
+gitmoot agent template add release-planner --file .gitmoot/templates/release-planner.md
+```
+
 When you want the current Codex chat to invoke a registered background-capable
 Gitmoot agent, route that request through the CLI:
 
@@ -1051,6 +1135,16 @@ path.
 
 For fast current-chat planning, ask Claude Code to use the Gitmoot planner here
 instead of starting a background `gitmoot agent ask` job.
+
+For current-chat template capture, ask Claude Code:
+
+```text
+Use Gitmoot to capture this session as agent template release-planner. Draft only.
+```
+
+Claude Code should apply the bundled template-capture instructions locally,
+write or return a draft, and wait for explicit approval before validation or
+installation.
 
 ## Troubleshooting
 
@@ -2208,6 +2302,10 @@ agent template from this chat" mean read [TEMPLATE_CAPTURE.md](references/TEMPLA
 and distill the visible current-chat context into a draft template. Gitmoot
 cannot read hidden model memory or runtime internals. Do not install, overwrite,
 or update a permanent template unless the user explicitly approves that step.
+Use `gitmoot agent template draft <id>` for a blank scaffold,
+`gitmoot agent template validate <file>` for a structural check,
+`gitmoot agent template add <id> --file <file>` to install a snapshot, and
+`gitmoot agent prompt <id>` to reuse the installed template in the current chat.
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
@@ -2503,6 +2601,19 @@ This prints the prompt content for the current chat to apply locally. It does
 not create a job, start a daemon, resume a runtime session, or post a PR
 comment.
 
+Draft and validate a captured template before installing it:
+
+```sh
+gitmoot agent template draft release-planner
+gitmoot agent template validate .gitmoot/templates/release-planner.md
+gitmoot agent template add release-planner --file .gitmoot/templates/release-planner.md
+```
+
+`agent template draft` only creates the standard markdown structure. For
+current-chat capture, the active Codex or Claude chat reads
+`references/TEMPLATE_CAPTURE.md` and fills that structure from visible
+conversation context. Gitmoot does not extract hidden runtime memory.
+
 Create a local custom prompt template:
 
 ```sh
@@ -2677,6 +2788,44 @@ import, not true system-prompt injection, and it does not create a Gitmoot job,
 start a daemon, resume a runtime session, or post a PR comment. If the user
 wants tracked background execution, use `gitmoot agent ask <agent> --background`
 instead.
+
+## Current-Chat Template Capture
+
+Use template capture when the user wants to turn a successful visible Codex or
+Claude Code conversation into a reusable agent template.
+
+```text
+Use Gitmoot to capture this session as agent template release-planner. Draft only.
+```
+
+The current chat reads `references/TEMPLATE_CAPTURE.md`, extracts durable
+workflow rules from visible conversation context and inspected files, and writes
+or returns a draft. It must not route the request through `gitmoot agent ask`,
+start a daemon, queue a job, or install/replace a template without explicit user
+approval.
+
+For a blank starting point, scaffold the required sections:
+
+```sh
+gitmoot agent template draft release-planner
+```
+
+After the user reviews the draft:
+
+```sh
+gitmoot agent template validate .gitmoot/templates/release-planner.md
+gitmoot agent template add release-planner --file .gitmoot/templates/release-planner.md
+gitmoot agent prompt release-planner
+```
+
+The capture pieces are distinct:
+
+- `agent template draft`: scaffold a blank structure.
+- "capture here": current chat fills that structure from visible context.
+- `agent template validate`: structural check.
+- `agent template add`: install a snapshot.
+- `agent prompt`: reuse the installed prompt in the current chat.
+- `agent start --template`: create a runnable background agent instance.
 
 ## Background Planner Agent
 

@@ -107,6 +107,44 @@ start a daemon, resume a runtime session, or post a PR comment. If the user
 wants tracked background execution, use `gitmoot agent ask <agent> --background`
 instead.
 
+## Current-Chat Template Capture
+
+Use template capture when the user wants to turn a successful visible Codex or
+Claude Code conversation into a reusable agent template.
+
+```text
+Use Gitmoot to capture this session as agent template release-planner. Draft only.
+```
+
+The current chat reads `references/TEMPLATE_CAPTURE.md`, extracts durable
+workflow rules from visible conversation context and inspected files, and writes
+or returns a draft. It must not route the request through `gitmoot agent ask`,
+start a daemon, queue a job, or install/replace a template without explicit user
+approval.
+
+For a blank starting point, scaffold the required sections:
+
+```sh
+gitmoot agent template draft release-planner
+```
+
+After the user reviews the draft:
+
+```sh
+gitmoot agent template validate .gitmoot/templates/release-planner.md
+gitmoot agent template add release-planner --file .gitmoot/templates/release-planner.md
+gitmoot agent prompt release-planner
+```
+
+The capture pieces are distinct:
+
+- `agent template draft`: scaffold a blank structure.
+- "capture here": current chat fills that structure from visible context.
+- `agent template validate`: structural check.
+- `agent template add`: install a snapshot.
+- `agent prompt`: reuse the installed prompt in the current chat.
+- `agent start --template`: create a runnable background agent instance.
+
 ## Background Planner Agent
 
 Use the planner template when the user wants a structured implementation plan or a

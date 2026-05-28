@@ -28,6 +28,16 @@ gitmoot agent prompt <agent-or-template>
 
 This keeps the work in the current chat and does not create a Gitmoot job.
 
+For template capture from the current chat:
+
+```text
+Use Gitmoot to capture this session as agent template release-planner. Draft only.
+```
+
+The plugin should guide the runtime to read Gitmoot's template-capture
+instructions, draft from visible context, and wait for explicit approval before
+validation or installation.
+
 For registered background-agent work from a runtime chat that supports command
 execution:
 

@@ -33,6 +33,10 @@ agent template from this chat" mean read [TEMPLATE_CAPTURE.md](references/TEMPLA
 and distill the visible current-chat context into a draft template. Gitmoot
 cannot read hidden model memory or runtime internals. Do not install, overwrite,
 or update a permanent template unless the user explicitly approves that step.
+Use `gitmoot agent template draft <id>` for a blank scaffold,
+`gitmoot agent template validate <file>` for a structural check,
+`gitmoot agent template add <id> --file <file>` to install a snapshot, and
+`gitmoot agent prompt <id>` to reuse the installed template in the current chat.
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the

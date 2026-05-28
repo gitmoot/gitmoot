@@ -20,8 +20,14 @@ into each job so the job has reproducible instructions.
 ```sh
 gitmoot agent template update planner
 gitmoot agent template update thermo-nuclear-code-quality-review
+gitmoot agent template draft release-planner
+gitmoot agent template validate .gitmoot/templates/release-planner.md
 gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 ```
+
+Template capture is the current-chat path for creating new custom templates
+from a successful visible workflow. The current Codex or Claude chat fills a
+draft from visible context; `agent template add` installs the reviewed snapshot.
 
 ## Jobs
 

@@ -25,6 +25,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'workflows/pr-comment-workflow',
         'workflows/planner-goal-workflow',
+        'workflows/template-capture-workflow',
         'workflows/review-agent-workflow',
       ],
     },
@@ -63,4 +64,3 @@ const sidebars: SidebarsConfig = {
 };
 
 export default sidebars;
-
