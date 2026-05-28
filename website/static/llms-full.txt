@@ -2140,6 +2140,67 @@ Expected signals:
    /tmp/gitmoot-current daemon status --home "$GITMOOT_SMOKE_HOME"
    ```
 
+## Template Capture Smoke Test
+
+Goal: current-chat template capture semantics -> draft scaffold -> structural
+validation -> local template install -> prompt reuse, without requiring a live
+background agent or PR comment.
+
+Prerequisites: a Gitmoot build that includes `agent template draft` and
+`agent template validate`.
+
+1. Build a local test binary and use an isolated Gitmoot home.
+
+   ```sh
+   GOTOOLCHAIN=go1.26.0 go build -o /tmp/gitmoot-current ./cmd/gitmoot
+   export GITMOOT_SMOKE_HOME="$(mktemp -d)"
+   export GITMOOT_DRAFT_FILE="$GITMOOT_SMOKE_HOME/release-planner.md"
+   /tmp/gitmoot-current init --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+2. Scaffold a draft file.
+
+   ```sh
+   /tmp/gitmoot-current agent template draft release-planner \
+     --home "$GITMOOT_SMOKE_HOME" \
+     --output "$GITMOOT_DRAFT_FILE"
+   ```
+
+3. In a Codex or Claude Code chat with the Gitmoot plugin/skill installed, fill
+   that draft from visible current-chat context:
+
+   ```text
+   Use Gitmoot to capture this session as agent template release-planner. Draft only.
+   ```
+
+4. After reviewing the filled draft, validate, install, and inspect the captured
+   template.
+
+   ```sh
+   /tmp/gitmoot-current agent template validate "$GITMOOT_DRAFT_FILE"
+   /tmp/gitmoot-current agent template add release-planner \
+     --home "$GITMOOT_SMOKE_HOME" \
+     --file "$GITMOOT_DRAFT_FILE"
+   /tmp/gitmoot-current agent template show \
+     --home "$GITMOOT_SMOKE_HOME" \
+     release-planner
+   /tmp/gitmoot-current agent prompt release-planner \
+     --home "$GITMOOT_SMOKE_HOME"
+   ```
+
+Expected signals:
+
+- `agent template draft` writes `$GITMOOT_DRAFT_FILE` with the standard
+  title and required sections.
+- The current-chat capture step fills the draft from visible context without
+  starting a daemon, queueing a job, or installing the template.
+- `agent template validate` succeeds for the draft and reports clear missing
+  sections or placeholders if the file is edited into an invalid state.
+- `agent template show` displays `source: local@file:` and
+  `resolved commit: sha256:...`.
+- `agent prompt release-planner` prints the installed template content for
+  current-chat reuse.
+
 ## Two-Repo Smoke Test
 
 Goal: one daemon -> two registered repos -> same allowed agent -> ask jobs in
