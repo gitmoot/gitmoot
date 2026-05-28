@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, jobs, branch locks, agent-templates, custom prompt agents, and Codex or Claude Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, jobs, branch locks, agent-templates, template capture, custom prompt agents, and Codex or Claude Code runtime workflows.
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex or Claude Code.
 metadata:
@@ -15,7 +15,7 @@ goals, reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, Codex or Claude Code agent startup, structured
 implementation plans, standard goal files, agent template workflows, custom
-prompt agents, job status, or branch lock inspection.
+prompt agents, template capture, job status, or branch lock inspection.
 
 For current-chat prompt import, "use <agent> here" or "use Gitmoot agent
 <agent> here" means run `gitmoot agent prompt <agent>` and apply the returned
@@ -26,6 +26,13 @@ template is not cached, read and apply the packaged
 `agent-templates/planner.md` instructions directly. Do not route a "here"
 request through a background `gitmoot agent ask` unless the user explicitly
 asks for background execution, PR-comment routing, or job tracking.
+
+For template capture, phrases like "capture this session as a Gitmoot agent
+template", "turn this workflow into a Gitmoot template", or "draft a reusable
+agent template from this chat" mean read [TEMPLATE_CAPTURE.md](references/TEMPLATE_CAPTURE.md)
+and distill the visible current-chat context into a draft template. Gitmoot
+cannot read hidden model memory or runtime internals. Do not install, overwrite,
+or update a permanent template unless the user explicitly approves that step.
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
@@ -62,6 +69,8 @@ repo access, runtime adapter, and job history model used by PR-comment jobs.
 
 For complete command examples, read [CLI.md](references/CLI.md).
 For end-to-end workflows, read [WORKFLOWS.md](references/WORKFLOWS.md).
+For current-chat template capture, read
+[TEMPLATE_CAPTURE.md](references/TEMPLATE_CAPTURE.md).
 For the canonical goal prompt template, read
 [GOAL_TEMPLATE.md](references/GOAL_TEMPLATE.md) only when the user asks for a
 goal file.

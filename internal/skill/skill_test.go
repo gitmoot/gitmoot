@@ -31,6 +31,7 @@ func TestCanonicalSkillFrontmatter(t *testing.T) {
 		"jobs",
 		"branch locks",
 		"agent-templates",
+		"template capture",
 		"custom prompt agents",
 		"Codex",
 		"Claude Code",
@@ -46,6 +47,7 @@ func TestCanonicalSkillReferencesExist(t *testing.T) {
 	for _, ref := range []string{
 		"references/CLI.md",
 		"references/WORKFLOWS.md",
+		"references/TEMPLATE_CAPTURE.md",
 		"references/GOAL_TEMPLATE.md",
 		"references/RESULT_CONTRACT.md",
 		"references/SAFETY.md",
@@ -93,6 +95,7 @@ func TestCanonicalSkillDocumentsLocalAgentAsk(t *testing.T) {
 				"gitmoot agent ask <agent>",
 				"The plugin is only the runtime discovery surface",
 				"gitmoot agent prompt <agent-or-template>",
+				"TEMPLATE_CAPTURE.md",
 			},
 		},
 		{
@@ -121,6 +124,42 @@ func TestCanonicalSkillDocumentsLocalAgentAsk(t *testing.T) {
 			if !strings.Contains(check.text, want) {
 				t.Fatalf("%s missing %q", check.name, want)
 			}
+		}
+	}
+}
+
+func TestCanonicalSkillDocumentsTemplateCapture(t *testing.T) {
+	text := readRepoFile(t, "skills", "gitmoot", "SKILL.md")
+	capture := readRepoFile(t, "skills", "gitmoot", "references", "TEMPLATE_CAPTURE.md")
+	for _, want := range []string{
+		"capture this session as a Gitmoot agent",
+		"template\", \"turn this workflow into a Gitmoot template\"",
+		"draft a reusable",
+		"agent template from this chat",
+		"cannot read hidden model memory",
+		"Do not install, overwrite,",
+		"or update a permanent template",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("canonical SKILL.md missing template capture guidance %q", want)
+		}
+	}
+	for _, want := range []string{
+		"Template capture is current-chat distillation",
+		"Draft Structure",
+		"## Role",
+		"## When To Use",
+		"## Workflow",
+		"## Inputs And Context",
+		"## Commands And Tools",
+		"## Output Contract",
+		"## Safety Rules",
+		"## Examples",
+		"## Non-Goals",
+		"gitmoot agent template add",
+	} {
+		if !strings.Contains(capture, want) {
+			t.Fatalf("TEMPLATE_CAPTURE.md missing %q", want)
 		}
 	}
 }
@@ -154,6 +193,7 @@ func TestRootSkillCompatibilityEntrypoint(t *testing.T) {
 		"gitmoot agent prompt <agent-or-template>",
 		"gitmoot.io/SKILL.md",
 		"gitmoot_result",
+		"template capture",
 		"branch locks",
 		"runtime session locks",
 		"gitmoot agent ask <agent>",

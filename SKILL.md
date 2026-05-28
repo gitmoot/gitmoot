@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, PR comments, daemon jobs, branch locks, agent templates, custom prompt agents, and Codex or Claude Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, PR comments, daemon jobs, branch locks, agent templates, template capture, custom prompt agents, and Codex or Claude Code runtime workflows.
 version: 0.1.0
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex or Claude Code.
@@ -29,8 +29,8 @@ Gitmoot is a local-first coordinator for AI agents working across repositories,
 goals, reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, Codex or Claude Code agent startup, structured
-implementation plans, standard goal files, agent template workflows, custom prompt agents,
-job status, or branch lock inspection.
+implementation plans, standard goal files, agent template workflows, template
+capture, custom prompt agents, job status, or branch lock inspection.
 
 For current-chat prompt import, "use <agent> here" means run
 `gitmoot agent prompt <agent>` and apply the returned prompt content in this
@@ -42,6 +42,14 @@ For fast planning, "use the Gitmoot planner here" is the natural-language
 shortcut for `gitmoot agent prompt planner`. If the planner template is not
 cached, read and apply the packaged `skills/gitmoot/agent-templates/planner.md`
 instructions directly.
+
+For template capture, phrases like "capture this session as a Gitmoot agent
+template", "turn this workflow into a Gitmoot template", or "draft a reusable
+agent template from this chat" mean read
+`skills/gitmoot/references/TEMPLATE_CAPTURE.md` and distill the visible
+current-chat context into a draft template. Gitmoot cannot read hidden model
+memory or runtime internals. Do not install, overwrite, or update a permanent
+template unless the user explicitly approves that step.
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the

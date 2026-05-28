@@ -18,6 +18,7 @@ const sources = [
   'skills/gitmoot/agent-templates/planner.md',
   'skills/gitmoot/references/CLI.md',
   'skills/gitmoot/references/WORKFLOWS.md',
+  'skills/gitmoot/references/TEMPLATE_CAPTURE.md',
   'skills/gitmoot/references/SAFETY.md',
   'skills/gitmoot/references/RESULT_CONTRACT.md',
   'skills/gitmoot/references/GOAL_TEMPLATE.md',

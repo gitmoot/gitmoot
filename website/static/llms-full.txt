@@ -297,7 +297,7 @@ go vet ./...
 
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, PR comments, daemon jobs, branch locks, agent templates, custom prompt agents, and Codex or Claude Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, PR comments, daemon jobs, branch locks, agent templates, template capture, custom prompt agents, and Codex or Claude Code runtime workflows.
 version: 0.1.0
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex or Claude Code.
@@ -326,8 +326,8 @@ Gitmoot is a local-first coordinator for AI agents working across repositories,
 goals, reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, Codex or Claude Code agent startup, structured
-implementation plans, standard goal files, agent template workflows, custom prompt agents,
-job status, or branch lock inspection.
+implementation plans, standard goal files, agent template workflows, template
+capture, custom prompt agents, job status, or branch lock inspection.
 
 For current-chat prompt import, "use <agent> here" means run
 `gitmoot agent prompt <agent>` and apply the returned prompt content in this
@@ -339,6 +339,14 @@ For fast planning, "use the Gitmoot planner here" is the natural-language
 shortcut for `gitmoot agent prompt planner`. If the planner template is not
 cached, read and apply the packaged `skills/gitmoot/agent-templates/planner.md`
 instructions directly.
+
+For template capture, phrases like "capture this session as a Gitmoot agent
+template", "turn this workflow into a Gitmoot template", or "draft a reusable
+agent template from this chat" mean read
+`skills/gitmoot/references/TEMPLATE_CAPTURE.md` and distill the visible
+current-chat context into a draft template. Gitmoot cannot read hidden model
+memory or runtime internals. Do not install, overwrite, or update a permanent
+template unless the user explicitly approves that step.
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
@@ -2167,7 +2175,7 @@ exact-owner stale lock; use `--force` only when the stored owner is stale.
 
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, jobs, branch locks, agent-templates, custom prompt agents, and Codex or Claude Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, jobs, branch locks, agent-templates, template capture, custom prompt agents, and Codex or Claude Code runtime workflows.
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex or Claude Code.
 metadata:
@@ -2182,7 +2190,7 @@ goals, reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, Codex or Claude Code agent startup, structured
 implementation plans, standard goal files, agent template workflows, custom
-prompt agents, job status, or branch lock inspection.
+prompt agents, template capture, job status, or branch lock inspection.
 
 For current-chat prompt import, "use <agent> here" or "use Gitmoot agent
 <agent> here" means run `gitmoot agent prompt <agent>` and apply the returned
@@ -2193,6 +2201,13 @@ template is not cached, read and apply the packaged
 `agent-templates/planner.md` instructions directly. Do not route a "here"
 request through a background `gitmoot agent ask` unless the user explicitly
 asks for background execution, PR-comment routing, or job tracking.
+
+For template capture, phrases like "capture this session as a Gitmoot agent
+template", "turn this workflow into a Gitmoot template", or "draft a reusable
+agent template from this chat" mean read [TEMPLATE_CAPTURE.md](references/TEMPLATE_CAPTURE.md)
+and distill the visible current-chat context into a draft template. Gitmoot
+cannot read hidden model memory or runtime internals. Do not install, overwrite,
+or update a permanent template unless the user explicitly approves that step.
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
@@ -2229,6 +2244,8 @@ repo access, runtime adapter, and job history model used by PR-comment jobs.
 
 For complete command examples, read [CLI.md](references/CLI.md).
 For end-to-end workflows, read [WORKFLOWS.md](references/WORKFLOWS.md).
+For current-chat template capture, read
+[TEMPLATE_CAPTURE.md](references/TEMPLATE_CAPTURE.md).
 For the canonical goal prompt template, read
 [GOAL_TEMPLATE.md](references/GOAL_TEMPLATE.md) only when the user asks for a
 goal file.
@@ -2734,6 +2751,120 @@ gitmoot agent allow reviewer --repo owner/project-b
 gitmoot status --repo owner/project-a
 gitmoot status --repo owner/project-b
 ```
+
+---
+
+# Source: skills/gitmoot/references/TEMPLATE_CAPTURE.md
+
+# Template Capture
+
+Use template capture when the user wants to turn the current Codex or Claude
+Code session into a reusable Gitmoot agent template.
+
+Template capture is current-chat distillation. Gitmoot cannot read hidden model
+memory, runtime internals, or private state outside the visible conversation and
+files you inspect. Capture only durable, user-approved behavior that can be
+reused safely by future agents.
+
+## Trigger Phrases
+
+Use this workflow for requests like:
+
+- "capture this session as a Gitmoot agent template"
+- "turn this workflow into a Gitmoot template"
+- "draft a reusable agent template from this chat"
+- "make this current agent behavior reusable"
+
+Do not route template capture through `gitmoot agent ask`, PR comments, or the
+daemon unless the user explicitly asks for a background job. Capture from
+"here" means the current chat writes a draft.
+
+## Capture Rules
+
+- Draft first. Do not install, overwrite, or update a permanent template unless
+  the user explicitly approves that step.
+- Extract durable workflow rules, role, trigger conditions, inputs, commands,
+  output contract, safety rules, examples, and non-goals.
+- Exclude one-off mistakes, temporary debugging, private secrets, unrelated repo
+  details, hidden model memory, and unverified assumptions.
+- Prefer project-agnostic language unless the template is intentionally scoped
+  to one project or repo.
+- Preserve important user preferences that were corrected repeatedly, but write
+  them as actionable rules instead of emotional transcript summaries.
+- Mark uncertainty as a question or assumption rather than turning it into a
+  permanent instruction.
+- Ask before installing or replacing an existing template.
+
+## Draft Structure
+
+Use this structure for captured templates:
+
+```markdown
+# <Template Name>
+
+## Role
+
+Describe what this agent is responsible for.
+
+## When To Use
+
+List the request types, project contexts, or trigger phrases that should use
+this template.
+
+## Workflow
+
+Give the repeatable step-by-step operating procedure.
+
+## Inputs And Context
+
+List the files, commands, tools, docs, conversation context, or repo state the
+agent should inspect.
+
+## Commands And Tools
+
+List important CLI commands, runtime commands, web/source lookup requirements,
+or tool usage constraints.
+
+## Output Contract
+
+Describe exactly what the agent should return or create.
+
+## Safety Rules
+
+List boundaries, approval gates, non-destructive behavior, secret handling, and
+when to stop or ask.
+
+## Examples
+
+Provide a few concise example requests and the expected style of response.
+
+## Non-Goals
+
+List work this template should not do.
+```
+
+## Suggested Current-Chat Flow
+
+1. Confirm the requested template id and intended scope if unclear.
+2. Inspect relevant visible conversation context and repo files.
+3. Draft the markdown template in chat, or write it to the path the user
+   requested.
+4. Tell the user to check the draft against the structure above before
+   installing it:
+
+   ```sh
+   gitmoot agent template add <template-id> --file .gitmoot/templates/<template-id>.md
+   ```
+
+5. If the user approves installation, check that required sections are filled
+   in, then install with `gitmoot agent template add`.
+
+## Result Expectations
+
+The final capture response should say what was drafted, where it is saved if a
+file was written, whether validation ran, and whether the template was
+installed. If installation was not explicitly requested, say that the draft is
+not installed yet.
 
 ---
 

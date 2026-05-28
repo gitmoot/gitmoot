@@ -117,6 +117,7 @@ func TestBuildUsesEmbeddedSkillByDefault(t *testing.T) {
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "SKILL.md"), "gitmoot agent prompt <agent>")
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "CLI.md"), "gitmoot agent ask project-planner --repo owner/repo")
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "WORKFLOWS.md"), "Current-Chat Custom Agent Prompt")
+	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "TEMPLATE_CAPTURE.md"), "Template capture is current-chat distillation")
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "GOAL_TEMPLATE.md"), "codex exec review is clean; ready for manual /review.")
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "RESULT_CONTRACT.md"), "gitmoot_result")
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "agent-templates", "planner.md"), "Gitmoot Planner")
