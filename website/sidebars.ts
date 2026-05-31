@@ -42,6 +42,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'reference/cli',
         'reference/runtime-adapters',
+        'reference/skillopt-exchange-contract',
       ],
     },
     {

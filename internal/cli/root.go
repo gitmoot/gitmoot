@@ -36,6 +36,7 @@ var rootCommands = []command{
 	{name: "task", summary: "run or inspect tasks", run: runTask},
 	{name: "job", summary: "inspect and recover jobs", run: runJob},
 	{name: "lock", summary: "inspect and release branch locks", run: runLock},
+	{name: "skillopt", summary: "export and import SkillOpt packages", run: runSkillOpt},
 }
 
 func Run(args []string, stdout, stderr io.Writer) int {

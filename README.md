@@ -270,6 +270,17 @@ gitmoot lock list --repo owner/repo
 gitmoot lock release owner/repo <branch> --owner <agent>
 ```
 
+### SkillOpt Exchange
+
+```sh
+gitmoot skillopt export --run <run-id> --output training.json
+gitmoot skillopt import --file candidate.json
+```
+
+The export/import boundary lets a future external `gitmoot-skillopt` optimizer
+train on local eval artifacts and return candidate template versions. Imported
+candidates stay pending until a human review workflow promotes them.
+
 Detailed command coverage lives in
 [skills/gitmoot/references/CLI.md](skills/gitmoot/references/CLI.md).
 

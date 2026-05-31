@@ -113,6 +113,8 @@ gitmoot job show <job-id>
 gitmoot job events <job-id>
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
+gitmoot skillopt export --run <run-id> [--output training.json]
+gitmoot skillopt import --file candidate.json
 ```
 
 Use `gitmoot daemon start` for the background daemon. Use `gitmoot daemon run`

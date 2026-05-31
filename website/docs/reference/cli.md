@@ -56,3 +56,10 @@ gitmoot job watch <job-id>
 gitmoot job retry <job-id>
 gitmoot lock list --repo owner/repo
 ```
+
+## SkillOpt Exchange
+
+```sh
+gitmoot skillopt export --run <run-id> [--output training.json]
+gitmoot skillopt import --file candidate.json
+```

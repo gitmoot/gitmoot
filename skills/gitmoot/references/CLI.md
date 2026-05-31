@@ -252,3 +252,16 @@ gitmoot job cancel <job-id>
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
+
+## SkillOpt Exchange
+
+```sh
+gitmoot skillopt export --run <run-id> [--output training.json]
+gitmoot skillopt import --file candidate.json
+```
+
+`skillopt export` writes a JSON training package with the template snapshot,
+eval run, review items, artifact manifests, feedback events when present, and
+evaluator config. `skillopt import` validates a candidate package and stores the
+candidate template as a pending version; it never promotes the candidate
+automatically.
