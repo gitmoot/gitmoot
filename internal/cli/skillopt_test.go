@@ -900,6 +900,217 @@ func TestSkillOptReviewItemAddStoresArtifacts(t *testing.T) {
 	}
 }
 
+func TestSkillOptHumanFeedbackTrialSmoke(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	template := cliSkillOptTemplate("planner", "Plan the work.")
+	if err := store.UpsertAgentTemplate(context.Background(), template); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	installed, err := store.GetAgentTemplate(context.Background(), "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "review", "create",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/repo",
+		"--run", "trial-smoke",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt review create exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	inputDir := t.TempDir()
+	baselinePath := filepath.Join(inputDir, "baseline.md")
+	candidatePath := filepath.Join(inputDir, "candidate.md")
+	if err := os.WriteFile(baselinePath, []byte("# Baseline\n\nPlan only the edit.\n"), 0o644); err != nil {
+		t.Fatalf("write baseline: %v", err)
+	}
+	if err := os.WriteFile(candidatePath, []byte("# Candidate\n\nPlan the edit, test, and rollback notes.\n"), 0o644); err != nil {
+		t.Fatalf("write candidate: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "review", "item", "add",
+		"--home", home,
+		"--run", "trial-smoke",
+		"--item", "item-001",
+		"--title", "README planning task",
+		"--baseline", baselinePath,
+		"--candidate", candidatePath,
+		"--metadata-json", `{"path":"README.md"}`,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt review item add exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	packetDir := filepath.Join(t.TempDir(), "packet")
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "feedback", "markdown", "export", "--home", home, "--run", "trial-smoke", "--output", packetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt feedback markdown export exit code = %d, stderr=%s", code, stderr.String())
+	}
+	feedbackYAML := `run_id: trial-smoke
+reviewer: jerry
+items:
+  - item_id: item-001
+    choice: a
+    reasoning: More complete execution plan.
+`
+	if err := os.WriteFile(filepath.Join(packetDir, "feedback.yml"), []byte(feedbackYAML), 0o644); err != nil {
+		t.Fatalf("write feedback.yml: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "feedback", "markdown", "import", "--home", home, "--packet", packetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt feedback markdown import exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "imported 1 feedback events") {
+		t.Fatalf("feedback import stdout = %q", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "review", "status", "--home", home, "--run", "trial-smoke"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt review status exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{
+		"items: 1",
+		"feedback: 1",
+		"ready_for_packet: true",
+		"ready_for_training: true",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("status stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+
+	trainingPath := filepath.Join(t.TempDir(), "training.json")
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "export", "--home", home, "--run", "trial-smoke", "--output", trainingPath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt export exit code = %d, stderr=%s", code, stderr.String())
+	}
+	trainingContent, err := os.ReadFile(trainingPath)
+	if err != nil {
+		t.Fatalf("read training package: %v", err)
+	}
+	var training skillopt.TrainingPackage
+	if err := json.Unmarshal(trainingContent, &training); err != nil {
+		t.Fatalf("decode training package: %v\n%s", err, string(trainingContent))
+	}
+	if training.EvalRun.ID != "trial-smoke" || len(training.Items) != 1 || len(training.Artifacts) != 2 || len(training.FeedbackEvents) != 1 {
+		t.Fatalf("training package = %+v", training)
+	}
+	if training.FeedbackEvents[0].ItemID != "item-001" || training.FeedbackEvents[0].Choice != "b" || training.FeedbackEvents[0].Reasoning != "More complete execution plan." {
+		t.Fatalf("training feedback = %+v", training.FeedbackEvents)
+	}
+
+	artifactDir := t.TempDir()
+	diffContent := []byte("candidate diff\n")
+	diffHash := artifact.ContentHash(diffContent)
+	if err := os.WriteFile(filepath.Join(artifactDir, "candidate.diff.md"), diffContent, 0o644); err != nil {
+		t.Fatalf("write diff artifact: %v", err)
+	}
+	diffSize := int64(len(diffContent))
+	candidate := cliSkillOptCandidatePackage(t, "planner", installed.VersionID, "Plan with test and rollback notes.")
+	candidate.Summary.DiffArtifactID = "candidate-diff"
+	candidate.Artifacts = []skillopt.CandidateArtifactRef{{
+		ID:        "candidate-diff",
+		Path:      "candidate.diff.md",
+		Hash:      diffHash,
+		MediaType: "text/markdown",
+		Driver:    "text",
+		SizeBytes: &diffSize,
+	}}
+	candidatePackagePath := filepath.Join(t.TempDir(), "candidate.json")
+	encodedCandidate, err := json.Marshal(candidate)
+	if err != nil {
+		t.Fatalf("marshal candidate package: %v", err)
+	}
+	if err := os.WriteFile(candidatePackagePath, encodedCandidate, 0o644); err != nil {
+		t.Fatalf("write candidate package: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "import", "--home", home, "--file", candidatePackagePath, "--artifact-dir", artifactDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt import exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "imported pending candidate planner@v2") {
+		t.Fatalf("candidate import stdout = %q", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "candidate", "show", "--home", home, "planner@v2"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt candidate show exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "state: pending") || !strings.Contains(stdout.String(), "diff_artifact: candidate-diff") {
+		t.Fatalf("candidate show stdout = %q", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "candidate", "reject", "--home", home, "planner@v2", "--reason", "trial smoke"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt candidate reject exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "rejected candidate planner@v2") {
+		t.Fatalf("candidate reject stdout = %q", stdout.String())
+	}
+
+	store, err = db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open after trial smoke returned error: %v", err)
+	}
+	defer store.Close()
+	current, err := store.GetAgentTemplate(context.Background(), "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	if current.VersionID != installed.VersionID {
+		t.Fatalf("current version = %q, want %q", current.VersionID, installed.VersionID)
+	}
+	rejected, err := store.GetAgentTemplateVersionByID(context.Background(), "planner@v2")
+	if err != nil {
+		t.Fatalf("GetAgentTemplateVersionByID returned error: %v", err)
+	}
+	if rejected.State != "rejected" {
+		t.Fatalf("rejected candidate = %+v", rejected)
+	}
+	review, err := store.GetAgentTemplateCandidateReview(context.Background(), "planner@v2")
+	if err != nil {
+		t.Fatalf("GetAgentTemplateCandidateReview returned error: %v", err)
+	}
+	if review.DecisionReason != "trial smoke" {
+		t.Fatalf("candidate review = %+v", review)
+	}
+}
+
 func TestSkillOptReviewItemAddRejectsInvalidInputs(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
