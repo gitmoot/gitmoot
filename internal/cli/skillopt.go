@@ -49,7 +49,7 @@ func runSkillOpt(args []string, stdout, stderr io.Writer) int {
 func printSkillOptUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot skillopt export --run <run-id> [--output package.json]")
-	fmt.Fprintln(w, "  gitmoot skillopt import --file candidate.json")
+	fmt.Fprintln(w, "  gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]")
 	fmt.Fprintln(w, "  gitmoot skillopt candidate list [--template id]")
 	fmt.Fprintln(w, "  gitmoot skillopt candidate show <version-id>")
 	fmt.Fprintln(w, "  gitmoot skillopt candidate promote <version-id>")
@@ -115,6 +115,7 @@ func runSkillOptImport(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	file := fs.String("file", "", "candidate package JSON file to import")
+	artifactDir := fs.String("artifact-dir", "", "directory containing candidate package artifacts")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -140,8 +141,12 @@ func runSkillOptImport(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	var versionID string
-	if err := withStore(*home, func(store *db.Store) error {
-		version, err := skillopt.ImportCandidatePackage(context.Background(), store, pkg, *file)
+	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
+		version, err := skillopt.ImportCandidatePackageWithOptions(context.Background(), store, pkg, skillopt.CandidateImportOptions{
+			SourcePath:  *file,
+			ArtifactDir: *artifactDir,
+			BlobStore:   artifact.NewStore(paths.ArtifactBlobs),
+		})
 		if err != nil {
 			return err
 		}

@@ -1172,6 +1172,12 @@ func persistAgentHealth(home, name, status string) error {
 }
 
 func withStore(home string, fn func(*db.Store) error) error {
+	return withStoreAndPaths(home, func(_ config.Paths, store *db.Store) error {
+		return fn(store)
+	})
+}
+
+func withStoreAndPaths(home string, fn func(config.Paths, *db.Store) error) error {
 	paths, err := pathsFromFlag(home)
 	if err != nil {
 		return err
@@ -1184,7 +1190,7 @@ func withStore(home string, fn func(*db.Store) error) error {
 		return err
 	}
 	defer store.Close()
-	return fn(store)
+	return fn(paths, store)
 }
 
 func dbAgent(agent runtime.Agent) db.Agent {

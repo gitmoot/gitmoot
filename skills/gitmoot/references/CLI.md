@@ -257,7 +257,7 @@ gitmoot lock show owner/repo <branch>
 
 ```sh
 gitmoot skillopt export --run <run-id> [--output training.json]
-gitmoot skillopt import --file candidate.json
+gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]
 gitmoot skillopt candidate list [--template id]
 gitmoot skillopt candidate show <version-id>
 gitmoot skillopt candidate promote <version-id>
@@ -272,7 +272,9 @@ gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issu
 eval run, review items, artifact manifests, feedback events when present, and
 evaluator config. `skillopt import` validates a candidate package and stores the
 candidate template as a pending version; it never promotes the candidate
-automatically. `skillopt candidate show` displays candidate metadata, eval
+automatically. If the candidate package includes new artifact manifest entries,
+pass `--artifact-dir` so Gitmoot can verify relative paths and SHA256 hashes
+before storing blobs. `skillopt candidate show` displays candidate metadata, eval
 report JSON, preference summary, and a content diff against the base/current
 version. `skillopt candidate promote` makes a pending candidate current, while
 `skillopt candidate reject` records an auditable rejection and prevents that

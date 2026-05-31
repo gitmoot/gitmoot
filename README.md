@@ -274,7 +274,7 @@ gitmoot lock release owner/repo <branch> --owner <agent>
 
 ```sh
 gitmoot skillopt export --run <run-id> --output training.json
-gitmoot skillopt import --file candidate.json
+gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]
 gitmoot skillopt candidate list [--template id]
 gitmoot skillopt candidate show <version-id>
 gitmoot skillopt candidate promote <version-id>
@@ -288,6 +288,9 @@ gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issu
 The export/import boundary lets a future external `gitmoot-skillopt` optimizer
 train on local eval artifacts and return candidate template versions. Imported
 candidates stay pending until a human review workflow promotes them.
+When a candidate package includes new artifact manifest entries, pass
+`--artifact-dir` to the directory containing those files; Gitmoot verifies
+relative paths and SHA256 hashes before storing blobs.
 Use `skillopt candidate show` to inspect the candidate metadata, eval report,
 feedback summary, and content diff before `promote` or `reject` records the
 decision.

@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/agenttemplate"
+	"github.com/jerryfane/gitmoot/internal/artifact"
 	"github.com/jerryfane/gitmoot/internal/db"
 )
 
@@ -100,14 +103,30 @@ type CandidateSummary struct {
 	Metadata          json.RawMessage `json:"metadata,omitempty"`
 }
 
+type CandidateArtifactRef struct {
+	ID        string `json:"id"`
+	Path      string `json:"path"`
+	Hash      string `json:"hash"`
+	MediaType string `json:"media_type"`
+	Driver    string `json:"driver"`
+	SizeBytes *int64 `json:"size_bytes,omitempty"`
+}
+
 type CandidatePackage struct {
-	Kind            string            `json:"kind"`
-	ContractVersion int               `json:"contract_version"`
-	TemplateID      string            `json:"template_id"`
-	BaseVersionID   string            `json:"base_version_id,omitempty"`
-	Candidate       CandidateTemplate `json:"candidate"`
-	EvalReport      json.RawMessage   `json:"eval_report,omitempty"`
-	Summary         CandidateSummary  `json:"summary,omitempty"`
+	Kind            string                 `json:"kind"`
+	ContractVersion int                    `json:"contract_version"`
+	TemplateID      string                 `json:"template_id"`
+	BaseVersionID   string                 `json:"base_version_id,omitempty"`
+	Candidate       CandidateTemplate      `json:"candidate"`
+	EvalReport      json.RawMessage        `json:"eval_report,omitempty"`
+	Summary         CandidateSummary       `json:"summary,omitempty"`
+	Artifacts       []CandidateArtifactRef `json:"artifacts,omitempty"`
+}
+
+type CandidateImportOptions struct {
+	SourcePath  string
+	ArtifactDir string
+	BlobStore   artifact.Store
 }
 
 func ExportTrainingPackage(ctx context.Context, store *db.Store, runID string) (TrainingPackage, error) {
@@ -178,10 +197,28 @@ func ExportTrainingPackage(ctx context.Context, store *db.Store, runID string) (
 }
 
 func ImportCandidatePackage(ctx context.Context, store *db.Store, candidate CandidatePackage, sourcePath string) (db.AgentTemplateVersion, error) {
+	return ImportCandidatePackageWithOptions(ctx, store, candidate, CandidateImportOptions{SourcePath: sourcePath})
+}
+
+func ImportCandidatePackageWithOptions(ctx context.Context, store *db.Store, candidate CandidatePackage, options CandidateImportOptions) (db.AgentTemplateVersion, error) {
 	if store == nil {
 		return db.AgentTemplateVersion{}, errors.New("store is required")
 	}
-	if err := validateCandidatePackage(ctx, store, candidate); err != nil {
+	preparedArtifacts, candidateArtifactIDs, err := prepareCandidateArtifacts(options.ArtifactDir, candidate.Artifacts)
+	if err != nil {
+		return db.AgentTemplateVersion{}, err
+	}
+	if len(preparedArtifacts) > 0 && strings.TrimSpace(options.BlobStore.Root) == "" {
+		return db.AgentTemplateVersion{}, errors.New("artifact blob store is required")
+	}
+	if err := validateCandidatePackage(ctx, store, candidate, candidateArtifactIDs); err != nil {
+		return db.AgentTemplateVersion{}, err
+	}
+	if err := validateCandidateArtifactIDsAvailable(ctx, store, candidateArtifactIDs); err != nil {
+		return db.AgentTemplateVersion{}, err
+	}
+	evalArtifacts, err := storeCandidateArtifactBlobs(options.BlobStore, preparedArtifacts)
+	if err != nil {
 		return db.AgentTemplateVersion{}, err
 	}
 	templateID := strings.TrimSpace(candidate.TemplateID)
@@ -193,7 +230,7 @@ func ImportCandidatePackage(ctx context.Context, store *db.Store, candidate Cand
 	if err != nil {
 		return db.AgentTemplateVersion{}, err
 	}
-	sourcePath = strings.TrimSpace(sourcePath)
+	sourcePath := strings.TrimSpace(options.SourcePath)
 	if sourcePath == "" {
 		sourcePath = "candidate-package.json"
 	}
@@ -208,10 +245,6 @@ func ImportCandidatePackage(ctx context.Context, store *db.Store, candidate Cand
 		Content:        candidate.Candidate.Content,
 		MetadataJSON:   metadataJSON,
 	}
-	version, err := store.AddPendingAgentTemplateVersion(ctx, template)
-	if err != nil {
-		return db.AgentTemplateVersion{}, err
-	}
 	evalReportJSON, err := rawMessageStorage(candidate.EvalReport)
 	if err != nil {
 		return db.AgentTemplateVersion{}, fmt.Errorf("candidate eval_report: %w", err)
@@ -220,9 +253,8 @@ func ImportCandidatePackage(ctx context.Context, store *db.Store, candidate Cand
 	if err != nil {
 		return db.AgentTemplateVersion{}, fmt.Errorf("candidate summary metadata: %w", err)
 	}
-	if err := store.UpsertAgentTemplateCandidateReview(ctx, db.AgentTemplateCandidateReview{
-		VersionID:           version.ID,
-		TemplateID:          version.TemplateID,
+	version, err := store.AddPendingAgentTemplateCandidate(ctx, template, db.AgentTemplateCandidateReview{
+		TemplateID:          template.ID,
 		BaseVersionID:       baseVersionID,
 		DiffArtifactID:      strings.TrimSpace(candidate.Summary.DiffArtifactID),
 		Score:               candidate.Summary.Score,
@@ -230,10 +262,18 @@ func ImportCandidatePackage(ctx context.Context, store *db.Store, candidate Cand
 		EvalReportJSON:      evalReportJSON,
 		SummaryMetadataJSON: summaryMetadataJSON,
 		State:               "pending",
-	}); err != nil {
+	}, evalArtifacts)
+	if err != nil {
 		return db.AgentTemplateVersion{}, err
 	}
 	return version, nil
+}
+
+type preparedCandidateArtifact struct {
+	ref     CandidateArtifactRef
+	hash    string
+	size    int64
+	content []byte
 }
 
 func candidateBaseVersionID(ctx context.Context, store *db.Store, templateID string, baseRef string) (string, error) {
@@ -255,7 +295,7 @@ func candidateBaseVersionID(ctx context.Context, store *db.Store, templateID str
 	return base.VersionID, nil
 }
 
-func validateCandidatePackage(ctx context.Context, store *db.Store, candidate CandidatePackage) error {
+func validateCandidatePackage(ctx context.Context, store *db.Store, candidate CandidatePackage, candidateArtifactIDs map[string]struct{}) error {
 	if candidate.Kind != CandidatePackageKind {
 		return fmt.Errorf("candidate package kind must be %q", CandidatePackageKind)
 	}
@@ -286,8 +326,11 @@ func validateCandidatePackage(ctx context.Context, store *db.Store, candidate Ca
 		return err
 	}
 	if strings.TrimSpace(candidate.Summary.DiffArtifactID) != "" {
-		if _, err := store.GetEvalArtifact(ctx, candidate.Summary.DiffArtifactID); err != nil {
-			return fmt.Errorf("load summary diff artifact %q: %w", candidate.Summary.DiffArtifactID, err)
+		diffArtifactID := strings.TrimSpace(candidate.Summary.DiffArtifactID)
+		if _, ok := candidateArtifactIDs[diffArtifactID]; !ok {
+			if _, err := store.GetEvalArtifact(ctx, diffArtifactID); err != nil {
+				return fmt.Errorf("load summary diff artifact %q: %w", candidate.Summary.DiffArtifactID, err)
+			}
 		}
 	}
 	if _, err := rawMessageStorage(candidate.EvalReport); err != nil {
@@ -297,6 +340,126 @@ func validateCandidatePackage(ctx context.Context, store *db.Store, candidate Ca
 		return fmt.Errorf("candidate summary metadata: %w", err)
 	}
 	return nil
+}
+
+func validateCandidateArtifactIDsAvailable(ctx context.Context, store *db.Store, ids map[string]struct{}) error {
+	for id := range ids {
+		if _, err := store.GetEvalArtifact(ctx, id); err == nil {
+			return fmt.Errorf("candidate artifact %q already exists", id)
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("load candidate artifact %q: %w", id, err)
+		}
+	}
+	return nil
+}
+
+func prepareCandidateArtifacts(artifactDir string, refs []CandidateArtifactRef) ([]preparedCandidateArtifact, map[string]struct{}, error) {
+	ids := make(map[string]struct{}, len(refs))
+	if len(refs) == 0 {
+		return nil, ids, nil
+	}
+	if strings.TrimSpace(artifactDir) == "" {
+		return nil, nil, errors.New("candidate artifacts require --artifact-dir")
+	}
+	prepared := make([]preparedCandidateArtifact, 0, len(refs))
+	for index, ref := range refs {
+		ref.ID = strings.TrimSpace(ref.ID)
+		ref.Path = strings.TrimSpace(ref.Path)
+		ref.Hash = strings.TrimSpace(ref.Hash)
+		ref.MediaType = strings.TrimSpace(ref.MediaType)
+		ref.Driver = strings.TrimSpace(ref.Driver)
+		if ref.ID == "" {
+			return nil, nil, fmt.Errorf("candidate artifact %d id is required", index+1)
+		}
+		if _, exists := ids[ref.ID]; exists {
+			return nil, nil, fmt.Errorf("candidate artifact %q is duplicated", ref.ID)
+		}
+		ids[ref.ID] = struct{}{}
+		if ref.MediaType == "" {
+			return nil, nil, fmt.Errorf("candidate artifact %q media_type is required", ref.ID)
+		}
+		if ref.Driver == "" {
+			return nil, nil, fmt.Errorf("candidate artifact %q driver is required", ref.ID)
+		}
+		if ref.SizeBytes != nil && *ref.SizeBytes < 0 {
+			return nil, nil, fmt.Errorf("candidate artifact %q size_bytes cannot be negative", ref.ID)
+		}
+		expectedHash, err := artifact.NormalizeHash(ref.Hash)
+		if err != nil {
+			return nil, nil, fmt.Errorf("candidate artifact %q hash: %w", ref.ID, err)
+		}
+		path, err := resolveCandidateArtifactPath(artifactDir, ref.Path)
+		if err != nil {
+			return nil, nil, fmt.Errorf("candidate artifact %q path: %w", ref.ID, err)
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read candidate artifact %q: %w", ref.ID, err)
+		}
+		size := int64(len(content))
+		if ref.SizeBytes != nil && *ref.SizeBytes != size {
+			return nil, nil, fmt.Errorf("candidate artifact %q size_bytes is %d, want %d", ref.ID, *ref.SizeBytes, size)
+		}
+		actualHash := artifact.ContentHash(content)
+		if actualHash != expectedHash {
+			return nil, nil, fmt.Errorf("candidate artifact %q hash is %s, want %s", ref.ID, actualHash, expectedHash)
+		}
+		ref.Hash = expectedHash
+		prepared = append(prepared, preparedCandidateArtifact{ref: ref, hash: actualHash, size: size, content: content})
+	}
+	return prepared, ids, nil
+}
+
+func resolveCandidateArtifactPath(artifactDir string, artifactPath string) (string, error) {
+	artifactPath = strings.TrimSpace(artifactPath)
+	if artifactPath == "" {
+		return "", errors.New("path is required")
+	}
+	if filepath.IsAbs(artifactPath) || !filepath.IsLocal(artifactPath) {
+		return "", fmt.Errorf("%q must be a relative path inside artifact-dir", artifactPath)
+	}
+	root, err := filepath.Abs(strings.TrimSpace(artifactDir))
+	if err != nil {
+		return "", fmt.Errorf("resolve artifact-dir: %w", err)
+	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve artifact-dir symlinks: %w", err)
+	}
+	candidatePath := filepath.Join(root, filepath.Clean(artifactPath))
+	candidatePath, err = filepath.EvalSymlinks(candidatePath)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(root, candidatePath)
+	if err != nil {
+		return "", fmt.Errorf("verify artifact path: %w", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("%q resolves outside artifact-dir", artifactPath)
+	}
+	return candidatePath, nil
+}
+
+func storeCandidateArtifactBlobs(blobStore artifact.Store, preparedArtifacts []preparedCandidateArtifact) ([]db.EvalArtifact, error) {
+	evalArtifacts := make([]db.EvalArtifact, 0, len(preparedArtifacts))
+	for _, prepared := range preparedArtifacts {
+		blob, err := blobStore.Put(prepared.content)
+		if err != nil {
+			return nil, fmt.Errorf("store candidate artifact %q blob: %w", prepared.ref.ID, err)
+		}
+		if blob.Hash != prepared.hash {
+			return nil, fmt.Errorf("store candidate artifact %q blob hash is %s, want %s", prepared.ref.ID, blob.Hash, prepared.hash)
+		}
+		evalArtifacts = append(evalArtifacts, db.EvalArtifact{
+			ID:        prepared.ref.ID,
+			Hash:      prepared.hash,
+			MediaType: prepared.ref.MediaType,
+			SizeBytes: prepared.size,
+			Driver:    prepared.ref.Driver,
+		})
+	}
+	return evalArtifacts, nil
 }
 
 func templateSnapshot(template db.AgentTemplate) (TemplateSnapshot, error) {

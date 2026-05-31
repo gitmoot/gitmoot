@@ -34,7 +34,7 @@ The export does not copy blobs into the repository by default.
 Import a candidate produced by an external optimizer:
 
 ```sh
-gitmoot skillopt import --file candidate.json
+gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]
 ```
 
 The imported package must have:
@@ -48,10 +48,17 @@ The imported package must have:
   frontmatter
 - `eval_report`: optional optimizer report
 - `summary`: optional diff, score, and preference summary
+- `artifacts`: optional candidate artifact manifest entries with `id`, relative
+  `path`, SHA256 `hash`, `media_type`, `driver`, and optional `size_bytes`
 
 Importing never promotes a candidate. Gitmoot stores it as a pending template
 version so later review and promotion commands can decide whether it becomes
 current.
+If `artifacts` is present, `--artifact-dir` is required. Gitmoot rejects
+absolute paths, path traversal, missing files, hash mismatches, duplicate
+artifact ids, and invalid `summary.diff_artifact_id` references before creating
+the pending candidate version. Verified blobs are stored in Gitmoot's
+content-addressed artifact store and registered in SQLite.
 
 Review pending candidates:
 
@@ -168,7 +175,7 @@ Complete local review path:
 
 1. `gitmoot skillopt export --run <run-id> --output training.json`
 2. External optimizer returns `candidate.json`.
-3. `gitmoot skillopt import --file candidate.json`
+3. `gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]`
 4. `gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>`
 5. Human fills `feedback.yml`.
 6. `gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id>`
@@ -177,7 +184,7 @@ Complete local review path:
 
 Complete GitHub review path:
 
-1. `gitmoot skillopt import --file candidate.json`
+1. `gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]`
 2. `gitmoot skillopt feedback github publish --run <run-id> --repo owner/reviews`
 3. Humans reply in GitHub comments using the run-scoped YAML or short-form block.
 4. `gitmoot skillopt feedback github sync --run <run-id> --repo owner/reviews --issue <number>`

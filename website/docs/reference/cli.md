@@ -61,7 +61,7 @@ gitmoot lock list --repo owner/repo
 
 ```sh
 gitmoot skillopt export --run <run-id> [--output training.json]
-gitmoot skillopt import --file candidate.json
+gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]
 gitmoot skillopt candidate list [--template id]
 gitmoot skillopt candidate show <version-id>
 gitmoot skillopt candidate promote <version-id>

@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1086,6 +1087,79 @@ func TestRepositoryMethods(t *testing.T) {
 	}
 	if removed {
 		t.Fatal("second RemoveAgent removed missing agent")
+	}
+}
+
+func TestAddPendingAgentTemplateCandidateRollsBackArtifacts(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	template := AgentTemplate{
+		ID:             "planner",
+		Name:           "Planner",
+		Description:    "Plans work",
+		SourceRepo:     "local",
+		SourceRef:      "current",
+		SourcePath:     "planner.md",
+		ResolvedCommit: "abc123",
+		Content:        "Plan carefully.",
+		MetadataJSON:   `{"id":"planner","name":"Planner","description":"Plans work","kind":"agent-template","version":1,"capabilities":["ask"],"runtime_compatibility":["codex"],"tags":["planning"],"inputs":["task"],"outputs":["plan"]}`,
+	}
+	if err := store.UpsertAgentTemplate(ctx, template); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	current, err := store.GetAgentTemplate(ctx, "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	_, err = store.AddPendingAgentTemplateCandidate(ctx, AgentTemplate{
+		ID:             "planner",
+		Name:           "Planner Candidate",
+		Description:    "Plans work",
+		SourceRepo:     "gitmoot-skillopt",
+		SourceRef:      "candidate",
+		SourcePath:     "candidate.json",
+		ResolvedCommit: "def456",
+		Content:        "Plan carefully with risks.",
+		MetadataJSON:   template.MetadataJSON,
+	}, AgentTemplateCandidateReview{
+		TemplateID:     "planner",
+		BaseVersionID:  current.VersionID,
+		DiffArtifactID: "candidate-diff",
+		State:          "pending",
+	}, []EvalArtifact{
+		{ID: "candidate-diff", Hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", MediaType: "text/markdown", SizeBytes: 10, Driver: "text"},
+		{ID: "candidate-diff", Hash: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", MediaType: "text/markdown", SizeBytes: 11, Driver: "text"},
+	})
+	if err == nil {
+		t.Fatal("AddPendingAgentTemplateCandidate returned nil error for duplicate artifact ids")
+	}
+	if _, err := store.GetEvalArtifact(ctx, "candidate-diff"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetEvalArtifact after rollback error = %v, want sql.ErrNoRows", err)
+	}
+	pending, err := store.ListPendingAgentTemplateVersions(ctx, "planner")
+	if err != nil {
+		t.Fatalf("ListPendingAgentTemplateVersions returned error: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending versions = %+v, want none", pending)
+	}
+	after, err := store.GetAgentTemplate(ctx, "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate after rollback returned error: %v", err)
+	}
+	if after.VersionID != current.VersionID {
+		t.Fatalf("template changed after rollback: before=%+v after=%+v", current, after)
+	}
+	latest, err := store.GetAgentTemplateReference(ctx, "planner@latest")
+	if err != nil {
+		t.Fatalf("GetAgentTemplateReference latest after rollback returned error: %v", err)
+	}
+	if latest.VersionID != current.VersionID {
+		t.Fatalf("latest template changed after rollback: latest=%+v current=%+v", latest, current)
 	}
 }
 

@@ -20,13 +20,15 @@ are not copied into the repository by default.
 ## Candidate Package
 
 ```sh
-gitmoot skillopt import --file candidate.json
+gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]
 ```
 
 The candidate package contains full agent-template Markdown with YAML
-frontmatter, matching metadata, an optional eval report, and an optional summary.
-Importing stores the candidate as a pending template version and never promotes
-it automatically.
+frontmatter, matching metadata, an optional eval report, an optional summary,
+and optional artifact manifest entries. When artifact entries are present,
+`--artifact-dir` is required; Gitmoot verifies relative paths and SHA256 hashes,
+stores the blobs, and registers artifact metadata before creating the pending
+candidate. Importing never promotes it automatically.
 
 ```sh
 gitmoot skillopt candidate list --template planner
