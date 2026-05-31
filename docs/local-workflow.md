@@ -175,7 +175,9 @@ same checkout remain serialized even when the worker count is higher.
 
    ```sh
    mkdir -p agents
-   printf '%s\n' 'Review frontend changes for correctness and responsive behavior.' > agents/frontend-reviewer.md
+   gitmoot agent template draft frontend-reviewer --output agents/frontend-reviewer.md
+   $EDITOR agents/frontend-reviewer.md
+   gitmoot agent template validate agents/frontend-reviewer.md
    gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
    gitmoot agent start frontend-reviewer \
      --runtime codex \
@@ -192,7 +194,7 @@ same checkout remain serialized even when the worker count is higher.
    still keeps the normal fallback defaults if omitted, while
    `agent subscribe --template <custom-id>` requires explicit values.
 
-   After editing a custom prompt file, refresh the cached snapshot explicitly:
+   After editing a custom template file, refresh the cached snapshot explicitly:
 
    ```sh
    gitmoot agent template diff frontend-reviewer

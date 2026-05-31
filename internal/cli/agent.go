@@ -861,7 +861,7 @@ func agentStartupPrompt(agent runtime.Agent, cachedTemplate db.AgentTemplate) st
 			fmt.Fprintf(&builder, " @ %s", cachedTemplate.ResolvedCommit)
 		}
 		builder.WriteString("\n\nTemplate instructions:\n")
-		builder.WriteString(strings.TrimRight(cachedTemplate.Content, "\n"))
+		builder.WriteString(strings.TrimRight(agenttemplate.InstructionsForContent(cachedTemplate.Content), "\n"))
 		builder.WriteString("\n\n")
 	}
 	builder.WriteString("Initialize this session for future Gitmoot jobs. Do not edit files, run long tasks, create commits, or open pull requests now. Reply with a short readiness acknowledgment only.")

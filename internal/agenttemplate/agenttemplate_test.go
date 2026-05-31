@@ -45,15 +45,93 @@ func TestUpdatePlannerTemplate(t *testing.T) {
 		t.Fatalf("Open returned error: %v", err)
 	}
 	defer store.Close()
-	updated, err := Update(ctx, store, fakeFetcher{commit: "def456", content: "Plan carefully."}, PlannerTemplateID)
+	content := testTemplateContent(PlannerTemplateID, "# Planner\n\nPlan carefully.\n")
+	updated, err := Update(ctx, store, fakeFetcher{commit: "def456", content: content}, PlannerTemplateID)
 	if err != nil {
 		t.Fatalf("Update returned error: %v", err)
 	}
-	if updated.ID != PlannerTemplateID || updated.ResolvedCommit != "def456" || updated.Content != "Plan carefully." {
+	if updated.ID != PlannerTemplateID || updated.ResolvedCommit != "def456" || updated.Content != content {
 		t.Fatalf("updated planner template = %+v", updated)
 	}
 	if updated.SourceRepo != "jerryfane/gitmoot" || updated.SourcePath != "skills/gitmoot/agent-templates/planner.md" {
 		t.Fatalf("updated source = %+v", updated)
+	}
+}
+
+func TestParseTemplateContentRequiresFrontmatter(t *testing.T) {
+	content := testTemplateContent("frontend-reviewer", "# Frontend Reviewer\n\nReview UI changes.\n")
+	parsed, err := ParseTemplateContent(content)
+	if err != nil {
+		t.Fatalf("ParseTemplateContent returned error: %v", err)
+	}
+	if parsed.Metadata.ID != "frontend-reviewer" || parsed.Metadata.Kind != TemplateKind || parsed.Metadata.Version != TemplateVersion {
+		t.Fatalf("metadata = %+v", parsed.Metadata)
+	}
+	if strings.TrimSpace(parsed.Body) != "# Frontend Reviewer\n\nReview UI changes." {
+		t.Fatalf("body = %q", parsed.Body)
+	}
+
+	cases := map[string]string{
+		"missing frontmatter": "# Frontend Reviewer\n\nReview UI changes.\n",
+		"missing kind": FormatTemplateContent(Metadata{
+			ID:                   "frontend-reviewer",
+			Name:                 "Frontend Reviewer",
+			Description:          "Reviews UI.",
+			Version:              TemplateVersion,
+			Capabilities:         []string{"ask"},
+			RuntimeCompatibility: []string{"codex"},
+			Tags:                 []string{"review"},
+			Inputs:               []string{"repo"},
+			Outputs:              []string{"response"},
+		}, "# Frontend Reviewer\n\nReview UI changes.\n"),
+		"invalid capability": FormatTemplateContent(Metadata{
+			ID:                   "frontend-reviewer",
+			Name:                 "Frontend Reviewer",
+			Description:          "Reviews UI.",
+			Kind:                 TemplateKind,
+			Version:              TemplateVersion,
+			Capabilities:         []string{"unknown"},
+			RuntimeCompatibility: []string{"codex"},
+			Tags:                 []string{"review"},
+			Inputs:               []string{"repo"},
+			Outputs:              []string{"response"},
+		}, "# Frontend Reviewer\n\nReview UI changes.\n"),
+		"invalid runtime": FormatTemplateContent(Metadata{
+			ID:                   "frontend-reviewer",
+			Name:                 "Frontend Reviewer",
+			Description:          "Reviews UI.",
+			Kind:                 TemplateKind,
+			Version:              TemplateVersion,
+			Capabilities:         []string{"ask"},
+			RuntimeCompatibility: []string{"claude-code"},
+			Tags:                 []string{"review"},
+			Inputs:               []string{"repo"},
+			Outputs:              []string{"response"},
+		}, "# Frontend Reviewer\n\nReview UI changes.\n"),
+		"empty body": FormatTemplateContent(testMetadata("frontend-reviewer"), ""),
+	}
+	for name, candidate := range cases {
+		if _, err := ParseTemplateContent(candidate); err == nil {
+			t.Fatalf("%s: ParseTemplateContent returned nil", name)
+		}
+	}
+}
+
+func TestContentForDefinitionWrapsGenericSkillContent(t *testing.T) {
+	definition, ok := Lookup(ThermoNuclearCodeQualityReviewID)
+	if !ok {
+		t.Fatal("thermo template missing")
+	}
+	content, err := ContentForDefinition(definition, "# Thermo\n\nReview deeply.\n")
+	if err != nil {
+		t.Fatalf("ContentForDefinition returned error: %v", err)
+	}
+	parsed, err := ParseTemplateContent(content)
+	if err != nil {
+		t.Fatalf("wrapped content did not parse: %v\n%s", err, content)
+	}
+	if parsed.Metadata.ID != ThermoNuclearCodeQualityReviewID || !strings.Contains(parsed.Body, "Review deeply.") {
+		t.Fatalf("wrapped template = %+v body=%q", parsed.Metadata, parsed.Body)
 	}
 }
 
@@ -120,7 +198,8 @@ func TestAddLocalInstallsCustomTemplate(t *testing.T) {
 	}
 	defer store.Close()
 	promptPath := filepath.Join(t.TempDir(), "reviewer.md")
-	if err := os.WriteFile(promptPath, []byte("Review UI changes.\n"), 0o600); err != nil {
+	content := testTemplateContent("frontend-reviewer", "# Frontend Reviewer\n\nReview UI changes.\n")
+	if err := os.WriteFile(promptPath, []byte(content), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 
@@ -129,13 +208,13 @@ func TestAddLocalInstallsCustomTemplate(t *testing.T) {
 		t.Fatalf("AddLocal returned error: %v", err)
 	}
 
-	if added.ID != "frontend-reviewer" || added.Name != "frontend-reviewer" || added.Description != DefaultLocalDescription {
+	if added.ID != "frontend-reviewer" || added.Name != "Frontend Reviewer" || added.Description != "Reviews UI." {
 		t.Fatalf("added template metadata = %+v", added)
 	}
 	if added.SourceRepo != LocalSourceRepo || added.SourceRef != LocalSourceRef || !filepath.IsAbs(added.SourcePath) {
 		t.Fatalf("added template source = %+v", added)
 	}
-	if added.ResolvedCommit != HashContent("Review UI changes.\n") || added.Content != "Review UI changes.\n" {
+	if added.ResolvedCommit != HashContent(content) || added.Content != content {
 		t.Fatalf("added template content = %+v", added)
 	}
 }
@@ -153,7 +232,11 @@ func TestAddLocalRejectsInvalidInputs(t *testing.T) {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 	validPath := filepath.Join(dir, "valid.md")
-	if err := os.WriteFile(validPath, []byte("Prompt."), 0o600); err != nil {
+	if err := os.WriteFile(validPath, []byte(testTemplateContent("valid", "# Valid\n\nPrompt.")), 0o600); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	noFrontmatterPath := filepath.Join(dir, "no-frontmatter.md")
+	if err := os.WriteFile(noFrontmatterPath, []byte("Prompt."), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 
@@ -166,6 +249,8 @@ func TestAddLocalRejectsInvalidInputs(t *testing.T) {
 		{id: "missing", path: filepath.Join(dir, "missing.md")},
 		{id: "directory", path: dir},
 		{id: "empty", path: emptyPath},
+		{id: "no-frontmatter", path: noFrontmatterPath},
+		{id: "mismatch", path: validPath},
 	}
 	for _, tc := range cases {
 		if _, err := AddLocal(ctx, store, tc.id, tc.path, "", ""); err == nil {
@@ -182,14 +267,27 @@ func TestUpdateLocalRefreshesFromStoredPath(t *testing.T) {
 	}
 	defer store.Close()
 	promptPath := filepath.Join(t.TempDir(), "reviewer.md")
-	if err := os.WriteFile(promptPath, []byte("Old prompt.\n"), 0o600); err != nil {
+	oldContent := testTemplateContent("frontend-reviewer", "# Frontend Reviewer\n\nOld prompt.\n")
+	if err := os.WriteFile(promptPath, []byte(oldContent), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 	added, err := AddLocal(ctx, store, "frontend-reviewer", promptPath, "Frontend Reviewer", "Reviews UI.")
 	if err != nil {
 		t.Fatalf("AddLocal returned error: %v", err)
 	}
-	if err := os.WriteFile(promptPath, []byte("New prompt.\n"), 0o600); err != nil {
+	newContent := FormatTemplateContent(Metadata{
+		ID:                   "frontend-reviewer",
+		Name:                 "Frontend Review Lead",
+		Description:          "Reviews frontend behavior and polish.",
+		Kind:                 TemplateKind,
+		Version:              TemplateVersion,
+		Capabilities:         []string{"ask"},
+		RuntimeCompatibility: []string{"codex", "claude"},
+		Tags:                 []string{"review"},
+		Inputs:               []string{"repo"},
+		Outputs:              []string{"response"},
+	}, "# Frontend Review Lead\n\nNew prompt.\n")
+	if err := os.WriteFile(promptPath, []byte(newContent), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 
@@ -198,11 +296,30 @@ func TestUpdateLocalRefreshesFromStoredPath(t *testing.T) {
 		t.Fatalf("UpdateLocal returned error: %v", err)
 	}
 
-	if updated.Name != "Frontend Reviewer" || updated.Description != "Reviews UI." {
-		t.Fatalf("UpdateLocal changed metadata: %+v", updated)
+	if updated.Name != "Frontend Review Lead" || updated.Description != "Reviews frontend behavior and polish." {
+		t.Fatalf("UpdateLocal metadata = %+v", updated)
 	}
-	if updated.Content != "New prompt.\n" || updated.ResolvedCommit != HashContent("New prompt.\n") {
+	if updated.Content != newContent || updated.ResolvedCommit != HashContent(newContent) {
 		t.Fatalf("UpdateLocal content = %+v", updated)
+	}
+}
+
+func testTemplateContent(id string, body string) string {
+	return FormatTemplateContent(testMetadata(id), body)
+}
+
+func testMetadata(id string) Metadata {
+	return Metadata{
+		ID:                   id,
+		Name:                 titleFromID(id),
+		Description:          "Reviews UI.",
+		Kind:                 TemplateKind,
+		Version:              TemplateVersion,
+		Capabilities:         []string{"ask"},
+		RuntimeCompatibility: []string{"codex", "claude"},
+		Tags:                 []string{"review"},
+		Inputs:               []string{"repo"},
+		Outputs:              []string{"response"},
 	}
 }
 

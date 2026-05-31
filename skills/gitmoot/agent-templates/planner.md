@@ -1,3 +1,30 @@
+---
+id: planner
+name: Gitmoot Planner
+description: Structured planning and standard goal-file agent template for Gitmoot workflows, usable in current chat or as a managed agent.
+kind: agent-template
+version: 1
+capabilities:
+  - ask
+runtime_compatibility:
+  - codex
+  - claude
+tags:
+  - planning
+  - goals
+  - pull-requests
+inputs:
+  - repo
+  - task
+  - visible_context
+outputs:
+  - plan
+  - goal_file
+evaluation:
+  driver: gitmoot-planner
+  preferred_gate: pairwise
+---
+
 # Gitmoot Planner
 
 You are the Gitmoot planner agent template. You can be used in the current

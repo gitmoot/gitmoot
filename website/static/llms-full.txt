@@ -186,12 +186,14 @@ Ask it from a PR comment:
 
 ### Custom Prompt Agents
 
-Custom agent templates let you keep a local prompt file and bind its snapshotted
-instructions to any Gitmoot agent.
+Custom agent templates let you keep a local template file and bind its
+snapshotted instructions to any Gitmoot agent.
 
 ```sh
 mkdir -p agents
-printf '%s\n' 'Review frontend changes for correctness and responsive behavior.' > agents/frontend-reviewer.md
+gitmoot agent template draft frontend-reviewer --output agents/frontend-reviewer.md
+$EDITOR agents/frontend-reviewer.md
+gitmoot agent template validate agents/frontend-reviewer.md
 gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 gitmoot agent start frontend-reviewer \
   --runtime codex \
@@ -202,7 +204,7 @@ gitmoot agent start frontend-reviewer \
   --capability review
 ```
 
-After editing the prompt file, refresh the cached snapshot:
+After editing the template file, refresh the cached snapshot:
 
 ```sh
 gitmoot agent template diff frontend-reviewer
@@ -484,6 +486,10 @@ gitmoot agent start thermo-review \
 Create a local custom prompt template:
 
 ```sh
+mkdir -p agents
+gitmoot agent template draft frontend-reviewer --output agents/frontend-reviewer.md
+$EDITOR agents/frontend-reviewer.md
+gitmoot agent template validate agents/frontend-reviewer.md
 gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 gitmoot agent start frontend-reviewer \
   --runtime codex \
@@ -494,7 +500,7 @@ gitmoot agent start frontend-reviewer \
   --capability review
 ```
 
-After editing a local prompt file, refresh Gitmoot's cached snapshot explicitly:
+After editing a local template file, refresh Gitmoot's cached snapshot explicitly:
 
 ```sh
 gitmoot agent template diff frontend-reviewer
@@ -734,7 +740,9 @@ same checkout remain serialized even when the worker count is higher.
 
    ```sh
    mkdir -p agents
-   printf '%s\n' 'Review frontend changes for correctness and responsive behavior.' > agents/frontend-reviewer.md
+   gitmoot agent template draft frontend-reviewer --output agents/frontend-reviewer.md
+   $EDITOR agents/frontend-reviewer.md
+   gitmoot agent template validate agents/frontend-reviewer.md
    gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
    gitmoot agent start frontend-reviewer \
      --runtime codex \
@@ -751,7 +759,7 @@ same checkout remain serialized even when the worker count is higher.
    still keeps the normal fallback defaults if omitted, while
    `agent subscribe --template <custom-id>` requires explicit values.
 
-   After editing a custom prompt file, refresh the cached snapshot explicitly:
+   After editing a custom template file, refresh the cached snapshot explicitly:
 
    ```sh
    gitmoot agent template diff frontend-reviewer
@@ -1347,12 +1355,13 @@ The thermo template is non-mutating. It supplies reviewer defaults and allows
 Local custom agent templates are installed from files:
 
 ```sh
+gitmoot agent template validate agents/frontend-reviewer.md
 gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 ```
 
 They store `local@file:<absolute-path>` metadata and a `sha256:<hash>` resolved
 identifier. Adapters should not read those files or decide how agent templates behave;
-workflow code passes only the rendered prompt. After a prompt file changes, the
+workflow code passes only the rendered prompt. After a template file changes, the
 user must run `gitmoot agent template update <custom-id>` before new jobs use the new
 content.
 
@@ -1456,9 +1465,10 @@ Fixes:
   gitmoot agent template update thermo-nuclear-code-quality-review
   ```
 
-  For a custom local prompt file:
+  For a custom local template file:
 
   ```sh
+  gitmoot agent template validate agents/<custom-id>.md
   gitmoot agent template add <custom-id> --file agents/<custom-id>.md
   gitmoot agent template update <custom-id>
   ```
@@ -2042,11 +2052,11 @@ Expected signals:
 
 ## Custom Prompt Template Smoke Test
 
-Goal: local prompt file -> cached custom template -> template-backed Codex agent ->
-queued PR comment job with custom template metadata.
+Goal: local v1 template file -> cached custom template -> template-backed Codex
+agent -> queued PR comment job with custom template metadata.
 
 Prerequisites: a safe test repository, authenticated `gh`, installed Codex, and
-a Gitmoot build that includes `agent template add`.
+a Gitmoot build that includes `agent template draft` and `agent template add`.
 
 1. Build a local test binary and use an isolated Gitmoot home.
 
@@ -2057,16 +2067,19 @@ a Gitmoot build that includes `agent template add`.
    /tmp/gitmoot-current init --home "$GITMOOT_SMOKE_HOME"
    ```
 
-2. From the test repo checkout, create and install a local prompt template.
+2. From the test repo checkout, create and install a local v1 template.
 
    ```sh
    cd /path/to/project
    mkdir -p agents
-   printf '%s\n' 'Review only correctness, regressions, and missing tests.' > agents/local-reviewer.md
+   /tmp/gitmoot-current agent template draft local-reviewer \
+     --output agents/local-reviewer.md \
+     --force
+   $EDITOR agents/local-reviewer.md
+   /tmp/gitmoot-current agent template validate agents/local-reviewer.md
    /tmp/gitmoot-current agent template add local-reviewer \
      --home "$GITMOOT_SMOKE_HOME" \
-     --file agents/local-reviewer.md \
-     --name "Local Reviewer"
+     --file agents/local-reviewer.md
    /tmp/gitmoot-current agent template show --home "$GITMOOT_SMOKE_HOME" local-reviewer
    ```
 
@@ -2125,10 +2138,11 @@ Expected signals:
 - The result comment includes `Agent`, `Runtime`, `Template`, and `Job` metadata.
 - `job show <job-id>` includes the custom template id and `sha256:` content hash.
 
-6. Edit and refresh the prompt only through explicit template commands.
+6. Edit and refresh the template only through explicit template commands.
 
    ```sh
-   printf '%s\n' 'Review correctness, regressions, missing tests, and edge cases.' > agents/local-reviewer.md
+   $EDITOR agents/local-reviewer.md
+   /tmp/gitmoot-current agent template validate agents/local-reviewer.md
    /tmp/gitmoot-current agent template diff --home "$GITMOOT_SMOKE_HOME" local-reviewer
    /tmp/gitmoot-current agent template update --home "$GITMOOT_SMOKE_HOME" local-reviewer
    ```
@@ -2436,6 +2450,33 @@ relevant job events before acting.
 
 # Source: skills/gitmoot/agent-templates/planner.md
 
+---
+id: planner
+name: Gitmoot Planner
+description: Structured planning and standard goal-file agent template for Gitmoot workflows, usable in current chat or as a managed agent.
+kind: agent-template
+version: 1
+capabilities:
+  - ask
+runtime_compatibility:
+  - codex
+  - claude
+tags:
+  - planning
+  - goals
+  - pull-requests
+inputs:
+  - repo
+  - task
+  - visible_context
+outputs:
+  - plan
+  - goal_file
+evaluation:
+  driver: gitmoot-planner
+  preferred_gate: pairwise
+---
+
 # Gitmoot Planner
 
 You are the Gitmoot planner agent template. You can be used in the current
@@ -2678,6 +2719,10 @@ conversation context. Gitmoot does not extract hidden runtime memory.
 Create a local custom prompt template:
 
 ```sh
+mkdir -p agents
+gitmoot agent template draft frontend-reviewer --output agents/frontend-reviewer.md
+$EDITOR agents/frontend-reviewer.md
+gitmoot agent template validate agents/frontend-reviewer.md
 gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 gitmoot agent start frontend-reviewer \
   --runtime codex \
@@ -2688,7 +2733,7 @@ gitmoot agent start frontend-reviewer \
   --capability review
 ```
 
-After editing a local prompt file, refresh Gitmoot's cached snapshot:
+After editing a local template file, refresh Gitmoot's cached snapshot:
 
 ```sh
 gitmoot agent template diff frontend-reviewer
@@ -2797,7 +2842,9 @@ Use custom prompt agent templates for project-specific reviewers or helpers.
 
 ```sh
 mkdir -p agents
-printf '%s\n' 'Review frontend changes for correctness and responsive behavior.' > agents/frontend-reviewer.md
+gitmoot agent template draft frontend-reviewer --output agents/frontend-reviewer.md
+$EDITOR agents/frontend-reviewer.md
+gitmoot agent template validate agents/frontend-reviewer.md
 gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 gitmoot agent start frontend-reviewer \
   --runtime codex \
@@ -2809,7 +2856,7 @@ gitmoot agent start frontend-reviewer \
 ```
 
 Custom template content is snapshotted into local Gitmoot state. After editing the
-source prompt file, run `gitmoot agent template diff <id>` and `gitmoot agent template update
+source template file, run `gitmoot agent template diff <id>` and `gitmoot agent template update
 <id>` before expecting new jobs to use the changed prompt.
 
 ## Current-Chat Planner

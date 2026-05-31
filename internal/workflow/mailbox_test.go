@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jerryfane/gitmoot/internal/agenttemplate"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 )
@@ -118,11 +119,23 @@ func TestMailboxRunIncludesTemplateSnapshotInPrompt(t *testing.T) {
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"approved","summary":"clean","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
 	}}
+	templateContent := agenttemplate.FormatTemplateContent(agenttemplate.Metadata{
+		ID:                   "thermo",
+		Name:                 "Thermo",
+		Description:          "Reviews deeply.",
+		Kind:                 agenttemplate.TemplateKind,
+		Version:              agenttemplate.TemplateVersion,
+		Capabilities:         []string{"ask", "review"},
+		RuntimeCompatibility: []string{"codex"},
+		Tags:                 []string{"review"},
+		Inputs:               []string{"repo", "diff"},
+		Outputs:              []string{"review_findings"},
+	}, "# Thermo\n\nReview deeply.")
 	payload, err := marshalPayload(JobPayload{
 		Repo:                   "jerryfane/gitmoot",
 		TemplateID:             "thermo",
 		TemplateResolvedCommit: "abc123",
-		TemplateContent:        "Review deeply.",
+		TemplateContent:        templateContent,
 	})
 	if err != nil {
 		t.Fatalf("marshalPayload returned error: %v", err)
@@ -134,7 +147,9 @@ func TestMailboxRunIncludesTemplateSnapshotInPrompt(t *testing.T) {
 	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	if len(adapter.prompts) != 1 || !strings.Contains(adapter.prompts[0], "Template instructions:\nReview deeply.") {
+	if len(adapter.prompts) != 1 ||
+		!strings.Contains(adapter.prompts[0], "Template instructions:\n# Thermo\n\nReview deeply.") ||
+		strings.Contains(adapter.prompts[0], "kind: agent-template") {
 		t.Fatalf("prompt = %+v", adapter.prompts)
 	}
 }

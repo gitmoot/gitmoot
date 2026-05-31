@@ -249,7 +249,7 @@ func TestRunAgentStartUsesInstalledCustomTemplate(t *testing.T) {
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
 	promptPath := filepath.Join(t.TempDir(), "frontend.md")
-	if err := os.WriteFile(promptPath, []byte("Review frontend behavior.\n"), 0o600); err != nil {
+	if err := os.WriteFile(promptPath, []byte(testLocalTemplateContent("frontend-reviewer", "Review frontend behavior.\n")), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 	var stdout, stderr bytes.Buffer
@@ -1518,7 +1518,7 @@ func TestRunAgentSubscribeAppliesInstalledTemplateDefaults(t *testing.T) {
 func TestRunAgentSubscribeUsesInstalledCustomTemplate(t *testing.T) {
 	home := t.TempDir()
 	promptPath := filepath.Join(t.TempDir(), "frontend.md")
-	if err := os.WriteFile(promptPath, []byte("Review frontend behavior.\n"), 0o600); err != nil {
+	if err := os.WriteFile(promptPath, []byte(testLocalTemplateContent("frontend-reviewer", "Review frontend behavior.\n")), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 	var stdout, stderr bytes.Buffer

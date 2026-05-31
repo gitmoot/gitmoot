@@ -156,7 +156,18 @@ func DraftCaptureTemplate(id string) (string, error) {
 	builder.WriteString("- \"Install this template.\" Validate the file, then add it with Gitmoot.\n\n")
 	builder.WriteString("## Non-Goals\n\n")
 	builder.WriteString("- Do not capture one-off debugging details, temporary mistakes, secrets, or hidden model state.\n")
-	return builder.String(), nil
+	return FormatTemplateContent(Metadata{
+		ID:                   id,
+		Name:                 name,
+		Description:          "Reusable agent template captured from a current chat workflow.",
+		Kind:                 TemplateKind,
+		Version:              TemplateVersion,
+		Capabilities:         []string{"ask"},
+		RuntimeCompatibility: []string{"codex", "claude"},
+		Tags:                 []string{"custom", "captured-workflow"},
+		Inputs:               []string{"current_request", "visible_context"},
+		Outputs:              []string{"response"},
+	}, builder.String()), nil
 }
 
 func ValidateCaptureTemplateFile(path string) error {
@@ -168,26 +179,38 @@ func ValidateCaptureTemplateFile(path string) error {
 }
 
 func ValidateCaptureTemplateContent(content string) error {
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return errors.New("template content is empty")
+	parsed, err := ParseTemplateContent(content)
+	if err != nil {
+		return err
 	}
-	title, ok := firstMarkdownTitle(content)
+	body := strings.TrimSpace(parsed.Body)
+	title, ok := firstMarkdownTitle(body)
 	if !ok {
 		return errors.New("template must start with a markdown title heading")
 	}
 	if obviousPlaceholderPattern.MatchString(title) {
 		return errors.New("template title contains an unresolved placeholder")
 	}
-	for _, section := range CaptureTemplateSections {
-		if !hasMarkdownHeading(content, 2, section) {
-			return fmt.Errorf("template missing required section %q", section)
+	if hasMetadataTag(parsed.Metadata, "captured-workflow") {
+		for _, section := range CaptureTemplateSections {
+			if !hasMarkdownHeading(body, 2, section) {
+				return fmt.Errorf("template missing required section %q", section)
+			}
 		}
 	}
-	if obviousPlaceholderPattern.MatchString(content) {
+	if obviousPlaceholderPattern.MatchString(body) {
 		return errors.New("template contains unresolved placeholder text")
 	}
 	return nil
+}
+
+func hasMetadataTag(metadata Metadata, tag string) bool {
+	for _, candidate := range metadata.Tags {
+		if strings.EqualFold(candidate, tag) {
+			return true
+		}
+	}
+	return false
 }
 
 func firstMarkdownTitle(content string) (string, bool) {
@@ -248,13 +271,20 @@ func AddLocal(ctx context.Context, store *db.Store, id string, path string, name
 	if err != nil {
 		return db.AgentTemplate{}, err
 	}
+	parsed, err := ParseTemplateContent(local.Content)
+	if err != nil {
+		return db.AgentTemplate{}, err
+	}
+	if parsed.Metadata.ID != id {
+		return db.AgentTemplate{}, fmt.Errorf("template id %q does not match frontmatter id %q", id, parsed.Metadata.ID)
+	}
 	name = strings.TrimSpace(name)
 	if name == "" {
-		name = id
+		name = parsed.Metadata.Name
 	}
 	description = strings.TrimSpace(description)
 	if description == "" {
-		description = DefaultLocalDescription
+		description = parsed.Metadata.Description
 	}
 	template := db.AgentTemplate{
 		ID:             id,
@@ -283,7 +313,16 @@ func UpdateLocal(ctx context.Context, store *db.Store, cached db.AgentTemplate) 
 	if err != nil {
 		return db.AgentTemplate{}, err
 	}
+	parsed, err := ParseTemplateContent(local.Content)
+	if err != nil {
+		return db.AgentTemplate{}, err
+	}
+	if parsed.Metadata.ID != cached.ID {
+		return db.AgentTemplate{}, fmt.Errorf("template id %q does not match frontmatter id %q", cached.ID, parsed.Metadata.ID)
+	}
 	updated := cached
+	updated.Name = parsed.Metadata.Name
+	updated.Description = parsed.Metadata.Description
 	updated.SourceRepo = LocalSourceRepo
 	updated.SourceRef = LocalSourceRef
 	updated.SourcePath = local.Path
@@ -331,6 +370,10 @@ func Update(ctx context.Context, store *db.Store, fetcher Fetcher, id string) (d
 	if err != nil {
 		return db.AgentTemplate{}, err
 	}
+	content, err := ContentForDefinition(definition, file.Content)
+	if err != nil {
+		return db.AgentTemplate{}, err
+	}
 	template := db.AgentTemplate{
 		ID:             definition.ID,
 		Name:           definition.Name,
@@ -339,12 +382,68 @@ func Update(ctx context.Context, store *db.Store, fetcher Fetcher, id string) (d
 		SourceRef:      definition.SourceRef,
 		SourcePath:     definition.SourcePath,
 		ResolvedCommit: resolvedCommit,
-		Content:        file.Content,
+		Content:        content,
 	}
 	if err := store.UpsertAgentTemplate(ctx, template); err != nil {
 		return db.AgentTemplate{}, err
 	}
 	return store.GetAgentTemplate(ctx, template.ID)
+}
+
+func ContentForDefinition(definition Definition, content string) (string, error) {
+	if strings.TrimSpace(content) == "" {
+		return "", errors.New("template content is empty")
+	}
+	parsed, err := ParseTemplateContent(content)
+	if err == nil {
+		if parsed.Metadata.ID != definition.ID {
+			return "", fmt.Errorf("template id %q does not match built-in id %q", parsed.Metadata.ID, definition.ID)
+		}
+		return content, nil
+	}
+	return FormatTemplateContent(metadataForDefinition(definition), content), nil
+}
+
+func InstructionsForContent(content string) string {
+	parsed, err := ParseTemplateContent(content)
+	if err != nil {
+		return content
+	}
+	return parsed.Body
+}
+
+func metadataForDefinition(definition Definition) Metadata {
+	metadata := Metadata{
+		ID:                   definition.ID,
+		Name:                 definition.Name,
+		Description:          definition.Description,
+		Kind:                 TemplateKind,
+		Version:              TemplateVersion,
+		Capabilities:         definition.DefaultCapabilities,
+		RuntimeCompatibility: []string{"codex", "claude"},
+		Tags:                 []string{"agent-template"},
+		Inputs:               []string{"repo", "task"},
+		Outputs:              []string{"response"},
+	}
+	switch definition.ID {
+	case PlannerTemplateID:
+		metadata.Tags = []string{"planning", "goals", "pull-requests"}
+		metadata.Inputs = []string{"repo", "task", "visible_context"}
+		metadata.Outputs = []string{"plan", "goal_file"}
+		metadata.Evaluation = map[string]string{
+			"driver":         "gitmoot-planner",
+			"preferred_gate": "pairwise",
+		}
+	case ThermoNuclearCodeQualityReviewID:
+		metadata.Tags = []string{"review", "code-quality", "cursor-team-kit"}
+		metadata.Inputs = []string{"repo", "diff", "pull_request"}
+		metadata.Outputs = []string{"review_findings"}
+		metadata.Evaluation = map[string]string{
+			"driver":         "code-review",
+			"preferred_gate": "human-review",
+		}
+	}
+	return metadata
 }
 
 type GHFetcher struct {

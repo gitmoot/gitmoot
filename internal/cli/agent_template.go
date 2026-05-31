@@ -61,7 +61,7 @@ func runAgentTemplateAdd(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agent template add", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	file := fs.String("file", "", "local prompt file to install")
+	file := fs.String("file", "", "local template file to install")
 	name := fs.String("name", "", "agent template display name")
 	description := fs.String("description", "", "agent template description")
 	id, flagArgs := leadingID(args)
@@ -351,9 +351,13 @@ func runAgentTemplateDiff(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
+		upstreamContent, err := agenttemplate.ContentForDefinition(definition, upstream.Content)
+		if err != nil {
+			return err
+		}
 		fmt.Fprintf(stdout, "cached:   %s\n", cached.ResolvedCommit)
 		fmt.Fprintf(stdout, "upstream: %s\n", resolvedCommit)
-		fmt.Fprint(stdout, agenttemplate.Diff(cached.Content, upstream.Content))
+		fmt.Fprint(stdout, agenttemplate.Diff(cached.Content, upstreamContent))
 		return nil
 	})
 }

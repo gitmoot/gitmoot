@@ -78,9 +78,10 @@ Fixes:
   gitmoot agent template update thermo-nuclear-code-quality-review
   ```
 
-  For a custom local prompt file:
+  For a custom local template file:
 
   ```sh
+  gitmoot agent template validate agents/<custom-id>.md
   gitmoot agent template add <custom-id> --file agents/<custom-id>.md
   gitmoot agent template update <custom-id>
   ```

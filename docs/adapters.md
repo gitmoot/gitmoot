@@ -160,12 +160,13 @@ The thermo template is non-mutating. It supplies reviewer defaults and allows
 Local custom agent templates are installed from files:
 
 ```sh
+gitmoot agent template validate agents/frontend-reviewer.md
 gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 ```
 
 They store `local@file:<absolute-path>` metadata and a `sha256:<hash>` resolved
 identifier. Adapters should not read those files or decide how agent templates behave;
-workflow code passes only the rendered prompt. After a prompt file changes, the
+workflow code passes only the rendered prompt. After a template file changes, the
 user must run `gitmoot agent template update <custom-id>` before new jobs use the new
 content.
 

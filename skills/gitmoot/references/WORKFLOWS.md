@@ -54,7 +54,9 @@ Use custom prompt agent templates for project-specific reviewers or helpers.
 
 ```sh
 mkdir -p agents
-printf '%s\n' 'Review frontend changes for correctness and responsive behavior.' > agents/frontend-reviewer.md
+gitmoot agent template draft frontend-reviewer --output agents/frontend-reviewer.md
+$EDITOR agents/frontend-reviewer.md
+gitmoot agent template validate agents/frontend-reviewer.md
 gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 gitmoot agent start frontend-reviewer \
   --runtime codex \
@@ -66,7 +68,7 @@ gitmoot agent start frontend-reviewer \
 ```
 
 Custom template content is snapshotted into local Gitmoot state. After editing the
-source prompt file, run `gitmoot agent template diff <id>` and `gitmoot agent template update
+source template file, run `gitmoot agent template diff <id>` and `gitmoot agent template update
 <id>` before expecting new jobs to use the changed prompt.
 
 ## Current-Chat Planner

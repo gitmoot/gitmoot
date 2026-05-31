@@ -176,12 +176,14 @@ Ask it from a PR comment:
 
 ### Custom Prompt Agents
 
-Custom agent templates let you keep a local prompt file and bind its snapshotted
-instructions to any Gitmoot agent.
+Custom agent templates let you keep a local template file and bind its
+snapshotted instructions to any Gitmoot agent.
 
 ```sh
 mkdir -p agents
-printf '%s\n' 'Review frontend changes for correctness and responsive behavior.' > agents/frontend-reviewer.md
+gitmoot agent template draft frontend-reviewer --output agents/frontend-reviewer.md
+$EDITOR agents/frontend-reviewer.md
+gitmoot agent template validate agents/frontend-reviewer.md
 gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 gitmoot agent start frontend-reviewer \
   --runtime codex \
@@ -192,7 +194,7 @@ gitmoot agent start frontend-reviewer \
   --capability review
 ```
 
-After editing the prompt file, refresh the cached snapshot:
+After editing the template file, refresh the cached snapshot:
 
 ```sh
 gitmoot agent template diff frontend-reviewer

@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/jerryfane/gitmoot/internal/agenttemplate"
 	"github.com/jerryfane/gitmoot/internal/db"
 )
 
@@ -149,6 +150,6 @@ func promptOutputForTemplate(kind string, name string, template db.AgentTemplate
 		Name:           name,
 		TemplateID:     template.ID,
 		ResolvedCommit: template.ResolvedCommit,
-		Content:        template.Content,
+		Content:        agenttemplate.InstructionsForContent(template.Content),
 	}
 }

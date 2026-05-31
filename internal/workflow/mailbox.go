@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/jerryfane/gitmoot/internal/agenttemplate"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/prompts"
 	"github.com/jerryfane/gitmoot/internal/runtime"
@@ -330,7 +331,7 @@ func (p JobPayload) prompt(action string) prompts.JobPrompt {
 		Constraints:            p.Constraints,
 		TemplateID:             p.TemplateID,
 		TemplateResolvedCommit: p.TemplateResolvedCommit,
-		TemplateInstructions:   p.TemplateContent,
+		TemplateInstructions:   agenttemplate.InstructionsForContent(p.TemplateContent),
 	}
 }
 

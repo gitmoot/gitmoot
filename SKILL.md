@@ -157,6 +157,10 @@ gitmoot agent start thermo-review \
 Create a local custom prompt template:
 
 ```sh
+mkdir -p agents
+gitmoot agent template draft frontend-reviewer --output agents/frontend-reviewer.md
+$EDITOR agents/frontend-reviewer.md
+gitmoot agent template validate agents/frontend-reviewer.md
 gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 gitmoot agent start frontend-reviewer \
   --runtime codex \
@@ -167,7 +171,7 @@ gitmoot agent start frontend-reviewer \
   --capability review
 ```
 
-After editing a local prompt file, refresh Gitmoot's cached snapshot explicitly:
+After editing a local template file, refresh Gitmoot's cached snapshot explicitly:
 
 ```sh
 gitmoot agent template diff frontend-reviewer

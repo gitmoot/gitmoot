@@ -365,11 +365,11 @@ Expected signals:
 
 ## Custom Prompt Template Smoke Test
 
-Goal: local prompt file -> cached custom template -> template-backed Codex agent ->
-queued PR comment job with custom template metadata.
+Goal: local v1 template file -> cached custom template -> template-backed Codex
+agent -> queued PR comment job with custom template metadata.
 
 Prerequisites: a safe test repository, authenticated `gh`, installed Codex, and
-a Gitmoot build that includes `agent template add`.
+a Gitmoot build that includes `agent template draft` and `agent template add`.
 
 1. Build a local test binary and use an isolated Gitmoot home.
 
@@ -380,16 +380,19 @@ a Gitmoot build that includes `agent template add`.
    /tmp/gitmoot-current init --home "$GITMOOT_SMOKE_HOME"
    ```
 
-2. From the test repo checkout, create and install a local prompt template.
+2. From the test repo checkout, create and install a local v1 template.
 
    ```sh
    cd /path/to/project
    mkdir -p agents
-   printf '%s\n' 'Review only correctness, regressions, and missing tests.' > agents/local-reviewer.md
+   /tmp/gitmoot-current agent template draft local-reviewer \
+     --output agents/local-reviewer.md \
+     --force
+   $EDITOR agents/local-reviewer.md
+   /tmp/gitmoot-current agent template validate agents/local-reviewer.md
    /tmp/gitmoot-current agent template add local-reviewer \
      --home "$GITMOOT_SMOKE_HOME" \
-     --file agents/local-reviewer.md \
-     --name "Local Reviewer"
+     --file agents/local-reviewer.md
    /tmp/gitmoot-current agent template show --home "$GITMOOT_SMOKE_HOME" local-reviewer
    ```
 
@@ -448,10 +451,11 @@ Expected signals:
 - The result comment includes `Agent`, `Runtime`, `Template`, and `Job` metadata.
 - `job show <job-id>` includes the custom template id and `sha256:` content hash.
 
-6. Edit and refresh the prompt only through explicit template commands.
+6. Edit and refresh the template only through explicit template commands.
 
    ```sh
-   printf '%s\n' 'Review correctness, regressions, missing tests, and edge cases.' > agents/local-reviewer.md
+   $EDITOR agents/local-reviewer.md
+   /tmp/gitmoot-current agent template validate agents/local-reviewer.md
    /tmp/gitmoot-current agent template diff --home "$GITMOOT_SMOKE_HOME" local-reviewer
    /tmp/gitmoot-current agent template update --home "$GITMOOT_SMOKE_HOME" local-reviewer
    ```

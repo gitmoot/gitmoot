@@ -129,7 +129,8 @@ func TestAgentTemplateAddInstallsLocalCustomTemplate(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	home := t.TempDir()
 	promptPath := filepath.Join(t.TempDir(), "frontend.md")
-	if err := os.WriteFile(promptPath, []byte("Review frontend changes.\n"), 0o600); err != nil {
+	content := testLocalTemplateContent("frontend-reviewer", "Review frontend changes.\n")
+	if err := os.WriteFile(promptPath, []byte(content), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 
@@ -168,6 +169,10 @@ func TestAgentTemplateAddRejectsInvalidLocalFiles(t *testing.T) {
 	if err := os.WriteFile(emptyPath, []byte("\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
+	plainPath := filepath.Join(dir, "plain.md")
+	if err := os.WriteFile(plainPath, []byte("Review frontend changes.\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
 
 	cases := [][]string{
 		{"agent", "template", "add", "--home", home, "frontend-reviewer"},
@@ -175,6 +180,7 @@ func TestAgentTemplateAddRejectsInvalidLocalFiles(t *testing.T) {
 		{"agent", "template", "add", "--home", home, "--file", dir, "frontend-reviewer"},
 		{"agent", "template", "add", "--home", home, "--file", emptyPath, "frontend-reviewer"},
 		{"agent", "template", "add", "--home", home, "--file", emptyPath, "Bad"},
+		{"agent", "template", "add", "--home", home, "--file", plainPath, "frontend-reviewer"},
 	}
 	for _, args := range cases {
 		stdout.Reset()
@@ -202,6 +208,11 @@ func TestAgentTemplateDraftWritesDefaultTemplatePath(t *testing.T) {
 	for _, want := range []string{"# Release Planner", "## Role", "## Non-Goals"} {
 		if !strings.Contains(string(content), want) {
 			t.Fatalf("draft missing %q:\n%s", want, string(content))
+		}
+	}
+	for _, want := range []string{"id: release-planner", "kind: agent-template", "runtime_compatibility:"} {
+		if !strings.Contains(string(content), want) {
+			t.Fatalf("draft frontmatter missing %q:\n%s", want, string(content))
 		}
 	}
 	if !strings.Contains(stdout.String(), "drafted release-planner at "+filepath.Join(".gitmoot", "templates", "release-planner.md")) {
@@ -261,7 +272,12 @@ func TestAgentTemplateValidateAcceptsDraftedTemplate(t *testing.T) {
 func TestAgentTemplateValidateRejectsIncompleteTemplate(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	path := filepath.Join(t.TempDir(), "bad.md")
-	if err := os.WriteFile(path, []byte("# Bad\n\n## Role\n\nTODO\n"), 0o600); err != nil {
+	content, err := agenttemplate.DraftCaptureTemplate("bad")
+	if err != nil {
+		t.Fatalf("DraftCaptureTemplate returned error: %v", err)
+	}
+	content = strings.Replace(content, "## When To Use\n\n", "## Missing Section\n\n", 1)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 
@@ -301,11 +317,11 @@ func TestAgentTemplateListShowsInstalledCustomTemplate(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	home := t.TempDir()
 	promptPath := filepath.Join(t.TempDir(), "frontend.md")
-	if err := os.WriteFile(promptPath, []byte("Review frontend changes.\n"), 0o600); err != nil {
+	if err := os.WriteFile(promptPath, []byte(testLocalTemplateContent("frontend-reviewer", "Review frontend changes.\n")), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 	apiPromptPath := filepath.Join(t.TempDir(), "api.md")
-	if err := os.WriteFile(apiPromptPath, []byte("Review API changes.\n"), 0o600); err != nil {
+	if err := os.WriteFile(apiPromptPath, []byte(testLocalTemplateContent("api-reviewer", "Review API changes.\n")), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 	if code := Run([]string{"agent", "template", "add", "--home", home, "--file", promptPath, "frontend-reviewer"}, &stdout, &stderr); code != 0 {
@@ -338,13 +354,13 @@ func TestAgentTemplateUpdateAndDiffLocalCustomTemplate(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	home := t.TempDir()
 	promptPath := filepath.Join(t.TempDir(), "frontend.md")
-	if err := os.WriteFile(promptPath, []byte("Old prompt.\n"), 0o600); err != nil {
+	if err := os.WriteFile(promptPath, []byte(testLocalTemplateContent("frontend-reviewer", "Old prompt.\n")), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 	if code := Run([]string{"agent", "template", "add", "--home", home, "--file", promptPath, "frontend-reviewer"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("template add exit code = %d, stderr=%s", code, stderr.String())
 	}
-	if err := os.WriteFile(promptPath, []byte("New prompt.\n"), 0o600); err != nil {
+	if err := os.WriteFile(promptPath, []byte(testLocalTemplateContent("frontend-reviewer", "New prompt.\n")), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 
@@ -385,13 +401,14 @@ func TestAgentTemplateDiffReportsExactTrailingNewlineChanges(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	home := t.TempDir()
 	promptPath := filepath.Join(t.TempDir(), "frontend.md")
-	if err := os.WriteFile(promptPath, []byte("Prompt.\n"), 0o600); err != nil {
+	content := testLocalTemplateContent("frontend-reviewer", "Prompt.\n")
+	if err := os.WriteFile(promptPath, []byte(content), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 	if code := Run([]string{"agent", "template", "add", "frontend-reviewer", "--home", home, "--file", promptPath}, &stdout, &stderr); code != 0 {
 		t.Fatalf("template add exit code = %d, stderr=%s", code, stderr.String())
 	}
-	if err := os.WriteFile(promptPath, []byte("Prompt.\n\n"), 0o600); err != nil {
+	if err := os.WriteFile(promptPath, []byte(content+"\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 
@@ -410,7 +427,8 @@ func TestAgentPromptPrintsCustomTemplateContent(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	home := t.TempDir()
 	promptPath := filepath.Join(t.TempDir(), "review-fe.md")
-	if err := os.WriteFile(promptPath, []byte("Review frontend changes.\n"), 0o600); err != nil {
+	content := testLocalTemplateContent("review-fe", "Review frontend changes.\n")
+	if err := os.WriteFile(promptPath, []byte(content), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 	if code := Run([]string{"agent", "template", "add", "review-fe", "--home", home, "--file", promptPath}, &stdout, &stderr); code != 0 {
@@ -434,11 +452,12 @@ func TestAgentPromptResolvesRegisteredAgentBeforeTemplate(t *testing.T) {
 	home := t.TempDir()
 	templateDir := t.TempDir()
 	reviewPath := filepath.Join(templateDir, "review-fe.md")
-	if err := os.WriteFile(reviewPath, []byte("Review frontend changes.\n"), 0o600); err != nil {
+	reviewContent := testLocalTemplateContent("review-fe", "Review frontend changes.\n")
+	if err := os.WriteFile(reviewPath, []byte(reviewContent), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 	clashPath := filepath.Join(templateDir, "clash.md")
-	if err := os.WriteFile(clashPath, []byte("Wrong direct template.\n"), 0o600); err != nil {
+	if err := os.WriteFile(clashPath, []byte(testLocalTemplateContent("clash", "Wrong direct template.\n")), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 	if code := Run([]string{"agent", "template", "add", "review-fe", "--home", home, "--file", reviewPath}, &stdout, &stderr); code != 0 {
@@ -479,7 +498,8 @@ func TestAgentPromptJSONIncludesAgentMetadata(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	home := t.TempDir()
 	promptPath := filepath.Join(t.TempDir(), "review-fe.md")
-	if err := os.WriteFile(promptPath, []byte("Review frontend changes.\n"), 0o600); err != nil {
+	content := testLocalTemplateContent("review-fe", "Review frontend changes.\n")
+	if err := os.WriteFile(promptPath, []byte(content), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 	if code := Run([]string{"agent", "template", "add", "review-fe", "--home", home, "--file", promptPath}, &stdout, &stderr); code != 0 {
@@ -512,7 +532,7 @@ func TestAgentPromptJSONIncludesAgentMetadata(t *testing.T) {
 	if output.Kind != "agent" || output.Name != "review-fe-agent" || output.TemplateID != "review-fe" || output.Runtime != "shell" || output.Role != "reviewer" {
 		t.Fatalf("prompt JSON metadata = %+v", output)
 	}
-	if strings.Join(output.Capabilities, ",") != "ask,review" || output.Content != "Review frontend changes.\n" || !strings.HasPrefix(output.ResolvedCommit, "sha256:") {
+	if strings.Join(output.Capabilities, ",") != "ask,review" || output.Content != "Review frontend changes." || !strings.HasPrefix(output.ResolvedCommit, "sha256:") {
 		t.Fatalf("prompt JSON content = %+v", output)
 	}
 }
@@ -622,6 +642,32 @@ func seedCachedAgentTemplate(t *testing.T, home string, template db.AgentTemplat
 	if err := store.UpsertAgentTemplate(context.Background(), template); err != nil {
 		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
 	}
+}
+
+func testLocalTemplateContent(id string, body string) string {
+	return agenttemplate.FormatTemplateContent(agenttemplate.Metadata{
+		ID:                   id,
+		Name:                 testTemplateName(id),
+		Description:          "Reviews UI.",
+		Kind:                 agenttemplate.TemplateKind,
+		Version:              agenttemplate.TemplateVersion,
+		Capabilities:         []string{"ask"},
+		RuntimeCompatibility: []string{"codex", "claude"},
+		Tags:                 []string{"review"},
+		Inputs:               []string{"repo"},
+		Outputs:              []string{"response"},
+	}, body)
+}
+
+func testTemplateName(id string) string {
+	parts := strings.Split(id, "-")
+	for index, part := range parts {
+		if part == "" {
+			continue
+		}
+		parts[index] = strings.ToUpper(part[:1]) + part[1:]
+	}
+	return strings.Join(parts, " ")
 }
 
 func replaceAgentTemplateFetcher(fetcher agenttemplate.Fetcher) func() {
