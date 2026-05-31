@@ -800,22 +800,8 @@ func (s *Store) AddPendingAgentTemplateVersion(ctx context.Context, template Age
 		return AgentTemplateVersion{}, err
 	}
 	defer tx.Rollback()
-	versionNumber, err := nextAgentTemplateVersionNumber(ctx, tx, template.ID)
+	_, versionNumber, err := addPendingAgentTemplateVersionTx(ctx, tx, template)
 	if err != nil {
-		return AgentTemplateVersion{}, err
-	}
-	versionID := agentTemplateVersionID(template.ID, versionNumber)
-	contentHash := templateContentHash(template.Content)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO agent_template_versions(id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, updated_at)
-		VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-		versionID, template.ID, versionNumber, template.Name, template.Description, template.SourceRepo, template.SourceRef, template.SourcePath, template.ResolvedCommit, contentHash, template.Content, template.MetadataJSON); err != nil {
-		return AgentTemplateVersion{}, err
-	}
-	result, err := tx.ExecContext(ctx, `UPDATE agent_templates SET latest_version_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, versionID, template.ID)
-	if err != nil {
-		return AgentTemplateVersion{}, err
-	}
-	if err := requireAffected(result, "agent template", template.ID); err != nil {
 		return AgentTemplateVersion{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -824,7 +810,61 @@ func (s *Store) AddPendingAgentTemplateVersion(ctx context.Context, template Age
 	return s.GetAgentTemplateVersion(ctx, template.ID, fmt.Sprintf("v%d", versionNumber))
 }
 
+func (s *Store) AddPendingAgentTemplateCandidate(ctx context.Context, template AgentTemplate, review AgentTemplateCandidateReview, artifacts []EvalArtifact) (AgentTemplateVersion, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	defer tx.Rollback()
+	versionID, versionNumber, err := addPendingAgentTemplateVersionTx(ctx, tx, template)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	for _, artifact := range artifacts {
+		if err := insertEvalArtifactTx(ctx, tx, artifact); err != nil {
+			return AgentTemplateVersion{}, err
+		}
+	}
+	review.VersionID = versionID
+	if strings.TrimSpace(review.TemplateID) == "" {
+		review.TemplateID = template.ID
+	}
+	if err := insertAgentTemplateCandidateReviewTx(ctx, tx, review); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	return s.GetAgentTemplateVersion(ctx, template.ID, fmt.Sprintf("v%d", versionNumber))
+}
+
+func addPendingAgentTemplateVersionTx(ctx context.Context, tx *sql.Tx, template AgentTemplate) (string, int, error) {
+	versionNumber, err := nextAgentTemplateVersionNumber(ctx, tx, template.ID)
+	if err != nil {
+		return "", 0, err
+	}
+	versionID := agentTemplateVersionID(template.ID, versionNumber)
+	contentHash := templateContentHash(template.Content)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO agent_template_versions(id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, updated_at)
+		VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		versionID, template.ID, versionNumber, template.Name, template.Description, template.SourceRepo, template.SourceRef, template.SourcePath, template.ResolvedCommit, contentHash, template.Content, template.MetadataJSON); err != nil {
+		return "", 0, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE agent_templates SET latest_version_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, versionID, template.ID)
+	if err != nil {
+		return "", 0, err
+	}
+	if err := requireAffected(result, "agent template", template.ID); err != nil {
+		return "", 0, err
+	}
+	return versionID, versionNumber, nil
+}
+
 func (s *Store) UpsertAgentTemplateCandidateReview(ctx context.Context, review AgentTemplateCandidateReview) error {
+	return upsertAgentTemplateCandidateReview(ctx, s.db, review)
+}
+
+func upsertAgentTemplateCandidateReview(ctx context.Context, execer sqlExecer, review AgentTemplateCandidateReview) error {
 	if strings.TrimSpace(review.VersionID) == "" {
 		return errors.New("candidate review version id is required")
 	}
@@ -834,7 +874,7 @@ func (s *Store) UpsertAgentTemplateCandidateReview(ctx context.Context, review A
 	if strings.TrimSpace(review.State) == "" {
 		review.State = "pending"
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO agent_template_candidate_reviews(
+	_, err := execer.ExecContext(ctx, `INSERT INTO agent_template_candidate_reviews(
 			version_id, template_id, base_version_id, diff_artifact_id, score, preference_summary,
 			eval_report_json, summary_metadata_json, state, decision_reason, updated_at
 		)
@@ -861,6 +901,10 @@ func (s *Store) UpsertAgentTemplateCandidateReview(ctx context.Context, review A
 		strings.TrimSpace(review.State),
 		strings.TrimSpace(review.DecisionReason))
 	return err
+}
+
+func insertAgentTemplateCandidateReviewTx(ctx context.Context, tx *sql.Tx, review AgentTemplateCandidateReview) error {
+	return upsertAgentTemplateCandidateReview(ctx, tx, review)
 }
 
 func (s *Store) GetAgentTemplateCandidateReview(ctx context.Context, versionID string) (AgentTemplateCandidateReview, error) {
@@ -1595,16 +1639,11 @@ func (s *Store) ListJobEvents(ctx context.Context, jobID string) ([]JobEvent, er
 }
 
 func (s *Store) UpsertEvalArtifact(ctx context.Context, artifact EvalArtifact) error {
-	if strings.TrimSpace(artifact.ID) == "" {
-		artifact.ID = artifact.Hash
+	artifact, err := normalizeEvalArtifact(artifact)
+	if err != nil {
+		return err
 	}
-	if strings.TrimSpace(artifact.Hash) == "" {
-		return errors.New("eval artifact hash is required")
-	}
-	if artifact.SizeBytes < 0 {
-		return errors.New("eval artifact size cannot be negative")
-	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO eval_artifacts(id, hash, media_type, size_bytes, driver, created_at)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO eval_artifacts(id, hash, media_type, size_bytes, driver, created_at)
 		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
 			hash = excluded.hash,
@@ -1613,6 +1652,34 @@ func (s *Store) UpsertEvalArtifact(ctx context.Context, artifact EvalArtifact) e
 			driver = excluded.driver`,
 		artifact.ID, artifact.Hash, artifact.MediaType, artifact.SizeBytes, artifact.Driver)
 	return err
+}
+
+func insertEvalArtifactTx(ctx context.Context, tx *sql.Tx, artifact EvalArtifact) error {
+	artifact, err := normalizeEvalArtifact(artifact)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO eval_artifacts(id, hash, media_type, size_bytes, driver, created_at)
+		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		artifact.ID, artifact.Hash, artifact.MediaType, artifact.SizeBytes, artifact.Driver)
+	return err
+}
+
+func normalizeEvalArtifact(artifact EvalArtifact) (EvalArtifact, error) {
+	if strings.TrimSpace(artifact.ID) == "" {
+		artifact.ID = artifact.Hash
+	}
+	if strings.TrimSpace(artifact.Hash) == "" {
+		return EvalArtifact{}, errors.New("eval artifact hash is required")
+	}
+	if artifact.SizeBytes < 0 {
+		return EvalArtifact{}, errors.New("eval artifact size cannot be negative")
+	}
+	artifact.ID = strings.TrimSpace(artifact.ID)
+	artifact.Hash = strings.TrimSpace(artifact.Hash)
+	artifact.MediaType = strings.TrimSpace(artifact.MediaType)
+	artifact.Driver = strings.TrimSpace(artifact.Driver)
+	return artifact, nil
 }
 
 func (s *Store) GetEvalArtifact(ctx context.Context, id string) (EvalArtifact, error) {

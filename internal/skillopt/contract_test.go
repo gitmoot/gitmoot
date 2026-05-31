@@ -3,7 +3,9 @@ package skillopt
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jerryfane/gitmoot/internal/agenttemplate"
@@ -170,6 +172,284 @@ func TestImportCandidatePackageCreatesPendingVersion(t *testing.T) {
 	}
 }
 
+func TestImportCandidatePackageWithArtifacts(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.UpsertAgentTemplate(ctx, testTemplate("planner", "Plan carefully.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	current, err := store.GetAgentTemplate(ctx, "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	artifactDir := t.TempDir()
+	diffContent := []byte("candidate diff\n")
+	diffHash := artifact.ContentHash(diffContent)
+	if err := os.WriteFile(filepath.Join(artifactDir, "candidate.diff.md"), diffContent, 0o644); err != nil {
+		t.Fatalf("write diff artifact: %v", err)
+	}
+	blobStore := artifact.NewStore(filepath.Join(t.TempDir(), "blobs"))
+	candidate := testCandidatePackage(t, "planner", current.VersionID, "Plan carefully with artifact-backed evidence.")
+	diffSize := int64(len(diffContent))
+	candidate.Summary.DiffArtifactID = "candidate-diff"
+	candidate.Artifacts = []CandidateArtifactRef{{
+		ID:        "candidate-diff",
+		Path:      "candidate.diff.md",
+		Hash:      diffHash,
+		MediaType: "text/markdown",
+		Driver:    "text",
+		SizeBytes: &diffSize,
+	}}
+
+	version, err := ImportCandidatePackageWithOptions(ctx, store, candidate, CandidateImportOptions{
+		SourcePath:  "candidate.json",
+		ArtifactDir: artifactDir,
+		BlobStore:   blobStore,
+	})
+	if err != nil {
+		t.Fatalf("ImportCandidatePackageWithOptions returned error: %v", err)
+	}
+	review, err := store.GetAgentTemplateCandidateReview(ctx, version.ID)
+	if err != nil {
+		t.Fatalf("GetAgentTemplateCandidateReview returned error: %v", err)
+	}
+	if review.DiffArtifactID != "candidate-diff" {
+		t.Fatalf("review diff artifact id = %q", review.DiffArtifactID)
+	}
+	stored, err := store.GetEvalArtifact(ctx, "candidate-diff")
+	if err != nil {
+		t.Fatalf("GetEvalArtifact returned error: %v", err)
+	}
+	if stored.Hash != diffHash || stored.SizeBytes != diffSize || stored.MediaType != "text/markdown" || stored.Driver != "text" {
+		t.Fatalf("stored artifact = %+v", stored)
+	}
+	storedContent, err := blobStore.Read(diffHash)
+	if err != nil {
+		t.Fatalf("Read stored blob returned error: %v", err)
+	}
+	if string(storedContent) != string(diffContent) {
+		t.Fatalf("stored blob content = %q", string(storedContent))
+	}
+}
+
+func TestImportCandidatePackageArtifactValidationFailsBeforeCandidateState(t *testing.T) {
+	tests := []struct {
+		name        string
+		path        string
+		hash        string
+		artifactDir string
+		writeFile   bool
+		wantErr     string
+	}{
+		{
+			name:        "missing artifact dir",
+			path:        "candidate.diff.md",
+			hash:        artifact.ContentHash([]byte("candidate diff\n")),
+			artifactDir: "",
+			writeFile:   true,
+			wantErr:     "candidate artifacts require --artifact-dir",
+		},
+		{
+			name:        "invalid hash",
+			path:        "candidate.diff.md",
+			hash:        artifact.ContentHash([]byte("other")),
+			artifactDir: "set",
+			writeFile:   true,
+			wantErr:     "hash is",
+		},
+		{
+			name:        "path traversal",
+			path:        "../candidate.diff.md",
+			hash:        artifact.ContentHash([]byte("candidate diff\n")),
+			artifactDir: "set",
+			writeFile:   false,
+			wantErr:     "relative path inside artifact-dir",
+		},
+		{
+			name:        "absolute path",
+			path:        "/tmp/candidate.diff.md",
+			hash:        artifact.ContentHash([]byte("candidate diff\n")),
+			artifactDir: "set",
+			writeFile:   false,
+			wantErr:     "relative path inside artifact-dir",
+		},
+		{
+			name:        "missing file",
+			path:        "missing.diff.md",
+			hash:        artifact.ContentHash([]byte("candidate diff\n")),
+			artifactDir: "set",
+			writeFile:   false,
+			wantErr:     "no such file",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+			if err != nil {
+				t.Fatalf("Open returned error: %v", err)
+			}
+			defer store.Close()
+			if err := store.UpsertAgentTemplate(ctx, testTemplate("planner", "Plan carefully.")); err != nil {
+				t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+			}
+			current, err := store.GetAgentTemplate(ctx, "planner")
+			if err != nil {
+				t.Fatalf("GetAgentTemplate returned error: %v", err)
+			}
+			artifactDir := ""
+			if tt.artifactDir == "set" {
+				artifactDir = t.TempDir()
+			}
+			if tt.writeFile && artifactDir != "" {
+				if err := os.WriteFile(filepath.Join(artifactDir, "candidate.diff.md"), []byte("candidate diff\n"), 0o644); err != nil {
+					t.Fatalf("write diff artifact: %v", err)
+				}
+			}
+			candidate := testCandidatePackage(t, "planner", current.VersionID, "Plan carefully with artifact-backed evidence.")
+			candidate.Summary.DiffArtifactID = "candidate-diff"
+			candidate.Artifacts = []CandidateArtifactRef{{
+				ID:        "candidate-diff",
+				Path:      tt.path,
+				Hash:      tt.hash,
+				MediaType: "text/markdown",
+				Driver:    "text",
+			}}
+
+			_, err = ImportCandidatePackageWithOptions(ctx, store, candidate, CandidateImportOptions{
+				SourcePath:  "candidate.json",
+				ArtifactDir: artifactDir,
+				BlobStore:   artifact.NewStore(filepath.Join(t.TempDir(), "blobs")),
+			})
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("ImportCandidatePackageWithOptions error = %v, want substring %q", err, tt.wantErr)
+			}
+			pending, err := store.ListPendingAgentTemplateVersions(ctx, "planner")
+			if err != nil {
+				t.Fatalf("ListPendingAgentTemplateVersions returned error: %v", err)
+			}
+			if len(pending) != 0 {
+				t.Fatalf("pending versions = %+v, want none", pending)
+			}
+			if _, err := store.GetEvalArtifact(ctx, "candidate-diff"); err == nil {
+				t.Fatalf("candidate artifact was registered despite failed import")
+			}
+		})
+	}
+}
+
+func TestImportCandidatePackageRejectsDuplicateCandidateArtifactIDs(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.UpsertAgentTemplate(ctx, testTemplate("planner", "Plan carefully.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	current, err := store.GetAgentTemplate(ctx, "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	artifactDir := t.TempDir()
+	content := []byte("candidate diff\n")
+	hash := artifact.ContentHash(content)
+	if err := os.WriteFile(filepath.Join(artifactDir, "candidate.diff.md"), content, 0o644); err != nil {
+		t.Fatalf("write diff artifact: %v", err)
+	}
+	candidate := testCandidatePackage(t, "planner", current.VersionID, "Plan carefully with artifact-backed evidence.")
+	candidate.Summary.DiffArtifactID = "candidate-diff"
+	candidate.Artifacts = []CandidateArtifactRef{
+		{ID: "candidate-diff", Path: "candidate.diff.md", Hash: hash, MediaType: "text/markdown", Driver: "text"},
+		{ID: "candidate-diff", Path: "candidate.diff.md", Hash: hash, MediaType: "text/markdown", Driver: "text"},
+	}
+
+	_, err = ImportCandidatePackageWithOptions(ctx, store, candidate, CandidateImportOptions{
+		SourcePath:  "candidate.json",
+		ArtifactDir: artifactDir,
+		BlobStore:   artifact.NewStore(filepath.Join(t.TempDir(), "blobs")),
+	})
+	if err == nil || !strings.Contains(err.Error(), "duplicated") {
+		t.Fatalf("ImportCandidatePackageWithOptions error = %v, want duplicate id", err)
+	}
+	pending, err := store.ListPendingAgentTemplateVersions(ctx, "planner")
+	if err != nil {
+		t.Fatalf("ListPendingAgentTemplateVersions returned error: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending versions = %+v, want none", pending)
+	}
+}
+
+func TestImportCandidatePackageRejectsExistingCandidateArtifactID(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.UpsertAgentTemplate(ctx, testTemplate("planner", "Plan carefully.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	originalHash := artifact.ContentHash([]byte("old diff\n"))
+	if err := store.UpsertEvalArtifact(ctx, db.EvalArtifact{
+		ID:        "candidate-diff",
+		Hash:      originalHash,
+		MediaType: "text/markdown",
+		SizeBytes: int64(len("old diff\n")),
+		Driver:    "text",
+	}); err != nil {
+		t.Fatalf("UpsertEvalArtifact returned error: %v", err)
+	}
+	current, err := store.GetAgentTemplate(ctx, "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	artifactDir := t.TempDir()
+	content := []byte("new diff\n")
+	hash := artifact.ContentHash(content)
+	if err := os.WriteFile(filepath.Join(artifactDir, "candidate.diff.md"), content, 0o644); err != nil {
+		t.Fatalf("write diff artifact: %v", err)
+	}
+	candidate := testCandidatePackage(t, "planner", current.VersionID, "Plan carefully with artifact-backed evidence.")
+	candidate.Summary.DiffArtifactID = "candidate-diff"
+	candidate.Artifacts = []CandidateArtifactRef{{
+		ID:        "candidate-diff",
+		Path:      "candidate.diff.md",
+		Hash:      hash,
+		MediaType: "text/markdown",
+		Driver:    "text",
+	}}
+
+	_, err = ImportCandidatePackageWithOptions(ctx, store, candidate, CandidateImportOptions{
+		SourcePath:  "candidate.json",
+		ArtifactDir: artifactDir,
+		BlobStore:   artifact.NewStore(filepath.Join(t.TempDir(), "blobs")),
+	})
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("ImportCandidatePackageWithOptions error = %v, want existing artifact rejection", err)
+	}
+	stored, err := store.GetEvalArtifact(ctx, "candidate-diff")
+	if err != nil {
+		t.Fatalf("GetEvalArtifact returned error: %v", err)
+	}
+	if stored.Hash != originalHash {
+		t.Fatalf("stored artifact hash = %q, want original %q", stored.Hash, originalHash)
+	}
+	pending, err := store.ListPendingAgentTemplateVersions(ctx, "planner")
+	if err != nil {
+		t.Fatalf("ListPendingAgentTemplateVersions returned error: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending versions = %+v, want none", pending)
+	}
+}
+
 func testTemplate(id string, body string) db.AgentTemplate {
 	content := testTemplateContent(id, body)
 	parsed, err := agenttemplate.ParseTemplateContent(content)
@@ -190,6 +470,29 @@ func testTemplate(id string, body string) db.AgentTemplate {
 		ResolvedCommit: agenttemplate.HashContent(content),
 		Content:        content,
 		MetadataJSON:   metadataJSON,
+	}
+}
+
+func testCandidatePackage(t *testing.T, templateID string, baseVersionID string, body string) CandidatePackage {
+	t.Helper()
+	candidateContent := testTemplateContent(templateID, body)
+	parsed, err := agenttemplate.ParseTemplateContent(candidateContent)
+	if err != nil {
+		t.Fatalf("ParseTemplateContent returned error: %v", err)
+	}
+	return CandidatePackage{
+		Kind:            CandidatePackageKind,
+		ContractVersion: ContractVersion,
+		TemplateID:      templateID,
+		BaseVersionID:   baseVersionID,
+		Candidate: CandidateTemplate{
+			Content:  candidateContent,
+			Metadata: parsed.Metadata,
+		},
+		EvalReport: json.RawMessage(`{"score":0.82}`),
+		Summary: CandidateSummary{
+			PreferenceSummary: "Candidate is more actionable.",
+		},
 	}
 }
 
