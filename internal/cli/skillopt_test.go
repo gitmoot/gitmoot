@@ -776,6 +776,233 @@ func TestSkillOptReviewCreateAndStatus(t *testing.T) {
 	}
 }
 
+func TestSkillOptReviewItemAddStoresArtifacts(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	template := cliSkillOptTemplate("planner", "Plan the work.")
+	if err := store.UpsertAgentTemplate(context.Background(), template); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "review", "create",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/repo",
+		"--run", "planner-ab-1",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt review create exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	inputDir := t.TempDir()
+	baselinePath := filepath.Join(inputDir, "baseline.md")
+	candidatePath := filepath.Join(inputDir, "candidate.md")
+	if err := os.WriteFile(baselinePath, []byte("# Baseline\n\nShort plan.\n"), 0o644); err != nil {
+		t.Fatalf("write baseline: %v", err)
+	}
+	if err := os.WriteFile(candidatePath, []byte("# Candidate\n\nShort plan with risks.\n"), 0o644); err != nil {
+		t.Fatalf("write candidate: %v", err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "review", "item", "add",
+		"--home", home,
+		"--run", "planner-ab-1",
+		"--item", "item-001",
+		"--title", "README planning task",
+		"--baseline", baselinePath,
+		"--candidate", candidatePath,
+		"--metadata-json", `{"path":"README.md"}`,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt review item add exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "added review item item-001 to planner-ab-1") {
+		t.Fatalf("review item add stdout = %q", stdout.String())
+	}
+
+	store, err = db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open after item add returned error: %v", err)
+	}
+	items, err := store.ListEvalReviewItems(context.Background(), "planner-ab-1")
+	if err != nil {
+		t.Fatalf("ListEvalReviewItems returned error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("review item count = %d, want 1", len(items))
+	}
+	item := items[0]
+	if item.Title != "README planning task" || item.BaselineArtifactID != "planner-ab-1/item-001/baseline" || item.CandidateArtifactID != "planner-ab-1/item-001/candidate" || item.MetadataJSON != `{"path":"README.md"}` {
+		t.Fatalf("review item = %+v", item)
+	}
+	baseline, err := store.GetEvalArtifact(context.Background(), item.BaselineArtifactID)
+	if err != nil {
+		t.Fatalf("GetEvalArtifact baseline returned error: %v", err)
+	}
+	candidate, err := store.GetEvalArtifact(context.Background(), item.CandidateArtifactID)
+	if err != nil {
+		t.Fatalf("GetEvalArtifact candidate returned error: %v", err)
+	}
+	if baseline.MediaType != "text/markdown" || candidate.MediaType != "text/markdown" || baseline.Driver != "text" || candidate.Driver != "text" {
+		t.Fatalf("artifacts = %+v %+v", baseline, candidate)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after artifact check returned error: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "review", "status", "--home", home, "--run", "planner-ab-1"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt review status exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{
+		"items: 1",
+		"feedback: 0",
+		"packet_blockers: 0",
+		"training_blockers: 1",
+		"ready_for_packet: true",
+		"ready_for_training: false",
+		"training_blocker: item item-001 has no imported feedback",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("status stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+
+	packetDir := filepath.Join(t.TempDir(), "packet")
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "feedback", "markdown", "export", "--home", home, "--run", "planner-ab-1", "--output", packetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt feedback markdown export exit code = %d, stderr=%s", code, stderr.String())
+	}
+	feedbackYAML, err := os.ReadFile(filepath.Join(packetDir, "feedback.yml"))
+	if err != nil {
+		t.Fatalf("read feedback.yml: %v", err)
+	}
+	if !strings.Contains(string(feedbackYAML), "item_id: item-001") {
+		t.Fatalf("feedback.yml = %s", string(feedbackYAML))
+	}
+}
+
+func TestSkillOptReviewItemAddRejectsInvalidInputs(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	template := cliSkillOptTemplate("planner", "Plan the work.")
+	if err := store.UpsertAgentTemplate(context.Background(), template); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	installed, err := store.GetAgentTemplate(context.Background(), "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	if err := store.UpsertEvalRun(context.Background(), db.EvalRun{
+		ID:                "planner-ab-1",
+		TemplateID:        "planner",
+		TemplateVersionID: installed.VersionID,
+		TargetRepo:        "owner/repo",
+		State:             "review",
+		MetadataJSON:      `{"driver":"manual-review"}`,
+	}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	inputDir := t.TempDir()
+	baselinePath := filepath.Join(inputDir, "baseline.md")
+	candidatePath := filepath.Join(inputDir, "candidate.md")
+	binaryPath := filepath.Join(inputDir, "candidate.bin")
+	if err := os.WriteFile(baselinePath, []byte("baseline\n"), 0o644); err != nil {
+		t.Fatalf("write baseline: %v", err)
+	}
+	if err := os.WriteFile(candidatePath, []byte("candidate\n"), 0o644); err != nil {
+		t.Fatalf("write candidate: %v", err)
+	}
+	if err := os.WriteFile(binaryPath, []byte{0xff, 0x00, 0x01}, 0o644); err != nil {
+		t.Fatalf("write binary: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name: "missing run",
+			args: []string{
+				"skillopt", "review", "item", "add",
+				"--home", home,
+				"--run", "missing-run",
+				"--item", "item-001",
+				"--baseline", baselinePath,
+				"--candidate", candidatePath,
+			},
+			wantErr: "review run missing-run not found",
+		},
+		{
+			name: "invalid metadata",
+			args: []string{
+				"skillopt", "review", "item", "add",
+				"--home", home,
+				"--run", "planner-ab-1",
+				"--item", "item-001",
+				"--baseline", baselinePath,
+				"--candidate", candidatePath,
+				"--metadata-json", "{not-json",
+			},
+			wantErr: "metadata-json:",
+		},
+		{
+			name: "binary without media type",
+			args: []string{
+				"skillopt", "review", "item", "add",
+				"--home", home,
+				"--run", "planner-ab-1",
+				"--item", "item-001",
+				"--baseline", baselinePath,
+				"--candidate", binaryPath,
+			},
+			wantErr: "binary content requires --media-type",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := Run(tt.args, &stdout, &stderr)
+			if code == 0 {
+				t.Fatalf("exit code = 0, stdout=%s", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), tt.wantErr) {
+				t.Fatalf("stderr = %q, want substring %q", stderr.String(), tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestSkillOptReviewStatusRequiresExportableArtifacts(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
