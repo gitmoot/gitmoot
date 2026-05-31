@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jerryfane/gitmoot/internal/artifact"
 	"github.com/jerryfane/gitmoot/internal/config"
@@ -53,6 +54,7 @@ func printSkillOptUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot skillopt export --run <run-id> [--output package.json]")
 	fmt.Fprintln(w, "  gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]")
 	fmt.Fprintln(w, "  gitmoot skillopt review create --template <id> --repo owner/repo --run <run-id>")
+	fmt.Fprintln(w, "  gitmoot skillopt review item add --run <run-id> --item <item-id> --baseline baseline.md --candidate candidate.md [--title text]")
 	fmt.Fprintln(w, "  gitmoot skillopt review status --run <run-id>")
 	fmt.Fprintln(w, "  gitmoot skillopt candidate list [--template id]")
 	fmt.Fprintln(w, "  gitmoot skillopt candidate show <version-id>")
@@ -72,6 +74,8 @@ func runSkillOptReview(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "create":
 		return runSkillOptReviewCreate(args[1:], stdout, stderr)
+	case "item":
+		return runSkillOptReviewItem(args[1:], stdout, stderr)
 	case "status":
 		return runSkillOptReviewStatus(args[1:], stdout, stderr)
 	default:
@@ -127,6 +131,97 @@ func runSkillOptReviewCreate(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	writeLine(stdout, "created review %s for %s", run.ID, run.TemplateVersionID)
+	return 0
+}
+
+func runSkillOptReviewItem(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		printSkillOptUsage(stdout)
+		return 0
+	}
+	switch args[0] {
+	case "add":
+		return runSkillOptReviewItemAdd(args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "unknown skillopt review item command %q\n\n", args[0])
+		printSkillOptUsage(stderr)
+		return 2
+	}
+}
+
+func runSkillOptReviewItemAdd(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("skillopt review item add", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	runID := fs.String("run", "", "review run id")
+	itemID := fs.String("item", "", "review item id")
+	title := fs.String("title", "", "review item title")
+	baselinePath := fs.String("baseline", "", "baseline output file")
+	candidatePath := fs.String("candidate", "", "candidate output file")
+	metadataJSON := fs.String("metadata-json", "", "JSON metadata to attach to the review item")
+	mediaType := fs.String("media-type", "", "media type override for stored artifacts")
+	driver := fs.String("driver", "text", "artifact driver")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "skillopt review item add does not accept positional arguments")
+		return 2
+	}
+	if strings.TrimSpace(*runID) == "" || strings.TrimSpace(*itemID) == "" || strings.TrimSpace(*baselinePath) == "" || strings.TrimSpace(*candidatePath) == "" {
+		fmt.Fprintln(stderr, "skillopt review item add requires --run, --item, --baseline, and --candidate")
+		return 2
+	}
+	metadata, err := normalizeSkillOptMetadataJSON(*metadataJSON)
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt review item add: %v\n", err)
+		return 2
+	}
+	var item db.EvalReviewItem
+	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
+		ctx := context.Background()
+		run, err := store.GetEvalRun(ctx, strings.TrimSpace(*runID))
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("review run %s not found", strings.TrimSpace(*runID))
+			}
+			return err
+		}
+		blobStore := artifact.NewStore(paths.ArtifactBlobs)
+		baseline, err := prepareReviewItemArtifact(blobStore, run.ID, *itemID, "baseline", *baselinePath, *mediaType, *driver)
+		if err != nil {
+			return err
+		}
+		candidate, err := prepareReviewItemArtifact(blobStore, run.ID, *itemID, "candidate", *candidatePath, *mediaType, *driver)
+		if err != nil {
+			return err
+		}
+		if baseline.ID == candidate.ID {
+			return errors.New("baseline and candidate artifact ids must be different")
+		}
+		if err := store.UpsertEvalArtifact(ctx, baseline); err != nil {
+			return fmt.Errorf("register baseline artifact: %w", err)
+		}
+		if err := store.UpsertEvalArtifact(ctx, candidate); err != nil {
+			return fmt.Errorf("register candidate artifact: %w", err)
+		}
+		item = db.EvalReviewItem{
+			RunID:               run.ID,
+			ItemID:              strings.TrimSpace(*itemID),
+			Title:               strings.TrimSpace(*title),
+			BaselineArtifactID:  baseline.ID,
+			CandidateArtifactID: candidate.ID,
+			MetadataJSON:        metadata,
+		}
+		return store.UpsertEvalReviewItem(ctx, item)
+	}); err != nil {
+		fmt.Fprintf(stderr, "skillopt review item add: %v\n", err)
+		return 1
+	}
+	writeLine(stdout, "added review item %s to %s", item.ItemID, item.RunID)
 	return 0
 }
 
@@ -283,6 +378,76 @@ func validateReviewArtifactBlob(ctx context.Context, store *db.Store, blobStore 
 		return []string{fmt.Sprintf("item %s %s artifact %s blob is not readable: %v", itemID, role, artifactID, err)}
 	}
 	return nil
+}
+
+func prepareReviewItemArtifact(blobStore artifact.Store, runID string, itemID string, role string, path string, mediaTypeOverride string, driver string) (db.EvalArtifact, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return db.EvalArtifact{}, fmt.Errorf("%s path is required", role)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return db.EvalArtifact{}, fmt.Errorf("read %s file: %w", role, err)
+	}
+	mediaType, err := reviewArtifactMediaType(path, content, mediaTypeOverride)
+	if err != nil {
+		return db.EvalArtifact{}, fmt.Errorf("%s file: %w", role, err)
+	}
+	blob, err := blobStore.Put(content)
+	if err != nil {
+		return db.EvalArtifact{}, fmt.Errorf("store %s artifact blob: %w", role, err)
+	}
+	artifactRecord := db.EvalArtifact{
+		ID:        reviewItemArtifactID(runID, itemID, role),
+		Hash:      blob.Hash,
+		MediaType: mediaType,
+		SizeBytes: blob.Size,
+		Driver:    strings.TrimSpace(driver),
+	}
+	if artifactRecord.Driver == "" {
+		artifactRecord.Driver = "text"
+	}
+	return artifactRecord, nil
+}
+
+func reviewItemArtifactID(runID string, itemID string, role string) string {
+	return strings.TrimSpace(runID) + "/" + strings.TrimSpace(itemID) + "/" + strings.TrimSpace(role)
+}
+
+func reviewArtifactMediaType(path string, content []byte, override string) (string, error) {
+	if mediaType := strings.TrimSpace(override); mediaType != "" {
+		return mediaType, nil
+	}
+	if !utf8.Valid(content) {
+		return "", errors.New("binary content requires --media-type")
+	}
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".md", ".markdown":
+		return "text/markdown", nil
+	case ".txt", ".text", ".diff", ".patch":
+		return "text/plain", nil
+	case ".csv":
+		return "text/csv", nil
+	case ".json":
+		return "application/json", nil
+	}
+	return "text/plain", nil
+}
+
+func normalizeSkillOptMetadataJSON(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	var decoded any
+	if err := json.Unmarshal([]byte(value), &decoded); err != nil {
+		return "", fmt.Errorf("metadata-json: %w", err)
+	}
+	encoded, err := json.Marshal(decoded)
+	if err != nil {
+		return "", fmt.Errorf("metadata-json: %w", err)
+	}
+	return string(encoded), nil
 }
 
 func runSkillOptExport(args []string, stdout, stderr io.Writer) int {
