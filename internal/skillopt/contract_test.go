@@ -129,7 +129,7 @@ func TestImportCandidatePackageCreatesPendingVersion(t *testing.T) {
 		Kind:            CandidatePackageKind,
 		ContractVersion: ContractVersion,
 		TemplateID:      "planner",
-		BaseVersionID:   current.VersionID,
+		BaseVersionID:   "planner@latest",
 		Candidate: CandidateTemplate{
 			Content:  candidateContent,
 			Metadata: parsed.Metadata,
@@ -160,6 +160,13 @@ func TestImportCandidatePackageCreatesPendingVersion(t *testing.T) {
 	}
 	if latest.VersionID != version.ID || latest.Content != candidateContent {
 		t.Fatalf("latest template = %+v", latest)
+	}
+	review, err := store.GetAgentTemplateCandidateReview(ctx, version.ID)
+	if err != nil {
+		t.Fatalf("GetAgentTemplateCandidateReview returned error: %v", err)
+	}
+	if review.BaseVersionID != current.VersionID || review.DiffArtifactID != "candidate-diff" || review.PreferenceSummary != "Candidate is more actionable." || review.EvalReportJSON != `{"score":0.82}` {
+		t.Fatalf("candidate review = %+v", review)
 	}
 }
 

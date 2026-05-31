@@ -35,6 +35,8 @@ func runSkillOpt(args []string, stdout, stderr io.Writer) int {
 		return runSkillOptExport(args[1:], stdout, stderr)
 	case "import":
 		return runSkillOptImport(args[1:], stdout, stderr)
+	case "candidate":
+		return runSkillOptCandidate(args[1:], stdout, stderr)
 	case "feedback":
 		return runSkillOptFeedback(args[1:], stdout, stderr)
 	default:
@@ -48,6 +50,10 @@ func printSkillOptUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot skillopt export --run <run-id> [--output package.json]")
 	fmt.Fprintln(w, "  gitmoot skillopt import --file candidate.json")
+	fmt.Fprintln(w, "  gitmoot skillopt candidate list [--template id]")
+	fmt.Fprintln(w, "  gitmoot skillopt candidate show <version-id>")
+	fmt.Fprintln(w, "  gitmoot skillopt candidate promote <version-id>")
+	fmt.Fprintln(w, "  gitmoot skillopt candidate reject <version-id> [--reason text]")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id> [--reviewer name]")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]")
@@ -147,6 +153,251 @@ func runSkillOptImport(args []string, stdout, stderr io.Writer) int {
 	}
 	writeLine(stdout, "imported pending candidate %s", versionID)
 	return 0
+}
+
+func runSkillOptCandidate(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		printSkillOptUsage(stdout)
+		return 0
+	}
+	switch args[0] {
+	case "list":
+		return runSkillOptCandidateList(args[1:], stdout, stderr)
+	case "show":
+		return runSkillOptCandidateShow(args[1:], stdout, stderr)
+	case "promote":
+		return runSkillOptCandidatePromote(args[1:], stdout, stderr)
+	case "reject":
+		return runSkillOptCandidateReject(args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "unknown skillopt candidate command %q\n\n", args[0])
+		printSkillOptUsage(stderr)
+		return 2
+	}
+}
+
+func runSkillOptCandidateList(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("skillopt candidate list", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	templateID := fs.String("template", "", "template id to filter")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "skillopt candidate list does not accept positional arguments")
+		return 2
+	}
+	var versions []db.AgentTemplateVersion
+	var reviews map[string]db.AgentTemplateCandidateReview
+	if err := withStore(*home, func(store *db.Store) error {
+		var err error
+		versions, err = store.ListPendingAgentTemplateVersions(context.Background(), *templateID)
+		if err != nil {
+			return err
+		}
+		reviews = make(map[string]db.AgentTemplateCandidateReview, len(versions))
+		for _, version := range versions {
+			review, err := store.GetAgentTemplateCandidateReview(context.Background(), version.ID)
+			if err == nil {
+				reviews[version.ID] = review
+			} else if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "skillopt candidate list: %v\n", err)
+		return 1
+	}
+	if len(versions) == 0 {
+		writeLine(stdout, "no pending candidates")
+		return 0
+	}
+	fmt.Fprintf(stdout, "%-18s %-14s %-9s %-8s %s\n", "VERSION", "TEMPLATE", "STATE", "SCORE", "SUMMARY")
+	for _, version := range versions {
+		review := reviews[version.ID]
+		fmt.Fprintf(stdout, "%-18s %-14s %-9s %-8s %s\n", version.ID, version.TemplateID, version.State, scoreText(review.Score), firstLine(review.PreferenceSummary))
+	}
+	return 0
+}
+
+func runSkillOptCandidateShow(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("skillopt candidate show", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(stderr, "skillopt candidate show requires exactly one version id")
+		return 2
+	}
+	versionID := fs.Arg(0)
+	var version db.AgentTemplateVersion
+	var review db.AgentTemplateCandidateReview
+	var hasReview bool
+	var base db.AgentTemplate
+	var hasBase bool
+	if err := withStore(*home, func(store *db.Store) error {
+		var err error
+		version, err = store.GetAgentTemplateVersionByID(context.Background(), versionID)
+		if err != nil {
+			return err
+		}
+		review, err = store.GetAgentTemplateCandidateReview(context.Background(), version.ID)
+		if err == nil {
+			hasReview = true
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		baseRef := strings.TrimSpace(review.BaseVersionID)
+		if baseRef == "" {
+			current, err := store.GetAgentTemplate(context.Background(), version.TemplateID)
+			if err != nil {
+				return err
+			}
+			baseRef = current.VersionID
+		}
+		if baseRef != "" && baseRef != version.ID {
+			base, err = store.GetAgentTemplateReference(context.Background(), baseRef)
+			if err == nil {
+				hasBase = true
+			} else if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "skillopt candidate show: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "version: %s\n", version.ID)
+	fmt.Fprintf(stdout, "template: %s\n", version.TemplateID)
+	fmt.Fprintf(stdout, "state: %s\n", version.State)
+	fmt.Fprintf(stdout, "source: %s@%s:%s\n", version.SourceRepo, version.SourceRef, version.SourcePath)
+	fmt.Fprintf(stdout, "content_hash: %s\n", version.ContentHash)
+	if hasReview {
+		fmt.Fprintf(stdout, "base_version: %s\n", emptyText(review.BaseVersionID))
+		fmt.Fprintf(stdout, "score: %s\n", scoreText(review.Score))
+		fmt.Fprintf(stdout, "preference_summary: %s\n", emptyText(review.PreferenceSummary))
+		fmt.Fprintf(stdout, "diff_artifact: %s\n", emptyText(review.DiffArtifactID))
+		if strings.TrimSpace(review.EvalReportJSON) != "" {
+			fmt.Fprintf(stdout, "eval_report:\n%s\n", indentJSON(review.EvalReportJSON))
+		}
+		if strings.TrimSpace(review.DecisionReason) != "" {
+			fmt.Fprintf(stdout, "decision_reason: %s\n", review.DecisionReason)
+		}
+	}
+	if hasBase {
+		diff := artifact.TextDriver{}.Diff(base.VersionID+".md", version.ID+".md", []byte(base.Content), []byte(version.Content))
+		fmt.Fprintf(stdout, "content_diff:\n%s", diff)
+	}
+	return 0
+}
+
+func runSkillOptCandidatePromote(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("skillopt candidate promote", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(stderr, "skillopt candidate promote requires exactly one version id")
+		return 2
+	}
+	var promoted db.AgentTemplateVersion
+	if err := withStore(*home, func(store *db.Store) error {
+		var err error
+		promoted, err = store.PromoteAgentTemplateVersion(context.Background(), fs.Arg(0))
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "skillopt candidate promote: %v\n", err)
+		return 1
+	}
+	writeLine(stdout, "promoted candidate %s", promoted.ID)
+	return 0
+}
+
+func runSkillOptCandidateReject(args []string, stdout, stderr io.Writer) int {
+	parsed, help, ok := parseSkillOptCandidateRejectArgs(args, stderr)
+	if help {
+		printSkillOptUsage(stdout)
+		return 0
+	}
+	if !ok {
+		return 2
+	}
+	if parsed.versionID == "" {
+		fmt.Fprintln(stderr, "skillopt candidate reject requires exactly one version id")
+		return 2
+	}
+	if parsed.extraVersion {
+		fmt.Fprintln(stderr, "skillopt candidate reject requires exactly one version id")
+		return 2
+	}
+	var rejected db.AgentTemplateVersion
+	if err := withStore(parsed.home, func(store *db.Store) error {
+		var err error
+		rejected, err = store.RejectAgentTemplateVersion(context.Background(), parsed.versionID, parsed.reason)
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "skillopt candidate reject: %v\n", err)
+		return 1
+	}
+	writeLine(stdout, "rejected candidate %s", rejected.ID)
+	return 0
+}
+
+type skillOptCandidateRejectArgs struct {
+	home         string
+	reason       string
+	versionID    string
+	extraVersion bool
+}
+
+func parseSkillOptCandidateRejectArgs(args []string, stderr io.Writer) (skillOptCandidateRejectArgs, bool, bool) {
+	var parsed skillOptCandidateRejectArgs
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "-h" || arg == "--help":
+			return parsed, true, true
+		case arg == "--home" || arg == "--reason":
+			if i+1 >= len(args) {
+				fmt.Fprintf(stderr, "skillopt candidate reject: %s requires a value\n", arg)
+				return parsed, false, false
+			}
+			i++
+			if arg == "--home" {
+				parsed.home = args[i]
+			} else {
+				parsed.reason = args[i]
+			}
+		case strings.HasPrefix(arg, "--home="):
+			parsed.home = strings.TrimPrefix(arg, "--home=")
+		case strings.HasPrefix(arg, "--reason="):
+			parsed.reason = strings.TrimPrefix(arg, "--reason=")
+		case strings.HasPrefix(arg, "-"):
+			fmt.Fprintf(stderr, "skillopt candidate reject: unknown flag %s\n", arg)
+			return parsed, false, false
+		case parsed.versionID == "":
+			parsed.versionID = arg
+		default:
+			parsed.extraVersion = true
+		}
+	}
+	return parsed, false, true
 }
 
 func writeSkillOptFile(path string, content []byte) error {
@@ -408,6 +659,48 @@ func resolveSkillOptFeedbackRepo(ctx context.Context, paths config.Paths, store 
 		return daemon.ParseRepository(defaultRepo)
 	}
 	return github.Repository{}, errors.New("skillopt feedback github requires --repo because no target repo, template source repo, or [feedback].repo default is configured")
+}
+
+func scoreText(score *float64) string {
+	if score == nil {
+		return "-"
+	}
+	return fmt.Sprintf("%.4g", *score)
+}
+
+func firstLine(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "-"
+	}
+	if before, _, ok := strings.Cut(value, "\n"); ok {
+		return strings.TrimSpace(before)
+	}
+	return value
+}
+
+func emptyText(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "-"
+	}
+	return value
+}
+
+func indentJSON(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	var decoded any
+	if err := json.Unmarshal([]byte(value), &decoded); err != nil {
+		return value
+	}
+	encoded, err := json.MarshalIndent(decoded, "  ", "  ")
+	if err != nil {
+		return value
+	}
+	return string(encoded)
 }
 
 func withSkillOptStore(home string, fn func(config.Paths, *db.Store) error) error {

@@ -634,11 +634,155 @@ func TestRepositoryMethods(t *testing.T) {
 	if pinned.VersionID != "thermo@v1" || pinned.Content != "Review deeply." {
 		t.Fatalf("pinned template = %+v", pinned)
 	}
+	score := 0.82
+	if err := store.UpsertAgentTemplateCandidateReview(ctx, AgentTemplateCandidateReview{
+		VersionID:         pending.ID,
+		TemplateID:        pending.TemplateID,
+		BaseVersionID:     current.VersionID,
+		DiffArtifactID:    "diff-1",
+		Score:             &score,
+		PreferenceSummary: "Candidate is more actionable.",
+		EvalReportJSON:    `{"score":0.82}`,
+		State:             "pending",
+	}); err != nil {
+		t.Fatalf("UpsertAgentTemplateCandidateReview returned error: %v", err)
+	}
+	review, err := store.GetAgentTemplateCandidateReview(ctx, pending.ID)
+	if err != nil {
+		t.Fatalf("GetAgentTemplateCandidateReview returned error: %v", err)
+	}
+	if review.BaseVersionID != current.VersionID || review.Score == nil || *review.Score != score || review.PreferenceSummary == "" {
+		t.Fatalf("review = %+v", review)
+	}
+	newerPending, err := store.AddPendingAgentTemplateVersion(ctx, AgentTemplate{
+		ID:             "thermo",
+		Name:           "Thermo Candidate 2",
+		Description:    "Candidate review",
+		SourceRepo:     "local",
+		SourceRef:      "candidate",
+		SourcePath:     "candidate-2.md",
+		ResolvedCommit: "sha256:candidate2",
+		Content:        "Newer pending instructions.",
+		MetadataJSON:   `{"id":"thermo","name":"Thermo Candidate","description":"Candidate review","kind":"agent-template","version":1,"capabilities":["review"],"runtime_compatibility":["codex"],"tags":["review"],"inputs":["repo"],"outputs":["review_findings"]}`,
+	})
+	if err != nil {
+		t.Fatalf("AddPendingAgentTemplateVersion newer candidate returned error: %v", err)
+	}
+	pendingVersions, err := store.ListPendingAgentTemplateVersions(ctx, "thermo")
+	if err != nil {
+		t.Fatalf("ListPendingAgentTemplateVersions returned error: %v", err)
+	}
+	if len(pendingVersions) != 2 || pendingVersions[0].ID != pending.ID || pendingVersions[1].ID != newerPending.ID {
+		t.Fatalf("pending versions = %+v", pendingVersions)
+	}
+	promoted, err := store.PromoteAgentTemplateVersion(ctx, pending.ID)
+	if err != nil {
+		t.Fatalf("PromoteAgentTemplateVersion returned error: %v", err)
+	}
+	if promoted.State != "current" || promoted.PromotedAt == "" {
+		t.Fatalf("promoted = %+v", promoted)
+	}
+	currentAfterPromote, err := store.GetAgentTemplate(ctx, "thermo")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate after promote returned error: %v", err)
+	}
+	if currentAfterPromote.VersionID != pending.ID || currentAfterPromote.Content != "Candidate instructions." {
+		t.Fatalf("current after promote = %+v", currentAfterPromote)
+	}
+	latestAfterPromote, err := store.GetAgentTemplateReference(ctx, "thermo@latest")
+	if err != nil {
+		t.Fatalf("GetAgentTemplateReference latest after promote returned error: %v", err)
+	}
+	if latestAfterPromote.VersionID != newerPending.ID || latestAfterPromote.VersionState != "pending" {
+		t.Fatalf("latest after promote = %+v", latestAfterPromote)
+	}
+	review, err = store.GetAgentTemplateCandidateReview(ctx, pending.ID)
+	if err != nil {
+		t.Fatalf("GetAgentTemplateCandidateReview after promote returned error: %v", err)
+	}
+	if review.State != "promoted" || review.DecidedAt == "" {
+		t.Fatalf("review after promote = %+v", review)
+	}
+	rejected, err := store.RejectAgentTemplateVersion(ctx, newerPending.ID, "too verbose")
+	if err != nil {
+		t.Fatalf("RejectAgentTemplateVersion returned error: %v", err)
+	}
+	if rejected.State != "rejected" {
+		t.Fatalf("rejected = %+v", rejected)
+	}
+	latestAfterReject, err := store.GetAgentTemplateReference(ctx, "thermo@latest")
+	if err != nil {
+		t.Fatalf("GetAgentTemplateReference latest after reject returned error: %v", err)
+	}
+	if latestAfterReject.VersionID != pending.ID || latestAfterReject.VersionState == "rejected" {
+		t.Fatalf("latest selected rejected candidate: %+v", latestAfterReject)
+	}
+	rejectReview, err := store.GetAgentTemplateCandidateReview(ctx, newerPending.ID)
+	if err != nil {
+		t.Fatalf("GetAgentTemplateCandidateReview reject returned error: %v", err)
+	}
+	if rejectReview.State != "rejected" || rejectReview.DecisionReason != "too verbose" || rejectReview.DecidedAt == "" {
+		t.Fatalf("reject review = %+v", rejectReview)
+	}
+	if err := store.UpsertAgentTemplate(ctx, AgentTemplate{
+		ID:             "outoforder",
+		Name:           "Out Of Order",
+		Description:    "Promotion ordering",
+		SourceRepo:     "local",
+		SourceRef:      "main",
+		SourcePath:     "template.md",
+		ResolvedCommit: "sha256:one",
+		Content:        "Current one.",
+		MetadataJSON:   `{"id":"outoforder","name":"Out Of Order","description":"Promotion ordering","kind":"agent-template","version":1,"capabilities":["ask"],"runtime_compatibility":["codex"],"tags":["planning"],"inputs":["repo"],"outputs":["plan"]}`,
+	}); err != nil {
+		t.Fatalf("UpsertAgentTemplate outoforder returned error: %v", err)
+	}
+	olderPending, err := store.AddPendingAgentTemplateVersion(ctx, AgentTemplate{
+		ID:             "outoforder",
+		Name:           "Out Of Order Pending",
+		Description:    "Promotion ordering",
+		SourceRepo:     "local",
+		SourceRef:      "candidate",
+		SourcePath:     "candidate.md",
+		ResolvedCommit: "sha256:pending",
+		Content:        "Older pending candidate.",
+		MetadataJSON:   `{"id":"outoforder","name":"Out Of Order Pending","description":"Promotion ordering","kind":"agent-template","version":1,"capabilities":["ask"],"runtime_compatibility":["codex"],"tags":["planning"],"inputs":["repo"],"outputs":["plan"]}`,
+	})
+	if err != nil {
+		t.Fatalf("AddPendingAgentTemplateVersion outoforder returned error: %v", err)
+	}
+	if err := store.UpsertAgentTemplate(ctx, AgentTemplate{
+		ID:             "outoforder",
+		Name:           "Out Of Order New Current",
+		Description:    "Promotion ordering",
+		SourceRepo:     "local",
+		SourceRef:      "main",
+		SourcePath:     "template.md",
+		ResolvedCommit: "sha256:three",
+		Content:        "Newer current version.",
+		MetadataJSON:   `{"id":"outoforder","name":"Out Of Order New Current","description":"Promotion ordering","kind":"agent-template","version":1,"capabilities":["ask"],"runtime_compatibility":["codex"],"tags":["planning"],"inputs":["repo"],"outputs":["plan"]}`,
+	}); err != nil {
+		t.Fatalf("UpsertAgentTemplate outoforder newer returned error: %v", err)
+	}
+	promotedOutOfOrder, err := store.PromoteAgentTemplateVersion(ctx, olderPending.ID)
+	if err != nil {
+		t.Fatalf("PromoteAgentTemplateVersion outoforder returned error: %v", err)
+	}
+	if promotedOutOfOrder.ID != olderPending.ID || promotedOutOfOrder.State != "current" {
+		t.Fatalf("promoted outoforder = %+v", promotedOutOfOrder)
+	}
+	latestOutOfOrder, err := store.GetAgentTemplateReference(ctx, "outoforder@latest")
+	if err != nil {
+		t.Fatalf("GetAgentTemplateReference outoforder latest returned error: %v", err)
+	}
+	if latestOutOfOrder.VersionID != olderPending.ID || latestOutOfOrder.VersionState == "superseded" {
+		t.Fatalf("outoforder latest selected wrong version: %+v", latestOutOfOrder)
+	}
 	templates, err := store.ListAgentTemplates(ctx)
 	if err != nil {
 		t.Fatalf("ListAgentTemplates returned error: %v", err)
 	}
-	if len(templates) != 1 || templates[0].ID != "thermo" {
+	if len(templates) != 2 || templates[0].ID != "outoforder" || templates[1].ID != "thermo" {
 		t.Fatalf("templates = %+v", templates)
 	}
 	if err := store.UpsertAgent(ctx, Agent{Name: "audit", Role: "reviewer", Runtime: "codex", RuntimeRef: "session", RepoScope: "jerryfane/gitmoot", TemplateID: "thermo", Capabilities: []string{"review"}, AutonomyPolicy: "auto", HealthStatus: "ok"}); err != nil {

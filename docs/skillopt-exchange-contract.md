@@ -53,6 +53,28 @@ Importing never promotes a candidate. Gitmoot stores it as a pending template
 version so later review and promotion commands can decide whether it becomes
 current.
 
+Review pending candidates:
+
+```sh
+gitmoot skillopt candidate list --template planner
+gitmoot skillopt candidate show planner@v2
+```
+
+`candidate show` includes the candidate state, source, content hash, base
+version, optimizer score, preference summary, eval report JSON, and a content
+diff against the base/current template version. It does not expose hidden A/B
+assignment mappings while blind reviews are active.
+
+Promote or reject after human review:
+
+```sh
+gitmoot skillopt candidate promote planner@v2
+gitmoot skillopt candidate reject planner@v3 --reason "Too broad for the current workflow"
+```
+
+Promotion updates the template's current version. Rejection records an audit
+reason and prevents the rejected candidate from being selected by `@latest`.
+
 ## Markdown Feedback Packet
 
 Generate a local blind A/B review packet:
@@ -141,3 +163,23 @@ gitmoot skillopt feedback github sync \
 
 For PR comment mode, use `--pr 123` instead of `--issue 42`. Sync ignores
 unrelated comments and de-duplicates repeated imports by comment URL.
+
+Complete local review path:
+
+1. `gitmoot skillopt export --run <run-id> --output training.json`
+2. External optimizer returns `candidate.json`.
+3. `gitmoot skillopt import --file candidate.json`
+4. `gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>`
+5. Human fills `feedback.yml`.
+6. `gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id>`
+7. `gitmoot skillopt candidate show <version-id>`
+8. `gitmoot skillopt candidate promote <version-id>` or `gitmoot skillopt candidate reject <version-id>`
+
+Complete GitHub review path:
+
+1. `gitmoot skillopt import --file candidate.json`
+2. `gitmoot skillopt feedback github publish --run <run-id> --repo owner/reviews`
+3. Humans reply in GitHub comments using the run-scoped YAML or short-form block.
+4. `gitmoot skillopt feedback github sync --run <run-id> --repo owner/reviews --issue <number>`
+5. `gitmoot skillopt candidate show <version-id>`
+6. `gitmoot skillopt candidate promote <version-id>` or `gitmoot skillopt candidate reject <version-id>`

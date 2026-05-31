@@ -80,6 +80,22 @@ type AgentTemplateVersion struct {
 	PromotedAt     string
 }
 
+type AgentTemplateCandidateReview struct {
+	VersionID           string
+	TemplateID          string
+	BaseVersionID       string
+	DiffArtifactID      string
+	Score               *float64
+	PreferenceSummary   string
+	EvalReportJSON      string
+	SummaryMetadataJSON string
+	State               string
+	DecisionReason      string
+	CreatedAt           string
+	UpdatedAt           string
+	DecidedAt           string
+}
+
 type AgentRepo struct {
 	AgentName    string
 	RepoFullName string
@@ -728,9 +744,41 @@ func (s *Store) GetAgentTemplateVersion(ctx context.Context, templateID string, 
 	return scanAgentTemplateVersion(row)
 }
 
+func (s *Store) GetAgentTemplateVersionByID(ctx context.Context, versionID string) (AgentTemplateVersion, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, created_at, updated_at, promoted_at
+		FROM agent_template_versions WHERE id = ?`, strings.TrimSpace(versionID))
+	return scanAgentTemplateVersion(row)
+}
+
 func (s *Store) ListAgentTemplateVersions(ctx context.Context, templateID string) ([]AgentTemplateVersion, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, created_at, updated_at, promoted_at
 		FROM agent_template_versions WHERE template_id = ? ORDER BY version`, templateID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	versions := []AgentTemplateVersion{}
+	for rows.Next() {
+		version, err := scanAgentTemplateVersion(rows)
+		if err != nil {
+			return nil, err
+		}
+		versions = append(versions, version)
+	}
+	return versions, rows.Err()
+}
+
+func (s *Store) ListPendingAgentTemplateVersions(ctx context.Context, templateID string) ([]AgentTemplateVersion, error) {
+	templateID = strings.TrimSpace(templateID)
+	query := `SELECT id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, created_at, updated_at, promoted_at
+		FROM agent_template_versions WHERE state = 'pending'`
+	args := []any{}
+	if templateID != "" {
+		query += ` AND template_id = ?`
+		args = append(args, templateID)
+	}
+	query += ` ORDER BY template_id, version`
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -774,6 +822,138 @@ func (s *Store) AddPendingAgentTemplateVersion(ctx context.Context, template Age
 		return AgentTemplateVersion{}, err
 	}
 	return s.GetAgentTemplateVersion(ctx, template.ID, fmt.Sprintf("v%d", versionNumber))
+}
+
+func (s *Store) UpsertAgentTemplateCandidateReview(ctx context.Context, review AgentTemplateCandidateReview) error {
+	if strings.TrimSpace(review.VersionID) == "" {
+		return errors.New("candidate review version id is required")
+	}
+	if strings.TrimSpace(review.TemplateID) == "" {
+		return errors.New("candidate review template id is required")
+	}
+	if strings.TrimSpace(review.State) == "" {
+		review.State = "pending"
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO agent_template_candidate_reviews(
+			version_id, template_id, base_version_id, diff_artifact_id, score, preference_summary,
+			eval_report_json, summary_metadata_json, state, decision_reason, updated_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(version_id) DO UPDATE SET
+			template_id = excluded.template_id,
+			base_version_id = excluded.base_version_id,
+			diff_artifact_id = excluded.diff_artifact_id,
+			score = excluded.score,
+			preference_summary = excluded.preference_summary,
+			eval_report_json = excluded.eval_report_json,
+			summary_metadata_json = excluded.summary_metadata_json,
+			state = excluded.state,
+			decision_reason = excluded.decision_reason,
+			updated_at = CURRENT_TIMESTAMP`,
+		strings.TrimSpace(review.VersionID),
+		strings.TrimSpace(review.TemplateID),
+		strings.TrimSpace(review.BaseVersionID),
+		strings.TrimSpace(review.DiffArtifactID),
+		review.Score,
+		strings.TrimSpace(review.PreferenceSummary),
+		strings.TrimSpace(review.EvalReportJSON),
+		strings.TrimSpace(review.SummaryMetadataJSON),
+		strings.TrimSpace(review.State),
+		strings.TrimSpace(review.DecisionReason))
+	return err
+}
+
+func (s *Store) GetAgentTemplateCandidateReview(ctx context.Context, versionID string) (AgentTemplateCandidateReview, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT version_id, template_id, base_version_id, diff_artifact_id, score, preference_summary,
+			eval_report_json, summary_metadata_json, state, decision_reason, created_at, updated_at, decided_at
+		FROM agent_template_candidate_reviews WHERE version_id = ?`, strings.TrimSpace(versionID))
+	return scanAgentTemplateCandidateReview(row)
+}
+
+func (s *Store) PromoteAgentTemplateVersion(ctx context.Context, versionID string) (AgentTemplateVersion, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	defer tx.Rollback()
+	target, err := getAgentTemplateVersionByIDTx(ctx, tx, versionID)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if target.State != "pending" {
+		return AgentTemplateVersion{}, fmt.Errorf("agent template version %s is %s, not pending", target.ID, target.State)
+	}
+	current, hasCurrent, err := getCurrentAgentTemplateVersion(ctx, tx, target.TemplateID)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if hasCurrent {
+		if _, err := tx.ExecContext(ctx, `UPDATE agent_template_versions SET state = 'superseded', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, current.ID); err != nil {
+			return AgentTemplateVersion{}, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE agent_template_versions SET state = 'current', promoted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, target.ID); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	latestID, err := latestSelectableVersionID(ctx, tx, target.TemplateID)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE agent_templates SET
+			name = ?, description = ?, source_repo = ?, source_ref = ?, source_path = ?, resolved_commit = ?,
+			content = ?, metadata_json = ?, current_version_id = ?, latest_version_id = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?`,
+		target.Name, target.Description, target.SourceRepo, target.SourceRef, target.SourcePath, target.ResolvedCommit,
+		target.Content, target.MetadataJSON, target.ID, latestID, target.TemplateID)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if err := requireAffected(result, "agent template", target.TemplateID); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if err := upsertAgentTemplateCandidateReviewDecisionTx(ctx, tx, target, "promoted", ""); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	return s.GetAgentTemplateVersionByID(ctx, target.ID)
+}
+
+func (s *Store) RejectAgentTemplateVersion(ctx context.Context, versionID string, reason string) (AgentTemplateVersion, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	defer tx.Rollback()
+	target, err := getAgentTemplateVersionByIDTx(ctx, tx, versionID)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if target.State != "pending" {
+		return AgentTemplateVersion{}, fmt.Errorf("agent template version %s is %s, not pending", target.ID, target.State)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE agent_template_versions SET state = 'rejected', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, target.ID); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	latestID, err := latestSelectableVersionID(ctx, tx, target.TemplateID)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE agent_templates SET latest_version_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, latestID, target.TemplateID)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if err := requireAffected(result, "agent template", target.TemplateID); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if err := upsertAgentTemplateCandidateReviewDecisionTx(ctx, tx, target, "rejected", reason); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	return s.GetAgentTemplateVersionByID(ctx, target.ID)
 }
 
 func (s *Store) AgentCanAccessRepo(ctx context.Context, agentName string, repoFullName string) (bool, error) {
@@ -1982,6 +2162,18 @@ func scanAgentTemplateVersion(scanner agentTemplateScanner) (AgentTemplateVersio
 	return version, nil
 }
 
+func scanAgentTemplateCandidateReview(scanner agentTemplateScanner) (AgentTemplateCandidateReview, error) {
+	var review AgentTemplateCandidateReview
+	var score sql.NullFloat64
+	if err := scanner.Scan(&review.VersionID, &review.TemplateID, &review.BaseVersionID, &review.DiffArtifactID, &score, &review.PreferenceSummary, &review.EvalReportJSON, &review.SummaryMetadataJSON, &review.State, &review.DecisionReason, &review.CreatedAt, &review.UpdatedAt, &review.DecidedAt); err != nil {
+		return AgentTemplateCandidateReview{}, err
+	}
+	if score.Valid {
+		review.Score = &score.Float64
+	}
+	return review, nil
+}
+
 func agentTemplateFromVersion(version AgentTemplateVersion) AgentTemplate {
 	return AgentTemplate{
 		ID:             version.TemplateID,
@@ -2026,6 +2218,37 @@ func getCurrentAgentTemplateVersion(ctx context.Context, tx *sql.Tx, templateID 
 		return AgentTemplateVersion{}, false, err
 	}
 	return version, true, nil
+}
+
+func getAgentTemplateVersionByIDTx(ctx context.Context, tx *sql.Tx, versionID string) (AgentTemplateVersion, error) {
+	row := tx.QueryRowContext(ctx, `SELECT id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, created_at, updated_at, promoted_at
+		FROM agent_template_versions WHERE id = ?`, strings.TrimSpace(versionID))
+	return scanAgentTemplateVersion(row)
+}
+
+func latestSelectableVersionID(ctx context.Context, tx *sql.Tx, templateID string) (string, error) {
+	var id string
+	err := tx.QueryRowContext(ctx, `SELECT id FROM agent_template_versions
+		WHERE template_id = ? AND state IN ('current', 'pending')
+		ORDER BY version DESC LIMIT 1`, templateID).Scan(&id)
+	return id, err
+}
+
+func upsertAgentTemplateCandidateReviewDecisionTx(ctx context.Context, tx *sql.Tx, version AgentTemplateVersion, state string, reason string) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO agent_template_candidate_reviews(
+			version_id, template_id, state, decision_reason, decided_at, updated_at
+		)
+		VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+		ON CONFLICT(version_id) DO UPDATE SET
+			state = excluded.state,
+			decision_reason = excluded.decision_reason,
+			decided_at = CURRENT_TIMESTAMP,
+			updated_at = CURRENT_TIMESTAMP`,
+		version.ID,
+		version.TemplateID,
+		strings.TrimSpace(state),
+		strings.TrimSpace(reason))
+	return err
 }
 
 func nextAgentTemplateVersionNumber(ctx context.Context, tx *sql.Tx, templateID string) (int, error) {
@@ -2374,6 +2597,23 @@ CREATE TABLE feedback_events (
 	source_url TEXT NOT NULL DEFAULT '',
 	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	UNIQUE(run_id, item_id, reviewer, source, source_url)
+);
+	`,
+	`
+CREATE TABLE agent_template_candidate_reviews (
+	version_id TEXT PRIMARY KEY,
+	template_id TEXT NOT NULL,
+	base_version_id TEXT NOT NULL DEFAULT '',
+	diff_artifact_id TEXT NOT NULL DEFAULT '',
+	score REAL,
+	preference_summary TEXT NOT NULL DEFAULT '',
+	eval_report_json TEXT NOT NULL DEFAULT '',
+	summary_metadata_json TEXT NOT NULL DEFAULT '',
+	state TEXT NOT NULL DEFAULT 'pending',
+	decision_reason TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	decided_at TEXT NOT NULL DEFAULT ''
 );
 	`,
 }

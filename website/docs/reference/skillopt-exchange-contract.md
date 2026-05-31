@@ -28,6 +28,17 @@ frontmatter, matching metadata, an optional eval report, and an optional summary
 Importing stores the candidate as a pending template version and never promotes
 it automatically.
 
+```sh
+gitmoot skillopt candidate list --template planner
+gitmoot skillopt candidate show planner@v2
+gitmoot skillopt candidate promote planner@v2
+gitmoot skillopt candidate reject planner@v3 --reason "Too broad"
+```
+
+`candidate show` includes the eval report, preference summary, and content diff.
+Promotion updates the current template version; rejection records an audit reason
+and keeps the rejected version out of `@latest`.
+
 ## Markdown Feedback Packet
 
 ```sh
@@ -91,3 +102,7 @@ gitmoot skillopt feedback github sync \
 
 For PR comment mode, sync with `--pr <number>`. Gitmoot ignores unrelated
 comments and de-duplicates repeated imports by GitHub comment URL.
+
+The complete review loop is: import a candidate, collect feedback with either
+the Markdown packet or GitHub collector, inspect the candidate with
+`gitmoot skillopt candidate show <version-id>`, then promote or reject it.

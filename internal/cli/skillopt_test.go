@@ -145,6 +145,11 @@ items:
 			Content:  candidateContent,
 			Metadata: parsed.Metadata,
 		},
+		EvalReport: json.RawMessage(`{"score":0.91}`),
+		Summary: skillopt.CandidateSummary{
+			Score:             floatPtr(0.91),
+			PreferenceSummary: "Candidate is more specific.",
+		},
 	}
 	candidatePath := filepath.Join(t.TempDir(), "candidate.json")
 	encodedCandidate, err := json.Marshal(candidate)
@@ -163,17 +168,43 @@ items:
 	if !strings.Contains(stdout.String(), "imported pending candidate planner@v2") {
 		t.Fatalf("import stdout = %q", stdout.String())
 	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "candidate", "list", "--home", home, "--template", "planner"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt candidate list exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "planner@v2") || !strings.Contains(stdout.String(), "Candidate is more specific.") {
+		t.Fatalf("candidate list stdout = %q", stdout.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "candidate", "show", "--home", home, "planner@v2"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt candidate show exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "state: pending") || !strings.Contains(stdout.String(), "eval_report:") || !strings.Contains(stdout.String(), "content_diff:") {
+		t.Fatalf("candidate show stdout = %q", stdout.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "candidate", "promote", "--home", home, "planner@v2"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt candidate promote exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "promoted candidate planner@v2") {
+		t.Fatalf("candidate promote stdout = %q", stdout.String())
+	}
 	store, err = db.Open(paths.Database)
 	if err != nil {
 		t.Fatalf("Open after import returned error: %v", err)
 	}
-	defer store.Close()
 	current, err := store.GetAgentTemplate(context.Background(), "planner")
 	if err != nil {
 		t.Fatalf("GetAgentTemplate current returned error: %v", err)
 	}
-	if current.VersionID != installed.VersionID {
-		t.Fatalf("current version = %q, want %q", current.VersionID, installed.VersionID)
+	if current.VersionID != "planner@v2" {
+		t.Fatalf("current version = %q, want planner@v2", current.VersionID)
 	}
 	latest, err := store.GetAgentTemplateReference(context.Background(), "planner@latest")
 	if err != nil {
@@ -182,6 +213,67 @@ items:
 	if latest.VersionID != "planner@v2" || latest.Content != candidateContent {
 		t.Fatalf("latest = %+v", latest)
 	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after promote returned error: %v", err)
+	}
+	rejectedContent := cliSkillOptTemplateContent("planner", "Plan the work and include every possible detail.")
+	rejectedParsed, err := agenttemplate.ParseTemplateContent(rejectedContent)
+	if err != nil {
+		t.Fatalf("ParseTemplateContent rejected returned error: %v", err)
+	}
+	candidate.Candidate.Content = rejectedContent
+	candidate.Candidate.Metadata = rejectedParsed.Metadata
+	encodedCandidate, err = json.Marshal(candidate)
+	if err != nil {
+		t.Fatalf("marshal rejected candidate: %v", err)
+	}
+	if err := os.WriteFile(candidatePath, encodedCandidate, 0o644); err != nil {
+		t.Fatalf("write rejected candidate: %v", err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "import", "--home", home, "--file", candidatePath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt import rejected exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "imported pending candidate planner@v3") {
+		t.Fatalf("second import stdout = %q", stdout.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "candidate", "reject", "--home", home, "planner@v3", "--reason", "too verbose"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt candidate reject exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "rejected candidate planner@v3") {
+		t.Fatalf("candidate reject stdout = %q", stdout.String())
+	}
+	store, err = db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open after reject returned error: %v", err)
+	}
+	defer store.Close()
+	rejected, err := store.GetAgentTemplateVersionByID(context.Background(), "planner@v3")
+	if err != nil {
+		t.Fatalf("GetAgentTemplateVersionByID rejected returned error: %v", err)
+	}
+	if rejected.State != "rejected" {
+		t.Fatalf("rejected = %+v", rejected)
+	}
+	rejectedReview, err := store.GetAgentTemplateCandidateReview(context.Background(), "planner@v3")
+	if err != nil {
+		t.Fatalf("GetAgentTemplateCandidateReview rejected returned error: %v", err)
+	}
+	if rejectedReview.DecisionReason != "too verbose" {
+		t.Fatalf("rejected review = %+v", rejectedReview)
+	}
+	latest, err = store.GetAgentTemplateReference(context.Background(), "planner@latest")
+	if err != nil {
+		t.Fatalf("GetAgentTemplateReference latest after reject returned error: %v", err)
+	}
+	if latest.VersionID != "planner@v2" {
+		t.Fatalf("latest after reject = %+v", latest)
+	}
 	events, err := store.ListFeedbackEvents(context.Background(), "run-1")
 	if err != nil {
 		t.Fatalf("ListFeedbackEvents returned error: %v", err)
@@ -189,6 +281,10 @@ items:
 	if len(events) != 1 || events[0].Choice != "a" {
 		t.Fatalf("feedback events = %+v", events)
 	}
+}
+
+func floatPtr(value float64) *float64 {
+	return &value
 }
 
 func TestSkillOptFeedbackRejectsIncompleteCommands(t *testing.T) {

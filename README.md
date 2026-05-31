@@ -275,6 +275,10 @@ gitmoot lock release owner/repo <branch> --owner <agent>
 ```sh
 gitmoot skillopt export --run <run-id> --output training.json
 gitmoot skillopt import --file candidate.json
+gitmoot skillopt candidate list [--template id]
+gitmoot skillopt candidate show <version-id>
+gitmoot skillopt candidate promote <version-id>
+gitmoot skillopt candidate reject <version-id> [--reason text]
 gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>
 gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id>
 gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]
@@ -284,6 +288,9 @@ gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issu
 The export/import boundary lets a future external `gitmoot-skillopt` optimizer
 train on local eval artifacts and return candidate template versions. Imported
 candidates stay pending until a human review workflow promotes them.
+Use `skillopt candidate show` to inspect the candidate metadata, eval report,
+feedback summary, and content diff before `promote` or `reject` records the
+decision.
 
 Use the GitHub feedback collector when review should happen in an issue or an
 existing PR thread. Reviewers can reply with either the copy-paste YAML block or

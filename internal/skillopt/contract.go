@@ -1,6 +1,7 @@
 package skillopt
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -183,6 +184,11 @@ func ImportCandidatePackage(ctx context.Context, store *db.Store, candidate Cand
 	if err := validateCandidatePackage(ctx, store, candidate); err != nil {
 		return db.AgentTemplateVersion{}, err
 	}
+	templateID := strings.TrimSpace(candidate.TemplateID)
+	baseVersionID, err := candidateBaseVersionID(ctx, store, templateID, candidate.BaseVersionID)
+	if err != nil {
+		return db.AgentTemplateVersion{}, err
+	}
 	metadataJSON, err := agenttemplate.MarshalMetadata(candidate.Candidate.Metadata)
 	if err != nil {
 		return db.AgentTemplateVersion{}, err
@@ -192,7 +198,7 @@ func ImportCandidatePackage(ctx context.Context, store *db.Store, candidate Cand
 		sourcePath = "candidate-package.json"
 	}
 	template := db.AgentTemplate{
-		ID:             strings.TrimSpace(candidate.TemplateID),
+		ID:             templateID,
 		Name:           candidate.Candidate.Metadata.Name,
 		Description:    candidate.Candidate.Metadata.Description,
 		SourceRepo:     CandidateSourceRepo,
@@ -202,7 +208,51 @@ func ImportCandidatePackage(ctx context.Context, store *db.Store, candidate Cand
 		Content:        candidate.Candidate.Content,
 		MetadataJSON:   metadataJSON,
 	}
-	return store.AddPendingAgentTemplateVersion(ctx, template)
+	version, err := store.AddPendingAgentTemplateVersion(ctx, template)
+	if err != nil {
+		return db.AgentTemplateVersion{}, err
+	}
+	evalReportJSON, err := rawMessageStorage(candidate.EvalReport)
+	if err != nil {
+		return db.AgentTemplateVersion{}, fmt.Errorf("candidate eval_report: %w", err)
+	}
+	summaryMetadataJSON, err := rawMessageStorage(candidate.Summary.Metadata)
+	if err != nil {
+		return db.AgentTemplateVersion{}, fmt.Errorf("candidate summary metadata: %w", err)
+	}
+	if err := store.UpsertAgentTemplateCandidateReview(ctx, db.AgentTemplateCandidateReview{
+		VersionID:           version.ID,
+		TemplateID:          version.TemplateID,
+		BaseVersionID:       baseVersionID,
+		DiffArtifactID:      strings.TrimSpace(candidate.Summary.DiffArtifactID),
+		Score:               candidate.Summary.Score,
+		PreferenceSummary:   strings.TrimSpace(candidate.Summary.PreferenceSummary),
+		EvalReportJSON:      evalReportJSON,
+		SummaryMetadataJSON: summaryMetadataJSON,
+		State:               "pending",
+	}); err != nil {
+		return db.AgentTemplateVersion{}, err
+	}
+	return version, nil
+}
+
+func candidateBaseVersionID(ctx context.Context, store *db.Store, templateID string, baseRef string) (string, error) {
+	baseRef = strings.TrimSpace(baseRef)
+	if baseRef == "" {
+		current, err := store.GetAgentTemplate(ctx, templateID)
+		if err != nil {
+			return "", fmt.Errorf("load current base version for %q: %w", templateID, err)
+		}
+		return current.VersionID, nil
+	}
+	base, err := store.GetAgentTemplateReference(ctx, baseRef)
+	if err != nil {
+		return "", fmt.Errorf("load base version %q: %w", baseRef, err)
+	}
+	if base.ID != templateID {
+		return "", fmt.Errorf("base version %q belongs to template %q, want %q", baseRef, base.ID, templateID)
+	}
+	return base.VersionID, nil
 }
 
 func validateCandidatePackage(ctx context.Context, store *db.Store, candidate CandidatePackage) error {
@@ -232,19 +282,19 @@ func validateCandidatePackage(ctx context.Context, store *db.Store, candidate Ca
 	if !sameMetadata(parsed.Metadata, candidate.Candidate.Metadata) {
 		return errors.New("candidate metadata does not match candidate template frontmatter")
 	}
-	if strings.TrimSpace(candidate.BaseVersionID) != "" {
-		base, err := store.GetAgentTemplateReference(ctx, candidate.BaseVersionID)
-		if err != nil {
-			return fmt.Errorf("load base version %q: %w", candidate.BaseVersionID, err)
-		}
-		if base.ID != templateID {
-			return fmt.Errorf("base version %q belongs to template %q, want %q", candidate.BaseVersionID, base.ID, templateID)
-		}
+	if _, err := candidateBaseVersionID(ctx, store, templateID, candidate.BaseVersionID); err != nil {
+		return err
 	}
 	if strings.TrimSpace(candidate.Summary.DiffArtifactID) != "" {
 		if _, err := store.GetEvalArtifact(ctx, candidate.Summary.DiffArtifactID); err != nil {
 			return fmt.Errorf("load summary diff artifact %q: %w", candidate.Summary.DiffArtifactID, err)
 		}
+	}
+	if _, err := rawMessageStorage(candidate.EvalReport); err != nil {
+		return fmt.Errorf("candidate eval_report: %w", err)
+	}
+	if _, err := rawMessageStorage(candidate.Summary.Metadata); err != nil {
+		return fmt.Errorf("candidate summary metadata: %w", err)
 	}
 	return nil
 }
@@ -358,6 +408,18 @@ func rawJSON(value string) (json.RawMessage, error) {
 		return nil, err
 	}
 	return json.RawMessage(value), nil
+}
+
+func rawMessageStorage(value json.RawMessage) (string, error) {
+	value = bytes.TrimSpace(value)
+	if len(value) == 0 {
+		return "", nil
+	}
+	var compacted bytes.Buffer
+	if err := json.Compact(&compacted, value); err != nil {
+		return "", err
+	}
+	return compacted.String(), nil
 }
 
 func sameMetadata(a agenttemplate.Metadata, b agenttemplate.Metadata) bool {

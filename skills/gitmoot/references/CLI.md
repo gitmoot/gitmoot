@@ -258,6 +258,10 @@ gitmoot lock show owner/repo <branch>
 ```sh
 gitmoot skillopt export --run <run-id> [--output training.json]
 gitmoot skillopt import --file candidate.json
+gitmoot skillopt candidate list [--template id]
+gitmoot skillopt candidate show <version-id>
+gitmoot skillopt candidate promote <version-id>
+gitmoot skillopt candidate reject <version-id> [--reason text]
 gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>
 gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id> [--reviewer name]
 gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]
@@ -268,10 +272,16 @@ gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issu
 eval run, review items, artifact manifests, feedback events when present, and
 evaluator config. `skillopt import` validates a candidate package and stores the
 candidate template as a pending version; it never promotes the candidate
-automatically. The Markdown feedback collector writes blind A/B review packets
-with `index.md`, per-item Markdown files, editable `feedback.yml`, and hidden
-assignment metadata that Gitmoot uses to validate the full response and import
-de-blinded canonical feedback events.
+automatically. `skillopt candidate show` displays candidate metadata, eval
+report JSON, preference summary, and a content diff against the base/current
+version. `skillopt candidate promote` makes a pending candidate current, while
+`skillopt candidate reject` records an auditable rejection and prevents that
+version from being selected by `@latest`.
+
+The Markdown feedback collector writes blind A/B review packets with `index.md`,
+per-item Markdown files, editable `feedback.yml`, and hidden assignment metadata
+that Gitmoot uses to validate the full response and import de-blinded canonical
+feedback events.
 
 The GitHub feedback collector publishes the same blind A/B review packet to a
 new issue by default, or to an existing PR when `--pr <number>` is provided.
