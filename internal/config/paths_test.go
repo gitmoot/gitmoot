@@ -14,4 +14,10 @@ func TestPathsForHome(t *testing.T) {
 	if paths.Database != filepath.Join("/tmp/example", ".gitmoot", "gitmoot.db") {
 		t.Fatalf("Database = %q", paths.Database)
 	}
+	if paths.Evals != filepath.Join("/tmp/example", ".gitmoot", "evals") {
+		t.Fatalf("Evals = %q", paths.Evals)
+	}
+	if paths.ArtifactBlobs != filepath.Join("/tmp/example", ".gitmoot", "evals", "blobs") {
+		t.Fatalf("ArtifactBlobs = %q", paths.ArtifactBlobs)
+	}
 }

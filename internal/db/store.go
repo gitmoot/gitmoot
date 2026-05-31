@@ -148,6 +148,41 @@ type JobEvent struct {
 	Message string
 }
 
+type EvalArtifact struct {
+	ID        string
+	Hash      string
+	MediaType string
+	SizeBytes int64
+	Driver    string
+	CreatedAt string
+}
+
+type EvalRun struct {
+	ID                string
+	TemplateID        string
+	TemplateVersionID string
+	TargetRepo        string
+	State             string
+	MetadataJSON      string
+	CreatedAt         string
+	UpdatedAt         string
+}
+
+type EvalReviewItem struct {
+	ID                  string
+	RunID               string
+	ItemID              string
+	Title               string
+	SourceArtifactID    string
+	BaselineArtifactID  string
+	CandidateArtifactID string
+	PreviewArtifactID   string
+	DiffArtifactID      string
+	MetadataJSON        string
+	CreatedAt           string
+	UpdatedAt           string
+}
+
 type BranchLock struct {
 	RepoFullName string
 	Branch       string
@@ -1367,6 +1402,134 @@ func (s *Store) ListJobEvents(ctx context.Context, jobID string) ([]JobEvent, er
 	return events, rows.Err()
 }
 
+func (s *Store) UpsertEvalArtifact(ctx context.Context, artifact EvalArtifact) error {
+	if strings.TrimSpace(artifact.ID) == "" {
+		artifact.ID = artifact.Hash
+	}
+	if strings.TrimSpace(artifact.Hash) == "" {
+		return errors.New("eval artifact hash is required")
+	}
+	if artifact.SizeBytes < 0 {
+		return errors.New("eval artifact size cannot be negative")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO eval_artifacts(id, hash, media_type, size_bytes, driver, created_at)
+		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(id) DO UPDATE SET
+			hash = excluded.hash,
+			media_type = excluded.media_type,
+			size_bytes = excluded.size_bytes,
+			driver = excluded.driver`,
+		artifact.ID, artifact.Hash, artifact.MediaType, artifact.SizeBytes, artifact.Driver)
+	return err
+}
+
+func (s *Store) GetEvalArtifact(ctx context.Context, id string) (EvalArtifact, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, hash, media_type, size_bytes, driver, created_at
+		FROM eval_artifacts WHERE id = ?`, id)
+	return scanEvalArtifact(row)
+}
+
+func (s *Store) UpsertEvalRun(ctx context.Context, run EvalRun) error {
+	if strings.TrimSpace(run.ID) == "" {
+		return errors.New("eval run id is required")
+	}
+	if strings.TrimSpace(run.State) == "" {
+		run.State = "draft"
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO eval_runs(id, template_id, template_version_id, target_repo, state, metadata_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+		ON CONFLICT(id) DO UPDATE SET
+			template_id = excluded.template_id,
+			template_version_id = excluded.template_version_id,
+			target_repo = excluded.target_repo,
+			state = excluded.state,
+			metadata_json = excluded.metadata_json,
+			updated_at = CURRENT_TIMESTAMP`,
+		run.ID, run.TemplateID, run.TemplateVersionID, run.TargetRepo, run.State, run.MetadataJSON)
+	return err
+}
+
+func (s *Store) GetEvalRun(ctx context.Context, id string) (EvalRun, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, template_id, template_version_id, target_repo, state, metadata_json, created_at, updated_at
+		FROM eval_runs WHERE id = ?`, id)
+	return scanEvalRun(row)
+}
+
+func (s *Store) UpsertEvalReviewItem(ctx context.Context, item EvalReviewItem) error {
+	if strings.TrimSpace(item.ID) == "" {
+		item.ID = item.RunID + "/" + item.ItemID
+	}
+	if strings.TrimSpace(item.RunID) == "" {
+		return errors.New("eval review item run id is required")
+	}
+	if strings.TrimSpace(item.ItemID) == "" {
+		return errors.New("eval review item id is required")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO eval_review_items(
+			id, run_id, item_id, title, source_artifact_id, baseline_artifact_id, candidate_artifact_id,
+			preview_artifact_id, diff_artifact_id, metadata_json, created_at, updated_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+		ON CONFLICT(id) DO UPDATE SET
+			run_id = excluded.run_id,
+			item_id = excluded.item_id,
+			title = excluded.title,
+			source_artifact_id = excluded.source_artifact_id,
+			baseline_artifact_id = excluded.baseline_artifact_id,
+			candidate_artifact_id = excluded.candidate_artifact_id,
+			preview_artifact_id = excluded.preview_artifact_id,
+			diff_artifact_id = excluded.diff_artifact_id,
+			metadata_json = excluded.metadata_json,
+			updated_at = CURRENT_TIMESTAMP`,
+		item.ID, item.RunID, item.ItemID, item.Title, item.SourceArtifactID, item.BaselineArtifactID, item.CandidateArtifactID,
+		item.PreviewArtifactID, item.DiffArtifactID, item.MetadataJSON)
+	return err
+}
+
+func (s *Store) ListEvalReviewItems(ctx context.Context, runID string) ([]EvalReviewItem, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, item_id, title, source_artifact_id, baseline_artifact_id,
+			candidate_artifact_id, preview_artifact_id, diff_artifact_id, metadata_json, created_at, updated_at
+		FROM eval_review_items WHERE run_id = ? ORDER BY item_id`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []EvalReviewItem
+	for rows.Next() {
+		item, err := scanEvalReviewItem(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func scanEvalArtifact(row interface{ Scan(dest ...any) error }) (EvalArtifact, error) {
+	var artifact EvalArtifact
+	if err := row.Scan(&artifact.ID, &artifact.Hash, &artifact.MediaType, &artifact.SizeBytes, &artifact.Driver, &artifact.CreatedAt); err != nil {
+		return EvalArtifact{}, err
+	}
+	return artifact, nil
+}
+
+func scanEvalRun(row interface{ Scan(dest ...any) error }) (EvalRun, error) {
+	var run EvalRun
+	if err := row.Scan(&run.ID, &run.TemplateID, &run.TemplateVersionID, &run.TargetRepo, &run.State, &run.MetadataJSON, &run.CreatedAt, &run.UpdatedAt); err != nil {
+		return EvalRun{}, err
+	}
+	return run, nil
+}
+
+func scanEvalReviewItem(row interface{ Scan(dest ...any) error }) (EvalReviewItem, error) {
+	var item EvalReviewItem
+	if err := row.Scan(&item.ID, &item.RunID, &item.ItemID, &item.Title, &item.SourceArtifactID, &item.BaselineArtifactID,
+		&item.CandidateArtifactID, &item.PreviewArtifactID, &item.DiffArtifactID, &item.MetadataJSON, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		return EvalReviewItem{}, err
+	}
+	return item, nil
+}
+
 func (s *Store) AcquireResourceLock(ctx context.Context, lock ResourceLock, now time.Time) (bool, error) {
 	resourceKey := strings.TrimSpace(lock.ResourceKey)
 	ownerJobID := strings.TrimSpace(lock.OwnerJobID)
@@ -2077,5 +2240,42 @@ UPDATE agent_templates
 SET current_version_id = id || '@v1',
 	latest_version_id = id || '@v1'
 WHERE current_version_id = '';
+	`,
+	`
+CREATE TABLE eval_artifacts (
+	id TEXT PRIMARY KEY,
+	hash TEXT NOT NULL,
+	media_type TEXT NOT NULL DEFAULT '',
+	size_bytes INTEGER NOT NULL DEFAULT 0,
+	driver TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE eval_runs (
+	id TEXT PRIMARY KEY,
+	template_id TEXT NOT NULL DEFAULT '',
+	template_version_id TEXT NOT NULL DEFAULT '',
+	target_repo TEXT NOT NULL DEFAULT '',
+	state TEXT NOT NULL DEFAULT 'draft',
+	metadata_json TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE eval_review_items (
+	id TEXT PRIMARY KEY,
+	run_id TEXT NOT NULL,
+	item_id TEXT NOT NULL,
+	title TEXT NOT NULL DEFAULT '',
+	source_artifact_id TEXT NOT NULL DEFAULT '',
+	baseline_artifact_id TEXT NOT NULL DEFAULT '',
+	candidate_artifact_id TEXT NOT NULL DEFAULT '',
+	preview_artifact_id TEXT NOT NULL DEFAULT '',
+	diff_artifact_id TEXT NOT NULL DEFAULT '',
+	metadata_json TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE(run_id, item_id)
+);
 	`,
 }

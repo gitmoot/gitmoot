@@ -13,7 +13,7 @@ func TestInitializeCreatesLocalState(t *testing.T) {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
 
-	for _, dir := range []string{paths.Home, paths.Logs, paths.Workspaces} {
+	for _, dir := range []string{paths.Home, paths.Logs, paths.Workspaces, paths.Evals, paths.ArtifactBlobs} {
 		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 			t.Fatalf("%s was not created as directory, info=%v err=%v", dir, info, err)
 		} else if info.Mode().Perm() != 0o700 {
@@ -27,5 +27,8 @@ func TestInitializeCreatesLocalState(t *testing.T) {
 	}
 	if !strings.Contains(string(config), "database") {
 		t.Fatalf("config missing database path:\n%s", string(config))
+	}
+	if !strings.Contains(string(config), "artifact_blobs") {
+		t.Fatalf("config missing artifact blob path:\n%s", string(config))
 	}
 }

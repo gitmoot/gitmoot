@@ -6,7 +6,7 @@ import (
 )
 
 func Initialize(paths Paths) error {
-	for _, dir := range []string{paths.Home, paths.Logs, paths.Workspaces} {
+	for _, dir := range []string{paths.Home, paths.Logs, paths.Workspaces, paths.Evals, paths.ArtifactBlobs} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return fmt.Errorf("create %s: %w", dir, err)
 		}
@@ -34,5 +34,7 @@ func DefaultConfig(paths Paths) string {
 database = %q
 logs = %q
 workspaces = %q
-`, paths.Database, paths.Logs, paths.Workspaces)
+evals = %q
+artifact_blobs = %q
+`, paths.Database, paths.Logs, paths.Workspaces, paths.Evals, paths.ArtifactBlobs)
 }

@@ -33,6 +33,9 @@ func TestOpenMigratesSchema(t *testing.T) {
 		"agent_repos",
 		"agent_templates",
 		"agent_template_versions",
+		"eval_artifacts",
+		"eval_runs",
+		"eval_review_items",
 	} {
 		ok, err := store.HasTable(ctx, table)
 		if err != nil {
@@ -45,6 +48,77 @@ func TestOpenMigratesSchema(t *testing.T) {
 
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatalf("second Migrate returned error: %v", err)
+	}
+}
+
+func TestEvalStorageMethods(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	artifact := EvalArtifact{
+		ID:        "artifact-a",
+		Hash:      "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		MediaType: "text/markdown",
+		SizeBytes: 42,
+		Driver:    "text",
+	}
+	if err := store.UpsertEvalArtifact(ctx, artifact); err != nil {
+		t.Fatalf("UpsertEvalArtifact returned error: %v", err)
+	}
+	storedArtifact, err := store.GetEvalArtifact(ctx, artifact.ID)
+	if err != nil {
+		t.Fatalf("GetEvalArtifact returned error: %v", err)
+	}
+	if storedArtifact.Hash != artifact.Hash || storedArtifact.MediaType != "text/markdown" || storedArtifact.Driver != "text" {
+		t.Fatalf("stored artifact = %+v", storedArtifact)
+	}
+
+	run := EvalRun{
+		ID:                "run-1",
+		TemplateID:        "planner",
+		TemplateVersionID: "planner@v2",
+		TargetRepo:        "owner/repo",
+		State:             "review",
+		MetadataJSON:      `{"seed":1}`,
+	}
+	if err := store.UpsertEvalRun(ctx, run); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+	storedRun, err := store.GetEvalRun(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("GetEvalRun returned error: %v", err)
+	}
+	if storedRun.TemplateVersionID != "planner@v2" || storedRun.MetadataJSON != `{"seed":1}` {
+		t.Fatalf("stored run = %+v", storedRun)
+	}
+
+	item := EvalReviewItem{
+		RunID:               run.ID,
+		ItemID:              "item-001",
+		Title:               "README plan",
+		SourceArtifactID:    artifact.ID,
+		BaselineArtifactID:  artifact.ID,
+		CandidateArtifactID: artifact.ID,
+		PreviewArtifactID:   artifact.ID,
+		DiffArtifactID:      artifact.ID,
+		MetadataJSON:        `{"path":"README.md"}`,
+	}
+	if err := store.UpsertEvalReviewItem(ctx, item); err != nil {
+		t.Fatalf("UpsertEvalReviewItem returned error: %v", err)
+	}
+	items, err := store.ListEvalReviewItems(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("ListEvalReviewItems returned error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("review items len = %d, want 1", len(items))
+	}
+	if items[0].ID != "run-1/item-001" || items[0].DiffArtifactID != artifact.ID || items[0].MetadataJSON != `{"path":"README.md"}` {
+		t.Fatalf("review item = %+v", items[0])
 	}
 }
 
