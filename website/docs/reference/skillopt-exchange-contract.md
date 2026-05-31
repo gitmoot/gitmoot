@@ -41,6 +41,36 @@ gitmoot skillopt candidate reject planner@v3 --reason "Too broad"
 Promotion updates the current template version; rejection records an audit reason
 and keeps the rejected version out of `@latest`.
 
+## Human Feedback Trial Happy Path
+
+Create a run and add saved baseline/candidate outputs:
+
+```sh
+gitmoot skillopt review create --template planner --repo owner/repo --run run-2026-05-31
+gitmoot skillopt review item add --run run-2026-05-31 --item item-001 --title "README planning task" --baseline baseline.md --candidate candidate.md --metadata-json '{"path":"README.md"}'
+gitmoot skillopt review status --run run-2026-05-31
+```
+
+Export a blind packet, have the human edit `feedback.yml`, and import it:
+
+```sh
+gitmoot skillopt feedback markdown export --run run-2026-05-31 --output .gitmoot/evals/run-2026-05-31
+# Human opens index.md, reviews items/*.md, sets reviewer, and edits feedback.yml.
+gitmoot skillopt feedback markdown import --packet .gitmoot/evals/run-2026-05-31
+```
+
+Export training data and validate the external optimizer contract:
+
+```sh
+gitmoot skillopt export --run run-2026-05-31 --output training.json
+gitmoot-skillopt optimize --training-package training.json --artifact-root ~/.gitmoot/evals/blobs --out-root .gitmoot/skillopt/run-2026-05-31 --candidate-output candidate.json --dry-run
+```
+
+For real model-backed optimization, check `gitmoot-skillopt optimize --help`
+and verify required backend/model environment variables for your installed
+optimizer version. Importing the candidate keeps it pending until a human
+explicitly promotes or rejects it.
+
 ## Markdown Feedback Packet
 
 ```sh
@@ -51,7 +81,7 @@ gitmoot skillopt feedback markdown export \
 
 The packet contains `index.md`, one Markdown file per item, editable
 `feedback.yml`, and hidden `.assignments.json` metadata that lets Gitmoot recover
-the blind A/B mapping.
+the blind A/B mapping. Keep `.assignments.json` untouched.
 
 Humans fill `feedback.yml` with `a`, `b`, `tie`, `neither`, or `skip`:
 
@@ -105,9 +135,11 @@ gitmoot skillopt feedback github sync \
 For PR comment mode, sync with `--pr <number>`. Gitmoot ignores unrelated
 comments and de-duplicates repeated imports by GitHub comment URL.
 
-The complete review loop is: import a candidate, collect feedback with either
-the Markdown packet or GitHub collector, inspect the candidate with
-`gitmoot skillopt candidate show <version-id>`, then promote or reject it.
+The complete saved-output review loop is: create a review run, add artifact
+backed review items, collect feedback with either the Markdown packet or GitHub
+collector, export training data, run the external optimizer, import the pending
+candidate, inspect it with `gitmoot skillopt candidate show <version-id>`, then
+promote or reject it.
 
 ## Future Live Pairwise Evaluation
 

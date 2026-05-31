@@ -60,6 +60,9 @@ gitmoot lock list --repo owner/repo
 ## SkillOpt Exchange
 
 ```sh
+gitmoot skillopt review create --template <id> --repo owner/repo --run <run-id>
+gitmoot skillopt review item add --run <run-id> --item <item-id> --baseline baseline.md --candidate candidate.md [--title text]
+gitmoot skillopt review status --run <run-id>
 gitmoot skillopt export --run <run-id> [--output training.json]
 gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]
 gitmoot skillopt candidate list [--template id]
