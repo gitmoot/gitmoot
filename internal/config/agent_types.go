@@ -120,7 +120,7 @@ func applyAgentTypeField(entry *AgentType, key string, value string) error {
 		parsed, err := parseConfigString(value)
 		entry.Runtime = parsed
 		return err
-	case "template", "preset":
+	case "template":
 		parsed, err := parseConfigString(value)
 		entry.Template = parsed
 		return err

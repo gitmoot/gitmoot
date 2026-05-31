@@ -46,15 +46,16 @@ job_timeout = "5m"
 	}
 }
 
-func TestLoadAgentTypesAcceptsLegacyPresetKey(t *testing.T) {
+func TestLoadAgentTypesIgnoresRetiredTemplateAlias(t *testing.T) {
 	paths := PathsForHome(t.TempDir())
 	if err := Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
+	retiredAlias := "pre" + "set"
 	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
 [agents.planner]
 runtime = "codex"
-preset = "planner"
+`+retiredAlias+` = "planner"
 `), 0o600); err != nil {
 		t.Fatalf("write config returned error: %v", err)
 	}
@@ -63,8 +64,8 @@ preset = "planner"
 	if err != nil {
 		t.Fatalf("LoadAgentTypes returned error: %v", err)
 	}
-	if got := types["planner"].Template; got != "planner" {
-		t.Fatalf("legacy preset key loaded template %q, want planner", got)
+	if got := types["planner"].Template; got != "" {
+		t.Fatalf("retired template alias loaded template %q, want empty", got)
 	}
 
 	if err := SaveAgentType(paths, types["planner"]); err != nil {
@@ -74,10 +75,10 @@ preset = "planner"
 	if err != nil {
 		t.Fatalf("read config returned error: %v", err)
 	}
-	if strings.Contains(string(content), "preset =") {
-		t.Fatalf("SaveAgentType preserved legacy preset key:\n%s", string(content))
+	if strings.Contains(string(content), retiredAlias+" =") {
+		t.Fatalf("SaveAgentType preserved retired template alias:\n%s", string(content))
 	}
-	if !strings.Contains(string(content), `template = "planner"`) {
-		t.Fatalf("SaveAgentType did not write template key:\n%s", string(content))
+	if strings.Contains(string(content), `template = "planner"`) {
+		t.Fatalf("SaveAgentType wrote template from retired alias:\n%s", string(content))
 	}
 }

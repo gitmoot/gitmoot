@@ -15,7 +15,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/db"
 )
 
-func TestAgentTemplateUpdateInstallsThermoPreset(t *testing.T) {
+func TestAgentTemplateUpdateInstallsThermoTemplate(t *testing.T) {
 	restore := replaceAgentTemplateFetcher(fakeAgentTemplateFetcher{
 		commit:  "abc123",
 		content: "Review deeply.",
@@ -66,7 +66,7 @@ func TestAgentTemplateUpdateRejectsRemovedPlannerHereTemplate(t *testing.T) {
 	}
 }
 
-func TestAgentTemplateDiffDoesNotMutateCachedPreset(t *testing.T) {
+func TestAgentTemplateDiffDoesNotMutateCachedTemplate(t *testing.T) {
 	restore := replaceAgentTemplateFetcher(fakeAgentTemplateFetcher{
 		commit:  "abc123",
 		content: "old body",
@@ -125,7 +125,7 @@ func TestAgentTemplateListShowsAvailableBuiltin(t *testing.T) {
 	}
 }
 
-func TestAgentTemplateAddInstallsLocalCustomPreset(t *testing.T) {
+func TestAgentTemplateAddInstallsLocalCustomTemplate(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	home := t.TempDir()
 	promptPath := filepath.Join(t.TempDir(), "frontend.md")
@@ -297,7 +297,7 @@ func TestAgentTemplateValidateRejectsNonRegularFile(t *testing.T) {
 	}
 }
 
-func TestAgentTemplateListShowsInstalledCustomPreset(t *testing.T) {
+func TestAgentTemplateListShowsInstalledCustomTemplate(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	home := t.TempDir()
 	promptPath := filepath.Join(t.TempDir(), "frontend.md")
@@ -334,7 +334,7 @@ func TestAgentTemplateListShowsInstalledCustomPreset(t *testing.T) {
 	}
 }
 
-func TestAgentTemplateUpdateAndDiffLocalCustomPreset(t *testing.T) {
+func TestAgentTemplateUpdateAndDiffLocalCustomTemplate(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	home := t.TempDir()
 	promptPath := filepath.Join(t.TempDir(), "frontend.md")
