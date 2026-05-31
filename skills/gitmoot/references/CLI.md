@@ -256,6 +256,9 @@ gitmoot lock show owner/repo <branch>
 ## SkillOpt Exchange
 
 ```sh
+gitmoot skillopt review create --template <id> --repo owner/repo --run <run-id>
+gitmoot skillopt review item add --run <run-id> --item <item-id> --baseline baseline.md --candidate candidate.md [--title text]
+gitmoot skillopt review status --run <run-id>
 gitmoot skillopt export --run <run-id> [--output training.json]
 gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]
 gitmoot skillopt candidate list [--template id]
@@ -268,10 +271,22 @@ gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--p
 gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)
 ```
 
+`skillopt review create` starts a review run for a template and target repo.
+`skillopt review item add` stores saved baseline/candidate outputs as artifact
+backed A/B review items. `skillopt review status` reports whether the run has
+items, complete artifacts, imported feedback for every item, and enough metadata
+to export.
+
 `skillopt export` writes a JSON training package with the template snapshot,
 eval run, review items, artifact manifests, feedback events when present, and
-evaluator config. `skillopt import` validates a candidate package and stores the
-candidate template as a pending version; it never promotes the candidate
+evaluator config. Use `gitmoot-skillopt optimize --training-package
+training.json --artifact-root ~/.gitmoot/evals/blobs --out-root
+.gitmoot/skillopt/<run-id> --candidate-output candidate.json --dry-run` first
+to validate the contract without model calls.
+Before real model-backed optimization, check `gitmoot-skillopt optimize --help`
+and verify required model/backend environment variables for the installed
+optimizer version. `skillopt import` validates a candidate package and stores
+the candidate template as a pending version; it never promotes the candidate
 automatically. If the candidate package includes new artifact manifest entries,
 pass `--artifact-dir` so Gitmoot can verify relative paths and SHA256 hashes
 before storing blobs. `skillopt candidate show` displays candidate metadata, eval
@@ -283,7 +298,9 @@ version from being selected by `@latest`.
 The Markdown feedback collector writes blind A/B review packets with `index.md`,
 per-item Markdown files, editable `feedback.yml`, and hidden assignment metadata
 that Gitmoot uses to validate the full response and import de-blinded canonical
-feedback events.
+feedback events. Open `index.md`, review every file in `items/*.md`, set
+`reviewer`, edit `feedback.yml` with exactly one of `a`, `b`, `tie`, `neither`,
+or `skip` for every item, and leave `.assignments.json` untouched.
 
 The GitHub feedback collector publishes the same blind A/B review packet to a
 new issue by default, or to an existing PR when `--pr <number>` is provided.

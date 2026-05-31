@@ -207,7 +207,7 @@ func (c MarkdownCollector) writeItem(ctx context.Context, store *db.Store, dir s
 	builder.WriteString("\n## Option B\n\n")
 	writeMarkdownFence(&builder, optionB)
 	builder.WriteString("\n## Feedback\n\n")
-	builder.WriteString("Fill `feedback.yml` with one of: `a`, `b`, `tie`, `neither`, `skip`.\n")
+	builder.WriteString("Record this item in `../feedback.yml` with one of: `a`, `b`, `tie`, `neither`, `skip`.\n")
 	return writeTextFile(filepath.Join(dir, "items", itemFilename(item.ItemID)), builder.String(), 0o644)
 }
 
@@ -340,13 +340,24 @@ func indexMarkdown(run db.EvalRun, items []db.EvalReviewItem) string {
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "# Gitmoot Feedback Packet: %s\n\n", run.ID)
 	builder.WriteString("Review each item without trying to infer which option is baseline or candidate.\n\n")
-	builder.WriteString("Allowed choices: `a`, `b`, `tie`, `neither`, `skip`.\n\n")
+	builder.WriteString("## How To Review\n\n")
+	builder.WriteString("1. Open this `index.md` file.\n")
+	builder.WriteString("2. Open each linked item in `items/*.md`.\n")
+	builder.WriteString("3. Compare Option A and Option B blind for each item.\n")
+	builder.WriteString("4. Edit `feedback.yml` in this packet directory and set `reviewer`.\n")
+	builder.WriteString("5. For every item, choose exactly one of: `a`, `b`, `tie`, `neither`, `skip`.\n")
+	builder.WriteString("6. Add concise `reasoning` when it helps explain the choice.\n")
+	builder.WriteString("7. Import the completed packet. If `reviewer` is not set in `feedback.yml`, pass `--reviewer <name>`:\n\n")
+	builder.WriteString("   ```sh\n")
+	builder.WriteString("   gitmoot skillopt feedback markdown import --packet <packet-dir> --reviewer <name>\n")
+	builder.WriteString("   ```\n\n")
+	builder.WriteString("Keep `.assignments.json` untouched. It is hidden Gitmoot metadata used to preserve and validate the blind A/B mapping on import.\n\n")
 	builder.WriteString("## Items\n\n")
 	for _, item := range items {
 		fmt.Fprintf(&builder, "- [%s](items/%s)\n", itemTitle(item), itemFilename(item.ItemID))
 	}
 	builder.WriteString("\n## Submit Feedback\n\n")
-	builder.WriteString("Edit `feedback.yml`, then import it with Gitmoot.\n")
+	builder.WriteString("After all items are filled in `feedback.yml`, run the import command above.\n")
 	return builder.String()
 }
 

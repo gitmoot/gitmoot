@@ -82,6 +82,87 @@ gitmoot skillopt candidate reject planner@v3 --reason "Too broad for the current
 Promotion updates the template's current version. Rejection records an audit
 reason and prevents the rejected candidate from being selected by `@latest`.
 
+## Human Feedback Trial Happy Path
+
+Create an eval review run and add saved baseline/candidate outputs:
+
+```sh
+gitmoot skillopt review create \
+  --template planner \
+  --repo owner/repo \
+  --run run-2026-05-31
+
+gitmoot skillopt review item add \
+  --run run-2026-05-31 \
+  --item item-001 \
+  --title "README planning task" \
+  --baseline baseline.md \
+  --candidate candidate.md \
+  --metadata-json '{"path":"README.md"}'
+
+gitmoot skillopt review status --run run-2026-05-31
+```
+
+Then export a blind local packet, collect human feedback, and import it:
+
+```sh
+gitmoot skillopt feedback markdown export \
+  --run run-2026-05-31 \
+  --output .gitmoot/evals/run-2026-05-31
+
+# Human opens index.md, reviews items/*.md, sets reviewer, and edits feedback.yml.
+
+gitmoot skillopt feedback markdown import \
+  --packet .gitmoot/evals/run-2026-05-31
+```
+
+When every review item has imported feedback, export the training package for
+the external optimizer:
+
+```sh
+gitmoot skillopt review status --run run-2026-05-31
+gitmoot skillopt export --run run-2026-05-31 --output training.json
+```
+
+Use `--dry-run` first to validate the exchange contract without model calls:
+
+```sh
+gitmoot-skillopt optimize \
+  --training-package training.json \
+  --artifact-root ~/.gitmoot/evals/blobs \
+  --out-root .gitmoot/skillopt/run-2026-05-31 \
+  --candidate-output candidate.json \
+  --dry-run
+```
+
+For real model-backed optimization, verify the installed optimizer contract and
+environment before running it:
+
+```sh
+gitmoot-skillopt --help
+gitmoot-skillopt optimize --help
+for name in OPENAI_API_KEY ANTHROPIC_API_KEY GITMOOT_SKILLOPT_BACKEND; do
+  if [ -n "${!name:-}" ]; then
+    printf '%s=set\n' "$name"
+  else
+    printf '%s=missing\n' "$name"
+  fi
+done
+```
+
+Use the backend, model, and budget flags shown by your installed
+`gitmoot-skillopt optimize --help`. Do not assume flag names without checking
+the local optimizer version.
+
+Import and review the candidate. Importing never promotes automatically:
+
+```sh
+gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]
+gitmoot skillopt candidate show <version-id>
+gitmoot skillopt candidate promote <version-id>
+gitmoot skillopt candidate reject <version-id> --reason "Needs narrower instructions"
+```
+
 ## Markdown Feedback Packet
 
 Generate a local blind A/B review packet:
@@ -173,14 +254,16 @@ unrelated comments and de-duplicates repeated imports by comment URL.
 
 Complete local review path:
 
-1. `gitmoot skillopt export --run <run-id> --output training.json`
-2. External optimizer returns `candidate.json`.
-3. `gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]`
-4. `gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>`
-5. Human fills `feedback.yml`.
-6. `gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id>`
-7. `gitmoot skillopt candidate show <version-id>`
-8. `gitmoot skillopt candidate promote <version-id>` or `gitmoot skillopt candidate reject <version-id>`
+1. `gitmoot skillopt review create --template <id> --repo owner/repo --run <run-id>`
+2. `gitmoot skillopt review item add --run <run-id> --item <item-id> --baseline baseline.md --candidate candidate.md`
+3. `gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>`
+4. Human opens `index.md`, reviews `items/*.md`, sets `reviewer`, and fills `feedback.yml`.
+5. `gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id>`
+6. `gitmoot skillopt export --run <run-id> --output training.json`
+7. `gitmoot-skillopt optimize --training-package training.json --artifact-root ~/.gitmoot/evals/blobs --out-root .gitmoot/skillopt/<run-id> --candidate-output candidate.json --dry-run`
+8. `gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]`
+9. `gitmoot skillopt candidate show <version-id>`
+10. `gitmoot skillopt candidate promote <version-id>` or `gitmoot skillopt candidate reject <version-id>`
 
 Complete GitHub review path:
 

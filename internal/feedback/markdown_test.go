@@ -69,7 +69,10 @@ func TestMarkdownCollectorWriteAndImportPacket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read index: %v", err)
 	}
-	if !strings.Contains(string(index), "Allowed choices") {
+	if !strings.Contains(string(index), "Open each linked item") ||
+		!strings.Contains(string(index), "set `reviewer`") ||
+		!strings.Contains(string(index), "gitmoot skillopt feedback markdown import --packet <packet-dir> --reviewer <name>") ||
+		!strings.Contains(string(index), ".assignments.json") {
 		t.Fatalf("index content misses instructions:\n%s", string(index))
 	}
 	itemContent, err := os.ReadFile(filepath.Join(packetDir, "items", itemFilename("item-001")))
@@ -78,6 +81,9 @@ func TestMarkdownCollectorWriteAndImportPacket(t *testing.T) {
 	}
 	if !strings.Contains(string(itemContent), "Option A") || !strings.Contains(string(itemContent), "Option B") {
 		t.Fatalf("item content missing options:\n%s", string(itemContent))
+	}
+	if !strings.Contains(string(itemContent), "../feedback.yml") {
+		t.Fatalf("item content missing feedback.yml guidance:\n%s", string(itemContent))
 	}
 	if !strings.Contains(string(itemContent), "````text") || !strings.Contains(string(itemContent), "```go") {
 		t.Fatalf("item content does not preserve nested Markdown fences:\n%s", string(itemContent))
