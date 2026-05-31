@@ -201,6 +201,14 @@ gitmoot agent template diff frontend-reviewer
 gitmoot agent template update frontend-reviewer
 ```
 
+Discover templates by metadata:
+
+```sh
+gitmoot agent template list --runtime codex --output goal_file
+gitmoot agent template list --tag review --capability ask
+gitmoot agent template show frontend-reviewer
+```
+
 Reuse a custom agent prompt in the current Codex or Claude chat without
 starting a background job:
 

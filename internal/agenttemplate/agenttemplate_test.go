@@ -50,7 +50,7 @@ func TestUpdatePlannerTemplate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Update returned error: %v", err)
 	}
-	if updated.ID != PlannerTemplateID || updated.ResolvedCommit != "def456" || updated.Content != content {
+	if updated.ID != PlannerTemplateID || updated.ResolvedCommit != "def456" || updated.Content != content || !strings.Contains(updated.MetadataJSON, `"id":"planner"`) || !strings.Contains(updated.MetadataJSON, `"outputs":["response"]`) {
 		t.Fatalf("updated planner template = %+v", updated)
 	}
 	if updated.SourceRepo != "jerryfane/gitmoot" || updated.SourcePath != "skills/gitmoot/agent-templates/planner.md" {
@@ -214,7 +214,7 @@ func TestAddLocalInstallsCustomTemplate(t *testing.T) {
 	if added.SourceRepo != LocalSourceRepo || added.SourceRef != LocalSourceRef || !filepath.IsAbs(added.SourcePath) {
 		t.Fatalf("added template source = %+v", added)
 	}
-	if added.ResolvedCommit != HashContent(content) || added.Content != content {
+	if added.ResolvedCommit != HashContent(content) || added.Content != content || !strings.Contains(added.MetadataJSON, `"id":"frontend-reviewer"`) {
 		t.Fatalf("added template content = %+v", added)
 	}
 }
@@ -299,7 +299,7 @@ func TestUpdateLocalRefreshesFromStoredPath(t *testing.T) {
 	if updated.Name != "Frontend Review Lead" || updated.Description != "Reviews frontend behavior and polish." {
 		t.Fatalf("UpdateLocal metadata = %+v", updated)
 	}
-	if updated.Content != newContent || updated.ResolvedCommit != HashContent(newContent) {
+	if updated.Content != newContent || updated.ResolvedCommit != HashContent(newContent) || !strings.Contains(updated.MetadataJSON, `"name":"Frontend Review Lead"`) {
 		t.Fatalf("UpdateLocal content = %+v", updated)
 	}
 }

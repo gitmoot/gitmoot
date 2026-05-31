@@ -39,7 +39,7 @@ func TestAgentTemplateUpdateInstallsThermoTemplate(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("template show exit code = %d, stderr=%s", code, stderr.String())
 	}
-	for _, want := range []string{"installed: yes", "resolved commit: abc123", "Review deeply."} {
+	for _, want := range []string{"installed: yes", "resolved commit: abc123", "metadata:", "outputs: review_findings", "Review deeply."} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("show output missing %q:\n%s", want, stdout.String())
 		}
@@ -110,8 +110,9 @@ func TestAgentTemplateDiffDoesNotMutateCachedTemplate(t *testing.T) {
 
 func TestAgentTemplateListShowsAvailableBuiltin(t *testing.T) {
 	var stdout, stderr bytes.Buffer
+	home := t.TempDir()
 
-	code := Run([]string{"agent", "template", "list", "--home", t.TempDir()}, &stdout, &stderr)
+	code := Run([]string{"agent", "template", "list", "--home", home}, &stdout, &stderr)
 
 	if code != 0 {
 		t.Fatalf("template list exit code = %d, stderr=%s", code, stderr.String())
@@ -122,6 +123,18 @@ func TestAgentTemplateListShowsAvailableBuiltin(t *testing.T) {
 	removedPlannerHereID := "planner-" + "here"
 	if strings.Contains(stdout.String(), removedPlannerHereID) {
 		t.Fatalf("removed planner id should not be listed as a builtin:\n%s", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "template", "show", "--home", home, "planner"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("template show exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{"installed: no", "metadata:", "outputs: plan,goal_file", "evaluation:"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("show output missing %q:\n%s", want, stdout.String())
+		}
 	}
 }
 
@@ -154,7 +167,7 @@ func TestAgentTemplateAddInstallsLocalCustomTemplate(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("template show exit code = %d, stderr=%s", code, stderr.String())
 	}
-	for _, want := range []string{"name: Frontend Reviewer", "description: Reviews UI.", "source: local@file:", "installed: yes", "Review frontend changes."} {
+	for _, want := range []string{"name: Frontend Reviewer", "description: Reviews UI.", "source: local@file:", "metadata:", "outputs: response", "installed: yes", "Review frontend changes."} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("show output missing %q:\n%s", want, stdout.String())
 		}
@@ -347,6 +360,66 @@ func TestAgentTemplateListShowsInstalledCustomTemplate(t *testing.T) {
 	}
 	if strings.Index(stdout.String(), "api-reviewer") > strings.Index(stdout.String(), "frontend-reviewer") {
 		t.Fatalf("custom agent templates are not sorted:\n%s", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "template", "list", "--home", home, "--output", "goal_file", "--runtime", "codex"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("template list filter exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "planner") || strings.Contains(stdout.String(), "frontend-reviewer") || strings.Contains(stdout.String(), "thermo-nuclear-code-quality-review") {
+		t.Fatalf("goal_file filter output =\n%s", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "template", "list", "--home", home, "--output", "response", "--tag", "review"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("template list custom filter exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "api-reviewer") || !strings.Contains(stdout.String(), "frontend-reviewer") || strings.Contains(stdout.String(), "planner") {
+		t.Fatalf("response filter output =\n%s", stdout.String())
+	}
+}
+
+func TestAgentTemplateListFiltersMigratedFrontmatterTemplate(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	home := t.TempDir()
+
+	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+
+	seedCachedAgentTemplate(t, home, db.AgentTemplate{
+		ID:             "migrated-reviewer",
+		Name:           "Migrated Reviewer",
+		Description:    "Migrated custom template",
+		SourceRepo:     "local",
+		SourceRef:      "file",
+		SourcePath:     "/tmp/migrated-reviewer.md",
+		ResolvedCommit: "sha256:abc123",
+		Content:        testLocalTemplateContent("migrated-reviewer", "Review migrated changes.\n"),
+	})
+
+	code := Run([]string{"agent", "template", "list", "--home", home, "--output", "response", "--runtime", "codex"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("template list exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "migrated-reviewer") {
+		t.Fatalf("migrated template missing from filtered list:\n%s", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "template", "show", "--home", home, "migrated-reviewer"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("template show exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "metadata:") || !strings.Contains(stdout.String(), "outputs: response") {
+		t.Fatalf("migrated template metadata missing from show:\n%s", stdout.String())
 	}
 }
 

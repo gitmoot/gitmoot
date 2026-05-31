@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/agenttemplate"
@@ -190,6 +191,14 @@ func runAgentTemplateList(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agent template list", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	var capabilityFilters repeatedFlag
+	var runtimeFilters repeatedFlag
+	var tagFilters repeatedFlag
+	var outputFilters repeatedFlag
+	fs.Var(&capabilityFilters, "capability", "filter by template capability")
+	fs.Var(&runtimeFilters, "runtime", "filter by compatible runtime")
+	fs.Var(&tagFilters, "tag", "filter by template tag")
+	fs.Var(&outputFilters, "output", "filter by template output")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -199,6 +208,12 @@ func runAgentTemplateList(args []string, stdout, stderr io.Writer) int {
 	if fs.NArg() != 0 {
 		fmt.Fprintln(stderr, "agent template list does not accept positional arguments")
 		return 2
+	}
+	filters := templateListFilters{
+		Capabilities: compactValues(capabilityFilters),
+		Runtimes:     compactValues(runtimeFilters),
+		Tags:         compactValues(tagFilters),
+		Outputs:      compactValues(outputFilters),
 	}
 	return withStoreExit(*home, stderr, "list agent templates", func(store *db.Store) error {
 		cachedTemplates, err := store.ListAgentTemplates(context.Background())
@@ -211,6 +226,10 @@ func runAgentTemplateList(args []string, stdout, stderr io.Writer) int {
 			if installedTemplate, ok := installed[definition.ID]; ok {
 				status = "installed@" + shortCommit(installedTemplate.ResolvedCommit)
 			}
+			metadata := metadataForTemplateDefinition(definition, installed[definition.ID])
+			if !filters.Match(metadata) {
+				continue
+			}
 			fmt.Fprintf(stdout, "%-36s %-18s %s\n", definition.ID, status, definition.SourceRepo+"/"+definition.SourcePath)
 		}
 		for _, cached := range cachedTemplates {
@@ -218,6 +237,10 @@ func runAgentTemplateList(args []string, stdout, stderr io.Writer) int {
 				continue
 			}
 			if agenttemplate.IsRetired(cached.ID) {
+				continue
+			}
+			metadata, ok := metadataForCachedTemplate(cached)
+			if !filters.MatchOptional(metadata, ok) {
 				continue
 			}
 			status := "installed@" + shortCommit(cached.ResolvedCommit)
@@ -255,6 +278,7 @@ func runAgentTemplateShow(args []string, stdout, stderr io.Writer) int {
 				return err
 			}
 			writeTemplateDefinition(stdout, definition)
+			writeTemplateMetadata(stdout, metadataForTemplateDefinition(definition, cached))
 			if !installed {
 				fmt.Fprintln(stdout, "installed: no")
 				return nil
@@ -412,7 +436,32 @@ func writeCustomTemplate(w io.Writer, cached db.AgentTemplate) {
 	fmt.Fprintln(w, "default role: ")
 	fmt.Fprintln(w, "default capabilities: ")
 	fmt.Fprintln(w, "mutation: false")
+	if metadata, ok := metadataForCachedTemplate(cached); ok {
+		writeTemplateMetadata(w, metadata)
+	}
 	writeInstalledTemplate(w, cached)
+}
+
+func writeTemplateMetadata(w io.Writer, metadata agenttemplate.Metadata) {
+	fmt.Fprintln(w, "metadata:")
+	fmt.Fprintf(w, "  kind: %s\n", metadata.Kind)
+	fmt.Fprintf(w, "  version: %d\n", metadata.Version)
+	fmt.Fprintf(w, "  capabilities: %s\n", strings.Join(metadata.Capabilities, ","))
+	fmt.Fprintf(w, "  runtime compatibility: %s\n", strings.Join(metadata.RuntimeCompatibility, ","))
+	fmt.Fprintf(w, "  tags: %s\n", strings.Join(metadata.Tags, ","))
+	fmt.Fprintf(w, "  inputs: %s\n", strings.Join(metadata.Inputs, ","))
+	fmt.Fprintf(w, "  outputs: %s\n", strings.Join(metadata.Outputs, ","))
+	if len(metadata.Evaluation) > 0 {
+		keys := make([]string, 0, len(metadata.Evaluation))
+		for key := range metadata.Evaluation {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		fmt.Fprintln(w, "  evaluation:")
+		for _, key := range keys {
+			fmt.Fprintf(w, "    %s: %s\n", key, metadata.Evaluation[key])
+		}
+	}
 }
 
 func writeInstalledTemplate(w io.Writer, cached db.AgentTemplate) {
@@ -421,6 +470,61 @@ func writeInstalledTemplate(w io.Writer, cached db.AgentTemplate) {
 	fmt.Fprintf(w, "updated: %s\n", cached.UpdatedAt)
 	fmt.Fprintln(w, "content:")
 	fmt.Fprintln(w, strings.TrimRight(cached.Content, "\n"))
+}
+
+type templateListFilters struct {
+	Capabilities []string
+	Runtimes     []string
+	Tags         []string
+	Outputs      []string
+}
+
+func (f templateListFilters) Empty() bool {
+	return len(f.Capabilities) == 0 && len(f.Runtimes) == 0 && len(f.Tags) == 0 && len(f.Outputs) == 0
+}
+
+func (f templateListFilters) MatchOptional(metadata agenttemplate.Metadata, ok bool) bool {
+	if !ok {
+		return f.Empty()
+	}
+	return f.Match(metadata)
+}
+
+func (f templateListFilters) Match(metadata agenttemplate.Metadata) bool {
+	return containsAll(metadata.Capabilities, f.Capabilities) &&
+		containsAll(metadata.RuntimeCompatibility, f.Runtimes) &&
+		containsAll(metadata.Tags, f.Tags) &&
+		containsAll(metadata.Outputs, f.Outputs)
+}
+
+func containsAll(values []string, filters []string) bool {
+	for _, filter := range filters {
+		if !containsValue(values, filter) {
+			return false
+		}
+	}
+	return true
+}
+
+func metadataForTemplateDefinition(definition agenttemplate.Definition, cached db.AgentTemplate) agenttemplate.Metadata {
+	if metadata, ok := metadataForCachedTemplate(cached); ok {
+		return metadata
+	}
+	return agenttemplate.MetadataForDefinition(definition)
+}
+
+func metadataForCachedTemplate(cached db.AgentTemplate) (agenttemplate.Metadata, bool) {
+	if strings.TrimSpace(cached.MetadataJSON) != "" {
+		metadata, err := agenttemplate.UnmarshalMetadata(cached.MetadataJSON)
+		if err == nil {
+			return metadata, true
+		}
+	}
+	parsed, err := agenttemplate.ParseTemplateContent(cached.Content)
+	if err != nil {
+		return agenttemplate.Metadata{}, false
+	}
+	return parsed.Metadata, true
 }
 
 func shortCommit(commit string) string {

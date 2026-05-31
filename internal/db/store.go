@@ -50,6 +50,7 @@ type AgentTemplate struct {
 	SourcePath     string
 	ResolvedCommit string
 	Content        string
+	MetadataJSON   string
 	CreatedAt      string
 	UpdatedAt      string
 }
@@ -515,8 +516,8 @@ func (s *Store) ListAgentRepos(ctx context.Context, agentName string) ([]string,
 }
 
 func (s *Store) UpsertAgentTemplate(ctx context.Context, template AgentTemplate) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO agent_templates(id, name, description, source_repo, source_ref, source_path, resolved_commit, content, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO agent_templates(id, name, description, source_repo, source_ref, source_path, resolved_commit, content, metadata_json, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
 			description = excluded.description,
@@ -525,19 +526,20 @@ func (s *Store) UpsertAgentTemplate(ctx context.Context, template AgentTemplate)
 			source_path = excluded.source_path,
 			resolved_commit = excluded.resolved_commit,
 			content = excluded.content,
+			metadata_json = excluded.metadata_json,
 			updated_at = CURRENT_TIMESTAMP`,
-		template.ID, template.Name, template.Description, template.SourceRepo, template.SourceRef, template.SourcePath, template.ResolvedCommit, template.Content)
+		template.ID, template.Name, template.Description, template.SourceRepo, template.SourceRef, template.SourcePath, template.ResolvedCommit, template.Content, template.MetadataJSON)
 	return err
 }
 
 func (s *Store) GetAgentTemplate(ctx context.Context, id string) (AgentTemplate, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, description, source_repo, source_ref, source_path, resolved_commit, content, created_at, updated_at
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, description, source_repo, source_ref, source_path, resolved_commit, content, metadata_json, created_at, updated_at
 		FROM agent_templates WHERE id = ?`, id)
 	return scanAgentTemplate(row)
 }
 
 func (s *Store) ListAgentTemplates(ctx context.Context) ([]AgentTemplate, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, description, source_repo, source_ref, source_path, resolved_commit, content, created_at, updated_at
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, description, source_repo, source_ref, source_path, resolved_commit, content, metadata_json, created_at, updated_at
 		FROM agent_templates ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -1527,7 +1529,7 @@ type agentTemplateScanner interface {
 
 func scanAgentTemplate(scanner agentTemplateScanner) (AgentTemplate, error) {
 	var template AgentTemplate
-	if err := scanner.Scan(&template.ID, &template.Name, &template.Description, &template.SourceRepo, &template.SourceRef, &template.SourcePath, &template.ResolvedCommit, &template.Content, &template.CreatedAt, &template.UpdatedAt); err != nil {
+	if err := scanner.Scan(&template.ID, &template.Name, &template.Description, &template.SourceRepo, &template.SourceRef, &template.SourcePath, &template.ResolvedCommit, &template.Content, &template.MetadataJSON, &template.CreatedAt, &template.UpdatedAt); err != nil {
 		return AgentTemplate{}, err
 	}
 	return template, nil
@@ -1773,5 +1775,8 @@ UPDATE agents SET template_id = preset_id WHERE template_id = '' AND preset_id <
 
 ALTER TABLE agent_instances ADD COLUMN template_id TEXT NOT NULL DEFAULT '';
 UPDATE agent_instances SET template_id = preset_id WHERE template_id = '' AND preset_id <> '';
+	`,
+	`
+ALTER TABLE agent_templates ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '';
 	`,
 }

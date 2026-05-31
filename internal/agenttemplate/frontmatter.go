@@ -1,6 +1,7 @@
 package agenttemplate
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -25,17 +26,17 @@ var validTemplateRuntimes = map[string]struct{}{
 }
 
 type Metadata struct {
-	ID                   string            `yaml:"id"`
-	Name                 string            `yaml:"name"`
-	Description          string            `yaml:"description"`
-	Kind                 string            `yaml:"kind"`
-	Version              int               `yaml:"version"`
-	Capabilities         []string          `yaml:"capabilities"`
-	RuntimeCompatibility []string          `yaml:"runtime_compatibility"`
-	Tags                 []string          `yaml:"tags"`
-	Inputs               []string          `yaml:"inputs"`
-	Outputs              []string          `yaml:"outputs"`
-	Evaluation           map[string]string `yaml:"evaluation,omitempty"`
+	ID                   string            `json:"id" yaml:"id"`
+	Name                 string            `json:"name" yaml:"name"`
+	Description          string            `json:"description" yaml:"description"`
+	Kind                 string            `json:"kind" yaml:"kind"`
+	Version              int               `json:"version" yaml:"version"`
+	Capabilities         []string          `json:"capabilities" yaml:"capabilities"`
+	RuntimeCompatibility []string          `json:"runtime_compatibility" yaml:"runtime_compatibility"`
+	Tags                 []string          `json:"tags" yaml:"tags"`
+	Inputs               []string          `json:"inputs" yaml:"inputs"`
+	Outputs              []string          `json:"outputs" yaml:"outputs"`
+	Evaluation           map[string]string `json:"evaluation,omitempty" yaml:"evaluation,omitempty"`
 }
 
 type ParsedTemplate struct {
@@ -60,6 +61,34 @@ func ParseTemplateContent(content string) (ParsedTemplate, error) {
 		return ParsedTemplate{}, errors.New("template body is empty")
 	}
 	return ParsedTemplate{Metadata: metadata, Body: body}, nil
+}
+
+func MarshalMetadata(metadata Metadata) (string, error) {
+	metadata = normalizeMetadata(metadata)
+	if err := validateMetadata(metadata); err != nil {
+		return "", err
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return "", fmt.Errorf("encode template metadata: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func UnmarshalMetadata(content string) (Metadata, error) {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return Metadata{}, errors.New("template metadata is empty")
+	}
+	var metadata Metadata
+	if err := json.Unmarshal([]byte(content), &metadata); err != nil {
+		return Metadata{}, fmt.Errorf("decode template metadata: %w", err)
+	}
+	metadata = normalizeMetadata(metadata)
+	if err := validateMetadata(metadata); err != nil {
+		return Metadata{}, err
+	}
+	return metadata, nil
 }
 
 func splitFrontmatter(content string) (string, string, error) {

@@ -278,6 +278,10 @@ func AddLocal(ctx context.Context, store *db.Store, id string, path string, name
 	if parsed.Metadata.ID != id {
 		return db.AgentTemplate{}, fmt.Errorf("template id %q does not match frontmatter id %q", id, parsed.Metadata.ID)
 	}
+	metadataJSON, err := MarshalMetadata(parsed.Metadata)
+	if err != nil {
+		return db.AgentTemplate{}, err
+	}
 	name = strings.TrimSpace(name)
 	if name == "" {
 		name = parsed.Metadata.Name
@@ -295,6 +299,7 @@ func AddLocal(ctx context.Context, store *db.Store, id string, path string, name
 		SourcePath:     local.Path,
 		ResolvedCommit: HashContent(local.Content),
 		Content:        local.Content,
+		MetadataJSON:   metadataJSON,
 	}
 	if err := store.UpsertAgentTemplate(ctx, template); err != nil {
 		return db.AgentTemplate{}, err
@@ -320,6 +325,10 @@ func UpdateLocal(ctx context.Context, store *db.Store, cached db.AgentTemplate) 
 	if parsed.Metadata.ID != cached.ID {
 		return db.AgentTemplate{}, fmt.Errorf("template id %q does not match frontmatter id %q", cached.ID, parsed.Metadata.ID)
 	}
+	metadataJSON, err := MarshalMetadata(parsed.Metadata)
+	if err != nil {
+		return db.AgentTemplate{}, err
+	}
 	updated := cached
 	updated.Name = parsed.Metadata.Name
 	updated.Description = parsed.Metadata.Description
@@ -328,6 +337,7 @@ func UpdateLocal(ctx context.Context, store *db.Store, cached db.AgentTemplate) 
 	updated.SourcePath = local.Path
 	updated.ResolvedCommit = HashContent(local.Content)
 	updated.Content = local.Content
+	updated.MetadataJSON = metadataJSON
 	if err := store.UpsertAgentTemplate(ctx, updated); err != nil {
 		return db.AgentTemplate{}, err
 	}
@@ -370,7 +380,11 @@ func Update(ctx context.Context, store *db.Store, fetcher Fetcher, id string) (d
 	if err != nil {
 		return db.AgentTemplate{}, err
 	}
-	content, err := ContentForDefinition(definition, file.Content)
+	content, metadata, err := ContentAndMetadataForDefinition(definition, file.Content)
+	if err != nil {
+		return db.AgentTemplate{}, err
+	}
+	metadataJSON, err := MarshalMetadata(metadata)
 	if err != nil {
 		return db.AgentTemplate{}, err
 	}
@@ -383,6 +397,7 @@ func Update(ctx context.Context, store *db.Store, fetcher Fetcher, id string) (d
 		SourcePath:     definition.SourcePath,
 		ResolvedCommit: resolvedCommit,
 		Content:        content,
+		MetadataJSON:   metadataJSON,
 	}
 	if err := store.UpsertAgentTemplate(ctx, template); err != nil {
 		return db.AgentTemplate{}, err
@@ -391,17 +406,23 @@ func Update(ctx context.Context, store *db.Store, fetcher Fetcher, id string) (d
 }
 
 func ContentForDefinition(definition Definition, content string) (string, error) {
+	content, _, err := ContentAndMetadataForDefinition(definition, content)
+	return content, err
+}
+
+func ContentAndMetadataForDefinition(definition Definition, content string) (string, Metadata, error) {
 	if strings.TrimSpace(content) == "" {
-		return "", errors.New("template content is empty")
+		return "", Metadata{}, errors.New("template content is empty")
 	}
 	parsed, err := ParseTemplateContent(content)
 	if err == nil {
 		if parsed.Metadata.ID != definition.ID {
-			return "", fmt.Errorf("template id %q does not match built-in id %q", parsed.Metadata.ID, definition.ID)
+			return "", Metadata{}, fmt.Errorf("template id %q does not match built-in id %q", parsed.Metadata.ID, definition.ID)
 		}
-		return content, nil
+		return content, parsed.Metadata, nil
 	}
-	return FormatTemplateContent(metadataForDefinition(definition), content), nil
+	metadata := MetadataForDefinition(definition)
+	return FormatTemplateContent(metadata, content), metadata, nil
 }
 
 func InstructionsForContent(content string) string {
@@ -412,7 +433,7 @@ func InstructionsForContent(content string) string {
 	return parsed.Body
 }
 
-func metadataForDefinition(definition Definition) Metadata {
+func MetadataForDefinition(definition Definition) Metadata {
 	metadata := Metadata{
 		ID:                   definition.ID,
 		Name:                 definition.Name,

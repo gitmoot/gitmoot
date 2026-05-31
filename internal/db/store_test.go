@@ -410,6 +410,7 @@ func TestRepositoryMethods(t *testing.T) {
 		SourcePath:     "cursor-team-kit/skills/thermo-nuclear-code-quality-review/SKILL.md",
 		ResolvedCommit: "abc123",
 		Content:        "Review deeply.",
+		MetadataJSON:   `{"id":"thermo","name":"Thermo","description":"Strict review","kind":"agent-template","version":1,"capabilities":["review"],"runtime_compatibility":["codex"],"tags":["review"],"inputs":["repo"],"outputs":["review_findings"]}`,
 	}); err != nil {
 		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
 	}
@@ -417,7 +418,7 @@ func TestRepositoryMethods(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAgentTemplate returned error: %v", err)
 	}
-	if template.ResolvedCommit != "abc123" || template.Content != "Review deeply." || template.CreatedAt == "" || template.UpdatedAt == "" {
+	if template.ResolvedCommit != "abc123" || template.Content != "Review deeply." || !strings.Contains(template.MetadataJSON, `"kind":"agent-template"`) || template.CreatedAt == "" || template.UpdatedAt == "" {
 		t.Fatalf("template = %+v", template)
 	}
 	templates, err := store.ListAgentTemplates(ctx)
@@ -883,7 +884,14 @@ func TestMigrationCopiesPresetsToAgentTemplates(t *testing.T) {
 	)`); err != nil {
 		t.Fatalf("create schema_migrations returned error: %v", err)
 	}
-	for version, migration := range migrations[:len(migrations)-1] {
+	templateMigration := len(migrations) - 1
+	for i, migration := range migrations {
+		if strings.Contains(migration, "DROP TABLE presets") {
+			templateMigration = i
+			break
+		}
+	}
+	for version, migration := range migrations[:templateMigration] {
 		if _, err := raw.ExecContext(ctx, migration); err != nil {
 			t.Fatalf("apply seed migration %d returned error: %v", version+1, err)
 		}
@@ -917,7 +925,7 @@ func TestMigrationCopiesPresetsToAgentTemplates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAgentTemplate returned error: %v", err)
 	}
-	if template.Content != "legacy instructions" || template.ResolvedCommit != "abc123" {
+	if template.Content != "legacy instructions" || template.ResolvedCommit != "abc123" || template.MetadataJSON != "" {
 		t.Fatalf("template = %+v", template)
 	}
 	agent, err := store.GetAgent(ctx, "legacy-agent")
