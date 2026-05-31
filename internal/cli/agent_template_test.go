@@ -39,7 +39,7 @@ func TestAgentTemplateUpdateInstallsThermoTemplate(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("template show exit code = %d, stderr=%s", code, stderr.String())
 	}
-	for _, want := range []string{"installed: yes", "resolved commit: abc123", "metadata:", "outputs: review_findings", "Review deeply."} {
+	for _, want := range []string{"installed: yes", "version: v1", "version id: thermo-nuclear-code-quality-review@v1", "promotion state: current", "content hash: sha256:", "resolved commit: abc123", "metadata:", "outputs: review_findings", "Review deeply."} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("show output missing %q:\n%s", want, stdout.String())
 		}
@@ -167,7 +167,7 @@ func TestAgentTemplateAddInstallsLocalCustomTemplate(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("template show exit code = %d, stderr=%s", code, stderr.String())
 	}
-	for _, want := range []string{"name: Frontend Reviewer", "description: Reviews UI.", "source: local@file:", "metadata:", "outputs: response", "installed: yes", "Review frontend changes."} {
+	for _, want := range []string{"name: Frontend Reviewer", "description: Reviews UI.", "source: local@file:", "metadata:", "outputs: response", "installed: yes", "version: v1", "promotion state: current", "content hash: sha256:", "Review frontend changes."} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("show output missing %q:\n%s", want, stdout.String())
 		}
@@ -467,6 +467,17 @@ func TestAgentTemplateUpdateAndDiffLocalCustomTemplate(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "updated frontend-reviewer at sha256:") {
 		t.Fatalf("stdout = %s", stdout.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "template", "show", "--home", home, "frontend-reviewer"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("template show after update exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{"version: v2", "version id: frontend-reviewer@v2", "promotion state: current", "New prompt."} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("show after update missing %q:\n%s", want, stdout.String())
+		}
 	}
 }
 

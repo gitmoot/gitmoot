@@ -466,6 +466,14 @@ func writeTemplateMetadata(w io.Writer, metadata agenttemplate.Metadata) {
 
 func writeInstalledTemplate(w io.Writer, cached db.AgentTemplate) {
 	fmt.Fprintln(w, "installed: yes")
+	if cached.VersionID != "" {
+		fmt.Fprintf(w, "version: v%d\n", cached.VersionNumber)
+		fmt.Fprintf(w, "version id: %s\n", cached.VersionID)
+		fmt.Fprintf(w, "promotion state: %s\n", cached.VersionState)
+	}
+	if cached.ContentHash != "" {
+		fmt.Fprintf(w, "content hash: %s\n", cached.ContentHash)
+	}
 	fmt.Fprintf(w, "resolved commit: %s\n", cached.ResolvedCommit)
 	fmt.Fprintf(w, "updated: %s\n", cached.UpdatedAt)
 	fmt.Fprintln(w, "content:")

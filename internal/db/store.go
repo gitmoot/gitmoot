@@ -2,7 +2,9 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,8 +53,31 @@ type AgentTemplate struct {
 	ResolvedCommit string
 	Content        string
 	MetadataJSON   string
+	VersionID      string
+	VersionNumber  int
+	VersionState   string
+	ContentHash    string
 	CreatedAt      string
 	UpdatedAt      string
+}
+
+type AgentTemplateVersion struct {
+	ID             string
+	TemplateID     string
+	VersionNumber  int
+	State          string
+	Name           string
+	Description    string
+	SourceRepo     string
+	SourceRef      string
+	SourcePath     string
+	ResolvedCommit string
+	ContentHash    string
+	Content        string
+	MetadataJSON   string
+	CreatedAt      string
+	UpdatedAt      string
+	PromotedAt     string
 }
 
 type AgentRepo struct {
@@ -516,8 +541,55 @@ func (s *Store) ListAgentRepos(ctx context.Context, agentName string) ([]string,
 }
 
 func (s *Store) UpsertAgentTemplate(ctx context.Context, template AgentTemplate) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO agent_templates(id, name, description, source_repo, source_ref, source_path, resolved_commit, content, metadata_json, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	contentHash := templateContentHash(template.Content)
+	current, hasCurrent, err := getCurrentAgentTemplateVersion(ctx, tx, template.ID)
+	if err != nil {
+		return err
+	}
+	versionID := current.ID
+	versionNumber := current.VersionNumber
+	if !hasCurrent || current.ContentHash != contentHash {
+		versionNumber, err = nextAgentTemplateVersionNumber(ctx, tx, template.ID)
+		if err != nil {
+			return err
+		}
+		versionID = agentTemplateVersionID(template.ID, versionNumber)
+		if hasCurrent {
+			if _, err := tx.ExecContext(ctx, `UPDATE agent_template_versions SET state = 'superseded', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = 'current'`, current.ID); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO agent_template_versions(id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, promoted_at, updated_at)
+			VALUES (?, ?, ?, 'current', ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+			versionID, template.ID, versionNumber, template.Name, template.Description, template.SourceRepo, template.SourceRef, template.SourcePath, template.ResolvedCommit, contentHash, template.Content, template.MetadataJSON); err != nil {
+			return err
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `UPDATE agent_template_versions
+			SET state = 'current',
+				name = ?,
+				description = ?,
+				source_repo = ?,
+				source_ref = ?,
+				source_path = ?,
+				resolved_commit = ?,
+				content_hash = ?,
+				content = ?,
+				metadata_json = ?,
+				updated_at = CURRENT_TIMESTAMP
+			WHERE id = ?`,
+			template.Name, template.Description, template.SourceRepo, template.SourceRef, template.SourcePath, template.ResolvedCommit, contentHash, template.Content, template.MetadataJSON, current.ID); err != nil {
+			return err
+		}
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO agent_templates(id, name, description, source_repo, source_ref, source_path, resolved_commit, content, metadata_json, current_version_id, latest_version_id, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
 			description = excluded.description,
@@ -527,33 +599,134 @@ func (s *Store) UpsertAgentTemplate(ctx context.Context, template AgentTemplate)
 			resolved_commit = excluded.resolved_commit,
 			content = excluded.content,
 			metadata_json = excluded.metadata_json,
+			current_version_id = excluded.current_version_id,
+			latest_version_id = CASE
+				WHEN agent_templates.current_version_id = excluded.current_version_id AND agent_templates.latest_version_id <> '' THEN agent_templates.latest_version_id
+				ELSE excluded.latest_version_id
+			END,
 			updated_at = CURRENT_TIMESTAMP`,
-		template.ID, template.Name, template.Description, template.SourceRepo, template.SourceRef, template.SourcePath, template.ResolvedCommit, template.Content, template.MetadataJSON)
-	return err
+		template.ID, template.Name, template.Description, template.SourceRepo, template.SourceRef, template.SourcePath, template.ResolvedCommit, template.Content, template.MetadataJSON, versionID, versionID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) GetAgentTemplate(ctx context.Context, id string) (AgentTemplate, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, description, source_repo, source_ref, source_path, resolved_commit, content, metadata_json, created_at, updated_at
-		FROM agent_templates WHERE id = ?`, id)
-	return scanAgentTemplate(row)
+	row := s.db.QueryRowContext(ctx, `SELECT t.id, t.name, t.description, t.source_repo, t.source_ref, t.source_path, t.resolved_commit, t.content, t.metadata_json,
+			COALESCE(v.id, ''), COALESCE(v.version, 0), COALESCE(v.state, ''), COALESCE(NULLIF(v.content_hash, ''), ''), t.created_at, t.updated_at
+		FROM agent_templates t
+		LEFT JOIN agent_template_versions v ON v.id = t.current_version_id
+		WHERE t.id = ?`, id)
+	return scanAgentTemplateWithVersion(row)
 }
 
 func (s *Store) ListAgentTemplates(ctx context.Context) ([]AgentTemplate, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, description, source_repo, source_ref, source_path, resolved_commit, content, metadata_json, created_at, updated_at
-		FROM agent_templates ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT t.id, t.name, t.description, t.source_repo, t.source_ref, t.source_path, t.resolved_commit, t.content, t.metadata_json,
+			COALESCE(v.id, ''), COALESCE(v.version, 0), COALESCE(v.state, ''), COALESCE(NULLIF(v.content_hash, ''), ''), t.created_at, t.updated_at
+		FROM agent_templates t
+		LEFT JOIN agent_template_versions v ON v.id = t.current_version_id
+		ORDER BY t.id`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	templates := []AgentTemplate{}
 	for rows.Next() {
-		template, err := scanAgentTemplate(rows)
+		template, err := scanAgentTemplateWithVersion(rows)
 		if err != nil {
 			return nil, err
 		}
 		templates = append(templates, template)
 	}
 	return templates, rows.Err()
+}
+
+func (s *Store) GetAgentTemplateReference(ctx context.Context, ref string) (AgentTemplate, error) {
+	templateID, versionRef := SplitAgentTemplateReference(ref)
+	if versionRef == "" || versionRef == "current" {
+		return s.GetAgentTemplate(ctx, templateID)
+	}
+	if versionRef == "latest" {
+		return s.GetLatestAgentTemplateVersion(ctx, templateID)
+	}
+	version, err := s.GetAgentTemplateVersion(ctx, templateID, versionRef)
+	if err != nil {
+		return AgentTemplate{}, err
+	}
+	return agentTemplateFromVersion(version), nil
+}
+
+func (s *Store) GetLatestAgentTemplateVersion(ctx context.Context, templateID string) (AgentTemplate, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT v.id, v.template_id, v.version, v.state, v.name, v.description, v.source_repo, v.source_ref, v.source_path, v.resolved_commit, v.content_hash, v.content, v.metadata_json, v.created_at, v.updated_at, v.promoted_at
+		FROM agent_templates t
+		JOIN agent_template_versions v ON v.id = t.latest_version_id
+		WHERE t.id = ?`, strings.TrimSpace(templateID))
+	version, err := scanAgentTemplateVersion(row)
+	if err != nil {
+		return AgentTemplate{}, err
+	}
+	return agentTemplateFromVersion(version), nil
+}
+
+func (s *Store) GetAgentTemplateVersion(ctx context.Context, templateID string, versionRef string) (AgentTemplateVersion, error) {
+	templateID = strings.TrimSpace(templateID)
+	versionRef = strings.TrimSpace(versionRef)
+	if strings.HasPrefix(versionRef, "v") && len(versionRef) > 1 {
+		versionRef = versionRef[1:]
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, created_at, updated_at, promoted_at
+		FROM agent_template_versions
+		WHERE template_id = ? AND (id = ? OR CAST(version AS TEXT) = ?)`, templateID, templateID+"@v"+versionRef, versionRef)
+	return scanAgentTemplateVersion(row)
+}
+
+func (s *Store) ListAgentTemplateVersions(ctx context.Context, templateID string) ([]AgentTemplateVersion, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, created_at, updated_at, promoted_at
+		FROM agent_template_versions WHERE template_id = ? ORDER BY version`, templateID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	versions := []AgentTemplateVersion{}
+	for rows.Next() {
+		version, err := scanAgentTemplateVersion(rows)
+		if err != nil {
+			return nil, err
+		}
+		versions = append(versions, version)
+	}
+	return versions, rows.Err()
+}
+
+func (s *Store) AddPendingAgentTemplateVersion(ctx context.Context, template AgentTemplate) (AgentTemplateVersion, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	defer tx.Rollback()
+	versionNumber, err := nextAgentTemplateVersionNumber(ctx, tx, template.ID)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	versionID := agentTemplateVersionID(template.ID, versionNumber)
+	contentHash := templateContentHash(template.Content)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO agent_template_versions(id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, updated_at)
+		VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		versionID, template.ID, versionNumber, template.Name, template.Description, template.SourceRepo, template.SourceRef, template.SourcePath, template.ResolvedCommit, contentHash, template.Content, template.MetadataJSON); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE agent_templates SET latest_version_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, versionID, template.ID)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if err := requireAffected(result, "agent template", template.ID); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	return s.GetAgentTemplateVersion(ctx, template.ID, fmt.Sprintf("v%d", versionNumber))
 }
 
 func (s *Store) AgentCanAccessRepo(ctx context.Context, agentName string, repoFullName string) (bool, error) {
@@ -1532,7 +1705,100 @@ func scanAgentTemplate(scanner agentTemplateScanner) (AgentTemplate, error) {
 	if err := scanner.Scan(&template.ID, &template.Name, &template.Description, &template.SourceRepo, &template.SourceRef, &template.SourcePath, &template.ResolvedCommit, &template.Content, &template.MetadataJSON, &template.CreatedAt, &template.UpdatedAt); err != nil {
 		return AgentTemplate{}, err
 	}
+	template.ContentHash = templateContentHash(template.Content)
+	template.VersionState = "current"
 	return template, nil
+}
+
+func scanAgentTemplateWithVersion(scanner agentTemplateScanner) (AgentTemplate, error) {
+	var template AgentTemplate
+	if err := scanner.Scan(&template.ID, &template.Name, &template.Description, &template.SourceRepo, &template.SourceRef, &template.SourcePath, &template.ResolvedCommit, &template.Content, &template.MetadataJSON, &template.VersionID, &template.VersionNumber, &template.VersionState, &template.ContentHash, &template.CreatedAt, &template.UpdatedAt); err != nil {
+		return AgentTemplate{}, err
+	}
+	if template.ContentHash == "" {
+		template.ContentHash = templateContentHash(template.Content)
+	}
+	if template.VersionState == "" {
+		template.VersionState = "current"
+	}
+	return template, nil
+}
+
+func scanAgentTemplateVersion(scanner agentTemplateScanner) (AgentTemplateVersion, error) {
+	var version AgentTemplateVersion
+	if err := scanner.Scan(&version.ID, &version.TemplateID, &version.VersionNumber, &version.State, &version.Name, &version.Description, &version.SourceRepo, &version.SourceRef, &version.SourcePath, &version.ResolvedCommit, &version.ContentHash, &version.Content, &version.MetadataJSON, &version.CreatedAt, &version.UpdatedAt, &version.PromotedAt); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if version.ContentHash == "" {
+		version.ContentHash = templateContentHash(version.Content)
+	}
+	return version, nil
+}
+
+func agentTemplateFromVersion(version AgentTemplateVersion) AgentTemplate {
+	return AgentTemplate{
+		ID:             version.TemplateID,
+		Name:           version.Name,
+		Description:    version.Description,
+		SourceRepo:     version.SourceRepo,
+		SourceRef:      version.SourceRef,
+		SourcePath:     version.SourcePath,
+		ResolvedCommit: version.ResolvedCommit,
+		Content:        version.Content,
+		MetadataJSON:   version.MetadataJSON,
+		VersionID:      version.ID,
+		VersionNumber:  version.VersionNumber,
+		VersionState:   version.State,
+		ContentHash:    version.ContentHash,
+		CreatedAt:      version.CreatedAt,
+		UpdatedAt:      version.UpdatedAt,
+	}
+}
+
+func SplitAgentTemplateReference(ref string) (string, string) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return "", ""
+	}
+	if index := strings.LastIndex(ref, "@"); index > 0 {
+		return strings.TrimSpace(ref[:index]), strings.TrimSpace(ref[index+1:])
+	}
+	return ref, ""
+}
+
+func getCurrentAgentTemplateVersion(ctx context.Context, tx *sql.Tx, templateID string) (AgentTemplateVersion, bool, error) {
+	row := tx.QueryRowContext(ctx, `SELECT v.id, v.template_id, v.version, v.state, v.name, v.description, v.source_repo, v.source_ref, v.source_path, v.resolved_commit, v.content_hash, v.content, v.metadata_json, v.created_at, v.updated_at, v.promoted_at
+		FROM agent_templates t
+		JOIN agent_template_versions v ON v.id = t.current_version_id
+		WHERE t.id = ?`, templateID)
+	version, err := scanAgentTemplateVersion(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AgentTemplateVersion{}, false, nil
+	}
+	if err != nil {
+		return AgentTemplateVersion{}, false, err
+	}
+	return version, true, nil
+}
+
+func nextAgentTemplateVersionNumber(ctx context.Context, tx *sql.Tx, templateID string) (int, error) {
+	var current sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT MAX(version) FROM agent_template_versions WHERE template_id = ?`, templateID).Scan(&current); err != nil {
+		return 0, err
+	}
+	if !current.Valid {
+		return 1, nil
+	}
+	return int(current.Int64) + 1, nil
+}
+
+func agentTemplateVersionID(templateID string, version int) string {
+	return fmt.Sprintf("%s@v%d", strings.TrimSpace(templateID), version)
+}
+
+func templateContentHash(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 func requireAffected(result sql.Result, subject string, id string) error {
@@ -1778,5 +2044,38 @@ UPDATE agent_instances SET template_id = preset_id WHERE template_id = '' AND pr
 	`,
 	`
 ALTER TABLE agent_templates ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '';
+	`,
+	`
+CREATE TABLE agent_template_versions (
+	id TEXT PRIMARY KEY,
+	template_id TEXT NOT NULL,
+	version INTEGER NOT NULL,
+	state TEXT NOT NULL,
+	name TEXT NOT NULL,
+	description TEXT NOT NULL DEFAULT '',
+	source_repo TEXT NOT NULL,
+	source_ref TEXT NOT NULL,
+	source_path TEXT NOT NULL,
+	resolved_commit TEXT NOT NULL,
+	content_hash TEXT NOT NULL DEFAULT '',
+	content TEXT NOT NULL,
+	metadata_json TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	promoted_at TEXT NOT NULL DEFAULT '',
+	UNIQUE(template_id, version)
+);
+
+INSERT OR REPLACE INTO agent_template_versions(id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, created_at, updated_at, promoted_at)
+SELECT id || '@v1', id, 1, 'current', name, description, source_repo, source_ref, source_path, resolved_commit, '', content, metadata_json, created_at, updated_at, updated_at
+FROM agent_templates;
+
+ALTER TABLE agent_templates ADD COLUMN current_version_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent_templates ADD COLUMN latest_version_id TEXT NOT NULL DEFAULT '';
+
+UPDATE agent_templates
+SET current_version_id = id || '@v1',
+	latest_version_id = id || '@v1'
+WHERE current_version_id = '';
 	`,
 }

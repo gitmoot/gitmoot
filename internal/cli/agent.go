@@ -796,9 +796,10 @@ func resolveAgentDefaults(templateID string, role string, capabilities []string,
 		}
 		return role, resolvedCapabilities, nil
 	}
-	definition, ok := agenttemplate.Lookup(templateID)
+	logicalTemplateID, _ := db.SplitAgentTemplateReference(templateID)
+	definition, ok := agenttemplate.Lookup(logicalTemplateID)
 	if !ok {
-		if err := agenttemplate.ValidateID(templateID); err != nil {
+		if err := agenttemplate.ValidateID(logicalTemplateID); err != nil {
 			return "", nil, err
 		}
 		if role == "" {
@@ -828,15 +829,16 @@ func resolveAgentDefaults(templateID string, role string, capabilities []string,
 }
 
 func loadInstalledTemplate(ctx context.Context, store *db.Store, templateID string) (db.AgentTemplate, error) {
-	if agenttemplate.IsRetired(templateID) {
-		return db.AgentTemplate{}, retiredAgentTemplateError(templateID)
+	logicalTemplateID, _ := db.SplitAgentTemplateReference(templateID)
+	if agenttemplate.IsRetired(logicalTemplateID) {
+		return db.AgentTemplate{}, retiredAgentTemplateError(logicalTemplateID)
 	}
-	cached, err := store.GetAgentTemplate(ctx, templateID)
+	cached, err := store.GetAgentTemplateReference(ctx, templateID)
 	if errors.Is(err, sql.ErrNoRows) {
-		if _, ok := agenttemplate.Lookup(templateID); !ok {
-			return db.AgentTemplate{}, fmt.Errorf("agent template %s is not installed; run gitmoot agent template add %s --file <path>", templateID, templateID)
+		if _, ok := agenttemplate.Lookup(logicalTemplateID); !ok {
+			return db.AgentTemplate{}, fmt.Errorf("agent template %s is not installed; run gitmoot agent template add %s --file <path>", logicalTemplateID, logicalTemplateID)
 		}
-		return db.AgentTemplate{}, fmt.Errorf("agent template %s is not installed; run gitmoot agent template update %s", templateID, templateID)
+		return db.AgentTemplate{}, fmt.Errorf("agent template %s is not installed; run gitmoot agent template update %s", logicalTemplateID, logicalTemplateID)
 	}
 	return cached, err
 }

@@ -197,6 +197,12 @@ gitmoot agent template diff frontend-reviewer
 gitmoot agent template update frontend-reviewer
 ```
 
+Template updates are versioned locally. `gitmoot agent template show <id>`
+prints the current version, content hash, source commit, and promotion state.
+Agents use the current promoted version by default, or a pinned version when
+configured with a reference such as `--template frontend-reviewer@v1`.
+Queued jobs keep the exact template content snapshot they were created with.
+
 Discover templates by metadata:
 
 ```sh

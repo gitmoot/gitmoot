@@ -32,6 +32,7 @@ func TestOpenMigratesSchema(t *testing.T) {
 		"merge_gates",
 		"agent_repos",
 		"agent_templates",
+		"agent_template_versions",
 	} {
 		ok, err := store.HasTable(ctx, table)
 		if err != nil {
@@ -418,8 +419,73 @@ func TestRepositoryMethods(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAgentTemplate returned error: %v", err)
 	}
-	if template.ResolvedCommit != "abc123" || template.Content != "Review deeply." || !strings.Contains(template.MetadataJSON, `"kind":"agent-template"`) || template.CreatedAt == "" || template.UpdatedAt == "" {
+	if template.ResolvedCommit != "abc123" || template.Content != "Review deeply." || !strings.Contains(template.MetadataJSON, `"kind":"agent-template"`) || template.VersionID != "thermo@v1" || template.VersionNumber != 1 || template.VersionState != "current" || !strings.HasPrefix(template.ContentHash, "sha256:") || template.CreatedAt == "" || template.UpdatedAt == "" {
 		t.Fatalf("template = %+v", template)
+	}
+	if err := store.UpsertAgentTemplate(ctx, AgentTemplate{
+		ID:             "thermo",
+		Name:           "Thermo",
+		Description:    "Strict review",
+		SourceRepo:     "cursor/plugins",
+		SourceRef:      "main",
+		SourcePath:     "cursor-team-kit/skills/thermo-nuclear-code-quality-review/SKILL.md",
+		ResolvedCommit: "def456",
+		Content:        "Review deeply again.",
+		MetadataJSON:   `{"id":"thermo","name":"Thermo","description":"Strict review","kind":"agent-template","version":1,"capabilities":["review"],"runtime_compatibility":["codex"],"tags":["review"],"inputs":["repo"],"outputs":["review_findings"]}`,
+	}); err != nil {
+		t.Fatalf("second UpsertAgentTemplate returned error: %v", err)
+	}
+	template, err = store.GetAgentTemplate(ctx, "thermo")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate second returned error: %v", err)
+	}
+	if template.VersionID != "thermo@v2" || template.VersionNumber != 2 || template.ResolvedCommit != "def456" {
+		t.Fatalf("template second version = %+v", template)
+	}
+	versions, err := store.ListAgentTemplateVersions(ctx, "thermo")
+	if err != nil {
+		t.Fatalf("ListAgentTemplateVersions returned error: %v", err)
+	}
+	if len(versions) != 2 || versions[0].State != "superseded" || versions[1].State != "current" {
+		t.Fatalf("versions = %+v", versions)
+	}
+	pending, err := store.AddPendingAgentTemplateVersion(ctx, AgentTemplate{
+		ID:             "thermo",
+		Name:           "Thermo Candidate",
+		Description:    "Candidate review",
+		SourceRepo:     "local",
+		SourceRef:      "candidate",
+		SourcePath:     "candidate.md",
+		ResolvedCommit: "sha256:candidate",
+		Content:        "Candidate instructions.",
+		MetadataJSON:   `{"id":"thermo","name":"Thermo Candidate","description":"Candidate review","kind":"agent-template","version":1,"capabilities":["review"],"runtime_compatibility":["codex"],"tags":["review"],"inputs":["repo"],"outputs":["review_findings"]}`,
+	})
+	if err != nil {
+		t.Fatalf("AddPendingAgentTemplateVersion returned error: %v", err)
+	}
+	if pending.State != "pending" || pending.VersionNumber != 3 {
+		t.Fatalf("pending version = %+v", pending)
+	}
+	current, err := store.GetAgentTemplate(ctx, "thermo")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate current returned error: %v", err)
+	}
+	if current.VersionID != "thermo@v2" || current.Content != "Review deeply again." {
+		t.Fatalf("pending changed current template = %+v", current)
+	}
+	latest, err := store.GetAgentTemplateReference(ctx, "thermo@latest")
+	if err != nil {
+		t.Fatalf("GetAgentTemplateReference latest returned error: %v", err)
+	}
+	if latest.VersionID != "thermo@v3" || latest.VersionState != "pending" || latest.Content != "Candidate instructions." {
+		t.Fatalf("latest template = %+v", latest)
+	}
+	pinned, err := store.GetAgentTemplateReference(ctx, "thermo@v1")
+	if err != nil {
+		t.Fatalf("GetAgentTemplateReference returned error: %v", err)
+	}
+	if pinned.VersionID != "thermo@v1" || pinned.Content != "Review deeply." {
+		t.Fatalf("pinned template = %+v", pinned)
 	}
 	templates, err := store.ListAgentTemplates(ctx)
 	if err != nil {
@@ -927,6 +993,13 @@ func TestMigrationCopiesPresetsToAgentTemplates(t *testing.T) {
 	}
 	if template.Content != "legacy instructions" || template.ResolvedCommit != "abc123" || template.MetadataJSON != "" {
 		t.Fatalf("template = %+v", template)
+	}
+	versions, err := store.ListAgentTemplateVersions(ctx, "legacy-template")
+	if err != nil {
+		t.Fatalf("ListAgentTemplateVersions returned error: %v", err)
+	}
+	if len(versions) != 1 || versions[0].ID != "legacy-template@v1" || versions[0].State != "current" || versions[0].Content != "legacy instructions" {
+		t.Fatalf("legacy versions = %+v", versions)
 	}
 	agent, err := store.GetAgent(ctx, "legacy-agent")
 	if err != nil {

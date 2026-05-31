@@ -109,6 +109,37 @@ func TestMailboxEnqueueSnapshotsAgentTemplate(t *testing.T) {
 	if payload.TemplateID != "thermo" || payload.TemplateResolvedCommit != "abc123" || payload.TemplateContent != "Review deeply." {
 		t.Fatalf("payload template snapshot = %+v", payload)
 	}
+
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:         "audit-pinned",
+		Role:         "reviewer",
+		Runtime:      "codex",
+		RuntimeRef:   "last",
+		RepoScope:    "jerryfane/gitmoot",
+		TemplateID:   "thermo@v1",
+		Capabilities: []string{"review"},
+	}); err != nil {
+		t.Fatalf("UpsertAgent pinned returned error: %v", err)
+	}
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID:     "job-2",
+		Agent:  "audit-pinned",
+		Action: "review",
+		Repo:   "jerryfane/gitmoot",
+	}); err != nil {
+		t.Fatalf("Enqueue pinned returned error: %v", err)
+	}
+	pinnedJob, err := store.GetJob(ctx, "job-2")
+	if err != nil {
+		t.Fatalf("GetJob pinned returned error: %v", err)
+	}
+	pinnedPayload, err := unmarshalPayload(pinnedJob.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload pinned returned error: %v", err)
+	}
+	if pinnedPayload.TemplateID != "thermo" || pinnedPayload.TemplateResolvedCommit != "abc123" || pinnedPayload.TemplateContent != "Review deeply." {
+		t.Fatalf("pinned payload template snapshot = %+v", pinnedPayload)
+	}
 }
 
 func TestMailboxRunIncludesTemplateSnapshotInPrompt(t *testing.T) {

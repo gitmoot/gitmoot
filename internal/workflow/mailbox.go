@@ -121,7 +121,7 @@ func (m Mailbox) templateSnapshot(ctx context.Context, agentName string) (db.Age
 	if strings.TrimSpace(agent.TemplateID) == "" {
 		return db.AgentTemplate{}, nil
 	}
-	template, err := m.Store.GetAgentTemplate(ctx, agent.TemplateID)
+	template, err := m.Store.GetAgentTemplateReference(ctx, agent.TemplateID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return db.AgentTemplate{}, fmt.Errorf("agent %q references missing template %q", agent.Name, agent.TemplateID)
