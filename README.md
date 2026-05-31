@@ -291,6 +291,8 @@ candidates stay pending until a human review workflow promotes them.
 When a candidate package includes new artifact manifest entries, pass
 `--artifact-dir` to the directory containing those files; Gitmoot verifies
 relative paths and SHA256 hashes before storing blobs.
+The external optimizer walkthrough lives in
+[`jerryfane/gitmoot-skillopt`](https://github.com/jerryfane/gitmoot-skillopt/blob/main/docs/guide/gitmoot-mvp-workflow.md).
 Use `skillopt candidate show` to inspect the candidate metadata, eval report,
 feedback summary, and content diff before `promote` or `reject` records the
 decision.
