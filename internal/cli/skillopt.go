@@ -35,6 +35,8 @@ func runSkillOpt(args []string, stdout, stderr io.Writer) int {
 		return runSkillOptExport(args[1:], stdout, stderr)
 	case "import":
 		return runSkillOptImport(args[1:], stdout, stderr)
+	case "review":
+		return runSkillOptReview(args[1:], stdout, stderr)
 	case "candidate":
 		return runSkillOptCandidate(args[1:], stdout, stderr)
 	case "feedback":
@@ -50,6 +52,8 @@ func printSkillOptUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot skillopt export --run <run-id> [--output package.json]")
 	fmt.Fprintln(w, "  gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]")
+	fmt.Fprintln(w, "  gitmoot skillopt review create --template <id> --repo owner/repo --run <run-id>")
+	fmt.Fprintln(w, "  gitmoot skillopt review status --run <run-id>")
 	fmt.Fprintln(w, "  gitmoot skillopt candidate list [--template id]")
 	fmt.Fprintln(w, "  gitmoot skillopt candidate show <version-id>")
 	fmt.Fprintln(w, "  gitmoot skillopt candidate promote <version-id>")
@@ -58,6 +62,227 @@ func printSkillOptUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id> [--reviewer name]")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)")
+}
+
+func runSkillOptReview(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		printSkillOptUsage(stdout)
+		return 0
+	}
+	switch args[0] {
+	case "create":
+		return runSkillOptReviewCreate(args[1:], stdout, stderr)
+	case "status":
+		return runSkillOptReviewStatus(args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "unknown skillopt review command %q\n\n", args[0])
+		printSkillOptUsage(stderr)
+		return 2
+	}
+}
+
+func runSkillOptReviewCreate(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("skillopt review create", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	templateID := fs.String("template", "", "agent template id or version to review")
+	repoFlag := fs.String("repo", "", "target repository in owner/repo form")
+	runID := fs.String("run", "", "review run id")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "skillopt review create does not accept positional arguments")
+		return 2
+	}
+	if strings.TrimSpace(*templateID) == "" || strings.TrimSpace(*repoFlag) == "" || strings.TrimSpace(*runID) == "" {
+		fmt.Fprintln(stderr, "skillopt review create requires --template, --repo, and --run")
+		return 2
+	}
+	repo, err := daemon.ParseRepository(*repoFlag)
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt review create: %v\n", err)
+		return 2
+	}
+	var run db.EvalRun
+	if err := withStore(*home, func(store *db.Store) error {
+		template, err := loadInstalledTemplate(context.Background(), store, *templateID)
+		if err != nil {
+			return err
+		}
+		run = db.EvalRun{
+			ID:                strings.TrimSpace(*runID),
+			TemplateID:        template.ID,
+			TemplateVersionID: template.VersionID,
+			TargetRepo:        repo.FullName(),
+			State:             "review",
+			MetadataJSON:      `{"driver":"manual-review"}`,
+		}
+		return store.UpsertEvalRun(context.Background(), run)
+	}); err != nil {
+		fmt.Fprintf(stderr, "skillopt review create: %v\n", err)
+		return 1
+	}
+	writeLine(stdout, "created review %s for %s", run.ID, run.TemplateVersionID)
+	return 0
+}
+
+func runSkillOptReviewStatus(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("skillopt review status", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	runID := fs.String("run", "", "review run id")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "skillopt review status does not accept positional arguments")
+		return 2
+	}
+	if strings.TrimSpace(*runID) == "" {
+		fmt.Fprintln(stderr, "skillopt review status requires --run")
+		return 2
+	}
+	var status skillOptReviewStatus
+	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
+		var err error
+		status, err = loadSkillOptReviewStatus(context.Background(), store, artifact.NewStore(paths.ArtifactBlobs), *runID)
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "skillopt review status: %v\n", err)
+		return 1
+	}
+	itemCount := len(status.Items)
+	feedbackCount := len(status.Feedback)
+	fmt.Fprintf(stdout, "run: %s\n", status.Run.ID)
+	fmt.Fprintf(stdout, "template: %s\n", status.Run.TemplateID)
+	fmt.Fprintf(stdout, "template_version: %s\n", status.Run.TemplateVersionID)
+	fmt.Fprintf(stdout, "repo: %s\n", status.Run.TargetRepo)
+	fmt.Fprintf(stdout, "state: %s\n", status.Run.State)
+	fmt.Fprintf(stdout, "items: %d\n", itemCount)
+	fmt.Fprintf(stdout, "feedback: %d\n", feedbackCount)
+	fmt.Fprintf(stdout, "packet_blockers: %d\n", len(status.PacketBlockers))
+	fmt.Fprintf(stdout, "training_blockers: %d\n", len(status.TrainingBlockers))
+	fmt.Fprintf(stdout, "ready_for_packet: %t\n", status.PacketReady)
+	fmt.Fprintf(stdout, "ready_for_training: %t\n", status.TrainingReady)
+	for _, blocker := range status.PacketBlockers {
+		fmt.Fprintf(stdout, "packet_blocker: %s\n", blocker)
+	}
+	for _, blocker := range status.TrainingBlockers {
+		fmt.Fprintf(stdout, "training_blocker: %s\n", blocker)
+	}
+	return 0
+}
+
+type skillOptReviewStatus struct {
+	Run              db.EvalRun
+	Items            []db.EvalReviewItem
+	Feedback         []db.FeedbackEvent
+	PacketBlockers   []string
+	TrainingBlockers []string
+	PacketReady      bool
+	TrainingReady    bool
+}
+
+func loadSkillOptReviewStatus(ctx context.Context, store *db.Store, blobStore artifact.Store, runID string) (skillOptReviewStatus, error) {
+	run, err := store.GetEvalRun(ctx, strings.TrimSpace(runID))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return skillOptReviewStatus{}, fmt.Errorf("review run %s not found", strings.TrimSpace(runID))
+		}
+		return skillOptReviewStatus{}, err
+	}
+	items, err := store.ListEvalReviewItems(ctx, run.ID)
+	if err != nil {
+		return skillOptReviewStatus{}, err
+	}
+	events, err := store.ListFeedbackEvents(ctx, run.ID)
+	if err != nil {
+		return skillOptReviewStatus{}, err
+	}
+	packetBlockers := reviewPacketBlockers(ctx, store, blobStore, items)
+	trainingBlockers := reviewTrainingBlockers(ctx, store, run.ID, items, events)
+	return skillOptReviewStatus{
+		Run:              run,
+		Items:            items,
+		Feedback:         events,
+		PacketBlockers:   packetBlockers,
+		TrainingBlockers: trainingBlockers,
+		PacketReady:      len(packetBlockers) == 0,
+		TrainingReady:    len(packetBlockers) == 0 && len(trainingBlockers) == 0,
+	}, nil
+}
+
+func reviewPacketBlockers(ctx context.Context, store *db.Store, blobStore artifact.Store, items []db.EvalReviewItem) []string {
+	if len(items) == 0 {
+		return []string{"run has no review items"}
+	}
+	var blockers []string
+	validated := map[string]struct{}{}
+	for _, item := range items {
+		itemID := strings.TrimSpace(item.ItemID)
+		if itemID == "" {
+			itemID = item.ID
+		}
+		baseline := strings.TrimSpace(item.BaselineArtifactID)
+		candidate := strings.TrimSpace(item.CandidateArtifactID)
+		if baseline == "" || candidate == "" {
+			blockers = append(blockers, fmt.Sprintf("item %s is missing a baseline or candidate artifact", itemID))
+			continue
+		}
+		if baseline == candidate {
+			blockers = append(blockers, fmt.Sprintf("item %s uses the same artifact for baseline and candidate", itemID))
+			continue
+		}
+		blockers = append(blockers, validateReviewArtifactBlob(ctx, store, blobStore, itemID, "baseline", baseline, validated)...)
+		blockers = append(blockers, validateReviewArtifactBlob(ctx, store, blobStore, itemID, "candidate", candidate, validated)...)
+	}
+	return blockers
+}
+
+func reviewTrainingBlockers(ctx context.Context, store *db.Store, runID string, items []db.EvalReviewItem, events []db.FeedbackEvent) []string {
+	if len(items) == 0 {
+		return []string{"run has no review items"}
+	}
+	var blockers []string
+	feedbackByItem := map[string]int{}
+	for _, event := range events {
+		feedbackByItem[strings.TrimSpace(event.ItemID)]++
+	}
+	for _, item := range items {
+		itemID := strings.TrimSpace(item.ItemID)
+		if itemID == "" {
+			itemID = item.ID
+		}
+		if feedbackByItem[itemID] == 0 {
+			blockers = append(blockers, fmt.Sprintf("item %s has no imported feedback", itemID))
+		}
+	}
+	if _, err := skillopt.ExportTrainingPackage(ctx, store, runID); err != nil {
+		blockers = append(blockers, fmt.Sprintf("training export failed: %v", err))
+	}
+	return blockers
+}
+
+func validateReviewArtifactBlob(ctx context.Context, store *db.Store, blobStore artifact.Store, itemID string, role string, artifactID string, validated map[string]struct{}) []string {
+	if _, ok := validated[artifactID]; ok {
+		return nil
+	}
+	validated[artifactID] = struct{}{}
+	record, err := store.GetEvalArtifact(ctx, artifactID)
+	if err != nil {
+		return []string{fmt.Sprintf("item %s %s artifact %s is not registered: %v", itemID, role, artifactID, err)}
+	}
+	if _, err := blobStore.Read(record.Hash); err != nil {
+		return []string{fmt.Sprintf("item %s %s artifact %s blob is not readable: %v", itemID, role, artifactID, err)}
+	}
+	return nil
 }
 
 func runSkillOptExport(args []string, stdout, stderr io.Writer) int {

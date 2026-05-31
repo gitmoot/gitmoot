@@ -642,6 +642,429 @@ func TestSkillOptFeedbackGitHubCommands(t *testing.T) {
 	}
 }
 
+func TestSkillOptReviewCreateAndStatus(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	template := cliSkillOptTemplate("planner", "Plan the work.")
+	if err := store.UpsertAgentTemplate(context.Background(), template); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	installed, err := store.GetAgentTemplate(context.Background(), "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "--help"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt help exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "gitmoot skillopt review create") || !strings.Contains(stdout.String(), "gitmoot skillopt review status") {
+		t.Fatalf("skillopt help missing review commands:\n%s", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "review", "create",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/repo",
+		"--run", "planner-ab-1",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt review create exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "created review planner-ab-1 for "+installed.VersionID) {
+		t.Fatalf("review create stdout = %q", stdout.String())
+	}
+
+	store, err = db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open after create returned error: %v", err)
+	}
+	run, err := store.GetEvalRun(context.Background(), "planner-ab-1")
+	if err != nil {
+		t.Fatalf("GetEvalRun returned error: %v", err)
+	}
+	if run.TemplateID != "planner" || run.TemplateVersionID != installed.VersionID || run.TargetRepo != "owner/repo" || run.State != "review" {
+		t.Fatalf("eval run = %+v", run)
+	}
+	blobStore := artifact.NewStore(paths.ArtifactBlobs)
+	baselineBlob, err := blobStore.Put([]byte("baseline"))
+	if err != nil {
+		t.Fatalf("Put baseline returned error: %v", err)
+	}
+	candidateBlob, err := blobStore.Put([]byte("candidate"))
+	if err != nil {
+		t.Fatalf("Put candidate returned error: %v", err)
+	}
+	if err := store.UpsertEvalArtifact(context.Background(), db.EvalArtifact{
+		ID:        "baseline",
+		Hash:      baselineBlob.Hash,
+		MediaType: "text/markdown",
+		SizeBytes: baselineBlob.Size,
+		Driver:    "text",
+	}); err != nil {
+		t.Fatalf("UpsertEvalArtifact baseline returned error: %v", err)
+	}
+	if err := store.UpsertEvalArtifact(context.Background(), db.EvalArtifact{
+		ID:        "candidate",
+		Hash:      candidateBlob.Hash,
+		MediaType: "text/markdown",
+		SizeBytes: candidateBlob.Size,
+		Driver:    "text",
+	}); err != nil {
+		t.Fatalf("UpsertEvalArtifact candidate returned error: %v", err)
+	}
+	if err := store.UpsertEvalReviewItem(context.Background(), db.EvalReviewItem{
+		RunID:               "planner-ab-1",
+		ItemID:              "item-001",
+		Title:               "README planning task",
+		BaselineArtifactID:  "baseline",
+		CandidateArtifactID: "candidate",
+	}); err != nil {
+		t.Fatalf("UpsertEvalReviewItem returned error: %v", err)
+	}
+	if err := store.UpsertFeedbackEvent(context.Background(), db.FeedbackEvent{
+		RunID:     "planner-ab-1",
+		ItemID:    "item-001",
+		Choice:    "b",
+		Reasoning: "More concrete.",
+		Reviewer:  "jerry",
+		Source:    "markdown",
+		CreatedAt: "2026-05-31T10:00:00Z",
+	}); err != nil {
+		t.Fatalf("UpsertFeedbackEvent returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after seed returned error: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "review", "status", "--home", home, "--run", "planner-ab-1"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt review status exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{
+		"run: planner-ab-1",
+		"template: planner",
+		"template_version: " + installed.VersionID,
+		"repo: owner/repo",
+		"state: review",
+		"items: 1",
+		"feedback: 1",
+		"packet_blockers: 0",
+		"training_blockers: 0",
+		"ready_for_packet: true",
+		"ready_for_training: true",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("status stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
+func TestSkillOptReviewStatusRequiresExportableArtifacts(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	template := cliSkillOptTemplate("planner", "Plan the work.")
+	if err := store.UpsertAgentTemplate(context.Background(), template); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	installed, err := store.GetAgentTemplate(context.Background(), "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	if err := store.UpsertEvalRun(context.Background(), db.EvalRun{
+		ID:                "planner-ab-1",
+		TemplateID:        "planner",
+		TemplateVersionID: installed.VersionID,
+		TargetRepo:        "owner/repo",
+		State:             "review",
+		MetadataJSON:      `{"driver":"manual-review"}`,
+	}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+	if err := store.UpsertEvalReviewItem(context.Background(), db.EvalReviewItem{
+		RunID:               "planner-ab-1",
+		ItemID:              "item-001",
+		BaselineArtifactID:  "baseline",
+		CandidateArtifactID: "candidate",
+	}); err != nil {
+		t.Fatalf("UpsertEvalReviewItem returned error: %v", err)
+	}
+	if err := store.UpsertFeedbackEvent(context.Background(), db.FeedbackEvent{
+		RunID:     "planner-ab-1",
+		ItemID:    "item-001",
+		Choice:    "b",
+		Reviewer:  "jerry",
+		Source:    "markdown",
+		CreatedAt: "2026-05-31T10:00:00Z",
+	}); err != nil {
+		t.Fatalf("UpsertFeedbackEvent returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "review", "status", "--home", home, "--run", "planner-ab-1"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt review status exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{
+		"items: 1",
+		"feedback: 1",
+		"packet_blockers: 2",
+		"training_blockers: 1",
+		"ready_for_packet: false",
+		"ready_for_training: false",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("status stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
+func TestSkillOptReviewStatusRequiresExportableMetadata(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	template := cliSkillOptTemplate("planner", "Plan the work.")
+	if err := store.UpsertAgentTemplate(context.Background(), template); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	installed, err := store.GetAgentTemplate(context.Background(), "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	blobStore := artifact.NewStore(paths.ArtifactBlobs)
+	baselineBlob, err := blobStore.Put([]byte("baseline"))
+	if err != nil {
+		t.Fatalf("Put baseline returned error: %v", err)
+	}
+	candidateBlob, err := blobStore.Put([]byte("candidate"))
+	if err != nil {
+		t.Fatalf("Put candidate returned error: %v", err)
+	}
+	if err := store.UpsertEvalArtifact(context.Background(), db.EvalArtifact{
+		ID:        "baseline",
+		Hash:      baselineBlob.Hash,
+		MediaType: "text/markdown",
+		SizeBytes: baselineBlob.Size,
+		Driver:    "text",
+	}); err != nil {
+		t.Fatalf("UpsertEvalArtifact baseline returned error: %v", err)
+	}
+	if err := store.UpsertEvalArtifact(context.Background(), db.EvalArtifact{
+		ID:        "candidate",
+		Hash:      candidateBlob.Hash,
+		MediaType: "text/markdown",
+		SizeBytes: candidateBlob.Size,
+		Driver:    "text",
+	}); err != nil {
+		t.Fatalf("UpsertEvalArtifact candidate returned error: %v", err)
+	}
+	if err := store.UpsertEvalRun(context.Background(), db.EvalRun{
+		ID:                "planner-ab-1",
+		TemplateID:        "planner",
+		TemplateVersionID: installed.VersionID,
+		TargetRepo:        "owner/repo",
+		State:             "review",
+		MetadataJSON:      `{"driver":"manual-review"}`,
+	}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+	if err := store.UpsertEvalReviewItem(context.Background(), db.EvalReviewItem{
+		RunID:               "planner-ab-1",
+		ItemID:              "item-001",
+		BaselineArtifactID:  "baseline",
+		CandidateArtifactID: "candidate",
+		MetadataJSON:        `{not-json`,
+	}); err != nil {
+		t.Fatalf("UpsertEvalReviewItem returned error: %v", err)
+	}
+	if err := store.UpsertFeedbackEvent(context.Background(), db.FeedbackEvent{
+		RunID:     "planner-ab-1",
+		ItemID:    "item-001",
+		Choice:    "b",
+		Reviewer:  "jerry",
+		Source:    "markdown",
+		CreatedAt: "2026-05-31T10:00:00Z",
+	}); err != nil {
+		t.Fatalf("UpsertFeedbackEvent returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "review", "status", "--home", home, "--run", "planner-ab-1"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt review status exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{
+		"packet_blockers: 0",
+		"training_blockers: 1",
+		"ready_for_packet: true",
+		"ready_for_training: false",
+		"training_blocker: training export failed: eval item item-001 metadata_json:",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("status stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
+func TestSkillOptReviewStatusRequiresFeedbackForEveryItem(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	template := cliSkillOptTemplate("planner", "Plan the work.")
+	if err := store.UpsertAgentTemplate(context.Background(), template); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	installed, err := store.GetAgentTemplate(context.Background(), "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	blobStore := artifact.NewStore(paths.ArtifactBlobs)
+	for _, fixture := range []struct {
+		id      string
+		content string
+	}{
+		{id: "item-001-baseline", content: "item 1 baseline"},
+		{id: "item-001-candidate", content: "item 1 candidate"},
+		{id: "item-002-baseline", content: "item 2 baseline"},
+		{id: "item-002-candidate", content: "item 2 candidate"},
+	} {
+		blob, err := blobStore.Put([]byte(fixture.content))
+		if err != nil {
+			t.Fatalf("Put %s returned error: %v", fixture.id, err)
+		}
+		if err := store.UpsertEvalArtifact(context.Background(), db.EvalArtifact{
+			ID:        fixture.id,
+			Hash:      blob.Hash,
+			MediaType: "text/markdown",
+			SizeBytes: blob.Size,
+			Driver:    "text",
+		}); err != nil {
+			t.Fatalf("UpsertEvalArtifact %s returned error: %v", fixture.id, err)
+		}
+	}
+	if err := store.UpsertEvalRun(context.Background(), db.EvalRun{
+		ID:                "planner-ab-1",
+		TemplateID:        "planner",
+		TemplateVersionID: installed.VersionID,
+		TargetRepo:        "owner/repo",
+		State:             "review",
+		MetadataJSON:      `{"driver":"manual-review"}`,
+	}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+	for _, item := range []db.EvalReviewItem{
+		{RunID: "planner-ab-1", ItemID: "item-001", BaselineArtifactID: "item-001-baseline", CandidateArtifactID: "item-001-candidate"},
+		{RunID: "planner-ab-1", ItemID: "item-002", BaselineArtifactID: "item-002-baseline", CandidateArtifactID: "item-002-candidate"},
+	} {
+		if err := store.UpsertEvalReviewItem(context.Background(), item); err != nil {
+			t.Fatalf("UpsertEvalReviewItem %s returned error: %v", item.ItemID, err)
+		}
+	}
+	if err := store.UpsertFeedbackEvent(context.Background(), db.FeedbackEvent{
+		RunID:     "planner-ab-1",
+		ItemID:    "item-001",
+		Choice:    "b",
+		Reviewer:  "jerry",
+		Source:    "markdown",
+		CreatedAt: "2026-05-31T10:00:00Z",
+	}); err != nil {
+		t.Fatalf("UpsertFeedbackEvent returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "review", "status", "--home", home, "--run", "planner-ab-1"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt review status exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{
+		"items: 2",
+		"feedback: 1",
+		"packet_blockers: 0",
+		"training_blockers: 1",
+		"ready_for_packet: true",
+		"ready_for_training: false",
+		"training_blocker: item item-002 has no imported feedback",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("status stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
+func TestSkillOptReviewCreateRejectsUnknownTemplate(t *testing.T) {
+	home := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "review", "create",
+		"--home", home,
+		"--template", "missing-template",
+		"--repo", "owner/repo",
+		"--run", "planner-ab-1",
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("skillopt review create exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "agent template missing-template is not installed") {
+		t.Fatalf("review create stderr = %q", stderr.String())
+	}
+}
+
+func TestSkillOptReviewStatusRejectsMissingRun(t *testing.T) {
+	home := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "review", "status", "--home", home, "--run", "missing-run"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("skillopt review status exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "review run missing-run not found") {
+		t.Fatalf("review status stderr = %q", stderr.String())
+	}
+}
+
 type skillOptFakeGitHub struct {
 	github.NoopClient
 
