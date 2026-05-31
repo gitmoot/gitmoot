@@ -98,3 +98,46 @@ uses `.assignments.json` to de-blind `a` and `b` so stored canonical feedback
 events use `choice: a` for the baseline artifact and `choice: b` for the
 candidate artifact. Each event includes `run_id`, `item_id`, `choice`, optional
 `reasoning`, `reviewer`, `source`, optional `source_url`, and `created_at`.
+
+## GitHub Feedback Collector
+
+Publish a collaborative blind A/B review packet to a new GitHub issue:
+
+```sh
+gitmoot skillopt feedback github publish \
+  --run run-2026-05-31 \
+  --repo owner/reviews
+```
+
+To publish the packet as a comment on an existing PR instead:
+
+```sh
+gitmoot skillopt feedback github publish \
+  --run run-2026-05-31 \
+  --repo owner/repo \
+  --pr 123
+```
+
+If `--repo` is omitted, Gitmoot resolves the target in this order: eval run
+target repo, template source repo, configured `[feedback].repo`, then an error
+asking for `--repo`.
+
+Reviewers can reply with the issue body's YAML block or with short-form lines:
+
+```text
+run_id: run-2026-05-31
+item-001: b - More concrete and easier to execute.
+item-002: tie
+```
+
+Sync comments back into canonical feedback events:
+
+```sh
+gitmoot skillopt feedback github sync \
+  --run run-2026-05-31 \
+  --repo owner/reviews \
+  --issue 42
+```
+
+For PR comment mode, use `--pr 123` instead of `--issue 42`. Sync ignores
+unrelated comments and de-duplicates repeated imports by comment URL.

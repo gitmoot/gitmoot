@@ -39,9 +39,10 @@ type blindAssignment struct {
 }
 
 type feedbackFile struct {
-	RunID    string              `yaml:"run_id"`
-	Reviewer string              `yaml:"reviewer"`
-	Items    []feedbackFileEntry `yaml:"items"`
+	RunID     string              `yaml:"run_id"`
+	Reviewer  string              `yaml:"reviewer"`
+	Items     []feedbackFileEntry `yaml:"items"`
+	ShortForm bool                `yaml:"-"`
 }
 
 type feedbackFileEntry struct {
@@ -74,15 +75,10 @@ func (c MarkdownCollector) WritePacket(ctx context.Context, store *db.Store, run
 	}
 	assignments := assignmentFile{RunID: run.ID}
 	for _, item := range items {
-		baselineArtifactID := strings.TrimSpace(item.BaselineArtifactID)
-		candidateArtifactID := strings.TrimSpace(item.CandidateArtifactID)
-		if baselineArtifactID == "" || candidateArtifactID == "" {
-			return fmt.Errorf("eval review item %s requires both baseline and candidate artifacts", item.ItemID)
+		assignment, err := validatedAssignmentFor(run.ID, item)
+		if err != nil {
+			return err
 		}
-		if baselineArtifactID == candidateArtifactID {
-			return fmt.Errorf("eval review item %s requires distinct baseline and candidate artifacts", item.ItemID)
-		}
-		assignment := assignmentFor(run.ID, item)
 		assignments.Items = append(assignments.Items, assignment)
 		if err := c.writeItem(ctx, store, dir, item, assignment); err != nil {
 			return err
@@ -252,6 +248,18 @@ func assignmentFor(runID string, item db.EvalReviewItem) blindAssignment {
 		assignment.B = item.BaselineArtifactID
 	}
 	return assignment
+}
+
+func validatedAssignmentFor(runID string, item db.EvalReviewItem) (blindAssignment, error) {
+	baselineArtifactID := strings.TrimSpace(item.BaselineArtifactID)
+	candidateArtifactID := strings.TrimSpace(item.CandidateArtifactID)
+	if baselineArtifactID == "" || candidateArtifactID == "" {
+		return blindAssignment{}, fmt.Errorf("eval review item %s requires both baseline and candidate artifacts", item.ItemID)
+	}
+	if baselineArtifactID == candidateArtifactID {
+		return blindAssignment{}, fmt.Errorf("eval review item %s requires distinct baseline and candidate artifacts", item.ItemID)
+	}
+	return assignmentFor(runID, item), nil
 }
 
 func validateAssignmentsAgainstStore(ctx context.Context, store *db.Store, assignments assignmentFile) error {

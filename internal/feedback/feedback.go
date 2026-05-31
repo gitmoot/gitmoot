@@ -14,6 +14,7 @@ const (
 	ChoiceSkip    = "skip"
 
 	SourceMarkdown = "markdown"
+	SourceGitHub   = "github"
 )
 
 var validChoices = map[string]struct{}{

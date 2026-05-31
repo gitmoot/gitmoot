@@ -1764,6 +1764,10 @@ func (f *fakeGitHub) CreatePullRequest(context.Context, github.CreatePullRequest
 	return github.PullRequest{}, errors.New("not implemented")
 }
 
+func (f *fakeGitHub) CreateIssue(context.Context, github.CreateIssueInput) (github.Issue, error) {
+	return github.Issue{}, errors.New("not implemented")
+}
+
 func (f *fakeGitHub) ListIssueComments(_ context.Context, _ github.Repository, issueNumber int64) ([]github.IssueComment, error) {
 	return append([]github.IssueComment(nil), f.comments[issueNumber]...), nil
 }

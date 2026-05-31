@@ -260,6 +260,8 @@ gitmoot skillopt export --run <run-id> [--output training.json]
 gitmoot skillopt import --file candidate.json
 gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>
 gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id> [--reviewer name]
+gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]
+gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)
 ```
 
 `skillopt export` writes a JSON training package with the template snapshot,
@@ -270,3 +272,12 @@ automatically. The Markdown feedback collector writes blind A/B review packets
 with `index.md`, per-item Markdown files, editable `feedback.yml`, and hidden
 assignment metadata that Gitmoot uses to validate the full response and import
 de-blinded canonical feedback events.
+
+The GitHub feedback collector publishes the same blind A/B review packet to a
+new issue by default, or to an existing PR when `--pr <number>` is provided.
+Repository resolution uses `--repo`, then the eval run target repo, then the
+template source repo, then optional `[feedback].repo = "owner/reviews"` in
+Gitmoot config. Reviewers can reply with full YAML or run-scoped short-form
+lines such as `run_id: run-1` followed by `item-001: b - More concrete.`.
+`github sync` imports valid comments into canonical feedback events and ignores
+unrelated comments safely.

@@ -117,6 +117,8 @@ gitmoot skillopt export --run <run-id> [--output training.json]
 gitmoot skillopt import --file candidate.json
 gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>
 gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id>
+gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]
+gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)
 ```
 
 Use `gitmoot daemon start` for the background daemon. Use `gitmoot daemon run`

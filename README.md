@@ -277,11 +277,21 @@ gitmoot skillopt export --run <run-id> --output training.json
 gitmoot skillopt import --file candidate.json
 gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>
 gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id>
+gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]
+gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)
 ```
 
 The export/import boundary lets a future external `gitmoot-skillopt` optimizer
 train on local eval artifacts and return candidate template versions. Imported
 candidates stay pending until a human review workflow promotes them.
+
+Use the GitHub feedback collector when review should happen in an issue or an
+existing PR thread. Reviewers can reply with either the copy-paste YAML block or
+run-scoped short lines such as `run_id: run-1` followed by
+`item-001: b - More concrete.`. Gitmoot imports matching comments into
+canonical feedback events and ignores unrelated comments. Repo selection uses
+`--repo`, then the eval run target repo, then the template source repo, then
+optional `[feedback].repo = "owner/reviews"` in Gitmoot config.
 
 Detailed command coverage lives in
 [skills/gitmoot/references/CLI.md](skills/gitmoot/references/CLI.md).

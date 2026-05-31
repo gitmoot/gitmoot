@@ -20,6 +20,7 @@ type Client interface {
 	ListPullRequests(ctx context.Context, repo Repository, state string) ([]PullRequest, error)
 	GetPullRequest(ctx context.Context, repo Repository, number int64) (PullRequest, error)
 	CreatePullRequest(ctx context.Context, input CreatePullRequestInput) (PullRequest, error)
+	CreateIssue(ctx context.Context, input CreateIssueInput) (Issue, error)
 	ListIssueComments(ctx context.Context, repo Repository, issueNumber int64) ([]IssueComment, error)
 	PostIssueComment(ctx context.Context, repo Repository, issueNumber int64, body string) (IssueComment, error)
 	GetUserPermission(ctx context.Context, repo Repository, username string) (UserPermission, error)
@@ -130,6 +131,19 @@ func (c *IssueComment) UnmarshalJSON(data []byte) error {
 	c.CreatedAt = decoded.CreatedAt
 	c.UpdatedAt = decoded.UpdatedAt
 	return nil
+}
+
+type Issue struct {
+	Number int64  `json:"number"`
+	Title  string `json:"title"`
+	State  string `json:"state"`
+	URL    string `json:"html_url"`
+}
+
+type CreateIssueInput struct {
+	Repo  Repository
+	Title string
+	Body  string
 }
 
 type CreatePullRequestInput struct {
@@ -264,6 +278,15 @@ func (c *GhClient) PostIssueComment(ctx context.Context, repo Repository, issueN
 	var comment IssueComment
 	err := c.apiJSON(ctx, true, &comment, endpoint(repo, "issues", issueNumber, "comments"), "-f", "body="+body)
 	return comment, err
+}
+
+func (c *GhClient) CreateIssue(ctx context.Context, input CreateIssueInput) (Issue, error) {
+	var issue Issue
+	err := c.apiJSON(ctx, true, &issue,
+		endpoint(input.Repo, "issues"),
+		"-f", "title="+input.Title,
+		"-f", "body="+input.Body)
+	return issue, err
 }
 
 func (c *GhClient) GetUserPermission(ctx context.Context, repo Repository, username string) (UserPermission, error) {
@@ -636,6 +659,10 @@ func (NoopClient) GetPullRequest(context.Context, Repository, int64) (PullReques
 
 func (NoopClient) CreatePullRequest(context.Context, CreatePullRequestInput) (PullRequest, error) {
 	return PullRequest{}, errors.ErrUnsupported
+}
+
+func (NoopClient) CreateIssue(context.Context, CreateIssueInput) (Issue, error) {
+	return Issue{}, errors.ErrUnsupported
 }
 
 func (NoopClient) ListIssueComments(context.Context, Repository, int64) ([]IssueComment, error) {
