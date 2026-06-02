@@ -73,6 +73,43 @@ includes `ranked_event_id`, which matches the corresponding
 feedback event so a future optimizer can combine useful traits across multiple
 winning options rather than only copying the top option.
 
+## Ranked Exploration Workflow
+
+Use ranked exploration when the template is still ambiguous and humans need to
+compare meaningfully different directions. Use A/B validation when the question
+is whether a specific candidate should replace the current template.
+
+1. `explore`: generate four to six diverse options for each review item. Ask
+   reviewers to rank every option and name useful and rejected traits. Keep
+   `exploration_level` set to `high` while the best direction is still unclear.
+2. `refine`: use two to three candidates that combine the strongest traits
+   discovered during exploration. Keep asking for rankings and trait notes, but
+   focus the alternatives around the same product/workflow goal.
+3. `distill`: convert accumulated ranked feedback into a candidate template
+   update. This phase should not require broad new directions.
+4. `validate`: compare the current template against the candidate on fresh
+   review items. Use the A/B path by default for final promotion decisions.
+
+`gitmoot skillopt review status --run <run-id>` reports the current mode,
+feedback count, pairwise preference count, ranking stability, and recommended
+next mode. Recommendations are advisory only. Gitmoot does not change the run
+mode, import a candidate, or promote a template automatically.
+
+Phase recommendations intentionally wait until every review item has imported
+feedback. This prevents one heavily reviewed item from advancing a whole run
+while other items are untouched. Blind Markdown and GitHub packets hide
+outcome-bearing recommendation details after feedback exists so later reviewers
+do not see the current winner before responding.
+
+Do not run heavy SkillOpt optimization after every tiny feedback update unless
+the user explicitly wants that. A practical cadence is:
+
+- collect enough rankings to make the status recommendation stable;
+- export the training package;
+- run the external optimizer;
+- import the candidate;
+- review or validate the candidate with fresh items before promotion.
+
 ## Candidate Package
 
 Import a candidate produced by an external optimizer:
@@ -253,6 +290,77 @@ events use `choice: a` for the baseline artifact and `choice: b` for the
 candidate artifact. Each event includes `run_id`, `item_id`, `choice`, optional
 `reasoning`, `reviewer`, `source`, optional `source_url`, and `created_at`.
 
+Generate a local ranked exploration packet by creating a ranked run and adding
+repeated option artifacts:
+
+```sh
+gitmoot skillopt review create \
+  --template landing-page-designer \
+  --repo owner/gitmoot-web \
+  --run landing-page-explore-001 \
+  --mode explore \
+  --exploration-level high \
+  --options 4
+
+gitmoot skillopt review item add \
+  --run landing-page-explore-001 \
+  --item hero-001 \
+  --title "Gitmoot landing page hero" \
+  --option a=previews/hero-a.md \
+  --option b=previews/hero-b.md \
+  --option c=previews/hero-c.md \
+  --option d=previews/hero-d.md \
+  --metadata-json '{"task":"landing-page","preview_url":"https://owner.github.io/gitmoot-previews/hero-001/"}'
+
+gitmoot skillopt feedback markdown export \
+  --run landing-page-explore-001 \
+  --output .gitmoot/evals/landing-page-explore-001
+```
+
+Humans fill ranked feedback with ordered options and trait notes:
+
+```yaml
+run_id: landing-page-explore-001
+reviewer: alice
+items:
+  - item_id: hero-001
+    ranking:
+      - C > A > D > B
+    useful_traits:
+      C:
+        - explains what Gitmoot does before the fold
+      A:
+        - strongest mascot placement
+    rejected_traits:
+      B:
+        - too generic for a developer tool
+    reasoning: C is clearest overall, but A has the better visual identity.
+```
+
+A non-visual text task uses the same structure:
+
+```sh
+gitmoot skillopt review create \
+  --template x-post-writer \
+  --repo owner/content-workflows \
+  --run x-post-style-explore-001 \
+  --mode explore \
+  --options 5
+
+gitmoot skillopt review item add \
+  --run x-post-style-explore-001 \
+  --item thread-hook-001 \
+  --title "Launch-thread opening post" \
+  --option a=posts/hook-a.txt \
+  --option b=posts/hook-b.txt \
+  --option c=posts/hook-c.txt \
+  --option d=posts/hook-d.txt \
+  --option e=posts/hook-e.txt
+```
+
+Rank every option from best to worst and use trait notes for style signals such
+as pacing, specificity, voice, sentence length, and phrases to avoid.
+
 ## GitHub Feedback Collector
 
 Publish a collaborative blind A/B review packet to a new GitHub issue:
@@ -295,6 +403,32 @@ gitmoot skillopt feedback github sync \
 
 For PR comment mode, use `--pr 123` instead of `--issue 42`. Sync ignores
 unrelated comments and de-duplicates repeated imports by comment URL.
+
+Ranked GitHub review uses the same run and item setup as the Markdown ranked
+workflow, then publishes to a review issue or PR:
+
+```sh
+gitmoot skillopt feedback github publish \
+  --run landing-page-explore-001 \
+  --repo owner/gitmoot-previews
+
+gitmoot skillopt feedback github sync \
+  --run landing-page-explore-001 \
+  --repo owner/gitmoot-previews \
+  --issue 42
+```
+
+Reviewers can reply with the YAML ranked block or a short ranking form:
+
+```text
+run_id: landing-page-explore-001
+hero-001 ranking: C > A > D > B
+best traits:
+- C: clearest product explanation
+- A: best mascot placement
+reject:
+- B: too generic
+```
 
 Complete local review path:
 

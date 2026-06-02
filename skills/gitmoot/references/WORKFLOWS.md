@@ -190,6 +190,73 @@ it explicitly:
 gitmoot goal import --file GOAL-feature.md --repo owner/repo
 ```
 
+## SkillOpt Ranked Exploration
+
+Use ranked exploration when a template needs broad search before final
+validation. Keep final promotion decisions on fresh A/B validation items unless
+the user explicitly asks for a different evaluation design.
+
+1. Explore with four to six diverse options per item.
+2. Rank every option and capture useful/rejected traits.
+3. Refine with two to three combined candidates once a direction stabilizes.
+4. Distill the accumulated feedback into a candidate template.
+5. Validate current template vs candidate on fresh A/B items.
+
+Landing-page example:
+
+```sh
+gitmoot skillopt review create \
+  --template landing-page-designer \
+  --repo owner/gitmoot-web \
+  --run landing-page-explore-001 \
+  --mode explore \
+  --exploration-level high \
+  --options 4
+
+gitmoot skillopt review item add \
+  --run landing-page-explore-001 \
+  --item hero-001 \
+  --title "Gitmoot landing page hero" \
+  --option a=previews/hero-a.md \
+  --option b=previews/hero-b.md \
+  --option c=previews/hero-c.md \
+  --option d=previews/hero-d.md
+
+gitmoot skillopt feedback markdown export \
+  --run landing-page-explore-001 \
+  --output .gitmoot/evals/landing-page-explore-001
+```
+
+Non-visual writing tasks use the same shape with text artifacts:
+
+```sh
+gitmoot skillopt review create \
+  --template x-post-writer \
+  --repo owner/content-workflows \
+  --run x-post-style-explore-001 \
+  --mode explore \
+  --options 5
+
+gitmoot skillopt review item add \
+  --run x-post-style-explore-001 \
+  --item thread-hook-001 \
+  --option a=posts/hook-a.txt \
+  --option b=posts/hook-b.txt \
+  --option c=posts/hook-c.txt \
+  --option d=posts/hook-d.txt \
+  --option e=posts/hook-e.txt
+```
+
+After importing feedback, inspect:
+
+```sh
+gitmoot skillopt review status --run landing-page-explore-001
+```
+
+Only run the external optimizer when the user wants a candidate update and the
+status recommendation is stable enough for the current phase. Do not run heavy
+SkillOpt optimization after every tiny feedback round by default.
+
 ## Execution Model
 
 Use `here` when the current chat should answer directly from the Gitmoot skill.
