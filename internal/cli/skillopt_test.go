@@ -6,17 +6,22 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/agenttemplate"
 	"github.com/jerryfane/gitmoot/internal/artifact"
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/github"
+	"github.com/jerryfane/gitmoot/internal/runtime"
 	"github.com/jerryfane/gitmoot/internal/skillopt"
+	"github.com/jerryfane/gitmoot/internal/subprocess"
 )
 
 func TestSkillOptExportAndImportCommands(t *testing.T) {
@@ -721,6 +726,967 @@ func TestGeneratedSkillOptTrainSessionIDIncludesSubsecondEntropy(t *testing.T) {
 	if id == second {
 		t.Fatalf("generated session ids collided: %q", id)
 	}
+}
+
+func TestSkillOptTrainContinueGeneratesOptionsWithManagedAgent(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/workspace.git")
+	t.Chdir(repoDir)
+	itemsPath := writeSkillOptTrainItemsFile(t)
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	template := cliSkillOptTemplate("planner", "Plan the work.")
+	if err := store.UpsertAgentTemplate(context.Background(), template); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after template seed returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"agent", "type", "set", "skillopt-generator",
+		"--home", home,
+		"--runtime", "codex",
+		"--role", "generator",
+		"--max-background", "1",
+		"--capability", "ask",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--session", "landing-train",
+		"--workspace-repo", "owner/workspace",
+		"--request", "Train landing page plans.",
+		"--task-kind", "design",
+		"--mode", "explore",
+		"--options", "2",
+		"--items-file", itemsPath,
+		"--yes",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("train start exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	runner := &agentStartRunner{results: []subprocess.Result{
+		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440201"}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option A\n\nHero with strong product narrative.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option B\n\nDashboard-led layout with proof metrics.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option A\n\nCheckout analytics proof block.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option B\n\nLifecycle commerce story with motion notes.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+	}}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{"skillopt", "train", "continue", "--home", home, "--session", "landing-train"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{
+		"current_phase: options_generated",
+		"continue_ready: true",
+		"generated_options: 4",
+		"jobs: 4",
+		"generator_agent: skillopt-generator-bg-",
+		"generator_runtime: codex",
+		"next: publish the human review packet",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("train continue stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+	if len(runner.calls) != 5 {
+		t.Fatalf("runtime calls = %+v, want start plus four deliveries", runner.calls)
+	}
+	runner.want(t, 0, repoDir, "codex", "exec", "--json", "--")
+	runner.want(t, 1, repoDir, "codex", "exec", "resume", "550e8400-e29b-41d4-a716-446655440201", "--")
+	if !strings.Contains(runner.calls[1].args[len(runner.calls[1].args)-1], "Option label: A") || !strings.Contains(runner.calls[1].args[len(runner.calls[1].args)-1], "Generate one review option") {
+		t.Fatalf("generation prompt = %q", runner.calls[1].args[len(runner.calls[1].args)-1])
+	}
+
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "landing-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+	if iteration.State != skillopt.TrainStateOptionsGenerated || !strings.Contains(iteration.MetadataJSON, `"status":"succeeded"`) || !strings.Contains(iteration.MetadataJSON, `"prompts"`) {
+		t.Fatalf("iteration after continue = %+v metadata=%s", iteration, iteration.MetadataJSON)
+	}
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	if len(jobs) != 4 {
+		t.Fatalf("jobs = %+v, want four generated jobs", jobs)
+	}
+	for _, job := range jobs {
+		payload, err := daemonJobPayload(job)
+		if err != nil {
+			t.Fatalf("daemonJobPayload returned error: %v", err)
+		}
+		if payload.Repo != "owner/workspace" {
+			t.Fatalf("generated job repo = %q, want owner/workspace", payload.Repo)
+		}
+	}
+	items, err := store.ListEvalReviewItems(context.Background(), "landing-train-review-001")
+	if err != nil {
+		t.Fatalf("ListEvalReviewItems returned error: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %+v", items)
+	}
+	for _, item := range items {
+		options, err := store.ListEvalReviewOptions(context.Background(), "landing-train-review-001", item.ItemID)
+		if err != nil {
+			t.Fatalf("ListEvalReviewOptions %s returned error: %v", item.ItemID, err)
+		}
+		if len(options) != 2 || options[0].Label != "a" || options[1].Label != "b" {
+			t.Fatalf("options for %s = %+v", item.ItemID, options)
+		}
+		artifactRecord, err := store.GetEvalArtifact(context.Background(), options[0].ArtifactID)
+		if err != nil {
+			t.Fatalf("GetEvalArtifact %s returned error: %v", options[0].ArtifactID, err)
+		}
+		if artifactRecord.MediaType != "text/markdown" || artifactRecord.Driver != "text" || !strings.Contains(options[0].MetadataJSON, `"job_id"`) {
+			t.Fatalf("artifact=%+v option=%+v", artifactRecord, options[0])
+		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "train", "continue", "--home", home, "--session", "landing-train"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("second train continue exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "continue_ready: false") || !strings.Contains(stdout.String(), "options already generated") {
+		t.Fatalf("second continue stdout = %q", stdout.String())
+	}
+}
+
+func TestSkillOptTrainContinueRejectsNonImplementedGenerationResult(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/workspace.git")
+	t.Chdir(repoDir)
+	itemsPath := writeSkillOptTrainItemsFile(t)
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	if err := store.UpsertAgentTemplate(context.Background(), cliSkillOptTemplate("planner", "Plan the work.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after template seed returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"agent", "type", "set", "skillopt-generator",
+		"--home", home,
+		"--runtime", "codex",
+		"--role", "generator",
+		"--max-background", "1",
+		"--capability", "ask",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--session", "landing-train",
+		"--workspace-repo", "owner/workspace",
+		"--request", "Train landing page plans.",
+		"--task-kind", "design",
+		"--mode", "explore",
+		"--options", "2",
+		"--items-file", itemsPath,
+		"--yes",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("train start exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	runner := &agentStartRunner{results: []subprocess.Result{
+		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440401"}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"changes_requested","summary":"This is a review finding, not generated content.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"changes_requested","summary":"This is still a review finding, not generated content.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+	}}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{"skillopt", "train", "continue", "--home", home, "--session", "landing-train"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("train continue exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "returned changes_requested, want implemented") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "landing-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+	if iteration.State != skillopt.TrainStateItemsReady || !strings.Contains(iteration.MetadataJSON, `"status":"failed"`) {
+		t.Fatalf("iteration after failure = %+v metadata=%s", iteration, iteration.MetadataJSON)
+	}
+	options, err := store.ListEvalReviewOptions(context.Background(), "landing-train-review-001", "hero-saas")
+	if err != nil {
+		t.Fatalf("ListEvalReviewOptions returned error: %v", err)
+	}
+	if len(options) != 0 {
+		t.Fatalf("non-generation decision persisted options: %+v", options)
+	}
+}
+
+func TestSkillOptTrainContinueRefusesConcurrentGeneration(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/workspace.git")
+	t.Chdir(repoDir)
+	itemsPath := writeSkillOptTrainItemsFile(t)
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	if err := store.UpsertAgentTemplate(context.Background(), cliSkillOptTemplate("planner", "Plan the work.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after template seed returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--session", "landing-train",
+		"--workspace-repo", "owner/workspace",
+		"--request", "Train landing page plans.",
+		"--task-kind", "design",
+		"--mode", "explore",
+		"--options", "2",
+		"--items-file", itemsPath,
+		"--yes",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("train start exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	store = openCLIJobStore(t, home)
+	acquired, err := store.AcquireResourceLock(context.Background(), db.ResourceLock{
+		ResourceKey: skillOptTrainGenerationLockKey("landing-train", "landing-train-001"),
+		OwnerJobID:  "test-concurrent-continue",
+		OwnerToken:  "test-token",
+		ExpiresAt:   time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano),
+	}, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("AcquireResourceLock returned error: %v", err)
+	}
+	if !acquired {
+		t.Fatal("AcquireResourceLock did not acquire generation lock")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close before continue returned error: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{"skillopt", "train", "continue", "--home", home, "--session", "landing-train"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("train continue exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "skillopt train generation is already running") {
+		t.Fatalf("train continue stderr = %q", stderr.String())
+	}
+
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "landing-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+	if iteration.State != skillopt.TrainStateItemsReady {
+		t.Fatalf("iteration state = %s, want %s", iteration.State, skillopt.TrainStateItemsReady)
+	}
+	if strings.Contains(iteration.MetadataJSON, `"status":"failed"`) {
+		t.Fatalf("busy generation lock recorded failed metadata: %s", iteration.MetadataJSON)
+	}
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("busy generation lock dispatched jobs: %+v", jobs)
+	}
+}
+
+func TestSkillOptTrainGenerationLockTTLScalesWithWorkload(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"agent", "type", "set", "skillopt-generator",
+		"--home", home,
+		"--runtime", "codex",
+		"--role", "generator",
+		"--max-background", "2",
+		"--job-timeout", "45m",
+		"--capability", "ask",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if err := store.UpsertEvalRun(context.Background(), db.EvalRun{
+		ID:               "landing-train-review-001",
+		Mode:             db.EvalRunModeExplore,
+		ExplorationLevel: db.ExplorationLevelHigh,
+		OptionsCount:     4,
+	}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+	for index := 0; index < 7; index++ {
+		itemID := fmt.Sprintf("item-%03d", index+1)
+		if err := store.UpsertEvalReviewItem(context.Background(), db.EvalReviewItem{
+			RunID:  "landing-train-review-001",
+			ItemID: itemID,
+			Title:  itemID,
+		}); err != nil {
+			t.Fatalf("UpsertEvalReviewItem returned error: %v", err)
+		}
+	}
+	ttl, err := estimateSkillOptTrainGenerationLockTTL(context.Background(), store, skillOptTrainContinueRequest{Home: home, GeneratorType: "skillopt-generator"}, db.SkillOptTrainIteration{
+		EvalRunID: "landing-train-review-001",
+	})
+	if err != nil {
+		t.Fatalf("estimateSkillOptTrainGenerationLockTTL returned error: %v", err)
+	}
+	want := 16*45*time.Minute + skillOptTrainGenerationLockBuffer
+	if ttl != want {
+		t.Fatalf("ttl = %s, want %s", ttl, want)
+	}
+	if ttl <= skillOptTrainGenerationLockTTL {
+		t.Fatalf("ttl = %s, want greater than fixed minimum %s", ttl, skillOptTrainGenerationLockTTL)
+	}
+}
+
+func TestSkillOptTrainContinueRecoversCompleteGeneratedOptions(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/workspace.git")
+	t.Chdir(repoDir)
+	itemsPath := writeSkillOptTrainItemsFile(t)
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	if err := store.UpsertAgentTemplate(context.Background(), cliSkillOptTemplate("planner", "Plan the work.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after template seed returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--session", "landing-train",
+		"--workspace-repo", "owner/workspace",
+		"--request", "Train landing page plans.",
+		"--task-kind", "design",
+		"--mode", "explore",
+		"--options", "2",
+		"--items-file", itemsPath,
+		"--yes",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("train start exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	store = openCLIJobStore(t, home)
+	blobStore := artifact.NewStore(paths.ArtifactBlobs)
+	items, err := store.ListEvalReviewItems(context.Background(), "landing-train-review-001")
+	if err != nil {
+		t.Fatalf("ListEvalReviewItems returned error: %v", err)
+	}
+	writes := make([]db.EvalReviewGenerationWrite, 0, len(items))
+	for _, item := range items {
+		var artifacts []db.EvalArtifact
+		var options []db.EvalReviewOption
+		for _, label := range []string{"a", "b"} {
+			artifactRecord, err := prepareReviewItemContentArtifact(blobStore, "landing-train-review-001", item.ItemID, "option-"+label, []byte("existing option "+label), "text/markdown", "text")
+			if err != nil {
+				t.Fatalf("prepareReviewItemContentArtifact returned error: %v", err)
+			}
+			artifacts = append(artifacts, artifactRecord)
+			options = append(options, db.EvalReviewOption{
+				RunID:      "landing-train-review-001",
+				ItemID:     item.ItemID,
+				Label:      label,
+				ArtifactID: artifactRecord.ID,
+				Role:       "option",
+			})
+		}
+		writes = append(writes, db.EvalReviewGenerationWrite{
+			ItemID:    item.ItemID,
+			Artifacts: artifacts,
+			Options:   options,
+		})
+	}
+	if err := store.ReplaceGeneratedEvalReviewArtifacts(context.Background(), "landing-train-review-001", writes); err != nil {
+		t.Fatalf("ReplaceGeneratedEvalReviewArtifacts returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after generated option seed returned error: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{"skillopt", "train", "continue", "--home", home, "--session", "landing-train"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue recovery exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "current_phase: options_generated") || !strings.Contains(stdout.String(), "generated_options: 4") {
+		t.Fatalf("train continue recovery stdout = %s", stdout.String())
+	}
+
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "landing-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+	if iteration.State != skillopt.TrainStateOptionsGenerated || !strings.Contains(iteration.MetadataJSON, `"status":"recovered"`) {
+		t.Fatalf("iteration after recovery = %+v metadata=%s", iteration, iteration.MetadataJSON)
+	}
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("recovery should not create generation jobs: %+v", jobs)
+	}
+}
+
+func TestSkillOptTrainContinueUsesManagedGeneratorConcurrency(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/workspace.git")
+	t.Chdir(repoDir)
+	itemsPath := writeSkillOptTrainItemsFile(t)
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	if err := store.UpsertAgentTemplate(context.Background(), cliSkillOptTemplate("planner", "Plan the work.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after template seed returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"agent", "type", "set", "skillopt-generator",
+		"--home", home,
+		"--runtime", "codex",
+		"--role", "generator",
+		"--max-background", "2",
+		"--capability", "ask",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--session", "landing-train",
+		"--workspace-repo", "owner/workspace",
+		"--request", "Train landing page plans.",
+		"--task-kind", "design",
+		"--mode", "explore",
+		"--options", "2",
+		"--items-file", itemsPath,
+		"--yes",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("train start exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	runner := &skillOptConcurrentGenerationRunner{startDelay: 300 * time.Millisecond}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{"skillopt", "train", "continue", "--home", home, "--session", "landing-train"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "current_phase: options_generated") || !strings.Contains(stdout.String(), "generated_options: 4") {
+		t.Fatalf("train continue stdout = %s", stdout.String())
+	}
+	if runner.maxActiveResumes < 2 {
+		t.Fatalf("max active resume calls = %d, want at least 2; calls=%+v", runner.maxActiveResumes, runner.calls)
+	}
+	if runner.startCalls < 2 {
+		t.Fatalf("start calls = %d, want at least two managed instances", runner.startCalls)
+	}
+}
+
+func TestSkillOptTrainContinueUsesRegisteredWorkspaceRepoCheckout(t *testing.T) {
+	home := t.TempDir()
+	targetDir := t.TempDir()
+	runGit(t, targetDir, "init")
+	runGit(t, targetDir, "branch", "-m", "main")
+	runGit(t, targetDir, "remote", "add", "origin", "https://github.com/owner/product.git")
+	workspaceDir := t.TempDir()
+	runGit(t, workspaceDir, "init")
+	runGit(t, workspaceDir, "branch", "-m", "main")
+	runGit(t, workspaceDir, "remote", "add", "origin", "https://github.com/owner/workspace.git")
+	t.Chdir(targetDir)
+	itemsPath := writeSkillOptTrainItemsFile(t)
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	if err := store.UpsertAgentTemplate(context.Background(), cliSkillOptTemplate("planner", "Plan the work.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after template seed returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"agent", "type", "set", "skillopt-generator",
+		"--home", home,
+		"--runtime", "codex",
+		"--role", "generator",
+		"--max-background", "1",
+		"--capability", "ask",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--session", "landing-train",
+		"--workspace-repo", "owner/workspace",
+		"--request", "Train landing page plans.",
+		"--task-kind", "design",
+		"--mode", "explore",
+		"--options", "2",
+		"--items-file", itemsPath,
+		"--yes",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("train start exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{"skillopt", "train", "continue", "--home", home, "--session", "landing-train"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("train continue without workspace checkout exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "gitmoot repo add owner/workspace --path /path/to/checkout") {
+		t.Fatalf("stderr did not explain workspace registration:\n%s", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"repo", "add", "owner/workspace", "--home", home, "--path", workspaceDir}, &stdout, &stderr); code != 0 {
+		t.Fatalf("repo add exit code = %d, stderr=%s", code, stderr.String())
+	}
+	runner := &agentStartRunner{results: []subprocess.Result{
+		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440401"}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option A\n\nWorkspace hero A.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option B\n\nWorkspace hero B.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option A\n\nWorkspace proof A.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option B\n\nWorkspace proof B.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+	}}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "train", "continue", "--home", home, "--session", "landing-train"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue with workspace checkout exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "current_phase: options_generated") {
+		t.Fatalf("train continue stdout = %s", stdout.String())
+	}
+	runner.want(t, 0, workspaceDir, "codex", "exec", "--json", "--")
+}
+
+func TestBuildSkillOptTrainGenerationPromptHonorsExplicitLowExploration(t *testing.T) {
+	prompt := buildSkillOptTrainGenerationPrompt(
+		db.SkillOptTrainSession{
+			ID:             "landing-train",
+			RequestSummary: "Train landing page outputs.",
+		},
+		db.SkillOptTrainIteration{ID: "landing-train-001"},
+		db.EvalRun{
+			ID:               "landing-train-review-001",
+			Mode:             db.EvalRunModeExplore,
+			ExplorationLevel: db.ExplorationLevelLow,
+			OptionsCount:     4,
+		},
+		db.EvalReviewItem{
+			ItemID: "hero-saas",
+			Title:  "SaaS hero",
+		},
+		"a",
+		true,
+	)
+	if strings.Contains(prompt, "Use high exploration") {
+		t.Fatalf("low exploration prompt included high exploration rule:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "Use low exploration") {
+		t.Fatalf("low exploration prompt missing low exploration rule:\n%s", prompt)
+	}
+}
+
+func TestSkillOptTrainContinueGeneratesValidateArtifacts(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/workspace.git")
+	t.Chdir(repoDir)
+	itemsPath := writeSkillOptTrainItemsFile(t)
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	if err := store.UpsertAgentTemplate(context.Background(), cliSkillOptTemplate("planner", "Plan the work.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after template seed returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"agent", "type", "set", "skillopt-generator",
+		"--home", home,
+		"--runtime", "codex",
+		"--role", "generator",
+		"--max-background", "1",
+		"--capability", "ask",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--session", "validate-train",
+		"--workspace-repo", "owner/workspace",
+		"--request", "Train validation comparisons.",
+		"--mode", "validate",
+		"--items-file", itemsPath,
+		"--yes",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("train start exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	runner := &agentStartRunner{results: []subprocess.Result{
+		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440301"}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Baseline\n\nConventional hero.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Candidate\n\nImproved hero.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Baseline\n\nConventional proof.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Candidate\n\nImproved proof.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+	}}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{"skillopt", "train", "continue", "--home", home, "--session", "validate-train"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{
+		"current_phase: options_generated",
+		"generated_options: 4",
+		"generator_runtime: codex",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("train continue stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+	if len(runner.calls) != 5 {
+		t.Fatalf("runtime calls = %+v, want start plus four deliveries", runner.calls)
+	}
+	if !strings.Contains(runner.calls[1].args[len(runner.calls[1].args)-1], "A/B artifact role: baseline") {
+		t.Fatalf("baseline prompt = %q", runner.calls[1].args[len(runner.calls[1].args)-1])
+	}
+	if !strings.Contains(runner.calls[2].args[len(runner.calls[2].args)-1], "A/B artifact role: candidate") {
+		t.Fatalf("candidate prompt = %q", runner.calls[2].args[len(runner.calls[2].args)-1])
+	}
+
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+	items, err := store.ListEvalReviewItems(context.Background(), "validate-train-review-001")
+	if err != nil {
+		t.Fatalf("ListEvalReviewItems returned error: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %+v", items)
+	}
+	for _, item := range items {
+		if item.BaselineArtifactID == "" || item.CandidateArtifactID == "" {
+			t.Fatalf("validate item missing A/B artifacts: %+v", item)
+		}
+		options, err := store.ListEvalReviewOptions(context.Background(), "validate-train-review-001", item.ItemID)
+		if err != nil {
+			t.Fatalf("ListEvalReviewOptions %s returned error: %v", item.ItemID, err)
+		}
+		if len(options) != 0 {
+			t.Fatalf("validate item should not have ranked options: %+v", options)
+		}
+		if _, err := store.GetEvalArtifact(context.Background(), item.BaselineArtifactID); err != nil {
+			t.Fatalf("GetEvalArtifact baseline returned error: %v", err)
+		}
+		if _, err := store.GetEvalArtifact(context.Background(), item.CandidateArtifactID); err != nil {
+			t.Fatalf("GetEvalArtifact candidate returned error: %v", err)
+		}
+	}
+}
+
+func TestSkillOptTrainContinueRecordsGenerationFailureWithoutOptions(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/workspace.git")
+	t.Chdir(repoDir)
+	itemsPath := writeSkillOptTrainItemsFile(t)
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	if err := store.UpsertAgentTemplate(context.Background(), cliSkillOptTemplate("planner", "Plan the work.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after template seed returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--session", "landing-train",
+		"--workspace-repo", "owner/workspace",
+		"--request", "Train landing page plans.",
+		"--task-kind", "design",
+		"--mode", "explore",
+		"--options", "2",
+		"--items-file", itemsPath,
+		"--yes",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("train start exit code = %d, stderr=%s", code, stderr.String())
+	}
+	runner := &agentStartRunner{}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{"skillopt", "train", "continue", "--home", home, "--session", "landing-train"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("train continue without generator exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `agent "skillopt-generator" not found`) {
+		t.Fatalf("continue failure stderr = %q", stderr.String())
+	}
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "landing-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+	if iteration.State != skillopt.TrainStateItemsReady || !strings.Contains(iteration.MetadataJSON, `"status":"failed"`) {
+		t.Fatalf("iteration after failure = %+v metadata=%s", iteration, iteration.MetadataJSON)
+	}
+	items, err := store.ListEvalReviewItems(context.Background(), "landing-train-review-001")
+	if err != nil {
+		t.Fatalf("ListEvalReviewItems returned error: %v", err)
+	}
+	for _, item := range items {
+		options, err := store.ListEvalReviewOptions(context.Background(), "landing-train-review-001", item.ItemID)
+		if err != nil {
+			t.Fatalf("ListEvalReviewOptions %s returned error: %v", item.ItemID, err)
+		}
+		if len(options) != 0 {
+			t.Fatalf("failure persisted options for %s: %+v", item.ItemID, options)
+		}
+	}
+}
+
+type skillOptConcurrentGenerationRunner struct {
+	mu               sync.Mutex
+	calls            []agentStartCall
+	startCalls       int
+	activeResumes    int
+	maxActiveResumes int
+	startDelay       time.Duration
+}
+
+func (r *skillOptConcurrentGenerationRunner) Run(_ context.Context, dir string, command string, args ...string) (subprocess.Result, error) {
+	r.mu.Lock()
+	r.calls = append(r.calls, agentStartCall{dir: dir, command: command, args: append([]string{}, args...)})
+	isResume := false
+	isStart := false
+	for _, arg := range args {
+		if arg == "resume" {
+			isResume = true
+		}
+		if arg == "--json" {
+			isStart = true
+		}
+	}
+	if isStart && !isResume {
+		r.startCalls++
+		threadID := fmt.Sprintf("550e8400-e29b-41d4-a716-%012d", 446655440500+r.startCalls)
+		startDelay := r.startDelay
+		r.mu.Unlock()
+		if startDelay > 0 {
+			time.Sleep(startDelay)
+		}
+		return subprocess.Result{Command: command, Args: args, Stdout: fmt.Sprintf(`{"type":"thread.started","thread_id":"%s"}`+"\n", threadID)}, nil
+	}
+	if isResume {
+		r.activeResumes++
+		if r.activeResumes > r.maxActiveResumes {
+			r.maxActiveResumes = r.activeResumes
+		}
+		r.mu.Unlock()
+		time.Sleep(750 * time.Millisecond)
+		r.mu.Lock()
+		r.activeResumes--
+		r.mu.Unlock()
+		prompt := ""
+		if len(args) > 0 {
+			prompt = args[len(args)-1]
+		}
+		summary := "# Generated option\n\n" + strings.Split(prompt, "\n")[0]
+		return subprocess.Result{Command: command, Args: args, Stdout: fmt.Sprintf(`{"gitmoot_result":{"decision":"implemented","summary":%q,"findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`+"\n", summary)}, nil
+	}
+	r.mu.Unlock()
+	return subprocess.Result{Command: command, Args: args}, nil
+}
+
+func (r *skillOptConcurrentGenerationRunner) LookPath(file string) (string, error) {
+	if file == "" {
+		return "", errors.New("empty file")
+	}
+	return "/usr/bin/" + file, nil
+}
+
+func writeSkillOptTrainItemsFile(t *testing.T) string {
+	t.Helper()
+	itemsPath := filepath.Join(t.TempDir(), "items.yml")
+	if err := os.WriteFile(itemsPath, []byte(`items:
+  - item_id: hero-saas
+    title: SaaS hero
+    brief: Design a landing page hero for a workflow SaaS product.
+    target_audience: founders
+    output_type: vue landing page
+    artifact_hints:
+      - clickable preview
+  - item_id: ecommerce-proof
+    title: Ecommerce proof section
+    brief: Design a social proof section for an ecommerce analytics product.
+    target_audience: growth teams
+    output_type: vue landing page
+`), 0o644); err != nil {
+		t.Fatalf("write items file: %v", err)
+	}
+	return itemsPath
 }
 
 func TestSkillOptTrainStartDryRunDoesNotInitializeFreshHome(t *testing.T) {

@@ -20,13 +20,14 @@ import (
 )
 
 type localAgentDispatchRequest struct {
-	RepoFlag     string
-	Agent        string
-	Action       string
-	Instructions string
-	Background   bool
-	Type         string
-	Home         string
+	RepoFlag         string
+	Agent            string
+	Action           string
+	Instructions     string
+	Background       bool
+	Type             string
+	Home             string
+	AllowManagedSync bool
 }
 
 type localAgentJobOutput struct {
@@ -53,8 +54,19 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
+	reservationReleased := false
+	releaseReservation := func(releaseCtx context.Context) error {
+		if reservationReleased {
+			return nil
+		}
+		if err := releaseAgentReservation(releaseCtx); err != nil {
+			return err
+		}
+		reservationReleased = true
+		return nil
+	}
 	defer func() {
-		_ = releaseAgentReservation(context.Background())
+		_ = releaseReservation(context.Background())
 	}()
 	if err := ensureLocalAgentAccess(ctx, store, agent, repo.FullName(), request.Action); err != nil {
 		return localAgentJobOutput{}, err
@@ -71,6 +83,9 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
+	if err := releaseReservation(ctx); err != nil {
+		return localAgentJobOutput{}, err
+	}
 	if request.Background {
 		return localAgentJobOutput{
 			JobID:          job.ID,
@@ -81,11 +96,15 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			RawOutputCount: 0,
 		}, nil
 	}
-	adapter, err := runtimeStartAdapter(newRuntimeFactory(), agent.Runtime, record.CheckoutPath)
+	managed, err := localManagedAgentDispatchConfigForAgent(ctx, store, request.Home, agent.Name)
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
-	releaseLock, acquired, lockKey, err := acquireRuntimeSessionLock(ctx, store, job.ID, runtimeAgent(agent), time.Now().UTC(), daemonRunningJobStaleAfter)
+	lockTTL := daemonRunningJobStaleAfter
+	if managed.OK {
+		lockTTL = managed.JobTimeout
+	}
+	releaseLock, acquired, lockKey, err := acquireRuntimeSessionLock(ctx, store, job.ID, runtimeAgent(agent), time.Now().UTC(), lockTTL)
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
@@ -102,7 +121,24 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	defer func() {
 		_ = releaseLock(context.Background())
 	}()
-	if _, err := (workflow.Mailbox{Store: store}).Run(ctx, job.ID, runtimeAgent(agent), adapter); err != nil {
+	adapter, err := runtimeStartAdapter(newRuntimeFactory(), agent.Runtime, record.CheckoutPath)
+	if err != nil {
+		return localAgentJobOutput{}, err
+	}
+	runCtx := ctx
+	if managed.OK {
+		now := time.Now().UTC()
+		if err := store.MarkAgentInstanceRunning(ctx, agent.Name, now, managed.JobTimeout); err != nil {
+			return localAgentJobOutput{}, err
+		}
+		defer func() {
+			_ = store.TouchAgentInstance(context.Background(), agent.Name, time.Now().UTC(), managed.IdleTimeout)
+		}()
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(ctx, managed.JobTimeout)
+		defer cancel()
+	}
+	if _, err := (workflow.Mailbox{Store: store}).Run(runCtx, job.ID, runtimeAgent(agent), adapter); err != nil {
 		return localAgentJobOutput{}, err
 	}
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_completed", Message: "workflow advancement completed"}); err != nil {
@@ -138,7 +174,7 @@ func resolveLocalDispatchAgent(ctx context.Context, store *db.Store, request loc
 			return db.Agent{}, noopAgentReservationRelease, err
 		}
 	}
-	if !request.Background {
+	if !request.Background && !request.AllowManagedSync {
 		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("agent %q not found", request.Agent)
 	}
 	typeName := firstNonEmpty(forceType, request.Agent)
@@ -147,6 +183,39 @@ func resolveLocalDispatchAgent(ctx context.Context, store *db.Store, request loc
 
 func noopAgentReservationRelease(context.Context) error {
 	return nil
+}
+
+type localManagedAgentDispatchConfig struct {
+	OK          bool
+	IdleTimeout time.Duration
+	JobTimeout  time.Duration
+}
+
+func localManagedAgentDispatchConfigForAgent(ctx context.Context, store *db.Store, home string, agentName string) (localManagedAgentDispatchConfig, error) {
+	instance, err := store.GetAgentInstance(ctx, agentName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return localManagedAgentDispatchConfig{}, nil
+	}
+	if err != nil {
+		return localManagedAgentDispatchConfig{}, err
+	}
+	types, err := loadAgentTypeConfig(home)
+	if err != nil {
+		return localManagedAgentDispatchConfig{}, err
+	}
+	agentType, ok := types[instance.Type]
+	if !ok {
+		return localManagedAgentDispatchConfig{}, fmt.Errorf("agent type %s not found for managed agent %s", instance.Type, agentName)
+	}
+	idleTimeout, err := time.ParseDuration(agentType.IdleTimeout)
+	if err != nil {
+		return localManagedAgentDispatchConfig{}, fmt.Errorf("agent type %s idle_timeout: %w", instance.Type, err)
+	}
+	jobTimeout, err := time.ParseDuration(agentType.JobTimeout)
+	if err != nil {
+		return localManagedAgentDispatchConfig{}, fmt.Errorf("agent type %s job_timeout: %w", instance.Type, err)
+	}
+	return localManagedAgentDispatchConfig{OK: true, IdleTimeout: idleTimeout, JobTimeout: jobTimeout}, nil
 }
 
 func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home string, typeName string, repo string, record db.Repo) (db.Agent, func(context.Context) error, error) {
@@ -162,14 +231,19 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 	if err != nil {
 		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("agent type %s idle_timeout: %w", typeName, err)
 	}
+	jobTimeout, err := time.ParseDuration(agentType.JobTimeout)
+	if err != nil {
+		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("agent type %s job_timeout: %w", typeName, err)
+	}
 	now := time.Now().UTC()
-	releaseTypeLock, acquiredTypeLock, typeLockKey, err := acquireManagedAgentTypeLock(ctx, store, typeName, now, daemonRunningJobStaleAfter)
+	releaseTypeLock, acquiredTypeLock, typeLockKey, err := acquireManagedAgentTypeLockWithWait(ctx, store, typeName, daemonRunningJobStaleAfter, jobTimeout)
 	if err != nil {
 		return db.Agent{}, noopAgentReservationRelease, err
 	}
 	if !acquiredTypeLock {
 		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("managed agent type %s is busy reserving %s", typeName, typeLockKey)
 	}
+	now = time.Now().UTC()
 	releaseOnError := true
 	defer func() {
 		if releaseOnError {
@@ -198,6 +272,9 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 		if err != nil {
 			return db.Agent{}, noopAgentReservationRelease, err
 		}
+		if ok && strings.TrimSpace(instance.State) == "starting" {
+			return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("managed agent type %s reached max_background while instances are still starting", typeName)
+		}
 		if ok {
 			agent, err := store.GetAgent(ctx, instance.Name)
 			if err != nil {
@@ -221,12 +298,36 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 	if err != nil {
 		return db.Agent{}, noopAgentReservationRelease, err
 	}
+	reservedInstance := db.AgentInstance{
+		Name:         instanceAgent.Name,
+		Type:         agentType.Name,
+		Runtime:      instanceAgent.Runtime,
+		RuntimeRef:   "starting:" + instanceAgent.Name,
+		RepoFullName: repo,
+		Role:         instanceAgent.Role,
+		TemplateID:   instanceAgent.TemplateID,
+		Capabilities: instanceAgent.Capabilities,
+		State:        "starting",
+		CreatedAt:    formatManagedAgentTime(now),
+		LastUsedAt:   formatManagedAgentTime(now),
+		ExpiresAt:    formatManagedAgentTime(now.Add(jobTimeout)),
+	}
+	if err := store.UpsertAgentInstance(ctx, reservedInstance); err != nil {
+		return db.Agent{}, noopAgentReservationRelease, err
+	}
+	if err := releaseTypeLock(ctx); err != nil {
+		_ = store.DeleteAgentInstance(context.Background(), reservedInstance.Name)
+		return db.Agent{}, noopAgentReservationRelease, err
+	}
+	releaseOnError = false
 	started, err := adapter.Start(ctx, runtime.StartRequest{Agent: instanceAgent, Prompt: agentStartupPrompt(instanceAgent, cachedTemplate)})
 	if err != nil {
+		_ = store.DeleteAgentInstance(context.Background(), reservedInstance.Name)
 		return db.Agent{}, noopAgentReservationRelease, err
 	}
 	instanceAgent.RuntimeRef = strings.TrimSpace(started.RuntimeRef)
 	if err := runtime.ValidateAgent(instanceAgent); err != nil {
+		_ = store.DeleteAgentInstance(context.Background(), reservedInstance.Name)
 		return db.Agent{}, noopAgentReservationRelease, err
 	}
 	instance := db.AgentInstance{
@@ -238,20 +339,50 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 		Role:         instanceAgent.Role,
 		TemplateID:   instanceAgent.TemplateID,
 		Capabilities: instanceAgent.Capabilities,
-		State:        "idle",
+		State:        "starting",
 		CreatedAt:    formatManagedAgentTime(now),
 		LastUsedAt:   formatManagedAgentTime(now),
-		ExpiresAt:    formatManagedAgentTime(now.Add(idleTimeout)),
+		ExpiresAt:    formatManagedAgentTime(now.Add(jobTimeout)),
 	}
 	if err := store.UpsertAgentInstance(ctx, instance); err != nil {
+		_ = store.DeleteAgentInstance(context.Background(), reservedInstance.Name)
 		return db.Agent{}, noopAgentReservationRelease, err
 	}
 	agent, err := store.GetAgent(ctx, instance.Name)
 	if err != nil {
 		return db.Agent{}, noopAgentReservationRelease, err
 	}
-	releaseOnError = false
-	return agent, releaseTypeLock, nil
+	return agent, func(releaseCtx context.Context) error {
+		return store.TouchAgentInstance(releaseCtx, instance.Name, time.Now().UTC(), idleTimeout)
+	}, nil
+}
+
+func acquireManagedAgentTypeLockWithWait(ctx context.Context, store *db.Store, typeName string, ttl time.Duration, waitTimeout time.Duration) (func(context.Context) error, bool, string, error) {
+	if waitTimeout <= 0 {
+		waitTimeout = ttl
+	}
+	deadline := time.Now().UTC().Add(waitTimeout)
+	var lastKey string
+	for {
+		release, acquired, key, err := acquireManagedAgentTypeLock(ctx, store, typeName, time.Now().UTC(), ttl)
+		lastKey = key
+		if err != nil || acquired {
+			return release, acquired, key, err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return noopAgentReservationRelease, false, firstNonEmpty(lastKey, "agent-type:"+typeName), nil
+		}
+		sleep := 100 * time.Millisecond
+		if remaining < sleep {
+			sleep = remaining
+		}
+		select {
+		case <-ctx.Done():
+			return release, false, key, ctx.Err()
+		case <-time.After(sleep):
+		}
+	}
 }
 
 func acquireManagedAgentTypeLock(ctx context.Context, store *db.Store, typeName string, now time.Time, ttl time.Duration) (func(context.Context) error, bool, string, error) {

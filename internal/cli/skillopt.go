@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/feedback"
+	gitutil "github.com/jerryfane/gitmoot/internal/git"
 	"github.com/jerryfane/gitmoot/internal/github"
 	"github.com/jerryfane/gitmoot/internal/skillopt"
 	"gopkg.in/yaml.v3"
@@ -71,7 +73,7 @@ func printSkillOptUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)")
 	fmt.Fprintln(w, "  gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file path [--yes]")
 	fmt.Fprintln(w, "  gitmoot skillopt train status --session <id>")
-	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id>")
+	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name]")
 	fmt.Fprintln(w, "  gitmoot skillopt train stop --session <id> --reason <text>")
 }
 
@@ -100,7 +102,7 @@ func printSkillOptTrainUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file path [--session <id>] [--workspace-repo owner/repo] [--preview-repo owner/repo] [--request-file path] [--task-kind kind] [--mode explore|refine|distill|validate] [--exploration-level high|medium|low] [--options N] [--min-items N] [--preferred-gate hard|soft|hard_then_soft] [--dry-run] [--yes]")
 	fmt.Fprintln(w, "  gitmoot skillopt train status --session <id>")
-	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id>")
+	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name]")
 	fmt.Fprintln(w, "  gitmoot skillopt train stop --session <id> --reason <text>")
 }
 
@@ -380,6 +382,8 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	sessionID := fs.String("session", "", "train session id")
+	generatorAgent := fs.String("generator-agent", "", "existing agent to use for option generation")
+	generatorType := fs.String("generator-type", "", "managed agent type to use for option generation; defaults to skillopt-generator")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -394,26 +398,510 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "skillopt train continue requires --session")
 		return 2
 	}
-	var session db.SkillOptTrainSession
-	var iteration *db.SkillOptTrainIteration
-	var counts skillopt.TrainStatusCounts
-	if err := withStore(*home, func(store *db.Store) error {
+	var output skillOptTrainContinueOutput
+	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
 		var err error
-		session, iteration, counts, err = loadSkillOptTrainStatus(context.Background(), store, *sessionID)
+		output, err = continueSkillOptTrain(context.Background(), paths, store, skillOptTrainContinueRequest{
+			Home:           *home,
+			SessionID:      *sessionID,
+			GeneratorAgent: *generatorAgent,
+			GeneratorType:  *generatorType,
+		})
 		return err
 	}); err != nil {
 		fmt.Fprintf(stderr, "skillopt train continue: %v\n", err)
 		return 1
 	}
-	summary := skillopt.BuildTrainStatusSummary(session, iteration, counts)
-	printSkillOptTrainStatus(stdout, summary, counts)
-	if summary.CurrentPhase == skillopt.TrainStateRunAbandoned {
+	printSkillOptTrainStatus(stdout, output.Summary, output.Counts)
+	if output.Summary.CurrentPhase == skillopt.TrainStateRunAbandoned {
 		fmt.Fprintln(stderr, "skillopt train continue: train session is abandoned")
 		return 1
 	}
-	writeLine(stdout, "continue_ready: false")
-	writeLine(stdout, "next: Task 3 will add workspace and item planning; use status for the current blocked step.")
+	writeLine(stdout, "continue_ready: %t", output.ContinueReady)
+	for _, line := range output.Lines {
+		writeLine(stdout, "%s", line)
+	}
 	return 0
+}
+
+type skillOptTrainContinueRequest struct {
+	Home              string
+	SessionID         string
+	GeneratorAgent    string
+	GeneratorType     string
+	GenerationLockTTL time.Duration
+}
+
+type skillOptTrainContinueOutput struct {
+	Summary       skillopt.TrainStatusSummary
+	Counts        skillopt.TrainStatusCounts
+	ContinueReady bool
+	Lines         []string
+}
+
+func continueSkillOptTrain(ctx context.Context, paths config.Paths, store *db.Store, request skillOptTrainContinueRequest) (skillOptTrainContinueOutput, error) {
+	session, iteration, counts, err := loadSkillOptTrainStatus(ctx, store, request.SessionID)
+	if err != nil {
+		return skillOptTrainContinueOutput{}, err
+	}
+	summary := skillopt.BuildTrainStatusSummary(session, iteration, counts)
+	output := skillOptTrainContinueOutput{Summary: summary, Counts: counts}
+	if summary.CurrentPhase == skillopt.TrainStateRunAbandoned {
+		return output, nil
+	}
+	if iteration == nil {
+		output.Lines = []string{"next: train session has no iteration to continue"}
+		return output, nil
+	}
+	switch summary.CurrentPhase {
+	case skillopt.TrainStateItemsReady:
+		generationLockTTL, err := estimateSkillOptTrainGenerationLockTTL(ctx, store, request, *iteration)
+		if err != nil {
+			return output, err
+		}
+		request.GenerationLockTTL = generationLockTTL
+		releaseGenerationLock, _, err := acquireSkillOptTrainGenerationLock(ctx, store, session.ID, iteration.ID, generationLockTTL)
+		if err != nil {
+			return output, err
+		}
+		defer func() {
+			_ = releaseGenerationLock(context.Background())
+		}()
+		session, iteration, counts, err = loadSkillOptTrainStatus(ctx, store, request.SessionID)
+		if err != nil {
+			return skillOptTrainContinueOutput{}, err
+		}
+		summary = skillopt.BuildTrainStatusSummary(session, iteration, counts)
+		output = skillOptTrainContinueOutput{Summary: summary, Counts: counts}
+		if iteration == nil {
+			output.Lines = []string{"next: train session has no iteration to continue"}
+			return output, nil
+		}
+		if summary.CurrentPhase != skillopt.TrainStateItemsReady {
+			output.Lines = []string{fmt.Sprintf("next: %s", summary.NextAction)}
+			return output, nil
+		}
+		result, err := generateSkillOptTrainOptions(ctx, paths, store, session, *iteration, request)
+		if err != nil {
+			if metaErr := recordSkillOptTrainGenerationFailure(ctx, store, session, *iteration, request, err); metaErr != nil {
+				return skillOptTrainContinueOutput{}, fmt.Errorf("%w; failed to record generation failure: %v", err, metaErr)
+			}
+			return skillOptTrainContinueOutput{}, err
+		}
+		session.State = skillopt.TrainStateOptionsGenerated
+		iteration.State = skillopt.TrainStateOptionsGenerated
+		session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "generation", result.Metadata)
+		iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "generation", result.Metadata)
+		if err := store.UpsertSkillOptTrainSession(ctx, session); err != nil {
+			return skillOptTrainContinueOutput{}, err
+		}
+		if err := store.UpsertSkillOptTrainIteration(ctx, *iteration); err != nil {
+			return skillOptTrainContinueOutput{}, err
+		}
+		updatedSession, updatedIteration, updatedCounts, err := loadSkillOptTrainStatus(ctx, store, session.ID)
+		if err != nil {
+			return skillOptTrainContinueOutput{}, err
+		}
+		updatedSummary := skillopt.BuildTrainStatusSummary(updatedSession, updatedIteration, updatedCounts)
+		return skillOptTrainContinueOutput{
+			Summary:       updatedSummary,
+			Counts:        updatedCounts,
+			ContinueReady: true,
+			Lines: []string{
+				fmt.Sprintf("generated_options: %d", result.GeneratedOptions),
+				fmt.Sprintf("jobs: %d", len(result.JobIDs)),
+				fmt.Sprintf("generator_agent: %s", result.AgentName),
+				fmt.Sprintf("generator_runtime: %s", result.Runtime),
+				"next: publish the human review packet",
+			},
+		}, nil
+	case skillopt.TrainStateOptionsGenerated:
+		output.Lines = []string{"next: options already generated; publish the human review packet"}
+		return output, nil
+	default:
+		output.Lines = []string{fmt.Sprintf("next: %s", summary.NextAction)}
+		return output, nil
+	}
+}
+
+type skillOptTrainGenerationResult struct {
+	GeneratedOptions int
+	JobIDs           []string
+	AgentName        string
+	Runtime          string
+	Metadata         map[string]any
+}
+
+var errSkillOptTrainGenerationBusy = errors.New("skillopt train generation is already running")
+
+const skillOptTrainGenerationLockTTL = 2 * time.Hour
+
+const skillOptTrainGenerationLockBuffer = 10 * time.Minute
+
+func acquireSkillOptTrainGenerationLock(ctx context.Context, store *db.Store, sessionID string, iterationID string, ttl time.Duration) (func(context.Context) error, bool, error) {
+	key := skillOptTrainGenerationLockKey(sessionID, iterationID)
+	token, err := newRuntimeLockOwnerToken()
+	if err != nil {
+		return noopAgentReservationRelease, false, err
+	}
+	if ttl <= 0 {
+		ttl = skillOptTrainGenerationLockTTL
+	}
+	now := time.Now().UTC()
+	ownerJobID := localAgentJobID("skillopt-train-generation", strings.TrimSpace(sessionID))
+	acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+		ResourceKey: key,
+		OwnerJobID:  ownerJobID,
+		OwnerToken:  token,
+		ExpiresAt:   now.Add(ttl).Format(time.RFC3339Nano),
+	}, now)
+	if err != nil {
+		return noopAgentReservationRelease, false, err
+	}
+	if !acquired {
+		return noopAgentReservationRelease, false, fmt.Errorf("%w: %s", errSkillOptTrainGenerationBusy, key)
+	}
+	return func(releaseCtx context.Context) error {
+		_, err := store.ReleaseResourceLock(releaseCtx, key, ownerJobID, token)
+		return err
+	}, true, nil
+}
+
+func estimateSkillOptTrainGenerationLockTTL(ctx context.Context, store *db.Store, request skillOptTrainContinueRequest, iteration db.SkillOptTrainIteration) (time.Duration, error) {
+	run, err := store.GetEvalRun(ctx, iteration.EvalRunID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, fmt.Errorf("eval run %s not found", iteration.EvalRunID)
+		}
+		return 0, err
+	}
+	items, err := store.ListEvalReviewItems(ctx, run.ID)
+	if err != nil {
+		return 0, err
+	}
+	itemCount := len(items)
+	if itemCount <= 0 {
+		itemCount = 1
+	}
+	roles := len(skillOptTrainGenerationRoles(run))
+	if roles <= 0 {
+		roles = 2
+	}
+	_, dispatchType, err := skillOptTrainGeneratorSelection(request)
+	if err != nil {
+		return 0, err
+	}
+	jobTimeout := skillOptTrainGenerationJobTimeoutHint(request, dispatchType)
+	concurrency := skillOptTrainGenerationConcurrencyHint(request, dispatchType)
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	if concurrency > itemCount {
+		concurrency = itemCount
+	}
+	batches := (itemCount + concurrency - 1) / concurrency
+	estimated := time.Duration(batches*roles)*jobTimeout + skillOptTrainGenerationLockBuffer
+	if estimated < skillOptTrainGenerationLockTTL {
+		return skillOptTrainGenerationLockTTL, nil
+	}
+	return estimated, nil
+}
+
+func skillOptTrainGenerationJobTimeoutHint(request skillOptTrainContinueRequest, dispatchType string) time.Duration {
+	if strings.TrimSpace(dispatchType) == "" {
+		return daemonRunningJobStaleAfter
+	}
+	types, err := loadAgentTypeConfig(request.Home)
+	if err != nil {
+		return daemonRunningJobStaleAfter
+	}
+	agentType, ok := types[dispatchType]
+	if !ok {
+		return daemonRunningJobStaleAfter
+	}
+	jobTimeout, err := time.ParseDuration(agentType.JobTimeout)
+	if err != nil || jobTimeout <= 0 {
+		return daemonRunningJobStaleAfter
+	}
+	return jobTimeout
+}
+
+func skillOptTrainGenerationConcurrencyHint(request skillOptTrainContinueRequest, dispatchType string) int {
+	if strings.TrimSpace(dispatchType) == "" {
+		return 1
+	}
+	types, err := loadAgentTypeConfig(request.Home)
+	if err != nil {
+		return 1
+	}
+	agentType, ok := types[dispatchType]
+	if !ok || agentType.MaxBackground <= 0 {
+		return 1
+	}
+	return agentType.MaxBackground
+}
+
+func skillOptTrainGenerationLockKey(sessionID string, iterationID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	iterationID = strings.TrimSpace(iterationID)
+	if iterationID == "" {
+		return "skillopt-train-generation:" + sessionID
+	}
+	return "skillopt-train-generation:" + sessionID + ":" + iterationID
+}
+
+func generateSkillOptTrainOptions(ctx context.Context, paths config.Paths, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, request skillOptTrainContinueRequest) (skillOptTrainGenerationResult, error) {
+	if err := skillopt.CanTransitionTrainIteration(iteration.State, skillopt.TrainStateOptionsGenerated); err != nil {
+		return skillOptTrainGenerationResult{}, err
+	}
+	run, err := store.GetEvalRun(ctx, iteration.EvalRunID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return skillOptTrainGenerationResult{}, fmt.Errorf("eval run %s not found", iteration.EvalRunID)
+		}
+		return skillOptTrainGenerationResult{}, err
+	}
+	rankedRun := skillOptRunUsesRankedOptions(run)
+	items, err := store.ListEvalReviewItems(ctx, run.ID)
+	if err != nil {
+		return skillOptTrainGenerationResult{}, err
+	}
+	if len(items) == 0 {
+		return skillOptTrainGenerationResult{}, fmt.Errorf("eval run %s has no review items to generate", run.ID)
+	}
+	roles := skillOptTrainGenerationRoles(run)
+	if len(roles) < 2 {
+		return skillOptTrainGenerationResult{}, fmt.Errorf("eval run %s expects at least 2 options", run.ID)
+	}
+	existingGenerated := 0
+	completeExistingItems := 0
+	for _, item := range items {
+		if rankedRun {
+			existing, err := store.ListEvalReviewOptions(ctx, run.ID, item.ItemID)
+			if err != nil {
+				return skillOptTrainGenerationResult{}, err
+			}
+			if len(existing) > 0 {
+				if len(existing) == len(roles) {
+					existingGenerated += len(existing)
+					completeExistingItems++
+					continue
+				}
+				return skillOptTrainGenerationResult{}, fmt.Errorf("item %s has partial generated options; inspect or clear review options before continuing", item.ItemID)
+			}
+			continue
+		}
+		hasBaseline := strings.TrimSpace(item.BaselineArtifactID) != ""
+		hasCandidate := strings.TrimSpace(item.CandidateArtifactID) != ""
+		if hasBaseline || hasCandidate {
+			if hasBaseline && hasCandidate {
+				existingGenerated += 2
+				completeExistingItems++
+				continue
+			}
+			return skillOptTrainGenerationResult{}, fmt.Errorf("item %s has partial generated A/B artifacts; inspect or clear review item artifacts before continuing", item.ItemID)
+		}
+	}
+	if completeExistingItems > 0 {
+		if completeExistingItems == len(items) {
+			metadata := map[string]any{
+				"status":            "recovered",
+				"generated_options": existingGenerated,
+				"strategy":          skillOptTrainGenerationStrategy(run),
+				"completed_at":      time.Now().UTC().Format(time.RFC3339Nano),
+			}
+			return skillOptTrainGenerationResult{
+				GeneratedOptions: existingGenerated,
+				Metadata:         metadata,
+			}, nil
+		}
+		return skillOptTrainGenerationResult{}, fmt.Errorf("eval run %s has partial generated items; inspect or clear review artifacts before continuing", run.ID)
+	}
+	dispatchAgent, dispatchType, err := skillOptTrainGeneratorSelection(request)
+	if err != nil {
+		return skillOptTrainGenerationResult{}, err
+	}
+	blobStore := artifact.NewStore(paths.ArtifactBlobs)
+	concurrency, err := skillOptTrainGenerationConcurrency(request, dispatchType)
+	if err != nil {
+		return skillOptTrainGenerationResult{}, err
+	}
+	if err := ensureSkillOptTrainGenerationRepoReady(ctx, store, skillOptTrainGenerationRepo(session)); err != nil {
+		return skillOptTrainGenerationResult{}, err
+	}
+	generatedItems, err := generateSkillOptTrainItemOptions(ctx, store, blobStore, session, iteration, run, items, roles, rankedRun, request, dispatchAgent, dispatchType, concurrency)
+	if err != nil {
+		return skillOptTrainGenerationResult{}, err
+	}
+	writes := make([]db.EvalReviewGenerationWrite, 0, len(generatedItems))
+	generated := 0
+	jobIDs := []string{}
+	var generatorAgent string
+	var generatorRuntime string
+	promptRecords := []map[string]any{}
+	for _, item := range generatedItems {
+		generated += len(item.Artifacts)
+		jobIDs = append(jobIDs, item.JobIDs...)
+		if generatorAgent == "" {
+			generatorAgent = item.AgentName
+		}
+		if generatorRuntime == "" {
+			generatorRuntime = item.Runtime
+		}
+		promptRecords = append(promptRecords, item.Prompts...)
+		writes = append(writes, db.EvalReviewGenerationWrite{
+			ItemID:     item.ItemID,
+			ReviewItem: item.ReviewItem,
+			Artifacts:  item.Artifacts,
+			Options:    item.Options,
+		})
+	}
+	if err := store.ReplaceGeneratedEvalReviewArtifacts(ctx, run.ID, writes); err != nil {
+		return skillOptTrainGenerationResult{}, err
+	}
+	metadata := map[string]any{
+		"status":            "succeeded",
+		"generated_options": generated,
+		"jobs":              jobIDs,
+		"agent":             generatorAgent,
+		"runtime":           generatorRuntime,
+		"concurrency":       concurrency,
+		"lock_ttl":          request.GenerationLockTTL.String(),
+		"strategy":          skillOptTrainGenerationStrategy(run),
+		"prompts":           promptRecords,
+		"completed_at":      time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	return skillOptTrainGenerationResult{
+		GeneratedOptions: generated,
+		JobIDs:           jobIDs,
+		AgentName:        generatorAgent,
+		Runtime:          generatorRuntime,
+		Metadata:         metadata,
+	}, nil
+}
+
+type skillOptTrainGeneratedItemOptions struct {
+	ItemID     string
+	ReviewItem *db.EvalReviewItem
+	Artifacts  []db.EvalArtifact
+	Options    []db.EvalReviewOption
+	JobIDs     []string
+	AgentName  string
+	Runtime    string
+	Prompts    []map[string]any
+}
+
+func generateSkillOptTrainItemOptions(ctx context.Context, store *db.Store, blobStore artifact.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, run db.EvalRun, items []db.EvalReviewItem, roles []string, rankedRun bool, request skillOptTrainContinueRequest, dispatchAgent string, dispatchType string, concurrency int) ([]skillOptTrainGeneratedItemOptions, error) {
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	if concurrency > len(items) {
+		concurrency = len(items)
+	}
+	results := make([]skillOptTrainGeneratedItemOptions, len(items))
+	errs := make([]error, len(items))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrency)
+	for index, item := range items {
+		index := index
+		item := item
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				errs[index] = ctx.Err()
+				return
+			}
+			result, err := generateSkillOptTrainSingleItemOptions(ctx, store, blobStore, session, iteration, run, item, roles, rankedRun, request, dispatchAgent, dispatchType)
+			if err != nil {
+				errs[index] = err
+				return
+			}
+			results[index] = result
+		}()
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+	return results, nil
+}
+
+func generateSkillOptTrainSingleItemOptions(ctx context.Context, store *db.Store, blobStore artifact.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, run db.EvalRun, item db.EvalReviewItem, roles []string, rankedRun bool, request skillOptTrainContinueRequest, dispatchAgent string, dispatchType string) (skillOptTrainGeneratedItemOptions, error) {
+	generatedItem := skillOptTrainGeneratedItemOptions{ItemID: item.ItemID}
+	replacementOptions := make([]db.EvalReviewOption, 0, len(roles))
+	artifactRecords := make([]db.EvalArtifact, 0, len(roles))
+	for _, role := range roles {
+		prompt := buildSkillOptTrainGenerationPrompt(session, iteration, run, item, role, rankedRun)
+		output, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+			RepoFlag:         skillOptTrainGenerationRepo(session),
+			Agent:            dispatchAgent,
+			Action:           "ask",
+			Instructions:     prompt,
+			Type:             dispatchType,
+			Home:             request.Home,
+			AllowManagedSync: dispatchType != "",
+		})
+		if err != nil {
+			return skillOptTrainGeneratedItemOptions{}, fmt.Errorf("generate %s for %s: %w", role, item.ItemID, err)
+		}
+		if output.Result == nil {
+			return skillOptTrainGeneratedItemOptions{}, fmt.Errorf("generate %s for %s: job %s did not return a result", role, item.ItemID, output.JobID)
+		}
+		if output.Result.Decision != "implemented" {
+			return skillOptTrainGeneratedItemOptions{}, fmt.Errorf("generate %s for %s: job %s returned %s, want implemented: %s", role, item.ItemID, output.JobID, output.Result.Decision, output.Result.Summary)
+		}
+		artifactRole := role
+		if rankedRun {
+			artifactRole = "option-" + role
+		}
+		artifactRecord, err := prepareReviewItemContentArtifact(blobStore, run.ID, item.ItemID, artifactRole, []byte(output.Result.Summary), "text/markdown", "text")
+		if err != nil {
+			return skillOptTrainGeneratedItemOptions{}, err
+		}
+		artifactRecords = append(artifactRecords, artifactRecord)
+		optionMetadata := skillOptTrainGeneratedOptionMetadata(output, prompt)
+		if rankedRun {
+			replacementOptions = append(replacementOptions, db.EvalReviewOption{
+				RunID:        run.ID,
+				ItemID:       item.ItemID,
+				Label:        role,
+				ArtifactID:   artifactRecord.ID,
+				Role:         "option",
+				MetadataJSON: optionMetadata,
+			})
+		} else if role == "baseline" {
+			item.BaselineArtifactID = artifactRecord.ID
+		} else if role == "candidate" {
+			item.CandidateArtifactID = artifactRecord.ID
+		}
+		generatedItem.JobIDs = append(generatedItem.JobIDs, output.JobID)
+		if generatedItem.AgentName == "" {
+			generatedItem.AgentName = output.Agent
+		}
+		if generatedItem.Runtime == "" {
+			if agent, err := store.GetAgent(ctx, output.Agent); err == nil {
+				generatedItem.Runtime = agent.Runtime
+			}
+		}
+		generatedItem.Prompts = append(generatedItem.Prompts, map[string]any{
+			"item_id": item.ItemID,
+			"role":    role,
+			"job_id":  output.JobID,
+			"prompt":  prompt,
+		})
+	}
+	generatedItem.Artifacts = artifactRecords
+	generatedItem.Options = replacementOptions
+	if !rankedRun {
+		generatedItem.ReviewItem = &item
+	}
+	return generatedItem, nil
 }
 
 func runSkillOptTrainStop(args []string, stdout, stderr io.Writer) int {
@@ -875,6 +1363,270 @@ func skillOptTrainDecisionMetadata(existing string, reason string) string {
 		return existing
 	}
 	return string(encoded)
+}
+
+func recordSkillOptTrainGenerationFailure(ctx context.Context, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, request skillOptTrainContinueRequest, failure error) error {
+	metadata := map[string]any{
+		"status":       "failed",
+		"agent":        strings.TrimSpace(request.GeneratorAgent),
+		"agent_type":   strings.TrimSpace(request.GeneratorType),
+		"error":        failure.Error(),
+		"completed_at": time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "generation", metadata)
+	iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "generation", metadata)
+	if err := store.UpsertSkillOptTrainSession(ctx, session); err != nil {
+		return err
+	}
+	return store.UpsertSkillOptTrainIteration(ctx, iteration)
+}
+
+func skillOptTrainGenerationRepo(session db.SkillOptTrainSession) string {
+	if repo := strings.TrimSpace(session.WorkspaceRepo); repo != "" {
+		return repo
+	}
+	return strings.TrimSpace(session.TargetRepo)
+}
+
+func ensureSkillOptTrainGenerationRepoReady(ctx context.Context, store *db.Store, repoName string) error {
+	repoName = strings.TrimSpace(repoName)
+	if repoName == "" {
+		return errors.New("skillopt train generation repo is required")
+	}
+	repo, err := daemon.ParseRepository(repoName)
+	if err != nil {
+		return err
+	}
+	if existing, err := store.GetRepo(ctx, repo.FullName()); err == nil {
+		if strings.TrimSpace(existing.CheckoutPath) == "" {
+			return fmt.Errorf("generation repo %s has no checkout path; run `gitmoot repo add %s --path /path/to/checkout` before train continue", repo.FullName(), repo.FullName())
+		}
+		record, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: existing.CheckoutPath})
+		if err != nil {
+			return fmt.Errorf("generation repo %s checkout is not ready: %w", repo.FullName(), err)
+		}
+		record.PollInterval = existing.PollInterval
+		return store.UpsertRepo(ctx, record)
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	record, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: "."})
+	if err != nil {
+		return fmt.Errorf("generation repo %s is not registered with a checkout path; run `gitmoot repo add %s --path /path/to/checkout` before train continue: %w", repo.FullName(), repo.FullName(), err)
+	}
+	return store.UpsertRepo(ctx, record)
+}
+
+func skillOptTrainGeneratorSelection(request skillOptTrainContinueRequest) (string, string, error) {
+	agent := strings.TrimSpace(request.GeneratorAgent)
+	agentType := strings.TrimSpace(request.GeneratorType)
+	if agent != "" && agentType != "" {
+		return "", "", errors.New("use only one of --generator-agent or --generator-type")
+	}
+	if agent != "" {
+		return agent, "", nil
+	}
+	if agentType == "" {
+		agentType = "skillopt-generator"
+	}
+	return agentType, agentType, nil
+}
+
+func skillOptTrainGenerationConcurrency(request skillOptTrainContinueRequest, dispatchType string) (int, error) {
+	if strings.TrimSpace(dispatchType) == "" {
+		return 1, nil
+	}
+	types, err := loadAgentTypeConfig(request.Home)
+	if err != nil {
+		return 0, err
+	}
+	agentType, ok := types[dispatchType]
+	if !ok {
+		return 0, fmt.Errorf("agent %q not found", dispatchType)
+	}
+	if agentType.MaxBackground <= 0 {
+		return 1, nil
+	}
+	return agentType.MaxBackground, nil
+}
+
+func skillOptTrainOptionLabels(count int) []string {
+	if count <= 0 {
+		count = 2
+	}
+	labels := make([]string, 0, count)
+	for index := 0; index < count; index++ {
+		if index < 26 {
+			labels = append(labels, string(rune('a'+index)))
+			continue
+		}
+		labels = append(labels, fmt.Sprintf("option-%d", index+1))
+	}
+	return labels
+}
+
+func skillOptTrainGenerationRoles(run db.EvalRun) []string {
+	if !skillOptRunUsesRankedOptions(run) {
+		return []string{"baseline", "candidate"}
+	}
+	return skillOptTrainOptionLabels(run.OptionsCount)
+}
+
+func buildSkillOptTrainGenerationPrompt(session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, run db.EvalRun, item db.EvalReviewItem, role string, rankedRun bool) string {
+	itemMetadata := decodedSkillOptMetadata(item.MetadataJSON)
+	sessionMetadata := decodedSkillOptMetadata(session.MetadataJSON)
+	requestText := metadataString(sessionMetadata, "request")
+	if requestText == "" {
+		requestText = session.RequestSummary
+	}
+	var builder strings.Builder
+	builder.WriteString("Generate one review option for a Gitmoot SkillOpt training run.\n")
+	builder.WriteString("Return the generated artifact content in gitmoot_result.summary with decision implemented. Do not include commentary outside the artifact.\n\n")
+	builder.WriteString("Training request:\n")
+	builder.WriteString(requestText)
+	builder.WriteString("\n\n")
+	builder.WriteString("Session: ")
+	builder.WriteString(session.ID)
+	builder.WriteString("\nIteration: ")
+	builder.WriteString(iteration.ID)
+	builder.WriteString("\nEval run: ")
+	builder.WriteString(run.ID)
+	builder.WriteString("\nMode: ")
+	builder.WriteString(run.Mode)
+	builder.WriteString("\nExploration level: ")
+	builder.WriteString(run.ExplorationLevel)
+	if rankedRun {
+		builder.WriteString("\nOption label: ")
+		builder.WriteString(strings.ToUpper(role))
+	} else {
+		builder.WriteString("\nA/B artifact role: ")
+		builder.WriteString(role)
+	}
+	builder.WriteString("\nItem id: ")
+	builder.WriteString(item.ItemID)
+	builder.WriteString("\nTitle: ")
+	builder.WriteString(item.Title)
+	if brief := metadataString(itemMetadata, "brief"); brief != "" {
+		builder.WriteString("\nBrief: ")
+		builder.WriteString(brief)
+	}
+	if audience := metadataString(itemMetadata, "target_audience"); audience != "" {
+		builder.WriteString("\nTarget audience: ")
+		builder.WriteString(audience)
+	}
+	if outputType := metadataString(itemMetadata, "output_type"); outputType != "" {
+		builder.WriteString("\nOutput type: ")
+		builder.WriteString(outputType)
+	}
+	if hints, ok := itemMetadata["artifact_hints"].([]any); ok && len(hints) > 0 {
+		builder.WriteString("\nArtifact hints:")
+		for _, hint := range hints {
+			if text := strings.TrimSpace(fmt.Sprint(hint)); text != "" {
+				builder.WriteString("\n- ")
+				builder.WriteString(text)
+			}
+		}
+	}
+	builder.WriteString("\n\nGeneration rules:\n")
+	if rankedRun {
+		builder.WriteString("- Make this option meaningfully different from the other labels in layout, content strategy, and visual/interaction direction.\n")
+	} else if role == "baseline" {
+		builder.WriteString("- Generate the baseline artifact: a solid, conventional answer that satisfies the item brief.\n")
+	} else {
+		builder.WriteString("- Generate the candidate artifact: a meaningfully different improved answer intended to be compared against the baseline.\n")
+	}
+	switch run.ExplorationLevel {
+	case db.ExplorationLevelHigh:
+		builder.WriteString("- Use high exploration: vary the product explanation, proof/content structure, and visual direction substantially.\n")
+	case db.ExplorationLevelMedium:
+		builder.WriteString("- Use medium exploration: combine promising directions while keeping alternatives visibly different.\n")
+	case db.ExplorationLevelLow:
+		builder.WriteString("- Use low exploration: make narrow refinements and avoid broad direction changes.\n")
+	}
+	builder.WriteString("- Keep the artifact self-contained and directly reviewable.\n")
+	builder.WriteString("- Preserve the requested output type.\n")
+	return builder.String()
+}
+
+func prepareReviewItemContentArtifact(blobStore artifact.Store, runID string, itemID string, role string, content []byte, mediaType string, driver string) (db.EvalArtifact, error) {
+	if len(content) == 0 || strings.TrimSpace(string(content)) == "" {
+		return db.EvalArtifact{}, fmt.Errorf("%s content is required", role)
+	}
+	blob, err := blobStore.Put(content)
+	if err != nil {
+		return db.EvalArtifact{}, fmt.Errorf("store %s artifact blob: %w", role, err)
+	}
+	if strings.TrimSpace(mediaType) == "" {
+		mediaType = "text/plain"
+	}
+	if strings.TrimSpace(driver) == "" {
+		driver = "text"
+	}
+	return db.EvalArtifact{
+		ID:        reviewItemArtifactID(runID, itemID, role),
+		Hash:      blob.Hash,
+		MediaType: mediaType,
+		SizeBytes: blob.Size,
+		Driver:    driver,
+	}, nil
+}
+
+func skillOptTrainGeneratedOptionMetadata(output localAgentJobOutput, prompt string) string {
+	metadata := map[string]any{
+		"source":           "gitmoot skillopt train continue",
+		"job_id":           output.JobID,
+		"agent":            output.Agent,
+		"prompt":           prompt,
+		"raw_output_count": output.RawOutputCount,
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
+}
+
+func skillOptTrainGenerationStrategy(run db.EvalRun) map[string]any {
+	return map[string]any{
+		"mode":              run.Mode,
+		"exploration_level": run.ExplorationLevel,
+		"options_count":     run.OptionsCount,
+	}
+}
+
+func mergeSkillOptTrainMetadata(existing string, key string, value map[string]any) string {
+	metadata := decodedSkillOptMetadata(existing)
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	metadata[key] = value
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return existing
+	}
+	return string(encoded)
+}
+
+func decodedSkillOptMetadata(value string) map[string]any {
+	var metadata map[string]any
+	if strings.TrimSpace(value) != "" {
+		_ = json.Unmarshal([]byte(value), &metadata)
+	}
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	return metadata
+}
+
+func metadataString(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, ok := metadata[key]
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
 }
 
 func skillOptTrainConfirmCommand(args []string, sessionID string) string {

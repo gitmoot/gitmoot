@@ -510,6 +510,60 @@ func TestRankedReviewStorageRejectsOptionCountMismatch(t *testing.T) {
 	}
 }
 
+func TestReplaceGeneratedEvalReviewArtifactsRollsBackBatch(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	err = store.ReplaceGeneratedEvalReviewArtifacts(ctx, "run-generated", []EvalReviewGenerationWrite{
+		{
+			ItemID: "item-001",
+			Artifacts: []EvalArtifact{{
+				ID:        "run-generated/item-001/option-a",
+				Hash:      "sha256:aaa",
+				MediaType: "text/markdown",
+				SizeBytes: 12,
+				Driver:    "text",
+			}},
+			Options: []EvalReviewOption{{
+				Label:      "a",
+				ArtifactID: "run-generated/item-001/option-a",
+				Role:       "option",
+			}},
+		},
+		{
+			ItemID: "item-002",
+			Artifacts: []EvalArtifact{{
+				ID:        "run-generated/item-002/option-a",
+				Hash:      "sha256:bbb",
+				MediaType: "text/markdown",
+				SizeBytes: 12,
+				Driver:    "text",
+			}},
+			Options: []EvalReviewOption{{
+				Label: "a",
+				Role:  "option",
+			}},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "artifact id is required") {
+		t.Fatalf("ReplaceGeneratedEvalReviewArtifacts error = %v", err)
+	}
+	if _, err := store.GetEvalArtifact(ctx, "run-generated/item-001/option-a"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetEvalArtifact after rollback error = %v, want sql.ErrNoRows", err)
+	}
+	options, err := store.ListEvalReviewOptions(ctx, "run-generated", "item-001")
+	if err != nil {
+		t.Fatalf("ListEvalReviewOptions returned error: %v", err)
+	}
+	if len(options) != 0 {
+		t.Fatalf("options after rollback = %+v", options)
+	}
+}
+
 func TestFeedbackEventMethods(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))

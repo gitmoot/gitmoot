@@ -261,6 +261,13 @@ type EvalReviewOption struct {
 	UpdatedAt    string
 }
 
+type EvalReviewGenerationWrite struct {
+	ItemID     string
+	ReviewItem *EvalReviewItem
+	Artifacts  []EvalArtifact
+	Options    []EvalReviewOption
+}
+
 type FeedbackEvent struct {
 	ID        string
 	RunID     string
@@ -1230,6 +1237,14 @@ func (s *Store) MarkAgentInstanceRunning(ctx context.Context, name string, now t
 	return requireAffected(result, "agent instance", name)
 }
 
+func (s *Store) DeleteAgentInstance(ctx context.Context, name string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM agent_instances WHERE name = ?`, strings.TrimSpace(name))
+	if err != nil {
+		return err
+	}
+	return requireAffected(result, "agent instance", name)
+}
+
 func (s *Store) DeleteExpiredAgentInstances(ctx context.Context, now time.Time) (int64, error) {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM agent_instances
 		WHERE state = 'idle'
@@ -1743,6 +1758,22 @@ func (s *Store) UpsertEvalArtifact(ctx context.Context, artifact EvalArtifact) e
 	return err
 }
 
+func upsertEvalArtifactTx(ctx context.Context, tx *sql.Tx, artifact EvalArtifact) error {
+	artifact, err := normalizeEvalArtifact(artifact)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO eval_artifacts(id, hash, media_type, size_bytes, driver, created_at)
+		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(id) DO UPDATE SET
+			hash = excluded.hash,
+			media_type = excluded.media_type,
+			size_bytes = excluded.size_bytes,
+			driver = excluded.driver`,
+		artifact.ID, artifact.Hash, artifact.MediaType, artifact.SizeBytes, artifact.Driver)
+	return err
+}
+
 func insertEvalArtifactTx(ctx context.Context, tx *sql.Tx, artifact EvalArtifact) error {
 	artifact, err := normalizeEvalArtifact(artifact)
 	if err != nil {
@@ -2071,6 +2102,112 @@ func (s *Store) UpsertEvalReviewItem(ctx context.Context, item EvalReviewItem) e
 		item.ID, item.RunID, item.ItemID, item.Title, item.SourceArtifactID, item.BaselineArtifactID, item.CandidateArtifactID,
 		item.PreviewArtifactID, item.DiffArtifactID, item.MetadataJSON)
 	return err
+}
+
+func (s *Store) ReplaceGeneratedEvalReviewArtifacts(ctx context.Context, runID string, writes []EvalReviewGenerationWrite) error {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return errors.New("eval review generation run id is required")
+	}
+	normalized := make([]EvalReviewGenerationWrite, 0, len(writes))
+	for _, write := range writes {
+		itemID := strings.TrimSpace(write.ItemID)
+		if itemID == "" && write.ReviewItem != nil {
+			itemID = strings.TrimSpace(write.ReviewItem.ItemID)
+		}
+		if itemID == "" {
+			return errors.New("eval review generation item id is required")
+		}
+		next := EvalReviewGenerationWrite{ItemID: itemID}
+		for _, artifact := range write.Artifacts {
+			artifact, err := normalizeEvalArtifact(artifact)
+			if err != nil {
+				return err
+			}
+			next.Artifacts = append(next.Artifacts, artifact)
+		}
+		if write.ReviewItem != nil {
+			item := *write.ReviewItem
+			item.RunID = runID
+			item.ItemID = itemID
+			if strings.TrimSpace(item.ID) == "" {
+				item.ID = item.RunID + "/" + item.ItemID
+			}
+			if strings.TrimSpace(item.RunID) == "" {
+				return errors.New("eval review item run id is required")
+			}
+			if strings.TrimSpace(item.ItemID) == "" {
+				return errors.New("eval review item id is required")
+			}
+			next.ReviewItem = &item
+		}
+		seen := map[string]struct{}{}
+		for _, option := range write.Options {
+			option.RunID = runID
+			option.ItemID = itemID
+			option, err := normalizeEvalReviewOption(option)
+			if err != nil {
+				return err
+			}
+			if _, ok := seen[option.Label]; ok {
+				return fmt.Errorf("eval review option label %q is duplicated for item %q", option.Label, itemID)
+			}
+			seen[option.Label] = struct{}{}
+			next.Options = append(next.Options, option)
+		}
+		normalized = append(normalized, next)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, write := range normalized {
+		for _, artifact := range write.Artifacts {
+			if err := upsertEvalArtifactTx(ctx, tx, artifact); err != nil {
+				return err
+			}
+		}
+		if write.ReviewItem != nil {
+			item := *write.ReviewItem
+			if _, err := tx.ExecContext(ctx, `INSERT INTO eval_review_items(
+					id, run_id, item_id, title, source_artifact_id, baseline_artifact_id, candidate_artifact_id,
+					preview_artifact_id, diff_artifact_id, metadata_json, created_at, updated_at
+				)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+				ON CONFLICT(id) DO UPDATE SET
+					run_id = excluded.run_id,
+					item_id = excluded.item_id,
+					title = excluded.title,
+					source_artifact_id = excluded.source_artifact_id,
+					baseline_artifact_id = excluded.baseline_artifact_id,
+					candidate_artifact_id = excluded.candidate_artifact_id,
+					preview_artifact_id = excluded.preview_artifact_id,
+					diff_artifact_id = excluded.diff_artifact_id,
+					metadata_json = excluded.metadata_json,
+					updated_at = CURRENT_TIMESTAMP`,
+				item.ID, item.RunID, item.ItemID, item.Title, item.SourceArtifactID, item.BaselineArtifactID, item.CandidateArtifactID,
+				item.PreviewArtifactID, item.DiffArtifactID, item.MetadataJSON); err != nil {
+				return err
+			}
+		}
+		if len(write.Options) == 0 {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM eval_review_options WHERE run_id = ? AND item_id = ?`, runID, write.ItemID); err != nil {
+			return err
+		}
+		for _, option := range write.Options {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO eval_review_options(
+					id, run_id, item_id, label, artifact_id, role, metadata_json, created_at, updated_at
+				)
+				VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+				option.ID, option.RunID, option.ItemID, option.Label, option.ArtifactID, option.Role, option.MetadataJSON); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) ListEvalReviewItems(ctx context.Context, runID string) ([]EvalReviewItem, error) {

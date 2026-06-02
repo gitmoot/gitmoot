@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -721,6 +722,121 @@ func TestRunAgentTypeSetListShowAndManagedBackgroundAsk(t *testing.T) {
 	}
 	if len(jobs) != 2 || jobs[0].Agent != instances[0].Name || jobs[1].Agent != instances[0].Name {
 		t.Fatalf("jobs = %+v, instance = %+v", jobs, instances[0])
+	}
+}
+
+func TestDispatchManagedSyncUsesJobTimeoutForRuntimeLock(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	t.Chdir(repoDir)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "type", "set", "planner",
+		"--home", home,
+		"--runtime", "codex",
+		"--max-background", "1",
+		"--idle-timeout", "20m",
+		"--job-timeout", "45m",
+		"--capability", "ask",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	runner := &managedSyncLockRunner{
+		t:          t,
+		store:      store,
+		runtimeKey: "runtime:codex:550e8400-e29b-41d4-a716-446655440222",
+		minTTL:     44 * time.Minute,
+	}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	output, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
+		RepoFlag:         "owner/repo",
+		Agent:            "planner",
+		Action:           "ask",
+		Instructions:     "Check the managed sync lock timeout.",
+		Type:             "planner",
+		Home:             home,
+		AllowManagedSync: true,
+	})
+	if err != nil {
+		t.Fatalf("dispatchLocalAgentJob returned error: %v", err)
+	}
+	if output.Result == nil || output.Result.Decision != "implemented" {
+		t.Fatalf("dispatch output = %+v", output)
+	}
+	if !runner.checked {
+		t.Fatal("runner did not inspect runtime lock during resume")
+	}
+}
+
+func TestEnsureManagedAgentInstanceKeepsNewInstanceReservedUntilRelease(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	t.Chdir(repoDir)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "type", "set", "planner",
+		"--home", home,
+		"--runtime", "codex",
+		"--max-background", "2",
+		"--idle-timeout", "20m",
+		"--job-timeout", "45m",
+		"--capability", "ask",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	record := db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir, DefaultBranch: "main", PollInterval: "30s"}
+	if err := store.UpsertRepo(context.Background(), record); err != nil {
+		t.Fatalf("UpsertRepo returned error: %v", err)
+	}
+	runner := &agentStartRunner{results: []subprocess.Result{
+		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440333"}` + "\n"},
+	}}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	agent, release, err := ensureManagedAgentInstance(context.Background(), store, home, "planner", "owner/repo", record)
+	if err != nil {
+		t.Fatalf("ensureManagedAgentInstance returned error: %v", err)
+	}
+	instance, err := store.GetAgentInstance(context.Background(), agent.Name)
+	if err != nil {
+		t.Fatalf("GetAgentInstance returned error: %v", err)
+	}
+	if instance.State != "starting" || instance.RuntimeRef != "550e8400-e29b-41d4-a716-446655440333" {
+		t.Fatalf("instance before release = %+v", instance)
+	}
+	reusable, ok, err := store.FindReusableAgentInstance(context.Background(), "planner", "owner/repo", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("FindReusableAgentInstance returned error: %v", err)
+	}
+	if ok {
+		t.Fatalf("new managed instance is reusable before release: %+v", reusable)
+	}
+	if err := release(context.Background()); err != nil {
+		t.Fatalf("release returned error: %v", err)
+	}
+	instance, err = store.GetAgentInstance(context.Background(), agent.Name)
+	if err != nil {
+		t.Fatalf("GetAgentInstance after release returned error: %v", err)
+	}
+	if instance.State != "idle" {
+		t.Fatalf("instance state after release = %s, want idle", instance.State)
 	}
 }
 
@@ -1761,6 +1877,7 @@ func replaceRuntimeFactory(factory runtime.Factory) func() {
 }
 
 type agentStartRunner struct {
+	mu      sync.Mutex
 	results []subprocess.Result
 	errs    []error
 	calls   []agentStartCall
@@ -1772,7 +1889,54 @@ type agentStartCall struct {
 	args    []string
 }
 
+type managedSyncLockRunner struct {
+	t          *testing.T
+	store      *db.Store
+	runtimeKey string
+	minTTL     time.Duration
+	checked    bool
+}
+
+func (r *managedSyncLockRunner) Run(ctx context.Context, _ string, command string, args ...string) (subprocess.Result, error) {
+	isResume := false
+	for _, arg := range args {
+		if arg == "resume" {
+			isResume = true
+			break
+		}
+	}
+	if !isResume {
+		return subprocess.Result{Command: command, Args: args, Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440222"}` + "\n"}, nil
+	}
+	lock, err := r.store.GetResourceLock(ctx, r.runtimeKey)
+	if err != nil {
+		r.t.Fatalf("GetResourceLock during resume returned error: %v", err)
+	}
+	acquiredAt, err := time.Parse(time.RFC3339Nano, lock.AcquiredAt)
+	if err != nil {
+		r.t.Fatalf("parse acquired_at %q: %v", lock.AcquiredAt, err)
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, lock.ExpiresAt)
+	if err != nil {
+		r.t.Fatalf("parse expires_at %q: %v", lock.ExpiresAt, err)
+	}
+	if ttl := expiresAt.Sub(acquiredAt); ttl < r.minTTL {
+		r.t.Fatalf("runtime lock ttl = %s, want at least %s", ttl, r.minTTL)
+	}
+	r.checked = true
+	return subprocess.Result{Command: command, Args: args, Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"}, nil
+}
+
+func (r *managedSyncLockRunner) LookPath(file string) (string, error) {
+	if file == "" {
+		return "", errors.New("empty file")
+	}
+	return "/usr/bin/" + file, nil
+}
+
 func (r *agentStartRunner) Run(_ context.Context, dir string, command string, args ...string) (subprocess.Result, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.calls = append(r.calls, agentStartCall{dir: dir, command: command, args: append([]string{}, args...)})
 	index := len(r.calls) - 1
 	result := subprocess.Result{Command: command, Args: args}
