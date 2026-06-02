@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/jerryfane/gitmoot/internal/artifact"
@@ -42,6 +43,8 @@ func runSkillOpt(args []string, stdout, stderr io.Writer) int {
 		return runSkillOptCandidate(args[1:], stdout, stderr)
 	case "feedback":
 		return runSkillOptFeedback(args[1:], stdout, stderr)
+	case "train":
+		return runSkillOptTrain(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown skillopt command %q\n\n", args[0])
 		printSkillOptUsage(stderr)
@@ -65,6 +68,557 @@ func printSkillOptUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id> [--reviewer name]")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)")
+	fmt.Fprintln(w, "  gitmoot skillopt train start --template <id> --repo owner/repo --request <text> [--yes]")
+	fmt.Fprintln(w, "  gitmoot skillopt train status --session <id>")
+	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id>")
+	fmt.Fprintln(w, "  gitmoot skillopt train stop --session <id> --reason <text>")
+}
+
+func runSkillOptTrain(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		printSkillOptTrainUsage(stdout)
+		return 0
+	}
+	switch args[0] {
+	case "start":
+		return runSkillOptTrainStart(args[1:], stdout, stderr)
+	case "status":
+		return runSkillOptTrainStatus(args[1:], stdout, stderr)
+	case "continue":
+		return runSkillOptTrainContinue(args[1:], stdout, stderr)
+	case "stop":
+		return runSkillOptTrainStop(args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "unknown skillopt train command %q\n\n", args[0])
+		printSkillOptTrainUsage(stderr)
+		return 2
+	}
+}
+
+func printSkillOptTrainUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  gitmoot skillopt train start --template <id> --repo owner/repo --request <text> [--session <id>] [--workspace-repo owner/repo] [--preview-repo owner/repo] [--request-file path] [--task-kind kind] [--mode explore|refine|distill|validate] [--exploration-level high|medium|low] [--options N] [--dry-run] [--yes]")
+	fmt.Fprintln(w, "  gitmoot skillopt train status --session <id>")
+	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id>")
+	fmt.Fprintln(w, "  gitmoot skillopt train stop --session <id> --reason <text>")
+}
+
+func runSkillOptTrainStart(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("skillopt train start", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	templateID := fs.String("template", "", "agent template id or version to train")
+	repoFlag := fs.String("repo", "", "target repository in owner/repo form")
+	sessionID := fs.String("session", "", "train session id")
+	workspaceRepoFlag := fs.String("workspace-repo", "", "workspace repository in owner/repo form")
+	previewRepoFlag := fs.String("preview-repo", "", "preview repository in owner/repo form")
+	requestText := fs.String("request", "", "human training request")
+	requestFile := fs.String("request-file", "", "file containing the human training request")
+	taskKind := fs.String("task-kind", "custom", "task kind: correctness, ux, design, writing, data, or custom")
+	mode := fs.String("mode", db.EvalRunModeExplore, "train mode: explore, refine, distill, or validate")
+	explorationLevel := fs.String("exploration-level", "", "exploration level: high, medium, or low")
+	optionsCount := fs.Int("options", 0, "expected number of review options")
+	dryRun := fs.Bool("dry-run", false, "print inferred session state without writing")
+	yes := fs.Bool("yes", false, "confirm creation without an interactive prompt")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "skillopt train start does not accept positional arguments")
+		return 2
+	}
+	request, err := readSkillOptTrainRequest(*requestText, *requestFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt train start: %v\n", err)
+		return 2
+	}
+	if strings.TrimSpace(*templateID) == "" || strings.TrimSpace(*repoFlag) == "" || strings.TrimSpace(request) == "" {
+		fmt.Fprintln(stderr, "skillopt train start requires --template, --repo, and --request or --request-file")
+		return 2
+	}
+	repo, err := daemon.ParseRepository(*repoFlag)
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt train start: %v\n", err)
+		return 2
+	}
+	workspaceRepo, err := parseOptionalSkillOptTrainRepo("workspace-repo", *workspaceRepoFlag)
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt train start: %v\n", err)
+		return 2
+	}
+	previewRepo, err := parseOptionalSkillOptTrainRepo("preview-repo", *previewRepoFlag)
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt train start: %v\n", err)
+		return 2
+	}
+	normalizedTaskKind, err := normalizeSkillOptTrainTaskKind(*taskKind)
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt train start: %v\n", err)
+		return 2
+	}
+	normalizedMode, normalizedExploration, err := normalizeSkillOptTrainMode(*mode, *explorationLevel)
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt train start: %v\n", err)
+		return 2
+	}
+	if *optionsCount < 0 || *optionsCount == 1 {
+		fmt.Fprintln(stderr, "skillopt train start: --options must be zero or at least 2")
+		return 2
+	}
+	var plan skillOptTrainStartPlan
+	openStore := withStore
+	if *dryRun || !*yes {
+		openStore = withReadOnlyStore
+	}
+	if err := openStore(*home, func(store *db.Store) error {
+		template, err := loadInstalledTemplate(context.Background(), store, *templateID)
+		if err != nil {
+			return err
+		}
+		plan = buildSkillOptTrainStartPlan(template, repo.FullName(), workspaceRepo, previewRepo, strings.TrimSpace(*sessionID), request, normalizedTaskKind, normalizedMode, normalizedExploration, *optionsCount)
+		if *dryRun {
+			return nil
+		}
+		if !*yes {
+			return nil
+		}
+		if _, err := store.GetSkillOptTrainSession(context.Background(), plan.Session.ID); err == nil {
+			return fmt.Errorf("train session %s already exists; use a different --session or inspect it with gitmoot skillopt train status --session %s", plan.Session.ID, plan.Session.ID)
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if err := store.UpsertSkillOptTrainSession(context.Background(), plan.Session); err != nil {
+			return err
+		}
+		return store.UpsertSkillOptTrainIteration(context.Background(), plan.Iteration)
+	}); err != nil {
+		fmt.Fprintf(stderr, "skillopt train start: %v\n", err)
+		return 1
+	}
+	printSkillOptTrainStartPlan(stdout, plan)
+	if *dryRun {
+		writeLine(stdout, "dry_run: true")
+		return 0
+	}
+	if !*yes {
+		writeLine(stdout, "confirmation_required: true")
+		writeLine(stdout, "confirm_command: %s", skillOptTrainConfirmCommand(args, plan.Session.ID))
+		return 2
+	}
+	writeLine(stdout, "created train session %s", plan.Session.ID)
+	return 0
+}
+
+type skillOptTrainStartPlan struct {
+	Session   db.SkillOptTrainSession
+	Iteration db.SkillOptTrainIteration
+	Summary   skillopt.TrainStatusSummary
+}
+
+func buildSkillOptTrainStartPlan(template db.AgentTemplate, repo string, workspaceRepo string, previewRepo string, sessionID string, request string, taskKind string, mode string, explorationLevel string, optionsCount int) skillOptTrainStartPlan {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		sessionID = generatedSkillOptTrainSessionID(template.ID)
+	}
+	metadata := skillOptTrainStartMetadata(request, mode, explorationLevel, optionsCount)
+	session := db.SkillOptTrainSession{
+		ID:                sessionID,
+		TemplateID:        template.ID,
+		TemplateVersionID: template.VersionID,
+		TargetRepo:        repo,
+		WorkspaceRepo:     workspaceRepo,
+		PreviewRepo:       previewRepo,
+		RequestSummary:    firstLine(request),
+		TaskKind:          taskKind,
+		State:             skillopt.TrainStateRequestConfirmed,
+		MetadataJSON:      metadata,
+	}
+	iteration := db.SkillOptTrainIteration{
+		ID:                    sessionID + "-001",
+		SessionID:             sessionID,
+		EvalRunID:             sessionID + "-review-001",
+		BaseTemplateVersionID: template.VersionID,
+		Mode:                  mode,
+		ExplorationLevel:      explorationLevel,
+		State:                 skillopt.TrainStateRequestConfirmed,
+		MetadataJSON:          metadata,
+	}
+	summary := skillopt.BuildTrainStatusSummary(session, &iteration, skillopt.TrainStatusCounts{})
+	return skillOptTrainStartPlan{Session: session, Iteration: iteration, Summary: summary}
+}
+
+func printSkillOptTrainStartPlan(stdout io.Writer, plan skillOptTrainStartPlan) {
+	writeLine(stdout, "session: %s", plan.Session.ID)
+	writeLine(stdout, "template: %s", plan.Session.TemplateID)
+	writeLine(stdout, "template_version: %s", plan.Session.TemplateVersionID)
+	writeLine(stdout, "repo: %s", plan.Session.TargetRepo)
+	writeLine(stdout, "workspace_repo: %s", emptyText(plan.Session.WorkspaceRepo))
+	writeLine(stdout, "preview_repo: %s", emptyText(plan.Session.PreviewRepo))
+	writeLine(stdout, "task_kind: %s", plan.Session.TaskKind)
+	writeLine(stdout, "request_summary: %s", plan.Session.RequestSummary)
+	writeLine(stdout, "iteration: %s", plan.Iteration.ID)
+	writeLine(stdout, "eval_run: %s", plan.Iteration.EvalRunID)
+	writeLine(stdout, "mode: %s", plan.Iteration.Mode)
+	writeLine(stdout, "exploration_level: %s", plan.Iteration.ExplorationLevel)
+	writeLine(stdout, "current_phase: %s", plan.Summary.CurrentPhase)
+	writeLine(stdout, "blocked_step: %s", plan.Summary.BlockedStep)
+	writeLine(stdout, "next_action: %s", plan.Summary.NextAction)
+}
+
+func runSkillOptTrainStatus(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("skillopt train status", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	sessionID := fs.String("session", "", "train session id")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "skillopt train status does not accept positional arguments")
+		return 2
+	}
+	if strings.TrimSpace(*sessionID) == "" {
+		fmt.Fprintln(stderr, "skillopt train status requires --session")
+		return 2
+	}
+	var session db.SkillOptTrainSession
+	var iteration *db.SkillOptTrainIteration
+	var counts skillopt.TrainStatusCounts
+	if err := withStore(*home, func(store *db.Store) error {
+		var err error
+		session, iteration, counts, err = loadSkillOptTrainStatus(context.Background(), store, *sessionID)
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "skillopt train status: %v\n", err)
+		return 1
+	}
+	printSkillOptTrainStatus(stdout, skillopt.BuildTrainStatusSummary(session, iteration, counts), counts)
+	return 0
+}
+
+func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("skillopt train continue", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	sessionID := fs.String("session", "", "train session id")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "skillopt train continue does not accept positional arguments")
+		return 2
+	}
+	if strings.TrimSpace(*sessionID) == "" {
+		fmt.Fprintln(stderr, "skillopt train continue requires --session")
+		return 2
+	}
+	var session db.SkillOptTrainSession
+	var iteration *db.SkillOptTrainIteration
+	var counts skillopt.TrainStatusCounts
+	if err := withStore(*home, func(store *db.Store) error {
+		var err error
+		session, iteration, counts, err = loadSkillOptTrainStatus(context.Background(), store, *sessionID)
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "skillopt train continue: %v\n", err)
+		return 1
+	}
+	summary := skillopt.BuildTrainStatusSummary(session, iteration, counts)
+	printSkillOptTrainStatus(stdout, summary, counts)
+	if summary.CurrentPhase == skillopt.TrainStateRunAbandoned {
+		fmt.Fprintln(stderr, "skillopt train continue: train session is abandoned")
+		return 1
+	}
+	writeLine(stdout, "continue_ready: false")
+	writeLine(stdout, "next: Task 3 will add workspace and item planning; use status for the current blocked step.")
+	return 0
+}
+
+func runSkillOptTrainStop(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("skillopt train stop", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	sessionID := fs.String("session", "", "train session id")
+	reason := fs.String("reason", "", "reason for abandoning the train session")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "skillopt train stop does not accept positional arguments")
+		return 2
+	}
+	if strings.TrimSpace(*sessionID) == "" || strings.TrimSpace(*reason) == "" {
+		fmt.Fprintln(stderr, "skillopt train stop requires --session and --reason")
+		return 2
+	}
+	var stopped db.SkillOptTrainIteration
+	if err := withStore(*home, func(store *db.Store) error {
+		ctx := context.Background()
+		session, err := store.GetSkillOptTrainSession(ctx, strings.TrimSpace(*sessionID))
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("train session %s not found", strings.TrimSpace(*sessionID))
+			}
+			return err
+		}
+		iteration, err := store.GetLatestSkillOptTrainIteration(ctx, session.ID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("train session %s has no iteration to stop", session.ID)
+			}
+			return err
+		}
+		if err := skillopt.CanTransitionTrainIteration(iteration.State, skillopt.TrainStateRunAbandoned); err != nil {
+			return err
+		}
+		session.State = skillopt.TrainStateRunAbandoned
+		session.MetadataJSON = skillOptTrainDecisionMetadata(session.MetadataJSON, *reason)
+		iteration.State = skillopt.TrainStateRunAbandoned
+		iteration.DecisionReason = strings.TrimSpace(*reason)
+		iteration.MetadataJSON = skillOptTrainDecisionMetadata(iteration.MetadataJSON, *reason)
+		if err := store.UpsertSkillOptTrainSession(ctx, session); err != nil {
+			return err
+		}
+		if err := store.UpsertSkillOptTrainIteration(ctx, iteration); err != nil {
+			return err
+		}
+		stopped = iteration
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "skillopt train stop: %v\n", err)
+		return 1
+	}
+	writeLine(stdout, "stopped train session %s", strings.TrimSpace(*sessionID))
+	writeLine(stdout, "iteration: %s", stopped.ID)
+	writeLine(stdout, "reason: %s", strings.TrimSpace(*reason))
+	return 0
+}
+
+func loadSkillOptTrainStatus(ctx context.Context, store *db.Store, sessionID string) (db.SkillOptTrainSession, *db.SkillOptTrainIteration, skillopt.TrainStatusCounts, error) {
+	session, err := store.GetSkillOptTrainSession(ctx, strings.TrimSpace(sessionID))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return db.SkillOptTrainSession{}, nil, skillopt.TrainStatusCounts{}, fmt.Errorf("train session %s not found", strings.TrimSpace(sessionID))
+		}
+		return db.SkillOptTrainSession{}, nil, skillopt.TrainStatusCounts{}, err
+	}
+	latest, err := store.GetLatestSkillOptTrainIteration(ctx, session.ID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return session, nil, skillopt.TrainStatusCounts{}, nil
+		}
+		return db.SkillOptTrainSession{}, nil, skillopt.TrainStatusCounts{}, err
+	}
+	counts, err := loadSkillOptTrainStatusCounts(ctx, store, latest.EvalRunID)
+	if err != nil {
+		return db.SkillOptTrainSession{}, nil, skillopt.TrainStatusCounts{}, err
+	}
+	return session, &latest, counts, nil
+}
+
+func loadSkillOptTrainStatusCounts(ctx context.Context, store *db.Store, runID string) (skillopt.TrainStatusCounts, error) {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return skillopt.TrainStatusCounts{}, nil
+	}
+	items, err := store.ListEvalReviewItems(ctx, runID)
+	if err != nil {
+		return skillopt.TrainStatusCounts{}, err
+	}
+	feedbackEvents, err := store.ListFeedbackEvents(ctx, runID)
+	if err != nil {
+		return skillopt.TrainStatusCounts{}, err
+	}
+	rankedFeedbackEvents, err := store.ListRankedFeedbackEvents(ctx, runID)
+	if err != nil {
+		return skillopt.TrainStatusCounts{}, err
+	}
+	pairwisePreferences, err := store.ListPairwisePreferences(ctx, runID)
+	if err != nil {
+		return skillopt.TrainStatusCounts{}, err
+	}
+	return skillopt.TrainStatusCounts{
+		ReviewItems:          len(items),
+		FeedbackEvents:       len(feedbackEvents),
+		RankedFeedbackEvents: len(rankedFeedbackEvents),
+		PairwisePreferences:  len(pairwisePreferences),
+	}, nil
+}
+
+func printSkillOptTrainStatus(stdout io.Writer, summary skillopt.TrainStatusSummary, counts skillopt.TrainStatusCounts) {
+	writeLine(stdout, "session: %s", summary.SessionID)
+	writeLine(stdout, "iteration: %s", emptyText(summary.IterationID))
+	writeLine(stdout, "current_phase: %s", summary.CurrentPhase)
+	writeLine(stdout, "completed_steps: %s", strings.Join(summary.CompletedSteps, ","))
+	writeLine(stdout, "blocked_step: %s", emptyText(summary.BlockedStep))
+	writeLine(stdout, "next_action: %s", summary.NextAction)
+	writeLine(stdout, "issue: %s", emptyText(summary.IssueURL))
+	writeLine(stdout, "pull_request: %s", emptyText(summary.PullRequestURL))
+	writeLine(stdout, "candidate: %s", emptyText(summary.CandidateVersion))
+	writeLine(stdout, "review_items: %d", counts.ReviewItems)
+	writeLine(stdout, "feedback: %d", summary.FeedbackCount)
+	writeLine(stdout, "pairwise_preferences: %d", counts.PairwisePreferences)
+}
+
+func readSkillOptTrainRequest(requestText string, requestFile string) (string, error) {
+	requestText = strings.TrimSpace(requestText)
+	requestFile = strings.TrimSpace(requestFile)
+	if requestText != "" && requestFile != "" {
+		return "", errors.New("use only one of --request or --request-file")
+	}
+	if requestFile == "" {
+		return requestText, nil
+	}
+	content, err := os.ReadFile(requestFile)
+	if err != nil {
+		return "", fmt.Errorf("read request-file: %w", err)
+	}
+	return strings.TrimSpace(string(content)), nil
+}
+
+func parseOptionalSkillOptTrainRepo(name string, value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	repo, err := daemon.ParseRepository(value)
+	if err != nil {
+		return "", fmt.Errorf("--%s: %w", name, err)
+	}
+	return repo.FullName(), nil
+}
+
+func normalizeSkillOptTrainTaskKind(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		value = "custom"
+	}
+	switch value {
+	case "correctness", "ux", "design", "writing", "data", "custom":
+		return value, nil
+	default:
+		return "", fmt.Errorf("task kind %q is not supported", value)
+	}
+}
+
+func normalizeSkillOptTrainMode(mode string, explorationLevel string) (string, string, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		mode = db.EvalRunModeExplore
+	}
+	switch mode {
+	case db.EvalRunModeExplore, db.EvalRunModeRefine, db.EvalRunModeDistill, db.EvalRunModeValidate:
+	default:
+		return "", "", fmt.Errorf("train mode %q is not supported", mode)
+	}
+	explorationLevel = strings.ToLower(strings.TrimSpace(explorationLevel))
+	if explorationLevel == "" {
+		switch mode {
+		case db.EvalRunModeExplore:
+			explorationLevel = db.ExplorationLevelHigh
+		case db.EvalRunModeRefine:
+			explorationLevel = db.ExplorationLevelMedium
+		default:
+			explorationLevel = db.ExplorationLevelLow
+		}
+	}
+	switch explorationLevel {
+	case db.ExplorationLevelHigh, db.ExplorationLevelMedium, db.ExplorationLevelLow:
+		return mode, explorationLevel, nil
+	default:
+		return "", "", fmt.Errorf("exploration level %q is not supported", explorationLevel)
+	}
+}
+
+func generatedSkillOptTrainSessionID(templateID string) string {
+	base := strings.ToLower(strings.TrimSpace(templateID))
+	if base == "" {
+		base = "template"
+	}
+	var b strings.Builder
+	for _, r := range base {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	now := time.Now().UTC()
+	return "train-" + strings.Trim(b.String(), "-_") + "-" + now.Format("20060102-150405") + fmt.Sprintf("-%09d", now.Nanosecond())
+}
+
+func skillOptTrainStartMetadata(request string, mode string, explorationLevel string, optionsCount int) string {
+	lines := strings.Count(request, "\n") + 1
+	words := len(strings.Fields(request))
+	metadata := map[string]any{
+		"request":           request,
+		"request_lines":     lines,
+		"request_words":     words,
+		"request_chars":     len(request),
+		"mode":              mode,
+		"exploration_level": explorationLevel,
+		"options_count":     optionsCount,
+		"source":            "gitmoot skillopt train start",
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
+}
+
+func skillOptTrainDecisionMetadata(existing string, reason string) string {
+	var metadata map[string]any
+	if strings.TrimSpace(existing) != "" {
+		_ = json.Unmarshal([]byte(existing), &metadata)
+	}
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	metadata["decision_reason"] = strings.TrimSpace(reason)
+	metadata["decision"] = skillopt.TrainStateRunAbandoned
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return existing
+	}
+	return string(encoded)
+}
+
+func skillOptTrainConfirmCommand(args []string, sessionID string) string {
+	filtered := make([]string, 0, len(args)+4)
+	filtered = append(filtered, "gitmoot", "skillopt", "train", "start")
+	hasSession := false
+	for _, arg := range args {
+		if arg == "--dry-run" || arg == "-dry-run" || strings.HasPrefix(arg, "--dry-run=") || strings.HasPrefix(arg, "-dry-run=") || arg == "--yes" || arg == "-yes" || strings.HasPrefix(arg, "--yes=") || strings.HasPrefix(arg, "-yes=") {
+			continue
+		}
+		if arg == "--session" || arg == "-session" || strings.HasPrefix(arg, "--session=") || strings.HasPrefix(arg, "-session=") {
+			hasSession = true
+		}
+		filtered = append(filtered, arg)
+	}
+	if !hasSession && strings.TrimSpace(sessionID) != "" {
+		filtered = append(filtered, "--session", strings.TrimSpace(sessionID))
+	}
+	filtered = append(filtered, "--yes")
+	return shellArgs(filtered)
 }
 
 func runSkillOptReview(args []string, stdout, stderr io.Writer) int {

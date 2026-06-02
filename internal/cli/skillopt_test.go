@@ -3,7 +3,9 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -385,6 +387,315 @@ func TestSkillOptExportIncludesRankedFields(t *testing.T) {
 	}
 	if training.RankedFeedbackEvents[0].ID == "" || training.PairwisePreferences[0].RankedEventID != training.RankedFeedbackEvents[0].ID {
 		t.Fatalf("ranked feedback provenance = %+v pairwise=%+v", training.RankedFeedbackEvents, training.PairwisePreferences)
+	}
+}
+
+func TestSkillOptTrainStartStatusAndStop(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	if err := store.UpsertAgentTemplate(context.Background(), cliSkillOptTemplate("planner", "Plan the work.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	installed, err := store.GetAgentTemplate(context.Background(), "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	requestPath := filepath.Join(t.TempDir(), "request.txt")
+	if err := os.WriteFile(requestPath, []byte("Train landing page plans with diverse review items."), 0o644); err != nil {
+		t.Fatalf("write request file: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--session", "landing-train",
+		"--workspace-repo", "owner/workspace",
+		"--preview-repo", "owner/previews",
+		"--request-file", requestPath,
+		"--task-kind", "design",
+		"--mode", "explore",
+		"--options", "4",
+		"--dry-run",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train start dry-run exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "dry_run: true") || !strings.Contains(stdout.String(), "template_version: "+installed.VersionID) {
+		t.Fatalf("dry-run stdout = %q", stdout.String())
+	}
+	store, err = db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open after dry-run returned error: %v", err)
+	}
+	if _, err := store.GetSkillOptTrainSession(context.Background(), "landing-train"); err == nil {
+		t.Fatalf("dry-run created train session")
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetSkillOptTrainSession dry-run returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after dry-run returned error: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--request", "Train landing page plans.",
+		"--options", "1",
+	}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("train start with one option exit code = %d, want 2; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--options must be zero or at least 2") {
+		t.Fatalf("one-option stderr = %q", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--session", "landing-train",
+		"--request", "Train landing page plans.",
+	}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("train start without yes exit code = %d, want 2; stderr=%s stdout=%s", code, stderr.String(), stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "confirmation_required: true") || !strings.Contains(stdout.String(), "--yes") {
+		t.Fatalf("confirmation stdout = %q", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--session", "landing-train",
+		"--workspace-repo", "owner/workspace",
+		"--preview-repo", "owner/previews",
+		"--request", "Train landing page plans.",
+		"--task-kind", "design",
+		"--mode", "explore",
+		"--options", "4",
+		"--yes",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train start exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "created train session landing-train") {
+		t.Fatalf("train start stdout = %q", stdout.String())
+	}
+	store, err = db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open after start returned error: %v", err)
+	}
+	session, err := store.GetSkillOptTrainSession(context.Background(), "landing-train")
+	if err != nil {
+		t.Fatalf("GetSkillOptTrainSession returned error: %v", err)
+	}
+	if session.TemplateVersionID != installed.VersionID || session.WorkspaceRepo != "owner/workspace" || session.PreviewRepo != "owner/previews" || session.TaskKind != "design" {
+		t.Fatalf("session = %+v", session)
+	}
+	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "landing-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+	if iteration.BaseTemplateVersionID != installed.VersionID || iteration.Mode != db.EvalRunModeExplore || iteration.ExplorationLevel != db.ExplorationLevelHigh || iteration.EvalRunID != "landing-train-review-001" {
+		t.Fatalf("iteration = %+v", iteration)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after start returned error: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--session", "landing-train",
+		"--request", "Overwrite existing train session.",
+		"--yes",
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("duplicate train start exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "already exists") {
+		t.Fatalf("duplicate train start stderr = %q", stderr.String())
+	}
+	store, err = db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open after duplicate start returned error: %v", err)
+	}
+	session, err = store.GetSkillOptTrainSession(context.Background(), "landing-train")
+	if err != nil {
+		t.Fatalf("GetSkillOptTrainSession after duplicate returned error: %v", err)
+	}
+	if session.RequestSummary != "Train landing page plans." {
+		t.Fatalf("duplicate start changed session = %+v", session)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after duplicate start returned error: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "train", "status", "--home", home, "--session", "landing-train"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train status exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "current_phase: request_confirmed") || !strings.Contains(stdout.String(), "blocked_step: workspace_ready") {
+		t.Fatalf("status stdout = %q", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "train", "stop", "--home", home, "--session", "landing-train", "--reason", "trial complete"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train stop exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "stopped train session landing-train") || !strings.Contains(stdout.String(), "reason: trial complete") {
+		t.Fatalf("stop stdout = %q", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "train", "continue", "--home", home, "--session", "landing-train"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("train continue after stop exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "abandoned") {
+		t.Fatalf("continue stderr = %q", stderr.String())
+	}
+
+	store, err = db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open for terminal stop returned error: %v", err)
+	}
+	if err := store.UpsertSkillOptTrainSession(context.Background(), db.SkillOptTrainSession{
+		ID:         "promoted-train",
+		TemplateID: "planner",
+		State:      skillopt.TrainStateCandidatePromoted,
+	}); err != nil {
+		t.Fatalf("UpsertSkillOptTrainSession terminal returned error: %v", err)
+	}
+	if err := store.UpsertSkillOptTrainIteration(context.Background(), db.SkillOptTrainIteration{
+		ID:        "promoted-train-001",
+		SessionID: "promoted-train",
+		State:     skillopt.TrainStateCandidatePromoted,
+	}); err != nil {
+		t.Fatalf("UpsertSkillOptTrainIteration terminal returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close for terminal stop returned error: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "train", "stop", "--home", home, "--session", "promoted-train", "--reason", "do not overwrite"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("train stop after terminal exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "terminal") {
+		t.Fatalf("terminal stop stderr = %q", stderr.String())
+	}
+	store, err = db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open after terminal stop returned error: %v", err)
+	}
+	terminalIteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "promoted-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration terminal returned error: %v", err)
+	}
+	if terminalIteration.State != skillopt.TrainStateCandidatePromoted {
+		t.Fatalf("terminal stop changed iteration = %+v", terminalIteration)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after terminal stop returned error: %v", err)
+	}
+}
+
+func TestGeneratedSkillOptTrainSessionIDIncludesSubsecondEntropy(t *testing.T) {
+	id := generatedSkillOptTrainSessionID("planner")
+	if strings.HasSuffix(id, "-000000000") {
+		t.Fatalf("generated session id used literal nanosecond suffix: %q", id)
+	}
+	second := generatedSkillOptTrainSessionID("planner")
+	if id == second {
+		t.Fatalf("generated session ids collided: %q", id)
+	}
+}
+
+func TestSkillOptTrainStartDryRunDoesNotInitializeFreshHome(t *testing.T) {
+	home := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--request", "Train landing page plans.",
+		"--dry-run",
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("train start dry-run against fresh home exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "not initialized") {
+		t.Fatalf("fresh-home dry-run stderr = %q", stderr.String())
+	}
+	if _, err := os.Stat(config.PathsForHome(home).Home); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dry-run initialized home, stat err=%v", err)
+	}
+}
+
+func TestSkillOptTrainConfirmCommandStripsBoolFlagForms(t *testing.T) {
+	command := skillOptTrainConfirmCommand([]string{
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--request", "Train landing pages.",
+		"--dry-run=true",
+		"-dry-run=false",
+		"--yes=false",
+	}, "generated-session")
+	if strings.Contains(command, "dry-run") || strings.Contains(command, "--yes=false") {
+		t.Fatalf("confirm command kept filtered bool flags: %s", command)
+	}
+	if !strings.Contains(command, "--session generated-session") {
+		t.Fatalf("confirm command did not preserve generated session: %s", command)
+	}
+	if !strings.HasSuffix(command, "--yes") {
+		t.Fatalf("confirm command did not append --yes: %s", command)
+	}
+
+	command = skillOptTrainConfirmCommand([]string{
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--session", "explicit-session",
+		"--request", "Train landing pages.",
+	}, "generated-session")
+	if strings.Contains(command, "generated-session") || !strings.Contains(command, "--session explicit-session") {
+		t.Fatalf("confirm command did not preserve explicit session: %s", command)
 	}
 }
 
