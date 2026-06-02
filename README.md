@@ -275,6 +275,8 @@ gitmoot lock release owner/repo <branch> --owner <agent>
 ```sh
 gitmoot skillopt review create --template <id> --repo owner/repo --run <run-id>
 gitmoot skillopt review item add --run <run-id> --item <item-id> --baseline baseline.md --candidate candidate.md [--title text]
+gitmoot skillopt review create --template <id> --repo owner/repo --run <run-id> --mode explore --options 4
+gitmoot skillopt review item add --run <run-id> --item <item-id> --option a=option-a.md --option b=option-b.md [...]
 gitmoot skillopt review status --run <run-id>
 gitmoot skillopt export --run <run-id> --output training.json
 gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]
@@ -291,6 +293,11 @@ gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issu
 Create a review run, add saved baseline/candidate outputs as review items,
 export a Markdown or GitHub feedback packet, import the completed feedback, then
 export `training.json` for a future external `gitmoot-skillopt` optimizer.
+Use ranked exploration when the template needs broad search: start with
+`--mode explore --options 4` to `6`, rank every option, record useful/rejected
+traits, then narrow into `refine`, `distill`, and finally A/B `validate`.
+`skillopt review status` reports ranking stability and the recommended next
+mode, but the recommendation is advisory only.
 Dry-run optimization validates the contract without model calls:
 
 ```sh
@@ -327,6 +334,10 @@ run-scoped short lines such as `run_id: run-1` followed by
 canonical feedback events and ignores unrelated comments. Repo selection uses
 `--repo`, then the eval run target repo, then the template source repo, then
 optional `[feedback].repo = "owner/reviews"` in Gitmoot config.
+
+Detailed ranked exploration examples, including a landing-page visual task and
+a non-visual writing task, live in
+[docs/skillopt-exchange-contract.md](docs/skillopt-exchange-contract.md).
 
 Detailed command coverage lives in
 [skills/gitmoot/references/CLI.md](skills/gitmoot/references/CLI.md).

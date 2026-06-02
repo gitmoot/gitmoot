@@ -258,6 +258,8 @@ gitmoot lock show owner/repo <branch>
 ```sh
 gitmoot skillopt review create --template <id> --repo owner/repo --run <run-id>
 gitmoot skillopt review item add --run <run-id> --item <item-id> --baseline baseline.md --candidate candidate.md [--title text]
+gitmoot skillopt review create --template <id> --repo owner/repo --run <run-id> --mode explore --exploration-level high --options 4
+gitmoot skillopt review item add --run <run-id> --item <item-id> --option a=option-a.md --option b=option-b.md [...]
 gitmoot skillopt review status --run <run-id>
 gitmoot skillopt export --run <run-id> [--output training.json]
 gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]
@@ -272,10 +274,14 @@ gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issu
 ```
 
 `skillopt review create` starts a review run for a template and target repo.
-`skillopt review item add` stores saved baseline/candidate outputs as artifact
-backed A/B review items. `skillopt review status` reports whether the run has
-items, complete artifacts, imported feedback for every item, and enough metadata
-to export.
+Use the default A/B shape for validation, or pass `--mode explore|refine|distill`
+with `--options N` for ranked exploration. `skillopt review item add` stores
+saved baseline/candidate outputs as artifact-backed A/B review items, or
+repeated `--option label=path` artifacts for ranked N-way items. `skillopt
+review status` reports whether the run has items, complete artifacts, imported
+feedback for every item, ranking stability, pairwise preference count, and a
+recommended next mode. Recommendations are advisory; Gitmoot never changes mode,
+imports a candidate, or promotes a template automatically.
 
 `skillopt export` writes a JSON training package with the template snapshot,
 eval run, review items, artifact manifests, feedback events when present, and
@@ -301,6 +307,10 @@ that Gitmoot uses to validate the full response and import de-blinded canonical
 feedback events. Open `index.md`, review every file in `items/*.md`, set
 `reviewer`, edit `feedback.yml` with exactly one of `a`, `b`, `tie`, `neither`,
 or `skip` for every item, and leave `.assignments.json` untouched.
+Ranked packets use the same files, but `feedback.yml` contains ordered rankings
+plus optional `useful_traits`, `rejected_traits`, and reasoning. After feedback
+exists, packet summaries hide outcome-bearing phase details so later blind
+reviewers do not see the current winner before responding.
 
 The GitHub feedback collector publishes the same blind A/B review packet to a
 new issue by default, or to an existing PR when `--pr <number>` is provided.
@@ -310,3 +320,6 @@ Gitmoot config. Reviewers can reply with full YAML or run-scoped short-form
 lines such as `run_id: run-1` followed by `item-001: b - More concrete.`.
 `github sync` imports valid comments into canonical feedback events and ignores
 unrelated comments safely.
+Ranked GitHub comments can use `item-001 ranking: C > A > D > B` plus trait
+notes. Use the ranked workflow for exploration/refinement and return to A/B
+validation for final promotion decisions on fresh items.
