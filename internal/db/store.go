@@ -179,10 +179,24 @@ type EvalRun struct {
 	TemplateVersionID string
 	TargetRepo        string
 	State             string
+	Mode              string
+	ExplorationLevel  string
+	OptionsCount      int
 	MetadataJSON      string
 	CreatedAt         string
 	UpdatedAt         string
 }
+
+const (
+	EvalRunModeExplore  = "explore"
+	EvalRunModeRefine   = "refine"
+	EvalRunModeDistill  = "distill"
+	EvalRunModeValidate = "validate"
+
+	ExplorationLevelHigh   = "high"
+	ExplorationLevelMedium = "medium"
+	ExplorationLevelLow    = "low"
+)
 
 type EvalReviewItem struct {
 	ID                  string
@@ -199,6 +213,18 @@ type EvalReviewItem struct {
 	UpdatedAt           string
 }
 
+type EvalReviewOption struct {
+	ID           string
+	RunID        string
+	ItemID       string
+	Label        string
+	ArtifactID   string
+	Role         string
+	MetadataJSON string
+	CreatedAt    string
+	UpdatedAt    string
+}
+
 type FeedbackEvent struct {
 	ID        string
 	RunID     string
@@ -209,6 +235,33 @@ type FeedbackEvent struct {
 	Source    string
 	SourceURL string
 	CreatedAt string
+}
+
+type RankedFeedbackEvent struct {
+	ID                 string
+	RunID              string
+	ItemID             string
+	RankingJSON        string
+	Winner             string
+	UsefulTraitsJSON   string
+	RejectedTraitsJSON string
+	Reasoning          string
+	Reviewer           string
+	Source             string
+	SourceURL          string
+	CreatedAt          string
+}
+
+type PairwisePreference struct {
+	RunID         string
+	ItemID        string
+	Preferred     string
+	Rejected      string
+	RankedEventID string
+	Reviewer      string
+	Source        string
+	SourceURL     string
+	CreatedAt     string
 }
 
 type BranchLock struct {
@@ -1689,27 +1742,79 @@ func (s *Store) GetEvalArtifact(ctx context.Context, id string) (EvalArtifact, e
 }
 
 func (s *Store) UpsertEvalRun(ctx context.Context, run EvalRun) error {
-	if strings.TrimSpace(run.ID) == "" {
-		return errors.New("eval run id is required")
+	run, err := normalizeEvalRun(run)
+	if err != nil {
+		return err
 	}
-	if strings.TrimSpace(run.State) == "" {
-		run.State = "draft"
-	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO eval_runs(id, template_id, template_version_id, target_repo, state, metadata_json, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO eval_runs(id, template_id, template_version_id, target_repo, state, mode, exploration_level, options_count, metadata_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
 			template_id = excluded.template_id,
 			template_version_id = excluded.template_version_id,
 			target_repo = excluded.target_repo,
 			state = excluded.state,
+			mode = excluded.mode,
+			exploration_level = excluded.exploration_level,
+			options_count = excluded.options_count,
 			metadata_json = excluded.metadata_json,
 			updated_at = CURRENT_TIMESTAMP`,
-		run.ID, run.TemplateID, run.TemplateVersionID, run.TargetRepo, run.State, run.MetadataJSON)
+		run.ID, run.TemplateID, run.TemplateVersionID, run.TargetRepo, run.State, run.Mode, run.ExplorationLevel, run.OptionsCount, run.MetadataJSON)
 	return err
 }
 
+func normalizeEvalRun(run EvalRun) (EvalRun, error) {
+	run.ID = strings.TrimSpace(run.ID)
+	if run.ID == "" {
+		return EvalRun{}, errors.New("eval run id is required")
+	}
+	run.TemplateID = strings.TrimSpace(run.TemplateID)
+	run.TemplateVersionID = strings.TrimSpace(run.TemplateVersionID)
+	run.TargetRepo = strings.TrimSpace(run.TargetRepo)
+	run.State = strings.TrimSpace(run.State)
+	if run.State == "" {
+		run.State = "draft"
+	}
+	run.Mode = strings.TrimSpace(strings.ToLower(run.Mode))
+	if run.Mode == "" {
+		run.Mode = EvalRunModeValidate
+	}
+	switch run.Mode {
+	case EvalRunModeExplore, EvalRunModeRefine, EvalRunModeDistill, EvalRunModeValidate:
+	default:
+		return EvalRun{}, fmt.Errorf("eval run mode %q is not supported", run.Mode)
+	}
+	run.ExplorationLevel = strings.TrimSpace(strings.ToLower(run.ExplorationLevel))
+	if run.ExplorationLevel == "" {
+		switch run.Mode {
+		case EvalRunModeExplore:
+			run.ExplorationLevel = ExplorationLevelHigh
+		case EvalRunModeRefine:
+			run.ExplorationLevel = ExplorationLevelMedium
+		default:
+			run.ExplorationLevel = ExplorationLevelLow
+		}
+	}
+	switch run.ExplorationLevel {
+	case ExplorationLevelHigh, ExplorationLevelMedium, ExplorationLevelLow:
+	default:
+		return EvalRun{}, fmt.Errorf("eval run exploration level %q is not supported", run.ExplorationLevel)
+	}
+	if run.OptionsCount == 0 {
+		if run.Mode == EvalRunModeExplore {
+			run.OptionsCount = 5
+		} else {
+			run.OptionsCount = 2
+		}
+	}
+	if run.OptionsCount < 2 {
+		return EvalRun{}, errors.New("eval run options count must be at least 2")
+	}
+	run.MetadataJSON = strings.TrimSpace(run.MetadataJSON)
+	return run, nil
+}
+
 func (s *Store) GetEvalRun(ctx context.Context, id string) (EvalRun, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, template_id, template_version_id, target_repo, state, metadata_json, created_at, updated_at
+	row := s.db.QueryRowContext(ctx, `SELECT id, template_id, template_version_id, target_repo, state, mode, exploration_level, options_count, metadata_json, created_at, updated_at
 		FROM eval_runs WHERE id = ?`, id)
 	return scanEvalRun(row)
 }
@@ -1764,6 +1869,80 @@ func (s *Store) ListEvalReviewItems(ctx context.Context, runID string) ([]EvalRe
 	return items, rows.Err()
 }
 
+func (s *Store) UpsertEvalReviewOption(ctx context.Context, option EvalReviewOption) error {
+	option, err := normalizeEvalReviewOption(option)
+	if err != nil {
+		return err
+	}
+	var existingID string
+	if err := s.db.QueryRowContext(ctx, `SELECT id FROM eval_review_options WHERE run_id = ? AND item_id = ? AND label = ?`,
+		option.RunID, option.ItemID, option.Label).Scan(&existingID); err == nil {
+		return fmt.Errorf("eval review option label %q already exists for item %q", option.Label, option.ItemID)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO eval_review_options(
+			id, run_id, item_id, label, artifact_id, role, metadata_json, created_at, updated_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+		option.ID, option.RunID, option.ItemID, option.Label, option.ArtifactID, option.Role, option.MetadataJSON)
+	return err
+}
+
+func normalizeEvalReviewOption(option EvalReviewOption) (EvalReviewOption, error) {
+	option.RunID = strings.TrimSpace(option.RunID)
+	if option.RunID == "" {
+		return EvalReviewOption{}, errors.New("eval review option run id is required")
+	}
+	option.ItemID = strings.TrimSpace(option.ItemID)
+	if option.ItemID == "" {
+		return EvalReviewOption{}, errors.New("eval review option item id is required")
+	}
+	option.Label = normalizeOptionLabel(option.Label)
+	if option.Label == "" {
+		return EvalReviewOption{}, errors.New("eval review option label is required")
+	}
+	option.ArtifactID = strings.TrimSpace(option.ArtifactID)
+	if option.ArtifactID == "" {
+		return EvalReviewOption{}, errors.New("eval review option artifact id is required")
+	}
+	option.Role = strings.TrimSpace(strings.ToLower(option.Role))
+	if option.ID == "" {
+		option.ID = option.RunID + "/" + option.ItemID + "/" + option.Label
+	}
+	option.MetadataJSON = strings.TrimSpace(option.MetadataJSON)
+	return option, nil
+}
+
+func (s *Store) ListEvalReviewOptions(ctx context.Context, runID string, itemID string) ([]EvalReviewOption, error) {
+	runID = strings.TrimSpace(runID)
+	itemID = strings.TrimSpace(itemID)
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if itemID == "" {
+		rows, err = s.db.QueryContext(ctx, `SELECT id, run_id, item_id, label, artifact_id, role, metadata_json, created_at, updated_at
+			FROM eval_review_options WHERE run_id = ? ORDER BY item_id, label`, runID)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `SELECT id, run_id, item_id, label, artifact_id, role, metadata_json, created_at, updated_at
+			FROM eval_review_options WHERE run_id = ? AND item_id = ? ORDER BY label`, runID, itemID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var options []EvalReviewOption
+	for rows.Next() {
+		option, err := scanEvalReviewOption(rows)
+		if err != nil {
+			return nil, err
+		}
+		options = append(options, option)
+	}
+	return options, rows.Err()
+}
+
 func scanEvalArtifact(row interface{ Scan(dest ...any) error }) (EvalArtifact, error) {
 	var artifact EvalArtifact
 	if err := row.Scan(&artifact.ID, &artifact.Hash, &artifact.MediaType, &artifact.SizeBytes, &artifact.Driver, &artifact.CreatedAt); err != nil {
@@ -1774,7 +1953,7 @@ func scanEvalArtifact(row interface{ Scan(dest ...any) error }) (EvalArtifact, e
 
 func scanEvalRun(row interface{ Scan(dest ...any) error }) (EvalRun, error) {
 	var run EvalRun
-	if err := row.Scan(&run.ID, &run.TemplateID, &run.TemplateVersionID, &run.TargetRepo, &run.State, &run.MetadataJSON, &run.CreatedAt, &run.UpdatedAt); err != nil {
+	if err := row.Scan(&run.ID, &run.TemplateID, &run.TemplateVersionID, &run.TargetRepo, &run.State, &run.Mode, &run.ExplorationLevel, &run.OptionsCount, &run.MetadataJSON, &run.CreatedAt, &run.UpdatedAt); err != nil {
 		return EvalRun{}, err
 	}
 	return run, nil
@@ -1787,6 +1966,14 @@ func scanEvalReviewItem(row interface{ Scan(dest ...any) error }) (EvalReviewIte
 		return EvalReviewItem{}, err
 	}
 	return item, nil
+}
+
+func scanEvalReviewOption(row interface{ Scan(dest ...any) error }) (EvalReviewOption, error) {
+	var option EvalReviewOption
+	if err := row.Scan(&option.ID, &option.RunID, &option.ItemID, &option.Label, &option.ArtifactID, &option.Role, &option.MetadataJSON, &option.CreatedAt, &option.UpdatedAt); err != nil {
+		return EvalReviewOption{}, err
+	}
+	return option, nil
 }
 
 func (s *Store) UpsertFeedbackEvent(ctx context.Context, event FeedbackEvent) error {
@@ -1851,6 +2038,241 @@ func scanFeedbackEvent(row interface{ Scan(dest ...any) error }) (FeedbackEvent,
 	return event, nil
 }
 
+func (s *Store) UpsertRankedFeedbackEvent(ctx context.Context, event RankedFeedbackEvent) error {
+	event, err := normalizeRankedFeedbackEvent(event)
+	if err != nil {
+		return err
+	}
+	if err := s.validateRankedFeedbackEventOptions(ctx, event); err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO ranked_feedback_events(
+			id, run_id, item_id, ranking_json, winner, useful_traits_json, rejected_traits_json,
+			reasoning, reviewer, source, source_url, created_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(run_id, item_id, reviewer, source, source_url) DO UPDATE SET
+			id = excluded.id,
+			ranking_json = excluded.ranking_json,
+			winner = excluded.winner,
+			useful_traits_json = excluded.useful_traits_json,
+			rejected_traits_json = excluded.rejected_traits_json,
+			reasoning = excluded.reasoning,
+			reviewer = excluded.reviewer,
+			source = excluded.source,
+			source_url = excluded.source_url,
+			created_at = excluded.created_at`,
+		event.ID, event.RunID, event.ItemID, event.RankingJSON, event.Winner, event.UsefulTraitsJSON, event.RejectedTraitsJSON,
+		event.Reasoning, event.Reviewer, event.Source, event.SourceURL, event.CreatedAt)
+	return err
+}
+
+func (s *Store) validateRankedFeedbackEventOptions(ctx context.Context, event RankedFeedbackEvent) error {
+	run, err := s.GetEvalRun(ctx, event.RunID)
+	if err != nil {
+		return err
+	}
+	options, err := s.ListEvalReviewOptions(ctx, event.RunID, event.ItemID)
+	if err != nil {
+		return err
+	}
+	if len(options) == 0 {
+		return fmt.Errorf("ranked feedback item %s has no registered review options", event.ItemID)
+	}
+	ranking, err := rankedFeedbackRanking(event)
+	if err != nil {
+		return err
+	}
+	expectedOptions := len(options)
+	if run.OptionsCount > 0 {
+		expectedOptions = run.OptionsCount
+		if len(options) != expectedOptions {
+			return fmt.Errorf("ranked feedback item %s has %d registered options, want %d run options", event.ItemID, len(options), expectedOptions)
+		}
+	}
+	if len(ranking) != expectedOptions {
+		return fmt.Errorf("ranked feedback item %s ranking includes %d options, want %d options", event.ItemID, len(ranking), expectedOptions)
+	}
+	known := make(map[string]struct{}, len(options))
+	for _, option := range options {
+		known[normalizeOptionLabel(option.Label)] = struct{}{}
+	}
+	ranked := make(map[string]struct{}, len(ranking))
+	for _, label := range ranking {
+		if _, ok := known[label]; !ok {
+			return fmt.Errorf("ranked feedback item %s references unknown option %q", event.ItemID, label)
+		}
+		ranked[label] = struct{}{}
+	}
+	for label := range known {
+		if _, ok := ranked[label]; !ok {
+			return fmt.Errorf("ranked feedback item %s missing registered option %q", event.ItemID, label)
+		}
+	}
+	if event.Winner != "" {
+		if _, ok := known[event.Winner]; !ok {
+			return fmt.Errorf("ranked feedback item %s winner references unknown option %q", event.ItemID, event.Winner)
+		}
+		if event.Winner != ranking[0] {
+			return fmt.Errorf("ranked feedback item %s winner %q does not match first ranked option %q", event.ItemID, event.Winner, ranking[0])
+		}
+	}
+	for _, traits := range []struct {
+		name string
+		json string
+	}{
+		{name: "useful_traits_json", json: event.UsefulTraitsJSON},
+		{name: "rejected_traits_json", json: event.RejectedTraitsJSON},
+	} {
+		if strings.TrimSpace(traits.json) == "" {
+			continue
+		}
+		var decoded map[string][]string
+		if err := json.Unmarshal([]byte(traits.json), &decoded); err != nil {
+			return fmt.Errorf("ranked feedback %s must be a JSON object keyed by option label: %w", traits.name, err)
+		}
+		for label := range decoded {
+			normalized := normalizeOptionLabel(label)
+			if normalized == "" {
+				return fmt.Errorf("ranked feedback %s contains an empty option label", traits.name)
+			}
+			if _, ok := known[normalized]; !ok {
+				return fmt.Errorf("ranked feedback %s references unknown option %q", traits.name, normalized)
+			}
+		}
+	}
+	return nil
+}
+
+func normalizeRankedFeedbackEvent(event RankedFeedbackEvent) (RankedFeedbackEvent, error) {
+	event.RunID = strings.TrimSpace(event.RunID)
+	if event.RunID == "" {
+		return RankedFeedbackEvent{}, errors.New("ranked feedback run id is required")
+	}
+	event.ItemID = strings.TrimSpace(event.ItemID)
+	if event.ItemID == "" {
+		return RankedFeedbackEvent{}, errors.New("ranked feedback item id is required")
+	}
+	event.Winner = normalizeOptionLabel(event.Winner)
+	event.RankingJSON = strings.TrimSpace(event.RankingJSON)
+	if event.RankingJSON == "" {
+		return RankedFeedbackEvent{}, errors.New("ranked feedback ranking_json is required")
+	}
+	if _, err := rankedFeedbackRanking(event); err != nil {
+		return RankedFeedbackEvent{}, err
+	}
+	event.UsefulTraitsJSON = strings.TrimSpace(event.UsefulTraitsJSON)
+	event.RejectedTraitsJSON = strings.TrimSpace(event.RejectedTraitsJSON)
+	event.Reasoning = strings.TrimSpace(event.Reasoning)
+	event.Reviewer = strings.TrimSpace(event.Reviewer)
+	if event.Reviewer == "" {
+		return RankedFeedbackEvent{}, errors.New("ranked feedback reviewer is required")
+	}
+	event.Source = strings.TrimSpace(event.Source)
+	if event.Source == "" {
+		return RankedFeedbackEvent{}, errors.New("ranked feedback source is required")
+	}
+	event.SourceURL = strings.TrimSpace(event.SourceURL)
+	if strings.TrimSpace(event.CreatedAt) == "" {
+		event.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	if strings.TrimSpace(event.ID) == "" {
+		event.ID = rankedFeedbackEventID(event)
+	}
+	return event, nil
+}
+
+func rankedFeedbackRanking(event RankedFeedbackEvent) ([]string, error) {
+	var ranking []string
+	if err := json.Unmarshal([]byte(event.RankingJSON), &ranking); err != nil {
+		return nil, fmt.Errorf("ranked feedback ranking_json must be a JSON array of option labels: %w", err)
+	}
+	if len(ranking) < 2 {
+		return nil, errors.New("ranked feedback ranking must include at least two options")
+	}
+	seen := map[string]struct{}{}
+	for index, label := range ranking {
+		normalized := normalizeOptionLabel(label)
+		if normalized == "" {
+			return nil, fmt.Errorf("ranked feedback ranking contains empty option label at position %d", index+1)
+		}
+		if _, ok := seen[normalized]; ok {
+			return nil, fmt.Errorf("ranked feedback ranking contains duplicate option label %q", normalized)
+		}
+		seen[normalized] = struct{}{}
+		ranking[index] = normalized
+	}
+	return ranking, nil
+}
+
+func (s *Store) ListRankedFeedbackEvents(ctx context.Context, runID string) ([]RankedFeedbackEvent, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, item_id, ranking_json, winner, useful_traits_json, rejected_traits_json,
+			reasoning, reviewer, source, source_url, created_at
+		FROM ranked_feedback_events WHERE run_id = ? ORDER BY item_id, reviewer, source, source_url`, strings.TrimSpace(runID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var events []RankedFeedbackEvent
+	for rows.Next() {
+		event, err := scanRankedFeedbackEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
+}
+
+func scanRankedFeedbackEvent(row interface{ Scan(dest ...any) error }) (RankedFeedbackEvent, error) {
+	var event RankedFeedbackEvent
+	if err := row.Scan(&event.ID, &event.RunID, &event.ItemID, &event.RankingJSON, &event.Winner, &event.UsefulTraitsJSON, &event.RejectedTraitsJSON,
+		&event.Reasoning, &event.Reviewer, &event.Source, &event.SourceURL, &event.CreatedAt); err != nil {
+		return RankedFeedbackEvent{}, err
+	}
+	return event, nil
+}
+
+func (s *Store) ListPairwisePreferences(ctx context.Context, runID string) ([]PairwisePreference, error) {
+	events, err := s.ListRankedFeedbackEvents(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	preferences := []PairwisePreference{}
+	for _, event := range events {
+		eventPreferences, err := PairwisePreferencesForRankedFeedback(event)
+		if err != nil {
+			return nil, err
+		}
+		preferences = append(preferences, eventPreferences...)
+	}
+	return preferences, nil
+}
+
+func PairwisePreferencesForRankedFeedback(event RankedFeedbackEvent) ([]PairwisePreference, error) {
+	ranking, err := rankedFeedbackRanking(event)
+	if err != nil {
+		return nil, err
+	}
+	preferences := make([]PairwisePreference, 0, len(ranking)*(len(ranking)-1)/2)
+	for preferredIndex, preferred := range ranking {
+		for _, rejected := range ranking[preferredIndex+1:] {
+			preferences = append(preferences, PairwisePreference{
+				RunID:         event.RunID,
+				ItemID:        event.ItemID,
+				Preferred:     preferred,
+				Rejected:      rejected,
+				RankedEventID: event.ID,
+				Reviewer:      event.Reviewer,
+				Source:        event.Source,
+				SourceURL:     event.SourceURL,
+				CreatedAt:     event.CreatedAt,
+			})
+		}
+	}
+	return preferences, nil
+}
+
 func feedbackEventID(event FeedbackEvent) string {
 	parts := []string{event.RunID, event.ItemID, event.Reviewer, event.Source, event.SourceURL}
 	for index, part := range parts {
@@ -1859,6 +2281,20 @@ func feedbackEventID(event FeedbackEvent) string {
 	content, _ := json.Marshal(parts)
 	sum := sha256.Sum256(content)
 	return "feedback:" + hex.EncodeToString(sum[:])
+}
+
+func rankedFeedbackEventID(event RankedFeedbackEvent) string {
+	parts := []string{event.RunID, event.ItemID, event.Reviewer, event.Source, event.SourceURL}
+	for index, part := range parts {
+		parts[index] = strings.TrimSpace(part)
+	}
+	content, _ := json.Marshal(parts)
+	sum := sha256.Sum256(content)
+	return "ranked-feedback:" + hex.EncodeToString(sum[:])
+}
+
+func normalizeOptionLabel(label string) string {
+	return strings.ToLower(strings.TrimSpace(label))
 }
 
 func (s *Store) AcquireResourceLock(ctx context.Context, lock ResourceLock, now time.Time) (bool, error) {
@@ -2681,6 +3117,40 @@ CREATE TABLE agent_template_candidate_reviews (
 	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	decided_at TEXT NOT NULL DEFAULT ''
+);
+	`,
+	`
+ALTER TABLE eval_runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'validate';
+ALTER TABLE eval_runs ADD COLUMN exploration_level TEXT NOT NULL DEFAULT 'low';
+ALTER TABLE eval_runs ADD COLUMN options_count INTEGER NOT NULL DEFAULT 2;
+
+CREATE TABLE eval_review_options (
+	id TEXT PRIMARY KEY,
+	run_id TEXT NOT NULL,
+	item_id TEXT NOT NULL,
+	label TEXT NOT NULL,
+	artifact_id TEXT NOT NULL,
+	role TEXT NOT NULL DEFAULT '',
+	metadata_json TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE(run_id, item_id, label)
+);
+
+CREATE TABLE ranked_feedback_events (
+	id TEXT PRIMARY KEY,
+	run_id TEXT NOT NULL,
+	item_id TEXT NOT NULL,
+	ranking_json TEXT NOT NULL,
+	winner TEXT NOT NULL DEFAULT '',
+	useful_traits_json TEXT NOT NULL DEFAULT '',
+	rejected_traits_json TEXT NOT NULL DEFAULT '',
+	reasoning TEXT NOT NULL DEFAULT '',
+	reviewer TEXT NOT NULL,
+	source TEXT NOT NULL,
+	source_url TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE(run_id, item_id, reviewer, source, source_url)
 );
 	`,
 }

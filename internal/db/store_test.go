@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -37,7 +38,9 @@ func TestOpenMigratesSchema(t *testing.T) {
 		"eval_artifacts",
 		"eval_runs",
 		"eval_review_items",
+		"eval_review_options",
 		"feedback_events",
+		"ranked_feedback_events",
 	} {
 		ok, err := store.HasTable(ctx, table)
 		if err != nil {
@@ -85,6 +88,9 @@ func TestEvalStorageMethods(t *testing.T) {
 		TemplateVersionID: "planner@v2",
 		TargetRepo:        "owner/repo",
 		State:             "review",
+		Mode:              EvalRunModeExplore,
+		ExplorationLevel:  ExplorationLevelHigh,
+		OptionsCount:      5,
 		MetadataJSON:      `{"seed":1}`,
 	}
 	if err := store.UpsertEvalRun(ctx, run); err != nil {
@@ -94,7 +100,7 @@ func TestEvalStorageMethods(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetEvalRun returned error: %v", err)
 	}
-	if storedRun.TemplateVersionID != "planner@v2" || storedRun.MetadataJSON != `{"seed":1}` {
+	if storedRun.TemplateVersionID != "planner@v2" || storedRun.Mode != EvalRunModeExplore || storedRun.ExplorationLevel != ExplorationLevelHigh || storedRun.OptionsCount != 5 || storedRun.MetadataJSON != `{"seed":1}` {
 		t.Fatalf("stored run = %+v", storedRun)
 	}
 
@@ -121,6 +127,219 @@ func TestEvalStorageMethods(t *testing.T) {
 	}
 	if items[0].ID != "run-1/item-001" || items[0].DiffArtifactID != artifact.ID || items[0].MetadataJSON != `{"path":"README.md"}` {
 		t.Fatalf("review item = %+v", items[0])
+	}
+}
+
+func TestEvalRunDefaultsToValidationMode(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.UpsertEvalRun(ctx, EvalRun{ID: "run-1", State: "review"}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+	run, err := store.GetEvalRun(ctx, "run-1")
+	if err != nil {
+		t.Fatalf("GetEvalRun returned error: %v", err)
+	}
+	if run.Mode != EvalRunModeValidate || run.ExplorationLevel != ExplorationLevelLow || run.OptionsCount != 2 {
+		t.Fatalf("run defaults = %+v", run)
+	}
+}
+
+func TestEvalRunRejectsInvalidModeAndExplorationLevel(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.UpsertEvalRun(ctx, EvalRun{ID: "run-1", Mode: "wide"}); err == nil || !strings.Contains(err.Error(), "mode") {
+		t.Fatalf("invalid mode error = %v", err)
+	}
+	if err := store.UpsertEvalRun(ctx, EvalRun{ID: "run-1", ExplorationLevel: "huge"}); err == nil || !strings.Contains(err.Error(), "exploration level") {
+		t.Fatalf("invalid exploration level error = %v", err)
+	}
+	if err := store.UpsertEvalRun(ctx, EvalRun{ID: "run-1", OptionsCount: 1}); err == nil || !strings.Contains(err.Error(), "at least 2") {
+		t.Fatalf("invalid options count error = %v", err)
+	}
+}
+
+func TestRankedReviewStorageAndPairwisePreferences(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.UpsertEvalRun(ctx, EvalRun{
+		ID:               "run-ranked",
+		State:            "review",
+		Mode:             EvalRunModeExplore,
+		ExplorationLevel: ExplorationLevelHigh,
+		OptionsCount:     5,
+	}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+	if err := store.UpsertEvalReviewItem(ctx, EvalReviewItem{RunID: "run-ranked", ItemID: "item-001", Title: "Landing page"}); err != nil {
+		t.Fatalf("UpsertEvalReviewItem returned error: %v", err)
+	}
+	for _, label := range []string{"a", "b", "c", "d", "e"} {
+		if err := store.UpsertEvalReviewOption(ctx, EvalReviewOption{
+			RunID:      "run-ranked",
+			ItemID:     "item-001",
+			Label:      label,
+			ArtifactID: "artifact-" + label,
+		}); err != nil {
+			t.Fatalf("UpsertEvalReviewOption %s returned error: %v", label, err)
+		}
+	}
+	options, err := store.ListEvalReviewOptions(ctx, "run-ranked", "item-001")
+	if err != nil {
+		t.Fatalf("ListEvalReviewOptions returned error: %v", err)
+	}
+	if len(options) != 5 || options[0].Label != "a" || options[4].ArtifactID != "artifact-e" {
+		t.Fatalf("options = %+v", options)
+	}
+
+	ranking, _ := json.Marshal([]string{"c", "a", "d", "b", "e"})
+	useful, _ := json.Marshal(map[string][]string{
+		"a": {"visual style"},
+		"d": {"motion"},
+	})
+	rejected, _ := json.Marshal(map[string][]string{
+		"b": {"generic"},
+	})
+	event := RankedFeedbackEvent{
+		RunID:              "run-ranked",
+		ItemID:             "item-001",
+		RankingJSON:        string(ranking),
+		Winner:             "c",
+		UsefulTraitsJSON:   string(useful),
+		RejectedTraitsJSON: string(rejected),
+		Reasoning:          "C is clearest.",
+		Reviewer:           "jerry",
+		Source:             "github",
+		SourceURL:          "https://github.com/example/repo/pull/1#issuecomment-1",
+		CreatedAt:          "2026-06-02T10:00:00Z",
+	}
+	if err := store.UpsertRankedFeedbackEvent(ctx, event); err != nil {
+		t.Fatalf("UpsertRankedFeedbackEvent returned error: %v", err)
+	}
+	stored, err := store.ListRankedFeedbackEvents(ctx, "run-ranked")
+	if err != nil {
+		t.Fatalf("ListRankedFeedbackEvents returned error: %v", err)
+	}
+	if len(stored) != 1 || stored[0].Winner != "c" || stored[0].ID == "" {
+		t.Fatalf("stored ranked feedback = %+v", stored)
+	}
+	pairs, err := store.ListPairwisePreferences(ctx, "run-ranked")
+	if err != nil {
+		t.Fatalf("ListPairwisePreferences returned error: %v", err)
+	}
+	if len(pairs) != 10 {
+		t.Fatalf("pairwise preferences len = %d, want 10: %+v", len(pairs), pairs)
+	}
+	if pairs[0].Preferred != "c" || pairs[0].Rejected != "a" || pairs[9].Preferred != "b" || pairs[9].Rejected != "e" {
+		t.Fatalf("pairwise preferences = %+v", pairs)
+	}
+}
+
+func TestRankedReviewStorageRejectsInvalidReferences(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.UpsertEvalRun(ctx, EvalRun{ID: "run-ranked", Mode: EvalRunModeExplore, OptionsCount: 3}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+	if err := store.UpsertEvalReviewItem(ctx, EvalReviewItem{RunID: "run-ranked", ItemID: "item-001"}); err != nil {
+		t.Fatalf("UpsertEvalReviewItem returned error: %v", err)
+	}
+	for _, label := range []string{"a", "b", "c"} {
+		if err := store.UpsertEvalReviewOption(ctx, EvalReviewOption{RunID: "run-ranked", ItemID: "item-001", Label: label, ArtifactID: "artifact-" + label}); err != nil {
+			t.Fatalf("UpsertEvalReviewOption %s returned error: %v", label, err)
+		}
+	}
+	if err := store.UpsertEvalReviewOption(ctx, EvalReviewOption{RunID: "run-ranked", ItemID: "item-001", Label: "A", ArtifactID: "artifact-duplicate"}); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("duplicate UpsertEvalReviewOption error = %v, want already exists", err)
+	}
+
+	tests := map[string]RankedFeedbackEvent{
+		"duplicate label": {
+			RankingJSON: `["a","a"]`,
+		},
+		"partial ranking": {
+			RankingJSON: `["a","b"]`,
+		},
+		"unknown option": {
+			RankingJSON: `["a","b","d"]`,
+		},
+		"unknown winner": {
+			RankingJSON: `["a","b","c"]`,
+			Winner:      "d",
+		},
+		"winner contradicts ranking": {
+			RankingJSON: `["a","b","c"]`,
+			Winner:      "b",
+		},
+		"unknown useful trait option": {
+			RankingJSON:      `["a","b","c"]`,
+			UsefulTraitsJSON: `{"d":["motion"]}`,
+		},
+	}
+	for name, event := range tests {
+		t.Run(name, func(t *testing.T) {
+			event.RunID = "run-ranked"
+			event.ItemID = "item-001"
+			event.Reviewer = "jerry"
+			event.Source = "github"
+			event.SourceURL = name
+			err := store.UpsertRankedFeedbackEvent(ctx, event)
+			if err == nil {
+				t.Fatal("UpsertRankedFeedbackEvent returned nil error")
+			}
+		})
+	}
+}
+
+func TestRankedReviewStorageRejectsOptionCountMismatch(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.UpsertEvalRun(ctx, EvalRun{ID: "run-ranked", Mode: EvalRunModeExplore, OptionsCount: 5}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+	if err := store.UpsertEvalReviewItem(ctx, EvalReviewItem{RunID: "run-ranked", ItemID: "item-001"}); err != nil {
+		t.Fatalf("UpsertEvalReviewItem returned error: %v", err)
+	}
+	for _, label := range []string{"a", "b", "c", "d"} {
+		if err := store.UpsertEvalReviewOption(ctx, EvalReviewOption{RunID: "run-ranked", ItemID: "item-001", Label: label, ArtifactID: "artifact-" + label}); err != nil {
+			t.Fatalf("UpsertEvalReviewOption %s returned error: %v", label, err)
+		}
+	}
+	err = store.UpsertRankedFeedbackEvent(ctx, RankedFeedbackEvent{
+		RunID:       "run-ranked",
+		ItemID:      "item-001",
+		RankingJSON: `["a","b","c","d"]`,
+		Reviewer:    "jerry",
+		Source:      "github",
+		SourceURL:   "mismatch",
+	})
+	if err == nil || !strings.Contains(err.Error(), "registered options") {
+		t.Fatalf("option count mismatch error = %v, want registered options", err)
 	}
 }
 
