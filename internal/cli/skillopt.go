@@ -543,9 +543,6 @@ func reviewTrainingBlockers(ctx context.Context, store *db.Store, run db.EvalRun
 			blockers = append(blockers, fmt.Sprintf("item %s has no imported feedback", itemID))
 		}
 	}
-	if skillOptRunUsesRankedOptions(run) && len(rankedEvents) > 0 {
-		blockers = append(blockers, "ranked feedback export is not implemented yet")
-	}
 	if _, err := skillopt.ExportTrainingPackage(ctx, store, run.ID); err != nil {
 		blockers = append(blockers, fmt.Sprintf("training export failed: %v", err))
 	}

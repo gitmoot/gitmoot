@@ -55,18 +55,29 @@ type EvalRun struct {
 	TemplateVersionID string          `json:"template_version_id"`
 	TargetRepo        string          `json:"target_repo"`
 	State             string          `json:"state"`
+	Mode              string          `json:"mode,omitempty"`
+	ExplorationLevel  string          `json:"exploration_level,omitempty"`
+	OptionsCount      int             `json:"options_count,omitempty"`
 	Metadata          json.RawMessage `json:"metadata,omitempty"`
 }
 
+type EvalReviewOption struct {
+	Label      string          `json:"label"`
+	ArtifactID string          `json:"artifact_id"`
+	Role       string          `json:"role,omitempty"`
+	Metadata   json.RawMessage `json:"metadata,omitempty"`
+}
+
 type EvalItem struct {
-	ID                  string          `json:"id"`
-	Title               string          `json:"title,omitempty"`
-	SourceArtifactID    string          `json:"source_artifact_id,omitempty"`
-	BaselineArtifactID  string          `json:"baseline_artifact_id,omitempty"`
-	CandidateArtifactID string          `json:"candidate_artifact_id,omitempty"`
-	PreviewArtifactID   string          `json:"preview_artifact_id,omitempty"`
-	DiffArtifactID      string          `json:"diff_artifact_id,omitempty"`
-	Metadata            json.RawMessage `json:"metadata,omitempty"`
+	ID                  string             `json:"id"`
+	Title               string             `json:"title,omitempty"`
+	SourceArtifactID    string             `json:"source_artifact_id,omitempty"`
+	BaselineArtifactID  string             `json:"baseline_artifact_id,omitempty"`
+	CandidateArtifactID string             `json:"candidate_artifact_id,omitempty"`
+	PreviewArtifactID   string             `json:"preview_artifact_id,omitempty"`
+	DiffArtifactID      string             `json:"diff_artifact_id,omitempty"`
+	Options             []EvalReviewOption `json:"options,omitempty"`
+	Metadata            json.RawMessage    `json:"metadata,omitempty"`
 }
 
 type FeedbackEvent struct {
@@ -80,15 +91,44 @@ type FeedbackEvent struct {
 	CreatedAt string `json:"created_at"`
 }
 
+type RankedFeedbackEvent struct {
+	ID             string          `json:"id"`
+	RunID          string          `json:"run_id"`
+	ItemID         string          `json:"item_id"`
+	Ranking        []string        `json:"ranking"`
+	Winner         string          `json:"winner,omitempty"`
+	UsefulTraits   json.RawMessage `json:"useful_traits,omitempty"`
+	RejectedTraits json.RawMessage `json:"rejected_traits,omitempty"`
+	Reasoning      string          `json:"reasoning,omitempty"`
+	Reviewer       string          `json:"reviewer"`
+	Source         string          `json:"source"`
+	SourceURL      string          `json:"source_url,omitempty"`
+	CreatedAt      string          `json:"created_at"`
+}
+
+type PairwisePreference struct {
+	RunID         string `json:"run_id"`
+	ItemID        string `json:"item_id"`
+	Preferred     string `json:"preferred"`
+	Rejected      string `json:"rejected"`
+	RankedEventID string `json:"ranked_event_id"`
+	Reviewer      string `json:"reviewer"`
+	Source        string `json:"source"`
+	SourceURL     string `json:"source_url,omitempty"`
+	CreatedAt     string `json:"created_at"`
+}
+
 type TrainingPackage struct {
-	Kind            string           `json:"kind"`
-	ContractVersion int              `json:"contract_version"`
-	Template        TemplateSnapshot `json:"template"`
-	EvalRun         EvalRun          `json:"eval_run"`
-	Items           []EvalItem       `json:"items"`
-	Artifacts       []ArtifactRef    `json:"artifacts"`
-	FeedbackEvents  []FeedbackEvent  `json:"feedback_events"`
-	EvaluatorConfig json.RawMessage  `json:"evaluator_config,omitempty"`
+	Kind                 string                `json:"kind"`
+	ContractVersion      int                   `json:"contract_version"`
+	Template             TemplateSnapshot      `json:"template"`
+	EvalRun              EvalRun               `json:"eval_run"`
+	Items                []EvalItem            `json:"items"`
+	Artifacts            []ArtifactRef         `json:"artifacts"`
+	FeedbackEvents       []FeedbackEvent       `json:"feedback_events"`
+	RankedFeedbackEvents []RankedFeedbackEvent `json:"ranked_feedback_events,omitempty"`
+	PairwisePreferences  []PairwisePreference  `json:"pairwise_preferences,omitempty"`
+	EvaluatorConfig      json.RawMessage       `json:"evaluator_config,omitempty"`
 }
 
 type CandidateTemplate struct {
@@ -156,7 +196,11 @@ func ExportTrainingPackage(ctx context.Context, store *db.Store, runID string) (
 	exportItems := make([]EvalItem, 0, len(items))
 	artifactIDs := map[string]struct{}{}
 	for _, item := range items {
-		exportItem, err := evalItem(item)
+		options, err := loadEvalReviewOptions(ctx, store, run.ID, item.ItemID)
+		if err != nil {
+			return TrainingPackage{}, fmt.Errorf("load item %s options: %w", item.ItemID, err)
+		}
+		exportItem, err := evalItem(item, options)
 		if err != nil {
 			return TrainingPackage{}, err
 		}
@@ -164,12 +208,23 @@ func ExportTrainingPackage(ctx context.Context, store *db.Store, runID string) (
 		for _, id := range itemArtifactIDs(item) {
 			artifactIDs[id] = struct{}{}
 		}
+		for _, option := range options {
+			artifactIDs[option.ArtifactID] = struct{}{}
+		}
 	}
 	artifacts, err := loadArtifactRefs(ctx, store, artifactIDs)
 	if err != nil {
 		return TrainingPackage{}, err
 	}
 	feedbackEvents, err := loadFeedbackEvents(ctx, store, run.ID)
+	if err != nil {
+		return TrainingPackage{}, err
+	}
+	rankedFeedbackEvents, err := loadRankedFeedbackEvents(ctx, store, run.ID)
+	if err != nil {
+		return TrainingPackage{}, err
+	}
+	pairwisePreferences, err := loadPairwisePreferences(ctx, store, run.ID)
 	if err != nil {
 		return TrainingPackage{}, err
 	}
@@ -187,12 +242,17 @@ func ExportTrainingPackage(ctx context.Context, store *db.Store, runID string) (
 			TemplateVersionID: run.TemplateVersionID,
 			TargetRepo:        run.TargetRepo,
 			State:             run.State,
+			Mode:              run.Mode,
+			ExplorationLevel:  run.ExplorationLevel,
+			OptionsCount:      run.OptionsCount,
 			Metadata:          metadata,
 		},
-		Items:           exportItems,
-		Artifacts:       artifacts,
-		FeedbackEvents:  feedbackEvents,
-		EvaluatorConfig: metadata,
+		Items:                exportItems,
+		Artifacts:            artifacts,
+		FeedbackEvents:       feedbackEvents,
+		RankedFeedbackEvents: rankedFeedbackEvents,
+		PairwisePreferences:  pairwisePreferences,
+		EvaluatorConfig:      metadata,
 	}, nil
 }
 
@@ -482,7 +542,7 @@ func templateSnapshot(template db.AgentTemplate) (TemplateSnapshot, error) {
 	}, nil
 }
 
-func evalItem(item db.EvalReviewItem) (EvalItem, error) {
+func evalItem(item db.EvalReviewItem, options []EvalReviewOption) (EvalItem, error) {
 	metadata, err := rawJSON(item.MetadataJSON)
 	if err != nil {
 		return EvalItem{}, fmt.Errorf("eval item %s metadata_json: %w", item.ItemID, err)
@@ -495,8 +555,30 @@ func evalItem(item db.EvalReviewItem) (EvalItem, error) {
 		CandidateArtifactID: item.CandidateArtifactID,
 		PreviewArtifactID:   item.PreviewArtifactID,
 		DiffArtifactID:      item.DiffArtifactID,
+		Options:             options,
 		Metadata:            metadata,
 	}, nil
+}
+
+func loadEvalReviewOptions(ctx context.Context, store *db.Store, runID string, itemID string) ([]EvalReviewOption, error) {
+	options, err := store.ListEvalReviewOptions(ctx, runID, itemID)
+	if err != nil {
+		return nil, err
+	}
+	output := make([]EvalReviewOption, 0, len(options))
+	for _, option := range options {
+		metadata, err := rawJSON(option.MetadataJSON)
+		if err != nil {
+			return nil, fmt.Errorf("review option %s metadata_json: %w", option.Label, err)
+		}
+		output = append(output, EvalReviewOption{
+			Label:      option.Label,
+			ArtifactID: option.ArtifactID,
+			Role:       option.Role,
+			Metadata:   metadata,
+		})
+	}
+	return output, nil
 }
 
 func itemArtifactIDs(item db.EvalReviewItem) []string {
@@ -556,6 +638,73 @@ func loadFeedbackEvents(ctx context.Context, store *db.Store, runID string) ([]F
 			Source:    event.Source,
 			SourceURL: event.SourceURL,
 			CreatedAt: event.CreatedAt,
+		})
+	}
+	return output, nil
+}
+
+func loadRankedFeedbackEvents(ctx context.Context, store *db.Store, runID string) ([]RankedFeedbackEvent, error) {
+	events, err := store.ListRankedFeedbackEvents(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	output := make([]RankedFeedbackEvent, 0, len(events))
+	for _, event := range events {
+		ranking, err := rankedFeedbackRanking(event)
+		if err != nil {
+			return nil, err
+		}
+		usefulTraits, err := rawJSON(event.UsefulTraitsJSON)
+		if err != nil {
+			return nil, fmt.Errorf("ranked feedback %s useful_traits_json: %w", event.ID, err)
+		}
+		rejectedTraits, err := rawJSON(event.RejectedTraitsJSON)
+		if err != nil {
+			return nil, fmt.Errorf("ranked feedback %s rejected_traits_json: %w", event.ID, err)
+		}
+		output = append(output, RankedFeedbackEvent{
+			ID:             event.ID,
+			RunID:          event.RunID,
+			ItemID:         event.ItemID,
+			Ranking:        ranking,
+			Winner:         event.Winner,
+			UsefulTraits:   usefulTraits,
+			RejectedTraits: rejectedTraits,
+			Reasoning:      event.Reasoning,
+			Reviewer:       event.Reviewer,
+			Source:         event.Source,
+			SourceURL:      event.SourceURL,
+			CreatedAt:      event.CreatedAt,
+		})
+	}
+	return output, nil
+}
+
+func rankedFeedbackRanking(event db.RankedFeedbackEvent) ([]string, error) {
+	var ranking []string
+	if err := json.Unmarshal([]byte(event.RankingJSON), &ranking); err != nil {
+		return nil, fmt.Errorf("ranked feedback %s ranking_json: %w", event.ID, err)
+	}
+	return ranking, nil
+}
+
+func loadPairwisePreferences(ctx context.Context, store *db.Store, runID string) ([]PairwisePreference, error) {
+	preferences, err := store.ListPairwisePreferences(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	output := make([]PairwisePreference, 0, len(preferences))
+	for _, preference := range preferences {
+		output = append(output, PairwisePreference{
+			RunID:         preference.RunID,
+			ItemID:        preference.ItemID,
+			Preferred:     preference.Preferred,
+			Rejected:      preference.Rejected,
+			RankedEventID: preference.RankedEventID,
+			Reviewer:      preference.Reviewer,
+			Source:        preference.Source,
+			SourceURL:     preference.SourceURL,
+			CreatedAt:     preference.CreatedAt,
 		})
 	}
 	return output, nil

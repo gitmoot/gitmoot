@@ -283,6 +283,111 @@ items:
 	}
 }
 
+func TestSkillOptExportIncludesRankedFields(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	template := cliSkillOptTemplate("planner", "Plan the work.")
+	if err := store.UpsertAgentTemplate(context.Background(), template); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	installed, err := store.GetAgentTemplate(context.Background(), "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	for _, label := range []string{"a", "b", "c", "d"} {
+		content := []byte("option " + label)
+		if err := store.UpsertEvalArtifact(context.Background(), db.EvalArtifact{
+			ID:        "option-" + label,
+			Hash:      artifact.ContentHash(content),
+			MediaType: "text/markdown",
+			SizeBytes: int64(len(content)),
+			Driver:    "text",
+		}); err != nil {
+			t.Fatalf("UpsertEvalArtifact %s returned error: %v", label, err)
+		}
+	}
+	if err := store.UpsertEvalRun(context.Background(), db.EvalRun{
+		ID:                "ranked-export-1",
+		TemplateID:        "planner",
+		TemplateVersionID: installed.VersionID,
+		TargetRepo:        "owner/repo",
+		State:             "review",
+		Mode:              db.EvalRunModeExplore,
+		ExplorationLevel:  db.ExplorationLevelHigh,
+		OptionsCount:      4,
+		MetadataJSON:      `{"driver":"manual-review"}`,
+	}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+	if err := store.UpsertEvalReviewItem(context.Background(), db.EvalReviewItem{
+		RunID:  "ranked-export-1",
+		ItemID: "item-001",
+		Title:  "Landing page",
+	}); err != nil {
+		t.Fatalf("UpsertEvalReviewItem returned error: %v", err)
+	}
+	for _, label := range []string{"a", "b", "c", "d"} {
+		if err := store.UpsertEvalReviewOption(context.Background(), db.EvalReviewOption{
+			RunID:      "ranked-export-1",
+			ItemID:     "item-001",
+			Label:      label,
+			ArtifactID: "option-" + label,
+			Role:       "option",
+		}); err != nil {
+			t.Fatalf("UpsertEvalReviewOption %s returned error: %v", label, err)
+		}
+	}
+	ranking, err := json.Marshal([]string{"c", "a", "d", "b"})
+	if err != nil {
+		t.Fatalf("marshal ranking: %v", err)
+	}
+	if err := store.UpsertRankedFeedbackEvent(context.Background(), db.RankedFeedbackEvent{
+		RunID:       "ranked-export-1",
+		ItemID:      "item-001",
+		RankingJSON: string(ranking),
+		Winner:      "c",
+		Reviewer:    "jerry",
+		Source:      "github",
+		CreatedAt:   "2026-06-02T10:00:00Z",
+	}); err != nil {
+		t.Fatalf("UpsertRankedFeedbackEvent returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "training.json")
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "export", "--home", home, "--run", "ranked-export-1", "--output", outputPath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt export exit code = %d, stderr=%s", code, stderr.String())
+	}
+	content, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("read training package: %v", err)
+	}
+	var training skillopt.TrainingPackage
+	if err := json.Unmarshal(content, &training); err != nil {
+		t.Fatalf("decode training package: %v\n%s", err, string(content))
+	}
+	if training.EvalRun.Mode != db.EvalRunModeExplore || len(training.Items) != 1 || len(training.Items[0].Options) != 4 {
+		t.Fatalf("ranked training package run/items = %+v %+v", training.EvalRun, training.Items)
+	}
+	if len(training.RankedFeedbackEvents) != 1 || len(training.PairwisePreferences) != 6 {
+		t.Fatalf("ranked training feedback = %+v pairwise=%+v", training.RankedFeedbackEvents, training.PairwisePreferences)
+	}
+	if training.RankedFeedbackEvents[0].ID == "" || training.PairwisePreferences[0].RankedEventID != training.RankedFeedbackEvents[0].ID {
+		t.Fatalf("ranked feedback provenance = %+v pairwise=%+v", training.RankedFeedbackEvents, training.PairwisePreferences)
+	}
+}
+
 func TestSkillOptImportCandidateArtifacts(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
@@ -1602,10 +1707,9 @@ func TestSkillOptReviewStatusShowsRankedPairwisePreferences(t *testing.T) {
 		"feedback: 1",
 		"pairwise_preferences: 6",
 		"packet_blockers: 0",
-		"training_blockers: 1",
+		"training_blockers: 0",
 		"ready_for_packet: true",
-		"ready_for_training: false",
-		"training_blocker: ranked feedback export is not implemented yet",
+		"ready_for_training: true",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("status stdout missing %q:\n%s", want, stdout.String())

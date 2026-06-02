@@ -18,16 +18,60 @@ The exported package has:
 - `contract_version: 1`
 - `template`: the logical template id, current or pinned version id, content
   hash, metadata, source, and exact template content
-- `eval_run`: run id, target repo, state, metadata, and template version
+- `eval_run`: run id, target repo, state, mode, exploration level, option
+  count, metadata, and template version
 - `items`: review/eval items with artifact references for source, baseline,
-  candidate, preview, and diff artifacts
+  candidate, preview, diff, and ranked option artifacts
 - `artifacts`: local artifact manifests with content hashes, media type, size,
   and driver
 - `feedback_events`: canonical human feedback events when available
+- `ranked_feedback_events`: canonical N-way ranked feedback events when
+  available, including the ordered ranking, optional winner, trait notes, and
+  reasoning
+- `pairwise_preferences`: derived pairwise preferences expanded from ranked
+  feedback, for example `C > A > D > B` becomes six ordered preferences
 - `evaluator_config`: the run metadata used by the external optimizer
 
 Artifact package entries reference local SHA256 blobs stored under Gitmoot home.
 The export does not copy blobs into the repository by default.
+
+A/B validation runs keep the existing `feedback_events` shape. Ranked
+exploration data is additive: optimizers that only consume A/B validation can
+ignore `items[].options`, `ranked_feedback_events`, and
+`pairwise_preferences`.
+
+## Ranked Exploration Export
+
+Ranked runs use `mode` to tell the optimizer how broad the update should be:
+
+- `explore`: learn broad directions from four to six diverse options.
+- `refine`: combine winning traits into a smaller set of stronger candidates.
+- `distill`: update the template body from accumulated feedback.
+- `validate`: compare the current template against a candidate on fresh review
+  items.
+
+The `exploration_level` field describes how much variation the optimizer should
+try in the next candidate set:
+
+- `high`: prioritize wider exploration and visibly different outputs.
+- `medium`: combine promising traits while still testing alternatives.
+- `low`: make narrow refinements and prepare for validation.
+
+Each ranked item exports `options` with the blind option label, artifact id,
+role, and optional metadata such as preview URLs. Ranked feedback exports:
+
+- `ranking`: canonical option labels ordered best to worst
+- `winner`: optional first-place option
+- `useful_traits`: JSON object keyed by canonical option label
+- `rejected_traits`: JSON object keyed by canonical option label
+- `reasoning`: reviewer notes
+
+Derived `pairwise_preferences` are provided so an optimizer can use simple
+preference comparisons without reparsing every ranking. Each pairwise row
+includes `ranked_event_id`, which matches the corresponding
+`ranked_feedback_events[].id`. Trait notes remain attached to the ranked
+feedback event so a future optimizer can combine useful traits across multiple
+winning options rather than only copying the top option.
 
 ## Candidate Package
 

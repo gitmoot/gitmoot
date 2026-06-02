@@ -97,6 +97,122 @@ func TestExportTrainingPackage(t *testing.T) {
 	}
 }
 
+func TestExportTrainingPackageIncludesRankedExplorationFeedback(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	template := testTemplate("planner", "Plan carefully.")
+	if err := store.UpsertAgentTemplate(ctx, template); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	installed, err := store.GetAgentTemplate(ctx, "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	for _, label := range []string{"a", "b", "c", "d"} {
+		content := []byte("option " + label)
+		if err := store.UpsertEvalArtifact(ctx, db.EvalArtifact{
+			ID:        "option-" + label,
+			Hash:      artifact.ContentHash(content),
+			MediaType: "text/markdown",
+			SizeBytes: int64(len(content)),
+			Driver:    "text",
+		}); err != nil {
+			t.Fatalf("UpsertEvalArtifact %s returned error: %v", label, err)
+		}
+	}
+	if err := store.UpsertEvalRun(ctx, db.EvalRun{
+		ID:                "ranked-1",
+		TemplateID:        "planner",
+		TemplateVersionID: installed.VersionID,
+		TargetRepo:        "owner/repo",
+		State:             "review",
+		Mode:              db.EvalRunModeExplore,
+		ExplorationLevel:  db.ExplorationLevelHigh,
+		OptionsCount:      4,
+		MetadataJSON:      `{"driver":"manual-review"}`,
+	}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+	if err := store.UpsertEvalReviewItem(ctx, db.EvalReviewItem{
+		RunID:        "ranked-1",
+		ItemID:       "item-001",
+		Title:        "Landing page",
+		MetadataJSON: `{"prompt":"build landing page"}`,
+	}); err != nil {
+		t.Fatalf("UpsertEvalReviewItem returned error: %v", err)
+	}
+	for _, label := range []string{"a", "b", "c", "d"} {
+		if err := store.UpsertEvalReviewOption(ctx, db.EvalReviewOption{
+			RunID:        "ranked-1",
+			ItemID:       "item-001",
+			Label:        label,
+			ArtifactID:   "option-" + label,
+			Role:         "option",
+			MetadataJSON: `{"preview_url":"https://example.com/` + label + `"}`,
+		}); err != nil {
+			t.Fatalf("UpsertEvalReviewOption %s returned error: %v", label, err)
+		}
+	}
+	ranking, err := json.Marshal([]string{"c", "a", "d", "b"})
+	if err != nil {
+		t.Fatalf("marshal ranking: %v", err)
+	}
+	useful, err := json.Marshal(map[string][]string{"c": {"clearest explanation"}, "d": {"motion"}})
+	if err != nil {
+		t.Fatalf("marshal useful traits: %v", err)
+	}
+	rejected, err := json.Marshal(map[string][]string{"b": {"too generic"}})
+	if err != nil {
+		t.Fatalf("marshal rejected traits: %v", err)
+	}
+	if err := store.UpsertRankedFeedbackEvent(ctx, db.RankedFeedbackEvent{
+		RunID:              "ranked-1",
+		ItemID:             "item-001",
+		RankingJSON:        string(ranking),
+		Winner:             "c",
+		UsefulTraitsJSON:   string(useful),
+		RejectedTraitsJSON: string(rejected),
+		Reasoning:          "C is the clearest direction.",
+		Reviewer:           "jerry",
+		Source:             "github",
+		SourceURL:          "https://github.com/owner/repo/issues/1#issuecomment-1",
+		CreatedAt:          "2026-06-02T10:00:00Z",
+	}); err != nil {
+		t.Fatalf("UpsertRankedFeedbackEvent returned error: %v", err)
+	}
+
+	pkg, err := ExportTrainingPackage(ctx, store, "ranked-1")
+	if err != nil {
+		t.Fatalf("ExportTrainingPackage returned error: %v", err)
+	}
+
+	if pkg.EvalRun.Mode != db.EvalRunModeExplore || pkg.EvalRun.ExplorationLevel != db.ExplorationLevelHigh || pkg.EvalRun.OptionsCount != 4 {
+		t.Fatalf("eval run = %+v", pkg.EvalRun)
+	}
+	if len(pkg.Items) != 1 || len(pkg.Items[0].Options) != 4 || pkg.Items[0].Options[2].ArtifactID != "option-c" {
+		t.Fatalf("items = %+v", pkg.Items)
+	}
+	if len(pkg.Artifacts) != 4 {
+		t.Fatalf("artifacts = %+v", pkg.Artifacts)
+	}
+	if len(pkg.RankedFeedbackEvents) != 1 || pkg.RankedFeedbackEvents[0].ID == "" || pkg.RankedFeedbackEvents[0].Winner != "c" || len(pkg.RankedFeedbackEvents[0].Ranking) != 4 {
+		t.Fatalf("ranked feedback = %+v", pkg.RankedFeedbackEvents)
+	}
+	if !strings.Contains(string(pkg.RankedFeedbackEvents[0].UsefulTraits), "clearest explanation") || !strings.Contains(string(pkg.RankedFeedbackEvents[0].RejectedTraits), "too generic") {
+		t.Fatalf("ranked traits useful=%s rejected=%s", pkg.RankedFeedbackEvents[0].UsefulTraits, pkg.RankedFeedbackEvents[0].RejectedTraits)
+	}
+	if len(pkg.PairwisePreferences) != 6 || pkg.PairwisePreferences[0].Preferred != "c" || pkg.PairwisePreferences[5].Rejected != "b" || pkg.PairwisePreferences[0].RankedEventID != pkg.RankedFeedbackEvents[0].ID {
+		t.Fatalf("pairwise preferences = %+v", pkg.PairwisePreferences)
+	}
+	if _, err := json.Marshal(pkg); err != nil {
+		t.Fatalf("exported ranked package did not marshal: %v", err)
+	}
+}
+
 func TestImportCandidatePackageCreatesPendingVersion(t *testing.T) {
 	ctx := context.Background()
 	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
