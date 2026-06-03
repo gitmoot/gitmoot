@@ -106,7 +106,7 @@ func runSkillOptTrain(args []string, stdout, stderr io.Writer) int {
 
 func printSkillOptTrainUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file path [--session <id>] [--workspace-repo owner/repo] [--preview-repo owner/repo] [--request-file path] [--task-kind kind] [--mode explore|refine|distill|validate] [--exploration-level high|medium|low] [--options N] [--min-items N] [--preferred-gate hard|soft|hard_then_soft] [--dry-run] [--yes]")
+	fmt.Fprintln(w, "  gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file path [--session <id>] [--workspace-repo owner/repo] [--preview-repo owner/repo] [--preview-mode none|optional|required] [--preview-renderer none|vue-vite] [--preview-publisher none|github-pages] [--preview-route-template template] [--request-file path] [--task-kind kind] [--mode explore|refine|distill|validate] [--exploration-level high|medium|low] [--options N] [--min-items N] [--preferred-gate hard|soft|hard_then_soft] [--dry-run] [--yes]")
 	fmt.Fprintln(w, "  gitmoot skillopt train status --session <id>")
 	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--model name] [--optimizer-model name] [--target-model name] [--gate hard|soft|mixed] [--out-root path] [--timeout duration] [--dry-run] [--rerun-optimizer] [--promote version|--reject version --reason text] [--start-next]")
 	fmt.Fprintln(w, "  gitmoot skillopt train stop --session <id> --reason <text>")
@@ -121,6 +121,10 @@ func runSkillOptTrainStart(args []string, stdout, stderr io.Writer) int {
 	sessionID := fs.String("session", "", "train session id")
 	workspaceRepoFlag := fs.String("workspace-repo", "", "workspace repository in owner/repo form")
 	previewRepoFlag := fs.String("preview-repo", "", "preview repository in owner/repo form")
+	previewMode := fs.String("preview-mode", "", "preview mode: none, optional, or required")
+	previewRenderer := fs.String("preview-renderer", "", "preview renderer: none or vue-vite")
+	previewPublisher := fs.String("preview-publisher", "", "preview publisher: none or github-pages")
+	previewRouteTemplate := fs.String("preview-route-template", "", "preview route template for published options")
 	requestText := fs.String("request", "", "human training request")
 	requestFile := fs.String("request-file", "", "file containing the human training request")
 	taskKind := fs.String("task-kind", "custom", "task kind: correctness, ux, design, writing, data, or custom")
@@ -166,6 +170,11 @@ func runSkillOptTrainStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "skillopt train start: %v\n", err)
 		return 2
 	}
+	policy, err := skillopt.BuildTrainPreviewPolicy(repo.FullName(), previewRepo, *previewMode, *previewRenderer, *previewPublisher, *previewRouteTemplate)
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt train start: %v\n", err)
+		return 2
+	}
 	normalizedTaskKind, err := normalizeSkillOptTrainTaskKind(*taskKind)
 	if err != nil {
 		fmt.Fprintf(stderr, "skillopt train start: %v\n", err)
@@ -200,7 +209,7 @@ func runSkillOptTrainStart(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	itemWarnings = append(itemWarnings, detectSkillOptTrainItemWarnings(items)...)
-	itemWarnings = append(itemWarnings, detectSkillOptTrainPreviewWarnings(previewRepo)...)
+	itemWarnings = append(itemWarnings, detectSkillOptTrainPreviewWarnings(policy)...)
 	var plan skillOptTrainStartPlan
 	openStore := withStore
 	if *dryRun || !*yes {
@@ -211,7 +220,7 @@ func runSkillOptTrainStart(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
-		plan = buildSkillOptTrainStartPlan(template, repo.FullName(), workspaceRepo, previewRepo, strings.TrimSpace(*sessionID), request, normalizedTaskKind, normalizedMode, normalizedExploration, effectiveOptionsCount, normalizedGate, items, itemWarnings)
+		plan = buildSkillOptTrainStartPlan(template, repo.FullName(), workspaceRepo, policy, strings.TrimSpace(*sessionID), request, normalizedTaskKind, normalizedMode, normalizedExploration, effectiveOptionsCount, normalizedGate, items, itemWarnings)
 		if *dryRun {
 			return nil
 		}
@@ -270,7 +279,7 @@ type skillOptTrainStartPlan struct {
 	Summary   skillopt.TrainStatusSummary
 }
 
-func buildSkillOptTrainStartPlan(template db.AgentTemplate, repo string, workspaceRepo string, previewRepo string, sessionID string, request string, taskKind string, mode string, explorationLevel string, optionsCount int, preferredGate string, itemPlans []skillOptTrainItemPlan, warnings []string) skillOptTrainStartPlan {
+func buildSkillOptTrainStartPlan(template db.AgentTemplate, repo string, workspaceRepo string, previewPolicy skillopt.TrainPreviewPolicy, sessionID string, request string, taskKind string, mode string, explorationLevel string, optionsCount int, preferredGate string, itemPlans []skillOptTrainItemPlan, warnings []string) skillOptTrainStartPlan {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		sessionID = generatedSkillOptTrainSessionID(template.ID)
@@ -279,14 +288,14 @@ func buildSkillOptTrainStartPlan(template db.AgentTemplate, repo string, workspa
 	if workspaceRepo != "" {
 		state = skillopt.TrainStateItemsReady
 	}
-	metadata := skillOptTrainStartMetadata(request, mode, explorationLevel, optionsCount, preferredGate, itemPlans, warnings)
+	metadata := skillOptTrainStartMetadata(request, mode, explorationLevel, optionsCount, preferredGate, itemPlans, warnings, previewPolicy)
 	session := db.SkillOptTrainSession{
 		ID:                sessionID,
 		TemplateID:        template.ID,
 		TemplateVersionID: template.VersionID,
 		TargetRepo:        repo,
 		WorkspaceRepo:     workspaceRepo,
-		PreviewRepo:       previewRepo,
+		PreviewRepo:       previewPolicy.Repo,
 		RequestSummary:    firstLine(request),
 		TaskKind:          taskKind,
 		State:             state,
@@ -333,6 +342,11 @@ func printSkillOptTrainStartPlan(stdout io.Writer, plan skillOptTrainStartPlan) 
 	writeLine(stdout, "repo: %s", plan.Session.TargetRepo)
 	writeLine(stdout, "workspace_repo: %s", emptyText(plan.Session.WorkspaceRepo))
 	writeLine(stdout, "preview_repo: %s", emptyText(plan.Session.PreviewRepo))
+	writeLine(stdout, "preview_mode: %s", plan.Summary.PreviewPolicy.Mode)
+	writeLine(stdout, "preview_renderer: %s", plan.Summary.PreviewPolicy.Renderer)
+	writeLine(stdout, "preview_publisher: %s", plan.Summary.PreviewPolicy.Publisher)
+	writeLine(stdout, "preview_route_template: %s", emptyText(plan.Summary.PreviewPolicy.RouteTemplate))
+	writeLine(stdout, "expected_review_repo: %s", emptyText(plan.Summary.PreviewPolicy.ExpectedReviewRepo))
 	writeLine(stdout, "task_kind: %s", plan.Session.TaskKind)
 	writeLine(stdout, "request_summary: %s", plan.Session.RequestSummary)
 	writeLine(stdout, "iteration: %s", plan.Iteration.ID)
@@ -2522,6 +2536,12 @@ func loadSkillOptTrainStatusCounts(ctx context.Context, store *db.Store, runID s
 func printSkillOptTrainStatus(stdout io.Writer, summary skillopt.TrainStatusSummary, counts skillopt.TrainStatusCounts) {
 	writeLine(stdout, "session: %s", summary.SessionID)
 	writeLine(stdout, "iteration: %s", emptyText(summary.IterationID))
+	writeLine(stdout, "preview_mode: %s", summary.PreviewPolicy.Mode)
+	writeLine(stdout, "preview_renderer: %s", summary.PreviewPolicy.Renderer)
+	writeLine(stdout, "preview_publisher: %s", summary.PreviewPolicy.Publisher)
+	writeLine(stdout, "preview_repo: %s", emptyText(summary.PreviewPolicy.Repo))
+	writeLine(stdout, "preview_route_template: %s", emptyText(summary.PreviewPolicy.RouteTemplate))
+	writeLine(stdout, "expected_review_repo: %s", emptyText(summary.PreviewPolicy.ExpectedReviewRepo))
 	writeLine(stdout, "current_phase: %s", summary.CurrentPhase)
 	writeLine(stdout, "completed_steps: %s", strings.Join(summary.CompletedSteps, ","))
 	writeLine(stdout, "blocked_step: %s", emptyText(summary.BlockedStep))
@@ -2646,8 +2666,8 @@ func detectSkillOptTrainItemWarnings(items []skillOptTrainItemPlan) []string {
 	return warnings
 }
 
-func detectSkillOptTrainPreviewWarnings(previewRepo string) []string {
-	if strings.TrimSpace(previewRepo) == "" {
+func detectSkillOptTrainPreviewWarnings(policy skillopt.TrainPreviewPolicy) []string {
+	if policy.Publisher != skillopt.TrainPreviewPublisherGitHubPages || strings.TrimSpace(policy.Repo) == "" {
 		return nil
 	}
 	return []string{"preview repo must be public or GitHub Pages-enabled before clickable demos can be published"}
@@ -2806,9 +2826,10 @@ func generatedSkillOptTrainSessionID(templateID string) string {
 	return "train-" + strings.Trim(b.String(), "-_") + "-" + now.Format("20060102-150405") + fmt.Sprintf("-%09d", now.Nanosecond())
 }
 
-func skillOptTrainStartMetadata(request string, mode string, explorationLevel string, optionsCount int, preferredGate string, items []skillOptTrainItemPlan, warnings []string) string {
+func skillOptTrainStartMetadata(request string, mode string, explorationLevel string, optionsCount int, preferredGate string, items []skillOptTrainItemPlan, warnings []string, previewPolicy skillopt.TrainPreviewPolicy) string {
 	lines := strings.Count(request, "\n") + 1
 	words := len(strings.Fields(request))
+	previewMetadata, reviewMetadata := previewPolicy.Metadata()
 	metadata := map[string]any{
 		"request":           request,
 		"request_lines":     lines,
@@ -2822,7 +2843,9 @@ func skillOptTrainStartMetadata(request string, mode string, explorationLevel st
 		"evaluation": map[string]any{
 			"preferred_gate": preferredGate,
 		},
-		"source": "gitmoot skillopt train start",
+		"preview": previewMetadata,
+		"review":  reviewMetadata,
+		"source":  "gitmoot skillopt train start",
 	}
 	encoded, err := json.Marshal(metadata)
 	if err != nil {
@@ -4660,6 +4683,11 @@ func runSkillOptFeedbackGitHubSync(args []string, stdout, stderr io.Writer) int 
 func resolveSkillOptFeedbackRepo(ctx context.Context, paths config.Paths, store *db.Store, run db.EvalRun, repoFlag string) (github.Repository, error) {
 	if strings.TrimSpace(repoFlag) != "" {
 		return daemon.ParseRepository(repoFlag)
+	}
+	if expectedRepo := skillOptMetadataString(run.MetadataJSON, "review", "expected_repo"); expectedRepo != "" {
+		if repo, err := daemon.ParseRepository(expectedRepo); err == nil {
+			return repo, nil
+		}
 	}
 	if strings.TrimSpace(run.TargetRepo) != "" {
 		if repo, err := daemon.ParseRepository(run.TargetRepo); err == nil {

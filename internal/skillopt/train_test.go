@@ -120,3 +120,64 @@ func TestBuildTrainStatusSummaryForAbandonedIterationDoesNotCompleteAllSteps(t *
 		t.Fatalf("abandoned completed steps = %+v", summary.CompletedSteps)
 	}
 }
+
+func TestBuildTrainPreviewPolicyDefaultsForTextOnlyAndPreviewRepo(t *testing.T) {
+	textOnly, err := BuildTrainPreviewPolicy("owner/product", "", "", "", "", "")
+	if err != nil {
+		t.Fatalf("text-only BuildTrainPreviewPolicy returned error: %v", err)
+	}
+	if textOnly.Mode != TrainPreviewModeNone || textOnly.Renderer != TrainPreviewRendererNone || textOnly.Publisher != TrainPreviewPublisherNone || textOnly.ExpectedReviewRepo != "owner/product" {
+		t.Fatalf("text-only policy = %+v", textOnly)
+	}
+
+	withPreview, err := BuildTrainPreviewPolicy("owner/product", "owner/previews", "", "", "", "")
+	if err != nil {
+		t.Fatalf("preview BuildTrainPreviewPolicy returned error: %v", err)
+	}
+	if withPreview.Mode != TrainPreviewModeRequired || withPreview.Renderer != TrainPreviewRendererVueVite || withPreview.Publisher != TrainPreviewPublisherGitHubPages || withPreview.Repo != "owner/previews" || withPreview.ExpectedReviewRepo != "owner/previews" {
+		t.Fatalf("preview policy = %+v", withPreview)
+	}
+	if withPreview.RouteTemplate != DefaultTrainPreviewRouteTemplate {
+		t.Fatalf("preview route template = %q", withPreview.RouteTemplate)
+	}
+}
+
+func TestBuildTrainPreviewPolicyRejectsInvalidRequiredCombinations(t *testing.T) {
+	if _, err := BuildTrainPreviewPolicy("owner/product", "owner/previews", TrainPreviewModeRequired, TrainPreviewRendererNone, "", ""); err == nil || !strings.Contains(err.Error(), "renderer") {
+		t.Fatalf("required without renderer error = %v", err)
+	}
+	if _, err := BuildTrainPreviewPolicy("owner/product", "", TrainPreviewModeRequired, TrainPreviewRendererVueVite, TrainPreviewPublisherGitHubPages, ""); err == nil || !strings.Contains(err.Error(), "preview repo") {
+		t.Fatalf("required without repo error = %v", err)
+	}
+	if _, err := BuildTrainPreviewPolicy("owner/product", "", TrainPreviewModeNone, TrainPreviewRendererVueVite, TrainPreviewPublisherNone, ""); err == nil || !strings.Contains(err.Error(), "preview renderer") {
+		t.Fatalf("none with renderer error = %v", err)
+	}
+	if _, err := BuildTrainPreviewPolicy("owner/product", "", "", "", "", "custom/{run_id}/"); err == nil || !strings.Contains(err.Error(), "preview repo") {
+		t.Fatalf("route template without preview repo error = %v", err)
+	}
+	if _, err := BuildTrainPreviewPolicy("owner/product", "", TrainPreviewModeNone, "", "", "custom/{run_id}/"); err == nil || !strings.Contains(err.Error(), "route template") {
+		t.Fatalf("route template with disabled publisher error = %v", err)
+	}
+}
+
+func TestBuildTrainPreviewPolicyAllowsOptionalWithoutPublisher(t *testing.T) {
+	policy, err := BuildTrainPreviewPolicy("owner/product", "", TrainPreviewModeOptional, "", "", "")
+	if err != nil {
+		t.Fatalf("optional without publisher returned error: %v", err)
+	}
+	if policy.Mode != TrainPreviewModeOptional || policy.Renderer != TrainPreviewRendererNone || policy.Publisher != TrainPreviewPublisherNone || policy.ExpectedReviewRepo != "owner/product" {
+		t.Fatalf("optional policy = %+v", policy)
+	}
+}
+
+func TestResolveTrainPreviewPolicyTreatsLegacyPreviewRepoAsNone(t *testing.T) {
+	session := db.SkillOptTrainSession{
+		ID:          "legacy",
+		TargetRepo:  "owner/product",
+		PreviewRepo: "owner/previews",
+	}
+	policy := ResolveTrainPreviewPolicy(session)
+	if policy.Mode != TrainPreviewModeNone || policy.ExpectedReviewRepo != "owner/product" {
+		t.Fatalf("legacy policy = %+v", policy)
+	}
+}

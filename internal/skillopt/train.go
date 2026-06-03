@@ -1,6 +1,7 @@
 package skillopt
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -24,11 +25,34 @@ const (
 	TrainStateRunAbandoned             = "run_abandoned"
 )
 
+const (
+	TrainPreviewModeNone     = "none"
+	TrainPreviewModeOptional = "optional"
+	TrainPreviewModeRequired = "required"
+
+	TrainPreviewRendererNone    = "none"
+	TrainPreviewRendererVueVite = "vue-vite"
+
+	TrainPreviewPublisherNone        = "none"
+	TrainPreviewPublisherGitHubPages = "github-pages"
+
+	DefaultTrainPreviewRouteTemplate = "runs/{run_id}/{item_id}/{option_label}/"
+)
+
 type TrainStatusCounts struct {
 	ReviewItems          int
 	FeedbackEvents       int
 	RankedFeedbackEvents int
 	PairwisePreferences  int
+}
+
+type TrainPreviewPolicy struct {
+	Mode               string
+	Renderer           string
+	Publisher          string
+	Repo               string
+	RouteTemplate      string
+	ExpectedReviewRepo string
 }
 
 type TrainStatusSummary struct {
@@ -42,6 +66,7 @@ type TrainStatusSummary struct {
 	PullRequestURL   string
 	CandidateVersion string
 	FeedbackCount    int
+	PreviewPolicy    TrainPreviewPolicy
 }
 
 var orderedTrainStates = []string{
@@ -136,6 +161,7 @@ func BuildTrainStatusSummary(session db.SkillOptTrainSession, iteration *db.Skil
 		SessionID:     strings.TrimSpace(session.ID),
 		CurrentPhase:  NormalizeTrainState(session.State),
 		FeedbackCount: counts.FeedbackEvents + counts.RankedFeedbackEvents,
+		PreviewPolicy: ResolveTrainPreviewPolicy(session),
 	}
 	if summary.CurrentPhase == "" {
 		summary.CurrentPhase = TrainStateRequestConfirmed
@@ -156,6 +182,172 @@ func BuildTrainStatusSummary(session db.SkillOptTrainSession, iteration *db.Skil
 	summary.CompletedSteps = completedTrainSteps(summary.CurrentPhase)
 	summary.BlockedStep, summary.NextAction = trainBlockedStepAndAction(summary.CurrentPhase)
 	return summary
+}
+
+func BuildTrainPreviewPolicy(targetRepo string, previewRepo string, mode string, renderer string, publisher string, routeTemplate string) (TrainPreviewPolicy, error) {
+	policy := TrainPreviewPolicy{
+		Mode:          strings.TrimSpace(strings.ToLower(mode)),
+		Renderer:      strings.TrimSpace(strings.ToLower(renderer)),
+		Publisher:     strings.TrimSpace(strings.ToLower(publisher)),
+		Repo:          strings.TrimSpace(previewRepo),
+		RouteTemplate: strings.TrimSpace(routeTemplate),
+	}
+	targetRepo = strings.TrimSpace(targetRepo)
+	if policy.Mode == "" {
+		if policy.Repo != "" || policy.Renderer != "" || policy.Publisher != "" || policy.RouteTemplate != "" {
+			policy.Mode = TrainPreviewModeRequired
+		} else {
+			policy.Mode = TrainPreviewModeNone
+		}
+	}
+	if policy.Renderer == "" {
+		if policy.Mode == TrainPreviewModeNone || (policy.Mode == TrainPreviewModeOptional && policy.Repo == "") {
+			policy.Renderer = TrainPreviewRendererNone
+		} else {
+			policy.Renderer = TrainPreviewRendererVueVite
+		}
+	}
+	if policy.Publisher == "" {
+		if policy.Mode == TrainPreviewModeNone || (policy.Mode == TrainPreviewModeOptional && policy.Repo == "") {
+			policy.Publisher = TrainPreviewPublisherNone
+		} else {
+			policy.Publisher = TrainPreviewPublisherGitHubPages
+		}
+	}
+	if policy.RouteTemplate == "" && policy.Publisher == TrainPreviewPublisherGitHubPages {
+		policy.RouteTemplate = DefaultTrainPreviewRouteTemplate
+	}
+	if err := policy.Validate(); err != nil {
+		return TrainPreviewPolicy{}, err
+	}
+	if policy.Mode == TrainPreviewModeNone || policy.Repo == "" {
+		policy.ExpectedReviewRepo = targetRepo
+	} else {
+		policy.ExpectedReviewRepo = policy.Repo
+	}
+	return policy, nil
+}
+
+func ResolveTrainPreviewPolicy(session db.SkillOptTrainSession) TrainPreviewPolicy {
+	targetRepo := strings.TrimSpace(session.TargetRepo)
+	metadata := decodedTrainMetadata(session.MetadataJSON)
+	preview := decodedTrainMetadataValue(metadata["preview"])
+	review := decodedTrainMetadataValue(metadata["review"])
+	policy := TrainPreviewPolicy{
+		Mode:               strings.ToLower(metadataString(preview, "mode")),
+		Renderer:           strings.ToLower(metadataString(preview, "renderer")),
+		Publisher:          strings.ToLower(metadataString(preview, "publisher")),
+		Repo:               metadataString(preview, "repo"),
+		RouteTemplate:      metadataString(preview, "route_template"),
+		ExpectedReviewRepo: metadataString(review, "expected_repo"),
+	}
+	if policy.Mode == "" {
+		policy.Mode = TrainPreviewModeNone
+	}
+	if policy.Renderer == "" {
+		policy.Renderer = TrainPreviewRendererNone
+	}
+	if policy.Publisher == "" {
+		policy.Publisher = TrainPreviewPublisherNone
+	}
+	if policy.ExpectedReviewRepo == "" {
+		if policy.Mode == TrainPreviewModeNone || policy.Repo == "" {
+			policy.ExpectedReviewRepo = targetRepo
+		} else {
+			policy.ExpectedReviewRepo = policy.Repo
+		}
+	}
+	return policy
+}
+
+func (p TrainPreviewPolicy) Validate() error {
+	switch p.Mode {
+	case TrainPreviewModeNone, TrainPreviewModeOptional, TrainPreviewModeRequired:
+	default:
+		return fmt.Errorf("preview mode %q is not supported", p.Mode)
+	}
+	switch p.Renderer {
+	case TrainPreviewRendererNone, TrainPreviewRendererVueVite:
+	default:
+		return fmt.Errorf("preview renderer %q is not supported", p.Renderer)
+	}
+	switch p.Publisher {
+	case TrainPreviewPublisherNone, TrainPreviewPublisherGitHubPages:
+	default:
+		return fmt.Errorf("preview publisher %q is not supported", p.Publisher)
+	}
+	if strings.TrimSpace(p.RouteTemplate) != "" && p.Publisher != TrainPreviewPublisherGitHubPages {
+		return fmt.Errorf("preview route template requires preview publisher %q", TrainPreviewPublisherGitHubPages)
+	}
+	if p.Mode == TrainPreviewModeNone {
+		if p.Renderer != TrainPreviewRendererNone {
+			return fmt.Errorf("preview renderer must be %q when preview mode is %q", TrainPreviewRendererNone, TrainPreviewModeNone)
+		}
+		if p.Publisher != TrainPreviewPublisherNone {
+			return fmt.Errorf("preview publisher must be %q when preview mode is %q", TrainPreviewPublisherNone, TrainPreviewModeNone)
+		}
+		return nil
+	}
+	if p.Mode == TrainPreviewModeRequired {
+		if p.Renderer == TrainPreviewRendererNone {
+			return errors.New("preview renderer is required when preview mode is required")
+		}
+		if p.Publisher == TrainPreviewPublisherNone {
+			return errors.New("preview publisher is required when preview mode is required")
+		}
+	}
+	if p.Publisher == TrainPreviewPublisherGitHubPages && strings.TrimSpace(p.Repo) == "" {
+		return errors.New("preview repo is required when preview publisher is github-pages")
+	}
+	return nil
+}
+
+func (p TrainPreviewPolicy) Metadata() (map[string]any, map[string]any) {
+	preview := map[string]any{
+		"mode":      p.Mode,
+		"renderer":  p.Renderer,
+		"publisher": p.Publisher,
+	}
+	if strings.TrimSpace(p.Repo) != "" {
+		preview["repo"] = strings.TrimSpace(p.Repo)
+	}
+	if strings.TrimSpace(p.RouteTemplate) != "" {
+		preview["route_template"] = strings.TrimSpace(p.RouteTemplate)
+	}
+	review := map[string]any{}
+	if strings.TrimSpace(p.ExpectedReviewRepo) != "" {
+		review["expected_repo"] = strings.TrimSpace(p.ExpectedReviewRepo)
+	}
+	return preview, review
+}
+
+func decodedTrainMetadata(value string) map[string]any {
+	var metadata map[string]any
+	if strings.TrimSpace(value) != "" {
+		_ = json.Unmarshal([]byte(value), &metadata)
+	}
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	return metadata
+}
+
+func decodedTrainMetadataValue(value any) map[string]any {
+	if object, ok := value.(map[string]any); ok {
+		return object
+	}
+	return map[string]any{}
+}
+
+func metadataString(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, ok := metadata[key]
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
 }
 
 func completedTrainSteps(state string) []string {

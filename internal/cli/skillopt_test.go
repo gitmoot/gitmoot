@@ -459,6 +459,17 @@ func TestSkillOptTrainStartStatusAndStop(t *testing.T) {
 	if !strings.Contains(stdout.String(), "dry_run: true") || !strings.Contains(stdout.String(), "template_version: "+installed.VersionID) {
 		t.Fatalf("dry-run stdout = %q", stdout.String())
 	}
+	for _, want := range []string{
+		"preview_mode: required",
+		"preview_renderer: vue-vite",
+		"preview_publisher: github-pages",
+		"preview_route_template: runs/{run_id}/{item_id}/{option_label}/",
+		"expected_review_repo: owner/previews",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("dry-run stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
 	store, err = db.Open(paths.Database)
 	if err != nil {
 		t.Fatalf("Open after dry-run returned error: %v", err)
@@ -487,6 +498,26 @@ func TestSkillOptTrainStartStatusAndStop(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "--options must be zero or at least 2") {
 		t.Fatalf("one-option stderr = %q", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--request", "Train landing page plans.",
+		"--items-file", itemsPath,
+		"--preview-mode", "required",
+		"--preview-renderer", "none",
+		"--yes",
+	}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("train start with invalid preview policy exit code = %d, want 2; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "preview renderer is required") {
+		t.Fatalf("invalid preview policy stderr = %q", stderr.String())
 	}
 
 	stdout.Reset()
@@ -530,6 +561,9 @@ func TestSkillOptTrainStartStatusAndStop(t *testing.T) {
 	if !strings.Contains(stdout.String(), "created train session landing-train") || !strings.Contains(stdout.String(), "preferred_gate: soft") || !strings.Contains(stdout.String(), "items: 2") || !strings.Contains(stdout.String(), "warning: preview repo must be public or GitHub Pages-enabled") {
 		t.Fatalf("train start stdout = %q", stdout.String())
 	}
+	if !strings.Contains(stdout.String(), "expected_review_repo: owner/previews") {
+		t.Fatalf("train start stdout missing expected review repo: %q", stdout.String())
+	}
 	store, err = db.Open(paths.Database)
 	if err != nil {
 		t.Fatalf("Open after start returned error: %v", err)
@@ -540,6 +574,10 @@ func TestSkillOptTrainStartStatusAndStop(t *testing.T) {
 	}
 	if session.TemplateVersionID != installed.VersionID || session.WorkspaceRepo != "owner/workspace" || session.PreviewRepo != "owner/previews" || session.TaskKind != "design" {
 		t.Fatalf("session = %+v", session)
+	}
+	policy := skillopt.ResolveTrainPreviewPolicy(session)
+	if policy.Mode != skillopt.TrainPreviewModeRequired || policy.Renderer != skillopt.TrainPreviewRendererVueVite || policy.Publisher != skillopt.TrainPreviewPublisherGitHubPages || policy.ExpectedReviewRepo != "owner/previews" {
+		t.Fatalf("preview policy = %+v metadata=%s", policy, session.MetadataJSON)
 	}
 	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "landing-train")
 	if err != nil {
@@ -557,6 +595,16 @@ func TestSkillOptTrainStartStatusAndStop(t *testing.T) {
 	}
 	if !strings.Contains(run.MetadataJSON, "preview repo must be public or GitHub Pages-enabled") {
 		t.Fatalf("eval run metadata did not include preview warning: %s", run.MetadataJSON)
+	}
+	if skillOptMetadataString(run.MetadataJSON, "review", "expected_repo") != "owner/previews" {
+		t.Fatalf("eval run metadata missing expected review repo: %s", run.MetadataJSON)
+	}
+	feedbackRepo, err := resolveSkillOptFeedbackRepo(context.Background(), paths, store, run, "")
+	if err != nil {
+		t.Fatalf("resolveSkillOptFeedbackRepo returned error: %v", err)
+	}
+	if feedbackRepo.FullName() != "owner/previews" {
+		t.Fatalf("feedback repo = %s, want owner/previews", feedbackRepo.FullName())
 	}
 	items, err := store.ListEvalReviewItems(context.Background(), "landing-train-review-001")
 	if err != nil {
@@ -600,6 +648,28 @@ func TestSkillOptTrainStartStatusAndStop(t *testing.T) {
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close after duplicate start returned error: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "train", "status",
+		"--home", home,
+		"--session", "landing-train",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train status exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	for _, want := range []string{
+		"preview_mode: required",
+		"preview_renderer: vue-vite",
+		"preview_publisher: github-pages",
+		"preview_repo: owner/previews",
+		"expected_review_repo: owner/previews",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("train status stdout missing %q:\n%s", want, stdout.String())
+		}
 	}
 
 	if err := config.Initialize(paths); err != nil {
@@ -5386,7 +5456,11 @@ func seedSkillOptTrainFeedbackSynced(t *testing.T) (string, string) {
 			t.Fatalf("UpsertEvalArtifact returned error: %v", err)
 		}
 	}
-	metadata := skillOptTrainStartMetadata("Train planner outputs from human feedback.", db.EvalRunModeValidate, db.ExplorationLevelLow, 2, "hard_then_soft", nil, nil)
+	previewPolicy, err := skillopt.BuildTrainPreviewPolicy("owner/product", "", "", "", "", "")
+	if err != nil {
+		t.Fatalf("BuildTrainPreviewPolicy returned error: %v", err)
+	}
+	metadata := skillOptTrainStartMetadata("Train planner outputs from human feedback.", db.EvalRunModeValidate, db.ExplorationLevelLow, 2, "hard_then_soft", nil, nil, previewPolicy)
 	session := db.SkillOptTrainSession{
 		ID:                "optimizer-train",
 		TemplateID:        "planner",
