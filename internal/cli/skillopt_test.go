@@ -1607,6 +1607,517 @@ func TestSkillOptTrainContinueRecordsGenerationFailureWithoutOptions(t *testing.
 	}
 }
 
+func TestSkillOptTrainContinueRunsOptimizerAndImportsCandidate(t *testing.T) {
+	home, baseVersionID := seedSkillOptTrainFeedbackSynced(t)
+	outRoot := filepath.Join(t.TempDir(), "optimizer")
+	candidate := cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with stronger candidate guidance.")
+	candidate.BaseVersionID = ""
+	runner := &skillOptTrainFakeOptimizerRunner{
+		candidate: candidate,
+	}
+	previousRunner := skillOptTrainOptimizerRunner
+	skillOptTrainOptimizerRunner = runner
+	defer func() {
+		skillOptTrainOptimizerRunner = previousRunner
+	}()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+		"--skillopt-bin", "gitmoot-skillopt",
+		"--model", "gpt-5.5",
+		"--gate", "mixed",
+		"--out-root", outRoot,
+		"--timeout", "5m",
+		"--dry-run",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue optimizer exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{
+		"current_phase: candidate_created",
+		"candidate: planner@v2",
+		"continue_ready: true",
+		"training_package: " + filepath.Join(outRoot, "training.json"),
+		"candidate_package: " + filepath.Join(outRoot, "candidate.json"),
+		"optimizer_dry_run: true",
+		"imported_candidate: planner@v2",
+		"next: publish candidate diff and preview review",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("train continue stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("optimizer calls = %+v, want one", runner.calls)
+	}
+	call := runner.calls[0]
+	for _, want := range []string{
+		"optimize",
+		"--training-package", filepath.Join(outRoot, "training.json"),
+		"--artifact-root", config.PathsForHome(home).ArtifactBlobs,
+		"--out-root", outRoot,
+		"--candidate-output", filepath.Join(outRoot, "candidate.json"),
+		"--artifact-dir", filepath.Join(outRoot, "artifacts"),
+		"--gate-metric", "mixed",
+		"--optimizer-model", "gpt-5.5",
+		"--target-model", "gpt-5.5",
+		"--dry-run",
+	} {
+		if !containsString(call.args, want) {
+			t.Fatalf("optimizer args missing %q: %+v", want, call.args)
+		}
+	}
+	trainingPackage, err := os.ReadFile(filepath.Join(outRoot, "training.json"))
+	if err != nil {
+		t.Fatalf("read training package: %v", err)
+	}
+	if !strings.Contains(string(trainingPackage), `"kind": "gitmoot-skillopt-training-package"`) {
+		t.Fatalf("training package = %s", string(trainingPackage))
+	}
+
+	store := openCLIJobStore(t, home)
+	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "optimizer-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+	if iteration.State != skillopt.TrainStateCandidateCreated || iteration.CandidateVersionID != "planner@v2" {
+		t.Fatalf("iteration = %+v", iteration)
+	}
+	if !strings.Contains(iteration.MetadataJSON, `"candidate_version":"planner@v2"`) || !strings.Contains(iteration.MetadataJSON, `--gate-metric`) {
+		t.Fatalf("iteration metadata = %s", iteration.MetadataJSON)
+	}
+	version, err := store.GetAgentTemplateVersionByID(context.Background(), "planner@v2")
+	if err != nil {
+		t.Fatalf("GetAgentTemplateVersionByID returned error: %v", err)
+	}
+	if version.State != "pending" {
+		t.Fatalf("candidate version = %+v", version)
+	}
+}
+
+func TestSkillOptTrainContinueResolvesRelativeOptimizerBinary(t *testing.T) {
+	home, baseVersionID := seedSkillOptTrainFeedbackSynced(t)
+	repoDir := t.TempDir()
+	t.Chdir(repoDir)
+	outRoot := filepath.Join(t.TempDir(), "optimizer")
+	runner := &skillOptTrainFakeOptimizerRunner{
+		candidate:     cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with relative binary-safe guidance."),
+		lookPathValue: filepath.Join(".", "bin", "gitmoot-skillopt"),
+	}
+	previousRunner := skillOptTrainOptimizerRunner
+	skillOptTrainOptimizerRunner = runner
+	defer func() {
+		skillOptTrainOptimizerRunner = previousRunner
+	}()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+		"--skillopt-bin", filepath.Join(".", "bin", "gitmoot-skillopt"),
+		"--out-root", outRoot,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue relative optimizer exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("optimizer calls = %+v, want one", runner.calls)
+	}
+	wantCommand := filepath.Join(repoDir, "bin", "gitmoot-skillopt")
+	if runner.calls[0].command != wantCommand {
+		t.Fatalf("optimizer command = %q, want absolute %q", runner.calls[0].command, wantCommand)
+	}
+	if runner.calls[0].dir != outRoot {
+		t.Fatalf("optimizer dir = %q, want %q", runner.calls[0].dir, outRoot)
+	}
+}
+
+func TestSkillOptTrainContinueRunsLocalFakeOptimizerExecutable(t *testing.T) {
+	home, baseVersionID := seedSkillOptTrainFeedbackSynced(t)
+	outRoot := filepath.Join(t.TempDir(), "optimizer")
+	candidate := cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with executable smoke guidance.")
+	candidateJSON, err := json.MarshalIndent(candidate, "", "  ")
+	if err != nil {
+		t.Fatalf("MarshalIndent candidate returned error: %v", err)
+	}
+	fakeBin := filepath.Join(t.TempDir(), "gitmoot-skillopt")
+	fakeScript := fmt.Sprintf(`#!/bin/sh
+set -eu
+if [ "${1:-}" != "optimize" ]; then
+  echo "expected optimize subcommand" >&2
+  exit 64
+fi
+shift
+candidate_output=""
+artifact_dir=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --training-package)
+      shift
+      test -f "$1"
+      ;;
+    --candidate-output)
+      shift
+      candidate_output="$1"
+      ;;
+    --artifact-dir)
+      shift
+      artifact_dir="$1"
+      ;;
+    --out-root|--artifact-root|--gate-metric|--optimizer-model|--target-model)
+      shift
+      ;;
+    --dry-run)
+      ;;
+  esac
+  shift
+done
+if [ "$candidate_output" = "" ]; then
+  echo "missing --candidate-output" >&2
+  exit 65
+fi
+if [ "$artifact_dir" = "" ]; then
+  echo "missing --artifact-dir" >&2
+  exit 66
+fi
+mkdir -p "$artifact_dir"
+mkdir -p "$(dirname "$candidate_output")"
+cat > "$candidate_output" <<'GITMOOT_CANDIDATE_JSON'
+%s
+GITMOOT_CANDIDATE_JSON
+echo "fake optimizer ok"
+`, string(candidateJSON))
+	if err := os.WriteFile(fakeBin, []byte(fakeScript), 0o755); err != nil {
+		t.Fatalf("WriteFile fake optimizer returned error: %v", err)
+	}
+
+	previousRunner := skillOptTrainOptimizerRunner
+	skillOptTrainOptimizerRunner = subprocess.ExecRunner{}
+	defer func() {
+		skillOptTrainOptimizerRunner = previousRunner
+	}()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+		"--skillopt-bin", fakeBin,
+		"--out-root", outRoot,
+		"--gate", "soft",
+		"--dry-run",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue fake executable exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "current_phase: candidate_created") || !strings.Contains(stdout.String(), "imported_candidate: planner@v2") {
+		t.Fatalf("fake executable stdout = %s", stdout.String())
+	}
+	if _, err := os.Stat(filepath.Join(outRoot, "training.json")); err != nil {
+		t.Fatalf("training package was not written: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outRoot, "candidate.json")); err != nil {
+		t.Fatalf("candidate package was not written: %v", err)
+	}
+}
+
+func TestSkillOptTrainContinueRecordsOptimizerFailureAtPackageGate(t *testing.T) {
+	home, baseVersionID := seedSkillOptTrainFeedbackSynced(t)
+	outRoot := filepath.Join(t.TempDir(), "optimizer")
+	runner := &skillOptTrainFakeOptimizerRunner{fail: true}
+	previousRunner := skillOptTrainOptimizerRunner
+	skillOptTrainOptimizerRunner = runner
+	defer func() {
+		skillOptTrainOptimizerRunner = previousRunner
+	}()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+		"--out-root", outRoot,
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("train continue failing optimizer exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "optimizer failed") || !strings.Contains(stderr.String(), "optimizer stderr") {
+		t.Fatalf("optimizer failure stderr = %q", stderr.String())
+	}
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "optimizer-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+	if iteration.State != skillopt.TrainStateTrainingPackageCreated || iteration.CandidateVersionID != "" {
+		t.Fatalf("iteration after optimizer failure = %+v", iteration)
+	}
+	if !strings.Contains(iteration.MetadataJSON, `"status":"failed"`) || !strings.Contains(iteration.MetadataJSON, "optimizer stderr") {
+		t.Fatalf("iteration metadata after failure = %s", iteration.MetadataJSON)
+	}
+	if _, err := store.GetAgentTemplateVersionByID(context.Background(), "planner@v2"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("optimizer failure created candidate err=%v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after optimizer failure returned error: %v", err)
+	}
+
+	changedOutRoot := filepath.Join(t.TempDir(), "changed-optimizer")
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+		"--out-root", changedOutRoot,
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("train continue changed out-root retry exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "optimizer package already exported") {
+		t.Fatalf("changed out-root retry stderr = %q", stderr.String())
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("changed out-root retry ran optimizer: %+v", runner.calls)
+	}
+
+	runner.fail = false
+	runner.candidate = cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with retry-safe candidate guidance.")
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue retry exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("optimizer calls after retry = %+v, want two", runner.calls)
+	}
+	retryCall := runner.calls[1]
+	if argValue(retryCall.args, "--out-root") != outRoot || argValue(retryCall.args, "--training-package") != filepath.Join(outRoot, "training.json") {
+		t.Fatalf("retry did not reuse persisted optimizer paths: %+v", retryCall.args)
+	}
+	if !strings.Contains(stdout.String(), "current_phase: candidate_created") || !strings.Contains(stdout.String(), "imported_candidate: planner@v2") {
+		t.Fatalf("retry stdout = %s", stdout.String())
+	}
+}
+
+func TestSkillOptTrainContinueRecordsOptimizerSetupFailure(t *testing.T) {
+	home, _ := seedSkillOptTrainFeedbackSynced(t)
+	runner := &skillOptTrainFakeOptimizerRunner{}
+	previousRunner := skillOptTrainOptimizerRunner
+	skillOptTrainOptimizerRunner = runner
+	defer func() {
+		skillOptTrainOptimizerRunner = previousRunner
+	}()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+		"--gate", "unsupported",
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("train continue invalid gate exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `optimizer gate "unsupported" is not supported`) {
+		t.Fatalf("invalid gate stderr = %q", stderr.String())
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("optimizer ran after setup failure: %+v", runner.calls)
+	}
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "optimizer-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+	if iteration.State != skillopt.TrainStateTrainingPackageCreated || iteration.CandidateVersionID != "" {
+		t.Fatalf("iteration after optimizer setup failure = %+v", iteration)
+	}
+	if !strings.Contains(iteration.MetadataJSON, `"status":"failed"`) || !strings.Contains(iteration.MetadataJSON, "unsupported") {
+		t.Fatalf("iteration metadata after setup failure = %s", iteration.MetadataJSON)
+	}
+}
+
+func TestSkillOptTrainContinueRejectsCandidateForDifferentSessionTemplate(t *testing.T) {
+	home, baseVersionID := seedSkillOptTrainFeedbackSynced(t)
+	store := openCLIJobStore(t, home)
+	if err := store.UpsertAgentTemplate(context.Background(), cliSkillOptTemplate("other", "Do different work.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate other returned error: %v", err)
+	}
+	other, err := store.GetAgentTemplate(context.Background(), "other")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate other returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after other template seed returned error: %v", err)
+	}
+
+	runner := &skillOptTrainFakeOptimizerRunner{
+		candidate: cliSkillOptCandidatePackage(t, "other", other.VersionID, "Do unrelated candidate work."),
+	}
+	previousRunner := skillOptTrainOptimizerRunner
+	skillOptTrainOptimizerRunner = runner
+	defer func() {
+		skillOptTrainOptimizerRunner = previousRunner
+	}()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("train continue mismatched candidate exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `optimizer candidate template_id "other" does not match train session template "planner"`) {
+		t.Fatalf("mismatched candidate stderr = %q", stderr.String())
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("optimizer calls = %+v, want one", runner.calls)
+	}
+
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "optimizer-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+	if iteration.State != skillopt.TrainStateOptimizerCompleted || iteration.CandidateVersionID != "" {
+		t.Fatalf("iteration after mismatched candidate = %+v", iteration)
+	}
+	if !strings.Contains(iteration.MetadataJSON, `"candidate_import"`) || !strings.Contains(iteration.MetadataJSON, `"status":"failed"`) {
+		t.Fatalf("iteration metadata after mismatched candidate = %s", iteration.MetadataJSON)
+	}
+	if _, err := store.GetAgentTemplateVersionByID(context.Background(), "other@v2"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("mismatched candidate imported other version err=%v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after mismatched candidate returned error: %v", err)
+	}
+
+	runner.candidate = cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with recovered candidate guidance.")
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("train continue deterministic import retry exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("deterministic import retry reran optimizer: %+v", runner.calls)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+		"--rerun-optimizer",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue after explicit optimizer rerun exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("optimizer calls after explicit optimizer rerun = %+v, want two", runner.calls)
+	}
+	if !strings.Contains(stdout.String(), "current_phase: candidate_created") || !strings.Contains(stdout.String(), "imported_candidate: planner@v2") {
+		t.Fatalf("explicit optimizer rerun stdout = %s", stdout.String())
+	}
+}
+
+func TestSkillOptTrainContinueOptimizerHandlesMissingIteration(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	if err := store.UpsertSkillOptTrainSession(context.Background(), db.SkillOptTrainSession{
+		ID:             "optimizer-train-empty",
+		TemplateID:     "planner",
+		TargetRepo:     "owner/product",
+		RequestSummary: "Train planner outputs from human feedback.",
+		TaskKind:       "custom",
+		State:          skillopt.TrainStateFeedbackSynced,
+	}); err != nil {
+		t.Fatalf("UpsertSkillOptTrainSession returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train-empty",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue missing iteration exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "next: train session has no iteration to continue") {
+		t.Fatalf("missing iteration stdout = %s", stdout.String())
+	}
+}
+
+func TestSkillOptTrainContinueRefusesConcurrentOptimizer(t *testing.T) {
+	home, baseVersionID := seedSkillOptTrainFeedbackSynced(t)
+	runner := &skillOptTrainFakeOptimizerRunner{
+		candidate: cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with lock-safe candidate guidance."),
+	}
+	previousRunner := skillOptTrainOptimizerRunner
+	skillOptTrainOptimizerRunner = runner
+	defer func() {
+		skillOptTrainOptimizerRunner = previousRunner
+	}()
+	store := openCLIJobStore(t, home)
+	release, _, err := acquireSkillOptTrainOptimizerLock(context.Background(), store, "optimizer-train", "optimizer-train-001", time.Hour)
+	if err != nil {
+		t.Fatalf("acquire optimizer lock returned error: %v", err)
+	}
+	defer store.Close()
+	defer func() {
+		_ = release(context.Background())
+	}()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("train continue locked optimizer exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "skillopt train optimizer is already running") {
+		t.Fatalf("locked optimizer stderr = %q", stderr.String())
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("optimizer ran while lock was held: %+v", runner.calls)
+	}
+}
+
 type skillOptConcurrentGenerationRunner struct {
 	mu               sync.Mutex
 	calls            []agentStartCall
@@ -3471,6 +3982,199 @@ func (f *skillOptFakeGitHub) CreateIssue(_ context.Context, input github.CreateI
 
 func (f *skillOptFakeGitHub) ListIssueComments(_ context.Context, _ github.Repository, issueNumber int64) ([]github.IssueComment, error) {
 	return append([]github.IssueComment(nil), f.comments[issueNumber]...), nil
+}
+
+func seedSkillOptTrainFeedbackSynced(t *testing.T) (string, string) {
+	t.Helper()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	template := cliSkillOptTemplate("planner", "Plan the work.")
+	if err := store.UpsertAgentTemplate(context.Background(), template); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	installed, err := store.GetAgentTemplate(context.Background(), "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	blobStore := artifact.NewStore(paths.ArtifactBlobs)
+	baselineBlob, err := blobStore.Put([]byte("# Baseline\n\nPlan the edit.\n"))
+	if err != nil {
+		t.Fatalf("Put baseline returned error: %v", err)
+	}
+	candidateBlob, err := blobStore.Put([]byte("# Candidate\n\nPlan the edit and verification.\n"))
+	if err != nil {
+		t.Fatalf("Put candidate returned error: %v", err)
+	}
+	for _, record := range []db.EvalArtifact{
+		{ID: "baseline-artifact", Hash: baselineBlob.Hash, MediaType: "text/markdown", SizeBytes: baselineBlob.Size, Driver: "text"},
+		{ID: "candidate-artifact", Hash: candidateBlob.Hash, MediaType: "text/markdown", SizeBytes: candidateBlob.Size, Driver: "text"},
+	} {
+		if err := store.UpsertEvalArtifact(context.Background(), record); err != nil {
+			t.Fatalf("UpsertEvalArtifact returned error: %v", err)
+		}
+	}
+	metadata := skillOptTrainStartMetadata("Train planner outputs from human feedback.", db.EvalRunModeValidate, db.ExplorationLevelLow, 2, "hard_then_soft", nil, nil)
+	session := db.SkillOptTrainSession{
+		ID:                "optimizer-train",
+		TemplateID:        "planner",
+		TemplateVersionID: installed.VersionID,
+		TargetRepo:        "owner/product",
+		RequestSummary:    "Train planner outputs from human feedback.",
+		TaskKind:          "custom",
+		State:             skillopt.TrainStateFeedbackSynced,
+		MetadataJSON:      metadata,
+	}
+	iteration := db.SkillOptTrainIteration{
+		ID:                    "optimizer-train-001",
+		SessionID:             session.ID,
+		EvalRunID:             "optimizer-train-review-001",
+		BaseTemplateVersionID: installed.VersionID,
+		Mode:                  db.EvalRunModeValidate,
+		ExplorationLevel:      db.ExplorationLevelLow,
+		State:                 skillopt.TrainStateFeedbackSynced,
+		MetadataJSON:          metadata,
+	}
+	run := db.EvalRun{
+		ID:                iteration.EvalRunID,
+		TemplateID:        "planner",
+		TemplateVersionID: installed.VersionID,
+		TargetRepo:        "owner/product",
+		State:             "review",
+		Mode:              db.EvalRunModeValidate,
+		ExplorationLevel:  db.ExplorationLevelLow,
+		OptionsCount:      2,
+		MetadataJSON:      metadata,
+	}
+	if err := store.UpsertSkillOptTrainSession(context.Background(), session); err != nil {
+		t.Fatalf("UpsertSkillOptTrainSession returned error: %v", err)
+	}
+	if err := store.UpsertSkillOptTrainIteration(context.Background(), iteration); err != nil {
+		t.Fatalf("UpsertSkillOptTrainIteration returned error: %v", err)
+	}
+	if err := store.UpsertEvalRun(context.Background(), run); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+	if err := store.UpsertEvalReviewItem(context.Background(), db.EvalReviewItem{
+		RunID:               run.ID,
+		ItemID:              "item-001",
+		Title:               "README plan",
+		BaselineArtifactID:  "baseline-artifact",
+		CandidateArtifactID: "candidate-artifact",
+	}); err != nil {
+		t.Fatalf("UpsertEvalReviewItem returned error: %v", err)
+	}
+	if err := store.UpsertFeedbackEvent(context.Background(), db.FeedbackEvent{
+		RunID:     run.ID,
+		ItemID:    "item-001",
+		Choice:    "b",
+		Reasoning: "Candidate is more complete.",
+		Reviewer:  "github:jerry",
+		Source:    "github",
+		SourceURL: "https://github.com/owner/product/issues/1#issuecomment-1",
+		CreatedAt: "2026-06-02T10:00:00Z",
+	}); err != nil {
+		t.Fatalf("UpsertFeedbackEvent returned error: %v", err)
+	}
+	return home, installed.VersionID
+}
+
+type skillOptTrainFakeOptimizerRunner struct {
+	candidate     skillopt.CandidatePackage
+	fail          bool
+	lookPathValue string
+	calls         []skillOptTrainFakeOptimizerCall
+}
+
+type skillOptTrainFakeOptimizerCall struct {
+	dir     string
+	command string
+	args    []string
+}
+
+func (r *skillOptTrainFakeOptimizerRunner) Run(_ context.Context, dir string, command string, args ...string) (subprocess.Result, error) {
+	r.calls = append(r.calls, skillOptTrainFakeOptimizerCall{dir: dir, command: command, args: append([]string{}, args...)})
+	result := subprocess.Result{Command: command, Args: args}
+	if r.fail {
+		result.Stderr = "optimizer stderr"
+		return result, errors.New("exit status 2")
+	}
+	candidateOutput := argValue(args, "--candidate-output")
+	artifactDir := argValue(args, "--artifact-dir")
+	if candidateOutput == "" || artifactDir == "" {
+		result.Stderr = "missing output paths"
+		return result, errors.New("missing output paths")
+	}
+	diffContent := []byte("candidate diff\n")
+	diffSize := int64(len(diffContent))
+	if err := os.MkdirAll(artifactDir, 0o755); err != nil {
+		result.Stderr = err.Error()
+		return result, err
+	}
+	if err := os.WriteFile(filepath.Join(artifactDir, "candidate.diff.md"), diffContent, 0o644); err != nil {
+		result.Stderr = err.Error()
+		return result, err
+	}
+	candidate := r.candidate
+	candidate.Summary.DiffArtifactID = "candidate-diff"
+	candidate.Artifacts = []skillopt.CandidateArtifactRef{{
+		ID:        "candidate-diff",
+		Path:      "candidate.diff.md",
+		Hash:      artifact.ContentHash(diffContent),
+		MediaType: "text/markdown",
+		Driver:    "text",
+		SizeBytes: &diffSize,
+	}}
+	encoded, err := json.Marshal(candidate)
+	if err != nil {
+		result.Stderr = err.Error()
+		return result, err
+	}
+	if err := os.MkdirAll(filepath.Dir(candidateOutput), 0o755); err != nil {
+		result.Stderr = err.Error()
+		return result, err
+	}
+	if err := os.WriteFile(candidateOutput, encoded, 0o644); err != nil {
+		result.Stderr = err.Error()
+		return result, err
+	}
+	result.Stdout = "wrote candidate package: " + candidateOutput + "\n"
+	return result, nil
+}
+
+func (r *skillOptTrainFakeOptimizerRunner) LookPath(file string) (string, error) {
+	if strings.TrimSpace(file) == "" {
+		return "", errors.New("empty file")
+	}
+	if strings.TrimSpace(r.lookPathValue) != "" {
+		return r.lookPathValue, nil
+	}
+	return "/fake/bin/" + file, nil
+}
+
+func argValue(args []string, name string) string {
+	for index := 0; index < len(args)-1; index++ {
+		if args[index] == name {
+			return args[index+1]
+		}
+	}
+	return ""
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func cliSkillOptTemplate(id string, body string) db.AgentTemplate {

@@ -23,12 +23,15 @@ import (
 	gitutil "github.com/jerryfane/gitmoot/internal/git"
 	"github.com/jerryfane/gitmoot/internal/github"
 	"github.com/jerryfane/gitmoot/internal/skillopt"
+	"github.com/jerryfane/gitmoot/internal/subprocess"
 	"gopkg.in/yaml.v3"
 )
 
 var newSkillOptGitHubClient = func() github.Client {
 	return github.NewClient("")
 }
+
+var skillOptTrainOptimizerRunner subprocess.Runner = subprocess.ExecRunner{}
 
 func runSkillOpt(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
@@ -73,7 +76,7 @@ func printSkillOptUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)")
 	fmt.Fprintln(w, "  gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file path [--yes]")
 	fmt.Fprintln(w, "  gitmoot skillopt train status --session <id>")
-	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name]")
+	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--model name] [--optimizer-model name] [--target-model name] [--gate hard|soft|mixed] [--out-root path] [--timeout duration] [--dry-run] [--rerun-optimizer]")
 	fmt.Fprintln(w, "  gitmoot skillopt train stop --session <id> --reason <text>")
 }
 
@@ -102,7 +105,7 @@ func printSkillOptTrainUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file path [--session <id>] [--workspace-repo owner/repo] [--preview-repo owner/repo] [--request-file path] [--task-kind kind] [--mode explore|refine|distill|validate] [--exploration-level high|medium|low] [--options N] [--min-items N] [--preferred-gate hard|soft|hard_then_soft] [--dry-run] [--yes]")
 	fmt.Fprintln(w, "  gitmoot skillopt train status --session <id>")
-	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name]")
+	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--model name] [--optimizer-model name] [--target-model name] [--gate hard|soft|mixed] [--out-root path] [--timeout duration] [--dry-run] [--rerun-optimizer]")
 	fmt.Fprintln(w, "  gitmoot skillopt train stop --session <id> --reason <text>")
 }
 
@@ -384,6 +387,15 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 	sessionID := fs.String("session", "", "train session id")
 	generatorAgent := fs.String("generator-agent", "", "existing agent to use for option generation")
 	generatorType := fs.String("generator-type", "", "managed agent type to use for option generation; defaults to skillopt-generator")
+	skillOptBin := fs.String("skillopt-bin", "", "gitmoot-skillopt executable path; defaults to gitmoot-skillopt on PATH")
+	model := fs.String("model", "", "model name to pass to both optimizer and target when specific model flags are omitted")
+	optimizerModel := fs.String("optimizer-model", "", "optimizer model name")
+	targetModel := fs.String("target-model", "", "target model name")
+	gate := fs.String("gate", "", "optimizer gate metric: hard, soft, or mixed")
+	outRoot := fs.String("out-root", "", "optimizer output directory")
+	timeout := fs.String("timeout", "", "optimizer timeout duration")
+	dryRun := fs.Bool("dry-run", false, "ask gitmoot-skillopt to avoid model calls while still producing a candidate package")
+	rerunOptimizer := fs.Bool("rerun-optimizer", false, "rerun gitmoot-skillopt after optimizer completion instead of retrying the existing candidate import")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -406,6 +418,17 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 			SessionID:      *sessionID,
 			GeneratorAgent: *generatorAgent,
 			GeneratorType:  *generatorType,
+			Optimizer: skillOptTrainOptimizerRequest{
+				SkillOptBin:    *skillOptBin,
+				Model:          *model,
+				OptimizerModel: *optimizerModel,
+				TargetModel:    *targetModel,
+				Gate:           *gate,
+				OutRoot:        *outRoot,
+				Timeout:        *timeout,
+				DryRun:         *dryRun,
+				RerunOptimizer: *rerunOptimizer,
+			},
 		})
 		return err
 	}); err != nil {
@@ -430,6 +453,19 @@ type skillOptTrainContinueRequest struct {
 	GeneratorAgent    string
 	GeneratorType     string
 	GenerationLockTTL time.Duration
+	Optimizer         skillOptTrainOptimizerRequest
+}
+
+type skillOptTrainOptimizerRequest struct {
+	SkillOptBin    string
+	Model          string
+	OptimizerModel string
+	TargetModel    string
+	Gate           string
+	OutRoot        string
+	Timeout        string
+	DryRun         bool
+	RerunOptimizer bool
 }
 
 type skillOptTrainContinueOutput struct {
@@ -518,10 +554,194 @@ func continueSkillOptTrain(ctx context.Context, paths config.Paths, store *db.St
 	case skillopt.TrainStateOptionsGenerated:
 		output.Lines = []string{"next: options already generated; publish the human review packet"}
 		return output, nil
+	case skillopt.TrainStateFeedbackSynced, skillopt.TrainStateTrainingPackageCreated, skillopt.TrainStateOptimizerCompleted:
+		if iteration == nil {
+			output.Lines = []string{"next: train session has no iteration to continue"}
+			return output, nil
+		}
+		optimizerLockTTL, err := skillOptTrainOptimizerLockTTLForRequest(request.Optimizer)
+		if err != nil {
+			return skillOptTrainContinueOutput{}, err
+		}
+		releaseOptimizerLock, _, err := acquireSkillOptTrainOptimizerLock(ctx, store, session.ID, iteration.ID, optimizerLockTTL)
+		if err != nil {
+			return output, err
+		}
+		defer func() {
+			_ = releaseOptimizerLock(context.Background())
+		}()
+		session, iteration, counts, err = loadSkillOptTrainStatus(ctx, store, request.SessionID)
+		if err != nil {
+			return skillOptTrainContinueOutput{}, err
+		}
+		summary = skillopt.BuildTrainStatusSummary(session, iteration, counts)
+		output = skillOptTrainContinueOutput{Summary: summary, Counts: counts}
+		if iteration == nil {
+			output.Lines = []string{"next: train session has no iteration to continue"}
+			return output, nil
+		}
+		if summary.CurrentPhase != skillopt.TrainStateFeedbackSynced &&
+			summary.CurrentPhase != skillopt.TrainStateTrainingPackageCreated &&
+			summary.CurrentPhase != skillopt.TrainStateOptimizerCompleted {
+			output.Lines = []string{fmt.Sprintf("next: %s", summary.NextAction)}
+			return output, nil
+		}
+		result, err := continueSkillOptTrainOptimizer(ctx, paths, store, session, *iteration, request.Optimizer)
+		if err != nil {
+			return skillOptTrainContinueOutput{}, err
+		}
+		updatedSession, updatedIteration, updatedCounts, err := loadSkillOptTrainStatus(ctx, store, session.ID)
+		if err != nil {
+			return skillOptTrainContinueOutput{}, err
+		}
+		updatedSummary := skillopt.BuildTrainStatusSummary(updatedSession, updatedIteration, updatedCounts)
+		lines := []string{
+			fmt.Sprintf("training_package: %s", result.TrainingPackagePath),
+			fmt.Sprintf("optimizer_out_root: %s", result.OutRoot),
+			fmt.Sprintf("candidate_package: %s", result.CandidatePackagePath),
+			fmt.Sprintf("artifact_dir: %s", result.ArtifactDir),
+			fmt.Sprintf("optimizer_command: %s", shellArgs(append([]string{result.Command}, result.Args...))),
+			fmt.Sprintf("optimizer_dry_run: %t", result.DryRun),
+			fmt.Sprintf("imported_candidate: %s", result.CandidateVersionID),
+			"next: publish candidate diff and preview review",
+		}
+		return skillOptTrainContinueOutput{
+			Summary:       updatedSummary,
+			Counts:        updatedCounts,
+			ContinueReady: true,
+			Lines:         lines,
+		}, nil
 	default:
 		output.Lines = []string{fmt.Sprintf("next: %s", summary.NextAction)}
 		return output, nil
 	}
+}
+
+type skillOptTrainOptimizerResult struct {
+	TrainingPackagePath  string
+	OutRoot              string
+	CandidatePackagePath string
+	ArtifactDir          string
+	Command              string
+	Args                 []string
+	DryRun               bool
+	CandidateVersionID   string
+}
+
+type skillOptTrainOptimizerPaths struct {
+	OutRoot              string
+	ArtifactRoot         string
+	TrainingPackagePath  string
+	CandidatePackagePath string
+	ArtifactDir          string
+}
+
+func continueSkillOptTrainOptimizer(ctx context.Context, paths config.Paths, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, request skillOptTrainOptimizerRequest) (skillOptTrainOptimizerResult, error) {
+	if strings.TrimSpace(iteration.EvalRunID) == "" {
+		return skillOptTrainOptimizerResult{}, fmt.Errorf("train iteration %s has no eval run id", iteration.ID)
+	}
+	optimizerPaths, err := resolveSkillOptTrainOptimizerPaths(paths, session, iteration, request)
+	if err != nil {
+		return skillOptTrainOptimizerResult{}, err
+	}
+	result := skillOptTrainOptimizerResult{
+		TrainingPackagePath:  optimizerPaths.TrainingPackagePath,
+		OutRoot:              optimizerPaths.OutRoot,
+		CandidatePackagePath: optimizerPaths.CandidatePackagePath,
+		ArtifactDir:          optimizerPaths.ArtifactDir,
+		DryRun:               request.DryRun,
+	}
+	state := skillopt.NormalizeTrainState(iteration.State)
+	if state == skillopt.TrainStateOptimizerCompleted && request.RerunOptimizer {
+		state = skillopt.TrainStateTrainingPackageCreated
+	}
+	if state == skillopt.TrainStateFeedbackSynced {
+		if err := skillopt.CanTransitionTrainIteration(iteration.State, skillopt.TrainStateTrainingPackageCreated); err != nil {
+			return skillOptTrainOptimizerResult{}, err
+		}
+		exportMetadata, err := exportSkillOptTrainPackage(ctx, store, iteration, optimizerPaths)
+		if err != nil {
+			return skillOptTrainOptimizerResult{}, err
+		}
+		session.State = skillopt.TrainStateTrainingPackageCreated
+		iteration.State = skillopt.TrainStateTrainingPackageCreated
+		session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "optimizer", exportMetadata)
+		iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "optimizer", exportMetadata)
+		if err := store.UpsertSkillOptTrainSession(ctx, session); err != nil {
+			return skillOptTrainOptimizerResult{}, err
+		}
+		if err := store.UpsertSkillOptTrainIteration(ctx, iteration); err != nil {
+			return skillOptTrainOptimizerResult{}, err
+		}
+		state = skillopt.TrainStateTrainingPackageCreated
+	}
+	if state == skillopt.TrainStateTrainingPackageCreated {
+		if err := skillopt.CanTransitionTrainIteration(iteration.State, skillopt.TrainStateOptimizerCompleted); err != nil {
+			return skillOptTrainOptimizerResult{}, err
+		}
+		command, args, err := buildSkillOptTrainOptimizerCommand(iteration, request, optimizerPaths)
+		if err != nil {
+			if metaErr := recordSkillOptTrainOptimizerFailure(ctx, store, session, iteration, request, optimizerPaths, command, args, subprocess.Result{}, err); metaErr != nil {
+				return skillOptTrainOptimizerResult{}, fmt.Errorf("%w; failed to record optimizer failure: %v", err, metaErr)
+			}
+			return skillOptTrainOptimizerResult{}, err
+		}
+		result.Command = command
+		result.Args = args
+		runResult, err := runSkillOptTrainOptimizer(ctx, optimizerPaths, request, command, args)
+		if err != nil {
+			if metaErr := recordSkillOptTrainOptimizerFailure(ctx, store, session, iteration, request, optimizerPaths, command, args, runResult, err); metaErr != nil {
+				return skillOptTrainOptimizerResult{}, fmt.Errorf("%w; failed to record optimizer failure: %v", err, metaErr)
+			}
+			return skillOptTrainOptimizerResult{}, err
+		}
+		metadata := skillOptTrainOptimizerMetadata(request, optimizerPaths, command, args, runResult, "succeeded", nil)
+		session.State = skillopt.TrainStateOptimizerCompleted
+		iteration.State = skillopt.TrainStateOptimizerCompleted
+		session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "optimizer", metadata)
+		iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "optimizer", metadata)
+		if err := store.UpsertSkillOptTrainSession(ctx, session); err != nil {
+			return skillOptTrainOptimizerResult{}, err
+		}
+		if err := store.UpsertSkillOptTrainIteration(ctx, iteration); err != nil {
+			return skillOptTrainOptimizerResult{}, err
+		}
+		state = skillopt.TrainStateOptimizerCompleted
+	}
+	if state == skillopt.TrainStateOptimizerCompleted {
+		if err := skillopt.CanTransitionTrainIteration(iteration.State, skillopt.TrainStateCandidateCreated); err != nil {
+			return skillOptTrainOptimizerResult{}, err
+		}
+		version, err := importSkillOptTrainCandidate(ctx, paths, store, session, iteration, optimizerPaths)
+		if err != nil {
+			if metaErr := recordSkillOptTrainCandidateImportFailure(ctx, store, session, iteration, optimizerPaths, err); metaErr != nil {
+				return skillOptTrainOptimizerResult{}, fmt.Errorf("%w; failed to record candidate import failure: %v", err, metaErr)
+			}
+			return skillOptTrainOptimizerResult{}, err
+		}
+		result.CandidateVersionID = version.ID
+		metadata := map[string]any{
+			"status":            "succeeded",
+			"candidate_version": version.ID,
+			"candidate_package": optimizerPaths.CandidatePackagePath,
+			"artifact_dir":      optimizerPaths.ArtifactDir,
+			"completed_at":      time.Now().UTC().Format(time.RFC3339Nano),
+			"source":            "gitmoot skillopt train continue",
+		}
+		session.State = skillopt.TrainStateCandidateCreated
+		iteration.State = skillopt.TrainStateCandidateCreated
+		iteration.CandidateVersionID = version.ID
+		session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "candidate_import", metadata)
+		iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "candidate_import", metadata)
+		if err := store.UpsertSkillOptTrainSession(ctx, session); err != nil {
+			return skillOptTrainOptimizerResult{}, err
+		}
+		if err := store.UpsertSkillOptTrainIteration(ctx, iteration); err != nil {
+			return skillOptTrainOptimizerResult{}, err
+		}
+		return result, nil
+	}
+	return skillOptTrainOptimizerResult{}, fmt.Errorf("train iteration %s is at %s; expected %s, %s, or %s", iteration.ID, iteration.State, skillopt.TrainStateFeedbackSynced, skillopt.TrainStateTrainingPackageCreated, skillopt.TrainStateOptimizerCompleted)
 }
 
 type skillOptTrainGenerationResult struct {
@@ -534,9 +754,72 @@ type skillOptTrainGenerationResult struct {
 
 var errSkillOptTrainGenerationBusy = errors.New("skillopt train generation is already running")
 
+var errSkillOptTrainOptimizerBusy = errors.New("skillopt train optimizer is already running")
+
 const skillOptTrainGenerationLockTTL = 2 * time.Hour
 
 const skillOptTrainGenerationLockBuffer = 10 * time.Minute
+
+const skillOptTrainOptimizerLockTTL = 4 * time.Hour
+
+const skillOptTrainOptimizerLockBuffer = 10 * time.Minute
+
+func acquireSkillOptTrainOptimizerLock(ctx context.Context, store *db.Store, sessionID string, iterationID string, ttl time.Duration) (func(context.Context) error, bool, error) {
+	key := skillOptTrainOptimizerLockKey(sessionID, iterationID)
+	token, err := newRuntimeLockOwnerToken()
+	if err != nil {
+		return noopAgentReservationRelease, false, err
+	}
+	if ttl <= 0 {
+		ttl = skillOptTrainOptimizerLockTTL
+	}
+	now := time.Now().UTC()
+	ownerJobID := localAgentJobID("skillopt-train-optimizer", strings.TrimSpace(sessionID))
+	acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+		ResourceKey: key,
+		OwnerJobID:  ownerJobID,
+		OwnerToken:  token,
+		ExpiresAt:   now.Add(ttl).Format(time.RFC3339Nano),
+	}, now)
+	if err != nil {
+		return noopAgentReservationRelease, false, err
+	}
+	if !acquired {
+		return noopAgentReservationRelease, false, fmt.Errorf("%w: %s", errSkillOptTrainOptimizerBusy, key)
+	}
+	return func(releaseCtx context.Context) error {
+		_, err := store.ReleaseResourceLock(releaseCtx, key, ownerJobID, token)
+		return err
+	}, true, nil
+}
+
+func skillOptTrainOptimizerLockKey(sessionID string, iterationID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	iterationID = strings.TrimSpace(iterationID)
+	if iterationID == "" {
+		return "skillopt-train-optimizer:" + sessionID
+	}
+	return "skillopt-train-optimizer:" + sessionID + ":" + iterationID
+}
+
+func skillOptTrainOptimizerLockTTLForRequest(request skillOptTrainOptimizerRequest) (time.Duration, error) {
+	timeout := strings.TrimSpace(request.Timeout)
+	if timeout == "" {
+		return skillOptTrainOptimizerLockTTL, nil
+	}
+	duration, err := time.ParseDuration(timeout)
+	if err != nil {
+		return 0, fmt.Errorf("parse optimizer timeout: %w", err)
+	}
+	if duration <= 0 {
+		return 0, errors.New("optimizer timeout must be greater than zero")
+	}
+	ttl := duration + skillOptTrainOptimizerLockBuffer
+	if ttl < skillOptTrainOptimizerLockTTL {
+		return skillOptTrainOptimizerLockTTL, nil
+	}
+	return ttl, nil
+}
 
 func acquireSkillOptTrainGenerationLock(ctx context.Context, store *db.Store, sessionID string, iterationID string, ttl time.Duration) (func(context.Context) error, bool, error) {
 	key := skillOptTrainGenerationLockKey(sessionID, iterationID)
@@ -1381,6 +1664,314 @@ func recordSkillOptTrainGenerationFailure(ctx context.Context, store *db.Store, 
 	return store.UpsertSkillOptTrainIteration(ctx, iteration)
 }
 
+func resolveSkillOptTrainOptimizerPaths(paths config.Paths, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, request skillOptTrainOptimizerRequest) (skillOptTrainOptimizerPaths, error) {
+	outRoot := strings.TrimSpace(request.OutRoot)
+	optimizerMetadata := decodedSkillOptMetadataValue(decodedSkillOptMetadata(iteration.MetadataJSON)["optimizer"])
+	persistedOutRoot := metadataString(optimizerMetadata, "out_root")
+	persistedTrainingPackage := metadataString(optimizerMetadata, "training_package")
+	persistedCandidateOutput := metadataString(optimizerMetadata, "candidate_output")
+	persistedArtifactDir := metadataString(optimizerMetadata, "artifact_dir")
+	if persistedTrainingPackage != "" && skillopt.NormalizeTrainState(iteration.State) != skillopt.TrainStateFeedbackSynced {
+		if outRoot != "" {
+			absRequestedOutRoot, err := filepath.Abs(outRoot)
+			if err != nil {
+				return skillOptTrainOptimizerPaths{}, fmt.Errorf("resolve optimizer out-root: %w", err)
+			}
+			absPersistedOutRoot := persistedOutRoot
+			if absPersistedOutRoot == "" {
+				absPersistedOutRoot = filepath.Dir(persistedTrainingPackage)
+			}
+			if absPersistedOutRoot, err = filepath.Abs(absPersistedOutRoot); err != nil {
+				return skillOptTrainOptimizerPaths{}, fmt.Errorf("resolve persisted optimizer out-root: %w", err)
+			}
+			if absRequestedOutRoot != absPersistedOutRoot {
+				return skillOptTrainOptimizerPaths{}, fmt.Errorf("optimizer package already exported at %s; retry with the same --out-root or omit --out-root", persistedTrainingPackage)
+			}
+		}
+		outRoot = persistedOutRoot
+		if outRoot == "" {
+			outRoot = filepath.Dir(persistedTrainingPackage)
+		}
+	}
+	if outRoot == "" {
+		outRoot = persistedOutRoot
+	}
+	if outRoot == "" {
+		outRoot = filepath.Join(paths.Evals, "train", session.ID, iteration.ID, "optimizer")
+	}
+	absOutRoot, err := filepath.Abs(outRoot)
+	if err != nil {
+		return skillOptTrainOptimizerPaths{}, fmt.Errorf("resolve optimizer out-root: %w", err)
+	}
+	trainingPackagePath := filepath.Join(absOutRoot, "training.json")
+	candidatePackagePath := filepath.Join(absOutRoot, "candidate.json")
+	artifactDir := filepath.Join(absOutRoot, "artifacts")
+	if persistedTrainingPackage != "" && skillopt.NormalizeTrainState(iteration.State) != skillopt.TrainStateFeedbackSynced {
+		trainingPackagePath = persistedTrainingPackage
+		if persistedCandidateOutput != "" {
+			candidatePackagePath = persistedCandidateOutput
+		}
+		if persistedArtifactDir != "" {
+			artifactDir = persistedArtifactDir
+		}
+	}
+	return skillOptTrainOptimizerPaths{
+		OutRoot:              absOutRoot,
+		ArtifactRoot:         paths.ArtifactBlobs,
+		TrainingPackagePath:  trainingPackagePath,
+		CandidatePackagePath: candidatePackagePath,
+		ArtifactDir:          artifactDir,
+	}, nil
+}
+
+func exportSkillOptTrainPackage(ctx context.Context, store *db.Store, iteration db.SkillOptTrainIteration, paths skillOptTrainOptimizerPaths) (map[string]any, error) {
+	pkg, err := skillopt.ExportTrainingPackage(ctx, store, iteration.EvalRunID)
+	if err != nil {
+		return nil, fmt.Errorf("export training package: %w", err)
+	}
+	encoded, err := json.MarshalIndent(pkg, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("encode training package: %w", err)
+	}
+	encoded = append(encoded, '\n')
+	if err := writeSkillOptFile(paths.TrainingPackagePath, encoded); err != nil {
+		return nil, fmt.Errorf("write training package: %w", err)
+	}
+	return map[string]any{
+		"status":           "package_created",
+		"training_package": paths.TrainingPackagePath,
+		"out_root":         paths.OutRoot,
+		"artifact_root":    paths.ArtifactRoot,
+		"candidate_output": paths.CandidatePackagePath,
+		"artifact_dir":     paths.ArtifactDir,
+		"created_at":       time.Now().UTC().Format(time.RFC3339Nano),
+		"source":           "gitmoot skillopt train continue",
+	}, nil
+}
+
+func buildSkillOptTrainOptimizerCommand(iteration db.SkillOptTrainIteration, request skillOptTrainOptimizerRequest, paths skillOptTrainOptimizerPaths) (string, []string, error) {
+	executable := strings.TrimSpace(request.SkillOptBin)
+	if executable == "" {
+		executable = "gitmoot-skillopt"
+	}
+	resolved, err := skillOptTrainOptimizerRunner.LookPath(executable)
+	if err != nil {
+		return "", nil, fmt.Errorf("find gitmoot-skillopt executable %q: %w", executable, err)
+	}
+	if !filepath.IsAbs(resolved) {
+		resolved, err = filepath.Abs(resolved)
+		if err != nil {
+			return "", nil, fmt.Errorf("resolve gitmoot-skillopt executable %q: %w", resolved, err)
+		}
+	}
+	gate, err := skillOptTrainOptimizerGate(iteration, request)
+	if err != nil {
+		return "", nil, err
+	}
+	args := []string{
+		"optimize",
+		"--training-package", paths.TrainingPackagePath,
+		"--artifact-root", paths.ArtifactRoot,
+		"--out-root", paths.OutRoot,
+		"--candidate-output", paths.CandidatePackagePath,
+		"--artifact-dir", paths.ArtifactDir,
+		"--gate-metric", gate,
+	}
+	optimizerModel := strings.TrimSpace(request.OptimizerModel)
+	targetModel := strings.TrimSpace(request.TargetModel)
+	if model := strings.TrimSpace(request.Model); model != "" {
+		if optimizerModel == "" {
+			optimizerModel = model
+		}
+		if targetModel == "" {
+			targetModel = model
+		}
+	}
+	if optimizerModel != "" {
+		args = append(args, "--optimizer-model", optimizerModel)
+	}
+	if targetModel != "" {
+		args = append(args, "--target-model", targetModel)
+	}
+	if request.DryRun {
+		args = append(args, "--dry-run")
+	}
+	return resolved, args, nil
+}
+
+func skillOptTrainOptimizerGate(iteration db.SkillOptTrainIteration, request skillOptTrainOptimizerRequest) (string, error) {
+	gate := strings.TrimSpace(strings.ToLower(request.Gate))
+	if gate == "" {
+		gate = skillOptMetadataString(iteration.MetadataJSON, "evaluation", "preferred_gate")
+	}
+	gate = strings.TrimSpace(strings.ToLower(gate))
+	if gate == "hard_then_soft" {
+		gate = "mixed"
+	}
+	if gate == "" {
+		gate = "hard"
+	}
+	switch gate {
+	case "hard", "soft", "mixed":
+		return gate, nil
+	default:
+		return "", fmt.Errorf("optimizer gate %q is not supported; use hard, soft, or mixed", gate)
+	}
+}
+
+func runSkillOptTrainOptimizer(ctx context.Context, paths skillOptTrainOptimizerPaths, request skillOptTrainOptimizerRequest, command string, args []string) (subprocess.Result, error) {
+	timeout := strings.TrimSpace(request.Timeout)
+	if timeout != "" {
+		duration, err := time.ParseDuration(timeout)
+		if err != nil {
+			return subprocess.Result{}, fmt.Errorf("parse optimizer timeout: %w", err)
+		}
+		if duration <= 0 {
+			return subprocess.Result{}, errors.New("optimizer timeout must be greater than zero")
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, duration)
+		defer cancel()
+	}
+	if err := os.MkdirAll(paths.OutRoot, 0o755); err != nil {
+		return subprocess.Result{}, fmt.Errorf("create optimizer out-root: %w", err)
+	}
+	result, err := skillOptTrainOptimizerRunner.Run(ctx, paths.OutRoot, command, args...)
+	if err != nil {
+		return result, fmt.Errorf("optimizer failed: %w%s", err, subprocessDiagnostics(result))
+	}
+	return result, nil
+}
+
+func subprocessDiagnostics(result subprocess.Result) string {
+	stderr := strings.TrimSpace(result.Stderr)
+	stdout := strings.TrimSpace(result.Stdout)
+	switch {
+	case stderr != "" && stdout != "":
+		return fmt.Sprintf(" (stderr: %s; stdout: %s)", truncateForMetadata(stderr), truncateForMetadata(stdout))
+	case stderr != "":
+		return fmt.Sprintf(" (stderr: %s)", truncateForMetadata(stderr))
+	case stdout != "":
+		return fmt.Sprintf(" (stdout: %s)", truncateForMetadata(stdout))
+	default:
+		return ""
+	}
+}
+
+func skillOptTrainOptimizerMetadata(request skillOptTrainOptimizerRequest, paths skillOptTrainOptimizerPaths, command string, args []string, result subprocess.Result, status string, failure error) map[string]any {
+	metadata := map[string]any{
+		"status":           status,
+		"command":          command,
+		"args":             args,
+		"training_package": paths.TrainingPackagePath,
+		"out_root":         paths.OutRoot,
+		"candidate_output": paths.CandidatePackagePath,
+		"artifact_dir":     paths.ArtifactDir,
+		"dry_run":          request.DryRun,
+		"stdout":           truncateForMetadata(result.Stdout),
+		"stderr":           truncateForMetadata(result.Stderr),
+		"completed_at":     time.Now().UTC().Format(time.RFC3339Nano),
+		"source":           "gitmoot skillopt train continue",
+	}
+	if failure != nil {
+		metadata["error"] = failure.Error()
+	}
+	return metadata
+}
+
+func recordSkillOptTrainOptimizerFailure(ctx context.Context, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, request skillOptTrainOptimizerRequest, paths skillOptTrainOptimizerPaths, command string, args []string, result subprocess.Result, failure error) error {
+	metadata := skillOptTrainOptimizerMetadata(request, paths, command, args, result, "failed", failure)
+	session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "optimizer", metadata)
+	iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "optimizer", metadata)
+	if err := store.UpsertSkillOptTrainSession(ctx, session); err != nil {
+		return err
+	}
+	return store.UpsertSkillOptTrainIteration(ctx, iteration)
+}
+
+func recordSkillOptTrainCandidateImportFailure(ctx context.Context, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, paths skillOptTrainOptimizerPaths, failure error) error {
+	metadata := map[string]any{
+		"status":            "failed",
+		"candidate_package": paths.CandidatePackagePath,
+		"artifact_dir":      paths.ArtifactDir,
+		"error":             failure.Error(),
+		"completed_at":      time.Now().UTC().Format(time.RFC3339Nano),
+		"source":            "gitmoot skillopt train continue",
+	}
+	session.State = skillopt.TrainStateOptimizerCompleted
+	iteration.State = skillopt.TrainStateOptimizerCompleted
+	session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "candidate_import", metadata)
+	iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "candidate_import", metadata)
+	if err := store.UpsertSkillOptTrainSession(ctx, session); err != nil {
+		return err
+	}
+	return store.UpsertSkillOptTrainIteration(ctx, iteration)
+}
+
+func importSkillOptTrainCandidate(ctx context.Context, paths config.Paths, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, optimizerPaths skillOptTrainOptimizerPaths) (db.AgentTemplateVersion, error) {
+	content, err := os.ReadFile(optimizerPaths.CandidatePackagePath)
+	if err != nil {
+		return db.AgentTemplateVersion{}, fmt.Errorf("read optimizer candidate package: %w", err)
+	}
+	var candidate skillopt.CandidatePackage
+	if err := json.Unmarshal(content, &candidate); err != nil {
+		return db.AgentTemplateVersion{}, fmt.Errorf("decode optimizer candidate package: %w", err)
+	}
+	if err := validateSkillOptTrainCandidatePackage(ctx, store, session, iteration, candidate); err != nil {
+		return db.AgentTemplateVersion{}, err
+	}
+	version, err := skillopt.ImportCandidatePackageWithOptions(ctx, store, candidate, skillopt.CandidateImportOptions{
+		SourcePath:  optimizerPaths.CandidatePackagePath,
+		ArtifactDir: optimizerPaths.ArtifactDir,
+		BlobStore:   artifact.NewStore(paths.ArtifactBlobs),
+	})
+	if err != nil {
+		return db.AgentTemplateVersion{}, fmt.Errorf("import optimizer candidate package: %w", err)
+	}
+	return version, nil
+}
+
+func validateSkillOptTrainCandidatePackage(ctx context.Context, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, candidate skillopt.CandidatePackage) error {
+	templateID := strings.TrimSpace(candidate.TemplateID)
+	if templateID != strings.TrimSpace(session.TemplateID) {
+		return fmt.Errorf("optimizer candidate template_id %q does not match train session template %q", templateID, strings.TrimSpace(session.TemplateID))
+	}
+	expectedBase := strings.TrimSpace(iteration.BaseTemplateVersionID)
+	if expectedBase == "" {
+		expectedBase = strings.TrimSpace(session.TemplateVersionID)
+	}
+	baseRef := strings.TrimSpace(candidate.BaseVersionID)
+	if baseRef == "" {
+		base, err := store.GetAgentTemplate(ctx, templateID)
+		if err != nil {
+			return fmt.Errorf("load optimizer candidate current base for %q: %w", templateID, err)
+		}
+		if base.VersionID != expectedBase {
+			return fmt.Errorf("optimizer candidate omitted base_version_id and current base is %q, want active train base %q", base.VersionID, expectedBase)
+		}
+		return nil
+	}
+	base, err := store.GetAgentTemplateReference(ctx, baseRef)
+	if err != nil {
+		return fmt.Errorf("load optimizer candidate base version %q: %w", baseRef, err)
+	}
+	if base.ID != templateID {
+		return fmt.Errorf("optimizer candidate base_version_id %q belongs to template %q, want %q", baseRef, base.ID, templateID)
+	}
+	if base.VersionID != expectedBase {
+		return fmt.Errorf("optimizer candidate base_version_id %q resolved to %q, want active train base %q", baseRef, base.VersionID, expectedBase)
+	}
+	return nil
+}
+
+func truncateForMetadata(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= 2000 {
+		return value
+	}
+	return value[:2000] + "...<truncated>"
+}
+
 func skillOptTrainGenerationRepo(session db.SkillOptTrainSession) string {
 	if repo := strings.TrimSpace(session.WorkspaceRepo); repo != "" {
 		return repo
@@ -1616,6 +2207,13 @@ func decodedSkillOptMetadata(value string) map[string]any {
 		metadata = map[string]any{}
 	}
 	return metadata
+}
+
+func decodedSkillOptMetadataValue(value any) map[string]any {
+	if object, ok := value.(map[string]any); ok {
+		return object
+	}
+	return map[string]any{}
 }
 
 func metadataString(metadata map[string]any, key string) string {
