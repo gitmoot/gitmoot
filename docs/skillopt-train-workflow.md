@@ -119,6 +119,19 @@ prefer URLs but can fall back to inline Markdown if preview publishing is not
 available. LaTeX/PDF, image, notebook, Storybook, and other preview types are
 future adapters and are not implemented in this workflow.
 
+Use previews only when the artifact has to be inspected as a rendered surface:
+
+| Output type | Preview policy | Evaluator |
+| --- | --- | --- |
+| Vue landing page or UI | `preview.mode=required`, `vue-vite/github-pages` | `landing_page_v1` |
+| Markdown, text plans, X/social post copy | `preview.mode=none` unless reviewers need a rendered page | text/LLM judge or fixture evaluator |
+| LaTeX/PDF, image, notebook, Storybook | future preview adapter | future evaluator-specific contract |
+
+GitHub review text is feedback for the optimizer. It is not a score. Optimizer
+scores come from the evaluator result artifacts produced by
+`gitmoot-skillopt`; if the evaluator is missing, fails, or returns invalid
+JSON, the gate is blocked instead of treating the result as a numeric loss.
+
 ## Review And Feedback
 
 `train continue` generates options through Gitmoot-managed temporary agents,
@@ -167,6 +180,18 @@ items:
     reasoning: C is strongest, but A has a better risk summary.
 ```
 
+Field meanings:
+
+- `quality`: reviewer confidence in the option set. Use `poor` when the whole
+  set is weak, `acceptable` when there is a usable direction, and `strong` when
+  the winner is strong enough to refine directly.
+- `continue_mode`: requested next search phase. Use `explore` to widen the
+  search, `refine` to improve the ranked winner, `distill` to simplify a strong
+  direction, and `validate` when the output should mostly be checked.
+- `promote`: human decision hint only. `yes` means the reviewer believes the
+  candidate should become current after candidate review; `no` keeps it as
+  optimizer feedback. Promotion still requires the explicit promote command.
+
 Use `quality: poor` or `continue_mode: explore` when all options are weak and a
 stable winner should not narrow the search yet. Gitmoot keeps feedback parsing
 deterministic and stores imported events as canonical feedback for export.
@@ -176,8 +201,9 @@ deterministic and stores imported events as canonical feedback for export.
 After feedback sync, `train continue` exports the training package, invokes the
 configured `gitmoot-skillopt optimize` command, imports the returned candidate
 package through the shared candidate validator, and leaves the candidate
-pending. Use `--dry-run` to validate the package and optimizer command shape
-without model calls.
+pending. Use `--dry-run` only on a disposable or reset train session to validate
+the package and optimizer command shape without model calls; dry-runs still
+import a candidate and advance the iteration to candidate review.
 
 ```sh
 gitmoot skillopt train continue \
@@ -187,7 +213,31 @@ gitmoot skillopt train continue \
   --dry-run
 ```
 
-Optimizer failures record blocked status and do not promote or partially install
+For the real landing-page optimizer pass on the production train session, do not
+include `--dry-run`; request the Vue preview evaluator explicitly:
+
+```sh
+gitmoot skillopt train continue \
+  --session landing-page-train \
+  --skillopt-bin /path/to/gitmoot-skillopt \
+  --out-root .gitmoot/skillopt/landing-page-train \
+  --optimizer-backend openai_chat \
+  --target-backend codex_exec \
+  --evaluator-id landing_page_v1 \
+  --evaluator-backend openai_chat \
+  --optimizer-model gpt-5.5 \
+  --target-model gpt-5.5 \
+  --evaluator-model gpt-5.5 \
+  --skill-update-mode full_rewrite_minibatch \
+  --num-epochs 1 \
+  --batch-size 2 \
+  --gate mixed
+```
+
+Before training starts, `gitmoot-skillopt` preflights the optimizer, target, and
+evaluator. The canaries must prove the target can return the exact requested
+text and that the evaluator can return structured hard/soft JSON. Optimizer
+failures record blocked status and do not promote or partially install
 candidate templates.
 
 ## Candidate Review And Next Iteration
@@ -226,3 +276,23 @@ preview blocking, expected review repo enforcement, preview URL review packets,
 feedback-to-optimizer handoff, candidate import, candidate review publication,
 promote/reject decisions, and start-next gate enforcement without real model
 calls or real GitHub mutation.
+
+## Troubleshooting
+
+- Wrong repo: all train review publish/sync commands must target
+  `review.expected_repo`. Use `gitmoot skillopt train status --session <id>` to
+  confirm the expected review repo before publishing.
+- Missing preview links: confirm the run has `--preview-repo`, the preview repo
+  checkout is registered with `gitmoot repo add`, and the generated option
+  output type is compatible with the current `vue-vite` renderer.
+- Missing evaluator: pass `--evaluator-id landing_page_v1` for landing-page
+  runs. Text-only flows can rely on the package evaluator config or the default
+  LLM judge.
+- Invalid evaluator JSON: fix the evaluator prompt/model/backend and rerun
+  `train continue`. Invalid hard/soft scores are blockers, not candidate
+  rejections.
+- Dry-run versus real optimizer: `--dry-run` checks package/candidate plumbing
+  without model calls or evaluator scoring, but it still advances train state.
+  Use a disposable/reset session for dry-runs; run the production session
+  without `--dry-run` and expect preflight to require working
+  credentials/backends.
