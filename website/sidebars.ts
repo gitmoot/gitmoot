@@ -27,6 +27,7 @@ const sidebars: SidebarsConfig = {
         'workflows/planner-goal-workflow',
         'workflows/template-capture-workflow',
         'workflows/review-agent-workflow',
+        'workflows/skillopt-train-workflow',
       ],
     },
     {

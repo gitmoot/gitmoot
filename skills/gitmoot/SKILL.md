@@ -71,13 +71,14 @@ The plugin is only the runtime discovery surface for this skill. Local agent
 invocation still goes through the `gitmoot` CLI and the same registered agent,
 repo access, runtime adapter, and job history model used by PR-comment jobs.
 
-For SkillOpt template learning, use ranked exploration when the user needs broad
-search across multiple directions, then narrow through refine and distill before
-final validation. Keep final promotion decisions on fresh A/B validation items
-unless the user explicitly asks for another evaluation design. Treat
-`gitmoot skillopt review status` recommendations as advisory. Do not run heavy
-SkillOpt optimization after every tiny feedback round unless the user explicitly
-wants that; collect enough rankings and trait notes first.
+For SkillOpt template learning, prefer the high-level
+`gitmoot skillopt train start/status/continue/stop` workflow when the user wants
+Gitmoot to enforce the full feedback, optimizer, candidate-review, and
+promotion loop. Use low-level `gitmoot skillopt review`, `feedback`, `export`,
+`import`, and `candidate` commands for advanced/debug work or when recovering a
+specific step. In train mode, collect enough ranked feedback and trait notes
+before optimizer handoff, keep promotion decisions explicit, and start follow-up
+iterations only through `train continue --start-next`.
 
 For complete command examples, read [CLI.md](references/CLI.md).
 For end-to-end workflows, read [WORKFLOWS.md](references/WORKFLOWS.md).

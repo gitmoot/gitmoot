@@ -2684,13 +2684,14 @@ The plugin is only the runtime discovery surface for this skill. Local agent
 invocation still goes through the `gitmoot` CLI and the same registered agent,
 repo access, runtime adapter, and job history model used by PR-comment jobs.
 
-For SkillOpt template learning, use ranked exploration when the user needs broad
-search across multiple directions, then narrow through refine and distill before
-final validation. Keep final promotion decisions on fresh A/B validation items
-unless the user explicitly asks for another evaluation design. Treat
-`gitmoot skillopt review status` recommendations as advisory. Do not run heavy
-SkillOpt optimization after every tiny feedback round unless the user explicitly
-wants that; collect enough rankings and trait notes first.
+For SkillOpt template learning, prefer the high-level
+`gitmoot skillopt train start/status/continue/stop` workflow when the user wants
+Gitmoot to enforce the full feedback, optimizer, candidate-review, and
+promotion loop. Use low-level `gitmoot skillopt review`, `feedback`, `export`,
+`import`, and `candidate` commands for advanced/debug work or when recovering a
+specific step. In train mode, collect enough ranked feedback and trait notes
+before optimizer handoff, keep promotion decisions explicit, and start follow-up
+iterations only through `train continue --start-next`.
 
 For complete command examples, read [CLI.md](references/CLI.md).
 For end-to-end workflows, read [WORKFLOWS.md](references/WORKFLOWS.md).
@@ -3091,7 +3092,20 @@ gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals
 gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id> [--reviewer name]
 gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]
 gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)
+gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file items.yml [--yes]
+gitmoot skillopt train status --session <id>
+gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--dry-run] [--promote version|--reject version --reason text] [--start-next]
+gitmoot skillopt train stop --session <id> --reason <text>
 ```
+
+Use `skillopt train` for the product workflow. It pins the template version,
+tracks sessions and iterations, validates item diversity, generates temporary
+agent options, publishes review packets, syncs feedback, hands off to the
+external optimizer, imports pending candidates, publishes candidate review
+context, and starts follow-up iterations only after a promoted/rejected/abandoned
+decision. Use `skillopt review`, `feedback`, `export`, `import`, and
+`candidate` directly only for advanced debugging, custom research runs, or
+recovering one step of a train session.
 
 `skillopt review create` starts a review run for a template and target repo.
 Use the default A/B shape for validation, or pass `--mode explore|refine|distill`
@@ -3338,6 +3352,52 @@ it explicitly:
 
 ```sh
 gitmoot goal import --file GOAL-feature.md --repo owner/repo
+```
+
+## SkillOpt Train Mode
+
+Use `gitmoot skillopt train` when a user wants Gitmoot to enforce the complete
+template-learning loop. Use low-level `skillopt review`, `feedback`, `export`,
+`import`, and `candidate` commands only for advanced/debug work, custom
+research runs, or one-step recovery.
+
+```sh
+gitmoot skillopt train start \
+  --template planner \
+  --session planner-train \
+  --repo owner/product \
+  --workspace-repo owner/product-workspace \
+  --preview-repo owner/product-previews \
+  --request "Improve release planning answers from reviewer feedback" \
+  --items-file train-items.yml \
+  --mode explore \
+  --exploration-level high \
+  --options 4 \
+  --preferred-gate hard_then_soft \
+  --yes
+
+gitmoot skillopt train status --session planner-train
+gitmoot skillopt train continue --session planner-train
+```
+
+Train sessions contain one or more iterations. Each iteration pins a base
+template version, owns one eval review run, stores workspace/preview metadata,
+collects ranked or A/B feedback, exports a training package, imports one
+pending optimizer candidate, and records an explicit promote/reject/abandon
+decision. The next iteration starts only through:
+
+```sh
+gitmoot skillopt train continue --session planner-train --start-next
+```
+
+If the previous candidate was promoted, the promoted candidate version becomes
+the next base. Rejections require a reason. Manual append-style next iterations
+are not part of the train workflow.
+
+Run the deterministic smoke before changing train behavior:
+
+```sh
+scripts/skillopt-train-smoke.sh
 ```
 
 ## SkillOpt Ranked Exploration

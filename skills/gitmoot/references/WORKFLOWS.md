@@ -190,6 +190,52 @@ it explicitly:
 gitmoot goal import --file GOAL-feature.md --repo owner/repo
 ```
 
+## SkillOpt Train Mode
+
+Use `gitmoot skillopt train` when a user wants Gitmoot to enforce the complete
+template-learning loop. Use low-level `skillopt review`, `feedback`, `export`,
+`import`, and `candidate` commands only for advanced/debug work, custom
+research runs, or one-step recovery.
+
+```sh
+gitmoot skillopt train start \
+  --template planner \
+  --session planner-train \
+  --repo owner/product \
+  --workspace-repo owner/product-workspace \
+  --preview-repo owner/product-previews \
+  --request "Improve release planning answers from reviewer feedback" \
+  --items-file train-items.yml \
+  --mode explore \
+  --exploration-level high \
+  --options 4 \
+  --preferred-gate hard_then_soft \
+  --yes
+
+gitmoot skillopt train status --session planner-train
+gitmoot skillopt train continue --session planner-train
+```
+
+Train sessions contain one or more iterations. Each iteration pins a base
+template version, owns one eval review run, stores workspace/preview metadata,
+collects ranked or A/B feedback, exports a training package, imports one
+pending optimizer candidate, and records an explicit promote/reject/abandon
+decision. The next iteration starts only through:
+
+```sh
+gitmoot skillopt train continue --session planner-train --start-next
+```
+
+If the previous candidate was promoted, the promoted candidate version becomes
+the next base. Rejections require a reason. Manual append-style next iterations
+are not part of the train workflow.
+
+Run the deterministic smoke before changing train behavior:
+
+```sh
+scripts/skillopt-train-smoke.sh
+```
+
 ## SkillOpt Ranked Exploration
 
 Use ranked exploration when a template needs broad search before final

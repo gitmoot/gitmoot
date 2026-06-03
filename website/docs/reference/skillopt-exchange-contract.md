@@ -6,6 +6,13 @@ Gitmoot keeps the SkillOpt optimizer outside the main binary. The boundary is a
 pair of JSON package formats handled by `gitmoot skillopt export` and
 `gitmoot skillopt import`.
 
+For the guided product workflow, use `gitmoot skillopt train` instead of
+assembling every low-level command manually. Train mode creates sessions and
+iterations, manages items, generates options, publishes review packets, syncs
+feedback, exports the package, runs the external optimizer, imports a pending
+candidate, and starts follow-up iterations only after an explicit decision. See
+[SkillOpt Train Workflow](/workflows/skillopt-train-workflow).
+
 ## Training Package
 
 ```sh

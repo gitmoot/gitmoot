@@ -4,6 +4,18 @@ Gitmoot keeps the SkillOpt optimizer outside the main binary. The boundary is a
 pair of JSON package formats handled by `gitmoot skillopt export` and
 `gitmoot skillopt import`.
 
+For the guided product workflow, use `gitmoot skillopt train` instead of
+assembling every low-level command manually. Train mode creates sessions and
+iterations, manages review items, generates options, publishes review packets,
+syncs feedback, exports the package, runs the external optimizer, imports a
+pending candidate, publishes candidate review context, and starts follow-up
+iterations only after an explicit decision. The low-level commands documented
+here are still useful for advanced debugging, custom research runs, and
+recovering individual train steps.
+
+See [SkillOpt Train Workflow](skillopt-train-workflow.md) for the end-to-end
+train-mode sequence.
+
 ## Training Package
 
 Export a local eval run:
@@ -442,6 +454,16 @@ Complete local review path:
 8. `gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]`
 9. `gitmoot skillopt candidate show <version-id>`
 10. `gitmoot skillopt candidate promote <version-id>` or `gitmoot skillopt candidate reject <version-id>`
+
+Complete train-mode path:
+
+1. `gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file items.yml --yes`
+2. `gitmoot skillopt train continue --session <session-id>` to generate options and publish the review packet.
+3. Human feedback is imported from the review surface.
+4. `gitmoot skillopt train continue --session <session-id>` to export the package, run `gitmoot-skillopt`, and import the pending candidate.
+5. `gitmoot skillopt train continue --session <session-id>` to publish candidate review context.
+6. `gitmoot skillopt train continue --session <session-id> --promote <version>` or `--reject <version> --reason <text>`.
+7. `gitmoot skillopt train continue --session <session-id> --start-next` only after the prior iteration is resolved.
 
 Complete GitHub review path:
 

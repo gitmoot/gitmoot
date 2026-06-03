@@ -271,7 +271,20 @@ gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals
 gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id> [--reviewer name]
 gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]
 gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)
+gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file items.yml [--yes]
+gitmoot skillopt train status --session <id>
+gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--dry-run] [--promote version|--reject version --reason text] [--start-next]
+gitmoot skillopt train stop --session <id> --reason <text>
 ```
+
+Use `skillopt train` for the product workflow. It pins the template version,
+tracks sessions and iterations, validates item diversity, generates temporary
+agent options, publishes review packets, syncs feedback, hands off to the
+external optimizer, imports pending candidates, publishes candidate review
+context, and starts follow-up iterations only after a promoted/rejected/abandoned
+decision. Use `skillopt review`, `feedback`, `export`, `import`, and
+`candidate` directly only for advanced debugging, custom research runs, or
+recovering one step of a train session.
 
 `skillopt review create` starts a review run for a template and target repo.
 Use the default A/B shape for validation, or pass `--mode explore|refine|distill`
