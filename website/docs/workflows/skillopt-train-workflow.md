@@ -67,11 +67,40 @@ items:
 Starting with too few items fails. Homogeneous item sets warn and require
 explicit confirmation.
 
+## Preview Repos
+
+Without `--preview-repo`, train sessions use `preview.mode=none` and publish
+text-only review packets to the target repo. With `--preview-repo
+owner/previews`, Gitmoot defaults to required Vue/Vite previews published
+through GitHub Pages, and the expected review repo becomes `owner/previews`.
+Register the preview checkout before publishing:
+
+```sh
+gitmoot repo add owner/previews --path /path/to/previews
+```
+
+The currently implemented renderer/publisher pairs are `none/none` and
+`vue-vite/github-pages`. Required previews block inline fallback until every
+generated option has a `preview_url`; optional previews use URLs when available
+and fall back to inline Markdown only when preview publishing is unavailable.
+LaTeX/PDF and other preview types are future adapters.
+
 ## Review, Feedback, And Optimizer Gate
 
 `train continue` generates options through Gitmoot-managed temporary agents and
-publishes a concise GitHub review packet. Reviewers can use ranked feedback with
-optional quality and phase hints:
+publishes a concise GitHub review packet. For landing-page preview runs, call it
+once to generate Vue/Vite bundles and a second time to build/publish previews
+and create the review issue:
+
+```sh
+gitmoot skillopt train continue --session planner-train
+gitmoot skillopt train continue --session planner-train
+```
+
+Low-level GitHub feedback publish/sync commands enforce the train run's
+expected review repo, so preview reviews cannot accidentally publish to the
+target product repo. Reviewers can use ranked feedback with optional quality and
+phase hints:
 
 ```yaml
 run_id: planner-train-review-001
@@ -114,5 +143,6 @@ scripts/skillopt-train-smoke.sh
 ```
 
 The smoke script runs focused CLI tests with fake managed generation, fake
-`gitmoot-skillopt`, and fake GitHub publication. It covers the train loop
-without real model calls or real GitHub mutation.
+preview publication, fake `gitmoot-skillopt`, and fake GitHub publication. It
+covers preview blocking, review-repo enforcement, the train loop, and candidate
+decisions without real model calls or real GitHub mutation.

@@ -230,6 +230,26 @@ If the previous candidate was promoted, the promoted candidate version becomes
 the next base. Rejections require a reason. Manual append-style next iterations
 are not part of the train workflow.
 
+Preview modes are explicit. Text-only sessions use `preview.mode=none`,
+`preview.renderer=none`, and `preview.publisher=none`; GitHub issues contain
+inline review content. Landing-page preview sessions use
+`--preview-repo owner/previews`, which defaults to `preview.mode=required`,
+`preview.renderer=vue-vite`, `preview.publisher=github-pages`, and
+`review.expected_repo=owner/previews`. Register the preview checkout first:
+
+```sh
+gitmoot repo add owner/previews --path /path/to/previews
+```
+
+Run `train continue` once to generate Vue/Vite bundles and a second time to
+publish GitHub Pages previews and create the human review issue. Required
+previews block inline fallback until every option has `preview_url`; optional
+previews use URLs when present and fall back to inline Markdown only when
+preview publication is unavailable. Low-level GitHub feedback publish/sync
+commands enforce the train run's expected review repo. LaTeX/PDF, Storybook,
+notebook, image, and other preview types are future adapters, not current
+renderer/publisher pairs.
+
 Run the deterministic smoke before changing train behavior:
 
 ```sh

@@ -73,9 +73,9 @@ gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals
 gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id> [--reviewer name]
 gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]
 gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)
-gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file items.yml [--yes]
+gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file items.yml [--workspace-repo owner/workspace] [--preview-repo owner/previews] [--preview-mode none|optional|required] [--preview-renderer none|vue-vite] [--preview-publisher none|github-pages] [--preview-route-template template] [--yes]
 gitmoot skillopt train status --session <id>
-gitmoot skillopt train continue --session <id> [--promote version|--reject version --reason text] [--start-next]
+gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--dry-run] [--promote version|--reject version --reason text] [--start-next]
 gitmoot skillopt train stop --session <id> --reason <text>
 ```
 

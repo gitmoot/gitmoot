@@ -93,16 +93,61 @@ items:
 
 Starting with too few items fails. Homogeneous item sets warn and require
 explicit acceptance. `workspace-repo` is where managed agents can work on
-generated outputs. `preview-repo` is where preview links can point when a
-workflow produces demos or rendered artifacts. Gitmoot records preview metadata,
-but it does not assume private GitHub Pages is available.
+generated outputs.
+
+`preview-repo` enables review previews. Without it, train sessions use
+`preview.mode=none`, `preview.renderer=none`, `preview.publisher=none`, and the
+review repo defaults to the target repo. With `--preview-repo owner/previews`,
+Gitmoot defaults to `preview.mode=required`, `preview.renderer=vue-vite`,
+`preview.publisher=github-pages`, and `review.expected_repo=owner/previews`.
+Register the preview checkout before publishing previews:
+
+```sh
+gitmoot repo add owner/previews --path /path/to/previews
+```
+
+The currently implemented renderer/publisher pairs are `none/none` and
+`vue-vite/github-pages`. Vue/Vite generation is a constrained file-bundle
+contract; Gitmoot supplies the trusted Vite scaffold, builds the bundle in a
+temporary work directory, publishes only `dist/` into the preview repo under
+`runs/{run_id}/{item_id}/{option_label}/`, pushes that route, and stores
+`preview_url` on the generated option.
+
+Required previews block inline fallback: Gitmoot will not publish the human
+review issue until every generated option has a preview URL. Optional previews
+prefer URLs but can fall back to inline Markdown if preview publishing is not
+available. LaTeX/PDF, image, notebook, Storybook, and other preview types are
+future adapters and are not implemented in this workflow.
 
 ## Review And Feedback
 
 `train continue` generates options through Gitmoot-managed temporary agents,
 stores artifact-backed review items/options, and publishes a concise GitHub
-review packet when the review step is ready. Reviewers can provide ranked
-feedback with optional quality and phase hints:
+review packet when the review step is ready. For required Vue previews, run
+`continue` once to generate bundles and a second time to build/publish previews
+and create the review issue in the expected preview repo:
+
+```sh
+gitmoot skillopt train start \
+  --template planner \
+  --repo owner/product \
+  --workspace-repo owner/product-workspace \
+  --preview-repo owner/product-previews \
+  --session landing-page-train \
+  --request "Train landing-page review options" \
+  --items-file train-items.yml \
+  --yes
+
+gitmoot skillopt train continue --session landing-page-train
+gitmoot skillopt train continue --session landing-page-train
+```
+
+Low-level `skillopt feedback github publish` and `sync` enforce
+`review.expected_repo` for train runs. If a preview train expects
+`owner/previews`, publishing or syncing against `owner/product` fails instead of
+posting to the wrong repository.
+
+Reviewers can provide ranked feedback with optional quality and phase hints:
 
 ```yaml
 run_id: planner-train-review-001
@@ -175,7 +220,9 @@ scripts/skillopt-train-smoke.sh
 ```
 
 The script runs focused CLI smoke tests with fake managed generation, fake
-`gitmoot-skillopt`, and fake GitHub publication. It covers local template
-creation, session setup, item/generation flow, feedback-to-optimizer handoff,
-candidate import, candidate review publication, promote/reject decisions, and
-start-next gate enforcement without real model calls or real GitHub mutation.
+`gitmoot-skillopt`, fake preview publication, and fake GitHub publication. It
+covers local template creation, session setup, item/generation flow, required
+preview blocking, expected review repo enforcement, preview URL review packets,
+feedback-to-optimizer handoff, candidate import, candidate review publication,
+promote/reject decisions, and start-next gate enforcement without real model
+calls or real GitHub mutation.
