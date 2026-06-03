@@ -4682,7 +4682,21 @@ func runSkillOptFeedbackGitHubSync(args []string, stdout, stderr io.Writer) int 
 
 func resolveSkillOptFeedbackRepo(ctx context.Context, paths config.Paths, store *db.Store, run db.EvalRun, repoFlag string) (github.Repository, error) {
 	if strings.TrimSpace(repoFlag) != "" {
-		return daemon.ParseRepository(repoFlag)
+		requested, err := daemon.ParseRepository(repoFlag)
+		if err != nil {
+			return github.Repository{}, err
+		}
+		if expected, ok, err := resolveSkillOptTrainFeedbackRepo(ctx, store, run); err != nil {
+			return github.Repository{}, err
+		} else if ok && expected.FullName() != "" && !strings.EqualFold(requested.FullName(), expected.FullName()) {
+			return github.Repository{}, fmt.Errorf("train run %s expects github feedback repo %s; got %s", run.ID, expected.FullName(), requested.FullName())
+		}
+		return requested, nil
+	}
+	if expected, ok, err := resolveSkillOptTrainFeedbackRepo(ctx, store, run); err != nil {
+		return github.Repository{}, err
+	} else if ok && expected.FullName() != "" {
+		return expected, nil
 	}
 	if expectedRepo := skillOptMetadataString(run.MetadataJSON, "review", "expected_repo"); expectedRepo != "" {
 		if repo, err := daemon.ParseRepository(expectedRepo); err == nil {
@@ -4716,6 +4730,30 @@ func resolveSkillOptFeedbackRepo(ctx context.Context, paths config.Paths, store 
 		return daemon.ParseRepository(defaultRepo)
 	}
 	return github.Repository{}, errors.New("skillopt feedback github requires --repo because no target repo, template source repo, or [feedback].repo default is configured")
+}
+
+func resolveSkillOptTrainFeedbackRepo(ctx context.Context, store *db.Store, run db.EvalRun) (github.Repository, bool, error) {
+	iteration, err := store.GetSkillOptTrainIterationByEvalRun(ctx, run.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return github.Repository{}, false, nil
+	}
+	if err != nil {
+		return github.Repository{}, true, err
+	}
+	session, err := store.GetSkillOptTrainSession(ctx, iteration.SessionID)
+	if err != nil {
+		return github.Repository{}, true, err
+	}
+	policy := skillopt.ResolveTrainPreviewPolicy(session)
+	expectedRepo := strings.TrimSpace(policy.ExpectedReviewRepo)
+	if expectedRepo == "" {
+		return github.Repository{}, true, nil
+	}
+	repo, err := daemon.ParseRepository(expectedRepo)
+	if err != nil {
+		return github.Repository{}, true, fmt.Errorf("train expected review repo: %w", err)
+	}
+	return repo, true, nil
 }
 
 func scoreText(score *float64) string {
