@@ -44,9 +44,16 @@ gate, and next action without writing state.
 
 ```sh
 gitmoot skillopt train status --session planner-train
+gitmoot skillopt train status --session planner-train --json --verbose
+gitmoot skillopt train status --session planner-train --watch --poll 5s
 gitmoot skillopt train continue --session planner-train
 gitmoot skillopt train stop --session planner-train --reason "Request changed"
 ```
+
+Verbose status reports the current phase, step, review issue, candidate state,
+active work locks, item progress, and next action. JSON output is for
+automation; watch mode is text-only and exits when the session waits for human
+input or reaches a terminal phase.
 
 The item file is YAML or JSON:
 
@@ -99,8 +106,10 @@ gitmoot skillopt train continue --session planner-train
 
 Low-level GitHub feedback publish/sync commands enforce the train run's
 expected review repo, so preview reviews cannot accidentally publish to the
-target product repo. Reviewers can use ranked feedback with optional quality and
-phase hints:
+target product repo. Review issues include a fenced `yaml` block for copyable
+feedback, and `train continue` auto-syncs GitHub comments when the review is
+published and no feedback has been imported yet. Reviewers can use ranked
+feedback with optional quality and phase hints:
 
 ```yaml
 run_id: planner-train-review-001
@@ -122,7 +131,20 @@ After feedback sync, train mode exports the training package, invokes
 candidate validator, and leaves the candidate pending. Use optimizer `--dry-run`
 flags to validate command shape without model calls.
 
-## Candidate Decision
+Evaluator profiles define artifact contracts and stages. Landing-page runs use
+cheap-first Vue/Vite checks, optional render smoke, and then the LLM judge.
+Structured failures include reasons, optimizer hints, failed checks, evidence,
+and stage status so the optimizer can update the skill from failure classes. If
+the optimizer returns the unchanged baseline, accepts no prompt edit, or returns
+the same content hash, Gitmoot records `optimizer_completed_no_candidate` and
+does not publish a candidate review.
+
+## Candidate Review And Decision
+
+Candidate reviews separate selection score, evaluator/test scores, gate status,
+no-op status, and promotability. If metadata marks the candidate as no-op or not
+promotable, the review says promotion is unavailable instead of showing a
+promote command.
 
 Promote or reject explicitly:
 
@@ -146,3 +168,17 @@ The smoke script runs focused CLI tests with fake managed generation, fake
 preview publication, fake `gitmoot-skillopt`, and fake GitHub publication. It
 covers preview blocking, review-repo enforcement, the train loop, and candidate
 decisions without real model calls or real GitHub mutation.
+
+## Troubleshooting
+
+- Missing feedback import: reply with the fenced YAML block or raw YAML, then
+  rerun `gitmoot skillopt train continue --session <id>` to auto-sync comments.
+- Invalid YAML: sync output reports wrong `run_id`, missing item feedback,
+  invalid ranking, unknown option, invalid signal value, no parseable YAML, or
+  no comments.
+- No candidate created: inspect `no_candidate_reason` with `train status
+  --verbose`.
+- Render adapter unavailable: install the required render dependency or use a
+  profile that does not require render smoke.
+- Evaluator skipped: cheap hard checks can intentionally stop render/LLM stages
+  after an artifact-contract failure.

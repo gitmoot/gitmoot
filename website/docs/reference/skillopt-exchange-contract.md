@@ -35,7 +35,10 @@ frontmatter, matching metadata, an optional eval report, an optional summary,
 and optional artifact manifest entries. When artifact entries are present,
 `--artifact-dir` is required; Gitmoot verifies relative paths and SHA256 hashes,
 stores the blobs, and registers artifact metadata before creating the pending
-candidate. Importing never promotes it automatically.
+candidate. Importing never promotes it automatically. If the eval report or
+summary metadata marks `promotable: false` with `no_candidate_reason`, or if the
+candidate content hash matches the base version, Gitmoot rejects the package as
+no candidate instead of creating a fake pending version.
 
 ```sh
 gitmoot skillopt candidate list --template planner
@@ -47,6 +50,11 @@ gitmoot skillopt candidate reject planner@v3 --reason "Too broad"
 `candidate show` includes the eval report, preference summary, and content diff.
 Promotion updates the current template version; rejection records an audit reason
 and keeps the rejected version out of `@latest`.
+
+Train-mode candidate reviews separate selection score, evaluator/test scores,
+gate status, no-op status, and promotability. Review bodies do not show a
+promote command when stored metadata marks a candidate as no-op or not
+promotable.
 
 ## Human Feedback Trial Happy Path
 

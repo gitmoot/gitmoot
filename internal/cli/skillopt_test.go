@@ -2939,8 +2939,13 @@ func TestSkillOptTrainContinuePublishesCandidateReviewPromotesAndStartsNext(t *t
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close after options count update returned error: %v", err)
 	}
+	candidatePackage := cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with candidate review guidance.")
+	selectionScore := 0.73
+	candidatePackage.Summary.Score = &selectionScore
+	candidatePackage.Summary.Metadata = json.RawMessage(`{"best_origin":"candidate","total_accepts":2,"promotable":true,"no_candidate_reason":null}`)
+	candidatePackage.EvalReport = json.RawMessage(`{"score":0.86,"hard":0.91,"soft":0.84,"best_selection_hard":0.77,"best_selection_soft":0.78,"baseline_selection_hard":0.55,"baseline_selection_soft":0.56,"test_hard":0.72,"test_soft":0.74,"baseline_test_hard":0.5,"baseline_test_soft":0.52,"dimension_scores":{"hero_quality":0.8},"gate_status":"passed","promotable":true,"no_candidate_reason":"stale_non_blocking_reason"}`)
 	runner := &skillOptTrainFakeOptimizerRunner{
-		candidate: cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with candidate review guidance."),
+		candidate: candidatePackage,
 	}
 	previousRunner := skillOptTrainOptimizerRunner
 	skillOptTrainOptimizerRunner = runner
@@ -3057,6 +3062,23 @@ func TestSkillOptTrainContinuePublishesCandidateReviewPromotesAndStartsNext(t *t
 		"SkillOpt Candidate Review",
 		"### Artifacts",
 		"`candidate-diff`",
+		"### Scores And Gate",
+		"Selection score: `0.73`",
+		"Best selection hard: `0.77`",
+		"Best selection soft: `0.78`",
+		"Baseline selection hard: `0.55`",
+		"Baseline selection soft: `0.56`",
+		"Test score: `0.86`",
+		"Hard score: `0.91`",
+		"Soft score: `0.84`",
+		"Test hard: `0.72`",
+		"Test soft: `0.74`",
+		"Baseline test hard: `0.5`",
+		"Baseline test soft: `0.52`",
+		"Dimension scores: `hero_quality=0.8`",
+		"Gate status: `passed`",
+		"No-op status: `not detected; best_origin=candidate; total_accepts=2`",
+		"Promotability: `promotable`",
 		"planner@v2",
 		skillOptTrainCandidateDecisionCommand(true, "optimizer-train", "--promote", "planner@v2", false),
 		skillOptTrainCandidateDecisionCommand(true, "optimizer-train", "--reject", "planner@v2", true),
@@ -3462,6 +3484,94 @@ func TestSkillOptTrainContinueRequiresReasonForExternalCandidateRejection(t *tes
 	}
 	if latest.ID != "optimizer-train-002" || latest.BaseTemplateVersionID != baseVersionID || latest.State != skillopt.TrainStateItemsReady {
 		t.Fatalf("latest iteration = %+v", latest)
+	}
+}
+
+func TestSkillOptTrainCandidateReviewBodyMarksNoOpNotPromotable(t *testing.T) {
+	home, baseVersionID := seedSkillOptTrainFeedbackSynced(t)
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+
+	candidate := cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with a changed candidate.")
+	version, err := skillopt.ImportCandidatePackage(context.Background(), store, candidate, "candidate.json")
+	if err != nil {
+		t.Fatalf("ImportCandidatePackage returned error: %v", err)
+	}
+	review, err := store.GetAgentTemplateCandidateReview(context.Background(), version.ID)
+	if err != nil {
+		t.Fatalf("GetAgentTemplateCandidateReview returned error: %v", err)
+	}
+	review.EvalReportJSON = `{"score":0,"hard":0,"soft":0,"gate_status":"blocked","promotable":false,"no_candidate_reason":"best_origin_initial_skill"}`
+	review.SummaryMetadataJSON = `{"best_origin":"initial_skill","total_accepts":0,"promotable":false,"no_candidate_reason":"best_origin_initial_skill"}`
+	if err := store.UpsertAgentTemplateCandidateReview(context.Background(), review); err != nil {
+		t.Fatalf("UpsertAgentTemplateCandidateReview returned error: %v", err)
+	}
+	session, err := store.GetSkillOptTrainSession(context.Background(), "optimizer-train")
+	if err != nil {
+		t.Fatalf("GetSkillOptTrainSession returned error: %v", err)
+	}
+	body, err := skillOptTrainCandidateReviewBody(context.Background(), store, session, db.SkillOptTrainIteration{
+		ID:                    "optimizer-train-001",
+		CandidateVersionID:    version.ID,
+		BaseTemplateVersionID: baseVersionID,
+	}, home)
+	if err != nil {
+		t.Fatalf("skillOptTrainCandidateReviewBody returned error: %v", err)
+	}
+	for _, want := range []string{
+		"### Scores And Gate",
+		"Test score: `0`",
+		"Hard score: `0`",
+		"Soft score: `0`",
+		"Gate status: `blocked`",
+		"No-op status: `blocked: best_origin_initial_skill`",
+		"Promotability: `not promotable: best_origin_initial_skill`",
+		"Promote: unavailable because best_origin_initial_skill.",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("candidate review body missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "--promote "+version.ID) {
+		t.Fatalf("candidate review body exposed promote command for no-op metadata:\n%s", body)
+	}
+	_, err = decideSkillOptTrainCandidate(context.Background(), store, session, db.SkillOptTrainIteration{
+		ID:                 "optimizer-train-001",
+		State:              skillopt.TrainStateCandidateReviewPublished,
+		CandidateVersionID: version.ID,
+	}, skillOptTrainContinueRequest{PromoteCandidate: version.ID})
+	if err == nil || !strings.Contains(err.Error(), "candidate planner@v2 is not promotable: best_origin_initial_skill") {
+		t.Fatalf("decideSkillOptTrainCandidate promote error = %v", err)
+	}
+	blockedVersion, err := store.GetAgentTemplateVersionByID(context.Background(), version.ID)
+	if err != nil {
+		t.Fatalf("GetAgentTemplateVersionByID after blocked promote returned error: %v", err)
+	}
+	if blockedVersion.State != "pending" {
+		t.Fatalf("blocked promote changed version state = %+v", blockedVersion)
+	}
+
+	review.EvalReportJSON = `{"score":0,"hard":0,"soft":0,"gate_status":"blocked"}`
+	review.SummaryMetadataJSON = `{"best_origin":"initial_skill","total_accepts":0}`
+	if err := store.UpsertAgentTemplateCandidateReview(context.Background(), review); err != nil {
+		t.Fatalf("UpsertAgentTemplateCandidateReview without reason returned error: %v", err)
+	}
+	body, err = skillOptTrainCandidateReviewBody(context.Background(), store, session, db.SkillOptTrainIteration{
+		ID:                    "optimizer-train-001",
+		CandidateVersionID:    version.ID,
+		BaseTemplateVersionID: baseVersionID,
+	}, home)
+	if err != nil {
+		t.Fatalf("skillOptTrainCandidateReviewBody without reason returned error: %v", err)
+	}
+	for _, want := range []string{
+		"No-op status: `blocked: best_origin_initial_skill`",
+		"Promotability: `not promotable: best_origin_initial_skill`",
+		"Promote: unavailable because best_origin_initial_skill.",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("candidate review body without reason missing %q:\n%s", want, body)
+		}
 	}
 }
 
