@@ -716,7 +716,7 @@ func TestSkillOptTrainStartStatusAndStop(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("train status exit code = %d, stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "current_phase: items_ready") || !strings.Contains(stdout.String(), "blocked_step: options_generated") || !strings.Contains(stdout.String(), "review_items: 2") {
+	if !strings.Contains(stdout.String(), "status_phase: items_ready") || !strings.Contains(stdout.String(), "current_phase: items_ready") || !strings.Contains(stdout.String(), "blocked_step: options_generated") || !strings.Contains(stdout.String(), "review_items: 2") {
 		t.Fatalf("status stdout = %q", stdout.String())
 	}
 
@@ -732,6 +732,7 @@ func TestSkillOptTrainStartStatusAndStop(t *testing.T) {
 	}
 	if statusJSON.SessionID != "landing-train" ||
 		statusJSON.CurrentPhase != skillopt.TrainStateItemsReady ||
+		statusJSON.StatusPhase != skillopt.TrainStateItemsReady ||
 		statusJSON.CurrentStep != skillopt.TrainStateOptionsGenerated ||
 		statusJSON.PreviewPolicy.ExpectedReviewRepo != "owner/previews" ||
 		statusJSON.Counts.ReviewItems != 2 ||
@@ -749,6 +750,7 @@ func TestSkillOptTrainStartStatusAndStop(t *testing.T) {
 		t.Fatalf("train status watch exit code = %d, stderr=%s", code, stderr.String())
 	}
 	for _, want := range []string{
+		"status_phase: items_ready",
 		"current_phase: items_ready",
 		"current_step: options_generated",
 		"elapsed:",
@@ -2716,7 +2718,6 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 		}
 	}
 	store := openCLIJobStore(t, home)
-	defer store.Close()
 	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "optimizer-train")
 	if err != nil {
 		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
@@ -2730,6 +2731,24 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 	}
 	if _, err := store.GetAgentTemplateVersionByID(context.Background(), "planner@v2"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("no-candidate imported planner@v2 err=%v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close no-candidate store returned error: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "train", "status", "--home", home, "--session", "optimizer-train", "--json", "--verbose"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train status no-candidate exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	var statusJSON skillOptTrainStatusSnapshot
+	if err := json.Unmarshal(stdout.Bytes(), &statusJSON); err != nil {
+		t.Fatalf("train status no-candidate json did not decode: %v\n%s", err, stdout.String())
+	}
+	if statusJSON.StatusPhase != "optimizer_completed_no_candidate" ||
+		statusJSON.NoCandidateReason != "candidate content is unchanged from the base version" {
+		t.Fatalf("train status no-candidate json = %+v", statusJSON)
 	}
 
 	stdout.Reset()
@@ -4538,8 +4557,9 @@ func TestSkillOptTrainContinueReportsRecoveryAfterOptimizerFailureArtifacts(t *t
 	home, baseVersionID := seedSkillOptTrainFeedbackSynced(t)
 	outRoot := filepath.Join(t.TempDir(), "optimizer")
 	runner := &skillOptTrainFakeOptimizerRunner{
-		candidate:          cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with recoverable candidate guidance."),
-		failAfterCandidate: true,
+		candidate:                cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with recoverable candidate guidance."),
+		failAfterCandidate:       true,
+		failAfterCandidateStderr: "optimizer backend config stderr after candidate",
 	}
 	previousRunner := skillOptTrainOptimizerRunner
 	skillOptTrainOptimizerRunner = runner
@@ -4557,7 +4577,7 @@ func TestSkillOptTrainContinueReportsRecoveryAfterOptimizerFailureArtifacts(t *t
 	if code != 1 {
 		t.Fatalf("train continue failing optimizer exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "optimizer stderr after candidate") {
+	if !strings.Contains(stderr.String(), "optimizer backend config stderr after candidate") {
 		t.Fatalf("optimizer failure stderr = %q", stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "recovery_available: true") {
@@ -4573,8 +4593,24 @@ func TestSkillOptTrainContinueReportsRecoveryAfterOptimizerFailureArtifacts(t *t
 	if code != 0 {
 		t.Fatalf("train status after recoverable optimizer failure exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "optimizer_recovery_available: true") {
+	if !strings.Contains(stdout.String(), "status_phase: recovery_available") ||
+		!strings.Contains(stdout.String(), "recovery_available: true") ||
+		!strings.Contains(stdout.String(), "optimizer_recovery_available: true") {
 		t.Fatalf("train status did not advertise recovery:\n%s", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "train", "status", "--home", home, "--session", "optimizer-train", "--json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train status recovery json exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	var statusJSON skillOptTrainStatusSnapshot
+	if err := json.Unmarshal(stdout.Bytes(), &statusJSON); err != nil {
+		t.Fatalf("train status recovery json did not decode: %v\n%s", err, stdout.String())
+	}
+	if statusJSON.StatusPhase != "recovery_available" || !statusJSON.RecoveryAvailable || statusJSON.Verbose != nil {
+		t.Fatalf("train status recovery json = %+v", statusJSON)
 	}
 
 	store := openCLIJobStore(t, home)
@@ -5197,6 +5233,7 @@ func TestSkillOptTrainContinueRefusesConcurrentOptimizer(t *testing.T) {
 		t.Fatalf("train status with optimizer lock exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 	for _, want := range []string{
+		"status_phase: optimizer_running",
 		"active_lock: optimizer skillopt-train:optimizer-train:optimizer-train-001 status=active",
 		"active_lock: optimizer_legacy skillopt-train-optimizer:optimizer-train:optimizer-train-001 status=active",
 		"owner=local-skillopt-train-optimizer-optimizer-train",
@@ -5249,8 +5286,23 @@ func TestSkillOptTrainContinueReportsStaleOptimizerLock(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("train status stale lock exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "active_lock: optimizer skillopt-train:optimizer-train:optimizer-train-001 status=stale") {
+	if !strings.Contains(stdout.String(), "status_phase: blocked_stale_lock") ||
+		!strings.Contains(stdout.String(), "active_lock: optimizer skillopt-train:optimizer-train:optimizer-train-001 status=stale") {
 		t.Fatalf("train status stale lock stdout = %s", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "train", "status", "--home", home, "--session", "optimizer-train", "--json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train status stale lock json exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	var statusJSON skillOptTrainStatusSnapshot
+	if err := json.Unmarshal(stdout.Bytes(), &statusJSON); err != nil {
+		t.Fatalf("train status stale lock json did not decode: %v\n%s", err, stdout.String())
+	}
+	if statusJSON.StatusPhase != "blocked_stale_lock" || statusJSON.Verbose != nil {
+		t.Fatalf("train status stale lock json = %+v", statusJSON)
 	}
 
 	stdout.Reset()
@@ -5260,6 +5312,7 @@ func TestSkillOptTrainContinueReportsStaleOptimizerLock(t *testing.T) {
 		t.Fatalf("train status watch stale lock exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "active_lock: optimizer skillopt-train:optimizer-train:optimizer-train-001 status=stale") ||
+		!strings.Contains(stdout.String(), "status_phase: blocked_stale_lock") ||
 		!strings.Contains(stdout.String(), "watch_state: waiting") {
 		t.Fatalf("train status watch stale lock stdout = %s", stdout.String())
 	}
@@ -7581,11 +7634,12 @@ func seedSkillOptTrainFeedbackSynced(t *testing.T) (string, string) {
 }
 
 type skillOptTrainFakeOptimizerRunner struct {
-	candidate          skillopt.CandidatePackage
-	fail               bool
-	failAfterCandidate bool
-	lookPathValue      string
-	calls              []skillOptTrainFakeOptimizerCall
+	candidate                skillopt.CandidatePackage
+	fail                     bool
+	failAfterCandidate       bool
+	failAfterCandidateStderr string
+	lookPathValue            string
+	calls                    []skillOptTrainFakeOptimizerCall
 }
 
 type skillOptTrainFakeOptimizerCall struct {
@@ -7642,7 +7696,10 @@ func (r *skillOptTrainFakeOptimizerRunner) Run(_ context.Context, dir string, co
 	}
 	result.Stdout = "wrote candidate package: " + candidateOutput + "\n"
 	if r.failAfterCandidate {
-		result.Stderr = "optimizer stderr after candidate"
+		result.Stderr = strings.TrimSpace(r.failAfterCandidateStderr)
+		if result.Stderr == "" {
+			result.Stderr = "optimizer stderr after candidate"
+		}
 		return result, errors.New("exit status 2")
 	}
 	return result, nil

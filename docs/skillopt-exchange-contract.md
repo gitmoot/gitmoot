@@ -467,14 +467,15 @@ Complete local review path:
 Complete train-mode path:
 
 1. `gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file items.yml --yes`
-2. `gitmoot skillopt train status --session <session-id> --json --verbose` or `--watch` to inspect live phase, item progress, active locks, review issue, candidate, and next action.
+2. `gitmoot skillopt train status --session <session-id> --json --verbose` or `--watch` to inspect `status_phase`, item progress, active locks with owner and heartbeat, review issue, candidate, recovery availability, no-candidate reason, and next action. `status_phase` is the stable automation field; it can pass through normal train states such as `items_ready` and can also report optimizer/blocker phases such as `preflight_running`, `optimizer_running`, `optimizer_heartbeat_stale`, `optimizer_completed_candidate`, `optimizer_completed_no_candidate`, `recovery_available`, `blocked_config`, `blocked_stale_lock`, or `failed_unrecoverable`.
 3. `gitmoot skillopt train continue --session <session-id>` to generate options and publish the review packet.
 4. Human feedback is imported from raw or fenced YAML comments; `train continue` auto-syncs GitHub comments when the review is published and feedback is missing.
 5. Evaluator profiles run cheap artifact checks first, optional render adapters second, and LLM judges last. Structured failures flow into optimizer input with reasons, hints, evidence, failed checks, and stage status.
 6. `gitmoot skillopt train continue --session <session-id> --backend codex` to export the package, print the resolved backend/preflight report, run `gitmoot-skillopt`, and import the pending candidate, or record `optimizer_completed_no_candidate` if the optimizer produced no promotable content.
-7. `gitmoot skillopt train continue --session <session-id>` to publish candidate review context with separate selection score, evaluator/test scores, gate status, no-op status, and promotability.
-8. `gitmoot skillopt train continue --session <session-id> --promote <version>` or `--reject <version> --reason <text>`.
-9. `gitmoot skillopt train continue --session <session-id> --start-next` only after the prior iteration is resolved.
+7. If the optimizer wrapper fails after writing completed artifacts and status reports `recovery_available`, run `gitmoot skillopt train recover --session <session-id> --out-root <optimizer-output-root>` to import a completed candidate or record the completed no-candidate result through the same gate.
+8. `gitmoot skillopt train continue --session <session-id>` to publish candidate review context with separate selection score, evaluator/test scores, gate status, no-op status, and promotability.
+9. `gitmoot skillopt train continue --session <session-id> --promote <version>` or `--reject <version> --reason <text>`.
+10. `gitmoot skillopt train continue --session <session-id> --start-next` only after the prior iteration is resolved.
 
 Complete GitHub review path:
 

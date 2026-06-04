@@ -68,6 +68,20 @@ candidate state, active generation/review/optimizer locks, item progress, and
 next action. JSON output is for automation. Watch mode is text-only and exits
 when the session is waiting for human input or terminal.
 
+Automation should read `status_phase` as the stable operational phase and keep
+`current_phase` as the lower-level state-machine checkpoint. During normal
+waiting states, `status_phase` can pass through the current train state, such
+as `request_confirmed`, `workspace_ready`, `items_ready`, `options_generated`,
+`review_published`, `feedback_synced`, `training_package_created`,
+`optimizer_completed`, or `run_abandoned`. During optimizer operation,
+candidate, and blocker states, it can report
+`preflight_running`, `optimizer_running`, `optimizer_heartbeat_stale`,
+`optimizer_completed_candidate`, `optimizer_completed_no_candidate`,
+`recovery_available`, `blocked_config`, `blocked_stale_lock`, or
+`failed_unrecoverable`. Verbose JSON also reports `recovery_available`,
+`no_candidate_reason` when applicable, and `active_locks[]` with lock owner,
+process, host, heartbeat, expiry, elapsed time, and content hash.
+
 Advance the next required step:
 
 ```sh
@@ -272,6 +286,19 @@ content with the same hash as the base template, Gitmoot records
 `optimizer_completed_no_candidate` with `no_candidate_reason` and does not
 create or publish a pending candidate review.
 
+If the optimizer wrapper fails after writing completed artifacts, status reports
+`status_phase: recovery_available`. Recover the artifacts through Gitmoot
+instead of re-running blindly:
+
+```sh
+gitmoot skillopt train recover --session planner-train --out-root .gitmoot/skillopt/planner-train
+```
+
+Recovery validates the package state, imports a completed candidate through the
+normal candidate gate, or records `optimizer_completed_no_candidate` with the
+stored rejection reason. Incomplete or corrupted artifacts fail without
+modifying the train state.
+
 ## Candidate Review And Next Iteration
 
 The candidate review step publishes the candidate summary, template diff,
@@ -312,8 +339,8 @@ The script runs focused CLI smoke tests with fake managed generation, fake
 covers local template creation, session setup, item/generation flow, required
 preview blocking, expected review repo enforcement, preview URL review packets,
 feedback-to-optimizer handoff, candidate import, candidate review publication,
-promote/reject decisions, and start-next gate enforcement without real model
-calls or real GitHub mutation.
+optimizer recovery, stable status phases, promote/reject decisions, and
+start-next gate enforcement without real model calls or real GitHub mutation.
 
 ## Troubleshooting
 
@@ -332,6 +359,14 @@ calls or real GitHub mutation.
 - No candidate created: inspect `no_candidate_reason` in `train status
   --verbose`; usually the optimizer kept the initial skill, accepted no update,
   or produced content with the same hash as the base version.
+- Optimizer wrapper failed after artifacts: if `status_phase` is
+  `recovery_available`, run `gitmoot skillopt train recover --session <id>
+  --out-root <optimizer-output-root>`.
+- Stale optimizer lock: if `status_phase` is `blocked_stale_lock`, inspect
+  `active_lock` owner, pid, host, heartbeat, and expiry in verbose status before
+  clearing stale state or retrying the optimizer.
+- Config blocker: if `status_phase` is `blocked_config`, fix the reported
+  backend, credential, or model configuration and rerun `train continue`.
 - Render adapter unavailable: install the profile's render dependency or run a
   profile/config that does not require render smoke. Required render profiles
   fail before the LLM judge so the optimizer receives a structured blocker.

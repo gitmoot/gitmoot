@@ -373,25 +373,28 @@ func printSkillOptTrainStartPlan(stdout io.Writer, plan skillOptTrainStartPlan) 
 }
 
 type skillOptTrainStatusSnapshot struct {
-	SessionID        string                         `json:"session_id"`
-	IterationID      string                         `json:"iteration_id,omitempty"`
-	TemplateID       string                         `json:"template_id,omitempty"`
-	TemplateVersion  string                         `json:"template_version,omitempty"`
-	TargetRepo       string                         `json:"target_repo,omitempty"`
-	WorkspaceRepo    string                         `json:"workspace_repo,omitempty"`
-	TaskKind         string                         `json:"task_kind,omitempty"`
-	CurrentPhase     string                         `json:"current_phase"`
-	CurrentStep      string                         `json:"current_step"`
-	CompletedSteps   []string                       `json:"completed_steps"`
-	BlockedStep      string                         `json:"blocked_step,omitempty"`
-	NextAction       string                         `json:"next_action"`
-	IssueURL         string                         `json:"issue_url,omitempty"`
-	PullRequestURL   string                         `json:"pull_request_url,omitempty"`
-	CandidateVersion string                         `json:"candidate_version,omitempty"`
-	PreviewPolicy    skillOptTrainPreviewPolicyJSON `json:"preview_policy"`
-	Counts           skillOptTrainStatusCountsJSON  `json:"counts"`
-	Progress         skillOptTrainStatusProgress    `json:"progress"`
-	Verbose          *skillOptTrainStatusVerbose    `json:"verbose,omitempty"`
+	SessionID         string                         `json:"session_id"`
+	IterationID       string                         `json:"iteration_id,omitempty"`
+	TemplateID        string                         `json:"template_id,omitempty"`
+	TemplateVersion   string                         `json:"template_version,omitempty"`
+	TargetRepo        string                         `json:"target_repo,omitempty"`
+	WorkspaceRepo     string                         `json:"workspace_repo,omitempty"`
+	TaskKind          string                         `json:"task_kind,omitempty"`
+	StatusPhase       string                         `json:"status_phase"`
+	CurrentPhase      string                         `json:"current_phase"`
+	CurrentStep       string                         `json:"current_step"`
+	CompletedSteps    []string                       `json:"completed_steps"`
+	BlockedStep       string                         `json:"blocked_step,omitempty"`
+	NextAction        string                         `json:"next_action"`
+	IssueURL          string                         `json:"issue_url,omitempty"`
+	PullRequestURL    string                         `json:"pull_request_url,omitempty"`
+	CandidateVersion  string                         `json:"candidate_version,omitempty"`
+	RecoveryAvailable bool                           `json:"recovery_available"`
+	NoCandidateReason string                         `json:"no_candidate_reason,omitempty"`
+	PreviewPolicy     skillOptTrainPreviewPolicyJSON `json:"preview_policy"`
+	Counts            skillOptTrainStatusCountsJSON  `json:"counts"`
+	Progress          skillOptTrainStatusProgress    `json:"progress"`
+	Verbose           *skillOptTrainStatusVerbose    `json:"verbose,omitempty"`
 }
 
 type skillOptTrainPreviewPolicyJSON struct {
@@ -4208,12 +4211,14 @@ func loadSkillOptTrainStatusSnapshot(ctx context.Context, store *db.Store, sessi
 	}
 	summary := skillopt.BuildTrainStatusSummary(session, iteration, counts)
 	snapshot := buildSkillOptTrainStatusSnapshot(session, iteration, summary, counts)
-	if verbose {
-		details, err := buildSkillOptTrainStatusVerbose(ctx, store, session, iteration)
-		if err != nil {
-			return skillOptTrainStatusSnapshot{}, err
-		}
-		snapshot.Verbose = &details
+	details, err := buildSkillOptTrainStatusVerbose(ctx, store, session, iteration)
+	if err != nil {
+		return skillOptTrainStatusSnapshot{}, err
+	}
+	snapshot.Verbose = &details
+	snapshot = applySkillOptTrainStableStatus(snapshot)
+	if !verbose {
+		snapshot.Verbose = nil
 	}
 	return snapshot, nil
 }
@@ -4238,6 +4243,7 @@ func buildSkillOptTrainStatusSnapshot(session db.SkillOptTrainSession, iteration
 		TargetRepo:       strings.TrimSpace(session.TargetRepo),
 		WorkspaceRepo:    strings.TrimSpace(session.WorkspaceRepo),
 		TaskKind:         strings.TrimSpace(session.TaskKind),
+		StatusPhase:      summary.CurrentPhase,
 		CurrentPhase:     summary.CurrentPhase,
 		CurrentStep:      currentStep,
 		CompletedSteps:   append([]string(nil), summary.CompletedSteps...),
@@ -4269,6 +4275,83 @@ func buildSkillOptTrainStatusSnapshot(session db.SkillOptTrainSession, iteration
 			ETA:                  "unknown",
 		},
 	}
+}
+
+func applySkillOptTrainStableStatus(snapshot skillOptTrainStatusSnapshot) skillOptTrainStatusSnapshot {
+	if strings.TrimSpace(snapshot.StatusPhase) == "" {
+		snapshot.StatusPhase = strings.TrimSpace(snapshot.CurrentPhase)
+	}
+	if snapshot.Verbose != nil {
+		if reason := strings.TrimSpace(snapshot.Verbose.Candidate.NoCandidateReason); reason != "" {
+			snapshot.NoCandidateReason = reason
+		}
+		if optimizer := snapshot.Verbose.Optimizer; optimizer != nil {
+			if available, ok := optimizer["recovery_available"].(bool); ok {
+				snapshot.RecoveryAvailable = available
+			}
+		}
+	}
+	snapshot.StatusPhase = skillOptTrainStableStatusPhase(snapshot)
+	return snapshot
+}
+
+func skillOptTrainStableStatusPhase(snapshot skillOptTrainStatusSnapshot) string {
+	if snapshot.Verbose != nil {
+		for _, lock := range snapshot.Verbose.ActiveLocks {
+			if lock.Name != "optimizer" && lock.Name != "optimizer_legacy" {
+				continue
+			}
+			switch strings.TrimSpace(lock.Status) {
+			case "active":
+				return "optimizer_running"
+			case "active_expired_heartbeat":
+				return "optimizer_heartbeat_stale"
+			case "stale":
+				return "blocked_stale_lock"
+			}
+		}
+		statuses := snapshot.Verbose.MetadataStatus
+		optimizerStatus := strings.TrimSpace(statuses["optimizer"])
+		candidateImportStatus := strings.TrimSpace(statuses["candidate_import"])
+		if optimizerStatus == "preflight_running" || optimizerStatus == "preflight" {
+			return "preflight_running"
+		}
+		if snapshot.RecoveryAvailable && optimizerStatus == "failed" {
+			return "recovery_available"
+		}
+		if skillOptStatusFailureLooksConfigBlocked(snapshot.Verbose.Optimizer) {
+			return "blocked_config"
+		}
+		if optimizerStatus == "failed" || candidateImportStatus == "failed" {
+			return "failed_unrecoverable"
+		}
+	}
+	switch strings.TrimSpace(snapshot.CurrentPhase) {
+	case skillopt.TrainStateOptimizerCompletedNoCandidate:
+		return "optimizer_completed_no_candidate"
+	case skillopt.TrainStateCandidateCreated, skillopt.TrainStateCandidateReviewPublished, skillopt.TrainStateCandidatePromoted, skillopt.TrainStateCandidateRejected:
+		return "optimizer_completed_candidate"
+	}
+	if snapshot.RecoveryAvailable {
+		return "recovery_available"
+	}
+	if strings.TrimSpace(snapshot.StatusPhase) != "" {
+		return strings.TrimSpace(snapshot.StatusPhase)
+	}
+	return strings.TrimSpace(snapshot.CurrentPhase)
+}
+
+func skillOptStatusFailureLooksConfigBlocked(metadata map[string]any) bool {
+	if metadataString(metadata, "status") != "failed" {
+		return false
+	}
+	errorText := strings.ToLower(metadataString(metadata, "error"))
+	for _, marker := range []string{"config", "credential", "api key", "openai", "azure", "backend"} {
+		if strings.Contains(errorText, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func buildSkillOptTrainStatusVerbose(ctx context.Context, store *db.Store, session db.SkillOptTrainSession, iteration *db.SkillOptTrainIteration) (skillOptTrainStatusVerbose, error) {
@@ -4585,6 +4668,7 @@ func printSkillOptTrainStatusSnapshot(stdout io.Writer, snapshot skillOptTrainSt
 	writeLine(stdout, "preview_repo: %s", emptyText(snapshot.PreviewPolicy.Repo))
 	writeLine(stdout, "preview_route_template: %s", emptyText(snapshot.PreviewPolicy.RouteTemplate))
 	writeLine(stdout, "expected_review_repo: %s", emptyText(snapshot.PreviewPolicy.ExpectedReviewRepo))
+	writeLine(stdout, "status_phase: %s", emptyText(snapshot.StatusPhase))
 	writeLine(stdout, "current_phase: %s", snapshot.CurrentPhase)
 	writeLine(stdout, "completed_steps: %s", strings.Join(snapshot.CompletedSteps, ","))
 	writeLine(stdout, "blocked_step: %s", emptyText(snapshot.BlockedStep))
@@ -4593,6 +4677,10 @@ func printSkillOptTrainStatusSnapshot(stdout io.Writer, snapshot skillOptTrainSt
 	writeLine(stdout, "issue: %s", emptyText(snapshot.IssueURL))
 	writeLine(stdout, "pull_request: %s", emptyText(snapshot.PullRequestURL))
 	writeLine(stdout, "candidate: %s", emptyText(snapshot.CandidateVersion))
+	writeLine(stdout, "recovery_available: %t", snapshot.RecoveryAvailable)
+	if snapshot.NoCandidateReason != "" {
+		writeLine(stdout, "no_candidate_reason: %s", snapshot.NoCandidateReason)
+	}
 	writeLine(stdout, "review_items: %d", snapshot.Counts.ReviewItems)
 	writeLine(stdout, "feedback: %d", snapshot.Counts.FeedbackEvents+snapshot.Counts.RankedFeedbackEvents)
 	writeLine(stdout, "pairwise_preferences: %d", snapshot.Counts.PairwisePreferences)
@@ -4618,7 +4706,7 @@ func printSkillOptTrainStatusSnapshot(stdout io.Writer, snapshot skillOptTrainSt
 	if snapshot.Verbose.ReviewIssue.URL != "" {
 		writeLine(stdout, "review_issue: %s", snapshot.Verbose.ReviewIssue.URL)
 	}
-	if snapshot.Verbose.Candidate.NoCandidateReason != "" {
+	if snapshot.NoCandidateReason == "" && snapshot.Verbose.Candidate.NoCandidateReason != "" {
 		writeLine(stdout, "no_candidate_reason: %s", snapshot.Verbose.Candidate.NoCandidateReason)
 	}
 	if snapshot.Verbose.Optimizer != nil {
