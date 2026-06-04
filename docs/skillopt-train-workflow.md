@@ -195,6 +195,37 @@ submit parseable feedback. `train continue` automatically syncs GitHub comments
 when the iteration is waiting in `review_published` and no feedback has been
 imported yet. Raw YAML and fenced YAML are both supported.
 
+For local-first automatic review watching, run the daemon with the watcher flag:
+
+```sh
+gitmoot daemon run --watch-skillopt-reviews
+```
+
+The watcher uses the same `gh`/GitHub API credentials as the rest of Gitmoot. It
+does not require a GitHub App, webhook server, centralized service, or extra
+credential model. Gitmoot only polls locally registered SkillOpt review issues
+that it created during train review publication; it does not scan arbitrary
+repository issues.
+
+The watcher behavior is:
+
+- valid plain YAML or fenced `yaml` feedback is imported idempotently;
+- invalid feedback receives one precise GitHub comment per distinct parse or
+  import error hash and the issue stays open;
+- after valid feedback imports, Gitmoot posts a success comment, closes the
+  review issue, and continues the train loop under the existing train lease;
+- if the train loop is already active, the issue remains open or queued for the
+  active run instead of starting a competing optimizer process;
+- stale issues receive one reminder after the configured stale time, currently
+  `24h` by default, with the review issue, run id, expected item ids, a
+  copy-paste agent prompt, and an equivalent `gitmoot skillopt train continue
+  --session <id>` fallback command.
+
+Stale reminders do not close the issue. If a reviewer posts feedback after the
+reminder, the watcher can still import it. If the watcher is not running, post
+the feedback YAML and use the prompt from the stale notice or run the CLI
+fallback manually.
+
 Reviewers can provide ranked feedback with optional quality and phase hints:
 
 ```yaml
@@ -286,6 +317,47 @@ content with the same hash as the base template, Gitmoot records
 `optimizer_completed_no_candidate` with `no_candidate_reason` and does not
 create or publish a pending candidate review.
 
+When a changed candidate loses the selection gate against the baseline, the
+optimizer result is treated as a gate rejection, not as an accepted candidate.
+The candidate package carries a structured `gate_rejection` packet with
+baseline and candidate hard/soft/gate scores, `primary_reason`,
+`human_reason`, `optimizer_hint`, failed dimensions, evidence, attempted patch,
+retry attempts, and `next_action`. By default `gitmoot-skillopt` skips the
+expensive final test eval after this selection rejection, records
+`final_test_skipped_reason: selection_gate_rejected_candidate`, and returns a
+no-candidate package instead of asking Gitmoot to publish a candidate review.
+
+Gate-rejection retry is bounded separately from no-op retry:
+
+- `noop_retry_budget`: defaults to `1` and is used when the optimizer produced
+  no meaningful skill change.
+- `gate_reject_retry_budget`: defaults to `1` and is used only when a changed
+  candidate loses selection eval and the rejection packet contains actionable
+  new information.
+
+A gate rejection is retryable only when the evaluator supplied an
+`optimizer_hint`, the candidate actually changed, the rejection is not a repeat
+of the same reason, and budget remains. The retry prompt includes the previous
+patch summary, baseline-vs-candidate score deltas, failed dimensions, why the
+candidate lost, and guidance not to repeat the same patch direction. If the
+retry also loses, repeats the same reason, produces a no-op, or exhausts the
+budget, the run stops with `optimizer_completed_no_candidate` and a precise
+reason such as `gate_rejected_best_origin_initial_skill`.
+
+Use verbose status to see why the run stopped and what to do next:
+
+```sh
+gitmoot skillopt train status --session planner-train --verbose
+```
+
+For gate rejections, status includes the baseline/candidate score comparison,
+attempted patch, failed dimensions, retry count such as `1/1`, and a
+`next_action`. The normal user choices are to collect more feedback, rerun after
+changing the retry/config inputs, or inspect the candidate package manually.
+Gitmoot does not create a pending candidate record when the best selected prompt
+is the unchanged baseline or the candidate content hash matches the base
+template.
+
 If the optimizer wrapper fails after writing completed artifacts, status reports
 `status_phase: recovery_available`. Recover the artifacts through Gitmoot
 instead of re-running blindly:
@@ -339,8 +411,26 @@ The script runs focused CLI smoke tests with fake managed generation, fake
 covers local template creation, session setup, item/generation flow, required
 preview blocking, expected review repo enforcement, preview URL review packets,
 feedback-to-optimizer handoff, candidate import, candidate review publication,
-optimizer recovery, stable status phases, promote/reject decisions, and
-start-next gate enforcement without real model calls or real GitHub mutation.
+optimizer recovery, structured no-candidate status, stable status phases,
+promote/reject decisions, start-next gate enforcement, watched review feedback
+import, review issue close/continue behavior, invalid-feedback comments, and
+one-time stale notices without real model calls or real GitHub mutation.
+
+For optimizer-side gate retry and final-test-skip checks in the sibling
+`gitmoot-skillopt` checkout, run the focused pytest smoke:
+
+```sh
+cd /path/to/gitmoot-skillopt
+PYTHONDONTWRITEBYTECODE=1 python -m pytest \
+  tests/test_gate_fail_closed.py \
+  tests/test_gitmoot_optimize_cli.py \
+  tests/test_gitmoot_package.py
+```
+
+Those tests cover selection rejection creating a structured gate-rejection
+packet, default final test skipping after selection reject, actionable
+gate-rejection retry, retry budget exhaustion, no-op retry separation, and the
+no-candidate package fields Gitmoot imports.
 
 ## Troubleshooting
 
@@ -352,13 +442,21 @@ start-next gate enforcement without real model calls or real GitHub mutation.
   output type is compatible with the current `vue-vite` renderer.
 - Missing feedback import: reply with the fenced YAML block from the review
   issue or raw YAML. Then rerun `gitmoot skillopt train continue --session
-  <id>`; it will attempt GitHub sync and report parse/import failures.
+  <id>`; it will attempt GitHub sync and report parse/import failures. With
+  `gitmoot daemon run --watch-skillopt-reviews`, valid watched issue comments
+  import automatically.
 - Invalid YAML: status output names wrong `run_id`, missing item feedback,
   invalid ranking, unknown option, invalid signal values, no parseable YAML, or
-  no comments.
+  no comments. The watcher posts the exact parse/import error once per distinct
+  error hash.
+- Stale review issue: the watcher posts one reminder and leaves the issue open.
+  Post the complete feedback YAML, then either keep the watcher running or use
+  the agent prompt/CLI command from the stale notice to resume manually.
 - No candidate created: inspect `no_candidate_reason` in `train status
   --verbose`; usually the optimizer kept the initial skill, accepted no update,
-  or produced content with the same hash as the base version.
+  produced content with the same hash as the base version, or lost the
+  selection gate. Gate rejection details show baseline and candidate scores,
+  attempted patch, failed dimensions, retry attempts, and next action.
 - Optimizer wrapper failed after artifacts: if `status_phase` is
   `recovery_available`, run `gitmoot skillopt train recover --session <id>
   --out-root <optimizer-output-root>`.
