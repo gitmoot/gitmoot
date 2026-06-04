@@ -1828,6 +1828,10 @@ func (f *fakeGitHub) ListPullRequestCommits(context.Context, github.Repository, 
 	return nil, errors.New("not implemented")
 }
 
+func (f *fakeGitHub) UpsertFile(context.Context, github.UpsertFileInput) (github.RepositoryFile, error) {
+	return github.RepositoryFile{}, errors.New("not implemented")
+}
+
 type fakeWorkflowMergeGate struct {
 	decision   workflow.MergeDecision
 	onEvaluate func(workflow.MergeRequest)

@@ -3249,6 +3249,13 @@ func TestSkillOptTrainContinuePublishesCandidateReviewPromotesAndStartsNext(t *t
 		"SkillOpt Candidate Review",
 		"### Artifacts",
 		"`candidate-diff`",
+		"### GitHub Files",
+		"Best skill",
+		"best_skill.md",
+		"Base skill",
+		"base_skill.md",
+		"Candidate diff",
+		"candidate.diff.md",
 		"### Scores And Gate",
 		"Selection score: `0.73`",
 		"Best selection hard: `0.77`",
@@ -3273,6 +3280,18 @@ func TestSkillOptTrainContinuePublishesCandidateReviewPromotesAndStartsNext(t *t
 	} {
 		if !strings.Contains(fakeGitHub.createdIssue.Body, want) {
 			t.Fatalf("candidate review body missing %q:\n%s", want, fakeGitHub.createdIssue.Body)
+		}
+	}
+	if len(fakeGitHub.upsertedFiles) != 3 {
+		t.Fatalf("published candidate review files = %+v, want 3", fakeGitHub.upsertedFiles)
+	}
+	for _, want := range []string{
+		"skillopt/runs/optimizer-train/optimizer-train-001/planner@v2/best_skill.md",
+		"skillopt/runs/optimizer-train/optimizer-train-001/planner@v2/base_skill.md",
+		"skillopt/runs/optimizer-train/optimizer-train-001/planner@v2/candidate.diff.md",
+	} {
+		if !skillOptFakeGitHubUpsertedPath(fakeGitHub.upsertedFiles, want) {
+			t.Fatalf("candidate review did not publish %s; files=%+v", want, fakeGitHub.upsertedFiles)
 		}
 	}
 
@@ -3674,6 +3693,55 @@ func TestSkillOptTrainContinueRequiresReasonForExternalCandidateRejection(t *tes
 	}
 }
 
+func TestSkillOptTrainContinuePublishesCandidateReviewWhenSkillFileUploadFails(t *testing.T) {
+	home, baseVersionID := seedSkillOptTrainFeedbackSynced(t)
+	runner := &skillOptTrainFakeOptimizerRunner{
+		candidate: cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with reviewable candidate guidance."),
+	}
+	previousRunner := skillOptTrainOptimizerRunner
+	skillOptTrainOptimizerRunner = runner
+	defer func() {
+		skillOptTrainOptimizerRunner = previousRunner
+	}()
+	fakeGitHub := &skillOptFakeGitHub{upsertFileErr: errors.New("contents write denied")}
+	oldClient := newSkillOptGitHubClient
+	newSkillOptGitHubClient = func() github.Client { return fakeGitHub }
+	defer func() {
+		newSkillOptGitHubClient = oldClient
+	}()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue optimizer exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue candidate review with file upload failure exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "current_phase: candidate_review_published") {
+		t.Fatalf("candidate review stdout = %s", stdout.String())
+	}
+	if !strings.Contains(fakeGitHub.createdIssue.Body, "File publish warning") ||
+		!strings.Contains(fakeGitHub.createdIssue.Body, "contents write denied") {
+		t.Fatalf("candidate review body missing file publish warning:\n%s", fakeGitHub.createdIssue.Body)
+	}
+	if len(fakeGitHub.upsertedFiles) != 0 {
+		t.Fatalf("file upload failure recorded uploaded files: %+v", fakeGitHub.upsertedFiles)
+	}
+}
+
 func TestSkillOptTrainCandidateReviewBodyMarksNoOpNotPromotable(t *testing.T) {
 	home, baseVersionID := seedSkillOptTrainFeedbackSynced(t)
 	store := openCLIJobStore(t, home)
@@ -3701,7 +3769,7 @@ func TestSkillOptTrainCandidateReviewBodyMarksNoOpNotPromotable(t *testing.T) {
 		ID:                    "optimizer-train-001",
 		CandidateVersionID:    version.ID,
 		BaseTemplateVersionID: baseVersionID,
-	}, home)
+	}, home, nil, nil)
 	if err != nil {
 		t.Fatalf("skillOptTrainCandidateReviewBody returned error: %v", err)
 	}
@@ -3747,7 +3815,7 @@ func TestSkillOptTrainCandidateReviewBodyMarksNoOpNotPromotable(t *testing.T) {
 		ID:                    "optimizer-train-001",
 		CandidateVersionID:    version.ID,
 		BaseTemplateVersionID: baseVersionID,
-	}, home)
+	}, home, nil, nil)
 	if err != nil {
 		t.Fatalf("skillOptTrainCandidateReviewBody without reason returned error: %v", err)
 	}
@@ -7973,11 +8041,13 @@ type skillOptFakeGitHub struct {
 
 	createdIssue       github.CreateIssueInput
 	postedComments     []skillOptPostedGitHubComment
+	upsertedFiles      []skillOptUpsertedGitHubFile
 	closedIssues       []skillOptClosedGitHubIssue
 	listedComments     []skillOptListedGitHubComments
 	comments           map[int64][]github.IssueComment
 	createIssueErr     error
 	postCommentErr     error
+	upsertFileErr      error
 	closeIssueErr      error
 	host               string
 	commentKinds       map[int64]string
@@ -7988,6 +8058,13 @@ type skillOptPostedGitHubComment struct {
 	Repo        github.Repository
 	IssueNumber int64
 	Body        string
+}
+
+type skillOptUpsertedGitHubFile struct {
+	Repo    github.Repository
+	Path    string
+	Content string
+	Message string
 }
 
 type skillOptClosedGitHubIssue struct {
@@ -8138,6 +8215,24 @@ func (f *skillOptFakeGitHub) PostIssueComment(_ context.Context, repo github.Rep
 	return github.IssueComment{ID: int64(len(f.postedComments)), Body: body, URL: url}, nil
 }
 
+func (f *skillOptFakeGitHub) UpsertFile(_ context.Context, input github.UpsertFileInput) (github.RepositoryFile, error) {
+	if f.upsertFileErr != nil {
+		return github.RepositoryFile{}, f.upsertFileErr
+	}
+	f.upsertedFiles = append(f.upsertedFiles, skillOptUpsertedGitHubFile{
+		Repo:    input.Repo,
+		Path:    strings.Trim(strings.TrimSpace(input.Path), "/"),
+		Content: string(input.Content),
+		Message: input.Message,
+	})
+	path := strings.Trim(strings.TrimSpace(input.Path), "/")
+	return github.RepositoryFile{
+		Path: path,
+		URL:  f.baseURL() + "/" + input.Repo.FullName() + "/blob/main/" + path,
+		SHA:  "fake-sha",
+	}, nil
+}
+
 func (f *skillOptFakeGitHub) ListIssueComments(_ context.Context, repo github.Repository, issueNumber int64) ([]github.IssueComment, error) {
 	f.listedComments = append(f.listedComments, skillOptListedGitHubComments{Repo: repo, IssueNumber: issueNumber})
 	return append([]github.IssueComment(nil), f.comments[issueNumber]...), nil
@@ -8148,6 +8243,15 @@ func (f *skillOptFakeGitHub) baseURL() string {
 		return "https://github.com"
 	}
 	return strings.TrimRight(strings.TrimSpace(f.host), "/")
+}
+
+func skillOptFakeGitHubUpsertedPath(files []skillOptUpsertedGitHubFile, path string) bool {
+	for _, file := range files {
+		if file.Path == path {
+			return true
+		}
+	}
+	return false
 }
 
 func seedSkillOptTrainFeedbackSynced(t *testing.T) (string, string) {

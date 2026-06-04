@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +33,7 @@ type Client interface {
 	CreateCommitStatus(ctx context.Context, input CommitStatusInput) (CommitStatus, error)
 	ListPullRequestFiles(ctx context.Context, repo Repository, number int64) ([]PullRequestFile, error)
 	ListPullRequestCommits(ctx context.Context, repo Repository, number int64) ([]PullRequestCommit, error)
+	UpsertFile(ctx context.Context, input UpsertFileInput) (RepositoryFile, error)
 }
 
 type Repository struct {
@@ -219,6 +221,20 @@ type PullRequestFile struct {
 
 type PullRequestCommit struct {
 	SHA string `json:"sha"`
+}
+
+type UpsertFileInput struct {
+	Repo    Repository
+	Path    string
+	Content []byte
+	Message string
+	Branch  string
+}
+
+type RepositoryFile struct {
+	Path string
+	URL  string
+	SHA  string
 }
 
 type GhClient struct {
@@ -489,6 +505,64 @@ func (c *GhClient) ListPullRequestCommits(ctx context.Context, repo Repository, 
 	return apiPaginatedJSON[PullRequestCommit](ctx, c, endpoint(repo, "pulls", number, "commits"))
 }
 
+func (c *GhClient) UpsertFile(ctx context.Context, input UpsertFileInput) (RepositoryFile, error) {
+	path := strings.Trim(strings.TrimSpace(input.Path), "/")
+	if input.Repo.FullName() == "" {
+		return RepositoryFile{}, errors.New("repository is required")
+	}
+	if path == "" {
+		return RepositoryFile{}, errors.New("file path is required")
+	}
+	message := strings.TrimSpace(input.Message)
+	if message == "" {
+		message = "Update " + path
+	}
+	sha := ""
+	var existing struct {
+		SHA string `json:"sha"`
+	}
+	getArgs := []string{"api", "-X", "GET", endpoint(input.Repo, "contents", path)}
+	if branch := strings.TrimSpace(input.Branch); branch != "" {
+		getArgs = append(getArgs, "-f", "ref="+branch)
+	}
+	result, err := c.run(ctx, false, getArgs...)
+	if err == nil {
+		if decodeErr := json.Unmarshal([]byte(result.Stdout), &existing); decodeErr != nil {
+			return RepositoryFile{}, fmt.Errorf("decode github contents response: %w", decodeErr)
+		}
+		sha = strings.TrimSpace(existing.SHA)
+	} else if !isNotFound(result) {
+		return RepositoryFile{}, err
+	}
+	args := []string{
+		"-X", "PUT",
+		endpoint(input.Repo, "contents", path),
+		"-f", "message=" + message,
+		"-f", "content=" + base64.StdEncoding.EncodeToString(input.Content),
+	}
+	if sha != "" {
+		args = append(args, "-f", "sha="+sha)
+	}
+	if branch := strings.TrimSpace(input.Branch); branch != "" {
+		args = append(args, "-f", "branch="+branch)
+	}
+	var response struct {
+		Content struct {
+			Path string `json:"path"`
+			URL  string `json:"html_url"`
+			SHA  string `json:"sha"`
+		} `json:"content"`
+	}
+	if err := c.apiJSON(ctx, true, &response, args...); err != nil {
+		return RepositoryFile{}, err
+	}
+	return RepositoryFile{
+		Path: firstNonEmpty(response.Content.Path, path),
+		URL:  response.Content.URL,
+		SHA:  response.Content.SHA,
+	}, nil
+}
+
 func (c *GhClient) getPullRequest(ctx context.Context, repo Repository, number int64) (PullRequest, error) {
 	var pr PullRequest
 	err := c.apiJSON(ctx, false, &pr, endpoint(repo, "pulls", number))
@@ -714,4 +788,8 @@ func (NoopClient) ListPullRequestFiles(context.Context, Repository, int64) ([]Pu
 
 func (NoopClient) ListPullRequestCommits(context.Context, Repository, int64) ([]PullRequestCommit, error) {
 	return nil, errors.ErrUnsupported
+}
+
+func (NoopClient) UpsertFile(context.Context, UpsertFileInput) (RepositoryFile, error) {
+	return RepositoryFile{}, errors.ErrUnsupported
 }
