@@ -5135,6 +5135,62 @@ func TestSkillOptTrainContinueRejectsCandidateForDifferentSessionTemplate(t *tes
 		t.Fatalf("deterministic import retry reran optimizer: %+v", runner.calls)
 	}
 
+	staleOutRoot := argValue(runner.calls[0].args, "--out-root")
+	if staleOutRoot == "" {
+		t.Fatalf("first optimizer call did not include --out-root: %+v", runner.calls[0].args)
+	}
+	staleFiles := []string{
+		filepath.Join(staleOutRoot, "candidate.json"),
+		filepath.Join(staleOutRoot, "history.json"),
+		filepath.Join(staleOutRoot, "summary.json"),
+		filepath.Join(staleOutRoot, "runtime_state.json"),
+		filepath.Join(staleOutRoot, "best_skill.md"),
+		filepath.Join(staleOutRoot, "steps", "step_0001", "step_record.json"),
+		filepath.Join(staleOutRoot, "artifacts", "stale.diff.md"),
+	}
+	for _, path := range staleFiles {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("create stale optimizer artifact dir returned error: %v", err)
+		}
+		if err := os.WriteFile(path, []byte("stale optimizer artifact\n"), 0o644); err != nil {
+			t.Fatalf("write stale optimizer artifact returned error: %v", err)
+		}
+	}
+	unrelatedFile := filepath.Join(staleOutRoot, "unrelated", "keep.txt")
+	if err := os.MkdirAll(filepath.Dir(unrelatedFile), 0o755); err != nil {
+		t.Fatalf("create unrelated out-root file dir returned error: %v", err)
+	}
+	if err := os.WriteFile(unrelatedFile, []byte("do not remove\n"), 0o644); err != nil {
+		t.Fatalf("write unrelated out-root file returned error: %v", err)
+	}
+	trainingPackagePath := filepath.Join(staleOutRoot, "training.json")
+	if _, err := os.Stat(trainingPackagePath); err != nil {
+		t.Fatalf("expected persisted training package before rerun: %v", err)
+	}
+	runner.beforeRun = func(dir string, args []string) error {
+		if len(runner.calls) != 2 {
+			return nil
+		}
+		if dir != staleOutRoot || argValue(args, "--out-root") != staleOutRoot {
+			return fmt.Errorf("rerun did not reuse optimizer out-root; dir=%s args=%v", dir, args)
+		}
+		if _, err := os.Stat(trainingPackagePath); err != nil {
+			return fmt.Errorf("rerun cleanup removed training package: %w", err)
+		}
+		if _, err := os.Stat(unrelatedFile); err != nil {
+			return fmt.Errorf("rerun cleanup removed unrelated out-root file: %w", err)
+		}
+		for _, path := range staleFiles {
+			if path == trainingPackagePath {
+				continue
+			}
+			if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("stale optimizer artifact still exists before rerun: %s", path)
+			}
+		}
+		return nil
+	}
+
 	stdout.Reset()
 	stderr.Reset()
 	code = Run([]string{
@@ -8206,6 +8262,7 @@ type skillOptTrainFakeOptimizerRunner struct {
 	failAfterCandidate       bool
 	failAfterCandidateStderr string
 	lookPathValue            string
+	beforeRun                func(dir string, args []string) error
 	calls                    []skillOptTrainFakeOptimizerCall
 }
 
@@ -8218,6 +8275,12 @@ type skillOptTrainFakeOptimizerCall struct {
 func (r *skillOptTrainFakeOptimizerRunner) Run(_ context.Context, dir string, command string, args ...string) (subprocess.Result, error) {
 	r.calls = append(r.calls, skillOptTrainFakeOptimizerCall{dir: dir, command: command, args: append([]string{}, args...)})
 	result := subprocess.Result{Command: command, Args: args}
+	if r.beforeRun != nil {
+		if err := r.beforeRun(dir, args); err != nil {
+			result.Stderr = err.Error()
+			return result, err
+		}
+	}
 	if r.fail && !r.failAfterCandidate {
 		result.Stderr = "optimizer stderr"
 		return result, errors.New("exit status 2")

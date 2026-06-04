@@ -2546,6 +2546,14 @@ func continueSkillOptTrainOptimizer(ctx context.Context, paths config.Paths, sto
 		}
 		result.Command = command
 		result.Args = args
+		if request.RerunOptimizer {
+			if err := cleanSkillOptTrainOptimizerRerunArtifacts(optimizerPaths); err != nil {
+				if metaErr := recordSkillOptTrainOptimizerFailure(ctx, store, session, iteration, request, optimizerPaths, command, args, subprocess.Result{}, err); metaErr != nil {
+					return result, fmt.Errorf("%w; failed to record optimizer failure: %v", err, metaErr)
+				}
+				return result, err
+			}
+		}
 		runResult, err := runSkillOptTrainOptimizer(ctx, optimizerPaths, request, command, args)
 		result.RecoveryAvailable = skillOptTrainOptimizerRecoveryAvailable(optimizerPaths)
 		if err != nil {
@@ -2610,6 +2618,71 @@ func continueSkillOptTrainOptimizer(ctx context.Context, paths config.Paths, sto
 		return result, nil
 	}
 	return skillOptTrainOptimizerResult{}, fmt.Errorf("train iteration %s is at %s; expected %s, %s, or %s", iteration.ID, iteration.State, skillopt.TrainStateFeedbackSynced, skillopt.TrainStateTrainingPackageCreated, skillopt.TrainStateOptimizerCompleted)
+}
+
+func cleanSkillOptTrainOptimizerRerunArtifacts(paths skillOptTrainOptimizerPaths) error {
+	outRoot := strings.TrimSpace(paths.OutRoot)
+	if outRoot == "" {
+		return errors.New("optimizer out-root is required for rerun cleanup")
+	}
+	absOutRoot, err := filepath.Abs(outRoot)
+	if err != nil {
+		return fmt.Errorf("resolve optimizer out-root for rerun cleanup: %w", err)
+	}
+	if err := os.MkdirAll(absOutRoot, 0o755); err != nil {
+		return fmt.Errorf("create optimizer out-root for rerun cleanup: %w", err)
+	}
+	trainingPackagePath := strings.TrimSpace(paths.TrainingPackagePath)
+	preserveTrainingPackage := ""
+	if trainingPackagePath != "" {
+		if absTrainingPackage, err := filepath.Abs(trainingPackagePath); err == nil {
+			preserveTrainingPackage = filepath.Clean(absTrainingPackage)
+		}
+	}
+	for _, name := range []string{
+		"candidate.json",
+		"summary.json",
+		"runtime_state.json",
+		"history.json",
+		"best_skill.md",
+		"initial_skill.md",
+		"config.json",
+		"lr_history.jsonl",
+		"token_summary.json",
+		"optimizer",
+		"steps",
+		"skills",
+		"artifacts",
+		"selection_eval_baseline",
+		"test_eval_baseline",
+		"test_eval",
+	} {
+		path := filepath.Join(absOutRoot, name)
+		if preserveTrainingPackage != "" && filepath.Clean(path) == preserveTrainingPackage {
+			continue
+		}
+		if err := os.RemoveAll(path); err != nil {
+			return fmt.Errorf("remove stale optimizer artifact %s: %w", path, err)
+		}
+	}
+	for _, path := range []string{paths.CandidatePackagePath, paths.ArtifactDir} {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			return fmt.Errorf("resolve optimizer artifact path for rerun cleanup: %w", err)
+		}
+		cleanPath := filepath.Clean(absPath)
+		if cleanPath == preserveTrainingPackage || strings.HasPrefix(cleanPath, filepath.Clean(absOutRoot)+string(os.PathSeparator)) {
+			continue
+		}
+		if err := os.RemoveAll(cleanPath); err != nil {
+			return fmt.Errorf("remove stale optimizer artifact %s: %w", cleanPath, err)
+		}
+	}
+	return nil
 }
 
 func skillOptTrainOptimizerLockState(request skillOptTrainOptimizerRequest) string {
