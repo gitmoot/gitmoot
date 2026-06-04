@@ -152,6 +152,10 @@ func TestExportTrainingPackageIncludesPreferredGateMetadata(t *testing.T) {
 func TestEvaluatorProfileAndFailurePacketContractsRoundTrip(t *testing.T) {
 	hard := 0.0
 	soft := 0.12
+	baselineSoft := 0.78
+	baselineGate := 0.89
+	candidateSoft := 0.68
+	candidateGate := 0.84
 	training := TrainingPackage{
 		Kind:            TrainingPackageKind,
 		ContractVersion: ContractVersion,
@@ -237,9 +241,53 @@ func TestEvaluatorProfileAndFailurePacketContractsRoundTrip(t *testing.T) {
 						{Stage: "artifact_contract", Status: "failed", DurationMS: 7},
 					},
 				},
+				GateRejection: &GateRejectionPacket{
+					RejectionType: "candidate_score_regression",
+					Retryable:     true,
+					Baseline: GateRejectionScores{
+						Hard:      &hard,
+						Soft:      &baselineSoft,
+						GateScore: &baselineGate,
+					},
+					Candidate: GateRejectionScores{
+						Hard:      &hard,
+						Soft:      &candidateSoft,
+						GateScore: &candidateGate,
+					},
+					PrimaryReason:    "candidate_quality_regressed",
+					HumanReason:      "The patch did not improve the requested design qualities.",
+					OptimizerHint:    "Add guidance for branding, product visuals, animation, and mobile layout.",
+					FailedDimensions: []string{"human_feedback_alignment", "visual_quality"},
+					Evidence:         []string{"Candidate soft score dropped from 0.78 to 0.68."},
+					AttemptedPatch:   "Hard Artifact Delivery",
+					RetryAttempts:    "0/1",
+					NextAction:       "Retry once with the gate rejection hint.",
+				},
 				StageStatus: []EvaluatorStageStatus{
 					{Stage: "artifact_contract", Status: "failed"},
 				},
+			},
+			GateRejection: &GateRejectionPacket{
+				RejectionType: "candidate_score_regression",
+				Retryable:     true,
+				Baseline: GateRejectionScores{
+					Hard:      &hard,
+					Soft:      &baselineSoft,
+					GateScore: &baselineGate,
+				},
+				Candidate: GateRejectionScores{
+					Hard:      &hard,
+					Soft:      &candidateSoft,
+					GateScore: &candidateGate,
+				},
+				PrimaryReason:    "candidate_quality_regressed",
+				HumanReason:      "Candidate lost selection against baseline.",
+				OptimizerHint:    "Do not repeat the previous artifact-delivery-only patch.",
+				FailedDimensions: []string{"human_feedback_alignment", "visual_quality"},
+				Evidence:         []string{"candidate gate score 0.84 <= baseline gate score 0.89"},
+				AttemptedPatch:   "Hard Artifact Delivery",
+				RetryAttempts:    "0/1",
+				NextAction:       "Retry once or collect more feedback.",
 			},
 		},
 	}
@@ -275,6 +323,25 @@ func TestEvaluatorProfileAndFailurePacketContractsRoundTrip(t *testing.T) {
 		decodedCandidate.Summary.EvaluatorScore.QualityStatus != "not_run" ||
 		!strings.Contains(string(decodedCandidate.Summary.EvaluatorScore.HumanFeedbackAlignment), "stronger product visuals") {
 		t.Fatalf("decoded evaluator failure = %+v", decodedCandidate.Summary.EvaluatorScore)
+	}
+	gateRejection := decodedCandidate.Summary.GateRejection
+	if gateRejection == nil ||
+		gateRejection.RejectionType != "candidate_score_regression" ||
+		!gateRejection.Retryable ||
+		gateRejection.Baseline.GateScore == nil ||
+		*gateRejection.Baseline.GateScore != baselineGate ||
+		gateRejection.Candidate.Soft == nil ||
+		*gateRejection.Candidate.Soft != candidateSoft ||
+		gateRejection.FailedDimensions[0] != "human_feedback_alignment" ||
+		!strings.Contains(gateRejection.OptimizerHint, "artifact-delivery-only") {
+		t.Fatalf("decoded gate rejection = %+v", gateRejection)
+	}
+	scoreGateRejection := decodedCandidate.Summary.EvaluatorScore.GateRejection
+	if scoreGateRejection == nil ||
+		scoreGateRejection.Baseline.GateScore == nil ||
+		*scoreGateRejection.Baseline.GateScore != baselineGate ||
+		scoreGateRejection.RetryAttempts != "0/1" {
+		t.Fatalf("decoded evaluator score gate rejection = %+v", scoreGateRejection)
 	}
 }
 

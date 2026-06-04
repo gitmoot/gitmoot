@@ -102,6 +102,27 @@ type EvaluatorFailurePacket struct {
 	StageStatus   []EvaluatorStageStatus `json:"stage_status,omitempty"`
 }
 
+type GateRejectionScores struct {
+	Hard      *float64 `json:"hard,omitempty"`
+	Soft      *float64 `json:"soft,omitempty"`
+	GateScore *float64 `json:"gate_score,omitempty"`
+}
+
+type GateRejectionPacket struct {
+	RejectionType    string              `json:"rejection_type,omitempty"`
+	Retryable        bool                `json:"retryable,omitempty"`
+	Baseline         GateRejectionScores `json:"baseline,omitempty"`
+	Candidate        GateRejectionScores `json:"candidate,omitempty"`
+	PrimaryReason    string              `json:"primary_reason,omitempty"`
+	HumanReason      string              `json:"human_reason,omitempty"`
+	OptimizerHint    string              `json:"optimizer_hint,omitempty"`
+	FailedDimensions []string            `json:"failed_dimensions,omitempty"`
+	Evidence         []string            `json:"evidence,omitempty"`
+	AttemptedPatch   string              `json:"attempted_patch,omitempty"`
+	RetryAttempts    string              `json:"retry_attempts,omitempty"`
+	NextAction       string              `json:"next_action,omitempty"`
+}
+
 type EvaluatorScore struct {
 	ProfileID              string                  `json:"profile_id,omitempty"`
 	TaskKind               string                  `json:"task_kind,omitempty"`
@@ -113,6 +134,7 @@ type EvaluatorScore struct {
 	DimensionScores        map[string]float64      `json:"dimension_scores,omitempty"`
 	FailReason             string                  `json:"fail_reason,omitempty"`
 	Failure                *EvaluatorFailurePacket `json:"failure,omitempty"`
+	GateRejection          *GateRejectionPacket    `json:"gate_rejection,omitempty"`
 	StageStatus            []EvaluatorStageStatus  `json:"stage_status,omitempty"`
 	Metadata               json.RawMessage         `json:"metadata,omitempty"`
 }
@@ -216,6 +238,7 @@ type CandidateSummary struct {
 	Metadata          json.RawMessage         `json:"metadata,omitempty"`
 	EvaluatorScore    *EvaluatorScore         `json:"evaluator_score,omitempty"`
 	Failure           *EvaluatorFailurePacket `json:"failure,omitempty"`
+	GateRejection     *GateRejectionPacket    `json:"gate_rejection,omitempty"`
 }
 
 type CandidateArtifactRef struct {
