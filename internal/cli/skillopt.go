@@ -1322,6 +1322,13 @@ type skillOptTrainOptimizerPaths struct {
 type skillOptTrainCandidateReviewResult struct {
 	URL                string
 	CandidateVersionID string
+	PublishedFiles     []skillOptTrainCandidateReviewFile
+}
+
+type skillOptTrainCandidateReviewFile struct {
+	Label string
+	Path  string
+	URL   string
 }
 
 type skillOptTrainCandidateDecisionResult struct {
@@ -1358,15 +1365,20 @@ func publishSkillOptTrainCandidateReview(ctx context.Context, paths config.Paths
 	if err != nil {
 		return skillOptTrainCandidateReviewResult{}, err
 	}
-	body, err := skillOptTrainCandidateReviewBody(ctx, store, session, iteration, commandHome)
-	if err != nil {
-		return skillOptTrainCandidateReviewResult{}, err
-	}
-	client := newSkillOptGitHubClient()
 	if iteration.PullRequestNumber > 0 && iteration.IssueNumber == 0 {
 		iteration.PullRequestRepo = repo.FullName()
 	} else {
 		iteration.IssueRepo = repo.FullName()
+	}
+	client := newSkillOptGitHubClient()
+	publishedFiles, filePublishErr := publishSkillOptTrainCandidateReviewFiles(ctx, paths, store, client, repo, session, iteration)
+	filePublishWarnings := []string{}
+	if filePublishErr != nil {
+		filePublishWarnings = append(filePublishWarnings, filePublishErr.Error())
+	}
+	body, err := skillOptTrainCandidateReviewBody(ctx, store, session, iteration, commandHome, publishedFiles, filePublishWarnings)
+	if err != nil {
+		return skillOptTrainCandidateReviewResult{}, err
 	}
 	title := fmt.Sprintf("SkillOpt candidate review: %s", session.ID)
 	publishingMetadata := map[string]any{
@@ -1379,6 +1391,8 @@ func publishSkillOptTrainCandidateReview(ctx context.Context, paths config.Paths
 		"pull_request_number": iteration.PullRequestNumber,
 		"pull_request_url":    iteration.PullRequestURL,
 		"issue_title":         title,
+		"published_files":     skillOptCandidateReviewFilesMetadata(publishedFiles),
+		"file_publish_errors": filePublishWarnings,
 		"started_at":          time.Now().UTC().Format(time.RFC3339Nano),
 		"source":              "gitmoot skillopt train continue",
 	}
@@ -1462,7 +1476,7 @@ func publishSkillOptTrainCandidateReview(ctx context.Context, paths config.Paths
 		return skillOptTrainCandidateReviewResult{}, err
 	}
 	_ = removeSkillOptCandidateReviewRecovery(paths, session, iteration)
-	return skillOptTrainCandidateReviewResult{URL: url, CandidateVersionID: candidateID}, nil
+	return skillOptTrainCandidateReviewResult{URL: url, CandidateVersionID: candidateID, PublishedFiles: publishedFiles}, nil
 }
 
 func recoverSkillOptCandidateReviewPublication(ctx context.Context, paths config.Paths, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, candidateID string) (skillOptTrainCandidateReviewResult, bool, error) {
@@ -1883,7 +1897,148 @@ func requestedSkillOptTrainCandidateID(request skillOptTrainContinueRequest) str
 	return strings.TrimSpace(request.RejectCandidate)
 }
 
-func skillOptTrainCandidateReviewBody(ctx context.Context, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, commandHome string) (string, error) {
+func publishSkillOptTrainCandidateReviewFiles(ctx context.Context, paths config.Paths, store *db.Store, client github.Client, repo github.Repository, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration) ([]skillOptTrainCandidateReviewFile, error) {
+	candidateID := strings.TrimSpace(iteration.CandidateVersionID)
+	if candidateID == "" {
+		return nil, nil
+	}
+	version, err := store.GetAgentTemplateVersionByID(ctx, candidateID)
+	if err != nil {
+		return nil, fmt.Errorf("load candidate version %s for review files: %w", candidateID, err)
+	}
+	review, err := store.GetAgentTemplateCandidateReview(ctx, candidateID)
+	if err != nil {
+		return nil, fmt.Errorf("load candidate review %s for review files: %w", candidateID, err)
+	}
+	basePath := skillOptCandidateReviewFileBasePath(session.ID, iteration.ID, candidateID)
+	if basePath == "" {
+		return nil, errors.New("candidate review file path is required")
+	}
+	files := []struct {
+		label   string
+		name    string
+		content []byte
+	}{
+		{
+			label:   "Best skill",
+			name:    "best_skill.md",
+			content: []byte(strings.TrimRight(version.Content, "\n") + "\n"),
+		},
+	}
+	if baseID := firstNonEmpty(review.BaseVersionID, iteration.BaseTemplateVersionID); baseID != "" {
+		if baseVersion, err := store.GetAgentTemplateVersionByID(ctx, baseID); err == nil {
+			files = append(files, struct {
+				label   string
+				name    string
+				content []byte
+			}{
+				label:   "Base skill",
+				name:    "base_skill.md",
+				content: []byte(strings.TrimRight(baseVersion.Content, "\n") + "\n"),
+			})
+		}
+	}
+	if diffContent, err := skillOptCandidateReviewDiffContent(ctx, paths, store, review); err == nil && len(diffContent) > 0 {
+		files = append(files, struct {
+			label   string
+			name    string
+			content []byte
+		}{
+			label:   "Candidate diff",
+			name:    "candidate.diff.md",
+			content: diffContent,
+		})
+	} else if err != nil {
+		return nil, err
+	}
+	published := make([]skillOptTrainCandidateReviewFile, 0, len(files))
+	for _, file := range files {
+		repoPath := basePath + "/" + file.name
+		result, err := client.UpsertFile(ctx, github.UpsertFileInput{
+			Repo:    repo,
+			Path:    repoPath,
+			Content: file.content,
+			Message: fmt.Sprintf("Publish SkillOpt candidate review file %s", candidateID),
+		})
+		if err != nil {
+			return published, fmt.Errorf("publish candidate review file %s: %w", repoPath, err)
+		}
+		published = append(published, skillOptTrainCandidateReviewFile{
+			Label: file.label,
+			Path:  firstNonEmpty(result.Path, repoPath),
+			URL:   result.URL,
+		})
+	}
+	return published, nil
+}
+
+func skillOptCandidateReviewDiffContent(ctx context.Context, paths config.Paths, store *db.Store, review db.AgentTemplateCandidateReview) ([]byte, error) {
+	diffID := strings.TrimSpace(review.DiffArtifactID)
+	if diffID == "" {
+		return nil, nil
+	}
+	record, err := store.GetEvalArtifact(ctx, diffID)
+	if err != nil {
+		return nil, fmt.Errorf("load candidate diff artifact %s: %w", diffID, err)
+	}
+	if strings.TrimSpace(record.Hash) == "" {
+		return nil, nil
+	}
+	content, err := artifact.NewStore(paths.ArtifactBlobs).Read(record.Hash)
+	if err != nil {
+		return nil, fmt.Errorf("read candidate diff artifact %s: %w", diffID, err)
+	}
+	return content, nil
+}
+
+func skillOptCandidateReviewFileBasePath(sessionID string, iterationID string, candidateID string) string {
+	parts := []string{
+		"skillopt",
+		"runs",
+		skillOptCandidateReviewFileToken(sessionID),
+		skillOptCandidateReviewFileToken(iterationID),
+		skillOptCandidateReviewFileToken(candidateID),
+	}
+	for _, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			return ""
+		}
+	}
+	return strings.Join(parts, "/")
+}
+
+func skillOptCandidateReviewFileToken(value string) string {
+	value = strings.TrimSpace(value)
+	var builder strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			builder.WriteRune(r)
+		case r == '.', r == '-', r == '_', r == '@':
+			builder.WriteRune(r)
+		default:
+			builder.WriteByte('-')
+		}
+	}
+	return strings.Trim(builder.String(), "-")
+}
+
+func skillOptCandidateReviewFilesMetadata(files []skillOptTrainCandidateReviewFile) []map[string]string {
+	if len(files) == 0 {
+		return nil
+	}
+	metadata := make([]map[string]string, 0, len(files))
+	for _, file := range files {
+		metadata = append(metadata, map[string]string{
+			"label": file.Label,
+			"path":  file.Path,
+			"url":   file.URL,
+		})
+	}
+	return metadata
+}
+
+func skillOptTrainCandidateReviewBody(ctx context.Context, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, commandHome string, publishedFiles []skillOptTrainCandidateReviewFile, filePublishWarnings []string) (string, error) {
 	candidateID := strings.TrimSpace(iteration.CandidateVersionID)
 	version, err := store.GetAgentTemplateVersionByID(ctx, candidateID)
 	if err != nil {
@@ -1919,6 +2074,28 @@ func skillOptTrainCandidateReviewBody(ctx context.Context, store *db.Store, sess
 		builder.WriteString("\n### Artifacts\n")
 		for _, artifactID := range artifactIDs {
 			fmt.Fprintf(&builder, "- `%s`\n", artifactID)
+		}
+	}
+	if len(publishedFiles) > 0 {
+		builder.WriteString("\n### GitHub Files\n")
+		for _, file := range publishedFiles {
+			label := strings.TrimSpace(file.Label)
+			if label == "" {
+				label = "File"
+			}
+			if strings.TrimSpace(file.URL) != "" {
+				fmt.Fprintf(&builder, "- %s: [%s](%s)\n", label, file.Path, file.URL)
+			} else {
+				fmt.Fprintf(&builder, "- %s: `%s`\n", label, file.Path)
+			}
+		}
+	}
+	if len(filePublishWarnings) > 0 {
+		if len(publishedFiles) == 0 {
+			builder.WriteString("\n### GitHub Files\n")
+		}
+		for _, warning := range filePublishWarnings {
+			fmt.Fprintf(&builder, "- File publish warning: `%s`\n", truncateForMetadata(warning))
 		}
 	}
 	if strings.TrimSpace(review.EvalReportJSON) != "" {
