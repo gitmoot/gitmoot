@@ -103,15 +103,18 @@ type EvaluatorFailurePacket struct {
 }
 
 type EvaluatorScore struct {
-	ProfileID       string                  `json:"profile_id,omitempty"`
-	TaskKind        string                  `json:"task_kind,omitempty"`
-	Hard            *float64                `json:"hard,omitempty"`
-	Soft            *float64                `json:"soft,omitempty"`
-	DimensionScores map[string]float64      `json:"dimension_scores,omitempty"`
-	FailReason      string                  `json:"fail_reason,omitempty"`
-	Failure         *EvaluatorFailurePacket `json:"failure,omitempty"`
-	StageStatus     []EvaluatorStageStatus  `json:"stage_status,omitempty"`
-	Metadata        json.RawMessage         `json:"metadata,omitempty"`
+	ProfileID              string                  `json:"profile_id,omitempty"`
+	TaskKind               string                  `json:"task_kind,omitempty"`
+	ContractStatus         string                  `json:"contract_status,omitempty"`
+	QualityStatus          string                  `json:"quality_status,omitempty"`
+	HumanFeedbackAlignment json.RawMessage         `json:"human_feedback_alignment,omitempty"`
+	Hard                   *float64                `json:"hard,omitempty"`
+	Soft                   *float64                `json:"soft,omitempty"`
+	DimensionScores        map[string]float64      `json:"dimension_scores,omitempty"`
+	FailReason             string                  `json:"fail_reason,omitempty"`
+	Failure                *EvaluatorFailurePacket `json:"failure,omitempty"`
+	StageStatus            []EvaluatorStageStatus  `json:"stage_status,omitempty"`
+	Metadata               json.RawMessage         `json:"metadata,omitempty"`
 }
 
 type EvalRun struct {

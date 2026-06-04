@@ -209,10 +209,13 @@ func TestEvaluatorProfileAndFailurePacketContractsRoundTrip(t *testing.T) {
 		TemplateID:      "planner",
 		Summary: CandidateSummary{
 			EvaluatorScore: &EvaluatorScore{
-				ProfileID: "vue_landing_page_v1",
-				TaskKind:  "vue_landing_page",
-				Hard:      &hard,
-				Soft:      &soft,
+				ProfileID:              "vue_landing_page_v1",
+				TaskKind:               "vue_landing_page",
+				ContractStatus:         "failed",
+				QualityStatus:          "not_run",
+				HumanFeedbackAlignment: json.RawMessage(`{"status":"feedback_available","required_improvements":["stronger product visuals"]}`),
+				Hard:                   &hard,
+				Soft:                   &soft,
 				DimensionScores: map[string]float64{
 					"artifact_contract": 0,
 				},
@@ -267,7 +270,10 @@ func TestEvaluatorProfileAndFailurePacketContractsRoundTrip(t *testing.T) {
 	if failure == nil ||
 		failure.PrimaryReason != "missing_required_artifact" ||
 		failure.FailedChecks[0].Check != "artifact_contract.required_files" ||
-		*decodedCandidate.Summary.EvaluatorScore.Soft != soft {
+		*decodedCandidate.Summary.EvaluatorScore.Soft != soft ||
+		decodedCandidate.Summary.EvaluatorScore.ContractStatus != "failed" ||
+		decodedCandidate.Summary.EvaluatorScore.QualityStatus != "not_run" ||
+		!strings.Contains(string(decodedCandidate.Summary.EvaluatorScore.HumanFeedbackAlignment), "stronger product visuals") {
 		t.Fatalf("decoded evaluator failure = %+v", decodedCandidate.Summary.EvaluatorScore)
 	}
 }
