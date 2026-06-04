@@ -373,28 +373,29 @@ func printSkillOptTrainStartPlan(stdout io.Writer, plan skillOptTrainStartPlan) 
 }
 
 type skillOptTrainStatusSnapshot struct {
-	SessionID         string                         `json:"session_id"`
-	IterationID       string                         `json:"iteration_id,omitempty"`
-	TemplateID        string                         `json:"template_id,omitempty"`
-	TemplateVersion   string                         `json:"template_version,omitempty"`
-	TargetRepo        string                         `json:"target_repo,omitempty"`
-	WorkspaceRepo     string                         `json:"workspace_repo,omitempty"`
-	TaskKind          string                         `json:"task_kind,omitempty"`
-	StatusPhase       string                         `json:"status_phase"`
-	CurrentPhase      string                         `json:"current_phase"`
-	CurrentStep       string                         `json:"current_step"`
-	CompletedSteps    []string                       `json:"completed_steps"`
-	BlockedStep       string                         `json:"blocked_step,omitempty"`
-	NextAction        string                         `json:"next_action"`
-	IssueURL          string                         `json:"issue_url,omitempty"`
-	PullRequestURL    string                         `json:"pull_request_url,omitempty"`
-	CandidateVersion  string                         `json:"candidate_version,omitempty"`
-	RecoveryAvailable bool                           `json:"recovery_available"`
-	NoCandidateReason string                         `json:"no_candidate_reason,omitempty"`
-	PreviewPolicy     skillOptTrainPreviewPolicyJSON `json:"preview_policy"`
-	Counts            skillOptTrainStatusCountsJSON  `json:"counts"`
-	Progress          skillOptTrainStatusProgress    `json:"progress"`
-	Verbose           *skillOptTrainStatusVerbose    `json:"verbose,omitempty"`
+	SessionID          string                         `json:"session_id"`
+	IterationID        string                         `json:"iteration_id,omitempty"`
+	TemplateID         string                         `json:"template_id,omitempty"`
+	TemplateVersion    string                         `json:"template_version,omitempty"`
+	TargetRepo         string                         `json:"target_repo,omitempty"`
+	WorkspaceRepo      string                         `json:"workspace_repo,omitempty"`
+	TaskKind           string                         `json:"task_kind,omitempty"`
+	StatusPhase        string                         `json:"status_phase"`
+	CurrentPhase       string                         `json:"current_phase"`
+	CurrentStep        string                         `json:"current_step"`
+	CompletedSteps     []string                       `json:"completed_steps"`
+	BlockedStep        string                         `json:"blocked_step,omitempty"`
+	NextAction         string                         `json:"next_action"`
+	IssueURL           string                         `json:"issue_url,omitempty"`
+	PullRequestURL     string                         `json:"pull_request_url,omitempty"`
+	CandidateVersion   string                         `json:"candidate_version,omitempty"`
+	RecoveryAvailable  bool                           `json:"recovery_available"`
+	NoCandidateReason  string                         `json:"no_candidate_reason,omitempty"`
+	NoCandidateDetails map[string]any                 `json:"no_candidate_details,omitempty"`
+	PreviewPolicy      skillOptTrainPreviewPolicyJSON `json:"preview_policy"`
+	Counts             skillOptTrainStatusCountsJSON  `json:"counts"`
+	Progress           skillOptTrainStatusProgress    `json:"progress"`
+	Verbose            *skillOptTrainStatusVerbose    `json:"verbose,omitempty"`
 }
 
 type skillOptTrainPreviewPolicyJSON struct {
@@ -446,9 +447,10 @@ type skillOptTrainStatusReviewIssue struct {
 }
 
 type skillOptTrainStatusCandidate struct {
-	VersionID         string `json:"version_id,omitempty"`
-	PullRequestURL    string `json:"pull_request_url,omitempty"`
-	NoCandidateReason string `json:"no_candidate_reason,omitempty"`
+	VersionID          string         `json:"version_id,omitempty"`
+	PullRequestURL     string         `json:"pull_request_url,omitempty"`
+	NoCandidateReason  string         `json:"no_candidate_reason,omitempty"`
+	NoCandidateDetails map[string]any `json:"no_candidate_details,omitempty"`
 }
 
 type skillOptTrainStatusJobs struct {
@@ -2551,12 +2553,12 @@ func continueSkillOptTrainOptimizer(ctx context.Context, paths config.Paths, sto
 		version, err := importSkillOptTrainCandidate(ctx, paths, store, session, iteration, optimizerPaths)
 		if err != nil {
 			if errors.Is(err, skillopt.ErrNoCandidate) {
-				reason := skillOptNoCandidateReason(err)
+				reason, nextAction := skillOptNoCandidateReasonAndNextAction(err, optimizerPaths.CandidatePackagePath)
 				if metaErr := recordSkillOptTrainNoCandidate(ctx, store, session, iteration, optimizerPaths, reason); metaErr != nil {
 					return skillOptTrainOptimizerResult{}, fmt.Errorf("%w; failed to record no-candidate result: %v", err, metaErr)
 				}
 				result.NoCandidateReason = reason
-				result.NoCandidateNextAction = skillOptNoCandidateNextAction()
+				result.NoCandidateNextAction = nextAction
 				return result, nil
 			}
 			if metaErr := recordSkillOptTrainCandidateImportFailure(ctx, store, session, iteration, optimizerPaths, err); metaErr != nil {
@@ -4285,6 +4287,9 @@ func applySkillOptTrainStableStatus(snapshot skillOptTrainStatusSnapshot) skillO
 		if reason := strings.TrimSpace(snapshot.Verbose.Candidate.NoCandidateReason); reason != "" {
 			snapshot.NoCandidateReason = reason
 		}
+		if len(snapshot.Verbose.Candidate.NoCandidateDetails) > 0 {
+			snapshot.NoCandidateDetails = snapshot.Verbose.Candidate.NoCandidateDetails
+		}
 		if optimizer := snapshot.Verbose.Optimizer; optimizer != nil {
 			if available, ok := optimizer["recovery_available"].(bool); ok {
 				snapshot.RecoveryAvailable = available
@@ -4400,9 +4405,10 @@ func buildSkillOptTrainStatusVerbose(ctx context.Context, store *db.Store, sessi
 	}
 	candidateImport := decodedSkillOptMetadataValue(iterationMetadata["candidate_import"])
 	details.Candidate = skillOptTrainStatusCandidate{
-		VersionID:         strings.TrimSpace(iteration.CandidateVersionID),
-		PullRequestURL:    strings.TrimSpace(iteration.PullRequestURL),
-		NoCandidateReason: metadataString(candidateImport, "no_candidate_reason"),
+		VersionID:          strings.TrimSpace(iteration.CandidateVersionID),
+		PullRequestURL:     strings.TrimSpace(iteration.PullRequestURL),
+		NoCandidateReason:  metadataString(candidateImport, "no_candidate_reason"),
+		NoCandidateDetails: decodedSkillOptMetadataValue(candidateImport["no_candidate_details"]),
 	}
 	if optimizer := decodedSkillOptMetadataValue(iterationMetadata["optimizer"]); len(optimizer) > 0 {
 		optimizerPaths, err := resolveSkillOptTrainOptimizerPaths(config.Paths{}, session, *iteration, skillOptTrainOptimizerRequest{})
@@ -4681,6 +4687,7 @@ func printSkillOptTrainStatusSnapshot(stdout io.Writer, snapshot skillOptTrainSt
 	if snapshot.NoCandidateReason != "" {
 		writeLine(stdout, "no_candidate_reason: %s", snapshot.NoCandidateReason)
 	}
+	printSkillOptNoCandidateDetails(stdout, snapshot.NoCandidateDetails)
 	writeLine(stdout, "review_items: %d", snapshot.Counts.ReviewItems)
 	writeLine(stdout, "feedback: %d", snapshot.Counts.FeedbackEvents+snapshot.Counts.RankedFeedbackEvents)
 	writeLine(stdout, "pairwise_preferences: %d", snapshot.Counts.PairwisePreferences)
@@ -4709,6 +4716,9 @@ func printSkillOptTrainStatusSnapshot(stdout io.Writer, snapshot skillOptTrainSt
 	if snapshot.NoCandidateReason == "" && snapshot.Verbose.Candidate.NoCandidateReason != "" {
 		writeLine(stdout, "no_candidate_reason: %s", snapshot.Verbose.Candidate.NoCandidateReason)
 	}
+	if len(snapshot.NoCandidateDetails) == 0 {
+		printSkillOptNoCandidateDetails(stdout, snapshot.Verbose.Candidate.NoCandidateDetails)
+	}
 	if snapshot.Verbose.Optimizer != nil {
 		if available, ok := snapshot.Verbose.Optimizer["recovery_available"]; ok {
 			writeLine(stdout, "optimizer_recovery_available: %v", available)
@@ -4716,6 +4726,27 @@ func printSkillOptTrainStatusSnapshot(stdout io.Writer, snapshot skillOptTrainSt
 	}
 	for _, lock := range snapshot.Verbose.ActiveLocks {
 		writeLine(stdout, "active_lock: %s", skillOptTrainStatusLockText(lock))
+	}
+}
+
+func printSkillOptNoCandidateDetails(stdout io.Writer, details map[string]any) {
+	if len(details) == 0 {
+		return
+	}
+	if attemptedPatch := metadataString(details, "attempted_patch"); attemptedPatch != "" {
+		writeLine(stdout, "attempted_patch: %s", attemptedPatch)
+	}
+	if retryAttempts := metadataString(details, "retry_attempts"); retryAttempts != "" {
+		writeLine(stdout, "retry_attempts: %s", retryAttempts)
+	}
+	rejection := decodedSkillOptMetadataValue(details["rejection"])
+	if len(rejection) == 0 {
+		return
+	}
+	baseline := decodedSkillOptMetadataValue(rejection["baseline"])
+	candidate := decodedSkillOptMetadataValue(rejection["candidate"])
+	if len(baseline) > 0 || len(candidate) > 0 {
+		writeLine(stdout, "rejection: baseline_gate=%s candidate_gate=%s", metadataString(baseline, "gate_score"), metadataString(candidate, "gate_score"))
 	}
 }
 
@@ -5420,7 +5451,7 @@ func recoverSkillOptTrainOptimizerArtifacts(ctx context.Context, paths config.Pa
 	}
 	if err := validateSkillOptTrainCandidatePackage(ctx, store, session, *iteration, candidate); err != nil {
 		if errors.Is(err, skillopt.ErrNoCandidate) {
-			reason := skillOptNoCandidateReason(err)
+			reason, nextAction := skillOptNoCandidateReasonAndNextAction(err, optimizerPaths.CandidatePackagePath)
 			session, iteration, err = markSkillOptTrainOptimizerRecoveredComplete(ctx, store, session, *iteration, optimizerPaths)
 			if err != nil {
 				result.Classification = "corrupted_unrecoverable"
@@ -5433,7 +5464,7 @@ func recoverSkillOptTrainOptimizerArtifacts(ctx context.Context, paths config.Pa
 			result.Classification = "completed_no_candidate"
 			result.CurrentPhase = skillopt.TrainStateOptimizerCompletedNoCandidate
 			result.NoCandidateReason = reason
-			result.NextAction = skillOptNoCandidateNextAction()
+			result.NextAction = nextAction
 			return result, nil
 		}
 		result.Classification = "corrupted_unrecoverable"
@@ -5446,7 +5477,7 @@ func recoverSkillOptTrainOptimizerArtifacts(ctx context.Context, paths config.Pa
 	version, err := importSkillOptTrainCandidate(ctx, paths, store, session, *iteration, optimizerPaths)
 	if err != nil {
 		if errors.Is(err, skillopt.ErrNoCandidate) {
-			reason := skillOptNoCandidateReason(err)
+			reason, nextAction := skillOptNoCandidateReasonAndNextAction(err, optimizerPaths.CandidatePackagePath)
 			session, iteration, err = markSkillOptTrainOptimizerRecoveredComplete(ctx, store, session, *iteration, optimizerPaths)
 			if err != nil {
 				result.Classification = "corrupted_unrecoverable"
@@ -5459,7 +5490,7 @@ func recoverSkillOptTrainOptimizerArtifacts(ctx context.Context, paths config.Pa
 			result.Classification = "completed_no_candidate"
 			result.CurrentPhase = skillopt.TrainStateOptimizerCompletedNoCandidate
 			result.NoCandidateReason = reason
-			result.NextAction = skillOptNoCandidateNextAction()
+			result.NextAction = nextAction
 			return result, nil
 		}
 		result.Classification = "corrupted_unrecoverable"
@@ -5816,14 +5847,25 @@ func recordSkillOptTrainNoCandidate(ctx context.Context, store *db.Store, sessio
 	if err := skillopt.CanTransitionTrainIteration(iteration.State, skillopt.TrainStateOptimizerCompletedNoCandidate); err != nil {
 		return err
 	}
+	packageReason, packageNextAction, packageDetails := skillOptNoCandidatePackageMetadata(paths.CandidatePackagePath)
+	if strings.TrimSpace(packageReason) != "" {
+		reason = packageReason
+	}
+	nextAction := skillOptNoCandidateNextAction()
+	if strings.TrimSpace(packageNextAction) != "" {
+		nextAction = packageNextAction
+	}
 	metadata := map[string]any{
 		"status":              "no_candidate",
 		"candidate_package":   paths.CandidatePackagePath,
 		"artifact_dir":        paths.ArtifactDir,
 		"no_candidate_reason": reason,
-		"next_action":         skillOptNoCandidateNextAction(),
+		"next_action":         nextAction,
 		"completed_at":        time.Now().UTC().Format(time.RFC3339Nano),
 		"source":              "gitmoot skillopt train continue",
+	}
+	if len(packageDetails) > 0 {
+		metadata["no_candidate_details"] = packageDetails
 	}
 	session.State = skillopt.TrainStateOptimizerCompletedNoCandidate
 	iteration.State = skillopt.TrainStateOptimizerCompletedNoCandidate
@@ -5845,8 +5887,113 @@ func skillOptNoCandidateReason(err error) string {
 	return text
 }
 
+func skillOptNoCandidateReasonAndNextAction(err error, candidatePackagePath string) (string, string) {
+	reason := skillOptNoCandidateReason(err)
+	packageReason, packageNextAction, _ := skillOptNoCandidatePackageMetadata(candidatePackagePath)
+	if strings.TrimSpace(packageReason) != "" {
+		reason = packageReason
+	}
+	nextAction := skillOptNoCandidateNextAction()
+	if strings.TrimSpace(packageNextAction) != "" {
+		nextAction = packageNextAction
+	}
+	return reason, nextAction
+}
+
 func skillOptNoCandidateNextAction() string {
 	return "do not publish a candidate review; revise feedback and start another iteration, rerun the optimizer with --rerun-optimizer, or stop"
+}
+
+func skillOptNoCandidatePackageMetadata(candidatePackagePath string) (string, string, map[string]any) {
+	candidatePackagePath = strings.TrimSpace(candidatePackagePath)
+	if candidatePackagePath == "" {
+		return "", "", nil
+	}
+	content, err := os.ReadFile(candidatePackagePath)
+	if err != nil {
+		return "", "", nil
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(content, &raw); err != nil {
+		return "", "", nil
+	}
+	summary := decodedSkillOptMetadataValue(raw["summary"])
+	metadata := decodedSkillOptMetadataValue(summary["metadata"])
+	evalReport := decodedSkillOptMetadataValue(raw["eval_report"])
+	reason := ""
+	nextAction := ""
+	var details map[string]any
+	for _, source := range []map[string]any{evalReport, metadata} {
+		if skillOptCandidateReviewExplicitPromotable(source) {
+			continue
+		}
+		if reason == "" {
+			reason = metadataString(source, "no_candidate_reason")
+		}
+		if nextAction == "" {
+			nextAction = metadataString(source, "next_action")
+		}
+		if len(details) == 0 {
+			details = decodedSkillOptMetadataValue(source["no_candidate_details"])
+		}
+	}
+	for _, gateRejection := range []map[string]any{
+		decodedSkillOptMetadataValue(summary["gate_rejection"]),
+		decodedSkillOptMetadataValue(decodedSkillOptMetadataValue(summary["evaluator_score"])["gate_rejection"]),
+		decodedSkillOptMetadataValue(evalReport["gate_rejection"]),
+	} {
+		if len(gateRejection) == 0 {
+			continue
+		}
+		if reason == "" {
+			reason = metadataString(gateRejection, "rejection_type")
+		}
+		if reason == "" {
+			reason = metadataString(gateRejection, "primary_reason")
+		}
+		if nextAction == "" {
+			nextAction = metadataString(gateRejection, "next_action")
+		}
+		if len(details) == 0 {
+			details = skillOptNoCandidateDetailsFromGateRejection(gateRejection)
+		}
+	}
+	if reason == "" {
+		return "", "", nil
+	}
+	return reason, nextAction, details
+}
+
+func skillOptNoCandidateDetailsFromGateRejection(gateRejection map[string]any) map[string]any {
+	if len(gateRejection) == 0 {
+		return nil
+	}
+	details := map[string]any{}
+	for _, key := range []string{"attempted_patch", "retry_attempts", "next_action"} {
+		if value := metadataString(gateRejection, key); value != "" {
+			details[key] = value
+		}
+	}
+	rejection := map[string]any{}
+	for _, key := range []string{"baseline", "candidate"} {
+		if value := decodedSkillOptMetadataValue(gateRejection[key]); len(value) > 0 {
+			rejection[key] = value
+		}
+	}
+	for _, key := range []string{"primary_reason", "human_reason", "optimizer_hint"} {
+		if value := metadataString(gateRejection, key); value != "" {
+			rejection[key] = value
+		}
+	}
+	for _, key := range []string{"failed_dimensions", "evidence"} {
+		if value := metadataStringSlice(gateRejection, key); len(value) > 0 {
+			rejection[key] = value
+		}
+	}
+	if len(rejection) > 0 {
+		details["rejection"] = rejection
+	}
+	return details
 }
 
 func skillOptTrainOptimizerReportLines(result skillOptTrainOptimizerResult) []string {

@@ -2684,8 +2684,32 @@ func TestResolveSkillOptTrainBackendRequestReportsDefaultOpenAIBackends(t *testi
 func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 	home, baseVersionID := seedSkillOptTrainFeedbackSynced(t)
 	outRoot := filepath.Join(t.TempDir(), "optimizer")
+	candidate := cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan the work.")
+	candidate.EvalReport = json.RawMessage(`{
+		"promotable": false,
+		"no_candidate_reason": "gate_rejected_best_origin_initial_skill"
+	}`)
+	candidate.Summary.Metadata = json.RawMessage(`{
+		"promotable": false,
+		"no_candidate_reason": "gate_rejected_best_origin_initial_skill",
+		"next_action": "Do not import or publish a candidate review; collect more feedback, rerun with gate-reject retry if budget remains, or inspect the candidate package."
+	}`)
+	baselineGateScore := 0.89
+	candidateGateScore := 0.84
+	candidate.Summary.GateRejection = &skillopt.GateRejectionPacket{
+		RejectionType:  "candidate_score_regression",
+		PrimaryReason:  "candidate_quality_regressed",
+		AttemptedPatch: "artifact delivery only",
+		RetryAttempts:  "1/1",
+		Baseline: skillopt.GateRejectionScores{
+			GateScore: &baselineGateScore,
+		},
+		Candidate: skillopt.GateRejectionScores{
+			GateScore: &candidateGateScore,
+		},
+	}
 	runner := &skillOptTrainFakeOptimizerRunner{
-		candidate: cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan the work."),
+		candidate: candidate,
 	}
 	previousRunner := skillOptTrainOptimizerRunner
 	skillOptTrainOptimizerRunner = runner
@@ -2710,8 +2734,8 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 		"continue_ready: true",
 		"candidate_package: " + filepath.Join(outRoot, "candidate.json"),
 		"optimizer_dry_run: true",
-		"no_candidate_reason: candidate content is unchanged from the base version",
-		"next: do not publish a candidate review",
+		"no_candidate_reason: gate_rejected_best_origin_initial_skill",
+		"next: Do not import or publish a candidate review; collect more feedback",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("train continue no-candidate stdout missing %q:\n%s", want, stdout.String())
@@ -2726,7 +2750,8 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 		t.Fatalf("iteration after no-candidate = %+v", iteration)
 	}
 	if !strings.Contains(iteration.MetadataJSON, `"status":"no_candidate"`) ||
-		!strings.Contains(iteration.MetadataJSON, `"no_candidate_reason":"candidate content is unchanged from the base version"`) {
+		!strings.Contains(iteration.MetadataJSON, `"no_candidate_reason":"gate_rejected_best_origin_initial_skill"`) ||
+		!strings.Contains(iteration.MetadataJSON, `"attempted_patch":"artifact delivery only"`) {
 		t.Fatalf("iteration metadata after no-candidate = %s", iteration.MetadataJSON)
 	}
 	if _, err := store.GetAgentTemplateVersionByID(context.Background(), "planner@v2"); !errors.Is(err, sql.ErrNoRows) {
@@ -2747,8 +2772,26 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 		t.Fatalf("train status no-candidate json did not decode: %v\n%s", err, stdout.String())
 	}
 	if statusJSON.StatusPhase != "optimizer_completed_no_candidate" ||
-		statusJSON.NoCandidateReason != "candidate content is unchanged from the base version" {
+		statusJSON.NoCandidateReason != "gate_rejected_best_origin_initial_skill" ||
+		statusJSON.NoCandidateDetails["attempted_patch"] != "artifact delivery only" {
 		t.Fatalf("train status no-candidate json = %+v", statusJSON)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "train", "status", "--home", home, "--session", "optimizer-train", "--verbose"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train status no-candidate text exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	for _, want := range []string{
+		"no_candidate_reason: gate_rejected_best_origin_initial_skill",
+		"attempted_patch: artifact delivery only",
+		"retry_attempts: 1/1",
+		"rejection: baseline_gate=0.89 candidate_gate=0.84",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("train status no-candidate text missing %q:\n%s", want, stdout.String())
+		}
 	}
 
 	stdout.Reset()
@@ -4676,8 +4719,11 @@ func TestSkillOptTrainRecoverImportsCandidateArtifacts(t *testing.T) {
 func TestSkillOptTrainRecoverRecordsNoCandidateArtifacts(t *testing.T) {
 	home, baseVersionID := seedSkillOptTrainFeedbackSynced(t)
 	outRoot := filepath.Join(t.TempDir(), "optimizer")
+	candidate := cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan the work.")
+	candidate.EvalReport = json.RawMessage(`{"promotable":true,"no_candidate_reason":"stale_non_blocking_reason","next_action":"stale next action"}`)
+	candidate.Summary.Metadata = json.RawMessage(`{"promotable":true,"no_candidate_reason":"stale_non_blocking_reason","next_action":"stale next action"}`)
 	runner := &skillOptTrainFakeOptimizerRunner{
-		candidate:          cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan the work."),
+		candidate:          candidate,
 		failAfterCandidate: true,
 	}
 	previousRunner := skillOptTrainOptimizerRunner
@@ -4716,6 +4762,9 @@ func TestSkillOptTrainRecoverRecordsNoCandidateArtifacts(t *testing.T) {
 	}
 	if iteration.State != skillopt.TrainStateOptimizerCompletedNoCandidate || iteration.CandidateVersionID != "" {
 		t.Fatalf("iteration after no-candidate recovery = %+v", iteration)
+	}
+	if strings.Contains(iteration.MetadataJSON, "stale_non_blocking_reason") || strings.Contains(iteration.MetadataJSON, "stale next action") {
+		t.Fatalf("iteration metadata used stale promotable no-candidate package metadata: %s", iteration.MetadataJSON)
 	}
 }
 
