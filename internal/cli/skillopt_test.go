@@ -6260,6 +6260,106 @@ func TestSkillOptFeedbackGitHubCommandsEnforceTrainReviewRepo(t *testing.T) {
 	}
 }
 
+func TestSkillOptReviewWatcherImportsValidYAML(t *testing.T) {
+	home, store, blobStore := seedSkillOptReviewWatcherRun(t)
+	defer store.Close()
+	fake := &skillOptFakeGitHub{
+		comments: map[int64][]github.IssueComment{
+			67: {
+				{ID: 100, Body: "```yaml\nrun_id: watcher-review-001\nitems:\n  - item_id: item-001\n    ranking:\n      - C > A > D > B\n  - item_id: item-002\n    ranking:\n      - B > C > A > D\n```\n", URL: "https://github.com/owner/previews/issues/67#issuecomment-100", Author: "alice", CreatedAt: "2026-06-04T10:00:00Z"},
+			},
+		},
+	}
+	var stdout bytes.Buffer
+	if _, err := pollSkillOptReviewWatches(context.Background(), store, blobStore, fake, &stdout, false); err != nil {
+		t.Fatalf("pollSkillOptReviewWatches returned error: %v", err)
+	}
+	events, err := store.ListRankedFeedbackEvents(context.Background(), "watcher-review-001")
+	if err != nil {
+		t.Fatalf("ListRankedFeedbackEvents returned error: %v", err)
+	}
+	if len(events) != 2 || events[0].Reviewer != "alice" {
+		t.Fatalf("ranked events = %+v", events)
+	}
+	watch, err := store.GetSkillOptReviewWatch(context.Background(), "owner/previews", 67)
+	if err != nil {
+		t.Fatalf("GetSkillOptReviewWatch returned error: %v", err)
+	}
+	if watch.Status != db.SkillOptReviewWatchStatusImported || watch.LastSeenCommentID != 100 {
+		t.Fatalf("watch = %+v", watch)
+	}
+	if len(fake.postedComments) != 0 {
+		t.Fatalf("posted comments = %+v", fake.postedComments)
+	}
+	if !strings.Contains(stdout.String(), "imported 2 skillopt review feedback events") {
+		t.Fatalf("stdout = %q; home=%s", stdout.String(), home)
+	}
+	if _, err := pollSkillOptReviewWatches(context.Background(), store, blobStore, fake, &stdout, false); err != nil {
+		t.Fatalf("second pollSkillOptReviewWatches returned error: %v", err)
+	}
+	events, err = store.ListRankedFeedbackEvents(context.Background(), "watcher-review-001")
+	if err != nil {
+		t.Fatalf("ListRankedFeedbackEvents after second poll returned error: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("ranked events after second poll = %+v", events)
+	}
+}
+
+func TestSkillOptReviewWatcherCommentsInvalidYAMLDeduped(t *testing.T) {
+	_, store, blobStore := seedSkillOptReviewWatcherRun(t)
+	defer store.Close()
+	fake := &skillOptFakeGitHub{
+		comments: map[int64][]github.IssueComment{
+			67: {
+				{ID: 100, Body: "run_id: watcher-review-001\nitems:\n  - item_id: item-001\n    ranking:\n      - C > A > D > B\n", URL: "https://github.com/owner/previews/issues/67#issuecomment-100", Author: "alice", CreatedAt: "2026-06-04T10:00:00Z"},
+			},
+		},
+	}
+	var stdout bytes.Buffer
+	if _, err := pollSkillOptReviewWatches(context.Background(), store, blobStore, fake, &stdout, false); err != nil {
+		t.Fatalf("pollSkillOptReviewWatches returned error: %v", err)
+	}
+	if len(fake.postedComments) != 1 {
+		t.Fatalf("posted comments = %+v", fake.postedComments)
+	}
+	if !strings.Contains(fake.postedComments[0].Body, skillOptReviewWatchErrorMarker) ||
+		!strings.Contains(fake.postedComments[0].Body, "missing feedback for expected item_id(s): item-002") {
+		t.Fatalf("error comment = %q", fake.postedComments[0].Body)
+	}
+	watch, err := store.GetSkillOptReviewWatch(context.Background(), "owner/previews", 67)
+	if err != nil {
+		t.Fatalf("GetSkillOptReviewWatch returned error: %v", err)
+	}
+	if watch.Status != db.SkillOptReviewWatchStatusWatching || watch.LastSeenCommentID != 0 || watch.LastImportErrorHash == "" {
+		t.Fatalf("watch after invalid import = %+v", watch)
+	}
+	if _, err := pollSkillOptReviewWatches(context.Background(), store, blobStore, fake, &stdout, false); err != nil {
+		t.Fatalf("second pollSkillOptReviewWatches returned error: %v", err)
+	}
+	if len(fake.postedComments) != 1 {
+		t.Fatalf("posted comments after second poll = %+v", fake.postedComments)
+	}
+	events, err := store.ListRankedFeedbackEvents(context.Background(), "watcher-review-001")
+	if err != nil {
+		t.Fatalf("ListRankedFeedbackEvents returned error: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("ranked events = %+v", events)
+	}
+	fake.comments[67][0].Body = "run_id: watcher-review-001\nitems:\n  - item_id: item-001\n    ranking:\n      - C > A > D > B\n  - item_id: item-002\n    ranking:\n      - B > C > A > D\n"
+	if _, err := pollSkillOptReviewWatches(context.Background(), store, blobStore, fake, &stdout, false); err != nil {
+		t.Fatalf("third pollSkillOptReviewWatches returned error: %v", err)
+	}
+	events, err = store.ListRankedFeedbackEvents(context.Background(), "watcher-review-001")
+	if err != nil {
+		t.Fatalf("ListRankedFeedbackEvents after edit returned error: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("ranked events after edit = %+v", events)
+	}
+}
+
 func TestSkillOptFeedbackRepoResolutionPreservesNonTrainExpectedRepoFallback(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
@@ -7548,6 +7648,67 @@ type skillOptPostedGitHubComment struct {
 type skillOptListedGitHubComments struct {
 	Repo        github.Repository
 	IssueNumber int64
+}
+
+func seedSkillOptReviewWatcherRun(t *testing.T) (string, *db.Store, artifact.Store) {
+	t.Helper()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	blobStore := artifact.NewStore(paths.ArtifactBlobs)
+	if err := store.UpsertEvalRun(context.Background(), db.EvalRun{
+		ID:               "watcher-review-001",
+		TargetRepo:       "owner/product",
+		State:            "review",
+		Mode:             db.EvalRunModeExplore,
+		ExplorationLevel: db.ExplorationLevelHigh,
+		OptionsCount:     4,
+	}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+	for _, itemID := range []string{"item-001", "item-002"} {
+		if err := store.UpsertEvalReviewItem(context.Background(), db.EvalReviewItem{
+			RunID:  "watcher-review-001",
+			ItemID: itemID,
+			Title:  itemID,
+		}); err != nil {
+			t.Fatalf("UpsertEvalReviewItem %s returned error: %v", itemID, err)
+		}
+		for _, label := range []string{"a", "b", "c", "d"} {
+			content := []byte(itemID + " option " + label)
+			blob, err := blobStore.Put(content)
+			if err != nil {
+				t.Fatalf("Put %s %s returned error: %v", itemID, label, err)
+			}
+			artifactID := itemID + "-option-" + label
+			if err := store.UpsertEvalArtifact(context.Background(), db.EvalArtifact{ID: artifactID, Hash: blob.Hash, MediaType: "text/markdown", SizeBytes: blob.Size, Driver: "text"}); err != nil {
+				t.Fatalf("UpsertEvalArtifact %s returned error: %v", artifactID, err)
+			}
+			if err := store.UpsertEvalReviewOption(context.Background(), db.EvalReviewOption{RunID: "watcher-review-001", ItemID: itemID, Label: label, ArtifactID: artifactID, Role: "option"}); err != nil {
+				t.Fatalf("UpsertEvalReviewOption %s %s returned error: %v", itemID, label, err)
+			}
+		}
+	}
+	itemIDsJSON, err := json.Marshal([]string{"item-001", "item-002"})
+	if err != nil {
+		t.Fatalf("Marshal item ids returned error: %v", err)
+	}
+	if err := store.UpsertSkillOptReviewWatch(context.Background(), db.SkillOptReviewWatch{
+		Repo:                "owner/previews",
+		IssueNumber:         67,
+		RunID:               "watcher-review-001",
+		ExpectedItemIDsJSON: string(itemIDsJSON),
+		Status:              db.SkillOptReviewWatchStatusWatching,
+	}); err != nil {
+		t.Fatalf("UpsertSkillOptReviewWatch returned error: %v", err)
+	}
+	return home, store, blobStore
 }
 
 func (f *skillOptFakeGitHub) CreateIssue(_ context.Context, input github.CreateIssueInput) (github.Issue, error) {

@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jerryfane/gitmoot/internal/artifact"
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
@@ -54,8 +55,8 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 
 func printDaemonUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot daemon start [--repo owner/repo] [--poll 30s] [--workers 1]")
-	fmt.Fprintln(w, "  gitmoot daemon run [--repo owner/repo] [--poll 30s] [--workers 1]")
+	fmt.Fprintln(w, "  gitmoot daemon start [--repo owner/repo] [--poll 30s] [--workers 1] [--watch-skillopt-reviews]")
+	fmt.Fprintln(w, "  gitmoot daemon run [--repo owner/repo] [--poll 30s] [--workers 1] [--watch-skillopt-reviews]")
 	fmt.Fprintln(w, "  gitmoot daemon stop")
 	fmt.Fprintln(w, "  gitmoot daemon restart")
 	fmt.Fprintln(w, "  gitmoot daemon status")
@@ -105,7 +106,7 @@ func runDaemonStartWithWorkDir(args []string, workDir string, stdout, stderr io.
 		}
 	}
 
-	started, err := startDaemonChild(cfg.Home, cfg.Poll.String(), cfg.Workers, state, resolvedWorkDir)
+	started, err := startDaemonChild(cfg.Home, cfg.Poll.String(), cfg.Workers, cfg.WatchSkillOptReviews, state, resolvedWorkDir)
 	if err != nil {
 		fmt.Fprintf(stderr, "daemon start: %v\n", err)
 		return 1
@@ -128,6 +129,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	poll := fs.Duration("poll", 30*time.Second, "poll interval")
 	workers := fs.Int("workers", 1, "worker count")
 	dryRun := fs.Bool("dry-run", false, "run without mutating external systems")
+	watchSkillOptReviews := fs.Bool("watch-skillopt-reviews", false, "poll watched SkillOpt review issue comments and import valid feedback")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -155,7 +157,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 
 	if *repoFlag == "" {
-		err := runRegisteredRepoSupervisor(ctx, *home, *poll, *workers, *dryRun, stdout)
+		err := runRegisteredRepoSupervisor(ctx, *home, *poll, *workers, *dryRun, *watchSkillOptReviews, stdout)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return 0
 		}
@@ -398,16 +400,18 @@ type daemonMeta struct {
 }
 
 type daemonStartConfig struct {
-	Home                string
-	RepoFlag            string
-	Repo                github.Repository
-	RepoSet             bool
-	Poll                time.Duration
-	Workers             int
-	ExplicitStartConfig bool
-	ExplicitRepo        bool
-	ExplicitPoll        bool
-	ExplicitWorkers     bool
+	Home                         string
+	RepoFlag                     string
+	Repo                         github.Repository
+	RepoSet                      bool
+	Poll                         time.Duration
+	Workers                      int
+	ExplicitStartConfig          bool
+	ExplicitRepo                 bool
+	ExplicitPoll                 bool
+	ExplicitWorkers              bool
+	WatchSkillOptReviews         bool
+	ExplicitWatchSkillOptReviews bool
 }
 
 const daemonHelp = -1
@@ -419,6 +423,7 @@ func parseDaemonStartConfig(command string, args []string, stderr io.Writer) (da
 	repoFlag := fs.String("repo", "", "GitHub repository as owner/repo")
 	poll := fs.Duration("poll", 30*time.Second, "poll interval")
 	workers := fs.Int("workers", 1, "worker count")
+	watchSkillOptReviews := fs.Bool("watch-skillopt-reviews", false, "poll watched SkillOpt review issue comments and import valid feedback")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return daemonStartConfig{}, daemonHelp
@@ -430,10 +435,11 @@ func parseDaemonStartConfig(command string, args []string, stderr io.Writer) (da
 		return daemonStartConfig{}, 2
 	}
 	cfg := daemonStartConfig{
-		Home:     *home,
-		RepoFlag: *repoFlag,
-		Poll:     *poll,
-		Workers:  *workers,
+		Home:                 *home,
+		RepoFlag:             *repoFlag,
+		Poll:                 *poll,
+		Workers:              *workers,
+		WatchSkillOptReviews: *watchSkillOptReviews,
 	}
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
@@ -445,6 +451,9 @@ func parseDaemonStartConfig(command string, args []string, stderr io.Writer) (da
 			cfg.ExplicitStartConfig = true
 		case "workers":
 			cfg.ExplicitWorkers = true
+			cfg.ExplicitStartConfig = true
+		case "watch-skillopt-reviews":
+			cfg.ExplicitWatchSkillOptReviews = true
 			cfg.ExplicitStartConfig = true
 		}
 	})
@@ -567,6 +576,9 @@ func overlayDaemonStartArgs(args []string, cfg daemonStartConfig) []string {
 	if cfg.ExplicitWorkers {
 		args = withDaemonFlagArg(args, "workers", strconv.Itoa(cfg.Workers))
 	}
+	if cfg.ExplicitWatchSkillOptReviews {
+		args = withDaemonBoolFlagArg(args, "watch-skillopt-reviews", cfg.WatchSkillOptReviews)
+	}
 	return args
 }
 
@@ -587,6 +599,21 @@ func withDaemonFlagArg(args []string, name string, value string) []string {
 		return cleaned
 	}
 	return append(cleaned, flagName, value)
+}
+
+func withDaemonBoolFlagArg(args []string, name string, enabled bool) []string {
+	flagName := "--" + name
+	cleaned := make([]string, 0, len(args)+1)
+	for _, arg := range args {
+		if arg == flagName || strings.HasPrefix(arg, flagName+"=") {
+			continue
+		}
+		cleaned = append(cleaned, arg)
+	}
+	if enabled {
+		return append(cleaned, flagName)
+	}
+	return cleaned
 }
 
 func currentDaemonPID(state daemonState) (pid int, stale bool, err error) {
@@ -613,7 +640,7 @@ func currentDaemonPID(state daemonState) (pid int, stale bool, err error) {
 	return pid, false, nil
 }
 
-func startDaemonChild(home string, poll string, workers int, state daemonState, workDir string) (daemonMeta, error) {
+func startDaemonChild(home string, poll string, workers int, watchSkillOptReviews bool, state daemonState, workDir string) (daemonMeta, error) {
 	executable, err := os.Executable()
 	if err != nil {
 		return daemonMeta{}, err
@@ -623,7 +650,7 @@ func startDaemonChild(home string, poll string, workers int, state daemonState, 
 		return daemonMeta{}, err
 	}
 	defer logFile.Close()
-	args := daemonChildArgs(home, poll, workers)
+	args := daemonChildArgs(home, poll, workers, watchSkillOptReviews)
 	cmd := exec.Command(executable, args...)
 	cmd.Dir = workDir
 	cmd.Stdout = logFile
@@ -646,10 +673,13 @@ func startDaemonChild(home string, poll string, workers int, state daemonState, 
 	}, nil
 }
 
-func daemonChildArgs(home string, poll string, workers int) []string {
+func daemonChildArgs(home string, poll string, workers int, watchSkillOptReviews bool) []string {
 	args := []string{"daemon", "run", "--poll", poll, "--workers", strconv.Itoa(workers)}
 	if home != "" {
 		args = append(args, "--home", home)
+	}
+	if watchSkillOptReviews {
+		args = append(args, "--watch-skillopt-reviews")
 	}
 	return args
 }
@@ -777,13 +807,15 @@ func hasWhitespace(value string) bool {
 	return strings.ContainsAny(value, " \t\r\n")
 }
 
-func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Duration, workers int, dryRun bool, stdout io.Writer) error {
-	return withStore(home, func(store *db.Store) error {
+func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Duration, workers int, dryRun bool, watchSkillOptReviews bool, stdout io.Writer) error {
+	return withStoreAndPaths(home, func(paths config.Paths, store *db.Store) error {
 		schedule := registeredRepoSchedule{
 			NextPoll:    map[string]time.Time{},
 			ErrorStreak: map[string]int{},
 		}
 		poller := defaultRegisteredRepoPoller(store, workers, dryRun, stdout)
+		blobStore := artifact.NewStore(paths.ArtifactBlobs)
+		reviewGitHub := newSkillOptGitHubClient()
 		worker := defaultJobWorker(store, stdout, home)
 		worker.CommenterFactory = worker.defaultCommenter
 		checkoutLocks := &repoCheckoutLocks{}
@@ -807,6 +839,11 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 			wait, err := pollRegisteredReposWithPoller(ctx, poller, schedule, time.Now().UTC(), poll)
 			if err != nil {
 				return err
+			}
+			if watchSkillOptReviews {
+				if _, err := pollSkillOptReviewWatches(ctx, store, blobStore, reviewGitHub, stdout, dryRun); err != nil {
+					writeLine(stdout, "skillopt review watch poll error: %s", err)
+				}
 			}
 			timer := time.NewTimer(wait)
 			select {
