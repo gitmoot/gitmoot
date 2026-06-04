@@ -43,6 +43,7 @@ func TestOpenMigratesSchema(t *testing.T) {
 		"ranked_feedback_events",
 		"skillopt_train_sessions",
 		"skillopt_train_iterations",
+		"skillopt_review_watches",
 	} {
 		ok, err := store.HasTable(ctx, table)
 		if err != nil {
@@ -194,6 +195,106 @@ func TestSkillOptTrainStorageDefaultsAndValidation(t *testing.T) {
 	}
 	if iteration.Mode != EvalRunModeExplore || iteration.ExplorationLevel != ExplorationLevelHigh || iteration.State != "request_confirmed" {
 		t.Fatalf("iteration defaults = %+v", iteration)
+	}
+}
+
+func TestSkillOptReviewWatchStorage(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	expectedItems, err := json.Marshal([]string{"item-001", "item-002"})
+	if err != nil {
+		t.Fatalf("marshal expected items: %v", err)
+	}
+	watch := SkillOptReviewWatch{
+		Repo:                  " owner/previews ",
+		IssueNumber:           67,
+		RunID:                 " landing-page-review-001 ",
+		ExpectedItemIDsJSON:   string(expectedItems),
+		LastSeenCommentID:     100,
+		LastImportErrorHash:   " error-hash ",
+		StaleAfter:            "2026-06-05T12:00:00Z",
+		StaleThresholdSeconds: 86400,
+		StaleNotified:         true,
+		MetadataJSON:          `{"source":"test"}`,
+	}
+	if err := store.UpsertSkillOptReviewWatch(ctx, watch); err != nil {
+		t.Fatalf("UpsertSkillOptReviewWatch returned error: %v", err)
+	}
+	stored, err := store.GetSkillOptReviewWatch(ctx, "owner/previews", 67)
+	if err != nil {
+		t.Fatalf("GetSkillOptReviewWatch returned error: %v", err)
+	}
+	if stored.Repo != "owner/previews" ||
+		stored.RunID != "landing-page-review-001" ||
+		stored.Status != SkillOptReviewWatchStatusWatching ||
+		stored.LastSeenCommentID != 100 ||
+		stored.LastImportErrorHash != "error-hash" ||
+		stored.StaleAfter != watch.StaleAfter ||
+		stored.StaleThresholdSeconds != 86400 ||
+		!stored.StaleNotified ||
+		stored.ExpectedItemIDsJSON != string(expectedItems) {
+		t.Fatalf("stored watch = %+v", stored)
+	}
+	if err := store.UpsertSkillOptReviewWatch(ctx, SkillOptReviewWatch{
+		Repo:        "owner/previews",
+		IssueNumber: 67,
+		RunID:       "landing-page-review-001",
+		Status:      SkillOptReviewWatchStatusImported,
+	}); err != nil {
+		t.Fatalf("UpsertSkillOptReviewWatch update returned error: %v", err)
+	}
+	watches, err := store.ListSkillOptReviewWatches(ctx, SkillOptReviewWatchStatusImported)
+	if err != nil {
+		t.Fatalf("ListSkillOptReviewWatches returned error: %v", err)
+	}
+	if len(watches) != 1 || watches[0].Status != SkillOptReviewWatchStatusImported || watches[0].IssueNumber != 67 {
+		t.Fatalf("imported watches = %+v", watches)
+	}
+	if err := store.UpsertSkillOptReviewWatch(ctx, SkillOptReviewWatch{Repo: "owner/previews", IssueNumber: 68, RunID: "run", Status: "paused"}); err == nil || !strings.Contains(err.Error(), "status") {
+		t.Fatalf("invalid status error = %v", err)
+	}
+}
+
+func TestSkillOptTrainPublicationAndReviewWatchStorageIsTransactional(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	session := SkillOptTrainSession{ID: "session-1", TemplateID: "planner", State: "review_published"}
+	iteration := SkillOptTrainIteration{ID: "session-1-001", SessionID: "session-1", EvalRunID: "review-001", State: "review_published", IssueRepo: "owner/review", IssueNumber: 8}
+	watch := SkillOptReviewWatch{Repo: "owner/review", IssueNumber: 8, RunID: "review-001", Status: SkillOptReviewWatchStatusWatching}
+	if err := store.UpsertSkillOptTrainSessionIterationAndReviewWatch(ctx, session, iteration, watch); err != nil {
+		t.Fatalf("UpsertSkillOptTrainSessionIterationAndReviewWatch returned error: %v", err)
+	}
+	storedIteration, err := store.GetSkillOptTrainIteration(ctx, "session-1-001")
+	if err != nil {
+		t.Fatalf("GetSkillOptTrainIteration returned error: %v", err)
+	}
+	storedWatch, err := store.GetSkillOptReviewWatch(ctx, "owner/review", 8)
+	if err != nil {
+		t.Fatalf("GetSkillOptReviewWatch returned error: %v", err)
+	}
+	if storedIteration.State != "review_published" || storedWatch.RunID != "review-001" {
+		t.Fatalf("stored iteration=%+v watch=%+v", storedIteration, storedWatch)
+	}
+
+	if err := store.UpsertSkillOptTrainSessionIterationAndReviewWatch(ctx,
+		SkillOptTrainSession{ID: "session-2", TemplateID: "planner", State: "review_published"},
+		SkillOptTrainIteration{ID: "session-2-001", SessionID: "session-2", EvalRunID: "review-002", State: "review_published", IssueRepo: "owner/review", IssueNumber: 9},
+		SkillOptReviewWatch{Repo: "owner/review", IssueNumber: 9, RunID: "review-002", Status: "paused"},
+	); err == nil || !strings.Contains(err.Error(), "status") {
+		t.Fatalf("invalid transactional watch error = %v", err)
+	}
+	if _, err := store.GetSkillOptTrainSession(ctx, "session-2"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("invalid transactional upsert stored session err=%v", err)
 	}
 }
 

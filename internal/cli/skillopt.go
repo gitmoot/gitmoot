@@ -3399,6 +3399,8 @@ type skillOptTrainReviewPublishResult struct {
 	PreviewURLs int
 }
 
+const skillOptReviewWatchDefaultStaleThreshold = 24 * time.Hour
+
 func autoSyncSkillOptTrainReviewFeedback(ctx context.Context, paths config.Paths, store *db.Store, iteration db.SkillOptTrainIteration) ([]string, bool) {
 	repoText := strings.TrimSpace(iteration.IssueRepo)
 	issueNumber := iteration.IssueNumber
@@ -3518,7 +3520,11 @@ func publishSkillOptTrainReview(ctx context.Context, paths config.Paths, store *
 	dbMetadata["status"] = "published"
 	session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "review", dbMetadata)
 	iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "review", dbMetadata)
-	if err := store.UpsertSkillOptTrainSessionAndIteration(ctx, session, iteration); err != nil {
+	watch, watchErr := skillOptTrainReviewWatch(ctx, store, iteration, published.Repo, published.IssueNumber, published.URL, previewURLs, "gitmoot skillopt train continue")
+	if watchErr != nil {
+		return skillOptTrainReviewPublishResult{}, fmt.Errorf("review was published at %s but watch registration preparation failed: %w", published.URL, watchErr)
+	}
+	if err := store.UpsertSkillOptTrainSessionIterationAndReviewWatch(ctx, session, iteration, watch); err != nil {
 		if externalMarkerErr != nil {
 			return skillOptTrainReviewPublishResult{}, fmt.Errorf("%w; review was published at %s but recovery marker write failed: %v", err, published.URL, externalMarkerErr)
 		}
@@ -3566,11 +3572,60 @@ func recoverSkillOptTrainReviewPublication(ctx context.Context, paths config.Pat
 	}
 	session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "review", metadata)
 	iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "review", metadata)
-	if err := store.UpsertSkillOptTrainSessionAndIteration(ctx, session, iteration); err != nil {
+	watch, err := skillOptTrainReviewWatch(ctx, store, iteration, repo, issueNumber, url, previewURLs, "gitmoot skillopt train recover")
+	if err != nil {
+		return skillOptTrainReviewPublishResult{}, true, err
+	}
+	if err := store.UpsertSkillOptTrainSessionIterationAndReviewWatch(ctx, session, iteration, watch); err != nil {
 		return skillOptTrainReviewPublishResult{}, true, err
 	}
 	_ = removeSkillOptTrainReviewRecovery(paths, session, iteration)
 	return skillOptTrainReviewPublishResult{Repo: repo, IssueNumber: issueNumber, URL: url, PreviewURLs: previewURLs}, true, nil
+}
+
+func skillOptTrainReviewWatch(ctx context.Context, store *db.Store, iteration db.SkillOptTrainIteration, repo github.Repository, issueNumber int64, url string, previewURLs int, source string) (db.SkillOptReviewWatch, error) {
+	if store == nil {
+		return db.SkillOptReviewWatch{}, errors.New("store is required")
+	}
+	runID := strings.TrimSpace(iteration.EvalRunID)
+	if runID == "" {
+		return db.SkillOptReviewWatch{}, errors.New("train review watch run id is required")
+	}
+	items, err := store.ListEvalReviewItems(ctx, runID)
+	if err != nil {
+		return db.SkillOptReviewWatch{}, err
+	}
+	itemIDs := make([]string, 0, len(items))
+	for _, item := range items {
+		if itemID := strings.TrimSpace(item.ItemID); itemID != "" {
+			itemIDs = append(itemIDs, itemID)
+		}
+	}
+	itemIDsJSON, err := json.Marshal(itemIDs)
+	if err != nil {
+		return db.SkillOptReviewWatch{}, err
+	}
+	metadata := map[string]any{
+		"session_id":   strings.TrimSpace(iteration.SessionID),
+		"iteration_id": strings.TrimSpace(iteration.ID),
+		"issue_url":    strings.TrimSpace(url),
+		"preview_urls": previewURLs,
+		"source":       strings.TrimSpace(source),
+	}
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		return db.SkillOptReviewWatch{}, err
+	}
+	return db.SkillOptReviewWatch{
+		Repo:                  repo.FullName(),
+		IssueNumber:           issueNumber,
+		RunID:                 runID,
+		ExpectedItemIDsJSON:   string(itemIDsJSON),
+		Status:                db.SkillOptReviewWatchStatusWatching,
+		StaleAfter:            time.Now().UTC().Add(skillOptReviewWatchDefaultStaleThreshold).Format(time.RFC3339Nano),
+		StaleThresholdSeconds: int64(skillOptReviewWatchDefaultStaleThreshold.Seconds()),
+		MetadataJSON:          string(metadataJSON),
+	}, nil
 }
 
 func writeSkillOptTrainReviewRecovery(paths config.Paths, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, metadata map[string]any) error {

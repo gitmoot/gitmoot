@@ -1484,6 +1484,16 @@ func TestSkillOptTrainContinueGeneratesRequiredVuePreviewBundles(t *testing.T) {
 		strings.Contains(fakeGitHub.createdIssue.Body, `"renderer":"vue-vite"`) {
 		t.Fatalf("created preview review issue = %+v\n%s", fakeGitHub.createdIssue, fakeGitHub.createdIssue.Body)
 	}
+	watch, err := store.GetSkillOptReviewWatch(context.Background(), "owner/previews", 8)
+	if err != nil {
+		t.Fatalf("GetSkillOptReviewWatch returned error: %v", err)
+	}
+	if watch.RunID != "preview-train-review-001" ||
+		watch.Status != db.SkillOptReviewWatchStatusWatching ||
+		watch.StaleThresholdSeconds != int64(skillOptReviewWatchDefaultStaleThreshold.Seconds()) ||
+		!strings.Contains(watch.ExpectedItemIDsJSON, "hero-saas") {
+		t.Fatalf("review watch = %+v", watch)
+	}
 	if _, err := os.Stat(filepath.Join(previewDir, "runs", "preview-train-review-001", "hero-saas", "a", "index.html")); err != nil {
 		t.Fatalf("preview index was not published: %v", err)
 	}

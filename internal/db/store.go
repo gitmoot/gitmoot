@@ -223,6 +223,22 @@ type SkillOptTrainIteration struct {
 	UpdatedAt             string
 }
 
+type SkillOptReviewWatch struct {
+	Repo                  string
+	IssueNumber           int64
+	RunID                 string
+	ExpectedItemIDsJSON   string
+	Status                string
+	LastSeenCommentID     int64
+	LastImportErrorHash   string
+	StaleAfter            string
+	StaleThresholdSeconds int64
+	StaleNotified         bool
+	MetadataJSON          string
+	CreatedAt             string
+	UpdatedAt             string
+}
+
 const (
 	EvalRunModeExplore  = "explore"
 	EvalRunModeRefine   = "refine"
@@ -232,6 +248,12 @@ const (
 	ExplorationLevelHigh   = "high"
 	ExplorationLevelMedium = "medium"
 	ExplorationLevelLow    = "low"
+
+	SkillOptReviewWatchStatusWatching      = "watching"
+	SkillOptReviewWatchStatusImported      = "imported"
+	SkillOptReviewWatchStatusClosed        = "closed"
+	SkillOptReviewWatchStatusStaleNotified = "stale_notified"
+	SkillOptReviewWatchStatusFailed        = "failed"
 )
 
 type EvalReviewItem struct {
@@ -2124,6 +2146,36 @@ func (s *Store) UpsertSkillOptTrainSessionAndIteration(ctx context.Context, sess
 	return tx.Commit()
 }
 
+func (s *Store) UpsertSkillOptTrainSessionIterationAndReviewWatch(ctx context.Context, session SkillOptTrainSession, iteration SkillOptTrainIteration, watch SkillOptReviewWatch) error {
+	session, err := normalizeSkillOptTrainSession(session)
+	if err != nil {
+		return err
+	}
+	iteration, err = normalizeSkillOptTrainIteration(iteration)
+	if err != nil {
+		return err
+	}
+	watch, err = normalizeSkillOptReviewWatch(watch)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := upsertSkillOptTrainSessionExec(ctx, tx, session); err != nil {
+		return err
+	}
+	if err := upsertSkillOptTrainIterationExec(ctx, tx, iteration); err != nil {
+		return err
+	}
+	if err := upsertSkillOptReviewWatchExec(ctx, tx, watch); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) UpsertSkillOptTrainNextIteration(ctx context.Context, session SkillOptTrainSession, iteration SkillOptTrainIteration, run EvalRun, items []EvalReviewItem) error {
 	session, err := normalizeSkillOptTrainSession(session)
 	if err != nil {
@@ -2263,6 +2315,110 @@ func (s *Store) GetSkillOptTrainIterationByEvalRun(ctx context.Context, evalRunI
 		ORDER BY rowid DESC
 		LIMIT 1`, strings.TrimSpace(evalRunID))
 	return scanSkillOptTrainIteration(row)
+}
+
+func (s *Store) UpsertSkillOptReviewWatch(ctx context.Context, watch SkillOptReviewWatch) error {
+	watch, err := normalizeSkillOptReviewWatch(watch)
+	if err != nil {
+		return err
+	}
+	return upsertSkillOptReviewWatchExec(ctx, s.db, watch)
+}
+
+func upsertSkillOptReviewWatchExec(ctx context.Context, exec sqlExecer, watch SkillOptReviewWatch) error {
+	_, err := exec.ExecContext(ctx, `INSERT INTO skillopt_review_watches(
+			repo, issue_number, run_id, expected_item_ids_json, status, last_seen_comment_id,
+			last_import_error_hash, stale_after, stale_threshold_seconds, stale_notified,
+			metadata_json, created_at, updated_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+		ON CONFLICT(repo, issue_number) DO UPDATE SET
+			run_id = excluded.run_id,
+			expected_item_ids_json = excluded.expected_item_ids_json,
+			status = excluded.status,
+			last_seen_comment_id = excluded.last_seen_comment_id,
+			last_import_error_hash = excluded.last_import_error_hash,
+			stale_after = excluded.stale_after,
+			stale_threshold_seconds = excluded.stale_threshold_seconds,
+			stale_notified = excluded.stale_notified,
+			metadata_json = excluded.metadata_json,
+			updated_at = CURRENT_TIMESTAMP`,
+		watch.Repo, watch.IssueNumber, watch.RunID, watch.ExpectedItemIDsJSON, watch.Status, watch.LastSeenCommentID,
+		watch.LastImportErrorHash, watch.StaleAfter, watch.StaleThresholdSeconds, boolInt(watch.StaleNotified), watch.MetadataJSON)
+	return err
+}
+
+func normalizeSkillOptReviewWatch(watch SkillOptReviewWatch) (SkillOptReviewWatch, error) {
+	watch.Repo = strings.TrimSpace(watch.Repo)
+	if watch.Repo == "" {
+		return SkillOptReviewWatch{}, errors.New("skillopt review watch repo is required")
+	}
+	if watch.IssueNumber <= 0 {
+		return SkillOptReviewWatch{}, errors.New("skillopt review watch issue number is required")
+	}
+	watch.RunID = strings.TrimSpace(watch.RunID)
+	if watch.RunID == "" {
+		return SkillOptReviewWatch{}, errors.New("skillopt review watch run id is required")
+	}
+	watch.ExpectedItemIDsJSON = strings.TrimSpace(watch.ExpectedItemIDsJSON)
+	watch.Status = strings.TrimSpace(strings.ToLower(watch.Status))
+	if watch.Status == "" {
+		watch.Status = SkillOptReviewWatchStatusWatching
+	}
+	switch watch.Status {
+	case SkillOptReviewWatchStatusWatching, SkillOptReviewWatchStatusImported, SkillOptReviewWatchStatusClosed, SkillOptReviewWatchStatusStaleNotified, SkillOptReviewWatchStatusFailed:
+	default:
+		return SkillOptReviewWatch{}, fmt.Errorf("skillopt review watch status %q is not supported", watch.Status)
+	}
+	watch.LastImportErrorHash = strings.TrimSpace(watch.LastImportErrorHash)
+	watch.StaleAfter = strings.TrimSpace(watch.StaleAfter)
+	if watch.StaleThresholdSeconds < 0 {
+		return SkillOptReviewWatch{}, errors.New("skillopt review watch stale threshold must not be negative")
+	}
+	watch.MetadataJSON = strings.TrimSpace(watch.MetadataJSON)
+	return watch, nil
+}
+
+func (s *Store) GetSkillOptReviewWatch(ctx context.Context, repo string, issueNumber int64) (SkillOptReviewWatch, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT repo, issue_number, run_id, expected_item_ids_json, status,
+			last_seen_comment_id, last_import_error_hash, stale_after, stale_threshold_seconds,
+			stale_notified, metadata_json, created_at, updated_at
+		FROM skillopt_review_watches
+		WHERE repo = ? AND issue_number = ?`, strings.TrimSpace(repo), issueNumber)
+	return scanSkillOptReviewWatch(row)
+}
+
+func (s *Store) ListSkillOptReviewWatches(ctx context.Context, status string) ([]SkillOptReviewWatch, error) {
+	status = strings.TrimSpace(strings.ToLower(status))
+	var rows *sql.Rows
+	var err error
+	if status == "" {
+		rows, err = s.db.QueryContext(ctx, `SELECT repo, issue_number, run_id, expected_item_ids_json, status,
+				last_seen_comment_id, last_import_error_hash, stale_after, stale_threshold_seconds,
+				stale_notified, metadata_json, created_at, updated_at
+			FROM skillopt_review_watches
+			ORDER BY rowid`)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `SELECT repo, issue_number, run_id, expected_item_ids_json, status,
+				last_seen_comment_id, last_import_error_hash, stale_after, stale_threshold_seconds,
+				stale_notified, metadata_json, created_at, updated_at
+			FROM skillopt_review_watches
+			WHERE status = ?
+			ORDER BY rowid`, status)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	watches := []SkillOptReviewWatch{}
+	for rows.Next() {
+		watch, err := scanSkillOptReviewWatch(rows)
+		if err != nil {
+			return nil, err
+		}
+		watches = append(watches, watch)
+	}
+	return watches, rows.Err()
 }
 
 func (s *Store) UpsertEvalReviewItem(ctx context.Context, item EvalReviewItem) error {
@@ -2579,6 +2735,18 @@ func scanSkillOptTrainIteration(row interface{ Scan(dest ...any) error }) (Skill
 	return iteration, nil
 }
 
+func scanSkillOptReviewWatch(row interface{ Scan(dest ...any) error }) (SkillOptReviewWatch, error) {
+	var watch SkillOptReviewWatch
+	var staleNotified int
+	if err := row.Scan(&watch.Repo, &watch.IssueNumber, &watch.RunID, &watch.ExpectedItemIDsJSON, &watch.Status,
+		&watch.LastSeenCommentID, &watch.LastImportErrorHash, &watch.StaleAfter, &watch.StaleThresholdSeconds,
+		&staleNotified, &watch.MetadataJSON, &watch.CreatedAt, &watch.UpdatedAt); err != nil {
+		return SkillOptReviewWatch{}, err
+	}
+	watch.StaleNotified = staleNotified != 0
+	return watch, nil
+}
+
 func scanEvalReviewItem(row interface{ Scan(dest ...any) error }) (EvalReviewItem, error) {
 	var item EvalReviewItem
 	if err := row.Scan(&item.ID, &item.RunID, &item.ItemID, &item.Title, &item.SourceArtifactID, &item.BaselineArtifactID,
@@ -2594,6 +2762,13 @@ func scanEvalReviewOption(row interface{ Scan(dest ...any) error }) (EvalReviewO
 		return EvalReviewOption{}, err
 	}
 	return option, nil
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func (s *Store) UpsertFeedbackEvent(ctx context.Context, event FeedbackEvent) error {
@@ -3894,5 +4069,26 @@ ALTER TABLE ranked_feedback_events ADD COLUMN required_improvements_json TEXT NO
 ALTER TABLE resource_locks ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE resource_locks ADD COLUMN owner_hostname TEXT NOT NULL DEFAULT '';
 ALTER TABLE resource_locks ADD COLUMN command_hash TEXT NOT NULL DEFAULT '';
+	`,
+	`
+CREATE TABLE skillopt_review_watches (
+	repo TEXT NOT NULL,
+	issue_number INTEGER NOT NULL,
+	run_id TEXT NOT NULL,
+	expected_item_ids_json TEXT NOT NULL DEFAULT '',
+	status TEXT NOT NULL DEFAULT 'watching',
+	last_seen_comment_id INTEGER NOT NULL DEFAULT 0,
+	last_import_error_hash TEXT NOT NULL DEFAULT '',
+	stale_after TEXT NOT NULL DEFAULT '',
+	stale_threshold_seconds INTEGER NOT NULL DEFAULT 0,
+	stale_notified INTEGER NOT NULL DEFAULT 0,
+	metadata_json TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY(repo, issue_number)
+);
+
+CREATE INDEX idx_skillopt_review_watches_status ON skillopt_review_watches(status);
+CREATE INDEX idx_skillopt_review_watches_run_id ON skillopt_review_watches(run_id);
 	`,
 }
