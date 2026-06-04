@@ -55,16 +55,17 @@ type feedbackFile struct {
 }
 
 type feedbackFileEntry struct {
-	ItemID         string              `yaml:"item_id"`
-	Choice         string              `yaml:"choice"`
-	Ranking        []string            `yaml:"ranking,omitempty"`
-	Winner         string              `yaml:"winner,omitempty"`
-	UsefulTraits   map[string][]string `yaml:"useful_traits,omitempty"`
-	RejectedTraits map[string][]string `yaml:"rejected_traits,omitempty"`
-	Quality        string              `yaml:"quality"`
-	ContinueMode   string              `yaml:"continue_mode"`
-	Promote        string              `yaml:"promote"`
-	Reasoning      string              `yaml:"reasoning,omitempty"`
+	ItemID               string              `yaml:"item_id"`
+	Choice               string              `yaml:"choice"`
+	Ranking              []string            `yaml:"ranking,omitempty"`
+	Winner               string              `yaml:"winner,omitempty"`
+	UsefulTraits         map[string][]string `yaml:"useful_traits,omitempty"`
+	RejectedTraits       map[string][]string `yaml:"rejected_traits,omitempty"`
+	RequiredImprovements []string            `yaml:"required_improvements,omitempty"`
+	Quality              string              `yaml:"quality"`
+	ContinueMode         string              `yaml:"continue_mode"`
+	Promote              string              `yaml:"promote"`
+	Reasoning            string              `yaml:"reasoning,omitempty"`
 }
 
 type ImportResult struct {
@@ -494,6 +495,10 @@ func rankedFeedbackEventFromEntry(runID string, itemID string, entry feedbackFil
 	if err != nil {
 		return db.RankedFeedbackEvent{}, fmt.Errorf("rejected_traits: %w", err)
 	}
+	requiredImprovementsJSON, err := rankedStringListJSON(entry.RequiredImprovements)
+	if err != nil {
+		return db.RankedFeedbackEvent{}, fmt.Errorf("required_improvements: %w", err)
+	}
 	winner := normalizeReviewOptionLabel(entry.Winner)
 	if winner == "" {
 		winner = ranking[0]
@@ -510,20 +515,21 @@ func rankedFeedbackEventFromEntry(runID string, itemID string, entry feedbackFil
 		return db.RankedFeedbackEvent{}, err
 	}
 	return db.RankedFeedbackEvent{
-		RunID:              strings.TrimSpace(runID),
-		ItemID:             strings.TrimSpace(itemID),
-		RankingJSON:        string(rankingJSON),
-		Winner:             winner,
-		UsefulTraitsJSON:   usefulTraitsJSON,
-		RejectedTraitsJSON: rejectedTraitsJSON,
-		Quality:            quality,
-		ContinueMode:       continueMode,
-		Promote:            promote,
-		Reasoning:          strings.TrimSpace(entry.Reasoning),
-		Reviewer:           strings.TrimSpace(reviewer),
-		Source:             strings.TrimSpace(source),
-		SourceURL:          strings.TrimSpace(sourceURL),
-		CreatedAt:          strings.TrimSpace(createdAt),
+		RunID:                    strings.TrimSpace(runID),
+		ItemID:                   strings.TrimSpace(itemID),
+		RankingJSON:              string(rankingJSON),
+		Winner:                   winner,
+		UsefulTraitsJSON:         usefulTraitsJSON,
+		RejectedTraitsJSON:       rejectedTraitsJSON,
+		RequiredImprovementsJSON: requiredImprovementsJSON,
+		Quality:                  quality,
+		ContinueMode:             continueMode,
+		Promote:                  promote,
+		Reasoning:                rankedFeedbackReasoning(entry),
+		Reviewer:                 strings.TrimSpace(reviewer),
+		Source:                   strings.TrimSpace(source),
+		SourceURL:                strings.TrimSpace(sourceURL),
+		CreatedAt:                strings.TrimSpace(createdAt),
 	}, nil
 }
 
@@ -612,6 +618,29 @@ func rankedTraitJSON(traits map[string][]string) (string, error) {
 		return "", err
 	}
 	return string(content), nil
+}
+
+func rankedStringListJSON(values []string) (string, error) {
+	values = trimStringList(values)
+	if len(values) == 0 {
+		return "", nil
+	}
+	content, err := json.Marshal(values)
+	if err != nil {
+		return "", err
+	}
+	return string(content), nil
+}
+
+func rankedFeedbackReasoning(entry feedbackFileEntry) string {
+	reasoning := strings.TrimSpace(entry.Reasoning)
+	if reasoning != "" {
+		return reasoning
+	}
+	if len(entry.Ranking) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(entry.Choice)
 }
 
 func normalizeReviewOptionLabel(label string) string {
@@ -869,6 +898,7 @@ func normalizeFeedbackFileEntries(feedback *feedbackFile) {
 		feedback.Items[index].Winner = strings.TrimSpace(feedback.Items[index].Winner)
 		feedback.Items[index].UsefulTraits = trimTraitMap(feedback.Items[index].UsefulTraits)
 		feedback.Items[index].RejectedTraits = trimTraitMap(feedback.Items[index].RejectedTraits)
+		feedback.Items[index].RequiredImprovements = trimStringList(feedback.Items[index].RequiredImprovements)
 		feedback.Items[index].Quality = strings.TrimSpace(feedback.Items[index].Quality)
 		feedback.Items[index].ContinueMode = strings.TrimSpace(feedback.Items[index].ContinueMode)
 		feedback.Items[index].Promote = strings.TrimSpace(feedback.Items[index].Promote)

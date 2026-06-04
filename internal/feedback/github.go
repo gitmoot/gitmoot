@@ -674,6 +674,23 @@ func trimTraitMap(values map[string][]string) map[string][]string {
 	return trimmed
 }
 
+func trimStringList(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	trimmed := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			trimmed = append(trimmed, value)
+		}
+	}
+	if len(trimmed) == 0 {
+		return nil
+	}
+	return trimmed
+}
+
 func cloneTraitMap(values map[string][]string) map[string][]string {
 	if len(values) == 0 {
 		return nil

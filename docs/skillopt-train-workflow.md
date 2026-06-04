@@ -198,6 +198,9 @@ items:
     rejected_traits:
       B:
         - too vague about rollback
+    required_improvements:
+      - clearer owner handoff
+      - stronger rollout checks
     reasoning: C is strongest, but A has a better risk summary.
 ```
 

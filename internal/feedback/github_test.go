@@ -456,7 +456,7 @@ func TestGitHubCollectorSyncImportsRankedYAMLCommentWithColonItemID(t *testing.T
 	fake := &fakeFeedbackGitHub{
 		comments: map[int64][]github.IssueComment{
 			42: {
-				{ID: 1, Body: "```yaml\nrun_id: ranked-1\nitems:\n  - item_id: scenario:landing\n    ranking:\n      - C > A > D > B\n    quality: poor\n    continue_mode: explore\n    promote: no\n    reasoning: option c is strongest\n```\n", URL: "https://github.com/owner/repo/issues/42#issuecomment-1", Author: "alice", CreatedAt: "2026-06-02T10:00:00Z"},
+				{ID: 1, Body: "```yaml\nrun_id: ranked-1\nitems:\n  - item_id: scenario:landing\n    ranking:\n      - C > A > D > B\n    quality: poor\n    continue_mode: explore\n    promote: no\n    choice: option c is strongest, but improve mobile and visuals\n    required_improvements:\n      - better mobile layout\n      - stronger product visuals\n```\n", URL: "https://github.com/owner/repo/issues/42#issuecomment-1", Author: "alice", CreatedAt: "2026-06-02T10:00:00Z"},
 			},
 		},
 	}
@@ -474,6 +474,9 @@ func TestGitHubCollectorSyncImportsRankedYAMLCommentWithColonItemID(t *testing.T
 	}
 	if result.RankedFeedbackEvents[0].Quality != "poor" || result.RankedFeedbackEvents[0].ContinueMode != "explore" || result.RankedFeedbackEvents[0].Promote != "no" {
 		t.Fatalf("ranked event signals = %+v", result.RankedFeedbackEvents[0])
+	}
+	if !strings.Contains(result.RankedFeedbackEvents[0].Reasoning, "improve mobile") || !strings.Contains(result.RankedFeedbackEvents[0].RequiredImprovementsJSON, "stronger product visuals") {
+		t.Fatalf("ranked event reasoning/improvements = %+v", result.RankedFeedbackEvents[0])
 	}
 }
 

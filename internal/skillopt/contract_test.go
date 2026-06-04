@@ -344,21 +344,26 @@ func TestExportTrainingPackageIncludesRankedExplorationFeedback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal rejected traits: %v", err)
 	}
+	required, err := json.Marshal([]string{"stronger visual identity", "responsive hero"})
+	if err != nil {
+		t.Fatalf("marshal required improvements: %v", err)
+	}
 	if err := store.UpsertRankedFeedbackEvent(ctx, db.RankedFeedbackEvent{
-		RunID:              "ranked-1",
-		ItemID:             "item-001",
-		RankingJSON:        string(ranking),
-		Winner:             "c",
-		UsefulTraitsJSON:   string(useful),
-		RejectedTraitsJSON: string(rejected),
-		Quality:            "acceptable",
-		ContinueMode:       db.EvalRunModeRefine,
-		Promote:            "no",
-		Reasoning:          "C is the clearest direction.",
-		Reviewer:           "jerry",
-		Source:             "github",
-		SourceURL:          "https://github.com/owner/repo/issues/1#issuecomment-1",
-		CreatedAt:          "2026-06-02T10:00:00Z",
+		RunID:                    "ranked-1",
+		ItemID:                   "item-001",
+		RankingJSON:              string(ranking),
+		Winner:                   "c",
+		UsefulTraitsJSON:         string(useful),
+		RejectedTraitsJSON:       string(rejected),
+		RequiredImprovementsJSON: string(required),
+		Quality:                  "acceptable",
+		ContinueMode:             db.EvalRunModeRefine,
+		Promote:                  "no",
+		Reasoning:                "C is the clearest direction.",
+		Reviewer:                 "jerry",
+		Source:                   "github",
+		SourceURL:                "https://github.com/owner/repo/issues/1#issuecomment-1",
+		CreatedAt:                "2026-06-02T10:00:00Z",
 	}); err != nil {
 		t.Fatalf("UpsertRankedFeedbackEvent returned error: %v", err)
 	}
@@ -382,6 +387,9 @@ func TestExportTrainingPackageIncludesRankedExplorationFeedback(t *testing.T) {
 	}
 	if !strings.Contains(string(pkg.RankedFeedbackEvents[0].UsefulTraits), "clearest explanation") || !strings.Contains(string(pkg.RankedFeedbackEvents[0].RejectedTraits), "too generic") {
 		t.Fatalf("ranked traits useful=%s rejected=%s", pkg.RankedFeedbackEvents[0].UsefulTraits, pkg.RankedFeedbackEvents[0].RejectedTraits)
+	}
+	if !strings.Contains(string(pkg.RankedFeedbackEvents[0].RequiredImprovements), "stronger visual identity") || !strings.Contains(string(pkg.RankedFeedbackEvents[0].RequiredImprovements), "responsive hero") {
+		t.Fatalf("ranked required improvements = %s", pkg.RankedFeedbackEvents[0].RequiredImprovements)
 	}
 	if pkg.RankedFeedbackEvents[0].Quality != "acceptable" || pkg.RankedFeedbackEvents[0].ContinueMode != db.EvalRunModeRefine || pkg.RankedFeedbackEvents[0].Promote != "no" {
 		t.Fatalf("ranked feedback signals = %+v", pkg.RankedFeedbackEvents[0])

@@ -157,21 +157,22 @@ type FeedbackEvent struct {
 }
 
 type RankedFeedbackEvent struct {
-	ID             string          `json:"id"`
-	RunID          string          `json:"run_id"`
-	ItemID         string          `json:"item_id"`
-	Ranking        []string        `json:"ranking"`
-	Winner         string          `json:"winner,omitempty"`
-	UsefulTraits   json.RawMessage `json:"useful_traits,omitempty"`
-	RejectedTraits json.RawMessage `json:"rejected_traits,omitempty"`
-	Quality        string          `json:"quality,omitempty"`
-	ContinueMode   string          `json:"continue_mode,omitempty"`
-	Promote        string          `json:"promote,omitempty"`
-	Reasoning      string          `json:"reasoning,omitempty"`
-	Reviewer       string          `json:"reviewer"`
-	Source         string          `json:"source"`
-	SourceURL      string          `json:"source_url,omitempty"`
-	CreatedAt      string          `json:"created_at"`
+	ID                   string          `json:"id"`
+	RunID                string          `json:"run_id"`
+	ItemID               string          `json:"item_id"`
+	Ranking              []string        `json:"ranking"`
+	Winner               string          `json:"winner,omitempty"`
+	UsefulTraits         json.RawMessage `json:"useful_traits,omitempty"`
+	RejectedTraits       json.RawMessage `json:"rejected_traits,omitempty"`
+	RequiredImprovements json.RawMessage `json:"required_improvements,omitempty"`
+	Quality              string          `json:"quality,omitempty"`
+	ContinueMode         string          `json:"continue_mode,omitempty"`
+	Promote              string          `json:"promote,omitempty"`
+	Reasoning            string          `json:"reasoning,omitempty"`
+	Reviewer             string          `json:"reviewer"`
+	Source               string          `json:"source"`
+	SourceURL            string          `json:"source_url,omitempty"`
+	CreatedAt            string          `json:"created_at"`
 }
 
 type PairwisePreference struct {
@@ -777,22 +778,27 @@ func loadRankedFeedbackEvents(ctx context.Context, store *db.Store, runID string
 		if err != nil {
 			return nil, fmt.Errorf("ranked feedback %s rejected_traits_json: %w", event.ID, err)
 		}
+		requiredImprovements, err := rawJSON(event.RequiredImprovementsJSON)
+		if err != nil {
+			return nil, fmt.Errorf("ranked feedback %s required_improvements_json: %w", event.ID, err)
+		}
 		output = append(output, RankedFeedbackEvent{
-			ID:             event.ID,
-			RunID:          event.RunID,
-			ItemID:         event.ItemID,
-			Ranking:        ranking,
-			Winner:         event.Winner,
-			UsefulTraits:   usefulTraits,
-			RejectedTraits: rejectedTraits,
-			Quality:        event.Quality,
-			ContinueMode:   event.ContinueMode,
-			Promote:        event.Promote,
-			Reasoning:      event.Reasoning,
-			Reviewer:       event.Reviewer,
-			Source:         event.Source,
-			SourceURL:      event.SourceURL,
-			CreatedAt:      event.CreatedAt,
+			ID:                   event.ID,
+			RunID:                event.RunID,
+			ItemID:               event.ItemID,
+			Ranking:              ranking,
+			Winner:               event.Winner,
+			UsefulTraits:         usefulTraits,
+			RejectedTraits:       rejectedTraits,
+			RequiredImprovements: requiredImprovements,
+			Quality:              event.Quality,
+			ContinueMode:         event.ContinueMode,
+			Promote:              event.Promote,
+			Reasoning:            event.Reasoning,
+			Reviewer:             event.Reviewer,
+			Source:               event.Source,
+			SourceURL:            event.SourceURL,
+			CreatedAt:            event.CreatedAt,
 		})
 	}
 	return output, nil

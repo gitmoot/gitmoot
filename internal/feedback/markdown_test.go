@@ -174,10 +174,13 @@ items:
     rejected_traits:
       B:
         - too generic
+    required_improvements:
+      - stronger branding
+      - richer animation
     quality: poor
     continue_mode: explore
     promote: no
-    reasoning: C explains the product best.
+    choice: C explains the product best and still needs more visual polish.
 `
 	if err := os.WriteFile(filepath.Join(packetDir, "feedback.yml"), []byte(feedbackContent), 0o644); err != nil {
 		t.Fatalf("write feedback.yml: %v", err)
@@ -193,7 +196,7 @@ items:
 	if err != nil {
 		t.Fatalf("ListRankedFeedbackEvents returned error: %v", err)
 	}
-	if len(stored) != 1 || stored[0].Winner != "c" || stored[0].Reasoning != "C explains the product best." || stored[0].Source != SourceMarkdown {
+	if len(stored) != 1 || stored[0].Winner != "c" || stored[0].Reasoning != "C explains the product best and still needs more visual polish." || stored[0].Source != SourceMarkdown {
 		t.Fatalf("stored ranked events = %+v", stored)
 	}
 	if stored[0].Quality != "poor" || stored[0].ContinueMode != "explore" || stored[0].Promote != "no" {
@@ -201,6 +204,9 @@ items:
 	}
 	if !strings.Contains(stored[0].UsefulTraitsJSON, `"a":["visual style"]`) || !strings.Contains(stored[0].RejectedTraitsJSON, `"b":["too generic"]`) {
 		t.Fatalf("stored traits useful=%s rejected=%s", stored[0].UsefulTraitsJSON, stored[0].RejectedTraitsJSON)
+	}
+	if !strings.Contains(stored[0].RequiredImprovementsJSON, "stronger branding") || !strings.Contains(stored[0].RequiredImprovementsJSON, "richer animation") {
+		t.Fatalf("stored required improvements = %s", stored[0].RequiredImprovementsJSON)
 	}
 	pairs, err := store.ListPairwisePreferences(ctx, "ranked-1")
 	if err != nil {

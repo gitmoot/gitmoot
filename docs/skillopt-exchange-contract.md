@@ -76,6 +76,8 @@ role, and optional metadata such as preview URLs. Ranked feedback exports:
 - `winner`: optional first-place option
 - `useful_traits`: JSON object keyed by canonical option label
 - `rejected_traits`: JSON object keyed by canonical option label
+- `required_improvements`: JSON array of requested improvements not tied to one
+  option
 - `reasoning`: reviewer notes
 
 Derived `pairwise_preferences` are provided so an optimizer can use simple
@@ -350,6 +352,9 @@ items:
     rejected_traits:
       B:
         - too generic for a developer tool
+    required_improvements:
+      - better mobile layout
+      - stronger product visuals
     reasoning: C is clearest overall, but A has the better visual identity.
 ```
 

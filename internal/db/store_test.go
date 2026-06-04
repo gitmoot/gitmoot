@@ -356,21 +356,23 @@ func TestRankedReviewStorageAndPairwisePreferences(t *testing.T) {
 	rejected, _ := json.Marshal(map[string][]string{
 		"b": {"generic"},
 	})
+	required, _ := json.Marshal([]string{"stronger visuals", "better mobile"})
 	event := RankedFeedbackEvent{
-		RunID:              "run-ranked",
-		ItemID:             "item-001",
-		RankingJSON:        string(ranking),
-		Winner:             "c",
-		UsefulTraitsJSON:   string(useful),
-		RejectedTraitsJSON: string(rejected),
-		Quality:            "Poor",
-		ContinueMode:       "Explore",
-		Promote:            "false",
-		Reasoning:          "C is clearest.",
-		Reviewer:           "jerry",
-		Source:             "github",
-		SourceURL:          "https://github.com/example/repo/pull/1#issuecomment-1",
-		CreatedAt:          "2026-06-02T10:00:00Z",
+		RunID:                    "run-ranked",
+		ItemID:                   "item-001",
+		RankingJSON:              string(ranking),
+		Winner:                   "c",
+		UsefulTraitsJSON:         string(useful),
+		RejectedTraitsJSON:       string(rejected),
+		RequiredImprovementsJSON: string(required),
+		Quality:                  "Poor",
+		ContinueMode:             "Explore",
+		Promote:                  "false",
+		Reasoning:                "C is clearest.",
+		Reviewer:                 "jerry",
+		Source:                   "github",
+		SourceURL:                "https://github.com/example/repo/pull/1#issuecomment-1",
+		CreatedAt:                "2026-06-02T10:00:00Z",
 	}
 	if err := store.UpsertRankedFeedbackEvent(ctx, event); err != nil {
 		t.Fatalf("UpsertRankedFeedbackEvent returned error: %v", err)
@@ -384,6 +386,9 @@ func TestRankedReviewStorageAndPairwisePreferences(t *testing.T) {
 	}
 	if stored[0].Quality != "poor" || stored[0].ContinueMode != "explore" || stored[0].Promote != "no" {
 		t.Fatalf("stored ranked feedback signals = %+v", stored[0])
+	}
+	if !strings.Contains(stored[0].RequiredImprovementsJSON, "stronger visuals") || !strings.Contains(stored[0].RequiredImprovementsJSON, "better mobile") {
+		t.Fatalf("stored required improvements = %s", stored[0].RequiredImprovementsJSON)
 	}
 	pairs, err := store.ListPairwisePreferences(ctx, "run-ranked")
 	if err != nil {
