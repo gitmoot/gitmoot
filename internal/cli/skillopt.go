@@ -12,6 +12,7 @@ import (
 	neturl "net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1783,9 +1784,7 @@ func skillOptTrainCandidateReviewBody(ctx context.Context, store *db.Store, sess
 	if summary := strings.TrimSpace(review.PreferenceSummary); summary != "" {
 		fmt.Fprintf(&builder, "\n### Candidate Summary\n%s\n", summary)
 	}
-	if review.Score != nil {
-		fmt.Fprintf(&builder, "\nScore: `%s`\n", scoreText(review.Score))
-	}
+	skillOptWriteCandidateReviewScores(&builder, review)
 	if strings.TrimSpace(session.PreviewRepo) != "" {
 		fmt.Fprintf(&builder, "\nPreview repo: `%s`\n", session.PreviewRepo)
 	}
@@ -1803,10 +1802,209 @@ func skillOptTrainCandidateReviewBody(ctx context.Context, store *db.Store, sess
 	}
 	builder.WriteString("\n### Decision\n")
 	usesCustomHome := strings.TrimSpace(commandHome) != ""
-	fmt.Fprintf(&builder, "- Promote: `%s`\n", skillOptTrainCandidateDecisionCommand(usesCustomHome, session.ID, "--promote", candidateID, false))
+	promotable, reason := skillOptCandidateReviewPromotability(review)
+	if promotable {
+		fmt.Fprintf(&builder, "- Promote: `%s`\n", skillOptTrainCandidateDecisionCommand(usesCustomHome, session.ID, "--promote", candidateID, false))
+	} else {
+		fmt.Fprintf(&builder, "- Promote: unavailable because %s.\n", reason)
+	}
 	fmt.Fprintf(&builder, "- Reject: `%s`\n", skillOptTrainCandidateDecisionCommand(usesCustomHome, session.ID, "--reject", candidateID, true))
 	fmt.Fprintf(&builder, "- Continue: `%s` after promote/reject completes.\n", skillOptTrainStartNextCommand(usesCustomHome, session.ID))
 	return builder.String(), nil
+}
+
+func skillOptWriteCandidateReviewScores(builder *strings.Builder, review db.AgentTemplateCandidateReview) {
+	evalReport := decodedSkillOptMetadata(review.EvalReportJSON)
+	summaryMetadata := decodedSkillOptMetadata(review.SummaryMetadataJSON)
+	builder.WriteString("\n### Scores And Gate\n")
+	fmt.Fprintf(builder, "- Selection score: `%s`\n", scoreText(review.Score))
+	skillOptWriteCandidateReviewScoreLine(builder, "Best selection hard", metadataFloatPtr(evalReport, "best_selection_hard"))
+	skillOptWriteCandidateReviewScoreLine(builder, "Best selection soft", metadataFloatPtr(evalReport, "best_selection_soft"))
+	skillOptWriteCandidateReviewScoreLine(builder, "Baseline selection hard", metadataFloatPtr(evalReport, "baseline_selection_hard"))
+	skillOptWriteCandidateReviewScoreLine(builder, "Baseline selection soft", metadataFloatPtr(evalReport, "baseline_selection_soft"))
+	if score := metadataFloatPtr(evalReport, "score"); score != nil {
+		fmt.Fprintf(builder, "- Test score: `%s`\n", scoreText(score))
+	} else {
+		builder.WriteString("- Test score: `-`\n")
+	}
+	if hard := metadataFloatPtr(evalReport, "hard"); hard != nil {
+		fmt.Fprintf(builder, "- Hard score: `%s`\n", scoreText(hard))
+	}
+	if soft := metadataFloatPtr(evalReport, "soft"); soft != nil {
+		fmt.Fprintf(builder, "- Soft score: `%s`\n", scoreText(soft))
+	}
+	skillOptWriteCandidateReviewScoreLine(builder, "Test hard", metadataFloatPtr(evalReport, "test_hard"))
+	skillOptWriteCandidateReviewScoreLine(builder, "Test soft", metadataFloatPtr(evalReport, "test_soft"))
+	skillOptWriteCandidateReviewScoreLine(builder, "Baseline test hard", metadataFloatPtr(evalReport, "baseline_test_hard"))
+	skillOptWriteCandidateReviewScoreLine(builder, "Baseline test soft", metadataFloatPtr(evalReport, "baseline_test_soft"))
+	if dimensions := metadataScoreMap(evalReport, "dimension_scores"); len(dimensions) > 0 {
+		labels := make([]string, 0, len(dimensions))
+		for label := range dimensions {
+			labels = append(labels, label)
+		}
+		sort.Strings(labels)
+		parts := make([]string, 0, len(labels))
+		for _, label := range labels {
+			score := dimensions[label]
+			parts = append(parts, fmt.Sprintf("%s=%s", label, scoreText(&score)))
+		}
+		fmt.Fprintf(builder, "- Dimension scores: `%s`\n", strings.Join(parts, ", "))
+	}
+	fmt.Fprintf(builder, "- Gate status: `%s`\n", firstNonEmpty(
+		metadataString(evalReport, "gate_status"),
+		metadataString(evalReport, "gate"),
+		metadataString(summaryMetadata, "gate_status"),
+		metadataString(summaryMetadata, "gate"),
+		"unknown",
+	))
+	fmt.Fprintf(builder, "- No-op status: `%s`\n", skillOptCandidateReviewNoOpStatus(evalReport, summaryMetadata))
+	promotable, reason := skillOptCandidateReviewPromotability(review)
+	if promotable {
+		builder.WriteString("- Promotability: `promotable`\n")
+	} else {
+		fmt.Fprintf(builder, "- Promotability: `not promotable: %s`\n", reason)
+	}
+}
+
+func skillOptWriteCandidateReviewScoreLine(builder *strings.Builder, label string, score *float64) {
+	if score != nil {
+		fmt.Fprintf(builder, "- %s: `%s`\n", label, scoreText(score))
+	}
+}
+
+func skillOptCandidateReviewPromotability(review db.AgentTemplateCandidateReview) (bool, string) {
+	for _, metadata := range []map[string]any{
+		decodedSkillOptMetadata(review.EvalReportJSON),
+		decodedSkillOptMetadata(review.SummaryMetadataJSON),
+	} {
+		if promotable := metadataBoolPtr(metadata, "promotable"); promotable != nil && !*promotable {
+			reason := metadataString(metadata, "no_candidate_reason")
+			if reason == "" {
+				reason = metadataString(metadata, "promotability_reason")
+			}
+			if reason == "" {
+				reason = metadataString(metadata, "reason")
+			}
+			if reason == "" {
+				reason = skillOptCandidateReviewNoOpMetadataReason(metadata)
+			}
+			if reason == "" {
+				reason = "candidate metadata marks it as not promotable"
+			}
+			return false, reason
+		}
+		if skillOptCandidateReviewExplicitPromotable(metadata) {
+			continue
+		}
+		if reason := metadataString(metadata, "no_candidate_reason"); reason != "" {
+			return false, reason
+		}
+		if reason := skillOptCandidateReviewNoOpMetadataReason(metadata); reason != "" {
+			return false, reason
+		}
+	}
+	return true, ""
+}
+
+func skillOptCandidateReviewNoOpStatus(evalReport map[string]any, summaryMetadata map[string]any) string {
+	for _, metadata := range []map[string]any{evalReport, summaryMetadata} {
+		if skillOptCandidateReviewExplicitPromotable(metadata) {
+			continue
+		}
+		if reason := metadataString(metadata, "no_candidate_reason"); reason != "" {
+			return "blocked: " + reason
+		}
+	}
+	for _, metadata := range []map[string]any{summaryMetadata, evalReport} {
+		if skillOptCandidateReviewExplicitPromotable(metadata) {
+			continue
+		}
+		if reason := skillOptCandidateReviewNoOpMetadataReason(metadata); reason != "" {
+			return "blocked: " + reason
+		}
+	}
+	bestOrigin := firstNonEmpty(metadataString(summaryMetadata, "best_origin"), metadataString(evalReport, "best_origin"))
+	totalAccepts := firstNonEmpty(metadataString(summaryMetadata, "total_accepts"), metadataString(evalReport, "total_accepts"))
+	if bestOrigin != "" || totalAccepts != "" {
+		parts := []string{"not detected"}
+		if bestOrigin != "" {
+			parts = append(parts, "best_origin="+bestOrigin)
+		}
+		if totalAccepts != "" {
+			parts = append(parts, "total_accepts="+totalAccepts)
+		}
+		return strings.Join(parts, "; ")
+	}
+	return "not reported"
+}
+
+func skillOptCandidateReviewExplicitPromotable(metadata map[string]any) bool {
+	promotable := metadataBoolPtr(metadata, "promotable")
+	return promotable != nil && *promotable
+}
+
+func skillOptCandidateReviewNoOpMetadataReason(metadata map[string]any) string {
+	if strings.EqualFold(metadataString(metadata, "best_origin"), "initial_skill") {
+		return "best_origin_initial_skill"
+	}
+	if metadataString(metadata, "total_accepts") == "0" {
+		return "total_accepts_zero"
+	}
+	return ""
+}
+
+func metadataFloatPtr(metadata map[string]any, key string) *float64 {
+	switch value := metadata[key].(type) {
+	case float64:
+		return &value
+	case int:
+		score := float64(value)
+		return &score
+	case int64:
+		score := float64(value)
+		return &score
+	case json.Number:
+		if score, err := value.Float64(); err == nil {
+			return &score
+		}
+	case string:
+		if score, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err == nil {
+			return &score
+		}
+	}
+	return nil
+}
+
+func metadataBoolPtr(metadata map[string]any, key string) *bool {
+	switch value := metadata[key].(type) {
+	case bool:
+		return &value
+	case string:
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "true", "yes":
+			parsed := true
+			return &parsed
+		case "false", "no":
+			parsed := false
+			return &parsed
+		}
+	}
+	return nil
+}
+
+func metadataScoreMap(metadata map[string]any, key string) map[string]float64 {
+	raw, ok := metadata[key].(map[string]any)
+	if !ok {
+		return nil
+	}
+	scores := map[string]float64{}
+	for label, value := range raw {
+		nested := map[string]any{"score": value}
+		if score := metadataFloatPtr(nested, "score"); score != nil {
+			scores[strings.TrimSpace(label)] = *score
+		}
+	}
+	return scores
 }
 
 func skillOptCandidateReviewArtifactIDs(review db.AgentTemplateCandidateReview) []string {
@@ -1880,6 +2078,11 @@ func decideSkillOptTrainCandidate(ctx context.Context, store *db.Store, session 
 	if candidateID != "" && candidateID != expected {
 		return skillOptTrainCandidateDecisionResult{}, fmt.Errorf("candidate %s does not match train iteration candidate %s", candidateID, expected)
 	}
+	if decision == "promoted" {
+		if err := validateSkillOptTrainCandidatePromotableForDecision(ctx, store, candidateID); err != nil {
+			return skillOptTrainCandidateDecisionResult{}, err
+		}
+	}
 	if decision == "" {
 		return syncSkillOptTrainCandidateDecision(ctx, store, session, iteration, expected, "", "")
 	}
@@ -1914,6 +2117,21 @@ func decideSkillOptTrainCandidate(ctx context.Context, store *db.Store, session 
 		return skillOptTrainCandidateDecisionResult{}, err
 	}
 	return skillOptTrainCandidateDecisionResult{Decided: true, Decision: decision, CandidateVersionID: candidateID}, nil
+}
+
+func validateSkillOptTrainCandidatePromotableForDecision(ctx context.Context, store *db.Store, candidateID string) error {
+	review, err := store.GetAgentTemplateCandidateReview(ctx, candidateID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("load candidate review %s: %w", candidateID, err)
+	}
+	promotable, reason := skillOptCandidateReviewPromotability(review)
+	if promotable {
+		return nil
+	}
+	return fmt.Errorf("candidate %s is not promotable: %s", candidateID, reason)
 }
 
 func syncSkillOptTrainCandidateDecision(ctx context.Context, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, candidateID string, expectedDecision string, fallbackReason string) (skillOptTrainCandidateDecisionResult, error) {
@@ -5063,6 +5281,9 @@ func metadataString(metadata map[string]any, key string) string {
 	}
 	value, ok := metadata[key]
 	if !ok {
+		return ""
+	}
+	if value == nil {
 		return ""
 	}
 	return strings.TrimSpace(fmt.Sprint(value))

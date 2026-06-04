@@ -147,6 +147,10 @@ The imported package must have:
 Importing never promotes a candidate. Gitmoot stores it as a pending template
 version so later review and promotion commands can decide whether it becomes
 current.
+If `eval_report` or `summary.metadata` marks `promotable: false` with
+`no_candidate_reason`, or if the candidate content hash matches the base
+version, Gitmoot rejects the import as `optimizer produced no candidate` instead
+of creating a fake pending version.
 If `artifacts` is present, `--artifact-dir` is required. Gitmoot rejects
 absolute paths, path traversal, missing files, hash mismatches, duplicate
 artifact ids, and invalid `summary.diff_artifact_id` references before creating
@@ -458,12 +462,14 @@ Complete local review path:
 Complete train-mode path:
 
 1. `gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file items.yml --yes`
-2. `gitmoot skillopt train continue --session <session-id>` to generate options and publish the review packet.
-3. Human feedback is imported from the review surface.
-4. `gitmoot skillopt train continue --session <session-id>` to export the package, run `gitmoot-skillopt`, and import the pending candidate.
-5. `gitmoot skillopt train continue --session <session-id>` to publish candidate review context.
-6. `gitmoot skillopt train continue --session <session-id> --promote <version>` or `--reject <version> --reason <text>`.
-7. `gitmoot skillopt train continue --session <session-id> --start-next` only after the prior iteration is resolved.
+2. `gitmoot skillopt train status --session <session-id> --json --verbose` or `--watch` to inspect live phase, item progress, active locks, review issue, candidate, and next action.
+3. `gitmoot skillopt train continue --session <session-id>` to generate options and publish the review packet.
+4. Human feedback is imported from raw or fenced YAML comments; `train continue` auto-syncs GitHub comments when the review is published and feedback is missing.
+5. Evaluator profiles run cheap artifact checks first, optional render adapters second, and LLM judges last. Structured failures flow into optimizer input with reasons, hints, evidence, failed checks, and stage status.
+6. `gitmoot skillopt train continue --session <session-id>` to export the package, run `gitmoot-skillopt`, and import the pending candidate, or record `optimizer_completed_no_candidate` if the optimizer produced no promotable content.
+7. `gitmoot skillopt train continue --session <session-id>` to publish candidate review context with separate selection score, evaluator/test scores, gate status, no-op status, and promotability.
+8. `gitmoot skillopt train continue --session <session-id> --promote <version>` or `--reject <version> --reason <text>`.
+9. `gitmoot skillopt train continue --session <session-id> --start-next` only after the prior iteration is resolved.
 
 Complete GitHub review path:
 
