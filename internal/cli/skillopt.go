@@ -565,9 +565,10 @@ func continueSkillOptTrain(ctx context.Context, paths config.Paths, store *db.St
 	if request.StartNext &&
 		summary.CurrentPhase != skillopt.TrainStateCandidateReviewPublished &&
 		summary.CurrentPhase != skillopt.TrainStateCandidateCreated &&
+		summary.CurrentPhase != skillopt.TrainStateOptimizerCompletedNoCandidate &&
 		summary.CurrentPhase != skillopt.TrainStateCandidatePromoted &&
 		summary.CurrentPhase != skillopt.TrainStateCandidateRejected {
-		return skillOptTrainContinueOutput{}, fmt.Errorf("--start-next requires a promoted or rejected candidate; current phase is %s", summary.CurrentPhase)
+		return skillOptTrainContinueOutput{}, fmt.Errorf("--start-next requires a promoted candidate, rejected candidate, or no-candidate optimizer result; current phase is %s", summary.CurrentPhase)
 	}
 	switch summary.CurrentPhase {
 	case skillopt.TrainStateItemsReady:
@@ -732,10 +733,33 @@ func continueSkillOptTrain(ctx context.Context, paths config.Paths, store *db.St
 			"next: export the training package before running the optimizer",
 		}
 		return skillOptTrainContinueOutput{Summary: updatedSummary, Counts: updatedCounts, ContinueReady: true, Lines: lines}, nil
-	case skillopt.TrainStateFeedbackSynced, skillopt.TrainStateTrainingPackageCreated, skillopt.TrainStateOptimizerCompleted:
+	case skillopt.TrainStateFeedbackSynced, skillopt.TrainStateTrainingPackageCreated, skillopt.TrainStateOptimizerCompleted, skillopt.TrainStateOptimizerCompletedNoCandidate:
 		if iteration == nil {
 			output.Lines = []string{"next: train session has no iteration to continue"}
 			return output, nil
+		}
+		if summary.CurrentPhase == skillopt.TrainStateOptimizerCompletedNoCandidate {
+			if request.StartNext {
+				next, err := startNextSkillOptTrainIteration(ctx, store, session, *iteration)
+				if err != nil {
+					return skillOptTrainContinueOutput{}, err
+				}
+				updatedSession, updatedIteration, updatedCounts, err := loadSkillOptTrainStatus(ctx, store, session.ID)
+				if err != nil {
+					return skillOptTrainContinueOutput{}, err
+				}
+				updatedSummary := skillopt.BuildTrainStatusSummary(updatedSession, updatedIteration, updatedCounts)
+				lines := []string{
+					fmt.Sprintf("started_iteration: %s", next.ID),
+					fmt.Sprintf("base_version: %s", next.BaseTemplateVersionID),
+					"next: generate review options with train continue",
+				}
+				return skillOptTrainContinueOutput{Summary: updatedSummary, Counts: updatedCounts, ContinueReady: true, Lines: lines}, nil
+			}
+			if !request.Optimizer.RerunOptimizer {
+				output.Lines = []string{"next: revise feedback and run --start-next, rerun the optimizer with --rerun-optimizer, or stop"}
+				return output, nil
+			}
 		}
 		optimizerLockTTL, err := skillOptTrainOptimizerLockTTLForRequest(request.Optimizer)
 		if err != nil {
@@ -760,7 +784,8 @@ func continueSkillOptTrain(ctx context.Context, paths config.Paths, store *db.St
 		}
 		if summary.CurrentPhase != skillopt.TrainStateFeedbackSynced &&
 			summary.CurrentPhase != skillopt.TrainStateTrainingPackageCreated &&
-			summary.CurrentPhase != skillopt.TrainStateOptimizerCompleted {
+			summary.CurrentPhase != skillopt.TrainStateOptimizerCompleted &&
+			summary.CurrentPhase != skillopt.TrainStateOptimizerCompletedNoCandidate {
 			output.Lines = []string{fmt.Sprintf("next: %s", summary.NextAction)}
 			return output, nil
 		}
@@ -780,8 +805,17 @@ func continueSkillOptTrain(ctx context.Context, paths config.Paths, store *db.St
 			fmt.Sprintf("artifact_dir: %s", result.ArtifactDir),
 			fmt.Sprintf("optimizer_command: %s", shellArgs(append([]string{result.Command}, result.Args...))),
 			fmt.Sprintf("optimizer_dry_run: %t", result.DryRun),
-			fmt.Sprintf("imported_candidate: %s", result.CandidateVersionID),
-			"next: publish candidate diff and preview review",
+		}
+		if result.NoCandidateReason != "" {
+			lines = append(lines,
+				fmt.Sprintf("no_candidate_reason: %s", result.NoCandidateReason),
+				fmt.Sprintf("next: %s", result.NoCandidateNextAction),
+			)
+		} else {
+			lines = append(lines,
+				fmt.Sprintf("imported_candidate: %s", result.CandidateVersionID),
+				"next: publish candidate diff and preview review",
+			)
 		}
 		return skillOptTrainContinueOutput{
 			Summary:       updatedSummary,
@@ -970,14 +1004,16 @@ func validateTerminalSkillOptTrainDecisionRequest(iteration db.SkillOptTrainIter
 }
 
 type skillOptTrainOptimizerResult struct {
-	TrainingPackagePath  string
-	OutRoot              string
-	CandidatePackagePath string
-	ArtifactDir          string
-	Command              string
-	Args                 []string
-	DryRun               bool
-	CandidateVersionID   string
+	TrainingPackagePath   string
+	OutRoot               string
+	CandidatePackagePath  string
+	ArtifactDir           string
+	Command               string
+	Args                  []string
+	DryRun                bool
+	CandidateVersionID    string
+	NoCandidateReason     string
+	NoCandidateNextAction string
 }
 
 type skillOptTrainOptimizerPaths struct {
@@ -1952,6 +1988,11 @@ func continueSkillOptTrainOptimizer(ctx context.Context, paths config.Paths, sto
 	if state == skillopt.TrainStateOptimizerCompleted && request.RerunOptimizer {
 		state = skillopt.TrainStateTrainingPackageCreated
 	}
+	if state == skillopt.TrainStateOptimizerCompletedNoCandidate && request.RerunOptimizer {
+		session.State = skillopt.TrainStateTrainingPackageCreated
+		iteration.State = skillopt.TrainStateTrainingPackageCreated
+		state = skillopt.TrainStateTrainingPackageCreated
+	}
 	if state == skillopt.TrainStateFeedbackSynced {
 		if err := skillopt.CanTransitionTrainIteration(iteration.State, skillopt.TrainStateTrainingPackageCreated); err != nil {
 			return skillOptTrainOptimizerResult{}, err
@@ -2011,6 +2052,15 @@ func continueSkillOptTrainOptimizer(ctx context.Context, paths config.Paths, sto
 		}
 		version, err := importSkillOptTrainCandidate(ctx, paths, store, session, iteration, optimizerPaths)
 		if err != nil {
+			if errors.Is(err, skillopt.ErrNoCandidate) {
+				reason := skillOptNoCandidateReason(err)
+				if metaErr := recordSkillOptTrainNoCandidate(ctx, store, session, iteration, optimizerPaths, reason); metaErr != nil {
+					return skillOptTrainOptimizerResult{}, fmt.Errorf("%w; failed to record no-candidate result: %v", err, metaErr)
+				}
+				result.NoCandidateReason = reason
+				result.NoCandidateNextAction = skillOptNoCandidateNextAction()
+				return result, nil
+			}
 			if metaErr := recordSkillOptTrainCandidateImportFailure(ctx, store, session, iteration, optimizerPaths, err); metaErr != nil {
 				return skillOptTrainOptimizerResult{}, fmt.Errorf("%w; failed to record candidate import failure: %v", err, metaErr)
 			}
@@ -4047,6 +4097,43 @@ func recordSkillOptTrainCandidateImportFailure(ctx context.Context, store *db.St
 		return err
 	}
 	return store.UpsertSkillOptTrainIteration(ctx, iteration)
+}
+
+func recordSkillOptTrainNoCandidate(ctx context.Context, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, paths skillOptTrainOptimizerPaths, reason string) error {
+	if err := skillopt.CanTransitionTrainIteration(iteration.State, skillopt.TrainStateOptimizerCompletedNoCandidate); err != nil {
+		return err
+	}
+	metadata := map[string]any{
+		"status":              "no_candidate",
+		"candidate_package":   paths.CandidatePackagePath,
+		"artifact_dir":        paths.ArtifactDir,
+		"no_candidate_reason": reason,
+		"next_action":         skillOptNoCandidateNextAction(),
+		"completed_at":        time.Now().UTC().Format(time.RFC3339Nano),
+		"source":              "gitmoot skillopt train continue",
+	}
+	session.State = skillopt.TrainStateOptimizerCompletedNoCandidate
+	iteration.State = skillopt.TrainStateOptimizerCompletedNoCandidate
+	iteration.CandidateVersionID = ""
+	session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "candidate_import", metadata)
+	iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "candidate_import", metadata)
+	if err := store.UpsertSkillOptTrainSession(ctx, session); err != nil {
+		return err
+	}
+	return store.UpsertSkillOptTrainIteration(ctx, iteration)
+}
+
+func skillOptNoCandidateReason(err error) string {
+	text := strings.TrimSpace(err.Error())
+	marker := skillopt.ErrNoCandidate.Error() + ":"
+	if index := strings.LastIndex(text, marker); index >= 0 {
+		return strings.TrimSpace(text[index+len(marker):])
+	}
+	return text
+}
+
+func skillOptNoCandidateNextAction() string {
+	return "do not publish a candidate review; revise feedback and start another iteration, rerun the optimizer with --rerun-optimizer, or stop"
 }
 
 func importSkillOptTrainCandidate(ctx context.Context, paths config.Paths, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, optimizerPaths skillOptTrainOptimizerPaths) (db.AgentTemplateVersion, error) {

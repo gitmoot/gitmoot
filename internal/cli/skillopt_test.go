@@ -2294,6 +2294,125 @@ func TestSkillOptTrainContinueRunsOptimizerAndImportsCandidate(t *testing.T) {
 	}
 }
 
+func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
+	home, baseVersionID := seedSkillOptTrainFeedbackSynced(t)
+	outRoot := filepath.Join(t.TempDir(), "optimizer")
+	runner := &skillOptTrainFakeOptimizerRunner{
+		candidate: cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan the work."),
+	}
+	previousRunner := skillOptTrainOptimizerRunner
+	skillOptTrainOptimizerRunner = runner
+	defer func() {
+		skillOptTrainOptimizerRunner = previousRunner
+	}()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+		"--out-root", outRoot,
+		"--dry-run",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue no-candidate exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	for _, want := range []string{
+		"current_phase: optimizer_completed_no_candidate",
+		"candidate: -",
+		"continue_ready: true",
+		"candidate_package: " + filepath.Join(outRoot, "candidate.json"),
+		"optimizer_dry_run: true",
+		"no_candidate_reason: candidate content is unchanged from the base version",
+		"next: do not publish a candidate review",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("train continue no-candidate stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "optimizer-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+	if iteration.State != skillopt.TrainStateOptimizerCompletedNoCandidate || iteration.CandidateVersionID != "" {
+		t.Fatalf("iteration after no-candidate = %+v", iteration)
+	}
+	if !strings.Contains(iteration.MetadataJSON, `"status":"no_candidate"`) ||
+		!strings.Contains(iteration.MetadataJSON, `"no_candidate_reason":"candidate content is unchanged from the base version"`) {
+		t.Fatalf("iteration metadata after no-candidate = %s", iteration.MetadataJSON)
+	}
+	if _, err := store.GetAgentTemplateVersionByID(context.Background(), "planner@v2"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("no-candidate imported planner@v2 err=%v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+		"--start-next",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue start-next after no-candidate exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "current_phase: items_ready") ||
+		!strings.Contains(stdout.String(), "started_iteration: optimizer-train-002") ||
+		!strings.Contains(stdout.String(), "base_version: "+baseVersionID) {
+		t.Fatalf("start-next after no-candidate stdout = %s", stdout.String())
+	}
+}
+
+func TestSkillOptTrainContinueRerunsOptimizerAfterNoCandidate(t *testing.T) {
+	home, baseVersionID := seedSkillOptTrainFeedbackSynced(t)
+	outRoot := filepath.Join(t.TempDir(), "optimizer")
+	runner := &skillOptTrainFakeOptimizerRunner{
+		candidate: cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan the work."),
+	}
+	previousRunner := skillOptTrainOptimizerRunner
+	skillOptTrainOptimizerRunner = runner
+	defer func() {
+		skillOptTrainOptimizerRunner = previousRunner
+	}()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+		"--out-root", outRoot,
+		"--dry-run",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue no-candidate exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("optimizer calls after no-candidate = %+v, want one", runner.calls)
+	}
+
+	runner.candidate = cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with rerun candidate guidance.")
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+		"--rerun-optimizer",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue rerun after no-candidate exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("optimizer calls after rerun = %+v, want two", runner.calls)
+	}
+	if !strings.Contains(stdout.String(), "current_phase: candidate_created") ||
+		!strings.Contains(stdout.String(), "imported_candidate: planner@v2") {
+		t.Fatalf("rerun after no-candidate stdout = %s", stdout.String())
+	}
+}
+
 func TestSkillOptTrainContinueMarksReviewPublishedFeedbackSynced(t *testing.T) {
 	home, _ := seedSkillOptTrainFeedbackSynced(t)
 	store := openCLIJobStore(t, home)
@@ -2720,7 +2839,7 @@ func TestSkillOptTrainContinuePublishesCandidateReviewPromotesAndStartsNext(t *t
 	if code != 1 {
 		t.Fatalf("train continue duplicate start-next exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "--start-next requires a promoted or rejected candidate; current phase is items_ready") {
+	if !strings.Contains(stderr.String(), "--start-next requires a promoted candidate, rejected candidate, or no-candidate optimizer result; current phase is items_ready") {
 		t.Fatalf("duplicate start-next stderr = %q", stderr.String())
 	}
 

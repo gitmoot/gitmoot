@@ -38,6 +38,15 @@ func TestCanTransitionTrainIterationAllowsTerminalDecisions(t *testing.T) {
 	}
 }
 
+func TestCanTransitionTrainIterationAllowsNoCandidateAfterOptimizer(t *testing.T) {
+	if err := CanTransitionTrainIteration(TrainStateOptimizerCompleted, TrainStateOptimizerCompletedNoCandidate); err != nil {
+		t.Fatalf("no-candidate transition returned error: %v", err)
+	}
+	if err := CanTransitionTrainIteration(TrainStateTrainingPackageCreated, TrainStateOptimizerCompletedNoCandidate); err == nil || !strings.Contains(err.Error(), "optimizer completes") {
+		t.Fatalf("early no-candidate transition error = %v", err)
+	}
+}
+
 func TestCanStartNextTrainIterationRequiresResolvedPreviousIteration(t *testing.T) {
 	if err := CanStartNextTrainIteration(db.SkillOptTrainIteration{ID: "iter-1", State: TrainStateCandidateCreated}); err == nil || !strings.Contains(err.Error(), TrainStateCandidateCreated) {
 		t.Fatalf("active iteration error = %v", err)
@@ -49,6 +58,7 @@ func TestCanStartNextTrainIterationRequiresResolvedPreviousIteration(t *testing.
 		t.Fatalf("rejected without reason error = %v", err)
 	}
 	for _, iteration := range []db.SkillOptTrainIteration{
+		{ID: "iter-1", State: TrainStateOptimizerCompletedNoCandidate},
 		{ID: "iter-1", State: TrainStateCandidatePromoted},
 		{ID: "iter-1", State: TrainStateRunAbandoned},
 		{ID: "iter-1", State: TrainStateCandidateRejected, DecisionReason: "too broad"},

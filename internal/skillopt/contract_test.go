@@ -3,6 +3,7 @@ package skillopt
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -465,6 +466,78 @@ func TestImportCandidatePackageCreatesPendingVersion(t *testing.T) {
 	}
 	if review.BaseVersionID != current.VersionID || review.DiffArtifactID != "candidate-diff" || review.PreferenceSummary != "Candidate is more actionable." || review.EvalReportJSON != `{"score":0.82}` {
 		t.Fatalf("candidate review = %+v", review)
+	}
+}
+
+func TestImportCandidatePackageRejectsNoCandidateMetadata(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	template := testTemplate("planner", "Plan carefully.")
+	if err := store.UpsertAgentTemplate(ctx, template); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	candidateContent := testTemplateContent("planner", "Plan carefully with a concise risk section.")
+	parsed, err := agenttemplate.ParseTemplateContent(candidateContent)
+	if err != nil {
+		t.Fatalf("ParseTemplateContent returned error: %v", err)
+	}
+
+	_, err = ImportCandidatePackage(ctx, store, CandidatePackage{
+		Kind:            CandidatePackageKind,
+		ContractVersion: ContractVersion,
+		TemplateID:      "planner",
+		BaseVersionID:   "planner@latest",
+		Candidate: CandidateTemplate{
+			Content:  candidateContent,
+			Metadata: parsed.Metadata,
+		},
+		EvalReport: json.RawMessage(`{"promotable":false,"no_candidate_reason":"best_origin_initial_skill"}`),
+		Summary: CandidateSummary{
+			Metadata: json.RawMessage(`{"promotable":false,"no_candidate_reason":"best_origin_initial_skill"}`),
+		},
+	}, "candidate.json")
+	if !errors.Is(err, ErrNoCandidate) || !strings.Contains(err.Error(), "optimizer produced no candidate: best_origin_initial_skill") {
+		t.Fatalf("ImportCandidatePackage error = %v", err)
+	}
+}
+
+func TestImportCandidatePackageRejectsUnchangedContent(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	template := testTemplate("planner", "Plan carefully.")
+	if err := store.UpsertAgentTemplate(ctx, template); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	current, err := store.GetAgentTemplate(ctx, "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	parsed, err := agenttemplate.ParseTemplateContent(current.Content)
+	if err != nil {
+		t.Fatalf("ParseTemplateContent returned error: %v", err)
+	}
+
+	_, err = ImportCandidatePackage(ctx, store, CandidatePackage{
+		Kind:            CandidatePackageKind,
+		ContractVersion: ContractVersion,
+		TemplateID:      "planner",
+		BaseVersionID:   current.VersionID,
+		Candidate: CandidateTemplate{
+			Content:  current.Content,
+			Metadata: parsed.Metadata,
+		},
+		Summary: CandidateSummary{},
+	}, "candidate.json")
+	if !errors.Is(err, ErrNoCandidate) || !strings.Contains(err.Error(), "optimizer produced no candidate: candidate content is unchanged") {
+		t.Fatalf("ImportCandidatePackage error = %v", err)
 	}
 }
 

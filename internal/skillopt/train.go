@@ -10,19 +10,20 @@ import (
 )
 
 const (
-	TrainStateRequestConfirmed         = "request_confirmed"
-	TrainStateWorkspaceReady           = "workspace_ready"
-	TrainStateItemsReady               = "items_ready"
-	TrainStateOptionsGenerated         = "options_generated"
-	TrainStateReviewPublished          = "review_published"
-	TrainStateFeedbackSynced           = "feedback_synced"
-	TrainStateTrainingPackageCreated   = "training_package_created"
-	TrainStateOptimizerCompleted       = "optimizer_completed"
-	TrainStateCandidateCreated         = "candidate_created"
-	TrainStateCandidateReviewPublished = "candidate_review_published"
-	TrainStateCandidatePromoted        = "candidate_promoted"
-	TrainStateCandidateRejected        = "candidate_rejected"
-	TrainStateRunAbandoned             = "run_abandoned"
+	TrainStateRequestConfirmed              = "request_confirmed"
+	TrainStateWorkspaceReady                = "workspace_ready"
+	TrainStateItemsReady                    = "items_ready"
+	TrainStateOptionsGenerated              = "options_generated"
+	TrainStateReviewPublished               = "review_published"
+	TrainStateFeedbackSynced                = "feedback_synced"
+	TrainStateTrainingPackageCreated        = "training_package_created"
+	TrainStateOptimizerCompleted            = "optimizer_completed"
+	TrainStateOptimizerCompletedNoCandidate = "optimizer_completed_no_candidate"
+	TrainStateCandidateCreated              = "candidate_created"
+	TrainStateCandidateReviewPublished      = "candidate_review_published"
+	TrainStateCandidatePromoted             = "candidate_promoted"
+	TrainStateCandidateRejected             = "candidate_rejected"
+	TrainStateRunAbandoned                  = "run_abandoned"
 )
 
 const (
@@ -96,7 +97,7 @@ func NormalizeTrainState(state string) string {
 
 func IsTerminalTrainState(state string) bool {
 	switch NormalizeTrainState(state) {
-	case TrainStateCandidatePromoted, TrainStateCandidateRejected, TrainStateRunAbandoned:
+	case TrainStateOptimizerCompletedNoCandidate, TrainStateCandidatePromoted, TrainStateCandidateRejected, TrainStateRunAbandoned:
 		return true
 	default:
 		return false
@@ -119,6 +120,12 @@ func CanTransitionTrainIteration(from string, to string) error {
 		return fmt.Errorf("cannot transition train iteration from terminal state %s to %s", from, to)
 	}
 	if IsTerminalTrainState(to) {
+		if to == TrainStateOptimizerCompletedNoCandidate {
+			if from != TrainStateOptimizerCompleted {
+				return fmt.Errorf("cannot transition train iteration from %s to %s before optimizer completes", from, to)
+			}
+			return nil
+		}
 		if to != TrainStateRunAbandoned && from != TrainStateCandidateReviewPublished {
 			return fmt.Errorf("cannot transition train iteration from %s to %s before candidate review is published", from, to)
 		}
@@ -144,7 +151,7 @@ func CanTransitionTrainIteration(from string, to string) error {
 func CanStartNextTrainIteration(previous db.SkillOptTrainIteration) error {
 	state := NormalizeTrainState(previous.State)
 	switch state {
-	case TrainStateCandidatePromoted, TrainStateRunAbandoned:
+	case TrainStateOptimizerCompletedNoCandidate, TrainStateCandidatePromoted, TrainStateRunAbandoned:
 		return nil
 	case TrainStateCandidateRejected:
 		if strings.TrimSpace(previous.DecisionReason) == "" {
@@ -358,6 +365,9 @@ func completedTrainSteps(state string) []string {
 			if state == TrainStateRunAbandoned {
 				return nil
 			}
+			if state == TrainStateOptimizerCompletedNoCandidate {
+				return append([]string{}, orderedTrainStates[:trainStateOrder[TrainStateOptimizerCompleted]+1]...)
+			}
 			return append([]string{}, orderedTrainStates...)
 		}
 		return nil
@@ -383,6 +393,8 @@ func trainBlockedStepAndAction(state string) (string, string) {
 		return TrainStateOptimizerCompleted, "run the external gitmoot-skillopt optimizer"
 	case TrainStateOptimizerCompleted:
 		return TrainStateCandidateCreated, "import the optimizer candidate package"
+	case TrainStateOptimizerCompletedNoCandidate:
+		return "", "no candidate was created; revise feedback and start another iteration, rerun the optimizer, or stop"
 	case TrainStateCandidateCreated:
 		return TrainStateCandidateReviewPublished, "publish candidate diff and preview review"
 	case TrainStateCandidateReviewPublished:

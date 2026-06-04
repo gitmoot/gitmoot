@@ -27,6 +27,8 @@ const (
 	CandidateSourceRef  = "candidate"
 )
 
+var ErrNoCandidate = errors.New("optimizer produced no candidate")
+
 type TemplateSnapshot struct {
 	ID             string                 `json:"id"`
 	VersionID      string                 `json:"version_id"`
@@ -346,12 +348,15 @@ func ImportCandidatePackageWithOptions(ctx context.Context, store *db.Store, can
 	if err := validateCandidateArtifactIDsAvailable(ctx, store, candidateArtifactIDs); err != nil {
 		return db.AgentTemplateVersion{}, err
 	}
-	evalArtifacts, err := storeCandidateArtifactBlobs(options.BlobStore, preparedArtifacts)
+	templateID := strings.TrimSpace(candidate.TemplateID)
+	baseVersionID, err := candidateBaseVersionID(ctx, store, templateID, candidate.BaseVersionID)
 	if err != nil {
 		return db.AgentTemplateVersion{}, err
 	}
-	templateID := strings.TrimSpace(candidate.TemplateID)
-	baseVersionID, err := candidateBaseVersionID(ctx, store, templateID, candidate.BaseVersionID)
+	if err := validateCandidateCreatesPendingVersion(ctx, store, candidate, baseVersionID); err != nil {
+		return db.AgentTemplateVersion{}, err
+	}
+	evalArtifacts, err := storeCandidateArtifactBlobs(options.BlobStore, preparedArtifacts)
 	if err != nil {
 		return db.AgentTemplateVersion{}, err
 	}
@@ -422,6 +427,47 @@ func candidateBaseVersionID(ctx context.Context, store *db.Store, templateID str
 		return "", fmt.Errorf("base version %q belongs to template %q, want %q", baseRef, base.ID, templateID)
 	}
 	return base.VersionID, nil
+}
+
+func validateCandidateCreatesPendingVersion(ctx context.Context, store *db.Store, candidate CandidatePackage, baseVersionID string) error {
+	reason := candidateNoCandidateReason(candidate)
+	if reason != "" {
+		return fmt.Errorf("%w: %s", ErrNoCandidate, reason)
+	}
+	base, err := store.GetAgentTemplateVersionByID(ctx, strings.TrimSpace(baseVersionID))
+	if err != nil {
+		return fmt.Errorf("load candidate base version %q: %w", baseVersionID, err)
+	}
+	candidateHash := agenttemplate.HashContent(candidate.Candidate.Content)
+	if strings.TrimSpace(base.ContentHash) == candidateHash || agenttemplate.HashContent(base.Content) == candidateHash {
+		return fmt.Errorf("%w: candidate content is unchanged from the base version", ErrNoCandidate)
+	}
+	return nil
+}
+
+func candidateNoCandidateReason(candidate CandidatePackage) string {
+	for _, source := range []json.RawMessage{candidate.EvalReport, candidate.Summary.Metadata} {
+		reason := rawNoCandidateReason(source)
+		if reason != "" {
+			return reason
+		}
+	}
+	return ""
+}
+
+func rawNoCandidateReason(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var data map[string]any
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return ""
+	}
+	if promotable, ok := data["promotable"].(bool); ok && promotable {
+		return ""
+	}
+	reason, _ := data["no_candidate_reason"].(string)
+	return strings.TrimSpace(reason)
 }
 
 func validateCandidatePackage(ctx context.Context, store *db.Store, candidate CandidatePackage, candidateArtifactIDs map[string]struct{}) error {
