@@ -35,6 +35,54 @@ type GitHubPublishResult struct {
 
 const githubFeedbackPacketMarker = "<!-- gitmoot:skillopt-feedback-packet -->"
 
+type GitHubReviewCommentValidation struct {
+	Parseable bool
+	ItemIDs   []string
+}
+
+func ValidateGitHubReviewComment(body string, runID string, expectedItemIDs []string) (GitHubReviewCommentValidation, error) {
+	parsed, ok, err := ParseGitHubFeedbackComment(body)
+	if err != nil {
+		return GitHubReviewCommentValidation{Parseable: true}, feedbackImportErrorHint(err)
+	}
+	if !ok {
+		return GitHubReviewCommentValidation{}, nil
+	}
+	runID = strings.TrimSpace(runID)
+	if parsed.RunID == "" {
+		return GitHubReviewCommentValidation{Parseable: true}, errors.New("missing run_id")
+	}
+	if parsed.RunID != runID {
+		return GitHubReviewCommentValidation{Parseable: true}, fmt.Errorf("wrong run_id %q, want %q", parsed.RunID, runID)
+	}
+	seen := map[string]struct{}{}
+	itemIDs := make([]string, 0, len(parsed.Items))
+	for _, entry := range parsed.Items {
+		itemID := strings.TrimSpace(entry.ItemID)
+		if itemID == "" {
+			return GitHubReviewCommentValidation{Parseable: true}, fmt.Errorf("missing item_id in feedback for run %q", runID)
+		}
+		if _, ok := seen[itemID]; !ok {
+			seen[itemID] = struct{}{}
+			itemIDs = append(itemIDs, itemID)
+		}
+	}
+	missing := []string{}
+	for _, expected := range expectedItemIDs {
+		expected = strings.TrimSpace(expected)
+		if expected == "" {
+			continue
+		}
+		if _, ok := seen[expected]; !ok {
+			missing = append(missing, expected)
+		}
+	}
+	if len(missing) > 0 {
+		return GitHubReviewCommentValidation{Parseable: true, ItemIDs: itemIDs}, fmt.Errorf("missing feedback for expected item_id(s): %s", strings.Join(missing, ", "))
+	}
+	return GitHubReviewCommentValidation{Parseable: true, ItemIDs: itemIDs}, nil
+}
+
 func (c GitHubCollector) Publish(ctx context.Context, store *db.Store, runID string, target GitHubPublishTarget) (GitHubPublishResult, error) {
 	if c.GitHub == nil {
 		return GitHubPublishResult{}, errors.New("github client is required")

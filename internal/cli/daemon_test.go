@@ -211,7 +211,7 @@ func TestDaemonRestartOverlayPreservesSavedArgs(t *testing.T) {
 }
 
 func TestDaemonChildArgsRunAllRepoSupervisor(t *testing.T) {
-	args := daemonChildArgs("/tmp/gitmoot-home", "30s", 2)
+	args := daemonChildArgs("/tmp/gitmoot-home", "30s", 2, true)
 
 	for i, arg := range args {
 		if arg == "--repo" || strings.HasPrefix(arg, "--repo=") {
@@ -225,7 +225,7 @@ func TestDaemonChildArgsRunAllRepoSupervisor(t *testing.T) {
 	if parsed.RepoSet {
 		t.Fatalf("daemon child args selected single-repo mode: %v", args)
 	}
-	if parsed.Workers != 2 || parsed.Poll != 30*time.Second {
+	if parsed.Workers != 2 || parsed.Poll != 30*time.Second || !parsed.WatchSkillOptReviews {
 		t.Fatalf("parsed child args = %+v", parsed)
 	}
 }
