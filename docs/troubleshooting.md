@@ -25,6 +25,52 @@ Fixes:
 - Confirm the `--repo owner/repo` value matches the checkout remote.
 - Retry after GitHub rate limits clear.
 
+## SkillOpt Review Operations
+
+Symptoms:
+
+- `gitmoot skillopt train continue` refuses to publish or sync GitHub review
+  feedback.
+- Review issue links show `pending deployment`, `failed deployment`, or
+  `stale deployment`.
+- A candidate review keeps waiting for a promote/reject decision.
+- Required Vue/Vite review items fail during generation.
+
+Checks:
+
+```sh
+gh auth status --hostname github.com
+gh repo view owner/reviews --json nameWithOwner
+gitmoot skillopt train status --session <session-id> --verbose
+gitmoot repo list
+```
+
+Fixes:
+
+- GitHub review operations use `gh`; authenticate it for the expected review
+  repo before publishing, syncing, candidate review publication, or review
+  watching. Preview publication can push Pages files before a later review issue
+  preflight fails, so run the `gh` checks before starting review publication.
+- Confirm `review.expected_repo` in train status. Preview review runs must
+  publish and sync against the preview/review repo, not the target product repo.
+- `pending deployment` means GitHub Pages had not finished for the pushed
+  preview commit during Gitmoot's bounded wait. The stored review label is not
+  refreshed automatically after it is written; inspect the link or the Pages
+  build directly.
+- `failed deployment` includes the Pages error when GitHub reports one. Fix the
+  preview repo Pages configuration or generated output. Existing review links
+  keep their recorded label; generate a new review item or clear/recreate the
+  affected preview metadata if reviewers need an updated label.
+- `stale deployment` means the latest Pages build still points at a different
+  commit after the wait. Confirm the preview repo push and Pages build manually;
+  `train continue` skips options that already have a preview URL, so it does not
+  re-observe status for the old review option.
+- Candidate review decisions are explicit: promote, reject with a reason, wait,
+  or reject and `--start-next` to keep improving.
+- Required Vue/Vite options retry once when preview-bundle validation fails with
+  an actionable error. If the retry also fails, inspect the structured error for
+  the item id, option label, validation class, and retry count.
+
 ## Codex
 
 Symptoms:
