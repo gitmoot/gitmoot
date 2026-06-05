@@ -149,6 +149,63 @@ func TestExportTrainingPackageIncludesPreferredGateMetadata(t *testing.T) {
 	}
 }
 
+func TestExportTrainingPackageBuildsEvaluatorProfileFromMetadata(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	template := testTemplate("designer", "Design carefully.")
+	if err := store.UpsertAgentTemplate(ctx, template); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	installed, err := store.GetAgentTemplate(ctx, "designer")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	if err := store.UpsertEvalRun(ctx, db.EvalRun{
+		ID:                "train-run-1",
+		TemplateID:        "designer",
+		TemplateVersionID: installed.VersionID,
+		TargetRepo:        "owner/repo",
+		State:             "review",
+		MetadataJSON:      `{"evaluation":{"evaluator_id":"landing_page_v1","evaluator_model":"gpt-evaluator"}}`,
+	}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+
+	pkg, err := ExportTrainingPackage(ctx, store, "train-run-1")
+	if err != nil {
+		t.Fatalf("ExportTrainingPackage returned error: %v", err)
+	}
+	if pkg.EvaluatorProfile == nil ||
+		pkg.EvaluatorProfile.ProfileID != "landing_page_v1" ||
+		pkg.EvaluatorProfile.TaskKind != "vue_landing_page" ||
+		pkg.EvaluatorProfile.ArtifactContract != "vue_vite_bundle" ||
+		pkg.EvaluatorProfile.PreviewAdapter != "vue_vite" ||
+		pkg.EvaluatorProfile.Judge == nil ||
+		pkg.EvaluatorProfile.Judge.Model != "gpt-evaluator" {
+		t.Fatalf("evaluator profile = %+v", pkg.EvaluatorProfile)
+	}
+}
+
+func TestBuildEvaluatorProfilePreservesCustomEvaluatorID(t *testing.T) {
+	profile := BuildEvaluatorProfile("CustomJudgeV2", "gpt-evaluator", json.RawMessage(`{"kind":"custom"}`))
+	if profile == nil {
+		t.Fatal("BuildEvaluatorProfile returned nil")
+	}
+	if profile.ProfileID != "CustomJudgeV2" {
+		t.Fatalf("ProfileID = %q, want CustomJudgeV2", profile.ProfileID)
+	}
+	if profile.TaskKind != "generic" {
+		t.Fatalf("TaskKind = %q, want generic", profile.TaskKind)
+	}
+	if profile.Judge == nil || profile.Judge.Model != "gpt-evaluator" {
+		t.Fatalf("Judge = %+v", profile.Judge)
+	}
+}
+
 func TestEvaluatorProfileAndFailurePacketContractsRoundTrip(t *testing.T) {
 	hard := 0.0
 	soft := 0.12

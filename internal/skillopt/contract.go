@@ -330,6 +330,7 @@ func ExportTrainingPackage(ctx context.Context, store *db.Store, runID string) (
 	if err != nil {
 		return TrainingPackage{}, fmt.Errorf("eval run metadata_json: %w", err)
 	}
+	evaluatorProfile := EvaluatorProfileFromConfig(metadata)
 	return TrainingPackage{
 		Kind:            TrainingPackageKind,
 		ContractVersion: ContractVersion,
@@ -351,7 +352,76 @@ func ExportTrainingPackage(ctx context.Context, store *db.Store, runID string) (
 		RankedFeedbackEvents: rankedFeedbackEvents,
 		PairwisePreferences:  pairwisePreferences,
 		EvaluatorConfig:      metadata,
+		EvaluatorProfile:     evaluatorProfile,
 	}, nil
+}
+
+func EvaluatorProfileFromConfig(config json.RawMessage) *EvaluatorProfile {
+	var metadata map[string]any
+	if len(bytes.TrimSpace(config)) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(config, &metadata); err != nil {
+		return nil
+	}
+	evaluatorID := evaluatorProfileMetadataString(metadata, "evaluator_id")
+	if evaluatorID == "" {
+		evaluatorID = evaluatorProfileMetadataString(metadata, "evaluation", "evaluator_id")
+	}
+	evaluatorModel := evaluatorProfileMetadataString(metadata, "evaluator_model")
+	if evaluatorModel == "" {
+		evaluatorModel = evaluatorProfileMetadataString(metadata, "evaluation", "evaluator_model")
+	}
+	return BuildEvaluatorProfile(evaluatorID, evaluatorModel, config)
+}
+
+func BuildEvaluatorProfile(evaluatorID string, evaluatorModel string, metadata json.RawMessage) *EvaluatorProfile {
+	profileID := strings.TrimSpace(evaluatorID)
+	evaluatorID = strings.ToLower(profileID)
+	if evaluatorID == "" {
+		return nil
+	}
+	judge := &EvaluatorJudgeConfig{Type: "llm_judge", When: "checks_pass"}
+	if model := strings.TrimSpace(evaluatorModel); model != "" {
+		judge.Model = model
+	}
+	switch evaluatorID {
+	case "landing_page_v1", "vue_landing_page_v1":
+		return &EvaluatorProfile{
+			ProfileID:        "landing_page_v1",
+			TaskKind:         "vue_landing_page",
+			ArtifactContract: "vue_vite_bundle",
+			PreviewAdapter:   "vue_vite",
+			Checks: []EvaluatorCheckConfig{
+				{ID: "required_files", Type: "artifact_contract", Required: true},
+				{ID: "render_smoke", Type: "playwright", When: "checks_pass"},
+			},
+			Judge:    judge,
+			Metadata: metadata,
+		}
+	default:
+		return &EvaluatorProfile{
+			ProfileID: profileID,
+			TaskKind:  "generic",
+			Judge:     judge,
+			Metadata:  metadata,
+		}
+	}
+}
+
+func evaluatorProfileMetadataString(metadata map[string]any, path ...string) string {
+	var current any = metadata
+	for _, key := range path {
+		object, ok := current.(map[string]any)
+		if !ok {
+			return ""
+		}
+		current = object[key]
+	}
+	if value, ok := current.(string); ok {
+		return strings.TrimSpace(value)
+	}
+	return ""
 }
 
 func ImportCandidatePackage(ctx context.Context, store *db.Store, candidate CandidatePackage, sourcePath string) (db.AgentTemplateVersion, error) {

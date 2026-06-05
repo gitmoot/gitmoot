@@ -2793,7 +2793,7 @@ func continueSkillOptTrainOptimizer(ctx context.Context, paths config.Paths, sto
 		if err := skillopt.CanTransitionTrainIteration(iteration.State, skillopt.TrainStateTrainingPackageCreated); err != nil {
 			return skillOptTrainOptimizerResult{}, err
 		}
-		exportMetadata, err := exportSkillOptTrainPackage(ctx, store, iteration, optimizerPaths)
+		exportMetadata, err := exportSkillOptTrainPackage(ctx, store, iteration, optimizerPaths, request)
 		if err != nil {
 			return result, err
 		}
@@ -2825,9 +2825,21 @@ func continueSkillOptTrainOptimizer(ctx context.Context, paths config.Paths, sto
 			}
 			return result, err
 		}
-		if rerunFromCompletedOptimizer {
+		if request.RerunOptimizer {
+			exportMetadata, err := exportSkillOptTrainPackage(ctx, store, iteration, optimizerPaths, request)
+			if err != nil {
+				return result, err
+			}
 			session.State = skillopt.TrainStateTrainingPackageCreated
 			iteration.State = skillopt.TrainStateTrainingPackageCreated
+			session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "optimizer", exportMetadata)
+			iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "optimizer", exportMetadata)
+			if err := store.UpsertSkillOptTrainSession(ctx, session); err != nil {
+				return result, err
+			}
+			if err := store.UpsertSkillOptTrainIteration(ctx, iteration); err != nil {
+				return result, err
+			}
 		}
 		if err := recordSkillOptTrainOptimizerStarted(ctx, store, &session, &iteration, request, optimizerPaths, command, args); err != nil {
 			return result, err
@@ -5935,11 +5947,8 @@ func resolveSkillOptTrainOptimizerPaths(paths config.Paths, session db.SkillOptT
 	candidatePackagePath := filepath.Join(absAttemptPath, "candidate.json")
 	artifactDir := filepath.Join(absAttemptPath, "artifacts")
 	if persistedTrainingPackage != "" && state != skillopt.TrainStateFeedbackSynced {
-		trainingPackagePath = persistedTrainingPackage
-		if request.RerunOptimizer {
-			candidatePackagePath = filepath.Join(absAttemptPath, "candidate.json")
-			artifactDir = filepath.Join(absAttemptPath, "artifacts")
-		} else {
+		if !request.RerunOptimizer {
+			trainingPackagePath = persistedTrainingPackage
 			if persistedCandidateOutput != "" {
 				candidatePackagePath = persistedCandidateOutput
 			}
@@ -6006,10 +6015,13 @@ func skillOptTrainOptimizerAttemptNumber(attempt string) int {
 	return number
 }
 
-func exportSkillOptTrainPackage(ctx context.Context, store *db.Store, iteration db.SkillOptTrainIteration, paths skillOptTrainOptimizerPaths) (map[string]any, error) {
+func exportSkillOptTrainPackage(ctx context.Context, store *db.Store, iteration db.SkillOptTrainIteration, paths skillOptTrainOptimizerPaths, request skillOptTrainOptimizerRequest) (map[string]any, error) {
 	pkg, err := skillopt.ExportTrainingPackage(ctx, store, iteration.EvalRunID)
 	if err != nil {
 		return nil, fmt.Errorf("export training package: %w", err)
+	}
+	if profile := skillopt.BuildEvaluatorProfile(request.EvaluatorID, request.EvaluatorModel, pkg.EvaluatorConfig); profile != nil {
+		pkg.EvaluatorProfile = profile
 	}
 	encoded, err := json.MarshalIndent(pkg, "", "  ")
 	if err != nil {

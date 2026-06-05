@@ -2874,6 +2874,18 @@ func TestSkillOptTrainContinueRunsOptimizerAndImportsCandidate(t *testing.T) {
 	if !strings.Contains(string(trainingPackage), `"kind": "gitmoot-skillopt-training-package"`) {
 		t.Fatalf("training package = %s", string(trainingPackage))
 	}
+	var decodedTrainingPackage skillopt.TrainingPackage
+	if err := json.Unmarshal(trainingPackage, &decodedTrainingPackage); err != nil {
+		t.Fatalf("decode training package: %v", err)
+	}
+	if decodedTrainingPackage.EvaluatorProfile == nil ||
+		decodedTrainingPackage.EvaluatorProfile.ProfileID != "landing_page_v1" ||
+		decodedTrainingPackage.EvaluatorProfile.ArtifactContract != "vue_vite_bundle" ||
+		decodedTrainingPackage.EvaluatorProfile.PreviewAdapter != "vue_vite" ||
+		decodedTrainingPackage.EvaluatorProfile.Judge == nil ||
+		decodedTrainingPackage.EvaluatorProfile.Judge.Model != "gpt-evaluator" {
+		t.Fatalf("training package evaluator profile = %+v", decodedTrainingPackage.EvaluatorProfile)
+	}
 
 	store := openCLIJobStore(t, home)
 	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "optimizer-train")
@@ -2892,6 +2904,149 @@ func TestSkillOptTrainContinueRunsOptimizerAndImportsCandidate(t *testing.T) {
 	}
 	if version.State != "pending" {
 		t.Fatalf("candidate version = %+v", version)
+	}
+}
+
+func TestSkillOptTrainRerunRefreshesEvaluatorProfilePackage(t *testing.T) {
+	home, _ := seedSkillOptTrainFeedbackSynced(t)
+	paths := config.PathsForHome(home)
+	ctx := context.Background()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	session, err := store.GetSkillOptTrainSession(ctx, "optimizer-train")
+	if err != nil {
+		t.Fatalf("GetSkillOptTrainSession returned error: %v", err)
+	}
+	iteration, err := store.GetLatestSkillOptTrainIteration(ctx, "optimizer-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+
+	request := skillOptTrainOptimizerRequest{
+		OutRoot:        filepath.Join(t.TempDir(), "optimizer"),
+		EvaluatorID:    "landing_page_v1",
+		EvaluatorModel: "initial-evaluator",
+	}
+	firstPaths, err := resolveSkillOptTrainOptimizerPaths(paths, session, iteration, request)
+	if err != nil {
+		t.Fatalf("resolve first optimizer paths: %v", err)
+	}
+	firstMetadata, err := exportSkillOptTrainPackage(ctx, store, iteration, firstPaths, request)
+	if err != nil {
+		t.Fatalf("export first training package: %v", err)
+	}
+	session.State = skillopt.TrainStateOptimizerCompleted
+	iteration.State = skillopt.TrainStateOptimizerCompleted
+	session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "optimizer", firstMetadata)
+	iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "optimizer", firstMetadata)
+	if err := store.UpsertSkillOptTrainSessionAndIteration(ctx, session, iteration); err != nil {
+		t.Fatalf("persist completed optimizer state: %v", err)
+	}
+
+	rerunRequest := request
+	rerunRequest.RerunOptimizer = true
+	rerunRequest.EvaluatorModel = "rerun-evaluator"
+	rerunPaths, err := resolveSkillOptTrainOptimizerPaths(paths, session, iteration, rerunRequest)
+	if err != nil {
+		t.Fatalf("resolve rerun optimizer paths: %v", err)
+	}
+	if rerunPaths.TrainingPackagePath == firstPaths.TrainingPackagePath {
+		t.Fatalf("rerun reused first training package path: %s", rerunPaths.TrainingPackagePath)
+	}
+	if _, err := exportSkillOptTrainPackage(ctx, store, iteration, rerunPaths, rerunRequest); err != nil {
+		t.Fatalf("export rerun training package: %v", err)
+	}
+	content, err := os.ReadFile(rerunPaths.TrainingPackagePath)
+	if err != nil {
+		t.Fatalf("read rerun training package: %v", err)
+	}
+	var pkg skillopt.TrainingPackage
+	if err := json.Unmarshal(content, &pkg); err != nil {
+		t.Fatalf("decode rerun training package: %v", err)
+	}
+	if pkg.EvaluatorProfile == nil ||
+		pkg.EvaluatorProfile.ProfileID != "landing_page_v1" ||
+		pkg.EvaluatorProfile.Judge == nil ||
+		pkg.EvaluatorProfile.Judge.Model != "rerun-evaluator" {
+		t.Fatalf("rerun training package evaluator profile = %+v", pkg.EvaluatorProfile)
+	}
+}
+
+func TestSkillOptTrainRerunFromPackageCreatedExportsFreshPackage(t *testing.T) {
+	home, baseVersionID := seedSkillOptTrainFeedbackSynced(t)
+	paths := config.PathsForHome(home)
+	ctx := context.Background()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	session, err := store.GetSkillOptTrainSession(ctx, "optimizer-train")
+	if err != nil {
+		t.Fatalf("GetSkillOptTrainSession returned error: %v", err)
+	}
+	iteration, err := store.GetLatestSkillOptTrainIteration(ctx, "optimizer-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+
+	request := skillOptTrainOptimizerRequest{OutRoot: filepath.Join(t.TempDir(), "optimizer")}
+	firstPaths, err := resolveSkillOptTrainOptimizerPaths(paths, session, iteration, request)
+	if err != nil {
+		t.Fatalf("resolve first optimizer paths: %v", err)
+	}
+	firstMetadata, err := exportSkillOptTrainPackage(ctx, store, iteration, firstPaths, request)
+	if err != nil {
+		t.Fatalf("export first training package: %v", err)
+	}
+	session.State = skillopt.TrainStateTrainingPackageCreated
+	iteration.State = skillopt.TrainStateTrainingPackageCreated
+	session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "optimizer", firstMetadata)
+	iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "optimizer", firstMetadata)
+	if err := store.UpsertSkillOptTrainSessionAndIteration(ctx, session, iteration); err != nil {
+		t.Fatalf("persist package-created state: %v", err)
+	}
+
+	runner := &skillOptTrainFakeOptimizerRunner{
+		candidate: cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with rerun candidate guidance."),
+	}
+	runner.beforeRun = func(dir string, args []string) error {
+		trainingPackage := argValue(args, "--training-package")
+		if trainingPackage == "" {
+			return errors.New("missing --training-package")
+		}
+		content, err := os.ReadFile(trainingPackage)
+		if err != nil {
+			return fmt.Errorf("read rerun training package: %w", err)
+		}
+		var pkg skillopt.TrainingPackage
+		if err := json.Unmarshal(content, &pkg); err != nil {
+			return fmt.Errorf("decode rerun training package: %w", err)
+		}
+		if pkg.EvaluatorProfile == nil ||
+			pkg.EvaluatorProfile.Judge == nil ||
+			pkg.EvaluatorProfile.Judge.Model != "rerun-evaluator" {
+			return fmt.Errorf("rerun training package evaluator profile = %+v", pkg.EvaluatorProfile)
+		}
+		return nil
+	}
+	previousRunner := skillOptTrainOptimizerRunner
+	skillOptTrainOptimizerRunner = runner
+	defer func() {
+		skillOptTrainOptimizerRunner = previousRunner
+	}()
+
+	_, err = continueSkillOptTrainOptimizer(ctx, paths, store, session, iteration, skillOptTrainOptimizerRequest{
+		OutRoot:        request.OutRoot,
+		RerunOptimizer: true,
+		EvaluatorID:    "landing_page_v1",
+		EvaluatorModel: "rerun-evaluator",
+	})
+	if err != nil {
+		t.Fatalf("continueSkillOptTrainOptimizer rerun returned error: %v", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("optimizer calls = %+v, want one", runner.calls)
+	}
+	if argValue(runner.calls[0].args, "--training-package") == firstPaths.TrainingPackagePath {
+		t.Fatalf("rerun reused first training package path: %s", firstPaths.TrainingPackagePath)
 	}
 }
 
@@ -5654,7 +5809,7 @@ func TestSkillOptTrainContinueRejectsCandidateForDifferentSessionTemplate(t *tes
 	if _, err := os.Stat(trainingPackagePath); err != nil {
 		t.Fatalf("expected persisted training package before rerun: %v", err)
 	}
-	secondAttemptRoot := filepath.Join(outRoot, "attempts", "attempt-002")
+	secondAttemptRoot := filepath.Join(filepath.Dir(firstAttemptRoot), "attempt-002")
 	runner.beforeRun = func(dir string, args []string) error {
 		if len(runner.calls) != 2 {
 			return nil
