@@ -373,13 +373,21 @@ modifying the train state.
 
 ## Candidate Review And Next Iteration
 
-The candidate review step publishes the candidate summary, template diff,
-preview/PR links when available, and copyable decision commands. It separates
-selection score, evaluator/test scores, gate status, no-op status, and
-promotability so a candidate selected by the optimizer is not confused with a
-candidate that passed evaluator gates. If stored metadata marks the candidate as
-no-op or not promotable, the review body says promotion is unavailable instead
-of showing a promote command.
+The candidate review step publishes the candidate summary, preview/PR links
+when available, GitHub links to the candidate skill files, and copyable decision
+commands. The review repo file contract is:
+
+- `skillopt/runs/<session>/<iteration>/<candidate>/best_skill.md`
+- `skillopt/runs/<session>/<iteration>/<candidate>/base_skill.md`
+- `skillopt/runs/<session>/<iteration>/<candidate>/candidate.diff.md`
+
+These files let reviewers inspect the proposed skill, the baseline skill, and
+the candidate diff directly in GitHub. The review also separates selection
+score, evaluator/test scores, gate status, no-op status, and promotability so a
+candidate selected by the optimizer is not confused with a candidate that passed
+evaluator gates. If stored metadata marks the candidate as no-op or not
+promotable, the review body says promotion is unavailable instead of showing a
+promote command.
 
 Promote or reject explicitly:
 
