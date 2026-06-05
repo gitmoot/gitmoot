@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -223,6 +224,7 @@ type TrainingPackage struct {
 	FeedbackEvents       []FeedbackEvent       `json:"feedback_events"`
 	RankedFeedbackEvents []RankedFeedbackEvent `json:"ranked_feedback_events,omitempty"`
 	PairwisePreferences  []PairwisePreference  `json:"pairwise_preferences,omitempty"`
+	FeedbackContext      json.RawMessage       `json:"feedback_context,omitempty"`
 	EvaluatorConfig      json.RawMessage       `json:"evaluator_config,omitempty"`
 	EvaluatorProfile     *EvaluatorProfile     `json:"evaluator_profile,omitempty"`
 }
@@ -327,6 +329,10 @@ func ExportTrainingPackage(ctx context.Context, store *db.Store, runID string) (
 	if err != nil {
 		return TrainingPackage{}, err
 	}
+	feedbackContext, err := buildTrainingFeedbackContext(run, feedbackEvents, rankedFeedbackEvents)
+	if err != nil {
+		return TrainingPackage{}, err
+	}
 	metadata, err := rawJSON(run.MetadataJSON)
 	if err != nil {
 		return TrainingPackage{}, fmt.Errorf("eval run metadata_json: %w", err)
@@ -352,9 +358,73 @@ func ExportTrainingPackage(ctx context.Context, store *db.Store, runID string) (
 		FeedbackEvents:       feedbackEvents,
 		RankedFeedbackEvents: rankedFeedbackEvents,
 		PairwisePreferences:  pairwisePreferences,
+		FeedbackContext:      feedbackContext,
 		EvaluatorConfig:      metadata,
 		EvaluatorProfile:     evaluatorProfile,
 	}, nil
+}
+
+func buildTrainingFeedbackContext(run db.EvalRun, feedback []FeedbackEvent, ranked []RankedFeedbackEvent) (json.RawMessage, error) {
+	if len(feedback) == 0 && len(ranked) == 0 {
+		return nil, nil
+	}
+	context := map[string]any{
+		"feedback_source":        "imported_human_review",
+		"feedback_target":        "baseline_review_outputs",
+		"review_run_id":          run.ID,
+		"reviewed_skill_version": run.TemplateVersionID,
+	}
+	if issue := reviewIssueFromFeedback(feedback, ranked); issue != "" {
+		context["review_issue"] = issue
+	}
+	if run.TargetRepo != "" {
+		context["target_repo"] = run.TargetRepo
+	}
+	raw, err := json.Marshal(context)
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func reviewIssueFromFeedback(feedback []FeedbackEvent, ranked []RankedFeedbackEvent) string {
+	for _, event := range ranked {
+		if issue := reviewIssueFromSourceURL(event.SourceURL); issue != "" {
+			return issue
+		}
+	}
+	for _, event := range feedback {
+		if issue := reviewIssueFromSourceURL(event.SourceURL); issue != "" {
+			return issue
+		}
+	}
+	return ""
+}
+
+func reviewIssueFromSourceURL(sourceURL string) string {
+	value := strings.TrimSpace(sourceURL)
+	if value == "" {
+		return ""
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return ""
+	}
+	host := strings.TrimSpace(parsed.Host)
+	if host != "github.com" && !strings.HasSuffix(host, ".github.com") {
+		return ""
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) < 4 || (parts[2] != "issues" && parts[2] != "pull") {
+		return ""
+	}
+	owner := strings.TrimSpace(parts[0])
+	repo := strings.TrimSpace(parts[1])
+	number := strings.TrimSpace(parts[3])
+	if owner == "" || repo == "" || number == "" {
+		return ""
+	}
+	return owner + "/" + repo + "#" + number
 }
 
 func EvaluatorProfileFromConfig(config json.RawMessage) *EvaluatorProfile {

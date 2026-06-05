@@ -527,8 +527,31 @@ func TestExportTrainingPackageIncludesRankedExplorationFeedback(t *testing.T) {
 	if len(pkg.PairwisePreferences) != 6 || pkg.PairwisePreferences[0].Preferred != "c" || pkg.PairwisePreferences[5].Rejected != "b" || pkg.PairwisePreferences[0].RankedEventID != pkg.RankedFeedbackEvents[0].ID {
 		t.Fatalf("pairwise preferences = %+v", pkg.PairwisePreferences)
 	}
+	var feedbackContext map[string]any
+	if err := json.Unmarshal(pkg.FeedbackContext, &feedbackContext); err != nil {
+		t.Fatalf("feedback context did not unmarshal: %v", err)
+	}
+	if feedbackContext["feedback_source"] != "imported_human_review" || feedbackContext["feedback_target"] != "baseline_review_outputs" {
+		t.Fatalf("feedback context source/target = %+v", feedbackContext)
+	}
+	if feedbackContext["review_issue"] != "owner/repo#1" || feedbackContext["review_run_id"] != "ranked-1" || feedbackContext["reviewed_skill_version"] != installed.VersionID {
+		t.Fatalf("feedback context review metadata = %+v", feedbackContext)
+	}
 	if _, err := json.Marshal(pkg); err != nil {
 		t.Fatalf("exported ranked package did not marshal: %v", err)
+	}
+}
+
+func TestReviewIssueFromSourceURLSupportsIssueAndPullTargets(t *testing.T) {
+	tests := map[string]string{
+		"https://github.com/owner/repo/issues/1#issuecomment-1": "owner/repo#1",
+		"https://github.com/owner/repo/pull/2#issuecomment-2":   "owner/repo#2",
+		"https://example.com/owner/repo/issues/3":               "",
+	}
+	for sourceURL, want := range tests {
+		if got := reviewIssueFromSourceURL(sourceURL); got != want {
+			t.Fatalf("reviewIssueFromSourceURL(%q) = %q, want %q", sourceURL, got, want)
+		}
 	}
 }
 
