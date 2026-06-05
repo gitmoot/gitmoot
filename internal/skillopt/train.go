@@ -398,7 +398,7 @@ func trainBlockedStepAndAction(state string) (string, string) {
 	case TrainStateCandidateCreated:
 		return TrainStateCandidateReviewPublished, "publish candidate diff and preview review"
 	case TrainStateCandidateReviewPublished:
-		return "candidate decision", "promote, reject with a reason, or abandon the iteration"
+		return "candidate decision", "choose promote, reject with a reason, or wait for human decision; keep improving by rejecting with an actionable reason and starting the next iteration"
 	case TrainStateCandidatePromoted:
 		return "", "start the next iteration from the promoted candidate or stop"
 	case TrainStateCandidateRejected:

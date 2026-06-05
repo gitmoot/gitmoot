@@ -155,11 +155,20 @@ score, evaluator/test scores, gate status, no-op status, and promotability. If
 metadata marks the candidate as no-op or not promotable, the review says
 promotion is unavailable instead of showing a promote command.
 
-Promote or reject explicitly:
+Choose explicitly:
 
 ```sh
 gitmoot skillopt train continue --session planner-train --promote planner@v2
 gitmoot skillopt train continue --session planner-train --reject planner@v2 --reason "Too broad"
+```
+
+Waiting is also a valid decision while a human is still reviewing: take no
+action and `gitmoot skillopt train status --session planner-train` keeps
+reporting the candidate decision gate. To keep improving, reject with an
+actionable reason such as "Improve product visuals and mobile polish", then
+start the next iteration after the rejection is recorded:
+
+```sh
 gitmoot skillopt train continue --session planner-train --start-next
 ```
 

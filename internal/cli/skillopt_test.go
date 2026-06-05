@@ -3276,6 +3276,8 @@ func TestSkillOptTrainContinuePublishesCandidateReviewPromotesAndStartsNext(t *t
 		"planner@v2",
 		skillOptTrainCandidateDecisionCommand(true, "optimizer-train", "--promote", "planner@v2", false),
 		skillOptTrainCandidateDecisionCommand(true, "optimizer-train", "--reject", "planner@v2", true),
+		"Wait: take no action",
+		"Keep improving: reject with an actionable reason",
 		skillOptTrainStartNextCommand(true, "optimizer-train"),
 	} {
 		if !strings.Contains(fakeGitHub.createdIssue.Body, want) {
@@ -3782,6 +3784,8 @@ func TestSkillOptTrainCandidateReviewBodyMarksNoOpNotPromotable(t *testing.T) {
 		"No-op status: `blocked: best_origin_initial_skill`",
 		"Promotability: `not promotable: best_origin_initial_skill`",
 		"Promote: unavailable because best_origin_initial_skill.",
+		"Wait: take no action",
+		"Keep improving: reject with an actionable reason",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("candidate review body missing %q:\n%s", want, body)

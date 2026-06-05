@@ -90,6 +90,18 @@ func TestBuildTrainStatusSummaryReportsNextAction(t *testing.T) {
 	if summary.FeedbackCount != 4 || summary.IssueURL == "" || summary.CandidateVersion != "planner@v3" {
 		t.Fatalf("summary counts/links = %+v", summary)
 	}
+
+	iteration.State = TrainStateCandidateReviewPublished
+	summary = BuildTrainStatusSummary(
+		db.SkillOptTrainSession{ID: "landing-page", State: TrainStateCandidateReviewPublished},
+		&iteration,
+		TrainStatusCounts{},
+	)
+	if summary.BlockedStep != "candidate decision" ||
+		!strings.Contains(summary.NextAction, "wait for human decision") ||
+		!strings.Contains(summary.NextAction, "rejecting with an actionable reason") {
+		t.Fatalf("candidate decision summary = %+v", summary)
+	}
 }
 
 func TestBuildTrainStatusSummaryWithoutIteration(t *testing.T) {

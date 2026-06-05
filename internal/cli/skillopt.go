@@ -1159,7 +1159,7 @@ func continueSkillOptTrain(ctx context.Context, paths config.Paths, store *db.St
 		lines := []string{
 			fmt.Sprintf("candidate_review: %s", result.URL),
 			fmt.Sprintf("candidate: %s", result.CandidateVersionID),
-			"next: promote with --promote, reject with --reject --reason, or wait for a human decision",
+			"next: choose promote, reject with a reason, or wait; keep improving by rejecting with an actionable reason and then running --start-next",
 		}
 		return skillOptTrainContinueOutput{Summary: updatedSummary, Counts: updatedCounts, ContinueReady: true, Lines: lines}, nil
 	case skillopt.TrainStateCandidateReviewPublished:
@@ -2157,7 +2157,8 @@ func skillOptTrainCandidateReviewBody(ctx context.Context, store *db.Store, sess
 		fmt.Fprintf(&builder, "- Promote: unavailable because %s.\n", reason)
 	}
 	fmt.Fprintf(&builder, "- Reject: `%s`\n", skillOptTrainCandidateDecisionCommand(usesCustomHome, session.ID, "--reject", candidateID, true))
-	fmt.Fprintf(&builder, "- Continue: `%s` after promote/reject completes.\n", skillOptTrainStartNextCommand(usesCustomHome, session.ID))
+	fmt.Fprintf(&builder, "- Wait: take no action; `%s` will keep reporting that a candidate decision is required.\n", skillOptTrainStatusCommand(usesCustomHome, session.ID))
+	fmt.Fprintf(&builder, "- Keep improving: reject with an actionable reason, then run `%s` after the rejection completes.\n", skillOptTrainStartNextCommand(usesCustomHome, session.ID))
 	return builder.String(), nil
 }
 
@@ -2399,6 +2400,15 @@ func skillOptTrainStartNextCommand(usesCustomHome bool, sessionID string) string
 		args = append(args, "--home", "<train-home>")
 	}
 	args = append(args, "--session", strings.TrimSpace(sessionID), "--start-next")
+	return shellArgs(args)
+}
+
+func skillOptTrainStatusCommand(usesCustomHome bool, sessionID string) string {
+	args := []string{"gitmoot", "skillopt", "train", "status"}
+	if usesCustomHome {
+		args = append(args, "--home", "<train-home>")
+	}
+	args = append(args, "--session", strings.TrimSpace(sessionID))
 	return shellArgs(args)
 }
 
