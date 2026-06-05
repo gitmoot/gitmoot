@@ -3072,9 +3072,12 @@ func TestSkillOptTrainContinueBackendCodexResolvesPresetAndReportsPreflight(t *t
 		"--target-backend", "codex",
 		"--evaluator-id", "landing_page_v1",
 		"--out-root", outRoot,
+		"--feedback-direct-mode", "auto",
 		"--gate-reject-retry-budget", "3",
 		"--noop-retry-budget", "1",
 		"--wrong-artifact-retry-budget", "1",
+		"--target-artifact-retry-budget", "2",
+		"--hard-failure-retry-budget", "3",
 		"--dry-run",
 	}, &stdout, &stderr)
 	if code != 0 {
@@ -3088,6 +3091,9 @@ func TestSkillOptTrainContinueBackendCodexResolvesPresetAndReportsPreflight(t *t
 		"internal_target_adapter: codex_exec",
 		"evaluator_backend: codex",
 		"backend_config_status: codex_no_azure_or_openai_required",
+		"feedback_direct_mode: auto",
+		"target_artifact_retry_budget: 2",
+		"hard_failure_retry_budget: 3",
 		"optimizer_lock: acquired",
 		"recovery_available: true",
 		"optimizer_dry_run: true",
@@ -3108,6 +3114,9 @@ func TestSkillOptTrainContinueBackendCodexResolvesPresetAndReportsPreflight(t *t
 		"--gate-reject-retry-budget", "3",
 		"--noop-retry-budget", "1",
 		"--wrong-artifact-retry-budget", "1",
+		"--target-artifact-retry-budget", "2",
+		"--hard-failure-retry-budget", "3",
+		"--feedback-direct-mode", "auto",
 		"--dry-run",
 	} {
 		if !containsString(call.args, want) {
@@ -3154,18 +3163,47 @@ func TestSkillOptTrainContinueBackendCodexRejectsConflictingAdvancedBackend(t *t
 	}
 }
 
-func TestSkillOptTrainContinueRejectsNegativeRetryBudget(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{
-		"skillopt", "train", "continue",
-		"--session", "optimizer-train",
-		"--noop-retry-budget", "-1",
-	}, &stdout, &stderr)
-	if code != 2 {
-		t.Fatalf("negative retry budget exit code = %d, want 2; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "--noop-retry-budget must be zero or greater") {
-		t.Fatalf("negative retry budget stderr = %q", stderr.String())
+func TestSkillOptTrainContinueRejectsInvalidOptimizerControls(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "negative noop retry budget",
+			args: []string{"--noop-retry-budget", "-1"},
+			want: "--noop-retry-budget must be zero or greater",
+		},
+		{
+			name: "negative target artifact retry budget",
+			args: []string{"--target-artifact-retry-budget", "-1"},
+			want: "--target-artifact-retry-budget must be zero or greater",
+		},
+		{
+			name: "negative hard failure retry budget",
+			args: []string{"--hard-failure-retry-budget", "-1"},
+			want: "--hard-failure-retry-budget must be zero or greater",
+		},
+		{
+			name: "invalid feedback direct mode",
+			args: []string{"--feedback-direct-mode", "bogus"},
+			want: "--feedback-direct-mode must be auto, on, or off",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			args := append([]string{
+				"skillopt", "train", "continue",
+				"--session", "optimizer-train",
+			}, tc.args...)
+			code := Run(args, &stdout, &stderr)
+			if code != 2 {
+				t.Fatalf("invalid optimizer control exit code = %d, want 2; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+			}
+			if !strings.Contains(stderr.String(), tc.want) {
+				t.Fatalf("invalid optimizer control stderr = %q, want %q", stderr.String(), tc.want)
+			}
+		})
 	}
 }
 
@@ -3200,6 +3238,15 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 			"retry_attempts": "1/1",
 			"duplicate_retry_detected": true,
 			"evaluator_reason": "Candidate was valid but had weaker imagery.",
+			"optimizer_hint": "Resolve imported review themes and artifact contract.",
+			"failed_dimensions": ["human_feedback_alignment", "artifact_contract"],
+			"human_feedback_context": {
+				"source_item_ids": ["item-001"],
+				"rankings": ["D > B > C > A"],
+				"preserve": ["D: clean hero"],
+				"improve": ["MoonAI-style premium branding", "scroll animations"],
+				"avoid": ["C: overlapping text"]
+			},
 			"next_action": [
 				"collect more feedback",
 				"rerun with higher retry budget",
@@ -3214,11 +3261,21 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 	}`)
 	baselineGateScore := 0.89
 	candidateGateScore := 0.84
+	humanFeedbackContext := json.RawMessage(`{
+		"source_item_ids": ["item-001"],
+		"rankings": ["D > B > C > A"],
+		"preserve": ["D: clean hero"],
+		"improve": ["MoonAI-style premium branding", "scroll animations"],
+		"avoid": ["C: overlapping text"]
+	}`)
 	candidate.Summary.GateRejection = &skillopt.GateRejectionPacket{
-		RejectionType:  "candidate_score_regression",
-		PrimaryReason:  "candidate_quality_regressed",
-		AttemptedPatch: "artifact delivery only",
-		RetryAttempts:  "1/1",
+		RejectionType:        "candidate_score_regression",
+		PrimaryReason:        "candidate_quality_regressed",
+		OptimizerHint:        "Resolve imported review themes and artifact contract.",
+		FailedDimensions:     []string{"human_feedback_alignment", "artifact_contract"},
+		HumanFeedbackContext: humanFeedbackContext,
+		AttemptedPatch:       "artifact delivery only",
+		RetryAttempts:        "1/1",
 		Baseline: skillopt.GateRejectionScores{
 			GateScore: &baselineGateScore,
 		},
@@ -3273,7 +3330,9 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 		!strings.Contains(iteration.MetadataJSON, `"no_candidate_reason":"gate_rejected_best_origin_initial_skill"`) ||
 		!strings.Contains(iteration.MetadataJSON, `"attempted_patch":"artifact delivery only"`) ||
 		!strings.Contains(iteration.MetadataJSON, `"duplicate_retry_detected":true`) ||
-		!strings.Contains(iteration.MetadataJSON, `"evaluator_reason":"Candidate was valid but had weaker imagery."`) {
+		!strings.Contains(iteration.MetadataJSON, `"evaluator_reason":"Candidate was valid but had weaker imagery."`) ||
+		!strings.Contains(iteration.MetadataJSON, `"optimizer_hint":"Resolve imported review themes and artifact contract."`) ||
+		!strings.Contains(iteration.MetadataJSON, `"source_item_ids":["item-001"]`) {
 		t.Fatalf("iteration metadata after no-candidate = %s", iteration.MetadataJSON)
 	}
 	if _, err := store.GetAgentTemplateVersionByID(context.Background(), "planner@v2"); !errors.Is(err, sql.ErrNoRows) {
@@ -3297,6 +3356,8 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 		statusJSON.NoCandidateReason != "gate_rejected_best_origin_initial_skill" ||
 		statusJSON.NoCandidateDetails["attempted_patch"] != "artifact delivery only" ||
 		statusJSON.NoCandidateDetails["duplicate_retry_detected"] != true ||
+		statusJSON.NoCandidateDetails["optimizer_hint"] != "Resolve imported review themes and artifact contract." ||
+		statusJSON.NoCandidateDetails["human_feedback_context"] == nil ||
 		statusJSON.Verbose == nil ||
 		statusJSON.Verbose.Optimizer["optimizer_attempt"] != "attempt-001" ||
 		statusJSON.Verbose.Optimizer["optimizer_attempt_state"] != "completed_no_candidate" {
@@ -3320,6 +3381,13 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 		"retry_attempts: 1/1",
 		"duplicate_retry_detected: true",
 		"evaluator_reason: Candidate was valid but had weaker imagery.",
+		"optimizer_hint: Resolve imported review themes and artifact contract.",
+		"failed_dimensions: human_feedback_alignment,artifact_contract",
+		"human_feedback_source_item_ids: item-001",
+		"human_feedback_rankings: D > B > C > A",
+		"human_feedback_preserve: D: clean hero",
+		"human_feedback_improve: MoonAI-style premium branding; scroll animations",
+		"human_feedback_avoid: C: overlapping text",
 		"next_action_option: collect more feedback",
 		"next_action_option: rerun with higher retry budget",
 	} {

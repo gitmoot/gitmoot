@@ -643,6 +643,9 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 	noopRetryBudget := fs.Int("noop-retry-budget", -1, "noop optimizer retry budget; omit to use gitmoot-skillopt default")
 	gateRejectRetryBudget := fs.Int("gate-reject-retry-budget", -1, "gate-rejection optimizer retry budget; omit to use gitmoot-skillopt default")
 	wrongArtifactRetryBudget := fs.Int("wrong-artifact-retry-budget", -1, "wrong-artifact optimizer retry budget; omit to use gitmoot-skillopt default")
+	targetArtifactRetryBudget := fs.Int("target-artifact-retry-budget", -1, "target artifact repair retry budget; omit to use gitmoot-skillopt default")
+	hardFailureRetryBudget := fs.Int("hard-failure-retry-budget", -1, "hard-failure reflection retry budget; omit to use gitmoot-skillopt default")
+	feedbackDirectMode := fs.String("feedback-direct-mode", "", "feedback-direct optimizer mode: auto, on, or off")
 	gate := fs.String("gate", "", "optimizer gate metric: hard, soft, or mixed")
 	outRoot := fs.String("out-root", "", "optimizer output directory")
 	timeout := fs.String("timeout", "", "optimizer timeout duration")
@@ -690,6 +693,18 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "skillopt train continue: --wrong-artifact-retry-budget must be zero or greater")
 		return 2
 	}
+	if setFlags["target-artifact-retry-budget"] && *targetArtifactRetryBudget < 0 {
+		fmt.Fprintln(stderr, "skillopt train continue: --target-artifact-retry-budget must be zero or greater")
+		return 2
+	}
+	if setFlags["hard-failure-retry-budget"] && *hardFailureRetryBudget < 0 {
+		fmt.Fprintln(stderr, "skillopt train continue: --hard-failure-retry-budget must be zero or greater")
+		return 2
+	}
+	if mode := strings.TrimSpace(strings.ToLower(*feedbackDirectMode)); mode != "" && mode != "auto" && mode != "on" && mode != "off" {
+		fmt.Fprintln(stderr, "skillopt train continue: --feedback-direct-mode must be auto, on, or off")
+		return 2
+	}
 	var output skillOptTrainContinueOutput
 	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
 		var err error
@@ -699,30 +714,35 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 			GeneratorAgent: *generatorAgent,
 			GeneratorType:  *generatorType,
 			Optimizer: skillOptTrainOptimizerRequest{
-				SkillOptBin:                 *skillOptBin,
-				Backend:                     *backend,
-				Model:                       *model,
-				OptimizerModel:              *optimizerModel,
-				TargetModel:                 *targetModel,
-				OptimizerBackend:            *optimizerBackend,
-				TargetBackend:               *targetBackend,
-				EvaluatorID:                 *evaluatorID,
-				EvaluatorModel:              *evaluatorModel,
-				EvaluatorBackend:            *evaluatorBackend,
-				SkillUpdateMode:             *skillUpdateMode,
-				NumEpochs:                   *numEpochs,
-				BatchSize:                   *batchSize,
-				NoopRetryBudget:             *noopRetryBudget,
-				NoopRetryBudgetSet:          setFlags["noop-retry-budget"],
-				GateRejectRetryBudget:       *gateRejectRetryBudget,
-				GateRejectRetryBudgetSet:    setFlags["gate-reject-retry-budget"],
-				WrongArtifactRetryBudget:    *wrongArtifactRetryBudget,
-				WrongArtifactRetryBudgetSet: setFlags["wrong-artifact-retry-budget"],
-				Gate:                        *gate,
-				OutRoot:                     *outRoot,
-				Timeout:                     *timeout,
-				DryRun:                      *dryRun,
-				RerunOptimizer:              *rerunOptimizer,
+				SkillOptBin:                  *skillOptBin,
+				Backend:                      *backend,
+				Model:                        *model,
+				OptimizerModel:               *optimizerModel,
+				TargetModel:                  *targetModel,
+				OptimizerBackend:             *optimizerBackend,
+				TargetBackend:                *targetBackend,
+				EvaluatorID:                  *evaluatorID,
+				EvaluatorModel:               *evaluatorModel,
+				EvaluatorBackend:             *evaluatorBackend,
+				SkillUpdateMode:              *skillUpdateMode,
+				NumEpochs:                    *numEpochs,
+				BatchSize:                    *batchSize,
+				NoopRetryBudget:              *noopRetryBudget,
+				NoopRetryBudgetSet:           setFlags["noop-retry-budget"],
+				GateRejectRetryBudget:        *gateRejectRetryBudget,
+				GateRejectRetryBudgetSet:     setFlags["gate-reject-retry-budget"],
+				WrongArtifactRetryBudget:     *wrongArtifactRetryBudget,
+				WrongArtifactRetryBudgetSet:  setFlags["wrong-artifact-retry-budget"],
+				TargetArtifactRetryBudget:    *targetArtifactRetryBudget,
+				TargetArtifactRetryBudgetSet: setFlags["target-artifact-retry-budget"],
+				HardFailureRetryBudget:       *hardFailureRetryBudget,
+				HardFailureRetryBudgetSet:    setFlags["hard-failure-retry-budget"],
+				FeedbackDirectMode:           strings.TrimSpace(strings.ToLower(*feedbackDirectMode)),
+				Gate:                         *gate,
+				OutRoot:                      *outRoot,
+				Timeout:                      *timeout,
+				DryRun:                       *dryRun,
+				RerunOptimizer:               *rerunOptimizer,
 			},
 			PromoteCandidate: *promote,
 			RejectCandidate:  *reject,
@@ -769,31 +789,36 @@ type skillOptTrainContinueRequest struct {
 }
 
 type skillOptTrainOptimizerRequest struct {
-	SkillOptBin                 string
-	Backend                     string
-	Model                       string
-	OptimizerModel              string
-	TargetModel                 string
-	OptimizerBackend            string
-	TargetBackend               string
-	EvaluatorID                 string
-	EvaluatorModel              string
-	EvaluatorBackend            string
-	SkillUpdateMode             string
-	NumEpochs                   int
-	BatchSize                   int
-	NoopRetryBudget             int
-	NoopRetryBudgetSet          bool
-	GateRejectRetryBudget       int
-	GateRejectRetryBudgetSet    bool
-	WrongArtifactRetryBudget    int
-	WrongArtifactRetryBudgetSet bool
-	Gate                        string
-	OutRoot                     string
-	Timeout                     string
-	DryRun                      bool
-	RerunOptimizer              bool
-	OptimizerLockState          string
+	SkillOptBin                  string
+	Backend                      string
+	Model                        string
+	OptimizerModel               string
+	TargetModel                  string
+	OptimizerBackend             string
+	TargetBackend                string
+	EvaluatorID                  string
+	EvaluatorModel               string
+	EvaluatorBackend             string
+	SkillUpdateMode              string
+	NumEpochs                    int
+	BatchSize                    int
+	NoopRetryBudget              int
+	NoopRetryBudgetSet           bool
+	GateRejectRetryBudget        int
+	GateRejectRetryBudgetSet     bool
+	WrongArtifactRetryBudget     int
+	WrongArtifactRetryBudgetSet  bool
+	TargetArtifactRetryBudget    int
+	TargetArtifactRetryBudgetSet bool
+	HardFailureRetryBudget       int
+	HardFailureRetryBudgetSet    bool
+	FeedbackDirectMode           string
+	Gate                         string
+	OutRoot                      string
+	Timeout                      string
+	DryRun                       bool
+	RerunOptimizer               bool
+	OptimizerLockState           string
 }
 
 type skillOptTrainContinueOutput struct {
@@ -1313,6 +1338,7 @@ type skillOptTrainOptimizerResult struct {
 	Command               string
 	Args                  []string
 	DryRun                bool
+	Request               skillOptTrainOptimizerRequest
 	BackendResolution     skillOptTrainBackendResolution
 	RecoveryAvailable     bool
 	OptimizerLockState    string
@@ -2780,6 +2806,7 @@ func continueSkillOptTrainOptimizer(ctx context.Context, paths config.Paths, sto
 		OptimizerAttempt:     optimizerPaths.OptimizerAttempt,
 		OptimizerAttemptPath: optimizerPaths.OptimizerAttemptPath,
 		DryRun:               request.DryRun,
+		Request:              request,
 		BackendResolution:    backendResolution,
 		RecoveryAvailable:    skillOptTrainOptimizerRecoveryAvailable(optimizerPaths),
 		OptimizerLockState:   skillOptTrainOptimizerLockState(request),
@@ -3241,10 +3268,19 @@ func skillOptTrainOptimizerRequestHash(request skillOptTrainOptimizerRequest) st
 			"set":   request.WrongArtifactRetryBudgetSet,
 			"value": request.WrongArtifactRetryBudget,
 		},
-		"gate":            strings.TrimSpace(request.Gate),
-		"timeout":         strings.TrimSpace(request.Timeout),
-		"dry_run":         request.DryRun,
-		"rerun_optimizer": request.RerunOptimizer,
+		"target_artifact_retry_budget": map[string]any{
+			"set":   request.TargetArtifactRetryBudgetSet,
+			"value": request.TargetArtifactRetryBudget,
+		},
+		"hard_failure_retry_budget": map[string]any{
+			"set":   request.HardFailureRetryBudgetSet,
+			"value": request.HardFailureRetryBudget,
+		},
+		"feedback_direct_mode": strings.TrimSpace(request.FeedbackDirectMode),
+		"gate":                 strings.TrimSpace(request.Gate),
+		"timeout":              strings.TrimSpace(request.Timeout),
+		"dry_run":              request.DryRun,
+		"rerun_optimizer":      request.RerunOptimizer,
 	})
 	if err != nil {
 		return ""
@@ -5296,6 +5332,20 @@ func printSkillOptTrainStatusSnapshot(stdout io.Writer, snapshot skillOptTrainSt
 		if path := metadataString(snapshot.Verbose.Optimizer, "optimizer_attempt_path"); path != "" {
 			writeLine(stdout, "optimizer_attempt_path: %s", path)
 		}
+		if mode := metadataString(snapshot.Verbose.Optimizer, "feedback_direct_mode"); mode != "" {
+			writeLine(stdout, "feedback_direct_mode: %s", mode)
+		}
+		for _, key := range []string{
+			"target_artifact_retry_budget",
+			"hard_failure_retry_budget",
+			"noop_retry_budget",
+			"gate_reject_retry_budget",
+			"wrong_artifact_retry_budget",
+		} {
+			if value := metadataString(snapshot.Verbose.Optimizer, key); value != "" {
+				writeLine(stdout, "%s: %s", key, value)
+			}
+		}
 		if available, ok := snapshot.Verbose.Optimizer["recovery_available"]; ok {
 			writeLine(stdout, "optimizer_recovery_available: %v", available)
 		}
@@ -5354,6 +5404,13 @@ func printSkillOptNoCandidateDetails(stdout io.Writer, details map[string]any) {
 	if evaluatorReason := metadataString(details, "evaluator_reason"); evaluatorReason != "" {
 		writeLine(stdout, "evaluator_reason: %s", evaluatorReason)
 	}
+	if optimizerHint := metadataString(details, "optimizer_hint"); optimizerHint != "" {
+		writeLine(stdout, "optimizer_hint: %s", optimizerHint)
+	}
+	if failedDimensions := metadataStringSlice(details, "failed_dimensions"); len(failedDimensions) > 0 {
+		writeLine(stdout, "failed_dimensions: %s", strings.Join(failedDimensions, ","))
+	}
+	printSkillOptHumanFeedbackContext(stdout, decodedSkillOptMetadataValue(details["human_feedback_context"]))
 	nextActions := metadataStringSlice(details, "next_actions")
 	if len(nextActions) == 0 {
 		nextActions = metadataStringSlice(details, "next_action")
@@ -5369,6 +5426,24 @@ func printSkillOptNoCandidateDetails(stdout io.Writer, details map[string]any) {
 	candidate := decodedSkillOptMetadataValue(rejection["candidate"])
 	if len(baseline) > 0 || len(candidate) > 0 {
 		writeLine(stdout, "rejection: baseline_gate=%s candidate_gate=%s", metadataString(baseline, "gate_score"), metadataString(candidate, "gate_score"))
+	}
+	if optimizerHint := metadataString(rejection, "optimizer_hint"); optimizerHint != "" {
+		writeLine(stdout, "rejection_optimizer_hint: %s", optimizerHint)
+	}
+	if failedDimensions := metadataStringSlice(rejection, "failed_dimensions"); len(failedDimensions) > 0 {
+		writeLine(stdout, "rejection_failed_dimensions: %s", strings.Join(failedDimensions, ","))
+	}
+	printSkillOptHumanFeedbackContext(stdout, decodedSkillOptMetadataValue(rejection["human_feedback_context"]))
+}
+
+func printSkillOptHumanFeedbackContext(stdout io.Writer, context map[string]any) {
+	if len(context) == 0 {
+		return
+	}
+	for _, key := range []string{"source_item_ids", "rankings", "preserve", "improve", "avoid"} {
+		if values := metadataStringSlice(context, key); len(values) > 0 {
+			writeLine(stdout, "human_feedback_%s: %s", key, strings.Join(values, "; "))
+		}
 	}
 }
 
@@ -6479,6 +6554,15 @@ func buildSkillOptTrainOptimizerCommand(iteration db.SkillOptTrainIteration, req
 	if request.WrongArtifactRetryBudgetSet {
 		args = append(args, "--wrong-artifact-retry-budget", strconv.Itoa(request.WrongArtifactRetryBudget))
 	}
+	if request.TargetArtifactRetryBudgetSet {
+		args = append(args, "--target-artifact-retry-budget", strconv.Itoa(request.TargetArtifactRetryBudget))
+	}
+	if request.HardFailureRetryBudgetSet {
+		args = append(args, "--hard-failure-retry-budget", strconv.Itoa(request.HardFailureRetryBudget))
+	}
+	if feedbackDirectMode := strings.TrimSpace(request.FeedbackDirectMode); feedbackDirectMode != "" {
+		args = append(args, "--feedback-direct-mode", feedbackDirectMode)
+	}
 	if request.DryRun {
 		args = append(args, "--dry-run")
 	}
@@ -6565,7 +6649,32 @@ func skillOptTrainOptimizerMetadata(request skillOptTrainOptimizerRequest, paths
 	if failure != nil {
 		metadata["error"] = failure.Error()
 	}
+	addSkillOptTrainOptimizerConfigMetadata(metadata, request)
 	return metadata
+}
+
+func addSkillOptTrainOptimizerConfigMetadata(metadata map[string]any, request skillOptTrainOptimizerRequest) {
+	if metadata == nil {
+		return
+	}
+	if mode := strings.TrimSpace(request.FeedbackDirectMode); mode != "" {
+		metadata["feedback_direct_mode"] = mode
+	}
+	if request.TargetArtifactRetryBudgetSet {
+		metadata["target_artifact_retry_budget"] = request.TargetArtifactRetryBudget
+	}
+	if request.HardFailureRetryBudgetSet {
+		metadata["hard_failure_retry_budget"] = request.HardFailureRetryBudget
+	}
+	if request.NoopRetryBudgetSet {
+		metadata["noop_retry_budget"] = request.NoopRetryBudget
+	}
+	if request.GateRejectRetryBudgetSet {
+		metadata["gate_reject_retry_budget"] = request.GateRejectRetryBudget
+	}
+	if request.WrongArtifactRetryBudgetSet {
+		metadata["wrong_artifact_retry_budget"] = request.WrongArtifactRetryBudget
+	}
 }
 
 func recordSkillOptTrainOptimizerStarted(ctx context.Context, store *db.Store, session *db.SkillOptTrainSession, iteration *db.SkillOptTrainIteration, request skillOptTrainOptimizerRequest, paths skillOptTrainOptimizerPaths, command string, args []string) error {
@@ -6584,6 +6693,7 @@ func recordSkillOptTrainOptimizerStarted(ctx context.Context, store *db.Store, s
 		"started_at":             time.Now().UTC().Format(time.RFC3339Nano),
 		"source":                 "gitmoot skillopt train continue",
 	}
+	addSkillOptTrainOptimizerConfigMetadata(metadata, request)
 	session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "optimizer", metadata)
 	iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "optimizer", metadata)
 	if err := store.UpsertSkillOptTrainSession(ctx, *session); err != nil {
@@ -6784,12 +6894,22 @@ func skillOptNoCandidateDetailsFromGateRejection(gateRejection map[string]any) m
 	for _, key := range []string{"primary_reason", "human_reason", "optimizer_hint"} {
 		if value := metadataString(gateRejection, key); value != "" {
 			rejection[key] = value
+			if key == "optimizer_hint" {
+				details["optimizer_hint"] = value
+			}
 		}
 	}
 	for _, key := range []string{"failed_dimensions", "evidence"} {
 		if value := metadataStringSlice(gateRejection, key); len(value) > 0 {
 			rejection[key] = value
+			if key == "failed_dimensions" {
+				details["failed_dimensions"] = value
+			}
 		}
+	}
+	if humanFeedbackContext := decodedSkillOptMetadataValue(gateRejection["human_feedback_context"]); len(humanFeedbackContext) > 0 {
+		rejection["human_feedback_context"] = humanFeedbackContext
+		details["human_feedback_context"] = humanFeedbackContext
 	}
 	if len(rejection) > 0 {
 		details["rejection"] = rejection
@@ -6834,6 +6954,15 @@ func skillOptTrainOptimizerReportLines(result skillOptTrainOptimizerResult) []st
 		lines = append(lines, fmt.Sprintf("optimizer_command: %s", shellArgs(append([]string{result.Command}, result.Args...))))
 	} else {
 		lines = append(lines, "optimizer_command: -")
+	}
+	if mode := strings.TrimSpace(result.Request.FeedbackDirectMode); mode != "" {
+		lines = append(lines, fmt.Sprintf("feedback_direct_mode: %s", mode))
+	}
+	if result.Request.TargetArtifactRetryBudgetSet {
+		lines = append(lines, fmt.Sprintf("target_artifact_retry_budget: %d", result.Request.TargetArtifactRetryBudget))
+	}
+	if result.Request.HardFailureRetryBudgetSet {
+		lines = append(lines, fmt.Sprintf("hard_failure_retry_budget: %d", result.Request.HardFailureRetryBudget))
 	}
 	lines = append(lines, fmt.Sprintf("optimizer_dry_run: %t", result.DryRun))
 	return lines

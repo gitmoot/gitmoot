@@ -109,18 +109,19 @@ type GateRejectionScores struct {
 }
 
 type GateRejectionPacket struct {
-	RejectionType    string              `json:"rejection_type,omitempty"`
-	Retryable        bool                `json:"retryable,omitempty"`
-	Baseline         GateRejectionScores `json:"baseline,omitempty"`
-	Candidate        GateRejectionScores `json:"candidate,omitempty"`
-	PrimaryReason    string              `json:"primary_reason,omitempty"`
-	HumanReason      string              `json:"human_reason,omitempty"`
-	OptimizerHint    string              `json:"optimizer_hint,omitempty"`
-	FailedDimensions []string            `json:"failed_dimensions,omitempty"`
-	Evidence         []string            `json:"evidence,omitempty"`
-	AttemptedPatch   string              `json:"attempted_patch,omitempty"`
-	RetryAttempts    string              `json:"retry_attempts,omitempty"`
-	NextAction       string              `json:"next_action,omitempty"`
+	RejectionType        string              `json:"rejection_type,omitempty"`
+	Retryable            bool                `json:"retryable,omitempty"`
+	Baseline             GateRejectionScores `json:"baseline,omitempty"`
+	Candidate            GateRejectionScores `json:"candidate,omitempty"`
+	PrimaryReason        string              `json:"primary_reason,omitempty"`
+	HumanReason          string              `json:"human_reason,omitempty"`
+	OptimizerHint        string              `json:"optimizer_hint,omitempty"`
+	FailedDimensions     []string            `json:"failed_dimensions,omitempty"`
+	Evidence             []string            `json:"evidence,omitempty"`
+	HumanFeedbackContext json.RawMessage     `json:"human_feedback_context,omitempty"`
+	AttemptedPatch       string              `json:"attempted_patch,omitempty"`
+	RetryAttempts        string              `json:"retry_attempts,omitempty"`
+	NextAction           string              `json:"next_action,omitempty"`
 }
 
 type EvaluatorScore struct {
