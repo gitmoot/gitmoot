@@ -2917,6 +2917,9 @@ func TestSkillOptTrainContinueBackendCodexResolvesPresetAndReportsPreflight(t *t
 		"--target-backend", "codex",
 		"--evaluator-id", "landing_page_v1",
 		"--out-root", outRoot,
+		"--gate-reject-retry-budget", "3",
+		"--noop-retry-budget", "1",
+		"--wrong-artifact-retry-budget", "1",
 		"--dry-run",
 	}, &stdout, &stderr)
 	if code != 0 {
@@ -2947,6 +2950,9 @@ func TestSkillOptTrainContinueBackendCodexResolvesPresetAndReportsPreflight(t *t
 		"--target-backend", "codex_exec",
 		"--evaluator-backend", "codex",
 		"--evaluator-id", "landing_page_v1",
+		"--gate-reject-retry-budget", "3",
+		"--noop-retry-budget", "1",
+		"--wrong-artifact-retry-budget", "1",
 		"--dry-run",
 	} {
 		if !containsString(call.args, want) {
@@ -2990,6 +2996,21 @@ func TestSkillOptTrainContinueBackendCodexRejectsConflictingAdvancedBackend(t *t
 	}
 	if len(runner.calls) != 0 {
 		t.Fatalf("optimizer started despite backend conflict: %+v", runner.calls)
+	}
+}
+
+func TestSkillOptTrainContinueRejectsNegativeRetryBudget(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "continue",
+		"--session", "optimizer-train",
+		"--noop-retry-budget", "-1",
+	}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("negative retry budget exit code = %d, want 2; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--noop-retry-budget must be zero or greater") {
+		t.Fatalf("negative retry budget stderr = %q", stderr.String())
 	}
 }
 

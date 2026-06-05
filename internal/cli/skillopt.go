@@ -640,6 +640,9 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 	skillUpdateMode := fs.String("skill-update-mode", "", "SkillOpt update mode")
 	numEpochs := fs.Int("num-epochs", 0, "optimizer epoch count")
 	batchSize := fs.Int("batch-size", 0, "optimizer batch size")
+	noopRetryBudget := fs.Int("noop-retry-budget", -1, "noop optimizer retry budget; omit to use gitmoot-skillopt default")
+	gateRejectRetryBudget := fs.Int("gate-reject-retry-budget", -1, "gate-rejection optimizer retry budget; omit to use gitmoot-skillopt default")
+	wrongArtifactRetryBudget := fs.Int("wrong-artifact-retry-budget", -1, "wrong-artifact optimizer retry budget; omit to use gitmoot-skillopt default")
 	gate := fs.String("gate", "", "optimizer gate metric: hard, soft, or mixed")
 	outRoot := fs.String("out-root", "", "optimizer output directory")
 	timeout := fs.String("timeout", "", "optimizer timeout duration")
@@ -655,6 +658,10 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 		}
 		return 2
 	}
+	setFlags := map[string]bool{}
+	fs.Visit(func(flag *flag.Flag) {
+		setFlags[flag.Name] = true
+	})
 	if fs.NArg() != 0 {
 		fmt.Fprintln(stderr, "skillopt train continue does not accept positional arguments")
 		return 2
@@ -671,6 +678,18 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "skillopt train continue: --batch-size must be zero or greater")
 		return 2
 	}
+	if setFlags["noop-retry-budget"] && *noopRetryBudget < 0 {
+		fmt.Fprintln(stderr, "skillopt train continue: --noop-retry-budget must be zero or greater")
+		return 2
+	}
+	if setFlags["gate-reject-retry-budget"] && *gateRejectRetryBudget < 0 {
+		fmt.Fprintln(stderr, "skillopt train continue: --gate-reject-retry-budget must be zero or greater")
+		return 2
+	}
+	if setFlags["wrong-artifact-retry-budget"] && *wrongArtifactRetryBudget < 0 {
+		fmt.Fprintln(stderr, "skillopt train continue: --wrong-artifact-retry-budget must be zero or greater")
+		return 2
+	}
 	var output skillOptTrainContinueOutput
 	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
 		var err error
@@ -680,24 +699,30 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 			GeneratorAgent: *generatorAgent,
 			GeneratorType:  *generatorType,
 			Optimizer: skillOptTrainOptimizerRequest{
-				SkillOptBin:      *skillOptBin,
-				Backend:          *backend,
-				Model:            *model,
-				OptimizerModel:   *optimizerModel,
-				TargetModel:      *targetModel,
-				OptimizerBackend: *optimizerBackend,
-				TargetBackend:    *targetBackend,
-				EvaluatorID:      *evaluatorID,
-				EvaluatorModel:   *evaluatorModel,
-				EvaluatorBackend: *evaluatorBackend,
-				SkillUpdateMode:  *skillUpdateMode,
-				NumEpochs:        *numEpochs,
-				BatchSize:        *batchSize,
-				Gate:             *gate,
-				OutRoot:          *outRoot,
-				Timeout:          *timeout,
-				DryRun:           *dryRun,
-				RerunOptimizer:   *rerunOptimizer,
+				SkillOptBin:                 *skillOptBin,
+				Backend:                     *backend,
+				Model:                       *model,
+				OptimizerModel:              *optimizerModel,
+				TargetModel:                 *targetModel,
+				OptimizerBackend:            *optimizerBackend,
+				TargetBackend:               *targetBackend,
+				EvaluatorID:                 *evaluatorID,
+				EvaluatorModel:              *evaluatorModel,
+				EvaluatorBackend:            *evaluatorBackend,
+				SkillUpdateMode:             *skillUpdateMode,
+				NumEpochs:                   *numEpochs,
+				BatchSize:                   *batchSize,
+				NoopRetryBudget:             *noopRetryBudget,
+				NoopRetryBudgetSet:          setFlags["noop-retry-budget"],
+				GateRejectRetryBudget:       *gateRejectRetryBudget,
+				GateRejectRetryBudgetSet:    setFlags["gate-reject-retry-budget"],
+				WrongArtifactRetryBudget:    *wrongArtifactRetryBudget,
+				WrongArtifactRetryBudgetSet: setFlags["wrong-artifact-retry-budget"],
+				Gate:                        *gate,
+				OutRoot:                     *outRoot,
+				Timeout:                     *timeout,
+				DryRun:                      *dryRun,
+				RerunOptimizer:              *rerunOptimizer,
 			},
 			PromoteCandidate: *promote,
 			RejectCandidate:  *reject,
@@ -744,25 +769,31 @@ type skillOptTrainContinueRequest struct {
 }
 
 type skillOptTrainOptimizerRequest struct {
-	SkillOptBin        string
-	Backend            string
-	Model              string
-	OptimizerModel     string
-	TargetModel        string
-	OptimizerBackend   string
-	TargetBackend      string
-	EvaluatorID        string
-	EvaluatorModel     string
-	EvaluatorBackend   string
-	SkillUpdateMode    string
-	NumEpochs          int
-	BatchSize          int
-	Gate               string
-	OutRoot            string
-	Timeout            string
-	DryRun             bool
-	RerunOptimizer     bool
-	OptimizerLockState string
+	SkillOptBin                 string
+	Backend                     string
+	Model                       string
+	OptimizerModel              string
+	TargetModel                 string
+	OptimizerBackend            string
+	TargetBackend               string
+	EvaluatorID                 string
+	EvaluatorModel              string
+	EvaluatorBackend            string
+	SkillUpdateMode             string
+	NumEpochs                   int
+	BatchSize                   int
+	NoopRetryBudget             int
+	NoopRetryBudgetSet          bool
+	GateRejectRetryBudget       int
+	GateRejectRetryBudgetSet    bool
+	WrongArtifactRetryBudget    int
+	WrongArtifactRetryBudgetSet bool
+	Gate                        string
+	OutRoot                     string
+	Timeout                     string
+	DryRun                      bool
+	RerunOptimizer              bool
+	OptimizerLockState          string
 }
 
 type skillOptTrainContinueOutput struct {
@@ -3186,10 +3217,22 @@ func skillOptTrainOptimizerRequestHash(request skillOptTrainOptimizerRequest) st
 		"skill_update_mode": strings.TrimSpace(request.SkillUpdateMode),
 		"num_epochs":        request.NumEpochs,
 		"batch_size":        request.BatchSize,
-		"gate":              strings.TrimSpace(request.Gate),
-		"timeout":           strings.TrimSpace(request.Timeout),
-		"dry_run":           request.DryRun,
-		"rerun_optimizer":   request.RerunOptimizer,
+		"noop_retry_budget": map[string]any{
+			"set":   request.NoopRetryBudgetSet,
+			"value": request.NoopRetryBudget,
+		},
+		"gate_reject_retry_budget": map[string]any{
+			"set":   request.GateRejectRetryBudgetSet,
+			"value": request.GateRejectRetryBudget,
+		},
+		"wrong_artifact_retry_budget": map[string]any{
+			"set":   request.WrongArtifactRetryBudgetSet,
+			"value": request.WrongArtifactRetryBudget,
+		},
+		"gate":            strings.TrimSpace(request.Gate),
+		"timeout":         strings.TrimSpace(request.Timeout),
+		"dry_run":         request.DryRun,
+		"rerun_optimizer": request.RerunOptimizer,
 	})
 	if err != nil {
 		return ""
@@ -6414,6 +6457,15 @@ func buildSkillOptTrainOptimizerCommand(iteration db.SkillOptTrainIteration, req
 	}
 	if request.BatchSize > 0 {
 		args = append(args, "--batch-size", strconv.Itoa(request.BatchSize))
+	}
+	if request.NoopRetryBudgetSet {
+		args = append(args, "--noop-retry-budget", strconv.Itoa(request.NoopRetryBudget))
+	}
+	if request.GateRejectRetryBudgetSet {
+		args = append(args, "--gate-reject-retry-budget", strconv.Itoa(request.GateRejectRetryBudget))
+	}
+	if request.WrongArtifactRetryBudgetSet {
+		args = append(args, "--wrong-artifact-retry-budget", strconv.Itoa(request.WrongArtifactRetryBudget))
 	}
 	if request.DryRun {
 		args = append(args, "--dry-run")

@@ -364,18 +364,43 @@ Gate-rejection retry is bounded separately from no-op retry:
 
 - `noop_retry_budget`: defaults to `1` and is used when the optimizer produced
   no meaningful skill change.
-- `gate_reject_retry_budget`: defaults to `1` and is used only when a changed
+- `gate_reject_retry_budget`: defaults to `3` and is used only when a changed
   candidate loses selection eval and the rejection packet contains actionable
   new information.
+- `wrong_artifact_retry_budget`: defaults to `1` and is used when the
+  evaluator says the target produced the wrong artifact type or otherwise
+  failed the artifact contract.
 
-A gate rejection is retryable only when the evaluator supplied an
-`optimizer_hint`, the candidate actually changed, the rejection is not a repeat
-of the same reason, and budget remains. The retry prompt includes the previous
-patch summary, baseline-vs-candidate score deltas, failed dimensions, why the
-candidate lost, and guidance not to repeat the same patch direction. If the
-retry also loses, repeats the same reason, produces a no-op, or exhausts the
-budget, the run stops with `optimizer_completed_no_candidate` and a precise
-reason such as `gate_rejected_best_origin_initial_skill`.
+The retry budgets can be changed when continuing training:
+
+```sh
+gitmoot skillopt train continue \
+  --session planner-train \
+  --gate-reject-retry-budget 3 \
+  --noop-retry-budget 1 \
+  --wrong-artifact-retry-budget 1
+```
+
+A gate rejection is retryable only when the evaluator supplied actionable
+information, the candidate actually changed, the rejection is not just repeated
+noise, and budget remains. The retry prompt includes the previous patch
+summary, baseline-vs-candidate score deltas, failed dimensions, why the
+candidate lost, and guidance not to repeat the same patch direction. Near-miss
+selection rejects can also retry adaptively when the candidate is close enough
+to the baseline according to `gate_reject_retry_close_gap`, which defaults to
+`0.03`.
+
+Duplicate retry candidates do not get silently accepted or loop forever. If a
+retry produces the same candidate hash, the next retry is forced to include
+stronger duplicate-specific context. If the optimizer repeats the duplicate,
+the run stops with duplicate retry metadata instead of creating a candidate.
+Wrong-artifact retries have their own budget and do not consume the generic
+gate-rejection retry budget.
+
+If the retry also loses, repeats the same reason, produces a no-op, repeats a
+duplicate, or exhausts the relevant budget, the run stops with
+`optimizer_completed_no_candidate` and a precise reason such as
+`gate_rejected_best_origin_initial_skill`.
 
 Use verbose status to see why the run stopped and what to do next:
 
@@ -384,12 +409,23 @@ gitmoot skillopt train status --session planner-train --verbose
 ```
 
 For gate rejections, status includes the baseline/candidate score comparison,
-attempted patch, failed dimensions, retry count such as `1/1`, and a
-`next_action`. The normal user choices are to collect more feedback, rerun after
-changing the retry/config inputs, or inspect the candidate package manually.
-Gitmoot does not create a pending candidate record when the best selected prompt
-is the unchanged baseline or the candidate content hash matches the base
-template.
+attempted patch, retry count such as `1/3`, duplicate retry detection,
+evaluator reason, and concise `next_action_option` lines. The normal user
+choices are to collect more feedback, rerun after changing the retry/config
+inputs, or inspect the candidate package manually. Gitmoot does not create a
+pending candidate record when the best selected prompt is the unchanged
+baseline or the candidate content hash matches the base template.
+
+Every optimizer run writes into a numbered attempt directory:
+
+```text
+<out-root>/attempts/attempt-001/
+<out-root>/attempts/attempt-002/
+```
+
+Gitmoot records `optimizer_attempt` and `optimizer_attempt_path` in train
+metadata. Status and recovery use the active recorded attempt, so reruns do not
+reuse stale candidate packages from older attempts.
 
 If the optimizer wrapper fails after writing completed artifacts, status reports
 `status_phase: recovery_available`. Recover the artifacts through Gitmoot
@@ -460,7 +496,8 @@ The script runs focused CLI smoke tests with fake managed generation, fake
 covers local template creation, session setup, item/generation flow, required
 preview blocking, expected review repo enforcement, preview URL review packets,
 feedback-to-optimizer handoff, candidate import, candidate review publication,
-optimizer recovery, structured no-candidate status, stable status phases,
+optimizer attempt directories, optimizer recovery, structured no-candidate
+status, active attempt status/import selection, stable status phases,
 promote/reject decisions, start-next gate enforcement, watched review feedback
 import, review issue close/continue behavior, invalid-feedback comments, and
 one-time stale notices without real model calls or real GitHub mutation.
@@ -478,7 +515,9 @@ PYTHONDONTWRITEBYTECODE=1 python -m pytest \
 
 Those tests cover selection rejection creating a structured gate-rejection
 packet, default final test skipping after selection reject, actionable
-gate-rejection retry, retry budget exhaustion, no-op retry separation, and the
+gate-rejection retry, configurable retry budget defaults, adaptive retry close
+gap, duplicate retry context and metadata, wrong-artifact retry separation,
+retry budget exhaustion, no-op retry separation, evaluator rationale, and the
 no-candidate package fields Gitmoot imports.
 
 Manual smoke scenarios for review operations:
@@ -542,7 +581,8 @@ Manual smoke scenarios for review operations:
   --verbose`; usually the optimizer kept the initial skill, accepted no update,
   produced content with the same hash as the base version, or lost the
   selection gate. Gate rejection details show baseline and candidate scores,
-  attempted patch, failed dimensions, retry attempts, and next action.
+  attempted patch, duplicate retry detection, evaluator reason, retry attempts,
+  and next action options.
 - Optimizer wrapper failed after artifacts: if `status_phase` is
   `recovery_available`, run `gitmoot skillopt train recover --session <id>
   --out-root <optimizer-output-root>`.
