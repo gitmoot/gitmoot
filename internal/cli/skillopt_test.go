@@ -1506,6 +1506,139 @@ func TestSkillOptTrainContinueGeneratesRequiredVuePreviewBundles(t *testing.T) {
 	}
 }
 
+func TestSkillOptTrainContinueRetriesInvalidRequiredVuePreviewOption(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/workspace.git")
+	t.Chdir(repoDir)
+	itemsPath := writeSkillOptTrainItemsFile(t)
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	if err := store.UpsertAgentTemplate(context.Background(), cliSkillOptTemplate("planner", "Plan the work.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after template seed returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"agent", "type", "set", "skillopt-generator",
+		"--home", home,
+		"--runtime", "codex",
+		"--role", "generator",
+		"--max-background", "1",
+		"--capability", "ask",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--session", "preview-retry-train",
+		"--workspace-repo", "owner/workspace",
+		"--preview-repo", "owner/previews",
+		"--request", "Train landing page previews.",
+		"--task-kind", "design",
+		"--mode", "explore",
+		"--options", "2",
+		"--items-file", itemsPath,
+		"--yes",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("train start exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	runner := &agentStartRunner{results: []subprocess.Result{
+		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440504"}` + "\n"},
+		cliImplementedSummaryResult(t, "# Option A\n\nMarkdown is not a preview bundle."),
+		cliImplementedSummaryResult(t, cliVuePreviewBundleSummary(t, "Option A retry hero")),
+		cliImplementedSummaryResult(t, cliVuePreviewBundleSummary(t, "Option B hero")),
+		cliImplementedSummaryResult(t, cliVuePreviewBundleSummary(t, "Option A proof")),
+		cliImplementedSummaryResult(t, cliVuePreviewBundleSummary(t, "Option B proof")),
+	}}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{"skillopt", "train", "continue", "--home", home, "--session", "preview-retry-train"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "current_phase: options_generated") ||
+		!strings.Contains(stdout.String(), "generated_options: 4") ||
+		!strings.Contains(stdout.String(), "jobs: 5") {
+		t.Fatalf("train continue stdout = %s", stdout.String())
+	}
+	if len(runner.calls) != 6 {
+		t.Fatalf("runtime calls = %+v, want start plus five deliveries", runner.calls)
+	}
+	retryPrompt := runner.calls[2].args[len(runner.calls[2].args)-1]
+	for _, want := range []string{
+		"Retry this same review option only",
+		"previous generated artifact failed validation",
+		"decode preview bundle JSON",
+		"Option label: A",
+	} {
+		if !strings.Contains(retryPrompt, want) {
+			t.Fatalf("retry prompt missing %q:\n%s", want, retryPrompt)
+		}
+	}
+
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+	options, err := store.ListEvalReviewOptions(context.Background(), "preview-retry-train-review-001", "")
+	if err != nil {
+		t.Fatalf("ListEvalReviewOptions returned error: %v", err)
+	}
+	if len(options) != 4 {
+		t.Fatalf("options = %+v", options)
+	}
+	retriedOptions := 0
+	for _, option := range options {
+		var metadata map[string]any
+		if err := json.Unmarshal([]byte(option.MetadataJSON), &metadata); err != nil {
+			t.Fatalf("option metadata unmarshal returned error: %v", err)
+		}
+		retryAttempts, ok := metadata["retry_attempts"].(float64)
+		if !ok {
+			continue
+		}
+		retriedOptions++
+		if int(retryAttempts) != 1 {
+			t.Fatalf("retried option metadata = %+v", metadata)
+		}
+		if _, ok := metadata["validation_errors"].([]any); !ok {
+			t.Fatalf("retried option metadata missing validation_errors: %+v", metadata)
+		}
+		if !strings.Contains(option.MetadataJSON, "decode preview bundle JSON") {
+			t.Fatalf("retried option metadata missing validation error text: %s", option.MetadataJSON)
+		}
+	}
+	if retriedOptions != 1 {
+		t.Fatalf("retried options = %d, want 1; options=%+v", retriedOptions, options)
+	}
+	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "preview-retry-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+	if !strings.Contains(iteration.MetadataJSON, `"attempt":1`) || !strings.Contains(iteration.MetadataJSON, `"validation_error"`) {
+		t.Fatalf("iteration metadata missing retry attempt/error: %s", iteration.MetadataJSON)
+	}
+}
+
 func TestSkillOptTrainContinueAllowsOptionalVuePreviewFallback(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()
@@ -1711,6 +1844,8 @@ func TestSkillOptTrainContinueFailsRequiredVuePreviewForProseOutput(t *testing.T
 		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440502"}` + "\n"},
 		cliImplementedSummaryResult(t, "# Option A\n\nMarkdown is not a preview bundle."),
 		cliImplementedSummaryResult(t, "# Option A\n\nMarkdown is not a preview bundle."),
+		cliImplementedSummaryResult(t, "# Option A\n\nMarkdown is not a preview bundle."),
+		cliImplementedSummaryResult(t, "# Option A\n\nMarkdown is not a preview bundle."),
 	}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -1721,8 +1856,22 @@ func TestSkillOptTrainContinueFailsRequiredVuePreviewForProseOutput(t *testing.T
 	if code != 1 {
 		t.Fatalf("train continue exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "preview bundle") || !strings.Contains(stderr.String(), "decode preview bundle JSON") {
+	if !strings.Contains(stderr.String(), "validation_class=preview_bundle") ||
+		!strings.Contains(stderr.String(), "retry_count=1") ||
+		!strings.Contains(stderr.String(), "decode preview bundle JSON") {
 		t.Fatalf("preview bundle failure stderr = %q", stderr.String())
+	}
+	if len(runner.calls) > 5 {
+		t.Fatalf("runtime calls = %+v, want bounded per-option retries only", runner.calls)
+	}
+	retryPrompts := 0
+	for _, call := range runner.calls {
+		if len(call.args) > 0 && strings.Contains(call.args[len(call.args)-1], "Retry this same review option only") {
+			retryPrompts++
+		}
+	}
+	if retryPrompts == 0 || retryPrompts > 2 {
+		t.Fatalf("retry prompt count = %d calls=%+v", retryPrompts, runner.calls)
 	}
 	store = openCLIJobStore(t, home)
 	defer store.Close()
@@ -1811,6 +1960,11 @@ func TestSkillOptTrainContinueRejectsNonImplementedGenerationResult(t *testing.T
 	}
 	if !strings.Contains(stderr.String(), "returned changes_requested, want implemented") {
 		t.Fatalf("stderr = %q", stderr.String())
+	}
+	for _, call := range runner.calls {
+		if len(call.args) > 0 && strings.Contains(call.args[len(call.args)-1], "Retry this same review option only") {
+			t.Fatalf("non-retryable generation failure retried: %+v", runner.calls)
+		}
 	}
 	store = openCLIJobStore(t, home)
 	defer store.Close()
@@ -1972,6 +2126,32 @@ func TestSkillOptTrainGenerationLockTTLScalesWithWorkload(t *testing.T) {
 	}
 	if ttl <= skillOptTrainGenerationLockTTL {
 		t.Fatalf("ttl = %s, want greater than fixed minimum %s", ttl, skillOptTrainGenerationLockTTL)
+	}
+	previewPolicy, err := skillopt.BuildTrainPreviewPolicy("owner/product", "owner/previews", skillopt.TrainPreviewModeRequired, skillopt.TrainPreviewRendererVueVite, skillopt.TrainPreviewPublisherGitHubPages, "")
+	if err != nil {
+		t.Fatalf("BuildTrainPreviewPolicy returned error: %v", err)
+	}
+	if err := store.UpsertSkillOptTrainSession(context.Background(), db.SkillOptTrainSession{
+		ID:           "preview-train",
+		TemplateID:   "planner",
+		TargetRepo:   "owner/product",
+		PreviewRepo:  "owner/previews",
+		TaskKind:     "design",
+		State:        skillopt.TrainStateItemsReady,
+		MetadataJSON: skillOptTrainStartMetadata("Train landing page previews.", db.EvalRunModeExplore, db.ExplorationLevelHigh, 4, "soft", nil, nil, previewPolicy),
+	}); err != nil {
+		t.Fatalf("UpsertSkillOptTrainSession returned error: %v", err)
+	}
+	previewTTL, err := estimateSkillOptTrainGenerationLockTTL(context.Background(), store, skillOptTrainContinueRequest{Home: home, GeneratorType: "skillopt-generator"}, db.SkillOptTrainIteration{
+		SessionID: "preview-train",
+		EvalRunID: "landing-train-review-001",
+	})
+	if err != nil {
+		t.Fatalf("estimateSkillOptTrainGenerationLockTTL preview returned error: %v", err)
+	}
+	previewWant := 32*45*time.Minute + skillOptTrainGenerationLockBuffer
+	if previewTTL != previewWant {
+		t.Fatalf("preview ttl = %s, want %s", previewTTL, previewWant)
 	}
 }
 

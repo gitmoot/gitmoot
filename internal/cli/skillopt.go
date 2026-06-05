@@ -2952,6 +2952,8 @@ const skillOptTrainGenerationLockTTL = 2 * time.Hour
 
 const skillOptTrainGenerationLockBuffer = 10 * time.Minute
 
+const skillOptTrainReviewOptionRetryBudget = 1
+
 const skillOptTrainOptimizerLockTTL = 4 * time.Hour
 
 const skillOptTrainOptimizerLockBuffer = 10 * time.Minute
@@ -3373,6 +3375,16 @@ func estimateSkillOptTrainGenerationLockTTL(ctx context.Context, store *db.Store
 	if roles <= 0 {
 		roles = 2
 	}
+	attemptsPerRole := 1
+	if strings.TrimSpace(iteration.SessionID) != "" {
+		session, err := store.GetSkillOptTrainSession(ctx, iteration.SessionID)
+		if err != nil {
+			return 0, err
+		}
+		if skillOptTrainRequiresVuePreviewBundle(session) {
+			attemptsPerRole += skillOptTrainReviewOptionRetryBudget
+		}
+	}
 	_, dispatchType, err := skillOptTrainGeneratorSelection(request)
 	if err != nil {
 		return 0, err
@@ -3386,7 +3398,7 @@ func estimateSkillOptTrainGenerationLockTTL(ctx context.Context, store *db.Store
 		concurrency = itemCount
 	}
 	batches := (itemCount + concurrency - 1) / concurrency
-	estimated := time.Duration(batches*roles)*jobTimeout + skillOptTrainGenerationLockBuffer
+	estimated := time.Duration(batches*roles*attemptsPerRole)*jobTimeout + skillOptTrainGenerationLockBuffer
 	if estimated < skillOptTrainGenerationLockTTL {
 		return skillOptTrainGenerationLockTTL, nil
 	}
@@ -3577,6 +3589,19 @@ type skillOptTrainGeneratedItemOptions struct {
 	Prompts    []map[string]any
 }
 
+type skillOptTrainGeneratedOption struct {
+	Output                localAgentJobOutput
+	Content               []byte
+	MediaType             string
+	Driver                string
+	PreviewBundleMetadata *skillopt.PreviewBundleMetadata
+	Prompt                string
+	Prompts               []map[string]any
+	JobIDs                []string
+	RetryAttempts         int
+	ValidationErrors      []map[string]any
+}
+
 func generateSkillOptTrainItemOptions(ctx context.Context, store *db.Store, blobStore artifact.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, run db.EvalRun, items []db.EvalReviewItem, roles []string, rankedRun bool, request skillOptTrainContinueRequest, dispatchAgent string, dispatchType string, concurrency int) ([]skillOptTrainGeneratedItemOptions, error) {
 	if concurrency <= 0 {
 		concurrency = 1
@@ -3625,56 +3650,20 @@ func generateSkillOptTrainSingleItemOptions(ctx context.Context, store *db.Store
 	wantsVuePreviewBundle := skillOptTrainWantsVuePreviewBundle(session)
 	requiresVuePreviewBundle := skillOptTrainRequiresVuePreviewBundle(session)
 	for _, role := range roles {
-		prompt := buildSkillOptTrainGenerationPrompt(session, iteration, run, item, role, rankedRun)
-		output, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
-			RepoFlag:         skillOptTrainGenerationRepo(session),
-			Agent:            dispatchAgent,
-			Action:           "ask",
-			Instructions:     prompt,
-			Type:             dispatchType,
-			Home:             request.Home,
-			AllowManagedSync: dispatchType != "",
-		})
+		generatedOption, err := generateSkillOptTrainSingleOption(ctx, store, session, iteration, run, item, role, rankedRun, request, dispatchAgent, dispatchType, wantsVuePreviewBundle, requiresVuePreviewBundle)
 		if err != nil {
-			return skillOptTrainGeneratedItemOptions{}, fmt.Errorf("generate %s for %s: %w", role, item.ItemID, err)
-		}
-		if output.Result == nil {
-			return skillOptTrainGeneratedItemOptions{}, fmt.Errorf("generate %s for %s: job %s did not return a result", role, item.ItemID, output.JobID)
-		}
-		if output.Result.Decision != "implemented" {
-			return skillOptTrainGeneratedItemOptions{}, fmt.Errorf("generate %s for %s: job %s returned %s, want implemented: %s", role, item.ItemID, output.JobID, output.Result.Decision, output.Result.Summary)
+			return skillOptTrainGeneratedItemOptions{}, err
 		}
 		artifactRole := role
 		if rankedRun {
 			artifactRole = "option-" + role
 		}
-		artifactContent := []byte(output.Result.Summary)
-		artifactMediaType := "text/markdown"
-		artifactDriver := "text"
-		var previewBundleMetadata *skillopt.PreviewBundleMetadata
-		if wantsVuePreviewBundle {
-			bundle, err := skillopt.ParsePreviewBundle([]byte(output.Result.Summary))
-			if err != nil {
-				if requiresVuePreviewBundle {
-					return skillOptTrainGeneratedItemOptions{}, fmt.Errorf("generate %s for %s: preview bundle: %w", role, item.ItemID, err)
-				}
-			} else {
-				artifactContent, err = json.Marshal(bundle)
-				if err != nil {
-					return skillOptTrainGeneratedItemOptions{}, fmt.Errorf("generate %s for %s: encode preview bundle: %w", role, item.ItemID, err)
-				}
-				metadata := bundle.Metadata()
-				previewBundleMetadata = &metadata
-				artifactMediaType = "application/json"
-				artifactDriver = skillopt.TrainPreviewRendererVueVite
-			}
-		}
-		artifactRecord, err := prepareReviewItemContentArtifact(blobStore, run.ID, item.ItemID, artifactRole, artifactContent, artifactMediaType, artifactDriver)
+		artifactRecord, err := prepareReviewItemContentArtifact(blobStore, run.ID, item.ItemID, artifactRole, generatedOption.Content, generatedOption.MediaType, generatedOption.Driver)
 		if err != nil {
 			return skillOptTrainGeneratedItemOptions{}, err
 		}
 		artifactRecords = append(artifactRecords, artifactRecord)
-		optionMetadata := skillOptTrainGeneratedOptionMetadata(output, prompt, previewBundleMetadata)
+		optionMetadata := skillOptTrainGeneratedOptionMetadata(generatedOption.Output, generatedOption.Prompt, generatedOption.PreviewBundleMetadata, generatedOption.RetryAttempts, generatedOption.ValidationErrors)
 		if rankedRun {
 			replacementOptions = append(replacementOptions, db.EvalReviewOption{
 				RunID:        run.ID,
@@ -3689,21 +3678,16 @@ func generateSkillOptTrainSingleItemOptions(ctx context.Context, store *db.Store
 		} else if role == "candidate" {
 			item.CandidateArtifactID = artifactRecord.ID
 		}
-		generatedItem.JobIDs = append(generatedItem.JobIDs, output.JobID)
+		generatedItem.JobIDs = append(generatedItem.JobIDs, generatedOption.JobIDs...)
 		if generatedItem.AgentName == "" {
-			generatedItem.AgentName = output.Agent
+			generatedItem.AgentName = generatedOption.Output.Agent
 		}
 		if generatedItem.Runtime == "" {
-			if agent, err := store.GetAgent(ctx, output.Agent); err == nil {
+			if agent, err := store.GetAgent(ctx, generatedOption.Output.Agent); err == nil {
 				generatedItem.Runtime = agent.Runtime
 			}
 		}
-		generatedItem.Prompts = append(generatedItem.Prompts, map[string]any{
-			"item_id": item.ItemID,
-			"role":    role,
-			"job_id":  output.JobID,
-			"prompt":  prompt,
-		})
+		generatedItem.Prompts = append(generatedItem.Prompts, generatedOption.Prompts...)
 	}
 	generatedItem.Artifacts = artifactRecords
 	generatedItem.Options = replacementOptions
@@ -3711,6 +3695,87 @@ func generateSkillOptTrainSingleItemOptions(ctx context.Context, store *db.Store
 		generatedItem.ReviewItem = &item
 	}
 	return generatedItem, nil
+}
+
+func generateSkillOptTrainSingleOption(ctx context.Context, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, run db.EvalRun, item db.EvalReviewItem, role string, rankedRun bool, request skillOptTrainContinueRequest, dispatchAgent string, dispatchType string, wantsVuePreviewBundle bool, requiresVuePreviewBundle bool) (skillOptTrainGeneratedOption, error) {
+	basePrompt := buildSkillOptTrainGenerationPrompt(session, iteration, run, item, role, rankedRun)
+	prompt := basePrompt
+	retryBudget := 0
+	if wantsVuePreviewBundle && requiresVuePreviewBundle {
+		retryBudget = skillOptTrainReviewOptionRetryBudget
+	}
+	validationErrors := []map[string]any{}
+	promptRecords := []map[string]any{}
+	jobIDs := []string{}
+	for attempt := 0; ; attempt++ {
+		output, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+			RepoFlag:         skillOptTrainGenerationRepo(session),
+			Agent:            dispatchAgent,
+			Action:           "ask",
+			Instructions:     prompt,
+			Type:             dispatchType,
+			Home:             request.Home,
+			AllowManagedSync: dispatchType != "",
+		})
+		if err != nil {
+			return skillOptTrainGeneratedOption{}, fmt.Errorf("generate %s for %s: %w", role, item.ItemID, err)
+		}
+		promptRecord := map[string]any{
+			"item_id": item.ItemID,
+			"role":    role,
+			"attempt": attempt,
+			"job_id":  output.JobID,
+			"prompt":  prompt,
+		}
+		promptRecords = append(promptRecords, promptRecord)
+		jobIDs = append(jobIDs, output.JobID)
+		if output.Result == nil {
+			return skillOptTrainGeneratedOption{}, fmt.Errorf("generate %s for %s: job %s did not return a result", role, item.ItemID, output.JobID)
+		}
+		if output.Result.Decision != "implemented" {
+			return skillOptTrainGeneratedOption{}, fmt.Errorf("generate %s for %s: job %s returned %s, want implemented: %s", role, item.ItemID, output.JobID, output.Result.Decision, output.Result.Summary)
+		}
+		content := []byte(output.Result.Summary)
+		mediaType := "text/markdown"
+		driver := "text"
+		var previewBundleMetadata *skillopt.PreviewBundleMetadata
+		if wantsVuePreviewBundle {
+			bundle, err := skillopt.ParsePreviewBundle([]byte(output.Result.Summary))
+			if err != nil {
+				if requiresVuePreviewBundle {
+					validationError := skillOptTrainOptionValidationError(item.ItemID, role, attempt, err)
+					validationErrors = append(validationErrors, validationError)
+					promptRecord["validation_error"] = validationError
+					if attempt < retryBudget {
+						prompt = buildSkillOptTrainGenerationRetryPrompt(basePrompt, validationError)
+						continue
+					}
+					return skillOptTrainGeneratedOption{}, fmt.Errorf("generate option validation failed: item=%s option=%s validation_class=preview_bundle retry_count=%d error=%w", item.ItemID, role, attempt, err)
+				}
+			} else {
+				content, err = json.Marshal(bundle)
+				if err != nil {
+					return skillOptTrainGeneratedOption{}, fmt.Errorf("generate %s for %s: encode preview bundle: %w", role, item.ItemID, err)
+				}
+				metadata := bundle.Metadata()
+				previewBundleMetadata = &metadata
+				mediaType = "application/json"
+				driver = skillopt.TrainPreviewRendererVueVite
+			}
+		}
+		return skillOptTrainGeneratedOption{
+			Output:                output,
+			Content:               content,
+			MediaType:             mediaType,
+			Driver:                driver,
+			PreviewBundleMetadata: previewBundleMetadata,
+			Prompt:                prompt,
+			Prompts:               promptRecords,
+			JobIDs:                jobIDs,
+			RetryAttempts:         len(validationErrors),
+			ValidationErrors:      validationErrors,
+		}, nil
+	}
 }
 
 func skillOptTrainWantsVuePreviewBundle(session db.SkillOptTrainSession) bool {
@@ -6677,6 +6742,29 @@ func buildSkillOptTrainGenerationPrompt(session db.SkillOptTrainSession, iterati
 	return builder.String()
 }
 
+func buildSkillOptTrainGenerationRetryPrompt(basePrompt string, validationError map[string]any) string {
+	var builder strings.Builder
+	builder.WriteString(basePrompt)
+	builder.WriteString("\n\nRetry instruction:\n")
+	builder.WriteString("- Retry this same review option only; do not change the item id or option label.\n")
+	builder.WriteString("- The previous generated artifact failed validation. Fix the concrete validation error below and return a fresh artifact.\n")
+	builder.WriteString("- Do not repeat the same invalid output.\n")
+	builder.WriteString("\nValidation error:\n")
+	fmt.Fprintf(&builder, "- class: %s\n", validationError["class"])
+	fmt.Fprintf(&builder, "- message: %s\n", validationError["message"])
+	return builder.String()
+}
+
+func skillOptTrainOptionValidationError(itemID string, role string, attempt int, err error) map[string]any {
+	return map[string]any{
+		"class":   "preview_bundle",
+		"item_id": itemID,
+		"role":    role,
+		"attempt": attempt,
+		"message": strings.TrimSpace(err.Error()),
+	}
+}
+
 func prepareReviewItemContentArtifact(blobStore artifact.Store, runID string, itemID string, role string, content []byte, mediaType string, driver string) (db.EvalArtifact, error) {
 	if len(content) == 0 || strings.TrimSpace(string(content)) == "" {
 		return db.EvalArtifact{}, fmt.Errorf("%s content is required", role)
@@ -6700,7 +6788,7 @@ func prepareReviewItemContentArtifact(blobStore artifact.Store, runID string, it
 	}, nil
 }
 
-func skillOptTrainGeneratedOptionMetadata(output localAgentJobOutput, prompt string, previewBundleMetadata *skillopt.PreviewBundleMetadata) string {
+func skillOptTrainGeneratedOptionMetadata(output localAgentJobOutput, prompt string, previewBundleMetadata *skillopt.PreviewBundleMetadata, retryAttempts int, validationErrors []map[string]any) string {
 	metadata := map[string]any{
 		"source":           "gitmoot skillopt train continue",
 		"job_id":           output.JobID,
@@ -6710,6 +6798,10 @@ func skillOptTrainGeneratedOptionMetadata(output localAgentJobOutput, prompt str
 	}
 	if previewBundleMetadata != nil {
 		metadata["preview_bundle"] = *previewBundleMetadata
+	}
+	if retryAttempts > 0 {
+		metadata["retry_attempts"] = retryAttempts
+		metadata["validation_errors"] = validationErrors
 	}
 	encoded, err := json.Marshal(metadata)
 	if err != nil {
