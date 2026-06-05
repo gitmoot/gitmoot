@@ -245,8 +245,25 @@ Run `train continue` once to generate Vue/Vite bundles and a second time to
 publish GitHub Pages previews and create the human review issue. Required
 previews block inline fallback until every option has `preview_url`; optional
 previews use URLs when present and fall back to inline Markdown only when
-preview publication is unavailable. Low-level GitHub feedback publish/sync
-commands enforce the train run's expected review repo. LaTeX/PDF, Storybook,
+preview publication is unavailable.
+
+Check `gh auth status --hostname github.com` and
+`gh repo view owner/previews --json nameWithOwner` before GitHub-backed review
+publication or watching. Gitmoot preflights GitHub issue/comment operations,
+but preview publication can push Pages files before a later review issue
+preflight fails.
+
+Required Vue/Vite options are validated immediately. An actionable preview
+bundle validation failure retries that option once while keeping valid sibling
+options. GitHub Pages publication records `preview_commit`, `preview_status`,
+and `preview_status_reason`; review links can show `open`,
+`pending deployment`, `failed deployment`, or `stale deployment`. Existing
+review links keep their recorded status label; `train continue` skips options
+that already have a preview URL.
+
+Low-level GitHub feedback publish/sync commands enforce the train run's expected
+review repo. Candidate decisions are explicit: promote, reject with a reason,
+wait, or reject and `--start-next` to keep improving. LaTeX/PDF, Storybook,
 notebook, image, and other preview types are future adapters, not current
 renderer/publisher pairs.
 

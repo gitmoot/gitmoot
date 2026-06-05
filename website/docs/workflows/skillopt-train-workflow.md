@@ -86,11 +86,35 @@ Register the preview checkout before publishing:
 gitmoot repo add owner/previews --path /path/to/previews
 ```
 
+GitHub-backed review operations require `gh` to be installed and authenticated
+for the expected review repository. Check it before starting review publication
+or watching:
+
+```sh
+gh auth status --hostname github.com
+gh repo view owner/previews --json nameWithOwner
+```
+
+Gitmoot preflights GitHub issue/comment operations such as feedback publish,
+feedback sync, candidate review publication, and review watching. Preview
+publication itself still commits and pushes the Pages route before the review
+issue is created, so a later `gh` auth failure can leave preview commits in the
+preview repo even though the review issue was not posted.
+
 The currently implemented renderer/publisher pairs are `none/none` and
 `vue-vite/github-pages`. Required previews block inline fallback until every
 generated option has a `preview_url`; optional previews use URLs when available
 and fall back to inline Markdown only when preview publishing is unavailable.
-LaTeX/PDF and other preview types are future adapters.
+Required Vue/Vite options are validated as soon as they are generated. An
+actionable preview-bundle validation failure retries that option once while
+keeping valid sibling options.
+
+GitHub Pages publication records `preview_commit`, `preview_status`, and
+`preview_status_reason` with each option. Gitmoot waits briefly for the pushed
+commit and for matching queued/building builds to become ready or failed.
+Review links render as `open`, `pending deployment`, `failed deployment`, or
+`stale deployment` based on that status. LaTeX/PDF and other preview types are
+future adapters.
 
 ## Review, Feedback, And Optimizer Gate
 
@@ -162,11 +186,10 @@ gitmoot skillopt train continue --session planner-train --promote planner@v2
 gitmoot skillopt train continue --session planner-train --reject planner@v2 --reason "Too broad"
 ```
 
-Waiting is also a valid decision while a human is still reviewing: take no
-action and `gitmoot skillopt train status --session planner-train` keeps
-reporting the candidate decision gate. To keep improving, reject with an
-actionable reason such as "Improve product visuals and mobile polish", then
-start the next iteration after the rejection is recorded:
+The supported decisions are promote, reject with reason, wait, and keep
+improving. Waiting means taking no action while status keeps reporting the
+candidate decision gate. Keep improving means rejecting with an actionable
+reason, then starting the next iteration after the rejection is recorded:
 
 ```sh
 gitmoot skillopt train continue --session planner-train --start-next
@@ -187,8 +210,32 @@ preview publication, fake `gitmoot-skillopt`, and fake GitHub publication. It
 covers preview blocking, review-repo enforcement, the train loop, and candidate
 decisions without real model calls or real GitHub mutation.
 
+Manual smoke scenarios:
+
+1. Candidate decision: publish a candidate review, confirm the review repo has
+   `best_skill.md`, `base_skill.md`, and `candidate.diff.md`, then use status to
+   confirm the decision gate before promoting or rejecting with a reason.
+2. Preview publication status: publish Vue/Vite review options and confirm the
+   issue links are labeled `open`, `pending deployment`, `failed deployment`,
+   or `stale deployment` according to the GitHub Pages build state.
+
 ## Troubleshooting
 
+- Missing `gh` auth: run `gh auth status --hostname github.com` and confirm
+  `gh repo view owner/repo --json nameWithOwner` succeeds for the expected
+  review repo before starting review publication. Preview publication can
+  already have pushed Pages files before a later review issue preflight fails.
+- Pending or failed preview links: pending means Pages had not completed within
+  the bounded wait, failed includes the Pages error when available, and stale
+  means the latest build still points at another commit. Existing review links
+  keep their recorded label; `train continue` does not refresh old deployment
+  status for options that already have a preview URL.
+- Invalid generated preview bundles: required Vue/Vite options retry once for
+  actionable validation errors; repeated failures stop with item, option,
+  validation class, and retry count.
+- Candidate waiting for decision: inspect the candidate files in the review repo
+  and then promote, reject with a reason, keep waiting, or reject and
+  `--start-next` to keep improving.
 - Missing feedback import: reply with the fenced YAML block or raw YAML, then
   rerun `gitmoot skillopt train continue --session <id>` to auto-sync comments.
 - Invalid YAML: sync output reports wrong `run_id`, missing item feedback,
