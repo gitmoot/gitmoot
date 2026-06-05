@@ -18,6 +18,7 @@ import (
 
 type Client interface {
 	Ping(ctx context.Context) error
+	Preflight(ctx context.Context, repo Repository) error
 	ListPullRequests(ctx context.Context, repo Repository, state string) ([]PullRequest, error)
 	GetPullRequest(ctx context.Context, repo Repository, number int64) (PullRequest, error)
 	CreatePullRequest(ctx context.Context, input CreatePullRequestInput) (PullRequest, error)
@@ -253,6 +254,21 @@ func NewClient(dir string) *GhClient {
 func (c *GhClient) Ping(ctx context.Context) error {
 	_, err := c.run(ctx, false, "repo", "view", "--json", "nameWithOwner")
 	return err
+}
+
+func (c *GhClient) Preflight(ctx context.Context, repo Repository) error {
+	if _, err := c.run(ctx, false, "--version"); err != nil {
+		return fmt.Errorf("GitHub CLI preflight failed: `gh --version` failed; install GitHub CLI (`gh`) and ensure it is on PATH: %w", err)
+	}
+	if _, err := c.run(ctx, false, "auth", "status", "--hostname", "github.com"); err != nil {
+		return fmt.Errorf("GitHub CLI preflight failed: `gh auth status --hostname github.com` failed; run `gh auth login --hostname github.com`: %w", err)
+	}
+	if strings.TrimSpace(repo.FullName()) != "" {
+		if _, err := c.run(ctx, false, "repo", "view", repo.FullName(), "--json", "nameWithOwner"); err != nil {
+			return fmt.Errorf("GitHub CLI preflight failed: cannot view expected repo %s; check repo access or run `gh auth login --hostname github.com`: %w", repo.FullName(), err)
+		}
+	}
+	return nil
 }
 
 func (c *GhClient) ListPullRequests(ctx context.Context, repo Repository, state string) ([]PullRequest, error) {
@@ -727,6 +743,10 @@ func firstNonEmpty(values ...string) string {
 type NoopClient struct{}
 
 func (NoopClient) Ping(context.Context) error {
+	return nil
+}
+
+func (NoopClient) Preflight(context.Context, Repository) error {
 	return nil
 }
 

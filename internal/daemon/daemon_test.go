@@ -1745,6 +1745,10 @@ func (f *fakeGitHub) Ping(context.Context) error {
 	return nil
 }
 
+func (f *fakeGitHub) Preflight(context.Context, github.Repository) error {
+	return nil
+}
+
 func (f *fakeGitHub) ListPullRequests(_ context.Context, _ github.Repository, state string) ([]github.PullRequest, error) {
 	f.listPullRequestsCalls++
 	if len(f.listPullRequestsErrs) > 0 {

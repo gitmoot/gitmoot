@@ -81,6 +81,62 @@ func TestCreateIssueUsesIssuesEndpoint(t *testing.T) {
 	runner.wantArgs(t, 0, "api", "repos/jerryfane/gitmoot/issues", "-f", "title=Review run-1", "-f", "body=body")
 }
 
+func TestPreflightChecksGhAuthAndRepoAccess(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{
+			{Stdout: "gh version 2.45.0"},
+			{Stdout: "Logged in to github.com"},
+			{Stdout: `{"nameWithOwner":"jerryfane/gitmoot"}`},
+		},
+	}
+	client := GhClient{Runner: runner}
+
+	if err := client.Preflight(context.Background(), Repository{Owner: "jerryfane", Name: "gitmoot"}); err != nil {
+		t.Fatalf("Preflight returned error: %v", err)
+	}
+
+	runner.wantArgs(t, 0, "--version")
+	runner.wantArgs(t, 1, "auth", "status", "--hostname", "github.com")
+	runner.wantArgs(t, 2, "repo", "view", "jerryfane/gitmoot", "--json", "nameWithOwner")
+}
+
+func TestPreflightReportsAuthLoginHint(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{
+			{Stdout: "gh version 2.45.0"},
+			{Stderr: "not logged in"},
+		},
+		errs: []error{nil, errors.New("exit status 1")},
+	}
+	client := GhClient{Runner: runner}
+
+	err := client.Preflight(context.Background(), Repository{Owner: "jerryfane", Name: "gitmoot"})
+
+	if err == nil || !strings.Contains(err.Error(), "gh auth login --hostname github.com") {
+		t.Fatalf("Preflight error = %v, want auth login hint", err)
+	}
+	runner.wantArgs(t, 1, "auth", "status", "--hostname", "github.com")
+}
+
+func TestPreflightReportsExpectedRepoAccess(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{
+			{Stdout: "gh version 2.45.0"},
+			{Stdout: "Logged in to github.com"},
+			{Stderr: "Could not resolve repository"},
+		},
+		errs: []error{nil, nil, errors.New("exit status 1")},
+	}
+	client := GhClient{Runner: runner}
+
+	err := client.Preflight(context.Background(), Repository{Owner: "owner", Name: "previews"})
+
+	if err == nil || !strings.Contains(err.Error(), "cannot view expected repo owner/previews") {
+		t.Fatalf("Preflight error = %v, want expected repo access error", err)
+	}
+	runner.wantArgs(t, 2, "repo", "view", "owner/previews", "--json", "nameWithOwner")
+}
+
 func TestCloseIssueUsesIssueEndpoint(t *testing.T) {
 	runner := &fakeRunner{
 		results: []subprocess.Result{{

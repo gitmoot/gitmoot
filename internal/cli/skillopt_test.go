@@ -6335,22 +6335,48 @@ func TestSkillOptFeedbackGitHubCommandsEnforceTrainReviewRepo(t *testing.T) {
 	})
 
 	var stdout, stderr bytes.Buffer
+	fake.preflightErr = errors.New("gh auth missing")
 	code := Run([]string{"skillopt", "feedback", "github", "publish", "--home", home, "--run", "preview-train-review-001"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("github publish preflight failure exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "gh auth missing") {
+		t.Fatalf("github publish preflight failure stderr = %q", stderr.String())
+	}
+	if fake.createdIssue.Repo.FullName() != "" {
+		t.Fatalf("preflight failure created issue = %+v", fake.createdIssue)
+	}
+	if len(fake.preflightRepos) != 1 || fake.preflightRepos[0].FullName() != "owner/previews" {
+		t.Fatalf("preflight repos = %+v, want owner/previews", fake.preflightRepos)
+	}
+	fake.preflightErr = nil
+	fake.preflightRepos = nil
+	stdout.Reset()
+	stderr.Reset()
+
+	code = Run([]string{"skillopt", "feedback", "github", "publish", "--home", home, "--run", "preview-train-review-001"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("github publish default repo exit code = %d, stderr=%s", code, stderr.String())
 	}
 	if fake.createdIssue.Repo.FullName() != "owner/previews" {
 		t.Fatalf("created issue repo = %s, want owner/previews", fake.createdIssue.Repo.FullName())
 	}
+	if len(fake.preflightRepos) != 1 || fake.preflightRepos[0].FullName() != "owner/previews" {
+		t.Fatalf("preflight repos after publish = %+v, want owner/previews", fake.preflightRepos)
+	}
 
 	stdout.Reset()
 	stderr.Reset()
+	fake.preflightRepos = nil
 	code = Run([]string{"skillopt", "feedback", "github", "publish", "--home", home, "--run", "preview-train-review-001", "--repo", "Owner/Previews", "--pr", "9"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("github publish matching repo exit code = %d, stderr=%s", code, stderr.String())
 	}
 	if len(fake.postedComments) != 1 || !strings.EqualFold(fake.postedComments[0].Repo.FullName(), "owner/previews") || fake.postedComments[0].IssueNumber != 9 {
 		t.Fatalf("posted comments = %+v, want owner/previews#9", fake.postedComments)
+	}
+	if len(fake.preflightRepos) != 1 || !strings.EqualFold(fake.preflightRepos[0].FullName(), "owner/previews") {
+		t.Fatalf("preflight repos after pr publish = %+v, want owner/previews", fake.preflightRepos)
 	}
 
 	stdout.Reset()
@@ -6369,12 +6395,16 @@ func TestSkillOptFeedbackGitHubCommandsEnforceTrainReviewRepo(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
+	fake.preflightRepos = nil
 	code = Run([]string{"skillopt", "feedback", "github", "sync", "--home", home, "--run", "preview-train-review-001", "--issue", "8"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("github sync default repo exit code = %d, stderr=%s", code, stderr.String())
 	}
 	if len(fake.listedComments) != 1 || fake.listedComments[0].Repo.FullName() != "owner/previews" {
 		t.Fatalf("listed comments = %+v, want owner/previews", fake.listedComments)
+	}
+	if len(fake.preflightRepos) != 1 || fake.preflightRepos[0].FullName() != "owner/previews" {
+		t.Fatalf("preflight repos after sync = %+v, want owner/previews", fake.preflightRepos)
 	}
 
 	stdout.Reset()
@@ -8048,11 +8078,13 @@ type skillOptFakeGitHub struct {
 	upsertedFiles      []skillOptUpsertedGitHubFile
 	closedIssues       []skillOptClosedGitHubIssue
 	listedComments     []skillOptListedGitHubComments
+	preflightRepos     []github.Repository
 	comments           map[int64][]github.IssueComment
 	createIssueErr     error
 	postCommentErr     error
 	upsertFileErr      error
 	closeIssueErr      error
+	preflightErr       error
 	host               string
 	commentKinds       map[int64]string
 	commentURLOverride string
@@ -8079,6 +8111,14 @@ type skillOptClosedGitHubIssue struct {
 type skillOptListedGitHubComments struct {
 	Repo        github.Repository
 	IssueNumber int64
+}
+
+func (f *skillOptFakeGitHub) Preflight(_ context.Context, repo github.Repository) error {
+	f.preflightRepos = append(f.preflightRepos, repo)
+	if f.preflightErr != nil {
+		return f.preflightErr
+	}
+	return nil
 }
 
 func seedSkillOptReviewWatcherRun(t *testing.T) (string, *db.Store, artifact.Store) {

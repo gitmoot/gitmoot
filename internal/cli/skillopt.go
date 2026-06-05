@@ -1371,6 +1371,9 @@ func publishSkillOptTrainCandidateReview(ctx context.Context, paths config.Paths
 		iteration.IssueRepo = repo.FullName()
 	}
 	client := newSkillOptGitHubClient()
+	if err := client.Preflight(ctx, repo); err != nil {
+		return skillOptTrainCandidateReviewResult{}, err
+	}
 	publishedFiles := existingSkillOptCandidateReviewPublishedFiles(session, iteration, repo, candidateID)
 	var filePublishErr error
 	if len(publishedFiles) == 0 {
@@ -3742,9 +3745,16 @@ func autoSyncSkillOptTrainReviewFeedback(ctx context.Context, paths config.Paths
 			fmt.Sprintf("github_feedback_error: invalid review repo %q: %v", repoText, err),
 		}, false
 	}
+	client := newSkillOptGitHubClient()
+	if err := client.Preflight(ctx, repo); err != nil {
+		return []string{
+			"github_feedback_sync: failed",
+			fmt.Sprintf("github_feedback_error: %v", err),
+		}, false
+	}
 	collector := feedback.GitHubCollector{
 		BlobStore: artifact.NewStore(paths.ArtifactBlobs),
-		GitHub:    newSkillOptGitHubClient(),
+		GitHub:    client,
 	}
 	result, err := collector.Sync(ctx, store, iteration.EvalRunID, repo, issueNumber)
 	if err != nil {
@@ -3787,6 +3797,10 @@ func publishSkillOptTrainReview(ctx context.Context, paths config.Paths, store *
 	if err != nil {
 		return skillOptTrainReviewPublishResult{}, err
 	}
+	client := newSkillOptGitHubClient()
+	if err := client.Preflight(ctx, repo); err != nil {
+		return skillOptTrainReviewPublishResult{}, err
+	}
 	publishingMetadata := map[string]any{
 		"status":       "publishing",
 		"repo":         repo.FullName(),
@@ -3807,7 +3821,6 @@ func publishSkillOptTrainReview(ctx context.Context, paths config.Paths, store *
 	if err != nil {
 		return skillOptTrainReviewPublishResult{}, err
 	}
-	client := newSkillOptGitHubClient()
 	postingMetadata := make(map[string]any, len(publishingMetadata)+2)
 	for key, value := range publishingMetadata {
 		postingMetadata[key] = value
@@ -7916,9 +7929,13 @@ func runSkillOptFeedbackGitHubPublish(args []string, stdout, stderr io.Writer) i
 		if err != nil {
 			return err
 		}
+		client := newSkillOptGitHubClient()
+		if err := client.Preflight(context.Background(), repo); err != nil {
+			return err
+		}
 		collector := feedback.GitHubCollector{
 			BlobStore: artifact.NewStore(paths.ArtifactBlobs),
-			GitHub:    newSkillOptGitHubClient(),
+			GitHub:    client,
 		}
 		result, err = collector.Publish(context.Background(), store, run.ID, feedback.GitHubPublishTarget{
 			Repo:        repo,
@@ -7977,9 +7994,13 @@ func runSkillOptFeedbackGitHubSync(args []string, stdout, stderr io.Writer) int 
 		if err != nil {
 			return err
 		}
+		client := newSkillOptGitHubClient()
+		if err := client.Preflight(context.Background(), repo); err != nil {
+			return err
+		}
 		collector := feedback.GitHubCollector{
 			BlobStore: artifact.NewStore(paths.ArtifactBlobs),
-			GitHub:    newSkillOptGitHubClient(),
+			GitHub:    client,
 		}
 		result, err = collector.Sync(context.Background(), store, run.ID, repo, targetNumber)
 		if err != nil {

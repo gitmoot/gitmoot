@@ -72,6 +72,9 @@ func pollSkillOptReviewWatch(ctx context.Context, paths config.Paths, store *db.
 	if err != nil {
 		return fmt.Errorf("skillopt review watch %s#%d: %w", watch.Repo, watch.IssueNumber, err)
 	}
+	if err := gh.Preflight(ctx, repo); err != nil {
+		return fmt.Errorf("skillopt review watch %s#%d: %w", watch.Repo, watch.IssueNumber, err)
+	}
 	comments, err := gh.ListIssueComments(ctx, repo, watch.IssueNumber)
 	if err != nil {
 		return fmt.Errorf("skillopt review watch %s#%d: list comments: %w", watch.Repo, watch.IssueNumber, err)
