@@ -141,10 +141,19 @@ does not publish a candidate review.
 
 ## Candidate Review And Decision
 
-Candidate reviews separate selection score, evaluator/test scores, gate status,
-no-op status, and promotability. If metadata marks the candidate as no-op or not
-promotable, the review says promotion is unavailable instead of showing a
-promote command.
+Candidate reviews publish the candidate summary, preview/PR links when
+available, GitHub links to the candidate skill files, and copyable decision
+commands. The review repo file contract is:
+
+- `skillopt/runs/<session>/<iteration>/<candidate>/best_skill.md`
+- `skillopt/runs/<session>/<iteration>/<candidate>/base_skill.md`
+- `skillopt/runs/<session>/<iteration>/<candidate>/candidate.diff.md`
+
+These files let reviewers inspect the proposed skill, the baseline skill, and
+the candidate diff directly in GitHub. Candidate reviews also separate selection
+score, evaluator/test scores, gate status, no-op status, and promotability. If
+metadata marks the candidate as no-op or not promotable, the review says
+promotion is unavailable instead of showing a promote command.
 
 Promote or reject explicitly:
 

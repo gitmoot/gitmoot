@@ -1371,7 +1371,11 @@ func publishSkillOptTrainCandidateReview(ctx context.Context, paths config.Paths
 		iteration.IssueRepo = repo.FullName()
 	}
 	client := newSkillOptGitHubClient()
-	publishedFiles, filePublishErr := publishSkillOptTrainCandidateReviewFiles(ctx, paths, store, client, repo, session, iteration)
+	publishedFiles := existingSkillOptCandidateReviewPublishedFiles(session, iteration, repo, candidateID)
+	var filePublishErr error
+	if len(publishedFiles) == 0 {
+		publishedFiles, filePublishErr = publishSkillOptTrainCandidateReviewFiles(ctx, paths, store, client, repo, session, iteration)
+	}
 	filePublishWarnings := []string{}
 	if filePublishErr != nil {
 		filePublishWarnings = append(filePublishWarnings, filePublishErr.Error())
@@ -2036,6 +2040,49 @@ func skillOptCandidateReviewFilesMetadata(files []skillOptTrainCandidateReviewFi
 		})
 	}
 	return metadata
+}
+
+func existingSkillOptCandidateReviewPublishedFiles(session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, repo github.Repository, candidateID string) []skillOptTrainCandidateReviewFile {
+	for _, metadataJSON := range []string{iteration.MetadataJSON, session.MetadataJSON} {
+		review := decodedSkillOptMetadataValue(decodedSkillOptMetadata(metadataJSON)["candidate_review"])
+		if metadataString(review, "candidate_version") != candidateID {
+			continue
+		}
+		if firstNonEmpty(metadataString(review, "issue_repo"), metadataString(review, "pull_request_repo")) != repo.FullName() {
+			continue
+		}
+		if len(metadataSlice(review["file_publish_errors"])) > 0 {
+			continue
+		}
+		files := skillOptCandidateReviewFilesFromMetadata(review["published_files"])
+		if len(files) > 0 {
+			return files
+		}
+	}
+	return nil
+}
+
+func skillOptCandidateReviewFilesFromMetadata(value any) []skillOptTrainCandidateReviewFile {
+	values := metadataSlice(value)
+	if len(values) == 0 {
+		return nil
+	}
+	files := make([]skillOptTrainCandidateReviewFile, 0, len(values))
+	for _, raw := range values {
+		metadata := decodedSkillOptMetadataValue(raw)
+		label := metadataString(metadata, "label")
+		path := metadataString(metadata, "path")
+		url := metadataString(metadata, "url")
+		if label == "" || path == "" {
+			continue
+		}
+		files = append(files, skillOptTrainCandidateReviewFile{
+			Label: label,
+			Path:  path,
+			URL:   url,
+		})
+	}
+	return files
 }
 
 func skillOptTrainCandidateReviewBody(ctx context.Context, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, commandHome string, publishedFiles []skillOptTrainCandidateReviewFile, filePublishWarnings []string) (string, error) {
@@ -6685,6 +6732,31 @@ func decodedSkillOptMetadataValue(value any) map[string]any {
 		return object
 	}
 	return map[string]any{}
+}
+
+func metadataSlice(value any) []any {
+	switch typed := value.(type) {
+	case []any:
+		return typed
+	case []map[string]any:
+		values := make([]any, 0, len(typed))
+		for _, item := range typed {
+			values = append(values, item)
+		}
+		return values
+	case []map[string]string:
+		values := make([]any, 0, len(typed))
+		for _, item := range typed {
+			metadata := make(map[string]any, len(item))
+			for key, value := range item {
+				metadata[key] = value
+			}
+			values = append(values, metadata)
+		}
+		return values
+	default:
+		return nil
+	}
 }
 
 func metadataString(metadata map[string]any, key string) string {
