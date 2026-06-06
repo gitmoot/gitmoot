@@ -646,6 +646,7 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 	targetArtifactRetryBudget := fs.Int("target-artifact-retry-budget", -1, "target artifact repair retry budget; omit to use gitmoot-skillopt default")
 	hardFailureRetryBudget := fs.Int("hard-failure-retry-budget", -1, "hard-failure reflection retry budget; omit to use gitmoot-skillopt default")
 	feedbackDirectMode := fs.String("feedback-direct-mode", "", "feedback-direct optimizer mode: auto, on, or off")
+	finalEval := fs.Bool("final-eval", false, "run gitmoot-skillopt final test evaluation after selection; disabled by default")
 	gate := fs.String("gate", "", "optimizer gate metric: hard, soft, or mixed")
 	outRoot := fs.String("out-root", "", "optimizer output directory")
 	timeout := fs.String("timeout", "", "optimizer timeout duration")
@@ -738,6 +739,7 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 				HardFailureRetryBudget:       *hardFailureRetryBudget,
 				HardFailureRetryBudgetSet:    setFlags["hard-failure-retry-budget"],
 				FeedbackDirectMode:           strings.TrimSpace(strings.ToLower(*feedbackDirectMode)),
+				FinalEval:                    *finalEval,
 				Gate:                         *gate,
 				OutRoot:                      *outRoot,
 				Timeout:                      *timeout,
@@ -813,6 +815,7 @@ type skillOptTrainOptimizerRequest struct {
 	HardFailureRetryBudget       int
 	HardFailureRetryBudgetSet    bool
 	FeedbackDirectMode           string
+	FinalEval                    bool
 	Gate                         string
 	OutRoot                      string
 	Timeout                      string
@@ -1389,12 +1392,24 @@ type skillOptTrainCandidateReviewResult struct {
 	URL                string
 	CandidateVersionID string
 	PublishedFiles     []skillOptTrainCandidateReviewFile
+	PublishedPreviews  []skillOptTrainCandidateReviewPreview
 }
 
 type skillOptTrainCandidateReviewFile struct {
 	Label string
 	Path  string
 	URL   string
+}
+
+type skillOptTrainCandidateReviewPreview struct {
+	Label        string
+	ArtifactID   string
+	Route        string
+	URL          string
+	Renderer     string
+	Status       string
+	StatusReason string
+	Error        string
 }
 
 type skillOptTrainCandidateDecisionResult struct {
@@ -1449,7 +1464,11 @@ func publishSkillOptTrainCandidateReview(ctx context.Context, paths config.Paths
 	if filePublishErr != nil {
 		filePublishWarnings = append(filePublishWarnings, filePublishErr.Error())
 	}
-	body, err := skillOptTrainCandidateReviewBody(ctx, store, session, iteration, commandHome, publishedFiles, filePublishWarnings)
+	publishedPreviews := existingSkillOptCandidateReviewPublishedPreviews(session, iteration, candidateID)
+	if len(publishedPreviews) == 0 {
+		publishedPreviews = publishSkillOptTrainCandidateSamplePreviews(ctx, paths, store, session, iteration)
+	}
+	body, err := skillOptTrainCandidateReviewBody(ctx, store, session, iteration, commandHome, publishedFiles, publishedPreviews, filePublishWarnings)
 	if err != nil {
 		return skillOptTrainCandidateReviewResult{}, err
 	}
@@ -1465,6 +1484,7 @@ func publishSkillOptTrainCandidateReview(ctx context.Context, paths config.Paths
 		"pull_request_url":    iteration.PullRequestURL,
 		"issue_title":         title,
 		"published_files":     skillOptCandidateReviewFilesMetadata(publishedFiles),
+		"published_previews":  skillOptCandidateReviewPreviewsMetadata(publishedPreviews),
 		"file_publish_errors": filePublishWarnings,
 		"started_at":          time.Now().UTC().Format(time.RFC3339Nano),
 		"source":              "gitmoot skillopt train continue",
@@ -1549,7 +1569,7 @@ func publishSkillOptTrainCandidateReview(ctx context.Context, paths config.Paths
 		return skillOptTrainCandidateReviewResult{}, err
 	}
 	_ = removeSkillOptCandidateReviewRecovery(paths, session, iteration)
-	return skillOptTrainCandidateReviewResult{URL: url, CandidateVersionID: candidateID, PublishedFiles: publishedFiles}, nil
+	return skillOptTrainCandidateReviewResult{URL: url, CandidateVersionID: candidateID, PublishedFiles: publishedFiles, PublishedPreviews: publishedPreviews}, nil
 }
 
 func recoverSkillOptCandidateReviewPublication(ctx context.Context, paths config.Paths, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, candidateID string) (skillOptTrainCandidateReviewResult, bool, error) {
@@ -2154,7 +2174,158 @@ func skillOptCandidateReviewFilesFromMetadata(value any) []skillOptTrainCandidat
 	return files
 }
 
-func skillOptTrainCandidateReviewBody(ctx context.Context, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, commandHome string, publishedFiles []skillOptTrainCandidateReviewFile, filePublishWarnings []string) (string, error) {
+func publishSkillOptTrainCandidateSamplePreviews(ctx context.Context, paths config.Paths, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration) []skillOptTrainCandidateReviewPreview {
+	candidateID := strings.TrimSpace(iteration.CandidateVersionID)
+	artifactID := skillOptCandidateSelectionSampleArtifactID(ctx, store, candidateID)
+	if candidateID == "" || artifactID == "" {
+		return nil
+	}
+	preview := skillOptTrainCandidateReviewPreview{
+		Label:      "Selection sample",
+		ArtifactID: artifactID,
+		Renderer:   skillopt.TrainPreviewRendererVueVite,
+	}
+	policy := skillopt.ResolveTrainPreviewPolicy(session)
+	if policy.Mode == skillopt.TrainPreviewModeNone || policy.Renderer != skillopt.TrainPreviewRendererVueVite || policy.Publisher != skillopt.TrainPreviewPublisherGitHubPages {
+		preview.Error = "candidate sample preview publishing is not configured for vue-vite GitHub Pages"
+		return []skillOptTrainCandidateReviewPreview{preview}
+	}
+	record, err := store.GetEvalArtifact(ctx, artifactID)
+	if err != nil {
+		preview.Error = err.Error()
+		return []skillOptTrainCandidateReviewPreview{preview}
+	}
+	content, err := artifact.NewStore(paths.ArtifactBlobs).Read(record.Hash)
+	if err != nil {
+		preview.Error = err.Error()
+		return []skillOptTrainCandidateReviewPreview{preview}
+	}
+	bundle, err := skillopt.ParsePreviewBundle(content)
+	if err != nil {
+		preview.Error = err.Error()
+		return []skillOptTrainCandidateReviewPreview{preview}
+	}
+	preview.Renderer = bundle.Renderer
+	previewRepo, err := previewRepoRecord(ctx, store, policy)
+	if err != nil {
+		preview.Error = err.Error()
+		return []skillOptTrainCandidateReviewPreview{preview}
+	}
+	distDir, cleanup, err := renderVueVitePreviewBundle(ctx, bundle)
+	if err != nil {
+		preview.Error = err.Error()
+		return []skillOptTrainCandidateReviewPreview{preview}
+	}
+	defer func() { _ = cleanup() }()
+	route, err := skillOptPreviewRoute(policy.RouteTemplate, session.ID, iteration.ID, "candidate-selection-sample-"+candidateID)
+	if err != nil {
+		preview.Error = err.Error()
+		return []skillOptTrainCandidateReviewPreview{preview}
+	}
+	publication, err := publishGitHubPagesPreview(ctx, previewRepo, route, distDir)
+	if err != nil {
+		preview.Error = err.Error()
+		return []skillOptTrainCandidateReviewPreview{preview}
+	}
+	preview.Route = route
+	preview.URL = publication.URL
+	preview.Status = publication.PagesStatus
+	preview.StatusReason = publication.StatusReason
+	return []skillOptTrainCandidateReviewPreview{preview}
+}
+
+func skillOptCandidateSelectionSampleArtifactID(ctx context.Context, store *db.Store, candidateID string) string {
+	if strings.TrimSpace(candidateID) == "" {
+		return ""
+	}
+	review, err := store.GetAgentTemplateCandidateReview(ctx, candidateID)
+	if err != nil {
+		return ""
+	}
+	for _, artifactID := range skillOptMetadataStringSlice(decodedSkillOptMetadata(review.SummaryMetadataJSON), "artifact_ids") {
+		if strings.HasSuffix(strings.TrimSpace(artifactID), "/candidate-selection-sample") {
+			return strings.TrimSpace(artifactID)
+		}
+	}
+	artifactID := strings.TrimSuffix(strings.TrimSpace(review.DiffArtifactID), "/candidate-diff") + "/candidate-selection-sample"
+	if strings.TrimSpace(artifactID) == "/candidate-selection-sample" {
+		return ""
+	}
+	if _, err := store.GetEvalArtifact(ctx, artifactID); err == nil {
+		return artifactID
+	}
+	return ""
+}
+
+func skillOptMetadataStringSlice(metadata map[string]any, key string) []string {
+	values := metadataSlice(metadata[key])
+	output := make([]string, 0, len(values))
+	for _, value := range values {
+		text := strings.TrimSpace(fmt.Sprint(value))
+		if text != "" {
+			output = append(output, text)
+		}
+	}
+	return output
+}
+
+func skillOptCandidateReviewPreviewsMetadata(previews []skillOptTrainCandidateReviewPreview) []map[string]string {
+	if len(previews) == 0 {
+		return nil
+	}
+	metadata := make([]map[string]string, 0, len(previews))
+	for _, preview := range previews {
+		metadata = append(metadata, map[string]string{
+			"label":         preview.Label,
+			"artifact_id":   preview.ArtifactID,
+			"route":         preview.Route,
+			"url":           preview.URL,
+			"renderer":      preview.Renderer,
+			"status":        preview.Status,
+			"status_reason": preview.StatusReason,
+			"error":         preview.Error,
+		})
+	}
+	return metadata
+}
+
+func existingSkillOptCandidateReviewPublishedPreviews(session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, candidateID string) []skillOptTrainCandidateReviewPreview {
+	for _, metadataJSON := range []string{iteration.MetadataJSON, session.MetadataJSON} {
+		review := decodedSkillOptMetadataValue(decodedSkillOptMetadata(metadataJSON)["candidate_review"])
+		if metadataString(review, "candidate_version") != candidateID {
+			continue
+		}
+		previews := skillOptCandidateReviewPreviewsFromMetadata(review["published_previews"])
+		if len(previews) > 0 {
+			return previews
+		}
+	}
+	return nil
+}
+
+func skillOptCandidateReviewPreviewsFromMetadata(value any) []skillOptTrainCandidateReviewPreview {
+	values := metadataSlice(value)
+	if len(values) == 0 {
+		return nil
+	}
+	previews := make([]skillOptTrainCandidateReviewPreview, 0, len(values))
+	for _, raw := range values {
+		metadata := decodedSkillOptMetadataValue(raw)
+		previews = append(previews, skillOptTrainCandidateReviewPreview{
+			Label:        metadataString(metadata, "label"),
+			ArtifactID:   metadataString(metadata, "artifact_id"),
+			Route:        metadataString(metadata, "route"),
+			URL:          metadataString(metadata, "url"),
+			Renderer:     metadataString(metadata, "renderer"),
+			Status:       metadataString(metadata, "status"),
+			StatusReason: metadataString(metadata, "status_reason"),
+			Error:        metadataString(metadata, "error"),
+		})
+	}
+	return previews
+}
+
+func skillOptTrainCandidateReviewBody(ctx context.Context, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, commandHome string, publishedFiles []skillOptTrainCandidateReviewFile, publishedPreviews []skillOptTrainCandidateReviewPreview, filePublishWarnings []string) (string, error) {
 	candidateID := strings.TrimSpace(iteration.CandidateVersionID)
 	version, err := store.GetAgentTemplateVersionByID(ctx, candidateID)
 	if err != nil {
@@ -2206,6 +2377,37 @@ func skillOptTrainCandidateReviewBody(ctx context.Context, store *db.Store, sess
 			}
 		}
 	}
+	builder.WriteString("\n### Candidate Sample Preview\n")
+	if len(publishedPreviews) == 0 {
+		builder.WriteString("- Preview: no selected candidate sample artifact was available to publish.\n")
+	} else {
+		for _, preview := range publishedPreviews {
+			label := firstNonEmpty(strings.TrimSpace(preview.Label), "Selection sample")
+			if strings.TrimSpace(preview.Error) != "" {
+				fmt.Fprintf(&builder, "- %s: publish failed for `%s`: `%s`\n", label, preview.ArtifactID, truncateForMetadata(preview.Error))
+				continue
+			}
+			if strings.TrimSpace(preview.URL) != "" {
+				fmt.Fprintf(&builder, "- %s: [%s](%s)\n", label, preview.URL, preview.URL)
+			} else {
+				fmt.Fprintf(&builder, "- %s: `%s`\n", label, preview.ArtifactID)
+			}
+			if strings.TrimSpace(preview.ArtifactID) != "" {
+				fmt.Fprintf(&builder, "  - Evaluated artifact: `%s`\n", preview.ArtifactID)
+			}
+			if strings.TrimSpace(preview.Renderer) != "" {
+				fmt.Fprintf(&builder, "  - Renderer: `%s`\n", preview.Renderer)
+			}
+			if strings.TrimSpace(preview.Status) != "" {
+				statusText := preview.Status
+				if strings.TrimSpace(preview.StatusReason) != "" {
+					statusText += ": " + preview.StatusReason
+				}
+				fmt.Fprintf(&builder, "  - Pages status: `%s`\n", truncateForMetadata(statusText))
+			}
+		}
+	}
+	skillOptWriteCandidateReviewFinalEval(&builder, review)
 	if len(filePublishWarnings) > 0 {
 		if len(publishedFiles) == 0 {
 			builder.WriteString("\n### GitHub Files\n")
@@ -2282,6 +2484,33 @@ func skillOptWriteCandidateReviewScores(builder *strings.Builder, review db.Agen
 	} else {
 		fmt.Fprintf(builder, "- Promotability: `not promotable: %s`\n", reason)
 	}
+}
+
+func skillOptWriteCandidateReviewFinalEval(builder *strings.Builder, review db.AgentTemplateCandidateReview) {
+	evalReport := decodedSkillOptMetadata(review.EvalReportJSON)
+	enabled := metadataBool(evalReport, "final_eval_enabled")
+	ran := metadataBool(evalReport, "final_eval_ran")
+	skippedReason := metadataString(evalReport, "final_test_skipped_reason")
+	if !enabled {
+		builder.WriteString("- Final eval: `disabled`\n")
+		builder.WriteString("  - Reason: candidate review uses selection eval by default.\n")
+		return
+	}
+	if !ran {
+		fmt.Fprintf(builder, "- Final eval: `enabled, skipped%s`\n", finalEvalReasonSuffix(skippedReason))
+		return
+	}
+	builder.WriteString("- Final eval: `enabled, ran`\n")
+	skillOptWriteCandidateReviewScoreLine(builder, "  - Final test hard", metadataFloatPtr(evalReport, "test_hard"))
+	skillOptWriteCandidateReviewScoreLine(builder, "  - Final test soft", metadataFloatPtr(evalReport, "test_soft"))
+}
+
+func finalEvalReasonSuffix(reason string) string {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return ""
+	}
+	return ": " + reason
 }
 
 func skillOptWriteCandidateReviewScoreLine(builder *strings.Builder, label string, score *float64) {
@@ -2408,6 +2637,11 @@ func metadataBoolPtr(metadata map[string]any, key string) *bool {
 		}
 	}
 	return nil
+}
+
+func metadataBool(metadata map[string]any, key string) bool {
+	value := metadataBoolPtr(metadata, key)
+	return value != nil && *value
 }
 
 func metadataScoreMap(metadata map[string]any, key string) map[string]float64 {
@@ -3277,6 +3511,7 @@ func skillOptTrainOptimizerRequestHash(request skillOptTrainOptimizerRequest) st
 			"value": request.HardFailureRetryBudget,
 		},
 		"feedback_direct_mode": strings.TrimSpace(request.FeedbackDirectMode),
+		"final_eval":           request.FinalEval,
 		"gate":                 strings.TrimSpace(request.Gate),
 		"timeout":              strings.TrimSpace(request.Timeout),
 		"dry_run":              request.DryRun,
@@ -6616,6 +6851,9 @@ func buildSkillOptTrainOptimizerCommand(iteration db.SkillOptTrainIteration, req
 	if feedbackDirectMode := strings.TrimSpace(request.FeedbackDirectMode); feedbackDirectMode != "" {
 		args = append(args, "--feedback-direct-mode", feedbackDirectMode)
 	}
+	if request.FinalEval {
+		args = append(args, "--eval-test")
+	}
 	if request.DryRun {
 		args = append(args, "--dry-run")
 	}
@@ -6712,6 +6950,9 @@ func addSkillOptTrainOptimizerConfigMetadata(metadata map[string]any, request sk
 	}
 	if mode := strings.TrimSpace(request.FeedbackDirectMode); mode != "" {
 		metadata["feedback_direct_mode"] = mode
+	}
+	if request.FinalEval {
+		metadata["final_eval"] = true
 	}
 	if request.TargetArtifactRetryBudgetSet {
 		metadata["target_artifact_retry_budget"] = request.TargetArtifactRetryBudget
@@ -7120,6 +7361,9 @@ func skillOptTrainOptimizerReportLines(result skillOptTrainOptimizerResult) []st
 	}
 	if mode := strings.TrimSpace(result.Request.FeedbackDirectMode); mode != "" {
 		lines = append(lines, fmt.Sprintf("feedback_direct_mode: %s", mode))
+	}
+	if result.Request.FinalEval {
+		lines = append(lines, "final_eval: true")
 	}
 	if result.Request.TargetArtifactRetryBudgetSet {
 		lines = append(lines, fmt.Sprintf("target_artifact_retry_budget: %d", result.Request.TargetArtifactRetryBudget))

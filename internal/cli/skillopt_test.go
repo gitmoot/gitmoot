@@ -2817,6 +2817,7 @@ func TestSkillOptTrainContinueRunsOptimizerAndImportsCandidate(t *testing.T) {
 		"--gate", "mixed",
 		"--out-root", outRoot,
 		"--timeout", "5m",
+		"--final-eval",
 		"--dry-run",
 	}, &stdout, &stderr)
 	if code != 0 {
@@ -2833,6 +2834,7 @@ func TestSkillOptTrainContinueRunsOptimizerAndImportsCandidate(t *testing.T) {
 		"optimizer_attempt_path: " + attemptRoot,
 		"candidate_package: " + filepath.Join(attemptRoot, "candidate.json"),
 		"optimizer_dry_run: true",
+		"final_eval: true",
 		"imported_candidate: planner@v2",
 		"next: publish candidate diff and preview review",
 	} {
@@ -2862,6 +2864,7 @@ func TestSkillOptTrainContinueRunsOptimizerAndImportsCandidate(t *testing.T) {
 		"--skill-update-mode", "full_rewrite_minibatch",
 		"--num-epochs", "2",
 		"--batch-size", "3",
+		"--eval-test",
 		"--dry-run",
 	} {
 		if !containsString(call.args, want) {
@@ -4505,7 +4508,7 @@ func TestSkillOptTrainCandidateReviewBodyMarksNoOpNotPromotable(t *testing.T) {
 		ID:                    "optimizer-train-001",
 		CandidateVersionID:    version.ID,
 		BaseTemplateVersionID: baseVersionID,
-	}, home, nil, nil)
+	}, home, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("skillOptTrainCandidateReviewBody returned error: %v", err)
 	}
@@ -4517,6 +4520,9 @@ func TestSkillOptTrainCandidateReviewBodyMarksNoOpNotPromotable(t *testing.T) {
 		"Gate status: `blocked`",
 		"No-op status: `blocked: best_origin_initial_skill`",
 		"Promotability: `not promotable: best_origin_initial_skill`",
+		"### Candidate Sample Preview",
+		"Preview: no selected candidate sample artifact was available to publish.",
+		"Final eval: `disabled`",
 		"Promote: unavailable because best_origin_initial_skill.",
 		"Wait: take no action",
 		"Keep improving: reject with an actionable reason",
@@ -4553,7 +4559,7 @@ func TestSkillOptTrainCandidateReviewBodyMarksNoOpNotPromotable(t *testing.T) {
 		ID:                    "optimizer-train-001",
 		CandidateVersionID:    version.ID,
 		BaseTemplateVersionID: baseVersionID,
-	}, home, nil, nil)
+	}, home, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("skillOptTrainCandidateReviewBody without reason returned error: %v", err)
 	}
