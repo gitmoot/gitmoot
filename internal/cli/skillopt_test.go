@@ -3238,19 +3238,24 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 		"no_candidate_details": {
 			"attempted_patch": "artifact delivery only",
 			"baseline_gate": 0.89,
-			"candidate_gate": 0.84,
-			"retry_attempts": "1/1",
-			"duplicate_retry_detected": true,
+				"candidate_gate": 0.84,
+				"retry_attempts": "1/1",
+				"retry_budget": "1",
+				"duplicate_retry_detected": true,
 			"diagnostic_categories": [
 				"old_review_training_signal",
 				"candidate_feedback_unresolved",
 				"retry_budget_exhausted"
 			],
 			"selection_gate_relation": "candidate_below_baseline",
-			"retry_budget_exhausted": true,
-			"retry_stop_reasons": ["budget_exhausted"],
-			"stop_reason": "budget_exhausted",
-			"feedback_themes": ["MoonAI-style premium branding", "scroll animations"],
+				"retry_budget_exhausted": true,
+				"retry_stop_reasons": ["budget_exhausted"],
+				"optimizer_context_items": ["item-001", "item-002"],
+				"score_gap": 0.05,
+				"score_gap_handling": "retry_context",
+				"hard_score_handling": "retryable_if_actionable",
+				"stop_reason": "budget_exhausted",
+				"feedback_themes": ["MoonAI-style premium branding", "scroll animations"],
 			"evaluator_reason": "Candidate was valid but had weaker imagery.",
 			"optimizer_hint": "Resolve imported review themes and artifact contract.",
 			"failed_dimensions": ["human_feedback_alignment", "artifact_contract"],
@@ -3361,6 +3366,9 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 		!strings.Contains(iteration.MetadataJSON, `"duplicate_retry_detected":true`) ||
 		!strings.Contains(iteration.MetadataJSON, `"evaluator_reason":"Candidate was valid but had weaker imagery."`) ||
 		!strings.Contains(iteration.MetadataJSON, `"optimizer_hint":"Resolve imported review themes and artifact contract."`) ||
+		!strings.Contains(iteration.MetadataJSON, `"optimizer_context_items":["item-001","item-002"]`) ||
+		!strings.Contains(iteration.MetadataJSON, `"score_gap_handling":"retry_context"`) ||
+		!strings.Contains(iteration.MetadataJSON, `"hard_score_handling":"retryable_if_actionable"`) ||
 		!strings.Contains(iteration.MetadataJSON, `"source_item_ids":["item-001"]`) {
 		t.Fatalf("iteration metadata after no-candidate = %s", iteration.MetadataJSON)
 	}
@@ -3390,6 +3398,8 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 		statusJSON.NoCandidateDetails["duplicate_retry_detected"] != true ||
 		statusJSON.NoCandidateDetails["selection_gate_relation"] != "candidate_below_baseline" ||
 		statusJSON.NoCandidateDetails["retry_budget_exhausted"] != true ||
+		statusJSON.NoCandidateDetails["score_gap_handling"] != "retry_context" ||
+		statusJSON.NoCandidateDetails["hard_score_handling"] != "retryable_if_actionable" ||
 		statusJSON.NoCandidateDetails["optimizer_hint"] != "Resolve imported review themes and artifact contract." ||
 		statusJSON.NoCandidateDetails["human_feedback_context"] == nil ||
 		statusJSON.Verbose == nil ||
@@ -3425,6 +3435,10 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 		"selection_gate_relation: candidate_below_baseline",
 		"retry_budget_exhausted: true",
 		"retry_stop_reasons: budget_exhausted",
+		"optimizer_context_items: item-001,item-002",
+		"score_gap: 0.05",
+		"score_gap_handling: retry_context",
+		"hard_score_handling: retryable_if_actionable",
 		"stop_reason: budget_exhausted",
 		"evaluator_reason: Candidate was valid but had weaker imagery.",
 		"optimizer_hint: Resolve imported review themes and artifact contract.",

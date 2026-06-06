@@ -5669,6 +5669,18 @@ func printSkillOptNoCandidateDetails(stdout io.Writer, details map[string]any) {
 	if retryStopReasons := metadataStringSlice(details, "retry_stop_reasons"); len(retryStopReasons) > 0 {
 		writeLine(stdout, "retry_stop_reasons: %s", strings.Join(retryStopReasons, ","))
 	}
+	if optimizerContextItems := metadataStringSlice(details, "optimizer_context_items"); len(optimizerContextItems) > 0 {
+		writeLine(stdout, "optimizer_context_items: %s", strings.Join(optimizerContextItems, ","))
+	}
+	if scoreGap := metadataString(details, "score_gap"); scoreGap != "" {
+		writeLine(stdout, "score_gap: %s", scoreGap)
+	}
+	if scoreGapHandling := metadataString(details, "score_gap_handling"); scoreGapHandling != "" {
+		writeLine(stdout, "score_gap_handling: %s", scoreGapHandling)
+	}
+	if hardScoreHandling := metadataString(details, "hard_score_handling"); hardScoreHandling != "" {
+		writeLine(stdout, "hard_score_handling: %s", hardScoreHandling)
+	}
 	if stopReason := metadataString(details, "stop_reason"); stopReason != "" {
 		writeLine(stdout, "stop_reason: %s", stopReason)
 	}
