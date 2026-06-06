@@ -381,14 +381,23 @@ gitmoot skillopt train continue \
   --wrong-artifact-retry-budget 1
 ```
 
-A gate rejection is retryable only when the evaluator supplied actionable
+A gate rejection is retryable when the evaluator supplied actionable
 information, the candidate actually changed, the rejection is not just repeated
-noise, and budget remains. The retry prompt includes the previous patch
-summary, baseline-vs-candidate score deltas, failed dimensions, why the
-candidate lost, and guidance not to repeat the same patch direction. Near-miss
-selection rejects can also retry adaptively when the candidate is close enough
-to the baseline according to `gate_reject_retry_close_gap`, which defaults to
-`0.03`.
+noise, and budget remains. In imported human-review mode, the optimizer context
+includes all reviewed feedback items; it does not optimize from only the sampled
+item that happened to be in the current minibatch. The retry prompt includes the
+previous patch summary, baseline-vs-candidate score deltas, failed dimensions,
+why the candidate lost, all reviewed feedback themes, and guidance not to repeat
+the same patch direction.
+
+Large score gaps and `hard=0` candidate scores are not automatic retry blockers
+when the rejection packet is actionable. They are recorded as retry metadata,
+for example `score_gap_handling: retry_context` or
+`hard_score_handling: retryable_if_actionable`, so the next optimizer attempt
+can use them as stronger context. Gitmoot stops retry only when budget is
+exhausted, the structured rejection is missing, actionable guidance is missing,
+the same candidate/reason repeats after duplicate handling, or an explicit
+external/config failure cannot be fixed by changing the skill.
 
 Duplicate retry candidates do not get silently accepted or loop forever. If a
 retry produces the same candidate hash, the next retry is forced to include
@@ -409,12 +418,27 @@ gitmoot skillopt train status --session planner-train --verbose
 ```
 
 For gate rejections, status includes the baseline/candidate score comparison,
-attempted patch, retry count such as `1/3`, duplicate retry detection,
-evaluator reason, and concise `next_action_option` lines. The normal user
-choices are to collect more feedback, rerun after changing the retry/config
-inputs, or inspect the candidate package manually. Gitmoot does not create a
-pending candidate record when the best selected prompt is the unchanged
-baseline or the candidate content hash matches the base template.
+attempted patch, retry count such as `1/3`, optimizer context items, duplicate
+retry detection, score-gap handling, hard-score handling, evaluator reason, and
+concise `next_action_option` lines. The normal user choices are to collect more
+feedback, rerun after changing the retry/config inputs, or inspect the candidate
+package manually. Gitmoot does not create a pending candidate record when the
+best selected prompt is the unchanged baseline or the candidate content hash
+matches the base template.
+
+```mermaid
+flowchart TD
+  A[Import GitHub review feedback] --> B[Build optimizer context from all reviewed items]
+  B --> C[Optimizer creates candidate skill]
+  C --> D[Target generates outputs]
+  D --> E[Judge compares candidate vs baseline]
+  E -->|candidate wins| F[Publish candidate for human decision]
+  E -->|candidate loses| G[Structured rejection packet]
+  G --> H{Budget remains + actionable guidance?}
+  H -->|yes| I[Retry optimizer with full review + rejection]
+  I --> C
+  H -->|no| J[Stop with clear reason]
+```
 
 Every optimizer run writes into a numbered attempt directory:
 
