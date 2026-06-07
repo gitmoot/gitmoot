@@ -150,6 +150,19 @@ items:
 Use `quality: poor` or `continue_mode: explore` when all options are weak and a
 stable winner should not narrow the search yet.
 
+For exploratory human-feedback optimization, prefer:
+
+```sh
+gitmoot skillopt train continue \
+  --session planner-train \
+  --skill-update-mode full_rewrite_minibatch \
+  --optimizer-views 4
+```
+
+`--optimizer-views` runs independent optimizer perspectives over the same full
+review feedback set before merge, while the compact update mode rewrites the
+skill instead of only appending more prompt rules.
+
 After feedback sync, train mode exports the training package, invokes
 `gitmoot-skillopt optimize`, imports the returned candidate through the shared
 candidate validator, and leaves the candidate pending. Use optimizer `--dry-run`

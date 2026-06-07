@@ -333,6 +333,7 @@ gitmoot skillopt train continue \
   --skill-update-mode full_rewrite_minibatch \
   --num-epochs 1 \
   --batch-size 2 \
+  --optimizer-views 4 \
   --gate mixed
 ```
 
@@ -385,10 +386,18 @@ A gate rejection is retryable when the evaluator supplied actionable
 information, the candidate actually changed, the rejection is not just repeated
 noise, and budget remains. In imported human-review mode, the optimizer context
 includes all reviewed feedback items; it does not optimize from only the sampled
-item that happened to be in the current minibatch. The retry prompt includes the
-previous patch summary, baseline-vs-candidate score deltas, failed dimensions,
-why the candidate lost, all reviewed feedback themes, and guidance not to repeat
-the same patch direction.
+item that happened to be in the current minibatch. Use `--optimizer-views N`
+when the same small feedback set should be analyzed by multiple independent
+optimizer perspectives before merge. Each view receives the full feedback set,
+but Gitmoot forces the view reflection minibatch size to one so views do not
+collapse into one analyst prompt. For exploratory human-feedback iterations,
+`--skill-update-mode full_rewrite_minibatch --optimizer-views 4` is the
+recommended compact-skill path; patch mode still prefers `replace`/`delete`
+edits over append-only prompt growth.
+
+The retry prompt includes the previous patch summary, baseline-vs-candidate
+score deltas, failed dimensions, why the candidate lost, all reviewed feedback
+themes, and guidance not to repeat the same patch direction.
 
 Large score gaps and `hard=0` candidate scores are not automatic retry blockers
 when the rejection packet is actionable. They are recorded as retry metadata,

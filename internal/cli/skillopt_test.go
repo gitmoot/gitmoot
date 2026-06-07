@@ -2814,6 +2814,7 @@ func TestSkillOptTrainContinueRunsOptimizerAndImportsCandidate(t *testing.T) {
 		"--skill-update-mode", "full_rewrite_minibatch",
 		"--num-epochs", "2",
 		"--batch-size", "3",
+		"--optimizer-views", "4",
 		"--gate", "mixed",
 		"--out-root", outRoot,
 		"--timeout", "5m",
@@ -2833,6 +2834,7 @@ func TestSkillOptTrainContinueRunsOptimizerAndImportsCandidate(t *testing.T) {
 		"optimizer_attempt: attempt-001",
 		"optimizer_attempt_path: " + attemptRoot,
 		"candidate_package: " + filepath.Join(attemptRoot, "candidate.json"),
+		"optimizer_views: 4",
 		"optimizer_dry_run: true",
 		"final_eval: true",
 		"imported_candidate: planner@v2",
@@ -2864,6 +2866,7 @@ func TestSkillOptTrainContinueRunsOptimizerAndImportsCandidate(t *testing.T) {
 		"--skill-update-mode", "full_rewrite_minibatch",
 		"--num-epochs", "2",
 		"--batch-size", "3",
+		"--optimizer-views", "4",
 		"--eval-test",
 		"--dry-run",
 	} {
@@ -3173,6 +3176,11 @@ func TestSkillOptTrainContinueRejectsInvalidOptimizerControls(t *testing.T) {
 		args []string
 		want string
 	}{
+		{
+			name: "zero optimizer views",
+			args: []string{"--optimizer-views", "0"},
+			want: "--optimizer-views must be greater than zero",
+		},
 		{
 			name: "negative noop retry budget",
 			args: []string{"--noop-retry-budget", "-1"},
