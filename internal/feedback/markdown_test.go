@@ -248,6 +248,48 @@ items:
 	}
 }
 
+func TestMarkdownCollectorImportsTiedRankedPacket(t *testing.T) {
+	ctx := context.Background()
+	store, blobs := setupMarkdownRankedFeedbackRun(t, "ranked-1")
+	packetDir := filepath.Join(t.TempDir(), "packet")
+	collector := MarkdownCollector{BlobStore: blobs}
+	if err := collector.WritePacket(ctx, store, "ranked-1", packetDir); err != nil {
+		t.Fatalf("WritePacket returned error: %v", err)
+	}
+	feedbackContent := `run_id: ranked-1
+reviewer: jerry
+items:
+  - item_id: item-001
+    ranking:
+      - A = B = C = D
+    quality: poor
+    continue_mode: explore
+    promote: no
+    choice: All options are equally weak.
+`
+	if err := os.WriteFile(filepath.Join(packetDir, "feedback.yml"), []byte(feedbackContent), 0o644); err != nil {
+		t.Fatalf("write feedback.yml: %v", err)
+	}
+	result, err := collector.ImportPacket(ctx, store, packetDir, "")
+	if err != nil {
+		t.Fatalf("ImportPacket returned error: %v", err)
+	}
+	if result.Count() != 1 || len(result.RankedFeedbackEvents) != 1 {
+		t.Fatalf("result = %+v", result)
+	}
+	event := result.RankedFeedbackEvents[0]
+	if event.Winner != "" || event.TieGroupsJSON != `[["a","b","c","d"]]` {
+		t.Fatalf("tied ranked event = %+v", event)
+	}
+	pairs, err := store.ListPairwisePreferences(ctx, "ranked-1")
+	if err != nil {
+		t.Fatalf("ListPairwisePreferences returned error: %v", err)
+	}
+	if len(pairs) != 0 {
+		t.Fatalf("tied ranking pairwise preferences = %+v, want none", pairs)
+	}
+}
+
 func TestMarkdownCollectorRejectsInvalidRankedWinnerWithoutPartialImport(t *testing.T) {
 	ctx := context.Background()
 	store, blobs := setupMarkdownRankedFeedbackRun(t, "ranked-1")

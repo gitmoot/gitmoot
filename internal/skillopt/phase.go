@@ -283,6 +283,15 @@ func normalizedWinner(event db.RankedFeedbackEvent) string {
 	if winner != "" {
 		return winner
 	}
+	if strings.TrimSpace(event.TieGroupsJSON) != "" {
+		var groups [][]string
+		if err := json.Unmarshal([]byte(event.TieGroupsJSON), &groups); err == nil && len(groups) > 0 {
+			if len(groups[0]) != 1 {
+				return "tie"
+			}
+			return strings.TrimSpace(strings.ToLower(groups[0][0]))
+		}
+	}
 	var ranking []string
 	if err := json.Unmarshal([]byte(event.RankingJSON), &ranking); err != nil || len(ranking) == 0 {
 		return ""

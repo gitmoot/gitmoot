@@ -544,7 +544,7 @@ func parseFullYAMLFeedback(content string) (feedbackFile, bool, error) {
 
 var shortFeedbackLine = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9._/-]*)\s*:\s*([A-Za-z]+)(?:\s*-\s*(.*))?$`)
 var shortRankingLine = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9._/-]*)\s+ranking\s*:\s*(.+)$`)
-var shortDirectRankingLine = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9._/-]*)\s*:\s*([A-Za-z][A-Za-z0-9._/-]*(?:\s*(?:>|,|\|)\s*[A-Za-z][A-Za-z0-9._/-]*)+)(?:\s*-\s*(.*))?$`)
+var shortDirectRankingLine = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9._/-]*)\s*:\s*([A-Za-z][A-Za-z0-9._/-]*(?:\s*(?:>|=|,|\|)\s*[A-Za-z][A-Za-z0-9._/-]*)+)(?:\s*-\s*(.*))?$`)
 var shortMetadataLine = regexp.MustCompile(`^(run_id|reviewer)\s*:\s*(.+)$`)
 var shortItemSignalLine = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9._/-]*)\s+(quality|continue_mode|promote)\s*:\s*(.+)$`)
 var shortBareSignalLine = regexp.MustCompile(`^(quality|continue_mode|promote)\s*:\s*(.+)$`)
@@ -618,18 +618,22 @@ func parseShortFormFeedback(content string) (feedbackFile, bool, error) {
 			traitItemIndex = -1
 		}
 		if match := shortRankingLine.FindStringSubmatch(line); match != nil {
+			ranking, tieGroups := splitRankingStringWithTieGroups(match[2])
 			parsed.Items = append(parsed.Items, feedbackFileEntry{
-				ItemID:  strings.TrimSpace(match[1]),
-				Ranking: splitRankingString(match[2]),
+				ItemID:    strings.TrimSpace(match[1]),
+				Ranking:   ranking,
+				TieGroups: tieGroups,
 			})
 			traitItemIndex = len(parsed.Items) - 1
 			traitTarget = ""
 			continue
 		}
 		if match := shortDirectRankingLine.FindStringSubmatch(line); match != nil {
+			ranking, tieGroups := splitRankingStringWithTieGroups(match[2])
 			parsed.Items = append(parsed.Items, feedbackFileEntry{
 				ItemID:    strings.TrimSpace(match[1]),
-				Ranking:   splitRankingString(match[2]),
+				Ranking:   ranking,
+				TieGroups: tieGroups,
 				Reasoning: strings.TrimSpace(match[3]),
 			})
 			traitItemIndex = len(parsed.Items) - 1
@@ -677,26 +681,44 @@ func setFeedbackItemSignal(entry *feedbackFileEntry, key string, value string) {
 }
 
 func splitRankingString(value string) []string {
-	parts := strings.FieldsFunc(value, func(r rune) bool {
-		return r == '>' || r == ',' || r == '|'
-	})
-	return splitRankingLabels(parts)
+	labels, _ := splitRankingStringWithTieGroups(value)
+	return labels
+}
+
+func splitRankingStringWithTieGroups(value string) ([]string, [][]string) {
+	return splitRankingLabelsAndTieGroups([]string{value})
 }
 
 func splitRankingLabels(values []string) []string {
+	labels, _ := splitRankingLabelsAndTieGroups(values)
+	return labels
+}
+
+func splitRankingLabelsAndTieGroups(values []string) ([]string, [][]string) {
 	labels := make([]string, 0, len(values))
+	groups := [][]string{}
 	for _, value := range values {
-		parts := strings.FieldsFunc(value, func(r rune) bool {
+		orderedParts := strings.FieldsFunc(value, func(r rune) bool {
 			return r == '>' || r == ',' || r == '|'
 		})
-		for _, part := range parts {
-			part = strings.TrimSpace(part)
-			if part != "" {
-				labels = append(labels, part)
+		for _, orderedPart := range orderedParts {
+			tieParts := strings.FieldsFunc(orderedPart, func(r rune) bool {
+				return r == '='
+			})
+			group := []string{}
+			for _, part := range tieParts {
+				part = strings.TrimSpace(part)
+				if part != "" {
+					labels = append(labels, part)
+					group = append(group, part)
+				}
+			}
+			if len(group) > 0 {
+				groups = append(groups, group)
 			}
 		}
 	}
-	return labels
+	return labels, groups
 }
 
 func trimTraitMap(values map[string][]string) map[string][]string {

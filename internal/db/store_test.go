@@ -503,6 +503,81 @@ func TestRankedReviewStorageAndPairwisePreferences(t *testing.T) {
 	}
 }
 
+func TestRankedReviewTieGroupsSkipInGroupPairwisePreferences(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.UpsertEvalRun(ctx, EvalRun{ID: "run-tied", State: "review", Mode: EvalRunModeExplore, OptionsCount: 4}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+	if err := store.UpsertEvalReviewItem(ctx, EvalReviewItem{RunID: "run-tied", ItemID: "item-001", Title: "Tweet"}); err != nil {
+		t.Fatalf("UpsertEvalReviewItem returned error: %v", err)
+	}
+	for _, label := range []string{"a", "b", "c", "d"} {
+		if err := store.UpsertEvalReviewOption(ctx, EvalReviewOption{RunID: "run-tied", ItemID: "item-001", Label: label, ArtifactID: "artifact-" + label}); err != nil {
+			t.Fatalf("UpsertEvalReviewOption %s returned error: %v", label, err)
+		}
+	}
+	if err := store.UpsertRankedFeedbackEvent(ctx, RankedFeedbackEvent{
+		RunID:         "run-tied",
+		ItemID:        "item-001",
+		RankingJSON:   `["a","b","c","d"]`,
+		TieGroupsJSON: `[["a","b","c","d"]]`,
+		Reviewer:      "jerry",
+		Source:        "github",
+		SourceURL:     "all-tied",
+	}); err != nil {
+		t.Fatalf("UpsertRankedFeedbackEvent all tied returned error: %v", err)
+	}
+	pairs, err := store.ListPairwisePreferences(ctx, "run-tied")
+	if err != nil {
+		t.Fatalf("ListPairwisePreferences all tied returned error: %v", err)
+	}
+	if len(pairs) != 0 {
+		t.Fatalf("all-tied pairwise preferences = %+v, want none", pairs)
+	}
+
+	if err := store.UpsertRankedFeedbackEvent(ctx, RankedFeedbackEvent{
+		RunID:         "run-tied",
+		ItemID:        "item-001",
+		RankingJSON:   `["a","b","c","d"]`,
+		TieGroupsJSON: `[["a"],["b","c"],["d"]]`,
+		Winner:        "a",
+		Reviewer:      "jerry",
+		Source:        "github",
+		SourceURL:     "partial-tie",
+	}); err != nil {
+		t.Fatalf("UpsertRankedFeedbackEvent partial tie returned error: %v", err)
+	}
+	events, err := store.ListRankedFeedbackEvents(ctx, "run-tied")
+	if err != nil {
+		t.Fatalf("ListRankedFeedbackEvents returned error: %v", err)
+	}
+	var partial RankedFeedbackEvent
+	for _, event := range events {
+		if event.SourceURL == "partial-tie" {
+			partial = event
+			break
+		}
+	}
+	partialPairs, err := PairwisePreferencesForRankedFeedback(partial)
+	if err != nil {
+		t.Fatalf("PairwisePreferencesForRankedFeedback partial tie returned error: %v", err)
+	}
+	if len(partialPairs) != 5 {
+		t.Fatalf("partial tie pairwise preference len = %d, want 5: %+v", len(partialPairs), partialPairs)
+	}
+	for _, pair := range partialPairs {
+		if (pair.Preferred == "b" && pair.Rejected == "c") || (pair.Preferred == "c" && pair.Rejected == "b") {
+			t.Fatalf("partial tie emitted in-group preference: %+v", partialPairs)
+		}
+	}
+}
+
 func TestRankedReviewStorageRejectsInvalidReferences(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
@@ -585,6 +660,10 @@ func TestRankedReviewStorageRejectsInvalidReferences(t *testing.T) {
 		"invalid promote": {
 			RankingJSON: `["a","b","c"]`,
 			Promote:     "maybe",
+		},
+		"tie groups mismatch ranking": {
+			RankingJSON:   `["a","b","c"]`,
+			TieGroupsJSON: `[["a"],["c","b"]]`,
 		},
 	}
 	for name, event := range tests {

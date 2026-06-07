@@ -307,6 +307,7 @@ type RankedFeedbackEvent struct {
 	RunID                    string
 	ItemID                   string
 	RankingJSON              string
+	TieGroupsJSON            string
 	Winner                   string
 	UsefulTraitsJSON         string
 	RejectedTraitsJSON       string
@@ -2842,13 +2843,14 @@ func (s *Store) UpsertRankedFeedbackEvent(ctx context.Context, event RankedFeedb
 		return err
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO ranked_feedback_events(
-			id, run_id, item_id, ranking_json, winner, useful_traits_json, rejected_traits_json,
+			id, run_id, item_id, ranking_json, tie_groups_json, winner, useful_traits_json, rejected_traits_json,
 			required_improvements_json, quality, continue_mode, promote, reasoning, reviewer, source, source_url, created_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(run_id, item_id, reviewer, source, source_url) DO UPDATE SET
 			id = excluded.id,
 			ranking_json = excluded.ranking_json,
+			tie_groups_json = excluded.tie_groups_json,
 			winner = excluded.winner,
 			useful_traits_json = excluded.useful_traits_json,
 			rejected_traits_json = excluded.rejected_traits_json,
@@ -2861,7 +2863,7 @@ func (s *Store) UpsertRankedFeedbackEvent(ctx context.Context, event RankedFeedb
 			source = excluded.source,
 			source_url = excluded.source_url,
 			created_at = excluded.created_at`,
-		event.ID, event.RunID, event.ItemID, event.RankingJSON, event.Winner, event.UsefulTraitsJSON, event.RejectedTraitsJSON, event.RequiredImprovementsJSON,
+		event.ID, event.RunID, event.ItemID, event.RankingJSON, event.TieGroupsJSON, event.Winner, event.UsefulTraitsJSON, event.RejectedTraitsJSON, event.RequiredImprovementsJSON,
 		event.Quality, event.ContinueMode, event.Promote, event.Reasoning, event.Reviewer, event.Source, event.SourceURL, event.CreatedAt)
 	return err
 }
@@ -2879,6 +2881,10 @@ func (s *Store) validateRankedFeedbackEventOptions(ctx context.Context, event Ra
 		return fmt.Errorf("ranked feedback item %s has no registered review options", event.ItemID)
 	}
 	ranking, err := rankedFeedbackRanking(event)
+	if err != nil {
+		return err
+	}
+	tieGroups, err := rankedFeedbackTieGroups(event)
 	if err != nil {
 		return err
 	}
@@ -2912,8 +2918,8 @@ func (s *Store) validateRankedFeedbackEventOptions(ctx context.Context, event Ra
 		if _, ok := known[event.Winner]; !ok {
 			return fmt.Errorf("ranked feedback item %s winner references unknown option %q", event.ItemID, event.Winner)
 		}
-		if event.Winner != ranking[0] {
-			return fmt.Errorf("ranked feedback item %s winner %q does not match first ranked option %q", event.ItemID, event.Winner, ranking[0])
+		if len(tieGroups) == 0 || !stringSliceContains(tieGroups[0], event.Winner) {
+			return fmt.Errorf("ranked feedback item %s winner %q is not in first ranked group", event.ItemID, event.Winner)
 		}
 	}
 	for _, traits := range []struct {
@@ -2959,6 +2965,17 @@ func normalizeRankedFeedbackEvent(event RankedFeedbackEvent) (RankedFeedbackEven
 	}
 	if _, err := rankedFeedbackRanking(event); err != nil {
 		return RankedFeedbackEvent{}, err
+	}
+	tieGroups, err := rankedFeedbackTieGroups(event)
+	if err != nil {
+		return RankedFeedbackEvent{}, err
+	}
+	if strings.TrimSpace(event.TieGroupsJSON) != "" {
+		encoded, err := json.Marshal(tieGroups)
+		if err != nil {
+			return RankedFeedbackEvent{}, err
+		}
+		event.TieGroupsJSON = string(encoded)
 	}
 	event.UsefulTraitsJSON = strings.TrimSpace(event.UsefulTraitsJSON)
 	event.RejectedTraitsJSON = strings.TrimSpace(event.RejectedTraitsJSON)
@@ -3055,8 +3072,54 @@ func rankedFeedbackRanking(event RankedFeedbackEvent) ([]string, error) {
 	return ranking, nil
 }
 
+func rankedFeedbackTieGroups(event RankedFeedbackEvent) ([][]string, error) {
+	ranking, err := rankedFeedbackRanking(event)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(event.TieGroupsJSON) == "" {
+		groups := make([][]string, 0, len(ranking))
+		for _, label := range ranking {
+			groups = append(groups, []string{label})
+		}
+		return groups, nil
+	}
+	var groups [][]string
+	if err := json.Unmarshal([]byte(event.TieGroupsJSON), &groups); err != nil {
+		return nil, fmt.Errorf("ranked feedback tie_groups_json must be a JSON array of option label arrays: %w", err)
+	}
+	flattened := make([]string, 0, len(ranking))
+	seen := map[string]struct{}{}
+	for groupIndex, group := range groups {
+		if len(group) == 0 {
+			return nil, fmt.Errorf("ranked feedback tie group %d is empty", groupIndex+1)
+		}
+		for labelIndex, label := range group {
+			normalized := normalizeOptionLabel(label)
+			if normalized == "" {
+				return nil, fmt.Errorf("ranked feedback tie group %d contains empty option label at position %d", groupIndex+1, labelIndex+1)
+			}
+			if _, ok := seen[normalized]; ok {
+				return nil, fmt.Errorf("ranked feedback tie groups contain duplicate option label %q", normalized)
+			}
+			seen[normalized] = struct{}{}
+			groups[groupIndex][labelIndex] = normalized
+			flattened = append(flattened, normalized)
+		}
+	}
+	if len(flattened) != len(ranking) {
+		return nil, fmt.Errorf("ranked feedback tie groups include %d options, want %d ranking options", len(flattened), len(ranking))
+	}
+	for index, label := range ranking {
+		if flattened[index] != label {
+			return nil, fmt.Errorf("ranked feedback tie groups do not match ranking order at position %d", index+1)
+		}
+	}
+	return groups, nil
+}
+
 func (s *Store) ListRankedFeedbackEvents(ctx context.Context, runID string) ([]RankedFeedbackEvent, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, item_id, ranking_json, winner, useful_traits_json, rejected_traits_json,
+	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, item_id, ranking_json, tie_groups_json, winner, useful_traits_json, rejected_traits_json,
 			required_improvements_json, quality, continue_mode, promote, reasoning, reviewer, source, source_url, created_at
 		FROM ranked_feedback_events WHERE run_id = ? ORDER BY item_id, reviewer, source, source_url`, strings.TrimSpace(runID))
 	if err != nil {
@@ -3076,7 +3139,7 @@ func (s *Store) ListRankedFeedbackEvents(ctx context.Context, runID string) ([]R
 
 func scanRankedFeedbackEvent(row interface{ Scan(dest ...any) error }) (RankedFeedbackEvent, error) {
 	var event RankedFeedbackEvent
-	if err := row.Scan(&event.ID, &event.RunID, &event.ItemID, &event.RankingJSON, &event.Winner, &event.UsefulTraitsJSON, &event.RejectedTraitsJSON,
+	if err := row.Scan(&event.ID, &event.RunID, &event.ItemID, &event.RankingJSON, &event.TieGroupsJSON, &event.Winner, &event.UsefulTraitsJSON, &event.RejectedTraitsJSON,
 		&event.RequiredImprovementsJSON, &event.Quality, &event.ContinueMode, &event.Promote, &event.Reasoning, &event.Reviewer, &event.Source, &event.SourceURL, &event.CreatedAt); err != nil {
 		return RankedFeedbackEvent{}, err
 	}
@@ -3100,27 +3163,40 @@ func (s *Store) ListPairwisePreferences(ctx context.Context, runID string) ([]Pa
 }
 
 func PairwisePreferencesForRankedFeedback(event RankedFeedbackEvent) ([]PairwisePreference, error) {
-	ranking, err := rankedFeedbackRanking(event)
+	tieGroups, err := rankedFeedbackTieGroups(event)
 	if err != nil {
 		return nil, err
 	}
-	preferences := make([]PairwisePreference, 0, len(ranking)*(len(ranking)-1)/2)
-	for preferredIndex, preferred := range ranking {
-		for _, rejected := range ranking[preferredIndex+1:] {
-			preferences = append(preferences, PairwisePreference{
-				RunID:         event.RunID,
-				ItemID:        event.ItemID,
-				Preferred:     preferred,
-				Rejected:      rejected,
-				RankedEventID: event.ID,
-				Reviewer:      event.Reviewer,
-				Source:        event.Source,
-				SourceURL:     event.SourceURL,
-				CreatedAt:     event.CreatedAt,
-			})
+	preferences := []PairwisePreference{}
+	for preferredGroupIndex, preferredGroup := range tieGroups {
+		for _, rejectedGroup := range tieGroups[preferredGroupIndex+1:] {
+			for _, preferred := range preferredGroup {
+				for _, rejected := range rejectedGroup {
+					preferences = append(preferences, PairwisePreference{
+						RunID:         event.RunID,
+						ItemID:        event.ItemID,
+						Preferred:     preferred,
+						Rejected:      rejected,
+						RankedEventID: event.ID,
+						Reviewer:      event.Reviewer,
+						Source:        event.Source,
+						SourceURL:     event.SourceURL,
+						CreatedAt:     event.CreatedAt,
+					})
+				}
+			}
 		}
 	}
 	return preferences, nil
+}
+
+func stringSliceContains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func feedbackEventID(event FeedbackEvent) string {
@@ -4090,5 +4166,8 @@ CREATE TABLE skillopt_review_watches (
 
 CREATE INDEX idx_skillopt_review_watches_status ON skillopt_review_watches(status);
 CREATE INDEX idx_skillopt_review_watches_run_id ON skillopt_review_watches(run_id);
+	`,
+	`
+ALTER TABLE ranked_feedback_events ADD COLUMN tie_groups_json TEXT NOT NULL DEFAULT '';
 	`,
 }

@@ -84,6 +84,26 @@ func TestRecommendPhaseExploreTieStaysExplore(t *testing.T) {
 	}
 }
 
+func TestRecommendPhaseCountsTopTieAsFeedback(t *testing.T) {
+	tiedTop := rankedEvent(t, "", "a", "b", "c", "d")
+	tiedTop.TieGroupsJSON = `[["a","b","c","d"]]`
+	ranked := []db.RankedFeedbackEvent{
+		rankedEvent(t, "c", "c", "a", "d", "b"),
+		rankedEvent(t, "c", "c", "d", "a", "b"),
+		tiedTop,
+	}
+	recommendation := RecommendPhase(
+		db.EvalRun{ID: "run-1", Mode: db.EvalRunModeExplore, ExplorationLevel: db.ExplorationLevelHigh},
+		nil,
+		ranked,
+		pairwisePreferences(12),
+	)
+
+	if recommendation.RankingStability != "c 2/3" {
+		t.Fatalf("ranking stability = %q, want c 2/3", recommendation.RankingStability)
+	}
+}
+
 func TestRecommendPhaseForItemsMissingFeedbackStaysCurrent(t *testing.T) {
 	items := []db.EvalReviewItem{
 		{ItemID: "item-001"},

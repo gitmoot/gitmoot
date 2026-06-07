@@ -450,6 +450,43 @@ func TestGitHubCollectorSyncImportsRankedShortFormComment(t *testing.T) {
 	}
 }
 
+func TestGitHubCollectorSyncImportsTiedRankedShortFormComment(t *testing.T) {
+	ctx := context.Background()
+	store, blobs := setupGitHubRankedFeedbackRun(t, "ranked-1", "owner/repo")
+	fake := &fakeFeedbackGitHub{
+		comments: map[int64][]github.IssueComment{
+			42: {
+				{ID: 1, Body: "run_id: ranked-1\nitem-001 ranking: A > B = C > D\n", URL: "https://github.com/owner/repo/issues/42#issuecomment-1", Author: "alice", CreatedAt: "2026-06-02T10:00:00Z"},
+			},
+		},
+	}
+	collector := GitHubCollector{BlobStore: blobs, GitHub: fake}
+
+	result, err := collector.Sync(ctx, store, "ranked-1", github.Repository{Owner: "owner", Name: "repo"}, 42)
+	if err != nil {
+		t.Fatalf("Sync returned error: %v", err)
+	}
+	if result.Count() != 1 || len(result.RankedFeedbackEvents) != 1 {
+		t.Fatalf("result = %+v", result)
+	}
+	event := result.RankedFeedbackEvents[0]
+	if event.Winner != "a" || event.TieGroupsJSON != `[["a"],["b","c"],["d"]]` {
+		t.Fatalf("tied ranked event = %+v", event)
+	}
+	pairs, err := store.ListPairwisePreferences(ctx, "ranked-1")
+	if err != nil {
+		t.Fatalf("ListPairwisePreferences returned error: %v", err)
+	}
+	if len(pairs) != 5 {
+		t.Fatalf("partial tie pairwise preferences len = %d, want 5: %+v", len(pairs), pairs)
+	}
+	for _, pair := range pairs {
+		if (pair.Preferred == "b" && pair.Rejected == "c") || (pair.Preferred == "c" && pair.Rejected == "b") {
+			t.Fatalf("partial tie emitted in-group preference: %+v", pairs)
+		}
+	}
+}
+
 func TestGitHubCollectorSyncImportsRankedYAMLCommentWithColonItemID(t *testing.T) {
 	ctx := context.Background()
 	store, blobs := setupGitHubRankedFeedbackRunWithItem(t, "ranked-1", "scenario:landing", "owner/repo")

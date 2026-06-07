@@ -58,6 +58,7 @@ type feedbackFileEntry struct {
 	ItemID               string              `yaml:"item_id"`
 	Choice               string              `yaml:"choice"`
 	Ranking              []string            `yaml:"ranking,omitempty"`
+	TieGroups            [][]string          `yaml:"-"`
 	Winner               string              `yaml:"winner,omitempty"`
 	UsefulTraits         map[string][]string `yaml:"useful_traits,omitempty"`
 	RejectedTraits       map[string][]string `yaml:"rejected_traits,omitempty"`
@@ -443,7 +444,7 @@ func rankedAssignmentsMatch(left blindAssignment, right blindAssignment) bool {
 }
 
 func rankedFeedbackEventFromEntry(runID string, itemID string, entry feedbackFileEntry, assignment blindAssignment, reviewer string, source string, sourceURL string, createdAt string) (db.RankedFeedbackEvent, error) {
-	ranking, err := normalizedRanking(entry.Ranking)
+	ranking, tieGroups, err := normalizedRankingWithTieGroups(entry)
 	if err != nil {
 		return db.RankedFeedbackEvent{}, err
 	}
@@ -487,6 +488,14 @@ func rankedFeedbackEventFromEntry(runID string, itemID string, entry feedbackFil
 	if err != nil {
 		return db.RankedFeedbackEvent{}, err
 	}
+	tieGroupsJSON := ""
+	if rankingHasTies(tieGroups) {
+		encoded, err := json.Marshal(tieGroups)
+		if err != nil {
+			return db.RankedFeedbackEvent{}, err
+		}
+		tieGroupsJSON = string(encoded)
+	}
 	usefulTraitsJSON, err := rankedTraitJSON(entry.UsefulTraits)
 	if err != nil {
 		return db.RankedFeedbackEvent{}, fmt.Errorf("useful_traits: %w", err)
@@ -501,13 +510,15 @@ func rankedFeedbackEventFromEntry(runID string, itemID string, entry feedbackFil
 	}
 	winner := normalizeReviewOptionLabel(entry.Winner)
 	if winner == "" {
-		winner = ranking[0]
+		if len(tieGroups) > 0 && len(tieGroups[0]) == 1 {
+			winner = ranking[0]
+		}
 	} else {
 		if _, ok := known[winner]; !ok {
 			return db.RankedFeedbackEvent{}, fmt.Errorf("winner references unknown option %q", winner)
 		}
-		if winner != ranking[0] {
-			return db.RankedFeedbackEvent{}, fmt.Errorf("winner %q does not match first ranked option %q", winner, ranking[0])
+		if len(tieGroups) == 0 || !rankingGroupContains(tieGroups[0], winner) {
+			return db.RankedFeedbackEvent{}, fmt.Errorf("winner %q is not in first ranked group", winner)
 		}
 	}
 	quality, continueMode, promote, err := normalizeRankedFeedbackSignals(entry)
@@ -518,6 +529,7 @@ func rankedFeedbackEventFromEntry(runID string, itemID string, entry feedbackFil
 		RunID:                    strings.TrimSpace(runID),
 		ItemID:                   strings.TrimSpace(itemID),
 		RankingJSON:              string(rankingJSON),
+		TieGroupsJSON:            tieGroupsJSON,
 		Winner:                   winner,
 		UsefulTraitsJSON:         usefulTraitsJSON,
 		RejectedTraitsJSON:       rejectedTraitsJSON,
@@ -573,24 +585,55 @@ func validateRankedTraitLabels(traits map[string][]string, known map[string]stru
 	return nil
 }
 
-func normalizedRanking(values []string) ([]string, error) {
-	ranking := make([]string, 0, len(values))
+func normalizedRankingWithTieGroups(entry feedbackFileEntry) ([]string, [][]string, error) {
+	groups := entry.TieGroups
+	if len(groups) == 0 {
+		_, groups = splitRankingLabelsAndTieGroups(entry.Ranking)
+	}
+	ranking := make([]string, 0, len(entry.Ranking))
+	tieGroups := make([][]string, 0, len(groups))
 	seen := map[string]struct{}{}
-	for _, value := range values {
-		label := normalizeReviewOptionLabel(value)
-		if label == "" {
-			return nil, errors.New("ranking contains an empty option label")
+	for groupIndex, group := range groups {
+		if len(group) == 0 {
+			return nil, nil, fmt.Errorf("ranking contains an empty tie group at position %d", groupIndex+1)
 		}
-		if _, ok := seen[label]; ok {
-			return nil, fmt.Errorf("ranking contains duplicate option label %q", label)
+		normalizedGroup := make([]string, 0, len(group))
+		for _, value := range group {
+			label := normalizeReviewOptionLabel(value)
+			if label == "" {
+				return nil, nil, errors.New("ranking contains an empty option label")
+			}
+			if _, ok := seen[label]; ok {
+				return nil, nil, fmt.Errorf("ranking contains duplicate option label %q", label)
+			}
+			seen[label] = struct{}{}
+			normalizedGroup = append(normalizedGroup, label)
+			ranking = append(ranking, label)
 		}
-		seen[label] = struct{}{}
-		ranking = append(ranking, label)
+		tieGroups = append(tieGroups, normalizedGroup)
 	}
 	if len(ranking) < 2 {
-		return nil, errors.New("ranking must include at least two options")
+		return nil, nil, errors.New("ranking must include at least two options")
 	}
-	return ranking, nil
+	return ranking, tieGroups, nil
+}
+
+func rankingHasTies(groups [][]string) bool {
+	for _, group := range groups {
+		if len(group) > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func rankingGroupContains(group []string, label string) bool {
+	for _, value := range group {
+		if value == label {
+			return true
+		}
+	}
+	return false
 }
 
 func rankedTraitJSON(traits map[string][]string) (string, error) {
@@ -906,7 +949,7 @@ func normalizeFeedbackFileEntries(feedback *feedbackFile) {
 	for index := range feedback.Items {
 		feedback.Items[index].ItemID = strings.TrimSpace(feedback.Items[index].ItemID)
 		feedback.Items[index].Choice = strings.TrimSpace(feedback.Items[index].Choice)
-		feedback.Items[index].Ranking = splitRankingLabels(feedback.Items[index].Ranking)
+		feedback.Items[index].Ranking, feedback.Items[index].TieGroups = splitRankingLabelsAndTieGroups(feedback.Items[index].Ranking)
 		feedback.Items[index].Winner = strings.TrimSpace(feedback.Items[index].Winner)
 		feedback.Items[index].UsefulTraits = trimTraitMap(feedback.Items[index].UsefulTraits)
 		feedback.Items[index].RejectedTraits = trimTraitMap(feedback.Items[index].RejectedTraits)

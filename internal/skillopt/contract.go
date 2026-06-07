@@ -188,6 +188,7 @@ type RankedFeedbackEvent struct {
 	RunID                string          `json:"run_id"`
 	ItemID               string          `json:"item_id"`
 	Ranking              []string        `json:"ranking"`
+	TieGroups            [][]string      `json:"tie_groups,omitempty"`
 	Winner               string          `json:"winner,omitempty"`
 	UsefulTraits         json.RawMessage `json:"useful_traits,omitempty"`
 	RejectedTraits       json.RawMessage `json:"rejected_traits,omitempty"`
@@ -977,6 +978,10 @@ func loadRankedFeedbackEvents(ctx context.Context, store *db.Store, runID string
 		if err != nil {
 			return nil, err
 		}
+		tieGroups, err := rankedFeedbackTieGroups(event, ranking)
+		if err != nil {
+			return nil, err
+		}
 		usefulTraits, err := rawJSON(event.UsefulTraitsJSON)
 		if err != nil {
 			return nil, fmt.Errorf("ranked feedback %s useful_traits_json: %w", event.ID, err)
@@ -994,6 +999,7 @@ func loadRankedFeedbackEvents(ctx context.Context, store *db.Store, runID string
 			RunID:                event.RunID,
 			ItemID:               event.ItemID,
 			Ranking:              ranking,
+			TieGroups:            tieGroups,
 			Winner:               event.Winner,
 			UsefulTraits:         usefulTraits,
 			RejectedTraits:       rejectedTraits,
@@ -1017,6 +1023,31 @@ func rankedFeedbackRanking(event db.RankedFeedbackEvent) ([]string, error) {
 		return nil, fmt.Errorf("ranked feedback %s ranking_json: %w", event.ID, err)
 	}
 	return ranking, nil
+}
+
+func rankedFeedbackTieGroups(event db.RankedFeedbackEvent, ranking []string) ([][]string, error) {
+	if strings.TrimSpace(event.TieGroupsJSON) == "" {
+		return nil, nil
+	}
+	var groups [][]string
+	if err := json.Unmarshal([]byte(event.TieGroupsJSON), &groups); err != nil {
+		return nil, fmt.Errorf("ranked feedback %s tie_groups_json: %w", event.ID, err)
+	}
+	flattened := make([]string, 0, len(ranking))
+	for _, group := range groups {
+		for _, label := range group {
+			flattened = append(flattened, strings.TrimSpace(strings.ToLower(label)))
+		}
+	}
+	if len(flattened) != len(ranking) {
+		return nil, fmt.Errorf("ranked feedback %s tie_groups_json does not match ranking length", event.ID)
+	}
+	for index, label := range ranking {
+		if flattened[index] != strings.TrimSpace(strings.ToLower(label)) {
+			return nil, fmt.Errorf("ranked feedback %s tie_groups_json does not match ranking order", event.ID)
+		}
+	}
+	return groups, nil
 }
 
 func loadPairwisePreferences(ctx context.Context, store *db.Store, runID string) ([]PairwisePreference, error) {
