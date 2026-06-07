@@ -84,7 +84,7 @@ func printSkillOptUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)")
 	fmt.Fprintln(w, "  gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file path [--yes]")
 	fmt.Fprintln(w, "  gitmoot skillopt train status --session <id>")
-	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--backend codex] [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--model name] [--optimizer-model name] [--target-model name] [--optimizer-backend name] [--target-backend name] [--evaluator-id id] [--evaluator-model name] [--evaluator-backend name] [--skill-update-mode mode] [--num-epochs N] [--batch-size N] [--optimizer-views N] [--gate hard|soft|mixed] [--out-root path] [--timeout duration] [--dry-run] [--rerun-optimizer] [--promote version|--reject version --reason text] [--start-next]")
+	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--backend codex] [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--model name] [--optimizer-model name] [--target-model name] [--optimizer-backend name] [--target-backend name] [--evaluator-id id] [--evaluator-model name] [--evaluator-backend name] [--skill-update-mode mode] [--num-epochs N] [--batch-size N] [--optimizer-views N] [--retry-optimizer-views auto|inherit|N] [--gate hard|soft|mixed] [--out-root path] [--timeout duration] [--dry-run] [--rerun-optimizer] [--promote version|--reject version --reason text] [--start-next]")
 	fmt.Fprintln(w, "  gitmoot skillopt train recover --session <id> [--out-root path]")
 	fmt.Fprintln(w, "  gitmoot skillopt train stop --session <id> --reason <text>")
 }
@@ -116,7 +116,7 @@ func printSkillOptTrainUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file path [--session <id>] [--workspace-repo owner/repo] [--preview-repo owner/repo] [--preview-mode none|optional|required] [--preview-renderer none|vue-vite] [--preview-publisher none|github-pages] [--preview-route-template template] [--request-file path] [--task-kind kind] [--mode explore|refine|distill|validate] [--exploration-level high|medium|low] [--options N] [--min-items N] [--preferred-gate hard|soft|hard_then_soft] [--dry-run] [--yes]")
 	fmt.Fprintln(w, "  gitmoot skillopt train status --session <id>")
-	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--backend codex] [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--model name] [--optimizer-model name] [--target-model name] [--optimizer-backend name] [--target-backend name] [--evaluator-id id] [--evaluator-model name] [--evaluator-backend name] [--skill-update-mode mode] [--num-epochs N] [--batch-size N] [--optimizer-views N] [--gate hard|soft|mixed] [--out-root path] [--timeout duration] [--dry-run] [--rerun-optimizer] [--promote version|--reject version --reason text] [--start-next]")
+	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--backend codex] [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--model name] [--optimizer-model name] [--target-model name] [--optimizer-backend name] [--target-backend name] [--evaluator-id id] [--evaluator-model name] [--evaluator-backend name] [--skill-update-mode mode] [--num-epochs N] [--batch-size N] [--optimizer-views N] [--retry-optimizer-views auto|inherit|N] [--gate hard|soft|mixed] [--out-root path] [--timeout duration] [--dry-run] [--rerun-optimizer] [--promote version|--reject version --reason text] [--start-next]")
 	fmt.Fprintln(w, "  gitmoot skillopt train recover --session <id> [--out-root path]")
 	fmt.Fprintln(w, "  gitmoot skillopt train stop --session <id> --reason <text>")
 }
@@ -641,6 +641,7 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 	numEpochs := fs.Int("num-epochs", 0, "optimizer epoch count")
 	batchSize := fs.Int("batch-size", 0, "optimizer batch size")
 	optimizerViews := fs.Int("optimizer-views", 0, "independent optimizer perspectives over imported human review feedback; omit to use gitmoot-skillopt default")
+	retryOptimizerViews := fs.String("retry-optimizer-views", "", "optimizer perspectives for gate-reject retries: auto, inherit, or a positive integer; omit to use gitmoot-skillopt default")
 	noopRetryBudget := fs.Int("noop-retry-budget", -1, "noop optimizer retry budget; omit to use gitmoot-skillopt default")
 	gateRejectRetryBudget := fs.Int("gate-reject-retry-budget", -1, "gate-rejection optimizer retry budget; omit to use gitmoot-skillopt default")
 	wrongArtifactRetryBudget := fs.Int("wrong-artifact-retry-budget", -1, "wrong-artifact optimizer retry budget; omit to use gitmoot-skillopt default")
@@ -686,6 +687,21 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 	if setFlags["optimizer-views"] && *optimizerViews <= 0 {
 		fmt.Fprintln(stderr, "skillopt train continue: --optimizer-views must be greater than zero")
 		return 2
+	}
+	normalizedRetryOptimizerViews := ""
+	if setFlags["retry-optimizer-views"] {
+		var err error
+		normalizedRetryOptimizerViews, err = normalizeSkillOptRetryOptimizerViews(*retryOptimizerViews)
+		if err != nil {
+			fmt.Fprintf(stderr, "skillopt train continue: %v\n", err)
+			return 2
+		}
+		if setFlags["optimizer-views"] {
+			if retryViews, ok := parseSkillOptRetryOptimizerViewsNumber(normalizedRetryOptimizerViews); ok && retryViews > *optimizerViews {
+				fmt.Fprintln(stderr, "skillopt train continue: --retry-optimizer-views cannot exceed --optimizer-views")
+				return 2
+			}
+		}
 	}
 	if setFlags["noop-retry-budget"] && *noopRetryBudget < 0 {
 		fmt.Fprintln(stderr, "skillopt train continue: --noop-retry-budget must be zero or greater")
@@ -735,6 +751,8 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 				BatchSize:                    *batchSize,
 				OptimizerViews:               *optimizerViews,
 				OptimizerViewsSet:            setFlags["optimizer-views"],
+				RetryOptimizerViews:          normalizedRetryOptimizerViews,
+				RetryOptimizerViewsSet:       setFlags["retry-optimizer-views"],
 				NoopRetryBudget:              *noopRetryBudget,
 				NoopRetryBudgetSet:           setFlags["noop-retry-budget"],
 				GateRejectRetryBudget:        *gateRejectRetryBudget,
@@ -772,6 +790,25 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func normalizeSkillOptRetryOptimizerViews(value string) (string, error) {
+	trimmed := strings.TrimSpace(strings.ToLower(value))
+	if trimmed == "auto" || trimmed == "inherit" {
+		return trimmed, nil
+	}
+	if parsed, err := strconv.Atoi(trimmed); err == nil && parsed > 0 {
+		return strconv.Itoa(parsed), nil
+	}
+	return "", fmt.Errorf("--retry-optimizer-views must be auto, inherit, or a positive integer")
+}
+
+func parseSkillOptRetryOptimizerViewsNumber(value string) (int, bool) {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || parsed <= 0 {
+		return 0, false
+	}
+	return parsed, true
 }
 
 func printSkillOptTrainContinueOutput(stdout io.Writer, output skillOptTrainContinueOutput) {
@@ -813,6 +850,8 @@ type skillOptTrainOptimizerRequest struct {
 	BatchSize                    int
 	OptimizerViews               int
 	OptimizerViewsSet            bool
+	RetryOptimizerViews          string
+	RetryOptimizerViewsSet       bool
 	NoopRetryBudget              int
 	NoopRetryBudgetSet           bool
 	GateRejectRetryBudget        int
@@ -3503,6 +3542,10 @@ func skillOptTrainOptimizerRequestHash(request skillOptTrainOptimizerRequest) st
 			"set":   request.OptimizerViewsSet,
 			"value": request.OptimizerViews,
 		},
+		"retry_optimizer_views": map[string]any{
+			"set":   request.RetryOptimizerViewsSet,
+			"value": strings.TrimSpace(request.RetryOptimizerViews),
+		},
 		"noop_retry_budget": map[string]any{
 			"set":   request.NoopRetryBudgetSet,
 			"value": request.NoopRetryBudget,
@@ -5585,6 +5628,7 @@ func printSkillOptTrainStatusSnapshot(stdout io.Writer, snapshot skillOptTrainSt
 		}
 		for _, key := range []string{
 			"optimizer_views",
+			"retry_optimizer_views",
 			"target_artifact_retry_budget",
 			"hard_failure_retry_budget",
 			"noop_retry_budget",
@@ -6862,6 +6906,9 @@ func buildSkillOptTrainOptimizerCommand(iteration db.SkillOptTrainIteration, req
 	if request.OptimizerViewsSet {
 		args = append(args, "--optimizer-views", strconv.Itoa(request.OptimizerViews))
 	}
+	if request.RetryOptimizerViewsSet {
+		args = append(args, "--retry-optimizer-views", strings.TrimSpace(request.RetryOptimizerViews))
+	}
 	if request.NoopRetryBudgetSet {
 		args = append(args, "--noop-retry-budget", strconv.Itoa(request.NoopRetryBudget))
 	}
@@ -6985,6 +7032,9 @@ func addSkillOptTrainOptimizerConfigMetadata(metadata map[string]any, request sk
 	}
 	if request.OptimizerViewsSet {
 		metadata["optimizer_views"] = request.OptimizerViews
+	}
+	if request.RetryOptimizerViewsSet {
+		metadata["retry_optimizer_views"] = strings.TrimSpace(request.RetryOptimizerViews)
 	}
 	if request.TargetArtifactRetryBudgetSet {
 		metadata["target_artifact_retry_budget"] = request.TargetArtifactRetryBudget
@@ -7396,6 +7446,9 @@ func skillOptTrainOptimizerReportLines(result skillOptTrainOptimizerResult) []st
 	}
 	if result.Request.OptimizerViewsSet {
 		lines = append(lines, fmt.Sprintf("optimizer_views: %d", result.Request.OptimizerViews))
+	}
+	if result.Request.RetryOptimizerViewsSet {
+		lines = append(lines, fmt.Sprintf("retry_optimizer_views: %s", strings.TrimSpace(result.Request.RetryOptimizerViews)))
 	}
 	if result.Request.FinalEval {
 		lines = append(lines, "final_eval: true")

@@ -75,7 +75,7 @@ gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--p
 gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)
 gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file items.yml [--workspace-repo owner/workspace] [--preview-repo owner/previews] [--preview-mode none|optional|required] [--preview-renderer none|vue-vite] [--preview-publisher none|github-pages] [--preview-route-template template] [--yes]
 gitmoot skillopt train status --session <id>
-gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--skill-update-mode mode] [--num-epochs N] [--batch-size N] [--optimizer-views N] [--dry-run] [--promote version|--reject version --reason text] [--start-next]
+gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--skill-update-mode mode] [--num-epochs N] [--batch-size N] [--optimizer-views N] [--retry-optimizer-views auto|inherit|N] [--dry-run] [--promote version|--reject version --reason text] [--start-next]
 gitmoot skillopt train stop --session <id> --reason <text>
 ```
 

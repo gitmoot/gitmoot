@@ -2815,6 +2815,7 @@ func TestSkillOptTrainContinueRunsOptimizerAndImportsCandidate(t *testing.T) {
 		"--num-epochs", "2",
 		"--batch-size", "3",
 		"--optimizer-views", "4",
+		"--retry-optimizer-views", "inherit",
 		"--gate", "mixed",
 		"--out-root", outRoot,
 		"--timeout", "5m",
@@ -2835,6 +2836,7 @@ func TestSkillOptTrainContinueRunsOptimizerAndImportsCandidate(t *testing.T) {
 		"optimizer_attempt_path: " + attemptRoot,
 		"candidate_package: " + filepath.Join(attemptRoot, "candidate.json"),
 		"optimizer_views: 4",
+		"retry_optimizer_views: inherit",
 		"optimizer_dry_run: true",
 		"final_eval: true",
 		"imported_candidate: planner@v2",
@@ -2867,6 +2869,7 @@ func TestSkillOptTrainContinueRunsOptimizerAndImportsCandidate(t *testing.T) {
 		"--num-epochs", "2",
 		"--batch-size", "3",
 		"--optimizer-views", "4",
+		"--retry-optimizer-views", "inherit",
 		"--eval-test",
 		"--dry-run",
 	} {
@@ -3182,6 +3185,21 @@ func TestSkillOptTrainContinueRejectsInvalidOptimizerControls(t *testing.T) {
 			want: "--optimizer-views must be greater than zero",
 		},
 		{
+			name: "invalid retry optimizer views",
+			args: []string{"--retry-optimizer-views", "bogus"},
+			want: "--retry-optimizer-views must be auto, inherit, or a positive integer",
+		},
+		{
+			name: "zero retry optimizer views",
+			args: []string{"--retry-optimizer-views", "0"},
+			want: "--retry-optimizer-views must be auto, inherit, or a positive integer",
+		},
+		{
+			name: "retry optimizer views exceeds optimizer views",
+			args: []string{"--optimizer-views", "2", "--retry-optimizer-views", "3"},
+			want: "--retry-optimizer-views cannot exceed --optimizer-views",
+		},
+		{
 			name: "negative noop retry budget",
 			args: []string{"--noop-retry-budget", "-1"},
 			want: "--noop-retry-budget must be zero or greater",
@@ -3337,6 +3355,8 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 		"--home", home,
 		"--session", "optimizer-train",
 		"--out-root", outRoot,
+		"--optimizer-views", "4",
+		"--retry-optimizer-views", "inherit",
 		"--dry-run",
 	}, &stdout, &stderr)
 	if code != 0 {
@@ -3349,6 +3369,8 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 		"optimizer_attempt: attempt-001",
 		"optimizer_attempt_path: " + filepath.Join(outRoot, "attempts", "attempt-001"),
 		"candidate_package: " + filepath.Join(outRoot, "attempts", "attempt-001", "candidate.json"),
+		"optimizer_views: 4",
+		"retry_optimizer_views: inherit",
 		"optimizer_dry_run: true",
 		"no_candidate_reason: gate_rejected_best_origin_initial_skill",
 		"next: Do not import or publish a candidate review; collect more feedback",
@@ -3412,7 +3434,8 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 		statusJSON.NoCandidateDetails["human_feedback_context"] == nil ||
 		statusJSON.Verbose == nil ||
 		statusJSON.Verbose.Optimizer["optimizer_attempt"] != "attempt-001" ||
-		statusJSON.Verbose.Optimizer["optimizer_attempt_state"] != "completed_no_candidate" {
+		statusJSON.Verbose.Optimizer["optimizer_attempt_state"] != "completed_no_candidate" ||
+		statusJSON.Verbose.Optimizer["retry_optimizer_views"] != "inherit" {
 		t.Fatalf("train status no-candidate json = %+v", statusJSON)
 	}
 
@@ -3427,6 +3450,8 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 		"optimizer_attempt: attempt-001",
 		"optimizer_attempt_state: completed_no_candidate",
 		"optimizer_attempt_path: " + filepath.Join(outRoot, "attempts", "attempt-001"),
+		"optimizer_views: 4",
+		"retry_optimizer_views: inherit",
 		"feedback_source: imported_human_review",
 		"feedback_target: baseline_review_outputs",
 		"review_issue: jerryfane/gitmoot-previews#21",

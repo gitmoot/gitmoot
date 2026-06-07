@@ -156,12 +156,16 @@ For exploratory human-feedback optimization, prefer:
 gitmoot skillopt train continue \
   --session planner-train \
   --skill-update-mode full_rewrite_minibatch \
-  --optimizer-views 4
+  --optimizer-views 4 \
+  --retry-optimizer-views auto
 ```
 
 `--optimizer-views` runs independent optimizer perspectives over the same full
 review feedback set before merge, while the compact update mode rewrites the
-skill instead of only appending more prompt rules.
+skill instead of only appending more prompt rules. `--retry-optimizer-views`
+controls whether gate-reject retries also use multiple optimizer perspectives;
+use `auto` to inherit the initial view count for full-rewrite minibatch retries
+while keeping cheaper patch-mode retries at one view.
 
 After feedback sync, train mode exports the training package, invokes
 `gitmoot-skillopt optimize`, imports the returned candidate through the shared

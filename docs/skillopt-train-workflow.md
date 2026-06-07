@@ -334,6 +334,7 @@ gitmoot skillopt train continue \
   --num-epochs 1 \
   --batch-size 2 \
   --optimizer-views 4 \
+  --retry-optimizer-views auto \
   --gate mixed
 ```
 
@@ -378,6 +379,7 @@ The retry budgets can be changed when continuing training:
 gitmoot skillopt train continue \
   --session planner-train \
   --gate-reject-retry-budget 3 \
+  --retry-optimizer-views auto \
   --noop-retry-budget 1 \
   --wrong-artifact-retry-budget 1
 ```
@@ -391,9 +393,13 @@ when the same small feedback set should be analyzed by multiple independent
 optimizer perspectives before merge. Each view receives the full feedback set,
 but Gitmoot forces the view reflection minibatch size to one so views do not
 collapse into one analyst prompt. For exploratory human-feedback iterations,
-`--skill-update-mode full_rewrite_minibatch --optimizer-views 4` is the
-recommended compact-skill path; patch mode still prefers `replace`/`delete`
-edits over append-only prompt growth.
+combine `--skill-update-mode full_rewrite_minibatch`, `--optimizer-views 4`,
+and `--retry-optimizer-views auto` as the recommended compact-skill path; patch
+mode still prefers `replace`/`delete` edits over append-only prompt growth.
+Retry optimizer views accept `auto`, `inherit`, or a positive integer. `auto`
+inherits the initial view count for full-rewrite minibatch retries and keeps
+patch-mode retries cheap; `inherit` always reuses the initial view count.
+Explicit retry view counts cannot exceed the initial optimizer view count.
 
 The retry prompt includes the previous patch summary, baseline-vs-candidate
 score deltas, failed dimensions, why the candidate lost, all reviewed feedback
