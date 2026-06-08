@@ -382,6 +382,7 @@ func TestRunTaskRunRejectsRepoMismatch(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("goal import exit code = %d, stderr=%s", code, stderr.String())
 	}
+	subscribeShellImplementAgent(t, home, "lead", "jerryfane/gitmoot")
 
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -409,6 +410,7 @@ func TestRunTaskRunRejectsWrongCheckout(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("goal import exit code = %d, stderr=%s", code, stderr.String())
 	}
+	subscribeShellImplementAgent(t, home, "lead", "jerryfane/gitmoot")
 
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -436,6 +438,7 @@ func TestRunTaskRunRegistersCurrentRepo(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("goal import exit code = %d, stderr=%s", code, stderr.String())
 	}
+	subscribeShellImplementAgent(t, home, "lead", "jerryfane/gitmoot")
 
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -455,12 +458,14 @@ func TestRunTaskRunRegistersCurrentRepo(t *testing.T) {
 	if !strings.Contains(stdout.String(), "worktree: ") {
 		t.Fatalf("stdout missing worktree path: %q", stdout.String())
 	}
+	if !strings.Contains(stdout.String(), "job: task-task-001-implement-lead") {
+		t.Fatalf("stdout missing task job id: %q", stdout.String())
+	}
 
 	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer store.Close()
 	repo, err := store.GetRepo(context.Background(), "jerryfane/gitmoot")
 	if err != nil {
 		t.Fatalf("GetRepo returned error: %v", err)
@@ -492,6 +497,116 @@ func TestRunTaskRunRegistersCurrentRepo(t *testing.T) {
 	if worktreeBranch := strings.TrimSpace(runGitOutput(t, wantWorktree, "branch", "--show-current")); worktreeBranch != "task-001-bootstrap" {
 		t.Fatalf("task worktree branch = %q, want task-001-bootstrap", worktreeBranch)
 	}
+	job, err := store.GetJob(context.Background(), "task-task-001-implement-lead")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.Agent != "lead" || job.Type != "implement" || job.State != "queued" {
+		t.Fatalf("job = %+v", job)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatalf("daemonJobPayload returned error: %v", err)
+	}
+	if payload.TaskID != "task-001" || payload.Branch != "task-001-bootstrap" || payload.PullRequest != 0 || payload.LeadAgent != "lead" {
+		t.Fatalf("payload = %+v", payload)
+	}
+	if payload.HeadSHA == "" {
+		t.Fatalf("payload missing head SHA: %+v", payload)
+	}
+	task.Title = "Bootstrap Updated"
+	if err := store.UpsertTask(context.Background(), task); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store before stale rerun: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"task", "run", "task-001", "--home", home, "--repo", "jerryfane/gitmoot", "--owner", "lead"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("stale rerun task run exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "job: task-task-001-implement-lead-") {
+		t.Fatalf("stale rerun stdout missing fresh task job id: %q", stdout.String())
+	}
+	store, err = db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("reopen store after stale rerun: %v", err)
+	}
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatalf("ListJobs after stale rerun returned error: %v", err)
+	}
+	updatedQueuedJobID := ""
+	for _, job := range jobs {
+		if !strings.HasPrefix(job.ID, "task-task-001-implement-lead-") || job.State != "queued" {
+			continue
+		}
+		payload, err := daemonJobPayload(job)
+		if err != nil {
+			t.Fatalf("daemonJobPayload(%s) returned error: %v", job.ID, err)
+		}
+		if payload.TaskTitle == "Bootstrap Updated" && strings.Contains(payload.Instructions, "Bootstrap Updated") {
+			updatedQueuedJobID = job.ID
+		}
+	}
+	if updatedQueuedJobID == "" {
+		t.Fatalf("jobs = %+v, want fresh queued rerun job with updated task metadata", jobs)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store before duplicate rerun: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"task", "run", "task-001", "--home", home, "--repo", "jerryfane/gitmoot", "--owner", "lead"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("duplicate rerun task run exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "job: "+updatedQueuedJobID) {
+		t.Fatalf("duplicate rerun stdout = %q, want existing job %s", stdout.String(), updatedQueuedJobID)
+	}
+	store, err = db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("reopen store after duplicate rerun: %v", err)
+	}
+	if err := store.UpdateJobState(context.Background(), "task-task-001-implement-lead", "succeeded"); err != nil {
+		t.Fatalf("UpdateJobState returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	store = nil
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"task", "run", "task-001", "--home", home, "--repo", "jerryfane/gitmoot", "--owner", "lead"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("rerun task run exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "job: task-task-001-implement-lead-") {
+		t.Fatalf("rerun stdout missing fresh task job id: %q", stdout.String())
+	}
+	store, err = db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer store.Close()
+	jobs, err = store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	foundFreshQueued := false
+	for _, job := range jobs {
+		if strings.HasPrefix(job.ID, "task-task-001-implement-lead-") && job.State == "queued" {
+			foundFreshQueued = true
+		}
+	}
+	if !foundFreshQueued {
+		t.Fatalf("jobs = %+v, want fresh queued rerun job", jobs)
+	}
 }
 
 func TestRunTaskRunBlocksWhenCheckoutMutationLocked(t *testing.T) {
@@ -504,6 +619,7 @@ func TestRunTaskRunBlocksWhenCheckoutMutationLocked(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("goal import exit code = %d, stderr=%s", code, stderr.String())
 	}
+	subscribeShellImplementAgent(t, home, "lead", "jerryfane/gitmoot")
 
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -557,6 +673,24 @@ func TestRunTaskRunBlocksWhenCheckoutMutationLocked(t *testing.T) {
 func TestTaskBranchNameFallsBackToTaskID(t *testing.T) {
 	if got := taskBranchName("task-001", "!!!"); got != "task-001" {
 		t.Fatalf("taskBranchName returned %q, want task-001", got)
+	}
+}
+
+func subscribeShellImplementAgent(t *testing.T, home string, name string, repo string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "subscribe", name,
+		"--home", home,
+		"--runtime", "shell",
+		"--session", `printf '%s\n' '{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}'`,
+		"--role", "lead",
+		"--repo", repo,
+		"--capability", "implement",
+		"--policy", "workspace-write",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent subscribe exit code = %d, stderr=%s", code, stderr.String())
 	}
 }
 

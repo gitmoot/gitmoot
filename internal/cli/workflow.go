@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/jerryfane/gitmoot/internal/config"
@@ -369,6 +370,7 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 	}
 
 	var started db.Task
+	var startedJob db.Job
 	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
 		task, err := store.GetTask(context.Background(), taskID)
 		if err != nil {
@@ -395,6 +397,13 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 		if err := store.UpsertRepo(context.Background(), repoRecord); err != nil {
 			return err
 		}
+		agent, err := store.GetAgent(context.Background(), strings.TrimSpace(*owner))
+		if err != nil {
+			return fmt.Errorf("load task owner agent %q: %w", strings.TrimSpace(*owner), err)
+		}
+		if err := ensureLocalAgentAccess(context.Background(), store, agent, requestRepo, "implement"); err != nil {
+			return err
+		}
 		checkout := repoRecord.CheckoutPath
 		requestBranch := firstNonEmpty(*branch, task.Branch, task.ID)
 		engine := workflow.Engine{Store: store}
@@ -409,6 +418,14 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 			Owner:      *owner,
 			Checkout:   checkout,
 		}, gitutil.Client{Dir: checkout})
+		if err != nil {
+			return err
+		}
+		headSHA, err := (gitutil.Client{Dir: started.WorktreePath}).HeadSHA(context.Background())
+		if err != nil {
+			return fmt.Errorf("resolve task worktree head: %w", err)
+		}
+		startedJob, err = enqueueTaskRunImplementJob(context.Background(), store, started, strings.TrimSpace(*owner), headSHA)
 		return err
 	}); err != nil {
 		fmt.Fprintf(stderr, "run task: %v\n", err)
@@ -418,7 +435,102 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 	if strings.TrimSpace(started.WorktreePath) != "" {
 		fmt.Fprintf(stdout, "worktree: %s\n", started.WorktreePath)
 	}
+	if strings.TrimSpace(startedJob.ID) != "" {
+		fmt.Fprintf(stdout, "job: %s\n", startedJob.ID)
+		if startedJob.State == string(workflow.JobQueued) {
+			fmt.Fprintf(stdout, "next: %s\n", jobRunCommand(startedJob.ID, *home))
+		} else {
+			fmt.Fprintf(stdout, "next: %s\n", jobWatchCommand(startedJob.ID, *home))
+		}
+	}
 	return 0
+}
+
+func enqueueTaskRunImplementJob(ctx context.Context, store *db.Store, task db.Task, owner string, headSHA string) (db.Job, error) {
+	baseJobID := taskRunImplementJobID(task.ID, owner)
+	jobID := baseJobID
+	request := taskRunImplementJobRequest(jobID, task, owner, headSHA)
+	if existing, err := store.GetJob(ctx, jobID); err == nil {
+		if (existing.State == string(workflow.JobQueued) || existing.State == string(workflow.JobRunning)) && taskRunJobMatchesRequest(existing, request) {
+			return existing, nil
+		}
+		if active, ok, err := findActiveTaskRunJob(ctx, store, request); err != nil {
+			return db.Job{}, err
+		} else if ok {
+			return active, nil
+		}
+		jobID = baseJobID + "-" + shortHash(existing.State+"\x00"+headSHA+"\x00"+time.Now().UTC().Format(time.RFC3339Nano))
+		request = taskRunImplementJobRequest(jobID, task, owner, headSHA)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return db.Job{}, err
+	}
+	return (workflow.Mailbox{Store: store}).Enqueue(ctx, request)
+}
+
+func findActiveTaskRunJob(ctx context.Context, store *db.Store, request workflow.JobRequest) (db.Job, bool, error) {
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		return db.Job{}, false, err
+	}
+	for _, job := range jobs {
+		if job.State != string(workflow.JobQueued) && job.State != string(workflow.JobRunning) {
+			continue
+		}
+		if taskRunJobMatchesRequest(job, request) {
+			return job, true, nil
+		}
+	}
+	return db.Job{}, false, nil
+}
+
+func taskRunImplementJobRequest(jobID string, task db.Task, owner string, headSHA string) workflow.JobRequest {
+	title := strings.TrimSpace(task.Title)
+	label := task.ID
+	if title != "" {
+		label += ": " + title
+	}
+	return workflow.JobRequest{
+		ID:           jobID,
+		Agent:        owner,
+		Action:       "implement",
+		Repo:         task.RepoFullName,
+		Branch:       task.Branch,
+		HeadSHA:      headSHA,
+		GoalID:       task.GoalID,
+		TaskID:       task.ID,
+		TaskTitle:    task.Title,
+		LeadAgent:    owner,
+		Sender:       "task run",
+		Instructions: "Implement task " + label + ".",
+	}
+}
+
+func taskRunJobMatchesRequest(job db.Job, request workflow.JobRequest) bool {
+	if job.Agent != request.Agent || job.Type != request.Action {
+		return false
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		return false
+	}
+	return payload.Repo == request.Repo &&
+		payload.Branch == request.Branch &&
+		payload.PullRequest == request.PullRequest &&
+		payload.HeadSHA == request.HeadSHA &&
+		payload.GoalID == request.GoalID &&
+		payload.TaskID == request.TaskID &&
+		payload.TaskTitle == request.TaskTitle &&
+		payload.LeadAgent == request.LeadAgent &&
+		payload.Sender == request.Sender &&
+		payload.Instructions == request.Instructions
+}
+
+func taskRunImplementJobID(taskID string, owner string) string {
+	value := slug("task-" + taskID + "-implement-" + owner)
+	if value == "" {
+		return "task-implement-" + shortHash(taskID+"\x00"+owner)
+	}
+	return value
 }
 
 func parseGoalFile(path string, repo string) (importedGoal, error) {

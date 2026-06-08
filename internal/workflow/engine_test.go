@@ -231,6 +231,42 @@ func TestEngineAdvanceImplementDefaultsLeadAgent(t *testing.T) {
 	mustJob(t, store, "review-audit-task-7-review-1")
 }
 
+func TestEngineAdvanceImplementSkipsPullRequestFlowWhenNoPullRequest(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+	insertCompletedJob(t, store, db.Job{
+		ID:    "implement-job",
+		Agent: "lead",
+		Type:  "implement",
+	}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-7",
+		GoalID:    "goal-1",
+		TaskID:    "task-7",
+		TaskTitle: "Workflow Engine",
+		LeadAgent: "lead",
+		Result:    &AgentResult{Decision: "implemented", Summary: "done locally"},
+	})
+
+	err := engine.AdvanceJob(ctx, "implement-job")
+
+	if err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	events, err := store.ListJobEvents(ctx, "implement-job")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	for _, event := range events {
+		if event.Kind == "advance_skipped_no_pr" {
+			return
+		}
+	}
+	t.Fatalf("events = %+v, want advance_skipped_no_pr", events)
+}
+
 func TestEngineRunJobAdvancesCompletedResult(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

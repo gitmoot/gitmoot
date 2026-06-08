@@ -264,6 +264,9 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 		if payload.Result.Decision != "implemented" {
 			return nil
 		}
+		if payload.PullRequest <= 0 {
+			return e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_skipped_no_pr", Message: "no pull request is attached; skipping PR advancement"})
+		}
 		leadAgent := strings.TrimSpace(payload.LeadAgent)
 		if leadAgent == "" {
 			leadAgent = job.Agent
