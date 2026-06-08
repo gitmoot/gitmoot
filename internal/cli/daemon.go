@@ -1500,6 +1500,21 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		return nil
 	}
 	agent := runtimeAgent(dbAgent)
+	if readOnlyImplementationBlocked(job.Type, agent) {
+		transitioned, err := markJobPermissionBlocked(ctx, w.Store, job.ID)
+		if err != nil {
+			return err
+		}
+		if !transitioned {
+			return nil
+		}
+		if err := blockTaskForPermissionBlockedJob(ctx, w.Store, job); err != nil {
+			return err
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, "", errors.New(agentPermissionBlockedMessage))
+		writeLine(w.Stdout, "job %s blocked: %s", job.ID, agentPermissionBlockedMessage)
+		return nil
+	}
 	checkout, err := w.CheckoutValidator(ctx, job, payload, agent)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
@@ -1577,7 +1592,14 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		if markErr := w.handleRunJobError(ctx, job.ID, err); markErr != nil {
 			return markErr
 		}
-		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
+		commentErr := err
+		if job.Type == "implement" && runtimePermissionFailure(err) {
+			latest, latestErr := w.Store.GetJob(ctx, job.ID)
+			if latestErr == nil && latest.State == string(workflow.JobBlocked) {
+				commentErr = errors.New(agentPermissionBlockedMessage)
+			}
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, commentErr)
 		writeLine(w.Stdout, "job %s failed: %v", job.ID, err)
 		return nil
 	}
@@ -1649,6 +1671,43 @@ func (w jobWorker) runningJobContext(ctx context.Context, jobID string) (context
 		cancel()
 		<-done
 	}
+}
+
+func blockTaskForPermissionBlockedJob(ctx context.Context, store *db.Store, job db.Job) error {
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(payload.TaskID) == "" {
+		return nil
+	}
+	task := db.Task{
+		ID:           payload.TaskID,
+		RepoFullName: payload.Repo,
+		GoalID:       payload.GoalID,
+		Title:        payload.TaskTitle,
+		State:        string(workflow.TaskBlocked),
+		Branch:       payload.Branch,
+	}
+	existing, err := store.GetTask(ctx, payload.TaskID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil {
+		if task.RepoFullName == "" {
+			task.RepoFullName = existing.RepoFullName
+		}
+		if task.GoalID == "" {
+			task.GoalID = existing.GoalID
+		}
+		if task.Title == "" {
+			task.Title = existing.Title
+		}
+		if task.Branch == "" {
+			task.Branch = existing.Branch
+		}
+	}
+	return store.UpsertTask(ctx, task)
 }
 
 func (w jobWorker) jobNeedsAdvanceRetry(ctx context.Context, jobID string) (bool, error) {
@@ -1914,6 +1973,18 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, cause er
 	latest, err := w.Store.GetJob(ctx, jobID)
 	if err != nil {
 		return err
+	}
+	if latest.Type == "implement" && runtimePermissionFailure(cause) {
+		payload, payloadErr := daemonJobPayload(latest)
+		if payloadErr != nil || payload.Result == nil {
+			transitioned, err := markJobPermissionBlocked(ctx, w.Store, jobID)
+			if err != nil {
+				return err
+			}
+			if transitioned {
+				return blockTaskForPermissionBlockedJob(ctx, w.Store, latest)
+			}
+		}
 	}
 	if latest.State == string(workflow.JobQueued) {
 		state := workflow.JobFailed

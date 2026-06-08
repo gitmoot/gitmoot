@@ -9,14 +9,15 @@ import (
 )
 
 type AgentType struct {
-	Name          string
-	Runtime       string
-	Template      string
-	Role          string
-	Capabilities  []string
-	MaxBackground int
-	IdleTimeout   string
-	JobTimeout    string
+	Name           string
+	Runtime        string
+	Template       string
+	Role           string
+	Capabilities   []string
+	AutonomyPolicy string
+	MaxBackground  int
+	IdleTimeout    string
+	JobTimeout     string
 }
 
 func LoadAgentTypes(paths Paths) (map[string]AgentType, error) {
@@ -103,6 +104,9 @@ func applyAgentTypeDefaults(entry *AgentType) {
 	if len(entry.Capabilities) == 0 {
 		entry.Capabilities = []string{"ask"}
 	}
+	if strings.TrimSpace(entry.AutonomyPolicy) == "" {
+		entry.AutonomyPolicy = "auto"
+	}
 	if entry.MaxBackground <= 0 {
 		entry.MaxBackground = 1
 	}
@@ -132,6 +136,17 @@ func applyAgentTypeField(entry *AgentType, key string, value string) error {
 		parsed, err := parseConfigStringArray(value)
 		entry.Capabilities = parsed
 		return err
+	case "autonomy_policy":
+		parsed, err := parseConfigString(value)
+		if err != nil {
+			return err
+		}
+		parsed = strings.TrimSpace(parsed)
+		if err := validateAgentTypeAutonomyPolicy(parsed); err != nil {
+			return err
+		}
+		entry.AutonomyPolicy = parsed
+		return nil
 	case "max_background":
 		parsed, err := strconv.Atoi(value)
 		entry.MaxBackground = parsed
@@ -146,6 +161,15 @@ func applyAgentTypeField(entry *AgentType, key string, value string) error {
 		return err
 	default:
 		return nil
+	}
+}
+
+func validateAgentTypeAutonomyPolicy(policy string) error {
+	switch strings.TrimSpace(policy) {
+	case "", "auto", "read-only", "workspace-write", "danger-full-access":
+		return nil
+	default:
+		return fmt.Errorf("unsupported autonomy policy %q; use auto, read-only, workspace-write, or danger-full-access", strings.TrimSpace(policy))
 	}
 }
 
@@ -234,7 +258,9 @@ func writeAgentTypeBlock(builder *strings.Builder, entry AgentType) {
 		}
 		builder.WriteString(strconv.Quote(capability))
 	}
-	builder.WriteString("]\nmax_background = ")
+	builder.WriteString("]\nautonomy_policy = ")
+	builder.WriteString(strconv.Quote(entry.AutonomyPolicy))
+	builder.WriteString("\nmax_background = ")
 	builder.WriteString(strconv.Itoa(entry.MaxBackground))
 	builder.WriteString("\nidle_timeout = ")
 	builder.WriteString(strconv.Quote(entry.IdleTimeout))

@@ -51,6 +51,33 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err := store.UpsertRepo(ctx, record); err != nil {
 		return localAgentJobOutput{}, err
 	}
+	if agent, blocked, err := readOnlyManagedImplementationBlock(ctx, store, request, repo.FullName()); err != nil {
+		return localAgentJobOutput{}, err
+	} else if blocked {
+		job, err := (workflow.Mailbox{Store: store}).Enqueue(ctx, workflow.JobRequest{
+			ID:           localAgentJobID(request.Action, agent.Name),
+			Agent:        agent.Name,
+			Action:       request.Action,
+			Repo:         repo.FullName(),
+			Branch:       record.DefaultBranch,
+			Sender:       "local",
+			Instructions: request.Instructions,
+		})
+		if err != nil {
+			return localAgentJobOutput{}, err
+		}
+		if _, err := markJobPermissionBlocked(ctx, store, job.ID); err != nil {
+			return localAgentJobOutput{}, err
+		}
+		return localAgentJobOutput{
+			JobID:          job.ID,
+			State:          string(workflow.JobBlocked),
+			Repo:           repo.FullName(),
+			Agent:          job.Agent,
+			Action:         job.Type,
+			RawOutputCount: 0,
+		}, nil
+	}
 	agent, releaseAgentReservation, err := resolveLocalDispatchAgent(ctx, store, request, repo.FullName(), record)
 	if err != nil {
 		return localAgentJobOutput{}, err
@@ -86,6 +113,19 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	if err := releaseReservation(ctx); err != nil {
 		return localAgentJobOutput{}, err
+	}
+	if readOnlyImplementationBlocked(job.Type, runtimeAgent(agent)) {
+		if _, err := markJobPermissionBlocked(ctx, store, job.ID); err != nil {
+			return localAgentJobOutput{}, err
+		}
+		return localAgentJobOutput{
+			JobID:          job.ID,
+			State:          string(workflow.JobBlocked),
+			Repo:           repo.FullName(),
+			Agent:          job.Agent,
+			Action:         job.Type,
+			RawOutputCount: 0,
+		}, nil
 	}
 	if request.Background {
 		return localAgentJobOutput{
@@ -188,6 +228,37 @@ func resolveLocalDispatchAgent(ctx context.Context, store *db.Store, request loc
 	return ensureManagedAgentInstance(ctx, store, request.Home, typeName, repo, record)
 }
 
+func readOnlyManagedImplementationBlock(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string) (runtime.Agent, bool, error) {
+	if strings.TrimSpace(request.Action) != "implement" {
+		return runtime.Agent{}, false, nil
+	}
+	forceType := strings.TrimSpace(request.Type)
+	if forceType == "" {
+		if _, err := store.GetAgent(ctx, request.Agent); err == nil {
+			return runtime.Agent{}, false, nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return runtime.Agent{}, false, err
+		}
+	}
+	if !request.Background && !request.AllowManagedSync {
+		return runtime.Agent{}, false, nil
+	}
+	typeName := firstNonEmpty(forceType, request.Agent)
+	types, err := loadAgentTypeConfig(request.Home)
+	if err != nil {
+		return runtime.Agent{}, false, err
+	}
+	agentType, ok := types[typeName]
+	if !ok {
+		return runtime.Agent{}, false, nil
+	}
+	agent := runtimeAgentFromType(agentType, repo, typeName)
+	if !agentHasCapability(agent.Capabilities, request.Action) {
+		return runtime.Agent{}, false, fmt.Errorf("agent %q lacks %s capability", agent.Name, request.Action)
+	}
+	return agent, readOnlyImplementationBlocked(request.Action, agent), nil
+}
+
 func noopAgentReservationRelease(context.Context) error {
 	return nil
 }
@@ -257,7 +328,7 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 			_ = releaseTypeLock(context.Background())
 		}
 	}()
-	if instance, ok, err := store.FindReusableAgentInstance(ctx, typeName, repo, now); err != nil {
+	if instance, ok, err := store.FindReusableAgentInstance(ctx, typeName, repo, agentType.AutonomyPolicy, now); err != nil {
 		return db.Agent{}, noopAgentReservationRelease, err
 	} else if ok {
 		if err := store.TouchAgentInstance(ctx, instance.Name, now, idleTimeout); err != nil {
@@ -270,12 +341,12 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 		releaseOnError = false
 		return agent, releaseTypeLock, nil
 	}
-	count, err := store.CountActiveAgentInstances(ctx, typeName, now)
+	count, err := store.CountActiveAgentInstances(ctx, typeName, agentType.AutonomyPolicy, now)
 	if err != nil {
 		return db.Agent{}, noopAgentReservationRelease, err
 	}
 	if count >= agentType.MaxBackground {
-		instance, ok, err := store.FindActiveAgentInstance(ctx, typeName, repo, now)
+		instance, ok, err := store.FindActiveAgentInstance(ctx, typeName, repo, agentType.AutonomyPolicy, now)
 		if err != nil {
 			return db.Agent{}, noopAgentReservationRelease, err
 		}
@@ -306,18 +377,19 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 		return db.Agent{}, noopAgentReservationRelease, err
 	}
 	reservedInstance := db.AgentInstance{
-		Name:         instanceAgent.Name,
-		Type:         agentType.Name,
-		Runtime:      instanceAgent.Runtime,
-		RuntimeRef:   "starting:" + instanceAgent.Name,
-		RepoFullName: repo,
-		Role:         instanceAgent.Role,
-		TemplateID:   instanceAgent.TemplateID,
-		Capabilities: instanceAgent.Capabilities,
-		State:        "starting",
-		CreatedAt:    formatManagedAgentTime(now),
-		LastUsedAt:   formatManagedAgentTime(now),
-		ExpiresAt:    formatManagedAgentTime(now.Add(jobTimeout)),
+		Name:           instanceAgent.Name,
+		Type:           agentType.Name,
+		Runtime:        instanceAgent.Runtime,
+		RuntimeRef:     "starting:" + instanceAgent.Name,
+		RepoFullName:   repo,
+		Role:           instanceAgent.Role,
+		TemplateID:     instanceAgent.TemplateID,
+		Capabilities:   instanceAgent.Capabilities,
+		AutonomyPolicy: instanceAgent.AutonomyPolicy,
+		State:          "starting",
+		CreatedAt:      formatManagedAgentTime(now),
+		LastUsedAt:     formatManagedAgentTime(now),
+		ExpiresAt:      formatManagedAgentTime(now.Add(jobTimeout)),
 	}
 	if err := store.UpsertAgentInstance(ctx, reservedInstance); err != nil {
 		return db.Agent{}, noopAgentReservationRelease, err
@@ -338,18 +410,19 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 		return db.Agent{}, noopAgentReservationRelease, err
 	}
 	instance := db.AgentInstance{
-		Name:         instanceAgent.Name,
-		Type:         agentType.Name,
-		Runtime:      instanceAgent.Runtime,
-		RuntimeRef:   instanceAgent.RuntimeRef,
-		RepoFullName: repo,
-		Role:         instanceAgent.Role,
-		TemplateID:   instanceAgent.TemplateID,
-		Capabilities: instanceAgent.Capabilities,
-		State:        "starting",
-		CreatedAt:    formatManagedAgentTime(now),
-		LastUsedAt:   formatManagedAgentTime(now),
-		ExpiresAt:    formatManagedAgentTime(now.Add(jobTimeout)),
+		Name:           instanceAgent.Name,
+		Type:           agentType.Name,
+		Runtime:        instanceAgent.Runtime,
+		RuntimeRef:     instanceAgent.RuntimeRef,
+		RepoFullName:   repo,
+		Role:           instanceAgent.Role,
+		TemplateID:     instanceAgent.TemplateID,
+		Capabilities:   instanceAgent.Capabilities,
+		AutonomyPolicy: instanceAgent.AutonomyPolicy,
+		State:          "starting",
+		CreatedAt:      formatManagedAgentTime(now),
+		LastUsedAt:     formatManagedAgentTime(now),
+		ExpiresAt:      formatManagedAgentTime(now.Add(jobTimeout)),
 	}
 	if err := store.UpsertAgentInstance(ctx, instance); err != nil {
 		_ = store.DeleteAgentInstance(context.Background(), reservedInstance.Name)
@@ -425,7 +498,7 @@ func runtimeAgentFromType(agentType config.AgentType, repo string, name string) 
 		RepoScope:      repo,
 		TemplateID:     agentType.Template,
 		Capabilities:   agentType.Capabilities,
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: runtime.NormalizeStoredAutonomyPolicy(agentType.AutonomyPolicy),
 		HealthStatus:   "idle",
 	}
 }

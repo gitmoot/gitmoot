@@ -102,18 +102,19 @@ type AgentRepo struct {
 }
 
 type AgentInstance struct {
-	Name         string
-	Type         string
-	Runtime      string
-	RuntimeRef   string
-	RepoFullName string
-	Role         string
-	TemplateID   string
-	Capabilities []string
-	State        string
-	CreatedAt    string
-	LastUsedAt   string
-	ExpiresAt    string
+	Name           string
+	Type           string
+	Runtime        string
+	RuntimeRef     string
+	RepoFullName   string
+	Role           string
+	TemplateID     string
+	Capabilities   []string
+	AutonomyPolicy string
+	State          string
+	CreatedAt      string
+	LastUsedAt     string
+	ExpiresAt      string
 }
 
 type Goal struct {
@@ -595,6 +596,10 @@ func (s *Store) GetAgent(ctx context.Context, name string) (Agent, error) {
 	if err != nil {
 		return Agent{}, err
 	}
+	policy := strings.TrimSpace(instance.AutonomyPolicy)
+	if policy == "" {
+		policy = "auto"
+	}
 	return Agent{
 		Name:           instance.Name,
 		Role:           instance.Role,
@@ -603,7 +608,7 @@ func (s *Store) GetAgent(ctx context.Context, name string) (Agent, error) {
 		RepoScope:      instance.RepoFullName,
 		TemplateID:     instance.TemplateID,
 		Capabilities:   instance.Capabilities,
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: policy,
 		HealthStatus:   instance.State,
 	}, nil
 }
@@ -1239,8 +1244,11 @@ func (s *Store) UpsertAgentInstance(ctx context.Context, instance AgentInstance)
 	instance.CreatedAt = normalizeStoredTime(instance.CreatedAt)
 	instance.LastUsedAt = normalizeStoredTime(instance.LastUsedAt)
 	instance.ExpiresAt = normalizeStoredTime(instance.ExpiresAt)
-	_, err = s.db.ExecContext(ctx, `INSERT INTO agent_instances(name, type, runtime, runtime_ref, repo_full_name, role, template_id, capabilities_json, state, created_at, last_used_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	if strings.TrimSpace(instance.AutonomyPolicy) == "" {
+		instance.AutonomyPolicy = "auto"
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO agent_instances(name, type, runtime, runtime_ref, repo_full_name, role, template_id, capabilities_json, autonomy_policy, state, created_at, last_used_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET
 			type = excluded.type,
 			runtime = excluded.runtime,
@@ -1249,23 +1257,27 @@ func (s *Store) UpsertAgentInstance(ctx context.Context, instance AgentInstance)
 			role = excluded.role,
 			template_id = excluded.template_id,
 			capabilities_json = excluded.capabilities_json,
+			autonomy_policy = excluded.autonomy_policy,
 			state = excluded.state,
 			last_used_at = excluded.last_used_at,
 			expires_at = excluded.expires_at`,
-		instance.Name, instance.Type, instance.Runtime, instance.RuntimeRef, instance.RepoFullName, instance.Role, instance.TemplateID, string(capabilities), instance.State, instance.CreatedAt, instance.LastUsedAt, instance.ExpiresAt)
+		instance.Name, instance.Type, instance.Runtime, instance.RuntimeRef, instance.RepoFullName, instance.Role, instance.TemplateID, string(capabilities), instance.AutonomyPolicy, instance.State, instance.CreatedAt, instance.LastUsedAt, instance.ExpiresAt)
 	return err
 }
 
 func (s *Store) GetAgentInstance(ctx context.Context, name string) (AgentInstance, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, template_id, capabilities_json, state, created_at, last_used_at, expires_at
+	row := s.db.QueryRowContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, template_id, capabilities_json, autonomy_policy, state, created_at, last_used_at, expires_at
 		FROM agent_instances WHERE name = ?`, name)
 	return scanAgentInstance(row)
 }
 
-func (s *Store) FindReusableAgentInstance(ctx context.Context, typ string, repo string, now time.Time) (AgentInstance, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, template_id, capabilities_json, state, created_at, last_used_at, expires_at
+func (s *Store) FindReusableAgentInstance(ctx context.Context, typ string, repo string, autonomyPolicy string, now time.Time) (AgentInstance, bool, error) {
+	if strings.TrimSpace(autonomyPolicy) == "" {
+		autonomyPolicy = "auto"
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, template_id, capabilities_json, autonomy_policy, state, created_at, last_used_at, expires_at
 		FROM agent_instances
-		WHERE type = ? AND repo_full_name = ? AND expires_at > ?
+		WHERE type = ? AND repo_full_name = ? AND autonomy_policy = ? AND expires_at > ?
 			AND state = 'idle'
 			AND NOT EXISTS (
 				SELECT 1 FROM jobs
@@ -1273,7 +1285,7 @@ func (s *Store) FindReusableAgentInstance(ctx context.Context, typ string, repo 
 					AND jobs.state IN ('queued', 'running')
 			)
 		ORDER BY last_used_at DESC, created_at DESC
-		LIMIT 1`, typ, repo, formatResourceLockTime(now))
+		LIMIT 1`, typ, repo, autonomyPolicy, formatResourceLockTime(now))
 	instance, err := scanAgentInstance(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AgentInstance{}, false, nil
@@ -1284,10 +1296,13 @@ func (s *Store) FindReusableAgentInstance(ctx context.Context, typ string, repo 
 	return instance, true, nil
 }
 
-func (s *Store) CountActiveAgentInstances(ctx context.Context, typ string, now time.Time) (int, error) {
+func (s *Store) CountActiveAgentInstances(ctx context.Context, typ string, autonomyPolicy string, now time.Time) (int, error) {
+	if strings.TrimSpace(autonomyPolicy) == "" {
+		autonomyPolicy = "auto"
+	}
 	var count int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_instances
-		WHERE type = ?
+		WHERE type = ? AND autonomy_policy = ?
 			AND (
 				expires_at > ?
 				OR EXISTS (
@@ -1295,14 +1310,17 @@ func (s *Store) CountActiveAgentInstances(ctx context.Context, typ string, now t
 					WHERE jobs.agent = agent_instances.name
 						AND jobs.state IN ('queued', 'running')
 				)
-			)`, typ, formatResourceLockTime(now)).Scan(&count)
+			)`, typ, autonomyPolicy, formatResourceLockTime(now)).Scan(&count)
 	return count, err
 }
 
-func (s *Store) FindActiveAgentInstance(ctx context.Context, typ string, repo string, now time.Time) (AgentInstance, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, template_id, capabilities_json, state, created_at, last_used_at, expires_at
+func (s *Store) FindActiveAgentInstance(ctx context.Context, typ string, repo string, autonomyPolicy string, now time.Time) (AgentInstance, bool, error) {
+	if strings.TrimSpace(autonomyPolicy) == "" {
+		autonomyPolicy = "auto"
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, template_id, capabilities_json, autonomy_policy, state, created_at, last_used_at, expires_at
 		FROM agent_instances
-		WHERE type = ? AND repo_full_name = ?
+		WHERE type = ? AND repo_full_name = ? AND autonomy_policy = ?
 			AND (
 				expires_at > ?
 				OR EXISTS (
@@ -1315,7 +1333,7 @@ func (s *Store) FindActiveAgentInstance(ctx context.Context, typ string, repo st
 			CASE WHEN expires_at > ? THEN 0 ELSE 1 END,
 			last_used_at DESC,
 			created_at DESC
-		LIMIT 1`, typ, repo, formatResourceLockTime(now), formatResourceLockTime(now))
+		LIMIT 1`, typ, repo, autonomyPolicy, formatResourceLockTime(now), formatResourceLockTime(now))
 	instance, err := scanAgentInstance(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AgentInstance{}, false, nil
@@ -1327,7 +1345,7 @@ func (s *Store) FindActiveAgentInstance(ctx context.Context, typ string, repo st
 }
 
 func (s *Store) ListAgentInstances(ctx context.Context) ([]AgentInstance, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, template_id, capabilities_json, state, created_at, last_used_at, expires_at
+	rows, err := s.db.QueryContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, template_id, capabilities_json, autonomy_policy, state, created_at, last_used_at, expires_at
 		FROM agent_instances ORDER BY type, repo_full_name, name`)
 	if err != nil {
 		return nil, err
@@ -1388,8 +1406,11 @@ func (s *Store) DeleteExpiredAgentInstances(ctx context.Context, now time.Time) 
 func scanAgentInstance(row interface{ Scan(dest ...any) error }) (AgentInstance, error) {
 	var instance AgentInstance
 	var capabilities string
-	if err := row.Scan(&instance.Name, &instance.Type, &instance.Runtime, &instance.RuntimeRef, &instance.RepoFullName, &instance.Role, &instance.TemplateID, &capabilities, &instance.State, &instance.CreatedAt, &instance.LastUsedAt, &instance.ExpiresAt); err != nil {
+	if err := row.Scan(&instance.Name, &instance.Type, &instance.Runtime, &instance.RuntimeRef, &instance.RepoFullName, &instance.Role, &instance.TemplateID, &capabilities, &instance.AutonomyPolicy, &instance.State, &instance.CreatedAt, &instance.LastUsedAt, &instance.ExpiresAt); err != nil {
 		return AgentInstance{}, err
+	}
+	if strings.TrimSpace(instance.AutonomyPolicy) == "" {
+		instance.AutonomyPolicy = "auto"
 	}
 	if strings.TrimSpace(capabilities) != "" {
 		if err := json.Unmarshal([]byte(capabilities), &instance.Capabilities); err != nil {
@@ -4169,5 +4190,8 @@ CREATE INDEX idx_skillopt_review_watches_run_id ON skillopt_review_watches(run_i
 	`,
 	`
 ALTER TABLE ranked_feedback_events ADD COLUMN tie_groups_json TEXT NOT NULL DEFAULT '';
+	`,
+	`
+ALTER TABLE agent_instances ADD COLUMN autonomy_policy TEXT NOT NULL DEFAULT 'auto';
 	`,
 }

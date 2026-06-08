@@ -580,6 +580,313 @@ func TestRunQueuedJobsMarksShellAdapterFailure(t *testing.T) {
 	}
 }
 
+func TestRunQueuedJobsBlocksReadOnlyImplementBeforeRuntime(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.ShellRuntime, "unused", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task 1", State: string(workflow.TaskChangesRequested), Branch: "task-1"}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-readonly-implement", Agent: "lead", Action: "implement", Repo: "owner/repo", Branch: "task-1", PullRequest: 7, GoalID: "goal-1", TaskID: "task-1", TaskTitle: "Task 1"})
+	comments := &cliPollFakeGitHub{}
+	checkoutCalls := 0
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"implemented","summary":"should not run","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		checkoutCalls++
+		return checkout, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return adapter, nil
+	}
+	worker.CommenterFactory = func(string) github.Client {
+		return comments
+	}
+
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+
+	if checkoutCalls != 0 {
+		t.Fatalf("checkout validator calls = %d, want 0", checkoutCalls)
+	}
+	if adapter.calls != 0 {
+		t.Fatalf("adapter calls = %d, want 0", adapter.calls)
+	}
+	job, err := store.GetJob(ctx, "job-readonly-implement")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobBlocked) {
+		t.Fatalf("job state = %q, want blocked", job.State)
+	}
+	task, err := store.GetTask(ctx, "task-1")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskBlocked) {
+		t.Fatalf("task state = %q, want blocked", task.State)
+	}
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !daemonWorkerHasEvent(events, string(workflow.JobBlocked)) || !daemonWorkerHasEvent(events, "permission_blocked") {
+		t.Fatalf("events = %+v, want blocked and permission_blocked", events)
+	}
+	if len(comments.posted) != 1 {
+		t.Fatalf("posted comments = %+v, want 1", comments.posted)
+	}
+	body := comments.posted[0].body
+	if !strings.Contains(body, "**Decision:** `blocked`") || !strings.Contains(body, agentPermissionBlockedMessage) {
+		t.Fatalf("comment body missing permission block:\n%s", body)
+	}
+}
+
+func TestRunQueuedJobsSkipsReadOnlySideEffectsWhenJobAlreadyMoved(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.ShellRuntime, "unused", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task 1", State: string(workflow.TaskChangesRequested), Branch: "task-1"}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-readonly-race", Agent: "lead", Action: "implement", Repo: "owner/repo", Branch: "task-1", PullRequest: 7, GoalID: "goal-1", TaskID: "task-1", TaskTitle: "Task 1"})
+	jobSnapshot, err := store.GetJob(ctx, "job-readonly-race")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if transitioned, err := store.TransitionJobState(ctx, jobSnapshot.ID, string(workflow.JobQueued), string(workflow.JobCancelled)); err != nil || !transitioned {
+		t.Fatalf("TransitionJobState returned transitioned=%v err=%v", transitioned, err)
+	}
+	comments := &cliPollFakeGitHub{}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		t.Fatal("checkout validator should not run")
+		return "", nil
+	}
+	worker.CommenterFactory = func(string) github.Client {
+		return comments
+	}
+
+	if err := worker.run(ctx, jobSnapshot); err != nil {
+		t.Fatalf("worker.run returned error: %v", err)
+	}
+
+	job, err := store.GetJob(ctx, "job-readonly-race")
+	if err != nil {
+		t.Fatalf("GetJob after run returned error: %v", err)
+	}
+	if job.State != string(workflow.JobCancelled) {
+		t.Fatalf("job state = %q, want cancelled", job.State)
+	}
+	task, err := store.GetTask(ctx, "task-1")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskChangesRequested) {
+		t.Fatalf("task state = %q, want changes_requested", task.State)
+	}
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if daemonWorkerHasEvent(events, "permission_blocked") {
+		t.Fatalf("events = %+v, did not want permission_blocked", events)
+	}
+	if len(comments.posted) != 0 {
+		t.Fatalf("posted comments = %+v, want none", comments.posted)
+	}
+}
+
+func TestRunQueuedJobsAllowsReadOnlyAsk(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-readonly-ask", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"ask ran","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return adapter, nil
+	}
+
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+
+	if adapter.calls != 1 {
+		t.Fatalf("adapter calls = %d, want 1", adapter.calls)
+	}
+	job, err := store.GetJob(ctx, "job-readonly-ask")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobSucceeded) {
+		t.Fatalf("job state = %q, want succeeded", job.State)
+	}
+}
+
+func TestRunQueuedJobsNormalizesRuntimePermissionFailure(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "lead", runtime.ShellRuntime, "unused", []string{"implement"}, "owner/repo")
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task 1", State: string(workflow.TaskReviewing), Branch: "task-1"}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-permission-fail", Agent: "lead", Action: "implement", Repo: "owner/repo", Branch: "task-1", PullRequest: 7, GoalID: "goal-1", TaskID: "task-1", TaskTitle: "Task 1"})
+	comments := &cliPollFakeGitHub{}
+	adapter := &cliWorkerFakeAdapter{err: errors.New("sandbox rejected write: permission denied")}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return adapter, nil
+	}
+	worker.CommenterFactory = func(string) github.Client {
+		return comments
+	}
+
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+
+	job, err := store.GetJob(ctx, "job-permission-fail")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobBlocked) {
+		t.Fatalf("job state = %q, want blocked", job.State)
+	}
+	task, err := store.GetTask(ctx, "task-1")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskBlocked) {
+		t.Fatalf("task state = %q, want blocked", task.State)
+	}
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !daemonWorkerHasEvent(events, "permission_blocked") {
+		t.Fatalf("events = %+v, want permission_blocked", events)
+	}
+	if len(comments.posted) != 1 || !strings.Contains(comments.posted[0].body, agentPermissionBlockedMessage) {
+		t.Fatalf("posted comments = %+v, want permission block comment", comments.posted)
+	}
+}
+
+func TestRunQueuedJobsPreservesGenericRuntimePermissionFailure(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "lead", runtime.ShellRuntime, "unused", []string{"implement"}, "owner/repo")
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task 1", State: string(workflow.TaskReviewing), Branch: "task-1"}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-generic-permission-fail", Agent: "lead", Action: "implement", Repo: "owner/repo", Branch: "task-1", PullRequest: 7, GoalID: "goal-1", TaskID: "task-1", TaskTitle: "Task 1"})
+	comments := &cliPollFakeGitHub{}
+	adapter := &cliWorkerFakeAdapter{err: errors.New("permission denied reading api token")}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return adapter, nil
+	}
+	worker.CommenterFactory = func(string) github.Client {
+		return comments
+	}
+
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+
+	job, err := store.GetJob(ctx, "job-generic-permission-fail")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobFailed) {
+		t.Fatalf("job state = %q, want failed", job.State)
+	}
+	task, err := store.GetTask(ctx, "task-1")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskReviewing) {
+		t.Fatalf("task state = %q, want reviewing", task.State)
+	}
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if daemonWorkerHasEvent(events, "permission_blocked") {
+		t.Fatalf("events = %+v, did not want permission_blocked", events)
+	}
+	if len(comments.posted) != 1 || strings.Contains(comments.posted[0].body, agentPermissionBlockedMessage) {
+		t.Fatalf("posted comments = %+v, want original failure comment", comments.posted)
+	}
+}
+
+func TestRunQueuedJobsPreservesAdvanceRetryForPostDeliveryPermissionError(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "lead", runtime.ShellRuntime, "unused", []string{"implement"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-advance-permission", Agent: "lead", Action: "implement", Repo: "owner/repo", Branch: "task-1", PullRequest: 7})
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"implemented","summary":"implemented","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return adapter, nil
+	}
+	worker.WorkflowFactory = func(string) workflow.Engine {
+		return workflow.Engine{
+			Store: store,
+			PayloadRefresher: func(context.Context, db.Job, workflow.JobPayload) (workflow.JobPayload, error) {
+				return workflow.JobPayload{}, errors.New("permission denied while refreshing implemented head")
+			},
+		}
+	}
+
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+
+	job, err := store.GetJob(ctx, "job-advance-permission")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobSucceeded) {
+		t.Fatalf("job state = %q, want succeeded result preserved", job.State)
+	}
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !daemonWorkerHasEvent(events, "advance_retry") {
+		t.Fatalf("events = %+v, want advance_retry", events)
+	}
+	if daemonWorkerHasEvent(events, "permission_blocked") {
+		t.Fatalf("events = %+v, did not want permission_blocked", events)
+	}
+}
+
 func TestRunQueuedJobsUsesMailboxRepairForMalformedOutput(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
@@ -2332,6 +2639,7 @@ func (f *cliPollFakeGitHub) GetUserPermission(context.Context, github.Repository
 type cliWorkerFakeAdapter struct {
 	mu                   sync.Mutex
 	output               string
+	err                  error
 	calls                int
 	delivered            []string
 	onDeliver            func()
@@ -2355,6 +2663,9 @@ func (f *cliWorkerFakeAdapter) Deliver(ctx context.Context, _ runtime.Agent, job
 		f.contextCancelled = true
 		f.mu.Unlock()
 		return runtime.Result{}, ctx.Err()
+	}
+	if f.err != nil {
+		return runtime.Result{}, f.err
 	}
 	return runtime.Result{Raw: f.output}, nil
 }
@@ -2410,6 +2721,11 @@ func seedDaemonWorkerRepo(t *testing.T, store *db.Store, fullName string, checko
 
 func seedDaemonWorkerAgent(t *testing.T, store *db.Store, name string, runtimeName string, runtimeRef string, capabilities []string, repo string) {
 	t.Helper()
+	seedDaemonWorkerAgentWithPolicy(t, store, name, runtimeName, runtimeRef, capabilities, repo, runtime.AutonomyPolicyAuto)
+}
+
+func seedDaemonWorkerAgentWithPolicy(t *testing.T, store *db.Store, name string, runtimeName string, runtimeRef string, capabilities []string, repo string, policy string) {
+	t.Helper()
 	if err := store.UpsertAgent(context.Background(), db.Agent{
 		Name:           name,
 		Role:           "worker",
@@ -2417,7 +2733,7 @@ func seedDaemonWorkerAgent(t *testing.T, store *db.Store, name string, runtimeNa
 		RuntimeRef:     runtimeRef,
 		RepoScope:      repo,
 		Capabilities:   capabilities,
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: policy,
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent returned error: %v", err)

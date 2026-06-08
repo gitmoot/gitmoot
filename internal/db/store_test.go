@@ -1079,17 +1079,18 @@ func TestAgentInstanceMethods(t *testing.T) {
 
 	now := time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC)
 	instance := AgentInstance{
-		Name:         "planner-bg-1",
-		Type:         "planner",
-		Runtime:      "codex",
-		RuntimeRef:   "550e8400-e29b-41d4-a716-446655440101",
-		RepoFullName: "owner/repo",
-		Role:         "planner",
-		Capabilities: []string{"ask"},
-		State:        "idle",
-		CreatedAt:    formatResourceLockTime(now),
-		LastUsedAt:   formatResourceLockTime(now),
-		ExpiresAt:    formatResourceLockTime(now.Add(time.Minute)),
+		Name:           "planner-bg-1",
+		Type:           "planner",
+		Runtime:        "codex",
+		RuntimeRef:     "550e8400-e29b-41d4-a716-446655440101",
+		RepoFullName:   "owner/repo",
+		Role:           "planner",
+		Capabilities:   []string{"ask"},
+		AutonomyPolicy: "read-only",
+		State:          "idle",
+		CreatedAt:      formatResourceLockTime(now),
+		LastUsedAt:     formatResourceLockTime(now),
+		ExpiresAt:      formatResourceLockTime(now.Add(time.Minute)),
 	}
 	if err := store.UpsertAgentInstance(ctx, instance); err != nil {
 		t.Fatalf("UpsertAgentInstance returned error: %v", err)
@@ -1098,7 +1099,7 @@ func TestAgentInstanceMethods(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAgent fallback returned error: %v", err)
 	}
-	if agent.Name != instance.Name || agent.RuntimeRef != instance.RuntimeRef || strings.Join(agent.Capabilities, ",") != "ask" {
+	if agent.Name != instance.Name || agent.RuntimeRef != instance.RuntimeRef || agent.AutonomyPolicy != "read-only" || strings.Join(agent.Capabilities, ",") != "ask" {
 		t.Fatalf("fallback agent = %+v", agent)
 	}
 	allowed, err := store.AgentCanAccessRepo(ctx, instance.Name, "owner/repo")
@@ -1108,22 +1109,32 @@ func TestAgentInstanceMethods(t *testing.T) {
 	if !allowed {
 		t.Fatal("agent instance was not allowed on its repo")
 	}
-	reusable, ok, err := store.FindReusableAgentInstance(ctx, "planner", "owner/repo", now.Add(30*time.Second))
+	reusable, ok, err := store.FindReusableAgentInstance(ctx, "planner", "owner/repo", "read-only", now.Add(30*time.Second))
 	if err != nil || !ok {
 		t.Fatalf("FindReusableAgentInstance returned instance=%+v ok=%v err=%v", reusable, ok, err)
 	}
-	count, err := store.CountActiveAgentInstances(ctx, "planner", now.Add(30*time.Second))
+	if _, ok, err := store.FindReusableAgentInstance(ctx, "planner", "owner/repo", "workspace-write", now.Add(30*time.Second)); err != nil || ok {
+		t.Fatalf("FindReusableAgentInstance with mismatched policy ok=%v err=%v, want false nil", ok, err)
+	}
+	count, err := store.CountActiveAgentInstances(ctx, "planner", "read-only", now.Add(30*time.Second))
 	if err != nil || count != 1 {
 		t.Fatalf("CountActiveAgentInstances = %d err=%v, want 1 nil", count, err)
+	}
+	count, err = store.CountActiveAgentInstances(ctx, "planner", "workspace-write", now.Add(30*time.Second))
+	if err != nil || count != 0 {
+		t.Fatalf("CountActiveAgentInstances with mismatched policy = %d err=%v, want 0 nil", count, err)
 	}
 	if err := store.MarkAgentInstanceRunning(ctx, instance.Name, now.Add(time.Minute), 5*time.Minute); err != nil {
 		t.Fatalf("MarkAgentInstanceRunning returned error: %v", err)
 	}
-	if _, ok, err := store.FindReusableAgentInstance(ctx, "planner", "owner/repo", now.Add(30*time.Second)); err != nil || ok {
+	if _, ok, err := store.FindReusableAgentInstance(ctx, "planner", "owner/repo", "read-only", now.Add(30*time.Second)); err != nil || ok {
 		t.Fatalf("running FindReusableAgentInstance ok=%v err=%v, want false nil", ok, err)
 	}
-	if active, ok, err := store.FindActiveAgentInstance(ctx, "planner", "owner/repo", now.Add(30*time.Second)); err != nil || !ok || active.Name != instance.Name {
+	if active, ok, err := store.FindActiveAgentInstance(ctx, "planner", "owner/repo", "read-only", now.Add(30*time.Second)); err != nil || !ok || active.Name != instance.Name {
 		t.Fatalf("FindActiveAgentInstance returned instance=%+v ok=%v err=%v", active, ok, err)
+	}
+	if _, ok, err := store.FindActiveAgentInstance(ctx, "planner", "owner/repo", "workspace-write", now.Add(30*time.Second)); err != nil || ok {
+		t.Fatalf("FindActiveAgentInstance with mismatched policy ok=%v err=%v, want false nil", ok, err)
 	}
 	deleted, err := store.DeleteExpiredAgentInstances(ctx, now.Add(4*time.Minute))
 	if err != nil {
@@ -1135,18 +1146,18 @@ func TestAgentInstanceMethods(t *testing.T) {
 	if err := store.TouchAgentInstance(ctx, instance.Name, now.Add(2*time.Minute), time.Minute); err != nil {
 		t.Fatalf("TouchAgentInstance returned error: %v", err)
 	}
-	count, err = store.CountActiveAgentInstances(ctx, "planner", now.Add(4*time.Minute))
+	count, err = store.CountActiveAgentInstances(ctx, "planner", "read-only", now.Add(4*time.Minute))
 	if err != nil || count != 0 {
 		t.Fatalf("expired idle CountActiveAgentInstances = %d err=%v, want 0 nil", count, err)
 	}
 	if err := store.CreateJob(ctx, Job{ID: "job-planner-1", Agent: instance.Name, Type: "ask", State: "queued", Payload: "{}"}); err != nil {
 		t.Fatalf("CreateJob returned error: %v", err)
 	}
-	count, err = store.CountActiveAgentInstances(ctx, "planner", now.Add(4*time.Minute))
+	count, err = store.CountActiveAgentInstances(ctx, "planner", "read-only", now.Add(4*time.Minute))
 	if err != nil || count != 1 {
 		t.Fatalf("expired queued CountActiveAgentInstances = %d err=%v, want 1 nil", count, err)
 	}
-	if active, ok, err := store.FindActiveAgentInstance(ctx, "planner", "owner/repo", now.Add(4*time.Minute)); err != nil || !ok || active.Name != instance.Name {
+	if active, ok, err := store.FindActiveAgentInstance(ctx, "planner", "owner/repo", "read-only", now.Add(4*time.Minute)); err != nil || !ok || active.Name != instance.Name {
 		t.Fatalf("expired queued FindActiveAgentInstance returned instance=%+v ok=%v err=%v", active, ok, err)
 	}
 	deleted, err = store.DeleteExpiredAgentInstances(ctx, now.Add(4*time.Minute))
@@ -1895,6 +1906,41 @@ func TestMigrateCopiesAgentRepoScopeToAgentRepos(t *testing.T) {
 	}
 	if len(repos) != 1 || repos[0] != "jerryfane/gitmoot" {
 		t.Fatalf("repos = %+v", repos)
+	}
+}
+
+func TestMigrateAppendsAgentInstanceAutonomyPolicy(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gitmoot.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open returned error: %v", err)
+	}
+	store := &Store{db: raw}
+	for version, migration := range migrations[:len(migrations)-1] {
+		if err := store.applyMigration(ctx, version+1, migration); err != nil {
+			t.Fatalf("applyMigration(%d) returned error: %v", version+1, err)
+		}
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO agent_instances(name, type, runtime, runtime_ref, repo_full_name, role, template_id, capabilities_json, state, created_at, last_used_at, expires_at)
+		VALUES ('planner-bg-legacy', 'planner', 'codex', 'session-id', 'owner/repo', 'planner', '', '["ask"]', 'idle', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z')`); err != nil {
+		t.Fatalf("insert legacy agent instance returned error: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw Close returned error: %v", err)
+	}
+
+	upgraded, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open upgraded DB returned error: %v", err)
+	}
+	defer upgraded.Close()
+	instance, err := upgraded.GetAgentInstance(ctx, "planner-bg-legacy")
+	if err != nil {
+		t.Fatalf("GetAgentInstance returned error: %v", err)
+	}
+	if instance.AutonomyPolicy != "auto" {
+		t.Fatalf("autonomy policy = %q, want auto", instance.AutonomyPolicy)
 	}
 }
 

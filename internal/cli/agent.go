@@ -270,7 +270,7 @@ func printAgentTypeUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent type list")
 	fmt.Fprintln(w, "  gitmoot agent type show <type>")
-	fmt.Fprintln(w, "  gitmoot agent type set <type> --runtime codex|claude --template <template-id> --max-background 2 --idle-timeout 20m")
+	fmt.Fprintln(w, "  gitmoot agent type set <type> --runtime codex|claude --template <template-id> --policy workspace-write --max-background 2 --idle-timeout 20m")
 }
 
 func runAgentTypeList(args []string, stdout, stderr io.Writer) int {
@@ -348,6 +348,7 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 	runtimeName := fs.String("runtime", "", "agent runtime: codex or claude")
 	templateID := fs.String("template", "", "agent template")
 	role := fs.String("role", "", "agent role")
+	policy := fs.String("policy", "", "agent autonomy policy: auto, read-only, workspace-write, or danger-full-access")
 	maxBackground := fs.Int("max-background", -1, "maximum managed background instances")
 	idleTimeout := fs.String("idle-timeout", "", "managed instance idle timeout")
 	jobTimeout := fs.String("job-timeout", "", "managed job timeout")
@@ -403,6 +404,14 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 	}
 	if strings.TrimSpace(*role) != "" {
 		entry.Role = strings.TrimSpace(*role)
+	}
+	if strings.TrimSpace(*policy) != "" {
+		normalized, err := runtime.NormalizeAutonomyPolicy(*policy)
+		if err != nil {
+			fmt.Fprintf(stderr, "invalid policy: %v\n", err)
+			return 2
+		}
+		entry.AutonomyPolicy = normalized
 	}
 	if *maxBackground == 0 || *maxBackground < -1 {
 		fmt.Fprintln(stderr, "max background must be positive")
@@ -526,6 +535,7 @@ func printAgentType(stdout io.Writer, entry config.AgentType) {
 	writeLine(stdout, "template: %s", entry.Template)
 	writeLine(stdout, "role: %s", entry.Role)
 	writeLine(stdout, "capabilities: %s", strings.Join(entry.Capabilities, ","))
+	writeLine(stdout, "policy: %s", runtime.NormalizeStoredAutonomyPolicy(entry.AutonomyPolicy))
 	writeLine(stdout, "max_background: %d", entry.MaxBackground)
 	writeLine(stdout, "idle_timeout: %s", entry.IdleTimeout)
 	writeLine(stdout, "job_timeout: %s", entry.JobTimeout)

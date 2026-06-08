@@ -688,6 +688,7 @@ func TestRunAgentTypeSetListShowAndManagedBackgroundAsk(t *testing.T) {
 		"--home", home,
 		"--runtime", "codex",
 		"--role", "planner",
+		"--policy", "workspace-write",
 		"--max-background", "1",
 		"--idle-timeout", "20m",
 		"--job-timeout", "5m",
@@ -714,7 +715,7 @@ func TestRunAgentTypeSetListShowAndManagedBackgroundAsk(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("agent type show exit code = %d, stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "max_background: 1") || !strings.Contains(stdout.String(), "capabilities: ask") {
+	if !strings.Contains(stdout.String(), "max_background: 1") || !strings.Contains(stdout.String(), "capabilities: ask") || !strings.Contains(stdout.String(), "policy: workspace-write") {
 		t.Fatalf("agent type show output = %q", stdout.String())
 	}
 
@@ -736,7 +737,7 @@ func TestRunAgentTypeSetListShowAndManagedBackgroundAsk(t *testing.T) {
 	if len(runner.calls) != 1 {
 		t.Fatalf("runtime start calls = %+v, want one", runner.calls)
 	}
-	runner.want(t, 0, repoDir, "codex", "exec", "--json", "--")
+	runner.want(t, 0, repoDir, "codex", "exec", "--sandbox", "workspace-write", "--json", "--")
 
 	stdout.Reset()
 	stderr.Reset()
@@ -753,7 +754,7 @@ func TestRunAgentTypeSetListShowAndManagedBackgroundAsk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListAgentInstances returned error: %v", err)
 	}
-	if len(instances) != 1 || instances[0].Type != "planner" || instances[0].RuntimeRef != "550e8400-e29b-41d4-a716-446655440111" {
+	if len(instances) != 1 || instances[0].Type != "planner" || instances[0].RuntimeRef != "550e8400-e29b-41d4-a716-446655440111" || instances[0].AutonomyPolicy != runtime.AutonomyPolicyWorkspaceWrite {
 		t.Fatalf("instances = %+v", instances)
 	}
 	config, err := (jobWorker{Store: store, ConfigHome: home}).managedJobConfig(context.Background(), instances[0].Name)
@@ -824,6 +825,190 @@ func TestDispatchManagedSyncUsesJobTimeoutForRuntimeLock(t *testing.T) {
 	}
 }
 
+func TestDispatchManagedAgentStartsFreshInstanceWhenPolicyChanges(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	t.Chdir(repoDir)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "type", "set", "planner",
+		"--home", home,
+		"--runtime", "codex",
+		"--max-background", "1",
+		"--capability", "ask",
+		"--policy", "read-only",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent type set read-only exit code = %d, stderr=%s", code, stderr.String())
+	}
+	runner := &agentStartRunner{results: []subprocess.Result{
+		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440411"}` + "\n"},
+		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440412"}` + "\n"},
+	}}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "ask", "planner", "First", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("first managed ask exit code = %d, stderr=%s", code, stderr.String())
+	}
+	runner.want(t, 0, repoDir, "codex", "exec", "--sandbox", "read-only", "--json", "--")
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"agent", "type", "set", "planner",
+		"--home", home,
+		"--runtime", "codex",
+		"--max-background", "1",
+		"--capability", "ask",
+		"--policy", "workspace-write",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent type set workspace-write exit code = %d, stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "ask", "planner", "Second", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("second managed ask exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("runtime start calls = %+v, want two", runner.calls)
+	}
+	runner.want(t, 1, repoDir, "codex", "exec", "--sandbox", "workspace-write", "--json", "--")
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	instances, err := store.ListAgentInstances(context.Background())
+	if err != nil {
+		t.Fatalf("ListAgentInstances returned error: %v", err)
+	}
+	policies := map[string]int{}
+	for _, instance := range instances {
+		policies[instance.AutonomyPolicy]++
+	}
+	if policies[runtime.AutonomyPolicyReadOnly] != 1 || policies[runtime.AutonomyPolicyWorkspaceWrite] != 1 {
+		t.Fatalf("instances = %+v, want one read-only and one workspace-write", instances)
+	}
+}
+
+func TestDispatchLocalAgentJobBlocksReadOnlyImplement(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepo(context.Background(), db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir, DefaultBranch: "main", PollInterval: "30s"}); err != nil {
+		t.Fatalf("UpsertRepo returned error: %v", err)
+	}
+	if err := store.UpsertAgent(context.Background(), db.Agent{
+		Name:           "lead",
+		Role:           "implementer",
+		Runtime:        runtime.ShellRuntime,
+		RuntimeRef:     "unused",
+		RepoScope:      "owner/repo",
+		Capabilities:   []string{"implement"},
+		AutonomyPolicy: runtime.AutonomyPolicyReadOnly,
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+
+	output, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
+		RepoFlag:     "owner/repo",
+		Agent:        "lead",
+		Action:       "implement",
+		Instructions: "Implement task 1.",
+		Home:         home,
+	})
+	if err != nil {
+		t.Fatalf("dispatchLocalAgentJob returned error: %v", err)
+	}
+
+	if output.State != string(workflow.JobBlocked) || output.Action != "implement" {
+		t.Fatalf("dispatch output = %+v", output)
+	}
+	job, err := store.GetJob(context.Background(), output.JobID)
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobBlocked) {
+		t.Fatalf("job state = %q, want blocked", job.State)
+	}
+	events, err := store.ListJobEvents(context.Background(), job.ID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !daemonWorkerHasEvent(events, "permission_blocked") {
+		t.Fatalf("events = %+v, want permission_blocked", events)
+	}
+}
+
+func TestDispatchLocalAgentJobBlocksReadOnlyManagedImplementBeforeStart(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	t.Chdir(repoDir)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "type", "set", "builder",
+		"--home", home,
+		"--runtime", "codex",
+		"--policy", "read-only",
+		"--max-background", "1",
+		"--idle-timeout", "20m",
+		"--job-timeout", "45m",
+		"--capability", "implement",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	runner := &agentStartRunner{}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	output, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
+		RepoFlag:         "owner/repo",
+		Agent:            "builder",
+		Action:           "implement",
+		Instructions:     "Implement task 1.",
+		Type:             "builder",
+		Home:             home,
+		AllowManagedSync: true,
+	})
+	if err != nil {
+		t.Fatalf("dispatchLocalAgentJob returned error: %v", err)
+	}
+
+	if output.State != string(workflow.JobBlocked) || output.Action != "implement" || output.Agent != "builder" {
+		t.Fatalf("dispatch output = %+v", output)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("runtime was started before read-only block: %+v", runner.calls)
+	}
+	events, err := store.ListJobEvents(context.Background(), output.JobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !daemonWorkerHasEvent(events, "permission_blocked") {
+		t.Fatalf("events = %+v, want permission_blocked", events)
+	}
+}
+
 func TestEnsureManagedAgentInstanceKeepsNewInstanceReservedUntilRelease(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()
@@ -868,7 +1053,7 @@ func TestEnsureManagedAgentInstanceKeepsNewInstanceReservedUntilRelease(t *testi
 	if instance.State != "starting" || instance.RuntimeRef != "550e8400-e29b-41d4-a716-446655440333" {
 		t.Fatalf("instance before release = %+v", instance)
 	}
-	reusable, ok, err := store.FindReusableAgentInstance(context.Background(), "planner", "owner/repo", time.Now().UTC())
+	reusable, ok, err := store.FindReusableAgentInstance(context.Background(), "planner", "owner/repo", "auto", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("FindReusableAgentInstance returned error: %v", err)
 	}
