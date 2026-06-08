@@ -191,7 +191,9 @@ func (a CodexAdapter) Start(ctx context.Context, request StartRequest) (StartRes
 	if err := validateStartRequest(request.Agent, a.Name(), request.Prompt); err != nil {
 		return StartResult{}, err
 	}
-	result, err := a.runner().Run(ctx, a.Dir, "codex", "exec", "--json", "--", request.Prompt)
+	args := append([]string{"exec"}, codexSandboxArgs(request.Agent)...)
+	args = append(args, "--json", "--", request.Prompt)
+	result, err := a.runner().Run(ctx, a.Dir, "codex", args...)
 	if err != nil {
 		return StartResult{Raw: result.Stdout + result.Stderr}, commandError(result, err)
 	}
@@ -213,7 +215,8 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 	if err := a.verifySession(ctx, agent); err != nil {
 		return Result{}, err
 	}
-	args := []string{"exec", "resume"}
+	args := append([]string{"exec"}, codexSandboxArgs(agent)...)
+	args = append(args, "resume")
 	if agent.RuntimeRef == "last" {
 		args = append(args, "--last")
 	} else {
@@ -267,6 +270,19 @@ func (a CodexAdapter) sessionResolver() CodexSessionResolver {
 	return CodexSessionIndex{}
 }
 
+func codexSandboxArgs(agent Agent) []string {
+	switch NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
+	case AutonomyPolicyReadOnly:
+		return []string{"--sandbox", "read-only"}
+	case AutonomyPolicyWorkspaceWrite:
+		return []string{"--sandbox", "workspace-write"}
+	case AutonomyPolicyDangerFullAccess:
+		return []string{"--sandbox", "danger-full-access"}
+	default:
+		return nil
+	}
+}
+
 type ClaudeAdapter struct {
 	Runner        subprocess.Runner
 	Dir           string
@@ -283,7 +299,7 @@ func (a ClaudeAdapter) Start(ctx context.Context, request StartRequest) (StartRe
 	if err != nil {
 		return StartResult{}, err
 	}
-	args := []string{"--session-id", runtimeRef, "-p", "--output-format", "json", "--", request.Prompt}
+	args := append(claudePermissionArgs(request.Agent), "--session-id", runtimeRef, "-p", "--output-format", "json", "--", request.Prompt)
 	result, err := a.runner().Run(ctx, a.Dir, "claude", args...)
 	if err != nil {
 		return StartResult{Raw: result.Stdout + result.Stderr}, commandError(result, err)
@@ -445,7 +461,7 @@ func newUUID() (string, error) {
 }
 
 func claudeArgs(agent Agent, prompt string, jsonOutput bool) []string {
-	args := []string{}
+	args := claudePermissionArgs(agent)
 	if agent.RuntimeRef == "last" {
 		args = append(args, "--continue")
 	} else {
@@ -456,6 +472,19 @@ func claudeArgs(agent Agent, prompt string, jsonOutput bool) []string {
 		args = append(args, "--output-format", "json")
 	}
 	return append(args, "--", prompt)
+}
+
+func claudePermissionArgs(agent Agent) []string {
+	switch NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
+	case AutonomyPolicyReadOnly:
+		return []string{"--permission-mode", "plan"}
+	case AutonomyPolicyWorkspaceWrite:
+		return []string{"--permission-mode", "acceptEdits"}
+	case AutonomyPolicyDangerFullAccess:
+		return []string{"--permission-mode", "bypassPermissions"}
+	default:
+		return nil
+	}
 }
 
 func isClaudeJSONUnsupported(result subprocess.Result) bool {

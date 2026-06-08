@@ -96,6 +96,29 @@ func TestCodexStartCommandParsesThreadID(t *testing.T) {
 	runner.want(t, 0, "codex", "exec", "--json", "--", "initialize")
 }
 
+func TestCodexStartCommandAppliesAutonomyPolicy(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		policy  string
+		sandbox string
+	}{
+		{name: "read_only", policy: AutonomyPolicyReadOnly, sandbox: "read-only"},
+		{name: "workspace_write", policy: AutonomyPolicyWorkspaceWrite, sandbox: "workspace-write"},
+		{name: "danger_full_access", policy: AutonomyPolicyDangerFullAccess, sandbox: "danger-full-access"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &fakeRunner{results: []subprocess.Result{{Stdout: "not json\n" + `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440009"}` + "\n"}}}
+			adapter := CodexAdapter{Runner: runner}
+			agent := Agent{Name: "lead", Role: "implementer", Runtime: CodexRuntime, RepoScope: "jerryfane/gitmoot", AutonomyPolicy: tt.policy}
+
+			if _, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "initialize"}); err != nil {
+				t.Fatalf("Start returned error: %v", err)
+			}
+			runner.want(t, 0, "codex", "exec", "--sandbox", tt.sandbox, "--json", "--", "initialize")
+		})
+	}
+}
+
 func TestCodexStartRejectsMissingThreadID(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"type":"turn.completed"}` + "\n"}}}
 	adapter := CodexAdapter{Runner: runner}
@@ -116,6 +139,29 @@ func TestCodexDeliverLastSessionCommand(t *testing.T) {
 		t.Fatalf("Deliver returned error: %v", err)
 	}
 	runner.want(t, 0, "codex", "exec", "resume", "--last", "--", "continue")
+}
+
+func TestCodexDeliverCommandAppliesAutonomyPolicy(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		policy  string
+		sandbox string
+	}{
+		{name: "read_only", policy: AutonomyPolicyReadOnly, sandbox: "read-only"},
+		{name: "workspace_write", policy: AutonomyPolicyWorkspaceWrite, sandbox: "workspace-write"},
+		{name: "danger_full_access", policy: AutonomyPolicyDangerFullAccess, sandbox: "danger-full-access"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &fakeRunner{results: []subprocess.Result{{Stdout: "done"}}}
+			adapter := CodexAdapter{Runner: runner, SessionResolver: staticCodexSessions{exists: true}}
+			agent := Agent{Name: "lead", Role: "implementer", Runtime: CodexRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440001", RepoScope: "jerryfane/gitmoot", AutonomyPolicy: tt.policy}
+
+			if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err != nil {
+				t.Fatalf("Deliver returned error: %v", err)
+			}
+			runner.want(t, 0, "codex", "exec", "--sandbox", tt.sandbox, "resume", "550e8400-e29b-41d4-a716-446655440001", "--", "review")
+		})
+	}
 }
 
 func TestCodexDeliverVerifiesNamedSession(t *testing.T) {
@@ -213,6 +259,34 @@ func TestClaudeStartCommandUsesGeneratedSessionID(t *testing.T) {
 	runner.want(t, 0, "claude", "--session-id", "550e8400-e29b-41d4-a716-446655440010", "-p", "--output-format", "json", "--", "initialize")
 }
 
+func TestClaudeStartCommandAppliesAutonomyPolicy(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		policy string
+		mode   string
+	}{
+		{name: "read_only", policy: AutonomyPolicyReadOnly, mode: "plan"},
+		{name: "workspace_write", policy: AutonomyPolicyWorkspaceWrite, mode: "acceptEdits"},
+		{name: "danger_full_access", policy: AutonomyPolicyDangerFullAccess, mode: "bypassPermissions"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"result":"ready"}`}}}
+			adapter := ClaudeAdapter{
+				Runner: runner,
+				NewRuntimeRef: func() (string, error) {
+					return "550e8400-e29b-41d4-a716-446655440010", nil
+				},
+			}
+			agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime, RepoScope: "jerryfane/gitmoot", AutonomyPolicy: tt.policy}
+
+			if _, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "initialize"}); err != nil {
+				t.Fatalf("Start returned error: %v", err)
+			}
+			runner.want(t, 0, "claude", "--permission-mode", tt.mode, "--session-id", "550e8400-e29b-41d4-a716-446655440010", "-p", "--output-format", "json", "--", "initialize")
+		})
+	}
+}
+
 func TestClaudeStartDoesNotStoreSessionIDWhenCommandFails(t *testing.T) {
 	runner := &fakeRunner{
 		results: []subprocess.Result{{Stderr: "failed"}},
@@ -241,6 +315,29 @@ func TestClaudeDeliverLastSessionCommand(t *testing.T) {
 		t.Fatalf("Deliver returned error: %v", err)
 	}
 	runner.want(t, 0, "claude", "--continue", "-p", "--output-format", "json", "--", "review")
+}
+
+func TestClaudeDeliverCommandAppliesAutonomyPolicy(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		policy string
+		mode   string
+	}{
+		{name: "read_only", policy: AutonomyPolicyReadOnly, mode: "plan"},
+		{name: "workspace_write", policy: AutonomyPolicyWorkspaceWrite, mode: "acceptEdits"},
+		{name: "danger_full_access", policy: AutonomyPolicyDangerFullAccess, mode: "bypassPermissions"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"result":"done"}`}}}
+			adapter := ClaudeAdapter{Runner: runner}
+			agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "jerryfane/gitmoot", AutonomyPolicy: tt.policy}
+
+			if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err != nil {
+				t.Fatalf("Deliver returned error: %v", err)
+			}
+			runner.want(t, 0, "claude", "--permission-mode", tt.mode, "--resume", "550e8400-e29b-41d4-a716-446655440002", "-p", "--output-format", "json", "--", "review")
+		})
+	}
 }
 
 func TestClaudeDeliverFallsBackToText(t *testing.T) {
