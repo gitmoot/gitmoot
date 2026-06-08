@@ -310,6 +310,14 @@ func textPreviewFromJSON(value any) string {
 	case string:
 		return strings.TrimSpace(typed)
 	case map[string]any:
+		if worthReply, ok := typed["worth_reply"].(bool); ok && !worthReply {
+			for _, key := range []string{"reason", "skip_reason", "rationale", "summary"} {
+				if text, ok := typed[key].(string); ok && strings.TrimSpace(text) != "" {
+					return "skip: " + strings.TrimSpace(text)
+				}
+			}
+			return "skip"
+		}
 		for _, key := range []string{"reply", "tweet", "text", "post", "content", "message", "summary", "original_post", "original", "source_text", "input"} {
 			if text, ok := typed[key].(string); ok && strings.TrimSpace(text) != "" {
 				return strings.TrimSpace(text)

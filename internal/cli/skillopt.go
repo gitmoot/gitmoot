@@ -2464,34 +2464,7 @@ func skillOptTrainCandidateReviewBody(ctx context.Context, store *db.Store, sess
 	if len(publishedPreviews) == 0 {
 		builder.WriteString("- Preview: no selected candidate sample artifact was available to publish.\n")
 	} else {
-		for _, preview := range publishedPreviews {
-			label := firstNonEmpty(strings.TrimSpace(preview.Label), "Selection sample")
-			if strings.TrimSpace(preview.Error) != "" {
-				fmt.Fprintf(&builder, "- %s: publish failed for `%s`: `%s`\n", label, preview.ArtifactID, truncateForMetadata(preview.Error))
-				continue
-			}
-			if strings.TrimSpace(preview.Content) != "" {
-				fmt.Fprintf(&builder, "- %s: inline preview from `%s`\n", label, preview.ArtifactID)
-				writeSkillOptMarkdownFence(&builder, preview.Content)
-			} else if strings.TrimSpace(preview.URL) != "" {
-				fmt.Fprintf(&builder, "- %s: [%s](%s)\n", label, preview.URL, preview.URL)
-			} else {
-				fmt.Fprintf(&builder, "- %s: `%s`\n", label, preview.ArtifactID)
-			}
-			if strings.TrimSpace(preview.ArtifactID) != "" {
-				fmt.Fprintf(&builder, "  - Evaluated artifact: `%s`\n", preview.ArtifactID)
-			}
-			if strings.TrimSpace(preview.Renderer) != "" {
-				fmt.Fprintf(&builder, "  - Renderer: `%s`\n", preview.Renderer)
-			}
-			if strings.TrimSpace(preview.Status) != "" {
-				statusText := preview.Status
-				if strings.TrimSpace(preview.StatusReason) != "" {
-					statusText += ": " + preview.StatusReason
-				}
-				fmt.Fprintf(&builder, "  - Pages status: `%s`\n", truncateForMetadata(statusText))
-			}
-		}
+		writeSkillOptCandidateSamplePreviewTable(&builder, publishedPreviews)
 	}
 	skillOptWriteCandidateReviewFinalEval(&builder, review)
 	if len(filePublishWarnings) > 0 {
@@ -2517,6 +2490,50 @@ func skillOptTrainCandidateReviewBody(ctx context.Context, store *db.Store, sess
 	fmt.Fprintf(&builder, "- Wait: take no action; `%s` will keep reporting that a candidate decision is required.\n", skillOptTrainStatusCommand(usesCustomHome, session.ID))
 	fmt.Fprintf(&builder, "- Keep improving: reject with an actionable reason, then run `%s` after the rejection completes.\n", skillOptTrainStartNextCommand(usesCustomHome, session.ID))
 	return builder.String(), nil
+}
+
+func writeSkillOptCandidateSamplePreviewTable(builder *strings.Builder, previews []skillOptTrainCandidateReviewPreview) {
+	builder.WriteString("| Sample | Preview | Artifact | Renderer | Status |\n")
+	builder.WriteString("| --- | --- | --- | --- | --- |\n")
+	for _, preview := range previews {
+		label := firstNonEmpty(strings.TrimSpace(preview.Label), "Selection sample")
+		fmt.Fprintf(
+			builder,
+			"| %s | %s | %s | %s | %s |\n",
+			skillOptMarkdownTableCell(label),
+			skillOptCandidateSamplePreviewCell(preview),
+			skillOptMarkdownTableCell(skillOptMarkdownInlineCode(preview.ArtifactID)),
+			skillOptMarkdownTableCell(skillOptMarkdownInlineCode(preview.Renderer)),
+			skillOptCandidateSamplePreviewStatusCell(preview),
+		)
+	}
+}
+
+func skillOptCandidateSamplePreviewCell(preview skillOptTrainCandidateReviewPreview) string {
+	if strings.TrimSpace(preview.Error) != "" {
+		return skillOptMarkdownTableCell(skillOptMarkdownInlineCode("publish failed"))
+	}
+	if strings.TrimSpace(preview.Content) != "" {
+		return skillOptMarkdownTableCell(skillOptMarkdownInlineCode(preview.Content))
+	}
+	if strings.TrimSpace(preview.URL) != "" {
+		return skillOptMarkdownTableCell(fmt.Sprintf("[open](%s)", strings.TrimSpace(preview.URL)))
+	}
+	return skillOptMarkdownTableCell(skillOptMarkdownInlineCode(preview.ArtifactID))
+}
+
+func skillOptCandidateSamplePreviewStatusCell(preview skillOptTrainCandidateReviewPreview) string {
+	if strings.TrimSpace(preview.Error) != "" {
+		return skillOptMarkdownTableCell(skillOptMarkdownInlineCode("publish failed: " + truncateForMetadata(preview.Error)))
+	}
+	statusText := strings.TrimSpace(preview.Status)
+	if statusText == "" {
+		return "-"
+	}
+	if strings.TrimSpace(preview.StatusReason) != "" {
+		statusText += ": " + strings.TrimSpace(preview.StatusReason)
+	}
+	return skillOptMarkdownTableCell(skillOptMarkdownInlineCode(truncateForMetadata(statusText)))
 }
 
 func skillOptWriteCandidateReviewScores(builder *strings.Builder, review db.AgentTemplateCandidateReview) {
@@ -4775,6 +4792,24 @@ func previewBundleInlineFallback(bundle skillopt.PreviewBundle) string {
 		builder.WriteString("\n")
 	}
 	return builder.String()
+}
+
+func skillOptMarkdownInlineCode(value string) string {
+	value = strings.ReplaceAll(strings.TrimSpace(value), "\n", " ")
+	value = strings.ReplaceAll(value, "`", "'")
+	if value == "" {
+		return "-"
+	}
+	return "`" + value + "`"
+}
+
+func skillOptMarkdownTableCell(value string) string {
+	value = strings.ReplaceAll(strings.TrimSpace(value), "\n", " ")
+	value = strings.ReplaceAll(value, "|", "\\|")
+	if value == "" {
+		return "-"
+	}
+	return value
 }
 
 func writeSkillOptMarkdownFence(builder *strings.Builder, content string) {
