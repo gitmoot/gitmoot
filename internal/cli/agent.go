@@ -598,7 +598,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		RepoScope:      repo.FullName(),
 		TemplateID:     strings.TrimSpace(*templateID),
 		Capabilities:   resolvedCapabilities,
-		AutonomyPolicy: *policy,
+		AutonomyPolicy: strings.TrimSpace(*policy),
 		HealthStatus:   "unknown",
 	}
 	if err := runtime.ValidateStartRequest(runtime.StartRequest{Agent: agent, Prompt: "preflight"}); err != nil {
@@ -749,7 +749,7 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 		RepoScope:      repoScope,
 		TemplateID:     strings.TrimSpace(*templateID),
 		Capabilities:   resolvedCapabilities,
-		AutonomyPolicy: *policy,
+		AutonomyPolicy: strings.TrimSpace(*policy),
 		HealthStatus:   "unknown",
 	}
 	if err := runtime.ValidateAgent(agent); err != nil {
@@ -1194,6 +1194,7 @@ func withStoreAndPaths(home string, fn func(config.Paths, *db.Store) error) erro
 }
 
 func dbAgent(agent runtime.Agent) db.Agent {
+	policy := runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy)
 	return db.Agent{
 		Name:           agent.Name,
 		Role:           agent.Role,
@@ -1202,12 +1203,13 @@ func dbAgent(agent runtime.Agent) db.Agent {
 		RepoScope:      agent.RepoScope,
 		TemplateID:     agent.TemplateID,
 		Capabilities:   agent.Capabilities,
-		AutonomyPolicy: agent.AutonomyPolicy,
+		AutonomyPolicy: policy,
 		HealthStatus:   agent.HealthStatus,
 	}
 }
 
 func runtimeAgent(agent db.Agent) runtime.Agent {
+	policy := runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy)
 	return runtime.Agent{
 		Name:           agent.Name,
 		Role:           agent.Role,
@@ -1216,7 +1218,7 @@ func runtimeAgent(agent db.Agent) runtime.Agent {
 		RepoScope:      agent.RepoScope,
 		TemplateID:     agent.TemplateID,
 		Capabilities:   agent.Capabilities,
-		AutonomyPolicy: agent.AutonomyPolicy,
+		AutonomyPolicy: policy,
 		HealthStatus:   agent.HealthStatus,
 	}
 }

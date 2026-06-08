@@ -17,6 +17,17 @@ func TestValidateAgent(t *testing.T) {
 	if err := ValidateAgent(agent); err != nil {
 		t.Fatalf("ValidateAgent returned error: %v", err)
 	}
+	for _, policy := range []string{AutonomyPolicyAuto, AutonomyPolicyReadOnly, AutonomyPolicyWorkspaceWrite, AutonomyPolicyDangerFullAccess} {
+		agent.AutonomyPolicy = policy
+		if err := ValidateAgent(agent); err != nil {
+			t.Fatalf("ValidateAgent rejected policy %q: %v", policy, err)
+		}
+	}
+	agent.AutonomyPolicy = "manual"
+	if err := ValidateAgent(agent); err == nil {
+		t.Fatal("ValidateAgent accepted unsupported autonomy policy")
+	}
+	agent.AutonomyPolicy = ""
 	agent.RepoScope = ""
 	if err := ValidateAgent(agent); err != nil {
 		t.Fatalf("ValidateAgent rejected global agent without repo scope: %v", err)

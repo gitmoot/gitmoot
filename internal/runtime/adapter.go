@@ -22,6 +22,11 @@ const (
 	LastRef       = "last"
 
 	healthPrompt = "Gitmoot health check. Reply OK only."
+
+	AutonomyPolicyAuto             = "auto"
+	AutonomyPolicyReadOnly         = "read-only"
+	AutonomyPolicyWorkspaceWrite   = "workspace-write"
+	AutonomyPolicyDangerFullAccess = "danger-full-access"
 )
 
 type Agent struct {
@@ -119,6 +124,9 @@ func validateStartRequest(agent Agent, runtimeName string, prompt string) error 
 }
 
 func validateAgentFields(agent Agent, requireRuntimeRef bool) error {
+	if _, err := NormalizeAutonomyPolicy(agent.AutonomyPolicy); err != nil {
+		return err
+	}
 	switch {
 	case strings.TrimSpace(agent.Name) == "":
 		return errors.New("agent name is required")
@@ -137,6 +145,29 @@ func validateAgentFields(agent Agent, requireRuntimeRef bool) error {
 		return err
 	}
 	return nil
+}
+
+func NormalizeAutonomyPolicy(policy string) (string, error) {
+	switch strings.TrimSpace(policy) {
+	case "", AutonomyPolicyAuto:
+		return AutonomyPolicyAuto, nil
+	case AutonomyPolicyReadOnly:
+		return AutonomyPolicyReadOnly, nil
+	case AutonomyPolicyWorkspaceWrite:
+		return AutonomyPolicyWorkspaceWrite, nil
+	case AutonomyPolicyDangerFullAccess:
+		return AutonomyPolicyDangerFullAccess, nil
+	default:
+		return "", fmt.Errorf("autonomy policy %q is not supported; use auto, read-only, workspace-write, or danger-full-access", strings.TrimSpace(policy))
+	}
+}
+
+func NormalizeStoredAutonomyPolicy(policy string) string {
+	normalized, err := NormalizeAutonomyPolicy(policy)
+	if err != nil {
+		return AutonomyPolicyAuto
+	}
+	return normalized
 }
 
 type CodexSessionResolver interface {

@@ -94,6 +94,53 @@ func TestRunAgentSubscribeListRemove(t *testing.T) {
 	}
 }
 
+func TestRunAgentSubscribeValidatesAutonomyPolicy(t *testing.T) {
+	home := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	code := Run([]string{
+		"agent", "subscribe", "audit",
+		"--home", home,
+		"--runtime", "codex",
+		"--session", "550e8400-e29b-41d4-a716-446655440001",
+		"--role", "reviewer",
+		"--repo", "jerryfane/gitmoot",
+		"--capability", "review",
+		"--policy", "workspace-write",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("subscribe exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	agent, err := store.GetAgent(context.Background(), "audit")
+	if err != nil {
+		t.Fatalf("GetAgent returned error: %v", err)
+	}
+	if agent.AutonomyPolicy != runtime.AutonomyPolicyWorkspaceWrite {
+		t.Fatalf("autonomy policy = %q", agent.AutonomyPolicy)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"agent", "subscribe", "badpolicy",
+		"--home", home,
+		"--runtime", "codex",
+		"--session", "550e8400-e29b-41d4-a716-446655440002",
+		"--role", "reviewer",
+		"--repo", "jerryfane/gitmoot",
+		"--policy", "manual",
+	}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("invalid policy exit code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "autonomy policy") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
 func TestRunAgentAccessCommands(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer
