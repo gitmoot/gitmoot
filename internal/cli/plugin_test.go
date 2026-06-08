@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/jerryfane/gitmoot/internal/pluginpack"
+	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
 func TestRunPluginPathPrintsPackagePath(t *testing.T) {
@@ -144,6 +145,71 @@ func TestRunPluginDoctorJSON(t *testing.T) {
 	assertDoctorCheck(t, output.Runtimes[0].Checks, "validation-command", "warn")
 }
 
+func TestRunPluginDoctorClaudeReportsMaskedAuthEnv(t *testing.T) {
+	withClaudeAuthEnv(t, map[string]string{runtime.ClaudeOAuthTokenEnv: "secret-token"})
+	home := t.TempDir()
+	if _, err := pluginpack.Build(pluginpack.BuildOptions{
+		Provider: pluginpack.ProviderClaude,
+		Home:     filepath.Join(home, ".gitmoot"),
+	}); err != nil {
+		t.Fatalf("build claude package: %v", err)
+	}
+	restore := stubPluginLookPath(map[string]string{"claude": "/tmp/bin/claude"})
+	defer restore()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"plugin", "doctor", "claude", "--home", home, "--json"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("plugin doctor exit code = %d, stderr=%s\nstdout=%s", code, stderr.String(), stdout.String())
+	}
+	var output pluginDoctorOutput
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+		t.Fatalf("doctor JSON did not parse: %v\n%s", err, stdout.String())
+	}
+	if len(output.Runtimes) != 1 || output.Runtimes[0].Runtime != "claude" {
+		t.Fatalf("unexpected runtimes: %+v", output.Runtimes)
+	}
+	check := findDoctorCheck(t, output.Runtimes[0].Checks, "runtime-auth-env")
+	if check.Status != "ok" {
+		t.Fatalf("runtime-auth-env status = %q, want ok; checks=%+v", check.Status, output.Runtimes[0].Checks)
+	}
+	if !strings.Contains(check.Detail, runtime.ClaudeOAuthTokenEnv+"=set") || strings.Contains(check.Detail, "secret-token") {
+		t.Fatalf("runtime-auth-env detail = %q", check.Detail)
+	}
+}
+
+func TestRunPluginDoctorClaudeWarnsWhenAuthEnvMissing(t *testing.T) {
+	withClaudeAuthEnv(t, nil)
+	home := t.TempDir()
+	if _, err := pluginpack.Build(pluginpack.BuildOptions{
+		Provider: pluginpack.ProviderClaude,
+		Home:     filepath.Join(home, ".gitmoot"),
+	}); err != nil {
+		t.Fatalf("build claude package: %v", err)
+	}
+	restore := stubPluginLookPath(map[string]string{"claude": "/tmp/bin/claude"})
+	defer restore()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"plugin", "doctor", "claude", "--home", home, "--json"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("plugin doctor exit code = %d, stderr=%s\nstdout=%s", code, stderr.String(), stdout.String())
+	}
+	var output pluginDoctorOutput
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+		t.Fatalf("doctor JSON did not parse: %v\n%s", err, stdout.String())
+	}
+	check := findDoctorCheck(t, output.Runtimes[0].Checks, "runtime-auth-env")
+	if check.Status != "warn" {
+		t.Fatalf("runtime-auth-env status = %q, want warn; checks=%+v", check.Status, output.Runtimes[0].Checks)
+	}
+	if !strings.Contains(check.Detail, "claude setup-token") {
+		t.Fatalf("runtime-auth-env detail = %q, want setup-token guidance", check.Detail)
+	}
+}
+
 func TestRunPluginDoctorFailsExplicitUnhealthyRuntime(t *testing.T) {
 	restore := stubPluginLookPath(map[string]string{})
 	defer restore()
@@ -203,13 +269,19 @@ func stubPluginLookPath(paths map[string]string) func() {
 
 func assertDoctorCheck(t *testing.T, checks []pluginCheck, name string, status string) {
 	t.Helper()
+	check := findDoctorCheck(t, checks, name)
+	if check.Status != status {
+		t.Fatalf("%s status = %q, want %q; checks=%+v", name, check.Status, status, checks)
+	}
+}
+
+func findDoctorCheck(t *testing.T, checks []pluginCheck, name string) pluginCheck {
+	t.Helper()
 	for _, check := range checks {
 		if check.Name == name {
-			if check.Status != status {
-				t.Fatalf("%s status = %q, want %q; checks=%+v", name, check.Status, status, checks)
-			}
-			return
+			return check
 		}
 	}
 	t.Fatalf("missing check %q in %+v", name, checks)
+	return pluginCheck{}
 }

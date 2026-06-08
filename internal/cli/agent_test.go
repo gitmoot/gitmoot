@@ -2102,6 +2102,75 @@ func TestRunAgentDoctorPersistsHealth(t *testing.T) {
 	}
 }
 
+func TestRunAgentDoctorClaudeReportsMaskedAuthEnv(t *testing.T) {
+	withClaudeAuthEnv(t, map[string]string{runtime.ClaudeOAuthTokenEnv: "secret-token"})
+	home := t.TempDir()
+	subscribeClaudeAgent(t, home, "claude-ok")
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"agent", "doctor", "claude-ok", "--home", home}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("doctor exit code = %d, stderr=%s\nstdout=%s", code, stderr.String(), stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "claude-auth-env ok") {
+		t.Fatalf("stdout missing claude auth status:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), runtime.ClaudeOAuthTokenEnv+"=set") || strings.Contains(stdout.String(), "secret-token") {
+		t.Fatalf("stdout leaked or missed masked auth detail:\n%s", stdout.String())
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	agent, err := store.GetAgent(context.Background(), "claude-ok")
+	if err != nil {
+		t.Fatalf("GetAgent returned error: %v", err)
+	}
+	if agent.HealthStatus != "ok" {
+		t.Fatalf("health status = %q, want ok", agent.HealthStatus)
+	}
+}
+
+func TestRunAgentDoctorClaudeFailsWhenAuthEnvMissing(t *testing.T) {
+	withClaudeAuthEnv(t, nil)
+	home := t.TempDir()
+	subscribeClaudeAgent(t, home, "claude-missing")
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"agent", "doctor", "claude-missing", "--home", home}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("doctor exit code = %d, want 1; stderr=%s\nstdout=%s", code, stderr.String(), stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "claude-auth-env warn") || !strings.Contains(stderr.String(), "claude setup-token") {
+		t.Fatalf("doctor output missing setup guidance:\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	agent, err := store.GetAgent(context.Background(), "claude-missing")
+	if err != nil {
+		t.Fatalf("GetAgent returned error: %v", err)
+	}
+	if agent.HealthStatus != "failed" {
+		t.Fatalf("health status = %q, want failed", agent.HealthStatus)
+	}
+}
+
+func subscribeClaudeAgent(t *testing.T, home string, name string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "subscribe", name,
+		"--home", home,
+		"--runtime", "claude",
+		"--session", "550e8400-e29b-41d4-a716-446655440099",
+		"--role", "reviewer",
+		"--repo", "jerryfane/gitmoot",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("subscribe exit code = %d, stderr=%s", code, stderr.String())
+	}
+}
+
 func seedThermoTemplate(t *testing.T, home string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
@@ -2258,4 +2327,38 @@ func (r *agentStartRunner) want(t *testing.T, index int, dir string, command str
 	if len(call.args) < len(wantPrefix) || !reflect.DeepEqual(call.args[:len(wantPrefix)], wantPrefix) {
 		t.Fatalf("call %d args = %s\nwant prefix %s", index, strings.Join(call.args, " "), strings.Join(wantPrefix, " "))
 	}
+}
+
+func withClaudeAuthEnv(t *testing.T, values map[string]string) {
+	t.Helper()
+	names := []string{
+		runtime.ClaudeOAuthTokenEnv,
+		runtime.AnthropicAPIKeyEnv,
+		runtime.AnthropicAuthTokenEnv,
+	}
+	previous := make(map[string]string, len(names))
+	present := make(map[string]bool, len(names))
+	for _, name := range names {
+		if value, ok := os.LookupEnv(name); ok {
+			previous[name] = value
+			present[name] = true
+		}
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatalf("unset %s: %v", name, err)
+		}
+	}
+	for name, value := range values {
+		if err := os.Setenv(name, value); err != nil {
+			t.Fatalf("set %s: %v", name, err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, name := range names {
+			if present[name] {
+				_ = os.Setenv(name, previous[name])
+			} else {
+				_ = os.Unsetenv(name)
+			}
+		}
+	})
 }

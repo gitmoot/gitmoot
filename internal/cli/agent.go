@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -1244,6 +1245,31 @@ func runAgentDoctor(args []string, stdout, stderr io.Writer) int {
 		_ = persistAgentHealth(*home, name, "failed")
 		fmt.Fprintf(stderr, "invalid agent: %v\n", err)
 		return 1
+	}
+	if rtAgent.Runtime == runtime.ClaudeRuntime {
+		auth := runtime.InspectClaudeAuthEnv(os.LookupEnv)
+		status := "ok"
+		if !auth.Ready() {
+			status = "warn"
+		} else if auth.Warning() != "" {
+			status = "warn"
+		}
+		detail := auth.MaskedDetail()
+		if warning := auth.Warning(); warning != "" {
+			detail += "; " + warning
+		}
+		fmt.Fprintf(stdout, "claude-auth-env %s %s\n", status, detail)
+		if !auth.Ready() {
+			_ = persistAgentHealth(*home, name, "failed")
+			fmt.Fprintf(stderr, "agent %s health failed: %s\n", rtAgent.Name, runtime.ClaudeAuthSetupMessage)
+			return 1
+		}
+		if err := persistAgentHealth(*home, name, "ok"); err != nil {
+			fmt.Fprintf(stderr, "update agent health: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "agent %s ok\n", rtAgent.Name)
+		return 0
 	}
 	if err := adapter.Health(context.Background(), rtAgent); err != nil {
 		_ = persistAgentHealth(*home, name, "failed")

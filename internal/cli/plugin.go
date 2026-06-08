@@ -16,6 +16,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/buildinfo"
 	"github.com/jerryfane/gitmoot/internal/plugininstall"
 	"github.com/jerryfane/gitmoot/internal/pluginpack"
+	"github.com/jerryfane/gitmoot/internal/runtime"
 	"github.com/jerryfane/gitmoot/internal/subprocess"
 	"github.com/jerryfane/gitmoot/skills"
 )
@@ -331,6 +332,9 @@ func doctorRuntime(home string, provider pluginpack.Provider, explicitRuntime bo
 	runtime.Checks = append(runtime.Checks, checkCopiedSkill(packagePath))
 	runtime.Checks = append(runtime.Checks, checkMarketplacePath(home, provider))
 	runtime.Checks = append(runtime.Checks, checkRuntimeCLI(provider, explicitRuntime))
+	if provider == pluginpack.ProviderClaude {
+		runtime.Checks = append(runtime.Checks, checkClaudeAuthEnv())
+	}
 	runtime.Checks = append(runtime.Checks, checkValidationCommand(provider, explicitRuntime))
 	runtime.Healthy = runtimeChecksHealthy(runtime.Checks)
 	return runtime
@@ -405,6 +409,18 @@ func checkRuntimeCLI(provider pluginpack.Provider, explicitRuntime bool) pluginC
 		return warnCheck("runtime-cli", binary+" was not found on PATH", false)
 	}
 	return okCheck("runtime-cli", path, true)
+}
+
+func checkClaudeAuthEnv() pluginCheck {
+	auth := runtime.InspectClaudeAuthEnv(os.LookupEnv)
+	detail := auth.MaskedDetail()
+	if warning := auth.Warning(); warning != "" {
+		detail += "; " + warning
+	}
+	if auth.Ready() && auth.Warning() == "" {
+		return okCheck("runtime-auth-env", detail, false)
+	}
+	return warnCheck("runtime-auth-env", detail, false)
 }
 
 func checkValidationCommand(provider pluginpack.Provider, explicitRuntime bool) pluginCheck {

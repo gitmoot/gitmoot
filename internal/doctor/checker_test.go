@@ -3,9 +3,11 @@ package doctor
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/jerryfane/gitmoot/internal/runtime"
 	"github.com/jerryfane/gitmoot/internal/subprocess"
 )
 
@@ -29,6 +31,7 @@ func (f fakeRunner) Run(ctx context.Context, dir string, command string, args ..
 }
 
 func TestCheckerRun(t *testing.T) {
+	withClaudeAuthEnv(t, map[string]string{runtime.ClaudeOAuthTokenEnv: "secret-token"})
 	runner := fakeRunner{
 		paths: map[string]bool{"git": true, "gh": true, "codex": true},
 		runs: map[string]subprocess.Result{
@@ -46,6 +49,22 @@ func TestCheckerRun(t *testing.T) {
 	if err := FailedRequired(checks); err != nil {
 		t.Fatalf("FailedRequired returned error: %v\nchecks=%+v", err, checks)
 	}
+	foundClaudeAuth := false
+	for _, check := range checks {
+		if check.Name != "claude auth" {
+			continue
+		}
+		foundClaudeAuth = true
+		if !check.OK || check.Required {
+			t.Fatalf("claude auth check = %+v, want optional ok check", check)
+		}
+		if !strings.Contains(check.Detail, "CLAUDE_CODE_OAUTH_TOKEN=set") || strings.Contains(check.Detail, "secret-token") {
+			t.Fatalf("claude auth detail = %q", check.Detail)
+		}
+	}
+	if !foundClaudeAuth {
+		t.Fatalf("checks missing claude auth: %+v", checks)
+	}
 }
 
 func TestCheckerFailsOnMissingRequiredCommand(t *testing.T) {
@@ -53,6 +72,23 @@ func TestCheckerFailsOnMissingRequiredCommand(t *testing.T) {
 	if err := FailedRequired(checks); err == nil {
 		t.Fatal("FailedRequired returned nil, want error")
 	}
+}
+
+func TestCheckerWarnsWhenClaudeAuthEnvMissing(t *testing.T) {
+	withClaudeAuthEnv(t, nil)
+	checks := Checker{Runner: fakeRunner{paths: map[string]bool{}}}.Run(context.Background())
+	for _, check := range checks {
+		if check.Name == "claude auth" {
+			if check.OK || check.Required {
+				t.Fatalf("claude auth check = %+v, want optional warning", check)
+			}
+			if !strings.Contains(check.Detail, "claude setup-token") {
+				t.Fatalf("claude auth detail = %q, want setup-token guidance", check.Detail)
+			}
+			return
+		}
+	}
+	t.Fatalf("checks missing claude auth: %+v", checks)
 }
 
 func TestCheckerRunsGlobalChecksOutsideRepoDir(t *testing.T) {
@@ -102,4 +138,38 @@ func (r dirSensitiveRunner) Run(ctx context.Context, dir string, command string,
 		return subprocess.Result{}, fmt.Errorf("bad dir was used for %s", key)
 	}
 	return r.fakeRunner.Run(ctx, dir, command, args...)
+}
+
+func withClaudeAuthEnv(t *testing.T, values map[string]string) {
+	t.Helper()
+	names := []string{
+		runtime.ClaudeOAuthTokenEnv,
+		runtime.AnthropicAPIKeyEnv,
+		runtime.AnthropicAuthTokenEnv,
+	}
+	previous := make(map[string]string, len(names))
+	present := make(map[string]bool, len(names))
+	for _, name := range names {
+		if value, ok := os.LookupEnv(name); ok {
+			previous[name] = value
+			present[name] = true
+		}
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatalf("unset %s: %v", name, err)
+		}
+	}
+	for name, value := range values {
+		if err := os.Setenv(name, value); err != nil {
+			t.Fatalf("set %s: %v", name, err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, name := range names {
+			if present[name] {
+				_ = os.Setenv(name, previous[name])
+			} else {
+				_ = os.Unsetenv(name)
+			}
+		}
+	})
 }

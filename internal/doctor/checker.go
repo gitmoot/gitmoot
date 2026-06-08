@@ -3,9 +3,11 @@ package doctor
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	gitutil "github.com/jerryfane/gitmoot/internal/git"
+	"github.com/jerryfane/gitmoot/internal/runtime"
 	"github.com/jerryfane/gitmoot/internal/subprocess"
 )
 
@@ -32,6 +34,7 @@ func (c Checker) Run(ctx context.Context) []Check {
 		c.command(ctx, runner, "gh", true, "--version"),
 		c.command(ctx, runner, "codex", true, "--version"),
 		c.command(ctx, runner, "claude", false, "--help"),
+		c.claudeAuthEnv(),
 		c.ghAuth(ctx, runner),
 		c.repoRemote(ctx, runner),
 		c.baseBranch(ctx, runner),
@@ -86,6 +89,15 @@ func (c Checker) baseBranch(ctx context.Context, runner subprocess.Runner) Check
 		return Check{Name: "base branch", Required: true, Detail: "detached HEAD"}
 	}
 	return Check{Name: "base branch", OK: true, Required: true, Detail: branch}
+}
+
+func (c Checker) claudeAuthEnv() Check {
+	auth := runtime.InspectClaudeAuthEnv(os.LookupEnv)
+	detail := auth.MaskedDetail()
+	if warning := auth.Warning(); warning != "" {
+		detail += "; " + warning
+	}
+	return Check{Name: "claude auth", OK: auth.Ready(), Required: false, Detail: detail}
 }
 
 func FailedRequired(checks []Check) error {
