@@ -99,7 +99,7 @@ func TestClientWorktreeCommandConstruction(t *testing.T) {
 
 	runner.wantArgs(t, 0, "git", "worktree", "add", "-b", "task-1", "/worktrees/task-1", "main")
 	runner.wantArgs(t, 1, "git", "show-ref", "--verify", "--quiet", "refs/heads/task-1")
-	runner.wantArgs(t, 2, "git", "worktree", "add", "--force", "/worktrees/task-1-existing", "task-1")
+	runner.wantArgs(t, 2, "git", "worktree", "add", "/worktrees/task-1-existing", "task-1")
 	runner.wantArgs(t, 3, "git", "worktree", "remove", "/worktrees/task-1")
 }
 
@@ -206,6 +206,28 @@ func TestClientWorktreeCleanSmoke(t *testing.T) {
 	}
 	if clean {
 		t.Fatal("WorktreeClean did not report untracked file")
+	}
+}
+
+func TestClientAddExistingBranchWorktreeRefusesCheckedOutBranchSmoke(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	runGit(t, dir, "init", "-b", "main")
+	runGit(t, dir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, dir, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# smoke\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runGit(t, dir, "add", "README.md")
+	runGit(t, dir, "commit", "-m", "init")
+	runGit(t, dir, "switch", "-c", "task-branch")
+
+	client := Client{Dir: dir}
+	err := client.AddExistingBranchWorktree(context.Background(), "task-branch", filepath.Join(dir, "task-worktree"))
+	if err == nil {
+		t.Fatal("AddExistingBranchWorktree allowed a branch already checked out in the main worktree")
 	}
 }
 

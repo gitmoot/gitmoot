@@ -50,7 +50,7 @@ func (c Client) AddExistingBranchWorktree(ctx context.Context, branch string, pa
 	if err != nil {
 		return err
 	}
-	_, err = c.run(ctx, "worktree", "add", "--force", path, branch)
+	_, err = c.run(ctx, "worktree", "add", path, branch)
 	return err
 }
 
