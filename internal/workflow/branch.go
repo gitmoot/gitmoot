@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 )
@@ -21,6 +22,7 @@ type TaskBranchRequest struct {
 	Branch     string
 	BaseBranch string
 	Owner      string
+	Checkout   string
 }
 
 func (e Engine) StartTaskBranch(ctx context.Context, request TaskBranchRequest, brancher BranchCreator) (db.Task, error) {
@@ -40,6 +42,15 @@ func (e Engine) StartTaskBranch(ctx context.Context, request TaskBranchRequest, 
 	if err == nil && existing.ID != request.TaskID {
 		return db.Task{}, errors.New("task branch is already assigned to another task")
 	}
+	releaseCheckoutLock, _, err := acquireCheckoutMutationLock(ctx, e.Store, request.Checkout, "task:"+request.TaskID, time.Now().UTC())
+	if err != nil {
+		return db.Task{}, err
+	}
+	defer func() {
+		if releaseCheckoutLock != nil {
+			_ = releaseCheckoutLock(context.Background())
+		}
+	}()
 	lock := db.BranchLock{RepoFullName: request.Repo, Branch: request.Branch, Owner: request.Owner}
 	createdLock, err := e.Store.CreateLock(ctx, lock)
 	if err != nil {

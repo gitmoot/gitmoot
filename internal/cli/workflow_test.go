@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 )
@@ -401,6 +402,59 @@ func TestRunTaskRunRegistersCurrentRepo(t *testing.T) {
 	}
 	if repo.CheckoutPath != repoDir || repo.RemoteURL != "https://github.com/jerryfane/gitmoot.git" {
 		t.Fatalf("repo = %+v", repo)
+	}
+}
+
+func TestRunTaskRunBlocksWhenCheckoutMutationLocked(t *testing.T) {
+	home := t.TempDir()
+	goalPath := filepath.Join(t.TempDir(), "GOAL.md")
+	writeFile(t, goalPath, "# Build Gitmoot\n\n### Task 1: Bootstrap\n")
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"goal", "import", "--home", home, "--file", goalPath, "--repo", "jerryfane/gitmoot"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("goal import exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/jerryfane/gitmoot.git")
+	withWorkingDirectory(t, repoDir)
+
+	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	absoluteCheckout, err := filepath.Abs(repoDir)
+	if err != nil {
+		t.Fatalf("Abs returned error: %v", err)
+	}
+	if acquired, err := store.AcquireResourceLock(context.Background(), db.ResourceLock{
+		ResourceKey: "checkout-mutation:" + filepath.Clean(absoluteCheckout),
+		OwnerJobID:  "task:other",
+		OwnerToken:  "other-token",
+		ExpiresAt:   time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano),
+	}, time.Now().UTC()); err != nil || !acquired {
+		t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"task", "run", "task-001", "--home", home, "--repo", "jerryfane/gitmoot", "--owner", "lead"}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("task run exit code = %d, want 1; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "This checkout is already being mutated by another Gitmoot task") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	branches := runGitOutput(t, repoDir, "branch", "--list", "task-001")
+	if strings.TrimSpace(branches) != "" {
+		t.Fatalf("task branch was created despite checkout lock: %q", branches)
 	}
 }
 

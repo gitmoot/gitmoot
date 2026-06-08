@@ -324,6 +324,7 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 			Branch:     requestBranch,
 			BaseBranch: *base,
 			Owner:      *owner,
+			Checkout:   checkout,
 		}, gitutil.Client{Dir: checkout})
 		return err
 	}); err != nil {

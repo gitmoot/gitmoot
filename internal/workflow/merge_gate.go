@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/github"
@@ -40,6 +42,7 @@ type PolicyMergeGate struct {
 	GitHub       MergeGateGitHub
 	Git          MergeGateGit
 	NextTasks    NextTaskEnqueuer
+	CheckoutPath string
 	DeleteBranch bool
 	MergeMethod  string
 }
@@ -62,6 +65,19 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	headSHA := strings.TrimSpace(pr.HeadSHA)
 	if headSHA == "" {
 		return g.block(ctx, request, "", "pull request head SHA is missing")
+	}
+	releaseCheckoutLock, err := g.acquireLocalCheckoutMutationLock(ctx, request)
+	if err != nil {
+		var blocked BlockedError
+		if errors.As(err, &blocked) {
+			return g.block(ctx, request, headSHA, blocked.Reason)
+		}
+		return MergeDecision{}, err
+	}
+	if releaseCheckoutLock != nil {
+		defer func() {
+			_ = releaseCheckoutLock(context.Background())
+		}()
 	}
 	if pullRequestMerged(pr) {
 		return g.finishMerged(ctx, request, pr, strings.TrimSpace(pr.MergeSHA))
@@ -161,6 +177,17 @@ func (g PolicyMergeGate) finishMerged(ctx context.Context, request MergeRequest,
 		_ = g.Store.UpsertMergeGate(ctx, db.MergeGate{RepoFullName: request.Repo, PullRequest: int64(request.PullRequest), State: "merged", Reason: reason})
 	}
 	return MergeDecision{Ready: true, Merged: true, MergeCommitSHA: mergeSHA, Reason: reason}, nil
+}
+
+func (g PolicyMergeGate) acquireLocalCheckoutMutationLock(ctx context.Context, request MergeRequest) (func(context.Context) error, error) {
+	if g.Git == nil {
+		return nil, nil
+	}
+	releaseCheckoutLock, _, err := acquireCheckoutMutationLock(ctx, g.Store, g.CheckoutPath, "merge:"+request.Repo+"#"+strconv.Itoa(request.PullRequest), time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	return releaseCheckoutLock, nil
 }
 
 func (g PolicyMergeGate) validate() error {

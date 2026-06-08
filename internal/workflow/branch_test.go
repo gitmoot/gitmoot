@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 )
@@ -44,6 +45,75 @@ func TestEngineStartTaskBranchCreatesBranchAndLock(t *testing.T) {
 	}
 }
 
+func TestEngineStartTaskBranchAcquiresCheckoutMutationLockBeforeBranchSetup(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	checkout := t.TempDir()
+	key, err := checkoutMutationLockKey(checkout)
+	if err != nil {
+		t.Fatalf("checkoutMutationLockKey returned error: %v", err)
+	}
+	brancher := &fakeBranchCreator{onCreate: func() {
+		lock, err := store.GetResourceLock(ctx, key)
+		if err != nil {
+			t.Fatalf("GetResourceLock during branch setup returned error: %v", err)
+		}
+		if lock.OwnerJobID != "task:task-8" {
+			t.Fatalf("checkout lock owner = %q, want task:task-8", lock.OwnerJobID)
+		}
+	}}
+
+	if _, err := engine.StartTaskBranch(ctx, TaskBranchRequest{
+		Repo:     "jerryfane/gitmoot",
+		TaskID:   "task-8",
+		Branch:   "task-8",
+		Owner:    "lead",
+		Checkout: checkout,
+	}, brancher); err != nil {
+		t.Fatalf("StartTaskBranch returned error: %v", err)
+	}
+	if _, err := store.GetResourceLock(ctx, key); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("checkout lock after branch setup error = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestEngineStartTaskBranchBlocksWhenCheckoutMutationLocked(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	checkout := t.TempDir()
+	key, err := checkoutMutationLockKey(checkout)
+	if err != nil {
+		t.Fatalf("checkoutMutationLockKey returned error: %v", err)
+	}
+	if acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+		ResourceKey: key,
+		OwnerJobID:  "task:other",
+		OwnerToken:  "other-token",
+		ExpiresAt:   "2099-01-01T00:00:00Z",
+	}, time.Now().UTC()); err != nil || !acquired {
+		t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
+	}
+	brancher := &fakeBranchCreator{}
+
+	_, err = engine.StartTaskBranch(ctx, TaskBranchRequest{
+		Repo:     "jerryfane/gitmoot",
+		TaskID:   "task-8",
+		Branch:   "task-8",
+		Owner:    "lead",
+		Checkout: checkout,
+	}, brancher)
+
+	var blocked BlockedError
+	if !errors.As(err, &blocked) || blocked.Reason != checkoutMutationBusyMessage {
+		t.Fatalf("error = %v, want checkout busy BlockedError", err)
+	}
+	if len(brancher.calls) != 0 {
+		t.Fatalf("branch was created despite checkout lock: %+v", brancher.calls)
+	}
+}
+
 func TestEngineStartTaskBranchReleasesLockOnBranchCreateFailure(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -62,6 +132,33 @@ func TestEngineStartTaskBranchReleasesLockOnBranchCreateFailure(t *testing.T) {
 	}
 	if _, lockErr := store.GetBranchLock(ctx, "jerryfane/gitmoot", "task-8"); !errors.Is(lockErr, sql.ErrNoRows) {
 		t.Fatalf("lock after failure error = %v, want sql.ErrNoRows", lockErr)
+	}
+}
+
+func TestEngineStartTaskBranchReleasesCheckoutMutationLockOnBranchCreateFailure(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	checkout := t.TempDir()
+	key, err := checkoutMutationLockKey(checkout)
+	if err != nil {
+		t.Fatalf("checkoutMutationLockKey returned error: %v", err)
+	}
+	brancher := &fakeBranchCreator{err: errors.New("git failed")}
+
+	_, err = engine.StartTaskBranch(ctx, TaskBranchRequest{
+		Repo:     "jerryfane/gitmoot",
+		TaskID:   "task-8",
+		Branch:   "task-8",
+		Owner:    "lead",
+		Checkout: checkout,
+	}, brancher)
+
+	if err == nil {
+		t.Fatal("StartTaskBranch succeeded despite branch failure")
+	}
+	if _, err := store.GetResourceLock(ctx, key); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("checkout lock after branch setup failure error = %v, want sql.ErrNoRows", err)
 	}
 }
 
@@ -193,8 +290,9 @@ func TestEngineStartTaskBranchAllowsSameBranchInAnotherRepo(t *testing.T) {
 }
 
 type fakeBranchCreator struct {
-	err   error
-	calls []branchCall
+	err      error
+	onCreate func()
+	calls    []branchCall
 }
 
 type branchCall struct {
@@ -203,6 +301,9 @@ type branchCall struct {
 }
 
 func (f *fakeBranchCreator) CreateBranch(_ context.Context, branch string, base string) error {
+	if f.onCreate != nil {
+		f.onCreate()
+	}
 	f.calls = append(f.calls, branchCall{branch: branch, base: base})
 	return f.err
 }

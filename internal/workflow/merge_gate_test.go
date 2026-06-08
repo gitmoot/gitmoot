@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/github"
@@ -48,7 +49,7 @@ func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
 	}
 	git := &fakeMergeGateGit{clean: true}
-	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: git, DeleteBranch: true}
+	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: git, CheckoutPath: t.TempDir(), DeleteBranch: true}
 
 	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "jerryfane/gitmoot", PullRequest: 9, TaskID: "task-9", Reviewer: "audit"})
 
@@ -83,6 +84,101 @@ func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 	}
 	if len(git.updated) != 1 || git.updated[0] != "origin/main" {
 		t.Fatalf("updated base calls = %+v", git.updated)
+	}
+}
+
+func TestPolicyMergeGateLocksCheckoutDuringLocalBaseUpdate(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "jerryfane/gitmoot", Branch: "task-9", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+		Repo:        "jerryfane/gitmoot",
+		Branch:      "task-9",
+		PullRequest: 9,
+		HeadSHA:     "head123",
+		TaskID:      "task-9",
+		ReviewRound: "review-1",
+		Result:      &AgentResult{Decision: "approved", Summary: "ready"},
+	})
+	checkout := t.TempDir()
+	key, err := checkoutMutationLockKey(checkout)
+	if err != nil {
+		t.Fatalf("checkoutMutationLockKey returned error: %v", err)
+	}
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr:          github.PullRequest{Number: 9, State: "open", URL: "https://github.com/jerryfane/gitmoot/pull/9", HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
+		status:      github.CombinedStatus{State: "success"},
+		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+	}
+	git := &fakeMergeGateGit{clean: true, onUpdate: func() {
+		lock, err := store.GetResourceLock(ctx, key)
+		if err != nil {
+			t.Fatalf("GetResourceLock during UpdateBase returned error: %v", err)
+		}
+		if lock.OwnerJobID != "merge:jerryfane/gitmoot#9" {
+			t.Fatalf("checkout lock owner = %q, want merge:jerryfane/gitmoot#9", lock.OwnerJobID)
+		}
+	}}
+	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: git, CheckoutPath: checkout}
+
+	if _, err := gate.Evaluate(ctx, MergeRequest{Repo: "jerryfane/gitmoot", PullRequest: 9, TaskID: "task-9", Reviewer: "audit"}); err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if _, err := store.GetResourceLock(ctx, key); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("checkout lock after UpdateBase error = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestPolicyMergeGateReportsBusyCheckoutForLocalBaseUpdate(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+		Repo:        "jerryfane/gitmoot",
+		Branch:      "task-9",
+		PullRequest: 9,
+		HeadSHA:     "head123",
+		TaskID:      "task-9",
+		ReviewRound: "review-1",
+		Result:      &AgentResult{Decision: "approved", Summary: "ready"},
+	})
+	checkout := t.TempDir()
+	key, err := checkoutMutationLockKey(checkout)
+	if err != nil {
+		t.Fatalf("checkoutMutationLockKey returned error: %v", err)
+	}
+	if acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+		ResourceKey: key,
+		OwnerJobID:  "task:other",
+		OwnerToken:  "other-token",
+		ExpiresAt:   "2099-01-01T00:00:00Z",
+	}, time.Now().UTC()); err != nil || !acquired {
+		t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
+	}
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr:          github.PullRequest{Number: 9, State: "open", URL: "https://github.com/jerryfane/gitmoot/pull/9", HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
+		status:      github.CombinedStatus{State: "success"},
+		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+	}
+	git := &fakeMergeGateGit{clean: true}
+	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: git, CheckoutPath: checkout}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "jerryfane/gitmoot", PullRequest: 9, TaskID: "task-9", Reviewer: "audit"})
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if decision.Ready || decision.Merged || !strings.Contains(decision.Reason, checkoutMutationBusyMessage) {
+		t.Fatalf("decision = %+v, want blocked checkout busy decision", decision)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge ran despite checkout lock: %+v", gh.merges)
+	}
+	if len(git.updated) != 0 {
+		t.Fatalf("UpdateBase ran despite checkout lock: %+v", git.updated)
 	}
 }
 
@@ -624,8 +720,9 @@ func (f *fakeMergeGateGitHub) MergePullRequest(_ context.Context, input github.M
 }
 
 type fakeMergeGateGit struct {
-	clean   bool
-	updated []string
+	clean    bool
+	onUpdate func()
+	updated  []string
 }
 
 func (f *fakeMergeGateGit) WorktreeClean(context.Context) (bool, error) {
@@ -633,6 +730,9 @@ func (f *fakeMergeGateGit) WorktreeClean(context.Context) (bool, error) {
 }
 
 func (f *fakeMergeGateGit) UpdateBase(_ context.Context, remote string, branch string) error {
+	if f.onUpdate != nil {
+		f.onUpdate()
+	}
 	f.updated = append(f.updated, remote+"/"+branch)
 	return nil
 }

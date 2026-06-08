@@ -191,6 +191,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 				Store:        store,
 				GitHub:       gh,
 				Git:          gitutil.Client{Dir: checkout},
+				CheckoutPath: checkout,
 				DeleteBranch: true,
 			},
 		}
@@ -1821,6 +1822,7 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string) wo
 			Store:        store,
 			GitHub:       gh,
 			Git:          gitutil.Client{Dir: checkout},
+			CheckoutPath: checkout,
 			DeleteBranch: true,
 		},
 		PayloadRefresher: func(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
