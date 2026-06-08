@@ -26,6 +26,31 @@ func (c Client) CreateBranch(ctx context.Context, branch string, base string) er
 	return err
 }
 
+func (c Client) AddWorktree(ctx context.Context, branch string, path string, base string) error {
+	if err := validateBranch(branch); err != nil {
+		return err
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return errors.New("worktree path is required")
+	}
+	args := []string{"worktree", "add", "-b", branch, path}
+	if strings.TrimSpace(base) != "" {
+		args = append(args, base)
+	}
+	_, err := c.run(ctx, args...)
+	return err
+}
+
+func (c Client) RemoveWorktree(ctx context.Context, path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return errors.New("worktree path is required")
+	}
+	_, err := c.run(ctx, "worktree", "remove", path)
+	return err
+}
+
 func (c Client) CurrentBranch(ctx context.Context) (string, error) {
 	result, err := c.run(ctx, "branch", "--show-current")
 	if err != nil {

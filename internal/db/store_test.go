@@ -1944,6 +1944,74 @@ func TestMigrateAppendsAgentInstanceAutonomyPolicy(t *testing.T) {
 	}
 }
 
+func TestMigrateAppendsTaskWorktreePath(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gitmoot.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open returned error: %v", err)
+	}
+	store := &Store{db: raw}
+	for version, migration := range migrations[:len(migrations)-1] {
+		if err := store.applyMigration(ctx, version+1, migration); err != nil {
+			t.Fatalf("applyMigration(%d) returned error: %v", version+1, err)
+		}
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch)
+		VALUES ('task-legacy', 'owner/repo', 'goal-1', 'Legacy', 'planned', 'task-legacy')`); err != nil {
+		t.Fatalf("insert legacy task returned error: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw Close returned error: %v", err)
+	}
+
+	upgraded, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open upgraded DB returned error: %v", err)
+	}
+	defer upgraded.Close()
+	task, err := upgraded.GetTask(ctx, "task-legacy")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.WorktreePath != "" {
+		t.Fatalf("worktree path = %q, want empty default", task.WorktreePath)
+	}
+}
+
+func TestTaskWorktreePathStorage(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.UpsertTask(ctx, Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "First", State: "planned", Branch: "task-1", WorktreePath: "/tmp/gitmoot/worktrees/owner--repo/task-1"}); err != nil {
+		t.Fatalf("UpsertTask with worktree returned error: %v", err)
+	}
+	task, err := store.GetTask(ctx, "task-1")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.WorktreePath != "/tmp/gitmoot/worktrees/owner--repo/task-1" {
+		t.Fatalf("worktree path = %q", task.WorktreePath)
+	}
+	if err := store.UpsertTask(ctx, Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Updated", State: "implementing", Branch: "task-1"}); err != nil {
+		t.Fatalf("UpsertTask update returned error: %v", err)
+	}
+	updated, err := store.GetTask(ctx, "task-1")
+	if err != nil {
+		t.Fatalf("GetTask updated returned error: %v", err)
+	}
+	if updated.WorktreePath != task.WorktreePath {
+		t.Fatalf("worktree path was not preserved: %q", updated.WorktreePath)
+	}
+	if updated.State != "implementing" || updated.Title != "Updated" {
+		t.Fatalf("task update did not apply: %+v", updated)
+	}
+}
+
 func TestTasksRequireUniqueNonEmptyBranches(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))

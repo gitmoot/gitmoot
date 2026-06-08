@@ -76,6 +76,33 @@ func TestClientRejectsUnsafeBranchNames(t *testing.T) {
 	}
 }
 
+func TestClientWorktreeCommandConstruction(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{}, {}}}
+	client := Client{Runner: runner, Dir: "/repo"}
+
+	if err := client.AddWorktree(context.Background(), "task-1", "/worktrees/task-1", "main"); err != nil {
+		t.Fatalf("AddWorktree returned error: %v", err)
+	}
+	if err := client.RemoveWorktree(context.Background(), "/worktrees/task-1"); err != nil {
+		t.Fatalf("RemoveWorktree returned error: %v", err)
+	}
+
+	runner.wantArgs(t, 0, "git", "worktree", "add", "-b", "task-1", "/worktrees/task-1", "main")
+	runner.wantArgs(t, 1, "git", "worktree", "remove", "/worktrees/task-1")
+}
+
+func TestClientAddWorktreeRejectsInvalidInput(t *testing.T) {
+	if err := (Client{}).AddWorktree(context.Background(), "bad branch", "/tmp/wt", "main"); err == nil {
+		t.Fatal("AddWorktree accepted unsafe branch")
+	}
+	if err := (Client{}).AddWorktree(context.Background(), "task-1", "", "main"); err == nil {
+		t.Fatal("AddWorktree accepted empty path")
+	}
+	if err := (Client{}).RemoveWorktree(context.Background(), " "); err == nil {
+		t.Fatal("RemoveWorktree accepted empty path")
+	}
+}
+
 func TestClientHeadSHA(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "abc123\n"}}}
 	sha, err := (Client{Runner: runner, Dir: "/repo"}).HeadSHA(context.Background())

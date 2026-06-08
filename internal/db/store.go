@@ -131,6 +131,7 @@ type Task struct {
 	Title        string
 	State        string
 	Branch       string
+	WorktreePath string
 }
 
 type PullRequest struct {
@@ -1463,16 +1464,20 @@ func (s *Store) UpsertTask(ctx context.Context, task Task) error {
 }
 
 func upsertTask(ctx context.Context, execer sqlExecer, task Task) error {
-	_, err := execer.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	_, err := execer.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, worktree_path, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
 			repo_full_name = excluded.repo_full_name,
 			goal_id = excluded.goal_id,
 			title = excluded.title,
 			state = excluded.state,
 			branch = excluded.branch,
+			worktree_path = CASE
+				WHEN excluded.worktree_path <> '' THEN excluded.worktree_path
+				ELSE tasks.worktree_path
+			END,
 			updated_at = CURRENT_TIMESTAMP`,
-		task.ID, task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch)
+		task.ID, task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch, task.WorktreePath)
 	return err
 }
 
@@ -1495,8 +1500,8 @@ func (s *Store) UpsertGoalWithTasks(ctx context.Context, goal Goal, tasks []Task
 }
 
 func upsertImportedTask(ctx context.Context, execer sqlExecer, task Task) error {
-	_, err := execer.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	_, err := execer.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, worktree_path, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 			ON CONFLICT(id) DO UPDATE SET
 				repo_full_name = CASE
 					WHEN excluded.repo_full_name <> '' THEN excluded.repo_full_name
@@ -1506,28 +1511,25 @@ func upsertImportedTask(ctx context.Context, execer sqlExecer, task Task) error 
 				title = excluded.title,
 				state = tasks.state,
 			branch = tasks.branch,
+			worktree_path = tasks.worktree_path,
 			updated_at = CURRENT_TIMESTAMP`,
-		task.ID, task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch)
+		task.ID, task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch, task.WorktreePath)
 	return err
 }
 
 func (s *Store) GetTask(ctx context.Context, id string) (Task, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, repo_full_name, goal_id, title, state, branch FROM tasks WHERE id = ?`, id)
-	var task Task
-	if err := row.Scan(&task.ID, &task.RepoFullName, &task.GoalID, &task.Title, &task.State, &task.Branch); err != nil {
-		return Task{}, err
-	}
-	return task, nil
+	row := s.db.QueryRowContext(ctx, taskSelectSQL()+` FROM tasks WHERE id = ?`, id)
+	return scanTask(row)
 }
 
 func (s *Store) GetTaskByBranch(ctx context.Context, branch string) (Task, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, repo_full_name, goal_id, title, state, branch
+	row := s.db.QueryRowContext(ctx, taskSelectSQL()+`
 		FROM tasks WHERE branch = ? ORDER BY updated_at DESC, id LIMIT 1`, branch)
 	return scanTask(row)
 }
 
 func (s *Store) GetTaskByRepoBranch(ctx context.Context, repoFullName string, branch string) (Task, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, repo_full_name, goal_id, title, state, branch
+	row := s.db.QueryRowContext(ctx, taskSelectSQL()+`
 		FROM tasks
 		WHERE branch = ? AND (repo_full_name = ? OR repo_full_name = '')
 		ORDER BY CASE WHEN repo_full_name = ? THEN 0 ELSE 1 END, updated_at DESC, id
@@ -1536,7 +1538,7 @@ func (s *Store) GetTaskByRepoBranch(ctx context.Context, repoFullName string, br
 }
 
 func (s *Store) ListTasks(ctx context.Context) ([]Task, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, repo_full_name, goal_id, title, state, branch FROM tasks ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, taskSelectSQL()+` FROM tasks ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -1553,7 +1555,7 @@ func (s *Store) ListTasks(ctx context.Context) ([]Task, error) {
 }
 
 func (s *Store) ListTasksByRepo(ctx context.Context, repoFullName string) ([]Task, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, repo_full_name, goal_id, title, state, branch
+	rows, err := s.db.QueryContext(ctx, taskSelectSQL()+`
 		FROM tasks
 		WHERE repo_full_name = ? OR repo_full_name = ''
 		ORDER BY CASE WHEN repo_full_name = ? THEN 0 ELSE 1 END, id`, repoFullName, repoFullName)
@@ -1573,7 +1575,7 @@ func (s *Store) ListTasksByRepo(ctx context.Context, repoFullName string) ([]Tas
 }
 
 func (s *Store) ListTasksByRepoState(ctx context.Context, repoFullName string, state string) ([]Task, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, repo_full_name, goal_id, title, state, branch
+	rows, err := s.db.QueryContext(ctx, taskSelectSQL()+`
 		FROM tasks
 		WHERE repo_full_name = ? AND state = ?
 		ORDER BY id`, repoFullName, state)
@@ -1594,10 +1596,14 @@ func (s *Store) ListTasksByRepoState(ctx context.Context, repoFullName string, s
 
 func scanTask(row interface{ Scan(dest ...any) error }) (Task, error) {
 	var task Task
-	if err := row.Scan(&task.ID, &task.RepoFullName, &task.GoalID, &task.Title, &task.State, &task.Branch); err != nil {
+	if err := row.Scan(&task.ID, &task.RepoFullName, &task.GoalID, &task.Title, &task.State, &task.Branch, &task.WorktreePath); err != nil {
 		return Task{}, err
 	}
 	return task, nil
+}
+
+func taskSelectSQL() string {
+	return `SELECT id, repo_full_name, goal_id, title, state, branch, worktree_path`
 }
 
 func (s *Store) UpsertPullRequest(ctx context.Context, pr PullRequest) error {
@@ -4193,5 +4199,8 @@ ALTER TABLE ranked_feedback_events ADD COLUMN tie_groups_json TEXT NOT NULL DEFA
 	`,
 	`
 ALTER TABLE agent_instances ADD COLUMN autonomy_policy TEXT NOT NULL DEFAULT 'auto';
+	`,
+	`
+ALTER TABLE tasks ADD COLUMN worktree_path TEXT NOT NULL DEFAULT '';
 	`,
 }
