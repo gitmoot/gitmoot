@@ -257,6 +257,8 @@ func TestTextArtifactPreviewExtractsHumanFacingJSONField(t *testing.T) {
 	}{
 		"reply field":    {content: `{"reply":"hello there","risk":"low"}`, want: "hello there"},
 		"tweet field":    {content: `{"tweet":"tweet text"}`, want: "tweet text"},
+		"skip decision":  {content: `{"worth_reply":false,"reason":"does not fit the voice"}`, want: "skip: does not fit the voice"},
+		"skip no reason": {content: `{"worth_reply":false}`, want: "skip"},
 		"source field":   {content: `{"original_post":"source text"}`, want: "source text"},
 		"input field":    {content: `{"input":"input text"}`, want: "input text"},
 		"json string":    {content: `"plain json string"`, want: "plain json string"},

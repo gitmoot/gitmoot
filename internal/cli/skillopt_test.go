@@ -4730,9 +4730,8 @@ func TestSkillOptTrainCandidateReviewBodyShowsTextSamplePreview(t *testing.T) {
 			}
 			for _, want := range []string{
 				"### Candidate Sample Preview",
-				"Selection sample: inline preview from `optimizer-train/optimizer-train-001/planner@v2/candidate-selection-sample`",
-				"so thats why my limits vanished before lunch",
-				"Renderer: `text`",
+				"| Sample | Preview | Artifact | Renderer | Status |",
+				"| Selection sample | `so thats why my limits vanished before lunch` | `optimizer-train/optimizer-train-001/planner@v2/candidate-selection-sample` | `text` | - |",
 			} {
 				if !strings.Contains(body, want) {
 					t.Fatalf("candidate review body missing %q:\n%s", want, body)
@@ -4742,6 +4741,7 @@ func TestSkillOptTrainCandidateReviewBodyShowsTextSamplePreview(t *testing.T) {
 				"Preview: no selected candidate sample artifact was available to publish.",
 				"candidate sample preview publishing is not configured",
 				`"risk"`,
+				"```text",
 			} {
 				if strings.Contains(body, unwanted) {
 					t.Fatalf("candidate review body contained %q:\n%s", unwanted, body)
