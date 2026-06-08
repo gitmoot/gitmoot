@@ -94,6 +94,58 @@ func TestRunAgentSubscribeListRemove(t *testing.T) {
 	}
 }
 
+func TestRunAgentShow(t *testing.T) {
+	home := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "subscribe", "audit",
+		"--home", home,
+		"--runtime", "codex",
+		"--session", "550e8400-e29b-41d4-a716-446655440001",
+		"--role", "reviewer",
+		"--repo", "jerryfane/gitmoot",
+		"--capability", "review",
+		"--policy", "workspace-write",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("subscribe exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "show", "audit", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent show exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{
+		"name: audit",
+		"runtime: codex",
+		"runtime_ref: 550e8400-e29b-41d4-a716-446655440001",
+		"role: reviewer",
+		"capabilities: review",
+		"policy: workspace-write",
+		"allowed_repos: jerryfane/gitmoot",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("agent show output missing %q:\n%s", want, stdout.String())
+		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "show", "audit", "--home", home, "--json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent show --json exit code = %d, stderr=%s", code, stderr.String())
+	}
+	var decoded agentShowOutput
+	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
+		t.Fatalf("json output did not decode: %v\n%s", err, stdout.String())
+	}
+	if decoded.Name != "audit" || decoded.Policy != runtime.AutonomyPolicyWorkspaceWrite || strings.Join(decoded.AllowedRepos, ",") != "jerryfane/gitmoot" {
+		t.Fatalf("decoded = %+v", decoded)
+	}
+}
+
 func TestRunAgentSubscribeValidatesAutonomyPolicy(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer

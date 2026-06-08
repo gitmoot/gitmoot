@@ -42,6 +42,8 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 		return runAgentGC(args[1:], stdout, stderr)
 	case "subscribe":
 		return runAgentSubscribe(args[1:], stdout, stderr)
+	case "show":
+		return runAgentShow(args[1:], stdout, stderr)
 	case "list":
 		return runAgentList(args[1:], stdout, stderr)
 	case "remove":
@@ -74,6 +76,7 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot agent allow <name> --repo owner/repo")
 	fmt.Fprintln(w, "  gitmoot agent deny <name> --repo owner/repo")
 	fmt.Fprintln(w, "  gitmoot agent repos <name>")
+	fmt.Fprintln(w, "  gitmoot agent show <name> [--json]")
 	fmt.Fprintln(w, "  gitmoot agent list")
 	fmt.Fprintln(w, "  gitmoot agent remove <name>")
 	fmt.Fprintln(w, "  gitmoot agent doctor <name>")
@@ -972,6 +975,91 @@ func runAgentList(args []string, stdout, stderr io.Writer) int {
 	for _, agent := range agents {
 		fmt.Fprintf(stdout, "%-16s %-8s %-12s %-20s %s\n", agent.Name, agent.Runtime, agent.Role, strings.Join(agentRepos[agent.Name], ","), strings.Join(agent.Capabilities, ","))
 	}
+	return 0
+}
+
+type agentShowOutput struct {
+	Name         string   `json:"name"`
+	Runtime      string   `json:"runtime"`
+	RuntimeRef   string   `json:"runtime_ref"`
+	Role         string   `json:"role"`
+	Capabilities []string `json:"capabilities"`
+	Policy       string   `json:"policy"`
+	TemplateID   string   `json:"template_id,omitempty"`
+	HealthStatus string   `json:"health_status"`
+	RepoScope    string   `json:"repo_scope,omitempty"`
+	AllowedRepos []string `json:"allowed_repos"`
+}
+
+func runAgentShow(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("agent show", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	jsonOutput := fs.Bool("json", false, "print agent as JSON")
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fs.Usage()
+		if len(args) == 0 {
+			fmt.Fprintln(stderr, "agent show requires exactly one name")
+			return 2
+		}
+		return 0
+	}
+	name := args[0]
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "agent show requires exactly one name")
+		return 2
+	}
+
+	var output agentShowOutput
+	if err := withStore(*home, func(store *db.Store) error {
+		agent, err := store.GetAgent(context.Background(), name)
+		if err != nil {
+			return err
+		}
+		repos, err := store.ListAgentRepos(context.Background(), agent.Name)
+		if err != nil {
+			return err
+		}
+		output = agentShowOutput{
+			Name:         agent.Name,
+			Runtime:      agent.Runtime,
+			RuntimeRef:   agent.RuntimeRef,
+			Role:         agent.Role,
+			Capabilities: agent.Capabilities,
+			Policy:       runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy),
+			TemplateID:   agent.TemplateID,
+			HealthStatus: agent.HealthStatus,
+			RepoScope:    agent.RepoScope,
+			AllowedRepos: repos,
+		}
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "agent show: %v\n", err)
+		return 1
+	}
+	if *jsonOutput {
+		if err := writeJSON(stdout, output); err != nil {
+			fmt.Fprintf(stderr, "agent show: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	writeLine(stdout, "name: %s", output.Name)
+	writeLine(stdout, "runtime: %s", output.Runtime)
+	writeLine(stdout, "runtime_ref: %s", output.RuntimeRef)
+	writeLine(stdout, "role: %s", output.Role)
+	writeLine(stdout, "capabilities: %s", strings.Join(output.Capabilities, ","))
+	writeLine(stdout, "policy: %s", output.Policy)
+	writeLine(stdout, "template: %s", emptyText(output.TemplateID))
+	writeLine(stdout, "health: %s", output.HealthStatus)
+	writeLine(stdout, "repo_scope: %s", emptyText(output.RepoScope))
+	writeLine(stdout, "allowed_repos: %s", strings.Join(output.AllowedRepos, ","))
 	return 0
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -247,6 +248,64 @@ func TestRunGoalImportPreservesExistingTaskProgress(t *testing.T) {
 	}
 	if task.RepoFullName != "jerryfane/gitmoot" || task.Title != "Bootstrap Updated" || task.State != "implementing" || task.Branch != "custom-branch" {
 		t.Fatalf("task after reimport = %+v", task)
+	}
+}
+
+func TestRunTaskList(t *testing.T) {
+	home := t.TempDir()
+	goalPath := filepath.Join(t.TempDir(), "GOAL.md")
+	writeFile(t, goalPath, "# Build Gitmoot\n\n### Task 1: Bootstrap\n\n### Task 2: Review\n")
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"goal", "import", "--home", home, "--file", goalPath, "--repo", "jerryfane/gitmoot"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("goal import exit code = %d, stderr=%s", code, stderr.String())
+	}
+	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.UpsertTask(context.Background(), db.Task{
+		ID:           "task-001",
+		RepoFullName: "jerryfane/gitmoot",
+		GoalID:       "goal",
+		Title:        "Bootstrap",
+		State:        "implementing",
+		Branch:       "task-001-bootstrap",
+		WorktreePath: "/tmp/gitmoot/worktrees/jerryfane--gitmoot/task-001",
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"task", "list", "--home", home, "--repo", "jerryfane/gitmoot", "--state", "implementing"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("task list exit code = %d, stderr=%s", code, stderr.String())
+	}
+	output := stdout.String()
+	if !strings.Contains(output, "task-001\timplementing\tjerryfane/gitmoot\ttask-001-bootstrap\t/tmp/gitmoot/worktrees/jerryfane--gitmoot/task-001\tBootstrap") {
+		t.Fatalf("task list output = %q", output)
+	}
+	if strings.Contains(output, "task-002") {
+		t.Fatalf("task list did not apply state filter:\n%s", output)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"task", "list", "--home", home, "--repo", "jerryfane/gitmoot", "--json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("task list --json exit code = %d, stderr=%s", code, stderr.String())
+	}
+	var decoded []taskListOutput
+	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
+		t.Fatalf("json output did not decode: %v\n%s", err, stdout.String())
+	}
+	if len(decoded) != 2 || decoded[0].ID != "task-001" || decoded[0].WorktreePath == "" {
+		t.Fatalf("decoded = %+v", decoded)
 	}
 }
 
