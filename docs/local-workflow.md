@@ -371,6 +371,9 @@ same checkout remain serialized even when the worker count is higher.
   written in the comment body.
 - Template content is not fetched at job runtime. Run `gitmoot agent template update`
   intentionally when you want to refresh a cached template.
+- For Claude implementation worker validation, including the explicit live
+  doctor check and mixed Codex + Claude parallel smoke, see
+  [Claude Runtime Validation](claude-runtime-validation.md).
 
 ## Multi-Repo Supervision
 

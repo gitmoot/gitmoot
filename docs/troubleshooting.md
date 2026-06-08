@@ -332,6 +332,8 @@ Fixes:
 - Temporary forkable workers, such as the future #177 flow, should remain gated
   on task worktree isolation. Forking sessions without checkout isolation only
   moves the contention from runtime memory to local git state.
+- For the full Claude implementation-worker smoke checklist, see
+  [Claude Runtime Validation](claude-runtime-validation.md).
 
 ## Malformed Agent Output
 
