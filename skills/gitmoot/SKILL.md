@@ -57,11 +57,12 @@ sessions or managed agent types with `max_background` greater than one.
 ## Common Commands
 
 Use `gitmoot status --repo owner/repo` for repo status, `gitmoot daemon status`
-for daemon state, `gitmoot agent list` for registered agents, and
-`gitmoot agent prompt <agent-or-template>` to import an agent prompt into the
-current chat. Use `gitmoot agent ask <agent> --repo owner/repo "..."` to invoke
-a registered Gitmoot agent through the runtime adapter path. Add `--background`
-only when the user wants a queued background job. Use
+for daemon state, `gitmoot agent list` and `gitmoot agent show <agent>` for
+registered agents, `gitmoot task list --repo owner/repo` for imported task
+state, and `gitmoot agent prompt <agent-or-template>` to import an agent prompt
+into the current chat. Use `gitmoot agent ask <agent> --repo owner/repo "..."`
+to invoke a registered Gitmoot agent through the runtime adapter path. Add
+`--background` only when the user wants a queued background job. Use
 `gitmoot job list --repo owner/repo` for queued or recent jobs. Use
 `gitmoot plugin doctor` when checking whether Codex or Claude Code can discover
 Gitmoot through an installed runtime plugin. Use `gitmoot goal template` when

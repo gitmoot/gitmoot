@@ -90,6 +90,8 @@ Inspect agents:
 
 ```sh
 gitmoot agent list
+gitmoot agent show reviewer
+gitmoot agent show reviewer --json
 gitmoot agent repos reviewer
 gitmoot agent doctor reviewer
 ```
@@ -224,6 +226,18 @@ Import a goal file into local Gitmoot state:
 ```sh
 gitmoot goal import --file GOAL-feature.md --repo owner/repo
 ```
+
+Start a task in its dedicated branch worktree and inspect task state:
+
+```sh
+gitmoot task run task-001 --repo owner/repo --owner lead --base main
+gitmoot task list --repo owner/repo
+gitmoot task list --repo owner/repo --state implementing --json
+```
+
+`task run` stores the deterministic task worktree path under
+`$GITMOOT_HOME/worktrees/<owner>--<repo>/<task-id>/` and leaves the registered
+checkout on its current branch.
 
 ## PR Comments
 

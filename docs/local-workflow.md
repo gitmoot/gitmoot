@@ -9,7 +9,7 @@ statuses, and merges only after the merge gate passes.
 ## What Exists Today
 
 The current CLI supports local setup, multi-repo daemon management, agent
-registration, plan import, task branch startup, status, recovery, and updates:
+registration, plan import, task worktree startup, status, recovery, and updates:
 
 ```sh
 gitmoot setup --repo owner/repo --path . --agent lead --runtime codex --session <session-ref> --role lead
@@ -31,9 +31,11 @@ gitmoot agent start thermo-review --runtime codex --repo owner/repo --template t
 gitmoot agent allow <name> --repo owner/repo
 gitmoot agent repos <name>
 gitmoot agent list
+gitmoot agent show <name>
 gitmoot agent doctor <name>
 gitmoot goal import --file GOAL.md --repo owner/repo
 gitmoot task run task-001 --repo owner/repo --owner lead --base main
+gitmoot task list --repo owner/repo
 gitmoot job list
 gitmoot job show <job-id>
 gitmoot job watch <job-id>
@@ -48,7 +50,8 @@ gitmoot daemon status
 ```
 
 Goal import turns Markdown headings shaped like `### Task N: Title` into local
-planned tasks. `task run` starts one task branch and records its branch lock.
+planned tasks. `task run` starts one task branch in a dedicated worktree,
+records its branch lock, and stores the worktree path on the task.
 
 ## Runtime Plugin Setup
 
