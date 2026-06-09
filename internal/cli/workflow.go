@@ -506,11 +506,17 @@ func taskRunImplementJobRequest(jobID string, task db.Task, owner string, headSH
 }
 
 func taskRunJobMatchesRequest(job db.Job, request workflow.JobRequest) bool {
-	if job.Agent != request.Agent || job.Type != request.Action {
+	if job.Type != request.Action {
 		return false
 	}
 	payload, err := daemonJobPayload(job)
 	if err != nil {
+		return false
+	}
+	if job.Agent != request.Agent &&
+		!(payload.DelegationReason == "runtime_session_busy" &&
+			payload.DelegatedAgent == job.Agent &&
+			payload.OriginalAgent == request.Agent) {
 		return false
 	}
 	return payload.Repo == request.Repo &&

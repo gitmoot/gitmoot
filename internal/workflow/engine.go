@@ -179,12 +179,7 @@ func (e Engine) RunJob(ctx context.Context, jobID string, agent runtime.Agent, a
 	if err != nil {
 		return AgentResult{}, err
 	}
-	if err := e.ensureAgentAllowed(ctx, JobRequest{
-		Agent:  job.Agent,
-		Action: job.Type,
-		Repo:   payload.Repo,
-		Branch: payload.Branch,
-	}, taskRefFromPayload(payload)); err != nil {
+	if err := e.ensureJobExecutorAllowed(ctx, job, payload, taskRefFromPayload(payload)); err != nil {
 		return AgentResult{}, err
 	}
 	result, err := (Mailbox{Store: e.Store}).Run(ctx, jobID, agent, adapter)
@@ -270,6 +265,11 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 		leadAgent := strings.TrimSpace(payload.LeadAgent)
 		if leadAgent == "" {
 			leadAgent = job.Agent
+			if payload.DelegationReason == "runtime_session_busy" &&
+				payload.DelegatedAgent == job.Agent &&
+				strings.TrimSpace(payload.OriginalAgent) != "" {
+				leadAgent = payload.OriginalAgent
+			}
 		}
 		event := PullRequestEvent{
 			Repo:              payload.Repo,
@@ -285,25 +285,36 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 		}
 		return e.HandlePullRequestOpened(ctx, event)
 	case "review":
+		reviewer := reviewDecisionAgent(job, payload)
 		switch payload.Result.Decision {
 		case "changes_requested":
 			if err := e.setTaskState(ctx, ref, TaskChangesRequested); err != nil {
 				return err
 			}
-			return e.dispatchFix(ctx, job.Agent, payload, *payload.Result, ref)
+			return e.dispatchFix(ctx, reviewer, payload, *payload.Result, ref)
 		case "approved":
-			ready, err := e.allRequiredReviewersApproved(ctx, job.Agent, payload)
+			ready, err := e.allRequiredReviewersApproved(ctx, reviewer, payload)
 			if err != nil {
 				return err
 			}
 			if !ready {
 				return e.setReviewingIfNotChangesRequested(ctx, ref)
 			}
-			_, err = e.runMergeGate(ctx, job.Agent, payload, ref)
+			_, err = e.runMergeGate(ctx, reviewer, payload, ref)
 			return err
 		}
 	}
 	return nil
+}
+
+func reviewDecisionAgent(job db.Job, payload JobPayload) string {
+	if job.Type == "review" &&
+		payload.DelegationReason == "runtime_session_busy" &&
+		payload.DelegatedAgent == job.Agent &&
+		strings.TrimSpace(payload.OriginalAgent) != "" {
+		return payload.OriginalAgent
+	}
+	return job.Agent
 }
 
 func (e Engine) jobPayload(ctx context.Context, jobID string) (db.Job, JobPayload, error) {
@@ -448,7 +459,7 @@ func (e Engine) allRequiredReviewersApproved(ctx context.Context, currentReviewe
 			continue
 		}
 		if jobPayload.Result.Decision == "approved" {
-			approved[job.Agent] = true
+			approved[reviewDecisionAgent(job, jobPayload)] = true
 		}
 	}
 
@@ -587,14 +598,26 @@ func (e Engine) existingJobMatchesRequest(ctx context.Context, request JobReques
 		}
 		return false, err
 	}
-	if job.Agent != request.Agent || job.Type != request.Action {
+	if job.Type != request.Action {
 		return false, nil
 	}
 	payload, err := unmarshalPayload(job.Payload)
 	if err != nil {
 		return false, err
 	}
+	if !jobMatchesRequestAgent(job, payload, request.Agent) {
+		return false, nil
+	}
 	return payloadMatchesRequest(payload, request), nil
+}
+
+func jobMatchesRequestAgent(job db.Job, payload JobPayload, requestAgent string) bool {
+	if job.Agent == requestAgent {
+		return true
+	}
+	return payload.DelegationReason == "runtime_session_busy" &&
+		payload.DelegatedAgent == job.Agent &&
+		payload.OriginalAgent == requestAgent
 }
 
 func payloadMatchesRequest(payload JobPayload, request JobRequest) bool {
@@ -609,8 +632,22 @@ func payloadMatchesRequest(payload JobPayload, request JobRequest) bool {
 		payload.ReviewRound == request.ReviewRound &&
 		payload.Sender == request.Sender &&
 		payload.Instructions == request.Instructions &&
+		payloadDelegationMatchesRequest(payload, request) &&
 		equalStrings(payload.Reviewers, compactStrings(request.Reviewers)) &&
 		equalStrings(payload.Constraints, compactStrings(request.Constraints))
+}
+
+func payloadDelegationMatchesRequest(payload JobPayload, request JobRequest) bool {
+	if payload.OriginalAgent == request.OriginalAgent &&
+		payload.DelegatedAgent == request.DelegatedAgent &&
+		payload.DelegationReason == request.DelegationReason {
+		return true
+	}
+	return request.OriginalAgent == "" &&
+		request.DelegatedAgent == "" &&
+		request.DelegationReason == "" &&
+		payload.DelegationReason == "runtime_session_busy" &&
+		payload.OriginalAgent == request.Agent
 }
 
 func equalStrings(left []string, right []string) bool {
@@ -626,6 +663,30 @@ func equalStrings(left []string, right []string) bool {
 }
 
 func (e Engine) ensureAgentAllowed(ctx context.Context, request JobRequest, ref taskRef) error {
+	return e.ensureAgentAllowedWithBranchOwner(ctx, request, request.Agent, ref, false)
+}
+
+func (e Engine) ensureJobExecutorAllowed(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) error {
+	branchOwner := job.Agent
+	authorizationAgent := job.Agent
+	if job.Type == "implement" && payload.DelegationReason == "runtime_session_busy" && payload.DelegatedAgent == job.Agent && strings.TrimSpace(payload.OriginalAgent) != "" {
+		branchOwner = payload.OriginalAgent
+	}
+	if payload.DelegationReason == "runtime_session_busy" && payload.DelegatedAgent == job.Agent && strings.TrimSpace(payload.OriginalAgent) != "" {
+		authorizationAgent = payload.OriginalAgent
+	}
+	allowMissingCapability := job.Type == "ask" &&
+		payload.DelegationReason == "temp_worker_merge_back" &&
+		payload.OriginalAgent == job.Agent
+	return e.ensureAgentAllowedWithBranchOwner(ctx, JobRequest{
+		Agent:  authorizationAgent,
+		Action: job.Type,
+		Repo:   payload.Repo,
+		Branch: payload.Branch,
+	}, branchOwner, ref, allowMissingCapability)
+}
+
+func (e Engine) ensureAgentAllowedWithBranchOwner(ctx context.Context, request JobRequest, branchOwner string, ref taskRef, allowMissingCapability bool) error {
 	agent, err := e.Store.GetAgent(ctx, request.Agent)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -640,11 +701,11 @@ func (e Engine) ensureAgentAllowed(ctx context.Context, request JobRequest, ref 
 	if !allowed {
 		return e.block(ctx, ref, fmt.Sprintf("agent %q is not allowed on %q", agent.Name, request.Repo))
 	}
-	if !contains(agent.Capabilities, request.Action) {
+	if !contains(agent.Capabilities, request.Action) && !allowMissingCapability {
 		return e.block(ctx, ref, fmt.Sprintf("agent %q lacks %q capability", agent.Name, request.Action))
 	}
 	if request.Action == "implement" {
-		if err := e.ensureBranchLock(ctx, request.Repo, request.Branch, request.Agent, ref); err != nil {
+		if err := e.ensureBranchLock(ctx, request.Repo, request.Branch, branchOwner, ref); err != nil {
 			return err
 		}
 	}

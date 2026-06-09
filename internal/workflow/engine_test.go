@@ -304,6 +304,90 @@ func TestEngineRunJobAdvancesCompletedResult(t *testing.T) {
 	mustJob(t, store, "review-audit-task-7-review-1")
 }
 
+func TestEngineRunJobAllowsDelegatedImplementWithOriginalBranchLock(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "jerryfane/gitmoot")
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "jerryfane/gitmoot", Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	payload, err := marshalPayload(JobPayload{
+		Repo:             "jerryfane/gitmoot",
+		Branch:           "task-7",
+		PullRequest:      7,
+		HeadSHA:          "head123",
+		TaskID:           "task-7",
+		Reviewers:        []string{"audit"},
+		OriginalAgent:    "lead",
+		DelegatedAgent:   "lead-temp-job-1",
+		DelegationReason: "runtime_session_busy",
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload returned error: %v", err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "job-1", Agent: "lead-temp-job-1", Type: "implement", State: string(JobQueued), Payload: payload}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	engine := testEngine(store)
+	agent := runtime.Agent{Name: "lead-temp-job-1", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "jerryfane/gitmoot", Role: "lead"}
+	adapter := &fakeDelivery{outputs: []string{
+		`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
+	}}
+
+	if _, err := engine.RunJob(ctx, "job-1", agent, adapter); err != nil {
+		t.Fatalf("RunJob returned error: %v", err)
+	}
+
+	job := mustJob(t, store, "job-1")
+	if job.State != string(JobSucceeded) {
+		t.Fatalf("job state = %q, want succeeded", job.State)
+	}
+	lock, err := store.GetBranchLock(ctx, "jerryfane/gitmoot", "task-7")
+	if err != nil {
+		t.Fatalf("GetBranchLock returned error: %v", err)
+	}
+	if lock.Owner != "lead" {
+		t.Fatalf("branch lock owner = %q, want original lead", lock.Owner)
+	}
+	assertTaskState(t, store, "task-7", TaskReviewing)
+	mustJob(t, store, "review-audit-task-7-review-1")
+}
+
+func TestEngineRunJobAllowsMergeBackAskForImplementOnlyOriginal(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "jerryfane/gitmoot")
+	payload, err := marshalPayload(JobPayload{
+		Repo:             "jerryfane/gitmoot",
+		Branch:           "task-7",
+		TaskID:           "task-7",
+		OriginalAgent:    "lead",
+		DelegatedAgent:   "lead-temp-job-1",
+		DelegationReason: "temp_worker_merge_back",
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload returned error: %v", err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "job-merge-back", Agent: "lead", Type: "ask", State: string(JobQueued), Payload: payload}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	engine := testEngine(store)
+	agent := runtime.Agent{Name: "lead", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "jerryfane/gitmoot", Role: "lead"}
+	adapter := &fakeDelivery{outputs: []string{
+		`{"gitmoot_result":{"decision":"approved","summary":"ack","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
+	}}
+
+	if _, err := engine.RunJob(ctx, "job-merge-back", agent, adapter); err != nil {
+		t.Fatalf("RunJob returned error: %v", err)
+	}
+
+	job := mustJob(t, store, "job-merge-back")
+	if job.State != string(JobSucceeded) {
+		t.Fatalf("job state = %q, want succeeded", job.State)
+	}
+}
+
 func TestEngineRunJobPreflightsPolicyBeforeDelivery(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -485,6 +569,88 @@ func TestEngineAdvanceReviewApprovalRunsMergeGate(t *testing.T) {
 	}
 }
 
+func TestEngineAdvanceDelegatedReviewApprovalUsesOriginalReviewer(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	gate := &fakeMergeGate{decision: MergeDecision{Ready: true}}
+	engine.MergeGate = gate
+	insertCompletedJob(t, store, db.Job{
+		ID:    "review-job",
+		Agent: "audit-temp-job-a",
+		Type:  "review",
+	}, JobPayload{
+		Repo:             "jerryfane/gitmoot",
+		Branch:           "task-7",
+		PullRequest:      7,
+		TaskID:           "task-7",
+		TaskTitle:        "Workflow Engine",
+		Reviewers:        []string{"audit"},
+		OriginalAgent:    "audit",
+		DelegatedAgent:   "audit-temp-job-a",
+		DelegationReason: "runtime_session_busy",
+		Result:           &AgentResult{Decision: "approved", Summary: "ready"},
+	})
+
+	err := engine.AdvanceJob(ctx, "review-job")
+
+	if err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	assertTaskState(t, store, "task-7", TaskReadyToMerge)
+	if len(gate.requests) != 1 || gate.requests[0].Reviewer != "audit" || gate.requests[0].PullRequest != 7 {
+		t.Fatalf("merge gate requests = %+v", gate.requests)
+	}
+}
+
+func TestEngineAdvanceReviewApprovalCountsPriorDelegatedReviewer(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	gate := &fakeMergeGate{decision: MergeDecision{Ready: true}}
+	engine.MergeGate = gate
+	reviewers := []string{"audit", "security"}
+	insertCompletedJob(t, store, db.Job{
+		ID:    "audit-review",
+		Agent: "audit-temp-job-a",
+		Type:  "review",
+	}, JobPayload{
+		Repo:             "jerryfane/gitmoot",
+		Branch:           "task-7",
+		PullRequest:      7,
+		TaskID:           "task-7",
+		TaskTitle:        "Workflow Engine",
+		Reviewers:        reviewers,
+		OriginalAgent:    "audit",
+		DelegatedAgent:   "audit-temp-job-a",
+		DelegationReason: "runtime_session_busy",
+		Result:           &AgentResult{Decision: "approved", Summary: "audit ready"},
+	})
+	insertCompletedJob(t, store, db.Job{
+		ID:    "security-review",
+		Agent: "security",
+		Type:  "review",
+	}, JobPayload{
+		Repo:        "jerryfane/gitmoot",
+		Branch:      "task-7",
+		PullRequest: 7,
+		TaskID:      "task-7",
+		TaskTitle:   "Workflow Engine",
+		Reviewers:   reviewers,
+		Result:      &AgentResult{Decision: "approved", Summary: "security ready"},
+	})
+
+	err := engine.AdvanceJob(ctx, "security-review")
+
+	if err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	assertTaskState(t, store, "task-7", TaskReadyToMerge)
+	if len(gate.requests) != 1 || gate.requests[0].Reviewer != "security" {
+		t.Fatalf("merge gate requests = %+v", gate.requests)
+	}
+}
+
 func TestEngineAdvanceReviewApprovalWaitsForAllRequiredReviewers(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -612,6 +778,65 @@ func TestEngineHandlePullRequestOpenedCreatesNewReviewRoundForUpdates(t *testing
 
 	mustJob(t, store, "review-audit-task-7-review-1")
 	mustJob(t, store, "review-audit-task-7-review-2")
+}
+
+func TestEngineHandlePullRequestOpenedIsIdempotentAfterDelegatedReview(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+	event := PullRequestEvent{
+		Repo:              "jerryfane/gitmoot",
+		Branch:            "task-7",
+		PullRequest:       7,
+		HeadSHA:           "head123",
+		TaskID:            "task-7",
+		TaskTitle:         "Workflow Engine",
+		LeadAgent:         "lead",
+		RequiredReviewers: []string{"audit"},
+	}
+
+	if err := engine.HandlePullRequestOpened(ctx, event); err != nil {
+		t.Fatalf("first HandlePullRequestOpened returned error: %v", err)
+	}
+	job := mustJob(t, store, "review-audit-task-7-review-1")
+	payload, err := unmarshalPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	payload.OriginalAgent = "audit"
+	payload.DelegatedAgent = "audit-temp-review-1"
+	payload.DelegationReason = "runtime_session_busy"
+	encoded, err := marshalPayload(payload)
+	if err != nil {
+		t.Fatalf("marshalPayload returned error: %v", err)
+	}
+	delegated, err := store.DelegateQueuedJob(ctx, job.ID, "audit", "audit-temp-review-1", encoded, db.JobEvent{
+		JobID:   job.ID,
+		Kind:    "temp_worker_delegated",
+		Message: "delegated for replay test",
+	})
+	if err != nil || !delegated {
+		t.Fatalf("DelegateQueuedJob returned delegated=%v err=%v", delegated, err)
+	}
+
+	if err := engine.HandlePullRequestOpened(ctx, event); err != nil {
+		t.Fatalf("second HandlePullRequestOpened returned error: %v", err)
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	reviewJobs := 0
+	for _, candidate := range jobs {
+		if candidate.Type == "review" {
+			reviewJobs++
+		}
+	}
+	if reviewJobs != 1 {
+		t.Fatalf("review job count = %d, want 1; jobs=%+v", reviewJobs, jobs)
+	}
 }
 
 func TestEngineHandlePullRequestOpenedPreflightsReviewersBeforeEnqueue(t *testing.T) {

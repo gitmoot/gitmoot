@@ -1503,6 +1503,15 @@ func TestRunQueuedJobsAllowsDifferentRuntimeSessionsAcrossRepos(t *testing.T) {
 func TestRunQueuedJobsLeavesBusyRuntimeSessionQueued(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	content := strings.Replace(config.DefaultConfig(paths), `same_session = "fork_temp_session"`, `same_session = "queue"`, 1)
+	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile config returned error: %v", err)
+	}
 	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
 	seedDaemonWorkerAgent(t, store, "audit", runtime.CodexRuntime, "session-1", []string{"ask"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
@@ -1517,7 +1526,7 @@ func TestRunQueuedJobsLeavesBusyRuntimeSessionQueued(t *testing.T) {
 	adapter := &cliWorkerFakeAdapter{
 		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
 	}
-	worker := defaultJobWorker(store, io.Discard)
+	worker := defaultJobWorker(store, io.Discard, home)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return t.TempDir(), nil
 	}
@@ -1545,6 +1554,396 @@ func TestRunQueuedJobsLeavesBusyRuntimeSessionQueued(t *testing.T) {
 	}
 	if !daemonWorkerHasEvent(events, "runtime_lock_wait") {
 		t.Fatalf("events = %+v, want runtime_lock_wait", events)
+	}
+}
+
+func TestRunQueuedJobsDelegatesBusyRuntimeToTempWorker(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.CodexRuntime, "session-1", []string{"ask"}, "owner/repo")
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task 1", State: string(workflow.TaskReviewing), Branch: "task-1"}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID:          "job-a",
+		Agent:       "audit",
+		Action:      "ask",
+		Repo:        "owner/repo",
+		Branch:      "task-1",
+		PullRequest: 7,
+		HeadSHA:     "abc123",
+		GoalID:      "goal-1",
+		TaskID:      "task-1",
+		TaskTitle:   "Task 1",
+	})
+	if acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+		ResourceKey: "runtime:codex:session-1",
+		OwnerJobID:  "other-job",
+		OwnerToken:  "other-token",
+		ExpiresAt:   time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano),
+	}, time.Now().UTC()); err != nil || !acquired {
+		t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
+	}
+	startAdapter := &cliWorkerFakeAdapter{startRuntimeRef: "550e8400-e29b-41d4-a716-446655440111"}
+	tempRuntimeLockKey := "runtime:codex:550e8400-e29b-41d4-a716-446655440111"
+	var lockObservedMu sync.Mutex
+	lockObserved := false
+	deliveryAdapter := &cliWorkerFakeAdapter{
+		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
+		onDeliver: func() {
+			if _, err := store.GetResourceLock(ctx, tempRuntimeLockKey); err != nil {
+				t.Errorf("GetResourceLock during temp delivery returned error: %v", err)
+				return
+			}
+			lockObservedMu.Lock()
+			lockObserved = true
+			lockObservedMu.Unlock()
+		},
+	}
+	startCheckouts := []string{}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.StartAdapterFactory = func(_ string, path string) (runtime.Adapter, error) {
+		startCheckouts = append(startCheckouts, path)
+		return startAdapter, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return deliveryAdapter, nil
+	}
+	worker.WorkflowFactory = func(string) workflow.Engine {
+		return workflow.Engine{Store: store}
+	}
+
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+
+	job, err := store.GetJob(ctx, "job-a")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobSucceeded) {
+		t.Fatalf("job state = %q, want succeeded", job.State)
+	}
+	if job.Agent == "audit" || !strings.HasPrefix(job.Agent, "audit-temp-job-a") {
+		t.Fatalf("job agent = %q, want temp worker", job.Agent)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatalf("daemonJobPayload returned error: %v", err)
+	}
+	if payload.OriginalAgent != "audit" || payload.DelegatedAgent != job.Agent || payload.DelegationReason != "runtime_session_busy" {
+		t.Fatalf("delegation payload = %+v, job agent=%s", payload, job.Agent)
+	}
+	if startAdapter.startCalls != 1 || deliveryAdapter.calls != 1 {
+		t.Fatalf("start calls=%d delivery calls=%d, want 1 each", startAdapter.startCalls, deliveryAdapter.calls)
+	}
+	lockObservedMu.Lock()
+	observed := lockObserved
+	lockObservedMu.Unlock()
+	if !observed {
+		t.Fatal("temp worker delivery did not observe runtime session lock")
+	}
+	if _, err := store.GetResourceLock(ctx, tempRuntimeLockKey); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetResourceLock after temp delivery returned error %v, want no rows", err)
+	}
+	if len(startCheckouts) != 1 || startCheckouts[0] != checkout {
+		t.Fatalf("start checkouts = %+v, want %q", startCheckouts, checkout)
+	}
+	instance, err := store.GetAgentInstance(ctx, job.Agent)
+	if err != nil {
+		t.Fatalf("GetAgentInstance returned error: %v", err)
+	}
+	if instance.Type != tempWorkerAgentType("audit") || instance.RuntimeRef != "550e8400-e29b-41d4-a716-446655440111" {
+		t.Fatalf("temp instance = %+v", instance)
+	}
+	agents, err := store.ListAgents(ctx)
+	if err != nil {
+		t.Fatalf("ListAgents returned error: %v", err)
+	}
+	for _, agent := range agents {
+		if agent.Name == job.Agent {
+			t.Fatalf("temp worker %q was persisted as regular agent: %+v", job.Agent, agents)
+		}
+	}
+	events, err := store.ListJobEvents(ctx, "job-a")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	for _, want := range []string{"temp_worker_eligible", "temp_worker_delegated", "temp_worker_merge_back_queued"} {
+		if !daemonWorkerHasEvent(events, want) {
+			t.Fatalf("events = %+v, want %s", events, want)
+		}
+	}
+	mergeBack, err := store.GetJob(ctx, "job-a-merge-back")
+	if err != nil {
+		t.Fatalf("GetJob merge-back returned error: %v", err)
+	}
+	if mergeBack.Agent != "audit" || mergeBack.Type != "ask" || mergeBack.State != string(workflow.JobQueued) {
+		t.Fatalf("merge-back job = %+v, want queued ask for original agent", mergeBack)
+	}
+	mergePayload, err := daemonJobPayload(mergeBack)
+	if err != nil {
+		t.Fatalf("daemonJobPayload merge-back returned error: %v", err)
+	}
+	if mergePayload.Sender != job.Agent || !strings.Contains(mergePayload.Instructions, "Temporary worker") || !strings.Contains(mergePayload.Instructions, "completed job job-a") {
+		t.Fatalf("merge-back payload = %+v", mergePayload)
+	}
+	if mergePayload.Branch != "task-1" || mergePayload.PullRequest != 0 || mergePayload.HeadSHA != "" {
+		t.Fatalf("merge-back payload checkout fields = %+v, want branch only", mergePayload)
+	}
+	if !strings.Contains(mergePayload.Instructions, "Pull request: #7") || !strings.Contains(mergePayload.Instructions, "Head SHA: abc123") {
+		t.Fatalf("merge-back instructions missing PR context: %q", mergePayload.Instructions)
+	}
+	if mergePayload.OriginalAgent != "audit" || mergePayload.DelegatedAgent != job.Agent || mergePayload.DelegationReason != "temp_worker_merge_back" {
+		t.Fatalf("merge-back delegation payload = %+v, completed job agent=%s", mergePayload, job.Agent)
+	}
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs merge-back returned error: %v", err)
+	}
+	mergeBack, err = store.GetJob(ctx, "job-a-merge-back")
+	if err != nil {
+		t.Fatalf("GetJob merge-back after retry returned error: %v", err)
+	}
+	if mergeBack.State != string(workflow.JobQueued) {
+		t.Fatalf("merge-back state after busy original runtime = %q, want queued", mergeBack.State)
+	}
+	if startAdapter.startCalls != 1 || deliveryAdapter.calls != 1 {
+		t.Fatalf("calls after merge-back retry start=%d delivery=%d, want no recursive temp worker", startAdapter.startCalls, deliveryAdapter.calls)
+	}
+	mergeEvents, err := store.ListJobEvents(ctx, "job-a-merge-back")
+	if err != nil {
+		t.Fatalf("ListJobEvents merge-back returned error: %v", err)
+	}
+	if !daemonWorkerHasEvent(mergeEvents, "runtime_lock_wait") {
+		t.Fatalf("merge-back events = %+v, want runtime_lock_wait", mergeEvents)
+	}
+}
+
+func TestRunQueuedJobsResumesDelegatedTempWorkerAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := config.SaveAgentType(paths, config.AgentType{
+		Name:           "planner",
+		Runtime:        runtime.CodexRuntime,
+		Role:           "planner",
+		Capabilities:   []string{"ask"},
+		AutonomyPolicy: runtime.AutonomyPolicyAuto,
+		IdleTimeout:    "17m",
+		JobTimeout:     "3m",
+	}); err != nil {
+		t.Fatalf("SaveAgentType returned error: %v", err)
+	}
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.CodexRuntime, "session-1", []string{"ask"}, "owner/repo")
+	now := time.Now().UTC()
+	if err := store.UpsertAgentInstance(ctx, db.AgentInstance{
+		Name:           "audit",
+		Type:           "planner",
+		Runtime:        runtime.CodexRuntime,
+		RuntimeRef:     "session-1",
+		RepoFullName:   "owner/repo",
+		Role:           "planner",
+		Capabilities:   []string{"ask"},
+		AutonomyPolicy: runtime.AutonomyPolicyAuto,
+		State:          "running",
+		CreatedAt:      now.Format(time.RFC3339Nano),
+		LastUsedAt:     now.Format(time.RFC3339Nano),
+		ExpiresAt:      now.Add(time.Hour).Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatalf("UpsertAgentInstance original returned error: %v", err)
+	}
+	if err := store.UpsertAgentInstance(ctx, db.AgentInstance{
+		Name:           "audit-temp-job-a",
+		Type:           tempWorkerAgentType("audit"),
+		Runtime:        runtime.CodexRuntime,
+		RuntimeRef:     "550e8400-e29b-41d4-a716-446655440333",
+		RepoFullName:   "owner/repo",
+		Role:           "planner",
+		Capabilities:   []string{"ask"},
+		AutonomyPolicy: runtime.AutonomyPolicyAuto,
+		State:          "idle",
+		CreatedAt:      now.Format(time.RFC3339Nano),
+		LastUsedAt:     now.Format(time.RFC3339Nano),
+		ExpiresAt:      now.Add(time.Hour).Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatalf("UpsertAgentInstance temp returned error: %v", err)
+	}
+	if _, err := store.GetAgent(ctx, "audit-temp-job-a"); err != nil {
+		t.Fatalf("GetAgent temp instance fallback returned error: %v", err)
+	}
+	agents, err := store.ListAgents(ctx)
+	if err != nil {
+		t.Fatalf("ListAgents returned error: %v", err)
+	}
+	for _, agent := range agents {
+		if agent.Name == "audit-temp-job-a" {
+			t.Fatalf("temp worker %q was persisted as regular agent: %+v", agent.Name, agents)
+		}
+	}
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo:             "owner/repo",
+		Branch:           "main",
+		Sender:           "tester",
+		Instructions:     "continue",
+		OriginalAgent:    "audit",
+		DelegatedAgent:   "audit-temp-job-a",
+		DelegationReason: "runtime_session_busy",
+	})
+	if err != nil {
+		t.Fatalf("Marshal payload returned error: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-a", Agent: "audit-temp-job-a", Type: "ask", State: string(workflow.JobQueued), Payload: string(payload)}, db.JobEvent{Kind: string(workflow.JobQueued), Message: "queued"}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	deliveryAdapter := &cliWorkerFakeAdapter{
+		output: `{"gitmoot_result":{"decision":"approved","summary":"resumed","findings":[],"changes_made":[],"tests_run":["go test"],"needs":[],"next_agents":[]}}`,
+	}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return deliveryAdapter, nil
+	}
+	worker.WorkflowFactory = func(string) workflow.Engine {
+		return workflow.Engine{Store: store}
+	}
+
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+
+	job, err := store.GetJob(ctx, "job-a")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobSucceeded) {
+		t.Fatalf("job state = %q, want succeeded", job.State)
+	}
+	instance, err := store.GetAgentInstance(ctx, "audit-temp-job-a")
+	if err != nil {
+		t.Fatalf("GetAgentInstance returned error: %v", err)
+	}
+	if instance.State != "idle" {
+		t.Fatalf("temp instance state = %q, want idle", instance.State)
+	}
+}
+
+func TestRunQueuedJobsReturnsTempWorkerIdleAfterDeliveryError(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.CodexRuntime, "session-1", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main"})
+	if acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+		ResourceKey: "runtime:codex:session-1",
+		OwnerJobID:  "other-job",
+		OwnerToken:  "other-token",
+		ExpiresAt:   time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano),
+	}, time.Now().UTC()); err != nil || !acquired {
+		t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
+	}
+	startAdapter := &cliWorkerFakeAdapter{startRuntimeRef: "550e8400-e29b-41d4-a716-446655440222"}
+	deliveryAdapter := &cliWorkerFakeAdapter{err: errors.New("delivery failed")}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.StartAdapterFactory = func(string, string) (runtime.Adapter, error) {
+		return startAdapter, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return deliveryAdapter, nil
+	}
+	worker.WorkflowFactory = func(string) workflow.Engine {
+		return workflow.Engine{Store: store}
+	}
+
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+
+	job, err := store.GetJob(ctx, "job-a")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobFailed) {
+		t.Fatalf("job state = %q, want failed", job.State)
+	}
+	instance, err := store.GetAgentInstance(ctx, job.Agent)
+	if err != nil {
+		t.Fatalf("GetAgentInstance returned error: %v", err)
+	}
+	if instance.State != "idle" {
+		t.Fatalf("temp instance state = %q, want idle", instance.State)
+	}
+}
+
+func TestRunQueuedJobsCleansTempWorkerWhenDelegationRaceLoses(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.CodexRuntime, "session-1", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main"})
+	if acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+		ResourceKey: "runtime:codex:session-1",
+		OwnerJobID:  "other-job",
+		OwnerToken:  "other-token",
+		ExpiresAt:   time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano),
+	}, time.Now().UTC()); err != nil || !acquired {
+		t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
+	}
+	startAdapter := &cliWorkerFakeAdapter{
+		startRuntimeRef: "550e8400-e29b-41d4-a716-446655440444",
+		onStart: func() {
+			if _, err := workflow.CancelJob(ctx, store, "job-a"); err != nil {
+				t.Fatalf("CancelJob returned error: %v", err)
+			}
+		},
+	}
+	deliveryAdapter := &cliWorkerFakeAdapter{
+		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
+	}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.StartAdapterFactory = func(string, string) (runtime.Adapter, error) {
+		return startAdapter, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return deliveryAdapter, nil
+	}
+
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+
+	job, err := store.GetJob(ctx, "job-a")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobCancelled) {
+		t.Fatalf("job state = %q, want cancelled", job.State)
+	}
+	if _, err := store.GetAgentInstance(ctx, "audit-temp-job-a"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetAgentInstance temp error = %v, want no rows", err)
+	}
+	if _, err := store.GetAgent(ctx, "audit-temp-job-a"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetAgent temp error = %v, want no rows", err)
 	}
 }
 
@@ -1839,6 +2238,76 @@ func TestRunQueuedJobsUsesTaskWorktreeForImplement(t *testing.T) {
 	}
 }
 
+func TestRunQueuedJobsResumesDelegatedImplementWithOriginalBranchLock(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	worktree := filepath.Join(t.TempDir(), "task-1")
+	runDaemonWorkerGit(t, checkout, "worktree", "add", "-b", "task-1", worktree, "main")
+	head, err := (gitutil.Client{Dir: worktree}).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("HeadSHA returned error: %v", err)
+	}
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "lead", runtime.ShellRuntime, "unused", []string{"implement"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "lead-temp-job-implement", runtime.ShellRuntime, "unused", []string{"implement"}, "owner/repo")
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task 1", State: string(workflow.TaskImplementing), Branch: "task-1", WorktreePath: worktree}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: "task-1", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID:               "job-implement",
+		Agent:            "lead-temp-job-implement",
+		Action:           "implement",
+		Repo:             "owner/repo",
+		Branch:           "task-1",
+		HeadSHA:          head,
+		GoalID:           "goal-1",
+		TaskID:           "task-1",
+		TaskTitle:        "Task 1",
+		LeadAgent:        "lead",
+		OriginalAgent:    "lead",
+		DelegatedAgent:   "lead-temp-job-implement",
+		DelegationReason: "runtime_session_busy",
+	})
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"implemented","summary":"implemented","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`}
+	worker := defaultJobWorker(store, io.Discard)
+	adapterCheckout := ""
+	worker.AdapterFactory = func(_ runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
+		adapterCheckout = checkout
+		return adapter, nil
+	}
+	worker.WorkflowFactory = func(checkout string) workflow.Engine {
+		return workflow.Engine{
+			Store: store,
+			PayloadRefresher: func(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
+				return refreshDaemonJobPayload(ctx, store, checkout, job, payload)
+			},
+		}
+	}
+
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+
+	job, err := store.GetJob(ctx, "job-implement")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobSucceeded) {
+		t.Fatalf("job state = %q, want succeeded", job.State)
+	}
+	wantCheckout := filepath.Clean(worktree)
+	if adapterCheckout != wantCheckout {
+		t.Fatalf("adapter checkout = %q, want %q", adapterCheckout, wantCheckout)
+	}
+	if adapter.calls != 1 {
+		t.Fatalf("adapter calls = %d, want 1", adapter.calls)
+	}
+}
+
 func TestRunQueuedJobsUsesTaskWorktreeForReview(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
@@ -2006,6 +2475,228 @@ func TestSelectRunnableQueuedJobsKeepsSameRuntimeSerializedAcrossWorktrees(t *te
 
 	if len(selected) != 1 || len(remaining) != 1 {
 		t.Fatalf("selected=%d remaining=%d, want same runtime session serialized", len(selected), len(remaining))
+	}
+}
+
+func TestSelectRunnableQueuedJobsAllowsForkEligibleSameRuntime(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerAgentWithPolicy(t, store, "lead-a", runtime.CodexRuntime, "session-1", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
+	seedDaemonWorkerAgentWithPolicy(t, store, "lead-b", runtime.CodexRuntime, "session-1", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
+	worktreeA := t.TempDir()
+	worktreeB := t.TempDir()
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-a", RepoFullName: "owner/repo", State: string(workflow.TaskImplementing), Branch: "task-a", WorktreePath: worktreeA}); err != nil {
+		t.Fatalf("UpsertTask task-a returned error: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-b", RepoFullName: "owner/repo", State: string(workflow.TaskImplementing), Branch: "task-b", WorktreePath: worktreeB}); err != nil {
+		t.Fatalf("UpsertTask task-b returned error: %v", err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "lead-a", Action: "implement", Repo: "owner/repo", Branch: "task-a", TaskID: "task-a"})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-b", Agent: "lead-b", Action: "implement", Repo: "owner/repo", Branch: "task-b", TaskID: "task-b"})
+	jobs, err := store.ListQueuedJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListQueuedJobs returned error: %v", err)
+	}
+
+	selected, remaining := selectRunnableQueuedJobsWithPolicy(ctx, store, jobs, 2, config.DefaultParallelSessionPolicy())
+
+	if len(selected) != 2 || len(remaining) != 0 {
+		t.Fatalf("selected=%d remaining=%d, want fork-eligible same runtime selected", len(selected), len(remaining))
+	}
+}
+
+func TestSelectRunnableQueuedJobsCountsExternallyBusyRuntimeAgainstTempCap(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.CodexRuntime, "session-1", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
+	worktreeA := t.TempDir()
+	worktreeB := t.TempDir()
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-a", RepoFullName: "owner/repo", State: string(workflow.TaskImplementing), Branch: "task-a", WorktreePath: worktreeA}); err != nil {
+		t.Fatalf("UpsertTask task-a returned error: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-b", RepoFullName: "owner/repo", State: string(workflow.TaskImplementing), Branch: "task-b", WorktreePath: worktreeB}); err != nil {
+		t.Fatalf("UpsertTask task-b returned error: %v", err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "lead", Action: "implement", Repo: "owner/repo", Branch: "task-a", TaskID: "task-a"})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-b", Agent: "lead", Action: "implement", Repo: "owner/repo", Branch: "task-b", TaskID: "task-b"})
+	if acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+		ResourceKey: "runtime:codex:session-1",
+		OwnerJobID:  "other-job",
+		OwnerToken:  "other-token",
+		ExpiresAt:   time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano),
+	}, time.Now().UTC()); err != nil || !acquired {
+		t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
+	}
+	jobs, err := store.ListQueuedJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListQueuedJobs returned error: %v", err)
+	}
+	policy := config.DefaultParallelSessionPolicy()
+	policy.MaxTempSessionsPerAgent = 1
+
+	selected, remaining := selectRunnableQueuedJobsWithPolicy(ctx, store, jobs, 2, policy)
+
+	if len(selected) != 1 || len(remaining) != 1 {
+		t.Fatalf("selected=%d remaining=%d, want external busy runtime counted against temp cap", len(selected), len(remaining))
+	}
+}
+
+func TestTempWorkerEligibleAllowsWritableImplementWithTaskWorktree(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	worktree := t.TempDir()
+	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.CodexRuntime, "session-1", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-a", RepoFullName: "owner/repo", State: string(workflow.TaskImplementing), Branch: "task-a", WorktreePath: worktree}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "lead", Action: "implement", Repo: "owner/repo", Branch: "task-a", TaskID: "task-a"})
+	job, err := store.GetJob(ctx, "job-a")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatalf("daemonJobPayload returned error: %v", err)
+	}
+
+	got := tempWorkerEligible(ctx, store, job, payload, runtime.Agent{Name: "lead", Runtime: runtime.CodexRuntime, AutonomyPolicy: runtime.AutonomyPolicyWorkspaceWrite}, config.DefaultParallelSessionPolicy(), time.Now().UTC())
+
+	if !got.Eligible {
+		t.Fatalf("tempWorkerEligible = %+v, want eligible", got)
+	}
+}
+
+func TestTempWorkerEligibleRejectsQueuePolicy(t *testing.T) {
+	policy := config.DefaultParallelSessionPolicy()
+	policy.SameSession = config.ParallelSessionQueue
+
+	got := tempWorkerEligible(context.Background(), nil, db.Job{ID: "job-a", Type: "ask"}, workflow.JobPayload{}, runtime.Agent{Name: "lead", Runtime: runtime.CodexRuntime}, policy, time.Now().UTC())
+
+	if got.Eligible || !strings.Contains(got.Reason, "same_session is queue") {
+		t.Fatalf("tempWorkerEligible = %+v, want queue policy rejection", got)
+	}
+}
+
+func TestTempWorkerEligibleRejectsAlreadyDelegatedJob(t *testing.T) {
+	got := tempWorkerEligible(context.Background(), nil, db.Job{ID: "job-a", Type: "ask"}, workflow.JobPayload{DelegationReason: "runtime_session_busy"}, runtime.Agent{Name: "lead-temp-job-a", Runtime: runtime.CodexRuntime}, config.DefaultParallelSessionPolicy(), time.Now().UTC())
+
+	if got.Eligible || !strings.Contains(got.Reason, "delegated temp worker waits") {
+		t.Fatalf("tempWorkerEligible = %+v, want delegated job rejection", got)
+	}
+}
+
+func TestJobWorkerParallelSessionPolicyUsesDefaultWhenHomeNotExplicit(t *testing.T) {
+	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard)
+
+	got, err := worker.parallelSessionPolicy()
+	if err != nil {
+		t.Fatalf("parallelSessionPolicy returned error: %v", err)
+	}
+
+	if got.SameSession != config.ParallelSessionForkTempSession {
+		t.Fatalf("same_session = %q, want default fork_temp_session", got.SameSession)
+	}
+}
+
+func TestJobWorkerParallelSessionPolicyLoadsExplicitHome(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	content := strings.Replace(config.DefaultConfig(paths), `same_session = "fork_temp_session"`, `same_session = "queue"`, 1)
+	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile config returned error: %v", err)
+	}
+	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
+
+	got, err := worker.parallelSessionPolicy()
+	if err != nil {
+		t.Fatalf("parallelSessionPolicy returned error: %v", err)
+	}
+
+	if got.SameSession != config.ParallelSessionQueue {
+		t.Fatalf("same_session = %q, want explicit queue config", got.SameSession)
+	}
+}
+
+func TestTempWorkerEligibleRejectsReadOnlyImplementation(t *testing.T) {
+	got := tempWorkerEligible(context.Background(), nil, db.Job{ID: "job-a", Type: "implement"}, workflow.JobPayload{}, runtime.Agent{Name: "lead", Runtime: runtime.CodexRuntime, AutonomyPolicy: runtime.AutonomyPolicyReadOnly}, config.DefaultParallelSessionPolicy(), time.Now().UTC())
+
+	if got.Eligible || !strings.Contains(got.Reason, "writable agent policy") {
+		t.Fatalf("tempWorkerEligible = %+v, want read-only implementation rejection", got)
+	}
+}
+
+func TestTempWorkerEligibleRejectsImplementationWithoutTaskWorktree(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+
+	got := tempWorkerEligible(ctx, store, db.Job{ID: "job-a", Type: "implement"}, workflow.JobPayload{Repo: "owner/repo", TaskID: "task-a"}, runtime.Agent{Name: "lead", Runtime: runtime.CodexRuntime, AutonomyPolicy: runtime.AutonomyPolicyWorkspaceWrite}, config.DefaultParallelSessionPolicy(), time.Now().UTC())
+
+	if got.Eligible || !strings.Contains(got.Reason, "task worktree") {
+		t.Fatalf("tempWorkerEligible = %+v, want missing worktree rejection", got)
+	}
+}
+
+func TestTempWorkerEligibleRejectsMaxTempWorkers(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	now := time.Now().UTC()
+	for i := 0; i < 4; i++ {
+		if err := store.UpsertAgentInstance(ctx, db.AgentInstance{
+			Name:           fmt.Sprintf("lead-temp-%d", i),
+			Type:           tempWorkerAgentType("lead"),
+			Runtime:        runtime.CodexRuntime,
+			RuntimeRef:     fmt.Sprintf("session-%d", i),
+			RepoFullName:   "owner/repo",
+			Role:           "worker",
+			AutonomyPolicy: runtime.AutonomyPolicyAuto,
+			State:          "idle",
+			CreatedAt:      now.Format(time.RFC3339),
+			LastUsedAt:     now.Format(time.RFC3339),
+			ExpiresAt:      now.Add(time.Hour).Format(time.RFC3339),
+		}); err != nil {
+			t.Fatalf("UpsertAgentInstance %d returned error: %v", i, err)
+		}
+	}
+
+	got := tempWorkerEligible(ctx, store, db.Job{ID: "job-a", Type: "ask"}, workflow.JobPayload{}, runtime.Agent{Name: "lead", Runtime: runtime.CodexRuntime, AutonomyPolicy: runtime.AutonomyPolicyAuto}, config.DefaultParallelSessionPolicy(), now)
+
+	if got.Eligible || !strings.Contains(got.Reason, "max temp workers reached") {
+		t.Fatalf("tempWorkerEligible = %+v, want cap rejection", got)
+	}
+}
+
+func TestDaemonReviewersIgnoresTempWorkerInstances(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.CodexRuntime, "session-1", []string{"review"}, "owner/repo")
+	now := time.Now().UTC()
+	if err := store.UpsertAgentInstance(ctx, db.AgentInstance{
+		Name:           "audit-temp-job-a",
+		Type:           tempWorkerAgentType("audit"),
+		Runtime:        runtime.CodexRuntime,
+		RuntimeRef:     "550e8400-e29b-41d4-a716-446655440555",
+		RepoFullName:   "owner/repo",
+		Role:           "reviewer",
+		Capabilities:   []string{"review"},
+		AutonomyPolicy: runtime.AutonomyPolicyAuto,
+		State:          "idle",
+		CreatedAt:      now.Format(time.RFC3339),
+		LastUsedAt:     now.Format(time.RFC3339),
+		ExpiresAt:      now.Add(time.Hour).Format(time.RFC3339),
+	}); err != nil {
+		t.Fatalf("UpsertAgentInstance returned error: %v", err)
+	}
+
+	reviewers, err := daemonReviewers(ctx, store, "owner/repo")
+	if err != nil {
+		t.Fatalf("daemonReviewers returned error: %v", err)
+	}
+
+	if !reflect.DeepEqual(reviewers, []string{"audit"}) {
+		t.Fatalf("reviewers = %+v, want only regular configured reviewer", reviewers)
 	}
 }
 
@@ -2866,11 +3557,42 @@ type cliWorkerFakeAdapter struct {
 	mu                   sync.Mutex
 	output               string
 	err                  error
+	startRuntimeRef      string
+	startErr             error
+	startCalls           int
+	startCheckouts       []string
 	calls                int
 	delivered            []string
+	onStart              func()
 	onDeliver            func()
 	waitForContextCancel bool
 	contextCancelled     bool
+}
+
+func (f *cliWorkerFakeAdapter) Name() string {
+	return "fake"
+}
+
+func (f *cliWorkerFakeAdapter) Start(_ context.Context, _ runtime.StartRequest) (runtime.StartResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.startCalls++
+	if f.startErr != nil {
+		return runtime.StartResult{}, f.startErr
+	}
+	onStart := f.onStart
+	ref := strings.TrimSpace(f.startRuntimeRef)
+	if ref == "" {
+		ref = "550e8400-e29b-41d4-a716-446655440000"
+	}
+	if onStart != nil {
+		onStart()
+	}
+	return runtime.StartResult{RuntimeRef: ref}, nil
+}
+
+func (f *cliWorkerFakeAdapter) Validate(context.Context, runtime.Agent) error {
+	return nil
 }
 
 func (f *cliWorkerFakeAdapter) Deliver(ctx context.Context, _ runtime.Agent, job runtime.Job) (runtime.Result, error) {
@@ -2894,6 +3616,14 @@ func (f *cliWorkerFakeAdapter) Deliver(ctx context.Context, _ runtime.Agent, job
 		return runtime.Result{}, f.err
 	}
 	return runtime.Result{Raw: f.output}, nil
+}
+
+func (f *cliWorkerFakeAdapter) Health(context.Context, runtime.Agent) error {
+	return nil
+}
+
+func (f *cliWorkerFakeAdapter) Capabilities(context.Context) ([]string, error) {
+	return nil, nil
 }
 
 func (f *cliWorkerFakeAdapter) observedContextCancel() bool {

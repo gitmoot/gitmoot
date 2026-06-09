@@ -1895,6 +1895,34 @@ func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id strin
 	return true, tx.Commit()
 }
 
+func (s *Store) DelegateQueuedJob(ctx context.Context, id string, fromAgent string, toAgent string, payload string, event JobEvent) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET agent = ?, payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND agent = ? AND state = ?`,
+		strings.TrimSpace(toAgent), payload, id, strings.TrimSpace(fromAgent), "queued")
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, tx.Commit()
+	}
+	if event.JobID == "" {
+		event.JobID = id
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
 func (s *Store) UpdateJobPayload(ctx context.Context, id string, payload string) error {
 	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, payload, id)
 	if err != nil {

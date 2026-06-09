@@ -19,22 +19,25 @@ type Mailbox struct {
 }
 
 type JobRequest struct {
-	ID           string
-	Agent        string
-	Action       string
-	Repo         string
-	Branch       string
-	PullRequest  int
-	HeadSHA      string
-	GoalID       string
-	TaskID       string
-	TaskTitle    string
-	LeadAgent    string
-	Reviewers    []string
-	ReviewRound  string
-	Sender       string
-	Instructions string
-	Constraints  []string
+	ID               string
+	Agent            string
+	Action           string
+	Repo             string
+	Branch           string
+	PullRequest      int
+	HeadSHA          string
+	GoalID           string
+	TaskID           string
+	TaskTitle        string
+	LeadAgent        string
+	Reviewers        []string
+	ReviewRound      string
+	Sender           string
+	Instructions     string
+	Constraints      []string
+	OriginalAgent    string
+	DelegatedAgent   string
+	DelegationReason string
 }
 
 type JobPayload struct {
@@ -54,6 +57,9 @@ type JobPayload struct {
 	TemplateID             string       `json:"template_id,omitempty"`
 	TemplateResolvedCommit string       `json:"template_resolved_commit,omitempty"`
 	TemplateContent        string       `json:"template_content,omitempty"`
+	OriginalAgent          string       `json:"original_agent,omitempty"`
+	DelegatedAgent         string       `json:"delegated_agent,omitempty"`
+	DelegationReason       string       `json:"delegation_reason,omitempty"`
 	RawOutputs             []string     `json:"raw_outputs,omitempty"`
 	Result                 *AgentResult `json:"result,omitempty"`
 }
@@ -92,6 +98,9 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		TemplateID:             snapshot.ID,
 		TemplateResolvedCommit: snapshot.ResolvedCommit,
 		TemplateContent:        snapshot.Content,
+		OriginalAgent:          request.OriginalAgent,
+		DelegatedAgent:         request.DelegatedAgent,
+		DelegationReason:       request.DelegationReason,
 	})
 	if err != nil {
 		return db.Job{}, err

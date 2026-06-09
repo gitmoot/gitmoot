@@ -1133,13 +1133,15 @@ func shorterWait(current time.Duration, candidate time.Duration, set *bool) time
 }
 
 type jobWorker struct {
-	Store             *db.Store
-	Stdout            io.Writer
-	ConfigHome        string
-	AdapterFactory    func(runtime.Agent, string) (workflow.DeliveryAdapter, error)
-	CheckoutValidator func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error)
-	WorkflowFactory   func(string) workflow.Engine
-	CommenterFactory  func(string) github.Client
+	Store               *db.Store
+	Stdout              io.Writer
+	ConfigHome          string
+	ConfigHomeExplicit  bool
+	AdapterFactory      func(runtime.Agent, string) (workflow.DeliveryAdapter, error)
+	StartAdapterFactory func(string, string) (runtime.Adapter, error)
+	CheckoutValidator   func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error)
+	WorkflowFactory     func(string) workflow.Engine
+	CommenterFactory    func(string) github.Client
 }
 
 const daemonRunningJobStaleAfter = 30 * time.Minute
@@ -1148,13 +1150,21 @@ const daemonWorkerLoopInterval = 1 * time.Second
 
 var errRuntimeSessionBusy = errors.New("runtime session is busy")
 
+type tempWorkerEligibility struct {
+	Eligible bool
+	Reason   string
+}
+
 func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWorker {
 	configHome := ""
+	configHomeExplicit := false
 	if len(home) > 0 {
 		configHome = home[0]
+		configHomeExplicit = true
 	}
-	worker := jobWorker{Store: store, Stdout: stdout, ConfigHome: configHome}
+	worker := jobWorker{Store: store, Stdout: stdout, ConfigHome: configHome, ConfigHomeExplicit: configHomeExplicit}
 	worker.AdapterFactory = worker.defaultAdapter
+	worker.StartAdapterFactory = worker.defaultStartAdapter
 	worker.CheckoutValidator = worker.defaultCheckout
 	worker.WorkflowFactory = worker.defaultWorkflow
 	return worker
@@ -1379,7 +1389,11 @@ func runQueuedJobsForRepo(ctx context.Context, worker jobWorker, limit int, repo
 		}
 	}
 	for len(pending) > 0 {
-		queued, remaining := selectRunnableQueuedJobs(ctx, worker.Store, pending, limit)
+		policy, err := worker.parallelSessionPolicy()
+		if err != nil {
+			policy = config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue}
+		}
+		queued, remaining := selectRunnableQueuedJobsWithPolicy(ctx, worker.Store, pending, limit, policy)
 		if len(queued) == 0 {
 			return nil
 		}
@@ -1407,19 +1421,27 @@ func runQueuedJobsForRepo(ctx context.Context, worker jobWorker, limit int, repo
 }
 
 type queuedJobResourceSelector struct {
-	limit     int
-	checkouts map[string]bool
-	runtimes  map[string]bool
+	limit            int
+	policy           config.ParallelSessionPolicy
+	checkouts        map[string]bool
+	runtimes         map[string]bool
+	tempReservations map[string]int
 }
 
 func selectRunnableQueuedJobs(ctx context.Context, store *db.Store, pending []db.Job, limit int) ([]db.Job, []db.Job) {
+	return selectRunnableQueuedJobsWithPolicy(ctx, store, pending, limit, config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue})
+}
+
+func selectRunnableQueuedJobsWithPolicy(ctx context.Context, store *db.Store, pending []db.Job, limit int, policy config.ParallelSessionPolicy) ([]db.Job, []db.Job) {
 	if limit <= 0 {
 		return nil, pending
 	}
 	selector := queuedJobResourceSelector{
-		limit:     limit,
-		checkouts: map[string]bool{},
-		runtimes:  map[string]bool{},
+		limit:            limit,
+		policy:           policy,
+		checkouts:        map[string]bool{},
+		runtimes:         map[string]bool{},
+		tempReservations: map[string]int{},
 	}
 	queued := make([]db.Job, 0, min(limit, len(pending)))
 	remaining := make([]db.Job, 0, len(pending))
@@ -1439,13 +1461,57 @@ func (s queuedJobResourceSelector) selects(ctx context.Context, store *db.Store,
 	}
 	checkoutKey := queuedJobCheckoutKey(ctx, store, job)
 	runtimeKey := queuedJobRuntimeResourceKey(ctx, store, job)
-	if s.checkouts[checkoutKey] || (runtimeKey != "" && s.runtimes[runtimeKey]) {
+	if s.checkouts[checkoutKey] {
 		return false
+	}
+	runtimeAlreadySelected := runtimeKey != "" && s.runtimes[runtimeKey]
+	runtimeAlreadyLocked := runtimeKey != "" && !runtimeAlreadySelected && runtimeResourceLocked(ctx, store, runtimeKey)
+	if runtimeAlreadySelected || runtimeAlreadyLocked {
+		if !s.canUseTempWorker(ctx, store, job) && runtimeAlreadySelected {
+			return false
+		}
 	}
 	s.checkouts[checkoutKey] = true
 	if runtimeKey != "" {
 		s.runtimes[runtimeKey] = true
 	}
+	return true
+}
+
+func runtimeResourceLocked(ctx context.Context, store *db.Store, runtimeKey string) bool {
+	if store == nil || strings.TrimSpace(runtimeKey) == "" {
+		return false
+	}
+	_, err := store.GetResourceLock(ctx, runtimeKey)
+	return err == nil
+}
+
+func (s queuedJobResourceSelector) canUseTempWorker(ctx context.Context, store *db.Store, job db.Job) bool {
+	if store == nil {
+		return false
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		return false
+	}
+	dbAgent, err := store.GetAgent(ctx, job.Agent)
+	if err != nil {
+		return false
+	}
+	agent := runtimeAgent(dbAgent)
+	typ := tempWorkerAgentType(agent.Name)
+	count, err := store.CountActiveAgentInstances(ctx, typ, agent.AutonomyPolicy, time.Now().UTC())
+	if err != nil {
+		return false
+	}
+	if count+s.tempReservations[typ] >= s.policy.MaxTempSessionsPerAgent {
+		return false
+	}
+	eligible := tempWorkerEligible(ctx, store, job, payload, agent, s.policy, time.Now().UTC())
+	if !eligible.Eligible {
+		return false
+	}
+	s.tempReservations[typ]++
 	return true
 }
 
@@ -1566,6 +1632,24 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	if !acquired {
 		message := fmt.Sprintf("runtime session %s is busy", lockKey)
+		policy, policyErr := w.parallelSessionPolicy()
+		if policyErr != nil {
+			if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, policyErr); finishErr != nil {
+				return finishErr
+			}
+			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, policyErr)
+			return nil
+		}
+		eligibility := tempWorkerEligible(ctx, w.Store, job, payload, agent, policy, time.Now().UTC())
+		if eligibility.Eligible {
+			eligibleMessage := fmt.Sprintf("%s; temp worker eligible", message)
+			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "temp_worker_eligible", Message: eligibleMessage}); eventErr != nil {
+				return eventErr
+			}
+			return w.runWithTempWorker(ctx, job, payload, agent, checkout, policy, eligibleMessage)
+		} else if strings.TrimSpace(eligibility.Reason) != "" {
+			message = fmt.Sprintf("%s; temp worker ineligible: %s", message, eligibility.Reason)
+		}
 		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_lock_wait", Message: message}); eventErr != nil {
 			return eventErr
 		}
@@ -1621,6 +1705,382 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	return nil
 }
 
+func (w jobWorker) parallelSessionPolicy() (config.ParallelSessionPolicy, error) {
+	if !w.ConfigHomeExplicit && strings.TrimSpace(w.ConfigHome) == "" {
+		return config.DefaultParallelSessionPolicy(), nil
+	}
+	paths, err := initializedPaths(w.ConfigHome)
+	if err != nil {
+		return config.ParallelSessionPolicy{}, err
+	}
+	return config.LoadParallelSessionPolicy(paths)
+}
+
+func tempWorkerEligible(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload, agent runtime.Agent, policy config.ParallelSessionPolicy, now time.Time) tempWorkerEligibility {
+	if payload.DelegationReason == "temp_worker_merge_back" {
+		return tempWorkerEligibility{Reason: "merge-back waits for original runtime session"}
+	}
+	if payload.DelegationReason == "runtime_session_busy" {
+		return tempWorkerEligibility{Reason: "delegated temp worker waits for assigned runtime session"}
+	}
+	if policy.SameSession != config.ParallelSessionForkTempSession {
+		return tempWorkerEligibility{Reason: "parallel_sessions.same_session is queue"}
+	}
+	switch agent.Runtime {
+	case runtime.CodexRuntime, runtime.ClaudeRuntime:
+	default:
+		return tempWorkerEligibility{Reason: fmt.Sprintf("runtime %s does not support temp workers", agent.Runtime)}
+	}
+	if !parallelSessionActionAllowed(job.Type, policy.EligibleActions) {
+		return tempWorkerEligibility{Reason: fmt.Sprintf("action %s is not eligible", job.Type)}
+	}
+	if readOnlyImplementationBlocked(job.Type, agent) {
+		return tempWorkerEligibility{Reason: "implementation requires writable agent policy"}
+	}
+	if strings.TrimSpace(job.Type) == "implement" {
+		path, ok := queuedJobTaskWorktreePath(ctx, store, payload)
+		if !ok {
+			return tempWorkerEligibility{Reason: "implementation requires task worktree"}
+		}
+		if info, err := os.Stat(path); err != nil || !info.IsDir() {
+			return tempWorkerEligibility{Reason: "implementation task worktree is missing"}
+		}
+	}
+	if store != nil {
+		count, err := store.CountActiveAgentInstances(ctx, tempWorkerAgentType(agent.Name), agent.AutonomyPolicy, now)
+		if err != nil {
+			return tempWorkerEligibility{Reason: fmt.Sprintf("count active temp workers: %v", err)}
+		}
+		if count >= policy.MaxTempSessionsPerAgent {
+			return tempWorkerEligibility{Reason: fmt.Sprintf("max temp workers reached for %s", agent.Name)}
+		}
+	}
+	return tempWorkerEligibility{Eligible: true}
+}
+
+func parallelSessionActionAllowed(action string, eligibleActions []string) bool {
+	action = strings.TrimSpace(action)
+	for _, candidate := range eligibleActions {
+		if strings.TrimSpace(candidate) == action {
+			return true
+		}
+	}
+	return false
+}
+
+func tempWorkerAgentType(agentName string) string {
+	return "temp:" + strings.TrimSpace(agentName)
+}
+
+type tempWorkerStartResult struct {
+	Agent       runtime.Agent
+	IdleTimeout time.Duration
+	JobTimeout  time.Duration
+}
+
+func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, original runtime.Agent, checkout string, policy config.ParallelSessionPolicy, reason string) error {
+	started, err := w.startTempWorker(ctx, job, payload, original, checkout)
+	if err != nil {
+		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "temp_worker_failed", Message: err.Error()}); eventErr != nil {
+			return eventErr
+		}
+		waitMessage := fmt.Sprintf("%s; temp worker start failed: %v", reason, err)
+		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_lock_wait", Message: waitMessage}); eventErr != nil {
+			return eventErr
+		}
+		writeLine(w.Stdout, "job %s waiting: %s", job.ID, waitMessage)
+		return fmt.Errorf("%w: %s", errRuntimeSessionBusy, waitMessage)
+	}
+	payload.OriginalAgent = original.Name
+	payload.DelegatedAgent = started.Agent.Name
+	payload.DelegationReason = "runtime_session_busy"
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	delegated, err := w.Store.DelegateQueuedJob(ctx, job.ID, original.Name, started.Agent.Name, string(encoded), db.JobEvent{
+		JobID:   job.ID,
+		Kind:    "temp_worker_delegated",
+		Message: fmt.Sprintf("delegated from %s to %s: %s", original.Name, started.Agent.Name, reason),
+	})
+	if err != nil {
+		w.cleanupTempWorker(context.Background(), started.Agent.Name)
+		return err
+	}
+	if !delegated {
+		w.cleanupTempWorker(context.Background(), started.Agent.Name)
+		return nil
+	}
+	delegatedJob, err := w.Store.GetJob(ctx, job.ID)
+	if err != nil {
+		return err
+	}
+	adapter, err := w.AdapterFactory(started.Agent, checkout)
+	if err != nil {
+		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
+		return nil
+	}
+	writeLine(w.Stdout, "running job %s for temporary worker %s in %s", job.ID, started.Agent.Name, payload.Repo)
+	releaseLock, acquired, lockKey, err := acquireRuntimeSessionLock(ctx, w.Store, delegatedJob.ID, started.Agent, time.Now().UTC(), started.JobTimeout)
+	if err != nil {
+		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
+		return nil
+	}
+	if !acquired {
+		message := fmt.Sprintf("runtime session %s is busy", lockKey)
+		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: delegatedJob.ID, Kind: "runtime_lock_wait", Message: message}); eventErr != nil {
+			return eventErr
+		}
+		writeLine(w.Stdout, "job %s waiting: %s", delegatedJob.ID, message)
+		return fmt.Errorf("%w: %s", errRuntimeSessionBusy, message)
+	}
+	defer func() {
+		if err := releaseLock(context.Background()); err != nil {
+			writeLine(w.Stdout, "job %s temp runtime lock release failed: %v", delegatedJob.ID, err)
+		}
+	}()
+	if err := w.Store.MarkAgentInstanceRunning(ctx, started.Agent.Name, time.Now().UTC(), started.JobTimeout); err != nil {
+		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
+		return nil
+	}
+	defer func() {
+		if err := w.Store.TouchAgentInstance(context.Background(), started.Agent.Name, time.Now().UTC(), started.IdleTimeout); err != nil {
+			writeLine(w.Stdout, "job %s temp worker state update failed: %v", delegatedJob.ID, err)
+		}
+	}()
+	runCtx, stopRun := w.runningJobContext(ctx, job.ID)
+	defer stopRun()
+	if started.JobTimeout > 0 {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(runCtx, started.JobTimeout)
+		defer cancel()
+	}
+	engine := w.WorkflowFactory(checkout)
+	_, err = engine.RunJob(runCtx, delegatedJob.ID, started.Agent, adapter)
+	if err != nil {
+		if markErr := w.handleRunJobError(ctx, delegatedJob.ID, err); markErr != nil {
+			return markErr
+		}
+		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
+		writeLine(w.Stdout, "job %s failed: %v", delegatedJob.ID, err)
+		return nil
+	}
+	if policy.MergeBack == config.ParallelSessionMergeBackSummary {
+		if err := w.queueTempWorkerMergeBack(ctx, delegatedJob.ID, original, started.Agent); err != nil {
+			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: delegatedJob.ID, Kind: "temp_worker_merge_back_failed", Message: err.Error()}); eventErr != nil {
+				return eventErr
+			}
+			return err
+		}
+	}
+	_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, nil)
+	writeLine(w.Stdout, "job %s completed by temporary worker %s", delegatedJob.ID, started.Agent.Name)
+	return nil
+}
+
+func (w jobWorker) queueTempWorkerMergeBack(ctx context.Context, completedJobID string, original runtime.Agent, tempAgent runtime.Agent) error {
+	completedJob, err := w.Store.GetJob(ctx, completedJobID)
+	if err != nil {
+		return err
+	}
+	payload, err := daemonJobPayload(completedJob)
+	if err != nil {
+		return err
+	}
+	if payload.Result == nil {
+		return fmt.Errorf("completed temp-worker job %s has no result", completedJob.ID)
+	}
+	mergeBackID := completedJob.ID + "-merge-back"
+	if _, err := w.Store.GetJob(ctx, mergeBackID); err == nil {
+		return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: completedJob.ID, Kind: "temp_worker_merge_back_existing", Message: fmt.Sprintf("summary merge-back job %s already exists", mergeBackID)})
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	request := workflow.JobRequest{
+		ID:               mergeBackID,
+		Agent:            original.Name,
+		Action:           "ask",
+		Repo:             payload.Repo,
+		Branch:           payload.Branch,
+		GoalID:           payload.GoalID,
+		TaskID:           payload.TaskID,
+		TaskTitle:        payload.TaskTitle,
+		LeadAgent:        payload.LeadAgent,
+		Reviewers:        payload.Reviewers,
+		ReviewRound:      payload.ReviewRound,
+		Sender:           tempAgent.Name,
+		Instructions:     tempWorkerMergeBackInstructions(completedJob, payload, tempAgent.Name),
+		OriginalAgent:    original.Name,
+		DelegatedAgent:   tempAgent.Name,
+		DelegationReason: "temp_worker_merge_back",
+		Constraints: []string{
+			"This is a temp-worker merge-back summary only.",
+			"Do not edit files, create commits, open pull requests, or dispatch more agents unless the summary explicitly requires follow-up.",
+		},
+	}
+	if _, err := (workflow.Mailbox{Store: w.Store}).Enqueue(ctx, request); err != nil {
+		return err
+	}
+	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: completedJob.ID, Kind: "temp_worker_merge_back_queued", Message: fmt.Sprintf("queued summary merge-back job %s for %s", mergeBackID, original.Name)})
+}
+
+func tempWorkerMergeBackInstructions(job db.Job, payload workflow.JobPayload, tempAgentName string) string {
+	result := payload.Result
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "Temporary worker %s completed job %s.\n", tempAgentName, job.ID)
+	fmt.Fprintf(&builder, "Repo: %s\n", payload.Repo)
+	if strings.TrimSpace(payload.Branch) != "" {
+		fmt.Fprintf(&builder, "Branch: %s\n", payload.Branch)
+	}
+	if payload.PullRequest > 0 {
+		fmt.Fprintf(&builder, "Pull request: #%d\n", payload.PullRequest)
+	}
+	if strings.TrimSpace(payload.HeadSHA) != "" {
+		fmt.Fprintf(&builder, "Head SHA: %s\n", payload.HeadSHA)
+	}
+	fmt.Fprintf(&builder, "Decision: %s\n", result.Decision)
+	if strings.TrimSpace(result.Summary) != "" {
+		fmt.Fprintf(&builder, "Summary: %s\n", result.Summary)
+	}
+	appendMergeBackList(&builder, "Changes made", result.ChangesMade)
+	appendMergeBackList(&builder, "Tests run", result.TestsRun)
+	appendMergeBackList(&builder, "Needs", result.Needs)
+	builder.WriteString("\nAcknowledge the summary and keep any follow-up concise.")
+	return builder.String()
+}
+
+func appendMergeBackList(builder *strings.Builder, label string, values []string) {
+	values = compactMergeBackStrings(values)
+	if len(values) == 0 {
+		return
+	}
+	fmt.Fprintf(builder, "%s:\n", label)
+	for _, value := range values {
+		fmt.Fprintf(builder, "- %s\n", value)
+	}
+}
+
+func compactMergeBackStrings(values []string) []string {
+	out := []string{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func (w jobWorker) startTempWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, original runtime.Agent, checkout string) (tempWorkerStartResult, error) {
+	idleTimeout := 20 * time.Minute
+	jobTimeout := daemonRunningJobStaleAfter
+	if managed, err := w.managedJobConfig(ctx, original.Name); err == nil && managed.OK {
+		idleTimeout = managed.IdleTimeout
+		jobTimeout = managed.JobTimeout
+	} else if err != nil {
+		return tempWorkerStartResult{}, err
+	}
+	tempAgent := original
+	tempAgent.Name = tempWorkerInstanceName(original.Name, job.ID)
+	tempAgent.RuntimeRef = ""
+	var cachedTemplate db.AgentTemplate
+	if tempAgent.TemplateID != "" {
+		var err error
+		cachedTemplate, err = loadInstalledTemplate(ctx, w.Store, tempAgent.TemplateID)
+		if err != nil {
+			return tempWorkerStartResult{}, err
+		}
+	}
+	now := time.Now().UTC()
+	reserved := db.AgentInstance{
+		Name:           tempAgent.Name,
+		Type:           tempWorkerAgentType(original.Name),
+		Runtime:        tempAgent.Runtime,
+		RuntimeRef:     "starting:" + tempAgent.Name,
+		RepoFullName:   payload.Repo,
+		Role:           tempAgent.Role,
+		TemplateID:     tempAgent.TemplateID,
+		Capabilities:   tempAgent.Capabilities,
+		AutonomyPolicy: tempAgent.AutonomyPolicy,
+		State:          "starting",
+		CreatedAt:      formatManagedAgentTime(now),
+		LastUsedAt:     formatManagedAgentTime(now),
+		ExpiresAt:      formatManagedAgentTime(now.Add(jobTimeout)),
+	}
+	if err := w.Store.UpsertAgentInstance(ctx, reserved); err != nil {
+		return tempWorkerStartResult{}, err
+	}
+	adapter, err := w.StartAdapterFactory(tempAgent.Runtime, checkout)
+	if err != nil {
+		_ = w.Store.DeleteAgentInstance(context.Background(), reserved.Name)
+		return tempWorkerStartResult{}, err
+	}
+	started, err := adapter.Start(ctx, runtime.StartRequest{Agent: tempAgent, Prompt: agentStartupPrompt(tempAgent, cachedTemplate)})
+	if err != nil {
+		_ = w.Store.DeleteAgentInstance(context.Background(), reserved.Name)
+		return tempWorkerStartResult{}, err
+	}
+	tempAgent.RuntimeRef = strings.TrimSpace(started.RuntimeRef)
+	if err := runtime.ValidateAgent(tempAgent); err != nil {
+		_ = w.Store.DeleteAgentInstance(context.Background(), reserved.Name)
+		return tempWorkerStartResult{}, err
+	}
+	instance := reserved
+	instance.RuntimeRef = tempAgent.RuntimeRef
+	instance.State = "idle"
+	if err := w.Store.UpsertAgentInstance(ctx, instance); err != nil {
+		_ = w.Store.DeleteAgentInstance(context.Background(), reserved.Name)
+		return tempWorkerStartResult{}, err
+	}
+	return tempWorkerStartResult{Agent: tempAgent, IdleTimeout: idleTimeout, JobTimeout: jobTimeout}, nil
+}
+
+func (w jobWorker) cleanupTempWorker(ctx context.Context, agentName string) {
+	if err := w.Store.DeleteAgentInstance(ctx, agentName); err != nil {
+		writeLine(w.Stdout, "temp worker %s instance cleanup failed: %v", agentName, err)
+	}
+	if removed, err := w.Store.RemoveAgent(ctx, agentName); err != nil {
+		writeLine(w.Stdout, "temp worker %s agent cleanup failed: %v", agentName, err)
+	} else if removed {
+		writeLine(w.Stdout, "temp worker %s agent cleanup removed regular agent row", agentName)
+	}
+}
+
+func tempWorkerInstanceName(agentName string, jobID string) string {
+	base := strings.Trim(strings.ToLower(agentName), "-_ ")
+	if base == "" {
+		base = "agent"
+	}
+	job := strings.Trim(strings.ToLower(jobID), "-_ ")
+	if job == "" {
+		job = strconv.FormatInt(time.Now().UTC().UnixNano(), 16)
+	}
+	name := base + "-temp-" + job
+	var builder strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+			builder.WriteRune(r)
+		case r >= '0' && r <= '9':
+			builder.WriteRune(r)
+		case r == '-' || r == '_':
+			builder.WriteRune(r)
+		default:
+			builder.WriteRune('-')
+		}
+	}
+	return strings.Trim(builder.String(), "-_")
+}
+
 type managedJobRuntimeConfig struct {
 	OK          bool
 	JobTimeout  time.Duration
@@ -1635,29 +2095,48 @@ func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (mana
 	if err != nil {
 		return managedJobRuntimeConfig{}, err
 	}
+	configType := instance.Type
+	if original := originalAgentForTempWorkerType(instance.Type); original != "" {
+		originalInstance, err := w.Store.GetAgentInstance(ctx, original)
+		if errors.Is(err, sql.ErrNoRows) {
+			return managedJobRuntimeConfig{}, nil
+		}
+		if err != nil {
+			return managedJobRuntimeConfig{}, err
+		}
+		configType = originalInstance.Type
+	}
 	types, err := loadAgentTypeConfig(w.ConfigHome)
 	if err != nil {
 		return managedJobRuntimeConfig{}, err
 	}
-	agentType, ok := types[instance.Type]
+	agentType, ok := types[configType]
 	if !ok {
-		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %q not found for managed instance %s", instance.Type, agentName)
+		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %q not found for managed instance %s", configType, agentName)
 	}
 	jobTimeout, err := time.ParseDuration(agentType.JobTimeout)
 	if err != nil {
-		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %s job_timeout: %w", instance.Type, err)
+		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %s job_timeout: %w", configType, err)
 	}
 	if jobTimeout <= 0 {
-		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %s job_timeout must be positive", instance.Type)
+		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %s job_timeout must be positive", configType)
 	}
 	idleTimeout, err := time.ParseDuration(agentType.IdleTimeout)
 	if err != nil {
-		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %s idle_timeout: %w", instance.Type, err)
+		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %s idle_timeout: %w", configType, err)
 	}
 	if idleTimeout <= 0 {
-		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %s idle_timeout must be positive", instance.Type)
+		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %s idle_timeout must be positive", configType)
 	}
 	return managedJobRuntimeConfig{OK: true, JobTimeout: jobTimeout, IdleTimeout: idleTimeout}, nil
+}
+
+func originalAgentForTempWorkerType(typ string) string {
+	original, ok := strings.CutPrefix(strings.TrimSpace(typ), "temp:")
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(original)
 }
 
 func (w jobWorker) runningJobContext(ctx context.Context, jobID string) (context.Context, func()) {
@@ -1808,6 +2287,10 @@ func (w jobWorker) defaultAdapter(agent runtime.Agent, checkout string) (workflo
 	}
 }
 
+func (w jobWorker) defaultStartAdapter(runtimeName string, checkout string) (runtime.Adapter, error) {
+	return runtimeStartAdapter(newRuntimeFactory(), runtimeName, checkout)
+}
+
 func (w jobWorker) defaultWorkflow(checkout string) workflow.Engine {
 	return daemonWorkflowEngine(w.Store, github.NewClient(checkout), checkout)
 }
@@ -1932,7 +2415,7 @@ func (w jobWorker) defaultCheckout(ctx context.Context, job db.Job, payload work
 		if err := w.validateTargetCheckout(ctx, payload, checkout); err != nil {
 			return "", err
 		}
-		if err := w.validateImplementationLock(ctx, payload, agent); err != nil {
+		if err := w.validateImplementationLock(ctx, payload, implementationLockOwner(agent, payload)); err != nil {
 			return "", err
 		}
 	case "review":
@@ -2048,13 +2531,20 @@ func (w jobWorker) validateTargetCheckout(ctx context.Context, payload workflow.
 	return nil
 }
 
-func (w jobWorker) validateImplementationLock(ctx context.Context, payload workflow.JobPayload, agent runtime.Agent) error {
+func implementationLockOwner(agent runtime.Agent, payload workflow.JobPayload) string {
+	if payload.DelegationReason == "runtime_session_busy" && payload.DelegatedAgent == agent.Name && strings.TrimSpace(payload.OriginalAgent) != "" {
+		return payload.OriginalAgent
+	}
+	return agent.Name
+}
+
+func (w jobWorker) validateImplementationLock(ctx context.Context, payload workflow.JobPayload, owner string) error {
 	lock, err := w.Store.GetBranchLock(ctx, payload.Repo, payload.Branch)
 	if err != nil {
 		return err
 	}
-	if lock.Owner != agent.Name {
-		return fmt.Errorf("branch %s is locked by %s, not %s", payload.Branch, lock.Owner, agent.Name)
+	if lock.Owner != owner {
+		return fmt.Errorf("branch %s is locked by %s, not %s", payload.Branch, lock.Owner, owner)
 	}
 	return nil
 }
