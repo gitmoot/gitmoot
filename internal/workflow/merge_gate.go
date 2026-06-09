@@ -416,10 +416,20 @@ func (g PolicyMergeGate) postMergeConflictComment(ctx context.Context, repo gith
 		"",
 		"- reason: " + reason,
 		"- retry: stopped; this is not retryable until the branch is fixed",
-		"- next action: resolve the conflict manually or run an explicit implement/fix job, then rerun review/merge",
+		"- task: " + mergeConflictTaskLabel(request),
+		"- next action: resolve the conflict manually, or queue a Gitmoot implement/fix job so Gitmoot applies file changes in the task worktree and owns commit/push/PR refresh",
+		"- after fix: rerun review/merge on the updated pull request head",
 	}, "\n")
 	_, err := g.GitHub.PostIssueComment(ctx, repo, int64(request.PullRequest), body)
 	return err
+}
+
+func mergeConflictTaskLabel(request MergeRequest) string {
+	taskID := strings.TrimSpace(request.TaskID)
+	if taskID == "" {
+		return "unknown"
+	}
+	return taskID
 }
 
 func (g PolicyMergeGate) ensureReviewMatchesHead(payload JobPayload, headSHA string, agent string) error {

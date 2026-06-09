@@ -570,7 +570,10 @@ func TestPolicyMergeGateBlocksStaleBranchUpdateConflict(t *testing.T) {
 	if !hasStatus(gh.statuses, gitmootMergeGateContext, "failure") {
 		t.Fatalf("statuses = %+v", gh.statuses)
 	}
-	if len(gh.comments) != 1 || !strings.Contains(gh.comments[0], "not retryable") {
+	if len(gh.comments) != 1 || !strings.Contains(gh.comments[0], "not retryable") ||
+		!strings.Contains(gh.comments[0], "task: task-9") ||
+		!strings.Contains(gh.comments[0], "Gitmoot applies file changes in the task worktree") ||
+		!strings.Contains(gh.comments[0], "rerun review/merge") {
 		t.Fatalf("comments = %+v", gh.comments)
 	}
 }
