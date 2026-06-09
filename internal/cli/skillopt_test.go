@@ -867,6 +867,68 @@ func TestSkillOptTrainStartStatusAndStop(t *testing.T) {
 	}
 }
 
+func TestSkillOptTrainInitTemplatesJSON(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	if err := store.UpsertAgentTemplate(context.Background(), cliSkillOptTemplate("custom-writer", "Write short posts.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	if err := store.UpsertAgent(context.Background(), db.Agent{
+		Name:         "writer",
+		Role:         "writer",
+		Runtime:      "codex",
+		TemplateID:   "custom-writer",
+		Capabilities: []string{"ask"},
+	}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "train", "init", "templates", "--home", home, "--json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("templates exit code = %d, stderr=%s", code, stderr.String())
+	}
+	var choices []skillopt.TrainInitTemplateChoice
+	if err := json.Unmarshal(stdout.Bytes(), &choices); err != nil {
+		t.Fatalf("decode choices: %v\n%s", err, stdout.String())
+	}
+	planner := cliTrainInitChoiceByID(t, choices, "planner")
+	if planner.Source != skillopt.TrainInitTemplateChoiceSourceBuiltin || planner.Label == "" {
+		t.Fatalf("planner choice = %+v", planner)
+	}
+	custom := cliTrainInitChoiceByID(t, choices, "custom-writer")
+	if !custom.Installed || !custom.Current || custom.CurrentVersion != "custom-writer@v1" || len(custom.Agents) != 1 || custom.Agents[0] != "writer" {
+		t.Fatalf("custom choice = %+v", custom)
+	}
+}
+
+func TestSkillOptTrainInitTemplatesRequiresJSON(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "train", "init", "templates", "--home", home}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "requires --json") {
+		t.Fatalf("templates without json code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func cliTrainInitChoiceByID(t *testing.T, choices []skillopt.TrainInitTemplateChoice, id string) skillopt.TrainInitTemplateChoice {
+	t.Helper()
+	for _, choice := range choices {
+		if choice.ID == id {
+			return choice
+		}
+	}
+	t.Fatalf("choice %s not found in %+v", id, choices)
+	return skillopt.TrainInitTemplateChoice{}
+}
+
 func TestSkillOptTrainStatusGeneratedProgressUsesCurrentIteration(t *testing.T) {
 	session := db.SkillOptTrainSession{
 		ID:           "landing-train",
