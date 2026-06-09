@@ -655,7 +655,7 @@ func TestTaskRunJobMatchesDelegatedImplementJob(t *testing.T) {
 	}
 }
 
-func TestRunTaskRunBlocksWhenCheckoutMutationLocked(t *testing.T) {
+func TestRunTaskRunWaitsWhenCheckoutMutationLocked(t *testing.T) {
 	home := t.TempDir()
 	goalPath := filepath.Join(t.TempDir(), "GOAL.md")
 	writeFile(t, goalPath, "# Build Gitmoot\n\n### Task 1: Bootstrap\n")
@@ -692,27 +692,31 @@ func TestRunTaskRunBlocksWhenCheckoutMutationLocked(t *testing.T) {
 	}, time.Now().UTC()); err != nil || !acquired {
 		t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
 	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("close store: %v", err)
-	}
+	released := make(chan struct{})
+	go func() {
+		defer close(released)
+		time.Sleep(20 * time.Millisecond)
+		_, _ = store.ReleaseResourceLock(context.Background(), "checkout-mutation:"+filepath.Clean(absoluteCheckout), "task:other", "other-token")
+	}()
 
 	stdout.Reset()
 	stderr.Reset()
 	code = Run([]string{"task", "run", "task-001", "--home", home, "--repo", "jerryfane/gitmoot", "--owner", "lead"}, &stdout, &stderr)
+	<-released
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
 
-	if code != 1 {
-		t.Fatalf("task run exit code = %d, want 1; stderr=%s", code, stderr.String())
+	if code != 0 {
+		t.Fatalf("task run exit code = %d, want 0; stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "This checkout is already being mutated by another Gitmoot task") {
-		t.Fatalf("stderr = %q", stderr.String())
-	}
-	branches := runGitOutput(t, repoDir, "branch", "--list", "task-001")
-	if strings.TrimSpace(branches) != "" {
-		t.Fatalf("task branch was created despite checkout lock: %q", branches)
+	branches := runGitOutput(t, repoDir, "branch", "--list", "task-001-bootstrap")
+	if strings.TrimSpace(branches) == "" {
+		t.Fatal("task branch was not created after checkout lock release")
 	}
 	worktreePath := filepath.Join(home, ".gitmoot", "worktrees", "jerryfane--gitmoot", "task-001")
-	if _, err := os.Stat(worktreePath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("worktree path after checkout lock error = %v, want os.ErrNotExist", err)
+	if _, err := os.Stat(worktreePath); err != nil {
+		t.Fatalf("worktree path after checkout lock release = %v, want existing worktree", err)
 	}
 }
 

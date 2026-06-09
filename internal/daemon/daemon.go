@@ -107,6 +107,9 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 				return err
 			}
 		}
+		if err := d.reconcileReviewingPullRequest(ctx, pull); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
 	if err := d.retryClosedReadyToMerge(ctx, openBranches); err != nil && firstErr == nil {
 		firstErr = err
@@ -186,12 +189,7 @@ func (d Daemon) pullRequestWorkflowRouting(ctx context.Context, pull github.Pull
 		if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
 			return pullRequestRouting{}, fmt.Errorf("parse job payload %q: %w", job.ID, err)
 		}
-		if payload.Repo == d.Repo.FullName() &&
-			payload.PullRequest == int(pull.Number) &&
-			payload.Branch == pull.HeadRef &&
-			strings.TrimSpace(payload.LeadAgent) != "" &&
-			strings.TrimSpace(payload.ReviewRound) != "" &&
-			len(payload.Reviewers) > 0 {
+		if workflowReviewJobMatchesPull(d.Repo.FullName(), pull, payload) {
 			if strings.TrimSpace(payload.HeadSHA) == pull.HeadSHA {
 				return pullRequestRouting{}, nil
 			}
@@ -227,6 +225,9 @@ func (d Daemon) pullRequestStoredMerged(ctx context.Context, pull github.PullReq
 func (d Daemon) handlePullRequestWorkflow(ctx context.Context, pull github.PullRequest) error {
 	if d.Workflow == nil {
 		return nil
+	}
+	if err := d.supersedeStaleReviewJobs(ctx, pull); err != nil {
+		return err
 	}
 	lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef)
 	if err != nil {
@@ -266,6 +267,42 @@ func (d Daemon) handlePullRequestWorkflow(ctx context.Context, pull github.PullR
 		Sender:            "github",
 		RequiredReviewers: reviewers,
 	})
+}
+
+func (d Daemon) supersedeStaleReviewJobs(ctx context.Context, pull github.PullRequest) error {
+	jobs, err := d.Store.ListJobs(ctx)
+	if err != nil {
+		return err
+	}
+	for _, job := range jobs {
+		if job.Type != "review" {
+			continue
+		}
+		payload, err := workflowPayload(job)
+		if err != nil {
+			return err
+		}
+		if !workflowReviewJobMatchesPull(d.Repo.FullName(), pull, payload) {
+			continue
+		}
+		if strings.TrimSpace(payload.HeadSHA) == pull.HeadSHA {
+			continue
+		}
+		reason := fmt.Sprintf("review job superseded_stale_head: PR #%d moved from head %q to %q", pull.Number, strings.TrimSpace(payload.HeadSHA), pull.HeadSHA)
+		if _, _, err := workflow.SupersedeStaleHeadJob(ctx, d.Store, job.ID, reason); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func workflowReviewJobMatchesPull(repoFullName string, pull github.PullRequest, payload workflow.JobPayload) bool {
+	return payload.Repo == repoFullName &&
+		payload.PullRequest == int(pull.Number) &&
+		payload.Branch == pull.HeadRef &&
+		strings.TrimSpace(payload.LeadAgent) != "" &&
+		strings.TrimSpace(payload.ReviewRound) != "" &&
+		len(payload.Reviewers) > 0
 }
 
 func (d Daemon) pullRequestReadyToMerge(ctx context.Context, pull github.PullRequest) (bool, error) {
@@ -310,6 +347,71 @@ func (d Daemon) handleReadyToMergeWorkflow(ctx context.Context, pull github.Pull
 		LeadAgent:   leadAgent,
 		Sender:      "github",
 	})
+}
+
+func (d Daemon) reconcileReviewingPullRequest(ctx context.Context, pull github.PullRequest) error {
+	if d.Workflow == nil {
+		return nil
+	}
+	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if task.State != string(workflow.TaskReviewing) {
+		return nil
+	}
+	jobs, err := d.Store.ListJobs(ctx)
+	if err != nil {
+		return err
+	}
+	hasCurrentReview := false
+	for _, job := range jobs {
+		if job.Type != "review" {
+			continue
+		}
+		payload, err := workflowPayload(job)
+		if err != nil {
+			return err
+		}
+		if !workflowReviewJobMatchesPull(d.Repo.FullName(), pull, payload) {
+			continue
+		}
+		if strings.TrimSpace(payload.TaskID) != "" && payload.TaskID != task.ID {
+			continue
+		}
+		if strings.TrimSpace(payload.HeadSHA) != pull.HeadSHA {
+			continue
+		}
+		hasCurrentReview = true
+		switch job.State {
+		case string(workflow.JobQueued), string(workflow.JobRunning):
+			return nil
+		}
+		if payload.Result == nil {
+			continue
+		}
+		if err := d.Workflow.AdvanceJob(ctx, job.ID); err != nil {
+			var blocked workflow.BlockedError
+			if errors.As(err, &blocked) {
+				return nil
+			}
+			return err
+		}
+		updated, err := d.Store.GetTask(ctx, task.ID)
+		if err != nil {
+			return err
+		}
+		if updated.State != string(workflow.TaskReviewing) {
+			return nil
+		}
+	}
+	if hasCurrentReview {
+		return nil
+	}
+	return d.handlePullRequestWorkflow(ctx, pull)
 }
 
 func (d Daemon) retryClosedReadyToMerge(ctx context.Context, openBranches map[string]struct{}) error {

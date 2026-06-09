@@ -91,6 +91,41 @@ func TestRetryJobAllowsRunningCancellationAfterWorkerSettles(t *testing.T) {
 	}
 }
 
+func TestRetryJobRejectsRunningSupersededReviewUntilWorkerSettles(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-1", Agent: "audit", Type: "review", State: string(JobRunning), Payload: `{"repo":"owner/repo"}`}, db.JobEvent{
+		Kind:    string(JobRunning),
+		Message: "running",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+
+	job, transitioned, err := SupersedeStaleHeadJob(ctx, store, "job-1", "review job superseded_stale_head: PR #1 moved from head \"old\" to \"new\"")
+	if err != nil {
+		t.Fatalf("SupersedeStaleHeadJob returned error: %v", err)
+	}
+	if !transitioned || job.State != string(JobCancelled) {
+		t.Fatalf("superseded job transitioned=%v state=%q, want cancelled transition", transitioned, job.State)
+	}
+	if _, err := RetryJob(ctx, store, "job-1"); err == nil {
+		t.Fatal("RetryJob accepted running superseded review before worker settled")
+	}
+	events, err := store.ListJobEvents(ctx, "job-1")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if len(events) < 2 || events[1].Kind != JobEventSupersededStaleHead || !strings.HasPrefix(events[1].Message, "cancel requested from running") {
+		t.Fatalf("events = %+v, want running supersede marker", events)
+	}
+	if _, err := SettleCancelledRunningJob(ctx, store, "job-1", "cancelled job worker settled"); err != nil {
+		t.Fatalf("SettleCancelledRunningJob returned error: %v", err)
+	}
+	if _, err := RetryJob(ctx, store, "job-1"); err != nil {
+		t.Fatalf("RetryJob rejected settled running superseded review: %v", err)
+	}
+}
+
 func TestCancelJobCancelsQueuedOrRunningJob(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)

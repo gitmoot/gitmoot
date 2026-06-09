@@ -506,12 +506,132 @@ func TestPollOnceReroutesLegacyReviewWithoutHeadSHA(t *testing.T) {
 	if err := daemon.PollOnce(ctx); err != nil {
 		t.Fatalf("PollOnce returned error: %v", err)
 	}
+	oldJob, err := store.GetJob(ctx, "review-audit-task-7-review-1")
+	if err != nil {
+		t.Fatalf("GetJob legacy review returned error: %v", err)
+	}
+	if oldJob.State != string(workflow.JobCancelled) {
+		t.Fatalf("legacy review state = %q, want cancelled", oldJob.State)
+	}
+	events, err := store.ListJobEvents(ctx, oldJob.ID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !hasDaemonJobEvent(events, workflow.JobEventSupersededStaleHead) {
+		t.Fatalf("legacy review events = %+v, want superseded stale head", events)
+	}
 	job, err := store.GetJob(ctx, "review-audit-task-7-review-2")
 	if err != nil {
 		t.Fatalf("GetJob rerouted review returned error: %v", err)
 	}
 	if !strings.Contains(job.Payload, `"head_sha":"abc123"`) {
 		t.Fatalf("rerouted job payload missing head sha: %s", job.Payload)
+	}
+}
+
+func TestPollOnceReconcilesReviewingPullRequestWithApprovedCurrentReview(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "lead",
+		Role:           "lead",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"implement"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent lead returned error: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "audit",
+		Role:           "reviewer",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"review"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent audit returned error: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-007",
+		RepoFullName: repo.FullName(),
+		GoalID:       "goal-1",
+		Title:        "Task 7",
+		State:        string(workflow.TaskReviewing),
+		Branch:       "task-7",
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo:        repo.FullName(),
+		Branch:      "task-7",
+		PullRequest: 7,
+		HeadSHA:     "abc123",
+		TaskID:      "task-007",
+		TaskTitle:   "Task 7",
+		LeadAgent:   "lead",
+		Reviewers:   []string{"audit"},
+		ReviewRound: "review-1",
+		Result:      &workflow.AgentResult{Decision: "approved", Summary: "approved"},
+	})
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID:      "review-audit-task-007-review-1",
+		Agent:   "audit",
+		Type:    "review",
+		State:   string(workflow.JobSucceeded),
+		Payload: string(payload),
+	}, db.JobEvent{Kind: string(workflow.JobSucceeded), Message: "review completed before daemon reconciliation"}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(),
+		Number:       7,
+		HeadBranch:   "task-7",
+		BaseBranch:   "main",
+		HeadSHA:      "abc123",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{
+			Number:  7,
+			Title:   "Task 7",
+			State:   "open",
+			URL:     "https://github.com/jerryfane/gitmoot/pull/7",
+			HeadRef: "task-7",
+			BaseRef: "main",
+			HeadSHA: "abc123",
+		}},
+		comments: map[int64][]github.IssueComment{7: {}},
+	}
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true}}
+	engine := workflow.Engine{Store: store, MergeGate: gate}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	task, err := store.GetTask(ctx, "task-007")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskReadyToMerge) {
+		t.Fatalf("task state = %q, want ready_to_merge", task.State)
+	}
+	if len(gate.requests) != 1 || gate.requests[0].HeadSHA != "abc123" {
+		t.Fatalf("merge gate requests = %+v", gate.requests)
 	}
 }
 
@@ -1939,4 +2059,13 @@ func (f *fakeWorkflowMergeGate) Evaluate(_ context.Context, request workflow.Mer
 		f.onEvaluate(request)
 	}
 	return f.decision, nil
+}
+
+func hasDaemonJobEvent(events []db.JobEvent, kind string) bool {
+	for _, event := range events {
+		if event.Kind == kind {
+			return true
+		}
+	}
+	return false
 }

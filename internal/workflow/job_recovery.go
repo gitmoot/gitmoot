@@ -3,9 +3,12 @@ package workflow
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 )
+
+const JobEventSupersededStaleHead = "superseded_stale_head"
 
 func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error) {
 	if store == nil {
@@ -66,8 +69,9 @@ func latestCancellationWasFromRunning(ctx context.Context, store *db.Store, jobI
 		if event.Kind == "cancel_settled" {
 			return false, nil
 		}
-		if event.Kind == string(JobCancelled) {
-			return event.Message == "cancel requested from running", nil
+		switch event.Kind {
+		case string(JobCancelled), JobEventSupersededStaleHead:
+			return strings.HasPrefix(event.Message, "cancel requested from running"), nil
 		}
 	}
 	return false, nil
@@ -126,4 +130,43 @@ func CancelJob(ctx context.Context, store *db.Store, jobID string) (db.Job, erro
 		return db.Job{}, fmt.Errorf("job %s is %s; cancel requires queued or running", latest.ID, latest.State)
 	}
 	return store.GetJob(ctx, job.ID)
+}
+
+func SupersedeStaleHeadJob(ctx context.Context, store *db.Store, jobID string, reason string) (db.Job, bool, error) {
+	if store == nil {
+		return db.Job{}, false, fmt.Errorf("store is required")
+	}
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		return db.Job{}, false, err
+	}
+	switch job.State {
+	case string(JobQueued), string(JobRunning):
+	default:
+		return job, false, nil
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "review job superseded by newer pull request head"
+	}
+	if job.State == string(JobRunning) && !strings.HasPrefix(reason, "cancel requested from running") {
+		reason = "cancel requested from running: " + reason
+	}
+	transitioned, err := store.TransitionJobStateWithEvent(ctx, job.ID, job.State, string(JobCancelled), db.JobEvent{
+		JobID:   job.ID,
+		Kind:    JobEventSupersededStaleHead,
+		Message: reason,
+	})
+	if err != nil {
+		return db.Job{}, false, err
+	}
+	if !transitioned {
+		latest, getErr := store.GetJob(ctx, job.ID)
+		if getErr != nil {
+			return db.Job{}, false, getErr
+		}
+		return latest, false, nil
+	}
+	updated, err := store.GetJob(ctx, job.ID)
+	return updated, true, err
 }
