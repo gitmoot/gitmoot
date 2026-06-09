@@ -283,6 +283,12 @@ gitmoot lock release owner/repo <branch> --owner <agent>
 ### SkillOpt Exchange
 
 ```sh
+gitmoot skillopt train init --name <name> --template <id> --review-repo owner/repo --artifact-kind kind --preview kind (--request text|--request-file path)
+gitmoot skillopt train init templates --json
+gitmoot interactive list --state pending --json
+gitmoot interactive show <prompt-id> --json
+gitmoot interactive answer <prompt-id> <value> --source agent
+gitmoot skillopt train start --config .gitmoot/skillopt/<name>/config.toml --yes
 gitmoot skillopt review create --template <id> --repo owner/repo --run <run-id>
 gitmoot skillopt review item add --run <run-id> --item <item-id> --baseline baseline.md --candidate candidate.md [--title text]
 gitmoot skillopt review create --template <id> --repo owner/repo --run <run-id> --mode explore --options 4
@@ -300,7 +306,15 @@ gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--p
 gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)
 ```
 
-Create a review run, add saved baseline/candidate outputs as review items,
+Use `skillopt train init` to create a local scaffold under
+`.gitmoot/skillopt/<name>/` without starting model work. The scaffold pins the
+template/version, writes `config.toml`, `task.md`, and starter
+`review-items.yml`, and prints the exact `train start --config` command. Agents
+can list template choices with `train init templates --json`; when an
+interactive setup needs missing values, they can answer the stored prompts with
+`gitmoot interactive list/show/answer`.
+
+For lower-level debugging, create a review run, add saved baseline/candidate outputs as review items,
 export a Markdown or GitHub feedback packet, import the completed feedback, then
 export `training.json` for a future external `gitmoot-skillopt` optimizer.
 Use ranked exploration when the template needs broad search: start with

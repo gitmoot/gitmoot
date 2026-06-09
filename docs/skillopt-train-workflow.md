@@ -32,9 +32,54 @@ candidates never become current silently.
 
 ## High-Level Commands
 
-Start with a request, target repo, pinned template, and item plan:
+Initialize a reusable training scaffold before expensive training work:
 
 ```sh
+gitmoot skillopt train init \
+  --name planner-train \
+  --template planner \
+  --review-repo owner/product \
+  --task-kind writing \
+  --artifact-kind text \
+  --preview text-table \
+  --mode explore \
+  --request "Improve release planning answers from reviewer feedback"
+```
+
+`train init` writes `.gitmoot/skillopt/<name>/config.toml`, `task.md`, and a
+starter `review-items.yml`. It pins the selected template/version, records the
+review repository, applies default generation/evaluator/optimizer settings, and
+prints the next `gitmoot skillopt train start --config ...` command. It does not
+start optimization, create review items, call models, or publish GitHub issues.
+
+List machine-readable template choices for agents before initializing:
+
+```sh
+gitmoot skillopt train init templates --json
+```
+
+If required fields are missing in an interactive terminal, Gitmoot stores
+structured prompt requests that agents can inspect and answer:
+
+```sh
+gitmoot interactive list --state pending --json
+gitmoot interactive show <prompt-id> --json
+gitmoot interactive answer <prompt-id> <value> --source agent
+gitmoot skillopt train init
+```
+
+If required fields are missing in non-interactive mode, `train init` exits before
+creating a scaffold or train session and prints the missing fields plus a fully
+flagged example command.
+
+Start from the scaffold, or pass the request, target repo, pinned template, and
+item plan directly:
+
+```sh
+gitmoot skillopt train start \
+  --config .gitmoot/skillopt/planner-train/config.toml \
+  --yes
+
 gitmoot skillopt train start \
   --template planner \
   --session planner-train \
