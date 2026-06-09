@@ -75,7 +75,7 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	if err != nil {
 		var blocked BlockedError
 		if errors.As(err, &blocked) {
-			return g.block(ctx, request, headSHA, blocked.Reason)
+			return MergeDecision{}, fmt.Errorf("merge gate checkout is busy: %s", blocked.Reason)
 		}
 		return MergeDecision{}, err
 	}

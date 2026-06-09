@@ -270,7 +270,7 @@ func TestPolicyMergeGateLocksCheckoutDuringLocalBaseUpdate(t *testing.T) {
 	}
 }
 
-func TestPolicyMergeGateReportsBusyCheckoutForLocalBaseUpdate(t *testing.T) {
+func TestPolicyMergeGateReturnsRetryableErrorForBusyCheckout(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
@@ -306,17 +306,27 @@ func TestPolicyMergeGateReportsBusyCheckoutForLocalBaseUpdate(t *testing.T) {
 
 	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "jerryfane/gitmoot", PullRequest: 9, TaskID: "task-9", Reviewer: "audit"})
 
-	if err != nil {
-		t.Fatalf("Evaluate returned error: %v", err)
+	if err == nil {
+		t.Fatal("Evaluate returned nil error, want retryable checkout-busy error")
 	}
-	if decision.Ready || decision.Merged || !strings.Contains(decision.Reason, checkoutMutationBusyMessage) {
-		t.Fatalf("decision = %+v, want blocked checkout busy decision", decision)
+	var blocked BlockedError
+	if errors.As(err, &blocked) {
+		t.Fatalf("Evaluate error = %v, should not expose checkout contention as policy BlockedError", err)
+	}
+	if !strings.Contains(err.Error(), checkoutMutationBusyMessage) {
+		t.Fatalf("Evaluate error = %v, want checkout busy message", err)
+	}
+	if decision.Ready || decision.Merged {
+		t.Fatalf("decision = %+v, want no merge decision on checkout contention", decision)
 	}
 	if len(gh.merges) != 0 {
 		t.Fatalf("merge ran despite checkout lock: %+v", gh.merges)
 	}
 	if len(git.updated) != 0 {
 		t.Fatalf("UpdateBase ran despite checkout lock: %+v", git.updated)
+	}
+	if _, err := store.GetMergeGate(ctx, "jerryfane/gitmoot", 9); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetMergeGate after checkout contention = %v, want sql.ErrNoRows", err)
 	}
 }
 
