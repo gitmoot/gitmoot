@@ -42,6 +42,11 @@ var skillOptTrainOptimizerRunner subprocess.Runner = subprocess.ExecRunner{}
 
 var skillOptTrainPreviewRunner subprocess.Runner = subprocess.ExecRunner{}
 
+var skillOptTrainInitInteractive = func() bool {
+	info, err := os.Stdin.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
 func runSkillOpt(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		printSkillOptUsage(stdout)
@@ -160,6 +165,7 @@ func runSkillOptTrainInitCreate(args []string, stdout, stderr io.Writer) int {
 	mode := fs.String("mode", db.EvalRunModeExplore, "train mode: explore, refine, distill, or validate")
 	requestText := fs.String("request", "", "human training request for task.md")
 	requestFile := fs.String("request-file", "", "file containing the human training request")
+	yes := fs.Bool("yes", false, "do not create interactive prompts for missing fields")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -185,38 +191,65 @@ func runSkillOptTrainInitCreate(args []string, stdout, stderr io.Writer) int {
 		Mode:         strings.TrimSpace(*mode),
 		Request:      strings.TrimSpace(request),
 	}
+	setFlags := flagNamesSet(fs)
 	if values.TaskKind == "" {
 		values.TaskKind = "custom"
 	}
 	if values.Mode == "" {
 		values.Mode = db.EvalRunModeExplore
 	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt train init: get working directory: %v\n", err)
+		return 1
+	}
+	promptScope := skillOptTrainInitPromptScope(cwd, values.Name)
+	rerunCommand := skillOptTrainInitRerunCommand(*home, values, strings.TrimSpace(*requestFile), setFlags)
+	appliedPromptFields, err := applySkillOptTrainInitPromptAnswers(*home, promptScope, setFlags, &values)
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
+		return 1
+	}
 	if missing := missingSkillOptTrainInitInputs(values); len(missing) > 0 {
+		if !*yes && skillOptTrainInitInteractive() {
+			prompts, err := createSkillOptTrainInitPrompts(*home, promptScope, values, missing)
+			if err != nil {
+				fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
+				return 1
+			}
+			printSkillOptTrainInitPromptInstructions(stdout, *home, rerunCommand, prompts)
+			return 0
+		}
 		fmt.Fprintf(stderr, "skillopt train init missing required fields: %s\n", strings.Join(missing, ", "))
 		fmt.Fprintf(stderr, "example: %s\n", skillOptTrainInitExampleCommand(values.Name))
 		return 2
 	}
 	if err := skillopt.ValidateTrainInitName(values.Name); err != nil {
+		clearSkillOptTrainInitPromptAnswerOnError(*home, promptScope, appliedPromptFields, "name")
 		fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
 		return 2
 	}
 	reviewRepo, err := daemon.ParseRepository(values.ReviewRepo)
 	if err != nil {
+		clearSkillOptTrainInitPromptAnswerOnError(*home, promptScope, appliedPromptFields, "review_repo")
 		fmt.Fprintf(stderr, "skillopt train init: review-repo: %v\n", err)
 		return 2
 	}
 	if _, err := normalizeSkillOptTrainTaskKind(values.TaskKind); err != nil {
+		clearSkillOptTrainInitPromptAnswerOnError(*home, promptScope, appliedPromptFields, "task_kind")
 		fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
 		return 2
 	}
 	normalizedPreview, err := normalizeSkillOptTrainInitPreview(values.Preview)
 	if err != nil {
+		clearSkillOptTrainInitPromptAnswerOnError(*home, promptScope, appliedPromptFields, "preview")
 		fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
 		return 2
 	}
 	values.Preview = normalizedPreview
 	normalizedMode, normalizedExploration, err := normalizeSkillOptTrainMode(values.Mode, "")
 	if err != nil {
+		clearSkillOptTrainInitPromptAnswerOnError(*home, promptScope, appliedPromptFields, "mode")
 		fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
 		return 2
 	}
@@ -227,6 +260,7 @@ func runSkillOptTrainInitCreate(args []string, stdout, stderr io.Writer) int {
 		template, err = skillopt.ResolveTrainInitTemplateChoice(context.Background(), store, newAgentTemplateFetcher(), values.Template)
 		return err
 	}); err != nil {
+		clearSkillOptTrainInitPromptAnswerOnError(*home, promptScope, appliedPromptFields, "template")
 		fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
 		return 1
 	}
@@ -241,17 +275,16 @@ func runSkillOptTrainInitCreate(args []string, stdout, stderr io.Writer) int {
 	config.Mode = values.Mode
 	config.ExplorationLevel = normalizedExploration
 	config.Options = skillOptTrainInitDefaultOptions(normalizedMode)
-	cwd, err := os.Getwd()
-	if err != nil {
-		fmt.Fprintf(stderr, "skillopt train init: get working directory: %v\n", err)
-		return 1
-	}
 	paths, err := skillopt.WriteTrainInitScaffold(cwd, skillopt.TrainInitScaffold{
 		Config:          config,
 		TaskMarkdown:    values.Request,
 		ReviewItemsYAML: skillOptTrainInitStarterReviewItemsYAML(values),
 	})
 	if err != nil {
+		fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
+		return 1
+	}
+	if err := consumeSkillOptTrainInitPromptAnswers(*home, promptScope); err != nil {
 		fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
 		return 1
 	}
@@ -273,6 +306,12 @@ type skillOptTrainInitInputs struct {
 	Request      string
 }
 
+type skillOptTrainInitPrompt struct {
+	Field  string
+	Flag   string
+	Prompt db.InteractivePrompt
+}
+
 func missingSkillOptTrainInitInputs(values skillOptTrainInitInputs) []string {
 	missing := []string{}
 	for field, value := range map[string]string{
@@ -291,6 +330,300 @@ func missingSkillOptTrainInitInputs(values skillOptTrainInitInputs) []string {
 	}
 	sort.Strings(missing)
 	return missing
+}
+
+func skillOptTrainInitPromptScope(workspaceRoot string, name string) string {
+	workspaceRoot = strings.TrimSpace(workspaceRoot)
+	if abs, err := filepath.Abs(workspaceRoot); err == nil {
+		workspaceRoot = abs
+	}
+	workspaceRoot = filepath.Clean(workspaceRoot)
+	sum := sha256.Sum256([]byte(workspaceRoot))
+	workspaceScope := "ws-" + hex.EncodeToString(sum[:8])
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return workspaceScope + "-empty"
+	}
+	return workspaceScope + "-name-" + hex.EncodeToString([]byte(name))
+}
+
+func skillOptTrainInitPromptID(scope string, field string) string {
+	return "skillopt-train-init." + strings.TrimSpace(scope) + "." + strings.ReplaceAll(field, "_", "-")
+}
+
+func applySkillOptTrainInitPromptAnswers(home string, scope string, setFlags map[string]struct{}, values *skillOptTrainInitInputs) (map[string]struct{}, error) {
+	if values == nil || !skillOptTrainInitPromptDatabaseExists(home) {
+		return nil, nil
+	}
+	paths, err := skillOptTrainInitConfigPaths(home)
+	if err != nil {
+		return nil, err
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		return nil, err
+	}
+	defer store.Close()
+	prompts, err := store.ListInteractivePrompts(context.Background(), "")
+	if err != nil {
+		return nil, err
+	}
+	answers := map[string]string{}
+	for _, prompt := range prompts {
+		if prompt.State != db.InteractivePromptStateResolved {
+			continue
+		}
+		field, ok := skillOptTrainInitPromptField(scope, prompt.ID)
+		if !ok {
+			continue
+		}
+		answers[field] = prompt.AnswerValue
+	}
+	applied := map[string]struct{}{}
+	for field, answer := range answers {
+		if strings.TrimSpace(answer) == "" || skillOptTrainInitFieldWasSet(field, setFlags) {
+			continue
+		}
+		switch field {
+		case "name":
+			values.Name = answer
+		case "template":
+			values.Template = answer
+		case "review_repo":
+			values.ReviewRepo = answer
+		case "task_kind":
+			values.TaskKind = answer
+		case "artifact_kind":
+			values.ArtifactKind = answer
+		case "preview":
+			values.Preview = answer
+		case "mode":
+			values.Mode = answer
+		case "request":
+			values.Request = answer
+		}
+		applied[field] = struct{}{}
+	}
+	return applied, nil
+}
+
+func clearSkillOptTrainInitPromptAnswerOnError(home string, scope string, appliedPromptFields map[string]struct{}, field string) {
+	if _, ok := appliedPromptFields[field]; !ok {
+		return
+	}
+	_ = deleteSkillOptTrainInitPrompt(home, scope, field)
+}
+
+func deleteSkillOptTrainInitPrompt(home string, scope string, field string) error {
+	if !skillOptTrainInitPromptDatabaseExists(home) {
+		return nil
+	}
+	paths, err := skillOptTrainInitConfigPaths(home)
+	if err != nil {
+		return err
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	return store.DeleteInteractivePrompt(context.Background(), skillOptTrainInitPromptID(scope, field))
+}
+
+func consumeSkillOptTrainInitPromptAnswers(home string, scope string) error {
+	if !skillOptTrainInitPromptDatabaseExists(home) {
+		return nil
+	}
+	paths, err := skillOptTrainInitConfigPaths(home)
+	if err != nil {
+		return err
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	prompts, err := store.ListInteractivePrompts(context.Background(), "")
+	if err != nil {
+		return err
+	}
+	for _, prompt := range prompts {
+		if _, ok := skillOptTrainInitPromptField(scope, prompt.ID); !ok {
+			continue
+		}
+		if err := store.DeleteInteractivePrompt(context.Background(), prompt.ID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func skillOptTrainInitPromptDatabaseExists(home string) bool {
+	paths, err := skillOptTrainInitConfigPaths(home)
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(paths.Database)
+	return err == nil && !info.IsDir()
+}
+
+func skillOptTrainInitConfigPaths(home string) (config.Paths, error) {
+	if strings.TrimSpace(home) != "" {
+		return config.PathsForHome(home), nil
+	}
+	return config.DefaultPaths()
+}
+
+func skillOptTrainInitPromptField(scope string, promptID string) (string, bool) {
+	prefix := "skillopt-train-init." + strings.TrimSpace(scope) + "."
+	if !strings.HasPrefix(promptID, prefix) {
+		return "", false
+	}
+	field := strings.TrimPrefix(promptID, prefix)
+	field = strings.ReplaceAll(field, "-", "_")
+	switch field {
+	case "name", "template", "review_repo", "task_kind", "artifact_kind", "preview", "mode", "request":
+		return field, true
+	default:
+		return "", false
+	}
+}
+
+func skillOptTrainInitFieldWasSet(field string, setFlags map[string]struct{}) bool {
+	switch field {
+	case "request":
+		return flagWasSet(setFlags, "request") || flagWasSet(setFlags, "request-file")
+	case "review_repo":
+		return flagWasSet(setFlags, "review-repo")
+	case "task_kind":
+		return flagWasSet(setFlags, "task-kind")
+	case "artifact_kind":
+		return flagWasSet(setFlags, "artifact-kind")
+	default:
+		return flagWasSet(setFlags, strings.ReplaceAll(field, "_", "-"))
+	}
+}
+
+func createSkillOptTrainInitPrompts(home string, scope string, values skillOptTrainInitInputs, missing []string) ([]skillOptTrainInitPrompt, error) {
+	var created []skillOptTrainInitPrompt
+	err := withStore(home, func(store *db.Store) error {
+		for _, field := range missing {
+			prompt := buildSkillOptTrainInitPrompt(scope, field, values)
+			if err := store.UpsertInteractivePrompt(context.Background(), prompt.Prompt); err != nil {
+				return err
+			}
+			created = append(created, prompt)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return created, nil
+}
+
+func buildSkillOptTrainInitPrompt(scope string, field string, values skillOptTrainInitInputs) skillOptTrainInitPrompt {
+	descriptor := skillOptTrainInitPrompt{
+		Field: field,
+		Flag:  skillOptTrainInitFlagForField(field),
+		Prompt: db.InteractivePrompt{
+			ID:            skillOptTrainInitPromptID(scope, field),
+			Required:      true,
+			AnswerFormat:  "text",
+			SourceCommand: "gitmoot skillopt train init",
+		},
+	}
+	switch field {
+	case "name":
+		descriptor.Prompt.Question = "Training name? (flag: --name)"
+	case "template":
+		descriptor.Prompt.Question = "Agent template to train? (flag: --template)"
+	case "review_repo":
+		descriptor.Prompt.Question = "Review repository in owner/repo form? (flag: --review-repo)"
+	case "task_kind":
+		descriptor.Prompt.Question = "Task kind? (flag: --task-kind)"
+		descriptor.Prompt.Choices = []string{"correctness", "ux", "design", "writing", "data", "custom"}
+		descriptor.Prompt.Default = firstNonEmpty(values.TaskKind, "custom")
+		descriptor.Prompt.AnswerFormat = "choice"
+	case "artifact_kind":
+		descriptor.Prompt.Question = "Artifact kind to optimize? (flag: --artifact-kind)"
+	case "preview":
+		descriptor.Prompt.Question = "Preview kind? (flag: --preview)"
+		descriptor.Prompt.Choices = []string{"none", "text-table", "vue"}
+		descriptor.Prompt.AnswerFormat = "choice"
+	case "mode":
+		descriptor.Prompt.Question = "Training mode? (flag: --mode)"
+		descriptor.Prompt.Choices = []string{db.EvalRunModeExplore, db.EvalRunModeRefine, db.EvalRunModeDistill, db.EvalRunModeValidate}
+		descriptor.Prompt.Default = firstNonEmpty(values.Mode, db.EvalRunModeExplore)
+		descriptor.Prompt.AnswerFormat = "choice"
+	case "request":
+		descriptor.Prompt.Question = "Training request text? (flag: --request)"
+	default:
+		descriptor.Prompt.Question = field + "? (flag: " + descriptor.Flag + ")"
+	}
+	return descriptor
+}
+
+func skillOptTrainInitFlagForField(field string) string {
+	switch field {
+	case "review_repo":
+		return "--review-repo"
+	case "task_kind":
+		return "--task-kind"
+	case "artifact_kind":
+		return "--artifact-kind"
+	default:
+		return "--" + strings.ReplaceAll(field, "_", "-")
+	}
+}
+
+func printSkillOptTrainInitPromptInstructions(stdout io.Writer, home string, rerunCommand []string, prompts []skillOptTrainInitPrompt) {
+	writeLine(stdout, "interactive_prompts_created: %d", len(prompts))
+	for _, prompt := range prompts {
+		writeLine(stdout, "prompt: %s field=%s flag=%s", prompt.Prompt.ID, prompt.Field, prompt.Flag)
+		writeLine(stdout, "question: %s", prompt.Prompt.Question)
+		writeLine(stdout, "show_command: %s", shellArgs(append(skillOptTrainInitInteractiveCommandPrefix("show", home), prompt.Prompt.ID, "--json")))
+		writeLine(stdout, "answer_command: %s <value>", shellArgs(append(skillOptTrainInitInteractiveCommandPrefix("answer", home), prompt.Prompt.ID)))
+	}
+	writeLine(stdout, "next: answer the prompts, then rerun %s", shellArgs(rerunCommand))
+}
+
+func skillOptTrainInitInteractiveCommandPrefix(command string, home string) []string {
+	args := []string{"gitmoot", "interactive", command}
+	if strings.TrimSpace(home) != "" {
+		args = append(args, "--home", strings.TrimSpace(home))
+	}
+	return args
+}
+
+func skillOptTrainInitRerunCommand(home string, values skillOptTrainInitInputs, requestFile string, setFlags map[string]struct{}) []string {
+	args := []string{"gitmoot", "skillopt", "train", "init"}
+	if strings.TrimSpace(home) != "" {
+		args = append(args, "--home", strings.TrimSpace(home))
+	}
+	for _, field := range []struct {
+		flag  string
+		value string
+	}{
+		{"name", values.Name},
+		{"template", values.Template},
+		{"review-repo", values.ReviewRepo},
+		{"task-kind", values.TaskKind},
+		{"artifact-kind", values.ArtifactKind},
+		{"preview", values.Preview},
+		{"mode", values.Mode},
+		{"request", values.Request},
+		{"request-file", requestFile},
+	} {
+		if !flagWasSet(setFlags, field.flag) || strings.TrimSpace(field.value) == "" {
+			continue
+		}
+		if field.flag == "request-file" && strings.TrimSpace(values.Request) == "" {
+			continue
+		}
+		args = append(args, "--"+field.flag, strings.TrimSpace(field.value))
+	}
+	return args
 }
 
 func skillOptTrainInitExampleCommand(name string) string {

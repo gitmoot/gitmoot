@@ -764,6 +764,18 @@ func replaceAgentTemplateFetcher(fetcher agenttemplate.Fetcher) func() {
 	}
 }
 
+func replaceSkillOptTrainInitInteractive(interactive bool) func() {
+	previous := skillOptTrainInitInteractive
+	active := true
+	skillOptTrainInitInteractive = func() bool {
+		return active && interactive
+	}
+	return func() {
+		active = false
+		skillOptTrainInitInteractive = previous
+	}
+}
+
 type fakeAgentTemplateFetcher struct {
 	commit  string
 	content string

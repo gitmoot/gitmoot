@@ -984,6 +984,383 @@ func TestSkillOptTrainInitCreatesScaffold(t *testing.T) {
 	}
 }
 
+func TestSkillOptTrainInitCompletesFromPromptAnswers(t *testing.T) {
+	home := t.TempDir()
+	workspace := chdirTemp(t)
+	scope := skillOptTrainInitPromptScope(workspace, "")
+	restoreFetcher := replaceAgentTemplateFetcher(fakeAgentTemplateFetcher{
+		commit:  "abc123",
+		content: "# Gitmoot Planner\n\nPlan work.",
+	})
+	defer restoreFetcher()
+	restoreInteractive := replaceSkillOptTrainInitInteractive(true)
+	defer restoreInteractive()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "train", "init", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("interactive train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "interactive_prompts_created: 6") || !strings.Contains(stdout.String(), "gitmoot interactive answer --home "+home+" "+skillOptTrainInitPromptID(scope, "template")+" <value>") {
+		t.Fatalf("prompt stdout = %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "rerun gitmoot skillopt train init --home "+home) {
+		t.Fatalf("prompt stdout missing home-aware rerun command = %q", stdout.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"interactive", "show", "--home", home, skillOptTrainInitPromptID(scope, "template"), "--json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("show template prompt exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	var templatePrompt db.InteractivePrompt
+	if err := json.Unmarshal(stdout.Bytes(), &templatePrompt); err != nil {
+		t.Fatalf("decode template prompt: %v\n%s", err, stdout.String())
+	}
+	if templatePrompt.AnswerFormat != "text" || len(templatePrompt.Choices) != 0 {
+		t.Fatalf("template prompt should accept template refs without choice restriction: %+v", templatePrompt)
+	}
+
+	answers := map[string]string{
+		"name":          "prompt-flow",
+		"template":      "planner",
+		"review-repo":   "jerryfane/gitmoot",
+		"artifact-kind": "text",
+		"preview":       "text-table",
+		"request":       "Improve planner summaries.",
+	}
+	for field, value := range answers {
+		stdout.Reset()
+		stderr.Reset()
+		code = Run([]string{"interactive", "answer", "--home", home, skillOptTrainInitPromptID(scope, strings.ReplaceAll(field, "-", "_")), value, "--source", "agent"}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("answer %s exit code = %d, stdout=%s stderr=%s", field, code, stdout.String(), stderr.String())
+		}
+	}
+
+	restoreInteractive()
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "train", "init", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("prompt-backed train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	cfg, err := skillopt.LoadTrainInitConfig(filepath.Join(workspace, ".gitmoot", "skillopt", "prompt-flow", "config.toml"))
+	if err != nil {
+		t.Fatalf("LoadTrainInitConfig returned error: %v", err)
+	}
+	if cfg.Name != "prompt-flow" || cfg.Template != "planner" || cfg.ReviewRepo != "jerryfane/gitmoot" || cfg.ArtifactKind != "text" || cfg.Preview != "text-table" || cfg.Mode != db.EvalRunModeExplore {
+		t.Fatalf("config from prompts = %+v", cfg)
+	}
+	task, err := os.ReadFile(filepath.Join(workspace, ".gitmoot", "skillopt", "prompt-flow", "task.md"))
+	if err != nil {
+		t.Fatalf("ReadFile task.md returned error: %v", err)
+	}
+	if strings.TrimSpace(string(task)) != "Improve planner summaries." {
+		t.Fatalf("task.md = %q", string(task))
+	}
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open store returned error: %v", err)
+	}
+	defer store.Close()
+	prompts, err := store.ListInteractivePrompts(context.Background(), "")
+	if err != nil {
+		t.Fatalf("ListInteractivePrompts returned error: %v", err)
+	}
+	if len(prompts) != 0 {
+		t.Fatalf("prompt answers should be consumed after scaffold creation: %+v", prompts)
+	}
+}
+
+func TestSkillOptTrainInitNamedPromptRerunIncludesName(t *testing.T) {
+	home := t.TempDir()
+	workspace := chdirTemp(t)
+	scope := skillOptTrainInitPromptScope(workspace, "named-flow")
+	restoreInteractive := replaceSkillOptTrainInitInteractive(true)
+	defer restoreInteractive()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "train", "init", "--home", home, "--name", "named-flow"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("named interactive train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), skillOptTrainInitPromptID(scope, "template")) {
+		t.Fatalf("named prompt stdout missing encoded scope:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "rerun gitmoot skillopt train init --home "+home+" --name named-flow") {
+		t.Fatalf("named prompt stdout missing name-aware rerun command:\n%s", stdout.String())
+	}
+}
+
+func TestSkillOptTrainInitPartialDefaultPromptRerunStaysDefaultScoped(t *testing.T) {
+	home := t.TempDir()
+	workspace := chdirTemp(t)
+	scope := skillOptTrainInitPromptScope(workspace, "")
+	restoreInteractive := replaceSkillOptTrainInitInteractive(true)
+	defer restoreInteractive()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "train", "init", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("interactive train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"interactive", "answer", "--home", home, skillOptTrainInitPromptID(scope, "name"), "partial-flow"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("answer name exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "train", "init", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("partial prompt rerun exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "--name partial-flow") {
+		t.Fatalf("default-scoped partial rerun should not switch scopes:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), skillOptTrainInitPromptID(scope, "template")) {
+		t.Fatalf("default-scoped partial rerun should keep empty prompt ids:\n%s", stdout.String())
+	}
+}
+
+func TestSkillOptTrainInitPromptRerunPreservesSuppliedFlags(t *testing.T) {
+	home := t.TempDir()
+	_ = chdirTemp(t)
+	restoreInteractive := replaceSkillOptTrainInitInteractive(true)
+	defer restoreInteractive()
+
+	requestFile := filepath.Join(t.TempDir(), "request.md")
+	if err := os.WriteFile(requestFile, []byte("Improve prompts.\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile request returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "init",
+		"--home", home,
+		"--template", "planner",
+		"--artifact-kind", "text",
+		"--request-file", requestFile,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("interactive train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	output := stdout.String()
+	for _, want := range []string{
+		"--template planner",
+		"--artifact-kind text",
+		"--request-file " + requestFile,
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("prompt rerun command did not preserve %s:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "--request Improve prompts") {
+		t.Fatalf("prompt rerun command should preserve request-file, not inline request text:\n%s", output)
+	}
+}
+
+func TestSkillOptTrainInitPromptRerunDropsEmptyRequestFile(t *testing.T) {
+	home := t.TempDir()
+	workspace := chdirTemp(t)
+	scope := skillOptTrainInitPromptScope(workspace, "")
+	restoreInteractive := replaceSkillOptTrainInitInteractive(true)
+	defer restoreInteractive()
+
+	requestFile := filepath.Join(t.TempDir(), "empty-request.md")
+	if err := os.WriteFile(requestFile, []byte(" \n\t\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile request returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "init",
+		"--home", home,
+		"--template", "planner",
+		"--request-file", requestFile,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("interactive train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "--request-file") {
+		t.Fatalf("empty request-file should not be preserved when request is prompted:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), skillOptTrainInitPromptID(scope, "request")) {
+		t.Fatalf("empty request-file should create request prompt:\n%s", stdout.String())
+	}
+}
+
+func TestSkillOptTrainInitClearsInvalidPromptAnswers(t *testing.T) {
+	home := t.TempDir()
+	workspace := chdirTemp(t)
+	scope := skillOptTrainInitPromptScope(workspace, "")
+	restoreInteractive := replaceSkillOptTrainInitInteractive(true)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "train", "init", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("interactive train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	answers := map[string]string{
+		"name":          "bad-prompt-flow",
+		"template":      "planner",
+		"review-repo":   "not-a-repo",
+		"artifact-kind": "text",
+		"preview":       "text-table",
+		"request":       "Improve planner summaries.",
+	}
+	for field, value := range answers {
+		stdout.Reset()
+		stderr.Reset()
+		code = Run([]string{"interactive", "answer", "--home", home, skillOptTrainInitPromptID(scope, strings.ReplaceAll(field, "-", "_")), value, "--source", "agent"}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("answer %s exit code = %d, stdout=%s stderr=%s", field, code, stdout.String(), stderr.String())
+		}
+	}
+
+	restoreInteractive()
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "train", "init", "--home", home}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("invalid prompt-backed init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "review-repo") {
+		t.Fatalf("stderr missing review repo validation error: %s", stderr.String())
+	}
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open store returned error: %v", err)
+	}
+	defer store.Close()
+	prompts, err := store.ListInteractivePrompts(context.Background(), "")
+	if err != nil {
+		t.Fatalf("ListInteractivePrompts returned error: %v", err)
+	}
+	if len(prompts) != 5 {
+		t.Fatalf("only the invalid prompt answer should be cleared, got: %+v", prompts)
+	}
+	for _, prompt := range prompts {
+		if strings.Contains(prompt.ID, ".review-repo") {
+			t.Fatalf("invalid review repo prompt should be cleared: %+v", prompts)
+		}
+	}
+}
+
+func TestSkillOptTrainInitKeepsPromptAnswersForExplicitFlagErrors(t *testing.T) {
+	home := t.TempDir()
+	workspace := chdirTemp(t)
+	scope := skillOptTrainInitPromptScope(workspace, "")
+	restoreInteractive := replaceSkillOptTrainInitInteractive(true)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "train", "init", "--home", home, "--preview", "bogus"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("interactive train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	answers := map[string]string{
+		"name":          "explicit-error-flow",
+		"template":      "planner",
+		"review-repo":   "jerryfane/gitmoot",
+		"artifact-kind": "text",
+		"request":       "Improve planner summaries.",
+	}
+	for field, value := range answers {
+		stdout.Reset()
+		stderr.Reset()
+		code = Run([]string{"interactive", "answer", "--home", home, skillOptTrainInitPromptID(scope, strings.ReplaceAll(field, "-", "_")), value, "--source", "agent"}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("answer %s exit code = %d, stdout=%s stderr=%s", field, code, stdout.String(), stderr.String())
+		}
+	}
+
+	restoreInteractive()
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "train", "init", "--home", home, "--preview", "bogus"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("explicit invalid preview init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open store returned error: %v", err)
+	}
+	defer store.Close()
+	prompts, err := store.ListInteractivePrompts(context.Background(), "")
+	if err != nil {
+		t.Fatalf("ListInteractivePrompts returned error: %v", err)
+	}
+	if len(prompts) != len(answers) {
+		t.Fatalf("explicit flag error should not clear prompt answers: %+v", prompts)
+	}
+	for _, prompt := range prompts {
+		if prompt.State != db.InteractivePromptStateResolved {
+			t.Fatalf("prompt answer should remain resolved after explicit flag error: %+v", prompt)
+		}
+	}
+}
+
+func TestSkillOptTrainInitFullyFlaggedBypassesPromptCreation(t *testing.T) {
+	home := t.TempDir()
+	_ = chdirTemp(t)
+	restoreFetcher := replaceAgentTemplateFetcher(fakeAgentTemplateFetcher{
+		commit:  "abc123",
+		content: "# Gitmoot Planner\n\nPlan work.",
+	})
+	defer restoreFetcher()
+	restoreInteractive := replaceSkillOptTrainInitInteractive(true)
+	defer restoreInteractive()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "init",
+		"--home", home,
+		"--name", "flagged-flow",
+		"--template", "planner",
+		"--review-repo", "jerryfane/gitmoot",
+		"--task-kind", "writing",
+		"--artifact-kind", "text",
+		"--preview", "text-table",
+		"--request", "Improve this.",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open store returned error: %v", err)
+	}
+	defer store.Close()
+	prompts, err := store.ListInteractivePrompts(context.Background(), "")
+	if err != nil {
+		t.Fatalf("ListInteractivePrompts returned error: %v", err)
+	}
+	if len(prompts) != 0 {
+		t.Fatalf("fully flagged init created prompts: %+v", prompts)
+	}
+}
+
+func TestSkillOptTrainInitPromptScopesDoNotCollide(t *testing.T) {
+	scopes := map[string]string{
+		"workspace-a-empty":   skillOptTrainInitPromptScope("/tmp/workspace-a", ""),
+		"workspace-b-empty":   skillOptTrainInitPromptScope("/tmp/workspace-b", ""),
+		"workspace-a-default": skillOptTrainInitPromptScope("/tmp/workspace-a", "default"),
+		"workspace-a-Foo":     skillOptTrainInitPromptScope("/tmp/workspace-a", "Foo"),
+		"workspace-a-foo":     skillOptTrainInitPromptScope("/tmp/workspace-a", "foo"),
+	}
+	seen := map[string]string{}
+	for label, scope := range scopes {
+		if previous, ok := seen[scope]; ok {
+			t.Fatalf("scope collision: %s and %s both use %s", previous, label, scope)
+		}
+		seen[scope] = label
+	}
+}
+
 func TestSkillOptTrainStartLoadsInitConfig(t *testing.T) {
 	home := t.TempDir()
 	workspace := chdirTemp(t)
@@ -1305,6 +1682,8 @@ func TestSkillOptTrainOptimizerDefaultsDoNotOverrideExplicitControls(t *testing.
 func TestSkillOptTrainInitMissingRequiredFieldsIsAtomic(t *testing.T) {
 	home := t.TempDir()
 	workspace := chdirTemp(t)
+	restoreInteractive := replaceSkillOptTrainInitInteractive(false)
+	defer restoreInteractive()
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{"skillopt", "train", "init", "--home", home, "--name", "missing-fields"}, &stdout, &stderr)
 	if code != 2 {

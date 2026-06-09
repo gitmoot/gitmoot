@@ -2691,6 +2691,15 @@ func (s *Store) AnswerInteractivePrompt(ctx context.Context, id string, value st
 	return s.GetInteractivePrompt(ctx, prompt.ID)
 }
 
+func (s *Store) DeleteInteractivePrompt(ctx context.Context, id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return errors.New("interactive prompt id is required")
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM interactive_prompts WHERE id = ?`, id)
+	return err
+}
+
 func validateInteractivePromptAnswer(prompt InteractivePrompt, value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" && strings.TrimSpace(prompt.Default) != "" {
