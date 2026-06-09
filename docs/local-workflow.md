@@ -22,6 +22,9 @@ gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 gitmoot agent template update thermo-nuclear-code-quality-review
 gitmoot agent start <name> --runtime codex|claude --repo owner/repo --path . --template thermo-nuclear-code-quality-review --start-daemon
 gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
+gitmoot agent run <name> "message" --repo owner/repo [--task task-id] [--pr number] [--background]
+gitmoot agent review <name> "message" --repo owner/repo --pr number [--background]
+gitmoot agent implement <name> "message" --repo owner/repo [--task task-id] [--background]
 gitmoot agent ask <name> "message" --repo owner/repo
 gitmoot agent ask <name> --background --repo owner/repo "message"
 gitmoot agent type list
@@ -76,10 +79,12 @@ planner job.
 
 If a Codex or Claude chat wants to reuse a registered Gitmoot agent prompt in
 the current chat, it should run `gitmoot agent prompt <agent-or-template>` and
-apply the returned prompt content locally. If it wants to invoke a registered
-Gitmoot agent through the runtime adapter path, it should run
-`gitmoot agent ask <agent> --repo owner/repo "..."`. That uses the same local
-agent registry and runtime adapter path as PR-comment ask jobs.
+apply the returned prompt content locally. If it wants to delegate work through
+the runtime adapter path, it should prefer `gitmoot agent run <agent> --repo
+owner/repo "..."`. `agent run` routes to `ask`, `review`, or `implement` from
+explicit flags and message intent. Use `agent ask` only for analysis, planning,
+or questions; use `agent review` for a PR review decision; use `agent implement`
+for code, docs, tests, or file edits.
 
 ## Execution Model
 
@@ -102,6 +107,12 @@ Background execution uses separate resource categories:
   two jobs at the same time.
 - **Branch locks**: workflow ownership records used for implementation and
   merge safety.
+
+Gitmoot owns repository orchestration for implementation jobs. Child agents
+should not be asked to create branches, commit, push, or open PRs through
+`agent ask`; use `agent run`, `agent implement`, or `task run` so Gitmoot can
+allocate worktrees, hold branch locks, commit changes, push branches, open PRs,
+and advance review state.
 
 The daemon defaults to `--workers 1`. Raise `--workers` when the Gitmoot home
 has independent runtime sessions, managed agent types with `max_background`

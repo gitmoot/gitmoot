@@ -2238,6 +2238,75 @@ func TestRunQueuedJobsUsesTaskWorktreeForImplement(t *testing.T) {
 	}
 }
 
+func TestRefreshDaemonJobPayloadPreservesTaskWorktreeHeadForFinalizer(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	remoteDir := filepath.Join(home, "remote.git")
+	checkout := filepath.Join(home, "repo")
+	worktree := filepath.Join(home, "task-1")
+	runGit(t, home, "init", "--bare", remoteDir)
+	runGit(t, home, "clone", remoteDir, checkout)
+	runGit(t, checkout, "config", "user.email", "gitmoot@example.com")
+	runGit(t, checkout, "config", "user.name", "Gitmoot Test")
+	if err := os.WriteFile(filepath.Join(checkout, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runGit(t, checkout, "add", "README.md")
+	runGit(t, checkout, "commit", "-m", "initial")
+	runGit(t, checkout, "branch", "-m", "main")
+	runGit(t, checkout, "push", "-u", "origin", "main")
+	runGit(t, checkout, "worktree", "add", "-b", "task-1", worktree, "main")
+	oldHead, err := (gitutil.Client{Dir: worktree}).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("HeadSHA returned error: %v", err)
+	}
+
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "lead", runtime.ShellRuntime, "unused", []string{"implement"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "reviewer", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task 1", State: string(workflow.TaskImplementing), Branch: "task-1", WorktreePath: worktree}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{RepoFullName: "owner/repo", Number: 12, URL: "https://github.com/owner/repo/pull/12", HeadBranch: "task-1", BaseBranch: "main", HeadSHA: oldHead, State: "open"}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: "task-1", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "feature.txt"), []byte("self committed\n"), 0o644); err != nil {
+		t.Fatalf("write feature: %v", err)
+	}
+	runGit(t, worktree, "add", "feature.txt")
+	runGit(t, worktree, "commit", "-m", "agent self commit")
+	newHead, err := (gitutil.Client{Dir: worktree}).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("HeadSHA returned error: %v", err)
+	}
+	if newHead == oldHead {
+		t.Fatal("worker did not create a new commit")
+	}
+	payload := workflow.JobPayload{Repo: "owner/repo", Branch: "task-1", PullRequest: 12, HeadSHA: oldHead, GoalID: "goal-1", TaskID: "task-1", TaskTitle: "Task 1", Result: &workflow.AgentResult{Decision: "implemented", Summary: "done"}}
+	refreshed, err := refreshDaemonJobPayload(ctx, store, worktree, db.Job{ID: "job-implement-worktree", Agent: "lead", Type: "implement"}, payload)
+	if err != nil {
+		t.Fatalf("refreshDaemonJobPayload returned error: %v", err)
+	}
+	if refreshed.HeadSHA != oldHead {
+		t.Fatalf("refreshed head = %q, want original %q", refreshed.HeadSHA, oldHead)
+	}
+	finalized, err := (daemonImplementationFinalizer{Store: store, GitHub: github.NoopClient{}}).FinalizeImplementation(ctx, db.Job{ID: "job-implement-worktree", Agent: "lead", Type: "implement"}, refreshed)
+	if err != nil {
+		t.Fatalf("FinalizeImplementation returned error: %v", err)
+	}
+	if finalized.HeadSHA != newHead {
+		t.Fatalf("finalized head = %q, want %q", finalized.HeadSHA, newHead)
+	}
+	remoteHead := strings.TrimSpace(runGitOutput(t, checkout, "ls-remote", "origin", "refs/heads/task-1"))
+	if !strings.Contains(remoteHead, newHead) {
+		t.Fatalf("remote task branch %q does not contain local head %q", remoteHead, newHead)
+	}
+}
+
 func TestRunQueuedJobsResumesDelegatedImplementWithOriginalBranchLock(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
@@ -2348,6 +2417,246 @@ func TestRunQueuedJobsUsesTaskWorktreeForReview(t *testing.T) {
 	}
 	if adapter.calls != 1 {
 		t.Fatalf("adapter calls = %d, want 1", adapter.calls)
+	}
+}
+
+func TestDaemonImplementationFinalizerCommitsBeforeReusingExistingPullRequest(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	remoteDir := filepath.Join(home, "remote.git")
+	repoDir := filepath.Join(home, "repo")
+	runGit(t, home, "init", "--bare", remoteDir)
+	runGit(t, home, "clone", remoteDir, repoDir)
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot Test")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "initial")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "push", "-u", "origin", "main")
+	runGit(t, repoDir, "switch", "-c", "task-1")
+	if err := os.WriteFile(filepath.Join(repoDir, "feature.txt"), []byte("new work\n"), 0o644); err != nil {
+		t.Fatalf("write feature: %v", err)
+	}
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir, DefaultBranch: "main", PollInterval: "30s"}); err != nil {
+		t.Fatalf("UpsertRepo returned error: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task 1", State: string(workflow.TaskImplementing), Branch: "task-1", WorktreePath: repoDir}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{RepoFullName: "owner/repo", Number: 12, URL: "https://github.com/owner/repo/pull/12", HeadBranch: "task-1", BaseBranch: "main", HeadSHA: "old", State: "open"}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	finalizer := daemonImplementationFinalizer{Store: store, GitHub: github.NoopClient{}}
+	payload := workflow.JobPayload{
+		Repo:      "owner/repo",
+		Branch:    "task-1",
+		GoalID:    "goal-1",
+		TaskID:    "task-1",
+		TaskTitle: "Task 1",
+		LeadAgent: "lead",
+		Result:    &workflow.AgentResult{Decision: "implemented", Summary: "done"},
+	}
+
+	finalized, err := finalizer.FinalizeImplementation(ctx, db.Job{ID: "job-1", Agent: "lead", Type: "implement"}, payload)
+	if err != nil {
+		t.Fatalf("FinalizeImplementation returned error: %v", err)
+	}
+
+	if finalized.PullRequest != 12 {
+		t.Fatalf("pull request = %d, want 12", finalized.PullRequest)
+	}
+	clean, err := (gitutil.Client{Dir: repoDir}).WorktreeClean(ctx)
+	if err != nil {
+		t.Fatalf("WorktreeClean returned error: %v", err)
+	}
+	if !clean {
+		t.Fatal("worktree still has uncommitted changes")
+	}
+	localHead, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("HeadSHA returned error: %v", err)
+	}
+	if finalized.HeadSHA != localHead {
+		t.Fatalf("finalized head = %q, want %q", finalized.HeadSHA, localHead)
+	}
+	remoteHead := strings.TrimSpace(runGitOutput(t, repoDir, "ls-remote", "origin", "refs/heads/task-1"))
+	if !strings.Contains(remoteHead, localHead) {
+		t.Fatalf("remote task branch %q does not contain local head %q", remoteHead, localHead)
+	}
+}
+
+func TestDaemonImplementationFinalizerPushesAlreadyCommittedWork(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	remoteDir := filepath.Join(home, "remote.git")
+	repoDir := filepath.Join(home, "repo")
+	runGit(t, home, "init", "--bare", remoteDir)
+	runGit(t, home, "clone", remoteDir, repoDir)
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot Test")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "initial")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "push", "-u", "origin", "main")
+	runGit(t, repoDir, "switch", "-c", "task-1")
+	oldHead, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("HeadSHA returned error: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "feature.txt"), []byte("already committed\n"), 0o644); err != nil {
+		t.Fatalf("write feature: %v", err)
+	}
+	runGit(t, repoDir, "add", "feature.txt")
+	runGit(t, repoDir, "commit", "-m", "agent commit")
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir, DefaultBranch: "main", PollInterval: "30s"}); err != nil {
+		t.Fatalf("UpsertRepo returned error: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task 1", State: string(workflow.TaskImplementing), Branch: "task-1", WorktreePath: repoDir}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{RepoFullName: "owner/repo", Number: 12, URL: "https://github.com/owner/repo/pull/12", HeadBranch: "task-1", BaseBranch: "main", HeadSHA: oldHead, State: "open"}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	finalizer := daemonImplementationFinalizer{Store: store, GitHub: github.NoopClient{}}
+	payload := workflow.JobPayload{
+		Repo:      "owner/repo",
+		Branch:    "task-1",
+		HeadSHA:   oldHead,
+		GoalID:    "goal-1",
+		TaskID:    "task-1",
+		TaskTitle: "Task 1",
+		LeadAgent: "lead",
+		Result:    &workflow.AgentResult{Decision: "implemented", Summary: "done"},
+	}
+
+	finalized, err := finalizer.FinalizeImplementation(ctx, db.Job{ID: "job-1", Agent: "lead", Type: "implement"}, payload)
+	if err != nil {
+		t.Fatalf("FinalizeImplementation returned error: %v", err)
+	}
+	localHead, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("HeadSHA returned error: %v", err)
+	}
+	if finalized.HeadSHA != localHead || finalized.HeadSHA == oldHead {
+		t.Fatalf("finalized head = %q, local=%q old=%q", finalized.HeadSHA, localHead, oldHead)
+	}
+	remoteHead := strings.TrimSpace(runGitOutput(t, repoDir, "ls-remote", "origin", "refs/heads/task-1"))
+	if !strings.Contains(remoteHead, localHead) {
+		t.Fatalf("remote task branch %q does not contain local head %q", remoteHead, localHead)
+	}
+}
+
+func TestDaemonImplementationFinalizerBlocksWrongBranch(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	remoteDir := filepath.Join(home, "remote.git")
+	repoDir := filepath.Join(home, "repo")
+	runGit(t, home, "init", "--bare", remoteDir)
+	runGit(t, home, "clone", remoteDir, repoDir)
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot Test")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "initial")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "push", "-u", "origin", "main")
+	runGit(t, repoDir, "switch", "-c", "wrong-branch")
+	if err := os.WriteFile(filepath.Join(repoDir, "feature.txt"), []byte("wrong branch work\n"), 0o644); err != nil {
+		t.Fatalf("write feature: %v", err)
+	}
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir, DefaultBranch: "main", PollInterval: "30s"}); err != nil {
+		t.Fatalf("UpsertRepo returned error: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task 1", State: string(workflow.TaskImplementing), Branch: "task-1", WorktreePath: repoDir}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	finalizer := daemonImplementationFinalizer{Store: store, GitHub: github.NoopClient{}}
+	payload := workflow.JobPayload{
+		Repo:      "owner/repo",
+		Branch:    "task-1",
+		GoalID:    "goal-1",
+		TaskID:    "task-1",
+		TaskTitle: "Task 1",
+		LeadAgent: "lead",
+		Result:    &workflow.AgentResult{Decision: "implemented", Summary: "done"},
+	}
+
+	_, err := finalizer.FinalizeImplementation(ctx, db.Job{ID: "job-1", Agent: "lead", Type: "implement"}, payload)
+	var blocked workflow.BlockedError
+	if !errors.As(err, &blocked) {
+		t.Fatalf("FinalizeImplementation error = %v, want BlockedError", err)
+	}
+	if !strings.Contains(blocked.Reason, "not task-1") {
+		t.Fatalf("blocked reason = %q", blocked.Reason)
+	}
+}
+
+func TestDaemonImplementationFinalizerAllowsAlreadyFinalizedPullRequest(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	remoteDir := filepath.Join(home, "remote.git")
+	repoDir := filepath.Join(home, "repo")
+	runGit(t, home, "init", "--bare", remoteDir)
+	runGit(t, home, "clone", remoteDir, repoDir)
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot Test")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "initial")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "push", "-u", "origin", "main")
+	runGit(t, repoDir, "switch", "-c", "task-1")
+	head, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("HeadSHA returned error: %v", err)
+	}
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir, DefaultBranch: "main", PollInterval: "30s"}); err != nil {
+		t.Fatalf("UpsertRepo returned error: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task 1", State: string(workflow.TaskImplementing), Branch: "task-1", WorktreePath: repoDir}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	finalizer := daemonImplementationFinalizer{Store: store, GitHub: github.NoopClient{}}
+	payload := workflow.JobPayload{
+		Repo:        "owner/repo",
+		Branch:      "task-1",
+		PullRequest: 12,
+		HeadSHA:     head,
+		GoalID:      "goal-1",
+		TaskID:      "task-1",
+		TaskTitle:   "Task 1",
+		LeadAgent:   "lead",
+		Result:      &workflow.AgentResult{Decision: "implemented", Summary: "done"},
+	}
+
+	finalized, err := finalizer.FinalizeImplementation(ctx, db.Job{ID: "job-1", Agent: "lead", Type: "implement"}, payload)
+	if err != nil {
+		t.Fatalf("FinalizeImplementation returned error: %v", err)
+	}
+	if finalized.HeadSHA != head || finalized.PullRequest != 12 || finalized.Branch != "task-1" {
+		t.Fatalf("finalized payload = %+v", finalized)
 	}
 }
 

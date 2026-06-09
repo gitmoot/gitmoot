@@ -23,6 +23,10 @@ main systems touched, and any explicit exclusions.
 - Keep changes clean, scoped, and organized. Avoid broad rewrites.
 - Avoid code duplication. When repeated logic appears, extract small reusable
   helpers that match existing repo patterns.
+- When delegating to Gitmoot agents, use `gitmoot agent run`,
+  `gitmoot agent implement`, `gitmoot agent review`, or `gitmoot task run`.
+  Do not put branch creation, commit, push, PR creation, or merge instructions
+  inside `gitmoot agent ask`; Gitmoot owns repository orchestration.
 - If implementation depends on external APIs, docs, CLIs, data formats,
   generated scripts, installers, service launchers, subprocess calls, env vars,
   config formats, or third-party libraries, verify the real contract with local

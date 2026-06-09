@@ -107,6 +107,9 @@ gitmoot plugin doctor
 gitmoot agent list
 gitmoot agent doctor <agent>
 gitmoot agent prompt <agent-or-template>
+gitmoot agent run <agent> --repo owner/repo "question, review, or implementation request"
+gitmoot agent review <agent> --repo owner/repo --pr <number> "review request"
+gitmoot agent implement <agent> --repo owner/repo --task <task-id> "implementation request"
 gitmoot agent ask <agent> --repo owner/repo "question or instructions"
 gitmoot job list --repo owner/repo
 gitmoot job show <job-id>
@@ -129,12 +132,14 @@ Use `gitmoot daemon start` for the background daemon. Use `gitmoot daemon run`
 only when the user explicitly wants a foreground process.
 
 Use `gitmoot agent prompt <agent-or-template>` when the user wants to reuse a
-Gitmoot agent prompt in the current chat. Use `gitmoot agent ask` when the user
-wants to invoke a registered Gitmoot agent through the Gitmoot runtime path. Add
-`--background` only when the user wants a queued background job. This is the
-same agent registry and runtime adapter path used by PR-comment ask jobs; the
-plugin only helps the runtime discover this skill and does not replace the
-`gitmoot` CLI.
+Gitmoot agent prompt in the current chat. Use `gitmoot agent run` for
+coordinator delegation through a registered Gitmoot agent; Gitmoot will route to
+ask, review, or implement and own worktrees, branch locks, commits, pushes, PRs,
+and workflow advancement. Use `gitmoot agent ask` only for analysis, planning,
+or questions. Add `--background` only when the user wants a queued background
+job. This is the same agent registry and runtime adapter path used by PR-comment
+jobs; the plugin only helps the runtime discover this skill and does not replace
+the `gitmoot` CLI.
 
 ## PR Comment Commands
 

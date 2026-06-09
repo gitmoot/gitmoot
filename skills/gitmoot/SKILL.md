@@ -60,9 +60,14 @@ Use `gitmoot status --repo owner/repo` for repo status, `gitmoot daemon status`
 for daemon state, `gitmoot agent list` and `gitmoot agent show <agent>` for
 registered agents, `gitmoot task list --repo owner/repo` for imported task
 state, and `gitmoot agent prompt <agent-or-template>` to import an agent prompt
-into the current chat. Use `gitmoot agent ask <agent> --repo owner/repo "..."`
-to invoke a registered Gitmoot agent through the runtime adapter path. Add
-`--background` only when the user wants a queued background job. Use
+into the current chat. Use `gitmoot agent run <agent> --repo owner/repo "..."`
+for coordinator delegation so Gitmoot can route to ask, review, or implement
+and own worktrees, branch locks, commits, pushes, PRs, and workflow
+advancement. Use `gitmoot agent ask <agent> --repo owner/repo "..."` only for
+analysis, planning, or questions. Use `gitmoot agent review <agent> --repo
+owner/repo --pr <number> "..."` for PR review decisions and `gitmoot agent
+implement <agent> --repo owner/repo --task <task-id> "..."` for file changes.
+Add `--background` only when the user wants a queued background job. Use
 `gitmoot job list --repo owner/repo` for queued or recent jobs. Use
 `gitmoot plugin doctor` when checking whether Codex or Claude Code can discover
 Gitmoot through an installed runtime plugin. Use `gitmoot goal template` when

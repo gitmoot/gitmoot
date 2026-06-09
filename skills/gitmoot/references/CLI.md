@@ -96,18 +96,28 @@ gitmoot agent repos reviewer
 gitmoot agent doctor reviewer
 ```
 
-Ask a registered agent from the current local chat:
+Delegate to a registered agent from the current local chat:
 
 ```sh
+gitmoot agent run project-planner --repo owner/repo "Return the plan status."
+gitmoot agent run lead --repo owner/repo --task task-001 --background "Implement this task."
+gitmoot agent run reviewer --repo owner/repo --pr 12 --background "Review this PR."
+gitmoot agent review reviewer --repo owner/repo --pr 12 "Review this PR."
+gitmoot agent implement lead --repo owner/repo --task task-001 "Implement this task."
 gitmoot agent ask project-planner --repo owner/repo "Return the plan status."
 gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
 gitmoot job watch <job-id>
 ```
 
 This uses the same agent registry, repo access grants, cached template snapshot,
-runtime adapter, and local job history as PR-comment ask jobs. The runtime
+runtime adapter, and local job history as PR-comment jobs. `agent run` is the
+default coordinator-safe entrypoint because it routes to `ask`, `review`, or
+`implement` and keeps branch, worktree, commit, push, PR, and workflow lifecycle
+inside Gitmoot. `agent ask` is for analysis, planning, and questions only; it
+blocks obvious branch/commit/push/PR orchestration unless `--force` is supplied.
+The runtime
 plugin helps Codex or Claude Code discover Gitmoot guidance, but it does not
-replace `gitmoot agent ask`. Synchronous asks and queued jobs both use the same
+replace the Gitmoot CLI. Synchronous jobs and queued jobs both use the same
 runtime session locks.
 
 Configure managed background agent types:

@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
+	gitutil "github.com/jerryfane/gitmoot/internal/git"
+	"github.com/jerryfane/gitmoot/internal/github"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 	"github.com/jerryfane/gitmoot/internal/subprocess"
 	"github.com/jerryfane/gitmoot/internal/workflow"
@@ -621,6 +623,192 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 	}
 	if jsonPayload.Branch != "feature/local-ask" || jsonPayload.Instructions != "- Write JSON" {
 		t.Fatalf("json ask payload = %+v", jsonPayload)
+	}
+}
+
+func TestSelectAgentRunAction(t *testing.T) {
+	tests := []struct {
+		name    string
+		options agentRunOptions
+		action  string
+	}{
+		{name: "task selects implement", options: agentRunOptions{taskID: "task-1", message: "anything"}, action: "implement"},
+		{name: "pr selects review", options: agentRunOptions{prNumber: 7, message: "anything"}, action: "review"},
+		{name: "head sha selects review", options: agentRunOptions{headSHA: strings.Repeat("a", 40), message: "anything"}, action: "review"},
+		{name: "review language selects review", options: agentRunOptions{message: "please review this PR"}, action: "review"},
+		{name: "implementation language selects implement", options: agentRunOptions{message: "update docs and add tests"}, action: "implement"},
+		{name: "write code selects implement", options: agentRunOptions{message: "write code for the new command"}, action: "implement"},
+		{name: "code question selects ask", options: agentRunOptions{message: "what does this code do?"}, action: "ask"},
+		{name: "plain question selects ask", options: agentRunOptions{message: "what is the risk here?"}, action: "ask"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			action, _ := selectAgentRunAction(tt.options)
+			if action != tt.action {
+				t.Fatalf("action = %q, want %q", action, tt.action)
+			}
+		})
+	}
+}
+
+func TestRunAgentAskBlocksWorkflowOrchestration(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"agent", "ask", "planner", "create branch, commit, push, and open PR"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "This looks like implementation workflow orchestration") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestWorkflowOrchestrationGuardAllowsCommitQuestions(t *testing.T) {
+	if looksLikeWorkflowOrchestration("Which commit introduced this regression?") {
+		t.Fatal("commit analysis question was incorrectly treated as workflow orchestration")
+	}
+	if !looksLikeWorkflowOrchestration("commit and push the branch, then open a PR") {
+		t.Fatal("explicit commit/push/PR workflow was not treated as workflow orchestration")
+	}
+}
+
+func TestPrepareLocalReviewDispatchRequestCreatesReviewWorktree(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "initial")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "switch", "-c", "feature/review")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "feature")
+	head, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("HeadSHA returned error: %v", err)
+	}
+	runGit(t, repoDir, "switch", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir}
+	request, checkout, err := prepareLocalReviewDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
+		Home:         home,
+		Agent:        "audit",
+		Action:       "review",
+		Instructions: "Review this PR.",
+		PullRequest:  12,
+		Branch:       "feature/review",
+		HeadSHA:      head,
+	})
+	if err != nil {
+		t.Fatalf("prepareLocalReviewDispatchRequest returned error: %v", err)
+	}
+	if request.TaskID == "" || checkout == "" {
+		t.Fatalf("request.TaskID=%q checkout=%q", request.TaskID, checkout)
+	}
+	reviewHead, err := (gitutil.Client{Dir: checkout}).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("review HeadSHA returned error: %v", err)
+	}
+	if reviewHead != head {
+		t.Fatalf("review worktree head = %q, want %q", reviewHead, head)
+	}
+	branch, err := (gitutil.Client{Dir: repoDir}).CurrentBranch(ctx)
+	if err != nil {
+		t.Fatalf("CurrentBranch returned error: %v", err)
+	}
+	if branch != "main" {
+		t.Fatalf("registered checkout branch = %q, want main", branch)
+	}
+	task, err := store.GetTask(ctx, request.TaskID)
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.WorktreePath != checkout || task.State != string(workflow.TaskReviewing) {
+		t.Fatalf("task = %+v, checkout=%q", task, checkout)
+	}
+}
+
+func TestPrepareLocalReviewDispatchRequestDoesNotReuseStaleReviewWorktree(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	staleWorktree := filepath.Join(home, "stale")
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "initial")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "switch", "-c", "feature/review")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("old feature\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "old feature")
+	oldHead, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("old HeadSHA returned error: %v", err)
+	}
+	runGit(t, repoDir, "worktree", "add", "--detach", staleWorktree, oldHead)
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("new feature\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "new feature")
+	newHead, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("new HeadSHA returned error: %v", err)
+	}
+	runGit(t, repoDir, "switch", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertTask(ctx, db.Task{ID: "stale-review", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Stale review", State: string(workflow.TaskReviewing), Branch: "feature/review", WorktreePath: staleWorktree}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir}
+	request, checkout, err := prepareLocalReviewDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
+		Home:         home,
+		Agent:        "audit",
+		Action:       "review",
+		Instructions: "Review this PR.",
+		PullRequest:  12,
+		Branch:       "feature/review",
+		HeadSHA:      newHead,
+	})
+	if err != nil {
+		t.Fatalf("prepareLocalReviewDispatchRequest returned error: %v", err)
+	}
+	if checkout == staleWorktree || request.TaskID == "stale-review" {
+		t.Fatalf("reused stale checkout=%q taskID=%q", checkout, request.TaskID)
+	}
+	reviewHead, err := (gitutil.Client{Dir: checkout}).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("review HeadSHA returned error: %v", err)
+	}
+	if reviewHead != newHead {
+		t.Fatalf("review worktree head = %q, want %q", reviewHead, newHead)
+	}
+	staleHead, err := (gitutil.Client{Dir: staleWorktree}).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("stale HeadSHA returned error: %v", err)
+	}
+	if staleHead != oldHead {
+		t.Fatalf("stale worktree head = %q, want %q", staleHead, oldHead)
 	}
 }
 

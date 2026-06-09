@@ -92,6 +92,7 @@ func TestCanonicalSkillDocumentsLocalAgentAsk(t *testing.T) {
 			name: "skill",
 			text: text,
 			want: []string{
+				"gitmoot agent run <agent>",
 				"gitmoot agent ask <agent>",
 				"The plugin is only the runtime discovery surface",
 				"gitmoot agent prompt <agent-or-template>",
@@ -102,9 +103,10 @@ func TestCanonicalSkillDocumentsLocalAgentAsk(t *testing.T) {
 			name: "cli",
 			text: cli,
 			want: []string{
+				"gitmoot agent run project-planner --repo owner/repo",
 				"gitmoot agent ask project-planner --repo owner/repo",
 				"gitmoot agent prompt frontend-reviewer",
-				"replace `gitmoot agent ask`",
+				"agent ask` is for analysis, planning, and questions only",
 				"gitmoot agent type set planner",
 				"gitmoot job watch <job-id>",
 			},

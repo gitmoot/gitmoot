@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,6 +37,12 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 		return runAgentStart(args[1:], stdout, stderr)
 	case "ask":
 		return runAgentAsk(args[1:], stdout, stderr)
+	case "run":
+		return runAgentRun(args[1:], stdout, stderr)
+	case "review":
+		return runAgentReview(args[1:], stdout, stderr)
+	case "implement":
+		return runAgentImplement(args[1:], stdout, stderr)
 	case "type":
 		return runAgentType(args[1:], stdout, stderr)
 	case "template":
@@ -71,6 +78,9 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude --repo owner/repo [--path .] [--template <template-id>] [--start-daemon]")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--background] [--type type] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background] [--type type] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--branch branch] [--background] [--type type] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
 	fmt.Fprintln(w, "  gitmoot agent template list|show|add|draft|validate|update|diff ...")
 	fmt.Fprintln(w, "  gitmoot agent prompt <agent-or-template> [--json]")
@@ -92,6 +102,7 @@ type agentAskOptions struct {
 	jsonOutput bool
 	background bool
 	typeName   string
+	force      bool
 	agent      string
 	message    string
 }
@@ -104,17 +115,25 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 		}
 		return 2
 	}
+	if !options.force && looksLikeWorkflowOrchestration(options.message) {
+		fmt.Fprintln(stderr, "This looks like implementation workflow orchestration.")
+		fmt.Fprintln(stderr, "Use `gitmoot agent run` or `gitmoot agent implement` so Gitmoot can manage worktrees, branches, commits, and PRs safely.")
+		return 2
+	}
 	var output localAgentJobOutput
 	if err := withStore(options.home, func(store *db.Store) error {
 		var err error
 		output, err = dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
-			RepoFlag:     options.repo,
-			Agent:        options.agent,
-			Action:       "ask",
-			Instructions: options.message,
-			Background:   options.background,
-			Type:         options.typeName,
-			Home:         options.home,
+			RepoFlag:             options.repo,
+			Agent:                options.agent,
+			Action:               "ask",
+			Instructions:         options.message,
+			Background:           options.background,
+			Type:                 options.typeName,
+			Home:                 options.home,
+			SelectedAction:       "ask",
+			SelectedActionReason: "explicit agent ask",
+			ExecutionPath:        "agent_ask",
 		})
 		return err
 	}); err != nil {
@@ -161,6 +180,8 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 		switch {
 		case arg == "--background":
 			options.background = true
+		case arg == "--force":
+			options.force = true
 		case arg == "--type":
 			if index+1 >= len(args) {
 				fmt.Fprintln(stderr, "agent ask requires a value for --type")
@@ -218,7 +239,318 @@ func containsHelpFlag(args []string) bool {
 
 func printAgentAskUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--type type] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--type type] [--home path] [--json] [--force]")
+}
+
+type agentRunOptions struct {
+	home       string
+	repo       string
+	jsonOutput bool
+	background bool
+	typeName   string
+	taskID     string
+	prNumber   int
+	headSHA    string
+	branch     string
+	agent      string
+	message    string
+}
+
+func runAgentRun(args []string, stdout, stderr io.Writer) int {
+	options, ok := parseAgentRunOptions("run", args, stderr)
+	if !ok {
+		if containsHelpFlag(args) {
+			return 0
+		}
+		return 2
+	}
+	selected, reason := selectAgentRunAction(options)
+	output, exit := dispatchAgentCommand(options, selected, reason, "agent_run", stdout, stderr)
+	if exit != 0 {
+		return exit
+	}
+	if options.jsonOutput {
+		if err := writeJSON(stdout, output); err != nil {
+			fmt.Fprintf(stderr, "agent run: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	printLocalAgentJobOutput(stdout, output)
+	printQueuedDaemonHint(stdout, output, options.background, options.home)
+	return 0
+}
+
+func runAgentReview(args []string, stdout, stderr io.Writer) int {
+	options, ok := parseAgentRunOptions("review", args, stderr)
+	if !ok {
+		if containsHelpFlag(args) {
+			return 0
+		}
+		return 2
+	}
+	if strings.TrimSpace(options.repo) == "" {
+		fmt.Fprintln(stderr, "agent review requires --repo owner/repo")
+		return 2
+	}
+	if options.prNumber <= 0 {
+		fmt.Fprintln(stderr, "agent review requires --pr number")
+		return 2
+	}
+	output, exit := dispatchAgentCommand(options, "review", "explicit agent review", "agent_review", stdout, stderr)
+	if exit != 0 {
+		return exit
+	}
+	if options.jsonOutput {
+		if err := writeJSON(stdout, output); err != nil {
+			fmt.Fprintf(stderr, "agent review: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	printLocalAgentJobOutput(stdout, output)
+	printQueuedDaemonHint(stdout, output, options.background, options.home)
+	return 0
+}
+
+func runAgentImplement(args []string, stdout, stderr io.Writer) int {
+	options, ok := parseAgentRunOptions("implement", args, stderr)
+	if !ok {
+		if containsHelpFlag(args) {
+			return 0
+		}
+		return 2
+	}
+	output, exit := dispatchAgentCommand(options, "implement", "explicit agent implement", "agent_implement", stdout, stderr)
+	if exit != 0 {
+		return exit
+	}
+	if options.jsonOutput {
+		if err := writeJSON(stdout, output); err != nil {
+			fmt.Fprintf(stderr, "agent implement: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	printLocalAgentJobOutput(stdout, output)
+	printQueuedDaemonHint(stdout, output, options.background, options.home)
+	return 0
+}
+
+func dispatchAgentCommand(options agentRunOptions, action string, reason string, executionPath string, stdout, stderr io.Writer) (localAgentJobOutput, int) {
+	var output localAgentJobOutput
+	if err := withStore(options.home, func(store *db.Store) error {
+		var err error
+		output, err = dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
+			RepoFlag:             options.repo,
+			Agent:                options.agent,
+			Action:               action,
+			Instructions:         options.message,
+			Background:           options.background,
+			Type:                 options.typeName,
+			Home:                 options.home,
+			TaskID:               options.taskID,
+			PullRequest:          options.prNumber,
+			HeadSHA:              options.headSHA,
+			Branch:               options.branch,
+			SelectedAction:       action,
+			SelectedActionReason: reason,
+			ExecutionPath:        executionPath,
+		})
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "agent %s: %v\n", action, err)
+		return localAgentJobOutput{}, 1
+	}
+	if options.background {
+		output.WatchCommand = jobWatchCommand(output.JobID, options.home)
+		running, err := daemonIsRunning(options.home)
+		if err != nil {
+			fmt.Fprintf(stderr, "agent %s: %v\n", action, err)
+			return localAgentJobOutput{}, 1
+		}
+		output.DaemonRunning = running
+	}
+	return output, 0
+}
+
+func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agentRunOptions, bool) {
+	if len(args) == 0 || containsHelpFlag(args) {
+		printAgentRunUsage(stderr, command)
+		if len(args) == 0 {
+			fmt.Fprintf(stderr, "agent %s requires exactly one agent and one message\n", command)
+		}
+		return agentRunOptions{}, false
+	}
+	options := agentRunOptions{}
+	positionals := []string{}
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		switch {
+		case arg == "--background":
+			options.background = true
+		case arg == "--json":
+			options.jsonOutput = true
+		case arg == "--type" || arg == "--repo" || arg == "--home" || arg == "--task" || arg == "--pr" || arg == "--head-sha" || arg == "--branch":
+			if index+1 >= len(args) {
+				fmt.Fprintf(stderr, "agent %s requires a value for %s\n", command, arg)
+				return agentRunOptions{}, false
+			}
+			index++
+			if !setAgentRunOption(&options, arg, args[index], stderr) {
+				return agentRunOptions{}, false
+			}
+		case strings.HasPrefix(arg, "--type="):
+			options.typeName = strings.TrimPrefix(arg, "--type=")
+		case strings.HasPrefix(arg, "--repo="):
+			options.repo = strings.TrimPrefix(arg, "--repo=")
+		case strings.HasPrefix(arg, "--home="):
+			options.home = strings.TrimPrefix(arg, "--home=")
+		case strings.HasPrefix(arg, "--task="):
+			options.taskID = strings.TrimPrefix(arg, "--task=")
+		case strings.HasPrefix(arg, "--pr="):
+			if !setAgentRunOption(&options, "--pr", strings.TrimPrefix(arg, "--pr="), stderr) {
+				return agentRunOptions{}, false
+			}
+		case strings.HasPrefix(arg, "--head-sha="):
+			options.headSHA = strings.TrimPrefix(arg, "--head-sha=")
+		case strings.HasPrefix(arg, "--branch="):
+			options.branch = strings.TrimPrefix(arg, "--branch=")
+		case strings.HasPrefix(arg, "-") && len(positionals) >= 2:
+			fmt.Fprintf(stderr, "unknown agent %s flag %q\n", command, arg)
+			return agentRunOptions{}, false
+		default:
+			positionals = append(positionals, arg)
+		}
+	}
+	if len(positionals) != 2 {
+		fmt.Fprintf(stderr, "agent %s requires exactly one agent and one message\n", command)
+		return agentRunOptions{}, false
+	}
+	options.agent = strings.TrimSpace(positionals[0])
+	options.message = strings.TrimSpace(positionals[1])
+	if options.agent == "" || options.message == "" {
+		fmt.Fprintf(stderr, "agent %s requires exactly one agent and one message\n", command)
+		return agentRunOptions{}, false
+	}
+	return options, true
+}
+
+func setAgentRunOption(options *agentRunOptions, flagName string, value string, stderr io.Writer) bool {
+	value = strings.TrimSpace(value)
+	switch flagName {
+	case "--type":
+		options.typeName = value
+	case "--repo":
+		options.repo = value
+	case "--home":
+		options.home = value
+	case "--task":
+		options.taskID = value
+	case "--head-sha":
+		options.headSHA = value
+	case "--branch":
+		options.branch = value
+	case "--pr":
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed <= 0 {
+			fmt.Fprintln(stderr, "agent command requires a positive integer for --pr")
+			return false
+		}
+		options.prNumber = parsed
+	}
+	return true
+}
+
+func printAgentRunUsage(w io.Writer, command string) {
+	fmt.Fprintln(w, "Usage:")
+	switch command {
+	case "review":
+		fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background] [--type type] [--home path] [--json]")
+	case "implement":
+		fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--branch branch] [--background] [--type type] [--home path] [--json]")
+	default:
+		fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--background] [--type type] [--home path] [--json]")
+	}
+}
+
+func selectAgentRunAction(options agentRunOptions) (string, string) {
+	if strings.TrimSpace(options.taskID) != "" {
+		return "implement", "--task selects implementation workflow"
+	}
+	if options.prNumber > 0 {
+		return "review", "--pr selects review workflow"
+	}
+	if strings.TrimSpace(options.headSHA) != "" {
+		return "review", "--head-sha selects review workflow"
+	}
+	if looksLikeReviewRequest(options.message) {
+		return "review", "message asks for PR review or approval"
+	}
+	if looksLikeImplementationRequest(options.message) {
+		return "implement", "message asks for code, docs, tests, or file changes"
+	}
+	return "ask", "message is analysis, planning, or a question"
+}
+
+func looksLikeWorkflowOrchestration(message string) bool {
+	lower := strings.ToLower(message)
+	phrases := []string{
+		"create branch",
+		"commit and push",
+		"commit, push",
+		"commit changes",
+		"make a commit",
+		"git commit",
+		"push branch",
+		"push changes",
+		"git push",
+		"open pr",
+		"open a pr",
+		"create pr",
+		"create a pr",
+		"create pull request",
+		"open pull request",
+		"merge pr",
+		"merge pull request",
+		"full implementation workflow",
+	}
+	for _, phrase := range phrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeReviewRequest(message string) bool {
+	lower := strings.ToLower(message)
+	phrases := []string{"review pr", "review this pr", "review pull request", "code review", "approve pr", "approve pull request", "request changes", "audit pr", "audit pull request"}
+	for _, phrase := range phrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeImplementationRequest(message string) bool {
+	lower := strings.ToLower(message)
+	phrases := []string{"implement", "edit", "change file", "update file", "write tests", "add test", "fix bug", "patch", "modify", "refactor", "update docs", "documentation", "write code", "change code", "code change"}
+	for _, phrase := range phrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+func printQueuedDaemonHint(stdout io.Writer, output localAgentJobOutput, background bool, home string) {
+	if background && !output.DaemonRunning {
+		writeLine(stdout, "queued: daemon is not running")
+		writeLine(stdout, "process: %s", daemonStartHint(home, output.Repo))
+		writeLine(stdout, "or: %s", jobRunCommand(output.JobID, home))
+	}
 }
 
 func daemonIsRunning(home string) (bool, error) {

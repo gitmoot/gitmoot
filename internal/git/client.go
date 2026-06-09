@@ -54,6 +54,18 @@ func (c Client) AddExistingBranchWorktree(ctx context.Context, branch string, pa
 	return err
 }
 
+func (c Client) AddDetachedWorktree(ctx context.Context, path string, ref string) error {
+	path, err := validateWorktreePath(path)
+	if err != nil {
+		return err
+	}
+	if err := validateRef(ref); err != nil {
+		return err
+	}
+	_, err = c.run(ctx, "worktree", "add", "--detach", path, ref)
+	return err
+}
+
 func (c Client) BranchExists(ctx context.Context, branch string) (bool, error) {
 	if err := validateBranch(branch); err != nil {
 		return false, err
@@ -97,6 +109,17 @@ func (c Client) PushBranch(ctx context.Context, remote string, branch string) er
 	return err
 }
 
+func (c Client) FetchPullRequest(ctx context.Context, remote string, number int) error {
+	if strings.TrimSpace(remote) == "" {
+		remote = "origin"
+	}
+	if number <= 0 {
+		return errors.New("pull request number must be positive")
+	}
+	_, err := c.run(ctx, "fetch", remote, fmt.Sprintf("pull/%d/head", number))
+	return err
+}
+
 func (c Client) Root(ctx context.Context) (string, error) {
 	result, err := c.run(ctx, "rev-parse", "--show-toplevel")
 	if err != nil {
@@ -127,6 +150,26 @@ func (c Client) WorktreeClean(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	return strings.TrimSpace(result.Stdout) == "", nil
+}
+
+func (c Client) StatusPorcelain(ctx context.Context) (string, error) {
+	result, err := c.run(ctx, "status", "--porcelain")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(result.Stdout), nil
+}
+
+func (c Client) CommitAll(ctx context.Context, message string) error {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return errors.New("commit message is required")
+	}
+	if _, err := c.run(ctx, "add", "-A"); err != nil {
+		return err
+	}
+	_, err := c.run(ctx, "commit", "-m", message)
+	return err
 }
 
 func (c Client) HeadSHA(ctx context.Context) (string, error) {
@@ -193,6 +236,19 @@ func validateBranch(branch string) error {
 		return fmt.Errorf("branch %q must not start or end with '/'", branch)
 	case strings.HasSuffix(branch, ".lock"):
 		return fmt.Errorf("branch %q must not end with .lock", branch)
+	}
+	return nil
+}
+
+func validateRef(ref string) error {
+	ref = strings.TrimSpace(ref)
+	switch {
+	case ref == "":
+		return errors.New("git ref is required")
+	case strings.HasPrefix(ref, "-"):
+		return fmt.Errorf("git ref %q must not start with '-'", ref)
+	case strings.ContainsAny(ref, " \t\r\n"):
+		return fmt.Errorf("git ref %q must not contain whitespace", ref)
 	}
 	return nil
 }

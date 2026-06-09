@@ -14,11 +14,12 @@ import (
 )
 
 type Engine struct {
-	Store             *db.Store
-	RequiredReviewers []string
-	MergeGate         MergeGate
-	JobID             func(JobRequest) string
-	PayloadRefresher  func(context.Context, db.Job, JobPayload) (JobPayload, error)
+	Store                   *db.Store
+	RequiredReviewers       []string
+	MergeGate               MergeGate
+	JobID                   func(JobRequest) string
+	PayloadRefresher        func(context.Context, db.Job, JobPayload) (JobPayload, error)
+	ImplementationFinalizer ImplementationFinalizer
 }
 
 type PullRequestEvent struct {
@@ -53,6 +54,10 @@ type MergeDecision struct {
 
 type MergeGate interface {
 	Evaluate(ctx context.Context, request MergeRequest) (MergeDecision, error)
+}
+
+type ImplementationFinalizer interface {
+	FinalizeImplementation(ctx context.Context, job db.Job, payload JobPayload) (JobPayload, error)
 }
 
 type BlockedError struct {
@@ -259,6 +264,20 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 		if payload.Result.Decision != "implemented" {
 			return nil
 		}
+		if e.implementationNeedsFinalizer(ctx, payload) {
+			finalized, err := e.ImplementationFinalizer.FinalizeImplementation(ctx, job, payload)
+			if err != nil {
+				return err
+			}
+			encoded, err := marshalPayload(finalized)
+			if err != nil {
+				return err
+			}
+			if err := e.Store.UpdateJobPayload(ctx, job.ID, encoded); err != nil {
+				return err
+			}
+			payload = finalized
+		}
 		if payload.PullRequest <= 0 {
 			return e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_skipped_no_pr", Message: "no pull request is attached; skipping PR advancement"})
 		}
@@ -305,6 +324,21 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 		}
 	}
 	return nil
+}
+
+func (e Engine) implementationNeedsFinalizer(ctx context.Context, payload JobPayload) bool {
+	if e.ImplementationFinalizer == nil {
+		return false
+	}
+	taskID := strings.TrimSpace(payload.TaskID)
+	if taskID == "" {
+		return false
+	}
+	task, err := e.Store.GetTask(ctx, taskID)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(task.WorktreePath) != ""
 }
 
 func reviewDecisionAgent(job db.Job, payload JobPayload) string {

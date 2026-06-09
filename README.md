@@ -96,11 +96,20 @@ Use the Gitmoot planner here. Write the implementation plan.
 That uses the same `planner` template as the background agent, but imports the
 prompt into the current chat instead of creating a Gitmoot job.
 
-Ask the registered background planner when you want a queued Gitmoot job:
+Ask the registered background planner when you want a queued analysis or
+planning job:
 
 ```sh
 gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
 gitmoot job watch <job-id>
+```
+
+For coordinator delegation where the request may require review or file edits,
+use `agent run` and let Gitmoot select the safe workflow path:
+
+```sh
+gitmoot agent run lead --repo owner/repo --task task-001 --background "Implement this task."
+gitmoot agent run reviewer --repo owner/repo --pr 12 --background "Review this PR."
 ```
 
 Background jobs are safe by default. The daemon starts with one worker, repo

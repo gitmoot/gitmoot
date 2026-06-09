@@ -2301,12 +2301,210 @@ func (w jobWorker) defaultCommenter(_ string) github.Client {
 
 func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string) workflow.Engine {
 	return workflow.Engine{
-		Store:     store,
-		MergeGate: daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout},
+		Store:                   store,
+		MergeGate:               daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout},
+		ImplementationFinalizer: daemonImplementationFinalizer{Store: store, GitHub: gh, FallbackCheckout: checkout},
 		PayloadRefresher: func(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
 			return refreshDaemonJobPayload(ctx, store, checkout, job, payload)
 		},
 	}
+}
+
+type daemonImplementationFinalizer struct {
+	Store            *db.Store
+	GitHub           github.Client
+	FallbackCheckout string
+}
+
+func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
+	if f.Store == nil {
+		return workflow.JobPayload{}, errors.New("implementation finalizer store is required")
+	}
+	if strings.TrimSpace(payload.TaskID) == "" {
+		return payload, workflow.BlockedError{Reason: "implemented job has no task id; cannot finalize branch and PR"}
+	}
+	task, err := f.Store.GetTask(ctx, payload.TaskID)
+	if err != nil {
+		return payload, fmt.Errorf("load task %s for implementation finalizer: %w", payload.TaskID, err)
+	}
+	if strings.TrimSpace(task.WorktreePath) == "" {
+		return payload, workflow.BlockedError{Reason: "implemented task has no worktree path; rerun through gitmoot task run or gitmoot agent implement"}
+	}
+	if strings.TrimSpace(task.Branch) == "" {
+		return payload, workflow.BlockedError{Reason: "implemented task has no branch; cannot push or open PR"}
+	}
+	git := gitutil.Client{Dir: task.WorktreePath}
+	branch, err := git.CurrentBranch(ctx)
+	if err != nil {
+		return payload, fmt.Errorf("resolve implementation branch: %w", err)
+	}
+	if branch != task.Branch {
+		return payload, workflow.BlockedError{Reason: fmt.Sprintf("implemented task worktree is on branch %s, not %s", branch, task.Branch)}
+	}
+	status, err := git.StatusPorcelain(ctx)
+	if err != nil {
+		return payload, fmt.Errorf("inspect implementation diff: %w", err)
+	}
+	if strings.TrimSpace(status) == "" {
+		head, err := git.HeadSHA(ctx)
+		if err != nil {
+			return payload, fmt.Errorf("resolve clean implementation head: %w", err)
+		}
+		if strings.TrimSpace(payload.HeadSHA) == "" || head == payload.HeadSHA {
+			if payload.PullRequest > 0 && head == payload.HeadSHA {
+				payload.Branch = task.Branch
+				return payload, nil
+			}
+			return payload, workflow.BlockedError{Reason: "implemented job produced no changes in the task worktree"}
+		}
+	} else {
+		message := "Gitmoot implement " + task.ID
+		if err := git.CommitAll(ctx, message); err != nil {
+			return payload, workflow.BlockedError{Reason: "commit implementation changes failed: " + err.Error()}
+		}
+	}
+	head, err := git.HeadSHA(ctx)
+	if err != nil {
+		return payload, fmt.Errorf("resolve implementation head after commit: %w", err)
+	}
+	if err := git.PushBranch(ctx, "origin", task.Branch); err != nil {
+		return payload, workflow.BlockedError{Reason: "push implementation branch failed: " + err.Error()}
+	}
+	repo, err := daemon.ParseRepository(payload.Repo)
+	if err != nil {
+		return payload, err
+	}
+	record, err := f.Store.GetRepo(ctx, payload.Repo)
+	if err != nil {
+		return payload, err
+	}
+	base := strings.TrimSpace(record.DefaultBranch)
+	if base == "" {
+		base = "main"
+	}
+	if existing, ok, err := existingBranchPullRequest(ctx, f.Store, payload.Repo, task.Branch); err != nil {
+		return payload, err
+	} else if ok {
+		payload.PullRequest = int(existing.Number)
+		payload.HeadSHA = head
+		payload.Branch = task.Branch
+		if err := f.Store.UpsertPullRequest(ctx, db.PullRequest{
+			RepoFullName: payload.Repo,
+			Number:       existing.Number,
+			URL:          existing.URL,
+			HeadBranch:   task.Branch,
+			BaseBranch:   firstNonEmpty(existing.BaseBranch, base),
+			HeadSHA:      head,
+			State:        firstNonEmpty(existing.State, "open"),
+		}); err != nil {
+			return payload, err
+		}
+		return payload, nil
+	}
+	pr, err := f.githubClient(task.WorktreePath).CreatePullRequest(ctx, github.CreatePullRequestInput{
+		Repo:  repo,
+		Title: finalizerPullRequestTitle(task),
+		Body:  finalizerPullRequestBody(job, payload, task),
+		Head:  task.Branch,
+		Base:  base,
+	})
+	if err != nil {
+		return payload, workflow.BlockedError{Reason: "open implementation PR failed: " + err.Error()}
+	}
+	payload.PullRequest = int(pr.Number)
+	payload.Branch = task.Branch
+	payload.HeadSHA = firstNonEmpty(pr.HeadSHA, head)
+	if payload.TaskTitle == "" {
+		payload.TaskTitle = task.Title
+	}
+	if payload.GoalID == "" {
+		payload.GoalID = task.GoalID
+	}
+	if err := f.Store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: payload.Repo,
+		Number:       pr.Number,
+		URL:          pr.URL,
+		HeadBranch:   firstNonEmpty(pr.HeadRef, task.Branch),
+		BaseBranch:   firstNonEmpty(pr.BaseRef, base),
+		HeadSHA:      payload.HeadSHA,
+		State:        firstNonEmpty(pr.State, "open"),
+	}); err != nil {
+		return payload, err
+	}
+	return payload, nil
+}
+
+func (f daemonImplementationFinalizer) githubClient(checkout string) github.Client {
+	if f.GitHub == nil {
+		return github.NewClient(checkout)
+	}
+	if _, ok := f.GitHub.(*github.GhClient); ok {
+		return github.NewClient(checkout)
+	}
+	return f.GitHub
+}
+
+func existingBranchPullRequest(ctx context.Context, store *db.Store, repo string, branch string) (db.PullRequest, bool, error) {
+	pr, err := store.GetPullRequestByRepoBranch(ctx, repo, branch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return db.PullRequest{}, false, nil
+	}
+	if err != nil {
+		return db.PullRequest{}, false, err
+	}
+	if strings.EqualFold(pr.State, "closed") || strings.EqualFold(pr.State, "merged") {
+		return db.PullRequest{}, false, nil
+	}
+	return pr, true, nil
+}
+
+func finalizerPullRequestTitle(task db.Task) string {
+	title := strings.TrimSpace(task.Title)
+	if title == "" {
+		title = task.ID
+	}
+	return "Gitmoot: " + title
+}
+
+func finalizerPullRequestBody(job db.Job, payload workflow.JobPayload, task db.Task) string {
+	summary := ""
+	if payload.Result != nil {
+		summary = strings.TrimSpace(payload.Result.Summary)
+	}
+	if summary == "" {
+		summary = "Implementation completed by " + job.Agent + "."
+	}
+	body, err := workflow.RenderPullRequestBody(workflow.PullRequestBody{
+		TaskID:          task.ID,
+		AgentNames:      []string{job.Agent},
+		What:            summary,
+		Why:             "Gitmoot finalized this implementation from a task worktree.",
+		Changes:         []string{"Committed changes from " + task.WorktreePath},
+		Results:         finalizerResults(payload),
+		Risk:            "Review the generated diff before merging.",
+		RawReviewOutput: rawFinalizerOutput(payload),
+	})
+	if err == nil {
+		return body
+	}
+	return summary
+}
+
+func finalizerResults(payload workflow.JobPayload) []string {
+	if payload.Result == nil || len(payload.Result.TestsRun) == 0 {
+		return []string{"No tests reported by the implementing agent."}
+	}
+	return append([]string{}, payload.Result.TestsRun...)
+}
+
+func rawFinalizerOutput(payload workflow.JobPayload) string {
+	if payload.Result != nil && strings.TrimSpace(payload.Result.Summary) != "" {
+		return payload.Result.Summary
+	}
+	if len(payload.RawOutputs) > 0 {
+		return payload.RawOutputs[len(payload.RawOutputs)-1]
+	}
+	return "Implementation completed."
 }
 
 type daemonMergeGate struct {
@@ -2363,11 +2561,13 @@ func refreshDaemonJobPayload(ctx context.Context, store *db.Store, checkout stri
 	if job.Type != "implement" || payload.Result == nil || payload.Result.Decision != "implemented" {
 		return payload, nil
 	}
-	head, err := (gitutil.Client{Dir: checkout}).HeadSHA(ctx)
-	if err != nil {
-		return workflow.JobPayload{}, err
+	if !payloadHasTaskWorktree(ctx, store, payload) {
+		head, err := (gitutil.Client{Dir: checkout}).HeadSHA(ctx)
+		if err != nil {
+			return workflow.JobPayload{}, err
+		}
+		payload.HeadSHA = head
 	}
-	payload.HeadSHA = head
 	if len(payload.Reviewers) == 0 {
 		reviewers, err := daemonReviewers(ctx, store, payload.Repo)
 		if err != nil {
@@ -2376,6 +2576,21 @@ func refreshDaemonJobPayload(ctx context.Context, store *db.Store, checkout stri
 		payload.Reviewers = reviewers
 	}
 	return payload, nil
+}
+
+func payloadHasTaskWorktree(ctx context.Context, store *db.Store, payload workflow.JobPayload) bool {
+	if store == nil {
+		return false
+	}
+	taskID := strings.TrimSpace(payload.TaskID)
+	if taskID == "" {
+		return false
+	}
+	task, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(task.WorktreePath) != ""
 }
 
 func daemonReviewers(ctx context.Context, store *db.Store, repo string) ([]string, error) {
@@ -2419,8 +2634,14 @@ func (w jobWorker) defaultCheckout(ctx context.Context, job db.Job, payload work
 			return "", err
 		}
 	case "review":
-		if err := w.validateTargetCheckout(ctx, payload, checkout); err != nil {
-			return "", err
+		if payload.PullRequest > 0 && strings.TrimSpace(payload.TaskID) != "" {
+			if err := w.validateReviewCheckout(ctx, payload, checkout); err != nil {
+				return "", err
+			}
+		} else {
+			if err := w.validateTargetCheckout(ctx, payload, checkout); err != nil {
+				return "", err
+			}
 		}
 	case "ask":
 		if payload.PullRequest > 0 {
@@ -2527,6 +2748,29 @@ func (w jobWorker) validateTargetCheckout(ctx context.Context, payload workflow.
 	}
 	if head != expectedHead {
 		return fmt.Errorf("checkout head is %s, not job head %s", head, expectedHead)
+	}
+	return nil
+}
+
+func (w jobWorker) validateReviewCheckout(ctx context.Context, payload workflow.JobPayload, checkout string) error {
+	git := gitutil.Client{Dir: checkout}
+	clean, err := git.WorktreeClean(ctx)
+	if err != nil {
+		return err
+	}
+	if !clean {
+		return fmt.Errorf("checkout %s has uncommitted changes", checkout)
+	}
+	expectedHead := strings.TrimSpace(payload.HeadSHA)
+	if expectedHead == "" {
+		return fmt.Errorf("review job for PR #%d has no head SHA", payload.PullRequest)
+	}
+	head, err := git.HeadSHA(ctx)
+	if err != nil {
+		return err
+	}
+	if head != expectedHead {
+		return fmt.Errorf("checkout head is %s, not review job head %s", head, expectedHead)
 	}
 	return nil
 }
