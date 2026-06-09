@@ -241,6 +241,22 @@ type SkillOptReviewWatch struct {
 	UpdatedAt             string
 }
 
+type InteractivePrompt struct {
+	ID            string   `json:"id"`
+	Question      string   `json:"question"`
+	Choices       []string `json:"choices,omitempty"`
+	Default       string   `json:"default,omitempty"`
+	Required      bool     `json:"required"`
+	AnswerFormat  string   `json:"answer_format"`
+	SourceCommand string   `json:"source_command"`
+	State         string   `json:"state"`
+	AnswerValue   string   `json:"answer_value,omitempty"`
+	AnswerSource  string   `json:"answer_source,omitempty"`
+	CreatedAt     string   `json:"created_at,omitempty"`
+	UpdatedAt     string   `json:"updated_at,omitempty"`
+	AnsweredAt    string   `json:"answered_at,omitempty"`
+}
+
 const (
 	EvalRunModeExplore  = "explore"
 	EvalRunModeRefine   = "refine"
@@ -256,6 +272,9 @@ const (
 	SkillOptReviewWatchStatusClosed        = "closed"
 	SkillOptReviewWatchStatusStaleNotified = "stale_notified"
 	SkillOptReviewWatchStatusFailed        = "failed"
+
+	InteractivePromptStatePending  = "pending"
+	InteractivePromptStateResolved = "resolved"
 )
 
 type EvalReviewItem struct {
@@ -2509,6 +2528,183 @@ func (s *Store) ListSkillOptReviewWatches(ctx context.Context, status string) ([
 	return watches, rows.Err()
 }
 
+func (s *Store) UpsertInteractivePrompt(ctx context.Context, prompt InteractivePrompt) error {
+	prompt, err := normalizeInteractivePrompt(prompt)
+	if err != nil {
+		return err
+	}
+	choicesJSON, err := json.Marshal(prompt.Choices)
+	if err != nil {
+		return fmt.Errorf("encode prompt choices: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO interactive_prompts(
+			id, question, choices_json, default_value, required, answer_format, source_command,
+			state, answer_value, answer_source, answered_at, created_at, updated_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+		ON CONFLICT(id) DO UPDATE SET
+			question = excluded.question,
+			choices_json = excluded.choices_json,
+			default_value = excluded.default_value,
+			required = excluded.required,
+			answer_format = excluded.answer_format,
+			source_command = excluded.source_command,
+			state = CASE
+				WHEN interactive_prompts.state = 'resolved' AND excluded.state = 'pending' THEN interactive_prompts.state
+				ELSE excluded.state
+			END,
+			answer_value = CASE
+				WHEN interactive_prompts.state = 'resolved' AND excluded.state = 'pending' THEN interactive_prompts.answer_value
+				ELSE excluded.answer_value
+			END,
+			answer_source = CASE
+				WHEN interactive_prompts.state = 'resolved' AND excluded.state = 'pending' THEN interactive_prompts.answer_source
+				ELSE excluded.answer_source
+			END,
+			answered_at = CASE
+				WHEN interactive_prompts.state = 'resolved' AND excluded.state = 'pending' THEN interactive_prompts.answered_at
+				ELSE excluded.answered_at
+			END,
+			updated_at = CURRENT_TIMESTAMP`,
+		prompt.ID, prompt.Question, string(choicesJSON), prompt.Default, boolInt(prompt.Required), prompt.AnswerFormat, prompt.SourceCommand,
+		prompt.State, prompt.AnswerValue, prompt.AnswerSource, prompt.AnsweredAt)
+	return err
+}
+
+func normalizeInteractivePrompt(prompt InteractivePrompt) (InteractivePrompt, error) {
+	prompt.ID = strings.TrimSpace(prompt.ID)
+	if prompt.ID == "" {
+		return InteractivePrompt{}, errors.New("interactive prompt id is required")
+	}
+	prompt.Question = strings.TrimSpace(prompt.Question)
+	if prompt.Question == "" {
+		return InteractivePrompt{}, errors.New("interactive prompt question is required")
+	}
+	prompt.Choices = trimUniqueStrings(prompt.Choices)
+	prompt.Default = strings.TrimSpace(prompt.Default)
+	if prompt.Default != "" && len(prompt.Choices) > 0 && !stringInSlice(prompt.Default, prompt.Choices) {
+		return InteractivePrompt{}, fmt.Errorf("interactive prompt default %q is not one of the allowed choices", prompt.Default)
+	}
+	prompt.AnswerFormat = strings.TrimSpace(prompt.AnswerFormat)
+	if prompt.AnswerFormat == "" {
+		if len(prompt.Choices) > 0 {
+			prompt.AnswerFormat = "choice"
+		} else {
+			prompt.AnswerFormat = "text"
+		}
+	}
+	prompt.SourceCommand = strings.TrimSpace(prompt.SourceCommand)
+	prompt.State = strings.TrimSpace(strings.ToLower(prompt.State))
+	if prompt.State == "" {
+		prompt.State = InteractivePromptStatePending
+	}
+	switch prompt.State {
+	case InteractivePromptStatePending, InteractivePromptStateResolved:
+	default:
+		return InteractivePrompt{}, fmt.Errorf("interactive prompt state %q is not supported", prompt.State)
+	}
+	prompt.AnswerValue = strings.TrimSpace(prompt.AnswerValue)
+	prompt.AnswerSource = strings.TrimSpace(prompt.AnswerSource)
+	prompt.AnsweredAt = strings.TrimSpace(prompt.AnsweredAt)
+	if prompt.State == InteractivePromptStateResolved {
+		value, err := validateInteractivePromptAnswer(prompt, prompt.AnswerValue)
+		if err != nil {
+			return InteractivePrompt{}, err
+		}
+		prompt.AnswerValue = value
+		if prompt.AnswerSource == "" {
+			prompt.AnswerSource = "unknown"
+		}
+		if prompt.AnsweredAt == "" {
+			prompt.AnsweredAt = time.Now().UTC().Format(time.RFC3339)
+		}
+	}
+	return prompt, nil
+}
+
+func (s *Store) ListInteractivePrompts(ctx context.Context, state string) ([]InteractivePrompt, error) {
+	state = strings.TrimSpace(strings.ToLower(state))
+	var rows *sql.Rows
+	var err error
+	if state == "" {
+		rows, err = s.db.QueryContext(ctx, `SELECT id, question, choices_json, default_value, required, answer_format,
+				source_command, state, answer_value, answer_source, created_at, updated_at, answered_at
+			FROM interactive_prompts
+			ORDER BY created_at, id`)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `SELECT id, question, choices_json, default_value, required, answer_format,
+				source_command, state, answer_value, answer_source, created_at, updated_at, answered_at
+			FROM interactive_prompts
+			WHERE state = ?
+			ORDER BY created_at, id`, state)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	prompts := []InteractivePrompt{}
+	for rows.Next() {
+		prompt, err := scanInteractivePrompt(rows)
+		if err != nil {
+			return nil, err
+		}
+		prompts = append(prompts, prompt)
+	}
+	return prompts, rows.Err()
+}
+
+func (s *Store) GetInteractivePrompt(ctx context.Context, id string) (InteractivePrompt, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, question, choices_json, default_value, required, answer_format,
+			source_command, state, answer_value, answer_source, created_at, updated_at, answered_at
+		FROM interactive_prompts
+		WHERE id = ?`, strings.TrimSpace(id))
+	return scanInteractivePrompt(row)
+}
+
+func (s *Store) AnswerInteractivePrompt(ctx context.Context, id string, value string, source string) (InteractivePrompt, error) {
+	prompt, err := s.GetInteractivePrompt(ctx, id)
+	if err != nil {
+		return InteractivePrompt{}, err
+	}
+	if prompt.State == InteractivePromptStateResolved {
+		return InteractivePrompt{}, fmt.Errorf("interactive prompt %s is already resolved", prompt.ID)
+	}
+	value, err = validateInteractivePromptAnswer(prompt, value)
+	if err != nil {
+		return InteractivePrompt{}, err
+	}
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = "cli"
+	}
+	answeredAt := time.Now().UTC().Format(time.RFC3339)
+	result, err := s.db.ExecContext(ctx, `UPDATE interactive_prompts
+		SET state = ?, answer_value = ?, answer_source = ?, answered_at = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND state = ?`,
+		InteractivePromptStateResolved, value, source, answeredAt, prompt.ID, InteractivePromptStatePending)
+	if err != nil {
+		return InteractivePrompt{}, err
+	}
+	if err := requireAffected(result, "interactive prompt", prompt.ID); err != nil {
+		return InteractivePrompt{}, err
+	}
+	return s.GetInteractivePrompt(ctx, prompt.ID)
+}
+
+func validateInteractivePromptAnswer(prompt InteractivePrompt, value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" && strings.TrimSpace(prompt.Default) != "" {
+		value = strings.TrimSpace(prompt.Default)
+	}
+	if value == "" && prompt.Required {
+		return "", fmt.Errorf("interactive prompt %s requires an answer", prompt.ID)
+	}
+	if value != "" && len(prompt.Choices) > 0 && !stringInSlice(value, prompt.Choices) {
+		return "", fmt.Errorf("interactive prompt %s answer %q is not one of: %s", prompt.ID, value, strings.Join(prompt.Choices, ", "))
+	}
+	return value, nil
+}
+
 func (s *Store) UpsertEvalReviewItem(ctx context.Context, item EvalReviewItem) error {
 	return upsertEvalReviewItemExec(ctx, s.db, item)
 }
@@ -2835,6 +3031,24 @@ func scanSkillOptReviewWatch(row interface{ Scan(dest ...any) error }) (SkillOpt
 	return watch, nil
 }
 
+func scanInteractivePrompt(row interface{ Scan(dest ...any) error }) (InteractivePrompt, error) {
+	var prompt InteractivePrompt
+	var choicesJSON string
+	var required int
+	if err := row.Scan(&prompt.ID, &prompt.Question, &choicesJSON, &prompt.Default, &required, &prompt.AnswerFormat,
+		&prompt.SourceCommand, &prompt.State, &prompt.AnswerValue, &prompt.AnswerSource, &prompt.CreatedAt, &prompt.UpdatedAt, &prompt.AnsweredAt); err != nil {
+		return InteractivePrompt{}, err
+	}
+	if strings.TrimSpace(choicesJSON) != "" {
+		if err := json.Unmarshal([]byte(choicesJSON), &prompt.Choices); err != nil {
+			return InteractivePrompt{}, fmt.Errorf("decode interactive prompt choices: %w", err)
+		}
+	}
+	prompt.Choices = trimUniqueStrings(prompt.Choices)
+	prompt.Required = required != 0
+	return prompt, nil
+}
+
 func scanEvalReviewItem(row interface{ Scan(dest ...any) error }) (EvalReviewItem, error) {
 	var item EvalReviewItem
 	if err := row.Scan(&item.ID, &item.RunID, &item.ItemID, &item.Title, &item.SourceArtifactID, &item.BaselineArtifactID,
@@ -2857,6 +3071,32 @@ func boolInt(value bool) int {
 		return 1
 	}
 	return 0
+}
+
+func trimUniqueStrings(values []string) []string {
+	seen := map[string]struct{}{}
+	output := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		output = append(output, value)
+	}
+	return output
+}
+
+func stringInSlice(value string, values []string) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) UpsertFeedbackEvent(ctx context.Context, event FeedbackEvent) error {
@@ -4262,5 +4502,24 @@ ALTER TABLE agent_instances ADD COLUMN autonomy_policy TEXT NOT NULL DEFAULT 'au
 	`,
 	`
 ALTER TABLE tasks ADD COLUMN worktree_path TEXT NOT NULL DEFAULT '';
+	`,
+	`
+CREATE TABLE interactive_prompts (
+	id TEXT PRIMARY KEY,
+	question TEXT NOT NULL,
+	choices_json TEXT NOT NULL DEFAULT '[]',
+	default_value TEXT NOT NULL DEFAULT '',
+	required INTEGER NOT NULL DEFAULT 1,
+	answer_format TEXT NOT NULL DEFAULT 'text',
+	source_command TEXT NOT NULL DEFAULT '',
+	state TEXT NOT NULL DEFAULT 'pending',
+	answer_value TEXT NOT NULL DEFAULT '',
+	answer_source TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	answered_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX idx_interactive_prompts_state ON interactive_prompts(state);
 	`,
 }

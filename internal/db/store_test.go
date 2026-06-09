@@ -44,6 +44,7 @@ func TestOpenMigratesSchema(t *testing.T) {
 		"skillopt_train_sessions",
 		"skillopt_train_iterations",
 		"skillopt_review_watches",
+		"interactive_prompts",
 	} {
 		ok, err := store.HasTable(ctx, table)
 		if err != nil {
@@ -94,6 +95,68 @@ func TestOpenConfiguresSQLiteContentionPragmas(t *testing.T) {
 	}
 	if busyTimeout != sqliteBusyTimeoutMillis {
 		t.Fatalf("read-only busy_timeout = %d, want %d", busyTimeout, sqliteBusyTimeoutMillis)
+	}
+}
+
+func TestInteractivePromptStorageAndAnswerValidation(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	prompt := InteractivePrompt{
+		ID:            "train-init-template",
+		Question:      "Which template should Gitmoot train?",
+		Choices:       []string{"planner", "writer", "planner"},
+		Default:       "planner",
+		Required:      true,
+		AnswerFormat:  "choice",
+		SourceCommand: "gitmoot skillopt train init",
+	}
+	if err := store.UpsertInteractivePrompt(ctx, prompt); err != nil {
+		t.Fatalf("UpsertInteractivePrompt returned error: %v", err)
+	}
+
+	pending, err := store.ListInteractivePrompts(ctx, InteractivePromptStatePending)
+	if err != nil {
+		t.Fatalf("ListInteractivePrompts returned error: %v", err)
+	}
+	if len(pending) != 1 || pending[0].ID != prompt.ID || len(pending[0].Choices) != 2 {
+		t.Fatalf("pending prompts = %+v", pending)
+	}
+
+	if _, err := store.AnswerInteractivePrompt(ctx, prompt.ID, "missing", "test"); err == nil || !strings.Contains(err.Error(), "not one of") {
+		t.Fatalf("AnswerInteractivePrompt invalid value error = %v", err)
+	}
+	answered, err := store.AnswerInteractivePrompt(ctx, prompt.ID, "", "agent")
+	if err != nil {
+		t.Fatalf("AnswerInteractivePrompt default returned error: %v", err)
+	}
+	if answered.State != InteractivePromptStateResolved || answered.AnswerValue != "planner" || answered.AnswerSource != "agent" || answered.AnsweredAt == "" {
+		t.Fatalf("answered prompt = %+v", answered)
+	}
+	if _, err := store.AnswerInteractivePrompt(ctx, prompt.ID, "writer", "agent"); err == nil || !strings.Contains(err.Error(), "already resolved") {
+		t.Fatalf("AnswerInteractivePrompt second answer error = %v", err)
+	}
+	if err := store.UpsertInteractivePrompt(ctx, InteractivePrompt{
+		ID:            prompt.ID,
+		Question:      "Which template should Gitmoot train now?",
+		Choices:       []string{"planner", "writer"},
+		Default:       "writer",
+		Required:      true,
+		AnswerFormat:  "choice",
+		SourceCommand: "gitmoot skillopt train init",
+	}); err != nil {
+		t.Fatalf("UpsertInteractivePrompt retry returned error: %v", err)
+	}
+	preserved, err := store.GetInteractivePrompt(ctx, prompt.ID)
+	if err != nil {
+		t.Fatalf("GetInteractivePrompt returned error: %v", err)
+	}
+	if preserved.State != InteractivePromptStateResolved || preserved.AnswerValue != "planner" || preserved.AnswerSource != "agent" || preserved.AnsweredAt != answered.AnsweredAt {
+		t.Fatalf("preserved prompt = %+v, answered_at before %q", preserved, answered.AnsweredAt)
 	}
 }
 
