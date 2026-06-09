@@ -918,6 +918,493 @@ func TestSkillOptTrainInitTemplatesRequiresJSON(t *testing.T) {
 	}
 }
 
+func TestSkillOptTrainInitCreatesScaffold(t *testing.T) {
+	home := t.TempDir()
+	workspace := chdirTemp(t)
+	restore := replaceAgentTemplateFetcher(fakeAgentTemplateFetcher{
+		commit:  "abc123",
+		content: "# Gitmoot Planner\n\nPlan work.",
+	})
+	defer restore()
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "init",
+		"--home", home,
+		"--name", "smithyx-x-posts",
+		"--template", "planner",
+		"--review-repo", "jerryfane/gitmoot-x-posts-smithyx",
+		"--task-kind", "writing",
+		"--artifact-kind", "text",
+		"--preview", "text-table",
+		"--mode", "explore",
+		"--request", "Improve the one-shot X post reply voice.",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "next: gitmoot skillopt train start --config .gitmoot/skillopt/smithyx-x-posts/config.toml") {
+		t.Fatalf("train init stdout missing next command:\n%s", stdout.String())
+	}
+	configPath := filepath.Join(workspace, ".gitmoot", "skillopt", "smithyx-x-posts", "config.toml")
+	cfg, err := skillopt.LoadTrainInitConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadTrainInitConfig returned error: %v", err)
+	}
+	if cfg.Template != "planner" || cfg.TemplateVersion == "" || cfg.ReviewRepo != "jerryfane/gitmoot-x-posts-smithyx" || cfg.TaskKind != "writing" || cfg.ArtifactKind != "text" || cfg.Preview != "text-table" {
+		t.Fatalf("unexpected config = %+v", cfg)
+	}
+	if cfg.Generation.Source != skillopt.TrainInitGenerationSourceCurrentSkill || cfg.Evaluator.Mode != skillopt.TrainInitEvaluatorModeJudge || cfg.Optimizer.InternalTargetAdapter != skillopt.TrainInitInternalTargetAdapterCodex || cfg.FinalEvaluatorEnabled {
+		t.Fatalf("unexpected defaults = %+v", cfg)
+	}
+	task, err := os.ReadFile(filepath.Join(workspace, ".gitmoot", "skillopt", "smithyx-x-posts", "task.md"))
+	if err != nil {
+		t.Fatalf("ReadFile task.md returned error: %v", err)
+	}
+	if strings.TrimSpace(string(task)) != "Improve the one-shot X post reply voice." {
+		t.Fatalf("task.md = %q", string(task))
+	}
+	reviewItems, err := os.ReadFile(filepath.Join(workspace, ".gitmoot", "skillopt", "smithyx-x-posts", "review-items.yml"))
+	if err != nil {
+		t.Fatalf("ReadFile review-items.yml returned error: %v", err)
+	}
+	if !strings.Contains(string(reviewItems), "item-001") || !strings.Contains(string(reviewItems), "item-002") {
+		t.Fatalf("review-items.yml = %q", string(reviewItems))
+	}
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open store returned error: %v", err)
+	}
+	defer store.Close()
+	template, err := store.GetAgentTemplate(context.Background(), "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate planner returned error: %v", err)
+	}
+	if template.VersionID != cfg.TemplateVersion {
+		t.Fatalf("template version = %q, config version = %q", template.VersionID, cfg.TemplateVersion)
+	}
+}
+
+func TestSkillOptTrainStartLoadsInitConfig(t *testing.T) {
+	home := t.TempDir()
+	workspace := chdirTemp(t)
+	restore := replaceAgentTemplateFetcher(fakeAgentTemplateFetcher{
+		commit:  "abc123",
+		content: "# Gitmoot Planner\n\nPlan work.",
+	})
+	defer restore()
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "init",
+		"--home", home,
+		"--name", "config-start",
+		"--template", "planner",
+		"--review-repo", "jerryfane/gitmoot-previews",
+		"--task-kind", "design",
+		"--artifact-kind", "vue",
+		"--preview", "vue",
+		"--request", "Improve landing page previews.",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	scaffoldDir := filepath.Join(workspace, ".gitmoot", "skillopt", "config-start")
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--config", filepath.Join(scaffoldDir, "config.toml"),
+		"--session", "config-start-session",
+		"--yes",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train start --config exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open store returned error: %v", err)
+	}
+	defer store.Close()
+	session, err := store.GetSkillOptTrainSession(context.Background(), "config-start-session")
+	if err != nil {
+		t.Fatalf("GetSkillOptTrainSession returned error: %v", err)
+	}
+	if session.TemplateID != "planner" || session.TargetRepo != "jerryfane/gitmoot-previews" || session.PreviewRepo != "jerryfane/gitmoot-previews" {
+		t.Fatalf("session = %+v", session)
+	}
+	if skillOptMetadataString(session.MetadataJSON, "preview", "mode") != skillopt.TrainPreviewModeRequired || skillOptMetadataString(session.MetadataJSON, "preview", "renderer") != skillopt.TrainPreviewRendererVueVite || skillOptMetadataString(session.MetadataJSON, "preview", "publisher") != skillopt.TrainPreviewPublisherGitHubPages {
+		t.Fatalf("preview metadata = %s", session.MetadataJSON)
+	}
+	if skillOptMetadataString(session.MetadataJSON, "optimizer_defaults", "backend") != "codex" || skillOptMetadataString(session.MetadataJSON, "optimizer_defaults", "skill_update_mode") != skillopt.TrainInitSkillUpdateModeFullRewrite {
+		t.Fatalf("optimizer defaults metadata = %s", session.MetadataJSON)
+	}
+	var defaults skillOptTrainOptimizerRequest
+	applySkillOptTrainOptimizerDefaultsFromMetadata(session.MetadataJSON, &defaults)
+	if defaults.Backend != "codex" || defaults.OptimizerViews != 4 || !defaults.OptimizerViewsSet || defaults.GateRejectRetryBudget != 3 || !defaults.GateRejectRetryBudgetSet || defaults.RetryOptimizerViews != "auto" || !defaults.RetryOptimizerViewsSet {
+		t.Fatalf("applied optimizer defaults = %+v", defaults)
+	}
+	run, err := store.GetEvalRun(context.Background(), "config-start-session-review-001")
+	if err != nil {
+		t.Fatalf("GetEvalRun returned error: %v", err)
+	}
+	if run.OptionsCount != 4 || run.ExplorationLevel != db.ExplorationLevelHigh {
+		t.Fatalf("eval run options/exploration = %d/%q, want 4/%q", run.OptionsCount, run.ExplorationLevel, db.ExplorationLevelHigh)
+	}
+	items, err := store.ListEvalReviewItems(context.Background(), "config-start-session-review-001")
+	if err != nil {
+		t.Fatalf("ListEvalReviewItems returned error: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("review items = %d, want 2", len(items))
+	}
+}
+
+func TestSkillOptTrainStartConfigPreviewModeOverrideDisablesVue(t *testing.T) {
+	home := t.TempDir()
+	workspace := chdirTemp(t)
+	restore := replaceAgentTemplateFetcher(fakeAgentTemplateFetcher{
+		commit:  "abc123",
+		content: "# Gitmoot Planner\n\nPlan work.",
+	})
+	defer restore()
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "init",
+		"--home", home,
+		"--name", "config-preview-override",
+		"--template", "planner",
+		"--review-repo", "jerryfane/gitmoot-previews",
+		"--artifact-kind", "vue",
+		"--preview", "vue",
+		"--request", "Improve landing page previews.",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	scaffoldDir := filepath.Join(workspace, ".gitmoot", "skillopt", "config-preview-override")
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--config", filepath.Join(scaffoldDir, "config.toml"),
+		"--preview-mode", "none",
+		"--session", "config-preview-override-session",
+		"--yes",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train start --config --preview-mode none exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open store returned error: %v", err)
+	}
+	defer store.Close()
+	session, err := store.GetSkillOptTrainSession(context.Background(), "config-preview-override-session")
+	if err != nil {
+		t.Fatalf("GetSkillOptTrainSession returned error: %v", err)
+	}
+	if session.PreviewRepo != "" {
+		t.Fatalf("preview repo = %q, want empty", session.PreviewRepo)
+	}
+	if skillOptMetadataString(session.MetadataJSON, "preview", "mode") != skillopt.TrainPreviewModeNone || skillOptMetadataString(session.MetadataJSON, "preview", "renderer") != skillopt.TrainPreviewRendererNone || skillOptMetadataString(session.MetadataJSON, "preview", "publisher") != skillopt.TrainPreviewPublisherNone {
+		t.Fatalf("preview metadata = %s", session.MetadataJSON)
+	}
+}
+
+func TestSkillOptTrainStartConfigPreviewFlagsOverrideNone(t *testing.T) {
+	home := t.TempDir()
+	workspace := chdirTemp(t)
+	restore := replaceAgentTemplateFetcher(fakeAgentTemplateFetcher{
+		commit:  "abc123",
+		content: "# Gitmoot Planner\n\nPlan work.",
+	})
+	defer restore()
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "init",
+		"--home", home,
+		"--name", "config-preview-enable",
+		"--template", "planner",
+		"--review-repo", "jerryfane/gitmoot",
+		"--artifact-kind", "text",
+		"--preview", "none",
+		"--request", "Improve planner summaries.",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	scaffoldDir := filepath.Join(workspace, ".gitmoot", "skillopt", "config-preview-enable")
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--config", filepath.Join(scaffoldDir, "config.toml"),
+		"--preview-repo", "jerryfane/gitmoot-previews",
+		"--session", "config-preview-enable-session",
+		"--yes",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train start --config --preview-repo exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open store returned error: %v", err)
+	}
+	defer store.Close()
+	session, err := store.GetSkillOptTrainSession(context.Background(), "config-preview-enable-session")
+	if err != nil {
+		t.Fatalf("GetSkillOptTrainSession returned error: %v", err)
+	}
+	if session.PreviewRepo != "jerryfane/gitmoot-previews" {
+		t.Fatalf("preview repo = %q, want jerryfane/gitmoot-previews", session.PreviewRepo)
+	}
+	if skillOptMetadataString(session.MetadataJSON, "preview", "mode") != skillopt.TrainPreviewModeRequired || skillOptMetadataString(session.MetadataJSON, "preview", "renderer") != skillopt.TrainPreviewRendererVueVite || skillOptMetadataString(session.MetadataJSON, "preview", "publisher") != skillopt.TrainPreviewPublisherGitHubPages {
+		t.Fatalf("preview metadata = %s", session.MetadataJSON)
+	}
+}
+
+func TestSkillOptTrainInitAppliesModeDefaults(t *testing.T) {
+	home := t.TempDir()
+	workspace := chdirTemp(t)
+	restore := replaceAgentTemplateFetcher(fakeAgentTemplateFetcher{
+		commit:  "abc123",
+		content: "# Gitmoot Planner\n\nPlan work.",
+	})
+	defer restore()
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "init",
+		"--home", home,
+		"--name", "validate-defaults",
+		"--template", "planner",
+		"--review-repo", "jerryfane/gitmoot",
+		"--artifact-kind", "text",
+		"--preview", "none",
+		"--mode", "validate",
+		"--request", "Validate planner summaries.",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train init validate exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	cfg, err := skillopt.LoadTrainInitConfig(filepath.Join(workspace, ".gitmoot", "skillopt", "validate-defaults", "config.toml"))
+	if err != nil {
+		t.Fatalf("LoadTrainInitConfig returned error: %v", err)
+	}
+	if cfg.Mode != db.EvalRunModeValidate || cfg.ExplorationLevel != db.ExplorationLevelLow || cfg.Options != 2 {
+		t.Fatalf("validate config defaults = mode %q exploration %q options %d", cfg.Mode, cfg.ExplorationLevel, cfg.Options)
+	}
+}
+
+func TestSkillOptTrainStartConfigRepoOverrideDrivesVuePreviewRepo(t *testing.T) {
+	home := t.TempDir()
+	workspace := chdirTemp(t)
+	restore := replaceAgentTemplateFetcher(fakeAgentTemplateFetcher{
+		commit:  "abc123",
+		content: "# Gitmoot Planner\n\nPlan work.",
+	})
+	defer restore()
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "init",
+		"--home", home,
+		"--name", "config-repo-override",
+		"--template", "planner",
+		"--review-repo", "jerryfane/gitmoot-previews",
+		"--artifact-kind", "vue",
+		"--preview", "vue",
+		"--request", "Improve landing page previews.",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	scaffoldDir := filepath.Join(workspace, ".gitmoot", "skillopt", "config-repo-override")
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--config", filepath.Join(scaffoldDir, "config.toml"),
+		"--repo", "jerryfane/gitmoot",
+		"--session", "config-repo-override-session",
+		"--yes",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train start --config --repo exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open store returned error: %v", err)
+	}
+	defer store.Close()
+	session, err := store.GetSkillOptTrainSession(context.Background(), "config-repo-override-session")
+	if err != nil {
+		t.Fatalf("GetSkillOptTrainSession returned error: %v", err)
+	}
+	if session.TargetRepo != "jerryfane/gitmoot" || session.PreviewRepo != "jerryfane/gitmoot" {
+		t.Fatalf("session repos = target %q preview %q", session.TargetRepo, session.PreviewRepo)
+	}
+	if skillOptMetadataString(session.MetadataJSON, "review", "expected_repo") != "jerryfane/gitmoot" {
+		t.Fatalf("expected review repo metadata = %s", session.MetadataJSON)
+	}
+}
+
+func TestSkillOptTrainOptimizerDefaultsDoNotOverrideExplicitControls(t *testing.T) {
+	metadata := `{"optimizer_defaults":{"backend":"codex","optimizer_backend":"openai_chat","target_backend":"openai_chat","evaluator_backend":"openai_chat","optimizer_views":4,"retry_optimizer_views":"auto"}}`
+	request := skillOptTrainOptimizerRequest{OptimizerBackend: "openai_chat"}
+	applySkillOptTrainOptimizerDefaultsFromMetadata(metadata, &request)
+	if request.Backend != "" || request.OptimizerBackend != "openai_chat" {
+		t.Fatalf("backend defaults overrode explicit backend controls: %+v", request)
+	}
+	if request.OptimizerViews != 4 || !request.OptimizerViewsSet || request.RetryOptimizerViews != "auto" || !request.RetryOptimizerViewsSet {
+		t.Fatalf("non-conflicting defaults were not applied: %+v", request)
+	}
+
+	request = skillOptTrainOptimizerRequest{Backend: "codex"}
+	applySkillOptTrainOptimizerDefaultsFromMetadata(metadata, &request)
+	if request.OptimizerBackend != "" || request.TargetBackend != "" || request.EvaluatorBackend != "" {
+		t.Fatalf("preset backend inherited conflicting backend defaults: %+v", request)
+	}
+	resolved, _, err := resolveSkillOptTrainBackendRequest(request)
+	if err != nil {
+		t.Fatalf("resolve codex override returned error: %v", err)
+	}
+	if resolved.OptimizerBackend != "codex" || resolved.TargetBackend != "codex_exec" || resolved.EvaluatorBackend != "codex" {
+		t.Fatalf("resolved codex backend = %+v", resolved)
+	}
+
+	request = skillOptTrainOptimizerRequest{RetryOptimizerViews: "8", RetryOptimizerViewsSet: true}
+	applySkillOptTrainOptimizerDefaultsFromMetadata(metadata, &request)
+	if err := validateSkillOptTrainOptimizerRequestAfterDefaults(&request); err == nil || !strings.Contains(err.Error(), "--retry-optimizer-views cannot exceed --optimizer-views") {
+		t.Fatalf("retry/optimizer views validation error = %v, request=%+v", err, request)
+	}
+
+	config := skillopt.DefaultTrainInitConfig()
+	config.Optimizer.OptimizerBackend = "openai_chat"
+	config.Optimizer.TargetBackend = "openai_chat"
+	config.Optimizer.InternalTargetAdapter = skillopt.TrainInitInternalTargetAdapterCodex
+	config.Optimizer.EvaluatorBackend = "openai_chat"
+	defaults := skillOptTrainOptimizerDefaultsFromInitConfig(config)
+	if defaults.TargetBackend != "openai_chat" {
+		t.Fatalf("custom target backend was not preserved: %+v", defaults)
+	}
+
+	request = skillOptTrainOptimizerRequest{}
+	applySkillOptTrainOptimizerDefaultsFromMetadata(`{"optimizer_defaults":{"final_eval":true}}`, &request)
+	if !request.FinalEval {
+		t.Fatalf("final eval default was not applied: %+v", request)
+	}
+	request = skillOptTrainOptimizerRequest{FinalEvalSet: true}
+	applySkillOptTrainOptimizerDefaultsFromMetadata(`{"optimizer_defaults":{"final_eval":true}}`, &request)
+	if request.FinalEval {
+		t.Fatalf("explicit final-eval=false was overridden: %+v", request)
+	}
+}
+
+func TestSkillOptTrainInitMissingRequiredFieldsIsAtomic(t *testing.T) {
+	home := t.TempDir()
+	workspace := chdirTemp(t)
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "train", "init", "--home", home, "--name", "missing-fields"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("train init missing exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "missing required fields") || !strings.Contains(stderr.String(), "example: gitmoot skillopt train init") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(workspace, ".gitmoot", "skillopt", "missing-fields")); !os.IsNotExist(err) {
+		t.Fatalf("scaffold residue err = %v, want not exist", err)
+	}
+	paths := config.PathsForHome(home)
+	if _, err := os.Stat(paths.Database); !os.IsNotExist(err) {
+		t.Fatalf("database residue err = %v, want not exist", err)
+	}
+}
+
+func TestSkillOptTrainInitRejectsMalformedReviewRepo(t *testing.T) {
+	home := t.TempDir()
+	_ = chdirTemp(t)
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "init",
+		"--home", home,
+		"--name", "bad-repo",
+		"--template", "planner",
+		"--review-repo", "not-a-repo",
+		"--task-kind", "writing",
+		"--artifact-kind", "text",
+		"--preview", "text-table",
+		"--request", "Improve this.",
+	}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "review-repo") {
+		t.Fatalf("bad repo code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestSkillOptTrainInitRejectsUnsupportedTaskKind(t *testing.T) {
+	home := t.TempDir()
+	workspace := chdirTemp(t)
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "init",
+		"--home", home,
+		"--name", "bad-task-kind",
+		"--template", "planner",
+		"--review-repo", "jerryfane/gitmoot-previews",
+		"--task-kind", "writng",
+		"--artifact-kind", "text",
+		"--preview", "text-table",
+		"--request", "Improve this.",
+	}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), `task kind "writng" is not supported`) {
+		t.Fatalf("bad task kind code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(workspace, ".gitmoot", "skillopt", "bad-task-kind")); !os.IsNotExist(err) {
+		t.Fatalf("scaffold residue err = %v, want not exist", err)
+	}
+}
+
+func TestSkillOptTrainInitRejectsUnsupportedPreview(t *testing.T) {
+	home := t.TempDir()
+	workspace := chdirTemp(t)
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "init",
+		"--home", home,
+		"--name", "bad-preview",
+		"--template", "planner",
+		"--review-repo", "jerryfane/gitmoot-previews",
+		"--task-kind", "writing",
+		"--artifact-kind", "text",
+		"--preview", "custom",
+		"--request", "Improve this.",
+	}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), `preview "custom" is not supported`) {
+		t.Fatalf("bad preview code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(workspace, ".gitmoot", "skillopt", "bad-preview")); !os.IsNotExist(err) {
+		t.Fatalf("scaffold residue err = %v, want not exist", err)
+	}
+}
+
+func TestSkillOptTrainInitHelpIncludesCreateCommand(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "train", "init", "--help"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("help exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "gitmoot skillopt train init --name <name>") || !strings.Contains(stdout.String(), "gitmoot skillopt train init templates --json") {
+		t.Fatalf("help output = %q", stdout.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "train", "--help"}, &stdout, &stderr)
+	if code != 0 || !strings.Contains(stdout.String(), "gitmoot skillopt train start --template <id>") {
+		t.Fatalf("train help regression code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
 func cliTrainInitChoiceByID(t *testing.T, choices []skillopt.TrainInitTemplateChoice, id string) skillopt.TrainInitTemplateChoice {
 	t.Helper()
 	for _, choice := range choices {
@@ -2380,7 +2867,7 @@ func TestSkillOptTrainGenerationLockTTLScalesWithWorkload(t *testing.T) {
 		PreviewRepo:  "owner/previews",
 		TaskKind:     "design",
 		State:        skillopt.TrainStateItemsReady,
-		MetadataJSON: skillOptTrainStartMetadata("Train landing page previews.", db.EvalRunModeExplore, db.ExplorationLevelHigh, 4, "soft", nil, nil, previewPolicy),
+		MetadataJSON: skillOptTrainStartMetadata("Train landing page previews.", db.EvalRunModeExplore, db.ExplorationLevelHigh, 4, "soft", nil, nil, previewPolicy, skillOptTrainStartConfigDefaults{}),
 	}); err != nil {
 		t.Fatalf("UpsertSkillOptTrainSession returned error: %v", err)
 	}
@@ -4776,7 +5263,7 @@ func TestSkillOptTrainCandidateReviewBodyShowsTextSamplePreview(t *testing.T) {
 		t.Fatalf("BuildTrainPreviewPolicy optional returned error: %v", err)
 	}
 	optionalSession := session
-	optionalSession.MetadataJSON = skillOptTrainStartMetadata("Train planner outputs from human feedback.", db.EvalRunModeValidate, db.ExplorationLevelLow, 2, "hard_then_soft", nil, nil, optionalPolicy)
+	optionalSession.MetadataJSON = skillOptTrainStartMetadata("Train planner outputs from human feedback.", db.EvalRunModeValidate, db.ExplorationLevelLow, 2, "hard_then_soft", nil, nil, optionalPolicy, skillOptTrainStartConfigDefaults{})
 	for _, tt := range []struct {
 		name    string
 		session db.SkillOptTrainSession
@@ -4871,7 +5358,7 @@ func TestSkillOptTrainCandidateReviewRequiredPreviewKeepsBundleFailure(t *testin
 	if err != nil {
 		t.Fatalf("GetSkillOptTrainSession returned error: %v", err)
 	}
-	session.MetadataJSON = skillOptTrainStartMetadata("Train planner outputs from human feedback.", db.EvalRunModeValidate, db.ExplorationLevelLow, 2, "hard_then_soft", nil, nil, requiredPolicy)
+	session.MetadataJSON = skillOptTrainStartMetadata("Train planner outputs from human feedback.", db.EvalRunModeValidate, db.ExplorationLevelLow, 2, "hard_then_soft", nil, nil, requiredPolicy, skillOptTrainStartConfigDefaults{})
 	previews := publishSkillOptTrainCandidateSamplePreviews(context.Background(), paths, store, session, db.SkillOptTrainIteration{
 		ID:                    "optimizer-train-001",
 		CandidateVersionID:    version.ID,
@@ -7382,7 +7869,7 @@ func TestSkillOptFeedbackGitHubCommandsEnforceTrainReviewRepo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildTrainPreviewPolicy returned error: %v", err)
 	}
-	metadata := skillOptTrainStartMetadata("Train landing page reviews.", db.EvalRunModeExplore, db.ExplorationLevelHigh, 4, "soft", nil, nil, previewPolicy)
+	metadata := skillOptTrainStartMetadata("Train landing page reviews.", db.EvalRunModeExplore, db.ExplorationLevelHigh, 4, "soft", nil, nil, previewPolicy, skillOptTrainStartConfigDefaults{})
 	session := db.SkillOptTrainSession{
 		ID:           "preview-train",
 		TemplateID:   "planner",
@@ -9463,7 +9950,7 @@ func seedSkillOptTrainFeedbackSynced(t *testing.T) (string, string) {
 	if err != nil {
 		t.Fatalf("BuildTrainPreviewPolicy returned error: %v", err)
 	}
-	metadata := skillOptTrainStartMetadata("Train planner outputs from human feedback.", db.EvalRunModeValidate, db.ExplorationLevelLow, 2, "hard_then_soft", nil, nil, previewPolicy)
+	metadata := skillOptTrainStartMetadata("Train planner outputs from human feedback.", db.EvalRunModeValidate, db.ExplorationLevelLow, 2, "hard_then_soft", nil, nil, previewPolicy, skillOptTrainStartConfigDefaults{})
 	session := db.SkillOptTrainSession{
 		ID:                "optimizer-train",
 		TemplateID:        "planner",

@@ -83,7 +83,9 @@ func printSkillOptUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id> [--reviewer name]")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)")
+	fmt.Fprintln(w, "  gitmoot skillopt train init --name <name> --template <id> --review-repo owner/repo --artifact-kind kind --preview kind (--request text|--request-file path)")
 	fmt.Fprintln(w, "  gitmoot skillopt train init templates --json")
+	fmt.Fprintln(w, "  gitmoot skillopt train start --config .gitmoot/skillopt/<name>/config.toml [--yes]")
 	fmt.Fprintln(w, "  gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file path [--yes]")
 	fmt.Fprintln(w, "  gitmoot skillopt train status --session <id>")
 	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--backend codex] [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--model name] [--optimizer-model name] [--target-model name] [--optimizer-backend name] [--target-backend name] [--evaluator-id id] [--evaluator-model name] [--evaluator-backend name] [--skill-update-mode mode] [--num-epochs N] [--batch-size N] [--optimizer-views N] [--retry-optimizer-views auto|inherit|N] [--gate hard|soft|mixed] [--out-root path] [--timeout duration] [--dry-run] [--rerun-optimizer] [--promote version|--reject version --reason text] [--start-next]")
@@ -118,7 +120,9 @@ func runSkillOptTrain(args []string, stdout, stderr io.Writer) int {
 
 func printSkillOptTrainUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  gitmoot skillopt train init --name <name> --template <id> --review-repo owner/repo --artifact-kind kind --preview kind (--request text|--request-file path)")
 	fmt.Fprintln(w, "  gitmoot skillopt train init templates --json")
+	fmt.Fprintln(w, "  gitmoot skillopt train start --config .gitmoot/skillopt/<name>/config.toml [--session <id>] [--items-file path] [--yes]")
 	fmt.Fprintln(w, "  gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file path [--session <id>] [--workspace-repo owner/repo] [--preview-repo owner/repo] [--preview-mode none|optional|required] [--preview-renderer none|vue-vite] [--preview-publisher none|github-pages] [--preview-route-template template] [--request-file path] [--task-kind kind] [--mode explore|refine|distill|validate] [--exploration-level high|medium|low] [--options N] [--min-items N] [--preferred-gate hard|soft|hard_then_soft] [--dry-run] [--yes]")
 	fmt.Fprintln(w, "  gitmoot skillopt train status --session <id>")
 	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--backend codex] [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--model name] [--optimizer-model name] [--target-model name] [--optimizer-backend name] [--target-backend name] [--evaluator-id id] [--evaluator-model name] [--evaluator-backend name] [--skill-update-mode mode] [--num-epochs N] [--batch-size N] [--optimizer-views N] [--retry-optimizer-views auto|inherit|N] [--gate hard|soft|mixed] [--out-root path] [--timeout duration] [--dry-run] [--rerun-optimizer] [--promote version|--reject version --reason text] [--start-next]")
@@ -127,23 +131,218 @@ func printSkillOptTrainUsage(w io.Writer) {
 }
 
 func runSkillOptTrainInit(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+	if len(args) > 0 && (args[0] == "-h" || args[0] == "--help") {
 		printSkillOptTrainInitUsage(stdout)
 		return 0
 	}
-	switch args[0] {
-	case "templates":
+	if len(args) > 0 && args[0] == "templates" {
 		return runSkillOptTrainInitTemplates(args[1:], stdout, stderr)
-	default:
-		fmt.Fprintf(stderr, "unknown skillopt train init command %q\n\n", args[0])
-		printSkillOptTrainInitUsage(stderr)
-		return 2
 	}
+	return runSkillOptTrainInitCreate(args, stdout, stderr)
 }
 
 func printSkillOptTrainInitUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  gitmoot skillopt train init --name <name> --template <id> --review-repo owner/repo --artifact-kind kind --preview kind (--request text|--request-file path) [--task-kind kind] [--mode explore|refine|distill|validate]")
 	fmt.Fprintln(w, "  gitmoot skillopt train init templates --json")
+}
+
+func runSkillOptTrainInitCreate(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("skillopt train init", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	name := fs.String("name", "", "train scaffold name")
+	templateRef := fs.String("template", "", "agent template id or version to train")
+	reviewRepoFlag := fs.String("review-repo", "", "review repository in owner/repo form")
+	taskKind := fs.String("task-kind", "custom", "task kind")
+	artifactKind := fs.String("artifact-kind", "", "artifact kind, such as text, vue, pdf, or custom")
+	preview := fs.String("preview", "", "preview kind: none, text-table, or vue")
+	mode := fs.String("mode", db.EvalRunModeExplore, "train mode: explore, refine, distill, or validate")
+	requestText := fs.String("request", "", "human training request for task.md")
+	requestFile := fs.String("request-file", "", "file containing the human training request")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "skillopt train init does not accept positional arguments")
+		return 2
+	}
+	request, err := readSkillOptTrainRequest(*requestText, *requestFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
+		return 2
+	}
+	values := skillOptTrainInitInputs{
+		Name:         strings.TrimSpace(*name),
+		Template:     strings.TrimSpace(*templateRef),
+		ReviewRepo:   strings.TrimSpace(*reviewRepoFlag),
+		TaskKind:     strings.TrimSpace(*taskKind),
+		ArtifactKind: strings.TrimSpace(*artifactKind),
+		Preview:      strings.TrimSpace(*preview),
+		Mode:         strings.TrimSpace(*mode),
+		Request:      strings.TrimSpace(request),
+	}
+	if values.TaskKind == "" {
+		values.TaskKind = "custom"
+	}
+	if values.Mode == "" {
+		values.Mode = db.EvalRunModeExplore
+	}
+	if missing := missingSkillOptTrainInitInputs(values); len(missing) > 0 {
+		fmt.Fprintf(stderr, "skillopt train init missing required fields: %s\n", strings.Join(missing, ", "))
+		fmt.Fprintf(stderr, "example: %s\n", skillOptTrainInitExampleCommand(values.Name))
+		return 2
+	}
+	if err := skillopt.ValidateTrainInitName(values.Name); err != nil {
+		fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
+		return 2
+	}
+	reviewRepo, err := daemon.ParseRepository(values.ReviewRepo)
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt train init: review-repo: %v\n", err)
+		return 2
+	}
+	if _, err := normalizeSkillOptTrainTaskKind(values.TaskKind); err != nil {
+		fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
+		return 2
+	}
+	normalizedPreview, err := normalizeSkillOptTrainInitPreview(values.Preview)
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
+		return 2
+	}
+	values.Preview = normalizedPreview
+	normalizedMode, normalizedExploration, err := normalizeSkillOptTrainMode(values.Mode, "")
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
+		return 2
+	}
+	values.Mode = normalizedMode
+	var template db.AgentTemplate
+	if err := withStore(*home, func(store *db.Store) error {
+		var err error
+		template, err = skillopt.ResolveTrainInitTemplateChoice(context.Background(), store, newAgentTemplateFetcher(), values.Template)
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
+		return 1
+	}
+	config := skillopt.DefaultTrainInitConfig()
+	config.Name = values.Name
+	config.Template = template.ID
+	config.TemplateVersion = template.VersionID
+	config.ReviewRepo = reviewRepo.FullName()
+	config.TaskKind = values.TaskKind
+	config.ArtifactKind = values.ArtifactKind
+	config.Preview = values.Preview
+	config.Mode = values.Mode
+	config.ExplorationLevel = normalizedExploration
+	config.Options = skillOptTrainInitDefaultOptions(normalizedMode)
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt train init: get working directory: %v\n", err)
+		return 1
+	}
+	paths, err := skillopt.WriteTrainInitScaffold(cwd, skillopt.TrainInitScaffold{
+		Config:          config,
+		TaskMarkdown:    values.Request,
+		ReviewItemsYAML: skillOptTrainInitStarterReviewItemsYAML(values),
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
+		return 1
+	}
+	writeLine(stdout, "created train init scaffold %s", relativeOrAbsolutePath(cwd, paths.Root))
+	writeLine(stdout, "config: %s", relativeOrAbsolutePath(cwd, paths.ConfigPath))
+	writeLine(stdout, "task: %s", relativeOrAbsolutePath(cwd, paths.TaskPath))
+	writeLine(stdout, "next: gitmoot skillopt train start --config %s", filepath.ToSlash(filepath.Join(".gitmoot", skillopt.TrainInitScaffoldDirName, values.Name, skillopt.TrainInitConfigFileName)))
+	return 0
+}
+
+type skillOptTrainInitInputs struct {
+	Name         string
+	Template     string
+	ReviewRepo   string
+	TaskKind     string
+	ArtifactKind string
+	Preview      string
+	Mode         string
+	Request      string
+}
+
+func missingSkillOptTrainInitInputs(values skillOptTrainInitInputs) []string {
+	missing := []string{}
+	for field, value := range map[string]string{
+		"name":          values.Name,
+		"template":      values.Template,
+		"review_repo":   values.ReviewRepo,
+		"task_kind":     values.TaskKind,
+		"artifact_kind": values.ArtifactKind,
+		"preview":       values.Preview,
+		"mode":          values.Mode,
+		"request":       values.Request,
+	} {
+		if strings.TrimSpace(value) == "" {
+			missing = append(missing, field)
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
+
+func skillOptTrainInitExampleCommand(name string) string {
+	if strings.TrimSpace(name) == "" {
+		name = "my-skill-training"
+	}
+	return "gitmoot skillopt train init --name " + name + " --template <template-id> --review-repo owner/repo --task-kind custom --artifact-kind text --preview text-table --mode explore --request \"Describe what to improve\""
+}
+
+func skillOptTrainInitStarterReviewItemsYAML(values skillOptTrainInitInputs) []byte {
+	artifactKind := firstNonEmpty(strings.TrimSpace(values.ArtifactKind), "artifact")
+	return []byte(strings.Join([]string{
+		"items:",
+		"  - item_id: item-001",
+		"    title: \"Primary scenario\"",
+		"    brief: " + strconv.Quote("Generate a representative "+artifactKind+" output for the training request."),
+		"    target_audience: \"Primary reviewer\"",
+		"    output_type: " + strconv.Quote(artifactKind),
+		"  - item_id: item-002",
+		"    title: \"Variation scenario\"",
+		"    brief: " + strconv.Quote("Generate a second "+artifactKind+" output with meaningfully different constraints or context."),
+		"    target_audience: \"Primary reviewer\"",
+		"    output_type: " + strconv.Quote(artifactKind),
+		"",
+	}, "\n"))
+}
+
+func normalizeSkillOptTrainInitPreview(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "none":
+		return "none", nil
+	case "text", "text-table":
+		return "text-table", nil
+	case "vue", "vue-vite":
+		return "vue", nil
+	default:
+		return "", fmt.Errorf("preview %q is not supported; use none, text-table, or vue", value)
+	}
+}
+
+func skillOptTrainInitDefaultOptions(mode string) int {
+	if mode == db.EvalRunModeExplore {
+		return skillopt.DefaultTrainInitConfig().Options
+	}
+	return effectiveSkillOptOptionsCount(mode, 0)
+}
+
+func relativeOrAbsolutePath(base string, path string) string {
+	if rel, err := filepath.Rel(base, path); err == nil && rel != "." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".." && !filepath.IsAbs(rel) {
+		return filepath.ToSlash(rel)
+	}
+	return path
 }
 
 func runSkillOptTrainInitTemplates(args []string, stdout, stderr io.Writer) int {
@@ -180,6 +379,7 @@ func runSkillOptTrainStart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("skillopt train start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	configPath := fs.String("config", "", "train init config.toml scaffold path")
 	templateID := fs.String("template", "", "agent template id or version to train")
 	repoFlag := fs.String("repo", "", "target repository in owner/repo form")
 	sessionID := fs.String("session", "", "train session id")
@@ -209,6 +409,16 @@ func runSkillOptTrainStart(args []string, stdout, stderr io.Writer) int {
 	if fs.NArg() != 0 {
 		fmt.Fprintln(stderr, "skillopt train start does not accept positional arguments")
 		return 2
+	}
+	setFlags := flagNamesSet(fs)
+	var configDefaults skillOptTrainStartConfigDefaults
+	if strings.TrimSpace(*configPath) != "" {
+		var err error
+		configDefaults, err = applySkillOptTrainStartConfig(*configPath, setFlags, templateID, repoFlag, taskKind, mode, explorationLevel, optionsCount, previewRepoFlag, previewMode, previewRenderer, previewPublisher, requestText, requestFile, itemsFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "skillopt train start: %v\n", err)
+			return 2
+		}
 	}
 	request, err := readSkillOptTrainRequest(*requestText, *requestFile)
 	if err != nil {
@@ -284,7 +494,7 @@ func runSkillOptTrainStart(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
-		plan = buildSkillOptTrainStartPlan(template, repo.FullName(), workspaceRepo, policy, strings.TrimSpace(*sessionID), request, normalizedTaskKind, normalizedMode, normalizedExploration, effectiveOptionsCount, normalizedGate, items, itemWarnings)
+		plan = buildSkillOptTrainStartPlan(template, repo.FullName(), workspaceRepo, policy, strings.TrimSpace(*sessionID), request, normalizedTaskKind, normalizedMode, normalizedExploration, effectiveOptionsCount, normalizedGate, items, itemWarnings, configDefaults)
 		if *dryRun {
 			return nil
 		}
@@ -334,6 +544,200 @@ func runSkillOptTrainStart(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+func flagNamesSet(fs *flag.FlagSet) map[string]struct{} {
+	set := map[string]struct{}{}
+	fs.Visit(func(f *flag.Flag) {
+		set[f.Name] = struct{}{}
+	})
+	return set
+}
+
+type skillOptTrainStartConfigDefaults struct {
+	Optimizer skillOptTrainOptimizerRequest
+}
+
+func applySkillOptTrainStartConfig(configPath string, setFlags map[string]struct{}, templateID *string, repoFlag *string, taskKind *string, mode *string, explorationLevel *string, optionsCount *int, previewRepoFlag *string, previewMode *string, previewRenderer *string, previewPublisher *string, requestText *string, requestFile *string, itemsFile *string) (skillOptTrainStartConfigDefaults, error) {
+	configPath = strings.TrimSpace(configPath)
+	config, err := skillopt.LoadTrainInitConfig(configPath)
+	if err != nil {
+		return skillOptTrainStartConfigDefaults{}, fmt.Errorf("load config: %w", err)
+	}
+	scaffoldDir := filepath.Dir(configPath)
+	if !flagWasSet(setFlags, "template") {
+		if strings.TrimSpace(config.TemplateVersion) != "" {
+			*templateID = config.TemplateVersion
+		} else {
+			*templateID = config.Template
+		}
+	}
+	if !flagWasSet(setFlags, "repo") {
+		*repoFlag = config.ReviewRepo
+	}
+	if !flagWasSet(setFlags, "task-kind") {
+		*taskKind = config.TaskKind
+	}
+	if !flagWasSet(setFlags, "mode") {
+		*mode = config.Mode
+	}
+	if !flagWasSet(setFlags, "exploration-level") {
+		*explorationLevel = config.ExplorationLevel
+	}
+	if !flagWasSet(setFlags, "options") {
+		*optionsCount = config.Options
+	}
+	if err := applySkillOptTrainStartPreviewConfig(config, setFlags, *repoFlag, previewRepoFlag, previewMode, previewRenderer, previewPublisher); err != nil {
+		return skillOptTrainStartConfigDefaults{}, err
+	}
+	if !flagWasSet(setFlags, "request") && !flagWasSet(setFlags, "request-file") {
+		taskPath := filepath.Join(scaffoldDir, skillopt.TrainInitTaskFileName)
+		content, err := os.ReadFile(taskPath)
+		if err != nil {
+			return skillOptTrainStartConfigDefaults{}, fmt.Errorf("read %s: %w", taskPath, err)
+		}
+		*requestText = strings.TrimSpace(string(content))
+		*requestFile = ""
+	}
+	if !flagWasSet(setFlags, "items-file") {
+		defaultItemsPath := filepath.Join(scaffoldDir, skillopt.TrainInitReviewItemsName)
+		if _, err := os.Stat(defaultItemsPath); err == nil {
+			*itemsFile = defaultItemsPath
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return skillOptTrainStartConfigDefaults{}, fmt.Errorf("inspect %s: %w", defaultItemsPath, err)
+		}
+	}
+	return skillOptTrainStartConfigDefaults{Optimizer: skillOptTrainOptimizerDefaultsFromInitConfig(config)}, nil
+}
+
+func applySkillOptTrainStartPreviewConfig(config skillopt.TrainInitConfig, setFlags map[string]struct{}, effectiveReviewRepo string, previewRepoFlag *string, previewMode *string, previewRenderer *string, previewPublisher *string) error {
+	preview, err := normalizeSkillOptTrainInitPreview(config.Preview)
+	if err != nil {
+		return err
+	}
+	defaultPreviewRepo := firstNonEmpty(strings.TrimSpace(effectiveReviewRepo), config.ReviewRepo)
+	if flagWasSet(setFlags, "preview-mode") {
+		switch strings.TrimSpace(strings.ToLower(*previewMode)) {
+		case skillopt.TrainPreviewModeNone:
+			if !flagWasSet(setFlags, "preview-renderer") {
+				*previewRenderer = skillopt.TrainPreviewRendererNone
+			}
+			if !flagWasSet(setFlags, "preview-publisher") {
+				*previewPublisher = skillopt.TrainPreviewPublisherNone
+			}
+		case skillopt.TrainPreviewModeRequired:
+			if !flagWasSet(setFlags, "preview-renderer") {
+				*previewRenderer = skillopt.TrainPreviewRendererVueVite
+			}
+			if !flagWasSet(setFlags, "preview-publisher") {
+				*previewPublisher = skillopt.TrainPreviewPublisherGitHubPages
+			}
+			if !flagWasSet(setFlags, "preview-repo") {
+				*previewRepoFlag = defaultPreviewRepo
+			}
+		case skillopt.TrainPreviewModeOptional:
+			if preview == "vue" {
+				if !flagWasSet(setFlags, "preview-renderer") {
+					*previewRenderer = skillopt.TrainPreviewRendererVueVite
+				}
+				if !flagWasSet(setFlags, "preview-publisher") {
+					*previewPublisher = skillopt.TrainPreviewPublisherGitHubPages
+				}
+				if !flagWasSet(setFlags, "preview-repo") {
+					*previewRepoFlag = defaultPreviewRepo
+				}
+			}
+		}
+		return nil
+	}
+	switch preview {
+	case "none", "text-table":
+		if skillOptTrainPreviewOverrideFlagWasSet(setFlags) {
+			return nil
+		}
+		*previewMode = skillopt.TrainPreviewModeNone
+		if !flagWasSet(setFlags, "preview-renderer") {
+			*previewRenderer = skillopt.TrainPreviewRendererNone
+		}
+		if !flagWasSet(setFlags, "preview-publisher") {
+			*previewPublisher = skillopt.TrainPreviewPublisherNone
+		}
+	case "vue":
+		*previewMode = skillopt.TrainPreviewModeRequired
+		if !flagWasSet(setFlags, "preview-renderer") {
+			*previewRenderer = skillopt.TrainPreviewRendererVueVite
+		}
+		if !flagWasSet(setFlags, "preview-publisher") {
+			*previewPublisher = skillopt.TrainPreviewPublisherGitHubPages
+		}
+		if !flagWasSet(setFlags, "preview-repo") {
+			*previewRepoFlag = defaultPreviewRepo
+		}
+	}
+	return nil
+}
+
+func skillOptTrainPreviewOverrideFlagWasSet(setFlags map[string]struct{}) bool {
+	for _, name := range []string{"preview-repo", "preview-renderer", "preview-publisher", "preview-route-template"} {
+		if flagWasSet(setFlags, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func flagWasSet(setFlags map[string]struct{}, name string) bool {
+	_, ok := setFlags[name]
+	return ok
+}
+
+func skillOptTrainOptimizerDefaultsFromInitConfig(config skillopt.TrainInitConfig) skillOptTrainOptimizerRequest {
+	request := skillOptTrainOptimizerRequest{
+		SkillUpdateMode:              config.Optimizer.SkillUpdateMode,
+		OptimizerViews:               config.Optimizer.OptimizerViews,
+		OptimizerViewsSet:            config.Optimizer.OptimizerViews > 0,
+		RetryOptimizerViews:          config.Optimizer.RetryOptimizerViews,
+		RetryOptimizerViewsSet:       strings.TrimSpace(config.Optimizer.RetryOptimizerViews) != "",
+		NoopRetryBudget:              trainInitConfigInt(config.Optimizer.NoopRetryBudget),
+		NoopRetryBudgetSet:           config.Optimizer.NoopRetryBudget != nil,
+		GateRejectRetryBudget:        trainInitConfigInt(config.Optimizer.GateRejectRetryBudget),
+		GateRejectRetryBudgetSet:     config.Optimizer.GateRejectRetryBudget != nil,
+		WrongArtifactRetryBudget:     trainInitConfigInt(config.Optimizer.WrongArtifactRetryBudget),
+		WrongArtifactRetryBudgetSet:  config.Optimizer.WrongArtifactRetryBudget != nil,
+		TargetArtifactRetryBudget:    trainInitConfigInt(config.Optimizer.TargetArtifactRetryBudget),
+		TargetArtifactRetryBudgetSet: config.Optimizer.TargetArtifactRetryBudget != nil,
+		HardFailureRetryBudget:       trainInitConfigInt(config.Optimizer.HardFailureRetryBudget),
+		HardFailureRetryBudgetSet:    config.Optimizer.HardFailureRetryBudget != nil,
+		FinalEval:                    config.FinalEvaluatorEnabled,
+	}
+	optimizerBackend := strings.TrimSpace(config.Optimizer.OptimizerBackend)
+	targetBackend := strings.TrimSpace(config.Optimizer.TargetBackend)
+	evaluatorBackend := strings.TrimSpace(config.Optimizer.EvaluatorBackend)
+	internalTargetAdapter := strings.TrimSpace(config.Optimizer.InternalTargetAdapter)
+	if strings.EqualFold(optimizerBackend, "codex") && strings.EqualFold(targetBackend, "codex") && strings.EqualFold(evaluatorBackend, "codex") && strings.EqualFold(internalTargetAdapter, "codex_exec") {
+		request.Backend = "codex"
+	} else {
+		request.OptimizerBackend = optimizerBackend
+		request.TargetBackend = skillOptTrainTargetBackendFromInitConfig(targetBackend, internalTargetAdapter)
+		request.EvaluatorBackend = evaluatorBackend
+	}
+	return request
+}
+
+func skillOptTrainTargetBackendFromInitConfig(targetBackend string, internalTargetAdapter string) string {
+	targetBackend = strings.TrimSpace(targetBackend)
+	internalTargetAdapter = strings.TrimSpace(internalTargetAdapter)
+	if strings.EqualFold(targetBackend, "codex") && strings.EqualFold(internalTargetAdapter, "codex_exec") {
+		return "codex_exec"
+	}
+	return firstNonEmpty(targetBackend, internalTargetAdapter)
+}
+
+func trainInitConfigInt(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
 type skillOptTrainStartPlan struct {
 	Session   db.SkillOptTrainSession
 	Iteration db.SkillOptTrainIteration
@@ -343,7 +747,7 @@ type skillOptTrainStartPlan struct {
 	Summary   skillopt.TrainStatusSummary
 }
 
-func buildSkillOptTrainStartPlan(template db.AgentTemplate, repo string, workspaceRepo string, previewPolicy skillopt.TrainPreviewPolicy, sessionID string, request string, taskKind string, mode string, explorationLevel string, optionsCount int, preferredGate string, itemPlans []skillOptTrainItemPlan, warnings []string) skillOptTrainStartPlan {
+func buildSkillOptTrainStartPlan(template db.AgentTemplate, repo string, workspaceRepo string, previewPolicy skillopt.TrainPreviewPolicy, sessionID string, request string, taskKind string, mode string, explorationLevel string, optionsCount int, preferredGate string, itemPlans []skillOptTrainItemPlan, warnings []string, configDefaults skillOptTrainStartConfigDefaults) skillOptTrainStartPlan {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		sessionID = generatedSkillOptTrainSessionID(template.ID)
@@ -352,7 +756,7 @@ func buildSkillOptTrainStartPlan(template db.AgentTemplate, repo string, workspa
 	if workspaceRepo != "" {
 		state = skillopt.TrainStateItemsReady
 	}
-	metadata := skillOptTrainStartMetadata(request, mode, explorationLevel, optionsCount, preferredGate, itemPlans, warnings, previewPolicy)
+	metadata := skillOptTrainStartMetadata(request, mode, explorationLevel, optionsCount, preferredGate, itemPlans, warnings, previewPolicy, configDefaults)
 	session := db.SkillOptTrainSession{
 		ID:                sessionID,
 		TemplateID:        template.ID,
@@ -820,6 +1224,7 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 				HardFailureRetryBudgetSet:    setFlags["hard-failure-retry-budget"],
 				FeedbackDirectMode:           strings.TrimSpace(strings.ToLower(*feedbackDirectMode)),
 				FinalEval:                    *finalEval,
+				FinalEvalSet:                 setFlags["final-eval"],
 				Gate:                         *gate,
 				OutRoot:                      *outRoot,
 				Timeout:                      *timeout,
@@ -919,6 +1324,7 @@ type skillOptTrainOptimizerRequest struct {
 	HardFailureRetryBudgetSet    bool
 	FeedbackDirectMode           string
 	FinalEval                    bool
+	FinalEvalSet                 bool
 	Gate                         string
 	OutRoot                      string
 	Timeout                      string
@@ -937,6 +1343,10 @@ type skillOptTrainContinueOutput struct {
 func continueSkillOptTrain(ctx context.Context, paths config.Paths, store *db.Store, request skillOptTrainContinueRequest) (skillOptTrainContinueOutput, error) {
 	session, iteration, counts, err := loadSkillOptTrainStatus(ctx, store, request.SessionID)
 	if err != nil {
+		return skillOptTrainContinueOutput{}, err
+	}
+	applySkillOptTrainOptimizerDefaultsFromMetadata(session.MetadataJSON, &request.Optimizer)
+	if err := validateSkillOptTrainOptimizerRequestAfterDefaults(&request.Optimizer); err != nil {
 		return skillOptTrainContinueOutput{}, err
 	}
 	summary := skillopt.BuildTrainStatusSummary(session, iteration, counts)
@@ -3677,6 +4087,7 @@ func skillOptTrainOptimizerRequestHash(request skillOptTrainOptimizerRequest) st
 		},
 		"feedback_direct_mode": strings.TrimSpace(request.FeedbackDirectMode),
 		"final_eval":           request.FinalEval,
+		"final_eval_set":       request.FinalEvalSet,
 		"gate":                 strings.TrimSpace(request.Gate),
 		"timeout":              strings.TrimSpace(request.Timeout),
 		"dry_run":              request.DryRun,
@@ -6357,7 +6768,7 @@ func generatedSkillOptTrainSessionID(templateID string) string {
 	return "train-" + strings.Trim(b.String(), "-_") + "-" + now.Format("20060102-150405") + fmt.Sprintf("-%09d", now.Nanosecond())
 }
 
-func skillOptTrainStartMetadata(request string, mode string, explorationLevel string, optionsCount int, preferredGate string, items []skillOptTrainItemPlan, warnings []string, previewPolicy skillopt.TrainPreviewPolicy) string {
+func skillOptTrainStartMetadata(request string, mode string, explorationLevel string, optionsCount int, preferredGate string, items []skillOptTrainItemPlan, warnings []string, previewPolicy skillopt.TrainPreviewPolicy, configDefaults skillOptTrainStartConfigDefaults) string {
 	lines := strings.Count(request, "\n") + 1
 	words := len(strings.Fields(request))
 	previewMetadata, reviewMetadata := previewPolicy.Metadata()
@@ -6378,11 +6789,166 @@ func skillOptTrainStartMetadata(request string, mode string, explorationLevel st
 		"review":  reviewMetadata,
 		"source":  "gitmoot skillopt train start",
 	}
+	if optimizerDefaults := skillOptTrainOptimizerDefaultsMetadata(configDefaults.Optimizer); len(optimizerDefaults) > 0 {
+		metadata["optimizer_defaults"] = optimizerDefaults
+	}
 	encoded, err := json.Marshal(metadata)
 	if err != nil {
 		return ""
 	}
 	return string(encoded)
+}
+
+func skillOptTrainOptimizerDefaultsMetadata(request skillOptTrainOptimizerRequest) map[string]any {
+	metadata := map[string]any{}
+	if value := strings.TrimSpace(request.Backend); value != "" {
+		metadata["backend"] = value
+	}
+	if value := strings.TrimSpace(request.OptimizerBackend); value != "" {
+		metadata["optimizer_backend"] = value
+	}
+	if value := strings.TrimSpace(request.TargetBackend); value != "" {
+		metadata["target_backend"] = value
+	}
+	if value := strings.TrimSpace(request.EvaluatorID); value != "" {
+		metadata["evaluator_id"] = value
+	}
+	if value := strings.TrimSpace(request.EvaluatorBackend); value != "" {
+		metadata["evaluator_backend"] = value
+	}
+	if value := strings.TrimSpace(request.SkillUpdateMode); value != "" {
+		metadata["skill_update_mode"] = value
+	}
+	if request.OptimizerViewsSet {
+		metadata["optimizer_views"] = request.OptimizerViews
+	}
+	if request.RetryOptimizerViewsSet {
+		metadata["retry_optimizer_views"] = strings.TrimSpace(request.RetryOptimizerViews)
+	}
+	if request.NoopRetryBudgetSet {
+		metadata["noop_retry_budget"] = request.NoopRetryBudget
+	}
+	if request.GateRejectRetryBudgetSet {
+		metadata["gate_reject_retry_budget"] = request.GateRejectRetryBudget
+	}
+	if request.WrongArtifactRetryBudgetSet {
+		metadata["wrong_artifact_retry_budget"] = request.WrongArtifactRetryBudget
+	}
+	if request.TargetArtifactRetryBudgetSet {
+		metadata["target_artifact_retry_budget"] = request.TargetArtifactRetryBudget
+	}
+	if request.HardFailureRetryBudgetSet {
+		metadata["hard_failure_retry_budget"] = request.HardFailureRetryBudget
+	}
+	if request.FinalEval {
+		metadata["final_eval"] = true
+	}
+	return metadata
+}
+
+func applySkillOptTrainOptimizerDefaultsFromMetadata(metadataJSON string, request *skillOptTrainOptimizerRequest) {
+	if request == nil {
+		return
+	}
+	metadata := decodedSkillOptMetadataValue(decodedSkillOptMetadata(metadataJSON)["optimizer_defaults"])
+	if len(metadata) == 0 {
+		return
+	}
+	if request.Backend == "" && request.OptimizerBackend == "" && request.TargetBackend == "" && request.EvaluatorBackend == "" {
+		request.Backend = metadataString(metadata, "backend")
+	}
+	if request.Backend == "" {
+		if request.OptimizerBackend == "" {
+			request.OptimizerBackend = metadataString(metadata, "optimizer_backend")
+		}
+		if request.TargetBackend == "" {
+			request.TargetBackend = metadataString(metadata, "target_backend")
+		}
+		if request.EvaluatorBackend == "" {
+			request.EvaluatorBackend = metadataString(metadata, "evaluator_backend")
+		}
+	}
+	if request.EvaluatorID == "" {
+		request.EvaluatorID = metadataString(metadata, "evaluator_id")
+	}
+	if request.SkillUpdateMode == "" {
+		request.SkillUpdateMode = metadataString(metadata, "skill_update_mode")
+	}
+	if !request.OptimizerViewsSet {
+		if value, ok := metadataInt(metadata, "optimizer_views"); ok {
+			request.OptimizerViews = value
+			request.OptimizerViewsSet = true
+		}
+	}
+	if !request.RetryOptimizerViewsSet {
+		if value := metadataString(metadata, "retry_optimizer_views"); value != "" {
+			request.RetryOptimizerViews = value
+			request.RetryOptimizerViewsSet = true
+		}
+	}
+	if !request.NoopRetryBudgetSet {
+		if value, ok := metadataInt(metadata, "noop_retry_budget"); ok {
+			request.NoopRetryBudget = value
+			request.NoopRetryBudgetSet = true
+		}
+	}
+	if !request.GateRejectRetryBudgetSet {
+		if value, ok := metadataInt(metadata, "gate_reject_retry_budget"); ok {
+			request.GateRejectRetryBudget = value
+			request.GateRejectRetryBudgetSet = true
+		}
+	}
+	if !request.WrongArtifactRetryBudgetSet {
+		if value, ok := metadataInt(metadata, "wrong_artifact_retry_budget"); ok {
+			request.WrongArtifactRetryBudget = value
+			request.WrongArtifactRetryBudgetSet = true
+		}
+	}
+	if !request.TargetArtifactRetryBudgetSet {
+		if value, ok := metadataInt(metadata, "target_artifact_retry_budget"); ok {
+			request.TargetArtifactRetryBudget = value
+			request.TargetArtifactRetryBudgetSet = true
+		}
+	}
+	if !request.HardFailureRetryBudgetSet {
+		if value, ok := metadataInt(metadata, "hard_failure_retry_budget"); ok {
+			request.HardFailureRetryBudget = value
+			request.HardFailureRetryBudgetSet = true
+		}
+	}
+	if !request.FinalEvalSet {
+		request.FinalEval = metadataBool(metadata, "final_eval")
+	}
+}
+
+func validateSkillOptTrainOptimizerRequestAfterDefaults(request *skillOptTrainOptimizerRequest) error {
+	if request == nil {
+		return nil
+	}
+	if request.OptimizerViewsSet && request.OptimizerViews <= 0 {
+		return errors.New("--optimizer-views must be greater than zero")
+	}
+	if request.RetryOptimizerViewsSet {
+		normalized, err := normalizeSkillOptRetryOptimizerViews(request.RetryOptimizerViews)
+		if err != nil {
+			return err
+		}
+		request.RetryOptimizerViews = normalized
+		if request.OptimizerViewsSet {
+			if retryViews, ok := parseSkillOptRetryOptimizerViewsNumber(normalized); ok && retryViews > request.OptimizerViews {
+				return errors.New("--retry-optimizer-views cannot exceed --optimizer-views")
+			}
+		}
+	}
+	return nil
+}
+
+func metadataInt(metadata map[string]any, key string) (int, bool) {
+	value := metadataFloatPtr(metadata, key)
+	if value == nil {
+		return 0, false
+	}
+	return int(*value), true
 }
 
 func skillOptMetadataString(metadataJSON string, path ...string) string {
@@ -7277,7 +7843,9 @@ func addSkillOptTrainOptimizerConfigMetadata(metadata map[string]any, request sk
 	if mode := strings.TrimSpace(request.FeedbackDirectMode); mode != "" {
 		metadata["feedback_direct_mode"] = mode
 	}
-	if request.FinalEval {
+	if request.FinalEvalSet {
+		metadata["final_eval"] = request.FinalEval
+	} else if request.FinalEval {
 		metadata["final_eval"] = true
 	}
 	if request.OptimizerViewsSet {
