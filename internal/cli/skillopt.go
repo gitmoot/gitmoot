@@ -83,6 +83,7 @@ func printSkillOptUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id> [--reviewer name]")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)")
+	fmt.Fprintln(w, "  gitmoot skillopt train init templates --json")
 	fmt.Fprintln(w, "  gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file path [--yes]")
 	fmt.Fprintln(w, "  gitmoot skillopt train status --session <id>")
 	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--backend codex] [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--model name] [--optimizer-model name] [--target-model name] [--optimizer-backend name] [--target-backend name] [--evaluator-id id] [--evaluator-model name] [--evaluator-backend name] [--skill-update-mode mode] [--num-epochs N] [--batch-size N] [--optimizer-views N] [--retry-optimizer-views auto|inherit|N] [--gate hard|soft|mixed] [--out-root path] [--timeout duration] [--dry-run] [--rerun-optimizer] [--promote version|--reject version --reason text] [--start-next]")
@@ -96,6 +97,8 @@ func runSkillOptTrain(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	switch args[0] {
+	case "init":
+		return runSkillOptTrainInit(args[1:], stdout, stderr)
 	case "start":
 		return runSkillOptTrainStart(args[1:], stdout, stderr)
 	case "status":
@@ -115,11 +118,62 @@ func runSkillOptTrain(args []string, stdout, stderr io.Writer) int {
 
 func printSkillOptTrainUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  gitmoot skillopt train init templates --json")
 	fmt.Fprintln(w, "  gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file path [--session <id>] [--workspace-repo owner/repo] [--preview-repo owner/repo] [--preview-mode none|optional|required] [--preview-renderer none|vue-vite] [--preview-publisher none|github-pages] [--preview-route-template template] [--request-file path] [--task-kind kind] [--mode explore|refine|distill|validate] [--exploration-level high|medium|low] [--options N] [--min-items N] [--preferred-gate hard|soft|hard_then_soft] [--dry-run] [--yes]")
 	fmt.Fprintln(w, "  gitmoot skillopt train status --session <id>")
 	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--backend codex] [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--model name] [--optimizer-model name] [--target-model name] [--optimizer-backend name] [--target-backend name] [--evaluator-id id] [--evaluator-model name] [--evaluator-backend name] [--skill-update-mode mode] [--num-epochs N] [--batch-size N] [--optimizer-views N] [--retry-optimizer-views auto|inherit|N] [--gate hard|soft|mixed] [--out-root path] [--timeout duration] [--dry-run] [--rerun-optimizer] [--promote version|--reject version --reason text] [--start-next]")
 	fmt.Fprintln(w, "  gitmoot skillopt train recover --session <id> [--out-root path]")
 	fmt.Fprintln(w, "  gitmoot skillopt train stop --session <id> --reason <text>")
+}
+
+func runSkillOptTrainInit(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		printSkillOptTrainInitUsage(stdout)
+		return 0
+	}
+	switch args[0] {
+	case "templates":
+		return runSkillOptTrainInitTemplates(args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "unknown skillopt train init command %q\n\n", args[0])
+		printSkillOptTrainInitUsage(stderr)
+		return 2
+	}
+}
+
+func printSkillOptTrainInitUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  gitmoot skillopt train init templates --json")
+}
+
+func runSkillOptTrainInitTemplates(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("skillopt train init templates", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	jsonOutput := fs.Bool("json", false, "write template choices as JSON")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "skillopt train init templates does not accept positional arguments")
+		return 2
+	}
+	if !*jsonOutput {
+		fmt.Fprintln(stderr, "skillopt train init templates requires --json")
+		return 2
+	}
+	return withStoreExit(*home, stderr, "list skillopt train init templates", func(store *db.Store) error {
+		choices, err := skillopt.ListTrainInitTemplateChoices(context.Background(), store)
+		if err != nil {
+			return err
+		}
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(choices)
+	})
 }
 
 func runSkillOptTrainStart(args []string, stdout, stderr io.Writer) int {
