@@ -15,6 +15,8 @@ import (
 
 const (
 	checkoutMutationLockTTL     = 30 * time.Minute
+	checkoutMutationWaitTimeout = 2 * time.Minute
+	checkoutMutationWaitBackoff = 100 * time.Millisecond
 	checkoutMutationBusyMessage = "This checkout is already being mutated by another Gitmoot task. Run tasks sequentially or enable per-task worktrees for parallel implementation."
 )
 
@@ -50,6 +52,58 @@ func acquireCheckoutMutationLock(ctx context.Context, store *db.Store, checkoutP
 		_, err := store.ReleaseResourceLock(releaseCtx, key, ownerID, token)
 		return err
 	}, key, nil
+}
+
+func acquireCheckoutMutationLockWithWait(ctx context.Context, store *db.Store, checkoutPath string, ownerID string, now time.Time) (func(context.Context) error, string, error) {
+	return acquireCheckoutMutationLockWithWaitBudget(ctx, store, checkoutPath, ownerID, now, checkoutMutationWaitTimeout, checkoutMutationWaitBackoff)
+}
+
+func acquireCheckoutMutationLockWithWaitBudget(ctx context.Context, store *db.Store, checkoutPath string, ownerID string, now time.Time, waitBudget time.Duration, backoff time.Duration) (func(context.Context) error, string, error) {
+	release, key, err := acquireCheckoutMutationLock(ctx, store, checkoutPath, ownerID, now)
+	if err == nil {
+		return release, key, nil
+	}
+	var blocked BlockedError
+	if !errors.As(err, &blocked) || waitBudget <= 0 {
+		return nil, key, err
+	}
+	if backoff <= 0 {
+		backoff = checkoutMutationWaitBackoff
+	}
+	deadline := now.UTC().Add(waitBudget)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, key, checkoutMutationWaitExpired(waitBudget)
+		}
+		sleepFor := backoff
+		if remaining < sleepFor {
+			sleepFor = remaining
+		}
+		timer := time.NewTimer(sleepFor)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil, key, ctx.Err()
+		case <-timer.C:
+		}
+		release, key, err = acquireCheckoutMutationLock(ctx, store, checkoutPath, ownerID, time.Now().UTC())
+		if err == nil {
+			return release, key, nil
+		}
+		if !errors.As(err, &blocked) {
+			return nil, key, err
+		}
+	}
+}
+
+func checkoutMutationWaitExpired(waitBudget time.Duration) BlockedError {
+	return BlockedError{Reason: fmt.Sprintf("%s Waited up to %s for the checkout mutation lock.", checkoutMutationBusyMessage, waitBudget.Round(time.Second))}
 }
 
 func checkoutMutationLockKey(checkoutPath string) (string, error) {

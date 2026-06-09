@@ -105,7 +105,7 @@ func TestEngineAllocateTaskWorktreeAddsGitWorktreeAndStoresPath(t *testing.T) {
 	}
 }
 
-func TestEngineAllocateTaskWorktreeBlocksWhenCheckoutMutationLocked(t *testing.T) {
+func TestEngineAllocateTaskWorktreeWaitsForCheckoutMutationLock(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	engine := testEngine(store)
@@ -124,8 +124,14 @@ func TestEngineAllocateTaskWorktreeBlocksWhenCheckoutMutationLocked(t *testing.T
 		t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
 	}
 	manager := &fakeWorktreeManager{}
+	released := make(chan struct{})
+	go func() {
+		defer close(released)
+		time.Sleep(20 * time.Millisecond)
+		_, _ = store.ReleaseResourceLock(context.Background(), key, "task:other", "other-token")
+	}()
 
-	_, err = engine.AllocateTaskWorktree(ctx, TaskWorktreeRequest{
+	task, err := engine.AllocateTaskWorktree(ctx, TaskWorktreeRequest{
 		Home:     home,
 		Repo:     "owner/repo",
 		TaskID:   "task-1",
@@ -134,12 +140,40 @@ func TestEngineAllocateTaskWorktreeBlocksWhenCheckoutMutationLocked(t *testing.T
 		Checkout: checkout,
 	}, manager)
 
-	var blocked BlockedError
-	if !errors.As(err, &blocked) || blocked.Reason != checkoutMutationBusyMessage {
-		t.Fatalf("error = %v, want checkout busy BlockedError", err)
+	if err != nil {
+		t.Fatalf("AllocateTaskWorktree returned error: %v", err)
 	}
-	if len(manager.calls) != 0 {
-		t.Fatalf("AddWorktree ran despite checkout lock: %+v", manager.calls)
+	<-released
+	if task.WorktreePath == "" {
+		t.Fatalf("task worktree path is empty: %+v", task)
+	}
+	if len(manager.calls) != 1 {
+		t.Fatalf("AddWorktree calls = %+v, want one call after checkout lock release", manager.calls)
+	}
+}
+
+func TestAcquireCheckoutMutationLockWithWaitBudgetTimesOutWhenLocked(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	checkout := t.TempDir()
+	key, err := checkoutMutationLockKey(checkout)
+	if err != nil {
+		t.Fatalf("checkoutMutationLockKey returned error: %v", err)
+	}
+	if acquired, err := store.AcquireResourceLock(context.Background(), db.ResourceLock{
+		ResourceKey: key,
+		OwnerJobID:  "task:other",
+		OwnerToken:  "other-token",
+		ExpiresAt:   time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano),
+	}, time.Now().UTC()); err != nil || !acquired {
+		t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
+	}
+
+	_, _, err = acquireCheckoutMutationLockWithWaitBudget(ctx, store, checkout, "worktree:task-1", time.Now().UTC(), 20*time.Millisecond, 5*time.Millisecond)
+
+	var blocked BlockedError
+	if !errors.As(err, &blocked) || !strings.Contains(blocked.Reason, "Waited up to") {
+		t.Fatalf("error = %v, want checkout wait timeout BlockedError", err)
 	}
 }
 

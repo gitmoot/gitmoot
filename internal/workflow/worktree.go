@@ -97,7 +97,7 @@ func (e Engine) AllocateTaskWorktree(ctx context.Context, request TaskWorktreeRe
 		}
 		return task, nil
 	}
-	releaseCheckoutLock, _, err := acquireCheckoutMutationLock(ctx, e.Store, request.Checkout, "worktree:"+request.TaskID, time.Now().UTC())
+	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(ctx, e.Store, request.Checkout, "worktree:"+request.TaskID, time.Now().UTC())
 	if err != nil {
 		if createdLock {
 			_, _ = e.Store.ReleaseLock(ctx, lock)
