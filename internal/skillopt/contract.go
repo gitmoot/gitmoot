@@ -847,7 +847,7 @@ func storeCandidateArtifactBlobs(blobStore artifact.Store, preparedArtifacts []p
 }
 
 func templateSnapshot(template db.AgentTemplate) (TemplateSnapshot, error) {
-	metadata, err := agenttemplate.UnmarshalMetadata(template.MetadataJSON)
+	metadata, err := templateMetadataOrSynthesized(template)
 	if err != nil {
 		return TemplateSnapshot{}, err
 	}
@@ -864,6 +864,50 @@ func templateSnapshot(template db.AgentTemplate) (TemplateSnapshot, error) {
 		Metadata:       metadata,
 		Content:        template.Content,
 	}, nil
+}
+
+// templateMetadataOrSynthesized parses the template's stored metadata, or —
+// for legacy rows installed before frontmatter became mandatory at install
+// time and therefore carrying an empty metadata_json — synthesizes a minimal
+// valid record from the row itself so training does not dead-end. Non-empty
+// but invalid metadata still fails loudly.
+func templateMetadataOrSynthesized(template db.AgentTemplate) (agenttemplate.Metadata, error) {
+	if strings.TrimSpace(template.MetadataJSON) != "" {
+		return agenttemplate.UnmarshalMetadata(template.MetadataJSON)
+	}
+	// Prefer frontmatter embedded in the content (mirrors the cached-template
+	// fallbacks in agent_template.go and train_init_templates.go), so the
+	// exported metadata cannot contradict the content's own frontmatter.
+	if parsed, err := agenttemplate.ParseTemplateContent(template.Content); err == nil {
+		return parsed.Metadata, nil
+	}
+	name := strings.TrimSpace(template.Name)
+	if name == "" {
+		name = template.ID
+	}
+	description := strings.TrimSpace(template.Description)
+	if description == "" {
+		description = "Agent template " + template.ID
+	}
+	minimal := agenttemplate.Metadata{
+		ID:                   template.ID,
+		Name:                 name,
+		Description:          description,
+		Kind:                 agenttemplate.TemplateKind,
+		Version:              agenttemplate.TemplateVersion,
+		Capabilities:         []string{"ask"},
+		RuntimeCompatibility: []string{"codex", "claude"},
+		Tags:                 []string{"agent-template"},
+		Inputs:               []string{"repo", "task"},
+		Outputs:              []string{"response"},
+	}
+	// Round-trip through the canonical encoder so the synthesized record is
+	// validated and normalized exactly like stored metadata.
+	encoded, err := agenttemplate.MarshalMetadata(minimal)
+	if err != nil {
+		return agenttemplate.Metadata{}, fmt.Errorf("synthesize metadata for template %s: %w", template.ID, err)
+	}
+	return agenttemplate.UnmarshalMetadata(encoded)
 }
 
 func evalItem(item db.EvalReviewItem, options []EvalReviewOption) (EvalItem, error) {

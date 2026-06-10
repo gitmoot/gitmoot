@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1127,4 +1128,66 @@ func testTemplateContent(id string, body string) string {
 		Inputs:               []string{"task"},
 		Outputs:              []string{"plan"},
 	}, "# Planner\n\n"+body+"\n")
+}
+
+func TestTemplateMetadataSynthesizedForLegacyEmptyRows(t *testing.T) {
+	// Templates installed before frontmatter became mandatory carry an empty
+	// metadata_json; export must synthesize a valid record instead of
+	// dead-ending the training run.
+	template := db.AgentTemplate{
+		ID:          "legacy-template",
+		Name:        "Legacy Template",
+		Description: "Installed before metadata was mandatory.",
+		Content:     "# Legacy Template\n\nDo the work.",
+	}
+	snapshot, err := templateSnapshot(template)
+	if err != nil {
+		t.Fatalf("templateSnapshot: %v", err)
+	}
+	meta := snapshot.Metadata
+	if meta.ID != "legacy-template" || meta.Name != "Legacy Template" {
+		t.Fatalf("synthesized identity wrong: %+v", meta)
+	}
+	// Pin the exact synthesized values: the Python-side candidate validation
+	// compares these against the candidate frontmatter, so drift breaks the
+	// cross-repo contract.
+	if len(meta.Capabilities) != 1 || meta.Capabilities[0] != "ask" {
+		t.Fatalf("capabilities = %v, want [ask]", meta.Capabilities)
+	}
+	if len(meta.RuntimeCompatibility) != 2 || meta.RuntimeCompatibility[0] != "codex" || meta.RuntimeCompatibility[1] != "claude" {
+		t.Fatalf("runtime_compatibility = %v", meta.RuntimeCompatibility)
+	}
+	if meta.Kind != agenttemplate.TemplateKind || meta.Version != agenttemplate.TemplateVersion {
+		t.Fatalf("kind/version = %q/%d", meta.Kind, meta.Version)
+	}
+	if len(meta.Tags) == 0 || len(meta.Inputs) == 0 || len(meta.Outputs) == 0 {
+		t.Fatalf("synthesized metadata incomplete: %+v", meta)
+	}
+	// Content frontmatter beats synthesis: a legacy row whose CONTENT carries
+	// frontmatter must export that, never the generic defaults.
+	withFM := testTemplate("with-fm", "Body.")
+	withFM.MetadataJSON = ""
+	fmSnapshot, err := templateSnapshot(withFM)
+	if err != nil {
+		t.Fatalf("templateSnapshot with frontmatter content: %v", err)
+	}
+	parsed, err := agenttemplate.ParseTemplateContent(withFM.Content)
+	if err != nil {
+		t.Fatalf("ParseTemplateContent: %v", err)
+	}
+	if !reflect.DeepEqual(fmSnapshot.Metadata, parsed.Metadata) {
+		t.Fatalf("content frontmatter not preferred:\ngot  %+v\nwant %+v", fmSnapshot.Metadata, parsed.Metadata)
+	}
+	// Name/description fall back when the row is bare.
+	bare, err := templateSnapshot(db.AgentTemplate{ID: "bare"})
+	if err != nil {
+		t.Fatalf("templateSnapshot bare: %v", err)
+	}
+	if bare.Metadata.Name != "bare" || bare.Metadata.Description == "" {
+		t.Fatalf("bare fallbacks wrong: %+v", bare.Metadata)
+	}
+	// Non-empty but corrupt metadata still fails loudly.
+	if _, err := templateSnapshot(db.AgentTemplate{ID: "corrupt", MetadataJSON: "{not json"}); err == nil {
+		t.Fatal("corrupt metadata must still error")
+	}
 }
