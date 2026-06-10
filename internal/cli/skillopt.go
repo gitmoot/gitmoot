@@ -1154,6 +1154,7 @@ func runSkillOptTrainStart(args []string, stdout, stderr io.Writer) int {
 	minItems := fs.Int("min-items", 2, "minimum number of training review items")
 	preferredGate := fs.String("preferred-gate", "", "evaluation gate: hard, soft, or hard_then_soft")
 	dryRun := fs.Bool("dry-run", false, "print inferred session state without writing")
+	createRepos := fs.Bool("create-repos", false, "create the target and workspace repositories on GitHub if they do not exist")
 	yes := fs.Bool("yes", false, "confirm creation without an interactive prompt")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -1197,6 +1198,14 @@ func runSkillOptTrainStart(args []string, stdout, stderr io.Writer) int {
 	if workspaceRepo == "" {
 		fmt.Fprintln(stderr, "skillopt train start requires --workspace-repo owner/repo; without it the session stays at request_confirmed and train continue cannot reach option generation")
 		return 2
+	}
+	if *createRepos {
+		for _, fullName := range []string{repo.FullName(), workspaceRepo} {
+			if err := ensureSkillOptTrainRepo(fullName, stdout); err != nil {
+				fmt.Fprintf(stderr, "skillopt train start: create repo %s: %v\n", fullName, err)
+				return 1
+			}
+		}
 	}
 	previewRepo, err := parseOptionalSkillOptTrainRepo("preview-repo", *previewRepoFlag)
 	if err != nil {
@@ -1301,6 +1310,34 @@ func runSkillOptTrainStart(args []string, stdout, stderr io.Writer) int {
 	}
 	writeLine(stdout, "created train session %s", plan.Session.ID)
 	return 0
+}
+
+// ensureSkillOptTrainRepo creates the given repo as a private GitHub repo when it
+// does not already exist. Deduplicated callers pass distinct names; an empty name
+// is a no-op. An ambiguous existence check (e.g. auth error) is left alone so the
+// later Preflight surfaces it, rather than wrongly attempting a create.
+func ensureSkillOptTrainRepo(fullName string, stdout io.Writer) error {
+	if strings.TrimSpace(fullName) == "" {
+		return nil
+	}
+	repo, err := daemon.ParseRepository(fullName)
+	if err != nil {
+		return err
+	}
+	client := newSkillOptGitHubClient()
+	exists, err := client.RepositoryExists(context.Background(), repo)
+	if err != nil {
+		// Ambiguous (auth/network); do not attempt a create, let Preflight report.
+		return nil
+	}
+	if exists {
+		return nil
+	}
+	if err := client.CreateRepository(context.Background(), repo, true); err != nil {
+		return err
+	}
+	writeLine(stdout, "created_repo: %s", fullName)
+	return nil
 }
 
 func flagNamesSet(fs *flag.FlagSet) map[string]struct{} {

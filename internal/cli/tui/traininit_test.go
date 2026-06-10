@@ -223,6 +223,80 @@ func TestTrainInitAutoAcceptWhenExternallyAnswered(t *testing.T) {
 	}
 }
 
+func TestTrainInitRepoCreateFlow(t *testing.T) {
+	created := ""
+	fields := []Field{
+		{Name: "review_repo", Label: "Review repository", Kind: FieldText, Prompt: db.InteractivePrompt{ID: "ti.review_repo"},
+			CheckRepo:  func(value string) (bool, error) { return true, nil }, // always missing
+			CreateRepo: func(value string) error { created = value; return nil }},
+		{Name: "name", Label: "Name", Kind: FieldText, Prompt: db.InteractivePrompt{ID: "ti.name"}},
+	}
+	m := startTI(t, newFakeStore(), fields)
+
+	// Type a repo and submit → repo check runs.
+	next, _ := m.Update(key("owner/repo"))
+	m = next.(TrainInitModel)
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(TrainInitModel)
+	if m.state != tiRepoCheck || cmd == nil {
+		t.Fatalf("enter should start a repo check, state=%v", m.state)
+	}
+	next, _ = m.Update(cmd()) // repoCheckMsg{missing:true}
+	m = next.(TrainInitModel)
+	if m.state != tiRepoMissing {
+		t.Fatalf("missing repo should offer creation, state=%v", m.state)
+	}
+	if !strings.Contains(m.View(), "does not exist") {
+		t.Fatalf("expected the missing-repo prompt:\n%s", m.View())
+	}
+
+	// c creates the repo, then advances to the next field.
+	next, cmd = m.Update(key("c"))
+	m = next.(TrainInitModel)
+	if cmd == nil {
+		t.Fatal("c should run create")
+	}
+	next, _ = m.Update(cmd()) // repoCreatedMsg
+	m = next.(TrainInitModel)
+	if created != "owner/repo" {
+		t.Fatalf("CreateRepo called with %q", created)
+	}
+	if m.Result().Values["review_repo"] != "owner/repo" || m.idx != 1 {
+		t.Fatalf("should record the repo and advance: values=%+v idx=%d", m.Result().Values, m.idx)
+	}
+}
+
+func TestTrainInitRepoReEnter(t *testing.T) {
+	createCalls := 0
+	fields := []Field{
+		{Name: "review_repo", Label: "Review repository", Kind: FieldText, Prompt: db.InteractivePrompt{ID: "ti.review_repo"},
+			CheckRepo:  func(value string) (bool, error) { return true, nil },
+			CreateRepo: func(value string) error { createCalls++; return nil }},
+	}
+	m := startTI(t, newFakeStore(), fields)
+	next, _ := m.Update(key("owner/typo"))
+	m = next.(TrainInitModel)
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(TrainInitModel)
+	next, _ = m.Update(cmd())
+	m = next.(TrainInitModel)
+	if m.state != tiRepoMissing {
+		t.Fatalf("expected tiRepoMissing, got %v", m.state)
+	}
+	// e re-enters the field with the value prefilled; no create.
+	next, _ = m.Update(key("e"))
+	m = next.(TrainInitModel)
+	if m.state != tiField {
+		t.Fatalf("e should return to the field, state=%v", m.state)
+	}
+	if !strings.Contains(m.input.Value(), "owner/typo") {
+		t.Fatalf("re-enter should prefill the value, got %q", m.input.Value())
+	}
+	if createCalls != 0 {
+		t.Fatal("re-enter must not create")
+	}
+}
+
 func TestTrainInitProgressHeader(t *testing.T) {
 	m := startTI(t, newFakeStore(), tiFields())
 	if !strings.Contains(m.View(), "[1/3]") {

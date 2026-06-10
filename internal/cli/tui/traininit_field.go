@@ -34,6 +34,11 @@ type Field struct {
 	Prompt  db.InteractivePrompt // record upserted so an agent can answer externally
 	Choices []Choice             // for FieldChoice/FieldTemplate
 	Default string               // text prefill / preselected choice value
+
+	// CheckRepo / CreateRepo, when set on a FieldText, gate advancing on the
+	// answer being an existing GitHub repo; a missing repo offers creation.
+	CheckRepo  func(value string) (missing bool, err error)
+	CreateRepo func(value string) error
 }
 
 // PromptStore is the subset of *db.Store the form needs to publish a prompt

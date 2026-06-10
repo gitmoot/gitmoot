@@ -14,9 +14,31 @@ func (m TrainInitModel) View() string {
 		return ""
 	case tiCustomPath:
 		return m.customPathView()
+	case tiRepoCheck:
+		return m.repoCheckView()
+	case tiRepoMissing:
+		return m.repoMissingView()
 	default:
 		return m.fieldView()
 	}
+}
+
+func (m TrainInitModel) repoCheckView() string {
+	return headerStyle.Render(m.fields[m.idx].Label) + "\n\n" +
+		mutedStyle.Render("checking "+m.pendingValue+" on GitHub…")
+}
+
+func (m TrainInitModel) repoMissingView() string {
+	var b strings.Builder
+	b.WriteString(headerStyle.Render(m.fields[m.idx].Label))
+	b.WriteString("\n\n")
+	b.WriteString("repo " + m.pendingValue + " does not exist on GitHub\n")
+	if m.inlineErr != "" {
+		b.WriteString(errorStyle.Render(m.inlineErr) + "\n")
+	}
+	b.WriteString("\n")
+	b.WriteString(mutedStyle.Render("c create private repo  e re-enter  esc re-enter"))
+	return b.String()
 }
 
 func (m TrainInitModel) fieldView() string {

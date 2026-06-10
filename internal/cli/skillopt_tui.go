@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/jerryfane/gitmoot/internal/cli/tui"
+	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/skillopt"
 )
@@ -98,12 +99,43 @@ func buildSkillOptTrainInitTUIFields(store *db.Store, scope string, values skill
 			for _, choice := range descriptor.Prompt.Choices {
 				entry.Choices = append(entry.Choices, tui.Choice{Value: choice, Label: choice})
 			}
+		case field == "review_repo":
+			entry.Kind = tui.FieldText
+			entry.CheckRepo = skillOptTrainRepoChecker()
+			entry.CreateRepo = skillOptTrainRepoCreator()
 		default:
 			entry.Kind = tui.FieldText
 		}
 		fields = append(fields, entry)
 	}
 	return fields, nil
+}
+
+// skillOptTrainRepoChecker reports whether a "owner/repo" value is missing on
+// GitHub. An unparseable value or an ambiguous (auth/network) check returns the
+// error so the form re-asks rather than offering a create.
+func skillOptTrainRepoChecker() func(string) (bool, error) {
+	return func(value string) (bool, error) {
+		repo, err := daemon.ParseRepository(value)
+		if err != nil {
+			return false, err
+		}
+		exists, err := newSkillOptGitHubClient().RepositoryExists(context.Background(), repo)
+		if err != nil {
+			return false, err
+		}
+		return !exists, nil
+	}
+}
+
+func skillOptTrainRepoCreator() func(string) error {
+	return func(value string) error {
+		repo, err := daemon.ParseRepository(value)
+		if err != nil {
+			return err
+		}
+		return newSkillOptGitHubClient().CreateRepository(context.Background(), repo, true)
+	}
 }
 
 // skillOptTrainInitTUISummaryRows renders the confirm-screen rows: each field's

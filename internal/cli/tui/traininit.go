@@ -15,6 +15,8 @@ type tiState int
 const (
 	tiField tiState = iota
 	tiCustomPath
+	tiRepoCheck
+	tiRepoMissing
 	tiConfirm
 	tiDone
 )
@@ -46,6 +48,10 @@ type TrainInitModel struct {
 
 	pendingPromptID string
 	aborted         bool
+
+	// pendingValue holds a validated free-text answer awaiting a repo
+	// existence check / creation decision (tiRepoCheck / tiRepoMissing).
+	pendingValue string
 }
 
 // NewTrainInit builds the form. summary renders the confirm-screen rows from the
@@ -106,8 +112,52 @@ func (m TrainInitModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Not answered yet (or the record is not visible yet) — keep polling.
 		return m, pollTick(m.poll, m.gen)
+	case repoCheckMsg:
+		if msg.gen != m.gen || m.state != tiRepoCheck {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.state = tiField
+			m.inlineErr = "repo check failed: " + msg.err.Error()
+			return m, nil
+		}
+		if !msg.missing {
+			return m.commit(msg.value)
+		}
+		m.state = tiRepoMissing
+		return m, nil
+	case repoCreatedMsg:
+		if msg.gen != m.gen || m.state != tiRepoMissing {
+			return m, nil // the user re-entered the field before the create returned
+		}
+		if msg.err != nil {
+			m.state = tiRepoMissing
+			m.inlineErr = "create failed: " + msg.err.Error()
+			return m, nil
+		}
+		return m.commit(msg.value)
 	}
 	return m, nil
+}
+
+func checkRepoCmd(field Field, value string, gen int) tea.Cmd {
+	return func() tea.Msg {
+		if field.CheckRepo == nil {
+			return repoCheckMsg{gen: gen, value: value}
+		}
+		missing, err := field.CheckRepo(value)
+		return repoCheckMsg{gen: gen, value: value, missing: missing, err: err}
+	}
+}
+
+func createRepoCmd(field Field, value string, gen int) tea.Cmd {
+	return func() tea.Msg {
+		var err error
+		if field.CreateRepo != nil {
+			err = field.CreateRepo(value)
+		}
+		return repoCreatedMsg{gen: gen, value: value, err: err}
+	}
 }
 
 func (m TrainInitModel) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -121,6 +171,27 @@ func (m TrainInitModel) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.updateFieldKey(msg)
 	case tiCustomPath:
 		return m.updateCustomPathKey(msg)
+	case tiRepoCheck:
+		if msg.String() == "esc" {
+			return m.abort()
+		}
+		return m, nil // checking; ignore keys until the result arrives
+	case tiRepoMissing:
+		switch msg.String() {
+		case "c", "C":
+			m.inlineErr = ""
+			return m, createRepoCmd(m.fields[m.idx], m.pendingValue, m.gen)
+		case "e", "E", "esc":
+			// Re-enter the field with the value prefilled.
+			m.state = tiField
+			m.inlineErr = ""
+			ti := textinput.New()
+			ti.SetValue(m.pendingValue)
+			ti.CursorEnd()
+			m.input = ti
+			return m, m.input.Focus()
+		}
+		return m, nil
 	case tiConfirm:
 		switch msg.String() {
 		case "y", "Y", "enter":
@@ -145,6 +216,12 @@ func (m TrainInitModel) updateFieldKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if status != "ok" {
 				m.inlineErr = "value required"
 				return m, nil
+			}
+			if field.CheckRepo != nil {
+				m.pendingValue = value
+				m.state = tiRepoCheck
+				m.inlineErr = ""
+				return m, checkRepoCmd(field, value, m.gen)
 			}
 			return m.commit(value)
 		}
@@ -311,6 +388,19 @@ type pollResultMsg struct {
 }
 
 type promptGoneMsg struct{ err error }
+
+type repoCheckMsg struct {
+	gen     int
+	value   string
+	missing bool
+	err     error
+}
+
+type repoCreatedMsg struct {
+	gen   int
+	value string
+	err   error
+}
 
 func upsertPromptCmd(store PromptStore, prompt db.InteractivePrompt, gen int) tea.Cmd {
 	return func() tea.Msg {
