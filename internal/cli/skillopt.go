@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/jerryfane/gitmoot/internal/artifact"
+	"github.com/jerryfane/gitmoot/internal/cli/style"
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
@@ -595,15 +596,23 @@ func runSkillOptTrainInitWizard(home, scope string, stdin io.Reader, stdout io.W
 		}
 	}()
 
+	// task_kind and mode are defaulted before missing-field detection, so they
+	// never reach the wizard; ask the remaining missing fields in a stable order.
+	ask := make([]string, 0, len(missing))
+	for _, field := range []string{"name", "template", "review_repo", "artifact_kind", "preview", "request"} {
+		if _, ok := missingSet[field]; ok {
+			ask = append(ask, field)
+		}
+	}
+	st := style.For(stdout)
+	if len(ask) > 0 {
+		fmt.Fprintln(stdout, st.Dim("tip: answer any question from another terminal with: gitmoot interactive answer <prompt-id> <value> (ids: gitmoot interactive list)"))
+	}
+
 	stdinClosed := false
 	return withStore(home, func(store *db.Store) error {
-		// task_kind and mode are defaulted before missing-field detection, so
-		// they never reach the wizard.
-		for _, field := range []string{"name", "template", "review_repo", "artifact_kind", "preview", "request"} {
-			if _, ok := missingSet[field]; !ok {
-				continue
-			}
-			value, err := skillOptTrainInitAwaitField(store, scope, field, *values, stdout, lines, &stdinClosed)
+		for index, field := range ask {
+			value, err := skillOptTrainInitAwaitField(store, scope, field, *values, stdout, st, index+1, len(ask), lines, &stdinClosed)
 			if err != nil {
 				return err
 			}
@@ -630,7 +639,7 @@ func runSkillOptTrainInitWizard(home, scope string, stdin io.Reader, stdout io.W
 // the question, and blocks until an answer arrives on stdin or the prompt is
 // resolved externally. It returns "" (and marks stdin closed) when stdin ends
 // before the field is answered, leaving the caller to report the missing field.
-func skillOptTrainInitAwaitField(store *db.Store, scope, field string, values skillOptTrainInitInputs, stdout io.Writer, lines <-chan skillOptTrainInitWizardLine, stdinClosed *bool) (string, error) {
+func skillOptTrainInitAwaitField(store *db.Store, scope, field string, values skillOptTrainInitInputs, stdout io.Writer, st style.Style, index, total int, lines <-chan skillOptTrainInitWizardLine, stdinClosed *bool) (string, error) {
 	ctx := context.Background()
 	prompt := buildSkillOptTrainInitPrompt(scope, field, values).Prompt
 	if err := store.UpsertInteractivePrompt(ctx, prompt); err != nil {
@@ -646,11 +655,7 @@ func skillOptTrainInitAwaitField(store *db.Store, scope, field string, values sk
 			return "", err
 		}
 	}
-	render := func() {
-		skillOptTrainInitWizardRenderQuestion(stdout, field, prompt, templateChoices)
-		fmt.Fprintf(stdout, "  (or answer from another terminal: gitmoot interactive answer %s <value>)\n", prompt.ID)
-	}
-	render()
+	skillOptTrainInitWizardRenderQuestion(stdout, st, field, prompt, templateChoices, index, total)
 	if *stdinClosed {
 		// No stdin remains and waiting only on an external answer could hang, so
 		// give up and let the caller report the missing field.
@@ -686,8 +691,8 @@ func skillOptTrainInitAwaitField(store *db.Store, scope, field string, values sk
 				if *stdinClosed {
 					return "", nil
 				}
-				fmt.Fprintln(stdout, "Unrecognized answer; please try again.")
-				render()
+				// Short re-ask without reprinting the whole question/list.
+				skillOptTrainInitWizardReask(stdout, st, field, prompt, templateChoices)
 			}
 		case <-ticker.C:
 			current, err := store.GetInteractivePrompt(ctx, prompt.ID)
@@ -770,35 +775,71 @@ func skillOptTrainInitWizardInterpret(field, text string, prompt db.InteractiveP
 	return value, "ok"
 }
 
-func skillOptTrainInitWizardRenderQuestion(stdout io.Writer, field string, prompt db.InteractivePrompt, templateChoices []skillopt.TrainInitTemplateChoice) {
+// skillOptTrainInitWizardLabel is the short human-facing prompt for a field.
+// The interactive prompt RECORD keeps its own flag-hint Question text; only the
+// terminal rendering uses these labels.
+func skillOptTrainInitWizardLabel(field string) string {
+	switch field {
+	case "name":
+		return "Training name"
+	case "review_repo":
+		return "Review repository (owner/repo)"
+	case "artifact_kind":
+		return "Artifact kind (text, vue, pdf, custom)"
+	case "preview":
+		return "Preview kind"
+	case "request":
+		return "Training request"
+	default:
+		return field
+	}
+}
+
+func skillOptTrainInitWizardRenderQuestion(stdout io.Writer, st style.Style, field string, prompt db.InteractivePrompt, templateChoices []skillopt.TrainInitTemplateChoice, index, total int) {
+	progress := st.Dim(fmt.Sprintf("[%d/%d] ", index, total))
 	if field == "template" {
-		fmt.Fprintln(stdout, "Choose a template:")
+		fmt.Fprintf(stdout, "%s%s\n", progress, st.Bold("Choose a template:"))
 		for i, choice := range templateChoices {
-			fmt.Fprintf(stdout, "%d. %s\n", i+1, skillOptTrainInitTemplateChoiceLabel(choice))
+			fmt.Fprintf(stdout, "  %s %s\n", st.Dim(fmt.Sprintf("%d.", i+1)), skillOptTrainInitTemplateChoiceLabel(choice))
 		}
-		fmt.Fprintf(stdout, "%d. Custom file\n", len(templateChoices)+1)
+		fmt.Fprintf(stdout, "  %s Custom file\n", st.Dim(fmt.Sprintf("%d.", len(templateChoices)+1)))
 		fmt.Fprint(stdout, "Enter number: ")
 		return
 	}
 	if len(prompt.Choices) > 0 {
-		fmt.Fprintln(stdout, prompt.Question)
+		fmt.Fprintf(stdout, "%s%s\n", progress, st.Bold(skillOptTrainInitWizardLabel(field)+":"))
 		for i, choice := range prompt.Choices {
 			suffix := ""
 			if choice == prompt.Default {
-				suffix = " (default)"
+				suffix = st.Dim(" (default)")
 			}
-			fmt.Fprintf(stdout, "%d. %s%s\n", i+1, choice, suffix)
+			fmt.Fprintf(stdout, "  %s %s%s\n", st.Dim(fmt.Sprintf("%d.", i+1)), choice, suffix)
 		}
 		fmt.Fprint(stdout, "Enter number or value: ")
 		return
 	}
-	fmt.Fprintf(stdout, "%s ", prompt.Question)
+	fmt.Fprintf(stdout, "%s%s ", progress, st.Bold(skillOptTrainInitWizardLabel(field)+":"))
+}
+
+// skillOptTrainInitWizardReask prints a short field-aware re-prompt without
+// reprinting the question or template list.
+func skillOptTrainInitWizardReask(stdout io.Writer, st style.Style, field string, prompt db.InteractivePrompt, templateChoices []skillopt.TrainInitTemplateChoice) {
+	switch {
+	case field == "template":
+		fmt.Fprintf(stdout, "%s ", st.Yellow(fmt.Sprintf("invalid — enter 1-%d:", len(templateChoices)+1)))
+	case len(prompt.Choices) > 0:
+		fmt.Fprintf(stdout, "%s ", st.Yellow(fmt.Sprintf("invalid — enter 1-%d or a listed value:", len(prompt.Choices))))
+	default:
+		fmt.Fprintf(stdout, "%s ", st.Yellow(skillOptTrainInitWizardLabel(field)+":"))
+	}
 }
 
 func skillOptTrainInitTemplateChoiceLabel(choice skillopt.TrainInitTemplateChoice) string {
 	label := choice.ID
 	if choice.CurrentVersion != "" {
-		label += " @" + choice.CurrentVersion
+		// CurrentVersion is the full version id (e.g. "planner@v3"); strip the
+		// redundant "<id>@" prefix so the label reads "planner @v3".
+		label += " @" + strings.TrimPrefix(choice.CurrentVersion, choice.ID+"@")
 	}
 	status := choice.Source
 	if !choice.Installed {

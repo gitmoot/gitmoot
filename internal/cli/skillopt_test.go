@@ -1159,10 +1159,19 @@ func TestSkillOptTrainInitWizardCompletesFromStdin(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("wizard train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
-	for _, want := range []string{"Choose a template:", "planner", "Custom file", "Preview kind?", "gitmoot interactive answer "} {
-		if !strings.Contains(stdout.String(), want) {
-			t.Fatalf("wizard stdout missing %q:\n%s", want, stdout.String())
+	out := stdout.String()
+	for _, want := range []string{"Choose a template:", "planner", "Custom file", "Preview kind:", "[1/6]", "gitmoot interactive answer "} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("wizard stdout missing %q:\n%s", want, out)
 		}
+	}
+	// One-time tip, not a per-question hint line.
+	if strings.Count(out, "gitmoot interactive answer ") != 1 {
+		t.Fatalf("expected exactly one answer-hint tip, got %d:\n%s", strings.Count(out, "gitmoot interactive answer "), out)
+	}
+	// Version label is not doubled (would render "planner @planner@<ver>").
+	if strings.Contains(out, "planner @planner@") {
+		t.Fatalf("template version label looks doubled:\n%s", out)
 	}
 	cfg, err := skillopt.LoadTrainInitConfig(filepath.Join(workspace, ".gitmoot", "skillopt", "wizard-flow", "config.toml"))
 	if err != nil {
