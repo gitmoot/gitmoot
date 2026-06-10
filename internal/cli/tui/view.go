@@ -34,9 +34,10 @@ var (
 	headerStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("81"))
-	redStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	greenStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	cyanStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("44"))
+	redStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	greenStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	cyanStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("44"))
+	selectedRowStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
 )
 
 func renderSidebar(selected, width, height int) string {
@@ -70,6 +71,8 @@ func (m Model) content() string {
 		b.WriteString("\n\n")
 	}
 	switch pages[m.selected].page {
+	case pageAttention:
+		b.WriteString(m.attentionContent())
 	case pageAgents:
 		b.WriteString(m.agentsContent())
 	case pageSessions:
@@ -80,8 +83,22 @@ func (m Model) content() string {
 		b.WriteString(m.locksContent())
 	}
 	b.WriteString("\n\n")
-	b.WriteString(mutedStyle.Render("tab/←→ page  j/k or wheel scroll  r refresh  q quit"))
+	b.WriteString(mutedStyle.Render(m.footerHelp()))
 	return b.String()
+}
+
+// footerHelp is the key-hint line for the current page/mode.
+func (m Model) footerHelp() string {
+	if m.mode == modeAnswerChoice {
+		return "↑/↓ choose  enter submit  esc cancel"
+	}
+	if m.mode == modeAnswerText {
+		return "type answer  enter submit  esc cancel"
+	}
+	if pages[m.selected].page == pageAttention {
+		return "tab/←→ page  ↑/↓ select  a answer  r refresh  q quit"
+	}
+	return "tab/←→ page  j/k or wheel scroll  r refresh  q quit"
 }
 
 func (m Model) loadingOr(empty string, loaded bool) string {
@@ -274,4 +291,18 @@ func dash(value string) string {
 		return "-"
 	}
 	return value
+}
+
+// truncate collapses internal whitespace and shortens value to limit runes with
+// a trailing ellipsis.
+func truncate(value string, limit int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	if limit <= 1 {
+		return string(runes[:max(0, limit)])
+	}
+	return string(runes[:limit-1]) + "…"
 }
