@@ -2292,6 +2292,49 @@ func TestSkillOptTrainWatchDoneIgnoresStaleMetadataWithoutActiveLock(t *testing.
 	}
 }
 
+func TestSkillOptTrainContinueFromGitHubURL(t *testing.T) {
+	cases := []struct {
+		phase string
+		url   string
+		want  string
+	}{
+		{"review_published", "https://github.com/o/r/issues/1", "https://github.com/o/r/issues/1"},
+		{"candidate_review_published", "https://github.com/o/r/issues/2", "https://github.com/o/r/issues/2"},
+		{"items_ready", "https://github.com/o/r/issues/1", ""},
+		{"optimizer_running", "https://github.com/o/r/issues/1", ""},
+		{"review_published", "  ", ""},
+	}
+	for _, tc := range cases {
+		if got := skillOptTrainContinueFromGitHubURL(tc.phase, tc.url); got != tc.want {
+			t.Fatalf("skillOptTrainContinueFromGitHubURL(%q,%q) = %q, want %q", tc.phase, tc.url, got, tc.want)
+		}
+	}
+}
+
+func TestSkillOptTrainStatusSnapshotPrintsContinueFromGitHub(t *testing.T) {
+	// review_published with an issue → the line is present.
+	var present bytes.Buffer
+	printSkillOptTrainStatusSnapshot(&present, skillOptTrainStatusSnapshot{
+		SessionID:    "s",
+		CurrentPhase: "review_published",
+		IssueURL:     "https://github.com/o/r/issues/7",
+	}, false)
+	if !strings.Contains(present.String(), "continue_from_github: https://github.com/o/r/issues/7") {
+		t.Fatalf("expected continue_from_github line:\n%s", present.String())
+	}
+
+	// A non-review phase → the line is absent (byte-stability for other phases).
+	var absent bytes.Buffer
+	printSkillOptTrainStatusSnapshot(&absent, skillOptTrainStatusSnapshot{
+		SessionID:    "s",
+		CurrentPhase: "items_ready",
+		IssueURL:     "https://github.com/o/r/issues/7",
+	}, false)
+	if strings.Contains(absent.String(), "continue_from_github:") {
+		t.Fatalf("continue_from_github must not appear at items_ready:\n%s", absent.String())
+	}
+}
+
 func TestGeneratedSkillOptTrainSessionIDIncludesSubsecondEntropy(t *testing.T) {
 	id := generatedSkillOptTrainSessionID("planner")
 	if strings.HasSuffix(id, "-000000000") {

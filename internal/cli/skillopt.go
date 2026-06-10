@@ -1604,6 +1604,7 @@ type skillOptTrainStatusSnapshot struct {
 	NextAction         string                         `json:"next_action"`
 	IssueURL           string                         `json:"issue_url,omitempty"`
 	PullRequestURL     string                         `json:"pull_request_url,omitempty"`
+	ContinueFromGitHub string                         `json:"continue_from_github,omitempty"`
 	CandidateVersion   string                         `json:"candidate_version,omitempty"`
 	RecoveryAvailable  bool                           `json:"recovery_available"`
 	NoCandidateReason  string                         `json:"no_candidate_reason,omitempty"`
@@ -2306,6 +2307,9 @@ func continueSkillOptTrain(ctx context.Context, paths config.Paths, store *db.St
 			for _, blocker := range status.TrainingBlockers {
 				lines = append(lines, fmt.Sprintf("training_blocker: %s", blocker))
 			}
+			if url := strings.TrimSpace(iteration.IssueURL); url != "" {
+				lines = append(lines, fmt.Sprintf("continue_from_github: %s", url))
+			}
 			lines = append(lines, "next: sync human feedback from the review surface")
 			output.Lines = lines
 			return output, nil
@@ -2569,7 +2573,12 @@ func continueSkillOptTrainCandidateDecision(ctx context.Context, store *db.Store
 		if request.StartNext {
 			return skillOptTrainContinueOutput{}, fmt.Errorf("--start-next requires a promoted or rejected candidate; current phase is %s", summary.CurrentPhase)
 		}
-		output.Lines = []string{"next: promote with --promote <candidate-version> or reject with --reject <candidate-version> --reason <text>"}
+		lines := []string{}
+		if url := strings.TrimSpace(iteration.IssueURL); url != "" {
+			lines = append(lines, fmt.Sprintf("continue_from_github: %s", url))
+		}
+		lines = append(lines, "next: promote with --promote <candidate-version> or reject with --reject <candidate-version> --reason <text>")
+		output.Lines = lines
 		return output, nil
 	}
 	return continueSkillOptTrainAfterCandidateDecision(ctx, store, session.ID, request, result)
@@ -6675,22 +6684,23 @@ func buildSkillOptTrainStatusSnapshot(session db.SkillOptTrainSession, iteration
 		currentStep = summary.CurrentPhase
 	}
 	return skillOptTrainStatusSnapshot{
-		SessionID:        summary.SessionID,
-		IterationID:      summary.IterationID,
-		TemplateID:       strings.TrimSpace(session.TemplateID),
-		TemplateVersion:  strings.TrimSpace(session.TemplateVersionID),
-		TargetRepo:       strings.TrimSpace(session.TargetRepo),
-		WorkspaceRepo:    strings.TrimSpace(session.WorkspaceRepo),
-		TaskKind:         strings.TrimSpace(session.TaskKind),
-		StatusPhase:      summary.CurrentPhase,
-		CurrentPhase:     summary.CurrentPhase,
-		CurrentStep:      currentStep,
-		CompletedSteps:   append([]string(nil), summary.CompletedSteps...),
-		BlockedStep:      summary.BlockedStep,
-		NextAction:       summary.NextAction,
-		IssueURL:         summary.IssueURL,
-		PullRequestURL:   summary.PullRequestURL,
-		CandidateVersion: summary.CandidateVersion,
+		SessionID:          summary.SessionID,
+		IterationID:        summary.IterationID,
+		TemplateID:         strings.TrimSpace(session.TemplateID),
+		TemplateVersion:    strings.TrimSpace(session.TemplateVersionID),
+		TargetRepo:         strings.TrimSpace(session.TargetRepo),
+		WorkspaceRepo:      strings.TrimSpace(session.WorkspaceRepo),
+		TaskKind:           strings.TrimSpace(session.TaskKind),
+		StatusPhase:        summary.CurrentPhase,
+		CurrentPhase:       summary.CurrentPhase,
+		CurrentStep:        currentStep,
+		CompletedSteps:     append([]string(nil), summary.CompletedSteps...),
+		BlockedStep:        summary.BlockedStep,
+		NextAction:         summary.NextAction,
+		IssueURL:           summary.IssueURL,
+		PullRequestURL:     summary.PullRequestURL,
+		ContinueFromGitHub: skillOptTrainContinueFromGitHubURL(summary.CurrentPhase, summary.IssueURL),
+		CandidateVersion:   summary.CandidateVersion,
 		PreviewPolicy: skillOptTrainPreviewPolicyJSON{
 			Mode:               policy.Mode,
 			Renderer:           policy.Renderer,
@@ -7126,9 +7136,26 @@ func printSkillOptTrainStatus(stdout io.Writer, summary skillopt.TrainStatusSumm
 	writeLine(stdout, "issue: %s", emptyText(summary.IssueURL))
 	writeLine(stdout, "pull_request: %s", emptyText(summary.PullRequestURL))
 	writeLine(stdout, "candidate: %s", emptyText(summary.CandidateVersion))
+	if url := skillOptTrainContinueFromGitHubURL(summary.CurrentPhase, summary.IssueURL); url != "" {
+		writeLine(stdout, "continue_from_github: %s", url)
+	}
 	writeLine(stdout, "review_items: %d", counts.ReviewItems)
 	writeLine(stdout, "feedback: %d", summary.FeedbackCount)
 	writeLine(stdout, "pairwise_preferences: %d", counts.PairwisePreferences)
+}
+
+// skillOptTrainContinueFromGitHubURL returns the GitHub issue/PR URL a human can
+// act on to advance the train from a review-blocked phase (the review-watcher
+// imports comments). It returns "" for phases that are not blocked on a human
+// reviewing on GitHub. At candidate_review_published the iteration's IssueURL
+// already points at the candidate review issue.
+func skillOptTrainContinueFromGitHubURL(phase, issueURL string) string {
+	switch phase {
+	case "review_published", "candidate_review_published":
+		return strings.TrimSpace(issueURL)
+	default:
+		return ""
+	}
 }
 
 func printSkillOptTrainStatusSnapshot(stdout io.Writer, snapshot skillOptTrainStatusSnapshot, verbose bool) {
@@ -7149,6 +7176,9 @@ func printSkillOptTrainStatusSnapshot(stdout io.Writer, snapshot skillOptTrainSt
 	writeLine(stdout, "issue: %s", emptyText(snapshot.IssueURL))
 	writeLine(stdout, "pull_request: %s", emptyText(snapshot.PullRequestURL))
 	writeLine(stdout, "candidate: %s", emptyText(snapshot.CandidateVersion))
+	if url := skillOptTrainContinueFromGitHubURL(snapshot.CurrentPhase, snapshot.IssueURL); url != "" {
+		writeLine(stdout, "continue_from_github: %s", url)
+	}
 	writeLine(stdout, "recovery_available: %t", snapshot.RecoveryAvailable)
 	if snapshot.NoCandidateReason != "" {
 		writeLine(stdout, "no_candidate_reason: %s", snapshot.NoCandidateReason)
