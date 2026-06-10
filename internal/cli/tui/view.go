@@ -73,19 +73,28 @@ func (m Model) content() string {
 		b.WriteString(errorStyle.Render("refresh error: " + m.loadErr))
 		b.WriteString("\n\n")
 	}
-	switch pages[m.selected].page {
-	case pageAttention:
-		b.WriteString(m.attentionContent())
-	case pageTrains:
-		b.WriteString(m.trainsContent())
-	case pageAgents:
-		b.WriteString(m.agentsContent())
-	case pageSessions:
-		b.WriteString(m.sessionsContent())
-	case pageJobs:
-		b.WriteString(m.jobsContent())
-	case pageLocks:
-		b.WriteString(m.locksContent())
+	// Job overlays can be entered from more than one page (Jobs, Attention), so
+	// they are dispatched once here rather than inside each page renderer.
+	switch m.mode {
+	case modeJobDetail:
+		b.WriteString(m.jobDetailView())
+	case modeConfirmJobRetry, modeConfirmJobCancel:
+		b.WriteString(m.jobConfirmView())
+	default:
+		switch pages[m.selected].page {
+		case pageAttention:
+			b.WriteString(m.attentionContent())
+		case pageTrains:
+			b.WriteString(m.trainsContent())
+		case pageAgents:
+			b.WriteString(m.agentsContent())
+		case pageSessions:
+			b.WriteString(m.sessionsContent())
+		case pageJobs:
+			b.WriteString(m.jobsContentInteractive())
+		case pageLocks:
+			b.WriteString(m.locksContent())
+		}
 	}
 	b.WriteString("\n\n")
 	b.WriteString(mutedStyle.Render(m.footerHelp()))
@@ -99,12 +108,21 @@ func (m Model) helpContent() string {
 	b.WriteString("\n\n")
 	switch pages[m.selected].page {
 	case pageAttention:
-		b.WriteString("↑/↓  select a pending prompt\n")
+		b.WriteString("↑/↓  select a row (pending prompts, then blocked/failed jobs)\n")
 		b.WriteString("a    answer the selected prompt (choices or text)\n")
 		b.WriteString("d    dismiss (delete) the selected prompt\n")
+		b.WriteString("enter open the selected job's detail (events)\n")
+		b.WriteString("R    retry the selected job\n")
+		b.WriteString("s    start the daemon when it is stopped\n")
 	case pageTrains:
 		b.WriteString("↑/↓  select a train session\n")
 		b.WriteString("enter open the session (live phase view; esc returns)\n")
+	case pageJobs:
+		b.WriteString("↑/↓  select a job\n")
+		b.WriteString("enter open the job's detail (events)\n")
+		b.WriteString("R    retry the selected job (failed/blocked/cancelled)\n")
+		b.WriteString("c    cancel the selected job (queued/running)\n")
+		b.WriteString("pgup/pgdn  scroll a long list\n")
 	default:
 		b.WriteString("j/k or wheel  scroll\n")
 	}
@@ -127,12 +145,18 @@ func (m Model) footerHelp() string {
 		return "y delete  n/esc cancel"
 	case modeTrainDetail:
 		return "enter/esc back"
+	case modeJobDetail:
+		return "R retry  c cancel  esc back"
+	case modeConfirmJobRetry, modeConfirmJobCancel:
+		return "y confirm  n/esc cancel"
 	}
 	switch pages[m.selected].page {
 	case pageAttention:
-		return "tab/←→ page  ↑/↓ select  a answer  d dismiss  r refresh  q quit"
+		return "tab/←→ page  ↑/↓ select  a answer  d dismiss  enter/R jobs  ? help  q quit"
 	case pageTrains:
-		return "tab/←→ page  ↑/↓ select  enter detail  r refresh  q quit"
+		return "tab/←→ page  ↑/↓ select  enter open  r refresh  q quit"
+	case pageJobs:
+		return "tab/←→ page  ↑/↓ select  enter detail  R retry  c cancel  ? help  q quit"
 	}
 	return "tab/←→ page  j/k or wheel scroll  r refresh  q quit"
 }
@@ -164,20 +188,6 @@ func (m Model) sessionsContent() string {
 		b.WriteString(line)
 		b.WriteByte('\n')
 	}
-	return b.String()
-}
-
-func (m Model) jobsContent() string {
-	if m.snap.Jobs.Total == 0 {
-		return m.loadingOr("No jobs.", !m.loadedAt.IsZero())
-	}
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Total %d\n\n", m.snap.Jobs.Total))
-	rows := [][]string{{"STATE", "COUNT"}}
-	for _, state := range sortedKeys(m.snap.Jobs.ByState) {
-		rows = append(rows, []string{jobStateColor(state), fmt.Sprint(m.snap.Jobs.ByState[state])})
-	}
-	b.WriteString(renderRows(rows))
 	return b.String()
 }
 

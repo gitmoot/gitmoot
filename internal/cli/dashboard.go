@@ -47,6 +47,15 @@ type dashboardSnapshot struct {
 	// TUI's inline answer flow. Unexported so it never appears in --json output
 	// or the plain renderer, keeping those contracts byte-stable.
 	promptDetails []db.InteractivePrompt
+	// jobRows carries per-job rows (and, for blocked/failed jobs, the latest
+	// event message) for the TUI's Jobs page. Unexported for the same reason.
+	jobRows []dashboardJobRow
+}
+
+// dashboardJobRow is one job with the context the TUI needs to act on it.
+type dashboardJobRow struct {
+	db.Job
+	LatestEvent string
 }
 
 type dashboardResourceLock struct {
@@ -303,12 +312,23 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 			return err
 		}
 		snapshot.Jobs.Total = len(jobs)
+		// One batched read of every job's latest event; blocked/failed rows
+		// surface WHY in the attention list.
+		latestEvents, err := store.LatestJobEvents(ctx)
+		if err != nil {
+			return err
+		}
 		for _, job := range jobs {
 			state := job.State
 			if strings.TrimSpace(state) == "" {
 				state = "unknown"
 			}
 			snapshot.Jobs.ByState[state]++
+			row := dashboardJobRow{Job: job}
+			if job.State == "blocked" || job.State == "failed" {
+				row.LatestEvent = latestEvents[job.ID].Message
+			}
+			snapshot.jobRows = append(snapshot.jobRows, row)
 		}
 		tasks, err := store.ListTasks(ctx)
 		if err != nil {

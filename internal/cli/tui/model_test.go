@@ -35,7 +35,11 @@ func sampleSnapshot() Snapshot {
 			{Name: "skillopt-generator-bg-bb22", Runtime: "claude", State: "idle"},
 			{Name: "solo", Runtime: "codex", Repo: "owner/repo", State: "running"},
 		},
-		Jobs:        Jobs{Total: 3, ByState: map[string]int{"failed": 1, "succeeded": 2}},
+		Jobs: Jobs{Total: 3, ByState: map[string]int{"failed": 1, "succeeded": 2}},
+		JobRows: []JobRow{
+			{ID: "job-1", Agent: "planner", Type: "ask", State: "failed", LatestEvent: "agent returned an error"},
+			{ID: "job-2", Agent: "planner", Type: "review", State: "succeeded"},
+		},
 		Trains:      []TrainSession{{ID: "train-s1", Phase: "items_ready", Candidate: "smithyx@v3", Repo: "owner/repo"}},
 		BranchLocks: []BranchLock{{Repo: "owner/repo", Branch: "main", Owner: "agent"}},
 		ResourceLocks: []ResourceLock{
@@ -56,7 +60,7 @@ func loadedModel(t *testing.T) Model {
 func TestPagesRenderExpectedContent(t *testing.T) {
 	m := loadedModel(t)
 	// Page order: Attention, Trains, Agents, Sessions, Jobs, Locks.
-	wants := []string{"pending prompts", "train-s1", "planner", "skillopt-generator", "failed", "branch locks"}
+	wants := []string{"needs attention", "train-s1", "planner", "skillopt-generator", "failed", "branch locks"}
 	for i, want := range wants {
 		if i > 0 {
 			next, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
@@ -121,8 +125,11 @@ func TestLoadErrorKeepsStaleData(t *testing.T) {
 }
 
 func TestEmptyStatesRenderWithoutPanic(t *testing.T) {
-	m := sizedModel(Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }})
-	next, _ := m.Update(snapshotMsg{snap: Snapshot{}, at: time.Unix(3, 0)})
+	// Daemon running so the attention page shows the empty state rather than
+	// the (legitimate) daemon-stopped banner.
+	empty := Snapshot{Daemon: Daemon{Running: true}}
+	m := sizedModel(Deps{Load: func() (Snapshot, error) { return empty, nil }})
+	next, _ := m.Update(snapshotMsg{snap: empty, at: time.Unix(3, 0)})
 	m = next.(Model)
 	for range pages {
 		_ = m.View()

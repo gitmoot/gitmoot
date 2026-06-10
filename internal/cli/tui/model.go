@@ -44,6 +44,9 @@ const (
 	modeAnswerText
 	modeConfirmDismiss
 	modeTrainDetail
+	modeJobDetail
+	modeConfirmJobRetry
+	modeConfirmJobCancel
 )
 
 const defaultInterval = 5 * time.Second
@@ -74,17 +77,28 @@ type Model struct {
 	actionBusy   bool                 // an action is in flight; suppress re-submit
 	showHelp     bool                 // '?' help overlay
 	tickGen      int                  // current tick chain; stale generations are dropped
+
+	// Jobs page interaction state.
+	jobCursor       int                 // selected row in snap.JobRows
+	activeJob       JobRow              // job shown in detail / being confirmed
+	jobEvents       []JobEventView      // lazy-loaded event history for the detail view
+	jobEventsLoaded bool                // the detail's event load has returned (possibly empty)
+	jobEventsErr    string              // error from the detail's event load
+	cancelling      map[string]struct{} // jobs with a cancel requested, until settled
+	daemonBusy      bool                // a daemon start is in flight; suppress re-submit
+	daemonErr       string              // error from the last daemon start attempt
 }
 
 // New returns a Model ready for tea.NewProgram. It starts in the loading state;
 // Init issues the first Load and arms the refresh tick.
 func New(deps Deps) Model {
 	m := Model{
-		deps:     deps,
-		width:    100,
-		height:   30,
-		viewport: viewport.New(80, 20),
-		inFlight: true,
+		deps:       deps,
+		width:      100,
+		height:     30,
+		viewport:   viewport.New(80, 20),
+		inFlight:   true,
+		cancelling: map[string]struct{}{},
 	}
 	m.resizeViewport()
 	m.viewport.SetContent(m.content())
@@ -115,6 +129,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case tea.KeyMsg:
 		// Modal overlays capture keys first; only ctrl+c stays global.
+		if m.mode == modeJobDetail || m.mode == modeConfirmJobRetry || m.mode == modeConfirmJobCancel {
+			if msg.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+			return m.updateJobOverlay(msg)
+		}
 		if m.mode != modeNormal {
 			return m.updateOverlay(msg)
 		}
@@ -141,31 +161,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.SetContent(m.content())
 			return m, tea.Batch(cmds...)
 		case "up", "k":
-			if pages[m.selected].page == pageAttention && len(m.snap.Prompts) > 0 {
-				if m.promptCursor > 0 {
-					m.promptCursor--
-				}
-				m.viewport.SetContent(m.content())
-				return m, tea.Batch(cmds...)
-			}
-			if pages[m.selected].page == pageTrains && len(m.snap.Trains) > 0 {
-				if m.trainCursor > 0 {
-					m.trainCursor--
+			if cursor, n := m.pageCursor(); cursor != nil && n > 0 {
+				if *cursor > 0 {
+					*cursor--
 				}
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
 			}
 		case "down", "j":
-			if pages[m.selected].page == pageAttention && len(m.snap.Prompts) > 0 {
-				if m.promptCursor < len(m.snap.Prompts)-1 {
-					m.promptCursor++
-				}
-				m.viewport.SetContent(m.content())
-				return m, tea.Batch(cmds...)
-			}
-			if pages[m.selected].page == pageTrains && len(m.snap.Trains) > 0 {
-				if m.trainCursor < len(m.snap.Trains)-1 {
-					m.trainCursor++
+			if cursor, n := m.pageCursor(); cursor != nil && n > 0 {
+				if *cursor < n-1 {
+					*cursor++
 				}
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
@@ -194,6 +200,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, Push(m.deps.OpenTrain(session))
 				}
 				m.openTrainDetail()
+				m.viewport.SetContent(m.content())
+				return m, tea.Batch(cmds...)
+			}
+			if job, ok := m.jobUnderCursor(); ok {
+				cmd := m.openJobDetail(job)
+				m.viewport.SetContent(m.content())
+				return m, cmd
+			}
+		case "R":
+			if job, ok := m.jobUnderCursor(); ok && jobRetryable(job.State) {
+				m.openJobConfirm(job, false)
+				m.viewport.SetContent(m.content())
+				return m, tea.Batch(cmds...)
+			}
+		case "c":
+			if job, ok := m.jobUnderCursor(); ok && jobCancelable(job.State) {
+				m.openJobConfirm(job, true)
+				m.viewport.SetContent(m.content())
+				return m, tea.Batch(cmds...)
+			}
+		case "s":
+			// Only once the first snapshot confirmed the daemon is down (the
+			// zero-value snapshot also reads as not-running), and never while a
+			// start is already in flight.
+			if pages[m.selected].page == pageAttention && !m.snap.Daemon.Running &&
+				!m.loadedAt.IsZero() && !m.daemonBusy {
+				m.daemonBusy = true
+				m.daemonErr = ""
+				cmds = append(cmds, daemonStartCmd(m.deps))
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
 			}
@@ -233,6 +268,44 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, cmd)
 			}
 		}
+	case jobEventsMsg:
+		if msg.id == m.activeJob.ID {
+			m.jobEventsLoaded = true
+			if msg.err != nil {
+				m.jobEventsErr = msg.err.Error()
+			} else {
+				m.jobEventsErr = ""
+				m.jobEvents = msg.events
+			}
+		}
+	case daemonStartMsg:
+		// Daemon start has its own busy/error state so its result cannot close
+		// or pollute an unrelated job confirm that opened in the meantime.
+		m.daemonBusy = false
+		if msg.err != nil {
+			m.daemonErr = msg.err.Error()
+		} else {
+			m.daemonErr = ""
+			if cmd := m.queueLoad(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
+	case jobActionMsg:
+		m.actionBusy = false
+		if msg.err != nil {
+			m.actionErr = msg.err.Error()
+		} else {
+			if msg.verb == "cancel" && msg.id != "" {
+				m.cancelling[msg.id] = struct{}{}
+			}
+			if m.mode == modeConfirmJobRetry || m.mode == modeConfirmJobCancel {
+				m.mode = modeNormal
+			}
+			m.actionErr = ""
+			if cmd := m.queueLoad(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
 	case snapshotMsg:
 		m.inFlight = false
 		if msg.err != nil {
@@ -243,6 +316,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loadedAt = msg.at
 			m.clampPromptCursor()
 			m.clampTrainCursor()
+			m.clampJobCursor()
+			// A cancel-requested job that has settled no longer needs the
+			// transitional "cancelling…" label.
+			for id := range m.cancelling {
+				settled := true
+				for _, job := range m.snap.JobRows {
+					if job.ID == id && jobCancelable(job.State) {
+						settled = false
+						break
+					}
+				}
+				if settled {
+					delete(m.cancelling, id)
+				}
+			}
 		}
 	case refreshNudgeMsg:
 		// Resumed after a pop: the old tick chain died unhandled under the child
@@ -295,25 +383,45 @@ func (m *Model) queueLoad() tea.Cmd {
 	return loadSnapshot(m.deps)
 }
 
-// clampPromptCursor keeps the Attention cursor within the current prompt list
-// after a refresh removes rows.
+// pageCursor returns the selected page's cursor and list length, or nil for
+// pages without a selectable list. New cursored pages only need a case here.
+func (m *Model) pageCursor() (*int, int) {
+	switch pages[m.selected].page {
+	case pageAttention:
+		return &m.promptCursor, len(m.attentionItems())
+	case pageTrains:
+		return &m.trainCursor, len(m.snap.Trains)
+	case pageJobs:
+		return &m.jobCursor, len(m.snap.JobRows)
+	}
+	return nil, 0
+}
+
+// clampCursor keeps a list cursor within [0, n-1] after a refresh removes rows.
+func clampCursor(cursor, n int) int {
+	if cursor >= n {
+		cursor = n - 1
+	}
+	if cursor < 0 {
+		cursor = 0
+	}
+	return cursor
+}
+
+// clampPromptCursor keeps the Attention cursor within the current item list
+// (prompts plus blocked/failed jobs) after a refresh removes rows.
 func (m *Model) clampPromptCursor() {
-	if m.promptCursor >= len(m.snap.Prompts) {
-		m.promptCursor = len(m.snap.Prompts) - 1
-	}
-	if m.promptCursor < 0 {
-		m.promptCursor = 0
-	}
+	m.promptCursor = clampCursor(m.promptCursor, len(m.attentionItems()))
 }
 
 // clampTrainCursor keeps the Trains cursor within the current session list.
 func (m *Model) clampTrainCursor() {
-	if m.trainCursor >= len(m.snap.Trains) {
-		m.trainCursor = len(m.snap.Trains) - 1
-	}
-	if m.trainCursor < 0 {
-		m.trainCursor = 0
-	}
+	m.trainCursor = clampCursor(m.trainCursor, len(m.snap.Trains))
+}
+
+// clampJobCursor keeps the Jobs cursor within the current job list.
+func (m *Model) clampJobCursor() {
+	m.jobCursor = clampCursor(m.jobCursor, len(m.snap.JobRows))
 }
 
 func loadSnapshot(deps Deps) tea.Cmd {

@@ -1,22 +1,57 @@
 package tui
 
 import (
-	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/jerryfane/gitmoot/internal/db"
 )
+
+// attnItem is one selectable row on the Attention page: a pending prompt or a
+// blocked/failed job.
+type attnItem struct {
+	prompt *db.InteractivePrompt
+	job    *JobRow
+}
+
+// attentionItems lists the actionable attention rows: pending prompts first,
+// then blocked/failed jobs.
+func (m Model) attentionItems() []attnItem {
+	items := make([]attnItem, 0, len(m.snap.Prompts))
+	for i := range m.snap.Prompts {
+		items = append(items, attnItem{prompt: &m.snap.Prompts[i]})
+	}
+	for i := range m.snap.JobRows {
+		if m.snap.JobRows[i].State == "blocked" || m.snap.JobRows[i].State == "failed" {
+			items = append(items, attnItem{job: &m.snap.JobRows[i]})
+		}
+	}
+	return items
+}
+
+// attentionPrompt returns the prompt under the attention cursor, if the
+// selected item is a prompt.
+func (m Model) attentionPrompt() (db.InteractivePrompt, bool) {
+	items := m.attentionItems()
+	if m.promptCursor < len(items) && items[m.promptCursor].prompt != nil {
+		return *items[m.promptCursor].prompt, true
+	}
+	return db.InteractivePrompt{}, false
+}
 
 // openAnswer enters the answer overlay for the prompt under the cursor. Choice
 // prompts get a selectable list with the default preselected; free-text prompts
 // get a text input prefilled with the default. Returns the textinput blink cmd
 // when relevant.
 func (m *Model) openAnswer() tea.Cmd {
-	if pages[m.selected].page != pageAttention || len(m.snap.Prompts) == 0 {
+	if pages[m.selected].page != pageAttention {
 		return nil
 	}
-	p := m.snap.Prompts[m.promptCursor]
+	p, ok := m.attentionPrompt()
+	if !ok {
+		return nil
+	}
 	m.active = p
 	m.actionErr = ""
 	m.actionBusy = false
@@ -35,10 +70,14 @@ func (m *Model) openAnswer() tea.Cmd {
 
 // openDismiss enters the dismiss-confirm overlay for the prompt under the cursor.
 func (m *Model) openDismiss() {
-	if pages[m.selected].page != pageAttention || len(m.snap.Prompts) == 0 {
+	if pages[m.selected].page != pageAttention {
 		return
 	}
-	m.active = m.snap.Prompts[m.promptCursor]
+	p, ok := m.attentionPrompt()
+	if !ok {
+		return
+	}
+	m.active = p
 	m.actionErr = ""
 	m.actionBusy = false
 	m.mode = modeConfirmDismiss
@@ -151,38 +190,54 @@ func (m Model) attentionContent() string {
 	var b strings.Builder
 	wrote := false
 
-	b.WriteString(headerStyle.Render("pending prompts"))
-	b.WriteByte('\n')
-	if len(m.snap.Prompts) == 0 {
-		b.WriteString(mutedStyle.Render("none"))
+	if !m.snap.Daemon.Running && !m.loadedAt.IsZero() {
+		hint := "press s to start"
+		if m.daemonBusy {
+			hint = "starting…"
+		}
+		b.WriteString(redStyle.Render("daemon stopped — jobs will not run") + "  " + mutedStyle.Render(hint))
 		b.WriteByte('\n')
-	} else {
-		for i, p := range m.snap.Prompts {
-			cursor := "  "
-			line := p.ID + "  " + truncate(p.Question, 60)
-			if i == m.promptCursor {
-				cursor = "▸ "
-				line = selectedRowStyle.Render(line)
-			}
-			b.WriteString(cursor)
-			b.WriteString(line)
+		if m.daemonErr != "" {
+			b.WriteString(errorStyle.Render(m.daemonErr))
 			b.WriteByte('\n')
 		}
-		b.WriteString(mutedStyle.Render("a answer  d dismiss"))
 		b.WriteByte('\n')
 		wrote = true
 	}
 
-	if blocked := m.snap.Jobs.ByState["blocked"]; blocked > 0 {
-		b.WriteString("\n")
-		b.WriteString(redStyle.Render(plural(blocked, "blocked job", "blocked jobs")))
+	items := m.attentionItems()
+	b.WriteString(headerStyle.Render("needs attention"))
+	b.WriteByte('\n')
+	if len(items) == 0 {
+		b.WriteString(mutedStyle.Render("none"))
+		b.WriteByte('\n')
+	} else {
+		for i, item := range items {
+			cursor := "  "
+			var line string
+			switch {
+			case item.prompt != nil:
+				line = "prompt " + item.prompt.ID + "  " + truncate(item.prompt.Question, 56)
+			case item.job != nil:
+				line = "job " + item.job.ID + "  " + item.job.Type + "  " + jobStateColor(item.job.State)
+				if item.job.LatestEvent != "" {
+					line += "  " + mutedStyle.Render(truncate(item.job.LatestEvent, 48))
+				}
+			}
+			if i == m.promptCursor {
+				cursor = "▸ "
+				line = selectedRowStyle.Render("• ") + line
+			}
+			b.WriteString(cursor + line + "\n")
+		}
+		// Attention only lists blocked/failed jobs, so cancel never applies here.
+		b.WriteString(mutedStyle.Render("prompts: a answer · d dismiss   jobs: enter detail · R retry"))
 		b.WriteByte('\n')
 		wrote = true
 	}
-	if failed := m.snap.Jobs.ByState["failed"]; failed > 0 {
-		b.WriteString(redStyle.Render(plural(failed, "failed job", "failed jobs")))
-		b.WriteByte('\n')
-		wrote = true
+
+	if m.actionErr != "" {
+		b.WriteString("\n" + errorStyle.Render(m.actionErr) + "\n")
 	}
 
 	stale := staleLocks(m.snap.ResourceLocks)
@@ -289,11 +344,4 @@ func staleLocks(locks []ResourceLock) []ResourceLock {
 		}
 	}
 	return out
-}
-
-func plural(n int, one, many string) string {
-	if n == 1 {
-		return "1 " + one
-	}
-	return strconv.Itoa(n) + " " + many
 }

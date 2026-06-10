@@ -158,6 +158,9 @@ type Job struct {
 	Type    string
 	State   string
 	Payload string
+	// UpdatedAt is populated by ListJobs (for age display in the dashboard);
+	// other readers may leave it zero.
+	UpdatedAt string
 }
 
 type JobEvent struct {
@@ -1871,7 +1874,7 @@ func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
 }
 
 func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload FROM jobs ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, updated_at FROM jobs ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -1880,7 +1883,7 @@ func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.UpdatedAt); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -2063,6 +2066,28 @@ func (s *Store) ListJobEvents(ctx context.Context, jobID string) ([]JobEvent, er
 			return nil, err
 		}
 		events = append(events, event)
+	}
+	return events, rows.Err()
+}
+
+// LatestJobEvents returns the most recent event for every job that has one,
+// keyed by job id, in a single query (the dashboard refresh would otherwise
+// issue one ListJobEvents per job).
+func (s *Store) LatestJobEvents(ctx context.Context) (map[string]JobEvent, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT job_id, kind, message FROM job_events
+		WHERE id IN (SELECT MAX(id) FROM job_events GROUP BY job_id)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	events := map[string]JobEvent{}
+	for rows.Next() {
+		var event JobEvent
+		if err := rows.Scan(&event.JobID, &event.Kind, &event.Message); err != nil {
+			return nil, err
+		}
+		events[event.JobID] = event
 	}
 	return events, rows.Err()
 }

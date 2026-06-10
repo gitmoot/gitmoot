@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/jerryfane/gitmoot/internal/cli/tui"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
 // dashboardFlags is the subset of dashboard flags that decide whether the
@@ -99,6 +101,45 @@ func dashboardTUIDeps(home string, interval time.Duration) tui.Deps {
 				return store.DeleteInteractivePrompt(context.Background(), id)
 			})
 		},
+		JobEvents: func(id string) ([]tui.JobEventView, error) {
+			var views []tui.JobEventView
+			err := withStore(home, func(store *db.Store) error {
+				events, err := store.ListJobEvents(context.Background(), id)
+				if err != nil {
+					return err
+				}
+				for _, event := range events {
+					views = append(views, tui.JobEventView{Kind: event.Kind, Message: event.Message})
+				}
+				return nil
+			})
+			return views, err
+		},
+		RetryJob: func(id string) error {
+			// workflow.RetryJob is the same path `gitmoot job retry` takes: it
+			// clears the stale payload.Result and emits the retry_queued event
+			// the daemon's retry bookkeeping keys on.
+			return withStore(home, func(store *db.Store) error {
+				_, err := workflow.RetryJob(context.Background(), store, id)
+				return err
+			})
+		},
+		CancelJob: func(id string) error {
+			return withStore(home, func(store *db.Store) error {
+				_, err := workflow.CancelJob(context.Background(), store, id)
+				return err
+			})
+		},
+		StartDaemon: func() error {
+			// Restart rather than start: it tolerates a stopped daemon and
+			// restores the previously persisted flags (workers, poll, watch)
+			// instead of silently reverting to defaults.
+			var out bytes.Buffer
+			if code := runDaemonRestart([]string{"--home", home}, &out, &out); code != 0 {
+				return fmt.Errorf("daemon start failed: %s", strings.TrimSpace(out.String()))
+			}
+			return nil
+		},
 	}
 }
 
@@ -131,6 +172,16 @@ func toTUISnapshot(s dashboardSnapshot) tui.Snapshot {
 	}
 	for _, l := range s.ResourceLocks {
 		out.ResourceLocks = append(out.ResourceLocks, tui.ResourceLock{Key: l.Key, Owner: l.Owner, Stale: l.Stale})
+	}
+	for _, row := range s.jobRows {
+		out.JobRows = append(out.JobRows, tui.JobRow{
+			ID:          row.ID,
+			Agent:       row.Agent,
+			Type:        row.Type,
+			State:       row.State,
+			UpdatedAt:   row.UpdatedAt,
+			LatestEvent: row.LatestEvent,
+		})
 	}
 	return out
 }

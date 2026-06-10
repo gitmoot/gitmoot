@@ -180,7 +180,7 @@ func TestAttentionCursorClampedOnRefresh(t *testing.T) {
 		t.Fatalf("cursor should be at 1, got %d", m.promptCursor)
 	}
 	// Refresh with an empty prompt list must not leave a dangling cursor.
-	next, _ = m.Update(snapshotMsg{snap: Snapshot{}, at: time.Unix(2, 0)})
+	next, _ = m.Update(snapshotMsg{snap: Snapshot{Daemon: Daemon{Running: true}}, at: time.Unix(2, 0)})
 	m = next.(Model)
 	if m.promptCursor != 0 {
 		t.Fatalf("cursor should clamp to 0 when prompts empty, got %d", m.promptCursor)

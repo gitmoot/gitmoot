@@ -206,3 +206,36 @@ func TestDeleteAgentChecked(t *testing.T) {
 		t.Fatalf("expected not-found on second delete, got %v", err)
 	}
 }
+
+func TestLatestJobEvents(t *testing.T) {
+	store := openCockpitStore(t)
+	ctx := context.Background()
+	if err := store.CreateJob(ctx, Job{ID: "job-a", Agent: "planner", Type: "ask", State: "failed"}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if err := store.CreateJob(ctx, Job{ID: "job-b", Agent: "planner", Type: "review", State: "queued"}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	for _, event := range []JobEvent{
+		{JobID: "job-a", Kind: "queued", Message: "created"},
+		{JobID: "job-a", Kind: "failed", Message: "boom"},
+		{JobID: "job-b", Kind: "queued", Message: "created"},
+	} {
+		if err := store.AddJobEvent(ctx, event); err != nil {
+			t.Fatalf("AddJobEvent: %v", err)
+		}
+	}
+	latest, err := store.LatestJobEvents(ctx)
+	if err != nil {
+		t.Fatalf("LatestJobEvents: %v", err)
+	}
+	if got := latest["job-a"]; got.Kind != "failed" || got.Message != "boom" {
+		t.Fatalf("job-a latest = %+v", got)
+	}
+	if got := latest["job-b"]; got.Kind != "queued" || got.Message != "created" {
+		t.Fatalf("job-b latest = %+v", got)
+	}
+	if _, ok := latest["job-missing"]; ok {
+		t.Fatal("jobs without events must be absent from the map")
+	}
+}

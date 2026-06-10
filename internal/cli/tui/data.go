@@ -29,6 +29,7 @@ type Snapshot struct {
 	Trains         []TrainSession
 	ResourceLocks  []ResourceLock
 	Prompts        []db.InteractivePrompt
+	JobRows        []JobRow
 }
 
 // Daemon mirrors cli.dashboardDaemon.
@@ -64,6 +65,23 @@ type Session struct {
 type Jobs struct {
 	Total   int
 	ByState map[string]int
+}
+
+// JobRow is one job the Jobs page can act on. LatestEvent is filled for
+// blocked/failed jobs (the "why" shown in the attention list).
+type JobRow struct {
+	ID          string
+	Agent       string
+	Type        string
+	State       string
+	UpdatedAt   string
+	LatestEvent string
+}
+
+// JobEventView is one entry of a job's event history shown in the detail view.
+type JobEventView struct {
+	Kind    string
+	Message string
 }
 
 // Worktree mirrors cli.dashboardWorktree.
@@ -106,6 +124,16 @@ type Deps struct {
 	// the Trains page pushes it onto the Root stack instead of the inline
 	// detail view.
 	OpenTrain func(sessionID string) tea.Model
+
+	// Job actions: event history (detail view), retry a failed/blocked job,
+	// cancel a queued/running one (cooperative — the daemon settles it).
+	JobEvents func(id string) ([]JobEventView, error)
+	RetryJob  func(id string) error
+	CancelJob func(id string) error
+
+	// StartDaemon starts the background daemon when the attention list shows it
+	// stopped.
+	StartDaemon func() error
 }
 
 // snapshotMsg carries the result of a Deps.Load call.
@@ -137,5 +165,25 @@ type answerResultMsg struct {
 // dismissResultMsg carries the outcome of a Deps.Dismiss call.
 type dismissResultMsg struct {
 	id  string
+	err error
+}
+
+// jobEventsMsg carries a job's event history for the detail view.
+type jobEventsMsg struct {
+	id     string
+	events []JobEventView
+	err    error
+}
+
+// jobActionMsg carries the outcome of a retry/cancel action.
+type jobActionMsg struct {
+	verb string // "retry" or "cancel"
+	id   string
+	err  error
+}
+
+// daemonStartMsg carries the outcome of a daemon start, separate from
+// jobActionMsg so it cannot close or pollute an open job confirm.
+type daemonStartMsg struct {
 	err error
 }
