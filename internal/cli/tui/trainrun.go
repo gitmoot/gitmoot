@@ -4,6 +4,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -32,6 +33,12 @@ type TrainRunSnapshot struct {
 	ETA                string
 	Elapsed            string
 	Terminal           bool
+
+	// Live-progress detail for the long phases.
+	PhaseStartedAt   time.Time // active generation/optimizer lock acquisition; zero when unknown
+	OptimizerBackend string    // e.g. "claude"
+	OptimizerModel   string    // e.g. "claude-sonnet-4-6"; empty = backend default
+	OptimizerAttempt string    // e.g. "attempt-001"
 }
 
 // TrainRunActionResult carries the output lines from a short in-process phase
@@ -141,6 +148,11 @@ type TrainRunModel struct {
 	// and the last few complete lines to show.
 	logOffset int64
 	logLines  []string
+
+	// Long-phase liveness: a spinner whose ticks (10 fps for spinner.Dot)
+	// also redraw the live elapsed time. Armed only while a long phase shows.
+	spin     spinner.Model
+	spinning bool
 }
 
 const trainLogTailLines = 8
@@ -160,6 +172,7 @@ func isLongTrainPhase(phase string) bool {
 // NewTrainRun returns a model ready for tea.NewProgram.
 func NewTrainRun(deps TrainRunDeps) TrainRunModel {
 	m := TrainRunModel{deps: deps, width: 100, height: 30, inFlight: true}
+	m.spin = spinner.New(spinner.WithSpinner(spinner.Dot))
 	if deps.Plan != nil {
 		m.confirming = true
 		m.inFlight = false
@@ -235,6 +248,13 @@ func (m TrainRunModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, cmd)
 			}
 		}
+	case spinner.TickMsg:
+		if !m.spinning {
+			break // disarmed: drop the stale tick instead of re-arming
+		}
+		var cmd tea.Cmd
+		m.spin, cmd = m.spin.Update(msg)
+		cmds = append(cmds, cmd)
 	case trainSnapshotMsg:
 		m.inFlight = false
 		if msg.err != nil {
@@ -243,6 +263,12 @@ func (m TrainRunModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loadErr = ""
 			m.snap = msg.snap
 			m.loadedAt = msg.at
+			if long := isLongTrainPhase(msg.snap.Phase); long && !m.spinning {
+				m.spinning = true
+				cmds = append(cmds, m.spin.Tick)
+			} else if !long {
+				m.spinning = false
+			}
 			// Clear the displayed lines when not in a long phase so stale output
 			// does not linger; the byte offset stays monotonic (one per-session
 			// log spans generation and optimizer).

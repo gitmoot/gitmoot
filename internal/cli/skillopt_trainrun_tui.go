@@ -445,8 +445,42 @@ func toTrainRunSnapshot(s skillOptTrainStatusSnapshot) tui.TrainRunSnapshot {
 		out.JobsRunning = s.Verbose.Jobs.Running
 		out.JobsSucceeded = s.Verbose.Jobs.Succeeded
 		out.JobsFailed = s.Verbose.Jobs.Failed
+		// The phase-matching lock's acquisition time is the phase start: a
+		// leftover lock from an earlier killed step (e.g. a review lock with a
+		// long TTL) can sort first, so the lock NAME must match the phase.
+		out.PhaseStartedAt = trainPhaseLockStart(s.StatusPhase, s.Verbose.ActiveLocks)
+		out.OptimizerBackend = metadataString(s.Verbose.Optimizer, "run_optimizer_backend")
+		out.OptimizerModel = metadataString(s.Verbose.Optimizer, "run_optimizer_model")
+		out.OptimizerAttempt = metadataString(s.Verbose.Optimizer, "optimizer_attempt")
 	}
 	return out
+}
+
+// trainPhaseLockStart returns the acquisition time of the active lock whose
+// name matches the displayed long phase (generation locks for generating
+// phases, optimizer locks for optimizer phases); zero when none matches.
+func trainPhaseLockStart(statusPhase string, locks []skillOptTrainStatusLock) time.Time {
+	var wanted map[string]bool
+	switch statusPhase {
+	case "generating_options", "generating_options_heartbeat_stale":
+		wanted = map[string]bool{"generation": true}
+	case "optimizer_running", "optimizer_heartbeat_stale":
+		wanted = map[string]bool{"optimizer": true, "optimizer_legacy": true}
+	default:
+		return time.Time{}
+	}
+	for _, lock := range locks {
+		if !wanted[lock.Name] {
+			continue
+		}
+		if lock.Status != "active" && lock.Status != "active_expired_heartbeat" {
+			continue
+		}
+		if acquired, ok := parseSkillOptStatusTime(lock.AcquiredAt); ok {
+			return acquired
+		}
+	}
+	return time.Time{}
 }
 
 // skillOptTrainRunLockActivePhase reports whether the display phase is derived

@@ -261,6 +261,27 @@ func TestToTrainRunSnapshotPostOptimizerTerminalAndDecisionURL(t *testing.T) {
 	}
 }
 
+func TestTrainPhaseLockStartMatchesPhaseFamily(t *testing.T) {
+	optimizerAcquired := "2026-06-11T10:00:00Z"
+	locks := []skillOptTrainStatusLock{
+		// A leftover review lock from a killed step sorts first; it must NOT
+		// provide the optimizer phase's start time.
+		{Name: "review", Status: "active", AcquiredAt: "2026-06-11T08:00:00Z"},
+		{Name: "optimizer", Status: "active", AcquiredAt: optimizerAcquired},
+	}
+	got := trainPhaseLockStart("optimizer_running", locks)
+	want, _ := parseSkillOptStatusTime(optimizerAcquired)
+	if !got.Equal(want) {
+		t.Fatalf("optimizer phase start = %v, want %v", got, want)
+	}
+	if !trainPhaseLockStart("generating_options", locks).IsZero() {
+		t.Fatal("no generation lock → zero start")
+	}
+	if !trainPhaseLockStart("review_published", locks).IsZero() {
+		t.Fatal("non-long phases have no lock-derived start")
+	}
+}
+
 func TestToTrainRunSnapshot(t *testing.T) {
 	snap := skillOptTrainStatusSnapshot{
 		SessionID:       "s1",

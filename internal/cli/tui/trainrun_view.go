@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // trainPhaseSegments are the four coarse stages shown in the phase bar.
@@ -157,7 +158,11 @@ func (m TrainRunModel) body() string {
 	case "items_ready", "request_confirmed", "workspace_ready":
 		b.WriteString(fmt.Sprintf("%d review items ready to generate options\n", s.ReviewItems))
 	case "generating_options", "generating_options_heartbeat_stale":
+		b.WriteString(m.spin.View())
 		b.WriteString(fmt.Sprintf("generating options — %d running · %d done · %d failed", s.JobsRunning, s.JobsSucceeded, s.JobsFailed))
+		if elapsed := m.liveElapsed(); elapsed != "" {
+			b.WriteString(" · elapsed " + elapsed)
+		}
 		if s.ETA != "" && s.ETA != "unknown" {
 			b.WriteString("  (eta " + s.ETA + ")")
 		}
@@ -168,11 +173,20 @@ func (m TrainRunModel) body() string {
 		b.WriteString(m.issueBlock())
 		b.WriteString(fmt.Sprintf("feedback so far: %d\n", s.FeedbackCount))
 	case "optimizer_running", "optimizer_heartbeat_stale", "training_package_created":
-		b.WriteString("optimizer running")
-		if s.Elapsed != "" {
-			b.WriteString(" · " + s.Elapsed)
+		if s.Phase == "training_package_created" {
+			b.WriteString("optimizer ready to run")
+		} else {
+			b.WriteString(m.spin.View())
+			b.WriteString("optimizing")
+			if elapsed := m.liveElapsed(); elapsed != "" {
+				b.WriteString(" — elapsed " + elapsed)
+			}
 		}
 		b.WriteByte('\n')
+		if header := m.optimizerHeader(); header != "" {
+			b.WriteString(mutedStyle.Render(header))
+			b.WriteByte('\n')
+		}
 	case "candidate_created":
 		b.WriteString(fmt.Sprintf("candidate %s created — ready to publish the candidate review\n", dash(s.CandidateVersion)))
 	case "candidate_review_published":
@@ -220,6 +234,42 @@ func (m TrainRunModel) body() string {
 		b.WriteByte('\n')
 	}
 	return b.String()
+}
+
+// liveElapsed renders the time since the phase's lock was acquired, ticking
+// with the spinner redraws; without a lock timestamp it falls back to the
+// snapshot's coarse elapsed text.
+func (m TrainRunModel) liveElapsed() string {
+	if !m.snap.PhaseStartedAt.IsZero() {
+		elapsed := time.Since(m.snap.PhaseStartedAt)
+		if elapsed >= 0 {
+			return elapsed.Round(time.Second).String()
+		}
+	}
+	return m.snap.Elapsed
+}
+
+// optimizerHeader identifies what the optimizer run is: backend, model, and
+// attempt, from the metadata recorded at launch.
+func (m TrainRunModel) optimizerHeader() string {
+	parts := []string{}
+	if m.snap.OptimizerBackend != "" {
+		parts = append(parts, m.snap.OptimizerBackend)
+	}
+	model := m.snap.OptimizerModel
+	if model == "" && m.snap.OptimizerBackend != "" {
+		model = "backend default model"
+	}
+	if model != "" {
+		parts = append(parts, model)
+	}
+	if m.snap.OptimizerAttempt != "" {
+		parts = append(parts, m.snap.OptimizerAttempt)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "optimizer: " + strings.Join(parts, " · ")
 }
 
 // issueBlock renders the GitHub issue URL prominently with the continue-from-

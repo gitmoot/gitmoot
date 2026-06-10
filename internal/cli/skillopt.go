@@ -4537,9 +4537,13 @@ func continueSkillOptTrainOptimizer(ctx context.Context, paths config.Paths, sto
 		}
 		result.Command = command
 		result.Args = args
-		announceSkillOptTrainOptimizerLaunch(progress, request)
-		stopHeartbeat := startSkillOptTrainOptimizerHeartbeat(progress)
-		runResult, err := runSkillOptTrainOptimizer(ctx, optimizerPaths, request, command, args)
+		// One serialized writer shared by the launch banner, the heartbeat
+		// ticker, and the optimizer's streamed output: they write concurrently
+		// and the destination is not necessarily concurrency-safe.
+		sharedProgress := subprocess.SyncWriter(progress)
+		announceSkillOptTrainOptimizerLaunch(sharedProgress, request)
+		stopHeartbeat := startSkillOptTrainOptimizerHeartbeat(sharedProgress)
+		runResult, err := runSkillOptTrainOptimizer(ctx, sharedProgress, optimizerPaths, request, command, args)
 		stopHeartbeat()
 		result.RecoveryAvailable = skillOptTrainOptimizerRecoveryAvailable(optimizerPaths)
 		if err != nil {
@@ -8887,7 +8891,7 @@ func startSkillOptTrainOptimizerHeartbeat(progress io.Writer) func() {
 	}
 }
 
-func runSkillOptTrainOptimizer(ctx context.Context, paths skillOptTrainOptimizerPaths, request skillOptTrainOptimizerRequest, command string, args []string) (subprocess.Result, error) {
+func runSkillOptTrainOptimizer(ctx context.Context, progress io.Writer, paths skillOptTrainOptimizerPaths, request skillOptTrainOptimizerRequest, command string, args []string) (subprocess.Result, error) {
 	timeout := strings.TrimSpace(request.Timeout)
 	if timeout != "" {
 		duration, err := time.ParseDuration(timeout)
@@ -8904,7 +8908,17 @@ func runSkillOptTrainOptimizer(ctx context.Context, paths skillOptTrainOptimizer
 	if err := os.MkdirAll(paths.OutRoot, 0o755); err != nil {
 		return subprocess.Result{}, fmt.Errorf("create optimizer out-root: %w", err)
 	}
-	result, err := skillOptTrainOptimizerRunner.Run(ctx, paths.OutRoot, command, args...)
+	// Stream the optimizer's progress lines live when the runner supports it:
+	// in the detached phase-view child, progress IS the tailed session log, so
+	// the minibatch/analyst/accept lines appear as they happen instead of only
+	// after exit. The buffered Result is unchanged either way.
+	var result subprocess.Result
+	var err error
+	if streamer, ok := skillOptTrainOptimizerRunner.(subprocess.StreamRunner); ok && progress != nil {
+		result, err = streamer.RunStream(ctx, paths.OutRoot, progress, command, args...)
+	} else {
+		result, err = skillOptTrainOptimizerRunner.Run(ctx, paths.OutRoot, command, args...)
+	}
 	if err != nil {
 		return result, fmt.Errorf("optimizer failed: %w%s", err, subprocessDiagnostics(result))
 	}
@@ -8957,6 +8971,14 @@ func addSkillOptTrainOptimizerConfigMetadata(metadata map[string]any, request sk
 	}
 	if mode := strings.TrimSpace(request.FeedbackDirectMode); mode != "" {
 		metadata["feedback_direct_mode"] = mode
+	}
+	// Resolved backend/model identify WHAT is running; the phase view shows
+	// them in its header.
+	if value := firstNonEmpty(strings.TrimSpace(request.OptimizerBackend), strings.TrimSpace(request.Backend)); value != "" {
+		metadata["run_optimizer_backend"] = value
+	}
+	if value := firstNonEmpty(strings.TrimSpace(request.OptimizerModel), strings.TrimSpace(request.Model)); value != "" {
+		metadata["run_optimizer_model"] = value
 	}
 	if request.FinalEvalSet {
 		metadata["final_eval"] = request.FinalEval
