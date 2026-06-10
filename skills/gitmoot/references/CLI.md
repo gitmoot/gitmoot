@@ -333,11 +333,23 @@ gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals
 gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id> [--reviewer name]
 gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]
 gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)
-gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file items.yml [--workspace-repo owner/workspace] [--preview-repo owner/previews] [--preview-mode none|optional|required] [--preview-renderer none|vue-vite] [--preview-publisher none|github-pages] [--preview-route-template template] [--yes]
+gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file items.yml [--workspace-repo owner/workspace] [--preview-repo owner/previews] [--preview-mode none|optional|required] [--preview-renderer none|vue-vite] [--preview-publisher none|github-pages] [--preview-route-template template] [--create-repos] [--yes]
 gitmoot skillopt train status --session <id>
+gitmoot skillopt train run [--config path | --session <id>] [--plain]
 gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--dry-run] [--promote version|--reject version --reason text] [--start-next]
 gitmoot skillopt train stop --session <id> --reason <text>
 ```
+
+On a real terminal, `skillopt train run` opens an interactive view of one session
+(resolved from `--session` or the newest session of a `--config`): a phase bar
+plus a single keypress per step — `enter` advances the current phase (the long
+generate/optimizer steps run in a detached background process so `q` leaves the
+run going), `p`/`x` promote or reject a candidate, `n` starts the next iteration.
+Review-blocked phases show the GitHub issue link to continue from the browser.
+`--plain`, a piped stdin, or `GITMOOT_NO_TUI`/`TERM=dumb` print a one-shot status
+snapshot instead. `train status`/`continue` print a `continue_from_github:` line
+at review-blocked phases. `train start --create-repos` (or the prompt in the
+`train init` form) creates a missing target/workspace/review repo on GitHub.
 
 Use `skillopt train` for the product workflow. It pins the template version,
 tracks sessions and iterations, validates item diversity, generates temporary

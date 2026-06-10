@@ -319,6 +319,18 @@ terminal can answer it with `gitmoot interactive answer` and the form advances
 automatically. Set `GITMOOT_NO_TUI=1` (or pipe stdin) to use the line-based
 wizard instead.
 
+On a real terminal, `gitmoot skillopt train run [--config path | --session <id>]`
+opens an interactive view of one train session: a phase bar
+(generate → review → optimize → promote) and a single keypress per step — `enter`
+generates options / publishes the review / syncs feedback / runs the optimizer
+(the long generate and optimizer steps run in a detached background process, so
+quitting the TUI with `q` leaves the run going), `p`/`x` promote or reject a
+candidate, `n` starts the next iteration. At a review-blocked phase it shows the
+GitHub issue link so you can instead comment on the issue and let the
+review-watcher continue. Piped/`--plain`/`GITMOOT_NO_TUI` print a one-shot status
+snapshot. Pass `--create-repos` to `train start` (or accept the in-form prompt
+during `train init`) to create a missing target/workspace/review repo on GitHub.
+
 For lower-level debugging, create a review run, add saved baseline/candidate outputs as review items,
 export a Markdown or GitHub feedback packet, import the completed feedback, then
 export `training.json` for a future external `gitmoot-skillopt` optimizer.
