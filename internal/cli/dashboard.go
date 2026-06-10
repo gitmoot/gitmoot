@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -8,8 +9,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jerryfane/gitmoot/internal/cli/style"
@@ -110,6 +113,8 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 	answerID := fs.String("answer", "", "pending prompt id to answer before showing the snapshot")
 	answerValue := fs.String("value", "", "answer value to use with --answer")
 	answerSource := fs.String("source", "dashboard", "answer source recorded with --answer")
+	watch := fs.Bool("watch", false, "refresh the snapshot on an interval until interrupted (terminal only)")
+	interval := fs.Duration("interval", 5*time.Second, "refresh interval for --watch")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -119,6 +124,21 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 	if fs.NArg() != 0 {
 		fmt.Fprintln(stderr, "dashboard does not accept positional arguments")
 		return 2
+	}
+	if *watch {
+		if *jsonOutput || strings.TrimSpace(*answerID) != "" {
+			fmt.Fprintln(stderr, "dashboard --watch cannot be combined with --json or --answer")
+			return 2
+		}
+		if !style.IsTerminal(stdout) {
+			fmt.Fprintln(stderr, "dashboard --watch requires a terminal")
+			return 2
+		}
+		if *interval <= 0 {
+			fmt.Fprintln(stderr, "dashboard --interval must be greater than zero")
+			return 2
+		}
+		return runDashboardWatch(stdout, *home, *all, *interval)
 	}
 
 	paths, err := initializedPaths(*home)
@@ -151,8 +171,50 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	printDashboardSnapshot(stdout, snapshot, *home, *all)
+	printDashboardSnapshot(stdout, style.For(stdout), snapshot, *home, *all)
 	return 0
+}
+
+// runDashboardWatch redraws the dashboard every interval until interrupted. Each
+// frame is rendered to a buffer and written once (after a cursor-home + clear)
+// to avoid flicker; transient store errors are shown in the frame rather than
+// ending the loop.
+func runDashboardWatch(stdout io.Writer, home string, all bool, interval time.Duration) int {
+	st := style.For(stdout)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	first := true
+	for {
+		var body bytes.Buffer
+		if paths, err := initializedPaths(home); err != nil {
+			fmt.Fprintf(&body, "dashboard: %v\n", err)
+		} else if snapshot, err := buildDashboardSnapshot(home, paths); err != nil {
+			fmt.Fprintf(&body, "dashboard: %v\n", err)
+		} else {
+			printDashboardSnapshot(&body, st, snapshot, home, all)
+		}
+		_, _ = stdout.Write(dashboardWatchFrame(body.Bytes(), first))
+		first = false
+		select {
+		case <-ctx.Done():
+			fmt.Fprintln(stdout)
+			return 0
+		case <-time.After(interval):
+		}
+	}
+}
+
+// dashboardWatchFrame wraps a rendered snapshot body with the terminal control
+// codes for an in-place redraw: clear-screen on the first frame, then
+// cursor-home + clear-below on every frame.
+func dashboardWatchFrame(body []byte, first bool) []byte {
+	var frame bytes.Buffer
+	if first {
+		frame.WriteString("\x1b[2J")
+	}
+	frame.WriteString("\x1b[H\x1b[0J")
+	frame.Write(body)
+	return frame.Bytes()
 }
 
 func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot, error) {
@@ -286,8 +348,7 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 	return snapshot, nil
 }
 
-func printDashboardSnapshot(stdout io.Writer, snapshot dashboardSnapshot, home string, all bool) {
-	st := style.For(stdout)
+func printDashboardSnapshot(stdout io.Writer, st style.Style, snapshot dashboardSnapshot, home string, all bool) {
 	printDashboardAttention(stdout, st, snapshot, home)
 
 	writeLine(stdout, "home: %s", snapshot.Home)

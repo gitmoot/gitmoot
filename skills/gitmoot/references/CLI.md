@@ -71,8 +71,16 @@ state.
 ```sh
 gitmoot dashboard
 gitmoot dashboard --json
+gitmoot dashboard --all
 gitmoot dashboard --answer <prompt-id> --value <value>
+gitmoot dashboard --watch          # refresh until Ctrl-C (terminal only)
+gitmoot dashboard --watch --interval 2s
 ```
+
+In styled (terminal) output the dashboard leads with a "needs attention" block,
+colors and truncates long lists, and groups near-identical runtime sessions;
+`--all` shows everything. `--watch` redraws on an interval (default 5s) and
+cannot be combined with `--json` or `--answer`.
 
 ## Agent Setup
 

@@ -268,3 +268,33 @@ func TestDashboardLockStale(t *testing.T) {
 		t.Fatalf("unparseable expiry should not be stale")
 	}
 }
+
+func TestDashboardWatchRejectsInvalidCombos(t *testing.T) {
+	home := dashboardTestHome(t)
+	cases := [][]string{
+		{"dashboard", "--home", home, "--watch", "--json"},
+		{"dashboard", "--home", home, "--watch", "--answer", "p1", "--value", "x"},
+		{"dashboard", "--home", home, "--watch"}, // stdout is a bytes.Buffer, not a terminal
+	}
+	for _, args := range cases {
+		var stdout, stderr bytes.Buffer
+		if code := Run(args, &stdout, &stderr); code != 2 {
+			t.Fatalf("Run(%v) = %d, want 2; stderr=%s", args, code, stderr.String())
+		}
+	}
+}
+
+func TestDashboardWatchFrame(t *testing.T) {
+	body := []byte("home: /h\n")
+	first := dashboardWatchFrame(body, true)
+	if !bytes.HasPrefix(first, []byte("\x1b[2J\x1b[H\x1b[0J")) || !bytes.Contains(first, body) {
+		t.Fatalf("first frame = %q", first)
+	}
+	next := dashboardWatchFrame(body, false)
+	if bytes.Contains(next, []byte("\x1b[2J")) {
+		t.Fatalf("non-first frame should not clear the whole screen: %q", next)
+	}
+	if !bytes.HasPrefix(next, []byte("\x1b[H\x1b[0J")) || !bytes.Contains(next, body) {
+		t.Fatalf("next frame = %q", next)
+	}
+}

@@ -107,6 +107,13 @@ func windowsVTCapable(lookup func(string) (string, bool)) bool {
 	return false
 }
 
+// IsTerminal reports whether w is a character device (a real terminal),
+// independent of the NO_COLOR / TERM color conventions. Use it to gate
+// terminal-only features such as a refreshing watch loop.
+func IsTerminal(w io.Writer) bool {
+	return isCharDevice(w)
+}
+
 func isCharDevice(w io.Writer) bool {
 	stater, ok := w.(interface {
 		Stat() (os.FileInfo, error)
