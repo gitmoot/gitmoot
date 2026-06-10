@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jerryfane/gitmoot/internal/cli/style"
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
 )
@@ -172,5 +174,97 @@ func TestDashboardWithoutAnswerDoesNotMutate(t *testing.T) {
 	}
 	if prompt.State != db.InteractivePromptStatePending {
 		t.Fatalf("dashboard without --answer must not resolve prompts: %+v", prompt)
+	}
+}
+
+func TestDashboardAttentionBlock(t *testing.T) {
+	home := dashboardTestHome(t)
+	seedDashboardPrompt(t, home, "attn.prompt", "Pick", nil)
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"dashboard", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("dashboard exit = %d, stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"needs attention:",
+		"prompt attn.prompt",
+		"gitmoot interactive answer --home " + home + " attn.prompt <value>",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("attention block missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestDashboardStyledRendering(t *testing.T) {
+	t.Setenv("CLICOLOR_FORCE", "1")
+	t.Setenv("NO_COLOR", "")
+	home := dashboardTestHome(t)
+	seedDashboardPrompt(t, home, "styled.prompt", "Pick", nil)
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"dashboard", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("dashboard exit = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "\x1b[") {
+		t.Fatalf("expected ANSI styling with CLICOLOR_FORCE:\n%q", stdout.String())
+	}
+}
+
+func TestDashboardAnswerCommand(t *testing.T) {
+	if got := dashboardAnswerCommand("/h", "p1"); got != "gitmoot interactive answer --home /h p1 <value>" {
+		t.Fatalf("with home = %q", got)
+	}
+	if got := dashboardAnswerCommand("", "p1"); got != "gitmoot interactive answer p1 <value>" {
+		t.Fatalf("no home = %q", got)
+	}
+}
+
+func TestDashboardTruncate(t *testing.T) {
+	items := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	if shown, hidden := dashboardTruncate(style.Enabled(), false, items); len(shown) != dashboardListCap || hidden != 2 {
+		t.Fatalf("styled truncate = %d shown, %d hidden", len(shown), hidden)
+	}
+	if shown, hidden := dashboardTruncate(style.Enabled(), true, items); len(shown) != 10 || hidden != 0 {
+		t.Fatalf("--all should keep all: %d, %d", len(shown), hidden)
+	}
+	if shown, hidden := dashboardTruncate(style.Disabled(), false, items); len(shown) != 10 || hidden != 0 {
+		t.Fatalf("plain mode keeps all: %d, %d", len(shown), hidden)
+	}
+}
+
+func TestGroupedRuntimeSessions(t *testing.T) {
+	sessions := []dashboardSession{
+		{Name: "skillopt-generator-bg-aaa", Runtime: "codex", State: "idle"},
+		{Name: "skillopt-generator-bg-bbb", Runtime: "codex", State: "idle"},
+		{Name: "skillopt-generator-bg-ccc", Runtime: "codex", State: "running"},
+		{Name: "planner", Runtime: "codex", Repo: "owner/repo", State: "idle"},
+	}
+	lines := groupedRuntimeSessions(sessions)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "skillopt-generator [codex] ×2 idle") {
+		t.Fatalf("missing grouped idle ×2:\n%s", joined)
+	}
+	if !strings.Contains(joined, "skillopt-generator [codex] ×1 running") {
+		t.Fatalf("missing grouped running ×1:\n%s", joined)
+	}
+	if !strings.Contains(joined, "planner [codex] owner/repo idle") {
+		t.Fatalf("ungrouped single missing:\n%s", joined)
+	}
+}
+
+func TestDashboardLockStale(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	past := "2026-06-10T11:00:00.000000000Z"
+	future := "2026-06-10T13:00:00.000000000Z"
+	if !dashboardLockStale(past, now) {
+		t.Fatalf("past expiry should be stale")
+	}
+	if dashboardLockStale(future, now) {
+		t.Fatalf("future expiry should not be stale")
+	}
+	if dashboardLockStale("not-a-time", now) {
+		t.Fatalf("unparseable expiry should not be stale")
 	}
 }

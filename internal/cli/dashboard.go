@@ -10,11 +10,17 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/jerryfane/gitmoot/internal/cli/style"
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/skillopt"
 )
+
+// dashboardListCap is how many entries each list shows in styled mode before
+// truncating with a "… N more" line; --all overrides it.
+const dashboardListCap = 8
 
 // dashboardSnapshot is a read-only view of local Gitmoot state. It is assembled
 // entirely from existing store/status sources; the dashboard never owns
@@ -31,7 +37,14 @@ type dashboardSnapshot struct {
 	Worktrees       []dashboardWorktree     `json:"worktrees"`
 	BranchLocks     []dashboardBranchLock   `json:"branch_locks"`
 	TrainSessions   []dashboardTrainSession `json:"train_sessions"`
+	ResourceLocks   []dashboardResourceLock `json:"resource_locks"`
 	PendingPrompts  []dashboardPrompt       `json:"pending_prompts"`
+}
+
+type dashboardResourceLock struct {
+	Key   string `json:"key"`
+	Owner string `json:"owner,omitempty"`
+	Stale bool   `json:"stale"`
 }
 
 type dashboardDaemon struct {
@@ -93,6 +106,7 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOutput := fs.Bool("json", false, "write the snapshot as JSON")
+	all := fs.Bool("all", false, "show full lists without truncation or grouping")
 	answerID := fs.String("answer", "", "pending prompt id to answer before showing the snapshot")
 	answerValue := fs.String("value", "", "answer value to use with --answer")
 	answerSource := fs.String("source", "dashboard", "answer source recorded with --answer")
@@ -137,7 +151,7 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	printDashboardSnapshot(stdout, snapshot)
+	printDashboardSnapshot(stdout, snapshot, *home, *all)
 	return 0
 }
 
@@ -152,8 +166,10 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 		Worktrees:       []dashboardWorktree{},
 		BranchLocks:     []dashboardBranchLock{},
 		TrainSessions:   []dashboardTrainSession{},
+		ResourceLocks:   []dashboardResourceLock{},
 		PendingPrompts:  []dashboardPrompt{},
 	}
+	now := time.Now().UTC()
 	if info, err := os.Stat(paths.Database); err == nil && !info.IsDir() {
 		snapshot.DatabaseExists = true
 	}
@@ -235,6 +251,17 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 			}
 			snapshot.TrainSessions = append(snapshot.TrainSessions, entry)
 		}
+		resourceLocks, err := store.ListResourceLocks(ctx)
+		if err != nil {
+			return err
+		}
+		for _, lock := range resourceLocks {
+			snapshot.ResourceLocks = append(snapshot.ResourceLocks, dashboardResourceLock{
+				Key:   lock.ResourceKey,
+				Owner: lock.OwnerJobID,
+				Stale: dashboardLockStale(lock.ExpiresAt, now),
+			})
+		}
 		prompts, err := store.ListInteractivePrompts(ctx, db.InteractivePromptStatePending)
 		if err != nil {
 			return err
@@ -250,7 +277,10 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 	return snapshot, nil
 }
 
-func printDashboardSnapshot(stdout io.Writer, snapshot dashboardSnapshot) {
+func printDashboardSnapshot(stdout io.Writer, snapshot dashboardSnapshot, home string, all bool) {
+	st := style.For(stdout)
+	printDashboardAttention(stdout, st, snapshot, home)
+
 	writeLine(stdout, "home: %s", snapshot.Home)
 	writeLine(stdout, "database: %s (%s)", snapshot.DatabasePath, presentOrMissing(snapshot.DatabaseExists))
 	if snapshot.Daemon.Running {
@@ -259,38 +289,187 @@ func printDashboardSnapshot(stdout io.Writer, snapshot dashboardSnapshot) {
 		writeLine(stdout, "daemon: stopped")
 	}
 
-	writeLine(stdout, "repos: %d", len(snapshot.Repos))
-	for _, repo := range snapshot.Repos {
-		writeLine(stdout, "  %s (%s)", repo.Name, enabledOrDisabled(repo.Enabled))
+	dashboardSectionHeader(stdout, st, "repos", len(snapshot.Repos))
+	repos, hidden := dashboardTruncate(st, all, snapshot.Repos)
+	for _, repo := range repos {
+		status := enabledOrDisabled(repo.Enabled)
+		if repo.Enabled {
+			status = st.Green(status)
+		} else {
+			status = st.Dim(status)
+		}
+		writeLine(stdout, "  %s (%s)", repo.Name, status)
 	}
-	writeLine(stdout, "agents: %d", len(snapshot.Agents))
-	for _, agent := range snapshot.Agents {
+	dashboardMore(stdout, st, hidden)
+
+	dashboardSectionHeader(stdout, st, "agents", len(snapshot.Agents))
+	agents, hidden := dashboardTruncate(st, all, snapshot.Agents)
+	for _, agent := range agents {
 		writeLine(stdout, "  %s [%s]%s", agent.Name, agent.Runtime, dashboardSuffix(agent.Role, agent.Health))
 	}
-	writeLine(stdout, "runtime_sessions: %d", len(snapshot.RuntimeSessions))
-	for _, session := range snapshot.RuntimeSessions {
-		writeLine(stdout, "  %s [%s] %s %s", session.Name, session.Runtime, emptyText(session.Repo), session.State)
+	dashboardMore(stdout, st, hidden)
+
+	dashboardSectionHeader(stdout, st, "runtime_sessions", len(snapshot.RuntimeSessions))
+	if st.Enabled() && !all {
+		for _, line := range groupedRuntimeSessions(snapshot.RuntimeSessions) {
+			writeLine(stdout, "  %s", line)
+		}
+	} else {
+		for _, session := range snapshot.RuntimeSessions {
+			writeLine(stdout, "  %s [%s] %s %s", session.Name, session.Runtime, emptyText(session.Repo), session.State)
+		}
 	}
-	writeLine(stdout, "jobs: %d", snapshot.Jobs.Total)
+
+	dashboardSectionHeader(stdout, st, "jobs", snapshot.Jobs.Total)
 	for _, state := range sortedKeys(snapshot.Jobs.ByState) {
-		writeLine(stdout, "  %s: %d", state, snapshot.Jobs.ByState[state])
+		writeLine(stdout, "  %s: %d", dashboardJobStateColor(st, state), snapshot.Jobs.ByState[state])
 	}
-	writeLine(stdout, "worktrees: %d", len(snapshot.Worktrees))
-	for _, worktree := range snapshot.Worktrees {
+
+	dashboardSectionHeader(stdout, st, "worktrees", len(snapshot.Worktrees))
+	worktrees, hidden := dashboardTruncate(st, all, snapshot.Worktrees)
+	for _, worktree := range worktrees {
 		writeLine(stdout, "  %s %s", worktree.Task, worktree.Path)
 	}
-	writeLine(stdout, "branch_locks: %d", len(snapshot.BranchLocks))
+	dashboardMore(stdout, st, hidden)
+
+	dashboardSectionHeader(stdout, st, "branch_locks", len(snapshot.BranchLocks))
 	for _, lock := range snapshot.BranchLocks {
 		writeLine(stdout, "  %s@%s %s", lock.Repo, lock.Branch, emptyText(lock.Owner))
 	}
-	writeLine(stdout, "train_sessions: %d", len(snapshot.TrainSessions))
-	for _, train := range snapshot.TrainSessions {
-		writeLine(stdout, "  %s phase=%s candidate=%s", train.ID, train.Phase, emptyText(train.Candidate))
+
+	dashboardSectionHeader(stdout, st, "train_sessions", len(snapshot.TrainSessions))
+	trains, hidden := dashboardTruncate(st, all, snapshot.TrainSessions)
+	for _, train := range trains {
+		line := fmt.Sprintf("%s phase=%s candidate=%s", train.ID, train.Phase, emptyText(train.Candidate))
+		if dashboardDeadTrainPhase(train.Phase) {
+			line = st.Dim(line)
+		}
+		writeLine(stdout, "  %s", line)
 	}
-	writeLine(stdout, "pending_prompts: %d", len(snapshot.PendingPrompts))
+	dashboardMore(stdout, st, hidden)
+
+	dashboardSectionHeader(stdout, st, "pending_prompts", len(snapshot.PendingPrompts))
 	for _, prompt := range snapshot.PendingPrompts {
 		writeLine(stdout, "  %s\t%s", prompt.ID, prompt.Question)
 	}
+}
+
+// printDashboardAttention prints, before the regular sections, the things a
+// human most likely needs to act on. It is additive and shown in both styled and
+// plain modes; it prints nothing when there is nothing to flag.
+func printDashboardAttention(stdout io.Writer, st style.Style, snapshot dashboardSnapshot, home string) {
+	lines := []string{}
+	for _, prompt := range snapshot.PendingPrompts {
+		lines = append(lines, st.Yellow("prompt")+" "+prompt.ID)
+		lines = append(lines, "  "+st.Dim(dashboardAnswerCommand(home, prompt.ID)))
+	}
+	if blocked := snapshot.Jobs.ByState["blocked"]; blocked > 0 {
+		lines = append(lines, st.Red(fmt.Sprintf("%d blocked job(s)", blocked)))
+	}
+	if failed := snapshot.Jobs.ByState["failed"]; failed > 0 {
+		lines = append(lines, st.Red(fmt.Sprintf("%d failed job(s)", failed)))
+	}
+	for _, lock := range snapshot.BranchLocks {
+		lines = append(lines, fmt.Sprintf("branch lock %s@%s %s", lock.Repo, lock.Branch, emptyText(lock.Owner)))
+	}
+	for _, lock := range snapshot.ResourceLocks {
+		if lock.Stale {
+			lines = append(lines, st.Red("stale lock")+" "+lock.Key)
+		}
+	}
+	if len(lines) == 0 {
+		return
+	}
+	writeLine(stdout, "%s", st.Bold("needs attention:"))
+	for _, line := range lines {
+		writeLine(stdout, "  %s", line)
+	}
+	writeLine(stdout, "")
+}
+
+func dashboardAnswerCommand(home, id string) string {
+	if strings.TrimSpace(home) != "" {
+		return fmt.Sprintf("gitmoot interactive answer --home %s %s <value>", home, id)
+	}
+	return fmt.Sprintf("gitmoot interactive answer %s <value>", id)
+}
+
+func dashboardSectionHeader(stdout io.Writer, st style.Style, name string, count int) {
+	fmt.Fprintf(stdout, "%s %d\n", st.Bold(name+":"), count)
+}
+
+// dashboardTruncate limits a list to dashboardListCap in styled mode; --all and
+// plain mode keep everything.
+func dashboardTruncate[T any](st style.Style, all bool, items []T) ([]T, int) {
+	if all || !st.Enabled() {
+		return items, 0
+	}
+	return style.TopN(items, dashboardListCap)
+}
+
+func dashboardMore(stdout io.Writer, st style.Style, hidden int) {
+	if hidden > 0 {
+		writeLine(stdout, "  %s", st.Dim(fmt.Sprintf("… %d more (use --all)", hidden)))
+	}
+}
+
+func dashboardJobStateColor(st style.Style, state string) string {
+	switch state {
+	case "failed", "blocked":
+		return st.Red(state)
+	case "succeeded":
+		return st.Green(state)
+	case "running":
+		return st.Cyan(state)
+	default:
+		return state
+	}
+}
+
+func dashboardDeadTrainPhase(phase string) bool {
+	switch phase {
+	case "run_abandoned", "candidate_rejected", "candidate_promoted":
+		return true
+	default:
+		return false
+	}
+}
+
+// groupedRuntimeSessions collapses generated "<type>-bg-<hex>" sessions sharing
+// a type/runtime/state into a single counted line, leaving other sessions
+// individual.
+func groupedRuntimeSessions(sessions []dashboardSession) []string {
+	type groupKey struct{ prefix, runtime, state string }
+	order := []groupKey{}
+	counts := map[groupKey]int{}
+	singles := []dashboardSession{}
+	for _, session := range sessions {
+		if prefix, ok := style.GroupSuffix(session.Name); ok {
+			key := groupKey{prefix: prefix, runtime: session.Runtime, state: session.State}
+			if counts[key] == 0 {
+				order = append(order, key)
+			}
+			counts[key]++
+		} else {
+			singles = append(singles, session)
+		}
+	}
+	lines := make([]string, 0, len(order)+len(singles))
+	for _, key := range order {
+		lines = append(lines, fmt.Sprintf("%s [%s] ×%d %s", key.prefix, key.runtime, counts[key], key.state))
+	}
+	for _, session := range singles {
+		lines = append(lines, fmt.Sprintf("%s [%s] %s %s", session.Name, session.Runtime, emptyText(session.Repo), session.State))
+	}
+	return lines
+}
+
+func dashboardLockStale(expiresAt string, now time.Time) bool {
+	expiry, err := time.Parse("2006-01-02T15:04:05.000000000Z", strings.TrimSpace(expiresAt))
+	if err != nil {
+		return false
+	}
+	return expiry.Before(now)
 }
 
 func presentOrMissing(present bool) string {

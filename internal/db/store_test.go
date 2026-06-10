@@ -976,6 +976,45 @@ func TestFeedbackEventMethods(t *testing.T) {
 	}
 }
 
+func TestListResourceLocks(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	empty, err := store.ListResourceLocks(ctx)
+	if err != nil {
+		t.Fatalf("ListResourceLocks empty returned error: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("expected no locks, got %d", len(empty))
+	}
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	for _, key := range []string{"runtime:codex:a", "generation:session-1"} {
+		if _, err := store.AcquireResourceLock(ctx, ResourceLock{
+			ResourceKey: key,
+			OwnerJobID:  "job-" + key,
+			OwnerToken:  "token",
+			ExpiresAt:   now.Add(time.Minute).Format(time.RFC3339Nano),
+		}, now); err != nil {
+			t.Fatalf("AcquireResourceLock(%s) returned error: %v", key, err)
+		}
+	}
+	locks, err := store.ListResourceLocks(ctx)
+	if err != nil {
+		t.Fatalf("ListResourceLocks returned error: %v", err)
+	}
+	if len(locks) != 2 {
+		t.Fatalf("expected 2 locks, got %d: %+v", len(locks), locks)
+	}
+	// Ordered by resource_key: "generation:..." < "runtime:...".
+	if locks[0].ResourceKey != "generation:session-1" {
+		t.Fatalf("locks not ordered by key: %+v", locks)
+	}
+}
+
 func TestResourceLockMethods(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
