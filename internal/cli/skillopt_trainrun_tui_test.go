@@ -236,6 +236,31 @@ func TestTailSkillOptTrainLog(t *testing.T) {
 	}
 }
 
+func TestToTrainRunSnapshotPostOptimizerTerminalAndDecisionURL(t *testing.T) {
+	// Post-optimizer the display phase stays "optimizer_completed_candidate";
+	// terminality and the decision link must follow the iteration phase.
+	snap := skillOptTrainStatusSnapshot{
+		SessionID:    "s1",
+		StatusPhase:  "optimizer_completed_candidate",
+		CurrentPhase: "candidate_promoted",
+		Verbose: &skillOptTrainStatusVerbose{
+			Candidate: skillOptTrainStatusCandidate{PullRequestURL: "https://github.com/o/r/issues/7#issuecomment-1"},
+		},
+	}
+	out := toTrainRunSnapshot(snap)
+	if !out.Terminal {
+		t.Fatalf("promoted iteration must be terminal: %+v", out)
+	}
+	if out.CandidateReviewURL != "https://github.com/o/r/issues/7#issuecomment-1" {
+		t.Fatalf("candidate review URL not mapped: %+v", out)
+	}
+	// Without verbose details the URL is simply absent.
+	snap.Verbose = nil
+	if out := toTrainRunSnapshot(snap); out.CandidateReviewURL != "" || !out.Terminal {
+		t.Fatalf("non-verbose mapping wrong: %+v", out)
+	}
+}
+
 func TestToTrainRunSnapshot(t *testing.T) {
 	snap := skillOptTrainStatusSnapshot{
 		SessionID:       "s1",

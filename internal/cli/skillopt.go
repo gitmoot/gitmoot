@@ -6976,6 +6976,12 @@ func buildSkillOptTrainStatusVerbose(ctx context.Context, store *db.Store, sessi
 		NoCandidateReason:  metadataString(candidateImport, "no_candidate_reason"),
 		NoCandidateDetails: decodedSkillOptMetadataValue(candidateImport["no_candidate_details"]),
 	}
+	if details.Candidate.PullRequestURL == "" {
+		// Issue-based candidate reviews never set iteration.PullRequestURL; the
+		// decision link lives in the candidate_review metadata instead.
+		review := decodedSkillOptMetadataValue(iterationMetadata["candidate_review"])
+		details.Candidate.PullRequestURL = skillOptCandidateReviewURLFromMetadata(review)
+	}
 	if optimizer := decodedSkillOptMetadataValue(iterationMetadata["optimizer"]); len(optimizer) > 0 {
 		candidateImport := decodedSkillOptMetadataValue(iterationMetadata["candidate_import"])
 		if attemptState := skillOptTrainOptimizerAttemptState(skillopt.NormalizeTrainState(iteration.State), optimizer, candidateImport); attemptState != "" {

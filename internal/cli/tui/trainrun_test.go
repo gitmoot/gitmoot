@@ -225,6 +225,57 @@ func TestTrainRunActionsGateOnIterationPhase(t *testing.T) {
 	}
 }
 
+func TestTrainRunTerminalKeysAndDecisionLinkPostOptimizer(t *testing.T) {
+	// Display phase stuck at optimizer_completed_candidate, iteration promoted:
+	// the terminal screen must offer n and show the candidate review link.
+	snap := TrainRunSnapshot{
+		SessionID:          "s",
+		Phase:              "optimizer_completed_candidate",
+		ActionPhase:        "candidate_promoted",
+		Terminal:           true,
+		CandidateVersion:   "c@v2",
+		CandidateReviewURL: "https://github.com/o/r/issues/7#issuecomment-1",
+	}
+	started := false
+	deps := TrainRunDeps{
+		Load:      func() (TrainRunSnapshot, error) { return snap, nil },
+		StartNext: func() (TrainRunActionResult, error) { started = true; return TrainRunActionResult{}, nil },
+	}
+	m := trainRunModelWithDeps(t, deps, snap)
+	view := m.View()
+	for _, want := range []string{"n start next iteration", "candidate review: https://github.com/o/r/issues/7#issuecomment-1", "promoted"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("terminal view missing %q:\n%s", want, view)
+		}
+	}
+	next, cmd := m.Update(key("n"))
+	m = next.(TrainRunModel)
+	if cmd == nil {
+		t.Fatal("n should start the next iteration")
+	}
+	cmd()
+	if !started {
+		t.Fatal("StartNext should have been called")
+	}
+}
+
+func TestTrainRunPromoteScreenShowsDecisionLink(t *testing.T) {
+	snap := TrainRunSnapshot{
+		SessionID:          "s",
+		Phase:              "optimizer_completed_candidate",
+		ActionPhase:        "candidate_review_published",
+		CandidateVersion:   "c@v2",
+		CandidateReviewURL: "https://github.com/o/r/issues/7#issuecomment-1",
+	}
+	m := trainRunModelWithDeps(t, TrainRunDeps{Load: func() (TrainRunSnapshot, error) { return snap, nil }}, snap)
+	view := m.View()
+	for _, want := range []string{"candidate: c@v2", "candidate review: https://github.com/o/r/issues/7#issuecomment-1", "p promote"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("promote view missing %q:\n%s", want, view)
+		}
+	}
+}
+
 func TestTrainRunRejectRequiresReason(t *testing.T) {
 	var gotReason string
 	decided := false

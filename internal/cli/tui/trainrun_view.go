@@ -190,6 +190,23 @@ func (m TrainRunModel) body() string {
 		b.WriteString(fmt.Sprintf("candidate %s rejected\n", dash(s.CandidateVersion)))
 	}
 
+	// Post-optimizer the display phase can stay "optimizer_completed_candidate"
+	// while the iteration advances, so the switch above misses the decision and
+	// terminal lines; render them from the iteration phase too.
+	if s.Phase != m.actionPhase() {
+		switch m.actionPhase() {
+		case "candidate_created":
+			b.WriteString(fmt.Sprintf("candidate %s created — ready to publish the candidate review\n", dash(s.CandidateVersion)))
+		case "candidate_review_published":
+			b.WriteString(fmt.Sprintf("candidate: %s\n", dash(s.CandidateVersion)))
+		case "candidate_promoted":
+			b.WriteString(greenStyle.Render(fmt.Sprintf("candidate %s promoted", dash(s.CandidateVersion))) + "\n")
+		case "candidate_rejected":
+			b.WriteString(fmt.Sprintf("candidate %s rejected\n", dash(s.CandidateVersion)))
+		}
+	}
+	b.WriteString(m.candidateDecisionBlock())
+
 	if isLongTrainPhase(s.Phase) && len(m.logLines) > 0 {
 		b.WriteByte('\n')
 		for _, line := range m.logLines {
@@ -213,4 +230,21 @@ func (m TrainRunModel) issueBlock() string {
 	}
 	return selectedRowStyle.Render("review issue: "+m.snap.IssueURL) + "\n" +
 		mutedStyle.Render("comment on the issue — the review watcher picks it up") + "\n"
+}
+
+// candidateDecisionBlock renders the candidate review link when a promote or
+// reject decision is pending (or just made), so the user can decide from
+// GitHub instead of the keys.
+func (m TrainRunModel) candidateDecisionBlock() string {
+	if strings.TrimSpace(m.snap.CandidateReviewURL) == "" {
+		return ""
+	}
+	if m.actionPhase() != "candidate_review_published" && !m.snap.Terminal {
+		return ""
+	}
+	block := selectedRowStyle.Render("candidate review: "+m.snap.CandidateReviewURL) + "\n"
+	if m.actionPhase() == "candidate_review_published" {
+		block += mutedStyle.Render("decide here with p/x — or comment on GitHub, the review watcher picks it up") + "\n"
+	}
+	return block
 }

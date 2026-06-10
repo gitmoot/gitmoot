@@ -11,26 +11,27 @@ import (
 // TrainRunSnapshot is the TUI-facing view of one train session's live state,
 // adapted by the cli from the skillopt status snapshot.
 type TrainRunSnapshot struct {
-	SessionID         string
-	IterationID       string
-	Template          string // "<id>@<version>"
-	ReviewRepo        string
-	WorkspaceRepo     string
-	Phase             string // lock-aware stable status phase (display)
-	ActionPhase       string // iteration phase gating the action keys; falls back to Phase when empty
-	NextAction        string
-	IssueURL          string // review issue (or candidate review issue) URL
-	CandidateVersion  string
-	NoCandidateReason string
-	FeedbackCount     int
-	ReviewItems       int
-	GeneratedOptions  int
-	JobsRunning       int
-	JobsSucceeded     int
-	JobsFailed        int
-	ETA               string
-	Elapsed           string
-	Terminal          bool
+	SessionID          string
+	IterationID        string
+	Template           string // "<id>@<version>"
+	ReviewRepo         string
+	WorkspaceRepo      string
+	Phase              string // lock-aware stable status phase (display)
+	ActionPhase        string // iteration phase gating the action keys; falls back to Phase when empty
+	NextAction         string
+	IssueURL           string // review issue (or candidate review issue) URL
+	CandidateVersion   string
+	CandidateReviewURL string // GitHub comment/issue where the promote/reject decision can also be made
+	NoCandidateReason  string
+	FeedbackCount      int
+	ReviewItems        int
+	GeneratedOptions   int
+	JobsRunning        int
+	JobsSucceeded      int
+	JobsFailed         int
+	ETA                string
+	Elapsed            string
+	Terminal           bool
 }
 
 // TrainRunActionResult carries the output lines from a short in-process phase

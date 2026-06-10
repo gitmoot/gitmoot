@@ -431,15 +431,33 @@ func toTrainRunSnapshot(s skillOptTrainStatusSnapshot) tui.TrainRunSnapshot {
 		FeedbackCount:     s.Counts.FeedbackEvents + s.Counts.RankedFeedbackEvents,
 		GeneratedOptions:  s.Progress.GeneratedOptions,
 		ETA:               s.Progress.ETA,
-		Terminal:          skillOptTrainRunTerminalPhase(s.StatusPhase),
+		// The iteration phase decides terminality: post-optimizer the display
+		// phase stays "optimizer_completed_candidate" even once the iteration
+		// is promoted/rejected (the #254 family of bugs). A lock-active display
+		// phase suppresses it: a session stopped while a detached worker still
+		// holds a lock is not actionable until the worker settles.
+		Terminal: skillOptTrainRunTerminalPhase(firstNonEmpty(s.CurrentPhase, s.StatusPhase)) &&
+			!skillOptTrainRunLockActivePhase(s.StatusPhase),
 	}
 	if s.Verbose != nil {
+		out.CandidateReviewURL = strings.TrimSpace(s.Verbose.Candidate.PullRequestURL)
 		out.Elapsed = s.Verbose.Elapsed
 		out.JobsRunning = s.Verbose.Jobs.Running
 		out.JobsSucceeded = s.Verbose.Jobs.Succeeded
 		out.JobsFailed = s.Verbose.Jobs.Failed
 	}
 	return out
+}
+
+// skillOptTrainRunLockActivePhase reports whether the display phase is derived
+// from a live resource lock (a detached worker is still running).
+func skillOptTrainRunLockActivePhase(phase string) bool {
+	switch phase {
+	case "generating_options", "generating_options_heartbeat_stale", "optimizer_running", "optimizer_heartbeat_stale":
+		return true
+	default:
+		return false
+	}
 }
 
 func skillOptTrainRunTerminalPhase(phase string) bool {
