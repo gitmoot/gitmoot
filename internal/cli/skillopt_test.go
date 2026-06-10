@@ -1132,6 +1132,61 @@ func TestSkillOptTrainInitCompletesFromPromptAnswers(t *testing.T) {
 	}
 }
 
+func TestSkillOptTrainInitWizardConfirm(t *testing.T) {
+	answers := "confirm-flow\nplanner\njerryfane/gitmoot\ntext\ntext-table\nImprove planner summaries.\n"
+	cases := []struct {
+		name         string
+		stdin        string
+		wantScaffold bool
+		wantOut      string
+	}{
+		{name: "accept with y", stdin: answers + "y\n", wantScaffold: true, wantOut: "Review:"},
+		{name: "accept with blank", stdin: answers + "\n", wantScaffold: true, wantOut: "Create scaffold?"},
+		{name: "decline with n", stdin: answers + "n\n", wantScaffold: false, wantOut: "aborted: no scaffold written"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			workspace := chdirTemp(t)
+			paths := config.PathsForHome(home)
+			if err := config.Initialize(paths); err != nil {
+				t.Fatalf("Initialize returned error: %v", err)
+			}
+			store, err := db.Open(paths.Database)
+			if err != nil {
+				t.Fatalf("Open returned error: %v", err)
+			}
+			if err := store.UpsertAgentTemplate(context.Background(), cliSkillOptTemplate("planner", "Plan the work.")); err != nil {
+				t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatalf("Close returned error: %v", err)
+			}
+			restoreInteractive := replaceSkillOptTrainInitInteractive(true)
+			defer restoreInteractive()
+			restoreStdin := replaceSkillOptTrainInitStdin(tc.stdin)
+			defer restoreStdin()
+
+			var stdout, stderr bytes.Buffer
+			code := Run([]string{"skillopt", "train", "init", "--home", home}, &stdout, &stderr)
+			if code != 0 {
+				t.Fatalf("exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+			}
+			if !strings.Contains(stdout.String(), tc.wantOut) {
+				t.Fatalf("stdout missing %q:\n%s", tc.wantOut, stdout.String())
+			}
+			scaffold := filepath.Join(workspace, ".gitmoot", "skillopt", "confirm-flow", "config.toml")
+			_, statErr := os.Stat(scaffold)
+			if tc.wantScaffold && statErr != nil {
+				t.Fatalf("expected scaffold, stat err = %v", statErr)
+			}
+			if !tc.wantScaffold && statErr == nil {
+				t.Fatalf("declined wizard should not write a scaffold")
+			}
+		})
+	}
+}
+
 func TestSkillOptTrainInitWizardCompletesFromStdin(t *testing.T) {
 	home := t.TempDir()
 	workspace := chdirTemp(t)

@@ -238,6 +238,10 @@ func runSkillOptTrainInitCreate(args []string, stdout, stderr io.Writer) int {
 			return 0
 		case skillOptTrainInitInteractive():
 			if err := runSkillOptTrainInitWizard(*home, promptScope, skillOptTrainInitStdin(), stdout, &values, missing); err != nil {
+				if errors.Is(err, errSkillOptTrainInitAborted) {
+					writeLine(stdout, "aborted: no scaffold written")
+					return 0
+				}
 				fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
 				return 1
 			}
@@ -610,9 +614,10 @@ func runSkillOptTrainInitWizard(home, scope string, stdin io.Reader, stdout io.W
 	}
 
 	stdinClosed := false
+	externallyAnswered := false
 	return withStore(home, func(store *db.Store) error {
 		for index, field := range ask {
-			value, err := skillOptTrainInitAwaitField(store, scope, field, *values, stdout, st, index+1, len(ask), lines, &stdinClosed)
+			value, err := skillOptTrainInitAwaitField(store, scope, field, *values, stdout, st, index+1, len(ask), lines, &stdinClosed, &externallyAnswered)
 			if err != nil {
 				return err
 			}
@@ -631,15 +636,71 @@ func runSkillOptTrainInitWizard(home, scope string, stdin io.Reader, stdout io.W
 				values.Request = value
 			}
 		}
+		// Only confirm when every field was actually answered (a cut-short stdin
+		// leaves missing fields for the caller to report) and when a human drove
+		// the wizard on stdin (an external driver answered each field
+		// deliberately, so auto-proceed).
+		if len(missingSkillOptTrainInitInputs(*values)) == 0 {
+			if !skillOptTrainInitWizardConfirm(stdout, st, *values, lines, stdinClosed, externallyAnswered) {
+				return errSkillOptTrainInitAborted
+			}
+		}
 		return nil
 	})
+}
+
+// errSkillOptTrainInitAborted signals that the human declined the wizard's
+// confirm step; the caller exits cleanly without writing a scaffold.
+var errSkillOptTrainInitAborted = errors.New("train init aborted by user")
+
+// skillOptTrainInitWizardConfirm prints a summary of the answers and asks for
+// confirmation. It auto-accepts when the wizard was driven externally (via
+// `gitmoot interactive answer`) or stdin has closed, so the agent-assisted and
+// scripted flows proceed without blocking. A blank line or EOF accepts; "n"/"no"
+// declines.
+func skillOptTrainInitWizardConfirm(stdout io.Writer, st style.Style, values skillOptTrainInitInputs, lines <-chan skillOptTrainInitWizardLine, stdinClosed, externallyAnswered bool) bool {
+	fmt.Fprintln(stdout, st.Bold("Review:"))
+	rows := [][]string{
+		{"name", values.Name},
+		{"template", values.Template},
+		{"review repo", values.ReviewRepo},
+		{"task kind", values.TaskKind},
+		{"artifact kind", values.ArtifactKind},
+		{"preview", values.Preview},
+		{"mode", values.Mode},
+		{"request", firstLine(values.Request)},
+	}
+	for _, line := range style.Columns(rows) {
+		fmt.Fprintf(stdout, "  %s\n", st.Dim(line))
+	}
+	if externallyAnswered || stdinClosed {
+		return true
+	}
+	for {
+		fmt.Fprint(stdout, st.Bold("Create scaffold? [Y/n] "))
+		msg, ok := <-lines
+		if !ok {
+			return true
+		}
+		switch strings.ToLower(strings.TrimSpace(msg.text)) {
+		case "", "y", "yes":
+			return true
+		case "n", "no":
+			return false
+		default:
+			if msg.eof {
+				return true
+			}
+			// Unrecognized non-EOF input: re-ask.
+		}
+	}
 }
 
 // skillOptTrainInitAwaitField publishes the prompt record for one field, renders
 // the question, and blocks until an answer arrives on stdin or the prompt is
 // resolved externally. It returns "" (and marks stdin closed) when stdin ends
 // before the field is answered, leaving the caller to report the missing field.
-func skillOptTrainInitAwaitField(store *db.Store, scope, field string, values skillOptTrainInitInputs, stdout io.Writer, st style.Style, index, total int, lines <-chan skillOptTrainInitWizardLine, stdinClosed *bool) (string, error) {
+func skillOptTrainInitAwaitField(store *db.Store, scope, field string, values skillOptTrainInitInputs, stdout io.Writer, st style.Style, index, total int, lines <-chan skillOptTrainInitWizardLine, stdinClosed, externallyAnswered *bool) (string, error) {
 	ctx := context.Background()
 	prompt := buildSkillOptTrainInitPrompt(scope, field, values).Prompt
 	if err := store.UpsertInteractivePrompt(ctx, prompt); err != nil {
@@ -700,6 +761,8 @@ func skillOptTrainInitAwaitField(store *db.Store, scope, field string, values sk
 				return "", err
 			}
 			if current.State == db.InteractivePromptStateResolved {
+				// Resolved by an external `gitmoot interactive answer`, not stdin.
+				*externallyAnswered = true
 				return current.AnswerValue, nil
 			}
 		}
