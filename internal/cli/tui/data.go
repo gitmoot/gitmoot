@@ -113,3 +113,9 @@ type snapshotMsg struct {
 
 // tickMsg fires on the refresh interval.
 type tickMsg struct{}
+
+// answerResultMsg carries the outcome of a Deps.Answer call.
+type answerResultMsg struct {
+	id  string
+	err error
+}

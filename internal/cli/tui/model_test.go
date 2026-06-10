@@ -54,7 +54,8 @@ func loadedModel(t *testing.T) Model {
 
 func TestPagesRenderExpectedContent(t *testing.T) {
 	m := loadedModel(t)
-	wants := []string{"planner", "skillopt-generator", "failed", "branch locks"}
+	// Page order: Attention, Agents, Sessions, Jobs, Locks.
+	wants := []string{"pending prompts", "planner", "skillopt-generator", "failed", "branch locks"}
 	for i, want := range wants {
 		if i > 0 {
 			next, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
@@ -102,6 +103,9 @@ func TestRefreshSuppressionWhileInFlight(t *testing.T) {
 func TestLoadErrorKeepsStaleData(t *testing.T) {
 	m := loadedModel(t)
 	next, _ := m.Update(snapshotMsg{err: errors.New("db locked"), at: time.Unix(2, 0)})
+	m = next.(Model)
+	// Move to the Agents page where the stale data is visible.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
 	m = next.(Model)
 	view := m.View()
 	if !strings.Contains(view, "refresh error: db locked") {

@@ -3,15 +3,18 @@ package tui
 import (
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/jerryfane/gitmoot/internal/db"
 )
 
 type page int
 
 const (
-	pageAgents page = iota
+	pageAttention page = iota
+	pageAgents
 	pageSessions
 	pageJobs
 	pageLocks
@@ -21,11 +24,22 @@ var pages = []struct {
 	page  page
 	label string
 }{
+	{pageAttention, "Attention"},
 	{pageAgents, "Agents"},
 	{pageSessions, "Sessions"},
 	{pageJobs, "Jobs"},
 	{pageLocks, "Locks"},
 }
+
+// mode is the interaction mode; modeNormal navigates pages, the others are
+// modal overlays that capture keys until dismissed.
+type mode int
+
+const (
+	modeNormal mode = iota
+	modeAnswerChoice
+	modeAnswerText
+)
 
 const defaultInterval = 5 * time.Second
 
@@ -42,6 +56,15 @@ type Model struct {
 	loadedAt time.Time
 	loadErr  string
 	inFlight bool
+
+	// Attention page interaction state.
+	mode         mode
+	promptCursor int                  // selected row in snap.Prompts on the Attention page
+	active       db.InteractivePrompt // prompt being answered in an overlay
+	choiceIdx    int                  // selected choice in modeAnswerChoice
+	input        textinput.Model      // free-text answer in modeAnswerText
+	actionErr    string               // inline error from the last Answer attempt
+	actionBusy   bool                 // an Answer is in flight; suppress re-submit
 }
 
 // New returns a Model ready for tea.NewProgram. It starts in the loading state;
@@ -82,6 +105,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.resizeViewport()
 		}
 	case tea.KeyMsg:
+		// Modal overlays capture keys first; only ctrl+c stays global.
+		if m.mode != modeNormal {
+			return m.updateOverlay(msg)
+		}
 		switch msg.String() {
 		case "ctrl+c", "q", "esc":
 			return m, tea.Quit
@@ -104,6 +131,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.viewport.SetContent(m.content())
 			return m, tea.Batch(cmds...)
+		case "up", "k":
+			if pages[m.selected].page == pageAttention && len(m.snap.Prompts) > 0 {
+				if m.promptCursor > 0 {
+					m.promptCursor--
+				}
+				m.viewport.SetContent(m.content())
+				return m, tea.Batch(cmds...)
+			}
+		case "down", "j":
+			if pages[m.selected].page == pageAttention && len(m.snap.Prompts) > 0 {
+				if m.promptCursor < len(m.snap.Prompts)-1 {
+					m.promptCursor++
+				}
+				m.viewport.SetContent(m.content())
+				return m, tea.Batch(cmds...)
+			}
+		case "a":
+			if pages[m.selected].page == pageAttention {
+				if cmd := m.openAnswer(); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+				m.viewport.SetContent(m.content())
+				return m, tea.Batch(cmds...)
+			}
 		}
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
@@ -112,6 +163,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
 		cmds = append(cmds, cmd)
+	case answerResultMsg:
+		m.actionBusy = false
+		if msg.err != nil {
+			m.actionErr = msg.err.Error()
+		} else {
+			m.mode = modeNormal
+			m.actionErr = ""
+			if cmd := m.queueLoad(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
 	case snapshotMsg:
 		m.inFlight = false
 		if msg.err != nil {
@@ -120,6 +182,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loadErr = ""
 			m.snap = msg.snap
 			m.loadedAt = msg.at
+			m.clampPromptCursor()
 		}
 	case tickMsg:
 		if cmd := m.queueLoad(); cmd != nil {
@@ -158,6 +221,17 @@ func (m *Model) queueLoad() tea.Cmd {
 	}
 	m.inFlight = true
 	return loadSnapshot(m.deps)
+}
+
+// clampPromptCursor keeps the Attention cursor within the current prompt list
+// after a refresh removes rows.
+func (m *Model) clampPromptCursor() {
+	if m.promptCursor >= len(m.snap.Prompts) {
+		m.promptCursor = len(m.snap.Prompts) - 1
+	}
+	if m.promptCursor < 0 {
+		m.promptCursor = 0
+	}
 }
 
 func loadSnapshot(deps Deps) tea.Cmd {
