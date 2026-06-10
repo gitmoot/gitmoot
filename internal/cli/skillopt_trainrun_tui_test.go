@@ -189,6 +189,53 @@ func TestCreateSkillOptTrainRunSession(t *testing.T) {
 	}
 }
 
+func TestTailSkillOptTrainLog(t *testing.T) {
+	home := t.TempDir()
+	if err := config.Initialize(config.PathsForHome(home)); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	logPath := filepath.Join(config.PathsForHome(home).Logs, "skillopt-train-sess.log")
+
+	// Missing log → no lines, offset unchanged.
+	lines, off, err := tailSkillOptTrainLog(home, "sess", 0)
+	if err != nil || len(lines) != 0 || off != 0 {
+		t.Fatalf("missing log: lines=%v off=%d err=%v", lines, off, err)
+	}
+
+	// Write two complete lines + a partial (no trailing newline).
+	if err := os.WriteFile(logPath, []byte("first\nsecond\npartial"), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	lines, off, err = tailSkillOptTrainLog(home, "sess", 0)
+	if err != nil {
+		t.Fatalf("tail: %v", err)
+	}
+	if len(lines) != 2 || lines[0] != "first" || lines[1] != "second" {
+		t.Fatalf("complete lines = %v (partial should be withheld)", lines)
+	}
+	// Offset is past "first\nsecond\n" (13 bytes), before "partial".
+	if off != 13 {
+		t.Fatalf("offset = %d, want 13", off)
+	}
+
+	// From that offset, after the partial line is completed, it appears.
+	if err := os.WriteFile(logPath, []byte("first\nsecond\npartial now done\n"), 0o644); err != nil {
+		t.Fatalf("rewrite log: %v", err)
+	}
+	lines, off2, err := tailSkillOptTrainLog(home, "sess", off)
+	if err != nil {
+		t.Fatalf("tail2: %v", err)
+	}
+	if len(lines) != 1 || lines[0] != "partial now done" || off2 <= off {
+		t.Fatalf("second tail = %v off=%d", lines, off2)
+	}
+
+	// Empty session id → no-op.
+	if l, _, err := tailSkillOptTrainLog(home, "", 5); err != nil || len(l) != 0 {
+		t.Fatalf("empty session: lines=%v err=%v", l, err)
+	}
+}
+
 func TestToTrainRunSnapshot(t *testing.T) {
 	snap := skillOptTrainStatusSnapshot{
 		SessionID:       "s1",

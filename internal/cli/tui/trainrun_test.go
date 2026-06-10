@@ -351,6 +351,83 @@ func TestTrainRunConfirmAbort(t *testing.T) {
 	}
 }
 
+func TestTrainRunTailsLogDuringLongPhase(t *testing.T) {
+	tailCalls := 0
+	deps := TrainRunDeps{
+		Load: func() (TrainRunSnapshot, error) {
+			return TrainRunSnapshot{SessionID: "s", Phase: "generating_options"}, nil
+		},
+		TailLog: func(offset int64) ([]string, int64, error) {
+			tailCalls++
+			return []string{"option item-001/A done"}, offset + 10, nil
+		},
+	}
+	m := trainRunModelWithDeps(t, deps, TrainRunSnapshot{SessionID: "s", Phase: "generating_options"})
+	// A tick during a long phase should issue a tail.
+	next, cmd := m.Update(trainTickMsg{})
+	m = next.(TrainRunModel)
+	if cmd == nil {
+		t.Fatal("tick should produce commands")
+	}
+	// Feed a log message directly and verify it renders.
+	next, _ = m.Update(trainLogMsg{lines: []string{"option item-001/A done"}, offset: 10})
+	m = next.(TrainRunModel)
+	if m.logOffset != 10 {
+		t.Fatalf("log offset = %d, want 10", m.logOffset)
+	}
+	if !strings.Contains(m.View(), "option item-001/A done") {
+		t.Fatalf("expected the log line in view:\n%s", m.View())
+	}
+}
+
+func TestTrainRunLogClearsDisplayButKeepsOffset(t *testing.T) {
+	deps := TrainRunDeps{Load: func() (TrainRunSnapshot, error) {
+		return TrainRunSnapshot{SessionID: "s", Phase: "generating_options"}, nil
+	}}
+	m := trainRunModelWithDeps(t, deps, TrainRunSnapshot{SessionID: "s", Phase: "generating_options"})
+	next, _ := m.Update(trainLogMsg{lines: []string{"line a", "line b"}, offset: 20})
+	m = next.(TrainRunModel)
+	if len(m.logLines) != 2 || m.logOffset != 20 {
+		t.Fatalf("log state = %+v off=%d", m.logLines, m.logOffset)
+	}
+	// Leaving a long phase clears the displayed lines but keeps the monotonic
+	// offset (generation + optimizer share one per-session log).
+	next, _ = m.Update(trainSnapshotMsg{snap: TrainRunSnapshot{SessionID: "s", Phase: "options_generated"}, at: time.Unix(2, 0)})
+	m = next.(TrainRunModel)
+	if len(m.logLines) != 0 {
+		t.Fatalf("displayed lines should clear off a long phase: %+v", m.logLines)
+	}
+	if m.logOffset != 20 {
+		t.Fatalf("offset must stay monotonic across phases, got %d", m.logOffset)
+	}
+	// A heartbeat flap (still a long phase) keeps the displayed lines.
+	next, _ = m.Update(trainSnapshotMsg{snap: TrainRunSnapshot{SessionID: "s", Phase: "optimizer_running"}, at: time.Unix(3, 0)})
+	m = next.(TrainRunModel)
+	next, _ = m.Update(trainLogMsg{lines: []string{"opt 1"}, offset: 25})
+	m = next.(TrainRunModel)
+	next, _ = m.Update(trainSnapshotMsg{snap: TrainRunSnapshot{SessionID: "s", Phase: "optimizer_heartbeat_stale"}, at: time.Unix(4, 0)})
+	m = next.(TrainRunModel)
+	if len(m.logLines) != 1 {
+		t.Fatalf("heartbeat flap should not clear the log display: %+v", m.logLines)
+	}
+}
+
+func TestTrainRunLogCapsLines(t *testing.T) {
+	deps := TrainRunDeps{Load: func() (TrainRunSnapshot, error) {
+		return TrainRunSnapshot{SessionID: "s", Phase: "optimizer_running"}, nil
+	}}
+	m := trainRunModelWithDeps(t, deps, TrainRunSnapshot{SessionID: "s", Phase: "optimizer_running"})
+	many := make([]string, 20)
+	for i := range many {
+		many[i] = "l"
+	}
+	next, _ := m.Update(trainLogMsg{lines: many, offset: 1})
+	m = next.(TrainRunModel)
+	if len(m.logLines) != trainLogTailLines {
+		t.Fatalf("log lines should cap at %d, got %d", trainLogTailLines, len(m.logLines))
+	}
+}
+
 func TestTrainRunActionErrorShown(t *testing.T) {
 	m := trainRunModel(t, TrainRunSnapshot{SessionID: "s", Phase: "options_generated"})
 	next, _ := m.Update(trainActionMsg{err: errors.New("another worker holds the lock")})

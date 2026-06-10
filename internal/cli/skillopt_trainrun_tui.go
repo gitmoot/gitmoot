@@ -254,7 +254,61 @@ func skillOptTrainRunDeps(home string, sessionID func() string) tui.TrainRunDeps
 			return runContinue(func(r *skillOptTrainContinueRequest) { r.StartNext = true })
 		},
 		SpawnContinue: func() (string, error) { return spawnSkillOptTrainContinueChild(home, sessionID()) },
+		TailLog: func(offset int64) ([]string, int64, error) {
+			return tailSkillOptTrainLog(home, sessionID(), offset)
+		},
 	}
+}
+
+// tailSkillOptTrainLog reads new complete lines from the current session's
+// detached-child log starting at offset, returning them and the next offset. A
+// missing log (the child hasn't started) yields no lines. Partial trailing lines
+// are left for the next read.
+func tailSkillOptTrainLog(home, sessionID string, offset int64) ([]string, int64, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil, offset, nil
+	}
+	paths, err := initializedPaths(home)
+	if err != nil {
+		return nil, offset, err
+	}
+	path := filepath.Join(paths.Logs, "skillopt-train-"+skillOptTrainLogSlug(sessionID)+".log")
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, offset, nil // no log yet
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, offset, err
+	}
+	size := info.Size()
+	if offset > size {
+		offset = 0 // truncated/rotated — restart
+	}
+	if offset >= size {
+		return nil, offset, nil
+	}
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return nil, offset, err
+	}
+	data := make([]byte, size-offset)
+	n, err := io.ReadFull(f, data)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return nil, offset, err
+	}
+	data = data[:n]
+	lastNL := bytes.LastIndexByte(data, '\n')
+	if lastNL < 0 {
+		return nil, offset, nil // no complete line yet
+	}
+	lines := []string{}
+	for _, line := range strings.Split(string(data[:lastNL]), "\n") {
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines, offset + int64(lastNL+1), nil
 }
 
 // buildSkillOptTrainRunPlan loads the config into a confirm-screen plan.
