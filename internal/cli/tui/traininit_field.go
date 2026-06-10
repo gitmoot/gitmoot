@@ -21,9 +21,10 @@ const (
 
 // Choice is one selectable option in a FieldChoice/FieldTemplate list.
 type Choice struct {
-	Value  string // value stored as the answer
-	Label  string // display text
-	Custom bool   // template "Custom file" sentinel → path sub-state
+	Value       string // value stored as the answer
+	Label       string // display text
+	Custom      bool   // sentinel entry → free-text sub-state
+	Placeholder string // free-text placeholder for a Custom entry
 }
 
 // Field describes one train-init question the form walks through.

@@ -1058,21 +1058,36 @@ func skillOptTrainInitExampleCommand(name string) string {
 }
 
 func skillOptTrainInitStarterReviewItemsYAML(values skillOptTrainInitInputs) []byte {
+	return skillOptTrainInitStarterReviewItemsYAMLN(values, 2)
+}
+
+// skillOptTrainInitStarterReviewItemsYAMLN emits count starter review items
+// (floor 2, the train-start minimum). The first two keep their established
+// titles/briefs; further items are numbered variation scenarios.
+func skillOptTrainInitStarterReviewItemsYAMLN(values skillOptTrainInitInputs, count int) []byte {
+	if count < 2 {
+		count = 2
+	}
 	artifactKind := firstNonEmpty(strings.TrimSpace(values.ArtifactKind), "artifact")
-	return []byte(strings.Join([]string{
-		"items:",
-		"  - item_id: item-001",
-		"    title: \"Primary scenario\"",
-		"    brief: " + strconv.Quote("Generate a representative "+artifactKind+" output for the training request."),
-		"    target_audience: \"Primary reviewer\"",
-		"    output_type: " + strconv.Quote(artifactKind),
-		"  - item_id: item-002",
-		"    title: \"Variation scenario\"",
-		"    brief: " + strconv.Quote("Generate a second "+artifactKind+" output with meaningfully different constraints or context."),
-		"    target_audience: \"Primary reviewer\"",
-		"    output_type: " + strconv.Quote(artifactKind),
-		"",
-	}, "\n"))
+	lines := []string{"items:"}
+	for i := 1; i <= count; i++ {
+		title, brief := "Variation scenario "+strconv.Itoa(i), "Generate another "+artifactKind+" output with meaningfully different constraints or context."
+		switch i {
+		case 1:
+			title, brief = "Primary scenario", "Generate a representative "+artifactKind+" output for the training request."
+		case 2:
+			title, brief = "Variation scenario", "Generate a second "+artifactKind+" output with meaningfully different constraints or context."
+		}
+		lines = append(lines,
+			fmt.Sprintf("  - item_id: item-%03d", i),
+			"    title: "+strconv.Quote(title),
+			"    brief: "+strconv.Quote(brief),
+			"    target_audience: \"Primary reviewer\"",
+			"    output_type: "+strconv.Quote(artifactKind),
+		)
+	}
+	lines = append(lines, "")
+	return []byte(strings.Join(lines, "\n"))
 }
 
 func normalizeSkillOptTrainInitPreview(value string) (string, error) {

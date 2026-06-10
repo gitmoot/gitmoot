@@ -248,8 +248,9 @@ func dashboardTUIDeps(home string, interval time.Duration) tui.Deps {
 			if err != nil {
 				return nil, err
 			}
+			repoChoices := skillOptRepoPickerChoices(skillOptKnownRepoNames(context.Background(), store))
 			form := tui.NewAgentOptimizeForm(formPromptStore{home: home, store: store},
-				agent.TemplateID, buildAgentOptimizeFields(),
+				agent.TemplateID, buildAgentOptimizeFields(home, repoChoices),
 				agentOptimizeSummaryRows(agent.TemplateID), agentOptimizeInterpret)
 			done := form.Done
 			form.Done = func(res tui.Result) tea.Cmd {

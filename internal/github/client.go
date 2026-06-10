@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ type Client interface {
 	RepositoryExists(ctx context.Context, repo Repository) (bool, error)
 	CreateRepository(ctx context.Context, repo Repository, private bool) error
 	DeleteRepository(ctx context.Context, repo Repository) error
+	ListUserRepositories(ctx context.Context, limit int) ([]RepoSummary, error)
 	ListPullRequests(ctx context.Context, repo Repository, state string) ([]PullRequest, error)
 	GetPullRequest(ctx context.Context, repo Repository, number int64) (PullRequest, error)
 	CreatePullRequest(ctx context.Context, input CreatePullRequestInput) (PullRequest, error)
@@ -319,6 +321,40 @@ func (c *GhClient) Preflight(ctx context.Context, repo Repository) error {
 		}
 	}
 	return nil
+}
+
+// RepoSummary is one repository in a recency-sorted listing.
+type RepoSummary struct {
+	FullName  string
+	UpdatedAt string
+}
+
+// ListUserRepositories lists the authenticated user's repositories, most
+// recently updated first, via `gh repo list`.
+func (c *GhClient) ListUserRepositories(ctx context.Context, limit int) ([]RepoSummary, error) {
+	if limit <= 0 {
+		limit = 30
+	}
+	result, err := c.run(ctx, false, "repo", "list", "--json", "nameWithOwner,updatedAt", "--limit", strconv.Itoa(limit))
+	if err != nil {
+		return nil, err
+	}
+	var rows []struct {
+		NameWithOwner string `json:"nameWithOwner"`
+		UpdatedAt     string `json:"updatedAt"`
+	}
+	if err := json.Unmarshal([]byte(result.Stdout), &rows); err != nil {
+		return nil, fmt.Errorf("parse gh repo list output: %w", err)
+	}
+	repos := make([]RepoSummary, 0, len(rows))
+	for _, row := range rows {
+		if strings.TrimSpace(row.NameWithOwner) == "" {
+			continue
+		}
+		repos = append(repos, RepoSummary{FullName: row.NameWithOwner, UpdatedAt: row.UpdatedAt})
+	}
+	sort.SliceStable(repos, func(i, j int) bool { return repos[i].UpdatedAt > repos[j].UpdatedAt })
+	return repos, nil
 }
 
 // RepositoryExists reports whether the repo is visible to the authenticated gh
@@ -907,6 +943,10 @@ func (NoopClient) RepositoryExists(context.Context, Repository) (bool, error) {
 
 func (NoopClient) CreateRepository(context.Context, Repository, bool) error {
 	return nil
+}
+
+func (NoopClient) ListUserRepositories(context.Context, int) ([]RepoSummary, error) {
+	return nil, nil
 }
 
 func (NoopClient) DeleteRepository(context.Context, Repository) error {

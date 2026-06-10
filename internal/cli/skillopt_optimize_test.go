@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/jerryfane/gitmoot/internal/config"
@@ -9,7 +10,7 @@ import (
 )
 
 func TestBuildAgentOptimizeFieldsSkipsTemplate(t *testing.T) {
-	fields := buildAgentOptimizeFields()
+	fields := buildAgentOptimizeFields("", nil)
 	names := make([]string, 0, len(fields))
 	for _, f := range fields {
 		if f.Name == "template" {
@@ -17,7 +18,7 @@ func TestBuildAgentOptimizeFieldsSkipsTemplate(t *testing.T) {
 		}
 		names = append(names, f.Name)
 	}
-	want := []string{"name", "review_repo", "workspace_repo", "artifact_kind", "preview", "request", "backend", "model"}
+	want := []string{"name", "review_repo", "workspace_repo", "items", "artifact_kind", "preview", "request", "backend", "model"}
 	if len(names) != len(want) {
 		t.Fatalf("fields = %v, want %v", names, want)
 	}
@@ -56,6 +57,7 @@ func TestStartAgentOptimizeSessionPersistsBackendAndModel(t *testing.T) {
 		"name":           "opt-planner",
 		"review_repo":    "owner/review",
 		"workspace_repo": "owner/workspace",
+		"items":          "4",
 		"artifact_kind":  "text",
 		"preview":        "none",
 		"request":        "Make plans sharper.",
@@ -125,5 +127,58 @@ func TestStartAgentOptimizeSessionPersistsBackendAndModel(t *testing.T) {
 	}
 	if !repos["owner/review"] || !repos["owner/workspace"] {
 		t.Fatalf("created repo records = %v", records)
+	}
+
+	// The requested item count flows through the scaffold into the session.
+	items, err := store.ListEvalReviewItems(ctx, sessionID+"-review-001")
+	if err != nil {
+		t.Fatalf("ListEvalReviewItems: %v", err)
+	}
+	if len(items) != 4 {
+		t.Fatalf("review items = %d, want 4", len(items))
+	}
+}
+
+func TestStarterReviewItemsYAMLCount(t *testing.T) {
+	values := skillOptTrainInitInputs{ArtifactKind: "text"}
+	// N=2 stays byte-identical to the historical fixed output.
+	if got, want := string(skillOptTrainInitStarterReviewItemsYAMLN(values, 2)), string(skillOptTrainInitStarterReviewItemsYAML(values)); got != want {
+		t.Fatalf("N=2 output drifted:\n%s", got)
+	}
+	four := string(skillOptTrainInitStarterReviewItemsYAMLN(values, 4))
+	for _, want := range []string{"item-001", "item-002", "item-003", "item-004", "Variation scenario 4"} {
+		if !strings.Contains(four, want) {
+			t.Fatalf("N=4 missing %q:\n%s", want, four)
+		}
+	}
+	// Below the floor clamps to 2.
+	if got := string(skillOptTrainInitStarterReviewItemsYAMLN(values, 1)); strings.Contains(got, "item-003") || !strings.Contains(got, "item-002") {
+		t.Fatalf("floor clamp wrong:\n%s", got)
+	}
+}
+
+func TestRepoPickerChoices(t *testing.T) {
+	if skillOptRepoPickerChoices(nil) != nil {
+		t.Fatal("no repos → free text (nil choices)")
+	}
+	choices := skillOptRepoPickerChoices([]string{"o/a", "o/b"})
+	if len(choices) != 3 || choices[0].Value != "o/a" || choices[1].Value != "o/b" {
+		t.Fatalf("choices = %+v", choices)
+	}
+	last := choices[2]
+	if !last.Custom || last.Placeholder != "owner/repo" {
+		t.Fatalf("trailing custom entry wrong: %+v", last)
+	}
+}
+
+func TestAgentOptimizeInterpretItems(t *testing.T) {
+	if _, status := agentOptimizeInterpret("items", "1"); status != "reask" {
+		t.Fatal("items below 2 must reask")
+	}
+	if _, status := agentOptimizeInterpret("items", "abc"); status != "reask" {
+		t.Fatal("non-numeric items must reask")
+	}
+	if value, status := agentOptimizeInterpret("items", " 5 "); status != "ok" || value != "5" {
+		t.Fatalf("items 5 = (%q, %q)", value, status)
 	}
 }

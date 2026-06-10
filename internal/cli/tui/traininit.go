@@ -122,8 +122,12 @@ func (m TrainInitModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.err != nil {
-			m.state = tiField
 			m.inlineErr = "repo check failed: " + msg.err.Error()
+			if m.fields[m.idx].Kind == FieldText {
+				m.state = tiField
+			} else {
+				m.state = tiCustomPath // keep the typed value editable
+			}
 			return m, nil
 		}
 		if !msg.missing {
@@ -178,7 +182,11 @@ func (m TrainInitModel) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.updateCustomPathKey(msg)
 	case tiRepoCheck:
 		if msg.String() == "esc" {
-			return m.abort()
+			// Cancel just the check; collected answers stay. The gen guard on
+			// repoCheckMsg drops the in-flight result.
+			m.gen++
+			m.inlineErr = ""
+			return m.reenterFieldEntry()
 		}
 		return m, nil // checking; ignore keys until the result arrives
 	case tiRepoMissing:
@@ -187,13 +195,18 @@ func (m TrainInitModel) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.inlineErr = ""
 			return m, createRepoCmd(m.fields[m.idx], m.pendingValue, m.gen)
 		case "e", "E", "esc":
-			// Re-enter the field with the value prefilled.
-			m.state = tiField
+			// Re-enter with the value prefilled; picker fields edit in their
+			// text sub-state (the field view renders the list, not the input).
 			m.inlineErr = ""
 			ti := textinput.New()
 			ti.SetValue(m.pendingValue)
 			ti.CursorEnd()
 			m.input = ti
+			if m.fields[m.idx].Kind == FieldText {
+				m.state = tiField
+			} else {
+				m.state = tiCustomPath
+			}
 			return m, m.input.Focus()
 		}
 		return m, nil
@@ -257,6 +270,9 @@ func (m TrainInitModel) updateFieldKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.state = tiCustomPath
 			m.inlineErr = ""
 			m.input = newPathInput()
+			if choice.Placeholder != "" {
+				m.input.Placeholder = choice.Placeholder
+			}
 			return m, m.input.Focus()
 		}
 		return m.commit(choice.Value)
@@ -272,16 +288,52 @@ func (m TrainInitModel) updateCustomPathKey(msg tea.KeyMsg) (tea.Model, tea.Cmd)
 		m.inlineErr = ""
 		return m, nil
 	case "enter":
-		value := strings.TrimSpace(m.input.Value())
-		if value == "" {
-			m.inlineErr = "enter a template id, version, or file path"
+		raw := strings.TrimSpace(m.input.Value())
+		if raw == "" {
+			m.inlineErr = "a value is required"
 			return m, nil
+		}
+		// The custom sub-state runs the same pipeline as a text field:
+		// validation, then the repo existence check when the field has one.
+		// The template field keeps its historical raw commit — its custom
+		// values (ids, versions, file paths, incl. digit-only ones the
+		// interpreter would mistake for menu numbers) resolve later in the cli.
+		field := m.fields[m.idx]
+		value := raw
+		if field.Kind != FieldTemplate {
+			var status string
+			value, status = m.validate(field.Name, raw)
+			if status != "ok" {
+				m.inlineErr = "invalid value — check the expected format"
+				return m, nil
+			}
+		}
+		if field.CheckRepo != nil {
+			m.pendingValue = value
+			m.state = tiRepoCheck
+			m.inlineErr = ""
+			return m, checkRepoCmd(field, value, m.gen)
 		}
 		return m.commit(value)
 	}
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	return m, cmd
+}
+
+// reenterFieldEntry returns to where the pending value was being entered: the
+// text field itself, or the picker's text sub-state with the value preserved.
+func (m TrainInitModel) reenterFieldEntry() (tea.Model, tea.Cmd) {
+	ti := textinput.New()
+	ti.SetValue(m.pendingValue)
+	ti.CursorEnd()
+	m.input = ti
+	if m.fields[m.idx].Kind == FieldText {
+		m.state = tiField
+	} else {
+		m.state = tiCustomPath
+	}
+	return m, m.input.Focus()
 }
 
 func (m TrainInitModel) validate(field, text string) (string, string) {

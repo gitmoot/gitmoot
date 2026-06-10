@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -107,6 +109,10 @@ func buildSkillOptTrainInitTUIFields(store *db.Store, scope string, values skill
 			entry.Kind = tui.FieldText
 			entry.CheckRepo = skillOptTrainRepoChecker()
 			entry.CreateRepo = skillOptTrainRepoCreator()
+			if choices := skillOptRepoPickerChoices(skillOptKnownRepoNames(context.Background(), store)); len(choices) > 0 {
+				entry.Kind = tui.FieldChoice
+				entry.Choices = choices
+			}
 		default:
 			entry.Kind = tui.FieldText
 		}
@@ -209,7 +215,7 @@ const agentOptimizePromptScope = "dashboard-optimize"
 // publishes (derived from the field definitions, so a new field cannot be
 // missed), letting the dashboard sweep them on exit.
 func agentOptimizePromptIDs() []string {
-	fields := buildAgentOptimizeFields()
+	fields := buildAgentOptimizeFields("", nil)
 	ids := make([]string, 0, len(fields))
 	for _, field := range fields {
 		ids = append(ids, field.Prompt.ID)
@@ -217,10 +223,61 @@ func agentOptimizePromptIDs() []string {
 	return ids
 }
 
+// skillOptRepoPickerChoices turns known repos into picker entries with a
+// trailing free-text entry, so the user selects instead of typing. An empty
+// list yields nil and the field stays free text.
+func skillOptRepoPickerChoices(repos []string) []tui.Choice {
+	if len(repos) == 0 {
+		return nil
+	}
+	choices := make([]tui.Choice, 0, len(repos)+1)
+	for _, repo := range repos {
+		choices = append(choices, tui.Choice{Value: repo, Label: repo})
+	}
+	choices = append(choices, tui.Choice{Custom: true, Label: "another repo… (created on GitHub if missing)", Placeholder: "owner/repo"})
+	return choices
+}
+
+// skillOptKnownRepoNames lists repos to offer in the setup pickers: the
+// subscribed store repos first, then the user's most recently updated GitHub
+// repos (deduped, best effort — gh flakiness must not break the form).
+func skillOptKnownRepoNames(ctx context.Context, store *db.Store) []string {
+	// Best effort with a hard deadline: this can run during form construction,
+	// and a hung gh must not block the setup from appearing.
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	seen := map[string]bool{}
+	names := []string{}
+	if repos, err := store.ListRepos(ctx); err == nil {
+		for _, repo := range repos {
+			full := repo.Owner + "/" + repo.Name
+			if !seen[full] {
+				seen[full] = true
+				names = append(names, full)
+			}
+		}
+	}
+	if recent, err := newSkillOptGitHubClient().ListUserRepositories(ctx, 30); err == nil {
+		for _, repo := range recent {
+			if !seen[repo.FullName] {
+				seen[repo.FullName] = true
+				names = append(names, repo.FullName)
+			}
+		}
+	}
+	const maxPickerRepos = 20
+	if len(names) > maxPickerRepos {
+		names = names[:maxPickerRepos]
+	}
+	return names
+}
+
 // buildAgentOptimizeFields builds the optimize-form fields: the standard
 // train-init questions (minus the pre-filled template), plus the workspace
-// repo, a codex/claude backend pick, and an optional model override.
-func buildAgentOptimizeFields() []tui.Field {
+// repo, the review-item count, a codex/claude backend pick, and an optional
+// model override. repoChoices, when non-empty, turns the repo questions into
+// pickers.
+func buildAgentOptimizeFields(home string, repoChoices []tui.Choice) []tui.Field {
 	standard := func(field string) tui.Field {
 		descriptor := buildSkillOptTrainInitPrompt(agentOptimizePromptScope, field, skillOptTrainInitInputs{})
 		entry := tui.Field{
@@ -268,15 +325,44 @@ func buildAgentOptimizeFields() []tui.Field {
 		}
 		return entry
 	}
+	review := standard("review_repo")
+	workspace := custom("workspace_repo", "Workspace repo", "Workspace repository in owner/repo form? (options are generated there)", nil, "", true)
+	for _, field := range []*tui.Field{&review, &workspace} {
+		field.CheckRepo = skillOptTrainRepoChecker()
+		field.CreateRepo = skillOptTrainRepoCreatorRecording(home)
+		if len(repoChoices) > 0 {
+			field.Kind = tui.FieldChoice
+			field.Choices = repoChoices
+		}
+	}
 	return []tui.Field{
 		standard("name"),
-		standard("review_repo"),
-		custom("workspace_repo", "Workspace repo", "Workspace repository in owner/repo form? (options are generated there)", nil, "", true),
+		review,
+		workspace,
+		custom("items", "Review items", "How many review items should the training scaffold start with? (minimum 2)", nil, "2", true),
 		standard("artifact_kind"),
 		standard("preview"),
 		standard("request"),
 		custom("backend", "Optimizer backend", "Backend for the optimizer and target runs?", []string{"codex", "claude"}, "codex", true),
 		custom("model", "Model (optional)", "Model override for the optimizer and target runs? (empty = backend default)", nil, "", false),
+	}
+}
+
+// skillOptTrainRepoCreatorRecording creates a missing repo AND records it as
+// gitmoot-created with an empty session id; startAgentOptimizeSession adopts
+// the record into the new session so the delete-time cleanup offer covers it.
+func skillOptTrainRepoCreatorRecording(home string) func(string) error {
+	return func(value string) error {
+		repo, err := daemon.ParseRepository(value)
+		if err != nil {
+			return err
+		}
+		if err := newSkillOptGitHubClient().CreateRepository(context.Background(), repo, true); err != nil {
+			return err
+		}
+		return withStore(home, func(store *db.Store) error {
+			return store.RecordCreatedRepo(context.Background(), db.CreatedRepo{Repo: repo.FullName(), Purpose: "train"})
+		})
 	}
 }
 
@@ -287,6 +373,12 @@ func agentOptimizeInterpret(field, text string) (string, string) {
 	switch field {
 	case "model":
 		return strings.TrimSpace(text), "ok"
+	case "items":
+		value := strings.TrimSpace(text)
+		if n, err := strconv.Atoi(value); err != nil || n < 2 {
+			return "", "reask"
+		}
+		return value, "ok"
 	case "name":
 		value := strings.TrimSpace(text)
 		if err := skillopt.ValidateTrainInitName(value); err != nil {
@@ -318,6 +410,7 @@ func agentOptimizeSummaryRows(template string) func(map[string]string) [][]strin
 			{"name", answers["name"]},
 			{"review repo", answers["review_repo"]},
 			{"workspace repo", answers["workspace_repo"]},
+			{"review items", firstNonEmpty(strings.TrimSpace(answers["items"]), "2")},
 			{"artifact kind", answers["artifact_kind"]},
 			{"preview", answers["preview"]},
 			{"backend", answers["backend"]},
@@ -400,15 +493,28 @@ func startAgentOptimizeSession(home, templateID string, answers map[string]strin
 	if _, err := os.Stat(scaffoldRoot); err == nil {
 		return "", fmt.Errorf("a train scaffold named %q already exists at %s; pick a different name", values.Name, scaffoldRoot)
 	}
+	itemCount := 2
+	if value := strings.TrimSpace(answers["items"]); value != "" {
+		if n, err := strconv.Atoi(value); err == nil && n >= 2 {
+			itemCount = n
+		}
+	}
 	paths, err := skillopt.WriteTrainInitScaffold(cwd, skillopt.TrainInitScaffold{
 		Config:          config,
 		TaskMarkdown:    values.Request,
-		ReviewItemsYAML: skillOptTrainInitStarterReviewItemsYAML(values),
+		ReviewItemsYAML: skillOptTrainInitStarterReviewItemsYAMLN(values, itemCount),
 	})
 	if err != nil {
 		return "", err
 	}
 	sessionID := generatedSkillOptTrainSessionID(template.ID)
+	// Repos the form created before the session existed are recorded with an
+	// empty session id; adopt them so delete-time cleanup offers them.
+	if err := withStore(home, func(store *db.Store) error {
+		return store.AdoptCreatedRepoRecords(context.Background(), sessionID, []string{reviewRepo.FullName(), workspaceRepo.FullName()})
+	}); err != nil {
+		return "", err
+	}
 	var stdout, stderr bytes.Buffer
 	args := []string{
 		"--home", home,

@@ -77,7 +77,7 @@ func (m TrainInitModel) fieldView() string {
 
 func (m TrainInitModel) customPathView() string {
 	var b strings.Builder
-	b.WriteString(headerStyle.Render("Custom template"))
+	b.WriteString(headerStyle.Render(m.fields[m.idx].Label))
 	b.WriteString("\n\n")
 	b.WriteString(m.input.View())
 	b.WriteByte('\n')

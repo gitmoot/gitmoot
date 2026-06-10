@@ -239,3 +239,33 @@ func TestLatestJobEvents(t *testing.T) {
 		t.Fatal("jobs without events must be absent from the map")
 	}
 }
+
+func TestAdoptCreatedRepoRecords(t *testing.T) {
+	store := openCockpitStore(t)
+	ctx := context.Background()
+	// Pending (form-created, no session yet) and owned rows.
+	if err := store.RecordCreatedRepo(ctx, CreatedRepo{Repo: "o/pending", Purpose: "train"}); err != nil {
+		t.Fatalf("record pending: %v", err)
+	}
+	if err := store.RecordCreatedRepo(ctx, CreatedRepo{Repo: "o/owned", Purpose: "train", SessionID: "other-session"}); err != nil {
+		t.Fatalf("record owned: %v", err)
+	}
+	if err := store.AdoptCreatedRepoRecords(ctx, "session-1", []string{"o/pending", "o/owned", "o/missing"}); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	adopted, err := store.ListCreatedReposForSession(ctx, "session-1")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(adopted) != 1 || adopted[0].Repo != "o/pending" {
+		t.Fatalf("adopted = %+v", adopted)
+	}
+	// The owned row keeps its original session.
+	owned, err := store.ListCreatedReposForSession(ctx, "other-session")
+	if err != nil || len(owned) != 1 {
+		t.Fatalf("owned rows disturbed: %v %+v", err, owned)
+	}
+	if err := store.AdoptCreatedRepoRecords(ctx, "", nil); err == nil {
+		t.Fatal("empty session id must error")
+	}
+}

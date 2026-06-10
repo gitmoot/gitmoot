@@ -2643,6 +2643,27 @@ func (s *Store) RecordCreatedRepo(ctx context.Context, record CreatedRepo) error
 }
 
 // ListCreatedReposForSession returns the repos gitmoot created for a session.
+// AdoptCreatedRepoRecords links repos recorded before a session existed (a
+// setup form creates them with an empty session id) to the session, so the
+// session-delete cleanup offer includes them. Rows already owned by another
+// session are left alone.
+func (s *Store) AdoptCreatedRepoRecords(ctx context.Context, sessionID string, repos []string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return errors.New("session id is required")
+	}
+	for _, repo := range repos {
+		repo = strings.TrimSpace(repo)
+		if repo == "" {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE created_repos SET session_id = ? WHERE repo = ? AND TRIM(COALESCE(session_id,'')) = ''`, sessionID, repo); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) ListCreatedReposForSession(ctx context.Context, sessionID string) ([]CreatedRepo, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT repo, purpose, session_id, created_at FROM created_repos WHERE session_id = ? ORDER BY created_at`, strings.TrimSpace(sessionID))
 	if err != nil {
