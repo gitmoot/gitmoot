@@ -2717,8 +2717,35 @@ func (s *Store) DeleteInteractivePrompt(ctx context.Context, id string) error {
 	if id == "" {
 		return errors.New("interactive prompt id is required")
 	}
-	_, err := s.db.ExecContext(ctx, `DELETE FROM interactive_prompts WHERE id = ?`, id)
-	return err
+	result, err := s.db.ExecContext(ctx, `DELETE FROM interactive_prompts WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return fmt.Errorf("interactive prompt %q not found", id)
+	}
+	return nil
+}
+
+// DeleteInteractivePromptsByState deletes every prompt in the given state and
+// returns the number removed. An empty state deletes all prompts regardless of
+// state.
+func (s *Store) DeleteInteractivePromptsByState(ctx context.Context, state string) (int64, error) {
+	var result sql.Result
+	var err error
+	if state == "" {
+		result, err = s.db.ExecContext(ctx, `DELETE FROM interactive_prompts`)
+	} else {
+		result, err = s.db.ExecContext(ctx, `DELETE FROM interactive_prompts WHERE state = ?`, state)
+	}
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 func validateInteractivePromptAnswer(prompt InteractivePrompt, value string) (string, error) {

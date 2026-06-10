@@ -113,6 +113,7 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 	answerID := fs.String("answer", "", "pending prompt id to answer before showing the snapshot")
 	answerValue := fs.String("value", "", "answer value to use with --answer")
 	answerSource := fs.String("source", "dashboard", "answer source recorded with --answer")
+	dismissID := fs.String("dismiss", "", "pending prompt id to delete before showing the snapshot")
 	watch := fs.Bool("watch", false, "refresh the snapshot on an interval until interrupted (terminal only)")
 	interval := fs.Duration("interval", 5*time.Second, "refresh interval for --watch")
 	if err := fs.Parse(args); err != nil {
@@ -126,8 +127,8 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if *watch {
-		if *jsonOutput || strings.TrimSpace(*answerID) != "" {
-			fmt.Fprintln(stderr, "dashboard --watch cannot be combined with --json or --answer")
+		if *jsonOutput || strings.TrimSpace(*answerID) != "" || strings.TrimSpace(*dismissID) != "" {
+			fmt.Fprintln(stderr, "dashboard --watch cannot be combined with --json, --answer, or --dismiss")
 			return 2
 		}
 		if !style.IsTerminal(stdout) {
@@ -147,14 +148,23 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// The only state the dashboard may mutate is answering a pending prompt, and
-	// it does so through the same store API as `gitmoot interactive answer`.
+	// The only state the dashboard may mutate is a pending prompt: answering it
+	// (same store API as `gitmoot interactive answer`) or dismissing it (same as
+	// `gitmoot interactive clear`).
 	if strings.TrimSpace(*answerID) != "" {
 		if err := withStore(*home, func(store *db.Store) error {
 			_, err := store.AnswerInteractivePrompt(context.Background(), *answerID, *answerValue, *answerSource)
 			return err
 		}); err != nil {
 			fmt.Fprintf(stderr, "dashboard: answer prompt: %v\n", err)
+			return 1
+		}
+	}
+	if strings.TrimSpace(*dismissID) != "" {
+		if err := withStore(*home, func(store *db.Store) error {
+			return store.DeleteInteractivePrompt(context.Background(), *dismissID)
+		}); err != nil {
+			fmt.Fprintf(stderr, "dashboard: dismiss prompt: %v\n", err)
 			return 1
 		}
 	}

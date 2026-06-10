@@ -160,6 +160,70 @@ func TestInteractivePromptStorageAndAnswerValidation(t *testing.T) {
 	}
 }
 
+func TestDeleteInteractivePrompt(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.UpsertInteractivePrompt(ctx, InteractivePrompt{ID: "present", Question: "q", Required: true}); err != nil {
+		t.Fatalf("UpsertInteractivePrompt returned error: %v", err)
+	}
+	if err := store.DeleteInteractivePrompt(ctx, "present"); err != nil {
+		t.Fatalf("DeleteInteractivePrompt returned error: %v", err)
+	}
+	if err := store.DeleteInteractivePrompt(ctx, "present"); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("DeleteInteractivePrompt missing error = %v", err)
+	}
+	if err := store.DeleteInteractivePrompt(ctx, "  "); err == nil || !strings.Contains(err.Error(), "required") {
+		t.Fatalf("DeleteInteractivePrompt empty id error = %v", err)
+	}
+}
+
+func TestDeleteInteractivePromptsByState(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	for _, id := range []string{"p1", "p2", "r1"} {
+		if err := store.UpsertInteractivePrompt(ctx, InteractivePrompt{ID: id, Question: "q", Required: true}); err != nil {
+			t.Fatalf("UpsertInteractivePrompt(%s) returned error: %v", id, err)
+		}
+	}
+	if _, err := store.AnswerInteractivePrompt(ctx, "r1", "done", "test"); err != nil {
+		t.Fatalf("AnswerInteractivePrompt returned error: %v", err)
+	}
+
+	removed, err := store.DeleteInteractivePromptsByState(ctx, InteractivePromptStateResolved)
+	if err != nil {
+		t.Fatalf("DeleteInteractivePromptsByState(resolved) returned error: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("resolved removed = %d, want 1", removed)
+	}
+
+	removedAll, err := store.DeleteInteractivePromptsByState(ctx, "")
+	if err != nil {
+		t.Fatalf("DeleteInteractivePromptsByState(all) returned error: %v", err)
+	}
+	if removedAll != 2 {
+		t.Fatalf("all removed = %d, want 2", removedAll)
+	}
+
+	remaining, err := store.ListInteractivePrompts(ctx, "")
+	if err != nil {
+		t.Fatalf("ListInteractivePrompts returned error: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("remaining prompts = %+v", remaining)
+	}
+}
+
 func TestListSkillOptTrainSessions(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))

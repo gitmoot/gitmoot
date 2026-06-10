@@ -76,6 +76,151 @@ func TestInteractiveListShowAndAnswer(t *testing.T) {
 	}
 }
 
+func TestInteractiveClearByID(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	for _, id := range []string{"alpha", "beta"} {
+		if err := store.UpsertInteractivePrompt(context.Background(), db.InteractivePrompt{
+			ID:       id,
+			Question: "Question " + id,
+			Required: true,
+		}); err != nil {
+			t.Fatalf("UpsertInteractivePrompt(%s) returned error: %v", id, err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"interactive", "clear", "--home", home, "alpha"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("interactive clear code=%d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "cleared alpha") {
+		t.Fatalf("clear stdout = %q", stdout.String())
+	}
+
+	store = openCLIJobStore(t, home)
+	remaining, err := store.ListInteractivePrompts(context.Background(), "")
+	if err != nil {
+		t.Fatalf("ListInteractivePrompts returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	if len(remaining) != 1 || remaining[0].ID != "beta" {
+		t.Fatalf("remaining prompts = %+v", remaining)
+	}
+}
+
+func TestInteractiveClearMissingIDFails(t *testing.T) {
+	home := t.TempDir()
+	openCLIJobStore(t, home).Close()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"interactive", "clear", "--home", home, "ghost"}, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "not found") {
+		t.Fatalf("clear missing code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestInteractiveClearResolvedSweep(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	if err := store.UpsertInteractivePrompt(context.Background(), db.InteractivePrompt{
+		ID: "pending-one", Question: "q1", Required: true,
+	}); err != nil {
+		t.Fatalf("UpsertInteractivePrompt returned error: %v", err)
+	}
+	if err := store.UpsertInteractivePrompt(context.Background(), db.InteractivePrompt{
+		ID: "resolved-one", Question: "q2", Required: true,
+	}); err != nil {
+		t.Fatalf("UpsertInteractivePrompt returned error: %v", err)
+	}
+	if _, err := store.AnswerInteractivePrompt(context.Background(), "resolved-one", "done", "test"); err != nil {
+		t.Fatalf("AnswerInteractivePrompt returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"interactive", "clear", "--home", home, "--resolved"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("clear --resolved code=%d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "cleared 1 prompt(s)") {
+		t.Fatalf("clear --resolved stdout = %q", stdout.String())
+	}
+
+	store = openCLIJobStore(t, home)
+	remaining, err := store.ListInteractivePrompts(context.Background(), "")
+	if err != nil {
+		t.Fatalf("ListInteractivePrompts returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	if len(remaining) != 1 || remaining[0].ID != "pending-one" {
+		t.Fatalf("remaining prompts = %+v", remaining)
+	}
+}
+
+func TestInteractiveClearAllSweep(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	for _, id := range []string{"a", "b", "c"} {
+		if err := store.UpsertInteractivePrompt(context.Background(), db.InteractivePrompt{
+			ID: id, Question: "q", Required: true,
+		}); err != nil {
+			t.Fatalf("UpsertInteractivePrompt(%s) returned error: %v", id, err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"interactive", "clear", "--home", home, "--all"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("clear --all code=%d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "cleared 3 prompt(s)") {
+		t.Fatalf("clear --all stdout = %q", stdout.String())
+	}
+
+	store = openCLIJobStore(t, home)
+	remaining, err := store.ListInteractivePrompts(context.Background(), "")
+	if err != nil {
+		t.Fatalf("ListInteractivePrompts returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("remaining prompts = %+v", remaining)
+	}
+}
+
+func TestInteractiveClearRejectsConflictingArgs(t *testing.T) {
+	home := t.TempDir()
+	openCLIJobStore(t, home).Close()
+
+	cases := [][]string{
+		{"interactive", "clear", "--home", home},                        // no id and no sweep flag
+		{"interactive", "clear", "--home", home, "--all", "id"},         // sweep + positional id
+		{"interactive", "clear", "--home", home, "--resolved", "--all"}, // both sweep flags
+	}
+	for _, args := range cases {
+		var stdout, stderr bytes.Buffer
+		code := Run(args, &stdout, &stderr)
+		if code != 2 {
+			t.Fatalf("args %v: code=%d stdout=%q stderr=%q", args, code, stdout.String(), stderr.String())
+		}
+	}
+}
+
 func TestInteractiveAnswerRejectsInvalidChoice(t *testing.T) {
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)

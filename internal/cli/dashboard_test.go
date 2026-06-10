@@ -177,6 +177,42 @@ func TestDashboardWithoutAnswerDoesNotMutate(t *testing.T) {
 	}
 }
 
+func TestDashboardDismissDeletesPrompt(t *testing.T) {
+	home := dashboardTestHome(t)
+	seedDashboardPrompt(t, home, "dash.prompt.dismiss", "Choose", nil)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"dashboard", "--home", home, "--dismiss", "dash.prompt.dismiss"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("dashboard --dismiss exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "pending_prompts: 0") {
+		t.Fatalf("dismissed prompt should not remain pending:\n%s", stdout.String())
+	}
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	prompts, err := store.ListInteractivePrompts(context.Background(), "")
+	if err != nil {
+		t.Fatalf("ListInteractivePrompts returned error: %v", err)
+	}
+	if len(prompts) != 0 {
+		t.Fatalf("dismiss should delete the prompt entirely: %+v", prompts)
+	}
+}
+
+func TestDashboardDismissMissingPromptFails(t *testing.T) {
+	home := dashboardTestHome(t)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"dashboard", "--home", home, "--dismiss", "ghost"}, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "not found") {
+		t.Fatalf("dashboard --dismiss missing code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
 func TestDashboardAttentionBlock(t *testing.T) {
 	home := dashboardTestHome(t)
 	seedDashboardPrompt(t, home, "attn.prompt", "Pick", nil)
@@ -274,6 +310,7 @@ func TestDashboardWatchRejectsInvalidCombos(t *testing.T) {
 	cases := [][]string{
 		{"dashboard", "--home", home, "--watch", "--json"},
 		{"dashboard", "--home", home, "--watch", "--answer", "p1", "--value", "x"},
+		{"dashboard", "--home", home, "--watch", "--dismiss", "p1"},
 		{"dashboard", "--home", home, "--watch"}, // stdout is a bytes.Buffer, not a terminal
 	}
 	for _, args := range cases {

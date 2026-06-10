@@ -23,6 +23,8 @@ func runInteractive(args []string, stdout, stderr io.Writer) int {
 		return runInteractiveShow(args[1:], stdout, stderr)
 	case "answer":
 		return runInteractiveAnswer(args[1:], stdout, stderr)
+	case "clear":
+		return runInteractiveClear(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown interactive command %q\n\n", args[0])
 		printInteractiveUsage(stderr)
@@ -35,6 +37,7 @@ func printInteractiveUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot interactive list [--state pending|resolved|all] [--json]")
 	fmt.Fprintln(w, "  gitmoot interactive show <id> --json")
 	fmt.Fprintln(w, "  gitmoot interactive answer <id> <value> [--source source]")
+	fmt.Fprintln(w, "  gitmoot interactive clear <id> [<id>...] | --resolved | --all")
 }
 
 func runInteractiveList(args []string, stdout, stderr io.Writer) int {
@@ -150,6 +153,73 @@ func runInteractiveAnswer(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	writeLine(stdout, "answered %s: %s", prompt.ID, prompt.AnswerValue)
+	return 0
+}
+
+func runInteractiveClear(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("interactive clear", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	resolved := fs.Bool("resolved", false, "clear all resolved prompts")
+	all := fs.Bool("all", false, "clear all prompts (pending and resolved)")
+	parsedArgs, err := reorderFlagArgs(args, map[string]struct{}{"home": {}}, map[string]struct{}{"resolved": {}, "all": {}})
+	if err != nil {
+		fmt.Fprintf(stderr, "interactive clear: %v\n", err)
+		return 2
+	}
+	if err := fs.Parse(parsedArgs); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if *resolved && *all {
+		fmt.Fprintln(stderr, "interactive clear: --resolved and --all are mutually exclusive")
+		return 2
+	}
+	sweep := *resolved || *all
+	ids := fs.Args()
+	if sweep && len(ids) != 0 {
+		fmt.Fprintln(stderr, "interactive clear: cannot combine prompt ids with --resolved or --all")
+		return 2
+	}
+	if !sweep && len(ids) == 0 {
+		fmt.Fprintln(stderr, "interactive clear requires a prompt id, --resolved, or --all")
+		return 2
+	}
+
+	if sweep {
+		state := ""
+		if *resolved {
+			state = db.InteractivePromptStateResolved
+		}
+		var removed int64
+		if err := withStore(*home, func(store *db.Store) error {
+			var err error
+			removed, err = store.DeleteInteractivePromptsByState(context.Background(), state)
+			return err
+		}); err != nil {
+			fmt.Fprintf(stderr, "interactive clear: %v\n", err)
+			return 1
+		}
+		writeLine(stdout, "cleared %d prompt(s)", removed)
+		return 0
+	}
+
+	if err := withStore(*home, func(store *db.Store) error {
+		for _, id := range ids {
+			if err := store.DeleteInteractivePrompt(context.Background(), id); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "interactive clear: %v\n", err)
+		return 1
+	}
+	for _, id := range ids {
+		writeLine(stdout, "cleared %s", id)
+	}
 	return 0
 }
 
