@@ -60,11 +60,21 @@ gitmoot skillopt train init templates --json
 
 If required fields are missing in an interactive terminal, `train init` runs a
 line-oriented wizard that asks for them one at a time (numbered choices for the
-template, with a "Custom file" option, and for the preview style).
+template, with a "Custom file" option, and for the preview style). Each question
+is also published as an interactive prompt record, so an agent driving the
+wizard in a PTY can answer the current question with `gitmoot interactive answer`
+instead of stdin; the wizard blocks on each question until it is answered either
+way and then resumes with the next one:
 
-For agents that prefer answering asynchronously, pass `--prompts` to store
-structured prompt requests instead of running the wizard, then inspect and
-answer them and rerun:
+```sh
+# in another terminal, while the wizard waits on a question:
+gitmoot interactive list --state pending --json
+gitmoot interactive answer <prompt-id> <value> --source agent
+```
+
+For agents that prefer answering everything asynchronously in one pass, pass
+`--prompts` to store all the prompt requests at once and exit instead of running
+the wizard, then answer them and rerun:
 
 ```sh
 gitmoot skillopt train init --prompts
