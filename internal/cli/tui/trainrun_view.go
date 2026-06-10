@@ -28,6 +28,9 @@ func trainPhaseSegment(phase string) int {
 }
 
 func (m TrainRunModel) View() string {
+	if m.confirming {
+		return m.confirmView()
+	}
 	if m.snap.SessionID == "" && m.loadedAt.IsZero() && m.loadErr == "" {
 		return "Loading…"
 	}
@@ -97,6 +100,36 @@ func (m TrainRunModel) footer() string {
 		action = "n start next iteration  "
 	}
 	return action + "r refresh  q quit"
+}
+
+func (m TrainRunModel) confirmView() string {
+	p := m.deps.Plan
+	var b strings.Builder
+	b.WriteString(headerStyle.Render("Create training session"))
+	b.WriteString("\n\n")
+	rows := [][]string{
+		{"name", dash(p.Name)},
+		{"template", dash(p.Template)},
+		{"review repo", dash(p.ReviewRepo)},
+	}
+	if !p.NeedWorkspaceRepo {
+		rows = append(rows, []string{"workspace repo", dash(p.WorkspaceRepo)})
+	}
+	b.WriteString(renderRows(rows))
+	b.WriteByte('\n')
+	if p.NeedWorkspaceRepo {
+		b.WriteString("workspace repo: " + m.wsInput.View() + "\n")
+	}
+	if m.createErr != "" {
+		b.WriteString(errorStyle.Render(m.createErr) + "\n")
+	}
+	b.WriteString("\n")
+	if m.creating {
+		b.WriteString(mutedStyle.Render("creating session… (missing repos are created private)"))
+	} else {
+		b.WriteString(mutedStyle.Render("enter create session  esc cancel"))
+	}
+	return b.String()
 }
 
 func (m TrainRunModel) phaseBar() string {

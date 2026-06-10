@@ -268,6 +268,89 @@ func TestTrainRunActionBusySuppressesReentry(t *testing.T) {
 	_ = next
 }
 
+func TestTrainRunConfirmCreatesAndEntersPhase(t *testing.T) {
+	var gotWS string
+	created := false
+	deps := TrainRunDeps{
+		Plan:          &TrainRunPlan{Name: "n", Template: "t @v1", ReviewRepo: "o/r", WorkspaceRepo: "o/ws"},
+		CreateSession: func(ws string) (string, error) { created = true; gotWS = ws; return "sess-new", nil },
+		Load: func() (TrainRunSnapshot, error) {
+			return TrainRunSnapshot{SessionID: "sess-new", Phase: "items_ready"}, nil
+		},
+	}
+	m := NewTrainRun(deps)
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m = next.(TrainRunModel)
+	if !m.confirming {
+		t.Fatal("a plan should open the confirm screen")
+	}
+	if !strings.Contains(m.View(), "Create training session") || !strings.Contains(m.View(), "o/r") {
+		t.Fatalf("confirm view missing plan:\n%s", m.View())
+	}
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(TrainRunModel)
+	if !m.creating || cmd == nil {
+		t.Fatal("enter should start session creation")
+	}
+	next, _ = m.Update(cmd()) // trainCreatedMsg
+	m = next.(TrainRunModel)
+	if !created || gotWS != "o/ws" {
+		t.Fatalf("CreateSession called=%v ws=%q", created, gotWS)
+	}
+	if m.confirming {
+		t.Fatal("after creation the confirm screen should close")
+	}
+}
+
+func TestTrainRunConfirmNeedsWorkspaceRepo(t *testing.T) {
+	called := false
+	deps := TrainRunDeps{
+		Plan:          &TrainRunPlan{Name: "n", Template: "t @v1", ReviewRepo: "o/r", NeedWorkspaceRepo: true},
+		CreateSession: func(ws string) (string, error) { called = true; return "s", nil },
+		Load:          func() (TrainRunSnapshot, error) { return TrainRunSnapshot{SessionID: "s"}, nil },
+	}
+	m := NewTrainRun(deps)
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m = next.(TrainRunModel)
+	// enter with no workspace repo → error, no create.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(TrainRunModel)
+	if called || m.createErr == "" {
+		t.Fatal("empty workspace repo should block creation with an error")
+	}
+	// type a repo then enter → create with it.
+	next, _ = m.Update(key("o/ws"))
+	m = next.(TrainRunModel)
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(TrainRunModel)
+	if cmd == nil {
+		t.Fatal("enter with a workspace repo should create")
+	}
+	cmd()
+	if !called {
+		t.Fatal("CreateSession should have been called")
+	}
+}
+
+func TestTrainRunConfirmAbort(t *testing.T) {
+	called := false
+	deps := TrainRunDeps{
+		Plan:          &TrainRunPlan{Name: "n", Template: "t", ReviewRepo: "o/r", WorkspaceRepo: "o/ws"},
+		CreateSession: func(ws string) (string, error) { called = true; return "s", nil },
+		Load:          func() (TrainRunSnapshot, error) { return TrainRunSnapshot{}, nil },
+	}
+	m := NewTrainRun(deps)
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m = next.(TrainRunModel)
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd == nil {
+		t.Fatal("esc should quit")
+	}
+	if called {
+		t.Fatal("esc must not create a session")
+	}
+}
+
 func TestTrainRunActionErrorShown(t *testing.T) {
 	m := trainRunModel(t, TrainRunSnapshot{SessionID: "s", Phase: "options_generated"})
 	next, _ := m.Update(trainActionMsg{err: errors.New("another worker holds the lock")})

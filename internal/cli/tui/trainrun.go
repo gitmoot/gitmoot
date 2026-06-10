@@ -38,6 +38,16 @@ type TrainRunActionResult struct {
 	Lines []string
 }
 
+// TrainRunPlan is shown on the confirm screen when there is no session yet for a
+// --config. CreateSession (below) writes it.
+type TrainRunPlan struct {
+	Name              string
+	Template          string // "<id>@<version>"
+	ReviewRepo        string
+	WorkspaceRepo     string // pre-supplied via --workspace-repo; else collected
+	NeedWorkspaceRepo bool
+}
+
 // TrainRunDeps are the data source and action callbacks the cli injects. The tui
 // package stays store-free. Continue advances a short (seconds) phase in
 // process; SpawnContinue launches the detached child for the long phases
@@ -49,6 +59,12 @@ type TrainRunDeps struct {
 	Decide        func(promote bool, candidate, reason string) (TrainRunActionResult, error)
 	StartNext     func() (TrainRunActionResult, error)
 	SpawnContinue func() (logPath string, err error)
+
+	// Plan, when non-nil, opens the confirm screen first (no session yet for the
+	// --config). CreateSession writes the session and returns its id; afterwards
+	// Load/Continue/… operate on the new session.
+	Plan          *TrainRunPlan
+	CreateSession func(workspaceRepo string) (sessionID string, err error)
 }
 
 type trainRunMode int
@@ -76,6 +92,11 @@ type trainSpawnMsg struct {
 	err     error
 }
 
+type trainCreatedMsg struct {
+	sessionID string
+	err       error
+}
+
 // TrainRunModel renders a single train session as a live phase view.
 type TrainRunModel struct {
 	deps     TrainRunDeps
@@ -91,11 +112,28 @@ type TrainRunModel struct {
 	actionErr   string
 	resultLines []string
 	rejectInput textinput.Model
+
+	// Confirm-screen state (deps.Plan != nil and no session yet).
+	confirming bool
+	creating   bool
+	createErr  string
+	wsInput    textinput.Model
 }
 
 // NewTrainRun returns a model ready for tea.NewProgram.
 func NewTrainRun(deps TrainRunDeps) TrainRunModel {
-	return TrainRunModel{deps: deps, width: 100, height: 30, inFlight: true}
+	m := TrainRunModel{deps: deps, width: 100, height: 30, inFlight: true}
+	if deps.Plan != nil {
+		m.confirming = true
+		m.inFlight = false
+		if deps.Plan.NeedWorkspaceRepo {
+			ti := textinput.New()
+			ti.Placeholder = "owner/repo"
+			m.wsInput = ti
+			m.wsInput.Focus() // focus state must be set here (Init's value receiver cannot persist it)
+		}
+	}
+	return m
 }
 
 func (m TrainRunModel) interval() time.Duration {
@@ -105,8 +143,16 @@ func (m TrainRunModel) interval() time.Duration {
 	return m.deps.Interval
 }
 
-// Init issues the first load and arms the refresh tick.
+// Init issues the first load and arms the refresh tick — unless a confirm screen
+// is pending (no session yet), in which case it waits for [enter] to create one
+// (the workspace-repo input, if any, was already focused in NewTrainRun).
 func (m TrainRunModel) Init() tea.Cmd {
+	if m.confirming {
+		if m.deps.Plan != nil && m.deps.Plan.NeedWorkspaceRepo {
+			return textinput.Blink
+		}
+		return nil
+	}
 	return tea.Batch(loadTrainSnapshot(m.deps), trainTick(m.interval()))
 }
 
@@ -129,6 +175,17 @@ func (m TrainRunModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if cmd := m.queueLoad(); cmd != nil {
 				cmds = append(cmds, cmd)
 			}
+		}
+	case trainCreatedMsg:
+		m.creating = false
+		if msg.err != nil {
+			m.createErr = msg.err.Error()
+		} else {
+			// Session created — leave the confirm screen and start the live view.
+			m.confirming = false
+			m.createErr = ""
+			m.inFlight = true
+			cmds = append(cmds, loadTrainSnapshot(m.deps), trainTick(m.interval()))
 		}
 	case trainSpawnMsg:
 		m.actionBusy = false
@@ -164,6 +221,33 @@ func (m TrainRunModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m TrainRunModel) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == "ctrl+c" {
 		return m, tea.Quit
+	}
+	if m.confirming {
+		switch msg.String() {
+		case "esc", "q":
+			return m, tea.Quit
+		case "enter":
+			if m.creating {
+				return m, nil
+			}
+			ws := m.deps.Plan.WorkspaceRepo
+			if m.deps.Plan.NeedWorkspaceRepo {
+				ws = strings.TrimSpace(m.wsInput.Value())
+				if ws == "" {
+					m.createErr = "workspace repo (owner/repo) is required"
+					return m, nil
+				}
+			}
+			m.creating = true
+			m.createErr = ""
+			return m, createSessionCmd(m.deps, ws)
+		}
+		if m.deps.Plan.NeedWorkspaceRepo && !m.creating {
+			var cmd tea.Cmd
+			m.wsInput, cmd = m.wsInput.Update(msg)
+			return m, cmd
+		}
+		return m, nil
 	}
 	if m.mode == trainModeReject {
 		switch msg.String() {
@@ -256,6 +340,16 @@ func startNextCmd(d TrainRunDeps) tea.Cmd {
 		}
 		res, err := d.StartNext()
 		return trainActionMsg{result: res, err: err}
+	}
+}
+
+func createSessionCmd(d TrainRunDeps, workspaceRepo string) tea.Cmd {
+	return func() tea.Msg {
+		if d.CreateSession == nil {
+			return trainCreatedMsg{}
+		}
+		id, err := d.CreateSession(workspaceRepo)
+		return trainCreatedMsg{sessionID: id, err: err}
 	}
 }
 

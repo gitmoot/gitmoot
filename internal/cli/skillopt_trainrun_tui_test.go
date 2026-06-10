@@ -115,6 +115,80 @@ func TestSkillOptTrainRunDispatchPlainFallback(t *testing.T) {
 	}
 }
 
+func TestBuildSkillOptTrainRunPlan(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	cfg := "name = \"x\"\ntemplate = \"planner\"\ntemplate_version = \"planner@v1\"\nreview_repo = \"o/r\"\ntask_kind = \"custom\"\nartifact_kind = \"text\"\npreview = \"none\"\nmode = \"explore\"\n"
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	// No workspace repo → confirm screen must ask for it; template label not doubled.
+	plan, err := buildSkillOptTrainRunPlan(cfgPath, "")
+	if err != nil {
+		t.Fatalf("buildSkillOptTrainRunPlan: %v", err)
+	}
+	if !plan.NeedWorkspaceRepo || plan.Template != "planner @v1" || plan.ReviewRepo != "o/r" {
+		t.Fatalf("plan = %+v", plan)
+	}
+	// With a workspace repo → no prompt needed.
+	plan, err = buildSkillOptTrainRunPlan(cfgPath, "o/ws")
+	if err != nil {
+		t.Fatalf("buildSkillOptTrainRunPlan: %v", err)
+	}
+	if plan.NeedWorkspaceRepo || plan.WorkspaceRepo != "o/ws" {
+		t.Fatalf("plan = %+v", plan)
+	}
+}
+
+func TestCreateSkillOptTrainRunSession(t *testing.T) {
+	home := t.TempDir()
+	workspace := chdirTemp(t)
+	seedPlannerTemplate(t, home)
+	// A scaffold config + items the start command can read.
+	scaffold := filepath.Join(workspace, ".gitmoot", "skillopt", "runsess")
+	if err := os.MkdirAll(scaffold, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cfgPath := filepath.Join(scaffold, "config.toml")
+	cfg := "name = \"runsess\"\ntemplate = \"planner\"\ntemplate_version = \"planner@v1\"\nreview_repo = \"jerryfane/gitmoot\"\ntask_kind = \"custom\"\nartifact_kind = \"text\"\npreview = \"none\"\nmode = \"explore\"\n"
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	itemsPath := filepath.Join(scaffold, "review-items.yml")
+	if err := os.WriteFile(itemsPath, []byte("items:\n  - title: One\n    brief: First item.\n    output_type: markdown\n  - title: Two\n    brief: Second item.\n    output_type: markdown\n"), 0o644); err != nil {
+		t.Fatalf("write items: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(scaffold, "task.md"), []byte("Improve the planner summaries.\n"), 0o644); err != nil {
+		t.Fatalf("write task.md: %v", err)
+	}
+
+	// Stub GitHub so --create-repos does not hit the network.
+	restore := replaceSkillOptGitHubClient(&repoCreateFakeGitHub{existing: map[string]bool{"jerryfane/gitmoot": true, "jerryfane/gitmoot-ws": true}})
+	defer restore()
+
+	id, err := createSkillOptTrainRunSession(home, cfgPath, "jerryfane/gitmoot-ws", &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("createSkillOptTrainRunSession: %v", err)
+	}
+	if id == "" {
+		t.Fatal("expected a session id")
+	}
+	// The session exists and is loadable.
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	if _, err := store.GetSkillOptTrainSession(context.Background(), id); err != nil {
+		t.Fatalf("created session not found: %v", err)
+	}
+
+	// Missing workspace repo → error, no session.
+	if _, err := createSkillOptTrainRunSession(home, cfgPath, "", &bytes.Buffer{}); err == nil {
+		t.Fatal("empty workspace repo should error")
+	}
+}
+
 func TestToTrainRunSnapshot(t *testing.T) {
 	snap := skillOptTrainStatusSnapshot{
 		SessionID:       "s1",

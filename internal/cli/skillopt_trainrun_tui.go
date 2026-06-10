@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -34,15 +36,63 @@ var skillOptTrainRunTUICapable = func() bool {
 		in.Mode()&os.ModeCharDevice != 0 && out.Mode()&os.ModeCharDevice != 0
 }
 
-// runSkillOptTrainRunTUI launches the bubbletea program. A var so dispatch tests
-// can stub the actual run.
+// runSkillOptTrainRunTUI launches the bubbletea program for an existing session.
+// A var so dispatch tests can stub the actual run.
 var runSkillOptTrainRunTUI = func(home, sessionID string, stdout, stderr io.Writer) int {
-	program := tea.NewProgram(tui.NewTrainRun(skillOptTrainRunDeps(home, sessionID)), tea.WithOutput(stdout))
+	deps := skillOptTrainRunDeps(home, func() string { return sessionID })
+	program := tea.NewProgram(tui.NewTrainRun(deps), tea.WithOutput(stdout))
 	if _, err := program.Run(); err != nil {
 		fmt.Fprintf(stderr, "skillopt train run: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+// runSkillOptTrainRunConfirmTUI launches the bubbletea program on the confirm
+// screen for a config with no session yet: it creates the session (via
+// train start --yes) and then shows the live phase view. A var so tests can stub it.
+var runSkillOptTrainRunConfirmTUI = func(home, configPath, workspaceRepo string, stdout, stderr io.Writer) int {
+	plan, err := buildSkillOptTrainRunPlan(configPath, workspaceRepo)
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt train run: %v\n", err)
+		return 1
+	}
+	created := &skillOptTrainRunSessionRef{}
+	deps := skillOptTrainRunDeps(home, created.get)
+	deps.Plan = plan
+	deps.CreateSession = func(ws string) (string, error) {
+		id, err := createSkillOptTrainRunSession(home, configPath, ws, stderr)
+		if err != nil {
+			return "", err
+		}
+		created.set(id)
+		return id, nil
+	}
+	program := tea.NewProgram(tui.NewTrainRun(deps), tea.WithOutput(stdout))
+	if _, err := program.Run(); err != nil {
+		fmt.Fprintf(stderr, "skillopt train run: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// skillOptTrainRunSessionRef holds the session id the confirm flow creates, read
+// concurrently by tea.Cmd goroutines (Load/Continue/…).
+type skillOptTrainRunSessionRef struct {
+	mu sync.Mutex
+	id string
+}
+
+func (r *skillOptTrainRunSessionRef) get() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.id
+}
+
+func (r *skillOptTrainRunSessionRef) set(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.id = id
 }
 
 func runSkillOptTrainRun(args []string, stdout, stderr io.Writer) int {
@@ -51,6 +101,7 @@ func runSkillOptTrainRun(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	configPath := fs.String("config", "", "train init config path to resolve the latest session")
 	sessionID := fs.String("session", "", "train session id")
+	workspaceRepo := fs.String("workspace-repo", "", "workspace repository to use when creating a session from --config")
 	plain := fs.Bool("plain", false, "print a one-shot status snapshot instead of the interactive TUI")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -69,8 +120,11 @@ func runSkillOptTrainRun(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if resolved == "" {
-		// No session yet for this config. Task 4 adds an interactive confirm
-		// screen; for now point at train start.
+		// No session yet for this config. On a terminal, open the confirm screen
+		// to create one; otherwise point at train start.
+		if !*plain && strings.TrimSpace(*configPath) != "" && skillOptTrainRunTUICapable() {
+			return runSkillOptTrainRunConfirmTUI(*home, *configPath, strings.TrimSpace(*workspaceRepo), stdout, stderr)
+		}
 		writeLine(stdout, "no train session yet for this config")
 		if strings.TrimSpace(*configPath) != "" {
 			writeLine(stdout, "next: gitmoot skillopt train start --config %s --workspace-repo <owner/repo>", *configPath)
@@ -149,8 +203,9 @@ func resolveSkillOptTrainRunSession(home, sessionID, configPath string) (string,
 }
 
 // skillOptTrainRunDeps wires the snapshot loader and phase actions into
-// tui.TrainRunDeps.
-func skillOptTrainRunDeps(home, sessionID string) tui.TrainRunDeps {
+// tui.TrainRunDeps. sessionID is a getter so the confirm flow (which creates the
+// session mid-program) and the resolved-session flow can share one builder.
+func skillOptTrainRunDeps(home string, sessionID func() string) tui.TrainRunDeps {
 	runContinue := func(mutate func(*skillOptTrainContinueRequest)) (tui.TrainRunActionResult, error) {
 		paths, err := initializedPaths(home)
 		if err != nil {
@@ -158,7 +213,7 @@ func skillOptTrainRunDeps(home, sessionID string) tui.TrainRunDeps {
 		}
 		var out skillOptTrainContinueOutput
 		err = withStore(home, func(store *db.Store) error {
-			request := skillOptTrainContinueRequest{Home: home, SessionID: sessionID}
+			request := skillOptTrainContinueRequest{Home: home, SessionID: sessionID()}
 			if mutate != nil {
 				mutate(&request)
 			}
@@ -173,7 +228,7 @@ func skillOptTrainRunDeps(home, sessionID string) tui.TrainRunDeps {
 		Load: func() (tui.TrainRunSnapshot, error) {
 			var snapshot skillOptTrainStatusSnapshot
 			if err := withStore(home, func(store *db.Store) error {
-				loaded, err := loadSkillOptTrainStatusSnapshot(context.Background(), store, sessionID, true)
+				loaded, err := loadSkillOptTrainStatusSnapshot(context.Background(), store, sessionID(), true)
 				if err != nil {
 					return err
 				}
@@ -198,8 +253,55 @@ func skillOptTrainRunDeps(home, sessionID string) tui.TrainRunDeps {
 		StartNext: func() (tui.TrainRunActionResult, error) {
 			return runContinue(func(r *skillOptTrainContinueRequest) { r.StartNext = true })
 		},
-		SpawnContinue: func() (string, error) { return spawnSkillOptTrainContinueChild(home, sessionID) },
+		SpawnContinue: func() (string, error) { return spawnSkillOptTrainContinueChild(home, sessionID()) },
 	}
+}
+
+// buildSkillOptTrainRunPlan loads the config into a confirm-screen plan.
+func buildSkillOptTrainRunPlan(configPath, workspaceRepo string) (*tui.TrainRunPlan, error) {
+	config, err := skillopt.LoadTrainInitConfig(configPath)
+	if err != nil {
+		return nil, err
+	}
+	template := strings.TrimSpace(config.Template)
+	if v := strings.TrimSpace(config.TemplateVersion); v != "" {
+		template += " @" + strings.TrimPrefix(v, strings.TrimSpace(config.Template)+"@")
+	}
+	return &tui.TrainRunPlan{
+		Name:              strings.TrimSpace(config.Name),
+		Template:          template,
+		ReviewRepo:        strings.TrimSpace(config.ReviewRepo),
+		WorkspaceRepo:     strings.TrimSpace(workspaceRepo),
+		NeedWorkspaceRepo: strings.TrimSpace(workspaceRepo) == "",
+	}, nil
+}
+
+// createSkillOptTrainRunSession creates a session from a config by invoking the
+// real `train start --yes` in process (no plan-building duplication), capturing
+// its output so it does not corrupt the TUI. Missing repos are created
+// (--create-repos). Returns the new session id.
+func createSkillOptTrainRunSession(home, configPath, workspaceRepo string, stderr io.Writer) (string, error) {
+	if strings.TrimSpace(workspaceRepo) == "" {
+		return "", errors.New("workspace repo is required")
+	}
+	config, err := skillopt.LoadTrainInitConfig(configPath)
+	if err != nil {
+		return "", err
+	}
+	sessionID := generatedSkillOptTrainSessionID(config.Template)
+	args := []string{
+		"--home", home,
+		"--config", configPath,
+		"--workspace-repo", workspaceRepo,
+		"--session", sessionID,
+		"--create-repos",
+		"--yes",
+	}
+	var buf bytes.Buffer
+	if code := runSkillOptTrainStart(args, &buf, &buf); code != 0 {
+		return "", fmt.Errorf("train start failed: %s", strings.TrimSpace(buf.String()))
+	}
+	return sessionID, nil
 }
 
 // spawnSkillOptTrainContinueChild launches `gitmoot skillopt train continue` as a
