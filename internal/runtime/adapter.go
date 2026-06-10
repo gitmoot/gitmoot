@@ -243,7 +243,9 @@ func (a CodexAdapter) runner() subprocess.Runner {
 	if a.Runner != nil {
 		return a.Runner
 	}
-	return subprocess.ExecRunner{}
+	// Group semantics so cancelling a job kills the runtime CLI's whole
+	// process tree, not just the immediate child.
+	return subprocess.GroupRunner{}
 }
 
 func (a CodexAdapter) verifySession(ctx context.Context, agent Agent) error {
@@ -351,7 +353,9 @@ func (a ClaudeAdapter) runner() subprocess.Runner {
 	if a.Runner != nil {
 		return a.Runner
 	}
-	return subprocess.ExecRunner{}
+	// Group semantics so cancelling a job kills the runtime CLI's whole
+	// process tree, not just the immediate child.
+	return subprocess.GroupRunner{}
 }
 
 func (a ClaudeAdapter) newRuntimeRef() (string, error) {
@@ -409,7 +413,9 @@ func (a ShellAdapter) runner() subprocess.Runner {
 	if a.Runner != nil {
 		return a.Runner
 	}
-	return subprocess.ExecRunner{}
+	// Group semantics so cancelling a job kills the runtime CLI's whole
+	// process tree, not just the immediate child.
+	return subprocess.GroupRunner{}
 }
 
 func commandError(result subprocess.Result, err error) error {
