@@ -1964,6 +1964,10 @@ func (f *fakeGitHub) CreateRepository(context.Context, github.Repository, bool) 
 	return nil
 }
 
+func (f *fakeGitHub) DeleteRepository(context.Context, github.Repository) error {
+	return nil
+}
+
 func (f *fakeGitHub) ListPullRequests(_ context.Context, _ github.Repository, state string) ([]github.PullRequest, error) {
 	f.listPullRequestsCalls++
 	if len(f.listPullRequestsErrs) > 0 {

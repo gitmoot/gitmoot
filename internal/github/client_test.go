@@ -89,6 +89,50 @@ func TestCreateRepository(t *testing.T) {
 	})
 }
 
+func TestDeleteRepository(t *testing.T) {
+	repo := Repository{Owner: "o", Name: "r"}
+
+	t.Run("deletes", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{{}}}
+		client := GhClient{Runner: runner}
+		if err := client.DeleteRepository(context.Background(), repo); err != nil {
+			t.Fatalf("DeleteRepository: %v", err)
+		}
+		runner.wantArgs(t, 0, "repo", "delete", "o/r", "--yes")
+	})
+
+	t.Run("missing delete_repo scope maps to remedy", func(t *testing.T) {
+		runner := &fakeRunner{
+			results: []subprocess.Result{{Stderr: "HTTP 403: Must have admin rights... This API operation needs the \"delete_repo\" scope"}},
+			errs:    []error{errors.New("exit status 1")},
+		}
+		client := GhClient{Runner: runner}
+		err := client.DeleteRepository(context.Background(), repo)
+		if err == nil || !strings.Contains(err.Error(), "gh auth refresh -h github.com -s delete_repo") {
+			t.Fatalf("expected the scope remedy in the error, got %v", err)
+		}
+	})
+
+	t.Run("other errors propagate unchanged", func(t *testing.T) {
+		runner := &fakeRunner{
+			results: []subprocess.Result{{Stderr: "HTTP 404: Not Found"}},
+			errs:    []error{errors.New("exit status 1")},
+		}
+		client := GhClient{Runner: runner}
+		err := client.DeleteRepository(context.Background(), repo)
+		if err == nil || strings.Contains(err.Error(), "delete_repo") {
+			t.Fatalf("non-scope error should propagate without the remedy, got %v", err)
+		}
+	})
+
+	t.Run("empty repo", func(t *testing.T) {
+		client := GhClient{Runner: &fakeRunner{}}
+		if err := client.DeleteRepository(context.Background(), Repository{}); err == nil {
+			t.Fatal("expected error for empty repo")
+		}
+	})
+}
+
 func TestListIssueCommentsDedupesByID(t *testing.T) {
 	runner := &fakeRunner{
 		results: []subprocess.Result{{

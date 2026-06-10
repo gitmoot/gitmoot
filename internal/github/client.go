@@ -21,6 +21,7 @@ type Client interface {
 	Preflight(ctx context.Context, repo Repository) error
 	RepositoryExists(ctx context.Context, repo Repository) (bool, error)
 	CreateRepository(ctx context.Context, repo Repository, private bool) error
+	DeleteRepository(ctx context.Context, repo Repository) error
 	ListPullRequests(ctx context.Context, repo Repository, state string) ([]PullRequest, error)
 	GetPullRequest(ctx context.Context, repo Repository, number int64) (PullRequest, error)
 	CreatePullRequest(ctx context.Context, input CreatePullRequestInput) (PullRequest, error)
@@ -350,6 +351,26 @@ func (c *GhClient) CreateRepository(ctx context.Context, repo Repository, privat
 	}
 	_, err := c.run(ctx, true, "repo", "create", repo.FullName(), visibility)
 	return err
+}
+
+// DeleteRepository deletes the repo via `gh repo delete`. GitHub requires the
+// non-default delete_repo token scope; a scope failure is mapped to the exact
+// remedy so callers can show it verbatim.
+func (c *GhClient) DeleteRepository(ctx context.Context, repo Repository) error {
+	if strings.TrimSpace(repo.FullName()) == "" {
+		return fmt.Errorf("repository owner/name is required")
+	}
+	result, err := c.run(ctx, true, "repo", "delete", repo.FullName(), "--yes")
+	if err != nil && isMissingDeleteRepoScope(result) {
+		return fmt.Errorf("deleting %s requires the delete_repo token scope; run `gh auth refresh -h github.com -s delete_repo` and retry: %w", repo.FullName(), err)
+	}
+	return err
+}
+
+func isMissingDeleteRepoScope(result subprocess.Result) bool {
+	text := strings.ToLower(result.Stdout + "\n" + result.Stderr)
+	return strings.Contains(text, "delete_repo") ||
+		(strings.Contains(text, "http 403") && strings.Contains(text, "scope"))
 }
 
 func (c *GhClient) ListPullRequests(ctx context.Context, repo Repository, state string) ([]PullRequest, error) {
@@ -885,6 +906,10 @@ func (NoopClient) RepositoryExists(context.Context, Repository) (bool, error) {
 }
 
 func (NoopClient) CreateRepository(context.Context, Repository, bool) error {
+	return nil
+}
+
+func (NoopClient) DeleteRepository(context.Context, Repository) error {
 	return nil
 }
 
