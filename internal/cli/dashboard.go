@@ -113,7 +113,7 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 	answerID := fs.String("answer", "", "pending prompt id to answer before showing the snapshot")
 	answerValue := fs.String("value", "", "answer value to use with --answer")
 	answerSource := fs.String("source", "dashboard", "answer source recorded with --answer")
-	dismissID := fs.String("dismiss", "", "pending prompt id to delete before showing the snapshot")
+	dismissID := fs.String("dismiss", "", "prompt id to delete before showing the snapshot")
 	watch := fs.Bool("watch", false, "refresh the snapshot on an interval until interrupted (terminal only)")
 	interval := fs.Duration("interval", 5*time.Second, "refresh interval for --watch")
 	if err := fs.Parse(args); err != nil {

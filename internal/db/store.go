@@ -2712,6 +2712,11 @@ func (s *Store) AnswerInteractivePrompt(ctx context.Context, id string, value st
 	return s.GetInteractivePrompt(ctx, prompt.ID)
 }
 
+// ErrInteractivePromptNotFound is returned by DeleteInteractivePrompt when no
+// prompt with the given id exists. Callers performing best-effort cleanup of a
+// prompt that may already be gone can ignore it via errors.Is.
+var ErrInteractivePromptNotFound = errors.New("interactive prompt not found")
+
 func (s *Store) DeleteInteractivePrompt(ctx context.Context, id string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -2726,7 +2731,7 @@ func (s *Store) DeleteInteractivePrompt(ctx context.Context, id string) error {
 		return err
 	}
 	if affected == 0 {
-		return fmt.Errorf("interactive prompt %q not found", id)
+		return fmt.Errorf("interactive prompt %q: %w", id, ErrInteractivePromptNotFound)
 	}
 	return nil
 }

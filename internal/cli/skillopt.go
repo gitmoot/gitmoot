@@ -483,7 +483,7 @@ func consumeSkillOptTrainInitPromptAnswers(home string, scope string) error {
 		if _, ok := skillOptTrainInitPromptField(scope, prompt.ID); !ok {
 			continue
 		}
-		if err := store.DeleteInteractivePrompt(context.Background(), prompt.ID); err != nil {
+		if err := store.DeleteInteractivePrompt(context.Background(), prompt.ID); err != nil && !errors.Is(err, db.ErrInteractivePromptNotFound) {
 			return err
 		}
 	}

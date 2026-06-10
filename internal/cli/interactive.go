@@ -206,19 +206,19 @@ func runInteractiveClear(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
+	// Deletes are not wrapped in a transaction; report each id as it succeeds so
+	// that on a mid-list failure the user can see exactly what was removed.
 	if err := withStore(*home, func(store *db.Store) error {
 		for _, id := range ids {
 			if err := store.DeleteInteractivePrompt(context.Background(), id); err != nil {
 				return err
 			}
+			writeLine(stdout, "cleared %s", id)
 		}
 		return nil
 	}); err != nil {
 		fmt.Fprintf(stderr, "interactive clear: %v\n", err)
 		return 1
-	}
-	for _, id := range ids {
-		writeLine(stdout, "cleared %s", id)
 	}
 	return 0
 }
