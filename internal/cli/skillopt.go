@@ -1203,7 +1203,7 @@ func runSkillOptTrainStart(args []string, stdout, stderr io.Writer) int {
 	}
 	if *createRepos {
 		for _, fullName := range []string{repo.FullName(), workspaceRepo} {
-			if err := ensureSkillOptTrainRepo(fullName, stdout); err != nil {
+			if err := ensureSkillOptTrainRepo(*home, fullName, "train", strings.TrimSpace(*sessionID), stdout); err != nil {
 				fmt.Fprintf(stderr, "skillopt train start: create repo %s: %v\n", fullName, err)
 				return 1
 			}
@@ -1315,10 +1315,12 @@ func runSkillOptTrainStart(args []string, stdout, stderr io.Writer) int {
 }
 
 // ensureSkillOptTrainRepo creates the given repo as a private GitHub repo when it
-// does not already exist. Deduplicated callers pass distinct names; an empty name
-// is a no-op. An ambiguous existence check (e.g. auth error) is left alone so the
-// later Preflight surfaces it, rather than wrongly attempting a create.
-func ensureSkillOptTrainRepo(fullName string, stdout io.Writer) error {
+// does not already exist, recording it in created_repos so cleanup flows can
+// offer deletion of exactly the repos gitmoot created. Deduplicated callers pass
+// distinct names; an empty name is a no-op. An ambiguous existence check (e.g.
+// auth error) is left alone so the later Preflight surfaces it, rather than
+// wrongly attempting a create.
+func ensureSkillOptTrainRepo(home, fullName, purpose, sessionID string, stdout io.Writer) error {
 	if strings.TrimSpace(fullName) == "" {
 		return nil
 	}
@@ -1337,6 +1339,12 @@ func ensureSkillOptTrainRepo(fullName string, stdout io.Writer) error {
 	}
 	if err := client.CreateRepository(context.Background(), repo, true); err != nil {
 		return err
+	}
+	if err := withStore(home, func(store *db.Store) error {
+		return store.RecordCreatedRepo(context.Background(), db.CreatedRepo{Repo: fullName, Purpose: purpose, SessionID: strings.TrimSpace(sessionID)})
+	}); err != nil {
+		// The repo exists either way; a failed record only loses the cleanup offer.
+		fmt.Fprintf(stdout, "warning: could not record created repo %s: %v\n", fullName, err)
 	}
 	writeLine(stdout, "created_repo: %s", fullName)
 	return nil
@@ -6601,33 +6609,8 @@ func runSkillOptTrainStop(args []string, stdout, stderr io.Writer) int {
 	}
 	var stopped db.SkillOptTrainIteration
 	if err := withStore(*home, func(store *db.Store) error {
-		ctx := context.Background()
-		session, err := store.GetSkillOptTrainSession(ctx, strings.TrimSpace(*sessionID))
+		iteration, err := stopSkillOptTrainSession(context.Background(), store, strings.TrimSpace(*sessionID), strings.TrimSpace(*reason))
 		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("train session %s not found", strings.TrimSpace(*sessionID))
-			}
-			return err
-		}
-		iteration, err := store.GetLatestSkillOptTrainIteration(ctx, session.ID)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("train session %s has no iteration to stop", session.ID)
-			}
-			return err
-		}
-		if err := skillopt.CanTransitionTrainIteration(iteration.State, skillopt.TrainStateRunAbandoned); err != nil {
-			return err
-		}
-		session.State = skillopt.TrainStateRunAbandoned
-		session.MetadataJSON = skillOptTrainDecisionMetadata(session.MetadataJSON, *reason)
-		iteration.State = skillopt.TrainStateRunAbandoned
-		iteration.DecisionReason = strings.TrimSpace(*reason)
-		iteration.MetadataJSON = skillOptTrainDecisionMetadata(iteration.MetadataJSON, *reason)
-		if err := store.UpsertSkillOptTrainSession(ctx, session); err != nil {
-			return err
-		}
-		if err := store.UpsertSkillOptTrainIteration(ctx, iteration); err != nil {
 			return err
 		}
 		stopped = iteration
@@ -6640,6 +6623,43 @@ func runSkillOptTrainStop(args []string, stdout, stderr io.Writer) int {
 	writeLine(stdout, "iteration: %s", stopped.ID)
 	writeLine(stdout, "reason: %s", strings.TrimSpace(*reason))
 	return 0
+}
+
+// stopSkillOptTrainSession abandons a train session with a reason — the shared
+// body behind `train stop` and the dashboard's stop action.
+func stopSkillOptTrainSession(ctx context.Context, store *db.Store, sessionID string, reason string) (db.SkillOptTrainIteration, error) {
+	if sessionID == "" || strings.TrimSpace(reason) == "" {
+		return db.SkillOptTrainIteration{}, errors.New("a session id and a reason are required")
+	}
+	session, err := store.GetSkillOptTrainSession(ctx, sessionID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return db.SkillOptTrainIteration{}, fmt.Errorf("train session %s not found", sessionID)
+		}
+		return db.SkillOptTrainIteration{}, err
+	}
+	iteration, err := store.GetLatestSkillOptTrainIteration(ctx, session.ID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return db.SkillOptTrainIteration{}, fmt.Errorf("train session %s has no iteration to stop", session.ID)
+		}
+		return db.SkillOptTrainIteration{}, err
+	}
+	if err := skillopt.CanTransitionTrainIteration(iteration.State, skillopt.TrainStateRunAbandoned); err != nil {
+		return db.SkillOptTrainIteration{}, err
+	}
+	session.State = skillopt.TrainStateRunAbandoned
+	session.MetadataJSON = skillOptTrainDecisionMetadata(session.MetadataJSON, reason)
+	iteration.State = skillopt.TrainStateRunAbandoned
+	iteration.DecisionReason = strings.TrimSpace(reason)
+	iteration.MetadataJSON = skillOptTrainDecisionMetadata(iteration.MetadataJSON, reason)
+	if err := store.UpsertSkillOptTrainSession(ctx, session); err != nil {
+		return db.SkillOptTrainIteration{}, err
+	}
+	if err := store.UpsertSkillOptTrainIteration(ctx, iteration); err != nil {
+		return db.SkillOptTrainIteration{}, err
+	}
+	return iteration, nil
 }
 
 func loadSkillOptTrainStatus(ctx context.Context, store *db.Store, sessionID string) (db.SkillOptTrainSession, *db.SkillOptTrainIteration, skillopt.TrainStatusCounts, error) {

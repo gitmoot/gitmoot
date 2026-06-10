@@ -699,6 +699,46 @@ func (s *Store) RemoveAgent(ctx context.Context, name string) (bool, error) {
 	return affected > 0, tx.Commit()
 }
 
+// DeleteAgentChecked removes an agent (and its instances) unless queued or
+// running jobs still reference it, in which case it refuses so in-flight work is
+// never orphaned.
+func (s *Store) DeleteAgentChecked(ctx context.Context, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("agent name is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var active int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE agent = ? AND state IN ('queued', 'running')`, name).Scan(&active); err != nil {
+		return err
+	}
+	if active > 0 {
+		return fmt.Errorf("agent %s has %d queued or running job(s); cancel them first", name, active)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM agent_repos WHERE agent_name = ?`, name); err != nil {
+		return err
+	}
+	// agent_instances are NOT deleted: their `type` column references a managed
+	// agent type, not this agents.name, so deleting by name could remove another
+	// type's instances. Instances are ephemeral (expiry-reaped) either way.
+	result, err := tx.ExecContext(ctx, `DELETE FROM agents WHERE name = ?`, name)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return fmt.Errorf("agent %q not found", name)
+	}
+	return tx.Commit()
+}
+
 func (s *Store) AllowAgentRepo(ctx context.Context, agentName string, repoFullName string) error {
 	result, err := s.db.ExecContext(ctx, `UPDATE agents
 		SET repo_scope = CASE WHEN repo_scope = '' THEN ? ELSE repo_scope END,
@@ -1170,6 +1210,60 @@ func (s *Store) RejectAgentTemplateVersion(ctx context.Context, versionID string
 		return AgentTemplateVersion{}, err
 	}
 	if err := upsertAgentTemplateCandidateReviewDecisionTx(ctx, tx, target, "rejected", reason); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	return s.GetAgentTemplateVersionByID(ctx, target.ID)
+}
+
+// RevertAgentTemplateVersion makes a previously superseded version current
+// again (a rollback). It mirrors PromoteAgentTemplateVersion's pointer/state
+// writes but accepts a superseded target instead of a pending one, and records
+// no candidate-review decision (reverts are not candidate decisions).
+func (s *Store) RevertAgentTemplateVersion(ctx context.Context, templateID string, versionID string) (AgentTemplateVersion, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	defer tx.Rollback()
+	target, err := getAgentTemplateVersionByIDTx(ctx, tx, versionID)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if target.TemplateID != strings.TrimSpace(templateID) {
+		return AgentTemplateVersion{}, fmt.Errorf("version %s belongs to template %s, not %s", target.ID, target.TemplateID, templateID)
+	}
+	if target.State != "superseded" {
+		return AgentTemplateVersion{}, fmt.Errorf("agent template version %s is %s, not superseded; only a previously current version can be reverted to", target.ID, target.State)
+	}
+	current, hasCurrent, err := getCurrentAgentTemplateVersion(ctx, tx, target.TemplateID)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if hasCurrent {
+		if _, err := tx.ExecContext(ctx, `UPDATE agent_template_versions SET state = 'superseded', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, current.ID); err != nil {
+			return AgentTemplateVersion{}, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE agent_template_versions SET state = 'current', promoted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, target.ID); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	latestID, err := latestSelectableVersionID(ctx, tx, target.TemplateID)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE agent_templates SET
+			name = ?, description = ?, source_repo = ?, source_ref = ?, source_path = ?, resolved_commit = ?,
+			content = ?, metadata_json = ?, current_version_id = ?, latest_version_id = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?`,
+		target.Name, target.Description, target.SourceRepo, target.SourceRef, target.SourcePath, target.ResolvedCommit,
+		target.Content, target.MetadataJSON, target.ID, latestID, target.TemplateID)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if err := requireAffected(result, "agent template", target.TemplateID); err != nil {
 		return AgentTemplateVersion{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -2387,6 +2481,165 @@ func normalizeSkillOptTrainIteration(iteration SkillOptTrainIteration) (SkillOpt
 	iteration.DecisionReason = strings.TrimSpace(iteration.DecisionReason)
 	iteration.MetadataJSON = strings.TrimSpace(iteration.MetadataJSON)
 	return iteration, nil
+}
+
+// DeleteSkillOptTrainSession removes a train session and everything keyed by it
+// in one transaction: iterations, each iteration's eval run with its review
+// items/options and (ranked) feedback events, review watches, and the session's
+// resource locks (matched as a whole colon-delimited key segment). It refuses
+// while a non-expired lock exists for the session so an in-flight generation or
+// optimizer is never pulled out from under its worker. Interactive prompt
+// records carry no session linkage (train-init prompts are workspace-scoped and
+// deleted by their own flows), so none are touched here.
+func (s *Store) DeleteSkillOptTrainSession(ctx context.Context, sessionID string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return errors.New("train session id is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM skillopt_train_sessions WHERE id = ?`, sessionID).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		return fmt.Errorf("train session %q not found", sessionID)
+	}
+
+	// Collect lock keys referencing the session as a whole segment, and refuse
+	// while any of them is still live.
+	now := time.Now().UTC().Format("2006-01-02T15:04:05.000000000Z")
+	lockRows, err := tx.QueryContext(ctx, `SELECT resource_key, expires_at FROM resource_locks`)
+	if err != nil {
+		return err
+	}
+	sessionLockKeys := []string{}
+	for lockRows.Next() {
+		var key, expiresAt string
+		if err := lockRows.Scan(&key, &expiresAt); err != nil {
+			lockRows.Close()
+			return err
+		}
+		matched := false
+		for _, segment := range strings.Split(key, ":") {
+			if segment == sessionID {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		if expiresAt > now {
+			lockRows.Close()
+			return fmt.Errorf("train session %s has an active resource lock (%s); wait for it to finish or recover it first", sessionID, key)
+		}
+		sessionLockKeys = append(sessionLockKeys, key)
+	}
+	if err := lockRows.Err(); err != nil {
+		lockRows.Close()
+		return err
+	}
+	lockRows.Close()
+
+	runRows, err := tx.QueryContext(ctx, `SELECT eval_run_id FROM skillopt_train_iterations WHERE session_id = ? AND eval_run_id <> ''`, sessionID)
+	if err != nil {
+		return err
+	}
+	runIDs := []string{}
+	for runRows.Next() {
+		var runID string
+		if err := runRows.Scan(&runID); err != nil {
+			runRows.Close()
+			return err
+		}
+		runIDs = append(runIDs, runID)
+	}
+	if err := runRows.Err(); err != nil {
+		runRows.Close()
+		return err
+	}
+	runRows.Close()
+
+	for _, runID := range runIDs {
+		for _, stmt := range []string{
+			`DELETE FROM eval_review_items WHERE run_id = ?`,
+			`DELETE FROM eval_review_options WHERE run_id = ?`,
+			`DELETE FROM feedback_events WHERE run_id = ?`,
+			`DELETE FROM ranked_feedback_events WHERE run_id = ?`,
+			`DELETE FROM skillopt_review_watches WHERE run_id = ?`,
+			`DELETE FROM eval_runs WHERE id = ?`,
+		} {
+			if _, err := tx.ExecContext(ctx, stmt, runID); err != nil {
+				return err
+			}
+		}
+	}
+	for _, key := range sessionLockKeys {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM resource_locks WHERE resource_key = ?`, key); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM skillopt_train_iterations WHERE session_id = ?`, sessionID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM skillopt_train_sessions WHERE id = ?`, sessionID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// CreatedRepo records a GitHub repository gitmoot itself created, so cleanup
+// flows can offer deletion of exactly those repos and never others.
+type CreatedRepo struct {
+	Repo      string `json:"repo"`
+	Purpose   string `json:"purpose,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
+}
+
+// RecordCreatedRepo remembers that gitmoot created the repo. A repo can only be
+// created once, so on conflict the ORIGINAL creator linkage is preserved (a
+// later session re-recording the same name must not steal the cleanup offer).
+func (s *Store) RecordCreatedRepo(ctx context.Context, record CreatedRepo) error {
+	record.Repo = strings.TrimSpace(record.Repo)
+	if record.Repo == "" {
+		return errors.New("created repo name is required")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO created_repos(repo, purpose, session_id, created_at)
+		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(repo) DO NOTHING`,
+		record.Repo, record.Purpose, record.SessionID)
+	return err
+}
+
+// ListCreatedReposForSession returns the repos gitmoot created for a session.
+func (s *Store) ListCreatedReposForSession(ctx context.Context, sessionID string) ([]CreatedRepo, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT repo, purpose, session_id, created_at FROM created_repos WHERE session_id = ? ORDER BY created_at`, strings.TrimSpace(sessionID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	records := []CreatedRepo{}
+	for rows.Next() {
+		var record CreatedRepo
+		if err := rows.Scan(&record.Repo, &record.Purpose, &record.SessionID, &record.CreatedAt); err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
+// DeleteCreatedRepoRecord forgets a created-repo record (after the repo itself
+// was deleted, or to stop offering cleanup for it).
+func (s *Store) DeleteCreatedRepoRecord(ctx context.Context, repo string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM created_repos WHERE repo = ?`, strings.TrimSpace(repo))
+	return err
 }
 
 func (s *Store) GetSkillOptTrainIteration(ctx context.Context, id string) (SkillOptTrainIteration, error) {
@@ -4601,5 +4854,15 @@ CREATE TABLE interactive_prompts (
 );
 
 CREATE INDEX idx_interactive_prompts_state ON interactive_prompts(state);
+	`,
+	`
+CREATE TABLE created_repos (
+	repo TEXT PRIMARY KEY,
+	purpose TEXT NOT NULL DEFAULT '',
+	session_id TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_created_repos_session ON created_repos(session_id);
 	`,
 }

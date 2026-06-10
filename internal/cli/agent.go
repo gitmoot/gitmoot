@@ -1199,6 +1199,39 @@ func persistAgentSubscription(ctx context.Context, store *db.Store, agent runtim
 	return store.ReplaceAgentRepos(ctx, agent.Name, repos)
 }
 
+// registerAgentOnly persists an agent record without launching a runtime
+// session — the shared body behind the dashboard's create-agent form. The agent
+// becomes addressable for jobs; a runtime session starts lazily when work is
+// delivered.
+func registerAgentOnly(ctx context.Context, store *db.Store, name, runtimeName, templateID, repoFullName string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("agent name is required")
+	}
+	runtimeName = strings.TrimSpace(runtimeName)
+	if runtimeName == "" {
+		return errors.New("agent runtime is required")
+	}
+	agent := runtime.Agent{
+		Name:       name,
+		Runtime:    runtimeName,
+		TemplateID: strings.TrimSpace(templateID),
+		RepoScope:  strings.TrimSpace(repoFullName),
+	}
+	repos := []string{}
+	if agent.RepoScope != "" {
+		repo, err := daemon.ParseRepository(agent.RepoScope)
+		if err != nil {
+			return err
+		}
+		if err := store.UpsertRepo(ctx, db.Repo{Owner: repo.Owner, Name: repo.Name}); err != nil {
+			return err
+		}
+		repos = append(repos, agent.RepoScope)
+	}
+	return persistAgentSubscription(ctx, store, agent, repos)
+}
+
 func agentStartupPrompt(agent runtime.Agent, cachedTemplate db.AgentTemplate) string {
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "You are a Gitmoot-managed agent named %s.\n", agent.Name)

@@ -40,6 +40,8 @@ func runAgentTemplate(args []string, stdout, stderr io.Writer) int {
 		return runAgentTemplateUpdate(args[1:], stdout, stderr)
 	case "diff":
 		return runAgentTemplateDiff(args[1:], stdout, stderr)
+	case "revert":
+		return runAgentTemplateRevert(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown agent template command %q\n\n", args[0])
 		printAgentTemplateUsage(stderr)
@@ -56,6 +58,41 @@ func printAgentTemplateUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot agent template show thermo-nuclear-code-quality-review")
 	fmt.Fprintln(w, "  gitmoot agent template update thermo-nuclear-code-quality-review")
 	fmt.Fprintln(w, "  gitmoot agent template diff thermo-nuclear-code-quality-review")
+	fmt.Fprintln(w, "  gitmoot agent template revert <template-id> --version <version-id>")
+}
+
+// runAgentTemplateRevert rolls a template back to a previously current
+// (superseded) version.
+func runAgentTemplateRevert(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("agent template revert", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	versionRef := fs.String("version", "", "superseded version id to make current again")
+	id, flagArgs := leadingID(args)
+	if err := fs.Parse(flagArgs); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if strings.TrimSpace(id) == "" || strings.TrimSpace(*versionRef) == "" {
+		fmt.Fprintln(stderr, "agent template revert requires <template-id> and --version")
+		return 2
+	}
+	var reverted db.AgentTemplateVersion
+	if err := withStore(*home, func(store *db.Store) error {
+		version, err := store.GetAgentTemplateVersion(context.Background(), strings.TrimSpace(id), strings.TrimSpace(*versionRef))
+		if err != nil {
+			return err
+		}
+		reverted, err = store.RevertAgentTemplateVersion(context.Background(), strings.TrimSpace(id), version.ID)
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "agent template revert: %v\n", err)
+		return 1
+	}
+	writeLine(stdout, "reverted %s to %s", strings.TrimSpace(id), reverted.ID)
+	return 0
 }
 
 func runAgentTemplateAdd(args []string, stdout, stderr io.Writer) int {
