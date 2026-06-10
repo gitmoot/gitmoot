@@ -6662,6 +6662,39 @@ func stopSkillOptTrainSession(ctx context.Context, store *db.Store, sessionID st
 	return iteration, nil
 }
 
+// deleteSkillOptTrainSession removes a train session and its history, and
+// returns the GitHub repos gitmoot recorded as created for it. The records
+// deliberately survive the cascade so a caller can offer their cleanup; any
+// future delete surface must list them BEFORE the delete or they orphan.
+func deleteSkillOptTrainSession(ctx context.Context, store *db.Store, sessionID string) ([]string, error) {
+	records, err := store.ListCreatedReposForSession(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.DeleteSkillOptTrainSession(ctx, sessionID); err != nil {
+		return nil, err
+	}
+	repos := make([]string, 0, len(records))
+	for _, record := range records {
+		repos = append(repos, record.Repo)
+	}
+	return repos, nil
+}
+
+// cleanupCreatedTrainRepo deletes a gitmoot-created GitHub repo and then its
+// created_repos record — in that order, so a failed GitHub delete keeps the
+// repo on offer for a retry.
+func cleanupCreatedTrainRepo(ctx context.Context, store *db.Store, repo string) error {
+	parsed, err := daemon.ParseRepository(repo)
+	if err != nil {
+		return err
+	}
+	if err := newSkillOptGitHubClient().DeleteRepository(ctx, parsed); err != nil {
+		return err
+	}
+	return store.DeleteCreatedRepoRecord(ctx, repo)
+}
+
 func loadSkillOptTrainStatus(ctx context.Context, store *db.Store, sessionID string) (db.SkillOptTrainSession, *db.SkillOptTrainIteration, skillopt.TrainStatusCounts, error) {
 	session, err := store.GetSkillOptTrainSession(ctx, strings.TrimSpace(sessionID))
 	if err != nil {

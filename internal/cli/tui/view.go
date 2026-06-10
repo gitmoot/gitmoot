@@ -74,12 +74,19 @@ func (m Model) content() string {
 		b.WriteString("\n\n")
 	}
 	// Job overlays can be entered from more than one page (Jobs, Attention), so
-	// they are dispatched once here rather than inside each page renderer.
+	// they are dispatched once here rather than inside each page renderer; the
+	// train action overlays follow the same pattern.
 	switch m.mode {
 	case modeJobDetail:
 		b.WriteString(m.jobDetailView())
 	case modeConfirmJobRetry, modeConfirmJobCancel:
 		b.WriteString(m.jobConfirmView())
+	case modeTrainStopReason:
+		b.WriteString(m.trainStopView())
+	case modeConfirmTrainDelete:
+		b.WriteString(m.trainDeleteConfirmView())
+	case modeConfirmTrainRepoCleanup:
+		b.WriteString(m.trainRepoCleanupView())
 	default:
 		switch pages[m.selected].page {
 		case pageAttention:
@@ -117,6 +124,9 @@ func (m Model) helpContent() string {
 	case pageTrains:
 		b.WriteString("↑/↓  select a train session\n")
 		b.WriteString("enter open the session (live phase view; esc returns)\n")
+		b.WriteString("s    stop a live session (asks for a reason)\n")
+		b.WriteString("d    delete a finished session and its history;\n")
+		b.WriteString("     repos gitmoot created for it can be deleted too\n")
 	case pageJobs:
 		b.WriteString("↑/↓  select a job\n")
 		b.WriteString("enter open the job's detail (events)\n")
@@ -149,12 +159,18 @@ func (m Model) footerHelp() string {
 		return "R retry  c cancel  esc back"
 	case modeConfirmJobRetry, modeConfirmJobCancel:
 		return "y confirm  n/esc cancel"
+	case modeTrainStopReason:
+		return "type reason  enter stop  esc cancel"
+	case modeConfirmTrainDelete:
+		return "y delete  n/esc cancel"
+	case modeConfirmTrainRepoCleanup:
+		return "y delete repos  n/esc keep them"
 	}
 	switch pages[m.selected].page {
 	case pageAttention:
 		return "tab/←→ page  ↑/↓ select  a answer  d dismiss  enter/R jobs  ? help  q quit"
 	case pageTrains:
-		return "tab/←→ page  ↑/↓ select  enter open  r refresh  q quit"
+		return "tab/←→ page  ↑/↓ select  enter open  s stop  d delete  ? help  q quit"
 	case pageJobs:
 		return "tab/←→ page  ↑/↓ select  enter detail  R retry  c cancel  ? help  q quit"
 	}

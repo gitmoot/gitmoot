@@ -2,6 +2,7 @@ package tui
 
 import (
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -47,6 +48,9 @@ const (
 	modeJobDetail
 	modeConfirmJobRetry
 	modeConfirmJobCancel
+	modeTrainStopReason
+	modeConfirmTrainDelete
+	modeConfirmTrainRepoCleanup
 )
 
 const defaultInterval = 5 * time.Second
@@ -87,6 +91,9 @@ type Model struct {
 	cancelling      map[string]struct{} // jobs with a cancel requested, until settled
 	daemonBusy      bool                // a daemon start is in flight; suppress re-submit
 	daemonErr       string              // error from the last daemon start attempt
+
+	// Trains page action state.
+	pendingRepos []string // gitmoot-created repos offered for cleanup after a delete
 }
 
 // New returns a Model ready for tea.NewProgram. It starts in the loading state;
@@ -129,11 +136,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case tea.KeyMsg:
 		// Modal overlays capture keys first; only ctrl+c stays global.
-		if m.mode == modeJobDetail || m.mode == modeConfirmJobRetry || m.mode == modeConfirmJobCancel {
+		switch m.mode {
+		case modeJobDetail, modeConfirmJobRetry, modeConfirmJobCancel:
 			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
 			}
 			return m.updateJobOverlay(msg)
+		case modeTrainStopReason, modeConfirmTrainDelete, modeConfirmTrainRepoCleanup:
+			if msg.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+			return m.updateTrainOverlay(msg)
 		}
 		if m.mode != modeNormal {
 			return m.updateOverlay(msg)
@@ -190,6 +203,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
 			}
+			if t, ok := m.trainUnderCursor(); ok && deadTrainPhase(t.Phase) {
+				m.openTrainDelete(t)
+				m.viewport.SetContent(m.content())
+				return m, tea.Batch(cmds...)
+			}
 		case "enter":
 			if pages[m.selected].page == pageTrains {
 				// With a Root router, open the full train-run view; otherwise the
@@ -232,6 +250,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
 			}
+			if t, ok := m.trainUnderCursor(); ok && !deadTrainPhase(t.Phase) {
+				cmd := m.openTrainStop(t)
+				m.viewport.SetContent(m.content())
+				return m, cmd
+			}
 		case "?":
 			m.showHelp = !m.showHelp
 			m.viewport.SetContent(m.content())
@@ -245,25 +268,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport, cmd = m.viewport.Update(msg)
 		cmds = append(cmds, cmd)
 	case answerResultMsg:
-		m.actionBusy = false
-		if msg.err != nil {
-			m.actionErr = msg.err.Error()
-		} else {
-			m.mode = modeNormal
-			m.actionErr = ""
+		// Apply only while the answer overlay is still open: the prompt
+		// overlays allow esc while busy, so a stale result must not close or
+		// pollute whatever overlay the user opened since. Refresh regardless.
+		if m.mode == modeAnswerChoice || m.mode == modeAnswerText {
+			m.actionBusy = false
+			if msg.err != nil {
+				m.actionErr = msg.err.Error()
+			} else {
+				m.mode = modeNormal
+				m.actionErr = ""
+			}
+		}
+		if msg.err == nil {
 			if cmd := m.queueLoad(); cmd != nil {
 				cmds = append(cmds, cmd)
 			}
 		}
 	case dismissResultMsg:
-		m.actionBusy = false
 		// A prompt already gone (removed by another terminal or a prior refresh)
 		// is treated as success, since the goal was to remove it.
-		if msg.err != nil && !errors.Is(msg.err, db.ErrInteractivePromptNotFound) {
-			m.actionErr = msg.err.Error()
-		} else {
-			m.mode = modeNormal
-			m.actionErr = ""
+		dismissed := msg.err == nil || errors.Is(msg.err, db.ErrInteractivePromptNotFound)
+		if m.mode == modeConfirmDismiss {
+			m.actionBusy = false
+			if dismissed {
+				m.mode = modeNormal
+				m.actionErr = ""
+			} else {
+				m.actionErr = msg.err.Error()
+			}
+		}
+		if dismissed {
 			if cmd := m.queueLoad(); cmd != nil {
 				cmds = append(cmds, cmd)
 			}
@@ -278,6 +313,61 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.jobEvents = msg.events
 			}
 		}
+	case trainStopMsg:
+		if m.mode == modeTrainStopReason {
+			m.actionBusy = false
+			if msg.err != nil {
+				m.actionErr = msg.err.Error()
+			} else {
+				m.mode = modeNormal
+				m.actionErr = ""
+			}
+		}
+		if msg.err == nil {
+			if cmd := m.queueLoad(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
+	case trainDeleteMsg:
+		if m.mode == modeConfirmTrainDelete {
+			m.actionBusy = false
+			if msg.err != nil {
+				// e.g. the lock-refusal from DeleteSkillOptTrainSession; stays
+				// in the confirm so the user reads it.
+				m.actionErr = msg.err.Error()
+			} else {
+				m.actionErr = ""
+				if len(msg.repos) > 0 {
+					m.pendingRepos = msg.repos
+					m.mode = modeConfirmTrainRepoCleanup
+				} else {
+					m.mode = modeNormal
+				}
+			}
+		}
+		if msg.err == nil {
+			if cmd := m.queueLoad(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
+	case trainRepoCleanupMsg:
+		if m.mode == modeConfirmTrainRepoCleanup {
+			m.actionBusy = false
+			if len(msg.errs) > 0 {
+				// Scope errors carry their remedy verbatim; keep the confirm
+				// open with only the still-failing repos on offer, so a retry
+				// does not replay repos that were already deleted.
+				m.actionErr = strings.Join(msg.errs, "\n")
+				m.pendingRepos = msg.failed
+			} else {
+				m.mode = modeNormal
+				m.actionErr = ""
+				m.pendingRepos = nil
+			}
+		}
+		if cmd := m.queueLoad(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	case daemonStartMsg:
 		// Daemon start has its own busy/error state so its result cannot close
 		// or pollute an unrelated job confirm that opened in the meantime.
@@ -291,17 +381,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case jobActionMsg:
-		m.actionBusy = false
-		if msg.err != nil {
-			m.actionErr = msg.err.Error()
-		} else {
-			if msg.verb == "cancel" && msg.id != "" {
-				m.cancelling[msg.id] = struct{}{}
-			}
-			if m.mode == modeConfirmJobRetry || m.mode == modeConfirmJobCancel {
+		if msg.err == nil && msg.verb == "cancel" && msg.id != "" {
+			m.cancelling[msg.id] = struct{}{}
+		}
+		if m.mode == modeConfirmJobRetry || m.mode == modeConfirmJobCancel {
+			m.actionBusy = false
+			if msg.err != nil {
+				m.actionErr = msg.err.Error()
+			} else {
 				m.mode = modeNormal
+				m.actionErr = ""
 			}
-			m.actionErr = ""
+		}
+		if msg.err == nil {
 			if cmd := m.queueLoad(); cmd != nil {
 				cmds = append(cmds, cmd)
 			}

@@ -130,6 +130,26 @@ func dashboardTUIDeps(home string, interval time.Duration) tui.Deps {
 				return err
 			})
 		},
+		StopTrain: func(id, reason string) error {
+			return withStore(home, func(store *db.Store) error {
+				_, err := stopSkillOptTrainSession(context.Background(), store, id, reason)
+				return err
+			})
+		},
+		DeleteTrain: func(id string) ([]string, error) {
+			var repos []string
+			err := withStore(home, func(store *db.Store) error {
+				var err error
+				repos, err = deleteSkillOptTrainSession(context.Background(), store, id)
+				return err
+			})
+			return repos, err
+		},
+		DeleteTrainRepo: func(repo string) error {
+			return withStore(home, func(store *db.Store) error {
+				return cleanupCreatedTrainRepo(context.Background(), store, repo)
+			})
+		},
 		StartDaemon: func() error {
 			// Restart rather than start: it tolerates a stopped daemon and
 			// restores the previously persisted flags (workers, poll, watch)

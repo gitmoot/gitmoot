@@ -134,6 +134,14 @@ type Deps struct {
 	// StartDaemon starts the background daemon when the attention list shows it
 	// stopped.
 	StartDaemon func() error
+
+	// Train session actions. StopTrain abandons a live session's current run
+	// with a reason. DeleteTrain removes a terminal session and its history,
+	// returning the GitHub repos gitmoot recorded as created for it (still
+	// pending cleanup). DeleteTrainRepo deletes one such repo and its record.
+	StopTrain       func(id, reason string) error
+	DeleteTrain     func(id string) ([]string, error)
+	DeleteTrainRepo func(repo string) error
 }
 
 // snapshotMsg carries the result of a Deps.Load call.
@@ -186,4 +194,24 @@ type jobActionMsg struct {
 // jobActionMsg so it cannot close or pollute an open job confirm.
 type daemonStartMsg struct {
 	err error
+}
+
+// trainStopMsg carries the outcome of a Deps.StopTrain call.
+type trainStopMsg struct {
+	err error
+}
+
+// trainDeleteMsg carries the outcome of a Deps.DeleteTrain call; repos are the
+// recorded gitmoot-created repos now eligible for cleanup.
+type trainDeleteMsg struct {
+	repos []string
+	err   error
+}
+
+// trainRepoCleanupMsg carries the outcome of a cleanup pass: the repos that
+// failed (so a retry only replays those) and their errors. Both empty on full
+// success.
+type trainRepoCleanupMsg struct {
+	failed []string
+	errs   []string
 }
