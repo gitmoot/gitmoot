@@ -236,6 +236,23 @@ func runSkillOptTrainInitCreate(args []string, stdout, stderr io.Writer) int {
 			}
 			printSkillOptTrainInitPromptInstructions(stdout, *home, rerunCommand, created)
 			return 0
+		case skillOptTrainInitTUICapable():
+			// A real terminal: run the interactive form. Ordered before the line
+			// wizard so that under `go test` (pipes, not char devices) capable() is
+			// false and the existing wizard path runs unchanged.
+			if err := runSkillOptTrainInitTUI(*home, promptScope, stdout, &values, missing); err != nil {
+				if errors.Is(err, errSkillOptTrainInitAborted) {
+					writeLine(stdout, "aborted: no scaffold written")
+					return 0
+				}
+				fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
+				return 1
+			}
+			if stillMissing := missingSkillOptTrainInitInputs(values); len(stillMissing) > 0 {
+				fmt.Fprintf(stderr, "skillopt train init missing required fields: %s\n", strings.Join(stillMissing, ", "))
+				fmt.Fprintf(stderr, "example: %s\n", skillOptTrainInitExampleCommand(values.Name))
+				return 2
+			}
 		case skillOptTrainInitInteractive():
 			if err := runSkillOptTrainInitWizard(*home, promptScope, skillOptTrainInitStdin(), stdout, &values, missing); err != nil {
 				if errors.Is(err, errSkillOptTrainInitAborted) {
