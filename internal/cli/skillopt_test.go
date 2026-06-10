@@ -1,13 +1,13 @@
 package cli
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1159,7 +1159,7 @@ func TestSkillOptTrainInitWizardCompletesFromStdin(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("wizard train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
-	for _, want := range []string{"Training name:", "Choose a template:", "planner", "Custom file", "Choose a preview style:"} {
+	for _, want := range []string{"Choose a template:", "planner", "Custom file", "Preview kind?", "gitmoot interactive answer "} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("wizard stdout missing %q:\n%s", want, stdout.String())
 		}
@@ -1171,6 +1171,107 @@ func TestSkillOptTrainInitWizardCompletesFromStdin(t *testing.T) {
 	if cfg.Name != "wizard-flow" || cfg.Template != "planner" || cfg.ReviewRepo != "jerryfane/gitmoot" || cfg.ArtifactKind != "text" || cfg.Preview != "text-table" || cfg.Mode != db.EvalRunModeExplore {
 		t.Fatalf("config from wizard = %+v", cfg)
 	}
+}
+
+func TestSkillOptTrainInitWizardCompletesFromInteractiveAnswers(t *testing.T) {
+	home := t.TempDir()
+	workspace := chdirTemp(t)
+	scope := skillOptTrainInitPromptScope(workspace, "")
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	if err := store.UpsertAgentTemplate(context.Background(), cliSkillOptTemplate("planner", "Plan the work.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	restoreInteractive := replaceSkillOptTrainInitInteractive(true)
+	defer restoreInteractive()
+	// Blocking stdin (an unwritten pipe) so the wizard can only be driven by
+	// `interactive answer`.
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	previousStdin := skillOptTrainInitStdin
+	skillOptTrainInitStdin = func() io.Reader { return pr }
+	defer func() { skillOptTrainInitStdin = previousStdin }()
+	previousPoll := skillOptTrainInitWizardPoll
+	skillOptTrainInitWizardPoll = 15 * time.Millisecond
+	defer func() { skillOptTrainInitWizardPoll = previousPoll }()
+
+	type wizardResult struct {
+		code   int
+		stderr string
+	}
+	resultCh := make(chan wizardResult, 1)
+	go func() {
+		var stdout, stderr bytes.Buffer
+		code := Run([]string{"skillopt", "train", "init", "--home", home}, &stdout, &stderr)
+		resultCh <- wizardResult{code: code, stderr: stderr.String()}
+	}()
+
+	answers := map[string]string{
+		"name":          "agent-flow",
+		"template":      "planner",
+		"review_repo":   "jerryfane/gitmoot",
+		"artifact_kind": "text",
+		"preview":       "text-table",
+		"request":       "Improve planner summaries.",
+	}
+	for range answers {
+		prompt := waitPendingInteractivePrompt(t, home, 5*time.Second)
+		field, ok := skillOptTrainInitPromptField(scope, prompt.ID)
+		if !ok {
+			t.Fatalf("unexpected prompt id %q", prompt.ID)
+		}
+		value, ok := answers[field]
+		if !ok {
+			t.Fatalf("no scripted answer for field %q", field)
+		}
+		var answerOut, answerErr bytes.Buffer
+		if code := Run([]string{"interactive", "answer", "--home", home, prompt.ID, value, "--source", "agent"}, &answerOut, &answerErr); code != 0 {
+			t.Fatalf("answer %s exit code = %d, stderr=%s", field, code, answerErr.String())
+		}
+	}
+
+	select {
+	case res := <-resultCh:
+		if res.code != 0 {
+			t.Fatalf("agent-driven wizard exit code = %d, stderr=%s", res.code, res.stderr)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("agent-driven wizard did not complete")
+	}
+	cfg, err := skillopt.LoadTrainInitConfig(filepath.Join(workspace, ".gitmoot", "skillopt", "agent-flow", "config.toml"))
+	if err != nil {
+		t.Fatalf("LoadTrainInitConfig returned error: %v", err)
+	}
+	if cfg.Name != "agent-flow" || cfg.Template != "planner" || cfg.ReviewRepo != "jerryfane/gitmoot" || cfg.ArtifactKind != "text" || cfg.Preview != "text-table" {
+		t.Fatalf("config from agent answers = %+v", cfg)
+	}
+}
+
+func waitPendingInteractivePrompt(t *testing.T, home string, timeout time.Duration) db.InteractivePrompt {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		store, err := db.Open(config.PathsForHome(home).Database)
+		if err == nil {
+			prompts, listErr := store.ListInteractivePrompts(context.Background(), db.InteractivePromptStatePending)
+			store.Close()
+			if listErr == nil && len(prompts) == 1 {
+				return prompts[0]
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for a pending interactive prompt")
+	return db.InteractivePrompt{}
 }
 
 func TestSkillOptTrainInitWizardIncompleteFailsCleanly(t *testing.T) {
@@ -1192,25 +1293,84 @@ func TestSkillOptTrainInitWizardIncompleteFailsCleanly(t *testing.T) {
 	}
 }
 
-func TestSkillOptTrainInitWizardChoiceSelection(t *testing.T) {
-	choices := []string{"none", "text-table", "vue"}
+func TestSkillOptTrainInitWizardUnterminatedFinalLineDoesNotHang(t *testing.T) {
+	home := t.TempDir()
+	_ = chdirTemp(t)
+	restoreInteractive := replaceSkillOptTrainInitInteractive(true)
+	defer restoreInteractive()
+	// The final answered line ("partial") has no trailing newline, so its read
+	// returns EOF alongside the value. Later required fields remain, so the
+	// wizard must report them and exit instead of blocking on a dead stdin.
+	restoreStdin := replaceSkillOptTrainInitStdin("partial")
+	defer restoreStdin()
+
+	type result struct {
+		code   int
+		stderr string
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		var stdout, stderr bytes.Buffer
+		code := Run([]string{"skillopt", "train", "init", "--home", home}, &stdout, &stderr)
+		resultCh <- result{code: code, stderr: stderr.String()}
+	}()
+	select {
+	case res := <-resultCh:
+		if res.code != 2 {
+			t.Fatalf("unterminated wizard exit code = %d, want 2; stderr=%s", res.code, res.stderr)
+		}
+		if !strings.Contains(res.stderr, "missing required fields") {
+			t.Fatalf("unterminated wizard stderr = %q", res.stderr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("wizard hung on an unterminated final stdin line")
+	}
+}
+
+func TestSkillOptTrainInitWizardInterpretChoice(t *testing.T) {
+	prompt := db.InteractivePrompt{Choices: []string{"none", "text-table", "vue"}, Default: "text-table"}
 	cases := []struct {
-		name  string
-		input string
-		want  string
+		name       string
+		input      string
+		wantValue  string
+		wantStatus string
 	}{
-		{name: "by number", input: "2\n", want: "text-table"},
-		{name: "by literal value", input: "vue\n", want: "vue"},
-		{name: "blank uses default", input: "\n", want: "text-table"},
-		{name: "reasks then accepts", input: "9\n1\n", want: "none"},
+		{name: "by number", input: "2", wantValue: "text-table", wantStatus: "ok"},
+		{name: "by literal value", input: "vue", wantValue: "vue", wantStatus: "ok"},
+		{name: "blank uses default", input: "", wantValue: "text-table", wantStatus: "ok"},
+		{name: "out of range reasks", input: "9", wantValue: "", wantStatus: "reask"},
+		{name: "unknown reasks", input: "bogus", wantValue: "", wantStatus: "reask"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			reader := bufio.NewReader(strings.NewReader(tc.input))
-			var stdout bytes.Buffer
-			got := skillOptTrainInitWizardChoice(reader, &stdout, "Choose a preview style:", choices, "text-table")
-			if got != tc.want {
-				t.Fatalf("choice = %q, want %q (stdout=%s)", got, tc.want, stdout.String())
+			value, status := skillOptTrainInitWizardInterpret("preview", tc.input, prompt, nil)
+			if value != tc.wantValue || status != tc.wantStatus {
+				t.Fatalf("interpret(%q) = (%q, %q), want (%q, %q)", tc.input, value, status, tc.wantValue, tc.wantStatus)
+			}
+		})
+	}
+}
+
+func TestSkillOptTrainInitWizardInterpretTemplate(t *testing.T) {
+	choices := []skillopt.TrainInitTemplateChoice{{ID: "planner"}, {ID: "designer"}}
+	prompt := db.InteractivePrompt{}
+	cases := []struct {
+		name       string
+		input      string
+		wantValue  string
+		wantStatus string
+	}{
+		{name: "by number", input: "1", wantValue: "planner", wantStatus: "ok"},
+		{name: "by id", input: "designer", wantValue: "designer", wantStatus: "ok"},
+		{name: "custom index", input: "3", wantValue: "", wantStatus: "custom"},
+		{name: "literal ref", input: "owner/repo@v2", wantValue: "owner/repo@v2", wantStatus: "ok"},
+		{name: "out of range reasks", input: "9", wantValue: "", wantStatus: "reask"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			value, status := skillOptTrainInitWizardInterpret("template", tc.input, prompt, choices)
+			if value != tc.wantValue || status != tc.wantStatus {
+				t.Fatalf("interpret(%q) = (%q, %q), want (%q, %q)", tc.input, value, status, tc.wantValue, tc.wantStatus)
 			}
 		})
 	}
