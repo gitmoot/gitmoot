@@ -2039,6 +2039,9 @@ type skillOptTrainContinueRequest struct {
 	// such as announcing a long-lived optimizer launch. It is nil for automated
 	// callers (the review watcher) that have no attached terminal.
 	Progress io.Writer
+	// GenerationLockExtend, when set, is called after each generated option to
+	// push the generation lock TTL forward so long runs do not outlive it.
+	GenerationLockExtend func() error
 }
 
 type skillOptTrainOptimizerRequest struct {
@@ -2131,13 +2134,14 @@ func continueSkillOptTrain(ctx context.Context, paths config.Paths, store *db.St
 			return output, err
 		}
 		request.GenerationLockTTL = generationLockTTL
-		releaseGenerationLock, _, err := acquireSkillOptTrainGenerationLock(ctx, store, session.ID, iteration.ID, generationLockTTL)
+		releaseGenerationLock, extendGenerationLock, _, err := acquireSkillOptTrainGenerationLock(ctx, store, session.ID, iteration.ID, generationLockTTL)
 		if err != nil {
 			return output, err
 		}
 		defer func() {
 			_ = releaseGenerationLock(context.Background())
 		}()
+		request.GenerationLockExtend = extendGenerationLock
 		session, iteration, counts, err = loadSkillOptTrainStatus(ctx, store, request.SessionID)
 		if err != nil {
 			return skillOptTrainContinueOutput{}, err
@@ -4951,33 +4955,45 @@ func skillOptTrainOptimizerLockTTLForRequest(request skillOptTrainOptimizerReque
 	return ttl, nil
 }
 
-func acquireSkillOptTrainGenerationLock(ctx context.Context, store *db.Store, sessionID string, iterationID string, ttl time.Duration) (func(context.Context) error, bool, error) {
+// skillOptTrainNoopExtend is a no-op lock-extend function for failure/automated paths.
+func skillOptTrainNoopExtend() error { return nil }
+
+func acquireSkillOptTrainGenerationLock(ctx context.Context, store *db.Store, sessionID string, iterationID string, ttl time.Duration) (release func(context.Context) error, extend func() error, acquired bool, err error) {
 	key := skillOptTrainGenerationLockKey(sessionID, iterationID)
 	token, err := newRuntimeLockOwnerToken()
 	if err != nil {
-		return noopAgentReservationRelease, false, err
+		return noopAgentReservationRelease, skillOptTrainNoopExtend, false, err
 	}
 	if ttl <= 0 {
 		ttl = skillOptTrainGenerationLockTTL
 	}
 	now := time.Now().UTC()
 	ownerJobID := localAgentJobID("skillopt-train-generation", strings.TrimSpace(sessionID))
-	acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+	ok, err := store.AcquireResourceLock(ctx, db.ResourceLock{
 		ResourceKey: key,
 		OwnerJobID:  ownerJobID,
 		OwnerToken:  token,
+		OwnerPID:    int64(os.Getpid()),
 		ExpiresAt:   now.Add(ttl).Format(time.RFC3339Nano),
 	}, now)
 	if err != nil {
-		return noopAgentReservationRelease, false, err
+		return noopAgentReservationRelease, skillOptTrainNoopExtend, false, err
 	}
-	if !acquired {
-		return noopAgentReservationRelease, false, fmt.Errorf("%w: %s", errSkillOptTrainGenerationBusy, key)
+	if !ok {
+		return noopAgentReservationRelease, skillOptTrainNoopExtend, false, fmt.Errorf("%w: %s", errSkillOptTrainGenerationBusy, key)
 	}
-	return func(releaseCtx context.Context) error {
+	release = func(releaseCtx context.Context) error {
 		_, err := store.ReleaseResourceLock(releaseCtx, key, ownerJobID, token)
 		return err
-	}, true, nil
+	}
+	// extend pushes the lock TTL forward so a long generation run does not
+	// outlive the upfront estimate (called from the per-option progress hook).
+	extend = func() error {
+		extendNow := time.Now().UTC()
+		_, err := store.HeartbeatResourceLock(context.Background(), key, ownerJobID, token, extendNow, extendNow.Add(ttl))
+		return err
+	}
+	return release, extend, true, nil
 }
 
 func estimateSkillOptTrainGenerationLockTTL(ctx context.Context, store *db.Store, request skillOptTrainContinueRequest, iteration db.SkillOptTrainIteration) (time.Duration, error) {
@@ -5094,14 +5110,15 @@ func skillOptTrainGenerationLockKey(sessionID string, iterationID string) string
 // watcher passes a nil Progress) stay silent. Writes are mutex-guarded because
 // options across items complete on concurrent goroutines.
 type skillOptTrainGenerationProgress struct {
-	mu    sync.Mutex
-	w     io.Writer
-	done  int
-	total int
+	mu     sync.Mutex
+	w      io.Writer
+	done   int
+	total  int
+	extend func() error
 }
 
-func newSkillOptTrainGenerationProgress(w io.Writer, total int) *skillOptTrainGenerationProgress {
-	return &skillOptTrainGenerationProgress{w: w, total: total}
+func newSkillOptTrainGenerationProgress(w io.Writer, total int, extend func() error) *skillOptTrainGenerationProgress {
+	return &skillOptTrainGenerationProgress{w: w, total: total, extend: extend}
 }
 
 func (p *skillOptTrainGenerationProgress) start(items, perItem int, runtime string) {
@@ -5118,7 +5135,14 @@ func (p *skillOptTrainGenerationProgress) start(items, perItem int, runtime stri
 }
 
 func (p *skillOptTrainGenerationProgress) optionDone(itemID, role string, elapsed time.Duration, failed bool) {
-	if p == nil || p.w == nil {
+	if p == nil {
+		return
+	}
+	// Keep the generation lock fresh while a long run is still producing options.
+	if !failed && p.extend != nil {
+		_ = p.extend()
+	}
+	if p.w == nil {
 		return
 	}
 	p.mu.Lock()
@@ -5226,7 +5250,7 @@ func generateSkillOptTrainOptions(ctx context.Context, paths config.Paths, store
 	if err := ensureSkillOptTrainGenerationRepoReady(ctx, store, skillOptTrainGenerationRepo(session)); err != nil {
 		return skillOptTrainGenerationResult{}, err
 	}
-	progress := newSkillOptTrainGenerationProgress(request.Progress, len(items)*len(roles))
+	progress := newSkillOptTrainGenerationProgress(request.Progress, len(items)*len(roles), request.GenerationLockExtend)
 	progress.start(len(items), len(roles), skillOptTrainGenerationRuntimeLabel(request))
 	generatedItems, err := generateSkillOptTrainItemOptions(ctx, store, blobStore, session, iteration, run, items, roles, rankedRun, request, dispatch, concurrency, progress)
 	if err != nil {
@@ -6688,20 +6712,39 @@ func applySkillOptTrainStableStatus(snapshot skillOptTrainStatusSnapshot) skillO
 	return snapshot
 }
 
-func skillOptTrainStableStatusPhase(snapshot skillOptTrainStatusSnapshot) string {
-	if snapshot.Verbose != nil {
-		for _, lock := range snapshot.Verbose.ActiveLocks {
-			if lock.Name != "optimizer" && lock.Name != "optimizer_legacy" {
-				continue
-			}
+// skillOptTrainLockPhase maps an active generation/optimizer resource lock to a
+// stable status phase. It is shared by `train status` and the dashboard so both
+// report the same live phase. ok is false when no lock determines the phase.
+func skillOptTrainLockPhase(locks []skillOptTrainStatusLock) (string, bool) {
+	for _, lock := range locks {
+		switch lock.Name {
+		case "optimizer", "optimizer_legacy":
 			switch strings.TrimSpace(lock.Status) {
 			case "active":
-				return "optimizer_running"
+				return "optimizer_running", true
 			case "active_expired_heartbeat":
-				return "optimizer_heartbeat_stale"
+				return "optimizer_heartbeat_stale", true
 			case "stale":
-				return "blocked_stale_lock"
+				return "blocked_stale_lock", true
 			}
+		case "generation":
+			switch strings.TrimSpace(lock.Status) {
+			case "active":
+				return "generating_options", true
+			case "active_expired_heartbeat":
+				return "generating_options_heartbeat_stale", true
+			case "stale":
+				return "blocked_stale_lock", true
+			}
+		}
+	}
+	return "", false
+}
+
+func skillOptTrainStableStatusPhase(snapshot skillOptTrainStatusSnapshot) string {
+	if snapshot.Verbose != nil {
+		if phase, ok := skillOptTrainLockPhase(snapshot.Verbose.ActiveLocks); ok {
+			return phase
 		}
 		statuses := snapshot.Verbose.MetadataStatus
 		optimizerStatus := strings.TrimSpace(statuses["optimizer"])
@@ -6850,10 +6893,16 @@ func skillOptTrainActiveLocks(ctx context.Context, store *db.Store, sessionID st
 			return nil, err
 		}
 		status := "active"
-		if candidate.name == "optimizer" || candidate.name == "optimizer_legacy" {
+		switch candidate.name {
+		case "optimizer", "optimizer_legacy", "generation":
+			// Report a heartbeat-stale/stale status (via OwnerPID liveness)
+			// instead of dropping an expired-but-running lock, so the phase
+			// does not flap back to items_ready mid-generation.
 			status = skillOptTrainOptimizerLockStatus(lock, now)
-		} else if !skillOptResourceLockActive(lock, now) {
-			continue
+		default:
+			if !skillOptResourceLockActive(lock, now) {
+				continue
+			}
 		}
 		locks = append(locks, skillOptTrainStatusLock{
 			Name:          candidate.name,

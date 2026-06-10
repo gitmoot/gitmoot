@@ -11125,3 +11125,93 @@ func TestSkillOptTrainOptimizerHeartbeat(t *testing.T) {
 	// A nil writer is a no-op and must not panic.
 	startSkillOptTrainOptimizerHeartbeat(nil)()
 }
+
+func TestSkillOptTrainLockPhase(t *testing.T) {
+	cases := []struct {
+		name   string
+		status string
+		lock   string
+		want   string
+		ok     bool
+	}{
+		{name: "generation active", lock: "generation", status: "active", want: "generating_options", ok: true},
+		{name: "generation heartbeat stale", lock: "generation", status: "active_expired_heartbeat", want: "generating_options_heartbeat_stale", ok: true},
+		{name: "generation stale", lock: "generation", status: "stale", want: "blocked_stale_lock", ok: true},
+		{name: "optimizer active", lock: "optimizer", status: "active", want: "optimizer_running", ok: true},
+		{name: "review lock ignored", lock: "review", status: "active", want: "", ok: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := skillOptTrainLockPhase([]skillOptTrainStatusLock{{Name: tc.lock, Status: tc.status}})
+			if got != tc.want || ok != tc.ok {
+				t.Fatalf("skillOptTrainLockPhase = (%q,%v), want (%q,%v)", got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
+func TestSkillOptTrainGeneratingOptionsPhase(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	ctx := context.Background()
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	if err := store.UpsertSkillOptTrainSession(ctx, db.SkillOptTrainSession{ID: "gen-phase", TemplateID: "planner", TargetRepo: "owner/repo", State: skillopt.TrainStateItemsReady}); err != nil {
+		t.Fatalf("UpsertSkillOptTrainSession returned error: %v", err)
+	}
+	if err := store.UpsertEvalRun(ctx, db.EvalRun{ID: "gen-phase-review-001", TemplateID: "planner", TargetRepo: "owner/repo", State: "review", Mode: db.EvalRunModeExplore}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+	if err := store.UpsertSkillOptTrainIteration(ctx, db.SkillOptTrainIteration{ID: "gen-phase-001", SessionID: "gen-phase", EvalRunID: "gen-phase-review-001", Mode: db.EvalRunModeExplore, State: skillopt.TrainStateItemsReady}); err != nil {
+		t.Fatalf("UpsertSkillOptTrainIteration returned error: %v", err)
+	}
+	now := time.Now().UTC()
+	key := skillOptTrainGenerationLockKey("gen-phase", "gen-phase-001")
+	if _, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+		ResourceKey: key,
+		OwnerJobID:  "gen-job",
+		OwnerToken:  "gen-token",
+		OwnerPID:    int64(os.Getpid()),
+		ExpiresAt:   now.Add(time.Hour).Format(time.RFC3339Nano),
+	}, now); err != nil {
+		t.Fatalf("AcquireResourceLock returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"skillopt", "train", "status", "--home", home, "--session", "gen-phase", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("train status exit = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "\"status_phase\": \"generating_options\"") {
+		t.Fatalf("train status did not report generating_options:\n%s", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"dashboard", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("dashboard exit = %d, stderr=%s", code, stderr.String())
+	}
+	var snapshot dashboardSnapshot
+	if err := json.Unmarshal(stdout.Bytes(), &snapshot); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	found := false
+	for _, train := range snapshot.TrainSessions {
+		if train.ID == "gen-phase" {
+			found = true
+			if train.Phase != "generating_options" {
+				t.Fatalf("dashboard train phase = %q, want generating_options", train.Phase)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("dashboard did not include the train session: %+v", snapshot.TrainSessions)
+	}
+}

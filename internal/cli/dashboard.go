@@ -244,6 +244,15 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 				summary := skillopt.BuildTrainStatusSummary(session, &iteration, skillopt.TrainStatusCounts{})
 				entry.Phase = summary.CurrentPhase
 				entry.Candidate = summary.CandidateVersion
+				// Override with the live lock-derived phase (e.g. generating_options,
+				// optimizer_running) using the same helper as `train status`.
+				locks, lockErr := skillOptTrainActiveLocks(ctx, store, session.ID, iteration.ID)
+				if lockErr != nil {
+					return lockErr
+				}
+				if phase, ok := skillOptTrainLockPhase(locks); ok {
+					entry.Phase = phase
+				}
 			case errors.Is(err, sql.ErrNoRows):
 				// No iteration yet — keep the session-state fallback.
 			default:
