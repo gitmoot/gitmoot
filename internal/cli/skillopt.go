@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -46,6 +47,10 @@ var skillOptTrainInitInteractive = func() bool {
 	info, err := os.Stdin.Stat()
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
+
+// skillOptTrainInitStdin is the reader the interactive train-init wizard reads
+// answers from. It is a function so tests can substitute a scripted stdin.
+var skillOptTrainInitStdin = func() io.Reader { return os.Stdin }
 
 func runSkillOpt(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
@@ -150,6 +155,10 @@ func printSkillOptTrainInitUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot skillopt train init --name <name> --template <id> --review-repo owner/repo --artifact-kind kind --preview kind (--request text|--request-file path) [--task-kind kind] [--mode explore|refine|distill|validate]")
 	fmt.Fprintln(w, "  gitmoot skillopt train init templates --json")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "With missing fields, an interactive terminal runs a line-oriented wizard.")
+	fmt.Fprintln(w, "Use --prompts to emit interactive prompt records instead (answer them with")
+	fmt.Fprintln(w, "gitmoot interactive answer, then rerun), or --yes to fail on missing fields.")
 }
 
 func runSkillOptTrainInitCreate(args []string, stdout, stderr io.Writer) int {
@@ -165,7 +174,8 @@ func runSkillOptTrainInitCreate(args []string, stdout, stderr io.Writer) int {
 	mode := fs.String("mode", db.EvalRunModeExplore, "train mode: explore, refine, distill, or validate")
 	requestText := fs.String("request", "", "human training request for task.md")
 	requestFile := fs.String("request-file", "", "file containing the human training request")
-	yes := fs.Bool("yes", false, "do not create interactive prompts for missing fields")
+	yes := fs.Bool("yes", false, "do not prompt for missing fields; fail if any are missing")
+	prompts := fs.Bool("prompts", false, "emit interactive prompt records for missing fields instead of running the inline wizard")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -211,18 +221,34 @@ func runSkillOptTrainInitCreate(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if missing := missingSkillOptTrainInitInputs(values); len(missing) > 0 {
-		if !*yes && skillOptTrainInitInteractive() {
-			prompts, err := createSkillOptTrainInitPrompts(*home, promptScope, values, missing)
+		switch {
+		case *yes:
+			fmt.Fprintf(stderr, "skillopt train init missing required fields: %s\n", strings.Join(missing, ", "))
+			fmt.Fprintf(stderr, "example: %s\n", skillOptTrainInitExampleCommand(values.Name))
+			return 2
+		case *prompts:
+			created, err := createSkillOptTrainInitPrompts(*home, promptScope, values, missing)
 			if err != nil {
 				fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
 				return 1
 			}
-			printSkillOptTrainInitPromptInstructions(stdout, *home, rerunCommand, prompts)
+			printSkillOptTrainInitPromptInstructions(stdout, *home, rerunCommand, created)
 			return 0
+		case skillOptTrainInitInteractive():
+			if err := runSkillOptTrainInitWizard(*home, skillOptTrainInitStdin(), stdout, &values, missing); err != nil {
+				fmt.Fprintf(stderr, "skillopt train init: %v\n", err)
+				return 1
+			}
+			if stillMissing := missingSkillOptTrainInitInputs(values); len(stillMissing) > 0 {
+				fmt.Fprintf(stderr, "skillopt train init missing required fields: %s\n", strings.Join(stillMissing, ", "))
+				fmt.Fprintf(stderr, "example: %s\n", skillOptTrainInitExampleCommand(values.Name))
+				return 2
+			}
+		default:
+			fmt.Fprintf(stderr, "skillopt train init missing required fields: %s\n", strings.Join(missing, ", "))
+			fmt.Fprintf(stderr, "example: %s\n", skillOptTrainInitExampleCommand(values.Name))
+			return 2
 		}
-		fmt.Fprintf(stderr, "skillopt train init missing required fields: %s\n", strings.Join(missing, ", "))
-		fmt.Fprintf(stderr, "example: %s\n", skillOptTrainInitExampleCommand(values.Name))
-		return 2
 	}
 	if err := skillopt.ValidateTrainInitName(values.Name); err != nil {
 		clearSkillOptTrainInitPromptAnswerOnError(*home, promptScope, appliedPromptFields, "name")
@@ -520,6 +546,171 @@ func createSkillOptTrainInitPrompts(home string, scope string, values skillOptTr
 		return nil, err
 	}
 	return created, nil
+}
+
+// runSkillOptTrainInitWizard fills the missing train-init fields by asking the
+// human one question at a time on stdout and reading answers from stdin. It
+// uses numbered choices for template/preview/task-kind/mode (the template list
+// includes a "Custom file" option) and free text for the remaining fields.
+// Semantic validation of the answers happens in the caller after the wizard
+// returns.
+func runSkillOptTrainInitWizard(home string, stdin io.Reader, stdout io.Writer, values *skillOptTrainInitInputs, missing []string) error {
+	reader := bufio.NewReader(stdin)
+	missingSet := make(map[string]struct{}, len(missing))
+	for _, field := range missing {
+		missingSet[field] = struct{}{}
+	}
+	// task_kind and mode are defaulted before missing-field detection, so they
+	// never reach the wizard; the remaining fields are asked in a stable order.
+	for _, field := range []string{"name", "template", "review_repo", "artifact_kind", "preview", "request"} {
+		if _, ok := missingSet[field]; !ok {
+			continue
+		}
+		switch field {
+		case "template":
+			value, err := skillOptTrainInitWizardTemplate(home, reader, stdout)
+			if err != nil {
+				return err
+			}
+			values.Template = value
+		case "preview":
+			values.Preview = skillOptTrainInitWizardChoice(reader, stdout, "Choose a preview style:", []string{"none", "text-table", "vue"}, "")
+		case "name":
+			values.Name = skillOptTrainInitWizardText(reader, stdout, "Training name:")
+		case "review_repo":
+			values.ReviewRepo = skillOptTrainInitWizardText(reader, stdout, "Review repository (owner/repo):")
+		case "artifact_kind":
+			values.ArtifactKind = skillOptTrainInitWizardText(reader, stdout, "Artifact kind to optimize (text, vue, pdf, custom):")
+		case "request":
+			values.Request = skillOptTrainInitWizardText(reader, stdout, "Training request:")
+		}
+	}
+	return nil
+}
+
+// skillOptTrainInitWizardText prints question and returns the next non-empty
+// trimmed line. It re-asks on a blank line and returns "" at EOF.
+func skillOptTrainInitWizardText(reader *bufio.Reader, stdout io.Writer, question string) string {
+	for {
+		fmt.Fprintf(stdout, "%s ", question)
+		line, err := reader.ReadString('\n')
+		if value := strings.TrimSpace(line); value != "" {
+			return value
+		}
+		if err != nil {
+			return ""
+		}
+	}
+}
+
+// skillOptTrainInitWizardChoice prints numbered choices and returns the selected
+// value. It accepts a 1-based number or a literal choice value, falls back to
+// defaultChoice on a blank line, and re-asks on unrecognized input until EOF.
+func skillOptTrainInitWizardChoice(reader *bufio.Reader, stdout io.Writer, header string, choices []string, defaultChoice string) string {
+	for {
+		fmt.Fprintln(stdout, header)
+		for i, choice := range choices {
+			suffix := ""
+			if choice == defaultChoice {
+				suffix = " (default)"
+			}
+			fmt.Fprintf(stdout, "%d. %s%s\n", i+1, choice, suffix)
+		}
+		fmt.Fprint(stdout, "Enter number or value: ")
+		line, err := reader.ReadString('\n')
+		value := strings.TrimSpace(line)
+		if value == "" {
+			if defaultChoice != "" {
+				return defaultChoice
+			}
+			if err != nil {
+				return ""
+			}
+			continue
+		}
+		if n, convErr := strconv.Atoi(value); convErr == nil {
+			if n >= 1 && n <= len(choices) {
+				return choices[n-1]
+			}
+		} else {
+			for _, choice := range choices {
+				if strings.EqualFold(value, choice) {
+					return choice
+				}
+			}
+		}
+		if err != nil {
+			return value
+		}
+		fmt.Fprintf(stdout, "Please enter a number 1-%d or one of the listed values.\n", len(choices))
+	}
+}
+
+// skillOptTrainInitWizardTemplate lists the available templates as numbered
+// choices plus a trailing "Custom file" option and returns the chosen template
+// reference.
+func skillOptTrainInitWizardTemplate(home string, reader *bufio.Reader, stdout io.Writer) (string, error) {
+	var choices []skillopt.TrainInitTemplateChoice
+	if err := withStore(home, func(store *db.Store) error {
+		var err error
+		choices, err = skillopt.ListTrainInitTemplateChoices(context.Background(), store)
+		return err
+	}); err != nil {
+		return "", err
+	}
+	customIndex := len(choices) + 1
+	for {
+		fmt.Fprintln(stdout, "Choose a template:")
+		for i, choice := range choices {
+			fmt.Fprintf(stdout, "%d. %s\n", i+1, skillOptTrainInitTemplateChoiceLabel(choice))
+		}
+		fmt.Fprintf(stdout, "%d. Custom file\n", customIndex)
+		fmt.Fprint(stdout, "Enter number: ")
+		line, err := reader.ReadString('\n')
+		value := strings.TrimSpace(line)
+		if value == "" {
+			if err != nil {
+				return "", nil
+			}
+			continue
+		}
+		if n, convErr := strconv.Atoi(value); convErr == nil {
+			if n >= 1 && n <= len(choices) {
+				return choices[n-1].ID, nil
+			}
+			if n == customIndex {
+				return skillOptTrainInitWizardText(reader, stdout, "Enter a template id, version, or file path:"), nil
+			}
+		} else {
+			for _, choice := range choices {
+				if strings.EqualFold(value, choice.ID) {
+					return choice.ID, nil
+				}
+			}
+		}
+		if err != nil {
+			return value, nil
+		}
+		fmt.Fprintf(stdout, "Please enter a number 1-%d.\n", customIndex)
+	}
+}
+
+func skillOptTrainInitTemplateChoiceLabel(choice skillopt.TrainInitTemplateChoice) string {
+	label := choice.ID
+	if choice.CurrentVersion != "" {
+		label += " @" + choice.CurrentVersion
+	}
+	status := choice.Source
+	if !choice.Installed {
+		if status != "" {
+			status += ", "
+		}
+		status += "not installed"
+	}
+	if status != "" {
+		label += " (" + status + ")"
+	}
+	return label
 }
 
 func buildSkillOptTrainInitPrompt(scope string, field string, values skillOptTrainInitInputs) skillOptTrainInitPrompt {

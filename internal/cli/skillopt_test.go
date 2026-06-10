@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
@@ -1055,7 +1056,7 @@ func TestSkillOptTrainInitCompletesFromPromptAnswers(t *testing.T) {
 	defer restoreInteractive()
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"skillopt", "train", "init", "--home", home}, &stdout, &stderr)
+	code := Run([]string{"skillopt", "train", "init", "--prompts", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("interactive train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
@@ -1131,6 +1132,90 @@ func TestSkillOptTrainInitCompletesFromPromptAnswers(t *testing.T) {
 	}
 }
 
+func TestSkillOptTrainInitWizardCompletesFromStdin(t *testing.T) {
+	home := t.TempDir()
+	workspace := chdirTemp(t)
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	if err := store.UpsertAgentTemplate(context.Background(), cliSkillOptTemplate("planner", "Plan the work.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	restoreInteractive := replaceSkillOptTrainInitInteractive(true)
+	defer restoreInteractive()
+	restoreStdin := replaceSkillOptTrainInitStdin("wizard-flow\nplanner\njerryfane/gitmoot\ntext\ntext-table\nImprove planner summaries.\n")
+	defer restoreStdin()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "train", "init", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("wizard train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	for _, want := range []string{"Training name:", "Choose a template:", "planner", "Custom file", "Choose a preview style:"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("wizard stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+	cfg, err := skillopt.LoadTrainInitConfig(filepath.Join(workspace, ".gitmoot", "skillopt", "wizard-flow", "config.toml"))
+	if err != nil {
+		t.Fatalf("LoadTrainInitConfig returned error: %v", err)
+	}
+	if cfg.Name != "wizard-flow" || cfg.Template != "planner" || cfg.ReviewRepo != "jerryfane/gitmoot" || cfg.ArtifactKind != "text" || cfg.Preview != "text-table" || cfg.Mode != db.EvalRunModeExplore {
+		t.Fatalf("config from wizard = %+v", cfg)
+	}
+}
+
+func TestSkillOptTrainInitWizardIncompleteFailsCleanly(t *testing.T) {
+	home := t.TempDir()
+	_ = chdirTemp(t)
+	restoreInteractive := replaceSkillOptTrainInitInteractive(true)
+	defer restoreInteractive()
+	// Only the name is answered; stdin then hits EOF for the remaining fields.
+	restoreStdin := replaceSkillOptTrainInitStdin("partial-wizard\n")
+	defer restoreStdin()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "train", "init", "--home", home}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("incomplete wizard exit code = %d, want 2; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "missing required fields") {
+		t.Fatalf("incomplete wizard stderr = %q", stderr.String())
+	}
+}
+
+func TestSkillOptTrainInitWizardChoiceSelection(t *testing.T) {
+	choices := []string{"none", "text-table", "vue"}
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "by number", input: "2\n", want: "text-table"},
+		{name: "by literal value", input: "vue\n", want: "vue"},
+		{name: "blank uses default", input: "\n", want: "text-table"},
+		{name: "reasks then accepts", input: "9\n1\n", want: "none"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := bufio.NewReader(strings.NewReader(tc.input))
+			var stdout bytes.Buffer
+			got := skillOptTrainInitWizardChoice(reader, &stdout, "Choose a preview style:", choices, "text-table")
+			if got != tc.want {
+				t.Fatalf("choice = %q, want %q (stdout=%s)", got, tc.want, stdout.String())
+			}
+		})
+	}
+}
+
 func TestSkillOptTrainInitNamedPromptRerunIncludesName(t *testing.T) {
 	home := t.TempDir()
 	workspace := chdirTemp(t)
@@ -1139,7 +1224,7 @@ func TestSkillOptTrainInitNamedPromptRerunIncludesName(t *testing.T) {
 	defer restoreInteractive()
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"skillopt", "train", "init", "--home", home, "--name", "named-flow"}, &stdout, &stderr)
+	code := Run([]string{"skillopt", "train", "init", "--prompts", "--home", home, "--name", "named-flow"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("named interactive train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
@@ -1159,7 +1244,7 @@ func TestSkillOptTrainInitPartialDefaultPromptRerunStaysDefaultScoped(t *testing
 	defer restoreInteractive()
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"skillopt", "train", "init", "--home", home}, &stdout, &stderr)
+	code := Run([]string{"skillopt", "train", "init", "--prompts", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("interactive train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
@@ -1173,7 +1258,7 @@ func TestSkillOptTrainInitPartialDefaultPromptRerunStaysDefaultScoped(t *testing
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"skillopt", "train", "init", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"skillopt", "train", "init", "--prompts", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("partial prompt rerun exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
@@ -1199,6 +1284,7 @@ func TestSkillOptTrainInitPromptRerunPreservesSuppliedFlags(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
 		"skillopt", "train", "init",
+		"--prompts",
 		"--home", home,
 		"--template", "planner",
 		"--artifact-kind", "text",
@@ -1237,6 +1323,7 @@ func TestSkillOptTrainInitPromptRerunDropsEmptyRequestFile(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
 		"skillopt", "train", "init",
+		"--prompts",
 		"--home", home,
 		"--template", "planner",
 		"--request-file", requestFile,
@@ -1259,7 +1346,7 @@ func TestSkillOptTrainInitClearsInvalidPromptAnswers(t *testing.T) {
 	restoreInteractive := replaceSkillOptTrainInitInteractive(true)
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"skillopt", "train", "init", "--home", home}, &stdout, &stderr)
+	code := Run([]string{"skillopt", "train", "init", "--prompts", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("interactive train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
@@ -1316,7 +1403,7 @@ func TestSkillOptTrainInitKeepsPromptAnswersForExplicitFlagErrors(t *testing.T) 
 	restoreInteractive := replaceSkillOptTrainInitInteractive(true)
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"skillopt", "train", "init", "--home", home, "--preview", "bogus"}, &stdout, &stderr)
+	code := Run([]string{"skillopt", "train", "init", "--prompts", "--home", home, "--preview", "bogus"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("interactive train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}

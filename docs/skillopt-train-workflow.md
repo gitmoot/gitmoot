@@ -58,19 +58,26 @@ List machine-readable template choices for agents before initializing:
 gitmoot skillopt train init templates --json
 ```
 
-If required fields are missing in an interactive terminal, Gitmoot stores
-structured prompt requests that agents can inspect and answer:
+If required fields are missing in an interactive terminal, `train init` runs a
+line-oriented wizard that asks for them one at a time (numbered choices for the
+template, with a "Custom file" option, and for the preview style).
+
+For agents that prefer answering asynchronously, pass `--prompts` to store
+structured prompt requests instead of running the wizard, then inspect and
+answer them and rerun:
 
 ```sh
+gitmoot skillopt train init --prompts
 gitmoot interactive list --state pending --json
 gitmoot interactive show <prompt-id> --json
 gitmoot interactive answer <prompt-id> <value> --source agent
 gitmoot skillopt train init
 ```
 
-If required fields are missing in non-interactive mode, `train init` exits before
-creating a scaffold or train session and prints the missing fields plus a fully
-flagged example command.
+If required fields are missing in non-interactive mode (and `--prompts` is not
+set), `train init` exits before creating a scaffold or train session and prints
+the missing fields plus a fully flagged example command. Pass `--yes` to force
+that fail-fast behavior even on an interactive terminal.
 
 Start from the scaffold, or pass the request, target repo, pinned template, and
 item plan directly:

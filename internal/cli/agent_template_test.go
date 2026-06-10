@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -773,6 +774,16 @@ func replaceSkillOptTrainInitInteractive(interactive bool) func() {
 	return func() {
 		active = false
 		skillOptTrainInitInteractive = previous
+	}
+}
+
+func replaceSkillOptTrainInitStdin(input string) func() {
+	previous := skillOptTrainInitStdin
+	skillOptTrainInitStdin = func() io.Reader {
+		return strings.NewReader(input)
+	}
+	return func() {
+		skillOptTrainInitStdin = previous
 	}
 }
 
