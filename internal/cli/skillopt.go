@@ -116,6 +116,8 @@ func runSkillOptTrain(args []string, stdout, stderr io.Writer) int {
 		return runSkillOptTrainStart(args[1:], stdout, stderr)
 	case "status":
 		return runSkillOptTrainStatus(args[1:], stdout, stderr)
+	case "run":
+		return runSkillOptTrainRun(args[1:], stdout, stderr)
 	case "continue":
 		return runSkillOptTrainContinue(args[1:], stdout, stderr)
 	case "recover":
