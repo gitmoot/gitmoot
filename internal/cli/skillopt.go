@@ -1525,6 +1525,12 @@ func skillOptTrainOptimizerDefaultsFromInitConfig(config skillopt.TrainInitConfi
 		request.TargetBackend = skillOptTrainTargetBackendFromInitConfig(targetBackend, internalTargetAdapter)
 		request.EvaluatorBackend = evaluatorBackend
 	}
+	if value := strings.TrimSpace(config.Optimizer.OptimizerModel); value != "" {
+		request.OptimizerModel = value
+	}
+	if value := strings.TrimSpace(config.Optimizer.TargetModel); value != "" {
+		request.TargetModel = value
+	}
 	return request
 }
 
@@ -7845,6 +7851,12 @@ func skillOptTrainOptimizerDefaultsMetadata(request skillOptTrainOptimizerReques
 	if value := strings.TrimSpace(request.TargetBackend); value != "" {
 		metadata["target_backend"] = value
 	}
+	if value := strings.TrimSpace(request.OptimizerModel); value != "" {
+		metadata["optimizer_model"] = value
+	}
+	if value := strings.TrimSpace(request.TargetModel); value != "" {
+		metadata["target_model"] = value
+	}
 	if value := strings.TrimSpace(request.EvaluatorID); value != "" {
 		metadata["evaluator_id"] = value
 	}
@@ -7889,6 +7901,10 @@ func applySkillOptTrainOptimizerDefaultsFromMetadata(metadataJSON string, reques
 	if len(metadata) == 0 {
 		return
 	}
+	// Captured before backend inheritance below: stored model names are
+	// backend-specific, so they are only inherited when the backends are too.
+	backendOverridden := request.Backend != "" || request.OptimizerBackend != "" ||
+		request.TargetBackend != "" || request.EvaluatorBackend != ""
 	if request.Backend == "" && request.OptimizerBackend == "" && request.TargetBackend == "" && request.EvaluatorBackend == "" {
 		request.Backend = metadataString(metadata, "backend")
 	}
@@ -7901,6 +7917,14 @@ func applySkillOptTrainOptimizerDefaultsFromMetadata(metadataJSON string, reques
 		}
 		if request.EvaluatorBackend == "" {
 			request.EvaluatorBackend = metadataString(metadata, "evaluator_backend")
+		}
+	}
+	if !backendOverridden && request.Model == "" {
+		if request.OptimizerModel == "" {
+			request.OptimizerModel = metadataString(metadata, "optimizer_model")
+		}
+		if request.TargetModel == "" {
+			request.TargetModel = metadataString(metadata, "target_model")
 		}
 	}
 	if request.EvaluatorID == "" {

@@ -222,7 +222,11 @@ func (m TrainInitModel) updateFieldKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if msg.String() == "enter" {
 			value, status := m.validate(field.Name, m.input.Value())
 			if status != "ok" {
-				m.inlineErr = "value required"
+				if strings.TrimSpace(m.input.Value()) != "" {
+					m.inlineErr = "invalid value — check the expected format"
+				} else {
+					m.inlineErr = "value required"
+				}
 				return m, nil
 			}
 			if field.CheckRepo != nil {

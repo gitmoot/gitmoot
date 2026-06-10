@@ -242,6 +242,110 @@ func TestAgentRevertUnavailableWithoutSuperseded(t *testing.T) {
 	}
 }
 
+func TestAgentOptimizeFlowOpensPhaseView(t *testing.T) {
+	var startedTemplate string
+	var startedValues map[string]string
+	pushedTrain := ""
+	form := NewAgentOptimizeForm(newFakeStore(), "planner-tpl", []Field{{Name: "name", Kind: FieldText}}, nil, nil)
+	deps := Deps{
+		OpenAgentOptimize: func(agent Agent) (tea.Model, error) { return form, nil },
+		StartOptimize: func(templateID string, values map[string]string) (string, error) {
+			startedTemplate = templateID
+			startedValues = values
+			return "train-planner-1", nil
+		},
+		OpenTrain: func(sessionID string) tea.Model {
+			pushedTrain = sessionID
+			return New(Deps{})
+		},
+	}
+	m := agentsModel(t, deps, agentsSnapshot())
+	next, cmd := m.Update(key("o"))
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("o should build the optimize form")
+	}
+	if _, ok := cmd().(PushModelMsg); !ok {
+		t.Fatalf("o should push the form, got %T", cmd())
+	}
+	// The popped form delivers its answers; the dashboard starts the session.
+	next, cmd = m.Update(agentOptimizeFormResultMsg{templateID: "planner-tpl", result: Result{Values: map[string]string{
+		"name": "opt-planner", "backend": "claude", "model": "claude-opus-4-8",
+	}}})
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("a completed optimize form should start the session")
+	}
+	if !strings.Contains(m.View(), "starting optimization…") {
+		t.Fatalf("the in-flight state should render:\n%s", m.View())
+	}
+	started := cmd()
+	if startedTemplate != "planner-tpl" || startedValues["backend"] != "claude" {
+		t.Fatalf("StartOptimize called with (%q, %v)", startedTemplate, startedValues)
+	}
+	// Success pushes the new session's phase view.
+	next, cmd = m.Update(started)
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("a started session should open its phase view")
+	}
+	var sawPush bool
+	var walk func(tea.Cmd)
+	walk = func(c tea.Cmd) {
+		if c == nil {
+			return
+		}
+		msg := c()
+		if batch, ok := msg.(tea.BatchMsg); ok {
+			for _, sub := range batch {
+				walk(sub)
+			}
+			return
+		}
+		if _, ok := msg.(PushModelMsg); ok {
+			sawPush = true
+		}
+	}
+	walk(cmd)
+	if !sawPush || pushedTrain != "train-planner-1" {
+		t.Fatalf("expected the phase view push for train-planner-1; push=%v opened=%q", sawPush, pushedTrain)
+	}
+	if m.optimizeBusy {
+		t.Fatal("the in-flight flag should clear once the session started")
+	}
+}
+
+func TestAgentOptimizeErrorRendersInline(t *testing.T) {
+	deps := Deps{
+		StartOptimize: func(templateID string, values map[string]string) (string, error) {
+			return "", errors.New("train start failed: no items")
+		},
+	}
+	m := agentsModel(t, deps, agentsSnapshot())
+	next, cmd := m.Update(agentOptimizeFormResultMsg{templateID: "planner-tpl", result: Result{Values: map[string]string{"name": "x"}}})
+	m = next.(Model)
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+	if !strings.Contains(m.View(), "train start failed: no items") {
+		t.Fatalf("the start error should render on the Agents page:\n%s", m.View())
+	}
+}
+
+func TestAgentOptimizeAbortedFormDoesNothing(t *testing.T) {
+	deps := Deps{
+		StartOptimize: func(templateID string, values map[string]string) (string, error) {
+			t.Fatal("aborted form must not start a session")
+			return "", nil
+		},
+	}
+	m := agentsModel(t, deps, agentsSnapshot())
+	next, cmd := m.Update(agentOptimizeFormResultMsg{templateID: "planner-tpl", result: Result{Aborted: true}})
+	_ = next
+	if cmd != nil {
+		t.Fatal("an aborted optimize form must produce no commands")
+	}
+}
+
 func TestAgentCreateFormCompletionPopsWithResult(t *testing.T) {
 	form := NewAgentCreateForm(newFakeStore(), []Choice{{Value: "planner-tpl", Label: "planner"}})
 	var model tea.Model = form

@@ -1,9 +1,13 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -195,4 +199,231 @@ func cleanupSkillOptTrainInitTUIPrompts(store *db.Store, scope string, fields []
 			_ = store.DeleteInteractivePrompt(ctx, id)
 		}
 	}
+}
+
+// agentOptimizePromptScope namespaces the prompt records the dashboard's
+// optimize form publishes (one form per dashboard process).
+const agentOptimizePromptScope = "dashboard-optimize"
+
+// agentOptimizePromptIDs returns the prompt record ids the optimize form
+// publishes (derived from the field definitions, so a new field cannot be
+// missed), letting the dashboard sweep them on exit.
+func agentOptimizePromptIDs() []string {
+	fields := buildAgentOptimizeFields()
+	ids := make([]string, 0, len(fields))
+	for _, field := range fields {
+		ids = append(ids, field.Prompt.ID)
+	}
+	return ids
+}
+
+// buildAgentOptimizeFields builds the optimize-form fields: the standard
+// train-init questions (minus the pre-filled template), plus the workspace
+// repo, a codex/claude backend pick, and an optional model override.
+func buildAgentOptimizeFields() []tui.Field {
+	standard := func(field string) tui.Field {
+		descriptor := buildSkillOptTrainInitPrompt(agentOptimizePromptScope, field, skillOptTrainInitInputs{})
+		entry := tui.Field{
+			Name:    field,
+			Label:   skillOptTrainInitWizardLabel(field),
+			Prompt:  descriptor.Prompt,
+			Default: descriptor.Prompt.Default,
+		}
+		if len(descriptor.Prompt.Choices) > 0 {
+			entry.Kind = tui.FieldChoice
+			for _, choice := range descriptor.Prompt.Choices {
+				entry.Choices = append(entry.Choices, tui.Choice{Value: choice, Label: choice})
+			}
+		} else {
+			entry.Kind = tui.FieldText
+		}
+		return entry
+	}
+	custom := func(field, label, question string, choices []string, def string, required bool) tui.Field {
+		format := "text"
+		if len(choices) > 0 {
+			format = "choice"
+		}
+		entry := tui.Field{
+			Name:    field,
+			Label:   label,
+			Kind:    tui.FieldText,
+			Default: def,
+			Prompt: db.InteractivePrompt{
+				ID:            skillOptTrainInitPromptID(agentOptimizePromptScope, field),
+				Question:      question,
+				Choices:       choices,
+				Default:       def,
+				Required:      required,
+				AnswerFormat:  format,
+				SourceCommand: "gitmoot dashboard agent optimize",
+				State:         db.InteractivePromptStatePending,
+			},
+		}
+		if len(choices) > 0 {
+			entry.Kind = tui.FieldChoice
+			for _, choice := range choices {
+				entry.Choices = append(entry.Choices, tui.Choice{Value: choice, Label: choice})
+			}
+		}
+		return entry
+	}
+	return []tui.Field{
+		standard("name"),
+		standard("review_repo"),
+		custom("workspace_repo", "Workspace repo", "Workspace repository in owner/repo form? (options are generated there)", nil, "", true),
+		standard("artifact_kind"),
+		standard("preview"),
+		standard("request"),
+		custom("backend", "Optimizer backend", "Backend for the optimizer and target runs?", []string{"codex", "claude"}, "codex", true),
+		custom("model", "Model (optional)", "Model override for the optimizer and target runs? (empty = backend default)", nil, "", false),
+	}
+}
+
+// agentOptimizeInterpret validates the optimize-form free-text answers with
+// the same core the train-init wizard uses; the model is the one optional
+// field, and the workspace repo borrows the review-repo format check.
+func agentOptimizeInterpret(field, text string) (string, string) {
+	switch field {
+	case "model":
+		return strings.TrimSpace(text), "ok"
+	case "name":
+		value := strings.TrimSpace(text)
+		if err := skillopt.ValidateTrainInitName(value); err != nil {
+			return "", "reask"
+		}
+		return value, "ok"
+	case "review_repo", "workspace_repo":
+		// Validate the owner/repo shape in the form, so a typo re-asks here
+		// instead of failing the whole pipeline after the form closed.
+		value := strings.TrimSpace(text)
+		if _, err := daemon.ParseRepository(value); err != nil {
+			return "", "reask"
+		}
+		return value, "ok"
+	default:
+		return skillOptTrainInitInterpretCore(field, text, db.InteractivePrompt{}, nil)
+	}
+}
+
+// agentOptimizeSummaryRows renders the optimize confirm screen.
+func agentOptimizeSummaryRows(template string) func(map[string]string) [][]string {
+	return func(answers map[string]string) [][]string {
+		model := strings.TrimSpace(answers["model"])
+		if model == "" {
+			model = "backend default"
+		}
+		return [][]string{
+			{"template", template},
+			{"name", answers["name"]},
+			{"review repo", answers["review_repo"]},
+			{"workspace repo", answers["workspace_repo"]},
+			{"artifact kind", answers["artifact_kind"]},
+			{"preview", answers["preview"]},
+			{"backend", answers["backend"]},
+			{"model", model},
+			{"request", firstLine(answers["request"])},
+		}
+	}
+}
+
+// startAgentOptimizeSession runs the full optimize pipeline headlessly: write
+// the train-init scaffold (with the backend/model choices in its [optimizer]
+// section, which train start persists into the session's optimizer_defaults
+// metadata), then run `skillopt train start --config --yes` with a
+// pre-generated session id so the caller can open its phase view.
+func startAgentOptimizeSession(home, templateID string, answers map[string]string) (string, error) {
+	name := strings.TrimSpace(answers["name"])
+	if err := skillopt.ValidateTrainInitName(name); err != nil {
+		return "", err
+	}
+	reviewRepo, err := daemon.ParseRepository(strings.TrimSpace(answers["review_repo"]))
+	if err != nil {
+		return "", fmt.Errorf("review repo: %w", err)
+	}
+	workspaceRepo, err := daemon.ParseRepository(strings.TrimSpace(answers["workspace_repo"]))
+	if err != nil {
+		return "", fmt.Errorf("workspace repo: %w", err)
+	}
+	preview, err := normalizeSkillOptTrainInitPreview(strings.TrimSpace(answers["preview"]))
+	if err != nil {
+		return "", err
+	}
+	var template db.AgentTemplate
+	if err := withStore(home, func(store *db.Store) error {
+		var err error
+		template, err = skillopt.ResolveTrainInitTemplateChoice(context.Background(), store, newAgentTemplateFetcher(), templateID)
+		return err
+	}); err != nil {
+		return "", err
+	}
+	values := skillOptTrainInitInputs{
+		Name:         name,
+		Template:     template.ID,
+		ReviewRepo:   reviewRepo.FullName(),
+		TaskKind:     "custom",
+		ArtifactKind: strings.TrimSpace(answers["artifact_kind"]),
+		Preview:      preview,
+		Mode:         db.EvalRunModeExplore,
+		Request:      strings.TrimSpace(answers["request"]),
+	}
+	// DefaultTrainInitConfig already carries the explore mode and its
+	// exploration level; only the per-run fields are overlaid here.
+	config := skillopt.DefaultTrainInitConfig()
+	config.Name = values.Name
+	config.Template = template.ID
+	config.TemplateVersion = template.VersionID
+	config.ReviewRepo = values.ReviewRepo
+	config.TaskKind = values.TaskKind
+	config.ArtifactKind = values.ArtifactKind
+	config.Preview = values.Preview
+	config.Options = skillOptTrainInitDefaultOptions(config.Mode)
+	if backend := strings.TrimSpace(answers["backend"]); backend != "" {
+		config.Optimizer.OptimizerBackend = backend
+		config.Optimizer.TargetBackend = backend
+		config.Optimizer.EvaluatorBackend = backend
+		if !strings.EqualFold(backend, "codex") {
+			// The codex_exec adapter default only applies to codex targets;
+			// leaving it in the scaffold would contradict the chosen backend.
+			config.Optimizer.InternalTargetAdapter = ""
+		}
+	}
+	if model := strings.TrimSpace(answers["model"]); model != "" {
+		config.Optimizer.OptimizerModel = model
+		config.Optimizer.TargetModel = model
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	scaffoldRoot := filepath.Join(cwd, ".gitmoot", skillopt.TrainInitScaffoldDirName, values.Name)
+	if _, err := os.Stat(scaffoldRoot); err == nil {
+		return "", fmt.Errorf("a train scaffold named %q already exists at %s; pick a different name", values.Name, scaffoldRoot)
+	}
+	paths, err := skillopt.WriteTrainInitScaffold(cwd, skillopt.TrainInitScaffold{
+		Config:          config,
+		TaskMarkdown:    values.Request,
+		ReviewItemsYAML: skillOptTrainInitStarterReviewItemsYAML(values),
+	})
+	if err != nil {
+		return "", err
+	}
+	sessionID := generatedSkillOptTrainSessionID(template.ID)
+	var stdout, stderr bytes.Buffer
+	args := []string{
+		"--home", home,
+		"--config", paths.ConfigPath,
+		"--session", sessionID,
+		"--workspace-repo", workspaceRepo.FullName(),
+		"--create-repos",
+		"--yes",
+	}
+	if code := runSkillOptTrainStart(args, &stdout, &stderr); code != 0 {
+		reason := strings.TrimSpace(stderr.String())
+		if reason == "" {
+			reason = strings.TrimSpace(stdout.String())
+		}
+		return "", fmt.Errorf("train start failed: %s", reason)
+	}
+	return sessionID, nil
 }

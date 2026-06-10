@@ -108,6 +108,8 @@ type Model struct {
 	versionCursor       int               // selected row in the revert pick list
 	revertVersion       TemplateVersion   // version being confirmed for revert
 	agentErr            string            // inline error on the Agents page (e.g. create failed)
+	optimizeBusy        bool              // a train session is being scaffolded/started
+	formPending         bool              // a form push is in flight; suppress re-dispatch
 }
 
 // New returns a Model ready for tea.NewProgram. It starts in the loading state;
@@ -231,8 +233,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if pages[m.selected].page == pageTrains {
 				// With a Root router, open the full train-run view; otherwise the
 				// inline detail (keeps the model usable standalone and old tests
-				// green).
-				if m.deps.OpenTrain != nil && len(m.snap.Trains) > 0 {
+				// green). Pushing is suppressed while an optimize start is in
+				// flight: its result message routes to the top of the stack, so a
+				// covering view would swallow it.
+				if m.deps.OpenTrain != nil && len(m.snap.Trains) > 0 && !m.optimizeBusy {
 					session := m.snap.Trains[m.trainCursor].ID
 					return m, Push(m.deps.OpenTrain(session))
 				}
@@ -282,7 +286,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "n":
 			// Form construction touches the database, so it runs as a command
 			// (a synchronous call here would freeze the UI on a busy store).
-			if pages[m.selected].page == pageAgents && m.deps.OpenAgentCreate != nil {
+			if pages[m.selected].page == pageAgents && m.deps.OpenAgentCreate != nil &&
+				!m.formPending && !m.optimizeBusy {
+				m.formPending = true
 				m.agentErr = ""
 				return m, openAgentFormCmd(m.deps)
 			}
@@ -291,6 +297,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.openAgentDelete(agent)
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
+			}
+		case "o":
+			if agent, ok := m.agentUnderCursor(); ok && agent.TemplateID != "" &&
+				m.deps.OpenAgentOptimize != nil && !m.formPending && !m.optimizeBusy {
+				m.formPending = true
+				m.activeAgent = agent
+				m.agentErr = ""
+				return m, openAgentOptimizeCmd(m.deps, agent)
 			}
 		case "?":
 			m.showHelp = !m.showHelp
@@ -422,11 +436,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.agentErr = ""
 			cmds = append(cmds, agentCreateCmd(m.deps, msg.result.Values))
 		}
+	case agentOptimizeFormResultMsg:
+		m.formPending = false
+		if !msg.result.Aborted {
+			m.agentErr = ""
+			m.optimizeBusy = true
+			cmds = append(cmds, startOptimizeCmd(m.deps, msg.templateID, msg.result.Values))
+		}
+	case optimizeStartedMsg:
+		m.optimizeBusy = false
+		if msg.err != nil {
+			m.agentErr = msg.err.Error()
+		} else {
+			m.agentErr = ""
+			if cmd := m.queueLoad(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+			// Straight into the new session's live phase view.
+			if m.deps.OpenTrain != nil && msg.sessionID != "" {
+				cmds = append(cmds, Push(m.deps.OpenTrain(msg.sessionID)))
+			}
+		}
 	case agentActionMsg:
 		switch msg.verb {
 		case "create", "form":
 			// No overlay is open by the time a create (or a failed form
 			// construction) settles; surface errors inline on the Agents page.
+			if msg.verb == "form" {
+				m.formPending = false
+			}
 			if msg.err != nil {
 				m.agentErr = msg.err.Error()
 			} else {
@@ -525,6 +563,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Resumed after a pop: the old tick chain died unhandled under the child
 		// view, so refresh now and start a NEW chain. Bumping the generation also
 		// kills a stale pre-push tick that would otherwise re-arm a second chain.
+		// A pop also means any pushed form is gone.
+		m.formPending = false
 		m.tickGen++
 		if cmd := m.queueLoad(); cmd != nil {
 			cmds = append(cmds, cmd)

@@ -68,6 +68,8 @@ type TrainInitOptimizerConfig struct {
 	OptimizerBackend          string
 	TargetBackend             string
 	EvaluatorBackend          string
+	OptimizerModel            string
+	TargetModel               string
 	InternalTargetAdapter     string
 }
 
@@ -194,6 +196,8 @@ func RenderTrainInitConfig(config TrainInitConfig) ([]byte, error) {
 	writeTrainInitString(&b, "optimizer_backend", config.Optimizer.OptimizerBackend)
 	writeTrainInitString(&b, "target_backend", config.Optimizer.TargetBackend)
 	writeTrainInitString(&b, "evaluator_backend", config.Optimizer.EvaluatorBackend)
+	writeTrainInitString(&b, "optimizer_model", config.Optimizer.OptimizerModel)
+	writeTrainInitString(&b, "target_model", config.Optimizer.TargetModel)
 	writeTrainInitString(&b, "internal_target_adapter", config.Optimizer.InternalTargetAdapter)
 	b.WriteString("\n[final_evaluator]\n")
 	writeTrainInitBool(&b, "enabled", config.FinalEvaluatorEnabled)
@@ -300,6 +304,12 @@ func ParseTrainInitConfig(content []byte) (TrainInitConfig, error) {
 	}
 	if value := getString("optimizer.evaluator_backend", false); value != "" {
 		config.Optimizer.EvaluatorBackend = value
+	}
+	if value := getString("optimizer.optimizer_model", false); value != "" {
+		config.Optimizer.OptimizerModel = value
+	}
+	if value := getString("optimizer.target_model", false); value != "" {
+		config.Optimizer.TargetModel = value
 	}
 	if value := getString("optimizer.internal_target_adapter", false); value != "" {
 		config.Optimizer.InternalTargetAdapter = value

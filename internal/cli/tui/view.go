@@ -139,6 +139,8 @@ func (m Model) helpContent() string {
 		b.WriteString("↑/↓  select an agent\n")
 		b.WriteString("enter open the agent (template, recent jobs, versions)\n")
 		b.WriteString("n    register a new agent (name, runtime, template)\n")
+		b.WriteString("o    optimize: start a training session for the agent's template\n")
+		b.WriteString("     (asks repos, request, codex/claude backend, optional model)\n")
 		b.WriteString("D    delete the selected agent (refused while jobs reference it)\n")
 		b.WriteString("v    in the detail: revert the template to a previous version\n")
 	case pageJobs:
@@ -192,7 +194,7 @@ func (m Model) footerHelp() string {
 	case pageTrains:
 		return "tab/←→ page  ↑/↓ select  enter open  s stop  d delete  ? help  q quit"
 	case pageAgents:
-		return "tab/←→ page  ↑/↓ select  enter detail  n new  D delete  ? help  q quit"
+		return "tab/←→ page  ↑/↓ select  enter detail  n new  o optimize  D delete  ? help  q quit"
 	case pageJobs:
 		return "tab/←→ page  ↑/↓ select  enter detail  R retry  c cancel  ? help  q quit"
 	}

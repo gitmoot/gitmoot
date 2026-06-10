@@ -72,7 +72,8 @@ func runDashboardTUI(home string, interval time.Duration, stdout, stderr io.Writ
 	// pending; sweep them so they do not haunt the attention list (mirrors
 	// the standalone wizard's deferred cleanup).
 	_ = withStore(home, func(store *db.Store) error {
-		for _, id := range tui.AgentCreatePromptIDs() {
+		ids := append(tui.AgentCreatePromptIDs(), agentOptimizePromptIDs()...)
+		for _, id := range ids {
 			_ = store.DeleteInteractivePrompt(context.Background(), id)
 		}
 		return nil
@@ -212,7 +213,7 @@ func dashboardTUIDeps(home string, interval time.Duration) tui.Deps {
 				store.Close()
 				return nil, fmt.Errorf("no agent templates installed; add one with `gitmoot agent template add`")
 			}
-			form := tui.NewAgentCreateForm(store, choices)
+			form := tui.NewAgentCreateForm(formPromptStore{home: home, store: store}, choices)
 			done := form.Done
 			form.Done = func(res tui.Result) tea.Cmd {
 				store.Close()
@@ -236,6 +237,30 @@ func dashboardTUIDeps(home string, interval time.Duration) tui.Deps {
 				return err
 			})
 		},
+		OpenAgentOptimize: func(agent tui.Agent) (tea.Model, error) {
+			// Same lifetime pattern as the create form: one store for the
+			// form's 200ms poll, closed from the Done hook.
+			paths, err := initializedPaths(home)
+			if err != nil {
+				return nil, err
+			}
+			store, err := db.Open(paths.Database)
+			if err != nil {
+				return nil, err
+			}
+			form := tui.NewAgentOptimizeForm(formPromptStore{home: home, store: store},
+				agent.TemplateID, buildAgentOptimizeFields(),
+				agentOptimizeSummaryRows(agent.TemplateID), agentOptimizeInterpret)
+			done := form.Done
+			form.Done = func(res tui.Result) tea.Cmd {
+				store.Close()
+				return done(res)
+			}
+			return form, nil
+		},
+		StartOptimize: func(templateID string, values map[string]string) (string, error) {
+			return startAgentOptimizeSession(home, templateID, values)
+		},
 		StartDaemon: func() error {
 			// Restart rather than start: it tolerates a stopped daemon and
 			// restores the previously persisted flags (workers, poll, watch)
@@ -247,6 +272,31 @@ func dashboardTUIDeps(home string, interval time.Duration) tui.Deps {
 			return nil
 		},
 	}
+}
+
+// formPromptStore is the PromptStore for pushed forms: the hot 200ms answer
+// poll reads through one held store, while the rare upserts/deletes go through
+// withStore so they still work after the held store is closed from the form's
+// Done hook (abort batches its prompt delete with the pop).
+type formPromptStore struct {
+	home  string
+	store *db.Store
+}
+
+func (s formPromptStore) UpsertInteractivePrompt(ctx context.Context, prompt db.InteractivePrompt) error {
+	return withStore(s.home, func(store *db.Store) error {
+		return store.UpsertInteractivePrompt(ctx, prompt)
+	})
+}
+
+func (s formPromptStore) GetInteractivePrompt(ctx context.Context, id string) (db.InteractivePrompt, error) {
+	return s.store.GetInteractivePrompt(ctx, id)
+}
+
+func (s formPromptStore) DeleteInteractivePrompt(ctx context.Context, id string) error {
+	return withStore(s.home, func(store *db.Store) error {
+		return store.DeleteInteractivePrompt(ctx, id)
+	})
 }
 
 // toTUISnapshot copies the cli dashboardSnapshot into the tui-facing Snapshot.

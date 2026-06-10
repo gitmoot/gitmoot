@@ -154,6 +154,13 @@ type Deps struct {
 	CreateAgent      func(name, runtime, template string) error
 	DeleteAgent      func(name string) error
 	RevertTemplate   func(templateID, versionID string) error
+
+	// Optimize an agent: OpenAgentOptimize builds the pre-filled training form
+	// for the agent's template; StartOptimize scaffolds and starts the train
+	// session from the collected answers and returns its id, which the
+	// dashboard opens via OpenTrain.
+	OpenAgentOptimize func(agent Agent) (tea.Model, error)
+	StartOptimize     func(templateID string, values map[string]string) (string, error)
 }
 
 // TemplateVersion is one row of a template's version history.
@@ -254,4 +261,18 @@ type agentActionMsg struct {
 // create-agent form pops (its Done callback is wired in NewAgentCreateForm).
 type agentFormResultMsg struct {
 	result Result
+}
+
+// agentOptimizeFormResultMsg is delivered when the pushed optimize form pops.
+// It carries the template the form was opened for, so a cursor move between
+// opening and completing the form cannot retarget the session.
+type agentOptimizeFormResultMsg struct {
+	templateID string
+	result     Result
+}
+
+// optimizeStartedMsg carries the outcome of Deps.StartOptimize.
+type optimizeStartedMsg struct {
+	sessionID string
+	err       error
 }
