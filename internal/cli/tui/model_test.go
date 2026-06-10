@@ -148,8 +148,29 @@ func TestResizeUpdatesViewport(t *testing.T) {
 
 func TestTickRearmsAndRefreshes(t *testing.T) {
 	m := loadedModel(t)
-	_, cmd := m.Update(tickMsg{})
+	_, cmd := m.Update(tickMsg{gen: m.tickGen})
 	if cmd == nil {
 		t.Fatal("tick should produce commands (re-arm + load)")
+	}
+}
+
+func TestStaleTickGenerationDropped(t *testing.T) {
+	m := loadedModel(t)
+	// A pop-nudge starts a new tick generation…
+	next, cmd := m.Update(refreshNudgeMsg{})
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("nudge should refresh and re-arm")
+	}
+	// …so a tick from the pre-push chain must be dropped without re-arming
+	// (otherwise fast push/pop cycles would accumulate parallel tick chains).
+	_, cmd = m.Update(tickMsg{gen: m.tickGen - 1})
+	if cmd != nil {
+		t.Fatal("a stale-generation tick must not re-arm")
+	}
+	// The current generation still works.
+	_, cmd = m.Update(tickMsg{gen: m.tickGen})
+	if cmd == nil {
+		t.Fatal("the current-generation tick should re-arm")
 	}
 }

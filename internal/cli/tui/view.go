@@ -59,6 +59,9 @@ func renderSidebar(selected, width, height int) string {
 }
 
 func (m Model) content() string {
+	if m.showHelp {
+		return m.helpContent()
+	}
 	var b strings.Builder
 	b.WriteString(titleStyle.Render(pages[m.selected].label))
 	if !m.loadedAt.IsZero() {
@@ -86,6 +89,30 @@ func (m Model) content() string {
 	}
 	b.WriteString("\n\n")
 	b.WriteString(mutedStyle.Render(m.footerHelp()))
+	return b.String()
+}
+
+// helpContent is the '?' overlay: every key for the current page plus globals.
+func (m Model) helpContent() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("Help — " + pages[m.selected].label))
+	b.WriteString("\n\n")
+	switch pages[m.selected].page {
+	case pageAttention:
+		b.WriteString("↑/↓  select a pending prompt\n")
+		b.WriteString("a    answer the selected prompt (choices or text)\n")
+		b.WriteString("d    dismiss (delete) the selected prompt\n")
+	case pageTrains:
+		b.WriteString("↑/↓  select a train session\n")
+		b.WriteString("enter open the session (live phase view; esc returns)\n")
+	default:
+		b.WriteString("j/k or wheel  scroll\n")
+	}
+	b.WriteString("\nGlobal:\n")
+	b.WriteString("tab/shift+tab or ←/→  switch page\n")
+	b.WriteString("r  refresh now\n")
+	b.WriteString("?  close this help\n")
+	b.WriteString("q  quit (background work keeps running)\n")
 	return b.String()
 }
 

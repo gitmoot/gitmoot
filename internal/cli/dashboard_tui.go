@@ -49,11 +49,18 @@ func stdinIsCharDevice() bool {
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
-// runDashboardTUI launches the bubbletea dashboard. It returns a process exit
-// code like the other dashboard paths.
+// runDashboardTUI launches the bubbletea dashboard inside the Root router so
+// pages can push full-screen child views (e.g. a train session's phase view).
+// It returns a process exit code like the other dashboard paths.
 func runDashboardTUI(home string, interval time.Duration, stdout, stderr io.Writer) int {
+	deps := dashboardTUIDeps(home, interval)
+	deps.OpenTrain = func(sessionID string) tea.Model {
+		trainDeps := skillOptTrainRunDeps(home, func() string { return sessionID })
+		trainDeps.Embedded = true
+		return tui.NewTrainRun(trainDeps)
+	}
 	program := tea.NewProgram(
-		tui.New(dashboardTUIDeps(home, interval)),
+		tui.NewRoot(tui.New(deps)),
 		tea.WithAltScreen(),
 		tea.WithOutput(stdout),
 	)

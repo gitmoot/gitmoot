@@ -70,6 +70,10 @@ type TrainRunDeps struct {
 	// returning any new lines and the next offset. Used to show live progress
 	// during the long generate/optimizer phases.
 	TailLog func(offset int64) (lines []string, next int64, err error)
+
+	// Embedded marks the model as a child of the Root router: q/esc pop back to
+	// the dashboard instead of quitting the program.
+	Embedded bool
 }
 
 type trainRunMode int
@@ -283,6 +287,9 @@ func (m TrainRunModel) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.confirming {
 		switch msg.String() {
 		case "esc", "q":
+			if m.deps.Embedded {
+				return m, Pop()
+			}
 			return m, tea.Quit
 		case "enter":
 			if m.creating {
@@ -331,6 +338,9 @@ func (m TrainRunModel) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch msg.String() {
 	case "q", "esc":
+		if m.deps.Embedded {
+			return m, Pop()
+		}
 		return m, tea.Quit
 	case "r":
 		return m, m.queueLoad()

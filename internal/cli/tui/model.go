@@ -72,6 +72,8 @@ type Model struct {
 	input        textinput.Model      // free-text answer in modeAnswerText
 	actionErr    string               // inline error from the last Answer/Dismiss attempt
 	actionBusy   bool                 // an action is in flight; suppress re-submit
+	showHelp     bool                 // '?' help overlay
+	tickGen      int                  // current tick chain; stale generations are dropped
 }
 
 // New returns a Model ready for tea.NewProgram. It starts in the loading state;
@@ -98,7 +100,7 @@ func (m Model) interval() time.Duration {
 
 // Init satisfies tea.Model.
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(loadSnapshot(m.deps), tick(m.interval()))
+	return tea.Batch(loadSnapshot(m.deps), tick(m.interval(), m.tickGen))
 }
 
 // Update satisfies tea.Model.
@@ -184,10 +186,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "enter":
 			if pages[m.selected].page == pageTrains {
+				// With a Root router, open the full train-run view; otherwise the
+				// inline detail (keeps the model usable standalone and old tests
+				// green).
+				if m.deps.OpenTrain != nil && len(m.snap.Trains) > 0 {
+					session := m.snap.Trains[m.trainCursor].ID
+					return m, Push(m.deps.OpenTrain(session))
+				}
 				m.openTrainDetail()
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
 			}
+		case "?":
+			m.showHelp = !m.showHelp
+			m.viewport.SetContent(m.content())
+			return m, tea.Batch(cmds...)
 		}
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
@@ -231,11 +244,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clampPromptCursor()
 			m.clampTrainCursor()
 		}
-	case tickMsg:
+	case refreshNudgeMsg:
+		// Resumed after a pop: the old tick chain died unhandled under the child
+		// view, so refresh now and start a NEW chain. Bumping the generation also
+		// kills a stale pre-push tick that would otherwise re-arm a second chain.
+		m.tickGen++
 		if cmd := m.queueLoad(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
-		cmds = append(cmds, tick(m.interval()))
+		cmds = append(cmds, tick(m.interval(), m.tickGen))
+	case tickMsg:
+		if msg.gen != m.tickGen {
+			break // a tick from a dead chain; do not re-arm
+		}
+		if cmd := m.queueLoad(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		cmds = append(cmds, tick(m.interval(), m.tickGen))
 	}
 	m.viewport.SetContent(m.content())
 	return m, tea.Batch(cmds...)
@@ -298,8 +323,8 @@ func loadSnapshot(deps Deps) tea.Cmd {
 	}
 }
 
-func tick(d time.Duration) tea.Cmd {
-	return tea.Tick(d, func(time.Time) tea.Msg { return tickMsg{} })
+func tick(d time.Duration, gen int) tea.Cmd {
+	return tea.Tick(d, func(time.Time) tea.Msg { return tickMsg{gen: gen} })
 }
 
 func max(a, b int) int {

@@ -9,6 +9,7 @@ package tui
 import (
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/jerryfane/gitmoot/internal/db"
 )
 
@@ -94,14 +95,17 @@ type ResourceLock struct {
 	Stale bool
 }
 
-// Deps are the data source and action callbacks the cli package injects. Answer
-// and Dismiss are unused by the read-only pages but are part of the stable
-// surface the Attention page (a later task) calls.
+// Deps are the data source and action callbacks the cli package injects.
 type Deps struct {
 	Load     func() (Snapshot, error)
 	Answer   func(id, value string) error
 	Dismiss  func(id string) error
 	Interval time.Duration
+
+	// OpenTrain, when set, builds the embedded train-run model for a session;
+	// the Trains page pushes it onto the Root stack instead of the inline
+	// detail view.
+	OpenTrain func(sessionID string) tea.Model
 }
 
 // snapshotMsg carries the result of a Deps.Load call.
@@ -111,8 +115,18 @@ type snapshotMsg struct {
 	at   time.Time
 }
 
-// tickMsg fires on the refresh interval.
-type tickMsg struct{}
+// tickMsg fires on the refresh interval. gen identifies the tick chain it
+// belongs to: while a child view covers the dashboard its ticks go unhandled
+// and the chain dies, so the pop-nudge starts a NEW generation — and a stale
+// pre-push tick that fires after a fast pop must be dropped, not re-armed,
+// or chains would accumulate.
+type tickMsg struct {
+	gen int
+}
+
+// refreshNudgeMsg asks a model to refresh once and restart its tick chain
+// under a new generation — sent by the Root when a pop resumes a model.
+type refreshNudgeMsg struct{}
 
 // answerResultMsg carries the outcome of a Deps.Answer call.
 type answerResultMsg struct {
