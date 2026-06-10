@@ -4445,7 +4445,9 @@ func continueSkillOptTrainOptimizer(ctx context.Context, paths config.Paths, sto
 		result.Command = command
 		result.Args = args
 		announceSkillOptTrainOptimizerLaunch(progress, request)
+		stopHeartbeat := startSkillOptTrainOptimizerHeartbeat(progress)
 		runResult, err := runSkillOptTrainOptimizer(ctx, optimizerPaths, request, command, args)
+		stopHeartbeat()
 		result.RecoveryAvailable = skillOptTrainOptimizerRecoveryAvailable(optimizerPaths)
 		if err != nil {
 			if metaErr := recordSkillOptTrainOptimizerFailure(ctx, store, session, iteration, request, optimizerPaths, command, args, runResult, err); metaErr != nil {
@@ -5086,6 +5088,65 @@ func skillOptTrainGenerationLockKey(sessionID string, iterationID string) string
 	return "skillopt-train-generation:" + sessionID + ":" + iterationID
 }
 
+// skillOptTrainGenerationProgress emits human-facing, one-line-per-option
+// progress to a writer (typically stderr) while option jobs run concurrently.
+// A nil receiver or nil writer is a no-op, so automated callers (the review
+// watcher passes a nil Progress) stay silent. Writes are mutex-guarded because
+// options across items complete on concurrent goroutines.
+type skillOptTrainGenerationProgress struct {
+	mu    sync.Mutex
+	w     io.Writer
+	done  int
+	total int
+}
+
+func newSkillOptTrainGenerationProgress(w io.Writer, total int) *skillOptTrainGenerationProgress {
+	return &skillOptTrainGenerationProgress{w: w, total: total}
+}
+
+func (p *skillOptTrainGenerationProgress) start(items, perItem int, runtime string) {
+	if p == nil || p.w == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	suffix := ""
+	if strings.TrimSpace(runtime) != "" {
+		suffix = " with " + runtime
+	}
+	fmt.Fprintf(p.w, "generating %d options (%d items x %d)%s...\n", p.total, items, perItem, suffix)
+}
+
+func (p *skillOptTrainGenerationProgress) optionDone(itemID, role string, elapsed time.Duration, failed bool) {
+	if p == nil || p.w == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.done++
+	status := "done"
+	if failed {
+		status = "failed"
+	}
+	fmt.Fprintf(p.w, "option %s/%s %s (%d/%d) - %s\n", itemID, role, status, p.done, p.total, formatShortDuration(elapsed))
+}
+
+func formatShortDuration(d time.Duration) string {
+	if d < time.Second {
+		return d.Round(time.Millisecond).String()
+	}
+	return d.Round(time.Second).String()
+}
+
+// skillOptTrainGenerationRuntimeLabel is a best-effort runtime name for the
+// generation start line, taken from the resolved target/optimizer backend.
+func skillOptTrainGenerationRuntimeLabel(request skillOptTrainContinueRequest) string {
+	if backend := strings.TrimSpace(request.Optimizer.TargetBackend); backend != "" {
+		return backend
+	}
+	return strings.TrimSpace(request.Optimizer.Backend)
+}
+
 func generateSkillOptTrainOptions(ctx context.Context, paths config.Paths, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, request skillOptTrainContinueRequest) (skillOptTrainGenerationResult, error) {
 	if err := skillopt.CanTransitionTrainIteration(iteration.State, skillopt.TrainStateOptionsGenerated); err != nil {
 		return skillOptTrainGenerationResult{}, err
@@ -5165,7 +5226,9 @@ func generateSkillOptTrainOptions(ctx context.Context, paths config.Paths, store
 	if err := ensureSkillOptTrainGenerationRepoReady(ctx, store, skillOptTrainGenerationRepo(session)); err != nil {
 		return skillOptTrainGenerationResult{}, err
 	}
-	generatedItems, err := generateSkillOptTrainItemOptions(ctx, store, blobStore, session, iteration, run, items, roles, rankedRun, request, dispatch, concurrency)
+	progress := newSkillOptTrainGenerationProgress(request.Progress, len(items)*len(roles))
+	progress.start(len(items), len(roles), skillOptTrainGenerationRuntimeLabel(request))
+	generatedItems, err := generateSkillOptTrainItemOptions(ctx, store, blobStore, session, iteration, run, items, roles, rankedRun, request, dispatch, concurrency, progress)
 	if err != nil {
 		return skillOptTrainGenerationResult{}, err
 	}
@@ -5247,7 +5310,7 @@ type skillOptTrainGeneratedOption struct {
 	ValidationErrors      []map[string]any
 }
 
-func generateSkillOptTrainItemOptions(ctx context.Context, store *db.Store, blobStore artifact.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, run db.EvalRun, items []db.EvalReviewItem, roles []string, rankedRun bool, request skillOptTrainContinueRequest, dispatch skillOptTrainGenerationDispatch, concurrency int) ([]skillOptTrainGeneratedItemOptions, error) {
+func generateSkillOptTrainItemOptions(ctx context.Context, store *db.Store, blobStore artifact.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, run db.EvalRun, items []db.EvalReviewItem, roles []string, rankedRun bool, request skillOptTrainContinueRequest, dispatch skillOptTrainGenerationDispatch, concurrency int, progress *skillOptTrainGenerationProgress) ([]skillOptTrainGeneratedItemOptions, error) {
 	if concurrency <= 0 {
 		concurrency = 1
 	}
@@ -5271,7 +5334,7 @@ func generateSkillOptTrainItemOptions(ctx context.Context, store *db.Store, blob
 				errs[index] = ctx.Err()
 				return
 			}
-			result, err := generateSkillOptTrainSingleItemOptions(ctx, store, blobStore, session, iteration, run, item, roles, rankedRun, request, dispatch)
+			result, err := generateSkillOptTrainSingleItemOptions(ctx, store, blobStore, session, iteration, run, item, roles, rankedRun, request, dispatch, progress)
 			if err != nil {
 				errs[index] = err
 				return
@@ -5288,17 +5351,20 @@ func generateSkillOptTrainItemOptions(ctx context.Context, store *db.Store, blob
 	return results, nil
 }
 
-func generateSkillOptTrainSingleItemOptions(ctx context.Context, store *db.Store, blobStore artifact.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, run db.EvalRun, item db.EvalReviewItem, roles []string, rankedRun bool, request skillOptTrainContinueRequest, dispatch skillOptTrainGenerationDispatch) (skillOptTrainGeneratedItemOptions, error) {
+func generateSkillOptTrainSingleItemOptions(ctx context.Context, store *db.Store, blobStore artifact.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, run db.EvalRun, item db.EvalReviewItem, roles []string, rankedRun bool, request skillOptTrainContinueRequest, dispatch skillOptTrainGenerationDispatch, progress *skillOptTrainGenerationProgress) (skillOptTrainGeneratedItemOptions, error) {
 	generatedItem := skillOptTrainGeneratedItemOptions{ItemID: item.ItemID}
 	replacementOptions := make([]db.EvalReviewOption, 0, len(roles))
 	artifactRecords := make([]db.EvalArtifact, 0, len(roles))
 	wantsVuePreviewBundle := skillOptTrainWantsVuePreviewBundle(session)
 	requiresVuePreviewBundle := skillOptTrainRequiresVuePreviewBundle(session)
 	for _, role := range roles {
+		optionStart := time.Now()
 		generatedOption, err := generateSkillOptTrainSingleOption(ctx, store, session, iteration, run, item, role, rankedRun, request, dispatch, wantsVuePreviewBundle, requiresVuePreviewBundle)
 		if err != nil {
+			progress.optionDone(item.ItemID, role, time.Since(optionStart), true)
 			return skillOptTrainGeneratedItemOptions{}, err
 		}
+		progress.optionDone(item.ItemID, role, time.Since(optionStart), false)
 		artifactRole := role
 		if rankedRun {
 			artifactRole = "option-" + role
@@ -8557,6 +8623,40 @@ func announceSkillOptTrainOptimizerLaunch(progress io.Writer, request skillOptTr
 		return
 	}
 	fmt.Fprintln(progress, "skillopt train continue: launching optimizer; this runs long-lived model calls and will not stream output until it finishes")
+}
+
+// skillOptTrainOptimizerProgressInterval is how often the optimizer heartbeat
+// reports elapsed time; it is a var so tests can shorten it.
+var skillOptTrainOptimizerProgressInterval = 30 * time.Second
+
+// startSkillOptTrainOptimizerHeartbeat prints an elapsed-time line every
+// interval while the (output-buffered, long-lived) optimizer subprocess runs,
+// so the operator can tell it is alive. It returns a stop func; a nil progress
+// writer makes it a no-op.
+func startSkillOptTrainOptimizerHeartbeat(progress io.Writer) func() {
+	if progress == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	start := time.Now()
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(skillOptTrainOptimizerProgressInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				fmt.Fprintf(progress, "optimizer running - %s\n", formatShortDuration(time.Since(start)))
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-stopped
+	}
 }
 
 func runSkillOptTrainOptimizer(ctx context.Context, paths skillOptTrainOptimizerPaths, request skillOptTrainOptimizerRequest, command string, args []string) (subprocess.Result, error) {

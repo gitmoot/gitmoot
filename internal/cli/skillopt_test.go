@@ -2623,6 +2623,13 @@ func TestSkillOptTrainContinueGeneratesOptionsWithCurrentSkill(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("train continue exit code = %d, stderr=%s", code, stderr.String())
 	}
+	// Live generation progress goes to stderr: a start line and one line per
+	// completed option, ending at (4/4).
+	for _, want := range []string{"generating 4 options (2 items x 2)", "option ", " done (4/4) - "} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("generation progress stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
 	for _, want := range []string{
 		"current_phase: options_generated",
 		"continue_ready: true",
@@ -11101,4 +11108,20 @@ func cliSkillOptTemplateContent(id string, body string) string {
 		Inputs:               []string{"task"},
 		Outputs:              []string{"plan"},
 	}, "# Planner\n\n"+body+"\n")
+}
+
+func TestSkillOptTrainOptimizerHeartbeat(t *testing.T) {
+	prev := skillOptTrainOptimizerProgressInterval
+	skillOptTrainOptimizerProgressInterval = 10 * time.Millisecond
+	defer func() { skillOptTrainOptimizerProgressInterval = prev }()
+
+	var buf bytes.Buffer
+	stop := startSkillOptTrainOptimizerHeartbeat(&buf)
+	time.Sleep(45 * time.Millisecond)
+	stop() // joins the heartbeat goroutine, so reading buf afterwards is race-free
+	if !strings.Contains(buf.String(), "optimizer running - ") {
+		t.Fatalf("expected at least one heartbeat line, got %q", buf.String())
+	}
+	// A nil writer is a no-op and must not panic.
+	startSkillOptTrainOptimizerHeartbeat(nil)()
 }
