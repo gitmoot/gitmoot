@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -145,8 +148,26 @@ func resolveSkillOptTrainRunSession(home, sessionID, configPath string) (string,
 	return resolved, nil
 }
 
-// skillOptTrainRunDeps wires the snapshot loader into tui.TrainRunDeps.
+// skillOptTrainRunDeps wires the snapshot loader and phase actions into
+// tui.TrainRunDeps.
 func skillOptTrainRunDeps(home, sessionID string) tui.TrainRunDeps {
+	runContinue := func(mutate func(*skillOptTrainContinueRequest)) (tui.TrainRunActionResult, error) {
+		paths, err := initializedPaths(home)
+		if err != nil {
+			return tui.TrainRunActionResult{}, err
+		}
+		var out skillOptTrainContinueOutput
+		err = withStore(home, func(store *db.Store) error {
+			request := skillOptTrainContinueRequest{Home: home, SessionID: sessionID}
+			if mutate != nil {
+				mutate(&request)
+			}
+			var runErr error
+			out, runErr = continueSkillOptTrain(context.Background(), paths, store, request)
+			return runErr
+		})
+		return tui.TrainRunActionResult{Lines: out.Lines}, err
+	}
 	return tui.TrainRunDeps{
 		Interval: 2 * time.Second,
 		Load: func() (tui.TrainRunSnapshot, error) {
@@ -163,7 +184,70 @@ func skillOptTrainRunDeps(home, sessionID string) tui.TrainRunDeps {
 			}
 			return toTrainRunSnapshot(snapshot), nil
 		},
+		Continue: func() (tui.TrainRunActionResult, error) { return runContinue(nil) },
+		Decide: func(promote bool, candidate, reason string) (tui.TrainRunActionResult, error) {
+			return runContinue(func(r *skillOptTrainContinueRequest) {
+				if promote {
+					r.PromoteCandidate = candidate
+				} else {
+					r.RejectCandidate = candidate
+					r.DecisionReason = reason
+				}
+			})
+		},
+		StartNext: func() (tui.TrainRunActionResult, error) {
+			return runContinue(func(r *skillOptTrainContinueRequest) { r.StartNext = true })
+		},
+		SpawnContinue: func() (string, error) { return spawnSkillOptTrainContinueChild(home, sessionID) },
 	}
+}
+
+// spawnSkillOptTrainContinueChild launches `gitmoot skillopt train continue` as a
+// detached background process so the long generation/optimizer phases survive
+// the TUI quitting. It is a var so tests can stub it. Returns the log path the
+// child's stdout/stderr are appended to.
+var spawnSkillOptTrainContinueChild = func(home, sessionID string) (string, error) {
+	paths, err := initializedPaths(home)
+	if err != nil {
+		return "", err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	logPath := filepath.Join(paths.Logs, "skillopt-train-"+skillOptTrainLogSlug(sessionID)+".log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", err
+	}
+	defer logFile.Close()
+	args := []string{"skillopt", "train", "continue", "--session", sessionID}
+	if strings.TrimSpace(home) != "" {
+		args = append(args, "--home", home)
+	}
+	cmd := exec.Command(executable, args...)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+	if err := cmd.Process.Release(); err != nil {
+		return "", err
+	}
+	return logPath, nil
+}
+
+// skillOptTrainLogSlug makes a session id safe for a log filename.
+func skillOptTrainLogSlug(sessionID string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		default:
+			return '-'
+		}
+	}, sessionID)
 }
 
 // toTrainRunSnapshot maps the cli status snapshot to the tui-facing shape.

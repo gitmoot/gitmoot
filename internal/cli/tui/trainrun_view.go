@@ -56,9 +56,47 @@ func (m TrainRunModel) View() string {
 	}
 
 	b.WriteString(m.body())
-	b.WriteString("\n\n")
-	b.WriteString(mutedStyle.Render("r refresh  q quit"))
+
+	if m.mode == trainModeReject {
+		b.WriteString("\nreject reason: " + m.rejectInput.View() + "\n")
+	}
+	if m.actionErr != "" {
+		b.WriteString("\n" + errorStyle.Render(m.actionErr) + "\n")
+	}
+	for _, line := range m.resultLines {
+		b.WriteString(mutedStyle.Render(line) + "\n")
+	}
+
+	b.WriteString("\n")
+	b.WriteString(mutedStyle.Render(m.footer()))
 	return b.String()
+}
+
+// footer is the phase-aware key hint line.
+func (m TrainRunModel) footer() string {
+	if m.mode == trainModeReject {
+		return "type reason  enter reject  esc cancel"
+	}
+	if m.actionBusy {
+		return "working…  q quit"
+	}
+	action := ""
+	switch m.snap.Phase {
+	case "items_ready", "feedback_synced", "training_package_created":
+		action = "enter generate  "
+	case "options_generated":
+		action = "enter publish review  "
+	case "review_published":
+		action = "enter sync feedback  "
+	case "candidate_created":
+		action = "enter publish candidate review  "
+	case "candidate_review_published":
+		action = "p promote  x reject  "
+	}
+	if m.snap.Terminal {
+		action = "n start next iteration  "
+	}
+	return action + "r refresh  q quit"
 }
 
 func (m TrainRunModel) phaseBar() string {

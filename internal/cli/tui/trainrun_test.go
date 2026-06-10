@@ -112,3 +112,170 @@ func TestTrainRunTickRearms(t *testing.T) {
 		t.Fatal("tick should re-arm and refresh")
 	}
 }
+
+func trainRunModelWithDeps(t *testing.T, deps TrainRunDeps, snap TrainRunSnapshot) TrainRunModel {
+	t.Helper()
+	m := NewTrainRun(deps)
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = next.(TrainRunModel)
+	next, _ = m.Update(trainSnapshotMsg{snap: snap, at: time.Unix(1, 0)})
+	return next.(TrainRunModel)
+}
+
+func TestTrainRunGenerateSpawnsChild(t *testing.T) {
+	spawned := false
+	deps := TrainRunDeps{
+		Load:          func() (TrainRunSnapshot, error) { return TrainRunSnapshot{SessionID: "s", Phase: "items_ready"}, nil },
+		SpawnContinue: func() (string, error) { spawned = true; return "/tmp/log", nil },
+	}
+	m := trainRunModelWithDeps(t, deps, TrainRunSnapshot{SessionID: "s", Phase: "items_ready"})
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(TrainRunModel)
+	if !m.actionBusy || cmd == nil {
+		t.Fatal("enter on items_ready should spawn and mark busy")
+	}
+	cmd() // execute the spawn command
+	if !spawned {
+		t.Fatal("SpawnContinue should have been called")
+	}
+}
+
+func TestTrainRunPublishUsesInProcessContinue(t *testing.T) {
+	called := false
+	deps := TrainRunDeps{
+		Load: func() (TrainRunSnapshot, error) {
+			return TrainRunSnapshot{SessionID: "s", Phase: "options_generated"}, nil
+		},
+		Continue: func() (TrainRunActionResult, error) {
+			called = true
+			return TrainRunActionResult{Lines: []string{"review: url"}}, nil
+		},
+	}
+	m := trainRunModelWithDeps(t, deps, TrainRunSnapshot{SessionID: "s", Phase: "options_generated"})
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(TrainRunModel)
+	if cmd == nil {
+		t.Fatal("enter on options_generated should run continue")
+	}
+	msg := cmd()
+	if !called {
+		t.Fatal("Continue should have been called")
+	}
+	next, _ = m.Update(msg)
+	m = next.(TrainRunModel)
+	if m.actionBusy {
+		t.Fatal("action result should clear busy")
+	}
+}
+
+func TestTrainRunPromote(t *testing.T) {
+	var gotPromote bool
+	var gotCandidate string
+	deps := TrainRunDeps{
+		Load: func() (TrainRunSnapshot, error) {
+			return TrainRunSnapshot{SessionID: "s", Phase: "candidate_review_published", CandidateVersion: "c@v2"}, nil
+		},
+		Decide: func(promote bool, candidate, reason string) (TrainRunActionResult, error) {
+			gotPromote, gotCandidate = promote, candidate
+			return TrainRunActionResult{}, nil
+		},
+	}
+	m := trainRunModelWithDeps(t, deps, TrainRunSnapshot{SessionID: "s", Phase: "candidate_review_published", CandidateVersion: "c@v2"})
+	next, cmd := m.Update(key("p"))
+	m = next.(TrainRunModel)
+	if cmd == nil {
+		t.Fatal("p should promote")
+	}
+	cmd()
+	if !gotPromote || gotCandidate != "c@v2" {
+		t.Fatalf("Decide(promote) called with (%v,%q)", gotPromote, gotCandidate)
+	}
+}
+
+func TestTrainRunRejectRequiresReason(t *testing.T) {
+	var gotReason string
+	decided := false
+	deps := TrainRunDeps{
+		Load: func() (TrainRunSnapshot, error) {
+			return TrainRunSnapshot{SessionID: "s", Phase: "candidate_review_published", CandidateVersion: "c@v2"}, nil
+		},
+		Decide: func(promote bool, candidate, reason string) (TrainRunActionResult, error) {
+			decided, gotReason = true, reason
+			return TrainRunActionResult{}, nil
+		},
+	}
+	m := trainRunModelWithDeps(t, deps, TrainRunSnapshot{SessionID: "s", Phase: "candidate_review_published", CandidateVersion: "c@v2"})
+	// x opens the reject reason input.
+	next, _ := m.Update(key("x"))
+	m = next.(TrainRunModel)
+	if m.mode != trainModeReject {
+		t.Fatalf("x should open the reject input, mode=%v", m.mode)
+	}
+	// enter with empty reason is rejected.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(TrainRunModel)
+	if decided || m.actionErr == "" {
+		t.Fatal("empty reason should not submit and should show an error")
+	}
+	// type a reason and submit.
+	next, _ = m.Update(key("not good enough"))
+	m = next.(TrainRunModel)
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(TrainRunModel)
+	if cmd == nil {
+		t.Fatal("enter with a reason should submit")
+	}
+	cmd()
+	if !decided || gotReason != "not good enough" {
+		t.Fatalf("Decide(reject) reason = %q", gotReason)
+	}
+}
+
+func TestTrainRunStartNextOnTerminal(t *testing.T) {
+	called := false
+	deps := TrainRunDeps{
+		Load: func() (TrainRunSnapshot, error) {
+			return TrainRunSnapshot{SessionID: "s", Phase: "candidate_promoted", Terminal: true}, nil
+		},
+		StartNext: func() (TrainRunActionResult, error) { called = true; return TrainRunActionResult{}, nil },
+	}
+	m := trainRunModelWithDeps(t, deps, TrainRunSnapshot{SessionID: "s", Phase: "candidate_promoted", Terminal: true})
+	next, cmd := m.Update(key("n"))
+	m = next.(TrainRunModel)
+	if cmd == nil {
+		t.Fatal("n should start next on a terminal phase")
+	}
+	cmd()
+	if !called {
+		t.Fatal("StartNext should have been called")
+	}
+}
+
+func TestTrainRunActionBusySuppressesReentry(t *testing.T) {
+	deps := TrainRunDeps{
+		Load: func() (TrainRunSnapshot, error) {
+			return TrainRunSnapshot{SessionID: "s", Phase: "options_generated"}, nil
+		},
+		Continue: func() (TrainRunActionResult, error) { return TrainRunActionResult{}, nil },
+	}
+	m := trainRunModelWithDeps(t, deps, TrainRunSnapshot{SessionID: "s", Phase: "options_generated"})
+	next, cmd1 := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(TrainRunModel)
+	next, cmd2 := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd1 == nil || cmd2 != nil {
+		t.Fatal("second enter while busy must be suppressed")
+	}
+	_ = next
+}
+
+func TestTrainRunActionErrorShown(t *testing.T) {
+	m := trainRunModel(t, TrainRunSnapshot{SessionID: "s", Phase: "options_generated"})
+	next, _ := m.Update(trainActionMsg{err: errors.New("another worker holds the lock")})
+	m = next.(TrainRunModel)
+	if m.actionBusy {
+		t.Fatal("error result should clear busy")
+	}
+	if !strings.Contains(m.View(), "another worker holds the lock") {
+		t.Fatalf("expected the action error in view:\n%s", m.View())
+	}
+}
