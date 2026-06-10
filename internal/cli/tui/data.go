@@ -119,3 +119,9 @@ type answerResultMsg struct {
 	id  string
 	err error
 }
+
+// dismissResultMsg carries the outcome of a Deps.Dismiss call.
+type dismissResultMsg struct {
+	id  string
+	err error
+}

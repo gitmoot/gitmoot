@@ -33,6 +33,26 @@ func (m *Model) openAnswer() tea.Cmd {
 	return m.input.Focus()
 }
 
+// openDismiss enters the dismiss-confirm overlay for the prompt under the cursor.
+func (m *Model) openDismiss() {
+	if pages[m.selected].page != pageAttention || len(m.snap.Prompts) == 0 {
+		return
+	}
+	m.active = m.snap.Prompts[m.promptCursor]
+	m.actionErr = ""
+	m.actionBusy = false
+	m.mode = modeConfirmDismiss
+}
+
+func dismissCmd(deps Deps, id string) tea.Cmd {
+	return func() tea.Msg {
+		if deps.Dismiss == nil {
+			return dismissResultMsg{id: id}
+		}
+		return dismissResultMsg{id: id, err: deps.Dismiss(id)}
+	}
+}
+
 // updateOverlay handles keys while an answer overlay is active.
 func (m Model) updateOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
@@ -47,6 +67,29 @@ func (m Model) updateOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch m.mode {
+	case modeConfirmDismiss:
+		switch msg.String() {
+		case "y", "Y":
+			if !m.actionBusy {
+				m.actionBusy = true
+				m.actionErr = ""
+				cmd := dismissCmd(m.deps, m.active.ID)
+				m.viewport.SetContent(m.content())
+				return m, cmd
+			}
+		default:
+			// Any other key cancels the dismissal.
+			m.mode = modeNormal
+			m.actionErr = ""
+		}
+		m.viewport.SetContent(m.content())
+		return m, nil
+	case modeTrainDetail:
+		if msg.String() == "enter" {
+			m.mode = modeNormal
+			m.viewport.SetContent(m.content())
+		}
+		return m, nil
 	case modeAnswerChoice:
 		switch msg.String() {
 		case "up", "k":
@@ -99,8 +142,11 @@ func answerCmd(deps Deps, id, value string) tea.Cmd {
 // attentionContent renders the Attention page: pending prompts (selectable),
 // then blocked/failed job counts, stale resource locks, and branch locks.
 func (m Model) attentionContent() string {
-	if m.mode == modeAnswerChoice || m.mode == modeAnswerText {
+	switch m.mode {
+	case modeAnswerChoice, modeAnswerText:
 		return m.answerOverlay()
+	case modeConfirmDismiss:
+		return m.dismissOverlay()
 	}
 	var b strings.Builder
 	wrote := false
@@ -200,6 +246,28 @@ func (m Model) answerOverlay() string {
 		b.WriteString(mutedStyle.Render("submitting…"))
 	} else {
 		b.WriteString(mutedStyle.Render("enter submit  esc cancel"))
+	}
+	return b.String()
+}
+
+func (m Model) dismissOverlay() string {
+	var b strings.Builder
+	b.WriteString(headerStyle.Render("dismiss " + m.active.ID))
+	b.WriteString("\n\n")
+	b.WriteString(truncate(m.active.Question, 70))
+	b.WriteString("\n\n")
+	b.WriteString("Delete this prompt? (y/n)")
+	b.WriteByte('\n')
+	if m.actionErr != "" {
+		b.WriteString("\n")
+		b.WriteString(errorStyle.Render(m.actionErr))
+		b.WriteByte('\n')
+	}
+	b.WriteString("\n")
+	if m.actionBusy {
+		b.WriteString(mutedStyle.Render("dismissing…"))
+	} else {
+		b.WriteString(mutedStyle.Render("y delete  n/esc cancel"))
 	}
 	return b.String()
 }

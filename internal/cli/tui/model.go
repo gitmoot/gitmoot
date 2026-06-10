@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -14,6 +15,7 @@ type page int
 
 const (
 	pageAttention page = iota
+	pageTrains
 	pageAgents
 	pageSessions
 	pageJobs
@@ -25,6 +27,7 @@ var pages = []struct {
 	label string
 }{
 	{pageAttention, "Attention"},
+	{pageTrains, "Trains"},
 	{pageAgents, "Agents"},
 	{pageSessions, "Sessions"},
 	{pageJobs, "Jobs"},
@@ -39,6 +42,8 @@ const (
 	modeNormal mode = iota
 	modeAnswerChoice
 	modeAnswerText
+	modeConfirmDismiss
+	modeTrainDetail
 )
 
 const defaultInterval = 5 * time.Second
@@ -57,14 +62,16 @@ type Model struct {
 	loadErr  string
 	inFlight bool
 
-	// Attention page interaction state.
+	// Attention / Trains page interaction state.
 	mode         mode
 	promptCursor int                  // selected row in snap.Prompts on the Attention page
-	active       db.InteractivePrompt // prompt being answered in an overlay
+	trainCursor  int                  // selected row in snap.Trains on the Trains page
+	active       db.InteractivePrompt // prompt being answered/dismissed in an overlay
+	activeTrain  TrainSession         // train shown in modeTrainDetail
 	choiceIdx    int                  // selected choice in modeAnswerChoice
 	input        textinput.Model      // free-text answer in modeAnswerText
-	actionErr    string               // inline error from the last Answer attempt
-	actionBusy   bool                 // an Answer is in flight; suppress re-submit
+	actionErr    string               // inline error from the last Answer/Dismiss attempt
+	actionBusy   bool                 // an action is in flight; suppress re-submit
 }
 
 // New returns a Model ready for tea.NewProgram. It starts in the loading state;
@@ -139,10 +146,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
 			}
+			if pages[m.selected].page == pageTrains && len(m.snap.Trains) > 0 {
+				if m.trainCursor > 0 {
+					m.trainCursor--
+				}
+				m.viewport.SetContent(m.content())
+				return m, tea.Batch(cmds...)
+			}
 		case "down", "j":
 			if pages[m.selected].page == pageAttention && len(m.snap.Prompts) > 0 {
 				if m.promptCursor < len(m.snap.Prompts)-1 {
 					m.promptCursor++
+				}
+				m.viewport.SetContent(m.content())
+				return m, tea.Batch(cmds...)
+			}
+			if pages[m.selected].page == pageTrains && len(m.snap.Trains) > 0 {
+				if m.trainCursor < len(m.snap.Trains)-1 {
+					m.trainCursor++
 				}
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
@@ -152,6 +173,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if cmd := m.openAnswer(); cmd != nil {
 					cmds = append(cmds, cmd)
 				}
+				m.viewport.SetContent(m.content())
+				return m, tea.Batch(cmds...)
+			}
+		case "d":
+			if pages[m.selected].page == pageAttention {
+				m.openDismiss()
+				m.viewport.SetContent(m.content())
+				return m, tea.Batch(cmds...)
+			}
+		case "enter":
+			if pages[m.selected].page == pageTrains {
+				m.openTrainDetail()
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
 			}
@@ -174,6 +207,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, cmd)
 			}
 		}
+	case dismissResultMsg:
+		m.actionBusy = false
+		// A prompt already gone (removed by another terminal or a prior refresh)
+		// is treated as success, since the goal was to remove it.
+		if msg.err != nil && !errors.Is(msg.err, db.ErrInteractivePromptNotFound) {
+			m.actionErr = msg.err.Error()
+		} else {
+			m.mode = modeNormal
+			m.actionErr = ""
+			if cmd := m.queueLoad(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
 	case snapshotMsg:
 		m.inFlight = false
 		if msg.err != nil {
@@ -183,6 +229,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.snap = msg.snap
 			m.loadedAt = msg.at
 			m.clampPromptCursor()
+			m.clampTrainCursor()
 		}
 	case tickMsg:
 		if cmd := m.queueLoad(); cmd != nil {
@@ -231,6 +278,16 @@ func (m *Model) clampPromptCursor() {
 	}
 	if m.promptCursor < 0 {
 		m.promptCursor = 0
+	}
+}
+
+// clampTrainCursor keeps the Trains cursor within the current session list.
+func (m *Model) clampTrainCursor() {
+	if m.trainCursor >= len(m.snap.Trains) {
+		m.trainCursor = len(m.snap.Trains) - 1
+	}
+	if m.trainCursor < 0 {
+		m.trainCursor = 0
 	}
 }
 

@@ -73,6 +73,8 @@ func (m Model) content() string {
 	switch pages[m.selected].page {
 	case pageAttention:
 		b.WriteString(m.attentionContent())
+	case pageTrains:
+		b.WriteString(m.trainsContent())
 	case pageAgents:
 		b.WriteString(m.agentsContent())
 	case pageSessions:
@@ -89,14 +91,21 @@ func (m Model) content() string {
 
 // footerHelp is the key-hint line for the current page/mode.
 func (m Model) footerHelp() string {
-	if m.mode == modeAnswerChoice {
+	switch m.mode {
+	case modeAnswerChoice:
 		return "↑/↓ choose  enter submit  esc cancel"
-	}
-	if m.mode == modeAnswerText {
+	case modeAnswerText:
 		return "type answer  enter submit  esc cancel"
+	case modeConfirmDismiss:
+		return "y delete  n/esc cancel"
+	case modeTrainDetail:
+		return "enter/esc back"
 	}
-	if pages[m.selected].page == pageAttention {
-		return "tab/←→ page  ↑/↓ select  a answer  r refresh  q quit"
+	switch pages[m.selected].page {
+	case pageAttention:
+		return "tab/←→ page  ↑/↓ select  a answer  d dismiss  r refresh  q quit"
+	case pageTrains:
+		return "tab/←→ page  ↑/↓ select  enter detail  r refresh  q quit"
 	}
 	return "tab/←→ page  j/k or wheel scroll  r refresh  q quit"
 }

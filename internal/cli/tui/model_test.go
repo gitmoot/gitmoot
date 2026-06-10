@@ -36,6 +36,7 @@ func sampleSnapshot() Snapshot {
 			{Name: "solo", Runtime: "codex", Repo: "owner/repo", State: "running"},
 		},
 		Jobs:        Jobs{Total: 3, ByState: map[string]int{"failed": 1, "succeeded": 2}},
+		Trains:      []TrainSession{{ID: "train-s1", Phase: "items_ready", Candidate: "smithyx@v3", Repo: "owner/repo"}},
 		BranchLocks: []BranchLock{{Repo: "owner/repo", Branch: "main", Owner: "agent"}},
 		ResourceLocks: []ResourceLock{
 			{Key: "generation:s1", Owner: "pid:1", Stale: false},
@@ -54,8 +55,8 @@ func loadedModel(t *testing.T) Model {
 
 func TestPagesRenderExpectedContent(t *testing.T) {
 	m := loadedModel(t)
-	// Page order: Attention, Agents, Sessions, Jobs, Locks.
-	wants := []string{"pending prompts", "planner", "skillopt-generator", "failed", "branch locks"}
+	// Page order: Attention, Trains, Agents, Sessions, Jobs, Locks.
+	wants := []string{"pending prompts", "train-s1", "planner", "skillopt-generator", "failed", "branch locks"}
 	for i, want := range wants {
 		if i > 0 {
 			next, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
@@ -104,7 +105,10 @@ func TestLoadErrorKeepsStaleData(t *testing.T) {
 	m := loadedModel(t)
 	next, _ := m.Update(snapshotMsg{err: errors.New("db locked"), at: time.Unix(2, 0)})
 	m = next.(Model)
-	// Move to the Agents page where the stale data is visible.
+	// Move to the Agents page (Attention → Trains → Agents) where the stale
+	// data is visible.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = next.(Model)
 	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
 	m = next.(Model)
 	view := m.View()
