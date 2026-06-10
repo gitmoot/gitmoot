@@ -65,6 +65,11 @@ type TrainRunDeps struct {
 	// Load/Continue/… operate on the new session.
 	Plan          *TrainRunPlan
 	CreateSession func(workspaceRepo string) (sessionID string, err error)
+
+	// TailLog reads the current session's detached-child log from a byte offset,
+	// returning any new lines and the next offset. Used to show live progress
+	// during the long generate/optimizer phases.
+	TailLog func(offset int64) (lines []string, next int64, err error)
 }
 
 type trainRunMode int
@@ -97,6 +102,11 @@ type trainCreatedMsg struct {
 	err       error
 }
 
+type trainLogMsg struct {
+	lines  []string
+	offset int64
+}
+
 // TrainRunModel renders a single train session as a live phase view.
 type TrainRunModel struct {
 	deps     TrainRunDeps
@@ -118,6 +128,27 @@ type TrainRunModel struct {
 	creating   bool
 	createErr  string
 	wsInput    textinput.Model
+
+	// Log tail (long phases): a monotonic byte offset into the per-session child
+	// log (generation and optimizer append to the same file, so the offset is
+	// never reset on phase change — only on truncation, handled by the reader),
+	// and the last few complete lines to show.
+	logOffset int64
+	logLines  []string
+}
+
+const trainLogTailLines = 8
+
+// isLongTrainPhase reports whether the phase runs in the detached child and so
+// has a log worth tailing.
+func isLongTrainPhase(phase string) bool {
+	switch phase {
+	case "generating_options", "generating_options_heartbeat_stale",
+		"optimizer_running", "optimizer_heartbeat_stale":
+		return true
+	default:
+		return false
+	}
 }
 
 // NewTrainRun returns a model ready for tea.NewProgram.
@@ -206,14 +237,41 @@ func (m TrainRunModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loadErr = ""
 			m.snap = msg.snap
 			m.loadedAt = msg.at
+			// Clear the displayed lines when not in a long phase so stale output
+			// does not linger; the byte offset stays monotonic (one per-session
+			// log spans generation and optimizer).
+			if !isLongTrainPhase(msg.snap.Phase) {
+				m.logLines = nil
+			}
 		}
+	case trainLogMsg:
+		if len(msg.lines) > 0 {
+			m.logLines = append(m.logLines, msg.lines...)
+			if len(m.logLines) > trainLogTailLines {
+				m.logLines = m.logLines[len(m.logLines)-trainLogTailLines:]
+			}
+		}
+		m.logOffset = msg.offset
 	case trainTickMsg:
 		if cmd := m.queueLoad(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+		if isLongTrainPhase(m.snap.Phase) && m.deps.TailLog != nil {
+			cmds = append(cmds, tailLogCmd(m.deps, m.logOffset))
+		}
 		cmds = append(cmds, trainTick(m.interval()))
 	}
 	return m, tea.Batch(cmds...)
+}
+
+func tailLogCmd(d TrainRunDeps, offset int64) tea.Cmd {
+	return func() tea.Msg {
+		lines, next, err := d.TailLog(offset)
+		if err != nil {
+			return trainLogMsg{offset: offset} // keep the offset; transient read errors are ignored
+		}
+		return trainLogMsg{lines: lines, offset: next}
+	}
 }
 
 // updateKey handles all key input: the reject-reason sub-mode first, then the

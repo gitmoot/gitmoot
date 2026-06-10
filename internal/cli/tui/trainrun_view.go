@@ -190,6 +190,14 @@ func (m TrainRunModel) body() string {
 		b.WriteString(fmt.Sprintf("candidate %s rejected\n", dash(s.CandidateVersion)))
 	}
 
+	if isLongTrainPhase(s.Phase) && len(m.logLines) > 0 {
+		b.WriteByte('\n')
+		for _, line := range m.logLines {
+			b.WriteString(mutedStyle.Render("│ " + line))
+			b.WriteByte('\n')
+		}
+	}
+
 	if s.NextAction != "" {
 		b.WriteString(mutedStyle.Render("next: " + s.NextAction))
 		b.WriteByte('\n')
