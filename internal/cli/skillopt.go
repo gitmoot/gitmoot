@@ -8779,6 +8779,23 @@ func buildSkillOptTrainOptimizerCommand(iteration db.SkillOptTrainIteration, req
 			targetModel = model
 		}
 	}
+	// When a role runs on the codex backend with no model set, default to the
+	// model the codex CLI is configured with. gitmoot-skillopt would otherwise
+	// fall back to gpt-4o, which a ChatGPT-account codex login rejects.
+	optimizerBackend := firstNonEmpty(strings.TrimSpace(request.OptimizerBackend), strings.TrimSpace(request.Backend))
+	targetBackend := firstNonEmpty(strings.TrimSpace(request.TargetBackend), strings.TrimSpace(request.Backend))
+	wantOptimizerCodexModel := optimizerModel == "" && optimizerBackend == runtime.CodexRuntime
+	wantTargetCodexModel := targetModel == "" && targetBackend == runtime.CodexRuntime
+	if wantOptimizerCodexModel || wantTargetCodexModel {
+		if codexModel, _ := runtime.ConfiguredCodexModel(); codexModel != "" {
+			if wantOptimizerCodexModel {
+				optimizerModel = codexModel
+			}
+			if wantTargetCodexModel {
+				targetModel = codexModel
+			}
+		}
+	}
 	if optimizerModel != "" {
 		args = append(args, "--optimizer-model", optimizerModel)
 	}

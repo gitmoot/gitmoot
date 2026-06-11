@@ -411,7 +411,7 @@ func buildAgentOptimizeFields(home string, repoChoices []tui.Choice) []tui.Field
 		standard("preview"),
 		standard("request"),
 		custom("backend", "Optimizer backend", "Backend for the optimizer and target runs?", []string{"codex", "claude"}, "codex", true),
-		custom("model", "Model (optional)", "Model override for the optimizer and target runs? (empty = backend default)", nil, "", false),
+		custom("model", "Model (optional)", "Model override for the optimizer and target runs? (empty = your codex model on the codex backend, else the backend default)", nil, "", false),
 	}
 }
 

@@ -2,12 +2,56 @@ package cli
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
 )
+
+func TestBuildOptimizerCommandDefaultsCodexModel(t *testing.T) {
+	prev := skillOptTrainOptimizerRunner
+	skillOptTrainOptimizerRunner = &skillOptTrainFakeOptimizerRunner{}
+	defer func() { skillOptTrainOptimizerRunner = prev }()
+
+	// A configured codex model the default should pick up.
+	codexHome := t.TempDir()
+	if err := os.WriteFile(filepath.Join(codexHome, "config.toml"), []byte("model = \"gpt-5.5\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", codexHome)
+
+	build := func(req skillOptTrainOptimizerRequest) []string {
+		req.SkillOptBin = "gitmoot-skillopt"
+		_, args, err := buildSkillOptTrainOptimizerCommand(db.SkillOptTrainIteration{}, req, skillOptTrainOptimizerPaths{})
+		if err != nil {
+			t.Fatalf("buildSkillOptTrainOptimizerCommand: %v", err)
+		}
+		return args
+	}
+
+	// codex backend, empty model → optimizer model defaults to the codex model.
+	// (Target resolves to codex_exec, which uses codex's model natively, so no
+	// --target-model is injected.)
+	args := build(skillOptTrainOptimizerRequest{Backend: "codex"})
+	if got := argValue(args, "--optimizer-model"); got != "gpt-5.5" {
+		t.Fatalf("codex+empty: --optimizer-model = %q, want gpt-5.5 (args=%v)", got, args)
+	}
+
+	// An explicit model still wins.
+	args = build(skillOptTrainOptimizerRequest{Backend: "codex", Model: "o3"})
+	if got := argValue(args, "--optimizer-model"); got != "o3" {
+		t.Fatalf("explicit model overridden: --optimizer-model = %q, want o3", got)
+	}
+
+	// A non-codex backend gets no codex-derived default.
+	args = build(skillOptTrainOptimizerRequest{OptimizerBackend: "openai_chat"})
+	if got := argValue(args, "--optimizer-model"); got == "gpt-5.5" {
+		t.Fatalf("non-codex backend must not pick up the codex model: args=%v", args)
+	}
+}
 
 func TestBuildAgentOptimizeFieldsSkipsTemplate(t *testing.T) {
 	fields := buildAgentOptimizeFields("", nil)
