@@ -96,6 +96,8 @@ func (m Model) content() string {
 		b.WriteString(m.agentRevertConfirmView())
 	case modeConfirmAgentDelete:
 		b.WriteString(m.agentDeleteConfirmView())
+	case modeAgentVersionView:
+		b.WriteString(m.agentVersionView())
 	case modeConfigEdit:
 		b.WriteString(m.configEditView())
 	default:

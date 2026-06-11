@@ -224,10 +224,13 @@ type Deps struct {
 	// collected answers. DeleteAgent refuses while jobs reference the agent.
 	// RevertTemplate makes a superseded template version current again.
 	TemplateVersions func(templateID string) ([]TemplateVersion, error)
-	OpenAgentCreate  func() (tea.Model, error)
-	CreateAgent      func(name, runtime, template string) error
-	DeleteAgent      func(name string) error
-	RevertTemplate   func(templateID, versionID string) error
+	// TemplateVersionContent loads a specific version's prompt content for the
+	// agent-detail preview pager.
+	TemplateVersionContent func(versionID string) (string, error)
+	OpenAgentCreate        func() (tea.Model, error)
+	CreateAgent            func(name, runtime, template string) error
+	DeleteAgent            func(name string) error
+	RevertTemplate         func(templateID, versionID string) error
 
 	// Optimize an agent: OpenAgentOptimize builds the pre-filled training form
 	// for the agent's template; StartOptimize scaffolds and starts the train
@@ -348,6 +351,13 @@ type agentVersionsMsg struct {
 	templateID string
 	versions   []TemplateVersion
 	err        error
+}
+
+// versionContentMsg carries a template version's content for the preview pager.
+type versionContentMsg struct {
+	versionID string
+	content   string
+	err       error
 }
 
 // agentActionMsg carries the outcome of an agent mutation.

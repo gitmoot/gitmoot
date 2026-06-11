@@ -207,6 +207,18 @@ func dashboardTUIDeps(home string, interval time.Duration) tui.Deps {
 			})
 			return views, err
 		},
+		TemplateVersionContent: func(versionID string) (string, error) {
+			var content string
+			err := withStore(home, func(store *db.Store) error {
+				version, err := store.GetAgentTemplateVersionByID(context.Background(), versionID)
+				if err != nil {
+					return err
+				}
+				content = version.Content
+				return nil
+			})
+			return content, err
+		},
 		OpenAgentCreate: func() (tea.Model, error) {
 			// One store for the form's lifetime: its 200ms external-answer poll
 			// would otherwise open/migrate/close the database five times a

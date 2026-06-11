@@ -24,6 +24,7 @@ func (m *Model) openAgentDetail(agent Agent) tea.Cmd {
 	m.agentVersions = nil
 	m.agentVersionsLoaded = false
 	m.agentVersionsErr = ""
+	m.detailVersionCursor = 0
 	m.actionErr = ""
 	m.actionBusy = false
 	m.mode = modeAgentDetail
@@ -40,6 +41,50 @@ func (m *Model) openAgentDelete(agent Agent) {
 	m.actionErr = ""
 	m.actionBusy = false
 	m.mode = modeConfirmAgentDelete
+}
+
+// openVersionView opens the preview pager for a template version, reusing the
+// cache when it already holds this version's content (the train-run skill-pager
+// pattern, keyed by version id).
+func (m *Model) openVersionView(version TemplateVersion) tea.Cmd {
+	m.activeAgentVersion = version
+	m.mode = modeAgentVersionView
+	if m.versionViewLoaded && m.versionViewErr == "" && m.versionViewID == version.ID {
+		return nil
+	}
+	m.versionViewID = version.ID
+	m.versionViewLoaded = false
+	m.versionViewErr = ""
+	return versionContentCmd(m.deps, version.ID)
+}
+
+func versionContentCmd(deps Deps, versionID string) tea.Cmd {
+	return func() tea.Msg {
+		if deps.TemplateVersionContent == nil {
+			return versionContentMsg{versionID: versionID}
+		}
+		content, err := deps.TemplateVersionContent(versionID)
+		return versionContentMsg{versionID: versionID, content: content, err: err}
+	}
+}
+
+// agentVersionView renders the version content pager.
+func (m Model) agentVersionView() string {
+	var b strings.Builder
+	v := m.activeAgentVersion
+	b.WriteString(headerStyle.Render("version v" + strconv.Itoa(v.Number) + "  " + dash(m.activeAgent.TemplateID)))
+	b.WriteString("\n\n")
+	switch {
+	case m.versionViewErr != "":
+		b.WriteString(errorStyle.Render(m.versionViewErr) + "\n")
+	case !m.versionViewLoaded:
+		b.WriteString(mutedStyle.Render("loading…") + "\n")
+	default:
+		b.WriteString(m.versionView.View())
+		b.WriteByte('\n')
+	}
+	b.WriteString("\n" + mutedStyle.Render("↑/↓ scroll  esc back"))
+	return b.String()
 }
 
 // revertableVersions are the superseded versions an agent's template can be
@@ -59,8 +104,21 @@ func (m Model) updateAgentOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch m.mode {
 	case modeAgentDetail:
 		switch msg.String() {
-		case "esc", "enter", "q":
+		case "esc", "q":
 			m.mode = modeNormal
+		case "up", "k":
+			if m.detailVersionCursor > 0 {
+				m.detailVersionCursor--
+			}
+		case "down", "j":
+			if m.detailVersionCursor < len(m.agentVersions)-1 {
+				m.detailVersionCursor++
+			}
+		case "enter":
+			// Open the selected version's prompt in the pager.
+			if m.detailVersionCursor < len(m.agentVersions) && m.deps.TemplateVersionContent != nil {
+				return m, m.openVersionView(m.agentVersions[m.detailVersionCursor])
+			}
 		case "v":
 			if len(m.revertableVersions()) > 0 {
 				m.versionCursor = 0
@@ -71,6 +129,21 @@ func (m Model) updateAgentOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.viewport.SetContent(m.content())
 		return m, nil
+	case modeAgentVersionView:
+		switch msg.String() {
+		case "esc", "q":
+			m.mode = modeAgentDetail
+			m.viewport.SetContent(m.content())
+			return m, nil
+		}
+		var cmd tea.Cmd
+		// Only steer the pager once its content is loaded — before that (or after
+		// a failed load) versionView is the zero viewport and scroll keys are noise.
+		if m.versionViewLoaded && m.versionViewErr == "" {
+			m.versionView, cmd = m.versionView.Update(msg)
+		}
+		m.viewport.SetContent(m.content())
+		return m, cmd
 	case modeAgentRevertPick:
 		versions := m.revertableVersions()
 		switch msg.String() {
@@ -366,8 +439,13 @@ func (m Model) agentDetailView() string {
 	case len(m.agentVersions) == 0:
 		b.WriteString(mutedStyle.Render("no versions") + "\n")
 	default:
-		for _, v := range m.agentVersions {
-			line := "v" + strconv.Itoa(v.Number) + "  " + versionStateColor(v.State)
+		for i, v := range m.agentVersions {
+			cursor := "  "
+			label := "v" + strconv.Itoa(v.Number)
+			if i == m.detailVersionCursor {
+				cursor, label = "▸ ", selectedRowStyle.Render(label)
+			}
+			line := cursor + label + "  " + versionStateColor(v.State)
 			if v.Name != "" {
 				line += "  " + truncate(v.Name, 48)
 			}
@@ -384,6 +462,9 @@ func (m Model) agentDetailView() string {
 	hint := "D delete  esc back"
 	if len(m.revertableVersions()) > 0 {
 		hint = "v revert  " + hint
+	}
+	if len(m.agentVersions) > 0 {
+		hint = "↑/↓ select  enter read version  " + hint
 	}
 	b.WriteString(mutedStyle.Render(hint))
 	return b.String()
