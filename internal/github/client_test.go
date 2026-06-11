@@ -36,6 +36,21 @@ func TestRepositoryExists(t *testing.T) {
 		}
 	})
 
+	t.Run("graphql could-not-resolve maps to not found", func(t *testing.T) {
+		// `gh repo view` reports a missing repo via the GraphQL resolver rather
+		// than HTTP 404; this is the phrasing that previously dead-ended the
+		// setup pickers' create offer.
+		runner := &fakeRunner{
+			results: []subprocess.Result{{Stderr: "GraphQL: Could not resolve to a Repository with the name 'o/r'. (repository)"}},
+			errs:    []error{errors.New("exit status 1")},
+		}
+		client := GhClient{Runner: runner}
+		ok, err := client.RepositoryExists(context.Background(), repo)
+		if err != nil || ok {
+			t.Fatalf("RepositoryExists = (%v, %v), want (false, nil) for could-not-resolve", ok, err)
+		}
+	})
+
 	t.Run("auth error propagates", func(t *testing.T) {
 		runner := &fakeRunner{
 			results: []subprocess.Result{{Stderr: "gh: To get started with GitHub CLI, please run: gh auth login"}},
