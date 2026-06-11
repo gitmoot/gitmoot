@@ -32,18 +32,26 @@ func TestBuildOptimizerCommandDefaultsCodexModel(t *testing.T) {
 		return args
 	}
 
-	// codex backend, empty model → optimizer model defaults to the codex model.
-	// (Target resolves to codex_exec, which uses codex's model natively, so no
-	// --target-model is injected.)
+	// codex preset, empty model → optimizer AND target default to the codex model.
+	// The preset resolves the optimizer to "codex" and the target to "codex_exec";
+	// both pass an explicit model to codex, so both need the override. The
+	// evaluator inherits the optimizer model in gitmoot-skillopt (no flag emitted).
 	args := build(skillOptTrainOptimizerRequest{Backend: "codex"})
-	if got := argValue(args, "--optimizer-model"); got != "gpt-5.5" {
-		t.Fatalf("codex+empty: --optimizer-model = %q, want gpt-5.5 (args=%v)", got, args)
+	for _, flag := range []string{"--optimizer-model", "--target-model"} {
+		if got := argValue(args, flag); got != "gpt-5.5" {
+			t.Fatalf("codex+empty: %s = %q, want gpt-5.5 (args=%v)", flag, got, args)
+		}
+	}
+	if got := argValue(args, "--evaluator-model"); got != "" {
+		t.Fatalf("evaluator should inherit the optimizer model, not get an explicit flag: %q", got)
 	}
 
-	// An explicit model still wins.
+	// An explicit model still wins for optimizer + target.
 	args = build(skillOptTrainOptimizerRequest{Backend: "codex", Model: "o3"})
-	if got := argValue(args, "--optimizer-model"); got != "o3" {
-		t.Fatalf("explicit model overridden: --optimizer-model = %q, want o3", got)
+	for _, flag := range []string{"--optimizer-model", "--target-model"} {
+		if got := argValue(args, flag); got != "o3" {
+			t.Fatalf("explicit model overridden: %s = %q, want o3", flag, got)
+		}
 	}
 
 	// A non-codex backend gets no codex-derived default.

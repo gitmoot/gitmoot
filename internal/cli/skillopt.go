@@ -8736,6 +8736,18 @@ func printSkillOptTrainRecoverResult(stdout io.Writer, result skillOptTrainRecov
 	writeLine(stdout, "next: %s", emptyText(result.NextAction))
 }
 
+// isCodexFamilyBackend reports whether a gitmoot-skillopt backend runs through
+// the codex CLI and would otherwise default to gpt-4o: the "codex" chat backend
+// (optimizer/evaluator) and the "codex_exec" target backend.
+func isCodexFamilyBackend(backend string) bool {
+	switch strings.TrimSpace(backend) {
+	case runtime.CodexRuntime, "codex_exec":
+		return true
+	default:
+		return false
+	}
+}
+
 func buildSkillOptTrainOptimizerCommand(iteration db.SkillOptTrainIteration, request skillOptTrainOptimizerRequest, paths skillOptTrainOptimizerPaths) (string, []string, error) {
 	resolvedRequest, _, err := resolveSkillOptTrainBackendRequest(request)
 	if err != nil {
@@ -8779,13 +8791,17 @@ func buildSkillOptTrainOptimizerCommand(iteration db.SkillOptTrainIteration, req
 			targetModel = model
 		}
 	}
-	// When a role runs on the codex backend with no model set, default to the
+	// When a role runs on a codex-family backend with no model set, default to the
 	// model the codex CLI is configured with. gitmoot-skillopt would otherwise
-	// fall back to gpt-4o, which a ChatGPT-account codex login rejects.
+	// fall back to gpt-4o (its OPTIMIZER/TARGET_DEPLOYMENT default), which a
+	// ChatGPT-account codex login rejects. The codex preset resolves the optimizer
+	// to "codex" and the target to "codex_exec" — both pass an explicit model to
+	// codex, so both need the override. The evaluator is left alone: it inherits
+	// the optimizer model in gitmoot-skillopt when --evaluator-model is omitted.
 	optimizerBackend := firstNonEmpty(strings.TrimSpace(request.OptimizerBackend), strings.TrimSpace(request.Backend))
 	targetBackend := firstNonEmpty(strings.TrimSpace(request.TargetBackend), strings.TrimSpace(request.Backend))
-	wantOptimizerCodexModel := optimizerModel == "" && optimizerBackend == runtime.CodexRuntime
-	wantTargetCodexModel := targetModel == "" && targetBackend == runtime.CodexRuntime
+	wantOptimizerCodexModel := optimizerModel == "" && isCodexFamilyBackend(optimizerBackend)
+	wantTargetCodexModel := targetModel == "" && isCodexFamilyBackend(targetBackend)
 	if wantOptimizerCodexModel || wantTargetCodexModel {
 		if codexModel, _ := runtime.ConfiguredCodexModel(); codexModel != "" {
 			if wantOptimizerCodexModel {
