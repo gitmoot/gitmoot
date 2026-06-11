@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jerryfane/gitmoot/internal/cli/style"
+	"github.com/jerryfane/gitmoot/internal/cli/tui"
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/skillopt"
@@ -54,6 +55,9 @@ type dashboardSnapshot struct {
 	// recent log errors for the TUI's Health page. Unexported so --json and
 	// the plain renderer stay byte-stable.
 	daemonDetail dashboardDaemonDetail
+	// configView carries the parsed config sections for the TUI's Config page.
+	// Unexported for the same byte-stability reason.
+	configView tui.ConfigView
 }
 
 // dashboardDaemonDetail is the extra daemon info the Health page shows beyond
@@ -363,6 +367,7 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 		snapshot.Daemon = dashboardDaemon{Running: false, LogFile: state.LogFile}
 	}
 	snapshot.daemonDetail = buildDashboardDaemonDetail(state)
+	snapshot.configView = buildDashboardConfigView(paths, snapshot.daemonDetail)
 
 	err := withStore(home, func(store *db.Store) error {
 		ctx := context.Background()

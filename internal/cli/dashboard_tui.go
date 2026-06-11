@@ -273,6 +273,20 @@ func dashboardTUIDeps(home string, interval time.Duration) tui.Deps {
 			}
 			return nil
 		},
+		EditConfig: func() tea.Cmd {
+			paths, err := initializedPaths(home)
+			if err != nil {
+				return func() tea.Msg { return tui.ConfigEditedMsg{Err: err} }
+			}
+			return editConfigCmd(paths.ConfigFile)
+		},
+		ValidateConfig: func() []string {
+			paths, err := initializedPaths(home)
+			if err != nil {
+				return []string{err.Error()}
+			}
+			return validateDashboardConfig(paths)
+		},
 		HealthChecks: func() ([]tui.HealthCheck, error) {
 			checks := doctor.Checker{Dir: "."}.Run(context.Background())
 			out := make([]tui.HealthCheck, 0, len(checks))
@@ -355,6 +369,7 @@ func toTUISnapshot(s dashboardSnapshot) tui.Snapshot {
 	for _, l := range s.ResourceLocks {
 		out.ResourceLocks = append(out.ResourceLocks, tui.ResourceLock{Key: l.Key, Owner: l.Owner, Stale: l.Stale})
 	}
+	out.Config = s.configView
 	for _, row := range s.jobRows {
 		out.JobRows = append(out.JobRows, tui.JobRow{
 			ID:          row.ID,
