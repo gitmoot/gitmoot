@@ -12,6 +12,65 @@ import (
 	"github.com/jerryfane/gitmoot/internal/github"
 )
 
+func TestRankedReplyYAMLRoundTrips(t *testing.T) {
+	items := []db.EvalReviewItem{{ItemID: "item-001"}}
+	assignments := map[string]githubAssignment{
+		"item-001": {blindAssignment: blindAssignment{ItemID: "item-001", Options: []blindOptionAssignment{
+			{Label: "a"}, {Label: "b"}, {Label: "c"},
+		}}},
+	}
+	tmpl, err := rankedReplyYAML("ranked-1", items, assignments)
+	if err != nil {
+		t.Fatalf("rankedReplyYAML: %v", err)
+	}
+	// The example ranking shows this item's actual labels.
+	if !strings.Contains(tmpl, "A > B > C") {
+		t.Fatalf("template missing the item's label example:\n%s", tmpl)
+	}
+
+	// A reviewer who only ranks (ties included) produces a complete, valid reply —
+	// the commented optional fields are ignored.
+	reply := strings.Replace(tmpl, "<rank best to worst, e.g. A > B > C>", "A > B = C", 1)
+	parsed, ok, err := ParseGitHubFeedbackComment("```yaml\n" + reply + "```\n")
+	if err != nil {
+		t.Fatalf("parse ranking-only reply: %v", err)
+	}
+	if !ok {
+		t.Fatalf("ranking-only reply should be accepted:\n%s", reply)
+	}
+	if parsed.RunID != "ranked-1" || len(parsed.Items) != 1 {
+		t.Fatalf("parsed = %+v", parsed)
+	}
+	entry := parsed.Items[0]
+	if entry.ItemID != "item-001" || strings.Join(entry.Ranking, ",") != "A,B,C" {
+		t.Fatalf("entry = %+v, want item-001 ranking [A B C]", entry)
+	}
+	if entry.Quality != "" || entry.ContinueMode != "" || entry.Promote != "" {
+		t.Fatalf("commented optional fields must not parse as values: %+v", entry)
+	}
+
+	// Uncommenting an optional field is honored (its trailing # hint is stripped).
+	filled := strings.Replace(reply, "    # quality: acceptable", "    quality: acceptable", 1)
+	parsedFull, ok, err := ParseGitHubFeedbackComment("```yaml\n" + filled + "```\n")
+	if err != nil || !ok {
+		t.Fatalf("filled reply parse: ok=%t err=%v", ok, err)
+	}
+	if parsedFull.Items[0].Quality != "acceptable" {
+		t.Fatalf("quality = %q, want acceptable", parsedFull.Items[0].Quality)
+	}
+
+	// Each optional is a single self-contained line, so uncommenting an inline
+	// trait map works on its own (no nested-indent footgun).
+	withTraits := strings.Replace(reply, "    # useful_traits: { A: [clear value prop] }", "    useful_traits: { A: [clear value prop] }", 1)
+	parsedTraits, ok, err := ParseGitHubFeedbackComment("```yaml\n" + withTraits + "```\n")
+	if err != nil || !ok {
+		t.Fatalf("inline traits parse: ok=%t err=%v", ok, err)
+	}
+	if got := parsedTraits.Items[0].UsefulTraits["A"]; len(got) != 1 || got[0] != "clear value prop" {
+		t.Fatalf("useful_traits = %v, want {A:[clear value prop]}", parsedTraits.Items[0].UsefulTraits)
+	}
+}
+
 func TestParseGitHubFeedbackComment(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -234,10 +293,12 @@ func TestGitHubCollectorPublishesRankedIssueBody(t *testing.T) {
 		"```yaml",
 		"run_id: ranked-1",
 		"item_id: item-001",
-		"<replace with ranked option labels, e.g. A > B > C > D>",
-		"quality: \"\"",
-		"continue_mode: \"\"",
-		"promote: \"\"",
+		"<rank best to worst, e.g. A > B > C > D>",
+		"# Minimum reply: set `ranking`",
+		"# quality: acceptable",
+		"poor | acceptable | strong",
+		"explore | refine | distill | validate",
+		"If you only do one thing: rank",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("ranked issue body missing %q:\n%s", want, body)
