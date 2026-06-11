@@ -358,9 +358,9 @@ func (c *GhClient) ListUserRepositories(ctx context.Context, limit int) ([]RepoS
 }
 
 // RepositoryExists reports whether the repo is visible to the authenticated gh
-// user. A 404 (or "not found") maps to (false, nil); any other error (auth,
-// network, rate limit) propagates so callers never offer to create a repo on an
-// ambiguous failure.
+// user. A 404, "not found", or the GraphQL "could not resolve to a repository"
+// phrasing maps to (false, nil); any other error (auth, network, rate limit)
+// propagates so callers never offer to create a repo on an ambiguous failure.
 func (c *GhClient) RepositoryExists(ctx context.Context, repo Repository) (bool, error) {
 	if strings.TrimSpace(repo.FullName()) == "" {
 		return false, fmt.Errorf("repository owner/name is required")
@@ -850,7 +850,15 @@ func isRateLimit(result subprocess.Result) bool {
 
 func isNotFound(result subprocess.Result) bool {
 	text := strings.ToLower(result.Stdout + "\n" + result.Stderr)
-	return strings.Contains(text, "http 404") || strings.Contains(text, "not found")
+	// `gh repo view` reports a missing repo via the GraphQL resolver phrasing
+	// rather than an HTTP 404 ("Could not resolve to a Repository with the
+	// name 'owner/name'"). gh uses the same phrasing for repos that exist but
+	// the token cannot see (private/org/EMU); treating those as "not found"
+	// is safe because the follow-up `gh repo create` then fails loudly with
+	// "name already exists" instead of leaving the caller dead-ended.
+	return strings.Contains(text, "http 404") ||
+		strings.Contains(text, "not found") ||
+		strings.Contains(text, "could not resolve to a repository")
 }
 
 func isNoChecks(result subprocess.Result) bool {
