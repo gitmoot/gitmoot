@@ -22,6 +22,7 @@ const (
 	pageJobs
 	pageLocks
 	pageHealth
+	pageConfig
 )
 
 // label is the (short) sidebar entry; title is the page heading. The sidebar
@@ -38,6 +39,7 @@ var pages = []struct {
 	{pageJobs, "Jobs", "Jobs"},
 	{pageLocks, "Locks", "Locks"},
 	{pageHealth, "Health", "Health"},
+	{pageConfig, "Config", "Config"},
 }
 
 // mode is the interaction mode; modeNormal navigates pages, the others are
@@ -107,6 +109,10 @@ type Model struct {
 	healthLoaded  bool
 	healthLoading bool
 	healthErr     string
+
+	// Config page state.
+	configProblems []string // validation problems after an edit (empty = valid)
+	configEditErr  string   // the editor itself failed to launch/run
 
 	// Trains page action state.
 	pendingRepos []string // gitmoot-created repos offered for cleanup after a delete
@@ -331,6 +337,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.agentErr = ""
 				return m, openAgentOptimizeCmd(m.deps, agent)
 			}
+		case "e":
+			if pages[m.selected].page == pageConfig && m.deps.EditConfig != nil {
+				m.configEditErr = ""
+				m.configProblems = nil
+				// tea.ExecProcess suspends the program for the editor; the
+				// result returns as a ConfigEditedMsg.
+				return m, m.deps.EditConfig()
+			}
 		case "?":
 			m.showHelp = !m.showHelp
 			m.viewport.SetContent(m.content())
@@ -397,6 +411,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.healthErr = ""
 			m.healthChecks = msg.checks
+		}
+	case ConfigEditedMsg:
+		if msg.Err != nil {
+			m.configEditErr = msg.Err.Error()
+		} else {
+			m.configEditErr = ""
+			// Validate the edited file and reload so the page shows the new
+			// content; problems render inline until the next clean edit.
+			if m.deps.ValidateConfig != nil {
+				m.configProblems = m.deps.ValidateConfig()
+			}
+			if cmd := m.queueLoad(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 		}
 	case trainStopMsg:
 		if m.mode == modeTrainStopReason {

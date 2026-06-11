@@ -112,6 +112,8 @@ func (m Model) content() string {
 			b.WriteString(m.locksContent())
 		case pageHealth:
 			b.WriteString(m.healthContent())
+		case pageConfig:
+			b.WriteString(m.configContent())
 		}
 	}
 	b.WriteString("\n\n")
@@ -156,6 +158,10 @@ func (m Model) helpContent() string {
 		b.WriteString("daemon state + flags, then environment checks\n")
 		b.WriteString("r    re-run the environment checks\n")
 		b.WriteString("s    start the daemon when it is stopped\n")
+	case pageConfig:
+		b.WriteString("the parsed config sections (read-only here)\n")
+		b.WriteString("e    edit config.toml in $EDITOR; re-validated on return\n")
+		b.WriteString("     structural edits (add/remove agent types) stay in the editor\n")
 	default:
 		b.WriteString("j/k or wheel  scroll\n")
 	}
@@ -206,6 +212,8 @@ func (m Model) footerHelp() string {
 		return "tab/←→ page  ↑/↓ select  enter detail  R retry  c cancel  ? help  q quit"
 	case pageHealth:
 		return "tab/←→ page  r re-run checks  s start daemon  ? help  q quit"
+	case pageConfig:
+		return "tab/←→ page  e edit in $EDITOR  ? help  q quit"
 	}
 	return "tab/←→ page  j/k or wheel scroll  r refresh  q quit"
 }

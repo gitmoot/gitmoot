@@ -30,6 +30,7 @@ type Snapshot struct {
 	ResourceLocks  []ResourceLock
 	Prompts        []db.InteractivePrompt
 	JobRows        []JobRow
+	Config         ConfigView
 }
 
 // Daemon mirrors cli.dashboardDaemon.
@@ -45,6 +46,23 @@ type Daemon struct {
 	WorkDir   string
 	StartedAt string
 	LogErrors []string // tail of recent error-ish lines from the daemon log
+}
+
+// ConfigView is the parsed config the Config page renders.
+type ConfigView struct {
+	Path     string
+	Sections []ConfigSection
+}
+
+// ConfigSection is one titled group of key/value rows on the Config page.
+type ConfigSection struct {
+	Title string
+	Rows  [][]string // each row is {key, value}
+}
+
+// ConfigEditedMsg is delivered when the external editor (Deps.EditConfig) exits.
+type ConfigEditedMsg struct {
+	Err error
 }
 
 // HealthCheck is one environment/runtime diagnostic for the Health page.
@@ -182,6 +200,13 @@ type Deps struct {
 	// page. It shells out (gh/codex/claude version calls), so it is dispatched
 	// lazily on first open and on r, never on the refresh tick.
 	HealthChecks func() ([]HealthCheck, error)
+
+	// EditConfig opens the config file in $EDITOR and returns a command whose
+	// completion delivers a ConfigEditedMsg (it is a tea.ExecProcess, which
+	// suspends the program for the editor). ValidateConfig re-parses the file
+	// and returns human-readable problems (empty when valid).
+	EditConfig     func() tea.Cmd
+	ValidateConfig func() []string
 }
 
 // TemplateVersion is one row of a template's version history.
