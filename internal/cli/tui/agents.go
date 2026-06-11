@@ -43,6 +43,63 @@ func (m *Model) openAgentDelete(agent Agent) {
 	m.mode = modeConfirmAgentDelete
 }
 
+// agentRuntimeOptions are the runtimes an agent can be switched between.
+var agentRuntimeOptions = []string{"codex", "claude"}
+
+// openAgentRuntimePick enters the switch-runtime overlay, preselecting the
+// agent's current runtime.
+func (m *Model) openAgentRuntimePick(agent Agent) {
+	m.activeAgent = agent
+	m.actionErr = ""
+	m.actionBusy = false
+	m.runtimePickCursor = 0
+	for i, rt := range agentRuntimeOptions {
+		if rt == agent.Runtime {
+			m.runtimePickCursor = i
+			break
+		}
+	}
+	m.mode = modeAgentRuntimePick
+}
+
+func agentSetRuntimeCmd(deps Deps, name, runtime string) tea.Cmd {
+	return func() tea.Msg {
+		if deps.SetAgentRuntime == nil {
+			return agentActionMsg{verb: "runtime"}
+		}
+		return agentActionMsg{verb: "runtime", err: deps.SetAgentRuntime(name, runtime)}
+	}
+}
+
+// agentRuntimePickView renders the switch-runtime choice overlay.
+func (m Model) agentRuntimePickView() string {
+	var b strings.Builder
+	b.WriteString(headerStyle.Render("switch runtime · " + m.activeAgent.Name))
+	b.WriteString("\n\n")
+	b.WriteString(mutedStyle.Render("Pick the runtime this agent runs on. The warm session resets; the next job starts fresh."))
+	b.WriteString("\n\n")
+	for i, rt := range agentRuntimeOptions {
+		cursor, label := "  ", rt
+		if i == m.runtimePickCursor {
+			cursor, label = "▸ ", selectedRowStyle.Render(rt)
+		}
+		if rt == m.activeAgent.Runtime {
+			label += "  " + mutedStyle.Render("(current)")
+		}
+		b.WriteString(cursor + label + "\n")
+	}
+	if m.actionErr != "" {
+		b.WriteString("\n" + errorStyle.Render(m.actionErr) + "\n")
+	}
+	b.WriteString("\n")
+	if m.actionBusy {
+		b.WriteString(mutedStyle.Render("switching…"))
+	} else {
+		b.WriteString(mutedStyle.Render("↑/↓ pick  enter apply  esc cancel"))
+	}
+	return b.String()
+}
+
 // openVersionView opens the preview pager for a template version, reusing the
 // cache when it already holds this version's content (the train-run skill-pager
 // pattern, keyed by version id).
@@ -144,6 +201,40 @@ func (m Model) updateAgentOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.viewport.SetContent(m.content())
 		return m, cmd
+	case modeAgentRuntimePick:
+		switch msg.String() {
+		case "esc", "q":
+			if m.actionBusy {
+				return m, nil
+			}
+			m.mode = modeNormal
+			m.actionErr = ""
+		case "up", "k":
+			if m.runtimePickCursor > 0 {
+				m.runtimePickCursor--
+			}
+		case "down", "j":
+			if m.runtimePickCursor < len(agentRuntimeOptions)-1 {
+				m.runtimePickCursor++
+			}
+		case "enter":
+			if m.actionBusy {
+				return m, nil
+			}
+			runtime := agentRuntimeOptions[m.runtimePickCursor]
+			if runtime == m.activeAgent.Runtime {
+				// Nothing to change; just close.
+				m.mode = modeNormal
+				m.actionErr = ""
+				break
+			}
+			m.actionBusy = true
+			m.actionErr = ""
+			m.viewport.SetContent(m.content())
+			return m, agentSetRuntimeCmd(m.deps, m.activeAgent.Name, runtime)
+		}
+		m.viewport.SetContent(m.content())
+		return m, nil
 	case modeAgentRevertPick:
 		versions := m.revertableVersions()
 		switch msg.String() {

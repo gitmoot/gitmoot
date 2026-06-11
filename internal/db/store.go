@@ -632,6 +632,30 @@ func (s *Store) UpsertAgent(ctx context.Context, agent Agent) error {
 	return tx.Commit()
 }
 
+// UpdateAgentRuntime switches a registered agent's runtime (codex or claude),
+// preserving its role, capabilities, repo scope, template, and policy. The warm
+// runtime_ref is cleared because it is bound to the old runtime — the next job
+// starts a fresh session for the new runtime. The old agent_instance, if any,
+// idle-expires on its own.
+func (s *Store) UpdateAgentRuntime(ctx context.Context, name, runtime string) error {
+	runtime = strings.TrimSpace(runtime)
+	if runtime != "codex" && runtime != "claude" {
+		return fmt.Errorf("unknown runtime %q (want codex or claude)", runtime)
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, capabilities_json, autonomy_policy, health_status
+		FROM agents WHERE name = ?`, name)
+	agent, err := scanAgent(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("agent %q is not registered", name)
+	}
+	if err != nil {
+		return err
+	}
+	agent.Runtime = runtime
+	agent.RuntimeRef = ""
+	return s.UpsertAgent(ctx, agent)
+}
+
 func (s *Store) GetAgent(ctx context.Context, name string) (Agent, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, capabilities_json, autonomy_policy, health_status
 		FROM agents WHERE name = ?`, name)

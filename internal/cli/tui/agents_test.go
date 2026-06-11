@@ -178,6 +178,80 @@ func TestAgentVersionPreviewCachesPerVersion(t *testing.T) {
 	}
 }
 
+func TestAgentSwitchRuntimeFlow(t *testing.T) {
+	var got []string
+	deps := Deps{SetAgentRuntime: func(name, runtime string) error {
+		got = []string{name, runtime}
+		return nil
+	}}
+	m := agentsModel(t, deps, agentsSnapshot())
+	// planner (claude) is under the cursor; e opens the runtime picker.
+	next, _ := m.Update(key("e"))
+	m = next.(Model)
+	if m.mode != modeAgentRuntimePick {
+		t.Fatalf("e should open the runtime picker, mode=%v", m.mode)
+	}
+	// Cursor preselects the current runtime (claude, index 1). Move up to codex.
+	if m.runtimePickCursor != 1 {
+		t.Fatalf("picker should preselect the current runtime, cursor=%d", m.runtimePickCursor)
+	}
+	next, _ = m.Update(key("k"))
+	m = next.(Model)
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("enter on a different runtime should apply it")
+	}
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+	if len(got) != 2 || got[0] != "planner" || got[1] != "codex" {
+		t.Fatalf("SetAgentRuntime called with %v, want [planner codex]", got)
+	}
+	if m.mode != modeNormal {
+		t.Fatalf("a successful switch should close the overlay, mode=%v", m.mode)
+	}
+}
+
+func TestAgentSwitchRuntimeNoChangeCloses(t *testing.T) {
+	deps := Deps{SetAgentRuntime: func(string, string) error {
+		t.Fatal("picking the current runtime must not call SetAgentRuntime")
+		return nil
+	}}
+	m := agentsModel(t, deps, agentsSnapshot())
+	next, _ := m.Update(key("e"))
+	m = next.(Model)
+	// Enter on the preselected (current) runtime is a no-op close.
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if cmd != nil {
+		t.Fatal("re-picking the current runtime should not issue a command")
+	}
+	if m.mode != modeNormal {
+		t.Fatalf("no-op pick should close the overlay, mode=%v", m.mode)
+	}
+}
+
+func TestAgentSwitchRuntimeErrorStaysOpen(t *testing.T) {
+	deps := Deps{SetAgentRuntime: func(string, string) error {
+		return errors.New("unknown runtime")
+	}}
+	m := agentsModel(t, deps, agentsSnapshot())
+	next, _ := m.Update(key("e"))
+	m = next.(Model)
+	next, _ = m.Update(key("k")) // claude → codex
+	m = next.(Model)
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+	if m.mode != modeAgentRuntimePick {
+		t.Fatalf("a failed switch should keep the overlay open, mode=%v", m.mode)
+	}
+	if !strings.Contains(m.View(), "unknown runtime") {
+		t.Fatalf("the error should render in the overlay:\n%s", m.View())
+	}
+}
+
 func TestAgentCreateFlowRunsCreateAgent(t *testing.T) {
 	var created []string
 	form := NewAgentCreateForm(newFakeStore(), []Choice{{Value: "planner-tpl", Label: "planner"}})

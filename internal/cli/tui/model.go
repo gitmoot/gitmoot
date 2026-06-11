@@ -64,6 +64,7 @@ const (
 	modeConfirmAgentRevert
 	modeConfirmAgentDelete
 	modeAgentVersionView
+	modeAgentRuntimePick
 	modeConfigEdit
 )
 
@@ -139,6 +140,7 @@ type Model struct {
 	versionCursor       int               // selected row in the revert pick list
 	revertVersion       TemplateVersion   // version being confirmed for revert
 	detailVersionCursor int               // selected version row in the agent detail
+	runtimePickCursor   int               // selected runtime in the switch-runtime overlay
 	activeAgentVersion  TemplateVersion   // version shown in the content pager
 	versionView         viewport.Model    // pager for a version's content
 	versionViewID       string            // version id the pager content belongs to
@@ -204,7 +206,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			return m.updateTrainOverlay(msg)
-		case modeAgentDetail, modeAgentRevertPick, modeConfirmAgentRevert, modeConfirmAgentDelete, modeAgentVersionView:
+		case modeAgentDetail, modeAgentRevertPick, modeConfirmAgentRevert, modeConfirmAgentDelete, modeAgentVersionView, modeAgentRuntimePick:
 			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
 			}
@@ -380,6 +382,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, openAgentOptimizeCmd(m.deps, agent)
 			}
 		case "e":
+			if agent, ok := m.agentUnderCursor(); ok && m.deps.SetAgentRuntime != nil {
+				m.openAgentRuntimePick(agent)
+				m.viewport.SetContent(m.content())
+				return m, tea.Batch(cmds...)
+			}
 			if pages[m.selected].page == pageConfig && m.deps.EditConfig != nil {
 				m.configEditErr = ""
 				m.configProblems = nil
@@ -612,6 +619,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "delete":
 			if m.mode == modeConfirmAgentDelete {
+				m.actionBusy = false
+				if msg.err != nil {
+					m.actionErr = msg.err.Error()
+				} else {
+					m.mode = modeNormal
+					m.actionErr = ""
+				}
+			}
+		case "runtime":
+			if m.mode == modeAgentRuntimePick {
 				m.actionBusy = false
 				if msg.err != nil {
 					m.actionErr = msg.err.Error()

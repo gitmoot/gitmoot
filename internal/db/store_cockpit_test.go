@@ -207,6 +207,53 @@ func TestDeleteAgentChecked(t *testing.T) {
 	}
 }
 
+func TestUpdateAgentRuntime(t *testing.T) {
+	store := openCockpitStore(t)
+	ctx := context.Background()
+	original := Agent{
+		Name:           "worker",
+		Role:           "implement",
+		Runtime:        "codex",
+		RuntimeRef:     "sess-abc",
+		RepoScope:      "owner/repo",
+		TemplateID:     "worker-tpl",
+		Capabilities:   []string{"implement", "review"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}
+	if err := store.UpsertAgent(ctx, original); err != nil {
+		t.Fatalf("upsert agent: %v", err)
+	}
+
+	// Unknown runtime is rejected, leaving the row untouched.
+	if err := store.UpdateAgentRuntime(ctx, "worker", "gpt"); err == nil || !strings.Contains(err.Error(), "unknown runtime") {
+		t.Fatalf("expected unknown-runtime error, got %v", err)
+	}
+	// Missing agent errors.
+	if err := store.UpdateAgentRuntime(ctx, "ghost", "claude"); err == nil || !strings.Contains(err.Error(), "not registered") {
+		t.Fatalf("expected not-registered error, got %v", err)
+	}
+
+	if err := store.UpdateAgentRuntime(ctx, "worker", "claude"); err != nil {
+		t.Fatalf("switch runtime: %v", err)
+	}
+	got, err := store.GetAgent(ctx, "worker")
+	if err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	if got.Runtime != "claude" {
+		t.Fatalf("runtime = %q, want claude", got.Runtime)
+	}
+	if got.RuntimeRef != "" {
+		t.Fatalf("runtime_ref = %q, want cleared", got.RuntimeRef)
+	}
+	// Everything else preserved.
+	if got.Role != "implement" || got.RepoScope != "owner/repo" || got.TemplateID != "worker-tpl" ||
+		got.AutonomyPolicy != "auto" || strings.Join(got.Capabilities, ",") != "implement,review" {
+		t.Fatalf("switch runtime altered preserved fields: %+v", got)
+	}
+}
+
 func TestLatestJobEvents(t *testing.T) {
 	store := openCockpitStore(t)
 	ctx := context.Background()

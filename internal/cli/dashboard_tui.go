@@ -274,6 +274,11 @@ func dashboardTUIDeps(home string, interval time.Duration) tui.Deps {
 				return err
 			})
 		},
+		SetAgentRuntime: func(name, runtimeName string) error {
+			return withStore(home, func(store *db.Store) error {
+				return store.UpdateAgentRuntime(context.Background(), name, runtimeName)
+			})
+		},
 		OpenAgentOptimize: func(agent tui.Agent) (tea.Model, error) {
 			// Same lifetime pattern as the create form: one store for the
 			// form's 200ms poll, closed from the Done hook.

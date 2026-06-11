@@ -98,6 +98,8 @@ func (m Model) content() string {
 		b.WriteString(m.agentDeleteConfirmView())
 	case modeAgentVersionView:
 		b.WriteString(m.agentVersionView())
+	case modeAgentRuntimePick:
+		b.WriteString(m.agentRuntimePickView())
 	case modeConfigEdit:
 		b.WriteString(m.configEditView())
 	default:
@@ -204,6 +206,8 @@ func (m Model) footerHelp() string {
 		return "v revert  D delete  esc back"
 	case modeAgentRevertPick:
 		return "↑/↓ pick  enter confirm  esc back"
+	case modeAgentRuntimePick:
+		return "↑/↓ pick  enter apply  esc cancel"
 	case modeConfirmAgentRevert, modeConfirmAgentDelete:
 		return "y confirm  n/esc cancel"
 	case modeConfigEdit:
@@ -217,7 +221,7 @@ func (m Model) footerHelp() string {
 	case pageTrains:
 		return "tab/←→ page  ↑/↓ select  enter open  s stop  d delete  ? help  q quit"
 	case pageAgents:
-		return "tab/←→ page  ↑/↓ select  enter detail  n new  o optimize  D delete  ? help  q quit"
+		return "tab/←→ page  ↑/↓ select  enter detail  n new  o optimize  e runtime  D delete  ? help  q quit"
 	case pageSessions:
 		return "tab/←→ page  ↑/↓ select  enter detail  ? help  q quit"
 	case pageJobs:
