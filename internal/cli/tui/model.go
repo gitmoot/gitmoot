@@ -768,7 +768,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clampPromptCursor()
 			m.clampTrainCursor()
 			m.clampJobCursor()
-			m.agentCursor = clampCursor(m.agentCursor, len(m.snap.Agents))
+			m.agentCursor = clampCursor(m.agentCursor, len(m.visibleAgents()))
 			m.sessionCursor = clampCursor(m.sessionCursor, len(m.sessionRows()))
 			m.configCursor = clampCursor(m.configCursor, len(m.configEditableFields()))
 			// A cancel-requested job that has settled no longer needs the
@@ -889,7 +889,7 @@ func (m *Model) pageCursor() (*int, int) {
 	case pageTrains:
 		return &m.trainCursor, len(m.snap.Trains)
 	case pageAgents:
-		return &m.agentCursor, len(m.snap.Agents)
+		return &m.agentCursor, len(m.visibleAgents())
 	case pageSessions:
 		return &m.sessionCursor, len(m.sessionRows())
 	case pageJobs:
