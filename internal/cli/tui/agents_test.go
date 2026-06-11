@@ -72,6 +72,112 @@ func TestAgentDetailRendersVersionsAndJobs(t *testing.T) {
 	}
 }
 
+// openAgentVersionDetail opens the agent detail and loads its versions, leaving
+// the model on modeAgentDetail with the cursor on the first (current) version.
+func openAgentVersionDetail(t *testing.T, deps Deps) Model {
+	t.Helper()
+	if deps.TemplateVersions == nil {
+		deps.TemplateVersions = func(string) ([]TemplateVersion, error) {
+			return []TemplateVersion{
+				{ID: "v2-id", Number: 2, State: "current", Name: "improved"},
+				{ID: "v1-id", Number: 1, State: "superseded", Name: "initial"},
+			}, nil
+		}
+	}
+	m := agentsModel(t, deps, agentsSnapshot())
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if cmd != nil {
+		next, _ = m.Update(cmd())
+		m = next.(Model)
+	}
+	if m.mode != modeAgentDetail {
+		t.Fatalf("expected modeAgentDetail, got %v", m.mode)
+	}
+	return m
+}
+
+func TestAgentVersionPreviewLoadsAndRenders(t *testing.T) {
+	var asked string
+	deps := Deps{TemplateVersionContent: func(versionID string) (string, error) {
+		asked = versionID
+		return "You are the planner.\nThink step by step.", nil
+	}}
+	m := openAgentVersionDetail(t, deps)
+	// enter opens the version under the cursor (the current one, v2).
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if m.mode != modeAgentVersionView || cmd == nil {
+		t.Fatalf("enter should open the version pager, mode=%v", m.mode)
+	}
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+	if asked != "v2-id" {
+		t.Fatalf("TemplateVersionContent asked for %q, want v2-id", asked)
+	}
+	view := m.View()
+	for _, want := range []string{"version v2", "planner-tpl", "You are the planner."} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("version view missing %q:\n%s", want, view)
+		}
+	}
+	// esc returns to the detail.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	if m.mode != modeAgentDetail {
+		t.Fatalf("esc should return to the detail, got %v", m.mode)
+	}
+}
+
+func TestAgentVersionPreviewEmptyContent(t *testing.T) {
+	deps := Deps{TemplateVersionContent: func(string) (string, error) { return "   \n", nil }}
+	m := openAgentVersionDetail(t, deps)
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+	if !strings.Contains(m.View(), "no content") {
+		t.Fatalf("blank version should show a no-content state:\n%s", m.View())
+	}
+}
+
+func TestAgentVersionPreviewCachesPerVersion(t *testing.T) {
+	calls := map[string]int{}
+	deps := Deps{TemplateVersionContent: func(versionID string) (string, error) {
+		calls[versionID]++
+		return "content of " + versionID, nil
+	}}
+	m := openAgentVersionDetail(t, deps)
+	// Open v2 (cursor 0), load, back out.
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	// Re-open the same version: cache hit, no command, no second fetch.
+	next, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if cmd != nil {
+		t.Fatal("re-opening the same version should hit the cache (no command)")
+	}
+	// Move the cursor to v1 and open: a different id must fetch.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	next, _ = m.Update(key("j"))
+	m = next.(Model)
+	next, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("a different version should fetch its content")
+	}
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+	if calls["v2-id"] != 1 || calls["v1-id"] != 1 {
+		t.Fatalf("expected one fetch per version, got %v", calls)
+	}
+}
+
 func TestAgentCreateFlowRunsCreateAgent(t *testing.T) {
 	var created []string
 	form := NewAgentCreateForm(newFakeStore(), []Choice{{Value: "planner-tpl", Label: "planner"}})

@@ -62,6 +62,7 @@ const (
 	modeAgentRevertPick
 	modeConfirmAgentRevert
 	modeConfirmAgentDelete
+	modeAgentVersionView
 	modeConfigEdit
 )
 
@@ -131,6 +132,12 @@ type Model struct {
 	agentVersionsErr    string            // error from the version load
 	versionCursor       int               // selected row in the revert pick list
 	revertVersion       TemplateVersion   // version being confirmed for revert
+	detailVersionCursor int               // selected version row in the agent detail
+	activeAgentVersion  TemplateVersion   // version shown in the content pager
+	versionView         viewport.Model    // pager for a version's content
+	versionViewID       string            // version id the pager content belongs to
+	versionViewErr      string            //
+	versionViewLoaded   bool              //
 	agentErr            string            // inline error on the Agents page (e.g. create failed)
 	optimizeBusy        bool              // a train session is being scaffolded/started
 	formPending         bool              // a form push is in flight; suppress re-dispatch
@@ -173,6 +180,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.width = msg.Width
 			m.height = msg.Height
 			m.resizeViewport()
+			if m.versionViewLoaded {
+				m.versionView.Width = max(20, m.width-4)
+				m.versionView.Height = max(5, m.height-6)
+			}
 		}
 	case tea.KeyMsg:
 		// Modal overlays capture keys first; only ctrl+c stays global.
@@ -187,7 +198,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			return m.updateTrainOverlay(msg)
-		case modeAgentDetail, modeAgentRevertPick, modeConfirmAgentRevert, modeConfirmAgentDelete:
+		case modeAgentDetail, modeAgentRevertPick, modeConfirmAgentRevert, modeConfirmAgentDelete, modeAgentVersionView:
 			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
 			}
@@ -529,6 +540,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.agentVersionsErr = ""
 				m.agentVersions = msg.versions
+				m.detailVersionCursor = clampCursor(m.detailVersionCursor, len(msg.versions))
+			}
+		}
+	case versionContentMsg:
+		if msg.versionID == m.versionViewID {
+			m.versionViewLoaded = true
+			if msg.err != nil {
+				m.versionViewErr = msg.err.Error()
+			} else {
+				m.versionViewErr = ""
+				content := msg.content
+				if strings.TrimSpace(content) == "" {
+					content = mutedStyle.Render("(no content)")
+				}
+				m.versionView = viewport.New(max(20, m.width-4), max(5, m.height-6))
+				m.versionView.SetContent(content)
 			}
 		}
 	case agentFormResultMsg:
