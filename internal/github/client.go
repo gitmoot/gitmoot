@@ -22,6 +22,7 @@ type Client interface {
 	Preflight(ctx context.Context, repo Repository) error
 	RepositoryExists(ctx context.Context, repo Repository) (bool, error)
 	CreateRepository(ctx context.Context, repo Repository, private bool) error
+	CloneRepository(ctx context.Context, repo Repository, dir string) error
 	DeleteRepository(ctx context.Context, repo Repository) error
 	ListUserRepositories(ctx context.Context, limit int) ([]RepoSummary, error)
 	ListPullRequests(ctx context.Context, repo Repository, state string) ([]PullRequest, error)
@@ -385,7 +386,23 @@ func (c *GhClient) CreateRepository(ctx context.Context, repo Repository, privat
 	if private {
 		visibility = "--private"
 	}
-	_, err := c.run(ctx, true, "repo", "create", repo.FullName(), visibility)
+	// --add-readme gives the new repo an initial commit and a default branch, so
+	// it is immediately clonable into a usable checkout (gitmoot only creates
+	// repos for its own workflows, where an empty repo is never useful).
+	_, err := c.run(ctx, true, "repo", "create", repo.FullName(), visibility, "--add-readme")
+	return err
+}
+
+// CloneRepository clones repo into dir via `gh repo clone`. dir must not already
+// exist (gh refuses to clone into a non-empty target).
+func (c *GhClient) CloneRepository(ctx context.Context, repo Repository, dir string) error {
+	if strings.TrimSpace(repo.FullName()) == "" {
+		return fmt.Errorf("repository owner/name is required")
+	}
+	if strings.TrimSpace(dir) == "" {
+		return fmt.Errorf("clone destination is required")
+	}
+	_, err := c.run(ctx, false, "repo", "clone", repo.FullName(), dir)
 	return err
 }
 
@@ -950,6 +967,10 @@ func (NoopClient) RepositoryExists(context.Context, Repository) (bool, error) {
 }
 
 func (NoopClient) CreateRepository(context.Context, Repository, bool) error {
+	return nil
+}
+
+func (NoopClient) CloneRepository(context.Context, Repository, string) error {
 	return nil
 }
 

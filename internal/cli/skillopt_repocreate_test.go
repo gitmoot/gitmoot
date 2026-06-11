@@ -3,19 +3,26 @@ package cli
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/jerryfane/gitmoot/internal/config"
+	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/github"
 )
 
 // repoCreateFakeGitHub reports configured repos as missing and records creates.
+// CloneRepository lays down a real local git checkout (origin + an initial commit
+// on a branch) so repoRecordForCheckout validates the provisioned repo.
 type repoCreateFakeGitHub struct {
 	github.NoopClient
 	existing map[string]bool
 	created  []string
+	cloned   []string
 	existErr error
 }
 
@@ -33,6 +40,27 @@ func (f *repoCreateFakeGitHub) CreateRepository(_ context.Context, repo github.R
 	}
 	f.existing[repo.FullName()] = true
 	return nil
+}
+
+func (f *repoCreateFakeGitHub) CloneRepository(_ context.Context, repo github.Repository, dir string) error {
+	f.cloned = append(f.cloned, repo.FullName()+" -> "+dir)
+	run := func(args ...string) error {
+		cmd := exec.Command("git", args...)
+		cmd.Env = append(cmd.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("git %s: %v: %s", strings.Join(args, " "), err, out)
+		}
+		return nil
+	}
+	if err := run("init", "-b", "main", dir); err != nil {
+		return err
+	}
+	if err := run("-C", dir, "remote", "add", "origin", "https://github.com/"+repo.FullName()+".git"); err != nil {
+		return err
+	}
+	return run("-C", dir, "commit", "--allow-empty", "-m", "init")
 }
 
 func replaceSkillOptGitHubClient(client github.Client) func() {
@@ -116,11 +144,75 @@ func TestSkillOptTrainRepoCheckerAndCreator(t *testing.T) {
 		t.Fatal("unparseable repo should error")
 	}
 
-	create := skillOptTrainRepoCreator()
+	home := t.TempDir()
+	if err := config.Initialize(config.PathsForHome(home)); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	create := skillOptTrainRepoCreator(home)
 	if err := create("o/new"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if len(fake.created) != 1 || fake.created[0] != "o/new" {
 		t.Fatalf("created = %v", fake.created)
+	}
+}
+
+func TestProvisionTrainGenerationRepo(t *testing.T) {
+	home := t.TempDir()
+	if err := config.Initialize(config.PathsForHome(home)); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	fake := &repoCreateFakeGitHub{}
+	restore := replaceSkillOptGitHubClient(fake)
+	defer restore()
+
+	repo, err := daemon.ParseRepository("o/fresh")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if err := provisionTrainGenerationRepo(context.Background(), home, repo); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	if len(fake.created) != 1 || len(fake.cloned) != 1 {
+		t.Fatalf("expected one create + one clone, got created=%v cloned=%v", fake.created, fake.cloned)
+	}
+
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	// Registered with a checkout under the gitmoot-managed checkouts dir.
+	got, err := store.GetRepo(ctx, "o/fresh")
+	if err != nil {
+		t.Fatalf("get repo: %v", err)
+	}
+	wantPrefix := filepath.Join(config.PathsForHome(home).Home, "checkouts", "o", "fresh")
+	if got.CheckoutPath != wantPrefix {
+		t.Fatalf("checkout path = %q, want %q", got.CheckoutPath, wantPrefix)
+	}
+	// Recorded for cleanup.
+	records, err := store.ListCreatedReposForSession(ctx, "")
+	if err != nil {
+		t.Fatalf("list created: %v", err)
+	}
+	found := false
+	for _, r := range records {
+		if r.Repo == "o/fresh" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("o/fresh should be recorded as created: %+v", records)
+	}
+
+	// Idempotent: a second provision reuses the existing checkout (no second clone).
+	if err := provisionTrainGenerationRepo(ctx, home, repo); err != nil {
+		t.Fatalf("re-provision: %v", err)
+	}
+	if len(fake.cloned) != 1 {
+		t.Fatalf("re-provision should not clone again: %v", fake.cloned)
 	}
 }

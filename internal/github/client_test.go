@@ -80,7 +80,7 @@ func TestCreateRepository(t *testing.T) {
 		if err := client.CreateRepository(context.Background(), repo, true); err != nil {
 			t.Fatalf("CreateRepository: %v", err)
 		}
-		runner.wantArgs(t, 0, "repo", "create", "o/r", "--private")
+		runner.wantArgs(t, 0, "repo", "create", "o/r", "--private", "--add-readme")
 	})
 
 	t.Run("public", func(t *testing.T) {
@@ -89,7 +89,7 @@ func TestCreateRepository(t *testing.T) {
 		if err := client.CreateRepository(context.Background(), repo, false); err != nil {
 			t.Fatalf("CreateRepository: %v", err)
 		}
-		runner.wantArgs(t, 0, "repo", "create", "o/r", "--public")
+		runner.wantArgs(t, 0, "repo", "create", "o/r", "--public", "--add-readme")
 	})
 
 	t.Run("error propagates", func(t *testing.T) {
@@ -100,6 +100,26 @@ func TestCreateRepository(t *testing.T) {
 		client := GhClient{Runner: runner}
 		if err := client.CreateRepository(context.Background(), repo, true); err == nil {
 			t.Fatal("expected error to propagate")
+		}
+	})
+}
+
+func TestCloneRepository(t *testing.T) {
+	repo := Repository{Owner: "o", Name: "r"}
+
+	t.Run("clones to dir", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{{}}}
+		client := GhClient{Runner: runner}
+		if err := client.CloneRepository(context.Background(), repo, "/tmp/o-r"); err != nil {
+			t.Fatalf("CloneRepository: %v", err)
+		}
+		runner.wantArgs(t, 0, "repo", "clone", "o/r", "/tmp/o-r")
+	})
+
+	t.Run("requires a destination", func(t *testing.T) {
+		client := GhClient{Runner: &fakeRunner{results: []subprocess.Result{{}}}}
+		if err := client.CloneRepository(context.Background(), repo, ""); err == nil {
+			t.Fatal("expected an error for an empty destination")
 		}
 	})
 }

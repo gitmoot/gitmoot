@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,8 +15,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/jerryfane/gitmoot/internal/cli/tui"
+	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/github"
 	"github.com/jerryfane/gitmoot/internal/skillopt"
 )
 
@@ -39,7 +42,7 @@ var runSkillOptTrainInitTUI = runSkillOptTrainInitTUIImpl
 
 func runSkillOptTrainInitTUIImpl(home, scope string, stdout io.Writer, values *skillOptTrainInitInputs, missing []string) error {
 	return withStore(home, func(store *db.Store) error {
-		fields, err := buildSkillOptTrainInitTUIFields(store, scope, *values, missing)
+		fields, err := buildSkillOptTrainInitTUIFields(store, home, scope, *values, missing)
 		if err != nil {
 			return err
 		}
@@ -71,7 +74,7 @@ func runSkillOptTrainInitTUIImpl(home, scope string, stdout io.Writer, values *s
 
 // buildSkillOptTrainInitTUIFields builds the form fields for the missing inputs,
 // in the same stable order as the line wizard.
-func buildSkillOptTrainInitTUIFields(store *db.Store, scope string, values skillOptTrainInitInputs, missing []string) ([]tui.Field, error) {
+func buildSkillOptTrainInitTUIFields(store *db.Store, home, scope string, values skillOptTrainInitInputs, missing []string) ([]tui.Field, error) {
 	missingSet := make(map[string]struct{}, len(missing))
 	for _, field := range missing {
 		missingSet[field] = struct{}{}
@@ -108,7 +111,7 @@ func buildSkillOptTrainInitTUIFields(store *db.Store, scope string, values skill
 		case field == "review_repo":
 			entry.Kind = tui.FieldText
 			entry.CheckRepo = skillOptTrainRepoChecker()
-			entry.CreateRepo = skillOptTrainRepoCreator()
+			entry.CreateRepo = skillOptTrainRepoCreator(home)
 			if choices := skillOptRepoPickerChoices(skillOptKnownRepoNames(context.Background(), store)); len(choices) > 0 {
 				entry.Kind = tui.FieldChoice
 				entry.Choices = choices
@@ -138,14 +141,63 @@ func skillOptTrainRepoChecker() func(string) (bool, error) {
 	}
 }
 
-func skillOptTrainRepoCreator() func(string) error {
+// skillOptTrainRepoCreator returns a form CreateRepo callback that provisions a
+// missing repo into a *usable* generation repo (created with an initial commit,
+// cloned to a gitmoot-managed checkout, and registered) so train generate can
+// run in it. home is the gitmoot home the checkout and store live under.
+func skillOptTrainRepoCreator(home string) func(string) error {
 	return func(value string) error {
 		repo, err := daemon.ParseRepository(value)
 		if err != nil {
 			return err
 		}
-		return newSkillOptGitHubClient().CreateRepository(context.Background(), repo, true)
+		return provisionTrainGenerationRepo(context.Background(), home, repo)
 	}
+}
+
+// provisionTrainGenerationRepo creates a missing generation repo with an initial
+// commit (so it has a default branch), clones it into a gitmoot-managed checkout
+// under <home>/checkouts/<owner>/<name>, registers that checkout, and records the
+// repo for later cleanup. It is idempotent: a pre-existing valid checkout of the
+// same repo is reused rather than re-cloned.
+func provisionTrainGenerationRepo(ctx context.Context, home string, repo github.Repository) error {
+	client := newSkillOptGitHubClient()
+	if err := client.CreateRepository(ctx, repo, true); err != nil {
+		return err
+	}
+	checkout := filepath.Join(config.PathsForHome(home).Home, "checkouts", repo.Owner, repo.Name)
+	if err := os.MkdirAll(filepath.Dir(checkout), 0o755); err != nil {
+		return err
+	}
+	switch _, statErr := os.Stat(checkout); {
+	case statErr == nil:
+		// A checkout dir already exists (e.g. a prior attempt) — reuse it only if
+		// it is genuinely this repo's checkout; otherwise refuse rather than clone
+		// into a non-empty/foreign directory.
+		if _, err := repoRecordFromPath(ctx, repo, checkout); err != nil {
+			return fmt.Errorf("checkout path %s already exists but is not a checkout of %s: %w", checkout, repo.FullName(), err)
+		}
+	case errors.Is(statErr, os.ErrNotExist):
+		if err := client.CloneRepository(ctx, repo, checkout); err != nil {
+			// Remove any partial clone so a retry isn't blocked by a stale dir; the
+			// repo now exists on GitHub, so recovery is `gitmoot repo add` (or a
+			// later train continue once the checkout is registered).
+			_ = os.RemoveAll(checkout)
+			return fmt.Errorf("created %s but cloning it to %s failed (register a checkout with `gitmoot repo add %s --path <dir>`): %w", repo.FullName(), checkout, repo.FullName(), err)
+		}
+	default:
+		return statErr
+	}
+	record, err := repoRecordFromPath(ctx, repo, checkout)
+	if err != nil {
+		return err
+	}
+	return withStore(home, func(store *db.Store) error {
+		if err := store.UpsertRepo(ctx, record); err != nil {
+			return err
+		}
+		return store.RecordCreatedRepo(ctx, db.CreatedRepo{Repo: repo.FullName(), Purpose: "train"})
+	})
 }
 
 // skillOptTrainInitTUISummaryRows renders the confirm-screen rows: each field's
@@ -329,7 +381,7 @@ func buildAgentOptimizeFields(home string, repoChoices []tui.Choice) []tui.Field
 	workspace := custom("workspace_repo", "Workspace repo", "Workspace repository in owner/repo form? (options are generated there)", nil, "", true)
 	for _, field := range []*tui.Field{&review, &workspace} {
 		field.CheckRepo = skillOptTrainRepoChecker()
-		field.CreateRepo = skillOptTrainRepoCreatorRecording(home)
+		field.CreateRepo = skillOptTrainRepoCreator(home)
 		if len(repoChoices) > 0 {
 			field.Kind = tui.FieldChoice
 			field.Choices = repoChoices
@@ -345,24 +397,6 @@ func buildAgentOptimizeFields(home string, repoChoices []tui.Choice) []tui.Field
 		standard("request"),
 		custom("backend", "Optimizer backend", "Backend for the optimizer and target runs?", []string{"codex", "claude"}, "codex", true),
 		custom("model", "Model (optional)", "Model override for the optimizer and target runs? (empty = backend default)", nil, "", false),
-	}
-}
-
-// skillOptTrainRepoCreatorRecording creates a missing repo AND records it as
-// gitmoot-created with an empty session id; startAgentOptimizeSession adopts
-// the record into the new session so the delete-time cleanup offer covers it.
-func skillOptTrainRepoCreatorRecording(home string) func(string) error {
-	return func(value string) error {
-		repo, err := daemon.ParseRepository(value)
-		if err != nil {
-			return err
-		}
-		if err := newSkillOptGitHubClient().CreateRepository(context.Background(), repo, true); err != nil {
-			return err
-		}
-		return withStore(home, func(store *db.Store) error {
-			return store.RecordCreatedRepo(context.Background(), db.CreatedRepo{Repo: repo.FullName(), Purpose: "train"})
-		})
 	}
 }
 
