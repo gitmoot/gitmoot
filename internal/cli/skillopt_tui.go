@@ -15,7 +15,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/jerryfane/gitmoot/internal/cli/tui"
-	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/github"
@@ -155,6 +154,19 @@ func skillOptTrainRepoCreator(home string) func(string) error {
 	}
 }
 
+// trainGenerationCheckoutPath is the gitmoot-managed checkout location for a
+// generation repo: <home>/checkouts/<owner>/<name>. It resolves the home the
+// same way the store does (pathsFromFlag → DefaultPaths when home is empty), so
+// the default-home case lands under the real ~/.gitmoot rather than a
+// cwd-relative ".gitmoot".
+func trainGenerationCheckoutPath(home string, repo github.Repository) (string, error) {
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(paths.Home, "checkouts", repo.Owner, repo.Name), nil
+}
+
 // provisionTrainGenerationRepo creates a missing generation repo with an initial
 // commit (so it has a default branch), clones it into a gitmoot-managed checkout
 // under <home>/checkouts/<owner>/<name>, registers that checkout, and records the
@@ -165,7 +177,10 @@ func provisionTrainGenerationRepo(ctx context.Context, home string, repo github.
 	if err := client.CreateRepository(ctx, repo, true); err != nil {
 		return err
 	}
-	checkout := filepath.Join(config.PathsForHome(home).Home, "checkouts", repo.Owner, repo.Name)
+	checkout, err := trainGenerationCheckoutPath(home, repo)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(checkout), 0o755); err != nil {
 		return err
 	}

@@ -195,7 +195,7 @@ func (a CodexAdapter) Start(ctx context.Context, request StartRequest) (StartRes
 	args = append(args, "--json", "--", request.Prompt)
 	result, err := a.runner().Run(ctx, a.Dir, "codex", args...)
 	if err != nil {
-		return StartResult{Raw: result.Stdout + result.Stderr}, commandError(result, err)
+		return StartResult{Raw: result.Stdout + result.Stderr}, codexCommandError(result, err)
 	}
 	threadID, err := parseCodexStartedThreadID(result.Stdout)
 	if err != nil {
@@ -225,7 +225,7 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 	args = append(args, "--", job.Prompt)
 	result, err := a.runner().Run(ctx, a.Dir, "codex", args...)
 	if err != nil {
-		return Result{Raw: result.Stdout + result.Stderr}, commandError(result, err)
+		return Result{Raw: result.Stdout + result.Stderr}, codexCommandError(result, err)
 	}
 	return Result{Raw: result.Stdout}, nil
 }
@@ -427,6 +427,54 @@ func commandError(result subprocess.Result, err error) error {
 		return err
 	}
 	return fmt.Errorf("%s: %w", detail, err)
+}
+
+// codexCommandError prefers the real failure message from codex's --json events
+// (on stdout) over the stderr-first commandError, which otherwise surfaces
+// codex's harmless "Reading additional input from stdin..." line instead of the
+// actual cause (usage limit, auth, etc.). Falls back to commandError when stdout
+// carries no parseable error event (e.g. the non-json Deliver path).
+func codexCommandError(result subprocess.Result, err error) error {
+	if detail := parseCodexErrorMessage(result.Stdout); detail != "" {
+		return fmt.Errorf("%s: %w", detail, err)
+	}
+	return commandError(result, err)
+}
+
+// parseCodexErrorMessage scans codex --json JSONL for the failure message in an
+// "error" ({"message":...}) or "turn.failed" ({"error":{"message":...}}) event,
+// returning the last non-empty one (turn.failed usually follows the error event).
+func parseCodexErrorMessage(output string) string {
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	message := ""
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var event struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+			Error   struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal([]byte(line), &event) != nil {
+			continue
+		}
+		switch event.Type {
+		case "error":
+			if m := strings.TrimSpace(event.Message); m != "" {
+				message = m
+			}
+		case "turn.failed":
+			if m := strings.TrimSpace(event.Error.Message); m != "" {
+				message = m
+			}
+		}
+	}
+	return message
 }
 
 func claudeCommandError(result subprocess.Result, err error) error {

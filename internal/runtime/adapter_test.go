@@ -625,3 +625,39 @@ func (f *fakeRunner) want(t *testing.T, index int, want ...string) {
 		t.Fatalf("call %d = %s\nwant %s", index, strings.Join(f.calls[index], " "), strings.Join(want, " "))
 	}
 }
+
+func TestCodexCommandError(t *testing.T) {
+	runErr := errors.New("exit status 1")
+
+	t.Run("surfaces the --json error event over stderr noise", func(t *testing.T) {
+		result := subprocess.Result{
+			Stderr: "Reading additional input from stdin...",
+			Stdout: `{"type":"thread.started","thread_id":"t1"}` + "\n" +
+				`{"type":"turn.started"}` + "\n" +
+				`{"type":"error","message":"You've hit your usage limit. try again at Jun 14th"}` + "\n",
+		}
+		got := codexCommandError(result, runErr).Error()
+		if !strings.Contains(got, "You've hit your usage limit") {
+			t.Fatalf("want the usage-limit message, got %q", got)
+		}
+		if strings.Contains(got, "Reading additional input from stdin") {
+			t.Fatalf("must not surface the stdin noise line, got %q", got)
+		}
+	})
+
+	t.Run("uses a turn.failed error.message", func(t *testing.T) {
+		result := subprocess.Result{
+			Stdout: `{"type":"turn.failed","error":{"message":"sandbox denied write"}}` + "\n",
+		}
+		if got := codexCommandError(result, runErr).Error(); !strings.Contains(got, "sandbox denied write") {
+			t.Fatalf("want the turn.failed message, got %q", got)
+		}
+	})
+
+	t.Run("falls back to stderr when stdout has no json error", func(t *testing.T) {
+		result := subprocess.Result{Stderr: "boom on stderr", Stdout: "plain non-json output"}
+		if got := codexCommandError(result, runErr).Error(); !strings.Contains(got, "boom on stderr") {
+			t.Fatalf("want the stderr fallback, got %q", got)
+		}
+	})
+}

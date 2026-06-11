@@ -157,6 +157,41 @@ func TestSkillOptTrainRepoCheckerAndCreator(t *testing.T) {
 	}
 }
 
+func TestTrainGenerationCheckoutPath(t *testing.T) {
+	repo, err := daemon.ParseRepository("o/fresh")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	// A non-empty home resolves under <home>/.gitmoot/checkouts/...
+	home := t.TempDir()
+	got, err := trainGenerationCheckoutPath(home, repo)
+	if err != nil {
+		t.Fatalf("explicit home: %v", err)
+	}
+	want := filepath.Join(config.PathsForHome(home).Home, "checkouts", "o", "fresh")
+	if got != want {
+		t.Fatalf("explicit-home path = %q, want %q", got, want)
+	}
+
+	// The default home (empty) must resolve to an ABSOLUTE path under the real
+	// gitmoot home — never a cwd-relative ".gitmoot/..." (the #278 regression).
+	def, err := trainGenerationCheckoutPath("", repo)
+	if err != nil {
+		t.Fatalf("default home: %v", err)
+	}
+	if !filepath.IsAbs(def) {
+		t.Fatalf("default-home checkout must be absolute, got %q", def)
+	}
+	defaults, err := config.DefaultPaths()
+	if err != nil {
+		t.Fatalf("DefaultPaths: %v", err)
+	}
+	if def != filepath.Join(defaults.Home, "checkouts", "o", "fresh") {
+		t.Fatalf("default-home path = %q, want under %q", def, defaults.Home)
+	}
+}
+
 func TestProvisionTrainGenerationRepo(t *testing.T) {
 	home := t.TempDir()
 	if err := config.Initialize(config.PathsForHome(home)); err != nil {
