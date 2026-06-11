@@ -61,6 +61,51 @@ func TestBuildOptimizerCommandDefaultsCodexModel(t *testing.T) {
 	}
 }
 
+func TestRemoveSkillOptTrainTargetAgents(t *testing.T) {
+	home := t.TempDir()
+	if err := config.Initialize(config.PathsForHome(home)); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	sid := "train-plan-20260101-000000-111"
+	otherTarget := "skillopt-target-train-other-20260101-000000-222-item-001-generator-ccc"
+	for _, name := range []string{
+		"skillopt-target-" + sid + "-item-001-generator-aaa",
+		"skillopt-target-" + sid + "-item-002-generator-bbb",
+		"planner",   // a real user agent
+		otherTarget, // another session's plumbing
+	} {
+		if err := store.UpsertAgent(ctx, db.Agent{Name: name, Runtime: "codex"}); err != nil {
+			t.Fatalf("upsert %s: %v", name, err)
+		}
+	}
+
+	removeSkillOptTrainTargetAgents(ctx, store, sid)
+
+	got, err := store.ListAgents(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	names := map[string]bool{}
+	for _, a := range got {
+		names[a.Name] = true
+	}
+	// This session's target agents are gone; the user agent and the other
+	// session's plumbing remain.
+	if names["skillopt-target-"+sid+"-item-001-generator-aaa"] || names["skillopt-target-"+sid+"-item-002-generator-bbb"] {
+		t.Fatalf("session target agents should be removed: %v", names)
+	}
+	if !names["planner"] || !names[otherTarget] {
+		t.Fatalf("unrelated agents must remain: %v", names)
+	}
+}
+
 func TestBuildAgentOptimizeFieldsSkipsTemplate(t *testing.T) {
 	fields := buildAgentOptimizeFields("", nil)
 	names := make([]string, 0, len(fields))

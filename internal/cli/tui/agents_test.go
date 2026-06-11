@@ -41,6 +41,38 @@ func agentsModel(t *testing.T, deps Deps, snap Snapshot) Model {
 	return m
 }
 
+func TestAgentsPageHidesTrainingAgents(t *testing.T) {
+	snap := agentsSnapshot()
+	// Add internal training plumbing alongside the real agents.
+	snap.Agents = append(snap.Agents,
+		Agent{Name: "skillopt-target-train-s1-item-001-generator-abc", Runtime: "codex"},
+		Agent{Name: "skillopt-target-train-s1-item-002-generator-def", Runtime: "codex"},
+		Agent{Name: "skillopt-generator-bg-18b5", Runtime: "codex"},
+	)
+	deps := Deps{}
+	m := agentsModel(t, deps, snap)
+	view := m.View()
+	// Real agents shown, training plumbing hidden + a count line.
+	for _, want := range []string{"planner", "reviewer", "3 training agents hidden"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("agents view missing %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "skillopt-target-") || strings.Contains(view, "skillopt-generator-bg") {
+		t.Fatalf("training agents must be hidden:\n%s", view)
+	}
+	// The cursor + enter act on the VISIBLE list (planner is first visible).
+	if a, ok := m.agentUnderCursor(); !ok || a.Name != "planner" {
+		t.Fatalf("cursor should target the first visible agent, got %q ok=%v", a.Name, ok)
+	}
+	// Moving down lands on the next visible agent, never the hidden ones.
+	next, _ := m.Update(key("j"))
+	m = next.(Model)
+	if a, _ := m.agentUnderCursor(); a.Name != "reviewer" {
+		t.Fatalf("down should move to the next visible agent, got %q", a.Name)
+	}
+}
+
 func TestAgentDetailRendersVersionsAndJobs(t *testing.T) {
 	var asked string
 	deps := Deps{TemplateVersions: func(templateID string) ([]TemplateVersion, error) {

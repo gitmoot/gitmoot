@@ -6700,11 +6700,30 @@ func deleteSkillOptTrainSession(ctx context.Context, store *db.Store, sessionID 
 	if err := store.DeleteSkillOptTrainSession(ctx, sessionID); err != nil {
 		return nil, err
 	}
+	// Remove the per-option target agents this session scaffolded so they don't
+	// accumulate on the Agents page / agent list (best-effort — internal plumbing).
+	removeSkillOptTrainTargetAgents(ctx, store, sessionID)
 	repos := make([]string, 0, len(records))
 	for _, record := range records {
 		repos = append(repos, record.Repo)
 	}
 	return repos, nil
+}
+
+// removeSkillOptTrainTargetAgents deletes the `skillopt-target-<run>-…` agents a
+// training session scaffolded (one per generated option). The session id is
+// embedded in each name, so it only touches this session's plumbing. Best-effort.
+func removeSkillOptTrainTargetAgents(ctx context.Context, store *db.Store, sessionID string) {
+	agents, err := store.ListAgents(ctx)
+	if err != nil {
+		return
+	}
+	marker := skillOptSafeAgentName(strings.TrimSpace(sessionID))
+	for _, agent := range agents {
+		if strings.HasPrefix(agent.Name, "skillopt-target-") && marker != "" && strings.Contains(agent.Name, marker) {
+			_, _ = store.RemoveAgent(ctx, agent.Name)
+		}
+	}
 }
 
 // cleanupCreatedTrainRepo deletes a gitmoot-created GitHub repo and then its

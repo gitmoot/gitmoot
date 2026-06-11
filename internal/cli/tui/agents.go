@@ -16,10 +16,32 @@ const agentCustomPromptValue = "__custom_prompt__"
 
 // agentUnderCursor returns the agent under the Agents cursor, if any.
 func (m Model) agentUnderCursor() (Agent, bool) {
-	if pages[m.selected].page != pageAgents || len(m.snap.Agents) == 0 {
+	visible := m.visibleAgents()
+	if pages[m.selected].page != pageAgents || m.agentCursor < 0 || m.agentCursor >= len(visible) {
 		return Agent{}, false
 	}
-	return m.snap.Agents[m.agentCursor], true
+	return visible[m.agentCursor], true
+}
+
+// isManagedTrainingAgent reports whether an agent name is internal skillopt
+// training plumbing — the per-option target agents and the generator workers —
+// that the user never acts on, so the Agents page hides them.
+func isManagedTrainingAgent(name string) bool {
+	name = strings.TrimSpace(name)
+	return strings.HasPrefix(name, "skillopt-target-") || strings.HasPrefix(name, "skillopt-generator")
+}
+
+// visibleAgents are the user-facing agents (training plumbing filtered out). The
+// Agents page renders, cursors, and acts on this list; the serialized snapshot
+// keeps every agent, so --json/--plain are unaffected.
+func (m Model) visibleAgents() []Agent {
+	out := make([]Agent, 0, len(m.snap.Agents))
+	for _, a := range m.snap.Agents {
+		if !isManagedTrainingAgent(a.Name) {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // openAgentDetail enters the detail view for an agent and lazily loads its
@@ -501,7 +523,14 @@ func choiceValues(choices []Choice) []string {
 // agentsContentInteractive renders the Agents page as a selectable list. Agent
 // overlays are dispatched once in content(), not here.
 func (m Model) agentsContentInteractive() string {
-	if len(m.snap.Agents) == 0 {
+	visible := m.visibleAgents()
+	hidden := len(m.snap.Agents) - len(visible)
+	hiddenLine := func(b *strings.Builder) {
+		if hidden > 0 {
+			b.WriteString("\n" + mutedStyle.Render(strconv.Itoa(hidden)+" training agents hidden (skillopt-*)") + "\n")
+		}
+	}
+	if len(visible) == 0 {
 		var b strings.Builder
 		b.WriteString(m.loadingOr("No registered agents.", !m.loadedAt.IsZero()))
 		b.WriteByte('\n')
@@ -511,12 +540,13 @@ func (m Model) agentsContentInteractive() string {
 		if m.agentNotice != "" {
 			b.WriteString("\n" + mutedStyle.Render(m.agentNotice) + "\n")
 		}
+		hiddenLine(&b)
 		b.WriteString("\n" + mutedStyle.Render("n new agent"))
 		return b.String()
 	}
 	var b strings.Builder
 	rows := [][]string{{"", "NAME", "RUNTIME", "ROLE", "HEALTH"}}
-	for i, a := range m.snap.Agents {
+	for i, a := range visible {
 		cursor, name := "  ", a.Name
 		if i == m.agentCursor {
 			cursor, name = "▸ ", selectedRowStyle.Render(a.Name)
@@ -530,6 +560,7 @@ func (m Model) agentsContentInteractive() string {
 	if m.agentNotice != "" {
 		b.WriteString("\n" + mutedStyle.Render(m.agentNotice) + "\n")
 	}
+	hiddenLine(&b)
 	if m.optimizeBusy {
 		b.WriteString("\n" + mutedStyle.Render("starting optimization…") + "\n")
 	}
