@@ -79,6 +79,47 @@ func TestTrainRunGeneratingShowsJobCounts(t *testing.T) {
 	}
 }
 
+func TestTrainRunSurfacesGenerationError(t *testing.T) {
+	m := trainRunModel(t, TrainRunSnapshot{SessionID: "s", Template: "t@v1", Phase: "items_ready"})
+	// A spawn first reports the optimistic "started in the background" note…
+	next, _ := m.Update(trainSpawnMsg{logPath: "/tmp/x.log"})
+	m = next.(TrainRunModel)
+	if !strings.Contains(m.View(), "started in the background") {
+		t.Fatalf("expected the optimistic note first:\n%s", m.View())
+	}
+	// …then a refresh shows the generation failed: surface it, drop the note.
+	failed := TrainRunSnapshot{SessionID: "s", Template: "t@v1", Phase: "items_ready",
+		GenerationError: "generation repo o/r is not registered with a checkout path"}
+	next, _ = m.Update(trainSnapshotMsg{snap: failed, at: time.Unix(3, 0)})
+	m = next.(TrainRunModel)
+	view := m.View()
+	if !strings.Contains(view, "generation failed: generation repo o/r is not registered") {
+		t.Fatalf("expected the generation error surfaced:\n%s", view)
+	}
+	if !strings.Contains(view, "press enter to retry") {
+		t.Fatalf("expected a retry hint:\n%s", view)
+	}
+	if strings.Contains(view, "started in the background") {
+		t.Fatalf("the optimistic note should be cleared on a failure:\n%s", view)
+	}
+}
+
+func TestTrainRunNoGenerationErrorKeepsNote(t *testing.T) {
+	m := trainRunModel(t, TrainRunSnapshot{SessionID: "s", Phase: "items_ready"})
+	next, _ := m.Update(trainSpawnMsg{logPath: "/tmp/x.log"})
+	m = next.(TrainRunModel)
+	// A clean refresh (no generation error) keeps the optimistic note.
+	next, _ = m.Update(trainSnapshotMsg{snap: TrainRunSnapshot{SessionID: "s", Phase: "items_ready"}, at: time.Unix(3, 0)})
+	m = next.(TrainRunModel)
+	view := m.View()
+	if strings.Contains(view, "generation failed") {
+		t.Fatalf("no error should render without a GenerationError:\n%s", view)
+	}
+	if !strings.Contains(view, "started in the background") {
+		t.Fatalf("the note should remain without a failure:\n%s", view)
+	}
+}
+
 func TestTrainRunLoadErrorKeepsStaleData(t *testing.T) {
 	m := trainRunModel(t, TrainRunSnapshot{SessionID: "s", Template: "t@v1", Phase: "items_ready"})
 	next, _ := m.Update(trainSnapshotMsg{err: errors.New("db locked"), at: time.Unix(2, 0)})

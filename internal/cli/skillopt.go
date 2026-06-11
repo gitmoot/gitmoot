@@ -1721,6 +1721,7 @@ type skillOptTrainStatusVerbose struct {
 	ReviewIssue           skillOptTrainStatusReviewIssue `json:"review_issue,omitempty"`
 	Candidate             skillOptTrainStatusCandidate   `json:"candidate,omitempty"`
 	Optimizer             map[string]any                 `json:"optimizer,omitempty"`
+	Generation            map[string]any                 `json:"generation,omitempty"`
 	Jobs                  skillOptTrainStatusJobs        `json:"jobs"`
 	ActiveLocks           []skillOptTrainStatusLock      `json:"active_locks,omitempty"`
 	Items                 []skillOptTrainStatusItem      `json:"items,omitempty"`
@@ -6972,6 +6973,11 @@ func buildSkillOptTrainStatusVerbose(ctx context.Context, store *db.Store, sessi
 	addStatus("candidate_decision", decodedSkillOptMetadataValue(statusMetadata["candidate_decision"]))
 	if len(statuses) > 0 {
 		details.MetadataStatus = statuses
+	}
+	// Carry the full generation metadata (status + error) so a failed background
+	// generate can be surfaced in the train-run view rather than silently stalling.
+	if generation := decodedSkillOptMetadataValue(statusMetadata["generation"]); len(generation) > 0 {
+		details.Generation = generation
 	}
 	if iteration == nil {
 		return details, nil

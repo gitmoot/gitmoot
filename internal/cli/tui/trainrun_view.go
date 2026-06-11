@@ -74,6 +74,10 @@ func (m TrainRunModel) View() string {
 	if m.actionErr != "" {
 		b.WriteString("\n" + errorStyle.Render(m.actionErr) + "\n")
 	}
+	if ge := strings.TrimSpace(m.snap.GenerationError); ge != "" {
+		b.WriteString("\n" + errorStyle.Render("generation failed: "+ge) + "\n")
+		b.WriteString(mutedStyle.Render("press enter to retry once the cause is fixed") + "\n")
+	}
 	for _, line := range m.resultLines {
 		b.WriteString(mutedStyle.Render(line) + "\n")
 	}

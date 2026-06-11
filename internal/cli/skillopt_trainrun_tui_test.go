@@ -310,3 +310,23 @@ func TestToTrainRunSnapshot(t *testing.T) {
 		t.Fatalf("verbose mapping wrong: %+v", out)
 	}
 }
+
+func TestToTrainRunSnapshotMapsGenerationError(t *testing.T) {
+	// A failed generation surfaces its error.
+	failed := skillOptTrainStatusSnapshot{
+		SessionID:   "s1",
+		StatusPhase: "items_ready",
+		Verbose: &skillOptTrainStatusVerbose{
+			Generation: map[string]any{"status": "failed", "error": "generation repo o/r is not registered with a checkout path"},
+		},
+	}
+	if out := toTrainRunSnapshot(failed); out.GenerationError != "generation repo o/r is not registered with a checkout path" {
+		t.Fatalf("generation error not mapped: %q", out.GenerationError)
+	}
+	// A succeeded/absent generation status carries no error.
+	ok := failed
+	ok.Verbose = &skillOptTrainStatusVerbose{Generation: map[string]any{"status": "succeeded", "error": "stale"}}
+	if out := toTrainRunSnapshot(ok); out.GenerationError != "" {
+		t.Fatalf("a non-failed generation must not surface an error: %q", out.GenerationError)
+	}
+}
