@@ -175,7 +175,8 @@ func (c GitHubCollector) rankedBody(ctx context.Context, store *db.Store, run db
 	}
 	builder.WriteString("- Compare each item across the option links or inline text below.\n")
 	builder.WriteString("- Rank every option from best to worst using the exact labels shown.\n")
-	builder.WriteString("- Reply by copying the fenced `yaml` block below into a new comment and filling every item.\n")
+	builder.WriteString("- Reply by copying the fenced `yaml` block below into a new comment.\n")
+	builder.WriteString("- If you only do one thing: rank each item's options best → worst (use `=` for ties). Everything else is optional.\n")
 	builder.WriteString("- Valid `quality` values: `poor`, `acceptable`, `strong`.\n")
 	builder.WriteString("- Valid `continue_mode` values: `explore`, `refine`, `distill`, `validate`.\n")
 	builder.WriteString("- Valid `promote` values: `yes`, `no`.\n\n")
@@ -345,28 +346,37 @@ func markdownTableCell(value string) string {
 	return value
 }
 
+// rankedReplyYAML builds the "Copy-Paste YAML Reply" the human posts back. It is
+// lazy-first and self-documenting: the only field you must set is `ranking` for
+// each item (winner + pairwise preferences are inferred from it); every other
+// field is an optional, commented-out hint showing its allowed values. The `#`
+// comments are ignored by the YAML parser, so the uncommented skeleton is a
+// complete, valid reply on its own.
 func rankedReplyYAML(runID string, items []db.EvalReviewItem, assignments map[string]githubAssignment) (string, error) {
-	type rankedReplyFile struct {
-		RunID string              `yaml:"run_id"`
-		Items []feedbackFileEntry `yaml:"items"`
-	}
-	packet := rankedReplyFile{RunID: runID}
+	var b strings.Builder
+	b.WriteString("# Minimum reply: set `ranking` for each item (best > worst; use = for ties).\n")
+	b.WriteString("# Everything else is optional — winner and pairwise preferences are inferred.\n")
+	fmt.Fprintf(&b, "run_id: %s\n", runID)
+	b.WriteString("items:\n")
 	for _, item := range items {
-		labels := displayOptionLabels(assignments[item.ItemID].Options)
-		packet.Items = append(packet.Items, feedbackFileEntry{
-			ItemID:       item.ItemID,
-			Ranking:      []string{fmt.Sprintf("<replace with ranked option labels, e.g. %s>", strings.Join(labels, " > "))},
-			Quality:      "",
-			ContinueMode: "",
-			Promote:      "",
-			Reasoning:    "",
-		})
+		example := strings.Join(displayOptionLabels(assignments[item.ItemID].Options), " > ")
+		if strings.TrimSpace(example) == "" {
+			example = "A > B > C"
+		}
+		fmt.Fprintf(&b, "  - item_id: %s\n", item.ItemID)
+		b.WriteString("    ranking:\n")
+		fmt.Fprintf(&b, "      - <rank best to worst, e.g. %s>\n", example)
+		b.WriteString("    # Optional — uncomment and fill any you care about:\n")
+		b.WriteString("    # quality: acceptable        # poor | acceptable | strong\n")
+		b.WriteString("    # continue_mode: refine      # explore | refine | distill | validate\n")
+		b.WriteString("    # promote: no                # yes | no\n")
+		b.WriteString("    # winner: A                  # defaults to the top-ranked option\n")
+		b.WriteString("    # required_improvements: [stronger hero copy, mobile layout]\n")
+		b.WriteString("    # useful_traits: { A: [clear value prop] }      # per-option strengths\n")
+		b.WriteString("    # rejected_traits: { B: [too generic] }         # per-option weaknesses\n")
+		b.WriteString("    # reasoning: why you ranked them this way\n")
 	}
-	content, err := yaml.Marshal(packet)
-	if err != nil {
-		return "", fmt.Errorf("encode ranked feedback reply: %w", err)
-	}
-	return string(content), nil
+	return b.String(), nil
 }
 
 func (c GitHubCollector) Sync(ctx context.Context, store *db.Store, runID string, repo github.Repository, issueNumber int64) (ImportResult, error) {
