@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/jerryfane/gitmoot/internal/cli/style"
 )
 
@@ -56,6 +57,87 @@ func (m Model) sessionRows() []sessionRow {
 	return rows
 }
 
+// updateSessionOverlay handles keys in the session detail and stop-confirm
+// modes. Like the job overlay it guards esc/keys while a stop is in flight so
+// the result (especially a refusal) is never dropped.
+func (m Model) updateSessionOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch m.mode {
+	case modeSessionDetail:
+		if s := msg.String(); s == "enter" || s == "q" || s == "esc" {
+			m.mode = modeNormal
+		}
+		m.viewport.SetContent(m.content())
+		return m, nil
+	case modeConfirmSessionStop:
+		switch msg.String() {
+		case "y", "Y":
+			if m.actionBusy {
+				return m, nil
+			}
+			m.actionBusy = true
+			m.actionErr = ""
+			cmd := sessionStopCmd(m.deps, m.activeSession.Name)
+			m.viewport.SetContent(m.content())
+			return m, cmd
+		default:
+			// While the stop is in flight, keep the confirm open so its result
+			// (especially an error like "running a job") is not dropped — this is
+			// why the overlay has its own handler rather than the shared esc path.
+			if m.actionBusy {
+				return m, nil
+			}
+			m.mode = modeNormal
+			m.actionErr = ""
+		}
+		m.viewport.SetContent(m.content())
+		return m, nil
+	}
+	return m, nil
+}
+
+// openSessionStop opens the stop confirmation for a single session. Collapsed
+// background groups aren't individually addressable, so a group row instead
+// sets a muted hint pointing at `gitmoot agent gc`.
+func (m *Model) openSessionStop(row sessionRow) {
+	m.actionErr = ""
+	m.actionBusy = false
+	if row.count > 1 {
+		m.sessionNotice = "background workers expire on their own — clear them with `gitmoot agent gc`"
+		return
+	}
+	m.sessionNotice = ""
+	m.activeSession = row.session
+	m.activeSessionCount = row.count
+	m.mode = modeConfirmSessionStop
+}
+
+func sessionStopCmd(deps Deps, name string) tea.Cmd {
+	return func() tea.Msg {
+		if deps.StopSession == nil {
+			return sessionActionMsg{}
+		}
+		return sessionActionMsg{err: deps.StopSession(name)}
+	}
+}
+
+func (m Model) sessionStopConfirmView() string {
+	var b strings.Builder
+	b.WriteString(headerStyle.Render("Stop session " + m.activeSession.Name))
+	b.WriteString("\n\n")
+	b.WriteString(dash(m.activeSession.Type) + " · " + dash(m.activeSession.Runtime) + " · " + dash(m.activeSession.State) + "\n\n")
+	b.WriteString("Stop this runtime session? The next job starts a fresh one. (y/n)\n")
+	if m.actionErr != "" {
+		b.WriteString("\n" + errorStyle.Render(m.actionErr) + "\n")
+	}
+	b.WriteString("\n")
+	if m.actionBusy {
+		b.WriteString(mutedStyle.Render("stopping…"))
+	} else {
+		b.WriteString(mutedStyle.Render("y confirm  n/esc cancel"))
+	}
+	return b.String()
+}
+
 // openSessionDetail enters the detail view for the session under the cursor.
 func (m *Model) openSessionDetail() {
 	rows := m.sessionRows()
@@ -84,7 +166,14 @@ func (m Model) sessionsContent() string {
 		b.WriteString(cursor + label + "\n")
 	}
 	b.WriteByte('\n')
-	b.WriteString(mutedStyle.Render("enter detail"))
+	hint := "enter detail"
+	if m.deps.StopSession != nil {
+		hint += "  s stop"
+	}
+	b.WriteString(mutedStyle.Render(hint))
+	if m.sessionNotice != "" {
+		b.WriteString("\n" + mutedStyle.Render(m.sessionNotice))
+	}
 	return b.String()
 }
 

@@ -80,6 +80,8 @@ func (m Model) content() string {
 		b.WriteString(m.jobDetailView())
 	case modeSessionDetail:
 		b.WriteString(m.sessionDetailView())
+	case modeConfirmSessionStop:
+		b.WriteString(m.sessionStopConfirmView())
 	case modeConfirmJobRetry, modeConfirmJobCancel:
 		b.WriteString(m.jobConfirmView())
 	case modeTrainStopReason:
@@ -214,6 +216,8 @@ func (m Model) footerHelp() string {
 		return "type value  enter save  esc cancel"
 	case modeSessionDetail:
 		return "enter/esc back"
+	case modeConfirmSessionStop:
+		return "y confirm  n/esc cancel"
 	}
 	switch pages[m.selected].page {
 	case pageAttention:
@@ -223,7 +227,7 @@ func (m Model) footerHelp() string {
 	case pageAgents:
 		return "tab/←→ page  ↑/↓ select  enter detail  n new  o optimize  e runtime  D delete  ? help  q quit"
 	case pageSessions:
-		return "tab/←→ page  ↑/↓ select  enter detail  ? help  q quit"
+		return "tab/←→ page  ↑/↓ select  enter detail  s stop  ? help  q quit"
 	case pageJobs:
 		return "tab/←→ page  ↑/↓ select  enter detail  R retry  c cancel  ? help  q quit"
 	case pageHealth:

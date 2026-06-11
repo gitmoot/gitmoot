@@ -129,12 +129,6 @@ func (m Model) updateOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.viewport.SetContent(m.content())
 		}
 		return m, nil
-	case modeSessionDetail:
-		if s := msg.String(); s == "enter" || s == "q" {
-			m.mode = modeNormal
-			m.viewport.SetContent(m.content())
-		}
-		return m, nil
 	case modeAnswerChoice:
 		switch msg.String() {
 		case "up", "k":

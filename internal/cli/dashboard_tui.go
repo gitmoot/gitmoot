@@ -279,6 +279,11 @@ func dashboardTUIDeps(home string, interval time.Duration) tui.Deps {
 				return store.UpdateAgentRuntime(context.Background(), name, runtimeName)
 			})
 		},
+		StopSession: func(name string) error {
+			return withStore(home, func(store *db.Store) error {
+				return store.StopAgentInstance(context.Background(), name)
+			})
+		},
 		EditAgentPrompt: func(seedTemplateID string) tea.Cmd {
 			seed := agentPromptScaffold
 			if strings.TrimSpace(seedTemplateID) != "" {

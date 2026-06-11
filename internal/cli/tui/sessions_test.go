@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -74,6 +75,89 @@ func TestSessionDetailGroupShowsCount(t *testing.T) {
 	}
 	if !strings.Contains(view, "background workers") {
 		t.Fatalf("group detail should explain the collapse:\n%s", view)
+	}
+}
+
+func sessionsPageModelWithDeps(t *testing.T, snap Snapshot, deps Deps) Model {
+	t.Helper()
+	if deps.Load == nil {
+		deps.Load = func() (Snapshot, error) { return snap, nil }
+	}
+	m := sizedModel(deps)
+	next, _ := m.Update(snapshotMsg{snap: snap, at: time.Unix(1_700_000_000, 0)})
+	m = next.(Model)
+	for i := 0; i < 3; i++ {
+		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+		m = next.(Model)
+	}
+	if pages[m.selected].page != pageSessions {
+		t.Fatalf("expected Sessions page, got %v", pages[m.selected].page)
+	}
+	return m
+}
+
+func TestSessionStopSingleConfirms(t *testing.T) {
+	var stopped string
+	deps := Deps{StopSession: func(name string) error { stopped = name; return nil }}
+	m := sessionsPageModelWithDeps(t, sessionDetailSnapshot(), deps)
+	// Cursor down to the single "planner" session (row 1; row 0 is the bg group).
+	next, _ := m.Update(key("j"))
+	m = next.(Model)
+	next, _ = m.Update(key("s"))
+	m = next.(Model)
+	if m.mode != modeConfirmSessionStop {
+		t.Fatalf("s on a single session should open the stop confirm, mode=%v", m.mode)
+	}
+	next, cmd := m.Update(key("y"))
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("y should dispatch the stop")
+	}
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+	if stopped != "planner" {
+		t.Fatalf("StopSession called with %q, want planner", stopped)
+	}
+	if m.mode != modeNormal {
+		t.Fatalf("a successful stop should close the confirm, mode=%v", m.mode)
+	}
+}
+
+func TestSessionStopGroupShowsHint(t *testing.T) {
+	deps := Deps{StopSession: func(string) error {
+		t.Fatal("a group row must not call StopSession")
+		return nil
+	}}
+	m := sessionsPageModelWithDeps(t, sessionDetailSnapshot(), deps)
+	// Cursor starts on the collapsed generator group (row 0).
+	next, _ := m.Update(key("s"))
+	m = next.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("s on a group must not open a confirm, mode=%v", m.mode)
+	}
+	if !strings.Contains(m.View(), "agent gc") {
+		t.Fatalf("group stop should hint at gc:\n%s", m.View())
+	}
+}
+
+func TestSessionStopRefusalRendersInline(t *testing.T) {
+	deps := Deps{StopSession: func(string) error {
+		return errors.New("session \"planner\" is running a job; cancel it from Jobs first")
+	}}
+	m := sessionsPageModelWithDeps(t, sessionDetailSnapshot(), deps)
+	next, _ := m.Update(key("j"))
+	m = next.(Model)
+	next, _ = m.Update(key("s"))
+	m = next.(Model)
+	next, cmd := m.Update(key("y"))
+	m = next.(Model)
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+	if m.mode != modeConfirmSessionStop {
+		t.Fatalf("a refused stop should keep the confirm open, mode=%v", m.mode)
+	}
+	if !strings.Contains(m.View(), "running a job") {
+		t.Fatalf("refusal should render inline:\n%s", m.View())
 	}
 }
 

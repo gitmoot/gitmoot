@@ -1556,6 +1556,24 @@ func (s *Store) DeleteAgentInstance(ctx context.Context, name string) error {
 	return requireAffected(result, "agent instance", name)
 }
 
+// StopAgentInstance removes a runtime session (warm agent_instance) by name. It
+// refuses a session that is mid-job (state "running") so an in-flight job is
+// never orphaned — the caller cancels the job first. A missing session errors.
+func (s *Store) StopAgentInstance(ctx context.Context, name string) error {
+	name = strings.TrimSpace(name)
+	instance, err := s.GetAgentInstance(ctx, name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("session %q not found", name)
+	}
+	if err != nil {
+		return err
+	}
+	if instance.State == "running" {
+		return fmt.Errorf("session %q is running a job; cancel it from Jobs first", name)
+	}
+	return s.DeleteAgentInstance(ctx, name)
+}
+
 func (s *Store) DeleteExpiredAgentInstances(ctx context.Context, now time.Time) (int64, error) {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM agent_instances
 		WHERE state = 'idle'

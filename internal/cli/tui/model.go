@@ -54,6 +54,7 @@ const (
 	modeTrainDetail
 	modeJobDetail
 	modeSessionDetail
+	modeConfirmSessionStop
 	modeConfirmJobRetry
 	modeConfirmJobCancel
 	modeTrainStopReason
@@ -99,8 +100,9 @@ type Model struct {
 
 	// Sessions page interaction state.
 	sessionCursor      int     // selected row in sessionRows()
-	activeSession      Session // session shown in modeSessionDetail
+	activeSession      Session // session shown in modeSessionDetail / being stopped
 	activeSessionCount int     // members collapsed into the selected row (>1 for a bg group)
+	sessionNotice      string  // muted note on the Sessions page (e.g. group not stoppable)
 
 	// Jobs page interaction state.
 	jobCursor       int                 // selected row in snap.JobRows
@@ -222,6 +224,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			return m.updateConfigOverlay(msg)
+		case modeSessionDetail, modeConfirmSessionStop:
+			if msg.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+			return m.updateSessionOverlay(msg)
 		}
 		if m.mode != modeNormal {
 			return m.updateOverlay(msg)
@@ -231,6 +238,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "tab", "right":
 			m.selected = (m.selected + 1) % len(pages)
+			m.sessionNotice = ""
 			m.viewport.GotoTop()
 			if cmd := m.maybeLoadHealth(); cmd != nil {
 				cmds = append(cmds, cmd)
@@ -242,6 +250,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.selected < 0 {
 				m.selected = len(pages) - 1
 			}
+			m.sessionNotice = ""
 			m.viewport.GotoTop()
 			if cmd := m.maybeLoadHealth(); cmd != nil {
 				cmds = append(cmds, cmd)
@@ -266,6 +275,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if *cursor > 0 {
 					*cursor--
 				}
+				m.sessionNotice = ""
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
 			}
@@ -274,6 +284,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if *cursor < n-1 {
 					*cursor++
 				}
+				m.sessionNotice = ""
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
 			}
@@ -363,6 +374,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmd := m.openTrainStop(t)
 				m.viewport.SetContent(m.content())
 				return m, cmd
+			}
+			if pages[m.selected].page == pageSessions && m.deps.StopSession != nil {
+				rows := m.sessionRows()
+				if m.sessionCursor < len(rows) {
+					m.openSessionStop(rows[m.sessionCursor])
+				}
+				m.viewport.SetContent(m.content())
+				return m, tea.Batch(cmds...)
 			}
 		case "n":
 			// Form construction touches the database, so it runs as a command
@@ -519,6 +538,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.agentNotice = "note: prompt has no gitmoot_result contract; created anyway"
 			}
 			cmds = append(cmds, agentCreateWithPromptCmd(m.deps, name, runtime, msg.Content))
+		}
+	case sessionActionMsg:
+		if m.mode == modeConfirmSessionStop {
+			m.actionBusy = false
+			if msg.err != nil {
+				m.actionErr = msg.err.Error()
+			} else {
+				m.mode = modeNormal
+				m.actionErr = ""
+			}
+		}
+		if msg.err == nil {
+			if cmd := m.queueLoad(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 		}
 	case trainStopMsg:
 		if m.mode == modeTrainStopReason {

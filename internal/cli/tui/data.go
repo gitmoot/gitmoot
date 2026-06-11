@@ -248,6 +248,10 @@ type Deps struct {
 	// preserving its role/capabilities/repos and clearing the warm session.
 	SetAgentRuntime func(name, runtime string) error
 
+	// StopSession removes a runtime session (warm agent_instance) by name,
+	// refusing one that is mid-job. Wired to store.StopAgentInstance.
+	StopSession func(name string) error
+
 	// EditAgentPrompt opens $EDITOR seeded from the given base template (empty =
 	// a minimal scaffold) and returns a command whose completion delivers an
 	// AgentPromptEditedMsg with the saved content (it is a tea.ExecProcess that
@@ -335,6 +339,11 @@ type jobDetailMsg struct {
 	id     string
 	detail JobDetail
 	err    error
+}
+
+// sessionActionMsg carries the outcome of a Deps.StopSession call.
+type sessionActionMsg struct {
+	err error
 }
 
 // jobActionMsg carries the outcome of a retry/cancel action.

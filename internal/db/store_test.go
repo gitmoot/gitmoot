@@ -1309,6 +1309,50 @@ func TestResourceLockDoesNotRecoverExpiredRunningOwner(t *testing.T) {
 	}
 }
 
+func TestStopAgentInstance(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 6, 11, 12, 0, 0, 0, time.UTC)
+
+	mk := func(name, state string) AgentInstance {
+		return AgentInstance{
+			Name: name, Type: "planner", Runtime: "codex", RuntimeRef: "ref-" + name,
+			RepoFullName: "owner/repo", Role: "planner", State: state,
+			CreatedAt: formatResourceLockTime(now), LastUsedAt: formatResourceLockTime(now),
+			ExpiresAt: formatResourceLockTime(now.Add(time.Minute)),
+		}
+	}
+	if err := store.UpsertAgentInstance(ctx, mk("idle-1", "idle")); err != nil {
+		t.Fatalf("seed idle: %v", err)
+	}
+	if err := store.UpsertAgentInstance(ctx, mk("busy-1", "running")); err != nil {
+		t.Fatalf("seed running: %v", err)
+	}
+
+	// Idle session stops (row removed).
+	if err := store.StopAgentInstance(ctx, "idle-1"); err != nil {
+		t.Fatalf("stop idle: %v", err)
+	}
+	if _, err := store.GetAgentInstance(ctx, "idle-1"); err == nil {
+		t.Fatal("idle session should be gone after stop")
+	}
+	// Running session is refused and left in place.
+	if err := store.StopAgentInstance(ctx, "busy-1"); err == nil || !strings.Contains(err.Error(), "running a job") {
+		t.Fatalf("expected running-refusal, got %v", err)
+	}
+	if _, err := store.GetAgentInstance(ctx, "busy-1"); err != nil {
+		t.Fatalf("running session must survive a refused stop: %v", err)
+	}
+	// Missing session errors.
+	if err := store.StopAgentInstance(ctx, "ghost"); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected not-found, got %v", err)
+	}
+}
+
 func TestAgentInstanceMethods(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
