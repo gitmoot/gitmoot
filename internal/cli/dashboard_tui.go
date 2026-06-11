@@ -398,7 +398,17 @@ func toTUISnapshot(s dashboardSnapshot) tui.Snapshot {
 		out.Agents = append(out.Agents, tui.Agent{Name: a.Name, Runtime: a.Runtime, Role: a.Role, Health: a.Health, TemplateID: a.templateID})
 	}
 	for _, sess := range s.RuntimeSessions {
-		out.Sessions = append(out.Sessions, tui.Session{Name: sess.Name, Runtime: sess.Runtime, Repo: sess.Repo, State: sess.State})
+		out.Sessions = append(out.Sessions, tui.Session{
+			Name:     sess.Name,
+			Runtime:  sess.Runtime,
+			Repo:     sess.Repo,
+			State:    sess.State,
+			Type:     sess.sessionType,
+			Role:     sess.role,
+			Template: sess.templateID,
+			LastUsed: sess.lastUsedAt,
+			Expires:  sess.expiresAt,
+		})
 	}
 	for _, w := range s.Worktrees {
 		out.Worktrees = append(out.Worktrees, tui.Worktree{Task: w.Task, Repo: w.Repo, Path: w.Path})

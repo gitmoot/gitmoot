@@ -115,12 +115,18 @@ type Agent struct {
 	TemplateID string
 }
 
-// Session mirrors cli.dashboardSession.
+// Session mirrors cli.dashboardSession. Type/Role/Template/LastUsed/Expires
+// back the interactive session detail view only (never serialized).
 type Session struct {
-	Name    string
-	Runtime string
-	Repo    string
-	State   string
+	Name     string
+	Runtime  string
+	Repo     string
+	State    string
+	Type     string
+	Role     string
+	Template string
+	LastUsed string
+	Expires  string
 }
 
 // Jobs mirrors cli.dashboardJobs.

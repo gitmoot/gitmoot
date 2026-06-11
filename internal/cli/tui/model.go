@@ -53,6 +53,7 @@ const (
 	modeConfirmDismiss
 	modeTrainDetail
 	modeJobDetail
+	modeSessionDetail
 	modeConfirmJobRetry
 	modeConfirmJobCancel
 	modeTrainStopReason
@@ -94,6 +95,11 @@ type Model struct {
 	actionBusy   bool                 // an action is in flight; suppress re-submit
 	showHelp     bool                 // '?' help overlay
 	tickGen      int                  // current tick chain; stale generations are dropped
+
+	// Sessions page interaction state.
+	sessionCursor      int     // selected row in sessionRows()
+	activeSession      Session // session shown in modeSessionDetail
+	activeSessionCount int     // members collapsed into the selected row (>1 for a bg group)
 
 	// Jobs page interaction state.
 	jobCursor       int                 // selected row in snap.JobRows
@@ -303,6 +309,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, Push(m.deps.OpenTrain(session))
 				}
 				m.openTrainDetail()
+				m.viewport.SetContent(m.content())
+				return m, tea.Batch(cmds...)
+			}
+			if pages[m.selected].page == pageSessions {
+				m.openSessionDetail()
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
 			}
@@ -673,6 +684,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clampTrainCursor()
 			m.clampJobCursor()
 			m.agentCursor = clampCursor(m.agentCursor, len(m.snap.Agents))
+			m.sessionCursor = clampCursor(m.sessionCursor, len(m.sessionRows()))
 			m.configCursor = clampCursor(m.configCursor, len(m.configEditableFields()))
 			// A cancel-requested job that has settled no longer needs the
 			// transitional "cancelling…" label.
@@ -793,6 +805,8 @@ func (m *Model) pageCursor() (*int, int) {
 		return &m.trainCursor, len(m.snap.Trains)
 	case pageAgents:
 		return &m.agentCursor, len(m.snap.Agents)
+	case pageSessions:
+		return &m.sessionCursor, len(m.sessionRows())
 	case pageJobs:
 		return &m.jobCursor, len(m.snap.JobRows)
 	case pageConfig:

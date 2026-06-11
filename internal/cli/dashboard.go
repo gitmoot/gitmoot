@@ -107,6 +107,15 @@ type dashboardSession struct {
 	Runtime string `json:"runtime"`
 	Repo    string `json:"repo,omitempty"`
 	State   string `json:"state,omitempty"`
+
+	// Detail fields shown only in the interactive session detail view. They are
+	// unexported so the --json/--plain output stays byte-stable (mirrors how
+	// dashboardAgent.templateID is carried).
+	sessionType string
+	role        string
+	templateID  string
+	lastUsedAt  string
+	expiresAt   string
 }
 
 type dashboardJobs struct {
@@ -390,7 +399,17 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 			return err
 		}
 		for _, instance := range instances {
-			snapshot.RuntimeSessions = append(snapshot.RuntimeSessions, dashboardSession{Name: instance.Name, Runtime: instance.Runtime, Repo: instance.RepoFullName, State: instance.State})
+			snapshot.RuntimeSessions = append(snapshot.RuntimeSessions, dashboardSession{
+				Name:        instance.Name,
+				Runtime:     instance.Runtime,
+				Repo:        instance.RepoFullName,
+				State:       instance.State,
+				sessionType: instance.Type,
+				role:        instance.Role,
+				templateID:  instance.TemplateID,
+				lastUsedAt:  instance.LastUsedAt,
+				expiresAt:   instance.ExpiresAt,
+			})
 		}
 		jobs, err := store.ListJobs(ctx)
 		if err != nil {

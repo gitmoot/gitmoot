@@ -1,14 +1,12 @@
 package tui
 
 import (
-	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/jerryfane/gitmoot/internal/cli/style"
 )
 
 var (
@@ -80,6 +78,8 @@ func (m Model) content() string {
 	switch m.mode {
 	case modeJobDetail:
 		b.WriteString(m.jobDetailView())
+	case modeSessionDetail:
+		b.WriteString(m.sessionDetailView())
 	case modeConfirmJobRetry, modeConfirmJobCancel:
 		b.WriteString(m.jobConfirmView())
 	case modeTrainStopReason:
@@ -208,6 +208,8 @@ func (m Model) footerHelp() string {
 		return "y confirm  n/esc cancel"
 	case modeConfigEdit:
 		return "type value  enter save  esc cancel"
+	case modeSessionDetail:
+		return "enter/esc back"
 	}
 	switch pages[m.selected].page {
 	case pageAttention:
@@ -216,6 +218,8 @@ func (m Model) footerHelp() string {
 		return "tab/←→ page  ↑/↓ select  enter open  s stop  d delete  ? help  q quit"
 	case pageAgents:
 		return "tab/←→ page  ↑/↓ select  enter detail  n new  o optimize  D delete  ? help  q quit"
+	case pageSessions:
+		return "tab/←→ page  ↑/↓ select  enter detail  ? help  q quit"
 	case pageJobs:
 		return "tab/←→ page  ↑/↓ select  enter detail  R retry  c cancel  ? help  q quit"
 	case pageHealth:
@@ -231,21 +235,6 @@ func (m Model) loadingOr(empty string, loaded bool) string {
 		return empty
 	}
 	return mutedStyle.Render("Loading…")
-}
-
-func (m Model) sessionsContent() string {
-	var b strings.Builder
-	b.WriteString(mutedStyle.Render("Long-lived codex/claude processes gitmoot keeps warm to run jobs; idle ones expire on their own."))
-	b.WriteString("\n\n")
-	if len(m.snap.Sessions) == 0 {
-		b.WriteString(m.loadingOr("No runtime sessions.", !m.loadedAt.IsZero()))
-		return b.String()
-	}
-	for _, line := range groupedSessions(m.snap.Sessions) {
-		b.WriteString(line)
-		b.WriteByte('\n')
-	}
-	return b.String()
 }
 
 func (m Model) locksContent() string {
@@ -292,35 +281,16 @@ func (m Model) locksContent() string {
 		}
 		b.WriteString(renderRows(rows))
 	}
-	return b.String()
-}
 
-// groupedSessions collapses generated "<type>-bg-<hex>" sessions sharing a
-// type/runtime/state into one counted line, mirroring cli.groupedRuntimeSessions.
-func groupedSessions(sessions []Session) []string {
-	type groupKey struct{ prefix, runtime, state string }
-	order := []groupKey{}
-	counts := map[groupKey]int{}
-	singles := []Session{}
-	for _, s := range sessions {
-		if prefix, ok := style.GroupSuffix(s.Name); ok {
-			key := groupKey{prefix: prefix, runtime: s.Runtime, state: s.State}
-			if counts[key] == 0 {
-				order = append(order, key)
-			}
-			counts[key]++
-		} else {
-			singles = append(singles, s)
-		}
-	}
-	lines := make([]string, 0, len(order)+len(singles))
-	for _, key := range order {
-		lines = append(lines, fmt.Sprintf("%s [%s] ×%d %s", key.prefix, key.runtime, counts[key], key.state))
-	}
-	for _, s := range singles {
-		lines = append(lines, fmt.Sprintf("%s [%s] %s %s", s.Name, s.Runtime, dash(s.Repo), s.State))
-	}
-	return lines
+	// What to do: usually nothing — locks clear themselves.
+	b.WriteByte('\n')
+	b.WriteString(mutedStyle.Render("what to do: usually nothing. Stale resource locks clear once the daemon runs (Health → s);"))
+	b.WriteByte('\n')
+	b.WriteString(mutedStyle.Render("branch locks release when their work finishes, or free one with"))
+	b.WriteByte('\n')
+	b.WriteString(mutedStyle.Render("  gitmoot lock release owner/repo <branch> --owner <agent>"))
+	b.WriteByte('\n')
+	return b.String()
 }
 
 func jobStateColor(state string) string {
