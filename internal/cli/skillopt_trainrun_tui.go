@@ -464,6 +464,11 @@ func toTrainRunSnapshot(s skillOptTrainStatusSnapshot) tui.TrainRunSnapshot {
 		out.OptimizerBackend = metadataString(s.Verbose.Optimizer, "run_optimizer_backend")
 		out.OptimizerModel = metadataString(s.Verbose.Optimizer, "run_optimizer_model")
 		out.OptimizerAttempt = metadataString(s.Verbose.Optimizer, "optimizer_attempt")
+		// Surface only a *failed* generation; a succeeded/retried attempt overwrites
+		// the metadata, so this clears itself once generate advances.
+		if metadataString(s.Verbose.Generation, "status") == "failed" {
+			out.GenerationError = strings.TrimSpace(metadataString(s.Verbose.Generation, "error"))
+		}
 	}
 	return out
 }

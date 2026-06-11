@@ -25,6 +25,7 @@ type TrainRunSnapshot struct {
 	CandidateVersion   string
 	CandidateReviewURL string // GitHub comment/issue where the promote/reject decision can also be made
 	NoCandidateReason  string
+	GenerationError    string // non-empty when the last generate attempt failed (surface + offer retry)
 	FeedbackCount      int
 	ReviewItems        int
 	GeneratedOptions   int
@@ -299,6 +300,11 @@ func (m TrainRunModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loadErr = ""
 			m.snap = msg.snap
 			m.loadedAt = msg.at
+			// A surfaced generation failure overrides the optimistic "started in
+			// the background" note — the background step did not succeed.
+			if strings.TrimSpace(msg.snap.GenerationError) != "" {
+				m.resultLines = nil
+			}
 			if long := isLongTrainPhase(msg.snap.Phase); long && !m.spinning {
 				m.spinning = true
 				cmds = append(cmds, m.spin.Tick)
