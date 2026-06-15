@@ -13,6 +13,8 @@ remain the public audit trail.
 - Install Gitmoot's agent skill into a local runtime plugin package.
 - Register a local marketplace named `gitmoot-local`.
 - Help Codex or Claude discover Gitmoot workflow instructions.
+- Add a read-only `SessionStart` presence hook that provides local Gitmoot
+  context when the runtime supports hooks.
 - Point agents to the `gitmoot` CLI for status, jobs, locks, and daemon
   management.
 
@@ -22,6 +24,8 @@ remain the public audit trail.
 - They do not replace `gitmoot daemon start`.
 - They do not install Codex, Claude Code, Git, or GitHub CLI.
 - They do not silently subscribe agents or mutate repository state.
+- Their startup hook does not start daemons, poll GitHub, create jobs, release
+  locks, or act as a slash-command/control surface.
 
 ## Install Gitmoot
 
@@ -77,6 +81,34 @@ gitmoot plugin doctor claude
 Doctor checks the canonical skill, generated package, manifest JSON, copied
 skill, marketplace path, runtime CLI availability, and runtime validation where
 supported.
+
+## Presence Hooks
+
+Generated Codex and Claude packages include a `SessionStart` command hook. On
+startup, resume, clear, and compact events, the runtime runs
+`gitmoot plugin hook-context` with a 5-second timeout and passes the hook event
+JSON on stdin. The command reads the session working directory when available,
+uses local Git and Gitmoot metadata, and returns
+`hookSpecificOutput.additionalContext` for the agent.
+
+The hook is read-only context, not a control surface. It helps agents answer
+Gitmoot health and status questions directly by running relevant read-only CLI
+checks. Agents should mention `gitmoot dashboard` only after the direct answer,
+as a live monitoring follow-up for humans.
+
+Role split:
+
+- Hook: lightweight startup context that fails open when context is unavailable.
+- Agent skill: guidance for choosing safe Gitmoot workflows and commands.
+- Gitmoot CLI: source of truth for status, jobs, locks, agents, plugin doctor,
+  and explicit actions.
+- Dashboard: live monitoring for humans, not a substitute for an agent answer.
+
+Hooks run local commands with the permissions of your runtime session. Review
+the generated hook command before enabling or trusting it. For Codex, plugin
+hooks are skipped until you review and trust the current hook definition. The
+expected Gitmoot command is limited to `gitmoot plugin hook-context` and does
+not mutate Gitmoot or repository state.
 
 ## Use From Codex
 

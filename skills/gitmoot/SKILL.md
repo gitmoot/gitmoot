@@ -44,6 +44,12 @@ same Codex or Claude session, and branch locks protect implementation ownership.
 The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
 
+For Gitmoot health or status questions, run the relevant read-only Gitmoot CLI
+checks and answer directly from the results. Mention `gitmoot dashboard` only
+after that answer, as a live monitoring follow-up. Do not start daemons, create
+agents, change subscriptions, update templates, or release locks unless the user
+asks for that action.
+
 ## Before Acting
 
 1. Check whether `gitmoot` is installed with `gitmoot version`.
@@ -51,8 +57,10 @@ sessions or managed agent types with `max_background` greater than one.
 3. Detect or ask for the target repo before starting daemons, subscribing agents,
    or routing jobs.
 4. Do not start daemons, create agents, update agent templates, or change
-   subscriptions unless the user asks or the current task clearly requires it.
-5. Prefer read-only status commands before mutating Gitmoot state.
+   subscriptions, or release locks unless the user asks or the current task
+   clearly requires it.
+5. Prefer read-only status commands and answer directly before mutating Gitmoot
+   state or pointing the user to live monitoring.
 
 ## Common Commands
 

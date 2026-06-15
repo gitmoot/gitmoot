@@ -541,15 +541,23 @@ same Codex or Claude session, and branch locks protect implementation ownership.
 The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
 
+For Gitmoot health or status questions, run the relevant read-only Gitmoot CLI
+checks and answer directly from the results. Mention `gitmoot dashboard` only
+after that answer, as a live monitoring follow-up. Do not start daemons, create
+agents, change subscriptions, update templates, or release locks unless the user
+asks for that action.
+
 ## Before Acting
 
 1. Check whether `gitmoot` is installed with `gitmoot version`.
 2. Confirm GitHub CLI access with `gh auth status` before using PR workflows.
 3. Detect or ask for the target repo before starting daemons, subscribing agents,
    or routing jobs.
-4. Do not start daemons, create agents, update agent templates, or change subscriptions
-   unless the user asks or the current task clearly requires it.
-5. Prefer read-only status commands before mutating Gitmoot state.
+4. Do not start daemons, create agents, update agent templates, change
+   subscriptions, or release locks unless the user asks or the current task
+   clearly requires it.
+5. Prefer read-only status commands and answer directly before mutating Gitmoot
+   state or pointing the user to live monitoring.
 
 ## Install And Update
 
@@ -1243,6 +1251,8 @@ remain the public audit trail.
 - Install Gitmoot's agent skill into a local runtime plugin package.
 - Register a local marketplace named `gitmoot-local`.
 - Help Codex or Claude discover Gitmoot workflow instructions.
+- Add a read-only `SessionStart` presence hook that provides local Gitmoot
+  context when the runtime supports hooks.
 - Point agents to the `gitmoot` CLI for status, jobs, locks, and daemon
   management.
 
@@ -1252,6 +1262,8 @@ remain the public audit trail.
 - They do not replace `gitmoot daemon start`.
 - They do not install Codex, Claude Code, Git, or GitHub CLI.
 - They do not silently subscribe agents or mutate repository state.
+- Their startup hook does not start daemons, poll GitHub, create jobs, release
+  locks, or act as a slash-command/control surface.
 
 ## Install Gitmoot
 
@@ -1307,6 +1319,34 @@ gitmoot plugin doctor claude
 Doctor checks the canonical skill, generated package, manifest JSON, copied
 skill, marketplace path, runtime CLI availability, and runtime validation where
 supported.
+
+## Presence Hooks
+
+Generated Codex and Claude packages include a `SessionStart` command hook. On
+startup, resume, clear, and compact events, the runtime runs
+`gitmoot plugin hook-context` with a 5-second timeout and passes the hook event
+JSON on stdin. The command reads the session working directory when available,
+uses local Git and Gitmoot metadata, and returns
+`hookSpecificOutput.additionalContext` for the agent.
+
+The hook is read-only context, not a control surface. It helps agents answer
+Gitmoot health and status questions directly by running relevant read-only CLI
+checks. Agents should mention `gitmoot dashboard` only after the direct answer,
+as a live monitoring follow-up for humans.
+
+Role split:
+
+- Hook: lightweight startup context that fails open when context is unavailable.
+- Agent skill: guidance for choosing safe Gitmoot workflows and commands.
+- Gitmoot CLI: source of truth for status, jobs, locks, agents, plugin doctor,
+  and explicit actions.
+- Dashboard: live monitoring for humans, not a substitute for an agent answer.
+
+Hooks run local commands with the permissions of your runtime session. Review
+the generated hook command before enabling or trusting it. For Codex, plugin
+hooks are skipped until you review and trust the current hook definition. The
+expected Gitmoot command is limited to `gitmoot plugin hook-context` and does
+not mutate Gitmoot or repository state.
 
 ## Use From Codex
 
@@ -4560,6 +4600,12 @@ same Codex or Claude session, and branch locks protect implementation ownership.
 The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
 
+For Gitmoot health or status questions, run the relevant read-only Gitmoot CLI
+checks and answer directly from the results. Mention `gitmoot dashboard` only
+after that answer, as a live monitoring follow-up. Do not start daemons, create
+agents, change subscriptions, update templates, or release locks unless the user
+asks for that action.
+
 ## Before Acting
 
 1. Check whether `gitmoot` is installed with `gitmoot version`.
@@ -4567,8 +4613,10 @@ sessions or managed agent types with `max_background` greater than one.
 3. Detect or ask for the target repo before starting daemons, subscribing agents,
    or routing jobs.
 4. Do not start daemons, create agents, update agent templates, or change
-   subscriptions unless the user asks or the current task clearly requires it.
-5. Prefer read-only status commands before mutating Gitmoot state.
+   subscriptions, or release locks unless the user asks or the current task
+   clearly requires it.
+5. Prefer read-only status commands and answer directly before mutating Gitmoot
+   state or pointing the user to live monitoring.
 
 ## Common Commands
 
