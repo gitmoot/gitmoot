@@ -58,16 +58,20 @@ func TestBuildJobReportFormatsRedactedJobReport(t *testing.T) {
 
 	for _, want := range []string{
 		"<!-- gitmoot:dashboard-report fingerprint:",
-		"## Summary",
-		"- **Repository:** owner/repo",
-		"- **Agent:** audit",
-		"- **Runtime:** codex",
-		"- **Action:** ask",
-		"- **Pull request:** #7",
-		"- **Task:** task-1 - Fix report bug token=[REDACTED]",
-		"## Agent Result",
+		"## What happened",
+		"- **Job:** failed ask job for audit in owner/repo",
+		"## Quick context",
+		"| Repository | owner/repo |",
+		"| Agent | audit |",
+		"| Runtime | codex |",
+		"| Action | ask |",
+		"| Pull request | #7 |",
+		"| Task | task-1 - Fix report bug token=[REDACTED] |",
+		"## Agent result",
 		"- **Decision:** failed",
-		"## Recent Events",
+		"<summary>Request instructions</summary>",
+		"<summary>Recent events</summary>",
+		"<summary>Redaction notes</summary>",
 		"Raw runtime outputs omitted: 1 retained locally.",
 		`\/gitmoot merge`,
 	} {
@@ -145,6 +149,43 @@ func TestBuildJobReportTruncatesLongRenderedFieldsAndOmitsRawOutput(t *testing.T
 	}
 	if !strings.Contains(report.Body, "Raw runtime outputs omitted: 1 retained locally.") {
 		t.Fatalf("report missing raw-output omission note:\n%s", report.Body)
+	}
+}
+
+func TestBuildJobReportSummarizesVerboseSelectedError(t *testing.T) {
+	ctx := context.Background()
+	store := openReportStore(t)
+	defer store.Close()
+	verboseError := strings.Join([]string{
+		"delivery failed: OpenAI Codex v0.139.0",
+		"--------",
+		"workdir: /tmp/worktree",
+		"ERROR: You've hit your usage limit.",
+		"tokens used: 9515",
+	}, "\n")
+	payload := workflow.JobPayload{Repo: "owner/repo"}
+	seedReportJob(t, store, db.Job{
+		ID:      "job-verbose",
+		Agent:   "audit",
+		Type:    "implement",
+		State:   string(workflow.JobFailed),
+		Payload: mustReportPayload(t, payload),
+	}, verboseError)
+
+	report, err := BuildJobReport(ctx, store, "job-verbose", JobOptions{})
+	if err != nil {
+		t.Fatalf("BuildJobReport returned error: %v", err)
+	}
+
+	for _, want := range []string{
+		"- **Selected error:** ERROR: You've hit your usage limit.",
+		"<summary>Selected error details</summary>",
+		"delivery failed: OpenAI Codex v0.139.0",
+		"tokens used: 9515",
+	} {
+		if !strings.Contains(report.Body, want) {
+			t.Fatalf("report body missing %q:\n%s", want, report.Body)
+		}
 	}
 }
 

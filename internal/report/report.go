@@ -227,43 +227,16 @@ func renderMarkdown(report Report, data jobReportData) string {
 	builder.WriteString(FingerprintMarker(report.Fingerprint))
 	builder.WriteString("\n\n")
 
-	builder.WriteString("## Summary\n\n")
-	writeBullet(&builder, "Source", report.Source.Kind+" "+report.Source.ID)
-	writeBullet(&builder, "State", report.Source.State)
-	writeBullet(&builder, "Selected error", report.SelectedErrorText)
+	builder.WriteString("## What happened\n\n")
+	selectedErrorSummary := selectedErrorHeadline(report.SelectedErrorText)
+	writeBullet(&builder, "Job", jobSummary(report.Source))
+	writeBullet(&builder, "Selected error", selectedErrorSummary)
 
-	builder.WriteString("\n## Environment\n\n")
-	writeBullet(&builder, "Repository", report.Source.Repo)
-	writeBullet(&builder, "Agent", report.Source.Agent)
-	writeBullet(&builder, "Runtime", report.Source.Runtime)
-	writeBullet(&builder, "Action", report.Source.Action)
-	writeBullet(&builder, "Branch", report.Source.Branch)
-	if report.Source.PullRequest > 0 {
-		writeBullet(&builder, "Pull request", "#"+strconv.Itoa(report.Source.PullRequest))
-	}
-	writeBullet(&builder, "Head SHA", report.Source.HeadSHA)
-
-	builder.WriteString("\n## Job Context\n\n")
-	writeBullet(&builder, "Job ID", report.Source.ID)
-	writeBullet(&builder, "Task", taskLabel(report.Source.TaskID, report.Source.TaskTitle))
-	writeBullet(&builder, "Sender", data.payload.Sender)
-	writeBullet(&builder, "Lead agent", data.payload.LeadAgent)
-	writeBullet(&builder, "Review round", data.payload.ReviewRound)
-	writeBullet(&builder, "Template", data.payload.TemplateID)
-	if len(data.payload.Reviewers) > 0 {
-		writeBullet(&builder, "Reviewers", strings.Join(data.payload.Reviewers, ", "))
-	}
-	if len(data.payload.Constraints) > 0 {
-		writeList(&builder, "Constraints", data.payload.Constraints)
-	}
-	if strings.TrimSpace(data.payload.Instructions) != "" {
-		builder.WriteString("\n### Request Instructions\n\n")
-		builder.WriteString(sanitizeBlock(data.payload.Instructions))
-		builder.WriteString("\n")
-	}
+	builder.WriteString("\n## Quick context\n\n")
+	writeContextTable(&builder, report, data)
 
 	if data.payload.Result != nil {
-		builder.WriteString("\n## Agent Result\n\n")
+		builder.WriteString("\n## Agent result\n\n")
 		writeBullet(&builder, "Decision", data.payload.Result.Decision)
 		writeBullet(&builder, "Summary", data.payload.Result.Summary)
 		writeJSONList(&builder, "Findings", data.payload.Result.Findings)
@@ -273,7 +246,114 @@ func renderMarkdown(report Report, data jobReportData) string {
 		writeList(&builder, "Next agents", data.payload.Result.NextAgents)
 	}
 
-	builder.WriteString("\n## Recent Events\n\n")
+	writeDetails(&builder, "Selected error details", func(details *strings.Builder) {
+		if strings.TrimSpace(report.SelectedErrorText) == "" || strings.TrimSpace(report.SelectedErrorText) == selectedErrorSummary {
+			return
+		}
+		details.WriteString(sanitizeBlock(report.SelectedErrorText))
+		details.WriteString("\n")
+	})
+	writeDetails(&builder, "Request instructions", func(details *strings.Builder) {
+		if strings.TrimSpace(data.payload.Instructions) == "" {
+			return
+		}
+		details.WriteString(sanitizeBlock(data.payload.Instructions))
+		details.WriteString("\n")
+	})
+	writeDetails(&builder, "Job context", func(details *strings.Builder) {
+		writeBullet(details, "Job ID", report.Source.ID)
+		writeBullet(details, "Task", taskLabel(report.Source.TaskID, report.Source.TaskTitle))
+		writeBullet(details, "Sender", data.payload.Sender)
+		writeBullet(details, "Lead agent", data.payload.LeadAgent)
+		writeBullet(details, "Review round", data.payload.ReviewRound)
+		writeBullet(details, "Template", data.payload.TemplateID)
+		if len(data.payload.Reviewers) > 0 {
+			writeBullet(details, "Reviewers", strings.Join(data.payload.Reviewers, ", "))
+		}
+		if len(data.payload.Constraints) > 0 {
+			writeList(details, "Constraints", data.payload.Constraints)
+		}
+	})
+	writeDetails(&builder, "Recent events", func(details *strings.Builder) {
+		writeRecentEvents(details, data)
+	})
+	writeDetails(&builder, "Redaction notes", func(details *strings.Builder) {
+		writeRedactionNotes(details, report)
+	})
+	writeDetails(&builder, "Fingerprint", func(details *strings.Builder) {
+		details.WriteString("`")
+		details.WriteString(report.Fingerprint)
+		details.WriteString("`\n")
+	})
+
+	return workflow.LimitCommentBody(builder.String())
+}
+
+func jobSummary(source SourceMetadata) string {
+	parts := compactStrings([]string{source.State, source.Action, source.Kind})
+	summary := strings.Join(parts, " ")
+	if source.Agent != "" {
+		summary = strings.TrimSpace(summary + " for " + source.Agent)
+	}
+	if source.Repo != "" {
+		summary = strings.TrimSpace(summary + " in " + source.Repo)
+	}
+	return summary
+}
+
+func selectedErrorHeadline(value string) string {
+	lines := compactStrings(strings.Split(strings.ReplaceAll(value, "\r\n", "\n"), "\n"))
+	if len(lines) == 0 {
+		return ""
+	}
+	headline := lines[0]
+	for _, line := range lines {
+		if strings.HasPrefix(strings.ToUpper(line), "ERROR:") {
+			headline = line
+			break
+		}
+	}
+	return limitRunes(headline, 280)
+}
+
+func writeContextTable(builder *strings.Builder, report Report, data jobReportData) {
+	pullRequest := ""
+	if report.Source.PullRequest > 0 {
+		pullRequest = "#" + strconv.Itoa(report.Source.PullRequest)
+	}
+	rows := []struct {
+		label string
+		value string
+	}{
+		{"Repository", report.Source.Repo},
+		{"Job ID", report.Source.ID},
+		{"Agent", report.Source.Agent},
+		{"Runtime", report.Source.Runtime},
+		{"Action", report.Source.Action},
+		{"State", report.Source.State},
+		{"Pull request", pullRequest},
+		{"Branch", report.Source.Branch},
+		{"Task", taskLabel(report.Source.TaskID, report.Source.TaskTitle)},
+		{"Head SHA", report.Source.HeadSHA},
+		{"Template", data.payload.TemplateID},
+	}
+
+	builder.WriteString("| Field | Value |\n")
+	builder.WriteString("| --- | --- |\n")
+	for _, row := range rows {
+		value := sanitizeTableCell(row.value)
+		if value == "" {
+			continue
+		}
+		builder.WriteString("| ")
+		builder.WriteString(sanitizeTableCell(row.label))
+		builder.WriteString(" | ")
+		builder.WriteString(value)
+		builder.WriteString(" |\n")
+	}
+}
+
+func writeRecentEvents(builder *strings.Builder, data jobReportData) {
 	if len(data.recentEvents) == 0 {
 		builder.WriteString("- No job events recorded.\n")
 	} else {
@@ -285,8 +365,9 @@ func renderMarkdown(report Report, data jobReportData) string {
 			builder.WriteString("\n")
 		}
 	}
+}
 
-	builder.WriteString("\n## Redaction Notes\n\n")
+func writeRedactionNotes(builder *strings.Builder, report Report) {
 	for _, note := range report.RedactionSummary.Notes {
 		builder.WriteString("- ")
 		builder.WriteString(sanitizeField(note))
@@ -304,13 +385,20 @@ func renderMarkdown(report Report, data jobReportData) string {
 		builder.WriteString(strconv.Itoa(report.RedactionSummary.RecentEventCount))
 		builder.WriteString(".\n")
 	}
+}
 
-	builder.WriteString("\n## Fingerprint\n\n")
-	builder.WriteString("`")
-	builder.WriteString(report.Fingerprint)
-	builder.WriteString("`\n")
-
-	return workflow.LimitCommentBody(builder.String())
+func writeDetails(builder *strings.Builder, summary string, writeContent func(*strings.Builder)) {
+	var content strings.Builder
+	writeContent(&content)
+	body := strings.TrimSpace(content.String())
+	if body == "" {
+		return
+	}
+	builder.WriteString("\n<details>\n<summary>")
+	builder.WriteString(sanitizeField(summary))
+	builder.WriteString("</summary>\n\n")
+	builder.WriteString(body)
+	builder.WriteString("\n\n</details>\n")
 }
 
 func writeBullet(builder *strings.Builder, label string, value string) {
@@ -558,4 +646,24 @@ func sanitizeBlock(value string) string {
 
 func sanitizeInline(value string) string {
 	return strings.ReplaceAll(sanitizeField(value), "`", "'")
+}
+
+func sanitizeTableCell(value string) string {
+	value = sanitizeField(value)
+	value = strings.ReplaceAll(value, "|", "\\|")
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	value = strings.ReplaceAll(value, "\n", "<br>")
+	return strings.TrimSpace(value)
+}
+
+func limitRunes(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if limit <= 0 {
+		return value
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit]) + " [truncated]"
 }

@@ -126,8 +126,6 @@ func (m Model) content() string {
 			b.WriteString(m.configContent())
 		}
 	}
-	b.WriteString("\n\n")
-	b.WriteString(mutedStyle.Render(m.footerHelp()))
 	return b.String()
 }
 

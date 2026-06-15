@@ -31,7 +31,9 @@ func TestReportBugJobPreviewDefaultsToPreview(t *testing.T) {
 		"Labels: gitmoot-dashboard-report, bug",
 		"Fingerprint: ",
 		"<!-- gitmoot:dashboard-report fingerprint:",
-		"## Recent Events",
+		"## What happened",
+		"## Quick context",
+		"<summary>Recent events</summary>",
 		"failed during delivery",
 	} {
 		if !strings.Contains(output, want) {
@@ -57,8 +59,9 @@ func TestReportBugJobPreviewCreateSmoke(t *testing.T) {
 	for _, want := range []string{
 		"Title: Gitmoot failed job ask for audit in owner/repo",
 		"Labels: gitmoot-dashboard-report, bug",
-		"## Job Context",
-		"## Redaction Notes",
+		"## Quick context",
+		"<summary>Job context</summary>",
+		"<summary>Redaction notes</summary>",
 	} {
 		if !strings.Contains(preview, want) {
 			t.Fatalf("preview output missing %q:\n%s", want, preview)
@@ -90,7 +93,7 @@ func TestReportBugJobPreviewCreateSmoke(t *testing.T) {
 		fake.createInput.Title != "Gitmoot failed job ask for audit in owner/repo" ||
 		strings.Join(fake.createInput.Labels, ",") != "gitmoot-dashboard-report,bug" ||
 		!strings.Contains(fake.createInput.Body, report.FingerprintMarker(fingerprint)) ||
-		!strings.Contains(fake.createInput.Body, "## Recent Events") {
+		!strings.Contains(fake.createInput.Body, "<summary>Recent events</summary>") {
 		t.Fatalf("create input = %+v", fake.createInput)
 	}
 }

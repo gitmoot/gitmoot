@@ -263,6 +263,32 @@ func TestJobsBugReportPreviewCreateFlow(t *testing.T) {
 	}
 }
 
+func TestJobsBugReportPreviewKeepsFooterVisibleForLongBody(t *testing.T) {
+	deps := Deps{
+		BugReportPreview: func(id string) (BugReportPreview, error) {
+			return BugReportPreview{
+				Title:       "Gitmoot failed job ask for planner",
+				Body:        "<!-- gitmoot:dashboard-report fingerprint:abc123 -->\n\n" + strings.Repeat("long preview line\n", 120),
+				Labels:      []string{"gitmoot-dashboard-report", "bug"},
+				Fingerprint: "abc123",
+			}, nil
+		},
+		CreateBugReport: func(id string, preview BugReportPreview) (BugReportCreateResult, error) {
+			return BugReportCreateResult{URL: "https://github.com/jerryfane/gitmoot/issues/777"}, nil
+		},
+	}
+	m := jobsModel(t, deps, jobsSnapshot())
+	next, cmd := m.Update(key("B"))
+	m = next.(Model)
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+
+	view := m.View()
+	if !strings.Contains(view, "g create issue  esc back") {
+		t.Fatalf("long preview should keep the action footer visible without scrolling:\n%s", view)
+	}
+}
+
 func TestJobsBugReportCreateErrorKeepsPreview(t *testing.T) {
 	deps := Deps{
 		BugReportPreview: func(id string) (BugReportPreview, error) {

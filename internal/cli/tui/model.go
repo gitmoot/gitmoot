@@ -852,18 +852,25 @@ func (m Model) View() string {
 	if m.width == 0 {
 		return "Loading..."
 	}
-	sidebar := renderSidebar(m.selected, sidebarWidth(m.width), m.height)
+	sidebarWidth := sidebarWidth(m.width)
+	bodyWidth := max(0, m.width-sidebarWidth-1)
+	sidebar := renderSidebar(m.selected, sidebarWidth, m.height)
+	bodyContent := lipgloss.JoinVertical(
+		lipgloss.Left,
+		m.viewport.View(),
+		mutedStyle.Width(max(1, bodyWidth-2)).Render(m.footerHelp()),
+	)
 	body := bodyStyle.
-		Width(max(0, m.width-sidebarWidth(m.width)-1)).
+		Width(bodyWidth).
 		Height(max(0, m.height)).
-		Render(m.viewport.View())
+		Render(bodyContent)
 	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, body)
 }
 
 func (m *Model) resizeViewport() {
 	sidebar := sidebarWidth(m.width)
 	m.viewport.Width = max(20, m.width-sidebar-3)
-	m.viewport.Height = max(5, m.height-2)
+	m.viewport.Height = max(5, m.height-4)
 }
 
 // queueLoad starts a refresh unless one is already in flight, mirroring the
