@@ -238,6 +238,61 @@ func TestCreateIssueUsesIssuesEndpoint(t *testing.T) {
 	runner.wantArgs(t, 0, "api", "repos/jerryfane/gitmoot/issues", "-f", "title=Review run-1", "-f", "body=body")
 }
 
+func TestCreateIssueAppliesLabelsBestEffort(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{
+			{Stdout: `{"number": 8, "title": "Bug", "state": "open", "html_url": "https://github.com/jerryfane/gitmoot/issues/8"}`},
+			{Stderr: "HTTP 422: Validation Failed"},
+			{Stderr: "HTTP 422: Validation Failed"},
+			{Stderr: "HTTP 422: Validation Failed"},
+		},
+		errs: []error{
+			nil,
+			errors.New("exit status 1"),
+			errors.New("exit status 1"),
+			errors.New("exit status 1"),
+		},
+	}
+	client := GhClient{Runner: runner}
+
+	issue, err := client.CreateIssue(context.Background(), CreateIssueInput{
+		Repo:   Repository{Owner: "jerryfane", Name: "gitmoot"},
+		Title:  "Bug",
+		Body:   "body",
+		Labels: []string{"gitmoot-dashboard-report", "bug"},
+	})
+
+	if err != nil {
+		t.Fatalf("CreateIssue returned error: %v", err)
+	}
+	if issue.Number != 8 {
+		t.Fatalf("issue = %+v", issue)
+	}
+	runner.wantArgs(t, 0, "api", "repos/jerryfane/gitmoot/issues", "-f", "title=Bug", "-f", "body=body")
+	runner.wantArgs(t, 1, "api", "repos/jerryfane/gitmoot/labels", "-f", "name=gitmoot-dashboard-report", "-f", "color=5319e7", "-f", "description=Gitmoot-generated bug report")
+	runner.wantArgs(t, 2, "api", "repos/jerryfane/gitmoot/labels", "-f", "name=bug", "-f", "color=d73a4a", "-f", "description=Something is not working")
+	runner.wantArgs(t, 3, "api", "repos/jerryfane/gitmoot/issues/8/labels", "-f", "labels[]=gitmoot-dashboard-report", "-f", "labels[]=bug")
+}
+
+func TestSearchOpenIssuesUsesIssueSearchEndpoint(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{
+			Stdout: `{"items":[{"number":8,"title":"Bug","state":"open","html_url":"https://github.com/jerryfane/gitmoot/issues/8","body":"<!-- gitmoot:dashboard-report fingerprint:abc -->"}]}`,
+		}},
+	}
+	client := GhClient{Runner: runner}
+
+	issues, err := client.SearchOpenIssues(context.Background(), Repository{Owner: "jerryfane", Name: "gitmoot"}, "<!-- gitmoot:dashboard-report fingerprint:abc -->")
+
+	if err != nil {
+		t.Fatalf("SearchOpenIssues returned error: %v", err)
+	}
+	if len(issues) != 1 || issues[0].Number != 8 || !strings.Contains(issues[0].Body, "fingerprint:abc") {
+		t.Fatalf("issues = %+v", issues)
+	}
+	runner.wantArgs(t, 0, "api", "-X", "GET", "search/issues", "-f", `q=repo:jerryfane/gitmoot is:issue is:open in:body "<!-- gitmoot:dashboard-report fingerprint:abc -->"`)
+}
+
 func TestPreflightChecksGhAuthAndRepoAccess(t *testing.T) {
 	runner := &fakeRunner{
 		results: []subprocess.Result{

@@ -149,12 +149,14 @@ type Issue struct {
 	Title  string `json:"title"`
 	State  string `json:"state"`
 	URL    string `json:"html_url"`
+	Body   string `json:"body"`
 }
 
 type CreateIssueInput struct {
-	Repo  Repository
-	Title string
-	Body  string
+	Repo   Repository
+	Title  string
+	Body   string
+	Labels []string
 }
 
 type CreatePullRequestInput struct {
@@ -468,13 +470,83 @@ func (c *GhClient) PostIssueComment(ctx context.Context, repo Repository, issueN
 	return comment, err
 }
 
+func (c *GhClient) SearchOpenIssues(ctx context.Context, repo Repository, text string) ([]Issue, error) {
+	if strings.TrimSpace(repo.FullName()) == "" {
+		return nil, fmt.Errorf("repository owner/name is required")
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil, fmt.Errorf("issue search text is required")
+	}
+	var response struct {
+		Items []Issue `json:"items"`
+	}
+	query := fmt.Sprintf("repo:%s is:issue is:open in:body %q", repo.FullName(), text)
+	err := c.apiJSON(ctx, false, &response, "-X", "GET", "search/issues", "-f", "q="+query)
+	return response.Items, err
+}
+
 func (c *GhClient) CreateIssue(ctx context.Context, input CreateIssueInput) (Issue, error) {
 	var issue Issue
 	err := c.apiJSON(ctx, true, &issue,
 		endpoint(input.Repo, "issues"),
 		"-f", "title="+input.Title,
 		"-f", "body="+input.Body)
-	return issue, err
+	if err != nil {
+		return Issue{}, err
+	}
+	c.applyIssueLabelsBestEffort(ctx, input.Repo, issue.Number, input.Labels)
+	return issue, nil
+}
+
+func (c *GhClient) applyIssueLabelsBestEffort(ctx context.Context, repo Repository, issueNumber int64, labels []string) {
+	labels = compactUniqueStrings(labels)
+	if strings.TrimSpace(repo.FullName()) == "" || issueNumber <= 0 || len(labels) == 0 {
+		return
+	}
+	for _, label := range labels {
+		color, description := issueLabelMetadata(label)
+		args := []string{
+			"api",
+			endpoint(repo, "labels"),
+			"-f", "name=" + label,
+			"-f", "color=" + color,
+		}
+		if description != "" {
+			args = append(args, "-f", "description="+description)
+		}
+		_, _ = c.run(ctx, true, args...)
+	}
+	args := []string{"api", endpoint(repo, "issues", issueNumber, "labels")}
+	for _, label := range labels {
+		args = append(args, "-f", "labels[]="+label)
+	}
+	_, _ = c.run(ctx, true, args...)
+}
+
+func issueLabelMetadata(label string) (string, string) {
+	switch label {
+	case "gitmoot-dashboard-report":
+		return "5319e7", "Gitmoot-generated bug report"
+	case "bug":
+		return "d73a4a", "Something is not working"
+	default:
+		return "ededed", ""
+	}
+}
+
+func compactUniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	var compacted []string
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		compacted = append(compacted, value)
+	}
+	return compacted
 }
 
 func (c *GhClient) CloseIssue(ctx context.Context, repo Repository, issueNumber int64) (Issue, error) {
@@ -996,6 +1068,10 @@ func (NoopClient) GetPullRequest(context.Context, Repository, int64) (PullReques
 
 func (NoopClient) CreatePullRequest(context.Context, CreatePullRequestInput) (PullRequest, error) {
 	return PullRequest{}, errors.ErrUnsupported
+}
+
+func (NoopClient) SearchOpenIssues(context.Context, Repository, string) ([]Issue, error) {
+	return nil, errors.ErrUnsupported
 }
 
 func (NoopClient) CreateIssue(context.Context, CreateIssueInput) (Issue, error) {

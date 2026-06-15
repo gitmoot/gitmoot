@@ -20,6 +20,8 @@ const (
 	SourceKindJob          = "job"
 	LabelDashboardReport   = "gitmoot-dashboard-report"
 	LabelBug               = "bug"
+	fingerprintMarkerStart = "<!-- gitmoot:dashboard-report fingerprint:"
+	fingerprintMarkerEnd   = " -->"
 	defaultRecentEventSize = 8
 )
 
@@ -60,6 +62,12 @@ type RedactionSummary struct {
 
 type JobOptions struct {
 	RecentEventLimit int
+}
+
+// FingerprintMarker returns the stable markdown marker used for duplicate
+// detection in GitHub issue bodies.
+func FingerprintMarker(fingerprint string) string {
+	return fingerprintMarkerStart + strings.TrimSpace(fingerprint) + fingerprintMarkerEnd
 }
 
 type jobReportData struct {
@@ -216,9 +224,8 @@ func reportTitle(job db.Job, payload workflow.JobPayload) string {
 
 func renderMarkdown(report Report, data jobReportData) string {
 	var builder strings.Builder
-	builder.WriteString("<!-- gitmoot:dashboard-report fingerprint:")
-	builder.WriteString(report.Fingerprint)
-	builder.WriteString(" -->\n\n")
+	builder.WriteString(FingerprintMarker(report.Fingerprint))
+	builder.WriteString("\n\n")
 
 	builder.WriteString("## Summary\n\n")
 	writeBullet(&builder, "Source", report.Source.Kind+" "+report.Source.ID)
