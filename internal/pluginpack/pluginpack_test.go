@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -14,10 +15,11 @@ import (
 func TestBuildCodexPackage(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "gitmoot")
 	result, err := Build(BuildOptions{
-		Provider: ProviderCodex,
-		OutDir:   out,
-		Info:     buildinfo.Info{Version: "v1.2.3"},
-		SourceFS: validSkillFS(),
+		Provider:      ProviderCodex,
+		OutDir:        out,
+		Info:          buildinfo.Info{Version: "v1.2.3"},
+		SourceFS:      validSkillFS(),
+		GitmootBinary: "/opt/Gitmoot App/gitmoot",
 	})
 	if err != nil {
 		t.Fatalf("Build() error = %v", err)
@@ -55,15 +57,34 @@ func TestBuildCodexPackage(t *testing.T) {
 	if !ok || len(defaultPrompt) != 1 || defaultPrompt[0] != "Use $gitmoot to check agent status." {
 		t.Fatalf("manifest defaultPrompt invalid: %#v", manifest["interface"])
 	}
+
+	hooks := readHooksFile(t, HooksPath(out))
+	handler := onlySessionStartHandler(t, hooks)
+	if handler.Type != "command" {
+		t.Fatalf("hook type = %q, want command", handler.Type)
+	}
+	if handler.Command != "'/opt/Gitmoot App/gitmoot' plugin hook-context || true" {
+		t.Fatalf("hook command = %q", handler.Command)
+	}
+	if handler.CommandWindows != `& "/opt/Gitmoot App/gitmoot" plugin hook-context; exit 0` {
+		t.Fatalf("hook commandWindows = %q", handler.CommandWindows)
+	}
+	if handler.Timeout != hookTimeoutSeconds {
+		t.Fatalf("hook timeout = %d, want %d", handler.Timeout, hookTimeoutSeconds)
+	}
+	if handler.StatusMessage != hookStatusMessage {
+		t.Fatalf("hook statusMessage = %q, want %q", handler.StatusMessage, hookStatusMessage)
+	}
 }
 
 func TestBuildClaudePackage(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "gitmoot")
 	_, err := Build(BuildOptions{
-		Provider: ProviderClaude,
-		OutDir:   out,
-		Info:     buildinfo.Info{Version: "dev"},
-		SourceFS: validSkillFS(),
+		Provider:      ProviderClaude,
+		OutDir:        out,
+		Info:          buildinfo.Info{Version: "dev"},
+		SourceFS:      validSkillFS(),
+		GitmootBinary: "/opt/gitmoot/bin/gitmoot",
 	})
 	if err != nil {
 		t.Fatalf("Build() error = %v", err)
@@ -82,6 +103,68 @@ func TestBuildClaudePackage(t *testing.T) {
 	}
 	if _, ok := manifest["skills"]; ok {
 		t.Fatalf("claude manifest should not include codex skills pointer: %#v", manifest)
+	}
+
+	hooks := readHooksFile(t, HooksPath(out))
+	handler := onlySessionStartHandler(t, hooks)
+	wantCommand := "/opt/gitmoot/bin/gitmoot plugin hook-context || true"
+	wantShell := ""
+	if runtime.GOOS == "windows" {
+		wantCommand = `& "/opt/gitmoot/bin/gitmoot" plugin hook-context; exit 0`
+		wantShell = "powershell"
+	}
+	if handler.Command != wantCommand {
+		t.Fatalf("hook command = %q", handler.Command)
+	}
+	if handler.CommandWindows != "" {
+		t.Fatalf("claude hook should not include Codex commandWindows: %+v", handler)
+	}
+	if handler.Shell != wantShell {
+		t.Fatalf("claude hook shell = %q, want %q", handler.Shell, wantShell)
+	}
+	if handler.Timeout != hookTimeoutSeconds || handler.StatusMessage != hookStatusMessage {
+		t.Fatalf("unexpected claude hook handler: %+v", handler)
+	}
+}
+
+func TestHookCommandsFallbackToGitmoot(t *testing.T) {
+	if got := posixHookCommand(""); got != "gitmoot plugin hook-context || true" {
+		t.Fatalf("posixHookCommand fallback = %q", got)
+	}
+	if got := powershellHookCommand(""); got != `& "gitmoot" plugin hook-context; exit 0` {
+		t.Fatalf("powershellHookCommand fallback = %q", got)
+	}
+}
+
+func TestHookCommandQuoting(t *testing.T) {
+	posixPath := "/tmp/git moot/it's/bin/gitmoot"
+	wantPOSIX := `'/tmp/git moot/it'"'"'s/bin/gitmoot' plugin hook-context || true`
+	if got := posixHookCommand(posixPath); got != wantPOSIX {
+		t.Fatalf("posixHookCommand() = %q, want %q", got, wantPOSIX)
+	}
+
+	powershellPath := "C:\\Program Files\\Git\"moot`\\git$moot.exe"
+	wantPowerShell := "& \"C:\\Program Files\\Git`\"moot``\\git`$moot.exe\" plugin hook-context; exit 0"
+	if got := powershellHookCommand(powershellPath); got != wantPowerShell {
+		t.Fatalf("powershellHookCommand() = %q, want %q", got, wantPowerShell)
+	}
+}
+
+func TestClaudeWindowsHookUsesPowerShell(t *testing.T) {
+	hooks, err := hooksManifest(ProviderClaude, `C:\Program Files\Gitmoot\git"moot.exe`, "windows")
+	if err != nil {
+		t.Fatalf("hooksManifest() error = %v", err)
+	}
+	handler := onlySessionStartHandler(t, hooks)
+	if handler.Shell != "powershell" {
+		t.Fatalf("claude Windows hook shell = %q, want powershell", handler.Shell)
+	}
+	wantCommand := "& \"C:\\Program Files\\Gitmoot\\git`\"moot.exe\" plugin hook-context; exit 0"
+	if handler.Command != wantCommand {
+		t.Fatalf("claude Windows hook command = %q, want %q", handler.Command, wantCommand)
+	}
+	if handler.CommandWindows != "" {
+		t.Fatalf("claude Windows hook should not use commandWindows: %+v", handler)
 	}
 }
 
@@ -259,4 +342,32 @@ func readJSON(t *testing.T, path string) map[string]any {
 		t.Fatalf("unmarshal %s: %v\n%s", path, err, content)
 	}
 	return value
+}
+
+func readHooksFile(t *testing.T, path string) hooksFile {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var value hooksFile
+	if err := json.Unmarshal(content, &value); err != nil {
+		t.Fatalf("unmarshal %s: %v\n%s", path, err, content)
+	}
+	return value
+}
+
+func onlySessionStartHandler(t *testing.T, hooks hooksFile) commandHook {
+	t.Helper()
+	groups := hooks.Hooks["SessionStart"]
+	if len(groups) != 1 {
+		t.Fatalf("SessionStart groups = %+v, want one", groups)
+	}
+	if groups[0].Matcher != sessionStartMatcher {
+		t.Fatalf("SessionStart matcher = %q, want %q", groups[0].Matcher, sessionStartMatcher)
+	}
+	if len(groups[0].Hooks) != 1 {
+		t.Fatalf("SessionStart handlers = %+v, want one", groups[0].Hooks)
+	}
+	return groups[0].Hooks[0]
 }

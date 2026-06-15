@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/buildinfo"
@@ -36,12 +37,13 @@ const (
 )
 
 type BuildOptions struct {
-	Provider Provider
-	Home     string
-	OutDir   string
-	Force    bool
-	Info     buildinfo.Info
-	SourceFS fs.FS
+	Provider      Provider
+	Home          string
+	OutDir        string
+	Force         bool
+	Info          buildinfo.Info
+	SourceFS      fs.FS
+	GitmootBinary string
 }
 
 type BuildResult struct {
@@ -79,6 +81,10 @@ func ManifestPath(root string, provider Provider) string {
 	default:
 		return filepath.Join(root, "plugin.json")
 	}
+}
+
+func HooksPath(root string) string {
+	return filepath.Join(root, "hooks", "hooks.json")
 }
 
 func IsGeneratedPackageDir(path string, provider Provider) bool {
@@ -141,6 +147,18 @@ func Build(opts BuildOptions) (BuildResult, error) {
 		return BuildResult{}, err
 	}
 	if err := writeJSON(manifestPath, manifest); err != nil {
+		return BuildResult{}, err
+	}
+
+	hooksPath := HooksPath(outDir)
+	if err := os.MkdirAll(filepath.Dir(hooksPath), 0o755); err != nil {
+		return BuildResult{}, fmt.Errorf("create hooks dir: %w", err)
+	}
+	hooks, err := hooksManifest(provider, opts.GitmootBinary, runtime.GOOS)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	if err := writeJSON(hooksPath, hooks); err != nil {
 		return BuildResult{}, err
 	}
 
@@ -308,6 +326,112 @@ type claudeManifest struct {
 	Homepage    string `json:"homepage"`
 	Repository  string `json:"repository"`
 	License     string `json:"license"`
+}
+
+const (
+	sessionStartMatcher = "startup|resume|clear|compact"
+	hookStatusMessage   = "Loading Gitmoot context"
+	hookTimeoutSeconds  = 5
+)
+
+type hooksFile struct {
+	Hooks map[string][]hookMatcher `json:"hooks"`
+}
+
+type hookMatcher struct {
+	Matcher string        `json:"matcher"`
+	Hooks   []commandHook `json:"hooks"`
+}
+
+type commandHook struct {
+	Type           string `json:"type"`
+	Command        string `json:"command"`
+	CommandWindows string `json:"commandWindows,omitempty"`
+	Shell          string `json:"shell,omitempty"`
+	Timeout        int    `json:"timeout"`
+	StatusMessage  string `json:"statusMessage"`
+}
+
+func hooksManifest(provider Provider, gitmootBinary string, goos string) (hooksFile, error) {
+	handler := commandHook{
+		Type:          "command",
+		Command:       posixHookCommand(gitmootBinary),
+		Timeout:       hookTimeoutSeconds,
+		StatusMessage: hookStatusMessage,
+	}
+	switch provider {
+	case ProviderCodex:
+		handler.CommandWindows = powershellHookCommand(gitmootBinary)
+	case ProviderClaude:
+		if goos == "windows" {
+			handler.Command = powershellHookCommand(gitmootBinary)
+			handler.Shell = "powershell"
+		}
+	default:
+		return hooksFile{}, fmt.Errorf("unknown plugin runtime %q", provider)
+	}
+	return hooksFile{
+		Hooks: map[string][]hookMatcher{
+			"SessionStart": {{
+				Matcher: sessionStartMatcher,
+				Hooks:   []commandHook{handler},
+			}},
+		},
+	}, nil
+}
+
+func posixHookCommand(gitmootBinary string) string {
+	return posixShellQuote(hookBinary(gitmootBinary)) + " plugin hook-context || true"
+}
+
+func powershellHookCommand(gitmootBinary string) string {
+	return "& " + powershellDoubleQuote(hookBinary(gitmootBinary)) + " plugin hook-context; exit 0"
+}
+
+func hookBinary(gitmootBinary string) string {
+	if trimmed := strings.TrimSpace(gitmootBinary); trimmed != "" {
+		return trimmed
+	}
+	return "gitmoot"
+}
+
+func posixShellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	for _, r := range value {
+		if !isPOSIXShellSafe(r) {
+			return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+		}
+	}
+	return value
+}
+
+func isPOSIXShellSafe(r rune) bool {
+	if r >= 'a' && r <= 'z' {
+		return true
+	}
+	if r >= 'A' && r <= 'Z' {
+		return true
+	}
+	if r >= '0' && r <= '9' {
+		return true
+	}
+	switch r {
+	case '/', '.', '_', '-', '+', '=', ':', ',', '@', '%':
+		return true
+	default:
+		return false
+	}
+}
+
+func powershellDoubleQuote(value string) string {
+	escaped := strings.NewReplacer(
+		"`", "``",
+		`"`, "`\"",
+		"$", "`$",
+	).Replace(value)
+	return `"` + escaped + `"`
 }
 
 var semverish = regexp.MustCompile(`^\d+\.\d+\.\d+([-.+][0-9A-Za-z.-]+)?$`)

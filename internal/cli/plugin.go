@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/buildinfo"
+	"github.com/jerryfane/gitmoot/internal/plugincontext"
 	"github.com/jerryfane/gitmoot/internal/plugininstall"
 	"github.com/jerryfane/gitmoot/internal/pluginpack"
 	"github.com/jerryfane/gitmoot/internal/runtime"
@@ -21,7 +22,9 @@ import (
 	"github.com/jerryfane/gitmoot/skills"
 )
 
+var pluginExecutable = os.Executable
 var pluginLookPath = exec.LookPath
+var pluginHookInput io.Reader = os.Stdin
 var pluginInstallRunner subprocess.Runner = subprocess.ExecRunner{}
 var pluginDoctorRunner subprocess.Runner = subprocess.ExecRunner{}
 
@@ -56,6 +59,8 @@ func runPlugin(args []string, stdout, stderr io.Writer) int {
 		return runPluginPath(args[1:], stdout, stderr)
 	case "doctor":
 		return runPluginDoctor(args[1:], stdout, stderr)
+	case "hook-context":
+		return runPluginHookContext(args[1:], stdout, stderr)
 	case "install":
 		return runPluginInstall(args[1:], stdout, stderr)
 	default:
@@ -71,6 +76,29 @@ func printPluginUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot plugin install codex|claude")
 	fmt.Fprintln(w, "  gitmoot plugin path codex|claude")
 	fmt.Fprintln(w, "  gitmoot plugin doctor [codex|claude] [--live]")
+}
+
+func runPluginHookContext(_ []string, stdout, stderr io.Writer) int {
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = ""
+	}
+	input := plugincontext.ReadHookInput(pluginHookInput, cwd)
+	contextText, err := plugincontext.Build(context.Background(), plugincontext.BuildOptions{
+		Input: input,
+	})
+	if err != nil {
+		if err := plugincontext.WriteOutput(stdout, ""); err != nil {
+			fmt.Fprintf(stderr, "plugin hook-context: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	if err := plugincontext.WriteOutput(stdout, contextText); err != nil {
+		fmt.Fprintf(stderr, "plugin hook-context: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 func runPluginInstall(args []string, stdout, stderr io.Writer) int {
@@ -94,12 +122,13 @@ func runPluginInstall(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	result, err := plugininstall.Install(context.Background(), plugininstall.Options{
-		Provider: provider,
-		Home:     paths.Home,
-		Scope:    *scope,
-		Force:    *force,
-		Info:     buildinfo.Current(),
-		Runner:   pluginInstallRunner,
+		Provider:      provider,
+		Home:          paths.Home,
+		Scope:         *scope,
+		Force:         *force,
+		Info:          buildinfo.Current(),
+		Runner:        pluginInstallRunner,
+		GitmootBinary: resolveGitmootBinary(),
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "plugin install: %v\n", err)
@@ -164,11 +193,12 @@ func runPluginBuild(args []string, stdout, stderr io.Writer) int {
 		homePath = paths.Home
 	}
 	result, err := pluginpack.Build(pluginpack.BuildOptions{
-		Provider: provider,
-		Home:     homePath,
-		OutDir:   *outDir,
-		Force:    *force,
-		Info:     buildinfo.Current(),
+		Provider:      provider,
+		Home:          homePath,
+		OutDir:        *outDir,
+		Force:         *force,
+		Info:          buildinfo.Current(),
+		GitmootBinary: resolveGitmootBinary(),
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "plugin build: %v\n", err)
@@ -176,6 +206,24 @@ func runPluginBuild(args []string, stdout, stderr io.Writer) int {
 	}
 	writeLine(stdout, "%s", result.Path)
 	return 0
+}
+
+func resolveGitmootBinary() string {
+	if executable, err := pluginExecutable(); err == nil && filepath.IsAbs(executable) {
+		return executable
+	}
+	path, err := pluginLookPath("gitmoot")
+	if err != nil || strings.TrimSpace(path) == "" {
+		return ""
+	}
+	path = strings.TrimSpace(path)
+	if filepath.IsAbs(path) {
+		return path
+	}
+	if absolute, err := filepath.Abs(path); err == nil {
+		return absolute
+	}
+	return ""
 }
 
 func runPluginPath(args []string, stdout, stderr io.Writer) int {

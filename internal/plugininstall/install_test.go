@@ -124,6 +124,28 @@ func TestInstallMissingRuntimeKeepsGeneratedFiles(t *testing.T) {
 	}
 }
 
+func TestInstallBuildsHookManifestsWithGitmootBinary(t *testing.T) {
+	home := filepath.Join(t.TempDir(), ".gitmoot")
+	result, err := Install(context.Background(), Options{
+		Provider:      pluginpack.ProviderCodex,
+		Home:          home,
+		Runner:        &fakeRunner{},
+		GitmootBinary: "/opt/Gitmoot App/gitmoot",
+	})
+	if err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	for _, path := range []string{
+		filepath.Join(result.PackagePath, "hooks", "hooks.json"),
+		filepath.Join(result.MarketplaceRoot, "plugins", pluginpack.PluginName, "hooks", "hooks.json"),
+	} {
+		command := readSessionStartCommand(t, path)
+		if command != "'/opt/Gitmoot App/gitmoot' plugin hook-context || true" {
+			t.Fatalf("%s command = %q", path, command)
+		}
+	}
+}
+
 func TestInstallMarketplaceIsIdempotent(t *testing.T) {
 	home := filepath.Join(t.TempDir(), ".gitmoot")
 	runner := &fakeRunner{paths: map[string]string{"codex": "/bin/codex"}}
@@ -262,4 +284,21 @@ func readJSONFile(t *testing.T, path string, out any) {
 	if err := json.Unmarshal(content, out); err != nil {
 		t.Fatalf("unmarshal %s: %v\n%s", path, err, content)
 	}
+}
+
+func readSessionStartCommand(t *testing.T, path string) string {
+	t.Helper()
+	var payload struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	readJSONFile(t, path, &payload)
+	groups := payload.Hooks["SessionStart"]
+	if len(groups) != 1 || len(groups[0].Hooks) != 1 {
+		t.Fatalf("unexpected hook manifest %s: %+v", path, payload)
+	}
+	return groups[0].Hooks[0].Command
 }

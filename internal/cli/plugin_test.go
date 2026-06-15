@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,6 +46,7 @@ func TestRunPluginBuildPrintsPackagePath(t *testing.T) {
 	for _, path := range []string{
 		filepath.Join(packagePath, ".claude-plugin", "plugin.json"),
 		filepath.Join(packagePath, "skills", "gitmoot", "SKILL.md"),
+		filepath.Join(packagePath, "hooks", "hooks.json"),
 	} {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("expected generated file %s: %v", path, err)
@@ -66,6 +68,9 @@ func TestRunPluginBuildExplicitOutDoesNotNeedHome(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(out, ".codex-plugin", "plugin.json")); err != nil {
 		t.Fatalf("codex manifest missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "hooks", "hooks.json")); err != nil {
+		t.Fatalf("hook manifest missing: %v", err)
 	}
 }
 
@@ -105,6 +110,114 @@ func TestRunPluginPathHelpBeforeRuntime(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "-home") {
 		t.Fatalf("plugin path --help missing flag help:\n%s", stderr.String())
+	}
+}
+
+func TestResolveGitmootBinaryPrefersExecutable(t *testing.T) {
+	restoreExecutable := stubPluginExecutable(func() (string, error) {
+		return "/tmp/current/gitmoot", nil
+	})
+	defer restoreExecutable()
+	restorePath := stubPluginLookPath(map[string]string{"gitmoot": "/tmp/path/gitmoot"})
+	defer restorePath()
+
+	if got := resolveGitmootBinary(); got != "/tmp/current/gitmoot" {
+		t.Fatalf("resolveGitmootBinary() = %q, want current executable", got)
+	}
+}
+
+func TestResolveGitmootBinaryFallsBackToLookPath(t *testing.T) {
+	restoreExecutable := stubPluginExecutable(func() (string, error) {
+		return "", errors.New("not available")
+	})
+	defer restoreExecutable()
+	restorePath := stubPluginLookPath(map[string]string{"gitmoot": "/tmp/path/gitmoot"})
+	defer restorePath()
+
+	if got := resolveGitmootBinary(); got != "/tmp/path/gitmoot" {
+		t.Fatalf("resolveGitmootBinary() = %q, want PATH binary", got)
+	}
+}
+
+func TestRunPluginHookContextSuccessAndOutputShape(t *testing.T) {
+	cwd := t.TempDir()
+	input, err := json.Marshal(map[string]string{
+		"cwd":             cwd,
+		"hook_event_name": "SessionStart",
+	})
+	if err != nil {
+		t.Fatalf("marshal hook input: %v", err)
+	}
+	restore := replacePluginHookInput(bytes.NewReader(input))
+	defer restore()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"plugin", "hook-context"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("plugin hook-context exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("plugin hook-context stderr = %q, want empty", stderr.String())
+	}
+	var output struct {
+		HookSpecificOutput struct {
+			HookEventName     string `json:"hookEventName"`
+			AdditionalContext string `json:"additionalContext"`
+		} `json:"hookSpecificOutput"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+		t.Fatalf("hook-context output did not parse: %v\n%s", err, stdout.String())
+	}
+	if output.HookSpecificOutput.HookEventName != "SessionStart" {
+		t.Fatalf("hook event = %q, want SessionStart", output.HookSpecificOutput.HookEventName)
+	}
+	contextText := output.HookSpecificOutput.AdditionalContext
+	for _, want := range []string{
+		"- cwd: \"" + cwd + "\"",
+		"- repo: not detected",
+		"`gitmoot dashboard`",
+		"answer directly",
+		"live monitoring follow-up",
+	} {
+		if !strings.Contains(contextText, want) {
+			t.Fatalf("additional context missing %q:\n%s", want, contextText)
+		}
+	}
+}
+
+func TestRunPluginHookContextMalformedInputStillSucceeds(t *testing.T) {
+	restore := replacePluginHookInput(strings.NewReader("{not json"))
+	defer restore()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"plugin", "hook-context"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("plugin hook-context exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("plugin hook-context stderr = %q, want empty", stderr.String())
+	}
+	var output map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+		t.Fatalf("hook-context output did not parse: %v\n%s", err, stdout.String())
+	}
+	if _, ok := output["hookSpecificOutput"]; !ok {
+		t.Fatalf("hookSpecificOutput missing from malformed-input fallback: %s", stdout.String())
+	}
+}
+
+func TestRunPluginUsageDoesNotListHookContext(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	code := Run([]string{"plugin", "--help"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("plugin --help exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), "hook-context") {
+		t.Fatalf("plugin help should not list hidden hook-context:\n%s", stdout.String())
 	}
 }
 
@@ -334,6 +447,22 @@ func stubPluginLookPath(paths map[string]string) func() {
 	}
 	return func() {
 		pluginLookPath = original
+	}
+}
+
+func stubPluginExecutable(fn func() (string, error)) func() {
+	original := pluginExecutable
+	pluginExecutable = fn
+	return func() {
+		pluginExecutable = original
+	}
+}
+
+func replacePluginHookInput(r io.Reader) func() {
+	original := pluginHookInput
+	pluginHookInput = r
+	return func() {
+		pluginHookInput = original
 	}
 }
 

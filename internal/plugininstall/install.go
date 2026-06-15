@@ -20,12 +20,13 @@ const (
 )
 
 type Options struct {
-	Provider pluginpack.Provider
-	Home     string
-	Scope    string
-	Force    bool
-	Info     buildinfo.Info
-	Runner   subprocess.Runner
+	Provider      pluginpack.Provider
+	Home          string
+	Scope         string
+	Force         bool
+	Info          buildinfo.Info
+	Runner        subprocess.Runner
+	GitmootBinary string
 }
 
 type Result struct {
@@ -62,11 +63,11 @@ func Install(ctx context.Context, opts Options) (Result, error) {
 	marketplaceRoot := pluginpack.DefaultMarketplaceDir(opts.Home, provider)
 	packagePath := pluginpack.DefaultPackageDir(opts.Home, provider)
 	marketplacePackagePath := filepath.Join(marketplaceRoot, "plugins", pluginpack.PluginName)
-	build, err := buildPackage(provider, opts.Home, packagePath, opts.Force, opts.Info)
+	build, err := buildPackage(provider, opts.Home, packagePath, opts.Force, opts.Info, opts.GitmootBinary)
 	if err != nil {
 		return Result{}, err
 	}
-	if _, err := buildPackage(provider, opts.Home, marketplacePackagePath, opts.Force, opts.Info); err != nil {
+	if _, err := buildPackage(provider, opts.Home, marketplacePackagePath, opts.Force, opts.Info, opts.GitmootBinary); err != nil {
 		return Result{}, err
 	}
 
@@ -113,7 +114,7 @@ func Install(ctx context.Context, opts Options) (Result, error) {
 	return result, nil
 }
 
-func buildPackage(provider pluginpack.Provider, home string, outDir string, force bool, info buildinfo.Info) (pluginpack.BuildResult, error) {
+func buildPackage(provider pluginpack.Provider, home string, outDir string, force bool, info buildinfo.Info, gitmootBinary string) (pluginpack.BuildResult, error) {
 	buildForce := force
 	if !buildForce {
 		if exists, err := pathExists(outDir); err != nil {
@@ -123,11 +124,12 @@ func buildPackage(provider pluginpack.Provider, home string, outDir string, forc
 		}
 	}
 	return pluginpack.Build(pluginpack.BuildOptions{
-		Provider: provider,
-		Home:     home,
-		OutDir:   outDir,
-		Force:    buildForce,
-		Info:     info,
+		Provider:      provider,
+		Home:          home,
+		OutDir:        outDir,
+		Force:         buildForce,
+		Info:          info,
+		GitmootBinary: gitmootBinary,
 	})
 }
 
