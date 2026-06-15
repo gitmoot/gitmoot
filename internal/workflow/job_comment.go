@@ -127,6 +127,18 @@ func formatFinding(raw json.RawMessage) string {
 	return string(raw)
 }
 
+// LimitCommentText applies the same redaction, truncation, and command
+// neutralization used for GitHub job result comments.
+func LimitCommentText(value string) string {
+	return limitCommentText(value)
+}
+
+// LimitCommentBody applies the same total body cap used for GitHub job result
+// comments, including redaction and command neutralization.
+func LimitCommentBody(value string) string {
+	return limitCommentBody(value)
+}
+
 func limitCommentText(value string) string {
 	value = RedactCommentText(value)
 	value = strings.TrimSpace(value)
