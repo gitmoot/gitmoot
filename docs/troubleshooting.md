@@ -25,6 +25,41 @@ Fixes:
 - Confirm the `--repo owner/repo` value matches the checkout remote.
 - Retry after GitHub rate limits clear.
 
+## Reporting A Gitmoot Failure
+
+Symptoms:
+
+- A job is failed, blocked, or cancelled and the user wants to send the details
+  upstream.
+- The dashboard shows `B report bug` for the selected job.
+- An agent needs to file a report without copying raw runtime logs into chat.
+
+Checks:
+
+```sh
+gitmoot job show <job-id>
+gitmoot report bug --job <job-id> --preview
+```
+
+Fixes:
+
+- Preview first. The report builder redacts secrets, omits raw runtime output by
+  default, includes recent job events and selected error context, and adds the
+  `gitmoot-dashboard-report` / `bug` labels.
+- Create the issue only when the user explicitly asks or the active workflow
+  policy allows it:
+
+  ```sh
+  gitmoot report bug --job <job-id> --create --yes
+  ```
+
+- Report the printed GitHub issue URL back to the user. If Gitmoot prints
+  `existing issue: ...`, use that URL instead of creating or describing a new
+  issue.
+- In the dashboard TUI, press `B` on a failed, blocked, or cancelled job to open
+  the same redacted preview. Press `g` from that preview to create or reuse the
+  issue; errors stay inline so the preview is not lost.
+
 ## SkillOpt Review Operations
 
 Symptoms:

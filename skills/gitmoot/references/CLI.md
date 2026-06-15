@@ -72,9 +72,9 @@ page can act, and each action runs the same store/workflow code as its CLI
 equivalent:
 
 - **Attention** lists pending prompts (`a` answer inline, `d` dismiss) and the
-  actual blocked/failed jobs with their latest event message (`enter` detail,
-  `R` retry). A red banner appears when the daemon is stopped; `s` restarts it
-  with its previously persisted flags.
+  actual blocked/failed/cancelled jobs with their latest event message
+  (`enter` detail, `R` retry, `B` report bug). A red banner appears when the
+  daemon is stopped; `s` restarts it with its previously persisted flags.
 - **Trains** lists every train session: `enter` opens ANY session's live phase
   view (not just the newest), `s` stops a live session (a reason is required;
   same path as `skillopt train stop`), `d` deletes a finished session and its
@@ -95,7 +95,9 @@ equivalent:
   history, `R` retries failed/blocked/cancelled jobs (same path as
   `gitmoot job retry`), `c` cancels queued AND running jobs (same as
   `gitmoot job cancel`; running ones show `cancelling…` until the daemon
-  settles them).
+  settles them), and `B` opens a redacted bug-report preview for
+  failed/blocked/cancelled jobs. In the preview, `g` creates or reuses the
+  GitHub issue and keeps the issue URL visible.
 - **Locks** explains and lists locks, stale resource locks first in red (the
   owning process died; a running daemon reclaims them automatically); active
   locks collapse to a count. Branch locks are released with
@@ -125,6 +127,37 @@ In the one-shot styled output the dashboard leads with a "needs attention" block
 colors and truncates long lists, and groups near-identical runtime sessions;
 `--all` shows everything. `--watch` redraws on an interval (default 5s) and cannot
 be combined with `--json`, `--answer`, or `--dismiss`.
+
+## Bug Reports
+
+Use `gitmoot report bug` to build a redacted GitHub-ready issue from local
+Gitmoot error state. Job reports are fully supported; daemon, dashboard, and
+train selectors are reserved and return clear unsupported-source errors until
+their source collectors are implemented.
+
+```sh
+gitmoot report bug --job <job-id> [--preview]
+gitmoot report bug --job <job-id> --create --yes
+gitmoot report bug --source daemon --preview
+gitmoot report bug --source dashboard --preview
+gitmoot report bug --train <session-id> --create --yes
+```
+
+Default behavior is preview. Agents should run preview first, show or summarize
+the redacted draft, and create an issue only when the user explicitly asks or
+the active workflow policy already permits filing reports. Non-interactive
+creation requires `--create --yes`.
+
+Created reports target `jerryfane/gitmoot`, include the labels
+`gitmoot-dashboard-report` and `bug`, and carry a fingerprint marker in the
+body so duplicate open issues can be reused instead of creating another report.
+If duplicate search fails in the CLI path, Gitmoot prints a warning and still
+creates the issue; dashboard creates fail closed and keep the preview open so
+the user can retry.
+
+After creation, report the printed issue URL back to the user. If Gitmoot says
+an existing issue was found, report that URL instead of presenting it as a new
+issue.
 
 ## Agent Setup
 

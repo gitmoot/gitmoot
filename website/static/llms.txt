@@ -17,11 +17,11 @@ workflows.
 
 ## References
 
-- [CLI Reference](https://gitmoot.io/docs/reference/cli): Commands for install, dashboard/TUI, agents, jobs, locks, goals, and SkillOpt.
+- [CLI Reference](https://gitmoot.io/docs/reference/cli): Commands for install, dashboard/TUI, agents, jobs, bug reports, locks, goals, and SkillOpt.
 - [Runtime Adapters](https://gitmoot.io/docs/reference/runtime-adapters): Codex, Claude Code, shell, and future runtimes.
 - [Codex And Claude Plugins](https://gitmoot.io/docs/plugins/codex-claude): Plugin discovery and runtime skill setup.
 - [SkillOpt Exchange Contract](https://gitmoot.io/docs/reference/skillopt-exchange-contract): Training and candidate package boundary for the external optimizer.
-- [Troubleshooting](https://gitmoot.io/docs/operations/troubleshooting): Diagnose GitHub auth, runtimes, agent templates, remotes, permissions, and locks.
+- [Troubleshooting](https://gitmoot.io/docs/operations/troubleshooting): Diagnose GitHub auth, bug reports, runtimes, agent templates, remotes, permissions, and locks.
 - [Release Notes](https://gitmoot.io/docs/release-notes/v0.3.0-beta.1): Latest beta notes, dashboard/TUI details, and known limits.
 - [Raw SKILL.md](https://gitmoot.io/SKILL.md): Agent skill entrypoint.
 - [Full LLM Context](https://gitmoot.io/llms-full.txt): Expanded Markdown context for agents.

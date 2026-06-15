@@ -71,11 +71,22 @@ Add `--background` only when the user wants a queued background job. Use
 `gitmoot job list --repo owner/repo` for queued or recent jobs. Use
 `gitmoot plugin doctor` when checking whether Codex or Claude Code can discover
 Gitmoot through an installed runtime plugin. Use `gitmoot goal template` when
-writing a standard task-by-task goal file.
+writing a standard task-by-task goal file. Use
+`gitmoot report bug --job <job-id> --preview` to inspect a redacted GitHub issue
+draft for failed, blocked, or cancelled jobs; use
+`gitmoot report bug --job <job-id> --create --yes` only when the user
+explicitly asks you to file it or the active workflow policy permits automatic
+bug filing.
 
 The plugin is only the runtime discovery surface for this skill. Local agent
 invocation still goes through the `gitmoot` CLI and the same registered agent,
 repo access, runtime adapter, and job history model used by PR-comment jobs.
+
+For Gitmoot bug reports, preview by default and treat the preview as the
+confirmation surface. Generated reports include redacted job context, recent
+events, labels, and a fingerprint marker for duplicate detection. After
+creation, tell the user the printed issue URL; if Gitmoot reused an existing
+issue, report that URL as existing instead of new.
 
 For SkillOpt template learning, prefer the high-level
 `gitmoot skillopt train start/status/continue/stop` workflow when the user wants
