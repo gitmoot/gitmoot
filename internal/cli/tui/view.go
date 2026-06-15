@@ -214,7 +214,7 @@ func (m Model) footerHelp() string {
 			return "esc back"
 		}
 		if m.actionBusy {
-			return "creating issue…  esc back"
+			return "creating issue…"
 		}
 		if m.bugReportLoaded && m.bugReportErr == "" && m.deps.CreateBugReport != nil {
 			return "g create issue  esc back"

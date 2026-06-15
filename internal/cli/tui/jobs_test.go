@@ -245,6 +245,9 @@ func TestJobsBugReportPreviewCreateFlow(t *testing.T) {
 	if cmd == nil || !m.actionBusy {
 		t.Fatalf("g should start issue creation, busy=%v cmd=%v", m.actionBusy, cmd)
 	}
+	if got := m.footerHelp(); strings.Contains(got, "esc back") || !strings.Contains(got, "creating issue") {
+		t.Fatalf("busy footer help = %q, want creating state without esc back", got)
+	}
 	next, _ = m.Update(cmd())
 	m = next.(Model)
 	if created != "j-failed" {
