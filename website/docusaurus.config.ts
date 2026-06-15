@@ -5,7 +5,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 const config: Config = {
   title: 'Gitmoot',
   tagline: 'Local-first multi-agent coordination for software projects',
-  favicon: 'img/gitmoot-logo.svg',
+  favicon: 'img/favicon.svg',
 
   url: 'https://gitmoot.io',
   baseUrl: '/docs/',
@@ -64,7 +64,7 @@ const config: Config = {
   ],
 
   themeConfig: {
-    image: 'img/gitmoot-hero.png',
+    image: 'https://gitmoot.io/gitmoot-og-image.png',
     colorMode: {
       defaultMode: 'dark',
       respectPrefersColorScheme: false,
@@ -73,7 +73,7 @@ const config: Config = {
       title: 'Gitmoot',
       logo: {
         alt: 'Gitmoot',
-        src: 'img/gitmoot-logo.svg',
+        src: 'img/gitmoot-char.svg',
         href: '/intro',
       },
       items: [
@@ -91,13 +91,18 @@ const config: Config = {
           label: 'GitHub',
           position: 'right',
         },
+        {
+          href: 'https://discord.gg/TTFRHFyDXf',
+          label: 'Discord',
+          position: 'right',
+        },
       ],
     },
     footer: {
       style: 'dark',
       logo: {
         alt: 'Gitmoot',
-        src: 'img/gitmoot-logo.svg',
+        src: 'img/gitmoot-char.svg',
         href: '/intro',
         width: 28,
         height: 28,
@@ -107,6 +112,7 @@ const config: Config = {
         {label: 'SKILL.md', href: 'https://gitmoot.io/SKILL.md'},
         {label: 'Website', href: 'https://gitmoot.io'},
         {label: 'GitHub', href: 'https://github.com/jerryfane/gitmoot'},
+        {label: 'Discord', href: 'https://discord.gg/TTFRHFyDXf'},
       ],
       copyright: `© ${new Date().getFullYear()} Gitmoot`,
     },
