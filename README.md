@@ -276,8 +276,9 @@ Attention page (plus `s` to restart a stopped daemon), open/stop/delete train
 sessions (with optional cleanup of GitHub repos gitmoot created for them),
 create/delete agents, revert a template to a previous version, start a training
 run for an agent with a codex/claude backend pick (`o`), and cancel queued or
-running jobs. Press `?` on any page for its keys. Piped/`--plain`/`--json`
-output is unchanged and script-stable.
+running jobs. For failed, blocked, or cancelled jobs, `B` opens a redacted bug
+report preview and `g` creates or reuses a GitHub issue. Press `?` on any page
+for its keys. Piped/`--plain`/`--json` output is unchanged and script-stable.
 
 ```sh
 gitmoot dashboard           # interactive cockpit
@@ -293,10 +294,18 @@ gitmoot job list --repo owner/repo
 gitmoot job show <job-id>
 gitmoot job retry <job-id>
 gitmoot job cancel <job-id>
+gitmoot report bug --job <job-id> [--preview]
+gitmoot report bug --job <job-id> --create --yes
 gitmoot daemon logs
 gitmoot lock list --repo owner/repo
 gitmoot lock release owner/repo <branch> --owner <agent>
 ```
+
+`gitmoot report bug` builds a redacted issue draft with job context, selected
+error, recent events, redaction notes, labels, and a duplicate-detection
+fingerprint. Agents should preview first and create only when the user explicitly
+asks or the active workflow policy allows filing the report, then return the
+created or existing issue URL.
 
 ### SkillOpt Exchange
 

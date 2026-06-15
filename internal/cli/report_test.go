@@ -43,6 +43,58 @@ func TestReportBugJobPreviewDefaultsToPreview(t *testing.T) {
 	}
 }
 
+func TestReportBugJobPreviewCreateSmoke(t *testing.T) {
+	home := seedCLIReportJob(t)
+	var previewOut, previewErr bytes.Buffer
+
+	code := Run([]string{"report", "bug", "--home", home, "--job", "job-failed", "--preview"}, &previewOut, &previewErr)
+
+	if code != 0 {
+		t.Fatalf("report bug preview exit code = %d, stderr=%s", code, previewErr.String())
+	}
+	preview := previewOut.String()
+	fingerprint := previewFingerprint(t, preview)
+	for _, want := range []string{
+		"Title: Gitmoot failed job ask for audit in owner/repo",
+		"Labels: gitmoot-dashboard-report, bug",
+		"## Job Context",
+		"## Redaction Notes",
+	} {
+		if !strings.Contains(preview, want) {
+			t.Fatalf("preview output missing %q:\n%s", want, preview)
+		}
+	}
+
+	fake := &reportFakeGitHub{
+		createdIssue: github.Issue{Number: 291, URL: "https://github.com/jerryfane/gitmoot/issues/291"},
+	}
+	restore := replaceReportGitHubClient(fake)
+	defer restore()
+	var createOut, createErr bytes.Buffer
+
+	code = Run([]string{"report", "bug", "--home", home, "--job", "job-failed", "--create", "--yes"}, &createOut, &createErr)
+
+	if code != 0 {
+		t.Fatalf("report bug create exit code = %d, stderr=%s", code, createErr.String())
+	}
+	if createOut.String() != "created issue: https://github.com/jerryfane/gitmoot/issues/291\n" {
+		t.Fatalf("stdout = %q", createOut.String())
+	}
+	if createErr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", createErr.String())
+	}
+	if len(fake.searches) != 1 || !strings.Contains(fake.searches[0], fingerprint) {
+		t.Fatalf("searches = %+v, want fingerprint %q", fake.searches, fingerprint)
+	}
+	if fake.createInput.Repo.FullName() != "jerryfane/gitmoot" ||
+		fake.createInput.Title != "Gitmoot failed job ask for audit in owner/repo" ||
+		strings.Join(fake.createInput.Labels, ",") != "gitmoot-dashboard-report,bug" ||
+		!strings.Contains(fake.createInput.Body, report.FingerprintMarker(fingerprint)) ||
+		!strings.Contains(fake.createInput.Body, "## Recent Events") {
+		t.Fatalf("create input = %+v", fake.createInput)
+	}
+}
+
 func TestReportBugCreateRequiresYes(t *testing.T) {
 	home := seedCLIReportJob(t)
 	var stdout, stderr bytes.Buffer
@@ -173,6 +225,22 @@ func seedCLIReportJob(t *testing.T) string {
 		t.Fatalf("CreateJobWithEvent returned error: %v", err)
 	}
 	return home
+}
+
+func previewFingerprint(t *testing.T, output string) string {
+	t.Helper()
+	const prefix = "Fingerprint: "
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			fingerprint := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+			if fingerprint == "" {
+				t.Fatal("preview fingerprint was empty")
+			}
+			return fingerprint
+		}
+	}
+	t.Fatalf("preview fingerprint missing:\n%s", output)
+	return ""
 }
 
 func replaceReportGitHubClient(client reportGitHubClient) func() {

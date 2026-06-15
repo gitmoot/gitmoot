@@ -286,8 +286,9 @@ Attention page (plus `s` to restart a stopped daemon), open/stop/delete train
 sessions (with optional cleanup of GitHub repos gitmoot created for them),
 create/delete agents, revert a template to a previous version, start a training
 run for an agent with a codex/claude backend pick (`o`), and cancel queued or
-running jobs. Press `?` on any page for its keys. Piped/`--plain`/`--json`
-output is unchanged and script-stable.
+running jobs. For failed, blocked, or cancelled jobs, `B` opens a redacted bug
+report preview and `g` creates or reuses a GitHub issue. Press `?` on any page
+for its keys. Piped/`--plain`/`--json` output is unchanged and script-stable.
 
 ```sh
 gitmoot dashboard           # interactive cockpit
@@ -303,10 +304,18 @@ gitmoot job list --repo owner/repo
 gitmoot job show <job-id>
 gitmoot job retry <job-id>
 gitmoot job cancel <job-id>
+gitmoot report bug --job <job-id> [--preview]
+gitmoot report bug --job <job-id> --create --yes
 gitmoot daemon logs
 gitmoot lock list --repo owner/repo
 gitmoot lock release owner/repo <branch> --owner <agent>
 ```
+
+`gitmoot report bug` builds a redacted issue draft with job context, selected
+error, recent events, redaction notes, labels, and a duplicate-detection
+fingerprint. Agents should preview first and create only when the user explicitly
+asks or the active workflow policy allows filing the report, then return the
+created or existing issue URL.
 
 ### SkillOpt Exchange
 
@@ -600,6 +609,8 @@ gitmoot agent ask <agent> --repo owner/repo "question or instructions"
 gitmoot job list --repo owner/repo
 gitmoot job show <job-id>
 gitmoot job events <job-id>
+gitmoot report bug --job <job-id> --preview
+gitmoot report bug --job <job-id> --create --yes
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 gitmoot skillopt export --run <run-id> [--output training.json]
@@ -626,6 +637,12 @@ or questions. Add `--background` only when the user wants a queued background
 job. This is the same agent registry and runtime adapter path used by PR-comment
 jobs; the plugin only helps the runtime discover this skill and does not replace
 the `gitmoot` CLI.
+
+Use `gitmoot report bug --job <job-id> --preview` when a failed, blocked, or
+cancelled Gitmoot job needs a user-shareable bug report. Preview first by
+default. Create with `--create --yes` only when the user explicitly asks or the
+active workflow policy permits filing reports, then report the created or
+existing GitHub issue URL back to the user.
 
 ## PR Comment Commands
 
@@ -1651,6 +1668,41 @@ Fixes:
 - Authenticate `gh` for the account that can read and write the repository.
 - Confirm the `--repo owner/repo` value matches the checkout remote.
 - Retry after GitHub rate limits clear.
+
+## Reporting A Gitmoot Failure
+
+Symptoms:
+
+- A job is failed, blocked, or cancelled and the user wants to send the details
+  upstream.
+- The dashboard shows `B report bug` for the selected job.
+- An agent needs to file a report without copying raw runtime logs into chat.
+
+Checks:
+
+```sh
+gitmoot job show <job-id>
+gitmoot report bug --job <job-id> --preview
+```
+
+Fixes:
+
+- Preview first. The report builder redacts secrets, omits raw runtime output by
+  default, includes recent job events and selected error context, and adds the
+  `gitmoot-dashboard-report` / `bug` labels.
+- Create the issue only when the user explicitly asks or the active workflow
+  policy allows it:
+
+  ```sh
+  gitmoot report bug --job <job-id> --create --yes
+  ```
+
+- Report the printed GitHub issue URL back to the user. If Gitmoot prints
+  `existing issue: ...`, use that URL instead of creating or describing a new
+  issue.
+- In the dashboard TUI, press `B` on a failed, blocked, or cancelled job to open
+  the same redacted preview. Press `g` from that preview to create or reuse the
+  issue; errors stay inline so the preview is not lost.
 
 ## SkillOpt Review Operations
 
@@ -4535,11 +4587,22 @@ Add `--background` only when the user wants a queued background job. Use
 `gitmoot job list --repo owner/repo` for queued or recent jobs. Use
 `gitmoot plugin doctor` when checking whether Codex or Claude Code can discover
 Gitmoot through an installed runtime plugin. Use `gitmoot goal template` when
-writing a standard task-by-task goal file.
+writing a standard task-by-task goal file. Use
+`gitmoot report bug --job <job-id> --preview` to inspect a redacted GitHub issue
+draft for failed, blocked, or cancelled jobs; use
+`gitmoot report bug --job <job-id> --create --yes` only when the user
+explicitly asks you to file it or the active workflow policy permits automatic
+bug filing.
 
 The plugin is only the runtime discovery surface for this skill. Local agent
 invocation still goes through the `gitmoot` CLI and the same registered agent,
 repo access, runtime adapter, and job history model used by PR-comment jobs.
+
+For Gitmoot bug reports, preview by default and treat the preview as the
+confirmation surface. Generated reports include redacted job context, recent
+events, labels, and a fingerprint marker for duplicate detection. After
+creation, tell the user the printed issue URL; if Gitmoot reused an existing
+issue, report that URL as existing instead of new.
 
 For SkillOpt template learning, prefer the high-level
 `gitmoot skillopt train start/status/continue/stop` workflow when the user wants
@@ -4752,9 +4815,9 @@ page can act, and each action runs the same store/workflow code as its CLI
 equivalent:
 
 - **Attention** lists pending prompts (`a` answer inline, `d` dismiss) and the
-  actual blocked/failed jobs with their latest event message (`enter` detail,
-  `R` retry). A red banner appears when the daemon is stopped; `s` restarts it
-  with its previously persisted flags.
+  actual blocked/failed/cancelled jobs with their latest event message
+  (`enter` detail, `R` retry, `B` report bug). A red banner appears when the
+  daemon is stopped; `s` restarts it with its previously persisted flags.
 - **Trains** lists every train session: `enter` opens ANY session's live phase
   view (not just the newest), `s` stops a live session (a reason is required;
   same path as `skillopt train stop`), `d` deletes a finished session and its
@@ -4775,7 +4838,9 @@ equivalent:
   history, `R` retries failed/blocked/cancelled jobs (same path as
   `gitmoot job retry`), `c` cancels queued AND running jobs (same as
   `gitmoot job cancel`; running ones show `cancelling…` until the daemon
-  settles them).
+  settles them), and `B` opens a redacted bug-report preview for
+  failed/blocked/cancelled jobs. In the preview, `g` creates or reuses the
+  GitHub issue and keeps the issue URL visible.
 - **Locks** explains and lists locks, stale resource locks first in red (the
   owning process died; a running daemon reclaims them automatically); active
   locks collapse to a count. Branch locks are released with
@@ -4805,6 +4870,37 @@ In the one-shot styled output the dashboard leads with a "needs attention" block
 colors and truncates long lists, and groups near-identical runtime sessions;
 `--all` shows everything. `--watch` redraws on an interval (default 5s) and cannot
 be combined with `--json`, `--answer`, or `--dismiss`.
+
+## Bug Reports
+
+Use `gitmoot report bug` to build a redacted GitHub-ready issue from local
+Gitmoot error state. Job reports are fully supported; daemon, dashboard, and
+train selectors are reserved and return clear unsupported-source errors until
+their source collectors are implemented.
+
+```sh
+gitmoot report bug --job <job-id> [--preview]
+gitmoot report bug --job <job-id> --create --yes
+gitmoot report bug --source daemon --preview
+gitmoot report bug --source dashboard --preview
+gitmoot report bug --train <session-id> --create --yes
+```
+
+Default behavior is preview. Agents should run preview first, show or summarize
+the redacted draft, and create an issue only when the user explicitly asks or
+the active workflow policy already permits filing reports. Non-interactive
+creation requires `--create --yes`.
+
+Created reports target `jerryfane/gitmoot`, include the labels
+`gitmoot-dashboard-report` and `bug`, and carry a fingerprint marker in the
+body so duplicate open issues can be reused instead of creating another report.
+If duplicate search fails in the CLI path, Gitmoot prints a warning and still
+creates the issue; dashboard creates fail closed and keep the preview open so
+the user can retry.
+
+After creation, report the printed issue URL back to the user. If Gitmoot says
+an existing issue was found, report that URL instead of presenting it as a new
+issue.
 
 ## Agent Setup
 

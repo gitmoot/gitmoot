@@ -85,6 +85,38 @@ gh pr list --repo owner/repo --state open
 Fix: authenticate `gh` for the account that can read and write the repository,
 then retry the Gitmoot operation.
 
+## Send A Gitmoot Bug Report
+
+Symptom: a Gitmoot job failed, blocked, or was cancelled, and you want to send a
+useful report without exposing raw runtime output.
+
+Likely cause: the failing job has local context that matters for debugging:
+repo, agent, runtime, action, task, selected error, result summary, and recent
+events.
+
+Check:
+
+```sh
+gitmoot job show <job-id>
+gitmoot report bug --job <job-id> --preview
+```
+
+Fix: preview first. The report is redacted, omits raw runtime output by default,
+adds the `gitmoot-dashboard-report` and `bug` labels, and includes a
+fingerprint marker so open duplicates can be reused.
+
+Create the GitHub issue only when you intend to file it:
+
+```sh
+gitmoot report bug --job <job-id> --create --yes
+```
+
+The command prints either `created issue: ...` or `existing issue: ...`; use that
+URL when sharing status. In the interactive dashboard, select a failed, blocked,
+or cancelled job and press `B report bug` to open the same preview, then `g` to
+create or reuse the issue. If creation fails, the preview stays open and shows
+the error inline.
+
 ## Plugin Doctor Fails
 
 Symptom: Codex or Claude Code does not discover Gitmoot, or

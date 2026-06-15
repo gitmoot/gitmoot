@@ -129,6 +129,8 @@ gitmoot agent ask <agent> --repo owner/repo "question or instructions"
 gitmoot job list --repo owner/repo
 gitmoot job show <job-id>
 gitmoot job events <job-id>
+gitmoot report bug --job <job-id> --preview
+gitmoot report bug --job <job-id> --create --yes
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 gitmoot skillopt export --run <run-id> [--output training.json]
@@ -155,6 +157,12 @@ or questions. Add `--background` only when the user wants a queued background
 job. This is the same agent registry and runtime adapter path used by PR-comment
 jobs; the plugin only helps the runtime discover this skill and does not replace
 the `gitmoot` CLI.
+
+Use `gitmoot report bug --job <job-id> --preview` when a failed, blocked, or
+cancelled Gitmoot job needs a user-shareable bug report. Preview first by
+default. Create with `--create --yes` only when the user explicitly asks or the
+active workflow policy permits filing reports, then report the created or
+existing GitHub issue URL back to the user.
 
 ## PR Comment Commands
 
