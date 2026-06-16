@@ -149,6 +149,15 @@ func dashboardTUIDeps(home string, interval time.Duration) tui.Deps {
 					detail.ResultDecision = payload.Result.Decision
 					detail.ResultSummary = payload.Result.Summary
 				}
+				// Lazily load the delegation tree: child jobs this coordinator
+				// spawned plus the continuation job, if any. Runs only for the
+				// one opened job, never on the refresh tick.
+				children, cerr := store.ListJobsByParent(context.Background(), id)
+				if cerr != nil {
+					return cerr
+				}
+				detail.Children, detail.ContinuationID, detail.ContinuationState =
+					buildDelegationTree(payload, children)
 				return nil
 			})
 			return detail, err
@@ -507,4 +516,74 @@ func toTUISnapshot(s dashboardSnapshot) tui.Snapshot {
 		})
 	}
 	return out
+}
+
+// buildDelegationTree maps a coordinator's child jobs into the detail view's
+// delegation tree. Each child with a non-empty delegation id becomes a JobChild
+// (action and deps read from the parent's settled result, keyed by delegation
+// id); the lone child with an empty delegation id is the coordinator
+// continuation job. DepsSatisfied is true when every dep's sibling child has
+// reached a successful terminal state.
+func buildDelegationTree(parent workflow.JobPayload, children []db.Job) ([]tui.JobChild, string, string) {
+	// Delegation metadata (action, declared deps) lives on the parent result,
+	// always available once the coordinator settles, so we stay independent of
+	// the child payload shape.
+	type delegationMeta struct {
+		action string
+		deps   []string
+	}
+	meta := map[string]delegationMeta{}
+	if parent.Result != nil {
+		for _, d := range parent.Result.Delegations {
+			meta[d.ID] = delegationMeta{action: d.Action, deps: d.Deps}
+		}
+	}
+	// Child state by delegation id, for resolving DepsSatisfied.
+	stateByDelegation := map[string]string{}
+	for _, child := range children {
+		if id := strings.TrimSpace(child.DelegationID); id != "" {
+			stateByDelegation[id] = child.State
+		}
+	}
+
+	var (
+		out               []tui.JobChild
+		continuationID    string
+		continuationState string
+	)
+	for _, child := range children {
+		delegationID := strings.TrimSpace(child.DelegationID)
+		if delegationID == "" {
+			// The coordinator continuation job carries no delegation id.
+			continuationID = child.ID
+			continuationState = child.State
+			continue
+		}
+		m := meta[delegationID]
+		action := m.action
+		if strings.TrimSpace(action) == "" {
+			action = child.Type
+		}
+		out = append(out, tui.JobChild{
+			ID:            child.ID,
+			DelegationID:  delegationID,
+			Agent:         child.Agent,
+			Action:        action,
+			State:         child.State,
+			Deps:          m.deps,
+			DepsSatisfied: delegationDepsSatisfied(m.deps, stateByDelegation),
+		})
+	}
+	return out, continuationID, continuationState
+}
+
+// delegationDepsSatisfied reports whether every dep delegation has a sibling
+// child in a successful terminal state (the TUI's success notion).
+func delegationDepsSatisfied(deps []string, stateByDelegation map[string]string) bool {
+	for _, dep := range deps {
+		if stateByDelegation[strings.TrimSpace(dep)] != "succeeded" {
+			return false
+		}
+	}
+	return true
 }

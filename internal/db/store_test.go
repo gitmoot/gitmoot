@@ -2491,3 +2491,56 @@ func TestMigrationCopiesPresetsToAgentTemplates(t *testing.T) {
 		t.Fatal("legacy presets table still exists")
 	}
 }
+
+func TestListJobsByParent(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.CreateJob(ctx, Job{ID: "parent", Agent: "planner", Type: "ask", State: "running"}); err != nil {
+		t.Fatalf("CreateJob parent returned error: %v", err)
+	}
+	// Two delegation children (inserted out of delegation_id order) plus the
+	// continuation child (empty delegation id) and one unrelated job.
+	if err := store.CreateJob(ctx, Job{ID: "child-ui", Agent: "coder", Type: "implement", State: "running", ParentJobID: "parent", DelegationID: "ui"}); err != nil {
+		t.Fatalf("CreateJob child-ui returned error: %v", err)
+	}
+	if err := store.CreateJob(ctx, Job{ID: "child-api", Agent: "coder", Type: "implement", State: "succeeded", ParentJobID: "parent", DelegationID: "api"}); err != nil {
+		t.Fatalf("CreateJob child-api returned error: %v", err)
+	}
+	if err := store.CreateJob(ctx, Job{ID: "child-cont", Agent: "planner", Type: "ask", State: "queued", ParentJobID: "parent"}); err != nil {
+		t.Fatalf("CreateJob child-cont returned error: %v", err)
+	}
+	if err := store.CreateJob(ctx, Job{ID: "unrelated", Agent: "planner", Type: "ask", State: "queued"}); err != nil {
+		t.Fatalf("CreateJob unrelated returned error: %v", err)
+	}
+
+	children, err := store.ListJobsByParent(ctx, "parent")
+	if err != nil {
+		t.Fatalf("ListJobsByParent returned error: %v", err)
+	}
+	// ORDER BY delegation_id, id: continuation (empty id) first, then api, ui.
+	wantIDs := []string{"child-cont", "child-api", "child-ui"}
+	if len(children) != len(wantIDs) {
+		t.Fatalf("ListJobsByParent returned %d children, want %d: %+v", len(children), len(wantIDs), children)
+	}
+	for i, want := range wantIDs {
+		if children[i].ID != want {
+			t.Fatalf("child[%d].ID = %q, want %q (order %+v)", i, children[i].ID, want, children)
+		}
+	}
+	if children[1].UpdatedAt == "" {
+		t.Fatalf("ListJobsByParent should populate UpdatedAt for child age: %+v", children[1])
+	}
+
+	empty, err := store.ListJobsByParent(ctx, "no-such-parent")
+	if err != nil {
+		t.Fatalf("ListJobsByParent unknown parent returned error: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("ListJobsByParent for unknown parent = %+v, want empty", empty)
+	}
+}

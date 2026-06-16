@@ -1941,6 +1941,29 @@ func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
 	return jobs, rows.Err()
 }
 
+// ListJobsByParent returns the direct children of parentJobID (delegation
+// children and the coordinator continuation job), ordered by delegation_id then
+// id for a stable tree. It selects updated_at like ListJobs so callers can show
+// child age; the idx_jobs_parent_job_id index backs the filter.
+func (s *Store) ListJobsByParent(ctx context.Context, parentJobID string) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, updated_at
+		FROM jobs WHERE parent_job_id = ? ORDER BY delegation_id, id`, parentJobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []Job
+	for rows.Next() {
+		var job Job
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.UpdatedAt); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
 func (s *Store) ListQueuedJobs(ctx context.Context) ([]Job, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by
 		FROM jobs WHERE state = ? ORDER BY created_at, rowid`, "queued")

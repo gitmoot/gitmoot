@@ -665,6 +665,92 @@ func TestJobDetailOmitsBlocksWhenAbsent(t *testing.T) {
 	}
 }
 
+func TestJobDetailShowsDelegationTree(t *testing.T) {
+	deps := Deps{
+		JobEvents: func(id string) ([]JobEventView, error) { return nil, nil },
+		JobDetail: func(id string) (JobDetail, error) {
+			return JobDetail{
+				Request: "Coordinate the auth refactor.",
+				Children: []JobChild{
+					{ID: "j-api", DelegationID: "api", Agent: "coder", Action: "implement api", State: "succeeded"},
+					{ID: "j-ui", DelegationID: "ui", Agent: "coder", Action: "implement ui", State: "running", Deps: []string{"api"}, DepsSatisfied: true},
+				},
+				ContinuationID:    "job-cont",
+				ContinuationState: "queued",
+			}, nil
+		},
+	}
+	m := jobsModel(t, deps, jobsSnapshot())
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	m = drainBatch(t, m, cmd)
+	view := m.View()
+	for _, want := range []string{
+		"delegations", "api", "ui", "coder",
+		"implement api", "implement ui",
+		"succeeded", "running",
+		"(satisfied)",
+		"continuation", "job-cont",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("delegation tree missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestJobDetailOmitsDelegationsWhenNone(t *testing.T) {
+	deps := Deps{
+		JobEvents: func(id string) ([]JobEventView, error) { return nil, nil },
+		JobDetail: func(id string) (JobDetail, error) { return JobDetail{Request: "no children here"}, nil },
+	}
+	m := jobsModel(t, deps, jobsSnapshot())
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	m = drainBatch(t, m, cmd)
+	if view := m.View(); strings.Contains(view, "delegations") || strings.Contains(view, "continuation") {
+		t.Fatalf("a job with no children should omit the delegations section:\n%s", view)
+	}
+}
+
+func TestJobDetailDelegationDepsPending(t *testing.T) {
+	deps := Deps{
+		JobEvents: func(id string) ([]JobEventView, error) { return nil, nil },
+		JobDetail: func(id string) (JobDetail, error) {
+			return JobDetail{
+				Children: []JobChild{
+					{ID: "j-ui", DelegationID: "ui", Agent: "coder", Action: "ship ui", State: "failed", Deps: []string{"api"}, DepsSatisfied: false},
+				},
+			}, nil
+		},
+	}
+	m := jobsModel(t, deps, jobsSnapshot())
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	m = drainBatch(t, m, cmd)
+	view := m.View()
+	// State renders via jobStateColor; under termenv.Ascii the word is plain.
+	for _, want := range []string{"delegations", "failed", "(pending)"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("delegation tree missing %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "continuation") {
+		t.Fatalf("no continuation id should omit the continuation line:\n%s", view)
+	}
+}
+
+func TestDepsLabel(t *testing.T) {
+	if got := depsLabel(JobChild{}); got != "-" {
+		t.Fatalf("depsLabel(no deps) = %q, want -", got)
+	}
+	if got := depsLabel(JobChild{Deps: []string{"api", "db"}, DepsSatisfied: true}); got != "api,db (satisfied)" {
+		t.Fatalf("depsLabel(satisfied) = %q", got)
+	}
+	if got := depsLabel(JobChild{Deps: []string{"api"}, DepsSatisfied: false}); got != "api (pending)" {
+		t.Fatalf("depsLabel(pending) = %q", got)
+	}
+}
+
 func TestJobDetailClampLines(t *testing.T) {
 	got := clampLines("a\nb\nc\nd\ne", 3)
 	if !strings.Contains(got, "a\nb\nc") || !strings.Contains(got, "2 more lines") {

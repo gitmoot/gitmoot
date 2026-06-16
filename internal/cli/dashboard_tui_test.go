@@ -8,7 +8,87 @@ import (
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/workflow"
 )
+
+func TestBuildDelegationTree(t *testing.T) {
+	parent := workflow.JobPayload{
+		Result: &workflow.AgentResult{
+			Delegations: []workflow.Delegation{
+				{ID: "api", Agent: "coder", Action: "implement api"},
+				{ID: "ui", Agent: "coder", Action: "implement ui", Deps: []string{"api"}},
+			},
+		},
+	}
+	children := []db.Job{
+		{ID: "j-api", Agent: "coder", Type: "implement", State: "succeeded", ParentJobID: "p", DelegationID: "api"},
+		{ID: "j-ui", Agent: "coder", Type: "implement", State: "running", ParentJobID: "p", DelegationID: "ui"},
+		{ID: "j-cont", Agent: "planner", Type: "ask", State: "queued", ParentJobID: "p"},
+	}
+
+	got, contID, contState := buildDelegationTree(parent, children)
+	if contID != "j-cont" || contState != "queued" {
+		t.Fatalf("continuation = (%q,%q), want (j-cont,queued)", contID, contState)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d delegation children, want 2: %+v", len(got), got)
+	}
+	byDelegation := map[string]struct {
+		action    string
+		satisfied bool
+	}{}
+	for _, c := range got {
+		byDelegation[c.DelegationID] = struct {
+			action    string
+			satisfied bool
+		}{c.Action, c.DepsSatisfied}
+	}
+	if api := byDelegation["api"]; api.action != "implement api" {
+		t.Fatalf("api action = %q, want implement api", api.action)
+	}
+	// ui's only dep (api) succeeded, so its deps are satisfied.
+	if ui := byDelegation["ui"]; ui.action != "implement ui" || !ui.satisfied {
+		t.Fatalf("ui = %+v, want action=implement ui satisfied=true", ui)
+	}
+}
+
+func TestBuildDelegationTreeActionFallsBackToType(t *testing.T) {
+	// No parent result: action falls back to the child job type, deps unsatisfied
+	// when a dep's sibling has not succeeded.
+	children := []db.Job{
+		{ID: "j-api", Agent: "coder", Type: "implement", State: "running", ParentJobID: "p", DelegationID: "api"},
+		{ID: "j-ui", Agent: "coder", Type: "review", State: "running", ParentJobID: "p", DelegationID: "ui"},
+	}
+	parent := workflow.JobPayload{
+		Result: &workflow.AgentResult{
+			Delegations: []workflow.Delegation{{ID: "ui", Agent: "coder", Action: "", Deps: []string{"api"}}},
+		},
+	}
+	got, contID, _ := buildDelegationTree(parent, children)
+	if contID != "" {
+		t.Fatalf("no continuation child should leave continuation id empty, got %q", contID)
+	}
+	var apiAction, uiAction string
+	var uiSatisfied bool
+	for _, c := range got {
+		switch c.DelegationID {
+		case "api":
+			apiAction = c.Action
+		case "ui":
+			uiAction = c.Action
+			uiSatisfied = c.DepsSatisfied
+		}
+	}
+	if apiAction != "implement" {
+		t.Fatalf("api action fallback = %q, want job type implement", apiAction)
+	}
+	if uiAction != "review" {
+		t.Fatalf("ui action fallback = %q, want job type review", uiAction)
+	}
+	if uiSatisfied {
+		t.Fatalf("ui deps should be pending while api is still running")
+	}
+}
 
 func TestShouldLaunchTUI(t *testing.T) {
 	cases := []struct {

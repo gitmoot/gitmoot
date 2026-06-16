@@ -162,6 +162,25 @@ type JobDetail struct {
 	Request        string // the human instructions that drove the job
 	ResultDecision string // gitmoot_result.decision, when the job has settled
 	ResultSummary  string // gitmoot_result.summary
+	// Children are the delegation child jobs this job spawned (empty for a
+	// non-coordinator job). They render as a "delegations" tree in the detail.
+	Children []JobChild
+	// ContinuationID/ContinuationState describe the coordinator continuation job
+	// enqueued once every delegation settled; ContinuationID is empty when none.
+	ContinuationID    string
+	ContinuationState string
+}
+
+// JobChild is one delegated child job in a coordinator's delegation tree, shown
+// in the job-detail "delegations" section.
+type JobChild struct {
+	ID            string
+	DelegationID  string
+	Agent         string
+	Action        string
+	State         string
+	Deps          []string
+	DepsSatisfied bool
 }
 
 // BugReportPreview is a redacted issue draft shown before creating a bug report.

@@ -244,6 +244,19 @@ func jobDecisionColor(decision string) string {
 	}
 }
 
+// depsLabel renders a delegation child's deps for the delegation tree: "-" when
+// it has none, else the comma-joined dep ids with a satisfied/pending suffix.
+func depsLabel(c JobChild) string {
+	if len(c.Deps) == 0 {
+		return "-"
+	}
+	suffix := " (pending)"
+	if c.DepsSatisfied {
+		suffix = " (satisfied)"
+	}
+	return strings.Join(c.Deps, ",") + suffix
+}
+
 // jobsContentInteractive renders the Jobs page as a selectable list. Job
 // overlays (detail/confirm) are dispatched once in content(), not here.
 func (m Model) jobsContentInteractive() string {
@@ -368,6 +381,38 @@ func (m Model) jobDetailView() string {
 		}
 		if d.ResultSummary != "" {
 			b.WriteString(clampLines(d.ResultSummary, 8) + "\n")
+		}
+		b.WriteByte('\n')
+	}
+
+	// Delegation tree (coordinator jobs): one row per delegated child plus the
+	// continuation job, if any.
+	if len(d.Children) > 0 {
+		b.WriteString(headerStyle.Render("delegations"))
+		b.WriteByte('\n')
+		rows := [][]string{{"DELEGATION", "AGENT", "ACTION", "DEPS", "STATE"}}
+		const maxChildren = 20
+		children := d.Children
+		omitted := 0
+		if len(children) > maxChildren {
+			omitted = len(children) - maxChildren
+			children = children[:maxChildren]
+		}
+		for _, c := range children {
+			rows = append(rows, []string{
+				dash(c.DelegationID),
+				dash(c.Agent),
+				truncate(c.Action, 30),
+				depsLabel(c),
+				jobStateColor(c.State),
+			})
+		}
+		b.WriteString(renderRows(rows))
+		if omitted > 0 {
+			b.WriteString(mutedStyle.Render(strconv.Itoa(omitted)+" more delegations omitted") + "\n")
+		}
+		if d.ContinuationID != "" {
+			b.WriteString("continuation  " + d.ContinuationID + "  " + jobStateColor(d.ContinuationState) + "\n")
 		}
 		b.WriteByte('\n')
 	}
