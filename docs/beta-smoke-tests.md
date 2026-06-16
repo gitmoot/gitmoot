@@ -148,6 +148,89 @@ Expected signals:
    gitmoot daemon status
    ```
 
+## Delegation Smoke Test
+
+Goal: background coordinator job -> `delegations` in the coordinator result ->
+two child jobs fanned out to worker agents -> both children succeed -> coordinator
+continuation job enqueued. This exercises the structured delegation path end to
+end with local shell agents, so it needs no external runtime CLIs.
+
+The coordinator must run as background work so the daemon executes it through the
+engine and dispatches the delegations. A synchronous `gitmoot agent ask` without
+`--background` only returns the coordinator's own result and does not fan out, so
+the test would silently pass with zero child jobs.
+
+1. Register a coordinator shell agent whose result returns two delegations, and
+   two worker shell agents whose results return empty `delegations` (so the
+   fan-out terminates and does not recurse).
+
+   ```sh
+   gitmoot setup --repo owner/project --path . --agent coordinator --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"coordinator delegating ui and api\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"delegations\":[{\"id\":\"ui\",\"agent\":\"ui-worker\",\"action\":\"ask\",\"prompt\":\"propose the ui changes\"},{\"id\":\"api\",\"agent\":\"api-worker\",\"action\":\"review\",\"prompt\":\"review the api contract\"}]}}'"
+   gitmoot agent subscribe ui-worker --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"ui worker done\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell smoke\"],\"needs\":[],\"delegations\":[]}}'" --role reviewer --repo owner/project --capability ask --capability review
+   gitmoot agent subscribe api-worker --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"api worker done\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell smoke\"],\"needs\":[],\"delegations\":[]}}'" --role reviewer --repo owner/project --capability ask --capability review
+   gitmoot agent repos coordinator
+   ```
+
+2. Start the background daemon so it executes the queued coordinator job and
+   fans out the delegations.
+
+   ```sh
+   gitmoot daemon start --repo owner/project --poll 30s
+   gitmoot daemon status
+   ```
+
+3. Queue the coordinator as background work.
+
+   ```sh
+   gitmoot agent ask coordinator --repo owner/project --background "coordinate the ui and api work"
+   ```
+
+4. Confirm the coordinator job, the two child jobs, and the continuation job.
+
+   ```sh
+   gitmoot job list --repo owner/project
+   gitmoot events --repo owner/project
+   ```
+
+Expected signals:
+
+- `gitmoot events --repo owner/project` shows two `delegation_enqueued` events
+  on the coordinator job, one for the `ui` delegation and one for the `api`
+  delegation.
+- `gitmoot job list --repo owner/project` shows two child jobs with composite
+  ids of the form `<coordinator-job-id>/delegation/ui` and
+  `<coordinator-job-id>/delegation/api`, each reaching `succeeded`.
+- After both children succeed, `gitmoot events --repo owner/project` shows a
+  `delegation_continuation_enqueued` event and `gitmoot job list` shows a
+  coordinator continuation job `<coordinator-job-id>/continuation` queued for
+  `coordinator`.
+
+5. (Optional) Verify dependency gating. Re-run with a coordinator whose result
+   adds a third delegation that depends on the first two; it must stay queued
+   until both deps succeed, then run.
+
+   ```json
+   {
+     "id": "integrate",
+     "agent": "api-worker",
+     "action": "ask",
+     "prompt": "integrate the ui and api work",
+     "deps": ["ui", "api"]
+   }
+   ```
+
+   Expected: `gitmoot events --repo owner/project` shows the
+   `<coordinator-job-id>/delegation/integrate` job enqueued only after the `ui`
+   and `api` children reach `succeeded`, and the continuation job is enqueued
+   once `integrate` also succeeds.
+
+6. Stop the daemon when finished.
+
+   ```sh
+   gitmoot daemon stop
+   gitmoot daemon status
+   ```
+
 ## Thermo Template Smoke Test
 
 Goal: PR comment -> queued review job -> Codex resume with cached thermo template

@@ -389,3 +389,64 @@ gitmoot agent allow reviewer --repo owner/project-b
 gitmoot status --repo owner/project-a
 gitmoot status --repo owner/project-b
 ```
+
+## Multi-Model Delegation
+
+A coordinator agent can fan work out to other agents running on different
+runtimes by returning a `delegations` array in its `gitmoot_result`. Gitmoot
+enqueues one child job per delegation, records a `delegation_enqueued` event on
+the coordinator job, and runs the children in the daemon. Start a coordinator
+and two workers on different runtimes so each delegation lands on the best model
+for the job:
+
+```sh
+gitmoot agent start coordinator --runtime codex --repo owner/repo --role planner --capability ask --start-daemon
+gitmoot agent start ui-worker --runtime claude --repo owner/repo --role reviewer --capability ask --capability review
+gitmoot agent start api-worker --runtime kimi --repo owner/repo --role reviewer --capability ask --capability review
+```
+
+Queue the coordinator as background work so the daemon runs it and dispatches
+its delegations (a synchronous `gitmoot agent ask` without `--background` only
+returns the coordinator's own answer and does not fan out):
+
+```sh
+gitmoot agent ask coordinator --repo owner/repo --background "Coordinate the redesign across the API and UI teams."
+```
+
+The coordinator returns two delegations to the workers on different runtimes:
+
+```json
+{
+  "gitmoot_result": {
+    "decision": "approved",
+    "summary": "Delegating UI review and API review to the workers.",
+    "findings": [],
+    "changes_made": [],
+    "tests_run": [],
+    "needs": [],
+    "delegations": [
+      {
+        "id": "ui",
+        "agent": "ui-worker",
+        "action": "ask",
+        "prompt": "Propose the component changes for the new dashboard layout."
+      },
+      {
+        "id": "api",
+        "agent": "api-worker",
+        "action": "review",
+        "prompt": "Review the API contract for the dashboard endpoints."
+      }
+    ]
+  }
+}
+```
+
+Gitmoot enqueues each delegation as a flat parallel child job
+(`<parent-job-id>/delegation/<id>`) with a `delegation_enqueued` event on the
+parent. Delegations that declare `deps` run only after the named siblings
+succeed, and once every top-level delegation is terminal Gitmoot enqueues one
+coordinator continuation job so the coordinator can synthesize the results.
+Inspect the fan-out with `gitmoot job list --repo owner/repo` (one row per child
+job) and `gitmoot events --repo owner/repo` (the `delegation_enqueued` events).
+See `RESULT_CONTRACT.md` for the full delegation field reference.

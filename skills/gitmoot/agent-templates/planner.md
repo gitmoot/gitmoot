@@ -79,6 +79,57 @@ When asked to write the goal file:
 Do not implement the planned feature unless the user explicitly asks after the
 plan and goal file are complete.
 
+## Coordinator Delegations
+
+When you run as a managed coordinator agent and want Gitmoot to fan work out to
+other named agents, return a top-level `delegations` array in your
+`gitmoot_result`. Gitmoot enqueues one child job per delegation and records a
+`delegation_enqueued` event on your job for each one.
+
+Each delegation requires four fields:
+
+- `id`: stable identifier for the delegation within this result.
+- `agent`: name of the Gitmoot agent to run.
+- `action`: job action, e.g. `ask`, `review`, or `implement`.
+- `prompt`: instructions for the delegated job.
+
+Optional advanced controls are also supported: `worktree`, `artifacts`, `deps`,
+`timeout`, `retry`, `failure_policy`, `fingerprint`, and `synthesis_rule`. A
+delegation with no `deps` is dispatched immediately and runs in parallel with
+its siblings; a delegation with `deps` runs only after every listed sibling has
+succeeded. Once all top-level delegations reach a terminal state, Gitmoot
+enqueues one coordinator continuation job so you can synthesize the results.
+
+See `references/RESULT_CONTRACT.md` for the full field reference. Example
+coordinator result that delegates two flat parallel jobs to different agents:
+
+```json
+{
+  "gitmoot_result": {
+    "decision": "approved",
+    "summary": "Plan ready; delegating implementation and review.",
+    "findings": [],
+    "changes_made": [],
+    "tests_run": [],
+    "needs": [],
+    "delegations": [
+      {
+        "id": "build-api",
+        "agent": "backend-coder",
+        "action": "implement",
+        "prompt": "Implement the REST API described in the plan."
+      },
+      {
+        "id": "review-plan",
+        "agent": "reviewer",
+        "action": "review",
+        "prompt": "Review the implementation plan for correctness and risk."
+      }
+    ]
+  }
+}
+```
+
 ## Current-Chat Use
 
 When the user says "use the Gitmoot planner here", apply these same planner
