@@ -2517,6 +2517,65 @@ func TestEngineDelegationDeferredDedupResolvesContinuation(t *testing.T) {
 	}
 }
 
+// TestEngineDelegationDepthCapStopsDispatch covers the runaway-recursion safety
+// net surfaced by the live E2E smoke: a coordinator whose continuation
+// re-delegates (e.g. a static shell agent) would otherwise spawn jobs forever
+// because the continuation reused the parent's depth. At/over MaxDelegationDepth
+// dispatch is refused with a delegation_depth_exceeded event; just under it,
+// dispatch still proceeds.
+func TestEngineDelegationDepthCapStopsDispatch(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "w", []string{"ask"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	result := func() *AgentResult {
+		return &AgentResult{
+			Decision:    "approved",
+			Summary:     "delegating",
+			Delegations: []Delegation{{ID: "w1", Agent: "w", Action: "ask", Prompt: "do work"}},
+		}
+	}
+
+	// At the cap: dispatch is refused and a delegation_depth_exceeded event fires.
+	insertCompletedJob(t, store, db.Job{ID: "deep-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo: "jerryfane/gitmoot", Branch: "task-005", TaskID: "task-5", Sender: "coord",
+		DelegationDepth: MaxDelegationDepth, Result: result(),
+	})
+	if err := engine.AdvanceJob(ctx, "deep-job"); err != nil {
+		t.Fatalf("AdvanceJob(deep): %v", err)
+	}
+	if jobExists(t, store, "deep-job/delegation/w1") {
+		t.Fatal("delegation must NOT be dispatched at the depth cap")
+	}
+	events, err := store.ListJobEvents(ctx, "deep-job")
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	capped := false
+	for _, ev := range events {
+		if ev.Kind == "delegation_depth_exceeded" {
+			capped = true
+		}
+	}
+	if !capped {
+		t.Fatal("expected a delegation_depth_exceeded event at the cap")
+	}
+
+	// Just under the cap: dispatch still proceeds.
+	insertCompletedJob(t, store, db.Job{ID: "shallow-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo: "jerryfane/gitmoot", Branch: "task-005", TaskID: "task-5", Sender: "coord",
+		DelegationDepth: MaxDelegationDepth - 1, Result: result(),
+	})
+	if err := engine.AdvanceJob(ctx, "shallow-job"); err != nil {
+		t.Fatalf("AdvanceJob(shallow): %v", err)
+	}
+	if !jobExists(t, store, "shallow-job/delegation/w1") {
+		t.Fatal("delegation just under the depth cap must still dispatch")
+	}
+}
+
 // TestEngineDelegationEscalateThenBlockParentFoldsIntoContinuation pins the
 // contradictory-state fix: once an escalate failure has enqueued the
 // continuation, a later block_parent sibling failure must NOT also block the

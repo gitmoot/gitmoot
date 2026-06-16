@@ -500,8 +500,26 @@ func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) 
 	}
 }
 
+// MaxDelegationDepth bounds how deep delegation nesting and coordinator
+// continuation chains may go. Each delegation child and each coordinator
+// continuation increments DelegationDepth; once a job at or beyond this depth
+// would dispatch, dispatchDelegations refuses and records a
+// delegation_depth_exceeded event. This is a safety net against runaway
+// recursion: a coordinator whose continuation re-delegates (e.g. a static or
+// looping agent) would otherwise spawn jobs forever.
+const MaxDelegationDepth = 8
+
 func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) error {
 	if payload.Result == nil || len(payload.Result.Delegations) == 0 {
+		return nil
+	}
+
+	if payload.DelegationDepth >= MaxDelegationDepth {
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "delegation_depth_exceeded",
+			Message: fmt.Sprintf("delegation depth %d reached the limit of %d; not dispatching %d delegation(s)", payload.DelegationDepth, MaxDelegationDepth, len(payload.Result.Delegations)),
+		})
 		return nil
 	}
 
@@ -879,7 +897,10 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		Instructions:    buildContinuationPrompt(parentResult, children, childPayloads),
 		Constraints:     parentPayload.Constraints,
 		ParentJobID:     parentJob.ID,
-		DelegationDepth: parentPayload.DelegationDepth,
+		// Increment depth per continuation generation so a coordinator whose
+		// continuation re-delegates is bounded by MaxDelegationDepth instead of
+		// looping forever (the continuation reused the parent's depth before).
+		DelegationDepth: parentPayload.DelegationDepth + 1,
 		DelegatedBy:     parentJob.Agent,
 	}
 	if err := e.enqueue(ctx, request); err != nil {
