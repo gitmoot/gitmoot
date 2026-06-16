@@ -39,6 +39,7 @@ type JobRequest struct {
 	DelegationID          string
 	DelegationDepth       int
 	DelegatedBy           string
+	RootJobID             string
 	Deps                  []string
 	JobTimeout            string
 	RetryCount            int
@@ -70,6 +71,7 @@ type JobPayload struct {
 	DelegationID           string       `json:"delegation_id,omitempty"`
 	DelegationDepth        int          `json:"delegation_depth,omitempty"`
 	DelegatedBy            string       `json:"delegated_by,omitempty"`
+	RootJobID              string       `json:"root_job_id,omitempty"`
 	Deps                   []string     `json:"deps,omitempty"`
 	JobTimeout             string       `json:"job_timeout,omitempty"`
 	RetryCount             int          `json:"retry_count,omitempty"`
@@ -123,6 +125,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		DelegationID:           request.DelegationID,
 		DelegationDepth:        request.DelegationDepth,
 		DelegatedBy:            request.DelegatedBy,
+		RootJobID:              request.RootJobID,
 		Deps:                   compactStrings(request.Deps),
 		JobTimeout:             strings.TrimSpace(request.JobTimeout),
 		RetryCount:             request.RetryCount,

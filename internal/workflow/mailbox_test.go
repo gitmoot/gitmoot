@@ -90,6 +90,35 @@ func TestMailboxEnqueuePersistsDelegationMetadata(t *testing.T) {
 	}
 }
 
+func TestMailboxEnqueuePersistsRootJobID(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID:        "job-child",
+		Agent:     "audit",
+		Action:    "ask",
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-005",
+		RootJobID: "root-coordinator",
+	}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+
+	stored, err := store.GetJob(ctx, "job-child")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	payload, err := unmarshalPayload(stored.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	if payload.RootJobID != "root-coordinator" {
+		t.Fatalf("payload RootJobID = %q, want %q", payload.RootJobID, "root-coordinator")
+	}
+}
+
 func TestMailboxEnqueueSnapshotsAgentTemplate(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)

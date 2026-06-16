@@ -464,10 +464,22 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 	return nil
 }
 
+// rootJobID returns the id of the coordinator that originated a coordination
+// tree. A child or continuation inherits its parent's RootJobID via the payload;
+// the originating coordinator has no RootJobID, so its own job id is the root.
+// Every job in one tree therefore shares a single root, which lets the loop
+// detector and per-root budget reason about the whole tree at once.
+func (e Engine) rootJobID(job db.Job, payload JobPayload) string {
+	if strings.TrimSpace(payload.RootJobID) != "" {
+		return payload.RootJobID
+	}
+	return job.ID
+}
+
 // delegationRequest builds the canonical child JobRequest for a delegation,
 // inheriting the parent's repo/branch/PR context and stamping the DAG fields
-// (ParentJobID/DelegationID/DelegationDepth/DelegatedBy/Deps). It is shared by
-// dispatchDelegations (initial enqueue of ready delegations) and
+// (ParentJobID/DelegationID/DelegationDepth/DelegatedBy/RootJobID/Deps). It is
+// shared by dispatchDelegations (initial enqueue of ready delegations) and
 // advanceDelegations (deferred enqueue once deps clear) so both paths produce
 // identical, idempotent requests for the same delegation ID.
 func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) JobRequest {
@@ -492,6 +504,7 @@ func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) 
 		DelegationID:    d.ID,
 		DelegationDepth: payload.DelegationDepth + 1,
 		DelegatedBy:     job.Agent,
+		RootJobID:       e.rootJobID(job, payload),
 		Deps:            compactStrings(d.Deps),
 		JobTimeout:      strings.TrimSpace(d.Timeout),
 		Fingerprint:     strings.TrimSpace(d.Fingerprint),
@@ -509,6 +522,40 @@ func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) 
 // looping agent) would otherwise spawn jobs forever.
 const MaxDelegationDepth = 8
 
+// MaxDelegationTotalJobs bounds how many jobs a single coordination tree (all
+// children and continuations sharing one root, see rootJobID) may produce. Where
+// MaxDelegationDepth caps nesting in one branch, this caps the total fan-out so a
+// coordinator that re-delegates wide (rather than deep) on every continuation is
+// still halted. Once a root's tree reaches this many jobs, dispatchDelegations
+// refuses further children and records a delegation_budget_exceeded event.
+const MaxDelegationTotalJobs = 64
+
+// countRootDelegationJobs counts every job belonging to a coordination tree: the
+// originating coordinator itself (job.ID == rootID) plus every child or
+// continuation whose payload RootJobID points back at it. There is no store query
+// keyed on root, so it lists all jobs and filters (mirroring childDelegationJobs).
+func (e Engine) countRootDelegationJobs(ctx context.Context, rootID string) (int, error) {
+	jobs, err := e.Store.ListJobs(ctx)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, job := range jobs {
+		if job.ID == rootID {
+			count++
+			continue
+		}
+		payload, err := unmarshalPayload(job.Payload)
+		if err != nil {
+			return 0, err
+		}
+		if payload.RootJobID == rootID {
+			count++
+		}
+	}
+	return count, nil
+}
+
 func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) error {
 	if payload.Result == nil || len(payload.Result.Delegations) == 0 {
 		return nil
@@ -519,6 +566,20 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 			JobID:   job.ID,
 			Kind:    "delegation_depth_exceeded",
 			Message: fmt.Sprintf("delegation depth %d reached the limit of %d; not dispatching %d delegation(s)", payload.DelegationDepth, MaxDelegationDepth, len(payload.Result.Delegations)),
+		})
+		return nil
+	}
+
+	rootID := e.rootJobID(job, payload)
+	total, err := e.countRootDelegationJobs(ctx, rootID)
+	if err != nil {
+		return err
+	}
+	if total >= MaxDelegationTotalJobs {
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "delegation_budget_exceeded",
+			Message: fmt.Sprintf("delegation tree for root %s reached the job budget of %d (%d jobs); not dispatching %d delegation(s)", rootID, MaxDelegationTotalJobs, total, len(payload.Result.Delegations)),
 		})
 		return nil
 	}
@@ -902,6 +963,9 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		// looping forever (the continuation reused the parent's depth before).
 		DelegationDepth: parentPayload.DelegationDepth + 1,
 		DelegatedBy:     parentJob.Agent,
+		// Share the originating coordinator's root so the whole continuation
+		// chain counts against one per-root budget and is visible to loop detection.
+		RootJobID: e.rootJobID(parentJob, parentPayload),
 	}
 	if err := e.enqueue(ctx, request); err != nil {
 		return fmt.Errorf("enqueue continuation for %q: %w", parentJob.ID, err)
@@ -1278,6 +1342,9 @@ func buildContinuationPrompt(parentResult *AgentResult, children map[string]db.J
 		}
 		builder.WriteString("\n")
 	}
+	// Completion contract: make termination directed. The engine already treats
+	// an empty delegations list as terminal, so spell it out for the agent.
+	builder.WriteString("\n\nIf the goal is now complete, return your result with an EMPTY delegations list to finish. Only return new delegations if more work is genuinely required.")
 	return builder.String()
 }
 

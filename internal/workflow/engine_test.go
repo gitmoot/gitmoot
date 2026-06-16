@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2573,6 +2574,146 @@ func TestEngineDelegationDepthCapStopsDispatch(t *testing.T) {
 	}
 	if !jobExists(t, store, "shallow-job/delegation/w1") {
 		t.Fatal("delegation just under the depth cap must still dispatch")
+	}
+}
+
+// TestEngineDelegationRootJobIDPropagates pins the lineage scaffolding the loop
+// detector relies on: an originating coordinator has no RootJobID, so its own id
+// is the root; both its delegation children and its continuation inherit that
+// same root so the whole coordination tree shares one originating id.
+func TestEngineDelegationRootJobIDPropagates(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "w", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	insertCompletedJob(t, store, db.Job{ID: "root-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-005",
+		TaskID:    "task-5",
+		TaskTitle: "Parent",
+		Sender:    "coord",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "w1", Agent: "w", Action: "review", Prompt: "do work"},
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "root-job"); err != nil {
+		t.Fatalf("AdvanceJob(root) returned error: %v", err)
+	}
+
+	// The child inherits the originating coordinator's id as its root.
+	child := mustJob(t, store, "root-job/delegation/w1")
+	childPayload, err := unmarshalPayload(child.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(child) returned error: %v", err)
+	}
+	if childPayload.RootJobID != "root-job" {
+		t.Fatalf("child RootJobID = %q, want %q", childPayload.RootJobID, "root-job")
+	}
+
+	// Once the child finishes, the continuation must share the same root.
+	completeDelegationChild(t, store, "root-job/delegation/w1", JobSucceeded, AgentResult{Decision: "approved", Summary: "w1 ok"})
+	if err := engine.AdvanceJob(ctx, "root-job/delegation/w1"); err != nil {
+		t.Fatalf("AdvanceJob(child) returned error: %v", err)
+	}
+	continuation := mustJob(t, store, delegationContinuationID("root-job"))
+	continuationPayload, err := unmarshalPayload(continuation.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(continuation) returned error: %v", err)
+	}
+	if continuationPayload.RootJobID != "root-job" {
+		t.Fatalf("continuation RootJobID = %q, want %q", continuationPayload.RootJobID, "root-job")
+	}
+}
+
+// TestContinuationPromptIncludesCompletionContract pins the L1 completion
+// contract: the continuation prompt must explicitly tell the coordinator to
+// finish by returning an EMPTY delegations list when the goal is complete.
+func TestContinuationPromptIncludesCompletionContract(t *testing.T) {
+	prompt := buildContinuationPrompt(
+		&AgentResult{Delegations: []Delegation{{ID: "w1", Agent: "w"}}},
+		map[string]db.Job{},
+		map[string]JobPayload{},
+	)
+	if !strings.Contains(prompt, "EMPTY delegations list") {
+		t.Fatalf("continuation prompt missing completion contract: %q", prompt)
+	}
+	if !strings.Contains(prompt, "Only return new delegations if more work is genuinely required") {
+		t.Fatalf("continuation prompt missing completion-contract guidance: %q", prompt)
+	}
+}
+
+// TestEngineDelegationBudgetCapStopsDispatch pins the L3 per-root job budget: a
+// coordinator tree that re-delegates wide is halted once it has produced
+// MaxDelegationTotalJobs jobs. Dispatch is refused with a
+// delegation_budget_exceeded event and no further children are created.
+func TestEngineDelegationBudgetCapStopsDispatch(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "w", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	// Seed MaxDelegationTotalJobs jobs already belonging to the root's tree: the
+	// originating coordinator itself plus enough children stamped with its root.
+	insertCompletedJob(t, store, db.Job{ID: "root-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-005",
+		TaskID:    "task-5",
+		TaskTitle: "Parent",
+		Sender:    "coord",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "w1", Agent: "w", Action: "review", Prompt: "do work"},
+			},
+		},
+	})
+	for i := 1; i < MaxDelegationTotalJobs; i++ {
+		insertCompletedJob(t, store, db.Job{ID: fmt.Sprintf("root-job/filler/%d", i), Agent: "w", Type: "review"}, JobPayload{
+			Repo:      "jerryfane/gitmoot",
+			Branch:    "task-005",
+			TaskID:    "task-5",
+			Sender:    "coord",
+			RootJobID: "root-job",
+		})
+	}
+
+	count, err := engine.countRootDelegationJobs(ctx, "root-job")
+	if err != nil {
+		t.Fatalf("countRootDelegationJobs returned error: %v", err)
+	}
+	if count != MaxDelegationTotalJobs {
+		t.Fatalf("countRootDelegationJobs = %d, want %d", count, MaxDelegationTotalJobs)
+	}
+
+	if err := engine.AdvanceJob(ctx, "root-job"); err != nil {
+		t.Fatalf("AdvanceJob(root) returned error: %v", err)
+	}
+
+	// At the budget: dispatch is refused and no child is created.
+	if jobExists(t, store, "root-job/delegation/w1") {
+		t.Fatal("delegation must NOT be dispatched once the per-root budget is reached")
+	}
+	events, err := store.ListJobEvents(ctx, "root-job")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	budgeted := false
+	for _, ev := range events {
+		if ev.Kind == "delegation_budget_exceeded" {
+			budgeted = true
+		}
+	}
+	if !budgeted {
+		t.Fatal("expected a delegation_budget_exceeded event at the per-root budget")
 	}
 }
 
