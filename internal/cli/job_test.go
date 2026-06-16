@@ -145,7 +145,7 @@ func TestRunJobRunUsesDaemonWorkerInternals(t *testing.T) {
 	runGit(t, checkout, "branch", "-m", "main")
 	runGit(t, checkout, "remote", "add", "origin", "https://github.com/owner/repo.git")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "audit", "shell", `printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}'`, []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "audit", "shell", `printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`, []string{"ask"}, "owner/repo")
 	seedCLIJob(t, store, db.Job{
 		ID:      "job-run",
 		Agent:   "audit",

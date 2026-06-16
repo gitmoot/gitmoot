@@ -2649,13 +2649,13 @@ func TestSkillOptTrainContinueGeneratesOptionsWithCurrentSkill(t *testing.T) {
 
 	runner := &agentStartRunner{results: []subprocess.Result{
 		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440201"}` + "\n"},
-		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option A\n\nHero with strong product narrative.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option A\n\nHero with strong product narrative.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"},
 		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440202"}` + "\n"},
-		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option B\n\nDashboard-led layout with proof metrics.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option B\n\nDashboard-led layout with proof metrics.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"},
 		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440203"}` + "\n"},
-		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option A\n\nCheckout analytics proof block.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option A\n\nCheckout analytics proof block.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"},
 		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440204"}` + "\n"},
-		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option B\n\nLifecycle commerce story with motion notes.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option B\n\nLifecycle commerce story with motion notes.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"},
 	}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -3477,8 +3477,8 @@ func TestSkillOptTrainContinueRejectsNonImplementedGenerationResult(t *testing.T
 
 	runner := &agentStartRunner{results: []subprocess.Result{
 		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440401"}` + "\n"},
-		{Stdout: `{"gitmoot_result":{"decision":"changes_requested","summary":"This is a review finding, not generated content.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
-		{Stdout: `{"gitmoot_result":{"decision":"changes_requested","summary":"This is still a review finding, not generated content.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"changes_requested","summary":"This is a review finding, not generated content.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"changes_requested","summary":"This is still a review finding, not generated content.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"},
 	}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -3940,10 +3940,10 @@ func TestSkillOptTrainContinueUsesRegisteredWorkspaceRepoCheckout(t *testing.T) 
 	}
 	runner := &agentStartRunner{results: []subprocess.Result{
 		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440401"}` + "\n"},
-		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option A\n\nWorkspace hero A.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
-		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option B\n\nWorkspace hero B.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
-		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option A\n\nWorkspace proof A.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
-		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option B\n\nWorkspace proof B.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option A\n\nWorkspace hero A.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option B\n\nWorkspace hero B.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option A\n\nWorkspace proof A.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option B\n\nWorkspace proof B.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"},
 	}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -4041,10 +4041,10 @@ func TestSkillOptTrainContinueGeneratesValidateArtifacts(t *testing.T) {
 
 	runner := &agentStartRunner{results: []subprocess.Result{
 		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440301"}` + "\n"},
-		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Baseline\n\nConventional hero.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
-		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Candidate\n\nImproved hero.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
-		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Baseline\n\nConventional proof.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
-		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Candidate\n\nImproved proof.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Baseline\n\nConventional hero.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Candidate\n\nImproved hero.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Baseline\n\nConventional proof.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Candidate\n\nImproved proof.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"},
 	}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -8269,7 +8269,7 @@ func (r *skillOptConcurrentGenerationRunner) Run(_ context.Context, dir string, 
 			prompt = args[len(args)-1]
 		}
 		summary := "# Generated option\n\n" + strings.Split(prompt, "\n")[0]
-		return subprocess.Result{Command: command, Args: args, Stdout: fmt.Sprintf(`{"gitmoot_result":{"decision":"implemented","summary":%q,"findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`+"\n", summary)}, nil
+		return subprocess.Result{Command: command, Args: args, Stdout: fmt.Sprintf(`{"gitmoot_result":{"decision":"implemented","summary":%q,"findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`+"\n", summary)}, nil
 	}
 	r.mu.Unlock()
 	return subprocess.Result{Command: command, Args: args}, nil
@@ -8314,7 +8314,7 @@ func cliImplementedSummaryResult(t *testing.T, summary string) subprocess.Result
 			"changes_made": []any{},
 			"tests_run":    []any{},
 			"needs":        []any{},
-			"next_agents":  []any{},
+			"delegations":  []any{},
 		},
 	})
 	if err != nil {

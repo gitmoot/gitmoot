@@ -268,7 +268,7 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
 
    ```sh
    gitmoot agent subscribe audit --runtime claude --session <claude-session-id> --role reviewer --repo owner/project --capability review --capability ask
-   gitmoot agent subscribe shell-smoke --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"ok\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell\"],\"needs\":[],\"next_agents\":[]}}'" --role reviewer --repo owner/project --capability ask
+   gitmoot agent subscribe shell-smoke --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"ok\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell\"],\"needs\":[],\"delegations\":[]}}'" --role reviewer --repo owner/project --capability ask
    gitmoot agent list
    ```
 
@@ -448,7 +448,7 @@ Agents must return exactly one JSON object containing `gitmoot_result`:
     "changes_made": [],
     "tests_run": [],
     "needs": [],
-    "next_agents": []
+    "delegations": []
   }
 }
 ```

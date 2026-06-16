@@ -7,7 +7,7 @@ continuation jobs. This keeps multi-agent coordination entirely inside Gitmoot
 (no external tools) and uses the existing job system as the coordination
 substrate.
 
-This goal also removes `next_agents` cleanly, as agreed in
+This goal also removes the old agent-list result field cleanly, as agreed in
 https://github.com/jerryfane/gitmoot/issues/301#issuecomment-4717451503.
 
 ## Core Rules
@@ -181,7 +181,7 @@ worktree, runs tests/review, pushes, opens a PR, and reports back.
 
 ## Implementation Tasks
 
-### Task 3051: Schema migration — introduce delegations and remove next_agents
+### Task 3051: Schema migration — introduce structured delegations
 
 **Scope:**
 
@@ -204,7 +204,7 @@ worktree, runs tests/review, pushes, opens a PR, and reports back.
   }
   ```
 
-- Replace `NextAgents []string` in `AgentResult` with `Delegations []Delegation`.
+- Replace the old string-list handoff field in `AgentResult` with `Delegations []Delegation`.
 - Update `normalizeAgentResult` to default `Delegations` to `[]Delegation{}`.
 - Add job DAG fields to `JobRequest` and `JobPayload` in
   `internal/workflow/mailbox.go`:
@@ -219,18 +219,17 @@ worktree, runs tests/review, pushes, opens a PR, and reports back.
   - indexes on `(parent_job_id)` and `(delegation_id)`
 - Update `db.Job` struct and `Store.CreateJobWithEvent` / `GetJob` paths to
   persist the new fields.
-- Remove all `NextAgents`/`next_agents` references from the schema and data
-  model.
+- Remove the old agent-list field from the schema and data model.
 
 **Acceptance criteria:**
 
 - `go test ./internal/workflow ./internal/db` passes.
-- `grep -R "NextAgents\|next_agents" --include="*.go" internal/workflow internal/db` returns nothing.
+- a tracked-file grep for the old agent-list field returns nothing.
 
 **Suggested commit message:**
 
 ```text
-feat(workflow): add delegations schema and remove next_agents
+feat(workflow): add structured delegations schema
 ```
 
 ### Task 3052: Parse delegations and update the result contract
@@ -241,24 +240,23 @@ feat(workflow): add delegations schema and remove next_agents
   `delegations`.
 - Update `validateAgentResult` and `normalizeAgentResult` for the new field.
 - Update `internal/prompts/prompts.go` `RenderJob` and `RenderRepairPrompt` to
-  show a `delegations` example instead of `next_agents`:
+  show a `delegations` example:
 
   ```json
   {"gitmoot_result":{"decision":"approved|changes_requested|blocked|implemented|failed","summary":"...","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}
   ```
 
-- Update `skills/gitmoot/references/RESULT_CONTRACT.md` with the new field,
-  delegation example, and migration note for `next_agents` removal.
+- Update `skills/gitmoot/references/RESULT_CONTRACT.md` with the new field and
+  delegation example.
 - Update `internal/cli/agent_dispatch.go` `printLocalAgentJobOutput` to print
-  `delegations` instead of `next_agents`.
+  delegation agent names.
 - Update tests in `internal/workflow/result_test.go` and
-  `internal/cli/agent_test.go` that assert on `next_agents`.
+  `internal/cli/agent_test.go` that assert on result fields.
 
 **Acceptance criteria:**
 
 - `go test ./internal/workflow ./internal/cli ./internal/prompts` passes.
-- `grep -R "next_agents" --include="*.go" --include="*.md" internal skills docs`
-  returns only release notes if desired.
+- a tracked-file grep for the old result field returns no matches.
 
 **Suggested commit message:**
 
@@ -270,7 +268,7 @@ feat(workflow): parse delegations and update result contract
 
 **Scope:**
 
-- Delete `dispatchNextAgents` in `internal/workflow/engine.go`.
+- Delete the old string-list delegation dispatcher in `internal/workflow/engine.go`.
 - Add `dispatchDelegations(ctx, payload, result, ref) error` that:
   - Iterates over `result.Delegations`.
   - Builds a `JobRequest` for each delegation with inherited repo/branch/PR
@@ -417,14 +415,14 @@ feat(cli): render delegation DAG in dashboard
   - coordinator returns two delegations
   - workers return results
   - continuation job is enqueued
-- Update any remaining docs that mention `next_agents`.
+- Update any remaining docs that mention the old result field.
 
 **Acceptance criteria:**
 
 - Docs are consistent and link checks pass.
 - Smoke test runs manually and passes.
-- `grep -R "next_agents" --include="*.md" skills docs` returns nothing except
-  release notes.
+- a tracked-file grep for the old result field returns no matches except release
+  notes if deliberately retained.
 
 **Suggested commit message:**
 

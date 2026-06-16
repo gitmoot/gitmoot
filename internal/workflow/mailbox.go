@@ -35,6 +35,10 @@ type JobRequest struct {
 	Sender           string
 	Instructions     string
 	Constraints      []string
+	ParentJobID      string
+	DelegationID     string
+	DelegationDepth  int
+	DelegatedBy      string
 	OriginalAgent    string
 	DelegatedAgent   string
 	DelegationReason string
@@ -54,6 +58,10 @@ type JobPayload struct {
 	Sender                 string       `json:"sender"`
 	Instructions           string       `json:"instructions"`
 	Constraints            []string     `json:"constraints"`
+	ParentJobID            string       `json:"parent_job_id,omitempty"`
+	DelegationID           string       `json:"delegation_id,omitempty"`
+	DelegationDepth        int          `json:"delegation_depth,omitempty"`
+	DelegatedBy            string       `json:"delegated_by,omitempty"`
 	TemplateID             string       `json:"template_id,omitempty"`
 	TemplateResolvedCommit string       `json:"template_resolved_commit,omitempty"`
 	TemplateContent        string       `json:"template_content,omitempty"`
@@ -95,6 +103,10 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		Sender:                 request.Sender,
 		Instructions:           request.Instructions,
 		Constraints:            compactStrings(request.Constraints),
+		ParentJobID:            request.ParentJobID,
+		DelegationID:           request.DelegationID,
+		DelegationDepth:        request.DelegationDepth,
+		DelegatedBy:            request.DelegatedBy,
 		TemplateID:             snapshot.ID,
 		TemplateResolvedCommit: snapshot.ResolvedCommit,
 		TemplateContent:        snapshot.Content,
@@ -107,11 +119,15 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 	}
 
 	job := db.Job{
-		ID:      request.ID,
-		Agent:   request.Agent,
-		Type:    request.Action,
-		State:   string(JobQueued),
-		Payload: payload,
+		ID:              request.ID,
+		Agent:           request.Agent,
+		Type:            request.Action,
+		State:           string(JobQueued),
+		Payload:         payload,
+		ParentJobID:     request.ParentJobID,
+		DelegationID:    request.DelegationID,
+		DelegationDepth: request.DelegationDepth,
+		DelegatedBy:     request.DelegatedBy,
 	}
 	if err := m.Store.CreateJobWithEvent(ctx, job, db.JobEvent{JobID: job.ID, Kind: string(JobQueued), Message: "job queued"}); err != nil {
 		return db.Job{}, err

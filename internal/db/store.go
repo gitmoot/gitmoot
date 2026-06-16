@@ -153,11 +153,15 @@ type Comment struct {
 }
 
 type Job struct {
-	ID      string
-	Agent   string
-	Type    string
-	State   string
-	Payload string
+	ID              string
+	Agent           string
+	Type            string
+	State           string
+	Payload         string
+	ParentJobID     string
+	DelegationID    string
+	DelegationDepth int
+	DelegatedBy     string
 	// UpdatedAt is populated by ListJobs (for age display in the dashboard);
 	// other readers may leave it zero.
 	UpdatedAt string
@@ -1881,8 +1885,10 @@ func (s *Store) MarkCommentSeenIfNew(ctx context.Context, comment Comment) (bool
 }
 
 func (s *Store) CreateJob(ctx context.Context, job Job) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, updated_at)
-		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`, job.ID, job.Agent, job.Type, job.State, job.Payload)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		job.ID, job.Agent, job.Type, job.State, job.Payload,
+		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy)
 	return err
 }
 
@@ -1893,8 +1899,10 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent)
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, updated_at)
-		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`, job.ID, job.Agent, job.Type, job.State, job.Payload); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		job.ID, job.Agent, job.Type, job.State, job.Payload,
+		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy); err != nil {
 		return err
 	}
 	if event.JobID == "" {
@@ -1907,16 +1915,16 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent)
 }
 
 func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, agent, type, state, payload FROM jobs WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by FROM jobs WHERE id = ?`, id)
 	var job Job
-	if err := row.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload); err != nil {
+	if err := row.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy); err != nil {
 		return Job{}, err
 	}
 	return job, nil
 }
 
 func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, updated_at FROM jobs ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, updated_at FROM jobs ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -1925,7 +1933,7 @@ func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.UpdatedAt); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.UpdatedAt); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -1934,7 +1942,7 @@ func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
 }
 
 func (s *Store) ListQueuedJobs(ctx context.Context) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by
 		FROM jobs WHERE state = ? ORDER BY created_at, rowid`, "queued")
 	if err != nil {
 		return nil, err
@@ -1944,7 +1952,7 @@ func (s *Store) ListQueuedJobs(ctx context.Context) ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -1953,7 +1961,7 @@ func (s *Store) ListQueuedJobs(ctx context.Context) ([]Job, error) {
 }
 
 func (s *Store) ListRunningJobsUpdatedBefore(ctx context.Context, before time.Time) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by
 		FROM jobs WHERE state = ? AND updated_at < ? ORDER BY id`, "running", before.UTC().Format("2006-01-02 15:04:05"))
 	if err != nil {
 		return nil, err
@@ -1963,7 +1971,7 @@ func (s *Store) ListRunningJobsUpdatedBefore(ctx context.Context, before time.Ti
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -4952,5 +4960,14 @@ CREATE TABLE created_repos (
 );
 
 CREATE INDEX idx_created_repos_session ON created_repos(session_id);
+	`,
+	`
+ALTER TABLE jobs ADD COLUMN parent_job_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN delegation_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN delegation_depth INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN delegated_by TEXT NOT NULL DEFAULT '';
+
+CREATE INDEX idx_jobs_parent_job_id ON jobs(parent_job_id);
+CREATE INDEX idx_jobs_delegation_id ON jobs(delegation_id);
 	`,
 }

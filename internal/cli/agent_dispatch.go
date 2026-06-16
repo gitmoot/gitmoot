@@ -839,7 +839,18 @@ func printLocalAgentJobOutput(stdout io.Writer, output localAgentJobOutput) {
 	printRawMessages(stdout, "findings", output.Result.Findings)
 	printStringList(stdout, "needs", output.Result.Needs)
 	printStringList(stdout, "tests_run", output.Result.TestsRun)
-	printStringList(stdout, "next_agents", output.Result.NextAgents)
+	printStringList(stdout, "delegations", delegationAgentNames(output.Result.Delegations))
+}
+
+func delegationAgentNames(delegations []workflow.Delegation) []string {
+	names := make([]string, 0, len(delegations))
+	for _, d := range delegations {
+		name := strings.TrimSpace(d.Agent)
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 func printRawMessages(stdout io.Writer, label string, values []json.RawMessage) {

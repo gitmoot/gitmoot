@@ -497,8 +497,8 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 	}
 
 	runner := &agentStartRunner{results: []subprocess.Result{
-		{Stdout: `{"gitmoot_result":{"decision":"approved","summary":"plan ready","findings":[{"title":"clear"}],"changes_made":[],"tests_run":["go test ./internal/cli"],"needs":["ship it"],"next_agents":["thermo-review"]}}` + "\n"},
-		{Stdout: `{"gitmoot_result":{"decision":"approved","summary":"json ready","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"approved","summary":"plan ready","findings":[{"title":"clear"}],"changes_made":[],"tests_run":["go test ./internal/cli"],"needs":["ship it"],"delegations":[{"id":"review","agent":"thermo-review","action":"review","prompt":"review the plan"}]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"approved","summary":"json ready","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"},
 	}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -523,7 +523,7 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 		"- ship it",
 		"tests_run:",
 		"- go test ./internal/cli",
-		"next_agents:",
+		"delegations:",
 		"- thermo-review",
 	} {
 		if !strings.Contains(stdout.String(), want) {
@@ -2525,7 +2525,7 @@ func (r *managedSyncLockRunner) Run(ctx context.Context, _ string, command strin
 		r.t.Fatalf("runtime lock ttl = %s, want at least %s", ttl, r.minTTL)
 	}
 	r.checked = true
-	return subprocess.Result{Command: command, Args: args, Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"}, nil
+	return subprocess.Result{Command: command, Args: args, Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"}, nil
 }
 
 func (r *managedSyncLockRunner) LookPath(file string) (string, error) {

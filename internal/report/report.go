@@ -243,7 +243,7 @@ func renderMarkdown(report Report, data jobReportData) string {
 		writeList(&builder, "Changes made", data.payload.Result.ChangesMade)
 		writeList(&builder, "Tests run", data.payload.Result.TestsRun)
 		writeList(&builder, "Needs", data.payload.Result.Needs)
-		writeList(&builder, "Next agents", data.payload.Result.NextAgents)
+		writeList(&builder, "Delegations", delegationAgentNames(data.payload.Result.Delegations))
 	}
 
 	writeDetails(&builder, "Selected error details", func(details *strings.Builder) {
@@ -287,6 +287,17 @@ func renderMarkdown(report Report, data jobReportData) string {
 	})
 
 	return workflow.LimitCommentBody(builder.String())
+}
+
+func delegationAgentNames(delegations []workflow.Delegation) []string {
+	names := make([]string, 0, len(delegations))
+	for _, d := range delegations {
+		name := strings.TrimSpace(d.Agent)
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 func jobSummary(source SourceMetadata) string {

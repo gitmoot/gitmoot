@@ -261,14 +261,15 @@ object:
     "changes_made": [],
     "tests_run": [],
     "needs": [],
-    "next_agents": []
+    "delegations": []
   }
 }
 ```
 
 Use `blocked` when work cannot continue without human input or external state.
 Use `failed` when the attempted action errored. Do not report tests, changes, or
-approvals that were not actually verified.
+approvals that were not actually verified. Use `delegations` to request follow-up
+work by named Gitmoot agents.
 
 ## Safety Rules
 

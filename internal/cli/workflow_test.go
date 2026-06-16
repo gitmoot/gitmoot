@@ -733,7 +733,7 @@ func subscribeShellImplementAgent(t *testing.T, home string, name string, repo s
 		"agent", "subscribe", name,
 		"--home", home,
 		"--runtime", "shell",
-		"--session", `printf '%s\n' '{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}'`,
+		"--session", `printf '%s\n' '{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`,
 		"--role", "lead",
 		"--repo", repo,
 		"--capability", "implement",

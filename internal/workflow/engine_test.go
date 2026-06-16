@@ -11,6 +11,58 @@ import (
 	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
+func TestEngineAdvanceJobDispatchesDelegations(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "audit", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "helper", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "audit", Type: "ask"}, JobPayload{
+		Repo:        "jerryfane/gitmoot",
+		Branch:      "task-005",
+		PullRequest: 5,
+		TaskID:      "task-5",
+		TaskTitle:   "Parent",
+		Sender:      "audit",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "del-1", Agent: "helper", Action: "review", Prompt: "review this"},
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	child := mustJob(t, store, "parent-job/delegation/del-1")
+	if child.Agent != "helper" || child.Type != "review" || child.State != string(JobQueued) {
+		t.Fatalf("child job = %+v", child)
+	}
+	if child.ParentJobID != "parent-job" || child.DelegationID != "del-1" || child.DelegationDepth != 1 || child.DelegatedBy != "audit" {
+		t.Fatalf("child metadata = %+v", child)
+	}
+
+	payload, err := unmarshalPayload(child.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	if payload.ParentJobID != "parent-job" || payload.DelegationID != "del-1" || payload.DelegationDepth != 1 || payload.DelegatedBy != "audit" {
+		t.Fatalf("child payload metadata = %+v", payload)
+	}
+	if payload.Sender != "audit" || payload.Instructions != "review this" {
+		t.Fatalf("child payload context = %+v", payload)
+	}
+
+	// Idempotent: advancing the same parent again must not duplicate the child.
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("second AdvanceJob returned error: %v", err)
+	}
+}
+
 func TestEngineHandlePullRequestOpenedDispatchesReviewers(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -433,7 +485,7 @@ func TestEngineRunJobAdvancesCompletedResult(t *testing.T) {
 	engine.RequiredReviewers = []string{"audit"}
 	agent := runtime.Agent{Name: "lead", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "jerryfane/gitmoot", Role: "lead"}
 	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"implemented","summary":"opened PR","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
+		`{"gitmoot_result":{"decision":"implemented","summary":"opened PR","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}}
 	if _, err := (Mailbox{Store: store}).Enqueue(ctx, JobRequest{
 		ID:          "implement-job",
@@ -489,7 +541,7 @@ func TestEngineRunJobAllowsDelegatedImplementWithOriginalBranchLock(t *testing.T
 	engine := testEngine(store)
 	agent := runtime.Agent{Name: "lead-temp-job-1", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "jerryfane/gitmoot", Role: "lead"}
 	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
+		`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}}
 
 	if _, err := engine.RunJob(ctx, "job-1", agent, adapter); err != nil {
@@ -532,7 +584,7 @@ func TestEngineRunJobAllowsMergeBackAskForImplementOnlyOriginal(t *testing.T) {
 	engine := testEngine(store)
 	agent := runtime.Agent{Name: "lead", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "jerryfane/gitmoot", Role: "lead"}
 	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"approved","summary":"ack","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
+		`{"gitmoot_result":{"decision":"approved","summary":"ack","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}}
 
 	if _, err := engine.RunJob(ctx, "job-merge-back", agent, adapter); err != nil {
@@ -557,7 +609,7 @@ func TestEngineRunJobPreflightsPolicyBeforeDelivery(t *testing.T) {
 	delivered := false
 	adapter := &fakeDelivery{
 		outputs: []string{
-			`{"gitmoot_result":{"decision":"implemented","summary":"opened PR","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
+			`{"gitmoot_result":{"decision":"implemented","summary":"opened PR","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 		},
 		onDeliver: func() {
 			delivered = true
@@ -1155,71 +1207,6 @@ func TestEngineAdvanceReviewApprovalIgnoresStaleRoundWhenNewerRoundExists(t *tes
 	}
 }
 
-func TestEngineAdvanceStaleReviewDoesNotDispatchNextAgents(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	engine := testEngine(store)
-	seedAgent(t, store, "planner", []string{"ask"}, "jerryfane/gitmoot")
-	if err := store.UpsertTask(ctx, db.Task{
-		ID:     "task-7",
-		GoalID: "goal-1",
-		Title:  "Workflow Engine",
-		State:  string(TaskReviewing),
-		Branch: "task-7",
-	}); err != nil {
-		t.Fatalf("UpsertTask returned error: %v", err)
-	}
-	insertCompletedJob(t, store, db.Job{
-		ID:    "audit-review-round-1",
-		Agent: "audit",
-		Type:  "review",
-	}, JobPayload{
-		Repo:        "jerryfane/gitmoot",
-		Branch:      "task-7",
-		PullRequest: 7,
-		TaskID:      "task-7",
-		TaskTitle:   "Workflow Engine",
-		Reviewers:   []string{"audit"},
-		ReviewRound: "review-1",
-		Result:      &AgentResult{Decision: "approved", Summary: "old approval", NextAgents: []string{"planner"}},
-	})
-	encoded, err := marshalPayload(JobPayload{
-		Repo:        "jerryfane/gitmoot",
-		Branch:      "task-7",
-		PullRequest: 7,
-		TaskID:      "task-7",
-		TaskTitle:   "Workflow Engine",
-		Reviewers:   []string{"audit"},
-		ReviewRound: "review-2",
-	})
-	if err != nil {
-		t.Fatalf("marshalPayload returned error: %v", err)
-	}
-	if err := store.CreateJobWithEvent(ctx, db.Job{
-		ID:      "audit-review-round-2",
-		Agent:   "audit",
-		Type:    "review",
-		State:   string(JobQueued),
-		Payload: encoded,
-	}, db.JobEvent{Kind: string(JobQueued), Message: "newer round queued"}); err != nil {
-		t.Fatalf("CreateJobWithEvent returned error: %v", err)
-	}
-
-	if err := engine.AdvanceJob(ctx, "audit-review-round-1"); err != nil {
-		t.Fatalf("AdvanceJob returned error: %v", err)
-	}
-	jobs, err := store.ListJobs(ctx)
-	if err != nil {
-		t.Fatalf("ListJobs returned error: %v", err)
-	}
-	for _, job := range jobs {
-		if job.Type == "ask" {
-			t.Fatalf("stale review dispatched next-agent job: %+v", job)
-		}
-	}
-	assertTaskState(t, store, "task-7", TaskReviewing)
-}
-
 func TestEngineAdvanceStaleReviewDoesNotRegressReadyState(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -1362,91 +1349,8 @@ func TestEngineAdvanceBlocksOnAgentBlockedResult(t *testing.T) {
 	assertTaskState(t, store, "task-7", TaskBlocked)
 }
 
-func TestEngineAdvanceDispatchesNextAgents(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "planner", []string{"ask"}, "jerryfane/gitmoot")
-	engine := testEngine(store)
-	insertCompletedJob(t, store, db.Job{
-		ID:    "review-job",
-		Agent: "audit",
-		Type:  "review",
-	}, JobPayload{
-		Repo:      "jerryfane/gitmoot",
-		Branch:    "task-7",
-		TaskID:    "task-7",
-		TaskTitle: "Workflow Engine",
-		Result:    &AgentResult{Decision: "approved", Summary: "ask planner", NextAgents: []string{"planner"}},
-	})
 
-	err := engine.AdvanceJob(ctx, "review-job")
 
-	if err != nil {
-		t.Fatalf("AdvanceJob returned error: %v", err)
-	}
-	mustJob(t, store, "ask-planner-task-7")
-}
-
-func TestEngineAdvanceBlocksWhenNextAgentScopeRejected(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "planner", []string{"ask"}, "other/repo")
-	engine := testEngine(store)
-	insertCompletedJob(t, store, db.Job{
-		ID:    "review-job",
-		Agent: "audit",
-		Type:  "review",
-	}, JobPayload{
-		Repo:      "jerryfane/gitmoot",
-		Branch:    "task-7",
-		TaskID:    "task-7",
-		TaskTitle: "Workflow Engine",
-		Result:    &AgentResult{Decision: "approved", Summary: "ask planner", NextAgents: []string{"planner"}},
-	})
-
-	err := engine.AdvanceJob(ctx, "review-job")
-
-	var blocked BlockedError
-	if !errors.As(err, &blocked) || !strings.Contains(blocked.Reason, "not allowed") {
-		t.Fatalf("error = %v, want scope BlockedError", err)
-	}
-	assertTaskState(t, store, "task-7", TaskBlocked)
-}
-
-func TestEngineAdvancePreflightsNextAgentsBeforeEnqueue(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "planner", []string{"ask"}, "jerryfane/gitmoot")
-	engine := testEngine(store)
-	insertCompletedJob(t, store, db.Job{
-		ID:    "review-job",
-		Agent: "audit",
-		Type:  "review",
-	}, JobPayload{
-		Repo:      "jerryfane/gitmoot",
-		Branch:    "task-7",
-		TaskID:    "task-7",
-		TaskTitle: "Workflow Engine",
-		Result:    &AgentResult{Decision: "approved", Summary: "ask planner", NextAgents: []string{"planner", "missing"}},
-	})
-
-	err := engine.AdvanceJob(ctx, "review-job")
-
-	var blocked BlockedError
-	if !errors.As(err, &blocked) || !strings.Contains(blocked.Reason, "not subscribed") {
-		t.Fatalf("error = %v, want missing next-agent BlockedError", err)
-	}
-	jobs, listErr := store.ListJobs(ctx)
-	if listErr != nil {
-		t.Fatalf("ListJobs returned error: %v", listErr)
-	}
-	for _, job := range jobs {
-		if job.Type == "ask" {
-			t.Fatalf("ask job was enqueued before next-agent preflight completed: %+v", job)
-		}
-	}
-	assertTaskState(t, store, "task-7", TaskBlocked)
-}
 
 func TestEngineSetTaskStatePreservesExistingMetadata(t *testing.T) {
 	ctx := context.Background()

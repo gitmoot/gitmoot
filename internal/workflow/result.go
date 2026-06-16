@@ -9,14 +9,32 @@ import (
 
 const resultKey = `"gitmoot_result"`
 
+// Delegation describes a child job that an agent wants Gitmoot to enqueue on
+// its behalf.
+type Delegation struct {
+	ID            string   `json:"id"`
+	Agent         string   `json:"agent"`
+	Action        string   `json:"action"`
+	Worktree      string   `json:"worktree,omitempty"`
+	Prompt        string   `json:"prompt"`
+	Artifacts     []string `json:"artifacts,omitempty"`
+	Deps          []string `json:"deps,omitempty"`
+	Timeout       string   `json:"timeout,omitempty"`
+	Retry         int      `json:"retry,omitempty"`
+	FailurePolicy string   `json:"failure_policy,omitempty"`
+	Fingerprint   string   `json:"fingerprint,omitempty"`
+	SynthesisRule string   `json:"synthesis_rule,omitempty"`
+}
+
 type AgentResult struct {
-	Decision    string            `json:"decision"`
-	Summary     string            `json:"summary"`
-	Findings    []json.RawMessage `json:"findings"`
-	ChangesMade []string          `json:"changes_made"`
-	TestsRun    []string          `json:"tests_run"`
-	Needs       []string          `json:"needs"`
-	NextAgents  []string          `json:"next_agents"`
+	Decision     string            `json:"decision"`
+	Summary      string            `json:"summary"`
+	Findings     []json.RawMessage `json:"findings"`
+	ChangesMade  []string          `json:"changes_made"`
+	TestsRun     []string          `json:"tests_run"`
+	Needs        []string          `json:"needs"`
+	Delegations  []Delegation      `json:"delegations"`
+	ArtifactBody string            `json:"artifact_body,omitempty"`
 }
 
 func ExtractAgentResult(output string) (AgentResult, error) {
@@ -28,6 +46,12 @@ func ExtractAgentResult(output string) (AgentResult, error) {
 		}
 		raw, ok := envelope["gitmoot_result"]
 		if !ok {
+			continue
+		}
+		if err := validateAgentResultFields(raw); err != nil {
+			if validationErr == nil {
+				validationErr = err
+			}
 			continue
 		}
 		var result AgentResult
@@ -52,6 +76,29 @@ func ExtractAgentResult(output string) (AgentResult, error) {
 	return AgentResult{}, errors.New("missing valid gitmoot_result JSON object")
 }
 
+func validateAgentResultFields(raw json.RawMessage) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	allowed := map[string]struct{}{
+		"decision":      {},
+		"summary":       {},
+		"findings":      {},
+		"changes_made":  {},
+		"tests_run":     {},
+		"needs":         {},
+		"delegations":   {},
+		"artifact_body": {},
+	}
+	for field := range fields {
+		if _, ok := allowed[field]; !ok {
+			return fmt.Errorf("unsupported gitmoot_result field %q", field)
+		}
+	}
+	return nil
+}
+
 func validateAgentResult(result AgentResult) error {
 	switch result.Decision {
 	case "approved", "changes_requested", "blocked", "implemented", "failed":
@@ -60,6 +107,23 @@ func validateAgentResult(result AgentResult) error {
 	}
 	if strings.TrimSpace(result.Summary) == "" {
 		return errors.New("gitmoot_result summary is required")
+	}
+	for _, d := range result.Delegations {
+		if strings.TrimSpace(d.ID) == "" {
+			return errors.New("delegation id is required")
+		}
+		if strings.TrimSpace(d.Agent) == "" {
+			return errors.New("delegation agent is required")
+		}
+		if strings.TrimSpace(d.Action) == "" {
+			return errors.New("delegation action is required")
+		}
+		if strings.TrimSpace(d.Prompt) == "" {
+			return errors.New("delegation prompt is required")
+		}
+		if len(d.Deps) > 0 {
+			return fmt.Errorf("delegation %q uses dependencies, which are not yet supported", d.ID)
+		}
 	}
 	return nil
 }
@@ -77,8 +141,8 @@ func normalizeAgentResult(result *AgentResult) {
 	if result.Needs == nil {
 		result.Needs = []string{}
 	}
-	if result.NextAgents == nil {
-		result.NextAgents = []string{}
+	if result.Delegations == nil {
+		result.Delegations = []Delegation{}
 	}
 }
 

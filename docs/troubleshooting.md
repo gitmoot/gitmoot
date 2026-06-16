@@ -392,7 +392,7 @@ Required shape:
     "changes_made": [],
     "tests_run": [],
     "needs": [],
-    "next_agents": []
+    "delegations": []
   }
 }
 ```

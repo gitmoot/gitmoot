@@ -20,7 +20,7 @@ func TestRenderJobResultCommentIncludesAttributionAndResult(t *testing.T) {
 			ChangesMade: []string{"reviewed workflow"},
 			TestsRun:    []string{"go test ./..."},
 			Needs:       []string{"rerun review"},
-			NextAgents:  []string{"lead"},
+			Delegations: []Delegation{{ID: "plan", Agent: "lead", Action: "ask", Prompt: "plan next steps"}},
 		},
 	})
 
@@ -36,7 +36,8 @@ func TestRenderJobResultCommentIncludesAttributionAndResult(t *testing.T) {
 		"**Changes Made**",
 		"**Tests Run**",
 		"**Needs**",
-		"**Next Agents**",
+		"**Delegations**",
+		"- lead",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("comment body missing %q:\n%s", want, body)

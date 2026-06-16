@@ -752,7 +752,7 @@ object:
     "changes_made": [],
     "tests_run": [],
     "needs": [],
-    "next_agents": []
+    "delegations": []
   }
 }
 ```
@@ -1055,7 +1055,7 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
 
    ```sh
    gitmoot agent subscribe audit --runtime claude --session <claude-session-id> --role reviewer --repo owner/project --capability review --capability ask
-   gitmoot agent subscribe shell-smoke --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"ok\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell\"],\"needs\":[],\"next_agents\":[]}}'" --role reviewer --repo owner/project --capability ask
+   gitmoot agent subscribe shell-smoke --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"ok\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell\"],\"needs\":[],\"delegations\":[]}}'" --role reviewer --repo owner/project --capability ask
    gitmoot agent list
    ```
 
@@ -1235,7 +1235,7 @@ Agents must return exactly one JSON object containing `gitmoot_result`:
     "changes_made": [],
     "tests_run": [],
     "needs": [],
-    "next_agents": []
+    "delegations": []
   }
 }
 ```
@@ -2124,7 +2124,7 @@ Required shape:
     "changes_made": [],
     "tests_run": [],
     "needs": [],
-    "next_agents": []
+    "delegations": []
   }
 }
 ```
@@ -3631,7 +3631,7 @@ the smoke test cannot approve or merge the PR.
 1. Register the repo and a shell smoke agent.
 
    ```sh
-   gitmoot setup --repo owner/project --path . --agent shell-smoke --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"shell ask smoke passed\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell smoke\"],\"needs\":[],\"next_agents\":[]}}'"
+   gitmoot setup --repo owner/project --path . --agent shell-smoke --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"shell ask smoke passed\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell smoke\"],\"needs\":[],\"delegations\":[]}}'"
    gitmoot agent repos shell-smoke
    ```
 
@@ -4230,10 +4230,10 @@ each repo -> no cross-routing. This intentionally avoids approving reviews.
 
    ```sh
    cd /path/to/project-a
-   gitmoot setup --repo owner/project-a --path . --agent shell-smoke --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"repo ask smoke passed\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell smoke\"],\"needs\":[],\"next_agents\":[]}}'"
+   gitmoot setup --repo owner/project-a --path . --agent shell-smoke --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"repo ask smoke passed\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell smoke\"],\"needs\":[],\"delegations\":[]}}'"
 
    cd /path/to/project-b
-   gitmoot setup --repo owner/project-b --path . --agent shell-smoke --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"repo ask smoke passed\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell smoke\"],\"needs\":[],\"next_agents\":[]}}'"
+   gitmoot setup --repo owner/project-b --path . --agent shell-smoke --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"repo ask smoke passed\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell smoke\"],\"needs\":[],\"delegations\":[]}}'"
 
    gitmoot agent repos shell-smoke
    ```
@@ -5989,7 +5989,7 @@ truthful, and tied to work that actually happened.
     "changes_made": [],
     "tests_run": [],
     "needs": [],
-    "next_agents": []
+    "delegations": []
   }
 }
 ```
@@ -6008,7 +6008,7 @@ truthful, and tied to work that actually happened.
 - Do not claim files were changed unless they were actually changed.
 - Use `needs` for missing credentials, unclear scope, unavailable tools, failing
   external services, or required human decisions.
-- Use `next_agents` only when another named Gitmoot agent should be invoked.
+- Use `delegations` only when another named Gitmoot agent should be invoked.
 - Redact secrets from summaries, findings, raw command output, and examples.
 
 ---

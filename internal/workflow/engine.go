@@ -255,7 +255,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 			return nil
 		}
 	}
-	if err := e.dispatchNextAgents(ctx, payload, *payload.Result, ref); err != nil {
+	if err := e.dispatchDelegations(ctx, job, payload, ref); err != nil {
 		return err
 	}
 
@@ -322,6 +322,90 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 			_, err = e.runMergeGate(ctx, reviewer, payload, ref)
 			return err
 		}
+	}
+	return nil
+}
+
+func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) error {
+	if payload.Result == nil || len(payload.Result.Delegations) == 0 {
+		return nil
+	}
+
+	requests := make([]JobRequest, 0, len(payload.Result.Delegations))
+	for _, d := range payload.Result.Delegations {
+		requests = append(requests, JobRequest{
+			ID:              job.ID + "/delegation/" + d.ID,
+			Agent:           d.Agent,
+			Action:          d.Action,
+			Repo:            payload.Repo,
+			Branch:          payload.Branch,
+			PullRequest:     payload.PullRequest,
+			HeadSHA:         payload.HeadSHA,
+			GoalID:          payload.GoalID,
+			TaskID:          payload.TaskID,
+			TaskTitle:       payload.TaskTitle,
+			LeadAgent:       payload.LeadAgent,
+			Reviewers:       payload.Reviewers,
+			ReviewRound:     payload.ReviewRound,
+			Sender:          job.Agent,
+			Instructions:    strings.TrimSpace(d.Prompt),
+			Constraints:     payload.Constraints,
+			ParentJobID:     job.ID,
+			DelegationID:    d.ID,
+			DelegationDepth: payload.DelegationDepth + 1,
+			DelegatedBy:     job.Agent,
+		})
+	}
+
+	// Preflight all delegations before enqueueing any child job so that a
+	// partial failure does not leave the parent half-dispatched. Use a lightweight
+	// check that does not acquire branch locks or other execution side effects.
+	for _, request := range requests {
+		if err := e.preflightDelegation(ctx, request); err != nil {
+			return e.block(ctx, ref, fmt.Sprintf("delegation %q preflight failed: %v", request.DelegationID, err))
+		}
+	}
+
+	// Acquire branch locks for all implement delegations before enqueueing any
+	// child job, so a later lock failure does not leave a half-dispatched batch.
+	for _, request := range requests {
+		if request.Action == "implement" {
+			if err := e.ensureBranchLock(ctx, request.Repo, request.Branch, request.Agent, ref); err != nil {
+				return err
+			}
+		}
+	}
+
+	for _, request := range requests {
+		if err := e.enqueue(ctx, request); err != nil {
+			return fmt.Errorf("dispatch delegation %q: %w", request.DelegationID, err)
+		}
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "delegation_enqueued",
+			Message: fmt.Sprintf("delegation %q enqueued as job %s", request.DelegationID, request.ID),
+		})
+	}
+	return nil
+}
+
+func (e Engine) preflightDelegation(ctx context.Context, request JobRequest) error {
+	agent, err := e.Store.GetAgent(ctx, request.Agent)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("agent %q is not subscribed", request.Agent)
+		}
+		return err
+	}
+	allowed, err := e.Store.AgentCanAccessRepo(ctx, agent.Name, request.Repo)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return fmt.Errorf("agent %q is not allowed on %q", agent.Name, request.Repo)
+	}
+	if !contains(agent.Capabilities, request.Action) {
+		return fmt.Errorf("agent %q lacks %q capability", agent.Name, request.Action)
 	}
 	return nil
 }
@@ -430,40 +514,6 @@ func (e Engine) leadAgent(ctx context.Context, payload JobPayload) (string, erro
 		return "", errors.New("lead agent is required")
 	}
 	return "", err
-}
-
-func (e Engine) dispatchNextAgents(ctx context.Context, payload JobPayload, result AgentResult, ref taskRef) error {
-	requests := []JobRequest{}
-	for _, agent := range compactStrings(result.NextAgents) {
-		request := JobRequest{
-			Agent:        agent,
-			Action:       "ask",
-			Repo:         payload.Repo,
-			Branch:       payload.Branch,
-			PullRequest:  payload.PullRequest,
-			HeadSHA:      payload.HeadSHA,
-			GoalID:       payload.GoalID,
-			TaskID:       payload.TaskID,
-			TaskTitle:    payload.TaskTitle,
-			LeadAgent:    payload.LeadAgent,
-			Reviewers:    e.requiredReviewers(payload),
-			ReviewRound:  payload.ReviewRound,
-			Sender:       payload.Sender,
-			Instructions: "Another agent requested your input: " + result.Summary,
-		}
-		requests = append(requests, request)
-	}
-	for _, request := range requests {
-		if err := e.ensureAgentAllowed(ctx, request, ref); err != nil {
-			return err
-		}
-	}
-	for _, request := range requests {
-		if err := e.enqueue(ctx, request); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (e Engine) allRequiredReviewersApproved(ctx context.Context, currentReviewer string, payload JobPayload) (bool, error) {

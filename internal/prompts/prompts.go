@@ -57,7 +57,7 @@ func RenderJob(prompt JobPrompt) string {
 	builder.WriteString("\nRequired output:\n")
 	builder.WriteString("Return exactly one JSON object containing a top-level gitmoot_result field.\n")
 	builder.WriteString("Use this shape:\n")
-	builder.WriteString(`{"gitmoot_result":{"decision":"approved|changes_requested|blocked|implemented|failed","summary":"...","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`)
+	builder.WriteString(`{"gitmoot_result":{"decision":"approved|changes_requested|blocked|implemented|failed","summary":"...","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`)
 	builder.WriteByte('\n')
 	return builder.String()
 }
@@ -69,7 +69,7 @@ func RenderRepairPrompt(rawOutput string, parseError error) string {
 		writeField(&builder, "Parse error", parseError.Error())
 	}
 	builder.WriteString("\nReturn only one JSON object in this exact shape:\n")
-	builder.WriteString(`{"gitmoot_result":{"decision":"approved|changes_requested|blocked|implemented|failed","summary":"...","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`)
+	builder.WriteString(`{"gitmoot_result":{"decision":"approved|changes_requested|blocked|implemented|failed","summary":"...","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`)
 	builder.WriteString("\n\nPrevious raw output:\n")
 	builder.WriteString(trimRawOutput(rawOutput, 12000))
 	builder.WriteByte('\n')
