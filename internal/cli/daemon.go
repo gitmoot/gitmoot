@@ -808,7 +808,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 			NextPoll:    map[string]time.Time{},
 			ErrorStreak: map[string]int{},
 		}
-		poller := defaultRegisteredRepoPoller(store, workers, dryRun, stdout)
+		poller := defaultRegisteredRepoPoller(store, workers, dryRun, stdout, paths.Home)
 		blobStore := artifact.NewStore(paths.ArtifactBlobs)
 		reviewGitHub := newSkillOptGitHubClient()
 		worker := defaultJobWorker(store, stdout, home)
@@ -958,7 +958,7 @@ func (l *repoCheckoutLocks) For(repo string) *sync.Mutex {
 }
 
 func pollRegisteredRepos(ctx context.Context, store *db.Store, workers int, dryRun bool, stdout io.Writer, nextPoll map[string]time.Time, now time.Time, fallbackPoll time.Duration) (time.Duration, error) {
-	return pollRegisteredReposWithPoller(ctx, defaultRegisteredRepoPoller(store, workers, dryRun, stdout), registeredRepoSchedule{NextPoll: nextPoll}, now, fallbackPoll)
+	return pollRegisteredReposWithPoller(ctx, defaultRegisteredRepoPoller(store, workers, dryRun, stdout, ""), registeredRepoSchedule{NextPoll: nextPoll}, now, fallbackPoll)
 }
 
 type registeredRepoSchedule struct {
@@ -987,7 +987,7 @@ type registeredRepoPoller struct {
 	WorkflowFactory func(store *db.Store, gh github.Client, checkout string) *workflow.Engine
 }
 
-func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdout io.Writer) registeredRepoPoller {
+func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdout io.Writer, home string) registeredRepoPoller {
 	return registeredRepoPoller{
 		Store:        store,
 		Workers:      workers,
@@ -995,7 +995,7 @@ func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdo
 		Stdout:       stdout,
 		GitHubClient: func(checkout string) github.Client { return github.NewClient(checkout) },
 		WorkflowFactory: func(store *db.Store, gh github.Client, checkout string) *workflow.Engine {
-			engine := daemonWorkflowEngine(store, gh, checkout)
+			engine := daemonWorkflowEngine(store, gh, checkout, home)
 			return &engine
 		},
 	}
@@ -1536,6 +1536,13 @@ func queuedJobCheckoutKey(ctx context.Context, store *db.Store, job db.Job) stri
 }
 
 func queuedJobTaskWorktreePath(ctx context.Context, store *db.Store, payload workflow.JobPayload) (string, bool) {
+	// Sibling delegations share a task id but run in distinct per-delegation
+	// worktrees; key off the payload worktree path so they schedule as separate
+	// checkout keys and can run in parallel.
+	if delegationPath := strings.TrimSpace(payload.WorktreePath); delegationPath != "" {
+		path, err := normalizeTaskWorktreePath(delegationPath)
+		return path, err == nil && path != ""
+	}
 	if store == nil || strings.TrimSpace(payload.TaskID) == "" {
 		return "", false
 	}
@@ -2294,15 +2301,27 @@ func (w jobWorker) defaultStartAdapter(runtimeName string, checkout string) (run
 }
 
 func (w jobWorker) defaultWorkflow(checkout string) workflow.Engine {
-	return daemonWorkflowEngine(w.Store, github.NewClient(checkout), checkout)
+	return daemonWorkflowEngine(w.Store, github.NewClient(checkout), checkout, w.workflowHome())
+}
+
+// workflowHome resolves the GITMOOT_HOME root used to place per-delegation
+// worktrees, mirroring how the daemon resolves paths elsewhere. It returns an
+// empty string when resolution fails so the engine falls back to legacy
+// shared-checkout dispatch rather than failing the job.
+func (w jobWorker) workflowHome() string {
+	paths, err := pathsFromFlag(w.ConfigHome)
+	if err != nil {
+		return ""
+	}
+	return paths.Home
 }
 
 func (w jobWorker) defaultCommenter(_ string) github.Client {
 	return github.NewClient("")
 }
 
-func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string) workflow.Engine {
-	return workflow.Engine{
+func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, home string) workflow.Engine {
+	engine := workflow.Engine{
 		Store:                   store,
 		MergeGate:               daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout},
 		ImplementationFinalizer: daemonImplementationFinalizer{Store: store, GitHub: gh, FallbackCheckout: checkout},
@@ -2310,6 +2329,12 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string) wo
 			return refreshDaemonJobPayload(ctx, store, checkout, job, payload)
 		},
 	}
+	if strings.TrimSpace(home) != "" && strings.TrimSpace(checkout) != "" {
+		engine.Home = home
+		engine.DelegationCheckout = checkout
+		engine.DelegationWorktrees = gitutil.Client{Dir: checkout}
+	}
+	return engine
 }
 
 type daemonImplementationFinalizer struct {
@@ -2685,6 +2710,16 @@ func (w jobWorker) resolveJobCheckout(ctx context.Context, job db.Job, payload w
 }
 
 func (w jobWorker) taskWorktreeCheckout(ctx context.Context, payload workflow.JobPayload) (string, bool, error) {
+	// Delegated implement jobs carry their own per-delegation worktree path in
+	// the payload; prefer it over the task-table worktree so the child runs in
+	// its isolated checkout.
+	if delegationPath := strings.TrimSpace(payload.WorktreePath); delegationPath != "" {
+		checkout, err := normalizeTaskWorktreePath(delegationPath)
+		if err != nil {
+			return "", false, err
+		}
+		return checkout, checkout != "", nil
+	}
 	if strings.TrimSpace(payload.TaskID) == "" {
 		return "", false, nil
 	}

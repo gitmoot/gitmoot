@@ -20,6 +20,14 @@ type Engine struct {
 	JobID                   func(JobRequest) string
 	PayloadRefresher        func(context.Context, db.Job, JobPayload) (JobPayload, error)
 	ImplementationFinalizer ImplementationFinalizer
+	// Home is the resolved GITMOOT_HOME root used to place per-delegation
+	// worktrees. DelegationWorktrees is the checkout-bound git client that
+	// performs the worktree-add. Both are optional: when either is unset, the
+	// dispatcher enqueues implement delegations against the shared checkout
+	// (legacy behavior) rather than allocating isolated worktrees.
+	Home                string
+	DelegationWorktrees WorktreeManager
+	DelegationCheckout  string
 }
 
 type PullRequestEvent struct {
@@ -331,8 +339,9 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 		return nil
 	}
 
-	requests := make([]JobRequest, 0, len(payload.Result.Delegations))
-	for _, d := range payload.Result.Delegations {
+	delegations := payload.Result.Delegations
+	requests := make([]JobRequest, 0, len(delegations))
+	for _, d := range delegations {
 		requests = append(requests, JobRequest{
 			ID:              job.ID + "/delegation/" + d.ID,
 			Agent:           d.Agent,
@@ -366,14 +375,41 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 		}
 	}
 
-	// Acquire branch locks for all implement delegations before enqueueing any
-	// child job, so a later lock failure does not leave a half-dispatched batch.
-	for _, request := range requests {
-		if request.Action == "implement" {
-			if err := e.ensureBranchLock(ctx, request.Repo, request.Branch, request.Agent, ref); err != nil {
+	// Allocate an isolated worktree (and branch lock) for every implement
+	// delegation before enqueueing any child job, so a later allocation failure
+	// does not leave a half-dispatched batch. Each sibling gets a distinct
+	// per-delegation branch and worktree path that overrides the parent's
+	// shared branch on the child request. When the engine has no worktree
+	// support wired, fall back to a bare branch lock on the parent branch.
+	for i := range requests {
+		if requests[i].Action != "implement" {
+			continue
+		}
+		if e.DelegationWorktrees == nil || strings.TrimSpace(e.Home) == "" {
+			if err := e.ensureBranchLock(ctx, requests[i].Repo, requests[i].Branch, requests[i].Agent, ref); err != nil {
 				return err
 			}
+			continue
 		}
+		result, err := e.AllocateDelegationWorktree(ctx, DelegationWorktreeRequest{
+			Home:         e.Home,
+			Repo:         requests[i].Repo,
+			ParentJobID:  job.ID,
+			DelegationID: requests[i].DelegationID,
+			Delegation:   delegations[i],
+			BaseBranch:   payload.Branch,
+			Owner:        requests[i].Agent,
+			Checkout:     e.DelegationCheckout,
+		}, e.DelegationWorktrees)
+		if err != nil {
+			var blocked BlockedError
+			if errors.As(err, &blocked) {
+				return e.block(ctx, ref, blocked.Reason)
+			}
+			return err
+		}
+		requests[i].Branch = result.Branch
+		requests[i].WorktreePath = result.Path
 	}
 
 	for _, request := range requests {
@@ -716,6 +752,7 @@ func payloadMatchesRequest(payload JobPayload, request JobRequest) bool {
 		payload.ReviewRound == request.ReviewRound &&
 		payload.Sender == request.Sender &&
 		payload.Instructions == request.Instructions &&
+		payload.WorktreePath == request.WorktreePath &&
 		payloadDelegationMatchesRequest(payload, request) &&
 		equalStrings(payload.Reviewers, compactStrings(request.Reviewers)) &&
 		equalStrings(payload.Constraints, compactStrings(request.Constraints))

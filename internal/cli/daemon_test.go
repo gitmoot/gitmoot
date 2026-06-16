@@ -408,7 +408,7 @@ func TestPollRegisteredReposRoutesEachRepoWithOwnGitHubClient(t *testing.T) {
 			},
 		},
 	}
-	poller := defaultRegisteredRepoPoller(store, 2, false, io.Discard)
+	poller := defaultRegisteredRepoPoller(store, 2, false, io.Discard, "")
 	poller.GitHubClient = func(checkout string) github.Client { return clients[checkout] }
 	poller.WorkflowFactory = func(*db.Store, github.Client, string) *workflow.Engine { return nil }
 
@@ -478,7 +478,7 @@ func TestPollRegisteredReposBacksOffFailedRepoWithoutStoppingOthers(t *testing.T
 	}
 	failing := &cliPollFakeGitHub{listErr: errors.New("rate limited")}
 	healthy := &cliPollFakeGitHub{}
-	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard)
+	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard, "")
 	poller.GitHubClient = func(checkout string) github.Client {
 		if checkout == "/tmp/failing" {
 			return failing
@@ -1329,7 +1329,7 @@ func TestRunQueuedJobsRefreshesImplementedHeadBeforeReviewDispatch(t *testing.T)
 		return adapter, nil
 	}
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		return daemonWorkflowEngine(store, github.NoopClient{}, checkout)
+		return daemonWorkflowEngine(store, github.NoopClient{}, checkout, "")
 	}
 
 	if err := runQueuedJobs(ctx, worker, 1); err != nil {
@@ -3504,7 +3504,7 @@ func TestRetryPendingJobAdvancementsRefreshesImplementedHeadBeforePreflight(t *t
 	}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		return daemonWorkflowEngine(store, github.NoopClient{}, checkout)
+		return daemonWorkflowEngine(store, github.NoopClient{}, checkout, "")
 	}
 
 	if err := retryPendingJobAdvancements(ctx, worker, ""); err != nil {

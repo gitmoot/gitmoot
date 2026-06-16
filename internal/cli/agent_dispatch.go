@@ -214,7 +214,11 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			return localAgentJobOutput{}, err
 		}
 	} else {
-		engine := daemonWorkflowEngine(store, github.NewClient(checkoutPath), checkoutPath)
+		workflowHome := ""
+		if paths, err := pathsFromFlag(request.Home); err == nil {
+			workflowHome = paths.Home
+		}
+		engine := daemonWorkflowEngine(store, github.NewClient(checkoutPath), checkoutPath, workflowHome)
 		if _, err := engine.RunJob(runCtx, job.ID, runtimeAgent(agent), adapter); err != nil {
 			return localAgentJobOutput{}, err
 		}

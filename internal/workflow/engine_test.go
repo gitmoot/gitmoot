@@ -63,6 +63,72 @@ func TestEngineAdvanceJobDispatchesDelegations(t *testing.T) {
 	}
 }
 
+func TestDispatchDelegationsTwoImplementSiblingsGetSeparateWorktrees(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "audit", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "builder-a", []string{"implement"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "builder-b", []string{"implement"}, "jerryfane/gitmoot")
+	home := t.TempDir()
+	manager := &fakeWorktreeManager{}
+	engine := testEngine(store)
+	engine.Home = home
+	engine.DelegationCheckout = t.TempDir()
+	engine.DelegationWorktrees = manager
+
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "audit", Type: "ask"}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-005",
+		TaskID:    "task-5",
+		TaskTitle: "Parent",
+		Sender:    "audit",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "d1", Agent: "builder-a", Action: "implement", Prompt: "build one"},
+				{ID: "d2", Agent: "builder-b", Action: "implement", Prompt: "build two"},
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	childOne := mustJob(t, store, "parent-job/delegation/d1")
+	childTwo := mustJob(t, store, "parent-job/delegation/d2")
+	payloadOne, err := unmarshalPayload(childOne.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(d1) returned error: %v", err)
+	}
+	payloadTwo, err := unmarshalPayload(childTwo.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(d2) returned error: %v", err)
+	}
+
+	wantPathOne := filepath.Join(home, "worktrees", "jerryfane--gitmoot", "delegations", "parent-job", "d1")
+	wantPathTwo := filepath.Join(home, "worktrees", "jerryfane--gitmoot", "delegations", "parent-job", "d2")
+	if payloadOne.WorktreePath != wantPathOne {
+		t.Fatalf("d1 worktree path = %q, want %q", payloadOne.WorktreePath, wantPathOne)
+	}
+	if payloadTwo.WorktreePath != wantPathTwo {
+		t.Fatalf("d2 worktree path = %q, want %q", payloadTwo.WorktreePath, wantPathTwo)
+	}
+	if payloadOne.WorktreePath == payloadTwo.WorktreePath {
+		t.Fatalf("siblings share worktree path %q", payloadOne.WorktreePath)
+	}
+	if payloadOne.Branch == payloadTwo.Branch {
+		t.Fatalf("siblings share branch %q", payloadOne.Branch)
+	}
+	if payloadOne.Branch == "task-005" || payloadTwo.Branch == "task-005" {
+		t.Fatalf("delegation branch not overridden: d1=%q d2=%q", payloadOne.Branch, payloadTwo.Branch)
+	}
+	if len(manager.calls) != 2 {
+		t.Fatalf("AddWorktree calls = %+v, want two", manager.calls)
+	}
+}
+
 func TestEngineHandlePullRequestOpenedDispatchesReviewers(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -1348,9 +1414,6 @@ func TestEngineAdvanceBlocksOnAgentBlockedResult(t *testing.T) {
 	}
 	assertTaskState(t, store, "task-7", TaskBlocked)
 }
-
-
-
 
 func TestEngineSetTaskStatePreservesExistingMetadata(t *testing.T) {
 	ctx := context.Background()

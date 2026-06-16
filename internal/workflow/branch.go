@@ -2,10 +2,14 @@ package workflow
 
 import (
 	"context"
+	"crypto/sha1"
 	"database/sql"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 )
@@ -104,6 +108,44 @@ func (e Engine) StartTaskBranch(ctx context.Context, request TaskBranchRequest, 
 		return db.Task{}, err
 	}
 	return task, nil
+}
+
+// delegationBranchName derives the git branch for a delegated implement job.
+// It prefers a slugged form of the delegation's requested worktree label and
+// otherwise falls back to a deterministic gitmoot-delegation-<parent-short>-<id>
+// name so sibling delegations from the same parent never collide.
+func delegationBranchName(d Delegation, parentJobID string, delegationID string) string {
+	if hint := slug(d.Worktree); hint != "" {
+		return hint
+	}
+	return fmt.Sprintf("gitmoot-delegation-%s-%s", parentShort(parentJobID), delegationID)
+}
+
+// slug normalizes an arbitrary label into a lowercase, dash-separated token
+// safe for use in branch names. Mirrors internal/cli/workflow.go::slug.
+func slug(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var builder strings.Builder
+	lastDash := false
+	for _, char := range value {
+		if unicode.IsLetter(char) || unicode.IsDigit(char) {
+			builder.WriteRune(char)
+			lastDash = false
+			continue
+		}
+		if !lastDash && builder.Len() > 0 {
+			builder.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(builder.String(), "-")
+}
+
+// parentShort returns the first eight hex characters of the SHA-1 of the parent
+// job id, giving a stable short identifier for delegation branch names.
+func parentShort(parentJobID string) string {
+	sum := sha1.Sum([]byte(parentJobID))
+	return hex.EncodeToString(sum[:])[:8]
 }
 
 func validateTaskBranchRequest(request TaskBranchRequest) error {
