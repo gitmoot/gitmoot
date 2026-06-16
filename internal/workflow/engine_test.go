@@ -3040,3 +3040,231 @@ func (f *fakeMergeGate) Evaluate(_ context.Context, request MergeRequest) (Merge
 	}
 	return f.decision, nil
 }
+
+// TestCanonicalDelegationSetHashStableUnderReorder pins the order-independence and
+// change-sensitivity contract the loop detector relies on: reordering the same
+// delegation set yields the same hash, while changing any field (prompt, agent,
+// or a dep) yields a different one.
+func TestCanonicalDelegationSetHashStableUnderReorder(t *testing.T) {
+	base := []Delegation{
+		{ID: "a", Agent: "wa", Action: "review", Prompt: "step a", Deps: []string{"x", "y"}},
+		{ID: "b", Agent: "wb", Action: "review", Prompt: "step b"},
+	}
+	reordered := []Delegation{
+		{ID: "b", Agent: "wb", Action: "review", Prompt: "step b"},
+		{ID: "a", Agent: "wa", Action: "review", Prompt: "step a", Deps: []string{"y", "x"}},
+	}
+	if canonicalDelegationSetHash(base) != canonicalDelegationSetHash(reordered) {
+		t.Fatal("hash must be stable under delegation and dep reordering")
+	}
+	// Whitespace-only prompt differences are normalized away.
+	trimmed := []Delegation{
+		{ID: "a", Agent: "wa", Action: "review", Prompt: "  step a  ", Deps: []string{"x", "y"}},
+		{ID: "b", Agent: "wb", Action: "review", Prompt: "step b"},
+	}
+	if canonicalDelegationSetHash(base) != canonicalDelegationSetHash(trimmed) {
+		t.Fatal("hash must ignore surrounding prompt whitespace")
+	}
+
+	promptChanged := []Delegation{
+		{ID: "a", Agent: "wa", Action: "review", Prompt: "DIFFERENT", Deps: []string{"x", "y"}},
+		{ID: "b", Agent: "wb", Action: "review", Prompt: "step b"},
+	}
+	agentChanged := []Delegation{
+		{ID: "a", Agent: "OTHER", Action: "review", Prompt: "step a", Deps: []string{"x", "y"}},
+		{ID: "b", Agent: "wb", Action: "review", Prompt: "step b"},
+	}
+	depChanged := []Delegation{
+		{ID: "a", Agent: "wa", Action: "review", Prompt: "step a", Deps: []string{"x", "z"}},
+		{ID: "b", Agent: "wb", Action: "review", Prompt: "step b"},
+	}
+	baseHash := canonicalDelegationSetHash(base)
+	for name, changed := range map[string][]Delegation{
+		"prompt": promptChanged,
+		"agent":  agentChanged,
+		"dep":    depChanged,
+	} {
+		if canonicalDelegationSetHash(changed) == baseHash {
+			t.Fatalf("hash must change when the %s changes", name)
+		}
+	}
+}
+
+// TestAppendDelegationHashWindowKeepsLastThree pins the sliding-window bound: only
+// the most recent delegationHashWindowSize hashes are retained.
+func TestAppendDelegationHashWindowKeepsLastThree(t *testing.T) {
+	var window []string
+	for _, h := range []string{"h1", "h2", "h3", "h4"} {
+		window = appendDelegationHashWindow(window, h)
+	}
+	if len(window) != delegationHashWindowSize {
+		t.Fatalf("window length = %d, want %d", len(window), delegationHashWindowSize)
+	}
+	want := []string{"h2", "h3", "h4"}
+	if !equalStrings(window, want) {
+		t.Fatalf("window = %v, want %v", window, want)
+	}
+}
+
+// driveStaticGeneration simulates one coordinator continuation generation: it
+// stamps the already-enqueued continuation job with a delegation result (the
+// same set every time, modeling a static coordinator) and advances it, which is
+// exactly what the daemon does when the continuation runs and re-delegates.
+func driveStaticGeneration(t *testing.T, store *db.Store, engine Engine, continuationID string, dels []Delegation) error {
+	t.Helper()
+	completeDelegationChild(t, store, continuationID, JobSucceeded, AgentResult{
+		Decision:    "approved",
+		Summary:     "still working",
+		Delegations: dels,
+	})
+	return engine.AdvanceJob(context.Background(), continuationID)
+}
+
+// TestEngineStaticCoordinatorHaltedByLoopDetection is the core regression: a
+// coordinator whose continuation re-issues the SAME delegation set every round is
+// stopped by windowed non-progress detection (a warning + corrective nudge, then
+// a delegation_loop_detected halt) well before MaxDelegationDepth — not left to
+// the blunt depth cap.
+func TestEngineStaticCoordinatorHaltedByLoopDetection(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "w", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	dels := []Delegation{{ID: "w1", Agent: "w", Action: "review", Prompt: "do work"}}
+
+	// Generation 0: the originating coordinator dispatches the set for real.
+	insertCompletedJob(t, store, db.Job{ID: "root-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-005",
+		TaskID:    "task-5",
+		TaskTitle: "Parent",
+		Sender:    "coord",
+		Result:    &AgentResult{Decision: "approved", Summary: "round 0", Delegations: dels},
+	})
+	if err := engine.AdvanceJob(ctx, "root-job"); err != nil {
+		t.Fatalf("AdvanceJob(root) returned error: %v", err)
+	}
+	if !jobExists(t, store, "root-job/delegation/w1") {
+		t.Fatal("generation 0 must dispatch the delegation for real")
+	}
+
+	// Child finishes -> continuation (generation 1) is enqueued carrying the
+	// window with generation 0's hash.
+	completeDelegationChild(t, store, "root-job/delegation/w1", JobSucceeded, AgentResult{Decision: "approved", Summary: "w1 ok"})
+	if err := engine.AdvanceJob(ctx, "root-job/delegation/w1"); err != nil {
+		t.Fatalf("AdvanceJob(child) returned error: %v", err)
+	}
+	continuationID := delegationContinuationID("root-job")
+	if !jobExists(t, store, continuationID) {
+		t.Fatal("a continuation must be enqueued after the child finishes")
+	}
+
+	// Generation 1: the continuation re-issues the SAME set. This is the first
+	// repeat -> a warning fires and a corrective continuation is enqueued INSTEAD
+	// of dispatching. The corrective continuation reuses the continuation id.
+	if err := driveStaticGeneration(t, store, engine, continuationID, dels); err != nil {
+		t.Fatalf("driveStaticGeneration(gen1) returned error: %v", err)
+	}
+	if countJobEvents(t, store, continuationID, "delegation_loop_warning") != 1 {
+		t.Fatal("first repeat must record exactly one delegation_loop_warning")
+	}
+	correctiveID := delegationContinuationID(continuationID)
+	if !jobExists(t, store, correctiveID) {
+		t.Fatal("first repeat must enqueue a corrective continuation instead of dispatching")
+	}
+	correctivePayload, err := unmarshalPayload(mustJob(t, store, correctiveID).Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(corrective) returned error: %v", err)
+	}
+	if correctivePayload.DelegationRepeatCount != 1 {
+		t.Fatalf("corrective DelegationRepeatCount = %d, want 1", correctivePayload.DelegationRepeatCount)
+	}
+	if !strings.Contains(correctivePayload.Instructions, "EMPTY delegations list") {
+		t.Fatalf("corrective prompt missing the change-or-finish nudge: %q", correctivePayload.Instructions)
+	}
+
+	// Generation 2: the coordinator repeats AGAIN after the corrective nudge ->
+	// delegation_loop_detected halts it with no further dispatch.
+	if err := driveStaticGeneration(t, store, engine, correctiveID, dels); err != nil {
+		t.Fatalf("driveStaticGeneration(gen2) returned error: %v", err)
+	}
+	if countJobEvents(t, store, correctiveID, "delegation_loop_detected") != 1 {
+		t.Fatal("second repeat after a nudge must record delegation_loop_detected")
+	}
+	// No further child or continuation may be created off the halted generation.
+	if jobExists(t, store, delegationContinuationID(correctiveID)) {
+		t.Fatal("delegation_loop_detected must not enqueue another continuation")
+	}
+
+	// It stopped well before the blunt depth cap: the deepest job created carries
+	// a DelegationDepth far below MaxDelegationDepth.
+	if correctivePayload.DelegationDepth >= MaxDelegationDepth {
+		t.Fatalf("loop detection must halt well before MaxDelegationDepth=%d (depth=%d)", MaxDelegationDepth, correctivePayload.DelegationDepth)
+	}
+}
+
+// TestEngineProgressingCoordinatorNotFalselyFlagged pins the false-positive guard:
+// a coordinator that issues a DIFFERENT delegation set each continuation keeps
+// dispatching for real and is never flagged as a loop.
+func TestEngineProgressingCoordinatorNotFalselyFlagged(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "w", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	// Generation 0: dispatch the first distinct set for real.
+	insertCompletedJob(t, store, db.Job{ID: "root-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-005",
+		TaskID:    "task-5",
+		TaskTitle: "Parent",
+		Sender:    "coord",
+		Result: &AgentResult{
+			Decision:    "approved",
+			Summary:     "round 0",
+			Delegations: []Delegation{{ID: "w1", Agent: "w", Action: "review", Prompt: "round 0 work"}},
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "root-job"); err != nil {
+		t.Fatalf("AdvanceJob(root) returned error: %v", err)
+	}
+
+	completeDelegationChild(t, store, "root-job/delegation/w1", JobSucceeded, AgentResult{Decision: "approved", Summary: "w1 ok"})
+	if err := engine.AdvanceJob(ctx, "root-job/delegation/w1"); err != nil {
+		t.Fatalf("AdvanceJob(child) returned error: %v", err)
+	}
+
+	// Walk several generations, each issuing a DISTINCT delegation set. Every
+	// generation must dispatch a real child and never warn or halt.
+	parentID := "root-job"
+	for round := 1; round <= 4; round++ {
+		continuationID := delegationContinuationID(parentID)
+		if !jobExists(t, store, continuationID) {
+			t.Fatalf("round %d: continuation must be enqueued", round)
+		}
+		delID := fmt.Sprintf("w%d", round+1)
+		dels := []Delegation{{ID: delID, Agent: "w", Action: "review", Prompt: fmt.Sprintf("round %d work", round)}}
+		if err := driveStaticGeneration(t, store, engine, continuationID, dels); err != nil {
+			t.Fatalf("round %d: generation returned error: %v", round, err)
+		}
+		if countJobEvents(t, store, continuationID, "delegation_loop_warning") != 0 {
+			t.Fatalf("round %d: a progressing coordinator must not warn", round)
+		}
+		if countJobEvents(t, store, continuationID, "delegation_loop_detected") != 0 {
+			t.Fatalf("round %d: a progressing coordinator must not be halted", round)
+		}
+		childID := continuationID + "/delegation/" + delID
+		if !jobExists(t, store, childID) {
+			t.Fatalf("round %d: a distinct set must dispatch a real child %s", round, childID)
+		}
+		// Finish the round's child so the next continuation is enqueued.
+		completeDelegationChild(t, store, childID, JobSucceeded, AgentResult{Decision: "approved", Summary: "ok"})
+		if err := engine.AdvanceJob(ctx, childID); err != nil {
+			t.Fatalf("round %d: AdvanceJob(child) returned error: %v", round, err)
+		}
+		parentID = continuationID
+	}
+}
