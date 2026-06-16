@@ -2717,6 +2717,45 @@ func TestEngineDelegationBudgetCapStopsDispatch(t *testing.T) {
 	}
 }
 
+// TestEngineDelegationWidthCapStopsDispatch covers the per-coordinator fan-out
+// width cap: the total-jobs budget is checked before a batch is dispatched, so
+// it cannot stop one enormous single fan-out; the width cap does.
+func TestEngineDelegationWidthCapStopsDispatch(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "w", []string{"ask"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	dels := make([]Delegation, 0, MaxDelegationWidth+1)
+	for i := 0; i <= MaxDelegationWidth; i++ {
+		dels = append(dels, Delegation{ID: fmt.Sprintf("d%d", i), Agent: "w", Action: "ask", Prompt: "work"})
+	}
+	insertCompletedJob(t, store, db.Job{ID: "wide-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo: "jerryfane/gitmoot", Branch: "task-005", TaskID: "task-5", Sender: "coord",
+		Result: &AgentResult{Decision: "approved", Summary: "too wide", Delegations: dels},
+	})
+	if err := engine.AdvanceJob(ctx, "wide-job"); err != nil {
+		t.Fatalf("AdvanceJob(wide): %v", err)
+	}
+	if jobExists(t, store, "wide-job/delegation/d0") {
+		t.Fatal("a delegation set wider than MaxDelegationWidth must not be dispatched")
+	}
+	events, err := store.ListJobEvents(ctx, "wide-job")
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	widened := false
+	for _, ev := range events {
+		if ev.Kind == "delegation_width_exceeded" {
+			widened = true
+		}
+	}
+	if !widened {
+		t.Fatal("expected a delegation_width_exceeded event")
+	}
+}
+
 // TestEngineDelegationEscalateThenBlockParentFoldsIntoContinuation pins the
 // contradictory-state fix: once an escalate failure has enqueued the
 // continuation, a later block_parent sibling failure must NOT also block the

@@ -533,7 +533,20 @@ const MaxDelegationDepth = 8
 // refuses further children and records a delegation_budget_exceeded event.
 const MaxDelegationTotalJobs = 64
 
+// MaxDelegationWidth bounds how many delegations a single coordinator result may
+// fan out in one generation. The total-jobs budget is checked before a batch is
+// dispatched, so it cannot stop one enormous fan-out on its own; this caps the
+// width of a single dispatch so a coordinator returning hundreds of delegations
+// at once is refused with a delegation_width_exceeded event.
+const MaxDelegationWidth = 16
+
 // delegationHashWindowSize is how many recent delegation-set hashes a coordinator
+// continuation chain remembers (threaded via the payload, not scanned across
+// jobs). A repeat within this sliding window is what the loop detector treats as
+// non-progress: a coordinator re-issuing a delegation set it already issued.
+// NOTE (follow-up, issue #305 "Later"): detection is set-only (not result-aware)
+// and only catches cycles of period <= delegationHashWindowSize; longer cycles
+// fall back to the depth/total-job/width backstops.
 // continuation chain remembers (threaded via the payload, not scanned across
 // jobs). A repeat within this sliding window is what the loop detector treats as
 // non-progress: a coordinator re-issuing a delegation set it already issued.
@@ -641,6 +654,15 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 		return nil
 	}
 
+	if width := len(payload.Result.Delegations); width > MaxDelegationWidth {
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "delegation_width_exceeded",
+			Message: fmt.Sprintf("delegation set width %d exceeds the per-coordinator limit of %d; not dispatching", width, MaxDelegationWidth),
+		})
+		return nil
+	}
+
 	// Windowed non-progress detection. The depth/budget caps above are blunt
 	// safety nets; this catches the common loop sooner: a coordinator whose
 	// continuation re-issues a delegation set it already issued within the last
@@ -719,6 +741,19 @@ func (e Engine) handleDelegationLoop(ctx context.Context, job db.Job, payload Jo
 	currentHash := canonicalDelegationSetHash(payload.Result.Delegations)
 	if !windowContainsHash(payload.RecentDelegationHashes, currentHash) {
 		return false, nil
+	}
+
+	// Idempotent on re-advance: if this job already emitted a loop event it has
+	// already enqueued its corrective continuation (deterministic id), so do not
+	// re-emit the event or double-count it.
+	events, err := e.Store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		return true, err
+	}
+	for _, ev := range events {
+		if ev.Kind == "delegation_loop_warning" || ev.Kind == "delegation_loop_detected" {
+			return true, nil
+		}
 	}
 
 	if payload.DelegationRepeatCount >= 1 {
