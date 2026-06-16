@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -154,6 +155,11 @@ type DelegationWorktreeRequest struct {
 	BaseBranch   string
 	Owner        string
 	Checkout     string
+	// RetryAttempt is the 1-based retry number for a re-enqueued delegation. It
+	// is 0 for the original attempt. A non-zero value gives the retry an isolated
+	// worktree path and branch so it never collides with the failed attempt's
+	// still-present worktree directory and checked-out branch.
+	RetryAttempt int
 }
 
 // DelegationWorktreeResult is the allocated worktree path and branch for a
@@ -185,11 +191,11 @@ func (e Engine) AllocateDelegationWorktree(ctx context.Context, request Delegati
 	if strings.TrimSpace(request.Owner) == "" {
 		return DelegationWorktreeResult{}, errors.New("delegation worktree owner is required")
 	}
-	path, err := DelegationWorktreePath(request.Home, request.Repo, request.ParentJobID, request.DelegationID)
+	path, err := DelegationWorktreePath(request.Home, request.Repo, request.ParentJobID, request.DelegationID, request.RetryAttempt)
 	if err != nil {
 		return DelegationWorktreeResult{}, err
 	}
-	branch := delegationBranchName(request.Delegation, request.ParentJobID, request.DelegationID)
+	branch := delegationBranchName(request.Delegation, request.ParentJobID, request.DelegationID, request.RetryAttempt)
 	if strings.TrimSpace(branch) == "" {
 		return DelegationWorktreeResult{}, errors.New("delegation worktree branch could not be derived")
 	}
@@ -264,8 +270,10 @@ func TaskWorktreePath(home string, repo string, taskID string) (string, error) {
 // DelegationWorktreePath builds the deterministic on-disk worktree path for a
 // delegated implement job:
 // $GITMOOT_HOME/worktrees/<owner>--<repo>/delegations/<parent-job-id>/<delegation-id>/.
+// A retryAttempt > 0 appends /retry/<n> so a re-enqueued delegation gets a fresh
+// isolated directory rather than colliding with the failed attempt's worktree.
 // It reuses the same repo/segment sanitization as TaskWorktreePath.
-func DelegationWorktreePath(home string, repo string, parentJobID string, delegationID string) (string, error) {
+func DelegationWorktreePath(home string, repo string, parentJobID string, delegationID string, retryAttempt int) (string, error) {
 	home = strings.TrimSpace(home)
 	if home == "" {
 		return "", errors.New("delegation worktree home is required")
@@ -282,7 +290,11 @@ func DelegationWorktreePath(home string, repo string, parentJobID string, delega
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, "worktrees", repoSegment, "delegations", parentSegment, delegationSegment), nil
+	base := filepath.Join(home, "worktrees", repoSegment, "delegations", parentSegment, delegationSegment)
+	if retryAttempt > 0 {
+		base = filepath.Join(base, "retry", strconv.Itoa(retryAttempt))
+	}
+	return base, nil
 }
 
 func taskWorktreeRepoSegment(repo string) (string, error) {

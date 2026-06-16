@@ -2248,6 +2248,49 @@ func TestRunQueuedJobsUsesTaskWorktreeForImplement(t *testing.T) {
 	}
 }
 
+func TestValidateTargetCheckoutSkipsHeadShaForDelegationWorktreeChild(t *testing.T) {
+	// A delegated implement child runs in its own freshly-allocated worktree whose
+	// HEAD is the base-branch tip at allocation time; the dispatcher clears the
+	// inherited parent HeadSHA. validateTargetCheckout must not reject such a child
+	// even when its payload HeadSHA is empty or stale, as long as the worktree is
+	// on the job branch and clean. A non-delegation job with a mismatched HeadSHA
+	// must still be rejected.
+	ctx := context.Background()
+	checkout := createDaemonWorkerGitCheckout(t, "task-005")
+	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard)
+
+	// Delegation child: empty HeadSHA + worktree path -> accepted.
+	delegationPayload := workflow.JobPayload{
+		Repo:         "owner/repo",
+		Branch:       "task-005",
+		DelegationID: "d1",
+		ParentJobID:  "parent-job",
+		WorktreePath: checkout,
+	}
+	if err := worker.validateTargetCheckout(ctx, delegationPayload, checkout); err != nil {
+		t.Fatalf("validateTargetCheckout rejected delegation worktree child: %v", err)
+	}
+
+	// Delegation child with a stale (non-matching) HeadSHA -> still accepted,
+	// because the equality check is skipped for delegation worktree children.
+	stalePayload := delegationPayload
+	stalePayload.HeadSHA = "0000000000000000000000000000000000000000"
+	if err := worker.validateTargetCheckout(ctx, stalePayload, checkout); err != nil {
+		t.Fatalf("validateTargetCheckout rejected delegation child with stale HeadSHA: %v", err)
+	}
+
+	// A non-delegation job with a mismatched HeadSHA must still be rejected so the
+	// HeadSHA guard is not weakened for ordinary jobs.
+	ordinaryPayload := workflow.JobPayload{
+		Repo:    "owner/repo",
+		Branch:  "task-005",
+		HeadSHA: "0000000000000000000000000000000000000000",
+	}
+	if err := worker.validateTargetCheckout(ctx, ordinaryPayload, checkout); err == nil {
+		t.Fatal("validateTargetCheckout accepted ordinary job with mismatched HeadSHA")
+	}
+}
+
 func TestRefreshDaemonJobPayloadPreservesTaskWorktreeHeadForFinalizer(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()

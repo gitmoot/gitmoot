@@ -110,15 +110,24 @@ func (e Engine) StartTaskBranch(ctx context.Context, request TaskBranchRequest, 
 	return task, nil
 }
 
-// delegationBranchName derives the git branch for a delegated implement job.
-// It prefers a slugged form of the delegation's requested worktree label and
-// otherwise falls back to a deterministic gitmoot-delegation-<parent-short>-<id>
-// name so sibling delegations from the same parent never collide.
-func delegationBranchName(d Delegation, parentJobID string, delegationID string) string {
+// delegationBranchName derives the git branch for a delegated implement job. The
+// branch is always namespaced with the parent-short and delegation id
+// (gitmoot-delegation-<parent-short>-<id>) so sibling delegations from the same
+// parent never collide, even when they share an identical or empty worktree
+// hint. A slugged form of the delegation's requested worktree label, when
+// present, is appended only as a human-readable suffix and never replaces the
+// namespacing. retryAttempt > 0 adds a -retry-<n> suffix so a retry of the same
+// delegation gets a fresh, isolated branch instead of reusing the failed
+// attempt's branch.
+func delegationBranchName(d Delegation, parentJobID string, delegationID string, retryAttempt int) string {
+	branch := fmt.Sprintf("gitmoot-delegation-%s-%s", parentShort(parentJobID), delegationID)
 	if hint := slug(d.Worktree); hint != "" {
-		return hint
+		branch += "-" + hint
 	}
-	return fmt.Sprintf("gitmoot-delegation-%s-%s", parentShort(parentJobID), delegationID)
+	if retryAttempt > 0 {
+		branch += fmt.Sprintf("-retry-%d", retryAttempt)
+	}
+	return branch
 }
 
 // slug normalizes an arbitrary label into a lowercase, dash-separated token

@@ -518,6 +518,15 @@ func (e Engine) enqueueDelegation(ctx context.Context, job db.Job, payload JobPa
 func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, payload JobPayload, d Delegation, request JobRequest, ref taskRef) error {
 	if request.Action == "implement" {
 		if e.DelegationWorktrees == nil || strings.TrimSpace(e.Home) == "" {
+			// No per-delegation worktree isolation is available (the engine lacks a
+			// Home/DelegationWorktrees manager), so the child falls back to a
+			// shared-checkout branch lock. Emit a parent event so the loss of
+			// isolation is observable rather than silent.
+			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+				JobID:   job.ID,
+				Kind:    "delegation_worktree_skipped",
+				Message: fmt.Sprintf("delegation %q implement runs in the shared checkout on branch %s: per-delegation worktree isolation unavailable", request.DelegationID, request.Branch),
+			})
 			if err := e.ensureBranchLock(ctx, request.Repo, request.Branch, request.Agent, ref); err != nil {
 				return err
 			}
@@ -531,6 +540,7 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 				BaseBranch:   payload.Branch,
 				Owner:        request.Agent,
 				Checkout:     e.DelegationCheckout,
+				RetryAttempt: request.RetryCount,
 			}, e.DelegationWorktrees)
 			if err != nil {
 				var blocked BlockedError
@@ -541,6 +551,14 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 			}
 			request.Branch = result.Branch
 			request.WorktreePath = result.Path
+			// The freshly-allocated worktree is created off the parent's base
+			// branch, whose tip may have advanced past the HeadSHA the child
+			// inherited from the parent payload. validateTargetCheckout (daemon)
+			// compares the worktree HEAD against payload.HeadSHA and would
+			// spuriously reject the child on a moving parent branch. Clear the
+			// inherited HeadSHA so the child validates against its own fresh
+			// worktree HEAD instead of a stale parent SHA.
+			request.HeadSHA = ""
 		}
 	}
 

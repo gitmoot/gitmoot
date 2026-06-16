@@ -2799,6 +2799,15 @@ func (w jobWorker) validateTargetCheckout(ctx context.Context, payload workflow.
 	if !clean {
 		return fmt.Errorf("checkout %s has uncommitted changes", checkout)
 	}
+	// A delegated implement child runs in its own freshly-allocated worktree,
+	// created off the parent's base branch whose tip may have advanced past the
+	// HeadSHA the child inherited from the parent payload. The dispatcher clears
+	// the inherited HeadSHA for these children, so the worktree HEAD is correct
+	// by construction (it is the base-branch tip at allocation time) and there is
+	// nothing to compare against. Skip the HeadSHA equality check for them.
+	if isDelegationWorktreeChild(payload) {
+		return nil
+	}
 	expectedHead := strings.TrimSpace(payload.HeadSHA)
 	if expectedHead == "" {
 		return fmt.Errorf("job for %s has no head SHA", payload.Branch)
@@ -2811,6 +2820,14 @@ func (w jobWorker) validateTargetCheckout(ctx context.Context, payload workflow.
 		return fmt.Errorf("checkout head is %s, not job head %s", head, expectedHead)
 	}
 	return nil
+}
+
+// isDelegationWorktreeChild reports whether the job is a delegated child running
+// in its own per-delegation worktree (it carries both a delegation id and an
+// allocated worktree path). Such children are validated against their isolated
+// worktree HEAD rather than the inherited parent HeadSHA.
+func isDelegationWorktreeChild(payload workflow.JobPayload) bool {
+	return strings.TrimSpace(payload.DelegationID) != "" && strings.TrimSpace(payload.WorktreePath) != ""
 }
 
 func (w jobWorker) validateReviewCheckout(ctx context.Context, payload workflow.JobPayload, checkout string) error {

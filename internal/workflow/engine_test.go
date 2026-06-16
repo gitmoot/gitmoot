@@ -218,6 +218,185 @@ func TestDispatchDelegationsTwoImplementSiblingsGetSeparateWorktrees(t *testing.
 	if len(manager.calls) != 2 {
 		t.Fatalf("AddWorktree calls = %+v, want two", manager.calls)
 	}
+	// Each child's HeadSHA is cleared so validateTargetCheckout validates the
+	// fresh worktree HEAD instead of the stale parent SHA.
+	if payloadOne.HeadSHA != "" || payloadTwo.HeadSHA != "" {
+		t.Fatalf("delegated implement children must not inherit parent HeadSHA: d1=%q d2=%q", payloadOne.HeadSHA, payloadTwo.HeadSHA)
+	}
+}
+
+func TestDispatchDelegationsSiblingsSharingWorktreeHintGetDistinctBranches(t *testing.T) {
+	// Two sibling implement delegations that share an identical worktree hint must
+	// still receive distinct, namespaced branches so the second AddWorktree does
+	// not collide on a branch already checked out by the first.
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "audit", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "builder-a", []string{"implement"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "builder-b", []string{"implement"}, "jerryfane/gitmoot")
+	home := t.TempDir()
+	manager := &fakeWorktreeManager{}
+	engine := testEngine(store)
+	engine.Home = home
+	engine.DelegationCheckout = t.TempDir()
+	engine.DelegationWorktrees = manager
+
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "audit", Type: "ask"}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-005",
+		TaskID:    "task-5",
+		TaskTitle: "Parent",
+		Sender:    "audit",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "d1", Agent: "builder-a", Action: "implement", Prompt: "build one", Worktree: "shared"},
+				{ID: "d2", Agent: "builder-b", Action: "implement", Prompt: "build two", Worktree: "shared"},
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	payloadOne, err := unmarshalPayload(mustJob(t, store, "parent-job/delegation/d1").Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(d1) returned error: %v", err)
+	}
+	payloadTwo, err := unmarshalPayload(mustJob(t, store, "parent-job/delegation/d2").Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(d2) returned error: %v", err)
+	}
+	if payloadOne.Branch == payloadTwo.Branch {
+		t.Fatalf("siblings sharing worktree hint share branch %q", payloadOne.Branch)
+	}
+	if len(manager.calls) != 2 {
+		t.Fatalf("AddWorktree calls = %+v, want two distinct allocations", manager.calls)
+	}
+	if manager.calls[0].branch == manager.calls[1].branch {
+		t.Fatalf("AddWorktree branches collide: %+v", manager.calls)
+	}
+}
+
+func TestDispatchDelegationsWithoutWorktreeManagerEmitsSkippedEvent(t *testing.T) {
+	// When the engine has no per-delegation worktree manager, an implement
+	// delegation falls back to a shared-checkout branch lock; the loss of
+	// isolation must be observable via a delegation_worktree_skipped event.
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "audit", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "builder", []string{"implement"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+	// No engine.Home / engine.DelegationWorktrees: isolation unavailable.
+
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "audit", Type: "ask"}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-005",
+		TaskID:    "task-5",
+		TaskTitle: "Parent",
+		Sender:    "audit",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "d1", Agent: "builder", Action: "implement", Prompt: "build one"},
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	child := mustJob(t, store, "parent-job/delegation/d1")
+	payload, err := unmarshalPayload(child.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	// The fallback child runs in the shared checkout on the parent branch with no
+	// per-delegation worktree path.
+	if strings.TrimSpace(payload.WorktreePath) != "" {
+		t.Fatalf("fallback child unexpectedly got worktree path %q", payload.WorktreePath)
+	}
+	if payload.Branch != "task-005" {
+		t.Fatalf("fallback child branch = %q, want parent branch task-005", payload.Branch)
+	}
+	if got := countJobEvents(t, store, "parent-job", "delegation_worktree_skipped"); got != 1 {
+		t.Fatalf("delegation_worktree_skipped event count = %d, want 1", got)
+	}
+}
+
+func TestEngineDelegationRetryGetsIsolatedWorktreePathAndBranch(t *testing.T) {
+	// A retry of a failed implement delegation must allocate a fresh, isolated
+	// worktree path and branch (retry-suffixed) so it never collides with the
+	// failed original attempt's leftover worktree directory and checked-out branch.
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "builder", []string{"implement"}, "jerryfane/gitmoot")
+	home := t.TempDir()
+	manager := &fakeWorktreeManager{}
+	engine := testEngine(store)
+	engine.Home = home
+	engine.DelegationCheckout = t.TempDir()
+	engine.DelegationWorktrees = manager
+
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-005",
+		TaskID:    "task-5",
+		TaskTitle: "Parent",
+		Sender:    "coord",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "build", Agent: "builder", Action: "implement", Prompt: "build it", Retry: 1},
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob(parent) returned error: %v", err)
+	}
+	originalPayload, err := unmarshalPayload(mustJob(t, store, "parent-job/delegation/build").Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(original) returned error: %v", err)
+	}
+
+	// Fail the original attempt and advance the parent so a retry is enqueued.
+	completeDelegationChild(t, store, "parent-job/delegation/build", JobFailed, AgentResult{Decision: "failed", Summary: "broke"})
+	if err := engine.AdvanceJob(ctx, "parent-job/delegation/build"); err != nil {
+		t.Fatalf("AdvanceJob(build) returned error: %v", err)
+	}
+
+	retry := mustJob(t, store, "parent-job/delegation/build/retry/1")
+	retryPayload, err := unmarshalPayload(retry.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(retry) returned error: %v", err)
+	}
+	if retryPayload.WorktreePath == originalPayload.WorktreePath {
+		t.Fatalf("retry reuses original worktree path %q", retryPayload.WorktreePath)
+	}
+	if retryPayload.Branch == originalPayload.Branch {
+		t.Fatalf("retry reuses original branch %q", retryPayload.Branch)
+	}
+	wantRetryPath := filepath.Join(home, "worktrees", "jerryfane--gitmoot", "delegations", "parent-job", "build", "retry", "1")
+	if retryPayload.WorktreePath != wantRetryPath {
+		t.Fatalf("retry worktree path = %q, want %q", retryPayload.WorktreePath, wantRetryPath)
+	}
+	if !strings.HasSuffix(retryPayload.Branch, "-retry-1") {
+		t.Fatalf("retry branch = %q, want -retry-1 suffix", retryPayload.Branch)
+	}
+	// Two distinct git worktrees were added: the original and the isolated retry.
+	if len(manager.calls) != 2 {
+		t.Fatalf("AddWorktree calls = %+v, want two (original + retry)", manager.calls)
+	}
+	if manager.calls[0].path == manager.calls[1].path || manager.calls[0].branch == manager.calls[1].branch {
+		t.Fatalf("retry allocation collides with original: %+v", manager.calls)
+	}
 }
 
 func TestEngineHandlePullRequestOpenedDispatchesReviewers(t *testing.T) {

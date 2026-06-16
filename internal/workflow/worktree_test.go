@@ -366,13 +366,26 @@ func TestEngineAllocateTaskWorktreeUsesExistingBranchWhenBranchAlreadyExists(t *
 }
 
 func TestDelegationWorktreePath(t *testing.T) {
-	path, err := DelegationWorktreePath("/home/gitmoot", "owner/repo", "job-1", "d1")
+	path, err := DelegationWorktreePath("/home/gitmoot", "owner/repo", "job-1", "d1", 0)
 	if err != nil {
 		t.Fatalf("DelegationWorktreePath returned error: %v", err)
 	}
 	want := filepath.Join("/home/gitmoot", "worktrees", "owner--repo", "delegations", "job-1", "d1")
 	if path != want {
 		t.Fatalf("path = %q, want %q", path, want)
+	}
+	// A retry attempt gets an isolated /retry/<n> subdirectory so it never
+	// collides with the failed original attempt's worktree.
+	retryPath, err := DelegationWorktreePath("/home/gitmoot", "owner/repo", "job-1", "d1", 2)
+	if err != nil {
+		t.Fatalf("DelegationWorktreePath (retry) returned error: %v", err)
+	}
+	wantRetry := filepath.Join("/home/gitmoot", "worktrees", "owner--repo", "delegations", "job-1", "d1", "retry", "2")
+	if retryPath != wantRetry {
+		t.Fatalf("retry path = %q, want %q", retryPath, wantRetry)
+	}
+	if retryPath == want {
+		t.Fatalf("retry path %q collides with original attempt path", retryPath)
 	}
 	for _, tc := range []struct {
 		name       string
@@ -388,7 +401,7 @@ func TestDelegationWorktreePath(t *testing.T) {
 		{name: "unsafe delegation", home: "/home/gitmoot", repo: "owner/repo", parentJob: "job-1", delegation: "../d"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := DelegationWorktreePath(tc.home, tc.repo, tc.parentJob, tc.delegation); err == nil {
+			if _, err := DelegationWorktreePath(tc.home, tc.repo, tc.parentJob, tc.delegation, 0); err == nil {
 				t.Fatal("DelegationWorktreePath accepted invalid input")
 			}
 		})
@@ -432,7 +445,7 @@ func TestAllocateDelegationWorktreeAddsGitWorktreeAndReturnsPathBranch(t *testin
 	if result.Path != wantPath {
 		t.Fatalf("path = %q, want %q", result.Path, wantPath)
 	}
-	wantBranch := delegationBranchName(Delegation{ID: "d1"}, "job-1", "d1")
+	wantBranch := delegationBranchName(Delegation{ID: "d1"}, "job-1", "d1", 0)
 	if result.Branch != wantBranch {
 		t.Fatalf("branch = %q, want %q", result.Branch, wantBranch)
 	}
@@ -521,8 +534,12 @@ func TestAllocateDelegationWorktreeBranchNaming(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AllocateDelegationWorktree (hinted) returned error: %v", err)
 	}
-	if hinted.Branch != "feature-login" {
-		t.Fatalf("hinted branch = %q, want feature-login", hinted.Branch)
+	// The worktree hint is appended only as a human-readable suffix; the branch is
+	// always namespaced with the parent-short and delegation id so it stays unique
+	// across siblings regardless of the hint.
+	wantHinted := "gitmoot-delegation-" + parentShort("job-1") + "-d1-feature-login"
+	if hinted.Branch != wantHinted {
+		t.Fatalf("hinted branch = %q, want %q", hinted.Branch, wantHinted)
 	}
 
 	fallback, err := engine.AllocateDelegationWorktree(ctx, DelegationWorktreeRequest{
@@ -548,7 +565,7 @@ func TestAllocateDelegationWorktreeReusesExistingBranch(t *testing.T) {
 	store := openEngineStore(t)
 	engine := testEngine(store)
 	home := t.TempDir()
-	branch := delegationBranchName(Delegation{ID: "d1"}, "job-1", "d1")
+	branch := delegationBranchName(Delegation{ID: "d1"}, "job-1", "d1", 0)
 	manager := &fakeWorktreeManager{existingBranches: map[string]bool{branch: true}}
 
 	result, err := engine.AllocateDelegationWorktree(ctx, DelegationWorktreeRequest{
@@ -579,7 +596,7 @@ func TestAllocateDelegationWorktreeReleasesBranchLockOnFailure(t *testing.T) {
 	store := openEngineStore(t)
 	engine := testEngine(store)
 	manager := &fakeWorktreeManager{err: errors.New("git failed")}
-	branch := delegationBranchName(Delegation{ID: "d1"}, "job-1", "d1")
+	branch := delegationBranchName(Delegation{ID: "d1"}, "job-1", "d1", 0)
 
 	_, err := engine.AllocateDelegationWorktree(ctx, DelegationWorktreeRequest{
 		Home:         t.TempDir(),
