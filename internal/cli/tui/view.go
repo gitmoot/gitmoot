@@ -156,7 +156,7 @@ func (m Model) helpContent() string {
 		b.WriteString("enter open the agent (template, recent jobs, versions)\n")
 		b.WriteString("n    register a new agent (name, runtime, template)\n")
 		b.WriteString("o    optimize: start a training session for the agent's template\n")
-		b.WriteString("     (asks repos, request, codex/claude backend, optional model)\n")
+		b.WriteString("     (asks repos, request, codex/claude/kimi backend, optional model)\n")
 		b.WriteString("D    delete the selected agent (refused while jobs reference it)\n")
 		b.WriteString("v    in the detail: revert the template to a previous version\n")
 	case pageJobs:

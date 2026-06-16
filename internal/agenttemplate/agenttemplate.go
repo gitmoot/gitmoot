@@ -163,7 +163,7 @@ func DraftCaptureTemplate(id string) (string, error) {
 		Kind:                 TemplateKind,
 		Version:              TemplateVersion,
 		Capabilities:         []string{"ask"},
-		RuntimeCompatibility: []string{"codex", "claude"},
+		RuntimeCompatibility: []string{"codex", "claude", "kimi"},
 		Tags:                 []string{"custom", "captured-workflow"},
 		Inputs:               []string{"current_request", "visible_context"},
 		Outputs:              []string{"response"},

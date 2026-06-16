@@ -151,7 +151,7 @@ func (m *Model) openSessionDetail() {
 
 func (m Model) sessionsContent() string {
 	var b strings.Builder
-	b.WriteString(mutedStyle.Render("The live codex/claude processes backing your Agents — one warm session per delivered job (up to max_background); idle ones expire on their own."))
+	b.WriteString(mutedStyle.Render("The live codex/claude/kimi processes backing your Agents — one warm session per delivered job (up to max_background); idle ones expire on their own."))
 	b.WriteString("\n\n")
 	rows := m.sessionRows()
 	if len(rows) == 0 {

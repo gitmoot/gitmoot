@@ -639,8 +639,8 @@ func (s *Store) UpsertAgent(ctx context.Context, agent Agent) error {
 // idle-expires on its own.
 func (s *Store) UpdateAgentRuntime(ctx context.Context, name, runtime string) error {
 	runtime = strings.TrimSpace(runtime)
-	if runtime != "codex" && runtime != "claude" {
-		return fmt.Errorf("unknown runtime %q (want codex or claude)", runtime)
+	if runtime != "codex" && runtime != "claude" && runtime != "kimi" {
+		return fmt.Errorf("unknown runtime %q (want codex, claude, or kimi)", runtime)
 	}
 	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, capabilities_json, autonomy_policy, health_status
 		FROM agents WHERE name = ?`, name)

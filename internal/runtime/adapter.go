@@ -18,6 +18,7 @@ import (
 const (
 	CodexRuntime  = "codex"
 	ClaudeRuntime = "claude"
+	KimiRuntime   = "kimi"
 	ShellRuntime  = "shell"
 	LastRef       = "last"
 
@@ -85,6 +86,8 @@ func (f Factory) Adapter(name string) (Adapter, error) {
 		return CodexAdapter{Runner: f.Runner}, nil
 	case ClaudeRuntime:
 		return ClaudeAdapter{Runner: f.Runner}, nil
+	case KimiRuntime:
+		return KimiAdapter{Runner: f.Runner}, nil
 	case ShellRuntime:
 		return ShellAdapter{Runner: f.Runner}, nil
 	default:
@@ -98,6 +101,9 @@ func ValidateAgent(agent Agent) error {
 	}
 	if agent.Runtime == ClaudeRuntime && agent.RuntimeRef != LastRef && !isUUID(agent.RuntimeRef) {
 		return fmt.Errorf("claude runtime reference %q must be a UUID or last", agent.RuntimeRef)
+	}
+	if agent.Runtime == KimiRuntime && agent.RuntimeRef != "" && !isKimiSessionID(agent.RuntimeRef) {
+		return fmt.Errorf("kimi runtime reference %q must be a Kimi session id or empty", agent.RuntimeRef)
 	}
 	return nil
 }

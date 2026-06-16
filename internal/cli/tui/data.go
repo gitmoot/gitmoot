@@ -262,7 +262,7 @@ type Deps struct {
 	CreateAgent            func(name, runtime, template string) error
 	DeleteAgent            func(name string) error
 	RevertTemplate         func(templateID, versionID string) error
-	// SetAgentRuntime switches a registered agent's runtime (codex/claude),
+	// SetAgentRuntime switches a registered agent's runtime (codex/claude/kimi),
 	// preserving its role/capabilities/repos and clearing the warm session.
 	SetAgentRuntime func(name, runtime string) error
 

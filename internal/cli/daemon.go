@@ -1727,7 +1727,7 @@ func tempWorkerEligible(ctx context.Context, store *db.Store, job db.Job, payloa
 		return tempWorkerEligibility{Reason: "parallel_sessions.same_session is queue"}
 	}
 	switch agent.Runtime {
-	case runtime.CodexRuntime, runtime.ClaudeRuntime:
+	case runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime:
 	default:
 		return tempWorkerEligibility{Reason: fmt.Sprintf("runtime %s does not support temp workers", agent.Runtime)}
 	}
@@ -2280,6 +2280,8 @@ func (w jobWorker) defaultAdapter(agent runtime.Agent, checkout string) (workflo
 		return runtime.CodexAdapter{Dir: checkout}, nil
 	case runtime.ClaudeRuntime:
 		return runtime.ClaudeAdapter{Dir: checkout}, nil
+	case runtime.KimiRuntime:
+		return runtime.KimiAdapter{Dir: checkout}, nil
 	case runtime.ShellRuntime:
 		return runtime.ShellAdapter{Dir: checkout}, nil
 	default:

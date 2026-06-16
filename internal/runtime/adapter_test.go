@@ -661,3 +661,159 @@ func TestCodexCommandError(t *testing.T) {
 		}
 	})
 }
+
+func TestValidateAgentAcceptsKimi(t *testing.T) {
+	agent := Agent{Name: "audit", Role: "reviewer", Runtime: KimiRuntime, RuntimeRef: "session_550e8400-e29b-41d4-a716-446655440000", RepoScope: "jerryfane/gitmoot"}
+	if err := ValidateAgent(agent); err != nil {
+		t.Fatalf("ValidateAgent rejected valid Kimi agent: %v", err)
+	}
+}
+
+func TestValidateAgentRejectsInvalidKimiRef(t *testing.T) {
+	agent := Agent{Name: "audit", Role: "reviewer", Runtime: KimiRuntime, RuntimeRef: "not-a-session", RepoScope: "jerryfane/gitmoot"}
+	if err := ValidateAgent(agent); err == nil {
+		t.Fatal("ValidateAgent accepted invalid Kimi runtime ref")
+	}
+}
+
+func TestKimiAdapterValidateRejectsRuntimeMismatch(t *testing.T) {
+	agent := Agent{Name: "audit", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: "session_550e8400-e29b-41d4-a716-446655440000", RepoScope: "jerryfane/gitmoot"}
+	if err := (KimiAdapter{}).Validate(context.Background(), agent); err == nil {
+		t.Fatal("KimiAdapter accepted a Claude agent")
+	}
+}
+
+func TestKimiStartCommandParsesSessionID(t *testing.T) {
+	stdout := `{"role":"assistant","content":"ready"}` + "\n" +
+		`{"role":"meta","type":"session.resume_hint","session_id":"session_550e8400-e29b-41d4-a716-446655440000","command":"kimi -r session_550e8400-e29b-41d4-a716-446655440000","content":"To resume this session: kimi -r session_550e8400-e29b-41d4-a716-446655440000"}` + "\n"
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
+	adapter := KimiAdapter{Runner: runner, Dir: "/repo"}
+	agent := Agent{Name: "lead", Role: "implementer", Runtime: KimiRuntime, RepoScope: "jerryfane/gitmoot", AutonomyPolicy: AutonomyPolicyReadOnly}
+
+	result, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "initialize"})
+	if err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	if result.RuntimeRef != "session_550e8400-e29b-41d4-a716-446655440000" {
+		t.Fatalf("runtime ref = %q", result.RuntimeRef)
+	}
+	if result.Raw != "ready" {
+		t.Fatalf("raw = %q", result.Raw)
+	}
+	runner.want(t, 0, "kimi", "-p", "initialize", "--output-format", "stream-json")
+}
+
+func TestKimiStartCommandDoesNotPassPermissionFlags(t *testing.T) {
+	stdout := `{"role":"assistant","content":"ready"}` + "\n" +
+		`{"role":"meta","type":"session.resume_hint","session_id":"session_550e8400-e29b-41d4-a716-446655440000","command":"kimi -r session_550e8400-e29b-41d4-a716-446655440000","content":"To resume this session: kimi -r session_550e8400-e29b-41d4-a716-446655440000"}` + "\n"
+
+	for _, tt := range []struct {
+		name   string
+		policy string
+	}{
+		{name: "read_only", policy: AutonomyPolicyReadOnly},
+		{name: "auto", policy: AutonomyPolicyAuto},
+		{name: "workspace_write", policy: AutonomyPolicyWorkspaceWrite},
+		{name: "danger_full_access", policy: AutonomyPolicyDangerFullAccess},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
+			adapter := KimiAdapter{
+				Runner: runner,
+				NewRuntimeRef: func() (string, error) {
+					return "550e8400-e29b-41d4-a716-446655440010", nil
+				},
+			}
+			agent := Agent{Name: "lead", Role: "implementer", Runtime: KimiRuntime, RepoScope: "jerryfane/gitmoot", AutonomyPolicy: tt.policy}
+
+			if _, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "initialize"}); err != nil {
+				t.Fatalf("Start returned error: %v", err)
+			}
+			runner.want(t, 0, "kimi", "-p", "initialize", "--output-format", "stream-json")
+		})
+	}
+}
+
+func TestKimiStartFallsBackToGeneratedRefWhenSessionIDMissing(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"role":"assistant","content":"ready"}` + "\n"}}}
+	adapter := KimiAdapter{
+		Runner: runner,
+		NewRuntimeRef: func() (string, error) {
+			return "550e8400-e29b-41d4-a716-446655440010", nil
+		},
+	}
+	agent := Agent{Name: "lead", Role: "implementer", Runtime: KimiRuntime, RepoScope: "jerryfane/gitmoot"}
+
+	result, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "initialize"})
+	if err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	if result.RuntimeRef != "550e8400-e29b-41d4-a716-446655440010" {
+		t.Fatalf("runtime ref = %q", result.RuntimeRef)
+	}
+}
+
+func TestKimiDeliverCommandResumesSession(t *testing.T) {
+	stdout := `{"role":"assistant","content":"done"}` + "\n" +
+		`{"role":"meta","type":"session.resume_hint","session_id":"session_550e8400-e29b-41d4-a716-446655440001","command":"kimi -r session_550e8400-e29b-41d4-a716-446655440001","content":"To resume this session: kimi -r session_550e8400-e29b-41d4-a716-446655440001"}` + "\n"
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
+	adapter := KimiAdapter{Runner: runner}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: KimiRuntime, RuntimeRef: "session_550e8400-e29b-41d4-a716-446655440001", RepoScope: "jerryfane/gitmoot", AutonomyPolicy: AutonomyPolicyReadOnly}
+
+	result, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"})
+	if err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	if result.Summary != "done" {
+		t.Fatalf("summary = %q", result.Summary)
+	}
+	if result.Raw != "done" {
+		t.Fatalf("raw = %q", result.Raw)
+	}
+	runner.want(t, 0, "kimi", "-S", "session_550e8400-e29b-41d4-a716-446655440001", "-p", "review", "--output-format", "stream-json")
+}
+
+
+func TestKimiHealthUsesRegisteredSession(t *testing.T) {
+	stdout := `{"role":"assistant","content":"OK"}` + "\n" +
+		`{"role":"meta","type":"session.resume_hint","session_id":"session_550e8400-e29b-41d4-a716-446655440002","command":"kimi -r session_550e8400-e29b-41d4-a716-446655440002","content":"To resume this session: kimi -r session_550e8400-e29b-41d4-a716-446655440002"}` + "\n"
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
+	adapter := KimiAdapter{Runner: runner}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: KimiRuntime, RuntimeRef: "session_550e8400-e29b-41d4-a716-446655440002", RepoScope: "jerryfane/gitmoot", AutonomyPolicy: AutonomyPolicyReadOnly}
+
+	if err := adapter.Health(context.Background(), agent); err != nil {
+		t.Fatalf("Health returned error: %v", err)
+	}
+	runner.want(t, 0, "kimi", "-S", "session_550e8400-e29b-41d4-a716-446655440002", "-p", KimiLiveCheckPrompt, "--output-format", "stream-json")
+}
+
+func TestKimiHealthClassifiesAuthFailure(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{Stderr: "Please run `kimi login` to authenticate."}},
+		errs:    []error{errors.New("exit 1")},
+	}
+	adapter := KimiAdapter{Runner: runner}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: KimiRuntime, RuntimeRef: "session_550e8400-e29b-41d4-a716-446655440002", RepoScope: "jerryfane/gitmoot"}
+
+	err := adapter.Health(context.Background(), agent)
+	if err == nil {
+		t.Fatal("Health accepted auth failure")
+	}
+	errText := err.Error()
+	for _, want := range []string{"Kimi Code authentication required", "kimi login", "restart the Gitmoot daemon"} {
+		if !strings.Contains(errText, want) {
+			t.Fatalf("error missing %q:\n%s", want, errText)
+		}
+	}
+}
+
+func TestKimiHealthRejectsBrokenSession(t *testing.T) {
+	runner := &fakeRunner{errs: []error{errors.New("exit 1")}}
+	adapter := KimiAdapter{Runner: runner}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: KimiRuntime, RuntimeRef: "session_550e8400-e29b-41d4-a716-446655440002", RepoScope: "jerryfane/gitmoot", AutonomyPolicy: AutonomyPolicyReadOnly}
+
+	if err := adapter.Health(context.Background(), agent); err == nil {
+		t.Fatal("Health accepted broken Kimi session")
+	}
+	runner.want(t, 0, "kimi", "-S", "session_550e8400-e29b-41d4-a716-446655440002", "-p", KimiLiveCheckPrompt, "--output-format", "stream-json")
+}

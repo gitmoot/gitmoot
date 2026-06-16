@@ -9,6 +9,7 @@ capabilities:
 runtime_compatibility:
   - codex
   - claude
+  - kimi
 tags:
   - planning
   - goals

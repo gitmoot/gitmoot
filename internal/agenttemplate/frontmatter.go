@@ -22,6 +22,7 @@ var validTemplateCapabilities = map[string]struct{}{
 var validTemplateRuntimes = map[string]struct{}{
 	"codex":  {},
 	"claude": {},
+	"kimi":   {},
 	"shell":  {},
 }
 

@@ -34,6 +34,7 @@ func (c Checker) Run(ctx context.Context) []Check {
 		c.command(ctx, runner, "gh", true, "--version"),
 		c.command(ctx, runner, "codex", true, "--version"),
 		c.command(ctx, runner, "claude", false, "--help"),
+		c.command(ctx, runner, "kimi", false, "--version"),
 		c.claudeAuthEnv(),
 		c.ghAuth(ctx, runner),
 		c.repoRemote(ctx, runner),
