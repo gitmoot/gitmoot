@@ -73,8 +73,19 @@ func RenderJob(prompt JobPrompt) string {
 	builder.WriteString("Use this shape:\n")
 	builder.WriteString(`{"gitmoot_result":{"decision":"approved|changes_requested|blocked|implemented|failed","summary":"...","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`)
 	builder.WriteByte('\n')
+	builder.WriteString(delegationSchemaHelp)
 	return builder.String()
 }
+
+// delegationSchemaHelp documents the delegations[] object shape inside the
+// rendered prompt itself. Runtime agents (codex/claude/kimi) only receive this
+// prompt, not the gitmoot skill docs, so without this they guess field names
+// (e.g. "to" instead of "agent") and the result fails validation.
+const delegationSchemaHelp = "\nEach delegations[] entry is an object: " +
+	`{"id":"unique-id","agent":"gitmoot-agent-name","action":"ask|review|implement","prompt":"what the agent should do"}` +
+	"\n- id, agent, action, and prompt are ALL required. Use \"agent\" (the target Gitmoot agent's name), not \"to\".\n" +
+	"- Optional: \"deps\":[\"other-id\"] makes this delegation wait until those sibling delegations succeed.\n" +
+	"- Leave delegations empty ([]) when no follow-up agents are needed — that is how you signal the work is complete.\n"
 
 func RenderRepairPrompt(rawOutput string, parseError error) string {
 	var builder strings.Builder
@@ -84,7 +95,9 @@ func RenderRepairPrompt(rawOutput string, parseError error) string {
 	}
 	builder.WriteString("\nReturn only one JSON object in this exact shape:\n")
 	builder.WriteString(`{"gitmoot_result":{"decision":"approved|changes_requested|blocked|implemented|failed","summary":"...","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`)
-	builder.WriteString("\n\nPrevious raw output:\n")
+	builder.WriteString("\n")
+	builder.WriteString(delegationSchemaHelp)
+	builder.WriteString("\nPrevious raw output:\n")
 	builder.WriteString(trimRawOutput(rawOutput, 12000))
 	builder.WriteByte('\n')
 	return builder.String()
