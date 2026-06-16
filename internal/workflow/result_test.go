@@ -76,3 +76,159 @@ func TestExtractAgentResultRejectsUnsupportedField(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+func TestExtractAgentResultAcceptsDelegationDeps(t *testing.T) {
+	output := `{"gitmoot_result":{"decision":"implemented","summary":"fan out",` +
+		`"delegations":[` +
+		`{"id":"api","agent":"impl","action":"implement","prompt":"build api"},` +
+		`{"id":"ui","agent":"impl","action":"implement","prompt":"build ui"},` +
+		`{"id":"integrate","agent":"impl","action":"implement","prompt":"wire up","deps":["api","ui"]}` +
+		`]}}`
+
+	result, err := ExtractAgentResult(output)
+
+	if err != nil {
+		t.Fatalf("ExtractAgentResult returned error: %v", err)
+	}
+	if len(result.Delegations) != 3 {
+		t.Fatalf("delegations = %+v", result.Delegations)
+	}
+	if got := result.Delegations[2].Deps; len(got) != 2 || got[0] != "api" || got[1] != "ui" {
+		t.Fatalf("deps = %+v", got)
+	}
+}
+
+func TestExtractAgentResultRejectsNextAgentsField(t *testing.T) {
+	output := `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[],"next_agents":["impl"]}}`
+
+	_, err := ExtractAgentResult(output)
+
+	if err == nil {
+		t.Fatal("ExtractAgentResult accepted next_agents field")
+	}
+	if !strings.Contains(err.Error(), `unsupported gitmoot_result field "next_agents"`) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestValidateAgentResultRejectsDelegationMissingFields(t *testing.T) {
+	cases := []struct {
+		name string
+		del  Delegation
+		want string
+	}{
+		{"missing id", Delegation{Agent: "impl", Action: "implement", Prompt: "do"}, "delegation id is required"},
+		{"missing agent", Delegation{ID: "a", Action: "implement", Prompt: "do"}, "delegation agent is required"},
+		{"missing action", Delegation{ID: "a", Agent: "impl", Prompt: "do"}, "delegation action is required"},
+		{"missing prompt", Delegation{ID: "a", Agent: "impl", Action: "implement"}, "delegation prompt is required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := AgentResult{Decision: "implemented", Summary: "x", Delegations: []Delegation{tc.del}}
+			err := validateAgentResult(result)
+			if err == nil {
+				t.Fatalf("validateAgentResult accepted %s", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateAgentResultRejectsDuplicateDelegationID(t *testing.T) {
+	result := AgentResult{
+		Decision: "implemented",
+		Summary:  "x",
+		Delegations: []Delegation{
+			{ID: "dup", Agent: "impl", Action: "implement", Prompt: "first"},
+			{ID: "dup", Agent: "other", Action: "implement", Prompt: "second"},
+		},
+	}
+	err := validateAgentResult(result)
+	if err == nil {
+		t.Fatal("validateAgentResult accepted duplicate delegation id")
+	}
+	if !strings.Contains(err.Error(), `delegation id "dup" is not unique`) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestValidateAgentResultRejectsUnknownDep(t *testing.T) {
+	result := AgentResult{
+		Decision: "implemented",
+		Summary:  "x",
+		Delegations: []Delegation{
+			{ID: "a", Agent: "impl", Action: "implement", Prompt: "do", Deps: []string{"nonexistent"}},
+		},
+	}
+	err := validateAgentResult(result)
+	if err == nil {
+		t.Fatal("validateAgentResult accepted unknown dep")
+	}
+	if !strings.Contains(err.Error(), `delegation "a" references unknown dep "nonexistent"`) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestValidateAgentResultRejectsSelfDep(t *testing.T) {
+	result := AgentResult{
+		Decision: "implemented",
+		Summary:  "x",
+		Delegations: []Delegation{
+			{ID: "a", Agent: "impl", Action: "implement", Prompt: "do", Deps: []string{"a"}},
+		},
+	}
+	err := validateAgentResult(result)
+	if err == nil {
+		t.Fatal("validateAgentResult accepted self-dep")
+	}
+	if !strings.Contains(err.Error(), `delegation "a" depends on itself`) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestValidateAgentResultRejectsDependencyCycle(t *testing.T) {
+	result := AgentResult{
+		Decision: "implemented",
+		Summary:  "x",
+		Delegations: []Delegation{
+			{ID: "a", Agent: "impl", Action: "implement", Prompt: "do", Deps: []string{"b"}},
+			{ID: "b", Agent: "impl", Action: "implement", Prompt: "do", Deps: []string{"a"}},
+		},
+	}
+	err := validateAgentResult(result)
+	if err == nil {
+		t.Fatal("validateAgentResult accepted dependency cycle")
+	}
+	if !strings.Contains(err.Error(), "dependency cycle") {
+		t.Fatalf("error = %v", err)
+	}
+	// The error must name both delegations in the cycle.
+	if !strings.Contains(err.Error(), "a") || !strings.Contains(err.Error(), "b") {
+		t.Fatalf("cycle error does not name the delegations: %v", err)
+	}
+}
+
+func TestValidateAgentResultRejectsArtifactsWithoutBody(t *testing.T) {
+	result := AgentResult{
+		Decision: "implemented",
+		Summary:  "x",
+		Delegations: []Delegation{
+			{ID: "a", Agent: "impl", Action: "implement", Prompt: "do", Artifacts: []string{"brief.md"}},
+		},
+	}
+	err := validateAgentResult(result)
+	if err == nil {
+		t.Fatal("validateAgentResult accepted delegation requesting artifacts with empty body")
+	}
+	if !strings.Contains(err.Error(), "artifact_body is required when delegations request artifacts") {
+		t.Fatalf("error = %v", err)
+	}
+
+	// With a brief written, the same delegations are valid.
+	result.ArtifactBody = "shared brief"
+	if err := validateAgentResult(result); err != nil {
+		t.Fatalf("validateAgentResult rejected delegations with a written brief: %v", err)
+	}
+}
