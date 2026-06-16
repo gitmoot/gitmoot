@@ -1,0 +1,44 @@
+name: CI
+
+# Runs the build/vet/test gate on every push to main and every pull request, so
+# "the tests pass" is enforced on a clean checkout rather than trusted from a
+# local run. Does NOT run the live multi-runtime (codex/claude/kimi) E2E — that
+# needs runtime auth and stays a manual step.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build / vet / test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Test (race detector, workflow engine)
+        run: go test -race ./internal/workflow/

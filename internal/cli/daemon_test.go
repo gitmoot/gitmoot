@@ -1408,6 +1408,15 @@ func TestRunQueuedJobsSerializesSameRepoCheckout(t *testing.T) {
 func TestRunQueuedJobsSerializesSameRuntimeSessionAcrossRepos(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	content := strings.Replace(config.DefaultConfig(paths), `same_session = "fork_temp_session"`, `same_session = "queue"`, 1)
+	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile config returned error: %v", err)
+	}
 	seedDaemonWorkerRepo(t, store, "owner/repo-a", t.TempDir())
 	seedDaemonWorkerRepo(t, store, "owner/repo-b", t.TempDir())
 	seedDaemonWorkerAgent(t, store, "audit", runtime.CodexRuntime, "session-1", []string{"ask"}, "owner/repo-a")
@@ -1434,7 +1443,7 @@ func TestRunQueuedJobsSerializesSameRuntimeSessionAcrossRepos(t *testing.T) {
 			mu.Unlock()
 		},
 	}
-	worker := defaultJobWorker(store, io.Discard)
+	worker := defaultJobWorker(store, io.Discard, home)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return t.TempDir(), nil
 	}
