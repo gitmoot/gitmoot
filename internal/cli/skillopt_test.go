@@ -2919,22 +2919,33 @@ func TestSkillOptTrainGenerationStampsCorrelationIDs(t *testing.T) {
 	defer store.Close()
 
 	const runID = "landing-train-review-001"
-	parentJobID := skillOptTrainGenerationParentJobID(runID)
-	if parentJobID != "skillopt-train-generation:"+runID {
-		t.Fatalf("parent job id = %q", parentJobID)
+	prefix := skillOptTrainGenerationCorrelationPrefix(runID)
+	if prefix != "skillopt-train-generation:"+runID {
+		t.Fatalf("correlation prefix = %q", prefix)
 	}
 
-	children, err := store.ListJobsByParent(context.Background(), parentJobID)
+	allJobs, err := store.ListJobs(context.Background())
 	if err != nil {
-		t.Fatalf("ListJobsByParent returned error: %v", err)
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	var children []db.Job
+	for _, job := range allJobs {
+		payload, err := daemonJobPayload(job)
+		if err != nil {
+			t.Fatalf("daemonJobPayload returned error: %v", err)
+		}
+		if strings.HasPrefix(payload.TaskID, prefix+":") {
+			children = append(children, job)
+		}
 	}
 	if len(children) != 4 {
-		t.Fatalf("ListJobsByParent(%q) returned %d jobs, want 4: %+v", parentJobID, len(children), children)
+		t.Fatalf("generation jobs with TaskID prefix %q = %d, want 4: %+v", prefix, len(children), children)
 	}
 
-	// Every generation child must be discoverable via the run-scoped parent id and
-	// carry the structured correlation ids: parent and root both point at the run
-	// parent, and the per-option TaskID encodes (run, item, label, attempt).
+	// Each generation child carries the per-option TaskID encoding
+	// (run, item, label, attempt). It must NOT carry ParentJobID/RootJobID:
+	// those are delegation-engine fields, and a synthetic value would make
+	// AdvanceJob fail for a requeued generation job.
 	wantTaskIDs := map[string]bool{
 		skillOptTrainGenerationTaskID(runID, "hero-saas", "a", 0):       false,
 		skillOptTrainGenerationTaskID(runID, "hero-saas", "b", 0):       false,
@@ -2942,21 +2953,15 @@ func TestSkillOptTrainGenerationStampsCorrelationIDs(t *testing.T) {
 		skillOptTrainGenerationTaskID(runID, "ecommerce-proof", "b", 0): false,
 	}
 	for _, job := range children {
-		if job.ParentJobID != parentJobID {
-			t.Fatalf("job %s parent_job_id = %q, want %q", job.ID, job.ParentJobID, parentJobID)
+		if job.ParentJobID != "" {
+			t.Fatalf("job %s parent_job_id = %q, want empty (generation jobs are not delegations)", job.ID, job.ParentJobID)
 		}
 		payload, err := daemonJobPayload(job)
 		if err != nil {
 			t.Fatalf("daemonJobPayload returned error: %v", err)
 		}
-		if payload.ParentJobID != parentJobID {
-			t.Fatalf("job %s payload parent_job_id = %q, want %q", job.ID, payload.ParentJobID, parentJobID)
-		}
-		if payload.RootJobID != parentJobID {
-			t.Fatalf("job %s payload root_job_id = %q, want %q", job.ID, payload.RootJobID, parentJobID)
-		}
-		if payload.DelegationID != "" {
-			t.Fatalf("job %s payload delegation_id = %q, want empty", job.ID, payload.DelegationID)
+		if payload.ParentJobID != "" || payload.RootJobID != "" {
+			t.Fatalf("job %s payload parent/root = %q/%q, want empty", job.ID, payload.ParentJobID, payload.RootJobID)
 		}
 		seen, ok := wantTaskIDs[payload.TaskID]
 		if !ok {

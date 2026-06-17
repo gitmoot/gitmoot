@@ -31,9 +31,6 @@ type localAgentDispatchRequest struct {
 	AllowManagedSync     bool
 	JobTimeout           time.Duration
 	TaskID               string
-	ParentJobID          string
-	DelegationID         string
-	RootJobID            string
 	PullRequest          int
 	HeadSHA              string
 	Branch               string
@@ -136,9 +133,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		TaskTitle:    request.TaskTitle,
 		LeadAgent:    firstNonEmpty(request.LeadAgent, agent.Name),
 		Reviewers:    request.Reviewers,
-		ParentJobID:  request.ParentJobID,
-		DelegationID: request.DelegationID,
-		RootJobID:    request.RootJobID,
 		Sender:       "local",
 		Instructions: request.Instructions,
 	})
