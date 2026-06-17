@@ -1,9 +1,9 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, PR comments, daemon jobs, branch locks, agent templates, template capture, custom prompt agents, and Codex or Claude Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, PR comments, daemon jobs, branch locks, agent templates, template capture, custom prompt agents, and Codex, Claude Code, or Kimi Code runtime workflows.
 version: 0.1.0
 license: Apache-2.0
-compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex or Claude Code.
+compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
   gitmoot-version: "0.1.0"
   source: "jerryfane/gitmoot"
@@ -28,9 +28,9 @@ This root `SKILL.md` is kept as a raw compatibility entrypoint for agents and
 Gitmoot is a local-first coordinator for AI agents working across repositories,
 goals, reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
-background daemon checks, Codex or Claude Code agent startup, structured
-implementation plans, standard goal files, agent template workflows, template
-capture, custom prompt agents, job status, or branch lock inspection.
+background daemon checks, Codex, Claude Code, or Kimi Code agent startup,
+structured implementation plans, standard goal files, agent template workflows,
+template capture, custom prompt agents, job status, or branch lock inspection.
 
 For current-chat prompt import, "use <agent> here" means run
 `gitmoot agent prompt <agent>` and apply the returned prompt content in this
@@ -57,9 +57,15 @@ Use `gitmoot agent template draft <id>` for a blank scaffold,
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
-same Codex or Claude session, and branch locks protect implementation ownership.
+same Codex, Claude, or Kimi session, and branch locks protect implementation
+ownership.
 The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
+
+For runtime selection, `gitmoot agent start <name> --runtime <runtime>` accepts
+`codex`, `claude`, or `kimi`. Kimi Code is a first-class runtime adapter
+alongside Codex and Claude Code. To use it, run `kimi login`, then restart the
+Gitmoot daemon so it inherits the session.
 
 For Gitmoot health or status questions, run the relevant read-only Gitmoot CLI
 checks and answer directly from the results. Mention `gitmoot dashboard` only
@@ -171,6 +177,24 @@ cancelled Gitmoot job needs a user-shareable bug report. Preview first by
 default. Create with `--create --yes` only when the user explicitly asks or the
 active workflow policy permits filing reports, then report the created or
 existing GitHub issue URL back to the user.
+
+SkillOpt train generation is durable and idempotent on resume. Each review
+item's artifacts, item row, and options commit in one transaction the moment
+that item finishes, so an interrupted generate phase loses only the item that
+was in flight. Re-running `gitmoot skillopt train continue` regenerates ONLY the
+items that are not yet complete; fully-generated items are skipped, so no
+duplicate options are produced and completed work is never rewritten. If a single
+item has some but not all of its options/artifacts persisted, resume returns a
+hard error (`item <id> has partial generated options; inspect or clear review
+options before continuing`) rather than guessing.
+
+Use `gitmoot skillopt train recover --session <id> [--out-root path] [--json]`
+to recover the OPTIMIZER phase only. It re-imports or repairs the optimizer
+candidate package and classifies the iteration (for example
+`already_completed_candidate`, `already_completed_no_candidate`,
+`optimizer_active`, or `corrupted_unrecoverable`). It does NOT release the
+generation-phase lock or rebuild generation options; use `train continue` for
+generation resume.
 
 ## PR Comment Commands
 

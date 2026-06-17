@@ -364,8 +364,8 @@ through a runtime adapter.
 Background jobs are scheduled against three distinct resources:
 
 - repo checkout mutexes for daemon ticks that use the same local checkout;
-- runtime session locks keyed as `runtime:<runtime>:<runtime_ref>` for Codex
-  and Claude delivery;
+- runtime session locks keyed as `runtime:<runtime>:<runtime_ref>` for Codex,
+  Claude, and Kimi delivery;
 - branch locks for implementation ownership and merge safety.
 
 The daemon default is `--workers 1`. Users can raise it when jobs target
@@ -449,4 +449,7 @@ succeed, and once every top-level delegation is terminal Gitmoot enqueues one
 coordinator continuation job so the coordinator can synthesize the results.
 Inspect the fan-out with `gitmoot job list --repo owner/repo` (one row per child
 job) and `gitmoot events --repo owner/repo` (the `delegation_enqueued` events).
-See `RESULT_CONTRACT.md` for the full delegation field reference.
+Each child job carries job-tree linkage fields — `parent_job_id`,
+`delegation_id`, `root_job_id`, `delegation_depth`, and `task_id` — so a child
+can be traced back to its parent, its originating delegation, and the root of the
+tree. See `RESULT_CONTRACT.md` for the full delegation field reference.

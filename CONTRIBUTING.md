@@ -56,6 +56,23 @@ For SkillOpt train-mode changes:
 scripts/skillopt-train-smoke.sh
 ```
 
+## Continuous Integration
+
+A GitHub Actions workflow named `CI` (`.github/workflows/ci.yml`) enforces the
+build/vet/test gate on every push to `main` and every pull request. The
+`build / vet / test` job runs on `ubuntu-latest`:
+
+```sh
+go build ./...
+go vet ./...
+go test ./...
+go test -race ./internal/workflow/
+```
+
+The race detector covers the workflow engine. CI does not run the live
+multi-runtime (codex/claude/kimi) E2E — that needs runtime auth and stays a
+manual step.
+
 ## Docs And LLM Context
 
 Public docs live in `website/docs`. Root docs under `docs/` and skill

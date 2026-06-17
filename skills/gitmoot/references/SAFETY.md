@@ -43,6 +43,26 @@ If the work depends on external APIs, CLIs, env vars, generated scripts, service
 launchers, installers, deployment behavior, or third-party libraries, verify the
 real contract with local commands and/or official documentation before editing.
 
+## Delegation Termination Bounds
+
+Delegation and coordinator-continuation chains are bounded so they cannot recurse
+or fan out forever:
+
+- Depth cap `MaxDelegationDepth = 8`: each delegation child and each coordinator
+  continuation increments `delegation_depth`. A job at or beyond this depth may
+  not delegate further.
+- Per-root job budget `MaxDelegationTotalJobs = 64`: the whole delegation tree
+  under one root (all children and continuations sharing that root) is capped.
+  When a batch would exceed it, the delegations are not dispatched.
+- Loop detection: a canonical windowed signature hash over recent delegation
+  activity halts repeated or cyclic delegation chains well before the depth cap
+  is reached, preventing oscillating A→B→A loops.
+
+When a bound trips, the offending delegations are dropped (not dispatched) and
+the parent receives a lifecycle/mailbox event explaining why (for example, the
+delegation tree for a root reached the job budget of 64). Work is bounded, not
+silently retried forever.
+
 ## When To Stop
 
 Stop and report `blocked` when the target repo is unclear, GitHub auth is

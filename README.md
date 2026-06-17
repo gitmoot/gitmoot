@@ -9,6 +9,7 @@ Local-first multi-agent coordination for GitHub pull request workflows.
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-black.svg)](./LICENSE)
 [![GitHub release](https://img.shields.io/github/v/release/jerryfane/gitmoot?include_prereleases&color=black)](https://github.com/jerryfane/gitmoot/releases)
 [![Go module](https://img.shields.io/badge/go-module-black.svg)](./go.mod)
+[![CI](https://github.com/jerryfane/gitmoot/actions/workflows/ci.yml/badge.svg)](https://github.com/jerryfane/gitmoot/actions/workflows/ci.yml)
 
 Gitmoot lets humans and AI agents collaborate through the place software teams
 already audit work: GitHub pull requests. It runs on the user's machine, keeps
@@ -26,8 +27,13 @@ trail. Gitmoot makes the repository and its pull requests the shared surface:
 
 - PR comments become agent tasks, review requests, retries, and merge signals.
 - Local SQLite records agents, repos, jobs, goals, tasks, PRs, and branch locks.
-- Runtime adapters keep Codex, Claude Code, and future runtimes behind the same
-  Gitmoot agent model.
+- Runtime adapters keep Codex, Claude Code, Kimi Code, and future runtimes
+  behind the same Gitmoot agent model.
+- Agents can return a validated `delegations[]` DAG that Gitmoot dispatches as
+  child jobs, then enqueues one continuation job to synthesize their results
+  (replacing the old `next_agents` mechanism).
+- Delegation trees are bounded by a depth cap, a per-root job budget, and loop
+  detection, so coordination halts instead of recursing forever.
 - Agent Templates and job snapshots make agent instructions explicit and reproducible.
 - Humans can follow progress from GitHub while agents keep working locally.
 
@@ -38,13 +44,13 @@ GitHub PR comments/state
   -> local gitmoot daemon
   -> local SQLite state machine and job mailbox
   -> registered runtime adapter
-  -> Codex, Claude Code, shell, or another agent runtime
+  -> Codex, Claude Code, Kimi Code, shell, or another agent runtime
   -> GitHub PR comments, statuses, branches, PRs, and merges
 ```
 
 The core primitive is a runtime-neutral Gitmoot agent, not a Codex-specific
-session. Codex and Claude Code are adapters behind the same internal runtime
-contract.
+session. Codex, Claude Code, and Kimi Code are adapters behind the same internal
+runtime contract.
 
 ## Install
 
@@ -93,6 +99,10 @@ gitmoot agent start project-planner \
   --template planner \
   --start-daemon
 ```
+
+`--runtime` accepts `codex`, `claude`, or `kimi`. For Kimi Code, run
+`kimi login` and restart the Gitmoot daemon so it inherits the session, then
+start the agent with `--runtime kimi`.
 
 For fast planning in the current Codex or Claude chat, ask the runtime:
 
@@ -144,7 +154,7 @@ For the full walkthrough, see [docs/local-workflow.md](docs/local-workflow.md).
 - **Agent**: a named Gitmoot identity with repo access, role, capabilities, and
   a runtime adapter.
 - **Runtime adapter**: the bridge from Gitmoot jobs to Codex, Claude Code,
-  shell commands, or future runtimes.
+  Kimi Code, shell commands, or future runtimes.
 - **Template**: cached prompt content attached to an agent and snapshotted into
   each job.
 - **Job**: a routed unit of work created from a PR comment, local ask, task run,
@@ -474,3 +484,6 @@ Gitmoot is licensed under the [Apache License 2.0](./LICENSE). See
 go test ./...
 go vet ./...
 ```
+
+GitHub Actions enforces the same gate on every push to `main` and every pull
+request: build, vet, and test, plus the race detector on `internal/workflow`.

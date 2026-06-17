@@ -1,7 +1,8 @@
 # Runtime Adapter Authoring
 
-Gitmoot treats Codex, Claude Code, and shell commands as runtime adapters behind
-one interface. Workflow, daemon, and GitHub code should stay runtime-neutral.
+Gitmoot treats Codex, Claude Code, Kimi Code, and shell commands as runtime
+adapters behind one interface. Workflow, daemon, and GitHub code should stay
+runtime-neutral.
 
 ## Adapter Contract
 
@@ -50,7 +51,8 @@ type Agent struct {
 ```
 
 `RuntimeRef` is runtime-specific. Codex accepts a session UUID, thread name, or
-`last`. Claude accepts a UUID or `last`. Shell uses the configured command.
+`last`. Claude accepts a UUID or `last`. Kimi accepts a Kimi session id of the
+form `session_<uuid>` or empty. Shell uses the configured command.
 `TemplateID` is Gitmoot-owned metadata. Adapters do not fetch or interpret template
 content; Gitmoot snapshots cached template instructions into the rendered prompt
 before delivery.
@@ -85,6 +87,22 @@ The UUID is stored only after the command succeeds. Future jobs use the Claude
 adapter's resume path. This depends on the installed Claude Code CLI supporting
 the documented `--session-id`, `-p`, `--output-format json`, and `--resume`
 contract.
+
+Kimi startup runs in the repo checkout path:
+
+```sh
+kimi -p '<startup-prompt>' --output-format stream-json
+```
+
+The adapter parses the stream-json output and stores the reported session id.
+Future jobs resume that session with:
+
+```sh
+kimi -S <session-id> -p '<job-prompt>' --output-format stream-json
+```
+
+Kimi runs against a logged-in Kimi CLI. Run `kimi login`, then restart the
+Gitmoot daemon so it inherits the session.
 
 Shell adapters do not support `agent start`; register shell commands with
 `agent subscribe`.
