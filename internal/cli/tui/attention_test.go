@@ -334,3 +334,36 @@ func TestAttentionGroupsJobsByRepo(t *testing.T) {
 		}
 	}
 }
+
+// TestAttentionCollapseJobRepo verifies a job repo group folds with space and
+// re-expands, while prompts and other repos stay put.
+func TestAttentionCollapseJobRepo(t *testing.T) {
+	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
+	snap := Snapshot{
+		Daemon: Daemon{Running: true},
+		JobRows: []JobRow{
+			{ID: "j1", Type: "ask", State: "failed", Repo: "o/alpha"},
+			{ID: "j2", Type: "ask", State: "blocked", Repo: "o/beta"},
+		},
+	}
+	m := attentionModel(t, deps, snap)
+	// Cursor 0 = j1 (o/alpha). Space folds o/alpha.
+	next, _ := m.Update(key(" "))
+	m = next.(Model)
+	view := m.View()
+	if strings.Contains(view, "j1") {
+		t.Fatalf("j1 should be hidden after folding o/alpha:\n%s", view)
+	}
+	if !strings.Contains(view, "[+]") {
+		t.Fatalf("folded repo should show a [+] marker:\n%s", view)
+	}
+	if !strings.Contains(view, "j2") {
+		t.Fatalf("o/beta job should still be visible:\n%s", view)
+	}
+	// Space on the collapsed header re-expands it.
+	next, _ = m.Update(key(" "))
+	m = next.(Model)
+	if !strings.Contains(m.View(), "j1") {
+		t.Fatalf("expanding o/alpha should restore j1:\n%s", m.View())
+	}
+}

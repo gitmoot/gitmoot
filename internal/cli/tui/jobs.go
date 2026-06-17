@@ -60,9 +60,13 @@ func (m Model) jobUnderCursor() (JobRow, bool) {
 		}
 		return m.snap.JobRows[m.jobCursor], true
 	case pageAttention:
+		idx := selectedItemIndex(m.attentionVisibleRows(), m.promptCursor)
+		if idx < 0 {
+			return JobRow{}, false
+		}
 		items := m.attentionItems()
-		if m.promptCursor < len(items) && items[m.promptCursor].job != nil {
-			return *items[m.promptCursor].job, true
+		if idx < len(items) && items[idx].job != nil {
+			return *items[idx].job, true
 		}
 	}
 	return JobRow{}, false

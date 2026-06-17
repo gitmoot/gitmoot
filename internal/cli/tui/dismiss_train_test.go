@@ -354,3 +354,41 @@ func TestTrainsGroupByRepoWithinSection(t *testing.T) {
 		t.Fatalf("cursor 0 should select a-v1, got %q", got.ID)
 	}
 }
+
+// TestTrainsCollapseRepoFoldsSessions verifies space folds the cursor's repo
+// group (hiding its sessions and showing a [+] header) and that the collapsed
+// header is selectable so space re-expands it.
+func TestTrainsCollapseRepoFoldsSessions(t *testing.T) {
+	snap := Snapshot{
+		Daemon: Daemon{Running: true},
+		Trains: []TrainSession{
+			{ID: "a1", Phase: "items_ready", Repo: "o/alpha"},
+			{ID: "b1", Phase: "items_ready", Repo: "o/beta"},
+		},
+	}
+	deps := Deps{Load: func() (Snapshot, error) { return snap, nil }}
+	m := sizedModel(deps)
+	next, _ := m.Update(snapshotMsg{snap: snap, at: time.Unix(1, 0)})
+	m = next.(Model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab}) // → Trains
+	m = next.(Model)
+	// Cursor 0 = a1 (o/alpha). Space folds o/alpha.
+	next, _ = m.Update(key(" "))
+	m = next.(Model)
+	view := m.View()
+	if strings.Contains(view, "a1") {
+		t.Fatalf("a1 should be hidden after folding o/alpha:\n%s", view)
+	}
+	if !strings.Contains(view, "[+]") {
+		t.Fatalf("folded repo should show a [+] marker:\n%s", view)
+	}
+	if !strings.Contains(view, "b1") {
+		t.Fatalf("o/beta should still be visible:\n%s", view)
+	}
+	// Cursor now sits on the collapsed o/alpha header; space re-expands it.
+	next, _ = m.Update(key(" "))
+	m = next.(Model)
+	if !strings.Contains(m.View(), "a1") {
+		t.Fatalf("expanding o/alpha should restore a1:\n%s", m.View())
+	}
+}

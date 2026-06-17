@@ -67,9 +67,13 @@ func orderJobsByRepo(jobs []*JobRow) []*JobRow {
 // attentionPrompt returns the prompt under the attention cursor, if the
 // selected item is a prompt.
 func (m Model) attentionPrompt() (db.InteractivePrompt, bool) {
+	idx := selectedItemIndex(m.attentionVisibleRows(), m.promptCursor)
+	if idx < 0 {
+		return db.InteractivePrompt{}, false
+	}
 	items := m.attentionItems()
-	if m.promptCursor < len(items) && items[m.promptCursor].prompt != nil {
-		return *items[m.promptCursor].prompt, true
+	if idx < len(items) && items[idx].prompt != nil {
+		return *items[idx].prompt, true
 	}
 	return db.InteractivePrompt{}, false
 }
@@ -219,6 +223,68 @@ func answerCmd(deps Deps, id, value string) tea.Cmd {
 // "Branch locks". Section headers carry no cursor index: the selectable items
 // (prompts then reportable jobs) keep the exact flat ordering and indices of
 // attentionItems(), which m.promptCursor indexes into.
+// attentionListRows builds the Attention page's collapsible row tree: a
+// "Prompts" section, a "Blocked & failed jobs" section grouped by repo, and the
+// "Stale locks" / "Branch locks" sections. Leaf itemIdx indexes attentionItems()
+// (prompts then repo-ordered jobs); lock rows are display-only leaves (itemIdx
+// -1, no action).
+func (m Model) attentionListRows() []listRow {
+	items := m.attentionItems()
+	promptN := countPrompts(items)
+	var rows []listRow
+
+	// Prompts: critical and few, so they are plain leaves under a static header —
+	// the cursor lands on the first prompt, ready to answer (no collapse).
+	if promptN > 0 {
+		rows = append(rows, staticRow(0, "Prompts ("+strconv.Itoa(promptN)+")"))
+		for i := 0; i < promptN; i++ {
+			p := items[i].prompt
+			rows = append(rows, leafRow(1, "prompt "+p.ID+"  "+truncate(p.Question, 56), i, ""))
+		}
+	}
+
+	// Blocked & failed jobs: a static section title with collapsible repo groups.
+	if jobN := len(items) - promptN; jobN > 0 {
+		rows = append(rows, staticRow(0, "Blocked & failed jobs ("+strconv.Itoa(jobN)+")"))
+		curRepo := "\x00" // sentinel so the first repo header always prints
+		repoKey := ""
+		for i := promptN; i < len(items); i++ {
+			j := items[i].job
+			if label := attentionRepoLabel(j.Repo); label != curRepo {
+				curRepo = label
+				repoKey = "attn:jobrepo:" + label
+				rows = append(rows, headerRow(repoKey, 1, label))
+			}
+			line := "job " + j.ID + "  " + j.Type + "  " + jobStateColor(j.State)
+			if j.LatestEvent != "" {
+				line += "  " + mutedStyle.Render(truncate(j.LatestEvent, 48))
+			}
+			rows = append(rows, leafRow(2, line, i, repoKey))
+		}
+	}
+
+	// Locks are display-only context (no actions), shown as static lines.
+	if stale := staleLocks(m.snap.ResourceLocks); len(stale) > 0 {
+		rows = append(rows, staticRow(0, "Stale locks ("+strconv.Itoa(len(stale))+")"))
+		for _, l := range stale {
+			rows = append(rows, staticRow(1, redStyle.Render(l.Key)))
+		}
+	}
+	if len(m.snap.BranchLocks) > 0 {
+		rows = append(rows, staticRow(0, "Branch locks ("+strconv.Itoa(len(m.snap.BranchLocks))+")"))
+		for _, l := range m.snap.BranchLocks {
+			rows = append(rows, staticRow(1, l.Repo+" "+l.Branch+" ("+dash(l.Owner)+")"))
+		}
+	}
+	return rows
+}
+
+// attentionVisibleRows is the Attention tree filtered by the collapse state — the
+// exact rows rendered, and the index space m.promptCursor walks.
+func (m Model) attentionVisibleRows() []listRow {
+	return visibleListRows(m.attentionListRows(), m.collapsed)
+}
+
 func (m Model) attentionContent() string {
 	switch m.mode {
 	case modeAnswerChoice, modeAnswerText:
@@ -249,106 +315,28 @@ func (m Model) attentionContent() string {
 		wrote = true
 	}
 
-	// items is the flat, ordered selectable slice (prompts first, then
-	// reportable jobs). i is the global cursor index for every selectable row;
-	// section headers are display-only and never advance it.
-	items := m.attentionItems()
-	renderRow := func(i int, item attnItem, indent string) {
-		marker := "  "
-		var line string
-		switch {
-		case item.prompt != nil:
-			line = "prompt " + item.prompt.ID + "  " + truncate(item.prompt.Question, 56)
-		case item.job != nil:
-			line = "job " + item.job.ID + "  " + item.job.Type + "  " + jobStateColor(item.job.State)
-			if item.job.LatestEvent != "" {
-				line += "  " + mutedStyle.Render(truncate(item.job.LatestEvent, 48))
+	// When only non-actionable context (locks) is present, say so explicitly so
+	// the page does not read as if those locks need an answer.
+	actionable := len(m.attentionItems())
+	rows := m.attentionVisibleRows()
+	if actionable == 0 && len(rows) > 0 {
+		b.WriteString(headerStyle.Render("Needs attention") + "\n" + mutedStyle.Render("none") + "\n\n")
+		wrote = true
+	}
+	if len(rows) > 0 {
+		renderListRows(&b, rows, m.promptCursor)
+		if actionable > 0 {
+			help := "↑/↓ move · space fold repo   prompts: a answer · d dismiss   jobs: enter detail · R retry"
+			if job, ok := m.jobUnderCursor(); ok && jobReportable(job.State) {
+				help += " · B report bug"
 			}
+			b.WriteString("\n" + mutedStyle.Render(help) + "\n")
 		}
-		if i == m.promptCursor {
-			marker = "▸ "
-			line = selectedRowStyle.Render("• ") + line
-		}
-		b.WriteString(indent + marker + line + "\n")
-	}
-
-	wrotePrompts := false
-	for i, item := range items {
-		if item.prompt == nil {
-			continue
-		}
-		if !wrotePrompts {
-			b.WriteString(headerStyle.Render("Prompts ("+strconv.Itoa(countPrompts(items))+")") + "\n")
-			wrotePrompts = true
-		}
-		renderRow(i, item, "")
-	}
-
-	// Blocked & failed jobs, grouped under repo sub-headers (display-only). The
-	// jobs are already repo-ordered in attentionItems, so a repo header is
-	// emitted whenever the repo changes; rows indent under their repo.
-	wroteJobs := false
-	curRepo := ""
-	for i, item := range items {
-		if item.job == nil {
-			continue
-		}
-		if !wroteJobs {
-			if wrotePrompts {
-				b.WriteByte('\n')
-			}
-			b.WriteString(redStyle.Render("Blocked & failed jobs ("+strconv.Itoa(len(items)-countPrompts(items))+")") + "\n")
-			wroteJobs = true
-			curRepo = "\x00" // sentinel so the first repo header always prints
-		}
-		if label := attentionRepoLabel(item.job.Repo); label != curRepo {
-			curRepo = label
-			b.WriteString("  " + mutedStyle.Render(label) + "\n")
-		}
-		renderRow(i, item, "  ")
-	}
-
-	if len(items) == 0 {
-		b.WriteString(headerStyle.Render("needs attention"))
-		b.WriteByte('\n')
-		b.WriteString(mutedStyle.Render("none"))
-		b.WriteByte('\n')
-	} else {
-		// Attention only lists reportable terminal jobs, so cancel never applies here.
-		help := "prompts: a answer · d dismiss   jobs: enter detail · R retry"
-		if job, ok := m.jobUnderCursor(); ok && jobReportable(job.State) {
-			help += " · B report bug"
-		}
-		b.WriteString(mutedStyle.Render(help))
-		b.WriteByte('\n')
 		wrote = true
 	}
 
 	if m.actionErr != "" {
 		b.WriteString("\n" + errorStyle.Render(m.actionErr) + "\n")
-	}
-
-	stale := staleLocks(m.snap.ResourceLocks)
-	if len(stale) > 0 {
-		b.WriteString("\n")
-		b.WriteString(redStyle.Render("Stale locks (" + strconv.Itoa(len(stale)) + ")"))
-		b.WriteByte('\n')
-		for _, l := range stale {
-			b.WriteString(redStyle.Render(l.Key))
-			b.WriteByte('\n')
-		}
-		wrote = true
-	}
-
-	if len(m.snap.BranchLocks) > 0 {
-		b.WriteString("\n")
-		b.WriteString(headerStyle.Render("Branch locks (" + strconv.Itoa(len(m.snap.BranchLocks)) + ")"))
-		b.WriteByte('\n')
-		for _, l := range m.snap.BranchLocks {
-			b.WriteString(l.Repo + " " + l.Branch + " (" + dash(l.Owner) + ")")
-			b.WriteByte('\n')
-		}
-		wrote = true
 	}
 
 	if !wrote {
