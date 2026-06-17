@@ -45,12 +45,57 @@ delegation describes a child job:
 
 Delegation fields:
 
-- `id` (required): stable identifier for this delegation within the result.
+- `id` (required): stable identifier for this delegation, unique within the
+  result. Sibling delegations reference it through `deps`.
 - `agent` (required): name of the Gitmoot agent to run.
 - `action` (required): job action, e.g. `ask`, `review`, or `implement`.
 - `prompt` (required): instructions for the delegated job.
-- `worktree`, `artifacts`, `deps`, `timeout`, `retry`, `failure_policy`,
-  `fingerprint`, `synthesis_rule`: optional controls for advanced dispatchers.
+- `deps` (optional): array of sibling delegation `id`s. This delegation runs
+  only after every listed sibling succeeds. Each entry must reference a known
+  sibling in the same result, may not be self-referential, and may not form a
+  cycle — delegations form a DAG, and cycles are rejected.
+- `failure_policy` (optional): one of `block_parent`, `continue`, or
+  `escalate`. Defaults to `block_parent` when omitted.
+- `synthesis_rule` (optional): one of `summary` or `vote`.
+- `timeout` (optional): a Go duration string and must be positive (e.g. `10m`).
+- `retry` (optional): integer `>= 0`.
+- `worktree` (optional): worktree path for the child job.
+- `artifacts` (optional): named artifact handles passed to the child. When any
+  delegation requests artifacts, the parent result must also set the top-level
+  `artifact_body` field; validation rejects the result otherwise.
+- `fingerprint` (optional): dedup key. Identical fingerprints are
+  de-duplicated, so the same delegation is not dispatched twice.
+
+A delegation with no `deps` dispatches immediately and runs in parallel with
+other dep-free siblings. Once every top-level delegation reaches a terminal
+state, Gitmoot enqueues exactly one coordinator "continuation" job — back to
+the delegating agent — to synthesize the children's results.
+
+Each child job carries `parent_job_id`, `delegation_id`, `root_job_id`,
+`delegation_depth`, and `task_id`, so a child can be traced to its parent, its
+originating delegation, and the root of the job tree.
+
+### Termination bounds
+
+Delegation trees are bounded so they cannot run forever:
+
+- Depth cap: `MaxDelegationDepth = 8`. Each delegation child and each
+  coordinator continuation increments `delegation_depth`; a job at or beyond
+  this depth may not delegate further.
+- Per-root job budget: `MaxDelegationTotalJobs = 64`. The whole delegation tree
+  under one root is capped at this many jobs.
+- Loop detection: a windowed signature over recent delegation activity halts
+  repeated or cyclic delegation chains (e.g. oscillating A→B→A) well before the
+  depth cap is reached.
+
+When a bound trips, the offending delegations are dropped rather than
+dispatched, and the parent receives a lifecycle/mailbox event explaining why
+(for example, "delegation tree for root <id> reached the job budget of 64").
+
+### Top-level fields
+
+- `artifact_body` (optional): the artifact payload made available to delegated
+  children. Required whenever any delegation sets `artifacts`.
 
 ## Decisions
 

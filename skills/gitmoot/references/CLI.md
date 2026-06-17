@@ -94,7 +94,7 @@ equivalent:
   remedy and can be retried in place).
 - **Agents** lists registered agents: `enter` opens a detail with the template,
   recent jobs, and the template's version history; `n` registers a new agent
-  (name, codex/claude runtime, installed template); `o` starts a training
+  (name, codex/claude/kimi runtime, installed template); `o` starts a training
   session for the agent's template via a pre-filled form (review/workspace
   repos, request, codex/claude backend, optional model — the backend/model are
   stored in the session's optimizer defaults so `train continue` inherits
@@ -183,6 +183,9 @@ gitmoot agent start reviewer \
   --capability review \
   --start-daemon
 ```
+
+`--runtime` accepts `codex`, `claude`, or `kimi`. For `kimi`, run `kimi login`
+first and restart the Gitmoot daemon so it inherits the session.
 
 Subscribe an existing runtime session:
 
@@ -418,6 +421,7 @@ gitmoot skillopt train start --template <id> --repo owner/repo --request <text> 
 gitmoot skillopt train status --session <id>
 gitmoot skillopt train run [--config path | --session <id>] [--plain]
 gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--dry-run] [--promote version|--reject version --reason text] [--start-next]
+gitmoot skillopt train recover --session <id> [--out-root path] [--json]
 gitmoot skillopt train stop --session <id> --reason <text>
 ```
 
@@ -440,6 +444,23 @@ context, and starts follow-up iterations only after a promoted/rejected/abandone
 decision. Use `skillopt review`, `feedback`, `export`, `import`, and
 `candidate` directly only for advanced debugging, custom research runs, or
 recovering one step of a train session.
+
+`skillopt train continue` generation is durable and idempotent on resume. Each
+review item's artifacts, item row, and options commit in one transaction the
+moment that item finishes, so an interrupted generate phase loses only the item
+that was in flight. Re-running `train continue` regenerates ONLY the items that
+are not yet complete; fully-generated items are skipped, so no duplicate options
+are produced and completed work is never rewritten. If a single item has some
+but not all of its options/artifacts persisted, resume returns a hard error
+(`item <id> has partial generated options; inspect or clear review options
+before continuing`) rather than guessing.
+
+`skillopt train recover --session <id>` recovers the OPTIMIZER phase only. It
+re-imports or repairs the optimizer candidate package and classifies the
+iteration (for example `already_completed_candidate`,
+`already_completed_no_candidate`, `optimizer_active`, or
+`corrupted_unrecoverable`). It does NOT release the generation-phase lock or
+rebuild generation options; use `train continue` for generation resume.
 
 `skillopt review create` starts a review run for a template and target repo.
 Use the default A/B shape for validation, or pass `--mode explore|refine|distill`

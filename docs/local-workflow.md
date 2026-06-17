@@ -20,8 +20,8 @@ gitmoot plugin doctor
 gitmoot agent template list
 gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 gitmoot agent template update thermo-nuclear-code-quality-review
-gitmoot agent start <name> --runtime codex|claude --repo owner/repo --path . --template thermo-nuclear-code-quality-review --start-daemon
-gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
+gitmoot agent start <name> --runtime codex|claude|kimi --repo owner/repo --path . --template thermo-nuclear-code-quality-review --start-daemon
+gitmoot agent subscribe <name> --runtime codex|claude|kimi|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
 gitmoot agent run <name> "message" --repo owner/repo [--task task-id] [--pr number] [--background]
 gitmoot agent review <name> "message" --repo owner/repo --pr number [--background]
 gitmoot agent implement <name> "message" --repo owner/repo [--task task-id] [--background]
@@ -103,8 +103,8 @@ Background execution uses separate resource categories:
   ticks from mutating the same checkout at once.
 - **Runtime session locks**: SQLite resource locks keyed as
   `runtime:<runtime>:<runtime_ref>`, shared by daemon jobs, `job run`, and
-  synchronous `agent ask`, so one Codex or Claude session is never resumed by
-  two jobs at the same time.
+  synchronous `agent ask`, so one Codex, Claude, or Kimi session is never resumed
+  by two jobs at the same time.
 - **Branch locks**: workflow ownership records used for implementation and
   merge safety.
 
@@ -126,8 +126,8 @@ max_temp_sessions_per_agent = 4
 eligible_actions = ["ask", "review", "implement"]
 ```
 
-When a Codex or Claude runtime session is busy, Gitmoot can start a bounded
-temporary worker with the same template and repo scope. Implementation jobs only
+When a Codex, Claude, or Kimi runtime session is busy, Gitmoot can start a
+bounded temporary worker with the same template and repo scope. Implementation jobs only
 fork when the task has a recorded worktree and the original agent is writable.
 If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
 
@@ -158,7 +158,9 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    reference, grants the repo, and can start the background daemon. For Codex it
    runs `codex exec --json -- <startup-prompt>` and records the emitted
    `thread.started.thread_id`. For Claude Code it creates a session id and uses
-   the installed Claude CLI's non-interactive print mode.
+   the installed Claude CLI's non-interactive print mode. For Kimi Code it runs
+   `kimi -p '<startup-prompt>' --output-format stream-json` and records the
+   `session_<uuid>` session id parsed from the stream-json output.
 
    ```sh
    gitmoot init

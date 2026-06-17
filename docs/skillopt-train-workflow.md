@@ -286,6 +286,29 @@ gitmoot skillopt train continue --session landing-page-train
 gitmoot skillopt train continue --session landing-page-train
 ```
 
+### Durable Generation And Idempotent Resume
+
+Option generation is durable per item. As soon as a single review item's
+options finish, that item's artifacts, item row, and options commit in one
+transaction, instead of a single end-of-phase batch write. A later item's
+failure or a mid-run cancellation cannot lose an item that already finished.
+
+Resume is idempotent. Re-running `train continue` regenerates only the items
+that are not yet complete; fully-generated items are skipped, so no duplicate
+options are produced and completed work is never rewritten. A mix of complete
+and incomplete items is the normal resume state.
+
+If a single item has some but not all of its options or A/B artifacts
+persisted, `train continue` does not guess. It stops with a hard error such as
+`item <id> has partial generated options; inspect or clear review options
+before continuing`, so a partially generated item is inspected or cleared
+rather than silently completed or duplicated.
+
+This per-item generation durability is separate from `skillopt train recover`,
+which recovers the optimizer phase only (see "Optimizer And Candidate Gate").
+`train recover` does not release the generation lock or rebuild generation
+options.
+
 Low-level `skillopt feedback github publish` and `sync` enforce
 `review.expected_repo` for train runs. If a preview train expects
 `owner/previews`, publishing or syncing against `owner/product` fails instead of
@@ -572,10 +595,20 @@ instead of re-running blindly:
 gitmoot skillopt train recover --session planner-train --out-root .gitmoot/skillopt/planner-train
 ```
 
-Recovery validates the package state, imports a completed candidate through the
-normal candidate gate, or records `optimizer_completed_no_candidate` with the
-stored rejection reason. Incomplete or corrupted artifacts fail without
-modifying the train state.
+```sh
+gitmoot skillopt train recover --session planner-train --out-root .gitmoot/skillopt/planner-train --json
+```
+
+`train recover` is scoped to the optimizer phase only. It re-imports or repairs
+the optimizer candidate package and classifies the active iteration, for example
+`already_completed_candidate`, `already_completed_no_candidate`,
+`optimizer_active`, or `corrupted_unrecoverable`. Recovery validates the package
+state, imports a completed candidate through the normal candidate gate, or
+records `optimizer_completed_no_candidate` with the stored rejection reason.
+Incomplete or corrupted artifacts fail without modifying the train state. It does
+not recover the generation phase, release the generation lock, or rebuild
+generation options; per-item generation durability and idempotent resume handle
+that (see "Durable Generation And Idempotent Resume").
 
 ## Candidate Review And Next Iteration
 

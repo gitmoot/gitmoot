@@ -1,8 +1,8 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, jobs, branch locks, agent-templates, template capture, custom prompt agents, and Codex or Claude Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, jobs, branch locks, agent-templates, template capture, custom prompt agents, and Codex, Claude Code, or Kimi Code runtime workflows.
 license: Apache-2.0
-compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex or Claude Code.
+compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
   gitmoot-version: "0.1.0"
   source: "jerryfane/gitmoot"
@@ -13,7 +13,7 @@ metadata:
 Gitmoot is a local-first coordinator for AI agents working across repositories,
 goals, reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
-background daemon checks, Codex or Claude Code agent startup, structured
+background daemon checks, Codex, Claude Code, or Kimi Code agent startup, structured
 implementation plans, standard goal files, agent template workflows, custom
 prompt agents, template capture, job status, or branch lock inspection.
 
@@ -40,7 +40,8 @@ Use `gitmoot agent template draft <id>` for a blank scaffold,
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
-same Codex or Claude session, and branch locks protect implementation ownership.
+same Codex, Claude, or Kimi session, and branch locks protect implementation
+ownership.
 The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
 
@@ -85,8 +86,8 @@ analysis, planning, or questions. Use `gitmoot agent review <agent> --repo
 owner/repo --pr <number> "..."` for PR review decisions and `gitmoot agent
 implement <agent> --repo owner/repo --task <task-id> "..."` for file changes.
 Add `--background` only when the user wants a queued background job. Use
-`gitmoot plugin doctor` when checking whether Codex or Claude Code can discover
-Gitmoot through an installed runtime plugin. Use
+`gitmoot plugin doctor` when checking whether Codex, Claude Code, or Kimi Code
+can discover Gitmoot through an installed runtime plugin. Use
 `gitmoot plugin codex-launch --repo <path>` to print a Codex launch command that
 adds the resolved `.gitmoot` home to the sandbox on Linux, macOS, and Windows.
 Use `gitmoot goal template` when
@@ -116,7 +117,16 @@ specific step. In train mode, collect enough ranked feedback and trait notes
 before optimizer handoff, check `gitmoot-skillopt --version` and
 `gitmoot-skillopt optimize --help` when optimizer-backed continue is needed,
 keep promotion decisions explicit, and start follow-up iterations only through
-`train continue --start-next`.
+`train continue --start-next`. Generation is durable: each review item's
+artifacts and options commit in one transaction the moment that item finishes,
+so an interrupted phase resumes idempotently when you re-run `train continue` —
+already-complete items are skipped and never duplicated, while an item with some
+but not all options persisted returns a hard error to inspect or clear before
+continuing. For optimizer-phase recovery, use
+`gitmoot skillopt train recover --session <id> [--out-root path] [--json]`,
+which re-imports or repairs the optimizer candidate package and classifies the
+iteration; it does not release the generation lock or rebuild generation
+options.
 
 For complete command examples, read [CLI.md](references/CLI.md).
 For end-to-end workflows, read [WORKFLOWS.md](references/WORKFLOWS.md).
