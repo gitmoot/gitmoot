@@ -3923,6 +3923,289 @@ func TestSkillOptTrainContinueRecoversCompleteGeneratedOptions(t *testing.T) {
 	}
 }
 
+// skillOptTrainItemAwareRunner answers generation jobs based on the item id
+// embedded in the delivered prompt rather than a fixed call sequence, so item
+// success/failure is deterministic regardless of goroutine scheduling. Start
+// calls return a thread, resume (delivery) calls return an implemented result
+// for any item id in failItems unless it is listed there, in which case they
+// return a non-implemented result that fails generation for that item.
+type skillOptTrainItemAwareRunner struct {
+	mu        sync.Mutex
+	failItems map[string]bool
+	threadSeq int
+	prompts   []string
+}
+
+func (r *skillOptTrainItemAwareRunner) Run(_ context.Context, _ string, command string, args ...string) (subprocess.Result, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	isResume := false
+	for _, arg := range args {
+		if arg == "resume" {
+			isResume = true
+			break
+		}
+	}
+	if !isResume {
+		r.threadSeq++
+		threadID := fmt.Sprintf("550e8400-e29b-41d4-a716-44665544%04d", 700+r.threadSeq)
+		return subprocess.Result{Command: command, Args: args, Stdout: `{"type":"thread.started","thread_id":"` + threadID + `"}` + "\n"}, nil
+	}
+	prompt := ""
+	if len(args) > 0 {
+		prompt = args[len(args)-1]
+	}
+	r.prompts = append(r.prompts, prompt)
+	for itemID := range r.failItems {
+		if strings.Contains(prompt, "Item id: "+itemID) {
+			return subprocess.Result{Command: command, Args: args, Stdout: `{"gitmoot_result":{"decision":"blocked","summary":"cannot generate","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"}, nil
+		}
+	}
+	return subprocess.Result{Command: command, Args: args, Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"# Option\n\nGenerated content.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"}, nil
+}
+
+func (r *skillOptTrainItemAwareRunner) LookPath(file string) (string, error) {
+	if file == "" {
+		return "", errors.New("empty file")
+	}
+	return "/usr/bin/" + file, nil
+}
+
+func startSkillOptTrainGenerationForPersistTest(t *testing.T, home string) {
+	t.Helper()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/workspace.git")
+	t.Chdir(repoDir)
+	itemsPath := writeSkillOptTrainItemsFile(t)
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	if err := store.UpsertAgentTemplate(context.Background(), cliSkillOptTemplate("planner", "Plan the work.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after template seed returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"agent", "type", "set", "skillopt-generator",
+		"--home", home,
+		"--runtime", "codex",
+		"--role", "generator",
+		"--max-background", "1",
+		"--capability", "ask",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{
+		"skillopt", "train", "start",
+		"--home", home,
+		"--template", "planner",
+		"--repo", "owner/product",
+		"--session", "landing-train",
+		"--workspace-repo", "owner/workspace",
+		"--request", "Train landing page plans.",
+		"--task-kind", "design",
+		"--mode", "explore",
+		"--options", "2",
+		"--items-file", itemsPath,
+		"--yes",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("train start exit code = %d, stderr=%s", code, stderr.String())
+	}
+}
+
+// TestSkillOptTrainContinuePersistsCompletedItemBeforeLaterFailure proves the
+// core data-loss fix: a completed item is committed the moment it finishes, so a
+// later item's failure cannot lose it, and a resume completes without
+// regenerating the already-durable item.
+func TestSkillOptTrainContinuePersistsCompletedItemBeforeLaterFailure(t *testing.T) {
+	home := t.TempDir()
+	startSkillOptTrainGenerationForPersistTest(t, home)
+	const runID = "landing-train-review-001"
+
+	// hero-saas fails; ecommerce-proof succeeds and must survive.
+	failRunner := &skillOptTrainItemAwareRunner{failItems: map[string]bool{"hero-saas": true}}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: failRunner})
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "train", "continue", "--home", home, "--session", "landing-train"}, &stdout, &stderr)
+	restoreFactory()
+	if code != 1 {
+		t.Fatalf("first continue exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	store := openCLIJobStore(t, home)
+	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "landing-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+	if iteration.State != skillopt.TrainStateItemsReady || !strings.Contains(iteration.MetadataJSON, `"status":"failed"`) {
+		t.Fatalf("iteration after failure = %+v metadata=%s", iteration, iteration.MetadataJSON)
+	}
+	completedOptions, err := store.ListEvalReviewOptions(context.Background(), runID, "ecommerce-proof")
+	if err != nil {
+		t.Fatalf("ListEvalReviewOptions ecommerce-proof returned error: %v", err)
+	}
+	if len(completedOptions) != 2 {
+		t.Fatalf("completed item not durable: ecommerce-proof options = %+v", completedOptions)
+	}
+	failedOptions, err := store.ListEvalReviewOptions(context.Background(), runID, "hero-saas")
+	if err != nil {
+		t.Fatalf("ListEvalReviewOptions hero-saas returned error: %v", err)
+	}
+	if len(failedOptions) != 0 {
+		t.Fatalf("failed item persisted options: hero-saas options = %+v", failedOptions)
+	}
+	completedArtifactIDs := []string{completedOptions[0].ArtifactID, completedOptions[1].ArtifactID}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after first continue returned error: %v", err)
+	}
+
+	// Resume with everything succeeding: only hero-saas should be regenerated.
+	successRunner := &skillOptTrainItemAwareRunner{}
+	restoreFactory = replaceRuntimeFactory(runtime.Factory{Runner: successRunner})
+	defer restoreFactory()
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "train", "continue", "--home", home, "--session", "landing-train"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("resume continue exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "current_phase: options_generated") || !strings.Contains(stdout.String(), "generated_options: 4") {
+		t.Fatalf("resume continue stdout = %s", stdout.String())
+	}
+	// Only the incomplete item's two options were regenerated (1 start + 1
+	// delivery per option).
+	for _, prompt := range successRunner.prompts {
+		if strings.Contains(prompt, "Item id: ecommerce-proof") {
+			t.Fatalf("resume regenerated the already-complete item: %q", prompt)
+		}
+		if !strings.Contains(prompt, "Item id: hero-saas") {
+			t.Fatalf("resume delivery for unexpected item: %q", prompt)
+		}
+	}
+	if len(successRunner.prompts) != 2 {
+		t.Fatalf("resume option deliveries = %d, want 2 (only hero-saas)", len(successRunner.prompts))
+	}
+
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+	for _, itemID := range []string{"ecommerce-proof", "hero-saas"} {
+		options, err := store.ListEvalReviewOptions(context.Background(), runID, itemID)
+		if err != nil {
+			t.Fatalf("ListEvalReviewOptions %s returned error: %v", itemID, err)
+		}
+		if len(options) != 2 || options[0].Label != "a" || options[1].Label != "b" {
+			t.Fatalf("options for %s after resume = %+v", itemID, options)
+		}
+	}
+	// The durable item's artifacts were not rewritten by the resume.
+	resumeOptions, err := store.ListEvalReviewOptions(context.Background(), runID, "ecommerce-proof")
+	if err != nil {
+		t.Fatalf("ListEvalReviewOptions ecommerce-proof after resume returned error: %v", err)
+	}
+	if resumeOptions[0].ArtifactID != completedArtifactIDs[0] || resumeOptions[1].ArtifactID != completedArtifactIDs[1] {
+		t.Fatalf("resume rewrote durable item artifacts: before=%v after=%v", completedArtifactIDs, []string{resumeOptions[0].ArtifactID, resumeOptions[1].ArtifactID})
+	}
+}
+
+// TestSkillOptTrainContinueResumeRegeneratesOnlyIncompleteItems seeds one
+// complete item, then verifies resume regenerates only the missing item with
+// correct totals and no duplicate options.
+func TestSkillOptTrainContinueResumeRegeneratesOnlyIncompleteItems(t *testing.T) {
+	home := t.TempDir()
+	startSkillOptTrainGenerationForPersistTest(t, home)
+	const runID = "landing-train-review-001"
+	paths := config.PathsForHome(home)
+
+	// Seed ecommerce-proof as already complete (durable from a prior partial run).
+	store := openCLIJobStore(t, home)
+	blobStore := artifact.NewStore(paths.ArtifactBlobs)
+	var seededArtifactIDs []string
+	var artifacts []db.EvalArtifact
+	var options []db.EvalReviewOption
+	for _, label := range []string{"a", "b"} {
+		artifactRecord, err := prepareReviewItemContentArtifact(blobStore, runID, "ecommerce-proof", "option-"+label, []byte("seeded "+label), "text/markdown", "text")
+		if err != nil {
+			t.Fatalf("prepareReviewItemContentArtifact returned error: %v", err)
+		}
+		artifacts = append(artifacts, artifactRecord)
+		seededArtifactIDs = append(seededArtifactIDs, artifactRecord.ID)
+		options = append(options, db.EvalReviewOption{
+			RunID:      runID,
+			ItemID:     "ecommerce-proof",
+			Label:      label,
+			ArtifactID: artifactRecord.ID,
+			Role:       "option",
+		})
+	}
+	if err := store.ReplaceGeneratedEvalReviewArtifactsForItem(context.Background(), runID, db.EvalReviewGenerationWrite{
+		ItemID:    "ecommerce-proof",
+		Artifacts: artifacts,
+		Options:   options,
+	}); err != nil {
+		t.Fatalf("ReplaceGeneratedEvalReviewArtifactsForItem returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after seed returned error: %v", err)
+	}
+
+	runner := &skillOptTrainItemAwareRunner{}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "train", "continue", "--home", home, "--session", "landing-train"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("resume continue exit code = %d, stderr=%s", code, stderr.String())
+	}
+	// Progress total reflects only the incomplete item.
+	if !strings.Contains(stderr.String(), "generating 2 options (1 items x 2)") {
+		t.Fatalf("resume progress stderr = %s", stderr.String())
+	}
+	// existingGenerated (2) + generated (2) with no double-count.
+	if !strings.Contains(stdout.String(), "current_phase: options_generated") || !strings.Contains(stdout.String(), "generated_options: 4") {
+		t.Fatalf("resume continue stdout = %s", stdout.String())
+	}
+	for _, prompt := range runner.prompts {
+		if !strings.Contains(prompt, "Item id: hero-saas") {
+			t.Fatalf("resume delivered a prompt for an already-complete item: %q", prompt)
+		}
+	}
+	if len(runner.prompts) != 2 {
+		t.Fatalf("resume option deliveries = %d, want 2 (only hero-saas)", len(runner.prompts))
+	}
+
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+	// hero-saas now generated, no duplicates.
+	heroOptions, err := store.ListEvalReviewOptions(context.Background(), runID, "hero-saas")
+	if err != nil {
+		t.Fatalf("ListEvalReviewOptions hero-saas returned error: %v", err)
+	}
+	if len(heroOptions) != 2 || heroOptions[0].Label != "a" || heroOptions[1].Label != "b" {
+		t.Fatalf("hero-saas options after resume = %+v", heroOptions)
+	}
+	// Seeded item untouched: same artifact ids, still exactly two options.
+	ecommerceOptions, err := store.ListEvalReviewOptions(context.Background(), runID, "ecommerce-proof")
+	if err != nil {
+		t.Fatalf("ListEvalReviewOptions ecommerce-proof returned error: %v", err)
+	}
+	if len(ecommerceOptions) != 2 || ecommerceOptions[0].ArtifactID != seededArtifactIDs[0] || ecommerceOptions[1].ArtifactID != seededArtifactIDs[1] {
+		t.Fatalf("seeded item changed after resume: %+v want artifacts %v", ecommerceOptions, seededArtifactIDs)
+	}
+}
+
 func TestSkillOptTrainContinueUsesManagedGeneratorConcurrency(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()
