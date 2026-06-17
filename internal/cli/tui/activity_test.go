@@ -22,8 +22,8 @@ func TestActivityPageRendersActiveTrees(t *testing.T) {
 		Activity: []ActivityRoot{{
 			JobID: "root-1", Agent: "planner", Action: "implement", State: "running", Repo: "o/r",
 			Children: []JobChild{
-				{DelegationID: "d1", Agent: "impl-a", Action: "build the API", State: "running"},
-				{DelegationID: "d2", Agent: "impl-b", Action: "write tests", State: "blocked"},
+				{ID: "c1", DelegationID: "d1", Agent: "impl-a", Action: "build the API", State: "running"},
+				{ID: "c2", DelegationID: "d2", Agent: "impl-b", Action: "write tests", State: "blocked"},
 			},
 			ContinuationID: "cont-1", ContinuationState: "queued",
 			Total: 2, Running: 1, Blocked: 1, Done: 0,
@@ -36,14 +36,21 @@ func TestActivityPageRendersActiveTrees(t *testing.T) {
 			t.Fatalf("activity view missing %q:\n%s", want, view)
 		}
 	}
-	// The cursor selects the root; enter opens its detail.
-	if r, ok := m.activityUnderCursor(); !ok || r.JobID != "root-1" {
-		t.Fatalf("cursor should select root-1, got %+v ok=%v", r, ok)
+	// Cursor 0 = the root; enter opens its detail.
+	if r, ok := m.activityUnderCursor(); !ok || r.ID != "root-1" {
+		t.Fatalf("cursor 0 should select root-1, got %+v ok=%v", r, ok)
+	}
+	// Cursor 1 = the first delegate; the cursor walks into the tree, and enter
+	// opens that delegate's detail (its request/result), not the root's.
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = next.(Model)
+	if r, ok := m.activityUnderCursor(); !ok || r.ID != "c1" {
+		t.Fatalf("cursor 1 should select delegate c1, got %+v ok=%v", r, ok)
 	}
 	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = next.(Model)
-	if m.mode != modeJobDetail || m.activeJob.ID != "root-1" {
-		t.Fatalf("enter should open the root's job detail, mode=%v job=%q", m.mode, m.activeJob.ID)
+	if m.mode != modeJobDetail || m.activeJob.ID != "c1" {
+		t.Fatalf("enter on a delegate should open ITS detail, mode=%v job=%q", m.mode, m.activeJob.ID)
 	}
 	_ = cmd
 }

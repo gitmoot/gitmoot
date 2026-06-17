@@ -373,8 +373,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(cmds...)
 			}
 			if r, ok := m.activityUnderCursor(); ok {
-				// Open the root coordinator's job detail (full request + tree).
-				cmd := m.openJobDetail(JobRow{ID: r.JobID, Agent: r.Agent, Type: r.Action, State: r.State})
+				// Open the selected job's detail — a root coordinator (full request
+				// + delegation tree) or a delegate (the prompt it received + result).
+				cmd := m.openJobDetail(r)
 				m.viewport.SetContent(m.content())
 				return m, cmd
 			}
@@ -837,7 +838,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clampPromptCursor()
 			m.clampTrainCursor()
 			m.clampJobCursor()
-			m.activityCursor = clampCursor(m.activityCursor, len(m.snap.Activity))
+			m.activityCursor = clampCursor(m.activityCursor, len(m.activitySelectable()))
 			m.agentCursor = clampCursor(m.agentCursor, len(m.visibleAgents()))
 			m.sessionCursor = clampCursor(m.sessionCursor, len(m.sessionRows()))
 			m.configCursor = clampCursor(m.configCursor, len(m.configEditableFields()))
@@ -964,7 +965,7 @@ func (m *Model) pageCursor() (*int, int) {
 	case pageAttention:
 		return &m.promptCursor, selectableCount(m.attentionVisibleRows())
 	case pageActivity:
-		return &m.activityCursor, len(m.snap.Activity)
+		return &m.activityCursor, len(m.activitySelectable())
 	case pageTrains:
 		return &m.trainCursor, selectableCount(m.trainVisibleRows())
 	case pageAgents:
