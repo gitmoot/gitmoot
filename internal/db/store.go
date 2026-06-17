@@ -452,6 +452,16 @@ func configureWritableSQLite(ctx context.Context, db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, `PRAGMA journal_mode=WAL`); err != nil {
 		return fmt.Errorf("configure sqlite WAL: %w", err)
 	}
+	// synchronous=NORMAL is the WAL-recommended setting: it fsyncs only at WAL
+	// checkpoints instead of on every commit (the FULL default), making the
+	// per-item generation commits cheap. The bounded tradeoff is that a power
+	// loss can lose at most the last in-flight commit (regenerated on resume);
+	// WAL still guarantees the database is never corrupted. The
+	// wal_autocheckpoint default (1000 pages) is left in place so long-lived
+	// read connections do not let the WAL grow unbounded.
+	if _, err := db.ExecContext(ctx, `PRAGMA synchronous=NORMAL`); err != nil {
+		return fmt.Errorf("configure sqlite synchronous: %w", err)
+	}
 	return nil
 }
 

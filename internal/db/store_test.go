@@ -98,6 +98,33 @@ func TestOpenConfiguresSQLiteContentionPragmas(t *testing.T) {
 	}
 }
 
+func TestOpenConfiguresSynchronousNormal(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	// synchronous=NORMAL reads back as 1 on the writable connection.
+	var synchronous int
+	if err := store.db.QueryRowContext(context.Background(), `PRAGMA synchronous`).Scan(&synchronous); err != nil {
+		t.Fatalf("PRAGMA synchronous returned error: %v", err)
+	}
+	if synchronous != 1 {
+		t.Fatalf("synchronous = %d, want 1 (NORMAL)", synchronous)
+	}
+
+	// wal_autocheckpoint stays at the sane SQLite default so long-lived read
+	// connections do not let the WAL grow unbounded.
+	var autocheckpoint int
+	if err := store.db.QueryRowContext(context.Background(), `PRAGMA wal_autocheckpoint`).Scan(&autocheckpoint); err != nil {
+		t.Fatalf("PRAGMA wal_autocheckpoint returned error: %v", err)
+	}
+	if autocheckpoint <= 0 {
+		t.Fatalf("wal_autocheckpoint = %d, want a positive default", autocheckpoint)
+	}
+}
+
 func TestInteractivePromptStorageAndAnswerValidation(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
