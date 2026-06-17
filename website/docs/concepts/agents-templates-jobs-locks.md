@@ -34,6 +34,17 @@ draft from visible context; `agent template add` installs the reviewed snapshot.
 Jobs are units of routed work. They can come from PR comments, local
 `agent ask`, task runs, retries, or merge actions.
 
+## Delegations
+
+An agent's result can return a validated `delegations[]` DAG, and Gitmoot
+dispatches each entry as a child job. Dependency-free delegations run in
+parallel, and once every top-level delegation is terminal Gitmoot enqueues a
+single coordinator continuation job back to the delegating agent to synthesize
+the results. Delegation trees are bounded by a depth cap, a per-root job budget,
+and loop detection, so offending delegations are dropped rather than retried
+forever. See the [Result Contract](../reference/result-contract.md) for the full
+field reference.
+
 ## Locks
 
 Gitmoot uses separate locks for separate resources:

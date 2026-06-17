@@ -11,7 +11,8 @@ hosted control plane in the current beta.
 ## What Gitmoot Is For
 
 - Route PR comments to named local agents.
-- Keep Codex, Claude Code, shell, and future runtimes behind one agent model.
+- Keep Codex, Claude Code, Kimi Code, shell, and future runtimes behind one
+  agent model.
 - Start or subscribe agents with explicit repo access and capabilities.
 - Use agent templates for reusable planner, review, or custom prompt agents.
 - Capture a successful current chat as a reviewed, reusable agent template
@@ -35,6 +36,7 @@ flowchart TD
   Daemon --> Runtime[Runtime adapter]
   Runtime --> Codex[Codex]
   Runtime --> Claude[Claude Code]
+  Runtime --> Kimi[Kimi Code]
   Runtime --> Shell[Shell]
   Daemon --> GitHub[GitHub issues and PRs]
   CLI --> SkillOpt[SkillOpt train workflow]
