@@ -60,7 +60,7 @@ func loadedModel(t *testing.T) Model {
 func TestPagesRenderExpectedContent(t *testing.T) {
 	m := loadedModel(t)
 	// Page order: Attention, Trains, Agents, Sessions, Jobs, Locks, Health, Config.
-	wants := []string{"needs attention", "train-s1", "planner", "skillopt-generator", "failed", "branch locks", "environment", "edit in $EDITOR"}
+	wants := []string{"Prompts (1)", "train-s1", "planner", "skillopt-generator", "failed", "branch locks", "environment", "edit in $EDITOR"}
 	for i, want := range wants {
 		if i > 0 {
 			next, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})

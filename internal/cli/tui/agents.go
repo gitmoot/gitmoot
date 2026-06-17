@@ -549,15 +549,28 @@ func (m Model) agentsContentInteractive() string {
 		return b.String()
 	}
 	var b strings.Builder
-	rows := [][]string{{"", "NAME", "RUNTIME", "ROLE", "HEALTH"}}
-	for i, a := range visible {
-		cursor, name := "  ", a.Name
-		if i == m.agentCursor {
-			cursor, name = "▸ ", selectedRowStyle.Render(a.Name)
+	// Group the visible agents by template for display only. The cursor still
+	// indexes visibleAgents() in its original order (agentUnderCursor and the
+	// shared pageCursor movement both rely on that), so each agent carries its
+	// original visible index and the cursor highlight is matched against that —
+	// regrouping the rows never shifts which agent the cursor selects.
+	for gi, g := range groupAgentsByTemplate(visible) {
+		if gi > 0 {
+			b.WriteByte('\n')
 		}
-		rows = append(rows, []string{cursor, name, a.Runtime, dash(a.Role), dash(a.Health)})
+		b.WriteString(headerStyle.Render(agentGroupLabel(g.templateID)))
+		b.WriteByte('\n')
+		rows := [][]string{{"", "NAME", "RUNTIME", "ROLE", "HEALTH"}}
+		for _, it := range g.agents {
+			a := it.agent
+			cursor, name := "  ", a.Name
+			if it.index == m.agentCursor {
+				cursor, name = "▸ ", selectedRowStyle.Render(a.Name)
+			}
+			rows = append(rows, []string{cursor, name, a.Runtime, dash(a.Role), dash(a.Health)})
+		}
+		b.WriteString(renderRows(rows))
 	}
-	b.WriteString(renderRows(rows))
 	if m.agentErr != "" {
 		b.WriteString("\n" + errorStyle.Render(m.agentErr) + "\n")
 	}
@@ -571,6 +584,48 @@ func (m Model) agentsContentInteractive() string {
 	b.WriteString(mutedStyle.Render("enter detail  n new  o optimize  D delete"))
 	b.WriteByte('\n')
 	return b.String()
+}
+
+// agentGroupLabel is the section header for a template group; agents without a
+// template share the "(no template)" group.
+func agentGroupLabel(templateID string) string {
+	if strings.TrimSpace(templateID) == "" {
+		return "(no template)"
+	}
+	return templateID
+}
+
+// indexedAgent pairs a visible agent with its index in visibleAgents(), so the
+// grouped display can still match the (unreordered) agentCursor.
+type indexedAgent struct {
+	index int
+	agent Agent
+}
+
+// agentGroup is a template's agents in their original visible order.
+type agentGroup struct {
+	templateID string
+	agents     []indexedAgent
+}
+
+// groupAgentsByTemplate buckets visible agents by TemplateID for display.
+// Groups appear in first-appearance order and agents keep their visible order
+// within each group, so the flat selectable ordering is preserved — only the
+// rendering is regrouped. Each agent carries its original visible index for the
+// cursor match.
+func groupAgentsByTemplate(visible []Agent) []agentGroup {
+	groups := []agentGroup{}
+	at := map[string]int{} // templateID → index into groups
+	for i, a := range visible {
+		pos, ok := at[a.TemplateID]
+		if !ok {
+			pos = len(groups)
+			at[a.TemplateID] = pos
+			groups = append(groups, agentGroup{templateID: a.TemplateID})
+		}
+		groups[pos].agents = append(groups[pos].agents, indexedAgent{index: i, agent: a})
+	}
+	return groups
 }
 
 func (m Model) agentDetailView() string {

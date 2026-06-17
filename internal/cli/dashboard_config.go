@@ -19,6 +19,13 @@ import (
 func buildDashboardConfigView(paths config.Paths, daemon dashboardDaemonDetail) tui.ConfigView {
 	view := tui.ConfigView{Path: paths.ConfigFile}
 
+	// Sections are appended in domain order so the page reads top-to-bottom as
+	// System (paths) → Agents (agent types) → Sessions (parallel sessions) →
+	// Feedback → Daemon. The first-row keys "paths"/"agent types"/"feedback"
+	// stay verbatim because the TUI render tests pin them; the parallel-sessions
+	// title is enriched to name its domain.
+
+	// System: filesystem paths.
 	view.Sections = append(view.Sections, tui.ConfigSection{
 		Title: "paths",
 		Rows: [][]string{
@@ -28,6 +35,7 @@ func buildDashboardConfigView(paths config.Paths, daemon dashboardDaemonDetail) 
 		},
 	})
 
+	// Agents: managed agent types.
 	if types, err := config.LoadAgentTypes(paths); err == nil && len(types) > 0 {
 		names := make([]string, 0, len(types))
 		for name := range types {
@@ -57,18 +65,32 @@ func buildDashboardConfigView(paths config.Paths, daemon dashboardDaemonDetail) 
 		view.Sections = append(view.Sections, tui.ConfigSection{Title: "agent types", Rows: rows, Editable: editable})
 	}
 
+	// Sessions: parallel-session policy. The scalar fields are inline-editable,
+	// mirroring feedback.repo / the agent timeouts; same_session and merge_back
+	// are short enums (ConfigText) and max_temp_sessions_per_agent is an int.
+	// eligible_actions is a string array: its editable Value is the bracketed
+	// TOML literal so configScalarForKind round-trips it back as a list and the
+	// re-parse in SetConfigScalar keeps accepting it.
 	if policy, err := config.LoadParallelSessionPolicy(paths); err == nil {
+		eligibleLiteral := configStringArrayLiteral(policy.EligibleActions)
 		view.Sections = append(view.Sections, tui.ConfigSection{
-			Title: "parallel sessions",
+			Title: "parallel sessions (session policy)",
 			Rows: [][]string{
 				{"same_session", policy.SameSession},
 				{"merge_back", policy.MergeBack},
 				{"max_temp_sessions_per_agent", strconv.Itoa(policy.MaxTempSessionsPerAgent)},
 				{"eligible_actions", strings.Join(policy.EligibleActions, ", ")},
 			},
+			Editable: []tui.ConfigField{
+				{Label: "parallel_sessions · same_session", KeyPath: []string{"parallel_sessions", "same_session"}, Kind: tui.ConfigText, Value: policy.SameSession},
+				{Label: "parallel_sessions · merge_back", KeyPath: []string{"parallel_sessions", "merge_back"}, Kind: tui.ConfigText, Value: policy.MergeBack},
+				{Label: "parallel_sessions · max_temp_sessions_per_agent", KeyPath: []string{"parallel_sessions", "max_temp_sessions_per_agent"}, Kind: tui.ConfigInt, Value: strconv.Itoa(policy.MaxTempSessionsPerAgent)},
+				{Label: "parallel_sessions · eligible_actions", KeyPath: []string{"parallel_sessions", "eligible_actions"}, Kind: tui.ConfigText, Value: eligibleLiteral},
+			},
 		})
 	}
 
+	// Feedback: default feedback repo.
 	if repo, err := config.LoadDefaultFeedbackRepo(paths); err == nil && strings.TrimSpace(repo) != "" {
 		view.Sections = append(view.Sections, tui.ConfigSection{
 			Title: "feedback",
@@ -79,6 +101,7 @@ func buildDashboardConfigView(paths config.Paths, daemon dashboardDaemonDetail) 
 		})
 	}
 
+	// Daemon: persisted daemon launch state.
 	daemonRows := [][]string{}
 	if len(daemon.Flags) > 0 {
 		daemonRows = append(daemonRows, []string{"flags", strings.Join(daemon.Flags, " ")})
@@ -96,13 +119,61 @@ func buildDashboardConfigView(paths config.Paths, daemon dashboardDaemonDetail) 
 // configScalarForKind types the value for the writer from the field's own
 // classification (the single source of truth), so a new int field cannot be
 // mis-written as a string. Durations and repos are stored as TOML strings.
+//
+// ConfigText covers both plain strings (repo, the session enums) and the
+// eligible_actions array. The TUI's edit overlay only carries a kind, not the
+// target's TOML shape, so a bracketed value ("[\"ask\", \"review\"]") is the
+// signal to write a string list; everything else is a plain string. None of the
+// scalar ConfigText values (owner/repo, queue/fork_temp_session, off/summary)
+// is ever bracketed, so this can't misclassify them.
 func configScalarForKind(kind tui.ConfigKind, value string) config.ConfigScalar {
 	if kind == tui.ConfigInt {
 		if n, err := strconv.Atoi(value); err == nil {
 			return config.IntScalar(n)
 		}
 	}
+	if items, ok := parseConfigStringArrayLiteral(value); ok {
+		return config.StringListScalar(items)
+	}
 	return config.StringScalar(value)
+}
+
+// configStringArrayLiteral renders a string slice as the bracketed TOML literal
+// the eligible_actions editor prefills (and round-trips back through
+// configScalarForKind). Empty slice → "[]".
+func configStringArrayLiteral(items []string) string {
+	quoted := make([]string, 0, len(items))
+	for _, item := range items {
+		quoted = append(quoted, strconv.Quote(item))
+	}
+	return "[" + strings.Join(quoted, ", ") + "]"
+}
+
+// parseConfigStringArrayLiteral parses a bracketed, comma-separated list of
+// (optionally quoted) items, e.g. `["ask", "review"]` or `[ask, review]`. It
+// returns ok=false for any value that is not bracketed, so plain ConfigText
+// scalars fall through to a string write unchanged.
+func parseConfigStringArrayLiteral(value string) ([]string, bool) {
+	trimmed := strings.TrimSpace(value)
+	if !strings.HasPrefix(trimmed, "[") || !strings.HasSuffix(trimmed, "]") {
+		return nil, false
+	}
+	inner := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+	if inner == "" {
+		return []string{}, true
+	}
+	items := make([]string, 0)
+	for _, part := range strings.Split(inner, ",") {
+		part = strings.TrimSpace(part)
+		if unquoted, err := strconv.Unquote(part); err == nil {
+			part = unquoted
+		}
+		part = strings.TrimSpace(part)
+		if part != "" {
+			items = append(items, part)
+		}
+	}
+	return items, true
 }
 
 func dashConfig(value string) string {

@@ -170,6 +170,112 @@ func TestAnswerDoubleSubmitSuppressed(t *testing.T) {
 	}
 }
 
+func TestAttentionGroupsUnderSectionHeaders(t *testing.T) {
+	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
+	snap := Snapshot{
+		Daemon:  Daemon{Running: true},
+		Prompts: []db.InteractivePrompt{choicePrompt(), textPrompt()},
+		JobRows: []JobRow{
+			{ID: "j1", Type: "review", State: "failed", LatestEvent: "boom went wrong"},
+			{ID: "j2", Type: "merge", State: "succeeded"}, // not reportable, must be skipped
+			{ID: "j3", Type: "build", State: "blocked", LatestEvent: "stuck on dep"},
+		},
+		ResourceLocks: []ResourceLock{
+			{Key: "skillopt-train:abc", Stale: true},
+			{Key: "live-lock", Stale: false},
+		},
+		BranchLocks: []BranchLock{{Repo: "gitmoot", Branch: "main", Owner: "alice"}},
+	}
+	m := attentionModel(t, deps, snap)
+	view := m.View()
+
+	// Section headers carry the count of items in that section.
+	if !strings.Contains(view, "Prompts (2)") {
+		t.Fatalf("expected Prompts (2) header:\n%s", view)
+	}
+	if !strings.Contains(view, "Blocked & failed jobs (2)") {
+		t.Fatalf("expected Blocked & failed jobs (2) header (succeeded job excluded):\n%s", view)
+	}
+	if !strings.Contains(view, "Stale locks (1)") {
+		t.Fatalf("expected Stale locks (1) header:\n%s", view)
+	}
+	if !strings.Contains(view, "Branch locks (1)") {
+		t.Fatalf("expected Branch locks (1) header:\n%s", view)
+	}
+
+	// The reportable jobs' LatestEvent is shown as the one-line 'why'.
+	if !strings.Contains(view, "boom went wrong") {
+		t.Fatalf("expected failed job's LatestEvent in view:\n%s", view)
+	}
+
+	// The succeeded job must not be listed, and the non-stale lock must not
+	// appear under Stale locks.
+	if strings.Contains(view, "j2") {
+		t.Fatalf("succeeded job j2 should not be listed:\n%s", view)
+	}
+	if strings.Contains(view, "live-lock") {
+		t.Fatalf("non-stale lock should not appear:\n%s", view)
+	}
+
+	// Sections render in order: Prompts, then jobs, then stale locks, then
+	// branch locks.
+	pi := strings.Index(view, "Prompts (2)")
+	ji := strings.Index(view, "Blocked & failed jobs (2)")
+	si := strings.Index(view, "Stale locks (1)")
+	bi := strings.Index(view, "Branch locks (1)")
+	if !(pi < ji && ji < si && si < bi) {
+		t.Fatalf("sections out of order: prompts=%d jobs=%d stale=%d branch=%d\n%s", pi, ji, si, bi, view)
+	}
+}
+
+func TestAttentionHeadersDoNotShiftCursor(t *testing.T) {
+	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
+	snap := Snapshot{
+		Daemon:  Daemon{Running: true},
+		Prompts: []db.InteractivePrompt{choicePrompt(), textPrompt()},
+		JobRows: []JobRow{{ID: "j1", Type: "review", State: "failed"}},
+	}
+	m := attentionModel(t, deps, snap)
+
+	// Cursor starts on the first prompt (index 0); 'a' answers it.
+	if _, ok := m.attentionPrompt(); !ok {
+		t.Fatalf("cursor 0 should select the first prompt")
+	}
+
+	// Move down twice: index 1 is the second prompt, index 2 is the failed job.
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = next.(Model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = next.(Model)
+	if m.promptCursor != 2 {
+		t.Fatalf("cursor should be at the job (index 2), got %d", m.promptCursor)
+	}
+	job, ok := m.jobUnderCursor()
+	if !ok || job.ID != "j1" {
+		t.Fatalf("section headers must not shift cursor; expected job j1 under cursor, got ok=%v job=%+v", ok, job)
+	}
+	if _, ok := m.attentionPrompt(); ok {
+		t.Fatalf("a job row must not resolve to a prompt")
+	}
+}
+
+func TestAttentionLocksOnlyNoNeedsAttentionItems(t *testing.T) {
+	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
+	snap := Snapshot{
+		Daemon:        Daemon{Running: true},
+		ResourceLocks: []ResourceLock{{Key: "skillopt-train:abc", Stale: true}},
+	}
+	m := attentionModel(t, deps, snap)
+	view := m.View()
+	if !strings.Contains(view, "Stale locks (1)") {
+		t.Fatalf("expected Stale locks (1) header:\n%s", view)
+	}
+	// With no prompts or jobs, the "none" placeholder is shown.
+	if !strings.Contains(view, "none") {
+		t.Fatalf("expected 'none' placeholder when no prompts/jobs:\n%s", view)
+	}
+}
+
 func TestAttentionCursorClampedOnRefresh(t *testing.T) {
 	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
 	m := attentionModel(t, deps, promptSnap(choicePrompt(), textPrompt()))

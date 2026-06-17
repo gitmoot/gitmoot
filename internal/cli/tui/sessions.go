@@ -49,7 +49,7 @@ func (m Model) sessionRows() []sessionRow {
 	}
 	for _, s := range singles {
 		rows = append(rows, sessionRow{
-			label:   fmt.Sprintf("%s [%s] %s %s", s.Name, s.Runtime, dash(s.Repo), s.State),
+			label:   fmt.Sprintf("%s (%s) [%s] %s %s", s.Name, dash(s.Type), s.Runtime, dash(s.Repo), s.State),
 			session: s,
 			count:   1,
 		})
@@ -151,8 +151,12 @@ func (m *Model) openSessionDetail() {
 
 func (m Model) sessionsContent() string {
 	var b strings.Builder
-	b.WriteString(mutedStyle.Render("The live codex/claude/kimi processes backing your Agents — one warm session per delivered job (up to max_background); idle ones expire on their own."))
-	b.WriteString("\n\n")
+	// Kept as short lines so the key phrases survive viewport wrapping.
+	b.WriteString(mutedStyle.Render("Live runtime processes (codex/claude/kimi) that execute jobs for your agents.") + "\n")
+	b.WriteString(mutedStyle.Render("Each row shows its owning agent type.") + "\n")
+	b.WriteString(mutedStyle.Render("Stopping one frees the warm process; it does NOT cancel a running job.") + "\n")
+	b.WriteString(mutedStyle.Render("Idle sessions expire on their own.") + "\n")
+	b.WriteString("\n")
 	rows := m.sessionRows()
 	if len(rows) == 0 {
 		b.WriteString(m.loadingOr("No runtime sessions.", !m.loadedAt.IsZero()))

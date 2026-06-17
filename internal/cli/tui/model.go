@@ -35,7 +35,7 @@ var pages = []struct {
 	{pageAttention, "Attention", "Attention"},
 	{pageTrains, "Trains", "Trains"},
 	{pageAgents, "Agents", "Agents"},
-	{pageSessions, "Sessions", "Runtime sessions"},
+	{pageSessions, "Workers", "Runtime workers (agent sessions)"},
 	{pageJobs, "Jobs", "Jobs"},
 	{pageLocks, "Locks", "Locks"},
 	{pageHealth, "Health", "Health"},

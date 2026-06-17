@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -178,8 +179,13 @@ func answerCmd(deps Deps, id, value string) tea.Cmd {
 	}
 }
 
-// attentionContent renders the Attention page: pending prompts (selectable),
-// then blocked/failed/cancelled jobs, stale resource locks, and branch locks.
+// attentionContent renders the Attention page. The daemon-down and
+// required-health-failed banners are pinned at the top, then the actionable
+// items are grouped under display-only section headers — "Prompts" (selectable),
+// "Blocked & failed jobs" (selectable) — followed by "Stale locks" and
+// "Branch locks". Section headers carry no cursor index: the selectable items
+// (prompts then reportable jobs) keep the exact flat ordering and indices of
+// attentionItems(), which m.promptCursor indexes into.
 func (m Model) attentionContent() string {
 	switch m.mode {
 	case modeAnswerChoice, modeAnswerText:
@@ -210,31 +216,62 @@ func (m Model) attentionContent() string {
 		wrote = true
 	}
 
+	// items is the flat, ordered selectable slice (prompts first, then
+	// reportable jobs). i is the global cursor index for every selectable row;
+	// section headers are display-only and never advance it.
 	items := m.attentionItems()
-	b.WriteString(headerStyle.Render("needs attention"))
-	b.WriteByte('\n')
+	renderRow := func(i int, item attnItem) {
+		cursor := "  "
+		var line string
+		switch {
+		case item.prompt != nil:
+			line = "prompt " + item.prompt.ID + "  " + truncate(item.prompt.Question, 56)
+		case item.job != nil:
+			line = "job " + item.job.ID + "  " + item.job.Type + "  " + jobStateColor(item.job.State)
+			if item.job.LatestEvent != "" {
+				line += "  " + mutedStyle.Render(truncate(item.job.LatestEvent, 48))
+			}
+		}
+		if i == m.promptCursor {
+			cursor = "▸ "
+			line = selectedRowStyle.Render("• ") + line
+		}
+		b.WriteString(cursor + line + "\n")
+	}
+
+	wrotePrompts := false
+	for i, item := range items {
+		if item.prompt == nil {
+			continue
+		}
+		if !wrotePrompts {
+			b.WriteString(headerStyle.Render("Prompts ("+strconv.Itoa(countPrompts(items))+")") + "\n")
+			wrotePrompts = true
+		}
+		renderRow(i, item)
+	}
+
+	wroteJobs := false
+	for i, item := range items {
+		if item.job == nil {
+			continue
+		}
+		if !wroteJobs {
+			if wrotePrompts {
+				b.WriteByte('\n')
+			}
+			b.WriteString(redStyle.Render("Blocked & failed jobs ("+strconv.Itoa(len(items)-countPrompts(items))+")") + "\n")
+			wroteJobs = true
+		}
+		renderRow(i, item)
+	}
+
 	if len(items) == 0 {
+		b.WriteString(headerStyle.Render("needs attention"))
+		b.WriteByte('\n')
 		b.WriteString(mutedStyle.Render("none"))
 		b.WriteByte('\n')
 	} else {
-		for i, item := range items {
-			cursor := "  "
-			var line string
-			switch {
-			case item.prompt != nil:
-				line = "prompt " + item.prompt.ID + "  " + truncate(item.prompt.Question, 56)
-			case item.job != nil:
-				line = "job " + item.job.ID + "  " + item.job.Type + "  " + jobStateColor(item.job.State)
-				if item.job.LatestEvent != "" {
-					line += "  " + mutedStyle.Render(truncate(item.job.LatestEvent, 48))
-				}
-			}
-			if i == m.promptCursor {
-				cursor = "▸ "
-				line = selectedRowStyle.Render("• ") + line
-			}
-			b.WriteString(cursor + line + "\n")
-		}
 		// Attention only lists reportable terminal jobs, so cancel never applies here.
 		help := "prompts: a answer · d dismiss   jobs: enter detail · R retry"
 		if job, ok := m.jobUnderCursor(); ok && jobReportable(job.State) {
@@ -252,7 +289,7 @@ func (m Model) attentionContent() string {
 	stale := staleLocks(m.snap.ResourceLocks)
 	if len(stale) > 0 {
 		b.WriteString("\n")
-		b.WriteString(headerStyle.Render("stale locks"))
+		b.WriteString(redStyle.Render("Stale locks (" + strconv.Itoa(len(stale)) + ")"))
 		b.WriteByte('\n')
 		for _, l := range stale {
 			b.WriteString(redStyle.Render(l.Key))
@@ -263,7 +300,7 @@ func (m Model) attentionContent() string {
 
 	if len(m.snap.BranchLocks) > 0 {
 		b.WriteString("\n")
-		b.WriteString(headerStyle.Render("branch locks"))
+		b.WriteString(headerStyle.Render("Branch locks (" + strconv.Itoa(len(m.snap.BranchLocks)) + ")"))
 		b.WriteByte('\n')
 		for _, l := range m.snap.BranchLocks {
 			b.WriteString(l.Repo + " " + l.Branch + " (" + dash(l.Owner) + ")")
@@ -276,6 +313,17 @@ func (m Model) attentionContent() string {
 		return "Nothing needs attention."
 	}
 	return b.String()
+}
+
+// countPrompts returns how many leading selectable rows are prompts.
+func countPrompts(items []attnItem) int {
+	n := 0
+	for _, item := range items {
+		if item.prompt != nil {
+			n++
+		}
+	}
+	return n
 }
 
 func (m Model) answerOverlay() string {

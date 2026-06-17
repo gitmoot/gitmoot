@@ -183,3 +183,126 @@ func TestTrainCursorClampedOnRefresh(t *testing.T) {
 		t.Fatalf("train cursor should clamp to 0, got %d", m.trainCursor)
 	}
 }
+
+func TestTrainStatusCategory(t *testing.T) {
+	cases := map[string]int{
+		"request_confirmed":                trainCatActive,
+		"items_ready":                      trainCatActive,
+		"optimizer_completed":              trainCatActive,
+		"generating_options":               trainCatActive,
+		"optimizer_running":                trainCatActive,
+		"preflight_running":                trainCatActive,
+		"recovery_available":               trainCatActive,
+		"blocked_stale_lock":               trainCatBlocked,
+		"failed_unrecoverable":             trainCatBlocked,
+		"blocked_config":                   trainCatBlocked,
+		"optimizer_heartbeat_stale":        trainCatBlocked,
+		"candidate_promoted":               trainCatDone,
+		"candidate_rejected":               trainCatDone,
+		"run_abandoned":                    trainCatDone,
+		"optimizer_completed_no_candidate": trainCatDone,
+	}
+	for phase, want := range cases {
+		if got := trainStatusCategory(phase); got != want {
+			t.Errorf("trainStatusCategory(%q) = %d, want %d", phase, got, want)
+		}
+	}
+}
+
+func TestTrainLineageBase(t *testing.T) {
+	cases := []struct {
+		id       string
+		wantBase string
+		wantHas  bool
+	}{
+		{"officeqa-treasury-skillopt-v1", "officeqa-treasury-skillopt", true},
+		{"officeqa-treasury-skillopt-v8", "officeqa-treasury-skillopt", true},
+		{"run-12", "run", true},
+		{"plain-name", "plain-name", false},
+		{"train-aaa", "train-aaa", false},
+	}
+	for _, c := range cases {
+		base, has := trainLineageBase(c.id)
+		if base != c.wantBase || has != c.wantHas {
+			t.Errorf("trainLineageBase(%q) = (%q,%v), want (%q,%v)", c.id, base, has, c.wantBase, c.wantHas)
+		}
+	}
+}
+
+// TestTrainsListGroupsAndCollapses renders a mixed list and asserts the section
+// headers, the collapsed lineage parent line, and that flat sessions stay flat.
+func TestTrainsListGroupsAndCollapses(t *testing.T) {
+	snap := Snapshot{
+		Daemon: Daemon{Running: true},
+		Trains: []TrainSession{
+			{ID: "skillopt-v1", Phase: "items_ready", Repo: "o/r"},      // 0 Active, lineage
+			{ID: "lonely", Phase: "generating_options", Repo: "o/r"},    // 1 Active, flat
+			{ID: "skillopt-v2", Phase: "review_published", Repo: "o/r"}, // 2 Active, lineage
+			{ID: "stalled", Phase: "blocked_stale_lock", Repo: "o/r"},   // 3 Blocked
+			{ID: "gone", Phase: "run_abandoned", Repo: "o/r"},           // 4 Done
+		},
+	}
+	deps := Deps{Load: func() (Snapshot, error) { return snap, nil }}
+	m := sizedModel(deps)
+	next, _ := m.Update(snapshotMsg{snap: snap, at: time.Unix(1, 0)})
+	m = next.(Model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab}) // Attention → Trains
+	m = next.(Model)
+	if pages[m.selected].page != pageTrains {
+		t.Fatalf("expected Trains page")
+	}
+	view := m.View()
+	for _, want := range []string{"Active", "Blocked", "Done"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("expected section header %q:\n%s", want, view)
+		}
+	}
+	// Two skillopt-v* sessions collapse under one lineage parent line.
+	if !strings.Contains(view, "skillopt  ") || !strings.Contains(view, "×2") {
+		t.Fatalf("expected collapsed lineage parent 'skillopt ×2':\n%s", view)
+	}
+	// All individual session ids still render (children + flat rows).
+	for _, id := range []string{"skillopt-v1", "skillopt-v2", "lonely", "stalled", "gone"} {
+		if !strings.Contains(view, id) {
+			t.Fatalf("expected session %q in view:\n%s", id, view)
+		}
+	}
+	// Sections render in order: Active before Blocked before Done.
+	ai, bi, di := strings.Index(view, "Active"), strings.Index(view, "Blocked"), strings.Index(view, "Done")
+	if !(ai < bi && bi < di) {
+		t.Fatalf("sections out of order: Active=%d Blocked=%d Done=%d\n%s", ai, bi, di, view)
+	}
+}
+
+// TestTrainCursorSelectsSessionDespiteGrouping proves the cursor still indexes
+// into snap.Trains regardless of the grouped/collapsed visual layout: a session
+// that sorts late visually (Done) but sits at an early snap index is reachable
+// by its index, and the action overlay opens for the right session.
+func TestTrainCursorSelectsSessionDespiteGrouping(t *testing.T) {
+	snap := Snapshot{
+		Daemon: Daemon{Running: true},
+		Trains: []TrainSession{
+			{ID: "done-early", Phase: "run_abandoned", Repo: "o/r"}, // idx 0 → Done section
+			{ID: "live-late", Phase: "items_ready", Repo: "o/r"},    // idx 1 → Active section
+		},
+	}
+	deps := Deps{Load: func() (Snapshot, error) { return snap, nil }}
+	m := sizedModel(deps)
+	next, _ := m.Update(snapshotMsg{snap: snap, at: time.Unix(1, 0)})
+	m = next.(Model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = next.(Model)
+	// Cursor 0 selects snap.Trains[0] = done-early, even though it renders last.
+	if got, _ := m.trainUnderCursor(); got.ID != "done-early" {
+		t.Fatalf("cursor 0 should select snap index 0 (done-early), got %q", got.ID)
+	}
+	// Down moves to snap index 1 = live-late.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = next.(Model)
+	if m.trainCursor != 1 {
+		t.Fatalf("down should move cursor to 1, got %d", m.trainCursor)
+	}
+	if got, _ := m.trainUnderCursor(); got.ID != "live-late" {
+		t.Fatalf("cursor 1 should select snap index 1 (live-late), got %q", got.ID)
+	}
+}

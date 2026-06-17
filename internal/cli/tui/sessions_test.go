@@ -39,6 +39,28 @@ func sessionDetailSnapshot() Snapshot {
 	}
 }
 
+func TestSessionsIntroExplainsRuntimeProcesses(t *testing.T) {
+	m := sessionsPageModel(t, sessionDetailSnapshot())
+	view := m.View()
+	// The intro must plainly frame sessions as live runtime processes that run
+	// jobs for agents, and that stopping one frees the process (not a job).
+	for _, want := range []string{"runtime processes", "execute jobs for your agents", "does NOT cancel a running job"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("sessions intro missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestSessionRowShowsOwningAgentType(t *testing.T) {
+	m := sessionsPageModel(t, sessionDetailSnapshot())
+	view := m.View()
+	// The single "planner" session row must surface its owning agent type so a
+	// name like "planner" reads as belonging to the "planner" type.
+	if !strings.Contains(view, "planner (planner)") {
+		t.Fatalf("session row should show the owning agent type:\n%s", view)
+	}
+}
+
 func TestSessionDetailRendersInstanceFields(t *testing.T) {
 	m := sessionsPageModel(t, sessionDetailSnapshot())
 	// The grouped bg rows sort first, then the single "planner". Move to it.

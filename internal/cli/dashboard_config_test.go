@@ -28,6 +28,12 @@ max_background = 4
 idle_timeout = "10m"
 job_timeout = "45m"
 
+[parallel_sessions]
+same_session = "fork_temp_session"
+merge_back = "summary"
+max_temp_sessions_per_agent = 4
+eligible_actions = ["ask", "review", "implement"]
+
 [feedback]
 repo = "owner/feedback"
 `
@@ -54,6 +60,15 @@ func sectionByTitle(view tui.ConfigView, title string) (tui.ConfigSection, bool)
 	return tui.ConfigSection{}, false
 }
 
+func editableByLabel(section tui.ConfigSection, label string) (tui.ConfigField, bool) {
+	for _, f := range section.Editable {
+		if f.Label == label {
+			return f, true
+		}
+	}
+	return tui.ConfigField{}, false
+}
+
 func TestBuildDashboardConfigView(t *testing.T) {
 	paths := writeConfig(t, sampleConfigTOML)
 	view := buildDashboardConfigView(paths, dashboardDaemonDetail{Flags: []string{"--workers", "4"}, WorkDir: "/work"})
@@ -67,6 +82,38 @@ func TestBuildDashboardConfigView(t *testing.T) {
 	agents, ok := sectionByTitle(view, "agent types")
 	if !ok || len(agents.Rows) != 2 || agents.Rows[1][0] != "planner" {
 		t.Fatalf("agent types section wrong: %+v", agents)
+	}
+	// Sessions: the title carries its domain and the scalars are inline-editable.
+	sessions, ok := sectionByTitle(view, "parallel sessions (session policy)")
+	if !ok || len(sessions.Rows) != 4 {
+		t.Fatalf("parallel sessions section wrong: %+v", sessions)
+	}
+	wantEditable := map[string]tui.ConfigKind{
+		"parallel_sessions · same_session":                tui.ConfigText,
+		"parallel_sessions · merge_back":                  tui.ConfigText,
+		"parallel_sessions · max_temp_sessions_per_agent": tui.ConfigInt,
+		"parallel_sessions · eligible_actions":            tui.ConfigText,
+	}
+	if len(sessions.Editable) != len(wantEditable) {
+		t.Fatalf("parallel sessions editable count = %d, want %d: %+v", len(sessions.Editable), len(wantEditable), sessions.Editable)
+	}
+	for _, f := range sessions.Editable {
+		kind, ok := wantEditable[f.Label]
+		if !ok {
+			t.Fatalf("unexpected editable field %q", f.Label)
+		}
+		if f.Kind != kind {
+			t.Fatalf("editable %q kind = %v, want %v", f.Label, f.Kind, kind)
+		}
+		if len(f.KeyPath) != 2 || f.KeyPath[0] != "parallel_sessions" {
+			t.Fatalf("editable %q keypath wrong: %v", f.Label, f.KeyPath)
+		}
+	}
+	// eligible_actions prefills the bracketed TOML literal so the writer can
+	// round-trip it back to a string array.
+	eligible, _ := editableByLabel(sessions, "parallel_sessions · eligible_actions")
+	if eligible.Value != `["ask", "review", "implement"]` {
+		t.Fatalf("eligible_actions value = %q", eligible.Value)
 	}
 	feedback, ok := sectionByTitle(view, "feedback")
 	if !ok || feedback.Rows[0][1] != "owner/feedback" {
@@ -114,6 +161,10 @@ func TestConfigScalarForKind(t *testing.T) {
 	intVal := configScalarForKind(tui.ConfigInt, "8")
 	strVal := configScalarForKind(tui.ConfigDuration, "15m")
 	repoVal := configScalarForKind(tui.ConfigText, "owner/x")
+	// A bracketed ConfigText value is written as a TOML string array, while a
+	// plain ConfigText scalar (the session enums) stays a string.
+	listVal := configScalarForKind(tui.ConfigText, `["ask", "review"]`)
+	sessionVal := configScalarForKind(tui.ConfigText, "queue")
 	// Apply each to a fixture and confirm the stored TOML type round-trips.
 	paths := writeConfig(t, sampleConfigTOML)
 	if err := config.SetConfigScalar(paths, []string{"agents", "planner", "max_background"}, intVal); err != nil {
@@ -125,11 +176,50 @@ func TestConfigScalarForKind(t *testing.T) {
 	if err := config.SetConfigScalar(paths, []string{"feedback", "repo"}, repoVal); err != nil {
 		t.Fatalf("repo write: %v", err)
 	}
+	if err := config.SetConfigScalar(paths, []string{"parallel_sessions", "eligible_actions"}, listVal); err != nil {
+		t.Fatalf("eligible_actions list write: %v", err)
+	}
+	if err := config.SetConfigScalar(paths, []string{"parallel_sessions", "same_session"}, sessionVal); err != nil {
+		t.Fatalf("same_session write: %v", err)
+	}
 	types, err := config.LoadAgentTypes(paths)
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	if types["planner"].MaxBackground != 8 || types["planner"].IdleTimeout != "15m" {
 		t.Fatalf("typed writes wrong: %+v", types["planner"])
+	}
+	policy, err := config.LoadParallelSessionPolicy(paths)
+	if err != nil {
+		t.Fatalf("reload policy: %v", err)
+	}
+	if strings.Join(policy.EligibleActions, ",") != "ask,review" {
+		t.Fatalf("eligible_actions list round-trip wrong: %+v", policy.EligibleActions)
+	}
+	if policy.SameSession != "queue" {
+		t.Fatalf("same_session scalar round-trip wrong: %q", policy.SameSession)
+	}
+}
+
+func TestParseConfigStringArrayLiteral(t *testing.T) {
+	cases := []struct {
+		in    string
+		items []string
+		ok    bool
+	}{
+		{`["ask", "review", "implement"]`, []string{"ask", "review", "implement"}, true},
+		{`[ask, review]`, []string{"ask", "review"}, true},
+		{`[]`, []string{}, true},
+		{"queue", nil, false},
+		{"owner/repo", nil, false},
+	}
+	for _, tc := range cases {
+		items, ok := parseConfigStringArrayLiteral(tc.in)
+		if ok != tc.ok {
+			t.Fatalf("%q: ok = %v, want %v", tc.in, ok, tc.ok)
+		}
+		if ok && strings.Join(items, ",") != strings.Join(tc.items, ",") {
+			t.Fatalf("%q: items = %v, want %v", tc.in, items, tc.items)
+		}
 	}
 }
