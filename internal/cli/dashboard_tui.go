@@ -674,12 +674,14 @@ func buildDashboardActivity(jobs []db.Job) []tui.ActivityRoot {
 			Total:             len(children),
 		}
 		for _, c := range children {
-			switch {
-			case activityJobActive(c.State):
+			switch c.State {
+			case "running":
 				root.Running++
-			case c.State == "blocked":
+			case "queued":
+				root.Queued++
+			case "blocked":
 				root.Blocked++
-			case c.State == "succeeded" || c.State == "failed" || c.State == "cancelled":
+			case "succeeded", "failed", "cancelled":
 				root.Done++
 			}
 		}

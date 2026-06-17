@@ -49,7 +49,8 @@ type ActivityRoot struct {
 	ContinuationID    string
 	ContinuationState string
 	Total             int // direct delegation children
-	Running           int // queued/running children
+	Running           int // children actively running
+	Queued            int // children waiting to start
 	Blocked           int
 	Done              int // terminal children (succeeded/failed/cancelled)
 }

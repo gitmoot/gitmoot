@@ -42,6 +42,7 @@ func (m Model) activityContent() string {
 			b.WriteString("    " + mutedStyle.Render(
 				strconv.Itoa(r.Total)+" delegations · "+
 					strconv.Itoa(r.Running)+" running · "+
+					strconv.Itoa(r.Queued)+" queued · "+
 					strconv.Itoa(r.Blocked)+" blocked · "+
 					strconv.Itoa(r.Done)+" done") + "\n")
 			for _, c := range r.Children {
