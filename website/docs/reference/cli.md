@@ -184,6 +184,27 @@ gitmoot agent start reviewer \
   --start-daemon
 ```
 
+`--runtime` accepts `codex`, `claude`, or `kimi`. Kimi Code is a first-class
+runtime adapter alongside Codex and Claude Code. Before starting a Kimi-backed
+agent, authenticate the Kimi CLI with `kimi login`, then restart the Gitmoot
+daemon so it inherits the logged-in session:
+
+```sh
+kimi login
+gitmoot daemon stop
+gitmoot daemon start --repo owner/repo
+gitmoot agent start reviewer \
+  --runtime kimi \
+  --repo owner/repo \
+  --path . \
+  --role reviewer \
+  --capability ask \
+  --capability review
+```
+
+A Kimi agent's runtime reference must be a Kimi session id (`session_<uuid>`)
+or empty; Gitmoot parses the session id from the Kimi CLI's stream-json output.
+
 Subscribe an existing runtime session:
 
 ```sh
@@ -418,6 +439,7 @@ gitmoot skillopt train start --template <id> --repo owner/repo --request <text> 
 gitmoot skillopt train status --session <id>
 gitmoot skillopt train run [--config path | --session <id>] [--plain]
 gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--dry-run] [--promote version|--reject version --reason text] [--start-next]
+gitmoot skillopt train recover --session <id> [--out-root path] [--json]
 gitmoot skillopt train stop --session <id> --reason <text>
 ```
 
@@ -440,6 +462,35 @@ context, and starts follow-up iterations only after a promoted/rejected/abandone
 decision. Use `skillopt review`, `feedback`, `export`, `import`, and
 `candidate` directly only for advanced debugging, custom research runs, or
 recovering one step of a train session.
+
+Option generation in `skillopt train continue` is durable and idempotent on
+resume. Each review item's artifacts, item row, and options commit in a single
+transaction the moment that item finishes, so an interrupted generation phase
+keeps every item that already completed instead of losing the whole batch.
+Re-running `skillopt train continue` regenerates only the incomplete items:
+completed items are skipped, no duplicate options are written, and finished work
+is never rewritten. If an item has some but not all of its options persisted,
+resume hard-errors with `item <id> has partial generated options; inspect or
+clear review options before continuing` so you can inspect or clear that item
+before retrying.
+
+`skillopt train recover` repairs the optimizer phase of a session — it
+re-imports or repairs the optimizer candidate package and classifies the
+iteration as `already_completed_candidate`, `already_completed_no_candidate`,
+`optimizer_active`, or `corrupted_unrecoverable`:
+
+```sh
+gitmoot skillopt train recover --session <id>
+gitmoot skillopt train recover --session <id> --out-root .gitmoot/skillopt/<run-id>
+gitmoot skillopt train recover --session <id> --json
+```
+
+`--out-root` overrides the optimizer output directory (it defaults to the
+session's persisted optimizer path), and `--json` prints the recovery result as
+JSON. Recovery scope is the optimizer phase only: it does not release the
+generation lock and does not rebuild generation options. To recover an
+interrupted generation phase, simply re-run `skillopt train continue`, which
+resumes the incomplete items as described above.
 
 `skillopt review create` starts a review run for a template and target repo.
 Use the default A/B shape for validation, or pass `--mode explore|refine|distill`

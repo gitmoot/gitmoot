@@ -105,6 +105,21 @@ To uninstall the CLI, remove the installed binary path returned by
 the runtime to stop finding Gitmoot guidance. Do not delete `~/.gitmoot` unless
 you intentionally want to remove local Gitmoot state, job history, and config.
 
+## Kimi Code Runtime
+
+To run agents on the Kimi Code runtime (`gitmoot agent start <name> --runtime
+kimi`), install the external `kimi` CLI, then authenticate so background jobs
+can reuse the session:
+
+```sh
+kimi login
+gitmoot update --restart-daemon
+```
+
+Restart the Gitmoot daemon after `kimi login` so it inherits the logged-in
+session. The Kimi runtime is a first-class adapter alongside Codex and Claude
+Code; it does not use the `gitmoot plugin install` discovery surface.
+
 ## SkillOpt Optimizer
 
 Gitmoot's SkillOpt train workflow invokes a separate Python optimizer only at

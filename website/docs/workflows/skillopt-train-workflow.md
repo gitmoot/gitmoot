@@ -374,6 +374,29 @@ Use `quality: poor` or `continue_mode: explore` when all options are weak and a
 stable winner should not narrow the search yet. Gitmoot keeps feedback parsing
 deterministic and stores imported events as canonical feedback for export.
 
+## Option Generation Durability
+
+Option generation is durable per item. As each review item finishes, its
+artifacts, item row, and options are committed together in one transaction, so
+finished work survives an interrupted run instead of being held until the whole
+generation phase completes.
+
+Resume is idempotent. Rerunning `gitmoot skillopt train continue` regenerates
+only the incomplete items: completed items are skipped, no duplicate options are
+created, and completed work is never rewritten. You can safely rerun `continue`
+after a crash, a kill, or a stopped run to finish only what is left.
+
+A partially generated item is a hard error rather than something Gitmoot
+silently repairs. If an item has some but not all of its options persisted,
+resume stops with:
+
+```text
+item <id> has partial generated options; inspect or clear review options before continuing
+```
+
+Inspect that item or clear its review options, then rerun `train continue` to
+regenerate it cleanly.
+
 ## Optimizer And Candidate Gate
 
 After feedback sync, `train continue` exports the training package, invokes the
@@ -572,10 +595,19 @@ instead of re-running blindly:
 gitmoot skillopt train recover --session planner-train --out-root .gitmoot/skillopt/planner-train
 ```
 
-Recovery validates the package state, imports a completed candidate through the
-normal candidate gate, or records `optimizer_completed_no_candidate` with the
-stored rejection reason. Incomplete or corrupted artifacts fail without
-modifying the train state.
+`train recover` accepts `--session <id>`, an optional `--out-root <path>`, and
+`--json`. Its scope is the optimizer phase only: it re-imports and repairs the
+optimizer candidate package and classifies the iteration as
+`already_completed_candidate`, `already_completed_no_candidate`,
+`optimizer_active`, or `corrupted_unrecoverable`. It re-imports a completed
+candidate through the normal candidate gate, or records
+`optimizer_completed_no_candidate` with the stored rejection reason. Incomplete
+or corrupted artifacts fail without modifying the train state.
+
+`train recover` does not touch option generation: it does not release the
+generation lock and does not rebuild generation options. To resume interrupted
+option generation, rerun `gitmoot skillopt train continue` (see
+[Option Generation Durability](#option-generation-durability)).
 
 ## Candidate Review And Next Iteration
 
@@ -729,7 +761,14 @@ Manual smoke scenarios for review operations:
   and next action options.
 - Optimizer wrapper failed after artifacts: if `status_phase` is
   `recovery_available`, run `gitmoot skillopt train recover --session <id>
-  --out-root <optimizer-output-root>`.
+  --out-root <optimizer-output-root>`. `train recover` repairs the optimizer
+  candidate package only; it does not release the generation lock or rebuild
+  generation options.
+- Interrupted option generation: rerun `gitmoot skillopt train continue
+  --session <id>`. It regenerates only incomplete items and never rewrites
+  completed work. If it reports that an item "has partial generated options",
+  inspect or clear that item's review options before continuing. Do not use
+  `train recover` for this; recover is optimizer-phase only.
 - Stale optimizer lock: if `status_phase` is `blocked_stale_lock`, inspect
   `active_lock` owner, pid, host, heartbeat, and expiry in verbose status before
   clearing stale state or retrying the optimizer.

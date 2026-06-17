@@ -1,8 +1,8 @@
 # Runtime Adapters
 
 Runtime adapters keep Gitmoot workflow logic independent from Codex, Claude
-Code, shell commands, and future runtimes. Gitmoot snapshots the agent template
-and rendered job prompt before handing work to an adapter.
+Code, Kimi Code, shell commands, and future runtimes. Gitmoot snapshots the
+agent template and rendered job prompt before handing work to an adapter.
 
 ## Current Runtimes
 
@@ -10,6 +10,12 @@ and rendered job prompt before handing work to an adapter.
   commands. Prefer explicit session ids for long-running agents.
 - **Claude Code** uses Claude CLI print/resume style commands when available.
   Restart the daemon or runtime session after changing token environment.
+- **Kimi Code** starts a session with `kimi -p '<prompt>' --output-format
+  stream-json` and resumes or delivers follow-up work with `kimi -S <session-id>
+  -p '<prompt>' --output-format stream-json`, parsing the session id from the
+  stream-json output. Select it with `gitmoot agent start <name> --runtime
+  kimi`. Authenticate once with `kimi login`, then restart the Gitmoot daemon so
+  it inherits the session.
 - **Shell** invokes a configured shell command and is mainly for smoke tests,
   demos, and adapter contract checks.
 
@@ -19,6 +25,7 @@ and rendered job prompt before handing work to an adapter.
 
 - Codex accepts a session UUID, thread name, or `last`.
 - Claude accepts a UUID or `last`.
+- Kimi accepts a session id of the form `session_<uuid>` or an empty value.
 - Shell uses the configured command.
 
 Prefer explicit runtime session ids over `last` for durable agents. Use

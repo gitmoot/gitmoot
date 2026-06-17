@@ -1,7 +1,7 @@
 # Quick Start
 
-Run from a project checkout. For Codex or Claude Code, start with the agent
-path:
+Run from a project checkout. For Codex, Claude Code, or Kimi Code, start with
+the agent path:
 
 ```text
 Install Gitmoot as a Codex or Claude skill/plugin in this repo, verify `gitmoot version`, run `gitmoot plugin doctor`, check `gh auth status`, and summarize the next Gitmoot workflow I can use.
@@ -40,6 +40,10 @@ gitmoot agent start project-planner \
   --template planner \
   --start-daemon
 ```
+
+The `--runtime` flag accepts `codex`, `claude`, or `kimi`. To use the Kimi Code
+runtime, run `kimi login` first, then restart the Gitmoot daemon so it inherits
+the session.
 
 For fast planning in the current Codex or Claude chat, ask the runtime:
 

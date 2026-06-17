@@ -1,0 +1,163 @@
+# Agent Result Contract
+
+Every Gitmoot agent job ends by returning a single `gitmoot_result` JSON object.
+The result is how an agent reports its outcome, records what it actually did, and
+optionally requests follow-up work from other agents. Gitmoot parses this object
+after the runtime delivers the agent's output and uses it to drive the rest of
+the workflow, so it should be concise, truthful, and tied to work that really
+happened.
+
+## The `gitmoot_result` Shape
+
+At a high level the result captures a decision, a short summary, and several
+arrays that describe the work:
+
+```json
+{
+  "gitmoot_result": {
+    "decision": "approved|changes_requested|blocked|implemented|failed",
+    "summary": "Brief outcome.",
+    "findings": [],
+    "changes_made": [],
+    "tests_run": [],
+    "needs": [],
+    "delegations": []
+  }
+}
+```
+
+The `decision` field reports the outcome of the job:
+
+- `approved`: a review found no blocking issues.
+- `changes_requested`: a review found issues that should be fixed before merge.
+- `blocked`: work cannot continue without human input or an external state
+  change.
+- `implemented`: the requested implementation work was completed.
+- `failed`: the attempted action errored or could not complete.
+
+The narrative and evidence fields are reporting-only. Do not claim tests were run
+in `tests_run` unless they were actually run, and do not list files in
+`changes_made` unless they were actually changed. Use `needs` for missing
+credentials, unclear scope, unavailable tools, failing external services, or
+required human decisions. Always redact secrets from summaries, findings, raw
+command output, and examples.
+
+## Delegations
+
+The `delegations` array is how an agent asks named Gitmoot agents to do
+follow-up work. Each entry describes a child job that Gitmoot spawns and tracks.
+This is the mechanism that replaced the legacy `next_agents` field: rather than
+naming a single hand-off, an agent can request a structured set of child jobs
+with dependencies, failure handling, and synthesis rules.
+
+```json
+{
+  "gitmoot_result": {
+    "decision": "approved",
+    "summary": "Plan ready for review.",
+    "findings": [],
+    "changes_made": [],
+    "tests_run": [],
+    "needs": [],
+    "delegations": [
+      {
+        "id": "review-plan",
+        "agent": "thermo-review",
+        "action": "review",
+        "prompt": "Review the implementation plan for correctness."
+      }
+    ]
+  }
+}
+```
+
+### Delegation fields
+
+- `id` (required): a stable identifier for this delegation, unique within the
+  result. Sibling delegations reference it through `deps`.
+- `agent` (required): the name of the Gitmoot agent to run for the child job.
+- `action` (required): the job action — one of `ask`, `review`, or `implement`.
+- `prompt` (required): the instructions handed to the delegated job.
+- `deps` (optional): an array of sibling delegation `id`s. The delegation runs
+  only after every listed sibling job succeeds. Each entry must reference a
+  known sibling in the same result, may not be self-referential, and may not
+  form a cycle. Delegations form a directed acyclic graph (DAG), and cycles are
+  rejected at validation time.
+- `failure_policy` (optional): one of `block_parent`, `continue`, or `escalate`.
+  Defaults to `block_parent` when omitted.
+- `synthesis_rule` (optional): one of `summary` or `vote`. It tells the
+  coordinator how to combine the children's results.
+- `timeout` (optional): a Go duration string that must be positive (for example,
+  `10m`).
+- `retry` (optional): an integer that must be `>= 0`.
+- `worktree` (optional): the worktree path for the child job.
+- `artifacts` (optional): named artifact handles passed to the child. When any
+  delegation requests `artifacts`, the parent result must also set the top-level
+  `artifact_body` field; validation rejects the result otherwise. See
+  [Top-level fields](#top-level-fields).
+- `fingerprint` (optional): a dedup key. Delegations with identical fingerprints
+  are de-duplicated, so the same delegation is not dispatched twice.
+
+### How delegations run
+
+A delegation with no `deps` is dispatched immediately and runs in parallel with
+its other dep-free siblings. A delegation that lists `deps` waits until every
+sibling it depends on has succeeded before it dispatches. Because the dependency
+graph is a DAG, Gitmoot can resolve a clear order without ever looping.
+
+Once every top-level delegation reaches a terminal state, Gitmoot enqueues
+exactly one coordinator "continuation" job, sent back to the delegating agent, to
+synthesize the children's results according to the `synthesis_rule`. There is
+always exactly one continuation per batch of top-level delegations, not one per
+child, so the delegating agent gets a single opportunity to consolidate the
+outcome.
+
+### Job-tree linkage
+
+Each child job carries linkage fields so any job can be traced through the tree:
+
+- `parent_job_id`: the job that delegated this child.
+- `delegation_id`: the `id` of the delegation that produced this child.
+- `root_job_id`: the root of the entire delegation tree.
+- `delegation_depth`: how deep this job sits below the root.
+- `task_id`: the task the tree belongs to.
+
+These fields let Gitmoot connect a child back to its parent, to the specific
+delegation that spawned it, and to the root of the job tree, and they are what
+the termination bounds below are measured against.
+
+## Top-level fields
+
+- `artifact_body` (optional): the artifact payload made available to delegated
+  children. It is required whenever any delegation sets `artifacts`. The two
+  fields are coupled: child-facing `artifacts` handles describe what a child can
+  reference, and `artifact_body` carries the actual payload at the top level of
+  the parent result. Setting `artifacts` without `artifact_body` is rejected by
+  validation.
+
+## Termination bounds
+
+Delegation and coordinator-continuation chains are bounded so they cannot recurse
+or fan out forever. The bounds are enforced by the workflow engine, and when one
+trips, the offending delegations are dropped rather than dispatched.
+
+- **Depth cap (`MaxDelegationDepth = 8`)**: each delegation child and each
+  coordinator continuation increments `delegation_depth`. A job at or beyond this
+  depth may not delegate further.
+- **Per-root job budget (`MaxDelegationTotalJobs = 64`)**: the whole delegation
+  tree under one root — all children and continuations sharing that root — is
+  capped at this many jobs. When a batch of delegations would exceed the budget,
+  it is dropped, and the parent receives a lifecycle event such as "delegation
+  tree for root &lt;id&gt; reached the job budget of 64".
+- **Loop detection**: a canonical windowed signature over recent delegation
+  activity halts repeated or cyclic delegation chains — for example an
+  oscillating A→B→A loop — well before the depth cap is reached.
+
+When any bound trips, the offending delegations are dropped (not dispatched) and
+the parent receives a lifecycle/mailbox event explaining why. Work is bounded,
+not silently retried forever.
+
+For the in-repo source of truth, see
+[`skills/gitmoot/references/RESULT_CONTRACT.md`](https://github.com/jerryfane/gitmoot/blob/main/skills/gitmoot/references/RESULT_CONTRACT.md)
+and the safety notes in
+[`skills/gitmoot/references/SAFETY.md`](https://github.com/jerryfane/gitmoot/blob/main/skills/gitmoot/references/SAFETY.md).

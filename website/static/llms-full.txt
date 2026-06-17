@@ -19,6 +19,7 @@ Local-first multi-agent coordination for GitHub pull request workflows.
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-black.svg)](./LICENSE)
 [![GitHub release](https://img.shields.io/github/v/release/jerryfane/gitmoot?include_prereleases&color=black)](https://github.com/jerryfane/gitmoot/releases)
 [![Go module](https://img.shields.io/badge/go-module-black.svg)](./go.mod)
+[![CI](https://github.com/jerryfane/gitmoot/actions/workflows/ci.yml/badge.svg)](https://github.com/jerryfane/gitmoot/actions/workflows/ci.yml)
 
 Gitmoot lets humans and AI agents collaborate through the place software teams
 already audit work: GitHub pull requests. It runs on the user's machine, keeps
@@ -36,8 +37,13 @@ trail. Gitmoot makes the repository and its pull requests the shared surface:
 
 - PR comments become agent tasks, review requests, retries, and merge signals.
 - Local SQLite records agents, repos, jobs, goals, tasks, PRs, and branch locks.
-- Runtime adapters keep Codex, Claude Code, and future runtimes behind the same
-  Gitmoot agent model.
+- Runtime adapters keep Codex, Claude Code, Kimi Code, and future runtimes
+  behind the same Gitmoot agent model.
+- Agents can return a validated `delegations[]` DAG that Gitmoot dispatches as
+  child jobs, then enqueues one continuation job to synthesize their results
+  (replacing the old `next_agents` mechanism).
+- Delegation trees are bounded by a depth cap, a per-root job budget, and loop
+  detection, so coordination halts instead of recursing forever.
 - Agent Templates and job snapshots make agent instructions explicit and reproducible.
 - Humans can follow progress from GitHub while agents keep working locally.
 
@@ -48,13 +54,13 @@ GitHub PR comments/state
   -> local gitmoot daemon
   -> local SQLite state machine and job mailbox
   -> registered runtime adapter
-  -> Codex, Claude Code, shell, or another agent runtime
+  -> Codex, Claude Code, Kimi Code, shell, or another agent runtime
   -> GitHub PR comments, statuses, branches, PRs, and merges
 ```
 
 The core primitive is a runtime-neutral Gitmoot agent, not a Codex-specific
-session. Codex and Claude Code are adapters behind the same internal runtime
-contract.
+session. Codex, Claude Code, and Kimi Code are adapters behind the same internal
+runtime contract.
 
 ## Install
 
@@ -103,6 +109,10 @@ gitmoot agent start project-planner \
   --template planner \
   --start-daemon
 ```
+
+`--runtime` accepts `codex`, `claude`, or `kimi`. For Kimi Code, run
+`kimi login` and restart the Gitmoot daemon so it inherits the session, then
+start the agent with `--runtime kimi`.
 
 For fast planning in the current Codex or Claude chat, ask the runtime:
 
@@ -154,7 +164,7 @@ For the full walkthrough, see [docs/local-workflow.md](docs/local-workflow.md).
 - **Agent**: a named Gitmoot identity with repo access, role, capabilities, and
   a runtime adapter.
 - **Runtime adapter**: the bridge from Gitmoot jobs to Codex, Claude Code,
-  shell commands, or future runtimes.
+  Kimi Code, shell commands, or future runtimes.
 - **Template**: cached prompt content attached to an agent and snapshotted into
   each job.
 - **Job**: a routed unit of work created from a PR comment, local ask, task run,
@@ -485,16 +495,19 @@ go test ./...
 go vet ./...
 ```
 
+GitHub Actions enforces the same gate on every push to `main` and every pull
+request: build, vet, and test, plus the race detector on `internal/workflow`.
+
 ---
 
 # Source: SKILL.md
 
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, PR comments, daemon jobs, branch locks, agent templates, template capture, custom prompt agents, and Codex or Claude Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, PR comments, daemon jobs, branch locks, agent templates, template capture, custom prompt agents, and Codex, Claude Code, or Kimi Code runtime workflows.
 version: 0.1.0
 license: Apache-2.0
-compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex or Claude Code.
+compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
   gitmoot-version: "0.1.0"
   source: "jerryfane/gitmoot"
@@ -519,9 +532,9 @@ This root `SKILL.md` is kept as a raw compatibility entrypoint for agents and
 Gitmoot is a local-first coordinator for AI agents working across repositories,
 goals, reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
-background daemon checks, Codex or Claude Code agent startup, structured
-implementation plans, standard goal files, agent template workflows, template
-capture, custom prompt agents, job status, or branch lock inspection.
+background daemon checks, Codex, Claude Code, or Kimi Code agent startup,
+structured implementation plans, standard goal files, agent template workflows,
+template capture, custom prompt agents, job status, or branch lock inspection.
 
 For current-chat prompt import, "use <agent> here" means run
 `gitmoot agent prompt <agent>` and apply the returned prompt content in this
@@ -548,9 +561,15 @@ Use `gitmoot agent template draft <id>` for a blank scaffold,
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
-same Codex or Claude session, and branch locks protect implementation ownership.
+same Codex, Claude, or Kimi session, and branch locks protect implementation
+ownership.
 The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
+
+For runtime selection, `gitmoot agent start <name> --runtime <runtime>` accepts
+`codex`, `claude`, or `kimi`. Kimi Code is a first-class runtime adapter
+alongside Codex and Claude Code. To use it, run `kimi login`, then restart the
+Gitmoot daemon so it inherits the session.
 
 For Gitmoot health or status questions, run the relevant read-only Gitmoot CLI
 checks and answer directly from the results. Mention `gitmoot dashboard` only
@@ -663,6 +682,24 @@ default. Create with `--create --yes` only when the user explicitly asks or the
 active workflow policy permits filing reports, then report the created or
 existing GitHub issue URL back to the user.
 
+SkillOpt train generation is durable and idempotent on resume. Each review
+item's artifacts, item row, and options commit in one transaction the moment
+that item finishes, so an interrupted generate phase loses only the item that
+was in flight. Re-running `gitmoot skillopt train continue` regenerates ONLY the
+items that are not yet complete; fully-generated items are skipped, so no
+duplicate options are produced and completed work is never rewritten. If a single
+item has some but not all of its options/artifacts persisted, resume returns a
+hard error (`item <id> has partial generated options; inspect or clear review
+options before continuing`) rather than guessing.
+
+Use `gitmoot skillopt train recover --session <id> [--out-root path] [--json]`
+to recover the OPTIMIZER phase only. It re-imports or repairs the optimizer
+candidate package and classifies the iteration (for example
+`already_completed_candidate`, `already_completed_no_candidate`,
+`optimizer_active`, or `corrupted_unrecoverable`). It does NOT release the
+generation-phase lock or rebuild generation options; use `train continue` for
+generation resume.
+
 ## PR Comment Commands
 
 Use GitHub PR comments as the public audit trail:
@@ -759,7 +796,8 @@ object:
 
 Use `blocked` when work cannot continue without human input or external state.
 Use `failed` when the attempted action errored. Do not report tests, changes, or
-approvals that were not actually verified.
+approvals that were not actually verified. Use `delegations` to request follow-up
+work by named Gitmoot agents.
 
 ## Safety Rules
 
@@ -807,8 +845,8 @@ gitmoot plugin doctor
 gitmoot agent template list
 gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 gitmoot agent template update thermo-nuclear-code-quality-review
-gitmoot agent start <name> --runtime codex|claude --repo owner/repo --path . --template thermo-nuclear-code-quality-review --start-daemon
-gitmoot agent subscribe <name> --runtime codex|claude|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
+gitmoot agent start <name> --runtime codex|claude|kimi --repo owner/repo --path . --template thermo-nuclear-code-quality-review --start-daemon
+gitmoot agent subscribe <name> --runtime codex|claude|kimi|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
 gitmoot agent run <name> "message" --repo owner/repo [--task task-id] [--pr number] [--background]
 gitmoot agent review <name> "message" --repo owner/repo --pr number [--background]
 gitmoot agent implement <name> "message" --repo owner/repo [--task task-id] [--background]
@@ -890,8 +928,8 @@ Background execution uses separate resource categories:
   ticks from mutating the same checkout at once.
 - **Runtime session locks**: SQLite resource locks keyed as
   `runtime:<runtime>:<runtime_ref>`, shared by daemon jobs, `job run`, and
-  synchronous `agent ask`, so one Codex or Claude session is never resumed by
-  two jobs at the same time.
+  synchronous `agent ask`, so one Codex, Claude, or Kimi session is never resumed
+  by two jobs at the same time.
 - **Branch locks**: workflow ownership records used for implementation and
   merge safety.
 
@@ -913,8 +951,8 @@ max_temp_sessions_per_agent = 4
 eligible_actions = ["ask", "review", "implement"]
 ```
 
-When a Codex or Claude runtime session is busy, Gitmoot can start a bounded
-temporary worker with the same template and repo scope. Implementation jobs only
+When a Codex, Claude, or Kimi runtime session is busy, Gitmoot can start a
+bounded temporary worker with the same template and repo scope. Implementation jobs only
 fork when the task has a recorded worktree and the original agent is writable.
 If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
 
@@ -945,7 +983,9 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    reference, grants the repo, and can start the background daemon. For Codex it
    runs `codex exec --json -- <startup-prompt>` and records the emitted
    `thread.started.thread_id`. For Claude Code it creates a session id and uses
-   the installed Claude CLI's non-interactive print mode.
+   the installed Claude CLI's non-interactive print mode. For Kimi Code it runs
+   `kimi -p '<startup-prompt>' --output-format stream-json` and records the
+   `session_<uuid>` session id parsed from the stream-json output.
 
    ```sh
    gitmoot init
@@ -1540,8 +1580,9 @@ Then confirm the runtime uses the same home directory as the shell where
 
 # Runtime Adapter Authoring
 
-Gitmoot treats Codex, Claude Code, and shell commands as runtime adapters behind
-one interface. Workflow, daemon, and GitHub code should stay runtime-neutral.
+Gitmoot treats Codex, Claude Code, Kimi Code, and shell commands as runtime
+adapters behind one interface. Workflow, daemon, and GitHub code should stay
+runtime-neutral.
 
 ## Adapter Contract
 
@@ -1590,7 +1631,8 @@ type Agent struct {
 ```
 
 `RuntimeRef` is runtime-specific. Codex accepts a session UUID, thread name, or
-`last`. Claude accepts a UUID or `last`. Shell uses the configured command.
+`last`. Claude accepts a UUID or `last`. Kimi accepts a Kimi session id of the
+form `session_<uuid>` or empty. Shell uses the configured command.
 `TemplateID` is Gitmoot-owned metadata. Adapters do not fetch or interpret template
 content; Gitmoot snapshots cached template instructions into the rendered prompt
 before delivery.
@@ -1625,6 +1667,22 @@ The UUID is stored only after the command succeeds. Future jobs use the Claude
 adapter's resume path. This depends on the installed Claude Code CLI supporting
 the documented `--session-id`, `-p`, `--output-format json`, and `--resume`
 contract.
+
+Kimi startup runs in the repo checkout path:
+
+```sh
+kimi -p '<startup-prompt>' --output-format stream-json
+```
+
+The adapter parses the stream-json output and stores the reported session id.
+Future jobs resume that session with:
+
+```sh
+kimi -S <session-id> -p '<job-prompt>' --output-format stream-json
+```
+
+Kimi runs against a logged-in Kimi CLI. Run `kimi login`, then restart the
+Gitmoot daemon so it inherits the session.
 
 Shell adapters do not support `agent start`; register shell commands with
 `agent subscribe`.
@@ -2475,6 +2533,29 @@ gitmoot skillopt train continue --session landing-page-train
 gitmoot skillopt train continue --session landing-page-train
 ```
 
+### Durable Generation And Idempotent Resume
+
+Option generation is durable per item. As soon as a single review item's
+options finish, that item's artifacts, item row, and options commit in one
+transaction, instead of a single end-of-phase batch write. A later item's
+failure or a mid-run cancellation cannot lose an item that already finished.
+
+Resume is idempotent. Re-running `train continue` regenerates only the items
+that are not yet complete; fully-generated items are skipped, so no duplicate
+options are produced and completed work is never rewritten. A mix of complete
+and incomplete items is the normal resume state.
+
+If a single item has some but not all of its options or A/B artifacts
+persisted, `train continue` does not guess. It stops with a hard error such as
+`item <id> has partial generated options; inspect or clear review options
+before continuing`, so a partially generated item is inspected or cleared
+rather than silently completed or duplicated.
+
+This per-item generation durability is separate from `skillopt train recover`,
+which recovers the optimizer phase only (see "Optimizer And Candidate Gate").
+`train recover` does not release the generation lock or rebuild generation
+options.
+
 Low-level `skillopt feedback github publish` and `sync` enforce
 `review.expected_repo` for train runs. If a preview train expects
 `owner/previews`, publishing or syncing against `owner/product` fails instead of
@@ -2761,10 +2842,20 @@ instead of re-running blindly:
 gitmoot skillopt train recover --session planner-train --out-root .gitmoot/skillopt/planner-train
 ```
 
-Recovery validates the package state, imports a completed candidate through the
-normal candidate gate, or records `optimizer_completed_no_candidate` with the
-stored rejection reason. Incomplete or corrupted artifacts fail without
-modifying the train state.
+```sh
+gitmoot skillopt train recover --session planner-train --out-root .gitmoot/skillopt/planner-train --json
+```
+
+`train recover` is scoped to the optimizer phase only. It re-imports or repairs
+the optimizer candidate package and classifies the active iteration, for example
+`already_completed_candidate`, `already_completed_no_candidate`,
+`optimizer_active`, or `corrupted_unrecoverable`. Recovery validates the package
+state, imports a completed candidate through the normal candidate gate, or
+records `optimizer_completed_no_candidate` with the stored rejection reason.
+Incomplete or corrupted artifacts fail without modifying the train state. It does
+not recover the generation phase, release the generation lock, or rebuild
+generation options; per-item generation durability and idempotent resume handle
+that (see "Durable Generation And Idempotent Resume").
 
 ## Candidate Review And Next Iteration
 
@@ -3673,6 +3764,101 @@ Expected signals:
   job events.
 
 5. Stop the daemon when finished.
+
+   ```sh
+   gitmoot daemon stop
+   gitmoot daemon status
+   ```
+
+## Delegation Smoke Test
+
+Goal: background coordinator job -> `delegations` in the coordinator result ->
+two child jobs fanned out to worker agents -> both children succeed -> coordinator
+continuation job enqueued. This exercises the structured delegation path end to
+end with local shell agents, so it needs no external runtime CLIs.
+
+The coordinator must run as background work so the daemon executes it through the
+engine and dispatches the delegations. A synchronous `gitmoot agent ask` without
+`--background` only returns the coordinator's own result and does not fan out, so
+the test would silently pass with zero child jobs.
+
+1. Register a coordinator shell agent whose result returns two delegations, and
+   two worker shell agents whose results return empty `delegations` (so the
+   fan-out terminates and does not recurse).
+
+   ```sh
+   gitmoot setup --repo owner/project --path . --agent coordinator --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"coordinator delegating ui and api\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"delegations\":[{\"id\":\"ui\",\"agent\":\"ui-worker\",\"action\":\"ask\",\"prompt\":\"propose the ui changes\"},{\"id\":\"api\",\"agent\":\"api-worker\",\"action\":\"ask\",\"prompt\":\"review the api contract\"}]}}'"
+   gitmoot agent subscribe ui-worker --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"ui worker done\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell smoke\"],\"needs\":[],\"delegations\":[]}}'" --role reviewer --repo owner/project --capability ask --capability review
+   gitmoot agent subscribe api-worker --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"api worker done\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell smoke\"],\"needs\":[],\"delegations\":[]}}'" --role reviewer --repo owner/project --capability ask --capability review
+   gitmoot agent repos coordinator
+   ```
+
+2. Start the background daemon so it executes the queued coordinator job and
+   fans out the delegations.
+
+   ```sh
+   gitmoot daemon start --repo owner/project --poll 30s
+   gitmoot daemon status
+   ```
+
+3. Queue the coordinator as background work.
+
+   ```sh
+   gitmoot agent ask coordinator --repo owner/project --background "coordinate the ui and api work"
+   ```
+
+4. Confirm the coordinator job, the two child jobs, and the continuation job.
+
+   ```sh
+   gitmoot job list --repo owner/project
+   gitmoot events --repo owner/project
+   ```
+
+Expected signals:
+
+- `gitmoot events --repo owner/project` shows two `delegation_enqueued` events
+  on the coordinator job, one for the `ui` delegation and one for the `api`
+  delegation.
+- `gitmoot job list --repo owner/project` shows two child jobs with composite
+  ids of the form `<coordinator-job-id>/delegation/ui` and
+  `<coordinator-job-id>/delegation/api`, each reaching `succeeded`.
+- After both children succeed, `gitmoot events --repo owner/project` shows a
+  `delegation_continuation_enqueued` event and `gitmoot job list` shows a
+  coordinator continuation job `<coordinator-job-id>/continuation` queued for
+  `coordinator`.
+
+> Note: the continuation job runs the **same** coordinator agent. A real LLM
+> coordinator ends the loop by returning no `delegations` on the continuation,
+> but a *static* shell agent returns the same delegations every time, so the
+> continuation re-delegates each generation. This is bounded by
+> `MaxDelegationDepth` (8): once a coordinator/continuation at that depth would
+> dispatch, Gitmoot refuses and records a `delegation_depth_exceeded` event
+> instead of spawning jobs forever. To keep this smoke test fast, run
+> `gitmoot daemon stop` once you have observed the first continuation rather than
+> waiting for the depth cap to halt the chain. Also note delegated `action:
+> review` requires a pull request / head SHA; use `action: ask` for PR-less
+> smoke agents (a no-PR review fails with "job for <branch> has no head SHA").
+
+5. (Optional) Verify dependency gating. Re-run with a coordinator whose result
+   adds a third delegation that depends on the first two; it must stay queued
+   until both deps succeed, then run.
+
+   ```json
+   {
+     "id": "integrate",
+     "agent": "api-worker",
+     "action": "ask",
+     "prompt": "integrate the ui and api work",
+     "deps": ["ui", "api"]
+   }
+   ```
+
+   Expected: `gitmoot events --repo owner/project` shows the
+   `<coordinator-job-id>/delegation/integrate` job enqueued only after the `ui`
+   and `api` children reach `succeeded`, and the continuation job is enqueued
+   once `integrate` also succeeds.
+
+6. Stop the daemon when finished.
 
    ```sh
    gitmoot daemon stop
@@ -4665,9 +4851,9 @@ bug-report workflow added after the v0.3.0 dashboard beta.
 
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, jobs, branch locks, agent-templates, template capture, custom prompt agents, and Codex or Claude Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, jobs, branch locks, agent-templates, template capture, custom prompt agents, and Codex, Claude Code, or Kimi Code runtime workflows.
 license: Apache-2.0
-compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex or Claude Code.
+compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
   gitmoot-version: "0.1.0"
   source: "jerryfane/gitmoot"
@@ -4678,7 +4864,7 @@ metadata:
 Gitmoot is a local-first coordinator for AI agents working across repositories,
 goals, reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
-background daemon checks, Codex or Claude Code agent startup, structured
+background daemon checks, Codex, Claude Code, or Kimi Code agent startup, structured
 implementation plans, standard goal files, agent template workflows, custom
 prompt agents, template capture, job status, or branch lock inspection.
 
@@ -4705,7 +4891,8 @@ Use `gitmoot agent template draft <id>` for a blank scaffold,
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
-same Codex or Claude session, and branch locks protect implementation ownership.
+same Codex, Claude, or Kimi session, and branch locks protect implementation
+ownership.
 The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
 
@@ -4750,8 +4937,8 @@ analysis, planning, or questions. Use `gitmoot agent review <agent> --repo
 owner/repo --pr <number> "..."` for PR review decisions and `gitmoot agent
 implement <agent> --repo owner/repo --task <task-id> "..."` for file changes.
 Add `--background` only when the user wants a queued background job. Use
-`gitmoot plugin doctor` when checking whether Codex or Claude Code can discover
-Gitmoot through an installed runtime plugin. Use
+`gitmoot plugin doctor` when checking whether Codex, Claude Code, or Kimi Code
+can discover Gitmoot through an installed runtime plugin. Use
 `gitmoot plugin codex-launch --repo <path>` to print a Codex launch command that
 adds the resolved `.gitmoot` home to the sandbox on Linux, macOS, and Windows.
 Use `gitmoot goal template` when
@@ -4781,7 +4968,16 @@ specific step. In train mode, collect enough ranked feedback and trait notes
 before optimizer handoff, check `gitmoot-skillopt --version` and
 `gitmoot-skillopt optimize --help` when optimizer-backed continue is needed,
 keep promotion decisions explicit, and start follow-up iterations only through
-`train continue --start-next`.
+`train continue --start-next`. Generation is durable: each review item's
+artifacts and options commit in one transaction the moment that item finishes,
+so an interrupted phase resumes idempotently when you re-run `train continue` —
+already-complete items are skipped and never duplicated, while an item with some
+but not all options persisted returns a hard error to inspect or clear before
+continuing. For optimizer-phase recovery, use
+`gitmoot skillopt train recover --session <id> [--out-root path] [--json]`,
+which re-imports or repairs the optimizer candidate package and classifies the
+iteration; it does not release the generation lock or rebuild generation
+options.
 
 For complete command examples, read [CLI.md](references/CLI.md).
 For end-to-end workflows, read [WORKFLOWS.md](references/WORKFLOWS.md).
@@ -4829,6 +5025,7 @@ capabilities:
 runtime_compatibility:
   - codex
   - claude
+  - kimi
 tags:
   - planning
   - goals
@@ -4897,6 +5094,57 @@ When asked to write the goal file:
 
 Do not implement the planned feature unless the user explicitly asks after the
 plan and goal file are complete.
+
+## Coordinator Delegations
+
+When you run as a managed coordinator agent and want Gitmoot to fan work out to
+other named agents, return a top-level `delegations` array in your
+`gitmoot_result`. Gitmoot enqueues one child job per delegation and records a
+`delegation_enqueued` event on your job for each one.
+
+Each delegation requires four fields:
+
+- `id`: stable identifier for the delegation within this result.
+- `agent`: name of the Gitmoot agent to run.
+- `action`: job action, e.g. `ask`, `review`, or `implement`.
+- `prompt`: instructions for the delegated job.
+
+Optional advanced controls are also supported: `worktree`, `artifacts`, `deps`,
+`timeout`, `retry`, `failure_policy`, `fingerprint`, and `synthesis_rule`. A
+delegation with no `deps` is dispatched immediately and runs in parallel with
+its siblings; a delegation with `deps` runs only after every listed sibling has
+succeeded. Once all top-level delegations reach a terminal state, Gitmoot
+enqueues one coordinator continuation job so you can synthesize the results.
+
+See `references/RESULT_CONTRACT.md` for the full field reference. Example
+coordinator result that delegates two flat parallel jobs to different agents:
+
+```json
+{
+  "gitmoot_result": {
+    "decision": "approved",
+    "summary": "Plan ready; delegating implementation and review.",
+    "findings": [],
+    "changes_made": [],
+    "tests_run": [],
+    "needs": [],
+    "delegations": [
+      {
+        "id": "build-api",
+        "agent": "backend-coder",
+        "action": "implement",
+        "prompt": "Implement the REST API described in the plan."
+      },
+      {
+        "id": "review-plan",
+        "agent": "reviewer",
+        "action": "review",
+        "prompt": "Review the implementation plan for correctness and risk."
+      }
+    ]
+  }
+}
+```
 
 ## Current-Chat Use
 
@@ -5005,7 +5253,7 @@ equivalent:
   remedy and can be retried in place).
 - **Agents** lists registered agents: `enter` opens a detail with the template,
   recent jobs, and the template's version history; `n` registers a new agent
-  (name, codex/claude runtime, installed template); `o` starts a training
+  (name, codex/claude/kimi runtime, installed template); `o` starts a training
   session for the agent's template via a pre-filled form (review/workspace
   repos, request, codex/claude backend, optional model — the backend/model are
   stored in the session's optimizer defaults so `train continue` inherits
@@ -5094,6 +5342,9 @@ gitmoot agent start reviewer \
   --capability review \
   --start-daemon
 ```
+
+`--runtime` accepts `codex`, `claude`, or `kimi`. For `kimi`, run `kimi login`
+first and restart the Gitmoot daemon so it inherits the session.
 
 Subscribe an existing runtime session:
 
@@ -5329,6 +5580,7 @@ gitmoot skillopt train start --template <id> --repo owner/repo --request <text> 
 gitmoot skillopt train status --session <id>
 gitmoot skillopt train run [--config path | --session <id>] [--plain]
 gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--dry-run] [--promote version|--reject version --reason text] [--start-next]
+gitmoot skillopt train recover --session <id> [--out-root path] [--json]
 gitmoot skillopt train stop --session <id> --reason <text>
 ```
 
@@ -5351,6 +5603,23 @@ context, and starts follow-up iterations only after a promoted/rejected/abandone
 decision. Use `skillopt review`, `feedback`, `export`, `import`, and
 `candidate` directly only for advanced debugging, custom research runs, or
 recovering one step of a train session.
+
+`skillopt train continue` generation is durable and idempotent on resume. Each
+review item's artifacts, item row, and options commit in one transaction the
+moment that item finishes, so an interrupted generate phase loses only the item
+that was in flight. Re-running `train continue` regenerates ONLY the items that
+are not yet complete; fully-generated items are skipped, so no duplicate options
+are produced and completed work is never rewritten. If a single item has some
+but not all of its options/artifacts persisted, resume returns a hard error
+(`item <id> has partial generated options; inspect or clear review options
+before continuing`) rather than guessing.
+
+`skillopt train recover --session <id>` recovers the OPTIMIZER phase only. It
+re-imports or repairs the optimizer candidate package and classifies the
+iteration (for example `already_completed_candidate`,
+`already_completed_no_candidate`, `optimizer_active`, or
+`corrupted_unrecoverable`). It does NOT release the generation-phase lock or
+rebuild generation options; use `train continue` for generation resume.
 
 `skillopt review create` starts a review run for a template and target repo.
 Use the default A/B shape for validation, or pass `--mode explore|refine|distill`
@@ -5775,8 +6044,8 @@ through a runtime adapter.
 Background jobs are scheduled against three distinct resources:
 
 - repo checkout mutexes for daemon ticks that use the same local checkout;
-- runtime session locks keyed as `runtime:<runtime>:<runtime_ref>` for Codex
-  and Claude delivery;
+- runtime session locks keyed as `runtime:<runtime>:<runtime_ref>` for Codex,
+  Claude, and Kimi delivery;
 - branch locks for implementation ownership and merge safety.
 
 The daemon default is `--workers 1`. Users can raise it when jobs target
@@ -5800,6 +6069,70 @@ gitmoot agent allow reviewer --repo owner/project-b
 gitmoot status --repo owner/project-a
 gitmoot status --repo owner/project-b
 ```
+
+## Multi-Model Delegation
+
+A coordinator agent can fan work out to other agents running on different
+runtimes by returning a `delegations` array in its `gitmoot_result`. Gitmoot
+enqueues one child job per delegation, records a `delegation_enqueued` event on
+the coordinator job, and runs the children in the daemon. Start a coordinator
+and two workers on different runtimes so each delegation lands on the best model
+for the job:
+
+```sh
+gitmoot agent start coordinator --runtime codex --repo owner/repo --role planner --capability ask --start-daemon
+gitmoot agent start ui-worker --runtime claude --repo owner/repo --role reviewer --capability ask --capability review
+gitmoot agent start api-worker --runtime kimi --repo owner/repo --role reviewer --capability ask --capability review
+```
+
+Queue the coordinator as background work so the daemon runs it and dispatches
+its delegations (a synchronous `gitmoot agent ask` without `--background` only
+returns the coordinator's own answer and does not fan out):
+
+```sh
+gitmoot agent ask coordinator --repo owner/repo --background "Coordinate the redesign across the API and UI teams."
+```
+
+The coordinator returns two delegations to the workers on different runtimes:
+
+```json
+{
+  "gitmoot_result": {
+    "decision": "approved",
+    "summary": "Delegating UI review and API review to the workers.",
+    "findings": [],
+    "changes_made": [],
+    "tests_run": [],
+    "needs": [],
+    "delegations": [
+      {
+        "id": "ui",
+        "agent": "ui-worker",
+        "action": "ask",
+        "prompt": "Propose the component changes for the new dashboard layout."
+      },
+      {
+        "id": "api",
+        "agent": "api-worker",
+        "action": "review",
+        "prompt": "Review the API contract for the dashboard endpoints."
+      }
+    ]
+  }
+}
+```
+
+Gitmoot enqueues each delegation as a flat parallel child job
+(`<parent-job-id>/delegation/<id>`) with a `delegation_enqueued` event on the
+parent. Delegations that declare `deps` run only after the named siblings
+succeed, and once every top-level delegation is terminal Gitmoot enqueues one
+coordinator continuation job so the coordinator can synthesize the results.
+Inspect the fan-out with `gitmoot job list --repo owner/repo` (one row per child
+job) and `gitmoot events --repo owner/repo` (the `delegation_enqueued` events).
+Each child job carries job-tree linkage fields — `parent_job_id`,
+`delegation_id`, `root_job_id`, `delegation_depth`, and `task_id` — so a child
+can be traced back to its parent, its originating delegation, and the root of the
+tree. See `RESULT_CONTRACT.md` for the full delegation field reference.
 
 ---
 
@@ -5964,6 +6297,26 @@ If the work depends on external APIs, CLIs, env vars, generated scripts, service
 launchers, installers, deployment behavior, or third-party libraries, verify the
 real contract with local commands and/or official documentation before editing.
 
+## Delegation Termination Bounds
+
+Delegation and coordinator-continuation chains are bounded so they cannot recurse
+or fan out forever:
+
+- Depth cap `MaxDelegationDepth = 8`: each delegation child and each coordinator
+  continuation increments `delegation_depth`. A job at or beyond this depth may
+  not delegate further.
+- Per-root job budget `MaxDelegationTotalJobs = 64`: the whole delegation tree
+  under one root (all children and continuations sharing that root) is capped.
+  When a batch would exceed it, the delegations are not dispatched.
+- Loop detection: a canonical windowed signature hash over recent delegation
+  activity halts repeated or cyclic delegation chains well before the depth cap
+  is reached, preventing oscillating A→B→A loops.
+
+When a bound trips, the offending delegations are dropped (not dispatched) and
+the parent receives a lifecycle/mailbox event explaining why (for example, the
+delegation tree for a root reached the job budget of 64). Work is bounded, not
+silently retried forever.
+
 ## When To Stop
 
 Stop and report `blocked` when the target repo is unclear, GitHub auth is
@@ -5994,6 +6347,86 @@ truthful, and tied to work that actually happened.
 }
 ```
 
+## Delegations
+
+Use `delegations` to request follow-up work by named Gitmoot agents. Each
+delegation describes a child job:
+
+```json
+{
+  "gitmoot_result": {
+    "decision": "approved",
+    "summary": "Plan ready for review.",
+    "findings": [],
+    "changes_made": [],
+    "tests_run": [],
+    "needs": [],
+    "delegations": [
+      {
+        "id": "review-plan",
+        "agent": "thermo-review",
+        "action": "review",
+        "prompt": "Review the implementation plan for correctness."
+      }
+    ]
+  }
+}
+```
+
+Delegation fields:
+
+- `id` (required): stable identifier for this delegation, unique within the
+  result. Sibling delegations reference it through `deps`.
+- `agent` (required): name of the Gitmoot agent to run.
+- `action` (required): job action, e.g. `ask`, `review`, or `implement`.
+- `prompt` (required): instructions for the delegated job.
+- `deps` (optional): array of sibling delegation `id`s. This delegation runs
+  only after every listed sibling succeeds. Each entry must reference a known
+  sibling in the same result, may not be self-referential, and may not form a
+  cycle — delegations form a DAG, and cycles are rejected.
+- `failure_policy` (optional): one of `block_parent`, `continue`, or
+  `escalate`. Defaults to `block_parent` when omitted.
+- `synthesis_rule` (optional): one of `summary` or `vote`.
+- `timeout` (optional): a Go duration string and must be positive (e.g. `10m`).
+- `retry` (optional): integer `>= 0`.
+- `worktree` (optional): worktree path for the child job.
+- `artifacts` (optional): named artifact handles passed to the child. When any
+  delegation requests artifacts, the parent result must also set the top-level
+  `artifact_body` field; validation rejects the result otherwise.
+- `fingerprint` (optional): dedup key. Identical fingerprints are
+  de-duplicated, so the same delegation is not dispatched twice.
+
+A delegation with no `deps` dispatches immediately and runs in parallel with
+other dep-free siblings. Once every top-level delegation reaches a terminal
+state, Gitmoot enqueues exactly one coordinator "continuation" job — back to
+the delegating agent — to synthesize the children's results.
+
+Each child job carries `parent_job_id`, `delegation_id`, `root_job_id`,
+`delegation_depth`, and `task_id`, so a child can be traced to its parent, its
+originating delegation, and the root of the job tree.
+
+### Termination bounds
+
+Delegation trees are bounded so they cannot run forever:
+
+- Depth cap: `MaxDelegationDepth = 8`. Each delegation child and each
+  coordinator continuation increments `delegation_depth`; a job at or beyond
+  this depth may not delegate further.
+- Per-root job budget: `MaxDelegationTotalJobs = 64`. The whole delegation tree
+  under one root is capped at this many jobs.
+- Loop detection: a windowed signature over recent delegation activity halts
+  repeated or cyclic delegation chains (e.g. oscillating A→B→A) well before the
+  depth cap is reached.
+
+When a bound trips, the offending delegations are dropped rather than
+dispatched, and the parent receives a lifecycle/mailbox event explaining why
+(for example, "delegation tree for root <id> reached the job budget of 64").
+
+### Top-level fields
+
+- `artifact_body` (optional): the artifact payload made available to delegated
+  children. Required whenever any delegation sets `artifacts`.
+
 ## Decisions
 
 - `approved`: review found no blocking issues.
@@ -6008,7 +6441,7 @@ truthful, and tied to work that actually happened.
 - Do not claim files were changed unless they were actually changed.
 - Use `needs` for missing credentials, unclear scope, unavailable tools, failing
   external services, or required human decisions.
-- Use `delegations` only when another named Gitmoot agent should be invoked.
+- Use `delegations` when another named Gitmoot agent should be invoked.
 - Redact secrets from summaries, findings, raw command output, and examples.
 
 ---
