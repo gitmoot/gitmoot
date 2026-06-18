@@ -48,6 +48,20 @@ The exported package has:
   optimizer. Top-level workflow mode is exported as `training_mode`, not as
   `evaluator_config.mode`; `evaluator_config.mode` is reserved for evaluator
   implementation ids or drivers.
+- `feedback_context`: human-review provenance, present only when the run has
+  imported feedback. It carries `feedback_source` (for example
+  `imported_human_review`), `feedback_target` (for example
+  `baseline_review_outputs`), `review_run_id` (the eval run id),
+  `reviewed_skill_version` (the reviewed template version id), `target_repo`
+  when the run has one, and `review_issue` (an `owner/repo#number` reference)
+  when the feedback came from a GitHub issue or PR.
+- `evaluator_profile`: the resolved evaluator profile, present only when the run
+  metadata names an evaluator. It carries `profile_id`, `task_kind`,
+  `artifact_contract` and `preview_adapter` (for artifact-backed tasks),
+  `checks` (an ordered list of cheap artifact/render checks, each with `id`,
+  `type`, `when`, `required`, and an optional `config`), `judge` (the LLM judge
+  config: `type`, `when`, optional `model`, and optional `config`), and
+  `metadata` (the raw evaluator config the profile was derived from).
 
 Artifact package entries reference local SHA256 blobs stored under Gitmoot home.
 The export does not copy blobs into the repository by default.
@@ -147,7 +161,15 @@ The imported package must have:
 - `candidate.metadata`: metadata that exactly matches the candidate
   frontmatter
 - `eval_report`: optional optimizer report
-- `summary`: optional diff, score, and preference summary
+- `summary`: optional candidate summary. Its fields are `diff_artifact_id`,
+  `score`, `preference_summary`, `metadata` (used for the `promotable: false` /
+  `no_candidate_reason` no-candidate gate), `evaluator_score` (the evaluator's
+  contract/quality status, hard/soft and dimension scores, and any
+  `human_feedback_alignment`), `failure` (a structured evaluator failure packet
+  with `primary_reason`, `human_reason`, `optimizer_hint`, `failed_checks`,
+  `evidence`, and `stage_status`), and `gate_rejection` (a gate-rejection packet
+  with the rejection type, retryability, baseline/candidate gate scores, reasons,
+  failed dimensions, evidence, and next action)
 - `artifacts`: optional candidate artifact manifest entries with `id`, relative
   `path`, SHA256 `hash`, `media_type`, `driver`, and optional `size_bytes`
 

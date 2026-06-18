@@ -133,6 +133,22 @@ the same `delegations` field, `coordinator`, and `continuation` mechanics.
   delegation (see [Termination bounds](#termination-bounds)): they do not relax
   the depth cap, the per-root job budget, or loop detection.
 
+  Ephemeral workers are **leaf-only**: an ephemeral child cannot return its own
+  `delegations`. Any delegations it returns are ignored, so it can never fan work
+  out further or spawn more workers. If the work itself needs to delegate, route
+  it to a registered `agent` instead.
+
+  **`agent` vs `ephemeral` — which to use:** delegate to a registered `agent`
+  when the work needs a specific, durable, addressable worker (a tuned or
+  SkillOpt-trained template, a resumable session, accountable job history) or
+  when the worker must itself delegate — ephemeral workers are leaf-only and
+  cannot return their own delegations. Use `ephemeral` for one-off, disposable,
+  dynamically-sized fan-out where you just need "a runtime + model + prompt"
+  with no pre-registration and no cleanup (for example N workers each producing
+  one result, or a cheap gate plus a strong verifier with per-worker models).
+  For the longer comparison, including how temp workers fit in, see
+  [Choosing a worker](../concepts/agents-templates-jobs-locks.md#choosing-a-worker-registered-agent-vs-ephemeral-worker).
+
 ### How delegations run
 
 A delegation with no `deps` is dispatched immediately and runs in parallel with
