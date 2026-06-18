@@ -80,6 +80,39 @@ func TestCodexDeliverCommand(t *testing.T) {
 	runner.want(t, 0, "codex", "exec", "resume", "550e8400-e29b-41d4-a716-446655440001", "--", "review this")
 }
 
+func TestCodexDeliverCommandUsesJobModel(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "done"}}}
+	adapter := CodexAdapter{Runner: runner, SessionResolver: staticCodexSessions{exists: true}}
+	agent := Agent{Name: "lead", Role: "implementer", Runtime: CodexRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440001", RepoScope: "jerryfane/gitmoot", Model: "agent-default"}
+
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review this", Model: "opus"}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	runner.want(t, 0, "codex", "exec", "resume", "--model", "opus", "550e8400-e29b-41d4-a716-446655440001", "--", "review this")
+}
+
+func TestCodexDeliverCommandFallsBackToAgentModel(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "done"}}}
+	adapter := CodexAdapter{Runner: runner, SessionResolver: staticCodexSessions{exists: true}}
+	agent := Agent{Name: "lead", Role: "implementer", Runtime: CodexRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440001", RepoScope: "jerryfane/gitmoot", Model: "sonnet"}
+
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review this"}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	runner.want(t, 0, "codex", "exec", "resume", "--model", "sonnet", "550e8400-e29b-41d4-a716-446655440001", "--", "review this")
+}
+
+func TestCodexStartCommandUsesAgentModel(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440009"}` + "\n"}}}
+	adapter := CodexAdapter{Runner: runner}
+	agent := Agent{Name: "lead", Role: "implementer", Runtime: CodexRuntime, RepoScope: "jerryfane/gitmoot", Model: "opus"}
+
+	if _, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "initialize"}); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	runner.want(t, 0, "codex", "exec", "--model", "opus", "--json", "--", "initialize")
+}
+
 func TestCodexStartCommandParsesThreadID(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "not json\n" + `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440009"}` + "\n"}}}
 	adapter := CodexAdapter{Runner: runner, Dir: "/repo"}
@@ -235,6 +268,44 @@ func TestClaudeDeliverCommand(t *testing.T) {
 		t.Fatalf("summary = %q", result.Summary)
 	}
 	runner.want(t, 0, "claude", "--resume", "550e8400-e29b-41d4-a716-446655440002", "-p", "--output-format", "json", "--", "review")
+}
+
+func TestClaudeDeliverCommandUsesJobModel(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"result":"done"}`}}}
+	adapter := ClaudeAdapter{Runner: runner}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "jerryfane/gitmoot", Model: "agent-default"}
+
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review", Model: "opus"}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	runner.want(t, 0, "claude", "--model", "opus", "--resume", "550e8400-e29b-41d4-a716-446655440002", "-p", "--output-format", "json", "--", "review")
+}
+
+func TestClaudeDeliverCommandFallsBackToAgentModel(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"result":"done"}`}}}
+	adapter := ClaudeAdapter{Runner: runner}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "jerryfane/gitmoot", Model: "sonnet"}
+
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	runner.want(t, 0, "claude", "--model", "sonnet", "--resume", "550e8400-e29b-41d4-a716-446655440002", "-p", "--output-format", "json", "--", "review")
+}
+
+func TestClaudeStartCommandUsesAgentModel(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"result":"ready"}`}}}
+	adapter := ClaudeAdapter{
+		Runner: runner,
+		NewRuntimeRef: func() (string, error) {
+			return "550e8400-e29b-41d4-a716-446655440010", nil
+		},
+	}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime, RepoScope: "jerryfane/gitmoot", Model: "opus"}
+
+	if _, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "initialize"}); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	runner.want(t, 0, "claude", "--model", "opus", "--session-id", "550e8400-e29b-41d4-a716-446655440010", "-p", "--output-format", "json", "--", "initialize")
 }
 
 func TestClaudeStartCommandUsesGeneratedSessionID(t *testing.T) {
@@ -773,6 +844,47 @@ func TestKimiDeliverCommandResumesSession(t *testing.T) {
 	runner.want(t, 0, "kimi", "-S", "session_550e8400-e29b-41d4-a716-446655440001", "-p", "review", "--output-format", "stream-json")
 }
 
+
+func TestKimiDeliverCommandUsesJobModel(t *testing.T) {
+	stdout := `{"role":"assistant","content":"done"}` + "\n"
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
+	adapter := KimiAdapter{Runner: runner}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: KimiRuntime, RuntimeRef: "session_550e8400-e29b-41d4-a716-446655440001", RepoScope: "jerryfane/gitmoot", AutonomyPolicy: AutonomyPolicyReadOnly, Model: "agent-default"}
+
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review", Model: "opus"}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	runner.want(t, 0, "kimi", "--model", "opus", "-S", "session_550e8400-e29b-41d4-a716-446655440001", "-p", "review", "--output-format", "stream-json")
+}
+
+func TestKimiDeliverCommandFallsBackToAgentModel(t *testing.T) {
+	stdout := `{"role":"assistant","content":"done"}` + "\n"
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
+	adapter := KimiAdapter{Runner: runner}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: KimiRuntime, RuntimeRef: "session_550e8400-e29b-41d4-a716-446655440001", RepoScope: "jerryfane/gitmoot", AutonomyPolicy: AutonomyPolicyReadOnly, Model: "sonnet"}
+
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	runner.want(t, 0, "kimi", "--model", "sonnet", "-S", "session_550e8400-e29b-41d4-a716-446655440001", "-p", "review", "--output-format", "stream-json")
+}
+
+func TestKimiStartCommandUsesAgentModel(t *testing.T) {
+	stdout := `{"role":"assistant","content":"ready"}` + "\n"
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
+	adapter := KimiAdapter{
+		Runner: runner,
+		NewRuntimeRef: func() (string, error) {
+			return "550e8400-e29b-41d4-a716-446655440010", nil
+		},
+	}
+	agent := Agent{Name: "lead", Role: "implementer", Runtime: KimiRuntime, RepoScope: "jerryfane/gitmoot", Model: "opus"}
+
+	if _, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "initialize"}); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	runner.want(t, 0, "kimi", "--model", "opus", "-p", "initialize", "--output-format", "stream-json")
+}
 
 func TestKimiHealthUsesRegisteredSession(t *testing.T) {
 	stdout := `{"role":"assistant","content":"OK"}` + "\n" +

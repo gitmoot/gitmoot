@@ -76,16 +76,16 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 
 func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude|kimi --repo owner/repo [--path .] [--template <template-id>] [--start-daemon]")
-	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--background] [--type type] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background] [--type type] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--branch branch] [--background] [--type type] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude|kimi --repo owner/repo [--path .] [--template <template-id>] [--model model] [--start-daemon]")
+	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--model model] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--background] [--type type] [--model model] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background] [--type type] [--model model] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--branch branch] [--background] [--type type] [--model model] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
 	fmt.Fprintln(w, "  gitmoot agent template list|show|add|draft|validate|update|diff ...")
 	fmt.Fprintln(w, "  gitmoot agent prompt <agent-or-template> [--json]")
 	fmt.Fprintln(w, "  gitmoot agent gc")
-	fmt.Fprintln(w, "  gitmoot agent subscribe <name> --runtime codex|claude|kimi|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] --capability <capability>")
+	fmt.Fprintln(w, "  gitmoot agent subscribe <name> --runtime codex|claude|kimi|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] [--model model] --capability <capability>")
 	fmt.Fprintln(w, "    Codex sessions may use a UUID, thread name, or last. Claude sessions may use a UUID or last. Kimi sessions may use a Kimi session id. Shell sessions are commands.")
 	fmt.Fprintln(w, "  gitmoot agent allow <name> --repo owner/repo")
 	fmt.Fprintln(w, "  gitmoot agent deny <name> --repo owner/repo")
@@ -102,6 +102,7 @@ type agentAskOptions struct {
 	jsonOutput bool
 	background bool
 	typeName   string
+	model      string
 	force      bool
 	agent      string
 	message    string
@@ -130,6 +131,7 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 			Instructions:         options.message,
 			Background:           options.background,
 			Type:                 options.typeName,
+			Model:                options.model,
 			Home:                 options.home,
 			SelectedAction:       "ask",
 			SelectedActionReason: "explicit agent ask",
@@ -189,6 +191,15 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 			}
 			index++
 			options.typeName = args[index]
+		case arg == "--model":
+			if index+1 >= len(args) {
+				fmt.Fprintln(stderr, "agent ask requires a value for --model")
+				return agentAskOptions{}, false
+			}
+			index++
+			options.model = strings.TrimSpace(args[index])
+		case strings.HasPrefix(arg, "--model="):
+			options.model = strings.TrimSpace(strings.TrimPrefix(arg, "--model="))
 		case arg == "--json":
 			options.jsonOutput = true
 		case arg == "--repo" || arg == "--home":
@@ -239,7 +250,7 @@ func containsHelpFlag(args []string) bool {
 
 func printAgentAskUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--type type] [--home path] [--json] [--force]")
+	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--type type] [--model model] [--home path] [--json] [--force]")
 }
 
 type agentRunOptions struct {
@@ -248,6 +259,7 @@ type agentRunOptions struct {
 	jsonOutput bool
 	background bool
 	typeName   string
+	model      string
 	taskID     string
 	prNumber   int
 	headSHA    string
@@ -322,7 +334,7 @@ func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 
 func printOrchestrateUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--model model] [--home path] [--json]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Orchestrate work across agents (a coordinator that fans out delegations).")
 	fmt.Fprintln(w, "Sugar for `gitmoot agent run <agent> --background`: the named agent is the")
@@ -407,6 +419,7 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 			Instructions:         options.message,
 			Background:           options.background,
 			Type:                 options.typeName,
+			Model:                options.model,
 			Home:                 options.home,
 			TaskID:               options.taskID,
 			PullRequest:          options.prNumber,
@@ -461,7 +474,7 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.background = true
 		case arg == "--json":
 			options.jsonOutput = true
-		case arg == "--type" || arg == "--repo" || arg == "--home" || arg == "--task" || arg == "--pr" || arg == "--head-sha" || arg == "--branch":
+		case arg == "--type" || arg == "--model" || arg == "--repo" || arg == "--home" || arg == "--task" || arg == "--pr" || arg == "--head-sha" || arg == "--branch":
 			if index+1 >= len(args) {
 				fmt.Fprintf(stderr, "%s requires a value for %s\n", label, arg)
 				return agentRunOptions{}, false
@@ -472,6 +485,8 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			}
 		case strings.HasPrefix(arg, "--type="):
 			options.typeName = strings.TrimPrefix(arg, "--type=")
+		case strings.HasPrefix(arg, "--model="):
+			options.model = strings.TrimSpace(strings.TrimPrefix(arg, "--model="))
 		case strings.HasPrefix(arg, "--repo="):
 			options.repo = strings.TrimPrefix(arg, "--repo=")
 		case strings.HasPrefix(arg, "--home="):
@@ -511,6 +526,8 @@ func setAgentRunOption(options *agentRunOptions, flagName string, value string, 
 	switch flagName {
 	case "--type":
 		options.typeName = value
+	case "--model":
+		options.model = value
 	case "--repo":
 		options.repo = value
 	case "--home":
@@ -536,13 +553,13 @@ func printAgentRunUsage(w io.Writer, command string) {
 	fmt.Fprintln(w, "Usage:")
 	switch command {
 	case "orchestrate":
-		fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--model model] [--home path] [--json]")
 	case "review":
-		fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background] [--type type] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background] [--type type] [--model model] [--home path] [--json]")
 	case "implement":
-		fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--branch branch] [--background] [--type type] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--branch branch] [--background] [--type type] [--model model] [--home path] [--json]")
 	default:
-		fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--background] [--type type] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--background] [--type type] [--model model] [--home path] [--json]")
 	}
 }
 
@@ -700,7 +717,7 @@ func printAgentTypeUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent type list")
 	fmt.Fprintln(w, "  gitmoot agent type show <type>")
-	fmt.Fprintln(w, "  gitmoot agent type set <type> --runtime codex|claude|kimi --template <template-id> --policy workspace-write --max-background 2 --idle-timeout 20m")
+	fmt.Fprintln(w, "  gitmoot agent type set <type> --runtime codex|claude|kimi --template <template-id> --model <model> --policy workspace-write --max-background 2 --idle-timeout 20m")
 }
 
 func runAgentTypeList(args []string, stdout, stderr io.Writer) int {
@@ -777,6 +794,7 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, or kimi")
 	templateID := fs.String("template", "", "agent template")
+	model := fs.String("model", "", "default runtime model for this agent type")
 	role := fs.String("role", "", "agent role")
 	policy := fs.String("policy", "", "agent autonomy policy: auto, read-only, workspace-write, or danger-full-access")
 	maxBackground := fs.Int("max-background", -1, "maximum managed background instances")
@@ -831,6 +849,9 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 	}
 	if strings.TrimSpace(*templateID) != "" {
 		entry.Template = strings.TrimSpace(*templateID)
+	}
+	if strings.TrimSpace(*model) != "" {
+		entry.Model = strings.TrimSpace(*model)
 	}
 	if strings.TrimSpace(*role) != "" {
 		entry.Role = strings.TrimSpace(*role)
@@ -980,6 +1001,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	path := fs.String("path", ".", "local checkout path")
 	role := fs.String("role", "", "agent role")
 	templateID := fs.String("template", "", "agent template")
+	model := fs.String("model", "", "default runtime model for this agent")
 	policy := fs.String("policy", "auto", "autonomy policy")
 	updateTemplate := fs.Bool("update-template", false, "install or refresh the agent template before starting")
 	startDaemon := fs.Bool("start-daemon", false, "start the background daemon after setup")
@@ -1037,6 +1059,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		Runtime:        strings.TrimSpace(*runtimeName),
 		RepoScope:      repo.FullName(),
 		TemplateID:     strings.TrimSpace(*templateID),
+		Model:          strings.TrimSpace(*model),
 		Capabilities:   resolvedCapabilities,
 		AutonomyPolicy: strings.TrimSpace(*policy),
 		HealthStatus:   "unknown",
@@ -1126,6 +1149,7 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 	session := fs.String("session", "", "runtime session reference, last, or shell command")
 	role := fs.String("role", "", "agent role")
 	templateID := fs.String("template", "", "agent template")
+	model := fs.String("model", "", "default runtime model for this agent")
 	policy := fs.String("policy", "auto", "autonomy policy")
 	var repos repeatedFlag
 	var capabilities repeatedFlag
@@ -1188,6 +1212,7 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 		RuntimeRef:     *session,
 		RepoScope:      repoScope,
 		TemplateID:     strings.TrimSpace(*templateID),
+		Model:          strings.TrimSpace(*model),
 		Capabilities:   resolvedCapabilities,
 		AutonomyPolicy: strings.TrimSpace(*policy),
 		HealthStatus:   "unknown",
@@ -1797,6 +1822,7 @@ func dbAgent(agent runtime.Agent) db.Agent {
 		RuntimeRef:     agent.RuntimeRef,
 		RepoScope:      agent.RepoScope,
 		TemplateID:     agent.TemplateID,
+		Model:          agent.Model,
 		Capabilities:   agent.Capabilities,
 		AutonomyPolicy: policy,
 		HealthStatus:   agent.HealthStatus,
@@ -1812,6 +1838,7 @@ func runtimeAgent(agent db.Agent) runtime.Agent {
 		RuntimeRef:     agent.RuntimeRef,
 		RepoScope:      agent.RepoScope,
 		TemplateID:     agent.TemplateID,
+		Model:          agent.Model,
 		Capabilities:   agent.Capabilities,
 		AutonomyPolicy: policy,
 		HealthStatus:   agent.HealthStatus,

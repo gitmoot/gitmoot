@@ -36,7 +36,11 @@ func (a KimiAdapter) Start(ctx context.Context, request StartRequest) (StartResu
 	if err != nil {
 		return StartResult{}, err
 	}
-	args := append(kimiPermissionArgs(request.Agent), "-p", request.Prompt, "--output-format", "stream-json")
+	args := kimiPermissionArgs(request.Agent)
+	if request.Agent.Model != "" {
+		args = append(args, "--model", request.Agent.Model)
+	}
+	args = append(args, "-p", request.Prompt, "--output-format", "stream-json")
 	result, err := a.runner().Run(ctx, a.Dir, "kimi", args...)
 	if err != nil {
 		return StartResult{Raw: result.Stdout + result.Stderr}, kimiCommandError(result, err)
@@ -65,7 +69,12 @@ func (a KimiAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result,
 	if err := a.Validate(ctx, agent); err != nil {
 		return Result{}, err
 	}
-	args := append(kimiPermissionArgs(agent), "-S", agent.RuntimeRef, "-p", job.Prompt, "--output-format", "stream-json")
+	args := kimiPermissionArgs(agent)
+	model := effectiveModel(agent, job)
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+	args = append(args, "-S", agent.RuntimeRef, "-p", job.Prompt, "--output-format", "stream-json")
 	result, err := a.runner().Run(ctx, a.Dir, "kimi", args...)
 	if err != nil {
 		return Result{Raw: result.Stdout + result.Stderr}, kimiCommandError(result, err)

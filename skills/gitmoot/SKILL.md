@@ -93,7 +93,10 @@ score so the players (child agents) run and a finale (continuation) reconvenes
 and synthesizes. `gitmoot orchestrate <agent> "..." [--repo R]` is sugar for
 `gitmoot agent run <agent> --background "..."`. See
 [RESULT_CONTRACT.md](references/RESULT_CONTRACT.md) for the delegation fields and
-termination bounds. Use
+termination bounds. An agent (via `--model` on start/subscribe/type set) and an
+individual job or delegation (via `--model` on run/ask/review/implement or the
+delegation `model` field) can pin a runtime model, with the per-job/delegation
+value overriding the agent default. Use
 `gitmoot plugin doctor` when checking whether Codex, Claude Code, or Kimi Code
 can discover Gitmoot through an installed runtime plugin. Use
 `gitmoot plugin codex-launch --repo <path>` to print a Codex launch command that

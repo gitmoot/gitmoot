@@ -53,6 +53,7 @@ type JobRequest struct {
 	DelegationReason       string
 	RecentDelegationHashes []string
 	DelegationRepeatCount  int
+	Model                  string
 }
 
 type JobPayload struct {
@@ -90,6 +91,7 @@ type JobPayload struct {
 	DelegationReason       string       `json:"delegation_reason,omitempty"`
 	RecentDelegationHashes []string     `json:"recent_delegation_hashes,omitempty"`
 	DelegationRepeatCount  int          `json:"delegation_repeat_count,omitempty"`
+	Model                  string       `json:"model,omitempty"`
 	RawOutputs             []string     `json:"raw_outputs,omitempty"`
 	Result                 *AgentResult `json:"result,omitempty"`
 }
@@ -146,6 +148,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		DelegationReason:       request.DelegationReason,
 		RecentDelegationHashes: request.RecentDelegationHashes,
 		DelegationRepeatCount:  request.DelegationRepeatCount,
+		Model:                  request.Model,
 	})
 	if err != nil {
 		return db.Job{}, err
@@ -275,6 +278,7 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		Prompt:      prompt,
 		Repository:  payload.Repo,
 		PullRequest: payload.PullRequest,
+		Model:       payload.Model,
 	})
 	if strings.TrimSpace(result.Summary) != "" {
 		return result.Summary, err

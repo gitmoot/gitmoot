@@ -25,6 +25,7 @@ type Delegation struct {
 	FailurePolicy string   `json:"failure_policy,omitempty"`
 	Fingerprint   string   `json:"fingerprint,omitempty"`
 	SynthesisRule string   `json:"synthesis_rule,omitempty"`
+	Model         string   `json:"model,omitempty"`
 }
 
 type AgentResult struct {

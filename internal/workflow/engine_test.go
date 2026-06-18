@@ -1976,6 +1976,46 @@ func TestEngineAdvanceDelegationsEnqueuesContinuationOnce(t *testing.T) {
 	}
 }
 
+// TestEngineContinuationCarriesParentModel guards that a per-invocation model
+// (e.g. from `orchestrate <agent> --model opus`) is carried into the coordinator's
+// synthesis continuation, instead of silently falling back to the agent default.
+func TestEngineContinuationCarriesParentModel(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "api", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:   "jerryfane/gitmoot",
+		Branch: "task-005",
+		Sender: "coord",
+		Model:  "opus",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "api", Agent: "api", Action: "review", Prompt: "build api"},
+			},
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob(parent): %v", err)
+	}
+	completeDelegationChild(t, store, "parent-job/delegation/api", JobSucceeded, AgentResult{Decision: "approved", Summary: "api ok"})
+	if err := engine.AdvanceJob(ctx, "parent-job/delegation/api"); err != nil {
+		t.Fatalf("AdvanceJob(api): %v", err)
+	}
+	continuation := mustJob(t, store, delegationContinuationID("parent-job"))
+	cp, err := unmarshalPayload(continuation.Payload)
+	if err != nil {
+		t.Fatalf("unmarshal continuation payload: %v", err)
+	}
+	if cp.Model != "opus" {
+		t.Fatalf("continuation payload Model = %q, want %q (per-invocation model must carry into the synthesis continuation)", cp.Model, "opus")
+	}
+}
+
 func TestEngineDelegationFailurePolicyBlockParent(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -2196,6 +2236,54 @@ func TestEngineDelegationTimeoutPlumbedToChildPayload(t *testing.T) {
 	}
 	if payload.JobTimeout != "30s" {
 		t.Fatalf("child JobTimeout = %q, want %q", payload.JobTimeout, "30s")
+	}
+}
+
+func TestEngineDelegationModelPlumbedToChildPayload(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "audit", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "helper", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "audit", Type: "ask"}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-005",
+		TaskID:    "task-5",
+		TaskTitle: "Parent",
+		Sender:    "audit",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "del-1", Agent: "helper", Action: "review", Prompt: "review this", Model: "  opus  "},
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	child := mustJob(t, store, "parent-job/delegation/del-1")
+	payload, err := unmarshalPayload(child.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	if payload.Model != "opus" {
+		t.Fatalf("child payload Model = %q, want trimmed %q", payload.Model, "opus")
+	}
+}
+
+func TestEngineDelegationRequestCopiesModel(t *testing.T) {
+	engine := Engine{}
+	request := engine.delegationRequest(
+		db.Job{ID: "parent-job", Agent: "audit"},
+		JobPayload{Repo: "jerryfane/gitmoot"},
+		Delegation{ID: "del-1", Agent: "helper", Action: "review", Prompt: "go", Model: "opus"},
+	)
+	if request.Model != "opus" {
+		t.Fatalf("request.Model = %q, want %q", request.Model, "opus")
 	}
 }
 

@@ -184,11 +184,20 @@ gitmoot agent start reviewer \
   --role reviewer \
   --capability ask \
   --capability review \
+  --model gpt-5-codex \
   --start-daemon
 ```
 
 `--runtime` accepts `codex`, `claude`, or `kimi`. For `kimi`, run `kimi login`
 first and restart the Gitmoot daemon so it inherits the session.
+
+`agent start`, `agent subscribe`, and `agent type set` accept an optional
+`--model <name>` flag that sets the agent's default runtime model. It is a
+free-form, runtime-scoped string (a Codex, Claude Code, or Kimi Code model name)
+with no allow-list; both `--model X` and `--model=X` are accepted. A per-job
+`--model` (or a delegation's `model` field) overrides this default, and an
+omitted model preserves the runtime's own default. The same default can be set
+in config under `[agents.<type>].model`.
 
 Subscribe an existing runtime session:
 
@@ -199,7 +208,8 @@ gitmoot agent subscribe reviewer \
   --repo owner/repo \
   --role reviewer \
   --capability ask \
-  --capability review
+  --capability review \
+  --model gpt-5-codex
 ```
 
 Inspect agents:
@@ -222,13 +232,22 @@ gitmoot agent review reviewer --repo owner/repo --pr 12 "Review this PR."
 gitmoot agent implement lead --repo owner/repo --task task-001 "Implement this task."
 gitmoot agent ask project-planner --repo owner/repo "Return the plan status."
 gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot agent run lead --repo owner/repo --model gpt-5-codex "Implement this task."
 gitmoot job watch <job-id>
 ```
+
+`gitmoot agent run`, `ask`, `implement`, and `review` (and `orchestrate`) accept
+an optional `--model <name>` flag that pins the runtime model for that one job,
+overriding the agent's configured default. It is a free-form, runtime-scoped
+string (a Codex, Claude Code, or Kimi Code model name) with no allow-list; an
+omitted `--model` leaves the agent's default model in effect. Both `--model X`
+and `--model=X` are accepted.
 
 Start an orchestra of agents with `gitmoot orchestrate`:
 
 ```sh
 gitmoot orchestrate project-planner "Plan and split this work across agents." --repo owner/repo
+gitmoot orchestrate project-planner "Plan and split this work." --repo owner/repo --model gpt-5-codex
 ```
 
 `gitmoot orchestrate <agent> "..." [--repo R]` is sugar for
@@ -254,8 +273,12 @@ Configure managed background agent types:
 gitmoot agent type list
 gitmoot agent type show planner
 gitmoot agent type set planner --runtime codex --template planner --max-background 2 --idle-timeout 20m
+gitmoot agent type set planner --model gpt-5-codex
 gitmoot agent gc
 ```
+
+`agent type set --model <name>` (or `[agents.<type>].model` in config) sets the
+default runtime model for that managed agent type.
 
 ## Agent Templates
 

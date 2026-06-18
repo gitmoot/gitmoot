@@ -90,6 +90,80 @@ func TestMailboxEnqueuePersistsDelegationMetadata(t *testing.T) {
 	}
 }
 
+func TestMailboxEnqueuePersistsModel(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID:     "job-model",
+		Agent:  "audit",
+		Action: "review",
+		Repo:   "jerryfane/gitmoot",
+		Model:  "opus",
+	}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+
+	stored, err := store.GetJob(ctx, "job-model")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if !strings.Contains(stored.Payload, `"model":"opus"`) {
+		t.Fatalf("payload = %q, want it to contain model override", stored.Payload)
+	}
+	payload, err := unmarshalPayload(stored.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	if payload.Model != "opus" {
+		t.Fatalf("payload.Model = %q, want %q", payload.Model, "opus")
+	}
+}
+
+func TestMailboxEnqueueOmitsEmptyModel(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID:     "job-no-model",
+		Agent:  "audit",
+		Action: "review",
+		Repo:   "jerryfane/gitmoot",
+	}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+
+	stored, err := store.GetJob(ctx, "job-no-model")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if strings.Contains(stored.Payload, `"model"`) {
+		t.Fatalf("payload = %q, want no model key when override is empty", stored.Payload)
+	}
+}
+
+func TestMailboxRunDeliversModelOverride(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "jerryfane/gitmoot", Role: "reviewer"}
+	adapter := &fakeDelivery{outputs: []string{
+		`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+	}}
+
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "implement", Repo: "jerryfane/gitmoot", Model: "opus"}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if len(adapter.models) != 1 || adapter.models[0] != "opus" {
+		t.Fatalf("delivered runtime.Job models = %+v, want the payload model override [opus]", adapter.models)
+	}
+}
+
 func TestMailboxEnqueuePersistsRootJobID(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
@@ -517,11 +591,13 @@ type fakeDelivery struct {
 	outputs   []string
 	summaries []string
 	prompts   []string
+	models    []string
 	onDeliver func()
 }
 
 func (f *fakeDelivery) Deliver(_ context.Context, _ runtime.Agent, job runtime.Job) (runtime.Result, error) {
 	f.prompts = append(f.prompts, job.Prompt)
+	f.models = append(f.models, job.Model)
 	if f.onDeliver != nil {
 		f.onDeliver()
 	}

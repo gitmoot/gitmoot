@@ -48,6 +48,56 @@ job_timeout = "5m"
 	}
 }
 
+func TestLoadAndSaveAgentTypeModel(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[agents.x]
+runtime = "claude"
+model = "claude-opus"
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	types, err := LoadAgentTypes(paths)
+	if err != nil {
+		t.Fatalf("LoadAgentTypes returned error: %v", err)
+	}
+	if got := types["x"].Model; got != "claude-opus" {
+		t.Fatalf("model = %q, want claude-opus", got)
+	}
+
+	// writeAgentTypeBlock round-trips the model.
+	var builder strings.Builder
+	writeAgentTypeBlock(&builder, types["x"])
+	if !strings.Contains(builder.String(), `model = "claude-opus"`) {
+		t.Fatalf("writeAgentTypeBlock did not write model:\n%s", builder.String())
+	}
+
+	// SaveAgentType round-trips the model through the config file.
+	if err := SaveAgentType(paths, types["x"]); err != nil {
+		t.Fatalf("SaveAgentType returned error: %v", err)
+	}
+	reloaded, err := LoadAgentTypes(paths)
+	if err != nil {
+		t.Fatalf("LoadAgentTypes after save returned error: %v", err)
+	}
+	if got := reloaded["x"].Model; got != "claude-opus" {
+		t.Fatalf("reloaded model = %q, want claude-opus", got)
+	}
+
+	// An empty model omits the model line entirely.
+	empty := reloaded["x"]
+	empty.Model = ""
+	var emptyBuilder strings.Builder
+	writeAgentTypeBlock(&emptyBuilder, empty)
+	if strings.Contains(emptyBuilder.String(), "model =") {
+		t.Fatalf("writeAgentTypeBlock wrote model for empty value:\n%s", emptyBuilder.String())
+	}
+}
+
 func TestLoadAgentTypesIgnoresRetiredTemplateAlias(t *testing.T) {
 	paths := PathsForHome(t.TempDir())
 	if err := Initialize(paths); err != nil {

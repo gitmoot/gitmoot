@@ -513,6 +513,7 @@ func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) 
 		Fingerprint:     strings.TrimSpace(d.Fingerprint),
 		FailurePolicy:   strings.TrimSpace(d.FailurePolicy),
 		SynthesisRule:   strings.TrimSpace(d.SynthesisRule),
+		Model:           strings.TrimSpace(d.Model),
 	}
 }
 
@@ -775,6 +776,7 @@ func (e Engine) handleDelegationLoop(ctx context.Context, job db.Job, payload Jo
 		ID:              delegationContinuationID(job.ID),
 		Agent:           job.Agent,
 		Action:          "ask",
+		Model:           payload.Model,
 		Repo:            payload.Repo,
 		Branch:          payload.Branch,
 		PullRequest:     payload.PullRequest,
@@ -1117,6 +1119,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		ID:           delegationContinuationID(parentJob.ID),
 		Agent:        parentJob.Agent,
 		Action:       "ask",
+		Model:        parentPayload.Model,
 		Repo:         parentPayload.Repo,
 		Branch:       parentPayload.Branch,
 		PullRequest:  parentPayload.PullRequest,

@@ -107,6 +107,10 @@ the same `delegations` field, `coordinator`, and `continuation` mechanics.
   [Top-level fields](#top-level-fields).
 - `fingerprint` (optional): a dedup key. Delegations with identical fingerprints
   are de-duplicated, so the same delegation is not dispatched twice.
+- `model` (optional): a free-form, runtime-scoped model string for the child job
+  (for example a Codex, Claude Code, or Kimi Code model name). When omitted, the
+  delegated agent's configured default model is used. There is no allow-list;
+  Gitmoot passes the value through to the runtime as-is.
 
 ### How delegations run
 
