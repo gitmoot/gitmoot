@@ -29,9 +29,11 @@ trail. Gitmoot makes the repository and its pull requests the shared surface:
 - Local SQLite records agents, repos, jobs, goals, tasks, PRs, and branch locks.
 - Runtime adapters keep Codex, Claude Code, Kimi Code, and future runtimes
   behind the same Gitmoot agent model.
-- Agents can return a validated `delegations[]` DAG that Gitmoot dispatches as
-  child jobs, then enqueues one continuation job to synthesize their results
-  (replacing the old `next_agents` mechanism).
+- **Orchestra** is Gitmoot's name for structured multi-agent delegation: a
+  conductor (coordinator) returns a validated `delegations[]` DAG that Gitmoot
+  dispatches as child jobs (the players), then enqueues one continuation job
+  (the finale) to synthesize their results (replacing the old `next_agents`
+  mechanism). Use `gitmoot orchestrate <agent> "..."` to start one.
 - Delegation trees are bounded by a depth cap, a per-root job budget, and loop
   detection, so coordination halts instead of recursing forever.
 - Agent Templates and job snapshots make agent instructions explicit and reproducible.
@@ -121,13 +123,18 @@ gitmoot agent ask project-planner --repo owner/repo --background "Write the impl
 gitmoot job watch <job-id>
 ```
 
-For coordinator delegation where the request may require review or file edits,
-use `agent run` and let Gitmoot select the safe workflow path:
+For coordinator delegation (the Orchestra pattern) where the request may require
+review or file edits, use `agent run` and let Gitmoot select the safe workflow
+path:
 
 ```sh
 gitmoot agent run lead --repo owner/repo --task task-001 --background "Implement this task."
 gitmoot agent run reviewer --repo owner/repo --pr 12 --background "Review this PR."
 ```
+
+`gitmoot orchestrate <agent> "..." [--repo R]` is sugar for
+`gitmoot agent run <agent> --background "..."` — it starts an orchestra of agents
+from a conductor that returns a `delegations[]` score.
 
 Background jobs are safe by default. The daemon starts with one worker, repo
 checkout locks protect local checkouts, branch locks protect implementation

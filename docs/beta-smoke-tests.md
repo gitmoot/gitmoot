@@ -148,7 +148,12 @@ Expected signals:
    gitmoot daemon status
    ```
 
-## Delegation Smoke Test
+## Delegation (Orchestra) Smoke Test
+
+Orchestra is Gitmoot's name for structured multi-agent delegation: a conductor
+(coordinator) returns a `delegations[]` score, the players (child agents) run in
+parallel or in dependency order, and a finale (continuation) reconvenes and
+synthesizes the results.
 
 Goal: background coordinator job -> `delegations` in the coordinator result ->
 two child jobs fanned out to worker agents -> both children succeed -> coordinator
