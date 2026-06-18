@@ -420,7 +420,7 @@ func (m Model) agentGroupDeleteConfirmView() string {
 	}
 	b.WriteByte('\n')
 	if k := m.agentsWithActiveJobs(m.groupDeleteNames); k > 0 {
-		b.WriteString(mutedStyle.Render(strconv.Itoa(k)+" have active jobs and will be skipped.") + "\n")
+		b.WriteString(mutedStyle.Render(strconv.Itoa(k)+" currently have active jobs and will be skipped.") + "\n")
 	}
 	b.WriteString("Unregister the whole group? (y/n)\n")
 	if m.actionErr != "" {

@@ -80,6 +80,59 @@ func TestAgentGroupDeleteFlow(t *testing.T) {
 	}
 }
 
+// TestAgentGroupDeleteStandaloneFallsBackToSingle guards the safety rule: X on a
+// template-less agent opens the single-agent delete (not a bulk delete of the
+// whole heterogeneous "Standalone agents" catch-all).
+func TestAgentGroupDeleteStandaloneFallsBackToSingle(t *testing.T) {
+	snap := agentsSnapshot()
+	snap.Agents = append(snap.Agents, Agent{Name: "drifter", Runtime: "codex"}) // TemplateID ""
+	called := false
+	deps := Deps{DeleteAgents: func(names []string) (int, []string, error) { called = true; return 0, nil, nil }}
+	m := agentsModel(t, deps, snap)
+	for i := 0; i < 6; i++ {
+		if a, ok := m.agentUnderCursor(); ok && a.Name == "drifter" {
+			break
+		}
+		next, _ := m.Update(key("j"))
+		m = next.(Model)
+	}
+	next, _ := m.Update(key("X"))
+	m = next.(Model)
+	if m.mode != modeConfirmAgentDelete {
+		t.Fatalf("X on a standalone agent should open single delete, mode=%v", m.mode)
+	}
+	if called {
+		t.Fatal("standalone X must not bulk-delete the catch-all group")
+	}
+}
+
+// TestAgentGroupDeletePartialErrorReported guards that a partial-error bulk delete
+// still closes the overlay, reports the committed deletes, and surfaces the error
+// (so the stale list/retry-wedge can't happen).
+func TestAgentGroupDeletePartialErrorReported(t *testing.T) {
+	snap := agentsSnapshot()
+	snap.Agents = append(snap.Agents, Agent{Name: "planner-2", Runtime: "claude", TemplateID: "planner-tpl"})
+	deps := Deps{DeleteAgents: func(names []string) (int, []string, error) {
+		return 1, nil, errors.New("db locked") // one committed, then failed
+	}}
+	m := agentsModel(t, deps, snap)
+	next, _ := m.Update(key("X"))
+	m = next.(Model)
+	next, cmd := m.Update(key("y"))
+	m = next.(Model)
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("a partial-error delete should still close the overlay, mode=%v", m.mode)
+	}
+	if !strings.Contains(m.agentNotice, "deleted 1") {
+		t.Fatalf("should still report the committed deletes: %q", m.agentNotice)
+	}
+	if !strings.Contains(m.agentErr, "db locked") {
+		t.Fatalf("should surface the error: %q", m.agentErr)
+	}
+}
+
 // TestAgentGroupDeleteNoDepInert verifies X is inert without a DeleteAgents dep.
 func TestAgentGroupDeleteNoDepInert(t *testing.T) {
 	m := agentsModel(t, Deps{}, agentsSnapshot())

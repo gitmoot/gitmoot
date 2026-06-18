@@ -742,9 +742,15 @@ func (s *Store) RemoveAgent(ctx context.Context, name string) (bool, error) {
 	return affected > 0, tx.Commit()
 }
 
+// ErrAgentHasActiveJobs is the sentinel DeleteAgentChecked wraps when it refuses
+// an agent that still has queued/running jobs. Callers (e.g. the dashboard's
+// bulk delete) classify "skip vs hard error" with errors.Is rather than matching
+// the message text.
+var ErrAgentHasActiveJobs = errors.New("agent has queued or running jobs")
+
 // DeleteAgentChecked removes an agent (and its instances) unless queued or
-// running jobs still reference it, in which case it refuses so in-flight work is
-// never orphaned.
+// running jobs still reference it, in which case it refuses (wrapping
+// ErrAgentHasActiveJobs) so in-flight work is never orphaned.
 func (s *Store) DeleteAgentChecked(ctx context.Context, name string) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -760,7 +766,7 @@ func (s *Store) DeleteAgentChecked(ctx context.Context, name string) error {
 		return err
 	}
 	if active > 0 {
-		return fmt.Errorf("agent %s has %d queued or running job(s); cancel them first", name, active)
+		return fmt.Errorf("agent %s has %d queued or running job(s); cancel them first: %w", name, active, ErrAgentHasActiveJobs)
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM agent_repos WHERE agent_name = ?`, name); err != nil {
 		return err

@@ -464,11 +464,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(cmds...)
 			}
 		case "X":
-			if pages[m.selected].page == pageAgents && m.deps.DeleteAgents != nil {
-				if _, ok := m.agentUnderCursor(); ok {
-					m.openAgentGroupDelete()
-					m.viewport.SetContent(m.content())
-					return m, tea.Batch(cmds...)
+			if pages[m.selected].page == pageAgents {
+				if agent, ok := m.agentUnderCursor(); ok {
+					// The "Standalone agents" bucket is a heterogeneous catch-all
+					// (every template-less agent), not a coherent set — bulk-deleting
+					// it would be a footgun, so fall back to single-agent delete.
+					if agent.TemplateID == "" {
+						m.openAgentDelete(agent)
+						m.viewport.SetContent(m.content())
+						return m, tea.Batch(cmds...)
+					}
+					if m.deps.DeleteAgents != nil {
+						m.openAgentGroupDelete()
+						m.viewport.SetContent(m.content())
+						return m, tea.Batch(cmds...)
+					}
 				}
 			}
 		case "o":
@@ -812,21 +822,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case agentGroupDeleteMsg:
 		if m.mode == modeConfirmAgentGroupDelete {
+			// The deletes are already committed (each is its own tx), so always
+			// close the overlay, report what actually happened, and refresh — even
+			// on a partial error — so the list never shows already-deleted agents
+			// and a retry can't wedge re-deleting them.
 			m.actionBusy = false
+			m.mode = modeNormal
+			note := "deleted " + strconv.Itoa(msg.deleted) + " agent(s)"
+			if len(msg.skipped) > 0 {
+				note += " · " + strconv.Itoa(len(msg.skipped)) + " skipped (active jobs)"
+			}
+			m.agentNotice = note
 			if msg.err != nil {
-				m.actionErr = msg.err.Error()
+				m.agentErr = msg.err.Error()
 			} else {
-				m.mode = modeNormal
-				m.actionErr = ""
-				note := "deleted " + strconv.Itoa(msg.deleted) + " agent(s)"
-				if len(msg.skipped) > 0 {
-					note += " · " + strconv.Itoa(len(msg.skipped)) + " skipped (active jobs)"
-				}
-				m.agentNotice = note
-				m.agentCursor = clampCursor(m.agentCursor, len(m.visibleAgents()))
-				if cmd := m.queueLoad(); cmd != nil {
-					cmds = append(cmds, cmd)
-				}
+				m.agentErr = ""
+			}
+			m.agentCursor = clampCursor(m.agentCursor, len(m.visibleAgents()))
+			if cmd := m.queueLoad(); cmd != nil {
+				cmds = append(cmds, cmd)
 			}
 		}
 	case daemonStartMsg:

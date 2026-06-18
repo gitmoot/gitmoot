@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -192,9 +193,10 @@ func TestDeleteAgentChecked(t *testing.T) {
 	if err := store.CreateJob(ctx, Job{ID: "j1", Agent: "worker", Type: "ask", State: "queued"}); err != nil {
 		t.Fatalf("job: %v", err)
 	}
-	// Refused while a queued job references the agent.
-	if err := store.DeleteAgentChecked(ctx, "worker"); err == nil || !strings.Contains(err.Error(), "queued or running") {
-		t.Fatalf("expected job-reference refusal, got %v", err)
+	// Refused while a queued job references the agent — wraps the sentinel so
+	// callers can classify with errors.Is, not message text.
+	if err := store.DeleteAgentChecked(ctx, "worker"); err == nil || !errors.Is(err, ErrAgentHasActiveJobs) {
+		t.Fatalf("expected job-reference refusal (ErrAgentHasActiveJobs), got %v", err)
 	}
 	if err := store.UpdateJobState(ctx, "j1", "succeeded"); err != nil {
 		t.Fatalf("settle job: %v", err)
