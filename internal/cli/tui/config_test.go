@@ -61,6 +61,59 @@ func TestConfigPageRendersSections(t *testing.T) {
 	}
 }
 
+// TestConfigEditableSettingsGroupedBySection verifies the editable settings
+// render grouped under their section sub-headers (in section order) while the
+// cursor still indexes the flat field order across sections.
+func TestConfigEditableSettingsGroupedBySection(t *testing.T) {
+	snap := Snapshot{
+		Daemon: Daemon{Running: true},
+		Config: ConfigView{
+			Path: "/c.toml",
+			Sections: []ConfigSection{
+				{Title: "daemon", Editable: []ConfigField{{Label: "workers", Value: "1"}}},
+				{Title: "delegation", Editable: []ConfigField{
+					{Label: "max depth", Value: "8"},
+					{Label: "budget", Value: "40"},
+				}},
+			},
+		},
+	}
+	m := configModel(t, Deps{}, snap)
+	view := m.View()
+
+	// Within the editable block, each section sub-header precedes its fields, in
+	// section order (slice the view from "editable settings" so the read-only
+	// overview above it can't satisfy the assertion).
+	eb := strings.Index(view, "editable settings")
+	if eb < 0 {
+		t.Fatalf("missing editable settings block:\n%s", view)
+	}
+	sub := view[eb:]
+	last := -1
+	for _, s := range []string{"daemon", "workers", "delegation", "max depth", "budget"} {
+		i := strings.Index(sub, s)
+		if i < 0 {
+			t.Fatalf("editable block missing %q:\n%s", s, sub)
+		}
+		if i < last {
+			t.Fatalf("editable block out of order at %q:\n%s", s, sub)
+		}
+		last = i
+	}
+
+	// The cursor indexes the flat field order across sections.
+	if f := m.configEditableFields(); len(f) != 3 || f[0].Label != "workers" || f[2].Label != "budget" {
+		t.Fatalf("flat field order wrong: %+v", f)
+	}
+	for i := 0; i < 2; i++ {
+		next, _ := m.Update(key("j"))
+		m = next.(Model)
+	}
+	if m.configCursor != 2 {
+		t.Fatalf("cursor should be 2 (budget) after two downs, got %d", m.configCursor)
+	}
+}
+
 func TestConfigEditDispatchesEditorCmd(t *testing.T) {
 	edited := false
 	deps := Deps{

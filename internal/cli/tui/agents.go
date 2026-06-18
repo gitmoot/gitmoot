@@ -600,10 +600,11 @@ func (m Model) agentsContentInteractive() string {
 }
 
 // agentGroupLabel is the section header for a template group; agents without a
-// template share the "(no template)" group.
+// template — they run a custom prompt rather than a reusable template — share
+// the "Standalone agents" group.
 func agentGroupLabel(templateID string) string {
 	if strings.TrimSpace(templateID) == "" {
-		return "(no template)"
+		return "Standalone agents (custom prompt)"
 	}
 	return templateID
 }
@@ -663,7 +664,7 @@ func (m Model) agentDetailView() string {
 	b.WriteByte('\n')
 	switch {
 	case a.TemplateID == "":
-		b.WriteString(mutedStyle.Render("no template") + "\n")
+		b.WriteString(mutedStyle.Render("none — standalone agent, runs a custom prompt") + "\n")
 	case m.agentVersionsErr != "":
 		b.WriteString(errorStyle.Render(m.agentVersionsErr) + "\n")
 	case !m.agentVersionsLoaded:

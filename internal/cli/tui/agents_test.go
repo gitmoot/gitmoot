@@ -57,9 +57,9 @@ func TestAgentsPageHidesTrainingAgents(t *testing.T) {
 		t.Fatalf("training agents must be hidden:\n%s", view)
 	}
 	// The hidden training agents have empty TemplateID, but they are filtered
-	// before grouping, so they must not surface a "(no template)" header.
-	if strings.Contains(view, "(no template)") {
-		t.Fatalf("hidden agents must not introduce a (no template) group:\n%s", view)
+	// before grouping, so they must not surface a "Standalone agents (custom prompt)" header.
+	if strings.Contains(view, "Standalone agents (custom prompt)") {
+		t.Fatalf("hidden agents must not introduce a Standalone agents (custom prompt) group:\n%s", view)
 	}
 	// The cursor + enter act on the VISIBLE list (planner is first visible).
 	if a, ok := m.agentUnderCursor(); !ok || a.Name != "planner" {
@@ -76,7 +76,7 @@ func TestAgentsPageHidesTrainingAgents(t *testing.T) {
 func TestAgentsPageGroupsByTemplate(t *testing.T) {
 	snap := agentsSnapshot()
 	// A second agent on planner-tpl (stays in the planner-tpl group) and one
-	// with no template (its own "(no template)" group).
+	// with no template (its own "Standalone agents (custom prompt)" group).
 	snap.Agents = append(snap.Agents,
 		Agent{Name: "scout", Runtime: "claude", TemplateID: "planner-tpl"},
 		Agent{Name: "drifter", Runtime: "codex"},
@@ -84,26 +84,26 @@ func TestAgentsPageGroupsByTemplate(t *testing.T) {
 	m := agentsModel(t, Deps{}, snap)
 	view := m.View()
 	// Both template headers and the no-template header render.
-	for _, want := range []string{"planner-tpl", "reviewer-tpl", "(no template)"} {
+	for _, want := range []string{"planner-tpl", "reviewer-tpl", "Standalone agents (custom prompt)"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("grouped view missing header %q:\n%s", want, view)
 		}
 	}
 	// Headers appear in first-appearance order: planner-tpl, then reviewer-tpl,
-	// then the (no template) group last.
+	// then the Standalone agents (custom prompt) group last.
 	pIdx := strings.Index(view, "planner-tpl")
 	rIdx := strings.Index(view, "reviewer-tpl")
-	nIdx := strings.Index(view, "(no template)")
+	nIdx := strings.Index(view, "Standalone agents (custom prompt)")
 	if !(pIdx < rIdx && rIdx < nIdx) {
 		t.Fatalf("group headers out of order (planner=%d reviewer=%d none=%d):\n%s", pIdx, rIdx, nIdx, view)
 	}
-	// The (no template) header precedes its sole member.
+	// The Standalone agents (custom prompt) header precedes its sole member.
 	if nIdx > strings.Index(view, "drifter") {
-		t.Fatalf("the (no template) header should precede its agent:\n%s", view)
+		t.Fatalf("the Standalone agents (custom prompt) header should precede its agent:\n%s", view)
 	}
 	// Cursor follows the on-screen (grouped) order, so ↑/↓ step through rows in
 	// the order they render: the planner-tpl group (planner, scout) first, then
-	// reviewer-tpl (reviewer), then the (no template) group (drifter).
+	// reviewer-tpl (reviewer), then the Standalone agents (custom prompt) group (drifter).
 	wants := []string{"planner", "scout", "reviewer", "drifter"}
 	for i, want := range wants {
 		a, ok := m.agentUnderCursor()
