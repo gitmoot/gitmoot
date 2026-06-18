@@ -281,6 +281,59 @@ func runAgentRun(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// runOrchestrate is the top-level `gitmoot orchestrate` command: sugar for
+// `gitmoot agent run <agent> --background "<message>"`. The named agent is the
+// conductor (coordinator) that returns a delegations[] score; the players
+// (child agents) run in parallel or in dependency order, and a finale
+// (continuation) reconvenes and synthesizes the results. It forwards to the
+// SAME dispatch as `agent run` with the run action and Background forced on, so
+// the engine and the delegations schema are untouched.
+func runOrchestrate(args []string, stdout, stderr io.Writer) int {
+	if containsHelpFlag(args) || len(args) == 0 {
+		printOrchestrateUsage(stdout)
+		if len(args) == 0 {
+			fmt.Fprintln(stderr, "orchestrate requires exactly one agent and one message")
+			return 2
+		}
+		return 0
+	}
+	options, ok := parseAgentRunOptions("run", args, stderr)
+	if !ok {
+		return 2
+	}
+	// Force the background run path: orchestrate always fans out delegations.
+	options.background = true
+	selected, reason := selectAgentRunAction(options)
+	output, exit := dispatchAgentCommand(options, selected, reason, "orchestrate", stdout, stderr)
+	if exit != 0 {
+		return exit
+	}
+	if options.jsonOutput {
+		if err := writeJSON(stdout, output); err != nil {
+			fmt.Fprintf(stderr, "orchestrate: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	printLocalAgentJobOutput(stdout, output)
+	printQueuedDaemonHint(stdout, output, options.background, options.home)
+	return 0
+}
+
+func printOrchestrateUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--home path] [--json]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Orchestrate work across agents (a coordinator that fans out delegations).")
+	fmt.Fprintln(w, "Sugar for `gitmoot agent run <agent> --background`: the named agent is the")
+	fmt.Fprintln(w, "conductor (coordinator) that returns a delegations[] score; the players (child")
+	fmt.Fprintln(w, "agents) run in parallel or in dependency order, and a finale (continuation)")
+	fmt.Fprintln(w, "reconvenes and synthesizes the results.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Example:")
+	fmt.Fprintln(w, "  gitmoot orchestrate planner \"audit the auth flow and fan out fixes\" --repo owner/repo")
+}
+
 func runAgentReview(args []string, stdout, stderr io.Writer) int {
 	options, ok := parseAgentRunOptions("review", args, stderr)
 	if !ok {

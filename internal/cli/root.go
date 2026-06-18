@@ -29,6 +29,7 @@ var rootCommands = []command{
 	{name: "repo", summary: "manage watched repositories", run: runRepo},
 	{name: "daemon", summary: "run the local PR watcher", run: runDaemon},
 	{name: "agent", summary: "manage registered agents", run: runAgent},
+	{name: "orchestrate", summary: "Orchestrate work across agents (a coordinator that fans out delegations)", run: runOrchestrate},
 	{name: "plugin", summary: "build and inspect Gitmoot agent plugins", run: runPlugin},
 	{name: "events", summary: "show local repo events", run: runEvents},
 	{name: "status", summary: "show local workflow status", run: runStatus},
@@ -68,7 +69,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Commands:")
 	for _, cmd := range rootCommands {
-		fmt.Fprintf(w, "  %-8s %s\n", cmd.name, cmd.summary)
+		fmt.Fprintf(w, "  %-11s %s\n", cmd.name, cmd.summary)
 	}
 }
 
