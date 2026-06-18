@@ -61,6 +61,13 @@ gitmoot agent ask project-planner --repo owner/repo --background "Write the impl
 gitmoot job watch <job-id>
 ```
 
+Pin the runtime model for a single job with `--model <name>` (a free-form,
+runtime-scoped Codex, Claude Code, or Kimi Code model name):
+
+```sh
+gitmoot agent run lead --repo owner/repo --model gpt-5-codex "Implement this task."
+```
+
 Or route work through PR comments:
 
 ```text
@@ -81,7 +88,12 @@ gitmoot events --repo owner/repo
 
 Use `gitmoot agent run` for coordinator delegation that may route to ask,
 review, or implement. Use `gitmoot agent ask` for analysis and planning only.
-Use `gitmoot dashboard --json` for scripts and noninteractive agent checks.
+
+On a real terminal, `gitmoot dashboard` launches an interactive TUI cockpit with
+pages for Attention, Trains, Agents, Runtime sessions, Jobs, and Locks (pending
+prompts live under Attention). Use `gitmoot dashboard --plain` for a one-shot
+snapshot and `gitmoot dashboard --json` for scripts and noninteractive agent
+checks.
 
 To kick off an orchestra of agents — a conductor (coordinator) that returns a
 `delegations[]` score, players (child agents) that run in parallel or in

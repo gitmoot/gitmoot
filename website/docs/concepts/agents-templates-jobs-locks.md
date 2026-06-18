@@ -106,7 +106,7 @@ Gitmoot uses separate locks for separate resources:
 
 - Repo checkout locks keep daemon ticks from using the same local checkout at
   the same time.
-- Runtime session locks serialize Codex or Claude delivery for the same
+- Runtime session locks serialize Codex, Claude, or Kimi delivery for the same
   `runtime:<runtime>:<runtime_ref>` across daemon jobs, `job run`, and
   synchronous `agent ask`.
 - Branch locks prevent multiple agents from racing on the same implementation

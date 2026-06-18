@@ -97,7 +97,7 @@ equivalent:
   recent job (then a version) and `enter` opens it: a recent job opens that job's
   detail (`esc` returns), and the list scrolls when an agent has many jobs; `n`
   registers a new agent
-  (name, codex/claude runtime, installed template); `o` starts a training
+  (name, codex/claude/kimi runtime, installed template); `o` starts a training
   session for the agent's template via a pre-filled form (review/workspace
   repos, request, codex/claude backend, optional model — the backend/model are
   stored in the session's optimizer defaults so `train continue` inherits

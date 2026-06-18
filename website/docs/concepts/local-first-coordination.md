@@ -9,8 +9,8 @@ audit trail.
 - **Repo**: a GitHub repository plus the local checkout path Gitmoot may use.
 - **Daemon**: the background process that polls GitHub and routes jobs.
 - **SQLite state**: local records for repos, agents, jobs, tasks, locks, and PRs.
-- **Runtime adapter**: a runtime-specific bridge for Codex, Claude Code, shell,
-  or future agents.
+- **Runtime adapter**: a runtime-specific bridge for Codex, Claude Code, Kimi
+  Code, shell, or future agents.
 - **Pull request comments**: the shared human-visible command and result log.
 
 This keeps a beta deployment simple: no webhook receiver, hosted dashboard,

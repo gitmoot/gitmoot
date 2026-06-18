@@ -148,11 +148,12 @@ CLI auth, or runtime/model credentials.
 
 ## Runtime Session Not Found
 
-Symptom: `gitmoot agent doctor <name>` cannot validate a Codex or Claude
+Symptom: `gitmoot agent doctor <name>` cannot validate a Codex, Claude, or Kimi
 session, or a job resumes the wrong session.
 
 Likely cause: a `last` reference changed, the runtime home changed, or the
-session id is stale.
+session id is stale. For a Kimi agent, the runtime reference must be a Kimi
+session id (`session_<uuid>`) or empty.
 
 Check:
 
@@ -162,6 +163,7 @@ gitmoot agent show <agent>
 gitmoot agent doctor <agent>
 codex exec resume --help
 claude --help
+kimi --help
 ```
 
 Fix: prefer explicit session UUIDs or thread names over `last`, then
