@@ -240,6 +240,18 @@ gitmoot agent ask project-planner --repo owner/repo --background "Write the impl
 gitmoot job watch <job-id>
 ```
 
+Start an orchestra of agents with `gitmoot orchestrate`:
+
+```sh
+gitmoot orchestrate project-planner "Plan and split this work across agents." --repo owner/repo
+```
+
+`gitmoot orchestrate <agent> "..." [--repo R]` is sugar for
+`gitmoot agent run <agent> --background "..."`. It starts a conductor
+(coordinator) that returns a `delegations[]` score; the players (child agents)
+then run in parallel or in dependency order, and a finale (continuation)
+reconvenes and synthesizes the results.
+
 This uses the same agent registry, repo access grants, cached template snapshot,
 runtime adapter, and local job history as PR-comment jobs. `agent run` is the
 default coordinator-safe entrypoint because it routes to `ask`, `review`, or

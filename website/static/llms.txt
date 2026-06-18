@@ -19,7 +19,7 @@ workflows.
 
 - [CLI Reference](https://gitmoot.io/docs/reference/cli): Commands for install, dashboard/TUI, agents, jobs, bug reports, locks, goals, and SkillOpt.
 - [Runtime Adapters](https://gitmoot.io/docs/reference/runtime-adapters): Codex, Claude Code, Kimi Code, shell, and future runtimes.
-- [Result Contract](https://gitmoot.io/docs/reference/result-contract): gitmoot_result shape, the delegations DAG, continuation, and termination bounds.
+- [Result Contract](https://gitmoot.io/docs/reference/result-contract): gitmoot_result shape, the delegations DAG (Orchestration), continuation, and termination bounds.
 - [Codex And Claude Plugins](https://gitmoot.io/docs/plugins/codex-claude): Plugin discovery and runtime skill setup.
 - [SkillOpt Exchange Contract](https://gitmoot.io/docs/reference/skillopt-exchange-contract): Training and candidate package boundary for the external optimizer.
 - [Troubleshooting](https://gitmoot.io/docs/operations/troubleshooting): Diagnose GitHub auth, bug reports, runtimes, agent templates, remotes, permissions, and locks.

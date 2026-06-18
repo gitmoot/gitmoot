@@ -45,6 +45,12 @@ and loop detection, so offending delegations are dropped rather than retried
 forever. See the [Result Contract](../reference/result-contract.md) for the full
 field reference.
 
+**Orchestra** is gitmoot's name for this structured multi-agent delegation: a
+conductor (coordinator) returns a `delegations[]` score, the players (child
+agents) run in parallel or in dependency order, and a finale (continuation)
+reconvenes and synthesizes the results. It is a naming layer on top of the same
+`delegations` mechanics described above.
+
 ## Locks
 
 Gitmoot uses separate locks for separate resources:

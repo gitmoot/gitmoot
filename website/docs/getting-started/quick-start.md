@@ -82,3 +82,15 @@ gitmoot events --repo owner/repo
 Use `gitmoot agent run` for coordinator delegation that may route to ask,
 review, or implement. Use `gitmoot agent ask` for analysis and planning only.
 Use `gitmoot dashboard --json` for scripts and noninteractive agent checks.
+
+To kick off an orchestra of agents — a conductor (coordinator) that returns a
+`delegations[]` score, players (child agents) that run in parallel or in
+dependency order, and a finale (continuation) that reconvenes and synthesizes —
+use `gitmoot orchestrate`:
+
+```sh
+gitmoot orchestrate project-planner "Plan and split this work across agents." --repo owner/repo
+```
+
+`gitmoot orchestrate <agent> "..." [--repo R]` is sugar for
+`gitmoot agent run <agent> --background "..."`.

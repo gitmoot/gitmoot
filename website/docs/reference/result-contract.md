@@ -42,13 +42,23 @@ credentials, unclear scope, unavailable tools, failing external services, or
 required human decisions. Always redact secrets from summaries, findings, raw
 command output, and examples.
 
-## Delegations
+## Delegations (Orchestration)
 
 The `delegations` array is how an agent asks named Gitmoot agents to do
 follow-up work. Each entry describes a child job that Gitmoot spawns and tracks.
 This is the mechanism that replaced the legacy `next_agents` field: rather than
 naming a single hand-off, an agent can request a structured set of child jobs
 with dependencies, failure handling, and synthesis rules.
+
+**Orchestra** is gitmoot's name for structured multi-agent delegation: a
+conductor (coordinator) returns a `delegations[]` score, the players (child
+agents) run in parallel or in dependency order, and a finale (continuation)
+reconvenes and synthesizes the results. The vocabulary maps onto the contract
+below: the conductor is the coordinator agent; the players are the delegated
+child agents; the score is the `delegations[]` DAG (`deps` are the cues); and
+the finale is the continuation job that reconvenes and synthesizes. None of the
+JSON keys or identifiers change — "Orchestra/orchestrate" is layered on top of
+the same `delegations` field, `coordinator`, and `continuation` mechanics.
 
 ```json
 {

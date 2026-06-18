@@ -14,6 +14,8 @@ hosted control plane in the current beta.
 - Keep Codex, Claude Code, Kimi Code, shell, and future runtimes behind one
   agent model.
 - Start or subscribe agents with explicit repo access and capabilities.
+- Orchestrate work across multiple agents with structured delegations and
+  automatic synthesis.
 - Use agent templates for reusable planner, review, or custom prompt agents.
 - Capture a successful current chat as a reviewed, reusable agent template
   draft.
