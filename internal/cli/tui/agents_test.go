@@ -35,6 +35,56 @@ func agentsModel(t *testing.T, deps Deps, snap Snapshot) Model {
 	return m
 }
 
+// TestAgentsHiddenLineShowsLiveCount verifies the hidden-agents line annotates how
+// many live sessions belong to hidden training agents (so the LIVE column isn't
+// silently empty when all live work is under hidden agents).
+func TestAgentsHiddenLineShowsLiveCount(t *testing.T) {
+	snap := agentsSnapshot()
+	snap.Agents = append(snap.Agents, Agent{Name: "skillopt-generator", Runtime: "codex"})
+	snap.Sessions = []Session{
+		{Name: "skillopt-generator-bg-1", Type: "skillopt-generator", Runtime: "codex", State: "running"},
+		{Name: "skillopt-generator-bg-2", Type: "skillopt-generator", Runtime: "codex", State: "idle"},
+	}
+	m := agentsModel(t, Deps{}, snap)
+	view := m.View()
+	if !strings.Contains(view, "1 training agents hidden") {
+		t.Fatalf("expected a hidden count:\n%s", view)
+	}
+	if !strings.Contains(view, "2 live") || !strings.Contains(view, "1 running") {
+		t.Fatalf("hidden line should annotate live/running session counts:\n%s", view)
+	}
+}
+
+// TestAgentsShowAllToggle verifies the 'a' key un-hides the training agents (and
+// hides them again), and that their LIVE counts then appear.
+func TestAgentsShowAllToggle(t *testing.T) {
+	snap := agentsSnapshot()
+	snap.Agents = append(snap.Agents, Agent{Name: "skillopt-generator", Runtime: "codex"})
+	snap.Sessions = []Session{
+		{Name: "skillopt-generator-bg-1", Type: "skillopt-generator", Runtime: "codex", State: "running"},
+	}
+	m := agentsModel(t, Deps{}, snap)
+	if strings.Contains(m.View(), "skillopt-generator") {
+		t.Fatalf("training agent should be hidden by default:\n%s", m.View())
+	}
+	// 'a' shows all.
+	next, _ := m.Update(key("a"))
+	m = next.(Model)
+	view := m.View()
+	if !strings.Contains(view, "skillopt-generator") {
+		t.Fatalf("'a' should reveal the hidden training agent:\n%s", view)
+	}
+	if !strings.Contains(view, "showing all agents") {
+		t.Fatalf("show-all mode should be indicated:\n%s", view)
+	}
+	// 'a' again hides them.
+	next, _ = m.Update(key("a"))
+	m = next.(Model)
+	if strings.Contains(m.View(), "skillopt-generator") {
+		t.Fatalf("'a' again should re-hide the training agent:\n%s", m.View())
+	}
+}
+
 func TestAgentsPageHidesTrainingAgents(t *testing.T) {
 	snap := agentsSnapshot()
 	// Add internal training plumbing alongside the real agents.

@@ -259,7 +259,7 @@ func (m Model) footerHelp() string {
 	case pageTrains:
 		return "tab/←→ page  ↑/↓ select  enter open  s stop  d delete  ? help  q quit"
 	case pageAgents:
-		return "tab/←→ page  ↑/↓ select  enter detail  n new  o optimize  e runtime  D delete  ? help  q quit"
+		return "tab/←→ page  ↑/↓ select  enter detail  n new  o optimize  e runtime  D delete  a show all/hide  ? help  q quit"
 	case pageSessions:
 		return "tab/←→ page  ↑/↓ select  enter detail  s stop  ? help  q quit"
 	case pageJobs:

@@ -49,6 +49,9 @@ func isManagedTrainingAgent(name string) bool {
 // Agents page renders, cursors, and acts on this list; the serialized snapshot
 // keeps every agent, so --json/--plain are unaffected.
 func (m Model) visibleAgents() []Agent {
+	if m.showAllAgents {
+		return m.snap.Agents
+	}
 	out := make([]Agent, 0, len(m.snap.Agents))
 	for _, a := range m.snap.Agents {
 		if !isManagedTrainingAgent(a.Name) {
@@ -543,9 +546,39 @@ func choiceValues(choices []Choice) []string {
 func (m Model) agentsContentInteractive() string {
 	visible := m.visibleAgents()
 	hidden := len(m.snap.Agents) - len(visible)
+	// LIVE = warm runtime sessions per agent. Count once over all sessions (keyed
+	// by owning agent) so the render stays O(agents + sessions); also tally the
+	// sessions owned by hidden training agents to annotate the hidden line.
+	liveByAgent := map[string]int{}
+	hiddenLive, hiddenRunning := 0, 0
+	for _, s := range m.snap.Sessions {
+		name := sessionAgentName(s)
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		liveByAgent[name]++
+		if isManagedTrainingAgent(name) {
+			hiddenLive++
+			if s.State == "running" {
+				hiddenRunning++
+			}
+		}
+	}
 	hiddenLine := func(b *strings.Builder) {
+		if m.showAllAgents {
+			b.WriteString("\n" + mutedStyle.Render("showing all agents · a hide training") + "\n")
+			return
+		}
 		if hidden > 0 {
-			b.WriteString("\n" + mutedStyle.Render(strconv.Itoa(hidden)+" training agents hidden (skillopt-*)") + "\n")
+			line := strconv.Itoa(hidden) + " training agents hidden (skillopt-*)"
+			if hiddenLive > 0 {
+				line += " · " + strconv.Itoa(hiddenLive) + " live"
+				if hiddenRunning > 0 {
+					line += " (" + strconv.Itoa(hiddenRunning) + " running)"
+				}
+			}
+			line += " · a show all"
+			b.WriteString("\n" + mutedStyle.Render(line) + "\n")
 		}
 	}
 	if len(visible) == 0 {
@@ -567,15 +600,6 @@ func (m Model) agentsContentInteractive() string {
 	// display order (orderedAgents), so pos advances per agent row in lockstep
 	// and the highlight matches the visible position. The column header prints
 	// once at the top; template labels are display-only and consume no position.
-	// LIVE = warm runtime sessions per agent. Count once over all sessions
-	// (keyed by owning agent) so the render stays O(agents + sessions), mirroring
-	// sessionRows' single-pass grouping rather than scanning per row.
-	liveByAgent := map[string]int{}
-	for _, s := range m.snap.Sessions {
-		if name := sessionAgentName(s); strings.TrimSpace(name) != "" {
-			liveByAgent[name]++
-		}
-	}
 	b.WriteString(renderRows([][]string{{"", "NAME", "RUNTIME", "ROLE", "HEALTH", "LIVE"}}))
 	pos := 0
 	for _, g := range groupAgentsByTemplate(visible) {
@@ -607,7 +631,7 @@ func (m Model) agentsContentInteractive() string {
 	if m.optimizeBusy {
 		b.WriteString("\n" + mutedStyle.Render("starting optimization…") + "\n")
 	}
-	b.WriteString(mutedStyle.Render("enter detail  n new  o optimize  D delete"))
+	b.WriteString(mutedStyle.Render("enter detail  n new  o optimize  D delete  a show all/hide"))
 	b.WriteByte('\n')
 	return b.String()
 }

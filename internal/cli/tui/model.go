@@ -157,6 +157,7 @@ type Model struct {
 
 	// Agents page interaction state.
 	agentCursor         int               // selected row in snap.Agents
+	showAllAgents       bool              // Agents page: include hidden skillopt-* training agents
 	activeAgent         Agent             // agent shown in detail / being confirmed
 	agentVersions       []TemplateVersion // lazy-loaded template version history
 	agentVersionsLoaded bool              // the version load has returned (possibly empty)
@@ -323,6 +324,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if cmd := m.openAnswer(); cmd != nil {
 					cmds = append(cmds, cmd)
 				}
+				m.viewport.SetContent(m.content())
+				return m, tea.Batch(cmds...)
+			}
+			if pages[m.selected].page == pageAgents {
+				// Toggle the hidden skillopt-* training agents in/out of the list.
+				m.showAllAgents = !m.showAllAgents
+				m.agentCursor = clampCursor(m.agentCursor, len(m.visibleAgents()))
+				m.viewport.GotoTop()
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
 			}
