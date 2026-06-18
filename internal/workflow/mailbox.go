@@ -54,46 +54,48 @@ type JobRequest struct {
 	RecentDelegationHashes []string
 	DelegationRepeatCount  int
 	Model                  string
+	Ephemeral              *EphemeralSpec
 }
 
 type JobPayload struct {
-	Repo                   string       `json:"repo"`
-	Branch                 string       `json:"branch"`
-	PullRequest            int          `json:"pull_request"`
-	HeadSHA                string       `json:"head_sha,omitempty"`
-	GoalID                 string       `json:"goal_id,omitempty"`
-	TaskID                 string       `json:"task_id"`
-	TaskTitle              string       `json:"task_title"`
-	LeadAgent              string       `json:"lead_agent,omitempty"`
-	Reviewers              []string     `json:"reviewers,omitempty"`
-	ReviewRound            string       `json:"review_round,omitempty"`
-	Sender                 string       `json:"sender"`
-	Instructions           string       `json:"instructions"`
-	Constraints            []string     `json:"constraints"`
-	ParentJobID            string       `json:"parent_job_id,omitempty"`
-	DelegationID           string       `json:"delegation_id,omitempty"`
-	DelegationDepth        int          `json:"delegation_depth,omitempty"`
-	DelegatedBy            string       `json:"delegated_by,omitempty"`
-	RootJobID              string       `json:"root_job_id,omitempty"`
-	Deps                   []string     `json:"deps,omitempty"`
-	JobTimeout             string       `json:"job_timeout,omitempty"`
-	RetryCount             int          `json:"retry_count,omitempty"`
-	Fingerprint            string       `json:"fingerprint,omitempty"`
-	FailurePolicy          string       `json:"failure_policy,omitempty"`
-	SynthesisRule          string       `json:"synthesis_rule,omitempty"`
-	DelegationArtifactDir  string       `json:"delegation_artifact_dir,omitempty"`
-	WorktreePath           string       `json:"worktree_path,omitempty"`
-	TemplateID             string       `json:"template_id,omitempty"`
-	TemplateResolvedCommit string       `json:"template_resolved_commit,omitempty"`
-	TemplateContent        string       `json:"template_content,omitempty"`
-	OriginalAgent          string       `json:"original_agent,omitempty"`
-	DelegatedAgent         string       `json:"delegated_agent,omitempty"`
-	DelegationReason       string       `json:"delegation_reason,omitempty"`
-	RecentDelegationHashes []string     `json:"recent_delegation_hashes,omitempty"`
-	DelegationRepeatCount  int          `json:"delegation_repeat_count,omitempty"`
-	Model                  string       `json:"model,omitempty"`
-	RawOutputs             []string     `json:"raw_outputs,omitempty"`
-	Result                 *AgentResult `json:"result,omitempty"`
+	Repo                   string         `json:"repo"`
+	Branch                 string         `json:"branch"`
+	PullRequest            int            `json:"pull_request"`
+	HeadSHA                string         `json:"head_sha,omitempty"`
+	GoalID                 string         `json:"goal_id,omitempty"`
+	TaskID                 string         `json:"task_id"`
+	TaskTitle              string         `json:"task_title"`
+	LeadAgent              string         `json:"lead_agent,omitempty"`
+	Reviewers              []string       `json:"reviewers,omitempty"`
+	ReviewRound            string         `json:"review_round,omitempty"`
+	Sender                 string         `json:"sender"`
+	Instructions           string         `json:"instructions"`
+	Constraints            []string       `json:"constraints"`
+	ParentJobID            string         `json:"parent_job_id,omitempty"`
+	DelegationID           string         `json:"delegation_id,omitempty"`
+	DelegationDepth        int            `json:"delegation_depth,omitempty"`
+	DelegatedBy            string         `json:"delegated_by,omitempty"`
+	RootJobID              string         `json:"root_job_id,omitempty"`
+	Deps                   []string       `json:"deps,omitempty"`
+	JobTimeout             string         `json:"job_timeout,omitempty"`
+	RetryCount             int            `json:"retry_count,omitempty"`
+	Fingerprint            string         `json:"fingerprint,omitempty"`
+	FailurePolicy          string         `json:"failure_policy,omitempty"`
+	SynthesisRule          string         `json:"synthesis_rule,omitempty"`
+	DelegationArtifactDir  string         `json:"delegation_artifact_dir,omitempty"`
+	WorktreePath           string         `json:"worktree_path,omitempty"`
+	TemplateID             string         `json:"template_id,omitempty"`
+	TemplateResolvedCommit string         `json:"template_resolved_commit,omitempty"`
+	TemplateContent        string         `json:"template_content,omitempty"`
+	OriginalAgent          string         `json:"original_agent,omitempty"`
+	DelegatedAgent         string         `json:"delegated_agent,omitempty"`
+	DelegationReason       string         `json:"delegation_reason,omitempty"`
+	RecentDelegationHashes []string       `json:"recent_delegation_hashes,omitempty"`
+	DelegationRepeatCount  int            `json:"delegation_repeat_count,omitempty"`
+	Model                  string         `json:"model,omitempty"`
+	Ephemeral              *EphemeralSpec `json:"ephemeral,omitempty"`
+	RawOutputs             []string       `json:"raw_outputs,omitempty"`
+	Result                 *AgentResult   `json:"result,omitempty"`
 }
 
 type DeliveryAdapter interface {
@@ -149,6 +151,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		RecentDelegationHashes: request.RecentDelegationHashes,
 		DelegationRepeatCount:  request.DelegationRepeatCount,
 		Model:                  request.Model,
+		Ephemeral:              request.Ephemeral,
 	})
 	if err != nil {
 		return db.Job{}, err

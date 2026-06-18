@@ -1,31 +1,52 @@
 package workflow
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
 const resultKey = `"gitmoot_result"`
 
+// EphemeralSpec describes an on-demand worker that Gitmoot should materialize
+// for a delegation instead of routing it to a pre-registered agent. The daemon
+// builds the worker from this spec (default sandbox read-only); the workflow
+// engine treats a delegation carrying a spec as inheriting the coordinator's
+// allowed repo scope, so it bypasses the registered-agent existence, repo-access,
+// and capability checks. Runtime is REQUIRED and must be one of codex/claude/kimi
+// — never shell.
+type EphemeralSpec struct {
+	Runtime        string   `json:"runtime"`
+	Model          string   `json:"model,omitempty"`
+	Template       string   `json:"template,omitempty"`
+	Role           string   `json:"role,omitempty"`
+	Capabilities   []string `json:"capabilities,omitempty"`
+	AutonomyPolicy string   `json:"autonomy_policy,omitempty"`
+}
+
 // Delegation describes a child job that an agent wants Gitmoot to enqueue on
 // its behalf.
 type Delegation struct {
-	ID            string   `json:"id"`
-	Agent         string   `json:"agent"`
-	Action        string   `json:"action"`
-	Worktree      string   `json:"worktree,omitempty"`
-	Prompt        string   `json:"prompt"`
-	Artifacts     []string `json:"artifacts,omitempty"`
-	Deps          []string `json:"deps,omitempty"`
-	Timeout       string   `json:"timeout,omitempty"`
-	Retry         int      `json:"retry,omitempty"`
-	FailurePolicy string   `json:"failure_policy,omitempty"`
-	Fingerprint   string   `json:"fingerprint,omitempty"`
-	SynthesisRule string   `json:"synthesis_rule,omitempty"`
-	Model         string   `json:"model,omitempty"`
+	ID            string         `json:"id"`
+	Agent         string         `json:"agent"`
+	Ephemeral     *EphemeralSpec `json:"ephemeral,omitempty"`
+	Action        string         `json:"action"`
+	Worktree      string         `json:"worktree,omitempty"`
+	Prompt        string         `json:"prompt"`
+	Artifacts     []string       `json:"artifacts,omitempty"`
+	Deps          []string       `json:"deps,omitempty"`
+	Timeout       string         `json:"timeout,omitempty"`
+	Retry         int            `json:"retry,omitempty"`
+	FailurePolicy string         `json:"failure_policy,omitempty"`
+	Fingerprint   string         `json:"fingerprint,omitempty"`
+	SynthesisRule string         `json:"synthesis_rule,omitempty"`
+	Model         string         `json:"model,omitempty"`
 }
 
 type AgentResult struct {
@@ -120,8 +141,8 @@ func validateAgentResult(result AgentResult) error {
 		if d.ID != strings.TrimSpace(d.ID) {
 			return fmt.Errorf("delegation id %q must not have leading or trailing whitespace", d.ID)
 		}
-		if strings.TrimSpace(d.Agent) == "" {
-			return errors.New("delegation agent is required")
+		if err := validateDelegationTarget(d); err != nil {
+			return err
 		}
 		if strings.TrimSpace(d.Action) == "" {
 			return errors.New("delegation action is required")
@@ -270,6 +291,92 @@ func validateDelegationLifecycle(d Delegation) error {
 		return fmt.Errorf("delegation %q synthesis_rule %q is invalid", d.ID, d.SynthesisRule)
 	}
 	return nil
+}
+
+// validateDelegationTarget enforces that a delegation routes to EXACTLY ONE of a
+// pre-registered agent or an inline ephemeral worker spec. A delegation with both
+// is ambiguous (which identity owns the branch lock and repo scope?), and one with
+// neither has no executor at all; both are rejected at result-parse time before any
+// side effects. When an ephemeral spec is present, its runtime must be one of
+// codex/claude/kimi (never shell or empty) because the daemon materializes a real
+// runtime worker from it.
+func validateDelegationTarget(d Delegation) error {
+	hasAgent := strings.TrimSpace(d.Agent) != ""
+	hasEphemeral := d.Ephemeral != nil
+	switch {
+	case hasAgent && hasEphemeral:
+		return fmt.Errorf("delegation %q sets both agent and ephemeral; exactly one is allowed", d.ID)
+	case !hasAgent && !hasEphemeral:
+		return fmt.Errorf("delegation %q must set exactly one of agent or ephemeral", d.ID)
+	}
+	if hasEphemeral {
+		if err := validateEphemeralSpec(d.ID, d.Ephemeral); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateEphemeralSpec validates the inline worker spec on a delegation: the
+// runtime is required and must be a real agent runtime (codex/claude/kimi); shell
+// and unknown runtimes are rejected so an ephemeral worker is never a raw shell.
+func validateEphemeralSpec(delegationID string, spec *EphemeralSpec) error {
+	if spec == nil {
+		return nil
+	}
+	switch strings.TrimSpace(spec.Runtime) {
+	case runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime:
+		return nil
+	case "":
+		return fmt.Errorf("delegation %q ephemeral runtime is required", delegationID)
+	default:
+		return fmt.Errorf("delegation %q ephemeral runtime %q is invalid; expected one of codex/claude/kimi", delegationID, spec.Runtime)
+	}
+}
+
+// ephemeralAgentName derives the synthetic agent name for an ephemeral delegation
+// child from the delegation id and parent job id. The name always contains the
+// literal infix "-ephemeral-" so the TUI can filter ephemeral workers off that
+// marker, and the trailing short hash of (parentJobID+delegationID) keeps the name
+// stable and unique per (parent, delegation) pair.
+func ephemeralAgentName(delegationID, parentJobID string) string {
+	return slugForName(delegationID) + "-ephemeral-" + shortHash(parentJobID+delegationID)
+}
+
+// slugForName lowercases an id and reduces it to a short, name-safe slug
+// (alphanumerics and dashes), so the ephemeral agent name stays readable while
+// the trailing hash guarantees uniqueness.
+func slugForName(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var builder strings.Builder
+	lastDash := false
+	for _, r := range value {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
+			builder.WriteRune(r)
+			lastDash = false
+		default:
+			if !lastDash && builder.Len() > 0 {
+				builder.WriteByte('-')
+				lastDash = true
+			}
+		}
+	}
+	slug := strings.Trim(builder.String(), "-")
+	if slug == "" {
+		return "ephem"
+	}
+	if len(slug) > 32 {
+		slug = strings.Trim(slug[:32], "-")
+	}
+	return slug
+}
+
+// shortHash returns a short, stable hex fingerprint of value used as the unique
+// suffix on an ephemeral agent name.
+func shortHash(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])[:10]
 }
 
 func normalizeAgentResult(result *AgentResult) {

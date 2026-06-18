@@ -118,7 +118,7 @@ func TestValidateAgentResultRejectsDelegationMissingFields(t *testing.T) {
 		want string
 	}{
 		{"missing id", Delegation{Agent: "impl", Action: "implement", Prompt: "do"}, "delegation id is required"},
-		{"missing agent", Delegation{ID: "a", Action: "implement", Prompt: "do"}, "delegation agent is required"},
+		{"missing agent", Delegation{ID: "a", Action: "implement", Prompt: "do"}, `delegation "a" must set exactly one of agent or ephemeral`},
 		{"missing action", Delegation{ID: "a", Agent: "impl", Prompt: "do"}, "delegation action is required"},
 		{"missing prompt", Delegation{ID: "a", Agent: "impl", Action: "implement"}, "delegation prompt is required"},
 	}
@@ -230,5 +230,105 @@ func TestValidateAgentResultRejectsArtifactsWithoutBody(t *testing.T) {
 	result.ArtifactBody = "shared brief"
 	if err := validateAgentResult(result); err != nil {
 		t.Fatalf("validateAgentResult rejected delegations with a written brief: %v", err)
+	}
+}
+
+func TestValidateAgentResultAcceptsEphemeralDelegation(t *testing.T) {
+	output := `{"gitmoot_result":{"decision":"implemented","summary":"fan out",` +
+		`"delegations":[` +
+		`{"id":"worker","ephemeral":{"runtime":"codex","model":"gpt-5.4"},"action":"implement","prompt":"hi"}` +
+		`]}}`
+
+	result, err := ExtractAgentResult(output)
+	if err != nil {
+		t.Fatalf("ExtractAgentResult rejected a valid ephemeral delegation: %v", err)
+	}
+	if len(result.Delegations) != 1 {
+		t.Fatalf("delegations = %+v", result.Delegations)
+	}
+	spec := result.Delegations[0].Ephemeral
+	if spec == nil {
+		t.Fatalf("ephemeral spec was not parsed: %+v", result.Delegations[0])
+	}
+	if spec.Runtime != "codex" || spec.Model != "gpt-5.4" {
+		t.Fatalf("ephemeral spec = %+v", spec)
+	}
+	if strings.TrimSpace(result.Delegations[0].Agent) != "" {
+		t.Fatalf("ephemeral delegation should not carry an agent: %q", result.Delegations[0].Agent)
+	}
+}
+
+func TestValidateAgentResultRejectsBothAgentAndEphemeral(t *testing.T) {
+	result := AgentResult{
+		Decision: "implemented",
+		Summary:  "x",
+		Delegations: []Delegation{
+			{ID: "d", Agent: "impl", Ephemeral: &EphemeralSpec{Runtime: "codex"}, Action: "implement", Prompt: "go"},
+		},
+	}
+	err := validateAgentResult(result)
+	if err == nil {
+		t.Fatal("validateAgentResult accepted a delegation with both agent and ephemeral")
+	}
+	if !strings.Contains(err.Error(), "sets both agent and ephemeral") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestValidateAgentResultRejectsNeitherAgentNorEphemeral(t *testing.T) {
+	result := AgentResult{
+		Decision: "implemented",
+		Summary:  "x",
+		Delegations: []Delegation{
+			{ID: "d", Action: "implement", Prompt: "go"},
+		},
+	}
+	err := validateAgentResult(result)
+	if err == nil {
+		t.Fatal("validateAgentResult accepted a delegation with neither agent nor ephemeral")
+	}
+	if !strings.Contains(err.Error(), "must set exactly one of agent or ephemeral") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestValidateAgentResultRejectsShellEphemeralRuntime(t *testing.T) {
+	cases := map[string]string{
+		"shell":   "shell",
+		"empty":   "",
+		"unknown": "bash",
+	}
+	for name, rt := range cases {
+		t.Run(name, func(t *testing.T) {
+			result := AgentResult{
+				Decision: "implemented",
+				Summary:  "x",
+				Delegations: []Delegation{
+					{ID: "d", Ephemeral: &EphemeralSpec{Runtime: rt}, Action: "implement", Prompt: "go"},
+				},
+			}
+			err := validateAgentResult(result)
+			if err == nil {
+				t.Fatalf("validateAgentResult accepted ephemeral runtime %q", rt)
+			}
+			if !strings.Contains(err.Error(), "ephemeral runtime") {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func TestEphemeralAgentNameContainsInfix(t *testing.T) {
+	name := ephemeralAgentName("worker-1", "parent-job")
+	if !strings.Contains(name, "-ephemeral-") {
+		t.Fatalf("ephemeral agent name %q does not contain the %q infix", name, "-ephemeral-")
+	}
+	// The name is stable for the same (delegation, parent) pair and distinct for
+	// different parents, so the TUI filter and idempotent enqueue agree.
+	if again := ephemeralAgentName("worker-1", "parent-job"); again != name {
+		t.Fatalf("ephemeralAgentName not stable: %q vs %q", name, again)
+	}
+	if other := ephemeralAgentName("worker-1", "other-parent"); other == name {
+		t.Fatalf("ephemeralAgentName collided across parents: %q", name)
 	}
 }

@@ -90,6 +90,43 @@ func TestMailboxEnqueuePersistsDelegationMetadata(t *testing.T) {
 	}
 }
 
+func TestMailboxEnqueuePersistsEphemeralSpec(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID:           "job-ephemeral",
+		Agent:        "worker-ephemeral-abc123",
+		Action:       "review",
+		Repo:         "jerryfane/gitmoot",
+		ParentJobID:  "job-parent",
+		DelegationID: "worker",
+		Ephemeral:    &EphemeralSpec{Runtime: "codex", Model: "gpt-5.4"},
+	}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+
+	stored, err := store.GetJob(ctx, "job-ephemeral")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	// The marshalled payload must carry the ephemeral key for downstream consumers.
+	if !strings.Contains(stored.Payload, `"ephemeral"`) {
+		t.Fatalf("payload = %q, want it to contain the ephemeral spec", stored.Payload)
+	}
+	payload, err := unmarshalPayload(stored.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	if payload.Ephemeral == nil {
+		t.Fatalf("payload missing ephemeral spec: %+v", payload)
+	}
+	if payload.Ephemeral.Runtime != "codex" || payload.Ephemeral.Model != "gpt-5.4" {
+		t.Fatalf("payload ephemeral spec = %+v", payload.Ephemeral)
+	}
+}
+
 func TestMailboxEnqueuePersistsModel(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
