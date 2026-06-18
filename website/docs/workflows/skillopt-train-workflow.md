@@ -459,6 +459,31 @@ gitmoot skillopt train continue \
   --gate mixed
 ```
 
+When you want every role on the same model, use the convenience `--model <name>`
+flag instead of repeating the per-role flags. It supplies the model to the
+optimizer and target whenever the specific `--optimizer-model` /
+`--target-model` flags are omitted, and the evaluator inherits the optimizer
+model when `--evaluator-model` is omitted — so a single `--model` reaches the
+optimizer, target, and evaluator. Any explicit per-role model flag still wins
+over `--model`.
+
+```sh
+gitmoot skillopt train continue \
+  --session planner-train \
+  --backend codex \
+  --model gpt-5.5
+```
+
+By default the expensive final test evaluation is skipped after the selection
+gate. Pass `--final-eval` to run it:
+
+```sh
+gitmoot skillopt train continue \
+  --session planner-train \
+  --backend codex \
+  --final-eval
+```
+
 `--backend codex` resolves the user-facing optimizer, evaluator, and target
 provider to `codex`; Gitmoot passes the internal SkillOpt target adapter as
 `codex_exec`, so users do not need to remember that implementation detail.

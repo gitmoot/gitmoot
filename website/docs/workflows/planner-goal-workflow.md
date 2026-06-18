@@ -10,8 +10,14 @@ gitmoot agent start project-planner \
   --repo owner/repo \
   --path . \
   --template planner \
+  --model gpt-5-codex \
   --start-daemon
 ```
+
+`--runtime` accepts `codex`, `claude`, or `kimi` (Kimi Code CLI). The optional
+`--model <name>` flag sets the agent's default runtime model; it is a free-form,
+runtime-scoped string with no allow-list, and an omitted `--model` preserves the
+runtime's own default.
 
 For fast planning in the current Codex or Claude chat, ask the runtime:
 
@@ -27,8 +33,13 @@ Ask the registered background planner when you want a queued Gitmoot job:
 
 ```sh
 gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot agent ask project-planner --repo owner/repo --model gpt-5-codex --background "Write the implementation plan and goal file."
 gitmoot job watch <job-id>
 ```
+
+`agent ask` (and `run`, `implement`, `review`) accept an optional
+`--model <name>` flag that pins the runtime model for that one job, overriding
+the agent's configured default.
 
 Goal files should use task headings shaped like:
 
