@@ -150,9 +150,9 @@ func (m Model) helpContent() string {
 		}
 		b.WriteString("s    start the daemon when it is stopped\n")
 	case pageActivity:
-		b.WriteString("live delegation trees with queued/running work (newest first)\n")
-		b.WriteString("each root shows the coordinator, a progress summary, and the\n")
-		b.WriteString("delegation children (which agent is doing what, and its state)\n")
+		b.WriteString("live orchestras: delegation trees with queued/running work (newest first)\n")
+		b.WriteString("each root shows the conductor (coordinator), a progress summary, and the\n")
+		b.WriteString("players (delegation children — which agent is doing what, and its state)\n")
 		b.WriteString("↑/↓  select an active root\n")
 		b.WriteString("enter open the root's full detail (request + delegation tree)\n")
 	case pageTrains:
@@ -257,7 +257,7 @@ func (m Model) footerHelp() string {
 		}
 		return help + "  ? help  q quit"
 	case pageActivity:
-		return "tab/←→ page  ↑/↓ select root or delegate  enter open detail  ? help  q quit"
+		return "orchestras · tab/←→ page  ↑/↓ select root or delegate  enter open detail  ? help  q quit"
 	case pageTrains:
 		return "tab/←→ page  ↑/↓ select  enter open  s stop  d delete  ? help  q quit"
 	case pageAgents:

@@ -169,7 +169,7 @@ func (m Model) activityContent() string {
 	}
 
 	var b strings.Builder
-	b.WriteString(mutedStyle.Render("Delegation trees with queued/running work (live, refreshes every 5s).") + "\n\n")
+	b.WriteString(mutedStyle.Render("Orchestras — live delegation trees with queued/running work (refreshes every 5s).") + "\n\n")
 	if start > 0 {
 		b.WriteString(mutedStyle.Render("  ↑ "+strconv.Itoa(start)+" more rows above") + "\n")
 	}
