@@ -114,6 +114,13 @@ other dep-free siblings. Once every top-level delegation reaches a terminal
 state, Gitmoot enqueues exactly one coordinator "continuation" job — back to
 the delegating agent — to synthesize the children's results.
 
+Sibling children that share the repo run in isolated git worktrees so they do
+not serialize on the shared checkout: `implement` children each get their own
+branch worktree, and when a coordinator fans out **two or more read-only**
+(`ask`/`review`) children, each gets a throwaway detached worktree (no branch).
+The worktrees are disposed automatically when each child finishes. This is
+internal scheduling — coordinators do not request it.
+
 Each child job carries `parent_job_id`, `delegation_id`, `root_job_id`,
 `delegation_depth`, and `task_id`, so a child can be traced to its parent, its
 originating delegation, and the root of the job tree.

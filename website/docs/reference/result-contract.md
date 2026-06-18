@@ -156,6 +156,13 @@ its other dep-free siblings. A delegation that lists `deps` waits until every
 sibling it depends on has succeeded before it dispatches. Because the dependency
 graph is a DAG, Gitmoot can resolve a clear order without ever looping.
 
+Sibling children that share the repo run in isolated git worktrees so they do
+not serialize on the shared checkout: `implement` children each get their own
+branch worktree, and when a coordinator fans out two or more read-only
+(`ask`/`review`) children, each gets a throwaway detached worktree (no branch),
+disposed automatically when the child finishes. This is internal scheduling —
+coordinators do not request it.
+
 Once every top-level delegation reaches a terminal state, Gitmoot enqueues
 exactly one coordinator "continuation" job, sent back to the delegating agent, to
 synthesize the children's results according to the `synthesis_rule`. There is

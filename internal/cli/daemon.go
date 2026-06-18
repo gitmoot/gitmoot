@@ -2938,14 +2938,17 @@ func normalizeTaskWorktreePath(path string) (string, error) {
 
 func (w jobWorker) validateTargetCheckout(ctx context.Context, payload workflow.JobPayload, checkout string) error {
 	git := gitutil.Client{Dir: checkout}
-	// A delegation worktree child runs in a gitmoot-managed worktree that is
-	// correct by construction: an implement child is on its delegation branch
-	// (created off the parent base, whose tip may have advanced past the inherited
-	// HeadSHA), while a read-only child uses a *detached* worktree with no branch
-	// at all (so CurrentBranch would error). Skip the branch and inherited-HeadSHA
-	// checks for these children, but still require the freshly allocated worktree
-	// to be clean before the job runs.
+	// A delegation worktree child runs in a gitmoot-managed worktree. An implement
+	// child is on its delegation branch (created off the parent base, whose tip may
+	// have advanced past the inherited HeadSHA — so its HeadSHA check is skipped),
+	// while a read-only child uses a *detached* worktree with no branch at all (so
+	// CurrentBranch errors). Validate the branch when the worktree has one (the
+	// implement guard, preserved) and skip it for a detached read-only worktree;
+	// both still require the freshly allocated worktree to be clean.
 	if isDelegationWorktreeChild(payload) {
+		if branch, err := git.CurrentBranch(ctx); err == nil && branch != payload.Branch {
+			return fmt.Errorf("checkout branch is %s, not job branch %s", branch, payload.Branch)
+		}
 		clean, err := git.WorktreeClean(ctx)
 		if err != nil {
 			return err

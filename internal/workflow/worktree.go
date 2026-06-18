@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -352,6 +353,12 @@ func (e Engine) cleanupReadOnlyDelegationWorktree(ctx context.Context, jobID str
 	// deadline/cancel.
 	opCtx := context.WithoutCancel(ctx)
 	path := strings.TrimSpace(payload.WorktreePath)
+	// Idempotent: AdvanceJob can run more than once for a job (re-advance / retry
+	// passes). If the worktree directory is already gone, do not re-lock or emit a
+	// spurious cleanup-failed event.
+	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+		return
+	}
 	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(opCtx, e.Store, e.DelegationCheckout, "worktree-cleanup:"+jobID, time.Now().UTC())
 	if err != nil {
 		_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_cleanup_failed", Message: fmt.Sprintf("read-only worktree %s cleanup could not lock checkout: %v", path, err)})

@@ -147,10 +147,23 @@ func TestCleanupReadOnlyDelegationWorktreeForceRemoves(t *testing.T) {
 	engine.DelegationCheckout = t.TempDir()
 	engine.DelegationWorktrees = manager
 
-	payload := JobPayload{DelegationID: "d1", WorktreePath: "/wt/d1"}
+	// The worktree path must exist on disk; cleanup skips an already-gone path.
+	wt := t.TempDir()
+	payload := JobPayload{DelegationID: "d1", WorktreePath: wt}
 	engine.cleanupReadOnlyDelegationWorktree(ctx, "job-1/delegation/d1", "ask", payload)
-	if len(manager.removedForce) != 1 || manager.removedForce[0] != "/wt/d1" {
-		t.Fatalf("removedForce = %+v, want one force-remove of /wt/d1", manager.removedForce)
+	if len(manager.removedForce) != 1 || manager.removedForce[0] != wt {
+		t.Fatalf("removedForce = %+v, want one force-remove of %q", manager.removedForce, wt)
+	}
+
+	// Idempotent: a second cleanup for an already-removed (non-existent) worktree
+	// is a silent no-op (no re-lock, no spurious cleanup-failed event).
+	gone := filepath.Join(t.TempDir(), "already-removed")
+	engine.cleanupReadOnlyDelegationWorktree(ctx, "job-1/delegation/d1", "ask", JobPayload{DelegationID: "d1", WorktreePath: gone})
+	if len(manager.removedForce) != 1 {
+		t.Fatalf("cleanup of a missing worktree must be a no-op: %+v", manager.removedForce)
+	}
+	if got := countJobEvents(t, store, "job-1/delegation/d1", "delegation_worktree_cleanup_failed"); got != 0 {
+		t.Fatalf("missing-worktree cleanup must not emit cleanup_failed events, got %d", got)
 	}
 	if got := countJobEvents(t, store, "job-1/delegation/d1", "delegation_worktree_removed"); got != 1 {
 		t.Fatalf("delegation_worktree_removed event count = %d, want 1", got)
