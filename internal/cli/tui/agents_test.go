@@ -118,13 +118,17 @@ func TestAgentsPageGroupsByTemplate(t *testing.T) {
 }
 
 // TestAgentDetailShowsLiveSessions verifies an agent's detail lists its live
-// runtime sessions (matched by session.Type == agent.Name) and that the agent
-// list shows the per-agent live count, while another agent's sessions don't leak.
+// runtime sessions (matched by owning agent — including temp workers, whose Type
+// carries a "temp:" prefix) and that the agent list shows the per-agent live
+// count, while another agent's sessions don't leak.
 func TestAgentDetailShowsLiveSessions(t *testing.T) {
 	snap := agentsSnapshot()
 	snap.Sessions = []Session{
 		{Name: "claude-bg-9f2", Type: "planner", Runtime: "claude", Repo: "o/r", State: "running", Expires: "2026-06-18T10:09:00Z"},
 		{Name: "claude-bg-1a7", Type: "planner", Runtime: "claude", Repo: "o/r", State: "idle", Expires: "2026-06-18T10:04:00Z"},
+		// A temp worker for planner: its Type carries the daemon's "temp:" prefix
+		// and must still roll up under planner.
+		{Name: "planner-temp-job9", Type: "temp:planner", Runtime: "claude", Repo: "o/r", State: "running"},
 		{Name: "codex-bg-77", Type: "reviewer", Runtime: "codex", Repo: "o/x", State: "running"},
 	}
 	m := agentsModel(t, Deps{}, snap)
@@ -140,7 +144,7 @@ func TestAgentDetailShowsLiveSessions(t *testing.T) {
 		m = next.(Model)
 	}
 	view := m.View()
-	for _, want := range []string{"live sessions", "claude-bg-9f2", "running", "claude-bg-1a7", "idle"} {
+	for _, want := range []string{"live sessions", "claude-bg-9f2", "running", "claude-bg-1a7", "idle", "planner-temp-job9"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("planner detail missing %q:\n%s", want, view)
 		}
