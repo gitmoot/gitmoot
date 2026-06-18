@@ -40,6 +40,7 @@ type Agent struct {
 	Capabilities   []string
 	AutonomyPolicy string
 	HealthStatus   string
+	Model          string
 }
 
 type Job struct {
@@ -49,6 +50,7 @@ type Job struct {
 	Prompt      string
 	Repository  string
 	PullRequest int
+	Model       string
 }
 
 type Result struct {
@@ -198,6 +200,9 @@ func (a CodexAdapter) Start(ctx context.Context, request StartRequest) (StartRes
 		return StartResult{}, err
 	}
 	args := append([]string{"exec"}, codexSandboxArgs(request.Agent)...)
+	if request.Agent.Model != "" {
+		args = append(args, "--model", request.Agent.Model)
+	}
 	args = append(args, "--json", "--", request.Prompt)
 	result, err := a.runner().Run(ctx, a.Dir, "codex", args...)
 	if err != nil {
@@ -223,6 +228,13 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 	}
 	args := append([]string{"exec"}, codexSandboxArgs(agent)...)
 	args = append(args, "resume")
+	model := job.Model
+	if model == "" {
+		model = agent.Model
+	}
+	if model != "" {
+		args = append(args, "--model", model)
+	}
 	if agent.RuntimeRef == "last" {
 		args = append(args, "--last")
 	} else {
@@ -307,7 +319,11 @@ func (a ClaudeAdapter) Start(ctx context.Context, request StartRequest) (StartRe
 	if err != nil {
 		return StartResult{}, err
 	}
-	args := append(claudePermissionArgs(request.Agent), "--session-id", runtimeRef, "-p", "--output-format", "json", "--", request.Prompt)
+	args := claudePermissionArgs(request.Agent)
+	if request.Agent.Model != "" {
+		args = append(args, "--model", request.Agent.Model)
+	}
+	args = append(args, "--session-id", runtimeRef, "-p", "--output-format", "json", "--", request.Prompt)
 	result, err := a.runner().Run(ctx, a.Dir, "claude", args...)
 	if err != nil {
 		return StartResult{Raw: result.Stdout + result.Stderr}, claudeCommandError(result, err)
@@ -323,10 +339,14 @@ func (a ClaudeAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Resul
 	if err := a.Validate(ctx, agent); err != nil {
 		return Result{}, err
 	}
-	args := claudeArgs(agent, job.Prompt, true)
+	model := job.Model
+	if model == "" {
+		model = agent.Model
+	}
+	args := claudeArgs(agent, job.Prompt, true, model)
 	result, err := a.runner().Run(ctx, a.Dir, "claude", args...)
 	if err != nil && isClaudeJSONUnsupported(result) {
-		result, err = a.runner().Run(ctx, a.Dir, "claude", claudeArgs(agent, job.Prompt, false)...)
+		result, err = a.runner().Run(ctx, a.Dir, "claude", claudeArgs(agent, job.Prompt, false, model)...)
 	}
 	if err != nil {
 		return Result{Raw: result.Stdout + result.Stderr}, claudeCommandError(result, err)
@@ -549,8 +569,11 @@ func newUUID() (string, error) {
 	return fmt.Sprintf("%s-%s-%s-%s-%s", encoded[0:8], encoded[8:12], encoded[12:16], encoded[16:20], encoded[20:32]), nil
 }
 
-func claudeArgs(agent Agent, prompt string, jsonOutput bool) []string {
+func claudeArgs(agent Agent, prompt string, jsonOutput bool, model string) []string {
 	args := claudePermissionArgs(agent)
+	if model != "" {
+		args = append(args, "--model", model)
+	}
 	if agent.RuntimeRef == "last" {
 		args = append(args, "--continue")
 	} else {
