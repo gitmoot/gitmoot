@@ -274,6 +274,53 @@ func TestAgentsPageHidesTrainingAgents(t *testing.T) {
 	}
 }
 
+// TestAgentsPageHidesEphemeralAgents guards #325: an ephemeral worker (its name
+// carries the "-ephemeral-" infix) is dropped from the persistent Agents
+// registry grouping, while a normal agent on the same template still renders.
+// Ephemeral agents are not training plumbing, so they must not be folded into
+// the "training agents hidden (skillopt-*)" count line.
+func TestAgentsPageHidesEphemeralAgents(t *testing.T) {
+	snap := agentsSnapshot()
+	snap.Agents = append(snap.Agents,
+		Agent{Name: "fixit-ephemeral-abc", Runtime: "claude", TemplateID: "planner-tpl"},
+	)
+	m := agentsModel(t, Deps{}, snap)
+
+	// The visible/registry list excludes the ephemeral agent but keeps the normal ones.
+	for _, a := range m.visibleAgents() {
+		if a.Name == "fixit-ephemeral-abc" {
+			t.Fatalf("ephemeral agent must be excluded from the registry list:\n%v", m.visibleAgents())
+		}
+	}
+	var sawPlanner, sawReviewer bool
+	for _, a := range m.visibleAgents() {
+		switch a.Name {
+		case "planner":
+			sawPlanner = true
+		case "reviewer":
+			sawReviewer = true
+		}
+	}
+	if !sawPlanner || !sawReviewer {
+		t.Fatalf("normal agents must remain in the registry list, got %v", m.visibleAgents())
+	}
+
+	view := m.View()
+	if strings.Contains(view, "fixit-ephemeral-abc") {
+		t.Fatalf("ephemeral agent must not render in the Agents registry:\n%s", view)
+	}
+	for _, want := range []string{"planner", "reviewer"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("agents view missing normal agent %q:\n%s", want, view)
+		}
+	}
+	// The ephemeral agent is not training plumbing: with no skillopt-* agents
+	// present, the "training agents hidden" line must not appear.
+	if strings.Contains(view, "training agents hidden") {
+		t.Fatalf("ephemeral agents must not be counted as hidden training agents:\n%s", view)
+	}
+}
+
 func TestAgentsPageGroupsByTemplate(t *testing.T) {
 	snap := agentsSnapshot()
 	// A second agent on planner-tpl (stays in the planner-tpl group) and one

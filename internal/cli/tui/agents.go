@@ -45,6 +45,14 @@ func isManagedTrainingAgent(name string) bool {
 	return strings.HasPrefix(name, "skillopt-target-") || strings.HasPrefix(name, "skillopt-generator")
 }
 
+// isEphemeralAgent reports whether an agent name belongs to an ephemeral worker
+// materialized for a single delegation (#325). Ephemeral names carry the
+// "-ephemeral-" infix (see workflow.ephemeralAgentName); they expire with the
+// delegation, so the persistent Agents registry hides them.
+func isEphemeralAgent(name string) bool {
+	return strings.Contains(name, "-ephemeral-")
+}
+
 // visibleAgents are the user-facing agents (training plumbing filtered out). The
 // Agents page renders, cursors, and acts on this list; the serialized snapshot
 // keeps every agent, so --json/--plain are unaffected.
@@ -54,7 +62,7 @@ func (m Model) visibleAgents() []Agent {
 	}
 	out := make([]Agent, 0, len(m.snap.Agents))
 	for _, a := range m.snap.Agents {
-		if !isManagedTrainingAgent(a.Name) {
+		if !isManagedTrainingAgent(a.Name) && !isEphemeralAgent(a.Name) {
 			out = append(out, a)
 		}
 	}
@@ -666,7 +674,16 @@ func choiceValues(choices []Choice) []string {
 // overlays are dispatched once in content(), not here.
 func (m Model) agentsContentInteractive() string {
 	visible := m.visibleAgents()
-	hidden := len(m.snap.Agents) - len(visible)
+	// hidden counts only the managed training agents the hidden line describes
+	// ("… training agents hidden (skillopt-*)"). Ephemeral agents (#325) are
+	// filtered from the registry too, but they are not training plumbing, so they
+	// are dropped silently rather than mislabeled here.
+	hidden := 0
+	for _, a := range m.snap.Agents {
+		if isManagedTrainingAgent(a.Name) {
+			hidden++
+		}
+	}
 	// LIVE = warm runtime sessions per agent. Count once over all sessions (keyed
 	// by owning agent) so the render stays O(agents + sessions); also tally the
 	// sessions owned by hidden training agents to annotate the hidden line.
