@@ -11,12 +11,23 @@ import (
 func (m Model) activitySelectable() []JobRow {
 	var out []JobRow
 	for _, r := range m.snap.Activity {
-		out = append(out, JobRow{ID: r.JobID, Agent: r.Agent, Type: r.Action, State: r.State})
+		out = append(out, JobRow{ID: r.JobID, Agent: r.Agent, Type: r.Action, State: r.State, UpdatedAt: r.UpdatedAt})
 		for _, c := range r.Children {
 			out = append(out, JobRow{ID: c.ID, Agent: c.Agent, Type: c.Action, State: c.State})
 		}
 	}
 	return out
+}
+
+// activitySelectableLen counts the selectable rows (root + children per tree)
+// without materializing the []JobRow — the cursor length needed on every
+// up/down keystroke and refresh clamp.
+func (m Model) activitySelectableLen() int {
+	n := 0
+	for _, r := range m.snap.Activity {
+		n += 1 + len(r.Children)
+	}
+	return n
 }
 
 // activityUnderCursor returns the job (root or delegate) under the Activity
@@ -32,109 +43,152 @@ func (m Model) activityUnderCursor() (JobRow, bool) {
 	return sel[m.activityCursor], true
 }
 
-// activityTreeCap is how many delegation trees fit the Activity page, leaving
-// room for the title/intro, the more/earlier markers, and the footer. A tree is
-// roughly a root line + progress + up to ~5 children + spacing.
-func activityTreeCap(height int) int {
-	if n := (height - 7) / 8; n >= 1 {
-		return n
+// activityWindowCap is how many display rows fit the Activity page, leaving room
+// for the title/intro, the above/below markers, and the footer. Mirrors
+// jobsWindowCap so a wide fan-out (or a short terminal) never pushes the cursor
+// off-screen.
+func activityWindowCap(height int) int {
+	if height-9 < 3 {
+		return 3
 	}
-	return 1
+	return height - 9
+}
+
+// activityRow is one rendered line of the Activity page. Selectable rows (a root
+// or a delegation child) carry the cursor marker and map to an activitySelectable
+// index; adornment rows (the progress summary, the continuation, blank
+// separators) are static.
+type activityRow struct {
+	selectable bool
+	sel        int    // activitySelectable index, when selectable
+	indent     string // spaces before the marker
+	target     string // text highlighted when this row is selected
+	rest       string // text after the target
+	static     string // full text for non-selectable rows
+}
+
+// activityRows flattens the delegation trees into display rows, assigning each
+// selectable row the same index activitySelectable() produces (root, then its
+// children, per tree) so the cursor and the rendered marker stay in lockstep.
+func (m Model) activityRows() []activityRow {
+	var rows []activityRow
+	sel := 0
+	for ri, r := range m.snap.Activity {
+		if ri > 0 {
+			rows = append(rows, activityRow{static: ""}) // blank separator between trees
+		}
+		rootRest := "  " + r.Agent + "  " + r.Action + "  " + jobStateColor(r.State)
+		if r.Repo != "" {
+			rootRest += "  " + mutedStyle.Render(r.Repo)
+		}
+		rows = append(rows, activityRow{selectable: true, sel: sel, target: r.JobID, rest: rootRest})
+		sel++
+		if r.Total > 0 {
+			rows = append(rows, activityRow{static: "    " + mutedStyle.Render(
+				strconv.Itoa(r.Total)+" delegations · "+
+					strconv.Itoa(r.Running)+" running · "+
+					strconv.Itoa(r.Queued)+" queued · "+
+					strconv.Itoa(r.Blocked)+" blocked · "+
+					strconv.Itoa(r.Done)+" done")})
+		}
+		for _, c := range r.Children {
+			rows = append(rows, activityRow{
+				selectable: true,
+				sel:        sel,
+				indent:     "    ",
+				target:     dash(c.Agent),
+				rest:       "  " + truncate(c.Action, 24) + "  " + jobStateColor(c.State),
+			})
+			sel++
+		}
+		// Show the continuation whenever one exists — including the corrective
+		// path where the coordinator re-enqueues a continuation with no fresh
+		// delegations (Total == 0), so its live work is never hidden.
+		if r.ContinuationID != "" {
+			rows = append(rows, activityRow{static: "      " + mutedStyle.Render("continuation") + "  " + jobStateColor(r.ContinuationState)})
+		}
+	}
+	return rows
 }
 
 // activityContent renders the Activity page: delegation trees with
 // queued/running work, newest first. Each root shows the coordinator line, a
 // progress summary, and the delegation children (which agent is doing what, and
 // its state) plus the continuation job. The cursor walks roots AND children;
-// enter opens the selected job's detail (its request + result). Trees are
-// windowed around the cursor so the page always fits and the cursor stays
-// visible; "↑/↓ N more trees" markers show what is scrolled off.
+// enter opens the selected job's detail (its request + result). Display rows are
+// windowed around the cursor so the page always fits and the selected row stays
+// visible — even for a single wide fan-out — with "↑/↓ N more rows" markers for
+// what is scrolled off.
 func (m Model) activityContent() string {
-	roots := m.snap.Activity
-	if len(roots) == 0 {
+	if len(m.snap.Activity) == 0 {
 		return m.loadingOr("No active jobs — nothing is running right now.", !m.loadedAt.IsZero())
 	}
 
-	// counts[i] = selectable rows in tree i (root + its children); find which
-	// tree the flat cursor falls in so we can window around it.
-	counts := make([]int, len(roots))
-	cursorTree := 0
-	cum := 0
-	for i, r := range roots {
-		counts[i] = 1 + len(r.Children)
-		if m.activityCursor >= cum && m.activityCursor < cum+counts[i] {
-			cursorTree = i
+	rows := m.activityRows()
+	capacity := activityWindowCap(m.height)
+
+	// Clamp the effective cursor into the selectable range so the row search
+	// below always matches — even if a future code path mutates m.snap.Activity
+	// without re-clamping m.activityCursor.
+	selCount := 0
+	for _, row := range rows {
+		if row.selectable {
+			selCount++
 		}
-		cum += counts[i]
+	}
+	cursor := m.activityCursor
+	if cursor < 0 {
+		cursor = 0
+	}
+	if selCount > 0 && cursor > selCount-1 {
+		cursor = selCount - 1
 	}
 
-	capacity := activityTreeCap(m.height)
+	// Locate the selected display row, then window around it (mirrors the Jobs
+	// page) so the cursor is always within the rendered slice.
+	cursorRow := 0
+	for i, row := range rows {
+		if row.selectable && row.sel == cursor {
+			cursorRow = i
+			break
+		}
+	}
 	start := 0
-	if len(roots) > capacity {
-		start = cursorTree - capacity/2
+	if len(rows) > capacity {
+		start = cursorRow - capacity/2
 		if start < 0 {
 			start = 0
 		}
-		if start > len(roots)-capacity {
-			start = len(roots) - capacity
+		if start > len(rows)-capacity {
+			start = len(rows) - capacity
 		}
 	}
 	end := start + capacity
-	if end > len(roots) {
-		end = len(roots)
-	}
-
-	// pos = flat selectable position of the first row in the window.
-	pos := 0
-	for i := 0; i < start; i++ {
-		pos += counts[i]
+	if end > len(rows) {
+		end = len(rows)
 	}
 
 	var b strings.Builder
 	b.WriteString(mutedStyle.Render("Delegation trees with queued/running work (live, refreshes every 5s).") + "\n\n")
 	if start > 0 {
-		b.WriteString(mutedStyle.Render("  ↑ "+strconv.Itoa(start)+" more trees") + "\n")
+		b.WriteString(mutedStyle.Render("  ↑ "+strconv.Itoa(start)+" more rows above") + "\n")
 	}
-	for ti := start; ti < end; ti++ {
-		r := roots[ti]
+	for i := start; i < end; i++ {
+		row := rows[i]
+		if !row.selectable {
+			b.WriteString(row.static + "\n")
+			continue
+		}
 		marker := "  "
-		id := r.JobID
-		if pos == m.activityCursor {
+		target := row.target
+		if row.sel == cursor {
 			marker = "▸ "
-			id = selectedRowStyle.Render(id)
+			target = selectedRowStyle.Render(target)
 		}
-		line := marker + id + "  " + r.Agent + "  " + r.Action + "  " + jobStateColor(r.State)
-		if r.Repo != "" {
-			line += "  " + mutedStyle.Render(r.Repo)
-		}
-		b.WriteString(line + "\n")
-		pos++
-
-		if r.Total > 0 {
-			b.WriteString("    " + mutedStyle.Render(
-				strconv.Itoa(r.Total)+" delegations · "+
-					strconv.Itoa(r.Running)+" running · "+
-					strconv.Itoa(r.Queued)+" queued · "+
-					strconv.Itoa(r.Blocked)+" blocked · "+
-					strconv.Itoa(r.Done)+" done") + "\n")
-			for _, c := range r.Children {
-				cm := "  "
-				agent := dash(c.Agent)
-				if pos == m.activityCursor {
-					cm = "▸ "
-					agent = selectedRowStyle.Render(agent)
-				}
-				b.WriteString("    " + cm + agent + "  " + truncate(c.Action, 24) + "  " + jobStateColor(c.State) + "\n")
-				pos++
-			}
-			if r.ContinuationID != "" {
-				b.WriteString("      " + mutedStyle.Render("continuation") + "  " + jobStateColor(r.ContinuationState) + "\n")
-			}
-		}
-		b.WriteByte('\n')
+		b.WriteString(row.indent + marker + target + row.rest + "\n")
 	}
-	if end < len(roots) {
-		b.WriteString(mutedStyle.Render("  ↓ "+strconv.Itoa(len(roots)-end)+" more trees") + "\n")
+	if end < len(rows) {
+		b.WriteString(mutedStyle.Render("  ↓ "+strconv.Itoa(len(rows)-end)+" more rows below") + "\n")
 	}
 	b.WriteString(mutedStyle.Render("↑/↓ select root or delegate · enter open its detail (request + result)"))
 	b.WriteByte('\n')

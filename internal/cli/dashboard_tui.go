@@ -611,62 +611,75 @@ func activityJobActive(state string) bool {
 	return state == "queued" || state == "running"
 }
 
-// buildDashboardActivity groups jobs into delegation trees keyed by root job and
-// returns the roots that have any queued/running work, newest first — the
-// Activity page's live "what are agents working on" view. Each job's root is read
-// from its payload RootJobID (falling back to its own id for an originating
-// coordinator); the root's direct delegation children come from the same
+// buildDashboardActivity groups jobs into delegation trees and returns the
+// originating roots that have queued/running work, newest first — the Activity
+// page's live "what are agents working on" view. A root is an originating job
+// (empty ParentJobID); its direct delegation children come from the same
 // buildDelegationTree used by the job-detail view.
+//
+// Two invariants keep this cheap and consistent: (1) the active decision and the
+// progress counts use the SAME scope — the root plus its direct delegation
+// children (incl. the continuation) — so a surfaced tree always shows visible
+// live work rather than a settled coordinator with "0 running" driven by a
+// deeper descendant; (2) job payloads are parsed only for the few live roots and
+// their direct children, never for every job on the refresh tick (matching the
+// cheap-tick design of the Attention path).
+//
+// Scope is intentionally one level deep: the page renders direct delegations, so
+// a tree whose root and direct children have all settled is not surfaced even if
+// a deeper grandchild (a sub-coordinator's own delegation) is still running.
+// Surfacing such a tree would show an all-settled, "0 running" coordinator with
+// the live grandchild invisible. Rendering the full recursive tree is a separate,
+// larger change.
 func buildDashboardActivity(jobs []db.Job) []tui.ActivityRoot {
 	jobByID := make(map[string]db.Job, len(jobs))
-	payloadOf := make(map[string]workflow.JobPayload, len(jobs))
-	rootOf := make(map[string]string, len(jobs))
 	childrenByParent := map[string][]db.Job{}
+	var rootIDs []string
 	for _, j := range jobs {
 		jobByID[j.ID] = j
-		payload, err := workflow.ParseJobPayload(j.Payload)
-		if err != nil {
-			payload = workflow.JobPayload{}
-		}
-		payloadOf[j.ID] = payload
-		root := strings.TrimSpace(payload.RootJobID)
-		if root == "" {
-			root = j.ID
-		}
-		rootOf[j.ID] = root
 		if parent := strings.TrimSpace(j.ParentJobID); parent != "" {
 			childrenByParent[parent] = append(childrenByParent[parent], j)
+		} else {
+			// An originating job (user-launched coordinator or standalone agent)
+			// roots its own delegation tree.
+			rootIDs = append(rootIDs, j.ID)
 		}
-	}
-
-	membersByRoot := map[string][]db.Job{}
-	for _, j := range jobs {
-		membersByRoot[rootOf[j.ID]] = append(membersByRoot[rootOf[j.ID]], j)
 	}
 
 	var roots []tui.ActivityRoot
-	for rootID, members := range membersByRoot {
-		active := false
-		for _, m := range members {
-			if activityJobActive(m.State) {
-				active = true
+	// Sort key per root: the most recent update across the tree (root + direct
+	// children + continuation). A coordinator freezes its own UpdatedAt once it
+	// fans out, so its actively-running children must drive "newest first".
+	latestByRoot := map[string]string{}
+	for _, rootID := range rootIDs {
+		rootJob := jobByID[rootID]
+		directChildren := childrenByParent[rootID]
+		// Decide activeness from raw job states (no payload parse) so a fully
+		// settled tree costs nothing on the tick. Scope = root + direct children
+		// (the continuation is a direct child), matching what the page renders.
+		active := activityJobActive(rootJob.State)
+		for _, c := range directChildren {
+			if active {
 				break
 			}
+			active = activityJobActive(c.State)
 		}
 		if !active {
 			continue
 		}
-		rootJob, ok := jobByID[rootID]
-		if !ok {
-			continue
+		// Only for the few live roots: parse the root payload (Repo + delegation
+		// metadata) and, via buildDelegationTree, the direct children.
+		payload, err := workflow.ParseJobPayload(rootJob.Payload)
+		if err != nil {
+			payload = workflow.JobPayload{}
 		}
-		children, contID, contState := buildDelegationTree(payloadOf[rootID], childrenByParent[rootID])
+		children, contID, contState := buildDelegationTree(payload, directChildren)
 		root := tui.ActivityRoot{
 			JobID:             rootJob.ID,
 			Agent:             rootJob.Agent,
 			Action:            rootJob.Type,
 			State:             rootJob.State,
-			Repo:              strings.TrimSpace(payloadOf[rootID].Repo),
+			Repo:              strings.TrimSpace(payload.Repo),
 			UpdatedAt:         rootJob.UpdatedAt,
 			Children:          children,
 			ContinuationID:    contID,
@@ -685,11 +698,19 @@ func buildDashboardActivity(jobs []db.Job) []tui.ActivityRoot {
 				root.Done++
 			}
 		}
+		latest := rootJob.UpdatedAt
+		for _, c := range directChildren {
+			if c.UpdatedAt > latest {
+				latest = c.UpdatedAt
+			}
+		}
+		latestByRoot[rootJob.ID] = latest
 		roots = append(roots, root)
 	}
 	sort.SliceStable(roots, func(i, j int) bool {
-		if roots[i].UpdatedAt != roots[j].UpdatedAt {
-			return roots[i].UpdatedAt > roots[j].UpdatedAt // newest activity first (ISO lexical)
+		li, lj := latestByRoot[roots[i].JobID], latestByRoot[roots[j].JobID]
+		if li != lj {
+			return li > lj // newest activity first (ISO lexical)
 		}
 		return roots[i].JobID < roots[j].JobID
 	})

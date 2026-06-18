@@ -838,7 +838,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clampPromptCursor()
 			m.clampTrainCursor()
 			m.clampJobCursor()
-			m.activityCursor = clampCursor(m.activityCursor, len(m.activitySelectable()))
+			m.activityCursor = clampCursor(m.activityCursor, m.activitySelectableLen())
 			m.agentCursor = clampCursor(m.agentCursor, len(m.visibleAgents()))
 			m.sessionCursor = clampCursor(m.sessionCursor, len(m.sessionRows()))
 			m.configCursor = clampCursor(m.configCursor, len(m.configEditableFields()))
@@ -965,7 +965,7 @@ func (m *Model) pageCursor() (*int, int) {
 	case pageAttention:
 		return &m.promptCursor, selectableCount(m.attentionVisibleRows())
 	case pageActivity:
-		return &m.activityCursor, len(m.activitySelectable())
+		return &m.activityCursor, m.activitySelectableLen()
 	case pageTrains:
 		return &m.trainCursor, selectableCount(m.trainVisibleRows())
 	case pageAgents:
