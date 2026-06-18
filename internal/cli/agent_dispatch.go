@@ -27,6 +27,7 @@ type localAgentDispatchRequest struct {
 	Instructions         string
 	Background           bool
 	Type                 string
+	Model                string
 	Home                 string
 	AllowManagedSync     bool
 	JobTimeout           time.Duration
@@ -135,6 +136,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		Reviewers:    request.Reviewers,
 		Sender:       "local",
 		Instructions: request.Instructions,
+		Model:        request.Model,
 	})
 	if err != nil {
 		return localAgentJobOutput{}, err
@@ -637,6 +639,7 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 		RepoFullName:   repo,
 		Role:           instanceAgent.Role,
 		TemplateID:     instanceAgent.TemplateID,
+		Model:          instanceAgent.Model,
 		Capabilities:   instanceAgent.Capabilities,
 		AutonomyPolicy: instanceAgent.AutonomyPolicy,
 		State:          "starting",
@@ -670,6 +673,7 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 		RepoFullName:   repo,
 		Role:           instanceAgent.Role,
 		TemplateID:     instanceAgent.TemplateID,
+		Model:          instanceAgent.Model,
 		Capabilities:   instanceAgent.Capabilities,
 		AutonomyPolicy: instanceAgent.AutonomyPolicy,
 		State:          "starting",
@@ -750,6 +754,7 @@ func runtimeAgentFromType(agentType config.AgentType, repo string, name string) 
 		Runtime:        agentType.Runtime,
 		RepoScope:      repo,
 		TemplateID:     agentType.Template,
+		Model:          agentType.Model,
 		Capabilities:   agentType.Capabilities,
 		AutonomyPolicy: runtime.NormalizeStoredAutonomyPolicy(agentType.AutonomyPolicy),
 		HealthStatus:   "idle",
