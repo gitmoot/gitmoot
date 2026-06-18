@@ -478,14 +478,15 @@ func (m Model) jobDetailView() string {
 	b.WriteString(renderRows(rows))
 	b.WriteByte('\n')
 
-	// What was asked. Shown in full (newlines preserved) — the detail viewport
-	// scrolls, so the whole request is readable, not just the first lines.
+	// What was asked. Shown in full, soft-wrapped to the viewport width so long
+	// lines aren't clipped at the right edge; the viewport scrolls vertically.
+	width := m.viewport.Width
 	if d.Request != "" {
 		b.WriteString(headerStyle.Render("request"))
 		b.WriteByte('\n')
-		b.WriteString(strings.TrimRight(d.Request, "\n") + "\n\n")
+		b.WriteString(wrapText(strings.TrimRight(d.Request, "\n"), width) + "\n\n")
 	}
-	// What came back (settled jobs). Shown in full; the viewport scrolls.
+	// What came back (settled jobs). Shown in full, wrapped the same way.
 	if d.ResultDecision != "" || d.ResultSummary != "" {
 		b.WriteString(headerStyle.Render("result"))
 		b.WriteByte('\n')
@@ -493,7 +494,7 @@ func (m Model) jobDetailView() string {
 			b.WriteString("decision  " + jobDecisionColor(d.ResultDecision) + "\n")
 		}
 		if d.ResultSummary != "" {
-			b.WriteString(strings.TrimRight(d.ResultSummary, "\n") + "\n")
+			b.WriteString(wrapText(strings.TrimRight(d.ResultSummary, "\n"), width) + "\n")
 		}
 		b.WriteByte('\n')
 	}

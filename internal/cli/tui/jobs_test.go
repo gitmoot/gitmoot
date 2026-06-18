@@ -8,6 +8,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 func jobsSnapshot() Snapshot {
@@ -766,6 +767,33 @@ func TestJobDetailShowsRequestAndResult(t *testing.T) {
 		if !strings.Contains(view, want) {
 			t.Fatalf("job detail missing %q:\n%s", want, view)
 		}
+	}
+}
+
+// TestJobDetailWrapsLongResult guards that a long single-line result summary is
+// soft-wrapped to the viewport width instead of being clipped at the right edge.
+func TestJobDetailWrapsLongResult(t *testing.T) {
+	long := "Implementation blocked because the workspace is mounted read-only. " +
+		strings.Repeat("decrypt-failure replay-poisoning regression coverage ", 12) + "END_TOKEN"
+	deps := Deps{
+		JobEvents: func(id string) ([]JobEventView, error) { return nil, nil },
+		JobDetail: func(id string) (JobDetail, error) {
+			return JobDetail{ResultDecision: "blocked", ResultSummary: long}, nil
+		},
+	}
+	m := jobsModel(t, deps, jobsSnapshot())
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	m = drainBatch(t, m, cmd)
+	detail := m.jobDetailView()
+	for _, ln := range strings.Split(detail, "\n") {
+		if w := lipgloss.Width(ln); w > m.viewport.Width {
+			t.Fatalf("detail line width %d exceeds viewport %d (would clip): %q", w, m.viewport.Width, ln)
+		}
+	}
+	// The tail of the summary survives the wrap (it was clipped before the fix).
+	if !strings.Contains(detail, "END_TOKEN") {
+		t.Fatalf("wrapped summary should include its tail:\n%s", detail)
 	}
 }
 

@@ -114,6 +114,48 @@ func TestConfigEditableSettingsGroupedBySection(t *testing.T) {
 	}
 }
 
+// TestConfigEditableSettingsSubgroupedByEntity verifies that editable fields with
+// a 3-part KeyPath (e.g. per agent type) sub-group under the entity name, with the
+// redundant "<entity> · " prefix dropped from the field label.
+func TestConfigEditableSettingsSubgroupedByEntity(t *testing.T) {
+	snap := Snapshot{
+		Daemon: Daemon{Running: true},
+		Config: ConfigView{
+			Path: "/c.toml",
+			Sections: []ConfigSection{{
+				Title: "agent types",
+				Editable: []ConfigField{
+					{Label: "planner · max_background", KeyPath: []string{"agents", "planner", "max_background"}, Value: "4"},
+					{Label: "planner · idle_timeout", KeyPath: []string{"agents", "planner", "idle_timeout"}, Value: "10m"},
+					{Label: "reviewer · max_background", KeyPath: []string{"agents", "reviewer", "max_background"}, Value: "2"},
+				},
+			}},
+		},
+	}
+	m := configModel(t, Deps{}, snap)
+	view := m.View()
+	eb := strings.Index(view, "editable settings")
+	if eb < 0 {
+		t.Fatalf("missing editable settings block:\n%s", view)
+	}
+	sub := view[eb:]
+	// The flat "<entity> · <setting>" label is gone; entity is a sub-heading.
+	if strings.Contains(sub, "planner · max_background") {
+		t.Fatalf("entity prefix should be dropped from the field label:\n%s", sub)
+	}
+	last := -1
+	for _, s := range []string{"agent types", "planner", "max_background", "idle_timeout", "reviewer"} {
+		i := strings.Index(sub, s)
+		if i < 0 {
+			t.Fatalf("editable block missing %q:\n%s", s, sub)
+		}
+		if i < last {
+			t.Fatalf("editable block out of order at %q:\n%s", s, sub)
+		}
+		last = i
+	}
+}
+
 func TestConfigEditDispatchesEditorCmd(t *testing.T) {
 	edited := false
 	deps := Deps{
