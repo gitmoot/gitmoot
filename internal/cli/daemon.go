@@ -2886,9 +2886,10 @@ func (w jobWorker) resolveJobCheckout(ctx context.Context, job db.Job, payload w
 }
 
 func (w jobWorker) taskWorktreeCheckout(ctx context.Context, payload workflow.JobPayload) (string, bool, error) {
-	// Delegated implement jobs carry their own per-delegation worktree path in
-	// the payload; prefer it over the task-table worktree so the child runs in
-	// its isolated checkout.
+	// Delegated jobs carry their own per-delegation worktree path in the payload
+	// (an implement child's branch worktree, or a read-only fan-out child's
+	// detached worktree); prefer it over the task-table worktree so the child runs
+	// in its isolated checkout.
 	if delegationPath := strings.TrimSpace(payload.WorktreePath); delegationPath != "" {
 		checkout, err := normalizeTaskWorktreePath(delegationPath)
 		if err != nil {
@@ -2937,6 +2938,23 @@ func normalizeTaskWorktreePath(path string) (string, error) {
 
 func (w jobWorker) validateTargetCheckout(ctx context.Context, payload workflow.JobPayload, checkout string) error {
 	git := gitutil.Client{Dir: checkout}
+	// A delegation worktree child runs in a gitmoot-managed worktree that is
+	// correct by construction: an implement child is on its delegation branch
+	// (created off the parent base, whose tip may have advanced past the inherited
+	// HeadSHA), while a read-only child uses a *detached* worktree with no branch
+	// at all (so CurrentBranch would error). Skip the branch and inherited-HeadSHA
+	// checks for these children, but still require the freshly allocated worktree
+	// to be clean before the job runs.
+	if isDelegationWorktreeChild(payload) {
+		clean, err := git.WorktreeClean(ctx)
+		if err != nil {
+			return err
+		}
+		if !clean {
+			return fmt.Errorf("checkout %s has uncommitted changes", checkout)
+		}
+		return nil
+	}
 	branch, err := git.CurrentBranch(ctx)
 	if err != nil {
 		return err
@@ -2950,15 +2968,6 @@ func (w jobWorker) validateTargetCheckout(ctx context.Context, payload workflow.
 	}
 	if !clean {
 		return fmt.Errorf("checkout %s has uncommitted changes", checkout)
-	}
-	// A delegated implement child runs in its own freshly-allocated worktree,
-	// created off the parent's base branch whose tip may have advanced past the
-	// HeadSHA the child inherited from the parent payload. The dispatcher clears
-	// the inherited HeadSHA for these children, so the worktree HEAD is correct
-	// by construction (it is the base-branch tip at allocation time) and there is
-	// nothing to compare against. Skip the HeadSHA equality check for them.
-	if isDelegationWorktreeChild(payload) {
-		return nil
 	}
 	expectedHead := strings.TrimSpace(payload.HeadSHA)
 	if expectedHead == "" {

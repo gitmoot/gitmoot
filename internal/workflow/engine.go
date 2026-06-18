@@ -328,6 +328,12 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 	}
 	ref := taskRefFromPayload(payload)
 
+	// A read-only delegation child runs in a throwaway detached worktree; dispose
+	// it once the child is terminal. Deferred so it fires on every return path
+	// below (the delegation DAG early-returns for policy-handled failures and
+	// pending retries). No-op for jobs that did not allocate a read-only worktree.
+	defer e.cleanupReadOnlyDelegationWorktree(ctx, jobID, job.Type, payload)
+
 	// When a delegated child job finishes, advance its parent's delegation DAG
 	// before running the child's own advancement: enqueue any now-ready
 	// dependent siblings, apply the failed delegation's failure_policy, and
@@ -917,6 +923,45 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 			// spuriously reject the child on a moving parent branch. Clear the
 			// inherited HeadSHA so the child validates against its own fresh
 			// worktree HEAD instead of a stale parent SHA.
+			request.HeadSHA = ""
+		}
+	} else if readOnlyFanoutNeedsWorktree(payload, d) {
+		// Read-only fan-out: >=2 read-only siblings share the parent repo and would
+		// otherwise serialize on the repo:<repo> checkout key (only one runs per
+		// daemon tick). Give this child its own detached, branch-lock-free worktree
+		// so its checkout key is worktree:<path> and the siblings run concurrently.
+		if manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager); !ok || strings.TrimSpace(e.Home) == "" {
+			// Isolation is unavailable (no Home/worktree manager, or the manager
+			// cannot create detached worktrees): the siblings fall back to the shared
+			// checkout and serialize. Emit a parent event so the loss of parallelism
+			// is observable rather than silent.
+			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+				JobID:   job.ID,
+				Kind:    "delegation_worktree_skipped",
+				Message: fmt.Sprintf("delegation %q read-only fan-out runs serialized in the shared checkout: detached worktree isolation unavailable", request.DelegationID),
+			})
+		} else {
+			path, err := e.AllocateReadOnlyDelegationWorktree(ctx, DelegationWorktreeRequest{
+				Home:         e.Home,
+				Repo:         request.Repo,
+				ParentJobID:  job.ID,
+				DelegationID: request.DelegationID,
+				Delegation:   d,
+				BaseBranch:   payload.Branch,
+				Checkout:     e.DelegationCheckout,
+				RetryAttempt: request.RetryCount,
+			}, manager)
+			if err != nil {
+				var blocked BlockedError
+				if errors.As(err, &blocked) {
+					return e.block(ctx, ref, blocked.Reason)
+				}
+				return err
+			}
+			request.WorktreePath = path
+			// The detached worktree is created at the parent base-branch tip, which
+			// may have advanced past the inherited HeadSHA. Clear it so the child
+			// validates against its own fresh worktree HEAD (see isDelegationWorktreeChild).
 			request.HeadSHA = ""
 		}
 	}

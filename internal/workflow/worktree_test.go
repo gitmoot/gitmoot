@@ -620,6 +620,9 @@ type fakeWorktreeManager struct {
 	existingBranches map[string]bool
 	calls            []worktreeCall
 	existingCalls    []worktreeCall
+	detachedCalls    []worktreeCall // AddDetachedWorktree: path in .path, ref in .base
+	removedForce     []string       // RemoveWorktreeForce paths
+	removeErr        error
 }
 
 type worktreeCall struct {
@@ -646,4 +649,17 @@ func (f *fakeWorktreeManager) AddExistingBranchWorktree(_ context.Context, branc
 
 func (f *fakeWorktreeManager) BranchExists(_ context.Context, branch string) (bool, error) {
 	return f.existingBranches[branch], nil
+}
+
+func (f *fakeWorktreeManager) AddDetachedWorktree(_ context.Context, path string, ref string) error {
+	if f.onAdd != nil {
+		f.onAdd()
+	}
+	f.detachedCalls = append(f.detachedCalls, worktreeCall{path: path, base: ref})
+	return f.err
+}
+
+func (f *fakeWorktreeManager) RemoveWorktreeForce(_ context.Context, path string) error {
+	f.removedForce = append(f.removedForce, path)
+	return f.removeErr
 }

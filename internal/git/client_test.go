@@ -122,6 +122,66 @@ func TestClientAddWorktreeRejectsInvalidInput(t *testing.T) {
 	if err := (Client{}).RemoveWorktree(context.Background(), " "); err == nil {
 		t.Fatal("RemoveWorktree accepted empty path")
 	}
+	if err := (Client{}).RemoveWorktreeForce(context.Background(), " "); err == nil {
+		t.Fatal("RemoveWorktreeForce accepted empty path")
+	}
+	if err := (Client{}).AddDetachedWorktree(context.Background(), "", "main"); err == nil {
+		t.Fatal("AddDetachedWorktree accepted empty path")
+	}
+	if err := (Client{}).AddDetachedWorktree(context.Background(), "/tmp/wt", " "); err == nil {
+		t.Fatal("AddDetachedWorktree accepted empty ref")
+	}
+	if err := (Client{}).AddDetachedWorktree(context.Background(), "/tmp/wt", "-bad"); err == nil {
+		t.Fatal("AddDetachedWorktree accepted ref starting with '-'")
+	}
+}
+
+func TestClientDetachedAndForceRemoveCommandConstruction(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{}, {}}}
+	client := Client{Runner: runner, Dir: "/repo"}
+	if err := client.AddDetachedWorktree(context.Background(), "/worktrees/d1", "main"); err != nil {
+		t.Fatalf("AddDetachedWorktree returned error: %v", err)
+	}
+	if err := client.RemoveWorktreeForce(context.Background(), "/worktrees/d1"); err != nil {
+		t.Fatalf("RemoveWorktreeForce returned error: %v", err)
+	}
+	runner.wantArgs(t, 0, "git", "worktree", "add", "--detach", "/worktrees/d1", "main")
+	runner.wantArgs(t, 1, "git", "worktree", "remove", "--force", "/worktrees/d1")
+}
+
+func TestClientRemoveWorktreeForceSmoke(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	runGit(t, dir, "init", "-b", "main")
+	runGit(t, dir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, dir, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# smoke\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runGit(t, dir, "add", "README.md")
+	runGit(t, dir, "commit", "-m", "init")
+
+	client := Client{Dir: dir}
+	wt := filepath.Join(t.TempDir(), "detached")
+	if err := client.AddDetachedWorktree(context.Background(), wt, "HEAD"); err != nil {
+		t.Fatalf("AddDetachedWorktree returned error: %v", err)
+	}
+	// A read-only runtime may leave untracked scratch files behind; plain remove
+	// refuses, force remove disposes the throwaway worktree anyway.
+	if err := os.WriteFile(filepath.Join(wt, "scratch.txt"), []byte("scratch\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile scratch returned error: %v", err)
+	}
+	if err := client.RemoveWorktree(context.Background(), wt); err == nil {
+		t.Fatal("RemoveWorktree unexpectedly removed a worktree with untracked files")
+	}
+	if err := client.RemoveWorktreeForce(context.Background(), wt); err != nil {
+		t.Fatalf("RemoveWorktreeForce returned error: %v", err)
+	}
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Fatalf("worktree dir still present after force remove: stat err = %v", err)
+	}
 }
 
 func TestClientBranchExistsReturnsFalseForMissingBranch(t *testing.T) {

@@ -25,6 +25,17 @@ type BranchExistenceChecker interface {
 	BranchExists(ctx context.Context, branch string) (bool, error)
 }
 
+// ReadOnlyWorktreeManager allocates and disposes throwaway detached worktrees
+// for read-only (ask/review) delegation fan-out. Unlike implement worktrees
+// these carry no branch and no branch lock: the worker only reads the checkout,
+// so the worktree exists solely to give concurrent same-repo read-only siblings
+// distinct checkout keys (otherwise they serialize on the shared repo checkout).
+// The checkout-bound gitutil.Client satisfies this interface.
+type ReadOnlyWorktreeManager interface {
+	AddDetachedWorktree(ctx context.Context, path string, ref string) error
+	RemoveWorktreeForce(ctx context.Context, path string) error
+}
+
 type TaskWorktreeRequest struct {
 	Home       string
 	Repo       string
@@ -232,6 +243,130 @@ func (e Engine) AllocateDelegationWorktree(ctx context.Context, request Delegati
 		return DelegationWorktreeResult{}, err
 	}
 	return DelegationWorktreeResult{Path: path, Branch: branch}, nil
+}
+
+// AllocateReadOnlyDelegationWorktree creates a detached, branch-lock-free git
+// worktree for a read-only (ask/review) delegation child so it does not
+// serialize with its same-repo siblings on the shared repo checkout key. It
+// reuses the deterministic DelegationWorktreePath and the checkout mutation lock
+// (a detached `git worktree add` mutates the shared .git) but takes no branch
+// lock and creates no branch: a read-only child owns nothing to merge. The
+// worktree is disposed by cleanupReadOnlyDelegationWorktree once the child job
+// reaches a terminal state.
+func (e Engine) AllocateReadOnlyDelegationWorktree(ctx context.Context, request DelegationWorktreeRequest, manager ReadOnlyWorktreeManager) (string, error) {
+	if err := e.validate(); err != nil {
+		return "", err
+	}
+	if manager == nil {
+		return "", errors.New("read-only worktree manager is required")
+	}
+	if strings.TrimSpace(request.ParentJobID) == "" {
+		return "", errors.New("delegation worktree parent job id is required")
+	}
+	if strings.TrimSpace(request.DelegationID) == "" {
+		return "", errors.New("delegation worktree delegation id is required")
+	}
+	path, err := DelegationWorktreePath(request.Home, request.Repo, request.ParentJobID, request.DelegationID, request.RetryAttempt)
+	if err != nil {
+		return "", err
+	}
+	ref := strings.TrimSpace(request.BaseBranch)
+	if ref == "" {
+		ref = "HEAD"
+	}
+	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(ctx, e.Store, request.Checkout, "worktree:"+request.ParentJobID+"/"+request.DelegationID, time.Now().UTC())
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if releaseCheckoutLock != nil {
+			_ = releaseCheckoutLock(context.Background())
+		}
+	}()
+	if err := manager.AddDetachedWorktree(ctx, path, ref); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// readOnlyDelegationAction reports whether a delegation action runs read-only.
+// implement is the only write action (it mutates a branch and merges); every
+// other action (ask, review) only reads the checkout.
+func readOnlyDelegationAction(action string) bool {
+	a := strings.ToLower(strings.TrimSpace(action))
+	return a != "" && a != "implement"
+}
+
+// readOnlyFanoutNeedsWorktree reports whether read-only delegation d should run
+// in its own detached worktree to avoid serializing with its siblings. It is
+// true only when d is read-only and the coordinator emitted >=2 read-only
+// delegations: all delegation children inherit the parent repo, so >=2 read-only
+// siblings otherwise collapse to the same repo:<repo> checkout key and run
+// one-at-a-time. A single read-only delegation stays in the shared checkout (a
+// worktree would be pure overhead with no parallelism to gain).
+func readOnlyFanoutNeedsWorktree(payload JobPayload, d Delegation) bool {
+	if !readOnlyDelegationAction(d.Action) {
+		return false
+	}
+	if payload.Result == nil {
+		return false
+	}
+	count := 0
+	for _, sib := range payload.Result.Delegations {
+		if readOnlyDelegationAction(sib.Action) {
+			count++
+			if count >= 2 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isReadOnlyDelegationWorktree reports whether a job ran in a detached read-only
+// delegation worktree that must be disposed. Only read-only delegation children
+// allocate one; implement children carry a branch and are cleaned through the
+// merge gate, so they are excluded.
+func isReadOnlyDelegationWorktree(jobType string, payload JobPayload) bool {
+	return strings.TrimSpace(payload.DelegationID) != "" &&
+		strings.TrimSpace(payload.WorktreePath) != "" &&
+		readOnlyDelegationAction(jobType)
+}
+
+// cleanupReadOnlyDelegationWorktree disposes the detached worktree allocated for
+// a read-only delegation child once the child job is terminal. It is best-effort
+// and idempotent: a missing worktree (already removed on a prior advance, or
+// never allocated) is logged, not fatal. Removal mutates the shared .git, so it
+// holds the checkout mutation lock like allocation does.
+func (e Engine) cleanupReadOnlyDelegationWorktree(ctx context.Context, jobID string, jobType string, payload JobPayload) {
+	if !isReadOnlyDelegationWorktree(jobType, payload) {
+		return
+	}
+	manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager)
+	if !ok || manager == nil {
+		return
+	}
+	// Detach from the caller's cancellation: this runs on the child's terminal
+	// AdvanceJob, which may carry a job context already cancelled by a run timeout.
+	// The worktree must still be disposed, so keep context values but drop the
+	// deadline/cancel.
+	opCtx := context.WithoutCancel(ctx)
+	path := strings.TrimSpace(payload.WorktreePath)
+	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(opCtx, e.Store, e.DelegationCheckout, "worktree-cleanup:"+jobID, time.Now().UTC())
+	if err != nil {
+		_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_cleanup_failed", Message: fmt.Sprintf("read-only worktree %s cleanup could not lock checkout: %v", path, err)})
+		return
+	}
+	defer func() {
+		if releaseCheckoutLock != nil {
+			_ = releaseCheckoutLock(context.Background())
+		}
+	}()
+	if err := manager.RemoveWorktreeForce(opCtx, path); err != nil {
+		_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_cleanup_failed", Message: fmt.Sprintf("read-only worktree %s force-remove failed: %v", path, err)})
+		return
+	}
+	_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_removed", Message: fmt.Sprintf("read-only worktree %s removed", path)})
 }
 
 func addTaskWorktree(ctx context.Context, manager WorktreeManager, branch string, path string, base string) error {

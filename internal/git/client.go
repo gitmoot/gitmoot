@@ -86,6 +86,19 @@ func (c Client) RemoveWorktree(ctx context.Context, path string) error {
 	return err
 }
 
+// RemoveWorktreeForce removes a worktree even when it has uncommitted or
+// untracked changes. It is intended for throwaway worktrees (e.g. detached
+// read-only delegation fan-out worktrees) whose contents are never integrated,
+// so a runtime that left scratch files behind must not block disposal.
+func (c Client) RemoveWorktreeForce(ctx context.Context, path string) error {
+	path, err := validateWorktreePath(path)
+	if err != nil {
+		return err
+	}
+	_, err = c.run(ctx, "worktree", "remove", "--force", path)
+	return err
+}
+
 func (c Client) CurrentBranch(ctx context.Context) (string, error) {
 	result, err := c.run(ctx, "branch", "--show-current")
 	if err != nil {

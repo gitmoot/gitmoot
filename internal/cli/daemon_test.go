@@ -2431,6 +2431,30 @@ func TestValidateTargetCheckoutSkipsHeadShaForDelegationWorktreeChild(t *testing
 	}
 }
 
+func TestValidateTargetCheckoutAcceptsDetachedReadOnlyWorktreeChild(t *testing.T) {
+	// A read-only delegation child runs in a *detached* worktree (no branch).
+	// CurrentBranch errors on a detached HEAD, so validateTargetCheckout must
+	// recognize the delegation worktree child and accept it on the clean-worktree
+	// check alone rather than rejecting it on the branch check.
+	ctx := context.Background()
+	checkout := createDaemonWorkerGitCheckout(t, "task-005")
+	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard)
+
+	detached := filepath.Join(t.TempDir(), "ro-worktree")
+	runDaemonWorkerGit(t, checkout, "worktree", "add", "--detach", detached, "HEAD")
+
+	payload := workflow.JobPayload{
+		Repo:         "owner/repo",
+		Branch:       "task-005",
+		DelegationID: "d1",
+		ParentJobID:  "parent-job",
+		WorktreePath: detached,
+	}
+	if err := worker.validateTargetCheckout(ctx, payload, detached); err != nil {
+		t.Fatalf("validateTargetCheckout rejected detached read-only worktree child: %v", err)
+	}
+}
+
 func TestRefreshDaemonJobPayloadPreservesTaskWorktreeHeadForFinalizer(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
