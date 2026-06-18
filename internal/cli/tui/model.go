@@ -119,7 +119,10 @@ type Model struct {
 	sessionNotice      string  // muted note on the Sessions page (e.g. group not stoppable)
 
 	// Jobs page interaction state.
-	jobCursor         int                 // selected row in snap.JobRows
+	jobCursor int // selected row in jobsVisibleRows(); resolve to a job via
+	// selectedItemIndex(jobsVisibleRows(), jobCursor) -> jobsOrdered(), NOT
+	// snap.JobRows (grouping reorders by status and collapsed headers take slots).
+	jobGroups         []jobStatusGroup    // per-snapshot status grouping cache (see jobsByStatusGroup)
 	activeJob         JobRow              // job shown in detail / being confirmed
 	jobEvents         []JobEventView      // lazy-loaded event history for the detail view
 	jobEventsLoaded   bool                // the detail's event load has returned (possibly empty)
@@ -835,6 +838,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loadErr = ""
 			m.snap = msg.snap
 			m.loadedAt = msg.at
+			m.jobGroups = computeJobsByStatusGroup(m.snap.JobRows)
 			m.clampPromptCursor()
 			m.clampTrainCursor()
 			m.clampJobCursor()
@@ -1075,6 +1079,7 @@ func (m *Model) toggleCurrentGroup() bool {
 	}
 	m.clampPromptCursor()
 	m.clampTrainCursor()
+	m.clampJobCursor()
 	return true
 }
 

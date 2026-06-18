@@ -263,9 +263,14 @@ func (m Model) footerHelp() string {
 	case pageSessions:
 		return "tab/←→ page  ↑/↓ select  enter detail  s stop  ? help  q quit"
 	case pageJobs:
-		help := "tab/←→ page  ↑/↓ select  space open/close  enter detail  R retry  c cancel"
-		if job, ok := m.jobUnderCursor(); ok && jobReportable(job.State) {
-			help += "  B report bug"
+		help := "tab/←→ page  ↑/↓ select  space open/close"
+		if m.cursorOnHeader() {
+			help += "  enter open/close"
+		} else {
+			help += "  enter detail  R retry  c cancel"
+			if job, ok := m.jobUnderCursor(); ok && jobReportable(job.State) {
+				help += "  B report bug"
+			}
 		}
 		return help + "  ? help  q quit"
 	case pageHealth:

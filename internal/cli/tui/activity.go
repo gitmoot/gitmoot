@@ -43,15 +43,15 @@ func (m Model) activityUnderCursor() (JobRow, bool) {
 	return sel[m.activityCursor], true
 }
 
-// activityWindowCap is how many display rows fit the Activity page, leaving room
-// for the title/intro, the above/below markers, and the footer. Mirrors
-// jobsWindowCap so a wide fan-out (or a short terminal) never pushes the cursor
-// off-screen.
+// activityWindowCap is how many display rows fit the Activity page. The viewport
+// is height-4; the page also renders the title block (2), the intro (2), both
+// scroll markers (2), and the footer (1) = 7 lines of chrome, so the window keeps
+// to height-11 to stay inside the viewport even when both markers show.
 func activityWindowCap(height int) int {
-	if height-9 < 3 {
+	if height-11 < 3 {
 		return 3
 	}
-	return height - 9
+	return height - 11
 }
 
 // activityRow is one rendered line of the Activity page. Selectable rows (a root

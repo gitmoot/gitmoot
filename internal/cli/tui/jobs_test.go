@@ -168,6 +168,58 @@ func TestJobsCollapsedByDefault(t *testing.T) {
 	}
 }
 
+// TestJobsWindowFitsViewport guards that, when both scroll markers show (cursor
+// mid-list), the windowed content fits inside the viewport so the "more rows
+// below" marker and the footer help are not clipped off the bottom.
+func TestJobsWindowFitsViewport(t *testing.T) {
+	snap := Snapshot{Daemon: Daemon{Running: true}}
+	for i := 0; i < 100; i++ {
+		snap.JobRows = append(snap.JobRows, JobRow{ID: "job-" + strconv.Itoa(i), Agent: "planner", Type: "ask", State: "succeeded"})
+	}
+	m := jobsModel(t, Deps{}, snap)
+	for i := 0; i < 50; i++ { // scroll into the middle → both markers present
+		next, _ := m.Update(key("j"))
+		m = next.(Model)
+	}
+	content := m.content()
+	if !strings.Contains(content, "more rows above") || !strings.Contains(content, "more rows below") {
+		t.Fatalf("mid-scroll should show both markers:\n%s", content)
+	}
+	lines := strings.Split(content, "\n")
+	idxOf := func(sub string) int {
+		for i, ln := range lines {
+			if strings.Contains(ln, sub) {
+				return i
+			}
+		}
+		return -1
+	}
+	// The below-marker and the footer help must land within the visible viewport.
+	for _, sub := range []string{"more rows below", "enter detail"} {
+		i := idxOf(sub)
+		if i < 0 || i >= m.viewport.Height {
+			t.Fatalf("%q at line %d is outside the %d-line viewport (would clip):\n%s", sub, i, m.viewport.Height, content)
+		}
+	}
+}
+
+// TestJobsWindowKeepsGroupContext guards that scrolling deep into a status group
+// (so its header scrolls off) keeps the group context on the "above" marker.
+func TestJobsWindowKeepsGroupContext(t *testing.T) {
+	snap := Snapshot{Daemon: Daemon{Running: true}}
+	for i := 0; i < 100; i++ {
+		snap.JobRows = append(snap.JobRows, JobRow{ID: "job-" + strconv.Itoa(i), Agent: "planner", Type: "ask", State: "succeeded"})
+	}
+	m := jobsModel(t, Deps{}, snap)
+	for i := 0; i < 60; i++ {
+		next, _ := m.Update(key("j"))
+		m = next.(Model)
+	}
+	if view := m.View(); !strings.Contains(view, "(continued)") {
+		t.Fatalf("deep cursor should keep the status-group context on the marker:\n%s", view)
+	}
+}
+
 func TestJobsPageDetailLoadsEvents(t *testing.T) {
 	var asked string
 	deps := Deps{JobEvents: func(id string) ([]JobEventView, error) {

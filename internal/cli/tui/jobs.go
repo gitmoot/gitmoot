@@ -275,12 +275,12 @@ type jobStatusGroup struct {
 	jobs  []JobRow
 }
 
-// jobsByStatusGroup buckets the snapshot jobs by state into display-ordered
-// groups (active first). Both jobsOrdered and jobsListRows derive from this, so
-// the cursor's item index and the rendered rows can never drift apart.
-func (m Model) jobsByStatusGroup() []jobStatusGroup {
+// computeJobsByStatusGroup buckets job rows by state into display-ordered groups
+// (active first, then any unknown states sorted). Pure over its input so the
+// result can be memoized per snapshot.
+func computeJobsByStatusGroup(jobRows []JobRow) []jobStatusGroup {
 	byState := map[string][]JobRow{}
-	for _, j := range m.snap.JobRows {
+	for _, j := range jobRows {
 		byState[j.State] = append(byState[j.State], j)
 	}
 	var groups []jobStatusGroup
@@ -302,6 +302,40 @@ func (m Model) jobsByStatusGroup() []jobStatusGroup {
 		groups = append(groups, jobStatusGroup{st, byState[st]})
 	}
 	return groups
+}
+
+// jobsByStatusGroup returns the status groups, reusing the per-snapshot cache
+// (m.jobGroups, set when the snapshot is applied) so jobsVisibleRows/jobsOrdered/
+// jobUnderCursor don't each re-bucket every job on every keystroke. Falls back to
+// computing on the fly when the cache is unset, so correctness never depends on
+// it. Both jobsOrdered and jobsListRows derive from this, so the cursor's item
+// index and the rendered rows can never drift apart.
+func (m Model) jobsByStatusGroup() []jobStatusGroup {
+	if m.jobGroups != nil {
+		return m.jobGroups
+	}
+	return computeJobsByStatusGroup(m.snap.JobRows)
+}
+
+// jobsSummaryOrder lists the states present in byState in the same active-first
+// order as the status groups, so the top summary line mirrors the sections.
+func jobsSummaryOrder(byState map[string]int) []string {
+	var out []string
+	used := map[string]bool{}
+	for _, st := range jobStatusGroupOrder {
+		if byState[st] > 0 {
+			out = append(out, st)
+			used[st] = true
+		}
+	}
+	var rest []string
+	for st, n := range byState {
+		if n > 0 && !used[st] {
+			rest = append(rest, st)
+		}
+	}
+	sort.Strings(rest)
+	return append(out, rest...)
 }
 
 // jobsOrdered is the jobs flattened in status-group order — the index space the
@@ -350,37 +384,58 @@ func (m Model) jobsContentInteractive() string {
 	}
 	var b strings.Builder
 	summary := []string{}
-	for _, state := range sortedKeys(m.snap.Jobs.ByState) {
+	for _, state := range jobsSummaryOrder(m.snap.Jobs.ByState) {
 		summary = append(summary, jobStateColor(state)+" "+strconv.Itoa(m.snap.Jobs.ByState[state]))
 	}
 	b.WriteString(mutedStyle.Render(strconv.Itoa(m.snap.Jobs.Total)+" total") + "  " + strings.Join(summary, "  "))
 	b.WriteString("\n\n")
 
-	windowed, rel, above, below := windowListRows(m.jobsVisibleRows(), m.jobCursor, jobsWindowCap(m.height))
+	rows := m.jobsVisibleRows()
+	windowed, rel, above, below := windowListRows(rows, m.jobCursor, jobsWindowCap(m.height))
 	if above > 0 {
-		b.WriteString(mutedStyle.Render("↑ "+strconv.Itoa(above)+" more rows above") + "\n")
+		// above == the window start index; keep the status-group context when the
+		// window opens mid-group (the group's header scrolled off).
+		marker := "↑ " + strconv.Itoa(above) + " more rows above"
+		if above < len(rows) && !rows[above].header {
+			for i := above - 1; i >= 0; i-- {
+				if rows[i].header {
+					marker += " · " + rows[i].text + " (continued)"
+					break
+				}
+			}
+		}
+		b.WriteString(mutedStyle.Render(marker) + "\n")
 	}
 	renderListRows(&b, windowed, rel)
 	if below > 0 {
 		b.WriteString(mutedStyle.Render("↓ "+strconv.Itoa(below)+" more rows below") + "\n")
 	}
 
-	help := "↑/↓ select · space open/close · enter detail · R retry · c cancel"
-	if job, ok := m.jobUnderCursor(); ok && jobReportable(job.State) {
-		help += " · B report bug"
+	// enter toggles a collapsed group header; it only opens a detail on a job leaf.
+	help := "↑/↓ select · space open/close"
+	if m.cursorOnHeader() {
+		help += " · enter open/close"
+	} else {
+		help += " · enter detail · R retry · c cancel"
+		if job, ok := m.jobUnderCursor(); ok && jobReportable(job.State) {
+			help += " · B report bug"
+		}
 	}
 	b.WriteString("\n" + mutedStyle.Render(help))
 	b.WriteByte('\n')
 	return b.String()
 }
 
-// jobsWindowCap is how many job rows fit the Jobs page, leaving room for the
-// title, summary, more/earlier markers, and footer.
+// jobsWindowCap is how many list rows fit the Jobs page. The viewport is
+// height-4; the page also renders the title block (2), the summary (2), both
+// scroll markers (2), and the blank-line+help footer (2) = 8 lines of chrome, so
+// the window keeps to height-12 to stay inside the viewport even when both
+// markers show.
 func jobsWindowCap(height int) int {
-	if height-9 < 3 {
+	if height-12 < 3 {
 		return 3
 	}
-	return height - 9
+	return height - 12
 }
 
 // formatJobTime renders a stored ISO timestamp ("2006-01-02 15:04:05", UTC from
