@@ -93,7 +93,10 @@ equivalent:
   create; a missing `delete_repo` token scope shows its `gh auth refresh`
   remedy and can be retried in place).
 - **Agents** lists registered agents: `enter` opens a detail with the template,
-  recent jobs, and the template's version history; `n` registers a new agent
+  recent jobs, and the template's version history — in the detail `↑/↓` selects a
+  recent job (then a version) and `enter` opens it: a recent job opens that job's
+  detail (`esc` returns), and the list scrolls when an agent has many jobs; `n`
+  registers a new agent
   (name, codex/claude/kimi runtime, installed template); `o` starts a training
   session for the agent's template via a pre-filled form (review/workspace
   repos, request, codex/claude backend, optional model — the backend/model are
