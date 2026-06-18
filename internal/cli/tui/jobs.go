@@ -25,6 +25,9 @@ func (m *Model) openJobDetail(job JobRow) tea.Cmd {
 	// jobDetailReturn afterward to return to its own overlay instead.
 	m.jobDetailReturn = modeNormal
 	m.mode = modeJobDetail
+	// Start at the top so a scroll position from the page/agent detail it was
+	// opened from does not carry over.
+	m.viewport.GotoTop()
 	return tea.Batch(jobEventsCmd(m.deps, job.ID), jobDetailCmd(m.deps, job.ID))
 }
 

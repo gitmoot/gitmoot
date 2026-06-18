@@ -72,6 +72,8 @@ func (m *Model) openAgentDetail(agent Agent) tea.Cmd {
 	m.actionErr = ""
 	m.actionBusy = false
 	m.mode = modeAgentDetail
+	// Start at the top so a scroll position from the agents list does not carry over.
+	m.viewport.GotoTop()
 	if agent.TemplateID == "" {
 		m.agentVersionsLoaded = true
 		return nil

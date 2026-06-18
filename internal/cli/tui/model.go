@@ -218,6 +218,17 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(loadSnapshot(m.deps), tick(m.interval(), m.tickGen))
 }
 
+// scrollResetOnModeChange snaps the shared viewport back to the top when a key
+// handler changed the mode (opening, closing, or switching a modal overlay), so
+// a scroll position from one mode does not leak into the next.
+func scrollResetOnModeChange(prev mode, model tea.Model, cmd tea.Cmd) (tea.Model, tea.Cmd) {
+	if nm, ok := model.(Model); ok && nm.mode != prev {
+		nm.viewport.GotoTop()
+		return nm, cmd
+	}
+	return model, cmd
+}
+
 // Update satisfies tea.Model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
@@ -239,30 +250,36 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
 			}
-			return m.updateJobOverlay(msg)
+			model, cmd := m.updateJobOverlay(msg)
+			return scrollResetOnModeChange(m.mode, model, cmd)
 		case modeTrainStopReason, modeConfirmTrainDelete, modeConfirmTrainRepoCleanup:
 			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
 			}
-			return m.updateTrainOverlay(msg)
+			model, cmd := m.updateTrainOverlay(msg)
+			return scrollResetOnModeChange(m.mode, model, cmd)
 		case modeAgentDetail, modeAgentRevertPick, modeConfirmAgentRevert, modeConfirmAgentDelete, modeConfirmAgentGroupDelete, modeAgentVersionView, modeAgentRuntimePick:
 			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
 			}
-			return m.updateAgentOverlay(msg)
+			model, cmd := m.updateAgentOverlay(msg)
+			return scrollResetOnModeChange(m.mode, model, cmd)
 		case modeConfigEdit:
 			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
 			}
-			return m.updateConfigOverlay(msg)
+			model, cmd := m.updateConfigOverlay(msg)
+			return scrollResetOnModeChange(m.mode, model, cmd)
 		case modeSessionDetail, modeConfirmSessionStop:
 			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
 			}
-			return m.updateSessionOverlay(msg)
+			model, cmd := m.updateSessionOverlay(msg)
+			return scrollResetOnModeChange(m.mode, model, cmd)
 		}
 		if m.mode != modeNormal {
-			return m.updateOverlay(msg)
+			model, cmd := m.updateOverlay(msg)
+			return scrollResetOnModeChange(m.mode, model, cmd)
 		}
 		switch msg.String() {
 		case "ctrl+c", "q", "esc":

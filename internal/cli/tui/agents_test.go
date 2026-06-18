@@ -589,6 +589,54 @@ func TestAgentDetailJobActionsReturnToDetail(t *testing.T) {
 	}
 }
 
+// TestAgentDetailScrollResetsOnReturn reproduces the shared-viewport scroll
+// leak: scrolling a job opened from the agent detail and pressing esc must land
+// the agent detail back at the top (showing its header), not stuck scrolled.
+func TestAgentDetailScrollResetsOnReturn(t *testing.T) {
+	// Many versions make the agent detail tall enough that a stale scroll offset
+	// would NOT be auto-clamped to zero on return — so this fails without the fix.
+	versions := make([]TemplateVersion, 30)
+	for i := range versions {
+		versions[i] = TemplateVersion{ID: "v" + strconv.Itoa(i+1), Number: i + 1, State: "superseded", Name: "T"}
+	}
+	deps := Deps{TemplateVersions: func(string) ([]TemplateVersion, error) { return versions, nil }}
+	snap := agentsSnapshot()
+	snap.JobRows = []JobRow{{ID: "job-f", Agent: "planner", Type: "ask", State: "succeeded"}}
+	m := agentsModel(t, deps, snap)
+
+	// Open the agent detail and drill into its recent job.
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if cmd != nil {
+		next, _ = m.Update(cmd())
+		m = next.(Model)
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if m.mode != modeJobDetail {
+		t.Fatalf("expected job detail, got %v", m.mode)
+	}
+
+	// Load a long request body and scroll the job detail down.
+	next, _ = m.Update(jobDetailMsg{id: "job-f", detail: JobDetail{Request: strings.Repeat("line\n", 200)}})
+	m = next.(Model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	m = next.(Model)
+	if m.viewport.YOffset == 0 {
+		t.Fatalf("job detail should have scrolled down")
+	}
+
+	// esc returns to the agent detail, which must be reset to the top.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	if m.mode != modeAgentDetail {
+		t.Fatalf("esc should return to the agent detail, got %v", m.mode)
+	}
+	if m.viewport.YOffset != 0 {
+		t.Fatalf("agent detail should reset to the top on return, YOffset=%d", m.viewport.YOffset)
+	}
+}
+
 // TestAgentDetailRecentJobsWindow guards that a busy agent's recent-jobs list
 // windows around the cursor so the detail stays scrollable.
 func TestAgentDetailRecentJobsWindow(t *testing.T) {
