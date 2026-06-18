@@ -2739,3 +2739,100 @@ func TestListJobsByParent(t *testing.T) {
 		t.Fatalf("ListJobsByParent for unknown parent = %+v, want empty", empty)
 	}
 }
+
+func TestUpsertAgentPersistsModel(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	agent := Agent{
+		Name:    "modeled",
+		Role:    "dev",
+		Runtime: "claude",
+		Model:   "claude-opus-4-1",
+	}
+	if err := store.UpsertAgent(ctx, agent); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+
+	got, err := store.GetAgent(ctx, "modeled")
+	if err != nil {
+		t.Fatalf("GetAgent returned error: %v", err)
+	}
+	if got.Model != "claude-opus-4-1" {
+		t.Fatalf("GetAgent model = %q, want %q", got.Model, "claude-opus-4-1")
+	}
+
+	agents, err := store.ListAgents(ctx)
+	if err != nil {
+		t.Fatalf("ListAgents returned error: %v", err)
+	}
+	found := false
+	for _, a := range agents {
+		if a.Name == "modeled" {
+			found = true
+			if a.Model != "claude-opus-4-1" {
+				t.Fatalf("ListAgents model = %q, want %q", a.Model, "claude-opus-4-1")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("ListAgents did not return agent %q", "modeled")
+	}
+
+	// An empty model upserts and reads back empty (additive, no default).
+	plain := Agent{Name: "plain", Role: "dev", Runtime: "codex"}
+	if err := store.UpsertAgent(ctx, plain); err != nil {
+		t.Fatalf("UpsertAgent (plain) returned error: %v", err)
+	}
+	gotPlain, err := store.GetAgent(ctx, "plain")
+	if err != nil {
+		t.Fatalf("GetAgent (plain) returned error: %v", err)
+	}
+	if gotPlain.Model != "" {
+		t.Fatalf("GetAgent (plain) model = %q, want empty", gotPlain.Model)
+	}
+}
+
+func TestUpsertAgentInstancePersistsModel(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	instance := AgentInstance{
+		Name:         "inst-1",
+		Type:         "dev",
+		Runtime:      "claude",
+		RepoFullName: "owner/repo",
+		Role:         "dev",
+		Model:        "claude-sonnet-4-5",
+		State:        "idle",
+	}
+	if err := store.UpsertAgentInstance(ctx, instance); err != nil {
+		t.Fatalf("UpsertAgentInstance returned error: %v", err)
+	}
+
+	got, err := store.GetAgentInstance(ctx, "inst-1")
+	if err != nil {
+		t.Fatalf("GetAgentInstance returned error: %v", err)
+	}
+	if got.Model != "claude-sonnet-4-5" {
+		t.Fatalf("GetAgentInstance model = %q, want %q", got.Model, "claude-sonnet-4-5")
+	}
+
+	// GetAgent falls back to the instance when no registered agent exists,
+	// and surfaces the instance's model.
+	agent, err := store.GetAgent(ctx, "inst-1")
+	if err != nil {
+		t.Fatalf("GetAgent (instance fallback) returned error: %v", err)
+	}
+	if agent.Model != "claude-sonnet-4-5" {
+		t.Fatalf("GetAgent (instance fallback) model = %q, want %q", agent.Model, "claude-sonnet-4-5")
+	}
+}
