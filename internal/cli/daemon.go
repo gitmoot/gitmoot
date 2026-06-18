@@ -2093,7 +2093,7 @@ func (w jobWorker) startTempWorker(ctx context.Context, job db.Job, payload work
 // already the engine-assigned "-ephemeral-" name; callers register a deferred
 // cleanupTempWorker to auto-dispose the worker on every exit path. The worker
 // runs read-only unless the spec opts into a writable autonomy policy.
-func (w jobWorker) startEphemeralWorker(ctx context.Context, job db.Job, payload workflow.JobPayload) error {
+func (w jobWorker) startEphemeralWorker(ctx context.Context, job db.Job, payload workflow.JobPayload) (err error) {
 	spec := payload.Ephemeral
 	if spec == nil {
 		return errors.New("ephemeral worker requires a spec")
@@ -2102,8 +2102,13 @@ func (w jobWorker) startEphemeralWorker(ctx context.Context, job db.Job, payload
 	if len(capabilities) == 0 {
 		capabilities = []string{job.Type}
 	}
-	// Default to read-only; the spec must opt into a writable policy.
-	policy := firstNonEmpty(strings.TrimSpace(spec.AutonomyPolicy), runtime.AutonomyPolicyReadOnly)
+	// Least privilege: default read-only, except an implement must be able to
+	// write. The spec may still opt into a different (validated) policy.
+	defaultPolicy := runtime.AutonomyPolicyReadOnly
+	if job.Type == "implement" {
+		defaultPolicy = runtime.AutonomyPolicyWorkspaceWrite
+	}
+	policy := firstNonEmpty(strings.TrimSpace(spec.AutonomyPolicy), defaultPolicy)
 	// Role is required by runtime.ValidateAgent but optional on the spec; fall
 	// back to the job action (e.g. "review"/"implement"), then a generic role.
 	role := firstNonEmpty(strings.TrimSpace(spec.Role), strings.TrimSpace(job.Type), "worker")
@@ -2122,6 +2127,16 @@ func (w jobWorker) startEphemeralWorker(ctx context.Context, job db.Job, payload
 	if err := w.Store.UpsertAgent(ctx, dbAgent(ephemeralAgent)); err != nil {
 		return err
 	}
+	// The agent row (and, below, its instance + a live runtime session) now
+	// exist. Dispose them if any later bring-up step fails so a partial
+	// materialization cannot leak an agent/instance/session — mirroring
+	// startTempWorker's cleanup-on-error. (The named return err is set by the
+	// `return err` paths below.)
+	defer func() {
+		if err != nil {
+			w.cleanupTempWorker(context.Background(), ephemeralAgent.Name)
+		}
+	}()
 	// Normalize the stored policy back onto the in-memory agent so the runtime
 	// session is started with the same sandbox the rest of run will use.
 	ephemeralAgent.AutonomyPolicy = runtime.NormalizeStoredAutonomyPolicy(ephemeralAgent.AutonomyPolicy)

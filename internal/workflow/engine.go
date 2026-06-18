@@ -582,7 +582,14 @@ func canonicalDelegationSetHash(dels []Delegation) string {
 	for _, d := range sorted {
 		deps := compactStrings(d.Deps)
 		sort.Strings(deps)
-		fields := []string{d.ID, d.Agent, d.Action, strings.TrimSpace(d.Prompt), strings.Join(deps, ",")}
+		// For an ephemeral delegation, d.Agent is empty; fold the spec identity
+		// (runtime/model/template/role) into the hash so two distinct ephemeral
+		// specs are not mistaken for the same work by loop detection / dedup.
+		eph := ""
+		if d.Ephemeral != nil {
+			eph = strings.Join([]string{d.Ephemeral.Runtime, d.Ephemeral.Model, d.Ephemeral.Template, d.Ephemeral.Role}, "|")
+		}
+		fields := []string{d.ID, d.Agent, eph, d.Action, strings.TrimSpace(d.Prompt), strings.Join(deps, ",")}
 		builder.WriteString(strings.Join(fields, "\x1f"))
 		builder.WriteString("\x1e")
 	}
@@ -641,6 +648,18 @@ func (e Engine) countRootDelegationJobs(ctx context.Context, rootID string) (int
 
 func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) error {
 	if payload.Result == nil || len(payload.Result.Delegations) == 0 {
+		return nil
+	}
+
+	// Ephemeral workers are leaf executors: they are auto-disposed when their job
+	// completes, so a continuation enqueued to their (now-deleted) synthetic agent
+	// would strand. Do not dispatch delegations returned by an ephemeral worker.
+	if payload.Ephemeral != nil {
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "delegation_ignored_ephemeral",
+			Message: fmt.Sprintf("ephemeral workers cannot delegate; ignoring %d delegation(s)", len(payload.Result.Delegations)),
+		})
 		return nil
 	}
 

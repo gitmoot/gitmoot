@@ -394,6 +394,9 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 			return err
 		}
 		for _, agent := range agents {
+			if isEphemeralAgentName(agent.Name) {
+				continue // transient spawn-from-spec workers are not part of the registry
+			}
 			snapshot.Agents = append(snapshot.Agents, dashboardAgent{Name: agent.Name, Runtime: agent.Runtime, Role: agent.Role, Health: agent.HealthStatus, templateID: agent.TemplateID})
 		}
 		instances, err := store.ListAgentInstances(ctx)

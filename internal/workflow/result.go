@@ -326,12 +326,20 @@ func validateEphemeralSpec(delegationID string, spec *EphemeralSpec) error {
 	}
 	switch strings.TrimSpace(spec.Runtime) {
 	case runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime:
-		return nil
 	case "":
 		return fmt.Errorf("delegation %q ephemeral runtime is required", delegationID)
 	default:
 		return fmt.Errorf("delegation %q ephemeral runtime %q is invalid; expected one of codex/claude/kimi", delegationID, spec.Runtime)
 	}
+	// Reject an unknown autonomy_policy at parse time: an unrecognized value
+	// would otherwise normalize to "auto" (writable) downstream and silently
+	// defeat the least-privilege read-only default.
+	if policy := strings.TrimSpace(spec.AutonomyPolicy); policy != "" {
+		if _, err := runtime.NormalizeAutonomyPolicy(policy); err != nil {
+			return fmt.Errorf("delegation %q ephemeral autonomy_policy %q is invalid", delegationID, spec.AutonomyPolicy)
+		}
+	}
+	return nil
 }
 
 // ephemeralAgentName derives the synthetic agent name for an ephemeral delegation

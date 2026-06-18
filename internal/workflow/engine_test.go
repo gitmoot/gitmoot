@@ -67,6 +67,36 @@ func TestEngineAdvanceJobDispatchesDelegations(t *testing.T) {
 	}
 }
 
+func TestEngineEphemeralWorkerCannotDelegate(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "helper", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	// A job that is itself an ephemeral worker (payload.Ephemeral set) returns a
+	// delegation. The engine must NOT dispatch it (an ephemeral worker is a leaf
+	// that is auto-disposed; a continuation to its synthetic agent would strand).
+	insertCompletedJob(t, store, db.Job{ID: "eph-job", Agent: "x-ephemeral-abc", Type: "ask"}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-005",
+		Sender:    "x-ephemeral-abc",
+		Ephemeral: &EphemeralSpec{Runtime: "codex"},
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "del-1", Agent: "helper", Action: "review", Prompt: "review this"},
+			},
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "eph-job"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	if jobExists(t, store, "eph-job/delegation/del-1") {
+		t.Fatalf("ephemeral worker's delegation must not be dispatched")
+	}
+}
+
 func TestEngineAdvanceJobWritesDelegationArtifacts(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

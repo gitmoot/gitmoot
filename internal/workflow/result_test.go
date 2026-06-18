@@ -318,6 +318,27 @@ func TestValidateAgentResultRejectsShellEphemeralRuntime(t *testing.T) {
 	}
 }
 
+func TestValidateAgentResultRejectsInvalidEphemeralAutonomyPolicy(t *testing.T) {
+	// An unknown policy must be rejected at parse time so it cannot normalize to
+	// a writable "auto" downstream and defeat the read-only default.
+	result := AgentResult{
+		Decision: "implemented",
+		Summary:  "x",
+		Delegations: []Delegation{
+			{ID: "d", Ephemeral: &EphemeralSpec{Runtime: "codex", AutonomyPolicy: "writable"}, Action: "ask", Prompt: "go"},
+		},
+	}
+	err := validateAgentResult(result)
+	if err == nil || !strings.Contains(err.Error(), "autonomy_policy") {
+		t.Fatalf("expected an autonomy_policy validation error, got %v", err)
+	}
+	// A valid policy passes.
+	result.Delegations[0].Ephemeral.AutonomyPolicy = "read-only"
+	if err := validateAgentResult(result); err != nil {
+		t.Fatalf("valid read-only policy rejected: %v", err)
+	}
+}
+
 func TestEphemeralAgentNameContainsInfix(t *testing.T) {
 	name := ephemeralAgentName("worker-1", "parent-job")
 	if !strings.Contains(name, "-ephemeral-") {
