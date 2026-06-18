@@ -68,7 +68,7 @@ func (m *Model) openAgentDetail(agent Agent) tea.Cmd {
 	m.agentVersions = nil
 	m.agentVersionsLoaded = false
 	m.agentVersionsErr = ""
-	m.detailVersionCursor = 0
+	m.agentDetailCursor = 0
 	m.actionErr = ""
 	m.actionBusy = false
 	m.mode = modeAgentDetail
@@ -208,17 +208,27 @@ func (m Model) updateAgentOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "esc", "q":
 			m.mode = modeNormal
 		case "up", "k":
-			if m.detailVersionCursor > 0 {
-				m.detailVersionCursor--
+			if m.agentDetailCursor > 0 {
+				m.agentDetailCursor--
 			}
 		case "down", "j":
-			if m.detailVersionCursor < len(m.agentVersions)-1 {
-				m.detailVersionCursor++
+			if m.agentDetailCursor < m.agentDetailSelectableCount()-1 {
+				m.agentDetailCursor++
 			}
 		case "enter":
-			// Open the selected version's prompt in the pager.
-			if m.detailVersionCursor < len(m.agentVersions) && m.deps.TemplateVersionContent != nil {
-				return m, m.openVersionView(m.agentVersions[m.detailVersionCursor])
+			// Recent jobs come first in the cursor space, then template versions.
+			// Enter on a job opens its detail (returning here on esc); enter on a
+			// version opens its prompt in the pager.
+			jobs := m.agentDetailJobs()
+			if m.agentDetailCursor < len(jobs) {
+				cmd := m.openJobDetail(jobs[m.agentDetailCursor])
+				m.jobDetailReturn = modeAgentDetail
+				m.viewport.SetContent(m.content())
+				return m, cmd
+			}
+			vi := m.agentDetailCursor - len(jobs)
+			if vi >= 0 && vi < len(m.agentVersions) && m.deps.TemplateVersionContent != nil {
+				return m, m.openVersionView(m.agentVersions[vi])
 			}
 		case "v":
 			if len(m.revertableVersions()) > 0 {
@@ -856,14 +866,47 @@ func (m Model) agentDetailView() string {
 	b.WriteString(renderRows(rows))
 	b.WriteByte('\n')
 
+	// Recent jobs: selectable (enter opens the job's detail) and windowed so a
+	// busy agent's history stays scrollable. The agent-detail cursor walks these
+	// jobs first, then the template versions below.
+	jobs := m.agentDetailJobs()
 	b.WriteString(headerStyle.Render("recent jobs"))
 	b.WriteByte('\n')
-	jobs := agentJobs(m.snap.JobRows, a.Name, 5)
 	if len(jobs) == 0 {
 		b.WriteString(mutedStyle.Render("none") + "\n")
 	} else {
-		for _, job := range jobs {
-			b.WriteString(job.ID + "  " + job.Type + "  " + jobStateColor(job.State) + "\n")
+		capacity := agentDetailJobsVisible(m.height)
+		anchor := m.agentDetailCursor
+		if anchor > len(jobs)-1 {
+			anchor = len(jobs) - 1
+		}
+		start := 0
+		if len(jobs) > capacity {
+			start = anchor - capacity/2
+			if start < 0 {
+				start = 0
+			}
+			if start > len(jobs)-capacity {
+				start = len(jobs) - capacity
+			}
+		}
+		end := start + capacity
+		if end > len(jobs) {
+			end = len(jobs)
+		}
+		if start > 0 {
+			b.WriteString(mutedStyle.Render("  ↑ "+strconv.Itoa(start)+" earlier") + "\n")
+		}
+		for i := start; i < end; i++ {
+			job := jobs[i]
+			cursor, id := "  ", job.ID
+			if i == m.agentDetailCursor {
+				cursor, id = "▸ ", selectedRowStyle.Render(job.ID)
+			}
+			b.WriteString(cursor + id + "  " + job.Type + "  " + jobStateColor(job.State) + "\n")
+		}
+		if end < len(jobs) {
+			b.WriteString(mutedStyle.Render("  ↓ "+strconv.Itoa(len(jobs)-end)+" more") + "\n")
 		}
 	}
 	b.WriteByte('\n')
@@ -904,7 +947,7 @@ func (m Model) agentDetailView() string {
 		for i, v := range m.agentVersions {
 			cursor := "  "
 			label := "v" + strconv.Itoa(v.Number)
-			if i == m.detailVersionCursor {
+			if len(jobs)+i == m.agentDetailCursor {
 				cursor, label = "▸ ", selectedRowStyle.Render(label)
 			}
 			line := cursor + label + "  " + versionStateColor(v.State)
@@ -925,8 +968,8 @@ func (m Model) agentDetailView() string {
 	if len(m.revertableVersions()) > 0 {
 		hint = "v revert  " + hint
 	}
-	if len(m.agentVersions) > 0 {
-		hint = "↑/↓ select  enter read version  " + hint
+	if m.agentDetailSelectableCount() > 0 {
+		hint = "↑/↓ select  enter open  " + hint
 	}
 	b.WriteString(mutedStyle.Render(hint))
 	return b.String()
@@ -1001,6 +1044,34 @@ func agentJobs(rows []JobRow, agent string, limit int) []JobRow {
 		matched = matched[:limit]
 	}
 	return matched
+}
+
+// agentDetailJobLimit caps how many of an agent's jobs the detail view keeps
+// (and the cursor can reach); the visible slice windows within this.
+const agentDetailJobLimit = 100
+
+// agentDetailJobs is the agent's recent jobs, selectable in the detail view.
+func (m Model) agentDetailJobs() []JobRow {
+	return agentJobs(m.snap.JobRows, m.activeAgent.Name, agentDetailJobLimit)
+}
+
+// agentDetailSelectableCount is how many rows the agent-detail cursor walks: the
+// recent jobs first, then the template versions.
+func (m Model) agentDetailSelectableCount() int {
+	return len(m.agentDetailJobs()) + len(m.agentVersions)
+}
+
+// agentDetailJobsVisible is how many recent-job rows render before the list
+// windows around the cursor (keeps the detail on-screen for a busy agent).
+func agentDetailJobsVisible(height int) int {
+	n := height - 14
+	if n < 4 {
+		return 4
+	}
+	if n > 12 {
+		return 12
+	}
+	return n
 }
 
 // AgentCreatePromptIDs are the interactive-prompt records the create form

@@ -21,6 +21,9 @@ func (m *Model) openJobDetail(job JobRow) tea.Cmd {
 	m.jobDetailLoaded = false
 	m.actionErr = ""
 	m.actionBusy = false
+	// Default: close back to the page. A caller (e.g. the agent detail) may set
+	// jobDetailReturn afterward to return to its own overlay instead.
+	m.jobDetailReturn = modeNormal
 	m.mode = modeJobDetail
 	return tea.Batch(jobEventsCmd(m.deps, job.ID), jobDetailCmd(m.deps, job.ID))
 }
@@ -98,7 +101,10 @@ func (m Model) updateJobOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case modeJobDetail:
 		switch msg.String() {
 		case "esc", "enter", "q":
-			m.mode = modeNormal
+			// Return to wherever the detail was opened from (the page, or the
+			// agent detail when drilled in from there).
+			m.mode = m.jobDetailReturn
+			m.jobDetailReturn = modeNormal
 		case "R":
 			if jobRetryable(m.activeJob.State) {
 				m.mode = modeConfirmJobRetry

@@ -428,6 +428,9 @@ func openAgentVersionDetail(t *testing.T, deps Deps) Model {
 	if m.mode != modeAgentDetail {
 		t.Fatalf("expected modeAgentDetail, got %v", m.mode)
 	}
+	// Recent jobs precede versions in the detail cursor space; position on the
+	// first version for the version-preview tests.
+	m.agentDetailCursor = len(m.agentDetailJobs())
 	return m
 }
 
@@ -460,6 +463,69 @@ func TestAgentVersionPreviewLoadsAndRenders(t *testing.T) {
 	m = next.(Model)
 	if m.mode != modeAgentDetail {
 		t.Fatalf("esc should return to the detail, got %v", m.mode)
+	}
+}
+
+// TestAgentDetailRecentJobOpensAndReturns: in the agent detail, the recent jobs
+// are selectable; enter on one opens its job detail, and esc returns to the agent
+// detail (not the agents list).
+func TestAgentDetailRecentJobOpensAndReturns(t *testing.T) {
+	deps := Deps{TemplateVersions: func(string) ([]TemplateVersion, error) { return nil, nil }}
+	m := agentsModel(t, deps, agentsSnapshot()) // cursor 0 = planner (has job-1)
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if cmd != nil {
+		next, _ = m.Update(cmd())
+		m = next.(Model)
+	}
+	if m.mode != modeAgentDetail {
+		t.Fatalf("expected agent detail, got %v", m.mode)
+	}
+	// Cursor 0 in the detail is planner's first recent job; enter opens it.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if m.mode != modeJobDetail || m.activeJob.ID != "job-1" {
+		t.Fatalf("enter on a recent job should open its detail, mode=%v job=%q", m.mode, m.activeJob.ID)
+	}
+	// esc returns to the agent detail, not the agents list.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	if m.mode != modeAgentDetail {
+		t.Fatalf("esc from a job opened in the agent detail should return there, got %v", m.mode)
+	}
+}
+
+// TestAgentDetailRecentJobsWindow guards that a busy agent's recent-jobs list
+// windows around the cursor so the detail stays scrollable.
+func TestAgentDetailRecentJobsWindow(t *testing.T) {
+	snap := Snapshot{Daemon: Daemon{Running: true}, Agents: []Agent{{Name: "busy", Runtime: "codex"}}}
+	for i := 0; i < 40; i++ {
+		snap.JobRows = append(snap.JobRows, JobRow{ID: "j-" + strconv.Itoa(i), Agent: "busy", Type: "ask", State: "succeeded"})
+	}
+	m := agentsModel(t, Deps{}, snap)
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // open busy's detail
+	m = next.(Model)
+	if cmd != nil {
+		next, _ = m.Update(cmd())
+		m = next.(Model)
+	}
+	view := m.View()
+	if !strings.Contains(view, "more") {
+		t.Fatalf("a long recent-jobs list should window with a 'more' marker:\n%s", view)
+	}
+	if strings.Contains(view, "j-39 ") {
+		t.Fatalf("the far end should not render while the cursor is at the top:\n%s", view)
+	}
+	for i := 0; i < 39; i++ {
+		next, _ := m.Update(key("j"))
+		m = next.(Model)
+	}
+	view = m.View()
+	if !strings.Contains(view, "j-39") {
+		t.Fatalf("the selected last job must be visible after scrolling:\n%s", view)
+	}
+	if !strings.Contains(view, "earlier") {
+		t.Fatalf("scrolled to the bottom, an 'earlier' marker should show:\n%s", view)
 	}
 }
 

@@ -168,7 +168,8 @@ type Model struct {
 	agentVersionsErr    string            // error from the version load
 	versionCursor       int               // selected row in the revert pick list
 	revertVersion       TemplateVersion   // version being confirmed for revert
-	detailVersionCursor int               // selected version row in the agent detail
+	agentDetailCursor   int               // selected row in the agent detail (recent jobs then versions)
+	jobDetailReturn     mode              // mode to return to when a job detail closes (modeNormal, or modeAgentDetail when opened from the agent detail)
 	runtimePickCursor   int               // selected runtime in the switch-runtime overlay
 	activeAgentVersion  TemplateVersion   // version shown in the content pager
 	versionView         viewport.Model    // pager for a version's content
@@ -710,7 +711,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.agentVersionsErr = ""
 				m.agentVersions = msg.versions
-				m.detailVersionCursor = clampCursor(m.detailVersionCursor, len(msg.versions))
+				m.agentDetailCursor = clampCursor(m.agentDetailCursor, m.agentDetailSelectableCount())
 			}
 		}
 	case versionContentMsg:
@@ -898,6 +899,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clampJobCursor()
 			m.activityCursor = clampCursor(m.activityCursor, m.activitySelectableLen())
 			m.agentCursor = clampCursor(m.agentCursor, len(m.visibleAgents()))
+			m.agentDetailCursor = clampCursor(m.agentDetailCursor, m.agentDetailSelectableCount())
 			m.sessionCursor = clampCursor(m.sessionCursor, len(m.sessionRows()))
 			m.configCursor = clampCursor(m.configCursor, len(m.configEditableFields()))
 			// A cancel-requested job that has settled no longer needs the
