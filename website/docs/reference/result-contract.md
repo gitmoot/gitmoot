@@ -179,8 +179,12 @@ Sibling children that share the repo run in isolated git worktrees so they do
 not serialize on the shared checkout: `implement` children each get their own
 branch worktree, and when a coordinator fans out two or more read-only
 (`ask`/`review`) children, each gets a throwaway detached worktree (no branch),
-disposed automatically when the child finishes. This is internal scheduling —
-coordinators do not request it.
+disposed automatically when the child finishes. A read-only child that `deps` on
+`implement` legs (e.g. a decompose-and-verify verify gate) runs in a detached
+worktree with those legs' branches merged in, so it sees their combined work
+rather than the base checkout; if the legs are not file-disjoint the merge
+conflicts and the parent is blocked. This is internal scheduling — coordinators
+do not request it.
 
 Once every top-level delegation reaches a terminal state, Gitmoot enqueues
 exactly one coordinator "continuation" job, sent back to the delegating agent, to

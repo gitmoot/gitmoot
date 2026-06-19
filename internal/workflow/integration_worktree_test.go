@@ -88,13 +88,13 @@ func TestIntegrationDepBranches(t *testing.T) {
 	// Two succeeded implement legs (distinct branches), one succeeded read-only dep
 	// (no branch), and one implement leg that ran in the shared checkout (branch ==
 	// base, so it is already on base and skipped).
-	insertCompletedJob(t, store, db.Job{ID: "p/delegation/legA", Agent: "builder", Type: "implement"},
+	insertCompletedJob(t, store, db.Job{ID: "p/delegation/legA", Agent: "builder", Type: "implement", ParentJobID: "p", DelegationID: "legA"},
 		JobPayload{Repo: "owner/repo", Branch: "branchA", DelegationID: "legA"})
-	insertCompletedJob(t, store, db.Job{ID: "p/delegation/legB", Agent: "builder", Type: "implement"},
+	insertCompletedJob(t, store, db.Job{ID: "p/delegation/legB", Agent: "builder", Type: "implement", ParentJobID: "p", DelegationID: "legB"},
 		JobPayload{Repo: "owner/repo", Branch: "branchB", DelegationID: "legB"})
-	insertCompletedJob(t, store, db.Job{ID: "p/delegation/note", Agent: "noter", Type: "ask"},
+	insertCompletedJob(t, store, db.Job{ID: "p/delegation/note", Agent: "noter", Type: "ask", ParentJobID: "p", DelegationID: "note"},
 		JobPayload{Repo: "owner/repo", Branch: "task-x", DelegationID: "note"})
-	insertCompletedJob(t, store, db.Job{ID: "p/delegation/legBase", Agent: "builder", Type: "implement"},
+	insertCompletedJob(t, store, db.Job{ID: "p/delegation/legBase", Agent: "builder", Type: "implement", ParentJobID: "p", DelegationID: "legBase"},
 		JobPayload{Repo: "owner/repo", Branch: "task-x", DelegationID: "legBase"})
 
 	parentJob := db.Job{ID: "p", Agent: "coord", Type: "ask"}
@@ -138,9 +138,9 @@ func TestAllocateAndEnqueueDelegationRoutesVerifyToIntegrationWorktree(t *testin
 	engine.DelegationCheckout = t.TempDir()
 	engine.DelegationWorktrees = manager
 
-	insertCompletedJob(t, store, db.Job{ID: "p/delegation/legA", Agent: "builder", Type: "implement"},
+	insertCompletedJob(t, store, db.Job{ID: "p/delegation/legA", Agent: "builder", Type: "implement", ParentJobID: "p", DelegationID: "legA"},
 		JobPayload{Repo: "owner/repo", Branch: "branchA", DelegationID: "legA"})
-	insertCompletedJob(t, store, db.Job{ID: "p/delegation/legB", Agent: "builder", Type: "implement"},
+	insertCompletedJob(t, store, db.Job{ID: "p/delegation/legB", Agent: "builder", Type: "implement", ParentJobID: "p", DelegationID: "legB"},
 		JobPayload{Repo: "owner/repo", Branch: "branchB", DelegationID: "legB"})
 
 	parentJob := db.Job{ID: "p", Agent: "coord", Type: "ask"}

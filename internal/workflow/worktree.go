@@ -308,9 +308,7 @@ func (e Engine) AllocateReadOnlyDelegationWorktree(ctx context.Context, request 
 // the dependent's own id, carries no branch/branch lock, and is disposed by the
 // same read-only cleanup as fan-out worktrees. A merge conflict means the
 // decomposition was not actually file-disjoint: it is returned as a BlockedError
-// so the caller blocks the parent rather than auto-resolving. It is idempotent —
-// an existing worktree is reused and the (already-merged) branches re-merge as
-// no-ops.
+// so the caller blocks the parent rather than auto-resolving.
 func (e Engine) AllocateIntegrationWorktree(ctx context.Context, request DelegationWorktreeRequest, legBranches []string, manager IntegrationWorktreeManager) (string, error) {
 	if err := e.validate(); err != nil {
 		return "", err
@@ -345,12 +343,11 @@ func (e Engine) AllocateIntegrationWorktree(ctx context.Context, request Delegat
 			_ = releaseCheckoutLock(context.Background())
 		}
 	}()
-	// Idempotent: reuse an existing integration worktree (e.g. a re-run of the same
-	// dispatch attempt); the merge below re-runs as a no-op for already-merged legs.
-	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
-		if err := manager.AddDetachedWorktree(ctx, path, ref); err != nil {
-			return "", err
-		}
+	// A delegation is dispatched once (advanceDelegations skips already-enqueued
+	// dependents; retries use a retry-suffixed path), so allocate a fresh detached
+	// worktree like the implement and read-only paths rather than reusing one.
+	if err := manager.AddDetachedWorktree(ctx, path, ref); err != nil {
+		return "", err
 	}
 	msg := "Gitmoot integration merge for delegation " + request.DelegationID
 	if err := manager.MergeBranches(ctx, path, legBranches, msg); err != nil {

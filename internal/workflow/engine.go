@@ -892,6 +892,13 @@ func (e Engine) integrationDepBranches(ctx context.Context, job db.Job, payload 
 	for _, sib := range payload.Result.Delegations {
 		byID[strings.TrimSpace(sib.ID)] = sib
 	}
+	// Resolve each dep to its winning child job the same way advanceDelegations
+	// does (latest attempt per delegation id), so a leg that succeeded on a retry
+	// contributes its retry branch rather than the failed original.
+	children, err := e.childDelegationJobs(ctx, job.ID)
+	if err != nil {
+		return nil, err
+	}
 	base := strings.TrimSpace(payload.Branch)
 	var branches []string
 	for _, dep := range deps {
@@ -899,14 +906,8 @@ func (e Engine) integrationDepBranches(ctx context.Context, job db.Job, payload 
 		if !ok || readOnlyDelegationAction(sib.Action) {
 			continue
 		}
-		legJob, err := e.Store.GetJob(ctx, job.ID+"/delegation/"+dep)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			return nil, err
-		}
-		if legJob.State != string(JobSucceeded) {
+		legJob, ok := children[dep]
+		if !ok || legJob.State != string(JobSucceeded) {
 			continue
 		}
 		legPayload, err := unmarshalPayload(legJob.Payload)
