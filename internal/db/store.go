@@ -1937,6 +1937,18 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent)
 	return tx.Commit()
 }
 
+// JobCreatedAt returns a job's created_at timestamp string (SQLite UTC format,
+// "2006-01-02 15:04:05"). Used by the delegation wall-clock backstop to measure a
+// tree's age from its root job. Returns sql.ErrNoRows if the job is unknown.
+func (s *Store) JobCreatedAt(ctx context.Context, id string) (string, error) {
+	var createdAt string
+	row := s.db.QueryRowContext(ctx, `SELECT created_at FROM jobs WHERE id = ?`, id)
+	if err := row.Scan(&createdAt); err != nil {
+		return "", err
+	}
+	return createdAt, nil
+}
+
 func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by FROM jobs WHERE id = ?`, id)
 	var job Job

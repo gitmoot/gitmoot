@@ -230,6 +230,13 @@ trips, the offending delegations are dropped rather than dispatched.
   capped at this many jobs. When a batch of delegations would exceed the budget,
   it is dropped, and the parent receives a lifecycle event such as "delegation
   tree for root &lt;id&gt; reached the job budget of 64".
+- **Wall-clock budget (`MaxDelegationWallClock = 2h`)**: the whole delegation
+  tree under one root is bounded in duration, measured from the root job's
+  creation. When a coordinator tries to fan out after the tree has run longer
+  than this, the new delegations are dropped and the parent receives a
+  `delegation_walltime_exceeded` event. This bounds an expensive-but-not-numerous
+  tree (slow agents, long per-job work) that the depth/job-count caps miss. It is
+  a generous runaway backstop, not a tight deadline.
 - **Loop detection**: a canonical windowed signature over recent delegation
   activity halts repeated or cyclic delegation chains — for example an
   oscillating A→B→A loop — well before the depth cap is reached.

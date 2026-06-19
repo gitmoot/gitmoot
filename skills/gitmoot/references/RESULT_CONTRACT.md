@@ -147,6 +147,11 @@ Delegation trees are bounded so they cannot run forever:
   this depth may not delegate further.
 - Per-root job budget: `MaxDelegationTotalJobs = 64`. The whole delegation tree
   under one root is capped at this many jobs.
+- Per-root wall-clock budget: `MaxDelegationWallClock = 2h`. The whole tree under
+  one root is bounded in duration (measured from the root job's creation); a
+  coordinator that tries to fan out after the tree has run this long is refused
+  with a `delegation_walltime_exceeded` event. A generous runaway backstop, not a
+  tight deadline.
 - Loop detection: a windowed signature over recent delegation activity halts
   repeated or cyclic delegation chains (e.g. oscillating A→B→A) well before the
   depth cap is reached.

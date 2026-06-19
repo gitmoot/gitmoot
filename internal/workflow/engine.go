@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/runtime"
@@ -39,6 +40,18 @@ type Engine struct {
 	// empty, artifact writing is skipped (ask-path and tests that build an
 	// Engine without it keep their existing behavior).
 	ArtifactRoot string
+	// Now returns the current time and is the engine's only clock source. It is
+	// optional and defaults to time.Now; tests inject it to drive the per-root
+	// wall-clock backstop (see MaxDelegationWallClock) deterministically.
+	Now func() time.Time
+}
+
+// now returns the engine's current time, defaulting to time.Now when Now is unset.
+func (e Engine) now() time.Time {
+	if e.Now != nil {
+		return e.Now()
+	}
+	return time.Now()
 }
 
 type PullRequestEvent struct {
@@ -497,6 +510,37 @@ func (e Engine) rootJobID(job db.Job, payload JobPayload) string {
 	return job.ID
 }
 
+// rootWallClockExceeded reports whether the coordination tree rooted at rootID has
+// been running longer than MaxDelegationWallClock, measured from the root job's
+// created_at, and the elapsed duration. It fails open: any lookup/parse problem
+// returns (false, 0) so a clock or timestamp hiccup never blocks dispatch.
+func (e Engine) rootWallClockExceeded(ctx context.Context, rootID string) (bool, time.Duration) {
+	createdAt, err := e.Store.JobCreatedAt(ctx, rootID)
+	if err != nil {
+		return false, 0
+	}
+	start, err := parseJobTimestamp(createdAt)
+	if err != nil {
+		return false, 0
+	}
+	elapsed := e.now().UTC().Sub(start)
+	return elapsed > MaxDelegationWallClock, elapsed
+}
+
+// parseJobTimestamp parses a jobs.created_at value. SQLite's CURRENT_TIMESTAMP
+// default is UTC in "2006-01-02 15:04:05" form; RFC3339 is also accepted
+// defensively in case a timestamp was written explicitly.
+func parseJobTimestamp(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if t, err := time.Parse("2006-01-02 15:04:05", s); err == nil {
+		return t.UTC(), nil
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.UTC(), nil
+	}
+	return time.Time{}, fmt.Errorf("unrecognized job timestamp %q", s)
+}
+
 // delegationRequest builds the canonical child JobRequest for a delegation,
 // inheriting the parent's repo/branch/PR context and stamping the DAG fields
 // (ParentJobID/DelegationID/DelegationDepth/DelegatedBy/RootJobID/Deps). It is
@@ -570,6 +614,16 @@ const MaxDelegationTotalJobs = 64
 // width of a single dispatch so a coordinator returning hundreds of delegations
 // at once is refused with a delegation_width_exceeded event.
 const MaxDelegationWidth = 16
+
+// MaxDelegationWallClock bounds how long a single coordination tree (all children
+// and continuations sharing one root, see rootJobID) may run before a coordinator
+// is refused further fan-out. Where the depth/job-count caps bound the shape of
+// the tree, this bounds its duration so an expensive-but-not-numerous tree (slow
+// agents, long per-job work) cannot run unbounded. Measured from the root job's
+// created_at; once exceeded, dispatchDelegations refuses further children and
+// records a delegation_walltime_exceeded event. It is a generous runaway backstop,
+// not a tight SLA. (A future enhancement could make it configurable — see #338.)
+const MaxDelegationWallClock = 2 * time.Hour
 
 // delegationHashWindowSize is how many recent delegation-set hashes a coordinator
 // continuation chain remembers (threaded via the payload, not scanned across
@@ -714,6 +768,15 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 			Message: fmt.Sprintf("delegation tree for root %s reached the job budget of %d (%d jobs); not dispatching %d delegation(s)", rootID, MaxDelegationTotalJobs, total, len(payload.Result.Delegations)),
 		})
 		return e.enqueueFinalizeContinuation(ctx, job, payload, fmt.Sprintf("per-root job budget of %d reached", MaxDelegationTotalJobs))
+	}
+
+	if exceeded, elapsed := e.rootWallClockExceeded(ctx, rootID); exceeded {
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "delegation_walltime_exceeded",
+			Message: fmt.Sprintf("delegation tree for root %s ran %s, exceeding the wall-clock limit of %s; not dispatching %d delegation(s)", rootID, elapsed.Round(time.Second), MaxDelegationWallClock, len(payload.Result.Delegations)),
+		})
+		return e.enqueueFinalizeContinuation(ctx, job, payload, fmt.Sprintf("wall-clock limit of %s reached", MaxDelegationWallClock))
 	}
 
 	if width := len(payload.Result.Delegations); width > MaxDelegationWidth {
