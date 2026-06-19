@@ -4653,3 +4653,95 @@ func (a *cliWorkerDelegationAdapter) Health(context.Context, runtime.Agent) erro
 func (a *cliWorkerDelegationAdapter) Capabilities(context.Context) ([]string, error) {
 	return nil, nil
 }
+
+// TestResolveDaemonStartRepoUsesRegisteredCheckout is the #202 regression: when
+// the target repo is already registered with a checkout, `daemon start --repo
+// owner/repo` resolves against the REGISTERED checkout regardless of the current
+// working directory, instead of failing because cwd's origin does not match.
+func TestResolveDaemonStartRepoUsesRegisteredCheckout(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+
+	// The registered checkout for owner/repo.
+	checkout := t.TempDir()
+	runGit(t, checkout, "init")
+	runGit(t, checkout, "config", "user.email", "gitmoot@example.com")
+	runGit(t, checkout, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(checkout, "README.md"), []byte("initial\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runGit(t, checkout, "add", "README.md")
+	runGit(t, checkout, "commit", "-m", "initial")
+	runGit(t, checkout, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+
+	// A non-matching working directory: a different git repo whose origin points
+	// at some other repo. Resolving from here previously errored with
+	// "current checkout origin is owner/other, not owner/repo".
+	otherDir := t.TempDir()
+	runGit(t, otherDir, "init")
+	runGit(t, otherDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, otherDir, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(otherDir, "f.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runGit(t, otherDir, "add", "f.txt")
+	runGit(t, otherDir, "commit", "-m", "init")
+	runGit(t, otherDir, "remote", "add", "origin", "https://github.com/owner/other.git")
+
+	repo, err := daemon.ParseRepository("owner/repo")
+	if err != nil {
+		t.Fatalf("ParseRepository returned error: %v", err)
+	}
+	record, err := resolveDaemonStartRepo(ctx, store, repo, otherDir)
+	if err != nil {
+		t.Fatalf("resolveDaemonStartRepo from non-matching cwd returned error: %v", err)
+	}
+	wantRoot := strings.TrimSpace(runGitOutput(t, checkout, "rev-parse", "--show-toplevel"))
+	if record.CheckoutPath != wantRoot {
+		t.Fatalf("resolved checkout = %q, want registered checkout %q", record.CheckoutPath, wantRoot)
+	}
+	if record.Owner != "owner" || record.Name != "repo" {
+		t.Fatalf("resolved repo = %s/%s, want owner/repo", record.Owner, record.Name)
+	}
+}
+
+// TestResolveDaemonStartRepoBootstrapsUnregistered pins that an unregistered repo
+// still resolves from the current checkout (first-time setup path), and that an
+// origin mismatch there still fails (origin protection intact).
+func TestResolveDaemonStartRepoBootstrapsUnregistered(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+
+	checkout := t.TempDir()
+	runGit(t, checkout, "init")
+	runGit(t, checkout, "config", "user.email", "gitmoot@example.com")
+	runGit(t, checkout, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(checkout, "README.md"), []byte("initial\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runGit(t, checkout, "add", "README.md")
+	runGit(t, checkout, "commit", "-m", "initial")
+	runGit(t, checkout, "remote", "add", "origin", "https://github.com/owner/repo.git")
+
+	repo, err := daemon.ParseRepository("owner/repo")
+	if err != nil {
+		t.Fatalf("ParseRepository returned error: %v", err)
+	}
+	// Bootstraps from the matching cwd.
+	record, err := resolveDaemonStartRepo(ctx, store, repo, checkout)
+	if err != nil {
+		t.Fatalf("resolveDaemonStartRepo bootstrap returned error: %v", err)
+	}
+	if record.Owner != "owner" || record.Name != "repo" {
+		t.Fatalf("bootstrapped repo = %s/%s, want owner/repo", record.Owner, record.Name)
+	}
+	// Origin protection: a non-matching cwd for an unregistered repo still fails.
+	other, err := daemon.ParseRepository("owner/elsewhere")
+	if err != nil {
+		t.Fatalf("ParseRepository returned error: %v", err)
+	}
+	if _, err := resolveDaemonStartRepo(ctx, store, other, checkout); err == nil {
+		t.Fatal("expected origin mismatch error for unregistered repo from non-matching cwd")
+	}
+}

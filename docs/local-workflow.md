@@ -296,11 +296,14 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    gitmoot daemon start --repo owner/project --poll 30s
    ```
 
-   The daemon validates that the current checkout's `origin` remote matches
-   `--repo`. `agent start --start-daemon` runs this same background start path
-   for the selected checkout. Use `gitmoot daemon start` without `--repo` after
-   registering all intended repos if one daemon should supervise the whole
-   Gitmoot home.
+   When `--repo` names a repo that is already registered, the daemon resolves
+   its registered checkout, so `gitmoot daemon start --repo owner/project` works
+   from any directory. For a repo that is not yet registered, run the command
+   from the matching checkout (the daemon validates the current checkout's
+   `origin` remote against `--repo` to bootstrap it). `agent start
+   --start-daemon` runs this same background start path for the selected
+   checkout. Use `gitmoot daemon start` without `--repo` after registering all
+   intended repos if one daemon should supervise the whole Gitmoot home.
 
    Gitmoot records agent autonomy policy as `read-only`, `workspace-write`,
    `danger-full-access`, or `auto`. For Codex these map to Codex sandbox
