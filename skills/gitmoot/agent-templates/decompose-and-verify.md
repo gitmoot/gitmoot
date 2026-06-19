@@ -52,7 +52,11 @@ gitmoot orchestrate decompose-and-verify "Implement the export feature described
    deps so they build in parallel in their own branch worktrees. Give each a
    precise prompt naming the files it owns and its acceptance.
 3. Create one verify step as a review-action ephemeral worker whose deps list
-   every implementation delegation id. Set synthesis_rule summary on it.
+   every implementation delegation id. Set synthesis_rule summary on it. Each
+   implementation leg lands on its own branch/worktree, so the verify step reads
+   the shared checkout, not an auto-merged combination of the legs; if it reports
+   the legs' work as missing, that is the cue for the continuation to integrate or
+   re-delegate (handled below), not a leg failure.
 4. Pick runtimes per leg; a stronger model for the verify gate is reasonable.
    Ephemeral workers are leaf-only.
 5. Every leg here is ephemeral. On each delegation set the `ephemeral` object
