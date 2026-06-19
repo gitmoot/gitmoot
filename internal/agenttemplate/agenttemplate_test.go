@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,12 +13,13 @@ import (
 
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/subprocess"
+	"github.com/jerryfane/gitmoot/skills"
 )
 
 func TestBuiltinsIncludesPlannerAndThermoTemplates(t *testing.T) {
 	definitions := Builtins()
-	if len(definitions) != 2 {
-		t.Fatalf("builtin count = %d, want 2", len(definitions))
+	if len(definitions) != 4 {
+		t.Fatalf("builtin count = %d, want 4", len(definitions))
 	}
 	thermo, ok := Lookup(ThermoNuclearCodeQualityReviewID)
 	if !ok {
@@ -35,6 +37,49 @@ func TestBuiltinsIncludesPlannerAndThermoTemplates(t *testing.T) {
 	}
 	if planner.SourceRepo != "jerryfane/gitmoot" || planner.SourcePath != "skills/gitmoot/agent-templates/planner.md" {
 		t.Fatalf("planner source = %+v", planner)
+	}
+	reviewPanel, ok := Lookup(ReviewPanelTemplateID)
+	if !ok {
+		t.Fatal("review-panel template missing")
+	}
+	if reviewPanel.Mutation || reviewPanel.DefaultRole != "coordinator" || !reflect.DeepEqual(reviewPanel.DefaultCapabilities, []string{"ask", "review"}) {
+		t.Fatalf("review-panel definition = %+v", reviewPanel)
+	}
+	if reviewPanel.SourceRepo != "jerryfane/gitmoot" || reviewPanel.SourcePath != "skills/gitmoot/agent-templates/review-panel.md" {
+		t.Fatalf("review-panel source = %+v", reviewPanel)
+	}
+	decompose, ok := Lookup(DecomposeAndVerifyTemplateID)
+	if !ok {
+		t.Fatal("decompose-and-verify template missing")
+	}
+	if !decompose.Mutation || decompose.DefaultRole != "coordinator" || !reflect.DeepEqual(decompose.DefaultCapabilities, []string{"ask", "review", "implement"}) {
+		t.Fatalf("decompose-and-verify definition = %+v", decompose)
+	}
+	if decompose.SourceRepo != "jerryfane/gitmoot" || decompose.SourcePath != "skills/gitmoot/agent-templates/decompose-and-verify.md" {
+		t.Fatalf("decompose-and-verify source = %+v", decompose)
+	}
+}
+
+func TestEmbeddedBuiltinTemplatesParseAndValidate(t *testing.T) {
+	for _, def := range Builtins() {
+		if def.SourceRepo != "jerryfane/gitmoot" {
+			continue
+		}
+		path := strings.TrimPrefix(def.SourcePath, "skills/")
+		data, err := fs.ReadFile(skills.FS, path)
+		if err != nil {
+			t.Fatalf("read embedded template %s: %v", def.ID, err)
+		}
+		parsed, err := ParseTemplateContent(string(data))
+		if err != nil {
+			t.Fatalf("template %s did not validate: %v", def.ID, err)
+		}
+		if parsed.Metadata.ID != def.ID {
+			t.Fatalf("template %s metadata id = %q", def.ID, parsed.Metadata.ID)
+		}
+		if !reflect.DeepEqual(parsed.Metadata.Capabilities, def.DefaultCapabilities) {
+			t.Fatalf("template %s capabilities = %v, want %v", def.ID, parsed.Metadata.Capabilities, def.DefaultCapabilities)
+		}
 	}
 }
 
