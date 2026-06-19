@@ -334,6 +334,18 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 	// pending retries). No-op for jobs that did not allocate a read-only worktree.
 	defer e.cleanupReadOnlyDelegationWorktree(ctx, jobID, job.Type, payload)
 
+	// Commit a succeeded implement leg's work to its own branch BEFORE advancing
+	// the parent's delegation DAG. The parent advance below may enqueue a dependent
+	// that integrates this leg (#332); if the commit ran later (in the switch), the
+	// leg that *triggered* the integration would not yet be on its branch and its
+	// work would be missing from the merge. The task/PR finalizer path commits its
+	// own way, so this only covers PR-less delegation legs; it is a no-op otherwise.
+	if job.Type == "implement" && payload.Result.Decision == "implemented" && !e.implementationNeedsFinalizer(ctx, payload) {
+		if err := e.commitDelegationLeg(ctx, job, payload); err != nil {
+			return err
+		}
+	}
+
 	// When a delegated child job finishes, advance its parent's delegation DAG
 	// before running the child's own advancement: enqueue any now-ready
 	// dependent siblings, apply the failed delegation's failure_policy, and
@@ -424,8 +436,6 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 				return err
 			}
 			payload = finalized
-		} else if err := e.commitDelegationLeg(ctx, job, payload); err != nil {
-			return err
 		}
 		if payload.PullRequest <= 0 {
 			return e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_skipped_no_pr", Message: "no pull request is attached; skipping PR advancement"})
