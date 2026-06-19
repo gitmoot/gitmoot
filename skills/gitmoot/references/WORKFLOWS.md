@@ -474,9 +474,10 @@ Two recipes ship built in:
 - **`review-panel`** — fans a PR or change out to a panel of ephemeral reviewers,
   each with a different lens (correctness and security; performance and
   maintainability; tests and edge cases), then synthesizes their findings into
-  one verdict. The panelists are dep-free, so they review in parallel, and they
-  are seeded from the `thermo-nuclear-code-quality-review` template across mixed
-  runtimes so the panel does not share one model's blind spots.
+  one verdict. The panelists are dep-free, so they review in parallel, each with
+  a self-contained lens prompt across mixed runtimes so the panel does not share
+  one model's blind spots (point a panelist at an installed review template such
+  as `thermo-nuclear-code-quality-review` only if you want).
 - **`decompose-and-verify`** — decomposes one implementation task into
   file-disjoint subtasks, fans them out to ephemeral implementation workers that
   build in parallel in their own branch worktrees, then runs a single `review`

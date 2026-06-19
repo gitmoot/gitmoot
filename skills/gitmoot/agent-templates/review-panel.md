@@ -49,11 +49,13 @@ gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/rep
    with no deps so they run in parallel. Default to three lenses; adapt to the
    change: correctness and security; performance and maintainability; tests and
    edge cases.
-3. Each reviewer is a throwaway worker spawned from the
-   thermo-nuclear-code-quality-review template, seeded with one lens in its
+3. Each reviewer is a throwaway ephemeral worker seeded with one lens in its
    prompt. Mix runtimes so the panel does not share one model's blind spots.
    Ephemeral workers are leaf-only: they return findings, never their own
-   delegations.
+   delegations. The lens prompt is self-contained — do not set an ephemeral
+   template unless that template is already installed in this Gitmoot home (for
+   example, set "template": "thermo-nuclear-code-quality-review" only when you
+   have run gitmoot agent template update for it).
 4. Set synthesis_rule summary on each delegation.
 5. Do not set agent on these delegations — agent and ephemeral are mutually
    exclusive, and the panel is ephemeral.
@@ -81,7 +83,6 @@ all finish.
         "synthesis_rule": "summary",
         "ephemeral": {
           "runtime": "claude",
-          "template": "thermo-nuclear-code-quality-review",
           "role": "reviewer",
           "capabilities": ["ask", "review"]
         }
@@ -93,7 +94,6 @@ all finish.
         "synthesis_rule": "summary",
         "ephemeral": {
           "runtime": "codex",
-          "template": "thermo-nuclear-code-quality-review",
           "role": "reviewer",
           "capabilities": ["ask", "review"]
         }
@@ -105,7 +105,6 @@ all finish.
         "synthesis_rule": "summary",
         "ephemeral": {
           "runtime": "claude",
-          "template": "thermo-nuclear-code-quality-review",
           "role": "reviewer",
           "capabilities": ["ask", "review"]
         }

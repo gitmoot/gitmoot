@@ -31,9 +31,10 @@ gitmoot agent template show review-panel
 independent reviewers, each looking through a different lens, then synthesizing
 their findings into one verdict. It fans out three dep-free reviewers by default —
 correctness and security; performance and maintainability; tests and edge cases —
-so they review in parallel. Each panelist is an ephemeral worker seeded from the
-`thermo-nuclear-code-quality-review` template, and the recipe mixes runtimes so
-the panel does not share one model's blind spots.
+so they review in parallel. Each panelist is an ephemeral worker with a
+self-contained lens prompt, and the recipe mixes runtimes so the panel does not
+share one model's blind spots (point a panelist at an installed review template
+such as `thermo-nuclear-code-quality-review` only if you want).
 
 ```sh
 gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
