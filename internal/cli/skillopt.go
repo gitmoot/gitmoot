@@ -11125,19 +11125,23 @@ func renderSkillOptJudgeReport(stdout io.Writer, outcomes []db.SkillOptJudgeOutc
 
 	// Cohen's kappa for the 2x2 judge-vs-human table:
 	//   po = observed agreement; pe = chance agreement from the marginals.
-	//   kappa = (po - pe) / (1 - pe). Reported as 1.0 when pe == 1 (every
-	//   rater always picked the same label, so there is no chance disagreement).
+	//   kappa = (po - pe) / (1 - pe). When pe == 1 (a rater used a single label
+	//   for every row) kappa is undefined: report 1.000 only when observed
+	//   agreement is also perfect, otherwise "n/a" rather than a misleading 1.0.
 	po := float64(agreements) / float64(total)
 	judgeAcceptTotal := agreeAccept + judgeAcceptHumanReject
 	humanAcceptTotal := agreeAccept + judgeRejectHumanAccept
 	judgeRejectTotal := total - judgeAcceptTotal
 	humanRejectTotal := total - humanAcceptTotal
 	pe := (float64(judgeAcceptTotal)*float64(humanAcceptTotal) + float64(judgeRejectTotal)*float64(humanRejectTotal)) / (float64(total) * float64(total))
-	kappa := 1.0
-	if pe < 1 {
-		kappa = (po - pe) / (1 - pe)
+	switch {
+	case pe < 1:
+		fmt.Fprintf(stdout, "cohen's kappa: %.3f\n", (po-pe)/(1-pe))
+	case po >= 1:
+		writeLine(stdout, "cohen's kappa: 1.000")
+	default:
+		writeLine(stdout, "cohen's kappa: n/a (degenerate: a rater used a single label)")
 	}
-	fmt.Fprintf(stdout, "cohen's kappa: %.3f\n", kappa)
 	writeLine(stdout, "")
 
 	renderSkillOptJudgeCalibration(stdout, outcomes)
@@ -11173,6 +11177,14 @@ func renderSkillOptJudgeCalibration(stdout io.Writer, outcomes []db.SkillOptJudg
 			continue
 		}
 		humanPromoted := outcome.HumanDecision == "promoted"
+		// Clamp out-of-range soft scores into [0,1] so a malformed value lands in
+		// an edge band rather than being silently dropped from the calibration.
+		if soft < 0 {
+			soft = 0
+		}
+		if soft > 1 {
+			soft = 1
+		}
 		for index, band := range skillOptJudgeBands {
 			if soft >= band.low && soft < band.high {
 				stats[index].count++

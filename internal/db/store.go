@@ -4645,7 +4645,14 @@ func captureSkillOptJudgeOutcome(ctx context.Context, execer sqlExecer, version 
 	if err != nil {
 		return err
 	}
-	judgeAccept, promptVersion, evaluatorID, promptHash := skillOptJudgeAcceptFromReport(evalReportJSON)
+	judgeAccept, hasSignal, promptVersion, evaluatorID, promptHash := skillOptJudgeAcceptFromReport(evalReportJSON)
+	if !hasSignal {
+		// No recognizable judge signal in the eval report (missing/empty/
+		// unrecognized): skip rather than record a misleading "judge rejected"
+		// outcome that would pollute the agreement dataset. Calibration excludes
+		// no-data decisions.
+		return nil
+	}
 	humanPromoted := strings.TrimSpace(humanDecision) == "promoted"
 	direction := skillOptJudgeDirection(humanPromoted, judgeAccept)
 	_, err = execer.ExecContext(ctx, `INSERT INTO skillopt_judge_outcomes(
@@ -4689,23 +4696,27 @@ func skillOptJudgeDirection(humanPromoted bool, judgeAccept bool) string {
 //
 // Judge-accept heuristic (most authoritative field wins):
 //  1. explicit boolean "promotable" — true => accept, false => reject;
-//  2. an explicit recommendation string ("recommendation"/"recommended_action"):
-//     "promote"/"accept" => accept, "reject" => reject;
+//  2. a recommendation string ("recommendation"/"recommended_action"):
+//     "promote"/"accept"/"approve"/"pass" => accept, "reject"/"decline"/"fail"
+//     => reject;
 //  3. a quality/contract status string ("quality_status"/"contract_status"):
-//     "pass"/"promote"/"ok"/"accept" => accept, an explicit "fail"/"reject" =>
-//     reject (statuses like "not_run" are inconclusive and skipped);
+//     "pass"/"passed"/"promote"/"ok"/"accept"/"approved" => accept,
+//     "fail"/"failed"/"reject"/"rejected" => reject (other statuses like
+//     "not_run" are inconclusive and skipped);
 //  4. fall back to the soft score: soft >= 0.5 => accept.
 //
-// If no signal at all is present the judge defaults to reject (a missing or
-// empty report is not evidence the judge endorsed the candidate).
-func skillOptJudgeAcceptFromReport(evalReportJSON string) (accept bool, promptVersion string, evaluatorID string, promptHash string) {
+// hasSignal reports whether any of the above produced a verdict. When it is
+// false (missing/empty/unrecognized report), callers should SKIP recording the
+// outcome rather than treat the absence of data as a "judge rejected" verdict,
+// which would pollute the calibration dataset.
+func skillOptJudgeAcceptFromReport(evalReportJSON string) (accept bool, hasSignal bool, promptVersion string, evaluatorID string, promptHash string) {
 	evalReportJSON = strings.TrimSpace(evalReportJSON)
 	if evalReportJSON == "" {
-		return false, "", "", ""
+		return false, false, "", "", ""
 	}
 	var report map[string]any
 	if err := json.Unmarshal([]byte(evalReportJSON), &report); err != nil {
-		return false, "", "", ""
+		return false, false, "", "", ""
 	}
 	// Search the report root and the nested evaluator_score object, preferring
 	// whichever supplies the most authoritative signal.
@@ -4721,34 +4732,34 @@ func skillOptJudgeAcceptFromReport(evalReportJSON string) (accept bool, promptVe
 	// 1) explicit promotable boolean.
 	for _, source := range sources {
 		if value, ok := source["promotable"].(bool); ok {
-			return value, promptVersion, evaluatorID, promptHash
+			return value, true, promptVersion, evaluatorID, promptHash
 		}
 	}
 	// 2) explicit recommendation.
 	if recommendation := firstSkillOptJudgeString(sources, "recommendation", "recommended_action"); recommendation != "" {
 		switch strings.ToLower(recommendation) {
 		case "promote", "accept", "approve", "pass":
-			return true, promptVersion, evaluatorID, promptHash
+			return true, true, promptVersion, evaluatorID, promptHash
 		case "reject", "decline", "fail":
-			return false, promptVersion, evaluatorID, promptHash
+			return false, true, promptVersion, evaluatorID, promptHash
 		}
 	}
 	// 3) quality / contract status.
 	if status := firstSkillOptJudgeString(sources, "quality_status", "contract_status"); status != "" {
 		switch strings.ToLower(status) {
 		case "pass", "passed", "promote", "ok", "accept", "approved":
-			return true, promptVersion, evaluatorID, promptHash
+			return true, true, promptVersion, evaluatorID, promptHash
 		case "fail", "failed", "reject", "rejected":
-			return false, promptVersion, evaluatorID, promptHash
+			return false, true, promptVersion, evaluatorID, promptHash
 		}
 	}
 	// 4) soft-score fallback.
 	for _, source := range sources {
 		if soft, ok := skillOptJudgeFloat(source["soft"]); ok {
-			return soft >= 0.5, promptVersion, evaluatorID, promptHash
+			return soft >= 0.5, true, promptVersion, evaluatorID, promptHash
 		}
 	}
-	return false, promptVersion, evaluatorID, promptHash
+	return false, false, promptVersion, evaluatorID, promptHash
 }
 
 func firstSkillOptJudgeString(sources []map[string]any, keys ...string) string {

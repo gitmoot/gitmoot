@@ -2993,6 +2993,32 @@ func TestDecideSkillOptTrainCandidateCapturesJudgeOutcome(t *testing.T) {
 	}
 }
 
+func TestDecideSkillOptTrainCandidateSkipsCaptureWithoutJudgeSignal(t *testing.T) {
+	// A decision whose eval report carries no recognizable judge signal must not
+	// record a misleading "judge rejected" outcome — it is skipped entirely.
+	for _, report := range []string{"", "{}", `{"summary":"no judge fields here"}`} {
+		ctx := context.Background()
+		store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+		if err != nil {
+			t.Fatalf("Open returned error: %v", err)
+		}
+		candidate := seedSkillOptJudgeCandidate(t, store, report)
+		session := SkillOptTrainSession{ID: "session-1", TemplateID: "planner", State: "review_published"}
+		iteration := SkillOptTrainIteration{ID: "session-1-001", SessionID: "session-1", State: "review_published"}
+		if _, err := store.DecideSkillOptTrainCandidate(ctx, session, iteration, candidate.ID, "promoted"); err != nil {
+			t.Fatalf("DecideSkillOptTrainCandidate returned error: %v", err)
+		}
+		outcomes, err := store.ListSkillOptJudgeOutcomes(ctx, "planner")
+		if err != nil {
+			t.Fatalf("ListSkillOptJudgeOutcomes returned error: %v", err)
+		}
+		if len(outcomes) != 0 {
+			t.Fatalf("report %q: captured %d outcomes, want 0 (no judge signal)", report, len(outcomes))
+		}
+		store.Close()
+	}
+}
+
 func seedSkillOptJudgeCandidate(t *testing.T, store *Store, evalReportJSON string) AgentTemplateVersion {
 	t.Helper()
 	ctx := context.Background()
