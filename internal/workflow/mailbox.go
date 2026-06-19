@@ -53,6 +53,7 @@ type JobRequest struct {
 	DelegationReason       string
 	RecentDelegationHashes []string
 	DelegationRepeatCount  int
+	DelegationFinalize     bool
 	Model                  string
 	Ephemeral              *EphemeralSpec
 }
@@ -92,6 +93,7 @@ type JobPayload struct {
 	DelegationReason       string         `json:"delegation_reason,omitempty"`
 	RecentDelegationHashes []string       `json:"recent_delegation_hashes,omitempty"`
 	DelegationRepeatCount  int            `json:"delegation_repeat_count,omitempty"`
+	DelegationFinalize     bool           `json:"delegation_finalize,omitempty"`
 	Model                  string         `json:"model,omitempty"`
 	Ephemeral              *EphemeralSpec `json:"ephemeral,omitempty"`
 	RawOutputs             []string       `json:"raw_outputs,omitempty"`
@@ -150,6 +152,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		DelegationReason:       request.DelegationReason,
 		RecentDelegationHashes: request.RecentDelegationHashes,
 		DelegationRepeatCount:  request.DelegationRepeatCount,
+		DelegationFinalize:     request.DelegationFinalize,
 		Model:                  request.Model,
 		Ephemeral:              request.Ephemeral,
 	})

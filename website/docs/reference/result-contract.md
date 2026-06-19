@@ -234,9 +234,14 @@ trips, the offending delegations are dropped rather than dispatched.
   activity halts repeated or cyclic delegation chains — for example an
   oscillating A→B→A loop — well before the depth cap is reached.
 
-When any bound trips, the offending delegations are dropped (not dispatched) and
-the parent receives a lifecycle/mailbox event explaining why. Work is bounded,
-not silently retried forever.
+When any bound trips, the offending delegations are not dispatched and the parent
+receives a typed lifecycle event explaining why. Rather than stopping silently,
+the engine then enqueues one **graceful finalize continuation**
+(`delegation_finalize_enqueued`): the coordinator is told it cannot delegate
+further and asked to synthesize a best-effort final result and return empty
+delegations. That continuation is terminal — any delegations it returns are
+ignored (`delegation_finalized`). Work is bounded and always ends with a clean
+synthesis, not a silent dead end.
 
 For the in-repo source of truth, see
 [`skills/gitmoot/references/RESULT_CONTRACT.md`](https://github.com/jerryfane/gitmoot/blob/main/skills/gitmoot/references/RESULT_CONTRACT.md)

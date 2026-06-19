@@ -3433,9 +3433,30 @@ func TestEngineStaticCoordinatorHaltedByLoopDetection(t *testing.T) {
 	if countJobEvents(t, store, correctiveID, "delegation_loop_detected") != 1 {
 		t.Fatal("second repeat after a nudge must record delegation_loop_detected")
 	}
-	// No further child or continuation may be created off the halted generation.
-	if jobExists(t, store, delegationContinuationID(correctiveID)) {
-		t.Fatal("delegation_loop_detected must not enqueue another continuation")
+	// Graceful finalize (#305 "Later"): loop_detected enqueues ONE terminal finalize
+	// continuation (best-effort synthesis) rather than stopping silently. No more
+	// delegations are dispatched off the halted generation.
+	if jobExists(t, store, correctiveID+"/delegation/"+dels[0].ID) {
+		t.Fatal("delegation_loop_detected must not dispatch the repeated delegations")
+	}
+	finalizeID := delegationContinuationID(correctiveID)
+	finalize, err := unmarshalPayload(mustJob(t, store, finalizeID).Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(finalize) returned error: %v", err)
+	}
+	if !finalize.DelegationFinalize {
+		t.Fatalf("loop_detected continuation must be a terminal finalize: %+v", finalize)
+	}
+	// The finalize continuation is itself terminal: even if it returns delegations,
+	// they are ignored, so it spawns no children and no further continuation.
+	if err := driveStaticGeneration(t, store, engine, finalizeID, dels); err != nil {
+		t.Fatalf("driveStaticGeneration(finalize) returned error: %v", err)
+	}
+	if jobExists(t, store, finalizeID+"/delegation/"+dels[0].ID) {
+		t.Fatal("a finalize continuation must not dispatch its delegations")
+	}
+	if jobExists(t, store, delegationContinuationID(finalizeID)) {
+		t.Fatal("a finalize continuation must be terminal (no further continuation)")
 	}
 
 	// It stopped well before the blunt depth cap: the deepest job created carries

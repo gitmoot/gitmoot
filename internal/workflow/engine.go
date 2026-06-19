@@ -577,10 +577,8 @@ const MaxDelegationWidth = 16
 // non-progress: a coordinator re-issuing a delegation set it already issued.
 // NOTE (follow-up, issue #305 "Later"): detection is set-only (not result-aware)
 // and only catches cycles of period <= delegationHashWindowSize; longer cycles
-// fall back to the depth/total-job/width backstops.
-// continuation chain remembers (threaded via the payload, not scanned across
-// jobs). A repeat within this sliding window is what the loop detector treats as
-// non-progress: a coordinator re-issuing a delegation set it already issued.
+// fall back to the depth/total-job/width backstops, which now enqueue a graceful
+// finalize continuation rather than stopping silently.
 const delegationHashWindowSize = 3
 
 // canonicalDelegationSetHash hashes a delegation set into a stable, order-
@@ -681,13 +679,27 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 		return nil
 	}
 
+	// A finalize continuation (enqueued when a backstop tripped, #305 "Later") is
+	// terminal: the coordinator was asked to synthesize a best-effort final result,
+	// so ignore any delegations it returned and stop the chain here. This must
+	// precede the budget checks so an over-budget finalize continuation is not
+	// itself re-tripped.
+	if payload.DelegationFinalize {
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "delegation_finalized",
+			Message: fmt.Sprintf("finalize continuation is terminal; ignoring %d delegation(s)", len(payload.Result.Delegations)),
+		})
+		return nil
+	}
+
 	if payload.DelegationDepth >= MaxDelegationDepth {
 		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    "delegation_depth_exceeded",
 			Message: fmt.Sprintf("delegation depth %d reached the limit of %d; not dispatching %d delegation(s)", payload.DelegationDepth, MaxDelegationDepth, len(payload.Result.Delegations)),
 		})
-		return nil
+		return e.enqueueFinalizeContinuation(ctx, job, payload, fmt.Sprintf("delegation depth limit of %d reached", MaxDelegationDepth))
 	}
 
 	rootID := e.rootJobID(job, payload)
@@ -701,7 +713,7 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 			Kind:    "delegation_budget_exceeded",
 			Message: fmt.Sprintf("delegation tree for root %s reached the job budget of %d (%d jobs); not dispatching %d delegation(s)", rootID, MaxDelegationTotalJobs, total, len(payload.Result.Delegations)),
 		})
-		return nil
+		return e.enqueueFinalizeContinuation(ctx, job, payload, fmt.Sprintf("per-root job budget of %d reached", MaxDelegationTotalJobs))
 	}
 
 	if width := len(payload.Result.Delegations); width > MaxDelegationWidth {
@@ -710,7 +722,7 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 			Kind:    "delegation_width_exceeded",
 			Message: fmt.Sprintf("delegation set width %d exceeds the per-coordinator limit of %d; not dispatching", width, MaxDelegationWidth),
 		})
-		return nil
+		return e.enqueueFinalizeContinuation(ctx, job, payload, fmt.Sprintf("delegation set width %d exceeds the per-coordinator limit of %d", width, MaxDelegationWidth))
 	}
 
 	// Windowed non-progress detection. The depth/budget caps above are blunt
@@ -812,6 +824,11 @@ func (e Engine) handleDelegationLoop(ctx context.Context, job db.Job, payload Jo
 			Kind:    "delegation_loop_detected",
 			Message: fmt.Sprintf("delegation set %s repeated after a corrective nudge (repeat count %d); not dispatching %d delegation(s)", currentHash, payload.DelegationRepeatCount, len(payload.Result.Delegations)),
 		})
+		// Graceful finalize (#305 "Later"): rather than stopping silently, give the
+		// coordinator one terminal continuation to synthesize a best-effort result.
+		if err := e.enqueueFinalizeContinuation(ctx, job, payload, "delegation set repeated after a corrective nudge"); err != nil {
+			return true, err
+		}
 		return true, nil
 	}
 
@@ -852,6 +869,59 @@ func (e Engine) handleDelegationLoop(ctx context.Context, job db.Job, payload Jo
 		return true, fmt.Errorf("enqueue corrective continuation for %q: %w", job.ID, err)
 	}
 	return true, nil
+}
+
+// enqueueFinalizeContinuation enqueues a single best-effort "finalize"
+// continuation back to the coordinator after a termination backstop trips (loop
+// detected, or a per-root depth/job/width budget exceeded). Instead of dropping
+// the offending delegations silently, the coordinator is re-invoked once with the
+// completed results and told to synthesize a final result and return empty
+// delegations. The continuation carries DelegationFinalize, so dispatchDelegations
+// treats its result as terminal (any delegations it returns are ignored),
+// guaranteeing the chain stops. Idempotent: the deterministic continuation id makes
+// e.enqueue a no-op on re-advance, and the once-guard avoids duplicate events.
+func (e Engine) enqueueFinalizeContinuation(ctx context.Context, job db.Job, payload JobPayload, reason string) error {
+	events, err := e.Store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		return err
+	}
+	for _, ev := range events {
+		if ev.Kind == "delegation_finalize_enqueued" {
+			return nil
+		}
+	}
+	request := JobRequest{
+		ID:                 delegationContinuationID(job.ID),
+		Agent:              job.Agent,
+		Action:             "ask",
+		Model:              payload.Model,
+		Repo:               payload.Repo,
+		Branch:             payload.Branch,
+		PullRequest:        payload.PullRequest,
+		HeadSHA:            payload.HeadSHA,
+		GoalID:             payload.GoalID,
+		TaskID:             payload.TaskID,
+		TaskTitle:          payload.TaskTitle,
+		LeadAgent:          payload.LeadAgent,
+		Reviewers:          payload.Reviewers,
+		Sender:             job.Agent,
+		Instructions:       buildFinalizeContinuationPrompt(payload.Result, reason),
+		Constraints:        payload.Constraints,
+		ParentJobID:        job.ID,
+		DelegationDepth:    payload.DelegationDepth + 1,
+		DelegatedBy:        job.Agent,
+		RootJobID:          e.rootJobID(job, payload),
+		DelegationFinalize: true,
+	}
+	if err := e.enqueue(ctx, request); err != nil {
+		return fmt.Errorf("enqueue finalize continuation for %q: %w", job.ID, err)
+	}
+	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   job.ID,
+		Kind:    "delegation_finalize_enqueued",
+		Message: fmt.Sprintf("termination backstop tripped (%s); enqueued a best-effort finalize continuation as job %s", reason, request.ID),
+	})
+	return nil
 }
 
 // enqueueDelegation allocates the per-delegation worktree (or branch lock) for
@@ -1741,6 +1811,25 @@ func buildCorrectiveContinuationPrompt(parentResult *AgentResult) string {
 	builder.WriteString("You delegated the same set as a previous round; it did not change the outcome. Change your approach or return an EMPTY delegations list to finish.\n\n")
 	if parentResult != nil && len(parentResult.Delegations) > 0 {
 		builder.WriteString("Repeated delegation set:\n")
+		for _, d := range parentResult.Delegations {
+			fmt.Fprintf(&builder, "- delegation %q (agent %s, action %s)\n", d.ID, d.Agent, d.Action)
+		}
+	}
+	return builder.String()
+}
+
+// buildFinalizeContinuationPrompt is the terminal continuation sent when a
+// termination backstop trips. It tells the coordinator it has hit a limit and
+// cannot delegate further, asks it to synthesize a best-effort final result from
+// the completed work, and states that any delegations it returns now are ignored
+// (the engine enforces this via DelegationFinalize). It lists the delegations that
+// were not dispatched for context.
+func buildFinalizeContinuationPrompt(parentResult *AgentResult, reason string) string {
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "A termination backstop was reached (%s). You cannot delegate any more work.\n\n", reason)
+	builder.WriteString("Synthesize a best-effort FINAL result from what has already completed, and return an EMPTY delegations list. Any delegations you return now will be ignored.\n")
+	if parentResult != nil && len(parentResult.Delegations) > 0 {
+		builder.WriteString("\nDelegations that were NOT dispatched:\n")
 		for _, d := range parentResult.Delegations {
 			fmt.Fprintf(&builder, "- delegation %q (agent %s, action %s)\n", d.ID, d.Agent, d.Action)
 		}
