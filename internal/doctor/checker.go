@@ -23,13 +23,20 @@ type Checker struct {
 	Runner subprocess.Runner
 }
 
+// Run returns the global (cwd-independent) checks followed by the per-repo
+// checks for the Checker's Dir, treated as a single checkout. This is the
+// `gitmoot doctor --repo <dir>` view.
 func (c Checker) Run(ctx context.Context) []Check {
-	runner := c.Runner
-	if runner == nil {
-		runner = subprocess.ExecRunner{}
-	}
+	checks := c.GlobalChecks(ctx)
+	return append(checks, c.RepoChecks(ctx, c.Dir)...)
+}
 
-	checks := []Check{
+// GlobalChecks returns the diagnostics that do not depend on any repo checkout:
+// required/optional runtime binaries and the auth checks. They can run from
+// anywhere, so the dashboard renders them once.
+func (c Checker) GlobalChecks(ctx context.Context) []Check {
+	runner := c.runner()
+	return []Check{
 		c.command(ctx, runner, "git", true, "--version"),
 		c.command(ctx, runner, "gh", true, "--version"),
 		c.command(ctx, runner, "codex", true, "--version"),
@@ -37,10 +44,29 @@ func (c Checker) Run(ctx context.Context) []Check {
 		c.command(ctx, runner, "kimi", false, "--version"),
 		c.claudeAuthEnv(),
 		c.ghAuth(ctx, runner),
-		c.repoRemote(ctx, runner),
-		c.baseBranch(ctx, runner),
 	}
-	return checks
+}
+
+// RepoChecks returns the per-repo diagnostics (origin remote resolves, base
+// branch present) run against checkoutPath. A repo that has no checkout path yet
+// (subscribed but never delivered to) reports a single non-required "no checkout"
+// check rather than failing the git-dependent checks.
+func (c Checker) RepoChecks(ctx context.Context, checkoutPath string) []Check {
+	if strings.TrimSpace(checkoutPath) == "" {
+		return []Check{{Name: "checkout", OK: false, Required: false, Detail: "no checkout yet"}}
+	}
+	runner := c.runner()
+	return []Check{
+		c.repoRemote(ctx, runner, checkoutPath),
+		c.baseBranch(ctx, runner, checkoutPath),
+	}
+}
+
+func (c Checker) runner() subprocess.Runner {
+	if c.Runner != nil {
+		return c.Runner
+	}
+	return subprocess.ExecRunner{}
 }
 
 func (c Checker) command(ctx context.Context, runner subprocess.Runner, name string, required bool, args ...string) Check {
@@ -62,8 +88,8 @@ func (c Checker) ghAuth(ctx context.Context, runner subprocess.Runner) Check {
 	return Check{Name: "gh auth", OK: true, Required: true, Detail: firstLine(result.Stdout, result.Stderr)}
 }
 
-func (c Checker) repoRemote(ctx context.Context, runner subprocess.Runner) Check {
-	result, err := runner.Run(ctx, c.Dir, "git", "remote", "get-url", "origin")
+func (c Checker) repoRemote(ctx context.Context, runner subprocess.Runner, dir string) Check {
+	result, err := runner.Run(ctx, dir, "git", "remote", "get-url", "origin")
 	if err != nil {
 		return Check{Name: "repo remote", Required: true, Detail: strings.TrimSpace(result.Stderr)}
 	}
@@ -73,15 +99,15 @@ func (c Checker) repoRemote(ctx context.Context, runner subprocess.Runner) Check
 		return Check{Name: "repo remote", Required: true, Detail: err.Error()}
 	}
 
-	view, err := runner.Run(ctx, c.Dir, "gh", "repo", "view", repo.String(), "--json", "nameWithOwner")
+	view, err := runner.Run(ctx, dir, "gh", "repo", "view", repo.String(), "--json", "nameWithOwner")
 	if err != nil {
 		return Check{Name: "repo remote", Required: true, Detail: strings.TrimSpace(view.Stderr)}
 	}
 	return Check{Name: "repo remote", OK: true, Required: true, Detail: repo.String()}
 }
 
-func (c Checker) baseBranch(ctx context.Context, runner subprocess.Runner) Check {
-	result, err := runner.Run(ctx, c.Dir, "git", "branch", "--show-current")
+func (c Checker) baseBranch(ctx context.Context, runner subprocess.Runner, dir string) Check {
+	result, err := runner.Run(ctx, dir, "git", "branch", "--show-current")
 	if err != nil {
 		return Check{Name: "base branch", Required: true, Detail: strings.TrimSpace(result.Stderr)}
 	}

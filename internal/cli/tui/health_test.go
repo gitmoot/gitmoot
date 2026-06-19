@@ -191,3 +191,26 @@ func TestHealthStartDaemonShowsInFlightAndError(t *testing.T) {
 		t.Fatalf("a daemon start failure should render on Health:\n%s", m.View())
 	}
 }
+
+func TestRenderHealthChecksGroupsByScope(t *testing.T) {
+	out := renderHealthChecks([]HealthCheck{
+		{Name: "git", Status: "ok", Required: true},
+		{Name: "gh auth", Status: "ok", Required: true},
+		{Name: "repo remote", Status: "ok", Required: true, Scope: "owner/a"},
+		{Name: "base branch", Status: "ok", Required: true, Scope: "owner/a"},
+		{Name: "checkout", Status: "warn", Required: false, Scope: "owner/b"},
+	})
+	for _, want := range []string{"git", "gh auth", "owner/a", "repo remote", "base branch", "owner/b", "checkout"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("renderHealthChecks output missing %q:\n%s", want, out)
+		}
+	}
+	// The global block (git) must appear before the first repo scope header.
+	if strings.Index(out, "git") > strings.Index(out, "owner/a") {
+		t.Fatalf("global checks should render before repo scopes:\n%s", out)
+	}
+	// owner/a's checks render under its header, before owner/b's header.
+	if strings.Index(out, "owner/a") > strings.Index(out, "owner/b") {
+		t.Fatalf("repo scopes should render in first-seen order:\n%s", out)
+	}
+}

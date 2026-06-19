@@ -127,12 +127,16 @@ type configWriteMsg struct {
 	err error
 }
 
-// HealthCheck is one environment/runtime diagnostic for the Health page.
+// HealthCheck is one environment/runtime diagnostic for the Health page. Scope
+// is empty for global (cwd-independent) checks and the repo full name
+// ("owner/repo") for per-repo checks, so the Health page can render the global
+// block once and group the rest by repo.
 type HealthCheck struct {
 	Name     string
 	Status   string // "ok", "warn", or "fail"
 	Detail   string
 	Required bool
+	Scope    string
 }
 
 // Repo mirrors cli.dashboardRepo.

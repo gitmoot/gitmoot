@@ -173,3 +173,66 @@ func withClaudeAuthEnv(t *testing.T, values map[string]string) {
 		}
 	})
 }
+
+func TestRepoChecksNoCheckoutWarns(t *testing.T) {
+	checks := Checker{Runner: fakeRunner{paths: map[string]bool{}}}.RepoChecks(context.Background(), "")
+	if len(checks) != 1 {
+		t.Fatalf("RepoChecks(\"\") = %+v, want a single check", checks)
+	}
+	c := checks[0]
+	if c.Name != "checkout" || c.OK || c.Required {
+		t.Fatalf("no-checkout check = %+v, want non-required, not-ok 'checkout'", c)
+	}
+	if !strings.Contains(c.Detail, "no checkout") {
+		t.Fatalf("no-checkout detail = %q", c.Detail)
+	}
+}
+
+func TestGlobalChecksHaveNoRepoChecks(t *testing.T) {
+	runner := fakeRunner{
+		paths: map[string]bool{"git": true, "gh": true, "codex": true},
+		runs: map[string]subprocess.Result{
+			"git --version":   {Stdout: "git version 2\n"},
+			"gh --version":    {Stdout: "gh version 2\n"},
+			"codex --version": {Stdout: "codex 1\n"},
+			"gh auth status":  {Stdout: "Logged in\n"},
+		},
+	}
+	for _, c := range (Checker{Runner: runner}).GlobalChecks(context.Background()) {
+		if c.Name == "repo remote" || c.Name == "base branch" || c.Name == "checkout" {
+			t.Fatalf("GlobalChecks unexpectedly included per-repo check %q", c.Name)
+		}
+	}
+}
+
+func TestRepoChecksAgainstCheckoutPath(t *testing.T) {
+	runner := pathSensitiveRunner{
+		want: "/checkout",
+		fakeRunner: fakeRunner{
+			runs: map[string]subprocess.Result{
+				"git remote get-url origin":                           {Stdout: "https://github.com/jerryfane/gitmoot.git\n"},
+				"gh repo view jerryfane/gitmoot --json nameWithOwner": {Stdout: `{"nameWithOwner":"jerryfane/gitmoot"}`},
+				"git branch --show-current":                           {Stdout: "main\n"},
+			},
+		},
+	}
+	checks := Checker{Runner: runner}.RepoChecks(context.Background(), "/checkout")
+	for _, c := range checks {
+		if !c.OK {
+			t.Fatalf("repo check %q ran against wrong dir or failed: %+v", c.Name, c)
+		}
+	}
+}
+
+// pathSensitiveRunner asserts that git/gh repo commands run in the expected dir.
+type pathSensitiveRunner struct {
+	fakeRunner
+	want string
+}
+
+func (r pathSensitiveRunner) Run(ctx context.Context, dir string, command string, args ...string) (subprocess.Result, error) {
+	if dir != r.want {
+		return subprocess.Result{}, fmt.Errorf("ran in %q, want %q", dir, r.want)
+	}
+	return r.fakeRunner.Run(ctx, dir, command, args...)
+}

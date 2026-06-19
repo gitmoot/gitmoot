@@ -447,22 +447,47 @@ func dashboardTUIDeps(home string, interval time.Duration) tui.Deps {
 			return config.SetConfigScalar(paths, keyPath, configScalarForKind(kind, value))
 		},
 		HealthChecks: func() ([]tui.HealthCheck, error) {
-			checks := doctor.Checker{Dir: "."}.Run(context.Background())
-			out := make([]tui.HealthCheck, 0, len(checks))
-			for _, c := range checks {
-				status := "ok"
-				if !c.OK {
-					if c.Required {
-						status = "fail"
-					} else {
-						status = "warn"
+			ctx := context.Background()
+			checker := doctor.Checker{}
+			out := []tui.HealthCheck{}
+			for _, c := range checker.GlobalChecks(ctx) {
+				out = append(out, toTUIHealthCheck(c, ""))
+			}
+			// Per-repo checks run against each tracked repo's recorded checkout,
+			// so the dashboard reports repo health from anywhere — not just the
+			// current directory (#267).
+			err := withStore(home, func(store *db.Store) error {
+				repos, err := store.ListRepos(ctx)
+				if err != nil {
+					return err
+				}
+				for _, r := range repos {
+					for _, c := range checker.RepoChecks(ctx, r.CheckoutPath) {
+						out = append(out, toTUIHealthCheck(c, r.FullName()))
 					}
 				}
-				out = append(out, tui.HealthCheck{Name: c.Name, Status: status, Detail: c.Detail, Required: c.Required})
+				return nil
+			})
+			if err != nil {
+				return nil, err
 			}
 			return out, nil
 		},
 	}
+}
+
+// toTUIHealthCheck maps a doctor.Check to a tui.HealthCheck, deriving the status
+// string and tagging it with scope ("" for global, "owner/repo" for per-repo).
+func toTUIHealthCheck(c doctor.Check, scope string) tui.HealthCheck {
+	status := "ok"
+	if !c.OK {
+		if c.Required {
+			status = "fail"
+		} else {
+			status = "warn"
+		}
+	}
+	return tui.HealthCheck{Name: c.Name, Status: status, Detail: c.Detail, Required: c.Required, Scope: scope}
 }
 
 // formPromptStore is the PromptStore for pushed forms: the hot 200ms answer
