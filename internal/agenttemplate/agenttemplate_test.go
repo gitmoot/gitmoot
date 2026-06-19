@@ -80,6 +80,19 @@ func TestEmbeddedBuiltinTemplatesParseAndValidate(t *testing.T) {
 		if !reflect.DeepEqual(parsed.Metadata.Capabilities, def.DefaultCapabilities) {
 			t.Fatalf("template %s capabilities = %v, want %v", def.ID, parsed.Metadata.Capabilities, def.DefaultCapabilities)
 		}
+		// The MetadataForDefinition fallback (used when a fetched file lacks
+		// frontmatter) must agree with the embedded file's frontmatter for the
+		// coordinator recipes, or a no-frontmatter fetch would report different
+		// tags/inputs/outputs than the template actually declares.
+		if def.ID == ReviewPanelTemplateID || def.ID == DecomposeAndVerifyTemplateID {
+			fallback := MetadataForDefinition(def)
+			if !reflect.DeepEqual(fallback.Tags, parsed.Metadata.Tags) ||
+				!reflect.DeepEqual(fallback.Inputs, parsed.Metadata.Inputs) ||
+				!reflect.DeepEqual(fallback.Outputs, parsed.Metadata.Outputs) {
+				t.Fatalf("template %s: MetadataForDefinition fallback diverges from frontmatter (tags %v/%v inputs %v/%v outputs %v/%v)",
+					def.ID, fallback.Tags, parsed.Metadata.Tags, fallback.Inputs, parsed.Metadata.Inputs, fallback.Outputs, parsed.Metadata.Outputs)
+			}
+		}
 	}
 }
 
