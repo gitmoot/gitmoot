@@ -9,6 +9,14 @@ CONTRACT_TESTS=(
   TestEvaluatorProfileAndFailurePacketContractsRoundTrip
   TestImportCandidatePackageRejectsNoCandidateMetadata
   TestImportCandidatePackageRejectsUnchangedContent
+  TestEvaluatorScoreJudgePromptFieldsRoundTrip
+  TestEvaluatorScoreJudgePromptFieldsOmitEmpty
+)
+
+DB_TESTS=(
+  TestSkillOptJudgeOutcomeCRUDRoundTrip
+  TestDecideSkillOptTrainCandidateCapturesJudgeOutcome
+  TestDecideSkillOptTrainCandidateSkipsCaptureWithoutJudgeSignal
 )
 
 CLI_TESTS=(
@@ -21,6 +29,7 @@ CLI_TESTS=(
   TestSkillOptPreviewRouteSlugsUnsafeSegments
   TestTrustedVueViteScaffoldUsesRelativeBase
   TestSkillOptGitHubPagesURLHandlesProjectAndUserPages
+  TestSkillOptJudgeReportRendersMatrixAndAgreement
   TestSkillOptTrainContinueRecordsNoCandidateResult
   TestSkillOptTrainContinueRerunsOptimizerAfterNoCandidate
   TestSkillOptTrainContinuePublishesCandidateReviewPromotesAndStartsNext
@@ -49,9 +58,11 @@ cd "$ROOT_DIR"
 IFS='|'
 CONTRACT_TEST_PATTERN="${CONTRACT_TESTS[*]}"
 CLI_TEST_PATTERN="${CLI_TESTS[*]}"
+DB_TEST_PATTERN="${DB_TESTS[*]}"
 unset IFS
 
 GOTOOLCHAIN="$GO_TOOLCHAIN" "$GO_BIN" test ./internal/skillopt -run "$CONTRACT_TEST_PATTERN"
+GOTOOLCHAIN="$GO_TOOLCHAIN" "$GO_BIN" test ./internal/db -run "$DB_TEST_PATTERN"
 GOTOOLCHAIN="$GO_TOOLCHAIN" "$GO_BIN" test ./internal/cli -run "$CLI_TEST_PATTERN"
 
 echo "skillopt train smoke passed"
