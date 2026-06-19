@@ -279,6 +279,21 @@ wait, or reject and `--start-next` to keep improving. LaTeX/PDF, Storybook,
 notebook, image, and other preview types are future adapters, not current
 renderer/publisher pairs.
 
+At each manual promote/reject decision, Gitmoot records the judge↔human outcome
+into a local store, tagged with the judge prompt version/id/hash that produced
+the score. All four directions are captured — `agree_accept`, `agree_reject`,
+`judge_accept_human_reject` (false positive), `judge_reject_human_accept` (false
+negative) — so you can measure agreements as well as disagreements. Capture is
+measurement only: it never alters the judge, overrides the decision, or bumps
+the result contract, and a capture error never fails the decision.
+
+Inspect calibration with `gitmoot skillopt judge-report [--template <id>]
+[--home <path>]`. It is read-only and prints a confusion matrix over the four
+directions, the agreement rate and Cohen's κ, calibration buckets (judge
+soft-score versus the human decision), and per-dimension disagreement — useful
+to tell whether the LLM judge is well-calibrated against human verdicts before
+you trust it to gate candidates.
+
 Run the deterministic smoke before changing train behavior:
 
 ```sh

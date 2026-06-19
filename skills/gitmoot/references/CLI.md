@@ -482,6 +482,7 @@ gitmoot skillopt train run [--config path | --session <id>] [--plain]
 gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--dry-run] [--promote version|--reject version --reason text] [--start-next]
 gitmoot skillopt train recover --session <id> [--out-root path] [--json]
 gitmoot skillopt train stop --session <id> --reason <text>
+gitmoot skillopt judge-report [--template <id>] [--home <path>]
 ```
 
 On a real terminal, `skillopt train run` opens an interactive view of one session
@@ -550,6 +551,22 @@ report JSON, preference summary, and a content diff against the base/current
 version. `skillopt candidate promote` makes a pending candidate current, while
 `skillopt candidate reject` records an auditable rejection and prevents that
 version from being selected by `@latest`.
+
+At the manual promote/reject gate, Gitmoot records every judge↔human outcome
+into a local store — all four directions: `agree_accept`, `agree_reject`,
+`judge_accept_human_reject` (judge accepts, human rejects — a false positive),
+and `judge_reject_human_accept` (judge rejects, human accepts — a false
+negative). Each outcome is tagged with the judge prompt version, evaluator id,
+and prompt hash that produced the score, so later analysis can compare judges by
+prompt revision. This capture is measurement only: it never changes the judge,
+overrides a decision, or bumps the result contract.
+
+`skillopt judge-report` reads those captured outcomes and reports how well the
+LLM judge is calibrated against human verdicts. It prints a confusion matrix
+(the four `direction` buckets), the agreement rate and Cohen's κ, calibration
+buckets (judge soft-score versus the human decision), and per-dimension
+disagreement. Pass `--template <id>` to scope the report to one template, and
+`--home <path>` to read from a non-default Gitmoot home. It is read-only.
 
 The Markdown feedback collector writes blind A/B review packets with `index.md`,
 per-item Markdown files, editable `feedback.yml`, and hidden assignment metadata

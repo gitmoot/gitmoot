@@ -680,6 +680,38 @@ Manual append-style next iterations are not supported. The train state machine
 creates the next iteration atomically from the resolved previous decision, its
 eval run, and copied item plan.
 
+## Judge↔Human Outcome Capture
+
+At each manual promote/reject decision, Gitmoot records the judge↔human outcome
+into a local store, tagged with the judge prompt version, evaluator id, and
+prompt hash that produced the candidate's score. All four directions are
+captured:
+
+- `agree_accept`: the judge accepted the candidate and the human promoted it;
+- `agree_reject`: the judge rejected the candidate and the human rejected it;
+- `judge_accept_human_reject`: the judge accepted but the human rejected (a
+  false positive);
+- `judge_reject_human_accept`: the judge rejected but the human promoted (a
+  false negative).
+
+Capture is measurement only. It never changes the judge, overrides the human
+decision, or bumps the result contract, and a capture error never fails the
+decision.
+
+Inspect how well the LLM judge tracks human verdicts:
+
+```sh
+gitmoot skillopt judge-report --template planner
+gitmoot skillopt judge-report --template planner --home /path/to/home
+```
+
+`judge-report` is read-only. It prints a confusion matrix over the four
+directions, the agreement rate and Cohen's κ, calibration buckets (judge
+soft-score versus the human decision), and per-dimension disagreement. `--template`
+scopes the report to one template, and `--home` reads from a non-default Gitmoot
+home. Use it to decide whether the judge is well-calibrated enough to trust at
+the gate before relying on it for candidate decisions.
+
 ## Deterministic Smoke
 
 Run the local train smoke script before shipping train-mode changes:
