@@ -2490,6 +2490,15 @@ func (w jobWorker) defaultCommenter(_ string) github.Client {
 	return github.NewClient("")
 }
 
+// The checkout-bound git client backs every per-delegation worktree role; assert
+// at compile time so the engine's runtime type-assertions can never silently fall
+// back (which would skip read-only-fanout or #332 integration worktrees).
+var (
+	_ workflow.WorktreeManager            = gitutil.Client{}
+	_ workflow.ReadOnlyWorktreeManager    = gitutil.Client{}
+	_ workflow.IntegrationWorktreeManager = gitutil.Client{}
+)
+
 func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, home string) workflow.Engine {
 	engine := workflow.Engine{
 		Store:                   store,

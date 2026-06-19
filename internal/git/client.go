@@ -99,6 +99,34 @@ func (c Client) RemoveWorktreeForce(ctx context.Context, path string) error {
 	return err
 }
 
+// MergeBranches sequentially merges each branch into the worktree at dir (its
+// current HEAD). It is used to integrate the per-delegation branches of parallel
+// implement legs into one tree before a dependent verify/review step runs
+// (issue #332). Sequential (not octopus) so a conflict pinpoints the offending
+// branch; on conflict the in-progress merge is aborted and an error naming the
+// branch is returned, so the caller can block rather than auto-resolve.
+func (c Client) MergeBranches(ctx context.Context, dir string, branches []string, message string) error {
+	dir, err := validateWorktreePath(dir)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(message) == "" {
+		message = "Gitmoot integration merge"
+	}
+	git := Client{Dir: dir, Runner: c.Runner}
+	for _, branch := range branches {
+		if err := validateBranch(branch); err != nil {
+			return err
+		}
+		if _, err := git.run(ctx, "merge", "--no-edit", "-m", message, branch); err != nil {
+			// Leave the worktree clean for disposal even on failure.
+			_, _ = git.run(ctx, "merge", "--abort")
+			return fmt.Errorf("merge branch %q: %w", branch, err)
+		}
+	}
+	return nil
+}
+
 func (c Client) CurrentBranch(ctx context.Context) (string, error) {
 	result, err := c.run(ctx, "branch", "--show-current")
 	if err != nil {

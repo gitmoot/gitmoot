@@ -875,6 +875,51 @@ func (e Engine) enqueueDelegation(ctx context.Context, job db.Job, payload JobPa
 	return e.allocateAndEnqueueDelegation(ctx, job, payload, d, request, ref)
 }
 
+// integrationDepBranches returns the per-delegation branches of delegation d's
+// succeeded implement-leg dependencies, so a dependent read-only step (e.g. a
+// decompose-and-verify verify gate) can run against a worktree with those legs
+// merged in rather than the base checkout (issue #332). It returns nil when d has
+// no such deps, in which case the normal read-only paths apply. Read-only deps
+// contribute no branch (they produce no implementation), and a leg that ran in
+// the shared checkout (branch == parent base) is skipped (its work is already on
+// the base).
+func (e Engine) integrationDepBranches(ctx context.Context, job db.Job, payload JobPayload, d Delegation) ([]string, error) {
+	deps := compactStrings(d.Deps)
+	if len(deps) == 0 || payload.Result == nil {
+		return nil, nil
+	}
+	byID := make(map[string]Delegation, len(payload.Result.Delegations))
+	for _, sib := range payload.Result.Delegations {
+		byID[strings.TrimSpace(sib.ID)] = sib
+	}
+	base := strings.TrimSpace(payload.Branch)
+	var branches []string
+	for _, dep := range deps {
+		sib, ok := byID[dep]
+		if !ok || readOnlyDelegationAction(sib.Action) {
+			continue
+		}
+		legJob, err := e.Store.GetJob(ctx, job.ID+"/delegation/"+dep)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return nil, err
+		}
+		if legJob.State != string(JobSucceeded) {
+			continue
+		}
+		legPayload, err := unmarshalPayload(legJob.Payload)
+		if err != nil {
+			return nil, err
+		}
+		if legBranch := strings.TrimSpace(legPayload.Branch); legBranch != "" && legBranch != base {
+			branches = append(branches, legBranch)
+		}
+	}
+	return branches, nil
+}
+
 // allocateAndEnqueueDelegation allocates the per-delegation worktree (or branch
 // lock) for implement delegations and enqueues the prepared request, recording a
 // delegation_enqueued event. It is shared by enqueueDelegation (initial/deferred
@@ -924,6 +969,46 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 			// inherited HeadSHA so the child validates against its own fresh
 			// worktree HEAD instead of a stale parent SHA.
 			request.HeadSHA = ""
+		}
+	} else if legBranches, err := e.integrationDepBranches(ctx, job, payload, d); err != nil {
+		return err
+	} else if len(legBranches) > 0 {
+		// This read-only delegation (e.g. a decompose-and-verify verify gate) depends
+		// on succeeded implement legs that each live on their own branch. Merge them
+		// into one detached worktree so the dependent sees the combined work instead
+		// of the base checkout (#332).
+		if manager, ok := e.DelegationWorktrees.(IntegrationWorktreeManager); !ok || strings.TrimSpace(e.Home) == "" {
+			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+				JobID:   job.ID,
+				Kind:    "delegation_worktree_skipped",
+				Message: fmt.Sprintf("delegation %q runs against the base checkout: integration worktree unavailable", request.DelegationID),
+			})
+		} else {
+			path, err := e.AllocateIntegrationWorktree(ctx, DelegationWorktreeRequest{
+				Home:         e.Home,
+				Repo:         request.Repo,
+				ParentJobID:  job.ID,
+				DelegationID: request.DelegationID,
+				BaseBranch:   payload.Branch,
+				Checkout:     e.DelegationCheckout,
+				RetryAttempt: request.RetryCount,
+			}, legBranches, manager)
+			if err != nil {
+				var blocked BlockedError
+				if errors.As(err, &blocked) {
+					return e.block(ctx, ref, blocked.Reason)
+				}
+				return err
+			}
+			request.WorktreePath = path
+			// Validate against the integration worktree's own HEAD, not the inherited
+			// parent HeadSHA (see isDelegationWorktreeChild).
+			request.HeadSHA = ""
+			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+				JobID:   job.ID,
+				Kind:    "delegation_integrated",
+				Message: fmt.Sprintf("delegation %q runs in an integration worktree merging %d implement leg(s)", request.DelegationID, len(legBranches)),
+			})
 		}
 	} else if readOnlyFanoutNeedsWorktree(payload, d) {
 		// Read-only fan-out: >=2 read-only siblings share the parent repo and would
