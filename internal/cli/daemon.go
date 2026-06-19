@@ -175,7 +175,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	}
 
 	err = withStore(*home, func(store *db.Store) error {
-		repoRecord, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: "."})
+		repoRecord, err := resolveDaemonStartRepo(ctx, store, repo, ".")
 		if err != nil {
 			return err
 		}
@@ -503,7 +503,7 @@ func daemonWorkDir(workDir string) (string, error) {
 
 func preflightDaemonRepoStart(ctx context.Context, home string, repo github.Repository, pollInterval string, workDir string) error {
 	return withStore(home, func(store *db.Store) error {
-		repoRecord, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: workDir})
+		repoRecord, err := resolveDaemonStartRepo(ctx, store, repo, workDir)
 		if err != nil {
 			return err
 		}
@@ -3312,6 +3312,28 @@ func resolveDaemonCheckout(ctx context.Context, repo github.Repository, client g
 		return "", err
 	}
 	return record.CheckoutPath, nil
+}
+
+// resolveDaemonStartRepo resolves the repo record that `daemon start/run --repo
+// owner/repo` should run against. When the repo is already registered with a
+// checkout path, it resolves against that REGISTERED checkout so the command
+// works from any working directory (#202) — origin protection is still enforced,
+// just against the registered checkout rather than the cwd. When the repo is not
+// yet registered (or has no checkout path), it bootstraps from workDir (the
+// current checkout), preserving the original behavior for first-time setup.
+func resolveDaemonStartRepo(ctx context.Context, store *db.Store, repo github.Repository, workDir string) (db.Repo, error) {
+	existing, err := store.GetRepo(ctx, repo.FullName())
+	switch {
+	case err == nil && strings.TrimSpace(existing.CheckoutPath) != "":
+		record, rerr := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: existing.CheckoutPath})
+		if rerr != nil {
+			return db.Repo{}, fmt.Errorf("registered checkout for %s at %s is unusable (re-register with `gitmoot repo add`): %w", repo.FullName(), existing.CheckoutPath, rerr)
+		}
+		return record, nil
+	case err != nil && !errors.Is(err, sql.ErrNoRows):
+		return db.Repo{}, err
+	}
+	return repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: workDir})
 }
 
 func repoRecordForCheckout(ctx context.Context, repo github.Repository, client gitutil.Client) (db.Repo, error) {
