@@ -77,6 +77,97 @@ type EvaluatorJudgeConfig struct {
 	Config json.RawMessage `json:"config,omitempty"`
 }
 
+// JudgePromptConfig is the additive, per-task_kind judge prompt payload carried
+// inside EvaluatorJudgeConfig.Config. It (un)marshals from the existing opaque
+// json.RawMessage passthrough, so it adds no new top-level contract fields and
+// does not bump ContractVersion. The Python judge reads
+// evaluator_profile.judge.config.judge_prompt_templates (keyed by task_kind) and
+// evaluator_profile.judge.config.judge_prompt_version.
+type JudgePromptConfig struct {
+	JudgePromptTemplates map[string]string `json:"judge_prompt_templates,omitempty"`
+	JudgePromptVersion   string            `json:"judge_prompt_version,omitempty"`
+}
+
+// JudgePromptConfig extracts the per-task_kind judge prompt templates and
+// version carried inside the judge Config passthrough, if present and
+// well-formed. It returns nil when neither field is present. Malformed shapes
+// (templates not an object of string→string, version not a string) are ignored,
+// consistent with the file's other best-effort metadata accessors, so a bad
+// payload never crashes export or import.
+func (c *EvaluatorJudgeConfig) JudgePromptConfig() *JudgePromptConfig {
+	if c == nil {
+		return nil
+	}
+	return parseJudgePromptConfig(c.Config)
+}
+
+func parseJudgePromptConfig(raw json.RawMessage) *JudgePromptConfig {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return nil
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return nil
+	}
+	out := &JudgePromptConfig{}
+	if rawTemplates, ok := decoded["judge_prompt_templates"]; ok {
+		var templates map[string]string
+		if err := json.Unmarshal(rawTemplates, &templates); err == nil && len(templates) > 0 {
+			out.JudgePromptTemplates = templates
+		}
+	}
+	if rawVersion, ok := decoded["judge_prompt_version"]; ok {
+		var version string
+		if err := json.Unmarshal(rawVersion, &version); err == nil {
+			out.JudgePromptVersion = strings.TrimSpace(version)
+		}
+	}
+	if len(out.JudgePromptTemplates) == 0 && out.JudgePromptVersion == "" {
+		return nil
+	}
+	return out
+}
+
+// mergeJudgePromptConfig folds the per-task_kind judge prompt templates and
+// version (parsed from the evaluator config) into the judge's opaque Config
+// passthrough without disturbing any other keys already present there. It is
+// additive: existing Config keys win on conflict only for non-judge-prompt
+// fields; the judge-prompt fields are (re)written from the parsed payload so the
+// validated shape is what survives export. A nil payload leaves Config
+// untouched.
+func mergeJudgePromptConfig(existing json.RawMessage, payload *JudgePromptConfig) (json.RawMessage, error) {
+	if payload == nil || (len(payload.JudgePromptTemplates) == 0 && payload.JudgePromptVersion == "") {
+		return existing, nil
+	}
+	merged := map[string]json.RawMessage{}
+	if trimmed := bytes.TrimSpace(existing); len(trimmed) > 0 {
+		if err := json.Unmarshal(trimmed, &merged); err != nil {
+			// Existing Config is not a JSON object we can extend; do not clobber it.
+			return existing, nil
+		}
+	}
+	if len(payload.JudgePromptTemplates) > 0 {
+		encoded, err := json.Marshal(payload.JudgePromptTemplates)
+		if err != nil {
+			return existing, err
+		}
+		merged["judge_prompt_templates"] = encoded
+	}
+	if payload.JudgePromptVersion != "" {
+		encoded, err := json.Marshal(payload.JudgePromptVersion)
+		if err != nil {
+			return existing, err
+		}
+		merged["judge_prompt_version"] = encoded
+	}
+	out, err := json.Marshal(merged)
+	if err != nil {
+		return existing, err
+	}
+	return json.RawMessage(out), nil
+}
+
 type EvaluatorStageStatus struct {
 	Stage      string          `json:"stage,omitempty"`
 	Status     string          `json:"status,omitempty"`
@@ -490,6 +581,27 @@ func EvaluatorProfileFromConfig(config json.RawMessage) *EvaluatorProfile {
 	return BuildEvaluatorProfile(evaluatorID, evaluatorModel, config)
 }
 
+// judgePromptConfigFromConfig pulls the per-task_kind judge prompt templates and
+// version out of the evaluator config, accepting them either at the top level or
+// nested under "evaluation" (mirroring how evaluator_id/evaluator_model are
+// read). It is best-effort: malformed shapes yield nil rather than an error.
+func judgePromptConfigFromConfig(config json.RawMessage) *JudgePromptConfig {
+	if len(bytes.TrimSpace(config)) == 0 {
+		return nil
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(config, &decoded); err != nil {
+		return nil
+	}
+	if payload := parseJudgePromptConfig(config); payload != nil {
+		return payload
+	}
+	if nested, ok := decoded["evaluation"]; ok {
+		return parseJudgePromptConfig(nested)
+	}
+	return nil
+}
+
 func BuildEvaluatorProfile(evaluatorID string, evaluatorModel string, metadata json.RawMessage) *EvaluatorProfile {
 	profileID := strings.TrimSpace(evaluatorID)
 	evaluatorID = strings.ToLower(profileID)
@@ -499,6 +611,11 @@ func BuildEvaluatorProfile(evaluatorID string, evaluatorModel string, metadata j
 	judge := &EvaluatorJudgeConfig{Type: "llm_judge", When: "checks_pass"}
 	if model := strings.TrimSpace(evaluatorModel); model != "" {
 		judge.Model = model
+	}
+	if payload := judgePromptConfigFromConfig(metadata); payload != nil {
+		if merged, err := mergeJudgePromptConfig(judge.Config, payload); err == nil {
+			judge.Config = merged
+		}
 	}
 	switch evaluatorID {
 	case "landing_page_v1", "vue_landing_page_v1":

@@ -238,6 +238,163 @@ func TestExportTrainingPackagePreservesEvaluatorConfigNumberFidelity(t *testing.
 	}
 }
 
+func TestExportTrainingPackageCarriesJudgePromptTemplates(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	template := testTemplate("designer", "Design carefully.")
+	if err := store.UpsertAgentTemplate(ctx, template); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	installed, err := store.GetAgentTemplate(ctx, "designer")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	if err := store.UpsertEvalRun(ctx, db.EvalRun{
+		ID:                "judge-prompt-run",
+		TemplateID:        "designer",
+		TemplateVersionID: installed.VersionID,
+		TargetRepo:        "owner/repo",
+		State:             "review",
+		MetadataJSON: `{"evaluation":{"evaluator_id":"landing_page_v1","evaluator_model":"gpt-evaluator",` +
+			`"judge_prompt_version":"jp-2",` +
+			`"judge_prompt_templates":{"vue_landing_page":"Judge the landing page.","generic":"Judge the artifact."}}}`,
+	}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+
+	pkg, err := ExportTrainingPackage(ctx, store, "judge-prompt-run")
+	if err != nil {
+		t.Fatalf("ExportTrainingPackage returned error: %v", err)
+	}
+	if pkg.EvaluatorProfile == nil || pkg.EvaluatorProfile.Judge == nil {
+		t.Fatalf("evaluator profile/judge missing: %+v", pkg.EvaluatorProfile)
+	}
+
+	assertJudgePrompt := func(t *testing.T, judge *EvaluatorJudgeConfig) {
+		t.Helper()
+		payload := judge.JudgePromptConfig()
+		if payload == nil {
+			t.Fatalf("judge prompt config missing; judge.Config = %s", string(judge.Config))
+		}
+		if payload.JudgePromptVersion != "jp-2" {
+			t.Fatalf("judge_prompt_version = %q, want jp-2", payload.JudgePromptVersion)
+		}
+		if len(payload.JudgePromptTemplates) != 2 ||
+			payload.JudgePromptTemplates["vue_landing_page"] != "Judge the landing page." ||
+			payload.JudgePromptTemplates["generic"] != "Judge the artifact." {
+			t.Fatalf("judge_prompt_templates = %+v", payload.JudgePromptTemplates)
+		}
+	}
+	assertJudgePrompt(t, pkg.EvaluatorProfile.Judge)
+
+	// The fields must survive a JSON round-trip (export → marshal → unmarshal),
+	// which is the boundary the Python judge reads across.
+	encoded, err := json.Marshal(pkg)
+	if err != nil {
+		t.Fatalf("marshal package: %v", err)
+	}
+	var decoded TrainingPackage
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal package: %v", err)
+	}
+	if decoded.EvaluatorProfile == nil || decoded.EvaluatorProfile.Judge == nil {
+		t.Fatalf("decoded evaluator profile/judge missing: %+v", decoded.EvaluatorProfile)
+	}
+	assertJudgePrompt(t, decoded.EvaluatorProfile.Judge)
+
+	// The Python side reads it at evaluator_profile.judge.config.* — verify the
+	// on-wire JSON path is exactly that.
+	if !strings.Contains(string(decoded.EvaluatorProfile.Judge.Config), `"judge_prompt_version":"jp-2"`) {
+		t.Fatalf("judge.config did not carry judge_prompt_version on the wire: %s", string(decoded.EvaluatorProfile.Judge.Config))
+	}
+
+	// The raw evaluator config also passes through unchanged.
+	if !strings.Contains(string(decoded.EvaluatorConfig), `"judge_prompt_version":"jp-2"`) ||
+		!strings.Contains(string(decoded.EvaluatorConfig), `"vue_landing_page":"Judge the landing page."`) {
+		t.Fatalf("evaluator_config did not carry judge prompt fields: %s", string(decoded.EvaluatorConfig))
+	}
+}
+
+func TestExportTrainingPackageJudgePromptTemplatesAbsentIsBackwardCompatible(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	template := testTemplate("designer", "Design carefully.")
+	if err := store.UpsertAgentTemplate(ctx, template); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	installed, err := store.GetAgentTemplate(ctx, "designer")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	if err := store.UpsertEvalRun(ctx, db.EvalRun{
+		ID:                "no-judge-prompt-run",
+		TemplateID:        "designer",
+		TemplateVersionID: installed.VersionID,
+		TargetRepo:        "owner/repo",
+		State:             "review",
+		MetadataJSON:      `{"evaluation":{"evaluator_id":"landing_page_v1","evaluator_model":"gpt-evaluator"}}`,
+	}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+
+	pkg, err := ExportTrainingPackage(ctx, store, "no-judge-prompt-run")
+	if err != nil {
+		t.Fatalf("ExportTrainingPackage returned error: %v", err)
+	}
+	if pkg.EvaluatorProfile == nil || pkg.EvaluatorProfile.Judge == nil {
+		t.Fatalf("evaluator profile/judge missing: %+v", pkg.EvaluatorProfile)
+	}
+	// Absent fields must not synthesize a judge prompt payload and must not add
+	// a judge config object to the wire format.
+	if payload := pkg.EvaluatorProfile.Judge.JudgePromptConfig(); payload != nil {
+		t.Fatalf("expected no judge prompt config, got %+v", payload)
+	}
+	if len(strings.TrimSpace(string(pkg.EvaluatorProfile.Judge.Config))) != 0 {
+		t.Fatalf("judge config should be empty when absent, got %s", string(pkg.EvaluatorProfile.Judge.Config))
+	}
+	encoded, err := json.Marshal(pkg)
+	if err != nil {
+		t.Fatalf("marshal package: %v", err)
+	}
+	if strings.Contains(string(encoded), "judge_prompt_templates") || strings.Contains(string(encoded), "judge_prompt_version") {
+		t.Fatalf("absent judge prompt fields leaked into package JSON: %s", string(encoded))
+	}
+}
+
+func TestEvaluatorJudgeConfigJudgePromptConfigIgnoresMalformedShapes(t *testing.T) {
+	tests := map[string]string{
+		"templates not an object":      `{"judge_prompt_templates":["a","b"]}`,
+		"templates values not strings": `{"judge_prompt_templates":{"vue":1}}`,
+		"version not a string":         `{"judge_prompt_version":42}`,
+		"config not an object":         `"just a string"`,
+		"empty templates object":       `{"judge_prompt_templates":{}}`,
+		"unrelated keys only":          `{"something_else":true}`,
+	}
+	for name, config := range tests {
+		t.Run(name, func(t *testing.T) {
+			judge := &EvaluatorJudgeConfig{Config: json.RawMessage(config)}
+			if payload := judge.JudgePromptConfig(); payload != nil {
+				t.Fatalf("malformed config %q should be ignored, got %+v", config, payload)
+			}
+		})
+	}
+	// A valid version alongside a malformed templates map still yields the
+	// version (the malformed half is dropped, not fatal).
+	judge := &EvaluatorJudgeConfig{Config: json.RawMessage(`{"judge_prompt_version":"jp-3","judge_prompt_templates":[1,2]}`)}
+	payload := judge.JudgePromptConfig()
+	if payload == nil || payload.JudgePromptVersion != "jp-3" || len(payload.JudgePromptTemplates) != 0 {
+		t.Fatalf("expected version-only payload, got %+v", payload)
+	}
+}
+
 func TestExportTrainingPackageBuildsEvaluatorProfileFromMetadata(t *testing.T) {
 	ctx := context.Background()
 	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
