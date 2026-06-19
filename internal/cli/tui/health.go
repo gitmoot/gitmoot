@@ -63,16 +63,51 @@ func (m Model) healthContent() string {
 	case len(m.healthChecks) == 0:
 		b.WriteString(mutedStyle.Render("no checks") + "\n")
 	default:
-		checkRows := [][]string{{"CHECK", "STATUS", "DETAIL"}}
-		for _, check := range m.healthChecks {
-			checkRows = append(checkRows, []string{check.Name, healthStatusColor(check.Status), truncate(dash(check.Detail), 70)})
-		}
-		b.WriteString(renderRows(checkRows))
+		b.WriteString(renderHealthChecks(m.healthChecks))
 	}
 
 	b.WriteByte('\n')
 	b.WriteString(mutedStyle.Render("r re-run checks · s start daemon"))
 	b.WriteByte('\n')
+	return b.String()
+}
+
+// renderHealthChecks renders the global checks (Scope == "") as one table, then
+// a labelled table per repo scope, in first-seen order. This keeps the global
+// block visible once and groups the per-repo rows under each repo.
+func renderHealthChecks(checks []HealthCheck) string {
+	var b strings.Builder
+	global := make([]HealthCheck, 0, len(checks))
+	scopeOrder := []string{}
+	byScope := map[string][]HealthCheck{}
+	for _, c := range checks {
+		if c.Scope == "" {
+			global = append(global, c)
+			continue
+		}
+		if _, seen := byScope[c.Scope]; !seen {
+			scopeOrder = append(scopeOrder, c.Scope)
+		}
+		byScope[c.Scope] = append(byScope[c.Scope], c)
+	}
+
+	writeTable := func(group []HealthCheck) {
+		rows := [][]string{{"CHECK", "STATUS", "DETAIL"}}
+		for _, check := range group {
+			rows = append(rows, []string{check.Name, healthStatusColor(check.Status), truncate(dash(check.Detail), 70)})
+		}
+		b.WriteString(renderRows(rows))
+	}
+
+	if len(global) > 0 {
+		writeTable(global)
+	}
+	for _, scope := range scopeOrder {
+		b.WriteByte('\n')
+		b.WriteString(headerStyle.Render(scope))
+		b.WriteByte('\n')
+		writeTable(byScope[scope])
+	}
 	return b.String()
 }
 
