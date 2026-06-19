@@ -1191,3 +1191,41 @@ func TestTemplateMetadataSynthesizedForLegacyEmptyRows(t *testing.T) {
 		t.Fatal("corrupt metadata must still error")
 	}
 }
+
+func TestEvaluatorScoreJudgePromptFieldsRoundTrip(t *testing.T) {
+	score := EvaluatorScore{
+		ProfileID:          "judge-default",
+		JudgePromptVersion: "2026-06-19.1",
+		JudgeEvaluatorID:   "evaluator-abc",
+		JudgePromptHash:    "sha256:deadbeef",
+	}
+	encoded, err := json.Marshal(score)
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+	var decoded EvaluatorScore
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if decoded.JudgePromptVersion != score.JudgePromptVersion {
+		t.Errorf("JudgePromptVersion = %q, want %q", decoded.JudgePromptVersion, score.JudgePromptVersion)
+	}
+	if decoded.JudgeEvaluatorID != score.JudgeEvaluatorID {
+		t.Errorf("JudgeEvaluatorID = %q, want %q", decoded.JudgeEvaluatorID, score.JudgeEvaluatorID)
+	}
+	if decoded.JudgePromptHash != score.JudgePromptHash {
+		t.Errorf("JudgePromptHash = %q, want %q", decoded.JudgePromptHash, score.JudgePromptHash)
+	}
+}
+
+func TestEvaluatorScoreJudgePromptFieldsOmitEmpty(t *testing.T) {
+	encoded, err := json.Marshal(EvaluatorScore{ProfileID: "judge-default"})
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+	for _, field := range []string{"judge_prompt_version", "judge_evaluator_id", "judge_prompt_hash"} {
+		if strings.Contains(string(encoded), field) {
+			t.Errorf("empty EvaluatorScore must omit %q, got %s", field, encoded)
+		}
+	}
+}

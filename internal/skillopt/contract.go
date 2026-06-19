@@ -139,6 +139,9 @@ type EvaluatorScore struct {
 	GateRejection          *GateRejectionPacket    `json:"gate_rejection,omitempty"`
 	StageStatus            []EvaluatorStageStatus  `json:"stage_status,omitempty"`
 	Metadata               json.RawMessage         `json:"metadata,omitempty"`
+	JudgePromptVersion     string                  `json:"judge_prompt_version,omitempty"`
+	JudgeEvaluatorID       string                  `json:"judge_evaluator_id,omitempty"`
+	JudgePromptHash        string                  `json:"judge_prompt_hash,omitempty"`
 }
 
 type EvalRun struct {
