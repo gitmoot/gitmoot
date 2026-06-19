@@ -218,6 +218,20 @@ Ask it from a PR comment:
 /gitmoot thermo-review review
 ```
 
+### Coordinator Recipes
+
+Coordinator recipes are built-in templates that turn the Orchestra pattern into
+one command. Each runs a coordinator that fans work out to ephemeral workers (no
+pre-registration) and reconvenes them in a single continuation. `review-panel`
+convenes a panel of diverse-lens reviewers over a PR and synthesizes one verdict;
+`decompose-and-verify` splits an implementation task into parallel, file-disjoint
+legs and runs a verify step that depends on all of them.
+
+```sh
+gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
+gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
+```
+
 ### Custom Prompt Agents
 
 Custom agent templates let you keep a local template file and bind its
@@ -735,6 +749,19 @@ gitmoot agent start thermo-review \
   --repo owner/repo \
   --template thermo-nuclear-code-quality-review \
   --start-daemon
+```
+
+Coordinator recipes are built-in templates for the Orchestra pattern: a
+coordinator that fans work out to ephemeral workers (no pre-registration) and
+reconvenes them in one continuation. `review-panel` convenes a panel of
+diverse-lens reviewers over a PR and synthesizes their verdict;
+`decompose-and-verify` splits an implementation task into parallel file-disjoint
+legs and runs a verify step that depends on all of them. Run them with
+`gitmoot orchestrate`:
+
+```sh
+gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
+gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
 ```
 
 Create a local custom prompt template:
@@ -5443,6 +5470,15 @@ gitmoot orchestrate project-planner "Plan and split this work across agents." --
 gitmoot orchestrate project-planner "Plan and split this work." --repo owner/repo --model gpt-5-codex
 ```
 
+The built-in coordinator recipes `review-panel` and `decompose-and-verify` are
+orchestrate-ready: each runs a coordinator that fans work out to ephemeral
+workers and reconvenes them in a continuation, with no agent pre-registration:
+
+```sh
+gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
+gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
+```
+
 `gitmoot orchestrate <agent> "..." [--repo R]` is sugar for
 `gitmoot agent run <agent> --background "..."`. It starts a conductor
 (coordinator) that returns a `delegations[]` score; the players (child agents)
@@ -5496,6 +5532,18 @@ gitmoot agent start project-planner \
   --path . \
   --template planner \
   --start-daemon
+```
+
+Install or refresh the built-in coordinator recipe templates. These are
+coordinator prompts for the Orchestra pattern, run with `gitmoot orchestrate`
+rather than started as long-lived agents:
+
+```sh
+gitmoot agent template update review-panel
+gitmoot agent template update decompose-and-verify
+gitmoot agent template show review-panel
+gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
+gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
 ```
 
 For fast current-chat planning, use the Gitmoot skill with the same packaged
@@ -6212,6 +6260,47 @@ Each child job carries job-tree linkage fields — `parent_job_id`,
 can be traced back to its parent, its originating delegation, and the root of the
 tree. See `RESULT_CONTRACT.md` for the full delegation field reference.
 
+## Coordinator Recipes
+
+Coordinator recipes are built-in agent templates that turn the Orchestra pattern
+into one-command workflows. Each recipe is a coordinator prompt that emits a
+`delegations[]` of **ephemeral** workers (no pre-registration), runs them in the
+daemon, then reconvenes their results in a single continuation. Start one with
+`gitmoot orchestrate <recipe-id> "..." --repo owner/repo`; the daemon runs the
+coordinator in the background and dispatches its delegations.
+
+Two recipes ship built in:
+
+- **`review-panel`** — fans a PR or change out to a panel of ephemeral reviewers,
+  each with a different lens (correctness and security; performance and
+  maintainability; tests and edge cases), then synthesizes their findings into
+  one verdict. The panelists are dep-free, so they review in parallel, each with
+  a self-contained lens prompt across mixed runtimes so the panel does not share
+  one model's blind spots (point a panelist at an installed review template such
+  as `thermo-nuclear-code-quality-review` only if you want).
+- **`decompose-and-verify`** — decomposes one implementation task into
+  file-disjoint subtasks, fans them out to ephemeral implementation workers that
+  build in parallel in their own branch worktrees, then runs a single `review`
+  verify step that `deps` on every implementation leg before reporting back.
+
+```sh
+gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
+gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
+```
+
+The panelists in `review-panel` and every implementation and verify leg in
+`decompose-and-verify` are **ephemeral** workers: Gitmoot creates each from the
+delegation's `ephemeral` spec, runs it, and disposes of it once the child job
+finishes. Ephemeral workers are leaf-only — they return findings, never their own
+delegations — so a recipe's fan-out is exactly one level deep. In both recipes the
+delegations never set `agent`, because `agent` and `ephemeral` are mutually
+exclusive. Once every leg is terminal, Gitmoot enqueues one continuation back to
+the coordinator to merge the results (the panel verdict, or the verify gate plus
+the merged changes). Inspect the run under `gitmoot job list --repo owner/repo`
+and the `delegation_enqueued` events in `gitmoot events --repo owner/repo`. See
+`RESULT_CONTRACT.md` for the `ephemeral` field reference and the termination
+bounds these recipes run inside.
+
 ---
 
 # Source: skills/gitmoot/references/TEMPLATE_CAPTURE.md
@@ -6519,10 +6608,26 @@ Delegation fields:
   pre-registration and no cleanup (e.g. N workers each producing one result, or a
   cheap gate plus a strong verifier with per-worker models).
 
+### Validation errors
+
+Each required-field failure is reported per entry as
+`delegations[<index>] (id "<id>"): <field> is required`, where `<index>` is the
+0-based position in `delegations[]` and `<id>` is the delegation's id (or
+`<missing>` when blank). All offending fields across the batch are reported
+together — not just the first — and the coordinator gets one repair retry to fix
+them all in a single round.
+
 A delegation with no `deps` dispatches immediately and runs in parallel with
 other dep-free siblings. Once every top-level delegation reaches a terminal
 state, Gitmoot enqueues exactly one coordinator "continuation" job — back to
 the delegating agent — to synthesize the children's results.
+
+Sibling children that share the repo run in isolated git worktrees so they do
+not serialize on the shared checkout: `implement` children each get their own
+branch worktree, and when a coordinator fans out **two or more read-only**
+(`ask`/`review`) children, each gets a throwaway detached worktree (no branch).
+The worktrees are disposed automatically when each child finishes. This is
+internal scheduling — coordinators do not request it.
 
 Each child job carries `parent_job_id`, `delegation_id`, `root_job_id`,
 `delegation_depth`, and `task_id`, so a child can be traced to its parent, its

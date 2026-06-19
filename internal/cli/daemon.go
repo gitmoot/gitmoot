@@ -2974,6 +2974,17 @@ func (w jobWorker) validateTargetCheckout(ctx context.Context, payload workflow.
 	}
 	expectedHead := strings.TrimSpace(payload.HeadSHA)
 	if expectedHead == "" {
+		// A delegation child can inherit an empty HeadSHA from a coordinator that
+		// has no PR context (a local `gitmoot orchestrate`). It is gitmoot-dispatched
+		// against the registered checkout, so run it against the current HEAD rather
+		// than failing — e.g. a decompose-and-verify verify step, or any read-only
+		// follow-up delegation. Implement children always run in a per-delegation
+		// worktree (handled above), so only non-mutating shared-checkout delegation
+		// children reach here. Non-delegation jobs (PR comments) still require a
+		// HeadSHA.
+		if strings.TrimSpace(payload.DelegationID) != "" {
+			return nil
+		}
 		return fmt.Errorf("job for %s has no head SHA", payload.Branch)
 	}
 	head, err := git.HeadSHA(ctx)

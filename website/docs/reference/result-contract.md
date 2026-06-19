@@ -158,6 +158,16 @@ Each required-field failure is reported per entry as
 together — not just the first — and the coordinator gets one repair retry to fix
 them all in a single round.
 
+:::tip Built-in coordinator recipes
+You do not have to author the `ephemeral` fan-out by hand. The built-in
+**coordinator recipes** `review-panel` and `decompose-and-verify` are templates
+that emit a ready-made ephemeral `delegations[]` for you — a diverse-lens review
+panel, or parallel implementation legs plus a verify gate. Run them with
+`gitmoot orchestrate review-panel "..."` /
+`gitmoot orchestrate decompose-and-verify "..."`. See the
+[Coordinator Recipes Workflow](../workflows/coordinator-recipes-workflow.md).
+:::
+
 ### How delegations run
 
 A delegation with no `deps` is dispatched immediately and runs in parallel with

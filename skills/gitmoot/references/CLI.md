@@ -250,6 +250,15 @@ gitmoot orchestrate project-planner "Plan and split this work across agents." --
 gitmoot orchestrate project-planner "Plan and split this work." --repo owner/repo --model gpt-5-codex
 ```
 
+The built-in coordinator recipes `review-panel` and `decompose-and-verify` are
+orchestrate-ready: each runs a coordinator that fans work out to ephemeral
+workers and reconvenes them in a continuation, with no agent pre-registration:
+
+```sh
+gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
+gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
+```
+
 `gitmoot orchestrate <agent> "..." [--repo R]` is sugar for
 `gitmoot agent run <agent> --background "..."`. It starts a conductor
 (coordinator) that returns a `delegations[]` score; the players (child agents)
@@ -303,6 +312,18 @@ gitmoot agent start project-planner \
   --path . \
   --template planner \
   --start-daemon
+```
+
+Install or refresh the built-in coordinator recipe templates. These are
+coordinator prompts for the Orchestra pattern, run with `gitmoot orchestrate`
+rather than started as long-lived agents:
+
+```sh
+gitmoot agent template update review-panel
+gitmoot agent template update decompose-and-verify
+gitmoot agent template show review-panel
+gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
+gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
 ```
 
 For fast current-chat planning, use the Gitmoot skill with the same packaged

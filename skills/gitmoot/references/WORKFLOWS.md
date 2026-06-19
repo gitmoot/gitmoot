@@ -459,3 +459,44 @@ Each child job carries job-tree linkage fields — `parent_job_id`,
 `delegation_id`, `root_job_id`, `delegation_depth`, and `task_id` — so a child
 can be traced back to its parent, its originating delegation, and the root of the
 tree. See `RESULT_CONTRACT.md` for the full delegation field reference.
+
+## Coordinator Recipes
+
+Coordinator recipes are built-in agent templates that turn the Orchestra pattern
+into one-command workflows. Each recipe is a coordinator prompt that emits a
+`delegations[]` of **ephemeral** workers (no pre-registration), runs them in the
+daemon, then reconvenes their results in a single continuation. Start one with
+`gitmoot orchestrate <recipe-id> "..." --repo owner/repo`; the daemon runs the
+coordinator in the background and dispatches its delegations.
+
+Two recipes ship built in:
+
+- **`review-panel`** — fans a PR or change out to a panel of ephemeral reviewers,
+  each with a different lens (correctness and security; performance and
+  maintainability; tests and edge cases), then synthesizes their findings into
+  one verdict. The panelists are dep-free, so they review in parallel, each with
+  a self-contained lens prompt across mixed runtimes so the panel does not share
+  one model's blind spots (point a panelist at an installed review template such
+  as `thermo-nuclear-code-quality-review` only if you want).
+- **`decompose-and-verify`** — decomposes one implementation task into
+  file-disjoint subtasks, fans them out to ephemeral implementation workers that
+  build in parallel in their own branch worktrees, then runs a single `review`
+  verify step that `deps` on every implementation leg before reporting back.
+
+```sh
+gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
+gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
+```
+
+The panelists in `review-panel` and every implementation and verify leg in
+`decompose-and-verify` are **ephemeral** workers: Gitmoot creates each from the
+delegation's `ephemeral` spec, runs it, and disposes of it once the child job
+finishes. Ephemeral workers are leaf-only — they return findings, never their own
+delegations — so a recipe's fan-out is exactly one level deep. In both recipes the
+delegations never set `agent`, because `agent` and `ephemeral` are mutually
+exclusive. Once every leg is terminal, Gitmoot enqueues one continuation back to
+the coordinator to merge the results (the panel verdict, or the verify gate plus
+the merged changes). Inspect the run under `gitmoot job list --repo owner/repo`
+and the `delegation_enqueued` events in `gitmoot events --repo owner/repo`. See
+`RESULT_CONTRACT.md` for the `ephemeral` field reference and the termination
+bounds these recipes run inside.

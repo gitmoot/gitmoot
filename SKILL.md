@@ -226,6 +226,19 @@ gitmoot agent start thermo-review \
   --start-daemon
 ```
 
+Coordinator recipes are built-in templates for the Orchestra pattern: a
+coordinator that fans work out to ephemeral workers (no pre-registration) and
+reconvenes them in one continuation. `review-panel` convenes a panel of
+diverse-lens reviewers over a PR and synthesizes their verdict;
+`decompose-and-verify` splits an implementation task into parallel file-disjoint
+legs and runs a verify step that depends on all of them. Run them with
+`gitmoot orchestrate`:
+
+```sh
+gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
+gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
+```
+
 Create a local custom prompt template:
 
 ```sh

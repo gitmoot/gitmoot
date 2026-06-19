@@ -2455,6 +2455,32 @@ func TestValidateTargetCheckoutAcceptsDetachedReadOnlyWorktreeChild(t *testing.T
 	}
 }
 
+func TestValidateTargetCheckoutAllowsSharedCheckoutDelegationChildWithoutHeadSHA(t *testing.T) {
+	// A read-only delegation child from a local orchestrate (no PR) inherits an
+	// empty HeadSHA and runs in the shared checkout (no per-delegation worktree).
+	// It must be accepted and run against the current HEAD, not rejected for a
+	// missing HeadSHA. A non-delegation job with no HeadSHA is still rejected.
+	ctx := context.Background()
+	checkout := createDaemonWorkerGitCheckout(t, "task-005")
+	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard)
+
+	delegationChild := workflow.JobPayload{
+		Repo:         "owner/repo",
+		Branch:       "task-005",
+		DelegationID: "verify-1",
+		ParentJobID:  "parent-job",
+		// no WorktreePath (shared checkout), no HeadSHA (PR-less local orchestrate)
+	}
+	if err := worker.validateTargetCheckout(ctx, delegationChild, checkout); err != nil {
+		t.Fatalf("validateTargetCheckout rejected shared-checkout delegation child without HeadSHA: %v", err)
+	}
+
+	nonDelegation := workflow.JobPayload{Repo: "owner/repo", Branch: "task-005"}
+	if err := worker.validateTargetCheckout(ctx, nonDelegation, checkout); err == nil {
+		t.Fatal("validateTargetCheckout accepted a non-delegation job with no HeadSHA")
+	}
+}
+
 func TestRefreshDaemonJobPayloadPreservesTaskWorktreeHeadForFinalizer(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
