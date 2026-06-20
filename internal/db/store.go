@@ -4703,7 +4703,9 @@ func skillOptJudgeDirection(humanPromoted bool, judgeAccept bool) string {
 //     "pass"/"passed"/"promote"/"ok"/"accept"/"approved" => accept,
 //     "fail"/"failed"/"reject"/"rejected" => reject (other statuses like
 //     "not_run" are inconclusive and skipped);
-//  4. fall back to the soft score: soft >= 0.5 => accept.
+//  4. fall back to a soft/selection score — "soft", or the landing-page
+//     profile's "best_selection_soft"/"best_selection_hard" — first present
+//     wins: score >= 0.5 => accept.
 //
 // hasSignal reports whether any of the above produced a verdict. When it is
 // false (missing/empty/unrecognized report), callers should SKIP recording the
@@ -4753,10 +4755,16 @@ func skillOptJudgeAcceptFromReport(evalReportJSON string) (accept bool, hasSigna
 			return false, true, promptVersion, evaluatorID, promptHash
 		}
 	}
-	// 4) soft-score fallback.
+	// 4) soft/selection-score fallback. Real optimizer reports vary by evaluator
+	// profile: the generic profile sets a top-level "promotable" (handled above);
+	// the landing-page profile instead reports the best candidate's selection-gate
+	// scores ("best_selection_soft"/"best_selection_hard") with no "promotable".
+	// Treat the first such score present as the judge's confidence: >= 0.5 => accept.
 	for _, source := range sources {
-		if soft, ok := skillOptJudgeFloat(source["soft"]); ok {
-			return soft >= 0.5, true, promptVersion, evaluatorID, promptHash
+		for _, key := range []string{"soft", "best_selection_soft", "best_selection_hard"} {
+			if score, ok := skillOptJudgeFloat(source[key]); ok {
+				return score >= 0.5, true, promptVersion, evaluatorID, promptHash
+			}
 		}
 	}
 	return false, false, promptVersion, evaluatorID, promptHash

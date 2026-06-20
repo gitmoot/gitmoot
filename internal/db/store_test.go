@@ -2948,6 +2948,23 @@ func TestDecideSkillOptTrainCandidateCapturesJudgeOutcome(t *testing.T) {
 			reason:        "style mismatch",
 			wantDirection: SkillOptJudgeDirectionJudgeAcceptHumanReject,
 		},
+		{
+			// Real landing-page profile shape (no "promotable"): judge-accept is
+			// derived from best_selection_soft. Promote => agree.
+			name:          "landing-page promote agrees via best_selection_soft",
+			evalReport:    `{"best_selection_hard":1.0,"best_selection_soft":0.88,"best_step":1,"dry_run":false}`,
+			decision:      "promoted",
+			wantDirection: SkillOptJudgeDirectionAgreeAccept,
+		},
+		{
+			// Real landing-page shape the gate scored well but the human rejected:
+			// the false-positive calibration signal we most want to capture.
+			name:          "landing-page reject captures judge over-score",
+			evalReport:    `{"best_selection_hard":0.9,"best_selection_soft":0.86,"best_step":2}`,
+			decision:      "rejected",
+			reason:        "off-brand",
+			wantDirection: SkillOptJudgeDirectionJudgeAcceptHumanReject,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3016,6 +3033,35 @@ func TestDecideSkillOptTrainCandidateSkipsCaptureWithoutJudgeSignal(t *testing.T
 			t.Fatalf("report %q: captured %d outcomes, want 0 (no judge signal)", report, len(outcomes))
 		}
 		store.Close()
+	}
+}
+
+func TestSkillOptJudgeAcceptFromRealReportShapes(t *testing.T) {
+	// Shapes taken from real optimizer eval reports in the wild (not synthetic):
+	// the generic profile sets top-level "promotable"; the landing-page profile
+	// instead reports "best_selection_soft"/"best_selection_hard" with no
+	// "promotable". Both must yield a signal so the decision is captured.
+	cases := []struct {
+		name       string
+		report     string
+		wantAccept bool
+		wantSignal bool
+	}{
+		{"generic promotable true", `{"promotable":true,"best_selection_soft":0.88}`, true, true},
+		{"generic promotable false", `{"promotable":false,"best_selection_soft":0.88}`, false, true},
+		{"landing-page best_selection_soft high", `{"best_selection_hard":1.0,"best_selection_soft":0.88,"best_step":1,"dry_run":false}`, true, true},
+		{"landing-page best_selection_soft low", `{"best_selection_hard":0.0,"best_selection_soft":0.2,"best_step":0}`, false, true},
+		{"landing-page hard only", `{"best_selection_hard":0.9,"best_step":1}`, true, true},
+		{"no signal", `{"best_step":0,"dry_run":true}`, false, false},
+	}
+	for _, tc := range cases {
+		accept, hasSignal, _, _, _ := skillOptJudgeAcceptFromReport(tc.report)
+		if hasSignal != tc.wantSignal {
+			t.Fatalf("%s: hasSignal=%v want %v (report=%s)", tc.name, hasSignal, tc.wantSignal, tc.report)
+		}
+		if hasSignal && accept != tc.wantAccept {
+			t.Fatalf("%s: accept=%v want %v", tc.name, accept, tc.wantAccept)
+		}
 	}
 }
 
