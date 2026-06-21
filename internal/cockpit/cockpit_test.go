@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/runtime"
 )
@@ -133,7 +134,18 @@ func (s *fakeStore) ListCockpitPanesByRoot(_ context.Context, rootJobID string) 
 func (s *fakeStore) DeleteCockpitPane(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.panes, id)
+	for jobID, p := range s.panes {
+		if p.ID == id {
+			delete(s.panes, jobID)
+		}
+	}
+	return nil
+}
+
+func (s *fakeStore) DeleteCockpitPaneByJob(_ context.Context, jobID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.panes, jobID)
 	return nil
 }
 
@@ -215,6 +227,43 @@ func TestAvailable(t *testing.T) {
 	})
 }
 
+func TestAvailableMemoizesWithinTTL(t *testing.T) {
+	fr := newFakeRunner()
+	c := newWithRunner(Options{}, newFakeStore(), fr.run, okLookPath)
+	now := time.Unix(0, 0)
+	c.now = func() time.Time { return now }
+
+	statusCalls := func() int {
+		n := 0
+		for _, v := range fr.verbs() {
+			if v == "status" {
+				n++
+			}
+		}
+		return n
+	}
+
+	// First call probes; subsequent calls within the TTL reuse the cache.
+	if !c.Available(context.Background()) {
+		t.Fatal("expected available")
+	}
+	if !c.Available(context.Background()) || !c.Available(context.Background()) {
+		t.Fatal("expected available (cached)")
+	}
+	if got := statusCalls(); got != 1 {
+		t.Fatalf("status shell-outs within TTL = %d, want 1", got)
+	}
+
+	// Past the TTL, the cache expires and the probe runs again.
+	now = now.Add(availableTTL + time.Second)
+	if !c.Available(context.Background()) {
+		t.Fatal("expected available after TTL")
+	}
+	if got := statusCalls(); got != 2 {
+		t.Fatalf("status shell-outs after TTL = %d, want 2", got)
+	}
+}
+
 func TestWrapUnavailableReturnsInnerUntouched(t *testing.T) {
 	fr := newFakeRunner()
 	c := newWithRunner(Options{}, newFakeStore(), fr.run, failLookPath)
@@ -288,6 +337,32 @@ func TestWrapDeliverCommandSequence(t *testing.T) {
 	}
 	if store.createN != 1 {
 		t.Fatalf("expected workspace created once, got %d", store.createN)
+	}
+}
+
+func TestWrapDeliverDeletesPaneRowByJobOnClose(t *testing.T) {
+	// close() must remove the pane row keyed by job id so it does not orphan and
+	// a re-run of the same job can reclaim its (workspace_id, pane_key) slot.
+	fr := newFakeRunner()
+	store := newFakeStore()
+	c := newWithRunner(Options{}, store, fr.run, okLookPath)
+	inner := &fakeInner{result: runtime.Result{Summary: "ok"}}
+
+	adapter := c.Wrap(inner, sampleMeta())
+	if _, err := adapter.Deliver(context.Background(), runtime.Agent{}, runtime.Job{ID: "abcdef0123456789"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := store.GetCockpitPaneByJob(context.Background(), "abcdef0123456789"); err == nil {
+		t.Fatal("expected pane row deleted by job on close")
+	}
+
+	// A re-run of the same job re-inserts and again deletes — no leaked row.
+	adapter2 := c.Wrap(&fakeInner{}, sampleMeta())
+	if _, err := adapter2.Deliver(context.Background(), runtime.Agent{}, runtime.Job{ID: "abcdef0123456789"}); err != nil {
+		t.Fatalf("unexpected error on re-run: %v", err)
+	}
+	if _, err := store.GetCockpitPaneByJob(context.Background(), "abcdef0123456789"); err == nil {
+		t.Fatal("expected pane row deleted by job on close after re-run")
 	}
 }
 

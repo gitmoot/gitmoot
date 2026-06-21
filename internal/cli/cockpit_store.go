@@ -44,6 +44,10 @@ func (s cockpitPaneStore) DeleteCockpitPane(ctx context.Context, id string) erro
 	return s.store.DeleteCockpitPane(ctx, id)
 }
 
+func (s cockpitPaneStore) DeleteCockpitPaneByJob(ctx context.Context, jobID string) error {
+	return s.store.DeleteCockpitPaneByJob(ctx, jobID)
+}
+
 func (s cockpitPaneStore) GetOrCreateWorkspaceForRoot(ctx context.Context, rootJobID string, create func() (workspaceID string, err error)) (string, error) {
 	return s.store.GetOrCreateWorkspaceForRoot(ctx, rootJobID, create)
 }
