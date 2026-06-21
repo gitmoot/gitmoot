@@ -43,6 +43,34 @@ func (ExecRunner) LookPath(file string) (string, error) {
 	return exec.LookPath(file)
 }
 
+// TeeRunner adapts a stream-capable runner into a plain Runner that always tees
+// the child's stdout/stderr live to Out. Adapters call only .Run(); wrapping
+// the inner runner in a TeeRunner makes those same .Run() calls stream their
+// output into Out (a per-job log a pane tails) with ZERO adapter change. Inner
+// defaults to GroupRunner{}, so the process-group kill semantics the runtime
+// adapters rely on are preserved. A nil Out degrades to the inner's plain Run,
+// and the buffered Result returned is exactly the one RunStream produces — so
+// result capture, locks, and signals are unchanged. The tee is purely additive.
+type TeeRunner struct {
+	Inner StreamRunner
+	Out   io.Writer
+}
+
+func (t TeeRunner) inner() StreamRunner {
+	if t.Inner != nil {
+		return t.Inner
+	}
+	return GroupRunner{}
+}
+
+func (t TeeRunner) Run(ctx context.Context, dir string, command string, args ...string) (Result, error) {
+	return t.inner().RunStream(ctx, dir, t.Out, command, args...)
+}
+
+func (t TeeRunner) LookPath(file string) (string, error) {
+	return t.inner().LookPath(file)
+}
+
 // SyncWriter serializes writes to w. Stream tees and any sibling writers
 // (e.g. a heartbeat ticker) sharing one destination should share one
 // SyncWriter, since destinations like bytes.Buffer are not safe for
@@ -108,7 +136,17 @@ func RunStream(ctx context.Context, dir string, out io.Writer, command string, a
 	}
 	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Dir = dir
+	return runStreamingCmd(cmd, out, command, args)
+}
 
+// runStreamingCmd wires line-teeing tee writers (sharing one SyncWriter so the
+// two pipes interleave safely) plus the buffered captures onto cmd, runs it, and
+// returns the same buffered Result Run/RunGroup produce. The cmd's run strategy
+// (plain context-cancel vs process-group) is the caller's choice: RunStream
+// passes a plain cmd; RunGroupStream wires the group cancel/sweep first. The
+// returned Result is byte-identical to the non-streaming runners' Result, so the
+// tee never changes result capture.
+func runStreamingCmd(cmd *exec.Cmd, out io.Writer, command string, args []string) (Result, error) {
 	tee := SyncWriter(out)
 	outLines := &lineWriter{out: tee}
 	errLines := &lineWriter{out: tee}
