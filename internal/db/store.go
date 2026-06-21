@@ -4707,7 +4707,7 @@ func (s *Store) GetCockpitPaneByKey(ctx context.Context, workspaceID, paneKey st
 // oldest first, so the cockpit can tear them all down on root finalize.
 func (s *Store) ListCockpitPanesByRoot(ctx context.Context, rootJobID string) ([]CockpitPane, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, job_id, pane_key, root_job_id, pane_id, workspace_id, source, created_at
-		FROM cockpit_panes WHERE root_job_id = ? ORDER BY created_at, id`, strings.TrimSpace(rootJobID))
+		FROM cockpit_panes WHERE root_job_id = ? ORDER BY created_at, rowid`, strings.TrimSpace(rootJobID))
 	if err != nil {
 		return nil, err
 	}
@@ -4728,7 +4728,7 @@ func (s *Store) ListCockpitPanesByRoot(ctx context.Context, rootJobID string) ([
 // root terminal) without scanning per-root.
 func (s *Store) ListAllCockpitPanes(ctx context.Context) ([]CockpitPane, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, job_id, pane_key, root_job_id, pane_id, workspace_id, source, created_at
-		FROM cockpit_panes ORDER BY created_at, id`)
+		FROM cockpit_panes ORDER BY created_at, rowid`)
 	if err != nil {
 		return nil, err
 	}
