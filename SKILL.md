@@ -5,7 +5,7 @@ version: 0.1.0
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
-  gitmoot-version: "0.1.0"
+  gitmoot-version: "0.4.0"
   source: "jerryfane/gitmoot"
   openclaw:
     requires:
@@ -107,7 +107,7 @@ continues:
 ```sh
 python3 -m pip install --user pipx
 python3 -m pipx ensurepath
-pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.2.0b1/gitmoot_skillopt-0.2.0b1-py3-none-any.whl
+pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.3.0/gitmoot_skillopt-0.3.0-py3-none-any.whl
 gitmoot-skillopt --version
 gitmoot-skillopt optimize --help
 ```

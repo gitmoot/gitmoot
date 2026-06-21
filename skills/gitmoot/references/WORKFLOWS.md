@@ -294,6 +294,15 @@ soft-score versus the human decision), and per-dimension disagreement — useful
 to tell whether the LLM judge is well-calibrated against human verdicts before
 you trust it to gate candidates.
 
+Those captured outcomes feed judge-prompt optimization. The contract carries a
+per-`task_kind` judge prompt
+(`evaluator_profile.judge.config.judge_prompt_templates[task_kind]` +
+`judge_prompt_version`), and gitmoot-skillopt v0.3.0 can tune it offline against
+held-out human verdicts with `gitmoot-skillopt optimize
+--judge-prompt-optimization --judge-human-labeled-path <labels.json>` — the
+freeze-and-alternate counterpart to skill optimization, accepting a candidate
+judge prompt only when it raises held-out human agreement.
+
 Run the deterministic smoke before changing train behavior:
 
 ```sh

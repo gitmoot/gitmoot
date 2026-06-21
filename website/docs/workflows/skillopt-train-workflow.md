@@ -421,7 +421,7 @@ recommended install path is:
 ```sh
 python3 -m pip install --user pipx
 python3 -m pipx ensurepath
-pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.2.0b1/gitmoot_skillopt-0.2.0b1-py3-none-any.whl
+pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.3.0/gitmoot_skillopt-0.3.0-py3-none-any.whl
 gitmoot-skillopt --version
 gitmoot-skillopt optimize --help
 ```
@@ -711,6 +711,30 @@ soft-score versus the human decision), and per-dimension disagreement. `--templa
 scopes the report to one template, and `--home` reads from a non-default Gitmoot
 home. Use it to decide whether the judge is well-calibrated enough to trust at
 the gate before relying on it for candidate decisions.
+
+### Optimizing the judge prompt
+
+The captured outcomes are the substrate for tuning the judge itself. The
+contract carries a per-`task_kind` judge prompt
+(`evaluator_profile.judge.config.judge_prompt_templates[task_kind]` +
+`judge_prompt_version`), and [gitmoot-skillopt
+v0.3.0](https://github.com/jerryfane/gitmoot-skillopt/releases/tag/v0.3.0) can
+optimize it offline against held-out human verdicts:
+
+```sh
+gitmoot-skillopt optimize \
+  --training-package training.json --artifact-root ~/.gitmoot/evals/blobs \
+  --out-root out/judge --candidate-output out/judge/judge_candidate.json \
+  --judge-prompt-optimization --judge-human-labeled-path held-out-labels.json \
+  --evaluator-backend codex --optimizer-backend codex
+```
+
+This is the freeze-and-alternate counterpart to skill optimization: it tunes the
+judge prompt (frozen skill) per `task_kind`, accepting a candidate only when it
+raises agreement with the held-out human-labeled set (the `human_agreement`
+gate). See the [judge-prompt optimization
+guide](https://github.com/jerryfane/gitmoot-skillopt/blob/main/docs/guide/judge-prompt-optimization.md)
+for the guardrails and cost/cadence discipline.
 
 ## Deterministic Smoke
 

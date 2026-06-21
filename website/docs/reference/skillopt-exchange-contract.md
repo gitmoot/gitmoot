@@ -61,7 +61,12 @@ The exported package has:
   `checks` (an ordered list of cheap artifact/render checks, each with `id`,
   `type`, `when`, `required`, and an optional `config`), `judge` (the LLM judge
   config: `type`, `when`, optional `model`, and optional `config`), and
-  `metadata` (the raw evaluator config the profile was derived from).
+  `metadata` (the raw evaluator config the profile was derived from). The
+  judge's `config` additively carries per-`task_kind` judge prompts under
+  `judge_prompt_templates[task_kind]` plus a `judge_prompt_version`, so a judge
+  prompt tuned by [judge-prompt
+  optimization](https://github.com/jerryfane/gitmoot-skillopt/blob/main/docs/guide/judge-prompt-optimization.md)
+  can be selected per task kind (no `contract_version` bump).
 
 Artifact package entries reference local SHA256 blobs stored under Gitmoot home.
 The export does not copy blobs into the repository by default.

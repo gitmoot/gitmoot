@@ -47,7 +47,11 @@ The exported package has:
 - `evaluator_config`: evaluator and run metadata used by the external
   optimizer. Top-level workflow mode is exported as `training_mode`, not as
   `evaluator_config.mode`; `evaluator_config.mode` is reserved for evaluator
-  implementation ids or drivers.
+  implementation ids or drivers. The judge config additively carries
+  per-`task_kind` judge prompts under `judge.config.judge_prompt_templates`
+  (with a `judge_prompt_version`), so a judge prompt tuned by gitmoot-skillopt's
+  judge-prompt optimization can be selected per task kind without a
+  `contract_version` bump.
 
 Artifact package entries reference local SHA256 blobs stored under Gitmoot home.
 The export does not copy blobs into the repository by default.

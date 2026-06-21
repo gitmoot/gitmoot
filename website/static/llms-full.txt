@@ -533,7 +533,7 @@ version: 0.1.0
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
-  gitmoot-version: "0.1.0"
+  gitmoot-version: "0.4.0"
   source: "jerryfane/gitmoot"
   openclaw:
     requires:
@@ -635,7 +635,7 @@ continues:
 ```sh
 python3 -m pip install --user pipx
 python3 -m pipx ensurepath
-pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.2.0b1/gitmoot_skillopt-0.2.0b1-py3-none-any.whl
+pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.3.0/gitmoot_skillopt-0.3.0-py3-none-any.whl
 gitmoot-skillopt --version
 gitmoot-skillopt optimize --help
 ```
@@ -2710,7 +2710,7 @@ recommended install path is:
 ```sh
 python3 -m pip install --user pipx
 python3 -m pipx ensurepath
-pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.2.0b1/gitmoot_skillopt-0.2.0b1-py3-none-any.whl
+pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.3.0/gitmoot_skillopt-0.3.0-py3-none-any.whl
 gitmoot-skillopt --version
 gitmoot-skillopt optimize --help
 ```
@@ -3129,7 +3129,11 @@ The exported package has:
 - `evaluator_config`: evaluator and run metadata used by the external
   optimizer. Top-level workflow mode is exported as `training_mode`, not as
   `evaluator_config.mode`; `evaluator_config.mode` is reserved for evaluator
-  implementation ids or drivers.
+  implementation ids or drivers. The judge config additively carries
+  per-`task_kind` judge prompts under `judge.config.judge_prompt_templates`
+  (with a `judge_prompt_version`), so a judge prompt tuned by gitmoot-skillopt's
+  judge-prompt optimization can be selected per task kind without a
+  `contract_version` bump.
 
 Artifact package entries reference local SHA256 blobs stored under Gitmoot home.
 The export does not copy blobs into the repository by default.
@@ -4896,6 +4900,66 @@ bug-report workflow added after the v0.3.0 dashboard beta.
 
 ---
 
+# Source: docs/release-notes/v0.4.0.md
+
+# Gitmoot v0.4.0
+
+First official (non-beta) release. Headlines the **SkillOpt evaluator-hardening**
+work (#345): Gitmoot now records how the LLM judge's accept/reject verdicts
+compare to the human's decision at the manual gate, reports calibration, and
+carries per-`task_kind` judge prompts in the contract — the substrate for tuning
+the judge against real human agreement.
+
+## Highlights
+
+### Judge↔human outcome capture + `judge-report`
+
+- Every candidate promote/reject at the manual gate records all four judge↔human
+  directions (`agree_accept`, `agree_reject`, `judge_accept_human_reject`,
+  `judge_reject_human_accept`) into a local `skillopt_judge_outcomes` table,
+  tagged with the judge prompt version, evaluator id, and prompt hash. Capture is
+  measurement-only and never overrides a decision; reports with no judge signal
+  are skipped.
+- `gitmoot skillopt judge-report [--template <id>]` renders a confusion matrix,
+  agreement rate, Cohen's κ, soft-score calibration bands, and per-dimension
+  disagreement.
+
+### Per-`task_kind` judge prompt in the contract
+
+- The exchange contract additively carries
+  `evaluator_profile.judge.config.judge_prompt_templates[task_kind]` and
+  `judge_prompt_version`, so a tuned judge prompt can be selected per task kind
+  (no `contract_version` bump).
+
+### Judge-prompt optimization (companion: gitmoot-skillopt v0.3.0)
+
+- The captured outcomes feed an **offline, frozen-and-alternated, per-`task_kind`
+  judge-prompt optimization** loop in
+  [gitmoot-skillopt v0.3.0](https://github.com/jerryfane/gitmoot-skillopt/releases/tag/v0.3.0)
+  (`optimize --judge-prompt-optimization`), gated on held-out human agreement.
+  On a real held-out set it lifted judge↔human agreement on the correctness task
+  kind from 0.33 → 0.67 (gate-accepted), with non-improving variants correctly
+  rejected. See the
+  [judge-prompt optimization guide](https://github.com/jerryfane/gitmoot-skillopt/blob/main/docs/guide/judge-prompt-optimization.md).
+
+## Validation
+
+- `go build` / `go vet` / `go test ./...` and the `-race` workflow suite are
+  green; the judge-outcome capture was validated end-to-end on a live Codex run
+  across all four directions.
+
+## Install / update
+
+```sh
+gitmoot update                                   # existing installs
+curl -fsSL https://gitmoot.io/install.sh | sh    # fresh install
+```
+
+Assets: `gitmoot_linux_amd64`, `gitmoot_darwin_amd64`, `gitmoot_darwin_arm64`,
+`sha256sums.txt`.
+
+---
+
 # Source: skills/gitmoot/SKILL.md
 
 ---
@@ -4904,7 +4968,7 @@ description: Use Gitmoot for local-first AI agent coordination across repositori
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
-  gitmoot-version: "0.1.0"
+  gitmoot-version: "0.4.0"
   source: "jerryfane/gitmoot"
 ---
 
@@ -5768,7 +5832,7 @@ training.json --artifact-root ~/.gitmoot/evals/blobs --out-root
 to validate the contract without model calls.
 Before real model-backed optimization, check `gitmoot-skillopt --version` and
 `gitmoot-skillopt optimize --help`, or install it with
-`pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.2.0b1/gitmoot_skillopt-0.2.0b1-py3-none-any.whl`.
+`pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.3.0/gitmoot_skillopt-0.3.0-py3-none-any.whl`.
 Verify required model/backend environment variables for the installed optimizer
 version. `skillopt import` validates a candidate package and stores the
 candidate template as a pending version; it never promotes the candidate
@@ -6118,6 +6182,15 @@ directions, the agreement rate and Cohen's κ, calibration buckets (judge
 soft-score versus the human decision), and per-dimension disagreement — useful
 to tell whether the LLM judge is well-calibrated against human verdicts before
 you trust it to gate candidates.
+
+Those captured outcomes feed judge-prompt optimization. The contract carries a
+per-`task_kind` judge prompt
+(`evaluator_profile.judge.config.judge_prompt_templates[task_kind]` +
+`judge_prompt_version`), and gitmoot-skillopt v0.3.0 can tune it offline against
+held-out human verdicts with `gitmoot-skillopt optimize
+--judge-prompt-optimization --judge-human-labeled-path <labels.json>` — the
+freeze-and-alternate counterpart to skill optimization, accepting a candidate
+judge prompt only when it raises held-out human agreement.
 
 Run the deterministic smoke before changing train behavior:
 
