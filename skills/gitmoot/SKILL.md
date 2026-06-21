@@ -4,7 +4,7 @@ description: Use Gitmoot for local-first AI agent coordination across repositori
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
-  gitmoot-version: "0.4.0"
+  gitmoot-version: "0.4.1"
   source: "jerryfane/gitmoot"
 ---
 

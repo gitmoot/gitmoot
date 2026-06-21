@@ -533,7 +533,7 @@ version: 0.1.0
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
-  gitmoot-version: "0.4.0"
+  gitmoot-version: "0.4.1"
   source: "jerryfane/gitmoot"
   openclaw:
     requires:
@@ -4960,6 +4960,49 @@ Assets: `gitmoot_linux_amd64`, `gitmoot_darwin_amd64`, `gitmoot_darwin_arm64`,
 
 ---
 
+# Source: docs/release-notes/v0.4.1.md
+
+# Gitmoot v0.4.1
+
+Patch release: fixes a Herdr **cockpit** bug (#357) so `gitmoot orchestrate
+--cockpit` actually opens a live pane per delegation subagent. In v0.4.0 the
+cockpit only ever created an empty workspace.
+
+## Fix
+
+### Cockpit panes now open (#364)
+
+- herdr's `pane split` requires a **pane** id as the split parent, but the
+  cockpit passed the **workspace** id, so the very first split failed with
+  `pane_not_found` and no child pane was ever created — only an empty
+  `gitmoot ·` workspace that finalize then tore down.
+- The root pane id returned by `workspace create` is now captured, persisted in
+  the `cockpit_workspaces` registry (new `root_pane_id` column + an `ALTER TABLE`
+  migration), and used as the split parent; a `<ws>:p1` fallback covers legacy
+  registry rows.
+- The cockpit's test fake now rejects a workspace-id split parent (mirrors real
+  herdr's `pane_not_found`), so this cannot regress.
+
+## Validation
+
+- Verified live with real Codex: `orchestrate --cockpit` opens one pane per
+  delegation subagent — the `gitmoot · …` workspace's pane count grows as the
+  orchestra fans out and tears down per job.
+- `go build` / `go vet` / `go test ./...` and the `-race` workflow suite are
+  green; squash-merged via the CI gate.
+
+## Install / update
+
+```sh
+gitmoot update                                   # existing installs
+curl -fsSL https://gitmoot.io/install.sh | sh    # fresh install
+```
+
+Assets: `gitmoot_linux_amd64`, `gitmoot_darwin_amd64`, `gitmoot_darwin_arm64`,
+`sha256sums.txt`.
+
+---
+
 # Source: skills/gitmoot/SKILL.md
 
 ---
@@ -4968,7 +5011,7 @@ description: Use Gitmoot for local-first AI agent coordination across repositori
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
-  gitmoot-version: "0.4.0"
+  gitmoot-version: "0.4.1"
   source: "jerryfane/gitmoot"
 ---
 

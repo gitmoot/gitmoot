@@ -24,6 +24,7 @@ const sources = [
   'docs/release-notes/v0.3.0-beta.1.md',
   'docs/release-notes/v0.3.1-beta.1.md',
   'docs/release-notes/v0.4.0.md',
+  'docs/release-notes/v0.4.1.md',
   'skills/gitmoot/SKILL.md',
   'skills/gitmoot/agent-templates/planner.md',
   'skills/gitmoot/references/CLI.md',
