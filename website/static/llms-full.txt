@@ -6414,6 +6414,65 @@ and the `delegation_enqueued` events in `gitmoot events --repo owner/repo`. See
 `RESULT_CONTRACT.md` for the `ephemeral` field reference and the termination
 bounds these recipes run inside.
 
+## Cockpit: Live Panes For An Orchestra
+
+Add `--cockpit` (alias `--herdr`) to `gitmoot orchestrate` to render one live
+[Herdr](https://github.com/jerryfane/herdr) pane per delegation subagent so a
+fan-out is watchable as it runs — in the terminal, and (through herdres) mirrored
+to Telegram. The cockpit is **opt-in and fail-open**: with `--cockpit` off, or
+when Herdr is absent or `herdr status` is not ok, orchestration is byte-identical
+to today. Gitmoot imports no Herdr code; it drives Herdr over its CLI only, and a
+herdr call never fails or stalls a job.
+
+```sh
+gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo --cockpit
+gitmoot orchestrate decompose-and-verify "Implement the export feature." \
+  --repo owner/repo --cockpit --cockpit-session feature-export
+```
+
+Each child job opens a pane labeled `<agent> · d<depth> · <branch>` and streams
+its progress; children inherit the cockpit setting from their parent, so one
+`--cockpit` on the root lights up the whole orchestra. The same panes are visible
+in the terminal (open the Herdr workspace) and on Telegram via the herdres bridge.
+
+A cockpit pane is a **view, not the job**: closing a pane (in the terminal or
+from Telegram) tears down the visible surface but does NOT cancel the underlying
+job — the child keeps running and its result is still synthesized. To stop work,
+cancel through the record path, not by closing the pane:
+
+```sh
+gitmoot job list --repo owner/repo     # find the child job id
+gitmoot job cancel <job-id>            # cancel via the record; pane teardown follows
+```
+
+Defaults live in `~/.gitmoot/config.toml` under `[orchestrate]` and are
+overridable per run by the flags above:
+
+```toml
+[orchestrate]
+cockpit_mode = "auto"      # on | off | auto (auto = on iff herdr is reachable)
+cockpit_session = ""       # default Herdr session/workspace label ("" = per-run)
+cockpit_max_panes = 4      # cap on simultaneous panes per run
+cockpit_pane_key = "job"   # job (one pane per job) | seat (reuse a pane per role)
+```
+
+On a constrained host the pane count is what bites, not the jobs. Lower
+`cockpit_max_panes` (the default is `4`; use `2` or `1` on a small box) — beyond
+the cap, extra subagents run **status-only**: they still report state to Herdr
+but do not split a new pane, so the work fans out exactly as without the cockpit
+while the visible surface stays small. Prefer `cockpit_pane_key = "seat"` for
+long multi-phase runs so panes are reused per role instead of accumulating one
+per job. The cockpit never changes the engine — the DAG, the result contract,
+the runtime-session locks, and the checkout keys are unchanged whether it is on,
+off, or unavailable — so capping panes only changes what you see, never how the
+orchestra runs. If `--cockpit` is asked for but Herdr is unreachable, gitmoot
+emits one `cockpit_unavailable` job event on the root and runs unwrapped.
+
+The optional `scripts/cockpit-smoke.sh` confirms the cockpit is opt-in and
+fail-open: it runs against an isolated `--home`, exercises the `--cockpit` wrap
+path when `herdr` is reachable, and skips cleanly when `herdr` or `gitmoot` is
+unavailable. See `../../../docs/cockpit-orchestrate.md` for the full reference.
+
 ---
 
 # Source: skills/gitmoot/references/TEMPLATE_CAPTURE.md
