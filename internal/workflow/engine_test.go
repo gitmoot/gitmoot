@@ -2317,6 +2317,34 @@ func TestEngineDelegationRequestCopiesModel(t *testing.T) {
 	}
 }
 
+func TestEngineDelegationRequestInheritsCockpit(t *testing.T) {
+	engine := Engine{}
+	request := engine.delegationRequest(
+		db.Job{ID: "parent-job", Agent: "audit"},
+		JobPayload{Repo: "jerryfane/gitmoot", Cockpit: true, CockpitSession: "room", CockpitPaneKey: "seat"},
+		Delegation{ID: "del-1", Agent: "helper", Action: "review", Prompt: "go"},
+	)
+	if !request.Cockpit {
+		t.Fatalf("request.Cockpit = false, want true (inherited from coordinator)")
+	}
+	if request.CockpitSession != "room" {
+		t.Fatalf("request.CockpitSession = %q, want %q", request.CockpitSession, "room")
+	}
+	if request.CockpitPaneKey != "seat" {
+		t.Fatalf("request.CockpitPaneKey = %q, want %q", request.CockpitPaneKey, "seat")
+	}
+
+	// A coordinator that did not opt in produces children with cockpit off.
+	off := engine.delegationRequest(
+		db.Job{ID: "parent-job", Agent: "audit"},
+		JobPayload{Repo: "jerryfane/gitmoot"},
+		Delegation{ID: "del-2", Agent: "helper", Action: "review", Prompt: "go"},
+	)
+	if off.Cockpit {
+		t.Fatalf("request.Cockpit = true, want false when coordinator did not opt in")
+	}
+}
+
 func TestEngineDelegationRequestThreadsEphemeralSpec(t *testing.T) {
 	engine := Engine{}
 	spec := &EphemeralSpec{Runtime: runtime.CodexRuntime, Model: "gpt-5.4"}

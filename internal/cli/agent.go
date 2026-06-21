@@ -254,18 +254,20 @@ func printAgentAskUsage(w io.Writer) {
 }
 
 type agentRunOptions struct {
-	home       string
-	repo       string
-	jsonOutput bool
-	background bool
-	typeName   string
-	model      string
-	taskID     string
-	prNumber   int
-	headSHA    string
-	branch     string
-	agent      string
-	message    string
+	home           string
+	repo           string
+	jsonOutput     bool
+	background     bool
+	typeName       string
+	model          string
+	taskID         string
+	prNumber       int
+	headSHA        string
+	branch         string
+	agent          string
+	message        string
+	cockpit        bool
+	cockpitSession string
 }
 
 func runAgentRun(args []string, stdout, stderr io.Writer) int {
@@ -334,7 +336,7 @@ func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 
 func printOrchestrateUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--model model] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--model model] [--cockpit] [--cockpit-session name] [--home path] [--json]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Orchestrate work across agents (a coordinator that fans out delegations).")
 	fmt.Fprintln(w, "Sugar for `gitmoot agent run <agent> --background`: the named agent is the")
@@ -425,6 +427,8 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 			PullRequest:          options.prNumber,
 			HeadSHA:              options.headSHA,
 			Branch:               options.branch,
+			Cockpit:              options.cockpit,
+			CockpitSession:       options.cockpitSession,
 			SelectedAction:       action,
 			SelectedActionReason: reason,
 			ExecutionPath:        executionPath,
@@ -474,7 +478,9 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.background = true
 		case arg == "--json":
 			options.jsonOutput = true
-		case arg == "--type" || arg == "--model" || arg == "--repo" || arg == "--home" || arg == "--task" || arg == "--pr" || arg == "--head-sha" || arg == "--branch":
+		case arg == "--cockpit" || arg == "--herdr":
+			options.cockpit = true
+		case arg == "--type" || arg == "--model" || arg == "--repo" || arg == "--home" || arg == "--task" || arg == "--pr" || arg == "--head-sha" || arg == "--branch" || arg == "--cockpit-session":
 			if index+1 >= len(args) {
 				fmt.Fprintf(stderr, "%s requires a value for %s\n", label, arg)
 				return agentRunOptions{}, false
@@ -483,6 +489,8 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			if !setAgentRunOption(&options, arg, args[index], stderr) {
 				return agentRunOptions{}, false
 			}
+		case strings.HasPrefix(arg, "--cockpit-session="):
+			options.cockpitSession = strings.TrimSpace(strings.TrimPrefix(arg, "--cockpit-session="))
 		case strings.HasPrefix(arg, "--type="):
 			options.typeName = strings.TrimPrefix(arg, "--type=")
 		case strings.HasPrefix(arg, "--model="):
@@ -538,6 +546,8 @@ func setAgentRunOption(options *agentRunOptions, flagName string, value string, 
 		options.headSHA = value
 	case "--branch":
 		options.branch = value
+	case "--cockpit-session":
+		options.cockpitSession = value
 	case "--pr":
 		parsed, err := strconv.Atoi(value)
 		if err != nil || parsed <= 0 {
@@ -553,7 +563,7 @@ func printAgentRunUsage(w io.Writer, command string) {
 	fmt.Fprintln(w, "Usage:")
 	switch command {
 	case "orchestrate":
-		fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--model model] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--model model] [--cockpit] [--cockpit-session name] [--home path] [--json]")
 	case "review":
 		fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background] [--type type] [--model model] [--home path] [--json]")
 	case "implement":
