@@ -2643,6 +2643,36 @@ func TestParseAgentRunOptionsCapturesModel(t *testing.T) {
 	}
 }
 
+func TestParseAgentRunOptionsCapturesCockpit(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		wantCockpit bool
+		wantSession string
+	}{
+		{name: "absent leaves off", args: []string{"planner", "fan out fixes"}, wantCockpit: false, wantSession: ""},
+		{name: "--cockpit turns on", args: []string{"planner", "fan out fixes", "--cockpit"}, wantCockpit: true, wantSession: ""},
+		{name: "--herdr alias turns on", args: []string{"planner", "fan out fixes", "--herdr"}, wantCockpit: true, wantSession: ""},
+		{name: "session space form", args: []string{"planner", "fan out fixes", "--cockpit", "--cockpit-session", "review-room"}, wantCockpit: true, wantSession: "review-room"},
+		{name: "session inline form", args: []string{"planner", "fan out fixes", "--cockpit-session=review-room"}, wantCockpit: false, wantSession: "review-room"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			options, ok := parseAgentRunOptions("orchestrate", tt.args, &stderr)
+			if !ok {
+				t.Fatalf("parseAgentRunOptions failed: %q", stderr.String())
+			}
+			if options.cockpit != tt.wantCockpit {
+				t.Fatalf("cockpit = %v, want %v", options.cockpit, tt.wantCockpit)
+			}
+			if options.cockpitSession != tt.wantSession {
+				t.Fatalf("cockpitSession = %q, want %q", options.cockpitSession, tt.wantSession)
+			}
+		})
+	}
+}
+
 func TestParseAgentAskOptionsCapturesModel(t *testing.T) {
 	tests := []struct {
 		name string

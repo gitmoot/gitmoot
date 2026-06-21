@@ -55,6 +55,9 @@ type JobRequest struct {
 	DelegationRepeatCount  int
 	DelegationFinalize     bool
 	Model                  string
+	Cockpit                bool
+	CockpitSession         string
+	CockpitPaneKey         string
 	Ephemeral              *EphemeralSpec
 }
 
@@ -95,6 +98,9 @@ type JobPayload struct {
 	DelegationRepeatCount  int            `json:"delegation_repeat_count,omitempty"`
 	DelegationFinalize     bool           `json:"delegation_finalize,omitempty"`
 	Model                  string         `json:"model,omitempty"`
+	Cockpit                bool           `json:"cockpit,omitempty"`
+	CockpitSession         string         `json:"cockpit_session,omitempty"`
+	CockpitPaneKey         string         `json:"cockpit_pane_key,omitempty"`
 	Ephemeral              *EphemeralSpec `json:"ephemeral,omitempty"`
 	RawOutputs             []string       `json:"raw_outputs,omitempty"`
 	Result                 *AgentResult   `json:"result,omitempty"`
@@ -154,6 +160,9 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		DelegationRepeatCount:  request.DelegationRepeatCount,
 		DelegationFinalize:     request.DelegationFinalize,
 		Model:                  request.Model,
+		Cockpit:                request.Cockpit,
+		CockpitSession:         strings.TrimSpace(request.CockpitSession),
+		CockpitPaneKey:         strings.TrimSpace(request.CockpitPaneKey),
 		Ephemeral:              request.Ephemeral,
 	})
 	if err != nil {

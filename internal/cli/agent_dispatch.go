@@ -39,6 +39,8 @@ type localAgentDispatchRequest struct {
 	TaskTitle            string
 	LeadAgent            string
 	Reviewers            []string
+	Cockpit              bool
+	CockpitSession       string
 	SelectedAction       string
 	SelectedActionReason string
 	ExecutionPath        string
@@ -122,21 +124,23 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		}
 	}
 	job, err := (workflow.Mailbox{Store: store}).Enqueue(ctx, workflow.JobRequest{
-		ID:           localAgentJobID(request.Action, agent.Name),
-		Agent:        agent.Name,
-		Action:       request.Action,
-		Repo:         repo.FullName(),
-		Branch:       firstNonEmpty(request.Branch, record.DefaultBranch),
-		PullRequest:  request.PullRequest,
-		HeadSHA:      request.HeadSHA,
-		GoalID:       request.GoalID,
-		TaskID:       request.TaskID,
-		TaskTitle:    request.TaskTitle,
-		LeadAgent:    firstNonEmpty(request.LeadAgent, agent.Name),
-		Reviewers:    request.Reviewers,
-		Sender:       "local",
-		Instructions: request.Instructions,
-		Model:        request.Model,
+		ID:             localAgentJobID(request.Action, agent.Name),
+		Agent:          agent.Name,
+		Action:         request.Action,
+		Repo:           repo.FullName(),
+		Branch:         firstNonEmpty(request.Branch, record.DefaultBranch),
+		PullRequest:    request.PullRequest,
+		HeadSHA:        request.HeadSHA,
+		GoalID:         request.GoalID,
+		TaskID:         request.TaskID,
+		TaskTitle:      request.TaskTitle,
+		LeadAgent:      firstNonEmpty(request.LeadAgent, agent.Name),
+		Reviewers:      request.Reviewers,
+		Sender:         "local",
+		Instructions:   request.Instructions,
+		Model:          request.Model,
+		Cockpit:        request.Cockpit,
+		CockpitSession: request.CockpitSession,
 	})
 	if err != nil {
 		return localAgentJobOutput{}, err

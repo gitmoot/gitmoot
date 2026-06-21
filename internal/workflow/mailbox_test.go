@@ -650,6 +650,66 @@ func (f *fakeDelivery) Deliver(_ context.Context, _ runtime.Agent, job runtime.J
 	return result, nil
 }
 
+func TestMailboxEnqueuePersistsCockpitFields(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID:             "job-cockpit",
+		Agent:          "audit",
+		Action:         "ask",
+		Repo:           "jerryfane/gitmoot",
+		Branch:         "task-005",
+		Sender:         "local",
+		Cockpit:        true,
+		CockpitSession: "  review-room  ",
+		CockpitPaneKey: "  seat-1  ",
+	}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+	stored, err := store.GetJob(ctx, "job-cockpit")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	payload, err := unmarshalPayload(stored.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	if !payload.Cockpit {
+		t.Fatalf("payload.Cockpit = false, want true")
+	}
+	// CockpitSession/CockpitPaneKey are trimmed on enqueue.
+	if payload.CockpitSession != "review-room" {
+		t.Fatalf("payload.CockpitSession = %q, want %q", payload.CockpitSession, "review-room")
+	}
+	if payload.CockpitPaneKey != "seat-1" {
+		t.Fatalf("payload.CockpitPaneKey = %q, want %q", payload.CockpitPaneKey, "seat-1")
+	}
+}
+
+func TestJobPayloadCockpitRoundTrip(t *testing.T) {
+	encoded, err := marshalPayload(JobPayload{Cockpit: true, CockpitSession: "room", CockpitPaneKey: "job"})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	got, err := unmarshalPayload(encoded)
+	if err != nil {
+		t.Fatalf("unmarshalPayload: %v", err)
+	}
+	if !got.Cockpit || got.CockpitSession != "room" || got.CockpitPaneKey != "job" {
+		t.Fatalf("round-trip wrong: %+v", got)
+	}
+	// Cockpit defaults are omitempty: a zero payload encodes without the keys.
+	zero, err := marshalPayload(JobPayload{})
+	if err != nil {
+		t.Fatalf("marshalPayload zero: %v", err)
+	}
+	if strings.Contains(zero, "cockpit") {
+		t.Fatalf("zero payload should omit cockpit keys: %s", zero)
+	}
+}
+
 func TestParseJobPayloadExported(t *testing.T) {
 	encoded, err := marshalPayload(JobPayload{Repo: "o/r", PullRequest: 7, Instructions: "do it", Result: &AgentResult{Decision: "approved", Summary: "done"}})
 	if err != nil {
