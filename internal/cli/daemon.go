@@ -1721,6 +1721,10 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 					if err := logFile.Close(); err != nil {
 						writeLine(w.Stdout, "job %s cockpit log close failed: %v", job.ID, err)
 					}
+					// The per-job log only backs the live pane tail, which is torn
+					// down with the job; remove it so cockpit logs don't accumulate
+					// one-file-per-job. Best-effort: a leftover log never matters.
+					_ = os.Remove(logPath)
 				}()
 				adapter = teeAdapter
 				meta.LogPath = logPath
