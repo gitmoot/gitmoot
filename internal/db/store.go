@@ -118,6 +118,22 @@ type SkillOptJudgeOutcome struct {
 	CreatedAt          string
 }
 
+// CockpitPane records one live Herdr pane opened for a delegation subagent's
+// job (issue #357). Panes are keyed by (workspace_id, pane_key) so the cockpit
+// can find/reuse a pane for a seat without splitting duplicates; root_job_id is
+// derived from the job payload (not a jobs column) so all panes of one
+// orchestration root can be listed and torn down together.
+type CockpitPane struct {
+	ID          string
+	JobID       string
+	PaneKey     string
+	RootJobID   string
+	PaneID      string
+	WorkspaceID string
+	Source      string
+	CreatedAt   string
+}
+
 type AgentRepo struct {
 	AgentName    string
 	RepoFullName string
@@ -4631,6 +4647,145 @@ func newSkillOptJudgeOutcomeID() (string, error) {
 	return "judge-outcome-" + hex.EncodeToString(raw[:]), nil
 }
 
+// InsertCockpitPane records a live Herdr pane for a delegation subagent's job
+// (issue #357). An empty ID is auto-generated. The (workspace_id, pane_key)
+// pair is UNIQUE, so a duplicate open for the same seat surfaces as an error the
+// cockpit can treat as "pane already exists, reuse it".
+func (s *Store) InsertCockpitPane(ctx context.Context, pane CockpitPane) error {
+	id := strings.TrimSpace(pane.ID)
+	if id == "" {
+		generated, err := newCockpitPaneID()
+		if err != nil {
+			return err
+		}
+		id = generated
+	}
+	if strings.TrimSpace(pane.JobID) == "" {
+		return errors.New("cockpit pane job_id is required")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO cockpit_panes(
+			id, job_id, pane_key, root_job_id, pane_id, workspace_id, source
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		id,
+		strings.TrimSpace(pane.JobID),
+		strings.TrimSpace(pane.PaneKey),
+		strings.TrimSpace(pane.RootJobID),
+		strings.TrimSpace(pane.PaneID),
+		strings.TrimSpace(pane.WorkspaceID),
+		strings.TrimSpace(pane.Source))
+	return err
+}
+
+// GetCockpitPaneByJob returns the pane recorded for a job, if any.
+func (s *Store) GetCockpitPaneByJob(ctx context.Context, jobID string) (CockpitPane, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, job_id, pane_key, root_job_id, pane_id, workspace_id, source, created_at
+		FROM cockpit_panes WHERE job_id = ?`, strings.TrimSpace(jobID))
+	return scanCockpitPane(row)
+}
+
+// ListCockpitPanesByRoot returns every pane opened under one orchestration root,
+// oldest first, so the cockpit can tear them all down on root finalize.
+func (s *Store) ListCockpitPanesByRoot(ctx context.Context, rootJobID string) ([]CockpitPane, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, job_id, pane_key, root_job_id, pane_id, workspace_id, source, created_at
+		FROM cockpit_panes WHERE root_job_id = ? ORDER BY created_at, id`, strings.TrimSpace(rootJobID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var panes []CockpitPane
+	for rows.Next() {
+		pane, err := scanCockpitPane(rows)
+		if err != nil {
+			return nil, err
+		}
+		panes = append(panes, pane)
+	}
+	return panes, rows.Err()
+}
+
+// DeleteCockpitPane removes a pane record by ID. Deleting a missing row is a
+// no-op (best-effort teardown should not fail on a stale record).
+func (s *Store) DeleteCockpitPane(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM cockpit_panes WHERE id = ?`, strings.TrimSpace(id))
+	return err
+}
+
+// GetOrCreateWorkspaceForRoot returns the single Herdr workspace id bound to an
+// orchestration root, creating it via create exactly once. Concurrent callers
+// for the same root serialize on the cockpit_workspaces primary key: the first
+// inserter wins and create runs once; losers read the winner's id back without
+// calling create. create is invoked outside the row insert (it shells out to
+// herdr), and a racing insert that loses simply re-reads the committed id.
+func (s *Store) GetOrCreateWorkspaceForRoot(ctx context.Context, rootJobID string, create func() (workspaceID string, err error)) (string, error) {
+	rootJobID = strings.TrimSpace(rootJobID)
+	if rootJobID == "" {
+		return "", errors.New("cockpit workspace root_job_id is required")
+	}
+	if create == nil {
+		return "", errors.New("cockpit workspace create func is required")
+	}
+	// Fast path: an existing registration short-circuits without calling create.
+	if existing, err := s.lookupWorkspaceForRoot(ctx, rootJobID); err != nil {
+		return "", err
+	} else if existing != "" {
+		return existing, nil
+	}
+	workspaceID, err := create()
+	if err != nil {
+		return "", err
+	}
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return "", errors.New("cockpit workspace create returned an empty workspace id")
+	}
+	// INSERT OR IGNORE: if a concurrent caller already bound this root, our row
+	// is dropped and we fall through to re-read the winning id (our freshly
+	// created workspace is then orphaned, which the cockpit reaper handles).
+	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO cockpit_workspaces(root_job_id, workspace_id) VALUES (?, ?)`,
+		rootJobID, workspaceID); err != nil {
+		return "", err
+	}
+	stored, err := s.lookupWorkspaceForRoot(ctx, rootJobID)
+	if err != nil {
+		return "", err
+	}
+	if stored == "" {
+		// Should not happen: we just inserted-or-ignored. Treat as our id.
+		return workspaceID, nil
+	}
+	return stored, nil
+}
+
+func (s *Store) lookupWorkspaceForRoot(ctx context.Context, rootJobID string) (string, error) {
+	var workspaceID string
+	err := s.db.QueryRowContext(ctx, `SELECT workspace_id FROM cockpit_workspaces WHERE root_job_id = ?`, rootJobID).Scan(&workspaceID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(workspaceID), nil
+}
+
+func scanCockpitPane(row interface{ Scan(dest ...any) error }) (CockpitPane, error) {
+	var pane CockpitPane
+	if err := row.Scan(&pane.ID, &pane.JobID, &pane.PaneKey, &pane.RootJobID,
+		&pane.PaneID, &pane.WorkspaceID, &pane.Source, &pane.CreatedAt); err != nil {
+		return CockpitPane{}, err
+	}
+	return pane, nil
+}
+
+func newCockpitPaneID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return "cockpit-pane-" + hex.EncodeToString(raw[:]), nil
+}
+
 // captureSkillOptJudgeOutcome records one judge-vs-human outcome row for a
 // candidate decision. It is best-effort: capture must never fail the decision,
 // so callers log and continue on error.
@@ -5414,5 +5569,27 @@ CREATE TABLE skillopt_judge_outcomes (
 
 CREATE INDEX idx_skillopt_judge_outcomes_template ON skillopt_judge_outcomes(template_id);
 CREATE INDEX idx_skillopt_judge_outcomes_candidate ON skillopt_judge_outcomes(candidate_version_id);
+	`,
+	`
+CREATE TABLE cockpit_panes (
+	id TEXT PRIMARY KEY,
+	job_id TEXT NOT NULL DEFAULT '',
+	pane_key TEXT NOT NULL DEFAULT '',
+	root_job_id TEXT NOT NULL DEFAULT '',
+	pane_id TEXT NOT NULL DEFAULT '',
+	workspace_id TEXT NOT NULL DEFAULT '',
+	source TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE(workspace_id, pane_key)
+);
+
+CREATE INDEX idx_cockpit_panes_job ON cockpit_panes(job_id);
+CREATE INDEX idx_cockpit_panes_root ON cockpit_panes(root_job_id);
+
+CREATE TABLE cockpit_workspaces (
+	root_job_id TEXT PRIMARY KEY,
+	workspace_id TEXT NOT NULL,
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 	`,
 }

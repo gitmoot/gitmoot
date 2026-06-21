@@ -7,6 +7,8 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -3106,4 +3108,267 @@ func seedSkillOptJudgeCandidate(t *testing.T, store *Store, evalReportJSON strin
 		t.Fatalf("AddPendingAgentTemplateCandidate returned error: %v", err)
 	}
 	return candidate
+}
+
+func TestCockpitPaneCRUDRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	pane := CockpitPane{
+		ID:          "cockpit-pane-1",
+		JobID:       "job-child-1",
+		PaneKey:     "job:job-child-1",
+		RootJobID:   "job-root",
+		PaneID:      "pane-aaa",
+		WorkspaceID: "ws-1",
+		Source:      "custom:gitmoot",
+	}
+	if err := store.InsertCockpitPane(ctx, pane); err != nil {
+		t.Fatalf("InsertCockpitPane returned error: %v", err)
+	}
+
+	got, err := store.GetCockpitPaneByJob(ctx, "job-child-1")
+	if err != nil {
+		t.Fatalf("GetCockpitPaneByJob returned error: %v", err)
+	}
+	if got.ID != pane.ID ||
+		got.JobID != pane.JobID ||
+		got.PaneKey != pane.PaneKey ||
+		got.RootJobID != pane.RootJobID ||
+		got.PaneID != pane.PaneID ||
+		got.WorkspaceID != pane.WorkspaceID ||
+		got.Source != pane.Source {
+		t.Fatalf("GetCockpitPaneByJob = %+v, want %+v", got, pane)
+	}
+	if strings.TrimSpace(got.CreatedAt) == "" {
+		t.Fatalf("expected created_at to be populated, got %+v", got)
+	}
+
+	// A second pane under the same root, with an auto-generated id and a
+	// distinct pane_key (so the UNIQUE(workspace_id, pane_key) holds).
+	second := CockpitPane{
+		JobID:       "job-child-2",
+		PaneKey:     "job:job-child-2",
+		RootJobID:   "job-root",
+		PaneID:      "pane-bbb",
+		WorkspaceID: "ws-1",
+		Source:      "custom:gitmoot",
+	}
+	if err := store.InsertCockpitPane(ctx, second); err != nil {
+		t.Fatalf("InsertCockpitPane (auto id) returned error: %v", err)
+	}
+
+	// A pane under a different root must not leak into the root listing.
+	other := CockpitPane{
+		JobID:       "job-other",
+		PaneKey:     "job:job-other",
+		RootJobID:   "job-root-2",
+		PaneID:      "pane-ccc",
+		WorkspaceID: "ws-2",
+		Source:      "custom:gitmoot",
+	}
+	if err := store.InsertCockpitPane(ctx, other); err != nil {
+		t.Fatalf("InsertCockpitPane (other root) returned error: %v", err)
+	}
+
+	rootPanes, err := store.ListCockpitPanesByRoot(ctx, "job-root")
+	if err != nil {
+		t.Fatalf("ListCockpitPanesByRoot returned error: %v", err)
+	}
+	if len(rootPanes) != 2 {
+		t.Fatalf("ListCockpitPanesByRoot(job-root) = %d rows, want 2", len(rootPanes))
+	}
+	if rootPanes[0].JobID != "job-child-1" || rootPanes[1].JobID != "job-child-2" {
+		t.Fatalf("ListCockpitPanesByRoot ordering = %s, %s; want job-child-1, job-child-2",
+			rootPanes[0].JobID, rootPanes[1].JobID)
+	}
+
+	// Delete the first pane; the listing shrinks and the by-job lookup misses.
+	if err := store.DeleteCockpitPane(ctx, "cockpit-pane-1"); err != nil {
+		t.Fatalf("DeleteCockpitPane returned error: %v", err)
+	}
+	if _, err := store.GetCockpitPaneByJob(ctx, "job-child-1"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetCockpitPaneByJob after delete = %v, want sql.ErrNoRows", err)
+	}
+	rootPanes, err = store.ListCockpitPanesByRoot(ctx, "job-root")
+	if err != nil {
+		t.Fatalf("ListCockpitPanesByRoot after delete returned error: %v", err)
+	}
+	if len(rootPanes) != 1 || rootPanes[0].JobID != "job-child-2" {
+		t.Fatalf("ListCockpitPanesByRoot after delete = %+v, want only job-child-2", rootPanes)
+	}
+
+	// Deleting a missing row is a no-op, not an error.
+	if err := store.DeleteCockpitPane(ctx, "cockpit-pane-missing"); err != nil {
+		t.Fatalf("DeleteCockpitPane(missing) returned error: %v", err)
+	}
+
+	// job_id is required.
+	if err := store.InsertCockpitPane(ctx, CockpitPane{PaneKey: "k", WorkspaceID: "ws-x"}); err == nil {
+		t.Fatal("InsertCockpitPane with empty job_id returned nil error")
+	}
+}
+
+func TestCockpitPaneUniquePerWorkspaceSeat(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	first := CockpitPane{
+		JobID:       "job-a",
+		PaneKey:     "seat:planner",
+		RootJobID:   "root",
+		PaneID:      "pane-1",
+		WorkspaceID: "ws-1",
+	}
+	if err := store.InsertCockpitPane(ctx, first); err != nil {
+		t.Fatalf("InsertCockpitPane(first) returned error: %v", err)
+	}
+
+	// Same (workspace_id, pane_key) for a different job must be rejected.
+	dup := CockpitPane{
+		JobID:       "job-b",
+		PaneKey:     "seat:planner",
+		RootJobID:   "root",
+		PaneID:      "pane-2",
+		WorkspaceID: "ws-1",
+	}
+	if err := store.InsertCockpitPane(ctx, dup); err == nil {
+		t.Fatal("InsertCockpitPane with duplicate (workspace_id, pane_key) returned nil error")
+	}
+
+	// The same pane_key in a different workspace is allowed.
+	otherWS := CockpitPane{
+		JobID:       "job-c",
+		PaneKey:     "seat:planner",
+		RootJobID:   "root",
+		PaneID:      "pane-3",
+		WorkspaceID: "ws-2",
+	}
+	if err := store.InsertCockpitPane(ctx, otherWS); err != nil {
+		t.Fatalf("InsertCockpitPane(other workspace) returned error: %v", err)
+	}
+}
+
+func TestGetOrCreateWorkspaceForRoot(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	var calls atomic.Int64
+	create := func() (string, error) {
+		calls.Add(1)
+		return "ws-created", nil
+	}
+
+	// First call creates and binds the workspace.
+	ws, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-1", create)
+	if err != nil {
+		t.Fatalf("GetOrCreateWorkspaceForRoot returned error: %v", err)
+	}
+	if ws != "ws-created" {
+		t.Fatalf("workspace id = %q, want ws-created", ws)
+	}
+
+	// Repeated calls for the same root return the bound id without calling create.
+	for i := 0; i < 3; i++ {
+		ws, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-1", create)
+		if err != nil {
+			t.Fatalf("GetOrCreateWorkspaceForRoot (repeat) returned error: %v", err)
+		}
+		if ws != "ws-created" {
+			t.Fatalf("workspace id (repeat) = %q, want ws-created", ws)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("create called %d times, want exactly 1", got)
+	}
+
+	// A different root creates its own workspace.
+	ws2, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-2", func() (string, error) {
+		return "ws-other", nil
+	})
+	if err != nil {
+		t.Fatalf("GetOrCreateWorkspaceForRoot(root-2) returned error: %v", err)
+	}
+	if ws2 != "ws-other" {
+		t.Fatalf("workspace id (root-2) = %q, want ws-other", ws2)
+	}
+
+	// Validation: empty root and nil create are rejected.
+	if _, err := store.GetOrCreateWorkspaceForRoot(ctx, "  ", create); err == nil {
+		t.Fatal("GetOrCreateWorkspaceForRoot with empty root returned nil error")
+	}
+	if _, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-3", nil); err == nil {
+		t.Fatal("GetOrCreateWorkspaceForRoot with nil create returned nil error")
+	}
+}
+
+func TestGetOrCreateWorkspaceForRootConcurrent(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	const goroutines = 16
+	var calls atomic.Int64
+	create := func() (string, error) {
+		// Each create returns a distinct id so we can verify exactly one wins.
+		n := calls.Add(1)
+		return "ws-" + string(rune('a'+int(n-1))), nil
+	}
+
+	var wg sync.WaitGroup
+	results := make([]string, goroutines)
+	start := make(chan struct{})
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			ws, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-race", create)
+			if err != nil {
+				t.Errorf("GetOrCreateWorkspaceForRoot(concurrent) returned error: %v", err)
+				return
+			}
+			results[idx] = ws
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	// All callers must observe the same single bound workspace id.
+	winner := results[0]
+	if winner == "" {
+		t.Fatal("first concurrent caller got an empty workspace id")
+	}
+	for i, got := range results {
+		if got != winner {
+			t.Fatalf("concurrent caller %d got %q, want the single winner %q", i, got, winner)
+		}
+	}
+	// create may run more than once under contention (it shells out before the
+	// insert), but the bound id is stable and matches what every caller sees.
+	final, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-race", func() (string, error) {
+		t.Fatal("create must not run once the root is bound")
+		return "", nil
+	})
+	if err != nil {
+		t.Fatalf("GetOrCreateWorkspaceForRoot(after race) returned error: %v", err)
+	}
+	if final != winner {
+		t.Fatalf("post-race bound id = %q, want %q", final, winner)
+	}
 }
