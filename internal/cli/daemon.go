@@ -2017,6 +2017,13 @@ func (w jobWorker) cockpitSeatLogAdapter(cp *cockpit.Cockpit, agent runtime.Agen
 // its per-Deliver teardown stays byte-identical.
 func (w jobWorker) finalizeCockpitRootIfDone(cp *cockpit.Cockpit, job db.Job, payload workflow.JobPayload, rootJobID string) {
 	ctx := context.Background()
+	// Cheap scoped guard before the full job-table scan: if the root has no live
+	// panes (none opened, or already finalized), there is nothing to do — this
+	// short-circuits the redundant rootTreeTerminal scans that would otherwise run
+	// on every in-tree job's completion once the root is already torn down.
+	if panes, perr := w.Store.ListCockpitPanesByRoot(ctx, rootJobID); perr == nil && len(panes) == 0 {
+		return
+	}
 	done, err := w.rootTreeTerminal(ctx, rootJobID)
 	if err != nil {
 		writeLine(w.Stdout, "job %s cockpit root-finalize check failed: %v", job.ID, err)
@@ -2037,8 +2044,8 @@ func (w jobWorker) finalizeCockpitRootIfDone(cp *cockpit.Cockpit, job db.Job, pa
 }
 
 // rootTreeTerminal reports whether every job in the coordination tree rooted at
-// rootJobID is terminal (succeeded/failed/blocked/cancelled) — i.e. nothing is
-// still queued or running. It lists jobs and matches the root id against each
+// rootJobID is terminal (succeeded/failed/cancelled) — i.e. nothing is still
+// queued, running, or blocked (a blocked job can resume, so it is not terminal). It lists jobs and matches the root id against each
 // job's own id (the root coordinator) or its payload RootJobID (children +
 // continuations), mirroring the engine's per-root reasoning. It fails closed
 // (returns false) on any unparseable payload so a transient hiccup never triggers
@@ -2106,9 +2113,14 @@ func (w jobWorker) isReconveneContinuation(ctx context.Context, job db.Job, payl
 func cockpitJobStateTerminal(state string) bool {
 	switch state {
 	case string(workflow.JobSucceeded), string(workflow.JobFailed),
-		string(workflow.JobBlocked), string(workflow.JobCancelled):
+		string(workflow.JobCancelled):
 		return true
 	default:
+		// JobBlocked is deliberately NOT terminal: a blocked job (e.g. awaiting a
+		// permission/approval or interactive answer) can resume, and finalizing the
+		// root then would tear down a pane + seat log the job still needs. The
+		// engine's graceful-finalize continuation provides the real terminal signal
+		// for a stuck tree.
 		return false
 	}
 }

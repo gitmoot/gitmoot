@@ -444,14 +444,16 @@ func TestRootTreeTerminal(t *testing.T) {
 func TestCockpitJobStateTerminal(t *testing.T) {
 	terminal := []string{
 		string(workflow.JobSucceeded), string(workflow.JobFailed),
-		string(workflow.JobBlocked), string(workflow.JobCancelled),
+		string(workflow.JobCancelled),
 	}
 	for _, s := range terminal {
 		if !cockpitJobStateTerminal(s) {
 			t.Errorf("cockpitJobStateTerminal(%q) = false, want true", s)
 		}
 	}
-	for _, s := range []string{string(workflow.JobQueued), string(workflow.JobRunning), "", "weird"} {
+	// JobBlocked is NOT terminal: a blocked job can resume, so finalizing the root
+	// (closing panes + removing seat logs) while blocked would be premature.
+	for _, s := range []string{string(workflow.JobQueued), string(workflow.JobRunning), string(workflow.JobBlocked), "", "weird"} {
 		if cockpitJobStateTerminal(s) {
 			t.Errorf("cockpitJobStateTerminal(%q) = true, want false", s)
 		}
