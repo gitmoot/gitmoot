@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -72,7 +73,16 @@ type Pane struct {
 type PaneStore interface {
 	InsertCockpitPane(ctx context.Context, pane Pane) error
 	GetCockpitPaneByJob(ctx context.Context, jobID string) (Pane, error)
+	// GetCockpitPaneByKey returns the live pane for a (workspaceID, paneKey) seat,
+	// if one exists. The bool reports found; a not-found row is (Pane{}, false, nil)
+	// — never a surfaced sql.ErrNoRows — so the seat-reuse fail-open path can treat
+	// "no pane yet" as a clean miss rather than an error. (Task 7, seat mode.)
+	GetCockpitPaneByKey(ctx context.Context, workspaceID, paneKey string) (Pane, bool, error)
 	ListCockpitPanesByRoot(ctx context.Context, rootJobID string) ([]Pane, error)
+	// ListAllCockpitPanes returns every recorded pane across all roots. The
+	// reconcile GC uses it to find orphaned rows (pane gone from herdr + owning
+	// root terminal). (Task 7, reconcile.)
+	ListAllCockpitPanes(ctx context.Context) ([]Pane, error)
 	DeleteCockpitPane(ctx context.Context, id string) error
 	DeleteCockpitPaneByJob(ctx context.Context, jobID string) error
 	// GetOrCreateWorkspaceForRoot serializes one workspace per root: create is
@@ -90,6 +100,13 @@ type Options struct {
 	MaxPanes int
 	// PaneKeyMode is "job" (P0) or "seat" (P2).
 	PaneKeyMode string
+	// GraceClose delays the per-Deliver pane teardown in JOB mode so the last
+	// output stays readable instead of vanishing the instant a child finishes
+	// (Task 8). It is non-blocking: the close fires from a detached goroutine after
+	// the grace, so the job never waits on it. A non-positive value defaults to
+	// defaultGraceClose; seat mode ignores it (those panes persist until root
+	// finalize).
+	GraceClose time.Duration
 }
 
 // JobMeta describes the delegation job a pane is opened for. The fields are
@@ -136,6 +153,12 @@ type Cockpit struct {
 	availAt     time.Time
 	// now is the clock used for TTL expiry; overridable in tests.
 	now func() time.Time
+
+	// removeAll / sleepAfter back the seat-log teardown and grace-close timing;
+	// they default to os.RemoveAll / time.AfterFunc and are overridable in tests so
+	// the filesystem and timer behavior can be asserted deterministically.
+	removeAll  func(string) error
+	sleepAfter func(time.Duration, func()) *time.Timer
 }
 
 // New builds a Cockpit. A zero HerdrBin defaults to "herdr"; a non-positive
@@ -162,6 +185,8 @@ func New(opts Options, store PaneStore) *Cockpit {
 		home:       os.Getenv("GITMOOT_HOME"),
 		logger:     slog.Default(),
 		now:        time.Now,
+		removeAll:  os.RemoveAll,
+		sleepAfter: time.AfterFunc,
 	}
 }
 
@@ -186,10 +211,30 @@ func newWithRunner(opts Options, store PaneStore, run runner, lookPath func(stri
 		home:       "",
 		logger:     slog.Default(),
 		now:        time.Now,
+		removeAll:  os.RemoveAll,
+		// Tests run the grace-close synchronously so the job-mode teardown sequence
+		// is observable inline (production uses the real time.AfterFunc timer).
+		sleepAfter: syncAfterFunc,
 	}
 }
 
+// syncAfterFunc runs fn immediately and returns a stopped timer. It is the
+// test-constructor's sleepAfter so the grace-close teardown is deterministic and
+// inline rather than firing on a real timer.
+func syncAfterFunc(_ time.Duration, fn func()) *time.Timer {
+	fn()
+	t := time.NewTimer(0)
+	t.Stop()
+	return t
+}
+
 const defaultMaxPanes = 4
+
+// defaultGraceClose is the default delay before a JOB-mode pane is torn down on
+// Deliver return (Task 8). It keeps the child's last output readable for a beat
+// rather than vanishing the instant the job finishes. The close runs detached so
+// the job never blocks on the grace.
+const defaultGraceClose = 8 * time.Second
 
 // Available reports whether the cockpit can render panes: the herdr binary is
 // on PATH and `herdr status` reports the server running. It is timeout-bounded
@@ -244,16 +289,26 @@ type paneAdapter struct {
 func (a *paneAdapter) Deliver(ctx context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error) {
 	pane := a.open(ctx)
 	if pane != "" {
-		defer a.close(pane)
+		// Seat mode: the pane persists for reuse across the seat's rounds — the
+		// delivery only marks the agent idle on return; the pane (and its row,
+		// workspace, seat log) is torn down on ROOT FINALIZE, not here (Task 7).
+		// Job mode: tear the pane down per delivery as in P0/P1, but after a short
+		// grace so the last output stays readable (Task 8).
+		if a.cockpit.seatMode() {
+			defer a.markIdle(pane)
+		} else {
+			defer a.cockpit.graceClose(pane, a.meta.JobID)
+		}
 	}
 	return a.inner.Deliver(ctx, agent, job)
 }
 
-// open resolves the per-root workspace, splits a child pane, labels it, marks
-// the agent working, runs the job-watch command, and persists the pane. It
-// returns the new pane id, or "" when no pane was opened (over MaxPanes, herdr
-// error, or missing root). Every failure is swallowed (fail-closed on the
-// pane) so delivery proceeds unwrapped.
+// open resolves the per-root workspace and either reuses the seat's existing pane
+// (seat mode) or splits a fresh child pane (job mode / first seat open), labels
+// it, marks the agent working, runs the watch command, and persists the pane. It
+// returns the pane id, or "" when no pane was opened (over MaxPanes, herdr error,
+// or missing root). Every failure is swallowed (fail-closed on the pane) so
+// delivery proceeds unwrapped.
 func (a *paneAdapter) open(ctx context.Context) string {
 	c := a.cockpit
 	rootJob := a.meta.RootJobID
@@ -261,12 +316,45 @@ func (a *paneAdapter) open(ctx context.Context) string {
 		rootJob = a.meta.JobID
 	}
 
-	// Honor MaxPanes: beyond the cap the job is status-only (no pane).
-	if existing, err := c.store.ListCockpitPanesByRoot(ctx, rootJob); err == nil {
-		if len(existing) >= c.opts.MaxPanes {
-			c.logf("cockpit: max panes reached for root %s; status-only", rootJob)
-			return ""
+	source := herdrSource
+	agentLabel := "gm-" + shortJobID(a.meta.JobID)
+
+	// List the root's panes once: seat mode uses it to find a seat to reuse, and
+	// both modes use it for the MaxPanes cap. Doing this BEFORE resolving the
+	// workspace keeps job mode byte-identical to P0/P1 (the cap is checked before
+	// any `workspace create`).
+	existing, listErr := c.store.ListCockpitPanesByRoot(ctx, rootJob)
+	if listErr != nil {
+		c.logf("cockpit: list panes for root %s: %v", rootJob, listErr)
+	}
+
+	// Seat mode: reuse an existing live pane for this seat (pane_key) instead of
+	// splitting a new one. The same agent across delegation rounds shares one pane
+	// that tails one accumulating seat log, so there is no second split and no
+	// second row. A reuse is NOT a new pane, so it bypasses the MaxPanes cap (the
+	// cap bounds distinct seats, enforced on the split path below).
+	if c.seatMode() {
+		for _, p := range existing {
+			if p.PaneKey == a.paneKey() && p.PaneID != "" {
+				c.bestEffort(ctx, "report-agent working", func(cctx context.Context) error {
+					return c.client.reportAgent(cctx, p.PaneID, source, agentLabel, agentStateWorking)
+				})
+				// Ensure the seat's pane is tailing its accumulating log. The seat log
+				// is the same file across rounds (O_APPEND, daemon-managed), so
+				// re-running the tail is idempotent and survives a pane that was
+				// started before the log existed.
+				c.bestEffort(ctx, "pane run", func(cctx context.Context) error {
+					return c.client.paneRun(cctx, p.PaneID, a.watchCommand())
+				})
+				return p.PaneID
+			}
 		}
+	}
+
+	// Honor MaxPanes: a fresh split beyond the cap is status-only (no pane).
+	if len(existing) >= c.opts.MaxPanes {
+		c.logf("cockpit: max panes reached for root %s; status-only", rootJob)
+		return ""
 	}
 
 	workspaceID, err := c.store.GetOrCreateWorkspaceForRoot(ctx, rootJob, func() (string, error) {
@@ -290,10 +378,6 @@ func (a *paneAdapter) open(ctx context.Context) string {
 		return ""
 	}
 
-	source := herdrSource
-	shortID := shortJobID(a.meta.JobID)
-	agentLabel := "gm-" + shortID
-
 	// Label + status + watch are best-effort; a failure here still yields a
 	// usable pane, so we keep it and persist it.
 	c.bestEffort(ctx, "rename", func(cctx context.Context) error {
@@ -315,32 +399,79 @@ func (a *paneAdapter) open(ctx context.Context) string {
 		Source:      source,
 	}
 	if err := c.store.InsertCockpitPane(ctx, record); err != nil {
+		// A UNIQUE(workspace_id, pane_key) violation means a concurrent same-seat
+		// open already persisted the seat's pane (the get-or-create convergence the
+		// frozen contract guarantees). In seat mode that is the expected race: the
+		// pane we just split is the redundant loser, so close it and reuse the
+		// winner's pane so the seat stays a single pane. In job mode the key is the
+		// (unique) job id, so this only fires on a genuine re-run and is harmless.
 		c.logf("cockpit: persist pane for job %s: %v", a.meta.JobID, err)
+		if c.seatMode() {
+			if winner, found, lookErr := c.store.GetCockpitPaneByKey(ctx, workspaceID, a.paneKey()); lookErr == nil && found && winner.PaneID != "" && winner.PaneID != paneID {
+				c.bestEffort(ctx, "pane close", func(cctx context.Context) error {
+					return c.client.paneClose(cctx, paneID)
+				})
+				return winner.PaneID
+			}
+		}
 		// The pane is open and useful even if persistence failed; keep it.
 	}
 	return paneID
 }
 
-// close marks the agent idle, releases it, and closes the pane — all
-// best-effort. Workspace close is deferred to root-finalize (P2), not here.
-func (a *paneAdapter) close(paneID string) {
+// markIdle reports the agent idle on a seat pane without closing it (seat mode):
+// the pane persists for reuse and is torn down only on root finalize. It is the
+// seat-mode analogue of close()'s first step.
+func (a *paneAdapter) markIdle(paneID string) {
 	c := a.cockpit
-	source := herdrSource
-	agentLabel := "gm-" + shortJobID(a.meta.JobID)
-	ctx := context.Background()
-
-	c.bestEffort(ctx, "report-agent idle", func(cctx context.Context) error {
-		return c.client.reportAgent(cctx, paneID, source, agentLabel, agentStateIdle)
+	c.bestEffort(context.Background(), "report-agent idle", func(cctx context.Context) error {
+		return c.client.reportAgent(cctx, paneID, herdrSource, "gm-"+shortJobID(a.meta.JobID), agentStateIdle)
 	})
+}
+
+// graceClose schedules a JOB-mode pane teardown after the configured grace so the
+// child's last output stays readable, then marks idle, releases, closes, and
+// deletes the row — all best-effort. The agent is marked idle immediately (so a
+// finished job never reads as "working" during the grace) and the actual close
+// fires from a detached timer, so the job never blocks on the grace window. The
+// per-job log only backs the live tail and is the daemon's to remove.
+func (c *Cockpit) graceClose(paneID, jobID string) {
+	// Mark idle now: a finished child must not read as "working" while its pane
+	// lingers during the grace window.
+	c.bestEffort(context.Background(), "report-agent idle", func(cctx context.Context) error {
+		return c.client.reportAgent(cctx, paneID, herdrSource, "gm-"+shortJobID(jobID), agentStateIdle)
+	})
+	grace := c.opts.GraceClose
+	if grace <= 0 {
+		grace = defaultGraceClose
+	}
+	after := c.sleepAfter
+	if after == nil {
+		after = time.AfterFunc
+	}
+	after(grace, func() { c.teardownJobPane(paneID, jobID) })
+}
+
+// teardownJobPane releases the agent, closes the pane, and deletes its row by job
+// id — the JOB-mode teardown body, run after the grace. All steps best-effort.
+func (c *Cockpit) teardownJobPane(paneID, jobID string) {
+	ctx := context.Background()
 	c.bestEffort(ctx, "release-agent", func(cctx context.Context) error {
-		return c.client.releaseAgent(cctx, paneID, source, agentLabel)
+		return c.client.releaseAgent(cctx, paneID, herdrSource, "gm-"+shortJobID(jobID))
 	})
 	c.bestEffort(ctx, "pane close", func(cctx context.Context) error {
 		return c.client.paneClose(cctx, paneID)
 	})
-	if err := c.store.DeleteCockpitPaneByJob(ctx, a.meta.JobID); err != nil {
-		c.logf("cockpit: delete pane record for job %s: %v", a.meta.JobID, err)
+	if err := c.store.DeleteCockpitPaneByJob(ctx, jobID); err != nil {
+		c.logf("cockpit: delete pane record for job %s: %v", jobID, err)
 	}
+}
+
+// seatMode reports whether the cockpit keys panes by logical seat (Task 7) rather
+// than by job (P0). It centralizes the mode check so the open/Deliver/finalize
+// paths stay in lockstep.
+func (c *Cockpit) seatMode() bool {
+	return c != nil && c.opts.PaneKeyMode == PaneKeyModeSeat
 }
 
 // paneKey returns the pane's dedup key. In P0 (job mode) it is the job id; the
@@ -417,4 +548,226 @@ func (c *Cockpit) logf(format string, args ...any) {
 	if c.logger != nil {
 		c.logger.Debug(fmt.Sprintf(format, args...))
 	}
+}
+
+// FinalizeRoot tears down every pane opened under one orchestration root when its
+// coordination tree terminates (Task 7, seat mode): it closes each pane (and its
+// workspace), deletes the rows, and removes the root's seat-log directory. It is
+// the seat-mode teardown — job-mode panes already close per-Deliver — and is
+// idempotent and entirely best-effort: a finalize on a root with no panes (job
+// mode, or already finalized) is a cheap no-op, and a herdr/store failure on one
+// pane never blocks finalizing the rest. The daemon calls it once when the root's
+// tree reaches a terminal state.
+func (c *Cockpit) FinalizeRoot(ctx context.Context, rootJobID string) {
+	if c == nil {
+		return
+	}
+	rootJobID = strings.TrimSpace(rootJobID)
+	if rootJobID == "" {
+		return
+	}
+	panes, err := c.store.ListCockpitPanesByRoot(ctx, rootJobID)
+	if err != nil {
+		c.logf("cockpit: finalize root %s list panes: %v", rootJobID, err)
+		return
+	}
+	workspaces := map[string]struct{}{}
+	for _, pane := range panes {
+		if pane.PaneID != "" {
+			c.bestEffort(ctx, "report-agent idle", func(cctx context.Context) error {
+				return c.client.reportAgent(cctx, pane.PaneID, herdrSource, "gm-"+shortJobID(pane.JobID), agentStateIdle)
+			})
+			c.bestEffort(ctx, "release-agent", func(cctx context.Context) error {
+				return c.client.releaseAgent(cctx, pane.PaneID, herdrSource, "gm-"+shortJobID(pane.JobID))
+			})
+			c.bestEffort(ctx, "pane close", func(cctx context.Context) error {
+				return c.client.paneClose(cctx, pane.PaneID)
+			})
+		}
+		if pane.WorkspaceID != "" {
+			workspaces[pane.WorkspaceID] = struct{}{}
+		}
+		if pane.ID != "" {
+			if err := c.store.DeleteCockpitPane(ctx, pane.ID); err != nil {
+				c.logf("cockpit: finalize root %s delete pane %s: %v", rootJobID, pane.ID, err)
+			}
+		} else if pane.JobID != "" {
+			if err := c.store.DeleteCockpitPaneByJob(ctx, pane.JobID); err != nil {
+				c.logf("cockpit: finalize root %s delete pane for job %s: %v", rootJobID, pane.JobID, err)
+			}
+		}
+	}
+	for workspaceID := range workspaces {
+		c.bestEffort(ctx, "workspace close", func(cctx context.Context) error {
+			return c.client.workspaceClose(cctx, workspaceID)
+		})
+	}
+	// Remove the root's seat-log directory: the accumulating per-seat logs only
+	// backed the live tails, which are now closed, so they persist no longer than
+	// the root's life.
+	if dir := c.seatLogRootDir(rootJobID); dir != "" {
+		remove := c.removeAll
+		if remove == nil {
+			remove = os.RemoveAll
+		}
+		if err := remove(dir); err != nil {
+			c.logf("cockpit: finalize root %s remove seat logs %s: %v", rootJobID, dir, err)
+		}
+	}
+}
+
+// FocusRoot surfaces the orchestration root's workspace (Task 8, coordinator
+// reconvene): on the coordinator's terminal continuation the daemon calls this so
+// the reconvene view — where the coordinator pane already shows the synthesized
+// verdict, since its continuation shares the coordinator seat — is brought
+// forward. It uses `herdr workspace focus <workspace_id>` (herdr has no
+// focus-pane-by-id verb, only the directional `pane focus`, so workspace focus is
+// the closest supported reconvene gesture). Best-effort: any failure (no live
+// workspace, herdr down) is swallowed.
+func (c *Cockpit) FocusRoot(ctx context.Context, rootJobID string) {
+	if c == nil {
+		return
+	}
+	rootJobID = strings.TrimSpace(rootJobID)
+	if rootJobID == "" {
+		return
+	}
+	panes, err := c.store.ListCockpitPanesByRoot(ctx, rootJobID)
+	if err != nil || len(panes) == 0 {
+		if err != nil {
+			c.logf("cockpit: focus root %s list panes: %v", rootJobID, err)
+		}
+		return
+	}
+	workspaceID := ""
+	for _, pane := range panes {
+		if pane.WorkspaceID != "" {
+			workspaceID = pane.WorkspaceID
+			break
+		}
+	}
+	if workspaceID == "" {
+		return
+	}
+	c.bestEffort(ctx, "workspace focus", func(cctx context.Context) error {
+		return c.client.workspaceFocus(cctx, workspaceID)
+	})
+}
+
+// Reconcile is the low-frequency GC sweep (Task 7): it drops cockpit_pane rows
+// whose herdr pane is gone AND whose owning root job is terminal, so orphaned
+// rows (a daemon crash before teardown, a pane the user closed) do not accumulate.
+// It pairs with report-metadata --ttl-ms self-expiry on the herdr side. It is
+// cheap and entirely best-effort — every error is swallowed and the sweep simply
+// skips that row. rootTerminal reports whether a root's coordination tree has
+// fully terminated (the daemon supplies it from job state); a nil rootTerminal
+// treats every root as non-terminal, so nothing is dropped.
+func (c *Cockpit) Reconcile(ctx context.Context, rootTerminal func(rootJobID string) bool) {
+	if c == nil || rootTerminal == nil {
+		return
+	}
+	panes, err := c.store.ListAllCockpitPanes(ctx)
+	if err != nil {
+		c.logf("cockpit: reconcile list panes: %v", err)
+		return
+	}
+	if len(panes) == 0 {
+		return
+	}
+	live, ok := c.livePaneIDs(ctx)
+	if !ok {
+		// Could not enumerate live panes (herdr down / parse error): do nothing
+		// rather than risk dropping rows for panes that are actually alive.
+		return
+	}
+	terminalCache := map[string]bool{}
+	for _, pane := range panes {
+		if _, alive := live[pane.PaneID]; alive && pane.PaneID != "" {
+			continue
+		}
+		terminal, cached := terminalCache[pane.RootJobID]
+		if !cached {
+			terminal = rootTerminal(pane.RootJobID)
+			terminalCache[pane.RootJobID] = terminal
+		}
+		if !terminal {
+			continue
+		}
+		if pane.ID != "" {
+			if err := c.store.DeleteCockpitPane(ctx, pane.ID); err != nil {
+				c.logf("cockpit: reconcile delete pane %s: %v", pane.ID, err)
+			}
+		} else if pane.JobID != "" {
+			if err := c.store.DeleteCockpitPaneByJob(ctx, pane.JobID); err != nil {
+				c.logf("cockpit: reconcile delete pane for job %s: %v", pane.JobID, err)
+			}
+		}
+	}
+}
+
+// livePaneIDs returns the set of pane ids herdr currently reports (`herdr pane
+// list`). The bool is false when the list could not be obtained (herdr down /
+// parse error), so the reconcile caller can skip dropping rows rather than risk
+// removing live panes.
+func (c *Cockpit) livePaneIDs(ctx context.Context) (map[string]struct{}, bool) {
+	cctx, cancel := context.WithTimeout(ctx, herdrCallTimeout)
+	defer cancel()
+	ids, err := c.client.paneList(cctx)
+	if err != nil {
+		c.logf("cockpit: reconcile pane list: %v", err)
+		return nil, false
+	}
+	set := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		set[id] = struct{}{}
+	}
+	return set, true
+}
+
+// SeatLogPath returns the stable per-seat append-log path for a (root, paneKey)
+// seat: <home>/logs/seats/<rootShort>/<seatSlug>.log. In seat mode the daemon
+// opens this O_APPEND (not per-job O_TRUNC) so the seat's one pane tails one file
+// that accumulates the seat's output across delegation rounds — no tail
+// re-pointing needed. It returns "" when home is unset so the caller falls back
+// to the P0 pane. paneKey is slugified so an agent name with path-unsafe
+// characters cannot escape the seat-log directory.
+func (c *Cockpit) SeatLogPath(rootJobID, paneKey string) string {
+	dir := c.seatLogRootDir(rootJobID)
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, seatSlug(paneKey)+".log")
+}
+
+// seatLogRootDir is the per-root seat-log directory removed on finalize:
+// <home>/logs/seats/<rootShort>. It returns "" when home is unset.
+func (c *Cockpit) seatLogRootDir(rootJobID string) string {
+	if c == nil || c.home == "" {
+		return ""
+	}
+	return filepath.Join(c.home, "logs", "seats", shortJobID(rootJobID))
+}
+
+// seatSlug maps a pane key (e.g. an agent name) to a filesystem-safe slug for the
+// seat-log filename. Any character outside [A-Za-z0-9._-] becomes '_', so a key
+// like "owner/repo" or "" cannot traverse out of the seat-log directory.
+func seatSlug(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "seat"
+	}
+	var b strings.Builder
+	for _, r := range key {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	out := b.String()
+	if out == "" {
+		return "seat"
+	}
+	return out
 }

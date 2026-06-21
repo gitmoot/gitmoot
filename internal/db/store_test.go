@@ -3298,6 +3298,96 @@ func TestDeleteCockpitPaneByJob(t *testing.T) {
 	}
 }
 
+// TestGetCockpitPaneByKey: the seat-reuse lookup finds the pane for a
+// (workspace_id, pane_key) seat and reports a clean miss (false, nil) — never
+// sql.ErrNoRows — when none exists.
+func TestGetCockpitPaneByKey(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	pane := CockpitPane{
+		JobID:       "job-seat",
+		PaneKey:     "seat:builder",
+		RootJobID:   "root",
+		PaneID:      "pane-seat",
+		WorkspaceID: "ws-1",
+		Source:      "custom:gitmoot",
+	}
+	if err := store.InsertCockpitPane(ctx, pane); err != nil {
+		t.Fatalf("InsertCockpitPane returned error: %v", err)
+	}
+
+	got, found, err := store.GetCockpitPaneByKey(ctx, "ws-1", "seat:builder")
+	if err != nil {
+		t.Fatalf("GetCockpitPaneByKey returned error: %v", err)
+	}
+	if !found {
+		t.Fatal("GetCockpitPaneByKey did not find the seat pane")
+	}
+	if got.PaneID != "pane-seat" || got.JobID != "job-seat" {
+		t.Fatalf("GetCockpitPaneByKey = %+v, want pane-seat/job-seat", got)
+	}
+
+	// A miss is a clean (false, nil), not sql.ErrNoRows.
+	_, found, err = store.GetCockpitPaneByKey(ctx, "ws-1", "seat:nobody")
+	if err != nil {
+		t.Fatalf("GetCockpitPaneByKey(miss) returned error: %v", err)
+	}
+	if found {
+		t.Fatal("GetCockpitPaneByKey(miss) reported found")
+	}
+	_, found, err = store.GetCockpitPaneByKey(ctx, "ws-other", "seat:builder")
+	if err != nil || found {
+		t.Fatalf("GetCockpitPaneByKey(other workspace) = (found=%v, err=%v), want (false, nil)", found, err)
+	}
+}
+
+// TestListAllCockpitPanes: the reconcile sweep can enumerate every pane across all
+// roots, oldest first.
+func TestListAllCockpitPanes(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	if all, err := store.ListAllCockpitPanes(ctx); err != nil || len(all) != 0 {
+		t.Fatalf("ListAllCockpitPanes(empty) = (%d rows, %v), want (0, nil)", len(all), err)
+	}
+
+	panes := []CockpitPane{
+		{JobID: "job-1", PaneKey: "seat:a", RootJobID: "root-1", PaneID: "p1", WorkspaceID: "ws-1"},
+		{JobID: "job-2", PaneKey: "seat:b", RootJobID: "root-1", PaneID: "p2", WorkspaceID: "ws-1"},
+		{JobID: "job-3", PaneKey: "seat:c", RootJobID: "root-2", PaneID: "p3", WorkspaceID: "ws-2"},
+	}
+	for _, p := range panes {
+		if err := store.InsertCockpitPane(ctx, p); err != nil {
+			t.Fatalf("InsertCockpitPane(%s) returned error: %v", p.JobID, err)
+		}
+	}
+	all, err := store.ListAllCockpitPanes(ctx)
+	if err != nil {
+		t.Fatalf("ListAllCockpitPanes returned error: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("ListAllCockpitPanes = %d rows, want 3", len(all))
+	}
+	seen := map[string]bool{}
+	for _, p := range all {
+		seen[p.JobID] = true
+	}
+	for _, want := range []string{"job-1", "job-2", "job-3"} {
+		if !seen[want] {
+			t.Fatalf("ListAllCockpitPanes missing %s; got %+v", want, all)
+		}
+	}
+}
+
 func TestGetOrCreateWorkspaceForRoot(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))

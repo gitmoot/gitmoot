@@ -4684,11 +4684,51 @@ func (s *Store) GetCockpitPaneByJob(ctx context.Context, jobID string) (CockpitP
 	return scanCockpitPane(row)
 }
 
+// GetCockpitPaneByKey returns the live pane for a (workspace_id, pane_key) seat,
+// if one exists (issue #357, seat mode). The bool reports found; a not-found row
+// is (CockpitPane{}, false, nil) — sql.ErrNoRows is never surfaced — so the
+// seat-reuse fail-open path can treat "no pane yet" as a clean miss rather than an
+// error. The (workspace_id, pane_key) pair is UNIQUE, so at most one row matches.
+func (s *Store) GetCockpitPaneByKey(ctx context.Context, workspaceID, paneKey string) (CockpitPane, bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, job_id, pane_key, root_job_id, pane_id, workspace_id, source, created_at
+		FROM cockpit_panes WHERE workspace_id = ? AND pane_key = ?`,
+		strings.TrimSpace(workspaceID), strings.TrimSpace(paneKey))
+	pane, err := scanCockpitPane(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CockpitPane{}, false, nil
+	}
+	if err != nil {
+		return CockpitPane{}, false, err
+	}
+	return pane, true, nil
+}
+
 // ListCockpitPanesByRoot returns every pane opened under one orchestration root,
 // oldest first, so the cockpit can tear them all down on root finalize.
 func (s *Store) ListCockpitPanesByRoot(ctx context.Context, rootJobID string) ([]CockpitPane, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, job_id, pane_key, root_job_id, pane_id, workspace_id, source, created_at
 		FROM cockpit_panes WHERE root_job_id = ? ORDER BY created_at, id`, strings.TrimSpace(rootJobID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var panes []CockpitPane
+	for rows.Next() {
+		pane, err := scanCockpitPane(rows)
+		if err != nil {
+			return nil, err
+		}
+		panes = append(panes, pane)
+	}
+	return panes, rows.Err()
+}
+
+// ListAllCockpitPanes returns every recorded pane across all roots, oldest first.
+// The reconcile GC uses it to find orphaned rows (pane gone from herdr + owning
+// root terminal) without scanning per-root.
+func (s *Store) ListAllCockpitPanes(ctx context.Context) ([]CockpitPane, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, job_id, pane_key, root_job_id, pane_id, workspace_id, source, created_at
+		FROM cockpit_panes ORDER BY created_at, id`)
 	if err != nil {
 		return nil, err
 	}

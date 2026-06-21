@@ -3,6 +3,9 @@ package cockpit
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -35,7 +38,9 @@ func newFakeRunner() *fakeRunner {
 		"pane run":           {stdout: `{}`},
 		"pane release-agent": {stdout: `{}`},
 		"pane close":         {stdout: `{}`},
+		"pane list":          {stdout: `{"result":{"panes":[]}}`},
 		"workspace close":    {stdout: `{}`},
+		"workspace focus":    {stdout: `{}`},
 	}}
 }
 
@@ -86,13 +91,18 @@ func okLookPath(string) (string, error) { return "/usr/bin/herdr", nil }
 
 func failLookPath(string) (string, error) { return "", errors.New("not found") }
 
-// fakeStore is an in-memory PaneStore with a one-workspace-per-root registry.
+// fakeStore is an in-memory PaneStore with a one-workspace-per-root registry. It
+// enforces UNIQUE(workspace_id, pane_key) on insert (like the real store) so the
+// seat-reuse convergence can be asserted, and assigns a generated ID to each row
+// so reconcile/finalize (which address panes by ID) round-trip.
 type fakeStore struct {
 	mu         sync.Mutex
 	panes      map[string]Pane // keyed by job id
 	workspaces map[string]string
 	createN    int
 	insertErr  error
+	byKeyErr   error
+	nextID     int
 }
 
 func newFakeStore() *fakeStore {
@@ -105,6 +115,17 @@ func (s *fakeStore) InsertCockpitPane(_ context.Context, pane Pane) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Enforce UNIQUE(workspace_id, pane_key): a second open for the same seat is a
+	// duplicate the cockpit treats as "pane already exists, reuse it".
+	for _, p := range s.panes {
+		if p.WorkspaceID == pane.WorkspaceID && p.PaneKey == pane.PaneKey {
+			return errors.New("UNIQUE constraint failed: cockpit_panes.workspace_id, cockpit_panes.pane_key")
+		}
+	}
+	if pane.ID == "" {
+		s.nextID++
+		pane.ID = "pane-id-" + strconv.Itoa(s.nextID)
+	}
 	s.panes[pane.JobID] = pane
 	return nil
 }
@@ -119,6 +140,20 @@ func (s *fakeStore) GetCockpitPaneByJob(_ context.Context, jobID string) (Pane, 
 	return p, nil
 }
 
+func (s *fakeStore) GetCockpitPaneByKey(_ context.Context, workspaceID, paneKey string) (Pane, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.byKeyErr != nil {
+		return Pane{}, false, s.byKeyErr
+	}
+	for _, p := range s.panes {
+		if p.WorkspaceID == workspaceID && p.PaneKey == paneKey {
+			return p, true, nil
+		}
+	}
+	return Pane{}, false, nil
+}
+
 func (s *fakeStore) ListCockpitPanesByRoot(_ context.Context, rootJobID string) ([]Pane, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -127,6 +162,16 @@ func (s *fakeStore) ListCockpitPanesByRoot(_ context.Context, rootJobID string) 
 		if p.RootJobID == rootJobID {
 			out = append(out, p)
 		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) ListAllCockpitPanes(_ context.Context) ([]Pane, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Pane, 0, len(s.panes))
+	for _, p := range s.panes {
+		out = append(out, p)
 	}
 	return out, nil
 }
@@ -596,6 +641,343 @@ func TestShortJobID(t *testing.T) {
 	for in, want := range cases {
 		if got := shortJobID(in); got != want {
 			t.Errorf("shortJobID(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// countVerb counts how many times a verb key appears in the runner's call log.
+func countVerb(fr *fakeRunner, verb string) int {
+	n := 0
+	for _, v := range fr.verbs() {
+		if v == verb {
+			n++
+		}
+	}
+	return n
+}
+
+// seatMeta is a seat-mode JobMeta: the same seat (pane_key) shared across rounds
+// by distinct jobs under one root.
+func seatMeta(jobID, paneKey string) JobMeta {
+	return JobMeta{
+		JobID:     jobID,
+		RootJobID: "root-seat",
+		Agent:     "builder",
+		Action:    "implement",
+		Branch:    "feat/x",
+		Worktree:  "/tmp/wt",
+		PaneKey:   paneKey,
+		Depth:     1,
+	}
+}
+
+// TestSeatModeReusesPaneAcrossRounds: in seat mode, two deliveries on the SAME
+// seat (pane_key) under one root split exactly one pane (the first), then reuse
+// it — no second `pane split`, no second `workspace create`, and the seat row
+// persists (it is NOT deleted per-Deliver as job mode does).
+func TestSeatModeReusesPaneAcrossRounds(t *testing.T) {
+	fr := newFakeRunner()
+	store := newFakeStore()
+	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, store, fr.run, okLookPath)
+
+	round1 := c.Wrap(&fakeInner{}, seatMeta("job-r1", "builder"))
+	if _, err := round1.Deliver(context.Background(), runtime.Agent{}, runtime.Job{}); err != nil {
+		t.Fatalf("round 1: %v", err)
+	}
+	round2 := c.Wrap(&fakeInner{}, seatMeta("job-r2", "builder"))
+	if _, err := round2.Deliver(context.Background(), runtime.Agent{}, runtime.Job{}); err != nil {
+		t.Fatalf("round 2: %v", err)
+	}
+
+	if got := countVerb(fr, "pane split"); got != 1 {
+		t.Fatalf("pane split count = %d, want 1 (seat reuse must not re-split); calls: %v", got, fr.calls)
+	}
+	if store.createN != 1 {
+		t.Fatalf("workspace created %d times, want 1 (one workspace per root)", store.createN)
+	}
+	if got := countVerb(fr, "pane close"); got != 0 {
+		t.Fatalf("pane close count = %d, want 0 (seat panes persist until root finalize)", got)
+	}
+	// The seat pane row persists for reuse (keyed by its first job's id here).
+	panes, _ := store.ListCockpitPanesByRoot(context.Background(), "root-seat")
+	if len(panes) != 1 {
+		t.Fatalf("seat rows = %d, want 1 (one row per seat); rows: %+v", len(panes), panes)
+	}
+	// On reuse the pane is re-marked working and the tail is (idempotently) re-run.
+	if got := countVerb(fr, "pane run"); got < 2 {
+		t.Fatalf("pane run count = %d, want >= 2 (reuse ensures the tail is running)", got)
+	}
+}
+
+// TestSeatModeDistinctSeatsSplitDistinctPanes: two different seats under one root
+// each get their own pane (one split each).
+func TestSeatModeDistinctSeatsSplitDistinctPanes(t *testing.T) {
+	fr := newFakeRunner()
+	fr.replies["pane split"] = reply{stdout: `{"result":{"pane":{"pane_id":"w1:pX"}}}`}
+	store := newFakeStore()
+	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, store, fr.run, okLookPath)
+
+	a := c.Wrap(&fakeInner{}, seatMeta("job-a", "builder"))
+	if _, err := a.Deliver(context.Background(), runtime.Agent{}, runtime.Job{}); err != nil {
+		t.Fatal(err)
+	}
+	b := c.Wrap(&fakeInner{}, seatMeta("job-b", "reviewer"))
+	if _, err := b.Deliver(context.Background(), runtime.Agent{}, runtime.Job{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := countVerb(fr, "pane split"); got != 2 {
+		t.Fatalf("pane split count = %d, want 2 (distinct seats)", got)
+	}
+	panes, _ := store.ListCockpitPanesByRoot(context.Background(), "root-seat")
+	if len(panes) != 2 {
+		t.Fatalf("seat rows = %d, want 2", len(panes))
+	}
+}
+
+// TestSeatModeDeliverMarksIdleNotClosed: a seat-mode Deliver, on return, reports
+// the agent idle but never releases/closes the pane (that is root-finalize's job).
+func TestSeatModeDeliverMarksIdleNotClosed(t *testing.T) {
+	fr := newFakeRunner()
+	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, newFakeStore(), fr.run, okLookPath)
+	adapter := c.Wrap(&fakeInner{}, seatMeta("job-1", "builder"))
+	if _, err := adapter.Deliver(context.Background(), runtime.Agent{}, runtime.Job{}); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(fr.calls, "\n")
+	if !strings.Contains(joined, "--state idle") {
+		t.Fatalf("expected report-agent idle on seat-mode return; calls:\n%s", joined)
+	}
+	if countVerb(fr, "pane release-agent") != 0 || countVerb(fr, "pane close") != 0 {
+		t.Fatalf("seat-mode Deliver must not release/close the pane; calls: %v", fr.calls)
+	}
+}
+
+// TestSeatModeConvergesOnUniqueViolation: when the open-time root list misses the
+// seat (a racing open) but the insert then hits the UNIQUE(workspace_id,pane_key)
+// constraint, the loser closes the pane it split and converges on the winner's
+// pane (found via GetCockpitPaneByKey) — the seat stays one pane.
+func TestSeatModeConvergesOnUniqueViolation(t *testing.T) {
+	fr := newFakeRunner()
+	base := newFakeStore()
+	// Pre-seed the winning seat pane row (the race winner already persisted it).
+	base.workspaces["root-seat"] = "w1"
+	base.panes["winner-job"] = Pane{ID: "pane-id-win", JobID: "winner-job", PaneKey: "builder", RootJobID: "root-seat", PaneID: "w1:pWIN", WorkspaceID: "w1"}
+	// The wrapper hides the winner from the open-time root list (one-shot) so the
+	// loser proceeds to split + insert and hits the UNIQUE constraint; the row is
+	// still present for the insert constraint + the post-violation by-key lookup.
+	hiding := &hideThenShowStore{fakeStore: base}
+	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, hiding, fr.run, okLookPath)
+
+	adapter := c.Wrap(&fakeInner{}, seatMeta("loser-job", "builder"))
+	paneID := adapter.(*paneAdapter).open(context.Background())
+	if paneID != "w1:pWIN" {
+		t.Fatalf("loser must converge on the winner's pane, got %q", paneID)
+	}
+	// Still exactly one seat row (the loser's split pane was not persisted).
+	rows, _ := base.ListCockpitPanesByRoot(context.Background(), "root-seat")
+	if len(rows) != 1 {
+		t.Fatalf("seat rows after convergence = %d, want 1; rows: %+v", len(rows), rows)
+	}
+	if countVerb(fr, "pane close") == 0 {
+		t.Fatalf("loser must close its redundant pane on the UNIQUE violation; calls: %v", fr.calls)
+	}
+}
+
+// hideThenShowStore hides the seat row from the open-time root list (one-shot) but
+// still enforces UNIQUE on insert and reveals the row on the post-violation by-key
+// lookup, exercising the convergence-on-violation path.
+type hideThenShowStore struct {
+	*fakeStore
+	lists int
+}
+
+func (s *hideThenShowStore) ListCockpitPanesByRoot(ctx context.Context, rootJobID string) ([]Pane, error) {
+	s.lists++
+	if s.lists == 1 {
+		return nil, nil // hide the seat from the open-time reuse scan
+	}
+	return s.fakeStore.ListCockpitPanesByRoot(ctx, rootJobID)
+}
+
+// TestFinalizeRootClosesDeletesAndRemovesSeatLogs: FinalizeRoot closes every
+// pane under a root, closes the workspace, deletes the rows, and removes the
+// root's seat-log directory.
+func TestFinalizeRootClosesDeletesAndRemovesSeatLogs(t *testing.T) {
+	fr := newFakeRunner()
+	store := newFakeStore()
+	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, store, fr.run, okLookPath)
+	home := t.TempDir()
+	c.home = home
+
+	// Open two seats under the root.
+	for _, seat := range []struct{ job, key string }{{"job-a", "builder"}, {"job-b", "reviewer"}} {
+		fr.replies["pane split"] = reply{stdout: `{"result":{"pane":{"pane_id":"w1:` + seat.key + `"}}}`}
+		adapter := c.Wrap(&fakeInner{}, seatMeta(seat.job, seat.key))
+		if _, err := adapter.Deliver(context.Background(), runtime.Agent{}, runtime.Job{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Create the seat-log directory + files that finalize must remove.
+	seatDir := c.seatLogRootDir("root-seat")
+	if err := os.MkdirAll(seatDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(seatDir, "builder.log"), []byte("history"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c.FinalizeRoot(context.Background(), "root-seat")
+
+	if got := countVerb(fr, "pane close"); got != 2 {
+		t.Fatalf("pane close count = %d, want 2 (one per seat)", got)
+	}
+	if got := countVerb(fr, "workspace close"); got != 1 {
+		t.Fatalf("workspace close count = %d, want 1 (one per root workspace)", got)
+	}
+	rows, _ := store.ListCockpitPanesByRoot(context.Background(), "root-seat")
+	if len(rows) != 0 {
+		t.Fatalf("rows after finalize = %d, want 0; rows: %+v", len(rows), rows)
+	}
+	if _, err := os.Stat(seatDir); !os.IsNotExist(err) {
+		t.Fatalf("seat-log dir still exists after finalize: %v", err)
+	}
+}
+
+// TestFinalizeRootNoPanesIsNoop: finalizing a root with no panes (job mode, or
+// already finalized) is a cheap no-op with no herdr calls beyond the list.
+func TestFinalizeRootNoPanesIsNoop(t *testing.T) {
+	fr := newFakeRunner()
+	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, newFakeStore(), fr.run, okLookPath)
+	c.FinalizeRoot(context.Background(), "root-empty")
+	if countVerb(fr, "pane close") != 0 || countVerb(fr, "workspace close") != 0 {
+		t.Fatalf("finalize of an empty root must make no close calls; calls: %v", fr.calls)
+	}
+}
+
+// TestReconcileDropsOrphans: reconcile drops rows whose pane is gone from herdr
+// AND whose root is terminal; it keeps rows that are still live, and keeps rows
+// whose root is not terminal even if the pane is gone.
+func TestReconcileDropsOrphans(t *testing.T) {
+	fr := newFakeRunner()
+	// herdr reports only "w1:live" as a live pane.
+	fr.replies["pane list"] = reply{stdout: `{"result":{"panes":[{"pane_id":"w1:live"}]}}`}
+	store := newFakeStore()
+	// orphan-terminal: pane gone + root terminal -> dropped
+	store.panes["job-orphan"] = Pane{ID: "id-orphan", JobID: "job-orphan", PaneID: "w1:gone", RootJobID: "root-done", WorkspaceID: "w1"}
+	// live: pane present -> kept regardless of root state
+	store.panes["job-live"] = Pane{ID: "id-live", JobID: "job-live", PaneID: "w1:live", RootJobID: "root-done", WorkspaceID: "w1"}
+	// orphan-active: pane gone but root NOT terminal -> kept
+	store.panes["job-active"] = Pane{ID: "id-active", JobID: "job-active", PaneID: "w1:gone2", RootJobID: "root-busy", WorkspaceID: "w1"}
+
+	c := newWithRunner(Options{}, store, fr.run, okLookPath)
+	terminal := func(root string) bool { return root == "root-done" }
+	c.Reconcile(context.Background(), terminal)
+
+	all, _ := store.ListAllCockpitPanes(context.Background())
+	got := map[string]bool{}
+	for _, p := range all {
+		got[p.JobID] = true
+	}
+	if got["job-orphan"] {
+		t.Fatalf("orphan-terminal row should be dropped; remaining: %+v", all)
+	}
+	if !got["job-live"] {
+		t.Fatalf("live row should be kept; remaining: %+v", all)
+	}
+	if !got["job-active"] {
+		t.Fatalf("orphan under a non-terminal root should be kept; remaining: %+v", all)
+	}
+}
+
+// TestReconcileSkipsWhenPaneListUnavailable: if `herdr pane list` errors, reconcile
+// drops nothing (it must not remove rows for panes that may be alive).
+func TestReconcileSkipsWhenPaneListUnavailable(t *testing.T) {
+	fr := newFakeRunner()
+	fr.replies["pane list"] = reply{err: errors.New("herdr down")}
+	store := newFakeStore()
+	store.panes["job-orphan"] = Pane{ID: "id-orphan", JobID: "job-orphan", PaneID: "w1:gone", RootJobID: "root-done", WorkspaceID: "w1"}
+	c := newWithRunner(Options{}, store, fr.run, okLookPath)
+	c.Reconcile(context.Background(), func(string) bool { return true })
+	all, _ := store.ListAllCockpitPanes(context.Background())
+	if len(all) != 1 {
+		t.Fatalf("reconcile must not drop rows when pane list is unavailable; rows: %+v", all)
+	}
+}
+
+// TestFocusRootFocusesWorkspace: FocusRoot focuses the root's workspace (Task 8
+// reconvene). With no panes it is a no-op.
+func TestFocusRootFocusesWorkspace(t *testing.T) {
+	fr := newFakeRunner()
+	store := newFakeStore()
+	store.panes["coord"] = Pane{ID: "id-c", JobID: "coord", PaneID: "w7:pC", RootJobID: "root-x", WorkspaceID: "w7"}
+	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, store, fr.run, okLookPath)
+	c.FocusRoot(context.Background(), "root-x")
+	joined := strings.Join(fr.calls, "\n")
+	if !strings.Contains(joined, "workspace focus w7") {
+		t.Fatalf("expected `workspace focus w7`; calls:\n%s", joined)
+	}
+
+	fr2 := newFakeRunner()
+	c2 := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, newFakeStore(), fr2.run, okLookPath)
+	c2.FocusRoot(context.Background(), "root-none")
+	if countVerb(fr2, "workspace focus") != 0 {
+		t.Fatalf("focus with no panes must be a no-op; calls: %v", fr2.calls)
+	}
+}
+
+// TestJobModeGraceCloseStillTearsDown: job mode is unchanged — a Deliver opens,
+// runs, and tears the pane down (release + close + row delete) after the grace
+// (synchronous in tests). The seat-only behaviors do not leak into job mode.
+func TestJobModeGraceCloseStillTearsDown(t *testing.T) {
+	fr := newFakeRunner()
+	store := newFakeStore()
+	c := newWithRunner(Options{}, store, fr.run, okLookPath) // default = job mode
+	adapter := c.Wrap(&fakeInner{}, sampleMeta())
+	if _, err := adapter.Deliver(context.Background(), runtime.Agent{}, runtime.Job{ID: "abcdef0123456789"}); err != nil {
+		t.Fatal(err)
+	}
+	if countVerb(fr, "pane close") != 1 || countVerb(fr, "pane release-agent") != 1 {
+		t.Fatalf("job mode must release + close the pane per Deliver; calls: %v", fr.calls)
+	}
+	// Idle is reported before the close (so a finished job never reads as working).
+	joined := strings.Join(fr.calls, "\n")
+	if !strings.Contains(joined, "--state idle") {
+		t.Fatalf("job mode must report idle on teardown; calls:\n%s", joined)
+	}
+	if _, err := store.GetCockpitPaneByJob(context.Background(), "abcdef0123456789"); err == nil {
+		t.Fatal("job-mode row must be deleted on teardown")
+	}
+}
+
+// TestSeatLogPath builds the stable per-seat append-log path and slugs unsafe keys.
+func TestSeatLogPath(t *testing.T) {
+	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, newFakeStore(), newFakeRunner().run, okLookPath)
+	if got := c.SeatLogPath("root-x", "builder"); got != "" {
+		t.Fatalf("empty home must yield empty seat-log path, got %q", got)
+	}
+	c.home = "/home/g"
+	want := filepath.Join("/home/g", "logs", "seats", "root-x", "builder.log")
+	if got := c.SeatLogPath("root-x", "builder"); got != want {
+		t.Fatalf("SeatLogPath = %q, want %q", got, want)
+	}
+	// A path-unsafe key is slugified so it cannot escape the seat-log dir.
+	wantSlug := filepath.Join("/home/g", "logs", "seats", "root-x", "owner_repo.log")
+	if got := c.SeatLogPath("root-x", "owner/repo"); got != wantSlug {
+		t.Fatalf("SeatLogPath(unsafe) = %q, want %q", got, wantSlug)
+	}
+}
+
+func TestSeatSlug(t *testing.T) {
+	cases := map[string]string{
+		"builder":    "builder",
+		"owner/repo": "owner_repo",
+		"":           "seat",
+		"a.b-c_d":    "a.b-c_d",
+		"../escape":  ".._escape",
+	}
+	for in, want := range cases {
+		if got := seatSlug(in); got != want {
+			t.Errorf("seatSlug(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

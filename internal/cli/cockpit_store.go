@@ -28,8 +28,28 @@ func (s cockpitPaneStore) GetCockpitPaneByJob(ctx context.Context, jobID string)
 	return fromDBCockpitPane(pane), nil
 }
 
+func (s cockpitPaneStore) GetCockpitPaneByKey(ctx context.Context, workspaceID, paneKey string) (cockpit.Pane, bool, error) {
+	pane, found, err := s.store.GetCockpitPaneByKey(ctx, workspaceID, paneKey)
+	if err != nil || !found {
+		return cockpit.Pane{}, found, err
+	}
+	return fromDBCockpitPane(pane), true, nil
+}
+
 func (s cockpitPaneStore) ListCockpitPanesByRoot(ctx context.Context, rootJobID string) ([]cockpit.Pane, error) {
 	panes, err := s.store.ListCockpitPanesByRoot(ctx, rootJobID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]cockpit.Pane, 0, len(panes))
+	for _, pane := range panes {
+		out = append(out, fromDBCockpitPane(pane))
+	}
+	return out, nil
+}
+
+func (s cockpitPaneStore) ListAllCockpitPanes(ctx context.Context) ([]cockpit.Pane, error) {
+	panes, err := s.store.ListAllCockpitPanes(ctx)
 	if err != nil {
 		return nil, err
 	}

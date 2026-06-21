@@ -181,6 +181,44 @@ func (c herdrClient) workspaceClose(ctx context.Context, workspace string) error
 	return err
 }
 
+// workspaceFocus runs `herdr workspace focus <workspace>` to bring a workspace
+// forward (Task 8 reconvene). herdr has no focus-pane-by-id verb (only the
+// directional `pane focus`), so workspace focus is the closest supported gesture.
+func (c herdrClient) workspaceFocus(ctx context.Context, workspace string) error {
+	_, err := c.run(ctx, "workspace", "focus", workspace)
+	return err
+}
+
+// paneListResult mirrors `herdr pane list`: only each pane's id is load-bearing
+// for the reconcile GC (which pane rows still have a live herdr pane).
+type paneListResult struct {
+	Result struct {
+		Panes []struct {
+			PaneID string `json:"pane_id"`
+		} `json:"panes"`
+	} `json:"result"`
+}
+
+// paneList runs `herdr pane list` and returns every live pane id. It backs the
+// reconcile sweep, which drops cockpit_pane rows whose pane is no longer present.
+func (c herdrClient) paneList(ctx context.Context) ([]string, error) {
+	out, err := c.run(ctx, "pane", "list")
+	if err != nil {
+		return nil, err
+	}
+	var pl paneListResult
+	if err := json.Unmarshal([]byte(out), &pl); err != nil {
+		return nil, fmt.Errorf("parse pane list: %w", err)
+	}
+	ids := make([]string, 0, len(pl.Result.Panes))
+	for _, p := range pl.Result.Panes {
+		if p.PaneID != "" {
+			ids = append(ids, p.PaneID)
+		}
+	}
+	return ids, nil
+}
+
 // shortJobID trims a job id to the 8-char form used in the gm-<jobid8> agent
 // label (the spike's verified report-agent --agent convention).
 func shortJobID(jobID string) string {

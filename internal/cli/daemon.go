@@ -828,6 +828,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 			workerErr = startSupervisorWorkerLoop(ctx, daemonWorkerLoopInterval, func(now time.Time) error {
 				return runEnabledRepoWorkerTicksWithLocks(ctx, store, worker, workers, stdout, now, checkoutLocks)
 			})
+			startCockpitReconcileLoop(ctx, store, paths.Home, stdout)
 		}
 		for {
 			if err := receiveSupervisorWorkerError(workerErr); err != nil {
@@ -880,6 +881,7 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		defer checkoutLock.Unlock()
 		return runDaemonWorkerTick(ctx, store, worker, workers, false, d.Repo.FullName(), stdout, now)
 	})
+	startCockpitReconcileLoop(ctx, store, home, stdout)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -945,6 +947,49 @@ func receiveSupervisorWorkerError(errCh <-chan error) error {
 	default:
 		return nil
 	}
+}
+
+// startCockpitReconcileLoop runs the low-frequency cockpit reconcile GC in the
+// background until ctx is cancelled (Task 7). Each tick drops cockpit_pane rows
+// whose herdr pane is gone AND whose owning root is terminal, complementing the
+// per-Deliver / root-finalize teardown and report-metadata --ttl-ms self-expiry.
+// It is entirely best-effort: it is gated on herdr availability (so a host without
+// herdr never sweeps), uses the auto-policy cockpit, and swallows every error. It
+// never blocks the supervisor's poll/worker loops. A policy load failure or a
+// disabled cockpit simply skips the sweep.
+func startCockpitReconcileLoop(ctx context.Context, store *db.Store, home string, stdout io.Writer) {
+	worker := defaultJobWorker(store, stdout, home)
+	go func() {
+		ticker := time.NewTicker(cockpitReconcileInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				reconcileCockpitPanesOnce(ctx, worker)
+			}
+		}
+	}()
+}
+
+// reconcileCockpitPanesOnce performs one best-effort cockpit reconcile sweep. It
+// builds the cockpit from the host orchestrate policy, skips when the cockpit is
+// disabled or herdr is unreachable, and otherwise asks cockpit.Reconcile to drop
+// orphaned rows (pane gone + root terminal). All errors are swallowed.
+func reconcileCockpitPanesOnce(ctx context.Context, worker jobWorker) {
+	policy, err := worker.orchestratePolicy()
+	if err != nil || policy.CockpitMode == config.CockpitModeOff {
+		return
+	}
+	cp := worker.newCockpit(policy)
+	if cp == nil || !cp.Available(ctx) {
+		return
+	}
+	cp.Reconcile(ctx, func(rootJobID string) bool {
+		terminal, terr := worker.rootTreeTerminal(ctx, rootJobID)
+		return terr == nil && terminal
+	})
 }
 
 type repoCheckoutLocks struct {
@@ -1149,6 +1194,12 @@ type jobWorker struct {
 const daemonRunningJobStaleAfter = 30 * time.Minute
 const daemonJobCancelPollInterval = 250 * time.Millisecond
 const daemonWorkerLoopInterval = 1 * time.Second
+
+// cockpitReconcileInterval is the low-frequency cadence of the cockpit reconcile
+// GC sweep (Task 7): it drops cockpit_pane rows whose herdr pane is gone and whose
+// owning root is terminal. It runs rarely because it is a backstop for the
+// per-Deliver / root-finalize teardown plus report-metadata --ttl-ms self-expiry.
+const cockpitReconcileInterval = 5 * time.Minute
 
 var errRuntimeSessionBusy = errors.New("runtime session is busy")
 
@@ -1709,22 +1760,32 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			cp = w.newCockpit(policy)
 		}
 		meta := cockpitJobMeta(job, payload, agent, checkout, policy.CockpitPaneKey)
+		seatMode := policy.CockpitPaneKey == config.CockpitPaneKeySeat
 		// Only when the cockpit will actually wrap (herdr available) do we tee the
-		// child's live output into a per-job log the pane tails (Task 6). The tee
-		// rebuilds the inner adapter with a group-kill-preserving TeeRunner and sets
+		// child's live output into a log the pane tails (Task 6). The tee rebuilds
+		// the inner adapter with a group-kill-preserving TeeRunner and sets
 		// meta.LogPath; on any log-setup failure it falls back to no LogPath (the P0
 		// `job watch` pane). The non-cockpit / unavailable paths never create a log
 		// file or tee — they stay byte-identical.
+		//
+		// Job mode uses a per-job truncate log removed when the job finishes. Seat
+		// mode (Task 7) uses a STABLE per-seat append log so the one seat pane tails
+		// one file that accumulates the seat's history across delegation rounds — it
+		// is opened O_APPEND and is NOT removed per job (it persists for the root's
+		// life and is torn down by FinalizeRoot).
 		if maybeWrapCockpitAvailable(cp, payload.Cockpit, userOptedOff) {
-			if teeAdapter, logPath, logFile := w.cockpitTeeAdapter(agent, checkout, job.ID); logFile != nil {
+			teeAdapter, logPath, logFile := w.cockpitLogAdapter(cp, agent, checkout, job.ID, meta.RootJobID, meta.PaneKey, seatMode)
+			if logFile != nil {
 				defer func() {
 					if err := logFile.Close(); err != nil {
 						writeLine(w.Stdout, "job %s cockpit log close failed: %v", job.ID, err)
 					}
-					// The per-job log only backs the live pane tail, which is torn
-					// down with the job; remove it so cockpit logs don't accumulate
-					// one-file-per-job. Best-effort: a leftover log never matters.
-					_ = os.Remove(logPath)
+					// Job mode: the per-job log only backs a per-job pane torn down with
+					// the job, so remove it. Seat mode: keep the append log — it backs the
+					// persisted seat pane and is removed on root finalize.
+					if !seatMode {
+						_ = os.Remove(logPath)
+					}
 				}()
 				adapter = teeAdapter
 				meta.LogPath = logPath
@@ -1736,6 +1797,14 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "cockpit_unavailable", Message: "cockpit requested but herdr is unavailable; running without a pane"}); eventErr != nil {
 				writeLine(w.Stdout, "job %s cockpit_unavailable event failed: %v", job.ID, eventErr)
 			}
+		}
+		// SEAT MODE ONLY: on the job's return, check whether the root coordination
+		// tree has now terminated and, if so, tear its panes / workspace / seat logs
+		// down once and surface the reconvene view (Task 7/8). Job mode is left
+		// byte-identical to P1 — its panes close per-Deliver and it never reaches
+		// here, so no extra herdr calls are made on the job-mode path.
+		if cp != nil && !userOptedOff && seatMode {
+			defer w.finalizeCockpitRootIfDone(cp, job, payload, meta.RootJobID)
 		}
 	}
 	if managed.OK {
@@ -1880,6 +1949,14 @@ func (w jobWorker) cockpitTeeAdapter(agent runtime.Agent, checkout string, jobID
 		writeLine(w.Stdout, "job %s cockpit log create failed: %v", jobID, err)
 		return nil, "", nil
 	}
+	return w.cockpitTeeOnFile(agent, checkout, jobID, logPath, logFile)
+}
+
+// cockpitTeeOnFile rebuilds the runtime adapter to tee the child's live
+// stdout/stderr into an already-open log file, shared by the per-job (truncate)
+// and per-seat (append) log paths. It is fail-open: an unsupported runtime closes
+// the file and returns nils so the caller falls back to the P0 pane.
+func (w jobWorker) cockpitTeeOnFile(agent runtime.Agent, checkout, jobID, logPath string, logFile *os.File) (workflow.DeliveryAdapter, string, *os.File) {
 	adapter, err := buildRuntimeAdapter(agent, checkout, subprocess.TeeRunner{Inner: subprocess.GroupRunner{}, Out: logFile})
 	if err != nil {
 		// Unsupported runtime: this should never happen (AdapterFactory already
@@ -1889,6 +1966,151 @@ func (w jobWorker) cockpitTeeAdapter(agent runtime.Agent, checkout string, jobID
 		return nil, "", nil
 	}
 	return adapter, logPath, logFile
+}
+
+// cockpitLogAdapter picks the live-output log per PaneKeyMode (Task 7): seat mode
+// uses the stable per-seat append log so the one seat pane tails one accumulating
+// file across rounds; job mode keeps the per-job truncate log (byte-identical to
+// P1). It is called only on the wrapping path (herdr available); a nil *os.File
+// means fall back to the P0 pane.
+func (w jobWorker) cockpitLogAdapter(cp *cockpit.Cockpit, agent runtime.Agent, checkout, jobID, rootJobID, paneKey string, seatMode bool) (workflow.DeliveryAdapter, string, *os.File) {
+	if seatMode {
+		return w.cockpitSeatLogAdapter(cp, agent, checkout, jobID, rootJobID, paneKey)
+	}
+	return w.cockpitTeeAdapter(agent, checkout, jobID)
+}
+
+// cockpitSeatLogAdapter opens the stable per-seat append log the seat's one pane
+// tails across delegation rounds (Task 7) and tees the child's stdout/stderr into
+// it. The path is <home>/logs/seats/<rootShort>/<seatSlug>.log, opened O_APPEND so
+// each round's output accumulates rather than truncating the prior round's — no
+// tail re-pointing needed. The log is NOT removed per job; it persists for the
+// root's life and is removed by FinalizeRoot. It is fail-open: any failure
+// (unresolved path, mkdir, create, unsupported runtime) returns nils so the caller
+// falls back to the P0 pane.
+func (w jobWorker) cockpitSeatLogAdapter(cp *cockpit.Cockpit, agent runtime.Agent, checkout, jobID, rootJobID, paneKey string) (workflow.DeliveryAdapter, string, *os.File) {
+	logPath := cp.SeatLogPath(rootJobID, paneKey)
+	if logPath == "" {
+		// Home unset (cockpit could not resolve GITMOOT_HOME): fall back to the P0
+		// pane rather than an unstable seat log.
+		return nil, "", nil
+	}
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		writeLine(w.Stdout, "job %s cockpit seat log dir create failed: %v", jobID, err)
+		return nil, "", nil
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		writeLine(w.Stdout, "job %s cockpit seat log open failed: %v", jobID, err)
+		return nil, "", nil
+	}
+	return w.cockpitTeeOnFile(agent, checkout, jobID, logPath, logFile)
+}
+
+// finalizeCockpitRootIfDone tears the root's cockpit down once the coordination
+// tree it belongs to has terminated (Task 7/8, seat mode only). It runs on a
+// wrapped seat-mode job's return: if every job sharing the root is terminal, it
+// calls FinalizeRoot (close panes / workspace, delete rows, remove seat logs) and,
+// when this job is the terminal coordinator continuation, FocusRoot to surface the
+// reconvene view. Everything is best-effort: it is deferred on a detached context
+// so a cockpit/herdr problem never affects the job. Job mode never reaches here, so
+// its per-Deliver teardown stays byte-identical.
+func (w jobWorker) finalizeCockpitRootIfDone(cp *cockpit.Cockpit, job db.Job, payload workflow.JobPayload, rootJobID string) {
+	ctx := context.Background()
+	done, err := w.rootTreeTerminal(ctx, rootJobID)
+	if err != nil {
+		writeLine(w.Stdout, "job %s cockpit root-finalize check failed: %v", job.ID, err)
+		return
+	}
+	if !done {
+		return
+	}
+	// A terminal continuation that absorbed the children (a finalize continuation,
+	// or a coordinator continuation that returned no further delegations) is the
+	// reconvene point: surface the root workspace so the synthesized verdict —
+	// which lands in the coordinator's own pane (its continuation shares the
+	// coordinator seat in seat mode) — is brought forward.
+	if w.isReconveneContinuation(ctx, job, payload) {
+		cp.FocusRoot(ctx, rootJobID)
+	}
+	cp.FinalizeRoot(ctx, rootJobID)
+}
+
+// rootTreeTerminal reports whether every job in the coordination tree rooted at
+// rootJobID is terminal (succeeded/failed/blocked/cancelled) — i.e. nothing is
+// still queued or running. It lists jobs and matches the root id against each
+// job's own id (the root coordinator) or its payload RootJobID (children +
+// continuations), mirroring the engine's per-root reasoning. It fails closed
+// (returns false) on any unparseable payload so a transient hiccup never triggers
+// a premature teardown.
+func (w jobWorker) rootTreeTerminal(ctx context.Context, rootJobID string) (bool, error) {
+	rootJobID = strings.TrimSpace(rootJobID)
+	if rootJobID == "" {
+		return false, nil
+	}
+	jobs, err := w.Store.ListJobs(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, j := range jobs {
+		inTree := j.ID == rootJobID
+		if !inTree {
+			p, perr := daemonJobPayload(j)
+			if perr != nil {
+				// An unparseable job payload could belong to the tree; do not finalize
+				// while its membership/state is unknown.
+				return false, nil
+			}
+			inTree = strings.TrimSpace(p.RootJobID) == rootJobID
+		}
+		if !inTree {
+			continue
+		}
+		if !cockpitJobStateTerminal(j.State) {
+			return false, nil
+		}
+	}
+	// Every in-tree job (if any) is terminal — the tree is done. An already-pruned
+	// root (no jobs found) is also terminal: a late finalize is a harmless no-op.
+	return true, nil
+}
+
+// isReconveneContinuation reports whether this job is the coordinator's terminal
+// reconvene point: a finalize continuation, or any coordinator continuation that
+// returned no further delegations (so the tree stops here). It is the signal to
+// refocus the root workspace on the synthesized verdict (Task 8).
+func (w jobWorker) isReconveneContinuation(ctx context.Context, job db.Job, payload workflow.JobPayload) bool {
+	if payload.DelegationFinalize {
+		return true
+	}
+	// A continuation job carries a parent (the prior coordinator job in the chain).
+	// When such a continuation returns no delegations, the coordination tree has
+	// reconvened on it.
+	if strings.TrimSpace(payload.ParentJobID) == "" {
+		// The root coordinator itself: a reconvene point only if it spawned no
+		// children (it ran to completion without delegating).
+		children, err := w.Store.ListJobsByParent(ctx, job.ID)
+		if err != nil {
+			return false
+		}
+		return len(children) == 0
+	}
+	if payload.Result != nil && len(payload.Result.Delegations) > 0 {
+		return false
+	}
+	return true
+}
+
+// cockpitJobStateTerminal reports whether a job state is terminal for the purpose
+// of root-tree finalization: nothing more will run for it.
+func cockpitJobStateTerminal(state string) bool {
+	switch state {
+	case string(workflow.JobSucceeded), string(workflow.JobFailed),
+		string(workflow.JobBlocked), string(workflow.JobCancelled):
+		return true
+	default:
+		return false
+	}
 }
 
 // maybeWrapCockpit decides whether a job's delivery is wrapped in a herdr pane.

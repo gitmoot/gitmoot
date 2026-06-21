@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -381,5 +382,232 @@ func TestWorkerNoCockpitEventWhenNotRequested(t *testing.T) {
 	}
 	if daemonWorkerHasEvent(events, "cockpit_unavailable") {
 		t.Fatalf("unexpected cockpit_unavailable event for non-cockpit job: %+v", events)
+	}
+}
+
+func cockpitTestJobPayload(t *testing.T, p workflow.JobPayload) string {
+	t.Helper()
+	encoded, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	return string(encoded)
+}
+
+// TestRootTreeTerminal: a root coordination tree is terminal only when every job
+// sharing the root (the root coordinator + every child/continuation by payload
+// RootJobID) is in a terminal state.
+func TestRootTreeTerminal(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	worker := defaultJobWorker(store, io.Discard)
+
+	// Root coordinator (its own id is the root) + two children carrying RootJobID.
+	mustCreate := func(id, state string, payload workflow.JobPayload) {
+		if err := store.CreateJob(ctx, db.Job{ID: id, Agent: "a", Type: "implement", State: state, Payload: cockpitTestJobPayload(t, payload)}); err != nil {
+			t.Fatalf("CreateJob %s: %v", id, err)
+		}
+	}
+	mustCreate("root-1", string(workflow.JobSucceeded), workflow.JobPayload{})
+	mustCreate("child-a", string(workflow.JobSucceeded), workflow.JobPayload{RootJobID: "root-1"})
+	mustCreate("child-b", string(workflow.JobRunning), workflow.JobPayload{RootJobID: "root-1"})
+
+	// child-b still running -> not terminal.
+	if done, err := worker.rootTreeTerminal(ctx, "root-1"); err != nil || done {
+		t.Fatalf("rootTreeTerminal with a running child = (%v, %v), want (false, nil)", done, err)
+	}
+
+	// Finish child-b -> terminal.
+	if _, err := store.TransitionJobState(ctx, "child-b", string(workflow.JobRunning), string(workflow.JobFailed)); err != nil {
+		t.Fatalf("transition child-b: %v", err)
+	}
+	if done, err := worker.rootTreeTerminal(ctx, "root-1"); err != nil || !done {
+		t.Fatalf("rootTreeTerminal with all children terminal = (%v, %v), want (true, nil)", done, err)
+	}
+
+	// A cancelled job counts as terminal.
+	mustCreate("child-c", string(workflow.JobCancelled), workflow.JobPayload{RootJobID: "root-1"})
+	if done, err := worker.rootTreeTerminal(ctx, "root-1"); err != nil || !done {
+		t.Fatalf("rootTreeTerminal with a cancelled child = (%v, %v), want (true, nil)", done, err)
+	}
+
+	// An unknown root with no jobs is treated as terminal (already pruned).
+	if done, err := worker.rootTreeTerminal(ctx, "root-none"); err != nil || !done {
+		t.Fatalf("rootTreeTerminal for an empty root = (%v, %v), want (true, nil)", done, err)
+	}
+	// An empty root id is never terminal.
+	if done, _ := worker.rootTreeTerminal(ctx, ""); done {
+		t.Fatal("rootTreeTerminal for an empty root id must be false")
+	}
+}
+
+func TestCockpitJobStateTerminal(t *testing.T) {
+	terminal := []string{
+		string(workflow.JobSucceeded), string(workflow.JobFailed),
+		string(workflow.JobBlocked), string(workflow.JobCancelled),
+	}
+	for _, s := range terminal {
+		if !cockpitJobStateTerminal(s) {
+			t.Errorf("cockpitJobStateTerminal(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{string(workflow.JobQueued), string(workflow.JobRunning), "", "weird"} {
+		if cockpitJobStateTerminal(s) {
+			t.Errorf("cockpitJobStateTerminal(%q) = true, want false", s)
+		}
+	}
+}
+
+// TestIsReconveneContinuation: a finalize continuation, a continuation that
+// returned no delegations, and a root coordinator with no children are reconvene
+// points; a coordinator that returned delegations is not.
+func TestIsReconveneContinuation(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	worker := defaultJobWorker(store, io.Discard)
+
+	// finalize continuation -> reconvene.
+	if !worker.isReconveneContinuation(ctx, db.Job{ID: "fin"}, workflow.JobPayload{DelegationFinalize: true}) {
+		t.Fatal("finalize continuation must be a reconvene point")
+	}
+	// continuation (has parent) with no delegations -> reconvene.
+	if !worker.isReconveneContinuation(ctx, db.Job{ID: "cont"}, workflow.JobPayload{ParentJobID: "coord", Result: &workflow.AgentResult{}}) {
+		t.Fatal("a childless continuation must be a reconvene point")
+	}
+	// continuation that returned delegations -> NOT reconvene.
+	withDel := workflow.JobPayload{ParentJobID: "coord", Result: &workflow.AgentResult{Delegations: []workflow.Delegation{{ID: "d1", Agent: "x", Action: "implement", Prompt: "go"}}}}
+	if worker.isReconveneContinuation(ctx, db.Job{ID: "cont2"}, withDel) {
+		t.Fatal("a continuation that returned delegations is not a reconvene point")
+	}
+	// root coordinator with NO children -> reconvene.
+	if err := store.CreateJob(ctx, db.Job{ID: "root-solo", Agent: "a", Type: "ask", State: string(workflow.JobSucceeded), Payload: cockpitTestJobPayload(t, workflow.JobPayload{})}); err != nil {
+		t.Fatal(err)
+	}
+	if !worker.isReconveneContinuation(ctx, db.Job{ID: "root-solo"}, workflow.JobPayload{}) {
+		t.Fatal("a childless root coordinator must be a reconvene point")
+	}
+	// root coordinator WITH a child -> not reconvene (the children, not this job,
+	// carry the work; the terminal continuation is the reconvene point).
+	if err := store.CreateJob(ctx, db.Job{ID: "root-par", Agent: "a", Type: "ask", State: string(workflow.JobSucceeded), Payload: cockpitTestJobPayload(t, workflow.JobPayload{})}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "child-1", Agent: "a", Type: "implement", State: string(workflow.JobSucceeded), ParentJobID: "root-par", Payload: cockpitTestJobPayload(t, workflow.JobPayload{RootJobID: "root-par", ParentJobID: "root-par"})}); err != nil {
+		t.Fatal(err)
+	}
+	if worker.isReconveneContinuation(ctx, db.Job{ID: "root-par"}, workflow.JobPayload{}) {
+		t.Fatal("a root coordinator with children is not itself the reconvene point")
+	}
+}
+
+// TestCockpitSeatLogAdapterAppends: seat mode uses a STABLE per-seat append log so
+// the seat's pane tails one accumulating file across rounds. The path is
+// <home>/logs/seats/<rootShort>/<seatSlug>.log, opened O_APPEND (prior output is
+// preserved, not truncated), and the adapter tees the child's stdout into it.
+func TestCockpitSeatLogAdapterAppends(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GITMOOT_HOME", home)
+	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
+	cp := cockpit.New(cockpit.Options{HerdrBin: "herdr-does-not-exist-for-tests", PaneKeyMode: config.CockpitPaneKeySeat}, nil)
+
+	wantPath := cp.SeatLogPath("root-seat", "builder")
+	if wantPath == "" {
+		t.Fatal("expected a non-empty seat-log path with GITMOOT_HOME set")
+	}
+	// Pre-seed prior-round history that the append log must preserve.
+	if err := os.MkdirAll(filepath.Dir(wantPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(wantPath, []byte("ROUND1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	agent := runtime.Agent{Name: "builder", Role: "builder", Runtime: runtime.ShellRuntime, RuntimeRef: "echo ROUND2"}
+	adapter, logPath, logFile := worker.cockpitSeatLogAdapter(cp, agent, t.TempDir(), "job-r2", "root-seat", "builder")
+	if logFile == nil {
+		t.Fatal("expected a non-nil seat log file")
+	}
+	defer logFile.Close()
+	if logPath != wantPath {
+		t.Fatalf("seat logPath = %q, want %q", logPath, wantPath)
+	}
+
+	if _, err := adapter.Deliver(context.Background(), agent, runtime.Job{Prompt: "go"}); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	logged, err := os.ReadFile(wantPath)
+	if err != nil {
+		t.Fatalf("read seat log: %v", err)
+	}
+	got := string(logged)
+	if !strings.Contains(got, "ROUND1") {
+		t.Fatalf("seat log must preserve prior-round history (append, not truncate); got: %q", got)
+	}
+	if !strings.Contains(got, "ROUND2") {
+		t.Fatalf("seat log must contain this round's teed output; got: %q", got)
+	}
+
+	// The seat-log adapter carries a group-kill-preserving TeeRunner (result capture
+	// unchanged).
+	shell, ok := adapter.(runtime.ShellAdapter)
+	if !ok {
+		t.Fatalf("adapter type = %T, want runtime.ShellAdapter", adapter)
+	}
+	tee, ok := shell.Runner.(subprocess.TeeRunner)
+	if !ok {
+		t.Fatalf("adapter Runner = %T, want subprocess.TeeRunner", shell.Runner)
+	}
+	if _, ok := tee.Inner.(subprocess.GroupRunner); !ok {
+		t.Fatalf("tee inner = %T, want subprocess.GroupRunner", tee.Inner)
+	}
+}
+
+// TestCockpitSeatLogAdapterFailOpenNoHome: with no resolvable home, the seat-log
+// path is empty and the adapter falls back to the P0 pane (nil file) — fail-open.
+func TestCockpitSeatLogAdapterFailOpenNoHome(t *testing.T) {
+	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard)
+	// An empty GITMOOT_HOME makes the cockpit's home empty, so SeatLogPath returns "".
+	t.Setenv("GITMOOT_HOME", "")
+	cp := cockpit.New(cockpit.Options{HerdrBin: "herdr-does-not-exist-for-tests", PaneKeyMode: config.CockpitPaneKeySeat}, nil)
+	agent := runtime.Agent{Name: "builder", Runtime: runtime.ShellRuntime, RuntimeRef: "true"}
+	adapter, logPath, logFile := worker.cockpitSeatLogAdapter(cp, agent, t.TempDir(), "job-x", "root-seat", "builder")
+	if adapter != nil || logPath != "" || logFile != nil {
+		t.Fatalf("expected fail-open nils with no home, got adapter=%v path=%q file=%v", adapter, logPath, logFile)
+	}
+}
+
+// TestCockpitLogAdapterPicksLogPerMode: job mode uses the per-job truncate log
+// (<home>/logs/jobs/<jobid>.log); seat mode uses the stable per-seat append log
+// (<home>/logs/seats/<rootShort>/<seatSlug>.log). The dispatch is what keeps job
+// mode byte-identical to P1.
+func TestCockpitLogAdapterPicksLogPerMode(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GITMOOT_HOME", home)
+	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
+	cp := cockpit.New(cockpit.Options{HerdrBin: "herdr-does-not-exist-for-tests", PaneKeyMode: config.CockpitPaneKeySeat}, nil)
+	agent := runtime.Agent{Name: "builder", Role: "builder", Runtime: runtime.ShellRuntime, RuntimeRef: "true"}
+
+	// Job mode -> per-job log under logs/jobs.
+	_, jobLog, jobFile := worker.cockpitLogAdapter(cp, agent, t.TempDir(), "job-1", "root-1", "builder", false)
+	if jobFile == nil {
+		t.Fatal("job-mode log file is nil")
+	}
+	jobFile.Close()
+	wantJob := filepath.Join(config.PathsForHome(home).Logs, "jobs", "job-1.log")
+	if jobLog != wantJob {
+		t.Fatalf("job-mode log = %q, want %q", jobLog, wantJob)
+	}
+
+	// Seat mode -> stable per-seat log under logs/seats/<rootShort>.
+	_, seatLog, seatFile := worker.cockpitLogAdapter(cp, agent, t.TempDir(), "job-1", "root-1", "builder", true)
+	if seatFile == nil {
+		t.Fatal("seat-mode log file is nil")
+	}
+	seatFile.Close()
+	wantSeat := cp.SeatLogPath("root-1", "builder")
+	if seatLog != wantSeat {
+		t.Fatalf("seat-mode log = %q, want %q", seatLog, wantSeat)
+	}
+	if !strings.Contains(seatLog, filepath.Join("logs", "seats")) {
+		t.Fatalf("seat-mode log %q is not under logs/seats", seatLog)
 	}
 }
