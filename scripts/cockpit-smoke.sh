@@ -19,6 +19,11 @@ command -v herdr >/dev/null 2>&1 || skip "herdr is not on PATH"
 # honor HERDR_SOCKET_PATH if the caller set one). No --session is needed.
 herdr status >/dev/null 2>&1 || skip "herdr status is not ok (server not running / not reachable)"
 
+# Gate the pane surface here too (matching herdr-train-init-smoke.sh) so we skip
+# BEFORE doing any home/repo init when panes are unavailable. These are the exact
+# reachability + pane primitives the cockpit adapter uses.
+herdr pane list >/dev/null 2>&1 || skip "herdr pane list failed — cockpit pane surface not available"
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 
@@ -54,10 +59,6 @@ gm init >/dev/null
   && git config user.name "cockpit smoke" \
   && git commit -q --allow-empty -m "init" )
 
-echo "cockpit-smoke: confirming the herdr reachability + pane surface"
-# These are the exact reachability + pane primitives the cockpit adapter uses;
-# `herdr status` already passed above, list confirms the pane surface is live.
-herdr pane list >/dev/null 2>&1 || skip "herdr pane list failed — cockpit pane surface not available"
 echo "cockpit-smoke: herdr is reachable; exercising the --cockpit wrap path"
 
 # Drive a tiny background orchestrate with --cockpit. We do not require a real

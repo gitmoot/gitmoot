@@ -2046,6 +2046,48 @@ func TestEngineContinuationCarriesParentModel(t *testing.T) {
 	}
 }
 
+// TestEngineContinuationInheritsCockpit guards that a coordinator's cockpit
+// settings carry into the post-synthesis continuation so the continuation
+// renders its pane under the same workspace/session as the rest of the tree.
+func TestEngineContinuationInheritsCockpit(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "api", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:           "jerryfane/gitmoot",
+		Branch:         "task-005",
+		Sender:         "coord",
+		Cockpit:        true,
+		CockpitSession: "room",
+		CockpitPaneKey: "seat",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "api", Agent: "api", Action: "review", Prompt: "build api"},
+			},
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob(parent): %v", err)
+	}
+	completeDelegationChild(t, store, "parent-job/delegation/api", JobSucceeded, AgentResult{Decision: "approved", Summary: "api ok"})
+	if err := engine.AdvanceJob(ctx, "parent-job/delegation/api"); err != nil {
+		t.Fatalf("AdvanceJob(api): %v", err)
+	}
+	continuation := mustJob(t, store, delegationContinuationID("parent-job"))
+	cp, err := unmarshalPayload(continuation.Payload)
+	if err != nil {
+		t.Fatalf("unmarshal continuation payload: %v", err)
+	}
+	if !cp.Cockpit || cp.CockpitSession != "room" || cp.CockpitPaneKey != "seat" {
+		t.Fatalf("continuation cockpit fields = (%t, %q, %q), want (true, room, seat)", cp.Cockpit, cp.CockpitSession, cp.CockpitPaneKey)
+	}
+}
+
 func TestEngineDelegationFailurePolicyBlockParent(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

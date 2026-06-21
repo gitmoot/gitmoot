@@ -2654,7 +2654,9 @@ func TestParseAgentRunOptionsCapturesCockpit(t *testing.T) {
 		{name: "--cockpit turns on", args: []string{"planner", "fan out fixes", "--cockpit"}, wantCockpit: true, wantSession: ""},
 		{name: "--herdr alias turns on", args: []string{"planner", "fan out fixes", "--herdr"}, wantCockpit: true, wantSession: ""},
 		{name: "session space form", args: []string{"planner", "fan out fixes", "--cockpit", "--cockpit-session", "review-room"}, wantCockpit: true, wantSession: "review-room"},
-		{name: "session inline form", args: []string{"planner", "fan out fixes", "--cockpit-session=review-room"}, wantCockpit: false, wantSession: "review-room"},
+		// --cockpit-session implies --cockpit, so the session is never silently ignored.
+		{name: "session space form implies cockpit", args: []string{"planner", "fan out fixes", "--cockpit-session", "review-room"}, wantCockpit: true, wantSession: "review-room"},
+		{name: "session inline form implies cockpit", args: []string{"planner", "fan out fixes", "--cockpit-session=review-room"}, wantCockpit: true, wantSession: "review-room"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

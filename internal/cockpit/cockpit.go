@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"sync"
 	"time"
 
 	"github.com/jerryfane/gitmoot/internal/runtime"
@@ -39,6 +40,13 @@ const (
 	// never stalls a job. Pane-open may be synchronous (only when streaming,
 	// P1); status/label/close are async best-effort.
 	herdrCallTimeout = 5 * time.Second
+
+	// availableTTL bounds how long a cached herdr-availability result is reused.
+	// Wrap is called once per job under the daemon's held runtime-session lock
+	// (SetMaxOpenConns(1)); shelling out to `herdr status` on every job would
+	// serialize a process spawn onto that hot path. A short TTL keeps the check
+	// cheap while still re-probing if herdr is started/stopped mid-run.
+	availableTTL = 30 * time.Second
 )
 
 // Pane is the cockpit's store-facing record for a single open pane. Its fields
@@ -65,6 +73,7 @@ type PaneStore interface {
 	GetCockpitPaneByJob(ctx context.Context, jobID string) (Pane, error)
 	ListCockpitPanesByRoot(ctx context.Context, rootJobID string) ([]Pane, error)
 	DeleteCockpitPane(ctx context.Context, id string) error
+	DeleteCockpitPaneByJob(ctx context.Context, jobID string) error
 	// GetOrCreateWorkspaceForRoot serializes one workspace per root: create is
 	// called only on first use for a given root and its workspace id is reused
 	// thereafter.
@@ -109,6 +118,17 @@ type Cockpit struct {
 	home       string
 
 	logger *slog.Logger
+
+	// availMu guards the memoized availability check. Wrap consults Available
+	// once per job on the locked hot path; caching the result for availableTTL
+	// avoids a `herdr status` shell-out per delivery while still re-probing
+	// periodically so a herdr that starts/stops mid-run is eventually noticed.
+	availMu     sync.Mutex
+	availCached bool
+	availOK     bool
+	availAt     time.Time
+	// now is the clock used for TTL expiry; overridable in tests.
+	now func() time.Time
 }
 
 // New builds a Cockpit. A zero HerdrBin defaults to "herdr"; a non-positive
@@ -134,6 +154,7 @@ func New(opts Options, store PaneStore) *Cockpit {
 		gitmootBin: bin,
 		home:       os.Getenv("GITMOOT_HOME"),
 		logger:     slog.Default(),
+		now:        time.Now,
 	}
 }
 
@@ -157,6 +178,7 @@ func newWithRunner(opts Options, store PaneStore, run runner, lookPath func(stri
 		gitmootBin: "gitmoot",
 		home:       "",
 		logger:     slog.Default(),
+		now:        time.Now,
 	}
 }
 
@@ -164,14 +186,30 @@ const defaultMaxPanes = 4
 
 // Available reports whether the cockpit can render panes: the herdr binary is
 // on PATH and `herdr status` reports the server running. It is timeout-bounded
-// so a hung herdr cannot stall gating.
+// so a hung herdr cannot stall gating, and the result is memoized for
+// availableTTL so the daemon's locked hot path does not shell out to `herdr
+// status` on every job. Fail-open: any probe error reports unavailable, which
+// makes Wrap return the inner adapter untouched.
 func (c *Cockpit) Available(ctx context.Context) bool {
 	if c == nil {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(ctx, herdrCallTimeout)
+	c.availMu.Lock()
+	defer c.availMu.Unlock()
+	clock := c.now
+	if clock == nil {
+		clock = time.Now
+	}
+	if c.availCached && clock().Sub(c.availAt) < availableTTL {
+		return c.availOK
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, herdrCallTimeout)
 	defer cancel()
-	return c.client.available(ctx)
+	ok := c.client.available(probeCtx)
+	c.availCached = true
+	c.availOK = ok
+	c.availAt = clock()
+	return ok
 }
 
 // Wrap returns a DeliveryAdapter that opens a pane (best-effort), runs
@@ -293,7 +331,7 @@ func (a *paneAdapter) close(paneID string) {
 	c.bestEffort(ctx, "pane close", func(cctx context.Context) error {
 		return c.client.paneClose(cctx, paneID)
 	})
-	if err := c.store.DeleteCockpitPane(ctx, a.meta.JobID); err != nil {
+	if err := c.store.DeleteCockpitPaneByJob(ctx, a.meta.JobID); err != nil {
 		c.logf("cockpit: delete pane record for job %s: %v", a.meta.JobID, err)
 	}
 }

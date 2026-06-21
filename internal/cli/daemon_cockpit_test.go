@@ -135,6 +135,31 @@ func TestCockpitJobMetaPaneKeyMode(t *testing.T) {
 	}
 }
 
+// TestCockpitJobMetaRootCoordinatorUsesOwnID guards that a root coordinator job
+// (empty payload.RootJobID) is its own root, so roots do not collide into one
+// herdr workspace keyed by the empty string.
+func TestCockpitJobMetaRootCoordinatorUsesOwnID(t *testing.T) {
+	agent := runtime.Agent{Name: "coord"}
+	checkout := "/tmp/worktree"
+
+	root := cockpitJobMeta(db.Job{ID: "root-job", Type: "ask"}, workflow.JobPayload{}, agent, checkout, "job")
+	if root.RootJobID != "root-job" {
+		t.Fatalf("root coordinator RootJobID = %q, want its own id %q", root.RootJobID, "root-job")
+	}
+
+	// A whitespace-only RootJobID is also treated as a root (mirrors the engine).
+	blank := cockpitJobMeta(db.Job{ID: "root-2", Type: "ask"}, workflow.JobPayload{RootJobID: "   "}, agent, checkout, "job")
+	if blank.RootJobID != "root-2" {
+		t.Fatalf("blank-root RootJobID = %q, want own id %q", blank.RootJobID, "root-2")
+	}
+
+	// A child carries the inherited root through unchanged.
+	child := cockpitJobMeta(db.Job{ID: "child-job", Type: "implement"}, workflow.JobPayload{RootJobID: "root-job"}, agent, checkout, "job")
+	if child.RootJobID != "root-job" {
+		t.Fatalf("child RootJobID = %q, want inherited %q", child.RootJobID, "root-job")
+	}
+}
+
 // TestWorkerEmitsCockpitUnavailableEvent drives the real worker path: a job that
 // requested --cockpit on a host without herdr runs unwrapped (the fake adapter
 // still delivers) and the worker records exactly one cockpit_unavailable event.

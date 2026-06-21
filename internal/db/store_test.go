@@ -3257,6 +3257,47 @@ func TestCockpitPaneUniquePerWorkspaceSeat(t *testing.T) {
 	}
 }
 
+func TestDeleteCockpitPaneByJob(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	pane := CockpitPane{
+		JobID:       "job-x",
+		PaneKey:     "job:job-x",
+		RootJobID:   "root",
+		PaneID:      "pane-1",
+		WorkspaceID: "ws-1",
+		Source:      "custom:gitmoot",
+	}
+	if err := store.InsertCockpitPane(ctx, pane); err != nil {
+		t.Fatalf("InsertCockpitPane returned error: %v", err)
+	}
+
+	// Delete by job id (the cockpit teardown path) removes the row without
+	// knowing its generated primary key.
+	if err := store.DeleteCockpitPaneByJob(ctx, "job-x"); err != nil {
+		t.Fatalf("DeleteCockpitPaneByJob returned error: %v", err)
+	}
+	if _, err := store.GetCockpitPaneByJob(ctx, "job-x"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetCockpitPaneByJob after delete-by-job = %v, want sql.ErrNoRows", err)
+	}
+
+	// The slot is reclaimable: re-inserting the same (workspace_id, pane_key)
+	// after a delete-by-job must not hit the UNIQUE constraint.
+	if err := store.InsertCockpitPane(ctx, pane); err != nil {
+		t.Fatalf("re-insert after DeleteCockpitPaneByJob returned error: %v", err)
+	}
+
+	// Deleting a missing job is a no-op, not an error.
+	if err := store.DeleteCockpitPaneByJob(ctx, "job-missing"); err != nil {
+		t.Fatalf("DeleteCockpitPaneByJob(missing) returned error: %v", err)
+	}
+}
+
 func TestGetOrCreateWorkspaceForRoot(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))

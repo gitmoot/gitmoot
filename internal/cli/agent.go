@@ -526,6 +526,11 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 		fmt.Fprintf(stderr, "%s requires exactly one agent and one message\n", label)
 		return agentRunOptions{}, false
 	}
+	// --cockpit-session implies --cockpit so naming a session does not silently
+	// no-op when the bare --cockpit flag was omitted.
+	if strings.TrimSpace(options.cockpitSession) != "" {
+		options.cockpit = true
+	}
 	return options, true
 }
 

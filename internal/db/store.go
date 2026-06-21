@@ -4705,9 +4705,19 @@ func (s *Store) ListCockpitPanesByRoot(ctx context.Context, rootJobID string) ([
 }
 
 // DeleteCockpitPane removes a pane record by ID. Deleting a missing row is a
-// no-op (best-effort teardown should not fail on a stale record).
+// no-op (best-effort teardown should not fail on a stale record). It stays
+// available for reconcile/GC, which addresses panes by their generated id.
 func (s *Store) DeleteCockpitPane(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM cockpit_panes WHERE id = ?`, strings.TrimSpace(id))
+	return err
+}
+
+// DeleteCockpitPaneByJob removes the pane record for a job. The cockpit opens a
+// pane without knowing its generated primary key, so teardown deletes by job_id;
+// this also lets a re-run of the same job reclaim its (workspace_id, pane_key)
+// slot. Deleting a missing row is a no-op.
+func (s *Store) DeleteCockpitPaneByJob(ctx context.Context, jobID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM cockpit_panes WHERE job_id = ?`, strings.TrimSpace(jobID))
 	return err
 }
 

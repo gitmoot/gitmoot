@@ -1698,14 +1698,18 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// cockpit rather than failing the job.
 	if payload.Cockpit {
 		policy, policyErr := w.orchestratePolicy()
-		modeOff := policyErr != nil || policy.CockpitMode == config.CockpitModeOff
+		// A policy LOAD error is not the same as the user opting out (mode off): the
+		// user asked for a cockpit, so degrade to cockpit-unavailable (run unwrapped
+		// AND emit the single cockpit_unavailable event) rather than silently
+		// dropping the pane. Only an explicit mode-off opts out without an event.
+		userOptedOff := policyErr == nil && policy.CockpitMode == config.CockpitModeOff
 		var cp *cockpit.Cockpit
-		if !modeOff {
+		if policyErr == nil && !userOptedOff {
 			cp = w.newCockpit(policy)
 		}
 		meta := cockpitJobMeta(job, payload, agent, checkout, policy.CockpitPaneKey)
 		var unavailable bool
-		adapter, unavailable = maybeWrapCockpit(cp, payload.Cockpit, modeOff, adapter, meta)
+		adapter, unavailable = maybeWrapCockpit(cp, payload.Cockpit, userOptedOff, adapter, meta)
 		if unavailable {
 			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "cockpit_unavailable", Message: "cockpit requested but herdr is unavailable; running without a pane"}); eventErr != nil {
 				writeLine(w.Stdout, "job %s cockpit_unavailable event failed: %v", job.ID, eventErr)
@@ -1806,9 +1810,16 @@ func cockpitJobMeta(job db.Job, payload workflow.JobPayload, agent runtime.Agent
 	if paneKeyMode == config.CockpitPaneKeySeat {
 		paneKey = agent.Name
 	}
+	// A root coordinator job has an empty payload.RootJobID; its own id IS the
+	// root (mirrors Engine.rootJobID). Without this every root collides into one
+	// herdr workspace keyed by "".
+	root := payload.RootJobID
+	if strings.TrimSpace(root) == "" {
+		root = job.ID
+	}
 	return cockpit.JobMeta{
 		JobID:     job.ID,
-		RootJobID: payload.RootJobID,
+		RootJobID: root,
 		Agent:     agent.Name,
 		Action:    job.Type,
 		Branch:    payload.Branch,

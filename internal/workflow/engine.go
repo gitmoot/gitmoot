@@ -932,6 +932,11 @@ func (e Engine) handleDelegationLoop(ctx context.Context, job db.Job, payload Jo
 		// detector escalates to delegation_loop_detected.
 		RecentDelegationHashes: appendDelegationHashWindow(payload.RecentDelegationHashes, currentHash),
 		DelegationRepeatCount:  payload.DelegationRepeatCount + 1,
+		// Inherit the coordinator's cockpit settings so the continuation renders
+		// its pane under the same workspace/session as the rest of the tree.
+		Cockpit:        payload.Cockpit,
+		CockpitSession: payload.CockpitSession,
+		CockpitPaneKey: payload.CockpitPaneKey,
 	}
 	if err := e.enqueue(ctx, request); err != nil {
 		return true, fmt.Errorf("enqueue corrective continuation for %q: %w", job.ID, err)
@@ -980,6 +985,11 @@ func (e Engine) enqueueFinalizeContinuation(ctx context.Context, job db.Job, pay
 		DelegatedBy:        job.Agent,
 		RootJobID:          e.rootJobID(job, payload),
 		DelegationFinalize: true,
+		// Inherit the coordinator's cockpit settings so the finalize continuation
+		// renders its pane under the same workspace/session as the rest of the tree.
+		Cockpit:        payload.Cockpit,
+		CockpitSession: payload.CockpitSession,
+		CockpitPaneKey: payload.CockpitPaneKey,
 	}
 	if err := e.enqueue(ctx, request); err != nil {
 		return fmt.Errorf("enqueue finalize continuation for %q: %w", job.ID, err)
@@ -1499,6 +1509,11 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		// corrective-nudge counter only climbs while the coordinator loops.
 		RecentDelegationHashes: appendDelegationHashWindow(parentPayload.RecentDelegationHashes, canonicalDelegationSetHash(parentResult.Delegations)),
 		DelegationRepeatCount:  0,
+		// Inherit the coordinator's cockpit settings so the continuation renders
+		// its pane under the same workspace/session as the rest of the tree.
+		Cockpit:        parentPayload.Cockpit,
+		CockpitSession: parentPayload.CockpitSession,
+		CockpitPaneKey: parentPayload.CockpitPaneKey,
 	}
 	if err := e.enqueue(ctx, request); err != nil {
 		return fmt.Errorf("enqueue continuation for %q: %w", parentJob.ID, err)
