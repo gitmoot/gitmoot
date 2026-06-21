@@ -398,6 +398,67 @@ func TestWrapDeliverArgsCarryVerifiedFields(t *testing.T) {
 	assertContains("pane close w1:p2")
 }
 
+func TestWatchCommandTailsLogWhenLogPathSet(t *testing.T) {
+	// With a per-job LogPath (P1, Task 6) the pane tails the streamed log instead
+	// of running `gitmoot job watch`. -n +1 replays from the start; -F follows
+	// across the truncate-on-start and rotation.
+	a := &paneAdapter{
+		cockpit: &Cockpit{gitmootBin: "gitmoot", home: "/home/g"},
+		meta:    JobMeta{JobID: "abcdef0123456789", LogPath: "/home/g/logs/jobs/abcdef0123456789.log"},
+	}
+	got := a.watchCommand()
+	want := "tail -n +1 -F '/home/g/logs/jobs/abcdef0123456789.log'"
+	if got != want {
+		t.Fatalf("watchCommand = %q, want %q", got, want)
+	}
+}
+
+func TestWatchCommandFallsBackToJobWatchWhenNoLogPath(t *testing.T) {
+	// No LogPath (herdr unavailable on the wrapping path, or the log could not be
+	// created) ⇒ the P0 `gitmoot job watch` command, byte-identical to before.
+	a := &paneAdapter{
+		cockpit: &Cockpit{gitmootBin: "gitmoot", home: "/home/g"},
+		meta:    JobMeta{JobID: "abcdef0123456789"},
+	}
+	got := a.watchCommand()
+	want := "gitmoot job watch abcdef0123456789 --home /home/g"
+	if got != want {
+		t.Fatalf("watchCommand = %q, want %q", got, want)
+	}
+}
+
+func TestWatchCommandShellQuotesLogPathWithSpaces(t *testing.T) {
+	// A log path with a space (or shell metacharacter) is passed as a single
+	// literal argument so tail receives the whole path.
+	a := &paneAdapter{
+		cockpit: &Cockpit{gitmootBin: "gitmoot"},
+		meta:    JobMeta{JobID: "x", LogPath: "/home/my logs/jobs/x.log"},
+	}
+	if got, want := a.watchCommand(), "tail -n +1 -F '/home/my logs/jobs/x.log'"; got != want {
+		t.Fatalf("watchCommand = %q, want %q", got, want)
+	}
+}
+
+func TestWrapDeliverPaneRunTailsLogPath(t *testing.T) {
+	// End-to-end through Wrap/Deliver: a meta carrying LogPath makes the pane-run
+	// command tail the streamed log rather than run job-watch.
+	fr := newFakeRunner()
+	c := newWithRunner(Options{}, newFakeStore(), fr.run, okLookPath)
+	meta := sampleMeta()
+	meta.LogPath = "/tmp/logs/jobs/abcdef0123456789.log"
+	adapter := c.Wrap(&fakeInner{}, meta)
+	if _, err := adapter.Deliver(context.Background(), runtime.Agent{}, runtime.Job{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	joined := strings.Join(fr.calls, "\n")
+	if want := "pane run w1:p2 tail -n +1 -F '/tmp/logs/jobs/abcdef0123456789.log'"; !strings.Contains(joined, want) {
+		t.Fatalf("expected pane run to tail the log; want %q; calls:\n%s", want, joined)
+	}
+	if strings.Contains(joined, "job watch") {
+		t.Fatalf("pane should tail the log, not run job watch; calls:\n%s", joined)
+	}
+}
+
 func TestWrapSwallowsHerdrErrors(t *testing.T) {
 	// pane split fails ⇒ no pane opened, but delivery still proceeds and the
 	// result is unchanged.

@@ -3,12 +3,17 @@ package cli
 import (
 	"context"
 	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jerryfane/gitmoot/internal/cockpit"
+	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/github"
 	"github.com/jerryfane/gitmoot/internal/runtime"
+	"github.com/jerryfane/gitmoot/internal/subprocess"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
@@ -213,6 +218,128 @@ func TestWorkerEmitsCockpitUnavailableEvent(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("cockpit_unavailable events = %d, want exactly 1 (events: %+v)", count, events)
+	}
+}
+
+// TestMaybeWrapCockpitAvailable checks the single source of truth the daemon uses
+// to decide whether to set up the per-job tee log: it is true only when requested,
+// not opted-off, the cockpit is non-nil, AND herdr is reachable. CI has no herdr
+// so every here-listed case is false; the available branch is covered by the
+// cockpit package's fake-runner tests + the live skip in TestMaybeWrapCockpitDecision.
+func TestMaybeWrapCockpitAvailable(t *testing.T) {
+	unavailableCockpit := cockpit.New(cockpit.Options{HerdrBin: "herdr-does-not-exist-for-tests"}, nil)
+	cases := []struct {
+		name      string
+		cp        *cockpit.Cockpit
+		requested bool
+		modeOff   bool
+	}{
+		{"not requested", unavailableCockpit, false, false},
+		{"mode off", unavailableCockpit, true, true},
+		{"nil cockpit", nil, true, false},
+		{"herdr absent", unavailableCockpit, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if maybeWrapCockpitAvailable(tc.cp, tc.requested, tc.modeOff) {
+				t.Fatalf("maybeWrapCockpitAvailable = true, want false")
+			}
+		})
+	}
+}
+
+// TestCockpitTeeAdapterCreatesLogAndTees proves the wrapping-path log setup: it
+// creates+truncates <home>/logs/jobs/<jobid>.log, returns the path + an open file
+// + a tee-instrumented adapter, and the adapter's Deliver streams the child's
+// stdout into that log (the file a pane tails). Result capture is unchanged.
+func TestCockpitTeeAdapterCreatesLogAndTees(t *testing.T) {
+	home := t.TempDir()
+	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
+	agent := runtime.Agent{Name: "lead", Role: "builder", Runtime: runtime.ShellRuntime, RuntimeRef: "echo streamed-line"}
+
+	adapter, logPath, logFile := worker.cockpitTeeAdapter(agent, t.TempDir(), "job-tee")
+	if logFile == nil {
+		t.Fatal("expected a non-nil log file on the wrapping path")
+	}
+	defer logFile.Close()
+
+	wantPath := filepath.Join(config.PathsForHome(home).Logs, "jobs", "job-tee.log")
+	if logPath != wantPath {
+		t.Fatalf("logPath = %q, want %q", logPath, wantPath)
+	}
+	if _, err := os.Stat(wantPath); err != nil {
+		t.Fatalf("log file not created: %v", err)
+	}
+
+	// The adapter must carry a TeeRunner whose Out is the log file (the seam that
+	// streams live with zero adapter change) and whose inner preserves group-kill.
+	shell, ok := adapter.(runtime.ShellAdapter)
+	if !ok {
+		t.Fatalf("adapter type = %T, want runtime.ShellAdapter", adapter)
+	}
+	tee, ok := shell.Runner.(subprocess.TeeRunner)
+	if !ok {
+		t.Fatalf("adapter Runner = %T, want subprocess.TeeRunner", shell.Runner)
+	}
+	if _, ok := tee.Inner.(subprocess.GroupRunner); !ok {
+		t.Fatalf("tee inner = %T, want subprocess.GroupRunner (group-kill preserved)", tee.Inner)
+	}
+
+	// Delivering tees the child's stdout into the log; the buffered Result is intact.
+	res, err := adapter.Deliver(context.Background(), agent, runtime.Job{Prompt: "go"})
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if !strings.Contains(res.Raw, "streamed-line") {
+		t.Fatalf("result raw missing output: %q", res.Raw)
+	}
+	logged, err := os.ReadFile(wantPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if !strings.Contains(string(logged), "streamed-line") {
+		t.Fatalf("log missing teed output: %q", string(logged))
+	}
+}
+
+// TestCockpitTeeAdapterTruncatesExistingLog: each run starts fresh, so stale
+// output from a prior run of the same job id is not shown in the pane.
+func TestCockpitTeeAdapterTruncatesExistingLog(t *testing.T) {
+	home := t.TempDir()
+	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
+	logPath := filepath.Join(config.PathsForHome(home).Logs, "jobs", "job-trunc.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("STALE OUTPUT\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	agent := runtime.Agent{Name: "lead", Role: "builder", Runtime: runtime.ShellRuntime, RuntimeRef: "true"}
+	_, _, logFile := worker.cockpitTeeAdapter(agent, t.TempDir(), "job-trunc")
+	if logFile == nil {
+		t.Fatal("expected a non-nil log file")
+	}
+	defer logFile.Close()
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if strings.Contains(string(logged), "STALE") {
+		t.Fatalf("log was not truncated: %q", string(logged))
+	}
+}
+
+// TestCockpitTeeAdapterFailOpenUnsupportedRuntime: an unsupported runtime fails
+// the adapter rebuild, so the helper returns a nil file (no leaked log) and the
+// caller falls back to the P0 pane — fail-open, never failing the job.
+func TestCockpitTeeAdapterFailOpenUnsupportedRuntime(t *testing.T) {
+	home := t.TempDir()
+	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
+	agent := runtime.Agent{Name: "x", Runtime: "nope-not-a-runtime"}
+	adapter, logPath, logFile := worker.cockpitTeeAdapter(agent, t.TempDir(), "job-bad")
+	if adapter != nil || logPath != "" || logFile != nil {
+		t.Fatalf("expected fail-open nils, got adapter=%v path=%q file=%v", adapter, logPath, logFile)
 	}
 }
 

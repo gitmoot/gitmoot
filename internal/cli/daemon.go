@@ -26,6 +26,7 @@ import (
 	gitutil "github.com/jerryfane/gitmoot/internal/git"
 	"github.com/jerryfane/gitmoot/internal/github"
 	"github.com/jerryfane/gitmoot/internal/runtime"
+	"github.com/jerryfane/gitmoot/internal/subprocess"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
@@ -1708,6 +1709,23 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			cp = w.newCockpit(policy)
 		}
 		meta := cockpitJobMeta(job, payload, agent, checkout, policy.CockpitPaneKey)
+		// Only when the cockpit will actually wrap (herdr available) do we tee the
+		// child's live output into a per-job log the pane tails (Task 6). The tee
+		// rebuilds the inner adapter with a group-kill-preserving TeeRunner and sets
+		// meta.LogPath; on any log-setup failure it falls back to no LogPath (the P0
+		// `job watch` pane). The non-cockpit / unavailable paths never create a log
+		// file or tee — they stay byte-identical.
+		if maybeWrapCockpitAvailable(cp, payload.Cockpit, userOptedOff) {
+			if teeAdapter, logPath, logFile := w.cockpitTeeAdapter(agent, checkout, job.ID); logFile != nil {
+				defer func() {
+					if err := logFile.Close(); err != nil {
+						writeLine(w.Stdout, "job %s cockpit log close failed: %v", job.ID, err)
+					}
+				}()
+				adapter = teeAdapter
+				meta.LogPath = logPath
+			}
+		}
 		var unavailable bool
 		adapter, unavailable = maybeWrapCockpit(cp, payload.Cockpit, userOptedOff, adapter, meta)
 		if unavailable {
@@ -1829,6 +1847,46 @@ func cockpitJobMeta(job db.Job, payload workflow.JobPayload, agent runtime.Agent
 	}
 }
 
+// cockpitTeeAdapter creates the per-job log the cockpit pane tails and rebuilds
+// the runtime adapter to tee the child's live stdout/stderr into it. It is called
+// ONLY on the wrapping path (herdr available), so non-cockpit and cockpit-off
+// jobs never create a log file or tee and stay byte-identical. The log lives at
+// <home>/logs/jobs/<jobid>.log and is created+truncated so each run starts fresh.
+// The tee uses a TeeRunner whose inner is GroupRunner{}, so process-group kill is
+// preserved and the buffered Result the adapter consumes is unchanged.
+//
+// It is fail-open: any failure (paths unresolved, mkdir, create, or an
+// unsupported runtime) returns a nil *os.File so the caller skips teeing and the
+// pane falls back to the P0 `job watch` command. The returned *os.File is the
+// caller's to Close after the job runs; when nil the adapter/path are ignored.
+func (w jobWorker) cockpitTeeAdapter(agent runtime.Agent, checkout string, jobID string) (workflow.DeliveryAdapter, string, *os.File) {
+	paths, err := pathsFromFlag(w.ConfigHome)
+	if err != nil {
+		writeLine(w.Stdout, "job %s cockpit log path resolve failed: %v", jobID, err)
+		return nil, "", nil
+	}
+	dir := filepath.Join(paths.Logs, "jobs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		writeLine(w.Stdout, "job %s cockpit log dir create failed: %v", jobID, err)
+		return nil, "", nil
+	}
+	logPath := filepath.Join(dir, jobID+".log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		writeLine(w.Stdout, "job %s cockpit log create failed: %v", jobID, err)
+		return nil, "", nil
+	}
+	adapter, err := buildRuntimeAdapter(agent, checkout, subprocess.TeeRunner{Inner: subprocess.GroupRunner{}, Out: logFile})
+	if err != nil {
+		// Unsupported runtime: this should never happen (AdapterFactory already
+		// built one above), but stay fail-open rather than leak the open file.
+		_ = logFile.Close()
+		writeLine(w.Stdout, "job %s cockpit tee adapter build failed: %v", jobID, err)
+		return nil, "", nil
+	}
+	return adapter, logPath, logFile
+}
+
 // maybeWrapCockpit decides whether a job's delivery is wrapped in a herdr pane.
 // It is a pure helper (no daemon state) so the wrap-vs-passthrough decision is
 // directly unit-testable. The returned unavailable flag is true exactly when the
@@ -1846,10 +1904,23 @@ func maybeWrapCockpit(cp *cockpit.Cockpit, requested bool, modeOff bool, inner w
 	if !requested || modeOff {
 		return inner, false
 	}
-	if cp == nil || !cp.Available(context.Background()) {
+	if !maybeWrapCockpitAvailable(cp, requested, modeOff) {
 		return inner, true
 	}
 	return cp.Wrap(inner, meta), false
+}
+
+// maybeWrapCockpitAvailable reports whether the cockpit will actually wrap this
+// job's delivery in a pane: requested, the host did not opt out (mode off), and
+// herdr is reachable. It is the single source of truth the daemon uses BOTH to
+// decide whether to set up the per-job tee log (so logs/tees are created only on
+// the wrapping path) and inside maybeWrapCockpit's final decision, so the two can
+// never drift. Availability is cached (availableTTL) so the extra call is cheap.
+func maybeWrapCockpitAvailable(cp *cockpit.Cockpit, requested bool, modeOff bool) bool {
+	if !requested || modeOff || cp == nil {
+		return false
+	}
+	return cp.Available(context.Background())
 }
 
 func tempWorkerEligible(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload, agent runtime.Agent, policy config.ParallelSessionPolicy, now time.Time) tempWorkerEligibility {
@@ -2560,15 +2631,26 @@ func (w jobWorker) refreshImplementedPayloadForRetry(ctx context.Context, job db
 }
 
 func (w jobWorker) defaultAdapter(agent runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
+	return buildRuntimeAdapter(agent, checkout, nil)
+}
+
+// buildRuntimeAdapter constructs the concrete runtime adapter for a job. A nil
+// runner leaves the adapter's Runner unset, so it falls through to the
+// process-group GroupRunner{} via the adapter's runner() — byte-identical to the
+// non-cockpit path. The cockpit path (Task 6) passes a non-nil tee runner so the
+// child's stdout/stderr is also streamed live into the per-job log the pane
+// tails; the tee preserves group-kill (its inner is GroupRunner{}) and returns
+// the same buffered Result, so result capture, locks, and signals are unchanged.
+func buildRuntimeAdapter(agent runtime.Agent, checkout string, runner subprocess.Runner) (workflow.DeliveryAdapter, error) {
 	switch agent.Runtime {
 	case runtime.CodexRuntime:
-		return runtime.CodexAdapter{Dir: checkout}, nil
+		return runtime.CodexAdapter{Dir: checkout, Runner: runner}, nil
 	case runtime.ClaudeRuntime:
-		return runtime.ClaudeAdapter{Dir: checkout}, nil
+		return runtime.ClaudeAdapter{Dir: checkout, Runner: runner}, nil
 	case runtime.KimiRuntime:
-		return runtime.KimiAdapter{Dir: checkout}, nil
+		return runtime.KimiAdapter{Dir: checkout, Runner: runner}, nil
 	case runtime.ShellRuntime:
-		return runtime.ShellAdapter{Dir: checkout}, nil
+		return runtime.ShellAdapter{Dir: checkout, Runner: runner}, nil
 	default:
 		return nil, fmt.Errorf("unsupported runtime: %s", agent.Runtime)
 	}

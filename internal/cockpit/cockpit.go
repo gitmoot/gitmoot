@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -103,6 +104,12 @@ type JobMeta struct {
 	Worktree  string
 	PaneKey   string
 	Depth     int
+	// LogPath is the per-job log file the daemon tees the child's live
+	// stdout/stderr into (P1, Task 6). When set, the pane tails it for live
+	// output; when empty the pane falls back to the P0 `gitmoot job watch`
+	// command. It is optional and best-effort: an empty LogPath leaves the pane
+	// behaving exactly as P0.
+	LogPath string
 }
 
 // Cockpit opens and tears down herdr panes around delegation deliveries.
@@ -362,14 +369,31 @@ func (a *paneAdapter) workspaceRoot() string {
 	return a.meta.JobID
 }
 
-// watchCommand is the P0 pane payload: tail the job's progress via the gitmoot
-// CLI. In P1 (Task 6) this is replaced by tailing a streamed log.
+// watchCommand is the pane payload. In P1 (Task 6), when the daemon tees the
+// child's live stdout/stderr into a per-job log (meta.LogPath set), the pane
+// tails that file so real output appears live: `tail -n +1 -F <log>` (-n +1
+// replays from the start so output written before the pane attached is not lost;
+// -F keeps following across the truncate-on-start and any rotation). With no log
+// (LogPath empty — herdr unavailable on the wrapping path, or a log that could
+// not be created) it falls back to the P0 `gitmoot job watch` command, so
+// behavior is unchanged.
 func (a *paneAdapter) watchCommand() string {
+	if a.meta.LogPath != "" {
+		return fmt.Sprintf("tail -n +1 -F %s", shellQuote(a.meta.LogPath))
+	}
 	cmd := fmt.Sprintf("%s job watch %s", a.cockpit.gitmootBin, a.meta.JobID)
 	if a.cockpit.home != "" {
 		cmd += fmt.Sprintf(" --home %s", a.cockpit.home)
 	}
 	return cmd
+}
+
+// shellQuote single-quotes s for safe interpolation into the single shell-string
+// command the pane runs, so a log path with spaces or shell metacharacters is
+// passed as one literal argument. Single quotes preserve everything except a
+// single quote, which is closed, escaped, and reopened.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // rootPaneFor returns the split-parent target for a workspace. The workspace id
