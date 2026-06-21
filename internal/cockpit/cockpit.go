@@ -87,8 +87,10 @@ type PaneStore interface {
 	DeleteCockpitPaneByJob(ctx context.Context, jobID string) error
 	// GetOrCreateWorkspaceForRoot serializes one workspace per root: create is
 	// called only on first use for a given root and its workspace id is reused
-	// thereafter.
-	GetOrCreateWorkspaceForRoot(ctx context.Context, rootJobID string, create func() (workspaceID string, err error)) (string, error)
+	// thereafter. create returns both the workspace id and its root pane id; the
+	// root pane id is persisted and returned on every reuse so subsequent children
+	// can split off it (herdr's pane split needs a PANE id, not a workspace id).
+	GetOrCreateWorkspaceForRoot(ctx context.Context, rootJobID string, create func() (workspaceID string, rootPaneID string, err error)) (workspaceID string, rootPaneID string, err error)
 	// GetWorkspaceForRoot returns the registered workspace id for a root, if one
 	// exists. The bool reports found; a not-found root is ("", false, nil) — never a
 	// surfaced sql.ErrNoRows — so FinalizeRoot's fail-open path treats "no workspace"
@@ -367,22 +369,29 @@ func (a *paneAdapter) open(ctx context.Context) string {
 		return ""
 	}
 
-	workspaceID, err := c.store.GetOrCreateWorkspaceForRoot(ctx, rootJob, func() (string, error) {
+	workspaceID, rootPaneID, err := c.store.GetOrCreateWorkspaceForRoot(ctx, rootJob, func() (string, string, error) {
 		callCtx, cancel := context.WithTimeout(ctx, herdrCallTimeout)
 		defer cancel()
-		wsID, _, createErr := c.client.workspaceCreate(callCtx, a.meta.Worktree, a.workspaceLabel())
-		return wsID, createErr
+		wsID, rootPane, createErr := c.client.workspaceCreate(callCtx, a.meta.Worktree, a.workspaceLabel())
+		return wsID, rootPane, createErr
 	})
 	if err != nil || workspaceID == "" {
 		c.logf("cockpit: resolve workspace for root %s: %v", rootJob, err)
 		return ""
 	}
 
-	// The parent pane for the first split is the workspace's root pane. herdr
-	// accepts the workspace id as the split parent target for the root pane.
+	// The parent of every split is the workspace's ROOT PANE. herdr's `pane split`
+	// requires a pane id as the parent target — passing the workspace id fails with
+	// pane_not_found — so we split off the root pane captured at workspace create
+	// (persisted in the registry and returned on reuse). rootPaneFor is a defensive
+	// fallback for legacy registry rows whose root pane id predates this capture.
 	splitCtx, cancel := context.WithTimeout(ctx, herdrCallTimeout)
 	defer cancel()
-	paneID, err := c.client.paneSplit(splitCtx, c.rootPaneFor(workspaceID), a.meta.Worktree)
+	splitParent := rootPaneID
+	if splitParent == "" {
+		splitParent = c.rootPaneFor(workspaceID)
+	}
+	paneID, err := c.client.paneSplit(splitCtx, splitParent, a.meta.Worktree)
 	if err != nil || paneID == "" {
 		c.logf("cockpit: pane split for job %s: %v", a.meta.JobID, err)
 		return ""
@@ -537,11 +546,17 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// rootPaneFor returns the split-parent target for a workspace. The workspace id
-// addresses its root pane for the first split; subsequent splits target the
-// root pane too (herdr lays them out under the workspace).
+// rootPaneFor derives a best-effort split-parent for a workspace whose root pane
+// id was not captured at create time (legacy registry rows predating that
+// capture). herdr names a workspace's root pane "<workspaceID>:p1", so we target
+// that; the workspace id alone is NOT a valid split parent (pane_not_found).
+// Freshly created workspaces pass the real root pane id from workspaceCreate and
+// never reach this fallback.
 func (c *Cockpit) rootPaneFor(workspaceID string) string {
-	return workspaceID
+	if workspaceID == "" {
+		return ""
+	}
+	return workspaceID + ":p1"
 }
 
 // bestEffort runs a timeout-bounded herdr call and swallows any error after

@@ -3397,28 +3397,34 @@ func TestGetOrCreateWorkspaceForRoot(t *testing.T) {
 	defer store.Close()
 
 	var calls atomic.Int64
-	create := func() (string, error) {
+	create := func() (string, string, error) {
 		calls.Add(1)
-		return "ws-created", nil
+		return "ws-created", "ws-created:p1", nil
 	}
 
-	// First call creates and binds the workspace.
-	ws, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-1", create)
+	// First call creates and binds the workspace AND its root pane id.
+	ws, rp, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-1", create)
 	if err != nil {
 		t.Fatalf("GetOrCreateWorkspaceForRoot returned error: %v", err)
 	}
 	if ws != "ws-created" {
 		t.Fatalf("workspace id = %q, want ws-created", ws)
 	}
+	if rp != "ws-created:p1" {
+		t.Fatalf("root pane id = %q, want ws-created:p1", rp)
+	}
 
-	// Repeated calls for the same root return the bound id without calling create.
+	// Repeated calls for the same root return the bound ids without calling create.
 	for i := 0; i < 3; i++ {
-		ws, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-1", create)
+		ws, rp, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-1", create)
 		if err != nil {
 			t.Fatalf("GetOrCreateWorkspaceForRoot (repeat) returned error: %v", err)
 		}
 		if ws != "ws-created" {
 			t.Fatalf("workspace id (repeat) = %q, want ws-created", ws)
+		}
+		if rp != "ws-created:p1" {
+			t.Fatalf("root pane id (repeat) = %q, want ws-created:p1", rp)
 		}
 	}
 	if got := calls.Load(); got != 1 {
@@ -3426,21 +3432,21 @@ func TestGetOrCreateWorkspaceForRoot(t *testing.T) {
 	}
 
 	// A different root creates its own workspace.
-	ws2, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-2", func() (string, error) {
-		return "ws-other", nil
+	ws2, rp2, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-2", func() (string, string, error) {
+		return "ws-other", "ws-other:p1", nil
 	})
 	if err != nil {
 		t.Fatalf("GetOrCreateWorkspaceForRoot(root-2) returned error: %v", err)
 	}
-	if ws2 != "ws-other" {
-		t.Fatalf("workspace id (root-2) = %q, want ws-other", ws2)
+	if ws2 != "ws-other" || rp2 != "ws-other:p1" {
+		t.Fatalf("root-2 = (%q,%q), want (ws-other,ws-other:p1)", ws2, rp2)
 	}
 
 	// Validation: empty root and nil create are rejected.
-	if _, err := store.GetOrCreateWorkspaceForRoot(ctx, "  ", create); err == nil {
+	if _, _, err := store.GetOrCreateWorkspaceForRoot(ctx, "  ", create); err == nil {
 		t.Fatal("GetOrCreateWorkspaceForRoot with empty root returned nil error")
 	}
-	if _, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-3", nil); err == nil {
+	if _, _, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-3", nil); err == nil {
 		t.Fatal("GetOrCreateWorkspaceForRoot with nil create returned nil error")
 	}
 }
@@ -3466,8 +3472,8 @@ func TestGetAndDeleteWorkspaceForRoot(t *testing.T) {
 		t.Fatalf("GetWorkspaceForRoot(empty) = (found=%v,err=%v), want (false,nil)", found, err)
 	}
 
-	if _, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-1", func() (string, error) {
-		return "ws-1", nil
+	if _, _, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-1", func() (string, string, error) {
+		return "ws-1", "ws-1:p1", nil
 	}); err != nil {
 		t.Fatalf("seed workspace: %v", err)
 	}
@@ -3500,10 +3506,11 @@ func TestGetOrCreateWorkspaceForRootConcurrent(t *testing.T) {
 
 	const goroutines = 16
 	var calls atomic.Int64
-	create := func() (string, error) {
+	create := func() (string, string, error) {
 		// Each create returns a distinct id so we can verify exactly one wins.
 		n := calls.Add(1)
-		return "ws-" + string(rune('a'+int(n-1))), nil
+		id := "ws-" + string(rune('a'+int(n-1)))
+		return id, id + ":p1", nil
 	}
 
 	var wg sync.WaitGroup
@@ -3514,7 +3521,7 @@ func TestGetOrCreateWorkspaceForRootConcurrent(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			<-start
-			ws, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-race", create)
+			ws, _, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-race", create)
 			if err != nil {
 				t.Errorf("GetOrCreateWorkspaceForRoot(concurrent) returned error: %v", err)
 				return
@@ -3537,9 +3544,9 @@ func TestGetOrCreateWorkspaceForRootConcurrent(t *testing.T) {
 	}
 	// create may run more than once under contention (it shells out before the
 	// insert), but the bound id is stable and matches what every caller sees.
-	final, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-race", func() (string, error) {
+	final, _, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-race", func() (string, string, error) {
 		t.Fatal("create must not run once the root is bound")
-		return "", nil
+		return "", "", nil
 	})
 	if err != nil {
 		t.Fatalf("GetOrCreateWorkspaceForRoot(after race) returned error: %v", err)

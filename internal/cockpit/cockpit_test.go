@@ -48,6 +48,13 @@ func (f *fakeRunner) run(_ context.Context, args ...string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, strings.Join(args, " "))
+	// Mirror real herdr: `pane split <parent>` requires a PANE id (form "ws:pN"),
+	// not a workspace id ("ws"). A workspace-id parent fails with pane_not_found.
+	// This guards the root-pane-id split fix from regressing: passing the bare
+	// workspace id (as the old rootPaneFor did) would silently create no pane.
+	if len(args) >= 3 && args[0] == "pane" && args[1] == "split" && !strings.Contains(args[2], ":") {
+		return `{"error":{"code":"pane_not_found","message":"pane not found"}}`, errors.New("pane_not_found: " + args[2])
+	}
 	r, ok := f.replies[replyKey(args)]
 	if !ok {
 		return "{}", nil
@@ -99,6 +106,7 @@ type fakeStore struct {
 	mu         sync.Mutex
 	panes      map[string]Pane // keyed by job id
 	workspaces map[string]string
+	rootPanes  map[string]string // root job id -> workspace root pane id
 	createN    int
 	insertErr  error
 	byKeyErr   error
@@ -106,7 +114,7 @@ type fakeStore struct {
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{panes: map[string]Pane{}, workspaces: map[string]string{}}
+	return &fakeStore{panes: map[string]Pane{}, workspaces: map[string]string{}, rootPanes: map[string]string{}}
 }
 
 func (s *fakeStore) InsertCockpitPane(_ context.Context, pane Pane) error {
@@ -194,22 +202,24 @@ func (s *fakeStore) DeleteCockpitPaneByJob(_ context.Context, jobID string) erro
 	return nil
 }
 
-func (s *fakeStore) GetOrCreateWorkspaceForRoot(_ context.Context, rootJobID string, create func() (string, error)) (string, error) {
+func (s *fakeStore) GetOrCreateWorkspaceForRoot(_ context.Context, rootJobID string, create func() (string, string, error)) (string, string, error) {
 	s.mu.Lock()
 	if ws, ok := s.workspaces[rootJobID]; ok {
+		rp := s.rootPanes[rootJobID]
 		s.mu.Unlock()
-		return ws, nil
+		return ws, rp, nil
 	}
 	s.mu.Unlock()
-	ws, err := create()
+	ws, rp, err := create()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	s.mu.Lock()
 	s.createN++
 	s.workspaces[rootJobID] = ws
+	s.rootPanes[rootJobID] = rp
 	s.mu.Unlock()
-	return ws, nil
+	return ws, rp, nil
 }
 
 func (s *fakeStore) GetWorkspaceForRoot(_ context.Context, rootJobID string) (string, bool, error) {
@@ -446,8 +456,9 @@ func TestWrapDeliverArgsCarryVerifiedFields(t *testing.T) {
 	// workspace create uses the worktree cwd and --no-focus.
 	assertContains("workspace create --cwd /tmp/wt --label")
 	assertContains("--no-focus")
-	// pane split targets the workspace root pane parent and the worktree cwd.
-	assertContains("pane split w1 --direction down --cwd /tmp/wt --no-focus")
+	// pane split targets the workspace's ROOT PANE id (w1:p1, captured at create),
+	// not the bare workspace id — herdr's pane split needs a pane parent.
+	assertContains("pane split w1:p1 --direction down --cwd /tmp/wt --no-focus")
 	// rename uses "<agent> · d<depth> · <branch>".
 	assertContains("pane rename w1:p2 builder · d1 · feat/x")
 	// report-agent uses the verified source + gm-<jobid8> agent + working.
@@ -885,8 +896,8 @@ func TestFinalizeRootClosesRegistryWorkspaceWithoutPaneRows(t *testing.T) {
 	// Simulate a finished job-mode run: a workspace was registered for the root, but
 	// the pane row was already deleted on the per-Deliver grace close, so no rows
 	// remain under the root.
-	if _, err := store.GetOrCreateWorkspaceForRoot(context.Background(), "root-job", func() (string, error) {
-		return "w-job", nil
+	if _, _, err := store.GetOrCreateWorkspaceForRoot(context.Background(), "root-job", func() (string, string, error) {
+		return "w-job", "w-job:p1", nil
 	}); err != nil {
 		t.Fatalf("seed workspace: %v", err)
 	}

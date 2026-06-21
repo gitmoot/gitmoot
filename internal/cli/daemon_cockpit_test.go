@@ -491,8 +491,8 @@ func TestFinalizeCockpitRootIfDoneJobMode(t *testing.T) {
 	if err := store.CreateJob(ctx, db.Job{ID: "root-job", Agent: "a", Type: "implement", State: string(workflow.JobSucceeded), Payload: cockpitTestJobPayload(t, workflow.JobPayload{})}); err != nil {
 		t.Fatalf("CreateJob: %v", err)
 	}
-	if _, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-job", func() (string, error) {
-		return "w-job", nil
+	if _, _, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-job", func() (string, string, error) {
+		return "w-job", "w-job:p1", nil
 	}); err != nil {
 		t.Fatalf("seed workspace: %v", err)
 	}

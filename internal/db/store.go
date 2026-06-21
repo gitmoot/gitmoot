@@ -4767,56 +4767,60 @@ func (s *Store) DeleteCockpitPaneByJob(ctx context.Context, jobID string) error 
 // inserter wins and create runs once; losers read the winner's id back without
 // calling create. create is invoked outside the row insert (it shells out to
 // herdr), and a racing insert that loses simply re-reads the committed id.
-func (s *Store) GetOrCreateWorkspaceForRoot(ctx context.Context, rootJobID string, create func() (workspaceID string, err error)) (string, error) {
+// create returns BOTH the new workspace id and the id of its root pane: herdr's
+// `pane split` requires a PANE id as the split parent (the workspace id is not a
+// valid target), so the root pane id is persisted alongside the workspace and
+// returned on every reuse so subsequent children split off it.
+func (s *Store) GetOrCreateWorkspaceForRoot(ctx context.Context, rootJobID string, create func() (workspaceID string, rootPaneID string, err error)) (workspaceID string, rootPaneID string, err error) {
 	rootJobID = strings.TrimSpace(rootJobID)
 	if rootJobID == "" {
-		return "", errors.New("cockpit workspace root_job_id is required")
+		return "", "", errors.New("cockpit workspace root_job_id is required")
 	}
 	if create == nil {
-		return "", errors.New("cockpit workspace create func is required")
+		return "", "", errors.New("cockpit workspace create func is required")
 	}
 	// Fast path: an existing registration short-circuits without calling create.
-	if existing, err := s.lookupWorkspaceForRoot(ctx, rootJobID); err != nil {
-		return "", err
-	} else if existing != "" {
-		return existing, nil
+	if existingWS, existingRP, err := s.lookupWorkspaceForRoot(ctx, rootJobID); err != nil {
+		return "", "", err
+	} else if existingWS != "" {
+		return existingWS, existingRP, nil
 	}
-	workspaceID, err := create()
+	workspaceID, rootPaneID, err = create()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	workspaceID = strings.TrimSpace(workspaceID)
+	rootPaneID = strings.TrimSpace(rootPaneID)
 	if workspaceID == "" {
-		return "", errors.New("cockpit workspace create returned an empty workspace id")
+		return "", "", errors.New("cockpit workspace create returned an empty workspace id")
 	}
 	// INSERT OR IGNORE: if a concurrent caller already bound this root, our row
 	// is dropped and we fall through to re-read the winning id (our freshly
 	// created workspace is then orphaned, which the cockpit reaper handles).
-	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO cockpit_workspaces(root_job_id, workspace_id) VALUES (?, ?)`,
-		rootJobID, workspaceID); err != nil {
-		return "", err
+	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO cockpit_workspaces(root_job_id, workspace_id, root_pane_id) VALUES (?, ?, ?)`,
+		rootJobID, workspaceID, rootPaneID); err != nil {
+		return "", "", err
 	}
-	stored, err := s.lookupWorkspaceForRoot(ctx, rootJobID)
+	storedWS, storedRP, err := s.lookupWorkspaceForRoot(ctx, rootJobID)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	if stored == "" {
-		// Should not happen: we just inserted-or-ignored. Treat as our id.
-		return workspaceID, nil
+	if storedWS == "" {
+		// Should not happen: we just inserted-or-ignored. Treat as our ids.
+		return workspaceID, rootPaneID, nil
 	}
-	return stored, nil
+	return storedWS, storedRP, nil
 }
 
-func (s *Store) lookupWorkspaceForRoot(ctx context.Context, rootJobID string) (string, error) {
-	var workspaceID string
-	err := s.db.QueryRowContext(ctx, `SELECT workspace_id FROM cockpit_workspaces WHERE root_job_id = ?`, rootJobID).Scan(&workspaceID)
+func (s *Store) lookupWorkspaceForRoot(ctx context.Context, rootJobID string) (workspaceID string, rootPaneID string, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT workspace_id, root_pane_id FROM cockpit_workspaces WHERE root_job_id = ?`, rootJobID).Scan(&workspaceID, &rootPaneID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
+		return "", "", nil
 	}
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return strings.TrimSpace(workspaceID), nil
+	return strings.TrimSpace(workspaceID), strings.TrimSpace(rootPaneID), nil
 }
 
 // GetWorkspaceForRoot returns the Herdr workspace id registered for an
@@ -4831,7 +4835,7 @@ func (s *Store) GetWorkspaceForRoot(ctx context.Context, rootJobID string) (stri
 	if rootJobID == "" {
 		return "", false, nil
 	}
-	workspaceID, err := s.lookupWorkspaceForRoot(ctx, rootJobID)
+	workspaceID, _, err := s.lookupWorkspaceForRoot(ctx, rootJobID)
 	if err != nil {
 		return "", false, err
 	}
@@ -5671,5 +5675,8 @@ CREATE TABLE cockpit_workspaces (
 	workspace_id TEXT NOT NULL,
 	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+	`,
+	`
+ALTER TABLE cockpit_workspaces ADD COLUMN root_pane_id TEXT NOT NULL DEFAULT '';
 	`,
 }
