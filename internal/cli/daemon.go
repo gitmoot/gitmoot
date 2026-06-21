@@ -1798,12 +1798,16 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 				writeLine(w.Stdout, "job %s cockpit_unavailable event failed: %v", job.ID, eventErr)
 			}
 		}
-		// SEAT MODE ONLY: on the job's return, check whether the root coordination
-		// tree has now terminated and, if so, tear its panes / workspace / seat logs
-		// down once and surface the reconvene view (Task 7/8). Job mode is left
-		// byte-identical to P1 — its panes close per-Deliver and it never reaches
-		// here, so no extra herdr calls are made on the job-mode path.
-		if cp != nil && !userOptedOff && seatMode {
+		// On the job's return, check whether the root coordination tree has now
+		// terminated and, if so, tear its panes / workspace / seat logs down once and
+		// surface the reconvene view (Task 7/8). This runs in BOTH modes: seat mode
+		// closes the persisted seat panes + workspace here, and job mode (whose panes
+		// already close per-Deliver) still needs the per-root WORKSPACE closed at
+		// root-terminal — the cockpit_workspaces registry is the only remaining handle
+		// once the pane rows are gone. finalizeCockpitRootIfDone's cheap guard
+		// short-circuits when there is neither a pane row nor a registered workspace,
+		// so a non-cockpit tree makes no extra herdr calls.
+		if cp != nil && !userOptedOff {
 			defer w.finalizeCockpitRootIfDone(cp, job, payload, meta.RootJobID)
 		}
 	}
@@ -1943,7 +1947,12 @@ func (w jobWorker) cockpitTeeAdapter(agent runtime.Agent, checkout string, jobID
 		writeLine(w.Stdout, "job %s cockpit log dir create failed: %v", jobID, err)
 		return nil, "", nil
 	}
-	logPath := filepath.Join(dir, jobID+".log")
+	// Sanitize the job id into a flat, path-safe filename: delegation/continuation
+	// job ids contain '/' (e.g. "root/delegation/haiku-ocean", ".../continuation"),
+	// which would nest the log into dirs that are never created and fail os.Create →
+	// the live tail silently falls back to the P0 pane. A flat slug keeps it one
+	// file in this dir (no deep per-job dir trees).
+	logPath := filepath.Join(dir, cockpit.SafeLogName(jobID)+".log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		writeLine(w.Stdout, "job %s cockpit log create failed: %v", jobID, err)
@@ -2017,12 +2026,18 @@ func (w jobWorker) cockpitSeatLogAdapter(cp *cockpit.Cockpit, agent runtime.Agen
 // its per-Deliver teardown stays byte-identical.
 func (w jobWorker) finalizeCockpitRootIfDone(cp *cockpit.Cockpit, job db.Job, payload workflow.JobPayload, rootJobID string) {
 	ctx := context.Background()
-	// Cheap scoped guard before the full job-table scan: if the root has no live
-	// panes (none opened, or already finalized), there is nothing to do — this
-	// short-circuits the redundant rootTreeTerminal scans that would otherwise run
-	// on every in-tree job's completion once the root is already torn down.
+	// Cheap scoped guard before the full job-table scan: short-circuit only when the
+	// root has NEITHER a live pane row NOR a registered workspace (none opened, or
+	// already finalized) — there is then nothing to tear down, so the redundant
+	// rootTreeTerminal scans on every in-tree job's completion are skipped. Job mode
+	// deletes pane rows per-Deliver, so by root-terminal the pane list is empty while
+	// a cockpit_workspaces row still needs closing; gating on the pane list alone
+	// would skip that workspace teardown (the leftover-workspace bug). Any store error
+	// falls through to the (idempotent, best-effort) finalize rather than skipping.
 	if panes, perr := w.Store.ListCockpitPanesByRoot(ctx, rootJobID); perr == nil && len(panes) == 0 {
-		return
+		if _, found, wsErr := w.Store.GetWorkspaceForRoot(ctx, rootJobID); wsErr == nil && !found {
+			return
+		}
 	}
 	done, err := w.rootTreeTerminal(ctx, rootJobID)
 	if err != nil {

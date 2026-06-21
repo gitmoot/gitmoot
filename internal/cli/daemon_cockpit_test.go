@@ -331,6 +331,40 @@ func TestCockpitTeeAdapterTruncatesExistingLog(t *testing.T) {
 	}
 }
 
+// TestCockpitTeeAdapterDelegationJobIDFlatPath is the bug-1 case: a
+// delegation/continuation job id contains '/', which the per-job log path must
+// sanitize into a single flat, path-safe filename in <home>/logs/jobs/ — otherwise
+// os.Create nests into non-existent dirs, fails, and the live stream silently falls
+// back to the P0 pane. The log file must actually be created (a non-nil file).
+func TestCockpitTeeAdapterDelegationJobIDFlatPath(t *testing.T) {
+	home := t.TempDir()
+	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
+	agent := runtime.Agent{Name: "lead", Role: "builder", Runtime: runtime.ShellRuntime, RuntimeRef: "true"}
+
+	jobID := "local-ask-conductor-1234/delegation/haiku-ocean"
+	adapter, logPath, logFile := worker.cockpitTeeAdapter(agent, t.TempDir(), jobID)
+	if logFile == nil || adapter == nil {
+		t.Fatalf("expected a non-nil adapter+log file for a slashed job id; adapter=%v file=%v", adapter, logFile)
+	}
+	defer logFile.Close()
+
+	jobsDir := filepath.Join(config.PathsForHome(home).Logs, "jobs")
+	// The log must be a single flat file directly in jobsDir (no nested dirs).
+	if got := filepath.Dir(logPath); got != jobsDir {
+		t.Fatalf("log dir = %q, want flat %q (slashed job id must not nest)", got, jobsDir)
+	}
+	wantPath := filepath.Join(jobsDir, cockpit.SafeLogName(jobID)+".log")
+	if logPath != wantPath {
+		t.Fatalf("logPath = %q, want %q", logPath, wantPath)
+	}
+	if strings.Contains(filepath.Base(logPath), "/") {
+		t.Fatalf("log filename %q still contains a path separator", filepath.Base(logPath))
+	}
+	if _, err := os.Stat(logPath); err != nil {
+		t.Fatalf("log file not created for slashed job id: %v", err)
+	}
+}
+
 // TestCockpitTeeAdapterFailOpenUnsupportedRuntime: an unsupported runtime fails
 // the adapter rebuild, so the helper returns a nil file (no leaked log) and the
 // caller falls back to the P0 pane — fail-open, never failing the job.
@@ -439,6 +473,47 @@ func TestRootTreeTerminal(t *testing.T) {
 	if done, _ := worker.rootTreeTerminal(ctx, ""); done {
 		t.Fatal("rootTreeTerminal for an empty root id must be false")
 	}
+}
+
+// TestFinalizeCockpitRootIfDoneJobMode is the bug-2 daemon case: in JOB mode the
+// per-Deliver teardown deletes the pane rows, so at root-terminal no pane rows
+// remain — but the per-root workspace (recorded in cockpit_workspaces) must still
+// be torn down. finalizeCockpitRootIfDone must therefore run in job mode (not only
+// seat mode), its cheap guard must NOT short-circuit while a registry workspace
+// row exists, and FinalizeRoot must delete that registry row.
+func TestFinalizeCockpitRootIfDoneJobMode(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	worker := defaultJobWorker(store, io.Discard)
+
+	// A terminal job-mode tree: the root coordinator succeeded and no pane rows
+	// remain (they were deleted per-Deliver), but a workspace was registered.
+	if err := store.CreateJob(ctx, db.Job{ID: "root-job", Agent: "a", Type: "implement", State: string(workflow.JobSucceeded), Payload: cockpitTestJobPayload(t, workflow.JobPayload{})}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if _, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-job", func() (string, error) {
+		return "w-job", nil
+	}); err != nil {
+		t.Fatalf("seed workspace: %v", err)
+	}
+	if rows, _ := store.ListCockpitPanesByRoot(ctx, "root-job"); len(rows) != 0 {
+		t.Fatalf("precondition: expected no pane rows, got %d", len(rows))
+	}
+
+	// A job-mode cockpit (herdr absent on CI, so the workspace-close call is a
+	// best-effort no-op); the load-bearing observable is that the registry row is
+	// deleted — proving the guard let job mode through and FinalizeRoot ran.
+	cp := cockpit.New(cockpit.Options{HerdrBin: "herdr-does-not-exist-for-tests", PaneKeyMode: config.CockpitPaneKeyJob}, cockpitPaneStore{store: store})
+
+	worker.finalizeCockpitRootIfDone(cp, db.Job{ID: "root-job"}, workflow.JobPayload{}, "root-job")
+
+	if ws, found, err := store.GetWorkspaceForRoot(ctx, "root-job"); err != nil || found || ws != "" {
+		t.Fatalf("workspace registry row after job-mode finalize = (%q,%v,%v), want (\"\",false,nil) — workspace not torn down", ws, found, err)
+	}
+
+	// Idempotent: a second finalize finds neither a pane row nor a workspace and
+	// short-circuits cleanly (no error, no panic).
+	worker.finalizeCockpitRootIfDone(cp, db.Job{ID: "root-job"}, workflow.JobPayload{}, "root-job")
 }
 
 func TestCockpitJobStateTerminal(t *testing.T) {

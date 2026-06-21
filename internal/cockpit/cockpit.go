@@ -89,6 +89,16 @@ type PaneStore interface {
 	// called only on first use for a given root and its workspace id is reused
 	// thereafter.
 	GetOrCreateWorkspaceForRoot(ctx context.Context, rootJobID string, create func() (workspaceID string, err error)) (string, error)
+	// GetWorkspaceForRoot returns the registered workspace id for a root, if one
+	// exists. The bool reports found; a not-found root is ("", false, nil) — never a
+	// surfaced sql.ErrNoRows — so FinalizeRoot's fail-open path treats "no workspace"
+	// as a clean miss. It lets job-mode finalize close the per-root workspace from
+	// the registry even after every pane row has been deleted per-Deliver.
+	GetWorkspaceForRoot(ctx context.Context, rootJobID string) (workspaceID string, found bool, err error)
+	// DeleteWorkspaceForRoot removes the workspace registry row for a root so a
+	// second finalize finds nothing and no-ops (idempotent). Deleting a missing row
+	// is not an error.
+	DeleteWorkspaceForRoot(ctx context.Context, rootJobID string) error
 }
 
 // Options configures a Cockpit. The fields are frozen.
@@ -597,10 +607,28 @@ func (c *Cockpit) FinalizeRoot(ctx context.Context, rootJobID string) {
 			}
 		}
 	}
+	// Also close the per-root workspace from the registry, even when no pane rows
+	// remain. In JOB mode the pane rows are deleted per-Deliver, so by the time the
+	// tree is terminal ListCockpitPanesByRoot is empty and the pane-row loop above
+	// closes nothing — the cockpit_workspaces registry (populated by
+	// GetOrCreateWorkspaceForRoot) is the only remaining handle on the workspace.
+	// Dedup against the pane-row workspaces so a workspace is never closed twice.
+	if registryWS, found, wsErr := c.store.GetWorkspaceForRoot(ctx, rootJobID); wsErr != nil {
+		c.logf("cockpit: finalize root %s get workspace: %v", rootJobID, wsErr)
+	} else if found && registryWS != "" {
+		// The set is keyed by workspace id, so adding one already closed via a pane
+		// row is a no-op — a workspace is never closed twice.
+		workspaces[registryWS] = struct{}{}
+	}
 	for workspaceID := range workspaces {
 		c.bestEffort(ctx, "workspace close", func(cctx context.Context) error {
 			return c.client.workspaceClose(cctx, workspaceID)
 		})
+	}
+	// Drop the workspace registry row so a second finalize finds nothing and
+	// no-ops (idempotent). Best-effort: a delete failure never blocks finalizing.
+	if err := c.store.DeleteWorkspaceForRoot(ctx, rootJobID); err != nil {
+		c.logf("cockpit: finalize root %s delete workspace: %v", rootJobID, err)
 	}
 	// Remove the root's seat-log directory: the accumulating per-seat logs only
 	// backed the live tails, which are now closed, so they persist no longer than
@@ -746,6 +774,17 @@ func (c *Cockpit) seatLogRootDir(rootJobID string) string {
 		return ""
 	}
 	return filepath.Join(c.home, "logs", "seats", shortJobID(rootJobID))
+}
+
+// SafeLogName maps a job id to a flat, filesystem-safe filename component for the
+// per-job log. Delegation/continuation job ids contain '/' (e.g.
+// "root/delegation/haiku-ocean", ".../continuation"), which would otherwise nest
+// the per-job log into directories that are never created and fail os.Create →
+// the live tail silently falls back to the P0 pane. Slugifying to a single
+// path-safe token keeps it one file in <home>/logs/jobs/. It reuses seatSlug so
+// the per-job and per-seat sanitizers stay in lockstep.
+func SafeLogName(jobID string) string {
+	return seatSlug(jobID)
 }
 
 // seatSlug maps a pane key (e.g. an agent name) to a filesystem-safe slug for the

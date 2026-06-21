@@ -212,6 +212,23 @@ func (s *fakeStore) GetOrCreateWorkspaceForRoot(_ context.Context, rootJobID str
 	return ws, nil
 }
 
+func (s *fakeStore) GetWorkspaceForRoot(_ context.Context, rootJobID string) (string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ws, ok := s.workspaces[rootJobID]
+	if !ok || ws == "" {
+		return "", false, nil
+	}
+	return ws, true, nil
+}
+
+func (s *fakeStore) DeleteWorkspaceForRoot(_ context.Context, rootJobID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.workspaces, rootJobID)
+	return nil
+}
+
 // fakeInner is the wrapped DeliveryAdapter. It records that it ran and returns a
 // fixed result so the pane wrapper's pass-through can be asserted.
 type fakeInner struct {
@@ -843,14 +860,81 @@ func TestFinalizeRootClosesDeletesAndRemovesSeatLogs(t *testing.T) {
 	}
 }
 
-// TestFinalizeRootNoPanesIsNoop: finalizing a root with no panes (job mode, or
-// already finalized) is a cheap no-op with no herdr calls beyond the list.
+// TestFinalizeRootNoPanesIsNoop: finalizing a root with no panes AND no registered
+// workspace (already finalized, or never opened) is a cheap no-op with no herdr
+// close calls beyond the list.
 func TestFinalizeRootNoPanesIsNoop(t *testing.T) {
 	fr := newFakeRunner()
 	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, newFakeStore(), fr.run, okLookPath)
 	c.FinalizeRoot(context.Background(), "root-empty")
 	if countVerb(fr, "pane close") != 0 || countVerb(fr, "workspace close") != 0 {
 		t.Fatalf("finalize of an empty root must make no close calls; calls: %v", fr.calls)
+	}
+}
+
+// TestFinalizeRootClosesRegistryWorkspaceWithoutPaneRows is the job-mode bug-2
+// case: by the time the root tree is terminal the pane rows have been deleted
+// per-Deliver, so ListCockpitPanesByRoot is empty — but the per-root workspace
+// (recorded in the cockpit_workspaces registry) must still be closed and its
+// registry row deleted. A second finalize then finds nothing and no-ops.
+func TestFinalizeRootClosesRegistryWorkspaceWithoutPaneRows(t *testing.T) {
+	fr := newFakeRunner()
+	store := newFakeStore()
+	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeJob}, store, fr.run, okLookPath)
+
+	// Simulate a finished job-mode run: a workspace was registered for the root, but
+	// the pane row was already deleted on the per-Deliver grace close, so no rows
+	// remain under the root.
+	if _, err := store.GetOrCreateWorkspaceForRoot(context.Background(), "root-job", func() (string, error) {
+		return "w-job", nil
+	}); err != nil {
+		t.Fatalf("seed workspace: %v", err)
+	}
+	if rows, _ := store.ListCockpitPanesByRoot(context.Background(), "root-job"); len(rows) != 0 {
+		t.Fatalf("precondition: expected no pane rows, got %d", len(rows))
+	}
+
+	c.FinalizeRoot(context.Background(), "root-job")
+
+	if got := countVerb(fr, "pane close"); got != 0 {
+		t.Fatalf("pane close count = %d, want 0 (no pane rows in job mode)", got)
+	}
+	if got := countVerb(fr, "workspace close"); got != 1 {
+		t.Fatalf("workspace close count = %d, want 1 (registry workspace closed without pane rows)", got)
+	}
+	if ws, found, _ := store.GetWorkspaceForRoot(context.Background(), "root-job"); found || ws != "" {
+		t.Fatalf("workspace registry row still present after finalize: ws=%q found=%v", ws, found)
+	}
+
+	// Idempotent: a second finalize finds neither a pane row nor a workspace, so it
+	// makes no further close calls.
+	c.FinalizeRoot(context.Background(), "root-job")
+	if got := countVerb(fr, "workspace close"); got != 1 {
+		t.Fatalf("workspace close count after second finalize = %d, want 1 (idempotent)", got)
+	}
+}
+
+// TestFinalizeRootDedupsPaneAndRegistryWorkspace: seat mode has both pane rows AND
+// a registry row pointing at the SAME workspace; finalize must close that
+// workspace exactly once (no double close).
+func TestFinalizeRootDedupsPaneAndRegistryWorkspace(t *testing.T) {
+	fr := newFakeRunner()
+	store := newFakeStore()
+	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, store, fr.run, okLookPath)
+
+	adapter := c.Wrap(&fakeInner{}, seatMeta("job-a", "builder"))
+	if _, err := adapter.Deliver(context.Background(), runtime.Agent{}, runtime.Job{}); err != nil {
+		t.Fatal(err)
+	}
+	// The open path recorded both a pane row (workspace w1) and the registry row.
+	if ws, found, _ := store.GetWorkspaceForRoot(context.Background(), "root-seat"); !found || ws == "" {
+		t.Fatalf("precondition: expected a registered workspace, got found=%v ws=%q", found, ws)
+	}
+
+	c.FinalizeRoot(context.Background(), "root-seat")
+
+	if got := countVerb(fr, "workspace close"); got != 1 {
+		t.Fatalf("workspace close count = %d, want 1 (pane-row + registry workspace deduped)", got)
 	}
 }
 
@@ -978,6 +1062,27 @@ func TestSeatSlug(t *testing.T) {
 	for in, want := range cases {
 		if got := seatSlug(in); got != want {
 			t.Errorf("seatSlug(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestSafeLogName: a delegation/continuation job id (which contains '/') is
+// flattened into a single path-safe filename component with no separators, so the
+// per-job log is one file rather than nesting into non-existent dirs (bug 1).
+func TestSafeLogName(t *testing.T) {
+	cases := map[string]string{
+		"plain-job-1234":                            "plain-job-1234",
+		"local-ask-conductor-1234/delegation/haiku": "local-ask-conductor-1234_delegation_haiku",
+		"root/continuation":                         "root_continuation",
+		"":                                          "seat",
+	}
+	for in, want := range cases {
+		got := SafeLogName(in)
+		if got != want {
+			t.Errorf("SafeLogName(%q) = %q, want %q", in, got, want)
+		}
+		if strings.ContainsAny(got, `/\`) {
+			t.Errorf("SafeLogName(%q) = %q still contains a path separator", in, got)
 		}
 	}
 }

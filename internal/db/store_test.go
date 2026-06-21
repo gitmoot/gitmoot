@@ -3445,6 +3445,51 @@ func TestGetOrCreateWorkspaceForRoot(t *testing.T) {
 	}
 }
 
+// TestGetAndDeleteWorkspaceForRoot covers the registry lookup + delete the
+// job-mode finalize relies on to close the per-root workspace once the pane rows
+// are gone: a registered root reports found; an unknown/empty root reports a clean
+// miss (never sql.ErrNoRows); delete drops the row and is idempotent.
+func TestGetAndDeleteWorkspaceForRoot(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	// Unknown root is a clean miss, not an error.
+	if ws, found, err := store.GetWorkspaceForRoot(ctx, "root-x"); err != nil || found || ws != "" {
+		t.Fatalf("GetWorkspaceForRoot(unknown) = (%q,%v,%v), want (\"\",false,nil)", ws, found, err)
+	}
+	// An empty root id is also a clean miss.
+	if _, found, err := store.GetWorkspaceForRoot(ctx, "  "); err != nil || found {
+		t.Fatalf("GetWorkspaceForRoot(empty) = (found=%v,err=%v), want (false,nil)", found, err)
+	}
+
+	if _, err := store.GetOrCreateWorkspaceForRoot(ctx, "root-1", func() (string, error) {
+		return "ws-1", nil
+	}); err != nil {
+		t.Fatalf("seed workspace: %v", err)
+	}
+
+	ws, found, err := store.GetWorkspaceForRoot(ctx, "root-1")
+	if err != nil || !found || ws != "ws-1" {
+		t.Fatalf("GetWorkspaceForRoot(root-1) = (%q,%v,%v), want (ws-1,true,nil)", ws, found, err)
+	}
+
+	// Delete drops the row; a subsequent lookup is a clean miss.
+	if err := store.DeleteWorkspaceForRoot(ctx, "root-1"); err != nil {
+		t.Fatalf("DeleteWorkspaceForRoot returned error: %v", err)
+	}
+	if _, found, err := store.GetWorkspaceForRoot(ctx, "root-1"); err != nil || found {
+		t.Fatalf("GetWorkspaceForRoot after delete = (found=%v,err=%v), want (false,nil)", found, err)
+	}
+	// Idempotent: deleting a missing row is a no-op, not an error.
+	if err := store.DeleteWorkspaceForRoot(ctx, "root-1"); err != nil {
+		t.Fatalf("DeleteWorkspaceForRoot (repeat) returned error: %v", err)
+	}
+}
+
 func TestGetOrCreateWorkspaceForRootConcurrent(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))

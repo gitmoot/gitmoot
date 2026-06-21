@@ -4819,6 +4819,36 @@ func (s *Store) lookupWorkspaceForRoot(ctx context.Context, rootJobID string) (s
 	return strings.TrimSpace(workspaceID), nil
 }
 
+// GetWorkspaceForRoot returns the Herdr workspace id registered for an
+// orchestration root, if one exists. The bool reports found; a not-found root is
+// ("", false, nil) — never a surfaced sql.ErrNoRows — so the cockpit's fail-open
+// finalize path can treat "no workspace" as a clean miss rather than an error.
+// FinalizeRoot uses it to close the per-root workspace even when no pane rows
+// remain (job mode deletes pane rows per-Deliver, so the registry is the only
+// remaining handle on the workspace at root-terminal).
+func (s *Store) GetWorkspaceForRoot(ctx context.Context, rootJobID string) (string, bool, error) {
+	rootJobID = strings.TrimSpace(rootJobID)
+	if rootJobID == "" {
+		return "", false, nil
+	}
+	workspaceID, err := s.lookupWorkspaceForRoot(ctx, rootJobID)
+	if err != nil {
+		return "", false, err
+	}
+	if workspaceID == "" {
+		return "", false, nil
+	}
+	return workspaceID, true, nil
+}
+
+// DeleteWorkspaceForRoot removes the cockpit_workspaces registry row for a root.
+// FinalizeRoot calls it after closing the workspace so a second finalize finds
+// nothing and no-ops (idempotent). Deleting a missing row is a no-op, not an error.
+func (s *Store) DeleteWorkspaceForRoot(ctx context.Context, rootJobID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM cockpit_workspaces WHERE root_job_id = ?`, strings.TrimSpace(rootJobID))
+	return err
+}
+
 func scanCockpitPane(row interface{ Scan(dest ...any) error }) (CockpitPane, error) {
 	var pane CockpitPane
 	if err := row.Scan(&pane.ID, &pane.JobID, &pane.PaneKey, &pane.RootJobID,

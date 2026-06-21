@@ -72,6 +72,14 @@ func (s cockpitPaneStore) GetOrCreateWorkspaceForRoot(ctx context.Context, rootJ
 	return s.store.GetOrCreateWorkspaceForRoot(ctx, rootJobID, create)
 }
 
+func (s cockpitPaneStore) GetWorkspaceForRoot(ctx context.Context, rootJobID string) (string, bool, error) {
+	return s.store.GetWorkspaceForRoot(ctx, rootJobID)
+}
+
+func (s cockpitPaneStore) DeleteWorkspaceForRoot(ctx context.Context, rootJobID string) error {
+	return s.store.DeleteWorkspaceForRoot(ctx, rootJobID)
+}
+
 func toDBCockpitPane(p cockpit.Pane) db.CockpitPane {
 	return db.CockpitPane{
 		ID:          p.ID,
