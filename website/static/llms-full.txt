@@ -155,6 +155,17 @@ ownership, and busy Codex/Claude runtime sessions can fork bounded temporary
 workers when `[parallel_sessions]` allows it. Temp workers still require
 checkout/worktree safety and write-capable agents for implementation jobs.
 
+`gitmoot daemon start --repo owner/repo` scopes the background daemon to that one
+repo; `gitmoot daemon start` with no `--repo` supervises every enabled repo. Both
+`daemon run` and `daemon start` accept `--session <root-job-id>` (alias `--root`)
+to pin the worker to a single orchestration run — it then runs only jobs whose
+`root_job_id` matches that value plus the root coordinator job itself, AND-combined
+with any `--repo` filter:
+
+```sh
+gitmoot daemon start --repo owner/repo --session <root-job-id>
+```
+
 Route work through PR comments:
 
 ```text
@@ -170,7 +181,8 @@ For the full walkthrough, see [docs/local-workflow.md](docs/local-workflow.md).
 - **Repo**: a GitHub repository plus local checkout path that Gitmoot is allowed
   to monitor and mutate.
 - **Daemon**: the local background process that polls GitHub PRs and routes
-  queued jobs.
+  queued jobs. By default it supervises every enabled repo; `--repo` scopes it to
+  one repo and `--session <root-job-id>` scopes it to one orchestration run.
 - **Agent**: a named Gitmoot identity with repo access, role, capabilities, and
   a runtime adapter.
 - **Runtime adapter**: the bridge from Gitmoot jobs to Codex, Claude Code,
@@ -659,6 +671,8 @@ gitmoot plugin doctor
 gitmoot status --repo owner/repo
 gitmoot events --repo owner/repo
 gitmoot daemon start --repo owner/repo --poll 30s
+gitmoot daemon start --repo owner/repo --session <root-job-id>
+gitmoot daemon start
 gitmoot daemon status
 gitmoot plugin doctor
 gitmoot agent list
@@ -688,7 +702,13 @@ gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issu
 ```
 
 Use `gitmoot daemon start` for the background daemon. Use `gitmoot daemon run`
-only when the user explicitly wants a foreground process.
+only when the user explicitly wants a foreground process. `gitmoot daemon start
+--repo owner/repo` scopes the background daemon to that one repo; `gitmoot daemon
+start` with no `--repo` supervises every enabled repo. Both `daemon run` and
+`daemon start` accept `--session <root-job-id>` (alias `--root`) to pin the
+worker to one orchestration run: it then runs only jobs whose `root_job_id`
+matches that value plus the root coordinator job itself, AND-combined with any
+`--repo` filter.
 
 Use `gitmoot agent prompt <agent-or-template>` when the user wants to reuse a
 Gitmoot agent prompt in the current chat. Use `gitmoot agent run` for
@@ -1166,8 +1186,26 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    from the matching checkout (the daemon validates the current checkout's
    `origin` remote against `--repo` to bootstrap it). `agent start
    --start-daemon` runs this same background start path for the selected
-   checkout. Use `gitmoot daemon start` without `--repo` after registering all
-   intended repos if one daemon should supervise the whole Gitmoot home.
+   checkout.
+
+   `gitmoot daemon start --repo owner/project` also scopes the background daemon
+   to that one repo: it only polls and runs jobs for `owner/project`. Use
+   `gitmoot daemon start` without `--repo` after registering all intended repos
+   if one daemon should supervise the whole Gitmoot home; that supervises every
+   enabled repo.
+
+   To pin a worker to a single orchestration run, pass `--session <root-job-id>`
+   (alias `--root`) to `daemon run` or `daemon start`:
+
+   ```sh
+   gitmoot daemon start --repo owner/project --session <root-job-id>
+   ```
+
+   With `--session` set, the worker runs only jobs whose `root_job_id` matches
+   that value, plus the root coordinator job itself, and ignores every other
+   queued job. `--session` composes with `--repo` (AND): a job must match both
+   filters to run. Leaving both empty keeps the default of matching all enabled
+   repos and all jobs.
 
    Gitmoot records agent autonomy policy as `read-only`, `workspace-write`,
    `danger-full-access`, or `auto`. For Codex these map to Codex sandbox
@@ -5390,6 +5428,8 @@ snippet with `--config-snippet`.
 gitmoot status --repo owner/repo
 gitmoot events --repo owner/repo
 gitmoot daemon start --repo owner/repo --poll 30s --workers 1
+gitmoot daemon start --repo owner/repo --session <root-job-id>
+gitmoot daemon start
 gitmoot daemon status
 gitmoot daemon logs
 gitmoot daemon stop
@@ -5403,6 +5443,17 @@ Use `daemon start` for the background daemon. Use `daemon run` only when the
 user explicitly wants a foreground process. Keep the default `--workers 1`
 unless the Gitmoot home has multiple independent runtime sessions or managed
 agent types with `max_background` greater than one.
+
+`daemon start --repo owner/repo` scopes the background daemon to a single repo:
+it only polls and runs jobs for that repo. `daemon start` with no `--repo` still
+supervises every enabled repo in the Gitmoot home.
+
+Both `daemon run` and `daemon start` accept `--session <root-job-id>` (alias
+`--root`) to pin the worker to one orchestration run. With `--session` set, the
+worker runs only jobs whose `root_job_id` matches that value plus the root
+coordinator job itself, and ignores every other queued job. `--session` composes
+with `--repo` (AND): a job must match both filters to run. Leaving both empty
+keeps the default behavior of matching all enabled repos and all jobs.
 
 `gitmoot dashboard` shows local state — daemon health, repos, agents and runtime
 sessions, jobs by state, worktrees, branch locks, SkillOpt train phase/candidate,
