@@ -95,8 +95,14 @@ the same `delegations` field, `coordinator`, and `continuation` mechanics.
   rejected at validation time.
 - `failure_policy` (optional): one of `block_parent`, `continue`, or `escalate`.
   Defaults to `block_parent` when omitted.
-- `synthesis_rule` (optional): one of `summary` or `vote`. It tells the
-  coordinator how to combine the children's results.
+- `synthesis_rule` (optional): one of `summary`, `vote`, or `quorum`. It tells
+  the coordinator how to combine the children's results.
+- `quorum` (optional): an integer `K` (`> 0`), required when `synthesis_rule` is
+  `quorum`. The coordinator continuation proceeds only if at least `K` children
+  reach an approving decision; otherwise the parent blocks, exactly as a failed
+  `vote` does. `vote` is the special case where `K` equals the number of
+  delegations (every child must approve). `K` is an integer count only — no
+  fractions or percentages.
 - `timeout` (optional): a Go duration string that must be positive (for example,
   `10m`).
 - `retry` (optional): an integer that must be `>= 0`.
