@@ -5,7 +5,7 @@ version: 0.1.0
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
-  gitmoot-version: "0.4.1"
+  gitmoot-version: "0.4.2"
   source: "jerryfane/gitmoot"
   openclaw:
     requires:
