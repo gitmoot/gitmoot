@@ -6958,7 +6958,15 @@ stops with a clean synthesis instead of a dead end.
 ### Top-level fields
 
 - `artifact_body` (optional): the artifact payload made available to delegated
-  children. Required whenever any delegation sets `artifacts`.
+  children. Required whenever any delegation sets `artifacts`. When the
+  orchestrate policy enables it, a child's `artifact_body` can also be **inlined**
+  into the coordinator continuation prompt — appended as a fenced block after each
+  child's decision/summary/PR line, size-capped (per body and per continuation)
+  and rune-safe truncated, with a marker pointing at the full on-disk brief at
+  `<ArtifactRoot>/delegations/<parent>/brief.md`. Inlining is **off by default**;
+  see `inline_artifact_bodies` in the orchestrate config docs
+  (`docs/cockpit-orchestrate.md`). With it off, the continuation prompt is
+  byte-identical to before.
 
 ## Decisions
 
