@@ -5629,6 +5629,18 @@ string (a Codex, Claude Code, or Kimi Code model name) with no allow-list; an
 omitted `--model` leaves the agent's default model in effect. Both `--model X`
 and `--model=X` are accepted.
 
+`gitmoot orchestrate`, `agent run`, and `agent implement` also accept an optional
+`--skip-native-review-fanout` flag. By default an `implement` job that opens a
+pull request fans the PR out to Gitmoot's native reviewers (the configured
+required reviewers, or the ones passed for the task). With
+`--skip-native-review-fanout` set, the coordinator owns review orchestration
+instead: the implement→PR step still records the PR baseline, runs the merge
+gate, and records the `implemented` decision, but it enqueues **no** native
+review jobs. The skip is honored on both PR-open paths — the engine's
+implement-advance and the daemon's GitHub PR-watcher — so a PR opened either way
+stays free of native review fan-out. The flag defaults off; leave it off for the
+full native review fan-out, which is byte-identical to prior behavior.
+
 Start an orchestra of agents with `gitmoot orchestrate`:
 
 ```sh
@@ -6466,6 +6478,29 @@ Each child job carries job-tree linkage fields — `parent_job_id`,
 `delegation_id`, `root_job_id`, `delegation_depth`, and `task_id` — so a child
 can be traced back to its parent, its originating delegation, and the root of the
 tree. See `RESULT_CONTRACT.md` for the full delegation field reference.
+
+## Coordinator-Owned Review
+
+By default an `implement` job that opens a pull request fans the PR out to
+Gitmoot's native reviewers — the configured required reviewers, or the ones
+passed for the task — so each reviewer runs as its own review job before the
+merge gate. When a coordinator already plans review itself (for example a
+`review-panel` leg, or a custom continuation that reconvenes its own reviewers),
+that native fan-out duplicates work. Pass `--skip-native-review-fanout` on
+`gitmoot orchestrate`, `gitmoot agent run`, or `gitmoot agent implement` to hand
+review orchestration to the coordinator:
+
+```sh
+gitmoot agent implement lead --repo owner/repo --task task-001 --skip-native-review-fanout "Implement this task."
+gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo --skip-native-review-fanout
+```
+
+With the flag set, the implement→PR step still records the PR baseline, runs the
+merge gate, and records the `implemented` decision — it simply enqueues **no**
+native review jobs. The skip is honored on both PR-open paths: the engine's
+implement-advance and the daemon's GitHub PR-watcher, so a PR opened either way
+stays free of native review fan-out. The flag defaults off; leaving it off keeps
+the full native review fan-out, byte-identical to prior behavior.
 
 ## Coordinator Recipes
 
