@@ -308,3 +308,88 @@ func TestSkillOptJudgePromoteApplyRoundTrip(t *testing.T) {
 		t.Fatalf("audit reason missing agreement delta: %q", outcome.Reason)
 	}
 }
+
+// TestSkillOptTrainStartFoldsPromotedJudgePrompt closes the #354 loop: a
+// template carrying a promoted judge prompt must have it folded into the
+// eval-run's evaluation config at train start, so the training-package export
+// reader (BuildEvaluatorProfile -> judgePromptConfigFromConfig) resolves it on a
+// subsequent run — not merely a unit round-trip of the template metadata.
+func TestSkillOptTrainStartFoldsPromotedJudgePrompt(t *testing.T) {
+	template := cliJudgeTemplate("planner-loop-354")
+
+	judgeEval := skillOptTemplateJudgeEvaluation(template)
+	if judgeEval == nil {
+		t.Fatal("skillOptTemplateJudgeEvaluation returned nil for a template with a promoted judge prompt")
+	}
+
+	metadata := skillOptTrainStartMetadata(
+		"Train planner outputs.",
+		db.EvalRunModeExplore, db.ExplorationLevelHigh, 4, "soft",
+		nil, nil, skillopt.TrainPreviewPolicy{}, skillOptTrainStartConfigDefaults{}, judgeEval,
+	)
+
+	profile := skillopt.BuildEvaluatorProfile("landing_page_v1", "gpt-evaluator", json.RawMessage(metadata))
+	if profile == nil || profile.Judge == nil {
+		t.Fatalf("BuildEvaluatorProfile returned nil judge: %+v", profile)
+	}
+	payload := profile.Judge.JudgePromptConfig()
+	if payload == nil {
+		t.Fatal("JudgePromptConfig is nil; promoted prompt was not folded into eval-run metadata")
+	}
+	if got := payload.JudgePromptTemplates["generic"]; got != "Existing generic prompt." {
+		t.Fatalf("eval-run judge_prompt_templates[generic] = %q, want %q", got, "Existing generic prompt.")
+	}
+	if payload.JudgePromptVersion != "v0" {
+		t.Fatalf("eval-run judge_prompt_version = %q, want v0", payload.JudgePromptVersion)
+	}
+}
+
+// TestSkillOptTrainStartOmitsJudgePromptWhenAbsent pins the no-op path: a
+// template with no promoted judge prompt yields a train-start evaluation block
+// carrying only preferred_gate (behavior unchanged).
+func TestSkillOptTrainStartOmitsJudgePromptWhenAbsent(t *testing.T) {
+	content := agenttemplate.FormatTemplateContent(agenttemplate.Metadata{
+		ID:                   "plain-354",
+		Name:                 "Plain",
+		Description:          "No judge prompt.",
+		Kind:                 agenttemplate.TemplateKind,
+		Version:              agenttemplate.TemplateVersion,
+		Capabilities:         []string{"ask"},
+		RuntimeCompatibility: []string{"codex"},
+		Tags:                 []string{"planning"},
+		Inputs:               []string{"task"},
+		Outputs:              []string{"plan"},
+	}, "# Plain\n\nDo the work.\n")
+	parsed, err := agenttemplate.ParseTemplateContent(content)
+	if err != nil {
+		t.Fatalf("ParseTemplateContent: %v", err)
+	}
+	metadataJSON, err := agenttemplate.MarshalMetadata(parsed.Metadata)
+	if err != nil {
+		t.Fatalf("MarshalMetadata: %v", err)
+	}
+	template := db.AgentTemplate{ID: "plain-354", MetadataJSON: metadataJSON}
+
+	if judgeEval := skillOptTemplateJudgeEvaluation(template); judgeEval != nil {
+		t.Fatalf("expected nil judge evaluation for a template without a promoted prompt, got %+v", judgeEval)
+	}
+
+	metadata := skillOptTrainStartMetadata(
+		"Train.", db.EvalRunModeExplore, db.ExplorationLevelHigh, 1, "soft",
+		nil, nil, skillopt.TrainPreviewPolicy{}, skillOptTrainStartConfigDefaults{}, nil,
+	)
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(metadata), &decoded); err != nil {
+		t.Fatalf("unmarshal metadata: %v", err)
+	}
+	evaluation, _ := decoded["evaluation"].(map[string]any)
+	if evaluation == nil {
+		t.Fatal("evaluation block missing")
+	}
+	if _, ok := evaluation["judge_prompt_templates"]; ok {
+		t.Fatal("evaluation should not carry judge_prompt_templates when the template has none")
+	}
+	if _, ok := evaluation["preferred_gate"]; !ok {
+		t.Fatal("evaluation should still carry preferred_gate")
+	}
+}

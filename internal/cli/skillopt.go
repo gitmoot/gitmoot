@@ -1590,7 +1590,7 @@ func buildSkillOptTrainStartPlan(template db.AgentTemplate, repo string, workspa
 	if workspaceRepo != "" {
 		state = skillopt.TrainStateItemsReady
 	}
-	metadata := skillOptTrainStartMetadata(request, mode, explorationLevel, optionsCount, preferredGate, itemPlans, warnings, previewPolicy, configDefaults)
+	metadata := skillOptTrainStartMetadata(request, mode, explorationLevel, optionsCount, preferredGate, itemPlans, warnings, previewPolicy, configDefaults, skillOptTemplateJudgeEvaluation(template))
 	session := db.SkillOptTrainSession{
 		ID:                sessionID,
 		TemplateID:        template.ID,
@@ -8091,10 +8091,44 @@ func generatedSkillOptTrainSessionID(templateID string) string {
 	return "train-" + strings.Trim(b.String(), "-_") + "-" + now.Format("20060102-150405") + fmt.Sprintf("-%09d", now.Nanosecond())
 }
 
-func skillOptTrainStartMetadata(request string, mode string, explorationLevel string, optionsCount int, preferredGate string, items []skillOptTrainItemPlan, warnings []string, previewPolicy skillopt.TrainPreviewPolicy, configDefaults skillOptTrainStartConfigDefaults) string {
+// skillOptTemplateJudgeEvaluation extracts a template's promoted judge prompt
+// fields (written by `skillopt judge promote`, #354) into the shape the
+// evaluator reader consumes: judge_prompt_templates as a real object and
+// judge_prompt_version as a string. Returns nil when the template carries none,
+// so train-start metadata stays byte-identical for templates without a promoted
+// judge prompt. This is the consumption half of #354: the promoted prompt is
+// folded into the eval-run's evaluation config so a subsequent run resolves it.
+func skillOptTemplateJudgeEvaluation(template db.AgentTemplate) map[string]any {
+	metadata, err := agenttemplate.UnmarshalMetadata(template.MetadataJSON)
+	if err != nil {
+		return nil
+	}
+	out := map[string]any{}
+	if raw := strings.TrimSpace(metadata.Evaluation["judge_prompt_templates"]); raw != "" {
+		templates := map[string]string{}
+		if err := json.Unmarshal([]byte(raw), &templates); err == nil && len(templates) > 0 {
+			out["judge_prompt_templates"] = templates
+		}
+	}
+	if version := strings.TrimSpace(metadata.Evaluation["judge_prompt_version"]); version != "" {
+		out["judge_prompt_version"] = version
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func skillOptTrainStartMetadata(request string, mode string, explorationLevel string, optionsCount int, preferredGate string, items []skillOptTrainItemPlan, warnings []string, previewPolicy skillopt.TrainPreviewPolicy, configDefaults skillOptTrainStartConfigDefaults, judgeEvaluation map[string]any) string {
 	lines := strings.Count(request, "\n") + 1
 	words := len(strings.Fields(request))
 	previewMetadata, reviewMetadata := previewPolicy.Metadata()
+	evaluation := map[string]any{
+		"preferred_gate": preferredGate,
+	}
+	for key, value := range judgeEvaluation {
+		evaluation[key] = value
+	}
 	metadata := map[string]any{
 		"request":           request,
 		"request_lines":     lines,
@@ -8105,12 +8139,10 @@ func skillOptTrainStartMetadata(request string, mode string, explorationLevel st
 		"options_count":     optionsCount,
 		"items_count":       len(items),
 		"item_warnings":     warnings,
-		"evaluation": map[string]any{
-			"preferred_gate": preferredGate,
-		},
-		"preview": previewMetadata,
-		"review":  reviewMetadata,
-		"source":  "gitmoot skillopt train start",
+		"evaluation":        evaluation,
+		"preview":           previewMetadata,
+		"review":            reviewMetadata,
+		"source":            "gitmoot skillopt train start",
 	}
 	if optimizerDefaults := skillOptTrainOptimizerDefaultsMetadata(configDefaults.Optimizer); len(optimizerDefaults) > 0 {
 		metadata["optimizer_defaults"] = optimizerDefaults

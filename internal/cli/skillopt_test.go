@@ -3805,7 +3805,7 @@ func TestSkillOptTrainGenerationLockTTLScalesWithWorkload(t *testing.T) {
 		PreviewRepo:  "owner/previews",
 		TaskKind:     "design",
 		State:        skillopt.TrainStateItemsReady,
-		MetadataJSON: skillOptTrainStartMetadata("Train landing page previews.", db.EvalRunModeExplore, db.ExplorationLevelHigh, 4, "soft", nil, nil, previewPolicy, skillOptTrainStartConfigDefaults{}),
+		MetadataJSON: skillOptTrainStartMetadata("Train landing page previews.", db.EvalRunModeExplore, db.ExplorationLevelHigh, 4, "soft", nil, nil, previewPolicy, skillOptTrainStartConfigDefaults{}, nil),
 	}); err != nil {
 		t.Fatalf("UpsertSkillOptTrainSession returned error: %v", err)
 	}
@@ -6701,7 +6701,7 @@ func TestSkillOptTrainCandidateReviewBodyShowsTextSamplePreview(t *testing.T) {
 		t.Fatalf("BuildTrainPreviewPolicy optional returned error: %v", err)
 	}
 	optionalSession := session
-	optionalSession.MetadataJSON = skillOptTrainStartMetadata("Train planner outputs from human feedback.", db.EvalRunModeValidate, db.ExplorationLevelLow, 2, "hard_then_soft", nil, nil, optionalPolicy, skillOptTrainStartConfigDefaults{})
+	optionalSession.MetadataJSON = skillOptTrainStartMetadata("Train planner outputs from human feedback.", db.EvalRunModeValidate, db.ExplorationLevelLow, 2, "hard_then_soft", nil, nil, optionalPolicy, skillOptTrainStartConfigDefaults{}, nil)
 	for _, tt := range []struct {
 		name    string
 		session db.SkillOptTrainSession
@@ -6796,7 +6796,7 @@ func TestSkillOptTrainCandidateReviewRequiredPreviewKeepsBundleFailure(t *testin
 	if err != nil {
 		t.Fatalf("GetSkillOptTrainSession returned error: %v", err)
 	}
-	session.MetadataJSON = skillOptTrainStartMetadata("Train planner outputs from human feedback.", db.EvalRunModeValidate, db.ExplorationLevelLow, 2, "hard_then_soft", nil, nil, requiredPolicy, skillOptTrainStartConfigDefaults{})
+	session.MetadataJSON = skillOptTrainStartMetadata("Train planner outputs from human feedback.", db.EvalRunModeValidate, db.ExplorationLevelLow, 2, "hard_then_soft", nil, nil, requiredPolicy, skillOptTrainStartConfigDefaults{}, nil)
 	previews := publishSkillOptTrainCandidateSamplePreviews(context.Background(), paths, store, session, db.SkillOptTrainIteration{
 		ID:                    "optimizer-train-001",
 		CandidateVersionID:    version.ID,
@@ -9318,7 +9318,7 @@ func TestSkillOptFeedbackGitHubCommandsEnforceTrainReviewRepo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildTrainPreviewPolicy returned error: %v", err)
 	}
-	metadata := skillOptTrainStartMetadata("Train landing page reviews.", db.EvalRunModeExplore, db.ExplorationLevelHigh, 4, "soft", nil, nil, previewPolicy, skillOptTrainStartConfigDefaults{})
+	metadata := skillOptTrainStartMetadata("Train landing page reviews.", db.EvalRunModeExplore, db.ExplorationLevelHigh, 4, "soft", nil, nil, previewPolicy, skillOptTrainStartConfigDefaults{}, nil)
 	session := db.SkillOptTrainSession{
 		ID:           "preview-train",
 		TemplateID:   "planner",
@@ -11399,7 +11399,7 @@ func seedSkillOptTrainFeedbackSynced(t *testing.T) (string, string) {
 	if err != nil {
 		t.Fatalf("BuildTrainPreviewPolicy returned error: %v", err)
 	}
-	metadata := skillOptTrainStartMetadata("Train planner outputs from human feedback.", db.EvalRunModeValidate, db.ExplorationLevelLow, 2, "hard_then_soft", nil, nil, previewPolicy, skillOptTrainStartConfigDefaults{})
+	metadata := skillOptTrainStartMetadata("Train planner outputs from human feedback.", db.EvalRunModeValidate, db.ExplorationLevelLow, 2, "hard_then_soft", nil, nil, previewPolicy, skillOptTrainStartConfigDefaults{}, nil)
 	session := db.SkillOptTrainSession{
 		ID:                "optimizer-train",
 		TemplateID:        "planner",
