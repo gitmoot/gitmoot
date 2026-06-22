@@ -6843,7 +6843,14 @@ Delegation fields:
   cycle — delegations form a DAG, and cycles are rejected.
 - `failure_policy` (optional): one of `block_parent`, `continue`, or
   `escalate`. Defaults to `block_parent` when omitted.
-- `synthesis_rule` (optional): one of `summary` or `vote`.
+- `synthesis_rule` (optional): one of `summary`, `vote`, or `quorum`.
+- `quorum` (optional): an integer `K` (`> 0`), required when `synthesis_rule`
+  is `quorum`. The coordinator continuation proceeds only if at least `K`
+  children reach an approving decision; otherwise the parent blocks, exactly as a
+  failed `vote` does. `vote` is the special case where `K` equals the number of
+  delegations (every child must approve). `K` is an integer count only — no
+  fractions or percentages — and must not exceed the number of delegations (a
+  larger `K` is unsatisfiable and is rejected).
 - `timeout` (optional): a Go duration string and must be positive (e.g. `10m`).
 - `retry` (optional): integer `>= 0`.
 - `worktree` (optional): worktree path for the child job.

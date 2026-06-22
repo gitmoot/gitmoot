@@ -46,6 +46,7 @@ type Delegation struct {
 	FailurePolicy string         `json:"failure_policy,omitempty"`
 	Fingerprint   string         `json:"fingerprint,omitempty"`
 	SynthesisRule string         `json:"synthesis_rule,omitempty"`
+	Quorum        int            `json:"quorum,omitempty"`
 	Model         string         `json:"model,omitempty"`
 	Phase         string         `json:"phase,omitempty"`
 }
@@ -189,6 +190,16 @@ func validateAgentResult(result AgentResult) error {
 	if err := validateDelegationGraph(result.Delegations); err != nil {
 		return err
 	}
+	// A quorum threshold larger than the number of delegations can never be
+	// satisfied (at most len(delegations) children can approve), which would block
+	// the coordinator forever. Reject it at extraction with a clear message rather
+	// than letting the gate block silently. (Per-delegation validation already
+	// guarantees each quorum delegation has Quorum > 0, so the threshold is >= 1.)
+	if delegationSynthesisRequiresQuorum(result.Delegations) {
+		if k := delegationQuorumThreshold(result.Delegations); k > len(result.Delegations) {
+			return fmt.Errorf("synthesis_rule quorum requires quorum (%d) to be <= the number of delegations (%d)", k, len(result.Delegations))
+		}
+	}
 	if delegationsRequestArtifacts(result.Delegations) && strings.TrimSpace(result.ArtifactBody) == "" {
 		return errors.New("artifact_body is required when delegations request artifacts")
 	}
@@ -319,6 +330,10 @@ func validateDelegationLifecycle(d Delegation) error {
 	}
 	switch strings.ToLower(strings.TrimSpace(d.SynthesisRule)) {
 	case "", "summary", "vote":
+	case "quorum":
+		if d.Quorum <= 0 {
+			return fmt.Errorf("delegation %q synthesis_rule quorum requires quorum > 0", d.ID)
+		}
 	default:
 		return fmt.Errorf("delegation %q synthesis_rule %q is invalid", d.ID, d.SynthesisRule)
 	}

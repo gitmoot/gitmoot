@@ -1502,6 +1502,15 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		return e.block(ctx, ref, fmt.Sprintf("delegation synthesis_rule vote failed: not all delegated children for %s were approved/succeeded", parentJob.ID))
 	}
 
+	// synthesis_rule "quorum": block the parent unless at least K children
+	// reached an approving outcome (succeeded state or an approving decision).
+	if delegationSynthesisRequiresQuorum(parentResult.Delegations) {
+		k := delegationQuorumThreshold(parentResult.Delegations)
+		if !delegationQuorumSatisfied(parentResult.Delegations, children, childPayloads, k) {
+			return e.block(ctx, ref, fmt.Sprintf("delegation synthesis_rule quorum failed: fewer than %d delegated children for %s were approved/succeeded", k, parentJob.ID))
+		}
+	}
+
 	request := JobRequest{
 		ID:           delegationContinuationID(parentJob.ID),
 		Agent:        parentJob.Agent,
@@ -2138,6 +2147,60 @@ func delegationVoteSatisfied(delegations []Delegation, children map[string]db.Jo
 		}
 	}
 	return true
+}
+
+// delegationSynthesisRequiresQuorum reports whether any delegation in the batch
+// declares synthesis_rule "quorum", which gates the coordinator continuation on
+// at least K children reaching an approving outcome.
+func delegationSynthesisRequiresQuorum(delegations []Delegation) bool {
+	for _, d := range delegations {
+		if delegationSynthesisRule(d) == "quorum" {
+			return true
+		}
+	}
+	return false
+}
+
+// delegationQuorumThreshold returns the quorum K declared on the quorum
+// delegation(s). When multiple quorum delegations declare different thresholds,
+// the maximum is used.
+func delegationQuorumThreshold(delegations []Delegation) int {
+	k := 0
+	for _, d := range delegations {
+		if delegationSynthesisRule(d) != "quorum" {
+			continue
+		}
+		if d.Quorum > k {
+			k = d.Quorum
+		}
+	}
+	return k
+}
+
+// delegationQuorumSatisfied reports whether at least k children reached an
+// approving outcome: a succeeded job state, or a child result decision of
+// approved/succeeded/implemented (the same approving-outcome test the vote rule
+// uses).
+func delegationQuorumSatisfied(delegations []Delegation, children map[string]db.Job, childPayloads map[string]JobPayload, k int) bool {
+	approving := 0
+	for _, d := range delegations {
+		child, ok := children[d.ID]
+		if !ok {
+			continue
+		}
+		if child.State == string(JobSucceeded) {
+			approving++
+			continue
+		}
+		payload, ok := childPayloads[d.ID]
+		if !ok || payload.Result == nil {
+			continue
+		}
+		if delegationDecisionApproves(payload.Result.Decision) {
+			approving++
+		}
+	}
+	return approving >= k
 }
 
 func delegationDecisionApproves(decision string) bool {
