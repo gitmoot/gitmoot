@@ -505,6 +505,7 @@ gitmoot skillopt train continue --session <id> [--generator-type skillopt-genera
 gitmoot skillopt train recover --session <id> [--out-root path] [--json]
 gitmoot skillopt train stop --session <id> --reason <text>
 gitmoot skillopt judge-report [--template <id>] [--home <path>]
+gitmoot skillopt judge promote --template <id> --task-kind <kind> --file <pkg.json> [--home <path>] [--yes] [--json]
 ```
 
 On a real terminal, `skillopt train run` opens an interactive view of one session
@@ -601,6 +602,22 @@ LLM judge is calibrated against human verdicts. It prints a confusion matrix
 buckets (judge soft-score versus the human decision), and per-dimension
 disagreement. Pass `--template <id>` to scope the report to one template, and
 `--home <path>` to read from a non-default Gitmoot home. It is read-only.
+
+`skillopt judge promote` closes the judge-prompt optimization loop: it applies an
+**accepted** judge-prompt variant (from the judge-prompt optimizer's
+`gitmoot-skillopt-judge-candidate` package) into a template, so the next
+skill-opt run judges with the improved prompt. Select the variant with
+`--task-kind <kind>` (use `_global` for the all-items pass). It **previews by
+default** — printing the template id, task kind, the `baseline→best` agreement
+delta, and a truncated prompt preview, and writing nothing — and requires
+`--yes` to apply. It refuses (hard error) any variant whose `accepted` is not
+true or whose `best_prompt` is empty, and any task kind missing from the package.
+On apply it writes the prompt into the template's `evaluation` metadata
+(`judge_prompt_templates` keyed by task kind, **merging** so other task kinds are
+preserved, plus a bumped `judge_prompt_version`) and records a
+`skillopt_judge_outcomes` audit row (`human_decision=promoted`, the old→new
+version, and the agreement delta in `reason`). `--json` emits the machine-readable
+preview/apply summary.
 
 The Markdown feedback collector writes blind A/B review packets with `index.md`,
 per-item Markdown files, editable `feedback.yml`, and hidden assignment metadata

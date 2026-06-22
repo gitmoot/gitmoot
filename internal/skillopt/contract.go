@@ -21,8 +21,9 @@ import (
 const (
 	ContractVersion = 1
 
-	TrainingPackageKind  = "gitmoot-skillopt-training-package"
-	CandidatePackageKind = "gitmoot-skillopt-candidate-package"
+	TrainingPackageKind       = "gitmoot-skillopt-training-package"
+	CandidatePackageKind      = "gitmoot-skillopt-candidate-package"
+	JudgeCandidatePackageKind = "gitmoot-skillopt-judge-candidate"
 
 	CandidateSourceRepo = "gitmoot-skillopt"
 	CandidateSourceRef  = "candidate"
@@ -166,6 +167,113 @@ func mergeJudgePromptConfig(existing json.RawMessage, payload *JudgePromptConfig
 		return existing, err
 	}
 	return json.RawMessage(out), nil
+}
+
+// JudgeCandidateVariant is one per-task_kind result emitted by the judge-prompt
+// optimizer (#345 Phase 2). The "_global" key in JudgeCandidatePackage.Variants
+// carries the all-items pass (TaskKind is empty there). A variant is only
+// eligible for promotion when Accepted is true and BestPrompt is non-empty.
+type JudgeCandidateVariant struct {
+	TaskKind           string  `json:"task_kind"`
+	NItems             int     `json:"n_items"`
+	BaselineAgreement  float64 `json:"baseline_agreement"`
+	BestAgreement      float64 `json:"best_agreement"`
+	BestOrigin         string  `json:"best_origin"`
+	JudgePromptVersion string  `json:"judge_prompt_version"`
+	Accepted           bool    `json:"accepted"`
+	BestPrompt         string  `json:"best_prompt"`
+}
+
+// JudgeCandidatePackage is the structured output of the judge-prompt optimizer,
+// emitted by the Python side as kind=JudgeCandidatePackageKind. It carries one
+// JudgeCandidateVariant per task_kind keyed in Variants (plus a "_global" pass).
+// `gitmoot skillopt judge promote` reads an accepted variant out of this package
+// and writes it into a template so the next skill-opt run judges with it.
+type JudgeCandidatePackage struct {
+	Kind                   string                           `json:"kind"`
+	ContractVersion        int                              `json:"contract_version"`
+	JudgePromptVersionBase string                           `json:"judge_prompt_version_base,omitempty"`
+	NLabeled               int                              `json:"n_labeled,omitempty"`
+	Variants               map[string]JudgeCandidateVariant `json:"variants"`
+}
+
+// ParseJudgeCandidatePackage decodes and validates a judge-candidate package
+// blob, enforcing the kind tag and ContractVersion so a stale or foreign payload
+// is rejected before any promotion is attempted.
+func ParseJudgeCandidatePackage(data []byte) (JudgeCandidatePackage, error) {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return JudgeCandidatePackage{}, errors.New("judge candidate package is empty")
+	}
+	var pkg JudgeCandidatePackage
+	if err := json.Unmarshal(data, &pkg); err != nil {
+		return JudgeCandidatePackage{}, fmt.Errorf("decode judge candidate package: %w", err)
+	}
+	if pkg.Kind != JudgeCandidatePackageKind {
+		return JudgeCandidatePackage{}, fmt.Errorf("judge candidate package kind must be %q, got %q", JudgeCandidatePackageKind, pkg.Kind)
+	}
+	if pkg.ContractVersion != ContractVersion {
+		return JudgeCandidatePackage{}, fmt.Errorf("judge candidate package contract_version must be %d, got %d", ContractVersion, pkg.ContractVersion)
+	}
+	if len(pkg.Variants) == 0 {
+		return JudgeCandidatePackage{}, errors.New("judge candidate package has no variants")
+	}
+	return pkg, nil
+}
+
+// EvaluationConfigForReader expands a template's flat Evaluation map
+// (map[string]string, where judge_prompt_templates is stored as a JSON-encoded
+// object string per the write contract of `judge promote`) into the nested
+// evaluator config that judgePromptConfigFromConfig / EvaluatorProfileFromConfig
+// consume. It mirrors how the eval-run start path nests an "evaluation" object:
+// the JSON-string value of judge_prompt_templates is re-inlined as a real object
+// so the reader's map[string]string decode succeeds. This is the bridge that
+// proves the round-trip without changing the reader's contract. It returns nil
+// for an empty map so callers can fall back to existing config sources.
+func EvaluationConfigForReader(evaluation map[string]string) json.RawMessage {
+	if len(evaluation) == 0 {
+		return nil
+	}
+	nested := make(map[string]json.RawMessage, len(evaluation))
+	for key, value := range evaluation {
+		switch key {
+		case "judge_prompt_templates":
+			trimmed := strings.TrimSpace(value)
+			if trimmed == "" {
+				continue
+			}
+			// Stored as a JSON-encoded object string; re-inline as raw JSON when
+			// it parses as the map[string]string the reader expects, otherwise
+			// fall back to a JSON string so the value is never silently dropped.
+			var probe map[string]string
+			if err := json.Unmarshal([]byte(trimmed), &probe); err == nil {
+				nested[key] = json.RawMessage(trimmed)
+				continue
+			}
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				continue
+			}
+			nested[key] = encoded
+		default:
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				continue
+			}
+			nested[key] = encoded
+		}
+	}
+	if len(nested) == 0 {
+		return nil
+	}
+	nestedRaw, err := json.Marshal(nested)
+	if err != nil {
+		return nil
+	}
+	wrapper, err := json.Marshal(map[string]json.RawMessage{"evaluation": nestedRaw})
+	if err != nil {
+		return nil
+	}
+	return json.RawMessage(wrapper)
 }
 
 type EvaluatorStageStatus struct {

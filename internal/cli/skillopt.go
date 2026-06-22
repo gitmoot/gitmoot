@@ -22,6 +22,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/jerryfane/gitmoot/internal/agenttemplate"
 	"github.com/jerryfane/gitmoot/internal/artifact"
 	"github.com/jerryfane/gitmoot/internal/cli/style"
 	"github.com/jerryfane/gitmoot/internal/config"
@@ -71,6 +72,8 @@ func runSkillOpt(args []string, stdout, stderr io.Writer) int {
 		return runSkillOptFeedback(args[1:], stdout, stderr)
 	case "judge-report":
 		return runSkillOptJudgeReport(args[1:], stdout, stderr)
+	case "judge":
+		return runSkillOptJudge(args[1:], stdout, stderr)
 	case "train":
 		return runSkillOptTrain(args[1:], stdout, stderr)
 	default:
@@ -97,6 +100,7 @@ func printSkillOptUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)")
 	fmt.Fprintln(w, "  gitmoot skillopt judge-report [--template id]")
+	fmt.Fprintln(w, "  gitmoot skillopt judge promote --template <id> --task-kind <kind> --file <pkg.json> [--home <h>] [--yes] [--json]")
 	fmt.Fprintln(w, "  gitmoot skillopt train init --name <name> --template <id> --review-repo owner/repo --artifact-kind kind --preview kind (--request text|--request-file path)")
 	fmt.Fprintln(w, "  gitmoot skillopt train init templates --json")
 	fmt.Fprintln(w, "  gitmoot skillopt train start --config .gitmoot/skillopt/<name>/config.toml [--yes]")
@@ -11452,6 +11456,258 @@ func runSkillOptCandidatePromote(args []string, stdout, stderr io.Writer) int {
 	}
 	writeLine(stdout, "promoted candidate %s", promoted.ID)
 	return 0
+}
+
+func runSkillOptJudge(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		printSkillOptJudgeUsage(stdout)
+		return 0
+	}
+	switch args[0] {
+	case "promote":
+		return runSkillOptJudgePromote(args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "unknown skillopt judge command %q\n\n", args[0])
+		printSkillOptJudgeUsage(stderr)
+		return 2
+	}
+}
+
+func printSkillOptJudgeUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  gitmoot skillopt judge promote --template <id> --task-kind <kind> --file <pkg.json> [--home <h>] [--yes] [--json]")
+}
+
+// skillOptJudgePromoteResult is the machine-readable preview/apply summary for
+// `skillopt judge promote`. Applied is false in preview mode (no --yes).
+type skillOptJudgePromoteResult struct {
+	TemplateID            string  `json:"template_id"`
+	TaskKind              string  `json:"task_kind"`
+	Applied               bool    `json:"applied"`
+	Accepted              bool    `json:"accepted"`
+	BaselineAgreement     float64 `json:"baseline_agreement"`
+	BestAgreement         float64 `json:"best_agreement"`
+	AgreementDelta        float64 `json:"agreement_delta"`
+	BestOrigin            string  `json:"best_origin,omitempty"`
+	PreviousPromptVersion string  `json:"previous_judge_prompt_version,omitempty"`
+	NewPromptVersion      string  `json:"new_judge_prompt_version,omitempty"`
+	PromptBytes           int     `json:"prompt_bytes"`
+	PromptPreview         string  `json:"prompt_preview,omitempty"`
+}
+
+const skillOptJudgePromptPreviewLimit = 800
+
+func runSkillOptJudgePromote(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("skillopt judge promote", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	templateID := fs.String("template", "", "agent template id to promote the judge prompt into")
+	taskKind := fs.String("task-kind", "", "task kind variant to promote (use _global for the all-items pass)")
+	file := fs.String("file", "", "judge candidate package JSON file")
+	yes := fs.Bool("yes", false, "apply the promotion; without it the command previews and writes nothing")
+	jsonOutput := fs.Bool("json", false, "print the result as JSON")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "skillopt judge promote does not accept positional arguments")
+		return 2
+	}
+	templateRef := strings.TrimSpace(*templateID)
+	if templateRef == "" {
+		fmt.Fprintln(stderr, "skillopt judge promote requires --template")
+		return 2
+	}
+	kind := strings.TrimSpace(*taskKind)
+	if kind == "" {
+		fmt.Fprintln(stderr, "skillopt judge promote requires --task-kind")
+		return 2
+	}
+	packagePath := strings.TrimSpace(*file)
+	if packagePath == "" {
+		fmt.Fprintln(stderr, "skillopt judge promote requires --file")
+		return 2
+	}
+	data, err := os.ReadFile(packagePath)
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt judge promote: read package: %v\n", err)
+		return 2
+	}
+	pkg, err := skillopt.ParseJudgeCandidatePackage(data)
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt judge promote: %v\n", err)
+		return 2
+	}
+	variant, ok := pkg.Variants[kind]
+	if !ok {
+		fmt.Fprintf(stderr, "skillopt judge promote: task-kind %q not found in package variants\n", kind)
+		return 2
+	}
+	if !variant.Accepted {
+		fmt.Fprintf(stderr, "skillopt judge promote: variant %q was not accepted by the judge optimizer (best_origin=%q); refusing to promote\n", kind, variant.BestOrigin)
+		return 1
+	}
+	if strings.TrimSpace(variant.BestPrompt) == "" {
+		fmt.Fprintf(stderr, "skillopt judge promote: variant %q has an empty best_prompt; nothing to promote\n", kind)
+		return 1
+	}
+
+	result := skillOptJudgePromoteResult{
+		TemplateID:        templateRef,
+		TaskKind:          kind,
+		Accepted:          variant.Accepted,
+		BaselineAgreement: variant.BaselineAgreement,
+		BestAgreement:     variant.BestAgreement,
+		AgreementDelta:    variant.BestAgreement - variant.BaselineAgreement,
+		BestOrigin:        variant.BestOrigin,
+		NewPromptVersion:  strings.TrimSpace(variant.JudgePromptVersion),
+		PromptBytes:       len(variant.BestPrompt),
+		PromptPreview:     truncateSkillOptJudgePrompt(variant.BestPrompt),
+	}
+
+	// Preview by default; only --yes writes.
+	openStore := withReadOnlyStore
+	if *yes {
+		openStore = withStore
+	}
+	if err := openStore(*home, func(store *db.Store) error {
+		ctx := context.Background()
+		template, err := loadInstalledTemplate(ctx, store, templateRef)
+		if err != nil {
+			return err
+		}
+		metadata, err := agenttemplate.UnmarshalMetadata(template.MetadataJSON)
+		if err != nil {
+			return fmt.Errorf("decode template metadata: %w", err)
+		}
+		result.PreviousPromptVersion = strings.TrimSpace(metadata.Evaluation["judge_prompt_version"])
+		updatedMetadata, err := applyJudgePromptToMetadata(metadata, kind, variant)
+		if err != nil {
+			return err
+		}
+		if !*yes {
+			return nil
+		}
+		metadataJSON, err := agenttemplate.MarshalMetadata(updatedMetadata)
+		if err != nil {
+			return fmt.Errorf("encode template metadata: %w", err)
+		}
+		if _, err := store.UpdateAgentTemplateMetadata(ctx, template.ID, metadataJSON); err != nil {
+			return err
+		}
+		result.Applied = true
+		reason := fmt.Sprintf("judge prompt promoted for task_kind=%s: agreement %.3f→%.3f (delta %+.3f), origin=%s, version %s→%s",
+			kind, variant.BaselineAgreement, variant.BestAgreement, result.AgreementDelta, variant.BestOrigin,
+			emptyToDash(result.PreviousPromptVersion), emptyToDash(result.NewPromptVersion))
+		outcome := db.SkillOptJudgeOutcome{
+			CandidateVersionID: judgeOutcomeCandidateVersionID(template),
+			TemplateID:         template.ID,
+			JudgePromptVersion: result.NewPromptVersion,
+			HumanDecision:      "promoted",
+			// The human promoted and the judge optimizer already accepted this
+			// variant (the accepted-gate above), so the decision agrees with the
+			// judge's signal.
+			Direction: db.SkillOptJudgeDirectionAgreeAccept,
+			Reason:    reason,
+		}
+		if err := store.InsertSkillOptJudgeOutcome(ctx, outcome); err != nil {
+			return fmt.Errorf("record judge outcome: %w", err)
+		}
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "skillopt judge promote: %v\n", err)
+		return 1
+	}
+
+	if *jsonOutput {
+		if err := writeJSON(stdout, result); err != nil {
+			fmt.Fprintf(stderr, "skillopt judge promote: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	printSkillOptJudgePromoteResult(stdout, result)
+	return 0
+}
+
+// applyJudgePromptToMetadata folds an accepted judge variant into a template's
+// flat Evaluation map: judge_prompt_templates is stored as a JSON-encoded
+// map[task_kind]string (merging so sibling task kinds are preserved), and
+// judge_prompt_version records the variant's version. The encoding round-trips
+// through EvaluationConfigForReader → judgePromptConfigFromConfig.
+func applyJudgePromptToMetadata(metadata agenttemplate.Metadata, taskKind string, variant skillopt.JudgeCandidateVariant) (agenttemplate.Metadata, error) {
+	templates := map[string]string{}
+	if existing := strings.TrimSpace(metadata.Evaluation["judge_prompt_templates"]); existing != "" {
+		if err := json.Unmarshal([]byte(existing), &templates); err != nil {
+			// Existing value is not a JSON object map; start fresh rather than
+			// silently dropping the new prompt.
+			templates = map[string]string{}
+		}
+	}
+	templates[taskKind] = variant.BestPrompt
+	encoded, err := json.Marshal(templates)
+	if err != nil {
+		return agenttemplate.Metadata{}, fmt.Errorf("encode judge prompt templates: %w", err)
+	}
+	if metadata.Evaluation == nil {
+		metadata.Evaluation = map[string]string{}
+	}
+	metadata.Evaluation["judge_prompt_templates"] = string(encoded)
+	if version := strings.TrimSpace(variant.JudgePromptVersion); version != "" {
+		metadata.Evaluation["judge_prompt_version"] = version
+	}
+	return metadata, nil
+}
+
+// judgeOutcomeCandidateVersionID picks a non-empty candidate_version_id for the
+// audit row (the column is NOT NULL): the template's current version when known,
+// otherwise the template id itself, since judge-prompt promotion targets the
+// template rather than a specific candidate version.
+func judgeOutcomeCandidateVersionID(template db.AgentTemplate) string {
+	if id := strings.TrimSpace(template.VersionID); id != "" {
+		return id
+	}
+	return template.ID
+}
+
+func truncateSkillOptJudgePrompt(prompt string) string {
+	prompt = strings.TrimSpace(prompt)
+	if utf8.RuneCountInString(prompt) <= skillOptJudgePromptPreviewLimit {
+		return prompt
+	}
+	runes := []rune(prompt)
+	return string(runes[:skillOptJudgePromptPreviewLimit]) + "…"
+}
+
+func emptyToDash(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "-"
+	}
+	return value
+}
+
+func printSkillOptJudgePromoteResult(w io.Writer, result skillOptJudgePromoteResult) {
+	writeLine(w, "template: %s", result.TemplateID)
+	writeLine(w, "task_kind: %s", result.TaskKind)
+	writeLine(w, "accepted: %t", result.Accepted)
+	writeLine(w, "agreement: %.3f → %.3f (delta %+.3f)", result.BaselineAgreement, result.BestAgreement, result.AgreementDelta)
+	if result.BestOrigin != "" {
+		writeLine(w, "best_origin: %s", result.BestOrigin)
+	}
+	writeLine(w, "judge_prompt_version: %s → %s", emptyToDash(result.PreviousPromptVersion), emptyToDash(result.NewPromptVersion))
+	writeLine(w, "prompt_bytes: %d", result.PromptBytes)
+	if result.PromptPreview != "" {
+		writeLine(w, "prompt_preview:")
+		writeLine(w, "%s", result.PromptPreview)
+	}
+	if result.Applied {
+		writeLine(w, "applied: wrote judge prompt into template %s", result.TemplateID)
+	} else {
+		writeLine(w, "preview only: nothing was written. Re-run with --yes to apply.")
+	}
 }
 
 func runSkillOptCandidateReject(args []string, stdout, stderr io.Writer) int {

@@ -1273,6 +1273,46 @@ func (s *Store) PromoteAgentTemplateVersion(ctx context.Context, versionID strin
 	return s.GetAgentTemplateVersionByID(ctx, target.ID)
 }
 
+// UpdateAgentTemplateMetadata replaces the stored metadata_json for an installed
+// template (the agent_templates row) and, when present, its current version row,
+// so both the template-level read path and version-referenced exports observe the
+// change. Content, name, description, and version identity are untouched: this is
+// a focused metadata write used by `skillopt judge promote` to fold an accepted
+// judge prompt into the template's Evaluation map without minting a new version.
+func (s *Store) UpdateAgentTemplateMetadata(ctx context.Context, templateID string, metadataJSON string) (AgentTemplate, error) {
+	templateID = strings.TrimSpace(templateID)
+	metadataJSON = strings.TrimSpace(metadataJSON)
+	if templateID == "" {
+		return AgentTemplate{}, errors.New("template id is required")
+	}
+	if metadataJSON == "" {
+		return AgentTemplate{}, errors.New("metadata_json is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AgentTemplate{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE agent_templates SET metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, metadataJSON, templateID)
+	if err != nil {
+		return AgentTemplate{}, err
+	}
+	if err := requireAffected(result, "agent template", templateID); err != nil {
+		return AgentTemplate{}, err
+	}
+	if current, hasCurrent, err := getCurrentAgentTemplateVersion(ctx, tx, templateID); err != nil {
+		return AgentTemplate{}, err
+	} else if hasCurrent {
+		if _, err := tx.ExecContext(ctx, `UPDATE agent_template_versions SET metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, metadataJSON, current.ID); err != nil {
+			return AgentTemplate{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return AgentTemplate{}, err
+	}
+	return s.GetAgentTemplate(ctx, templateID)
+}
+
 func (s *Store) RejectAgentTemplateVersion(ctx context.Context, versionID string, reason string) (AgentTemplateVersion, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
