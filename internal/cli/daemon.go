@@ -843,7 +843,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 			if err := recoverExpiredRuntimeSessionLocks(ctx, store, stdout, time.Now().UTC()); err != nil {
 				return err
 			}
-			if err := recoverCancelledRunningJobsForEnabledRepos(ctx, store, stdout); err != nil {
+			if err := recoverCancelledRunningJobsForEnabledRepos(ctx, store, rootFilter, stdout); err != nil {
 				return err
 			}
 			workerErr = startSupervisorWorkerLoop(ctx, daemonWorkerLoopInterval, func(now time.Time) error {
@@ -1267,7 +1267,7 @@ func recoverRunningJobsForRepo(ctx context.Context, store *db.Store, stdout io.W
 	return recoverRunningJobsBeforeForRepo(ctx, store, stdout, time.Now().UTC().Add(-daemonRunningJobStaleAfter), repoFilter, rootFilter)
 }
 
-func recoverCancelledRunningJobsForEnabledRepos(ctx context.Context, store *db.Store, stdout io.Writer) error {
+func recoverCancelledRunningJobsForEnabledRepos(ctx context.Context, store *db.Store, rootFilter string, stdout io.Writer) error {
 	repos, err := store.ListRepos(ctx)
 	if err != nil {
 		return err
@@ -1276,7 +1276,7 @@ func recoverCancelledRunningJobsForEnabledRepos(ctx context.Context, store *db.S
 		if !repo.Enabled {
 			continue
 		}
-		if err := recoverCancelledRunningJobsForRepo(ctx, store, stdout, repo.FullName(), ""); err != nil {
+		if err := recoverCancelledRunningJobsForRepo(ctx, store, stdout, repo.FullName(), rootFilter); err != nil {
 			return err
 		}
 	}
