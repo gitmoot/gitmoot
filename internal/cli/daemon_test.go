@@ -4045,6 +4045,96 @@ func TestRunQueuedJobsPoolHonorsCheckoutSafety(t *testing.T) {
 	}
 }
 
+func TestRunQueuedJobsPoolIsolatesContendedReadJob(t *testing.T) {
+	// Two same-repo read (ask) jobs under the pool with isolation enabled
+	// (ConfigHome + a real checkout): one runs in the shared checkout, the other is
+	// auto-isolated into a detached worktree so it runs beside it (#394 part 2)
+	// instead of serializing/deadlocking, and the worktree is disposed afterward.
+	ctx := context.Background()
+	home := t.TempDir()
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-1", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-2", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 2})
+	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
+	worker := poolSchedulerWorker(t, store, adapter, true)
+	worker.ConfigHome = home // enable isolation
+
+	if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
+		t.Fatalf("pool run: %v", err)
+	}
+
+	isolated := 0
+	for _, id := range []string{"job-1", "job-2"} {
+		job, err := store.GetJob(ctx, id)
+		if err != nil {
+			t.Fatalf("GetJob %s: %v", id, err)
+		}
+		if job.State != string(workflow.JobSucceeded) {
+			t.Fatalf("%s state = %q, want succeeded (contended read job must run, not stay queued)", id, job.State)
+		}
+		payload, err := daemonJobPayload(job)
+		if err != nil {
+			t.Fatalf("payload %s: %v", id, err)
+		}
+		if payload.WorktreePath != "" {
+			isolated++
+			if _, statErr := os.Stat(payload.WorktreePath); !os.IsNotExist(statErr) {
+				t.Fatalf("%s isolation worktree %s was not cleaned up", id, payload.WorktreePath)
+			}
+		}
+	}
+	if isolated != 1 {
+		t.Fatalf("isolated read jobs = %d, want exactly 1 (the contended one)", isolated)
+	}
+}
+
+func TestRunQueuedJobsPoolRecoversWorkerPanicAndCleansWorktree(t *testing.T) {
+	// A panicking worker must not hang the pool or crash the daemon, and any
+	// isolation worktree allocated for the contended job must still be disposed
+	// (the always-send-to-done invariant keeps reap's cleanup intact).
+	ctx := context.Background()
+	home := t.TempDir()
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-1", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-2", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 2})
+	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
+	adapter.onDeliver = func() { panic("boom") }
+	worker := poolSchedulerWorker(t, store, adapter, true)
+	worker.ConfigHome = home
+
+	resultCh := make(chan error, 1)
+	go func() { resultCh <- runQueuedJobsForRepo(ctx, worker, 2, "", "") }()
+	select {
+	case err := <-resultCh:
+		if err == nil || !strings.Contains(err.Error(), "panicked") {
+			t.Fatalf("err = %v, want a recovered panic error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pool hung after a worker panic (recovery did not send to done)")
+	}
+	for _, id := range []string{"job-1", "job-2"} {
+		job, err := store.GetJob(ctx, id)
+		if err != nil {
+			t.Fatalf("GetJob %s: %v", id, err)
+		}
+		payload, err := daemonJobPayload(job)
+		if err != nil {
+			t.Fatalf("payload %s: %v", id, err)
+		}
+		if payload.WorktreePath != "" {
+			if _, statErr := os.Stat(payload.WorktreePath); !os.IsNotExist(statErr) {
+				t.Fatalf("%s isolation worktree %s leaked after panic", id, payload.WorktreePath)
+			}
+		}
+	}
+}
+
 func TestRunQueuedJobsForRepoSkipsOtherSessions(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)

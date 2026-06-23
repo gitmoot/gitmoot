@@ -1587,9 +1587,11 @@ func runQueuedJobsForRepoPool(ctx context.Context, worker jobWorker, limit int, 
 	}
 
 	type finished struct {
-		checkoutKey string
-		runtimeKey  string
-		err         error
+		checkoutKey  string
+		runtimeKey   string
+		worktreePath string
+		repoCheckout string
+		err          error
 	}
 	inflightCheckouts := map[string]bool{}
 	inflightRuntimes := map[string]bool{}
@@ -1603,6 +1605,13 @@ func runQueuedJobsForRepoPool(ctx context.Context, worker jobWorker, limit int, 
 			delete(inflightRuntimes, f.runtimeKey)
 		}
 		running--
+		// Dispose an auto-created isolation worktree (#394 part 2). Best-effort and
+		// on a non-cancellable context so it still runs during daemon shutdown; both
+		// the add (in allocatePoolIsolationWorktree) and this remove run on the
+		// dispatcher goroutine under the tick's per-repo lock, so they never race.
+		if f.worktreePath != "" && f.repoCheckout != "" {
+			_ = gitutil.Client{Dir: f.repoCheckout}.RemoveWorktreeForce(context.WithoutCancel(ctx), f.worktreePath)
+		}
 		if f.err != nil && firstErr == nil && !errors.Is(f.err, errRuntimeSessionBusy) {
 			firstErr = f.err
 		}
@@ -1633,7 +1642,7 @@ func runQueuedJobsForRepoPool(ctx context.Context, worker jobWorker, limit int, 
 			if err != nil {
 				firstErr = err
 			} else if slots := limit - running; slots > 0 {
-				queued, _ := selectRunnableQueuedJobsSeeded(ctx, worker.Store, pending, slots, policy, inflightCheckouts, inflightRuntimes)
+				queued, remaining := selectRunnableQueuedJobsSeeded(ctx, worker.Store, pending, slots, policy, inflightCheckouts, inflightRuntimes)
 				for _, job := range queued {
 					job := job
 					checkoutKey := queuedJobCheckoutKey(ctx, worker.Store, job)
@@ -1645,7 +1654,41 @@ func runQueuedJobsForRepoPool(ctx context.Context, worker jobWorker, limit int, 
 					running++
 					dispatched++
 					go func() {
-						done <- finished{checkoutKey: checkoutKey, runtimeKey: runtimeKey, err: worker.run(ctx, job)}
+						done <- finished{checkoutKey: checkoutKey, runtimeKey: runtimeKey, err: runPoolJobRecovered(ctx, worker, job)}
+					}()
+				}
+				// #394 part 2: a read-only job left blocked ONLY by a contended same-repo
+				// checkout (its repo:<repo> key is held by an in-flight job) can run beside
+				// the holder in an auto-created detached worktree — the distinct
+				// worktree:<path> key is safe to parallelize. This is what lets an awaited
+				// same-repo follow-up (the #394 deadlock) make progress.
+				for _, job := range remaining {
+					if running >= limit {
+						break
+					}
+					payload, perr := daemonJobPayload(job)
+					if perr != nil || !poolIsolationEligible(job, payload) {
+						continue
+					}
+					if queuedJobCheckoutKey(ctx, worker.Store, job) != "repo:"+payload.Repo || !inflightCheckouts["repo:"+payload.Repo] {
+						continue // not blocked by a contended same-repo checkout
+					}
+					runtimeKey := queuedJobRuntimeResourceKey(ctx, worker.Store, job)
+					if runtimeKey != "" && (inflightRuntimes[runtimeKey] || runtimeResourceLocked(ctx, worker.Store, runtimeKey)) {
+						continue // also runtime-contended; leave it to the runtime/temp-worker path
+					}
+					iso, ok := worker.allocatePoolIsolationWorktree(ctx, job, payload)
+					if !ok {
+						continue
+					}
+					inflightCheckouts[iso.checkoutKey] = true
+					if iso.runtimeKey != "" {
+						inflightRuntimes[iso.runtimeKey] = true
+					}
+					running++
+					dispatched++
+					go func() {
+						done <- finished{checkoutKey: iso.checkoutKey, runtimeKey: iso.runtimeKey, worktreePath: iso.worktreePath, repoCheckout: iso.repoCheckout, err: runPoolJobRecovered(ctx, worker, iso.job)}
 					}()
 				}
 			}
@@ -1666,6 +1709,88 @@ func runQueuedJobsForRepoPool(ctx context.Context, worker jobWorker, limit int, 
 			reap(<-done)
 		}
 	}
+}
+
+// runPoolJobRecovered runs a pool job and converts a panic into an error so the
+// worker goroutine ALWAYS sends its result to the done channel. This keeps the
+// pool's resource accounting and worktree cleanup (in reap) intact even on a
+// panicking job, and prevents one bad job from crashing an unattended daemon.
+func runPoolJobRecovered(ctx context.Context, worker jobWorker, job db.Job) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("pool worker panicked on job %s: %v", job.ID, r)
+		}
+	}()
+	return worker.run(ctx, job)
+}
+
+// poolIsolationEligible reports whether a queued job blocked by a contended
+// same-repo checkout key may be safely run in an ephemeral detached worktree
+// (#394 part 2). Scope: read-only actions (ask/review) with no existing worktree.
+// implement jobs are excluded — they either already carry a task worktree
+// (already keyed) or must not run detached without the finalize/merge wiring.
+func poolIsolationEligible(job db.Job, payload workflow.JobPayload) bool {
+	switch strings.TrimSpace(job.Type) {
+	case "ask", "review":
+	default:
+		return false
+	}
+	return strings.TrimSpace(payload.WorktreePath) == "" && strings.TrimSpace(payload.TaskID) == ""
+}
+
+type poolIsolatedDispatch struct {
+	job          db.Job
+	checkoutKey  string
+	runtimeKey   string
+	worktreePath string
+	repoCheckout string
+}
+
+// allocatePoolIsolationWorktree creates a detached read-only worktree for a
+// read-capable job otherwise blocked behind a contended same-repo checkout,
+// rewrites the job's payload to run in it (so its checkout key becomes
+// worktree:<path>), and returns the dispatch handle incl. cleanup info. ok=false
+// means the job is not isolable or the worktree could not be created — the caller
+// then leaves it queued to serialize as before (graceful, no deadlock-for-safety
+// trade). Runs on the dispatcher goroutine under the tick's per-repo lock.
+func (w jobWorker) allocatePoolIsolationWorktree(ctx context.Context, job db.Job, payload workflow.JobPayload) (poolIsolatedDispatch, bool) {
+	if strings.TrimSpace(w.ConfigHome) == "" {
+		return poolIsolatedDispatch{}, false
+	}
+	repoRecord, err := w.Store.GetRepo(ctx, payload.Repo)
+	if err != nil || strings.TrimSpace(repoRecord.CheckoutPath) == "" {
+		return poolIsolatedDispatch{}, false
+	}
+	path, err := workflow.DelegationWorktreePath(w.ConfigHome, payload.Repo, job.ID, "pool-isolation", 0)
+	if err != nil || strings.TrimSpace(path) == "" {
+		return poolIsolatedDispatch{}, false
+	}
+	ref := firstNonEmpty(strings.TrimSpace(payload.HeadSHA), strings.TrimSpace(payload.Branch), "HEAD")
+	client := gitutil.Client{Dir: repoRecord.CheckoutPath}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return poolIsolatedDispatch{}, false
+	}
+	if err := client.AddDetachedWorktree(ctx, path, ref); err != nil {
+		return poolIsolatedDispatch{}, false
+	}
+	payload.WorktreePath = path
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		_ = client.RemoveWorktreeForce(context.WithoutCancel(ctx), path)
+		return poolIsolatedDispatch{}, false
+	}
+	if err := w.Store.UpdateJobPayload(ctx, job.ID, string(encoded)); err != nil {
+		_ = client.RemoveWorktreeForce(context.WithoutCancel(ctx), path)
+		return poolIsolatedDispatch{}, false
+	}
+	job.Payload = string(encoded)
+	return poolIsolatedDispatch{
+		job:          job,
+		checkoutKey:  queuedJobCheckoutKey(ctx, w.Store, job),
+		runtimeKey:   queuedJobRuntimeResourceKey(ctx, w.Store, job),
+		worktreePath: path,
+		repoCheckout: repoRecord.CheckoutPath,
+	}, true
 }
 
 type queuedJobResourceSelector struct {
