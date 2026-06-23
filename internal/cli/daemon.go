@@ -108,7 +108,7 @@ func runDaemonStartWithWorkDir(args []string, workDir string, stdout, stderr io.
 		}
 	}
 
-	started, err := startDaemonChild(cfg.Home, cfg.Poll.String(), cfg.Workers, cfg.WatchSkillOptReviews, cfg.RepoFlag, cfg.Session, state, resolvedWorkDir)
+	started, err := startDaemonChild(cfg.Home, cfg.Poll.String(), cfg.Workers, cfg.WatchSkillOptReviews, cfg.Scheduler, cfg.RepoFlag, cfg.Session, state, resolvedWorkDir)
 	if err != nil {
 		fmt.Fprintf(stderr, "daemon start: %v\n", err)
 		return 1
@@ -123,6 +123,18 @@ func runDaemonStartWithWorkDir(args []string, workDir string, stdout, stderr io.
 	return 0
 }
 
+// parseSchedulerMode maps the --scheduler flag to the worker-pool toggle (#394).
+func parseSchedulerMode(mode string) (bool, error) {
+	switch strings.TrimSpace(mode) {
+	case "", "barrier":
+		return false, nil
+	case "pool":
+		return true, nil
+	default:
+		return false, fmt.Errorf("invalid --scheduler %q: want \"barrier\" or \"pool\"", mode)
+	}
+}
+
 func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("daemon run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -135,6 +147,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	workers := fs.Int("workers", 1, "worker count")
 	dryRun := fs.Bool("dry-run", false, "run without mutating external systems")
 	watchSkillOptReviews := fs.Bool("watch-skillopt-reviews", false, "poll watched SkillOpt review issue comments and import valid feedback")
+	scheduler := fs.String("scheduler", "barrier", "queued-job scheduler: barrier (default) or pool (#394 opt-in continuous worker pool)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -153,6 +166,11 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "workers must be positive")
 		return 2
 	}
+	usePool, schedErr := parseSchedulerMode(*scheduler)
+	if schedErr != nil {
+		fmt.Fprintln(stderr, schedErr.Error())
+		return 2
+	}
 	if *repoFlag != "" && *dryRun {
 		fmt.Fprintln(stderr, "daemon run --dry-run is only supported without --repo")
 		return 2
@@ -162,7 +180,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 
 	if *repoFlag == "" {
-		err := runRegisteredRepoSupervisor(ctx, *home, *poll, *workers, *dryRun, *watchSkillOptReviews, session, stdout)
+		err := runRegisteredRepoSupervisor(ctx, *home, *poll, *workers, *dryRun, *watchSkillOptReviews, usePool, session, stdout)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return 0
 		}
@@ -205,7 +223,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 			Store:        store,
 			GitHub:       gh,
 			Workflow:     &engine,
-		}, store, *workers, session, stdout)
+		}, store, *workers, usePool, session, stdout)
 	})
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return 0
@@ -418,6 +436,8 @@ type daemonStartConfig struct {
 	ExplicitWorkers              bool
 	WatchSkillOptReviews         bool
 	ExplicitWatchSkillOptReviews bool
+	Scheduler                    string
+	ExplicitScheduler            bool
 }
 
 const daemonHelp = -1
@@ -433,6 +453,7 @@ func parseDaemonStartConfig(command string, args []string, stderr io.Writer) (da
 	poll := fs.Duration("poll", 30*time.Second, "poll interval")
 	workers := fs.Int("workers", 1, "worker count")
 	watchSkillOptReviews := fs.Bool("watch-skillopt-reviews", false, "poll watched SkillOpt review issue comments and import valid feedback")
+	scheduler := fs.String("scheduler", "barrier", "queued-job scheduler: barrier (default) or pool (#394 opt-in continuous worker pool)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return daemonStartConfig{}, daemonHelp
@@ -450,6 +471,7 @@ func parseDaemonStartConfig(command string, args []string, stderr io.Writer) (da
 		Poll:                 *poll,
 		Workers:              *workers,
 		WatchSkillOptReviews: *watchSkillOptReviews,
+		Scheduler:            *scheduler,
 	}
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
@@ -467,6 +489,9 @@ func parseDaemonStartConfig(command string, args []string, stderr io.Writer) (da
 			cfg.ExplicitStartConfig = true
 		case "watch-skillopt-reviews":
 			cfg.ExplicitWatchSkillOptReviews = true
+			cfg.ExplicitStartConfig = true
+		case "scheduler":
+			cfg.ExplicitScheduler = true
 			cfg.ExplicitStartConfig = true
 		}
 	})
@@ -488,6 +513,10 @@ func parseDaemonStartConfig(command string, args []string, stderr io.Writer) (da
 	}
 	if cfg.Workers <= 0 {
 		fmt.Fprintln(stderr, "workers must be positive")
+		return daemonStartConfig{}, 2
+	}
+	if _, err := parseSchedulerMode(cfg.Scheduler); err != nil {
+		fmt.Fprintln(stderr, err.Error())
 		return daemonStartConfig{}, 2
 	}
 	return cfg, 0
@@ -595,6 +624,9 @@ func overlayDaemonStartArgs(args []string, cfg daemonStartConfig) []string {
 	if cfg.ExplicitWatchSkillOptReviews {
 		args = withDaemonBoolFlagArg(args, "watch-skillopt-reviews", cfg.WatchSkillOptReviews)
 	}
+	if cfg.ExplicitScheduler {
+		args = withDaemonFlagArg(args, "scheduler", cfg.Scheduler)
+	}
 	return args
 }
 
@@ -656,7 +688,7 @@ func currentDaemonPID(state daemonState) (pid int, stale bool, err error) {
 	return pid, false, nil
 }
 
-func startDaemonChild(home string, poll string, workers int, watchSkillOptReviews bool, repo string, session string, state daemonState, workDir string) (daemonMeta, error) {
+func startDaemonChild(home string, poll string, workers int, watchSkillOptReviews bool, scheduler string, repo string, session string, state daemonState, workDir string) (daemonMeta, error) {
 	executable, err := os.Executable()
 	if err != nil {
 		return daemonMeta{}, err
@@ -666,7 +698,7 @@ func startDaemonChild(home string, poll string, workers int, watchSkillOptReview
 		return daemonMeta{}, err
 	}
 	defer logFile.Close()
-	args := daemonChildArgs(home, poll, workers, watchSkillOptReviews, repo, session)
+	args := daemonChildArgs(home, poll, workers, watchSkillOptReviews, scheduler, repo, session)
 	cmd := exec.Command(executable, args...)
 	cmd.Dir = workDir
 	cmd.Stdout = logFile
@@ -689,7 +721,7 @@ func startDaemonChild(home string, poll string, workers int, watchSkillOptReview
 	}, nil
 }
 
-func daemonChildArgs(home string, poll string, workers int, watchSkillOptReviews bool, repo string, session string) []string {
+func daemonChildArgs(home string, poll string, workers int, watchSkillOptReviews bool, scheduler string, repo string, session string) []string {
 	args := []string{"daemon", "run", "--poll", poll, "--workers", strconv.Itoa(workers)}
 	if home != "" {
 		args = append(args, "--home", home)
@@ -702,6 +734,9 @@ func daemonChildArgs(home string, poll string, workers int, watchSkillOptReviews
 	}
 	if watchSkillOptReviews {
 		args = append(args, "--watch-skillopt-reviews")
+	}
+	if usePool, _ := parseSchedulerMode(scheduler); usePool {
+		args = append(args, "--scheduler", "pool")
 	}
 	return args
 }
@@ -829,7 +864,7 @@ func hasWhitespace(value string) bool {
 	return strings.ContainsAny(value, " \t\r\n")
 }
 
-func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Duration, workers int, dryRun bool, watchSkillOptReviews bool, rootFilter string, stdout io.Writer) error {
+func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Duration, workers int, dryRun bool, watchSkillOptReviews bool, usePool bool, rootFilter string, stdout io.Writer) error {
 	return withStoreAndPaths(home, func(paths config.Paths, store *db.Store) error {
 		schedule := registeredRepoSchedule{
 			NextPoll:    map[string]time.Time{},
@@ -840,6 +875,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 		reviewGitHub := newSkillOptGitHubClient()
 		worker := defaultJobWorker(store, stdout, home)
 		worker.CommenterFactory = worker.defaultCommenter
+		worker.UsePool = usePool
 		checkoutLocks := &repoCheckoutLocks{}
 		poller.CheckoutLocks = checkoutLocks
 		var workerErr <-chan error
@@ -884,7 +920,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 	})
 }
 
-func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, store *db.Store, workers int, rootFilter string, stdout io.Writer) error {
+func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, store *db.Store, workers int, usePool bool, rootFilter string, stdout io.Writer) error {
 	if err := recoverExpiredRuntimeSessionLocks(ctx, store, stdout, time.Now().UTC()); err != nil {
 		return err
 	}
@@ -900,6 +936,7 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	}
 	worker := defaultJobWorker(store, stdout, home)
 	worker.CommenterFactory = worker.defaultCommenter
+	worker.UsePool = usePool
 	var checkoutLock sync.Mutex
 	workerErr := startSupervisorWorkerLoop(ctx, daemonWorkerLoopInterval, func(now time.Time) error {
 		checkoutLock.Lock()
@@ -1214,6 +1251,9 @@ type jobWorker struct {
 	CheckoutValidator   func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error)
 	WorkflowFactory     func(string) workflow.Engine
 	CommenterFactory    func(string) github.Client
+	// UsePool selects the opt-in continuous worker-pool scheduler (#394,
+	// --scheduler=pool) over the default per-tick wg.Wait() barrier.
+	UsePool bool
 }
 
 const daemonRunningJobStaleAfter = 30 * time.Minute
@@ -1456,24 +1496,12 @@ func runQueuedJobsForRepo(ctx context.Context, worker jobWorker, limit int, repo
 	if limit <= 0 {
 		return nil
 	}
-	jobs, err := worker.Store.ListQueuedJobs(ctx)
+	if worker.UsePool {
+		return runQueuedJobsForRepoPool(ctx, worker, limit, repoFilter, rootFilter)
+	}
+	pending, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter)
 	if err != nil {
 		return err
-	}
-	pending := make([]db.Job, 0, len(jobs))
-	for _, job := range jobs {
-		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
-			continue
-		}
-		// Operator kill switch (#341): once a tree's root is killed, do not start
-		// any of its queued children. The coordinator's own continuation still runs
-		// so the engine can route through the graceful finalize path; in-flight
-		// children finish normally. Only children (payload.RootJobID points at
-		// another root) are skipped here — the root job itself is never skipped.
-		if queuedChildOfKilledRoot(ctx, worker.Store, job) {
-			continue
-		}
-		pending = append(pending, job)
 	}
 	for len(pending) > 0 {
 		policy, err := worker.parallelSessionPolicy()
@@ -1507,6 +1535,139 @@ func runQueuedJobsForRepo(ctx context.Context, worker jobWorker, limit int, repo
 	return nil
 }
 
+// listPendingQueuedJobs returns the queued jobs eligible to run for this
+// repo/session filter, dropping children of a killed root.
+//
+// Operator kill switch (#341): once a tree's root is killed, do not start any of
+// its queued children. The coordinator's own continuation still runs so the
+// engine can route through the graceful finalize path; in-flight children finish
+// normally. Only children (payload.RootJobID points at another root) are skipped
+// here — the root job itself is never skipped.
+func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string) ([]db.Job, error) {
+	jobs, err := worker.Store.ListQueuedJobs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pending := make([]db.Job, 0, len(jobs))
+	for _, job := range jobs {
+		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+			continue
+		}
+		if queuedChildOfKilledRoot(ctx, worker.Store, job) {
+			continue
+		}
+		pending = append(pending, job)
+	}
+	return pending, nil
+}
+
+// runQueuedJobsForRepoPool is the opt-in (--scheduler=pool) continuous scheduler
+// for #394. Unlike the per-tick barrier it never blocks the tick on a whole
+// batch: it keeps up to `limit` workers busy and RE-QUERIES the queue as each
+// worker frees, so a job queued *after* dispatch began (e.g. a running job that
+// kicks off a follow-up same-repo job and polls it) is picked up without waiting
+// for the in-flight batch to drain (layer 1).
+//
+// Working-tree safety is preserved by live in-flight checkout accounting: a job
+// whose checkout key is already held by a running job is never dispatched
+// concurrently (layer 2). Same-repo no-worktree jobs therefore still serialize;
+// only distinct checkout keys (e.g. isolated worktrees) run in parallel — a
+// follow-up PR makes the awaited follow-up carry one so the chain can complete.
+//
+// inflightCheckouts/inflightRuntimes/running/firstErr are owned solely by this
+// dispatcher goroutine; worker goroutines communicate only via the done channel,
+// so no lock is required.
+func runQueuedJobsForRepoPool(ctx context.Context, worker jobWorker, limit int, repoFilter string, rootFilter string) error {
+	if limit <= 0 {
+		return nil
+	}
+	policy, perr := worker.parallelSessionPolicy()
+	if perr != nil {
+		policy = config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue}
+	}
+
+	type finished struct {
+		checkoutKey string
+		runtimeKey  string
+		err         error
+	}
+	inflightCheckouts := map[string]bool{}
+	inflightRuntimes := map[string]bool{}
+	running := 0
+	done := make(chan finished, limit)
+	var firstErr error
+
+	reap := func(f finished) {
+		delete(inflightCheckouts, f.checkoutKey)
+		if f.runtimeKey != "" {
+			delete(inflightRuntimes, f.runtimeKey)
+		}
+		running--
+		if f.err != nil && firstErr == nil && !errors.Is(f.err, errRuntimeSessionBusy) {
+			firstErr = f.err
+		}
+	}
+
+	for {
+		// Reap finished workers (non-blocking) so freed checkout keys and slots are
+		// visible to this dispatch pass.
+		for reaping := true; reaping; {
+			select {
+			case f := <-done:
+				reap(f)
+			default:
+				reaping = false
+			}
+		}
+
+		// Stop dispatching promptly on cancellation rather than relying on the next
+		// store query to observe it; in-flight workers return as their own ctx is
+		// cancelled (parity with the barrier's wg.Wait()), then we drain and exit.
+		if firstErr == nil && ctx.Err() != nil {
+			firstErr = ctx.Err()
+		}
+
+		dispatched := 0
+		if firstErr == nil {
+			pending, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter)
+			if err != nil {
+				firstErr = err
+			} else if slots := limit - running; slots > 0 {
+				queued, _ := selectRunnableQueuedJobsSeeded(ctx, worker.Store, pending, slots, policy, inflightCheckouts, inflightRuntimes)
+				for _, job := range queued {
+					job := job
+					checkoutKey := queuedJobCheckoutKey(ctx, worker.Store, job)
+					runtimeKey := queuedJobRuntimeResourceKey(ctx, worker.Store, job)
+					inflightCheckouts[checkoutKey] = true
+					if runtimeKey != "" {
+						inflightRuntimes[runtimeKey] = true
+					}
+					running++
+					dispatched++
+					go func() {
+						done <- finished{checkoutKey: checkoutKey, runtimeKey: runtimeKey, err: worker.run(ctx, job)}
+					}()
+				}
+			}
+		}
+
+		if running == 0 {
+			// Nothing running: if we also dispatched nothing this pass the queue is
+			// drained (or everything left is un-runnable for now) — return, surfacing
+			// any worker error. On firstErr we reach here once inflight has drained.
+			if dispatched == 0 {
+				return firstErr
+			}
+			continue
+		}
+		if dispatched == 0 {
+			// No progress is possible until a running worker frees a resource; block
+			// for one, then re-query (which may now include newly-queued jobs).
+			reap(<-done)
+		}
+	}
+}
+
 type queuedJobResourceSelector struct {
 	limit            int
 	policy           config.ParallelSessionPolicy
@@ -1520,14 +1681,23 @@ func selectRunnableQueuedJobs(ctx context.Context, store *db.Store, pending []db
 }
 
 func selectRunnableQueuedJobsWithPolicy(ctx context.Context, store *db.Store, pending []db.Job, limit int, policy config.ParallelSessionPolicy) ([]db.Job, []db.Job) {
+	return selectRunnableQueuedJobsSeeded(ctx, store, pending, limit, policy, nil, nil)
+}
+
+// selectRunnableQueuedJobsSeeded is selectRunnableQueuedJobsWithPolicy with the
+// checkout/runtime resource sets pre-seeded from already-running jobs. The
+// barrier path passes nil seeds (empty, == the original behavior); the pool path
+// (#394) seeds the live in-flight keys so a job whose checkout key is already
+// held by a running job is not selected. The seed maps are copied, never mutated.
+func selectRunnableQueuedJobsSeeded(ctx context.Context, store *db.Store, pending []db.Job, limit int, policy config.ParallelSessionPolicy, seedCheckouts map[string]bool, seedRuntimes map[string]bool) ([]db.Job, []db.Job) {
 	if limit <= 0 {
 		return nil, pending
 	}
 	selector := queuedJobResourceSelector{
 		limit:            limit,
 		policy:           policy,
-		checkouts:        map[string]bool{},
-		runtimes:         map[string]bool{},
+		checkouts:        copyStringSet(seedCheckouts),
+		runtimes:         copyStringSet(seedRuntimes),
 		tempReservations: map[string]int{},
 	}
 	queued := make([]db.Job, 0, min(limit, len(pending)))
@@ -1540,6 +1710,16 @@ func selectRunnableQueuedJobsWithPolicy(ctx context.Context, store *db.Store, pe
 		remaining = append(remaining, job)
 	}
 	return queued, remaining
+}
+
+func copyStringSet(src map[string]bool) map[string]bool {
+	dst := make(map[string]bool, len(src))
+	for k, v := range src {
+		if v {
+			dst[k] = true
+		}
+	}
+	return dst
 }
 
 func (s queuedJobResourceSelector) selects(ctx context.Context, store *db.Store, job db.Job, selected int) bool {
