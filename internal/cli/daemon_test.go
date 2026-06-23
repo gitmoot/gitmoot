@@ -4515,12 +4515,16 @@ func TestRunQueuedJobsForRepoSkipsChildrenOfKilledRoot(t *testing.T) {
 	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
 	seedDaemonWorkerAgent(t, store, "w", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
 
-	killedChildPayload := mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Branch: "main", Sender: "w", RootJobID: "killed-root"})
-	liveChildPayload := mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Branch: "main", Sender: "w", RootJobID: "live-root"})
+	killedChildPayload := mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Branch: "main", Sender: "w", RootJobID: "killed-root", DelegationID: "d1"})
+	liveChildPayload := mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Branch: "main", Sender: "w", RootJobID: "live-root", DelegationID: "d2"})
+	// A continuation of the killed root carries NO DelegationID and MUST still run
+	// so the engine routes the tree through the graceful #305 finalize.
+	killedContinuationPayload := mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Branch: "main", Sender: "w", RootJobID: "killed-root", DelegationFinalize: true})
 	for _, j := range []db.Job{
 		{ID: "killed-root", Agent: "w", Type: "ask", State: string(workflow.JobSucceeded), Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Sender: "w"})},
 		{ID: "live-root", Agent: "w", Type: "ask", State: string(workflow.JobSucceeded), Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Sender: "w"})},
 		{ID: "killed-child", Agent: "w", Type: "ask", State: string(workflow.JobQueued), Payload: killedChildPayload},
+		{ID: "killed-root/continuation", Agent: "w", Type: "ask", State: string(workflow.JobQueued), Payload: killedContinuationPayload},
 		{ID: "live-child", Agent: "w", Type: "ask", State: string(workflow.JobQueued), Payload: liveChildPayload},
 	} {
 		if err := store.CreateJobWithEvent(ctx, j, db.JobEvent{Kind: j.State, Message: "seed"}); err != nil {
@@ -4561,6 +4565,15 @@ func TestRunQueuedJobsForRepoSkipsChildrenOfKilledRoot(t *testing.T) {
 	}
 	if !liveDelivered {
 		t.Fatalf("a queued child of an un-killed root must still run; delivered=%v", adapter.delivered)
+	}
+	continuationDelivered := false
+	for _, id := range adapter.delivered {
+		if id == "killed-root/continuation" {
+			continuationDelivered = true
+		}
+	}
+	if !continuationDelivered {
+		t.Fatalf("the continuation of a killed root must run so the graceful finalize executes; delivered=%v", adapter.delivered)
 	}
 
 	killedChild, err := store.GetJob(ctx, "killed-child")

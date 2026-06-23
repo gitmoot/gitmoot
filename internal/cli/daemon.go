@@ -1628,12 +1628,18 @@ func queuedJobMatchesSession(job db.Job, rootFilter string) bool {
 	return err == nil && payload.RootJobID == rootFilter
 }
 
-// queuedChildOfKilledRoot reports whether a queued job is a child of a delegation
-// tree whose root has been killed by an operator (#341). Only children are
-// matched: the root coordinator itself (payload.RootJobID == "" or == job.ID) is
-// never skipped, so its next continuation can run and route the engine through
-// the graceful finalize path. A payload-parse miss or store error fails open
-// (returns false) so a hiccup never silently strands a normal job.
+// queuedChildOfKilledRoot reports whether a queued job is a delegation child leg
+// of a tree whose root has been killed by an operator (#341). Only child legs are
+// matched and skipped. Two classes are deliberately exempted so the graceful
+// finalize can still run:
+//   - the root coordinator itself (payload.RootJobID == "" or == job.ID); and
+//   - any continuation (coordinator reconvene or the #305 graceful finalize),
+//     which carries no DelegationID — it MUST run so the engine routes the killed
+//     tree through enqueueFinalizeContinuation and emits a terminal result.
+//
+// Delegation child legs set DelegationID (delegationRequest), so a non-empty
+// DelegationID is what marks a job as skippable work. A payload-parse miss or
+// store error fails open (returns false) so a hiccup never silently strands a job.
 func queuedChildOfKilledRoot(ctx context.Context, store *db.Store, job db.Job) bool {
 	if store == nil {
 		return false
@@ -1644,6 +1650,12 @@ func queuedChildOfKilledRoot(ctx context.Context, store *db.Store, job db.Job) b
 	}
 	rootJobID := strings.TrimSpace(payload.RootJobID)
 	if rootJobID == "" || rootJobID == job.ID {
+		return false
+	}
+	// Continuations (DelegationID == "") reconvene the coordinator / finalize the
+	// tree and must always run, even for a killed root. Only actual child legs are
+	// skipped.
+	if strings.TrimSpace(payload.DelegationID) == "" {
 		return false
 	}
 	killed, err := store.IsRootJobKilled(ctx, rootJobID)

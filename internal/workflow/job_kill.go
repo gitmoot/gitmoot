@@ -9,8 +9,14 @@ import (
 )
 
 // KillDelegationTree is the operator kill switch (#341). It marks the delegation
-// tree rooted at rootJobID as killed so the engine and daemon stop expanding it,
-// then returns the root job.
+// tree as killed so the engine and daemon stop expanding it, then returns the
+// killed root job.
+//
+// jobID may be ANY job in the tree — the root coordinator or any child/
+// continuation. A child carries payload.RootJobID; the kill is always applied to
+// that real root, since the engine and daemon only ever consult the root's flag.
+// Passing a child id therefore kills the whole tree rather than silently marking a
+// row nothing reads.
 //
 // The kill is graceful, not a hard stop: it does NOT cancel in-flight jobs. The
 // flag takes effect at the two expansion points:
@@ -19,21 +25,33 @@ import (
 //     and, on the coordinator's next continuation, routes through the #305 graceful
 //     finalize continuation (synthesize what completed → stop) instead of
 //     dispatching the next generation; and
-//   - the daemon skips queued children of a killed root, so no new child starts.
+//   - the daemon skips queued child legs of a killed root (continuations still run).
 //
-// In-flight children run to completion normally. The root job must exist; an
-// unknown id is an error so an operator typo does not silently no-op.
-func KillDelegationTree(ctx context.Context, store *db.Store, rootJobID string) (db.Job, error) {
+// In-flight children run to completion normally. The job must exist; an unknown id
+// is an error so an operator typo does not silently no-op.
+func KillDelegationTree(ctx context.Context, store *db.Store, jobID string) (db.Job, error) {
 	if store == nil {
 		return db.Job{}, fmt.Errorf("store is required")
 	}
-	rootJobID = strings.TrimSpace(rootJobID)
-	if rootJobID == "" {
-		return db.Job{}, fmt.Errorf("root job id is required")
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return db.Job{}, fmt.Errorf("job id is required")
 	}
-	root, err := store.GetJob(ctx, rootJobID)
+	target, err := store.GetJob(ctx, jobID)
 	if err != nil {
-		return db.Job{}, fmt.Errorf("kill delegation tree %s: %w", rootJobID, err)
+		return db.Job{}, fmt.Errorf("kill delegation tree %s: %w", jobID, err)
+	}
+	// Resolve to the real root: a child/continuation carries RootJobID, the root
+	// coordinator does not. The engine/daemon only consult the root's flag, so we
+	// must mark the root even when the operator passes a descendant id.
+	root := target
+	if payload, perr := unmarshalPayload(target.Payload); perr == nil {
+		if r := strings.TrimSpace(payload.RootJobID); r != "" && r != target.ID {
+			root, err = store.GetJob(ctx, r)
+			if err != nil {
+				return db.Job{}, fmt.Errorf("kill delegation tree: resolve root %s of %s: %w", r, jobID, err)
+			}
+		}
 	}
 	if err := store.SetRootJobKilled(ctx, root.ID); err != nil {
 		return db.Job{}, err
@@ -41,9 +59,10 @@ func KillDelegationTree(ctx context.Context, store *db.Store, rootJobID string) 
 	if err := store.AddJobEvent(ctx, db.JobEvent{
 		JobID:   root.ID,
 		Kind:    "delegation_killed",
-		Message: fmt.Sprintf("operator killed delegation tree rooted at %s; new delegations and queued children stop, in-flight jobs finish", root.ID),
+		Message: fmt.Sprintf("operator killed delegation tree rooted at %s; new delegations and queued child legs stop, in-flight jobs finish", root.ID),
 	}); err != nil {
 		return db.Job{}, err
 	}
-	return store.GetJob(ctx, root.ID)
+	root.RootKilled = true
+	return root, nil
 }

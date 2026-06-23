@@ -113,3 +113,38 @@ func TestKillDelegationTreeMarksRootAndErrorsOnMissing(t *testing.T) {
 		t.Fatal("KillDelegationTree on a missing root must error")
 	}
 }
+
+// TestKillDelegationTreeResolvesChildToRoot pins that passing ANY tree member's
+// id (a child/continuation, not just the root) kills the whole tree — the engine
+// and daemon only consult the root's flag, so a child id must resolve to it.
+func TestKillDelegationTreeResolvesChildToRoot(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	insertCompletedJob(t, store, db.Job{ID: "root", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo: "jerryfane/gitmoot", TaskID: "task-9", Sender: "coord",
+		Result: &AgentResult{Decision: "approved", Summary: "tree"},
+	})
+	insertCompletedJob(t, store, db.Job{ID: "root/delegation/c1", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo: "jerryfane/gitmoot", Sender: "coord", RootJobID: "root", DelegationID: "d1",
+		Result: &AgentResult{Decision: "approved", Summary: "child"},
+	})
+
+	// Operator passes a CHILD id; the whole tree (its root) must be killed.
+	root, err := KillDelegationTree(ctx, store, "root/delegation/c1")
+	if err != nil {
+		t.Fatalf("KillDelegationTree(child) returned error: %v", err)
+	}
+	if root.ID != "root" {
+		t.Fatalf("kill should resolve a child id to the root; got %q", root.ID)
+	}
+	if killed, _ := store.IsRootJobKilled(ctx, "root"); !killed {
+		t.Fatal("the ROOT must be marked killed when an operator passes a child id")
+	}
+	if killed, _ := store.IsRootJobKilled(ctx, "root/delegation/c1"); killed {
+		t.Fatal("the child row itself should not carry the kill flag")
+	}
+	if got := countJobEvents(t, store, "root", "delegation_killed"); got != 1 {
+		t.Fatalf("delegation_killed events on root = %d, want 1", got)
+	}
+}
