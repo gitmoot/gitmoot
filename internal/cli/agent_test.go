@@ -1065,6 +1065,209 @@ func TestDispatchManagedSyncUsesJobTimeoutForRuntimeLock(t *testing.T) {
 	}
 }
 
+// TestDispatchForegroundAskToManagedTypeSpinsInstance covers #395: a plain
+// foreground ask whose name resolves to a configured managed agent type (no
+// --type, no AllowManagedSync) must dispatch synchronously to the managed type
+// instead of erroring "agent not found".
+func TestDispatchForegroundAskToManagedTypeSpinsInstance(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	t.Chdir(repoDir)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "type", "set", "planner",
+		"--home", home,
+		"--runtime", "codex",
+		"--max-background", "1",
+		"--idle-timeout", "20m",
+		"--job-timeout", "45m",
+		"--capability", "ask",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	runner := &managedSyncLockRunner{
+		t:          t,
+		store:      store,
+		runtimeKey: "runtime:codex:550e8400-e29b-41d4-a716-446655440222",
+		minTTL:     44 * time.Minute,
+	}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	// No Type, no AllowManagedSync: this is the plain foreground ask the issue
+	// targets. Before #395 this returned `agent "planner" not found`.
+	output, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
+		RepoFlag:     "owner/repo",
+		Agent:        "planner",
+		Action:       "ask",
+		Instructions: "Plan the work foreground.",
+		Home:         home,
+	})
+	if err != nil {
+		t.Fatalf("dispatchLocalAgentJob returned error: %v", err)
+	}
+	if output.Result == nil || output.Result.Decision != "implemented" {
+		t.Fatalf("dispatch output = %+v", output)
+	}
+	// Reaching ensureManagedAgentInstance must have spun a managed instance of
+	// the type, proving the synchronous managed path was taken.
+	instances, err := store.ListAgentInstances(context.Background())
+	if err != nil {
+		t.Fatalf("ListAgentInstances returned error: %v", err)
+	}
+	if len(instances) != 1 || instances[0].Type != "planner" {
+		t.Fatalf("instances = %+v, want one planner managed instance", instances)
+	}
+	if output.Agent != instances[0].Name {
+		t.Fatalf("job agent = %q, want managed instance %q", output.Agent, instances[0].Name)
+	}
+}
+
+// TestDispatchForegroundReviewToManagedTypeStillErrors pins the #395 scoping
+// decision: the foreground managed-type fall-through is limited to the `ask`
+// action. A foreground `review` whose name resolves to a configured managed
+// type must NOT spin a managed instance (review carries required params the
+// foreground path has not validated here) — it stays the historical not-found
+// error, so a heuristic-selected `run`->`review` can't spin-then-fail downstream.
+func TestDispatchForegroundReviewToManagedTypeStillErrors(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	t.Chdir(repoDir)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "type", "set", "planner",
+		"--home", home,
+		"--runtime", "codex",
+		"--max-background", "1",
+		"--idle-timeout", "20m",
+		"--job-timeout", "45m",
+		"--capability", "ask",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+
+	_, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
+		RepoFlag:     "owner/repo",
+		Agent:        "planner",
+		Action:       "review",
+		PullRequest:  7,
+		Instructions: "Review the PR foreground.",
+		Home:         home,
+	})
+	if err == nil || !strings.Contains(err.Error(), `agent "planner" not found`) {
+		t.Fatalf("review-to-type dispatch err = %v, want \"agent not found\"", err)
+	}
+	instances, err := store.ListAgentInstances(context.Background())
+	if err != nil {
+		t.Fatalf("ListAgentInstances returned error: %v", err)
+	}
+	if len(instances) != 0 {
+		t.Fatalf("instances = %+v, want zero (review must not spin a managed instance)", instances)
+	}
+}
+
+// TestDispatchForegroundAskSingleInstanceUnchanged confirms a name that
+// resolves to a registered single agent still dispatches to that instance and
+// does not spin a managed instance, preserving single-instance-shadows-type.
+func TestDispatchForegroundAskSingleInstanceUnchanged(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	t.Chdir(repoDir)
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepo(context.Background(), db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir, DefaultBranch: "main", PollInterval: "30s"}); err != nil {
+		t.Fatalf("UpsertRepo returned error: %v", err)
+	}
+	if err := store.UpsertAgent(context.Background(), db.Agent{
+		Name:           "solo",
+		Role:           "planner",
+		Runtime:        runtime.ShellRuntime,
+		RuntimeRef:     "echo",
+		RepoScope:      "owner/repo",
+		Capabilities:   []string{"ask"},
+		AutonomyPolicy: runtime.AutonomyPolicyReadOnly,
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+	runner := &agentStartRunner{results: []subprocess.Result{
+		{Stdout: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"},
+	}}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	output, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
+		RepoFlag:     "owner/repo",
+		Agent:        "solo",
+		Action:       "ask",
+		Instructions: "Use the single instance.",
+		Home:         home,
+	})
+	if err != nil {
+		t.Fatalf("dispatchLocalAgentJob returned error: %v", err)
+	}
+	if output.Agent != "solo" {
+		t.Fatalf("job agent = %q, want solo", output.Agent)
+	}
+	instances, err := store.ListAgentInstances(context.Background())
+	if err != nil {
+		t.Fatalf("ListAgentInstances returned error: %v", err)
+	}
+	if len(instances) != 0 {
+		t.Fatalf("instances = %+v, want no managed instances for a single agent", instances)
+	}
+}
+
+// TestDispatchForegroundAskUnknownNameStillErrors confirms requirement #3: a
+// name resolving to neither a single agent nor a managed type still returns the
+// historical `agent "<name>" not found` error in the foreground.
+func TestDispatchForegroundAskUnknownNameStillErrors(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	t.Chdir(repoDir)
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepo(context.Background(), db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir, DefaultBranch: "main", PollInterval: "30s"}); err != nil {
+		t.Fatalf("UpsertRepo returned error: %v", err)
+	}
+
+	_, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
+		RepoFlag:     "owner/repo",
+		Agent:        "ghost",
+		Action:       "ask",
+		Instructions: "Should not resolve.",
+		Home:         home,
+	})
+	if err == nil {
+		t.Fatal("dispatchLocalAgentJob returned nil error, want not found")
+	}
+	if !strings.Contains(err.Error(), `agent "ghost" not found`) {
+		t.Fatalf("error = %q, want agent not found", err.Error())
+	}
+}
+
 func TestDispatchManagedAgentStartsFreshInstanceWhenPolicyChanges(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()

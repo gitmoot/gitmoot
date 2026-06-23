@@ -527,11 +527,51 @@ func resolveLocalDispatchAgent(ctx context.Context, store *db.Store, request loc
 			return db.Agent{}, noopAgentReservationRelease, err
 		}
 	}
-	if !request.Background && !request.AllowManagedSync {
-		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("agent %q not found", request.Agent)
-	}
 	typeName := firstNonEmpty(forceType, request.Agent)
+	// A background dispatch (or a caller that explicitly opted in via
+	// AllowManagedSync, e.g. the skillopt path) always reaches the managed path.
+	// For a plain foreground dispatch, fall through to the managed path only for
+	// the `ask` action AND only when the resolved name maps to a configured
+	// managed agent type; otherwise preserve the historical "agent not found"
+	// error so a name that resolves to neither a single instance nor a type still
+	// fails as before. Scoped to `ask`: `implement` keeps its existing
+	// read-only/finalize semantics (readOnlyManagedImplementationBlock), and
+	// `review` carries required params (--pr / --head-sha) that the foreground
+	// path does not validate before this point — letting a heuristic-selected
+	// `run`->`review` reach the managed path would spin an instance and then fail
+	// downstream (#395).
+	if !request.Background && !request.AllowManagedSync {
+		allowSync := false
+		if strings.TrimSpace(request.Action) == "ask" {
+			ok, err := managedAgentTypeExists(request.Home, typeName)
+			if err != nil {
+				return db.Agent{}, noopAgentReservationRelease, err
+			}
+			allowSync = ok
+		}
+		if !allowSync {
+			return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("agent %q not found", request.Agent)
+		}
+	}
 	return ensureManagedAgentInstance(ctx, store, request.Home, typeName, repo, record)
+}
+
+// managedAgentTypeExists reports whether typeName names a configured managed
+// agent type for the given home. It is used to decide whether a foreground
+// ask/run may dispatch synchronously to a managed type (#395) without changing
+// the historical "agent not found" behavior for names that match neither a
+// single instance nor a type.
+func managedAgentTypeExists(home string, typeName string) (bool, error) {
+	typeName = strings.TrimSpace(typeName)
+	if typeName == "" {
+		return false, nil
+	}
+	types, err := loadAgentTypeConfig(home)
+	if err != nil {
+		return false, err
+	}
+	_, ok := types[typeName]
+	return ok, nil
 }
 
 func readOnlyManagedImplementationBlock(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string) (runtime.Agent, bool, error) {
