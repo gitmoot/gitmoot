@@ -206,6 +206,13 @@ type Job struct {
 	// dispatch routes through the graceful finalize continuation instead of
 	// dispatching new delegations, and the daemon skips queued children.
 	RootKilled bool
+	// InputTokens and OutputTokens record the runtime token usage captured for
+	// this job (best-effort per runtime; see UpdateJobUsage). They default to 0
+	// and are populated by every jobs SELECT so the per-root delegation token
+	// budget (#338 Part B) can sum a tree's usage. A job whose runtime does not
+	// report usage contributes 0 — the budget still works, it just under-counts.
+	InputTokens  int
+	OutputTokens int
 	// UpdatedAt is populated by ListJobs (for age display in the dashboard);
 	// other readers may leave it zero.
 	UpdatedAt string
@@ -2081,16 +2088,16 @@ func (s *Store) IsRootJobKilled(ctx context.Context, rootID string) (bool, error
 }
 
 func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed FROM jobs WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens FROM jobs WHERE id = ?`, id)
 	var job Job
-	if err := row.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled); err != nil {
+	if err := row.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens); err != nil {
 		return Job{}, err
 	}
 	return job, nil
 }
 
 func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, updated_at FROM jobs ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, updated_at FROM jobs ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -2099,7 +2106,7 @@ func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.UpdatedAt); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -2112,7 +2119,7 @@ func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
 // id for a stable tree. It selects updated_at like ListJobs so callers can show
 // child age; the idx_jobs_parent_job_id index backs the filter.
 func (s *Store) ListJobsByParent(ctx context.Context, parentJobID string) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, updated_at
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, updated_at
 		FROM jobs WHERE parent_job_id = ? ORDER BY delegation_id, id`, parentJobID)
 	if err != nil {
 		return nil, err
@@ -2122,7 +2129,7 @@ func (s *Store) ListJobsByParent(ctx context.Context, parentJobID string) ([]Job
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.UpdatedAt); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -2131,7 +2138,7 @@ func (s *Store) ListJobsByParent(ctx context.Context, parentJobID string) ([]Job
 }
 
 func (s *Store) ListQueuedJobs(ctx context.Context) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens
 		FROM jobs WHERE state = ? ORDER BY created_at, rowid`, "queued")
 	if err != nil {
 		return nil, err
@@ -2141,7 +2148,7 @@ func (s *Store) ListQueuedJobs(ctx context.Context) ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -2150,7 +2157,7 @@ func (s *Store) ListQueuedJobs(ctx context.Context) ([]Job, error) {
 }
 
 func (s *Store) ListRunningJobsUpdatedBefore(ctx context.Context, before time.Time) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens
 		FROM jobs WHERE state = ? AND updated_at < ? ORDER BY id`, "running", before.UTC().Format("2006-01-02 15:04:05"))
 	if err != nil {
 		return nil, err
@@ -2160,7 +2167,7 @@ func (s *Store) ListRunningJobsUpdatedBefore(ctx context.Context, before time.Ti
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -2280,6 +2287,26 @@ func (s *Store) DelegateQueuedJob(ctx context.Context, id string, fromAgent stri
 
 func (s *Store) UpdateJobPayload(ctx context.Context, id string, payload string) error {
 	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, payload, id)
+	if err != nil {
+		return err
+	}
+	return requireAffected(result, "job", id)
+}
+
+// UpdateJobUsage records the runtime token usage for a job (best-effort capture
+// from the runtime adapters; see internal/runtime). Negative values are clamped
+// to 0 so a malformed runtime usage report can never push a tree's aggregate
+// below zero (#338 Part B / ruflo design reference #380). It does not touch
+// updated_at: usage is captured at delivery time alongside the existing payload
+// write and is purely additive accounting, not a state transition.
+func (s *Store) UpdateJobUsage(ctx context.Context, id string, inputTokens int, outputTokens int) error {
+	if inputTokens < 0 {
+		inputTokens = 0
+	}
+	if outputTokens < 0 {
+		outputTokens = 0
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET input_tokens = ?, output_tokens = ? WHERE id = ?`, inputTokens, outputTokens, id)
 	if err != nil {
 		return err
 	}
@@ -5765,5 +5792,9 @@ ALTER TABLE branch_locks ADD COLUMN skip_native_review_fanout INTEGER NOT NULL D
 	`,
 	`
 ALTER TABLE jobs ADD COLUMN root_killed INTEGER NOT NULL DEFAULT 0;
+	`,
+	`
+ALTER TABLE jobs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0;
 	`,
 }

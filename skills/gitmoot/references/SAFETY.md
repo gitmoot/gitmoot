@@ -61,6 +61,15 @@ cannot recurse or fan out forever:
   coordinator that tries to fan out after the tree has run this long is refused
   with a `delegation_walltime_exceeded` event. A generous runaway backstop, not a
   tight deadline.
+- Per-root token budget (cost) `[orchestrate].max_delegation_token_budget`,
+  **off by default** (`0` = unlimited): when set to a positive value, the whole
+  tree under one root is bounded by cumulative token usage (input + output across
+  every job in the tree). A coordinator that tries to fan out after the tree has
+  already used at least the budget is refused with a `delegation_cost_exceeded`
+  event. Token capture is **best-effort per runtime** (Claude reports usage; Kimi
+  reports it if its stream emits it; Codex `Deliver` runs without `--json` and so
+  contributes `0`), so the budget can under-count but never over-counts. Leaving
+  the knob at `0` skips the check entirely.
 - Per-coordinator width `MaxDelegationWidth = 16`: a single coordinator result
   may not fan out more than this many delegations in one generation; an over-wide
   set is refused with a `delegation_width_exceeded` event.

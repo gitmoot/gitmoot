@@ -6854,6 +6854,15 @@ cannot recurse or fan out forever:
   coordinator that tries to fan out after the tree has run this long is refused
   with a `delegation_walltime_exceeded` event. A generous runaway backstop, not a
   tight deadline.
+- Per-root token budget (cost) `[orchestrate].max_delegation_token_budget`,
+  **off by default** (`0` = unlimited): when set to a positive value, the whole
+  tree under one root is bounded by cumulative token usage (input + output across
+  every job in the tree). A coordinator that tries to fan out after the tree has
+  already used at least the budget is refused with a `delegation_cost_exceeded`
+  event. Token capture is **best-effort per runtime** (Claude reports usage; Kimi
+  reports it if its stream emits it; Codex `Deliver` runs without `--json` and so
+  contributes `0`), so the budget can under-count but never over-counts. Leaving
+  the knob at `0` skips the check entirely.
 - Per-coordinator width `MaxDelegationWidth = 16`: a single coordinator result
   may not fan out more than this many delegations in one generation; an over-wide
   set is refused with a `delegation_width_exceeded` event.
@@ -7057,6 +7066,16 @@ Delegation trees are bounded so they cannot run forever:
   coordinator that tries to fan out after the tree has run this long is refused
   with a `delegation_walltime_exceeded` event. A generous runaway backstop, not a
   tight deadline.
+- Per-root token budget (cost): `[orchestrate].max_delegation_token_budget`,
+  **off by default** (`0` = unlimited). When set to a positive value, the whole
+  tree under one root is bounded by cumulative token usage (input + output,
+  summed across every job in the tree). A coordinator that tries to fan out after
+  the tree has already used at least the budget is refused with a
+  `delegation_cost_exceeded` event and routes through the finalize continuation.
+  Token capture is **best-effort per runtime** — see the capture-status note
+  below — so the budget can under-count a runtime that does not report usage; it
+  never over-counts. Leaving the knob at `0` skips the check entirely (behavior is
+  byte-identical to before the knob existed).
 - Per-coordinator width: `MaxDelegationWidth = 16`. A single coordinator result
   may not fan out more than this many delegations in one generation; an over-wide
   set is refused with a `delegation_width_exceeded` event and routes through the
@@ -7079,6 +7098,24 @@ told it cannot delegate further and asked to synthesize a best-effort final
 result and return empty delegations. That continuation is terminal — any
 delegations it returns are ignored (`delegation_finalized`) — so the chain always
 stops with a clean synthesis instead of a dead end.
+
+#### Token-capture status (per runtime)
+
+The per-root **token budget** sums whatever token usage each job's runtime
+reports at delivery time. Capture is **best-effort and uneven across runtimes**;
+a job whose runtime reports no usage contributes `0` to the sum, so the budget
+**under-counts** that runtime rather than failing. Current status:
+
+| Runtime | Reports token usage? | How |
+| --- | --- | --- |
+| **Claude Code** | Yes | Parsed from the `usage.{input,output}_tokens` of the `--output-format json` envelope on delivery. |
+| **Kimi Code** | Best-effort | Captured if the `--output-format stream-json` stream emits a `usage` object; otherwise `0`. |
+| **Codex** | No (contributes `0`) | `codex exec resume … -- <prompt>` runs without `--json` (plain text), so delivery exposes no machine-readable usage. |
+
+Because of this, a tree made up mostly of Codex jobs will accumulate little or no
+counted usage — set the budget with that in mind, and prefer it as a coarse
+runaway-cost backstop rather than a precise spend limit. A `$`-denominated price
+table is intentionally **not** implemented yet; the budget is in raw tokens.
 
 ### Top-level fields
 

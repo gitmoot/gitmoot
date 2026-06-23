@@ -301,6 +301,15 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		PullRequest: payload.PullRequest,
 		Model:       payload.Model,
 	})
+	// Record best-effort runtime token usage so the per-root delegation token
+	// budget (#338 Part B) can sum a tree's cost. Only persist when the runtime
+	// actually reported usage (a positive count) so runtimes that report nothing
+	// (e.g. codex Deliver, which runs without --json) leave the columns at their 0
+	// default rather than taking a no-op write. Usage accounting must never fail a
+	// delivery, so a write error is swallowed.
+	if err == nil && (result.InputTokens > 0 || result.OutputTokens > 0) {
+		_ = m.Store.UpdateJobUsage(ctx, job.ID, result.InputTokens, result.OutputTokens)
+	}
 	if strings.TrimSpace(result.Summary) != "" {
 		return result.Summary, err
 	}

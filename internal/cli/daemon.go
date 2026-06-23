@@ -194,9 +194,10 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 			Store:     store,
 			MergeGate: newDaemonPolicyMergeGate(store, gh, checkout),
 		}
-		// Honor the opt-in [orchestrate] artifact-body inlining policy on this
-		// single-repo engine too; fail-safe to off if the policy cannot load.
-		defaultJobWorker(store, stdout, *home).applyInlineArtifactPolicy(&engine)
+		// Honor the opt-in [orchestrate] policy (artifact-body inlining + per-root
+		// delegation token budget) on this single-repo engine too; fail-safe to the
+		// defaults if the policy cannot load.
+		defaultJobWorker(store, stdout, *home).applyOrchestratePolicy(&engine)
 		fmt.Fprintf(stdout, "watching %s every %s\n", repo.FullName(), poll.String())
 		return runSingleRepoSupervisor(ctx, *home, daemon.Daemon{
 			Repo:         repo,
@@ -3000,20 +3001,23 @@ func (w jobWorker) defaultStartAdapter(runtimeName string, checkout string) (run
 
 func (w jobWorker) defaultWorkflow(checkout string) workflow.Engine {
 	engine := daemonWorkflowEngine(w.Store, github.NewClient(checkout), checkout, w.workflowHome())
-	w.applyInlineArtifactPolicy(&engine)
+	w.applyOrchestratePolicy(&engine)
 	return engine
 }
 
-// applyInlineArtifactPolicy sets the engine's opt-in artifact-body inlining fields
-// from the host [orchestrate] policy. It is fail-safe: any load error leaves the
-// engine with inlining off (the default) rather than failing engine construction.
-func (w jobWorker) applyInlineArtifactPolicy(engine *workflow.Engine) {
+// applyOrchestratePolicy sets the engine's opt-in [orchestrate] fields — the
+// artifact-body inlining knobs and the per-root delegation token budget (#338
+// Part B) — from the host policy. It is fail-safe: any load error leaves the
+// engine with its defaults (inlining off, token budget 0 = unlimited) rather than
+// failing engine construction.
+func (w jobWorker) applyOrchestratePolicy(engine *workflow.Engine) {
 	policy, err := w.orchestratePolicy()
 	if err != nil {
 		return
 	}
 	engine.InlineArtifactBodies = policy.InlineArtifactBodies
 	engine.MaxInlineArtifactBytes = policy.InlineArtifactMaxBytes
+	engine.MaxDelegationTokenBudget = policy.MaxDelegationTokenBudget
 }
 
 // workflowHome resolves the GITMOOT_HOME root used to place per-delegation

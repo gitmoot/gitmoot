@@ -38,16 +38,23 @@ type OrchestratePolicy struct {
 	// InlineArtifactMaxBytes is the per-body byte cap applied when
 	// InlineArtifactBodies is set; 0 means the engine's built-in default.
 	InlineArtifactMaxBytes int
+	// MaxDelegationTokenBudget is the cumulative per-root token budget (input +
+	// output, summed across a delegation tree) that bounds a tree by cost in
+	// addition to depth/width/total-jobs/wall-clock (#338 Part B). 0 (the default)
+	// means unlimited/off, so default behavior is unchanged. The daemon wires this
+	// into Engine.MaxDelegationTokenBudget at startup.
+	MaxDelegationTokenBudget int
 }
 
 func DefaultOrchestratePolicy() OrchestratePolicy {
 	return OrchestratePolicy{
-		CockpitMode:            CockpitModeAuto,
-		CockpitSession:         "",
-		CockpitMaxPanes:        4,
-		CockpitPaneKey:         CockpitPaneKeyJob,
-		InlineArtifactBodies:   false,
-		InlineArtifactMaxBytes: 0,
+		CockpitMode:              CockpitModeAuto,
+		CockpitSession:           "",
+		CockpitMaxPanes:          4,
+		CockpitPaneKey:           CockpitPaneKeyJob,
+		InlineArtifactBodies:     false,
+		InlineArtifactMaxBytes:   0,
+		MaxDelegationTokenBudget: 0,
 	}
 }
 
@@ -111,6 +118,10 @@ func applyOrchestratePolicyField(policy *OrchestratePolicy, key string, value st
 		parsed, err := strconv.Atoi(value)
 		policy.InlineArtifactMaxBytes = parsed
 		return err
+	case "max_delegation_token_budget":
+		parsed, err := strconv.Atoi(value)
+		policy.MaxDelegationTokenBudget = parsed
+		return err
 	default:
 		return nil
 	}
@@ -129,6 +140,9 @@ func validateOrchestratePolicy(policy OrchestratePolicy) error {
 	case CockpitPaneKeyJob, CockpitPaneKeySeat:
 	default:
 		return fmt.Errorf("unsupported orchestrate.cockpit_pane_key %q; use job or seat", policy.CockpitPaneKey)
+	}
+	if policy.MaxDelegationTokenBudget < 0 {
+		return fmt.Errorf("orchestrate.max_delegation_token_budget must be 0 (unlimited) or positive")
 	}
 	return nil
 }

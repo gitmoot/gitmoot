@@ -45,7 +45,7 @@ func (a KimiAdapter) Start(ctx context.Context, request StartRequest) (StartResu
 	if err != nil {
 		return StartResult{Raw: result.Stdout + result.Stderr}, kimiCommandError(result, err)
 	}
-	content, sessionID, parseErr := parseKimiStreamJSON(result.Stdout)
+	content, sessionID, _, parseErr := parseKimiStreamJSON(result.Stdout)
 	if parseErr != nil {
 		return StartResult{Raw: result.Stdout}, fmt.Errorf("parse kimi stream-json output: %w", parseErr)
 	}
@@ -79,11 +79,11 @@ func (a KimiAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result,
 	if err != nil {
 		return Result{Raw: result.Stdout + result.Stderr}, kimiCommandError(result, err)
 	}
-	content, _, parseErr := parseKimiStreamJSON(result.Stdout)
+	content, _, usage, parseErr := parseKimiStreamJSON(result.Stdout)
 	if parseErr != nil {
 		return Result{Raw: result.Stdout}, fmt.Errorf("parse kimi stream-json output: %w", parseErr)
 	}
-	return Result{Raw: content, Summary: strings.TrimSpace(content)}, nil
+	return Result{Raw: content, Summary: strings.TrimSpace(content), InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens}, nil
 }
 
 func (a KimiAdapter) Health(ctx context.Context, agent Agent) error {
@@ -126,16 +126,32 @@ type kimiStreamEvent struct {
 	Type      string `json:"type"`
 	Content   string `json:"content"`
 	SessionID string `json:"session_id"`
+	// Usage carries best-effort token counts when Kimi's stream emits a usage or
+	// result event (#338 Part B). The field set mirrors the common LLM-CLI shape
+	// (input_tokens/output_tokens). It is nil/zero on events that carry no usage,
+	// so a runtime that never reports usage simply contributes 0 to the budget.
+	Usage *kimiUsage `json:"usage"`
+}
+
+// kimiUsage holds the best-effort token counts extracted from a Kimi stream-json
+// usage/result event. Counts default to 0 when the stream omits usage.
+type kimiUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
 }
 
 // parseKimiStreamJSON reads Kimi's --output-format stream-json JSONL output and
-// returns the concatenated assistant content plus the session id from the resume
-// hint meta event, if present.
-func parseKimiStreamJSON(output string) (string, string, error) {
+// returns the concatenated assistant content, the session id from the resume hint
+// meta event (if present), and the best-effort token usage from the last event
+// that carried a usage object (if any). Usage capture is best-effort: when no
+// event reports usage the returned kimiUsage is zero-valued and the job
+// contributes 0 to the per-root token budget.
+func parseKimiStreamJSON(output string) (string, string, kimiUsage, error) {
 	scanner := bufio.NewScanner(strings.NewReader(output))
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	var contentParts []string
 	var sessionID string
+	var usage kimiUsage
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -144,6 +160,9 @@ func parseKimiStreamJSON(output string) (string, string, error) {
 		var event kimiStreamEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
 			continue
+		}
+		if event.Usage != nil {
+			usage = *event.Usage
 		}
 		switch event.Role {
 		case "assistant":
@@ -155,9 +174,9 @@ func parseKimiStreamJSON(output string) (string, string, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return "", "", err
+		return "", "", kimiUsage{}, err
 	}
-	return strings.Join(contentParts, ""), sessionID, nil
+	return strings.Join(contentParts, ""), sessionID, usage, nil
 }
 
 func isKimiSessionID(ref string) bool {

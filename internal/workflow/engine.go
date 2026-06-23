@@ -56,6 +56,19 @@ type Engine struct {
 	// defaultMaxInlineArtifactBytes. The total inlined across all children in one
 	// continuation is additionally bounded by maxInlineArtifactTotalBytes.
 	MaxInlineArtifactBytes int
+	// MaxDelegationTokenBudget is the cumulative per-root token budget (input +
+	// output, summed across a coordination tree) that bounds a delegation tree by
+	// cost in addition to depth/width/total-jobs/wall-clock (#338 Part B). When a
+	// coordinator is about to dispatch a new generation and the tree has already
+	// used at least this many tokens, dispatchDelegations refuses further fan-out
+	// and routes to the #305 finalize continuation (delegation_cost_exceeded).
+	// 0 (the default) means unlimited: the check is skipped entirely so default
+	// behavior is byte-identical to before this knob existed. It is sourced from
+	// the host [orchestrate].max_delegation_token_budget config at daemon startup.
+	// NOTE: token capture is best-effort per runtime (see internal/runtime); a
+	// runtime that does not report usage contributes 0 to the sum, so the budget
+	// under-counts that runtime rather than failing.
+	MaxDelegationTokenBudget int
 }
 
 // now returns the engine's current time, defaulting to time.Now when Now is unset.
@@ -765,6 +778,37 @@ func (e Engine) countRootDelegationJobs(ctx context.Context, rootID string) (int
 	return count, nil
 }
 
+// sumRootDelegationTokens sums the runtime token usage (input + output) across an
+// entire coordination tree: the originating coordinator itself (job.ID == rootID)
+// plus every child or continuation whose payload RootJobID points back at it. It
+// mirrors countRootDelegationJobs (there is no store query keyed on root, so it
+// lists all jobs and filters). Used by the per-root token budget (#338 Part B) to
+// decide, before dispatching a new generation, whether the tree has already spent
+// its budget. Token capture is best-effort per runtime (see internal/runtime); a
+// job whose runtime did not report usage contributes 0, so the sum under-counts
+// rather than over-counts.
+func (e Engine) sumRootDelegationTokens(ctx context.Context, rootID string) (int, error) {
+	jobs, err := e.Store.ListJobs(ctx)
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for _, job := range jobs {
+		if job.ID == rootID {
+			total += job.InputTokens + job.OutputTokens
+			continue
+		}
+		payload, err := unmarshalPayload(job.Payload)
+		if err != nil {
+			return 0, err
+		}
+		if payload.RootJobID == rootID {
+			total += job.InputTokens + job.OutputTokens
+		}
+	}
+	return total, nil
+}
+
 func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) error {
 	if payload.Result == nil || len(payload.Result.Delegations) == 0 {
 		return nil
@@ -841,6 +885,26 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 			Message: fmt.Sprintf("delegation tree for root %s ran %s, exceeding the wall-clock limit of %s; not dispatching %d delegation(s)", rootID, elapsed.Round(time.Second), MaxDelegationWallClock, len(payload.Result.Delegations)),
 		})
 		return e.enqueueFinalizeContinuation(ctx, job, payload, fmt.Sprintf("wall-clock limit of %s reached", MaxDelegationWallClock))
+	}
+
+	// Per-root token budget (#338 Part B). Where the depth/total-jobs/wall-clock
+	// backstops bound the shape and duration of a tree, this bounds its cost: a
+	// coordination tree that has already used at least MaxDelegationTokenBudget
+	// tokens (input + output, summed across the whole tree) is refused further
+	// fan-out and routed to the #305 finalize continuation. It is opt-in: when the
+	// budget is 0 (the default) the check is skipped entirely, so default behavior
+	// is byte-identical. The sum fails open — a lookup/parse hiccup yields 0 and
+	// does not block dispatch — and is best-effort per runtime (a runtime that
+	// reports no usage contributes 0, so the budget under-counts that runtime).
+	if e.MaxDelegationTokenBudget > 0 {
+		if used, _ := e.sumRootDelegationTokens(ctx, rootID); used >= e.MaxDelegationTokenBudget {
+			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+				JobID:   job.ID,
+				Kind:    "delegation_cost_exceeded",
+				Message: fmt.Sprintf("delegation tree %s reached token budget %d (used %d); not dispatching %d delegation(s)", rootID, e.MaxDelegationTokenBudget, used, len(payload.Result.Delegations)),
+			})
+			return e.enqueueFinalizeContinuation(ctx, job, payload, fmt.Sprintf("token budget %d reached", e.MaxDelegationTokenBudget))
+		}
 	}
 
 	if width := len(payload.Result.Delegations); width > MaxDelegationWidth {

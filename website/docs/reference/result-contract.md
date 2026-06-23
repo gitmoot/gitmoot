@@ -258,6 +258,16 @@ trips, the offending delegations are dropped rather than dispatched.
   `delegation_walltime_exceeded` event. This bounds an expensive-but-not-numerous
   tree (slow agents, long per-job work) that the depth/job-count caps miss. It is
   a generous runaway backstop, not a tight deadline.
+- **Per-root token budget / cost (`[orchestrate].max_delegation_token_budget`, off
+  by default — `0` = unlimited)**: when set to a positive value, the whole
+  delegation tree under one root is bounded by cumulative token usage (input +
+  output, summed across every job in the tree). A coordinator that tries to fan
+  out after the tree has already used at least the budget is refused with a
+  `delegation_cost_exceeded` event and routed through the graceful finalize
+  continuation. Token capture is **best-effort per runtime** (see the table
+  below), so the budget can under-count a runtime that does not report usage — it
+  never over-counts. Leaving the knob at `0` skips the check entirely (behavior is
+  byte-identical to before the knob existed).
 - **Per-coordinator width (`MaxDelegationWidth = 16`)**: a single coordinator
   result may request at most this many delegations in one generation; a wider set
   is refused with a `delegation_width_exceeded` event and routed through the same
@@ -280,6 +290,24 @@ further and asked to synthesize a best-effort final result and return empty
 delegations. That continuation is terminal — any delegations it returns are
 ignored (`delegation_finalized`). Work is bounded and always ends with a clean
 synthesis, not a silent dead end.
+
+### Token-capture status (per runtime)
+
+The per-root **token budget** sums whatever usage each job's runtime reports at
+delivery time. Capture is best-effort and uneven across runtimes; a job whose
+runtime reports no usage contributes `0`, so the budget **under-counts** rather
+than failing:
+
+| Runtime | Reports token usage? | How |
+| --- | --- | --- |
+| **Claude Code** | Yes | Parsed from `usage.{input,output}_tokens` of the `--output-format json` envelope. |
+| **Kimi Code** | Best-effort | Captured if the `--output-format stream-json` stream emits a `usage` object; otherwise `0`. |
+| **Codex** | No (contributes `0`) | Delivery runs `codex exec resume … -- <prompt>` without `--json` (plain text), so no machine-readable usage is exposed. |
+
+Because of this, a tree made up mostly of Codex jobs accumulates little or no
+counted usage — set the budget accordingly and treat it as a coarse runaway-cost
+backstop, not a precise spend limit. A `$`-denominated price table is not
+implemented yet; the budget is in raw tokens.
 
 For the in-repo source of truth, see
 [`skills/gitmoot/references/RESULT_CONTRACT.md`](https://github.com/jerryfane/gitmoot/blob/main/skills/gitmoot/references/RESULT_CONTRACT.md)

@@ -57,6 +57,15 @@ type Result struct {
 	Decision string
 	Summary  string
 	Raw      string
+	// InputTokens and OutputTokens are best-effort runtime token usage captured
+	// from the CLI's structured output where it exposes one (#338 Part B). They
+	// default to 0. Per-runtime status today: claude reports usage via its
+	// --output-format json envelope; kimi reports usage if its stream-json emits a
+	// usage/result event; codex Deliver runs without --json (plain text) so it
+	// contributes 0. A 0 here means "not captured", and the per-root delegation
+	// token budget simply under-counts that job rather than failing.
+	InputTokens  int
+	OutputTokens int
 }
 
 type StartRequest struct {
@@ -356,15 +365,42 @@ func (a ClaudeAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Resul
 		return Result{Raw: result.Stdout + result.Stderr}, claudeCommandError(result, err)
 	}
 	parsed := Result{Raw: result.Stdout}
-	var payload struct {
-		Result string `json:"result"`
-	}
-	if json.Unmarshal([]byte(result.Stdout), &payload) == nil && payload.Result != "" {
-		parsed.Summary = payload.Result
+	summary, inTok, outTok := parseClaudeJSONResult(result.Stdout)
+	if summary != "" {
+		parsed.Summary = summary
 	} else {
 		parsed.Summary = strings.TrimSpace(result.Stdout)
 	}
+	parsed.InputTokens = inTok
+	parsed.OutputTokens = outTok
 	return parsed, nil
+}
+
+// claudeJSONResult mirrors the relevant fields of the Claude Code
+// --output-format json result envelope. The CLI emits a single JSON object whose
+// "result" holds the assistant's final text and whose "usage" object carries the
+// token counts. We read only what the budget and summary need and ignore the rest
+// (cost, session id, tool stats, …) so unrelated schema additions are harmless.
+type claudeJSONResult struct {
+	Result string `json:"result"`
+	Usage  struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage"`
+}
+
+// parseClaudeJSONResult extracts the assistant summary and best-effort token
+// usage from a Claude Code --output-format json envelope. It returns ("", 0, 0)
+// when stdout is not the JSON envelope (e.g. the --output-format json fallback to
+// plain text), so the caller can fall back to the raw text and contribute 0 to
+// the token budget. Usage capture is best-effort: a missing "usage" object leaves
+// the counts at 0 rather than erroring.
+func parseClaudeJSONResult(stdout string) (summary string, inputTokens int, outputTokens int) {
+	var payload claudeJSONResult
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		return "", 0, 0
+	}
+	return payload.Result, payload.Usage.InputTokens, payload.Usage.OutputTokens
 }
 
 func (a ClaudeAdapter) Health(ctx context.Context, agent Agent) error {

@@ -35,6 +35,48 @@ func TestLoadOrchestratePolicyDefaults(t *testing.T) {
 	if policy.InlineArtifactMaxBytes != 0 {
 		t.Fatalf("InlineArtifactMaxBytes = %d, want 0 by default", policy.InlineArtifactMaxBytes)
 	}
+	if policy.MaxDelegationTokenBudget != 0 {
+		t.Fatalf("MaxDelegationTokenBudget = %d, want 0 (unlimited) by default", policy.MaxDelegationTokenBudget)
+	}
+}
+
+// TestLoadOrchestratePolicyMaxDelegationTokenBudget pins #338 Part B: the token
+// budget parses from [orchestrate] and an absent key keeps the 0 (unlimited)
+// default.
+func TestLoadOrchestratePolicyMaxDelegationTokenBudget(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[orchestrate]
+max_delegation_token_budget = 500000
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+
+	policy, err := LoadOrchestratePolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadOrchestratePolicy returned error: %v", err)
+	}
+	if policy.MaxDelegationTokenBudget != 500000 {
+		t.Fatalf("MaxDelegationTokenBudget = %d, want 500000", policy.MaxDelegationTokenBudget)
+	}
+
+	// Absent key keeps the unlimited default even with the section present.
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[orchestrate]
+cockpit_mode = "auto"
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	policy, err = LoadOrchestratePolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadOrchestratePolicy returned error: %v", err)
+	}
+	if policy.MaxDelegationTokenBudget != 0 {
+		t.Fatalf("absent max_delegation_token_budget should default 0, got %d", policy.MaxDelegationTokenBudget)
+	}
 }
 
 // TestLoadOrchestratePolicyInlineArtifactKeys pins #368: both inline-artifact keys
@@ -133,6 +175,22 @@ cockpit_max_panes = 0
 cockpit_pane_key = "row"
 `,
 			wantErr: "unsupported orchestrate.cockpit_pane_key",
+		},
+		{
+			name: "max_delegation_token_budget_non_int",
+			body: `
+[orchestrate]
+max_delegation_token_budget = lots
+`,
+			wantErr: "parse [orchestrate].max_delegation_token_budget",
+		},
+		{
+			name: "max_delegation_token_budget_negative",
+			body: `
+[orchestrate]
+max_delegation_token_budget = -1
+`,
+			wantErr: "max_delegation_token_budget must be 0 (unlimited) or positive",
 		},
 	}
 	for _, tt := range tests {

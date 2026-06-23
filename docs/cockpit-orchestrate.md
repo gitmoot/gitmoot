@@ -75,6 +75,7 @@ cockpit_max_panes = 4      # cap on simultaneous panes per run
 cockpit_pane_key = "job"   # job (one pane per job) | seat (reuse a pane per role)
 inline_artifact_bodies = false   # inline each child's artifact_body into the coordinator continuation
 inline_artifact_max_bytes = 32768  # per-body cap (bytes) when inlining is on
+max_delegation_token_budget = 0  # per-root delegation token budget (input+output); 0 = unlimited (off)
 ```
 
 - `cockpit_mode = "off"` disables the cockpit even if `--cockpit` was passed;
@@ -93,6 +94,19 @@ inline_artifact_max_bytes = 32768  # per-body cap (bytes) when inlining is on
   many bytes of each child's body are inlined; longer bodies are rune-safe
   truncated with a marker pointing at the full on-disk brief. A per-continuation
   aggregate cap also bounds the total inlined across all children.
+- `max_delegation_token_budget` (default `0` = unlimited/off) bounds a delegation
+  tree by **cost** in addition to depth/width/total-jobs/wall-clock. When set to a
+  positive value, the whole tree under one root is capped at that many cumulative
+  tokens (input + output, summed across every job in the tree). A coordinator that
+  tries to fan out after the tree has already used at least the budget is refused
+  with a `delegation_cost_exceeded` event and routed to the graceful finalize
+  continuation (synthesize what completed, then stop). Token capture is
+  **best-effort per runtime**: Claude reports usage via its `--output-format json`
+  envelope, Kimi reports it when its stream emits a `usage` object, and Codex runs
+  delivery without `--json` so it contributes `0` (the budget under-counts Codex
+  rather than failing). Treat it as a coarse runaway-cost backstop, not a precise
+  spend limit; the budget is in raw tokens (no `$` price table yet). Leaving it at
+  `0` is byte-identical to before the knob existed.
 
 ## Constrained hosts
 
