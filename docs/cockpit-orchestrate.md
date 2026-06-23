@@ -76,6 +76,7 @@ cockpit_pane_key = "job"   # job (one pane per job) | seat (reuse a pane per rol
 inline_artifact_bodies = false   # inline each child's artifact_body into the coordinator continuation
 inline_artifact_max_bytes = 32768  # per-body cap (bytes) when inlining is on
 max_delegation_token_budget = 0  # per-root delegation token budget (input+output); 0 = unlimited (off)
+max_delegation_cost_usd = 0      # per-root delegation dollar-cost budget (USD); 0 = unlimited (off)
 ```
 
 - `cockpit_mode = "off"` disables the cockpit even if `--cockpit` was passed;
@@ -105,8 +106,22 @@ max_delegation_token_budget = 0  # per-root delegation token budget (input+outpu
   envelope, Kimi reports it when its stream emits a `usage` object, and Codex runs
   delivery without `--json` so it contributes `0` (the budget under-counts Codex
   rather than failing). Treat it as a coarse runaway-cost backstop, not a precise
-  spend limit; the budget is in raw tokens (no `$` price table yet). Leaving it at
-  `0` is byte-identical to before the knob existed.
+  spend limit; the budget is in raw tokens. Leaving it at `0` is byte-identical to
+  before the knob existed.
+- `max_delegation_cost_usd` (default `0` = unlimited/off) is the **dollar-cost**
+  analogue of the token budget (#380): it bounds the same tree by its *measured
+  spend* rather than raw token count. Cost is derived from the same per-job token
+  usage the token budget already sums, priced through a small built-in per-model
+  price table (per-1M-token list prices — Haiku `0.25/1.25`, Sonnet `3/15`, Opus
+  `15/75` input/output USD — matched by substring against each job's model id;
+  an empty or unrecognized model id is priced at the mid-tier Sonnet default so it
+  is never free). When the tree's accumulated cost reaches the budget, the next
+  fan-out is refused with a `delegation_cost_usd_exceeded` event and routed to the
+  same graceful finalize continuation (synthesize what completed, then stop) — it
+  is **never hard-killed**. Because cost rides on the same best-effort token
+  capture and a hardcoded price table, it is a coarse runaway-cost backstop, not a
+  precise spend meter. Leaving it at `0` is byte-identical to before the knob
+  existed.
 
 ## Constrained hosts
 

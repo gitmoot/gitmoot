@@ -176,6 +176,16 @@ Delegation trees are bounded so they cannot run forever:
   below — so the budget can under-count a runtime that does not report usage; it
   never over-counts. Leaving the knob at `0` skips the check entirely (behavior is
   byte-identical to before the knob existed).
+- Per-root **dollar-cost** budget (#380): `[orchestrate].max_delegation_cost_usd`,
+  **off by default** (`0` = unlimited). The cost analogue of the token budget: it
+  bounds the same tree by *measured spend*, derived from the same per-job token
+  usage priced through a built-in per-model price table (Haiku/Sonnet/Opus list
+  prices matched by substring; unknown/empty models priced at the mid-tier Sonnet
+  default so they are never free). When the tree's accumulated cost reaches the
+  budget, the next fan-out is refused with a `delegation_cost_usd_exceeded` event
+  and routes through the finalize continuation — never hard-killed. Coarse
+  runaway-cost backstop, not a precise spend meter; leaving the knob at `0` is
+  byte-identical to before the knob existed.
 - Per-coordinator width: `MaxDelegationWidth = 16`. A single coordinator result
   may not fan out more than this many delegations in one generation; an over-wide
   set is refused with a `delegation_width_exceeded` event and routes through the

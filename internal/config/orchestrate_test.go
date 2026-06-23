@@ -38,6 +38,48 @@ func TestLoadOrchestratePolicyDefaults(t *testing.T) {
 	if policy.MaxDelegationTokenBudget != 0 {
 		t.Fatalf("MaxDelegationTokenBudget = %d, want 0 (unlimited) by default", policy.MaxDelegationTokenBudget)
 	}
+	if policy.MaxDelegationCostUSD != 0 {
+		t.Fatalf("MaxDelegationCostUSD = %v, want 0 (unlimited) by default", policy.MaxDelegationCostUSD)
+	}
+}
+
+// TestLoadOrchestratePolicyMaxDelegationCostUSD pins #380: the dollar-cost budget
+// parses from [orchestrate] and an absent key keeps the 0 (unlimited) default,
+// mirroring the token-budget test above.
+func TestLoadOrchestratePolicyMaxDelegationCostUSD(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[orchestrate]
+max_delegation_cost_usd = 2.50
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+
+	policy, err := LoadOrchestratePolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadOrchestratePolicy returned error: %v", err)
+	}
+	if policy.MaxDelegationCostUSD != 2.50 {
+		t.Fatalf("MaxDelegationCostUSD = %v, want 2.50", policy.MaxDelegationCostUSD)
+	}
+
+	// Absent key keeps the unlimited default even with the section present.
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[orchestrate]
+cockpit_mode = "auto"
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	policy, err = LoadOrchestratePolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadOrchestratePolicy returned error: %v", err)
+	}
+	if policy.MaxDelegationCostUSD != 0 {
+		t.Fatalf("absent max_delegation_cost_usd should default 0, got %v", policy.MaxDelegationCostUSD)
+	}
 }
 
 // TestLoadOrchestratePolicyMaxDelegationTokenBudget pins #338 Part B: the token
@@ -191,6 +233,22 @@ max_delegation_token_budget = lots
 max_delegation_token_budget = -1
 `,
 			wantErr: "max_delegation_token_budget must be 0 (unlimited) or positive",
+		},
+		{
+			name: "max_delegation_cost_usd_non_float",
+			body: `
+[orchestrate]
+max_delegation_cost_usd = cheap
+`,
+			wantErr: "parse [orchestrate].max_delegation_cost_usd",
+		},
+		{
+			name: "max_delegation_cost_usd_negative",
+			body: `
+[orchestrate]
+max_delegation_cost_usd = -0.5
+`,
+			wantErr: "max_delegation_cost_usd must be 0 (unlimited) or positive",
 		},
 	}
 	for _, tt := range tests {

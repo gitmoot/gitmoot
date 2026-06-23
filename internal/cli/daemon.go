@@ -3311,10 +3311,10 @@ func (w jobWorker) defaultWorkflow(checkout string) workflow.Engine {
 }
 
 // applyOrchestratePolicy sets the engine's opt-in [orchestrate] fields — the
-// artifact-body inlining knobs and the per-root delegation token budget (#338
-// Part B) — from the host policy. It is fail-safe: any load error leaves the
-// engine with its defaults (inlining off, token budget 0 = unlimited) rather than
-// failing engine construction.
+// artifact-body inlining knobs and the per-root delegation token (#338 Part B)
+// and dollar-cost (#380) budgets — from the host policy. It is fail-safe: any
+// load error leaves the engine with its defaults (inlining off, both budgets 0 =
+// unlimited) rather than failing engine construction.
 func (w jobWorker) applyOrchestratePolicy(engine *workflow.Engine) {
 	policy, err := w.orchestratePolicy()
 	if err != nil {
@@ -3323,6 +3323,7 @@ func (w jobWorker) applyOrchestratePolicy(engine *workflow.Engine) {
 	engine.InlineArtifactBodies = policy.InlineArtifactBodies
 	engine.MaxInlineArtifactBytes = policy.InlineArtifactMaxBytes
 	engine.MaxDelegationTokenBudget = policy.MaxDelegationTokenBudget
+	engine.MaxDelegationCostUSD = policy.MaxDelegationCostUSD
 }
 
 // workflowHome resolves the GITMOOT_HOME root used to place per-delegation

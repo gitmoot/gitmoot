@@ -69,6 +69,21 @@ type Engine struct {
 	// runtime that does not report usage contributes 0 to the sum, so the budget
 	// under-counts that runtime rather than failing.
 	MaxDelegationTokenBudget int
+	// MaxDelegationCostUSD is the cumulative per-root dollar-cost budget that bounds
+	// a delegation tree by its measured spend, layered on top of the token budget
+	// (#380). Cost is derived from the same per-job token usage the token budget
+	// already sums, priced through a small per-model price table (see cost.go):
+	// cost = Σ (input × input_price + output × output_price) over every job in the
+	// tree. When a coordinator is about to dispatch a new generation and the tree
+	// has already spent at least this many dollars, dispatchDelegations refuses
+	// further fan-out and routes to the #305 finalize continuation
+	// (delegation_cost_usd_exceeded). 0 (the default) means unlimited: the check is
+	// skipped entirely so default behavior is byte-identical to before this knob
+	// existed. It is sourced from the host [orchestrate].max_delegation_cost_usd
+	// config at daemon startup. Because cost is derived from best-effort token
+	// capture and a hardcoded price table, treat it as a coarse runaway-cost
+	// backstop, not a precise spend meter.
+	MaxDelegationCostUSD float64
 }
 
 // now returns the engine's current time, defaulting to time.Now when Now is unset.
@@ -933,6 +948,27 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 				Message: fmt.Sprintf("delegation tree %s reached token budget %d (used %d); not dispatching %d delegation(s)", rootID, e.MaxDelegationTokenBudget, used, len(payload.Result.Delegations)),
 			})
 			return e.enqueueFinalizeContinuation(ctx, job, payload, fmt.Sprintf("token budget %d reached", e.MaxDelegationTokenBudget))
+		}
+	}
+
+	// Per-root dollar-cost budget (#380). This is the cost analogue of the token
+	// budget above: where the token budget bounds raw token count, this bounds the
+	// measured spend derived from those same tokens × a per-model price table (see
+	// cost.go). A tree that has already spent at least MaxDelegationCostUSD dollars
+	// is refused further fan-out and routed to the same #305 finalize continuation,
+	// exactly like every backstop above — never hard-killed. It is opt-in: when the
+	// budget is 0 (the default) the check is skipped entirely, so default behavior
+	// is byte-identical. The sum fails open (a lookup/parse hiccup yields 0 and does
+	// not block dispatch) and is best-effort per runtime: a runtime that reports no
+	// usage contributes $0, so the budget under-counts that runtime.
+	if e.MaxDelegationCostUSD > 0 {
+		if spent, _ := e.sumRootDelegationCost(ctx, rootID); spent >= e.MaxDelegationCostUSD {
+			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+				JobID:   job.ID,
+				Kind:    "delegation_cost_usd_exceeded",
+				Message: fmt.Sprintf("delegation tree %s reached cost budget $%.4f (spent $%.4f); not dispatching %d delegation(s)", rootID, e.MaxDelegationCostUSD, spent, len(payload.Result.Delegations)),
+			})
+			return e.enqueueFinalizeContinuation(ctx, job, payload, fmt.Sprintf("cost budget $%.4f reached", e.MaxDelegationCostUSD))
 		}
 	}
 

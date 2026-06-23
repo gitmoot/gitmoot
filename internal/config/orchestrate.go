@@ -44,6 +44,12 @@ type OrchestratePolicy struct {
 	// means unlimited/off, so default behavior is unchanged. The daemon wires this
 	// into Engine.MaxDelegationTokenBudget at startup.
 	MaxDelegationTokenBudget int
+	// MaxDelegationCostUSD is the cumulative per-root dollar-cost budget that bounds
+	// a delegation tree by its measured spend (token usage × a per-model price
+	// table), layered on top of the token budget (#380). 0 (the default) means
+	// unlimited/off, so default behavior is unchanged. The daemon wires this into
+	// Engine.MaxDelegationCostUSD at startup.
+	MaxDelegationCostUSD float64
 }
 
 func DefaultOrchestratePolicy() OrchestratePolicy {
@@ -55,6 +61,7 @@ func DefaultOrchestratePolicy() OrchestratePolicy {
 		InlineArtifactBodies:     false,
 		InlineArtifactMaxBytes:   0,
 		MaxDelegationTokenBudget: 0,
+		MaxDelegationCostUSD:     0,
 	}
 }
 
@@ -122,6 +129,10 @@ func applyOrchestratePolicyField(policy *OrchestratePolicy, key string, value st
 		parsed, err := strconv.Atoi(value)
 		policy.MaxDelegationTokenBudget = parsed
 		return err
+	case "max_delegation_cost_usd":
+		parsed, err := strconv.ParseFloat(value, 64)
+		policy.MaxDelegationCostUSD = parsed
+		return err
 	default:
 		return nil
 	}
@@ -143,6 +154,9 @@ func validateOrchestratePolicy(policy OrchestratePolicy) error {
 	}
 	if policy.MaxDelegationTokenBudget < 0 {
 		return fmt.Errorf("orchestrate.max_delegation_token_budget must be 0 (unlimited) or positive")
+	}
+	if policy.MaxDelegationCostUSD < 0 {
+		return fmt.Errorf("orchestrate.max_delegation_cost_usd must be 0 (unlimited) or positive")
 	}
 	return nil
 }

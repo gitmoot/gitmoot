@@ -70,6 +70,15 @@ cannot recurse or fan out forever:
   reports it if its stream emits it; Codex `Deliver` runs without `--json` and so
   contributes `0`), so the budget can under-count but never over-counts. Leaving
   the knob at `0` skips the check entirely.
+- Per-root **dollar-cost** budget `[orchestrate].max_delegation_cost_usd`,
+  **off by default** (`0` = unlimited): the cost analogue of the token budget
+  (#380). It bounds the same tree by *measured spend* — the same per-job token
+  usage priced through a built-in per-model price table (Haiku/Sonnet/Opus list
+  prices, matched by substring; unknown models priced at the mid-tier Sonnet
+  default so they are never free). When the tree's accumulated cost reaches the
+  budget, the next fan-out is refused with a `delegation_cost_usd_exceeded` event
+  and routed to the finalize continuation — never hard-killed. Coarse backstop,
+  not a precise spend meter; leaving the knob at `0` skips the check entirely.
 - Per-coordinator width `MaxDelegationWidth = 16`: a single coordinator result
   may not fan out more than this many delegations in one generation; an over-wide
   set is refused with a `delegation_width_exceeded` event.
