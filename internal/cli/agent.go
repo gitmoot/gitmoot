@@ -454,6 +454,13 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 		}
 		output.DaemonRunning = running
 	}
+	// The job + delivery succeeded terminally; only a benign post-success
+	// advance step errored (e.g. a merge-gate block on the freshly-opened PR, or
+	// a 422 "PR already exists" race). Per clig.dev, the result still goes to
+	// stdout with exit 0; the advance warning goes to stderr.
+	if output.AdvanceError != "" {
+		fmt.Fprintf(stderr, "%s: advance warning: %s\n", errLabel, output.AdvanceError)
+	}
 	return output, 0
 }
 

@@ -5687,6 +5687,17 @@ implement-advance and the daemon's GitHub PR-watcher — so a PR opened either w
 stays free of native review fan-out. The flag defaults off; leave it off for the
 full native review fan-out, which is byte-identical to prior behavior.
 
+When a synchronous `agent implement`/`run`/`ask`/`review`/`orchestrate` job
+delivers and **succeeds terminally** but a benign *post-success* advancement step
+errors — for example a merge-gate block on the freshly-opened PR, or a 422
+"a pull request already exists" race — the command no longer discards the result.
+It **exits 0** with the agent result on stdout (in JSON mode this includes an
+additive `advance_error` field carrying the advance warning, omitted when there
+is none), prints `advance warning: …` to stderr, and shows an `advance_error:`
+line in human output. Genuine non-terminal failures (the job did not reach
+`succeeded`) still exit non-zero as before. A normal success with no advance error
+is byte-identical to prior behavior — no `advance_error` field is emitted.
+
 Start an orchestra of agents with `gitmoot orchestrate`:
 
 ```sh

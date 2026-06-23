@@ -130,6 +130,27 @@ func (e BlockedError) Error() string {
 	return "workflow blocked: " + e.Reason
 }
 
+// AdvanceError wraps an error that occurred while advancing a job *after* the
+// agent delivery + job already succeeded terminally. RunJob returns the
+// agent's result alongside it, so callers can distinguish a benign
+// post-success advance condition (e.g. a merge-gate block on a freshly-opened
+// PR, or a 422 "PR already exists" race) from a genuine delivery/run failure
+// and surface the persisted terminal-success result instead of discarding it.
+type AdvanceError struct {
+	Err error
+}
+
+func (e AdvanceError) Error() string {
+	if e.Err == nil {
+		return "workflow advance failed"
+	}
+	return "workflow advance failed: " + e.Err.Error()
+}
+
+func (e AdvanceError) Unwrap() error {
+	return e.Err
+}
+
 func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEvent) error {
 	if err := e.validate(); err != nil {
 		return err
@@ -262,7 +283,11 @@ func (e Engine) RunJob(ctx context.Context, jobID string, agent runtime.Agent, a
 		}
 	}
 	if err := e.AdvanceJob(ctx, jobID); err != nil {
-		return result, err
+		// The agent delivery and the job itself already succeeded; only this
+		// post-success advance step errored. Wrap it so callers can recover the
+		// persisted terminal-success result (the result is in hand) instead of
+		// discarding it. Delivery/run failures above stay raw.
+		return result, AdvanceError{Err: err}
 	}
 	if err := e.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_completed", Message: "workflow advancement completed"}); err != nil {
 		return result, err

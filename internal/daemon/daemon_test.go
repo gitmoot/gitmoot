@@ -2151,6 +2151,14 @@ func (f *fakeGitHub) CreatePullRequest(context.Context, github.CreatePullRequest
 	return github.PullRequest{}, errors.New("not implemented")
 }
 
+func (f *fakeGitHub) GetOpenPullRequestByHead(context.Context, github.Repository, string) (github.PullRequest, bool, error) {
+	return github.PullRequest{}, false, errors.New("not implemented")
+}
+
+func (f *fakeGitHub) EnsurePullRequest(context.Context, github.CreatePullRequestInput) (github.PullRequest, error) {
+	return github.PullRequest{}, errors.New("not implemented")
+}
+
 func (f *fakeGitHub) CreateIssue(context.Context, github.CreateIssueInput) (github.Issue, error) {
 	return github.Issue{}, errors.New("not implemented")
 }

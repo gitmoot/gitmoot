@@ -987,6 +987,97 @@ func TestEngineRunJobAdvancesCompletedResult(t *testing.T) {
 	mustJob(t, store, "review-audit-task-7-review-1")
 }
 
+// A benign post-success advance condition (here: a merge-gate block on the
+// freshly-"opened" PR) makes AdvanceJob return after the agent delivery + job
+// already succeeded terminally. RunJob must wrap that error in AdvanceError
+// (so callers can recover the persisted result) while still returning the
+// result; the job stays JobSucceeded.
+func TestEngineRunJobWrapsPostSuccessAdvanceError(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+	// A pending (not-ready) merge gate blocks the no-reviewers tail -> AdvanceJob
+	// returns a BlockedError AFTER the result is stored.
+	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{Reason: "ci is pending"}}
+	agent := runtime.Agent{Name: "lead", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "jerryfane/gitmoot", Role: "lead"}
+	adapter := &fakeDelivery{outputs: []string{
+		`{"gitmoot_result":{"decision":"implemented","summary":"opened PR","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+	}}
+	if _, err := (Mailbox{Store: store}).Enqueue(ctx, JobRequest{
+		ID:          "implement-job",
+		Agent:       "lead",
+		Action:      "implement",
+		Repo:        "jerryfane/gitmoot",
+		Branch:      "task-7",
+		PullRequest: 7,
+		HeadSHA:     "head123",
+		TaskID:      "task-7",
+		TaskTitle:   "Workflow Engine",
+		LeadAgent:   "lead",
+	}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+
+	result, err := engine.RunJob(ctx, "implement-job", agent, adapter)
+
+	var advErr AdvanceError
+	if !errors.As(err, &advErr) {
+		t.Fatalf("RunJob error = %v, want AdvanceError", err)
+	}
+	// The wrapped cause is still reachable; the result is in hand.
+	var blocked BlockedError
+	if !errors.As(advErr, &blocked) || blocked.Reason != "ci is pending" {
+		t.Fatalf("AdvanceError did not wrap the merge-gate BlockedError: %v", advErr)
+	}
+	if result.Decision != "implemented" || result.Summary != "opened PR" {
+		t.Fatalf("result = %+v, want the delivered implemented result", result)
+	}
+	// The job is terminally succeeded despite the post-success advance error.
+	job := mustJob(t, store, "implement-job")
+	if job.State != string(JobSucceeded) {
+		t.Fatalf("job state = %q, want succeeded", job.State)
+	}
+}
+
+// A delivery/run failure (here: a non-existent runtime command) errors BEFORE
+// AdvanceJob, so RunJob must return that error raw, NOT wrapped in AdvanceError,
+// and the job must not be JobSucceeded.
+func TestEngineRunJobDeliveryFailureStaysRaw(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+	agent := runtime.Agent{Name: "lead", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "jerryfane/gitmoot", Role: "lead"}
+	// A delivery error before the result is stored.
+	adapter := &fakeDelivery{err: errors.New("runtime exploded")}
+	if _, err := (Mailbox{Store: store}).Enqueue(ctx, JobRequest{
+		ID:        "implement-job",
+		Agent:     "lead",
+		Action:    "implement",
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-7",
+		TaskID:    "task-7",
+		LeadAgent: "lead",
+	}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+
+	_, err := engine.RunJob(ctx, "implement-job", agent, adapter)
+
+	if err == nil {
+		t.Fatal("RunJob returned nil error, want delivery failure")
+	}
+	var advErr AdvanceError
+	if errors.As(err, &advErr) {
+		t.Fatalf("delivery failure wrapped as AdvanceError: %v", err)
+	}
+	job := mustJob(t, store, "implement-job")
+	if job.State == string(JobSucceeded) {
+		t.Fatalf("job state = %q, want non-succeeded after delivery failure", job.State)
+	}
+}
+
 func TestEngineRunJobAllowsDelegatedImplementWithOriginalBranchLock(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

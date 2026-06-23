@@ -27,7 +27,9 @@ type Client interface {
 	ListUserRepositories(ctx context.Context, limit int) ([]RepoSummary, error)
 	ListPullRequests(ctx context.Context, repo Repository, state string) ([]PullRequest, error)
 	GetPullRequest(ctx context.Context, repo Repository, number int64) (PullRequest, error)
+	GetOpenPullRequestByHead(ctx context.Context, repo Repository, head string) (PullRequest, bool, error)
 	CreatePullRequest(ctx context.Context, input CreatePullRequestInput) (PullRequest, error)
+	EnsurePullRequest(ctx context.Context, input CreatePullRequestInput) (PullRequest, error)
 	CreateIssue(ctx context.Context, input CreateIssueInput) (Issue, error)
 	CloseIssue(ctx context.Context, repo Repository, issueNumber int64) (Issue, error)
 	ListIssueComments(ctx context.Context, repo Repository, issueNumber int64) ([]IssueComment, error)
@@ -457,6 +459,92 @@ func (c *GhClient) CreatePullRequest(ctx context.Context, input CreatePullReques
 		return PullRequest{}, err
 	}
 	return pr, nil
+}
+
+// GetOpenPullRequestByHead returns the open PR whose head branch is `head`, if
+// one exists, via `gh pr list`. The boolean is false (with a nil error) when no
+// open PR is found. `gh pr list --json` field names differ from the REST API
+// (url/headRefOid/baseRefName), so the response is decoded through a dedicated
+// wire shape and mapped onto PullRequest.
+func (c *GhClient) GetOpenPullRequestByHead(ctx context.Context, repo Repository, head string) (PullRequest, bool, error) {
+	if strings.TrimSpace(repo.FullName()) == "" {
+		return PullRequest{}, false, fmt.Errorf("repository owner/name is required")
+	}
+	if strings.TrimSpace(head) == "" {
+		return PullRequest{}, false, fmt.Errorf("head branch is required")
+	}
+	result, err := c.run(ctx, false,
+		"pr", "list",
+		"--repo", repo.FullName(),
+		"--head", head,
+		"--state", "open",
+		"--json", "number,url,headRefOid,baseRefName,state",
+	)
+	if err != nil {
+		return PullRequest{}, false, err
+	}
+	var wire []struct {
+		Number      int64  `json:"number"`
+		URL         string `json:"url"`
+		HeadRefOid  string `json:"headRefOid"`
+		BaseRefName string `json:"baseRefName"`
+		State       string `json:"state"`
+	}
+	if err := json.Unmarshal([]byte(result.Stdout), &wire); err != nil {
+		return PullRequest{}, false, fmt.Errorf("decode gh pr list response: %w", err)
+	}
+	if len(wire) == 0 {
+		return PullRequest{}, false, nil
+	}
+	w := wire[0]
+	return PullRequest{
+		Number:  w.Number,
+		URL:     w.URL,
+		State:   strings.ToLower(strings.TrimSpace(w.State)),
+		HeadRef: head,
+		HeadSHA: w.HeadRefOid,
+		BaseRef: w.BaseRefName,
+	}, true, nil
+}
+
+// EnsurePullRequest returns the open PR for input.Head idempotently: it adopts
+// an existing open head PR (query-first, no create), otherwise creates one, and
+// if create races a concurrent open (a 422 "a pull request already exists") it
+// re-queries by head and adopts the winner. This removes the TOCTOU window
+// where two finalizers (or an out-of-band PR) turn a benign "already exists"
+// into a hard error.
+func (c *GhClient) EnsurePullRequest(ctx context.Context, input CreatePullRequestInput) (PullRequest, error) {
+	if existing, ok, err := c.GetOpenPullRequestByHead(ctx, input.Repo, input.Head); err != nil {
+		return PullRequest{}, err
+	} else if ok {
+		return existing, nil
+	}
+	pr, err := c.CreatePullRequest(ctx, input)
+	if err == nil {
+		return pr, nil
+	}
+	if !isPullRequestAlreadyExists(err) {
+		return PullRequest{}, err
+	}
+	// A concurrent create won the race; adopt the now-existing open PR.
+	if existing, ok, qerr := c.GetOpenPullRequestByHead(ctx, input.Repo, input.Head); qerr != nil {
+		return PullRequest{}, qerr
+	} else if ok {
+		return existing, nil
+	}
+	return PullRequest{}, err
+}
+
+// isPullRequestAlreadyExists detects the gh/GitHub 422 raised when a PR already
+// exists for the head branch. gh surfaces it in the error text, so match on the
+// "already exists" phrasing (and the 422 status) robustly.
+func isPullRequestAlreadyExists(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "already exists") ||
+		(strings.Contains(text, "422") && strings.Contains(text, "pull request"))
 }
 
 func (c *GhClient) ListIssueComments(ctx context.Context, repo Repository, issueNumber int64) ([]IssueComment, error) {
@@ -1066,7 +1154,15 @@ func (NoopClient) GetPullRequest(context.Context, Repository, int64) (PullReques
 	return PullRequest{}, errors.ErrUnsupported
 }
 
+func (NoopClient) GetOpenPullRequestByHead(context.Context, Repository, string) (PullRequest, bool, error) {
+	return PullRequest{}, false, errors.ErrUnsupported
+}
+
 func (NoopClient) CreatePullRequest(context.Context, CreatePullRequestInput) (PullRequest, error) {
+	return PullRequest{}, errors.ErrUnsupported
+}
+
+func (NoopClient) EnsurePullRequest(context.Context, CreatePullRequestInput) (PullRequest, error) {
 	return PullRequest{}, errors.ErrUnsupported
 }
 

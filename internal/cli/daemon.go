@@ -3160,7 +3160,11 @@ func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Contex
 		}
 		return payload, nil
 	}
-	pr, err := f.githubClient(task.WorktreePath).CreatePullRequest(ctx, github.CreatePullRequestInput{
+	// No local record yet: ensure the PR on GitHub idempotently. EnsurePullRequest
+	// adopts an out-of-band/concurrent open PR for this head (and survives the 422
+	// "already exists" create race) instead of erroring, so a benign race no longer
+	// blocks the implementation after the work already landed.
+	pr, err := f.githubClient(task.WorktreePath).EnsurePullRequest(ctx, github.CreatePullRequestInput{
 		Repo:  repo,
 		Title: finalizerPullRequestTitle(task),
 		Body:  finalizerPullRequestBody(job, payload, task),

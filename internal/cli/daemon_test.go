@@ -2850,6 +2850,109 @@ func TestDaemonImplementationFinalizerCommitsBeforeReusingExistingPullRequest(t 
 	}
 }
 
+// stubEnsureGitHub adopts a pre-existing open PR via EnsurePullRequest, the way
+// the real GhClient does when GetOpenPullRequestByHead finds one. It records
+// whether CreatePullRequest was called so the test can prove the finalizer took
+// the idempotent adopt path instead of erroring on a 422 race.
+type stubEnsureGitHub struct {
+	github.NoopClient
+	existing    github.PullRequest
+	ensureCalls int
+	createCalls int
+	ensureErr   error
+}
+
+func (s *stubEnsureGitHub) EnsurePullRequest(context.Context, github.CreatePullRequestInput) (github.PullRequest, error) {
+	s.ensureCalls++
+	if s.ensureErr != nil {
+		return github.PullRequest{}, s.ensureErr
+	}
+	return s.existing, nil
+}
+
+func (s *stubEnsureGitHub) CreatePullRequest(context.Context, github.CreatePullRequestInput) (github.PullRequest, error) {
+	s.createCalls++
+	return github.PullRequest{}, errors.New("CreatePullRequest should not be called when EnsurePullRequest adopts")
+}
+
+// With no local PR record, the finalizer must adopt an out-of-band/concurrent
+// open PR via EnsurePullRequest instead of erroring with a BlockedError — the
+// #387 idempotency fix.
+func TestDaemonImplementationFinalizerAdoptsExistingPullRequestViaEnsure(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	remoteDir := filepath.Join(home, "remote.git")
+	repoDir := filepath.Join(home, "repo")
+	runGit(t, home, "init", "--bare", remoteDir)
+	runGit(t, home, "clone", remoteDir, repoDir)
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot Test")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "initial")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "push", "-u", "origin", "main")
+	runGit(t, repoDir, "switch", "-c", "task-1")
+	if err := os.WriteFile(filepath.Join(repoDir, "feature.txt"), []byte("new work\n"), 0o644); err != nil {
+		t.Fatalf("write feature: %v", err)
+	}
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir, DefaultBranch: "main", PollInterval: "30s"}); err != nil {
+		t.Fatalf("UpsertRepo returned error: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task 1", State: string(workflow.TaskImplementing), Branch: "task-1", WorktreePath: repoDir}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	// No local PR record: the local fast-path misses, so the github-side ensure runs.
+	gh := &stubEnsureGitHub{existing: github.PullRequest{
+		Number:  99,
+		URL:     "https://github.com/owner/repo/pull/99",
+		State:   "open",
+		HeadRef: "task-1",
+		BaseRef: "main",
+	}}
+	finalizer := daemonImplementationFinalizer{Store: store, GitHub: gh}
+	payload := workflow.JobPayload{
+		Repo:      "owner/repo",
+		Branch:    "task-1",
+		GoalID:    "goal-1",
+		TaskID:    "task-1",
+		TaskTitle: "Task 1",
+		LeadAgent: "lead",
+		Result:    &workflow.AgentResult{Decision: "implemented", Summary: "done"},
+	}
+
+	finalized, err := finalizer.FinalizeImplementation(ctx, db.Job{ID: "job-1", Agent: "lead", Type: "implement"}, payload)
+	if err != nil {
+		t.Fatalf("FinalizeImplementation returned error: %v", err)
+	}
+	var blocked workflow.BlockedError
+	if errors.As(err, &blocked) {
+		t.Fatalf("FinalizeImplementation returned BlockedError on an existing PR: %v", err)
+	}
+	if finalized.PullRequest != 99 {
+		t.Fatalf("finalized pull request = %d, want 99 (adopted)", finalized.PullRequest)
+	}
+	if gh.ensureCalls != 1 {
+		t.Fatalf("EnsurePullRequest calls = %d, want 1", gh.ensureCalls)
+	}
+	if gh.createCalls != 0 {
+		t.Fatalf("CreatePullRequest calls = %d, want 0 (adopt, not create)", gh.createCalls)
+	}
+	// The adopted PR is persisted locally.
+	stored, err := store.GetPullRequest(ctx, "owner/repo", 99)
+	if err != nil {
+		t.Fatalf("GetPullRequest(99) returned error: %v", err)
+	}
+	if stored.HeadBranch != "task-1" || !strings.EqualFold(stored.State, "open") {
+		t.Fatalf("stored PR = %+v", stored)
+	}
+}
+
 func TestDaemonImplementationFinalizerPushesAlreadyCommittedWork(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()

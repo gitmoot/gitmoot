@@ -684,6 +684,7 @@ type fakeDelivery struct {
 	prompts   []string
 	models    []string
 	onDeliver func()
+	err       error
 }
 
 func (f *fakeDelivery) Deliver(_ context.Context, _ runtime.Agent, job runtime.Job) (runtime.Result, error) {
@@ -691,6 +692,9 @@ func (f *fakeDelivery) Deliver(_ context.Context, _ runtime.Agent, job runtime.J
 	f.models = append(f.models, job.Model)
 	if f.onDeliver != nil {
 		f.onDeliver()
+	}
+	if f.err != nil {
+		return runtime.Result{}, f.err
 	}
 	index := len(f.prompts) - 1
 	result := runtime.Result{}

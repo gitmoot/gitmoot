@@ -810,6 +810,126 @@ func TestCreatePullRequestFetchesCreatedPR(t *testing.T) {
 	runner.wantArgs(t, 1, "api", "repos/jerryfane/gitmoot/pulls/7")
 }
 
+func TestGetOpenPullRequestByHead(t *testing.T) {
+	repo := Repository{Owner: "jerryfane", Name: "gitmoot"}
+
+	t.Run("found", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{
+			{Stdout: `[{"number":7,"url":"https://github.com/jerryfane/gitmoot/pull/7","headRefOid":"abc123","baseRefName":"main","state":"OPEN"}]`},
+		}}
+		client := GhClient{Runner: runner}
+		pr, ok, err := client.GetOpenPullRequestByHead(context.Background(), repo, "task-7")
+		if err != nil || !ok {
+			t.Fatalf("GetOpenPullRequestByHead = (%+v, %v, %v), want found", pr, ok, err)
+		}
+		if pr.Number != 7 || pr.HeadSHA != "abc123" || pr.BaseRef != "main" || pr.HeadRef != "task-7" || pr.State != "open" {
+			t.Fatalf("pr = %+v", pr)
+		}
+		runner.wantArgs(t, 0,
+			"pr", "list",
+			"--repo", "jerryfane/gitmoot",
+			"--head", "task-7",
+			"--state", "open",
+			"--json", "number,url,headRefOid,baseRefName,state",
+		)
+	})
+
+	t.Run("none", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: `[]`}}}
+		client := GhClient{Runner: runner}
+		_, ok, err := client.GetOpenPullRequestByHead(context.Background(), repo, "task-7")
+		if err != nil || ok {
+			t.Fatalf("GetOpenPullRequestByHead = (ok=%v, err=%v), want (false, nil)", ok, err)
+		}
+	})
+}
+
+func TestEnsurePullRequest(t *testing.T) {
+	repo := Repository{Owner: "jerryfane", Name: "gitmoot"}
+	input := CreatePullRequestInput{Repo: repo, Title: "Task 7", Body: "body", Head: "task-7", Base: "main"}
+
+	t.Run("adopts existing open head PR without creating", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{
+			{Stdout: `[{"number":9,"url":"https://github.com/jerryfane/gitmoot/pull/9","headRefOid":"def456","baseRefName":"main","state":"OPEN"}]`},
+		}}
+		client := GhClient{Runner: runner}
+		pr, err := client.EnsurePullRequest(context.Background(), input)
+		if err != nil {
+			t.Fatalf("EnsurePullRequest returned error: %v", err)
+		}
+		if pr.Number != 9 || pr.HeadSHA != "def456" {
+			t.Fatalf("pr = %+v", pr)
+		}
+		// Only the query ran; no create.
+		if len(runner.calls) != 1 {
+			t.Fatalf("calls = %v, want exactly the query call", runner.calls)
+		}
+		runner.wantArgs(t, 0, "pr", "list", "--repo", "jerryfane/gitmoot", "--head", "task-7", "--state", "open", "--json", "number,url,headRefOid,baseRefName,state")
+	})
+
+	t.Run("creates when absent", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{
+			{Stdout: `[]`}, // query: none
+			{Stdout: "https://github.com/jerryfane/gitmoot/pull/11\n"}, // create
+			{Stdout: `{"number":11,"title":"Task 7","state":"open","html_url":"https://github.com/jerryfane/gitmoot/pull/11","head":{"ref":"task-7","sha":"sha11"},"base":{"ref":"main"}}`}, // getPullRequest
+		}}
+		client := GhClient{Runner: runner}
+		pr, err := client.EnsurePullRequest(context.Background(), input)
+		if err != nil {
+			t.Fatalf("EnsurePullRequest returned error: %v", err)
+		}
+		if pr.Number != 11 || pr.HeadSHA != "sha11" {
+			t.Fatalf("pr = %+v", pr)
+		}
+		runner.wantArgs(t, 0, "pr", "list", "--repo", "jerryfane/gitmoot", "--head", "task-7", "--state", "open", "--json", "number,url,headRefOid,baseRefName,state")
+		runner.wantArgs(t, 1, "pr", "create", "--repo", "jerryfane/gitmoot", "--title", "Task 7", "--body", "body", "--head", "task-7", "--base", "main")
+	})
+
+	t.Run("re-queries and adopts on 422 already exists race", func(t *testing.T) {
+		runner := &fakeRunner{
+			results: []subprocess.Result{
+				{Stdout: `[]`}, // query: none (TOCTOU window)
+				{Stderr: "pull request create failed: GraphQL: A pull request already exists for jerryfane:task-7. (createPullRequest)"},                  // create: 422
+				{Stdout: `[{"number":13,"url":"https://github.com/jerryfane/gitmoot/pull/13","headRefOid":"sha13","baseRefName":"main","state":"OPEN"}]`}, // re-query: winner
+			},
+			errs: []error{
+				nil,
+				errors.New("exit status 1"),
+				nil,
+			},
+		}
+		client := GhClient{Runner: runner}
+		pr, err := client.EnsurePullRequest(context.Background(), input)
+		if err != nil {
+			t.Fatalf("EnsurePullRequest returned error: %v", err)
+		}
+		if pr.Number != 13 || pr.HeadSHA != "sha13" {
+			t.Fatalf("pr = %+v", pr)
+		}
+		// query, create (422), re-query.
+		if len(runner.calls) != 3 {
+			t.Fatalf("calls = %v, want query+create+requery", runner.calls)
+		}
+	})
+
+	t.Run("propagates a non-422 create error", func(t *testing.T) {
+		runner := &fakeRunner{
+			results: []subprocess.Result{
+				{Stdout: `[]`},
+				{Stderr: "HTTP 403: forbidden"},
+			},
+			errs: []error{nil, errors.New("exit status 1")},
+		}
+		client := GhClient{Runner: runner}
+		if _, err := client.EnsurePullRequest(context.Background(), input); err == nil {
+			t.Fatal("expected a non-422 create error to propagate")
+		}
+		if len(runner.calls) != 2 {
+			t.Fatalf("calls = %v, want query+create only (no re-query on a hard error)", runner.calls)
+		}
+	})
+}
+
 type fakeRunner struct {
 	results []subprocess.Result
 	errs    []error
