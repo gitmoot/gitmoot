@@ -2188,7 +2188,7 @@ type skillOptTrainOptimizerRequest struct {
 	OptimizerLockState           string
 }
 
-const skillOptTrainSkillOptWheelURL = "https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.2.0b1/gitmoot_skillopt-0.2.0b1-py3-none-any.whl"
+const skillOptTrainSkillOptWheelURL = "https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.3.1/gitmoot_skillopt-0.3.1-py3-none-any.whl"
 
 type skillOptTrainOptimizerPreflightError struct {
 	Executable string

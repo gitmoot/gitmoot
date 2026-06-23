@@ -107,7 +107,7 @@ continues:
 ```sh
 python3 -m pip install --user pipx
 python3 -m pipx ensurepath
-pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.3.0/gitmoot_skillopt-0.3.0-py3-none-any.whl
+pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.3.1/gitmoot_skillopt-0.3.1-py3-none-any.whl
 gitmoot-skillopt --version
 gitmoot-skillopt optimize --help
 ```
