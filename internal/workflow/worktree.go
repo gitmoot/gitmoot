@@ -2,7 +2,9 @@ package workflow
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -534,8 +536,49 @@ func taskWorktreePathSegment(value string, label string) (string, error) {
 	if value == "" {
 		return "", fmt.Errorf("%s is required", label)
 	}
-	if value == "." || value == ".." || strings.ContainsAny(value, `/\`) {
-		return "", fmt.Errorf("%s %q is not safe for a worktree path", label, value)
+	// Already a safe single segment -> return it unchanged so existing worktree
+	// paths are byte-identical (backward-compatible: no in-flight worktree moves).
+	if isSafeWorktreeSegment(value) {
+		return value, nil
+	}
+	// The value contains characters that are not path-safe -- most importantly
+	// '/', which legitimately appears in a coordinator's *continuation* parent job
+	// id (e.g. "local-ask-lead-abc123/continuation/continuation"). Rejecting it
+	// outright made it impossible to dispatch an implement / integration-worktree
+	// delegation from any continuation deeper than the root job, which breaks the
+	// multi-round Orchestra coordinator pattern. Deterministically sanitize
+	// instead: collapse each run of unsafe characters to '_' and append a short
+	// hash of the ORIGINAL value so distinct ids can never collide on one path.
+	// The result is a single, path-safe, traversal-safe directory segment.
+	var b strings.Builder
+	prevSep := false
+	for _, char := range value {
+		switch {
+		case char >= 'a' && char <= 'z', char >= 'A' && char <= 'Z',
+			char >= '0' && char <= '9', char == '-', char == '_', char == '.':
+			b.WriteRune(char)
+			prevSep = false
+		default:
+			if !prevSep {
+				b.WriteByte('_')
+				prevSep = true
+			}
+		}
+	}
+	sanitized := strings.Trim(b.String(), "_.")
+	if sanitized == "" {
+		sanitized = "seg"
+	}
+	sum := sha256.Sum256([]byte(value))
+	return sanitized + "-" + hex.EncodeToString(sum[:])[:12], nil
+}
+
+// isSafeWorktreeSegment reports whether value is already a safe single path
+// segment: non-empty, not "." or "..", and composed only of [A-Za-z0-9._-].
+// Such values are used verbatim so existing worktree paths never move.
+func isSafeWorktreeSegment(value string) bool {
+	if value == "" || value == "." || value == ".." {
+		return false
 	}
 	for _, char := range value {
 		switch {
@@ -544,8 +587,8 @@ func taskWorktreePathSegment(value string, label string) (string, error) {
 		case char >= '0' && char <= '9':
 		case char == '-' || char == '_' || char == '.':
 		default:
-			return "", fmt.Errorf("%s %q contains unsupported path characters", label, value)
+			return false
 		}
 	}
-	return value, nil
+	return true
 }
