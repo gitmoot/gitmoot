@@ -214,7 +214,7 @@ func TestDaemonRestartOverlayPreservesSavedArgs(t *testing.T) {
 func TestDaemonStartForwardsRepoAndSessionThroughRestart(t *testing.T) {
 	// The detached child argv carries both filters (this is exactly what
 	// daemonMeta.Args records).
-	childArgs := daemonChildArgs("/tmp/gitmoot-home", "30s", 1, false, "owner/project", "root-coordinator")
+	childArgs := daemonChildArgs("/tmp/gitmoot-home", "30s", 1, false, "barrier", "owner/project", "root-coordinator")
 	if !daemonArgsContainFlag(childArgs, "repo", "owner/project") {
 		t.Fatalf("child argv missing --repo: %v", childArgs)
 	}
@@ -274,7 +274,7 @@ func TestDaemonStartConfigSessionRootAlias(t *testing.T) {
 }
 
 func TestDaemonChildArgsRunAllRepoSupervisor(t *testing.T) {
-	args := daemonChildArgs("/tmp/gitmoot-home", "30s", 2, true, "", "")
+	args := daemonChildArgs("/tmp/gitmoot-home", "30s", 2, true, "barrier", "", "")
 
 	for i, arg := range args {
 		if arg == "--repo" || strings.HasPrefix(arg, "--repo=") {
@@ -300,7 +300,7 @@ func TestDaemonChildArgsRunAllRepoSupervisor(t *testing.T) {
 }
 
 func TestDaemonChildArgsForwardsRepo(t *testing.T) {
-	args := daemonChildArgs("/tmp/gitmoot-home", "30s", 1, false, "owner/project", "")
+	args := daemonChildArgs("/tmp/gitmoot-home", "30s", 1, false, "barrier", "owner/project", "")
 
 	if !daemonArgsContainFlag(args, "repo", "owner/project") {
 		t.Fatalf("daemon child args missing --repo owner/project: %v", args)
@@ -318,7 +318,7 @@ func TestDaemonChildArgsForwardsRepo(t *testing.T) {
 }
 
 func TestDaemonChildArgsForwardsSession(t *testing.T) {
-	args := daemonChildArgs("/tmp/gitmoot-home", "30s", 1, false, "owner/project", "root-coordinator")
+	args := daemonChildArgs("/tmp/gitmoot-home", "30s", 1, false, "barrier", "owner/project", "root-coordinator")
 
 	if !daemonArgsContainFlag(args, "repo", "owner/project") {
 		t.Fatalf("daemon child args missing --repo owner/project: %v", args)
@@ -3810,6 +3810,238 @@ func TestRunQueuedJobsForRepoSkipsOtherRepos(t *testing.T) {
 	}
 	if adapter.calls != 1 {
 		t.Fatalf("adapter calls = %d, want 1", adapter.calls)
+	}
+}
+
+// --- #394 PR1: opt-in continuous worker-pool scheduler (--scheduler=pool) ---
+
+const poolSchedulerAskResult = `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+
+func TestParseSchedulerMode(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    bool
+		wantErr bool
+	}{
+		{"", false, false},
+		{"barrier", false, false},
+		{"pool", true, false},
+		{"  pool  ", true, false},
+		{"bogus", false, true},
+	}
+	for _, tc := range cases {
+		got, err := parseSchedulerMode(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("parseSchedulerMode(%q) err = nil, want error", tc.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseSchedulerMode(%q) err = %v", tc.in, err)
+		}
+		if got != tc.want {
+			t.Errorf("parseSchedulerMode(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestDaemonChildArgsForwardsPoolScheduler(t *testing.T) {
+	pool := daemonChildArgs("/tmp/home", "30s", 1, false, "pool", "", "")
+	if !daemonArgsContainFlag(pool, "scheduler", "pool") {
+		t.Fatalf("pool child args missing --scheduler pool: %v", pool)
+	}
+	parsed, code := parseDaemonStartConfig("daemon restart", pool[2:], io.Discard)
+	if code != 0 {
+		t.Fatalf("parse pool child args code = %d: %v", code, pool)
+	}
+	if parsed.Scheduler != "pool" || !parsed.ExplicitScheduler {
+		t.Fatalf("parsed pool scheduler = %q explicit=%v", parsed.Scheduler, parsed.ExplicitScheduler)
+	}
+	// barrier (the default) appends no --scheduler flag, keeping the child argv
+	// byte-identical to before this change.
+	barrier := daemonChildArgs("/tmp/home", "30s", 1, false, "barrier", "", "")
+	for _, a := range barrier {
+		if a == "--scheduler" {
+			t.Fatalf("barrier child args should not carry --scheduler: %v", barrier)
+		}
+	}
+	if _, code := parseDaemonStartConfig("daemon start", []string{"--scheduler", "bogus"}, io.Discard); code != 2 {
+		t.Fatalf("invalid --scheduler code = %d, want 2", code)
+	}
+}
+
+func poolSchedulerWorker(t *testing.T, store *db.Store, adapter workflow.DeliveryAdapter, usePool bool) jobWorker {
+	t.Helper()
+	worker := defaultJobWorker(store, io.Discard)
+	worker.UsePool = usePool
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return t.TempDir(), nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return adapter, nil
+	}
+	return worker
+}
+
+func TestRunQueuedJobsPoolDrainsIndependentJobs(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo-a", t.TempDir())
+	seedDaemonWorkerRepo(t, store, "owner/repo-b", t.TempDir())
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo-a")
+	if err := store.AllowAgentRepo(ctx, "audit", "owner/repo-b"); err != nil {
+		t.Fatalf("AllowAgentRepo: %v", err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit", Action: "ask", Repo: "owner/repo-a", Branch: "main", PullRequest: 1})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-b", Agent: "audit", Action: "ask", Repo: "owner/repo-b", Branch: "main", PullRequest: 2})
+	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
+	worker := poolSchedulerWorker(t, store, adapter, true)
+
+	if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
+		t.Fatalf("pool runQueuedJobsForRepo: %v", err)
+	}
+	for _, id := range []string{"job-a", "job-b"} {
+		job, err := store.GetJob(ctx, id)
+		if err != nil {
+			t.Fatalf("GetJob %s: %v", id, err)
+		}
+		if job.State != string(workflow.JobSucceeded) {
+			t.Fatalf("%s state = %q, want succeeded", id, job.State)
+		}
+	}
+}
+
+// runMidFlightEnqueueScenario runs job-a, which enqueues job-b (a different repo,
+// so a distinct checkout key) once dispatch has begun, then returns job-b's final
+// state. The pool re-queries and runs it; the barrier never re-queries, so it
+// stays queued — the #394 layer-1 behavior the pool fixes.
+func runMidFlightEnqueueScenario(t *testing.T, usePool bool) string {
+	t.Helper()
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo-a", t.TempDir())
+	seedDaemonWorkerRepo(t, store, "owner/repo-b", t.TempDir())
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo-a")
+	if err := store.AllowAgentRepo(ctx, "audit", "owner/repo-b"); err != nil {
+		t.Fatalf("AllowAgentRepo: %v", err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit", Action: "ask", Repo: "owner/repo-a", Branch: "main", PullRequest: 1})
+
+	var once sync.Once
+	var enqErr error
+	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
+	adapter.onDeliver = func() {
+		once.Do(func() {
+			_, enqErr = (workflow.Mailbox{Store: store}).Enqueue(ctx, workflow.JobRequest{ID: "job-b", Agent: "audit", Action: "ask", Repo: "owner/repo-b", Branch: "main", PullRequest: 2})
+		})
+	}
+	worker := poolSchedulerWorker(t, store, adapter, usePool)
+
+	if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
+		t.Fatalf("runQueuedJobsForRepo(usePool=%v): %v", usePool, err)
+	}
+	if enqErr != nil {
+		t.Fatalf("mid-flight enqueue of job-b failed: %v", enqErr)
+	}
+	job, err := store.GetJob(ctx, "job-b")
+	if err != nil {
+		t.Fatalf("GetJob job-b: %v", err)
+	}
+	return job.State
+}
+
+func TestRunQueuedJobsPoolPicksUpMidFlightJob(t *testing.T) {
+	if got := runMidFlightEnqueueScenario(t, true); got != string(workflow.JobSucceeded) {
+		t.Fatalf("pool: job-b state = %q, want succeeded (mid-flight job not picked up)", got)
+	}
+	if got := runMidFlightEnqueueScenario(t, false); got != string(workflow.JobQueued) {
+		t.Fatalf("barrier: job-b state = %q, want queued (barrier must not re-query mid-tick)", got)
+	}
+}
+
+func TestRunQueuedJobsPoolStopsOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo-a", t.TempDir())
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo-a")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit", Action: "ask", Repo: "owner/repo-a", Branch: "main", PullRequest: 1})
+	// The worker blocks until its context is cancelled; the pool must drain it and
+	// return rather than hang.
+	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult, waitForContextCancel: true}
+	worker := poolSchedulerWorker(t, store, adapter, true)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- runQueuedJobsForRepo(ctx, worker, 2, "", "") }()
+	cancel()
+	select {
+	case <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pool did not return after context cancellation (hang)")
+	}
+}
+
+type poolConcurrencyTracker struct {
+	mu     sync.Mutex
+	active int
+	max    int
+}
+
+func (c *poolConcurrencyTracker) span() {
+	c.mu.Lock()
+	c.active++
+	if c.active > c.max {
+		c.max = c.active
+	}
+	c.mu.Unlock()
+	time.Sleep(25 * time.Millisecond)
+	c.mu.Lock()
+	c.active--
+	c.mu.Unlock()
+}
+
+func (c *poolConcurrencyTracker) peak() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.max
+}
+
+func runPoolConcurrencyScenario(t *testing.T, repoB string) int {
+	t.Helper()
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo-a", t.TempDir())
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo-a")
+	if repoB != "owner/repo-a" {
+		seedDaemonWorkerRepo(t, store, repoB, t.TempDir())
+		if err := store.AllowAgentRepo(ctx, "audit", repoB); err != nil {
+			t.Fatalf("AllowAgentRepo: %v", err)
+		}
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-1", Agent: "audit", Action: "ask", Repo: "owner/repo-a", Branch: "main", PullRequest: 1})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-2", Agent: "audit", Action: "ask", Repo: repoB, Branch: "main", PullRequest: 2})
+
+	tracker := &poolConcurrencyTracker{}
+	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
+	adapter.onDeliver = tracker.span
+	worker := poolSchedulerWorker(t, store, adapter, true)
+
+	if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
+		t.Fatalf("runQueuedJobsForRepo: %v", err)
+	}
+	return tracker.peak()
+}
+
+func TestRunQueuedJobsPoolHonorsCheckoutSafety(t *testing.T) {
+	// Same repo, no worktree ⇒ same checkout key ⇒ live accounting must serialize
+	// them even at --workers 2 (working-tree safety, #394 layer 2).
+	if peak := runPoolConcurrencyScenario(t, "owner/repo-a"); peak != 1 {
+		t.Fatalf("same-repo peak concurrency = %d, want 1 (must serialize same checkout key)", peak)
+	}
+	// Distinct repos ⇒ distinct checkout keys ⇒ the pool runs them in parallel.
+	if peak := runPoolConcurrencyScenario(t, "owner/repo-b"); peak != 2 {
+		t.Fatalf("distinct-repo peak concurrency = %d, want 2 (distinct keys must parallelize)", peak)
 	}
 }
 
