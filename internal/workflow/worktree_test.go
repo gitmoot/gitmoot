@@ -28,13 +28,23 @@ func TestTaskWorktreePath(t *testing.T) {
 	}{
 		{name: "empty repo", repo: "", task: "task-1"},
 		{name: "nested repo", repo: "owner/repo/extra", task: "task-1"},
-		{name: "unsafe task", repo: "owner/repo", task: "../task"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := TaskWorktreePath("/home/gitmoot", tc.repo, tc.task); err == nil {
 				t.Fatal("TaskWorktreePath accepted invalid input")
 			}
 		})
+	}
+
+	// A task id that is not a plain path segment (e.g. "../task") is now sanitized
+	// into a safe, traversal-safe segment rather than rejected.
+	tp, err := TaskWorktreePath("/home/gitmoot", "owner/repo", "../task")
+	if err != nil {
+		t.Fatalf("TaskWorktreePath should sanitize unsafe task id, got error: %v", err)
+	}
+	troot := filepath.Join("/home/gitmoot", "worktrees", "owner--repo")
+	if rel, err := filepath.Rel(troot, tp); err != nil || strings.HasPrefix(rel, "..") {
+		t.Fatalf("sanitized task path %q escaped the worktrees root (rel=%q err=%v)", tp, rel, err)
 	}
 }
 
@@ -397,12 +407,37 @@ func TestDelegationWorktreePath(t *testing.T) {
 		{name: "empty home", home: "", repo: "owner/repo", parentJob: "job-1", delegation: "d1"},
 		{name: "empty repo", home: "/home/gitmoot", repo: "", parentJob: "job-1", delegation: "d1"},
 		{name: "nested repo", home: "/home/gitmoot", repo: "owner/repo/extra", parentJob: "job-1", delegation: "d1"},
-		{name: "unsafe parent", home: "/home/gitmoot", repo: "owner/repo", parentJob: "../job", delegation: "d1"},
-		{name: "unsafe delegation", home: "/home/gitmoot", repo: "owner/repo", parentJob: "job-1", delegation: "../d"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := DelegationWorktreePath(tc.home, tc.repo, tc.parentJob, tc.delegation, 0); err == nil {
 				t.Fatal("DelegationWorktreePath accepted invalid input")
+			}
+		})
+	}
+
+	// Parent/delegation ids that are not a plain path segment -- a "/"-bearing
+	// continuation id, or a "../" attempt -- are now SANITIZED into a safe segment
+	// rather than rejected, so the multi-round coordinator can dispatch an
+	// implement delegation from a continuation. The result must stay traversal-safe
+	// (never escape the delegations root).
+	for _, tc := range []struct {
+		name       string
+		parentJob  string
+		delegation string
+	}{
+		{name: "slashed parent (continuation)", parentJob: "job-1/continuation/continuation", delegation: "d1"},
+		{name: "dotdot parent", parentJob: "../job", delegation: "d1"},
+		{name: "dotdot delegation", parentJob: "job-1", delegation: "../d"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := DelegationWorktreePath("/home/gitmoot", "owner/repo", tc.parentJob, tc.delegation, 0)
+			if err != nil {
+				t.Fatalf("DelegationWorktreePath should sanitize, got error: %v", err)
+			}
+			root := filepath.Join("/home/gitmoot", "worktrees", "owner--repo", "delegations")
+			rel, err := filepath.Rel(root, p)
+			if err != nil || strings.HasPrefix(rel, "..") {
+				t.Fatalf("sanitized path %q escaped the delegations root (rel=%q err=%v)", p, rel, err)
 			}
 		})
 	}
@@ -682,4 +717,67 @@ func (f *fakeWorktreeManager) CommitWorktree(_ context.Context, dir string, _ st
 func (f *fakeWorktreeManager) RemoveWorktreeForce(_ context.Context, path string) error {
 	f.removedForce = append(f.removedForce, path)
 	return f.removeErr
+}
+
+func TestTaskWorktreePathSegmentSanitizesSlashedIDs(t *testing.T) {
+	// Backward-compatible: already-safe values are returned unchanged so existing
+	// worktree paths never move.
+	for _, v := range []string{"local-ask-lead-abc123", "task-1", "owner_repo", "a.b-c_d"} {
+		got, err := taskWorktreePathSegment(v, "x")
+		if err != nil {
+			t.Fatalf("safe value %q errored: %v", v, err)
+		}
+		if got != v {
+			t.Fatalf("safe value %q changed to %q (must be byte-identical)", v, got)
+		}
+	}
+
+	// A coordinator continuation parent id (contains '/') must no longer error;
+	// it sanitizes to a single, path-safe, traversal-safe, deterministic segment.
+	id := "local-ask-lead-abc123/continuation/continuation"
+	got, err := taskWorktreePathSegment(id, "parent job id")
+	if err != nil {
+		t.Fatalf("slashed continuation id errored (the bug this fixes): %v", err)
+	}
+	if strings.ContainsAny(got, `/\`) {
+		t.Fatalf("sanitized segment %q still contains a path separator", got)
+	}
+	if got == "." || got == ".." || strings.HasPrefix(got, ".") {
+		t.Fatalf("sanitized segment %q is not traversal-safe", got)
+	}
+	if again, _ := taskWorktreePathSegment(id, "parent job id"); got != again {
+		t.Fatalf("not deterministic: %q vs %q", got, again)
+	}
+
+	// DelegationWorktreePath (the real caller) now succeeds for a slashed parent.
+	p, err := DelegationWorktreePath("/h", "o/r", id, "impl", 0)
+	if err != nil {
+		t.Fatalf("DelegationWorktreePath rejected slashed parent (the bug): %v", err)
+	}
+	if !strings.Contains(p, got) {
+		t.Fatalf("path %q missing sanitized parent segment %q", p, got)
+	}
+
+	// Distinct unsafe ids that collapse to the same prefix must NOT collide.
+	a, _ := taskWorktreePathSegment("x/y", "p")
+	b, _ := taskWorktreePathSegment("x:y", "p")
+	if a == b {
+		t.Fatalf("distinct unsafe ids collided: both -> %q", a)
+	}
+
+	// "." and ".." sanitize to a safe segment rather than being usable as traversal.
+	for _, dotted := range []string{".", ".."} {
+		seg, err := taskWorktreePathSegment(dotted, "p")
+		if err != nil {
+			t.Fatalf("%q errored: %v", dotted, err)
+		}
+		if seg == "." || seg == ".." || strings.ContainsAny(seg, `/\`) {
+			t.Fatalf("%q produced unsafe segment %q", dotted, seg)
+		}
+	}
+
+	// Empty / whitespace still errors.
+	if _, err := taskWorktreePathSegment("   ", "p"); err == nil {
+		t.Fatalf("blank value should still error")
+	}
 }
