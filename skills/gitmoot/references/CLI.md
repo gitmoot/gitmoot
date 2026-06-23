@@ -82,6 +82,14 @@ coordinator job itself, and ignores every other queued job. `--session` composes
 with `--repo` (AND): a job must match both filters to run. Leaving both empty
 keeps the default behavior of matching all enabled repos and all jobs.
 
+Both `daemon run` and `daemon start` also accept two opt-in flags (both off by
+default, so leaving them unset is byte-identical to before): `--watch-issues`
+watches open **issues** for `@<agent> ask …` mentions and routes them to jobs,
+mirroring the PR-comment watcher; `--scheduler pool` selects the continuous
+worker-pool scheduler that re-queries the queue as workers free and auto-isolates
+a contended same-repo read job into an ephemeral worktree (fixing a same-repo
+dependent-job deadlock), versus the default `--scheduler barrier`.
+
 `gitmoot dashboard` shows local state — daemon health, repos, agents and runtime
 sessions, jobs by state, worktrees, branch locks, SkillOpt train phase/candidate,
 and pending interactive prompts.
@@ -328,10 +336,10 @@ default runtime model for that managed agent type.
 A registered single instance **shadows** a managed type of the same name:
 dispatch resolves `gitmoot agent <name>` to a registered single instance before a
 type, so force the type with `--type <name>` (or do not register a single
-instance of that name). Managed-type auto-spin and `[parallel_sessions]`
-temp-session forking happen on the **background** path only — a foreground
-`gitmoot agent ask <type> --type <type>` returns `agent not found`; use
-`--background`. See WORKFLOWS.md → "Running one agent's jobs in parallel".
+instance of that name). Since **v0.5.1** a foreground `gitmoot agent ask <type>`
+(the `ask` action) dispatches to the managed type synchronously; background
+`run`/`review`/`implement` to a type and `[parallel_sessions]` temp-session
+forking use the **background** path. See WORKFLOWS.md → "Running one agent's jobs in parallel".
 
 ## Agent Templates
 

@@ -5501,6 +5501,14 @@ coordinator job itself, and ignores every other queued job. `--session` composes
 with `--repo` (AND): a job must match both filters to run. Leaving both empty
 keeps the default behavior of matching all enabled repos and all jobs.
 
+Both `daemon run` and `daemon start` also accept two opt-in flags (both off by
+default, so leaving them unset is byte-identical to before): `--watch-issues`
+watches open **issues** for `@<agent> ask …` mentions and routes them to jobs,
+mirroring the PR-comment watcher; `--scheduler pool` selects the continuous
+worker-pool scheduler that re-queries the queue as workers free and auto-isolates
+a contended same-repo read job into an ephemeral worktree (fixing a same-repo
+dependent-job deadlock), versus the default `--scheduler barrier`.
+
 `gitmoot dashboard` shows local state — daemon health, repos, agents and runtime
 sessions, jobs by state, worktrees, branch locks, SkillOpt train phase/candidate,
 and pending interactive prompts.
@@ -5747,10 +5755,10 @@ default runtime model for that managed agent type.
 A registered single instance **shadows** a managed type of the same name:
 dispatch resolves `gitmoot agent <name>` to a registered single instance before a
 type, so force the type with `--type <name>` (or do not register a single
-instance of that name). Managed-type auto-spin and `[parallel_sessions]`
-temp-session forking happen on the **background** path only — a foreground
-`gitmoot agent ask <type> --type <type>` returns `agent not found`; use
-`--background`. See WORKFLOWS.md → "Running one agent's jobs in parallel".
+instance of that name). Since **v0.5.1** a foreground `gitmoot agent ask <type>`
+(the `ask` action) dispatches to the managed type synchronously; background
+`run`/`review`/`implement` to a type and `[parallel_sessions]` temp-session
+forking use the **background** path. See WORKFLOWS.md → "Running one agent's jobs in parallel".
 
 ## Agent Templates
 
@@ -6520,9 +6528,10 @@ instances / temp sessions actually run concurrently.
 registered agent by name **first**, so if you `gitmoot agent start researcher`
 *and* `gitmoot agent type set researcher`, plain `researcher` always uses the
 single instance. Force the managed type with `--type researcher` (or don't
-register a single instance of that name). A **foreground** ask cannot route to a
-type today — `gitmoot agent ask <type> --type <type>` errors `agent not found`;
-use `--background`.
+register a single instance of that name). Since **v0.5.1** a **foreground**
+`gitmoot agent ask <type>` (the `ask` action) dispatches to the managed type
+synchronously — it spins or reuses a managed instance up to `max_background`.
+`review`/`implement` to a type still use `--background`.
 
 ## Multi-Repo Work
 
@@ -6920,6 +6929,15 @@ cannot recurse or fan out forever:
   reports it if its stream emits it; Codex `Deliver` runs without `--json` and so
   contributes `0`), so the budget can under-count but never over-counts. Leaving
   the knob at `0` skips the check entirely.
+- Per-root **dollar-cost** budget `[orchestrate].max_delegation_cost_usd`,
+  **off by default** (`0` = unlimited): the cost analogue of the token budget
+  (#380). It bounds the same tree by *measured spend* — the same per-job token
+  usage priced through a built-in per-model price table (Haiku/Sonnet/Opus list
+  prices, matched by substring; unknown models priced at the mid-tier Sonnet
+  default so they are never free). When the tree's accumulated cost reaches the
+  budget, the next fan-out is refused with a `delegation_cost_usd_exceeded` event
+  and routed to the finalize continuation — never hard-killed. Coarse backstop,
+  not a precise spend meter; leaving the knob at `0` skips the check entirely.
 - Per-coordinator width `MaxDelegationWidth = 16`: a single coordinator result
   may not fan out more than this many delegations in one generation; an over-wide
   set is refused with a `delegation_width_exceeded` event.
@@ -7042,6 +7060,44 @@ Delegation fields:
   job (for example a Codex, Claude Code, or Kimi Code model name). When omitted,
   the delegated agent's configured default model is used. There is no allow-list;
   Gitmoot passes the value through to the runtime as-is.
+
+  **Model-tier routing (recommendation).** Picking a per-delegation `model` is
+  the coordinator's call — Gitmoot does not choose or override it. As a costing
+  heuristic, think of each leg as falling into one of four abstract **tiers**,
+  then map the tier to a concrete model for whichever runtime the leg uses:
+
+  - **mechanical** — rote, deterministic edits (a rename, a codemod-style
+    find-and-replace, a version bump, regenerating a file). Use the smallest /
+    cheapest model.
+  - **cheap** — low-complexity legs (a short `ask`, a narrow single-file
+    lookup). A small, fast model is enough.
+  - **standard** — ordinary work with no strong hardness signal. **Leave
+    `model` empty** so the leg runs on the delegated agent's runtime default.
+  - **deep** — genuinely hard or quorum-critical legs. Reserve a strong,
+    expensive model.
+
+  Cheap **hardness signals** a coordinator can read off a leg before dispatch: a
+  long, detailed prompt; hard-topic keywords (`architecture`, `oauth`, `schema`,
+  `concurrency`, `migration`, `security`, `refactor`, …); a multi-file
+  `implement`/`fix` action versus a read-only `ask`; broad scope (several
+  `artifacts` or a dedicated `worktree`); and whether the leg is part of a
+  `quorum`. More of these lean **deep**; their absence leans **cheap**. Gitmoot
+  ships an uncalibrated helper for this — `workflow.ScoreComplexity` /
+  `workflow.TierFor` (`internal/workflow/modeltier.go`) — that turns a
+  delegation into a tier. It is a pure recommendation primitive: the engine
+  never calls it and never overrides a coordinator's chosen `model`.
+
+  **Cascade / escalate-in-continuation pattern.** Prefer to start a leg on the
+  cheapest plausible tier and **escalate in a continuation** only if it falls
+  short: run the first attempt on a cheap/standard model, and if the result is
+  `blocked`/`failed` (or a `quorum` vote is not met), have the coordinator
+  re-issue that leg in its next round on a deep model. This keeps the common
+  case cheap while still reaching a strong model for the legs that genuinely
+  need it.
+
+  **Rule of thumb:** downshift `model` for cheap/mechanical legs; leave `model`
+  empty for standard legs (so they take the runtime default); and reserve a deep
+  model for genuinely hard or quorum-critical legs.
 - `phase` (optional): a free-form per-delegation string. It is pass-through
   metadata — Gitmoot carries it through to the child job untouched and echoes it
   back in the coordinator continuation for each delegation that set a non-empty
@@ -7133,6 +7189,16 @@ Delegation trees are bounded so they cannot run forever:
   below — so the budget can under-count a runtime that does not report usage; it
   never over-counts. Leaving the knob at `0` skips the check entirely (behavior is
   byte-identical to before the knob existed).
+- Per-root **dollar-cost** budget (#380): `[orchestrate].max_delegation_cost_usd`,
+  **off by default** (`0` = unlimited). The cost analogue of the token budget: it
+  bounds the same tree by *measured spend*, derived from the same per-job token
+  usage priced through a built-in per-model price table (Haiku/Sonnet/Opus list
+  prices matched by substring; unknown/empty models priced at the mid-tier Sonnet
+  default so they are never free). When the tree's accumulated cost reaches the
+  budget, the next fan-out is refused with a `delegation_cost_usd_exceeded` event
+  and routes through the finalize continuation — never hard-killed. Coarse
+  runaway-cost backstop, not a precise spend meter; leaving the knob at `0` is
+  byte-identical to before the knob existed.
 - Per-coordinator width: `MaxDelegationWidth = 16`. A single coordinator result
   may not fan out more than this many delegations in one generation; an over-wide
   set is refused with a `delegation_width_exceeded` event and routes through the

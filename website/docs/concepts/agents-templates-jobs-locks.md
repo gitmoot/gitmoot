@@ -126,8 +126,10 @@ jobs at once (default `1`; raise it, e.g. `--workers 6`).
 
 **Precedence:** dispatch resolves a registered single instance by name *before* a
 managed type, so a single agent named `researcher` shadows a `researcher` type —
-force the type with `--type researcher`. Foreground `gitmoot agent ask <type>`
-cannot route to a type today (it returns `agent not found`); use `--background`.
+force the type with `--type researcher`. Since **v0.5.1** a foreground `gitmoot
+agent ask <type>` (the `ask` action) routes to the managed type synchronously
+(spins/reuses an instance up to `max_background`); `review`/`implement` to a type
+still use `--background`.
 
 ## Locks
 

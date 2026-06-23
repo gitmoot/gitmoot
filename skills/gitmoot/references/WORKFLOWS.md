@@ -430,9 +430,10 @@ instances / temp sessions actually run concurrently.
 registered agent by name **first**, so if you `gitmoot agent start researcher`
 *and* `gitmoot agent type set researcher`, plain `researcher` always uses the
 single instance. Force the managed type with `--type researcher` (or don't
-register a single instance of that name). A **foreground** ask cannot route to a
-type today — `gitmoot agent ask <type> --type <type>` errors `agent not found`;
-use `--background`.
+register a single instance of that name). Since **v0.5.1** a **foreground**
+`gitmoot agent ask <type>` (the `ask` action) dispatches to the managed type
+synchronously — it spins or reuses a managed instance up to `max_background`.
+`review`/`implement` to a type still use `--background`.
 
 ## Multi-Repo Work
 
