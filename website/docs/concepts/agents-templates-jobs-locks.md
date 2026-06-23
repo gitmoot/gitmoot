@@ -102,6 +102,33 @@ reusable, addressable, trainable, and resume a warm session; ephemeral workers
 are zero-setup and self-cleaning but cold-spawn each time and carry no
 accumulated identity.
 
+## Running one agent's jobs concurrently
+
+A single registered agent answers one **foreground** ask at a time —
+`gitmoot agent ask <name>` pins one resumable runtime session, serialized by the
+runtime session lock. To run the *same* agent on several tasks at once, dispatch
+**background** jobs; the daemon spins extra sessions two ways:
+
+- **Temp-session forking** — the default. `[parallel_sessions]` ships with
+  `same_session = "fork_temp_session"` and `max_temp_sessions_per_agent = 4`, so a
+  busy registered agent's extra eligible background jobs (`ask` / `review` /
+  `implement`) fork throwaway **temp workers** that run in parallel (same runtime
+  only; same-checkout work stays serialized; `implement` needs a task worktree).
+  Zero configuration — this is the "temp worker" column in the table above.
+- **Managed agent types** — `gitmoot agent type set <type> --max-background N`
+  defines a reusable, addressable pool. Dispatch with
+  `gitmoot agent run <type> --type <type> --background …` and the daemon reuses an
+  idle instance or spins a new one, up to `N`.
+
+Both need daemon **job slots** to run at the same time: `max_background` and temp
+sessions are session slots, but the daemon still executes at most `--workers`
+jobs at once (default `1`; raise it, e.g. `--workers 6`).
+
+**Precedence:** dispatch resolves a registered single instance by name *before* a
+managed type, so a single agent named `researcher` shadows a `researcher` type —
+force the type with `--type researcher`. Foreground `gitmoot agent ask <type>`
+cannot route to a type today (it returns `agent not found`); use `--background`.
+
 ## Locks
 
 Gitmoot uses separate locks for separate resources:

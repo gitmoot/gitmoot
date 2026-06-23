@@ -334,6 +334,15 @@ gitmoot agent gc
 `agent type set --model <name>` (or `[agents.<type>].model` in config) sets the
 default runtime model for that managed agent type.
 
+A registered single instance **shadows** a managed type of the same name:
+dispatch resolves `gitmoot agent <name>` to a registered single instance before a
+type, so force the type with `--type <name>` (or do not register a single
+instance of that name). Managed-type auto-spin and `[parallel_sessions]`
+temp-session forking happen on the **background** path only — a foreground
+`gitmoot agent ask <type> --type <type>` returns `agent not found`; use
+`--background`. See [Running one agent's jobs
+concurrently](../concepts/agents-templates-jobs-locks.md#running-one-agents-jobs-concurrently).
+
 ## Agent Templates
 
 Install or refresh the built-in thermo review template:

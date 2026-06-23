@@ -401,6 +401,39 @@ than one, or forkable temporary workers. By default `[parallel_sessions]` uses
 serialized; same-runtime Codex/Claude jobs can fork only when the action is
 eligible and implementation jobs have a safe task worktree.
 
+### Running one agent's jobs in parallel
+
+One registered agent serves one **foreground** ask at a time: `gitmoot agent ask
+<name>` pins a single resumable runtime session, serialized by the
+`runtime:<runtime>:<runtime_ref>` lock. Foreground asks do not auto-fork — to run
+the *same* agent on several questions at once, dispatch them as **background**
+jobs, where two mechanisms spin extra sessions for you:
+
+1. **Temp-session forking (default, zero-config).** `[parallel_sessions]` ships
+   with `same_session = "fork_temp_session"` and `max_temp_sessions_per_agent =
+   4`: when a registered agent's session is busy and another **eligible**
+   background job (`ask`/`review`/`implement`) is queued for it, the daemon forks
+   a throwaway temp worker from that agent so the jobs run in parallel. Same
+   runtime only (Codex/Claude/Kimi); same-checkout work stays serialized; an
+   `implement` fork needs a safe task worktree. Nothing to configure.
+2. **Managed agent types (`max_background`).** `gitmoot agent type set <type>
+   --max-background N` defines a *pool* of named, reusable managed instances.
+   Dispatch to the type with `gitmoot agent run <type> --type <type>
+   --background …` and the daemon reuses an idle instance or spins a new one, up
+   to `N`.
+
+Both only deliver real parallelism when the daemon has job slots: raise
+`--workers` above the default `1` (e.g. `--workers 6`) so `max_background`
+instances / temp sessions actually run concurrently.
+
+**Precedence — a single instance shadows a same-named type.** Dispatch resolves a
+registered agent by name **first**, so if you `gitmoot agent start researcher`
+*and* `gitmoot agent type set researcher`, plain `researcher` always uses the
+single instance. Force the managed type with `--type researcher` (or don't
+register a single instance of that name). A **foreground** ask cannot route to a
+type today — `gitmoot agent ask <type> --type <type>` errors `agent not found`;
+use `--background`.
+
 ## Multi-Repo Work
 
 Agents are global identities with explicit per-repo access. When working across
