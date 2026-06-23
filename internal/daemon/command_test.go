@@ -30,6 +30,46 @@ func TestParseCommandAskAgentShape(t *testing.T) {
 	}
 }
 
+// TestParseCommandMentionForm is the regression guard for the #389 live bug: a
+// real user summons an agent on an issue with a bare `@<agent> ask …` mention,
+// not `/gitmoot <agent> ask …`. The parser previously required the line to start
+// with `/gitmoot`, so the mention was silently dropped — PollIssuesOnce saw zero
+// commands, routed no job, and posted no reply. ParseCommand must now treat a
+// leading `@<agent>` as the same agent-first command, with the `@` stripped.
+func TestParseCommandMentionForm(t *testing.T) {
+	command, ok := ParseCommand("@helper ask Reply with exactly: ok")
+	if !ok {
+		t.Fatal("ParseCommand did not parse @<agent> ask mention")
+	}
+	if command.Agent != "helper" || command.Action != "ask" || command.Instructions != "Reply with exactly: ok" {
+		t.Fatalf("command = %+v", command)
+	}
+
+	// The mention form is general agent-first, mirroring the /gitmoot form.
+	command, ok = ParseCommand("@builder implement fix the flaky test")
+	if !ok {
+		t.Fatal("ParseCommand did not parse @<agent> implement mention")
+	}
+	if command.Agent != "builder" || command.Action != "implement" || command.Instructions != "fix the flaky test" {
+		t.Fatalf("command = %+v", command)
+	}
+
+	// A bare `@agent` with no action is not a command.
+	if _, ok := ParseCommand("@helper"); ok {
+		t.Fatal("ParseCommand accepted a bare @agent with no action")
+	}
+
+	// A lone `@` is not a mention.
+	if _, ok := ParseCommand("@ ask something"); ok {
+		t.Fatal("ParseCommand accepted a lone @ as a mention")
+	}
+
+	// Plain prose that merely contains an @mention mid-line is not a command.
+	if _, ok := ParseCommand("thanks @helper for the help"); ok {
+		t.Fatal("ParseCommand accepted mid-line prose as a mention command")
+	}
+}
+
 func TestParseCommandsOnlyReturnsGitmootLines(t *testing.T) {
 	commands := ParseCommands("hello\n/gitmoot status\n/gitmoot merge when ready\nthanks")
 	if len(commands) != 2 {

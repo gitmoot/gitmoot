@@ -2597,6 +2597,50 @@ func TestValidateTargetCheckoutAllowsSharedCheckoutDelegationChildWithoutHeadSHA
 	}
 }
 
+// TestDefaultCheckoutAllowsBranchlessIssueAsk is the regression guard for the
+// #389 live bug: an issue `@<agent> ask` job carries the *issue number* in
+// PullRequest (>0) but no Branch (the question stands alone). The `ask` case in
+// defaultCheckout previously gated its branch validation on PullRequest>0, so an
+// issue ask was rejected with "checkout branch is main, not job branch " — the
+// job failed instead of answering, and no real reply was ever posted. This test
+// drives the real defaultCheckout against a real git checkout that is on `main`
+// (not the empty job branch) and asserts the branchless issue ask is accepted.
+// It also asserts that a branch-carrying ask (the PR ask) is still validated, so
+// the PR ask's checkout guard is not weakened.
+func TestDefaultCheckoutAllowsBranchlessIssueAsk(t *testing.T) {
+	ctx := context.Background()
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	worker := defaultJobWorker(store, io.Discard)
+
+	issueAsk := workflow.JobPayload{
+		Repo:        "owner/repo",
+		PullRequest: 7, // the issue number; >0 but carries no branch
+		// Branch and HeadSHA intentionally empty (issue ask, no PR context).
+	}
+	job := db.Job{ID: "issue-comment-regression", Type: "ask"}
+	got, err := worker.defaultCheckout(ctx, job, issueAsk, runtime.Agent{})
+	if err != nil {
+		t.Fatalf("defaultCheckout rejected branchless issue ask: %v", err)
+	}
+	if got != checkout {
+		t.Fatalf("defaultCheckout = %q, want %q", got, checkout)
+	}
+
+	// A PR ask carries the PR head branch; when that branch does not match the
+	// checkout (here the checkout is on `main`), validation must still fail so the
+	// PR ask guard is preserved.
+	prAsk := workflow.JobPayload{
+		Repo:        "owner/repo",
+		PullRequest: 12,
+		Branch:      "feature-branch",
+	}
+	if _, err := worker.defaultCheckout(ctx, job, prAsk, runtime.Agent{}); err == nil {
+		t.Fatal("defaultCheckout accepted a PR ask whose branch does not match the checkout")
+	}
+}
+
 func TestRefreshDaemonJobPayloadPreservesTaskWorktreeHeadForFinalizer(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()

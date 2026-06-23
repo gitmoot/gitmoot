@@ -25,7 +25,20 @@ func ParseCommands(body string) []Command {
 
 func ParseCommand(line string) (Command, bool) {
 	fields := strings.Fields(strings.TrimSpace(line))
-	if len(fields) == 0 || fields[0] != "/gitmoot" {
+	if len(fields) == 0 {
+		return Command{}, false
+	}
+	// Issue/PR mention form (#389): a bare `@<agent> <action> …` line routes to
+	// that agent, exactly like the `/gitmoot <agent> <action> …` agent-first form.
+	// This is the natural way a user summons an agent on an issue, so it is the
+	// trigger the issue-comment watcher actually receives.
+	if strings.HasPrefix(fields[0], "@") && len(fields[0]) > 1 {
+		if len(fields) < 2 {
+			return Command{}, false
+		}
+		return Command{Action: fields[1], Agent: cleanAgent(fields[0]), Instructions: trailing(fields, 2)}, true
+	}
+	if fields[0] != "/gitmoot" {
 		return Command{}, false
 	}
 	if len(fields) == 1 {

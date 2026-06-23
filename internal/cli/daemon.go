@@ -3746,7 +3746,16 @@ func (w jobWorker) defaultCheckout(ctx context.Context, job db.Job, payload work
 			}
 		}
 	case "ask":
-		if payload.PullRequest > 0 {
+		// A PR ask carries BOTH the PR head branch and PullRequest>0, so the
+		// registered checkout must be on that branch/head before the agent reads
+		// the tree. An issue ask (#389) reuses PullRequest for the *issue number*
+		// (PullRequest>0) but carries no branch, so the prior `PullRequest > 0`
+		// gate wrongly validated it against the job branch and failed it with
+		// "checkout branch is main, not job branch ". Require both a positive
+		// PullRequest AND a branch so only a real PR ask is validated; a branchless
+		// issue ask — and a branch-only PR-less CLI ask — run against the
+		// registered checkout as-is.
+		if payload.PullRequest > 0 && strings.TrimSpace(payload.Branch) != "" {
 			if err := w.validateTargetCheckout(ctx, payload, checkout); err != nil {
 				return "", err
 			}

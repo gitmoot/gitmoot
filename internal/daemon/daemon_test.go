@@ -2227,6 +2227,70 @@ func TestPollIssuesOnceIgnoresNonAskAndUnknownAgent(t *testing.T) {
 	}
 }
 
+// TestHandleIssueCommentRoutesMentionForm is the daemon-level regression guard
+// for the #389 live bug. The existing PollIssuesOnce test fed `/gitmoot <agent>
+// ask …` and passed, so it never exercised the form a real user types: a bare
+// `@<agent> ask …` mention. handleIssueComment ran ParseCommands on that mention,
+// got zero commands, and silently returned nil — no job, no reply. This drives
+// the real handleIssueComment with the exact live mention body and asserts it
+// enqueues the deduped issue ask job and posts the acknowledgement.
+func TestHandleIssueCommentRoutesMentionForm(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "helper",
+		Role:           "helper",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"ask"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+	client := &fakeGitHub{}
+	d := Daemon{Repo: repo, Store: store, GitHub: client, WatchIssues: true}
+
+	issue := github.Issue{Number: 1, Title: "Question", State: "open"}
+	comment := github.IssueComment{ID: 900, Body: "@helper ask Reply with exactly: ok", Author: "alice"}
+	if err := d.handleIssueComment(ctx, issue, comment); err != nil {
+		t.Fatalf("handleIssueComment returned error: %v", err)
+	}
+
+	wantID := issueJobID(repo, 1, 900, 0, "helper", "ask")
+	job, err := store.GetJob(ctx, wantID)
+	if err != nil {
+		t.Fatalf("GetJob returned error (mention was not routed): %v", err)
+	}
+	if job.Agent != "helper" || job.Type != "ask" || job.State != string(workflow.JobQueued) {
+		t.Fatalf("job = %+v", job)
+	}
+	var payload workflow.JobPayload
+	if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload.Instructions != "Reply with exactly: ok" {
+		t.Fatalf("payload instructions = %q", payload.Instructions)
+	}
+	if len(client.posted) != 1 || client.posted[0].issueNumber != 1 {
+		t.Fatalf("posted = %+v, want 1 ack on issue 1", client.posted)
+	}
+	if !strings.Contains(client.posted[0].body, "queued `ask` job") || !strings.Contains(client.posted[0].body, "`helper`") {
+		t.Fatalf("ack body = %q", client.posted[0].body)
+	}
+
+	// Re-running the same mention must dedupe: the comment is now seen, so no
+	// duplicate job or ack.
+	if err := d.handleIssueComment(ctx, issue, comment); err != nil {
+		t.Fatalf("second handleIssueComment returned error: %v", err)
+	}
+	if len(client.posted) != 1 {
+		t.Fatalf("posted after re-run = %+v, want 1 (deduped)", client.posted)
+	}
+}
+
 func testStore(t *testing.T) *db.Store {
 	t.Helper()
 	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
