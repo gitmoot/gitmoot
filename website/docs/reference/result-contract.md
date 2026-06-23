@@ -118,6 +118,44 @@ the same `delegations` field, `coordinator`, and `continuation` mechanics.
   (for example a Codex, Claude Code, or Kimi Code model name). When omitted, the
   delegated agent's configured default model is used. There is no allow-list;
   Gitmoot passes the value through to the runtime as-is.
+
+  **Model-tier routing (recommendation).** Picking a per-delegation `model` is
+  the coordinator's call — Gitmoot does not choose or override it. As a costing
+  heuristic, think of each leg as falling into one of four abstract **tiers**,
+  then map the tier to a concrete model for whichever runtime the leg uses:
+
+  - **mechanical** — rote, deterministic edits (a rename, a codemod-style
+    find-and-replace, a version bump, regenerating a file). Use the smallest /
+    cheapest model.
+  - **cheap** — low-complexity legs (a short `ask`, a narrow single-file
+    lookup). A small, fast model is enough.
+  - **standard** — ordinary work with no strong hardness signal. **Leave
+    `model` empty** so the leg runs on the delegated agent's runtime default.
+  - **deep** — genuinely hard or quorum-critical legs. Reserve a strong,
+    expensive model.
+
+  Cheap **hardness signals** a coordinator can read off a leg before dispatch: a
+  long, detailed prompt; hard-topic keywords (`architecture`, `oauth`, `schema`,
+  `concurrency`, `migration`, `security`, `refactor`, …); a multi-file
+  `implement`/`fix` action versus a read-only `ask`; broad scope (several
+  `artifacts` or a dedicated `worktree`); and whether the leg is part of a
+  `quorum`. More of these lean **deep**; their absence leans **cheap**. Gitmoot
+  ships an uncalibrated helper for this — `workflow.ScoreComplexity` /
+  `workflow.TierFor` (`internal/workflow/modeltier.go`) — that turns a
+  delegation into a tier. It is a pure recommendation primitive: the engine
+  never calls it and never overrides a coordinator's chosen `model`.
+
+  **Cascade / escalate-in-continuation pattern.** Prefer to start a leg on the
+  cheapest plausible tier and **escalate in a continuation** only if it falls
+  short: run the first attempt on a cheap/standard model, and if the result is
+  `blocked`/`failed` (or a `quorum` vote is not met), have the coordinator
+  re-issue that leg in its next round on a deep model. This keeps the common
+  case cheap while still reaching a strong model for the legs that genuinely
+  need it.
+
+  **Rule of thumb:** downshift `model` for cheap/mechanical legs; leave `model`
+  empty for standard legs (so they take the runtime default); and reserve a deep
+  model for genuinely hard or quorum-critical legs.
 - `phase` (optional): a free-form per-delegation string. It is pass-through
   metadata — Gitmoot carries it through to the child job untouched and echoes it
   back in the coordinator continuation for each delegation that set a non-empty
