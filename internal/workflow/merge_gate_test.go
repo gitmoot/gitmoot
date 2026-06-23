@@ -925,6 +925,90 @@ func TestPolicyMergeGateBlocksLegacyReviewWithoutHeadSHA(t *testing.T) {
 	}
 }
 
+// TestPolicyMergeGateAdvancesIntegrationWorktreeReviewWithoutHeadSHA is the #388
+// regression: a gate-required review that ran on a #332 integration worktree has
+// its inherited HeadSHA cleared by design (the worktree carries no branch and is
+// validated against its own fresh HEAD). The gate must not treat that empty SHA
+// as a stale/unverifiable review — otherwise the merge deadlocks because the
+// required review can never be satisfied. With the fix the PR advances and merges.
+func TestPolicyMergeGateAdvancesIntegrationWorktreeReviewWithoutHeadSHA(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: "jerryfane/gitmoot",
+		Number:       9,
+		URL:          "https://github.com/jerryfane/gitmoot/pull/9",
+		HeadBranch:   "task-9",
+		BaseBranch:   "main",
+		HeadSHA:      "head123",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	// An integration-worktree review: a delegation child (DelegationID +
+	// WorktreePath set) whose HeadSHA the engine intentionally cleared.
+	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review", DelegationID: "verify-gate"}, JobPayload{
+		Repo:         "jerryfane/gitmoot",
+		PullRequest:  9,
+		TaskID:       "task-9",
+		ReviewRound:  "review-1",
+		DelegationID: "verify-gate",
+		WorktreePath: "/tmp/gitmoot/integration-verify-gate",
+		Result:       &AgentResult{Decision: "approved", Summary: "integration verified"},
+	})
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr:          github.PullRequest{Number: 9, HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
+		status:      github.CombinedStatus{State: "success"},
+		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+	}
+	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "jerryfane/gitmoot", PullRequest: 9, TaskID: "task-9"})
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.Merged {
+		t.Fatalf("integration-worktree review did not advance to merge: decision = %+v", decision)
+	}
+}
+
+// TestPolicyMergeGateBlocksDelegationReviewForMismatchedHead is the safety guard:
+// the #388 exception applies only to an empty HeadSHA. A delegation review that
+// DID record a head SHA which does not match the PR head is still a real mismatch
+// and must STILL be rejected — the integration-worktree carve-out must not weaken
+// the head-match check for any review that carries a concrete (wrong) SHA.
+func TestPolicyMergeGateBlocksDelegationReviewForMismatchedHead(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review", DelegationID: "verify-gate"}, JobPayload{
+		Repo:         "jerryfane/gitmoot",
+		PullRequest:  9,
+		HeadSHA:      "stale999",
+		TaskID:       "task-9",
+		ReviewRound:  "review-1",
+		DelegationID: "verify-gate",
+		WorktreePath: "/tmp/gitmoot/integration-verify-gate",
+		Result:       &AgentResult{Decision: "approved", Summary: "ready"},
+	})
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr:     github.PullRequest{Number: 9, HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
+		status: github.CombinedStatus{State: "success"},
+	}
+	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "jerryfane/gitmoot", PullRequest: 9, TaskID: "task-9"})
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if decision.Ready || !strings.Contains(decision.Reason, "different head SHA") {
+		t.Fatalf("delegation review with mismatched head was not rejected: decision = %+v", decision)
+	}
+}
+
 func TestPolicyMergeGateBlocksMissingFinalReview(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

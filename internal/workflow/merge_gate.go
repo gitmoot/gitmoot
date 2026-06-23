@@ -440,7 +440,28 @@ func (g PolicyMergeGate) ensureReviewMatchesHead(payload JobPayload, headSHA str
 	if reviewHead != "" {
 		return fmt.Errorf("latest review from %s is for a different head SHA", agent)
 	}
+	// A review that ran in an integration worktree (#332 decompose-and-verify)
+	// has its inherited HeadSHA deliberately cleared by the engine
+	// (allocateAndEnqueueDelegation in engine.go): the worktree carries no
+	// branch and is validated against its own fresh HEAD, not the parent PR
+	// head. Such a review legitimately records no head SHA, so accepting it here
+	// is what lets a gate-required integration review advance instead of
+	// deadlocking. This is narrow: a normal review with a mismatched non-empty
+	// head still fails above, and a normal review missing a head SHA but lacking
+	// the integration-worktree markers still fails below.
+	if isIntegrationWorktreeReview(payload) {
+		return nil
+	}
 	return fmt.Errorf("latest review from %s does not record a head SHA; rerun review", agent)
+}
+
+// isIntegrationWorktreeReview reports whether the review job ran in a
+// gitmoot-managed delegation worktree (it carries both a delegation id and an
+// allocated worktree path). The engine clears the inherited HeadSHA for exactly
+// these children so they validate against their isolated worktree HEAD, mirroring
+// isDelegationWorktreeChild in the daemon's checkout validation.
+func isIntegrationWorktreeReview(payload JobPayload) bool {
+	return strings.TrimSpace(payload.DelegationID) != "" && strings.TrimSpace(payload.WorktreePath) != ""
 }
 
 func (g PolicyMergeGate) ensureStatuses(ctx context.Context, repo github.Repository, pullRequest int64, headSHA string) error {
