@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -79,10 +80,60 @@ func TestClaudeLiveCheckClassifiesAuthFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("ClaudeLiveCheck accepted auth failure")
 	}
-	for _, want := range []string{"Claude Code authentication failed", "claude setup-token", "restart the Gitmoot daemon"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("error missing %q:\n%s", want, err)
-		}
+	// A real subprocess auth/session failure must surface the session-failure
+	// message (refresh + rebind), not the background-token caveat.
+	if !strings.Contains(err.Error(), ClaudeSessionAuthFailedMessage) {
+		t.Fatalf("error missing session-failure message:\n%s", err)
+	}
+	if strings.Contains(err.Error(), ClaudeBackgroundTokenMessage) {
+		t.Fatalf("error must not reuse the background-token caveat for a real auth failure:\n%s", err)
+	}
+}
+
+// (F) The two messages must be distinct, and a classified subprocess auth/session
+// failure (the path the adapter uses) must wrap the session message — never the
+// background-token caveat.
+func TestClaudeAuthMessagesAreDistinct(t *testing.T) {
+	if ClaudeBackgroundTokenMessage == ClaudeSessionAuthFailedMessage {
+		t.Fatal("background-token and session-failure messages must differ")
+	}
+	if !strings.Contains(ClaudeBackgroundTokenMessage, "background") {
+		t.Fatalf("background-token message lost its background-job framing:\n%s", ClaudeBackgroundTokenMessage)
+	}
+	if !strings.Contains(ClaudeSessionAuthFailedMessage, "session") {
+		t.Fatalf("session-failure message lost its session framing:\n%s", ClaudeSessionAuthFailedMessage)
+	}
+	err := ClassifyClaudeCommandError(
+		subprocess.Result{Stderr: "401 Invalid authentication credentials"},
+		errors.New("exit 1"),
+	)
+	if err == nil || !strings.Contains(err.Error(), ClaudeSessionAuthFailedMessage) {
+		t.Fatalf("ClassifyClaudeCommandError must wrap the session message:\n%v", err)
+	}
+}
+
+// A missing/unexecutable claude binary is "probe unavailable", not an auth
+// failure — ClaudeProbeUnavailable distinguishes it so doctor never false-fails.
+func TestClaudeProbeUnavailableClassifiesMissingBinary(t *testing.T) {
+	runner := &fakeRunner{
+		errs: []error{&exec.Error{Name: "claude", Err: exec.ErrNotFound}},
+	}
+	err := ClaudeLiveCheck(context.Background(), runner, "/repo")
+	if err == nil {
+		t.Fatal("ClaudeLiveCheck accepted a missing binary")
+	}
+	if !ClaudeProbeUnavailable(err) {
+		t.Fatalf("missing binary not classified as probe-unavailable:\n%v", err)
+	}
+	authErr := ClassifyClaudeCommandError(
+		subprocess.Result{Stderr: "401 authentication_error"},
+		errors.New("exit 1"),
+	)
+	if ClaudeProbeUnavailable(authErr) {
+		t.Fatalf("auth failure must NOT be classified as probe-unavailable:\n%v", authErr)
+	}
+	if ClaudeProbeUnavailable(nil) {
+		t.Fatal("nil error must not be probe-unavailable")
 	}
 }
 

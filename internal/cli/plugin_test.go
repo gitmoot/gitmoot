@@ -477,8 +477,8 @@ func TestRunPluginDoctorClaudeLiveClassifiesAuthFailure(t *testing.T) {
 	if check.Status != "fail" {
 		t.Fatalf("runtime-live status = %q, want fail; checks=%+v", check.Status, output.Runtimes[0].Checks)
 	}
-	if !strings.Contains(check.Detail, "claude setup-token") || !strings.Contains(check.Detail, "restart the Gitmoot daemon") {
-		t.Fatalf("runtime-live detail = %q, want classified auth guidance", check.Detail)
+	if !strings.Contains(check.Detail, runtime.ClaudeSessionAuthFailedMessage) {
+		t.Fatalf("runtime-live detail = %q, want session-failure guidance", check.Detail)
 	}
 }
 

@@ -552,7 +552,7 @@ func ClassifyClaudeCommandError(result subprocess.Result, err error) error {
 	if !isClaudeAuthFailure(result) {
 		return base
 	}
-	return fmt.Errorf("Claude Code authentication failed. %s: %w", ClaudeAuthSetupMessage, base)
+	return fmt.Errorf("Claude Code authentication failed. %s: %w", ClaudeSessionAuthFailedMessage, base)
 }
 
 func isClaudeAuthFailure(result subprocess.Result) bool {

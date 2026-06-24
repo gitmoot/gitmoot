@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -2521,28 +2522,151 @@ func TestRunAgentDoctorClaudeReportsMaskedAuthEnv(t *testing.T) {
 	}
 }
 
-func TestRunAgentDoctorClaudeFailsWhenAuthEnvMissing(t *testing.T) {
+// (A) env-missing but the live probe authenticates fine → the env check is not
+// a failure; report warn/0 with the background-token caveat (NOT failed, NOT a
+// dead-session message). This is the false-negative the live-probe fallback fixes.
+func TestRunAgentDoctorClaudeAuthEnvMissingProbeOKWarns(t *testing.T) {
 	withClaudeAuthEnv(t, nil)
 	home := t.TempDir()
-	subscribeClaudeAgent(t, home, "claude-missing")
+	subscribeClaudeAgent(t, home, "claude-probe-ok")
+	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"result":"OK"}`}}}
+	restoreRunner := replaceAgentDoctorRunner(runner)
+	defer restoreRunner()
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "doctor", "claude-missing", "--home", home}, &stdout, &stderr)
+	code := Run([]string{"agent", "doctor", "claude-probe-ok", "--home", home}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("doctor exit code = %d, want 0; stderr=%s\nstdout=%s", code, stderr.String(), stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "claude-auth-env warn") {
+		t.Fatalf("stdout missing claude-auth-env warn:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), runtime.ClaudeBackgroundTokenMessage) {
+		t.Fatalf("stdout missing background-token caveat:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), runtime.ClaudeSessionAuthFailedMessage) ||
+		strings.Contains(stderr.String(), runtime.ClaudeSessionAuthFailedMessage) {
+		t.Fatalf("output should NOT mention a dead-session message on probe-ok:\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
+	}
+	// The probe must actually be invoked even without --live.
+	runner.want(t, 0, "", "claude", "-p", "--output-format", "json", "--", runtime.ClaudeLiveCheckPrompt)
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	agent, err := store.GetAgent(context.Background(), "claude-probe-ok")
+	if err != nil {
+		t.Fatalf("GetAgent returned error: %v", err)
+	}
+	if agent.HealthStatus != "warn" {
+		t.Fatalf("health status = %q, want warn", agent.HealthStatus)
+	}
+}
+
+// (B) env-missing and the live probe returns an auth-classified failure → escalate
+// to failed/1 with the SESSION-failure message (refresh/rebind), not just "set up
+// a token".
+func TestRunAgentDoctorClaudeAuthEnvMissingProbeFailsSession(t *testing.T) {
+	withClaudeAuthEnv(t, nil)
+	home := t.TempDir()
+	subscribeClaudeAgent(t, home, "claude-probe-fail")
+	runner := &agentStartRunner{
+		results: []subprocess.Result{{Stderr: "401 Invalid authentication credentials"}},
+		errs:    []error{errors.New("exit 1")},
+	}
+	restoreRunner := replaceAgentDoctorRunner(runner)
+	defer restoreRunner()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"agent", "doctor", "claude-probe-fail", "--home", home}, &stdout, &stderr)
 
 	if code != 1 {
 		t.Fatalf("doctor exit code = %d, want 1; stderr=%s\nstdout=%s", code, stderr.String(), stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "claude-auth-env warn") || !strings.Contains(stderr.String(), "claude setup-token") {
-		t.Fatalf("doctor output missing setup guidance:\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
+	if !strings.Contains(stdout.String(), "claude-live fail") {
+		t.Fatalf("stdout missing classified probe failure:\n%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), runtime.ClaudeSessionAuthFailedMessage) {
+		t.Fatalf("stderr missing session-failure message:\n%s", stderr.String())
 	}
 	store := openCLIJobStore(t, home)
 	defer store.Close()
-	agent, err := store.GetAgent(context.Background(), "claude-missing")
+	agent, err := store.GetAgent(context.Background(), "claude-probe-fail")
 	if err != nil {
 		t.Fatalf("GetAgent returned error: %v", err)
 	}
 	if agent.HealthStatus != "failed" {
 		t.Fatalf("health status = %q, want failed", agent.HealthStatus)
+	}
+}
+
+// (C) env-missing and the probe is unavailable (binary missing / exec error) →
+// warn/0 with the caveat; never a NEW false-fail just because the CLI is absent.
+func TestRunAgentDoctorClaudeAuthEnvMissingProbeUnavailableWarns(t *testing.T) {
+	withClaudeAuthEnv(t, nil)
+	home := t.TempDir()
+	subscribeClaudeAgent(t, home, "claude-probe-unavail")
+	runner := &agentStartRunner{
+		errs: []error{&exec.Error{Name: "claude", Err: exec.ErrNotFound}},
+	}
+	restoreRunner := replaceAgentDoctorRunner(runner)
+	defer restoreRunner()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"agent", "doctor", "claude-probe-unavail", "--home", home}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("doctor exit code = %d, want 0; stderr=%s\nstdout=%s", code, stderr.String(), stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "claude-live warn probe unavailable") {
+		t.Fatalf("stdout missing probe-unavailable warn line:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), runtime.ClaudeBackgroundTokenMessage) {
+		t.Fatalf("stdout missing background-token caveat:\n%s", stdout.String())
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	agent, err := store.GetAgent(context.Background(), "claude-probe-unavail")
+	if err != nil {
+		t.Fatalf("GetAgent returned error: %v", err)
+	}
+	if agent.HealthStatus != "warn" {
+		t.Fatalf("health status = %q, want warn", agent.HealthStatus)
+	}
+}
+
+// (D) env token present → ok/0, the runner is NOT consulted (env-Ready boxes stay
+// instant; no probe).
+func TestRunAgentDoctorClaudeAuthEnvPresentSkipsProbe(t *testing.T) {
+	withClaudeAuthEnv(t, map[string]string{runtime.ClaudeOAuthTokenEnv: "secret-token"})
+	home := t.TempDir()
+	subscribeClaudeAgent(t, home, "claude-env-ok")
+	runner := &agentStartRunner{}
+	restoreRunner := replaceAgentDoctorRunner(runner)
+	defer restoreRunner()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"agent", "doctor", "claude-env-ok", "--home", home}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("doctor exit code = %d, want 0; stderr=%s\nstdout=%s", code, stderr.String(), stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "claude-auth-env ok") {
+		t.Fatalf("stdout missing claude-auth-env ok:\n%s", stdout.String())
+	}
+	runner.mu.Lock()
+	calls := len(runner.calls)
+	runner.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("runner consulted %d times, want 0 (env-Ready must not probe)", calls)
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	agent, err := store.GetAgent(context.Background(), "claude-env-ok")
+	if err != nil {
+		t.Fatalf("GetAgent returned error: %v", err)
+	}
+	if agent.HealthStatus != "ok" {
+		t.Fatalf("health status = %q, want ok", agent.HealthStatus)
 	}
 }
 

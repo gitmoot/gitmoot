@@ -397,10 +397,13 @@ func TestClaudeStartClassifiesAuthFailure(t *testing.T) {
 		t.Fatal("Start accepted auth failure")
 	}
 	errText := err.Error()
-	for _, want := range []string{"Claude Code authentication failed", "claude setup-token", "restart the Gitmoot daemon", "401 Invalid authentication credentials"} {
+	for _, want := range []string{"Claude Code authentication failed", ClaudeSessionAuthFailedMessage, "401 Invalid authentication credentials"} {
 		if !strings.Contains(errText, want) {
 			t.Fatalf("error missing %q:\n%s", want, errText)
 		}
+	}
+	if strings.Contains(errText, ClaudeBackgroundTokenMessage) {
+		t.Fatalf("real subprocess auth failure must not reuse the background-token caveat:\n%s", errText)
 	}
 	if result.Raw != raw {
 		t.Fatalf("raw = %q, want %q", result.Raw, raw)
@@ -479,10 +482,13 @@ func TestClaudeDeliverClassifiesAuthFailure(t *testing.T) {
 		t.Fatal("Deliver accepted auth failure")
 	}
 	errText := err.Error()
-	for _, want := range []string{"Claude Code authentication failed", "claude setup-token", "restart the Gitmoot daemon", raw} {
+	for _, want := range []string{"Claude Code authentication failed", ClaudeSessionAuthFailedMessage, raw} {
 		if !strings.Contains(errText, want) {
 			t.Fatalf("error missing %q:\n%s", want, errText)
 		}
+	}
+	if strings.Contains(errText, ClaudeBackgroundTokenMessage) {
+		t.Fatalf("real subprocess auth failure must not reuse the background-token caveat:\n%s", errText)
 	}
 	if result.Raw != raw {
 		t.Fatalf("raw = %q, want %q", result.Raw, raw)
@@ -514,10 +520,13 @@ func TestClaudeHealthClassifiesAuthFailure(t *testing.T) {
 		t.Fatal("Health accepted auth failure")
 	}
 	errText := err.Error()
-	for _, want := range []string{"Claude Code authentication failed", "claude setup-token", "restart the Gitmoot daemon"} {
+	for _, want := range []string{"Claude Code authentication failed", ClaudeSessionAuthFailedMessage} {
 		if !strings.Contains(errText, want) {
 			t.Fatalf("error missing %q:\n%s", want, errText)
 		}
+	}
+	if strings.Contains(errText, ClaudeBackgroundTokenMessage) {
+		t.Fatalf("real subprocess auth failure must not reuse the background-token caveat:\n%s", errText)
 	}
 }
 

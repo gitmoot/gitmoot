@@ -1797,15 +1797,40 @@ func runAgentDoctor(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintf(stdout, "claude-auth-env %s %s\n", status, detail)
 		if !auth.Ready() && !*live {
-			_ = persistAgentHealth(*home, name, "failed")
-			fmt.Fprintf(stderr, "agent %s health failed: %s\n", rtAgent.Name, runtime.ClaudeAuthSetupMessage)
-			return 1
+			// Env not Ready does not mean auth is broken: foreground Claude may
+			// authenticate fine via cached ~/.claude credentials. Probe the real
+			// dependency (claude -p) instead of false-failing on the env check.
+			// A probe failure escalates to failed/1; an OK or unavailable probe
+			// reports warn/0 (degraded-but-serving) with the background-token
+			// caveat — never a new false-fail.
+			if err := runtime.ClaudeLiveCheck(context.Background(), agentDoctorRunner, ""); err != nil {
+				if runtime.ClaudeProbeUnavailable(err) {
+					fmt.Fprintf(stdout, "claude-live warn probe unavailable: %s\n", err)
+					if perr := persistAgentHealth(*home, name, "warn"); perr != nil {
+						fmt.Fprintf(stderr, "update agent health: %v\n", perr)
+						return 1
+					}
+					fmt.Fprintf(stdout, "agent %s warn %s\n", rtAgent.Name, runtime.ClaudeBackgroundTokenMessage)
+					return 0
+				}
+				_ = persistAgentHealth(*home, name, "failed")
+				fmt.Fprintf(stdout, "claude-live fail %s\n", err)
+				fmt.Fprintf(stderr, "agent %s health failed: %s: %v\n", rtAgent.Name, runtime.ClaudeSessionAuthFailedMessage, err)
+				return 1
+			}
+			fmt.Fprintln(stdout, "claude-live ok live Claude print-mode check succeeded")
+			if perr := persistAgentHealth(*home, name, "warn"); perr != nil {
+				fmt.Fprintf(stderr, "update agent health: %v\n", perr)
+				return 1
+			}
+			fmt.Fprintf(stdout, "agent %s warn %s\n", rtAgent.Name, runtime.ClaudeBackgroundTokenMessage)
+			return 0
 		}
 		if *live {
 			if err := runtime.ClaudeLiveCheck(context.Background(), agentDoctorRunner, ""); err != nil {
 				_ = persistAgentHealth(*home, name, "failed")
 				fmt.Fprintf(stdout, "claude-live fail %s\n", err)
-				fmt.Fprintf(stderr, "agent %s health failed: %v\n", rtAgent.Name, err)
+				fmt.Fprintf(stderr, "agent %s health failed: %s: %v\n", rtAgent.Name, runtime.ClaudeSessionAuthFailedMessage, err)
 				return 1
 			}
 			fmt.Fprintln(stdout, "claude-live ok live Claude print-mode check succeeded")

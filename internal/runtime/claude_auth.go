@@ -3,18 +3,27 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/subprocess"
 )
 
 const (
-	ClaudeOAuthTokenEnv    = "CLAUDE_CODE_OAUTH_TOKEN"
-	AnthropicAPIKeyEnv     = "ANTHROPIC_API_KEY"
-	AnthropicAuthTokenEnv  = "ANTHROPIC_AUTH_TOKEN"
-	ClaudeAuthSetupMessage = "Claude Code background jobs need non-interactive credentials. Run: claude setup-token; export CLAUDE_CODE_OAUTH_TOKEN=<token>; then restart the Gitmoot daemon so it inherits the token."
-	ClaudeLiveCheckPrompt  = "Gitmoot Claude live check. Return OK only."
+	ClaudeOAuthTokenEnv   = "CLAUDE_CODE_OAUTH_TOKEN"
+	AnthropicAPIKeyEnv    = "ANTHROPIC_API_KEY"
+	AnthropicAuthTokenEnv = "ANTHROPIC_AUTH_TOKEN"
+	// ClaudeBackgroundTokenMessage is the warn-path caveat: foreground Claude
+	// authenticates fine via cached credentials, but daemon background jobs run
+	// non-interactively and need an explicit token in the daemon env.
+	ClaudeBackgroundTokenMessage = "Foreground Claude works via cached credentials, but daemon background jobs run non-interactively and need a token in the daemon env. Run: claude setup-token; export CLAUDE_CODE_OAUTH_TOKEN=<token>; then restart the Gitmoot daemon so it inherits the token."
+	// ClaudeSessionAuthFailedMessage is the failure-path message: a genuine
+	// authentication/session failure (the cached session is expired or the
+	// --resume target is dead) that needs re-authentication and a fresh bind.
+	ClaudeSessionAuthFailedMessage = "Claude authentication/session failed; the cached session may be expired or the --resume target is dead. Re-authenticate (claude setup-token) and rebind the session."
+	ClaudeLiveCheckPrompt          = "Gitmoot Claude live check. Return OK only."
 )
 
 type ClaudeAuthEnv struct {
@@ -52,7 +61,7 @@ func (e ClaudeAuthEnv) MaskedDetail() string {
 func (e ClaudeAuthEnv) Warning() string {
 	switch {
 	case !e.Ready():
-		return ClaudeAuthSetupMessage
+		return ClaudeBackgroundTokenMessage
 	case e.AnthropicAPIKey:
 		return "ANTHROPIC_API_KEY is set; Claude Code may use API-key billing and this can override Claude OAuth behavior."
 	case e.AnthropicAuthToken:
@@ -78,6 +87,24 @@ func ClaudeLiveCheck(ctx context.Context, runner subprocess.Runner, dir string) 
 		return ClassifyClaudeCommandError(result, err)
 	}
 	return validateClaudeLiveJSON(result.Stdout)
+}
+
+// ClaudeProbeUnavailable reports whether a ClaudeLiveCheck error means the probe
+// could not run at all — the `claude` binary is missing or otherwise not
+// executable — as opposed to running and returning an auth/session failure. A
+// missing binary must never be classified as an auth failure: the operator may
+// simply lack the CLI on this box, which is not a new health regression. The
+// underlying exec error is wrapped with %w by commandError/ClassifyClaudeCommandError,
+// so errors.Is/As still reach it through the chain.
+func ClaudeProbeUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, exec.ErrNotFound) {
+		return true
+	}
+	var execErr *exec.Error
+	return errors.As(err, &execErr)
 }
 
 func validateClaudeLiveJSON(stdout string) error {
