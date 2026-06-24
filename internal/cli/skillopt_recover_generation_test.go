@@ -225,6 +225,169 @@ func TestSkillOptTrainRecoverGenerationRefusesLiveOwner(t *testing.T) {
 	}
 }
 
+func TestSkillOptTrainRecoverGenerationReclaimsDeadEmptyHostLock(t *testing.T) {
+	// Legacy strand (pre-#303): the lock was written by a binary that did not
+	// record owner_hostname, so it is empty. A local-first workflow treats an
+	// unrecorded host as this host, so a dead PID with an unexpired lease must be
+	// reclaimable — exactly the motivating case #303 exists to clear.
+	home, _ := seedSkillOptTrainItemsReady(t, 2)
+	seedStrandedGenerationLock(t, home, deadPID(t), "", time.Now().UTC().Add(time.Hour))
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "train", "recover", "--home", home, "--session", "landing-train", "--generation"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("recover empty-host exit code = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"mode: generation",
+		"lock_reclaimed: true",
+		"recovery_state: generation_complete",
+		"expected_items: 2",
+		"recovered_items: 2",
+		"missing_items: 0",
+		"persisted_options: 4",
+		"state_advanced: false",
+		"current_phase: items_ready",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("recover empty-host stdout missing %q:\n%s", want, out)
+		}
+	}
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	// The stranded lock must be gone.
+	if _, err := store.GetResourceLock(context.Background(), skillOptTrainGenerationLockKey("landing-train", "landing-train-001")); err == nil {
+		t.Fatalf("generation lock still held after empty-host reclaim")
+	}
+	// An audit event for the reclaim must exist.
+	events, err := store.ListJobEvents(context.Background(), "local-skillopt-train-generation-landing-train-deadbeef")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	foundReclaim := false
+	for _, event := range events {
+		if event.Kind == "lock_reclaimed" {
+			foundReclaim = true
+		}
+	}
+	if !foundReclaim {
+		t.Fatalf("no lock_reclaimed audit event recorded: %+v", events)
+	}
+	// State must NOT have advanced without --advance-state.
+	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "landing-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+	if iteration.State != skillopt.TrainStateItemsReady {
+		t.Fatalf("iteration state = %s, want items_ready", iteration.State)
+	}
+}
+
+func TestSkillOptTrainRecoverGenerationEmptyHostAdvanceState(t *testing.T) {
+	// Legacy empty-host strand with a dead owner: --advance-state must advance the
+	// complete run to options_generated, mirroring the same-host advance test.
+	home, _ := seedSkillOptTrainItemsReady(t, 2)
+	seedStrandedGenerationLock(t, home, deadPID(t), "", time.Now().UTC().Add(time.Hour))
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"skillopt", "train", "recover", "--home", home, "--session", "landing-train", "--generation", "--advance-state"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("recover empty-host --advance-state exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	for _, want := range []string{
+		"state_advanced: true",
+		"current_phase: options_generated",
+		"recovery_state: generation_complete",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("recover empty-host --advance-state stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "landing-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+	if iteration.State != skillopt.TrainStateOptionsGenerated {
+		t.Fatalf("iteration state after empty-host --advance-state = %s, want options_generated", iteration.State)
+	}
+}
+
+func TestSkillOptTrainRecoverGenerationEmptyHostAbortReclaims(t *testing.T) {
+	// --abort must reach the reclaim path for a legacy empty-host dead-owner lock
+	// (the host gate must not short-circuit before abort). Persisted items survive.
+	home, _ := seedSkillOptTrainItemsReady(t, 2)
+	seedStrandedGenerationLock(t, home, deadPID(t), "", time.Now().UTC().Add(time.Hour))
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "train", "recover", "--home", home, "--session", "landing-train", "--generation", "--abort"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("recover empty-host --abort exit code = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	for _, want := range []string{
+		"recovery_state: generation_lock_reclaimed",
+		"lock_reclaimed: true",
+		"current_phase: items_ready",
+		"state_advanced: false",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("recover empty-host --abort stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if _, err := store.GetResourceLock(context.Background(), skillOptTrainGenerationLockKey("landing-train", "landing-train-001")); err == nil {
+		t.Fatalf("generation lock still held after empty-host --abort reclaim")
+	}
+	options, err := store.ListEvalReviewOptions(context.Background(), "landing-train-review-001", "")
+	if err != nil {
+		t.Fatalf("ListEvalReviewOptions returned error: %v", err)
+	}
+	if len(options) != 4 {
+		t.Fatalf("abort dropped persisted options: got %d, want 4", len(options))
+	}
+}
+
+func TestSkillOptTrainRecoverGenerationEmptyHostRefusesLiveOwner(t *testing.T) {
+	// A LIVE owner with an empty (legacy) hostname must still be refused — never
+	// steal a live owner — and the message must NOT claim the owner is on another
+	// host (the host is simply unrecorded, and the workflow is local-first).
+	home, _ := seedSkillOptTrainItemsReady(t, 2)
+	seedStrandedGenerationLock(t, home, int64(os.Getpid()), "", time.Now().UTC().Add(time.Hour))
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "train", "recover", "--home", home, "--session", "landing-train", "--generation"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("recover empty-host live owner exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "recovery_state: generation_active") {
+		t.Fatalf("recover empty-host live owner stdout = %s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "skillopt train generation is already running") {
+		t.Fatalf("recover empty-host live owner stderr = %s", stderr.String())
+	}
+	// The message must report the running PID, not claim a foreign host.
+	if !strings.Contains(stderr.String(), "still running") {
+		t.Fatalf("recover empty-host live owner stderr missing 'still running': %s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "another host") || strings.Contains(stderr.String(), "owner on host") {
+		t.Fatalf("recover empty-host live owner stderr wrongly claims another host: %s", stderr.String())
+	}
+
+	// The live owner's lock must NOT have been stolen.
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	lock, err := store.GetResourceLock(context.Background(), skillOptTrainGenerationLockKey("landing-train", "landing-train-001"))
+	if err != nil {
+		t.Fatalf("live owner lock missing after refused recover: %v", err)
+	}
+	if lock.OwnerPID != int64(os.Getpid()) {
+		t.Fatalf("live owner lock owner pid = %d, want %d", lock.OwnerPID, os.Getpid())
+	}
+}
+
 func TestSkillOptTrainRecoverGenerationRequiresTTLForCrossHost(t *testing.T) {
 	home, _ := seedSkillOptTrainItemsReady(t, 2)
 	// Cross-host dead owner, lease NOT yet expired -> must refuse (cannot verify

@@ -8968,11 +8968,14 @@ func validateSkillOptTrainOptimizerRecoverableCompleteState(iteration db.SkillOp
 //
 // It is a liveness-gated steal-then-own: the stranded lock is reclaimed ONLY
 // when its owner PID is provably dead AND the lock was held on this same host
-// (owner_hostname == this host). A live owner is never stolen — recovery refuses
-// with the busy error so the operator stops the running process first. A
-// cross-host owner cannot be liveness-checked locally, so recovery requires the
-// lock's TTL to have expired before reclaiming it. The recover process then
-// re-acquires the lock for itself so the recovery is also crash-safe.
+// (owner_hostname == this host, OR owner_hostname is empty — a pre-#303 legacy
+// strand from a binary that did not record the host, treated as local since
+// skillopt train is local-first). A live owner is never stolen — recovery
+// refuses with the busy error so the operator stops the running process first. A
+// cross-host owner (a different, recorded host) cannot be liveness-checked
+// locally, so recovery requires the lock's TTL to have expired before reclaiming
+// it. The recover process then re-acquires the lock for itself so the recovery
+// is also crash-safe.
 //
 // Salvage is import-only: completed items are already durable (per-item commits
 // from #311), so recovery just classifies what is persisted vs. missing.
@@ -9018,25 +9021,39 @@ func recoverSkillOptTrainGenerationLock(ctx context.Context, paths config.Paths,
 		result.LockOwnerPID = lock.OwnerPID
 		result.LockOwnerHostname = strings.TrimSpace(lock.OwnerHostname)
 		ownerLive := skillOptOwnerPIDLive(lock.OwnerPID)
-		sameHost := strings.TrimSpace(lock.OwnerHostname) != "" && strings.EqualFold(strings.TrimSpace(lock.OwnerHostname), strings.TrimSpace(thisHost))
+		host := strings.TrimSpace(lock.OwnerHostname)
+		// Treat an empty/unrecorded owner_hostname as same-host-eligible: skillopt
+		// train is a local-first workflow (one local SQLite home), and an empty
+		// owner_hostname is the pre-#303 legacy case — the lock was written by a
+		// binary that didn't record the host. Those legacy strands are exactly the
+		// ones #303 exists to clear, so we treat an unknown host as this host. The
+		// PID-dead gate still applies: a LIVE owner is always refused (never steal a
+		// live owner); only a DEAD PID with an empty/this-host hostname is reclaimable.
+		sameHost := host == "" || strings.EqualFold(host, strings.TrimSpace(thisHost))
 		expired := !skillOptResourceLockActive(lock, now)
 		switch {
 		case ownerLive:
-			// Never steal a live owner — its deferred release will run.
+			// Never steal a live owner — its deferred release will run. When the
+			// host is unrecorded (legacy lock) the owner is, by the local-first
+			// invariant above, on this host, so say so rather than implying a
+			// foreign host we cannot verify.
 			result.Classification = "generation_active"
 			result.GenerationLockBlocked = true
 			result.NextAction = "stop the running generation process before recovering"
 			return result, fmt.Errorf("%w: %s (owner pid %d still running)", errSkillOptTrainGenerationBusy, lockKey, lock.OwnerPID)
 		case sameHost:
-			// Same-host dead owner: provably crashed, safe to reclaim.
+			// Same-host (or unrecorded/legacy host) dead owner: provably crashed,
+			// safe to reclaim.
 		case expired:
-			// Cross-host (or unknown-host) owner we cannot liveness-check: only
-			// reclaim once the lease has actually expired.
+			// Genuinely cross-host owner we cannot liveness-check: only reclaim
+			// once the lease has actually expired.
 		default:
+			// Genuinely cross-host (non-empty, different host) owner with an
+			// unexpired lease: cannot verify liveness, so refuse until TTL expiry.
 			result.Classification = "generation_active"
 			result.GenerationLockBlocked = true
 			result.NextAction = "owner is on another host; wait for the generation lock TTL to expire before recovering"
-			return result, fmt.Errorf("%w: %s (owner on host %q; cannot verify liveness, lease not expired)", errSkillOptTrainGenerationBusy, lockKey, strings.TrimSpace(lock.OwnerHostname))
+			return result, fmt.Errorf("%w: %s (owner on host %q; cannot verify liveness, lease not expired)", errSkillOptTrainGenerationBusy, lockKey, host)
 		}
 		// Reclaim by the stored owner job id (the deterministic identity of the
 		// crashed holder) and emit an audit event — there is no
