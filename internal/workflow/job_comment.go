@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -97,14 +98,233 @@ func writeFindings(builder *strings.Builder, findings []json.RawMessage) {
 	}
 	builder.WriteString("\n**Findings**\n")
 	for _, finding := range findings {
-		text := formatFinding(finding)
-		if text == "" {
-			continue
+		writeFinding(builder, finding)
+	}
+}
+
+// writeFinding renders a single finding. String findings render as a plain
+// bullet; object findings render as a bold heading plus an indented key/value
+// sub-list; anything unrenderable falls back to a pretty-printed fenced JSON
+// block. All emitted text is passed through limitCommentText for redaction and
+// truncation.
+func writeFinding(builder *strings.Builder, raw json.RawMessage) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return
+	}
+
+	// String finding -> plain bullet (unchanged behavior).
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		if strings.TrimSpace(text) == "" {
+			return
 		}
 		builder.WriteString("- ")
 		builder.WriteString(limitCommentText(text))
 		builder.WriteByte('\n')
+		return
 	}
+
+	// Object finding -> heading + indented key/value sub-list.
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err == nil && len(obj) > 0 {
+		writeFindingObject(builder, obj)
+		return
+	}
+
+	// Anything else (arrays, scalars, malformed) -> pretty-printed JSON block.
+	writeFindingJSONFallback(builder, raw)
+}
+
+// findingHeadingKeys are the conventional keys, in priority order, used to
+// derive a finding's bold heading. None is mandatory.
+var findingHeadingKeys = []string{"title", "approach", "name", "summary", "finding"}
+
+// findingSourceKeys are rendered as markdown links when present.
+var findingSourceKeys = map[string]bool{"source_url": true, "url": true, "source": true}
+
+func writeFindingObject(builder *strings.Builder, obj map[string]json.RawMessage) {
+	headingKey := ""
+	for _, key := range findingHeadingKeys {
+		if _, ok := obj[key]; ok {
+			if h := scalarFindingValue(obj[key]); strings.TrimSpace(h) != "" {
+				headingKey = key
+				break
+			}
+		}
+	}
+
+	heading := ""
+	if headingKey != "" {
+		heading = scalarFindingValue(obj[headingKey])
+	}
+
+	// A recommendation/severity-style qualifier shown alongside the heading.
+	qualifier := ""
+	for _, key := range []string{"recommendation", "severity", "status"} {
+		if _, ok := obj[key]; ok && key != headingKey {
+			if q := scalarFindingValue(obj[key]); strings.TrimSpace(q) != "" {
+				qualifier = q
+				break
+			}
+		}
+	}
+
+	builder.WriteString("- ")
+	if strings.TrimSpace(heading) != "" {
+		builder.WriteString("**")
+		builder.WriteString(limitCommentText(heading))
+		builder.WriteString("**")
+		if strings.TrimSpace(qualifier) != "" {
+			builder.WriteString(" (")
+			builder.WriteString(limitCommentText(qualifier))
+			builder.WriteString(")")
+		}
+	} else if strings.TrimSpace(qualifier) != "" {
+		builder.WriteString("**")
+		builder.WriteString(limitCommentText(qualifier))
+		builder.WriteString("**")
+	} else {
+		builder.WriteString("Finding")
+	}
+	builder.WriteByte('\n')
+
+	for _, key := range sortedFindingKeys(obj) {
+		if key == headingKey {
+			continue
+		}
+		writeFindingField(builder, "  ", key, obj[key], 0)
+	}
+}
+
+// writeFindingField renders a single key/value pair as an indented bullet.
+func writeFindingField(builder *strings.Builder, indent, key string, raw json.RawMessage, depth int) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return
+	}
+
+	// Nested array -> nested bullet sub-list.
+	if len(raw) > 0 && raw[0] == '[' {
+		var arr []json.RawMessage
+		if err := json.Unmarshal(raw, &arr); err == nil {
+			if len(arr) == 0 {
+				return
+			}
+			builder.WriteString(indent)
+			builder.WriteString("- ")
+			builder.WriteString(limitCommentText(key))
+			builder.WriteString(":\n")
+			if depth >= maxFindingDepth {
+				builder.WriteString(indent)
+				builder.WriteString("  - ")
+				builder.WriteString(limitCommentText(compactJSON(raw)))
+				builder.WriteByte('\n')
+				return
+			}
+			for _, item := range arr {
+				val := scalarFindingValue(item)
+				builder.WriteString(indent)
+				builder.WriteString("  - ")
+				builder.WriteString(limitCommentText(val))
+				builder.WriteByte('\n')
+			}
+			return
+		}
+	}
+
+	// Nested object -> key: value lines (depth-bounded).
+	if len(raw) > 0 && raw[0] == '{' {
+		var nested map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &nested); err == nil {
+			builder.WriteString(indent)
+			builder.WriteString("- ")
+			builder.WriteString(limitCommentText(key))
+			builder.WriteString(":\n")
+			if depth >= maxFindingDepth || len(nested) == 0 {
+				builder.WriteString(indent)
+				builder.WriteString("  - ")
+				builder.WriteString(limitCommentText(compactJSON(raw)))
+				builder.WriteByte('\n')
+				return
+			}
+			for _, nk := range sortedFindingKeys(nested) {
+				writeFindingField(builder, indent+"  ", nk, nested[nk], depth+1)
+			}
+			return
+		}
+	}
+
+	value := scalarFindingValue(raw)
+	if strings.TrimSpace(value) == "" {
+		return
+	}
+
+	builder.WriteString(indent)
+	builder.WriteString("- ")
+	if findingSourceKeys[strings.ToLower(strings.TrimSpace(key))] {
+		// Sanitize the URL on its own, then render it as a markdown link. URLs
+		// are not field-prefixed secrets, so per-fragment redaction is safe.
+		link := limitCommentText(strings.TrimSpace(value))
+		builder.WriteString(limitCommentText(key))
+		builder.WriteString(": [")
+		builder.WriteString(link)
+		builder.WriteString("](")
+		builder.WriteString(link)
+		builder.WriteString(")")
+		builder.WriteByte('\n')
+		return
+	}
+
+	// Render "key: value" as one fragment so redactors keyed on the field name
+	// (e.g. token=, password:) see the prefix and value together.
+	builder.WriteString(limitCommentText(key + ": " + value))
+	builder.WriteByte('\n')
+}
+
+func writeFindingJSONFallback(builder *strings.Builder, raw json.RawMessage) {
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, raw, "", "  "); err != nil {
+		pretty.Reset()
+		pretty.WriteString(compactJSON(raw))
+	}
+	builder.WriteString("- \n  ```json\n")
+	builder.WriteString(limitCommentText(pretty.String()))
+	builder.WriteString("\n  ```\n")
+}
+
+const maxFindingDepth = 2
+
+// scalarFindingValue converts a JSON value to a single-line string: JSON
+// strings unwrap to their text, numbers/bools render literally, and
+// objects/arrays compact to JSON.
+func scalarFindingValue(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	return compactJSON(raw)
+}
+
+func compactJSON(raw json.RawMessage) string {
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, raw); err == nil {
+		return compact.String()
+	}
+	return string(raw)
+}
+
+func sortedFindingKeys(obj map[string]json.RawMessage) []string {
+	keys := make([]string, 0, len(obj))
+	for k := range obj {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func writeList(builder *strings.Builder, title string, values []string) {
@@ -120,22 +340,6 @@ func writeList(builder *strings.Builder, title string, values []string) {
 		builder.WriteString(limitCommentText(item))
 		builder.WriteByte('\n')
 	}
-}
-
-func formatFinding(raw json.RawMessage) string {
-	raw = bytes.TrimSpace(raw)
-	if len(raw) == 0 {
-		return ""
-	}
-	var text string
-	if err := json.Unmarshal(raw, &text); err == nil {
-		return text
-	}
-	var compact bytes.Buffer
-	if err := json.Compact(&compact, raw); err == nil {
-		return compact.String()
-	}
-	return string(raw)
 }
 
 // LimitCommentText applies the same redaction, truncation, and command

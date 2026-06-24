@@ -16,7 +16,7 @@ func TestRenderJobResultCommentIncludesAttributionAndResult(t *testing.T) {
 		Result: &AgentResult{
 			Decision:    "changes_requested",
 			Summary:     "fix the edge case",
-			Findings:    []json.RawMessage{json.RawMessage(`{"severity":"high","body":"bad branch"}`)},
+			Findings:    []json.RawMessage{json.RawMessage(`{"severity":"high","summary":"bad branch"}`)},
 			ChangesMade: []string{"reviewed workflow"},
 			TestsRun:    []string{"go test ./..."},
 			Needs:       []string{"rerun review"},
@@ -32,7 +32,7 @@ func TestRenderJobResultCommentIncludesAttributionAndResult(t *testing.T) {
 		"**Decision:** `changes_requested`",
 		"**Summary:** fix the edge case",
 		"**Findings**",
-		`{"severity":"high","body":"bad branch"}`,
+		"- **bad branch** (high)",
 		"**Changes Made**",
 		"**Tests Run**",
 		"**Needs**",
@@ -42,6 +42,51 @@ func TestRenderJobResultCommentIncludesAttributionAndResult(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("comment body missing %q:\n%s", want, body)
 		}
+	}
+}
+
+func TestRenderJobResultCommentRendersFindings(t *testing.T) {
+	body := RenderJobResultComment(JobResultComment{
+		AgentName: "researcher",
+		Runtime:   "claude",
+		JobID:     "job-findings",
+		JobState:  string(JobSucceeded),
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "researched options",
+			Findings: []json.RawMessage{
+				json.RawMessage(`"a plain string finding"`),
+				json.RawMessage(`{"approach":"A — Playwright Scraping","recommendation":"PRIMARY","cost":"$0","source_url":"https://example.com/a","steps":["scrape","parse"]}`),
+				json.RawMessage(`[1,2,3]`),
+			},
+		},
+	})
+
+	for _, want := range []string{
+		"**Findings**",
+		// String finding renders as a plain bullet.
+		"- a plain string finding",
+		// Object finding: bold heading + qualifier.
+		"- **A — Playwright Scraping** (PRIMARY)",
+		// Indented key/value sub-list.
+		"  - cost: $0",
+		// source_url rendered as a markdown link.
+		"  - source_url: [https://example.com/a](https://example.com/a)",
+		// Nested array rendered as a nested bullet sub-list.
+		"  - steps:",
+		"    - scrape",
+		"    - parse",
+		// Non-object/non-string JSON falls back to a fenced json block.
+		"```json",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("comment body missing %q:\n%s", want, body)
+		}
+	}
+
+	// The object finding must not appear as an inline raw JSON blob.
+	if strings.Contains(body, `{"approach":`) {
+		t.Fatalf("object finding rendered as inline raw JSON:\n%s", body)
 	}
 }
 
@@ -73,10 +118,10 @@ func TestRenderJobResultCommentRedactsSecretsAndOmitsRawOutput(t *testing.T) {
 	if !strings.Contains(body, "token=[REDACTED]") || !strings.Contains(body, "password=[REDACTED]") {
 		t.Fatalf("comment did not redact expected fields:\n%s", body)
 	}
-	if !strings.Contains(body, `"token":"[REDACTED]"`) || !strings.Contains(body, `"password":"[REDACTED]"`) {
-		t.Fatalf("comment did not redact JSON secret fields:\n%s", body)
+	if !strings.Contains(body, "token: [REDACTED]") || !strings.Contains(body, "password: [REDACTED]") {
+		t.Fatalf("comment did not redact rendered secret fields:\n%s", body)
 	}
-	if !strings.Contains(body, `"aws_secret_access_key":"[REDACTED]"`) {
+	if !strings.Contains(body, "aws_secret_access_key: [REDACTED]") {
 		t.Fatalf("comment did not redact AWS secret key field:\n%s", body)
 	}
 	if !strings.Contains(body, "AWS_SECRET_ACCESS_KEY=[REDACTED]") {

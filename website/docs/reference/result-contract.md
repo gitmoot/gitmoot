@@ -42,6 +42,27 @@ credentials, unclear scope, unavailable tools, failing external services, or
 required human decisions. Always redact secrets from summaries, findings, raw
 command output, and examples.
 
+## Findings
+
+`findings` is a free-form array — each entry may be a plain string or a JSON
+object; there is no rigid schema. When you emit **object** findings, the posted
+PR/issue comment renders them as readable markdown (a bold heading plus an
+indented `key: value` sub-list) instead of an inline JSON blob, so a few
+conventional keys make the result easier for humans to audit:
+
+- **Heading**: the renderer uses the first present of `title`, `approach`,
+  `name`, `summary`, or `finding` as the bold heading.
+- **Qualifier**: the first present of `recommendation`, `severity`, or `status`
+  is shown in parentheses next to the heading (e.g. `(PRIMARY)`, `(high)`).
+- **Links**: a `source_url`, `url`, or `source` value is rendered as a clickable
+  markdown link.
+- **Nested values**: arrays become a nested bullet sub-list; nested objects
+  render as `key: value` lines (depth-bounded).
+
+None of these keys is mandatory. String findings still render exactly as the
+plain text you provide, and any finding the renderer cannot map (for example a
+top-level array) falls back to a pretty-printed fenced ```json``` block.
+
 ## Delegations (Orchestration)
 
 The `delegations` array is how an agent asks named Gitmoot agents to do
