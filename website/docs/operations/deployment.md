@@ -47,3 +47,29 @@ flowchart LR
 `docs.gitmoot.io` currently resolves to this server but should only be enabled
 after the origin TLS certificate and nginx server block explicitly cover that
 host.
+
+## Install script (`gitmoot.io/install.sh`)
+
+The one-liner installer (`curl -fsSL https://gitmoot.io/install.sh | sh`) is
+served from the nginx web root at the site root — **separate** from the
+Docusaurus docs build (`baseUrl` is `/docs/`, so `website/static/` files would
+land under `/docs/`, not `/`). The source of truth is tracked at
+**`scripts/install.sh`**; deploy it by copying that file to the path the
+`gitmoot.io` server block serves `/install.sh` from (confirm against the live
+nginx config), e.g.:
+
+```sh
+# from the repo root, on the server (adjust the destination to the real root):
+install -m 0644 scripts/install.sh /var/www/gitmoot-docs/install.sh
+```
+
+Smoke check after deploy:
+
+```sh
+curl -fsSL https://gitmoot.io/install.sh | sh -n -   # downloads + shell-parses
+```
+
+The installer downloads the per-OS/arch binary plus `sha256sums.txt` from the
+matching GitHub release and verifies the checksum. The release assets
+(including `gitmoot_linux_arm64`) and `sha256sums.txt` are produced by
+`.github/workflows/release.yml` on release publish.
