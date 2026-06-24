@@ -3500,12 +3500,21 @@ func (n *daemonEscalationNotifier) NotifyEscalation(ctx context.Context, request
 }
 
 // buildEscalationComment renders the @-tag escalation comment body (#340).
+//
+// The body must never begin a line with "@<handle>" or a bare "/gitmoot": the
+// daemon ingests comments on its own PRs, and ParseCommand treats a line whose
+// first token is "@<agent>" as a "@<agent> <action>" command — so a leading
+// "@<handle> Gitmoot paused…" would make the daemon post a spurious "unsupported
+// command action" ack on its own escalation notification. The human is mentioned
+// mid-line ("cc @<handle>"), which still notifies them on GitHub but is not
+// parsed as a command.
 func buildEscalationComment(handle string, request workflow.EscalationRequest) string {
 	var b strings.Builder
-	if strings.TrimSpace(handle) != "" {
-		b.WriteString("@" + strings.TrimPrefix(handle, "@") + " ")
+	b.WriteString("Gitmoot paused a delegation tree awaiting your decision (escalate_human).\n")
+	if h := strings.TrimPrefix(strings.TrimSpace(handle), "@"); h != "" {
+		b.WriteString("cc @" + h + "\n")
 	}
-	b.WriteString("Gitmoot paused a delegation tree awaiting your decision (escalate_human).\n\n")
+	b.WriteString("\n")
 	if d := strings.TrimSpace(request.DelegationID); d != "" {
 		b.WriteString(fmt.Sprintf("- failing leg: `%s`\n", d))
 	}

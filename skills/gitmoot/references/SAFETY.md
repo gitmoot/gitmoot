@@ -103,7 +103,10 @@ cannot recurse or fan out forever:
   `/gitmoot resume <coordinatorJobID> retry|continue|abort [instructions]`
   (authorize-commenter gated, exactly like `/gitmoot retry`/`cancel`); a
   never-answered escalation is auto-finalized through the graceful finalize path
-  below after `[orchestrate].escalation_ttl` (default 24h).
+  below after `[orchestrate].escalation_ttl` (default 24h). The daemon ingests
+  `/gitmoot resume` comments on the tree's **open** PR or issue; the dashboard
+  **Attention** section and the TTL backstop cover a tree whose PR/issue is no
+  longer open.
 
 When a bound trips, the offending delegations are not dispatched and the parent
 receives a typed lifecycle event explaining why (for example, the delegation tree

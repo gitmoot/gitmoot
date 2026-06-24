@@ -5693,3 +5693,45 @@ func TestResolveDaemonStartRepoBootstrapsUnregistered(t *testing.T) {
 		t.Fatal("expected origin mismatch error for unregistered repo from non-matching cwd")
 	}
 }
+
+// TestBuildEscalationCommentIsNotParsedAsCommand pins the #340 regression where
+// the escalation notification, posted by the daemon on its own PR, led a line
+// with "@<handle> Gitmoot paused…" and so was parsed by ParseCommand as a
+// "@<agent> <action=Gitmoot>" command — making the daemon reply with a spurious
+// "unsupported command action 'Gitmoot'" ack. The body must @-mention the human
+// (so GitHub still notifies) without any line that ParseCommand treats as a
+// command.
+func TestBuildEscalationCommentIsNotParsedAsCommand(t *testing.T) {
+	req := workflow.EscalationRequest{
+		CoordinatorJobID: "coord-123",
+		DelegationID:     "failing-leg",
+		Reason:           "child returned failed",
+		Question:         "how should we proceed?",
+	}
+	body := buildEscalationComment("jerryfane", req)
+
+	// The human is still mentioned (GitHub notification preserved)...
+	if !strings.Contains(body, "@jerryfane") {
+		t.Fatalf("escalation comment dropped the @-mention; body:\n%s", body)
+	}
+	// ...but never as the first token of a line (which ParseCommand would treat
+	// as a `@<agent> <action>` command), and no line starts with a bare /gitmoot.
+	for _, line := range strings.Split(body, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 0 {
+			continue
+		}
+		if strings.HasPrefix(fields[0], "@") {
+			t.Fatalf("escalation comment line starts with an @-mention (parses as a command): %q", line)
+		}
+		if fields[0] == "/gitmoot" {
+			t.Fatalf("escalation comment line starts with a bare /gitmoot (parses as a command): %q", line)
+		}
+	}
+
+	// And end-to-end: the daemon's own parser yields no command at all for the
+	// notification body, so the daemon never acks it as an (un)routable command.
+	if cmds := daemon.ParseCommands(body); len(cmds) != 0 {
+		t.Fatalf("escalation comment parsed into %d command(s); want 0: %+v\nbody:\n%s", len(cmds), cmds, body)
+	}
+}

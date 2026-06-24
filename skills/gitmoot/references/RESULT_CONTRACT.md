@@ -82,7 +82,10 @@ Delegation fields:
     routes to the graceful finalize continuation. A never-answered escalation is
     auto-finalized after `[orchestrate].escalation_ttl` (default 24h); paused
     time is excluded from the per-root wall-clock budget, and a paused tree is
-    never counted as a budget failure.
+    never counted as a budget failure. The daemon routes `/gitmoot resume`
+    comments on the tree's **open** PR or issue (it watches open PRs/issues); the
+    dashboard **Attention** section and the `escalation_ttl` backstop cover a tree
+    whose PR/issue is no longer open.
 - `synthesis_rule` (optional): one of `summary`, `vote`, or `quorum`.
 - `quorum` (optional): an integer `K` (`> 0`), required when `synthesis_rule`
   is `quorum`. The coordinator continuation proceeds only if at least `K`
