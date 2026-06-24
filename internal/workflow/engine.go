@@ -93,6 +93,37 @@ type Engine struct {
 	// capture and a hardcoded price table, treat it as a coarse runaway-cost
 	// backstop, not a precise spend meter.
 	MaxDelegationCostUSD float64
+	// MaxDelegationNonProgressStreak bounds how many consecutive continuation
+	// generations a coordination tree may produce with NO new durable side effect
+	// before the result-aware loop detector trips (#339). Where the structural
+	// fast-path (handleDelegationLoop / canonicalDelegationSetHash) only catches a
+	// coordinator literally re-issuing the same delegation SET, this catches a
+	// coordinator that perturbs the set each round (evading the set hash) yet whose
+	// children keep returning nothing new — comparing a mechanical progressDigest of
+	// each generation's verifiable child side effects (decision, changes_made,
+	// tests_run, PR/HeadSHA, artifact body) against the previous digest threaded
+	// through the payload. A streak of unchanged digests at or above this threshold
+	// trips the SAME ladder as the structural check (delegation_loop_warning +
+	// corrective continuation, then delegation_loop_detected + graceful finalize).
+	// Any new durable side effect resets the streak to 0 even if the self-reported
+	// summary repeats. <= 0 means use defaultMaxDelegationNonProgressStreak (2); it
+	// is configurable per-root alongside the depth/width/budget bounds.
+	MaxDelegationNonProgressStreak int
+}
+
+// defaultMaxDelegationNonProgressStreak is the streak threshold used when the
+// engine's MaxDelegationNonProgressStreak is unset (<= 0): two consecutive
+// non-progress generations trip the result-aware loop detector (#339).
+const defaultMaxDelegationNonProgressStreak = 2
+
+// nonProgressStreakThreshold returns the configured result-aware non-progress
+// streak threshold, falling back to defaultMaxDelegationNonProgressStreak when
+// unset so a zero-valued Engine keeps the documented default.
+func (e Engine) nonProgressStreakThreshold() int {
+	if e.MaxDelegationNonProgressStreak > 0 {
+		return e.MaxDelegationNonProgressStreak
+	}
+	return defaultMaxDelegationNonProgressStreak
 }
 
 // now returns the engine's current time, defaulting to time.Now when Now is unset.
@@ -929,6 +960,65 @@ func windowContainsHash(window []string, h string) bool {
 		}
 	}
 	return false
+}
+
+// progressDigest fingerprints the VERIFIABLE side effects a finished generation
+// of delegated children produced, so the result-aware loop detector (#339) can
+// tell "a coordinator that keeps producing the same results" (no progress) from
+// "genuinely new results" (progress). Two generations whose children advanced
+// nothing externally observable hash identically EVEN IF the coordinator
+// perturbed the delegation set (different ids/agents/prompts) or the children
+// rewrote their self-reported prose; any new durable side effect — a different
+// decision, a new commit/change, a test run, a new PR/HeadSHA, or a changed
+// artifact body — changes the digest.
+//
+// Only externally-verifiable fields are folded in, per child: Result.Decision,
+// Result.ChangesMade, Result.TestsRun, the child payload's PullRequest + HeadSHA
+// (where a real PR advance lands), and Result.ArtifactBody. The self-reported
+// Summary/Findings TEXT is deliberately excluded (weight 0) so a coordinator
+// cannot defeat the detector by churning prose, and a repeated summary over a
+// real new side effect is still correctly read as progress.
+//
+// Crucially the per-child side-effect tuple is hashed WITHOUT the delegation id,
+// then the tuples are SORTED, so the digest depends only on the multiset of side
+// effects the generation produced — not on the labels the coordinator chose.
+// That is what closes the evasion hole: a coordinator that trivially perturbs the
+// delegation set each round but whose children keep returning nothing new yields
+// the same (empty-result) multiset every round, so the digest repeats and the
+// streak climbs. A child whose Result did not parse contributes the same empty
+// tuple as a child that ran but produced no durable effect. The separators (\x1f
+// between fields, \x1e between children, \x1d between list items) keep field
+// boundaries unambiguous.
+func progressDigest(dels []Delegation, childPayloads map[string]JobPayload) string {
+	tuples := make([]string, 0, len(dels))
+	for _, d := range dels {
+		fields := []string{"", "", "", "0", "", ""}
+		if payload, ok := childPayloads[d.ID]; ok && payload.Result != nil {
+			r := payload.Result
+			changes := append([]string(nil), r.ChangesMade...)
+			sort.Strings(changes)
+			tests := append([]string(nil), r.TestsRun...)
+			sort.Strings(tests)
+			fields = []string{
+				strings.TrimSpace(r.Decision),
+				strings.Join(changes, "\x1d"),
+				strings.Join(tests, "\x1d"),
+				strconv.Itoa(payload.PullRequest),
+				strings.TrimSpace(payload.HeadSHA),
+				strings.TrimSpace(r.ArtifactBody),
+			}
+		}
+		tuples = append(tuples, strings.Join(fields, "\x1f"))
+	}
+	sort.Strings(tuples)
+
+	var builder strings.Builder
+	for _, t := range tuples {
+		builder.WriteString(t)
+		builder.WriteString("\x1e")
+	}
+	sum := sha256.Sum256([]byte(builder.String()))
+	return hex.EncodeToString(sum[:])
 }
 
 // countRootDelegationJobs counts every job belonging to a coordination tree: the
@@ -1823,6 +1913,97 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		}
 	}
 
+	// Result-aware non-progress detection (#339). The structural fast-path
+	// (handleDelegationLoop) only catches a coordinator literally re-issuing the
+	// same delegation SET; a coordinator that perturbs the set each round to evade
+	// the set hash, yet whose children keep returning nothing new, slips past it.
+	// Here — after every child has finished and childPayloads carry full results —
+	// fold the generation's verifiable side effects into a progressDigest and
+	// compare it to the previous generation's digest threaded through the payload.
+	// No new durable side effect + an unchanged digest => the streak climbs; any
+	// new side effect (a different decision, a new commit/change, a test run, a new
+	// PR/HeadSHA, a changed artifact body) resets it to 0 even when the summary
+	// text repeats. At the threshold the result-aware path trips the SAME ladder as
+	// the structural check: a first trip emits delegation_loop_warning and a
+	// corrective continuation; a trip after a corrective nudge has already fired
+	// (DelegationRepeatCount >= 1) emits delegation_loop_detected and routes to the
+	// #305 graceful finalize continuation. Both reuse the existing once-guards
+	// (the continuationEnqueued top-guard above + enqueueFinalizeContinuation's own
+	// guard) so re-advance never double-fires.
+	digest := progressDigest(parentResult.Delegations, childPayloads)
+	nonProgressStreak := 0
+	if digest == parentPayload.LastProgressDigest {
+		// The previous generation recorded this exact digest and this generation
+		// reproduced it: no new durable side effect => the streak climbs.
+		nonProgressStreak = parentPayload.NonProgressStreak + 1
+	}
+	if nonProgressStreak >= e.nonProgressStreakThreshold() {
+		if parentPayload.DelegationRepeatCount >= 1 {
+			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+				JobID:   parentJob.ID,
+				Kind:    "delegation_loop_detected",
+				Message: fmt.Sprintf("delegation tree made no new durable side effect for %d consecutive generations after a corrective nudge (digest %s); finalizing instead of continuing", nonProgressStreak, digest),
+			})
+			// Graceful finalize (#305): give the coordinator one terminal continuation
+			// to synthesize a best-effort result rather than stopping silently.
+			return e.enqueueFinalizeContinuation(ctx, parentJob, parentPayload, "delegation tree made no progress after a corrective nudge")
+		}
+
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   parentJob.ID,
+			Kind:    "delegation_loop_warning",
+			Message: fmt.Sprintf("delegation tree made no new durable side effect for %d consecutive generations (digest %s); sending a corrective continuation instead of continuing", nonProgressStreak, digest),
+		})
+		correctiveRequest := JobRequest{
+			ID:              delegationContinuationID(parentJob.ID),
+			Agent:           parentJob.Agent,
+			Action:          "ask",
+			Model:           parentPayload.Model,
+			Phase:           parentPayload.Phase,
+			Repo:            parentPayload.Repo,
+			Branch:          parentPayload.Branch,
+			PullRequest:     parentPayload.PullRequest,
+			HeadSHA:         parentPayload.HeadSHA,
+			GoalID:          parentPayload.GoalID,
+			TaskID:          parentPayload.TaskID,
+			TaskTitle:       parentPayload.TaskTitle,
+			LeadAgent:       parentPayload.LeadAgent,
+			Reviewers:       parentPayload.Reviewers,
+			Sender:          parentJob.Agent,
+			Instructions:    buildCorrectiveContinuationPrompt(parentResult),
+			Constraints:     parentPayload.Constraints,
+			ParentJobID:     parentJob.ID,
+			DelegationDepth: parentPayload.DelegationDepth + 1,
+			DelegatedBy:     parentJob.Agent,
+			RootJobID:       e.rootJobID(parentJob, parentPayload),
+			// Carry the window forward and mark that a corrective nudge has fired so a
+			// further non-progress generation escalates to delegation_loop_detected.
+			RecentDelegationHashes: appendDelegationHashWindow(parentPayload.RecentDelegationHashes, canonicalDelegationSetHash(parentResult.Delegations)),
+			DelegationRepeatCount:  parentPayload.DelegationRepeatCount + 1,
+			// Thread the non-progress streak forward: if the coordinator's corrective
+			// continuation still produces no new side effect, the streak stays at or
+			// above the threshold and the next generation escalates.
+			NonProgressStreak:  nonProgressStreak,
+			LastProgressDigest: digest,
+			Cockpit:            parentPayload.Cockpit,
+			CockpitSession:     parentPayload.CockpitSession,
+			CockpitPaneKey:     parentPayload.CockpitPaneKey,
+		}
+		if err := e.enqueue(ctx, correctiveRequest); err != nil {
+			return fmt.Errorf("enqueue corrective continuation for %q: %w", parentJob.ID, err)
+		}
+		// The corrective continuation IS the coordinator's single continuation, so it
+		// occupies the continuation slot: emit delegation_continuation_enqueued so a
+		// re-advance hits the continuationEnqueued top-guard rather than re-running
+		// the streak logic.
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   parentJob.ID,
+			Kind:    "delegation_continuation_enqueued",
+			Message: fmt.Sprintf("corrective continuation occupies the continuation slot for job %s", correctiveRequest.ID),
+		})
+		return nil
+	}
+
 	request := JobRequest{
 		ID:           delegationContinuationID(parentJob.ID),
 		Agent:        parentJob.Agent,
@@ -1856,6 +2037,13 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		// corrective-nudge counter only climbs while the coordinator loops.
 		RecentDelegationHashes: appendDelegationHashWindow(parentPayload.RecentDelegationHashes, canonicalDelegationSetHash(parentResult.Delegations)),
 		DelegationRepeatCount:  0,
+		// Result-aware non-progress carry-forward (#339): record this generation's
+		// progressDigest so the next generation can detect a non-progress repeat, and
+		// thread the (sub-threshold) streak forward. nonProgressStreak is 0 whenever
+		// this generation produced a new durable side effect, so genuine progress
+		// always resets the streak even when the self-reported summary repeats.
+		NonProgressStreak:  nonProgressStreak,
+		LastProgressDigest: digest,
 		// Inherit the coordinator's cockpit settings so the continuation renders
 		// its pane under the same workspace/session as the rest of the tree.
 		Cockpit:        parentPayload.Cockpit,

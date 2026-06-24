@@ -544,7 +544,7 @@ gitmoot skillopt train start --template <id> --repo owner/repo --request <text> 
 gitmoot skillopt train status --session <id>
 gitmoot skillopt train run [--config path | --session <id>] [--plain]
 gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--dry-run] [--promote version|--reject version --reason text] [--start-next]
-gitmoot skillopt train recover --session <id> [--out-root path] [--json]
+gitmoot skillopt train recover --session <id> [--out-root path] [--generation [--abort | --advance-state]] [--json]
 gitmoot skillopt train stop --session <id> --reason <text>
 gitmoot skillopt judge-report [--template <id>] [--home <path>]
 gitmoot skillopt judge promote --template <id> --task-kind <kind> --file <pkg.json> [--home <path>] [--yes] [--json]
@@ -581,7 +581,7 @@ resume hard-errors with `item <id> has partial generated options; inspect or
 clear review options before continuing` so you can inspect or clear that item
 before retrying.
 
-`skillopt train recover` repairs the optimizer phase of a session — it
+`skillopt train recover` repairs the optimizer phase of a session by default — it
 re-imports or repairs the optimizer candidate package and classifies the
 iteration as `already_completed_candidate`, `already_completed_no_candidate`,
 `optimizer_active`, or `corrupted_unrecoverable`:
@@ -594,10 +594,31 @@ gitmoot skillopt train recover --session <id> --json
 
 `--out-root` overrides the optimizer output directory (it defaults to the
 session's persisted optimizer path), and `--json` prints the recovery result as
-JSON. Recovery scope is the optimizer phase only: it does not release the
-generation lock and does not rebuild generation options. To recover an
-interrupted generation phase, simply re-run `skillopt train continue`, which
-resumes the incomplete items as described above.
+JSON.
+
+Pass `--generation` to recover the generation phase instead:
+
+```sh
+gitmoot skillopt train recover --session <id> --generation
+gitmoot skillopt train recover --session <id> --generation --advance-state
+gitmoot skillopt train recover --session <id> --generation --abort
+```
+
+This reclaims a generation lock stranded by a crashed/killed `train continue`
+(whose deferred lock release never ran) and salvages the persisted per-item
+options. Reclamation is liveness-gated: the lock is released only when its owner
+PID is provably dead AND it was held on this same host. A live owner is refused
+(`skillopt train generation is already running`) so you stop the running process
+first; a cross-host owner requires the lock TTL to expire. The recover process
+re-acquires the lock for itself so the salvage is crash-safe. Salvage is
+import-only — it reports `expected_items`, `recovered_items`, and `missing_items`
+and classifies the run as `generation_complete`, `generation_incomplete`, or
+`generation_active`. The iteration advances to `options_generated` only with
+`--advance-state` and only when every expected item is recovered (regenerating
+missing items remains `train continue`'s job). `--abort` reclaims the lock and
+leaves the phase at `items_ready`, keeping persisted items. A stale generation
+lock also surfaces in `train status` as a `stale` active lock, separate from the
+true current phase.
 
 `skillopt review create` starts a review run for a template and target repo.
 Use the default A/B shape for validation, or pass `--mode explore|refine|distill`

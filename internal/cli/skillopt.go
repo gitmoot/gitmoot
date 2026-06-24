@@ -108,7 +108,7 @@ func printSkillOptUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot skillopt train status --session <id>")
 	fmt.Fprintln(w, "  gitmoot skillopt train run [--config path | --session <id>] [--plain]")
 	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--backend codex] [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--model name] [--optimizer-model name] [--target-model name] [--optimizer-backend name] [--target-backend name] [--evaluator-id id] [--evaluator-model name] [--evaluator-backend name] [--skill-update-mode mode] [--num-epochs N] [--batch-size N] [--optimizer-views N] [--retry-optimizer-views auto|inherit|N] [--gate hard|soft|mixed] [--out-root path] [--timeout duration] [--dry-run] [--rerun-optimizer] [--export-only] [--promote version|--reject version --reason text] [--start-next]")
-	fmt.Fprintln(w, "  gitmoot skillopt train recover --session <id> [--out-root path]")
+	fmt.Fprintln(w, "  gitmoot skillopt train recover --session <id> [--out-root path] [--generation [--abort | --advance-state]] [--json]")
 	fmt.Fprintln(w, "  gitmoot skillopt train stop --session <id> --reason <text>")
 }
 
@@ -148,7 +148,7 @@ func printSkillOptTrainUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot skillopt train status --session <id>")
 	fmt.Fprintln(w, "  gitmoot skillopt train run [--config path | --session <id>] [--plain]")
 	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--backend codex] [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--model name] [--optimizer-model name] [--target-model name] [--optimizer-backend name] [--target-backend name] [--evaluator-id id] [--evaluator-model name] [--evaluator-backend name] [--skill-update-mode mode] [--num-epochs N] [--batch-size N] [--optimizer-views N] [--retry-optimizer-views auto|inherit|N] [--gate hard|soft|mixed] [--out-root path] [--timeout duration] [--dry-run] [--rerun-optimizer] [--export-only] [--promote version|--reject version --reason text] [--start-next]")
-	fmt.Fprintln(w, "  gitmoot skillopt train recover --session <id> [--out-root path]")
+	fmt.Fprintln(w, "  gitmoot skillopt train recover --session <id> [--out-root path] [--generation [--abort | --advance-state]] [--json]")
 	fmt.Fprintln(w, "  gitmoot skillopt train stop --session <id> --reason <text>")
 }
 
@@ -1873,6 +1873,9 @@ func runSkillOptTrainRecover(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	sessionID := fs.String("session", "", "train session id")
 	outRoot := fs.String("out-root", "", "optimizer output directory; defaults to the persisted train optimizer path")
+	generation := fs.Bool("generation", false, "recover the option-generation phase: reclaim a stranded generation lock and salvage persisted options instead of the optimizer phase")
+	abort := fs.Bool("abort", false, "with --generation, reclaim the stranded generation lock and leave the iteration at items_ready (does not advance state)")
+	advanceState := fs.Bool("advance-state", false, "with --generation, advance the iteration to options_generated when every expected item is recovered")
 	jsonOutput := fs.Bool("json", false, "print recovery result as JSON")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -1888,9 +1891,21 @@ func runSkillOptTrainRecover(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "skillopt train recover requires --session")
 		return 2
 	}
+	if !*generation && (*abort || *advanceState) {
+		fmt.Fprintln(stderr, "skillopt train recover --abort and --advance-state require --generation")
+		return 2
+	}
+	if *abort && *advanceState {
+		fmt.Fprintln(stderr, "skillopt train recover --abort and --advance-state are mutually exclusive")
+		return 2
+	}
 	var result skillOptTrainRecoverResult
 	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
 		var recoverErr error
+		if *generation {
+			result, recoverErr = recoverSkillOptTrainGenerationLock(context.Background(), paths, store, *sessionID, *abort, *advanceState)
+			return recoverErr
+		}
 		result, recoverErr = recoverSkillOptTrainOptimizerArtifacts(context.Background(), paths, store, *sessionID, *outRoot)
 		return recoverErr
 	}); err != nil {
@@ -2884,6 +2899,23 @@ type skillOptTrainRecoverResult struct {
 	CandidatePackagePath string   `json:"candidate_package,omitempty"`
 	ArtifactDir          string   `json:"artifact_dir,omitempty"`
 	Artifacts            []string `json:"artifacts,omitempty"`
+
+	// Generation-recovery fields (populated by recover --generation). They
+	// describe the stranded generation lock that was classified/reclaimed and
+	// the per-item salvage outcome.
+	Mode                  string   `json:"mode,omitempty"`
+	LockState             string   `json:"lock_state,omitempty"`
+	LockOwnerJobID        string   `json:"lock_owner_job_id,omitempty"`
+	LockOwnerPID          int64    `json:"lock_owner_pid,omitempty"`
+	LockOwnerHostname     string   `json:"lock_owner_hostname,omitempty"`
+	LockReclaimed         bool     `json:"lock_reclaimed,omitempty"`
+	ExpectedItems         int      `json:"expected_items,omitempty"`
+	RecoveredItems        int      `json:"recovered_items,omitempty"`
+	MissingItems          int      `json:"missing_items,omitempty"`
+	PersistedOptions      int      `json:"persisted_options,omitempty"`
+	MissingItemIDs        []string `json:"missing_item_ids,omitempty"`
+	StateAdvanced         bool     `json:"state_advanced,omitempty"`
+	GenerationLockBlocked bool     `json:"generation_lock_blocked,omitempty"`
 }
 
 type skillOptTrainBackendResolution struct {
@@ -5266,12 +5298,14 @@ func acquireSkillOptTrainGenerationLock(ctx context.Context, store *db.Store, se
 	}
 	now := time.Now().UTC()
 	ownerJobID := localAgentJobID("skillopt-train-generation", strings.TrimSpace(sessionID))
+	hostname, _ := os.Hostname()
 	ok, err := store.AcquireResourceLock(ctx, db.ResourceLock{
-		ResourceKey: key,
-		OwnerJobID:  ownerJobID,
-		OwnerToken:  token,
-		OwnerPID:    int64(os.Getpid()),
-		ExpiresAt:   now.Add(ttl).Format(time.RFC3339Nano),
+		ResourceKey:   key,
+		OwnerJobID:    ownerJobID,
+		OwnerToken:    token,
+		OwnerPID:      int64(os.Getpid()),
+		OwnerHostname: hostname,
+		ExpiresAt:     now.Add(ttl).Format(time.RFC3339Nano),
 	}, now)
 	if err != nil {
 		return noopAgentReservationRelease, skillOptTrainNoopExtend, false, err
@@ -5485,6 +5519,73 @@ func skillOptTrainGenerationRuntimeLabel(request skillOptTrainContinueRequest) s
 	return strings.TrimSpace(request.Optimizer.Backend)
 }
 
+// skillOptTrainGenerationPlan classifies a run's review items against what is
+// already persisted: which items are complete (and how many options that adds),
+// and which items still need generation. It is the shared detection used by both
+// the continue/resume path and generation-lock recovery, so "skip complete,
+// regenerate missing" behaves identically in both.
+type skillOptTrainGenerationPlan struct {
+	ExistingGenerated int
+	ToGenerate        []db.EvalReviewItem
+	CompleteItemIDs   []string
+	MissingItemIDs    []string
+}
+
+// classifySkillOptTrainGenerationItems partitions items into already-persisted
+// (complete) and still-missing. A complete item contributes its persisted
+// options to ExistingGenerated and is skipped; a partially persisted single item
+// is an error (per-item commits are atomic, so a half-written item is corruption,
+// not a normal resume state).
+func classifySkillOptTrainGenerationItems(ctx context.Context, store *db.Store, run db.EvalRun, items []db.EvalReviewItem, roles []string, rankedRun bool) (skillOptTrainGenerationPlan, error) {
+	plan := skillOptTrainGenerationPlan{
+		ToGenerate: make([]db.EvalReviewItem, 0, len(items)),
+	}
+	// Count already-persisted options per item in ONE run-scoped query instead of
+	// one query per item (the single-conn store would otherwise serialize N
+	// round-trips on resume of a large run).
+	existingOptionCount := map[string]int{}
+	if rankedRun {
+		allOptions, err := store.ListEvalReviewOptions(ctx, run.ID, "")
+		if err != nil {
+			return skillOptTrainGenerationPlan{}, err
+		}
+		for _, opt := range allOptions {
+			existingOptionCount[opt.ItemID]++
+		}
+	}
+	// A mix of complete and incomplete items is the normal resume state (per-item
+	// commits), so it is not an error — only a partially generated single item is.
+	for _, item := range items {
+		if rankedRun {
+			existing := existingOptionCount[item.ItemID]
+			if existing > 0 {
+				if existing == len(roles) {
+					plan.ExistingGenerated += existing
+					plan.CompleteItemIDs = append(plan.CompleteItemIDs, item.ItemID)
+					continue
+				}
+				return skillOptTrainGenerationPlan{}, fmt.Errorf("item %s has partial generated options; inspect or clear review options before continuing", item.ItemID)
+			}
+			plan.ToGenerate = append(plan.ToGenerate, item)
+			plan.MissingItemIDs = append(plan.MissingItemIDs, item.ItemID)
+			continue
+		}
+		hasBaseline := strings.TrimSpace(item.BaselineArtifactID) != ""
+		hasCandidate := strings.TrimSpace(item.CandidateArtifactID) != ""
+		if hasBaseline || hasCandidate {
+			if hasBaseline && hasCandidate {
+				plan.ExistingGenerated += 2
+				plan.CompleteItemIDs = append(plan.CompleteItemIDs, item.ItemID)
+				continue
+			}
+			return skillOptTrainGenerationPlan{}, fmt.Errorf("item %s has partial generated A/B artifacts; inspect or clear review item artifacts before continuing", item.ItemID)
+		}
+		plan.ToGenerate = append(plan.ToGenerate, item)
+		plan.MissingItemIDs = append(plan.MissingItemIDs, item.ItemID)
+	}
+	return plan, nil
+}
+
 func generateSkillOptTrainOptions(ctx context.Context, paths config.Paths, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, request skillOptTrainContinueRequest) (skillOptTrainGenerationResult, error) {
 	if err := skillopt.CanTransitionTrainIteration(iteration.State, skillopt.TrainStateOptionsGenerated); err != nil {
 		return skillOptTrainGenerationResult{}, err
@@ -5508,49 +5609,12 @@ func generateSkillOptTrainOptions(ctx context.Context, paths config.Paths, store
 	if len(roles) < 2 {
 		return skillOptTrainGenerationResult{}, fmt.Errorf("eval run %s expects at least 2 options", run.ID)
 	}
-	existingGenerated := 0
-	// Count already-persisted options per item in ONE run-scoped query instead of
-	// one query per item (the single-conn store would otherwise serialize N
-	// round-trips on resume of a large run).
-	existingOptionCount := map[string]int{}
-	if rankedRun {
-		allOptions, err := store.ListEvalReviewOptions(ctx, run.ID, "")
-		if err != nil {
-			return skillOptTrainGenerationResult{}, err
-		}
-		for _, opt := range allOptions {
-			existingOptionCount[opt.ItemID]++
-		}
+	plan, err := classifySkillOptTrainGenerationItems(ctx, store, run, items, roles, rankedRun)
+	if err != nil {
+		return skillOptTrainGenerationResult{}, err
 	}
-	// toGenerate holds only the items that still need generation; complete items
-	// are skipped so resume regenerates nothing already persisted. A mix of
-	// complete and incomplete items is the normal resume state (per-item commits),
-	// so it is not an error — only a partially generated single item is.
-	toGenerate := make([]db.EvalReviewItem, 0, len(items))
-	for _, item := range items {
-		if rankedRun {
-			existing := existingOptionCount[item.ItemID]
-			if existing > 0 {
-				if existing == len(roles) {
-					existingGenerated += existing
-					continue
-				}
-				return skillOptTrainGenerationResult{}, fmt.Errorf("item %s has partial generated options; inspect or clear review options before continuing", item.ItemID)
-			}
-			toGenerate = append(toGenerate, item)
-			continue
-		}
-		hasBaseline := strings.TrimSpace(item.BaselineArtifactID) != ""
-		hasCandidate := strings.TrimSpace(item.CandidateArtifactID) != ""
-		if hasBaseline || hasCandidate {
-			if hasBaseline && hasCandidate {
-				existingGenerated += 2
-				continue
-			}
-			return skillOptTrainGenerationResult{}, fmt.Errorf("item %s has partial generated A/B artifacts; inspect or clear review item artifacts before continuing", item.ItemID)
-		}
-		toGenerate = append(toGenerate, item)
-	}
+	existingGenerated := plan.ExistingGenerated
+	toGenerate := plan.ToGenerate
 	if len(toGenerate) == 0 {
 		metadata := map[string]any{
 			"status":            "recovered",
@@ -8897,6 +8961,246 @@ func validateSkillOptTrainOptimizerRecoverableCompleteState(iteration db.SkillOp
 	}
 }
 
+// recoverSkillOptTrainGenerationLock reclaims a generation lock stranded by a
+// crashed/killed train continue (the lock's deferred release never ran) and
+// salvages the already-persisted per-item options, optionally advancing the
+// iteration to options_generated.
+//
+// It is a liveness-gated steal-then-own: the stranded lock is reclaimed ONLY
+// when its owner PID is provably dead AND the lock was held on this same host
+// (owner_hostname == this host, OR owner_hostname is empty — a pre-#303 legacy
+// strand from a binary that did not record the host, treated as local since
+// skillopt train is local-first). A live owner is never stolen — recovery
+// refuses with the busy error so the operator stops the running process first. A
+// cross-host owner (a different, recorded host) cannot be liveness-checked
+// locally, so recovery requires the lock's TTL to have expired before reclaiming
+// it. The recover process then re-acquires the lock for itself so the recovery
+// is also crash-safe.
+//
+// Salvage is import-only: completed items are already durable (per-item commits
+// from #311), so recovery just classifies what is persisted vs. missing.
+// Regenerating missing items is deferred to a future --regenerate. The iteration
+// advances to options_generated only when advanceState is set and every expected
+// item is recovered. With abort set, the lock is reclaimed and the phase is left
+// at items_ready (persisted items are kept).
+func recoverSkillOptTrainGenerationLock(ctx context.Context, paths config.Paths, store *db.Store, sessionID string, abort bool, advanceState bool) (skillOptTrainRecoverResult, error) {
+	session, iteration, _, err := loadSkillOptTrainStatus(ctx, store, sessionID)
+	if err != nil {
+		return skillOptTrainRecoverResult{}, err
+	}
+	result := skillOptTrainRecoverResult{
+		SessionID: strings.TrimSpace(session.ID),
+		Mode:      "generation",
+	}
+	if iteration == nil {
+		result.Classification = "unrecoverable"
+		return result, errors.New("train session has no iteration to recover")
+	}
+	result.IterationID = strings.TrimSpace(iteration.ID)
+	result.CurrentPhase = skillopt.NormalizeTrainState(iteration.State)
+
+	// Classify the stranded generation lock (if any) and decide whether it is
+	// safe to reclaim. A live owner is refused; a cross-host owner needs TTL
+	// expiry; a same-host dead owner is reclaimable.
+	lockKey := skillOptTrainGenerationLockKey(session.ID, iteration.ID)
+	now := time.Now().UTC()
+	thisHost, _ := os.Hostname()
+	lock, lockErr := store.GetResourceLock(ctx, lockKey)
+	hasLock := false
+	switch {
+	case lockErr == nil:
+		hasLock = true
+	case errors.Is(lockErr, sql.ErrNoRows):
+		hasLock = false
+	default:
+		return result, lockErr
+	}
+	if hasLock {
+		result.LockState = skillOptTrainOptimizerLockStatus(lock, now)
+		result.LockOwnerJobID = strings.TrimSpace(lock.OwnerJobID)
+		result.LockOwnerPID = lock.OwnerPID
+		result.LockOwnerHostname = strings.TrimSpace(lock.OwnerHostname)
+		ownerLive := skillOptOwnerPIDLive(lock.OwnerPID)
+		host := strings.TrimSpace(lock.OwnerHostname)
+		// Treat an empty/unrecorded owner_hostname as same-host-eligible: skillopt
+		// train is a local-first workflow (one local SQLite home), and an empty
+		// owner_hostname is the pre-#303 legacy case — the lock was written by a
+		// binary that didn't record the host. Those legacy strands are exactly the
+		// ones #303 exists to clear, so we treat an unknown host as this host. The
+		// PID-dead gate still applies: a LIVE owner is always refused (never steal a
+		// live owner); only a DEAD PID with an empty/this-host hostname is reclaimable.
+		sameHost := host == "" || strings.EqualFold(host, strings.TrimSpace(thisHost))
+		expired := !skillOptResourceLockActive(lock, now)
+		switch {
+		case ownerLive:
+			// Never steal a live owner — its deferred release will run. When the
+			// host is unrecorded (legacy lock) the owner is, by the local-first
+			// invariant above, on this host, so say so rather than implying a
+			// foreign host we cannot verify.
+			result.Classification = "generation_active"
+			result.GenerationLockBlocked = true
+			result.NextAction = "stop the running generation process before recovering"
+			return result, fmt.Errorf("%w: %s (owner pid %d still running)", errSkillOptTrainGenerationBusy, lockKey, lock.OwnerPID)
+		case sameHost:
+			// Same-host (or unrecorded/legacy host) dead owner: provably crashed,
+			// safe to reclaim.
+		case expired:
+			// Genuinely cross-host owner we cannot liveness-check: only reclaim
+			// once the lease has actually expired.
+		default:
+			// Genuinely cross-host (non-empty, different host) owner with an
+			// unexpired lease: cannot verify liveness, so refuse until TTL expiry.
+			result.Classification = "generation_active"
+			result.GenerationLockBlocked = true
+			result.NextAction = "owner is on another host; wait for the generation lock TTL to expire before recovering"
+			return result, fmt.Errorf("%w: %s (owner on host %q; cannot verify liveness, lease not expired)", errSkillOptTrainGenerationBusy, lockKey, host)
+		}
+		// Reclaim by the stored owner job id (the deterministic identity of the
+		// crashed holder) and emit an audit event — there is no
+		// ForceReleaseLockWithEvent for resource locks, so the event is emitted
+		// manually.
+		released, err := store.DeleteResourceLocksByOwner(ctx, strings.TrimSpace(lock.OwnerJobID))
+		if err != nil {
+			return result, err
+		}
+		if released > 0 {
+			result.LockReclaimed = true
+			auditMessage := fmt.Sprintf("reclaimed stranded skillopt generation lock %s (owner pid %d, host %q, state %s) during recover --generation", lockKey, lock.OwnerPID, strings.TrimSpace(lock.OwnerHostname), result.LockState)
+			if eventErr := store.AddJobEvent(ctx, db.JobEvent{
+				JobID:   strings.TrimSpace(lock.OwnerJobID),
+				Kind:    "lock_reclaimed",
+				Message: auditMessage,
+			}); eventErr != nil {
+				return result, eventErr
+			}
+		}
+	}
+
+	if abort {
+		// --abort: reclaim only, keep persisted items, leave phase at items_ready.
+		if result.LockReclaimed {
+			result.Classification = "generation_lock_reclaimed"
+		} else {
+			result.Classification = "generation_no_lock"
+		}
+		result.CurrentPhase = skillopt.NormalizeTrainState(iteration.State)
+		result.NextAction = "rerun train continue to regenerate the remaining items"
+		return result, nil
+	}
+
+	// Steal-then-own: re-acquire the generation lock for THIS recover process so
+	// the salvage itself is crash-safe (a crash here strands our own lock, which a
+	// subsequent recover reclaims the same way).
+	releaseGenerationLock, _, acquired, err := acquireSkillOptTrainGenerationLock(ctx, store, session.ID, iteration.ID, skillOptTrainGenerationLockTTL)
+	if err != nil {
+		return result, err
+	}
+	if !acquired {
+		result.Classification = "generation_active"
+		result.GenerationLockBlocked = true
+		result.NextAction = "another process re-acquired the generation lock; retry recovery"
+		return result, fmt.Errorf("%w: %s", errSkillOptTrainGenerationBusy, lockKey)
+	}
+	defer func() {
+		_ = releaseGenerationLock(context.Background())
+	}()
+
+	// Reload after taking ownership so we classify against the freshest state.
+	session, reloaded, _, err := loadSkillOptTrainStatus(ctx, store, session.ID)
+	if err != nil {
+		return result, err
+	}
+	if reloaded == nil {
+		result.Classification = "unrecoverable"
+		return result, errors.New("train session has no iteration to recover")
+	}
+	iteration = reloaded
+	result.CurrentPhase = skillopt.NormalizeTrainState(iteration.State)
+
+	run, err := store.GetEvalRun(ctx, iteration.EvalRunID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			result.Classification = "unrecoverable"
+			return result, fmt.Errorf("eval run %s not found", iteration.EvalRunID)
+		}
+		return result, err
+	}
+	rankedRun := skillOptRunUsesRankedOptions(run)
+	items, err := store.ListEvalReviewItems(ctx, run.ID)
+	if err != nil {
+		return result, err
+	}
+	if len(items) == 0 {
+		result.Classification = "unrecoverable"
+		return result, fmt.Errorf("eval run %s has no review items to recover", run.ID)
+	}
+	roles := skillOptTrainGenerationRoles(run)
+	if len(roles) < 2 {
+		result.Classification = "unrecoverable"
+		return result, fmt.Errorf("eval run %s expects at least 2 options", run.ID)
+	}
+	plan, err := classifySkillOptTrainGenerationItems(ctx, store, run, items, roles, rankedRun)
+	if err != nil {
+		// A partially persisted single item is corruption, not a normal resume
+		// state — surface it without advancing.
+		result.Classification = "generation_partial"
+		result.ExpectedItems = len(items)
+		result.NextAction = "inspect or clear the partially persisted item before recovering"
+		return result, err
+	}
+	result.ExpectedItems = len(items)
+	result.RecoveredItems = len(plan.CompleteItemIDs)
+	result.MissingItems = len(plan.ToGenerate)
+	result.MissingItemIDs = plan.MissingItemIDs
+	result.PersistedOptions = plan.ExistingGenerated
+
+	if len(plan.ToGenerate) == 0 {
+		// Every expected item is persisted — recovery imported nothing new (the
+		// per-item commits already did the work) but the run is salvageable.
+		result.Classification = "generation_complete"
+		if advanceState {
+			if err := advanceSkillOptTrainToOptionsGenerated(ctx, store, session, *iteration, plan.ExistingGenerated); err != nil {
+				return result, err
+			}
+			result.StateAdvanced = true
+			result.CurrentPhase = skillopt.TrainStateOptionsGenerated
+			result.NextAction = "publish the human review packet"
+			return result, nil
+		}
+		result.NextAction = "rerun with --advance-state to advance the iteration to options_generated"
+		return result, nil
+	}
+
+	// Some items are still missing. Import-only recovery does not regenerate them
+	// (deferred to a future --regenerate), so it never advances state.
+	result.Classification = "generation_incomplete"
+	result.NextAction = "rerun train continue to regenerate the missing items"
+	return result, nil
+}
+
+// advanceSkillOptTrainToOptionsGenerated moves an iteration whose options are all
+// persisted to options_generated, recording recovered generation metadata. It is
+// used by recover --generation --advance-state.
+func advanceSkillOptTrainToOptionsGenerated(ctx context.Context, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, generatedOptions int) error {
+	if err := skillopt.CanTransitionTrainIteration(iteration.State, skillopt.TrainStateOptionsGenerated); err != nil {
+		return err
+	}
+	metadata := map[string]any{
+		"status":            "recovered",
+		"generated_options": generatedOptions,
+		"recovered_via":     "recover --generation --advance-state",
+		"completed_at":      time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	session.State = skillopt.TrainStateOptionsGenerated
+	iteration.State = skillopt.TrainStateOptionsGenerated
+	session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "generation", metadata)
+	iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "generation", metadata)
+	if err := store.UpsertSkillOptTrainSession(ctx, session); err != nil {
+		return err
+	}
+	return store.UpsertSkillOptTrainIteration(ctx, iteration)
+}
+
 func markSkillOptTrainOptimizerRecoveredComplete(ctx context.Context, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, paths skillOptTrainOptimizerPaths) (db.SkillOptTrainSession, *db.SkillOptTrainIteration, error) {
 	if err := validateSkillOptTrainOptimizerRecoverableCompleteState(iteration); err != nil {
 		return db.SkillOptTrainSession{}, nil, err
@@ -9002,6 +9306,10 @@ func printSkillOptTrainRecoverResult(stdout io.Writer, result skillOptTrainRecov
 	writeLine(stdout, "iteration: %s", emptyText(result.IterationID))
 	writeLine(stdout, "recovery_state: %s", emptyText(result.Classification))
 	writeLine(stdout, "current_phase: %s", emptyText(result.CurrentPhase))
+	if result.Mode == "generation" {
+		printSkillOptTrainGenerationRecoverResult(stdout, result)
+		return
+	}
 	writeLine(stdout, "recovery_available: %t", result.RecoveryAvailable)
 	writeLine(stdout, "optimizer_out_root: %s", emptyText(result.OutRoot))
 	writeLine(stdout, "optimizer_root: %s", emptyText(result.OptimizerRoot))
@@ -9015,6 +9323,30 @@ func printSkillOptTrainRecoverResult(stdout io.Writer, result skillOptTrainRecov
 	}
 	if len(result.Artifacts) > 0 {
 		writeLine(stdout, "artifacts: %s", strings.Join(result.Artifacts, ","))
+	}
+	writeLine(stdout, "next: %s", emptyText(result.NextAction))
+}
+
+func printSkillOptTrainGenerationRecoverResult(stdout io.Writer, result skillOptTrainRecoverResult) {
+	writeLine(stdout, "mode: generation")
+	writeLine(stdout, "lock_state: %s", emptyText(result.LockState))
+	writeLine(stdout, "lock_reclaimed: %t", result.LockReclaimed)
+	if result.LockOwnerJobID != "" {
+		writeLine(stdout, "lock_owner_job_id: %s", result.LockOwnerJobID)
+	}
+	if result.LockOwnerPID > 0 {
+		writeLine(stdout, "lock_owner_pid: %d", result.LockOwnerPID)
+	}
+	if result.LockOwnerHostname != "" {
+		writeLine(stdout, "lock_owner_hostname: %s", result.LockOwnerHostname)
+	}
+	writeLine(stdout, "expected_items: %d", result.ExpectedItems)
+	writeLine(stdout, "recovered_items: %d", result.RecoveredItems)
+	writeLine(stdout, "missing_items: %d", result.MissingItems)
+	writeLine(stdout, "persisted_options: %d", result.PersistedOptions)
+	writeLine(stdout, "state_advanced: %t", result.StateAdvanced)
+	if len(result.MissingItemIDs) > 0 {
+		writeLine(stdout, "missing_item_ids: %s", strings.Join(result.MissingItemIDs, ","))
 	}
 	writeLine(stdout, "next: %s", emptyText(result.NextAction))
 }

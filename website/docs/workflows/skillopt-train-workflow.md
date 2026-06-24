@@ -621,18 +621,35 @@ gitmoot skillopt train recover --session planner-train --out-root .gitmoot/skill
 ```
 
 `train recover` accepts `--session <id>`, an optional `--out-root <path>`, and
-`--json`. Its scope is the optimizer phase only: it re-imports and repairs the
-optimizer candidate package and classifies the iteration as
+`--json`. By default its scope is the optimizer phase: it re-imports and repairs
+the optimizer candidate package and classifies the iteration as
 `already_completed_candidate`, `already_completed_no_candidate`,
 `optimizer_active`, or `corrupted_unrecoverable`. It re-imports a completed
 candidate through the normal candidate gate, or records
 `optimizer_completed_no_candidate` with the stored rejection reason. Incomplete
 or corrupted artifacts fail without modifying the train state.
 
-`train recover` does not touch option generation: it does not release the
-generation lock and does not rebuild generation options. To resume interrupted
-option generation, rerun `gitmoot skillopt train continue` (see
-[Option Generation Durability](#option-generation-durability)).
+Pass `--generation` to recover the generation phase instead:
+
+```sh
+gitmoot skillopt train recover --session planner-train --generation
+gitmoot skillopt train recover --session planner-train --generation --advance-state
+gitmoot skillopt train recover --session planner-train --generation --abort
+```
+
+This reclaims a generation lock stranded by a crashed/killed `train continue`
+(whose deferred lock release never ran) and salvages the persisted per-item
+options. Reclamation is liveness-gated: the lock is released only when its owner
+PID is provably dead AND it was held on this same host. A live owner is refused
+(`skillopt train generation is already running`) so you stop the running process
+first; a cross-host owner requires the lock TTL to expire. The recover process
+re-acquires the lock for itself so the salvage is crash-safe. Salvage is
+import-only — it reports `expected_items`, `recovered_items`, and `missing_items`
+and classifies the run as `generation_complete`, `generation_incomplete`, or
+`generation_active`. The iteration advances to `options_generated` only with
+`--advance-state` and only when every expected item is recovered (regenerating
+missing items remains `train continue`'s job). `--abort` reclaims the lock and
+leaves the phase at `items_ready`, keeping persisted items.
 
 ## Candidate Review And Next Iteration
 
@@ -842,14 +859,21 @@ Manual smoke scenarios for review operations:
   and next action options.
 - Optimizer wrapper failed after artifacts: if `status_phase` is
   `recovery_available`, run `gitmoot skillopt train recover --session <id>
-  --out-root <optimizer-output-root>`. `train recover` repairs the optimizer
-  candidate package only; it does not release the generation lock or rebuild
-  generation options.
+  --out-root <optimizer-output-root>`. By default `train recover` repairs the
+  optimizer candidate package only.
 - Interrupted option generation: rerun `gitmoot skillopt train continue
   --session <id>`. It regenerates only incomplete items and never rewrites
   completed work. If it reports that an item "has partial generated options",
-  inspect or clear that item's review options before continuing. Do not use
-  `train recover` for this; recover is optimizer-phase only.
+  inspect or clear that item's review options before continuing.
+- Stale generation lock blocking re-entry: if a `train continue` was killed
+  mid-generation, its generation lock is stranded and `train continue` reports
+  `skillopt train generation is already running` until the lock TTL expires.
+  Run `gitmoot skillopt train recover --session <id> --generation` to reclaim
+  the lock (when its owner is provably dead and same-host) and salvage persisted
+  options; add `--advance-state` to advance a fully recovered run to
+  `options_generated`, or `--abort` to reclaim and stay at `items_ready`. A stale
+  generation lock also surfaces in verbose `train status` as a `stale`
+  `active_lock`, separate from the true current phase.
 - Stale optimizer lock: if `status_phase` is `blocked_stale_lock`, inspect
   `active_lock` owner, pid, host, heartbeat, and expiry in verbose status before
   clearing stale state or retrying the optimizer.

@@ -249,9 +249,19 @@ Delegation trees are bounded so they cannot run forever:
   may not fan out more than this many delegations in one generation; an over-wide
   set is refused with a `delegation_width_exceeded` event and routes through the
   finalize continuation.
-- Loop detection: a windowed signature over recent delegation activity halts
-  repeated or cyclic delegation chains (e.g. oscillating A→B→A) well before the
-  depth cap is reached.
+- Loop detection (two signals): a **structural** windowed signature over recent
+  delegation sets halts a coordinator re-issuing the same set (e.g. oscillating
+  A→B→A) well before the depth cap; a **result-aware non-progress streak** (#339)
+  additionally catches a coordinator that perturbs the set each round to dodge the
+  structural hash but whose children keep returning nothing new — it fingerprints
+  the children's verifiable side effects (`decision`, `changes_made`, `tests_run`,
+  PR/HeadSHA, `artifact_body`; self-reported summary/findings text is excluded) and
+  trips after `MaxDelegationNonProgressStreak` consecutive generations with no new
+  durable side effect (default `2`, configurable per-host via
+  `[orchestrate].max_delegation_non_progress_streak`). Any new durable side effect
+  resets the streak even if the summary repeats. Both share the same ladder
+  (`delegation_loop_warning` → corrective continuation → `delegation_loop_detected`
+  → finalize).
 - Operator kill switch: `gitmoot job kill <root-job-id>` terminates a runaway
   tree by its root id from outside. It is the **first** backstop (operator action
   wins over every budget cap) and is graceful — in-flight jobs finish, the

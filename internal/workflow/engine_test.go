@@ -2673,6 +2673,23 @@ func countJobEvents(t *testing.T, store *db.Store, jobID, kind string) int {
 	return count
 }
 
+// jobEventMessage returns the message of the first event of kind on jobID, or ""
+// when none exists. Used to attribute a delegation_loop_* event to the structural
+// vs result-aware path (both emit the same kind, distinguished by message).
+func jobEventMessage(t *testing.T, store *db.Store, jobID, kind string) string {
+	t.Helper()
+	events, err := store.ListJobEvents(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents(%s) returned error: %v", jobID, err)
+	}
+	for _, event := range events {
+		if event.Kind == kind {
+			return event.Message
+		}
+	}
+	return ""
+}
+
 func TestEngineDelegationTimeoutPlumbedToChildPayload(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -4128,8 +4145,10 @@ func TestEngineStaticCoordinatorHaltedByLoopDetection(t *testing.T) {
 }
 
 // TestEngineProgressingCoordinatorNotFalselyFlagged pins the false-positive guard:
-// a coordinator that issues a DIFFERENT delegation set each continuation keeps
-// dispatching for real and is never flagged as a loop.
+// a coordinator that issues a DIFFERENT delegation set each continuation AND whose
+// children land a genuinely new durable side effect each round keeps dispatching
+// for real and is never flagged as a loop — by either the structural fast-path or
+// the result-aware non-progress streak (#339).
 func TestEngineProgressingCoordinatorNotFalselyFlagged(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -4182,11 +4201,336 @@ func TestEngineProgressingCoordinatorNotFalselyFlagged(t *testing.T) {
 		if !jobExists(t, store, childID) {
 			t.Fatalf("round %d: a distinct set must dispatch a real child %s", round, childID)
 		}
-		// Finish the round's child so the next continuation is enqueued.
-		completeDelegationChild(t, store, childID, JobSucceeded, AgentResult{Decision: "approved", Summary: "ok"})
+		// Finish the round's child with a genuinely NEW durable side effect (a
+		// distinct ChangesMade) so the result-aware progressDigest differs every
+		// round and the non-progress streak stays reset — real progress, never
+		// flagged.
+		completeDelegationChild(t, store, childID, JobSucceeded, AgentResult{
+			Decision:    "approved",
+			Summary:     "ok",
+			ChangesMade: []string{fmt.Sprintf("change %d", round)},
+		})
 		if err := engine.AdvanceJob(ctx, childID); err != nil {
 			t.Fatalf("round %d: AdvanceJob(child) returned error: %v", round, err)
 		}
 		parentID = continuationID
+	}
+}
+
+// driveResultAwareGeneration runs one full coordinator continuation generation
+// for the result-aware (#339) tests: it stamps the already-enqueued continuation
+// job `parentID` with the delegation set `dels`, advances it (dispatching the
+// children), then completes each child with the matching result from
+// `childResults` (keyed by delegation id) and advances one child so
+// advanceDelegations -> maybeEnqueueContinuation runs the non-progress check. It
+// returns the id of the next continuation (delegationContinuationID(parentID)),
+// which is the same id whether the generation continued normally, tripped a
+// corrective continuation, or tripped a finalize continuation.
+func driveResultAwareGeneration(t *testing.T, store *db.Store, engine Engine, parentID string, dels []Delegation, childResults map[string]AgentResult) string {
+	t.Helper()
+	ctx := context.Background()
+	// Stamp the continuation job with this generation's delegation set and advance
+	// it so the children are dispatched (modeling the coordinator re-delegating).
+	completeDelegationChild(t, store, parentID, JobSucceeded, AgentResult{
+		Decision:    "approved",
+		Summary:     "coordinating",
+		Delegations: dels,
+	})
+	if err := engine.AdvanceJob(ctx, parentID); err != nil {
+		t.Fatalf("driveResultAwareGeneration: AdvanceJob(parent %s) returned error: %v", parentID, err)
+	}
+	// Complete every dispatched child with its chosen result, then advance one so
+	// the parent's continuation decision runs once all children are terminal.
+	var lastChildID string
+	for _, d := range dels {
+		childID := parentID + "/delegation/" + d.ID
+		if !jobExists(t, store, childID) {
+			// The generation was halted before dispatch (e.g. a finalize trip from a
+			// prior corrective nudge): no children to complete.
+			continue
+		}
+		result := childResults[d.ID]
+		completeDelegationChild(t, store, childID, JobSucceeded, result)
+		lastChildID = childID
+	}
+	if lastChildID != "" {
+		if err := engine.AdvanceJob(ctx, lastChildID); err != nil {
+			t.Fatalf("driveResultAwareGeneration: AdvanceJob(child %s) returned error: %v", lastChildID, err)
+		}
+	}
+	return delegationContinuationID(parentID)
+}
+
+// TestProgressDigestIgnoresDelegationIdentityAndText pins the two properties the
+// result-aware loop detector relies on: the digest is independent of the
+// delegation labels (so a perturbed set with the same empty results matches) and
+// independent of self-reported Summary/Findings text, while ANY new durable side
+// effect changes it.
+func TestProgressDigestIgnoresDelegationIdentityAndText(t *testing.T) {
+	noEffect := func(summary string) *AgentResult {
+		return &AgentResult{Decision: "approved", Summary: summary}
+	}
+	genA := []Delegation{{ID: "w1", Agent: "wa", Action: "review"}}
+	payA := map[string]JobPayload{"w1": {Result: noEffect("first wording")}}
+	// Perturbed set (different id/agent) + different summary text, same empty side
+	// effects: must hash identically.
+	genB := []Delegation{{ID: "x9", Agent: "wb", Action: "review"}}
+	payB := map[string]JobPayload{"x9": {Result: noEffect("totally different wording")}}
+	if progressDigest(genA, payA) != progressDigest(genB, payB) {
+		t.Fatal("digest must ignore delegation identity and self-reported text when side effects are unchanged")
+	}
+
+	// A new durable side effect (ChangesMade) must change the digest.
+	payChanged := map[string]JobPayload{"w1": {Result: &AgentResult{Decision: "approved", ChangesMade: []string{"edited file"}}}}
+	if progressDigest(genA, payA) == progressDigest(genA, payChanged) {
+		t.Fatal("a new ChangesMade must change the digest")
+	}
+	// A new PR/HeadSHA must change the digest.
+	payPR := map[string]JobPayload{"w1": {PullRequest: 7, HeadSHA: "abc123", Result: noEffect("first wording")}}
+	if progressDigest(genA, payA) == progressDigest(genA, payPR) {
+		t.Fatal("a new PR/HeadSHA must change the digest")
+	}
+}
+
+// TestEngineResultAwareNonProgressStreakTripsLadder is the core #339 regression:
+// a coordinator that PERTURBS the delegation set every round (evading the
+// structural set-hash fast-path) but whose children keep returning NO new durable
+// side effect is caught by the result-aware non-progress streak. It trips the SAME
+// ladder as the structural check: delegation_loop_warning + a corrective
+// continuation, then delegation_loop_detected + a graceful finalize continuation.
+func TestEngineResultAwareNonProgressStreakTripsLadder(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "w", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	// Each round the child returns the same trivial approval with NO durable side
+	// effect, regardless of the (perturbed) delegation id.
+	noProgress := AgentResult{Decision: "approved", Summary: "still investigating"}
+	perturbed := func(round int) ([]Delegation, map[string]AgentResult) {
+		id := fmt.Sprintf("w%d", round)
+		return []Delegation{{ID: id, Agent: "w", Action: "review", Prompt: fmt.Sprintf("attempt %d", round)}},
+			map[string]AgentResult{id: noProgress}
+	}
+
+	// Generation 0: the originating coordinator dispatches a real set; its child
+	// returns no durable effect, establishing the baseline digest.
+	insertCompletedJob(t, store, db.Job{ID: "root-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-005",
+		TaskID:    "task-5",
+		TaskTitle: "Parent",
+		Sender:    "coord",
+		Result:    &AgentResult{Decision: "approved", Summary: "round 0", Delegations: []Delegation{{ID: "w0", Agent: "w", Action: "review", Prompt: "attempt 0"}}},
+	})
+	if err := engine.AdvanceJob(ctx, "root-job"); err != nil {
+		t.Fatalf("AdvanceJob(root) returned error: %v", err)
+	}
+	completeDelegationChild(t, store, "root-job/delegation/w0", JobSucceeded, noProgress)
+	if err := engine.AdvanceJob(ctx, "root-job/delegation/w0"); err != nil {
+		t.Fatalf("AdvanceJob(root child) returned error: %v", err)
+	}
+
+	// Generation 1 runs the continuation root-job/continuation: its (perturbed-set)
+	// children again make no progress, so the digest repeats and the streak climbs
+	// to 1. Still a normal continuation, no warning. The set is perturbed each round
+	// so the STRUCTURAL fast-path never fires — only the RESULT-aware path can.
+	gen1Cont := delegationContinuationID("root-job")
+	dels1, res1 := perturbed(1)
+	gen2Cont := driveResultAwareGeneration(t, store, engine, gen1Cont, dels1, res1)
+	if countJobEvents(t, store, gen1Cont, "delegation_loop_warning") != 0 {
+		t.Fatal("generation 1 must not warn: streak only reached 1")
+	}
+	if countJobEvents(t, store, gen1Cont, "delegation_loop_detected") != 0 {
+		t.Fatal("generation 1 must not be halted")
+	}
+	gen2Payload, err := unmarshalPayload(mustJob(t, store, gen2Cont).Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(gen2) returned error: %v", err)
+	}
+	if gen2Payload.NonProgressStreak != 1 {
+		t.Fatalf("gen2 NonProgressStreak = %d, want 1", gen2Payload.NonProgressStreak)
+	}
+
+	// Generation 2: streak reaches the threshold (2) -> delegation_loop_warning and a
+	// corrective continuation INSTEAD of a normal one. Structural detection never
+	// fired (the set hashes differ each round), proving the RESULT-aware path tripped.
+	dels2, res2 := perturbed(2)
+	gen3Cont := driveResultAwareGeneration(t, store, engine, gen2Cont, dels2, res2)
+	if countJobEvents(t, store, gen2Cont, "delegation_loop_warning") != 1 {
+		t.Fatal("generation 2 must record exactly one delegation_loop_warning (result-aware trip)")
+	}
+	// Attribute the trip to the RESULT-aware path, not the structural set-hash path:
+	// both emit delegation_loop_warning, distinguished by message.
+	if msg := jobEventMessage(t, store, gen2Cont, "delegation_loop_warning"); !strings.Contains(msg, "no new durable side effect") {
+		t.Fatalf("warning must come from the result-aware path, got message: %q", msg)
+	}
+	correctivePayload, err := unmarshalPayload(mustJob(t, store, gen3Cont).Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(corrective) returned error: %v", err)
+	}
+	if correctivePayload.DelegationRepeatCount != 1 {
+		t.Fatalf("corrective DelegationRepeatCount = %d, want 1", correctivePayload.DelegationRepeatCount)
+	}
+	if correctivePayload.NonProgressStreak < 2 {
+		t.Fatalf("corrective NonProgressStreak = %d, want >= 2 (carried forward)", correctivePayload.NonProgressStreak)
+	}
+	if !strings.Contains(correctivePayload.Instructions, "EMPTY delegations list") {
+		t.Fatalf("corrective prompt missing the change-or-finish nudge: %q", correctivePayload.Instructions)
+	}
+
+	// Generation 3: the coordinator STILL makes no progress after the corrective
+	// nudge -> delegation_loop_detected + a terminal finalize continuation.
+	dels3, res3 := perturbed(3)
+	gen4Cont := driveResultAwareGeneration(t, store, engine, gen3Cont, dels3, res3)
+	if countJobEvents(t, store, gen3Cont, "delegation_loop_detected") != 1 {
+		t.Fatal("generation 3 must record delegation_loop_detected after the corrective nudge")
+	}
+	if countJobEvents(t, store, gen3Cont, "delegation_finalize_enqueued") != 1 {
+		t.Fatal("delegation_loop_detected must enqueue a graceful finalize continuation")
+	}
+	finalizePayload, err := unmarshalPayload(mustJob(t, store, gen4Cont).Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(finalize) returned error: %v", err)
+	}
+	if !finalizePayload.DelegationFinalize {
+		t.Fatalf("loop_detected continuation must be a terminal finalize: %+v", finalizePayload)
+	}
+	// It halted well before the blunt depth cap.
+	if finalizePayload.DelegationDepth >= MaxDelegationDepth {
+		t.Fatalf("result-aware loop detection must halt well before MaxDelegationDepth=%d (depth=%d)", MaxDelegationDepth, finalizePayload.DelegationDepth)
+	}
+}
+
+// TestEngineResultAwareProgressResetsStreak pins the progress boundary from the
+// other side: a coordinator whose children land a genuinely new durable side
+// effect each round (a fresh ChangesMade, then a fresh TestsRun, …) is NEVER
+// flagged by the result-aware streak, because each new side effect resets the
+// streak even though the self-reported summary text repeats verbatim. The
+// delegation set is perturbed each round so the STRUCTURAL fast-path stays silent
+// and the test isolates the result-aware decision: the only reason it does not
+// trip is that the digest changes every round.
+func TestEngineResultAwareProgressResetsStreak(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "w", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	// Each round perturbs the delegation id (silencing the structural set-hash path)
+	// and lands a NEW durable side effect, while the Summary text repeats verbatim.
+	progressing := func(round int) ([]Delegation, map[string]AgentResult) {
+		id := fmt.Sprintf("w%d", round)
+		r := AgentResult{Decision: "approved", Summary: "still working"}
+		if round%2 == 1 {
+			r.ChangesMade = []string{fmt.Sprintf("edit-%d", round)}
+		} else {
+			r.TestsRun = []string{fmt.Sprintf("go test ./pkg%d", round)}
+		}
+		return []Delegation{{ID: id, Agent: "w", Action: "review", Prompt: fmt.Sprintf("round %d", round)}},
+			map[string]AgentResult{id: r}
+	}
+
+	// Generation 0: dispatch the first set for real with a first durable effect.
+	insertCompletedJob(t, store, db.Job{ID: "root-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-005",
+		TaskID:    "task-5",
+		TaskTitle: "Parent",
+		Sender:    "coord",
+		Result:    &AgentResult{Decision: "approved", Summary: "still working", Delegations: []Delegation{{ID: "w0", Agent: "w", Action: "review", Prompt: "round 0"}}},
+	})
+	if err := engine.AdvanceJob(ctx, "root-job"); err != nil {
+		t.Fatalf("AdvanceJob(root) returned error: %v", err)
+	}
+	completeDelegationChild(t, store, "root-job/delegation/w0", JobSucceeded, AgentResult{Decision: "approved", Summary: "still working", ChangesMade: []string{"edit-0"}})
+	if err := engine.AdvanceJob(ctx, "root-job/delegation/w0"); err != nil {
+		t.Fatalf("AdvanceJob(root child) returned error: %v", err)
+	}
+
+	parentID := delegationContinuationID("root-job")
+	for round := 1; round <= 4; round++ {
+		dels, res := progressing(round)
+		next := driveResultAwareGeneration(t, store, engine, parentID, dels, res)
+		if countJobEvents(t, store, parentID, "delegation_loop_warning") != 0 {
+			t.Fatalf("round %d: a progressing coordinator must not warn", round)
+		}
+		if countJobEvents(t, store, parentID, "delegation_loop_detected") != 0 {
+			t.Fatalf("round %d: a progressing coordinator must not be halted", round)
+		}
+		nextPayload, err := unmarshalPayload(mustJob(t, store, next).Payload)
+		if err != nil {
+			t.Fatalf("round %d: unmarshalPayload(next) returned error: %v", round, err)
+		}
+		if nextPayload.NonProgressStreak != 0 {
+			t.Fatalf("round %d: a progressing coordinator must keep NonProgressStreak at 0, got %d", round, nextPayload.NonProgressStreak)
+		}
+		parentID = next
+	}
+}
+
+// TestEngineResultAwareStreakIdempotentOnReadvance pins that re-advancing a
+// coordinator whose result-aware streak already tripped does not double-fire: the
+// once-guards (continuationEnqueued + the finalize guard) make a second
+// advanceDelegations a no-op, so the warning/finalize events and the corrective
+// continuation are emitted exactly once.
+func TestEngineResultAwareStreakIdempotentOnReadvance(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "w", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	noProgress := AgentResult{Decision: "approved", Summary: "stuck"}
+	perturbed := func(round int) ([]Delegation, map[string]AgentResult) {
+		id := fmt.Sprintf("w%d", round)
+		return []Delegation{{ID: id, Agent: "w", Action: "review", Prompt: fmt.Sprintf("attempt %d", round)}},
+			map[string]AgentResult{id: noProgress}
+	}
+
+	insertCompletedJob(t, store, db.Job{ID: "root-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-005",
+		TaskID:    "task-5",
+		TaskTitle: "Parent",
+		Sender:    "coord",
+		Result:    &AgentResult{Decision: "approved", Summary: "round 0", Delegations: []Delegation{{ID: "w0", Agent: "w", Action: "review", Prompt: "attempt 0"}}},
+	})
+	if err := engine.AdvanceJob(ctx, "root-job"); err != nil {
+		t.Fatalf("AdvanceJob(root) returned error: %v", err)
+	}
+	completeDelegationChild(t, store, "root-job/delegation/w0", JobSucceeded, noProgress)
+	if err := engine.AdvanceJob(ctx, "root-job/delegation/w0"); err != nil {
+		t.Fatalf("AdvanceJob(root child) returned error: %v", err)
+	}
+
+	// Drive to the first trip: generation 1 climbs the streak to 1, generation 2
+	// reaches the threshold and the warning + corrective continuation fire on the
+	// generation-2 continuation job (gen2Cont).
+	gen1Cont := delegationContinuationID("root-job")
+	dels1, res1 := perturbed(1)
+	gen2Cont := driveResultAwareGeneration(t, store, engine, gen1Cont, dels1, res1)
+	dels2, res2 := perturbed(2)
+	_ = driveResultAwareGeneration(t, store, engine, gen2Cont, dels2, res2)
+	if countJobEvents(t, store, gen2Cont, "delegation_loop_warning") != 1 {
+		t.Fatal("warning must fire exactly once on the first result-aware trip")
+	}
+
+	// Re-advance the tripped coordinator and its already-completed child several
+	// times: the once-guards must keep every count at exactly one.
+	for i := 0; i < 3; i++ {
+		if err := engine.AdvanceJob(ctx, gen2Cont); err != nil {
+			t.Fatalf("re-advance %d AdvanceJob(parent) returned error: %v", i, err)
+		}
+		if err := engine.AdvanceJob(ctx, gen2Cont+"/delegation/w2"); err != nil {
+			t.Fatalf("re-advance %d AdvanceJob(child) returned error: %v", i, err)
+		}
+	}
+	if got := countJobEvents(t, store, gen2Cont, "delegation_loop_warning"); got != 1 {
+		t.Fatalf("delegation_loop_warning fired %d times under re-advance, want 1", got)
+	}
+	if got := countJobEvents(t, store, gen2Cont, "delegation_continuation_enqueued"); got != 1 {
+		t.Fatalf("delegation_continuation_enqueued fired %d times under re-advance, want 1", got)
 	}
 }

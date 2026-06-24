@@ -304,10 +304,17 @@ persisted, `train continue` does not guess. It stops with a hard error such as
 before continuing`, so a partially generated item is inspected or cleared
 rather than silently completed or duplicated.
 
-This per-item generation durability is separate from `skillopt train recover`,
-which recovers the optimizer phase only (see "Optimizer And Candidate Gate").
-`train recover` does not release the generation lock or rebuild generation
-options.
+This per-item generation durability is complemented by `skillopt train recover
+--generation`. If a `train continue` is killed mid-generation, its generation
+lock is stranded (the deferred release never runs) and blocks re-entry until the
+~2h TTL expires. `skillopt train recover --session <id> --generation` reclaims
+that lock when its owner is provably dead and same-host (a live owner is refused;
+a cross-host owner waits for TTL), re-acquires it for the recover process, and
+salvages the persisted per-item options. It advances the iteration to
+`options_generated` only with `--advance-state` and only when every expected item
+is recovered; `--abort` reclaims the lock and leaves the phase at `items_ready`.
+By default `train recover` (without `--generation`) still recovers the optimizer
+phase only (see "Optimizer And Candidate Gate").
 
 Low-level `skillopt feedback github publish` and `sync` enforce
 `review.expected_repo` for train runs. If a preview train expects
@@ -599,16 +606,35 @@ gitmoot skillopt train recover --session planner-train --out-root .gitmoot/skill
 gitmoot skillopt train recover --session planner-train --out-root .gitmoot/skillopt/planner-train --json
 ```
 
-`train recover` is scoped to the optimizer phase only. It re-imports or repairs
-the optimizer candidate package and classifies the active iteration, for example
-`already_completed_candidate`, `already_completed_no_candidate`,
+By default `train recover` is scoped to the optimizer phase. It re-imports or
+repairs the optimizer candidate package and classifies the active iteration, for
+example `already_completed_candidate`, `already_completed_no_candidate`,
 `optimizer_active`, or `corrupted_unrecoverable`. Recovery validates the package
 state, imports a completed candidate through the normal candidate gate, or
 records `optimizer_completed_no_candidate` with the stored rejection reason.
-Incomplete or corrupted artifacts fail without modifying the train state. It does
-not recover the generation phase, release the generation lock, or rebuild
-generation options; per-item generation durability and idempotent resume handle
-that (see "Durable Generation And Idempotent Resume").
+Incomplete or corrupted artifacts fail without modifying the train state.
+
+Pass `--generation` to recover the generation phase instead: it reclaims a
+generation lock stranded by a crashed/killed `train continue` and salvages the
+persisted per-item options (see "Durable Generation And Idempotent Resume").
+
+```sh
+gitmoot skillopt train recover --session planner-train --generation
+gitmoot skillopt train recover --session planner-train --generation --advance-state
+gitmoot skillopt train recover --session planner-train --generation --abort
+```
+
+Reclamation is liveness-gated: the stranded lock is released only when its owner
+PID is provably dead AND it was held on this same host. A live owner is refused
+(`skillopt train generation is already running`) so you stop the running process
+first; a cross-host owner requires the lock TTL to expire. The recover process
+re-acquires the lock for itself so the salvage is crash-safe. Salvage is
+import-only — it reports `expected_items`, `recovered_items`, and `missing_items`
+and classifies the run as `generation_complete`, `generation_incomplete`, or
+`generation_active`. The iteration advances to `options_generated` only with
+`--advance-state` and only when every expected item is recovered (regenerating
+missing items remains `train continue`'s job). `--abort` reclaims the lock and
+leaves the phase at `items_ready`, keeping persisted items.
 
 ## Candidate Review And Next Iteration
 

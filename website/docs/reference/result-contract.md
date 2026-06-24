@@ -331,9 +331,21 @@ trips, the offending delegations are dropped rather than dispatched.
   result may request at most this many delegations in one generation; a wider set
   is refused with a `delegation_width_exceeded` event and routed through the same
   graceful finalize continuation.
-- **Loop detection**: a canonical windowed signature over recent delegation
-  activity halts repeated or cyclic delegation chains — for example an
-  oscillating A→B→A loop — well before the depth cap is reached.
+- **Loop detection (two signals)**: a **structural** windowed signature over
+  recent delegation sets halts a coordinator that re-issues the same set — for
+  example an oscillating A→B→A loop — well before the depth cap is reached. A
+  **result-aware non-progress streak** (#339) layers on top to catch a coordinator
+  that perturbs the set each round to dodge the structural hash but whose children
+  keep returning nothing new: after every generation finishes, the engine
+  fingerprints the children's *verifiable* side effects (`decision`,
+  `changes_made`, `tests_run`, PR/HeadSHA, `artifact_body` — self-reported
+  summary/findings text is deliberately excluded) and trips the loop ladder once
+  that digest repeats for `MaxDelegationNonProgressStreak` consecutive generations
+  (default `2`, configurable per-host via
+  `[orchestrate].max_delegation_non_progress_streak`). Any new durable side effect
+  resets the streak even when the summary text repeats. Both signals share one
+  ladder: a `delegation_loop_warning` plus a corrective continuation, then
+  `delegation_loop_detected` plus the graceful finalize continuation.
 - **Operator kill switch**: `gitmoot job kill <root-job-id>` lets an operator
   terminate a runaway tree by its root id from outside. It is the **first**
   backstop, so operator action wins over every budget cap. The kill is graceful —

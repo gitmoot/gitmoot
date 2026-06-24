@@ -59,6 +59,13 @@ type OrchestratePolicy struct {
 	// daemon's background scan auto-finalizes it (#340), as a Go duration string.
 	// Empty (the default) uses DefaultEscalationTTL (24h); the daemon parses it.
 	EscalationTTL string
+	// MaxDelegationNonProgressStreak is the per-root threshold for the result-aware
+	// non-progress loop detector (#339): how many consecutive continuation
+	// generations a delegation tree may produce with no new durable side effect
+	// before the loop ladder trips. 0 (the default) means use the engine's built-in
+	// default (2), so default behavior is unchanged. The daemon wires this into
+	// Engine.MaxDelegationNonProgressStreak at startup.
+	MaxDelegationNonProgressStreak int
 }
 
 // DefaultEscalationTTL is the fallback time a paused-for-human tree may sit
@@ -67,16 +74,17 @@ const DefaultEscalationTTL = "24h"
 
 func DefaultOrchestratePolicy() OrchestratePolicy {
 	return OrchestratePolicy{
-		CockpitMode:              CockpitModeAuto,
-		CockpitSession:           "",
-		CockpitMaxPanes:          4,
-		CockpitPaneKey:           CockpitPaneKeyJob,
-		InlineArtifactBodies:     false,
-		InlineArtifactMaxBytes:   0,
-		MaxDelegationTokenBudget: 0,
-		MaxDelegationCostUSD:     0,
-		EscalationHandle:         "",
-		EscalationTTL:            "",
+		CockpitMode:                    CockpitModeAuto,
+		CockpitSession:                 "",
+		CockpitMaxPanes:                4,
+		CockpitPaneKey:                 CockpitPaneKeyJob,
+		InlineArtifactBodies:           false,
+		InlineArtifactMaxBytes:         0,
+		MaxDelegationTokenBudget:       0,
+		MaxDelegationCostUSD:           0,
+		EscalationHandle:               "",
+		EscalationTTL:                  "",
+		MaxDelegationNonProgressStreak: 0,
 	}
 }
 
@@ -156,6 +164,10 @@ func applyOrchestratePolicyField(policy *OrchestratePolicy, key string, value st
 		parsed, err := parseConfigString(value)
 		policy.EscalationTTL = strings.TrimSpace(parsed)
 		return err
+	case "max_delegation_non_progress_streak":
+		parsed, err := strconv.Atoi(value)
+		policy.MaxDelegationNonProgressStreak = parsed
+		return err
 	default:
 		return nil
 	}
@@ -189,6 +201,9 @@ func validateOrchestratePolicy(policy OrchestratePolicy) error {
 		if parsed <= 0 {
 			return fmt.Errorf("orchestrate.escalation_ttl must be positive")
 		}
+	}
+	if policy.MaxDelegationNonProgressStreak < 0 {
+		return fmt.Errorf("orchestrate.max_delegation_non_progress_streak must be 0 (engine default) or positive")
 	}
 	return nil
 }

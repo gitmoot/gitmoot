@@ -84,9 +84,20 @@ cannot recurse or fan out forever:
 - Per-coordinator width `MaxDelegationWidth = 16`: a single coordinator result
   may not fan out more than this many delegations in one generation; an over-wide
   set is refused with a `delegation_width_exceeded` event.
-- Loop detection: a canonical windowed signature hash over recent delegation
-  activity halts repeated or cyclic delegation chains well before the depth cap
-  is reached, preventing oscillating A→B→A loops.
+- Loop detection (two signals): a cheap **structural** signature hash over recent
+  delegation sets halts a coordinator that literally re-issues the same set,
+  preventing oscillating A→B→A loops well before the depth cap. Layered on top, a
+  **result-aware non-progress streak** (#339) catches a coordinator that perturbs
+  the set each round to evade the structural hash but whose children keep
+  returning nothing new: after every generation finishes, the engine fingerprints
+  the children's *verifiable* side effects (decision, `changes_made`, `tests_run`,
+  PR/HeadSHA, `artifact_body` — self-reported summary/findings text is excluded).
+  When that digest repeats for `MaxDelegationNonProgressStreak` consecutive
+  generations (default `2`, set per-host via
+  `[orchestrate].max_delegation_non_progress_streak`), the tree trips the same loop
+  ladder; any new durable side effect resets the streak even if the summary text
+  repeats. Both signals share one ladder: `delegation_loop_warning` + a corrective
+  continuation, then `delegation_loop_detected` + the graceful finalize below.
 - Operator kill switch: `gitmoot job kill <root-job-id>` lets an operator
   terminate a runaway tree by its root id from outside. It is the **first**
   backstop, so operator action wins over every budget cap. The kill is graceful,
