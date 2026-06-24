@@ -4106,6 +4106,57 @@ func (w jobWorker) finishQueuedJob(ctx context.Context, jobID string, state work
 	if transitioned {
 		writeLine(w.Stdout, "job %s %s: %v", jobID, state, cause)
 	}
+	// A delegation child that fails in ANY pre-flight step (checkout/branch-lock
+	// validation, adapter factory, managed config, runtime-session lock/busy,
+	// ephemeral bring-up, delegated dispatch) is closed here straight from
+	// JobQueued — it never reached queued→running, so handleRunJobError's
+	// ParentJobID finalize branch (which fires only for non-queued children) is
+	// bypassed and the child strands `failed` with Result == nil. Without this,
+	// advanceDelegations never runs for the child and its failure_policy
+	// (escalate_human / block_parent / continue / escalate) never fires (#409).
+	//
+	// finishQueuedJob is the single choke point all ~12 direct
+	// finishQueuedJob(JobFailed) sites (and handleRunJobError's JobQueued branch)
+	// funnel through, so finalizing here covers every pre-flight failure exactly
+	// once. Gate on a genuine queued→failed transition + a delegation child with
+	// no stored result, so non-delegation jobs (PR/issue asks) are byte-identical
+	// and an already-terminal/cancelled child is never force-finalized.
+	if transitioned && state == workflow.JobFailed {
+		return w.finalizePreflightDelegationChild(ctx, jobID, cause)
+	}
+	return nil
+}
+
+// finalizePreflightDelegationChild drives the parent delegation DAG for a child
+// that was just transitioned queued→failed in a daemon pre-flight step, so the
+// delegation's failure_policy fires exactly as it would for a runtime failure.
+// It is a no-op for a non-delegation job or a child that already stored a result
+// (finalizeTimedOutDelegationChild / Engine.FinalizeTimedOutDelegationChild are
+// idempotent), so a re-run (retry / stale-running recovery) re-enters cleanly. It
+// mirrors handleRunJobError (~4169-4189): an AwaitingHumanError (escalate_human
+// paused the tree awaiting a human, #340) and a BlockedError (block_parent blocked
+// the shared parent task) are EXPECTED terminal outcomes of advancing the DAG, not
+// errors to propagate.
+func (w jobWorker) finalizePreflightDelegationChild(ctx context.Context, jobID string, cause error) error {
+	job, err := w.Store.GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	payload, payloadErr := daemonJobPayload(job)
+	if payloadErr != nil || strings.TrimSpace(payload.ParentJobID) == "" || payload.Result != nil {
+		return nil
+	}
+	if _, finalizeErr := w.finalizeTimedOutDelegationChild(ctx, job, cause); finalizeErr != nil {
+		var awaiting workflow.AwaitingHumanError
+		if errors.As(finalizeErr, &awaiting) {
+			return nil
+		}
+		var blocked workflow.BlockedError
+		if errors.As(finalizeErr, &blocked) {
+			return nil
+		}
+		return finalizeErr
+	}
 	return nil
 }
 
