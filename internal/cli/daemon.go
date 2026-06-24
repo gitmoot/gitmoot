@@ -2117,6 +2117,16 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, "", errors.New(agentPermissionBlockedMessage))
 		writeLine(w.Stdout, "job %s blocked: %s", job.ID, agentPermissionBlockedMessage)
+		// A read-only implement DELEGATION child short-circuits to blocked here,
+		// BEFORE finishQueuedJob, via markJobPermissionBlocked (a direct transition)
+		// — and blockTaskForPermissionBlockedJob only blocks the task, it never
+		// advances the parent DAG. So without this the parent strands exactly like
+		// #409. Route the delegation child through the SAME finalize helper so its
+		// failure_policy fires. Gated strictly on a delegation child (ParentJobID set,
+		// Result nil), so a NON-delegation permission-blocked job is byte-identical.
+		if err := w.finalizePreflightDelegationChild(ctx, job.ID, errors.New(agentPermissionBlockedMessage)); err != nil {
+			return err
+		}
 		return nil
 	}
 	checkout, err := w.CheckoutValidator(ctx, job, payload, agent)
@@ -4106,6 +4116,70 @@ func (w jobWorker) finishQueuedJob(ctx context.Context, jobID string, state work
 	if transitioned {
 		writeLine(w.Stdout, "job %s %s: %v", jobID, state, cause)
 	}
+	// A delegation child that fails in ANY pre-flight step (checkout/branch-lock
+	// validation, adapter factory, managed config, runtime-session lock/busy,
+	// ephemeral bring-up, delegated dispatch) is closed here straight from
+	// JobQueued — it never reached queued→running, so handleRunJobError's
+	// ParentJobID finalize branch (which fires only for non-queued children) is
+	// bypassed and the child strands `failed` with Result == nil. Without this,
+	// advanceDelegations never runs for the child and its failure_policy
+	// (escalate_human / block_parent / continue / escalate) never fires (#409).
+	//
+	// finishQueuedJob is the single choke point all ~12 direct
+	// finishQueuedJob(JobFailed) sites (and handleRunJobError's JobQueued branch)
+	// funnel through, so finalizing here covers every pre-flight failure exactly
+	// once. Gate on a genuine queued→(failed|blocked) transition + a delegation
+	// child with no stored result, so non-delegation jobs (PR/issue asks) are
+	// byte-identical and an already-terminal/cancelled child is never
+	// force-finalized.
+	//
+	// JobBlocked is included alongside JobFailed: a queued delegation child that
+	// fails an executor pre-flight check returning a BlockedError (a same-branch
+	// sibling branch-lock conflict, an empty implement branch, a missing
+	// action/repo capability, an unsubscribed agent — all from
+	// ensureJobExecutorAllowed/e.block) is routed by handleRunJobError to
+	// finishQueuedJob(..., JobBlocked, ...). Both failed and blocked are genuine
+	// terminal failures the engine already finalizes (FinalizeTimedOutDelegationChild
+	// accepts JobRunning/JobFailed/JobBlocked), so both must advance the parent DAG
+	// or the blocked class strands the parent — the exact #409 bug. JobCancelled is
+	// deliberately excluded: the engine switch rejects it and a cancelled child
+	// must follow the cancelled path.
+	if transitioned && (state == workflow.JobFailed || state == workflow.JobBlocked) {
+		return w.finalizePreflightDelegationChild(ctx, jobID, cause)
+	}
+	return nil
+}
+
+// finalizePreflightDelegationChild drives the parent delegation DAG for a child
+// that was just transitioned queued→failed in a daemon pre-flight step, so the
+// delegation's failure_policy fires exactly as it would for a runtime failure.
+// It is a no-op for a non-delegation job or a child that already stored a result
+// (finalizeTimedOutDelegationChild / Engine.FinalizeTimedOutDelegationChild are
+// idempotent), so a re-run (retry / stale-running recovery) re-enters cleanly. It
+// mirrors handleRunJobError (~4169-4189): an AwaitingHumanError (escalate_human
+// paused the tree awaiting a human, #340) and a BlockedError (block_parent blocked
+// the shared parent task) are EXPECTED terminal outcomes of advancing the DAG, not
+// errors to propagate.
+func (w jobWorker) finalizePreflightDelegationChild(ctx context.Context, jobID string, cause error) error {
+	job, err := w.Store.GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	payload, payloadErr := daemonJobPayload(job)
+	if payloadErr != nil || strings.TrimSpace(payload.ParentJobID) == "" || payload.Result != nil {
+		return nil
+	}
+	if _, finalizeErr := w.finalizeTimedOutDelegationChild(ctx, job, cause); finalizeErr != nil {
+		var awaiting workflow.AwaitingHumanError
+		if errors.As(finalizeErr, &awaiting) {
+			return nil
+		}
+		var blocked workflow.BlockedError
+		if errors.As(finalizeErr, &blocked) {
+			return nil
+		}
+		return finalizeErr
+	}
 	return nil
 }
 
@@ -4122,7 +4196,22 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, cause er
 				return err
 			}
 			if transitioned {
-				return blockTaskForPermissionBlockedJob(ctx, w.Store, latest)
+				if err := blockTaskForPermissionBlockedJob(ctx, w.Store, latest); err != nil {
+					return err
+				}
+				// A WRITABLE implement DELEGATION child whose runtime fails MID-RUN
+				// with a permission error (read-only FS / sandbox denies write) is
+				// transitioned JobRunning->JobBlocked here and returns early — it never
+				// reaches the ParentJobID finalize branch below, so the parent DAG
+				// strands exactly like #409 (the mid-run sibling of the pre-flight
+				// read-only-implement case fixed at ~2127). Route it through the SAME
+				// finalize helper so its failure_policy fires. The helper no-ops for a
+				// non-delegation job (ParentJobID empty) or one that already stored a
+				// result, so the solo-implement case stays byte-identical.
+				if err := w.finalizePreflightDelegationChild(ctx, jobID, errors.New(agentPermissionBlockedMessage)); err != nil {
+					return err
+				}
+				return nil
 			}
 		}
 	}
