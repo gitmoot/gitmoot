@@ -4,11 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"os"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/runtime"
@@ -299,45 +297,5 @@ func TestRunAgentRestartStartFailsLeavesNoPartialWrite(t *testing.T) {
 	}
 	if got.HealthStatus != "failed" {
 		t.Fatalf("HealthStatus = %q, want unchanged failed (no partial write)", got.HealthStatus)
-	}
-}
-
-// T7 — the runtime-session lock runtime:<rt>:<ref> held by a LIVE pid blocks the
-// restart (a concurrent foreground `agent ask` with no DB job). We use the test
-// process's own pid as the guaranteed-live owner.
-func TestRunAgentRestartRejectsLiveSessionLock(t *testing.T) {
-	home := t.TempDir()
-	const r1 = "550e8400-e29b-41d4-a716-446655440041"
-	seedRestartAgent(t, home, "codex", r1)
-	func() {
-		store := openCLIJobStore(t, home)
-		defer store.Close()
-		acquired, err := store.AcquireResourceLock(context.Background(), db.ResourceLock{
-			ResourceKey: "runtime:codex:" + r1,
-			OwnerJobID:  "foreground-ask",
-			OwnerToken:  "tok",
-			OwnerPID:    int64(os.Getpid()),
-			ExpiresAt:   time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano),
-		}, time.Now().UTC())
-		if err != nil || !acquired {
-			t.Fatalf("AcquireResourceLock acquired=%v err=%v", acquired, err)
-		}
-	}()
-
-	fake := &agentRestartFakeAdapter{newRef: "550e8400-e29b-41d4-a716-446655440042"}
-	replaceRuntimeStartAdapter(t, fake)
-
-	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "restart", "rebind-me", "--home", home}, &stdout, &stderr); code != 1 {
-		t.Fatalf("restart exit code = %d, want 1; stderr=%s", code, stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "busy") {
-		t.Fatalf("stderr = %q, want live-session busy rejection", stderr.String())
-	}
-	if fake.calls() != 0 {
-		t.Fatalf("adapter.Start calls = %d, want 0 (live session must not be replaced)", fake.calls())
-	}
-	if got := getRestartAgent(t, home, "rebind-me"); got.RuntimeRef != r1 {
-		t.Fatalf("RuntimeRef = %q, want unchanged %q", got.RuntimeRef, r1)
 	}
 }

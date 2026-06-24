@@ -101,7 +101,7 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot agent show <name> [--json]")
 	fmt.Fprintln(w, "  gitmoot agent list")
 	fmt.Fprintln(w, "  gitmoot agent remove <name>")
-	fmt.Fprintln(w, "  gitmoot agent restart <name>")
+	fmt.Fprintln(w, "  gitmoot agent restart <name>      # abandon + replace the runtime session (finish in-flight asks first)")
 	fmt.Fprintln(w, "  gitmoot agent doctor <name>")
 }
 
@@ -1784,9 +1784,14 @@ func runAgentRestart(args []string, stdout, stderr io.Writer) int {
 		record   db.Repo
 		cached   db.AgentTemplate
 	)
-	// Load + guards: resolve the existing agent and its checkout, and refuse a
-	// busy / live-session agent BEFORE calling adapter.Start. A guard failure
-	// must leave runtime_ref untouched and never start a session.
+	// Load + busy pre-flight: resolve the existing agent and its checkout, and
+	// refuse an agent with queued/running jobs BEFORE calling adapter.Start so a
+	// refusal leaves runtime_ref untouched and never starts a session. This is a
+	// best-effort pre-flight guard, NOT atomic with the rebind: the count and the
+	// later runtime_ref write happen in separate store sessions with adapter.Start
+	// between them, so a job enqueued in that window isn't re-checked. That is
+	// benign for this manual recovery verb — restart abandons and replaces the
+	// session rather than orphaning work.
 	if err := withStore(*home, func(store *db.Store) error {
 		var err error
 		existing, err = store.GetAgent(context.Background(), name)
@@ -1806,9 +1811,14 @@ func runAgentRestart(args []string, stdout, stderr io.Writer) int {
 		if active > 0 {
 			return fmt.Errorf("agent %s has %d queued or running job(s); cancel them first: %w", name, active, db.ErrAgentHasActiveJobs)
 		}
-		if err := runtimeSessionLockHeldByLivePID(context.Background(), store, runtimeAgent(existing)); err != nil {
-			return err
-		}
+		// No runtime-session-lock guard here: the production runtime:<rt>:<ref>
+		// session lock never records an OwnerPID (see acquireRuntimeSessionLock),
+		// so a live foreground `agent ask` can't be distinguished from a stranded
+		// lock at this layer. Restart doesn't need to: it mints a NEW session (new
+		// runtime_ref → new lock key), so any old/stranded runtime:<rt>:<oldref>
+		// lock is simply left to self-clear on its TTL. A real session guard
+		// (record OwnerPID+host on acquisition, then a same-host liveness check) is
+		// a separate follow-up. The jobs-busy check above is the effective guard.
 		record, err = store.GetRepo(context.Background(), existing.RepoScope)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
@@ -1851,30 +1861,8 @@ func runAgentRestart(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stdout, "restarted %s (%s); session: %s\n", existing.Name, existing.Runtime, existing.RuntimeRef)
+	fmt.Fprintf(stdout, "note: this abandons and replaces %s's current runtime session; finish any in-flight foreground `agent ask` first\n", existing.Name)
 	return 0
-}
-
-// runtimeSessionLockHeldByLivePID refuses a restart when the foreground
-// runtime-session lock runtime:<rt>:<ref> is held by a live process — a
-// concurrent `agent ask` holds it without a DB job, so the jobs-busy check
-// alone would miss it. A held-but-dead lock (stranded PID) does NOT block:
-// restart is exactly the recovery for an abandoned session.
-func runtimeSessionLockHeldByLivePID(ctx context.Context, store *db.Store, agent runtime.Agent) error {
-	key, ok := runtimeSessionResourceKey(agent)
-	if !ok {
-		return nil
-	}
-	lock, err := store.GetResourceLock(ctx, key)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if lock.OwnerPID > 0 && skillOptOwnerPIDLive(lock.OwnerPID) {
-		return fmt.Errorf("agent %s session %s is busy (held by live pid %d); wait for it to finish, then restart", agent.Name, agent.RuntimeRef, lock.OwnerPID)
-	}
-	return nil
 }
 
 func runAgentDoctor(args []string, stdout, stderr io.Writer) int {
