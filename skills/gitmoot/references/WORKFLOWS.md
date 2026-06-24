@@ -550,7 +550,7 @@ daemon, then reconvenes their results in a single continuation. Start one with
 `gitmoot orchestrate <recipe-id> "..." --repo owner/repo`; the daemon runs the
 coordinator in the background and dispatches its delegations.
 
-Two recipes ship built in:
+Three recipes ship built in:
 
 - **`review-panel`** — fans a PR or change out to a panel of ephemeral reviewers,
   each with a different lens (correctness and security; performance and
@@ -563,16 +563,37 @@ Two recipes ship built in:
   file-disjoint subtasks, fans them out to ephemeral implementation workers that
   build in parallel in their own branch worktrees, then runs a single `review`
   verify step that `deps` on every implementation leg before reporting back.
+- **`verifier`** — the minimal **produce vs. independent check** recipe: one
+  producer leg plus one independent verify leg. The verify leg is a read-only
+  ephemeral `review` worker that `deps` on the producer, runs on a **different
+  runtime/model**, and checks the producer's combined result against the original
+  goal — re-running the build and tests itself rather than trusting the producer's
+  self-report. It returns `changes_requested` with structured findings on any
+  objective failure (else `approved`), with `failure_policy: escalate` routing a
+  failed verdict back to the coordinator continuation for autonomous correction
+  (or `escalate_human` for a human pause).
+
+**Produce vs. independent check.** A `synthesis_rule` (`summary`/`vote`/`quorum`)
+reconciles what the producers **self-report** — self-evaluation, which inherits
+the producer's blind spots. A `verifier`/`decompose-and-verify` verify leg is a
+*separate* worker on a different runtime/model that checks the combined result
+against the goal — cross-evaluation, which the literature finds beats
+self-evaluation (the generator-verifier gap; LLM-as-judge self-preference bias).
+This generalizes ROMA's Verifier (`(goal, candidate_output) -> verdict +
+feedback`, vendored at `repos/ROMA`); it uses only shipped primitives
+(`ephemeral`, `failure_policy`, the merge gate) — no new engine code. See the
+**produce vs. independent check** note in `RESULT_CONTRACT.md`.
 
 ```sh
 gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
 gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
+gitmoot orchestrate verifier "Implement the rate limiter described in the task and prove it works." --repo owner/repo
 ```
 
-The panelists in `review-panel` and every implementation and verify leg in
-`decompose-and-verify` are **ephemeral** workers: Gitmoot creates each from the
-delegation's `ephemeral` spec, runs it, and disposes of it once the child job
-finishes. Ephemeral workers are leaf-only — they return findings, never their own
+The panelists in `review-panel` and every producer and verify leg in
+`decompose-and-verify` and `verifier` are **ephemeral** workers: Gitmoot creates
+each from the delegation's `ephemeral` spec, runs it, and disposes of it once the
+child job finishes. Ephemeral workers are leaf-only — they return findings, never their own
 delegations — so a recipe's fan-out is exactly one level deep. In both recipes the
 delegations never set `agent`, because `agent` and `ephemeral` are mutually
 exclusive. Once every leg is terminal, Gitmoot enqueues one continuation back to

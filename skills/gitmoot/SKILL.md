@@ -95,7 +95,14 @@ and synthesizes. `gitmoot orchestrate <agent> "..." [--repo R]` is sugar for
 [RESULT_CONTRACT.md](references/RESULT_CONTRACT.md) for the delegation fields and
 termination bounds. A coordinator can also spawn throwaway, auto-disposed
 ephemeral workers on demand via a delegation's `ephemeral` spec (no
-pre-registration; mutually exclusive with `agent`). An agent (via `--model` on start/subscribe/type set) and an
+pre-registration; mutually exclusive with `agent`). A `synthesis_rule`
+(`summary`/`vote`/`quorum`) reconciles the producers' **self-report**; to check
+the combined result against the goal **independently**, add a read-only verify
+leg on a **different** runtime/model that `deps` on the producer(s) — produce vs.
+independent check, the same separation as ROMA's Verifier (cross-evaluation beats
+self-evaluation; see the `verifier` and `decompose-and-verify` recipes and the
+"produce vs. independent check" note in
+[RESULT_CONTRACT.md](references/RESULT_CONTRACT.md)). An agent (via `--model` on start/subscribe/type set) and an
 individual job or delegation (via `--model` on run/ask/review/implement or the
 delegation `model` field) can pin a runtime model, with the per-job/delegation
 value overriding the agent default. Use

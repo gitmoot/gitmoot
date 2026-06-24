@@ -125,6 +125,29 @@ the same `delegations` field, `coordinator`, and `continuation` mechanics.
   delegations (every child must approve). `K` is an integer count only — no
   fractions or percentages — and must not exceed the number of delegations (a
   larger `K` is unsatisfiable and is rejected).
+
+  **Produce vs. independent check.** The `synthesis_rule`s above reconcile what
+  the producers **self-report** — `summary` merges their summaries, `vote`/`quorum`
+  count their *own* approving decisions. That is **self-evaluation**, and it
+  inherits the producer's blind spots. To check the *combined* result against the
+  original goal independently, add a separate **verify leg**: a read-only ephemeral
+  `review` child that `deps` on the producer(s), runs on a **different
+  runtime/model**, and re-runs the build and tests itself rather than trusting the
+  producers' self-reported `tests_run`. It returns `decision: changes_requested`
+  with structured findings on any objective failure, else `approved`. This is
+  **cross-evaluation**, which the literature consistently finds beats
+  self-evaluation: a capable verifier catches failures the solver does not (the
+  generator-verifier gap), and LLM-as-judge graders show a self-preference bias
+  toward their own outputs that a different-model judge does not share. It is the
+  same separation as [ROMA](https://github.com/sentient-agi/ROMA)'s Verifier
+  (`VerifierSignature: (goal, candidate_output) -> verdict + feedback`), where a
+  failed verdict drives a re-plan instead of trusting the producer. Route a failed
+  verdict with `failure_policy: escalate` (autonomous correction in the coordinator
+  continuation) or `escalate_human` (a human-in-the-loop pause); the merge gate
+  independently blocks merge on the non-ready decision. The built-in
+  [`verifier` and `decompose-and-verify` recipes](../workflows/coordinator-recipes-workflow.md)
+  are templates for this — no new engine primitive is involved (`ephemeral`,
+  `failure_policy`, and the merge gate already ship).
 - `timeout` (optional): a Go duration string that must be positive (for example,
   `10m`).
 - `retry` (optional): an integer that must be `>= 0`.
@@ -233,11 +256,13 @@ them all in a single round.
 
 :::tip Built-in coordinator recipes
 You do not have to author the `ephemeral` fan-out by hand. The built-in
-**coordinator recipes** `review-panel` and `decompose-and-verify` are templates
-that emit a ready-made ephemeral `delegations[]` for you — a diverse-lens review
-panel, or parallel implementation legs plus a verify gate. Run them with
+**coordinator recipes** `review-panel`, `decompose-and-verify`, and `verifier`
+are templates that emit a ready-made ephemeral `delegations[]` for you — a
+diverse-lens review panel, parallel implementation legs plus a verify gate, or one
+producer plus an independent verify leg. Run them with
 `gitmoot orchestrate review-panel "..."` /
-`gitmoot orchestrate decompose-and-verify "..."`. See the
+`gitmoot orchestrate decompose-and-verify "..."` /
+`gitmoot orchestrate verifier "..."`. See the
 [Coordinator Recipes Workflow](../workflows/coordinator-recipes-workflow.md).
 :::
 
