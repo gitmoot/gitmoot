@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -382,7 +383,12 @@ func TestRunPluginDoctorClaudeReportsMaskedAuthEnv(t *testing.T) {
 	}
 }
 
-func TestRunPluginDoctorClaudeWarnsWhenAuthEnvMissing(t *testing.T) {
+// TestRunPluginDoctorClaudeProbesOKWhenAuthEnvMissing is the load-bearing PR3
+// flip: with no env token but a successful live `claude -p` probe, the
+// runtime-auth-env check reports OK (was a false-negative "warn" under the
+// env-only InspectClaudeAuthEnv behavior). Reverting checkClaudeAuthEnv to the
+// env-only check makes this assert ok->fail.
+func TestRunPluginDoctorClaudeProbesOKWhenAuthEnvMissing(t *testing.T) {
 	withClaudeAuthEnv(t, nil)
 	home := t.TempDir()
 	if _, err := pluginpack.Build(pluginpack.BuildOptions{
@@ -393,6 +399,9 @@ func TestRunPluginDoctorClaudeWarnsWhenAuthEnvMissing(t *testing.T) {
 	}
 	restore := stubPluginLookPath(map[string]string{"claude": "/tmp/bin/claude"})
 	defer restore()
+	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"result":"OK"}`}}}
+	restoreRunner := replacePluginDoctorRunner(runner)
+	defer restoreRunner()
 
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{"plugin", "doctor", "claude", "--home", home, "--json"}, &stdout, &stderr)
@@ -405,11 +414,126 @@ func TestRunPluginDoctorClaudeWarnsWhenAuthEnvMissing(t *testing.T) {
 		t.Fatalf("doctor JSON did not parse: %v\n%s", err, stdout.String())
 	}
 	check := findDoctorCheck(t, output.Runtimes[0].Checks, "runtime-auth-env")
+	if check.Status != "ok" {
+		t.Fatalf("runtime-auth-env status = %q, want ok; checks=%+v", check.Status, output.Runtimes[0].Checks)
+	}
+	if !strings.Contains(check.Detail, runtime.ClaudeBackgroundTokenMessage) {
+		t.Fatalf("runtime-auth-env detail = %q, want background-token caveat", check.Detail)
+	}
+	// The default (no --live) check live-probes via claude -p in the not-Ready branch.
+	runner.want(t, 0, "", "claude", "-p", "--output-format", "json", "--", runtime.ClaudeLiveCheckPrompt)
+}
+
+func TestRunPluginDoctorClaudeWarnsWhenAuthEnvMissingAndProbeFails(t *testing.T) {
+	withClaudeAuthEnv(t, nil)
+	home := t.TempDir()
+	if _, err := pluginpack.Build(pluginpack.BuildOptions{
+		Provider: pluginpack.ProviderClaude,
+		Home:     filepath.Join(home, ".gitmoot"),
+	}); err != nil {
+		t.Fatalf("build claude package: %v", err)
+	}
+	restore := stubPluginLookPath(map[string]string{"claude": "/tmp/bin/claude"})
+	defer restore()
+	runner := &agentStartRunner{
+		results: []subprocess.Result{{Stderr: "401 Invalid authentication credentials"}},
+		errs:    []error{errors.New("exit 1")},
+	}
+	restoreRunner := replacePluginDoctorRunner(runner)
+	defer restoreRunner()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"plugin", "doctor", "claude", "--home", home, "--json"}, &stdout, &stderr)
+
+	// runtime-auth-env is non-required, so a failed probe is still a warn (exit 0),
+	// but with the session-failure message, not the background-token caveat.
+	if code != 0 {
+		t.Fatalf("plugin doctor exit code = %d, stderr=%s\nstdout=%s", code, stderr.String(), stdout.String())
+	}
+	var output pluginDoctorOutput
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+		t.Fatalf("doctor JSON did not parse: %v\n%s", err, stdout.String())
+	}
+	check := findDoctorCheck(t, output.Runtimes[0].Checks, "runtime-auth-env")
 	if check.Status != "warn" {
 		t.Fatalf("runtime-auth-env status = %q, want warn; checks=%+v", check.Status, output.Runtimes[0].Checks)
 	}
-	if !strings.Contains(check.Detail, "claude setup-token") {
-		t.Fatalf("runtime-auth-env detail = %q, want setup-token guidance", check.Detail)
+	if !strings.Contains(check.Detail, runtime.ClaudeSessionAuthFailedMessage) {
+		t.Fatalf("runtime-auth-env detail = %q, want session-failure message", check.Detail)
+	}
+}
+
+func TestRunPluginDoctorClaudeWarnsWhenAuthEnvMissingAndProbeUnavailable(t *testing.T) {
+	withClaudeAuthEnv(t, nil)
+	home := t.TempDir()
+	if _, err := pluginpack.Build(pluginpack.BuildOptions{
+		Provider: pluginpack.ProviderClaude,
+		Home:     filepath.Join(home, ".gitmoot"),
+	}); err != nil {
+		t.Fatalf("build claude package: %v", err)
+	}
+	restore := stubPluginLookPath(map[string]string{"claude": "/tmp/bin/claude"})
+	defer restore()
+	runner := &agentStartRunner{
+		errs: []error{&exec.Error{Name: "claude", Err: exec.ErrNotFound}},
+	}
+	restoreRunner := replacePluginDoctorRunner(runner)
+	defer restoreRunner()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"plugin", "doctor", "claude", "--home", home, "--json"}, &stdout, &stderr)
+
+	// A missing/unrunnable binary is never a new false-fail: it stays a warn
+	// (the runtime-cli presence check already covers absence).
+	if code != 0 {
+		t.Fatalf("plugin doctor exit code = %d, stderr=%s\nstdout=%s", code, stderr.String(), stdout.String())
+	}
+	var output pluginDoctorOutput
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+		t.Fatalf("doctor JSON did not parse: %v\n%s", err, stdout.String())
+	}
+	check := findDoctorCheck(t, output.Runtimes[0].Checks, "runtime-auth-env")
+	if check.Status != "warn" {
+		t.Fatalf("runtime-auth-env status = %q, want warn; checks=%+v", check.Status, output.Runtimes[0].Checks)
+	}
+	if !strings.Contains(check.Detail, "probe unavailable") {
+		t.Fatalf("runtime-auth-env detail = %q, want probe-unavailable caveat", check.Detail)
+	}
+}
+
+// TestRunPluginDoctorClaudeOKWhenAuthEnvSetSkipsProbe asserts the env-Ready
+// fast path stays instant: the runner is never consulted.
+func TestRunPluginDoctorClaudeOKWhenAuthEnvSetSkipsProbe(t *testing.T) {
+	withClaudeAuthEnv(t, map[string]string{runtime.ClaudeOAuthTokenEnv: "secret-token"})
+	home := t.TempDir()
+	if _, err := pluginpack.Build(pluginpack.BuildOptions{
+		Provider: pluginpack.ProviderClaude,
+		Home:     filepath.Join(home, ".gitmoot"),
+	}); err != nil {
+		t.Fatalf("build claude package: %v", err)
+	}
+	restore := stubPluginLookPath(map[string]string{"claude": "/tmp/bin/claude"})
+	defer restore()
+	runner := &agentStartRunner{}
+	restoreRunner := replacePluginDoctorRunner(runner)
+	defer restoreRunner()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"plugin", "doctor", "claude", "--home", home, "--json"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("plugin doctor exit code = %d, stderr=%s\nstdout=%s", code, stderr.String(), stdout.String())
+	}
+	var output pluginDoctorOutput
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+		t.Fatalf("doctor JSON did not parse: %v\n%s", err, stdout.String())
+	}
+	check := findDoctorCheck(t, output.Runtimes[0].Checks, "runtime-auth-env")
+	if check.Status != "ok" {
+		t.Fatalf("runtime-auth-env status = %q, want ok; checks=%+v", check.Status, output.Runtimes[0].Checks)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("env-Ready path consulted the runner (%d calls), want no probe", len(runner.calls))
 	}
 }
 

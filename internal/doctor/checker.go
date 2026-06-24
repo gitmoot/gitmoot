@@ -21,6 +21,13 @@ type Check struct {
 type Checker struct {
 	Dir    string
 	Runner subprocess.Runner
+	// LiveProbe opts the claude auth check into a live `claude -p` probe when the
+	// auth env is not Ready, instead of false-reporting OK:false on a cached-creds
+	// box. It is opt-in because GlobalChecks is re-run on every dashboard refresh
+	// (dashboard_tui.go) and an unconditional probe would spawn claude each time.
+	// The one-shot `gitmoot doctor` (root.go) sets this true; the dashboard leaves
+	// it false so a refresh never spawns claude.
+	LiveProbe bool
 }
 
 // Run returns the global (cwd-independent) checks followed by the per-repo
@@ -42,7 +49,7 @@ func (c Checker) GlobalChecks(ctx context.Context) []Check {
 		c.command(ctx, runner, "codex", true, "--version"),
 		c.command(ctx, runner, "claude", false, "--help"),
 		c.command(ctx, runner, "kimi", false, "--version"),
-		c.claudeAuthEnv(),
+		c.claudeAuthEnv(ctx),
 		c.ghAuth(ctx, runner),
 	}
 }
@@ -118,13 +125,38 @@ func (c Checker) baseBranch(ctx context.Context, runner subprocess.Runner, dir s
 	return Check{Name: "base branch", OK: true, Required: true, Detail: branch}
 }
 
-func (c Checker) claudeAuthEnv() Check {
+func (c Checker) claudeAuthEnv(ctx context.Context) Check {
 	auth := runtime.InspectClaudeAuthEnv(os.LookupEnv)
-	detail := auth.MaskedDetail()
-	if warning := auth.Warning(); warning != "" {
-		detail += "; " + warning
+	masked := auth.MaskedDetail()
+	if auth.Ready() {
+		detail := masked
+		if warning := auth.Warning(); warning != "" {
+			detail += "; " + warning
+		}
+		return Check{Name: "claude auth", OK: true, Required: false, Detail: detail}
 	}
-	return Check{Name: "claude auth", OK: auth.Ready(), Required: false, Detail: detail}
+	// Env not Ready does not mean auth is broken: foreground Claude may
+	// authenticate fine via cached ~/.claude credentials. The dashboard path
+	// (LiveProbe false) keeps the env-only warn — it must never spawn claude per
+	// refresh. The one-shot `gitmoot doctor` (LiveProbe true) probes the real
+	// dependency (claude -p) so a cached-creds box reports OK instead of a
+	// false-negative warn.
+	if !c.LiveProbe {
+		detail := masked
+		if warning := auth.Warning(); warning != "" {
+			detail += "; " + warning
+		}
+		return Check{Name: "claude auth", OK: false, Required: false, Detail: detail}
+	}
+	if err := runtime.ClaudeLiveCheck(ctx, c.runner(), ""); err != nil {
+		if runtime.ClaudeProbeUnavailable(err) {
+			// Missing/unrunnable binary is not an auth regression; the claude CLI
+			// presence check already covers it. Keep it a non-required warn.
+			return Check{Name: "claude auth", OK: false, Required: false, Detail: masked + "; " + runtime.ClaudeBackgroundTokenMessage + " (probe unavailable)"}
+		}
+		return Check{Name: "claude auth", OK: false, Required: false, Detail: masked + "; " + runtime.ClaudeSessionAuthFailedMessage}
+	}
+	return Check{Name: "claude auth", OK: true, Required: false, Detail: masked + "; " + runtime.ClaudeBackgroundTokenMessage}
 }
 
 func FailedRequired(checks []Check) error {

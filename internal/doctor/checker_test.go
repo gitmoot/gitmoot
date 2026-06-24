@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -89,6 +90,125 @@ func TestCheckerWarnsWhenClaudeAuthEnvMissing(t *testing.T) {
 		}
 	}
 	t.Fatalf("checks missing claude auth: %+v", checks)
+}
+
+// claudeProbeKey is the fakeRunner key for the live claude -p JSON probe that
+// ClaudeLiveCheck issues.
+var claudeProbeKey = "claude -p --output-format json -- " + runtime.ClaudeLiveCheckPrompt
+
+// countingRunner wraps fakeRunner and records every Run invocation so a test can
+// assert the probe never fired (the dashboard / env-Ready paths).
+type countingRunner struct {
+	fakeRunner
+	runs *int
+}
+
+func (r countingRunner) Run(ctx context.Context, dir, command string, args ...string) (subprocess.Result, error) {
+	*r.runs++
+	return r.fakeRunner.Run(ctx, dir, command, args...)
+}
+
+// TestClaudeAuthEnvLiveProbeOKFlipsWarnToOK is the load-bearing PR3 flip: with
+// no env token but a successful live probe, LiveProbe reports OK:true (the
+// env-only behavior returned OK:false). Reverting claudeAuthEnv to env-only
+// makes this assert OK:true -> false.
+func TestClaudeAuthEnvLiveProbeOKFlipsWarnToOK(t *testing.T) {
+	withClaudeAuthEnv(t, nil)
+	runs := 0
+	runner := countingRunner{
+		fakeRunner: fakeRunner{
+			runs: map[string]subprocess.Result{claudeProbeKey: {Stdout: `{"result":"OK"}`}},
+		},
+		runs: &runs,
+	}
+	check := Checker{Runner: runner, LiveProbe: true}.claudeAuthEnv(context.Background())
+	if !check.OK || check.Required {
+		t.Fatalf("claude auth check = %+v, want OK:true non-required", check)
+	}
+	if !strings.Contains(check.Detail, runtime.ClaudeBackgroundTokenMessage) {
+		t.Fatalf("claude auth detail = %q, want background-token caveat", check.Detail)
+	}
+	if runs != 1 {
+		t.Fatalf("probe ran %d times, want exactly 1", runs)
+	}
+}
+
+func TestClaudeAuthEnvLiveProbeFailIsNotOK(t *testing.T) {
+	withClaudeAuthEnv(t, nil)
+	runner := fakeRunner{
+		runs: map[string]subprocess.Result{claudeProbeKey: {Stderr: "401 Invalid authentication credentials"}},
+		errs: map[string]error{claudeProbeKey: fmt.Errorf("exit 1")},
+	}
+	check := Checker{Runner: runner, LiveProbe: true}.claudeAuthEnv(context.Background())
+	if check.OK {
+		t.Fatalf("claude auth check = %+v, want OK:false on probe failure", check)
+	}
+	if !strings.Contains(check.Detail, runtime.ClaudeSessionAuthFailedMessage) {
+		t.Fatalf("claude auth detail = %q, want session-failure message", check.Detail)
+	}
+}
+
+func TestClaudeAuthEnvLiveProbeUnavailableWarns(t *testing.T) {
+	withClaudeAuthEnv(t, nil)
+	runner := fakeRunner{
+		errs: map[string]error{claudeProbeKey: &exec.Error{Name: "claude", Err: exec.ErrNotFound}},
+	}
+	check := Checker{Runner: runner, LiveProbe: true}.claudeAuthEnv(context.Background())
+	if check.OK || check.Required {
+		t.Fatalf("claude auth check = %+v, want OK:false non-required (probe unavailable)", check)
+	}
+	if !strings.Contains(check.Detail, "probe unavailable") {
+		t.Fatalf("claude auth detail = %q, want probe-unavailable caveat", check.Detail)
+	}
+	if !strings.Contains(check.Detail, runtime.ClaudeBackgroundTokenMessage) {
+		t.Fatalf("claude auth detail = %q, want background-token caveat", check.Detail)
+	}
+}
+
+// TestClaudeAuthEnvDashboardNeverProbes guards the critical invariant: the
+// dashboard path (LiveProbe false) reports the env-only warn WITHOUT consulting
+// the runner — so a dashboard refresh never spawns claude.
+func TestClaudeAuthEnvDashboardNeverProbes(t *testing.T) {
+	withClaudeAuthEnv(t, nil)
+	runs := 0
+	// A runner that returns success if ever called for the probe — proving the
+	// dashboard path does not run it (otherwise OK would flip to true).
+	runner := countingRunner{
+		fakeRunner: fakeRunner{
+			runs: map[string]subprocess.Result{claudeProbeKey: {Stdout: `{"result":"OK"}`}},
+		},
+		runs: &runs,
+	}
+	check := Checker{Runner: runner, LiveProbe: false}.claudeAuthEnv(context.Background())
+	if check.OK {
+		t.Fatalf("claude auth check = %+v, want OK:false (env-only warn, no probe)", check)
+	}
+	if runs != 0 {
+		t.Fatalf("dashboard path ran the runner %d times, want 0 (must never spawn claude)", runs)
+	}
+	if !strings.Contains(check.Detail, runtime.ClaudeBackgroundTokenMessage) {
+		t.Fatalf("claude auth detail = %q, want background-token caveat", check.Detail)
+	}
+}
+
+func TestClaudeAuthEnvReadySkipsProbe(t *testing.T) {
+	withClaudeAuthEnv(t, map[string]string{runtime.ClaudeOAuthTokenEnv: "secret-token"})
+	runs := 0
+	runner := countingRunner{
+		fakeRunner: fakeRunner{
+			runs: map[string]subprocess.Result{claudeProbeKey: {Stderr: "should not run"}},
+			errs: map[string]error{claudeProbeKey: fmt.Errorf("should not run")},
+		},
+		runs: &runs,
+	}
+	// Even with LiveProbe true, an env token present takes the instant path.
+	check := Checker{Runner: runner, LiveProbe: true}.claudeAuthEnv(context.Background())
+	if !check.OK {
+		t.Fatalf("claude auth check = %+v, want OK:true when env token present", check)
+	}
+	if runs != 0 {
+		t.Fatalf("env-Ready path ran the runner %d times, want 0", runs)
+	}
 }
 
 func TestCheckerRunsGlobalChecksOutsideRepoDir(t *testing.T) {

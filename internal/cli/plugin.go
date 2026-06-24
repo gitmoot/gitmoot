@@ -435,7 +435,9 @@ func doctorRuntime(home string, provider pluginpack.Provider, explicitRuntime bo
 	runtime.Checks = append(runtime.Checks, checkMarketplacePath(home, provider))
 	runtime.Checks = append(runtime.Checks, checkRuntimeCLI(provider, explicitRuntime))
 	if provider == pluginpack.ProviderClaude {
-		runtime.Checks = append(runtime.Checks, checkClaudeAuthEnv())
+		// When --live is set, checkClaudeLive already runs the authoritative
+		// claude -p probe, so the auth-env check stays env-only (no second probe).
+		runtime.Checks = append(runtime.Checks, checkClaudeAuthEnv(live))
 		if live {
 			runtime.Checks = append(runtime.Checks, checkClaudeLive())
 		}
@@ -530,16 +532,39 @@ func checkRuntimeCLI(provider pluginpack.Provider, explicitRuntime bool) pluginC
 	return okCheck("runtime-cli", path, true)
 }
 
-func checkClaudeAuthEnv() pluginCheck {
+func checkClaudeAuthEnv(live bool) pluginCheck {
 	auth := gitmootruntime.InspectClaudeAuthEnv(os.LookupEnv)
-	detail := auth.MaskedDetail()
-	if warning := auth.Warning(); warning != "" {
-		detail += "; " + warning
+	masked := auth.MaskedDetail()
+	if auth.Ready() {
+		detail := masked
+		if warning := auth.Warning(); warning != "" {
+			detail += "; " + warning
+		}
+		if auth.Warning() == "" {
+			return okCheck("runtime-auth-env", detail, false)
+		}
+		return warnCheck("runtime-auth-env", detail, false)
 	}
-	if auth.Ready() && auth.Warning() == "" {
-		return okCheck("runtime-auth-env", detail, false)
+	if live {
+		// checkClaudeLive runs the authoritative probe in the --live path; keep
+		// the auth-env check env-only here so we don't spawn claude twice.
+		return warnCheck("runtime-auth-env", masked+"; "+gitmootruntime.ClaudeBackgroundTokenMessage, false)
 	}
-	return warnCheck("runtime-auth-env", detail, false)
+	// Env not Ready does not mean auth is broken: foreground Claude may
+	// authenticate fine via cached ~/.claude credentials. `plugin doctor` is an
+	// operator one-shot (infrequent), so probe the real dependency (claude -p)
+	// instead of false-warning on the env check. A successful probe reports ok
+	// with the background-token caveat; a missing binary stays warn (the runtime
+	// CLI presence check already covers absence); a genuine auth/session failure
+	// stays warn (this is a non-required runtime-auth check) with the session
+	// message. The `--live` checkClaudeLive path is unchanged.
+	if err := gitmootruntime.ClaudeLiveCheck(context.Background(), pluginDoctorRunner, ""); err != nil {
+		if gitmootruntime.ClaudeProbeUnavailable(err) {
+			return warnCheck("runtime-auth-env", masked+"; "+gitmootruntime.ClaudeBackgroundTokenMessage+" (probe unavailable)", false)
+		}
+		return warnCheck("runtime-auth-env", masked+"; "+gitmootruntime.ClaudeSessionAuthFailedMessage, false)
+	}
+	return okCheck("runtime-auth-env", masked+"; "+gitmootruntime.ClaudeBackgroundTokenMessage, false)
 }
 
 func formatCodexLaunchCommand(cli string, repo string, gitmootHome string, shell string) string {

@@ -125,7 +125,11 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	checks := doctor.Checker{Dir: *repoDir}.Run(context.Background())
+	// The one-shot `gitmoot doctor` opts into the live claude probe (LiveProbe)
+	// so a cached-creds box is reported accurately rather than false-warned. The
+	// dashboard (dashboard_tui.go) leaves LiveProbe false so its refresh loop
+	// never spawns claude.
+	checks := doctor.Checker{Dir: *repoDir, LiveProbe: true}.Run(context.Background())
 	for _, check := range checks {
 		status := "ok"
 		if !check.OK {
