@@ -802,6 +802,18 @@ func (s *Store) RemoveAgent(ctx context.Context, name string) (bool, error) {
 // the message text.
 var ErrAgentHasActiveJobs = errors.New("agent has queued or running jobs")
 
+// AgentActiveJobCount returns how many queued or running jobs reference the
+// named agent. It is the shared busy check behind DeleteAgentChecked and the
+// `agent restart` rebind, so both refuse an agent with in-flight work using the
+// same query (callers wrap ErrAgentHasActiveJobs to classify the refusal).
+func (s *Store) AgentActiveJobCount(ctx context.Context, name string) (int, error) {
+	var active int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE agent = ? AND state IN ('queued', 'running')`, name).Scan(&active); err != nil {
+		return 0, err
+	}
+	return active, nil
+}
+
 // DeleteAgentChecked removes an agent (and its instances) unless queued or
 // running jobs still reference it, in which case it refuses (wrapping
 // ErrAgentHasActiveJobs) so in-flight work is never orphaned.
