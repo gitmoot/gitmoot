@@ -686,6 +686,84 @@ func (e Engine) rootJobID(job db.Job, payload JobPayload) string {
 	return job.ID
 }
 
+// originalGoal resolves the goal text that a coordinator continuation prompt is
+// anchored to (#418). It reads the ROOT coordinator's own Instructions — the
+// user's original prompt — via rootJobID, which is depth-stable: a NESTED
+// continuation's parentPayload.Instructions holds the parent continuation's built
+// prompt (not the user's goal), so resolving from the root keeps every generation
+// of the chain anchored to the same intent. The caller passes fallback (the
+// immediate parentPayload.Instructions) for two cases: the root was pruned (lookup
+// fails) or the root carries no instructions; in both the continuation must never
+// error, so it falls back rather than failing. The result is whitespace-trimmed;
+// empty/whitespace yields "" so the builders omit the Original goal header.
+func (e Engine) originalGoal(ctx context.Context, rootJobID, fallback string) string {
+	if root, err := e.Store.GetJob(ctx, rootJobID); err == nil {
+		if payload, err := unmarshalPayload(root.Payload); err == nil {
+			if goal := strings.TrimSpace(payload.Instructions); goal != "" {
+				return goal
+			}
+		}
+	}
+	return strings.TrimSpace(fallback)
+}
+
+// goalAnchorHeader renders the "Original goal:" section prepended to a coordinator
+// continuation prompt (#418). An empty/whitespace goal yields "" so the prompt
+// never prints an empty header (the closing instruction degrades to generic
+// synthesis framing — see goalSynthesisClosing). The goal is the user's own prompt,
+// so it is emitted as plain labeled text without fencing.
+func goalAnchorHeader(goal string) string {
+	goal = strings.TrimSpace(goal)
+	if goal == "" {
+		return ""
+	}
+	return "Original goal:\n" + goal + "\n\n"
+}
+
+// goalSynthesisClosing returns the goal-anchored synthesis instruction that
+// replaces the legacy "decide the next step" framing (#418). When a goal is
+// present it asks the coordinator to synthesize an answer to THAT goal; when the
+// goal is empty it degrades to generic synthesis framing. Both spell out the
+// unchanged termination contract: an empty delegations list finishes, and new
+// delegations are only for a genuine remaining gap.
+func goalSynthesisClosing(goal string) string {
+	if strings.TrimSpace(goal) != "" {
+		return "Synthesize these results into an answer to the ORIGINAL GOAL above. " +
+			"Reconcile any conflicts between children and flag any gaps. " +
+			"Only return new delegations if a genuine gap remains; " +
+			"otherwise return an EMPTY delegations list to finish."
+	}
+	return "Synthesize these results into a single coherent answer. " +
+		"Reconcile any conflicts between children and flag any gaps. " +
+		"Only return new delegations if a genuine gap remains; " +
+		"otherwise return an EMPTY delegations list to finish."
+}
+
+// budgetPressureLine returns a one-line nudge to bias the coordinator toward
+// synthesizing rather than re-delegating when the coordination tree is near a
+// termination bound (#418). depth is the depth the NEXT generation would occupy
+// (parentPayload.DelegationDepth+1) and jobs is the current per-root job count.
+// It fires only within budgetPressureSlack of a bound; otherwise it returns "" so
+// a tree with plenty of headroom prints no line (keeping the prompt clean). A
+// non-positive jobs (the count was unavailable) suppresses the job clause.
+func budgetPressureLine(depth, jobs int) string {
+	nearDepth := depth >= MaxDelegationDepth-budgetPressureSlack
+	nearJobs := jobs > 0 && jobs >= MaxDelegationTotalJobs-budgetPressureSlack
+	if !nearDepth && !nearJobs {
+		return ""
+	}
+	if jobs > 0 {
+		return fmt.Sprintf("You are at depth %d/%d and %d/%d jobs — prefer finishing (synthesize now) over re-delegating.\n\n",
+			depth, MaxDelegationDepth, jobs, MaxDelegationTotalJobs)
+	}
+	return fmt.Sprintf("You are at depth %d/%d — prefer finishing (synthesize now) over re-delegating.\n\n",
+		depth, MaxDelegationDepth)
+}
+
+// budgetPressureSlack is how close to a termination bound (depth or per-root job
+// count) the tree must be before budgetPressureLine injects its nudge (#418).
+const budgetPressureSlack = 2
+
 // rootWallClockExceeded reports whether the coordination tree rooted at rootID has
 // been running longer than MaxDelegationWallClock, measured from the root job's
 // created_at MINUS any time the tree spent paused awaiting a human (#340), and the
@@ -1047,6 +1125,18 @@ func (e Engine) countRootDelegationJobs(ctx context.Context, rootID string) (int
 	return count, nil
 }
 
+// rootJobCountForPressure returns the per-root job count for the budget-pressure
+// nudge (#418), failing open to 0 on any lookup error. A 0 makes budgetPressureLine
+// drop only the job clause (depth pressure still fires); it must never error the
+// continuation, which is why this swallows the error rather than propagating it.
+func (e Engine) rootJobCountForPressure(ctx context.Context, rootID string) int {
+	count, err := e.countRootDelegationJobs(ctx, rootID)
+	if err != nil {
+		return 0
+	}
+	return count
+}
+
 // sumRootDelegationTokens sums the runtime token usage (input + output) across an
 // entire coordination tree: the originating coordinator itself (job.ID == rootID)
 // plus every child or continuation whose payload RootJobID points back at it. It
@@ -1335,7 +1425,7 @@ func (e Engine) handleDelegationLoop(ctx context.Context, job db.Job, payload Jo
 		LeadAgent:       payload.LeadAgent,
 		Reviewers:       payload.Reviewers,
 		Sender:          job.Agent,
-		Instructions:    buildCorrectiveContinuationPrompt(payload.Result),
+		Instructions:    buildCorrectiveContinuationPrompt(e.originalGoal(ctx, e.rootJobID(job, payload), payload.Instructions), payload.Result),
 		Constraints:     payload.Constraints,
 		ParentJobID:     job.ID,
 		DelegationDepth: payload.DelegationDepth + 1,
@@ -1393,7 +1483,7 @@ func (e Engine) enqueueFinalizeContinuation(ctx context.Context, job db.Job, pay
 		LeadAgent:          payload.LeadAgent,
 		Reviewers:          payload.Reviewers,
 		Sender:             job.Agent,
-		Instructions:       buildFinalizeContinuationPrompt(payload.Result, reason),
+		Instructions:       buildFinalizeContinuationPrompt(e.originalGoal(ctx, e.rootJobID(job, payload), payload.Instructions), payload.Result, reason),
 		Constraints:        payload.Constraints,
 		ParentJobID:        job.ID,
 		DelegationDepth:    payload.DelegationDepth + 1,
@@ -1897,6 +1987,13 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		childPayloads[id] = childPayload
 	}
 
+	// Goal-anchor the continuation (#418): resolve the user's ORIGINAL goal from
+	// the ROOT coordinator (depth-stable; parentPayload.Instructions is the parent
+	// continuation's built prompt for a nested generation) so every variant below
+	// restates the same intent. A pruned/empty root falls back to the parent's
+	// instructions and, ultimately, an empty goal that omits the header.
+	goal := e.originalGoal(ctx, e.rootJobID(parentJob, parentPayload), parentPayload.Instructions)
+
 	// synthesis_rule "vote": block the parent unless every child approved or
 	// succeeded. The default ("" / "summary") concatenates child summaries into
 	// the continuation prompt below.
@@ -1970,7 +2067,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 			LeadAgent:       parentPayload.LeadAgent,
 			Reviewers:       parentPayload.Reviewers,
 			Sender:          parentJob.Agent,
-			Instructions:    buildCorrectiveContinuationPrompt(parentResult),
+			Instructions:    buildCorrectiveContinuationPrompt(goal, parentResult),
 			Constraints:     parentPayload.Constraints,
 			ParentJobID:     parentJob.ID,
 			DelegationDepth: parentPayload.DelegationDepth + 1,
@@ -2005,22 +2102,26 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 	}
 
 	request := JobRequest{
-		ID:           delegationContinuationID(parentJob.ID),
-		Agent:        parentJob.Agent,
-		Action:       "ask",
-		Model:        parentPayload.Model,
-		Phase:        parentPayload.Phase,
-		Repo:         parentPayload.Repo,
-		Branch:       parentPayload.Branch,
-		PullRequest:  parentPayload.PullRequest,
-		HeadSHA:      parentPayload.HeadSHA,
-		GoalID:       parentPayload.GoalID,
-		TaskID:       parentPayload.TaskID,
-		TaskTitle:    parentPayload.TaskTitle,
-		LeadAgent:    parentPayload.LeadAgent,
-		Reviewers:    parentPayload.Reviewers,
-		Sender:       parentJob.Agent,
-		Instructions: e.buildContinuationPrompt(parentResult, children, childPayloads),
+		ID:          delegationContinuationID(parentJob.ID),
+		Agent:       parentJob.Agent,
+		Action:      "ask",
+		Model:       parentPayload.Model,
+		Phase:       parentPayload.Phase,
+		Repo:        parentPayload.Repo,
+		Branch:      parentPayload.Branch,
+		PullRequest: parentPayload.PullRequest,
+		HeadSHA:     parentPayload.HeadSHA,
+		GoalID:      parentPayload.GoalID,
+		TaskID:      parentPayload.TaskID,
+		TaskTitle:   parentPayload.TaskTitle,
+		LeadAgent:   parentPayload.LeadAgent,
+		Reviewers:   parentPayload.Reviewers,
+		Sender:      parentJob.Agent,
+		// Budget-pressure nudge (#418): when the tree is near a depth/job bound, bias
+		// the coordinator toward synthesizing now over more fan-out. The job count is
+		// best-effort — a lookup error yields 0, which suppresses only the job clause,
+		// never the continuation.
+		Instructions: e.buildContinuationPrompt(goal, budgetPressureLine(parentPayload.DelegationDepth+1, e.rootJobCountForPressure(ctx, e.rootJobID(parentJob, parentPayload))), parentResult, children, childPayloads),
 		Constraints:  parentPayload.Constraints,
 		ParentJobID:  parentJob.ID,
 		// Increment depth per continuation generation so a coordinator whose
@@ -2400,9 +2501,11 @@ func delegationContinuationID(parentJobID string) string {
 // buildContinuationPrompt inlines each finished child's job id, agent, decision,
 // summary, and PR link into the coordinator continuation prompt so the
 // coordinator can synthesize the results without re-reading every child job.
-func (e Engine) buildContinuationPrompt(parentResult *AgentResult, children map[string]db.Job, childPayloads map[string]JobPayload) string {
+func (e Engine) buildContinuationPrompt(goal, budgetLine string, parentResult *AgentResult, children map[string]db.Job, childPayloads map[string]JobPayload) string {
 	var builder strings.Builder
-	builder.WriteString("All delegated jobs have finished. Review the results below and decide the next step.\n\n")
+	builder.WriteString(goalAnchorHeader(goal))
+	builder.WriteString("All delegated jobs have finished. Review the results below.\n\n")
+	builder.WriteString(budgetLine)
 	builder.WriteString("Delegation results:\n")
 	// remainingInline tracks the aggregate ArtifactBody budget across all children
 	// for this continuation; only consulted when InlineArtifactBodies is set.
@@ -2440,8 +2543,12 @@ func (e Engine) buildContinuationPrompt(parentResult *AgentResult, children map[
 		}
 	}
 	// Completion contract: make termination directed. The engine already treats
-	// an empty delegations list as terminal, so spell it out for the agent.
-	builder.WriteString("\n\nIf the goal is now complete, return your result with an EMPTY delegations list to finish. Only return new delegations if more work is genuinely required.")
+	// an empty delegations list as terminal, so spell it out for the agent. The
+	// closing is reframed (#418) from "decide the next step" to goal-anchored
+	// synthesis — but the termination semantics (empty delegations = done) are
+	// unchanged.
+	builder.WriteString("\n\n")
+	builder.WriteString(goalSynthesisClosing(goal))
 	return builder.String()
 }
 
@@ -2569,15 +2676,18 @@ func truncateUTF8Bytes(s string, maxBytes int) (string, int) {
 // coordinator the repeat changed nothing and asks it to change approach or
 // finish, then lists the repeated delegations for context. If it repeats again,
 // handleDelegationLoop escalates to delegation_loop_detected and stops.
-func buildCorrectiveContinuationPrompt(parentResult *AgentResult) string {
+func buildCorrectiveContinuationPrompt(goal string, parentResult *AgentResult) string {
 	var builder strings.Builder
+	builder.WriteString(goalAnchorHeader(goal))
 	builder.WriteString("You delegated the same set as a previous round; it did not change the outcome. Change your approach or return an EMPTY delegations list to finish.\n\n")
 	if parentResult != nil && len(parentResult.Delegations) > 0 {
 		builder.WriteString("Repeated delegation set:\n")
 		for _, d := range parentResult.Delegations {
 			fmt.Fprintf(&builder, "- delegation %q (agent %s, action %s)\n", d.ID, d.Agent, d.Action)
 		}
+		builder.WriteString("\n")
 	}
+	builder.WriteString(goalSynthesisClosing(goal))
 	return builder.String()
 }
 
@@ -2587,10 +2697,19 @@ func buildCorrectiveContinuationPrompt(parentResult *AgentResult) string {
 // the completed work, and states that any delegations it returns now are ignored
 // (the engine enforces this via DelegationFinalize). It lists the delegations that
 // were not dispatched for context.
-func buildFinalizeContinuationPrompt(parentResult *AgentResult, reason string) string {
+func buildFinalizeContinuationPrompt(goal string, parentResult *AgentResult, reason string) string {
 	var builder strings.Builder
+	builder.WriteString(goalAnchorHeader(goal))
 	fmt.Fprintf(&builder, "A termination backstop was reached (%s). You cannot delegate any more work.\n\n", reason)
-	builder.WriteString("Synthesize a best-effort FINAL result from what has already completed, and return an EMPTY delegations list. Any delegations you return now will be ignored.\n")
+	// Goal-anchored synthesis (#418): the finalize continuation is already
+	// terminal (any delegations are ignored — DelegationFinalize), so it restates
+	// the goal and asks for a best-effort answer to it, reconciling child conflicts
+	// and flagging gaps, rather than a raw stitch of child outputs.
+	if strings.TrimSpace(goal) != "" {
+		builder.WriteString("Synthesize a best-effort FINAL answer to the ORIGINAL GOAL above from what has already completed — reconcile any conflicts between children and flag any gaps — and return an EMPTY delegations list. Any delegations you return now will be ignored.\n")
+	} else {
+		builder.WriteString("Synthesize a best-effort FINAL result from what has already completed — reconcile any conflicts between children and flag any gaps — and return an EMPTY delegations list. Any delegations you return now will be ignored.\n")
+	}
 	if parentResult != nil && len(parentResult.Delegations) > 0 {
 		builder.WriteString("\nDelegations that were NOT dispatched:\n")
 		for _, d := range parentResult.Delegations {

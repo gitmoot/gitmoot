@@ -90,6 +90,7 @@ func TestEngineFinalizeContinuationIsTerminal(t *testing.T) {
 
 func TestBuildFinalizeContinuationPrompt(t *testing.T) {
 	prompt := buildFinalizeContinuationPrompt(
+		"",
 		&AgentResult{Delegations: []Delegation{{ID: "x", Agent: "w", Action: "ask"}}},
 		"per-root job budget of 64 reached",
 	)
