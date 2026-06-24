@@ -157,7 +157,15 @@ func (c Checker) claudeAuthDaemon() (Check, bool) {
 	if strings.TrimSpace(c.Paths.Home) == "" {
 		return Check{}, false
 	}
-	daemon := presence.InspectDaemonClaudeAuth(c.Paths)
+	return claudeAuthDaemonCheck(presence.InspectDaemonClaudeAuth(c.Paths))
+}
+
+// claudeAuthDaemonCheck builds the daemon-aware claude auth Check from an already
+// inspected snapshot. It is split from claudeAuthDaemon so the Detected=true
+// branches (Check name/detail, pid prefix, masked set/unset, warn vs ok) are
+// testable without a live daemon or readable /proc (issue #427). Secrets never
+// reach the detail — only daemon.Auth.MaskedDetail()'s set/unset booleans.
+func claudeAuthDaemonCheck(daemon presence.DaemonAuthSnapshot) (Check, bool) {
 	if !daemon.Detected {
 		return Check{}, false
 	}

@@ -23,6 +23,15 @@ func readProcessEnviron(pid int) (func(string) (string, bool), bool) {
 	if err != nil {
 		return nil, false
 	}
+	return parseEnviron(contents), true
+}
+
+// parseEnviron turns the raw NUL-delimited contents of /proc/<pid>/environ into
+// an env lookup. Each entry is a NUL-terminated key=value pair; the value may
+// itself contain '=', so the split is on the first '=' only. Entries without an
+// '=' (or empty trailing entries) are skipped. It is split from readProcessEnviron
+// so the parser can be unit-tested on synthetic bytes (issue #427).
+func parseEnviron(contents []byte) func(string) (string, bool) {
 	env := map[string]string{}
 	for _, entry := range strings.Split(string(contents), "\x00") {
 		if entry == "" {
@@ -37,5 +46,5 @@ func readProcessEnviron(pid int) (func(string) (string, bool), bool) {
 	return func(key string) (string, bool) {
 		value, ok := env[key]
 		return value, ok
-	}, true
+	}
 }

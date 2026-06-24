@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jerryfane/gitmoot/internal/presence"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 	"github.com/jerryfane/gitmoot/internal/subprocess"
 )
@@ -380,5 +381,69 @@ func TestClaudeAuthEnvLabeledAsShellScoped(t *testing.T) {
 func TestClaudeAuthDaemonSkippedWithoutPaths(t *testing.T) {
 	if _, ok := (Checker{}).claudeAuthDaemon(); ok {
 		t.Fatalf("claudeAuthDaemon returned a check without Paths set; want skip")
+	}
+}
+
+// TestClaudeAuthDaemonCheckReadyBuildsLabeledCheck exercises the Detected=true
+// ok branch (#427) without a live daemon: a detected daemon whose env carries an
+// OAuth token yields an OK `claude auth (daemon)` check whose detail is prefixed
+// with the daemon pid and reports the masked set/unset booleans — never a secret.
+func TestClaudeAuthDaemonCheckReadyBuildsLabeledCheck(t *testing.T) {
+	check, ok := claudeAuthDaemonCheck(presence.DaemonAuthSnapshot{
+		Running:  true,
+		PID:      4321,
+		Detected: true,
+		Auth:     runtime.ClaudeAuthEnv{ClaudeOAuthToken: true},
+	})
+	if !ok {
+		t.Fatalf("claudeAuthDaemonCheck ok=false for a detected daemon, want true")
+	}
+	if check.Name != "claude auth (daemon)" {
+		t.Fatalf("check.Name = %q, want \"claude auth (daemon)\"", check.Name)
+	}
+	if !check.OK || check.Required {
+		t.Fatalf("check = %+v, want optional OK check for a token-bearing daemon", check)
+	}
+	if !strings.Contains(check.Detail, "running daemon (pid 4321):") {
+		t.Fatalf("check.Detail = %q, want pid-prefixed daemon detail", check.Detail)
+	}
+	if !strings.Contains(check.Detail, runtime.ClaudeOAuthTokenEnv+"=set") {
+		t.Fatalf("check.Detail = %q, want masked CLAUDE_CODE_OAUTH_TOKEN=set", check.Detail)
+	}
+	if strings.Contains(check.Detail, "set; ANTHROPIC") && !strings.Contains(check.Detail, "=unset") {
+		t.Fatalf("check.Detail = %q, want unset reported for absent vars", check.Detail)
+	}
+}
+
+// TestClaudeAuthDaemonCheckUnauthenticatedWarns exercises the Detected=true warn
+// branch: a detected daemon with no token yields an OK:false check carrying the
+// background-token persistence guidance, still pid-prefixed and secret-free.
+func TestClaudeAuthDaemonCheckUnauthenticatedWarns(t *testing.T) {
+	check, ok := claudeAuthDaemonCheck(presence.DaemonAuthSnapshot{
+		Running:  true,
+		PID:      7,
+		Detected: true,
+		Auth:     runtime.ClaudeAuthEnv{},
+	})
+	if !ok {
+		t.Fatalf("claudeAuthDaemonCheck ok=false for a detected daemon, want true")
+	}
+	if check.OK || check.Required {
+		t.Fatalf("check = %+v, want optional warn for an unauthenticated daemon", check)
+	}
+	if !strings.Contains(check.Detail, "running daemon (pid 7):") {
+		t.Fatalf("check.Detail = %q, want pid-prefixed daemon detail", check.Detail)
+	}
+	if !strings.Contains(check.Detail, runtime.ClaudeBackgroundTokenMessage) {
+		t.Fatalf("check.Detail = %q, want background-token persistence guidance", check.Detail)
+	}
+}
+
+// TestClaudeAuthDaemonCheckSkipsWhenUndetected guards the fail-open contract at
+// the construction seam: an undetected snapshot (non-Linux, unreadable /proc, or
+// no daemon) yields ok=false so callers fall back to the shell-local check.
+func TestClaudeAuthDaemonCheckSkipsWhenUndetected(t *testing.T) {
+	if _, ok := claudeAuthDaemonCheck(presence.DaemonAuthSnapshot{Running: true, PID: 9, Detected: false}); ok {
+		t.Fatalf("claudeAuthDaemonCheck ok=true for an undetected daemon, want skip")
 	}
 }
