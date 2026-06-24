@@ -1704,8 +1704,12 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 // retry uses a distinct .../retry/<n> id so the enqueue idempotency path does not
 // mistake it for the already-failed original, carries RetryCount+1 in its
 // payload, and inherits the same DelegationID so it represents the same node in
-// the delegation graph. It returns whether a retry was enqueued.
-func (e Engine) requeueDelegation(ctx context.Context, parentJob db.Job, parentPayload JobPayload, d Delegation, failedChild db.Job, artifactDir string, ref taskRef) (bool, error) {
+// the delegation graph. upstreamContext is the #419 "Upstream dependency results"
+// block (or "" when InjectUpstreamDepContext is off); the caller computes it from
+// the current children/dedupWinners so a retried dependent re-receives the same
+// upstream block its first attempt got rather than running blind. It returns
+// whether a retry was enqueued.
+func (e Engine) requeueDelegation(ctx context.Context, parentJob db.Job, parentPayload JobPayload, d Delegation, failedChild db.Job, artifactDir string, upstreamContext string, ref taskRef) (bool, error) {
 	if d.Retry <= 0 {
 		return false, nil
 	}
@@ -1719,6 +1723,13 @@ func (e Engine) requeueDelegation(ctx context.Context, parentJob db.Job, parentP
 	request.ID = parentJob.ID + "/delegation/" + d.ID + "/retry/" + strconv.Itoa(next)
 	request.RetryCount = next
 	request.DelegationArtifactDir = artifactDir
+	// Re-inject the #419 "Upstream dependency results" block so a retried dependent
+	// runs WITH its upstream deps' results, exactly as its first attempt did.
+	// upstreamContext is "" unless Engine.InjectUpstreamDepContext is set, so the
+	// flag-off retry prompt is byte-identical to before this field existed.
+	if upstreamContext != "" {
+		request.Instructions = request.Instructions + upstreamContext
+	}
 
 	if err := e.allocateAndEnqueueDelegation(ctx, parentJob, parentPayload, d, request, ref); err != nil {
 		return false, err
@@ -1778,7 +1789,18 @@ func (e Engine) advanceDelegations(ctx context.Context, parentJob db.Job, parent
 		if !ok || !isTerminalJobState(child.State) || child.State == string(JobSucceeded) {
 			continue
 		}
-		didRetry, err := e.requeueDelegation(ctx, parentJob, parentPayload, d, child, artifactDir, ref)
+		// #419: a retried dependent must not run blind to its upstream deps. The
+		// first attempt got the "Upstream dependency results" block injected at its
+		// enqueue point in advanceDelegations, but a retry re-enqueues from
+		// requeueDelegation, so re-inject the same block here (resolved against the
+		// current children/dedupWinners, which still hold the succeeded deps).
+		// Gated on InjectUpstreamDepContext so the flag-off retry prompt is
+		// byte-identical to before this change.
+		upstreamContext := ""
+		if e.InjectUpstreamDepContext {
+			upstreamContext = e.buildUpstreamDepBlock(d, children, dedupWinners)
+		}
+		didRetry, err := e.requeueDelegation(ctx, parentJob, parentPayload, d, child, artifactDir, upstreamContext, ref)
 		if err != nil {
 			return err
 		}

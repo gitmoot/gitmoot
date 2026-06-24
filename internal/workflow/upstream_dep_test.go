@@ -339,6 +339,141 @@ func TestAdvanceDelegationsUpstreamFlagOffByteIdentical(t *testing.T) {
 	}
 }
 
+// TestAdvanceDelegationsRetryReinjectsUpstreamContext pins #419 FINDING 2: when a
+// dependent leg fails and is retried, the retry must re-receive the same "Upstream
+// dependency results" block its first attempt got, so a retried dependent is not
+// blind to its succeeded upstream deps. The retry is enqueued from
+// requeueDelegation (a different path than the first enqueue), which is where the
+// re-injection lives.
+func TestAdvanceDelegationsRetryReinjectsUpstreamContext(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "researcher", []string{"review"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "writer", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+	engine.InjectUpstreamDepContext = true
+
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-419",
+		TaskID:    "task-419",
+		TaskTitle: "Parent",
+		Sender:    "coord",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "research", Agent: "researcher", Action: "review", Prompt: "research the topic"},
+				{ID: "write", Agent: "writer", Action: "review", Prompt: "WRITE_REPORT_PROMPT", Deps: []string{"research"}, Retry: 1},
+			},
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob(parent) returned error: %v", err)
+	}
+	// research succeeds, which enqueues the dependent write with the upstream block.
+	completeDelegationChild(t, store, "parent-job/delegation/research", JobSucceeded, AgentResult{
+		Decision: "approved", Summary: "RESEARCH_FINDINGS_SUMMARY", ArtifactBody: "RESEARCH_BODY",
+	})
+	if err := engine.AdvanceJob(ctx, "parent-job/delegation/research"); err != nil {
+		t.Fatalf("AdvanceJob(research) returned error: %v", err)
+	}
+	first, err := unmarshalPayload(mustJob(t, store, "parent-job/delegation/write").Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(write) returned error: %v", err)
+	}
+	if !strings.Contains(first.Instructions, "Upstream dependency results:") {
+		t.Fatalf("first attempt should carry the upstream block\n%s", first.Instructions)
+	}
+
+	// The dependent fails; with Retry: 1 left, requeueDelegation re-enqueues it as
+	// .../write/retry/1. That retry must re-receive the upstream block.
+	completeDelegationChild(t, store, "parent-job/delegation/write", JobFailed, AgentResult{
+		Decision: "failed", Summary: "writer crashed",
+	})
+	if err := engine.AdvanceJob(ctx, "parent-job/delegation/write"); err != nil {
+		t.Fatalf("AdvanceJob(write) returned error: %v", err)
+	}
+	retry, err := unmarshalPayload(mustJob(t, store, "parent-job/delegation/write/retry/1").Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(write/retry/1) returned error: %v", err)
+	}
+	if !strings.HasPrefix(retry.Instructions, "WRITE_REPORT_PROMPT") {
+		t.Fatalf("retry prompt should start with the original prompt\n%s", retry.Instructions)
+	}
+	for _, want := range []string{"Upstream dependency results:", "RESEARCH_FINDINGS_SUMMARY", "RESEARCH_BODY"} {
+		if !strings.Contains(retry.Instructions, want) {
+			t.Fatalf("retried dependent prompt missing upstream %q (retry ran blind)\n%s", want, retry.Instructions)
+		}
+	}
+}
+
+// TestAdvanceDelegationsRetryUpstreamFlagOffByteIdentical is the load-bearing
+// parity pin for the retry path: with InjectUpstreamDepContext off, a retried
+// dependent's instructions are byte-identical to the bare delegation prompt — no
+// upstream block leaks into the retry when the feature is disabled.
+func TestAdvanceDelegationsRetryUpstreamFlagOffByteIdentical(t *testing.T) {
+	run := func(t *testing.T, inject bool) string {
+		t.Helper()
+		ctx := context.Background()
+		store := openEngineStore(t)
+		seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+		seedAgent(t, store, "researcher", []string{"review"}, "jerryfane/gitmoot")
+		seedAgent(t, store, "writer", []string{"review"}, "jerryfane/gitmoot")
+		engine := testEngine(store)
+		engine.InjectUpstreamDepContext = inject
+
+		insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
+			Repo:      "jerryfane/gitmoot",
+			Branch:    "task-419",
+			TaskID:    "task-419",
+			TaskTitle: "Parent",
+			Sender:    "coord",
+			Result: &AgentResult{
+				Decision: "approved",
+				Summary:  "done",
+				Delegations: []Delegation{
+					{ID: "research", Agent: "researcher", Action: "review", Prompt: "research the topic"},
+					{ID: "write", Agent: "writer", Action: "review", Prompt: "WRITE_REPORT_PROMPT", Deps: []string{"research"}, Retry: 1},
+				},
+			},
+		})
+		if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+			t.Fatalf("AdvanceJob(parent) returned error: %v", err)
+		}
+		completeDelegationChild(t, store, "parent-job/delegation/research", JobSucceeded, AgentResult{
+			Decision: "approved", Summary: "RESEARCH_FINDINGS_SUMMARY", ArtifactBody: "RESEARCH_BODY",
+		})
+		if err := engine.AdvanceJob(ctx, "parent-job/delegation/research"); err != nil {
+			t.Fatalf("AdvanceJob(research) returned error: %v", err)
+		}
+		completeDelegationChild(t, store, "parent-job/delegation/write", JobFailed, AgentResult{
+			Decision: "failed", Summary: "writer crashed",
+		})
+		if err := engine.AdvanceJob(ctx, "parent-job/delegation/write"); err != nil {
+			t.Fatalf("AdvanceJob(write) returned error: %v", err)
+		}
+		retry, err := unmarshalPayload(mustJob(t, store, "parent-job/delegation/write/retry/1").Payload)
+		if err != nil {
+			t.Fatalf("unmarshalPayload(write/retry/1) returned error: %v", err)
+		}
+		return retry.Instructions
+	}
+
+	off := run(t, false)
+	if off != "WRITE_REPORT_PROMPT" {
+		t.Fatalf("flag-off retry instructions must equal the bare prompt, got:\n%q", off)
+	}
+	on := run(t, true)
+	if on == off {
+		t.Fatalf("flag-on retry instructions unexpectedly identical to flag-off; re-injection not wired")
+	}
+	if !strings.Contains(on, "Upstream dependency results:") {
+		t.Fatalf("flag-on retry instructions should carry the upstream block, got:\n%q", on)
+	}
+}
+
 // TestAdvanceDelegationsUpstreamIdempotentReEnqueue pins that re-running
 // advanceDelegations after the dependent is already enqueued does not rewrite or
 // duplicate the dependent (its Instructions are stable across passes).

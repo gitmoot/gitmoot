@@ -3379,11 +3379,12 @@ func (w jobWorker) defaultWorkflow(checkout string) workflow.Engine {
 }
 
 // applyOrchestratePolicy sets the engine's opt-in [orchestrate] fields — the
-// artifact-body inlining knobs, the per-root delegation token (#338 Part B) and
-// dollar-cost (#380) budgets, and the result-aware non-progress streak threshold
-// (#339) — from the host policy. It is fail-safe: any load error leaves the
-// engine with its defaults (inlining off, both budgets 0 = unlimited, streak
-// threshold 0 = engine default) rather than failing engine construction.
+// artifact-body inlining knobs, the upstream-dep-context injection toggle (#419),
+// the per-root delegation token (#338 Part B) and dollar-cost (#380) budgets, and
+// the result-aware non-progress streak threshold (#339) — from the host policy. It
+// is fail-safe: any load error leaves the engine with its defaults (inlining off,
+// upstream-dep injection off, both budgets 0 = unlimited, streak threshold 0 =
+// engine default) rather than failing engine construction.
 func (w jobWorker) applyOrchestratePolicy(engine *workflow.Engine) {
 	policy, err := w.orchestratePolicy()
 	if err != nil {
@@ -3391,6 +3392,7 @@ func (w jobWorker) applyOrchestratePolicy(engine *workflow.Engine) {
 	}
 	engine.InlineArtifactBodies = policy.InlineArtifactBodies
 	engine.MaxInlineArtifactBytes = policy.InlineArtifactMaxBytes
+	engine.InjectUpstreamDepContext = policy.InjectUpstreamDepContext
 	engine.MaxDelegationTokenBudget = policy.MaxDelegationTokenBudget
 	engine.MaxDelegationCostUSD = policy.MaxDelegationCostUSD
 	engine.MaxDelegationNonProgressStreak = policy.MaxDelegationNonProgressStreak

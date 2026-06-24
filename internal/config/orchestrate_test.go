@@ -35,6 +35,9 @@ func TestLoadOrchestratePolicyDefaults(t *testing.T) {
 	if policy.InlineArtifactMaxBytes != 0 {
 		t.Fatalf("InlineArtifactMaxBytes = %d, want 0 by default", policy.InlineArtifactMaxBytes)
 	}
+	if policy.InjectUpstreamDepContext {
+		t.Fatalf("InjectUpstreamDepContext = true, want false by default")
+	}
 	if policy.MaxDelegationTokenBudget != 0 {
 		t.Fatalf("MaxDelegationTokenBudget = %d, want 0 (unlimited) by default", policy.MaxDelegationTokenBudget)
 	}
@@ -258,6 +261,45 @@ cockpit_mode = "auto"
 	}
 }
 
+// TestLoadOrchestratePolicyInjectUpstreamDepContext pins #419: the
+// inject_upstream_dep_context toggle parses from [orchestrate], and an absent key
+// keeps the off default, mirroring the inline-artifact keys above.
+func TestLoadOrchestratePolicyInjectUpstreamDepContext(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[orchestrate]
+inject_upstream_dep_context = true
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+
+	policy, err := LoadOrchestratePolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadOrchestratePolicy returned error: %v", err)
+	}
+	if !policy.InjectUpstreamDepContext {
+		t.Fatalf("InjectUpstreamDepContext = false, want true")
+	}
+
+	// Absent key keeps the off default even when the section is otherwise present.
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[orchestrate]
+cockpit_mode = "auto"
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	policy, err = LoadOrchestratePolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadOrchestratePolicy returned error: %v", err)
+	}
+	if policy.InjectUpstreamDepContext {
+		t.Fatalf("absent inject_upstream_dep_context should default off, got %+v", policy)
+	}
+}
+
 func TestLoadOrchestratePolicyOverrides(t *testing.T) {
 	paths := PathsForHome(t.TempDir())
 	if err := Initialize(paths); err != nil {
@@ -344,6 +386,14 @@ max_delegation_cost_usd = cheap
 max_delegation_cost_usd = -0.5
 `,
 			wantErr: "max_delegation_cost_usd must be 0 (unlimited) or positive",
+		},
+		{
+			name: "inject_upstream_dep_context_non_bool",
+			body: `
+[orchestrate]
+inject_upstream_dep_context = maybe
+`,
+			wantErr: "parse [orchestrate].inject_upstream_dep_context",
 		},
 		{
 			name: "max_delegation_non_progress_streak_non_int",

@@ -39,6 +39,14 @@ type OrchestratePolicy struct {
 	// InlineArtifactMaxBytes is the per-body byte cap applied when
 	// InlineArtifactBodies is set; 0 means the engine's built-in default.
 	InlineArtifactMaxBytes int
+	// InjectUpstreamDepContext opts a ready dependent delegation leg into running
+	// with its succeeded direct deps' results injected into its prompt as a
+	// byte-budgeted "Upstream dependency results" block (deps[] as real dataflow,
+	// see issue #419). It is off by default — flag-off the enqueued prompt is
+	// byte-identical — and reuses the same artifact-body byte budget as
+	// InlineArtifactBodies (no new knob). The daemon wires this into
+	// Engine.InjectUpstreamDepContext at startup.
+	InjectUpstreamDepContext bool
 	// MaxDelegationTokenBudget is the cumulative per-root token budget (input +
 	// output, summed across a delegation tree) that bounds a tree by cost in
 	// addition to depth/width/total-jobs/wall-clock (#338 Part B). 0 (the default)
@@ -80,6 +88,7 @@ func DefaultOrchestratePolicy() OrchestratePolicy {
 		CockpitPaneKey:                 CockpitPaneKeyJob,
 		InlineArtifactBodies:           false,
 		InlineArtifactMaxBytes:         0,
+		InjectUpstreamDepContext:       false,
 		MaxDelegationTokenBudget:       0,
 		MaxDelegationCostUSD:           0,
 		EscalationHandle:               "",
@@ -147,6 +156,10 @@ func applyOrchestratePolicyField(policy *OrchestratePolicy, key string, value st
 	case "inline_artifact_max_bytes":
 		parsed, err := strconv.Atoi(value)
 		policy.InlineArtifactMaxBytes = parsed
+		return err
+	case "inject_upstream_dep_context":
+		parsed, err := strconv.ParseBool(value)
+		policy.InjectUpstreamDepContext = parsed
 		return err
 	case "max_delegation_token_budget":
 		parsed, err := strconv.Atoi(value)
