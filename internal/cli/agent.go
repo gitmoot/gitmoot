@@ -1811,14 +1811,21 @@ func runAgentRestart(args []string, stdout, stderr io.Writer) int {
 		if active > 0 {
 			return fmt.Errorf("agent %s has %d queued or running job(s); cancel them first: %w", name, active, db.ErrAgentHasActiveJobs)
 		}
-		// No runtime-session-lock guard here: the production runtime:<rt>:<ref>
-		// session lock never records an OwnerPID (see acquireRuntimeSessionLock),
-		// so a live foreground `agent ask` can't be distinguished from a stranded
-		// lock at this layer. Restart doesn't need to: it mints a NEW session (new
-		// runtime_ref → new lock key), so any old/stranded runtime:<rt>:<oldref>
-		// lock is simply left to self-clear on its TTL. A real session guard
-		// (record OwnerPID+host on acquisition, then a same-host liveness check) is
-		// a separate follow-up. The jobs-busy check above is the effective guard.
+		// Functional session-lock guard (#425): a live foreground `agent ask` holds
+		// the runtime:<rt>:<ref> session lock WITHOUT a DB job, so the jobs-busy
+		// check above can't see it. Refuse only a provably-LIVE same-host owner —
+		// restarting under a live session would clobber it. A stranded (dead-owner)
+		// or expired or absent lock does NOT block: restart is exactly the recovery
+		// for an abandoned session (and it mints a new runtime_ref → new lock key,
+		// so it never touches the old lock). This is the inverse of the #303
+		// generation-lock reclaim, which steals only a provably-dead/expired lock.
+		held, detail, err := runtimeSessionHeldByLiveOwner(context.Background(), store, runtimeAgent(existing))
+		if err != nil {
+			return err
+		}
+		if held {
+			return fmt.Errorf("a foreground runtime session for %s is in use (%s); finish or cancel it first", name, detail)
+		}
 		record, err = store.GetRepo(context.Background(), existing.RepoScope)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
@@ -1861,7 +1868,7 @@ func runAgentRestart(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stdout, "restarted %s (%s); session: %s\n", existing.Name, existing.Runtime, existing.RuntimeRef)
-	fmt.Fprintf(stdout, "note: this abandons and replaces %s's current runtime session; finish any in-flight foreground `agent ask` first\n", existing.Name)
+	fmt.Fprintf(stdout, "note: this abandons and replaces %s's current runtime session; restart refuses while a live foreground `agent ask` holds it, but recovers a stranded one\n", existing.Name)
 	return 0
 }
 

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/runtime"
@@ -297,5 +299,172 @@ func TestRunAgentRestartStartFailsLeavesNoPartialWrite(t *testing.T) {
 	}
 	if got.HealthStatus != "failed" {
 		t.Fatalf("HealthStatus = %q, want unchanged failed (no partial write)", got.HealthStatus)
+	}
+}
+
+// runtimeAgentForRef builds the runtime.Agent whose runtime:<rt>:<ref> session
+// key a seeded "rebind-me" agent maps to — used to drive the REAL
+// acquireRuntimeSessionLock at the exact key the restart guard inspects.
+func runtimeAgentForRef(runtimeName, runtimeRef string) runtime.Agent {
+	return runtime.Agent{Name: "rebind-me", Runtime: runtimeName, RuntimeRef: runtimeRef}
+}
+
+// T7 (LOAD-BEARING) — a LIVE same-host owner holding the runtime-session lock
+// blocks the restart. The lock is acquired through the REAL
+// acquireRuntimeSessionLock, which now records this test process's os.Getpid()
+// (live) and os.Hostname() (this host). The guard must REJECT: exit non-zero,
+// runtime_ref UNCHANGED, adapter.Start NOT called.
+//
+// This is the test PR2's removed guard could not pass: that guard fired only on
+// lock.OwnerPID > 0, but acquireRuntimeSessionLock recorded no PID (OwnerPID=0),
+// so it never fired. Revert EITHER the OwnerPID recording in
+// acquireRuntimeSessionLock OR the runtimeSessionHeldByLiveOwner call in
+// runAgentRestart and this test fails (restart would proceed and rebind) —
+// proving both halves are load-bearing.
+func TestRunAgentRestartRejectsLiveSessionOwner(t *testing.T) {
+	home := t.TempDir()
+	const r1 = "550e8400-e29b-41d4-a716-446655440041"
+	agent, _ := seedRestartAgent(t, home, "codex", r1)
+
+	// Acquire the session lock for runtime:codex:<r1> via the real path.
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	release, acquired, key, err := acquireRuntimeSessionLock(
+		context.Background(), store, "live-ask-job",
+		runtimeAgentForRef(agent.Runtime, agent.RuntimeRef),
+		time.Now().UTC(), 30*time.Minute,
+	)
+	if err != nil || !acquired {
+		t.Fatalf("acquireRuntimeSessionLock: acquired=%v err=%v", acquired, err)
+	}
+	t.Cleanup(func() { _ = release(context.Background()) })
+	if key != "runtime:codex:"+r1 {
+		t.Fatalf("session key = %q, want runtime:codex:%s", key, r1)
+	}
+
+	fake := &agentRestartFakeAdapter{newRef: "550e8400-e29b-41d4-a716-446655440042"}
+	replaceRuntimeStartAdapter(t, fake)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"agent", "restart", "rebind-me", "--home", home}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("restart exit code = 0, want non-zero (live session must block); stdout=%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "foreground runtime session for rebind-me is in use") {
+		t.Fatalf("stderr = %q, want live-session refusal", stderr.String())
+	}
+	if fake.calls() != 0 {
+		t.Fatalf("adapter.Start calls = %d, want 0 (live session must not start a new one)", fake.calls())
+	}
+	if got := getRestartAgent(t, home, "rebind-me"); got.RuntimeRef != r1 {
+		t.Fatalf("RuntimeRef = %q, want unchanged %q", got.RuntimeRef, r1)
+	}
+}
+
+// seedRuntimeSessionLock writes a raw runtime:<rt>:<ref> resource lock with an
+// explicit owner PID / hostname / lease, bypassing acquireRuntimeSessionLock so
+// a test can model a stranded (dead-owner) or expired session precisely.
+func seedRuntimeSessionLock(t *testing.T, home, runtimeName, runtimeRef string, ownerPID int64, hostname string, expiresAt time.Time) {
+	t.Helper()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	key, ok := runtimeSessionResourceKey(runtimeAgentForRef(runtimeName, runtimeRef))
+	if !ok {
+		t.Fatalf("runtimeSessionResourceKey(%s,%s) not resumable", runtimeName, runtimeRef)
+	}
+	acquired, err := store.AcquireResourceLock(context.Background(), db.ResourceLock{
+		ResourceKey:   key,
+		OwnerJobID:    "seed-session-owner",
+		OwnerToken:    "seed-token",
+		OwnerPID:      ownerPID,
+		OwnerHostname: hostname,
+		ExpiresAt:     expiresAt.UTC().Format(time.RFC3339Nano),
+	}, time.Now().UTC())
+	if err != nil || !acquired {
+		t.Fatalf("seed AcquireResourceLock: acquired=%v err=%v", acquired, err)
+	}
+}
+
+// T8 — a STRANDED (dead-owner) same-host session lock does NOT block the restart:
+// restart is exactly the recovery for an abandoned foreground ask. Dead PID
+// 2147480000 is far above any live PID; the lease is non-expired and the host is
+// this host, so only the PID-liveness gate decides — and a dead PID proceeds.
+func TestRunAgentRestartProceedsStrandedDeadOwner(t *testing.T) {
+	home := t.TempDir()
+	const r1 = "550e8400-e29b-41d4-a716-446655440051"
+	const r2 = "550e8400-e29b-41d4-a716-446655440052"
+	seedRestartAgent(t, home, "codex", r1)
+	thisHost, _ := os.Hostname()
+	seedRuntimeSessionLock(t, home, "codex", r1, 2147480000, thisHost, time.Now().UTC().Add(30*time.Minute))
+
+	fake := &agentRestartFakeAdapter{newRef: r2}
+	replaceRuntimeStartAdapter(t, fake)
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"agent", "restart", "rebind-me", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("restart exit code = %d, want 0 (stranded session must be recoverable); stderr=%s", code, stderr.String())
+	}
+	if fake.calls() != 1 {
+		t.Fatalf("adapter.Start calls = %d, want 1", fake.calls())
+	}
+	if got := getRestartAgent(t, home, "rebind-me"); got.RuntimeRef != r2 {
+		t.Fatalf("RuntimeRef = %q, want rebound %q", got.RuntimeRef, r2)
+	}
+}
+
+// T9 — an EXPIRED lease does NOT block, even with a live owner PID: the lock is
+// stale and self-clears on the next acquire, so restart proceeds.
+func TestRunAgentRestartProceedsExpiredLease(t *testing.T) {
+	home := t.TempDir()
+	const r1 = "550e8400-e29b-41d4-a716-446655440061"
+	const r2 = "550e8400-e29b-41d4-a716-446655440062"
+	seedRestartAgent(t, home, "codex", r1)
+	thisHost, _ := os.Hostname()
+	// Live PID (this process) but a lease that expired in the past.
+	seedRuntimeSessionLock(t, home, "codex", r1, int64(os.Getpid()), thisHost, time.Now().UTC().Add(-time.Minute))
+
+	fake := &agentRestartFakeAdapter{newRef: r2}
+	replaceRuntimeStartAdapter(t, fake)
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"agent", "restart", "rebind-me", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("restart exit code = %d, want 0 (expired lease must not block); stderr=%s", code, stderr.String())
+	}
+	if fake.calls() != 1 {
+		t.Fatalf("adapter.Start calls = %d, want 1", fake.calls())
+	}
+	if got := getRestartAgent(t, home, "rebind-me"); got.RuntimeRef != r2 {
+		t.Fatalf("RuntimeRef = %q, want rebound %q", got.RuntimeRef, r2)
+	}
+}
+
+// T10 — acquisition records identity: acquireRuntimeSessionLock then
+// GetResourceLock shows OwnerPID == os.Getpid() and OwnerHostname ==
+// os.Hostname() (trimmed). This is the additive metadata that makes the live
+// guard above functional at all.
+func TestAcquireRuntimeSessionLockRecordsOwnerIdentity(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+
+	agent := runtimeAgentForRef("codex", "550e8400-e29b-41d4-a716-446655440071")
+	release, acquired, key, err := acquireRuntimeSessionLock(
+		context.Background(), store, "identity-job", agent, time.Now().UTC(), time.Minute,
+	)
+	if err != nil || !acquired {
+		t.Fatalf("acquireRuntimeSessionLock: acquired=%v err=%v", acquired, err)
+	}
+	defer func() { _ = release(context.Background()) }()
+
+	lock, err := store.GetResourceLock(context.Background(), key)
+	if err != nil {
+		t.Fatalf("GetResourceLock(%q) returned error: %v", key, err)
+	}
+	if lock.OwnerPID != int64(os.Getpid()) {
+		t.Fatalf("lock.OwnerPID = %d, want os.Getpid() = %d", lock.OwnerPID, os.Getpid())
+	}
+	wantHost, _ := os.Hostname()
+	if lock.OwnerHostname != strings.TrimSpace(wantHost) {
+		t.Fatalf("lock.OwnerHostname = %q, want os.Hostname() = %q", lock.OwnerHostname, strings.TrimSpace(wantHost))
 	}
 }
