@@ -3092,10 +3092,13 @@ func (e Engine) reviewApprovalAlreadyAdvanced(ctx context.Context, ref taskRef) 
 	return task.State == string(TaskReadyToMerge) || task.State == string(TaskMerged), nil
 }
 
-// Escalation event kinds (#340). The requested event is the one-shot pause
-// marker (idempotent: a second escalate_human pass observing it re-notifies
-// nothing and re-records nothing); the resolved event is recorded by the resume
-// path when an operator answers.
+// Escalation event kinds (#340). Escalation is round-based: a coordinator/leg can
+// pause more than once over its lifetime (a retried leg that fails again opens a
+// NEW round). The pause is OPEN while requested > resolved, and CLOSED (resolved
+// or finalizable) while requested == resolved. So a second escalate_human pass
+// during an OPEN round re-notifies nothing and re-records nothing (idempotent),
+// but the first failure of a round whose every prior escalation was resolved
+// opens a fresh round: a new requested event, a re-notify, and a re-pause.
 const (
 	escalationRequestedEvent = "delegation_escalation_requested"
 	escalationResolvedEvent  = "delegation_escalation_resolved"
@@ -3115,9 +3118,10 @@ type EscalationRecord struct {
 }
 
 // pauseAwaitingHuman is the escalate_human analogue of block (#340): it sets the
-// shared parent task to TaskAwaitingHuman, records a one-shot
-// delegation_escalation_requested event (idempotent via the ListJobEvents
-// once-guard), notifies the human best-effort through the injected
+// shared parent task to TaskAwaitingHuman, records a per-round
+// delegation_escalation_requested event (idempotent WITHIN an open round via the
+// requested>resolved guard, but a retried leg that fails again opens a fresh
+// round and re-pauses), notifies the human best-effort through the injected
 // EscalationNotifier, and returns an AwaitingHumanError so the caller enqueues NO
 // continuation. The tree therefore consumes zero compute until an operator
 // resumes it with `/gitmoot resume <coordinator> retry|continue|abort`.
@@ -3125,18 +3129,20 @@ func (e Engine) pauseAwaitingHuman(ctx context.Context, parentJob db.Job, parent
 	reason := childFailureReason(child)
 	awaitErr := AwaitingHumanError{Reason: fmt.Sprintf("delegation %q failed (failure_policy escalate_human): %s", d.ID, reason)}
 
-	// Once the pause marker exists, this is an idempotent re-advance (a concurrent
-	// child completion, or the same child's AdvanceJob re-running): keep the task
-	// in awaiting_human and return the same pause error, but re-record nothing and
-	// re-notify nobody.
-	events, err := e.Store.ListJobEvents(ctx, parentJob.ID)
+	// While an escalation round is OPEN (requested > resolved), this is an
+	// idempotent re-advance (a concurrent child completion, or the same child's
+	// AdvanceJob re-running): keep the task in awaiting_human and return the same
+	// pause error, but re-record nothing and re-notify nobody. When the round is
+	// CLOSED (requested == resolved: a prior escalation was resolved, e.g. a retry
+	// that has now failed AGAIN) we fall through to open a FRESH round below — a
+	// new requested event, a re-pause, and a re-notify — so the tree never strands
+	// permanently in planned with nothing in flight (#340).
+	open, err := e.escalationOpen(ctx, parentJob.ID)
 	if err != nil {
 		return err
 	}
-	for _, ev := range events {
-		if ev.Kind == escalationRequestedEvent {
-			return awaitErr
-		}
+	if open {
+		return awaitErr
 	}
 
 	if err := e.setTaskState(ctx, ref, TaskAwaitingHuman); err != nil {
@@ -3220,20 +3226,52 @@ func (e Engine) loadEscalation(ctx context.Context, coordinatorJobID string) (Es
 	return rec, true, nil
 }
 
-// escalationResolved reports whether a paused coordinator already had its
-// escalation resolved (a resume verb ran). The resume path is authorize-gated
-// and idempotency-guarded by this check.
-func (e Engine) escalationResolved(ctx context.Context, coordinatorJobID string) (bool, error) {
+// escalationRoundCounts returns how many escalation rounds were requested vs
+// resolved for a coordinator (#340). Escalation is round-based: a retried leg
+// that fails again opens a fresh round, so a coordinator can accumulate several
+// requested/resolved pairs over its lifetime. The pause is OPEN (resolvable /
+// finalizable) while requested > resolved, and CLOSED while requested ==
+// resolved.
+func (e Engine) escalationRoundCounts(ctx context.Context, coordinatorJobID string) (requested, resolved int, err error) {
 	events, err := e.Store.ListJobEvents(ctx, coordinatorJobID)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, ev := range events {
+		switch ev.Kind {
+		case escalationRequestedEvent:
+			requested++
+		case escalationResolvedEvent:
+			resolved++
+		}
+	}
+	return requested, resolved, nil
+}
+
+// escalationOpen reports whether a coordinator currently has an UNRESOLVED
+// escalation round (requested > resolved): the tree is paused awaiting a human
+// right now. When false, either no escalation ever opened, or every round that
+// opened has been resolved (the leg may then fail AGAIN to open a new round).
+func (e Engine) escalationOpen(ctx context.Context, coordinatorJobID string) (bool, error) {
+	requested, resolved, err := e.escalationRoundCounts(ctx, coordinatorJobID)
 	if err != nil {
 		return false, err
 	}
-	for _, ev := range events {
-		if ev.Kind == escalationResolvedEvent {
-			return true, nil
-		}
+	return requested > resolved, nil
+}
+
+// escalationResolved reports whether the coordinator has no OPEN escalation round
+// to act on — i.e. every requested escalation has been resolved (requested ==
+// resolved). The resume path and the TTL backstop are idempotency-guarded by
+// this check: an OPEN round (requested > resolved) is resolvable/finalizable, a
+// CLOSED one is a no-op. Round-based so a re-pause after a failed retry is again
+// resolvable, never permanently stranded (#340).
+func (e Engine) escalationResolved(ctx context.Context, coordinatorJobID string) (bool, error) {
+	open, err := e.escalationOpen(ctx, coordinatorJobID)
+	if err != nil {
+		return false, err
 	}
-	return false, nil
+	return !open, nil
 }
 
 // ResumeDecision is one of the three human resume verbs for a paused tree (#340).

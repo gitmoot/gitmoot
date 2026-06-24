@@ -285,6 +285,150 @@ func TestResolveEscalationRetryReenqueuesLeg(t *testing.T) {
 	}
 }
 
+// TestEscalateHumanRetryFailingAgainRePausesAndRemainsResolvable is the
+// regression for the round-based escalation fix (#340): a `retry` resume that
+// itself fails again must open a FRESH escalation round (re-pause the tree,
+// re-notify the human, enqueue no continuation) and remain resolvable/finalizable
+// — never stranded in planned with nothing in flight.
+func TestEscalateHumanRetryFailingAgainRePausesAndRemainsResolvable(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "api", []string{"review"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "ui", []string{"review"}, "jerryfane/gitmoot")
+	notifier := &recordingNotifier{}
+	engine := testEngine(store)
+	engine.EscalationNotifier = notifier
+
+	// Round 1: the leg fails and the tree pauses awaiting a human.
+	seedEscalateHumanCoordinator(t, store, engine)
+	if err := engine.AdvanceJob(ctx, "parent-job/delegation/api"); err == nil {
+		t.Fatal("expected AwaitingHumanError on the first failure")
+	}
+	assertTaskState(t, store, "task-5", TaskAwaitingHuman)
+	if got := countJobEvents(t, store, "parent-job", escalationRequestedEvent); got != 1 {
+		t.Fatalf("%s events after round 1 = %d, want 1", escalationRequestedEvent, got)
+	}
+	if len(notifier.calls) != 1 {
+		t.Fatalf("notifier calls after round 1 = %d, want 1", len(notifier.calls))
+	}
+
+	// The human resumes with `retry`: the failing leg is re-enqueued and round 1
+	// is resolved (the task leaves awaiting_human, planned for now).
+	if err := engine.ResolveEscalation(ctx, "parent-job", ResumeRetry, "try the staging endpoint"); err != nil {
+		t.Fatalf("ResolveEscalation(retry) returned error: %v", err)
+	}
+	resumeJobID := "parent-job/delegation/api/resume"
+	if !jobExists(t, store, resumeJobID) {
+		t.Fatal("retry must re-enqueue the failing leg")
+	}
+	if got := countJobEvents(t, store, "parent-job", escalationResolvedEvent); got != 1 {
+		t.Fatalf("%s events after retry resume = %d, want 1", escalationResolvedEvent, got)
+	}
+	if state, _ := store.GetTask(ctx, "task-5"); state.State == string(TaskAwaitingHuman) {
+		t.Fatal("retry resume must clear awaiting_human")
+	}
+
+	// The re-run ALSO fails — a normal, expected outcome (the leg already failed
+	// once). Advancing it must open a FRESH escalation round, not silently strand.
+	completeDelegationChild(t, store, resumeJobID, JobFailed, AgentResult{Decision: "failed", Summary: "api still broken"})
+	err := engine.AdvanceJob(ctx, resumeJobID)
+	var awaiting AwaitingHumanError
+	if !errors.As(err, &awaiting) {
+		t.Fatalf("AdvanceJob(resume) error = %v, want AwaitingHumanError (re-pause)", err)
+	}
+
+	// Re-pause: the task is awaiting_human again so the dashboard Attention section
+	// re-shows it.
+	assertTaskState(t, store, "task-5", TaskAwaitingHuman)
+
+	// A SECOND requested event exists (a fresh round), and the human was re-notified.
+	if got := countJobEvents(t, store, "parent-job", escalationRequestedEvent); got != 2 {
+		t.Fatalf("%s events after re-pause = %d, want 2 (a new round)", escalationRequestedEvent, got)
+	}
+	if len(notifier.calls) != 2 {
+		t.Fatalf("notifier calls after re-pause = %d, want 2 (re-notified)", len(notifier.calls))
+	}
+
+	// Still zero compute: no continuation was enqueued by the re-pause.
+	if jobExists(t, store, delegationContinuationID("parent-job")) {
+		t.Fatal("a re-pause must NOT enqueue a continuation")
+	}
+
+	// The fresh round is OPEN again, so a follow-up `/gitmoot resume ... abort`
+	// resolves and finalizes it — proving the tree is not permanently stranded.
+	if err := engine.ResolveEscalation(ctx, "parent-job", ResumeAbort, "give up"); err != nil {
+		t.Fatalf("ResolveEscalation(abort) on the re-pause returned error: %v", err)
+	}
+	if got := countJobEvents(t, store, "parent-job", escalationResolvedEvent); got != 2 {
+		t.Fatalf("%s events after abort = %d, want 2 (both rounds resolved)", escalationResolvedEvent, got)
+	}
+	cont, err := unmarshalPayload(mustJob(t, store, delegationContinuationID("parent-job")).Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	if !cont.DelegationFinalize {
+		t.Fatalf("abort on the re-pause must route to the graceful finalize continuation: %+v", cont)
+	}
+	if got := countJobEvents(t, store, "parent-job", "delegation_finalize_enqueued"); got != 1 {
+		t.Fatalf("delegation_finalize_enqueued events = %d, want 1", got)
+	}
+}
+
+// TestAutoFinalizeExpiredEscalationsCatchesRePause pins that a re-paused tree (a
+// retried leg that failed again, opening a new round) that nobody answers is
+// still caught by the wall-clock TTL backstop — the anti-stranding guarantee
+// holds across rounds (#340).
+func TestAutoFinalizeExpiredEscalationsCatchesRePause(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "api", []string{"review"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "ui", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+	engine.EscalationNotifier = &recordingNotifier{}
+
+	base := time.Now().UTC()
+	engine.Now = func() time.Time { return base }
+
+	// Round 1 pause → retry → re-run fails again → re-pause (round 2 open).
+	seedEscalateHumanCoordinator(t, store, engine)
+	if err := engine.AdvanceJob(ctx, "parent-job/delegation/api"); err == nil {
+		t.Fatal("expected AwaitingHumanError on the first failure")
+	}
+	if err := engine.ResolveEscalation(ctx, "parent-job", ResumeRetry, ""); err != nil {
+		t.Fatalf("ResolveEscalation(retry) returned error: %v", err)
+	}
+	resumeJobID := "parent-job/delegation/api/resume"
+	completeDelegationChild(t, store, resumeJobID, JobFailed, AgentResult{Decision: "failed", Summary: "still broken"})
+	if err := engine.AdvanceJob(ctx, resumeJobID); err == nil {
+		t.Fatal("expected AwaitingHumanError on the re-pause")
+	}
+	assertTaskState(t, store, "task-5", TaskAwaitingHuman)
+
+	// Within TTL: the OPEN re-pause is not finalized.
+	if finalized, err := engine.AutoFinalizeExpiredEscalations(ctx, 48*time.Hour); err != nil || finalized != 0 {
+		t.Fatalf("within-TTL re-pause finalized = %d (err %v), want 0", finalized, err)
+	}
+
+	// Past TTL: the never-answered re-pause auto-finalizes gracefully.
+	engine.Now = func() time.Time { return base.Add(49 * time.Hour) }
+	finalized, err := engine.AutoFinalizeExpiredEscalations(ctx, 48*time.Hour)
+	if err != nil {
+		t.Fatalf("AutoFinalizeExpiredEscalations returned error: %v", err)
+	}
+	if finalized != 1 {
+		t.Fatalf("past-TTL re-pause finalized = %d, want 1", finalized)
+	}
+	cont, err := unmarshalPayload(mustJob(t, store, delegationContinuationID("parent-job")).Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	if !cont.DelegationFinalize {
+		t.Fatalf("TTL auto-finalize of a re-pause must enqueue a finalize continuation: %+v", cont)
+	}
+}
+
 func TestResolveEscalationContinueEnqueuesContinuation(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
