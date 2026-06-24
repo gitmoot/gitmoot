@@ -94,6 +94,31 @@ Delegation fields:
   delegations (every child must approve). `K` is an integer count only — no
   fractions or percentages — and must not exceed the number of delegations (a
   larger `K` is unsatisfiable and is rejected).
+
+  **Produce vs. independent check.** The `synthesis_rule`s above reconcile what
+  the producers **self-report** — `summary` merges their summaries, `vote`/`quorum`
+  count their *own* approving decisions. That is **self-evaluation**: it trusts the
+  producer's "I approve / I implemented it" and inherits the producer's blind
+  spots. To check the *combined* result against the original goal independently,
+  add a separate **verify leg** — a read-only ephemeral `review` child that `deps`
+  on the producer(s), runs on a **different runtime/model**, and re-runs the build
+  and tests itself rather than trusting the producers' self-reported `tests_run`.
+  It returns `decision: changes_requested` with structured findings on any
+  objective failure, else `approved`. This is **cross-evaluation**, which the
+  literature consistently finds beats self-evaluation: a capable verifier catches
+  failures the solver does not (the generator-verifier gap), and LLM-as-judge
+  graders show a self-preference bias toward their own outputs that a
+  different-model judge does not share. It is the same separation as ROMA's
+  Verifier (`VerifierSignature: (goal, candidate_output) -> verdict + feedback`,
+  vendored at `repos/ROMA`), where a failed verdict drives a re-plan instead of
+  trusting the producer. Route a failed verdict with `failure_policy: escalate`
+  (autonomous correction in the coordinator continuation) or `escalate_human` (a
+  human-in-the-loop pause); the merge gate independently blocks merge on the
+  non-ready decision. The shipped `decompose-and-verify` recipe is one instance of
+  this (parallel producers + one verify gate), and the `verifier` recipe is its
+  minimal one-producer form — both are templates under
+  `skills/gitmoot/agent-templates/`. No new primitive is involved: `EphemeralSpec`,
+  `failure_policy`, and the merge gate already ship.
 - `timeout` (optional): a Go duration string and must be positive (e.g. `10m`).
 - `retry` (optional): integer `>= 0`.
 - `worktree` (optional): worktree path for the child job.

@@ -22,6 +22,7 @@ const ThermoNuclearCodeQualityReviewID = "thermo-nuclear-code-quality-review"
 const PlannerTemplateID = "planner"
 const ReviewPanelTemplateID = "review-panel"
 const DecomposeAndVerifyTemplateID = "decompose-and-verify"
+const VerifierTemplateID = "verifier"
 const LocalSourceRepo = "local"
 const LocalSourceRef = "file"
 const DefaultLocalDescription = "Local custom prompt agent template."
@@ -93,6 +94,10 @@ var builtins = []Definition{
 		Description:         "Coordinator recipe that decomposes a task into parallel ephemeral implementation subtasks, then runs a verify step that depends on all of them.",
 		DefaultRole:         "coordinator", DefaultCapabilities: []string{"ask", "review", "implement"}, Mutation: true,
 		SourceRepo: "jerryfane/gitmoot", SourceRef: "main", SourcePath: "skills/gitmoot/agent-templates/decompose-and-verify.md"},
+	{ID: VerifierTemplateID, Name: "Verifier Coordinator",
+		Description:         "Coordinator recipe that runs one producer leg, then an independent read-only verify leg on a different runtime that checks the combined result against the original goal before reporting back.",
+		DefaultRole:         "coordinator", DefaultCapabilities: []string{"ask", "review", "implement"}, Mutation: true,
+		SourceRepo: "jerryfane/gitmoot", SourceRef: "main", SourcePath: "skills/gitmoot/agent-templates/verifier.md"},
 }
 
 var retiredIDs = map[string]struct{}{
@@ -479,6 +484,10 @@ func MetadataForDefinition(definition Definition) Metadata {
 		metadata.Outputs = []string{"delegations", "review_synthesis"}
 	case DecomposeAndVerifyTemplateID:
 		metadata.Tags = []string{"coordinator", "implement", "orchestra"}
+		metadata.Inputs = []string{"repo", "task"}
+		metadata.Outputs = []string{"delegations", "verification_report"}
+	case VerifierTemplateID:
+		metadata.Tags = []string{"coordinator", "review", "orchestra"}
 		metadata.Inputs = []string{"repo", "task"}
 		metadata.Outputs = []string{"delegations", "verification_report"}
 	}

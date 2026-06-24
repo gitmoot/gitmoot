@@ -2632,10 +2632,17 @@ persisted, `train continue` does not guess. It stops with a hard error such as
 before continuing`, so a partially generated item is inspected or cleared
 rather than silently completed or duplicated.
 
-This per-item generation durability is separate from `skillopt train recover`,
-which recovers the optimizer phase only (see "Optimizer And Candidate Gate").
-`train recover` does not release the generation lock or rebuild generation
-options.
+This per-item generation durability is complemented by `skillopt train recover
+--generation`. If a `train continue` is killed mid-generation, its generation
+lock is stranded (the deferred release never runs) and blocks re-entry until the
+~2h TTL expires. `skillopt train recover --session <id> --generation` reclaims
+that lock when its owner is provably dead and same-host (a live owner is refused;
+a cross-host owner waits for TTL), re-acquires it for the recover process, and
+salvages the persisted per-item options. It advances the iteration to
+`options_generated` only with `--advance-state` and only when every expected item
+is recovered; `--abort` reclaims the lock and leaves the phase at `items_ready`.
+By default `train recover` (without `--generation`) still recovers the optimizer
+phase only (see "Optimizer And Candidate Gate").
 
 Low-level `skillopt feedback github publish` and `sync` enforce
 `review.expected_repo` for train runs. If a preview train expects
@@ -2927,16 +2934,35 @@ gitmoot skillopt train recover --session planner-train --out-root .gitmoot/skill
 gitmoot skillopt train recover --session planner-train --out-root .gitmoot/skillopt/planner-train --json
 ```
 
-`train recover` is scoped to the optimizer phase only. It re-imports or repairs
-the optimizer candidate package and classifies the active iteration, for example
-`already_completed_candidate`, `already_completed_no_candidate`,
+By default `train recover` is scoped to the optimizer phase. It re-imports or
+repairs the optimizer candidate package and classifies the active iteration, for
+example `already_completed_candidate`, `already_completed_no_candidate`,
 `optimizer_active`, or `corrupted_unrecoverable`. Recovery validates the package
 state, imports a completed candidate through the normal candidate gate, or
 records `optimizer_completed_no_candidate` with the stored rejection reason.
-Incomplete or corrupted artifacts fail without modifying the train state. It does
-not recover the generation phase, release the generation lock, or rebuild
-generation options; per-item generation durability and idempotent resume handle
-that (see "Durable Generation And Idempotent Resume").
+Incomplete or corrupted artifacts fail without modifying the train state.
+
+Pass `--generation` to recover the generation phase instead: it reclaims a
+generation lock stranded by a crashed/killed `train continue` and salvages the
+persisted per-item options (see "Durable Generation And Idempotent Resume").
+
+```sh
+gitmoot skillopt train recover --session planner-train --generation
+gitmoot skillopt train recover --session planner-train --generation --advance-state
+gitmoot skillopt train recover --session planner-train --generation --abort
+```
+
+Reclamation is liveness-gated: the stranded lock is released only when its owner
+PID is provably dead AND it was held on this same host. A live owner is refused
+(`skillopt train generation is already running`) so you stop the running process
+first; a cross-host owner requires the lock TTL to expire. The recover process
+re-acquires the lock for itself so the salvage is crash-safe. Salvage is
+import-only — it reports `expected_items`, `recovered_items`, and `missing_items`
+and classifies the run as `generation_complete`, `generation_incomplete`, or
+`generation_active`. The iteration advances to `options_generated` only with
+`--advance-state` and only when every expected item is recovered (regenerating
+missing items remains `train continue`'s job). `--abort` reclaims the lock and
+leaves the phase at `items_ready`, keeping persisted items.
 
 ## Candidate Review And Next Iteration
 
@@ -5186,7 +5212,14 @@ and synthesizes. `gitmoot orchestrate <agent> "..." [--repo R]` is sugar for
 [RESULT_CONTRACT.md](references/RESULT_CONTRACT.md) for the delegation fields and
 termination bounds. A coordinator can also spawn throwaway, auto-disposed
 ephemeral workers on demand via a delegation's `ephemeral` spec (no
-pre-registration; mutually exclusive with `agent`). An agent (via `--model` on start/subscribe/type set) and an
+pre-registration; mutually exclusive with `agent`). A `synthesis_rule`
+(`summary`/`vote`/`quorum`) reconciles the producers' **self-report**; to check
+the combined result against the goal **independently**, add a read-only verify
+leg on a **different** runtime/model that `deps` on the producer(s) — produce vs.
+independent check, the same separation as ROMA's Verifier (cross-evaluation beats
+self-evaluation; see the `verifier` and `decompose-and-verify` recipes and the
+"produce vs. independent check" note in
+[RESULT_CONTRACT.md](references/RESULT_CONTRACT.md)). An agent (via `--model` on start/subscribe/type set) and an
 individual job or delegation (via `--model` on run/ask/review/implement or the
 delegation `model` field) can pin a runtime model, with the per-job/delegation
 value overriding the agent default. Use
@@ -5964,7 +5997,7 @@ gitmoot skillopt train start --template <id> --repo owner/repo --request <text> 
 gitmoot skillopt train status --session <id>
 gitmoot skillopt train run [--config path | --session <id>] [--plain]
 gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--dry-run] [--promote version|--reject version --reason text] [--start-next]
-gitmoot skillopt train recover --session <id> [--out-root path] [--json]
+gitmoot skillopt train recover --session <id> [--out-root path] [--generation [--abort | --advance-state]] [--json]
 gitmoot skillopt train stop --session <id> --reason <text>
 gitmoot skillopt judge-report [--template <id>] [--home <path>]
 gitmoot skillopt judge promote --template <id> --task-kind <kind> --file <pkg.json> [--home <path>] [--yes] [--json]
@@ -6000,12 +6033,29 @@ but not all of its options/artifacts persisted, resume returns a hard error
 (`item <id> has partial generated options; inspect or clear review options
 before continuing`) rather than guessing.
 
-`skillopt train recover --session <id>` recovers the OPTIMIZER phase only. It
-re-imports or repairs the optimizer candidate package and classifies the
+`skillopt train recover --session <id>` recovers the OPTIMIZER phase by default.
+It re-imports or repairs the optimizer candidate package and classifies the
 iteration (for example `already_completed_candidate`,
 `already_completed_no_candidate`, `optimizer_active`, or
-`corrupted_unrecoverable`). It does NOT release the generation-phase lock or
-rebuild generation options; use `train continue` for generation resume.
+`corrupted_unrecoverable`).
+
+`skillopt train recover --session <id> --generation` recovers the GENERATION
+phase: it reclaims a generation lock stranded by a crashed/killed `train
+continue` (whose deferred lock release never ran) and salvages the already
+persisted per-item options. Reclamation is liveness-gated — the stranded lock is
+released ONLY when its owner PID is provably dead AND it was held on this same
+host; a live owner is refused (`skillopt train generation is already running`) so
+you stop the running process first, and a cross-host owner requires the lock's
+TTL to have expired. The recover process re-acquires the lock for itself so the
+salvage is also crash-safe. Salvage is import-only: completed items are already
+durable, so recovery classifies them as `expected_items`/`recovered_items`/
+`missing_items` and reports `recovery_state: generation_complete`,
+`generation_incomplete`, or `generation_active`. The iteration advances to
+`options_generated` only with `--advance-state` and only when every expected item
+is recovered (regenerating missing items remains `train continue`'s job). Use
+`--abort` to reclaim the lock and leave the iteration at `items_ready` (persisted
+items are kept). A stale generation lock is also surfaced in `train status` (as a
+`stale` active lock, separate from the true current phase).
 
 `skillopt review create` starts a review run for a template and target repo.
 Use the default A/B shape for validation, or pass `--mode explore|refine|distill`
@@ -6648,7 +6698,7 @@ daemon, then reconvenes their results in a single continuation. Start one with
 `gitmoot orchestrate <recipe-id> "..." --repo owner/repo`; the daemon runs the
 coordinator in the background and dispatches its delegations.
 
-Two recipes ship built in:
+Three recipes ship built in:
 
 - **`review-panel`** — fans a PR or change out to a panel of ephemeral reviewers,
   each with a different lens (correctness and security; performance and
@@ -6661,17 +6711,38 @@ Two recipes ship built in:
   file-disjoint subtasks, fans them out to ephemeral implementation workers that
   build in parallel in their own branch worktrees, then runs a single `review`
   verify step that `deps` on every implementation leg before reporting back.
+- **`verifier`** — the minimal **produce vs. independent check** recipe: one
+  producer leg plus one independent verify leg. The verify leg is a read-only
+  ephemeral `review` worker that `deps` on the producer, runs on a **different
+  runtime/model**, and checks the producer's combined result against the original
+  goal — re-running the build and tests itself rather than trusting the producer's
+  self-report. It returns `changes_requested` with structured findings on any
+  objective failure (else `approved`), with `failure_policy: escalate` routing a
+  failed verdict back to the coordinator continuation for autonomous correction
+  (or `escalate_human` for a human pause).
+
+**Produce vs. independent check.** A `synthesis_rule` (`summary`/`vote`/`quorum`)
+reconciles what the producers **self-report** — self-evaluation, which inherits
+the producer's blind spots. A `verifier`/`decompose-and-verify` verify leg is a
+*separate* worker on a different runtime/model that checks the combined result
+against the goal — cross-evaluation, which the literature finds beats
+self-evaluation (the generator-verifier gap; LLM-as-judge self-preference bias).
+This generalizes ROMA's Verifier (`(goal, candidate_output) -> verdict +
+feedback`, vendored at `repos/ROMA`); it uses only shipped primitives
+(`ephemeral`, `failure_policy`, the merge gate) — no new engine code. See the
+**produce vs. independent check** note in `RESULT_CONTRACT.md`.
 
 ```sh
 gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
 gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
+gitmoot orchestrate verifier "Implement the rate limiter described in the task and prove it works." --repo owner/repo
 ```
 
-The panelists in `review-panel` and every implementation and verify leg in
-`decompose-and-verify` are **ephemeral** workers: Gitmoot creates each from the
-delegation's `ephemeral` spec, runs it, and disposes of it once the child job
-finishes. Ephemeral workers are leaf-only — they return findings, never their own
-delegations — so a recipe's fan-out is exactly one level deep. In both recipes the
+The panelists in `review-panel` and every producer and verify leg in
+`decompose-and-verify` and `verifier` are **ephemeral** workers: Gitmoot creates
+each from the delegation's `ephemeral` spec, runs it, and disposes of it once the
+child job finishes. Ephemeral workers are leaf-only — they return findings, never their own
+delegations — so a recipe's fan-out is exactly one level deep. In all three recipes the
 delegations never set `agent`, because `agent` and `ephemeral` are mutually
 exclusive. Once every leg is terminal, Gitmoot enqueues one continuation back to
 the coordinator to merge the results (the panel verdict, or the verify gate plus
@@ -6919,7 +6990,9 @@ cannot recurse or fan out forever:
   one root is bounded in duration (measured from the root job's creation); a
   coordinator that tries to fan out after the tree has run this long is refused
   with a `delegation_walltime_exceeded` event. A generous runaway backstop, not a
-  tight deadline.
+  tight deadline. **Time a tree spends paused awaiting a human** (the
+  `escalate_human` failure_policy, below) **is excluded** from this measurement, so
+  a slow human response is never punished as a runaway.
 - Per-root token budget (cost) `[orchestrate].max_delegation_token_budget`,
   **off by default** (`0` = unlimited): when set to a positive value, the whole
   tree under one root is bounded by cumulative token usage (input + output across
@@ -6941,9 +7014,20 @@ cannot recurse or fan out forever:
 - Per-coordinator width `MaxDelegationWidth = 16`: a single coordinator result
   may not fan out more than this many delegations in one generation; an over-wide
   set is refused with a `delegation_width_exceeded` event.
-- Loop detection: a canonical windowed signature hash over recent delegation
-  activity halts repeated or cyclic delegation chains well before the depth cap
-  is reached, preventing oscillating A→B→A loops.
+- Loop detection (two signals): a cheap **structural** signature hash over recent
+  delegation sets halts a coordinator that literally re-issues the same set,
+  preventing oscillating A→B→A loops well before the depth cap. Layered on top, a
+  **result-aware non-progress streak** (#339) catches a coordinator that perturbs
+  the set each round to evade the structural hash but whose children keep
+  returning nothing new: after every generation finishes, the engine fingerprints
+  the children's *verifiable* side effects (decision, `changes_made`, `tests_run`,
+  PR/HeadSHA, `artifact_body` — self-reported summary/findings text is excluded).
+  When that digest repeats for `MaxDelegationNonProgressStreak` consecutive
+  generations (default `2`, set per-host via
+  `[orchestrate].max_delegation_non_progress_streak`), the tree trips the same loop
+  ladder; any new durable side effect resets the streak even if the summary text
+  repeats. Both signals share one ladder: `delegation_loop_warning` + a corrective
+  continuation, then `delegation_loop_detected` + the graceful finalize below.
 - Operator kill switch: `gitmoot job kill <root-job-id>` lets an operator
   terminate a runaway tree by its root id from outside. It is the **first**
   backstop, so operator action wins over every budget cap. The kill is graceful,
@@ -6951,6 +7035,19 @@ cannot recurse or fan out forever:
   continuation routes through the same finalize path below (a
   `delegation_killed` event is emitted), and the daemon stops starting queued
   children of the killed root.
+- Human-in-the-loop pause (`escalate_human` failure_policy, #340): when a child
+  fails under `escalate_human`, the parent task enters the resumable
+  `awaiting_human` state, a one-shot `delegation_escalation_requested` event is
+  recorded, the human is @-tagged in a GitHub comment, and **no continuation is
+  enqueued** — the tree consumes zero tokens/compute while it waits. A paused tree
+  is **not** a budget failure. A human resumes with
+  `/gitmoot resume <coordinatorJobID> retry|continue|abort [instructions]`
+  (authorize-commenter gated, exactly like `/gitmoot retry`/`cancel`); a
+  never-answered escalation is auto-finalized through the graceful finalize path
+  below after `[orchestrate].escalation_ttl` (default 24h). The daemon ingests
+  `/gitmoot resume` comments on the tree's **open** PR or issue; the dashboard
+  **Attention** section and the TTL backstop cover a tree whose PR/issue is no
+  longer open.
 
 When a bound trips, the offending delegations are not dispatched and the parent
 receives a typed lifecycle event explaining why (for example, the delegation tree
@@ -7038,8 +7135,29 @@ Delegation fields:
   only after every listed sibling succeeds. Each entry must reference a known
   sibling in the same result, may not be self-referential, and may not form a
   cycle — delegations form a DAG, and cycles are rejected.
-- `failure_policy` (optional): one of `block_parent`, `continue`, or
-  `escalate`. Defaults to `block_parent` when omitted.
+- `failure_policy` (optional): one of `block_parent`, `continue`, `escalate`, or
+  `escalate_human`. Defaults to `block_parent` when omitted.
+  - `block_parent` — a failed child blocks the shared parent task (terminal).
+  - `continue` — independent siblings keep running; only this branch's dependents
+    are skipped.
+  - `escalate` — hand every child outcome to the **coordinator** continuation to
+    decide autonomously (no human).
+  - `escalate_human` — a **durable human-in-the-loop pause** (#340). On a child
+    failure the parent task enters the resumable `awaiting_human` state, **no
+    continuation is enqueued, and the tree consumes zero tokens/compute** until a
+    human resumes it. The daemon @-tags the human in a GitHub comment (default
+    handle: the repo owner, or `[orchestrate].escalation_handle`) and the
+    dashboard lists the tree under **Attention**. A human resumes with
+    `/gitmoot resume <coordinatorJobID> retry|continue|abort [instructions]`:
+    `retry` re-runs the failing leg with the instructions folded in, `continue`
+    proceeds the coordinator continuation (now human-approved), and `abort`
+    routes to the graceful finalize continuation. A never-answered escalation is
+    auto-finalized after `[orchestrate].escalation_ttl` (default 24h); paused
+    time is excluded from the per-root wall-clock budget, and a paused tree is
+    never counted as a budget failure. The daemon routes `/gitmoot resume`
+    comments on the tree's **open** PR or issue (it watches open PRs/issues); the
+    dashboard **Attention** section and the `escalation_ttl` backstop cover a tree
+    whose PR/issue is no longer open.
 - `synthesis_rule` (optional): one of `summary`, `vote`, or `quorum`.
 - `quorum` (optional): an integer `K` (`> 0`), required when `synthesis_rule`
   is `quorum`. The coordinator continuation proceeds only if at least `K`
@@ -7048,6 +7166,31 @@ Delegation fields:
   delegations (every child must approve). `K` is an integer count only — no
   fractions or percentages — and must not exceed the number of delegations (a
   larger `K` is unsatisfiable and is rejected).
+
+  **Produce vs. independent check.** The `synthesis_rule`s above reconcile what
+  the producers **self-report** — `summary` merges their summaries, `vote`/`quorum`
+  count their *own* approving decisions. That is **self-evaluation**: it trusts the
+  producer's "I approve / I implemented it" and inherits the producer's blind
+  spots. To check the *combined* result against the original goal independently,
+  add a separate **verify leg** — a read-only ephemeral `review` child that `deps`
+  on the producer(s), runs on a **different runtime/model**, and re-runs the build
+  and tests itself rather than trusting the producers' self-reported `tests_run`.
+  It returns `decision: changes_requested` with structured findings on any
+  objective failure, else `approved`. This is **cross-evaluation**, which the
+  literature consistently finds beats self-evaluation: a capable verifier catches
+  failures the solver does not (the generator-verifier gap), and LLM-as-judge
+  graders show a self-preference bias toward their own outputs that a
+  different-model judge does not share. It is the same separation as ROMA's
+  Verifier (`VerifierSignature: (goal, candidate_output) -> verdict + feedback`,
+  vendored at `repos/ROMA`), where a failed verdict drives a re-plan instead of
+  trusting the producer. Route a failed verdict with `failure_policy: escalate`
+  (autonomous correction in the coordinator continuation) or `escalate_human` (a
+  human-in-the-loop pause); the merge gate independently blocks merge on the
+  non-ready decision. The shipped `decompose-and-verify` recipe is one instance of
+  this (parallel producers + one verify gate), and the `verifier` recipe is its
+  minimal one-producer form — both are templates under
+  `skills/gitmoot/agent-templates/`. No new primitive is involved: `EphemeralSpec`,
+  `failure_policy`, and the merge gate already ship.
 - `timeout` (optional): a Go duration string and must be positive (e.g. `10m`).
 - `retry` (optional): integer `>= 0`.
 - `worktree` (optional): worktree path for the child job.
@@ -7203,9 +7346,19 @@ Delegation trees are bounded so they cannot run forever:
   may not fan out more than this many delegations in one generation; an over-wide
   set is refused with a `delegation_width_exceeded` event and routes through the
   finalize continuation.
-- Loop detection: a windowed signature over recent delegation activity halts
-  repeated or cyclic delegation chains (e.g. oscillating A→B→A) well before the
-  depth cap is reached.
+- Loop detection (two signals): a **structural** windowed signature over recent
+  delegation sets halts a coordinator re-issuing the same set (e.g. oscillating
+  A→B→A) well before the depth cap; a **result-aware non-progress streak** (#339)
+  additionally catches a coordinator that perturbs the set each round to dodge the
+  structural hash but whose children keep returning nothing new — it fingerprints
+  the children's verifiable side effects (`decision`, `changes_made`, `tests_run`,
+  PR/HeadSHA, `artifact_body`; self-reported summary/findings text is excluded) and
+  trips after `MaxDelegationNonProgressStreak` consecutive generations with no new
+  durable side effect (default `2`, configurable per-host via
+  `[orchestrate].max_delegation_non_progress_streak`). Any new durable side effect
+  resets the streak even if the summary repeats. Both share the same ladder
+  (`delegation_loop_warning` → corrective continuation → `delegation_loop_detected`
+  → finalize).
 - Operator kill switch: `gitmoot job kill <root-job-id>` terminates a runaway
   tree by its root id from outside. It is the **first** backstop (operator action
   wins over every budget cap) and is graceful — in-flight jobs finish, the

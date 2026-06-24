@@ -18,8 +18,8 @@ import (
 
 func TestBuiltinsIncludesPlannerAndThermoTemplates(t *testing.T) {
 	definitions := Builtins()
-	if len(definitions) != 4 {
-		t.Fatalf("builtin count = %d, want 4", len(definitions))
+	if len(definitions) != 5 {
+		t.Fatalf("builtin count = %d, want 5", len(definitions))
 	}
 	thermo, ok := Lookup(ThermoNuclearCodeQualityReviewID)
 	if !ok {
@@ -58,6 +58,64 @@ func TestBuiltinsIncludesPlannerAndThermoTemplates(t *testing.T) {
 	if decompose.SourceRepo != "jerryfane/gitmoot" || decompose.SourcePath != "skills/gitmoot/agent-templates/decompose-and-verify.md" {
 		t.Fatalf("decompose-and-verify source = %+v", decompose)
 	}
+	verifier, ok := Lookup(VerifierTemplateID)
+	if !ok {
+		t.Fatal("verifier template missing")
+	}
+	if !verifier.Mutation || verifier.DefaultRole != "coordinator" || !reflect.DeepEqual(verifier.DefaultCapabilities, []string{"ask", "review", "implement"}) {
+		t.Fatalf("verifier definition = %+v", verifier)
+	}
+	if verifier.SourceRepo != "jerryfane/gitmoot" || verifier.SourcePath != "skills/gitmoot/agent-templates/verifier.md" {
+		t.Fatalf("verifier source = %+v", verifier)
+	}
+}
+
+// TestEmbeddedAgentTemplatesMatchBuiltins is the registry/embed parity gate: an
+// agent-template .md present in the embedded skill tree must be registered as a
+// built-in (or a documented bootstrap command like `orchestrate <id>` /
+// `agent template update <id>` silently fails), and every gitmoot-sourced
+// built-in must point at an embedded file that actually exists. Either gap
+// fails here so the orphan is CI-visible.
+func TestEmbeddedAgentTemplatesMatchBuiltins(t *testing.T) {
+	const dir = "gitmoot/agent-templates"
+	entries, err := fs.ReadDir(skills.FS, dir)
+	if err != nil {
+		t.Fatalf("read embedded agent-templates dir: %v", err)
+	}
+
+	// Map every gitmoot-sourced built-in by its embedded source path.
+	builtinByPath := map[string]Definition{}
+	for _, def := range Builtins() {
+		if def.SourceRepo != "jerryfane/gitmoot" {
+			continue
+		}
+		if !strings.HasPrefix(def.SourcePath, "skills/"+dir+"/") {
+			continue
+		}
+		builtinByPath[def.SourcePath] = def
+	}
+
+	// Every embedded .md template must be registered as a built-in.
+	embeddedPaths := map[string]struct{}{}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		sourcePath := "skills/" + dir + "/" + entry.Name()
+		embeddedPaths[sourcePath] = struct{}{}
+		if _, ok := builtinByPath[sourcePath]; !ok {
+			t.Errorf("embedded agent template %s is not registered in the builtins slice; "+
+				"documented `orchestrate`/`agent template update` commands for it would fail", entry.Name())
+		}
+	}
+
+	// Every gitmoot-sourced built-in under agent-templates/ must point at an
+	// embedded file that exists.
+	for path, def := range builtinByPath {
+		if _, ok := embeddedPaths[path]; !ok {
+			t.Errorf("built-in %s references embedded template %q, but no such file is embedded", def.ID, path)
+		}
+	}
 }
 
 func TestEmbeddedBuiltinTemplatesParseAndValidate(t *testing.T) {
@@ -84,7 +142,7 @@ func TestEmbeddedBuiltinTemplatesParseAndValidate(t *testing.T) {
 		// frontmatter) must agree with the embedded file's frontmatter for the
 		// coordinator recipes, or a no-frontmatter fetch would report different
 		// tags/inputs/outputs than the template actually declares.
-		if def.ID == ReviewPanelTemplateID || def.ID == DecomposeAndVerifyTemplateID {
+		if def.ID == ReviewPanelTemplateID || def.ID == DecomposeAndVerifyTemplateID || def.ID == VerifierTemplateID {
 			fallback := MetadataForDefinition(def)
 			if !reflect.DeepEqual(fallback.Tags, parsed.Metadata.Tags) ||
 				!reflect.DeepEqual(fallback.Inputs, parsed.Metadata.Inputs) ||
