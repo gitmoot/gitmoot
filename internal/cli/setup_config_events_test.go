@@ -75,6 +75,54 @@ func TestRunSetupRegistersRepoAndAgent(t *testing.T) {
 	}
 }
 
+func TestRunSetupPrintsTaggingReadinessByDefault(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"setup", "--home", home, "--repo", "owner/repo", "--path", repoDir, "--agent", "lead", "--runtime", "codex", "--session", "last"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("setup exit code = %d, stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"readiness:",
+		"repo registered: owner/repo",
+		"agent access: lead -> owner/repo",
+		"gitmoot daemon start --repo owner/repo --watch-issues",
+		"@lead ask <your question>",
+		"only the `ask` action is acted on",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("tagging readiness output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRunSetupWatchIssuesFalseSuppressesTagHelp(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"setup", "--home", home, "--repo", "owner/repo", "--path", repoDir, "--agent", "lead", "--runtime", "codex", "--session", "last", "--watch-issues=false"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("setup exit code = %d, stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "issue-watching is OFF for this run") {
+		t.Fatalf("expected off-note when --watch-issues=false:\n%s", out)
+	}
+	if strings.Contains(out, "@lead ask") {
+		t.Fatalf("did not expect tag help when issue-watching is off:\n%s", out)
+	}
+}
+
 func TestRunSetupPreservesExistingAgentRepoAccess(t *testing.T) {
 	home := t.TempDir()
 	firstRepoDir := t.TempDir()

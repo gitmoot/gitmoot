@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/daemon"
@@ -25,6 +26,7 @@ func runSetup(args []string, stdout, stderr io.Writer) int {
 	session := fs.String("session", "", "runtime session reference, last, or shell command")
 	role := fs.String("role", "agent", "agent role")
 	startDaemon := fs.Bool("start-daemon", false, "start the background daemon after setup")
+	watchIssues := fs.Bool("watch-issues", true, "watch open issues and route @<agent> ask comments to jobs (#389); on by default so the daemon is tagging-ready")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -88,10 +90,71 @@ func runSetup(args []string, stdout, stderr io.Writer) int {
 	writeLine(stdout, "configured %s with agent %s", repo.FullName(), agent.Name)
 	if *startDaemon {
 		writeLine(stdout, "step: start background daemon")
-		return runDaemonStartWithWorkDir([]string{"--home", *home, "--repo", repo.FullName()}, record.CheckoutPath, stdout, stderr)
+		daemonArgs := []string{"--home", *home, "--repo", repo.FullName()}
+		if *watchIssues {
+			daemonArgs = append(daemonArgs, "--watch-issues")
+		}
+		code := runDaemonStartWithWorkDir(daemonArgs, record.CheckoutPath, stdout, stderr)
+		if code != 0 {
+			return code
+		}
+		writeSetupReadiness(stdout, agent, repo.FullName(), *watchIssues, true)
+		return 0
 	}
-	writeLine(stdout, "next: gitmoot daemon start --repo %s", repo.FullName())
+	writeSetupReadiness(stdout, agent, repo.FullName(), *watchIssues, false)
 	return 0
+}
+
+// writeSetupReadiness prints a post-setup readiness summary so a freshly
+// configured tagging agent is usable without tribal knowledge: which
+// prerequisites are wired, whether the daemon watches issues, a daemon
+// runtime-auth note, and the exact comment to post (#428).
+func writeSetupReadiness(stdout io.Writer, agent runtime.Agent, repoFullName string, watchIssues bool, daemonStarted bool) {
+	writeLine(stdout, "")
+	writeLine(stdout, "readiness:")
+	writeLine(stdout, "  [ok] repo registered: %s", repoFullName)
+	writeLine(stdout, "  [ok] agent access: %s -> %s", agent.Name, repoFullName)
+	if daemonStarted {
+		if watchIssues {
+			writeLine(stdout, "  [ok] daemon: started with --watch-issues (answers issue tags)")
+		} else {
+			writeLine(stdout, "  [warn] daemon: started WITHOUT --watch-issues; it will NOT answer issue tags")
+			writeLine(stdout, "         re-run with --watch-issues, or: gitmoot daemon restart --repo %s --watch-issues", repoFullName)
+		}
+		writeSetupDaemonAuthNote(stdout, agent)
+	} else {
+		if watchIssues {
+			writeLine(stdout, "  [next] daemon not started; run from a shell that holds the runtime token:")
+		} else {
+			writeLine(stdout, "  [next] daemon not started; issue-watching is OFF for this run.")
+		}
+		writeLine(stdout, "next: gitmoot daemon start --repo %s --watch-issues", repoFullName)
+	}
+	if watchIssues {
+		writeLine(stdout, "")
+		writeLine(stdout, "to tag the agent, post this as the FIRST token of a line in a %s issue/PR comment:", repoFullName)
+		writeLine(stdout, "  @%s ask <your question>", agent.Name)
+		writeLine(stdout, "note: on issues only the `ask` action is acted on (review/implement apply to PRs).")
+	}
+}
+
+// writeSetupDaemonAuthNote surfaces a fail-open daemon runtime-auth note. The
+// authoritative daemon-aware auth check is tracked in #427 (a sibling PR); to
+// keep this flow independently mergeable we only inspect the current shell's
+// env for the claude runtime and never fail setup on it — the daemon inherits
+// the env of the shell that (re)started it, which is the common footgun.
+func writeSetupDaemonAuthNote(stdout io.Writer, agent runtime.Agent) {
+	if !strings.EqualFold(strings.TrimSpace(agent.Runtime), "claude") {
+		return
+	}
+	env := runtime.InspectClaudeAuthEnv(os.LookupEnv)
+	if env.Ready() {
+		writeLine(stdout, "  [ok] daemon runtime auth: claude credentials present in this shell (%s)", env.MaskedDetail())
+		return
+	}
+	writeLine(stdout, "  [warn] daemon runtime auth: no claude credentials in this shell; the daemon inherits this env.")
+	writeLine(stdout, "         %s", env.Warning())
+	writeLine(stdout, "         (daemon-aware auth validation is tracked in #427)")
 }
 
 func existingCompatibleAgent(ctx context.Context, store *db.Store, agent runtime.Agent) (bool, error) {

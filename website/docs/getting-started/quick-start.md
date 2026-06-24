@@ -45,6 +45,40 @@ The `--runtime` flag accepts `codex`, `claude`, or `kimi`. To use the Kimi Code
 runtime, run `kimi login` first, then restart the Gitmoot daemon so it inherits
 the session.
 
+## Set up a GitHub "tagging" agent
+
+To get an agent that answers `@<agent> ask …` comments on a repo's issues and
+PRs in one step, use `gitmoot setup`. It registers the repo, subscribes the
+agent, grants it repo access, and (with `--start-daemon`) launches a
+tagging-ready daemon:
+
+```sh
+gitmoot setup --repo owner/repo --path . \
+  --agent helper --runtime claude --session last --start-daemon
+```
+
+`gitmoot setup` enables issue-watching by default (`--watch-issues`, on unless
+you pass `--watch-issues=false`), so `gitmoot setup --start-daemon` produces a
+daemon that actually answers issue tags instead of silently leaving
+issue-watching off. After setup it prints a readiness summary: repo registered,
+agent access granted, daemon issue-watching state, a daemon runtime-auth note,
+and the exact comment to post.
+
+Two things to know when tagging on issues:
+
+- **Run the daemon from a shell that holds the runtime token.** The daemon
+  inherits the environment of the shell that (re)started it, so start it where
+  the runtime (for example Claude) is authenticated. Daemon-aware auth
+  validation is tracked in #427.
+- **On issues only the `ask` action is acted on.** Post the tag as the first
+  token of a line:
+
+  ```text
+  @helper ask <your question>
+  ```
+
+  `review` and `implement` actions apply to PRs; on issues they are ignored.
+
 For fast planning in the current Codex or Claude chat, ask the runtime:
 
 ```text

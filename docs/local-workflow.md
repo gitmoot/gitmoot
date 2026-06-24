@@ -324,6 +324,39 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    filters to run. Leaving both empty keeps the default of matching all enabled
    repos and all jobs.
 
+   ### Set up a GitHub "tagging" agent
+
+   To get an agent that answers `@<agent> ask …` comments on a repo's issues and
+   PRs, use `gitmoot setup` — it registers the repo, subscribes the agent, grants
+   it repo access, and (with `--start-daemon`) launches a tagging-ready daemon:
+
+   ```sh
+   gitmoot setup --repo owner/project --path . \
+     --agent helper --runtime claude --session last --start-daemon
+   ```
+
+   `gitmoot setup` enables issue-watching by default (`--watch-issues`, on unless
+   you pass `--watch-issues=false`), so `gitmoot setup --start-daemon` yields a
+   daemon that actually answers issue tags rather than silently leaving
+   issue-watching off. After setup it prints a readiness summary: repo registered,
+   agent access granted, daemon issue-watching state, a daemon runtime-auth note,
+   and the exact comment to post.
+
+   Two things to know when tagging on issues:
+
+   - **Run the daemon from a shell that holds the runtime token.** The daemon
+     inherits the environment of the shell that (re)started it, so start it where
+     the runtime (e.g. Claude) is authenticated. (Daemon-aware auth validation is
+     tracked in #427.)
+   - **On issues only the `ask` action is acted on.** Post the tag as the first
+     token of a line:
+
+     ```text
+     @helper ask <your question>
+     ```
+
+   `review` and `implement` actions apply to PRs; on issues they are ignored.
+
    Gitmoot records agent autonomy policy as `read-only`, `workspace-write`,
    `danger-full-access`, or `auto`. For Codex these map to Codex sandbox
    policies; for Claude Code they map to Claude permission modes. Implementation
