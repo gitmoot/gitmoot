@@ -3879,8 +3879,19 @@ func (w jobWorker) defaultCheckout(ctx context.Context, job db.Job, payload work
 	}
 	switch job.Type {
 	case "implement":
-		if err := w.validateTargetCheckout(ctx, payload, checkout); err != nil {
-			return "", err
+		// A worktree-less delegation child (delegation leg, empty WorktreePath)
+		// can only resolve the registered shared checkout, which sits on `main`,
+		// never its inherited coordinator branch — so validating that checkout
+		// against payload.Branch would reject it with "checkout branch is main, not
+		// job branch <X>". Skip the branch-identity guard for that child only (the
+		// engine's delegation_worktree_skipped fallback runs it against the shared
+		// checkout and still holds its branch lock); mirror the #389 ask-arm escape.
+		// validateImplementationLock stays UNCONDITIONAL — the branch lock, not this
+		// identity guard, is the designed mutation-safety mechanism (#413).
+		if !isWorktreeLessDelegationChild(payload) {
+			if err := w.validateTargetCheckout(ctx, payload, checkout); err != nil {
+				return "", err
+			}
 		}
 		if err := w.validateImplementationLock(ctx, payload, implementationLockOwner(agent, payload)); err != nil {
 			return "", err
@@ -3890,7 +3901,10 @@ func (w jobWorker) defaultCheckout(ctx context.Context, job db.Job, payload work
 			if err := w.validateReviewCheckout(ctx, payload, checkout); err != nil {
 				return "", err
 			}
-		} else {
+		} else if !isWorktreeLessDelegationChild(payload) {
+			// Same worktree-less delegation child escape as the implement arm; a
+			// review is read-only ⇒ running it against the shared checkout is
+			// trivially safe (#413).
 			if err := w.validateTargetCheckout(ctx, payload, checkout); err != nil {
 				return "", err
 			}
@@ -4061,6 +4075,24 @@ func (w jobWorker) validateTargetCheckout(ctx context.Context, payload workflow.
 // worktree HEAD rather than the inherited parent HeadSHA.
 func isDelegationWorktreeChild(payload workflow.JobPayload) bool {
 	return strings.TrimSpace(payload.DelegationID) != "" && strings.TrimSpace(payload.WorktreePath) != ""
+}
+
+// isWorktreeLessDelegationChild is the exact complement of
+// isDelegationWorktreeChild: a delegation child (it carries a delegation id — a
+// delegation *leg*, NOT just a ParentJobID, which continuations also carry with
+// an empty DelegationID and which route through the `ask` arm) that has no
+// allocated worktree path. With no worktree it can only resolve the repo's
+// registered shared checkout, which sits on `main` — never the inherited
+// coordinator branch (delegationRequest sets Branch: payload.Branch) — so
+// validating that checkout against payload.Branch would reject it with
+// "checkout branch is main, not job branch <X>". A wrong-branch *task* worktree
+// is already rejected upstream at taskWorktreeCheckout, so WorktreePath == ""
+// cleanly means "the shared registered checkout is the only resolution."
+// defaultCheckout's implement/review arms skip the validateTargetCheckout branch
+// guard for such a child (the branch lock, not this identity guard, is the
+// designed mutation-safety mechanism); see #389 (the ask-arm precedent) and #413.
+func isWorktreeLessDelegationChild(payload workflow.JobPayload) bool {
+	return strings.TrimSpace(payload.DelegationID) != "" && strings.TrimSpace(payload.WorktreePath) == ""
 }
 
 func (w jobWorker) validateReviewCheckout(ctx context.Context, payload workflow.JobPayload, checkout string) error {
