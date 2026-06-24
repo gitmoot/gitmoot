@@ -65,6 +65,17 @@ type Engine struct {
 	// defaultMaxInlineArtifactBytes. The total inlined across all children in one
 	// continuation is additionally bounded by maxInlineArtifactTotalBytes.
 	MaxInlineArtifactBytes int
+	// InjectUpstreamDepContext, when true, makes deps[] real dataflow (#419):
+	// when advanceDelegations enqueues a ready dependent leg, each of that leg's
+	// succeeded DIRECT deps' results (decision, summary preview, PR link,
+	// changes_made count, short HeadSHA, then the fenced artifact_body) are
+	// appended to the dependent's Instructions as a byte-budgeted "Upstream
+	// dependency results" block, so the dependent runs WITH its upstream results
+	// rather than blind to them. It mirrors InlineArtifactBodies: opt-in (default
+	// false) and reusing the SAME MaxInlineArtifactBytes per-body cap and
+	// maxInlineArtifactTotalBytes aggregate budget (no new knob). With the flag
+	// off the enqueued prompt is byte-identical to before this field existed.
+	InjectUpstreamDepContext bool
 	// MaxDelegationTokenBudget is the cumulative per-root token budget (input +
 	// output, summed across a coordination tree) that bounds a delegation tree by
 	// cost in addition to depth/width/total-jobs/wall-clock (#338 Part B). When a
@@ -1256,7 +1267,10 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 		if len(compactStrings(d.Deps)) > 0 {
 			continue
 		}
-		if err := e.enqueueDelegation(ctx, job, payload, d, artifactDir, ref); err != nil {
+		// Ready (dep-free) delegations dispatch here with no upstream context: a
+		// dep-free leg has no upstream deps to inject, and a deps-bearing leg is
+		// deferred to advanceDelegations (which injects #419 upstream results).
+		if err := e.enqueueDelegation(ctx, job, payload, d, artifactDir, "", ref); err != nil {
 			return err
 		}
 	}
@@ -1435,9 +1449,16 @@ func (e Engine) enqueueFinalizeContinuation(ctx context.Context, job db.Job, pay
 // deterministic-ID insert is swallowed by e.enqueue when the existing job
 // matches the request, so it is safe to call from both dispatchDelegations and
 // advanceDelegations.
-func (e Engine) enqueueDelegation(ctx context.Context, job db.Job, payload JobPayload, d Delegation, artifactDir string, ref taskRef) error {
+func (e Engine) enqueueDelegation(ctx context.Context, job db.Job, payload JobPayload, d Delegation, artifactDir string, upstreamContext string, ref taskRef) error {
 	request := e.delegationRequest(job, payload, d)
 	request.DelegationArtifactDir = artifactDir
+	// Append the #419 "Upstream dependency results" block (built by the caller
+	// from this dependent's succeeded direct deps) to the child's instructions.
+	// upstreamContext is "" unless Engine.InjectUpstreamDepContext is set, so the
+	// flag-off enqueued prompt is byte-identical to before this field existed.
+	if upstreamContext != "" {
+		request.Instructions = request.Instructions + upstreamContext
+	}
 
 	// Fingerprint dedup: skip enqueueing a child whose fingerprint already
 	// appears among a sibling under the same parent. Scoped to this parent via
@@ -1842,7 +1863,16 @@ func (e Engine) advanceDelegations(ctx context.Context, parentJob db.Job, parent
 			if !depsSatisfied(d.Deps, children, dedupWinners) {
 				continue
 			}
-			if err := e.enqueueDelegation(ctx, parentJob, parentPayload, d, artifactDir, ref); err != nil {
+			// #419: make deps[] real dataflow. This dependent is enqueued exactly
+			// here, after every dep succeeded and while children/dedupWinners hold
+			// the dep payloads, so inject the succeeded direct deps' results into
+			// its prompt. Gated behind InjectUpstreamDepContext so the flag-off
+			// enqueued instructions are byte-identical to before this change.
+			upstreamContext := ""
+			if e.InjectUpstreamDepContext {
+				upstreamContext = e.buildUpstreamDepBlock(d, children, dedupWinners)
+			}
+			if err := e.enqueueDelegation(ctx, parentJob, parentPayload, d, artifactDir, upstreamContext, ref); err != nil {
 				return err
 			}
 			// Re-read children AND events so a second satisfied dependent in the
@@ -2493,6 +2523,139 @@ func (e Engine) appendInlineArtifactBody(builder *strings.Builder, payload JobPa
 	builder.WriteString(inner.String())
 	builder.WriteString(fence)
 	builder.WriteString("\n")
+}
+
+// maxUpstreamDepSummaryPreviewBytes caps the inline summary preview emitted on a
+// dependency's header line in the "Upstream dependency results" block (#419). The
+// full body travels by reference as the fenced artifact_body below the line, so
+// the header preview is intentionally short; it is rune-safe truncated and fenced
+// so an embedded gitmoot_result sentinel in a summary cannot escape inline.
+const maxUpstreamDepSummaryPreviewBytes = 280
+
+// buildUpstreamDepBlock renders the "Upstream dependency results" block injected
+// into a ready dependent leg's prompt when InjectUpstreamDepContext is set (#419):
+// deps[] as real dataflow. For each of d's succeeded DIRECT deps (sorted by id for
+// stable output), it emits a header line —
+//
+//	- dep <id> (agent <a>, action <act>): <decision> — <summary preview> (<PR>) [changes_made: N] [head <sha7>]
+//
+// then the dep's artifact_body as a fenced, byte-budgeted block reusing
+// appendInlineArtifactBody (the SAME per-body cap and shared aggregate budget the
+// continuation prompt uses). Deps travel by reference: decision + truncated
+// summary preview + PR link + changes count + short HeadSHA + the on-disk body
+// path in any truncation marker — never the bulk body by value beyond the budget.
+//
+// Decided defaults (#419): direct-deps only; succeeded only
+// (State==JobSucceeded && Result!=nil), defensive on a nil Result (decision/state
+// line only, no body); body-only (no Findings). A dep resolved through
+// fingerprint dedup is followed to its winning sibling. Returns "" when d has no
+// deps or none are succeeded, so the caller appends nothing (and the flag-off
+// path is byte-identical). Callers MUST gate the call on InjectUpstreamDepContext.
+func (e Engine) buildUpstreamDepBlock(d Delegation, children map[string]db.Job, dedupWinners map[string]db.Job) string {
+	deps := compactStrings(d.Deps)
+	if len(deps) == 0 {
+		return ""
+	}
+	// Sort by id for stable, order-independent output regardless of how the
+	// coordinator listed deps.
+	sortedDeps := make([]string, len(deps))
+	copy(sortedDeps, deps)
+	sort.Strings(sortedDeps)
+
+	// remaining tracks the SAME aggregate artifact-body budget the continuation
+	// prompt uses, so a verbose upstream body cannot balloon the dependent's
+	// prompt across multiple deps.
+	remaining := maxInlineArtifactTotalBytes
+	var builder strings.Builder
+	wrote := false
+	for _, dep := range sortedDeps {
+		depJob, ok := children[dep]
+		if !ok {
+			// A dep that points at a fingerprint-deduped delegation has no child of
+			// its own; follow it to the winning sibling that did run.
+			depJob, ok = dedupWinners[dep]
+		}
+		if !ok || depJob.State != string(JobSucceeded) {
+			// Succeeded-only: a not-yet-run/failed dep contributes nothing (and a
+			// dependent only enqueues once depsSatisfied, so this is defensive).
+			continue
+		}
+		depPayload, err := unmarshalPayload(depJob.Payload)
+		if err != nil {
+			continue
+		}
+		if !wrote {
+			builder.WriteString("\n\nUpstream dependency results:\n")
+			wrote = true
+		}
+		e.appendUpstreamDepEntry(&builder, dep, depJob, depPayload, &remaining)
+	}
+	if !wrote {
+		return ""
+	}
+	return builder.String()
+}
+
+// appendUpstreamDepEntry writes one dependency's header line and (when present)
+// its fenced artifact_body to the upstream block. The header line carries the
+// pass-by-reference handle (decision/summary preview/PR/changes count/HeadSHA);
+// the body, if any, is fenced + truncated via appendInlineArtifactBody so it
+// shares the aggregate budget and cannot break out of its fence. Defensive on a
+// nil Result: emits the decision/state line only.
+func (e Engine) appendUpstreamDepEntry(builder *strings.Builder, depID string, depJob db.Job, depPayload JobPayload, remaining *int) {
+	decision := depJob.State
+	summary := ""
+	if depPayload.Result != nil {
+		if d := strings.TrimSpace(depPayload.Result.Decision); d != "" {
+			decision = d
+		}
+		summary = strings.TrimSpace(depPayload.Result.Summary)
+	}
+	fmt.Fprintf(builder, "- dep %q (agent %s, action %s): %s", depID, depJob.Agent, depJob.Type, decision)
+	if summary != "" {
+		fmt.Fprintf(builder, " — %s", upstreamDepSummaryPreview(summary))
+	}
+	if link := childPullRequestLink(depPayload); link != "" {
+		fmt.Fprintf(builder, " (%s)", link)
+	}
+	if depPayload.Result != nil && len(depPayload.Result.ChangesMade) > 0 {
+		fmt.Fprintf(builder, " [changes_made: %d]", len(depPayload.Result.ChangesMade))
+	}
+	if sha := shortHeadSHA(depPayload.HeadSHA); sha != "" {
+		fmt.Fprintf(builder, " [head %s]", sha)
+	}
+	builder.WriteString("\n")
+	// Body by reference: a fenced, truncated artifact_body under the line, sharing
+	// the aggregate budget. appendInlineArtifactBody is a no-op when the body is
+	// empty or the budget is spent, so a nil/empty Result emits only the line.
+	e.appendInlineArtifactBody(builder, depPayload, depJob.ID, remaining)
+}
+
+// upstreamDepSummaryPreview caps the summary shown inline on a dep's header line
+// to a short, rune-safe preview and fences it when it contains a backtick run so
+// an embedded sentinel cannot escape. The full body travels separately as the
+// fenced artifact_body, so this preview is deliberately short.
+func upstreamDepSummaryPreview(summary string) string {
+	preview, omitted := truncateUTF8Bytes(summary, maxUpstreamDepSummaryPreviewBytes)
+	if omitted > 0 {
+		preview = strings.TrimRight(preview, " \t\n") + "…"
+	}
+	if strings.Contains(preview, "`") {
+		fence := artifactBodyFence(preview)
+		return fence + preview + fence
+	}
+	return preview
+}
+
+// shortHeadSHA returns the first 7 hex chars of a commit SHA for compact display,
+// or "" when the SHA is empty. It does not validate hex; a shorter SHA is returned
+// as-is.
+func shortHeadSHA(sha string) string {
+	sha = strings.TrimSpace(sha)
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
 }
 
 // artifactBodyFence returns a backtick fence guaranteed longer than the longest
