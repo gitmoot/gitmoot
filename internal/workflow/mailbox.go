@@ -53,6 +53,8 @@ type JobRequest struct {
 	DelegationReason       string
 	RecentDelegationHashes []string
 	DelegationRepeatCount  int
+	NonProgressStreak      int
+	LastProgressDigest     string
 	DelegationFinalize     bool
 	Model                  string
 	Phase                  string
@@ -98,6 +100,8 @@ type JobPayload struct {
 	DelegationReason       string         `json:"delegation_reason,omitempty"`
 	RecentDelegationHashes []string       `json:"recent_delegation_hashes,omitempty"`
 	DelegationRepeatCount  int            `json:"delegation_repeat_count,omitempty"`
+	NonProgressStreak      int            `json:"non_progress_streak,omitempty"`
+	LastProgressDigest     string         `json:"last_progress_digest,omitempty"`
 	DelegationFinalize     bool           `json:"delegation_finalize,omitempty"`
 	Model                  string         `json:"model,omitempty"`
 	Phase                  string         `json:"phase,omitempty"`
@@ -162,6 +166,8 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		DelegationReason:       request.DelegationReason,
 		RecentDelegationHashes: request.RecentDelegationHashes,
 		DelegationRepeatCount:  request.DelegationRepeatCount,
+		NonProgressStreak:      request.NonProgressStreak,
+		LastProgressDigest:     request.LastProgressDigest,
 		DelegationFinalize:     request.DelegationFinalize,
 		Model:                  request.Model,
 		Phase:                  request.Phase,

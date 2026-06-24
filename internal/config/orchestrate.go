@@ -50,18 +50,26 @@ type OrchestratePolicy struct {
 	// unlimited/off, so default behavior is unchanged. The daemon wires this into
 	// Engine.MaxDelegationCostUSD at startup.
 	MaxDelegationCostUSD float64
+	// MaxDelegationNonProgressStreak is the per-root threshold for the result-aware
+	// non-progress loop detector (#339): how many consecutive continuation
+	// generations a delegation tree may produce with no new durable side effect
+	// before the loop ladder trips. 0 (the default) means use the engine's built-in
+	// default (2), so default behavior is unchanged. The daemon wires this into
+	// Engine.MaxDelegationNonProgressStreak at startup.
+	MaxDelegationNonProgressStreak int
 }
 
 func DefaultOrchestratePolicy() OrchestratePolicy {
 	return OrchestratePolicy{
-		CockpitMode:              CockpitModeAuto,
-		CockpitSession:           "",
-		CockpitMaxPanes:          4,
-		CockpitPaneKey:           CockpitPaneKeyJob,
-		InlineArtifactBodies:     false,
-		InlineArtifactMaxBytes:   0,
-		MaxDelegationTokenBudget: 0,
-		MaxDelegationCostUSD:     0,
+		CockpitMode:                    CockpitModeAuto,
+		CockpitSession:                 "",
+		CockpitMaxPanes:                4,
+		CockpitPaneKey:                 CockpitPaneKeyJob,
+		InlineArtifactBodies:           false,
+		InlineArtifactMaxBytes:         0,
+		MaxDelegationTokenBudget:       0,
+		MaxDelegationCostUSD:           0,
+		MaxDelegationNonProgressStreak: 0,
 	}
 }
 
@@ -133,6 +141,10 @@ func applyOrchestratePolicyField(policy *OrchestratePolicy, key string, value st
 		parsed, err := strconv.ParseFloat(value, 64)
 		policy.MaxDelegationCostUSD = parsed
 		return err
+	case "max_delegation_non_progress_streak":
+		parsed, err := strconv.Atoi(value)
+		policy.MaxDelegationNonProgressStreak = parsed
+		return err
 	default:
 		return nil
 	}
@@ -157,6 +169,9 @@ func validateOrchestratePolicy(policy OrchestratePolicy) error {
 	}
 	if policy.MaxDelegationCostUSD < 0 {
 		return fmt.Errorf("orchestrate.max_delegation_cost_usd must be 0 (unlimited) or positive")
+	}
+	if policy.MaxDelegationNonProgressStreak < 0 {
+		return fmt.Errorf("orchestrate.max_delegation_non_progress_streak must be 0 (engine default) or positive")
 	}
 	return nil
 }

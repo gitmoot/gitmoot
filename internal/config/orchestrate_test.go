@@ -41,6 +41,48 @@ func TestLoadOrchestratePolicyDefaults(t *testing.T) {
 	if policy.MaxDelegationCostUSD != 0 {
 		t.Fatalf("MaxDelegationCostUSD = %v, want 0 (unlimited) by default", policy.MaxDelegationCostUSD)
 	}
+	if policy.MaxDelegationNonProgressStreak != 0 {
+		t.Fatalf("MaxDelegationNonProgressStreak = %d, want 0 (engine default) by default", policy.MaxDelegationNonProgressStreak)
+	}
+}
+
+// TestLoadOrchestratePolicyMaxDelegationNonProgressStreak pins #339: the
+// result-aware non-progress streak threshold parses from [orchestrate] and an
+// absent key keeps the 0 (engine default) value.
+func TestLoadOrchestratePolicyMaxDelegationNonProgressStreak(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[orchestrate]
+max_delegation_non_progress_streak = 3
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+
+	policy, err := LoadOrchestratePolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadOrchestratePolicy returned error: %v", err)
+	}
+	if policy.MaxDelegationNonProgressStreak != 3 {
+		t.Fatalf("MaxDelegationNonProgressStreak = %d, want 3", policy.MaxDelegationNonProgressStreak)
+	}
+
+	// Absent key keeps the engine-default (0) even with the section present.
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[orchestrate]
+cockpit_mode = "auto"
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	policy, err = LoadOrchestratePolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadOrchestratePolicy returned error: %v", err)
+	}
+	if policy.MaxDelegationNonProgressStreak != 0 {
+		t.Fatalf("absent max_delegation_non_progress_streak should default 0, got %d", policy.MaxDelegationNonProgressStreak)
+	}
 }
 
 // TestLoadOrchestratePolicyMaxDelegationCostUSD pins #380: the dollar-cost budget
@@ -249,6 +291,22 @@ max_delegation_cost_usd = cheap
 max_delegation_cost_usd = -0.5
 `,
 			wantErr: "max_delegation_cost_usd must be 0 (unlimited) or positive",
+		},
+		{
+			name: "max_delegation_non_progress_streak_non_int",
+			body: `
+[orchestrate]
+max_delegation_non_progress_streak = many
+`,
+			wantErr: "parse [orchestrate].max_delegation_non_progress_streak",
+		},
+		{
+			name: "max_delegation_non_progress_streak_negative",
+			body: `
+[orchestrate]
+max_delegation_non_progress_streak = -1
+`,
+			wantErr: "max_delegation_non_progress_streak must be 0 (engine default) or positive",
 		},
 	}
 	for _, tt := range tests {
