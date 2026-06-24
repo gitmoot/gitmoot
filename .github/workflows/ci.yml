@@ -34,6 +34,15 @@ jobs:
       - name: Build
         run: go build ./...
 
+      - name: Generated contract is current
+        # The gitmoot_result reply contract is single-sourced from the workflow
+        # result structs and regenerated into internal/prompts/contract_generated.go
+        # by `go generate ./...`. Fail if the checked-in artifact is stale so a
+        # struct change can never silently drift the prompt agents are given.
+        run: |
+          go generate ./...
+          git diff --exit-code
+
       - name: Vet
         run: go vet ./...
 

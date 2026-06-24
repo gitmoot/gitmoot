@@ -14,6 +14,37 @@ import (
 
 const resultKey = `"gitmoot_result"`
 
+// The following slices are the single source of truth for the enum-valued
+// fields of the gitmoot_result contract. The validator below checks against
+// them, and the build-time contract generator (internal/prompts/contractgen)
+// reflects over them so the prompt prose and the validator can never drift
+// apart. Keep them in declaration order — the generated prose lists them in
+// the same order.
+
+// ResultDecisions are the allowed values of AgentResult.Decision.
+var ResultDecisions = []string{"approved", "changes_requested", "blocked", "implemented", "failed"}
+
+// DelegationFailurePolicies are the allowed values of Delegation.FailurePolicy
+// (the empty string falls back to the default and is accepted separately).
+var DelegationFailurePolicies = []string{"block_parent", "continue", "escalate", "escalate_human"}
+
+// DelegationSynthesisRules are the allowed values of Delegation.SynthesisRule
+// (the empty string falls back to the default and is accepted separately).
+var DelegationSynthesisRules = []string{"summary", "vote", "quorum"}
+
+// EphemeralRuntimes are the allowed values of EphemeralSpec.Runtime. They are a
+// subset of the registered runtimes: an ephemeral worker is never a raw shell.
+var EphemeralRuntimes = []string{runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime}
+
+// allowedSet returns a lookup set for the given allowed-value slice.
+func allowedSet(values []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(values))
+	for _, v := range values {
+		set[v] = struct{}{}
+	}
+	return set
+}
+
 // EphemeralSpec describes an on-demand worker that Gitmoot should materialize
 // for a delegation instead of routing it to a pre-registered agent. The daemon
 // builds the worker from this spec (default sandbox read-only); the workflow
@@ -151,9 +182,7 @@ func delegationFieldError(i int, d Delegation, field, msg string) error {
 }
 
 func validateAgentResult(result AgentResult) error {
-	switch result.Decision {
-	case "approved", "changes_requested", "blocked", "implemented", "failed":
-	default:
+	if _, ok := allowedSet(ResultDecisions)[result.Decision]; !ok {
 		return fmt.Errorf("unsupported gitmoot_result decision %q", result.Decision)
 	}
 	if strings.TrimSpace(result.Summary) == "" {
@@ -323,19 +352,20 @@ func validateDelegationLifecycle(d Delegation) error {
 	if d.Retry < 0 {
 		return fmt.Errorf("delegation %q retry must be >= 0", d.ID)
 	}
-	switch strings.ToLower(strings.TrimSpace(d.FailurePolicy)) {
-	case "", "block_parent", "continue", "escalate", "escalate_human":
-	default:
-		return fmt.Errorf("delegation %q failure_policy %q is invalid", d.ID, d.FailurePolicy)
+	failurePolicies := allowedSet(DelegationFailurePolicies)
+	if fp := strings.ToLower(strings.TrimSpace(d.FailurePolicy)); fp != "" {
+		if _, ok := failurePolicies[fp]; !ok {
+			return fmt.Errorf("delegation %q failure_policy %q is invalid", d.ID, d.FailurePolicy)
+		}
 	}
-	switch strings.ToLower(strings.TrimSpace(d.SynthesisRule)) {
-	case "", "summary", "vote":
-	case "quorum":
-		if d.Quorum <= 0 {
+	synthesisRules := allowedSet(DelegationSynthesisRules)
+	if sr := strings.ToLower(strings.TrimSpace(d.SynthesisRule)); sr != "" {
+		if _, ok := synthesisRules[sr]; !ok {
+			return fmt.Errorf("delegation %q synthesis_rule %q is invalid", d.ID, d.SynthesisRule)
+		}
+		if sr == "quorum" && d.Quorum <= 0 {
 			return fmt.Errorf("delegation %q synthesis_rule quorum requires quorum > 0", d.ID)
 		}
-	default:
-		return fmt.Errorf("delegation %q synthesis_rule %q is invalid", d.ID, d.SynthesisRule)
 	}
 	return nil
 }
@@ -371,12 +401,13 @@ func validateEphemeralSpec(delegationID string, spec *EphemeralSpec) error {
 	if spec == nil {
 		return nil
 	}
-	switch strings.TrimSpace(spec.Runtime) {
-	case runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime:
-	case "":
+	switch rt := strings.TrimSpace(spec.Runtime); {
+	case rt == "":
 		return fmt.Errorf("delegation %q ephemeral runtime is required", delegationID)
 	default:
-		return fmt.Errorf("delegation %q ephemeral runtime %q is invalid; expected one of codex/claude/kimi", delegationID, spec.Runtime)
+		if _, ok := allowedSet(EphemeralRuntimes)[rt]; !ok {
+			return fmt.Errorf("delegation %q ephemeral runtime %q is invalid; expected one of codex/claude/kimi", delegationID, spec.Runtime)
+		}
 	}
 	// Reject an unknown autonomy_policy at parse time: an unrecognized value
 	// would otherwise normalize to "auto" (writable) downstream and silently
