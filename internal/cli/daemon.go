@@ -4196,7 +4196,22 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, cause er
 				return err
 			}
 			if transitioned {
-				return blockTaskForPermissionBlockedJob(ctx, w.Store, latest)
+				if err := blockTaskForPermissionBlockedJob(ctx, w.Store, latest); err != nil {
+					return err
+				}
+				// A WRITABLE implement DELEGATION child whose runtime fails MID-RUN
+				// with a permission error (read-only FS / sandbox denies write) is
+				// transitioned JobRunning->JobBlocked here and returns early — it never
+				// reaches the ParentJobID finalize branch below, so the parent DAG
+				// strands exactly like #409 (the mid-run sibling of the pre-flight
+				// read-only-implement case fixed at ~2127). Route it through the SAME
+				// finalize helper so its failure_policy fires. The helper no-ops for a
+				// non-delegation job (ParentJobID empty) or one that already stored a
+				// result, so the solo-implement case stays byte-identical.
+				if err := w.finalizePreflightDelegationChild(ctx, jobID, errors.New(agentPermissionBlockedMessage)); err != nil {
+					return err
+				}
+				return nil
 			}
 		}
 	}
