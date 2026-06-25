@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/events"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
@@ -33,6 +34,18 @@ type Engine struct {
 	// dashboard "Attention" section and the recorded event remain), only the
 	// GitHub notification is skipped. A notifier error never fails the pause.
 	EscalationNotifier EscalationNotifier
+	// EventSink is the injected, best-effort outbound event seam (#446), mirroring
+	// EscalationNotifier: when configured, the engine emits a redacted, versioned
+	// events.Event on each terminal transition it owns (job.finished on a
+	// succeeded terminal, job.needs_attention on an escalate_human pause) so an
+	// off-box consumer (a webhook) can observe the run. It is optional and
+	// nil-safe: when nil (the default, no [events] config) NO event is constructed
+	// or emitted and behavior is byte-identical. Emit is fire-and-forget and best-
+	// effort — a slow/hung/erroring sink never blocks or fails a job (see
+	// internal/events). The daemon emits the failure/blocked/awaiting-human
+	// terminal cases it owns through the SAME sink so the whole terminal set is
+	// covered. #445 (the ask-gate) rides this seam to emit its job.needs_attention.
+	EventSink events.Sink
 	// Home is the resolved GITMOOT_HOME root used to place per-delegation
 	// worktrees. DelegationWorktrees is the checkout-bound git client that
 	// performs the worktree-add. Both are optional: when either is unset, the
@@ -173,6 +186,59 @@ func (e Engine) now() time.Time {
 		return e.Now()
 	}
 	return time.Now()
+}
+
+// mailbox builds the engine's Mailbox with the best-effort terminal-event hook
+// wired to e.EventSink (#446). When EventSink is nil (the default) the hook is
+// nil too, so finishWithPayload neither constructs nor emits an event and the
+// path is byte-identical. The hook maps the terminal JobState to the event_type,
+// resolves root_id from the payload, and ships a redacted event fire-and-forget.
+func (e Engine) mailbox() Mailbox {
+	mb := Mailbox{Store: e.Store}
+	if e.EventSink == nil {
+		return mb
+	}
+	mb.emitTerminal = func(ctx context.Context, jobID string, state JobState, payload JobPayload) {
+		eventType, ok := terminalEventType(state)
+		if !ok {
+			return
+		}
+		rootID := strings.TrimSpace(payload.RootJobID)
+		if rootID == "" {
+			rootID = jobID
+		}
+		detail := ""
+		if payload.Result != nil {
+			detail = payload.Result.Summary
+		}
+		events.EmitEvent(ctx, e.EventSink, events.NewEvent(
+			eventType,
+			jobID,
+			rootID,
+			payload.Repo,
+			string(state),
+			detail,
+			e.now(),
+			RedactCommentText,
+		))
+	}
+	return mb
+}
+
+// terminalEventType maps a terminal JobState to the outbound event_type (#446).
+// Only the terminal set {succeeded,failed,blocked} maps; any other state returns
+// ok=false so no event is emitted for it.
+func terminalEventType(state JobState) (events.EventType, bool) {
+	switch state {
+	case JobSucceeded:
+		return events.EventJobFinished, true
+	case JobFailed:
+		return events.EventJobFailed, true
+	case JobBlocked:
+		return events.EventJobBlocked, true
+	default:
+		return "", false
+	}
 }
 
 type PullRequestEvent struct {
@@ -415,7 +481,7 @@ func (e Engine) RunJob(ctx context.Context, jobID string, agent runtime.Agent, a
 	if err := e.ensureJobExecutorAllowed(ctx, job, payload, taskRefFromPayload(payload)); err != nil {
 		return AgentResult{}, err
 	}
-	result, err := (Mailbox{Store: e.Store}).Run(ctx, jobID, agent, adapter)
+	result, err := e.mailbox().Run(ctx, jobID, agent, adapter)
 	if err != nil {
 		return result, err
 	}
@@ -484,7 +550,7 @@ func (e Engine) FinalizeTimedOutDelegationChild(ctx context.Context, jobID strin
 		Decision: "failed",
 		Summary:  reason,
 	}
-	mailbox := Mailbox{Store: e.Store}
+	mailbox := e.mailbox()
 	if job.State == string(JobRunning) {
 		if err := mailbox.finishWithPayload(ctx, jobID, JobFailed, reason, payload); err != nil {
 			return false, err
@@ -3919,6 +3985,28 @@ func (e Engine) pauseAwaitingHuman(ctx context.Context, parentJob db.Job, parent
 			TaskTitle:        ref.Title,
 		})
 	}
+
+	// Emit a best-effort job.needs_attention on the FRESH escalation round (#446).
+	// It is gated on the same one-shot path as the escalationRequested event above
+	// (we only reach here when the round was CLOSED), so a re-advance does NOT
+	// re-emit. nil-safe: no EventSink => no event. detail carries the redacted
+	// question. This is the seam #445's ask-gate rides to emit its own
+	// job.needs_attention. The coordinator job id is the subject so a consumer can
+	// resume the right tree; root_id groups the run.
+	rootID := strings.TrimSpace(parentPayload.RootJobID)
+	if rootID == "" {
+		rootID = parentJob.ID
+	}
+	events.EmitEvent(ctx, e.EventSink, events.NewEvent(
+		events.EventJobNeedsAttention,
+		parentJob.ID,
+		rootID,
+		firstNonEmptyString(ref.Repo, parentPayload.Repo),
+		string(TaskAwaitingHuman),
+		strings.TrimSpace(d.Prompt),
+		e.now(),
+		RedactCommentText,
+	))
 
 	return awaitErr
 }

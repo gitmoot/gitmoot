@@ -235,3 +235,129 @@ func validateOrchestratePolicy(policy OrchestratePolicy) error {
 	}
 	return nil
 }
+
+// EventsPolicy is the host-level outbound-event-stream policy read from the
+// [events] section of the gitmoot config (#446). It is a distinct concern from
+// [orchestrate] (cockpit/delegation budgets): when WebhookURL is empty (the
+// default) NO sink is constructed and behavior is byte-identical (off by
+// default). The daemon uses it to build the best-effort webhook Sink wired into
+// the workflow engine's terminal-transition path.
+type EventsPolicy struct {
+	// WebhookURL is the single https/http endpoint each terminal/needs_attention
+	// event is POSTed to as application/json. Empty (the default) means the event
+	// stream is OFF: no sink, no goroutine, no emits.
+	WebhookURL string
+	// Timeout bounds a single outbound POST so a hung consumer never stalls the
+	// drain goroutine, as a Go duration string. Empty (the default) uses
+	// DefaultEventsTimeout (2s); the daemon parses it.
+	Timeout string
+	// SocketPath is RESERVED for the graduate Unix-socket transport (#446
+	// open question). It is parsed and validated but UNUSED by the pilot
+	// (webhook-only); listing it keeps the config surface forward-compatible.
+	SocketPath string
+}
+
+// DefaultEventsTimeout is the fallback per-POST timeout when [events].timeout is
+// unset. It matches events.DefaultWebhookTimeout (kept as a string here so the
+// config package does not import internal/events).
+const DefaultEventsTimeout = "2s"
+
+func DefaultEventsPolicy() EventsPolicy {
+	return EventsPolicy{
+		WebhookURL: "",
+		Timeout:    "",
+		SocketPath: "",
+	}
+}
+
+// Enabled reports whether the event stream is configured on. With no [events]
+// config (the default) it is OFF and no sink should be constructed.
+func (p EventsPolicy) Enabled() bool {
+	return strings.TrimSpace(p.WebhookURL) != ""
+}
+
+// ResolvedTimeout returns the parsed per-POST timeout, falling back to
+// DefaultEventsTimeout when unset. validateEventsPolicy guarantees a non-empty
+// value parses, so this never errors for a validated policy.
+func (p EventsPolicy) ResolvedTimeout() time.Duration {
+	raw := strings.TrimSpace(p.Timeout)
+	if raw == "" {
+		raw = DefaultEventsTimeout
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		d, _ = time.ParseDuration(DefaultEventsTimeout)
+	}
+	return d
+}
+
+func LoadEventsPolicy(paths Paths) (EventsPolicy, error) {
+	content, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		return EventsPolicy{}, err
+	}
+	policy := DefaultEventsPolicy()
+	current := false
+	for _, raw := range strings.Split(string(content), "\n") {
+		line := strings.TrimSpace(stripConfigComment(raw))
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section := strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
+			current = strings.TrimSpace(section) == "events"
+			continue
+		}
+		if !current {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		if err := applyEventsPolicyField(&policy, strings.TrimSpace(key), strings.TrimSpace(value)); err != nil {
+			return EventsPolicy{}, fmt.Errorf("parse [events].%s: %w", strings.TrimSpace(key), err)
+		}
+	}
+	if err := validateEventsPolicy(policy); err != nil {
+		return EventsPolicy{}, err
+	}
+	return policy, nil
+}
+
+func applyEventsPolicyField(policy *EventsPolicy, key string, value string) error {
+	switch key {
+	case "webhook_url":
+		parsed, err := parseConfigString(value)
+		policy.WebhookURL = strings.TrimSpace(parsed)
+		return err
+	case "timeout":
+		parsed, err := parseConfigString(value)
+		policy.Timeout = strings.TrimSpace(parsed)
+		return err
+	case "socket_path":
+		parsed, err := parseConfigString(value)
+		policy.SocketPath = strings.TrimSpace(parsed)
+		return err
+	default:
+		return nil
+	}
+}
+
+func validateEventsPolicy(policy EventsPolicy) error {
+	if url := strings.TrimSpace(policy.WebhookURL); url != "" {
+		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+			return fmt.Errorf("events.webhook_url %q must be an http:// or https:// URL", url)
+		}
+	}
+	if raw := strings.TrimSpace(policy.Timeout); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("events.timeout %q is invalid: %w", raw, err)
+		}
+		if parsed <= 0 {
+			return fmt.Errorf("events.timeout must be positive")
+		}
+	}
+	return nil
+}

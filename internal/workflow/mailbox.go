@@ -16,6 +16,14 @@ import (
 
 type Mailbox struct {
 	Store *db.Store
+	// emitTerminal, when set, is called best-effort AFTER a genuine running->
+	// terminal transition in finishWithPayload (#446). It is the single
+	// chokepoint the engine uses to emit job.finished/job.failed/job.blocked, so
+	// the success/advance path and the timeout-finalize path both fan out exactly
+	// once. It is nil-safe: when unset (the default, no EventSink configured) no
+	// event is constructed or emitted and behavior is byte-identical. The hook is
+	// fire-and-forget — it must never block or fail the finish.
+	emitTerminal func(ctx context.Context, jobID string, state JobState, payload JobPayload)
 }
 
 type JobRequest struct {
@@ -367,6 +375,12 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 			return getErr
 		}
 		return fmt.Errorf("job %q is %s, not running", jobID, latest.State)
+	}
+	// Best-effort outbound emit on the genuine running->terminal transition only
+	// (#446). Gated on transitioned==true so a re-run never double-emits; nil-safe
+	// so the default (no EventSink) path is byte-identical.
+	if m.emitTerminal != nil {
+		m.emitTerminal(ctx, jobID, state, payload)
 	}
 	return nil
 }

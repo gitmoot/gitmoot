@@ -23,6 +23,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/events"
 	gitutil "github.com/jerryfane/gitmoot/internal/git"
 	"github.com/jerryfane/gitmoot/internal/github"
 	"github.com/jerryfane/gitmoot/internal/presence"
@@ -1360,6 +1361,24 @@ type jobWorker struct {
 	// it is a shared pointer across all per-repo dispatch passes so the cap is
 	// process-global (host-global for the normal single-daemon deployment).
 	Admission *admissionBudget
+	// EventSinkOverride lets a test inject a recording events.Sink (#446) without
+	// a config file / webhook. When nil (production), eventSink() resolves the
+	// shared process-global webhook sink from [events] config instead.
+	EventSinkOverride events.Sink
+}
+
+// eventSink resolves the best-effort outbound event Sink (#446) for the
+// worker's home, or nil when [events] is OFF (the default). It is the seam
+// finishQueuedJob / handleRunJobError use to emit the DAEMON-owned terminal
+// cases (pre-flight queued->failed/blocked and permission-blocked
+// running->blocked) that never pass through the engine's Mailbox chokepoint. The
+// underlying webhook sink is a process-global singleton, so this is a cheap
+// cache hit on the hot path. A test override short-circuits config resolution.
+func (w jobWorker) eventSink() events.Sink {
+	if w.EventSinkOverride != nil {
+		return w.EventSinkOverride
+	}
+	return daemonEventSink(w.Store, w.workflowHome())
 }
 
 const daemonRunningJobStaleAfter = 30 * time.Minute
@@ -3606,6 +3625,14 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 		// pauses awaiting a decision. Best-effort and nil-safe in the engine; the
 		// handle is filled in from policy by applyOrchestratePolicy.
 		EscalationNotifier: &daemonEscalationNotifier{Store: store, GitHub: gh},
+		// Off-by-default outbound event stream (#446): the engine emits
+		// job.finished/job.failed/job.blocked on its terminal Mailbox path and
+		// job.needs_attention on an escalate_human pause through this best-effort,
+		// nil-safe sink. daemonEventSink returns nil unless [events].webhook_url is
+		// set, so with no config NO sink is constructed and behavior is
+		// byte-identical. The sink is a process-global shared singleton (one drain
+		// goroutine), so re-building the engine per tick never leaks goroutines.
+		EventSink: daemonEventSink(store, home),
 		PayloadRefresher: func(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
 			return refreshDaemonJobPayload(ctx, store, checkout, job, payload)
 		},
@@ -4319,6 +4346,16 @@ func (w jobWorker) finishQueuedJob(ctx context.Context, jobID string, state work
 	}
 	if transitioned {
 		writeLine(w.Stdout, "job %s %s: %v", jobID, state, cause)
+		// Best-effort outbound emit (#446) for a DAEMON-owned pre-flight terminal
+		// transition (queued->failed|blocked) — this never reaches the engine's
+		// Mailbox.finishWithPayload chokepoint, so the daemon owns its emit. Gated
+		// on transitioned==true so it fires exactly once per genuine transition;
+		// nil-safe when [events] is OFF. The subsequent finalizePreflightDelegationChild
+		// only attaches a synthetic result via savePayload (no further transition),
+		// so it does not double-emit.
+		if eventType, ok := daemonTerminalEventType(state); ok {
+			emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, eventType, string(state), cause.Error())
+		}
 	}
 	// A delegation child that fails in ANY pre-flight step (checkout/branch-lock
 	// validation, adapter factory, managed config, runtime-session lock/busy,
@@ -4403,6 +4440,12 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, cause er
 				if err := blockTaskForPermissionBlockedJob(ctx, w.Store, latest); err != nil {
 					return err
 				}
+				// Best-effort outbound emit (#446): this running->blocked permission
+				// transition is daemon-owned (it does not pass through the engine's
+				// Mailbox.finishWithPayload chokepoint), so emit job.blocked exactly
+				// once here. The following finalizePreflightDelegationChild only attaches
+				// a synthetic result (savePayload, no transition), so it never re-emits.
+				emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, events.EventJobBlocked, string(workflow.JobBlocked), agentPermissionBlockedMessage)
 				// A WRITABLE implement DELEGATION child whose runtime fails MID-RUN
 				// with a permission error (read-only FS / sandbox denies write) is
 				// transitioned JobRunning->JobBlocked here and returns early — it never
