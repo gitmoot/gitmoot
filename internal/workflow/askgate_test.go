@@ -402,3 +402,270 @@ func TestParseHumanAnswers(t *testing.T) {
 		t.Fatalf("parseHumanAnswers single = %+v, want only=just do v3", got)
 	}
 }
+
+// seedAskWithDelegationsCoordinator inserts a coordinator whose HEALTHY result
+// carries BOTH human_questions[] AND delegations[] (the goal explicitly endorses a
+// coordinator that fans out AND asks). synthesisRule is applied to each delegation
+// (e.g. "vote"/"quorum"). The ask-gate short-circuits AdvanceJob BEFORE
+// dispatchDelegations, so these delegations are NEVER dispatched and no children
+// exist for them.
+func seedAskWithDelegationsCoordinator(t *testing.T, store *db.Store, synthesisRule string) {
+	t.Helper()
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-005",
+		TaskID:    "task-5",
+		TaskTitle: "Parent",
+		Sender:    "coord",
+		Result: &AgentResult{
+			Decision:       "approved",
+			Summary:        "fan out, but I need a decision first",
+			HumanQuestions: []HumanQuestion{{ID: "q1", Prompt: "Target v2 or v3 API?", Choices: []string{"v2", "v3"}}},
+			Delegations: []Delegation{
+				{ID: "api", Agent: "api", Action: "review", Prompt: "build api", SynthesisRule: synthesisRule},
+				{ID: "ui", Agent: "ui", Action: "review", Prompt: "build ui", SynthesisRule: synthesisRule},
+			},
+		},
+	})
+}
+
+// TestAskGateWithVoteDelegationsAnswerEnqueuesContinuation is the regression for
+// the HIGH finding: a result carrying BOTH human_questions[] AND
+// synthesis_rule:vote delegations[] must NOT deadlock on `answer`. Because the
+// ask-gate short-circuits dispatch, the delegations never ran; the answer-driven
+// continuation must not run the vote synthesis gate against an empty children map
+// (which would block the parent and silently lose the answer).
+func TestAskGateWithVoteDelegationsAnswerEnqueuesContinuation(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "api", []string{"review"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "ui", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+	engine.EscalationNotifier = &recordingNotifier{}
+
+	seedAskWithDelegationsCoordinator(t, store, "vote")
+
+	// AdvanceJob pauses at the ask-gate BEFORE any delegation child is created.
+	err := engine.AdvanceJob(ctx, "parent-job")
+	var awaiting AwaitingHumanError
+	if !errors.As(err, &awaiting) {
+		t.Fatalf("AdvanceJob(parent) error = %v, want AwaitingHumanError", err)
+	}
+	if jobExists(t, store, "parent-job/delegation/api") || jobExists(t, store, "parent-job/delegation/ui") {
+		t.Fatal("ask-gate must short-circuit BEFORE dispatching delegations")
+	}
+	assertTaskState(t, store, "task-5", TaskAwaitingHuman)
+
+	// The human answers. The vote/quorum synthesis gate must NOT fire (the
+	// delegations were never dispatched), so this enqueues the coordinator
+	// continuation and clears the pause rather than blocking.
+	if err := engine.ResolveEscalation(ctx, "parent-job", ResumeAnswer, "q1: v3"); err != nil {
+		t.Fatalf("ResolveEscalation(answer) returned error = %v, want nil (must not block on un-dispatched vote delegations)", err)
+	}
+
+	if !jobExists(t, store, delegationContinuationID("parent-job")) {
+		t.Fatal("answer must enqueue the coordinator continuation even when un-dispatched delegations declared vote")
+	}
+	// The pause is cleared: the task left awaiting_human (planned), not blocked.
+	task, err := store.GetTask(ctx, "task-5")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State == string(TaskAwaitingHuman) || task.State == string(TaskBlocked) {
+		t.Fatalf("task state = %q, want it to leave awaiting_human/blocked after the answer", task.State)
+	}
+	// The continuation carries the human's answer and does NOT render the
+	// un-dispatched delegations as "not enqueued (dependencies unmet)".
+	cont, err := unmarshalPayload(mustJob(t, store, delegationContinuationID("parent-job")).Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	if !strings.Contains(cont.HumanAnswer, "v3") {
+		t.Fatalf("continuation HumanAnswer = %q, want it to carry v3", cont.HumanAnswer)
+	}
+	if strings.Contains(cont.Instructions, "not enqueued (dependencies unmet)") {
+		t.Fatalf("continuation prompt must not present un-dispatched ask delegations as deps-unmet:\n%s", cont.Instructions)
+	}
+}
+
+// TestAskGateWithQuorumDelegationsAnswerEnqueuesContinuation mirrors the vote
+// regression for synthesis_rule:quorum, which deadlocked identically.
+func TestAskGateWithQuorumDelegationsAnswerEnqueuesContinuation(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "api", []string{"review"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "ui", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+	engine.EscalationNotifier = &recordingNotifier{}
+
+	seedAskWithDelegationsCoordinator(t, store, "quorum")
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err == nil {
+		t.Fatal("expected AwaitingHumanError")
+	}
+	if err := engine.ResolveEscalation(ctx, "parent-job", ResumeAnswer, "q1: v3"); err != nil {
+		t.Fatalf("ResolveEscalation(answer) returned error = %v, want nil (must not block on un-dispatched quorum delegations)", err)
+	}
+	if !jobExists(t, store, delegationContinuationID("parent-job")) {
+		t.Fatal("answer must enqueue the coordinator continuation even when un-dispatched delegations declared quorum")
+	}
+	task, err := store.GetTask(ctx, "task-5")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State == string(TaskAwaitingHuman) || task.State == string(TaskBlocked) {
+		t.Fatalf("task state = %q, want it to leave awaiting_human/blocked after the answer", task.State)
+	}
+}
+
+// seedCoordinatorWithAskingChildren inserts a coordinator with `n` independent
+// review delegations and dispatches them via AdvanceJob, returning their child job
+// ids. The children share one parent task (task-5) and one coordinator (parent-job).
+func seedCoordinatorWithAskingChildren(t *testing.T, store *db.Store, engine Engine, ids ...string) {
+	t.Helper()
+	ctx := context.Background()
+	dels := make([]Delegation, 0, len(ids))
+	for _, id := range ids {
+		seedAgent(t, store, id, []string{"review"}, "jerryfane/gitmoot")
+		dels = append(dels, Delegation{ID: id, Agent: id, Action: "review", Prompt: "review " + id})
+	}
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-005",
+		TaskID:    "task-5",
+		TaskTitle: "Parent",
+		Sender:    "coord",
+		Result: &AgentResult{
+			Decision:    "approved",
+			Summary:     "fan out",
+			Delegations: dels,
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob(parent) returned error: %v", err)
+	}
+}
+
+// TestAskGateChildRoutesPauseToCoordinator is the regression for the MEDIUM
+// finding at line 705: a healthy delegation CHILD that returns human_questions[]
+// must (a) record the ask round on the COORDINATOR (not the child) so the human
+// resumes the coordinator whose continuation carries the answer, and (b) NOT let
+// the parent DAG advance enqueue the coordinator continuation while the round is
+// open (zero compute, no contradiction).
+func TestAskGateChildRoutesPauseToCoordinator(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	notifier := &recordingNotifier{}
+	engine := testEngine(store)
+	engine.EscalationNotifier = notifier
+
+	seedCoordinatorWithAskingChildren(t, store, engine, "api")
+
+	// The only child finishes HEALTHY but carrying a question.
+	completeDelegationChild(t, store, "parent-job/delegation/api", JobSucceeded, AgentResult{
+		Decision:       "approved",
+		Summary:        "need a call",
+		HumanQuestions: []HumanQuestion{{ID: "q1", Prompt: "v2 or v3?"}},
+	})
+	err := engine.AdvanceJob(ctx, "parent-job/delegation/api")
+	var awaiting AwaitingHumanError
+	if !errors.As(err, &awaiting) {
+		t.Fatalf("AdvanceJob(api child) error = %v, want AwaitingHumanError", err)
+	}
+
+	// The shared parent task is paused.
+	assertTaskState(t, store, "task-5", TaskAwaitingHuman)
+
+	// The round is recorded on the COORDINATOR, not the child.
+	if got := countJobEvents(t, store, "parent-job", escalationRequestedEvent); got != 1 {
+		t.Fatalf("coordinator %s events = %d, want 1 (the child's ask routes to the coordinator)", escalationRequestedEvent, got)
+	}
+	if got := countJobEvents(t, store, "parent-job/delegation/api", escalationRequestedEvent); got != 0 {
+		t.Fatalf("child %s events = %d, want 0 (the round is the coordinator's)", escalationRequestedEvent, got)
+	}
+
+	// The coordinator continuation must NOT be enqueued while the ask round is open:
+	// the tree must not proceed past the question even though the asking child was
+	// the last/only sibling to finish.
+	if jobExists(t, store, delegationContinuationID("parent-job")) {
+		t.Fatal("the coordinator continuation must NOT be enqueued while a child's ask round is open")
+	}
+	if got := countJobEvents(t, store, "parent-job", "delegation_continuation_enqueued"); got != 0 {
+		t.Fatalf("delegation_continuation_enqueued events = %d, want 0 while the ask round is open", got)
+	}
+
+	// The resume target the human is told to use is the COORDINATOR.
+	if len(notifier.calls) != 1 || notifier.calls[0].CoordinatorJobID != "parent-job" {
+		t.Fatalf("notifier calls = %+v, want one targeting CoordinatorJobID=parent-job", notifier.calls)
+	}
+
+	// Answering the COORDINATOR enqueues its single continuation and clears the pause.
+	if err := engine.ResolveEscalation(ctx, "parent-job", ResumeAnswer, "q1: v3"); err != nil {
+		t.Fatalf("ResolveEscalation(coordinator answer) returned error: %v", err)
+	}
+	if !jobExists(t, store, delegationContinuationID("parent-job")) {
+		t.Fatal("answering the coordinator must enqueue its continuation")
+	}
+}
+
+// TestAskGateSiblingsShareOneRoundOnCoordinator is the regression for the MEDIUM
+// finding at line 4126: two sibling delegation children that BOTH return
+// human_questions[] must open exactly ONE shared round on the coordinator — the
+// first asking sibling opens it, the second hits the open-round guard — not two
+// independent rounds that ping-pong the shared task.
+func TestAskGateSiblingsShareOneRoundOnCoordinator(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	notifier := &recordingNotifier{}
+	engine := testEngine(store)
+	engine.EscalationNotifier = notifier
+
+	seedCoordinatorWithAskingChildren(t, store, engine, "a", "b")
+
+	// Both siblings finish HEALTHY, each carrying its own question.
+	completeDelegationChild(t, store, "parent-job/delegation/a", JobSucceeded, AgentResult{
+		Decision:       "approved",
+		Summary:        "a asks",
+		HumanQuestions: []HumanQuestion{{ID: "qa", Prompt: "a: v2 or v3?"}},
+	})
+	completeDelegationChild(t, store, "parent-job/delegation/b", JobSucceeded, AgentResult{
+		Decision:       "approved",
+		Summary:        "b asks",
+		HumanQuestions: []HumanQuestion{{ID: "qb", Prompt: "b: x or y?"}},
+	})
+
+	// First sibling opens the single round on the coordinator.
+	if err := engine.AdvanceJob(ctx, "parent-job/delegation/a"); err == nil {
+		t.Fatal("AdvanceJob(a) expected AwaitingHumanError")
+	}
+	// Second sibling must hit the open-round guard, NOT open a second round.
+	if err := engine.AdvanceJob(ctx, "parent-job/delegation/b"); err == nil {
+		t.Fatal("AdvanceJob(b) expected AwaitingHumanError (open-round guard)")
+	}
+
+	// Exactly ONE escalation round on the coordinator, shared by both siblings.
+	if got := countJobEvents(t, store, "parent-job", escalationRequestedEvent); got != 1 {
+		t.Fatalf("coordinator %s events = %d, want 1 (single shared round across siblings)", escalationRequestedEvent, got)
+	}
+	// Neither child records its own round.
+	if got := countJobEvents(t, store, "parent-job/delegation/a", escalationRequestedEvent); got != 0 {
+		t.Fatalf("child a %s events = %d, want 0", escalationRequestedEvent, got)
+	}
+	if got := countJobEvents(t, store, "parent-job/delegation/b", escalationRequestedEvent); got != 0 {
+		t.Fatalf("child b %s events = %d, want 0", escalationRequestedEvent, got)
+	}
+	// The human is notified once (one logical pause), not twice.
+	if len(notifier.calls) != 1 {
+		t.Fatalf("notifier calls = %d, want 1 (single round = single @-tag)", len(notifier.calls))
+	}
+	assertTaskState(t, store, "task-5", TaskAwaitingHuman)
+
+	// No continuation while the shared round is open.
+	if jobExists(t, store, delegationContinuationID("parent-job")) {
+		t.Fatal("no coordinator continuation may be enqueued while the shared ask round is open")
+	}
+}

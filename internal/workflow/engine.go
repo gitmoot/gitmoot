@@ -644,6 +644,33 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 		if err != nil {
 			return err
 		}
+		// Ask-gate for a delegation CHILD (#445): a HEALTHY child that returned
+		// human_questions[] pauses the SHARED parent task on the COORDINATOR's round
+		// BEFORE advancing the parent DAG. Running it here — ahead of
+		// advanceDelegations — is load-bearing: if the asking child is the last/only
+		// sibling to finish, advanceDelegations would otherwise enqueue the coordinator
+		// continuation (the tree would PROCEED past the question, consuming compute and
+		// contradicting the open pause). Routing the pause to the coordinator
+		// (pauseAwaitingHumanAnswer keys on payload.ParentJobID) also makes the human's
+		// resume target the coordinator — whose answer-driven continuation is the one
+		// the tree advances on — and lets sibling asks share the single round. A
+		// blocked/failed child never asks (it takes the failure path below).
+		if len(payload.Result.HumanQuestions) > 0 &&
+			payload.Result.Decision != "blocked" && payload.Result.Decision != "failed" {
+			open, perr := e.pauseAwaitingHumanAnswer(ctx, job, payload, ref)
+			if perr != nil {
+				return perr
+			}
+			if open {
+				return AwaitingHumanError{Reason: fmt.Sprintf("job %q is awaiting a human answer to %d question(s)", payload.ParentJobID, len(payload.Result.HumanQuestions))}
+			}
+			// CLOSED: the human already answered (the coordinator continuation that
+			// carries the answer is in flight) or the ask was TTL-finalized. The
+			// answer-driven coordinator continuation is the asking child's sole
+			// continuation, so short-circuit — neither the parent DAG advance nor this
+			// child's own delegations[] re-dispatch.
+			return nil
+		}
 		if parentPayload.Result != nil {
 			if err := e.advanceDelegations(ctx, parentJob, parentPayload, parentPayload.Result, taskRefFromPayload(parentPayload)); err != nil {
 				return err
@@ -4120,10 +4147,34 @@ func (e Engine) pauseAwaitingHuman(ctx context.Context, parentJob db.Job, parent
 // false => the round is CLOSED (the human already answered and the answer-driven
 // continuation is in flight, or the ask was TTL-finalized): the caller
 // short-circuits AdvanceJob without redispatching.
+//
+// When the asking job is a delegation CHILD (#445), the round is keyed/recorded/
+// routed on its COORDINATOR (payload.ParentJobID) exactly like the escalate_human
+// failure pause (which keys on parentJob.ID), NOT on the child's own id. This
+// preserves the frozen single-round-per-parent invariant: the FIRST asking sibling
+// opens the one shared round and subsequent siblings hit the open-round guard, the
+// shared parent task flips once, and the human resumes the COORDINATOR (whose
+// continuation carries the answer) — not a child that the parent DAG would advance
+// past independently.
 func (e Engine) pauseAwaitingHumanAnswer(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) (bool, error) {
-	// While ANY escalation round is OPEN (requested > resolved) this is an
-	// idempotent re-advance: keep the pause, re-record nothing, re-notify nobody.
-	open, err := e.escalationOpen(ctx, job.ID)
+	// Route the pause to the coordinator when the asking job is a delegation child:
+	// the escalation event, round guard, notifier target, and task ref all key on
+	// the coordinator so siblings share one round (mirrors pauseAwaitingHuman).
+	targetID := job.ID
+	targetRef := ref
+	if parentID := strings.TrimSpace(payload.ParentJobID); parentID != "" {
+		targetID = parentID
+		if _, parentPayload, perr := e.jobPayload(ctx, parentID); perr == nil {
+			if pref := taskRefFromPayload(parentPayload); pref.ID != "" {
+				targetRef = pref
+			}
+		}
+	}
+
+	// While ANY escalation round is OPEN (requested > resolved) on the target
+	// (coordinator for a child, else self), this is an idempotent re-advance: keep
+	// the pause, re-record nothing, re-notify nobody.
+	open, err := e.escalationOpen(ctx, targetID)
 	if err != nil {
 		return false, err
 	}
@@ -4131,22 +4182,27 @@ func (e Engine) pauseAwaitingHumanAnswer(ctx context.Context, job db.Job, payloa
 		return true, nil
 	}
 
-	// No OPEN round. If an ask round was already opened AND resolved for this job,
+	// No OPEN round. If an ask round was already opened AND resolved for the target,
 	// the human has answered (or TTL-finalized) and the answer-driven continuation
 	// is the asking job's sole continuation: report CLOSED so the caller
 	// short-circuits without re-pausing or redispatching. Mirrors the
 	// escalate_human round model, but an asking job is never re-run to open a
 	// second ask round (only a retried failing leg re-pauses), so a resolved ask
 	// round stays closed.
-	if _, exists, lerr := e.loadEscalation(ctx, job.ID); lerr != nil {
+	if _, exists, lerr := e.loadEscalation(ctx, targetID); lerr != nil {
 		return false, lerr
 	} else if exists {
+		// A child that asks while the coordinator's round was already opened+resolved
+		// by a sibling is CLOSED (the shared answer-continuation is in flight); a
+		// resolved/non-ask round on the coordinator is also not ours to reopen.
 		return false, nil
 	}
 
-	// Open a FRESH ask round: pause the task, record the requested event with the
-	// questions, notify best-effort, and emit job.needs_attention once.
-	if err := e.setTaskState(ctx, ref, TaskAwaitingHuman); err != nil {
+	// Open a FRESH ask round: pause the (coordinator's) task, record the requested
+	// event with the questions on the target, notify best-effort, and emit
+	// job.needs_attention once. All keyed on targetID/targetRef so a child's ask
+	// routes to its coordinator.
+	if err := e.setTaskState(ctx, targetRef, TaskAwaitingHuman); err != nil {
 		return false, err
 	}
 
@@ -4164,7 +4220,7 @@ func (e Engine) pauseAwaitingHumanAnswer(ctx context.Context, job db.Job, payloa
 		message = string(encoded)
 	}
 	if err := e.Store.AddJobEvent(ctx, db.JobEvent{
-		JobID:   job.ID,
+		JobID:   targetID,
 		Kind:    escalationRequestedEvent,
 		Message: message,
 	}); err != nil {
@@ -4172,33 +4228,37 @@ func (e Engine) pauseAwaitingHumanAnswer(ctx context.Context, job db.Job, payloa
 	}
 
 	// Notify the human best-effort (nil notifier / notifier error never fails the
-	// pause): the recorded event + dashboard Attention are the durable truth.
+	// pause): the recorded event + dashboard Attention are the durable truth. The
+	// CoordinatorJobID is the resume target (the coordinator for a child's ask) so
+	// the human resumes the job whose continuation actually carries the answer.
 	if e.EscalationNotifier != nil {
 		_ = e.EscalationNotifier.NotifyEscalation(ctx, EscalationRequest{
-			CoordinatorJobID: job.ID,
+			CoordinatorJobID: targetID,
 			Question:         renderHumanQuestions(questions),
 			Ask:              true,
 			Questions:        questions,
-			Repo:             firstNonEmptyString(ref.Repo, payload.Repo),
+			Repo:             firstNonEmptyString(targetRef.Repo, payload.Repo),
 			PullRequest:      payload.PullRequest,
-			Branch:           firstNonEmptyString(ref.Branch, payload.Branch),
-			TaskID:           ref.ID,
-			TaskTitle:        ref.Title,
+			Branch:           firstNonEmptyString(targetRef.Branch, payload.Branch),
+			TaskID:           targetRef.ID,
+			TaskTitle:        targetRef.Title,
 		})
 	}
 
 	// Emit a best-effort job.needs_attention on the FRESH ask round via the SAME
 	// #446 EventSink the failure escalation rides (NOT a parallel notify path).
-	// One-shot (we only reach here when no round was open) and nil-safe.
+	// One-shot (we only reach here when no round was open) and nil-safe. The subject
+	// is the resume target (coordinator for a child) so a consumer resumes the right
+	// tree; root_id groups the run.
 	rootID := strings.TrimSpace(payload.RootJobID)
 	if rootID == "" {
-		rootID = job.ID
+		rootID = targetID
 	}
 	events.EmitEvent(ctx, e.EventSink, events.NewEvent(
 		events.EventJobNeedsAttention,
-		job.ID,
+		targetID,
 		rootID,
-		firstNonEmptyString(ref.Repo, payload.Repo),
+		firstNonEmptyString(targetRef.Repo, payload.Repo),
 		string(TaskAwaitingHuman),
 		renderHumanQuestions(questions),
 		e.now(),
@@ -4567,7 +4627,21 @@ func (e Engine) resumeAnswerLeg(ctx context.Context, parentJob db.Job, parentPay
 		return err
 	}
 	answerBlock := renderHumanAnswerBlock(rec.Questions, answers)
-	if err := e.maybeEnqueueContinuation(ctx, parentJob, parentPayload, parentPayload.Result, children, ref, withHumanAnswer(answerBlock)); err != nil {
+	// The ask-gate short-circuits AdvanceJob BEFORE dispatchDelegations (engine.go
+	// ask-gate block), so an asking result's delegations[] were NEVER dispatched —
+	// no children exist for them (#445). Feeding the un-dispatched delegations into
+	// maybeEnqueueContinuation would (a) make the vote/quorum synthesis gates fail
+	// (every delegation id is missing from the empty children map) and block the
+	// parent — silently losing the human's answer — and (b) make a verify
+	// synthesis_rule emit a misleading replan continuation. It would also render
+	// each delegation as "not enqueued (dependencies unmet)" in the continuation
+	// prompt, which is wrong: they were never attempted. Resume the coordinator from
+	// a copy of its result with Delegations cleared, so the answer-driven
+	// continuation always enqueues and the coordinator decides fresh (it may
+	// re-issue the same delegations now that it has the answer).
+	resumeResult := *parentPayload.Result
+	resumeResult.Delegations = nil
+	if err := e.maybeEnqueueContinuation(ctx, parentJob, parentPayload, &resumeResult, children, ref, withHumanAnswer(answerBlock)); err != nil {
 		return err
 	}
 	return e.Store.AddJobEvent(ctx, db.JobEvent{
