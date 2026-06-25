@@ -58,6 +58,7 @@ var resultFieldAnnotations = map[string]fieldAnnotation{
 	"needs":         {example: "[]"},
 	"delegations":   {example: "[]"},
 	"artifact_body": {help: `top-level artifact_body (string) is required when any delegation requests artifacts.`},
+	"human_questions": {help: `top-level human_questions (object[], optional): use SPARINGLY to pause for a specific human decision instead of guessing; each entry is {id (string, required, unique), prompt (string, required), choices (string[], optional)}. Returning it pauses the tree awaiting a human answer (no leg fails, no continuation runs); a human replies with /gitmoot resume <job> answer "<id>: ...". Leave it absent when you can proceed.`},
 }
 
 // delegationFieldAnnotations covers every JSON field of workflow.Delegation.
@@ -213,6 +214,12 @@ func renderDelegationHelp() string {
 	// artifact_body lives on the top-level result, not on a delegation, but it
 	// is conditionally required by delegations, so document it here.
 	if h := resultFieldAnnotations["artifact_body"].help; h != "" {
+		b.WriteString("- " + h + "\n")
+	}
+	// human_questions is a top-level ask-gate field (#445), not a delegation field,
+	// but it composes with delegations (a coordinator can fan out AND ask), so it is
+	// documented in the same prompt block the runtime agent actually receives.
+	if h := resultFieldAnnotations["human_questions"].help; h != "" {
 		b.WriteString("- " + h + "\n")
 	}
 	return b.String()

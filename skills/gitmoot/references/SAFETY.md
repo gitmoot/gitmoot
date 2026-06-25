@@ -118,6 +118,23 @@ cannot recurse or fan out forever:
   `/gitmoot resume` comments on the tree's **open** PR or issue; the dashboard
   **Attention** section and the TTL backstop cover a tree whose PR/issue is no
   longer open.
+- Non-failure ask-gate (`human_questions[]`, #445): the **healthy-result** sibling
+  of `escalate_human`. A worker/coordinator that returns a healthy result carrying
+  `human_questions[]` pauses the parent task at the **same** resumable
+  `awaiting_human` state for a specific human answer — **no leg fails**, no
+  continuation or delegation children are enqueued, and the tree consumes zero
+  tokens/compute. It reuses the **same** pause plumbing as `escalate_human` (one
+  `delegation_escalation_requested` event tagged `kind=ask` with the questions, the
+  @-tag comment, the dashboard **Attention** section), so the **same**
+  `[orchestrate].escalation_ttl` auto-finalizes an unanswered ask, the **same**
+  wall-clock pause exclusion applies, and the pause is **budget-neutral** (it
+  enqueues no job; only the eventual answer-driven continuation occupies the single
+  continuation slot). A human answers with
+  `/gitmoot resume <coordinatorJobID> answer "<id>: ..."` (authorize-commenter
+  gated); the answer is injected into the coordinator continuation prompt. The
+  `answer` verb is valid only on an ask round and `retry`/`continue`/`abort` only
+  on a failure round — a mismatch is rejected with a clear message. Absence of
+  `human_questions[]` is byte-identical to today's behavior.
 
 When a bound trips, the offending delegations are not dispatched and the parent
 receives a typed lifecycle event explaining why (for example, the delegation tree

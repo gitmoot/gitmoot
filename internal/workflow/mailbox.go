@@ -16,6 +16,17 @@ import (
 
 type Mailbox struct {
 	Store *db.Store
+	// emitTerminal, when set, is called best-effort AFTER a genuine running->
+	// terminal transition in BOTH finishWithPayload (success/advance + timeout-
+	// finalize) and finish (the m.fail delivery/parse-failure path) (#446). Wiring
+	// both is what makes the whole terminal set fan out exactly once: the
+	// success/advance path emits job.finished, and the most common failure mode —
+	// a runtime delivery error, timeout, or malformed-output-after-repair — emits
+	// job.failed/job.blocked through finish rather than being silently dropped. It
+	// is nil-safe: when unset (the default, no EventSink configured) no event is
+	// constructed or emitted and behavior is byte-identical. The hook is
+	// fire-and-forget — it must never block or fail the finish.
+	emitTerminal func(ctx context.Context, jobID string, state JobState, payload JobPayload)
 }
 
 type JobRequest struct {
@@ -55,6 +66,7 @@ type JobRequest struct {
 	DelegationRepeatCount  int
 	NonProgressStreak      int
 	LastProgressDigest     string
+	VerifyAttempt          int
 	DelegationFinalize     bool
 	Model                  string
 	Phase                  string
@@ -63,6 +75,10 @@ type JobRequest struct {
 	CockpitPaneKey         string
 	SkipNativeReviewFanout bool
 	Ephemeral              *EphemeralSpec
+	// HumanAnswer carries the rendered ask-gate answer block (#445) into the
+	// coordinator continuation enqueued by the `answer` resume verb. Empty for
+	// every other job, so the stored payload is byte-identical by default.
+	HumanAnswer string
 }
 
 type JobPayload struct {
@@ -102,6 +118,7 @@ type JobPayload struct {
 	DelegationRepeatCount  int            `json:"delegation_repeat_count,omitempty"`
 	NonProgressStreak      int            `json:"non_progress_streak,omitempty"`
 	LastProgressDigest     string         `json:"last_progress_digest,omitempty"`
+	VerifyAttempt          int            `json:"verify_attempt,omitempty"`
 	DelegationFinalize     bool           `json:"delegation_finalize,omitempty"`
 	Model                  string         `json:"model,omitempty"`
 	Phase                  string         `json:"phase,omitempty"`
@@ -110,6 +127,7 @@ type JobPayload struct {
 	CockpitPaneKey         string         `json:"cockpit_pane_key,omitempty"`
 	SkipNativeReviewFanout bool           `json:"skip_native_review_fanout,omitempty"`
 	Ephemeral              *EphemeralSpec `json:"ephemeral,omitempty"`
+	HumanAnswer            string         `json:"human_answer,omitempty"`
 	RawOutputs             []string       `json:"raw_outputs,omitempty"`
 	Result                 *AgentResult   `json:"result,omitempty"`
 }
@@ -168,6 +186,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		DelegationRepeatCount:  request.DelegationRepeatCount,
 		NonProgressStreak:      request.NonProgressStreak,
 		LastProgressDigest:     request.LastProgressDigest,
+		VerifyAttempt:          request.VerifyAttempt,
 		DelegationFinalize:     request.DelegationFinalize,
 		Model:                  request.Model,
 		Phase:                  request.Phase,
@@ -176,6 +195,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		CockpitPaneKey:         strings.TrimSpace(request.CockpitPaneKey),
 		SkipNativeReviewFanout: request.SkipNativeReviewFanout,
 		Ephemeral:              request.Ephemeral,
+		HumanAnswer:            request.HumanAnswer,
 	})
 	if err != nil {
 		return db.Job{}, err
@@ -338,7 +358,43 @@ func (m Mailbox) finish(ctx context.Context, jobID string, state JobState, messa
 		}
 		return fmt.Errorf("job %q is %s, not running", jobID, latest.State)
 	}
+	// Best-effort outbound emit on the genuine running->terminal transition, wired
+	// symmetrically with finishWithPayload (#446). m.fail (delivery failure,
+	// malformed-output-after-repair) reaches a terminal state through THIS path,
+	// not finishWithPayload, so without this the most common runtime failure mode
+	// silently never emits job.failed/job.blocked. finish has no payload arg, so
+	// load the stored one for full root_id/repo; when it carries no Result (the
+	// usual delivery-failure case) synthesize a transient one from the transition
+	// message so detail is a meaningful, redacted failure summary. Gated on
+	// transitioned==true (fires exactly once) and nil-safe (no EventSink => no-op,
+	// byte-identical). The load failure degrades gracefully to an id-rooted emit
+	// rather than dropping the event or failing the finish.
+	if m.emitTerminal != nil {
+		payload := m.loadTerminalEmitPayload(ctx, jobID, message)
+		m.emitTerminal(ctx, jobID, state, payload)
+	}
 	return nil
+}
+
+// loadTerminalEmitPayload loads the stored payload for a finish-path terminal
+// emit, ensuring a non-nil Result so the emit detail carries a failure summary.
+// A delivery/parse failure transitions via finish without a stored Result; the
+// transition message (e.g. "delivery failed: ...") is the only failure context,
+// so synthesize a transient Result from it (in-memory only — never persisted).
+// On any load error it returns a minimal payload so the emit still fires.
+func (m Mailbox) loadTerminalEmitPayload(ctx context.Context, jobID, message string) JobPayload {
+	job, err := m.Store.GetJob(ctx, jobID)
+	if err != nil {
+		return JobPayload{Result: &AgentResult{Summary: strings.TrimSpace(message)}}
+	}
+	payload, err := unmarshalPayload(job.Payload)
+	if err != nil {
+		return JobPayload{Result: &AgentResult{Summary: strings.TrimSpace(message)}}
+	}
+	if payload.Result == nil {
+		payload.Result = &AgentResult{Summary: strings.TrimSpace(message)}
+	}
+	return payload
 }
 
 func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobState, message string, payload JobPayload) error {
@@ -364,6 +420,12 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 			return getErr
 		}
 		return fmt.Errorf("job %q is %s, not running", jobID, latest.State)
+	}
+	// Best-effort outbound emit on the genuine running->terminal transition only
+	// (#446). Gated on transitioned==true so a re-run never double-emits; nil-safe
+	// so the default (no EventSink) path is byte-identical.
+	if m.emitTerminal != nil {
+		m.emitTerminal(ctx, jobID, state, payload)
 	}
 	return nil
 }
