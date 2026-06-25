@@ -5906,3 +5906,38 @@ func TestBuildEscalationCommentIsNotParsedAsCommand(t *testing.T) {
 		t.Fatalf("escalation comment parsed into %d command(s); want 0: %+v\nbody:\n%s", len(cmds), cmds, body)
 	}
 }
+
+// TestBuildAskGateComment pins the #445 ask-gate notification: when the request
+// is flagged Ask, the comment quotes each question (id + prompt + choices) and
+// offers the `answer` resume verb, NOT the failure retry/continue/abort verbs.
+// It must also be unparseable as a command (same regression guard as #340).
+func TestBuildAskGateComment(t *testing.T) {
+	req := workflow.EscalationRequest{
+		CoordinatorJobID: "coord-123",
+		Ask:              true,
+		Questions: []workflow.HumanQuestion{
+			{ID: "q1", Prompt: "Target v2 or v3 API?", Choices: []string{"v2", "v3"}},
+		},
+	}
+	body := buildEscalationComment("jerryfane", req)
+
+	if !strings.Contains(body, "@jerryfane") {
+		t.Fatalf("ask-gate comment dropped the @-mention; body:\n%s", body)
+	}
+	if !strings.Contains(body, "q1") || !strings.Contains(body, "Target v2 or v3 API?") {
+		t.Fatalf("ask-gate comment must quote the question; body:\n%s", body)
+	}
+	if !strings.Contains(body, "choices: v2, v3") {
+		t.Fatalf("ask-gate comment must render choices; body:\n%s", body)
+	}
+	if !strings.Contains(body, "resume coord-123 answer") {
+		t.Fatalf("ask-gate comment must offer the answer verb; body:\n%s", body)
+	}
+	if strings.Contains(body, "retry <instructions>") || strings.Contains(body, "abort` —") {
+		t.Fatalf("ask-gate comment must NOT offer the failure verbs; body:\n%s", body)
+	}
+	// Same command-injection guard as the failure comment.
+	if cmds := daemon.ParseCommands(body); len(cmds) != 0 {
+		t.Fatalf("ask-gate comment parsed into %d command(s); want 0: %+v\nbody:\n%s", len(cmds), cmds, body)
+	}
+}

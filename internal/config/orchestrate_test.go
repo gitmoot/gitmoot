@@ -47,6 +47,9 @@ func TestLoadOrchestratePolicyDefaults(t *testing.T) {
 	if policy.MaxDelegationNonProgressStreak != 0 {
 		t.Fatalf("MaxDelegationNonProgressStreak = %d, want 0 (engine default) by default", policy.MaxDelegationNonProgressStreak)
 	}
+	if policy.MaxVerifyReplanAttempts != 0 {
+		t.Fatalf("MaxVerifyReplanAttempts = %d, want 0 (engine default) by default", policy.MaxVerifyReplanAttempts)
+	}
 }
 
 // TestLoadOrchestratePolicyMaxDelegationNonProgressStreak pins #339: the
@@ -85,6 +88,45 @@ cockpit_mode = "auto"
 	}
 	if policy.MaxDelegationNonProgressStreak != 0 {
 		t.Fatalf("absent max_delegation_non_progress_streak should default 0, got %d", policy.MaxDelegationNonProgressStreak)
+	}
+}
+
+// TestLoadOrchestratePolicyMaxVerifyReplanAttempts pins #439: the verify→replan
+// attempt cap parses from [orchestrate] and an absent key keeps the 0 (engine
+// default) value, mirroring the non-progress-streak test above.
+func TestLoadOrchestratePolicyMaxVerifyReplanAttempts(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[orchestrate]
+max_verify_replan_attempts = 3
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+
+	policy, err := LoadOrchestratePolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadOrchestratePolicy returned error: %v", err)
+	}
+	if policy.MaxVerifyReplanAttempts != 3 {
+		t.Fatalf("MaxVerifyReplanAttempts = %d, want 3", policy.MaxVerifyReplanAttempts)
+	}
+
+	// Absent key keeps the engine-default (0) even with the section present.
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[orchestrate]
+cockpit_mode = "auto"
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	policy, err = LoadOrchestratePolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadOrchestratePolicy returned error: %v", err)
+	}
+	if policy.MaxVerifyReplanAttempts != 0 {
+		t.Fatalf("absent max_verify_replan_attempts should default 0, got %d", policy.MaxVerifyReplanAttempts)
 	}
 }
 
@@ -410,6 +452,22 @@ max_delegation_non_progress_streak = many
 max_delegation_non_progress_streak = -1
 `,
 			wantErr: "max_delegation_non_progress_streak must be 0 (engine default) or positive",
+		},
+		{
+			name: "max_verify_replan_attempts_non_int",
+			body: `
+[orchestrate]
+max_verify_replan_attempts = lots
+`,
+			wantErr: "parse [orchestrate].max_verify_replan_attempts",
+		},
+		{
+			name: "max_verify_replan_attempts_negative",
+			body: `
+[orchestrate]
+max_verify_replan_attempts = -1
+`,
+			wantErr: "max_verify_replan_attempts must be 0 (engine default) or positive",
 		},
 	}
 	for _, tt := range tests {

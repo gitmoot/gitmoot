@@ -23,6 +23,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/events"
 	gitutil "github.com/jerryfane/gitmoot/internal/git"
 	"github.com/jerryfane/gitmoot/internal/github"
 	"github.com/jerryfane/gitmoot/internal/presence"
@@ -1360,6 +1361,24 @@ type jobWorker struct {
 	// it is a shared pointer across all per-repo dispatch passes so the cap is
 	// process-global (host-global for the normal single-daemon deployment).
 	Admission *admissionBudget
+	// EventSinkOverride lets a test inject a recording events.Sink (#446) without
+	// a config file / webhook. When nil (production), eventSink() resolves the
+	// shared process-global webhook sink from [events] config instead.
+	EventSinkOverride events.Sink
+}
+
+// eventSink resolves the best-effort outbound event Sink (#446) for the
+// worker's home, or nil when [events] is OFF (the default). It is the seam
+// finishQueuedJob / handleRunJobError use to emit the DAEMON-owned terminal
+// cases (pre-flight queued->failed/blocked and permission-blocked
+// running->blocked) that never pass through the engine's Mailbox chokepoint. The
+// underlying webhook sink is a process-global singleton, so this is a cheap
+// cache hit on the hot path. A test override short-circuits config resolution.
+func (w jobWorker) eventSink() events.Sink {
+	if w.EventSinkOverride != nil {
+		return w.EventSinkOverride
+	}
+	return daemonEventSink(w.Store, w.workflowHome())
 }
 
 const daemonRunningJobStaleAfter = 30 * time.Minute
@@ -2209,6 +2228,15 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		if err := blockTaskForPermissionBlockedJob(ctx, w.Store, job); err != nil {
 			return err
 		}
+		// Best-effort outbound emit (#446): this PRE-FLIGHT queued->blocked
+		// permission transition is daemon-owned (it never reaches the engine's
+		// Mailbox chokepoint), exactly like the MID-RUN permission block in
+		// handleRunJobError which already emits job.blocked. Emit here too so both
+		// halves of the permission-blocked terminal case are covered; gated on the
+		// genuine transition above, nil-safe when [events] is OFF. The following
+		// finalizePreflightDelegationChild only attaches a synthetic result
+		// (savePayload, no transition), so it never re-emits.
+		emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, job.ID, events.EventJobBlocked, string(workflow.JobBlocked), agentPermissionBlockedMessage)
 		_ = w.postJobResultComment(ctx, job.ID, agent, "", errors.New(agentPermissionBlockedMessage))
 		writeLine(w.Stdout, "job %s blocked: %s", job.ID, agentPermissionBlockedMessage)
 		// A read-only implement DELEGATION child short-circuits to blocked here,
@@ -3551,11 +3579,12 @@ func (w jobWorker) defaultWorkflow(checkout string) workflow.Engine {
 
 // applyOrchestratePolicy sets the engine's opt-in [orchestrate] fields — the
 // artifact-body inlining knobs, the upstream-dep-context injection toggle (#419),
-// the per-root delegation token (#338 Part B) and dollar-cost (#380) budgets, and
-// the result-aware non-progress streak threshold (#339) — from the host policy. It
-// is fail-safe: any load error leaves the engine with its defaults (inlining off,
-// upstream-dep injection off, both budgets 0 = unlimited, streak threshold 0 =
-// engine default) rather than failing engine construction.
+// the per-root delegation token (#338 Part B) and dollar-cost (#380) budgets, the
+// result-aware non-progress streak threshold (#339), and the verify→replan
+// attempt cap (#439) — from the host policy. It is fail-safe: any load error
+// leaves the engine with its defaults (inlining off, upstream-dep injection off,
+// both budgets 0 = unlimited, streak threshold and verify cap 0 = engine default)
+// rather than failing engine construction.
 func (w jobWorker) applyOrchestratePolicy(engine *workflow.Engine) {
 	policy, err := w.orchestratePolicy()
 	if err != nil {
@@ -3567,6 +3596,7 @@ func (w jobWorker) applyOrchestratePolicy(engine *workflow.Engine) {
 	engine.MaxDelegationTokenBudget = policy.MaxDelegationTokenBudget
 	engine.MaxDelegationCostUSD = policy.MaxDelegationCostUSD
 	engine.MaxDelegationNonProgressStreak = policy.MaxDelegationNonProgressStreak
+	engine.MaxVerifyReplanAttempts = policy.MaxVerifyReplanAttempts
 	if notifier, ok := engine.EscalationNotifier.(*daemonEscalationNotifier); ok && notifier != nil {
 		notifier.Handle = policy.EscalationHandle
 	}
@@ -3607,6 +3637,14 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 		// pauses awaiting a decision. Best-effort and nil-safe in the engine; the
 		// handle is filled in from policy by applyOrchestratePolicy.
 		EscalationNotifier: &daemonEscalationNotifier{Store: store, GitHub: gh},
+		// Off-by-default outbound event stream (#446): the engine emits
+		// job.finished/job.failed/job.blocked on its terminal Mailbox path and
+		// job.needs_attention on an escalate_human pause through this best-effort,
+		// nil-safe sink. daemonEventSink returns nil unless [events].webhook_url is
+		// set, so with no config NO sink is constructed and behavior is
+		// byte-identical. The sink is a process-global shared singleton (one drain
+		// goroutine), so re-building the engine per tick never leaks goroutines.
+		EventSink: daemonEventSink(store, home),
 		PayloadRefresher: func(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
 			return refreshDaemonJobPayload(ctx, store, checkout, job, payload)
 		},
@@ -3694,6 +3732,9 @@ func (n *daemonEscalationNotifier) NotifyEscalation(ctx context.Context, request
 // mid-line ("cc @<handle>"), which still notifies them on GitHub but is not
 // parsed as a command.
 func buildEscalationComment(handle string, request workflow.EscalationRequest) string {
+	if request.Ask {
+		return buildAskGateComment(handle, request)
+	}
 	var b strings.Builder
 	b.WriteString("Gitmoot paused a delegation tree awaiting your decision (escalate_human).\n")
 	if h := strings.TrimPrefix(strings.TrimSpace(handle), "@"); h != "" {
@@ -3713,6 +3754,36 @@ func buildEscalationComment(handle string, request workflow.EscalationRequest) s
 	b.WriteString(fmt.Sprintf("- `/gitmoot resume %s retry <instructions>` — re-run the failing leg with your guidance\n", request.CoordinatorJobID))
 	b.WriteString(fmt.Sprintf("- `/gitmoot resume %s continue` — proceed the coordinator with what completed\n", request.CoordinatorJobID))
 	b.WriteString(fmt.Sprintf("- `/gitmoot resume %s abort` — stop and synthesize a best-effort final result\n", request.CoordinatorJobID))
+	return b.String()
+}
+
+// buildAskGateComment renders the @-tag comment for a non-failure ask-gate pause
+// (#445): a HEALTHY coordinator returned human_questions[] to ask a specific
+// decision rather than guess. It quotes each question (id + prompt + choices) and
+// gives the `answer` resume verb instead of the failure verbs. Like
+// buildEscalationComment it never begins a line with "@<handle>" or "/gitmoot"
+// (the human is mentioned mid-line) so the daemon does not parse its own
+// notification as a command.
+func buildAskGateComment(handle string, request workflow.EscalationRequest) string {
+	var b strings.Builder
+	b.WriteString("Gitmoot paused a job awaiting your answer to a question (no work failed; the agent chose to ask instead of guess).\n")
+	if h := strings.TrimPrefix(strings.TrimSpace(handle), "@"); h != "" {
+		b.WriteString("cc @" + h + "\n")
+	}
+	b.WriteString("\nQuestions:\n")
+	if len(request.Questions) > 0 {
+		for _, q := range request.Questions {
+			line := fmt.Sprintf("- `%s`: %s", strings.TrimSpace(q.ID), strings.TrimSpace(q.Prompt))
+			if len(q.Choices) > 0 {
+				line += fmt.Sprintf(" (choices: %s)", strings.Join(q.Choices, ", "))
+			}
+			b.WriteString(line + "\n")
+		}
+	} else if q := strings.TrimSpace(request.Question); q != "" {
+		b.WriteString(q + "\n")
+	}
+	b.WriteString("\nAnswer with:\n")
+	b.WriteString(fmt.Sprintf("- `/gitmoot resume %s answer \"<id>: your answer\"` — one `<id>: ...` line per question\n", request.CoordinatorJobID))
 	return b.String()
 }
 
@@ -4320,6 +4391,16 @@ func (w jobWorker) finishQueuedJob(ctx context.Context, jobID string, state work
 	}
 	if transitioned {
 		writeLine(w.Stdout, "job %s %s: %v", jobID, state, cause)
+		// Best-effort outbound emit (#446) for a DAEMON-owned pre-flight terminal
+		// transition (queued->failed|blocked) — this never reaches the engine's
+		// Mailbox.finishWithPayload chokepoint, so the daemon owns its emit. Gated
+		// on transitioned==true so it fires exactly once per genuine transition;
+		// nil-safe when [events] is OFF. The subsequent finalizePreflightDelegationChild
+		// only attaches a synthetic result via savePayload (no further transition),
+		// so it does not double-emit.
+		if eventType, ok := daemonTerminalEventType(state); ok {
+			emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, eventType, string(state), cause.Error())
+		}
 	}
 	// A delegation child that fails in ANY pre-flight step (checkout/branch-lock
 	// validation, adapter factory, managed config, runtime-session lock/busy,
@@ -4404,6 +4485,12 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, cause er
 				if err := blockTaskForPermissionBlockedJob(ctx, w.Store, latest); err != nil {
 					return err
 				}
+				// Best-effort outbound emit (#446): this running->blocked permission
+				// transition is daemon-owned (it does not pass through the engine's
+				// Mailbox.finishWithPayload chokepoint), so emit job.blocked exactly
+				// once here. The following finalizePreflightDelegationChild only attaches
+				// a synthetic result (savePayload, no transition), so it never re-emits.
+				emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, events.EventJobBlocked, string(workflow.JobBlocked), agentPermissionBlockedMessage)
 				// A WRITABLE implement DELEGATION child whose runtime fails MID-RUN
 				// with a permission error (read-only FS / sandbox denies write) is
 				// transitioned JobRunning->JobBlocked here and returns early — it never

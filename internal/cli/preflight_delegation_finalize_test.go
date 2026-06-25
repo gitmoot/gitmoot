@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/events"
 	"github.com/jerryfane/gitmoot/internal/github"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 	"github.com/jerryfane/gitmoot/internal/workflow"
@@ -619,37 +620,47 @@ func TestPreflightReadOnlyImplementNonDelegationUnaffected(t *testing.T) {
 	}
 }
 
-// TestPreflightAutoImplementIsPermissionBlocked closes the #452 gap: an implement
-// job whose agent has the default auto policy (no write granted headlessly) is now
-// permission-blocked at dispatch with the actionable message, instead of running
-// to completion and producing no files.
-func TestPreflightAutoImplementIsPermissionBlocked(t *testing.T) {
+// TestPreflightReadOnlyImplementEmitsJobBlocked is the regression for the #446
+// review finding: the PRE-FLIGHT readOnlyImplementationBlocked path transitions a
+// job queued->blocked via markJobPermissionBlocked (a daemon-owned terminal
+// transition that never reaches the engine's Mailbox chokepoint), so it must emit
+// job.blocked itself — mirroring the MID-RUN permission block in
+// handleRunJobError. Before the fix this half of the permission-blocked terminal
+// case was silently dropped.
+func TestPreflightReadOnlyImplementEmitsJobBlocked(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	seedDaemonWorkerRepo(t, store, "jerryfane/gitmoot", t.TempDir())
-	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.CodexRuntime, "unused", []string{"implement"}, "jerryfane/gitmoot", runtime.AutonomyPolicyAuto)
+	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.CodexRuntime, "unused", []string{"implement"}, "jerryfane/gitmoot", runtime.AutonomyPolicyReadOnly)
 	job := db.Job{ID: "impl-job", Agent: "lead", Type: "implement", State: string(workflow.JobQueued), Payload: mustJobPayload(t, workflow.JobPayload{
-		Repo: "jerryfane/gitmoot", Branch: "feature", TaskID: "task-impl", TaskTitle: "Solo implement", Sender: "lead",
+		Repo: "jerryfane/gitmoot", Branch: "feature", TaskID: "task-impl", TaskTitle: "Solo implement", Sender: "lead", RootJobID: "root-impl",
 	})}
 	if err := store.CreateJobWithEvent(ctx, job, db.JobEvent{Kind: string(workflow.JobQueued), Message: "seed"}); err != nil {
 		t.Fatalf("CreateJobWithEvent returned error: %v", err)
 	}
 
+	sink := &recordingSink{}
 	worker := defaultJobWorker(store, io.Discard)
-	worker.WorkflowFactory = func(string) workflow.Engine {
-		t.Fatal("permission-blocked auto implement must not build an engine")
-		return workflow.Engine{}
-	}
+	worker.EventSinkOverride = sink
 
 	if err := worker.run(ctx, mustWorkerJob(t, store, "impl-job")); err != nil {
-		t.Fatalf("worker.run(auto implement) returned error: %v", err)
+		t.Fatalf("worker.run(read-only implement) returned error: %v", err)
 	}
 	got := mustWorkerJob(t, store, "impl-job")
 	if got.State != string(workflow.JobBlocked) {
 		t.Fatalf("job state = %q, want blocked", got.State)
 	}
-	if n := countWorkerJobEvents(t, store, "impl-job", "permission_blocked"); n == 0 {
-		t.Fatalf("expected a permission_blocked event for an auto-policy implement job")
+
+	blocked := sink.byType(events.EventJobBlocked)
+	if len(blocked) != 1 {
+		t.Fatalf("job.blocked emissions = %d, want exactly 1; all=%+v", len(blocked), sink.events)
+	}
+	ev := blocked[0]
+	if ev.JobID != "impl-job" || ev.RootID != "root-impl" || ev.Repo != "jerryfane/gitmoot" || ev.Status != string(workflow.JobBlocked) {
+		t.Fatalf("job.blocked event = %+v", ev)
+	}
+	if ev.Detail != agentPermissionBlockedMessage {
+		t.Fatalf("detail = %q, want the permission-blocked message", ev.Detail)
 	}
 }
 

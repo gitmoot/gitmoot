@@ -18,7 +18,7 @@ func TestContinuationPromptAnchorsGoalAndReconcileFraming(t *testing.T) {
 	children := map[string]db.Job{"a": {ID: "p/delegation/a", Agent: "a", State: string(JobSucceeded)}}
 	childPayloads := map[string]JobPayload{"a": {Result: &AgentResult{Decision: "done", Summary: "quicksort fastest"}}}
 
-	prompt := Engine{}.buildContinuationPrompt(goal, "", &AgentResult{Delegations: dels}, children, childPayloads)
+	prompt := Engine{}.buildContinuationPrompt(goal, "", &AgentResult{Delegations: dels}, children, childPayloads, "")
 
 	if !strings.Contains(prompt, "Original goal:\n"+goal) {
 		t.Fatalf("continuation prompt missing the Original goal header for %q:\n%s", goal, prompt)
@@ -51,7 +51,7 @@ func TestContinuationPromptOmitsEmptyGoalHeader(t *testing.T) {
 	childPayloads := map[string]JobPayload{"a": {Result: &AgentResult{Decision: "done", Summary: "s"}}}
 
 	for _, goal := range []string{"", "   \n\t  "} {
-		prompt := Engine{}.buildContinuationPrompt(goal, "", &AgentResult{Delegations: dels}, children, childPayloads)
+		prompt := Engine{}.buildContinuationPrompt(goal, "", &AgentResult{Delegations: dels}, children, childPayloads, "")
 		if strings.Contains(prompt, "Original goal:") {
 			t.Fatalf("empty goal %q must omit the Original goal header:\n%s", goal, prompt)
 		}
