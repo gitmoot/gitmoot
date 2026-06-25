@@ -4538,3 +4538,287 @@ func TestEngineResultAwareStreakIdempotentOnReadvance(t *testing.T) {
 		t.Fatalf("delegation_continuation_enqueued fired %d times under re-advance, want 1", got)
 	}
 }
+
+// --- #451: actionable delegation preflight errors + corrective continuation ---
+
+// preflightFailureReason returns the message of the single delegation_preflight_failed
+// event on jobID, failing the test if absent.
+func preflightFailureReason(t *testing.T, store *db.Store, jobID string) string {
+	t.Helper()
+	msg := jobEventMessage(t, store, jobID, "delegation_preflight_failed")
+	if msg == "" {
+		t.Fatalf("expected a delegation_preflight_failed event on %s", jobID)
+	}
+	return msg
+}
+
+func TestEngineDelegationPreflightRuntimeNameMixup(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coordinator", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "shipper", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	// The coordinator names the runtime "claude" instead of a registered agent.
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coordinator", Type: "ask"}, JobPayload{
+		Repo:   "jerryfane/gitmoot",
+		Sender: "coordinator",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "fan out",
+			Delegations: []Delegation{
+				{ID: "impl", Agent: "claude", Action: "review", Prompt: "do it"},
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob returned error (want nil, not BlockedError): %v", err)
+	}
+	if jobExists(t, store, "parent-job/delegation/impl") {
+		t.Fatalf("no child must be dispatched for an unroutable delegation set")
+	}
+	reason := preflightFailureReason(t, store, "parent-job")
+	for _, want := range []string{"is a runtime, not a registered agent", "shipper", "ephemeral"} {
+		if !strings.Contains(reason, want) {
+			t.Fatalf("preflight reason %q missing %q", reason, want)
+		}
+	}
+	// The coordinator is re-invoked via a corrective continuation, not blocked.
+	if !jobExists(t, store, delegationContinuationID("parent-job")) {
+		t.Fatalf("expected a corrective continuation for the coordinator")
+	}
+	if got := countJobEvents(t, store, "parent-job", "delegation_continuation_enqueued"); got != 1 {
+		t.Fatalf("delegation_continuation_enqueued = %d, want 1", got)
+	}
+}
+
+func TestEngineDelegationPreflightUnknownAgentNoRuntimeLine(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coordinator", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "shipper", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	// A typo'd, non-runtime agent name: list available agents, no runtime line.
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coordinator", Type: "ask"}, JobPayload{
+		Repo:   "jerryfane/gitmoot",
+		Sender: "coordinator",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "fan out",
+			Delegations: []Delegation{
+				{ID: "impl", Agent: "shippr", Action: "review", Prompt: "do it"},
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	reason := preflightFailureReason(t, store, "parent-job")
+	if !strings.Contains(reason, "is not subscribed") || !strings.Contains(reason, "shipper") {
+		t.Fatalf("preflight reason %q missing 'is not subscribed' or available agents", reason)
+	}
+	if strings.Contains(reason, "is a runtime, not a registered agent") {
+		t.Fatalf("non-runtime typo must NOT get the runtime-mixup line: %q", reason)
+	}
+}
+
+func TestEngineDelegationPreflightAgentNamedClaudeNoFalseTrigger(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coordinator", []string{"ask"}, "jerryfane/gitmoot")
+	// A legitimately-registered, capable agent literally named "claude".
+	seedAgent(t, store, "claude", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coordinator", Type: "ask"}, JobPayload{
+		Repo:   "jerryfane/gitmoot",
+		Sender: "coordinator",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "fan out",
+			Delegations: []Delegation{
+				{ID: "impl", Agent: "claude", Action: "review", Prompt: "do it"},
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	child := mustJob(t, store, "parent-job/delegation/impl")
+	if child.Agent != "claude" || child.State != string(JobQueued) {
+		t.Fatalf("a registered agent named 'claude' must dispatch normally: %+v", child)
+	}
+	if countJobEvents(t, store, "parent-job", "delegation_preflight_failed") != 0 {
+		t.Fatalf("a routable agent must not emit a preflight failure")
+	}
+}
+
+func TestEngineDelegationPreflightNotAllowedOnRepo(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coordinator", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "helper", []string{"review"}, "jerryfane/gitmoot")
+	// shipper exists and is capable but is scoped to a DIFFERENT repo.
+	seedAgent(t, store, "shipper", []string{"review"}, "other/repo")
+	engine := testEngine(store)
+
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coordinator", Type: "ask"}, JobPayload{
+		Repo:   "jerryfane/gitmoot",
+		Sender: "coordinator",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "fan out",
+			Delegations: []Delegation{
+				{ID: "impl", Agent: "shipper", Action: "review", Prompt: "do it"},
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	reason := preflightFailureReason(t, store, "parent-job")
+	if !strings.Contains(reason, "is not allowed on") || !strings.Contains(reason, "helper") {
+		t.Fatalf("not-allowed reason %q missing 'is not allowed on' or available agents", reason)
+	}
+	if strings.Contains(reason, "is a runtime, not a registered agent") {
+		t.Fatalf("an existing agent must NOT get the runtime-mixup line: %q", reason)
+	}
+}
+
+func TestEngineDelegationPreflightLacksCapability(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coordinator", []string{"ask"}, "jerryfane/gitmoot")
+	// shipper is on the repo but cannot do "review".
+	seedAgent(t, store, "shipper", []string{"ask"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coordinator", Type: "ask"}, JobPayload{
+		Repo:   "jerryfane/gitmoot",
+		Sender: "coordinator",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "fan out",
+			Delegations: []Delegation{
+				{ID: "impl", Agent: "shipper", Action: "review", Prompt: "do it"},
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	reason := preflightFailureReason(t, store, "parent-job")
+	if !strings.Contains(reason, "lacks") || !strings.Contains(reason, "capability") {
+		t.Fatalf("lacks-capability reason %q missing the capability phrasing", reason)
+	}
+	if !strings.Contains(reason, "ephemeral") {
+		t.Fatalf("lacks-capability reason %q must mention the ephemeral option", reason)
+	}
+}
+
+func TestEngineDelegationPreflightDeferredLeg(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coordinator", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "helper", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	// del-2 is DEFERRED (depends on del-1) and names a runtime; the upfront preflight
+	// must catch it and route the whole set through the corrective continuation
+	// without dispatching the ready leg del-1.
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coordinator", Type: "ask"}, JobPayload{
+		Repo:   "jerryfane/gitmoot",
+		Sender: "coordinator",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "fan out",
+			Delegations: []Delegation{
+				{ID: "del-1", Agent: "helper", Action: "review", Prompt: "first"},
+				{ID: "del-2", Agent: "claude", Action: "review", Prompt: "second", Deps: []string{"del-1"}},
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	if jobExists(t, store, "parent-job/delegation/del-1") {
+		t.Fatalf("atomic preflight must not dispatch the ready leg when a deferred leg is unroutable")
+	}
+	if countJobEvents(t, store, "parent-job", "delegation_preflight_failed") != 1 {
+		t.Fatalf("the deferred bad-agent leg must trigger exactly one preflight failure")
+	}
+}
+
+func TestEngineDelegationPreflightIdempotentReadvance(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coordinator", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "helper", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coordinator", Type: "ask"}, JobPayload{
+		Repo:   "jerryfane/gitmoot",
+		Sender: "coordinator",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "fan out",
+			Delegations: []Delegation{
+				{ID: "impl", Agent: "claude", Action: "review", Prompt: "do it"},
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("first AdvanceJob returned error: %v", err)
+	}
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("second AdvanceJob returned error: %v", err)
+	}
+	if got := countJobEvents(t, store, "parent-job", "delegation_preflight_failed"); got != 1 {
+		t.Fatalf("delegation_preflight_failed fired %d times under re-advance, want 1", got)
+	}
+	if got := countJobEvents(t, store, "parent-job", "delegation_continuation_enqueued"); got != 1 {
+		t.Fatalf("delegation_continuation_enqueued fired %d times under re-advance, want 1", got)
+	}
+}
+
+func TestEngineDelegationPreflightBoundedFinalize(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coordinator", []string{"ask"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	// A coordinator generation that has already taken a corrective nudge
+	// (DelegationRepeatCount >= 1) and is at the streak threshold must finalize
+	// gracefully rather than loop, when it again names an unroutable agent.
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coordinator", Type: "ask"}, JobPayload{
+		Repo:                  "jerryfane/gitmoot",
+		Sender:                "coordinator",
+		DelegationRepeatCount: 1,
+		NonProgressStreak:     engine.nonProgressStreakThreshold() - 1,
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "fan out again",
+			Delegations: []Delegation{
+				{ID: "impl", Agent: "claude", Action: "review", Prompt: "do it"},
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	if countJobEvents(t, store, "parent-job", "delegation_finalize_enqueued") != 1 {
+		t.Fatalf("a repeated unroutable set after a nudge must finalize gracefully")
+	}
+	if countJobEvents(t, store, "parent-job", "delegation_preflight_failed") != 1 {
+		t.Fatalf("the finalize path must still record the structured preflight failure")
+	}
+}
