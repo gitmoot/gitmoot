@@ -2,6 +2,9 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -529,5 +532,203 @@ func TestAdvanceDelegationsUpstreamIdempotentReEnqueue(t *testing.T) {
 	}
 	if c := strings.Count(second.Instructions, "Upstream dependency results:"); c != 1 {
 		t.Fatalf("upstream block injected %d times, want exactly 1\n%s", c, second.Instructions)
+	}
+}
+
+// --- #438: structured upstream dep references in context-manifest.json (engine) ---
+
+// seedManifestParent inserts a coordinator parent whose research->write pipeline
+// requests artifacts (so the context manifest is written), mirroring the #419
+// engine fixtures but with Artifacts + an ArtifactBody so the manifest exists.
+func seedManifestParent(t *testing.T, store *db.Store) {
+	t.Helper()
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "researcher", []string{"review"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "writer", []string{"review"}, "jerryfane/gitmoot")
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		Branch:    "task-438",
+		TaskID:    "task-438",
+		TaskTitle: "Parent",
+		Sender:    "coord",
+		Result: &AgentResult{
+			Decision:     "approved",
+			Summary:      "done",
+			ArtifactBody: "# Shared brief\n",
+			Delegations: []Delegation{
+				{ID: "research", Agent: "researcher", Action: "review", Prompt: "research the topic", Artifacts: []string{"brief.md"}},
+				{ID: "write", Agent: "writer", Action: "review", Prompt: "WRITE_REPORT_PROMPT", Deps: []string{"research"}},
+			},
+		},
+	})
+}
+
+func readManifest(t *testing.T, root string) delegationManifest {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(root, "delegations", "parent-job", "context-manifest.json"))
+	if err != nil {
+		t.Fatalf("read context-manifest.json: %v", err)
+	}
+	var manifest delegationManifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		t.Fatalf("manifest not valid JSON: %v", err)
+	}
+	return manifest
+}
+
+// TestAdvanceDelegationsEnrichesManifestWhenEnabled is the #438 engine pin: with
+// InjectUpstreamDepContext set, after research succeeds and advanceDelegations
+// runs, context-manifest.json's research entry carries the structured
+// result-reference fields while the still-pending write entry stays reduced.
+func TestAdvanceDelegationsEnrichesManifestWhenEnabled(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.InjectUpstreamDepContext = true
+	engine.ArtifactRoot = t.TempDir()
+	seedManifestParent(t, store)
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob(parent) returned error: %v", err)
+	}
+	completeDelegationChild(t, store, "parent-job/delegation/research", JobSucceeded, AgentResult{
+		Decision: "approved", Summary: "RESEARCH_FINDINGS_SUMMARY", ChangesMade: []string{"x", "y"}, ArtifactBody: "RESEARCH_BODY",
+	})
+	if err := engine.AdvanceJob(ctx, "parent-job/delegation/research"); err != nil {
+		t.Fatalf("AdvanceJob(research) returned error: %v", err)
+	}
+
+	manifest := readManifest(t, engine.ArtifactRoot)
+	if len(manifest.Delegations) != 2 {
+		t.Fatalf("manifest delegations = %d, want 2", len(manifest.Delegations))
+	}
+	research, write := manifest.Delegations[0], manifest.Delegations[1]
+	if research.ID != "research" {
+		t.Fatalf("entry[0] = %q, want research", research.ID)
+	}
+	if research.Decision != "approved" {
+		t.Fatalf("research decision = %q, want approved", research.Decision)
+	}
+	if research.SummaryPreview != "RESEARCH_FINDINGS_SUMMARY" {
+		t.Fatalf("research summary_preview = %q", research.SummaryPreview)
+	}
+	if research.ChangesMade != 2 {
+		t.Fatalf("research changes_made = %d, want 2", research.ChangesMade)
+	}
+	if want := engine.inlineBriefPath("parent-job/delegation/research"); research.OutputPath != want {
+		t.Fatalf("research output_path = %q, want %q", research.OutputPath, want)
+	}
+	// output_path must reference the brief.md that actually exists on disk.
+	if _, err := os.Stat(research.OutputPath); err != nil {
+		t.Fatalf("research output_path does not exist on disk: %v", err)
+	}
+	if len(research.DerivedFrom) != 0 {
+		t.Fatalf("research derived_from = %v, want empty (no declared deps)", research.DerivedFrom)
+	}
+	// The still-pending write entry stays reduced.
+	if write.ID != "write" {
+		t.Fatalf("entry[1] = %q, want write", write.ID)
+	}
+	if write.Decision != "" || write.SummaryPreview != "" || write.OutputPath != "" {
+		t.Fatalf("pending write entry must stay reduced: %+v", write)
+	}
+	if len(write.DerivedFrom) != 0 { // not enriched -> derived_from omitted even though it has deps
+		t.Fatalf("pending write entry derived_from = %v, want omitted", write.DerivedFrom)
+	}
+}
+
+// TestAdvanceDelegationsManifestFlagOffByteIdentical is the load-bearing parity
+// pin: with InjectUpstreamDepContext off, the bytes of context-manifest.json after
+// the full research->write advance are byte-identical to the flag-off dispatch-time
+// manifest (no enrichment, no rewrite-induced churn). Sanity: flag-on bytes differ.
+func TestAdvanceDelegationsManifestFlagOffByteIdentical(t *testing.T) {
+	run := func(t *testing.T, inject bool) []byte {
+		t.Helper()
+		ctx := context.Background()
+		store := openEngineStore(t)
+		engine := testEngine(store)
+		engine.InjectUpstreamDepContext = inject
+		engine.ArtifactRoot = t.TempDir()
+		seedManifestParent(t, store)
+
+		if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+			t.Fatalf("AdvanceJob(parent) returned error: %v", err)
+		}
+		completeDelegationChild(t, store, "parent-job/delegation/research", JobSucceeded, AgentResult{
+			Decision: "approved", Summary: "RESEARCH_FINDINGS_SUMMARY", ArtifactBody: "RESEARCH_BODY",
+		})
+		if err := engine.AdvanceJob(ctx, "parent-job/delegation/research"); err != nil {
+			t.Fatalf("AdvanceJob(research) returned error: %v", err)
+		}
+		raw, err := os.ReadFile(filepath.Join(engine.ArtifactRoot, "delegations", "parent-job", "context-manifest.json"))
+		if err != nil {
+			t.Fatalf("read context-manifest.json: %v", err)
+		}
+		return raw
+	}
+
+	// The dispatch-time reduced manifest, written by writeDelegationArtifacts, is
+	// the byte target the flag-off advance must NOT have changed.
+	dispatchRoot := t.TempDir()
+	dispatchResult := &AgentResult{
+		ArtifactBody: "# Shared brief\n",
+		Delegations: []Delegation{
+			{ID: "research", Agent: "researcher", Action: "review", Artifacts: []string{"brief.md"}},
+			{ID: "write", Agent: "writer", Action: "review", Deps: []string{"research"}},
+		},
+	}
+	if _, err := writeDelegationArtifacts(dispatchRoot, "parent-job", dispatchResult); err != nil {
+		t.Fatalf("writeDelegationArtifacts returned error: %v", err)
+	}
+	dispatchBytes, err := os.ReadFile(filepath.Join(dispatchRoot, "delegations", "parent-job", "context-manifest.json"))
+	if err != nil {
+		t.Fatalf("read dispatch manifest: %v", err)
+	}
+
+	off := run(t, false)
+	if string(off) != string(dispatchBytes) {
+		t.Fatalf("flag-off manifest changed after advance:\n--- dispatch ---\n%s\n--- after advance ---\n%s", dispatchBytes, off)
+	}
+	on := run(t, true)
+	if string(on) == string(off) {
+		t.Fatalf("flag-on manifest unexpectedly identical to flag-off; enrichment not wired")
+	}
+}
+
+// TestAdvanceDelegationsManifestIdempotentReAugment pins that re-running AdvanceJob
+// after the dependent is enqueued does not change context-manifest.json bytes
+// (stable sorted JSON, no double-write drift).
+func TestAdvanceDelegationsManifestIdempotentReAugment(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.InjectUpstreamDepContext = true
+	engine.ArtifactRoot = t.TempDir()
+	seedManifestParent(t, store)
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob(parent) returned error: %v", err)
+	}
+	completeDelegationChild(t, store, "parent-job/delegation/research", JobSucceeded, AgentResult{
+		Decision: "approved", Summary: "RESEARCH_FINDINGS_SUMMARY", ArtifactBody: "RESEARCH_BODY",
+	})
+	if err := engine.AdvanceJob(ctx, "parent-job/delegation/research"); err != nil {
+		t.Fatalf("first AdvanceJob(research) returned error: %v", err)
+	}
+	manifestPath := filepath.Join(engine.ArtifactRoot, "delegations", "parent-job", "context-manifest.json")
+	first, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest #1: %v", err)
+	}
+
+	if err := engine.AdvanceJob(ctx, "parent-job/delegation/research"); err != nil {
+		t.Fatalf("second AdvanceJob(research) returned error: %v", err)
+	}
+	second, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest #2: %v", err)
+	}
+	if string(first) != string(second) {
+		t.Fatalf("re-augment changed manifest bytes:\n--- first ---\n%s\n--- second ---\n%s", first, second)
 	}
 }

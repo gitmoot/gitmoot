@@ -262,6 +262,88 @@ func TestToTUISnapshotCarriesPromptDetails(t *testing.T) {
 	}
 }
 
+// TestDashboardSnapshotSurfacesDelegationPreflightFailure verifies the dashboard
+// snapshot flags a coordinator whose delegation fan-out could not be routed
+// (#451). Such a coordinator ends succeeded (it took a corrective continuation),
+// so neither its state nor its overall-latest event reveals the zero-child
+// fan-out — the snapshot must mark it PreflightFailed with the reason as the
+// row's "why", and that must flow through to the TUI snapshot. Mirrors the
+// `job list` PREFLIGHT_FAILED treatment, reusing the same store helper.
+func TestDashboardSnapshotSurfacesDelegationPreflightFailure(t *testing.T) {
+	home := dashboardTestHome(t)
+	store := openCLIJobStore(t, home)
+	seedCLIJob(t, store, db.Job{
+		ID:      "coord-1",
+		Agent:   "coordinator",
+		Type:    "ask",
+		State:   string(workflow.JobSucceeded),
+		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Branch: "main"}),
+	}, "succeeded")
+	if err := store.AddJobEvent(context.Background(), db.JobEvent{
+		JobID:   "coord-1",
+		Kind:    "delegation_preflight_failed",
+		Message: `delegation "impl": "claude" is a runtime, not a registered agent`,
+	}); err != nil {
+		t.Fatalf("AddJobEvent returned error: %v", err)
+	}
+	// A later continuation event becomes the overall-latest event, so a
+	// latest-event-only surface would miss the preflight reason.
+	if err := store.AddJobEvent(context.Background(), db.JobEvent{
+		JobID:   "coord-1",
+		Kind:    "delegation_continuation_enqueued",
+		Message: "preflight corrective continuation",
+	}); err != nil {
+		t.Fatalf("AddJobEvent returned error: %v", err)
+	}
+	store.Close()
+
+	paths, err := initializedPaths(home)
+	if err != nil {
+		t.Fatalf("initializedPaths: %v", err)
+	}
+	snap, err := buildDashboardSnapshot(home, paths)
+	if err != nil {
+		t.Fatalf("buildDashboardSnapshot: %v", err)
+	}
+
+	var row *dashboardJobRow
+	for i := range snap.jobRows {
+		if snap.jobRows[i].ID == "coord-1" {
+			row = &snap.jobRows[i]
+			break
+		}
+	}
+	if row == nil {
+		t.Fatalf("coord-1 not in jobRows: %+v", snap.jobRows)
+	}
+	if !row.PreflightFailed {
+		t.Fatalf("coord-1 should be flagged PreflightFailed: %+v", row)
+	}
+	if !strings.Contains(row.LatestEvent, "is a runtime, not a registered agent") {
+		t.Fatalf("preflight reason should be the row's why, got %q", row.LatestEvent)
+	}
+	if row.Repo != "owner/repo" {
+		t.Fatalf("repo should be parsed for attention grouping, got %q", row.Repo)
+	}
+
+	tuiSnap := toTUISnapshot(snap)
+	var found bool
+	for _, jr := range tuiSnap.JobRows {
+		if jr.ID == "coord-1" {
+			found = true
+			if !jr.PreflightFailed {
+				t.Fatalf("tui JobRow should carry PreflightFailed: %+v", jr)
+			}
+			if !strings.Contains(jr.LatestEvent, "is a runtime, not a registered agent") {
+				t.Fatalf("tui JobRow should carry the reason, got %q", jr.LatestEvent)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("coord-1 missing from tui snapshot JobRows")
+	}
+}
+
 // TestDashboardTUIDepsActions exercises the injected Answer/Dismiss closures end
 // to end against a real store, the same APIs the model will call.
 func TestDashboardTUIDepsActions(t *testing.T) {

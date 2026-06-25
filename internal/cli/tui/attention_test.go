@@ -170,6 +170,45 @@ func TestAnswerDoubleSubmitSuppressed(t *testing.T) {
 	}
 }
 
+// A coordinator whose delegation fan-out could not be routed (#451) ends
+// succeeded — not blocked/failed — so it is not jobReportable by state. The
+// PreflightFailed flag must still surface it on the Attention page (with its
+// reason), or the zero-child fan-out this issue set out to fix stays invisible.
+func TestAttentionSurfacesPreflightFailedCoordinator(t *testing.T) {
+	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
+	snap := Snapshot{
+		Daemon: Daemon{Running: true},
+		JobRows: []JobRow{
+			{
+				ID:              "coord-1",
+				Type:            "ask",
+				State:           "succeeded",
+				PreflightFailed: true,
+				LatestEvent:     "PREFLIGHT_FAILED: \"claude\" is a runtime, not a registered agent",
+				Repo:            "owner/repo",
+			},
+			{ID: "plain", Type: "merge", State: "succeeded"}, // ordinary success, excluded
+		},
+	}
+	m := attentionModel(t, deps, snap)
+	view := m.View()
+
+	if !strings.Contains(view, "Blocked, failed & preflight-failed jobs (1)") {
+		t.Fatalf("expected widened section title incl. preflight-failed (1):\n%s", view)
+	}
+	if !strings.Contains(view, "coord-1") {
+		t.Fatalf("preflight-failed coordinator should be listed:\n%s", view)
+	}
+	// The reason is rendered as the one-line 'why' (truncated for the row width),
+	// so assert on the leading, non-truncated portion.
+	if !strings.Contains(view, "PREFLIGHT_FAILED:") || !strings.Contains(view, "is a runtime") {
+		t.Fatalf("preflight reason should be the one-line 'why':\n%s", view)
+	}
+	if strings.Contains(view, "plain") {
+		t.Fatalf("ordinary succeeded job should not be listed:\n%s", view)
+	}
+}
+
 func TestAttentionGroupsUnderSectionHeaders(t *testing.T) {
 	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
 	snap := Snapshot{

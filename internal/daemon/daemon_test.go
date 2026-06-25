@@ -151,7 +151,7 @@ func TestPollOnceRoutesPullRequestUpdatesToWorkflow(t *testing.T) {
 		RuntimeRef:     "last",
 		RepoScope:      repo.FullName(),
 		Capabilities:   []string{"implement"},
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: "workspace-write",
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent lead returned error: %v", err)
@@ -231,7 +231,7 @@ func TestHandlePullRequestWorkflowSkipsReviewFanoutWhenLockSet(t *testing.T) {
 		RuntimeRef:     "last",
 		RepoScope:      repo.FullName(),
 		Capabilities:   []string{"implement"},
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: "workspace-write",
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent lead returned error: %v", err)
@@ -320,7 +320,7 @@ func TestHandlePullRequestWorkflowFansOutWhenLockUnset(t *testing.T) {
 		RuntimeRef:     "last",
 		RepoScope:      repo.FullName(),
 		Capabilities:   []string{"implement"},
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: "workspace-write",
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent lead returned error: %v", err)
@@ -387,7 +387,7 @@ func TestPollOnceRetriesPullRequestWorkflowAfterRoutingFailure(t *testing.T) {
 		RuntimeRef:     "last",
 		RepoScope:      repo.FullName(),
 		Capabilities:   []string{"implement"},
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: "workspace-write",
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent lead returned error: %v", err)
@@ -466,7 +466,7 @@ func TestPollOnceRecordsAlreadyRoutedPullRequestWithoutDuplicateReviewRound(t *t
 		RuntimeRef:     "last",
 		RepoScope:      repo.FullName(),
 		Capabilities:   []string{"implement"},
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: "workspace-write",
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent lead returned error: %v", err)
@@ -585,7 +585,7 @@ func TestPollOnceReroutesLegacyReviewWithoutHeadSHA(t *testing.T) {
 		RuntimeRef:     "last",
 		RepoScope:      repo.FullName(),
 		Capabilities:   []string{"implement"},
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: "workspace-write",
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent lead returned error: %v", err)
@@ -696,7 +696,7 @@ func TestPollOnceReconcilesReviewingPullRequestWithApprovedCurrentReview(t *test
 		RuntimeRef:     "last",
 		RepoScope:      repo.FullName(),
 		Capabilities:   []string{"implement"},
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: "workspace-write",
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent lead returned error: %v", err)
@@ -812,7 +812,7 @@ func TestPollOnceRetriesReadyToMergePullRequestWithoutHeadChange(t *testing.T) {
 		RuntimeRef:     "last",
 		RepoScope:      repo.FullName(),
 		Capabilities:   []string{"implement"},
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: "workspace-write",
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent returned error: %v", err)
@@ -876,7 +876,7 @@ func TestPollOnceRetriesReadyToMergePullRequestAfterBranchUpdateHeadChange(t *te
 		RuntimeRef:     "last",
 		RepoScope:      repo.FullName(),
 		Capabilities:   []string{"implement"},
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: "workspace-write",
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent returned error: %v", err)
@@ -1003,7 +1003,7 @@ func TestPollOnceDoesNotOverwriteNoReviewerAutoMerge(t *testing.T) {
 		RuntimeRef:     "last",
 		RepoScope:      repo.FullName(),
 		Capabilities:   []string{"implement"},
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: "workspace-write",
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent lead returned error: %v", err)
@@ -1066,7 +1066,7 @@ func TestPollOnceRoutesPullRequestWithEmptyStoredHeadSHA(t *testing.T) {
 		RuntimeRef:     "last",
 		RepoScope:      repo.FullName(),
 		Capabilities:   []string{"implement"},
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: "workspace-write",
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent lead returned error: %v", err)
@@ -1140,7 +1140,7 @@ func TestPollOnceDoesNotTreatManualReviewJobAsWorkflowRoute(t *testing.T) {
 		RuntimeRef:     "last",
 		RepoScope:      repo.FullName(),
 		Capabilities:   []string{"implement"},
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: "workspace-write",
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent lead returned error: %v", err)
@@ -1375,7 +1375,7 @@ func TestPollOnceAcknowledgesMissingCapabilityWithoutJob(t *testing.T) {
 		RuntimeRef:     "last",
 		RepoScope:      repo.FullName(),
 		Capabilities:   []string{"implement"},
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: "workspace-write",
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent returned error: %v", err)
@@ -1408,7 +1408,7 @@ func TestPollOnceRejectsImplementWithoutBranchLock(t *testing.T) {
 		RuntimeRef:     "last",
 		RepoScope:      repo.FullName(),
 		Capabilities:   []string{"implement"},
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: "workspace-write",
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent returned error: %v", err)
@@ -1930,7 +1930,7 @@ func TestPollOnceQueuesImplementWithBranchLock(t *testing.T) {
 		RuntimeRef:     "last",
 		RepoScope:      repo.FullName(),
 		Capabilities:   []string{"implement"},
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: "workspace-write",
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent returned error: %v", err)

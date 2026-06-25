@@ -10,11 +10,19 @@ import (
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
-const agentPermissionBlockedMessage = "This Gitmoot worker does not have write permissions, so implementation was not started. Start or subscribe a writable worker for implementation tasks, then rerun."
+const agentPermissionBlockedMessage = "This Gitmoot worker does not have write permissions, so implementation was not started. Set --policy danger-full-access for full headless implementation (file writes plus go/git/gh via Bash), or --policy workspace-write for edits-only (acceptEdits; does NOT unblock Bash, so go/git/gh stay blocked). Then start or subscribe a writable worker and rerun."
 
+// readOnlyImplementationBlocked reports whether an implement job must be refused
+// because its agent's autonomy policy grants no headless write. This now covers
+// BOTH read-only AND auto/empty (the default): auto emits no --permission-mode, so
+// its write capability is inherited from ambient Claude config and is
+// non-deterministic across hosts — fail-closed is the safe default. The shared
+// runtime predicate backs every fail-closed seam so the rule stays consistent.
 func readOnlyImplementationBlocked(jobType string, agent runtime.Agent) bool {
-	return strings.TrimSpace(jobType) == "implement" &&
-		runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) == runtime.AutonomyPolicyReadOnly
+	if strings.TrimSpace(jobType) != "implement" {
+		return false
+	}
+	return !runtime.PolicyGrantsImplementWrite(agent.AutonomyPolicy)
 }
 
 func markJobPermissionBlocked(ctx context.Context, store *db.Store, jobID string) (bool, error) {

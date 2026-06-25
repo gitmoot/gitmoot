@@ -249,3 +249,94 @@ func TestHandleResumeRequiresWorkflowEngine(t *testing.T) {
 		t.Fatalf("expected a not-configured ack, got %+v", client.posted)
 	}
 }
+
+// askGateFixture seeds a HEALTHY coordinator whose result carries
+// human_questions[] (#445) and drives it to the awaiting_human ask pause. The
+// coordinator id is "coord" with PR #7.
+func askGateFixture(t *testing.T, store *db.Store) (*workflow.Engine, github.PullRequest) {
+	t.Helper()
+	ctx := context.Background()
+	repo := "jerryfane/gitmoot"
+	seedResumeAgent(t, store, "coord", []string{"ask"}, repo)
+
+	engine := &workflow.Engine{
+		Store: store,
+		JobID: func(request workflow.JobRequest) string { return request.ID },
+	}
+
+	coordPayload := workflow.JobPayload{
+		Repo:        repo,
+		Branch:      "task-7",
+		PullRequest: 7,
+		TaskID:      "task-7",
+		TaskTitle:   "Parent",
+		Sender:      "coord",
+		Result: &workflow.AgentResult{
+			Decision: "approved",
+			Summary:  "need a decision",
+			HumanQuestions: []workflow.HumanQuestion{
+				{ID: "q1", Prompt: "Target v2 or v3 API?", Choices: []string{"v2", "v3"}},
+			},
+		},
+	}
+	createResumeJob(t, store, db.Job{ID: "coord", Agent: "coord", Type: "ask"}, coordPayload)
+	if err := engine.AdvanceJob(ctx, "coord"); err == nil {
+		t.Fatal("AdvanceJob(coord) should return AwaitingHumanError for an ask-gate result")
+	}
+
+	task, err := store.GetTask(ctx, "task-7")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskAwaitingHuman) {
+		t.Fatalf("task state = %q, want awaiting_human", task.State)
+	}
+	return engine, github.PullRequest{Number: 7, HeadRef: "task-7", HeadSHA: "abc"}
+}
+
+func TestHandleResumeAnswerEnqueuesContinuation(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	engine, pull := askGateFixture(t, store)
+	client := &fakeGitHub{}
+	d := Daemon{Repo: github.Repository{Owner: "jerryfane", Name: "gitmoot"}, Store: store, GitHub: client, Workflow: engine}
+
+	if err := d.handleResumeCommand(ctx, pull, Command{Action: "resume", JobID: "coord", Decision: "answer", Instructions: "q1: v3"}); err != nil {
+		t.Fatalf("handleResumeCommand(answer) returned error: %v", err)
+	}
+	job, err := store.GetJob(ctx, "coord/continuation")
+	if err != nil {
+		t.Fatalf("answer must enqueue the coordinator continuation: %v", err)
+	}
+	var payload workflow.JobPayload
+	if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+		t.Fatalf("unmarshal continuation payload: %v", err)
+	}
+	if !strings.Contains(payload.HumanAnswer, "v3") {
+		t.Fatalf("continuation must carry the human answer: %+v", payload.HumanAnswer)
+	}
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "resumed job `coord` with `answer`") {
+		t.Fatalf("ack = %+v", client.posted)
+	}
+}
+
+// TestHandleResumeAnswerRejectedOnFailureRound proves the verb/round-kind gate is
+// enforced through the daemon: `answer` on a failure escalation round is rejected
+// with a clear ack and no continuation is enqueued.
+func TestHandleResumeAnswerRejectedOnFailureRound(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	engine, pull := resumeFixture(t, store)
+	client := &fakeGitHub{}
+	d := Daemon{Repo: github.Repository{Owner: "jerryfane", Name: "gitmoot"}, Store: store, GitHub: client, Workflow: engine}
+
+	if err := d.handleResumeCommand(ctx, pull, Command{Action: "resume", JobID: "coord", Decision: "answer", Instructions: "q1: v3"}); err != nil {
+		t.Fatalf("handleResumeCommand(answer) returned error: %v", err)
+	}
+	if _, err := store.GetJob(ctx, "coord/continuation"); err == nil {
+		t.Fatal("answer on a failure round must not enqueue a continuation")
+	}
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "could not resume") {
+		t.Fatalf("expected a verb-mismatch ack, got %+v", client.posted)
+	}
+}

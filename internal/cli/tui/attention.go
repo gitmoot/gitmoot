@@ -26,7 +26,10 @@ func (m Model) attentionItems() []attnItem {
 	}
 	var jobs []*JobRow
 	for i := range m.snap.JobRows {
-		if jobReportable(m.snap.JobRows[i].State) {
+		// PreflightFailed coordinators (#451) end succeeded, so they are not
+		// jobReportable by state, but their zero-child fan-out is exactly what the
+		// Attention page must surface — include them too.
+		if jobReportable(m.snap.JobRows[i].State) || m.snap.JobRows[i].PreflightFailed {
 			jobs = append(jobs, &m.snap.JobRows[i])
 		}
 	}
@@ -238,7 +241,16 @@ func (m Model) attentionListRows() []listRow {
 
 	// Blocked & failed jobs: a static section title with collapsible repo groups.
 	if jobN := len(items) - promptN; jobN > 0 {
-		rows = append(rows, staticRow(0, "Blocked & failed jobs ("+strconv.Itoa(jobN)+")"))
+		// A preflight-failed coordinator (#451) ends succeeded, so widen the title
+		// only when one is present (keeps the common-case wording byte-stable).
+		title := "Blocked & failed jobs"
+		for i := promptN; i < len(items); i++ {
+			if items[i].job != nil && items[i].job.PreflightFailed {
+				title = "Blocked, failed & preflight-failed jobs"
+				break
+			}
+		}
+		rows = append(rows, staticRow(0, title+" ("+strconv.Itoa(jobN)+")"))
 		repoCount := map[string]int{} // per-repo job count for the header ("×N")
 		for i := promptN; i < len(items); i++ {
 			repoCount[attentionRepoLabel(items[i].job.Repo)]++

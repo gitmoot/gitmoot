@@ -59,5 +59,24 @@ cockpit_pane_key = "job"
 # (Go duration; default 24h). Both optional.
 escalation_handle = ""
 escalation_ttl = ""
+
+# [admission] is an OPT-IN, off-by-default host-global concurrency budget the
+# daemon applies BEFORE starting each agent session, on top of --workers/pool
+# and the per-repo checkout / runtime-session locks (issue #365). With both caps
+# 0 (the default, below) it is DISABLED and scheduling is byte-identical to a
+# config with no [admission] section. Set max_concurrent_sessions to cap total
+# in-flight sessions across all repos in the daemon process; set max_memory_gb to
+# cap the summed per-runtime RAM estimate of in-flight sessions (a job is admitted
+# only if it fits BOTH). A job that does not fit is left queued and retried next
+# tick — never failed. The per-runtime *_memory_gb values are operator-tunable
+# RAM priors; a non-session runtime contributes 0. Note: the budget is enforced
+# per daemon process (host-global for the normal single-daemon deployment).
+# [admission]
+# max_concurrent_sessions = 0
+# max_memory_gb = 0
+# codex_memory_gb = 0.2
+# claude_memory_gb = 0.85
+# kimi_memory_gb = 0.5
+# default_memory_gb = 0.5
 `, paths.Database, paths.Logs, paths.Workspaces, paths.Evals, paths.ArtifactBlobs)
 }

@@ -135,6 +135,8 @@ Symptoms:
 - An implementation job is blocked before the agent starts.
 - A job comment says the worker is read-only or cannot make changes.
 - Runtime output asks for permission or reports that writes are blocked.
+- `agent start`/`subscribe` refuses an `implement` agent whose policy is
+  `auto`/empty or `read-only` (these grant no deterministic headless write).
 
 Checks:
 
@@ -152,7 +154,11 @@ Fixes:
   rerun the task.
 - For Codex agents, use an autonomy policy that permits writes for implementation
   jobs. For Claude Code agents, use a permission mode that accepts edits for
-  implementation jobs.
+  implementation jobs. The default `auto` policy (and an unset policy) grants no
+  deterministic headless write, so it is refused for `implement` just like
+  `read-only`; set `--policy danger-full-access` for full implementation
+  including `go`/`git`/`gh`, or `--policy workspace-write` for edits-only (note
+  `acceptEdits` does not unblock Bash).
 - Review and ask jobs can still run with read-only workers when they do not need
   to modify files.
 

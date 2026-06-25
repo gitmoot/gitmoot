@@ -28,6 +28,52 @@ gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
 
+## Autonomy Policy And Headless Write Permission
+
+An agent's autonomy policy maps to a Claude Code `--permission-mode` (Codex uses
+the equivalent `--sandbox`). It governs what the headless `claude -p` / `codex
+exec` run is allowed to do:
+
+| Policy | Claude `--permission-mode` | Headless write capability |
+|---|---|---|
+| `read-only` | `plan` | no writes (inspect/report only) |
+| `workspace-write` | `acceptEdits` | file edits only — does NOT unblock Bash |
+| `danger-full-access` | `bypassPermissions` | full: file writes plus `go`/`git`/`gh` via Bash |
+| `auto` (the default) / unset | *(no flag emitted)* | non-deterministic — inherited from ambient Claude config |
+
+Two consequences matter for implementation jobs:
+
+- **`auto` is non-deterministic, not "always denied".** With `auto` (or an unset
+  policy) Gitmoot emits no `--permission-mode`, so the headless run inherits its
+  write capability from whatever ambient Claude config exists on the host
+  (settings.json allow rules / `defaultMode` / prior directory trust). It writes
+  where permissive settings exist and silently denies where they don't — a
+  hidden, environment-dependent dependency on a job-critical decision.
+- **`workspace-write` (`acceptEdits`) auto-accepts file edits but does NOT unblock
+  Bash.** An implement job needs `go build`/`go test`, `git`, and `gh`; those run
+  through Bash, which `acceptEdits` still gates. Use `danger-full-access`
+  (`bypassPermissions`) for full headless implementation. `bypassPermissions`
+  stays gated strictly behind explicit `danger-full-access`; a git worktree is not
+  a sandbox, so Bash there still reaches the whole machine.
+
+### Fail-closed implement guard
+
+Because of the above, Gitmoot **refuses** an agent (or ephemeral worker) that
+carries the `implement` capability while its policy grants no headless write
+(`auto`/empty or `read-only`), rather than letting the job run and produce no
+files. The refusal fires at four seams with the same actionable message:
+
+- `gitmoot agent start` and `gitmoot agent subscribe` (exit 2 before any session
+  is spawned);
+- implement-job **dispatch** (the job is BLOCKED — this catches pre-existing
+  agents and later policy edits);
+- ephemeral delegation specs at `validateEphemeralSpec` (an ephemeral implement
+  worker must carry an explicit write policy).
+
+To fix a refusal: set `--policy danger-full-access` for full headless
+implementation, or `--policy workspace-write` for edits-only (knowing Bash stays
+blocked). `read-only`/`ask`/`review` agents are never affected.
+
 ## Files And Secrets
 
 Do not commit generated data, caches, logs, build outputs, session archives,
@@ -118,6 +164,23 @@ cannot recurse or fan out forever:
   `/gitmoot resume` comments on the tree's **open** PR or issue; the dashboard
   **Attention** section and the TTL backstop cover a tree whose PR/issue is no
   longer open.
+- Non-failure ask-gate (`human_questions[]`, #445): the **healthy-result** sibling
+  of `escalate_human`. A worker/coordinator that returns a healthy result carrying
+  `human_questions[]` pauses the parent task at the **same** resumable
+  `awaiting_human` state for a specific human answer — **no leg fails**, no
+  continuation or delegation children are enqueued, and the tree consumes zero
+  tokens/compute. It reuses the **same** pause plumbing as `escalate_human` (one
+  `delegation_escalation_requested` event tagged `kind=ask` with the questions, the
+  @-tag comment, the dashboard **Attention** section), so the **same**
+  `[orchestrate].escalation_ttl` auto-finalizes an unanswered ask, the **same**
+  wall-clock pause exclusion applies, and the pause is **budget-neutral** (it
+  enqueues no job; only the eventual answer-driven continuation occupies the single
+  continuation slot). A human answers with
+  `/gitmoot resume <coordinatorJobID> answer "<id>: ..."` (authorize-commenter
+  gated); the answer is injected into the coordinator continuation prompt. The
+  `answer` verb is valid only on an ask round and `retry`/`continue`/`abort` only
+  on a failure round — a mismatch is rejected with a clear message. Absence of
+  `human_questions[]` is byte-identical to today's behavior.
 
 When a bound trips, the offending delegations are not dispatched and the parent
 receives a typed lifecycle event explaining why (for example, the delegation tree

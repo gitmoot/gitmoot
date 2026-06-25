@@ -47,6 +47,7 @@ const sidebars: SidebarsConfig = {
         'reference/cli',
         'reference/runtime-adapters',
         'reference/result-contract',
+        'reference/event-stream',
         'reference/skillopt-exchange-contract',
       ],
     },
@@ -64,6 +65,7 @@ const sidebars: SidebarsConfig = {
       label: 'Release Notes',
       items: [
         'release-notes/v0.6.0',
+        'release-notes/v0.5.3',
         'release-notes/v0.5.2',
         'release-notes/v0.5.1',
         'release-notes/v0.5.0',

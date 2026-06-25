@@ -180,7 +180,8 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
      --role lead \
      --capability ask \
      --capability review \
-     --capability implement
+     --capability implement \
+     --policy danger-full-access
    gitmoot agent list
    gitmoot agent doctor lead
    ```
@@ -364,11 +365,20 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
 
    Gitmoot records agent autonomy policy as `read-only`, `workspace-write`,
    `danger-full-access`, or `auto`. For Codex these map to Codex sandbox
-   policies; for Claude Code they map to Claude permission modes. Implementation
-   jobs require a writable policy. If an implementation worker is read-only or
-   its runtime asks for write permission, Gitmoot blocks the job before treating
-   it as implementation work and tells the user to restart or subscribe a
-   writable worker.
+   policies; for Claude Code they map to Claude permission modes
+   (`read-only`→`plan`, `workspace-write`→`acceptEdits`,
+   `danger-full-access`→`bypassPermissions`; `auto`/unset emits no flag, so its
+   headless write capability is inherited non-deterministically from ambient
+   Claude config). Implementation jobs require an explicit write policy, and
+   Gitmoot **refuses** an `implement`-capable agent (or ephemeral worker) whose
+   policy grants no headless write — `auto`/empty **or** `read-only` — at `agent
+   start`/`subscribe`, at implement-job dispatch (catching pre-existing agents
+   and later policy edits), and in ephemeral delegation specs. To fix the
+   refusal, set `--policy danger-full-access` for full headless implementation
+   including `go`/`git`/`gh` via Bash, or `--policy workspace-write` for
+   edits-only (note that `acceptEdits` does **not** unblock Bash). `read-only`,
+   `ask`, and `review` workers are unaffected and can still run jobs that do not
+   modify files.
 
 6. Start and open the first task PR.
 

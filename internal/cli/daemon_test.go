@@ -4179,6 +4179,170 @@ func TestRunQueuedJobsPoolRecoversWorkerPanicAndCleansWorktree(t *testing.T) {
 	}
 }
 
+// runAdmissionConcurrencyScenario enqueues two jobs that would otherwise run in
+// parallel (distinct repos ⇒ distinct checkout keys; distinct codex sessions ⇒
+// distinct runtime keys, so neither the checkout nor the runtime lock serializes
+// them) and runs them under the barrier or pool scheduler with the given
+// admission budget attached. It returns the observed peak concurrent deliveries.
+func runAdmissionConcurrencyScenario(t *testing.T, usePool bool, budget *admissionBudget) int {
+	t.Helper()
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo-a", t.TempDir())
+	seedDaemonWorkerRepo(t, store, "owner/repo-b", t.TempDir())
+	seedDaemonWorkerAgent(t, store, "audit-a", runtime.CodexRuntime, "session-a", []string{"ask"}, "owner/repo-a")
+	seedDaemonWorkerAgent(t, store, "audit-b", runtime.CodexRuntime, "session-b", []string{"ask"}, "owner/repo-b")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit-a", Action: "ask", Repo: "owner/repo-a", Branch: "main", PullRequest: 1})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-b", Agent: "audit-b", Action: "ask", Repo: "owner/repo-b", Branch: "main", PullRequest: 2})
+
+	tracker := &poolConcurrencyTracker{}
+	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
+	adapter.onDeliver = tracker.span
+	worker := poolSchedulerWorker(t, store, adapter, usePool)
+	worker.Admission = budget
+
+	if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
+		t.Fatalf("runQueuedJobsForRepo(usePool=%v): %v", usePool, err)
+	}
+	for _, id := range []string{"job-a", "job-b"} {
+		job, err := store.GetJob(ctx, id)
+		if err != nil {
+			t.Fatalf("GetJob %s: %v", id, err)
+		}
+		if job.State != string(workflow.JobSucceeded) {
+			t.Fatalf("%s state = %q, want succeeded (a deferred job must still run, never drop)", id, job.State)
+		}
+	}
+	return tracker.peak()
+}
+
+// TestRunQueuedJobsBarrierAdmissionDefers proves the host-global session cap (#365)
+// serializes two otherwise-parallel jobs under the barrier scheduler, and that a
+// nil Admission (the default) preserves byte-identical parallel behavior.
+func TestRunQueuedJobsBarrierAdmissionDefers(t *testing.T) {
+	if peak := runAdmissionConcurrencyScenario(t, false, nil); peak != 2 {
+		t.Fatalf("nil-Admission barrier peak = %d, want 2 (default parallelism must be unchanged)", peak)
+	}
+	budget := newAdmissionBudget(config.AdmissionPolicy{MaxConcurrentSessions: 1})
+	if peak := runAdmissionConcurrencyScenario(t, false, budget); peak != 1 {
+		t.Fatalf("max_concurrent_sessions=1 barrier peak = %d, want 1 (cap must override --workers)", peak)
+	}
+}
+
+// TestRunQueuedJobsPoolAdmissionDefers proves the same host-global cap serializes
+// two otherwise-parallel jobs under the pool scheduler, and the nil default keeps
+// the pool's parallel dispatch byte-identical.
+func TestRunQueuedJobsPoolAdmissionDefers(t *testing.T) {
+	if peak := runAdmissionConcurrencyScenario(t, true, nil); peak != 2 {
+		t.Fatalf("nil-Admission pool peak = %d, want 2 (default parallelism must be unchanged)", peak)
+	}
+	budget := newAdmissionBudget(config.AdmissionPolicy{MaxConcurrentSessions: 1})
+	if peak := runAdmissionConcurrencyScenario(t, true, budget); peak != 1 {
+		t.Fatalf("max_concurrent_sessions=1 pool peak = %d, want 1 (cap must override pool width)", peak)
+	}
+}
+
+// TestRunQueuedJobsAdmissionMemoryCapDefers proves the memory gate serializes two
+// jobs whose summed per-runtime RAM estimate exceeds the cap. Two codex sessions
+// (0.2GB prior each) fit a 0.5GB cap together but two claude sessions (0.85GB
+// each) do not, so the claude pair serializes.
+func TestRunQueuedJobsAdmissionMemoryCapDefers(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+`
+[admission]
+max_memory_gb = 1.0
+codex_memory_gb = 0.2
+claude_memory_gb = 0.85
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	seedDaemonWorkerRepo(t, store, "owner/repo-a", t.TempDir())
+	seedDaemonWorkerRepo(t, store, "owner/repo-b", t.TempDir())
+	seedDaemonWorkerAgent(t, store, "claude-a", runtime.ClaudeRuntime, "session-a", []string{"ask"}, "owner/repo-a")
+	seedDaemonWorkerAgent(t, store, "claude-b", runtime.ClaudeRuntime, "session-b", []string{"ask"}, "owner/repo-b")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "claude-a", Action: "ask", Repo: "owner/repo-a", Branch: "main", PullRequest: 1})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-b", Agent: "claude-b", Action: "ask", Repo: "owner/repo-b", Branch: "main", PullRequest: 2})
+
+	tracker := &poolConcurrencyTracker{}
+	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
+	adapter.onDeliver = tracker.span
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return t.TempDir(), nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return adapter, nil
+	}
+	worker.Admission = worker.loadAdmissionBudget()
+	if worker.Admission == nil {
+		t.Fatal("a [admission] config with max_memory_gb set must yield a non-nil budget")
+	}
+
+	if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
+		t.Fatalf("runQueuedJobsForRepo: %v", err)
+	}
+	if peak := tracker.peak(); peak != 1 {
+		t.Fatalf("two 0.85GB claude jobs under a 1.0GB cap peak = %d, want 1 (summed estimate must defer)", peak)
+	}
+	for _, id := range []string{"job-a", "job-b"} {
+		job, err := store.GetJob(ctx, id)
+		if err != nil {
+			t.Fatalf("GetJob %s: %v", id, err)
+		}
+		if job.State != string(workflow.JobSucceeded) {
+			t.Fatalf("%s state = %q, want succeeded", id, job.State)
+		}
+	}
+}
+
+// TestPerJobAdmissionEstimate maps each session runtime to its configured RAM
+// estimate (and marks it session-counted), and a non-session runtime (shell, or a
+// session runtime with no ref) to 0 RAM AND not session-counted.
+func TestPerJobAdmissionEstimate(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
+	seedDaemonWorkerAgent(t, store, "codex-agent", runtime.CodexRuntime, "ref-1", []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "claude-agent", runtime.ClaudeRuntime, "ref-2", []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "kimi-agent", runtime.KimiRuntime, "ref-3", []string{"ask"}, "owner/repo")
+	// A shell agent has no resumable runtime session key ⇒ contributes 0 and is not
+	// session-counted (matches its exemption from the runtime session lock).
+	seedDaemonWorkerAgent(t, store, "shell-agent", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
+	// A codex agent with an empty runtime ref also has no session key ⇒ 0 / not counted.
+	seedDaemonWorkerAgent(t, store, "codex-no-ref", runtime.CodexRuntime, "", []string{"ask"}, "owner/repo")
+
+	policy := config.AdmissionPolicy{CodexMemoryGB: 0.2, ClaudeMemoryGB: 0.85, KimiMemoryGB: 0.5, DefaultMemoryGB: 0.7}
+	cases := []struct {
+		agent       string
+		wantMemGB   float64
+		wantSession bool
+	}{
+		{"codex-agent", 0.2, true},
+		{"claude-agent", 0.85, true},
+		{"kimi-agent", 0.5, true},
+		{"shell-agent", 0, false},
+		{"codex-no-ref", 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.agent, func(t *testing.T) {
+			job := db.Job{ID: "job-" + tc.agent, Agent: tc.agent}
+			got := perJobAdmissionEstimate(ctx, store, job, policy)
+			if got.memGB != tc.wantMemGB {
+				t.Fatalf("perJobAdmissionEstimate(%s).memGB = %v, want %v", tc.agent, got.memGB, tc.wantMemGB)
+			}
+			if got.session != tc.wantSession {
+				t.Fatalf("perJobAdmissionEstimate(%s).session = %v, want %v", tc.agent, got.session, tc.wantSession)
+			}
+		})
+	}
+}
+
 func TestRunQueuedJobsForRepoSkipsOtherSessions(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
@@ -5122,7 +5286,14 @@ func seedDaemonWorkerRepo(t *testing.T, store *db.Store, fullName string, checko
 
 func seedDaemonWorkerAgent(t *testing.T, store *db.Store, name string, runtimeName string, runtimeRef string, capabilities []string, repo string) {
 	t.Helper()
-	seedDaemonWorkerAgentWithPolicy(t, store, name, runtimeName, runtimeRef, capabilities, repo, runtime.AutonomyPolicyAuto)
+	// Implement-capable workers need a write policy or the fail-closed dispatch
+	// preflight blocks their jobs (#452); default everyone else to auto. Tests that
+	// deliberately exercise a non-write implement policy use the WithPolicy variant.
+	policy := runtime.AutonomyPolicyAuto
+	if runtime.HasImplementCapability(capabilities) {
+		policy = runtime.AutonomyPolicyWorkspaceWrite
+	}
+	seedDaemonWorkerAgentWithPolicy(t, store, name, runtimeName, runtimeRef, capabilities, repo, policy)
 }
 
 func seedDaemonWorkerAgentWithPolicy(t *testing.T, store *db.Store, name string, runtimeName string, runtimeRef string, capabilities []string, repo string, policy string) {
@@ -6033,5 +6204,40 @@ func TestDaemonAutoPoolSurvivesChildArgsAndRestart(t *testing.T) {
 	}
 	if parsed.Scheduler != "pool" || parsed.Workers != 4 {
 		t.Fatalf("restart lost config: scheduler=%q workers=%d, want pool/4; args=%v", parsed.Scheduler, parsed.Workers, targetArgs)
+	}
+}
+
+// TestBuildAskGateComment pins the #445 ask-gate notification: when the request
+// is flagged Ask, the comment quotes each question (id + prompt + choices) and
+// offers the `answer` resume verb, NOT the failure retry/continue/abort verbs.
+// It must also be unparseable as a command (same regression guard as #340).
+func TestBuildAskGateComment(t *testing.T) {
+	req := workflow.EscalationRequest{
+		CoordinatorJobID: "coord-123",
+		Ask:              true,
+		Questions: []workflow.HumanQuestion{
+			{ID: "q1", Prompt: "Target v2 or v3 API?", Choices: []string{"v2", "v3"}},
+		},
+	}
+	body := buildEscalationComment("jerryfane", req)
+
+	if !strings.Contains(body, "@jerryfane") {
+		t.Fatalf("ask-gate comment dropped the @-mention; body:\n%s", body)
+	}
+	if !strings.Contains(body, "q1") || !strings.Contains(body, "Target v2 or v3 API?") {
+		t.Fatalf("ask-gate comment must quote the question; body:\n%s", body)
+	}
+	if !strings.Contains(body, "choices: v2, v3") {
+		t.Fatalf("ask-gate comment must render choices; body:\n%s", body)
+	}
+	if !strings.Contains(body, "resume coord-123 answer") {
+		t.Fatalf("ask-gate comment must offer the answer verb; body:\n%s", body)
+	}
+	if strings.Contains(body, "retry <instructions>") || strings.Contains(body, "abort` —") {
+		t.Fatalf("ask-gate comment must NOT offer the failure verbs; body:\n%s", body)
+	}
+	// Same command-injection guard as the failure comment.
+	if cmds := daemon.ParseCommands(body); len(cmds) != 0 {
+		t.Fatalf("ask-gate comment parsed into %d command(s); want 0: %+v\nbody:\n%s", len(cmds), cmds, body)
 	}
 }

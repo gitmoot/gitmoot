@@ -83,6 +83,74 @@ func TestRunJobListShowEventsRetryCancel(t *testing.T) {
 	}
 }
 
+func TestRunJobListSurfacesDelegationPreflightFailure(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	// A coordinator whose delegation fan-out could not be routed. Its job state is
+	// not "blocked" (it took a corrective continuation), so the reason must surface
+	// from the delegation_preflight_failed event, not the job state.
+	seedCLIJob(t, store, db.Job{
+		ID:      "coordinator-job",
+		Agent:   "coordinator",
+		Type:    "ask",
+		State:   string(workflow.JobSucceeded),
+		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Branch: "main"}),
+	}, "succeeded")
+	if err := store.AddJobEvent(context.Background(), db.JobEvent{
+		JobID:   "coordinator-job",
+		Kind:    "delegation_preflight_failed",
+		Message: `delegation "impl": "claude" is a runtime, not a registered agent`,
+	}); err != nil {
+		t.Fatalf("AddJobEvent returned error: %v", err)
+	}
+	// A continuation event arrives later (becomes the latest overall event), so a
+	// latest-event-only surface would miss the preflight reason.
+	if err := store.AddJobEvent(context.Background(), db.JobEvent{
+		JobID:   "coordinator-job",
+		Kind:    "delegation_continuation_enqueued",
+		Message: "preflight corrective continuation",
+	}); err != nil {
+		t.Fatalf("AddJobEvent returned error: %v", err)
+	}
+	// An ordinary job with no preflight failure must print unchanged.
+	seedCLIJob(t, store, db.Job{
+		ID:      "plain-job",
+		Agent:   "audit",
+		Type:    "ask",
+		State:   string(workflow.JobQueued),
+		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Branch: "main", PullRequest: 3}),
+	}, "queued")
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"job", "list", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("job list exit code = %d, stderr=%s", code, stderr.String())
+	}
+	var coordinatorLine, plainLine string
+	for _, line := range strings.Split(strings.TrimRight(stdout.String(), "\n"), "\n") {
+		if strings.HasPrefix(line, "coordinator-job\t") {
+			coordinatorLine = line
+		}
+		if strings.HasPrefix(line, "plain-job\t") {
+			plainLine = line
+		}
+	}
+	if coordinatorLine == "" || plainLine == "" {
+		t.Fatalf("job list output = %q", stdout.String())
+	}
+	if !strings.Contains(coordinatorLine, "PREFLIGHT_FAILED: ") || !strings.Contains(coordinatorLine, "is a runtime, not a registered agent") {
+		t.Fatalf("coordinator line missing the preflight reason column: %q", coordinatorLine)
+	}
+	// The existing six columns stay byte-stable: a plain job has exactly six.
+	if got := strings.Count(plainLine, "\t"); got != 5 {
+		t.Fatalf("plain job line changed shape (%d tabs, want 5): %q", got, plainLine)
+	}
+	if strings.Contains(plainLine, "PREFLIGHT_FAILED") {
+		t.Fatalf("a job without a preflight failure must not print the column: %q", plainLine)
+	}
+}
+
 func TestRunJobWatchPrintsEventsUntilTerminal(t *testing.T) {
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)

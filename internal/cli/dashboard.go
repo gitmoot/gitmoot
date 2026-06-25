@@ -79,6 +79,11 @@ type dashboardJobRow struct {
 	db.Job
 	LatestEvent string
 	Repo        string // parsed from the payload for reportable jobs (attention grouping)
+	// PreflightFailed marks a coordinator whose delegation fan-out could not be
+	// routed (#451). It no longer terminal-blocks (it takes a corrective
+	// continuation and ends succeeded), so this surfaces it on the Attention page
+	// regardless of state, mirroring the `job list` PREFLIGHT_FAILED column.
+	PreflightFailed bool
 }
 
 // dashboardAwaitingHuman is one task paused at awaiting_human (#340), shown in the
@@ -439,6 +444,13 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 		if err != nil {
 			return err
 		}
+		// A delegation preflight failure (#451) no longer terminal-blocks the
+		// coordinator — it takes a corrective continuation and ends succeeded — so
+		// its state and overall-latest event hide the zero-child fan-out. This one
+		// batched read (mirroring the `job list` treatment, reusing the same helper
+		// rather than parallel plumbing) lets the Attention page surface it anyway.
+		// Best-effort: a lookup error just leaves the surfacing off.
+		preflightFailed, _ := store.JobIDsWithEventKind(ctx, "delegation_preflight_failed")
 		for _, job := range jobs {
 			state := job.State
 			if strings.TrimSpace(state) == "" {
@@ -449,10 +461,19 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 			if job.State == "blocked" || job.State == "failed" {
 				row.LatestEvent = latestEvents[job.ID].Message
 			}
-			// Reportable jobs surface on the Attention page grouped by repo; the
-			// repo lives in the payload, so parse it only for that small subset to
-			// keep the refresh tick cheap.
-			if job.State == "blocked" || job.State == "failed" || job.State == "cancelled" {
+			if reason, ok := preflightFailed[job.ID]; ok && strings.TrimSpace(reason) != "" {
+				row.PreflightFailed = true
+				// Prefer the preflight reason as the "why" unless a blocked/failed
+				// latest event already carries a more specific message.
+				if strings.TrimSpace(row.LatestEvent) == "" {
+					row.LatestEvent = "PREFLIGHT_FAILED: " + reason
+				}
+			}
+			// Reportable jobs (and preflight-failed coordinators, whatever their
+			// state) surface on the Attention page grouped by repo; the repo lives in
+			// the payload, so parse it only for that small subset to keep the refresh
+			// tick cheap.
+			if job.State == "blocked" || job.State == "failed" || job.State == "cancelled" || row.PreflightFailed {
 				var p struct {
 					Repo string `json:"repo"`
 				}

@@ -66,6 +66,11 @@ type Result struct {
 	// token budget simply under-counts that job rather than failing.
 	InputTokens  int
 	OutputTokens int
+	// RefreshedRuntimeRef is non-empty only when the adapter self-healed a dead
+	// pre-execution session and re-pinned the agent to a fresh runtime reference
+	// (#443). The mailbox persists it through the Store so subsequent jobs use the
+	// new ref. Other adapters and the happy path leave it empty.
+	RefreshedRuntimeRef string
 }
 
 type StartRequest struct {
@@ -185,6 +190,57 @@ func NormalizeStoredAutonomyPolicy(policy string) string {
 		return AutonomyPolicyAuto
 	}
 	return normalized
+}
+
+// ImplementWritePolicyGuidance is the single, actionable message emitted whenever
+// an agent (or ephemeral spec) carrying the "implement" capability is paired with
+// a non-write autonomy policy (auto/empty or read-only). It is shared verbatim by
+// every fail-closed seam — agent start, agent subscribe, implement-job dispatch,
+// and ephemeral-spec validation — so operators always see the same fix.
+//
+// The guidance names both writable policies and is explicit that workspace-write
+// (acceptEdits) only auto-accepts file edits — it does NOT unblock the Bash an
+// implement job needs (go/git/gh), so full headless implementation requires
+// danger-full-access (bypassPermissions). The behavior is fail-closed: gitmoot
+// refuses rather than silently delegating the write decision to ambient Claude
+// config, whose headless write capability is non-deterministic across hosts.
+const ImplementWritePolicyGuidance = "autonomy policy %q grants no write permission in headless runs, but this worker has the \"implement\" capability — the job would run and produce no files. Set --policy danger-full-access for full headless implementation (file writes plus go/git/gh via Bash), or --policy workspace-write for edits-only (note: workspace-write maps to acceptEdits and does NOT unblock Bash, so go/git/gh stay blocked)."
+
+// PolicyGrantsImplementWrite reports whether the given autonomy policy permits
+// headless file writes. Only workspace-write and danger-full-access qualify; auto
+// (and the empty/unset policy, which normalizes to auto) and read-only do not.
+func PolicyGrantsImplementWrite(policy string) bool {
+	switch NormalizeStoredAutonomyPolicy(policy) {
+	case AutonomyPolicyWorkspaceWrite, AutonomyPolicyDangerFullAccess:
+		return true
+	default:
+		return false
+	}
+}
+
+// HasImplementCapability reports whether the capability set contains "implement".
+func HasImplementCapability(capabilities []string) bool {
+	for _, capability := range capabilities {
+		if strings.TrimSpace(capability) == "implement" {
+			return true
+		}
+	}
+	return false
+}
+
+// ImplementWritePolicyError returns a non-nil, actionable error when the given
+// capability set contains "implement" but the autonomy policy grants no write
+// (auto/empty or read-only); otherwise it returns nil. This is the shared
+// fail-closed predicate behind every capability<->policy seam. read-only / ask /
+// review agents (no implement capability) are never refused.
+func ImplementWritePolicyError(capabilities []string, policy string) error {
+	if !HasImplementCapability(capabilities) {
+		return nil
+	}
+	if PolicyGrantsImplementWrite(policy) {
+		return nil
+	}
+	return fmt.Errorf(ImplementWritePolicyGuidance, NormalizeStoredAutonomyPolicy(policy))
 }
 
 type CodexSessionResolver interface {
@@ -361,10 +417,28 @@ func (a ClaudeAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Resul
 	if err != nil && isClaudeJSONUnsupported(result) {
 		result, err = a.runner().Run(ctx, a.Dir, "claude", claudeArgs(agent, job.Prompt, false, model)...)
 	}
+	// Self-heal a dead pinned session (#443): when a pinned --resume delivery
+	// fails before any model turn because the conversation no longer exists, mint
+	// a fresh dedicated --session-id, retry the job exactly ONCE, and thread the
+	// new ref out via Result.RefreshedRuntimeRef so mailbox.Run re-pins the agent.
+	// Bounded to a single pre-execution retry: never loops, never touches the
+	// shared --continue ("last") path, and never masks an auth failure (a fresh
+	// start that fails for auth reasons still surfaces as auth below).
+	var refreshedRef string
+	if err != nil && agent.RuntimeRef != LastRef && isClaudeSessionMissing(result) {
+		newRef, refErr := a.newRuntimeRef()
+		if refErr == nil {
+			refreshedRef = newRef
+			result, err = a.runner().Run(ctx, a.Dir, "claude", claudeFreshSessionArgs(agent, job.Prompt, model, newRef)...)
+			if err != nil {
+				return Result{Raw: result.Stdout + result.Stderr}, a.claudeSessionMissingError(agent, result, err)
+			}
+		}
+	}
 	if err != nil {
 		return Result{Raw: result.Stdout + result.Stderr}, claudeCommandError(result, err)
 	}
-	parsed := Result{Raw: result.Stdout}
+	parsed := Result{Raw: result.Stdout, RefreshedRuntimeRef: refreshedRef}
 	summary, inTok, outTok := parseClaudeJSONResult(result.Stdout)
 	if summary != "" {
 		parsed.Summary = summary
@@ -374,6 +448,31 @@ func (a ClaudeAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Resul
 	parsed.InputTokens = inTok
 	parsed.OutputTokens = outTok
 	return parsed, nil
+}
+
+// claudeFreshSessionArgs builds the args for a brand-new dedicated session,
+// mirroring Start's --session-id shape (never --resume/--continue), so self-heal
+// preserves per-agent isolation rather than collapsing onto the shared --continue
+// path.
+func claudeFreshSessionArgs(agent Agent, prompt string, model string, sessionID string) []string {
+	args := claudePermissionArgs(agent)
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+	return append(args, "--session-id", sessionID, "-p", "--output-format", "json", "--", prompt)
+}
+
+// claudeSessionMissingError wraps an unrecoverable dead-session failure (the
+// pinned session was gone AND the fresh start also failed) in an actionable,
+// agent-named gitmoot message instead of raw CLI stderr. If the fresh start
+// failed for an auth reason, ClassifyClaudeCommandError still surfaces it as auth
+// so a real auth failure is never masked as a stale session.
+func (a ClaudeAdapter) claudeSessionMissingError(agent Agent, result subprocess.Result, err error) error {
+	if isClaudeAuthFailure(result) {
+		return claudeCommandError(result, err)
+	}
+	return fmt.Errorf("runtime session for agent %q no longer exists and a fresh session could not be started. %s: %w",
+		agent.Name, ClaudeSessionMissingMessage, claudeCommandError(result, err))
 }
 
 // claudeJSONResult mirrors the relevant fields of the Claude Code
@@ -553,6 +652,24 @@ func ClassifyClaudeCommandError(result subprocess.Result, err error) error {
 		return base
 	}
 	return fmt.Errorf("Claude Code authentication failed. %s: %w", ClaudeSessionAuthFailedMessage, base)
+}
+
+// claudeSessionMissingMarker is the exact stderr signature emitted by `claude
+// --resume <uuid>` when the pinned conversation no longer exists (captured from
+// claude v2.1.191). It is a pre-execution failure: exit 1, empty stdout, no model
+// turn ran — so a retry on a fresh session duplicates no side effects.
+const claudeSessionMissingMarker = "No conversation found with session ID:"
+
+// isClaudeSessionMissing reports whether a failed Claude delivery is the
+// pre-execution dead-session signal — distinct from auth failures and from
+// generic non-zero exits. It matches the distinctive mixed-case marker without
+// lowercasing (lowercasing would force lowercasing the marker too and weaken the
+// match). The exit!=0 precondition is enforced structurally by the Deliver call
+// site, which only consults this classifier when the runner returned err!=nil;
+// subprocess.Result carries no exit-code field, so the marker is the signal.
+func isClaudeSessionMissing(result subprocess.Result) bool {
+	return strings.Contains(result.Stderr, claudeSessionMissingMarker) ||
+		strings.Contains(result.Stdout, claudeSessionMissingMarker)
 }
 
 func isClaudeAuthFailure(result subprocess.Result) bool {

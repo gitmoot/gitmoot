@@ -12,6 +12,55 @@ import (
 	"github.com/jerryfane/gitmoot/internal/subprocess"
 )
 
+func TestImplementWritePolicyError(t *testing.T) {
+	implement := []string{"ask", "review", "implement"}
+	readOnlyCaps := []string{"ask", "review"}
+	for _, tc := range []struct {
+		name         string
+		capabilities []string
+		policy       string
+		wantErr      bool
+	}{
+		{"implement + empty refused", implement, "", true},
+		{"implement + auto refused", implement, AutonomyPolicyAuto, true},
+		{"implement + read-only refused", implement, AutonomyPolicyReadOnly, true},
+		{"implement + workspace-write allowed", implement, AutonomyPolicyWorkspaceWrite, false},
+		{"implement + danger-full-access allowed", implement, AutonomyPolicyDangerFullAccess, false},
+		{"no implement + auto allowed", readOnlyCaps, AutonomyPolicyAuto, false},
+		{"no implement + read-only allowed", readOnlyCaps, AutonomyPolicyReadOnly, false},
+		{"no implement + empty allowed", readOnlyCaps, "", false},
+	} {
+		err := ImplementWritePolicyError(tc.capabilities, tc.policy)
+		if tc.wantErr {
+			if err == nil {
+				t.Fatalf("%s: expected an error, got nil", tc.name)
+			}
+			for _, fragment := range []string{"danger-full-access", "workspace-write", "implement"} {
+				if !strings.Contains(err.Error(), fragment) {
+					t.Fatalf("%s: error %q must mention %q", tc.name, err.Error(), fragment)
+				}
+			}
+		} else if err != nil {
+			t.Fatalf("%s: expected no error, got %v", tc.name, err)
+		}
+	}
+}
+
+func TestPolicyGrantsImplementWrite(t *testing.T) {
+	for policy, want := range map[string]bool{
+		"":                             false,
+		AutonomyPolicyAuto:             false,
+		AutonomyPolicyReadOnly:         false,
+		AutonomyPolicyWorkspaceWrite:   true,
+		AutonomyPolicyDangerFullAccess: true,
+		"bogus":                        false,
+	} {
+		if got := PolicyGrantsImplementWrite(policy); got != want {
+			t.Fatalf("PolicyGrantsImplementWrite(%q) = %v, want %v", policy, got, want)
+		}
+	}
+}
+
 func TestValidateAgent(t *testing.T) {
 	agent := Agent{Name: "audit", Role: "reviewer", Runtime: CodexRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440000", RepoScope: "jerryfane/gitmoot"}
 	if err := ValidateAgent(agent); err != nil {
@@ -290,6 +339,156 @@ func TestClaudeDeliverCommandFallsBackToAgentModel(t *testing.T) {
 		t.Fatalf("Deliver returned error: %v", err)
 	}
 	runner.want(t, 0, "claude", "--model", "sonnet", "--resume", "550e8400-e29b-41d4-a716-446655440002", "-p", "--output-format", "json", "--", "review")
+}
+
+func TestIsClaudeSessionMissing(t *testing.T) {
+	missing := subprocess.Result{Stderr: "No conversation found with session ID: 550e8400-e29b-41d4-a716-446655440002"}
+	if !isClaudeSessionMissing(missing) {
+		t.Fatal("expected dead-session stderr to be classified as session-missing")
+	}
+	// Pin the disjointness invariant in both directions: the canonical
+	// session-missing sample must NOT be classified as an auth failure, so the
+	// self-heal path can never be entered for (or suppressed by) an auth error.
+	if isClaudeAuthFailure(missing) {
+		t.Fatal("session-missing sample must NOT be classified as an auth failure")
+	}
+	for name, result := range map[string]subprocess.Result{
+		"auth via stderr 401": {Stderr: `{"error":{"type":"authentication_error","message":"401 Invalid authentication credentials"}}`},
+		"auth via type":       {Stderr: "authentication_error"},
+		"generic non-zero":    {Stderr: "fatal: some other failure", Stdout: "partial work"},
+		"empty":               {},
+	} {
+		if isClaudeSessionMissing(result) {
+			t.Fatalf("%s must NOT be classified as session-missing", name)
+		}
+		// Guard the invariant that auth and session-missing are disjoint classes.
+		if name == "auth via stderr 401" && !isClaudeAuthFailure(result) {
+			t.Fatalf("%s should still be an auth failure", name)
+		}
+	}
+}
+
+func TestClaudeDeliverSelfHealsDeadSession(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{
+			{Stderr: "No conversation found with session ID: 550e8400-e29b-41d4-a716-446655440002"},
+			{Stdout: `{"result":"done"}`},
+		},
+		errs: []error{errors.New("exit 1"), nil},
+	}
+	adapter := ClaudeAdapter{
+		Runner: runner,
+		NewRuntimeRef: func() (string, error) {
+			return "550e8400-e29b-41d4-a716-446655440099", nil
+		},
+	}
+	agent := Agent{Name: "shipper", Role: "implementer", Runtime: ClaudeRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "jerryfane/gitmoot"}
+
+	result, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"})
+
+	if err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	if result.Summary != "done" {
+		t.Fatalf("summary = %q", result.Summary)
+	}
+	if result.RefreshedRuntimeRef != "550e8400-e29b-41d4-a716-446655440099" {
+		t.Fatalf("RefreshedRuntimeRef = %q, want the fresh UUID", result.RefreshedRuntimeRef)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("expected exactly 2 runner calls (single bounded retry), got %d: %v", len(runner.calls), runner.calls)
+	}
+	runner.want(t, 0, "claude", "--resume", "550e8400-e29b-41d4-a716-446655440002", "-p", "--output-format", "json", "--", "review")
+	runner.want(t, 1, "claude", "--session-id", "550e8400-e29b-41d4-a716-446655440099", "-p", "--output-format", "json", "--", "review")
+}
+
+func TestClaudeDeliverSelfHealUnrecoverable(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{
+			{Stderr: "No conversation found with session ID: 550e8400-e29b-41d4-a716-446655440002"},
+			{Stderr: "claude: internal error starting session"},
+		},
+		errs: []error{errors.New("exit 1"), errors.New("exit 1")},
+	}
+	adapter := ClaudeAdapter{
+		Runner: runner,
+		NewRuntimeRef: func() (string, error) {
+			return "550e8400-e29b-41d4-a716-446655440099", nil
+		},
+	}
+	agent := Agent{Name: "shipper", Role: "implementer", Runtime: ClaudeRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "jerryfane/gitmoot"}
+
+	_, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"})
+
+	if err == nil {
+		t.Fatal("Deliver accepted an unrecoverable dead session")
+	}
+	errText := err.Error()
+	for _, want := range []string{`agent "shipper"`, "gitmoot agent restart", "--session last"} {
+		if !strings.Contains(errText, want) {
+			t.Fatalf("actionable error missing %q:\n%s", want, errText)
+		}
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("expected exactly 2 runner calls (single bounded retry), got %d: %v", len(runner.calls), runner.calls)
+	}
+}
+
+func TestClaudeDeliverSelfHealAuthFailureStaysAuth(t *testing.T) {
+	// If the fresh start fails for an auth reason, surface it as auth — never mask
+	// a genuine auth failure behind the stale-session remediation.
+	runner := &fakeRunner{
+		results: []subprocess.Result{
+			{Stderr: "No conversation found with session ID: 550e8400-e29b-41d4-a716-446655440002"},
+			{Stderr: `{"error":{"type":"authentication_error","message":"401 Invalid authentication credentials"}}`},
+		},
+		errs: []error{errors.New("exit 1"), errors.New("exit 1")},
+	}
+	adapter := ClaudeAdapter{
+		Runner: runner,
+		NewRuntimeRef: func() (string, error) {
+			return "550e8400-e29b-41d4-a716-446655440099", nil
+		},
+	}
+	agent := Agent{Name: "shipper", Role: "implementer", Runtime: ClaudeRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "jerryfane/gitmoot"}
+
+	_, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"})
+	if err == nil {
+		t.Fatal("Deliver accepted an auth failure on the fresh start")
+	}
+	if !strings.Contains(err.Error(), "Claude Code authentication failed") {
+		t.Fatalf("fresh-start auth failure should surface as auth, got:\n%s", err.Error())
+	}
+}
+
+func TestClaudeDeliverDoesNotHealLastSession(t *testing.T) {
+	// A "last" (--continue) agent must never trigger a fresh --session-id start,
+	// even on a generic failure.
+	called := false
+	runner := &fakeRunner{
+		results: []subprocess.Result{{Stderr: "No conversation found with session ID: anything"}},
+		errs:    []error{errors.New("exit 1")},
+	}
+	adapter := ClaudeAdapter{
+		Runner: runner,
+		NewRuntimeRef: func() (string, error) {
+			called = true
+			return "550e8400-e29b-41d4-a716-446655440099", nil
+		},
+	}
+	agent := Agent{Name: "researcher", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: LastRef, RepoScope: "jerryfane/gitmoot"}
+
+	_, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"})
+	if err == nil {
+		t.Fatal("expected the underlying failure to surface")
+	}
+	if called {
+		t.Fatal("self-heal must not mint a fresh session for a last/--continue agent")
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("expected exactly 1 runner call, got %d: %v", len(runner.calls), runner.calls)
+	}
+	runner.want(t, 0, "claude", "--continue", "-p", "--output-format", "json", "--", "review")
 }
 
 func TestClaudeStartCommandUsesAgentModel(t *testing.T) {

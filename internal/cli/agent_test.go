@@ -267,6 +267,7 @@ func TestRunAgentStartCreatesCodexSessionAndStoresAgent(t *testing.T) {
 		"--runtime", "codex",
 		"--repo", "owner/repo",
 		"--path", repoDir,
+		"--policy", "workspace-write",
 	}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("start exit code = %d, stderr=%s", code, stderr.String())
@@ -282,7 +283,7 @@ func TestRunAgentStartCreatesCodexSessionAndStoresAgent(t *testing.T) {
 			t.Fatalf("start output missing %q:\n%s", want, stdout.String())
 		}
 	}
-	runner.want(t, 0, repoDir, "codex", "exec", "--json", "--")
+	runner.want(t, 0, repoDir, "codex", "exec", "--sandbox", "workspace-write", "--json", "--")
 
 	store := openCLIJobStore(t, home)
 	defer store.Close()
@@ -372,6 +373,7 @@ func TestRunAgentStartUsesInstalledCustomTemplate(t *testing.T) {
 		"--repo", "owner/repo",
 		"--path", repoDir,
 		"--template", "frontend-reviewer",
+		"--policy", "workspace-write",
 	}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("start exit code = %d, stderr=%s", code, stderr.String())
@@ -450,6 +452,7 @@ func TestRunAgentStartAllowsImplementForPlannerTemplate(t *testing.T) {
 		"--template", "planner",
 		"--capability", "ask",
 		"--capability", "implement",
+		"--policy", "workspace-write",
 	}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("start exit code = %d, stderr=%s", code, stderr.String())
@@ -2147,6 +2150,7 @@ func TestRunAgentStartRejectsMissingCustomTemplateBeforeRuntime(t *testing.T) {
 		"--repo", "owner/repo",
 		"--path", repoDir,
 		"--template", "frontend-reviewer",
+		"--policy", "workspace-write",
 	}, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("start exit code = %d, want 1", code)
@@ -2175,7 +2179,7 @@ func TestRunAgentStartRejectsExistingAgentBeforeRuntime(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code := Run([]string{"agent", "start", "lead", "--home", home, "--runtime", "codex", "--repo", "owner/repo", "--path", repoDir}, &stdout, &stderr)
+	code := Run([]string{"agent", "start", "lead", "--home", home, "--runtime", "codex", "--repo", "owner/repo", "--path", repoDir, "--policy", "workspace-write"}, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("start exit code = %d, want 1", code)
 	}
@@ -2441,6 +2445,97 @@ func TestRunAgentSubscribeRejectsMissingTemplateAndImplementCapability(t *testin
 	}
 	if !strings.Contains(stderr.String(), "does not allow implement capability") {
 		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestRunAgentStartRefusesImplementWithNonWritePolicy(t *testing.T) {
+	for _, policy := range []string{"", "read-only"} {
+		home := t.TempDir()
+		repoDir := t.TempDir()
+		runGit(t, repoDir, "init")
+		runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+		runner := &agentStartRunner{}
+		restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+
+		args := []string{
+			"agent", "start", "shipper",
+			"--home", home,
+			"--runtime", "codex",
+			"--repo", "owner/repo",
+			"--path", repoDir,
+			"--capability", "implement",
+		}
+		if policy != "" {
+			args = append(args, "--policy", policy)
+		}
+		var stdout, stderr bytes.Buffer
+		code := Run(args, &stdout, &stderr)
+		restoreFactory()
+		if code != 2 {
+			t.Fatalf("policy %q: start exit code = %d, want 2; stderr=%s", policy, code, stderr.String())
+		}
+		for _, fragment := range []string{"danger-full-access", "workspace-write", "implement"} {
+			if !strings.Contains(stderr.String(), fragment) {
+				t.Fatalf("policy %q: stderr %q must mention %q", policy, stderr.String(), fragment)
+			}
+		}
+		// The refusal must precede the runtime session, so no session is spent.
+		if len(runner.calls) != 0 {
+			t.Fatalf("policy %q: runtime was started before the policy refusal: %+v", policy, runner.calls)
+		}
+	}
+}
+
+func TestRunAgentStartAllowsImplementWithWritePolicy(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440044"}` + "\n"}}}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "start", "shipper",
+		"--home", home,
+		"--runtime", "codex",
+		"--repo", "owner/repo",
+		"--path", repoDir,
+		"--capability", "implement",
+		"--policy", "workspace-write",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("start exit code = %d, stderr=%s", code, stderr.String())
+	}
+}
+
+func TestRunAgentSubscribeRefusesImplementWithNonWritePolicy(t *testing.T) {
+	for _, policy := range []string{"", "read-only"} {
+		home := t.TempDir()
+		args := []string{
+			"agent", "subscribe", "shipper",
+			"--home", home,
+			"--runtime", "codex",
+			"--session", "550e8400-e29b-41d4-a716-446655440001",
+			"--repo", "owner/repo",
+			"--role", "shipper",
+			"--capability", "implement",
+		}
+		if policy != "" {
+			args = append(args, "--policy", policy)
+		}
+		var stdout, stderr bytes.Buffer
+		code := Run(args, &stdout, &stderr)
+		if code != 2 {
+			t.Fatalf("policy %q: subscribe exit code = %d, want 2; stderr=%s", policy, code, stderr.String())
+		}
+		for _, fragment := range []string{"danger-full-access", "workspace-write", "implement"} {
+			if !strings.Contains(stderr.String(), fragment) {
+				t.Fatalf("policy %q: stderr %q must mention %q", policy, stderr.String(), fragment)
+			}
+		}
 	}
 }
 

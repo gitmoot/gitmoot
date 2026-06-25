@@ -118,7 +118,7 @@ Gitmoot enqueues one continuation after verify finishes.
         "id": "produce",
         "action": "implement",
         "prompt": "Implement the token-bucket rate limiter in internal/ratelimit/limiter.go and wire it into the middleware. Add unit tests in internal/ratelimit/limiter_test.go covering burst, steady-state, and reset. Acceptance: the limiter enforces the configured rate and the new tests pass.",
-        "ephemeral": { "runtime": "codex", "role": "producer", "capabilities": ["ask", "implement"] }
+        "ephemeral": { "runtime": "codex", "role": "producer", "capabilities": ["ask", "implement"], "autonomy_policy": "danger-full-access" }
       },
       {
         "id": "verify",

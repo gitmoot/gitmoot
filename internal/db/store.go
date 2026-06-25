@@ -790,6 +790,28 @@ func (s *Store) UpdateAgentRuntime(ctx context.Context, name, runtime string) er
 	return s.UpsertAgent(ctx, agent)
 }
 
+// UpdateAgentRuntimeRef re-pins an agent's runtime_ref in place, updating only
+// that column (#443). Unlike UpdateAgentRuntime — which switches runtimes and
+// deliberately CLEARS runtime_ref — this is used by the self-heal path to record
+// a freshly minted session id while preserving every other field. It returns an
+// error if no agent row matched the name.
+func (s *Store) UpdateAgentRuntimeRef(ctx context.Context, name, ref string) error {
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE agents SET runtime_ref = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?`,
+		strings.TrimSpace(ref), name)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return fmt.Errorf("agent %q is not registered", name)
+	}
+	return nil
+}
+
 func (s *Store) GetAgent(ctx context.Context, name string) (Agent, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, model, capabilities_json, autonomy_policy, health_status
 		FROM agents WHERE name = ?`, name)
@@ -2529,6 +2551,32 @@ func (s *Store) LatestJobEvents(ctx context.Context) (map[string]JobEvent, error
 		events[event.JobID] = event
 	}
 	return events, rows.Err()
+}
+
+// JobIDsWithEventKind returns a map jobID -> message of the LATEST job_event of
+// the given kind, one entry per job that has at least one such event. It is a
+// single indexed query mirroring LatestJobEvents (but scoped to one kind) so a
+// caller can surface, e.g., a delegation_preflight_failed reason in `job list`
+// without an N-per-job lookup and regardless of whether that event is the job's
+// overall latest event (a corrective continuation makes delegation_continuation_enqueued
+// the latest event of the coordinator).
+func (s *Store) JobIDsWithEventKind(ctx context.Context, kind string) (map[string]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT job_id, message FROM job_events
+		WHERE kind = ? AND id IN (SELECT MAX(id) FROM job_events WHERE kind = ? GROUP BY job_id)`, kind, kind)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string]string{}
+	for rows.Next() {
+		var jobID, message string
+		if err := rows.Scan(&jobID, &message); err != nil {
+			return nil, err
+		}
+		out[jobID] = message
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) UpsertEvalArtifact(ctx context.Context, artifact EvalArtifact) error {

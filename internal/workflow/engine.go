@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/events"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
@@ -33,6 +34,18 @@ type Engine struct {
 	// dashboard "Attention" section and the recorded event remain), only the
 	// GitHub notification is skipped. A notifier error never fails the pause.
 	EscalationNotifier EscalationNotifier
+	// EventSink is the injected, best-effort outbound event seam (#446), mirroring
+	// EscalationNotifier: when configured, the engine emits a redacted, versioned
+	// events.Event on each terminal transition it owns (job.finished on a
+	// succeeded terminal, job.needs_attention on an escalate_human pause) so an
+	// off-box consumer (a webhook) can observe the run. It is optional and
+	// nil-safe: when nil (the default, no [events] config) NO event is constructed
+	// or emitted and behavior is byte-identical. Emit is fire-and-forget and best-
+	// effort — a slow/hung/erroring sink never blocks or fails a job (see
+	// internal/events). The daemon emits the failure/blocked/awaiting-human
+	// terminal cases it owns through the SAME sink so the whole terminal set is
+	// covered. #445 (the ask-gate) rides this seam to emit its job.needs_attention.
+	EventSink events.Sink
 	// Home is the resolved GITMOOT_HOME root used to place per-delegation
 	// worktrees. DelegationWorktrees is the checkout-bound git client that
 	// performs the worktree-add. Both are optional: when either is unset, the
@@ -120,12 +133,32 @@ type Engine struct {
 	// summary repeats. <= 0 means use defaultMaxDelegationNonProgressStreak (2); it
 	// is configurable per-root alongside the depth/width/budget bounds.
 	MaxDelegationNonProgressStreak int
+	// MaxVerifyReplanAttempts bounds the engine-level verify→replan corrective loop
+	// (#439): when a delegation set declares synthesis_rule "verify" and the
+	// verify-tagged legs reach a FAILED verdict, the engine — instead of blocking
+	// (vote/quorum) — enqueues a bounded corrective "replan" continuation so the
+	// coordinator can self-correct. This is the dedicated per-root cap on how many
+	// such replan attempts may fire before the loop routes to the #305 graceful
+	// finalize continuation (verify_replan_exhausted) rather than looping forever.
+	// It is layered ON TOP OF all existing structural bounds (depth/width/total
+	// jobs/wall-clock/token/cost), which still count every replan continuation as a
+	// generation. <= 0 means use defaultMaxVerifyReplanAttempts (2); it only ever
+	// matters once a set actually tags a verify leg, so default behavior for every
+	// existing set is byte-identical. It is sourced from the host
+	// [orchestrate].max_verify_replan_attempts config at daemon startup.
+	MaxVerifyReplanAttempts int
 }
 
 // defaultMaxDelegationNonProgressStreak is the streak threshold used when the
 // engine's MaxDelegationNonProgressStreak is unset (<= 0): two consecutive
 // non-progress generations trip the result-aware loop detector (#339).
 const defaultMaxDelegationNonProgressStreak = 2
+
+// defaultMaxVerifyReplanAttempts is the verify→replan attempt cap used when the
+// engine's MaxVerifyReplanAttempts is unset (<= 0): the engine issues at most two
+// bounded corrective replan continuations on a failed verify verdict before
+// routing to the #305 graceful finalize continuation (#439).
+const defaultMaxVerifyReplanAttempts = 2
 
 // nonProgressStreakThreshold returns the configured result-aware non-progress
 // streak threshold, falling back to defaultMaxDelegationNonProgressStreak when
@@ -137,12 +170,75 @@ func (e Engine) nonProgressStreakThreshold() int {
 	return defaultMaxDelegationNonProgressStreak
 }
 
+// verifyReplanAttemptCap returns the configured verify→replan attempt cap,
+// falling back to defaultMaxVerifyReplanAttempts when unset so a zero-valued
+// Engine keeps the documented default (#439).
+func (e Engine) verifyReplanAttemptCap() int {
+	if e.MaxVerifyReplanAttempts > 0 {
+		return e.MaxVerifyReplanAttempts
+	}
+	return defaultMaxVerifyReplanAttempts
+}
+
 // now returns the engine's current time, defaulting to time.Now when Now is unset.
 func (e Engine) now() time.Time {
 	if e.Now != nil {
 		return e.Now()
 	}
 	return time.Now()
+}
+
+// mailbox builds the engine's Mailbox with the best-effort terminal-event hook
+// wired to e.EventSink (#446). When EventSink is nil (the default) the hook is
+// nil too, so finishWithPayload neither constructs nor emits an event and the
+// path is byte-identical. The hook maps the terminal JobState to the event_type,
+// resolves root_id from the payload, and ships a redacted event fire-and-forget.
+func (e Engine) mailbox() Mailbox {
+	mb := Mailbox{Store: e.Store}
+	if e.EventSink == nil {
+		return mb
+	}
+	mb.emitTerminal = func(ctx context.Context, jobID string, state JobState, payload JobPayload) {
+		eventType, ok := terminalEventType(state)
+		if !ok {
+			return
+		}
+		rootID := strings.TrimSpace(payload.RootJobID)
+		if rootID == "" {
+			rootID = jobID
+		}
+		detail := ""
+		if payload.Result != nil {
+			detail = payload.Result.Summary
+		}
+		events.EmitEvent(ctx, e.EventSink, events.NewEvent(
+			eventType,
+			jobID,
+			rootID,
+			payload.Repo,
+			string(state),
+			detail,
+			e.now(),
+			RedactCommentText,
+		))
+	}
+	return mb
+}
+
+// terminalEventType maps a terminal JobState to the outbound event_type (#446).
+// Only the terminal set {succeeded,failed,blocked} maps; any other state returns
+// ok=false so no event is emitted for it.
+func terminalEventType(state JobState) (events.EventType, bool) {
+	switch state {
+	case JobSucceeded:
+		return events.EventJobFinished, true
+	case JobFailed:
+		return events.EventJobFailed, true
+	case JobBlocked:
+		return events.EventJobBlocked, true
+	default:
+		return "", false
+	}
 }
 
 type PullRequestEvent struct {
@@ -204,6 +300,14 @@ type EscalationRequest struct {
 	// Question is the human-facing escalation question (the delegation's prompt),
 	// so the notification can quote what is being asked of the human.
 	Question string
+	// Ask is true when this is a non-failure ask-gate pause (#445) rather than a
+	// failure escalation, so the notifier renders the ask wording + the `answer`
+	// resume verb instead of the retry/continue/abort verbs.
+	Ask bool
+	// Questions carries the ask-gate's human_questions[] (#445) so the notifier can
+	// render each id + prompt (+ choices) and tell the human exactly what to answer.
+	// Empty for a failure escalation.
+	Questions []HumanQuestion
 	// Repo/PullRequest/Branch/TaskID/TaskTitle locate the tree's PR or issue so
 	// the notifier can post the @-tag comment in the right place.
 	Repo        string
@@ -385,7 +489,7 @@ func (e Engine) RunJob(ctx context.Context, jobID string, agent runtime.Agent, a
 	if err := e.ensureJobExecutorAllowed(ctx, job, payload, taskRefFromPayload(payload)); err != nil {
 		return AgentResult{}, err
 	}
-	result, err := (Mailbox{Store: e.Store}).Run(ctx, jobID, agent, adapter)
+	result, err := e.mailbox().Run(ctx, jobID, agent, adapter)
 	if err != nil {
 		return result, err
 	}
@@ -454,7 +558,7 @@ func (e Engine) FinalizeTimedOutDelegationChild(ctx context.Context, jobID strin
 		Decision: "failed",
 		Summary:  reason,
 	}
-	mailbox := Mailbox{Store: e.Store}
+	mailbox := e.mailbox()
 	if job.State == string(JobRunning) {
 		if err := mailbox.finishWithPayload(ctx, jobID, JobFailed, reason, payload); err != nil {
 			return false, err
@@ -540,6 +644,33 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 		if err != nil {
 			return err
 		}
+		// Ask-gate for a delegation CHILD (#445): a HEALTHY child that returned
+		// human_questions[] pauses the SHARED parent task on the COORDINATOR's round
+		// BEFORE advancing the parent DAG. Running it here — ahead of
+		// advanceDelegations — is load-bearing: if the asking child is the last/only
+		// sibling to finish, advanceDelegations would otherwise enqueue the coordinator
+		// continuation (the tree would PROCEED past the question, consuming compute and
+		// contradicting the open pause). Routing the pause to the coordinator
+		// (pauseAwaitingHumanAnswer keys on payload.ParentJobID) also makes the human's
+		// resume target the coordinator — whose answer-driven continuation is the one
+		// the tree advances on — and lets sibling asks share the single round. A
+		// blocked/failed child never asks (it takes the failure path below).
+		if len(payload.Result.HumanQuestions) > 0 &&
+			payload.Result.Decision != "blocked" && payload.Result.Decision != "failed" {
+			open, perr := e.pauseAwaitingHumanAnswer(ctx, job, payload, ref)
+			if perr != nil {
+				return perr
+			}
+			if open {
+				return AwaitingHumanError{Reason: fmt.Sprintf("job %q is awaiting a human answer to %d question(s)", payload.ParentJobID, len(payload.Result.HumanQuestions))}
+			}
+			// CLOSED: the human already answered (the coordinator continuation that
+			// carries the answer is in flight) or the ask was TTL-finalized. The
+			// answer-driven coordinator continuation is the asking child's sole
+			// continuation, so short-circuit — neither the parent DAG advance nor this
+			// child's own delegations[] re-dispatch.
+			return nil
+		}
 		if parentPayload.Result != nil {
 			if err := e.advanceDelegations(ctx, parentJob, parentPayload, parentPayload.Result, taskRefFromPayload(parentPayload)); err != nil {
 				return err
@@ -587,6 +718,34 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 	}
 	if payload.Result.Decision == "blocked" || payload.Result.Decision == "failed" {
 		return e.block(ctx, ref, payload.Result.Summary)
+	}
+	// Ask-gate (#445): a HEALTHY result that carries human_questions[] pauses the
+	// task at awaiting_human for a specific human answer instead of guessing —
+	// reusing the escalate_human pause machinery on a SUCCESS result. It runs
+	// AFTER the blocked/failed early-return (so a failed result never asks) and
+	// BEFORE dispatchDelegations/the continuation, so NO delegations dispatch and
+	// NO continuation enqueues while the round is open: zero compute, budget-
+	// neutral. pauseAwaitingHumanAnswer returns AwaitingHumanError (an idempotent
+	// re-advance within the open round returns it without re-recording), so the
+	// switch below is skipped and the agent's already-delivered result is
+	// preserved while the tree waits.
+	if len(payload.Result.HumanQuestions) > 0 {
+		open, err := e.pauseAwaitingHumanAnswer(ctx, job, payload, ref)
+		if err != nil {
+			return err
+		}
+		if open {
+			// The round is OPEN (freshly opened now, or an idempotent re-advance while
+			// awaiting the answer): the tree consumes zero compute until the human
+			// resumes with `answer`.
+			return AwaitingHumanError{Reason: fmt.Sprintf("job %q is awaiting a human answer to %d question(s)", job.ID, len(payload.Result.HumanQuestions))}
+		}
+		// The round is CLOSED: the human already answered (resumeAnswerLeg enqueued
+		// the coordinator continuation that carries the answer) or the ask was
+		// TTL-finalized. Either way the answer-driven continuation is the asking
+		// job's sole continuation, so short-circuit here — the asking result's own
+		// delegations[] must NOT also dispatch and no second continuation enqueues.
+		return nil
 	}
 	if job.Type == "review" && payload.Result.Decision == "approved" {
 		done, err := e.reviewApprovalAlreadyAdvanced(ctx, ref)
@@ -1288,7 +1447,17 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 	for _, d := range delegations {
 		request := e.delegationRequest(job, payload, d)
 		if err := e.preflightDelegation(ctx, request); err != nil {
-			return e.block(ctx, ref, fmt.Sprintf("delegation %q preflight failed: %v", request.DelegationID, err))
+			// An unroutable delegation set (an unknown / not-allowed / uncapable
+			// agent — usually a runtime name where an agent NAME was required) is no
+			// longer a terminal block: that dead-ends the coordinator before any
+			// child or continuation enqueues. Instead emit a structured
+			// delegation_preflight_failed event and route the actionable error back
+			// through the corrective continuation so the coordinator can re-emit a
+			// corrected set. The all-or-nothing preflight is preserved: we return on
+			// the FIRST failure before the enqueue loop below, so no partial dispatch,
+			// and deferred legs are covered because this loop sees every delegation.
+			reason := fmt.Sprintf("delegation %q preflight failed: %v", request.DelegationID, err)
+			return e.handleDelegationPreflightFailure(ctx, job, payload, reason)
 		}
 	}
 
@@ -1421,6 +1590,102 @@ func (e Engine) handleDelegationLoop(ctx context.Context, job db.Job, payload Jo
 		return true, fmt.Errorf("enqueue corrective continuation for %q: %w", job.ID, err)
 	}
 	return true, nil
+}
+
+// handleDelegationPreflightFailure is the disposition of an unroutable delegation
+// set (#451). It mirrors the delegation-loop seam (handleDelegationLoop) rather
+// than terminal-blocking: the coordinator named an agent that does not resolve to
+// a routable registered agent (unknown / not-allowed / uncapable — most often a
+// runtime name where an agent NAME was required), so instead of dead-ending it is
+// re-invoked once with the actionable error as a corrective continuation so it can
+// re-emit a corrected set. The non-progress bound (MaxDelegationNonProgressStreak)
+// guarantees a graceful finalize if it keeps naming bad agents: a repeat after a
+// corrective nudge (DelegationRepeatCount >= 1) at the streak threshold routes to
+// the #305 finalize continuation rather than looping forever.
+//
+// It always emits a structured delegation_preflight_failed event carrying the
+// reason (the observability surface for `gitmoot job list`), then enqueues the
+// corrective (or finalize) continuation and returns nil — NOT a BlockedError — so
+// the coordinator can self-correct. Idempotent on re-advance: a deterministic
+// continuation id makes e.enqueue a no-op, and a once-guard on the
+// delegation_preflight_failed event avoids double-emitting/double-enqueueing.
+func (e Engine) handleDelegationPreflightFailure(ctx context.Context, job db.Job, payload JobPayload, reason string) error {
+	// Once-guard: if this generation already recorded a preflight failure it has
+	// already enqueued its single continuation (deterministic id), so a re-advance
+	// must not re-emit the event or re-run the streak logic.
+	events, err := e.Store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		return err
+	}
+	for _, ev := range events {
+		if ev.Kind == "delegation_preflight_failed" {
+			return nil
+		}
+	}
+
+	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   job.ID,
+		Kind:    "delegation_preflight_failed",
+		Message: reason,
+	})
+
+	// Bound the corrective loop with the SAME streak ladder the loop/non-progress
+	// detectors use: a coordinator that keeps re-emitting an unroutable set climbs
+	// the streak and, once a corrective nudge has already fired, finalizes
+	// gracefully instead of looping forever.
+	nonProgressStreak := payload.NonProgressStreak + 1
+	if nonProgressStreak >= e.nonProgressStreakThreshold() && payload.DelegationRepeatCount >= 1 {
+		return e.enqueueFinalizeContinuation(ctx, job, payload, "delegation set named an unroutable agent after a corrective nudge")
+	}
+
+	goal := e.originalGoal(ctx, e.rootJobID(job, payload), payload.Instructions)
+	request := JobRequest{
+		ID:              delegationContinuationID(job.ID),
+		Agent:           job.Agent,
+		Action:          "ask",
+		Model:           payload.Model,
+		Phase:           payload.Phase,
+		Repo:            payload.Repo,
+		Branch:          payload.Branch,
+		PullRequest:     payload.PullRequest,
+		HeadSHA:         payload.HeadSHA,
+		GoalID:          payload.GoalID,
+		TaskID:          payload.TaskID,
+		TaskTitle:       payload.TaskTitle,
+		LeadAgent:       payload.LeadAgent,
+		Reviewers:       payload.Reviewers,
+		Sender:          job.Agent,
+		Instructions:    buildPreflightCorrectiveContinuationPrompt(goal, payload.Result, reason),
+		Constraints:     payload.Constraints,
+		ParentJobID:     job.ID,
+		DelegationDepth: payload.DelegationDepth + 1,
+		DelegatedBy:     job.Agent,
+		RootJobID:       e.rootJobID(job, payload),
+		// Carry the window forward and mark that a corrective nudge has fired, and
+		// thread the streak forward, so a coordinator that keeps naming bad agents
+		// escalates to a graceful finalize.
+		RecentDelegationHashes: appendDelegationHashWindow(payload.RecentDelegationHashes, canonicalDelegationSetHash(payload.Result.Delegations)),
+		DelegationRepeatCount:  payload.DelegationRepeatCount + 1,
+		NonProgressStreak:      nonProgressStreak,
+		LastProgressDigest:     payload.LastProgressDigest,
+		// Inherit the coordinator's cockpit settings so the continuation renders its
+		// pane under the same workspace/session as the rest of the tree.
+		Cockpit:        payload.Cockpit,
+		CockpitSession: payload.CockpitSession,
+		CockpitPaneKey: payload.CockpitPaneKey,
+	}
+	if err := e.enqueue(ctx, request); err != nil {
+		return fmt.Errorf("enqueue preflight corrective continuation for %q: %w", job.ID, err)
+	}
+	// The corrective continuation IS the coordinator's single continuation, so it
+	// occupies the continuation slot: emit delegation_continuation_enqueued so a
+	// re-advance hits the continuationEnqueued top-guard.
+	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   job.ID,
+		Kind:    "delegation_continuation_enqueued",
+		Message: fmt.Sprintf("preflight corrective continuation occupies the continuation slot for job %s", request.ID),
+	})
+	return nil
 }
 
 // enqueueFinalizeContinuation enqueues a single best-effort "finalize"
@@ -1828,6 +2093,34 @@ func (e Engine) advanceDelegations(ctx context.Context, parentJob db.Job, parent
 		return err
 	}
 
+	// #438: structured sibling of the #419 prose block. Now that a child has
+	// finished, augment context-manifest.json with the result-reference fields for
+	// every SUCCEEDED delegation so a downstream reader can reference an upstream
+	// output by structured JSON rather than re-parsing the prose block. The
+	// just-finished child is already in the children map read above, so the enriched
+	// view reflects the current succeeded set (later re-reads in this pass only add
+	// newly-enqueued, not-yet-succeeded dependents). It is gated on
+	// InjectUpstreamDepContext so the flag-off path never re-writes the manifest and
+	// stays byte-identical to today, and the write is idempotent (deterministic,
+	// sorted JSON) so repeated passes over a stable succeeded set produce no churn.
+	// Best-effort like the dispatch artifact write: a manifest write failure must
+	// not block draining ready dependents.
+	if e.InjectUpstreamDepContext {
+		if augmentedDir, augErr := augmentDelegationManifest(e.ArtifactRoot, parentJob.ID, parentResult, children, dedupWinners, e); augErr != nil {
+			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+				JobID:   parentJob.ID,
+				Kind:    "delegation_manifest_augment_failed",
+				Message: fmt.Sprintf("augment delegation manifest: %v", augErr),
+			})
+		} else if augmentedDir != "" {
+			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+				JobID:   parentJob.ID,
+				Kind:    "delegation_manifest_augmented",
+				Message: fmt.Sprintf("delegation manifest augmented at %s", augmentedDir),
+			})
+		}
+	}
+
 	// Retry pass: a delegation that failed but has retry budget left is
 	// re-enqueued as a fresh child before any failure_policy is applied, so its
 	// failure is absorbed by the retry rather than blocking/escalating. A
@@ -1976,13 +2269,38 @@ func (e Engine) advanceDelegations(ctx context.Context, parentJob db.Job, parent
 	return nil
 }
 
+// continuationConfig holds the optional inputs threaded into a coordinator
+// continuation (#445). It is empty by default so every existing call site builds
+// the byte-identical continuation it always did.
+type continuationConfig struct {
+	// humanAnswer, when non-empty, is the rendered ask-gate answer block injected
+	// at the top of the NORMAL continuation prompt so the resumed coordinator reads
+	// the human's decision (the answer-driven resume path only ever reaches the
+	// normal continuation, never the loop/verify-replan corrective ones).
+	humanAnswer string
+}
+
+// continuationOption configures a maybeEnqueueContinuation call without changing
+// the byte-identical default (no options) path.
+type continuationOption func(*continuationConfig)
+
+// withHumanAnswer threads a rendered ask-gate answer block into the continuation
+// prompt (#445).
+func withHumanAnswer(answer string) continuationOption {
+	return func(c *continuationConfig) { c.humanAnswer = answer }
+}
+
 // maybeEnqueueContinuation enqueues exactly one coordinator continuation job for
 // a parent whose delegations have all finished. Idempotency is enforced by a
 // deterministic continuation id plus a one-shot delegation_continuation_enqueued
 // event on the parent, so concurrent child completions enqueue it at most once.
 // When any delegation declares synthesis_rule "vote", the continuation is gated:
 // the parent task is blocked unless every child was approved/succeeded.
-func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, parentPayload JobPayload, parentResult *AgentResult, children map[string]db.Job, ref taskRef) error {
+func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, parentPayload JobPayload, parentResult *AgentResult, children map[string]db.Job, ref taskRef, opts ...continuationOption) error {
+	var cfg continuationConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	events, err := e.Store.ListJobEvents(ctx, parentJob.ID)
 	if err != nil {
 		return err
@@ -2114,6 +2432,96 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		return nil
 	}
 
+	// synthesis_rule "verify" (#439): unlike vote/quorum (which BLOCK on failure),
+	// verify derives a pass/fail VERDICT from the verify-tagged legs and, on a
+	// FAILED verdict, enqueues a BOUNDED corrective "replan" continuation so the
+	// coordinator can self-correct — the verify→replan loop is enforced by the
+	// engine rather than left to the coordinator. The verdict is mechanical: any
+	// verify-tagged leg that did NOT reach an approving outcome (the same test
+	// vote/quorum use) fails it (a missing verify child also fails). On a PASSED
+	// verdict this falls through to the normal synthesis continuation below,
+	// byte-identical to the pre-change path. The loop is bounded by a dedicated
+	// per-root VerifyAttempt cap: below the cap a verify_replan_warning + corrective
+	// replan continuation fire; at/over the cap it routes to the #305 graceful
+	// finalize continuation (verify_replan_exhausted) like every other backstop.
+	// This sits AFTER the continuationEnqueued top-guard and the non-progress check
+	// and emits delegation_continuation_enqueued for its own request, so it occupies
+	// the single continuation slot and a re-advance never double-enqueues.
+	// dedupWinners mirrors advanceDelegations: a fingerprint-deduped verify leg
+	// never owns its own child, so the verdict must resolve it against its winning
+	// sibling rather than reading the absent child as a failed verdict.
+	dedupWinners := dedupedDelegationWinners(parentResult.Delegations, children, events)
+	if delegationSynthesisRequiresVerify(parentResult.Delegations) && !verifyVerdictPassed(parentResult.Delegations, children, childPayloads, dedupWinners) {
+		attemptCap := e.verifyReplanAttemptCap()
+		if parentPayload.VerifyAttempt >= attemptCap {
+			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+				JobID:   parentJob.ID,
+				Kind:    "verify_replan_exhausted",
+				Message: fmt.Sprintf("verify→replan attempt cap of %d reached for job %s; finalizing instead of replanning", attemptCap, parentJob.ID),
+			})
+			// Graceful finalize (#305): give the coordinator one terminal continuation
+			// to synthesize a best-effort result rather than looping on a failed verdict.
+			return e.enqueueFinalizeContinuation(ctx, parentJob, parentPayload, fmt.Sprintf("verify→replan attempt cap of %d reached", attemptCap))
+		}
+
+		attempt := parentPayload.VerifyAttempt + 1
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   parentJob.ID,
+			Kind:    "verify_replan_warning",
+			Message: fmt.Sprintf("independent verification failed (attempt %d/%d); sending a corrective replan continuation for job %s", attempt, attemptCap, parentJob.ID),
+		})
+		replanRequest := JobRequest{
+			ID:              delegationContinuationID(parentJob.ID),
+			Agent:           parentJob.Agent,
+			Action:          "ask",
+			Model:           parentPayload.Model,
+			Phase:           parentPayload.Phase,
+			Repo:            parentPayload.Repo,
+			Branch:          parentPayload.Branch,
+			PullRequest:     parentPayload.PullRequest,
+			HeadSHA:         parentPayload.HeadSHA,
+			GoalID:          parentPayload.GoalID,
+			TaskID:          parentPayload.TaskID,
+			TaskTitle:       parentPayload.TaskTitle,
+			LeadAgent:       parentPayload.LeadAgent,
+			Reviewers:       parentPayload.Reviewers,
+			Sender:          parentJob.Agent,
+			Instructions:    buildVerifyReplanContinuationPrompt(goal, parentResult, children, childPayloads, attempt, attemptCap),
+			Constraints:     parentPayload.Constraints,
+			ParentJobID:     parentJob.ID,
+			DelegationDepth: parentPayload.DelegationDepth + 1,
+			DelegatedBy:     parentJob.Agent,
+			RootJobID:       e.rootJobID(parentJob, parentPayload),
+			// Consume one verify attempt so a still-failing verdict next generation
+			// climbs toward the cap and eventually finalizes.
+			VerifyAttempt: attempt,
+			// Carry the non-progress carry-forward fields so a genuine corrective replan
+			// is not misclassified as a loop: record this generation's progressDigest and
+			// thread the (sub-threshold) streak/window forward exactly like the normal
+			// continuation below. A real verdict-driven replan IS a new generation.
+			RecentDelegationHashes: appendDelegationHashWindow(parentPayload.RecentDelegationHashes, canonicalDelegationSetHash(parentResult.Delegations)),
+			DelegationRepeatCount:  0,
+			NonProgressStreak:      nonProgressStreak,
+			LastProgressDigest:     digest,
+			Cockpit:                parentPayload.Cockpit,
+			CockpitSession:         parentPayload.CockpitSession,
+			CockpitPaneKey:         parentPayload.CockpitPaneKey,
+		}
+		if err := e.enqueue(ctx, replanRequest); err != nil {
+			return fmt.Errorf("enqueue verify replan continuation for %q: %w", parentJob.ID, err)
+		}
+		// The replan continuation IS the coordinator's single continuation, so it
+		// occupies the continuation slot: emit delegation_continuation_enqueued so a
+		// re-advance hits the continuationEnqueued top-guard rather than re-running
+		// the verify gate (and never double-enqueues a normal continuation).
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   parentJob.ID,
+			Kind:    "delegation_continuation_enqueued",
+			Message: fmt.Sprintf("verify replan continuation occupies the continuation slot for job %s", replanRequest.ID),
+		})
+		return nil
+	}
+
 	request := JobRequest{
 		ID:          delegationContinuationID(parentJob.ID),
 		Agent:       parentJob.Agent,
@@ -2134,9 +2542,14 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		// the coordinator toward synthesizing now over more fan-out. The job count is
 		// best-effort — a lookup error yields 0, which suppresses only the job clause,
 		// never the continuation.
-		Instructions: e.buildContinuationPrompt(goal, budgetPressureLine(parentPayload.DelegationDepth+1, e.rootJobCountForPressure(ctx, e.rootJobID(parentJob, parentPayload))), parentResult, children, childPayloads),
+		Instructions: e.buildContinuationPrompt(goal, budgetPressureLine(parentPayload.DelegationDepth+1, e.rootJobCountForPressure(ctx, e.rootJobID(parentJob, parentPayload))), parentResult, children, childPayloads, cfg.humanAnswer),
 		Constraints:  parentPayload.Constraints,
 		ParentJobID:  parentJob.ID,
+		// Ask-gate answer (#445): carry the human's answer block on the continuation
+		// for durability/observability; buildContinuationPrompt above already rendered
+		// it at the top of the prompt. Empty (the default) for every non-answer path,
+		// so omitempty keeps the stored payload byte-identical.
+		HumanAnswer: cfg.humanAnswer,
 		// Increment depth per continuation generation so a coordinator whose
 		// continuation re-delegates is bounded by MaxDelegationDepth instead of
 		// looping forever (the continuation reused the parent's depth before).
@@ -2513,10 +2926,19 @@ func delegationContinuationID(parentJobID string) string {
 
 // buildContinuationPrompt inlines each finished child's job id, agent, decision,
 // summary, and PR link into the coordinator continuation prompt so the
-// coordinator can synthesize the results without re-reading every child job.
-func (e Engine) buildContinuationPrompt(goal, budgetLine string, parentResult *AgentResult, children map[string]db.Job, childPayloads map[string]JobPayload) string {
+// coordinator can synthesize the results without re-reading every child job. When
+// humanAnswer is non-empty (the ask-gate `answer` resume path, #445) it is
+// rendered as a clearly-labelled block at the TOP of the prompt so the resumed
+// coordinator reads the human's decision before the delegation results; it is ""
+// for every non-answer continuation, keeping that prompt byte-identical.
+func (e Engine) buildContinuationPrompt(goal, budgetLine string, parentResult *AgentResult, children map[string]db.Job, childPayloads map[string]JobPayload, humanAnswer string) string {
 	var builder strings.Builder
 	builder.WriteString(goalAnchorHeader(goal))
+	if block := strings.TrimSpace(humanAnswer); block != "" {
+		builder.WriteString("Human answers to your questions (you paused to ask these; use them and proceed):\n")
+		builder.WriteString(block)
+		builder.WriteString("\n\n")
+	}
 	builder.WriteString("All delegated jobs have finished. Review the results below.\n\n")
 	builder.WriteString(budgetLine)
 	builder.WriteString("Delegation results:\n")
@@ -2627,7 +3049,7 @@ const maxUpstreamDepSummaryPreviewBytes = 280
 // deps[] as real dataflow. For each of d's succeeded DIRECT deps (sorted by id for
 // stable output), it emits a header line —
 //
-//	- dep <id> (agent <a>, action <act>): <decision> — <summary preview> (<PR>) [changes_made: N] [head <sha7>]
+//   - dep <id> (agent <a>, action <act>): <decision> — <summary preview> (<PR>) [changes_made: N] [head <sha7>]
 //
 // then the dep's artifact_body as a fenced, byte-budgeted block reusing
 // appendInlineArtifactBody (the SAME per-body cap and shared aggregate budget the
@@ -2837,6 +3259,84 @@ func buildCorrectiveContinuationPrompt(goal string, parentResult *AgentResult) s
 	return builder.String()
 }
 
+// buildPreflightCorrectiveContinuationPrompt is the corrective continuation sent
+// when a delegation set is unroutable (#451): one or more delegations named an
+// agent that is not a routable registered agent (unknown / not-allowed /
+// uncapable — most often a runtime name where an agent NAME was required). It
+// carries the actionable preflight reason (which lists the agents valid for the
+// repo and the inline ephemeral alternative) so the coordinator can re-emit a
+// corrected set, and it restates that the agent field is a registered agent NAME,
+// not a runtime. None of the set was dispatched (all-or-nothing preflight).
+func buildPreflightCorrectiveContinuationPrompt(goal string, parentResult *AgentResult, reason string) string {
+	var builder strings.Builder
+	builder.WriteString(goalAnchorHeader(goal))
+	builder.WriteString("Your delegation set could not be dispatched: it named an agent that is not routable, so NONE of it was dispatched (the preflight is all-or-nothing).\n\n")
+	fmt.Fprintf(&builder, "%s\n\n", strings.TrimSpace(reason))
+	builder.WriteString("A delegation's `agent` field is a registered agent NAME, not a runtime (codex/claude/kimi are runtimes). Re-emit the delegation set using a valid agent name from the list above, or use an inline `ephemeral` spec for an unregistered worker. If you cannot route the work, return an EMPTY delegations list to finish.\n")
+	if parentResult != nil && len(parentResult.Delegations) > 0 {
+		builder.WriteString("\nDelegations that were NOT dispatched:\n")
+		for _, d := range parentResult.Delegations {
+			fmt.Fprintf(&builder, "- delegation %q (agent %s, action %s)\n", d.ID, d.Agent, d.Action)
+		}
+	}
+	return builder.String()
+}
+
+// buildVerifyReplanContinuationPrompt is the bounded corrective continuation sent
+// when the engine-level verify gate (#439) derives a FAILED verdict from the
+// verify-tagged legs. Unlike the finalize prompt it is NOT terminal — it asks the
+// coordinator to REPLAN: fix the issues the independent verification surfaced and
+// re-run the work. It is goal-anchored (#418), surfaces each verify leg's
+// decision/summary so the replan can target the fix, and states the remaining
+// attempt budget (after this attempt the loop routes to a best-effort finalize).
+func buildVerifyReplanContinuationPrompt(goal string, parentResult *AgentResult, children map[string]db.Job, childPayloads map[string]JobPayload, attempt, attemptCap int) string {
+	var builder strings.Builder
+	builder.WriteString(goalAnchorHeader(goal))
+	builder.WriteString("Independent verification FAILED: at least one verify leg reported the work is not yet correct.\n\n")
+	// Surface the verify legs' findings so the coordinator can target the fix
+	// rather than re-running blind. Only the verify-tagged legs are listed (the
+	// failing verdict is derived from them).
+	if parentResult != nil {
+		wrote := false
+		for _, d := range parentResult.Delegations {
+			if delegationSynthesisRule(d) != "verify" {
+				continue
+			}
+			if !wrote {
+				builder.WriteString("Verification findings:\n")
+				wrote = true
+			}
+			decision := "missing"
+			summary := ""
+			if child, ok := children[d.ID]; ok {
+				decision = child.State
+			}
+			if payload, ok := childPayloads[d.ID]; ok && payload.Result != nil {
+				if strings.TrimSpace(payload.Result.Decision) != "" {
+					decision = payload.Result.Decision
+				}
+				summary = strings.TrimSpace(payload.Result.Summary)
+			}
+			fmt.Fprintf(&builder, "- verify leg %q (agent %s): %s", d.ID, d.Agent, decision)
+			if summary != "" {
+				fmt.Fprintf(&builder, " — %s", summary)
+			}
+			builder.WriteString("\n")
+		}
+		if wrote {
+			builder.WriteString("\n")
+		}
+	}
+	fmt.Fprintf(&builder, "This is verify→replan attempt %d of %d. Address the verification findings above, then re-delegate the corrective work. ", attempt, attemptCap)
+	if attempt >= attemptCap {
+		builder.WriteString("This is the LAST attempt: if verification fails again you will be asked to synthesize a best-effort final result.\n\n")
+	} else {
+		builder.WriteString("\n\n")
+	}
+	builder.WriteString(goalSynthesisClosing(goal))
+	return builder.String()
+}
+
 // buildFinalizeContinuationPrompt is the terminal continuation sent when a
 // termination backstop trips. It tells the coordinator it has hit a limit and
 // cannot delegate further, asks it to synthesize a best-effort final result from
@@ -2979,6 +3479,83 @@ func delegationDecisionApproves(decision string) bool {
 	}
 }
 
+// delegationSynthesisRequiresVerify reports whether any delegation in the batch
+// declares synthesis_rule "verify", which makes the coordinator continuation
+// subject to the engine-level verify→replan gate (#439). Unlike vote/quorum it
+// does NOT block on failure; it issues a bounded corrective replan continuation.
+func delegationSynthesisRequiresVerify(delegations []Delegation) bool {
+	for _, d := range delegations {
+		if delegationSynthesisRule(d) == "verify" {
+			return true
+		}
+	}
+	return false
+}
+
+// verifyVerdictPassed derives the v1 verify VERDICT (#439) mechanically from the
+// verify-tagged legs (synthesis_rule == "verify"): it returns false iff any such
+// leg reached a NON-approving outcome. The verdict is DECISION-driven, reusing the
+// approving-outcome test (delegationDecisionApproves) over the #421 convention that
+// a verify leg returns approved on a pass and changes_requested on a fail. Because
+// a review's changes_requested decision maps to a SUCCEEDED job state
+// (stateForDecision), the decision is consulted FIRST whenever the leg produced a
+// parsed result — otherwise the succeeded-state short-circuit vote/quorum use would
+// read every changes_requested verdict as a pass and defeat the gate. The
+// succeeded-state check is kept only as a fallback for a verify leg that finished
+// in a succeeded state without a parsed result.
+//
+// A verify leg with NO child is interpreted by whether it could ever have run.
+// A leg whose deps terminally failed (delegationPermanentlyBlocked, the same
+// predicate allDelegationsResolved uses) or that was folded into a fingerprint
+// dedup winner NEVER RAN: verification was not performed, so its outcome is
+// already governed by the upstream failure policy (continue/escalate) and it must
+// be SKIPPED here, not read as a failed verdict — otherwise the engine would
+// fabricate a failed verdict from an absent verifier and fire a premature
+// verify→replan continuation claiming verification failed when it never happened
+// (#439 review). Only a verify leg that WAS dispatchable yet has no terminal child
+// (a genuinely missing/crashed verification) fails the verdict, so an absent
+// verification of work that actually ran is never read as a pass. Non-verify legs
+// are ignored here (the conservative ordering runs the vote/quorum gates first).
+// No engine-side verify subprocess or second model call is made: the engine reads
+// the already-completed verdict the verify leg reported.
+func verifyVerdictPassed(delegations []Delegation, children map[string]db.Job, childPayloads map[string]JobPayload, dedupWinners map[string]db.Job) bool {
+	byID := delegationsByID(delegations)
+	for _, d := range delegations {
+		if delegationSynthesisRule(d) != "verify" {
+			continue
+		}
+		child, ok := children[d.ID]
+		if !ok {
+			// A verify leg that never ran (its deps terminally failed, or it was
+			// folded into a dedup winner) is governed by the upstream failure policy,
+			// not by this verdict: skip it rather than fabricating a failed verdict.
+			if _, deduped := dedupWinners[d.ID]; deduped {
+				continue
+			}
+			if delegationPermanentlyBlocked(d, children, byID, dedupWinners, map[string]bool{}) {
+				continue
+			}
+			// Dispatchable verify leg with no terminal child: a genuinely missing or
+			// crashed verification fails the verdict.
+			return false
+		}
+		// Decision-first: when the verify leg produced a parsed result, its decision
+		// is the verdict (approved => pass, changes_requested/failed/blocked => fail).
+		if payload, ok := childPayloads[d.ID]; ok && payload.Result != nil {
+			if !delegationDecisionApproves(payload.Result.Decision) {
+				return false
+			}
+			continue
+		}
+		// No parsed result: fall back to the job state — a succeeded leg with no
+		// verdict is treated as a pass, anything else (failed/blocked/queued) fails.
+		if child.State != string(JobSucceeded) {
+			return false
+		}
+	}
+	return true
+}
+
 func (e Engine) preflightDelegation(ctx context.Context, request JobRequest) error {
 	// An ephemeral delegation routes to an on-demand worker that no agent row
 	// backs, so the registered-agent existence, repo-access, and capability checks
@@ -2986,12 +3563,21 @@ func (e Engine) preflightDelegation(ctx context.Context, request JobRequest) err
 	// scope. Only validate that the spec runtime is a real agent runtime (never
 	// shell); the daemon materializes the worker from the spec.
 	if request.Ephemeral != nil {
-		return validateEphemeralSpec(request.DelegationID, request.Ephemeral)
+		return validateEphemeralSpec(request.DelegationID, request.Action, request.Ephemeral)
 	}
+	// Check existence FIRST so a legitimately-named agent literally called
+	// "claude" (GetAgent hits) is never mistaken for the runtime-name mixup below.
 	agent, err := e.Store.GetAgent(ctx, request.Agent)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("agent %q is not subscribed", request.Agent)
+			// The name resolves to no agent. Only when it is itself a runtime name
+			// ({codex,claude,kimi}) is this the common runtime-vs-agent mixup, so
+			// flag that explicitly; otherwise it is a typo/unknown agent.
+			prefix := fmt.Sprintf("agent %q is not subscribed", request.Agent)
+			if _, isRuntime := allowedSet(EphemeralRuntimes)[strings.TrimSpace(request.Agent)]; isRuntime {
+				prefix = fmt.Sprintf("%q is a runtime, not a registered agent", request.Agent)
+			}
+			return fmt.Errorf("%s. %s", prefix, e.delegationAgentHint(ctx, request.Repo))
 		}
 		return err
 	}
@@ -3000,12 +3586,49 @@ func (e Engine) preflightDelegation(ctx context.Context, request JobRequest) err
 		return err
 	}
 	if !allowed {
-		return fmt.Errorf("agent %q is not allowed on %q", agent.Name, request.Repo)
+		return fmt.Errorf("agent %q is not allowed on %q. %s", agent.Name, request.Repo, e.delegationAgentHint(ctx, request.Repo))
 	}
 	if !contains(agent.Capabilities, request.Action) {
-		return fmt.Errorf("agent %q lacks %q capability", agent.Name, request.Action)
+		return fmt.Errorf("agent %q lacks %q capability. %s", agent.Name, request.Action, e.delegationAgentHint(ctx, request.Repo))
 	}
 	return nil
+}
+
+// availableAgentsForRepo returns the names of registered agents that can access
+// repo, sorted by name (ListAgents already ORDER BY name). It fails soft: a
+// ListAgents error yields nil so the caller's base error is never masked, and a
+// per-agent AgentCanAccessRepo error simply drops that agent from the suggestion.
+func (e Engine) availableAgentsForRepo(ctx context.Context, repo string) []string {
+	agents, err := e.Store.ListAgents(ctx)
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, a := range agents {
+		ok, err := e.Store.AgentCanAccessRepo(ctx, a.Name, repo)
+		if err != nil || !ok {
+			continue
+		}
+		names = append(names, a.Name)
+	}
+	return names
+}
+
+// delegationAgentHint renders the actionable suffix appended to every
+// preflightDelegation error: which registered agents are usable on repo (so a
+// coordinator can re-emit a corrected set) plus the inline ephemeral escape hatch
+// that needs no pre-registration. The agent field of a delegation is a registered
+// agent NAME, not a runtime.
+func (e Engine) delegationAgentHint(ctx context.Context, repo string) string {
+	var b strings.Builder
+	names := e.availableAgentsForRepo(ctx, repo)
+	if len(names) > 0 {
+		fmt.Fprintf(&b, "Agents allowed on %s: %s. ", repo, strings.Join(names, ", "))
+	} else {
+		fmt.Fprintf(&b, "No agents are registered for %s. ", repo)
+	}
+	b.WriteString(`To run an unregistered worker, use an inline ephemeral spec ({runtime: "codex|claude|kimi"}).`)
+	return b.String()
 }
 
 func (e Engine) implementationNeedsFinalizer(ctx context.Context, payload JobPayload) bool {
@@ -3381,7 +4004,7 @@ func (e Engine) ensureAgentAllowedWithBranchOwner(ctx context.Context, request J
 	// agent runtime (never shell), then fall through to the shared branch-lock path
 	// so an ephemeral implement still serializes on its branch like any other.
 	if request.Ephemeral != nil {
-		if err := validateEphemeralSpec(request.DelegationID, request.Ephemeral); err != nil {
+		if err := validateEphemeralSpec(request.DelegationID, request.Action, request.Ephemeral); err != nil {
 			return e.block(ctx, ref, err.Error())
 		}
 		if request.Action == "implement" {
@@ -3407,6 +4030,14 @@ func (e Engine) ensureAgentAllowedWithBranchOwner(ctx context.Context, request J
 		return e.block(ctx, ref, fmt.Sprintf("agent %q lacks %q capability", agent.Name, request.Action))
 	}
 	if request.Action == "implement" {
+		// Fail-closed: an implement job whose agent grants no headless write
+		// (auto/empty or read-only) is BLOCKED here — at the universal dispatch
+		// preflight — rather than running to completion and producing no files. This
+		// catches pre-existing agents and later policy edits, using the same shared
+		// guidance the CLI emits at start/subscribe.
+		if err := runtime.ImplementWritePolicyError([]string{request.Action}, agent.AutonomyPolicy); err != nil {
+			return e.block(ctx, ref, err.Error())
+		}
 		if err := e.ensureBranchLock(ctx, request.Repo, request.Branch, branchOwner, ref); err != nil {
 			return err
 		}
@@ -3568,7 +4199,25 @@ type EscalationRecord struct {
 	Reason       string `json:"reason,omitempty"`
 	Question     string `json:"question,omitempty"`
 	PausedAt     string `json:"paused_at,omitempty"`
+	// Kind discriminates the pause flavor (#445): "" (or "failure") is the
+	// escalate_human failure pause; "ask" is the non-failure ask-gate pause opened
+	// by a healthy result's human_questions[]. It rides the SAME
+	// delegation_escalation_requested/_resolved event kinds so TTL, wall-clock
+	// pause exclusion, and round-idempotency all apply unchanged; only the
+	// human-facing rendering and the resume verb gating branch on it.
+	Kind string `json:"kind,omitempty"`
+	// Questions carries the ask-gate's human_questions[] on the requested event so
+	// the notifier can render them and the resume can map answers by id. Empty for
+	// a failure escalation.
+	Questions []HumanQuestion `json:"questions,omitempty"`
+	// Answers carries the human's parsed id->answer map on the resolved event of an
+	// ask round. Empty for a failure escalation or an unanswered (TTL) resolution.
+	Answers map[string]string `json:"answers,omitempty"`
 }
+
+// escalationKindAsk is the EscalationRecord.Kind discriminator for an ask-gate
+// pause (#445); the failure-escalation pause leaves Kind empty.
+const escalationKindAsk = "ask"
 
 // pauseAwaitingHuman is the escalate_human analogue of block (#340): it sets the
 // shared parent task to TaskAwaitingHuman, records a per-round
@@ -3640,7 +4289,186 @@ func (e Engine) pauseAwaitingHuman(ctx context.Context, parentJob db.Job, parent
 		})
 	}
 
+	// Emit a best-effort job.needs_attention on the FRESH escalation round (#446).
+	// It is gated on the same one-shot path as the escalationRequested event above
+	// (we only reach here when the round was CLOSED), so a re-advance does NOT
+	// re-emit. nil-safe: no EventSink => no event. detail carries the redacted
+	// question. This is the seam #445's ask-gate rides to emit its own
+	// job.needs_attention. The coordinator job id is the subject so a consumer can
+	// resume the right tree; root_id groups the run.
+	rootID := strings.TrimSpace(parentPayload.RootJobID)
+	if rootID == "" {
+		rootID = parentJob.ID
+	}
+	events.EmitEvent(ctx, e.EventSink, events.NewEvent(
+		events.EventJobNeedsAttention,
+		parentJob.ID,
+		rootID,
+		firstNonEmptyString(ref.Repo, parentPayload.Repo),
+		string(TaskAwaitingHuman),
+		strings.TrimSpace(d.Prompt),
+		e.now(),
+		RedactCommentText,
+	))
+
 	return awaitErr
+}
+
+// pauseAwaitingHumanAnswer is the non-failure ask-gate sibling of
+// pauseAwaitingHuman (#445): a HEALTHY job that returned human_questions[] pauses
+// its task at awaiting_human for a specific human answer. It reuses the exact
+// escalate_human pause plumbing — the same delegation_escalation_requested event
+// kind (tagged Kind="ask" + the questions), the same escalationOpen round guard,
+// and the same EscalationNotifier / job.needs_attention (#446) seam — so TTL
+// auto-finalize, wall-clock pause exclusion, and round-idempotency all apply with
+// no extra plumbing. It enqueues NO continuation and dispatches NO delegations
+// (the caller short-circuits on a true return), so the pause is budget-neutral
+// and consumes zero compute until the human resumes with `answer`.
+//
+// It returns whether the ask round is currently OPEN. true => the caller returns
+// AwaitingHumanError (freshly opened, or an idempotent re-advance while awaiting).
+// false => the round is CLOSED (the human already answered and the answer-driven
+// continuation is in flight, or the ask was TTL-finalized): the caller
+// short-circuits AdvanceJob without redispatching.
+//
+// When the asking job is a delegation CHILD (#445), the round is keyed/recorded/
+// routed on its COORDINATOR (payload.ParentJobID) exactly like the escalate_human
+// failure pause (which keys on parentJob.ID), NOT on the child's own id. This
+// preserves the frozen single-round-per-parent invariant: the FIRST asking sibling
+// opens the one shared round and subsequent siblings hit the open-round guard, the
+// shared parent task flips once, and the human resumes the COORDINATOR (whose
+// continuation carries the answer) — not a child that the parent DAG would advance
+// past independently.
+func (e Engine) pauseAwaitingHumanAnswer(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) (bool, error) {
+	// Route the pause to the coordinator when the asking job is a delegation child:
+	// the escalation event, round guard, notifier target, and task ref all key on
+	// the coordinator so siblings share one round (mirrors pauseAwaitingHuman).
+	targetID := job.ID
+	targetRef := ref
+	if parentID := strings.TrimSpace(payload.ParentJobID); parentID != "" {
+		targetID = parentID
+		if _, parentPayload, perr := e.jobPayload(ctx, parentID); perr == nil {
+			if pref := taskRefFromPayload(parentPayload); pref.ID != "" {
+				targetRef = pref
+			}
+		}
+	}
+
+	// While ANY escalation round is OPEN (requested > resolved) on the target
+	// (coordinator for a child, else self), this is an idempotent re-advance: keep
+	// the pause, re-record nothing, re-notify nobody.
+	open, err := e.escalationOpen(ctx, targetID)
+	if err != nil {
+		return false, err
+	}
+	if open {
+		return true, nil
+	}
+
+	// No OPEN round. If an ask round was already opened AND resolved for the target,
+	// the human has answered (or TTL-finalized) and the answer-driven continuation
+	// is the asking job's sole continuation: report CLOSED so the caller
+	// short-circuits without re-pausing or redispatching. Mirrors the
+	// escalate_human round model, but an asking job is never re-run to open a
+	// second ask round (only a retried failing leg re-pauses), so a resolved ask
+	// round stays closed.
+	if _, exists, lerr := e.loadEscalation(ctx, targetID); lerr != nil {
+		return false, lerr
+	} else if exists {
+		// A child that asks while the coordinator's round was already opened+resolved
+		// by a sibling is CLOSED (the shared answer-continuation is in flight); a
+		// resolved/non-ask round on the coordinator is also not ours to reopen.
+		return false, nil
+	}
+
+	// Open a FRESH ask round: pause the (coordinator's) task, record the requested
+	// event with the questions on the target, notify best-effort, and emit
+	// job.needs_attention once. All keyed on targetID/targetRef so a child's ask
+	// routes to its coordinator.
+	if err := e.setTaskState(ctx, targetRef, TaskAwaitingHuman); err != nil {
+		return false, err
+	}
+
+	questions := payload.Result.HumanQuestions
+	record := EscalationRecord{
+		Reason:    fmt.Sprintf("%d human question(s) awaiting an answer", len(questions)),
+		Question:  renderHumanQuestions(questions),
+		PausedAt:  e.now().UTC().Format(time.RFC3339),
+		Kind:      escalationKindAsk,
+		Questions: questions,
+	}
+	encoded, marshalErr := json.Marshal(record)
+	message := record.Reason
+	if marshalErr == nil {
+		message = string(encoded)
+	}
+	if err := e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   targetID,
+		Kind:    escalationRequestedEvent,
+		Message: message,
+	}); err != nil {
+		return false, err
+	}
+
+	// Notify the human best-effort (nil notifier / notifier error never fails the
+	// pause): the recorded event + dashboard Attention are the durable truth. The
+	// CoordinatorJobID is the resume target (the coordinator for a child's ask) so
+	// the human resumes the job whose continuation actually carries the answer.
+	if e.EscalationNotifier != nil {
+		_ = e.EscalationNotifier.NotifyEscalation(ctx, EscalationRequest{
+			CoordinatorJobID: targetID,
+			Question:         renderHumanQuestions(questions),
+			Ask:              true,
+			Questions:        questions,
+			Repo:             firstNonEmptyString(targetRef.Repo, payload.Repo),
+			PullRequest:      payload.PullRequest,
+			Branch:           firstNonEmptyString(targetRef.Branch, payload.Branch),
+			TaskID:           targetRef.ID,
+			TaskTitle:        targetRef.Title,
+		})
+	}
+
+	// Emit a best-effort job.needs_attention on the FRESH ask round via the SAME
+	// #446 EventSink the failure escalation rides (NOT a parallel notify path).
+	// One-shot (we only reach here when no round was open) and nil-safe. The subject
+	// is the resume target (coordinator for a child) so a consumer resumes the right
+	// tree; root_id groups the run.
+	rootID := strings.TrimSpace(payload.RootJobID)
+	if rootID == "" {
+		rootID = targetID
+	}
+	events.EmitEvent(ctx, e.EventSink, events.NewEvent(
+		events.EventJobNeedsAttention,
+		targetID,
+		rootID,
+		firstNonEmptyString(targetRef.Repo, payload.Repo),
+		string(TaskAwaitingHuman),
+		renderHumanQuestions(questions),
+		e.now(),
+		RedactCommentText,
+	))
+
+	return true, nil
+}
+
+// renderHumanQuestions renders the ask-gate questions as a compact, human-facing
+// multi-line block ("- <id>: <prompt> (choices: ...)") used both as the recorded
+// Question text and the needs_attention detail. Empty for no questions.
+func renderHumanQuestions(questions []HumanQuestion) string {
+	if len(questions) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, q := range questions {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		fmt.Fprintf(&b, "- %s: %s", strings.TrimSpace(q.ID), strings.TrimSpace(q.Prompt))
+		if len(q.Choices) > 0 {
+			fmt.Fprintf(&b, " (choices: %s)", strings.Join(q.Choices, ", "))
+		}
+	}
+	return b.String()
 }
 
 // firstNonEmptyString returns the first non-blank value, or "".
@@ -3740,6 +4568,11 @@ const (
 	// ResumeAbort routes to the #305 graceful finalize continuation for a terminal
 	// best-effort synthesis of whatever completed.
 	ResumeAbort ResumeDecision = "abort"
+	// ResumeAnswer delivers a human's answer(s) to an ask-gate pause (#445): it
+	// enqueues the coordinator continuation carrying the answer text. It is valid
+	// only on an ask round (Kind="ask"); the retry/continue/abort verbs are valid
+	// only on a failure-escalation round.
+	ResumeAnswer ResumeDecision = "answer"
 )
 
 // validResumeDecision normalizes and validates a resume verb.
@@ -3751,6 +4584,8 @@ func validResumeDecision(decision string) (ResumeDecision, bool) {
 		return ResumeContinue, true
 	case ResumeAbort:
 		return ResumeAbort, true
+	case ResumeAnswer:
+		return ResumeAnswer, true
 	default:
 		return "", false
 	}
@@ -3777,7 +4612,7 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 	}
 	verb, ok := validResumeDecision(string(decision))
 	if !ok {
-		return fmt.Errorf("invalid resume decision %q; want retry|continue|abort", decision)
+		return fmt.Errorf("invalid resume decision %q; want retry|continue|abort|answer", decision)
 	}
 
 	rec, exists, err := e.loadEscalation(ctx, coordinatorJobID)
@@ -3797,6 +4632,18 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 		return nil
 	}
 
+	// Verb/round-kind gating (#445): the ask-gate's `answer` verb is valid ONLY on
+	// an ask round, and the failure verbs (retry/continue/abort) ONLY on a failure
+	// escalation round. A mismatch is a clear, side-effect-free error so a human who
+	// sends the wrong verb gets a precise ack and the pause stays intact.
+	isAskRound := rec.Kind == escalationKindAsk
+	if verb == ResumeAnswer && !isAskRound {
+		return fmt.Errorf("job %s is paused on a failure escalation, not an ask; resume it with retry|continue|abort, not answer", coordinatorJobID)
+	}
+	if verb != ResumeAnswer && isAskRound {
+		return fmt.Errorf("job %s is awaiting a human answer; resume it with `answer \"<id>: ...\"`, not %s", coordinatorJobID, verb)
+	}
+
 	parentJob, parentPayload, err := e.jobPayload(ctx, coordinatorJobID)
 	if err != nil {
 		return err
@@ -3805,6 +4652,10 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 		return fmt.Errorf("job %s has no result to resume", coordinatorJobID)
 	}
 	ref := taskRefFromPayload(parentPayload)
+
+	// answers is populated only on the ask-gate `answer` verb; it is recorded on the
+	// resolution event (parsed + any unmatched ids) and threaded into the continuation.
+	var answers map[string]string
 
 	switch verb {
 	case ResumeRetry:
@@ -3827,6 +4678,11 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 		if err := e.enqueueFinalizeContinuation(ctx, parentJob, parentPayload, reason); err != nil {
 			return err
 		}
+	case ResumeAnswer:
+		answers = parseHumanAnswers(rec.Questions, instructions)
+		if err := e.resumeAnswerLeg(ctx, parentJob, parentPayload, ref, rec, answers); err != nil {
+			return err
+		}
 	}
 
 	// Clear the pause: move the task out of awaiting_human. retry/continue re-arm
@@ -3844,6 +4700,8 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 		Reason:       string(verb),
 		Question:     strings.TrimSpace(instructions),
 		PausedAt:     e.now().UTC().Format(time.RFC3339), // reused as resolved_at
+		Kind:         rec.Kind,
+		Answers:      answers,
 	}
 	message := string(verb)
 	if encoded, marshalErr := json.Marshal(resolution); marshalErr == nil {
@@ -3883,6 +4741,135 @@ func (e Engine) resumeRetryLeg(ctx context.Context, parentJob db.Job, parentPayl
 		Kind:    "delegation_escalation_retry",
 		Message: fmt.Sprintf("human resume retry re-enqueued delegation %q as job %s", d.ID, request.ID),
 	})
+}
+
+// parseHumanAnswers parses the human's free-form `answer` instructions into an
+// id->answer map (#445). The instruction body is multi-line; each line of the
+// form "<id>: <text>" maps the answer to the matching question id. An id that
+// does not match any open question is recorded under its literal key so it is
+// surfaced (never silently dropped) rather than failing the resume. When the body
+// has no recognizable "<id>:" prefix at all AND there is exactly one open
+// question, the whole body is taken as that question's answer (the common
+// single-question convenience). Returns nil when nothing parses, so the
+// resolution event omits the answers map.
+func parseHumanAnswers(questions []HumanQuestion, instructions string) map[string]string {
+	known := make(map[string]struct{}, len(questions))
+	for _, q := range questions {
+		known[strings.TrimSpace(q.ID)] = struct{}{}
+	}
+	answers := make(map[string]string)
+	matchedAny := false
+	lastID := ""
+	for _, line := range strings.Split(instructions, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if idx := strings.Index(line, ":"); idx > 0 {
+			id := strings.TrimSpace(line[:idx])
+			text := strings.TrimSpace(line[idx+1:])
+			if id != "" {
+				answers[id] = text
+				lastID = id
+				if _, ok := known[id]; ok {
+					matchedAny = true
+				}
+				continue
+			}
+		}
+		// A line with no "<id>:" prefix continues the most recently parsed answer
+		// (a multi-line answer body); with no answer yet it is dropped (the
+		// single-question convenience below covers a prefix-less single answer).
+		if lastID != "" {
+			answers[lastID] = strings.TrimSpace(answers[lastID] + "\n" + line)
+		}
+	}
+	// Single-question convenience: if nothing matched a known id and there is exactly
+	// one question, treat the whole body as that question's answer.
+	if !matchedAny && len(questions) == 1 {
+		if body := strings.TrimSpace(instructions); body != "" {
+			return map[string]string{strings.TrimSpace(questions[0].ID): body}
+		}
+	}
+	if len(answers) == 0 {
+		return nil
+	}
+	return answers
+}
+
+// resumeAnswerLeg enqueues the coordinator continuation carrying the human's
+// answer(s) to an ask-gate pause (#445). It mirrors the ResumeContinue path
+// (maybeEnqueueContinuation under the deterministic continuation id, idempotent
+// via the continuationEnqueued guard) but threads the parsed answers into the
+// continuation request's HumanAnswer field so buildContinuationPrompt renders a
+// clearly-labelled "Human answers to your questions" block at the top of the
+// coordinator's continuation prompt. It is the `answer` verb's worker.
+func (e Engine) resumeAnswerLeg(ctx context.Context, parentJob db.Job, parentPayload JobPayload, ref taskRef, rec EscalationRecord, answers map[string]string) error {
+	children, err := e.childDelegationJobs(ctx, parentJob.ID)
+	if err != nil {
+		return err
+	}
+	answerBlock := renderHumanAnswerBlock(rec.Questions, answers)
+	// The ask-gate short-circuits AdvanceJob BEFORE dispatchDelegations (engine.go
+	// ask-gate block), so an asking result's delegations[] were NEVER dispatched —
+	// no children exist for them (#445). Feeding the un-dispatched delegations into
+	// maybeEnqueueContinuation would (a) make the vote/quorum synthesis gates fail
+	// (every delegation id is missing from the empty children map) and block the
+	// parent — silently losing the human's answer — and (b) make a verify
+	// synthesis_rule emit a misleading replan continuation. It would also render
+	// each delegation as "not enqueued (dependencies unmet)" in the continuation
+	// prompt, which is wrong: they were never attempted. Resume the coordinator from
+	// a copy of its result with Delegations cleared, so the answer-driven
+	// continuation always enqueues and the coordinator decides fresh (it may
+	// re-issue the same delegations now that it has the answer).
+	resumeResult := *parentPayload.Result
+	resumeResult.Delegations = nil
+	if err := e.maybeEnqueueContinuation(ctx, parentJob, parentPayload, &resumeResult, children, ref, withHumanAnswer(answerBlock)); err != nil {
+		return err
+	}
+	return e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   parentJob.ID,
+		Kind:    "delegation_ask_answered",
+		Message: fmt.Sprintf("human answered %d ask-gate question(s) for job %s", len(rec.Questions), parentJob.ID),
+	})
+}
+
+// renderHumanAnswerBlock renders the human's answers (#445) as a stable,
+// id-ordered block keyed by each original question, so the coordinator
+// continuation reads exactly which question got which answer. Questions with no
+// answer are shown as "(no answer provided)"; any answer keyed to an unknown id
+// (a typo the human made) is appended under an "unmatched" section so it is
+// surfaced, never silently dropped.
+func renderHumanAnswerBlock(questions []HumanQuestion, answers map[string]string) string {
+	if len(questions) == 0 && len(answers) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	matched := make(map[string]struct{}, len(answers))
+	for _, q := range questions {
+		id := strings.TrimSpace(q.ID)
+		fmt.Fprintf(&b, "- %s — %s\n", id, strings.TrimSpace(q.Prompt))
+		if ans, ok := answers[id]; ok {
+			matched[id] = struct{}{}
+			fmt.Fprintf(&b, "  answer: %s\n", strings.TrimSpace(ans))
+		} else {
+			b.WriteString("  answer: (no answer provided)\n")
+		}
+	}
+	var unmatched []string
+	for id := range answers {
+		if _, ok := matched[id]; !ok {
+			unmatched = append(unmatched, id)
+		}
+	}
+	if len(unmatched) > 0 {
+		sort.Strings(unmatched)
+		b.WriteString("Unmatched answer ids (no such question; treat as additional human guidance):\n")
+		for _, id := range unmatched {
+			fmt.Fprintf(&b, "- %s: %s\n", id, strings.TrimSpace(answers[id]))
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // findDelegation returns the delegation with the given id from a result's set.
