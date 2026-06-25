@@ -79,7 +79,7 @@ func writeDelegationArtifacts(root string, parentJobID string, result *AgentResu
 		return "", fmt.Errorf("create delegation artifact directory: %w", err)
 	}
 	briefPath := filepath.Join(dir, "brief.md")
-	if err := os.WriteFile(briefPath, []byte(result.ArtifactBody), 0o644); err != nil {
+	if err := writeFileAtomic(briefPath, []byte(result.ArtifactBody), 0o644); err != nil {
 		return "", fmt.Errorf("write delegation brief %s: %w", briefPath, err)
 	}
 	manifest := delegationManifest{
@@ -100,7 +100,7 @@ func writeDelegationArtifacts(root string, parentJobID string, result *AgentResu
 		return "", fmt.Errorf("encode delegation manifest: %w", err)
 	}
 	manifestPath := filepath.Join(dir, "context-manifest.json")
-	if err := os.WriteFile(manifestPath, encoded, 0o644); err != nil {
+	if err := writeFileAtomic(manifestPath, encoded, 0o644); err != nil {
 		return "", fmt.Errorf("write delegation manifest %s: %w", manifestPath, err)
 	}
 	return dir, nil
@@ -123,8 +123,11 @@ func writeDelegationArtifacts(root string, parentJobID string, result *AgentResu
 // dispatch), so repeated passes over a stable succeeded set produce byte-identical
 // output (idempotent — no churn). It is a no-op (returns the resolved dir, no
 // write) when the root is empty or no delegation requested artifacts, mirroring
-// writeDelegationArtifacts. It reuses the same MkdirAll(0o755)+WriteFile(0o644)
-// pattern so a child reading the directory always sees a complete manifest.
+// writeDelegationArtifacts. The manifest write is atomic (writeFileAtomic:
+// temp-file + os.Rename), because advanceDelegations invokes this on EVERY child
+// completion and concurrent sibling completions of one parent can call it in
+// parallel; the rename guarantees a child reading the directory always sees a
+// complete (old-or-new) manifest, never a torn write.
 func augmentDelegationManifest(root string, parentJobID string, parentResult *AgentResult, children, dedupWinners map[string]db.Job, e Engine) (string, error) {
 	if strings.TrimSpace(root) == "" {
 		return "", nil
@@ -152,10 +155,53 @@ func augmentDelegationManifest(root string, parentJobID string, parentResult *Ag
 		return "", fmt.Errorf("encode delegation manifest: %w", err)
 	}
 	manifestPath := filepath.Join(dir, "context-manifest.json")
-	if err := os.WriteFile(manifestPath, encoded, 0o644); err != nil {
+	if err := writeFileAtomic(manifestPath, encoded, 0o644); err != nil {
 		return "", fmt.Errorf("write delegation manifest %s: %w", manifestPath, err)
 	}
 	return dir, nil
+}
+
+// writeFileAtomic writes data to path atomically: it writes to a uniquely-named
+// temp file in the same directory, closes it, then os.Renames it onto
+// path. Rename is atomic on a single filesystem, so a concurrent reader always
+// observes either the complete old or the complete new file, never a torn/short
+// one. This matters for context-manifest.json, which advanceDelegations re-writes
+// on every child completion (augmentDelegationManifest): two read-only sibling
+// delegations of one parent can finish near-simultaneously and the #328/#329
+// read-only fan-out runs them in parallel (distinct worktree checkout keys, not
+// serialized on repo:<repo>), so the augment write must not interleave a bare
+// O_TRUNC os.WriteFile. The encoded manifest is deterministic, so a lost-update
+// race over a stable succeeded set converges harmlessly. It mirrors the
+// established in-repo pattern (internal/artifact/store.go, internal/config/edit.go).
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temp file: %w", err)
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("rename temp file: %w", err)
+	}
+	committed = true
+	return nil
 }
 
 // buildEnrichedManifestEntry returns the reduced manifest entry for a delegation,
