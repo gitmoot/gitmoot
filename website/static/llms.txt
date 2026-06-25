@@ -27,7 +27,7 @@ full expanded context.
 - [Codex And Claude Plugins](https://gitmoot.io/docs/plugins/codex-claude): Plugin discovery and runtime skill setup.
 - [SkillOpt Exchange Contract](https://gitmoot.io/docs/reference/skillopt-exchange-contract): Training and candidate package boundary for the external optimizer.
 - [Troubleshooting](https://gitmoot.io/docs/operations/troubleshooting): Diagnose GitHub auth, bug reports, runtimes, agent templates, remotes, permissions, and locks.
-- [Release Notes](https://gitmoot.io/docs/release-notes/v0.4.2): Latest release — five opt-in orchestration primitives: daemon `--repo`/`--session` scoping, delegation `phase`, inline `artifact_body`, `quorum` synthesis rule, and `--skip-native-review-fanout` (v0.4.1 fixed the Herdr cockpit panes).
+- [Release Notes](https://gitmoot.io/docs/release-notes/v0.5.2): Latest release (v0.5.2) — Orchestra upgrades: goal-anchored finale, `deps[]` dataflow, independent `verifier` pattern, result-aware loop detection, `escalate_human` human-in-the-loop pause, pre-flight DAG fix, `root_id` index, single-sourced result contract; plus `agent restart`, accurate Claude auth health, and automated linux/arm64 releases.
 - [Raw SKILL.md](https://gitmoot.io/SKILL.md): Agent skill entrypoint.
 - [Full LLM Context](https://gitmoot.io/llms-full.txt): Expanded Markdown context for agents.
 - [GitHub Repository](https://github.com/jerryfane/gitmoot): Source code and releases.
