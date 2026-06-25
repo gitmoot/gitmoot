@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -75,14 +77,26 @@ func buildDaemonEventSink(store *db.Store, home string) events.Sink {
 // disabled default when the home or config cannot be resolved/parsed so the
 // event stream stays OFF rather than erroring the daemon.
 func loadEventsPolicy(home string) (config.EventsPolicy, error) {
-	if strings.TrimSpace(home) == "" {
+	home = strings.TrimSpace(home)
+	if home == "" {
 		return config.DefaultEventsPolicy(), nil
 	}
-	paths, err := initializedPaths(home)
-	if err != nil {
-		return config.DefaultEventsPolicy(), nil
+	// The daemon resolves `home` to two different shapes depending on the call
+	// path: jobWorker.workflowHome() yields the already-resolved <home>/.gitmoot
+	// ROOT, while the registered-repo supervisor passes the RAW --home value — and
+	// both flow into daemonWorkflowEngine -> daemonEventSink. Resolve robustly to
+	// the config.toml for EITHER shape, WITHOUT re-running pathsFromFlag/
+	// initializedPaths (which appended ".gitmoot" a SECOND time, read a phantom
+	// .gitmoot/.gitmoot/config.toml that has no [events] section, and even created
+	// that phantom home — leaving the event stream silently always-off even when
+	// [events].webhook_url was set; #446 regression caught by a live E2E).
+	cfg := filepath.Join(home, config.ConfigName)
+	if _, err := os.Stat(cfg); err != nil {
+		// `home` was the raw --home (no config.toml directly under it); append the
+		// .gitmoot dir as PathsForHome would. Side-effect-free (no Initialize).
+		cfg = config.PathsForHome(home).ConfigFile
 	}
-	return config.LoadEventsPolicy(paths)
+	return config.LoadEventsPolicy(config.Paths{ConfigFile: cfg})
 }
 
 // daemonTerminalEventType maps a daemon-owned terminal JobState to the outbound

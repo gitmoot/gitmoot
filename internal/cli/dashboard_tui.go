@@ -573,13 +573,14 @@ func toTUISnapshot(s dashboardSnapshot) tui.Snapshot {
 	jobs := make([]db.Job, 0, len(s.jobRows))
 	for _, row := range s.jobRows {
 		out.JobRows = append(out.JobRows, tui.JobRow{
-			ID:          row.ID,
-			Agent:       row.Agent,
-			Type:        row.Type,
-			State:       row.State,
-			UpdatedAt:   row.UpdatedAt,
-			LatestEvent: row.LatestEvent,
-			Repo:        row.Repo,
+			ID:              row.ID,
+			Agent:           row.Agent,
+			Type:            row.Type,
+			State:           row.State,
+			UpdatedAt:       row.UpdatedAt,
+			LatestEvent:     row.LatestEvent,
+			Repo:            row.Repo,
+			PreflightFailed: row.PreflightFailed,
 		})
 		jobs = append(jobs, row.Job)
 	}

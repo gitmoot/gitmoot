@@ -1447,7 +1447,17 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 	for _, d := range delegations {
 		request := e.delegationRequest(job, payload, d)
 		if err := e.preflightDelegation(ctx, request); err != nil {
-			return e.block(ctx, ref, fmt.Sprintf("delegation %q preflight failed: %v", request.DelegationID, err))
+			// An unroutable delegation set (an unknown / not-allowed / uncapable
+			// agent — usually a runtime name where an agent NAME was required) is no
+			// longer a terminal block: that dead-ends the coordinator before any
+			// child or continuation enqueues. Instead emit a structured
+			// delegation_preflight_failed event and route the actionable error back
+			// through the corrective continuation so the coordinator can re-emit a
+			// corrected set. The all-or-nothing preflight is preserved: we return on
+			// the FIRST failure before the enqueue loop below, so no partial dispatch,
+			// and deferred legs are covered because this loop sees every delegation.
+			reason := fmt.Sprintf("delegation %q preflight failed: %v", request.DelegationID, err)
+			return e.handleDelegationPreflightFailure(ctx, job, payload, reason)
 		}
 	}
 
@@ -1580,6 +1590,102 @@ func (e Engine) handleDelegationLoop(ctx context.Context, job db.Job, payload Jo
 		return true, fmt.Errorf("enqueue corrective continuation for %q: %w", job.ID, err)
 	}
 	return true, nil
+}
+
+// handleDelegationPreflightFailure is the disposition of an unroutable delegation
+// set (#451). It mirrors the delegation-loop seam (handleDelegationLoop) rather
+// than terminal-blocking: the coordinator named an agent that does not resolve to
+// a routable registered agent (unknown / not-allowed / uncapable — most often a
+// runtime name where an agent NAME was required), so instead of dead-ending it is
+// re-invoked once with the actionable error as a corrective continuation so it can
+// re-emit a corrected set. The non-progress bound (MaxDelegationNonProgressStreak)
+// guarantees a graceful finalize if it keeps naming bad agents: a repeat after a
+// corrective nudge (DelegationRepeatCount >= 1) at the streak threshold routes to
+// the #305 finalize continuation rather than looping forever.
+//
+// It always emits a structured delegation_preflight_failed event carrying the
+// reason (the observability surface for `gitmoot job list`), then enqueues the
+// corrective (or finalize) continuation and returns nil — NOT a BlockedError — so
+// the coordinator can self-correct. Idempotent on re-advance: a deterministic
+// continuation id makes e.enqueue a no-op, and a once-guard on the
+// delegation_preflight_failed event avoids double-emitting/double-enqueueing.
+func (e Engine) handleDelegationPreflightFailure(ctx context.Context, job db.Job, payload JobPayload, reason string) error {
+	// Once-guard: if this generation already recorded a preflight failure it has
+	// already enqueued its single continuation (deterministic id), so a re-advance
+	// must not re-emit the event or re-run the streak logic.
+	events, err := e.Store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		return err
+	}
+	for _, ev := range events {
+		if ev.Kind == "delegation_preflight_failed" {
+			return nil
+		}
+	}
+
+	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   job.ID,
+		Kind:    "delegation_preflight_failed",
+		Message: reason,
+	})
+
+	// Bound the corrective loop with the SAME streak ladder the loop/non-progress
+	// detectors use: a coordinator that keeps re-emitting an unroutable set climbs
+	// the streak and, once a corrective nudge has already fired, finalizes
+	// gracefully instead of looping forever.
+	nonProgressStreak := payload.NonProgressStreak + 1
+	if nonProgressStreak >= e.nonProgressStreakThreshold() && payload.DelegationRepeatCount >= 1 {
+		return e.enqueueFinalizeContinuation(ctx, job, payload, "delegation set named an unroutable agent after a corrective nudge")
+	}
+
+	goal := e.originalGoal(ctx, e.rootJobID(job, payload), payload.Instructions)
+	request := JobRequest{
+		ID:              delegationContinuationID(job.ID),
+		Agent:           job.Agent,
+		Action:          "ask",
+		Model:           payload.Model,
+		Phase:           payload.Phase,
+		Repo:            payload.Repo,
+		Branch:          payload.Branch,
+		PullRequest:     payload.PullRequest,
+		HeadSHA:         payload.HeadSHA,
+		GoalID:          payload.GoalID,
+		TaskID:          payload.TaskID,
+		TaskTitle:       payload.TaskTitle,
+		LeadAgent:       payload.LeadAgent,
+		Reviewers:       payload.Reviewers,
+		Sender:          job.Agent,
+		Instructions:    buildPreflightCorrectiveContinuationPrompt(goal, payload.Result, reason),
+		Constraints:     payload.Constraints,
+		ParentJobID:     job.ID,
+		DelegationDepth: payload.DelegationDepth + 1,
+		DelegatedBy:     job.Agent,
+		RootJobID:       e.rootJobID(job, payload),
+		// Carry the window forward and mark that a corrective nudge has fired, and
+		// thread the streak forward, so a coordinator that keeps naming bad agents
+		// escalates to a graceful finalize.
+		RecentDelegationHashes: appendDelegationHashWindow(payload.RecentDelegationHashes, canonicalDelegationSetHash(payload.Result.Delegations)),
+		DelegationRepeatCount:  payload.DelegationRepeatCount + 1,
+		NonProgressStreak:      nonProgressStreak,
+		LastProgressDigest:     payload.LastProgressDigest,
+		// Inherit the coordinator's cockpit settings so the continuation renders its
+		// pane under the same workspace/session as the rest of the tree.
+		Cockpit:        payload.Cockpit,
+		CockpitSession: payload.CockpitSession,
+		CockpitPaneKey: payload.CockpitPaneKey,
+	}
+	if err := e.enqueue(ctx, request); err != nil {
+		return fmt.Errorf("enqueue preflight corrective continuation for %q: %w", job.ID, err)
+	}
+	// The corrective continuation IS the coordinator's single continuation, so it
+	// occupies the continuation slot: emit delegation_continuation_enqueued so a
+	// re-advance hits the continuationEnqueued top-guard.
+	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   job.ID,
+		Kind:    "delegation_continuation_enqueued",
+		Message: fmt.Sprintf("preflight corrective continuation occupies the continuation slot for job %s", request.ID),
+	})
+	return nil
 }
 
 // enqueueFinalizeContinuation enqueues a single best-effort "finalize"
@@ -3153,6 +3259,29 @@ func buildCorrectiveContinuationPrompt(goal string, parentResult *AgentResult) s
 	return builder.String()
 }
 
+// buildPreflightCorrectiveContinuationPrompt is the corrective continuation sent
+// when a delegation set is unroutable (#451): one or more delegations named an
+// agent that is not a routable registered agent (unknown / not-allowed /
+// uncapable — most often a runtime name where an agent NAME was required). It
+// carries the actionable preflight reason (which lists the agents valid for the
+// repo and the inline ephemeral alternative) so the coordinator can re-emit a
+// corrected set, and it restates that the agent field is a registered agent NAME,
+// not a runtime. None of the set was dispatched (all-or-nothing preflight).
+func buildPreflightCorrectiveContinuationPrompt(goal string, parentResult *AgentResult, reason string) string {
+	var builder strings.Builder
+	builder.WriteString(goalAnchorHeader(goal))
+	builder.WriteString("Your delegation set could not be dispatched: it named an agent that is not routable, so NONE of it was dispatched (the preflight is all-or-nothing).\n\n")
+	fmt.Fprintf(&builder, "%s\n\n", strings.TrimSpace(reason))
+	builder.WriteString("A delegation's `agent` field is a registered agent NAME, not a runtime (codex/claude/kimi are runtimes). Re-emit the delegation set using a valid agent name from the list above, or use an inline `ephemeral` spec for an unregistered worker. If you cannot route the work, return an EMPTY delegations list to finish.\n")
+	if parentResult != nil && len(parentResult.Delegations) > 0 {
+		builder.WriteString("\nDelegations that were NOT dispatched:\n")
+		for _, d := range parentResult.Delegations {
+			fmt.Fprintf(&builder, "- delegation %q (agent %s, action %s)\n", d.ID, d.Agent, d.Action)
+		}
+	}
+	return builder.String()
+}
+
 // buildVerifyReplanContinuationPrompt is the bounded corrective continuation sent
 // when the engine-level verify gate (#439) derives a FAILED verdict from the
 // verify-tagged legs. Unlike the finalize prompt it is NOT terminal — it asks the
@@ -3436,10 +3565,19 @@ func (e Engine) preflightDelegation(ctx context.Context, request JobRequest) err
 	if request.Ephemeral != nil {
 		return validateEphemeralSpec(request.DelegationID, request.Action, request.Ephemeral)
 	}
+	// Check existence FIRST so a legitimately-named agent literally called
+	// "claude" (GetAgent hits) is never mistaken for the runtime-name mixup below.
 	agent, err := e.Store.GetAgent(ctx, request.Agent)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("agent %q is not subscribed", request.Agent)
+			// The name resolves to no agent. Only when it is itself a runtime name
+			// ({codex,claude,kimi}) is this the common runtime-vs-agent mixup, so
+			// flag that explicitly; otherwise it is a typo/unknown agent.
+			prefix := fmt.Sprintf("agent %q is not subscribed", request.Agent)
+			if _, isRuntime := allowedSet(EphemeralRuntimes)[strings.TrimSpace(request.Agent)]; isRuntime {
+				prefix = fmt.Sprintf("%q is a runtime, not a registered agent", request.Agent)
+			}
+			return fmt.Errorf("%s. %s", prefix, e.delegationAgentHint(ctx, request.Repo))
 		}
 		return err
 	}
@@ -3448,12 +3586,49 @@ func (e Engine) preflightDelegation(ctx context.Context, request JobRequest) err
 		return err
 	}
 	if !allowed {
-		return fmt.Errorf("agent %q is not allowed on %q", agent.Name, request.Repo)
+		return fmt.Errorf("agent %q is not allowed on %q. %s", agent.Name, request.Repo, e.delegationAgentHint(ctx, request.Repo))
 	}
 	if !contains(agent.Capabilities, request.Action) {
-		return fmt.Errorf("agent %q lacks %q capability", agent.Name, request.Action)
+		return fmt.Errorf("agent %q lacks %q capability. %s", agent.Name, request.Action, e.delegationAgentHint(ctx, request.Repo))
 	}
 	return nil
+}
+
+// availableAgentsForRepo returns the names of registered agents that can access
+// repo, sorted by name (ListAgents already ORDER BY name). It fails soft: a
+// ListAgents error yields nil so the caller's base error is never masked, and a
+// per-agent AgentCanAccessRepo error simply drops that agent from the suggestion.
+func (e Engine) availableAgentsForRepo(ctx context.Context, repo string) []string {
+	agents, err := e.Store.ListAgents(ctx)
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, a := range agents {
+		ok, err := e.Store.AgentCanAccessRepo(ctx, a.Name, repo)
+		if err != nil || !ok {
+			continue
+		}
+		names = append(names, a.Name)
+	}
+	return names
+}
+
+// delegationAgentHint renders the actionable suffix appended to every
+// preflightDelegation error: which registered agents are usable on repo (so a
+// coordinator can re-emit a corrected set) plus the inline ephemeral escape hatch
+// that needs no pre-registration. The agent field of a delegation is a registered
+// agent NAME, not a runtime.
+func (e Engine) delegationAgentHint(ctx context.Context, repo string) string {
+	var b strings.Builder
+	names := e.availableAgentsForRepo(ctx, repo)
+	if len(names) > 0 {
+		fmt.Fprintf(&b, "Agents allowed on %s: %s. ", repo, strings.Join(names, ", "))
+	} else {
+		fmt.Fprintf(&b, "No agents are registered for %s. ", repo)
+	}
+	b.WriteString(`To run an unregistered worker, use an inline ephemeral spec ({runtime: "codex|claude|kimi"}).`)
+	return b.String()
 }
 
 func (e Engine) implementationNeedsFinalizer(ctx context.Context, payload JobPayload) bool {

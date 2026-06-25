@@ -187,14 +187,21 @@ type Jobs struct {
 // blocked/failed jobs (the "why" shown in the attention list). Repo is filled
 // for reportable (blocked/failed/cancelled) jobs so the Attention page can group
 // them by repository.
+//
+// PreflightFailed marks a coordinator whose delegation fan-out could not be
+// routed (#451). Such a coordinator no longer terminal-blocks — it takes a
+// corrective continuation and ends succeeded — so neither its state nor its
+// overall-latest event reveals the zero-child fan-out; this flag makes the
+// Attention page surface it (with the reason in LatestEvent) regardless of state.
 type JobRow struct {
-	ID          string
-	Agent       string
-	Type        string
-	State       string
-	UpdatedAt   string
-	LatestEvent string
-	Repo        string
+	ID              string
+	Agent           string
+	Type            string
+	State           string
+	UpdatedAt       string
+	LatestEvent     string
+	Repo            string
+	PreflightFailed bool
 }
 
 // JobDetail is the job's parsed payload, loaded lazily when its detail opens

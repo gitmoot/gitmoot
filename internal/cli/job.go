@@ -74,17 +74,31 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	var jobs []db.Job
+	// preflightFailed maps a coordinator job id -> the reason its delegation
+	// fan-out could not be routed (#451). A delegation preflight failure no longer
+	// terminal-blocks the coordinator, so its job state and overall-latest event do
+	// not reveal it; this surfaces the reason as a trailing column so a zero-child
+	// fan-out is not invisible. Best-effort: a lookup error leaves the column off.
+	var preflightFailed map[string]string
 	if err := withStore(*home, func(store *db.Store) error {
 		var err error
 		jobs, err = store.ListJobs(context.Background())
-		return err
+		if err != nil {
+			return err
+		}
+		preflightFailed, _ = store.JobIDsWithEventKind(context.Background(), "delegation_preflight_failed")
+		return nil
 	}); err != nil {
 		fmt.Fprintf(stderr, "job list: %v\n", err)
 		return 1
 	}
 	for _, job := range filterJobs(jobs, *repo, *state) {
 		payload, _ := daemonJobPayload(job)
-		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t#%d\n", job.ID, job.State, job.Type, job.Agent, payload.Repo, payload.PullRequest)
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t#%d", job.ID, job.State, job.Type, job.Agent, payload.Repo, payload.PullRequest)
+		if reason, ok := preflightFailed[job.ID]; ok && strings.TrimSpace(reason) != "" {
+			fmt.Fprintf(stdout, "\tPREFLIGHT_FAILED: %s", reason)
+		}
+		fmt.Fprintln(stdout)
 	}
 	return 0
 }

@@ -77,7 +77,15 @@ Delegation fields:
 
 - `id` (required): stable identifier for this delegation, unique within the
   result. Sibling delegations reference it through `deps`.
-- `agent` (required): name of the Gitmoot agent to run.
+- `agent` (required): the **registered agent name** to run (e.g. `shipper`,
+  `researcher`) — **not** a runtime. `codex`, `claude`, and `kimi` are *runtimes*,
+  not agent names; naming one here is the common mistake that makes a fan-out
+  unroutable. To run a worker that is **not** pre-registered, use the inline
+  `ephemeral` spec below instead (it needs no registration). An unroutable `agent` (unknown / not allowed on the repo / lacking
+  the action capability) does **not** silently dead-end: it emits a structured
+  `delegation_preflight_failed` event listing the agents valid for the repo and
+  routes the coordinator through a corrective continuation (see
+  [Termination bounds](#termination-bounds) below).
 - `action` (required): job action, e.g. `ask`, `review`, or `implement`.
 - `prompt` (required): instructions for the delegated job.
 - `deps` (optional): array of sibling delegation `id`s. This delegation runs
@@ -346,6 +354,24 @@ Delegation trees are bounded so they cannot run forever:
   resets the streak even if the summary repeats. Both share the same ladder
   (`delegation_loop_warning` → corrective continuation → `delegation_loop_detected`
   → finalize).
+- Unroutable delegation set (preflight): every delegation (ready **and** deferred)
+  is preflighted **atomically** before any child is enqueued — if even one names an
+  agent that does not resolve to a routable registered agent (unknown / not allowed
+  on the repo / lacking the action capability), **none** of the set dispatches (no
+  partial fan-out). This is no longer a terminal block: the engine emits a
+  structured `delegation_preflight_failed` event carrying an actionable reason (the
+  agents valid for the repo, a runtime-name-mixup hint when the name is a runtime,
+  and the `ephemeral` escape hatch) and routes the coordinator through the **same
+  corrective continuation** as loop detection, so it can re-emit a corrected set. A
+  coordinator that keeps naming bad agents is bounded by
+  `MaxDelegationNonProgressStreak` → after a corrective nudge it routes to the
+  graceful finalize instead of looping. The set is retryable once the agent names
+  are corrected; no need to recreate the root job. Because the coordinator now ends
+  `succeeded` (not blocked), the failure is surfaced from the
+  `delegation_preflight_failed` event — not the job state — in `gitmoot job list`
+  (a trailing `PREFLIGHT_FAILED:` column), the `gitmoot dashboard` **Attention**
+  page (flagged with its reason regardless of state), and the `delegation preflight
+  failures` count in `gitmoot daemon status`.
 - Operator kill switch: `gitmoot job kill <root-job-id>` terminates a runaway
   tree by its root id from outside. It is the **first** backstop (operator action
   wins over every budget cap) and is graceful — in-flight jobs finish, the

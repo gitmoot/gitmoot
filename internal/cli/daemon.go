@@ -379,7 +379,31 @@ func runDaemonStatus(args []string, stdout, stderr io.Writer) int {
 		writeLine(stdout, "%s", daemonClaudeAuthLine(paths))
 	}
 	writeLine(stdout, "%s", daemonAdmissionLine(paths))
+	writeLine(stdout, "%s", daemonPreflightFailureLine(*home))
 	return 0
+}
+
+// daemonPreflightFailureLine reports how many coordinator jobs currently carry a
+// delegation_preflight_failed event (#451) for `gitmoot daemon status`. A
+// delegation fan-out that named a runtime instead of a registered agent no longer
+// terminal-blocks the coordinator, so this is the cheap at-a-glance signal that a
+// fan-out produced zero children and is being corrected. It is a single additive
+// line reusing the JobIDsWithEventKind helper (no parallel plumbing); a store-open
+// or query error degrades to "unavailable" rather than failing status.
+func daemonPreflightFailureLine(home string) string {
+	var count int
+	err := withStore(home, func(store *db.Store) error {
+		failed, err := store.JobIDsWithEventKind(context.Background(), "delegation_preflight_failed")
+		if err != nil {
+			return err
+		}
+		count = len(failed)
+		return nil
+	})
+	if err != nil {
+		return "delegation preflight failures: unavailable"
+	}
+	return fmt.Sprintf("delegation preflight failures: %d", count)
 }
 
 // daemonAdmissionLine reports the configured host-global admission budget caps
