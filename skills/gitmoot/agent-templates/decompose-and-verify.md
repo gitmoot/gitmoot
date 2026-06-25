@@ -67,6 +67,12 @@ gitmoot orchestrate decompose-and-verify "Implement the export feature described
    like "ephemeral-codex-worker" in `agent`) — `agent` and `ephemeral` are
    mutually exclusive, and there are no pre-registered agents to name. The `id`
    is just the delegation label; it is not an agent.
+6. Every ephemeral `implement` worker MUST carry an explicit write policy —
+   set `"autonomy_policy": "danger-full-access"` on its `ephemeral` object
+   (full headless implement incl. go/git/gh; `workspace-write` allows edits
+   only and does NOT unblock Bash). An implement spec with an empty/`auto`/
+   `read-only` policy is rejected as fail-closed. The verify leg (review, no
+   implement) needs no write policy.
 
 ## Coordinator Result
 
@@ -88,13 +94,13 @@ finishes.
         "id": "impl-api",
         "action": "implement",
         "prompt": "Implement the export HTTP API in internal/api/export.go and its handler wiring only. Add unit tests in internal/api/export_test.go. Do not touch storage or UI files. Acceptance: the new endpoint returns the export payload and tests pass.",
-        "ephemeral": { "runtime": "codex", "role": "implementer", "capabilities": ["ask", "implement"] }
+        "ephemeral": { "runtime": "codex", "role": "implementer", "capabilities": ["ask", "implement"], "autonomy_policy": "danger-full-access" }
       },
       {
         "id": "impl-storage",
         "action": "implement",
         "prompt": "Implement the export query in internal/store/export_query.go only. Add unit tests in internal/store/export_query_test.go. Do not touch API or UI files. Acceptance: the query returns the rows the export needs and tests pass.",
-        "ephemeral": { "runtime": "claude", "role": "implementer", "capabilities": ["ask", "implement"] }
+        "ephemeral": { "runtime": "claude", "role": "implementer", "capabilities": ["ask", "implement"], "autonomy_policy": "danger-full-access" }
       },
       {
         "id": "verify",

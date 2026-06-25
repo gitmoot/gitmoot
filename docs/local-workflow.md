@@ -175,7 +175,8 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
      --role lead \
      --capability ask \
      --capability review \
-     --capability implement
+     --capability implement \
+     --policy danger-full-access
    gitmoot agent list
    gitmoot agent doctor lead
    ```
