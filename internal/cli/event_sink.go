@@ -77,26 +77,43 @@ func buildDaemonEventSink(store *db.Store, home string) events.Sink {
 // disabled default when the home or config cannot be resolved/parsed so the
 // event stream stays OFF rather than erroring the daemon.
 func loadEventsPolicy(home string) (config.EventsPolicy, error) {
-	home = strings.TrimSpace(home)
-	if home == "" {
+	cfg := resolveConfigFile(home)
+	if cfg == "" {
 		return config.DefaultEventsPolicy(), nil
 	}
-	// The daemon resolves `home` to two different shapes depending on the call
-	// path: jobWorker.workflowHome() yields the already-resolved <home>/.gitmoot
-	// ROOT, while the registered-repo supervisor passes the RAW --home value — and
-	// both flow into daemonWorkflowEngine -> daemonEventSink. Resolve robustly to
-	// the config.toml for EITHER shape, WITHOUT re-running pathsFromFlag/
-	// initializedPaths (which appended ".gitmoot" a SECOND time, read a phantom
-	// .gitmoot/.gitmoot/config.toml that has no [events] section, and even created
-	// that phantom home — leaving the event stream silently always-off even when
-	// [events].webhook_url was set; #446 regression caught by a live E2E).
+	return config.LoadEventsPolicy(config.Paths{ConfigFile: cfg})
+}
+
+// resolveConfigFile resolves the gitmoot config.toml for a `home` that may be
+// EITHER an already-resolved <home>/.gitmoot ROOT or a RAW --home, returning ""
+// for an empty home. It is the single, side-effect-free home->config.toml
+// resolver shared by the daemon's read-only policy loaders (loadEventsPolicy,
+// resolveEscalationTTL).
+//
+// On main the daemon's engine wiring (daemonWorkflowEngine -> daemonEventSink)
+// receives the already-resolved <home>/.gitmoot root on ALL callers
+// (jobWorker.workflowHome(), the registered-repo supervisor's paths.Home, and
+// local dispatch's paths.Home), so the common case is the resolved-root branch.
+// The probe also tolerates a RAW --home (no config.toml directly under it) by
+// appending the .gitmoot dir as PathsForHome would — kept as defense in depth so
+// a caller mistake can never re-introduce the #446 silent-off bug.
+//
+// It MUST stay side-effect-free: it never runs pathsFromFlag/initializedPaths
+// (which re-appended ".gitmoot" a SECOND time, read a phantom
+// .gitmoot/.gitmoot/config.toml with no [events]/[orchestrate] section, and even
+// created that phantom home; #446/#459).
+func resolveConfigFile(home string) string {
+	home = strings.TrimSpace(home)
+	if home == "" {
+		return ""
+	}
 	cfg := filepath.Join(home, config.ConfigName)
 	if _, err := os.Stat(cfg); err != nil {
 		// `home` was the raw --home (no config.toml directly under it); append the
 		// .gitmoot dir as PathsForHome would. Side-effect-free (no Initialize).
 		cfg = config.PathsForHome(home).ConfigFile
 	}
-	return config.LoadEventsPolicy(config.Paths{ConfigFile: cfg})
+	return cfg
 }
 
 // daemonTerminalEventType maps a daemon-owned terminal JobState to the outbound

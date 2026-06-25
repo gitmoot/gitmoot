@@ -50,10 +50,12 @@ func TestBuildDaemonEventSinkDisabledWithoutEventsSection(t *testing.T) {
 	}
 }
 
-// The registered-repo supervisor path passes the RAW --home (not the resolved
-// .gitmoot root) into daemonWorkflowEngine -> daemonEventSink, so the resolver
-// must also build the sink correctly from a raw --home, without creating a
-// phantom doubled home.
+// On main the registered-repo supervisor passes paths.Home (the already-resolved
+// <home>/.gitmoot root), not the raw --home, into daemonWorkflowEngine ->
+// daemonEventSink (#459). The resolver must nonetheless also build the sink
+// correctly from a RAW --home — kept as defense in depth so a caller mistake can
+// never re-introduce the #446 silent-off bug — without creating a phantom doubled
+// home. This test exercises that raw-home tolerance directly.
 func TestBuildDaemonEventSinkFromRawHome(t *testing.T) {
 	home := t.TempDir() // a raw --home value
 	root := config.PathsForHome(home).Home

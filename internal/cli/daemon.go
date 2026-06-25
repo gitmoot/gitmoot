@@ -1071,7 +1071,9 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 			NextPoll:    map[string]time.Time{},
 			ErrorStreak: map[string]int{},
 		}
-		poller := defaultRegisteredRepoPoller(store, workers, dryRun, stdout, paths.Home)
+		// rawHome (the function's own param) feeds the read-only policy loaders;
+		// paths.Home (the resolved <home>/.gitmoot root) feeds the engine wiring (#459).
+		poller := defaultRegisteredRepoPoller(store, workers, dryRun, stdout, home, paths.Home)
 		poller.WatchIssues = watchIssues
 		blobStore := artifact.NewStore(paths.ArtifactBlobs)
 		reviewGitHub := newSkillOptGitHubClient()
@@ -1271,7 +1273,7 @@ func (l *repoCheckoutLocks) For(repo string) *sync.Mutex {
 }
 
 func pollRegisteredRepos(ctx context.Context, store *db.Store, workers int, dryRun bool, stdout io.Writer, nextPoll map[string]time.Time, now time.Time, fallbackPoll time.Duration) (time.Duration, error) {
-	return pollRegisteredReposWithPoller(ctx, defaultRegisteredRepoPoller(store, workers, dryRun, stdout, ""), registeredRepoSchedule{NextPoll: nextPoll}, now, fallbackPoll)
+	return pollRegisteredReposWithPoller(ctx, defaultRegisteredRepoPoller(store, workers, dryRun, stdout, "", ""), registeredRepoSchedule{NextPoll: nextPoll}, now, fallbackPoll)
 }
 
 type registeredRepoSchedule struct {
@@ -1302,22 +1304,39 @@ type registeredRepoPoller struct {
 	WorkflowFactory func(store *db.Store, gh github.Client, checkout string) *workflow.Engine
 }
 
-func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdout io.Writer, home string) registeredRepoPoller {
+// defaultRegisteredRepoPoller wires the registered-repo supervisor's per-tick
+// poller. It takes TWO home values with DISTINCT, documented shapes (#459):
+//
+//   - rawHome: the RAW --home (NOT <home>/.gitmoot). It feeds the READ-ONLY policy
+//     loaders — resolveEscalationTTL and jobWorker.ConfigHome (orchestratePolicy) —
+//     each of which resolves it to the config.toml exactly once. Passing a resolved
+//     root here would re-append ".gitmoot" inside those loaders and create the
+//     phantom <home>/.gitmoot/.gitmoot.
+//   - resolvedRoot: the already-resolved <home>/.gitmoot root (config.Paths.Home).
+//     It feeds the engine wiring — daemonWorkflowEngine's ArtifactRoot/Home and
+//     daemonEventSink — which expect the resolved root and do NOT re-resolve.
+//
+// The legacy/test caller (pollRegisteredRepos) passes "" for both, which is a
+// no-op: resolveEscalationTTL("") returns the default and daemonWorkflowEngine("")
+// leaves ArtifactRoot/Home/EventSink unset.
+func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdout io.Writer, rawHome, resolvedRoot string) registeredRepoPoller {
 	return registeredRepoPoller{
 		Store:         store,
 		Workers:       workers,
 		DryRun:        dryRun,
 		Stdout:        stdout,
-		EscalationTTL: resolveEscalationTTL(home),
+		EscalationTTL: resolveEscalationTTL(rawHome),
 		GitHubClient:  func(checkout string) github.Client { return github.NewClient(checkout) },
 		WorkflowFactory: func(store *db.Store, gh github.Client, checkout string) *workflow.Engine {
-			engine := daemonWorkflowEngine(store, gh, checkout, home)
+			engine := daemonWorkflowEngine(store, gh, checkout, resolvedRoot)
 			// Apply only the escalate_human notifier handle from policy (#340),
 			// keeping the budget/inlining knobs out of this path so its existing
 			// behavior is unchanged. The notifier itself is already wired by
 			// daemonWorkflowEngine; this just sets the configured @-handle.
+			// orchestratePolicy reads via jobWorker.ConfigHome, which is ALWAYS the
+			// RAW --home (#459) so it never re-resolves into a phantom doubled home.
 			if notifier, ok := engine.EscalationNotifier.(*daemonEscalationNotifier); ok && notifier != nil {
-				if policy, err := defaultJobWorker(store, stdout, home).orchestratePolicy(); err == nil {
+				if policy, err := defaultJobWorker(store, stdout, rawHome).orchestratePolicy(); err == nil {
 					notifier.Handle = policy.EscalationHandle
 				}
 			}
@@ -1329,13 +1348,20 @@ func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdo
 // resolveEscalationTTL reads the [orchestrate].escalation_ttl policy (#340),
 // falling back to DefaultEscalationTTL when unset and to 0 (scan disabled) only
 // on a hard parse failure, so the auto-finalize backstop is on by default.
+//
+// It is READ-ONLY and shape-tolerant (#459): it resolves the config.toml for
+// EITHER a raw --home or an already-resolved <home>/.gitmoot root via
+// resolveConfigFile, then LoadOrchestratePolicy (which only ReadFile-s, never
+// MkdirAll-s). It MUST NOT call initializedPaths/config.Initialize: the real home
+// is already initialized upstream by withStore/withStoreAndPaths, and Initializing
+// here on a resolved root would re-append ".gitmoot" and create the phantom
+// <home>/.gitmoot/.gitmoot. Being side-effect-free makes it phantom-free even if a
+// caller hands it the resolved root by mistake — defense in depth.
 func resolveEscalationTTL(home string) time.Duration {
 	policy := config.DefaultOrchestratePolicy()
-	if strings.TrimSpace(home) != "" {
-		if paths, err := initializedPaths(home); err == nil {
-			if loaded, err := config.LoadOrchestratePolicy(paths); err == nil {
-				policy = loaded
-			}
+	if cfg := resolveConfigFile(home); cfg != "" {
+		if loaded, err := config.LoadOrchestratePolicy(config.Paths{ConfigFile: cfg}); err == nil {
+			policy = loaded
 		}
 	}
 	raw := strings.TrimSpace(policy.EscalationTTL)
@@ -1483,8 +1509,18 @@ func shorterWait(current time.Duration, candidate time.Duration, set *bool) time
 }
 
 type jobWorker struct {
-	Store               *db.Store
-	Stdout              io.Writer
+	Store  *db.Store
+	Stdout io.Writer
+	// ConfigHome is ALWAYS the RAW --home (never the resolved <home>/.gitmoot
+	// root) — INVARIANT (#459). The read-only policy loaders below
+	// (orchestratePolicy/parallelSessionPolicy/admissionPolicy via configPaths())
+	// resolve it through pathsFromFlag -> PathsForHome, which appends ".gitmoot"
+	// exactly once. Passing the already-resolved root here would append it a SECOND
+	// time and read a phantom <home>/.gitmoot/.gitmoot/config.toml. workflowHome()
+	// likewise resolves ConfigHome once to the engine's resolved root. The loaders
+	// are side-effect-free (no config.Initialize), so even a mistaken resolved-root
+	// ConfigHome can never MkdirAll the phantom — but every construction site must
+	// still pass the raw --home so the config is actually found.
 	ConfigHome          string
 	ConfigHomeExplicit  bool
 	AdapterFactory      func(runtime.Agent, string) (workflow.DeliveryAdapter, error)
@@ -2698,11 +2734,24 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	return nil
 }
 
+// configPaths resolves this worker's config.Paths for READ-ONLY policy loading
+// WITHOUT calling config.Initialize (#459). ConfigHome is the raw --home invariant
+// (see the struct field doc), so pathsFromFlag resolves it exactly once to the
+// real <home>/.gitmoot, which withStore/withStoreAndPaths already initialized
+// upstream. Using pathsFromFlag instead of initializedPaths here is the durable
+// guard: even if a caller mistakenly passes the already-resolved root, this never
+// MkdirAll-s the phantom <home>/.gitmoot/.gitmoot — it just reads (and degrades to
+// an error the best-effort callers absorb). Initialize is the only dir-creator and
+// the policy loaders only need to READ.
+func (w jobWorker) configPaths() (config.Paths, error) {
+	return pathsFromFlag(w.ConfigHome)
+}
+
 func (w jobWorker) parallelSessionPolicy() (config.ParallelSessionPolicy, error) {
 	if !w.ConfigHomeExplicit && strings.TrimSpace(w.ConfigHome) == "" {
 		return config.DefaultParallelSessionPolicy(), nil
 	}
-	paths, err := initializedPaths(w.ConfigHome)
+	paths, err := w.configPaths()
 	if err != nil {
 		return config.ParallelSessionPolicy{}, err
 	}
@@ -2716,7 +2765,7 @@ func (w jobWorker) admissionPolicy() (config.AdmissionPolicy, error) {
 	if !w.ConfigHomeExplicit && strings.TrimSpace(w.ConfigHome) == "" {
 		return config.DefaultAdmissionPolicy(), nil
 	}
-	paths, err := initializedPaths(w.ConfigHome)
+	paths, err := w.configPaths()
 	if err != nil {
 		return config.AdmissionPolicy{}, err
 	}
@@ -2791,7 +2840,7 @@ func (w jobWorker) orchestratePolicy() (config.OrchestratePolicy, error) {
 	if !w.ConfigHomeExplicit && strings.TrimSpace(w.ConfigHome) == "" {
 		return config.DefaultOrchestratePolicy(), nil
 	}
-	paths, err := initializedPaths(w.ConfigHome)
+	paths, err := w.configPaths()
 	if err != nil {
 		return config.OrchestratePolicy{}, err
 	}
@@ -3894,6 +3943,14 @@ var (
 	_ workflow.WorktreeCommitter          = gitutil.Client{}
 )
 
+// daemonWorkflowEngine builds the per-tick/per-repo workflow.Engine. Its `home`
+// param is — by convention (#459) — the already-RESOLVED <home>/.gitmoot root
+// (config.Paths.Home), NOT the raw --home. All three callers comply:
+// jobWorker.workflowHome() (resolves ConfigHome once), the registered-repo
+// supervisor (paths.Home), and local dispatch (paths.Home). The resolved root is
+// used verbatim for engine.ArtifactRoot, engine.Home, and daemonEventSink — none
+// of which re-resolve — so handing it the raw --home would misplace delegation
+// artifacts and the event-sink config probe.
 func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, home string) workflow.Engine {
 	engine := workflow.Engine{
 		Store:                   store,

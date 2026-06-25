@@ -524,7 +524,7 @@ func TestPollRegisteredReposRoutesEachRepoWithOwnGitHubClient(t *testing.T) {
 			},
 		},
 	}
-	poller := defaultRegisteredRepoPoller(store, 2, false, io.Discard, "")
+	poller := defaultRegisteredRepoPoller(store, 2, false, io.Discard, "", "")
 	poller.GitHubClient = func(checkout string) github.Client { return clients[checkout] }
 	poller.WorkflowFactory = func(*db.Store, github.Client, string) *workflow.Engine { return nil }
 
@@ -594,7 +594,7 @@ func TestPollRegisteredReposBacksOffFailedRepoWithoutStoppingOthers(t *testing.T
 	}
 	failing := &cliPollFakeGitHub{listErr: errors.New("rate limited")}
 	healthy := &cliPollFakeGitHub{}
-	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard, "")
+	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard, "", "")
 	poller.GitHubClient = func(checkout string) github.Client {
 		if checkout == "/tmp/failing" {
 			return failing
