@@ -999,9 +999,14 @@ should not be asked to create branches, commit, push, or open PRs through
 allocate worktrees, hold branch locks, commit changes, push branches, open PRs,
 and advance review state.
 
-The daemon defaults to `--workers 1`. Raise `--workers` when the Gitmoot home
-has independent runtime sessions, managed agent types with `max_background`
-greater than one, or forkable temporary workers enabled. By default,
+The daemon defaults to `--workers 1` and the per-tick `--scheduler barrier`,
+which serializes same-repo jobs. Raise `--workers` when the Gitmoot home has
+independent runtime sessions, managed agent types with `max_background` greater
+than one, or forkable temporary workers enabled — and to run a repo's queued jobs
+N-wide, use `gitmoot daemon start --parallel N` (or `--workers N`, which now
+auto-selects the `pool` scheduler). See
+[`parallel-jobs.md`](./parallel-jobs.md) for the full on-ramp and the two
+serialization layers (checkout lock and runtime session lock). By default,
 `[parallel_sessions]` uses:
 
 ```toml
@@ -1059,7 +1064,8 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
      --role lead \
      --capability ask \
      --capability review \
-     --capability implement
+     --capability implement \
+     --policy danger-full-access
    gitmoot agent list
    gitmoot agent doctor lead
    ```
@@ -1243,11 +1249,20 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
 
    Gitmoot records agent autonomy policy as `read-only`, `workspace-write`,
    `danger-full-access`, or `auto`. For Codex these map to Codex sandbox
-   policies; for Claude Code they map to Claude permission modes. Implementation
-   jobs require a writable policy. If an implementation worker is read-only or
-   its runtime asks for write permission, Gitmoot blocks the job before treating
-   it as implementation work and tells the user to restart or subscribe a
-   writable worker.
+   policies; for Claude Code they map to Claude permission modes
+   (`read-only`→`plan`, `workspace-write`→`acceptEdits`,
+   `danger-full-access`→`bypassPermissions`; `auto`/unset emits no flag, so its
+   headless write capability is inherited non-deterministically from ambient
+   Claude config). Implementation jobs require an explicit write policy, and
+   Gitmoot **refuses** an `implement`-capable agent (or ephemeral worker) whose
+   policy grants no headless write — `auto`/empty **or** `read-only` — at `agent
+   start`/`subscribe`, at implement-job dispatch (catching pre-existing agents
+   and later policy edits), and in ephemeral delegation specs. To fix the
+   refusal, set `--policy danger-full-access` for full headless implementation
+   including `go`/`git`/`gh` via Bash, or `--policy workspace-write` for
+   edits-only (note that `acceptEdits` does **not** unblock Bash). `read-only`,
+   `ask`, and `review` workers are unaffected and can still run jobs that do not
+   modify files.
 
 6. Start and open the first task PR.
 
@@ -2039,6 +2054,8 @@ Symptoms:
 - An implementation job is blocked before the agent starts.
 - A job comment says the worker is read-only or cannot make changes.
 - Runtime output asks for permission or reports that writes are blocked.
+- `agent start`/`subscribe` refuses an `implement` agent whose policy is
+  `auto`/empty or `read-only` (these grant no deterministic headless write).
 
 Checks:
 
@@ -2056,7 +2073,11 @@ Fixes:
   rerun the task.
 - For Codex agents, use an autonomy policy that permits writes for implementation
   jobs. For Claude Code agents, use a permission mode that accepts edits for
-  implementation jobs.
+  implementation jobs. The default `auto` policy (and an unset policy) grants no
+  deterministic headless write, so it is refused for `implement` just like
+  `read-only`; set `--policy danger-full-access` for full implementation
+  including `go`/`git`/`gh`, or `--policy workspace-write` for edits-only (note
+  `acceptEdits` does not unblock Bash).
 - Review and ask jobs can still run with read-only workers when they do not need
   to modify files.
 
@@ -5575,6 +5596,16 @@ worker-pool scheduler that re-queries the queue as workers free and auto-isolate
 a contended same-repo read job into an ephemeral worktree (fixing a same-repo
 dependent-job deadlock), versus the default `--scheduler barrier`.
 
+To run a repo's queued jobs N-wide, use `--parallel N` (sugar for `--workers N
+--scheduler pool`; it cannot be combined with `--workers` or `--scheduler`).
+Raising `--workers` above 1 without an explicit `--scheduler` now **auto-selects
+`pool`** (multiple workers under `barrier` serialize same-repo jobs anyway); an
+explicit `--scheduler barrier` is still honored. `gitmoot daemon status` reports
+the live scheduler mode and worker count (e.g. `scheduler: pool, workers: 5`), and
+the daemon logs a preflight warning — with the exact relaunch command — when ≥2
+parallelizable jobs are queued under a serializing config. Same-repo parallelism
+is bounded by **distinct runtime sessions** as well as distinct checkouts.
+
 `gitmoot dashboard` shows local state — daemon health, repos, agents and runtime
 sessions, jobs by state, worktrees, branch locks, SkillOpt train phase/candidate,
 and pending interactive prompts.
@@ -5704,6 +5735,24 @@ with no allow-list; both `--model X` and `--model=X` are accepted. A per-job
 `--model` (or a delegation's `model` field) overrides this default, and an
 omitted model preserves the runtime's own default. The same default can be set
 in config under `[agents.<type>].model`.
+
+`agent start` and `agent subscribe` accept `--policy` (default `auto`). The policy
+maps to the runtime permission mode and decides what a headless job may do:
+
+| `--policy` | Claude `--permission-mode` | Headless capability |
+|---|---|---|
+| `read-only` | `plan` | inspect/report only, no writes |
+| `workspace-write` | `acceptEdits` | file edits only — does NOT unblock Bash (`go`/`git`/`gh`) |
+| `danger-full-access` | `bypassPermissions` | full implementation: file writes plus Bash |
+| `auto` (default) | *(no flag)* | non-deterministic — inherited from ambient Claude config |
+
+Because of this, an agent that carries the `implement` capability **must** be
+started/subscribed with a write policy. Gitmoot fails closed: `--capability
+implement` with `auto`/empty or `read-only` is refused at `agent start`, `agent
+subscribe`, and at implement-job dispatch with an actionable message. Set
+`--policy danger-full-access` for full headless implementation (file writes plus
+`go`/`git`/`gh`), or `--policy workspace-write` for edits-only (Bash stays
+blocked). See `references/SAFETY.md` for the full mapping and rationale.
 
 Subscribe an existing runtime session:
 
@@ -6991,6 +7040,52 @@ gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
 
+## Autonomy Policy And Headless Write Permission
+
+An agent's autonomy policy maps to a Claude Code `--permission-mode` (Codex uses
+the equivalent `--sandbox`). It governs what the headless `claude -p` / `codex
+exec` run is allowed to do:
+
+| Policy | Claude `--permission-mode` | Headless write capability |
+|---|---|---|
+| `read-only` | `plan` | no writes (inspect/report only) |
+| `workspace-write` | `acceptEdits` | file edits only — does NOT unblock Bash |
+| `danger-full-access` | `bypassPermissions` | full: file writes plus `go`/`git`/`gh` via Bash |
+| `auto` (the default) / unset | *(no flag emitted)* | non-deterministic — inherited from ambient Claude config |
+
+Two consequences matter for implementation jobs:
+
+- **`auto` is non-deterministic, not "always denied".** With `auto` (or an unset
+  policy) Gitmoot emits no `--permission-mode`, so the headless run inherits its
+  write capability from whatever ambient Claude config exists on the host
+  (settings.json allow rules / `defaultMode` / prior directory trust). It writes
+  where permissive settings exist and silently denies where they don't — a
+  hidden, environment-dependent dependency on a job-critical decision.
+- **`workspace-write` (`acceptEdits`) auto-accepts file edits but does NOT unblock
+  Bash.** An implement job needs `go build`/`go test`, `git`, and `gh`; those run
+  through Bash, which `acceptEdits` still gates. Use `danger-full-access`
+  (`bypassPermissions`) for full headless implementation. `bypassPermissions`
+  stays gated strictly behind explicit `danger-full-access`; a git worktree is not
+  a sandbox, so Bash there still reaches the whole machine.
+
+### Fail-closed implement guard
+
+Because of the above, Gitmoot **refuses** an agent (or ephemeral worker) that
+carries the `implement` capability while its policy grants no headless write
+(`auto`/empty or `read-only`), rather than letting the job run and produce no
+files. The refusal fires at four seams with the same actionable message:
+
+- `gitmoot agent start` and `gitmoot agent subscribe` (exit 2 before any session
+  is spawned);
+- implement-job **dispatch** (the job is BLOCKED — this catches pre-existing
+  agents and later policy edits);
+- ephemeral delegation specs at `validateEphemeralSpec` (an ephemeral implement
+  worker must carry an explicit write policy).
+
+To fix a refusal: set `--policy danger-full-access` for full headless
+implementation, or `--policy workspace-write` for edits-only (knowing Bash stays
+blocked). `read-only`/`ask`/`review` agents are never affected.
+
 ## Files And Secrets
 
 Do not commit generated data, caches, logs, build outputs, session archives,
@@ -7081,6 +7176,23 @@ cannot recurse or fan out forever:
   `/gitmoot resume` comments on the tree's **open** PR or issue; the dashboard
   **Attention** section and the TTL backstop cover a tree whose PR/issue is no
   longer open.
+- Non-failure ask-gate (`human_questions[]`, #445): the **healthy-result** sibling
+  of `escalate_human`. A worker/coordinator that returns a healthy result carrying
+  `human_questions[]` pauses the parent task at the **same** resumable
+  `awaiting_human` state for a specific human answer — **no leg fails**, no
+  continuation or delegation children are enqueued, and the tree consumes zero
+  tokens/compute. It reuses the **same** pause plumbing as `escalate_human` (one
+  `delegation_escalation_requested` event tagged `kind=ask` with the questions, the
+  @-tag comment, the dashboard **Attention** section), so the **same**
+  `[orchestrate].escalation_ttl` auto-finalizes an unanswered ask, the **same**
+  wall-clock pause exclusion applies, and the pause is **budget-neutral** (it
+  enqueues no job; only the eventual answer-driven continuation occupies the single
+  continuation slot). A human answers with
+  `/gitmoot resume <coordinatorJobID> answer "<id>: ..."` (authorize-commenter
+  gated); the answer is injected into the coordinator continuation prompt. The
+  `answer` verb is valid only on an ask round and `retry`/`continue`/`abort` only
+  on a failure round — a mismatch is rejected with a clear message. Absence of
+  `human_questions[]` is byte-identical to today's behavior.
 
 When a bound trips, the offending delegations are not dispatched and the parent
 receives a typed lifecycle event explaining why (for example, the delegation tree
@@ -7182,7 +7294,15 @@ Delegation fields:
 
 - `id` (required): stable identifier for this delegation, unique within the
   result. Sibling delegations reference it through `deps`.
-- `agent` (required): name of the Gitmoot agent to run.
+- `agent` (required): the **registered agent name** to run (e.g. `shipper`,
+  `researcher`) — **not** a runtime. `codex`, `claude`, and `kimi` are *runtimes*,
+  not agent names; naming one here is the common mistake that makes a fan-out
+  unroutable. To run a worker that is **not** pre-registered, use the inline
+  `ephemeral` spec below instead (it needs no registration). An unroutable `agent` (unknown / not allowed on the repo / lacking
+  the action capability) does **not** silently dead-end: it emits a structured
+  `delegation_preflight_failed` event listing the agents valid for the repo and
+  routes the coordinator through a corrective continuation (see
+  [Termination bounds](#termination-bounds) below).
 - `action` (required): job action, e.g. `ask`, `review`, or `implement`.
 - `prompt` (required): instructions for the delegated job.
 - `deps` (optional): array of sibling delegation `id`s. This delegation runs
@@ -7212,7 +7332,7 @@ Delegation fields:
     comments on the tree's **open** PR or issue (it watches open PRs/issues); the
     dashboard **Attention** section and the `escalation_ttl` backstop cover a tree
     whose PR/issue is no longer open.
-- `synthesis_rule` (optional): one of `summary`, `vote`, or `quorum`.
+- `synthesis_rule` (optional): one of `summary`, `vote`, `quorum`, or `verify`.
 - `quorum` (optional): an integer `K` (`> 0`), required when `synthesis_rule`
   is `quorum`. The coordinator continuation proceeds only if at least `K`
   children reach an approving decision; otherwise the parent blocks, exactly as a
@@ -7220,6 +7340,23 @@ Delegation fields:
   delegations (every child must approve). `K` is an integer count only — no
   fractions or percentages — and must not exceed the number of delegations (a
   larger `K` is unsatisfiable and is rejected).
+
+  **`verify` — engine-enforced verify→replan (#439).** Where `vote`/`quorum`
+  **block** the parent on failure (a terminal dead-end), `verify` does NOT block:
+  when every child has resolved, the engine derives a pass/fail **verdict** from
+  the `verify`-tagged leg(s) — a verify leg passes iff its decision approves
+  (`approved`/`implemented`), and a `changes_requested`/`failed` or missing verify
+  leg fails it — and on a **failed** verdict enqueues a single **bounded corrective
+  "replan" continuation** (autonomous self-correction) instead of the normal
+  synthesis continuation. The verify→replan loop is bounded by a dedicated per-root
+  attempt cap (default **2**, configurable via `[orchestrate].max_verify_replan_attempts`);
+  on exhaustion it routes to the graceful **finalize** continuation (#305) like
+  every other backstop, never an unbounded loop. All existing structural bounds
+  (depth/width/jobs/wall-clock/token/cost) still apply — each replan is just
+  another continuation generation. The verdict is read mechanically from the
+  already-completed verify leg (the convention below): the engine adds **no** new
+  verify subprocess or second model call. `verify` requires no `quorum` field. A
+  set that does not tag a `verify` leg behaves exactly as before.
 
   **Produce vs. independent check.** The `synthesis_rule`s above reconcile what
   the producers **self-report** — `summary` merges their summaries, `vote`/`quorum`
@@ -7237,14 +7374,27 @@ Delegation fields:
   different-model judge does not share. It is the same separation as ROMA's
   Verifier (`VerifierSignature: (goal, candidate_output) -> verdict + feedback`,
   vendored at `repos/ROMA`), where a failed verdict drives a re-plan instead of
-  trusting the producer. Route a failed verdict with `failure_policy: escalate`
-  (autonomous correction in the coordinator continuation) or `escalate_human` (a
-  human-in-the-loop pause); the merge gate independently blocks merge on the
-  non-ready decision. The shipped `decompose-and-verify` recipe is one instance of
-  this (parallel producers + one verify gate), and the `verifier` recipe is its
-  minimal one-producer form — both are templates under
-  `skills/gitmoot/agent-templates/`. No new primitive is involved: `EphemeralSpec`,
-  `failure_policy`, and the merge gate already ship.
+  trusting the producer.
+
+  There are **two ways** to drive the failed verdict back into a re-plan: a
+  template pattern and an engine-enforced rule.
+
+  - **Template pattern (#421).** Tag the verify leg with `failure_policy: escalate`
+    (autonomous correction in the coordinator continuation) or `escalate_human` (a
+    human-in-the-loop pause); the **coordinator** hand-rolls the verify→replan loop
+    in its continuation. The merge gate independently blocks merge on the non-ready
+    decision. The shipped `decompose-and-verify` recipe is one instance of this
+    (parallel producers + one verify gate), and the `verifier` recipe is its
+    minimal one-producer form — both are templates under
+    `skills/gitmoot/agent-templates/`. No new primitive is involved: `EphemeralSpec`,
+    `failure_policy`, and the merge gate already ship.
+  - **Engine-enforced rule (#439).** Tag the verify leg with
+    `synthesis_rule: verify` (see above). The **engine** then derives the verdict
+    from the verify leg and, on a fail, enqueues the bounded replan continuation
+    itself — so the verify→replan loop and its attempt cap are enforced engine-side
+    rather than depending on the coordinator to drive them. Use this when you want
+    the self-correction loop guaranteed and bounded by the engine; use the template
+    pattern when you want full coordinator control over how the failure is routed.
 - `timeout` (optional): a Go duration string and must be positive (e.g. `10m`).
 - `retry` (optional): integer `>= 0`.
 - `worktree` (optional): worktree path for the child job.
@@ -7318,7 +7468,15 @@ Delegation fields:
   - `capabilities` (optional): an array of capability strings advertised by the
     worker.
   - `autonomy_policy` (optional): the worker's sandbox autonomy. Defaults to
-    `read-only`.
+    `read-only`. An **implement** ephemeral worker (`action: "implement"` or an
+    explicit `"implement"` capability) **must** carry a write policy
+    (`workspace-write` or `danger-full-access`); an empty/`auto`/`read-only`
+    policy is rejected at validation with the same fail-closed guidance the CLI
+    emits, because an unset policy normalizes to `auto`, which grants no
+    deterministic headless write. Note `workspace-write` (`acceptEdits`) auto-
+    accepts file edits but does NOT unblock Bash (`go`/`git`/`gh`), so full
+    headless implementation needs `danger-full-access`. See
+    `references/SAFETY.md` for the policy→permission-mode mapping.
 
   Ephemeral delegations are bounded by the same delegation limits as any other
   delegation (see [Termination bounds](#termination-bounds)); they do not relax
@@ -7413,6 +7571,24 @@ Delegation trees are bounded so they cannot run forever:
   resets the streak even if the summary repeats. Both share the same ladder
   (`delegation_loop_warning` → corrective continuation → `delegation_loop_detected`
   → finalize).
+- Unroutable delegation set (preflight): every delegation (ready **and** deferred)
+  is preflighted **atomically** before any child is enqueued — if even one names an
+  agent that does not resolve to a routable registered agent (unknown / not allowed
+  on the repo / lacking the action capability), **none** of the set dispatches (no
+  partial fan-out). This is no longer a terminal block: the engine emits a
+  structured `delegation_preflight_failed` event carrying an actionable reason (the
+  agents valid for the repo, a runtime-name-mixup hint when the name is a runtime,
+  and the `ephemeral` escape hatch) and routes the coordinator through the **same
+  corrective continuation** as loop detection, so it can re-emit a corrected set. A
+  coordinator that keeps naming bad agents is bounded by
+  `MaxDelegationNonProgressStreak` → after a corrective nudge it routes to the
+  graceful finalize instead of looping. The set is retryable once the agent names
+  are corrected; no need to recreate the root job. Because the coordinator now ends
+  `succeeded` (not blocked), the failure is surfaced from the
+  `delegation_preflight_failed` event — not the job state — in `gitmoot job list`
+  (a trailing `PREFLIGHT_FAILED:` column), the `gitmoot dashboard` **Attention**
+  page (flagged with its reason regardless of state), and the `delegation preflight
+  failures` count in `gitmoot daemon status`.
 - Operator kill switch: `gitmoot job kill <root-job-id>` terminates a runaway
   tree by its root id from outside. It is the **first** backstop (operator action
   wins over every budget cap) and is graceful — in-flight jobs finish, the
@@ -7459,6 +7635,39 @@ table is intentionally **not** implemented yet; the budget is in raw tokens.
   see `inline_artifact_bodies` in the orchestrate config docs
   (`docs/cockpit-orchestrate.md`). With it off, the continuation prompt is
   byte-identical to before.
+
+- `human_questions` (optional): an **ask-gate** — the non-failure sibling of
+  `escalate_human` (#445). A **healthy** result (any decision) may carry
+  `human_questions[]` to **pause for a specific human answer instead of guessing**.
+  Each entry is `{ "id": "...", "prompt": "...", "choices": ["...", ...] }` where
+  `id` is required and unique within the result, `prompt` is required, and
+  `choices` is optional. It is **fully additive and orthogonal to `decision`** — a
+  result that omits it behaves byte-identically, and a coordinator can both fan out
+  (`delegations[]`) **and** ask in the same result.
+
+  When a result carries `human_questions[]`, the parent task enters the resumable
+  `awaiting_human` state, **no continuation or delegation children are enqueued,
+  and the tree consumes zero tokens/compute** until a human answers — exactly like
+  `escalate_human`, but **no leg fails** (it is a healthy result that simply needs
+  a decision). The daemon @-tags the human (default handle: the repo owner, or
+  `[orchestrate].escalation_handle`) with the question(s) rendered, and the
+  dashboard lists the tree under **Attention**. A human answers with
+  `/gitmoot resume <coordinatorJobID> answer "<id>: ..."` — one `<id>: text` line
+  per question (a single-question pause also accepts a bare answer body). The
+  answer is delivered to the coordinator continuation as a clearly-labelled
+  **"Human answers to your questions"** block injected at the top of its prompt;
+  the coordinator then proceeds with the human's decision. An unmatched id (a typo)
+  is surfaced as additional guidance, never silently dropped.
+
+  The ask-gate reuses the **same** `[orchestrate].escalation_ttl` backstop (default
+  24h): an unanswered ask auto-finalizes gracefully exactly like a failure
+  escalation, paused time is excluded from the per-root wall-clock budget, and the
+  pause is **budget-neutral** (it enqueues no job; only the eventual continuation
+  occupies the single continuation slot). The `answer` verb is valid **only** on an
+  ask round, and `retry`/`continue`/`abort` are valid **only** on a failure
+  escalation round — a mismatch is rejected with a clear message. **Use the ask-gate
+  sparingly**: ask only when you genuinely cannot proceed without a human decision,
+  not on every result.
 
 ## Decisions
 
