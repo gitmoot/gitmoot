@@ -5735,3 +5735,235 @@ func TestBuildEscalationCommentIsNotParsedAsCommand(t *testing.T) {
 		t.Fatalf("escalation comment parsed into %d command(s); want 0: %+v\nbody:\n%s", len(cmds), cmds, body)
 	}
 }
+
+// --- #444: same-repo parallel-job discoverability ---
+
+func TestAutoSelectScheduler(t *testing.T) {
+	cases := []struct {
+		name              string
+		scheduler         string
+		workers           int
+		explicitScheduler bool
+		want              string
+	}{
+		{"single worker stays barrier", "barrier", 1, false, "barrier"},
+		{"multi worker auto-pools", "barrier", 4, false, "pool"},
+		{"explicit barrier is honored", "barrier", 4, true, "barrier"},
+		{"explicit pool is honored", "pool", 1, true, "pool"},
+		{"multi worker already pool", "pool", 4, false, "pool"},
+		{"default empty single", "", 1, false, ""},
+		{"default empty multi auto-pools", "", 3, false, "pool"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := autoSelectScheduler(tc.scheduler, tc.workers, tc.explicitScheduler); got != tc.want {
+				t.Fatalf("autoSelectScheduler(%q, %d, %t) = %q, want %q", tc.scheduler, tc.workers, tc.explicitScheduler, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseDaemonStartConfigAutoPoolsWithWorkers(t *testing.T) {
+	parsed, code := parseDaemonStartConfig("daemon start", []string{"--workers", "4"}, io.Discard)
+	if code != 0 {
+		t.Fatalf("parseDaemonStartConfig code = %d", code)
+	}
+	if parsed.Scheduler != "pool" {
+		t.Fatalf("scheduler = %q, want pool (auto-selected for --workers 4)", parsed.Scheduler)
+	}
+	if parsed.ExplicitScheduler {
+		t.Fatalf("ExplicitScheduler = true, want false (auto-selection is not explicit)")
+	}
+	// The resolved child args must carry --scheduler pool so the daemon child runs it.
+	childArgs := daemonChildArgs("", "30s", parsed.Workers, false, false, parsed.Scheduler, "", "")
+	if !daemonArgsContainFlag(childArgs, "scheduler", "pool") {
+		t.Fatalf("child argv missing --scheduler pool: %v", childArgs)
+	}
+}
+
+func TestParseDaemonStartConfigExplicitBarrierWithWorkersIsHonored(t *testing.T) {
+	parsed, code := parseDaemonStartConfig("daemon start", []string{"--workers", "4", "--scheduler", "barrier"}, io.Discard)
+	if code != 0 {
+		t.Fatalf("parseDaemonStartConfig code = %d", code)
+	}
+	if parsed.Scheduler != "barrier" {
+		t.Fatalf("scheduler = %q, want barrier (explicit opt-out preserved)", parsed.Scheduler)
+	}
+	if !parsed.ExplicitScheduler {
+		t.Fatalf("ExplicitScheduler = false, want true")
+	}
+}
+
+func TestParseDaemonStartConfigParallelFlag(t *testing.T) {
+	parsed, code := parseDaemonStartConfig("daemon start", []string{"--parallel", "5"}, io.Discard)
+	if code != 0 {
+		t.Fatalf("parseDaemonStartConfig code = %d", code)
+	}
+	if parsed.Workers != 5 {
+		t.Fatalf("workers = %d, want 5", parsed.Workers)
+	}
+	if parsed.Scheduler != "pool" {
+		t.Fatalf("scheduler = %q, want pool", parsed.Scheduler)
+	}
+	if !parsed.ExplicitWorkers || !parsed.ExplicitScheduler {
+		t.Fatalf("--parallel must mark workers+scheduler explicit so they persist through restart (got workers=%t scheduler=%t)", parsed.ExplicitWorkers, parsed.ExplicitScheduler)
+	}
+}
+
+func TestParseDaemonStartConfigParallelConflictsWithWorkers(t *testing.T) {
+	var stderr bytes.Buffer
+	_, code := parseDaemonStartConfig("daemon start", []string{"--parallel", "5", "--workers", "2"}, &stderr)
+	if code == 0 {
+		t.Fatalf("parseDaemonStartConfig accepted --parallel with --workers; want rejection")
+	}
+	if !strings.Contains(stderr.String(), "--parallel cannot be combined") {
+		t.Fatalf("stderr = %q, want conflict message", stderr.String())
+	}
+}
+
+func TestParseDaemonStartConfigParallelRejectsNonPositive(t *testing.T) {
+	var stderr bytes.Buffer
+	_, code := parseDaemonStartConfig("daemon start", []string{"--parallel", "0"}, &stderr)
+	if code == 0 {
+		t.Fatalf("parseDaemonStartConfig accepted --parallel 0; want rejection")
+	}
+}
+
+func TestDaemonSchedulerStatusLine(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"defaults", []string{"daemon", "run", "--poll", "30s", "--workers", "1"}, "scheduler: barrier, workers: 1"},
+		{"pool multi", []string{"daemon", "run", "--workers", "4", "--scheduler", "pool"}, "scheduler: pool, workers: 4"},
+		{"equals form", []string{"daemon", "run", "--workers=3", "--scheduler=pool"}, "scheduler: pool, workers: 3"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := daemonSchedulerStatusLine(tc.args); got != tc.want {
+				t.Fatalf("daemonSchedulerStatusLine(%v) = %q, want %q", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDaemonSchedulerStatusLineWarnsBarrierWithWorkers(t *testing.T) {
+	got := daemonSchedulerStatusLine([]string{"daemon", "run", "--workers", "4"})
+	if !strings.HasPrefix(got, "scheduler: barrier, workers: 4") {
+		t.Fatalf("line = %q, want barrier/4 prefix", got)
+	}
+	if !strings.Contains(got, "--scheduler pool") {
+		t.Fatalf("line = %q, want a relaunch hint pointing at --scheduler pool", got)
+	}
+}
+
+func TestParallelizableSerialJobsCountsDistinctRuntimeSessions(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
+	// Two codex agents with DISTINCT sessions -> two parallelizable slots.
+	seedDaemonWorkerAgent(t, store, "a", runtime.CodexRuntime, "session-a", []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "b", runtime.CodexRuntime, "session-b", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "a", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-b", Agent: "b", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 2})
+	worker := defaultJobWorker(store, io.Discard)
+	if got := parallelizableSerialJobs(ctx, worker, "owner/repo", ""); got != 2 {
+		t.Fatalf("parallelizableSerialJobs = %d, want 2", got)
+	}
+}
+
+func TestParallelizableSerialJobsCollapsesSameSession(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
+	// One codex agent (single session) -> both jobs serialize on the session lock,
+	// so only ONE parallelizable slot. Raw same-repo count (2) would over-warn.
+	seedDaemonWorkerAgent(t, store, "a", runtime.CodexRuntime, "session-a", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "a", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-b", Agent: "a", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 2})
+	worker := defaultJobWorker(store, io.Discard)
+	if got := parallelizableSerialJobs(ctx, worker, "owner/repo", ""); got != 1 {
+		t.Fatalf("parallelizableSerialJobs = %d, want 1 (same session collapses)", got)
+	}
+}
+
+func TestWarnSerializedParallelJobsEmitsRelaunchCommand(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
+	seedDaemonWorkerAgent(t, store, "a", runtime.CodexRuntime, "session-a", []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "b", runtime.CodexRuntime, "session-b", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "a", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-b", Agent: "b", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 2})
+	var out bytes.Buffer
+	worker := defaultJobWorker(store, &out)
+	// Serializing config (single worker) with 2 parallelizable jobs warns.
+	warnSerializedParallelJobs(ctx, worker, 1, "owner/repo", "")
+	got := out.String()
+	if !strings.Contains(got, "will run serially") {
+		t.Fatalf("warning = %q, want serialization notice", got)
+	}
+	if !strings.Contains(got, "--parallel 2") {
+		t.Fatalf("warning = %q, want exact relaunch command with --parallel 2", got)
+	}
+}
+
+func TestWarnSerializedParallelJobsSilentBelowTwo(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
+	seedDaemonWorkerAgent(t, store, "a", runtime.CodexRuntime, "session-a", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "a", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
+	var out bytes.Buffer
+	worker := defaultJobWorker(store, &out)
+	warnSerializedParallelJobs(ctx, worker, 1, "owner/repo", "")
+	if out.Len() != 0 {
+		t.Fatalf("warning emitted for a single parallelizable job: %q", out.String())
+	}
+}
+
+func TestSerializingConfig(t *testing.T) {
+	cases := []struct {
+		usePool bool
+		limit   int
+		want    bool
+	}{
+		{false, 1, true},  // barrier, single worker
+		{false, 4, true},  // barrier serializes regardless of workers
+		{true, 1, true},   // pool but single worker
+		{true, 4, false},  // pool + multi worker: parallel-capable
+	}
+	for _, tc := range cases {
+		if got := serializingConfig(tc.usePool, tc.limit); got != tc.want {
+			t.Fatalf("serializingConfig(%t, %d) = %t, want %t", tc.usePool, tc.limit, got, tc.want)
+		}
+	}
+}
+
+func TestDaemonAutoPoolSurvivesChildArgsAndRestart(t *testing.T) {
+	// daemon start --workers 4 auto-selects pool; the persisted child argv must
+	// carry --scheduler pool, and a restart that re-parses those args must keep it.
+	cfg, code := parseDaemonStartConfig("daemon start", []string{"--workers", "4"}, io.Discard)
+	if code != 0 {
+		t.Fatalf("parseDaemonStartConfig code = %d", code)
+	}
+	childArgs := daemonChildArgs(cfg.Home, cfg.Poll.String(), cfg.Workers, cfg.WatchSkillOptReviews, cfg.WatchIssues, cfg.Scheduler, cfg.RepoFlag, cfg.Session)
+	if !daemonArgsContainFlag(childArgs, "scheduler", "pool") {
+		t.Fatalf("persisted child argv lost auto-selected pool: %v", childArgs)
+	}
+	meta := daemonMeta{Args: childArgs}
+
+	restartCfg, code := parseDaemonStartConfig("daemon restart", nil, io.Discard)
+	if code != 0 {
+		t.Fatalf("parseDaemonStartConfig(restart) code = %d", code)
+	}
+	targetArgs := overlayDaemonStartArgs(daemonStartArgsFromRunArgs(meta.Args), restartCfg)
+	parsed, code := parseDaemonStartConfig("daemon restart", targetArgs, io.Discard)
+	if code != 0 {
+		t.Fatalf("parse restored restart args code = %d, args=%v", code, targetArgs)
+	}
+	if parsed.Scheduler != "pool" || parsed.Workers != 4 {
+		t.Fatalf("restart lost config: scheduler=%q workers=%d, want pool/4; args=%v", parsed.Scheduler, parsed.Workers, targetArgs)
+	}
+}

@@ -29,6 +29,7 @@ const sidebars: SidebarsConfig = {
         'workflows/review-agent-workflow',
         'workflows/coordinator-recipes-workflow',
         'workflows/cockpit-orchestrate-workflow',
+        'workflows/parallel-jobs-workflow',
         'workflows/skillopt-train-workflow',
       ],
     },
@@ -62,6 +63,7 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Release Notes',
       items: [
+        'release-notes/v0.6.0',
         'release-notes/v0.5.2',
         'release-notes/v0.5.1',
         'release-notes/v0.5.0',

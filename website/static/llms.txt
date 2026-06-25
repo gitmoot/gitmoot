@@ -18,6 +18,7 @@ full expanded context.
 - [Planner And Goal Workflow](https://gitmoot.io/docs/workflows/planner-goal-workflow): Create structured plans and goal files.
 - [Template Capture Workflow](https://gitmoot.io/docs/workflows/template-capture-workflow): Turn a current chat workflow into a reviewed reusable template.
 - [SkillOpt Train Workflow](https://gitmoot.io/docs/workflows/skillopt-train-workflow): Run the full feedback, optimizer, candidate-review, and promotion loop, including judge↔human outcome capture, `judge-report`, and judge-prompt optimization.
+- [Run Jobs In Parallel On A Repo](https://gitmoot.io/docs/workflows/parallel-jobs-workflow): Use `--parallel N` (or `--workers N`, now auto-`pool`) to run a repo's queued jobs N-wide; the two serialization layers (checkout lock + runtime session lock).
 
 ## References
 
@@ -27,7 +28,7 @@ full expanded context.
 - [Codex And Claude Plugins](https://gitmoot.io/docs/plugins/codex-claude): Plugin discovery and runtime skill setup.
 - [SkillOpt Exchange Contract](https://gitmoot.io/docs/reference/skillopt-exchange-contract): Training and candidate package boundary for the external optimizer.
 - [Troubleshooting](https://gitmoot.io/docs/operations/troubleshooting): Diagnose GitHub auth, bug reports, runtimes, agent templates, remotes, permissions, and locks.
-- [Release Notes](https://gitmoot.io/docs/release-notes/v0.5.2): Latest release (v0.5.2) — Orchestra upgrades: goal-anchored finale, `deps[]` dataflow, independent `verifier` pattern, result-aware loop detection, `escalate_human` human-in-the-loop pause, pre-flight DAG fix, `root_id` index, single-sourced result contract; plus `agent restart`, accurate Claude auth health, and automated linux/arm64 releases.
+- [Release Notes](https://gitmoot.io/docs/release-notes/v0.6.0): Latest release (v0.6.0) — same-repo parallel jobs made discoverable: `--workers > 1` auto-selects the `pool` scheduler, a `--parallel N` flag, scheduler/workers in `daemon status`, and a preflight serialization warning with the exact relaunch command.
 - [Raw SKILL.md](https://gitmoot.io/SKILL.md): Agent skill entrypoint.
 - [Full LLM Context](https://gitmoot.io/llms-full.txt): Expanded Markdown context for agents.
 - [GitHub Repository](https://github.com/jerryfane/gitmoot): Source code and releases.

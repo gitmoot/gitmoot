@@ -90,6 +90,16 @@ worker-pool scheduler that re-queries the queue as workers free and auto-isolate
 a contended same-repo read job into an ephemeral worktree (fixing a same-repo
 dependent-job deadlock), versus the default `--scheduler barrier`.
 
+To run a repo's queued jobs N-wide, use `--parallel N` (sugar for `--workers N
+--scheduler pool`; it cannot be combined with `--workers` or `--scheduler`).
+Raising `--workers` above 1 without an explicit `--scheduler` now **auto-selects
+`pool`** (multiple workers under `barrier` serialize same-repo jobs anyway); an
+explicit `--scheduler barrier` is still honored. `gitmoot daemon status` reports
+the live scheduler mode and worker count (e.g. `scheduler: pool, workers: 5`), and
+the daemon logs a preflight warning — with the exact relaunch command — when ≥2
+parallelizable jobs are queued under a serializing config. Same-repo parallelism
+is bounded by **distinct runtime sessions** as well as distinct checkouts.
+
 `gitmoot dashboard` shows local state — daemon health, repos, agents and runtime
 sessions, jobs by state, worktrees, branch locks, SkillOpt train phase/candidate,
 and pending interactive prompts.

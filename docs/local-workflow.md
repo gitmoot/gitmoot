@@ -115,9 +115,14 @@ should not be asked to create branches, commit, push, or open PRs through
 allocate worktrees, hold branch locks, commit changes, push branches, open PRs,
 and advance review state.
 
-The daemon defaults to `--workers 1`. Raise `--workers` when the Gitmoot home
-has independent runtime sessions, managed agent types with `max_background`
-greater than one, or forkable temporary workers enabled. By default,
+The daemon defaults to `--workers 1` and the per-tick `--scheduler barrier`,
+which serializes same-repo jobs. Raise `--workers` when the Gitmoot home has
+independent runtime sessions, managed agent types with `max_background` greater
+than one, or forkable temporary workers enabled — and to run a repo's queued jobs
+N-wide, use `gitmoot daemon start --parallel N` (or `--workers N`, which now
+auto-selects the `pool` scheduler). See
+[`parallel-jobs.md`](./parallel-jobs.md) for the full on-ramp and the two
+serialization layers (checkout lock and runtime session lock). By default,
 `[parallel_sessions]` uses:
 
 ```toml
