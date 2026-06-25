@@ -247,11 +247,12 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	}
 
 	prompt := prompts.RenderJob(payload.prompt(job.Type))
-	firstRaw, firstErr := m.deliver(ctx, adapter, agent, job, payload, prompt)
+	firstRaw, firstRefreshedRef, firstErr := m.deliver(ctx, adapter, agent, job, payload, prompt)
 	if firstErr != nil {
 		_ = m.fail(ctx, job.ID, fmt.Sprintf("delivery failed: %v", firstErr))
 		return AgentResult{}, firstErr
 	}
+	m.persistRefreshedRuntimeRef(ctx, job.ID, agent, firstRefreshedRef)
 	payload.RawOutputs = append(payload.RawOutputs, firstRaw)
 
 	result, parseErr := ExtractAgentResult(firstRaw)
@@ -270,11 +271,12 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		}
 
 		repairPrompt := prompts.RenderRepairPrompt(firstRaw, parseErr)
-		secondRaw, secondErr := m.deliver(ctx, adapter, agent, job, payload, repairPrompt)
+		secondRaw, secondRefreshedRef, secondErr := m.deliver(ctx, adapter, agent, job, payload, repairPrompt)
 		if secondErr != nil {
 			_ = m.fail(ctx, job.ID, fmt.Sprintf("repair delivery failed: %v", secondErr))
 			return AgentResult{}, secondErr
 		}
+		m.persistRefreshedRuntimeRef(ctx, job.ID, agent, secondRefreshedRef)
 		payload.RawOutputs = append(payload.RawOutputs, secondRaw)
 		result, parseErr = ExtractAgentResult(secondRaw)
 		if parseErr != nil {
@@ -297,7 +299,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	return result, nil
 }
 
-func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent runtime.Agent, job db.Job, payload JobPayload, prompt string) (string, error) {
+func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent runtime.Agent, job db.Job, payload JobPayload, prompt string) (string, string, error) {
 	result, err := adapter.Deliver(ctx, agent, runtime.Job{
 		ID:          job.ID,
 		AgentName:   agent.Name,
@@ -317,9 +319,22 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		_ = m.Store.UpdateJobUsage(ctx, job.ID, result.InputTokens, result.OutputTokens)
 	}
 	if strings.TrimSpace(result.Summary) != "" {
-		return result.Summary, err
+		return result.Summary, result.RefreshedRuntimeRef, err
 	}
-	return result.Raw, err
+	return result.Raw, result.RefreshedRuntimeRef, err
+}
+
+// persistRefreshedRuntimeRef re-pins an agent that self-healed a dead session
+// (#443). It is best-effort and fail-open: a ref-write failure must never fail an
+// otherwise-successful job, mirroring the usage-write swallow in deliver. It
+// emits a session_refresh_retry event alongside the repair_retry pattern so the
+// self-heal is observable.
+func (m Mailbox) persistRefreshedRuntimeRef(ctx context.Context, jobID string, agent runtime.Agent, refreshedRef string) {
+	if refreshedRef == "" || refreshedRef == agent.RuntimeRef {
+		return
+	}
+	_ = m.Store.UpdateAgentRuntimeRef(ctx, agent.Name, refreshedRef)
+	_ = m.addEvent(ctx, jobID, "session_refresh_retry", fmt.Sprintf("re-pinned agent %q to fresh runtime session after dead-session self-heal", agent.Name))
 }
 
 func (m Mailbox) finish(ctx context.Context, jobID string, state JobState, message string) error {

@@ -499,6 +499,102 @@ func TestMailboxRunUsesAdapterSummaryWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestMailboxRunPersistsRefreshedRuntimeRef(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+	oldRef := "550e8400-e29b-41d4-a716-446655440002"
+	newRef := "550e8400-e29b-41d4-a716-446655440099"
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:       "shipper",
+		Role:       "implementer",
+		Runtime:    runtime.ClaudeRuntime,
+		RuntimeRef: oldRef,
+		RepoScope:  "jerryfane/gitmoot",
+	}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+	agent := runtime.Agent{Name: "shipper", Runtime: runtime.ClaudeRuntime, RuntimeRef: oldRef, RepoScope: "jerryfane/gitmoot", Role: "implementer"}
+	adapter := &fakeDelivery{
+		outputs: []string{
+			`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["x"],"tests_run":[],"needs":[],"delegations":[]}}`,
+		},
+		refreshedRefs: []string{newRef},
+	}
+
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "shipper", Action: "implement", Repo: "jerryfane/gitmoot"}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	stored, err := store.GetAgent(ctx, "shipper")
+	if err != nil {
+		t.Fatalf("GetAgent returned error: %v", err)
+	}
+	if stored.RuntimeRef != newRef {
+		t.Fatalf("agent runtime_ref = %q, want re-pinned %q", stored.RuntimeRef, newRef)
+	}
+	events, err := store.ListJobEvents(ctx, "job-1")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	found := false
+	for _, e := range events {
+		if e.Kind == "session_refresh_retry" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a session_refresh_retry event, got %+v", events)
+	}
+}
+
+func TestMailboxRunNoRefreshLeavesRefUnchanged(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+	oldRef := "550e8400-e29b-41d4-a716-446655440002"
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:       "shipper",
+		Role:       "implementer",
+		Runtime:    runtime.ClaudeRuntime,
+		RuntimeRef: oldRef,
+		RepoScope:  "jerryfane/gitmoot",
+	}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+	agent := runtime.Agent{Name: "shipper", Runtime: runtime.ClaudeRuntime, RuntimeRef: oldRef, RepoScope: "jerryfane/gitmoot", Role: "implementer"}
+	adapter := &fakeDelivery{outputs: []string{
+		`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["x"],"tests_run":[],"needs":[],"delegations":[]}}`,
+	}}
+
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "shipper", Action: "implement", Repo: "jerryfane/gitmoot"}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	stored, err := store.GetAgent(ctx, "shipper")
+	if err != nil {
+		t.Fatalf("GetAgent returned error: %v", err)
+	}
+	if stored.RuntimeRef != oldRef {
+		t.Fatalf("agent runtime_ref = %q, want unchanged %q", stored.RuntimeRef, oldRef)
+	}
+	events, err := store.ListJobEvents(ctx, "job-1")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	for _, e := range events {
+		if e.Kind == "session_refresh_retry" {
+			t.Fatalf("unexpected session_refresh_retry event with no refresh: %+v", events)
+		}
+	}
+}
+
 func TestMailboxRunRetriesMalformedOutputOnce(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
@@ -679,12 +775,13 @@ func hasEvent(events []db.JobEvent, kind string) bool {
 }
 
 type fakeDelivery struct {
-	outputs   []string
-	summaries []string
-	prompts   []string
-	models    []string
-	onDeliver func()
-	err       error
+	outputs       []string
+	summaries     []string
+	refreshedRefs []string
+	prompts       []string
+	models        []string
+	onDeliver     func()
+	err           error
 }
 
 func (f *fakeDelivery) Deliver(_ context.Context, _ runtime.Agent, job runtime.Job) (runtime.Result, error) {
@@ -704,6 +801,9 @@ func (f *fakeDelivery) Deliver(_ context.Context, _ runtime.Agent, job runtime.J
 	result.Raw = f.outputs[index]
 	if index < len(f.summaries) {
 		result.Summary = f.summaries[index]
+	}
+	if index < len(f.refreshedRefs) {
+		result.RefreshedRuntimeRef = f.refreshedRefs[index]
 	}
 	return result, nil
 }

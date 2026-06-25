@@ -23,7 +23,12 @@ const (
 	// authentication/session failure (the cached session is expired or the
 	// --resume target is dead) that needs re-authentication and a fresh bind.
 	ClaudeSessionAuthFailedMessage = "Claude authentication/session failed; the cached session may be expired or the --resume target is dead. Re-authenticate (claude setup-token) and rebind the session."
-	ClaudeLiveCheckPrompt          = "Gitmoot Claude live check. Return OK only."
+	// ClaudeSessionMissingMessage is the remediation guidance for an unrecoverable
+	// dead pinned session (#443): the pinned conversation is gone and self-heal
+	// could not start a fresh one. The caller formats in the agent name; this
+	// constant carries the generic remediation so it stays reusable.
+	ClaudeSessionMissingMessage = "Re-point the agent with `gitmoot agent restart <name>` or `gitmoot agent subscribe … --session last`."
+	ClaudeLiveCheckPrompt       = "Gitmoot Claude live check. Return OK only."
 )
 
 type ClaudeAuthEnv struct {

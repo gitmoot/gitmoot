@@ -790,6 +790,28 @@ func (s *Store) UpdateAgentRuntime(ctx context.Context, name, runtime string) er
 	return s.UpsertAgent(ctx, agent)
 }
 
+// UpdateAgentRuntimeRef re-pins an agent's runtime_ref in place, updating only
+// that column (#443). Unlike UpdateAgentRuntime — which switches runtimes and
+// deliberately CLEARS runtime_ref — this is used by the self-heal path to record
+// a freshly minted session id while preserving every other field. It returns an
+// error if no agent row matched the name.
+func (s *Store) UpdateAgentRuntimeRef(ctx context.Context, name, ref string) error {
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE agents SET runtime_ref = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?`,
+		strings.TrimSpace(ref), name)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return fmt.Errorf("agent %q is not registered", name)
+	}
+	return nil
+}
+
 func (s *Store) GetAgent(ctx context.Context, name string) (Agent, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, model, capabilities_json, autonomy_policy, health_status
 		FROM agents WHERE name = ?`, name)
