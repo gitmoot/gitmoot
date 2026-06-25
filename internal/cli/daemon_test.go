@@ -5286,7 +5286,14 @@ func seedDaemonWorkerRepo(t *testing.T, store *db.Store, fullName string, checko
 
 func seedDaemonWorkerAgent(t *testing.T, store *db.Store, name string, runtimeName string, runtimeRef string, capabilities []string, repo string) {
 	t.Helper()
-	seedDaemonWorkerAgentWithPolicy(t, store, name, runtimeName, runtimeRef, capabilities, repo, runtime.AutonomyPolicyAuto)
+	// Implement-capable workers need a write policy or the fail-closed dispatch
+	// preflight blocks their jobs (#452); default everyone else to auto. Tests that
+	// deliberately exercise a non-write implement policy use the WithPolicy variant.
+	policy := runtime.AutonomyPolicyAuto
+	if runtime.HasImplementCapability(capabilities) {
+		policy = runtime.AutonomyPolicyWorkspaceWrite
+	}
+	seedDaemonWorkerAgentWithPolicy(t, store, name, runtimeName, runtimeRef, capabilities, repo, policy)
 }
 
 func seedDaemonWorkerAgentWithPolicy(t *testing.T, store *db.Store, name string, runtimeName string, runtimeRef string, capabilities []string, repo string, policy string) {

@@ -1970,6 +1970,14 @@ func testEngine(store *db.Store) Engine {
 
 func seedAgent(t *testing.T, store *db.Store, name string, capabilities []string, repo string) {
 	t.Helper()
+	// Implement-capable agents need a write policy or the fail-closed dispatch
+	// preflight (ensureAgentAllowedWithBranchOwner) BLOCKS their jobs (#452). Pick a
+	// writable policy automatically so the ~dozens of implement seeds stay valid
+	// without per-call-site churn; non-implement seeds keep the default "auto".
+	policy := "auto"
+	if runtime.HasImplementCapability(capabilities) {
+		policy = runtime.AutonomyPolicyWorkspaceWrite
+	}
 	if err := store.UpsertAgent(context.Background(), db.Agent{
 		Name:           name,
 		Role:           "agent",
@@ -1977,7 +1985,7 @@ func seedAgent(t *testing.T, store *db.Store, name string, capabilities []string
 		RuntimeRef:     "printf ok",
 		RepoScope:      repo,
 		Capabilities:   capabilities,
-		AutonomyPolicy: "auto",
+		AutonomyPolicy: policy,
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent returned error: %v", err)

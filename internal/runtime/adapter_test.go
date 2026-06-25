@@ -12,6 +12,55 @@ import (
 	"github.com/jerryfane/gitmoot/internal/subprocess"
 )
 
+func TestImplementWritePolicyError(t *testing.T) {
+	implement := []string{"ask", "review", "implement"}
+	readOnlyCaps := []string{"ask", "review"}
+	for _, tc := range []struct {
+		name         string
+		capabilities []string
+		policy       string
+		wantErr      bool
+	}{
+		{"implement + empty refused", implement, "", true},
+		{"implement + auto refused", implement, AutonomyPolicyAuto, true},
+		{"implement + read-only refused", implement, AutonomyPolicyReadOnly, true},
+		{"implement + workspace-write allowed", implement, AutonomyPolicyWorkspaceWrite, false},
+		{"implement + danger-full-access allowed", implement, AutonomyPolicyDangerFullAccess, false},
+		{"no implement + auto allowed", readOnlyCaps, AutonomyPolicyAuto, false},
+		{"no implement + read-only allowed", readOnlyCaps, AutonomyPolicyReadOnly, false},
+		{"no implement + empty allowed", readOnlyCaps, "", false},
+	} {
+		err := ImplementWritePolicyError(tc.capabilities, tc.policy)
+		if tc.wantErr {
+			if err == nil {
+				t.Fatalf("%s: expected an error, got nil", tc.name)
+			}
+			for _, fragment := range []string{"danger-full-access", "workspace-write", "implement"} {
+				if !strings.Contains(err.Error(), fragment) {
+					t.Fatalf("%s: error %q must mention %q", tc.name, err.Error(), fragment)
+				}
+			}
+		} else if err != nil {
+			t.Fatalf("%s: expected no error, got %v", tc.name, err)
+		}
+	}
+}
+
+func TestPolicyGrantsImplementWrite(t *testing.T) {
+	for policy, want := range map[string]bool{
+		"":                             false,
+		AutonomyPolicyAuto:             false,
+		AutonomyPolicyReadOnly:         false,
+		AutonomyPolicyWorkspaceWrite:   true,
+		AutonomyPolicyDangerFullAccess: true,
+		"bogus":                        false,
+	} {
+		if got := PolicyGrantsImplementWrite(policy); got != want {
+			t.Fatalf("PolicyGrantsImplementWrite(%q) = %v, want %v", policy, got, want)
+		}
+	}
+}
+
 func TestValidateAgent(t *testing.T) {
 	agent := Agent{Name: "audit", Role: "reviewer", Runtime: CodexRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440000", RepoScope: "jerryfane/gitmoot"}
 	if err := ValidateAgent(agent); err != nil {

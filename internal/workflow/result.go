@@ -387,7 +387,7 @@ func validateDelegationTarget(d Delegation) error {
 		return fmt.Errorf("delegation %q must set exactly one of agent or ephemeral", d.ID)
 	}
 	if hasEphemeral {
-		if err := validateEphemeralSpec(d.ID, d.Ephemeral); err != nil {
+		if err := validateEphemeralSpec(d.ID, d.Action, d.Ephemeral); err != nil {
 			return err
 		}
 	}
@@ -397,7 +397,14 @@ func validateDelegationTarget(d Delegation) error {
 // validateEphemeralSpec validates the inline worker spec on a delegation: the
 // runtime is required and must be a real agent runtime (codex/claude/kimi); shell
 // and unknown runtimes are rejected so an ephemeral worker is never a raw shell.
-func validateEphemeralSpec(delegationID string, spec *EphemeralSpec) error {
+//
+// action is the delegation's action: an ephemeral implement worker (action
+// "implement" or an explicit "implement" capability on the spec) whose
+// autonomy_policy is empty/auto/read-only is fail-closed with the same guidance
+// the CLI emits, because an empty policy normalizes to auto → no write headlessly
+// (ties #451: coordinators must set an explicit write policy when fanning out
+// ephemeral implement workers).
+func validateEphemeralSpec(delegationID string, action string, spec *EphemeralSpec) error {
 	if spec == nil {
 		return nil
 	}
@@ -416,6 +423,17 @@ func validateEphemeralSpec(delegationID string, spec *EphemeralSpec) error {
 		if _, err := runtime.NormalizeAutonomyPolicy(policy); err != nil {
 			return fmt.Errorf("delegation %q ephemeral autonomy_policy %q is invalid", delegationID, spec.AutonomyPolicy)
 		}
+	}
+	// Fail-closed implement guard: an ephemeral implement worker with a non-write
+	// policy (empty/auto/read-only) is rejected with the shared guidance. The spec's
+	// capabilities default to the delegation action when omitted, so fold the action
+	// into the capability set the predicate inspects.
+	capabilities := spec.Capabilities
+	if strings.TrimSpace(action) != "" {
+		capabilities = append(append([]string{}, spec.Capabilities...), action)
+	}
+	if err := runtime.ImplementWritePolicyError(capabilities, spec.AutonomyPolicy); err != nil {
+		return fmt.Errorf("delegation %q ephemeral %v", delegationID, err)
 	}
 	return nil
 }

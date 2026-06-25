@@ -71,7 +71,7 @@ gitmoot doctor          # shows claude auth (daemon) and the shell-local check
 
 | Scenario | Required signal |
 | --- | --- |
-| Claude read-only implement worker | Job is blocked before runtime delivery with a `permission_blocked` event and the standard write-permission message. |
+| Claude read-only (or `auto`/default) implement worker | Job is blocked before runtime delivery with a `permission_blocked` event and the standard write-permission message — `auto` grants no deterministic headless write, so it fails closed like `read-only` (#452). |
 | Claude workspace-write implement worker | Job runs in `task.worktree_path` and produces the expected marker change there, not in the registered checkout. |
 | Mixed Codex + Claude parallel implement | Two tasks have two distinct worktrees, daemon runs with `--workers 2`, Codex owns one runtime session, Claude owns another, and both jobs finish without checkout or runtime-session contention. |
 | Local/no-PR implement advancement | Implementation job records `advance_skipped_no_pr`, then `advance_completed`; it should not keep retrying PR advancement when no PR is attached. |

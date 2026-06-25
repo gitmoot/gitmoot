@@ -1116,6 +1116,10 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "invalid agent: %v\n", err)
 		return 2
 	}
+	if err := runtime.ImplementWritePolicyError(agent.Capabilities, agent.AutonomyPolicy); err != nil {
+		fmt.Fprintf(stderr, "invalid agent: %v\n", err)
+		return 2
+	}
 	if agent.Runtime == runtime.ShellRuntime {
 		fmt.Fprintln(stderr, "start runtime: shell runtime does not support agent start; use gitmoot agent subscribe --runtime shell --session <command>")
 		return 1
@@ -1266,6 +1270,10 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 		HealthStatus:   "unknown",
 	}
 	if err := runtime.ValidateAgent(agent); err != nil {
+		fmt.Fprintf(stderr, "invalid agent: %v\n", err)
+		return 2
+	}
+	if err := runtime.ImplementWritePolicyError(agent.Capabilities, agent.AutonomyPolicy); err != nil {
 		fmt.Fprintf(stderr, "invalid agent: %v\n", err)
 		return 2
 	}

@@ -619,6 +619,40 @@ func TestPreflightReadOnlyImplementNonDelegationUnaffected(t *testing.T) {
 	}
 }
 
+// TestPreflightAutoImplementIsPermissionBlocked closes the #452 gap: an implement
+// job whose agent has the default auto policy (no write granted headlessly) is now
+// permission-blocked at dispatch with the actionable message, instead of running
+// to completion and producing no files.
+func TestPreflightAutoImplementIsPermissionBlocked(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "jerryfane/gitmoot", t.TempDir())
+	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.CodexRuntime, "unused", []string{"implement"}, "jerryfane/gitmoot", runtime.AutonomyPolicyAuto)
+	job := db.Job{ID: "impl-job", Agent: "lead", Type: "implement", State: string(workflow.JobQueued), Payload: mustJobPayload(t, workflow.JobPayload{
+		Repo: "jerryfane/gitmoot", Branch: "feature", TaskID: "task-impl", TaskTitle: "Solo implement", Sender: "lead",
+	})}
+	if err := store.CreateJobWithEvent(ctx, job, db.JobEvent{Kind: string(workflow.JobQueued), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+
+	worker := defaultJobWorker(store, io.Discard)
+	worker.WorkflowFactory = func(string) workflow.Engine {
+		t.Fatal("permission-blocked auto implement must not build an engine")
+		return workflow.Engine{}
+	}
+
+	if err := worker.run(ctx, mustWorkerJob(t, store, "impl-job")); err != nil {
+		t.Fatalf("worker.run(auto implement) returned error: %v", err)
+	}
+	got := mustWorkerJob(t, store, "impl-job")
+	if got.State != string(workflow.JobBlocked) {
+		t.Fatalf("job state = %q, want blocked", got.State)
+	}
+	if n := countWorkerJobEvents(t, store, "impl-job", "permission_blocked"); n == 0 {
+		t.Fatalf("expected a permission_blocked event for an auto-policy implement job")
+	}
+}
+
 // TestPreflightEphemeralDelegationChildAdvancesParent is the load-bearing test for
 // finding 3: an EPHEMERAL delegation child whose pre-flight fails goes through the
 // ephemeral wrapper at run() (~2083-2093) — an `ephemeral_worker_failed` event +

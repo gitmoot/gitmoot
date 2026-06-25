@@ -3158,7 +3158,10 @@ func (w jobWorker) startEphemeralWorker(ctx context.Context, job db.Job, payload
 		capabilities = []string{job.Type}
 	}
 	// Least privilege: default read-only, except an implement must be able to
-	// write. The spec may still opt into a different (validated) policy.
+	// write. The spec may still opt into a different (validated) policy. Note an
+	// EMPTY-policy implement spec is already refused upstream by
+	// validateEphemeralSpec (#452), so this implement default is now defense in
+	// depth for any path that reaches here without that validation.
 	defaultPolicy := runtime.AutonomyPolicyReadOnly
 	if job.Type == "implement" {
 		defaultPolicy = runtime.AutonomyPolicyWorkspaceWrite

@@ -213,7 +213,15 @@ Delegation fields:
   - `capabilities` (optional): an array of capability strings advertised by the
     worker.
   - `autonomy_policy` (optional): the worker's sandbox autonomy. Defaults to
-    `read-only`.
+    `read-only`. An **implement** ephemeral worker (`action: "implement"` or an
+    explicit `"implement"` capability) **must** carry a write policy
+    (`workspace-write` or `danger-full-access`); an empty/`auto`/`read-only`
+    policy is rejected at validation with the same fail-closed guidance the CLI
+    emits, because an unset policy normalizes to `auto`, which grants no
+    deterministic headless write. Note `workspace-write` (`acceptEdits`) auto-
+    accepts file edits but does NOT unblock Bash (`go`/`git`/`gh`), so full
+    headless implementation needs `danger-full-access`. See
+    `references/SAFETY.md` for the policy→permission-mode mapping.
 
   Ephemeral delegations are bounded by the same delegation limits as any other
   delegation (see [Termination bounds](#termination-bounds)); they do not relax

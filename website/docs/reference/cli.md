@@ -217,6 +217,24 @@ with no allow-list; both `--model X` and `--model=X` are accepted. A per-job
 omitted model preserves the runtime's own default. The same default can be set
 in config under `[agents.<type>].model`.
 
+`agent start` and `agent subscribe` accept `--policy` (default `auto`). The policy
+maps to the runtime permission mode and decides what a headless job may do:
+
+| `--policy` | Claude `--permission-mode` | Headless capability |
+|---|---|---|
+| `read-only` | `plan` | inspect/report only, no writes |
+| `workspace-write` | `acceptEdits` | file edits only — does NOT unblock Bash (`go`/`git`/`gh`) |
+| `danger-full-access` | `bypassPermissions` | full implementation: file writes plus Bash |
+| `auto` (default) | *(no flag)* | non-deterministic — inherited from ambient Claude config |
+
+Because of this, an agent that carries the `implement` capability **must** be
+started/subscribed with a write policy. Gitmoot fails closed: `--capability
+implement` with `auto`/empty or `read-only` is refused at `agent start`, `agent
+subscribe`, and at implement-job dispatch with an actionable message. Set
+`--policy danger-full-access` for full headless implementation (file writes plus
+`go`/`git`/`gh`), or `--policy workspace-write` for edits-only (Bash stays
+blocked). `read-only`/`ask`/`review` agents are unaffected.
+
 `--runtime` accepts `codex`, `claude`, or `kimi`. Kimi Code is a first-class
 runtime adapter alongside Codex and Claude Code. Before starting a Kimi-backed
 agent, authenticate the Kimi CLI with `kimi login`, then restart the Gitmoot

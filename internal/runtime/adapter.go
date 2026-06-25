@@ -187,6 +187,57 @@ func NormalizeStoredAutonomyPolicy(policy string) string {
 	return normalized
 }
 
+// ImplementWritePolicyGuidance is the single, actionable message emitted whenever
+// an agent (or ephemeral spec) carrying the "implement" capability is paired with
+// a non-write autonomy policy (auto/empty or read-only). It is shared verbatim by
+// every fail-closed seam — agent start, agent subscribe, implement-job dispatch,
+// and ephemeral-spec validation — so operators always see the same fix.
+//
+// The guidance names both writable policies and is explicit that workspace-write
+// (acceptEdits) only auto-accepts file edits — it does NOT unblock the Bash an
+// implement job needs (go/git/gh), so full headless implementation requires
+// danger-full-access (bypassPermissions). The behavior is fail-closed: gitmoot
+// refuses rather than silently delegating the write decision to ambient Claude
+// config, whose headless write capability is non-deterministic across hosts.
+const ImplementWritePolicyGuidance = "autonomy policy %q grants no write permission in headless runs, but this worker has the \"implement\" capability — the job would run and produce no files. Set --policy danger-full-access for full headless implementation (file writes plus go/git/gh via Bash), or --policy workspace-write for edits-only (note: workspace-write maps to acceptEdits and does NOT unblock Bash, so go/git/gh stay blocked)."
+
+// PolicyGrantsImplementWrite reports whether the given autonomy policy permits
+// headless file writes. Only workspace-write and danger-full-access qualify; auto
+// (and the empty/unset policy, which normalizes to auto) and read-only do not.
+func PolicyGrantsImplementWrite(policy string) bool {
+	switch NormalizeStoredAutonomyPolicy(policy) {
+	case AutonomyPolicyWorkspaceWrite, AutonomyPolicyDangerFullAccess:
+		return true
+	default:
+		return false
+	}
+}
+
+// HasImplementCapability reports whether the capability set contains "implement".
+func HasImplementCapability(capabilities []string) bool {
+	for _, capability := range capabilities {
+		if strings.TrimSpace(capability) == "implement" {
+			return true
+		}
+	}
+	return false
+}
+
+// ImplementWritePolicyError returns a non-nil, actionable error when the given
+// capability set contains "implement" but the autonomy policy grants no write
+// (auto/empty or read-only); otherwise it returns nil. This is the shared
+// fail-closed predicate behind every capability<->policy seam. read-only / ask /
+// review agents (no implement capability) are never refused.
+func ImplementWritePolicyError(capabilities []string, policy string) error {
+	if !HasImplementCapability(capabilities) {
+		return nil
+	}
+	if PolicyGrantsImplementWrite(policy) {
+		return nil
+	}
+	return fmt.Errorf(ImplementWritePolicyGuidance, NormalizeStoredAutonomyPolicy(policy))
+}
+
 type CodexSessionResolver interface {
 	Exists(ctx context.Context, ref string) (bool, error)
 }
