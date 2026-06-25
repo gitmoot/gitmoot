@@ -300,6 +300,14 @@ type EscalationRequest struct {
 	// Question is the human-facing escalation question (the delegation's prompt),
 	// so the notification can quote what is being asked of the human.
 	Question string
+	// Ask is true when this is a non-failure ask-gate pause (#445) rather than a
+	// failure escalation, so the notifier renders the ask wording + the `answer`
+	// resume verb instead of the retry/continue/abort verbs.
+	Ask bool
+	// Questions carries the ask-gate's human_questions[] (#445) so the notifier can
+	// render each id + prompt (+ choices) and tell the human exactly what to answer.
+	// Empty for a failure escalation.
+	Questions []HumanQuestion
 	// Repo/PullRequest/Branch/TaskID/TaskTitle locate the tree's PR or issue so
 	// the notifier can post the @-tag comment in the right place.
 	Repo        string
@@ -683,6 +691,34 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 	}
 	if payload.Result.Decision == "blocked" || payload.Result.Decision == "failed" {
 		return e.block(ctx, ref, payload.Result.Summary)
+	}
+	// Ask-gate (#445): a HEALTHY result that carries human_questions[] pauses the
+	// task at awaiting_human for a specific human answer instead of guessing —
+	// reusing the escalate_human pause machinery on a SUCCESS result. It runs
+	// AFTER the blocked/failed early-return (so a failed result never asks) and
+	// BEFORE dispatchDelegations/the continuation, so NO delegations dispatch and
+	// NO continuation enqueues while the round is open: zero compute, budget-
+	// neutral. pauseAwaitingHumanAnswer returns AwaitingHumanError (an idempotent
+	// re-advance within the open round returns it without re-recording), so the
+	// switch below is skipped and the agent's already-delivered result is
+	// preserved while the tree waits.
+	if len(payload.Result.HumanQuestions) > 0 {
+		open, err := e.pauseAwaitingHumanAnswer(ctx, job, payload, ref)
+		if err != nil {
+			return err
+		}
+		if open {
+			// The round is OPEN (freshly opened now, or an idempotent re-advance while
+			// awaiting the answer): the tree consumes zero compute until the human
+			// resumes with `answer`.
+			return AwaitingHumanError{Reason: fmt.Sprintf("job %q is awaiting a human answer to %d question(s)", job.ID, len(payload.Result.HumanQuestions))}
+		}
+		// The round is CLOSED: the human already answered (resumeAnswerLeg enqueued
+		// the coordinator continuation that carries the answer) or the ask was
+		// TTL-finalized. Either way the answer-driven continuation is the asking
+		// job's sole continuation, so short-circuit here — the asking result's own
+		// delegations[] must NOT also dispatch and no second continuation enqueues.
+		return nil
 	}
 	if job.Type == "review" && payload.Result.Decision == "approved" {
 		done, err := e.reviewApprovalAlreadyAdvanced(ctx, ref)
@@ -2100,13 +2136,38 @@ func (e Engine) advanceDelegations(ctx context.Context, parentJob db.Job, parent
 	return nil
 }
 
+// continuationConfig holds the optional inputs threaded into a coordinator
+// continuation (#445). It is empty by default so every existing call site builds
+// the byte-identical continuation it always did.
+type continuationConfig struct {
+	// humanAnswer, when non-empty, is the rendered ask-gate answer block injected
+	// at the top of the NORMAL continuation prompt so the resumed coordinator reads
+	// the human's decision (the answer-driven resume path only ever reaches the
+	// normal continuation, never the loop/verify-replan corrective ones).
+	humanAnswer string
+}
+
+// continuationOption configures a maybeEnqueueContinuation call without changing
+// the byte-identical default (no options) path.
+type continuationOption func(*continuationConfig)
+
+// withHumanAnswer threads a rendered ask-gate answer block into the continuation
+// prompt (#445).
+func withHumanAnswer(answer string) continuationOption {
+	return func(c *continuationConfig) { c.humanAnswer = answer }
+}
+
 // maybeEnqueueContinuation enqueues exactly one coordinator continuation job for
 // a parent whose delegations have all finished. Idempotency is enforced by a
 // deterministic continuation id plus a one-shot delegation_continuation_enqueued
 // event on the parent, so concurrent child completions enqueue it at most once.
 // When any delegation declares synthesis_rule "vote", the continuation is gated:
 // the parent task is blocked unless every child was approved/succeeded.
-func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, parentPayload JobPayload, parentResult *AgentResult, children map[string]db.Job, ref taskRef) error {
+func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, parentPayload JobPayload, parentResult *AgentResult, children map[string]db.Job, ref taskRef, opts ...continuationOption) error {
+	var cfg continuationConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	events, err := e.Store.ListJobEvents(ctx, parentJob.ID)
 	if err != nil {
 		return err
@@ -2348,9 +2409,14 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		// the coordinator toward synthesizing now over more fan-out. The job count is
 		// best-effort — a lookup error yields 0, which suppresses only the job clause,
 		// never the continuation.
-		Instructions: e.buildContinuationPrompt(goal, budgetPressureLine(parentPayload.DelegationDepth+1, e.rootJobCountForPressure(ctx, e.rootJobID(parentJob, parentPayload))), parentResult, children, childPayloads),
+		Instructions: e.buildContinuationPrompt(goal, budgetPressureLine(parentPayload.DelegationDepth+1, e.rootJobCountForPressure(ctx, e.rootJobID(parentJob, parentPayload))), parentResult, children, childPayloads, cfg.humanAnswer),
 		Constraints:  parentPayload.Constraints,
 		ParentJobID:  parentJob.ID,
+		// Ask-gate answer (#445): carry the human's answer block on the continuation
+		// for durability/observability; buildContinuationPrompt above already rendered
+		// it at the top of the prompt. Empty (the default) for every non-answer path,
+		// so omitempty keeps the stored payload byte-identical.
+		HumanAnswer: cfg.humanAnswer,
 		// Increment depth per continuation generation so a coordinator whose
 		// continuation re-delegates is bounded by MaxDelegationDepth instead of
 		// looping forever (the continuation reused the parent's depth before).
@@ -2727,10 +2793,19 @@ func delegationContinuationID(parentJobID string) string {
 
 // buildContinuationPrompt inlines each finished child's job id, agent, decision,
 // summary, and PR link into the coordinator continuation prompt so the
-// coordinator can synthesize the results without re-reading every child job.
-func (e Engine) buildContinuationPrompt(goal, budgetLine string, parentResult *AgentResult, children map[string]db.Job, childPayloads map[string]JobPayload) string {
+// coordinator can synthesize the results without re-reading every child job. When
+// humanAnswer is non-empty (the ask-gate `answer` resume path, #445) it is
+// rendered as a clearly-labelled block at the TOP of the prompt so the resumed
+// coordinator reads the human's decision before the delegation results; it is ""
+// for every non-answer continuation, keeping that prompt byte-identical.
+func (e Engine) buildContinuationPrompt(goal, budgetLine string, parentResult *AgentResult, children map[string]db.Job, childPayloads map[string]JobPayload, humanAnswer string) string {
 	var builder strings.Builder
 	builder.WriteString(goalAnchorHeader(goal))
+	if block := strings.TrimSpace(humanAnswer); block != "" {
+		builder.WriteString("Human answers to your questions (you paused to ask these; use them and proceed):\n")
+		builder.WriteString(block)
+		builder.WriteString("\n\n")
+	}
 	builder.WriteString("All delegated jobs have finished. Review the results below.\n\n")
 	builder.WriteString(budgetLine)
 	builder.WriteString("Delegation results:\n")
@@ -3914,7 +3989,25 @@ type EscalationRecord struct {
 	Reason       string `json:"reason,omitempty"`
 	Question     string `json:"question,omitempty"`
 	PausedAt     string `json:"paused_at,omitempty"`
+	// Kind discriminates the pause flavor (#445): "" (or "failure") is the
+	// escalate_human failure pause; "ask" is the non-failure ask-gate pause opened
+	// by a healthy result's human_questions[]. It rides the SAME
+	// delegation_escalation_requested/_resolved event kinds so TTL, wall-clock
+	// pause exclusion, and round-idempotency all apply unchanged; only the
+	// human-facing rendering and the resume verb gating branch on it.
+	Kind string `json:"kind,omitempty"`
+	// Questions carries the ask-gate's human_questions[] on the requested event so
+	// the notifier can render them and the resume can map answers by id. Empty for
+	// a failure escalation.
+	Questions []HumanQuestion `json:"questions,omitempty"`
+	// Answers carries the human's parsed id->answer map on the resolved event of an
+	// ask round. Empty for a failure escalation or an unanswered (TTL) resolution.
+	Answers map[string]string `json:"answers,omitempty"`
 }
+
+// escalationKindAsk is the EscalationRecord.Kind discriminator for an ask-gate
+// pause (#445); the failure-escalation pause leaves Kind empty.
+const escalationKindAsk = "ask"
 
 // pauseAwaitingHuman is the escalate_human analogue of block (#340): it sets the
 // shared parent task to TaskAwaitingHuman, records a per-round
@@ -4009,6 +4102,130 @@ func (e Engine) pauseAwaitingHuman(ctx context.Context, parentJob db.Job, parent
 	))
 
 	return awaitErr
+}
+
+// pauseAwaitingHumanAnswer is the non-failure ask-gate sibling of
+// pauseAwaitingHuman (#445): a HEALTHY job that returned human_questions[] pauses
+// its task at awaiting_human for a specific human answer. It reuses the exact
+// escalate_human pause plumbing — the same delegation_escalation_requested event
+// kind (tagged Kind="ask" + the questions), the same escalationOpen round guard,
+// and the same EscalationNotifier / job.needs_attention (#446) seam — so TTL
+// auto-finalize, wall-clock pause exclusion, and round-idempotency all apply with
+// no extra plumbing. It enqueues NO continuation and dispatches NO delegations
+// (the caller short-circuits on a true return), so the pause is budget-neutral
+// and consumes zero compute until the human resumes with `answer`.
+//
+// It returns whether the ask round is currently OPEN. true => the caller returns
+// AwaitingHumanError (freshly opened, or an idempotent re-advance while awaiting).
+// false => the round is CLOSED (the human already answered and the answer-driven
+// continuation is in flight, or the ask was TTL-finalized): the caller
+// short-circuits AdvanceJob without redispatching.
+func (e Engine) pauseAwaitingHumanAnswer(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) (bool, error) {
+	// While ANY escalation round is OPEN (requested > resolved) this is an
+	// idempotent re-advance: keep the pause, re-record nothing, re-notify nobody.
+	open, err := e.escalationOpen(ctx, job.ID)
+	if err != nil {
+		return false, err
+	}
+	if open {
+		return true, nil
+	}
+
+	// No OPEN round. If an ask round was already opened AND resolved for this job,
+	// the human has answered (or TTL-finalized) and the answer-driven continuation
+	// is the asking job's sole continuation: report CLOSED so the caller
+	// short-circuits without re-pausing or redispatching. Mirrors the
+	// escalate_human round model, but an asking job is never re-run to open a
+	// second ask round (only a retried failing leg re-pauses), so a resolved ask
+	// round stays closed.
+	if _, exists, lerr := e.loadEscalation(ctx, job.ID); lerr != nil {
+		return false, lerr
+	} else if exists {
+		return false, nil
+	}
+
+	// Open a FRESH ask round: pause the task, record the requested event with the
+	// questions, notify best-effort, and emit job.needs_attention once.
+	if err := e.setTaskState(ctx, ref, TaskAwaitingHuman); err != nil {
+		return false, err
+	}
+
+	questions := payload.Result.HumanQuestions
+	record := EscalationRecord{
+		Reason:    fmt.Sprintf("%d human question(s) awaiting an answer", len(questions)),
+		Question:  renderHumanQuestions(questions),
+		PausedAt:  e.now().UTC().Format(time.RFC3339),
+		Kind:      escalationKindAsk,
+		Questions: questions,
+	}
+	encoded, marshalErr := json.Marshal(record)
+	message := record.Reason
+	if marshalErr == nil {
+		message = string(encoded)
+	}
+	if err := e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   job.ID,
+		Kind:    escalationRequestedEvent,
+		Message: message,
+	}); err != nil {
+		return false, err
+	}
+
+	// Notify the human best-effort (nil notifier / notifier error never fails the
+	// pause): the recorded event + dashboard Attention are the durable truth.
+	if e.EscalationNotifier != nil {
+		_ = e.EscalationNotifier.NotifyEscalation(ctx, EscalationRequest{
+			CoordinatorJobID: job.ID,
+			Question:         renderHumanQuestions(questions),
+			Ask:              true,
+			Questions:        questions,
+			Repo:             firstNonEmptyString(ref.Repo, payload.Repo),
+			PullRequest:      payload.PullRequest,
+			Branch:           firstNonEmptyString(ref.Branch, payload.Branch),
+			TaskID:           ref.ID,
+			TaskTitle:        ref.Title,
+		})
+	}
+
+	// Emit a best-effort job.needs_attention on the FRESH ask round via the SAME
+	// #446 EventSink the failure escalation rides (NOT a parallel notify path).
+	// One-shot (we only reach here when no round was open) and nil-safe.
+	rootID := strings.TrimSpace(payload.RootJobID)
+	if rootID == "" {
+		rootID = job.ID
+	}
+	events.EmitEvent(ctx, e.EventSink, events.NewEvent(
+		events.EventJobNeedsAttention,
+		job.ID,
+		rootID,
+		firstNonEmptyString(ref.Repo, payload.Repo),
+		string(TaskAwaitingHuman),
+		renderHumanQuestions(questions),
+		e.now(),
+		RedactCommentText,
+	))
+
+	return true, nil
+}
+
+// renderHumanQuestions renders the ask-gate questions as a compact, human-facing
+// multi-line block ("- <id>: <prompt> (choices: ...)") used both as the recorded
+// Question text and the needs_attention detail. Empty for no questions.
+func renderHumanQuestions(questions []HumanQuestion) string {
+	if len(questions) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, q := range questions {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		fmt.Fprintf(&b, "- %s: %s", strings.TrimSpace(q.ID), strings.TrimSpace(q.Prompt))
+		if len(q.Choices) > 0 {
+			fmt.Fprintf(&b, " (choices: %s)", strings.Join(q.Choices, ", "))
+		}
+	}
+	return b.String()
 }
 
 // firstNonEmptyString returns the first non-blank value, or "".
@@ -4108,6 +4325,11 @@ const (
 	// ResumeAbort routes to the #305 graceful finalize continuation for a terminal
 	// best-effort synthesis of whatever completed.
 	ResumeAbort ResumeDecision = "abort"
+	// ResumeAnswer delivers a human's answer(s) to an ask-gate pause (#445): it
+	// enqueues the coordinator continuation carrying the answer text. It is valid
+	// only on an ask round (Kind="ask"); the retry/continue/abort verbs are valid
+	// only on a failure-escalation round.
+	ResumeAnswer ResumeDecision = "answer"
 )
 
 // validResumeDecision normalizes and validates a resume verb.
@@ -4119,6 +4341,8 @@ func validResumeDecision(decision string) (ResumeDecision, bool) {
 		return ResumeContinue, true
 	case ResumeAbort:
 		return ResumeAbort, true
+	case ResumeAnswer:
+		return ResumeAnswer, true
 	default:
 		return "", false
 	}
@@ -4145,7 +4369,7 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 	}
 	verb, ok := validResumeDecision(string(decision))
 	if !ok {
-		return fmt.Errorf("invalid resume decision %q; want retry|continue|abort", decision)
+		return fmt.Errorf("invalid resume decision %q; want retry|continue|abort|answer", decision)
 	}
 
 	rec, exists, err := e.loadEscalation(ctx, coordinatorJobID)
@@ -4165,6 +4389,18 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 		return nil
 	}
 
+	// Verb/round-kind gating (#445): the ask-gate's `answer` verb is valid ONLY on
+	// an ask round, and the failure verbs (retry/continue/abort) ONLY on a failure
+	// escalation round. A mismatch is a clear, side-effect-free error so a human who
+	// sends the wrong verb gets a precise ack and the pause stays intact.
+	isAskRound := rec.Kind == escalationKindAsk
+	if verb == ResumeAnswer && !isAskRound {
+		return fmt.Errorf("job %s is paused on a failure escalation, not an ask; resume it with retry|continue|abort, not answer", coordinatorJobID)
+	}
+	if verb != ResumeAnswer && isAskRound {
+		return fmt.Errorf("job %s is awaiting a human answer; resume it with `answer \"<id>: ...\"`, not %s", coordinatorJobID, verb)
+	}
+
 	parentJob, parentPayload, err := e.jobPayload(ctx, coordinatorJobID)
 	if err != nil {
 		return err
@@ -4173,6 +4409,10 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 		return fmt.Errorf("job %s has no result to resume", coordinatorJobID)
 	}
 	ref := taskRefFromPayload(parentPayload)
+
+	// answers is populated only on the ask-gate `answer` verb; it is recorded on the
+	// resolution event (parsed + any unmatched ids) and threaded into the continuation.
+	var answers map[string]string
 
 	switch verb {
 	case ResumeRetry:
@@ -4195,6 +4435,11 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 		if err := e.enqueueFinalizeContinuation(ctx, parentJob, parentPayload, reason); err != nil {
 			return err
 		}
+	case ResumeAnswer:
+		answers = parseHumanAnswers(rec.Questions, instructions)
+		if err := e.resumeAnswerLeg(ctx, parentJob, parentPayload, ref, rec, answers); err != nil {
+			return err
+		}
 	}
 
 	// Clear the pause: move the task out of awaiting_human. retry/continue re-arm
@@ -4212,6 +4457,8 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 		Reason:       string(verb),
 		Question:     strings.TrimSpace(instructions),
 		PausedAt:     e.now().UTC().Format(time.RFC3339), // reused as resolved_at
+		Kind:         rec.Kind,
+		Answers:      answers,
 	}
 	message := string(verb)
 	if encoded, marshalErr := json.Marshal(resolution); marshalErr == nil {
@@ -4251,6 +4498,121 @@ func (e Engine) resumeRetryLeg(ctx context.Context, parentJob db.Job, parentPayl
 		Kind:    "delegation_escalation_retry",
 		Message: fmt.Sprintf("human resume retry re-enqueued delegation %q as job %s", d.ID, request.ID),
 	})
+}
+
+// parseHumanAnswers parses the human's free-form `answer` instructions into an
+// id->answer map (#445). The instruction body is multi-line; each line of the
+// form "<id>: <text>" maps the answer to the matching question id. An id that
+// does not match any open question is recorded under its literal key so it is
+// surfaced (never silently dropped) rather than failing the resume. When the body
+// has no recognizable "<id>:" prefix at all AND there is exactly one open
+// question, the whole body is taken as that question's answer (the common
+// single-question convenience). Returns nil when nothing parses, so the
+// resolution event omits the answers map.
+func parseHumanAnswers(questions []HumanQuestion, instructions string) map[string]string {
+	known := make(map[string]struct{}, len(questions))
+	for _, q := range questions {
+		known[strings.TrimSpace(q.ID)] = struct{}{}
+	}
+	answers := make(map[string]string)
+	matchedAny := false
+	lastID := ""
+	for _, line := range strings.Split(instructions, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if idx := strings.Index(line, ":"); idx > 0 {
+			id := strings.TrimSpace(line[:idx])
+			text := strings.TrimSpace(line[idx+1:])
+			if id != "" {
+				answers[id] = text
+				lastID = id
+				if _, ok := known[id]; ok {
+					matchedAny = true
+				}
+				continue
+			}
+		}
+		// A line with no "<id>:" prefix continues the most recently parsed answer
+		// (a multi-line answer body); with no answer yet it is dropped (the
+		// single-question convenience below covers a prefix-less single answer).
+		if lastID != "" {
+			answers[lastID] = strings.TrimSpace(answers[lastID] + "\n" + line)
+		}
+	}
+	// Single-question convenience: if nothing matched a known id and there is exactly
+	// one question, treat the whole body as that question's answer.
+	if !matchedAny && len(questions) == 1 {
+		if body := strings.TrimSpace(instructions); body != "" {
+			return map[string]string{strings.TrimSpace(questions[0].ID): body}
+		}
+	}
+	if len(answers) == 0 {
+		return nil
+	}
+	return answers
+}
+
+// resumeAnswerLeg enqueues the coordinator continuation carrying the human's
+// answer(s) to an ask-gate pause (#445). It mirrors the ResumeContinue path
+// (maybeEnqueueContinuation under the deterministic continuation id, idempotent
+// via the continuationEnqueued guard) but threads the parsed answers into the
+// continuation request's HumanAnswer field so buildContinuationPrompt renders a
+// clearly-labelled "Human answers to your questions" block at the top of the
+// coordinator's continuation prompt. It is the `answer` verb's worker.
+func (e Engine) resumeAnswerLeg(ctx context.Context, parentJob db.Job, parentPayload JobPayload, ref taskRef, rec EscalationRecord, answers map[string]string) error {
+	children, err := e.childDelegationJobs(ctx, parentJob.ID)
+	if err != nil {
+		return err
+	}
+	answerBlock := renderHumanAnswerBlock(rec.Questions, answers)
+	if err := e.maybeEnqueueContinuation(ctx, parentJob, parentPayload, parentPayload.Result, children, ref, withHumanAnswer(answerBlock)); err != nil {
+		return err
+	}
+	return e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   parentJob.ID,
+		Kind:    "delegation_ask_answered",
+		Message: fmt.Sprintf("human answered %d ask-gate question(s) for job %s", len(rec.Questions), parentJob.ID),
+	})
+}
+
+// renderHumanAnswerBlock renders the human's answers (#445) as a stable,
+// id-ordered block keyed by each original question, so the coordinator
+// continuation reads exactly which question got which answer. Questions with no
+// answer are shown as "(no answer provided)"; any answer keyed to an unknown id
+// (a typo the human made) is appended under an "unmatched" section so it is
+// surfaced, never silently dropped.
+func renderHumanAnswerBlock(questions []HumanQuestion, answers map[string]string) string {
+	if len(questions) == 0 && len(answers) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	matched := make(map[string]struct{}, len(answers))
+	for _, q := range questions {
+		id := strings.TrimSpace(q.ID)
+		fmt.Fprintf(&b, "- %s — %s\n", id, strings.TrimSpace(q.Prompt))
+		if ans, ok := answers[id]; ok {
+			matched[id] = struct{}{}
+			fmt.Fprintf(&b, "  answer: %s\n", strings.TrimSpace(ans))
+		} else {
+			b.WriteString("  answer: (no answer provided)\n")
+		}
+	}
+	var unmatched []string
+	for id := range answers {
+		if _, ok := matched[id]; !ok {
+			unmatched = append(unmatched, id)
+		}
+	}
+	if len(unmatched) > 0 {
+		sort.Strings(unmatched)
+		b.WriteString("Unmatched answer ids (no such question; treat as additional human guidance):\n")
+		for _, id := range unmatched {
+			fmt.Fprintf(&b, "- %s: %s\n", id, strings.TrimSpace(answers[id]))
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // findDelegation returns the delegation with the given id from a result's set.

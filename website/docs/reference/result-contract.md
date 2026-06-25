@@ -371,6 +371,39 @@ the termination bounds below are measured against.
   [cockpit/orchestrate config](../workflows/cockpit-orchestrate-workflow.md#configuration-the-orchestrate-section).
   With it off, the continuation prompt is byte-identical to before.
 
+- `human_questions` (optional): an **ask-gate** — the non-failure sibling of
+  `escalate_human`. A **healthy** result (any decision) may carry
+  `human_questions[]` to **pause for a specific human answer instead of guessing**.
+  Each entry is `{ "id": "...", "prompt": "...", "choices": ["...", ...] }` where
+  `id` is required and unique within the result, `prompt` is required, and
+  `choices` is optional. It is **fully additive and orthogonal to `decision`** — a
+  result that omits it behaves byte-identically, and a coordinator can both fan out
+  (`delegations[]`) **and** ask in the same result.
+
+  When a result carries `human_questions[]`, the parent task enters the resumable
+  `awaiting_human` state, **no continuation or delegation children are enqueued,
+  and the tree consumes zero tokens/compute** until a human answers — exactly like
+  `escalate_human`, but **no leg fails** (it is a healthy result that simply needs
+  a decision). The daemon @-tags the human (default handle: the repo owner, or
+  `[orchestrate].escalation_handle`) with the question(s) rendered, and the
+  dashboard lists the tree under **Attention**. A human answers with
+  `/gitmoot resume <coordinatorJobID> answer "<id>: ..."` — one `<id>: text` line
+  per question (a single-question pause also accepts a bare answer body). The
+  answer is delivered to the coordinator continuation as a clearly-labelled
+  **"Human answers to your questions"** block injected at the top of its prompt; the
+  coordinator then proceeds with the human's decision. An unmatched id (a typo) is
+  surfaced as additional guidance, never silently dropped.
+
+  The ask-gate reuses the **same** `[orchestrate].escalation_ttl` backstop (default
+  24h): an unanswered ask auto-finalizes gracefully exactly like a failure
+  escalation, paused time is excluded from the per-root wall-clock budget, and the
+  pause is **budget-neutral** (it enqueues no job; only the eventual continuation
+  occupies the single continuation slot). The `answer` verb is valid **only** on an
+  ask round, and `retry`/`continue`/`abort` are valid **only** on a failure
+  escalation round — a mismatch is rejected with a clear message. **Use the ask-gate
+  sparingly**: ask only when you genuinely cannot proceed without a human decision,
+  not on every result.
+
 ## Termination bounds
 
 Delegation and coordinator-continuation chains are bounded so they cannot recurse

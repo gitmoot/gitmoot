@@ -82,6 +82,18 @@ type Delegation struct {
 	Phase         string         `json:"phase,omitempty"`
 }
 
+// HumanQuestion is a single mid-run clarifying question a healthy
+// worker/coordinator can return to pause its tree for a specific human decision
+// (#445). It is orthogonal to AgentResult.Decision: an agent may return one or
+// more on ANY healthy decision instead of guessing. ID is a stable handle the
+// human answers against (`/gitmoot resume <job> answer "<id>: ..."`), Prompt is
+// the question text, and Choices are optional suggested answers.
+type HumanQuestion struct {
+	ID      string   `json:"id"`
+	Prompt  string   `json:"prompt"`
+	Choices []string `json:"choices,omitempty"`
+}
+
 type AgentResult struct {
 	Decision     string            `json:"decision"`
 	Summary      string            `json:"summary"`
@@ -91,6 +103,13 @@ type AgentResult struct {
 	Needs        []string          `json:"needs"`
 	Delegations  []Delegation      `json:"delegations"`
 	ArtifactBody string            `json:"artifact_body,omitempty"`
+	// HumanQuestions, when non-empty, asks the engine to pause the parent task at
+	// awaiting_human for a specific human answer (#445) — a non-failure sibling of
+	// the escalate_human pause. It is fully additive: a result that omits it
+	// behaves byte-identically (omitempty), and the pause enqueues no continuation
+	// and consumes zero compute until the human answers via the `answer` resume
+	// verb. The same escalation TTL backstop auto-finalizes an unanswered ask.
+	HumanQuestions []HumanQuestion `json:"human_questions,omitempty"`
 }
 
 func ExtractAgentResult(output string) (AgentResult, error) {
@@ -138,14 +157,15 @@ func validateAgentResultFields(raw json.RawMessage) error {
 		return err
 	}
 	allowed := map[string]struct{}{
-		"decision":      {},
-		"summary":       {},
-		"findings":      {},
-		"changes_made":  {},
-		"tests_run":     {},
-		"needs":         {},
-		"delegations":   {},
-		"artifact_body": {},
+		"decision":        {},
+		"summary":         {},
+		"findings":        {},
+		"changes_made":    {},
+		"tests_run":       {},
+		"needs":           {},
+		"delegations":     {},
+		"artifact_body":   {},
+		"human_questions": {},
 	}
 	for field := range fields {
 		if _, ok := allowed[field]; !ok {
@@ -187,6 +207,9 @@ func validateAgentResult(result AgentResult) error {
 	}
 	if strings.TrimSpace(result.Summary) == "" {
 		return errors.New("gitmoot_result summary is required")
+	}
+	if err := validateHumanQuestions(result.HumanQuestions); err != nil {
+		return err
 	}
 	var errs []error
 	for i, d := range result.Delegations {
@@ -231,6 +254,33 @@ func validateAgentResult(result AgentResult) error {
 	}
 	if delegationsRequestArtifacts(result.Delegations) && strings.TrimSpace(result.ArtifactBody) == "" {
 		return errors.New("artifact_body is required when delegations request artifacts")
+	}
+	return nil
+}
+
+// validateHumanQuestions validates the optional ask-gate field (#445): each
+// entry must carry a non-blank id and a non-blank prompt, and ids must be unique
+// within the batch so the human's `<id>: text` answer lines map unambiguously to
+// a question. An empty/absent slice is valid (the field is fully optional and
+// the byte-identical default when omitted). Choices are free-form and need no
+// validation.
+func validateHumanQuestions(questions []HumanQuestion) error {
+	if len(questions) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(questions))
+	for i, q := range questions {
+		id := strings.TrimSpace(q.ID)
+		if id == "" {
+			return fmt.Errorf("human_questions[%d] id is required", i)
+		}
+		if strings.TrimSpace(q.Prompt) == "" {
+			return fmt.Errorf("human_questions[%d] (id %q) prompt is required", i, id)
+		}
+		if _, ok := seen[id]; ok {
+			return fmt.Errorf("human_questions[%d] id %q is not unique", i, id)
+		}
+		seen[id] = struct{}{}
 	}
 	return nil
 }

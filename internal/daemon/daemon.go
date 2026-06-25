@@ -840,6 +840,7 @@ func (d Daemon) handleHelpCommand(ctx context.Context, pull github.PullRequest) 
 		"- `/gitmoot retry <job-id>`",
 		"- `/gitmoot cancel <job-id>`",
 		"- `/gitmoot resume <job-id> <retry|continue|abort> [instructions]`",
+		"- `/gitmoot resume <job-id> answer \"<id>: ...\"` — answer a paused ask-gate question",
 		"- `/gitmoot merge`",
 	}
 	agents, err := d.Store.ListAgents(ctx)
@@ -894,11 +895,15 @@ func (d Daemon) handleCancelCommand(ctx context.Context, pull github.PullRequest
 }
 
 // handleResumeCommand resolves a tree paused at awaiting_human (#340) via
-// `/gitmoot resume <jobID> retry|continue|abort [instructions]`. It is
+// `/gitmoot resume <jobID> retry|continue|abort|answer [instructions]`. It is
 // authorize-commenter gated by the caller (handleComment / handleRecoveryComment)
 // and job-scope gated here, exactly like retry/cancel. retry re-enqueues the
 // failed leg with the human's instructions; continue proceeds the coordinator
-// continuation; abort routes to the #305 graceful finalize.
+// continuation; abort routes to the #305 graceful finalize; answer (#445)
+// delivers the human's reply to a non-failure ask-gate pause as injected context
+// on the coordinator continuation. The engine rejects a verb whose flavor does
+// not match the open round's kind (answer on a failure round, or
+// retry/continue/abort on an ask round) with a clear message.
 func (d Daemon) handleResumeCommand(ctx context.Context, pull github.PullRequest, command Command) error {
 	if d.Workflow == nil {
 		return d.ack(ctx, pull.Number, "Gitmoot cannot resume this tree because the workflow engine is not configured.")
@@ -908,7 +913,7 @@ func (d Daemon) handleResumeCommand(ctx context.Context, pull github.PullRequest
 	}
 	decision, ok := workflow.ParseResumeDecision(command.Decision)
 	if !ok {
-		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not resume job `%s`: decision must be retry, continue, or abort.", command.JobID))
+		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not resume job `%s`: decision must be retry, continue, abort, or answer.", command.JobID))
 	}
 	if err := d.Workflow.ResolveEscalation(ctx, command.JobID, decision, command.Instructions); err != nil {
 		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not resume job `%s`: %v.", command.JobID, err))

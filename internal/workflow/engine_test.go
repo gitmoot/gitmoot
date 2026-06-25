@@ -2442,7 +2442,7 @@ func TestContinuationPromptInlinesChildResults(t *testing.T) {
 		"api": {Repo: "jerryfane/gitmoot", PullRequest: 12, Result: &AgentResult{Decision: "implemented", Summary: "api built"}},
 		"ui":  {Result: &AgentResult{Decision: "approved", Summary: "ui built"}},
 	}
-	prompt := Engine{}.buildContinuationPrompt("", "", &AgentResult{Delegations: dels}, children, childPayloads)
+	prompt := Engine{}.buildContinuationPrompt("", "", &AgentResult{Delegations: dels}, children, childPayloads, "")
 	for _, want := range []string{
 		"parent-job/delegation/api",
 		"parent-job/delegation/ui",
@@ -2471,7 +2471,7 @@ func TestContinuationPromptIncludesPhase(t *testing.T) {
 		"api": {Result: &AgentResult{Decision: "implemented", Summary: "api built"}},
 		"ui":  {Result: &AgentResult{Decision: "approved", Summary: "ui built"}},
 	}
-	withPhase := Engine{}.buildContinuationPrompt("", "", &AgentResult{Delegations: dels}, children, childPayloads)
+	withPhase := Engine{}.buildContinuationPrompt("", "", &AgentResult{Delegations: dels}, children, childPayloads, "")
 	if !strings.Contains(withPhase, "[phase: design]") {
 		t.Fatalf("continuation prompt missing phase label\n%s", withPhase)
 	}
@@ -2482,7 +2482,7 @@ func TestContinuationPromptIncludesPhase(t *testing.T) {
 		{ID: "api", Agent: "api", Action: "review", Prompt: "build api"},
 		{ID: "ui", Agent: "ui", Action: "review", Prompt: "build ui"},
 	}
-	noPhase := Engine{}.buildContinuationPrompt("", "", &AgentResult{Delegations: noPhaseDels}, children, childPayloads)
+	noPhase := Engine{}.buildContinuationPrompt("", "", &AgentResult{Delegations: noPhaseDels}, children, childPayloads, "")
 	if strings.Contains(noPhase, "phase") {
 		t.Fatalf("continuation prompt must not mention phase when none set\n%s", noPhase)
 	}
@@ -2493,7 +2493,7 @@ func TestContinuationPromptIncludesPhase(t *testing.T) {
 		{ID: "api", Agent: "api", Action: "review", Prompt: "build api"},
 		{ID: "ui", Agent: "ui", Action: "review", Prompt: "build ui"},
 	}
-	if got := (Engine{}).buildContinuationPrompt("", "", &AgentResult{Delegations: cleared}, children, childPayloads); got != noPhase {
+	if got := (Engine{}).buildContinuationPrompt("", "", &AgentResult{Delegations: cleared}, children, childPayloads, ""); got != noPhase {
 		t.Fatalf("clearing phase changed the prompt:\n--- got ---\n%s\n--- want ---\n%s", got, noPhase)
 	}
 }
@@ -2515,7 +2515,7 @@ func TestContinuationPromptInlinesArtifactBodyWhenEnabled(t *testing.T) {
 		"ui":  {Result: &AgentResult{Decision: "approved", Summary: "ui built", ArtifactBody: "UI BRIEF BODY"}},
 	}
 	engine := Engine{InlineArtifactBodies: true}
-	prompt := engine.buildContinuationPrompt("", "", &AgentResult{Delegations: dels}, children, childPayloads)
+	prompt := engine.buildContinuationPrompt("", "", &AgentResult{Delegations: dels}, children, childPayloads, "")
 	for _, want := range []string{"API BRIEF BODY", "UI BRIEF BODY", "artifact_body:", "```"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("inline-enabled continuation prompt missing %q\n%s", want, prompt)
@@ -2535,7 +2535,7 @@ func TestContinuationPromptInlineFenceSurvivesBacktickBody(t *testing.T) {
 	dels := []Delegation{{ID: "api", Agent: "api", Action: "review"}}
 	children := map[string]db.Job{"api": {ID: "parent-job/delegation/api", Agent: "api", State: string(JobSucceeded)}}
 	childPayloads := map[string]JobPayload{"api": {Result: &AgentResult{Decision: "implemented", Summary: "s", ArtifactBody: body}}}
-	prompt := Engine{InlineArtifactBodies: true}.buildContinuationPrompt("", "", &AgentResult{Delegations: dels}, children, childPayloads)
+	prompt := Engine{InlineArtifactBodies: true}.buildContinuationPrompt("", "", &AgentResult{Delegations: dels}, children, childPayloads, "")
 	if !strings.Contains(prompt, body) {
 		t.Fatalf("body with embedded ``` not inlined verbatim\n%s", prompt)
 	}
@@ -2567,8 +2567,8 @@ func TestContinuationPromptByteIdenticalWhenDisabled(t *testing.T) {
 	}
 	// Default-off engine ignores ArtifactBody entirely: output equals the legacy
 	// rendering produced for the same children without any body present.
-	got := Engine{}.buildContinuationPrompt("", "", &AgentResult{Delegations: dels}, children, withBody)
-	want := Engine{}.buildContinuationPrompt("", "", &AgentResult{Delegations: dels}, children, noBody)
+	got := Engine{}.buildContinuationPrompt("", "", &AgentResult{Delegations: dels}, children, withBody, "")
+	want := Engine{}.buildContinuationPrompt("", "", &AgentResult{Delegations: dels}, children, noBody, "")
 	if got != want {
 		t.Fatalf("default-off prompt not byte-identical to legacy:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
@@ -2590,7 +2590,7 @@ func TestContinuationPromptInlineOverCapTruncatedWithMarker(t *testing.T) {
 		"api": {Result: &AgentResult{Decision: "implemented", ArtifactBody: body}},
 	}
 	engine := Engine{InlineArtifactBodies: true, MaxInlineArtifactBytes: 10, ArtifactRoot: "/home/.gitmoot"}
-	prompt := engine.buildContinuationPrompt("", "", &AgentResult{Delegations: dels}, children, childPayloads)
+	prompt := engine.buildContinuationPrompt("", "", &AgentResult{Delegations: dels}, children, childPayloads, "")
 	if !strings.Contains(prompt, strings.Repeat("x", 10)) {
 		t.Fatalf("expected the first 10 bytes inlined\n%s", prompt)
 	}
@@ -2617,7 +2617,7 @@ func TestContinuationPromptInlineRuneSafe(t *testing.T) {
 		"api": {Result: &AgentResult{Decision: "implemented", ArtifactBody: body}},
 	}
 	engine := Engine{InlineArtifactBodies: true, MaxInlineArtifactBytes: 10}
-	prompt := engine.buildContinuationPrompt("", "", &AgentResult{Delegations: dels}, children, childPayloads)
+	prompt := engine.buildContinuationPrompt("", "", &AgentResult{Delegations: dels}, children, childPayloads, "")
 	if !utf8.ValidString(prompt) {
 		t.Fatalf("inlined prompt contains an invalid (split) UTF-8 rune\n%q", prompt)
 	}
@@ -2649,7 +2649,7 @@ func TestContinuationPromptInlineAggregateCapHonored(t *testing.T) {
 	// Per-body cap is large enough to admit the whole first body, exhausting the
 	// aggregate budget so the second body is dropped entirely.
 	engine := Engine{InlineArtifactBodies: true, MaxInlineArtifactBytes: maxInlineArtifactTotalBytes}
-	prompt := engine.buildContinuationPrompt("", "", &AgentResult{Delegations: dels}, children, childPayloads)
+	prompt := engine.buildContinuationPrompt("", "", &AgentResult{Delegations: dels}, children, childPayloads, "")
 	if strings.Contains(prompt, "SECOND_BODY_MARKER") {
 		t.Fatalf("aggregate cap not honored: second body inlined despite exhausted budget")
 	}
@@ -3389,6 +3389,7 @@ func TestContinuationPromptIncludesCompletionContract(t *testing.T) {
 		&AgentResult{Delegations: []Delegation{{ID: "w1", Agent: "w"}}},
 		map[string]db.Job{},
 		map[string]JobPayload{},
+		"",
 	)
 	// Termination contract unchanged (#418): an empty delegations list finishes,
 	// and new delegations are only for a genuine remaining gap.

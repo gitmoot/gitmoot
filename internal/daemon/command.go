@@ -57,7 +57,9 @@ func ParseCommand(line string) (Command, bool) {
 		}
 		return Command{Action: fields[1], JobID: fields[2], Instructions: trailing(fields, 3)}, true
 	case "resume":
-		// `/gitmoot resume <jobID> <retry|continue|abort> [instructions]` (#340).
+		// `/gitmoot resume <jobID> <retry|continue|abort|answer> [instructions]`
+		// (#340; `answer` added by #445). For `answer`, Instructions is the trailing
+		// `<id>: text` payload (multi-line for several questions).
 		if len(fields) < 4 {
 			return Command{}, false
 		}
@@ -86,9 +88,9 @@ func (c Command) Validate() error {
 	}
 	if c.Action == "resume" {
 		switch c.Decision {
-		case "retry", "continue", "abort":
+		case "retry", "continue", "abort", "answer":
 		default:
-			return fmt.Errorf("command resume requires a decision of retry, continue, or abort")
+			return fmt.Errorf("command resume requires a decision of retry, continue, abort, or answer")
 		}
 	}
 	if c.Action != "status" && c.Action != "merge" && c.Action != "retry" && c.Action != "cancel" && c.Action != "help" && c.Action != "resume" && c.Agent == "" {

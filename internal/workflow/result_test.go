@@ -111,6 +111,53 @@ func TestExtractAgentResultRejectsNextAgentsField(t *testing.T) {
 	}
 }
 
+func TestExtractAgentResultAcceptsHumanQuestions(t *testing.T) {
+	output := `{"gitmoot_result":{"decision":"approved","summary":"need a decision",` +
+		`"human_questions":[` +
+		`{"id":"q1","prompt":"Target v2 or v3 API?","choices":["v2","v3"]},` +
+		`{"id":"q2","prompt":"Use the legacy auth flow?"}` +
+		`]}}`
+
+	result, err := ExtractAgentResult(output)
+	if err != nil {
+		t.Fatalf("ExtractAgentResult returned error: %v", err)
+	}
+	if len(result.HumanQuestions) != 2 {
+		t.Fatalf("human_questions = %+v", result.HumanQuestions)
+	}
+	if q := result.HumanQuestions[0]; q.ID != "q1" || q.Prompt != "Target v2 or v3 API?" || len(q.Choices) != 2 {
+		t.Fatalf("human_questions[0] = %+v", q)
+	}
+	if q := result.HumanQuestions[1]; q.ID != "q2" || len(q.Choices) != 0 {
+		t.Fatalf("human_questions[1] = %+v", q)
+	}
+}
+
+func TestExtractAgentResultRejectsMalformedHumanQuestions(t *testing.T) {
+	cases := []struct {
+		name    string
+		entries string
+		want    string
+	}{
+		{"missing id", `[{"prompt":"x"}]`, "id is required"},
+		{"blank id", `[{"id":"  ","prompt":"x"}]`, "id is required"},
+		{"blank prompt", `[{"id":"q1","prompt":"   "}]`, "prompt is required"},
+		{"dup id", `[{"id":"q1","prompt":"a"},{"id":"q1","prompt":"b"}]`, "is not unique"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			output := `{"gitmoot_result":{"decision":"approved","summary":"ok","human_questions":` + tc.entries + `}}`
+			_, err := ExtractAgentResult(output)
+			if err == nil {
+				t.Fatalf("ExtractAgentResult accepted malformed human_questions (%s)", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestValidateAgentResultRejectsDelegationMissingFields(t *testing.T) {
 	cases := []struct {
 		name string

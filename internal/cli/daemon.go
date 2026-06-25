@@ -3729,6 +3729,9 @@ func (n *daemonEscalationNotifier) NotifyEscalation(ctx context.Context, request
 // mid-line ("cc @<handle>"), which still notifies them on GitHub but is not
 // parsed as a command.
 func buildEscalationComment(handle string, request workflow.EscalationRequest) string {
+	if request.Ask {
+		return buildAskGateComment(handle, request)
+	}
 	var b strings.Builder
 	b.WriteString("Gitmoot paused a delegation tree awaiting your decision (escalate_human).\n")
 	if h := strings.TrimPrefix(strings.TrimSpace(handle), "@"); h != "" {
@@ -3748,6 +3751,36 @@ func buildEscalationComment(handle string, request workflow.EscalationRequest) s
 	b.WriteString(fmt.Sprintf("- `/gitmoot resume %s retry <instructions>` — re-run the failing leg with your guidance\n", request.CoordinatorJobID))
 	b.WriteString(fmt.Sprintf("- `/gitmoot resume %s continue` — proceed the coordinator with what completed\n", request.CoordinatorJobID))
 	b.WriteString(fmt.Sprintf("- `/gitmoot resume %s abort` — stop and synthesize a best-effort final result\n", request.CoordinatorJobID))
+	return b.String()
+}
+
+// buildAskGateComment renders the @-tag comment for a non-failure ask-gate pause
+// (#445): a HEALTHY coordinator returned human_questions[] to ask a specific
+// decision rather than guess. It quotes each question (id + prompt + choices) and
+// gives the `answer` resume verb instead of the failure verbs. Like
+// buildEscalationComment it never begins a line with "@<handle>" or "/gitmoot"
+// (the human is mentioned mid-line) so the daemon does not parse its own
+// notification as a command.
+func buildAskGateComment(handle string, request workflow.EscalationRequest) string {
+	var b strings.Builder
+	b.WriteString("Gitmoot paused a job awaiting your answer to a question (no work failed; the agent chose to ask instead of guess).\n")
+	if h := strings.TrimPrefix(strings.TrimSpace(handle), "@"); h != "" {
+		b.WriteString("cc @" + h + "\n")
+	}
+	b.WriteString("\nQuestions:\n")
+	if len(request.Questions) > 0 {
+		for _, q := range request.Questions {
+			line := fmt.Sprintf("- `%s`: %s", strings.TrimSpace(q.ID), strings.TrimSpace(q.Prompt))
+			if len(q.Choices) > 0 {
+				line += fmt.Sprintf(" (choices: %s)", strings.Join(q.Choices, ", "))
+			}
+			b.WriteString(line + "\n")
+		}
+	} else if q := strings.TrimSpace(request.Question); q != "" {
+		b.WriteString(q + "\n")
+	}
+	b.WriteString("\nAnswer with:\n")
+	b.WriteString(fmt.Sprintf("- `/gitmoot resume %s answer \"<id>: your answer\"` — one `<id>: ...` line per question\n", request.CoordinatorJobID))
 	return b.String()
 }
 

@@ -75,6 +75,10 @@ type JobRequest struct {
 	CockpitPaneKey         string
 	SkipNativeReviewFanout bool
 	Ephemeral              *EphemeralSpec
+	// HumanAnswer carries the rendered ask-gate answer block (#445) into the
+	// coordinator continuation enqueued by the `answer` resume verb. Empty for
+	// every other job, so the stored payload is byte-identical by default.
+	HumanAnswer string
 }
 
 type JobPayload struct {
@@ -123,6 +127,7 @@ type JobPayload struct {
 	CockpitPaneKey         string         `json:"cockpit_pane_key,omitempty"`
 	SkipNativeReviewFanout bool           `json:"skip_native_review_fanout,omitempty"`
 	Ephemeral              *EphemeralSpec `json:"ephemeral,omitempty"`
+	HumanAnswer            string         `json:"human_answer,omitempty"`
 	RawOutputs             []string       `json:"raw_outputs,omitempty"`
 	Result                 *AgentResult   `json:"result,omitempty"`
 }
@@ -190,6 +195,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		CockpitPaneKey:         strings.TrimSpace(request.CockpitPaneKey),
 		SkipNativeReviewFanout: request.SkipNativeReviewFanout,
 		Ephemeral:              request.Ephemeral,
+		HumanAnswer:            request.HumanAnswer,
 	})
 	if err != nil {
 		return db.Job{}, err

@@ -156,3 +156,22 @@ func TestValidateResume(t *testing.T) {
 		t.Fatal("Validate accepted resume without a decision")
 	}
 }
+
+// TestParseCommandResumeAnswer pins the #445 ask-gate answer grammar:
+// `/gitmoot resume <jobID> answer "<id>: ..."` — Decision=answer and Instructions
+// is the trailing `<id>: text` payload.
+func TestParseCommandResumeAnswer(t *testing.T) {
+	command, ok := ParseCommand(`/gitmoot resume job-1 answer q1: v3`)
+	if !ok {
+		t.Fatal("ParseCommand did not parse resume answer command")
+	}
+	if command.Action != "resume" || command.JobID != "job-1" || command.Decision != "answer" || command.Instructions != "q1: v3" {
+		t.Fatalf("command = %+v", command)
+	}
+}
+
+func TestValidateResumeAnswer(t *testing.T) {
+	if err := (Command{Action: "resume", JobID: "job-1", Decision: "answer", Instructions: "q1: v3"}).Validate(); err != nil {
+		t.Fatalf("Validate rejected a valid answer resume: %v", err)
+	}
+}
