@@ -57,8 +57,16 @@ type CrossFamilyReviewer struct {
 // AgentLister is the minimal read the cross-family selector needs over the store
 // (*db.Store satisfies it). It is its own narrow interface so PickCrossFamilyReviewer
 // is unit-testable with a stub and so the cli dispatcher can pass the real store.
+//
+// AgentCanAccessRepo is the AUTHORITATIVE repo-access check (the agent_repos /
+// agent_instances join the rest of the engine uses at preflightDelegation /
+// availableAgentsForRepo), NOT the single agents.repo_scope string — so a reviewer
+// granted multi-repo access via agent_repos is correctly included and an
+// empty-scope agent is not silently treated as global. Its signature matches
+// *db.Store.AgentCanAccessRepo so the real store satisfies this interface directly.
 type AgentLister interface {
 	ListAgents(ctx context.Context) ([]db.Agent, error)
+	AgentCanAccessRepo(ctx context.Context, agentName string, repoFullName string) (bool, error)
 }
 
 // PickCrossFamilyReviewer is the exported entry point the cli dispatcher calls;
@@ -143,10 +151,18 @@ func pickCrossFamilyReviewer(ctx context.Context, store AgentLister, implementer
 	return CrossFamilyReviewer{}, false, nil
 }
 
-// listReviewAgents returns the registered review-capable agents whose repo scope
-// covers repo, sorted deterministically by name (ListAgents already orders by
-// name; this re-sorts defensively so the first-match selection is stable
-// regardless of the store's ordering).
+// listReviewAgents returns the registered review-capable agents that can access
+// repo, sorted deterministically by name (ListAgents already orders by name; this
+// re-sorts defensively so the first-match selection is stable regardless of the
+// store's ordering).
+//
+// Repo access is resolved through the AUTHORITATIVE AgentCanAccessRepo seam (the
+// agent_repos / agent_instances join the rest of the engine uses), NOT the single
+// agents.repo_scope string — so a reviewer granted access to repo via an
+// agent_repos row is correctly included even when its repo_scope column names a
+// different repo, and an empty-scope agent the convention would deny is not
+// silently treated as global. A per-agent access error fails soft (the agent is
+// dropped from the candidate set) rather than failing the whole selection.
 func listReviewAgents(ctx context.Context, store AgentLister, repo string) ([]db.Agent, error) {
 	if store == nil {
 		return nil, nil
@@ -161,25 +177,14 @@ func listReviewAgents(ctx context.Context, store AgentLister, repo string) ([]db
 		if !contains(agent.Capabilities, reviewCapability) {
 			continue
 		}
-		if !agentRepoScopeCovers(agent.RepoScope, repo) {
+		allowed, err := store.AgentCanAccessRepo(ctx, agent.Name, repo)
+		if err != nil || !allowed {
 			continue
 		}
 		out = append(out, agent)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
-}
-
-// agentRepoScopeCovers reports whether a registered agent's repo scope covers repo.
-// An empty scope is treated as "all repos" (the registry convention used by
-// AgentCanAccessRepo for a global agent); otherwise the scope must equal the repo.
-func agentRepoScopeCovers(scope string, repo string) bool {
-	scope = strings.TrimSpace(scope)
-	repo = strings.TrimSpace(repo)
-	if scope == "" {
-		return true
-	}
-	return strings.EqualFold(scope, repo)
 }
 
 // ephemeralReviewerSpec builds the read-only ephemeral review-leg spec for the

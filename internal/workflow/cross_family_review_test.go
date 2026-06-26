@@ -4,34 +4,61 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
 // stubAgentLister is an in-memory AgentLister for the cross-family selector tests.
+// access maps an agent name to the set of repos it can access — modeling the
+// AUTHORITATIVE agent_repos / AgentCanAccessRepo convention (an explicit grant,
+// NOT the single repo_scope string). When access carries no entry for an agent the
+// agent has NO access (matching the real store: no rows => denied).
 type stubAgentLister struct {
 	agents []db.Agent
+	access map[string][]string
 }
 
 func (s stubAgentLister) ListAgents(context.Context) ([]db.Agent, error) {
 	return s.agents, nil
 }
 
+func (s stubAgentLister) AgentCanAccessRepo(_ context.Context, agentName string, repo string) (bool, error) {
+	for _, r := range s.access[agentName] {
+		if strings.EqualFold(strings.TrimSpace(r), strings.TrimSpace(repo)) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func reviewAgent(name, rt, repoScope string) db.Agent {
 	return db.Agent{Name: name, Runtime: rt, RepoScope: repoScope, Capabilities: []string{"review"}}
+}
+
+// reviewListerGrant builds a stubAgentLister granting EVERY listed agent access to
+// the given repo (the common cross-family case where the candidate reviewers are
+// authorized on the PR's repo via the authoritative grant).
+func reviewListerGrant(repo string, agents ...db.Agent) stubAgentLister {
+	access := map[string][]string{}
+	for _, a := range agents {
+		access[a.Name] = []string{repo}
+	}
+	return stubAgentLister{agents: agents, access: access}
 }
 
 // TestPickCrossFamilyReviewerPrefersDifferentFamilyRegistered: a registered
 // review-capable agent of a DIFFERENT runtime family wins, deterministically by
 // name, and is never tagged self-family.
 func TestPickCrossFamilyReviewerPrefersDifferentFamilyRegistered(t *testing.T) {
-	store := stubAgentLister{agents: []db.Agent{
+	store := reviewListerGrant("owner/repo",
 		// Same-family agent sorts first by name but must be skipped in favor of cross.
 		reviewAgent("aaa-codex-reviewer", runtime.CodexRuntime, "owner/repo"),
 		reviewAgent("zzz-claude-reviewer", runtime.ClaudeRuntime, "owner/repo"),
-	}}
+	)
 	reviewer, ok, err := PickCrossFamilyReviewer(context.Background(), store, runtime.CodexRuntime, "owner/repo", nil)
 	if err != nil {
 		t.Fatalf("PickCrossFamilyReviewer error: %v", err)
@@ -77,9 +104,9 @@ func TestPickCrossFamilyReviewerEphemeralFallback(t *testing.T) {
 // reviewer tagged SelfFamily (the caller emits the warning). It is never silent.
 func TestPickCrossFamilyReviewerSameFamilyFallbackWithWarning(t *testing.T) {
 	// (a) registered same-family agent path.
-	store := stubAgentLister{agents: []db.Agent{
+	store := reviewListerGrant("owner/repo",
 		reviewAgent("codex-reviewer", runtime.CodexRuntime, "owner/repo"),
-	}}
+	)
 	reviewer, ok, err := PickCrossFamilyReviewer(context.Background(), store, runtime.CodexRuntime, "owner/repo", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
@@ -124,7 +151,7 @@ func TestPickCrossFamilyReviewerSkipsWhenNoRuntimeAuthed(t *testing.T) {
 // TestPickCrossFamilyReviewerUnknownImplementerSkips: an unrecoverable implementer
 // family yields SKIP rather than risk a silent same-family review.
 func TestPickCrossFamilyReviewerUnknownImplementerSkips(t *testing.T) {
-	store := stubAgentLister{agents: []db.Agent{reviewAgent("claude-reviewer", runtime.ClaudeRuntime, "owner/repo")}}
+	store := reviewListerGrant("owner/repo", reviewAgent("claude-reviewer", runtime.ClaudeRuntime, "owner/repo"))
 	_, ok, err := PickCrossFamilyReviewer(context.Background(), store, "mystery-runtime", "owner/repo", map[string]bool{runtime.ClaudeRuntime: true})
 	if err != nil {
 		t.Fatalf("error: %v", err)
@@ -134,19 +161,28 @@ func TestPickCrossFamilyReviewerUnknownImplementerSkips(t *testing.T) {
 	}
 }
 
-// TestPickCrossFamilyReviewerRepoScope: a registered reviewer whose scope does not
-// cover the repo is excluded; a global (empty-scope) reviewer is included.
-func TestPickCrossFamilyReviewerRepoScope(t *testing.T) {
-	store := stubAgentLister{agents: []db.Agent{
-		reviewAgent("scoped-elsewhere", runtime.ClaudeRuntime, "other/repo"),
-		reviewAgent("global", runtime.ClaudeRuntime, ""),
-	}}
+// TestPickCrossFamilyReviewerRepoAccess: repo access is resolved through the
+// AUTHORITATIVE AgentCanAccessRepo grant, NOT the single repo_scope string. A
+// reviewer GRANTED access to the PR's repo is included even when its repo_scope
+// column names a DIFFERENT repo (the multi-repo case), and a reviewer with NO
+// grant is excluded even when its repo_scope string matches.
+func TestPickCrossFamilyReviewerRepoAccess(t *testing.T) {
+	store := stubAgentLister{
+		agents: []db.Agent{
+			// repo_scope says "other/repo" but the agent is GRANTED owner/repo via the
+			// authoritative agent_repos seam — it must be included.
+			reviewAgent("multi-repo-claude", runtime.ClaudeRuntime, "other/repo"),
+			// repo_scope matches owner/repo but there is NO grant — it must be excluded.
+			reviewAgent("ungranted-claude", runtime.ClaudeRuntime, "owner/repo"),
+		},
+		access: map[string][]string{"multi-repo-claude": {"owner/repo"}},
+	}
 	reviewer, ok, err := PickCrossFamilyReviewer(context.Background(), store, runtime.CodexRuntime, "owner/repo", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
-	if !ok || reviewer.RegisteredAgent != "global" {
-		t.Fatalf("picked %+v, want the global (empty-scope) reviewer", reviewer)
+	if !ok || reviewer.RegisteredAgent != "multi-repo-claude" {
+		t.Fatalf("picked %+v, want the granted multi-repo reviewer (authoritative access, not repo_scope)", reviewer)
 	}
 }
 
@@ -371,6 +407,84 @@ func TestEngineReviewDispatchSkipWritesNothing(t *testing.T) {
 	for _, o := range harvester.snapshot() {
 		if o.Kind == OutcomeReviewed {
 			t.Fatal("a SKIP must not harvest a reviewed outcome")
+		}
+	}
+}
+
+// blockingReviewDispatcher blocks inside Review until released, modeling a wedged
+// live reviewer adapter.Deliver. started fires once Review is entered.
+type blockingReviewDispatcher struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingReviewDispatcher) Review(_ context.Context, _ db.Job, _ JobPayload, _ string) (Outcome, bool, error) {
+	b.once.Do(func() { close(b.started) })
+	<-b.release
+	return Outcome{Kind: OutcomeReviewed, Repo: "jerryfane/gitmoot", PullRequest: 7, Reviewer: "claude"}, true, nil
+}
+
+// TestEngineReviewLegDoesNotBlockAdvanceJob is the review-fix regression: even when
+// the reviewer adapter blocks indefinitely, AdvanceJob returns PROMPTLY (the merge
+// completes) because the review leg is DETACHED into its own goroutine — it never
+// stalls AdvanceJob, the worker tick, or the daemon's checkoutLock. The detached
+// review still runs once unblocked.
+func TestEngineReviewLegDoesNotBlockAdvanceJob(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "jerryfane/gitmoot")
+	// Build an engine with the PRODUCTION default async spawn (no synchronous
+	// spawnReview override), so the detached goroutine is exercised for real.
+	engine := Engine{
+		Store: store,
+		JobID: func(request JobRequest) string { return strings.Join([]string{request.Action, request.Agent, request.TaskID}, "-") },
+	}
+	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{Ready: true, Merged: true, MergeCommitSHA: "merge123"}}
+	harvester := &recordingHarvester{}
+	engine.OutcomeHarvester = harvester
+	dispatcher := &blockingReviewDispatcher{started: make(chan struct{}), release: make(chan struct{})}
+	engine.ReviewLegDispatcher = dispatcher
+	seedMergeReviewJobs(t, store)
+
+	done := make(chan error, 1)
+	go func() { done <- engine.AdvanceJob(ctx, "review-job") }()
+
+	// AdvanceJob must return promptly despite the wedged reviewer.
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("AdvanceJob returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("AdvanceJob did not return while the reviewer was blocked — the review leg is NOT detached")
+	}
+	assertTaskState(t, store, "task-7", TaskMerged)
+
+	// The detached review goroutine did enter Review (proving it was dispatched).
+	select {
+	case <-dispatcher.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the detached review leg never started")
+	}
+
+	// Release the reviewer and confirm the detached leg eventually harvests.
+	close(dispatcher.release)
+	deadline := time.After(5 * time.Second)
+	for {
+		reviewed := false
+		for _, o := range harvester.snapshot() {
+			if o.Kind == OutcomeReviewed {
+				reviewed = true
+			}
+		}
+		if reviewed {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("the detached review never harvested its OutcomeReviewed after release")
+		case <-time.After(10 * time.Millisecond):
 		}
 	}
 }

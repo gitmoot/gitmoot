@@ -500,13 +500,17 @@ read-only leg in the `verifier.md` style). The reviewer scores subjective qualit
 the PR diff + `changes_made`) plus `architecture` / `readability` / `abstraction`
 — each in `[0,1]`. The rubric is mapped to `dimension_scores`, fused by the
 mean-of-dimensions path, and written as a **second** `FeedbackEvent` in the SAME
-`auto-trace:<version>` run under a distinct item id (`review#<repo>#<pr>`) and a
-distinct reviewer (`gitmoot-review:<rt>`), so it never overwrites the verifiable
-floor row.
+`auto-trace:<version>` run under a distinct item id (`review#<repo>#<pr>`) and the
+fixed `gitmoot-review` reviewer sentinel, so it never overwrites the verifiable
+floor row — and so a re-review by a *different* reviewer family overwrites the row
+in place rather than accumulating a stale duplicate. The mapped mean **drives the
+a/b choice** (a below-`0.5` mean registers as a non-baseline `b` vote, not a
+baseline win) and an empty rubric writes **no row**.
 
 This signal is **soft, judge-tagged, and weighted low**. The review row rides the
 run's `feedback_source = automatic_trace` (no new contract field,
-`contract_version` stays `1`) and its eval item carries `judge_derived = true`, so
+`contract_version` stays `1`) and its eval item carries `judge_derived = true`,
+the `reviewer_runtime` family, and the projected `rubric_score`, so
 the export/optimizer ranks it below the verifiable floor and below human gold —
 **weight tiers: human gold > verifiable floor > cross-family judge > same-family
 judge.** It is **best-effort and off the blocking merge path**: a review-leg
@@ -517,9 +521,10 @@ event). The rubric text is **never** injected into the implementer's prompt
 **Same-family fallback (with warning).** When *no* different-family reviewer is
 available/authed, gitmoot falls back to a **same-family** reviewer — but never
 silently: it logs and records a `cross_family_review_samefamily_fallback` job
-event (self-preference bias applies), tags the row `gitmoot-review-self:<rt>` with
-`self_family = true`, and weights it *below* a cross-family review. Only when **no**
-review-capable runtime is authed at all is the review skipped (no review row).
+event (self-preference bias applies), tags the review item `self_family = true`
+(with `reviewer_runtime` carrying the family), and weights it *below* a
+cross-family review. Only when **no** review-capable runtime is authed at all is
+the review skipped (no review row).
 
 The judge is uncalibrated in this slice — it is judge-tagged and weighted low (a
 measure-the-judge calibration hook for #344/#345 is a follow-on). The review

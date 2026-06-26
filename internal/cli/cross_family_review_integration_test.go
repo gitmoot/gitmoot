@@ -107,16 +107,16 @@ func TestCrossFamilyReviewFullChain(t *testing.T) {
 	}
 
 	events := autoTraceFeedback(t, store, version.ID)
-	// The verifiable floor (gitmoot-auto) AND the soft review (gitmoot-review:shell).
+	// The verifiable floor (gitmoot-auto) AND the soft review (gitmoot-review).
 	if len(events) != 2 {
 		t.Fatalf("expected the floor + review row (2), got %d: %+v", len(events), events)
 	}
 	var floor, review *db.FeedbackEvent
 	for i := range events {
-		switch {
-		case events[i].Reviewer == "gitmoot-auto":
+		switch events[i].Reviewer {
+		case "gitmoot-auto":
 			floor = &events[i]
-		case strings.HasPrefix(events[i].Reviewer, "gitmoot-review:"):
+		case "gitmoot-review":
 			review = &events[i]
 		}
 	}
@@ -126,13 +126,10 @@ func TestCrossFamilyReviewFullChain(t *testing.T) {
 	if review == nil {
 		t.Fatalf("cross-family review row missing; got %+v", events)
 	}
-	// Cross-family ENFORCED: reviewer family (shell) != implementer family (codex);
-	// the reviewer id is the cross-family tag, NOT the self-family one.
-	if review.Reviewer != "gitmoot-review:shell" {
-		t.Fatalf("review reviewer = %q, want gitmoot-review:shell (cross-family)", review.Reviewer)
-	}
-	if strings.HasPrefix(review.Reviewer, "gitmoot-review-self:") {
-		t.Fatal("a cross-family review must NOT be tagged self-family")
+	// The review row uses the FIXED gitmoot-review sentinel (family-independent so a
+	// re-review by a different family overwrites in place).
+	if review.Reviewer != "gitmoot-review" {
+		t.Fatalf("review reviewer = %q, want the fixed gitmoot-review sentinel", review.Reviewer)
 	}
 	// Distinct item ids: the review row never overwrote the floor.
 	if floor.ItemID == review.ItemID {
@@ -143,7 +140,9 @@ func TestCrossFamilyReviewFullChain(t *testing.T) {
 		t.Fatalf("review reasoning = %q, want the stub's findings", review.Reasoning)
 	}
 
-	// Judge-tagged: the review item carries judge_derived=true.
+	// Judge-tagged: the review item carries judge_derived=true and the reviewer
+	// family (shell) lives in the item metadata; cross-family ENFORCED means it is
+	// NOT tagged self_family (reviewer family shell != implementer family codex).
 	items, err := store.ListEvalReviewItems(ctx, "auto-trace:"+version.ID)
 	if err != nil {
 		t.Fatalf("ListEvalReviewItems returned error: %v", err)
@@ -158,6 +157,12 @@ func TestCrossFamilyReviewFullChain(t *testing.T) {
 	}
 	if reviewMeta == nil || reviewMeta["judge_derived"] != true {
 		t.Fatalf("review item must be judge_derived=true, got %v", reviewMeta)
+	}
+	if reviewMeta["reviewer_runtime"] != "shell" {
+		t.Fatalf("review item must carry reviewer_runtime=shell, got %v", reviewMeta["reviewer_runtime"])
+	}
+	if _, present := reviewMeta["self_family"]; present {
+		t.Fatal("a cross-family review must NOT carry the self_family tag")
 	}
 
 	// The merge still happened (the review never blocked the job).
@@ -224,8 +229,9 @@ func (stubReviewAdapter) Deliver(_ context.Context, _ runtime.Agent, _ runtime.J
 
 // TestCrossFamilyReviewSameFamilyFallbackWarns (REFINEMENT #1): when NO different
 // family is available, the dispatcher falls back to a SAME-family reviewer, emits
-// the cross_family_review_samefamily_fallback warning event, and tags the row
-// gitmoot-review-self:<rt> + self_family=true so it weights below cross-family.
+// the cross_family_review_samefamily_fallback warning event, and tags the review
+// item self_family=true (reviewer_runtime=codex) so it weights below cross-family —
+// the feedback row keeps the fixed gitmoot-review reviewer sentinel.
 func TestCrossFamilyReviewSameFamilyFallbackWarns(t *testing.T) {
 	ctx := context.Background()
 	store := openTraceChainStore(t)
@@ -272,16 +278,32 @@ func TestCrossFamilyReviewSameFamilyFallbackWarns(t *testing.T) {
 		t.Fatalf("expected a cross_family_review_samefamily_fallback warning event, got %+v", events)
 	}
 
-	// The review row is tagged self-family (gitmoot-review-self:codex).
+	// The review row uses the fixed gitmoot-review sentinel; the same-family tag
+	// (self_family=true, reviewer_runtime=codex) lives in the review item metadata.
 	rows := autoTraceFeedback(t, store, version.ID)
-	foundSelf := false
-	for _, r := range rows {
-		if r.Reviewer == "gitmoot-review-self:codex" {
-			foundSelf = true
+	var review *db.FeedbackEvent
+	for i := range rows {
+		if rows[i].Reviewer == "gitmoot-review" {
+			review = &rows[i]
 		}
 	}
-	if !foundSelf {
-		t.Fatalf("expected a gitmoot-review-self:codex row, got %+v", rows)
+	if review == nil {
+		t.Fatalf("expected a gitmoot-review row, got %+v", rows)
+	}
+	items, err := store.ListEvalReviewItems(ctx, "auto-trace:"+version.ID)
+	if err != nil {
+		t.Fatalf("ListEvalReviewItems returned error: %v", err)
+	}
+	var meta map[string]any
+	for _, item := range items {
+		if item.ItemID == review.ItemID {
+			if err := json.Unmarshal([]byte(item.MetadataJSON), &meta); err != nil {
+				t.Fatalf("review item metadata unmarshal: %v", err)
+			}
+		}
+	}
+	if meta["self_family"] != true || meta["reviewer_runtime"] != "codex" {
+		t.Fatalf("same-family fallback item must carry self_family=true + reviewer_runtime=codex, got %v", meta)
 	}
 }
 

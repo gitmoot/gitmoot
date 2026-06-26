@@ -411,17 +411,20 @@ style) scores subjective quality + scope-fidelity as one rubric (coverage /
 containment / fidelity + architecture / readability / abstraction, each in
 `[0,1]`). The rubric becomes a **second**, judge-tagged, down-weighted
 `FeedbackEvent` in the SAME `auto-trace:<version>` run under a distinct item id
-(`review#<repo>#<pr>`) and reviewer (`gitmoot-review:<rt>`), so it never
-overwrites the verifiable floor. Weight tiers: **human gold > verifiable floor >
-cross-family judge > same-family judge.**
+(`review#<repo>#<pr>`) and the fixed `gitmoot-review` reviewer sentinel, so it
+never overwrites the verifiable floor — and so a re-review by a different reviewer
+family overwrites in place rather than accumulating a stale duplicate. The mapped
+mean **drives the a/b choice** (a below-`0.5` mean is a non-baseline `b` vote, not
+a baseline win) and an empty rubric writes no row. Weight tiers: **human gold >
+verifiable floor > cross-family judge > same-family judge.**
 
 The review leg runs **off the blocking merge path** and is best-effort — a
 failure records a `cross_family_review_failed` job event and never blocks the
 merge. When no different-family reviewer is available it falls back to a
 **same-family** reviewer *with a warning* (a `cross_family_review_samefamily_fallback`
-job event, a `gitmoot-review-self:<rt>` row tagged `self_family = true` so it
-weights below a cross-family review); only when no review-capable runtime is
-authed at all is the review skipped. The rubric text is never shown to the
+job event, a review item tagged `self_family = true` with `reviewer_runtime`
+carrying the family so it weights below a cross-family review); only when no
+review-capable runtime is authed at all is the review skipped. The rubric text is never shown to the
 implementer (anti-gaming). Promotion stays manual (the harvester writes only
 eval/feedback rows); the signal is weighted-low + judge-tagged and is subject to
 the configurable `[skillopt].auto_promote` policy (#463) when that lands — it is

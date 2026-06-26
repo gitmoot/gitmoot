@@ -1965,6 +1965,9 @@ func testEngine(store *db.Store) Engine {
 			}
 			return strings.Join(parts, "-")
 		},
+		// Run the detached cross-family review leg SYNCHRONOUSLY in tests so its
+		// dispatch + harvest are deterministic; production defaults to a goroutine.
+		ReviewSpawner: func(fn func()) { fn() },
 	}
 }
 

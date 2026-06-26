@@ -171,6 +171,21 @@ type Engine struct {
 	// existing set is byte-identical. It is sourced from the host
 	// [orchestrate].max_verify_replan_attempts config at daemon startup.
 	MaxVerifyReplanAttempts int
+	// ReviewLegTimeout bounds the DETACHED cross-family review leg (#469): the
+	// review runs a live LLM adapter.Deliver that can take minutes, so it must
+	// never run unbounded. The detached goroutine's context is wrapped in this
+	// timeout so a wedged reviewer process is reaped rather than leaking forever.
+	// <= 0 means defaultReviewLegTimeout. It only matters when a ReviewLegDispatcher
+	// is wired (off by default).
+	ReviewLegTimeout time.Duration
+	// ReviewSpawner runs the detached cross-family review leg OFF the AdvanceJob /
+	// daemon-poll path so a live, possibly-wedged reviewer adapter.Deliver can never
+	// block AdvanceJob, the worker tick, or the daemon's checkoutLock. The default
+	// (nil) spawns a goroutine; tests inject a synchronous runner so the review is
+	// deterministic. It mirrors the EventSink fire-and-forget seam: the engine hands
+	// off a self-contained closure that owns its own bounded, cancellation-detached
+	// context.
+	ReviewSpawner func(func())
 }
 
 // defaultMaxDelegationNonProgressStreak is the streak threshold used when the
@@ -183,6 +198,12 @@ const defaultMaxDelegationNonProgressStreak = 2
 // bounded corrective replan continuations on a failed verify verdict before
 // routing to the #305 graceful finalize continuation (#439).
 const defaultMaxVerifyReplanAttempts = 2
+
+// defaultReviewLegTimeout bounds the detached cross-family review leg (#469) when
+// the engine's ReviewLegTimeout is unset (<= 0). It is a generous ceiling — a live
+// cross-family LLM review can legitimately take a few minutes — whose only job is
+// to reap a wedged reviewer so the detached goroutine cannot leak forever.
+const defaultReviewLegTimeout = 10 * time.Minute
 
 // nonProgressStreakThreshold returns the configured result-aware non-progress
 // streak threshold, falling back to defaultMaxDelegationNonProgressStreak when
@@ -457,9 +478,11 @@ type Outcome struct {
 	// byte-identical to before.
 
 	// Reviewer is the reviewer runtime family that produced the rubric (codex /
-	// claude / kimi). The harvester tags the review FeedbackEvent's reviewer as
-	// gitmoot-review:<Reviewer> (or gitmoot-review-self:<Reviewer> when SelfFamily)
-	// so the soft row never collides with the verifiable-floor reviewer.
+	// claude / kimi). The harvester writes the review FeedbackEvent under a FIXED
+	// gitmoot-review reviewer sentinel (distinct from the verifiable-floor reviewer)
+	// and carries this family — plus the SelfFamily flag — in the review item
+	// metadata, so a re-review by a different family overwrites the row in place
+	// rather than accumulating a stale duplicate.
 	Reviewer string
 	// SelfFamily is true when no DIFFERENT-family reviewer was available and the
 	// review fell back to a SAME-family reviewer (REFINEMENT #1). A self-family row
@@ -4347,10 +4370,13 @@ func (e Engine) runMergeGate(ctx context.Context, reviewer string, payload JobPa
 			PullRequest: payload.PullRequest,
 			HeadSHA:     mergedHead,
 		})
-		// Soft cross-family review signal (#469), OFF the blocking merge path and
-		// strictly best-effort: a nil dispatcher (the default, no
-		// cross_family_review_enabled) is a no-op, and any review-leg failure is
-		// swallowed so it can never block or fail the (already-completed) merge.
+		// Soft cross-family review signal (#469), DETACHED from the blocking
+		// AdvanceJob / daemon-poll path and strictly best-effort: a nil dispatcher
+		// (the default, no cross_family_review_enabled) is a no-op, the live reviewer
+		// adapter.Deliver runs in its own bounded, cancellation-detached goroutine so
+		// it can never stall AdvanceJob / the worker tick / the daemon's checkoutLock,
+		// and any review-leg failure is swallowed so it can never block or fail the
+		// (already-completed) merge.
 		e.reviewCrossFamilyForMergeGate(ctx, payload, mergedHead)
 		return decision, nil
 	}
@@ -4360,21 +4386,43 @@ func (e Engine) runMergeGate(ctx context.Context, reviewer string, payload JobPa
 // reviewCrossFamilyForMergeGate runs the cross-family review leg for a just-merged
 // PR and harvests its OutcomeReviewed rubric into the SAME auto-trace run as a
 // SOFT, down-weighted, judge-tagged secondary signal (#469). It is nil-safe (no
-// dispatcher => no-op, byte-identical) and best-effort: the review leg runs OFF
-// the blocking merge path and a dispatch error is swallowed + recorded as a
-// cross_family_review_failed job event, NEVER returned up, so a review failure can
-// never block or fail a job. The outcome is attributed to the IMPLEMENT job that
-// produced the diff (the same implementJobForTask attribution the merge-gate
-// harvest uses), so the soft review row lands on the implementer's template
-// version next to the verifiable floor.
+// dispatcher => no-op, byte-identical) and best-effort.
+//
+// CRITICAL (review-fix): the review runs a LIVE reviewer adapter.Deliver that can
+// take minutes, so it is DETACHED from the caller's path — it runs in its own
+// goroutine (via spawnReview) under a fresh, cancellation-decoupled context bounded
+// by ReviewLegTimeout. This guarantees a wedged reviewer process can NEVER stall
+// AdvanceJob, the daemon worker tick, or the daemon's checkoutLock (which the
+// AdvanceJob path holds), and is reaped by the timeout rather than leaking forever.
+// A dispatch error is swallowed + recorded as a cross_family_review_failed job
+// event, NEVER returned up, so a review failure can never block or fail a job. The
+// outcome is attributed to the IMPLEMENT job that produced the diff (the same
+// implementJobForTask attribution the merge-gate harvest uses), so the soft review
+// row lands on the implementer's template version next to the verifiable floor.
 func (e Engine) reviewCrossFamilyForMergeGate(ctx context.Context, reviewPayload JobPayload, mergedHead string) {
 	if e.ReviewLegDispatcher == nil || e.OutcomeHarvester == nil {
 		return
 	}
+	// Resolve the owning implement job up front (a cheap store read, no LLM) so the
+	// detached closure is self-contained. If none resolves, there is nothing to
+	// review/attribute.
 	job, payload, ok := e.implementJobForTask(ctx, reviewPayload)
 	if !ok {
 		return
 	}
+	e.spawnReviewLeg(func() {
+		// Fresh context decoupled from the caller's ctx (which is cancelled the moment
+		// AdvanceJob returns) yet bounded so a wedged reviewer is reaped, not leaked.
+		reviewCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), e.reviewLegTimeout())
+		defer cancel()
+		e.runReviewLeg(reviewCtx, job, payload, mergedHead)
+	})
+}
+
+// runReviewLeg performs the actual cross-family review dispatch + harvest. It is
+// called from the DETACHED goroutine (never on the AdvanceJob path) so its live
+// adapter.Deliver cannot block job advancement.
+func (e Engine) runReviewLeg(ctx context.Context, job db.Job, payload JobPayload, mergedHead string) {
 	outcome, ok, err := e.ReviewLegDispatcher.Review(ctx, job, payload, mergedHead)
 	if err != nil {
 		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
@@ -4389,6 +4437,27 @@ func (e Engine) reviewCrossFamilyForMergeGate(ctx context.Context, reviewPayload
 		return
 	}
 	e.harvestOutcome(ctx, job, payload, outcome)
+}
+
+// reviewLegTimeout returns the configured detached-review-leg ceiling, defaulting
+// to defaultReviewLegTimeout when unset so a zero-valued Engine keeps a bounded
+// reviewer.
+func (e Engine) reviewLegTimeout() time.Duration {
+	if e.ReviewLegTimeout > 0 {
+		return e.ReviewLegTimeout
+	}
+	return defaultReviewLegTimeout
+}
+
+// spawnReviewLeg runs fn off the caller's path. The default spawns a goroutine
+// (fire-and-forget, like the EventSink seam); tests inject a synchronous runner via
+// the ReviewSpawner hook so the detached review is deterministic.
+func (e Engine) spawnReviewLeg(fn func()) {
+	if e.ReviewSpawner != nil {
+		e.ReviewSpawner(fn)
+		return
+	}
+	go fn()
 }
 
 // harvestOutcomeForMergeGate resolves the implement job that owns this PR/task and

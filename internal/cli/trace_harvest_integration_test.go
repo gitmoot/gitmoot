@@ -211,6 +211,10 @@ func chainEngine(store *db.Store, gate workflow.MergeGate) workflow.Engine {
 			}
 			return strings.Join(parts, "-")
 		},
+		// Run the detached cross-family review leg SYNCHRONOUSLY in the integration
+		// tests so its dispatch + harvest are deterministic; the daemon defaults to a
+		// goroutine (the review is genuinely off the AdvanceJob path in production).
+		ReviewSpawner: func(fn func()) { fn() },
 	}
 }
 

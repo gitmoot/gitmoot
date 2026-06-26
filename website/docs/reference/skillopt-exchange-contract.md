@@ -248,11 +248,15 @@ scores subjective quality **and** scope-fidelity as ONE rubric:
 Each dimension is in `[0,1]`. The rubric is mapped to `dimension_scores` and fused
 by the **mean-of-dimensions** path of the normalized `{score, feedback}`
 projection, then written as a **second** `FeedbackEvent` in the SAME
-`auto-trace:<version>` run under a distinct item id (`review#<repo>#<pr>`) and a
-distinct reviewer (`gitmoot-review:<rt>`), so it **never overwrites** the
-verifiable-floor row. The review eval item carries `judge_derived = true` (and
-`self_family = true` on the same-family fallback) while the run keeps
-`feedback_source = automatic_trace` — additive, **no new contract field,
+`auto-trace:<version>` run under a distinct item id (`review#<repo>#<pr>`) and the
+fixed `gitmoot-review` reviewer sentinel, so it **never overwrites** the
+verifiable-floor row — and so a re-review by a *different* reviewer family
+overwrites the row in place rather than accumulating a stale duplicate. The mapped
+mean **drives the a/b choice** (a below-`0.5` mean registers as a non-baseline `b`
+vote, not a baseline win) and an empty rubric writes **no row**. The review eval
+item carries `judge_derived = true`, the `reviewer_runtime` family, the projected
+`rubric_score`, and (on the same-family fallback) `self_family = true`, while the
+run keeps `feedback_source = automatic_trace` — additive, **no new contract field,
 `contract_version` stays `1`**.
 
 The signal is **soft, judge-tagged, and weighted low** — weight tiers:
@@ -264,9 +268,9 @@ The rubric text is **never** injected into the implementer's prompt (anti-gaming
 When no different-family reviewer is available/authed, gitmoot falls back to a
 **same-family** reviewer — never silently: it logs and records a
 `cross_family_review_samefamily_fallback` job event (self-preference bias
-applies), tags the row `gitmoot-review-self:<rt>` with `self_family = true`, and
-weights it below a cross-family review. Only when no review-capable runtime is
-authed at all is the review skipped (no review row).
+applies), tags the review item `self_family = true` (with `reviewer_runtime`
+carrying the family), and weights it below a cross-family review. Only when no
+review-capable runtime is authed at all is the review skipped (no review row).
 
 The judge is uncalibrated in this slice — judge-tagged and weighted low, with a
 measure-the-judge calibration hook for #344/#345 as a follow-on. Promotion stays
