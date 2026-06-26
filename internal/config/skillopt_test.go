@@ -56,6 +56,62 @@ auto_trace_enabled = maybe
 	}
 }
 
+// TestLoadSkillOptPolicyReviewDefaultsDisabled: the cross-family review knob is OFF
+// by default and ReviewEnabled() is false.
+func TestLoadSkillOptPolicyReviewDefaultsDisabled(t *testing.T) {
+	policy := DefaultSkillOptPolicy()
+	if policy.CrossFamilyReviewEnabled || policy.ReviewEnabled() {
+		t.Fatalf("cross-family review must default OFF, got %+v", policy)
+	}
+}
+
+// TestLoadSkillOptPolicyReviewRequiresAutoTrace: cross_family_review_enabled alone
+// (without auto_trace_enabled) is OFF — ReviewEnabled() requires BOTH.
+func TestLoadSkillOptPolicyReviewRequiresAutoTrace(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[skillopt]
+cross_family_review_enabled = true
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	policy, err := LoadSkillOptPolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadSkillOptPolicy returned error: %v", err)
+	}
+	if !policy.CrossFamilyReviewEnabled {
+		t.Fatal("cross_family_review_enabled = true should parse")
+	}
+	if policy.ReviewEnabled() {
+		t.Fatal("ReviewEnabled() must be false without auto_trace_enabled (requires BOTH)")
+	}
+}
+
+// TestLoadSkillOptPolicyReviewEnabledWithBoth: both knobs on => ReviewEnabled().
+func TestLoadSkillOptPolicyReviewEnabledWithBoth(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[skillopt]
+auto_trace_enabled = true
+cross_family_review_enabled = true
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	policy, err := LoadSkillOptPolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadSkillOptPolicy returned error: %v", err)
+	}
+	if !policy.ReviewEnabled() {
+		t.Fatalf("ReviewEnabled() must be true with both knobs on, got %+v", policy)
+	}
+}
+
 // TestLoadSkillOptPolicyIgnoresOtherSections proves a config that only sets
 // [events]/[orchestrate] leaves the trace-harvester at its disabled default.
 func TestLoadSkillOptPolicyIgnoresOtherSections(t *testing.T) {

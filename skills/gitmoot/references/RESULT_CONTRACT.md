@@ -485,3 +485,46 @@ promotes** — a human still promotes a candidate. With the knob unset, no
 harvester runs and behavior is byte-identical. See
 `docs/skillopt-exchange-contract.md` for the outcome→score mapping, the no-CI
 guard, and the corrective-on-revert overwrite.
+
+### Cross-family review soft signal (off by default)
+
+When **both** `[skillopt].auto_trace_enabled = true` **and**
+`[skillopt].cross_family_review_enabled = true` (both default `false`), a merged
+implement job additionally runs a read-only **cross-family review leg**: a
+reviewer of a *different runtime family* than the implementer
+(codex→claude, claude→codex, kimi→claude — a registered review-capable agent of
+another family if one is scoped to the repo, else an ephemeral different-family
+read-only leg in the `verifier.md` style). The reviewer scores subjective quality
+**and** scope-fidelity as ONE rubric — `coverage` / `containment` / `fidelity`
+(intended scope = the implement job's instructions + task title + goal title vs.
+the PR diff + `changes_made`) plus `architecture` / `readability` / `abstraction`
+— each in `[0,1]`. The rubric is mapped to `dimension_scores`, fused by the
+mean-of-dimensions path, and written as a **second** `FeedbackEvent` in the SAME
+`auto-trace:<version>` run under a distinct item id (`review#<repo>#<pr>`) and a
+distinct reviewer (`gitmoot-review:<rt>`), so it never overwrites the verifiable
+floor row.
+
+This signal is **soft, judge-tagged, and weighted low**. The review row rides the
+run's `feedback_source = automatic_trace` (no new contract field,
+`contract_version` stays `1`) and its eval item carries `judge_derived = true`, so
+the export/optimizer ranks it below the verifiable floor and below human gold —
+**weight tiers: human gold > verifiable floor > cross-family judge > same-family
+judge.** It is **best-effort and off the blocking merge path**: a review-leg
+failure never blocks or fails a job (it records a `cross_family_review_failed` job
+event). The rubric text is **never** injected into the implementer's prompt
+(anti-gaming).
+
+**Same-family fallback (with warning).** When *no* different-family reviewer is
+available/authed, gitmoot falls back to a **same-family** reviewer — but never
+silently: it logs and records a `cross_family_review_samefamily_fallback` job
+event (self-preference bias applies), tags the row `gitmoot-review-self:<rt>` with
+`self_family = true`, and weights it *below* a cross-family review. Only when **no**
+review-capable runtime is authed at all is the review skipped (no review row).
+
+The judge is uncalibrated in this slice — it is judge-tagged and weighted low (a
+measure-the-judge calibration hook for #344/#345 is a follow-on). The review
+signal feeds the optimizer like any other and, when the configurable
+`[skillopt].auto_promote` policy (#463) lands, is subject to it (weighted-low +
+judge-tagged — *not* barred from promotion); this slice simply preserves the
+current **manual** promotion by writing only `eval_runs` / `eval_review_items` /
+`feedback_events`.

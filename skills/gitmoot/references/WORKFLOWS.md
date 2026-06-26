@@ -379,6 +379,55 @@ Before launching it, verify `gitmoot-skillopt --version` and
 `gitmoot-skillopt optimize --help`; missing or broken installs should be
 handled as configuration blockers.
 
+## Automatic Trace-Harvested Feedback (Mode A, off by default)
+
+For hands-off template learning, the daemon can derive feedback from the
+**verifiable outcomes** an implement job reaches instead of waiting for a human
+ranking. Enable it per host in `[skillopt]`:
+
+```toml
+[skillopt]
+auto_trace_enabled = true            # off by default
+cross_family_review_enabled = false  # off by default; also needs auto_trace_enabled
+```
+
+With `auto_trace_enabled = true`, a merge (passing CI vs. empty-gate), a
+merge-gate block, or a review `changes_requested` is projected into a synthetic
+`FeedbackEvent` (`reviewer = gitmoot-auto`, `feedback_source = automatic_trace`)
+in a per-template-version `auto-trace:<version>` eval run. It is additive
+(`contract_version` stays `1`), best-effort (a failure records an
+`auto_trace_harvest_failed` job event, never blocks a job), and **never
+promotes** — a human still promotes a candidate. With the knob unset, no
+harvester runs and behavior is byte-identical.
+
+### Cross-family review agent (soft quality + scope-fidelity signal)
+
+Turning on **both** `auto_trace_enabled` and `cross_family_review_enabled` adds a
+read-only **cross-family review leg** on every merge: a reviewer of a *different
+runtime family* than the implementer (codex→claude, claude→codex, kimi→claude —
+preferring a registered review-capable agent of another family scoped to the
+repo, else an ephemeral different-family read-only leg in the `verifier.md`
+style) scores subjective quality + scope-fidelity as one rubric (coverage /
+containment / fidelity + architecture / readability / abstraction, each in
+`[0,1]`). The rubric becomes a **second**, judge-tagged, down-weighted
+`FeedbackEvent` in the SAME `auto-trace:<version>` run under a distinct item id
+(`review#<repo>#<pr>`) and reviewer (`gitmoot-review:<rt>`), so it never
+overwrites the verifiable floor. Weight tiers: **human gold > verifiable floor >
+cross-family judge > same-family judge.**
+
+The review leg runs **off the blocking merge path** and is best-effort — a
+failure records a `cross_family_review_failed` job event and never blocks the
+merge. When no different-family reviewer is available it falls back to a
+**same-family** reviewer *with a warning* (a `cross_family_review_samefamily_fallback`
+job event, a `gitmoot-review-self:<rt>` row tagged `self_family = true` so it
+weights below a cross-family review); only when no review-capable runtime is
+authed at all is the review skipped. The rubric text is never shown to the
+implementer (anti-gaming). Promotion stays manual (the harvester writes only
+eval/feedback rows); the signal is weighted-low + judge-tagged and is subject to
+the configurable `[skillopt].auto_promote` policy (#463) when that lands — it is
+not barred from promotion. See
+`skills/gitmoot/references/RESULT_CONTRACT.md` for the full contract.
+
 ## Execution Model
 
 Use `here` when the current chat should answer directly from the Gitmoot skill.

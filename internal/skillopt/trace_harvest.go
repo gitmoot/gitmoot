@@ -126,6 +126,12 @@ func (h *OutcomeHarvester) Harvest(ctx context.Context, job db.Job, payload work
 		// Unresolvable template version: skip rather than guess (#465 risk note).
 		return nil
 	}
+	if outcome.Kind == workflow.OutcomeReviewed {
+		// SOFT cross-family review signal (#469): a SECOND, judge-tagged,
+		// down-weighted FeedbackEvent in the SAME auto-trace run under a distinct item
+		// id + reviewer, so it never overwrites the verifiable floor.
+		return h.writeReviewFeedback(ctx, version, outcome, projectReview(outcome))
+	}
 	signal, choice := h.project(ctx, payload, outcome)
 	return h.writeFeedback(ctx, version, payload, outcome, signal, choice)
 }

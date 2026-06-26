@@ -3977,6 +3977,15 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 		// TrainingPackage — is byte-identical. The harvester writes ONLY
 		// eval/feedback rows; promotion stays 100% manual.
 		OutcomeHarvester: daemonOutcomeHarvester(store, gh, home),
+		// Off-by-default cross-family review-agent soft signal (#469): on a MERGE the
+		// engine additionally runs a read-only CROSS-FAMILY review leg (off the
+		// blocking merge path, best-effort) whose subjective-quality + scope-fidelity
+		// rubric is projected into a SECOND, judge-tagged, down-weighted FeedbackEvent
+		// in the SAME auto-trace run. daemonReviewLegDispatcher returns nil unless BOTH
+		// [skillopt].cross_family_review_enabled AND auto_trace_enabled are set, so with
+		// no config NO review leg runs and NO review row is written — byte-identical.
+		// A review-leg failure never blocks or fails a job; promotion stays manual.
+		ReviewLegDispatcher: daemonReviewLegDispatcher(store, gh, checkout, home),
 		PayloadRefresher: func(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
 			return refreshDaemonJobPayload(ctx, store, checkout, job, payload)
 		},

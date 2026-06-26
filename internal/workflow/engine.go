@@ -58,6 +58,18 @@ type Engine struct {
 	// promotes. The concrete impl lives in internal/skillopt and is wired only in
 	// cli (daemonWorkflowEngine), keeping the engine free of skillopt coupling.
 	OutcomeHarvester OutcomeHarvester
+	// ReviewLegDispatcher is the injected, best-effort, nil-by-default seam (#469)
+	// the engine calls AFTER a merge harvest to run a CROSS-FAMILY review leg whose
+	// rubric is projected into the SAME auto-trace run as a SOFT, down-weighted,
+	// judge-tagged secondary signal. It mirrors OutcomeHarvester: optional and
+	// nil-safe (when nil — the default, no [skillopt].cross_family_review_enabled —
+	// NO review leg runs and NO review row is written, so behavior is
+	// byte-identical), and best-effort (a dispatch error is swallowed and recorded
+	// as a cross_family_review_failed job event, never returned up, so it can never
+	// block or fail a job). It runs OFF the blocking merge path. The concrete impl
+	// is wired only in cli (gated by cross_family_review_enabled AND
+	// auto_trace_enabled), keeping the engine free of runtime/skillopt coupling.
+	ReviewLegDispatcher ReviewLegDispatcher
 	// Home is the resolved GITMOOT_HOME root used to place per-delegation
 	// worktrees. DelegationWorktrees is the checkout-bound git client that
 	// performs the worktree-add. Both are optional: when either is unset, the
@@ -400,6 +412,16 @@ const (
 	// harvested merge, re-firing harvestOutcomeForMergeGate for the reverted PR) is
 	// a follow-on; see CORRECTIVE-ON-REVERT in docs/skillopt-exchange-contract.md.
 	OutcomeReverted OutcomeKind = "reverted"
+	// OutcomeReviewed is the SOFT, down-weighted, judge-tagged secondary signal a
+	// cross-family review leg produces (#469). Unlike the verifiable kinds above it
+	// is NOT derived from a gate transition: it is the rubric a different-runtime
+	// reviewer scored on subjective quality + scope-fidelity, projected into a
+	// SECOND FeedbackEvent in the SAME auto-trace run under a distinct item id and a
+	// gitmoot-review[-self]:<rt> reviewer so it never overwrites the verifiable
+	// floor. It is best-effort and off-by-default: only constructed when
+	// [skillopt].cross_family_review_enabled (which also requires auto_trace_enabled)
+	// is on, and a review-leg failure NEVER blocks or fails a job.
+	OutcomeReviewed OutcomeKind = "reviewed"
 )
 
 // Outcome carries the verifiable signal the engine derives at an outcome seam and
@@ -428,6 +450,31 @@ type Outcome struct {
 	// FixRounds is the review-round number at a changes_requested decision (round 1
 	// is the first), used to grade the negative: more rounds => worse score.
 	FixRounds int
+
+	// The fields below are populated ONLY for Kind == OutcomeReviewed (the
+	// cross-family review-agent soft signal, #469); they are zero for every
+	// verifiable kind so an OutcomeMerged/Blocked/ChangesRequested/Reverted is
+	// byte-identical to before.
+
+	// Reviewer is the reviewer runtime family that produced the rubric (codex /
+	// claude / kimi). The harvester tags the review FeedbackEvent's reviewer as
+	// gitmoot-review:<Reviewer> (or gitmoot-review-self:<Reviewer> when SelfFamily)
+	// so the soft row never collides with the verifiable-floor reviewer.
+	Reviewer string
+	// SelfFamily is true when no DIFFERENT-family reviewer was available and the
+	// review fell back to a SAME-family reviewer (REFINEMENT #1). A self-family row
+	// is tagged distinctly and weights BELOW a cross-family review because
+	// self-preference bias applies. It is always false for a true cross-family
+	// review.
+	SelfFamily bool
+	// Rubric is the reviewer's subjective-quality + scope-fidelity rubric, each
+	// dimension in [0,1] (coverage/containment/fidelity + architecture/readability/
+	// abstraction). The harvester maps it to EvaluatorScore.DimensionScores and lets
+	// ProjectSignal take the mean (#462 path), so no new aggregation is invented.
+	Rubric map[string]float64
+	// Findings is the reviewer's free-text reasoning, surfaced verbatim in the soft
+	// FeedbackEvent's reasoning.
+	Findings string
 }
 
 // OutcomeHarvester is the injected, best-effort, nil-by-default seam (#465, Mode
@@ -4300,9 +4347,48 @@ func (e Engine) runMergeGate(ctx context.Context, reviewer string, payload JobPa
 			PullRequest: payload.PullRequest,
 			HeadSHA:     mergedHead,
 		})
+		// Soft cross-family review signal (#469), OFF the blocking merge path and
+		// strictly best-effort: a nil dispatcher (the default, no
+		// cross_family_review_enabled) is a no-op, and any review-leg failure is
+		// swallowed so it can never block or fail the (already-completed) merge.
+		e.reviewCrossFamilyForMergeGate(ctx, payload, mergedHead)
 		return decision, nil
 	}
 	return decision, e.setTaskState(ctx, ref, TaskReadyToMerge)
+}
+
+// reviewCrossFamilyForMergeGate runs the cross-family review leg for a just-merged
+// PR and harvests its OutcomeReviewed rubric into the SAME auto-trace run as a
+// SOFT, down-weighted, judge-tagged secondary signal (#469). It is nil-safe (no
+// dispatcher => no-op, byte-identical) and best-effort: the review leg runs OFF
+// the blocking merge path and a dispatch error is swallowed + recorded as a
+// cross_family_review_failed job event, NEVER returned up, so a review failure can
+// never block or fail a job. The outcome is attributed to the IMPLEMENT job that
+// produced the diff (the same implementJobForTask attribution the merge-gate
+// harvest uses), so the soft review row lands on the implementer's template
+// version next to the verifiable floor.
+func (e Engine) reviewCrossFamilyForMergeGate(ctx context.Context, reviewPayload JobPayload, mergedHead string) {
+	if e.ReviewLegDispatcher == nil || e.OutcomeHarvester == nil {
+		return
+	}
+	job, payload, ok := e.implementJobForTask(ctx, reviewPayload)
+	if !ok {
+		return
+	}
+	outcome, ok, err := e.ReviewLegDispatcher.Review(ctx, job, payload, mergedHead)
+	if err != nil {
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "cross_family_review_failed",
+			Message: err.Error(),
+		})
+		return
+	}
+	if !ok {
+		// No review-capable runtime authed at all: skip silently (no review row).
+		return
+	}
+	e.harvestOutcome(ctx, job, payload, outcome)
 }
 
 // harvestOutcomeForMergeGate resolves the implement job that owns this PR/task and

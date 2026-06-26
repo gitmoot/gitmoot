@@ -377,11 +377,24 @@ type SkillOptPolicy struct {
 	// FeedbackEvent in a dedicated auto-trace eval_run. Empty/false (the default)
 	// means OFF: no harvester is constructed and the daemon writes nothing extra.
 	AutoTraceEnabled bool
+
+	// CrossFamilyReviewEnabled opts the daemon into the Mode A cross-family
+	// review-agent SOFT signal (#469): when true (AND AutoTraceEnabled is also true),
+	// a merged implement job additionally runs a read-only CROSS-FAMILY review leg
+	// whose subjective-quality + scope-fidelity rubric is projected into a SECOND,
+	// judge-tagged, down-weighted FeedbackEvent in the SAME auto-trace run. Empty/
+	// false (the default) means OFF: NO review leg runs and NO review row is written
+	// — byte-identical to the verifiable-floor-only behavior. It additionally
+	// requires AutoTraceEnabled (a review row only makes sense inside the auto-trace
+	// run); ReviewEnabled() encodes that dependency. A live cross-family LLM review
+	// per merge is a real cost surface, so it must be opt-in.
+	CrossFamilyReviewEnabled bool
 }
 
 func DefaultSkillOptPolicy() SkillOptPolicy {
 	return SkillOptPolicy{
-		AutoTraceEnabled: false,
+		AutoTraceEnabled:         false,
+		CrossFamilyReviewEnabled: false,
 	}
 }
 
@@ -389,6 +402,14 @@ func DefaultSkillOptPolicy() SkillOptPolicy {
 // no [skillopt] config (the default) it is OFF and no harvester is constructed.
 func (p SkillOptPolicy) Enabled() bool {
 	return p.AutoTraceEnabled
+}
+
+// ReviewEnabled reports whether the cross-family review-agent soft signal (#469)
+// is configured on. It requires BOTH cross_family_review_enabled AND
+// auto_trace_enabled (the review row only makes sense inside the auto-trace run),
+// so enabling the review knob alone — without the auto-trace harvester — is OFF.
+func (p SkillOptPolicy) ReviewEnabled() bool {
+	return p.AutoTraceEnabled && p.CrossFamilyReviewEnabled
 }
 
 func LoadSkillOptPolicy(paths Paths) (SkillOptPolicy, error) {
@@ -427,6 +448,10 @@ func applySkillOptPolicyField(policy *SkillOptPolicy, key string, value string) 
 	case "auto_trace_enabled":
 		parsed, err := strconv.ParseBool(value)
 		policy.AutoTraceEnabled = parsed
+		return err
+	case "cross_family_review_enabled":
+		parsed, err := strconv.ParseBool(value)
+		policy.CrossFamilyReviewEnabled = parsed
 		return err
 	default:
 		return nil

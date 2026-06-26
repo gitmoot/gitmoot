@@ -213,6 +213,51 @@ human default `imported_human_review`), and the run lives in its own
 automatic feedback independently of sparse human gold. A human run never carries
 the `feedback_source` metadata key, so its export is byte-identical.
 
+### Cross-family review soft signal (off by default)
+
+Setting **both** `[skillopt].auto_trace_enabled = true` **and**
+`[skillopt].cross_family_review_enabled = true` (both default `false`) adds a
+read-only **cross-family review leg** on every merge. A reviewer of a *different
+runtime family* than the implementer (codex→claude, claude→codex, kimi→claude —
+preferring a registered review-capable agent of another family scoped to the
+repo, else an ephemeral different-family read-only leg in the `verifier.md` style)
+scores subjective quality **and** scope-fidelity as ONE rubric:
+
+- **coverage / containment / fidelity** — intended scope (the implement job's
+  instructions + task title + goal title) vs. the delivered work (the PR diff,
+  read-only at the head SHA, plus the agent's self-reported `changes_made` as a
+  secondary cross-check). Coverage = did all of the ask; containment = no creep
+  beyond it; fidelity = the ask, not something adjacent.
+- **architecture / readability / abstraction** — subjective code quality.
+
+Each dimension is in `[0,1]`. The rubric maps to `dimension_scores`, is fused by
+the **mean-of-dimensions** path, and is written as a **second** `FeedbackEvent` in
+the SAME `auto-trace:<version>` run under a distinct item id (`review#<repo>#<pr>`)
+and reviewer (`gitmoot-review:<rt>`), so it **never overwrites** the verifiable
+floor. The review eval item carries `judge_derived = true` (and `self_family = true`
+on the same-family fallback) while the run keeps `feedback_source = automatic_trace`
+— additive, **no new contract field, `contract_version` stays `1`**.
+
+The signal is **soft, judge-tagged, and weighted low** — weight tiers:
+**human gold > verifiable floor > cross-family judge > same-family judge.** It
+runs **off the blocking merge path** and is best-effort: a review-leg failure
+records a `cross_family_review_failed` job event and never blocks or fails a job.
+The rubric text is **never** injected into the implementer's prompt (anti-gaming).
+
+When no different-family reviewer is available/authed, gitmoot falls back to a
+**same-family** reviewer — never silently: it logs and records a
+`cross_family_review_samefamily_fallback` job event, tags the row
+`gitmoot-review-self:<rt>` with `self_family = true`, and weights it below a
+cross-family review. Only when no review-capable runtime is authed at all is the
+review skipped (no review row).
+
+The judge is uncalibrated in this slice — judge-tagged and weighted low, with a
+measure-the-judge calibration hook for #344/#345 as a follow-on. Promotion stays
+manual (the harvester writes only `eval_runs` / `eval_review_items` /
+`feedback_events`); the review signal feeds the optimizer like any other and is
+subject to the configurable `[skillopt].auto_promote` policy (#463) when that
+lands — weighted-low + judge-tagged, **not** barred from promotion.
+
 ## Ranked Exploration Workflow
 
 Use ranked exploration when the template is still ambiguous and humans need to
