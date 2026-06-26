@@ -42,6 +42,7 @@ type localAgentDispatchRequest struct {
 	Cockpit                bool
 	CockpitSession         string
 	SkipNativeReviewFanout bool
+	Recipe                 string
 	SelectedAction         string
 	SelectedActionReason   string
 	ExecutionPath          string
@@ -130,6 +131,17 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			checkoutPath = task.WorktreePath
 		}
 	}
+	// A --recipe routes this coordinator to a named built-in recipe template's
+	// prompt (resolved from the installed-template store) without rebinding the
+	// agent; the override is captured into the job payload at enqueue time.
+	var recipeTemplate *db.AgentTemplate
+	if strings.TrimSpace(request.Recipe) != "" {
+		tmpl, err := loadInstalledTemplate(ctx, store, request.Recipe)
+		if err != nil {
+			return localAgentJobOutput{}, err
+		}
+		recipeTemplate = &tmpl
+	}
 	job, err := (workflow.Mailbox{Store: store}).Enqueue(ctx, workflow.JobRequest{
 		ID:                     localAgentJobID(request.Action, agent.Name),
 		Agent:                  agent.Name,
@@ -149,6 +161,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		Cockpit:                request.Cockpit,
 		CockpitSession:         request.CockpitSession,
 		SkipNativeReviewFanout: request.SkipNativeReviewFanout,
+		TemplateOverride:       recipeTemplate,
 	})
 	if err != nil {
 		return localAgentJobOutput{}, err

@@ -3065,6 +3065,48 @@ func TestParseAgentRunOptionsCapturesModel(t *testing.T) {
 	}
 }
 
+func TestParseAgentRunOptionsCapturesRecipe(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "space form", args: []string{"planner", "do the work", "--recipe", "review-panel"}, want: "review-panel"},
+		{name: "inline form", args: []string{"planner", "do the work", "--recipe=decompose-and-verify"}, want: "decompose-and-verify"},
+		{name: "third valid id", args: []string{"planner", "do the work", "--recipe=verifier"}, want: "verifier"},
+		{name: "absent leaves empty", args: []string{"planner", "do the work"}, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			options, ok := parseAgentRunOptions("orchestrate", tt.args, &stderr)
+			if !ok {
+				t.Fatalf("parseAgentRunOptions failed: %q", stderr.String())
+			}
+			if options.recipe != tt.want {
+				t.Fatalf("recipe = %q, want %q", options.recipe, tt.want)
+			}
+		})
+	}
+
+	t.Run("unknown recipe rejected", func(t *testing.T) {
+		var stderr bytes.Buffer
+		_, ok := parseAgentRunOptions("orchestrate", []string{"planner", "do the work", "--recipe=bogus"}, &stderr)
+		if ok {
+			t.Fatalf("parseAgentRunOptions accepted an unknown recipe")
+		}
+		errText := stderr.String()
+		if !strings.Contains(errText, `unknown recipe "bogus"`) {
+			t.Fatalf("stderr missing unknown-recipe message: %q", errText)
+		}
+		for _, id := range []string{"review-panel", "decompose-and-verify", "verifier"} {
+			if !strings.Contains(errText, id) {
+				t.Fatalf("stderr missing valid id %q: %q", id, errText)
+			}
+		}
+	})
+}
+
 func TestParseAgentRunOptionsCapturesCockpit(t *testing.T) {
 	tests := []struct {
 		name        string

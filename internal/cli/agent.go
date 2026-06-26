@@ -278,6 +278,7 @@ type agentRunOptions struct {
 	cockpit                bool
 	cockpitSession         string
 	skipNativeReviewFanout bool
+	recipe                 string
 }
 
 func runAgentRun(args []string, stdout, stderr io.Writer) int {
@@ -351,7 +352,7 @@ func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 
 func printOrchestrateUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--model model] [--cockpit] [--cockpit-session name] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--model model] [--recipe id] [--cockpit] [--cockpit-session name] [--home path] [--json]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Orchestrate work across agents (a coordinator that fans out delegations).")
 	fmt.Fprintln(w, "Sugar for `gitmoot agent run <agent> --background`: the named agent is the")
@@ -361,6 +362,10 @@ func printOrchestrateUsage(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Example:")
 	fmt.Fprintln(w, "  gitmoot orchestrate planner \"audit the auth flow and fan out fixes\" --repo owner/repo")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "--recipe <review-panel|decompose-and-verify|verifier> routes the coordinator")
+	fmt.Fprintln(w, "to a named built-in recipe prompt (an opt-in deterministic decomposition")
+	fmt.Fprintln(w, "shape) instead of the agent's own prompt; the agent's identity is unchanged.")
 }
 
 func runAgentReview(args []string, stdout, stderr io.Writer) int {
@@ -445,6 +450,7 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 			Cockpit:                options.cockpit,
 			CockpitSession:         options.cockpitSession,
 			SkipNativeReviewFanout: options.skipNativeReviewFanout,
+			Recipe:                 options.recipe,
 			SelectedAction:         action,
 			SelectedActionReason:   reason,
 			ExecutionPath:          executionPath,
@@ -505,7 +511,7 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.cockpit = true
 		case arg == "--skip-native-review-fanout":
 			options.skipNativeReviewFanout = true
-		case arg == "--type" || arg == "--model" || arg == "--repo" || arg == "--home" || arg == "--task" || arg == "--pr" || arg == "--head-sha" || arg == "--branch" || arg == "--cockpit-session":
+		case arg == "--type" || arg == "--model" || arg == "--repo" || arg == "--home" || arg == "--task" || arg == "--pr" || arg == "--head-sha" || arg == "--branch" || arg == "--cockpit-session" || arg == "--recipe":
 			if index+1 >= len(args) {
 				fmt.Fprintf(stderr, "%s requires a value for %s\n", label, arg)
 				return agentRunOptions{}, false
@@ -520,6 +526,8 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.typeName = strings.TrimPrefix(arg, "--type=")
 		case strings.HasPrefix(arg, "--model="):
 			options.model = strings.TrimSpace(strings.TrimPrefix(arg, "--model="))
+		case strings.HasPrefix(arg, "--recipe="):
+			options.recipe = strings.TrimSpace(strings.TrimPrefix(arg, "--recipe="))
 		case strings.HasPrefix(arg, "--repo="):
 			options.repo = strings.TrimPrefix(arg, "--repo=")
 		case strings.HasPrefix(arg, "--home="):
@@ -556,6 +564,12 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 	if strings.TrimSpace(options.cockpitSession) != "" {
 		options.cockpit = true
 	}
+	normalizedRecipe, err := validateRecipeID(options.recipe)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s: %v\n", label, err)
+		return agentRunOptions{}, false
+	}
+	options.recipe = normalizedRecipe
 	return options, true
 }
 
@@ -586,6 +600,8 @@ func setAgentRunOption(options *agentRunOptions, flagName string, value string, 
 		options.branch = value
 	case "--cockpit-session":
 		options.cockpitSession = value
+	case "--recipe":
+		options.recipe = value
 	case "--pr":
 		parsed, err := strconv.Atoi(value)
 		if err != nil || parsed <= 0 {
@@ -601,14 +617,39 @@ func printAgentRunUsage(w io.Writer, command string) {
 	fmt.Fprintln(w, "Usage:")
 	switch command {
 	case "orchestrate":
-		fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--model model] [--cockpit] [--cockpit-session name] [--skip-native-review-fanout] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--model model] [--recipe id] [--cockpit] [--cockpit-session name] [--skip-native-review-fanout] [--home path] [--json]")
 	case "review":
 		fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background] [--type type] [--model model] [--home path] [--json]")
 	case "implement":
 		fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--branch branch] [--background] [--type type] [--model model] [--skip-native-review-fanout] [--home path] [--json]")
 	default:
-		fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--background] [--type type] [--model model] [--skip-native-review-fanout] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--background] [--type type] [--model model] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
 	}
+}
+
+// recipeTemplateIDs is the allowlist of built-in coordinator recipes the
+// --recipe flag may select. It is keyed off the agenttemplate registry consts so
+// the set stays coupled to the registry of installable templates.
+var recipeTemplateIDs = []string{
+	agenttemplate.ReviewPanelTemplateID,
+	agenttemplate.DecomposeAndVerifyTemplateID,
+	agenttemplate.VerifierTemplateID,
+}
+
+// validateRecipeID normalizes and validates the --recipe value against the
+// built-in coordinator recipe registry. Empty (flag absent) is valid and
+// means "use the agent's own prompt".
+func validateRecipeID(recipe string) (string, error) {
+	recipe = strings.TrimSpace(recipe)
+	if recipe == "" {
+		return "", nil
+	}
+	for _, id := range recipeTemplateIDs {
+		if recipe == id {
+			return recipe, nil
+		}
+	}
+	return "", fmt.Errorf("unknown recipe %q; choose one of %s", recipe, strings.Join(recipeTemplateIDs, ", "))
 }
 
 // selectOrchestrateAction routes an orchestrate job by EXPLICIT FLAGS only
