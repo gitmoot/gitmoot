@@ -53,10 +53,23 @@ func notifyOnly(reason string) AutoPromoteDecision {
 //     auto_promote without a sample floor must never promote a sparse candidate).
 //   - min_score unset (nil) OR a nil candidate Summary.Score -> hard do-not-promote.
 //   - require_external_ci=true with no real-CI positive in the run -> do not promote.
+//   - min_confidence (#473 Mode B) is ADDITIVE and OPTIONAL: when
+//     policy.AutoPromoteMinConfidence is nil (the default) the bandit confidence is
+//     ignored entirely and behavior is byte-identical to #471 — `confidence` may be
+//     nil. When the floor IS set, promote additionally requires a non-nil
+//     confidence >= the floor AND at least AutoPromoteMinSamples bandit samples
+//     behind it (small-sample over-confidence guard); a nil/low confidence or thin
+//     evidence FAILS SAFE to notify-only.
 //
-// On a pass the reason names the guardrails that held (score, samples, external CI)
-// so the candidate.auto_promoted event explains the decision.
-func EvaluateAutoPromote(policy config.SkillOptPolicy, candidate CandidatePackage, feedbackEvents []db.FeedbackEvent, feedbackUnavailable bool) AutoPromoteDecision {
+// `confidence` is the Mode B P(challenger>champion) the runCandidateNotify seam
+// supplies from the bandit (nil when there is no arm); `confidenceSamples` is the
+// challenger arm's pull count behind it (0 when absent). Both are ignored unless
+// AutoPromoteMinConfidence is set, so EXISTING callers/tests are unchanged in
+// behavior.
+//
+// On a pass the reason names the guardrails that held (score, samples, external CI,
+// confidence) so the candidate.auto_promoted event explains the decision.
+func EvaluateAutoPromote(policy config.SkillOptPolicy, candidate CandidatePackage, feedbackEvents []db.FeedbackEvent, feedbackUnavailable bool, confidence *float64, confidenceSamples int) AutoPromoteDecision {
 	if !policy.AutoPromote {
 		return notifyOnly("auto_promote is off; notify only (manual promotion)")
 	}
@@ -117,6 +130,27 @@ func EvaluateAutoPromote(policy config.SkillOptPolicy, candidate CandidatePackag
 			return notifyOnly("auto_promote_require_external_ci is set but no eval_run feedback recorded a real external-CI pass; notify only")
 		}
 		passed = append(passed, "external CI confirmed")
+	}
+
+	// Guardrail: min_confidence (#473 Mode B). ADDITIVE and OPTIONAL — when unset
+	// (the default) the bandit confidence is ignored and this whole block is a
+	// no-op, so #471 behavior is byte-identical. When set, promote requires a
+	// non-nil confidence at or above the floor, backed by at least
+	// AutoPromoteMinSamples bandit pulls (a Beta posterior on a couple of pulls can
+	// read 0.9 by luck — the tiering floor refuses thin evidence). nil/low/thin all
+	// fail safe to notify-only.
+	if policy.AutoPromoteMinConfidence != nil {
+		floor := *policy.AutoPromoteMinConfidence
+		if confidence == nil {
+			return notifyOnly(fmt.Sprintf("auto_promote_min_confidence=%.4g is set but no bandit confidence is available; notify only", floor))
+		}
+		if confidenceSamples < *policy.AutoPromoteMinSamples {
+			return notifyOnly(fmt.Sprintf("bandit confidence %.0f%% has only %d sample(s), below auto_promote_min_samples=%d; notify only", *confidence*100, confidenceSamples, *policy.AutoPromoteMinSamples))
+		}
+		if *confidence < floor {
+			return notifyOnly(fmt.Sprintf("bandit confidence %.0f%% below auto_promote_min_confidence=%.4g; notify only", *confidence*100, floor))
+		}
+		passed = append(passed, fmt.Sprintf("confidence %.0f%% >= %.4g over %d samples", *confidence*100, floor, confidenceSamples))
 	}
 
 	return AutoPromoteDecision{

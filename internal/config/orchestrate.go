@@ -421,7 +421,30 @@ type SkillOptPolicy struct {
 	// traffic + regression-window infrastructure does not exist yet, so when true it
 	// FAILS SAFE to notify-don't-promote. Documented as deferred.
 	AutoPromoteCanary bool
+
+	// AutoPromoteMinConfidence is the minimum Mode B bandit confidence
+	// P(challenger>champion) required to auto-promote (#473). nil (unset, the
+	// default) IGNORES the guardrail entirely — #471's behavior is byte-identical
+	// when this is absent. When SET, auto-promote additionally requires a non-nil
+	// confidence >= this floor; a nil or below-floor confidence FAILS SAFE to
+	// notify-only (the same nil-is-hard-no discipline as the other guardrails). It
+	// is the scalar the pairwise A/B bandit supplies at the runCandidateNotify seam.
+	AutoPromoteMinConfidence *float64
+
+	// BanditMinSamples is the per-agent low-traffic floor (#473 tiering): below
+	// this many bandit pulls the Mode B bandit still records preferences and
+	// updates the posterior, but the (deferred) auto A/B loop never runs and the
+	// confidence is never trusted to auto-promote. nil (unset, the default) means
+	// the deferred auto loop has no floor configured. The manual `skillopt ab` CLI
+	// is ALWAYS allowed regardless of this floor; it only governs the deferred
+	// automatic path. The promotion side reuses AutoPromoteMinSamples.
+	BanditMinSamples *int
 }
+
+// DefaultBanditMinSamples is the documented default low-traffic floor for the
+// deferred Mode B auto loop (#473). It is NOT applied when bandit_min_samples is
+// unset (nil stays nil, off); it is the value the config stub comments suggest.
+const DefaultBanditMinSamples = 30
 
 func DefaultSkillOptPolicy() SkillOptPolicy {
 	return SkillOptPolicy{
@@ -433,6 +456,8 @@ func DefaultSkillOptPolicy() SkillOptPolicy {
 		AutoPromoteRequireExternalCI:    false,
 		AutoPromoteRequireMeasuredJudge: false,
 		AutoPromoteCanary:               false,
+		AutoPromoteMinConfidence:        nil,
+		BanditMinSamples:                nil,
 	}
 }
 
@@ -521,6 +546,20 @@ func applySkillOptPolicyField(policy *SkillOptPolicy, key string, value string) 
 		parsed, err := strconv.ParseBool(value)
 		policy.AutoPromoteCanary = parsed
 		return err
+	case "auto_promote_min_confidence":
+		parsed, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return err
+		}
+		policy.AutoPromoteMinConfidence = &parsed
+		return nil
+	case "bandit_min_samples":
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		policy.BanditMinSamples = &parsed
+		return nil
 	default:
 		return nil
 	}

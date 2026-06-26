@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -12,6 +13,13 @@ import (
 	"github.com/jerryfane/gitmoot/internal/skillopt"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
+
+// banditConfidenceSeed pins the Monte Carlo rng used at the notify seam so the
+// confidence carried into a candidate.awaiting_promotion event is deterministic
+// for a given pair of posteriors (the same discipline the CLI A/B uses). The
+// estimate is stable to ~0.003 at DefaultProbDraws, well under any sensible
+// auto_promote_min_confidence floor.
+const banditConfidenceSeed int64 = 473
 
 // notifyAndMaybeAutoPromoteCandidate is the SINGLE shared post-import step (#471)
 // that BOTH CLI callers (runSkillOptImport for manual `skillopt import` and
@@ -83,7 +91,40 @@ func notifyAndMaybeAutoPromoteCandidate(ctx context.Context, store *db.Store, ho
 	// short-lived CLI command exits, or the candidate.* POST never lands.
 	sink := buildDaemonEventSink(store, home)
 	defer events.FlushSink(ctx, sink)
-	return runCandidateNotify(ctx, store, sink, policy, candidate, version, feedbackEvents, feedbackUnavailable)
+	confidence, confidenceSamples, confidenceSummary := resolveBanditConfidence(ctx, store, version)
+	return runCandidateNotify(ctx, store, sink, policy, candidate, version, feedbackEvents, feedbackUnavailable, confidence, confidenceSamples, confidenceSummary)
+}
+
+// resolveBanditConfidence looks up the #473 Mode B bandit confidence backing a
+// just-pending candidate: the challenger arm is the candidate version itself; the
+// champion arm is the template's current promoted version. When the challenger
+// has at least one recorded pull it computes P(challenger>champion) from the two
+// Beta posteriors and returns (confidence, challengerPulls, "NN% likely better
+// over K samples"). When there is no bandit evidence (no challenger arm, or no
+// store) it returns (nil, 0, "") so EvaluateAutoPromote ignores the confidence
+// guardrail and the awaiting detail is unchanged — byte-identical to #471 when
+// Mode B was never exercised. Missing rows degrade to the Beta(1,1) prior; any
+// read error degrades to "no confidence" (fail safe, never block the notify).
+func resolveBanditConfidence(ctx context.Context, store *db.Store, version db.AgentTemplateVersion) (*float64, int, string) {
+	if store == nil {
+		return nil, 0, ""
+	}
+	challengerArm, found, err := store.GetBanditArm(ctx, version.TemplateID, version.ID)
+	if err != nil || !found || challengerArm.Pulls == 0 {
+		// No A/B evidence for this candidate: Mode B contributes nothing, so the
+		// optional confidence guardrail stays a no-op.
+		return nil, 0, ""
+	}
+	champion := skillopt.BetaParams{Alpha: 1, Beta: 1}
+	if tmpl, terr := store.GetAgentTemplate(ctx, version.TemplateID); terr == nil && strings.TrimSpace(tmpl.VersionID) != "" {
+		if champArm, champFound, cerr := store.GetBanditArm(ctx, version.TemplateID, tmpl.VersionID); cerr == nil && champFound {
+			champion = skillopt.BetaParams{Alpha: champArm.Alpha, Beta: champArm.Beta}
+		}
+	}
+	challenger := skillopt.BetaParams{Alpha: challengerArm.Alpha, Beta: challengerArm.Beta}
+	prob := skillopt.ProbChallengerBeats(champion, challenger, rand.New(rand.NewSource(banditConfidenceSeed)), skillopt.DefaultProbDraws)
+	summary := skillopt.ConfidenceSummary(prob, challengerArm.Pulls)
+	return &prob, challengerArm.Pulls, summary
 }
 
 // runCandidateNotify is the testable core of the post-import notify+auto-promote
@@ -95,12 +136,14 @@ func notifyAndMaybeAutoPromoteCandidate(ctx context.Context, store *db.Store, ho
 // candidate.auto_promoted. Splitting it from the home/sink/feedback resolution lets
 // a recording sink assert the exactly-once emit and the no-double-emit invariant
 // deterministically.
-func runCandidateNotify(ctx context.Context, store *db.Store, sink events.Sink, policy config.SkillOptPolicy, candidate skillopt.CandidatePackage, version db.AgentTemplateVersion, feedbackEvents []db.FeedbackEvent, feedbackUnavailable bool) error {
-	decision := skillopt.EvaluateAutoPromote(policy, candidate, feedbackEvents, feedbackUnavailable)
+func runCandidateNotify(ctx context.Context, store *db.Store, sink events.Sink, policy config.SkillOptPolicy, candidate skillopt.CandidatePackage, version db.AgentTemplateVersion, feedbackEvents []db.FeedbackEvent, feedbackUnavailable bool, confidence *float64, confidenceSamples int, confidenceSummary string) error {
+	decision := skillopt.EvaluateAutoPromote(policy, candidate, feedbackEvents, feedbackUnavailable, confidence, confidenceSamples)
 
 	// (3) Always-on notify (when [events] is configured), independent of the
-	// promotion policy: emit candidate.awaiting_promotion exactly once.
-	awaitingDetail := candidateAwaitingDetail(version, candidate, len(feedbackEvents), decision)
+	// promotion policy: emit candidate.awaiting_promotion exactly once. When the
+	// candidate has a Mode B bandit arm (#473) its confidence string rides along in
+	// the detail so a reader sees "NN% likely better over K samples".
+	awaitingDetail := candidateAwaitingDetail(version, candidate, len(feedbackEvents), decision, confidenceSummary)
 	emitCandidateEvent(ctx, sink, events.EventCandidateAwaitingPromotion, version, "awaiting_promotion", awaitingDetail)
 
 	// (4) Auto-promote only on a guardrails pass; on a fail the awaiting_promotion
@@ -141,12 +184,15 @@ func emitCandidateEvent(ctx context.Context, sink events.Sink, eventType events.
 // candidate.awaiting_promotion event: the candidate's score (when present), the
 // eval_run sample count, and — on an auto_promote-on run — the guardrail decision
 // reason so a reader sees WHY it will or will not auto-promote.
-func candidateAwaitingDetail(version db.AgentTemplateVersion, candidate skillopt.CandidatePackage, samples int, decision skillopt.AutoPromoteDecision) string {
+func candidateAwaitingDetail(version db.AgentTemplateVersion, candidate skillopt.CandidatePackage, samples int, decision skillopt.AutoPromoteDecision, confidenceSummary string) string {
 	score := "n/a"
 	if candidate.Summary.Score != nil {
 		score = fmt.Sprintf("%.4g", *candidate.Summary.Score)
 	}
 	detail := fmt.Sprintf("candidate %s for template %s awaiting promotion (score %s, %d samples)", version.ID, version.TemplateID, score, samples)
+	if summary := strings.TrimSpace(confidenceSummary); summary != "" {
+		detail += "; " + summary
+	}
 	if reason := strings.TrimSpace(decision.Reason); reason != "" {
 		detail += "; " + reason
 	}

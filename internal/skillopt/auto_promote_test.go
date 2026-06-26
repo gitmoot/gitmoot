@@ -160,7 +160,7 @@ func TestEvaluateAutoPromote(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			decision := EvaluateAutoPromote(tc.policy, tc.candidate, tc.feedback, tc.feedbackUnavailable)
+			decision := EvaluateAutoPromote(tc.policy, tc.candidate, tc.feedback, tc.feedbackUnavailable, nil, 0)
 			if decision.Promote != tc.wantPromote {
 				t.Fatalf("Promote = %v, want %v (reason: %q)", decision.Promote, tc.wantPromote, decision.Reason)
 			}

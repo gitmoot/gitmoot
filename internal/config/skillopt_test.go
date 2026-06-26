@@ -126,6 +126,37 @@ func TestLoadSkillOptPolicyAutoPromoteDefaultsOff(t *testing.T) {
 	if policy.AutoPromoteRequireExternalCI || policy.AutoPromoteRequireMeasuredJudge || policy.AutoPromoteCanary {
 		t.Fatalf("auto_promote guardrail flags must default false, got %+v", policy)
 	}
+	// #473 Mode B additive keys default nil (off): byte-identical when unset.
+	if policy.AutoPromoteMinConfidence != nil || policy.BanditMinSamples != nil {
+		t.Fatalf("auto_promote_min_confidence and bandit_min_samples must default nil (unset), got %+v", policy)
+	}
+}
+
+// TestLoadSkillOptPolicyParsesModeBKeys proves the #473 auto_promote_min_confidence
+// and bandit_min_samples keys parse into their pointers, and an absent section
+// leaves them nil (the off-by-default contract).
+func TestLoadSkillOptPolicyParsesModeBKeys(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[skillopt]
+auto_promote_min_confidence = 0.95
+bandit_min_samples = 30
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	policy, err := LoadSkillOptPolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadSkillOptPolicy returned error: %v", err)
+	}
+	if policy.AutoPromoteMinConfidence == nil || *policy.AutoPromoteMinConfidence != 0.95 {
+		t.Fatalf("auto_promote_min_confidence = %v, want 0.95", policy.AutoPromoteMinConfidence)
+	}
+	if policy.BanditMinSamples == nil || *policy.BanditMinSamples != 30 {
+		t.Fatalf("bandit_min_samples = %v, want 30", policy.BanditMinSamples)
+	}
 }
 
 // TestLoadSkillOptPolicyParsesAutoPromote proves every new auto_promote_* key

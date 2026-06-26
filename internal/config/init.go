@@ -90,6 +90,16 @@ escalation_ttl = ""
 #     notify-only.
 #   auto_promote_canary: PARSED but DEFERRED (canary follow-on) — sampled traffic +
 #     auto-rollback do not exist yet, so when true it FAILS SAFE to notify-only.
+#   auto_promote_min_confidence (#473 Mode B): minimum bandit confidence
+#     P(challenger>champion) — supplied by the manual 'skillopt ab' champion-
+#     challenger A/B — required to auto-promote. UNSET ignores the guardrail
+#     entirely (byte-identical to #471). When SET, auto-promote additionally
+#     requires a non-nil confidence >= this floor; a nil/low confidence FAILS SAFE
+#     to notify-only.
+#   bandit_min_samples (#473 Mode B): per-agent low-traffic floor for the DEFERRED
+#     auto A/B loop. Below it the bandit still records preferences and updates its
+#     posterior but never auto-runs/auto-promotes off thin evidence. The manual
+#     'skillopt ab' CLI is always allowed regardless. (default 30)
 # [skillopt]
 # auto_trace_enabled = false
 # cross_family_review_enabled = false
@@ -99,6 +109,8 @@ escalation_ttl = ""
 # auto_promote_require_external_ci = false
 # auto_promote_require_measured_judge = false
 # auto_promote_canary = false
+# auto_promote_min_confidence = 0.95
+# bandit_min_samples = 30
 
 # [admission] is an OPT-IN, off-by-default host-global concurrency budget the
 # daemon applies BEFORE starting each agent session, on top of --workers/pool

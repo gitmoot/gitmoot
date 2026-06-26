@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -60,7 +61,7 @@ func TestRunCandidateNotifyEmitsAwaitingExactlyOnce(t *testing.T) {
 	store, version, candidate, _ := candidateNotifyFixture(t)
 	sink := &recordingSink{}
 
-	if err := runCandidateNotify(ctx, store, sink, config.DefaultSkillOptPolicy(), candidate, version, nil, false); err != nil {
+	if err := runCandidateNotify(ctx, store, sink, config.DefaultSkillOptPolicy(), candidate, version, nil, false, nil, 0, ""); err != nil {
 		t.Fatalf("runCandidateNotify returned error: %v", err)
 	}
 
@@ -96,7 +97,7 @@ func TestRunCandidateNotifyNilSinkIsNoOp(t *testing.T) {
 	ctx := context.Background()
 	store, version, candidate, _ := candidateNotifyFixture(t)
 
-	if err := runCandidateNotify(ctx, store, nil, config.DefaultSkillOptPolicy(), candidate, version, nil, false); err != nil {
+	if err := runCandidateNotify(ctx, store, nil, config.DefaultSkillOptPolicy(), candidate, version, nil, false, nil, 0, ""); err != nil {
 		t.Fatalf("runCandidateNotify with nil sink returned error: %v", err)
 	}
 	after, err := store.GetAgentTemplateVersionByID(ctx, version.ID)
@@ -209,6 +210,53 @@ func TestNotifyAndMaybeAutoPromoteFlushesPerInvocationSink(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("expected the delivered awaiting_promotion event")
+	}
+}
+
+// TestResolveBanditConfidenceNoArmIsNil proves the notify seam contributes
+// nothing when the candidate has no bandit arm: (nil, 0, "") so the optional
+// confidence guardrail stays a no-op and the awaiting detail is unchanged.
+func TestResolveBanditConfidenceNoArmIsNil(t *testing.T) {
+	ctx := context.Background()
+	store, version, _, _ := candidateNotifyFixture(t)
+	conf, samples, summary := resolveBanditConfidence(ctx, store, version)
+	if conf != nil || samples != 0 || summary != "" {
+		t.Fatalf("no-arm confidence = (%v, %d, %q), want (nil, 0, \"\")", conf, samples, summary)
+	}
+}
+
+// TestResolveBanditConfidenceComputesFromArms proves the seam computes a
+// confidence when the candidate (challenger) arm has pulls: a challenger far
+// ahead of the champion yields a high P(>) and a summary naming the challenger
+// pull count. The champion arm is keyed by the template's CURRENT version id,
+// which resolveBanditConfidence resolves via GetAgentTemplate.
+func TestResolveBanditConfidenceComputesFromArms(t *testing.T) {
+	ctx := context.Background()
+	store, version, _, _ := candidateNotifyFixture(t)
+
+	champ, err := store.GetAgentTemplate(ctx, version.TemplateID)
+	if err != nil {
+		t.Fatalf("GetAgentTemplate: %v", err)
+	}
+	if err := store.UpsertBanditArm(ctx, db.BanditArm{TemplateID: version.TemplateID, TemplateVersionID: champ.VersionID, Alpha: 2, Beta: 40, Pulls: 40}); err != nil {
+		t.Fatalf("seed champion arm: %v", err)
+	}
+	if err := store.UpsertBanditArm(ctx, db.BanditArm{TemplateID: version.TemplateID, TemplateVersionID: version.ID, Alpha: 40, Beta: 2, Pulls: 40}); err != nil {
+		t.Fatalf("seed challenger arm: %v", err)
+	}
+
+	conf, samples, summary := resolveBanditConfidence(ctx, store, version)
+	if conf == nil {
+		t.Fatal("expected a non-nil confidence when the challenger arm has pulls")
+	}
+	if *conf < 0.95 {
+		t.Fatalf("P(>) = %.4f, want > 0.95 for a dominant challenger", *conf)
+	}
+	if samples != 40 {
+		t.Fatalf("samples = %d, want 40 (challenger pulls)", samples)
+	}
+	if !strings.Contains(summary, "over 40 samples") {
+		t.Fatalf("summary = %q, want it to name 40 samples", summary)
 	}
 }
 

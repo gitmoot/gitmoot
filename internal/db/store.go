@@ -99,6 +99,23 @@ type AgentTemplateCandidateReview struct {
 	DecidedAt           string
 }
 
+// BanditArm is one persisted Beta-Bernoulli arm of the #473 Mode B
+// champion-challenger bandit, keyed by (TemplateID, TemplateVersionID). Alpha
+// and Beta are the Beta(1+wins, 1+losses) posterior under the uniform Beta(1,1)
+// prior (so a missing row is exactly NewArm()); Pulls is the total win+loss
+// count that drives the "over K samples" string and the low-traffic tiering
+// floor. The arm key is the version id (which already encodes the agent and
+// template), so champion and challenger are two distinct rows and promoting or
+// rejecting a version naturally retires its arm.
+type BanditArm struct {
+	TemplateID        string
+	TemplateVersionID string
+	Alpha             float64
+	Beta              float64
+	Pulls             int
+	UpdatedAt         string
+}
+
 // SkillOptJudgeOutcome records a single human promote/reject decision on a
 // SkillOpt candidate alongside the LLM judge's signal for the same candidate,
 // so judge calibration (agreement, Cohen's kappa, per-dimension drift) can be
@@ -4369,6 +4386,108 @@ func scanRankedFeedbackEvent(row interface{ Scan(dest ...any) error }) (RankedFe
 	return event, nil
 }
 
+// GetBanditArm reads the #473 Mode B bandit arm for a (templateID,
+// versionID) variant. A missing row is NOT an error: it returns ok=false with a
+// zero arm, and the caller treats that as the uniform Beta(1,1) prior
+// (skillopt.NewArm). This keeps the table off-by-default — no row exists until
+// the manual A/B records its first pick.
+func (s *Store) GetBanditArm(ctx context.Context, templateID, versionID string) (BanditArm, bool, error) {
+	templateID = strings.TrimSpace(templateID)
+	versionID = strings.TrimSpace(versionID)
+	if versionID == "" {
+		return BanditArm{}, false, errors.New("bandit arm version id is required")
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT template_id, template_version_id, alpha, beta, pulls, updated_at
+		FROM skillopt_bandit_arms WHERE template_id = ? AND template_version_id = ?`, templateID, versionID)
+	var arm BanditArm
+	if err := row.Scan(&arm.TemplateID, &arm.TemplateVersionID, &arm.Alpha, &arm.Beta, &arm.Pulls, &arm.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return BanditArm{}, false, nil
+		}
+		return BanditArm{}, false, err
+	}
+	return arm, true, nil
+}
+
+// UpsertBanditArm writes (or replaces) a bandit arm's full posterior. The alpha/
+// beta/pulls are the caller's authoritative counters; this never increments, it
+// stores exactly what it is given.
+func (s *Store) UpsertBanditArm(ctx context.Context, arm BanditArm) error {
+	arm.TemplateVersionID = strings.TrimSpace(arm.TemplateVersionID)
+	if arm.TemplateVersionID == "" {
+		return errors.New("bandit arm version id is required")
+	}
+	arm.TemplateID = strings.TrimSpace(arm.TemplateID)
+	if arm.Alpha <= 0 {
+		arm.Alpha = 1
+	}
+	if arm.Beta <= 0 {
+		arm.Beta = 1
+	}
+	if arm.Pulls < 0 {
+		arm.Pulls = 0
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO skillopt_bandit_arms(template_id, template_version_id, alpha, beta, pulls, updated_at)
+		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(template_id, template_version_id) DO UPDATE SET
+			alpha = excluded.alpha,
+			beta = excluded.beta,
+			pulls = excluded.pulls,
+			updated_at = CURRENT_TIMESTAMP`,
+		arm.TemplateID, arm.TemplateVersionID, arm.Alpha, arm.Beta, arm.Pulls)
+	return err
+}
+
+// IncrementBanditArm atomically applies ONE pairwise outcome to a (templateID,
+// versionID) arm in a single transaction: a win bumps alpha, a loss bumps beta,
+// and either way pulls increments. A first-ever pull seeds the row from the
+// Beta(1,1) prior. It returns the post-update arm so the caller can recompute
+// P(challenger>champion) immediately. The two arms of one A/B are incremented
+// with two calls (winner=+win, loser=+loss).
+func (s *Store) IncrementBanditArm(ctx context.Context, templateID, versionID string, win bool) (BanditArm, error) {
+	templateID = strings.TrimSpace(templateID)
+	versionID = strings.TrimSpace(versionID)
+	if versionID == "" {
+		return BanditArm{}, errors.New("bandit arm version id is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return BanditArm{}, err
+	}
+	defer tx.Rollback()
+
+	arm := BanditArm{TemplateID: templateID, TemplateVersionID: versionID, Alpha: 1, Beta: 1, Pulls: 0}
+	row := tx.QueryRowContext(ctx, `SELECT template_id, alpha, beta, pulls FROM skillopt_bandit_arms
+		WHERE template_id = ? AND template_version_id = ?`, templateID, versionID)
+	if err := row.Scan(&arm.TemplateID, &arm.Alpha, &arm.Beta, &arm.Pulls); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return BanditArm{}, err
+		}
+		// No row yet: keep the Beta(1,1) prior seeded above.
+		arm.TemplateID = templateID
+	}
+	if win {
+		arm.Alpha++
+	} else {
+		arm.Beta++
+	}
+	arm.Pulls++
+	if _, err := tx.ExecContext(ctx, `INSERT INTO skillopt_bandit_arms(template_id, template_version_id, alpha, beta, pulls, updated_at)
+		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(template_id, template_version_id) DO UPDATE SET
+			alpha = excluded.alpha,
+			beta = excluded.beta,
+			pulls = excluded.pulls,
+			updated_at = CURRENT_TIMESTAMP`,
+		arm.TemplateID, arm.TemplateVersionID, arm.Alpha, arm.Beta, arm.Pulls); err != nil {
+		return BanditArm{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return BanditArm{}, err
+	}
+	return arm, nil
+}
+
 func (s *Store) ListPairwisePreferences(ctx context.Context, runID string) ([]PairwisePreference, error) {
 	events, err := s.ListRankedFeedbackEvents(ctx, runID)
 	if err != nil {
@@ -6044,5 +6163,23 @@ ALTER TABLE jobs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN root_id TEXT NOT NULL DEFAULT '';
 
 CREATE INDEX idx_jobs_root_id ON jobs(root_id);
+	`,
+	// #473 Mode B: per-(template, version) Beta-Bernoulli bandit arm. alpha/beta
+	// are the Beta(1+wins, 1+losses) posterior under the uniform Beta(1,1) prior,
+	// so the row is the sufficient statistic and the posterior is reconstructable.
+	// pulls is wins+losses (the "over K samples" / tiering count). The table is
+	// dedicated so these MUTABLE counters never overload the immutable contract
+	// rows (ranked_feedback_events). Off-by-default: no rows exist unless the
+	// manual `skillopt ab` A/B runs.
+	`
+CREATE TABLE skillopt_bandit_arms (
+	template_id TEXT NOT NULL,
+	template_version_id TEXT NOT NULL,
+	alpha REAL NOT NULL DEFAULT 1,
+	beta REAL NOT NULL DEFAULT 1,
+	pulls INTEGER NOT NULL DEFAULT 0,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (template_id, template_version_id)
+);
 	`,
 }

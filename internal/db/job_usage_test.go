@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -123,11 +124,23 @@ INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'su
 `); err != nil {
 		t.Fatalf("seed old schema returned error: %v", err)
 	}
-	// Mark every migration before the token-column ALTER as already applied. The
-	// token-column ALTER is the second-to-last migration (the #420 root_id ALTER
-	// is last), so leave the final two versions unapplied: both run on Open, and
-	// the seeded table is missing both sets of columns so both ALTERs succeed.
-	tokenMigrationVersion := len(migrations) - 1
+	// Mark every migration before the token-column ALTER as already applied, then
+	// leave that ALTER (and everything after it) unapplied so they all run on Open.
+	// The seeded jobs table is missing the token columns AND root_id, so the
+	// token-column ALTER and the #420 root_id ALTER both succeed; any later
+	// migrations (e.g. #473's skillopt_bandit_arms) are independent and also run.
+	// We locate the token migration by CONTENT rather than position so appending
+	// new migrations never breaks this pin.
+	tokenMigrationVersion := -1
+	for i, m := range migrations {
+		if strings.Contains(m, "input_tokens") {
+			tokenMigrationVersion = i + 1 // migration versions are 1-indexed
+			break
+		}
+	}
+	if tokenMigrationVersion < 1 {
+		t.Fatalf("could not locate the input_tokens migration")
+	}
 	for v := 1; v < tokenMigrationVersion; v++ {
 		if _, err := raw.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, 'seed')`, v); err != nil {
 			t.Fatalf("seed schema_migrations v%d returned error: %v", v, err)

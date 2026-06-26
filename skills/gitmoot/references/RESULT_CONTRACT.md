@@ -565,5 +565,39 @@ returns and, on a guardrails pass, calls the existing promote machinery.
   `0`**. On a pass it promotes via the existing path and emits
   **`candidate.auto_promoted`** so a human can review or roll back even in full-auto.
 
+### Champion-challenger A/B preferences (Mode B, off by default)
+
+For **ask / research** agents there is no verifiable terminal outcome, so Mode A's
+harvester and the score/CI guardrails above cannot supply a promotion confidence.
+**Mode B** (#473, scoped from RFC #463) closes the loop via **pairwise
+preference**, and is **additive** (`contract_version` stays `1`) and **manual**:
+
+- `gitmoot skillopt ab <agent> "<prompt>" [--challenger <versionId>] [--pick a|b]
+  [--seed N] [--home path]` resolves the **champion** (the template's current
+  promoted version) and a **challenger** (a pending candidate version, or
+  `--challenger`), delivers **both** through the runtime adapter **serialized** (so
+  the two one-shot asks never overlap and runtime-session locks release cleanly),
+  presents them **label-shuffled** as Option A / Option B, and records the human
+  pick mapped back to the correct role. **No pending challenger ⇒ a clean no-op**
+  (`nothing to A/B …`), zero rows written.
+- A pick writes one **2-option `eval_run`** (`OptionsCount = 2`,
+  `metadata.feedback_source = preference_ab`, run id `skillopt-ab:<versionId>`),
+  **two `eval_review_options`** (`champion` / `challenger`, answers stored as
+  `eval_artifacts` via the blob path), and **one `RankedFeedbackEvent`**
+  (`ranking = [winner, loser]`, `reviewer = human`, `source = skillopt-ab`) that
+  passes `validateRankedFeedbackEventOptions`. The `source = skillopt-ab` tag keeps
+  Mode B rows separable from Mode A (`auto-trace`) and human gold.
+- Each `(template_id, version_id)` variant is a **Beta-Bernoulli arm** (`Beta(1,1)`
+  prior) persisted in `skillopt_bandit_arms`; a pick increments winner/loser, then
+  the confidence **`P(challenger > champion)`** is recomputed by deterministic (seeded)
+  Monte Carlo and surfaced as `NN% likely better over K samples`.
+- That confidence is the scalar **`[skillopt].auto_promote_min_confidence`** (nil
+  default = ignored, byte-identical to #471) consumes: at the candidate notify seam
+  it rides into `candidate.awaiting_promotion`'s detail and, when the floor is set,
+  auto-promote additionally requires `confidence >= floor` backed by at least
+  `auto_promote_min_samples` bandit pulls — a nil/low/thin confidence fails safe to
+  notify-only. **`bandit_min_samples`** (default 30) is the low-traffic floor for the
+  DEFERRED auto loop; the manual `skillopt ab` CLI is always allowed.
+
 See `docs/skillopt-exchange-contract.md` and `docs/events.md` for the full knob
 reference and event shapes.

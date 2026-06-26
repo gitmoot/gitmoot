@@ -295,6 +295,8 @@ auto_promote_min_score = 0.0              # UNSET, or a candidate with no score 
 auto_promote_require_external_ci = false  # require >= 1 real-external-CI feedback event in the eval_run
 auto_promote_require_measured_judge = false  # PARSED but DEFERRED (#344): true => fail safe to no-promote
 auto_promote_canary = false               # PARSED but DEFERRED (canary follow-on): true => fail safe to no-promote
+auto_promote_min_confidence = 0.95        # #473 Mode B: UNSET = ignore; SET = require bandit P(>) >= floor (+ enough samples)
+bandit_min_samples = 30                   # #473 Mode B low-traffic floor for the DEFERRED auto loop (manual `skillopt ab` always allowed)
 ```
 
 The guardrails read the candidate's **harvester auto-trace run**
@@ -326,6 +328,65 @@ auto-trace evidence fails safe to notify-only).
   the sampled-traffic canary + auto-rollback do not exist, so setting either to
   `true` **forces notify-only** today. They are documented so a user can write the
   knob forward-compatibly.
+- `auto_promote_min_confidence` (#473 Mode B) is **additive and optional**. **Unset
+  ignores it entirely** — the auto-promote decision is byte-identical to the
+  guardrails above. When **set**, auto-promote additionally requires a non-nil
+  bandit confidence `P(challenger > champion) >=` this floor, backed by at least
+  `auto_promote_min_samples` bandit pulls (a Beta posterior on a couple of pulls
+  can read 0.9 by luck — the sample floor refuses thin evidence). A nil, low, or
+  thin confidence **fails safe to notify-only**. The confidence is supplied by the
+  manual `skillopt ab` A/B (below); promotion is still the existing
+  `PromoteAgentTemplateVersion` path, never a bypass.
+
+## Champion-challenger A/B preferences (Mode B, off by default)
+
+For **ask / research** agents there is no verifiable terminal outcome (no PR / CI
+/ merge), so Mode A's single-artifact harvester and the score/CI guardrails above
+cannot supply a promotion confidence. **Mode B** (issue #473, scoped from RFC
+#463) closes the loop via **pairwise preference**: A/B a query across two template
+variants and feed the human's pick to the optimizer as a contract
+`RankedFeedbackEvent`.
+
+```sh
+gitmoot skillopt ab <agent> "<prompt>" [--challenger <versionId>] [--pick a|b] [--seed N] [--home path]
+```
+
+- **Champion** = the agent template's **current promoted** version; **challenger**
+  = a **pending** candidate version (the sole pending one, or `--challenger`). With
+  **no pending challenger** the command is a clean no-op (`nothing to A/B …`) — no
+  rows are written.
+- It delivers **both** variants through the runtime adapter (serialized, so the two
+  one-shot asks never overlap and runtime-session locks release cleanly), presents
+  the two answers **label-shuffled** as Option A / Option B, and records the human
+  pick. The shuffle mapping is recorded so the stored event maps the pick back to
+  the **correct** champion/challenger label.
+- Each pick writes exactly **one 2-option `eval_run`** (`OptionsCount = 2`,
+  `metadata.feedback_source = preference_ab`, run id `skillopt-ab:<versionId>`),
+  **two `eval_review_options`** (`champion` / `challenger`) whose answer text is
+  stored as `eval_artifacts` via the existing blob path, and **one
+  `RankedFeedbackEvent`** (`ranking = [winner, loser]`, `reviewer = human`,
+  `source = skillopt-ab`) that passes `validateRankedFeedbackEventOptions`. The
+  distinct `source` tag and run-id prefix keep Mode B rows trivially separable from
+  Mode A (`auto-trace`) and human gold. **No contract struct changes —
+  `ContractVersion` stays `1`.**
+
+**The bandit.** Each `(template_id, version_id)` variant is one **Beta-Bernoulli
+arm** (uniform `Beta(1,1)` prior; a win bumps `alpha`, a loss bumps `beta`),
+persisted in the dedicated `skillopt_bandit_arms` table as the sufficient
+statistic. A pick increments the winner (`+win`) and loser (`+loss`), then the
+confidence `P(challenger > champion)` is recomputed by Monte Carlo (deterministic
+given an injected seed) and printed as `NN% likely better over K samples`. That
+scalar is exactly what `auto_promote_min_confidence` consumes: at the candidate
+notify seam the candidate's challenger arm + the champion arm produce the
+confidence carried into `candidate.awaiting_promotion`'s detail and into the
+auto-promote guardrails.
+
+**Tiering.** Below `bandit_min_samples` (default 30) the bandit still records
+preferences and updates the posterior but the **deferred** auto A/B loop never
+runs and the confidence is never trusted to auto-promote (the promotion-side floor
+reuses `auto_promote_min_samples`). The **manual** `skillopt ab` CLI is always
+allowed. Live-traffic interception, the cross-family LLM-judge auto-pairwise,
+canary, and the auto A/B scheduling loop are **deferred** to follow-ons.
 
 ## Ranked Exploration Workflow
 

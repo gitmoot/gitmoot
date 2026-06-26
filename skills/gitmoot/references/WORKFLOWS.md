@@ -431,6 +431,34 @@ the configurable `[skillopt].auto_promote` policy (#463) when that lands — it 
 not barred from promotion. See
 `skills/gitmoot/references/RESULT_CONTRACT.md` for the full contract.
 
+## Champion-Challenger A/B (Mode B, off by default)
+
+For **ask / research** agents — which have no verifiable PR/CI/merge outcome —
+use the manual champion-challenger A/B to capture a **pairwise preference**
+(#473):
+
+```sh
+gitmoot skillopt ab planner-bot "Plan the data migration." --seed 42
+```
+
+It resolves the **champion** (the agent template's current promoted version) and
+a **challenger** (the sole pending candidate, or `--challenger <versionId>`),
+delivers **both** through the runtime adapter **serialized**, shows the two
+answers **label-shuffled** as Option A / Option B, and records the human pick
+(`--pick a|b`, or interactively). With **no pending challenger** it is a clean
+no-op. The pick writes one 2-option `eval_run` + two `eval_review_options`
+(`champion`/`challenger`) + one `RankedFeedbackEvent` (`source = skillopt-ab`,
+`contract_version` stays `1`), updates the per-variant **Beta-Bernoulli bandit**
+(`skillopt_bandit_arms`), and prints `P(challenger > champion)` as
+`NN% likely better over K samples`.
+
+That confidence feeds the **`[skillopt].auto_promote_min_confidence`** guardrail
+(nil default = ignored; set = require `confidence >= floor` over enough samples,
+else fail safe to notify-only) — supplying the promotion confidence Mode A could
+not provide for ask agents. `bandit_min_samples` (default 30) gates only the
+**deferred** auto loop; the manual A/B is always allowed. Live interception, the
+cross-family LLM-judge auto-pairwise, canary, and the auto A/B loop are deferred.
+
 ## Execution Model
 
 Use `here` when the current chat should answer directly from the Gitmoot skill.
