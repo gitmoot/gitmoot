@@ -3968,6 +3968,15 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 		// byte-identical. The sink is a process-global shared singleton (one drain
 		// goroutine), so re-building the engine per tick never leaks goroutines.
 		EventSink: daemonEventSink(store, home),
+		// Off-by-default Mode-A trace-harvester (#465): on a verifiable implement-job
+		// outcome (merge merged/blocked, review changes_requested, revert) the engine
+		// harvests a synthetic {score, feedback} FeedbackEvent for the job's template
+		// version through this best-effort, nil-safe seam. daemonOutcomeHarvester
+		// returns nil unless [skillopt].auto_trace_enabled is set, so with no config
+		// NO harvester is constructed and behavior — and every human-run
+		// TrainingPackage — is byte-identical. The harvester writes ONLY
+		// eval/feedback rows; promotion stays 100% manual.
+		OutcomeHarvester: daemonOutcomeHarvester(store, gh, home),
 		PayloadRefresher: func(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
 			return refreshDaemonJobPayload(ctx, store, checkout, job, payload)
 		},

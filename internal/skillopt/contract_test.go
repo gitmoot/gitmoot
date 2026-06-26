@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1676,5 +1677,133 @@ func TestProjectSignalDoesNotChangeWirePackages(t *testing.T) {
 	}
 	if string(reMarshaled) != wantCandidate {
 		t.Fatalf("ProjectSignal mutated the candidate package")
+	}
+}
+
+// TestHumanRunFeedbackContextByteIdentical pins the exact feedback_context bytes
+// of a human-ranked run's exported TrainingPackage (#465 acceptance: the Mode-A
+// auto-trace feedback_source override must NEVER leak into a human run). A human
+// run's eval_run metadata never carries the feedback_source key, so runFeedbackSource
+// falls back to imported_human_review and the bytes are unchanged from before the
+// harvester existed. The companion auto-trace assertion lives in
+// TestExportAutoTraceRunFeedbackSource.
+func TestHumanRunFeedbackContextByteIdentical(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.UpsertAgentTemplate(ctx, testTemplate("planner", "Plan carefully.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	installed, err := store.GetAgentTemplate(ctx, "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	// A human run carries NO feedback_source in metadata_json.
+	if err := store.UpsertEvalRun(ctx, db.EvalRun{
+		ID:                "human-run-1",
+		TemplateID:        "planner",
+		TemplateVersionID: installed.VersionID,
+		TargetRepo:        "owner/repo",
+		State:             "ready",
+	}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+	if err := store.UpsertEvalReviewItem(ctx, db.EvalReviewItem{
+		RunID:  "human-run-1",
+		ItemID: "item-001",
+		Title:  "README",
+	}); err != nil {
+		t.Fatalf("UpsertEvalReviewItem returned error: %v", err)
+	}
+	if err := store.UpsertFeedbackEvent(ctx, db.FeedbackEvent{
+		RunID:     "human-run-1",
+		ItemID:    "item-001",
+		Choice:    "b",
+		Reasoning: "More specific.",
+		Reviewer:  "jerry",
+		Source:    "markdown",
+		SourceURL: "https://github.com/owner/repo/pull/1",
+		CreatedAt: "2026-05-31T10:00:00Z",
+	}); err != nil {
+		t.Fatalf("UpsertFeedbackEvent returned error: %v", err)
+	}
+	pkg, err := ExportTrainingPackage(ctx, store, "human-run-1")
+	if err != nil {
+		t.Fatalf("ExportTrainingPackage returned error: %v", err)
+	}
+	// Pinned bytes: the historical human feedback_context, unchanged.
+	want := fmt.Sprintf(
+		`{"feedback_source":"imported_human_review","feedback_target":"baseline_review_outputs","review_issue":"owner/repo#1","review_run_id":"human-run-1","reviewed_skill_version":%q,"target_repo":"owner/repo"}`,
+		installed.VersionID,
+	)
+	if string(pkg.FeedbackContext) != want {
+		t.Fatalf("human feedback_context bytes changed:\n got %s\nwant %s", pkg.FeedbackContext, want)
+	}
+	if strings.Contains(string(pkg.FeedbackContext), FeedbackSourceAutomaticTrace) {
+		t.Fatalf("auto-trace feedback_source leaked into a human run: %s", pkg.FeedbackContext)
+	}
+}
+
+// TestExportAutoTraceRunFeedbackSource asserts the companion: an eval_run whose
+// metadata_json carries feedback_source=automatic_trace exports with that
+// run-level feedback_source (and no spurious evaluator_config), without any
+// contract field or ContractVersion change (#465).
+func TestExportAutoTraceRunFeedbackSource(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.UpsertAgentTemplate(ctx, testTemplate("planner", "Plan carefully.")); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	installed, err := store.GetAgentTemplate(ctx, "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate returned error: %v", err)
+	}
+	if err := store.UpsertEvalRun(ctx, db.EvalRun{
+		ID:                "auto-trace:" + installed.VersionID,
+		TemplateID:        "planner",
+		TemplateVersionID: installed.VersionID,
+		TargetRepo:        "owner/repo",
+		State:             "ready",
+		Mode:              db.EvalRunModeValidate,
+		MetadataJSON:      `{"feedback_source":"automatic_trace","mode":"validate"}`,
+	}); err != nil {
+		t.Fatalf("UpsertEvalRun returned error: %v", err)
+	}
+	if err := store.UpsertEvalReviewItem(ctx, db.EvalReviewItem{
+		RunID:  "auto-trace:" + installed.VersionID,
+		ItemID: "owner/repo#7",
+	}); err != nil {
+		t.Fatalf("UpsertEvalReviewItem returned error: %v", err)
+	}
+	if err := store.UpsertFeedbackEvent(ctx, db.FeedbackEvent{
+		RunID:     "auto-trace:" + installed.VersionID,
+		ItemID:    "owner/repo#7",
+		Choice:    "a",
+		Reviewer:  "gitmoot-auto",
+		Source:    "auto-trace",
+		SourceURL: "https://github.com/owner/repo/pull/7",
+	}); err != nil {
+		t.Fatalf("UpsertFeedbackEvent returned error: %v", err)
+	}
+	pkg, err := ExportTrainingPackage(ctx, store, "auto-trace:"+installed.VersionID)
+	if err != nil {
+		t.Fatalf("ExportTrainingPackage returned error: %v", err)
+	}
+	var fc map[string]any
+	if err := json.Unmarshal(pkg.FeedbackContext, &fc); err != nil {
+		t.Fatalf("feedback context did not unmarshal: %v", err)
+	}
+	if fc["feedback_source"] != FeedbackSourceAutomaticTrace {
+		t.Fatalf("auto-trace feedback_source = %v, want %q", fc["feedback_source"], FeedbackSourceAutomaticTrace)
+	}
+	if len(pkg.EvaluatorConfig) != 0 {
+		t.Fatalf("auto-trace run leaked evaluator_config = %s", string(pkg.EvaluatorConfig))
 	}
 }

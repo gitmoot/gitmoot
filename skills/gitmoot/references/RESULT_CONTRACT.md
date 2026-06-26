@@ -468,3 +468,19 @@ table is intentionally **not** implemented yet; the budget is in raw tokens.
   external services, or required human decisions.
 - Use `delegations` when another named Gitmoot agent should be invoked.
 - Redact secrets from summaries, findings, raw command output, and examples.
+
+## Automatic trace-harvested feedback (Mode A, off by default)
+
+When `[skillopt].auto_trace_enabled = true` (default `false`), gitmoot derives
+template-learning feedback from the **verifiable outcomes** an implement job
+reaches — merged with passing CI vs. blocked at the merge gate, review
+`changes_requested`, or a later revert — and writes a synthetic
+`FeedbackEvent` (`source = auto-trace`, `reviewer = gitmoot-auto`, A/B `choice`,
+`feedback_source = automatic_trace`) into a dedicated per-template-version
+`auto-trace:<version>` eval run. This is **additive** (`contract_version` stays
+`1`, no new result field), **best-effort** (a harvest error never blocks or fails
+a job; it records an `auto_trace_harvest_failed` job event), and **never
+promotes** — a human still promotes a candidate. With the knob unset, no
+harvester runs and behavior is byte-identical. See
+`docs/skillopt-exchange-contract.md` for the outcome→score mapping, the no-CI
+guard, and the corrective-on-revert overwrite.
