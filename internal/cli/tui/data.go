@@ -17,22 +17,23 @@ import (
 // dashboardSnapshot. Prompts carries the full interactive-prompt records (not
 // just id/question) so the Attention page can answer them inline.
 type Snapshot struct {
-	Home           string
-	DatabaseExists bool
-	Daemon         Daemon
-	Repos          []Repo
-	Agents         []Agent
-	Sessions       []Session
-	Jobs           Jobs
-	Worktrees      []Worktree
-	BranchLocks    []BranchLock
-	Trains         []TrainSession
-	ResourceLocks  []ResourceLock
-	Prompts        []db.InteractivePrompt
-	JobRows        []JobRow
-	AwaitingHuman  []AwaitingHumanTask
-	Activity       []ActivityRoot
-	Config         ConfigView
+	Home              string
+	DatabaseExists    bool
+	Daemon            Daemon
+	Repos             []Repo
+	Agents            []Agent
+	Sessions          []Session
+	Jobs              Jobs
+	Worktrees         []Worktree
+	BranchLocks       []BranchLock
+	Trains            []TrainSession
+	ResourceLocks     []ResourceLock
+	Prompts           []db.InteractivePrompt
+	JobRows           []JobRow
+	AwaitingHuman     []AwaitingHumanTask
+	PendingCandidates []PendingCandidate
+	Activity          []ActivityRoot
+	Config            ConfigView
 }
 
 // AwaitingHumanTask is one delegation tree paused at awaiting_human (#340), shown
@@ -41,6 +42,16 @@ type AwaitingHumanTask struct {
 	TaskID string
 	Repo   string
 	Title  string
+}
+
+// PendingCandidate is one SkillOpt template candidate awaiting a promote/reject
+// decision (#471), shown on the Attention page next to AwaitingHumanTask so a
+// candidate is locally visible even when [events] is off. VersionID is the pending
+// agent_template_version id; Score is the review row's score (empty when absent).
+type PendingCandidate struct {
+	VersionID  string
+	TemplateID string
+	Score      string
 }
 
 // ActivityRoot is one live delegation tree on the Activity page: a root

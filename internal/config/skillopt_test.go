@@ -112,6 +112,77 @@ cross_family_review_enabled = true
 	}
 }
 
+// TestLoadSkillOptPolicyAutoPromoteDefaultsOff proves auto_promote and its
+// thresholds default OFF/unset (#471): the manual flow, byte-identical. An unset
+// threshold is nil (a hard do-not-promote), never 0.
+func TestLoadSkillOptPolicyAutoPromoteDefaultsOff(t *testing.T) {
+	policy := DefaultSkillOptPolicy()
+	if policy.AutoPromote {
+		t.Fatalf("auto_promote must default false, got %+v", policy)
+	}
+	if policy.AutoPromoteMinSamples != nil || policy.AutoPromoteMinScore != nil {
+		t.Fatalf("auto_promote thresholds must default nil (unset), got %+v", policy)
+	}
+	if policy.AutoPromoteRequireExternalCI || policy.AutoPromoteRequireMeasuredJudge || policy.AutoPromoteCanary {
+		t.Fatalf("auto_promote guardrail flags must default false, got %+v", policy)
+	}
+}
+
+// TestLoadSkillOptPolicyParsesAutoPromote proves every new auto_promote_* key
+// parses into the policy (including the deferred-but-parsed knobs).
+func TestLoadSkillOptPolicyParsesAutoPromote(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[skillopt]
+auto_promote = true
+auto_promote_min_samples = 5
+auto_promote_min_score = 0.9
+auto_promote_require_external_ci = true
+auto_promote_require_measured_judge = true
+auto_promote_canary = true
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	policy, err := LoadSkillOptPolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadSkillOptPolicy returned error: %v", err)
+	}
+	if !policy.AutoPromote {
+		t.Fatal("auto_promote = true should parse")
+	}
+	if policy.AutoPromoteMinSamples == nil || *policy.AutoPromoteMinSamples != 5 {
+		t.Fatalf("auto_promote_min_samples = %v, want 5", policy.AutoPromoteMinSamples)
+	}
+	if policy.AutoPromoteMinScore == nil || *policy.AutoPromoteMinScore != 0.9 {
+		t.Fatalf("auto_promote_min_score = %v, want 0.9", policy.AutoPromoteMinScore)
+	}
+	if !policy.AutoPromoteRequireExternalCI || !policy.AutoPromoteRequireMeasuredJudge || !policy.AutoPromoteCanary {
+		t.Fatalf("deferred/external-ci guardrail flags should parse, got %+v", policy)
+	}
+}
+
+// TestLoadSkillOptPolicyRejectsBadAutoPromoteThreshold proves a garbled numeric
+// threshold surfaces a parse error (fail-safe: the policy is not silently kept).
+func TestLoadSkillOptPolicyRejectsBadAutoPromoteThreshold(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[skillopt]
+auto_promote = true
+auto_promote_min_samples = lots
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	if _, err := LoadSkillOptPolicy(paths); err == nil {
+		t.Fatal("expected an error for a non-integer auto_promote_min_samples")
+	}
+}
+
 // TestLoadSkillOptPolicyIgnoresOtherSections proves a config that only sets
 // [events]/[orchestrate] leaves the trace-harvester at its disabled default.
 func TestLoadSkillOptPolicyIgnoresOtherSections(t *testing.T) {

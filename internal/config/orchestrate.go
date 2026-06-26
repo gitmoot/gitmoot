@@ -389,12 +389,50 @@ type SkillOptPolicy struct {
 	// run); ReviewEnabled() encodes that dependency. A live cross-family LLM review
 	// per merge is a real cost surface, so it must be opt-in.
 	CrossFamilyReviewEnabled bool
+
+	// AutoPromote opts into the off-by-default auto-promote policy (#471): when
+	// false (the default) a newly-pending candidate is ONLY notified
+	// (candidate.awaiting_promotion) and NEVER auto-promoted — promotion stays
+	// 100% manual, byte-identical to today. When true, a candidate is auto-promoted
+	// (the existing PromoteAgentTemplateVersion + a candidate.auto_promoted event)
+	// ONLY when every configured guardrail below holds; ANY uncertainty fails safe
+	// to notify-don't-promote.
+	AutoPromote bool
+
+	// AutoPromoteMinSamples is the minimum count of feedback_events in the
+	// candidate's eval_run required to auto-promote. nil (unset) is a HARD
+	// "do not promote" — flipping AutoPromote on without a threshold never promotes.
+	AutoPromoteMinSamples *int
+	// AutoPromoteMinScore is the minimum candidate Summary.Score required to
+	// auto-promote. nil (unset) is a HARD "do not promote"; a nil candidate score
+	// also fails safe.
+	AutoPromoteMinScore *float64
+	// AutoPromoteRequireExternalCI requires at least one feedback event in the
+	// candidate's eval_run to be a real-CI positive (a merge that passed genuine
+	// external CI, not the no-CI near-neutral band). When true and no such event is
+	// present, the candidate is not promoted.
+	AutoPromoteRequireExternalCI bool
+
+	// AutoPromoteRequireMeasuredJudge is PARSED but DEFERRED (#471 / gated on #344):
+	// there is no judge<->human calibration source yet, so when true it FAILS SAFE
+	// to notify-don't-promote. Documented so a user can set it forward-compatibly.
+	AutoPromoteRequireMeasuredJudge bool
+	// AutoPromoteCanary is PARSED but DEFERRED (#471 canary follow-on): the sampled
+	// traffic + regression-window infrastructure does not exist yet, so when true it
+	// FAILS SAFE to notify-don't-promote. Documented as deferred.
+	AutoPromoteCanary bool
 }
 
 func DefaultSkillOptPolicy() SkillOptPolicy {
 	return SkillOptPolicy{
-		AutoTraceEnabled:         false,
-		CrossFamilyReviewEnabled: false,
+		AutoTraceEnabled:                false,
+		CrossFamilyReviewEnabled:        false,
+		AutoPromote:                     false,
+		AutoPromoteMinSamples:           nil,
+		AutoPromoteMinScore:             nil,
+		AutoPromoteRequireExternalCI:    false,
+		AutoPromoteRequireMeasuredJudge: false,
+		AutoPromoteCanary:               false,
 	}
 }
 
@@ -452,6 +490,36 @@ func applySkillOptPolicyField(policy *SkillOptPolicy, key string, value string) 
 	case "cross_family_review_enabled":
 		parsed, err := strconv.ParseBool(value)
 		policy.CrossFamilyReviewEnabled = parsed
+		return err
+	case "auto_promote":
+		parsed, err := strconv.ParseBool(value)
+		policy.AutoPromote = parsed
+		return err
+	case "auto_promote_min_samples":
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		policy.AutoPromoteMinSamples = &parsed
+		return nil
+	case "auto_promote_min_score":
+		parsed, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return err
+		}
+		policy.AutoPromoteMinScore = &parsed
+		return nil
+	case "auto_promote_require_external_ci":
+		parsed, err := strconv.ParseBool(value)
+		policy.AutoPromoteRequireExternalCI = parsed
+		return err
+	case "auto_promote_require_measured_judge":
+		parsed, err := strconv.ParseBool(value)
+		policy.AutoPromoteRequireMeasuredJudge = parsed
+		return err
+	case "auto_promote_canary":
+		parsed, err := strconv.ParseBool(value)
+		policy.AutoPromoteCanary = parsed
 		return err
 	default:
 		return nil

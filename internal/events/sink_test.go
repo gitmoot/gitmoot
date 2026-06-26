@@ -52,14 +52,16 @@ func TestNewEventContractShape(t *testing.T) {
 
 func TestEventTypeEnumValues(t *testing.T) {
 	cases := map[EventType]string{
-		EventJobFinished:           "job.finished",
-		EventJobFailed:             "job.failed",
-		EventJobBlocked:            "job.blocked",
-		EventJobNeedsAttention:     "job.needs_attention",
-		EventJobStarted:            "job.started",
-		EventDelegationEscalation:  "delegation.escalation",
-		EventDelegationFinalized:   "delegation.finalized",
-		EventOrchestrationFinished: "orchestration.finished",
+		EventJobFinished:                "job.finished",
+		EventJobFailed:                  "job.failed",
+		EventJobBlocked:                 "job.blocked",
+		EventJobNeedsAttention:          "job.needs_attention",
+		EventCandidateAwaitingPromotion: "candidate.awaiting_promotion",
+		EventCandidateAutoPromoted:      "candidate.auto_promoted",
+		EventJobStarted:                 "job.started",
+		EventDelegationEscalation:       "delegation.escalation",
+		EventDelegationFinalized:        "delegation.finalized",
+		EventOrchestrationFinished:      "orchestration.finished",
 	}
 	for typ, want := range cases {
 		if string(typ) != want {
@@ -147,6 +149,29 @@ func TestNewEventRepoIsOwnerRepoOnly(t *testing.T) {
 		if ev.Repo != want {
 			t.Fatalf("ownerRepoOnly(%q) -> %q, want %q", in, ev.Repo, want)
 		}
+	}
+}
+
+// TestNewEventCandidateDetailRedactedAndScrubbed proves a candidate.* event's
+// Detail is redacted (secret) and path-scrubbed (no absolute path) like every
+// other emit site, and SchemaVersion stays 1 for the additive enum values (#471).
+func TestNewEventCandidateDetailRedactedAndScrubbed(t *testing.T) {
+	redact := func(s string) string {
+		return strings.ReplaceAll(s, "ghp_secretsecretsecret", "[REDACTED]")
+	}
+	detail := "candidate agent-template:foo:v7 promoted from /root/.gitmoot/evals/run; token ghp_secretsecretsecret"
+	ev := NewEvent(EventCandidateAutoPromoted, "agent-template:foo:v7", "agent-template:foo", "", "auto_promoted", detail, time.Now(), redact)
+	if ev.SchemaVersion != 1 {
+		t.Fatalf("SchemaVersion = %d, want 1 (additive enum, no bump)", ev.SchemaVersion)
+	}
+	if strings.Contains(ev.Detail, "ghp_secretsecretsecret") {
+		t.Fatalf("candidate detail not redacted: %q", ev.Detail)
+	}
+	if strings.Contains(ev.Detail, "/root/.gitmoot/evals/run") {
+		t.Fatalf("candidate detail absolute path not scrubbed: %q", ev.Detail)
+	}
+	if ev.JobID != "agent-template:foo:v7" || ev.RootID != "agent-template:foo" {
+		t.Fatalf("candidate event ids = %q/%q, want version/template id", ev.JobID, ev.RootID)
 	}
 }
 

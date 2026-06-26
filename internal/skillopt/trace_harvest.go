@@ -22,23 +22,47 @@ import (
 // never rewards "merges that pass no real CI" (#465, #463 guardrail).
 const gitmootNoCIContext = "gitmoot/ci"
 
-// autoTraceSource is the FeedbackEvent.source tag every synthetic auto-trace row
-// carries (#465). Combined with autoTraceReviewer it makes auto feedback
+// AutoTraceSource is the FeedbackEvent.source tag every synthetic auto-trace row
+// carries (#465). Combined with AutoTraceReviewer it makes auto feedback
 // identifiable per-event even within a mixed package, and the UNIQUE
 // (run_id,item_id,reviewer,source,source_url) key it participates in is what lets
-// a later revert overwrite the prior positive in place.
-const autoTraceSource = "auto-trace"
+// a later revert overwrite the prior positive in place. Exported because the #471
+// auto-promote external-CI guardrail (FeedbackEventIsRealExternalCIPositive) keys
+// off this provenance, so any caller constructing/recognizing a real-CI event must
+// match it.
+const AutoTraceSource = "auto-trace"
 
-// autoTraceReviewer is the FeedbackEvent.reviewer attributed to every synthetic
+// autoTraceSource is the internal alias kept so the dense in-package call sites
+// stay terse; it is the same value as the exported AutoTraceSource.
+const autoTraceSource = AutoTraceSource
+
+// AutoTraceReviewer is the FeedbackEvent.reviewer attributed to every synthetic
 // auto-trace row (#465): a sentinel non-human reviewer so auto feedback is never
-// mistaken for a human ranking.
-const autoTraceReviewer = "gitmoot-auto"
+// mistaken for a human ranking. Exported alongside AutoTraceSource so the real-CI
+// provenance the #471 guardrail requires is a shared, forge-proof contract.
+const AutoTraceReviewer = "gitmoot-auto"
+
+// autoTraceReviewer is the internal alias for AutoTraceReviewer.
+const autoTraceReviewer = AutoTraceReviewer
 
 // autoTraceRunIDPrefix namespaces the dedicated per-template-version auto-trace
 // eval_run id ("auto-trace:"+versionID) so human-gold runs stay entirely
 // untouched and the export/optimizer can filter or down-weight the auto namespace
 // independently (#465).
 const autoTraceRunIDPrefix = "auto-trace:"
+
+// AutoTraceRunID is the dedicated harvester eval_run id for a template version
+// ("auto-trace:"+versionID). It is the single source of truth for the namespacing
+// so callers outside this package (the #471 auto-promote external-CI guardrail,
+// which must read the HARVESTER's run rather than the human/markdown review run)
+// build the same id the harvester writes. Returns "" for an empty version id.
+func AutoTraceRunID(versionID string) string {
+	versionID = strings.TrimSpace(versionID)
+	if versionID == "" {
+		return ""
+	}
+	return autoTraceRunIDPrefix + versionID
+}
 
 // Score bands for the verifiable-outcome → {score, feedback} projection (#465).
 // These feed a synthetic EvaluatorScore that ProjectSignal fuses into one
@@ -57,6 +81,44 @@ const (
 	scoreChangesRequestedBase = 0.6
 	scoreChangesRequestedStep = 0.2
 )
+
+// realExternalCIPhrase is the canonical marker phrase the harvester writes into a
+// real-CI positive feedback event's Reasoning (the scoreMergedRealCI band: a
+// merge that passed a genuine non-gitmoot/ external CI). It is the SINGLE source
+// of truth shared between the harvester (which writes it) and
+// FeedbackEventIsRealExternalCIPositive (which the #471 auto-promote external-CI
+// guardrail reads), so the guardrail never re-hardcodes the 0.5 near-neutral band
+// or its own copy of the phrase — if the band/phrasing changes, both move together.
+const realExternalCIPhrase = "passing external CI"
+
+// FeedbackEventIsRealExternalCIPositive reports whether a harvested auto-trace
+// feedback event records a merge that passed GENUINE external CI (the
+// scoreMergedRealCI band), as opposed to a near-neutral empty-gate merge
+// (scoreMergedNoCI / "no external CI") or any negative. The #471 auto-promote
+// external-CI guardrail uses it to require at least one real-CI positive in the
+// candidate's eval_run; it mirrors the harvester's own vocabulary via the shared
+// realExternalCIPhrase rather than re-deriving the 0.5 band, so the two cannot
+// drift.
+//
+// PROVENANCE (#471 review): the real-CI marker is written ONLY by the harvester's
+// project path (this file), attributed to the autoTraceReviewer/autoTraceSource
+// sentinels. We therefore require BOTH the structured provenance (reviewer AND
+// source) AND the marker phrase, so a SIBLING auto-trace row that shares the
+// run — notably the cross-family review (cross_family_review.go), which writes
+// Choice=="a" with FREE-TEXT human-derived findings under the DISTINCT
+// gitmoot-review reviewer — can never spoof the gate by coincidentally mentioning
+// "passing external CI" in its prose. A choice of "a" (the positive
+// baseline-champion choice) from the harvester whose Reasoning carries the real-CI
+// marker is the only thing that counts.
+func FeedbackEventIsRealExternalCIPositive(event db.FeedbackEvent) bool {
+	if strings.TrimSpace(event.Choice) != "a" {
+		return false
+	}
+	if strings.TrimSpace(event.Reviewer) != autoTraceReviewer || strings.TrimSpace(event.Source) != autoTraceSource {
+		return false
+	}
+	return strings.Contains(strings.ToLower(event.Reasoning), strings.ToLower(realExternalCIPhrase))
+}
 
 // CombinedStatusReader is the minimal GitHub read the no-CI guard needs (#465):
 // the combined commit status at a head SHA AND the PR's check-runs. github.Client
@@ -222,7 +284,7 @@ func (h *OutcomeHarvester) project(ctx context.Context, payload workflow.JobPayl
 	case workflow.OutcomeMerged:
 		if h.mergeHasRealCI(ctx, outcome) {
 			return positiveSignal(scoreMergedRealCI,
-				fmt.Sprintf("PR #%d merged with passing external CI.", outcome.PullRequest)), "a"
+				fmt.Sprintf("PR #%d merged with %s.", outcome.PullRequest, realExternalCIPhrase)), "a"
 		}
 		return positiveSignal(scoreMergedNoCI,
 			fmt.Sprintf("PR #%d merged through an empty gate (no external CI); near-neutral, not a strong positive.", outcome.PullRequest)), "a"
@@ -376,7 +438,7 @@ func negativeSignal(hard float64, feedback string) NormalizedSignal {
 // key is deterministic per PR, so a later revert re-upserts the SAME row in place
 // (corrective overwrite, row count unchanged).
 func (h *OutcomeHarvester) writeFeedback(ctx context.Context, version db.AgentTemplateVersion, payload workflow.JobPayload, outcome workflow.Outcome, signal NormalizedSignal, choice string) error {
-	runID := autoTraceRunIDPrefix + strings.TrimSpace(version.ID)
+	runID := AutoTraceRunID(version.ID)
 	itemID := autoTraceItemID(outcome)
 	sourceURL := pullRequestURL(outcome.Repo, outcome.PullRequest)
 

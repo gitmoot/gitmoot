@@ -10173,6 +10173,13 @@ func importSkillOptTrainCandidate(ctx context.Context, paths config.Paths, store
 	if err != nil {
 		return db.AgentTemplateVersion{}, fmt.Errorf("import optimizer candidate package: %w", err)
 	}
+	// Notify + (config-gated) auto-promote on the just-pending version (#471). The
+	// import write above stays side-effect-pure; this is the separate post-import
+	// step both CLI callers share. The train iteration carries the eval_run id whose
+	// feedback events feed the min_samples / external-CI guardrails.
+	if err := notifyAndMaybeAutoPromoteCandidate(ctx, store, paths.Home, candidate, version, iteration.EvalRunID); err != nil {
+		return db.AgentTemplateVersion{}, err
+	}
 	return version, nil
 }
 
@@ -11346,7 +11353,12 @@ func runSkillOptImport(args []string, stdout, stderr io.Writer) int {
 			return err
 		}
 		versionID = version.ID
-		return nil
+		// Notify + (config-gated) auto-promote on the just-pending version (#471). The
+		// import write above stays side-effect-pure; this is the separate post-import
+		// step. A plain `skillopt import` has no train iteration, so no eval_run id is
+		// resolvable — auto-promote fails safe to notify-only (a sparse import never
+		// auto-promotes), but candidate.awaiting_promotion still fires.
+		return notifyAndMaybeAutoPromoteCandidate(context.Background(), store, paths.Home, pkg, version, "")
 	}); err != nil {
 		fmt.Fprintf(stderr, "skillopt import: %v\n", err)
 		return 1

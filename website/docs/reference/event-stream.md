@@ -14,18 +14,31 @@ fan-out, not a migration.
 
 The pilot emits a tight allowlist of event types over the webhook transport:
 
-| `event_type`           | When                                                              |
-| ---------------------- | ---------------------------------------------------------------- |
-| `job.finished`         | a job reaches the `succeeded` terminal state                     |
-| `job.failed`           | a job reaches the `failed` terminal state                        |
-| `job.blocked`          | a job reaches the `blocked` terminal state                       |
-| `job.needs_attention`  | a tree pauses awaiting a human (the `escalate_human` pause today) |
+| `event_type`                    | When                                                                              |
+| ------------------------------- | --------------------------------------------------------------------------------- |
+| `job.finished`                  | a job reaches the `succeeded` terminal state                                       |
+| `job.failed`                    | a job reaches the `failed` terminal state                                          |
+| `job.blocked`                   | a job reaches the `blocked` terminal state                                         |
+| `job.needs_attention`           | a tree pauses awaiting a human (the `escalate_human` pause today)                  |
+| `candidate.awaiting_promotion`  | a SkillOpt template candidate becomes `pending` after import (always, off the auto-promote policy) |
+| `candidate.auto_promoted`       | the off-by-default `[skillopt].auto_promote` policy auto-promoted a candidate to `current`          |
 
 Each terminal transition emits **exactly once**. The engine owns the
 succeeded/failed/blocked emit on its `Mailbox` terminal path; the daemon owns the
 pre-flight (`queued -> failed|blocked`) and permission-blocked cases that never
 pass through that path. `job.needs_attention` is emitted once per fresh
 escalation round (a re-advance does not re-emit).
+
+The two `candidate.*` events come from the `skillopt import` / `train continue`
+CLI path, NOT the daemon. When a candidate becomes `pending`,
+`candidate.awaiting_promotion` is emitted **once** carrying the version id
+(`job_id`), the template id (`root_id`), and a redacted score/samples/CI reason —
+independent of the auto-promote policy, so a human is notified even in the manual
+default. If `[skillopt].auto_promote` is on **and** every configured guardrail
+holds, the candidate is promoted via the existing promote path and
+`candidate.auto_promoted` fires so the change can be reviewed or rolled back. The
+adjacent dashboard **Attention** page also lists every pending candidate
+(read-only), so candidates are visible locally even with `[events]` off.
 
 The following `event_type` values are **reserved** for the graduate step. They
 are enumerated in the contract so a consumer can `switch` over them

@@ -533,3 +533,37 @@ signal feeds the optimizer like any other and, when the configurable
 judge-tagged — *not* barred from promotion); this slice simply preserves the
 current **manual** promotion by writing only `eval_runs` / `eval_review_items` /
 `feedback_events`.
+
+### Candidate promotion policy + notifications (off by default)
+
+When a candidate becomes **pending** (after `skillopt import` or `train
+continue`), gitmoot can **notify** over the event stream and optionally
+**auto-promote** it — both **off by default**, additive, and **importing never
+promotes** (#471). The import write only ever creates the pending version; the
+notify + auto-promote is a separate, config-gated step that runs *after* import
+returns and, on a guardrails pass, calls the existing promote machinery.
+
+- **`candidate.awaiting_promotion`** is emitted **once** for every newly-pending
+  candidate over the `[events]` stream (`job_id` = version id, `root_id` = template
+  id, a redacted score/samples/CI `detail`), **independent of the auto-promote
+  policy**. The dashboard **Attention** page also lists pending candidates
+  (read-only), so they are visible locally even with `[events]` off. Nil-safe:
+  with `[events]` unset, nothing is emitted and behavior is byte-identical.
+- **`[skillopt].auto_promote`** (default `false` = manual, byte-identical) gates
+  auto-promotion on **checkable guardrails** read from the candidate's HARVESTER
+  auto-trace run (`auto-trace:<version>`), not the human/markdown review run:
+  `auto_promote_min_samples` (feedback-event count), `auto_promote_min_score`
+  (`summary.score >=` threshold), and `auto_promote_require_external_ci` (≥1 real
+  external-CI feedback event, keyed off the harvester's `auto-trace`/`gitmoot-auto`
+  provenance so a cross-family review row cannot spoof it). **ALL configured
+  guardrails must hold**, and **any** uncertainty — nil score, unset/garbled
+  threshold, an unresolvable run or a store read error (treated as *feedback
+  unavailable*), **zero feedback samples** (an absolute floor even when
+  `min_samples = 0`), `auto_promote_require_measured_judge = true` (deferred, gated
+  on #344), or `auto_promote_canary = true` (deferred) — **fails safe to notify, do
+  not promote**. An unset `min_samples`/`min_score` is a **hard do-not-promote, not
+  `0`**. On a pass it promotes via the existing path and emits
+  **`candidate.auto_promoted`** so a human can review or roll back even in full-auto.
+
+See `docs/skillopt-exchange-contract.md` and `docs/events.md` for the full knob
+reference and event shapes.

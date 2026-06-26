@@ -60,6 +60,46 @@ cockpit_pane_key = "job"
 escalation_handle = ""
 escalation_ttl = ""
 
+# [skillopt] is the OFF-BY-DEFAULT template-learning policy (#465 Mode A, #471).
+# With no [skillopt] section behavior is byte-identical: no trace harvesting, no
+# event emission, and promotion stays fully MANUAL. auto_trace_enabled opts the
+# daemon into harvesting an implement job's verifiable terminal outcome into a
+# synthetic feedback event; cross_family_review_enabled (requires auto_trace) adds
+# a down-weighted cross-family review soft signal. auto_promote (#471) opts into
+# AUTO-PROMOTING a newly-pending candidate, but ONLY when every configured
+# guardrail below holds — any uncertainty fails safe to notify-only (no promote).
+# A pending candidate ALWAYS emits candidate.awaiting_promotion when [events] is
+# configured, independent of auto_promote; a successful auto-promote additionally
+# emits candidate.auto_promoted so a human can review or roll back.
+# The guardrails read the candidate's HARVESTER auto-trace run
+# (auto-trace:<version_id>), NOT the human/markdown review run. A feedback read
+# error or unresolvable run fails safe to notify-only, and ZERO samples is always a
+# hard do-not-promote regardless of the min below.
+#   auto_promote_min_samples: minimum feedback-event count in the candidate's
+#     auto-trace run. UNSET is a HARD "do not promote" (never 0) — flipping
+#     auto_promote on without this never promotes. Even an explicit 0 cannot promote
+#     a zero-evidence candidate (absolute floor of at least one sample).
+#   auto_promote_min_score: minimum candidate score. UNSET, or a candidate with no
+#     score, is a HARD "do not promote".
+#   auto_promote_require_external_ci: require at least one auto-trace feedback event
+#     to record a merge that passed GENUINE external CI (not the no-CI band). Keys
+#     off the harvester's provenance so only Mode A (auto-trace) evidence counts and
+#     a cross-family review row cannot spoof it.
+#   auto_promote_require_measured_judge: PARSED but DEFERRED (gated on #344) — there
+#     is no judge<->human calibration source yet, so when true it FAILS SAFE to
+#     notify-only.
+#   auto_promote_canary: PARSED but DEFERRED (canary follow-on) — sampled traffic +
+#     auto-rollback do not exist yet, so when true it FAILS SAFE to notify-only.
+# [skillopt]
+# auto_trace_enabled = false
+# cross_family_review_enabled = false
+# auto_promote = false
+# auto_promote_min_samples = 0
+# auto_promote_min_score = 0.0
+# auto_promote_require_external_ci = false
+# auto_promote_require_measured_judge = false
+# auto_promote_canary = false
+
 # [admission] is an OPT-IN, off-by-default host-global concurrency budget the
 # daemon applies BEFORE starting each agent session, on top of --workers/pool
 # and the per-repo checkout / runtime-session locks (issue #365). With both caps

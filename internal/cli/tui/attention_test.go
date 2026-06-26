@@ -337,6 +337,30 @@ func TestAttentionShowsAwaitingHuman(t *testing.T) {
 	}
 }
 
+// TestAttentionShowsPendingCandidates proves a pending SkillOpt candidate (#471)
+// renders on the Attention page next to AwaitingHumanTask, with its version id,
+// template id, score, and the decide hint; zero candidates renders unchanged.
+func TestAttentionShowsPendingCandidates(t *testing.T) {
+	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
+	snap := Snapshot{
+		Daemon:            Daemon{Running: true},
+		PendingCandidates: []PendingCandidate{{VersionID: "planner:v7", TemplateID: "planner", Score: "0.96"}},
+	}
+	m := attentionModel(t, deps, snap)
+	view := m.View()
+	for _, want := range []string{"Pending candidates (1)", "planner:v7", "template planner", "score 0.96", "skillopt candidate promote|reject"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("expected %q in attention view:\n%s", want, view)
+		}
+	}
+
+	// Zero pending candidates: no Pending candidates header.
+	empty := attentionModel(t, deps, Snapshot{Daemon: Daemon{Running: true}})
+	if strings.Contains(empty.View(), "Pending candidates") {
+		t.Fatalf("empty candidate list should not render the header:\n%s", empty.View())
+	}
+}
+
 func TestAttentionCursorClampedOnRefresh(t *testing.T) {
 	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
 	m := attentionModel(t, deps, promptSnap(choicePrompt(), textPrompt()))

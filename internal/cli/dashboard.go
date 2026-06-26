@@ -56,6 +56,10 @@ type dashboardSnapshot struct {
 	// awaitingHuman carries the tasks paused at awaiting_human (#340) for the
 	// TUI's Attention page. Unexported so --json/--plain stay byte-stable.
 	awaitingHuman []dashboardAwaitingHuman
+	// pendingCandidates carries the SkillOpt template candidates awaiting a
+	// promote/reject decision (#471) for the TUI's Attention page. Unexported so
+	// --json/--plain stay byte-stable.
+	pendingCandidates []dashboardPendingCandidate
 	// daemonDetail carries the persisted daemon flags/workdir and a tail of
 	// recent log errors for the TUI's Health page. Unexported so --json and
 	// the plain renderer stay byte-stable.
@@ -92,6 +96,14 @@ type dashboardAwaitingHuman struct {
 	TaskID string
 	Repo   string
 	Title  string
+}
+
+// dashboardPendingCandidate is one SkillOpt template candidate awaiting a
+// promote/reject decision (#471), shown in the TUI's Attention page.
+type dashboardPendingCandidate struct {
+	VersionID  string
+	TemplateID string
+	Score      string
 }
 
 type dashboardResourceLock struct {
@@ -511,6 +523,20 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 		}
 		for _, lock := range locks {
 			snapshot.BranchLocks = append(snapshot.BranchLocks, dashboardBranchLock{Repo: lock.RepoFullName, Branch: lock.Branch, Owner: lock.Owner})
+		}
+		// Pending SkillOpt candidates awaiting a promote/reject decision (#471), for
+		// the TUI Attention page. Read-only: the existing ListPendingAgentTemplateVersions
+		// + the review row's score, no new query infrastructure.
+		pendingCandidates, err := store.ListPendingAgentTemplateVersions(ctx, "")
+		if err != nil {
+			return err
+		}
+		for _, version := range pendingCandidates {
+			entry := dashboardPendingCandidate{VersionID: version.ID, TemplateID: version.TemplateID}
+			if review, err := store.GetAgentTemplateCandidateReview(ctx, version.ID); err == nil && review.Score != nil {
+				entry.Score = fmt.Sprintf("%.4g", *review.Score)
+			}
+			snapshot.pendingCandidates = append(snapshot.pendingCandidates, entry)
 		}
 		trainSessions, err := store.ListSkillOptTrainSessions(ctx)
 		if err != nil {

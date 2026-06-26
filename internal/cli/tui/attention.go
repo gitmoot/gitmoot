@@ -287,6 +287,22 @@ func (m Model) attentionListRows() []listRow {
 		}
 	}
 
+	// Pending candidates (#471): SkillOpt template candidates awaiting a
+	// promote/reject decision. Display-only (the verb lives on `gitmoot skillopt
+	// candidate promote|reject`), so these are static rows next to Awaiting human,
+	// visible locally even when [events] is off.
+	if n := len(m.snap.PendingCandidates); n > 0 {
+		rows = append(rows, staticRow(0, "Pending candidates ("+strconv.Itoa(n)+")"))
+		for _, c := range m.snap.PendingCandidates {
+			line := "candidate " + c.VersionID + "  template " + c.TemplateID
+			if strings.TrimSpace(c.Score) != "" {
+				line += "  " + mutedStyle.Render("score "+c.Score)
+			}
+			rows = append(rows, staticRow(1, line))
+			rows = append(rows, staticRow(2, mutedStyle.Render("decide: gitmoot skillopt candidate promote|reject "+c.VersionID)))
+		}
+	}
+
 	// Locks are display-only context (no actions), shown as static lines.
 	if stale := staleLocks(m.snap.ResourceLocks); len(stale) > 0 {
 		rows = append(rows, staticRow(0, "Stale locks ("+strconv.Itoa(len(stale))+")"))

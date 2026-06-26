@@ -146,7 +146,7 @@ func (h *OutcomeHarvester) writeReviewFeedback(ctx context.Context, version db.A
 	if !signal.HasScore {
 		return nil
 	}
-	runID := autoTraceRunIDPrefix + strings.TrimSpace(version.ID)
+	runID := AutoTraceRunID(version.ID)
 	itemID := crossFamilyReviewItemID(outcome)
 	reviewer := reviewReviewer(outcome)
 	sourceURL := pullRequestURL(outcome.Repo, outcome.PullRequest)
