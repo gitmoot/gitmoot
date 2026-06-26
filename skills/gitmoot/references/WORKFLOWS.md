@@ -446,18 +446,23 @@ a **challenger** (the sole pending candidate, or `--challenger <versionId>`),
 delivers **both** through the runtime adapter **serialized**, shows the two
 answers **label-shuffled** as Option A / Option B, and records the human pick
 (`--pick a|b`, or interactively). With **no pending challenger** it is a clean
-no-op. The pick writes one 2-option `eval_run` + two `eval_review_options`
-(`champion`/`challenger`) + one `RankedFeedbackEvent` (`source = skillopt-ab`,
-`contract_version` stays `1`), updates the per-variant **Beta-Bernoulli bandit**
+no-op. The pick writes a 2-option `eval_run` + two `eval_review_options`
+(`champion`/`challenger`) + one `RankedFeedbackEvent` **per pick** (`source =
+skillopt-ab`, `contract_version` stays `1`; a unique per-pick `source_url` makes
+repeated A/Bs of the same challenger each persist as a distinct row instead of
+overwriting one), updates the per-variant **Beta-Bernoulli bandit**
 (`skillopt_bandit_arms`), and prints `P(challenger > champion)` as
 `NN% likely better over K samples`.
 
 That confidence feeds the **`[skillopt].auto_promote_min_confidence`** guardrail
 (nil default = ignored; set = require `confidence >= floor` over enough samples,
 else fail safe to notify-only) — supplying the promotion confidence Mode A could
-not provide for ask agents. `bandit_min_samples` (default 30) gates only the
-**deferred** auto loop; the manual A/B is always allowed. Live interception, the
-cross-family LLM-judge auto-pairwise, canary, and the auto A/B loop are deferred.
+not provide for ask agents. For a genuine ask candidate (no harvester score or
+feedback rows) the bandit pulls stand in for the Mode A sample/score floors, so the
+confidence gate alone can auto-promote it. `bandit_min_samples` (default 30) gates
+only the **deferred** auto loop; the manual A/B is always allowed. Live
+interception, the cross-family LLM-judge auto-pairwise, canary, and the auto A/B
+loop are deferred.
 
 ## Execution Model
 

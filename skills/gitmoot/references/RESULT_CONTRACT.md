@@ -580,24 +580,33 @@ preference**, and is **additive** (`contract_version` stays `1`) and **manual**:
   presents them **label-shuffled** as Option A / Option B, and records the human
   pick mapped back to the correct role. **No pending challenger ⇒ a clean no-op**
   (`nothing to A/B …`), zero rows written.
-- A pick writes one **2-option `eval_run`** (`OptionsCount = 2`,
+- A pick writes a **2-option `eval_run`** (`OptionsCount = 2`,
   `metadata.feedback_source = preference_ab`, run id `skillopt-ab:<versionId>`),
   **two `eval_review_options`** (`champion` / `challenger`, answers stored as
-  `eval_artifacts` via the blob path), and **one `RankedFeedbackEvent`**
+  `eval_artifacts` via the blob path), and **one `RankedFeedbackEvent` per pick**
   (`ranking = [winner, loser]`, `reviewer = human`, `source = skillopt-ab`) that
-  passes `validateRankedFeedbackEventOptions`. The `source = skillopt-ab` tag keeps
+  passes `validateRankedFeedbackEventOptions`. Repeated A/Bs of the same challenger
+  each persist as a **distinct** row (a unique per-pick `source_url` keeps the
+  `(run_id, item_id, reviewer, source, source_url)` conflict key distinct), so picks
+  accumulate instead of overwriting one row. The `source = skillopt-ab` tag keeps
   Mode B rows separable from Mode A (`auto-trace`) and human gold.
 - Each `(template_id, version_id)` variant is a **Beta-Bernoulli arm** (`Beta(1,1)`
   prior) persisted in `skillopt_bandit_arms`; a pick increments winner/loser, then
   the confidence **`P(challenger > champion)`** is recomputed by deterministic (seeded)
   Monte Carlo and surfaced as `NN% likely better over K samples`.
-- That confidence is the scalar **`[skillopt].auto_promote_min_confidence`** (nil
-  default = ignored, byte-identical to #471) consumes: at the candidate notify seam
-  it rides into `candidate.awaiting_promotion`'s detail and, when the floor is set,
-  auto-promote additionally requires `confidence >= floor` backed by at least
-  `auto_promote_min_samples` bandit pulls — a nil/low/thin confidence fails safe to
-  notify-only. **`bandit_min_samples`** (default 30) is the low-traffic floor for the
-  DEFERRED auto loop; the manual `skillopt ab` CLI is always allowed.
+- That confidence is the scalar the **`[skillopt].auto_promote_min_confidence`** (nil
+  default = ignored, byte-identical to #471) guardrail consumes: at the candidate
+  notify seam it rides into `candidate.awaiting_promotion`'s detail and, when the
+  floor is set, auto-promote additionally requires `confidence >= floor` backed by at
+  least `auto_promote_min_samples` bandit pulls — a nil/low/thin confidence fails safe
+  to notify-only. For a **genuine Mode B candidate** (an ask/research agent with no
+  harvester score and no eval_run feedback rows), the bandit pulls stand in for the
+  Mode A feedback-sample floor and the absent score, so the confidence gate alone can
+  promote it — the loop actually closes for ask agents, not just when Mode A evidence
+  is also present. A present score still has to clear `auto_promote_min_score`, and a
+  set `require_external_ci` still applies (a pure ask agent simply leaves it off).
+  **`bandit_min_samples`** (default 30) is the low-traffic floor for the DEFERRED auto
+  loop; the manual `skillopt ab` CLI is always allowed.
 
 See `docs/skillopt-exchange-contract.md` and `docs/events.md` for the full knob
 reference and event shapes.

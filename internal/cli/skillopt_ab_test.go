@@ -186,6 +186,105 @@ func TestRunSkillOptABLabelShuffleMapsPickCorrectly(t *testing.T) {
 	}
 }
 
+// TestRunSkillOptABUnseededShuffleIsNotPinned proves the debiasing fix: on the
+// DEFAULT interactive path (no --seed), the label shuffle must NOT be pinned to
+// swap=false. Before the fix, options.seed defaulted to 0 and
+// rand.NewSource(0).Intn(2) is a constant 0, so Option A was ALWAYS the champion
+// and Option B ALWAYS the challenger on every run — a human doing repeated A/Bs
+// would learn "Option B is always the new variant", reintroducing exactly the
+// position/identity bias the shuffle exists to remove. With a nondeterministic
+// (time-based) fallback seed, both shuffle orderings occur, so picking the SAME
+// presented letter (a) records the champion on some runs and the challenger on
+// others. We assert BOTH winner roles appear across many unseeded runs.
+func TestRunSkillOptABUnseededShuffleIsNotPinned(t *testing.T) {
+	home, store, _, challengerID := skillOptABFixture(t)
+	withFakeSkillOptABDeliver(t, "Champion answer.", "Challenger answer.")
+	ctx := context.Background()
+
+	sawChampion, sawChallenger := false, false
+	const runs = 40
+	for i := 0; i < runs; i++ {
+		var stdout, stderr bytes.Buffer
+		// NO --seed: the shuffle seed must be nondeterministic. Always pick a.
+		code := runSkillOptAB([]string{"planner-bot", "Plan it.", "--home", home, "--pick", "a"}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("runSkillOptAB exit = %d, stderr: %s", code, stderr.String())
+		}
+	}
+
+	runID := skillOptABRunIDPrefix + challengerID
+	events, err := store.ListRankedFeedbackEvents(ctx, runID)
+	if err != nil {
+		t.Fatalf("ListRankedFeedbackEvents: %v", err)
+	}
+	for _, ev := range events {
+		switch ev.Winner {
+		case skillOptABChampionLabel:
+			sawChampion = true
+		case skillOptABChallengerLabel:
+			sawChallenger = true
+		}
+	}
+	if !sawChampion || !sawChallenger {
+		t.Fatalf("unseeded shuffle is pinned: over %d runs with pick a, sawChampion=%v sawChallenger=%v (want both); the default-0 seed would pin swap=false", runs, sawChampion, sawChallenger)
+	}
+}
+
+// TestRunSkillOptABRepeatedPicksEachPersist proves the contract-row fix: repeated
+// A/Bs of the SAME challenger each write a DISTINCT RankedFeedbackEvent instead of
+// overwriting a single row. The ranked_feedback_events conflict key is
+// (run_id, item_id, reviewer, source, source_url); run_id (skillopt-ab:<versionId>),
+// item_id (ab), reviewer (human), and source (skillopt-ab) are all constant across
+// picks, so without a unique per-pick source_url the ON CONFLICT DO UPDATE would
+// overwrite every prior preference and only the last pick would survive as evidence
+// — silently losing all earlier human preferences the optimizer/audit consumes.
+func TestRunSkillOptABRepeatedPicksEachPersist(t *testing.T) {
+	home, store, _, challengerID := skillOptABFixture(t)
+	withFakeSkillOptABDeliver(t, "Champion answer.", "Challenger answer.")
+	ctx := context.Background()
+
+	const picks = 5
+	for i := 0; i < picks; i++ {
+		var stdout, stderr bytes.Buffer
+		// Fixed seed so each pick records the challenger as winner (seed 1 swaps:
+		// A=challenger, pick a -> challenger wins). The point is row COUNT, not role.
+		code := runSkillOptAB([]string{"planner-bot", "Plan it.", "--home", home, "--pick", "a", "--seed", "1"}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("pick %d: runSkillOptAB exit = %d, stderr: %s", i, code, stderr.String())
+		}
+	}
+
+	runID := skillOptABRunIDPrefix + challengerID
+	events, err := store.ListRankedFeedbackEvents(ctx, runID)
+	if err != nil {
+		t.Fatalf("ListRankedFeedbackEvents: %v", err)
+	}
+	if len(events) != picks {
+		t.Fatalf("ranked feedback events = %d after %d picks, want %d (each pick must persist a distinct contract row)", len(events), picks, picks)
+	}
+	// Every row must carry a distinct source_url (the per-pick uniqueness key).
+	seen := make(map[string]struct{}, len(events))
+	for _, ev := range events {
+		if strings.TrimSpace(ev.SourceURL) == "" {
+			t.Fatalf("pick row has empty source_url; the conflict key would collapse repeated picks")
+		}
+		if _, dup := seen[ev.SourceURL]; dup {
+			t.Fatalf("duplicate source_url %q across picks; rows would overwrite", ev.SourceURL)
+		}
+		seen[ev.SourceURL] = struct{}{}
+	}
+
+	// The bandit arm still accrues one pull per pick (it is keyed per (template,
+	// version), not per pick, and is unchanged by the source_url fix).
+	chalArm, found, err := store.GetBanditArm(ctx, "planner", challengerID)
+	if err != nil || !found {
+		t.Fatalf("challenger arm: found=%v err=%v", found, err)
+	}
+	if chalArm.Pulls != picks {
+		t.Fatalf("challenger arm pulls = %d, want %d", chalArm.Pulls, picks)
+	}
+}
+
 // TestRunSkillOptABNoChallengerIsCleanNoOp proves the honest no-op: with NO
 // pending challenger, the command exits 0, writes no eval run and no bandit arm,
 // and prints the "nothing to A/B" message.

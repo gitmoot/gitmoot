@@ -35,6 +35,8 @@ func TestEvaluateAutoPromote(t *testing.T) {
 		candidate           CandidatePackage
 		feedback            []db.FeedbackEvent
 		feedbackUnavailable bool
+		confidence          *float64
+		confidenceSamples   int
 		wantPromote         bool
 		reasonHas           string
 	}{
@@ -156,11 +158,75 @@ func TestEvaluateAutoPromote(t *testing.T) {
 			wantPromote: false,
 			reasonHas:   "canary",
 		},
+		{
+			// MODE B (#473): a GENUINE ask-agent candidate has NO harvester feedback rows
+			// and NO score. Without the Mode B confidence path the empty-feedback
+			// zero-evidence floor (or the nil-score hard stop) would make this candidate
+			// structurally unreachable by the confidence gate. With a set min_confidence,
+			// a present confidence, and enough bandit pulls, the bandit evidence stands in
+			// for the sample/score floors and it promotes.
+			name:              "mode B confidence-backed promotes with no feedback and no score",
+			policy:            config.SkillOptPolicy{AutoPromote: true, AutoPromoteMinSamples: intPtr(30), AutoPromoteMinScore: floatPtr(0.5), AutoPromoteMinConfidence: floatPtr(0.95)},
+			candidate:         CandidatePackage{Summary: CandidateSummary{Score: nil}},
+			feedback:          nil,
+			confidence:        floatPtr(0.97),
+			confidenceSamples: 80,
+			wantPromote:       true,
+			reasonHas:         "confidence 97%",
+		},
+		{
+			// Mode B thin evidence: a high confidence but FEWER bandit pulls than the
+			// sample floor must NOT promote — small-sample over-confidence is exactly the
+			// tiering failure the floor exists to block. It also must not fall back to the
+			// Mode A zero-evidence path (that would still refuse, but for the wrong reason).
+			name:              "mode B confidence below sample floor stays pending",
+			policy:            config.SkillOptPolicy{AutoPromote: true, AutoPromoteMinSamples: intPtr(30), AutoPromoteMinScore: floatPtr(0.5), AutoPromoteMinConfidence: floatPtr(0.95)},
+			candidate:         CandidatePackage{Summary: CandidateSummary{Score: nil}},
+			feedback:          nil,
+			confidence:        floatPtr(0.99),
+			confidenceSamples: 5,
+			wantPromote:       false,
+			reasonHas:         "below auto_promote_min_samples",
+		},
+		{
+			// Mode B with a confidence below the floor fails safe even though the pull
+			// count clears the sample floor.
+			name:              "mode B confidence below floor stays pending",
+			policy:            config.SkillOptPolicy{AutoPromote: true, AutoPromoteMinSamples: intPtr(30), AutoPromoteMinScore: floatPtr(0.5), AutoPromoteMinConfidence: floatPtr(0.95)},
+			candidate:         CandidatePackage{Summary: CandidateSummary{Score: nil}},
+			feedback:          nil,
+			confidence:        floatPtr(0.60),
+			confidenceSamples: 80,
+			wantPromote:       false,
+			reasonHas:         "below auto_promote_min_confidence",
+		},
+		{
+			// A nil score with NO bandit confidence (min_confidence unset) is still the
+			// Mode A hard stop — the score floor is not waived without bandit evidence.
+			name:        "nil score without confidence is still a hard stop",
+			policy:      config.SkillOptPolicy{AutoPromote: true, AutoPromoteMinSamples: intPtr(1), AutoPromoteMinScore: floatPtr(0.5)},
+			candidate:   CandidatePackage{Summary: CandidateSummary{Score: nil}},
+			feedback:    []db.FeedbackEvent{realCIFeedback()},
+			wantPromote: false,
+			reasonHas:   "no score",
+		},
+		{
+			// Mode B path still honors a PRESENT score that is below the floor: the bandit
+			// stands in only for an ABSENT score, never to override a real failing one.
+			name:              "mode B with present failing score stays pending",
+			policy:            config.SkillOptPolicy{AutoPromote: true, AutoPromoteMinSamples: intPtr(30), AutoPromoteMinScore: floatPtr(0.9), AutoPromoteMinConfidence: floatPtr(0.95)},
+			candidate:         candidateWithScore(0.4),
+			feedback:          nil,
+			confidence:        floatPtr(0.99),
+			confidenceSamples: 80,
+			wantPromote:       false,
+			reasonHas:         "below auto_promote_min_score",
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			decision := EvaluateAutoPromote(tc.policy, tc.candidate, tc.feedback, tc.feedbackUnavailable, nil, 0)
+			decision := EvaluateAutoPromote(tc.policy, tc.candidate, tc.feedback, tc.feedbackUnavailable, tc.confidence, tc.confidenceSamples)
 			if decision.Promote != tc.wantPromote {
 				t.Fatalf("Promote = %v, want %v (reason: %q)", decision.Promote, tc.wantPromote, decision.Reason)
 			}

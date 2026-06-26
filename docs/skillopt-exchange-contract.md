@@ -360,15 +360,19 @@ gitmoot skillopt ab <agent> "<prompt>" [--challenger <versionId>] [--pick a|b] [
   the two answers **label-shuffled** as Option A / Option B, and records the human
   pick. The shuffle mapping is recorded so the stored event maps the pick back to
   the **correct** champion/challenger label.
-- Each pick writes exactly **one 2-option `eval_run`** (`OptionsCount = 2`,
+- Each pick writes a 2-option `eval_run` (`OptionsCount = 2`,
   `metadata.feedback_source = preference_ab`, run id `skillopt-ab:<versionId>`),
   **two `eval_review_options`** (`champion` / `challenger`) whose answer text is
   stored as `eval_artifacts` via the existing blob path, and **one
-  `RankedFeedbackEvent`** (`ranking = [winner, loser]`, `reviewer = human`,
-  `source = skillopt-ab`) that passes `validateRankedFeedbackEventOptions`. The
-  distinct `source` tag and run-id prefix keep Mode B rows trivially separable from
-  Mode A (`auto-trace`) and human gold. **No contract struct changes —
-  `ContractVersion` stays `1`.**
+  `RankedFeedbackEvent` per pick** (`ranking = [winner, loser]`, `reviewer =
+  human`, `source = skillopt-ab`) that passes `validateRankedFeedbackEventOptions`.
+  Repeated A/Bs of the **same** challenger each persist as a **distinct** preference
+  row: the `ranked_feedback_events` conflict key is
+  `(run_id, item_id, reviewer, source, source_url)`, and every pick carries a unique
+  per-pick `source_url`, so picks accumulate as evidence instead of overwriting one
+  row. The distinct `source` tag and run-id prefix keep Mode B rows trivially
+  separable from Mode A (`auto-trace`) and human gold. **No contract struct changes
+  — `ContractVersion` stays `1`.**
 
 **The bandit.** Each `(template_id, version_id)` variant is one **Beta-Bernoulli
 arm** (uniform `Beta(1,1)` prior; a win bumps `alpha`, a loss bumps `beta`),

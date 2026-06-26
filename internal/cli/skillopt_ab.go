@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jerryfane/gitmoot/internal/agenttemplate"
@@ -229,7 +230,14 @@ func runSkillOptABWithStore(ctx context.Context, store *db.Store, paths config.P
 	// the human cannot infer which is the challenger, yet the stored event maps the
 	// pick back to the CORRECT role (an off-by-one here would silently invert every
 	// preference). optionA/optionB are the deliveries behind the presented labels.
-	rng := rand.New(rand.NewSource(options.seed))
+	//
+	// Seed selection mirrors skillOptABProbSeed: when --seed is set the shuffle is
+	// deterministic (so the seeded tests pin the A=champion/A=challenger mapping);
+	// when it is NOT set we MUST seed nondeterministically. rand.NewSource(0).Intn(2)
+	// is a constant 0, so a fixed default-0 seed would make swap=false on EVERY
+	// unseeded run — Option B would always be the challenger, reintroducing exactly
+	// the position/identity bias the shuffle exists to remove.
+	rng := rand.New(rand.NewSource(skillOptABShuffleSeed(options)))
 	swap := rng.Intn(2) == 1
 	optionA, optionB := championDelivery, challengerDelivery
 	if swap {
@@ -256,8 +264,16 @@ func runSkillOptABWithStore(ctx context.Context, store *db.Store, paths config.P
 		loserLabel = skillOptABChallengerLabel
 	}
 
+	// runID keeps the version-id prefix so every pick stays trivially filterable as
+	// Mode B for THIS challenger. pickSourceURL is a per-pick token that makes each
+	// recorded preference a DISTINCT contract row: the ranked_feedback_events
+	// conflict key is (run_id, item_id, reviewer, source, source_url), and the first
+	// four are identical across repeated A/Bs of the same challenger, so without a
+	// unique source_url an ON CONFLICT DO UPDATE would overwrite every prior pick and
+	// only the last preference would survive as evidence.
 	runID := skillOptABRunIDPrefix + challenger.version.ID
-	if err := recordSkillOptABPick(ctx, store, paths, runID, templateID, champion, challenger, championDelivery, challengerDelivery, winnerLabel, loserLabel, options.prompt); err != nil {
+	pickSourceURL := skillOptABPickSourceURL(challenger.version.ID)
+	if err := recordSkillOptABPick(ctx, store, paths, runID, pickSourceURL, templateID, champion, challenger, championDelivery, challengerDelivery, winnerLabel, loserLabel, options.prompt); err != nil {
 		fmt.Fprintf(stderr, "skillopt ab: record pick: %v\n", err)
 		return 1
 	}
@@ -291,6 +307,20 @@ func runSkillOptABWithStore(ctx context.Context, store *db.Store, paths config.P
 	fmt.Fprintf(stdout, "Challenger %s: Beta(%.0f, %.0f)\n", challenger.version.ID, challengerArm.Alpha, challengerArm.Beta)
 	fmt.Fprintf(stdout, "P(challenger>champion): %s\n", skillopt.ConfidenceSummary(prob, challengerArm.Pulls))
 	return 0
+}
+
+// skillOptABShuffleSeed derives the label-shuffle seed: the explicit --seed when
+// set (so the seeded shuffle tests pin the A/B->role mapping deterministically),
+// else a nondeterministic time-based fallback so repeated unseeded interactive
+// runs do NOT all reuse seed 0. rand.NewSource(0).Intn(2) is a constant 0, so a
+// pinned-0 default would make swap=false on every default run — Option B would
+// always be the challenger, defeating the anti-bias guarantee. This mirrors
+// skillOptABProbSeed's !seedSet fallback so the two seams stay consistent.
+func skillOptABShuffleSeed(options skillOptABOptions) int64 {
+	if options.seedSet {
+		return options.seed
+	}
+	return time.Now().UnixNano()
 }
 
 // skillOptABProbSeed derives the P(>) Monte Carlo seed: the explicit --seed when
@@ -422,7 +452,7 @@ func defaultReadSkillOptABLine() (string, bool) {
 // the existing blob path), one eval_review_item, and ONE RankedFeedbackEvent
 // (ranking=[winner,loser], source=skillopt-ab) that passes
 // store.validateRankedFeedbackEventOptions.
-func recordSkillOptABPick(ctx context.Context, store *db.Store, paths config.Paths, runID, templateID string, champion, challenger skillOptABVariant, championDelivery, challengerDelivery skillOptABDelivery, winnerLabel, loserLabel, prompt string) error {
+func recordSkillOptABPick(ctx context.Context, store *db.Store, paths config.Paths, runID, pickSourceURL, templateID string, champion, challenger skillOptABVariant, championDelivery, challengerDelivery skillOptABDelivery, winnerLabel, loserLabel, prompt string) error {
 	blobStore := artifact.NewStore(paths.ArtifactBlobs)
 
 	metadataJSON, err := json.Marshal(map[string]any{
@@ -493,8 +523,28 @@ func recordSkillOptABPick(ctx context.Context, store *db.Store, paths config.Pat
 		Winner:        winnerLabel,
 		Reviewer:      "human",
 		Source:        skillOptABSource,
+		// A distinct per-pick SourceURL makes the (run_id,item_id,reviewer,source,
+		// source_url) conflict key unique per pick, so repeated A/Bs of the same
+		// challenger each persist as their own immutable preference row instead of
+		// overwriting the prior one.
+		SourceURL: pickSourceURL,
 	})
 }
+
+// skillOptABPickSourceURL mints a unique-per-pick SourceURL for the Mode B
+// RankedFeedbackEvent. The run id, item id, reviewer, and source are constant
+// across repeated A/Bs of one challenger, so this token is what differentiates
+// each pick's conflict key; it embeds the version id for separability and a
+// strictly increasing nanosecond+counter suffix so a tight loop of picks never
+// collides on a single row.
+func skillOptABPickSourceURL(versionID string) string {
+	seq := atomic.AddUint64(&skillOptABPickSeq, 1)
+	return fmt.Sprintf("%s%s#%d-%d", skillOptABRunIDPrefix, versionID, time.Now().UnixNano(), seq)
+}
+
+// skillOptABPickSeq is a process-local monotonic counter that guarantees two
+// picks recorded within the same nanosecond still get distinct SourceURLs.
+var skillOptABPickSeq uint64
 
 // answerOrPlaceholder guarantees a non-empty artifact body (the blob path rejects
 // empty content), substituting a marker when a variant returned no text.

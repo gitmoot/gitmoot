@@ -168,6 +168,54 @@ func TestRunCandidateNotifyBanditConfidencePromotes(t *testing.T) {
 	}
 }
 
+// TestRunCandidateNotifyModeBNoScoreNoFeedbackPromotes is the #473 acceptance
+// case that the PR's other promote test did NOT cover: a GENUINE Mode B ask-agent
+// candidate has NO harvester score and NO eval_run feedback events (the harvester
+// only writes Mode A runs), so its ONLY evidence is the pairwise bandit confidence.
+// This proves that path actually reaches EvaluateAutoPromote and auto-promotes —
+// before the Mode B confidence fix, the empty-feedback zero-evidence floor (and the
+// nil-score hard stop) made it structurally unreachable, so it could never fire for
+// the ask agents the feature targets.
+func TestRunCandidateNotifyModeBNoScoreNoFeedbackPromotes(t *testing.T) {
+	ctx := context.Background()
+	store, version, candidate, _ := candidateNotifyFixture(t)
+	// Genuine Mode B: no harvester score at all.
+	candidate.Summary.Score = nil
+	sink := &recordingSink{}
+
+	// require_external_ci OFF (a pure ask agent has no CI); the bandit confidence is
+	// the whole evidence. min_samples=30 is the bandit-pull floor.
+	policy := config.DefaultSkillOptPolicy()
+	policy.AutoPromote = true
+	policy.AutoPromoteMinSamples = floatPtrCLIInt(30)
+	policy.AutoPromoteMinScore = floatPtrCLI(0.5)
+	policy.AutoPromoteMinConfidence = floatPtrCLI(0.95)
+
+	confidence := 0.97
+	summary := skillopt.ConfidenceSummary(confidence, 80)
+	// EMPTY feedback events — the defining property of a Mode B candidate.
+	if err := runCandidateNotify(ctx, store, sink, policy, candidate, version, nil, false, &confidence, 80, summary); err != nil {
+		t.Fatalf("runCandidateNotify returned error: %v", err)
+	}
+
+	if got := len(sink.byType(events.EventCandidateAwaitingPromotion)); got != 1 {
+		t.Fatalf("awaiting_promotion emits = %d, want 1", got)
+	}
+	if got := len(sink.byType(events.EventCandidateAutoPromoted)); got != 1 {
+		t.Fatalf("auto_promoted emits = %d, want 1 (Mode B confidence path must reach the gate)", got)
+	}
+	after, err := store.GetAgentTemplateVersionByID(ctx, version.ID)
+	if err != nil {
+		t.Fatalf("GetAgentTemplateVersionByID returned error: %v", err)
+	}
+	if after.State != "current" {
+		t.Fatalf("version state = %q, want current (Mode B auto-promoted on confidence alone)", after.State)
+	}
+}
+
+// floatPtrCLIInt is a local int-pointer helper for the Mode B sample-floor cases.
+func floatPtrCLIInt(v int) *int { return &v }
+
 // TestRunCandidateNotifyBanditConfidenceBelowFloorStaysPending proves a set
 // confidence floor that is NOT met fails safe to notify-only — the candidate
 // stays pending even though the other guardrails pass.

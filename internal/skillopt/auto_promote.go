@@ -51,8 +51,14 @@ func notifyOnly(reason string) AutoPromoteDecision {
 //     zero verifiable evidence.
 //   - min_samples unset (nil) -> a HARD do-not-promote, NOT 0 (a user who flips
 //     auto_promote without a sample floor must never promote a sparse candidate).
-//   - min_score unset (nil) OR a nil candidate Summary.Score -> hard do-not-promote.
-//   - require_external_ci=true with no real-CI positive in the run -> do not promote.
+//   - min_score unset (nil) OR a nil candidate Summary.Score -> hard do-not-promote
+//     ON THE MODE A (verifiable-outcome) PATH. A genuine Mode B (ask/research)
+//     candidate has NO harvester score; its evidence is the pairwise bandit, so the
+//     score/feedback-sample floors are satisfied by the confidence + bandit-pull
+//     floor instead (see modeBConfidenceBacked below) and a nil score is allowed.
+//   - require_external_ci=true with no real-CI positive in the run -> do not promote
+//     (still hard, including on the Mode B path: a pure ask agent has no CI, so an
+//     operator simply leaves require_external_ci off; if they DO set it we fail safe).
 //   - min_confidence (#473 Mode B) is ADDITIVE and OPTIONAL: when
 //     policy.AutoPromoteMinConfidence is nil (the default) the bandit confidence is
 //     ignored entirely and behavior is byte-identical to #471 — `confidence` may be
@@ -60,6 +66,16 @@ func notifyOnly(reason string) AutoPromoteDecision {
 //     confidence >= the floor AND at least AutoPromoteMinSamples bandit samples
 //     behind it (small-sample over-confidence guard); a nil/low confidence or thin
 //     evidence FAILS SAFE to notify-only.
+//
+// MODE B PATH (the ask/research loop this slice closes): when AutoPromoteMinConfidence
+// is set AND a confidence backed by >= AutoPromoteMinSamples bandit pulls is present,
+// the bandit pulls ARE the sample evidence and the pairwise preference IS the quality
+// signal — so the bandit-pull floor stands in for len(feedbackEvents) (a Mode B
+// candidate has zero harvester feedback rows) and the nil-score hard stop is skipped.
+// This is what makes a real ask-agent candidate (empty feedbackEvents, nil score)
+// reachable by the confidence gate; without it the zero-evidence / nil-score hard
+// stops above would make Mode B auto-promotion structurally unreachable. A score, if
+// present, must still clear min_score; require_external_ci, if set, must still hold.
 //
 // `confidence` is the Mode B P(challenger>champion) the runCandidateNotify seam
 // supplies from the bandit (nil when there is no arm); `confidenceSamples` is the
@@ -90,41 +106,69 @@ func EvaluateAutoPromote(policy config.SkillOptPolicy, candidate CandidatePackag
 		return notifyOnly("auto_promote_canary is set but canary promotion is deferred; notify only")
 	}
 
-	passed := make([]string, 0, 3)
-
-	// Guardrail: min_samples. Unset is a hard do-not-promote, never 0.
+	// min_samples must always be set (the unset-is-hard-no discipline holds for both
+	// paths: a user who flips auto_promote without a sample floor must never promote).
 	if policy.AutoPromoteMinSamples == nil {
 		return notifyOnly("auto_promote_min_samples is not set; refusing to promote without a sample floor (notify only)")
 	}
-	samples := len(feedbackEvents)
-	// Absolute floor: a configured auto_promote_min_samples=0 is a LEGAL value, but
-	// `0 < 0` is false, so without this an explicit 0 would let a zero-evidence
-	// candidate promote. We never auto-promote on zero verifiable samples regardless
-	// of the configured minimum.
-	if samples == 0 {
-		return notifyOnly("no eval_run feedback samples; refusing to auto-promote on zero evidence (notify only)")
-	}
-	if samples < *policy.AutoPromoteMinSamples {
-		return notifyOnly(fmt.Sprintf("only %d feedback sample(s), below auto_promote_min_samples=%d; notify only", samples, *policy.AutoPromoteMinSamples))
-	}
-	passed = append(passed, fmt.Sprintf("%d samples >= %d", samples, *policy.AutoPromoteMinSamples))
 
-	// Guardrail: min_score. Unset, or a nil candidate score, is a hard do-not-promote.
+	// modeBConfidenceBacked is true when this candidate's promotion rests on pairwise
+	// bandit evidence rather than a harvested score/feedback run: a min_confidence
+	// floor is configured AND a confidence is present. On this path the bandit pulls
+	// are the samples and the preference is the quality signal, so the Mode A
+	// feedback-sample and score floors below are deferred to the confidence block —
+	// which is the single place the bandit-pull floor and confidence floor are
+	// enforced (with precise, Mode-B-worded reasons). The pull-count adequacy is NOT
+	// part of this predicate on purpose: a too-thin confidence must still reach the
+	// confidence block and be rejected there with the "below auto_promote_min_samples"
+	// reason, not silently fall back to the Mode A "zero evidence" stop.
+	modeBConfidenceBacked := policy.AutoPromoteMinConfidence != nil && confidence != nil
+
+	passed := make([]string, 0, 4)
+
+	// Guardrail: min_samples (Mode A feedback rows). On the Mode B confidence path the
+	// bandit pulls ARE the sample evidence (a real ask candidate has zero harvester
+	// feedback rows), so the sample floor is checked against the bandit pulls in the
+	// confidence block below instead of here.
+	if !modeBConfidenceBacked {
+		samples := len(feedbackEvents)
+		// Absolute floor: a configured auto_promote_min_samples=0 is a LEGAL value, but
+		// `0 < 0` is false, so without this an explicit 0 would let a zero-evidence
+		// candidate promote. We never auto-promote on zero verifiable samples regardless
+		// of the configured minimum.
+		if samples == 0 {
+			return notifyOnly("no eval_run feedback samples; refusing to auto-promote on zero evidence (notify only)")
+		}
+		if samples < *policy.AutoPromoteMinSamples {
+			return notifyOnly(fmt.Sprintf("only %d feedback sample(s), below auto_promote_min_samples=%d; notify only", samples, *policy.AutoPromoteMinSamples))
+		}
+		passed = append(passed, fmt.Sprintf("%d samples >= %d", samples, *policy.AutoPromoteMinSamples))
+	}
+
+	// Guardrail: min_score. Unset is always a hard do-not-promote. A nil candidate
+	// score is a hard stop ONLY on the Mode A path — a genuine Mode B candidate has no
+	// harvester score, so the bandit confidence stands in for it; a score that IS
+	// present must still clear the floor on either path.
 	if policy.AutoPromoteMinScore == nil {
 		return notifyOnly("auto_promote_min_score is not set; refusing to promote without a score floor (notify only)")
 	}
 	if candidate.Summary.Score == nil {
-		return notifyOnly("candidate has no score; cannot evaluate auto_promote_min_score (notify only)")
+		if !modeBConfidenceBacked {
+			return notifyOnly("candidate has no score; cannot evaluate auto_promote_min_score (notify only)")
+		}
+		// Mode B: no score is expected; the confidence gate below carries the burden.
+	} else {
+		score := *candidate.Summary.Score
+		if score < *policy.AutoPromoteMinScore {
+			return notifyOnly(fmt.Sprintf("score %.4g below auto_promote_min_score=%.4g; notify only", score, *policy.AutoPromoteMinScore))
+		}
+		passed = append(passed, fmt.Sprintf("score %.4g >= %.4g", score, *policy.AutoPromoteMinScore))
 	}
-	score := *candidate.Summary.Score
-	if score < *policy.AutoPromoteMinScore {
-		return notifyOnly(fmt.Sprintf("score %.4g below auto_promote_min_score=%.4g; notify only", score, *policy.AutoPromoteMinScore))
-	}
-	passed = append(passed, fmt.Sprintf("score %.4g >= %.4g", score, *policy.AutoPromoteMinScore))
 
 	// Guardrail: require_external_ci. At least one feedback event in the eval_run
 	// must be a real-CI positive (mirrors the harvester's vocabulary, never the
-	// raw 0.5 band).
+	// raw 0.5 band). Applies on both paths: a Mode B ask agent has no CI, so an
+	// operator leaves this off; if they set it anyway we fail safe.
 	if policy.AutoPromoteRequireExternalCI {
 		if !hasRealExternalCIPositive(feedbackEvents) {
 			return notifyOnly("auto_promote_require_external_ci is set but no eval_run feedback recorded a real external-CI pass; notify only")
@@ -138,7 +182,8 @@ func EvaluateAutoPromote(policy config.SkillOptPolicy, candidate CandidatePackag
 	// non-nil confidence at or above the floor, backed by at least
 	// AutoPromoteMinSamples bandit pulls (a Beta posterior on a couple of pulls can
 	// read 0.9 by luck — the tiering floor refuses thin evidence). nil/low/thin all
-	// fail safe to notify-only.
+	// fail safe to notify-only. On the Mode B path this floor IS the sample floor
+	// (the bandit pulls stand in for the absent harvester feedback rows).
 	if policy.AutoPromoteMinConfidence != nil {
 		floor := *policy.AutoPromoteMinConfidence
 		if confidence == nil {
