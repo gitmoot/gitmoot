@@ -461,8 +461,18 @@ not provide for ask agents. For a genuine ask candidate (no harvester score or
 feedback rows) the bandit pulls stand in for the Mode A sample/score floors, so the
 confidence gate alone can auto-promote it. `bandit_min_samples` (default 30) gates
 only the **deferred** auto loop; the manual A/B is always allowed. Live
-interception, the cross-family LLM-judge auto-pairwise, canary, and the auto A/B
-loop are deferred.
+interception, canary, and the auto A/B loop are deferred.
+
+Pass **`--judge`** (or set `[skillopt].mode_b_judge_enabled = true`, both **off by
+default**, #483) to ALSO have a **cross-family LLM judge** (a different runtime
+family than the agent under test) pick A/B from the **same shuffled** options and
+record a **separate** `RankedFeedbackEvent` (`reviewer`/`source =
+skillopt-ab-judge`) that **coexists with** and **weights below** the human row.
+The judge is **cross-family only** (skipped — never same-family — when no other
+family is available), **never** touches the promotion bandit, drops fail-safe on
+unparseable output, and its trust is **deferred to measure-the-judge (#344)**.
+`--judge-only` records only the judge row (skips the human prompt). Off ⇒
+byte-identical.
 
 ## Execution Model
 

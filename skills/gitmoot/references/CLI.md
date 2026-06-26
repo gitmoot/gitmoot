@@ -565,7 +565,7 @@ gitmoot skillopt candidate list [--template id]
 gitmoot skillopt candidate show <version-id>
 gitmoot skillopt candidate promote <version-id>
 gitmoot skillopt candidate reject <version-id> [--reason text]
-gitmoot skillopt ab <agent> "<prompt>" [--challenger <versionId>] [--pick a|b] [--seed N] [--home path]
+gitmoot skillopt ab <agent> "<prompt>" [--challenger <versionId>] [--pick a|b] [--seed N] [--judge] [--judge-only] [--home path]
 gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>
 gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id> [--reviewer name]
 gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]

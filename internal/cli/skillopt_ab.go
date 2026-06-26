@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"strings"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 	"github.com/jerryfane/gitmoot/internal/skillopt"
+	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
 // skillOptABSource is the contract source tag on every Mode B (#473) row: the
@@ -30,6 +32,26 @@ const (
 	skillOptABItemID          = "ab"
 	skillOptABChampionLabel   = "champion"
 	skillOptABChallengerLabel = "challenger"
+)
+
+// skillOptABJudgeSource / skillOptABJudgeReviewer tag the off-by-default
+// cross-family LLM-judge auto-pairwise row (#483). They are DISTINCT from the
+// human row's source/reviewer (skillopt-ab / human) so the judge's
+// RankedFeedbackEvent COEXISTS with the human row under the UNIQUE
+// (run_id,item_id,reviewer,source,source_url) conflict key instead of
+// overwriting it — separable evidence, weighted BELOW the human pick by the
+// source tag in the downstream export/optimizer.
+//
+// MEASURE-THE-JUDGE (#344/#345): the A/B judge is judge-derived, cross-family,
+// and weighted-low here; it is NOT calibrated against human gold in this slice.
+// It is judge-tagged + weighted-below-human + evidence-only (it NEVER touches
+// the promotion Beta-Bernoulli bandit) until a judge↔human agreement capture
+// per task-kind lands (#344/#345) and the optimizer can trust it more. Mirrors
+// internal/skillopt/cross_family_review.go's reviewReviewerID MEASURE-THE-JUDGE
+// note.
+const (
+	skillOptABJudgeSource   = "skillopt-ab-judge"
+	skillOptABJudgeReviewer = "skillopt-ab-judge"
 )
 
 // skillOptABVariant is one resolved A/B arm: the version being served plus its
@@ -56,6 +78,29 @@ type skillOptABDeliverFunc func(ctx context.Context, agent runtime.Agent, prompt
 // adapter path; overridden in tests). It is a var, not a const, exactly so the
 // CLI A/B test can supply a fake adapter.
 var skillOptABDeliver skillOptABDeliverFunc = realSkillOptABDeliver
+
+// skillOptABJudgeDeliver is the SEPARATE delivery seam for the off-by-default
+// cross-family LLM-judge call (#483). It defaults to the SAME real adapter path
+// as skillOptABDeliver (realSkillOptABDeliver builds the adapter from the passed
+// runtime.Agent's Runtime, so a judge Agent carrying a DIFFERENT family runs the
+// judge on that family), and is its own var purely so tests inject a
+// deterministic judge independent of the variant seam. The judge call is run
+// SERIALIZED after the two variant deliveries (a third sequential Deliver) so
+// per-runtime session locks never overlap — the same serialize-the-Deliver-calls
+// discipline realSkillOptABDeliver documents (a foreground ask strands a 30-min
+// runtime-session lock if it overlaps another on the same family).
+var skillOptABJudgeDeliver skillOptABDeliverFunc = realSkillOptABDeliver
+
+// skillOptABJudgeAuthedRuntimes is the injectable probe for which runtime
+// families are authed/available, used to let PickCrossFamilyReviewer materialize
+// an ephemeral cross-family judge leg only on a family that can actually run. It
+// defaults to the real daemonAuthedRuntimes probe (which runs live Health checks)
+// and is overridden in tests so unit tests stay deterministic and offline. It is
+// a var of the reviewAuthedRuntimes type so it shares the cross-family review
+// injection seam.
+var skillOptABJudgeAuthedRuntimes = func(repoScope string) reviewAuthedRuntimes {
+	return daemonAuthedRuntimes(repoScope)
+}
 
 // realSkillOptABDeliver resolves the agent's runtime adapter and delivers a
 // single one-shot prompt, returning the answer text. Each call is independent
@@ -86,6 +131,14 @@ type skillOptABOptions struct {
 	pick       string
 	seed       int64
 	seedSet    bool
+	// judge turns the off-by-default cross-family LLM-judge auto-pairwise path ON
+	// for this invocation (#483); the [skillopt].mode_b_judge_enabled config knob is
+	// the equivalent persistent admission gate. When neither is set the command is
+	// byte-identical to #473 (no judge selected, delivered, or recorded).
+	judge bool
+	// judgeOnly skips soliciting the human pick and records ONLY the judge row
+	// (mirrors the --pick non-interactive escape). It implies --judge.
+	judgeOnly bool
 }
 
 func runSkillOptAB(args []string, stdout, stderr io.Writer) int {
@@ -124,6 +177,8 @@ func parseSkillOptABOptions(args []string, stderr io.Writer) (skillOptABOptions,
 	challenger := fs.String("challenger", "", "challenger version id (defaults to the sole pending candidate)")
 	pick := fs.String("pick", "", "non-interactive pick: a or b (the shuffled option labels)")
 	seed := fs.Int64("seed", 0, "deterministic seed for the label shuffle and the P(>) Monte Carlo")
+	judge := fs.Bool("judge", false, "also have a cross-family LLM judge pick A/B and record a separate skillopt-ab-judge row (#483; off by default)")
+	judgeOnly := fs.Bool("judge-only", false, "record ONLY the cross-family judge row, skipping the human pick prompt (implies --judge)")
 	// Separate the leading positionals (agent, prompt) from flags. flag.Parse stops
 	// at the first non-flag, so collect positionals manually to allow them anywhere.
 	positionals := []string{}
@@ -160,6 +215,9 @@ func parseSkillOptABOptions(args []string, stderr io.Writer) (skillOptABOptions,
 		fmt.Fprintln(stderr, "skillopt ab --pick must be a or b")
 		return skillOptABOptions{}, false
 	}
+	// --judge-only implies --judge: recording only the judge row still requires the
+	// judge path to be admitted.
+	judgeOn := *judge || *judgeOnly
 	return skillOptABOptions{
 		home:       strings.TrimSpace(*home),
 		agent:      strings.TrimSpace(positionals[0]),
@@ -168,12 +226,14 @@ func parseSkillOptABOptions(args []string, stderr io.Writer) (skillOptABOptions,
 		pick:       pickValue,
 		seed:       *seed,
 		seedSet:    seedSet,
+		judge:      judgeOn,
+		judgeOnly:  *judgeOnly,
 	}, true
 }
 
 func printSkillOptABUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot skillopt ab <agent> \"<prompt>\" [--challenger <versionId>] [--pick a|b] [--seed N] [--home path]")
+	fmt.Fprintln(w, "  gitmoot skillopt ab <agent> \"<prompt>\" [--challenger <versionId>] [--pick a|b] [--seed N] [--judge] [--judge-only] [--home path]")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Champion-challenger A/B (#473 Mode B): serves the prompt through the agent's")
 	fmt.Fprintln(w, "current promoted template version (champion) AND a pending candidate version")
@@ -181,6 +241,13 @@ func printSkillOptABUsage(w io.Writer) {
 	fmt.Fprintln(w, "pairwise RankedFeedbackEvent (source=skillopt-ab), updates the Beta-Bernoulli")
 	fmt.Fprintln(w, "bandit, and prints P(challenger>champion). Manual only; no pending candidate is a")
 	fmt.Fprintln(w, "clean no-op.")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "--judge (or [skillopt].mode_b_judge_enabled, off by default) ALSO has a")
+	fmt.Fprintln(w, "CROSS-FAMILY LLM judge pick A/B from the same shuffled options and records a")
+	fmt.Fprintln(w, "SEPARATE skillopt-ab-judge RankedFeedbackEvent that coexists with (and weights")
+	fmt.Fprintln(w, "below) the human row. The judge NEVER touches the promotion bandit and is")
+	fmt.Fprintln(w, "skipped when no different runtime family is available. --judge-only records only")
+	fmt.Fprintln(w, "the judge row (skips the human pick prompt).")
 }
 
 func runSkillOptABWithStore(ctx context.Context, store *db.Store, paths config.Paths, options skillOptABOptions, stdout, stderr io.Writer) int {
@@ -248,6 +315,30 @@ func runSkillOptABWithStore(ctx context.Context, store *db.Store, paths config.P
 	fmt.Fprintf(stdout, "Option A:\n%s\n\n", optionA.answer)
 	fmt.Fprintf(stdout, "Option B:\n%s\n\n", optionB.answer)
 
+	// runID keeps the version-id prefix so every pick stays trivially filterable as
+	// Mode B for THIS challenger. The judge row (when enabled) reuses this SAME run
+	// and item so it coexists with the human row instead of forming a parallel run.
+	runID := skillOptABRunIDPrefix + challenger.version.ID
+
+	// OFF-BY-DEFAULT cross-family LLM-judge auto-pairwise (#483). When neither the
+	// --judge flag nor [skillopt].mode_b_judge_enabled is set, judgeEnabled is false
+	// and this whole branch is skipped — no cross-family reviewer is selected, no
+	// third Deliver happens, no judge row is written: byte-identical to #473. The
+	// judge delivery is the THIRD SERIALIZED Deliver (after both variants, before any
+	// interactive human pick) so per-runtime session locks never overlap; the judge
+	// sees the SAME shuffled Option A/B as the human (it never learns champion vs
+	// challenger), and its pick maps back through the SAME optionA/optionB mapping.
+	if skillOptABJudgeEnabled(paths, options) {
+		runSkillOptABJudge(ctx, store, paths, runtimeAgent, agent, runID, templateID, champion, challenger, optionA, optionB, options, stdout, stderr)
+	}
+
+	// --judge-only records ONLY the judge row above and skips the human pick + bandit
+	// update entirely (mirrors the --pick non-interactive escape). The human path is
+	// untouched in every other case.
+	if options.judgeOnly {
+		return 0
+	}
+
 	pick, ok := resolveSkillOptABPick(options.pick, stdout, stderr)
 	if !ok {
 		return 2
@@ -264,14 +355,12 @@ func runSkillOptABWithStore(ctx context.Context, store *db.Store, paths config.P
 		loserLabel = skillOptABChallengerLabel
 	}
 
-	// runID keeps the version-id prefix so every pick stays trivially filterable as
-	// Mode B for THIS challenger. pickSourceURL is a per-pick token that makes each
-	// recorded preference a DISTINCT contract row: the ranked_feedback_events
-	// conflict key is (run_id, item_id, reviewer, source, source_url), and the first
-	// four are identical across repeated A/Bs of the same challenger, so without a
-	// unique source_url an ON CONFLICT DO UPDATE would overwrite every prior pick and
-	// only the last preference would survive as evidence.
-	runID := skillOptABRunIDPrefix + challenger.version.ID
+	// pickSourceURL is a per-pick token that makes each recorded preference a
+	// DISTINCT contract row: the ranked_feedback_events conflict key is
+	// (run_id, item_id, reviewer, source, source_url), and the first four are
+	// identical across repeated A/Bs of the same challenger, so without a unique
+	// source_url an ON CONFLICT DO UPDATE would overwrite every prior pick and only
+	// the last preference would survive as evidence.
 	pickSourceURL := skillOptABPickSourceURL(challenger.version.ID)
 	if err := recordSkillOptABPick(ctx, store, paths, runID, pickSourceURL, templateID, champion, challenger, championDelivery, challengerDelivery, winnerLabel, loserLabel, options.prompt); err != nil {
 		fmt.Fprintf(stderr, "skillopt ab: record pick: %v\n", err)
@@ -453,6 +542,21 @@ func defaultReadSkillOptABLine() (string, bool) {
 // (ranking=[winner,loser], source=skillopt-ab) that passes
 // store.validateRankedFeedbackEventOptions.
 func recordSkillOptABPick(ctx context.Context, store *db.Store, paths config.Paths, runID, pickSourceURL, templateID string, champion, challenger skillOptABVariant, championDelivery, challengerDelivery skillOptABDelivery, winnerLabel, loserLabel, prompt string) error {
+	if err := ensureSkillOptABRunRows(ctx, store, paths, runID, templateID, champion, challenger, championDelivery, challengerDelivery, prompt); err != nil {
+		return err
+	}
+	return upsertSkillOptABRankedEvent(ctx, store, runID, winnerLabel, loserLabel, "human", skillOptABSource, pickSourceURL)
+}
+
+// ensureSkillOptABRunRows idempotently upserts the shared pairwise scaffolding for
+// one A/B run: the 2-option eval_run (OptionsCount=2, metadata
+// feedback_source=preference_ab), the eval_review_item, and the two
+// eval_review_options (champion/challenger) backed by the answer artifacts via the
+// blob path. Both the human-record path AND the judge-record path call it, so the
+// judge row is self-sufficient when --judge-only skips the human record, and the
+// rows are byte-identical when both run (every write here is an idempotent upsert
+// keyed by (run_id,item_id,label)).
+func ensureSkillOptABRunRows(ctx context.Context, store *db.Store, paths config.Paths, runID, templateID string, champion, challenger skillOptABVariant, championDelivery, challengerDelivery skillOptABDelivery, prompt string) error {
 	blobStore := artifact.NewStore(paths.ArtifactBlobs)
 
 	metadataJSON, err := json.Marshal(map[string]any{
@@ -506,7 +610,18 @@ func recordSkillOptABPick(ctx context.Context, store *db.Store, paths config.Pat
 			return err
 		}
 	}
+	return nil
+}
 
+// upsertSkillOptABRankedEvent writes ONE pairwise RankedFeedbackEvent
+// (ranking=[winner,loser], tie groups [[winner],[loser]]) for the given
+// reviewer/source/source_url over the existing run's two options. The
+// (run_id,item_id,reviewer,source,source_url) conflict key is what keeps the human
+// row (reviewer=human,source=skillopt-ab) and the judge row
+// (reviewer=skillopt-ab-judge,source=skillopt-ab-judge) as SEPARATE coexisting
+// rows on the same run/item, and what makes repeated picks each persist via a
+// distinct per-pick source_url.
+func upsertSkillOptABRankedEvent(ctx context.Context, store *db.Store, runID, winnerLabel, loserLabel, reviewer, source, sourceURL string) error {
 	ranking, err := json.Marshal([]string{winnerLabel, loserLabel})
 	if err != nil {
 		return err
@@ -521,13 +636,9 @@ func recordSkillOptABPick(ctx context.Context, store *db.Store, paths config.Pat
 		RankingJSON:   string(ranking),
 		TieGroupsJSON: string(tieGroups),
 		Winner:        winnerLabel,
-		Reviewer:      "human",
-		Source:        skillOptABSource,
-		// A distinct per-pick SourceURL makes the (run_id,item_id,reviewer,source,
-		// source_url) conflict key unique per pick, so repeated A/Bs of the same
-		// challenger each persist as their own immutable preference row instead of
-		// overwriting the prior one.
-		SourceURL: pickSourceURL,
+		Reviewer:      reviewer,
+		Source:        source,
+		SourceURL:     sourceURL,
 	})
 }
 
@@ -553,4 +664,193 @@ func answerOrPlaceholder(answer string) string {
 		return "(no answer)"
 	}
 	return answer
+}
+
+// skillOptABJudgeEnabled is the SINGLE admission gate for the off-by-default
+// cross-family LLM-judge auto-pairwise path (#483): the per-invocation --judge /
+// --judge-only flag OR the persistent [skillopt].mode_b_judge_enabled config knob.
+// When neither is set it returns false and the judge branch is skipped entirely —
+// byte-identical to #473. A config read error fails safe to OFF (the flag still
+// admits it) so a malformed config never turns the judge on by accident.
+func skillOptABJudgeEnabled(paths config.Paths, options skillOptABOptions) bool {
+	if options.judge {
+		return true
+	}
+	policy, err := config.LoadSkillOptPolicy(paths)
+	if err != nil {
+		return false
+	}
+	return policy.ModeBJudgeEnabled
+}
+
+// runSkillOptABJudge runs the off-by-default cross-family LLM-judge auto-pairwise
+// leg (#483) best-effort: it selects a CROSS-FAMILY judge (reusing #470's
+// PickCrossFamilyReviewer + the SelfFamily refinement), SKIPS on no-cross-family /
+// not-authed (never a silent same-family self-judgment), delivers the SAME shuffled
+// Option A/B text the human sees through the SERIALIZED third Deliver seam, parses
+// the judge's {"pick":"a"|"b"}, maps that pick back through the SAME optionA/optionB
+// mapping to the correct champion/challenger role, and records ONE separate
+// skillopt-ab-judge RankedFeedbackEvent that coexists with the human row. It NEVER
+// touches the promotion bandit and NEVER fails the command: every error path logs a
+// best-effort note and returns, leaving the human path intact (fail-safe).
+func runSkillOptABJudge(ctx context.Context, store *db.Store, paths config.Paths, runtimeAgent runtime.Agent, agent db.Agent, runID, templateID string, champion, challenger skillOptABVariant, optionA, optionB skillOptABDelivery, options skillOptABOptions, stdout, stderr io.Writer) {
+	// authedRuntimes probes which families can actually run, so an ephemeral judge
+	// leg is only materialized on an authed DIFFERENT family. The probe is injectable
+	// so unit tests stay deterministic/offline.
+	authed := map[string]bool{}
+	if probe := skillOptABJudgeAuthedRuntimes(agent.RepoScope); probe != nil {
+		authed = probe(ctx)
+	}
+	reviewer, ok, err := workflow.PickCrossFamilyReviewer(ctx, store, agent.Runtime, agent.RepoScope, authed)
+	if err != nil {
+		log.Printf("skillopt ab judge: select cross-family judge: %v", err)
+		return
+	}
+	// CROSS-FAMILY ONLY: SelfFamily (no different family available) or !ok (no
+	// review-capable runtime authed at all) means SKIP — never a same-family
+	// self-preference judgment of one's own template family. This is stricter than
+	// #470's same-family-with-warning, which is correct for an A/B judge of one's own
+	// family.
+	if !ok || reviewer.SelfFamily {
+		fmt.Fprintln(stdout, "skillopt ab: no cross-family judge available; skipping judge (cross-family only)")
+		return
+	}
+
+	judgeAgent := skillOptABJudgeAgent(reviewer)
+	prompt := buildSkillOptABJudgePrompt(options.prompt, optionA.answer, optionB.answer)
+	raw, err := skillOptABJudgeDeliver(ctx, judgeAgent, prompt)
+	if err != nil {
+		log.Printf("skillopt ab judge: deliver judge prompt: %v", err)
+		return
+	}
+	pick, parsed := parseSkillOptABJudgePick(raw)
+	if !parsed {
+		// Fail-safe: unparseable/empty/tie judge output drops the judge result — no
+		// row, no error escalation — exactly like ParseReviewRubric's HasScore=false
+		// "don't fabricate" stance. The human path is unaffected.
+		fmt.Fprintln(stdout, "skillopt ab: judge returned no usable pick; skipping judge row")
+		return
+	}
+
+	// Map the judge's a/b pick back to the role label via the SAME shuffle mapping
+	// the human pick uses (the judge saw the SAME debiased Option A/B), so an
+	// off-by-one here cannot silently invert the judged preference.
+	pickedDelivery := optionA
+	if pick == "b" {
+		pickedDelivery = optionB
+	}
+	winnerLabel := pickedDelivery.label
+	loserLabel := skillOptABChampionLabel
+	if winnerLabel == skillOptABChampionLabel {
+		loserLabel = skillOptABChallengerLabel
+	}
+
+	// Ensure the shared run/item/options exist (idempotent) so the judge row is
+	// self-sufficient even under --judge-only where the human record path never runs.
+	if err := ensureSkillOptABRunRows(ctx, store, paths, runID, templateID, champion, challenger, optionAToDelivery(optionA, optionB, champion), optionAToDelivery(optionA, optionB, challenger), options.prompt); err != nil {
+		log.Printf("skillopt ab judge: ensure run rows: %v", err)
+		return
+	}
+	judgeSourceURL := skillOptABJudgeSourceURL(challenger.version.ID)
+	if err := upsertSkillOptABRankedEvent(ctx, store, runID, winnerLabel, loserLabel, skillOptABJudgeReviewer, skillOptABJudgeSource, judgeSourceURL); err != nil {
+		log.Printf("skillopt ab judge: record judge pick: %v", err)
+		return
+	}
+
+	// Evidence-only, judge-tagged, weighted-below-human, NOT calibrated against human
+	// gold in this slice (MEASURE-THE-JUDGE, #344/#345). The judge NEVER increments
+	// the promotion Beta-Bernoulli bandit — promotion stays manual + human-driven.
+	fmt.Fprintf(stdout, "Judge (%s, cross-family): %s (Option %s) — recorded as %s (evidence-only, does not move the promotion bandit)\n",
+		reviewer.Runtime, winnerLabel, strings.ToUpper(pick), skillOptABJudgeSource)
+}
+
+// optionAToDelivery recovers the champion/challenger delivery from the shuffled
+// optionA/optionB pair by matching the role label, so the shared run-row scaffold
+// always registers the champion option with the champion answer and the challenger
+// option with the challenger answer regardless of the shuffle.
+func optionAToDelivery(optionA, optionB skillOptABDelivery, variant skillOptABVariant) skillOptABDelivery {
+	if optionA.label == variant.label {
+		return optionA
+	}
+	return optionB
+}
+
+// skillOptABJudgeAgent synthesizes the read-only runtime.Agent the judge runs as.
+// Its Runtime is the SELECTED CROSS-FAMILY reviewer family (a DIFFERENT family than
+// the agent under test), so realSkillOptABDeliver builds the adapter on that family
+// and the judgment is never a self-preference judgment of one's own template family.
+// A registered reviewer agent supplies its runtime ref/model; an ephemeral judge is
+// a synthetic read-only ask worker on the chosen family.
+func skillOptABJudgeAgent(reviewer workflow.CrossFamilyReviewer) runtime.Agent {
+	return runtime.Agent{
+		Name:           "gitmoot-ab-judge-" + reviewer.Runtime,
+		Role:           "ask",
+		Runtime:        reviewer.Runtime,
+		Capabilities:   []string{"ask"},
+		AutonomyPolicy: runtime.AutonomyPolicyReadOnly,
+	}
+}
+
+// buildSkillOptABJudgePrompt assembles the cross-family judge prompt from the SAME
+// shuffled Option A/Option B text the human sees (it NEVER learns which is champion
+// vs challenger — anti-position/identity bias), asking for a small
+// gitmoot_result-style JSON pick. The judge must return ONLY {"pick":"a"} or
+// {"pick":"b"}; anything else is dropped fail-safe by parseSkillOptABJudgePick.
+func buildSkillOptABJudgePrompt(userPrompt, optionA, optionB string) string {
+	var b strings.Builder
+	b.WriteString("You are an impartial cross-family judge comparing two answers to the SAME prompt. ")
+	b.WriteString("You do NOT know which answer is the established version and which is the candidate — judge ONLY on quality. ")
+	b.WriteString("This is a SOFT, advisory signal; it never promotes or blocks anything.\n\n")
+	b.WriteString("## Prompt\n")
+	b.WriteString(strings.TrimSpace(userPrompt) + "\n\n")
+	b.WriteString("## Option A\n")
+	b.WriteString(strings.TrimSpace(optionA) + "\n\n")
+	b.WriteString("## Option B\n")
+	b.WriteString(strings.TrimSpace(optionB) + "\n\n")
+	b.WriteString("Decide which option is the better answer. Return ONLY a JSON object of the form ")
+	b.WriteString(`{"pick":"a"} or {"pick":"b"} (no ties, no prose). Do NOT modify any files (read-only).`)
+	b.WriteString("\n")
+	return b.String()
+}
+
+// parseSkillOptABJudgePick extracts the judge's a/b pick from its raw output using
+// the existing brace-balanced jsonCandidates scan (reused from the cross-family
+// review parser), tolerating a result wrapped in surrounding prose. It accepts a
+// top-level {"pick":...} or a gitmoot_result-nested pick. ok=false on
+// empty/unparseable/ambiguous output (the fail-safe drop): a non-a/non-b value, no
+// JSON candidate, or no pick field at all all yield ("", false), so a garbled judge
+// never fabricates a preference.
+func parseSkillOptABJudgePick(raw string) (string, bool) {
+	for _, candidate := range jsonCandidates(raw) {
+		var envelope struct {
+			Pick          string `json:"pick"`
+			GitmootResult struct {
+				Pick     string `json:"pick"`
+				Metadata struct {
+					Pick string `json:"pick"`
+				} `json:"metadata"`
+			} `json:"gitmoot_result"`
+		}
+		if err := json.Unmarshal([]byte(candidate), &envelope); err != nil {
+			continue
+		}
+		pick := firstNonEmpty(
+			strings.ToLower(strings.TrimSpace(envelope.Pick)),
+			strings.ToLower(strings.TrimSpace(envelope.GitmootResult.Pick)),
+			strings.ToLower(strings.TrimSpace(envelope.GitmootResult.Metadata.Pick)),
+		)
+		if pick == "a" || pick == "b" {
+			return pick, true
+		}
+	}
+	return "", false
+}
+
+// skillOptABJudgeSourceURL mints a unique-per-judgment SourceURL for the judge's
+// RankedFeedbackEvent, mirroring skillOptABPickSourceURL but with a distinct judge
+// prefix so the judge row's (run_id,item_id,reviewer,source,source_url) conflict key
+// never collides with a human pick's and repeated judge runs each persist.
+func skillOptABJudgeSourceURL(versionID string) string {
+	seq := atomic.AddUint64(&skillOptABPickSeq, 1)
+	return fmt.Sprintf("%s%s:judge#%d-%d", skillOptABRunIDPrefix, versionID, time.Now().UnixNano(), seq)
 }

@@ -363,7 +363,7 @@ variants and feed the human's pick to the optimizer as a contract
 `RankedFeedbackEvent`.
 
 ```sh
-gitmoot skillopt ab <agent> "<prompt>" [--challenger <versionId>] [--pick a|b] [--seed N] [--home path]
+gitmoot skillopt ab <agent> "<prompt>" [--challenger <versionId>] [--pick a|b] [--seed N] [--judge] [--judge-only] [--home path]
 ```
 
 - **Champion** = the agent template's **current promoted** version; **challenger**
@@ -404,8 +404,45 @@ auto-promote guardrails.
 preferences and updates the posterior but the **deferred** auto A/B loop never
 runs and the confidence is never trusted to auto-promote (the promotion-side floor
 reuses `auto_promote_min_samples`). The **manual** `skillopt ab` CLI is always
-allowed. Live-traffic interception, the cross-family LLM-judge auto-pairwise,
-canary, and the auto A/B scheduling loop are **deferred** to follow-ons.
+allowed. Live-traffic interception, canary, and the auto A/B scheduling loop are
+**deferred** to follow-ons.
+
+### Cross-family LLM-judge auto-pairwise (off by default, #483)
+
+Every A/B pick needs a human in the loop, so the comparison signal is cheap to
+want but expensive to get. With `--judge` (or `[skillopt].mode_b_judge_enabled =
+true`, both **off by default**), in addition to the human pick a **cross-family
+LLM judge** — a runtime family **different** from the agent under test — also
+picks the better of the two answers automatically:
+
+```sh
+gitmoot skillopt ab <agent> "<prompt>" --judge      # human pick AND a judge row
+gitmoot skillopt ab <agent> "<prompt>" --judge-only # only the judge row (skip the human prompt)
+```
+
+- **Off by default:** with neither the flag nor the config knob set, no
+  cross-family judge is selected, no judge delivery happens, and no judge row is
+  written — **byte-identical** to the #473 human-only path.
+- **Cross-family only.** The judge family is chosen by the **same**
+  `PickCrossFamilyReviewer` selector Mode A uses; a `SelfFamily` result (no
+  different family available) is **skipped with a clear message**, never a silent
+  same-family self-judgment of one's own template family.
+- The judge is shown the **same shuffled Option A / Option B** the human sees (it
+  never learns champion vs challenger) and returns a small `{"pick":"a"|"b"}`,
+  parsed leniently; **unparseable / empty / tie output drops the judge result**
+  (no row, no error) — fail-safe. Its pick maps back through the **same** shuffle
+  mapping, so the recorded judge winner is the correct champion/challenger role.
+- The judge writes its **own** `RankedFeedbackEvent` with `reviewer =
+  skillopt-ab-judge` and `source = skillopt-ab-judge`, so it **coexists** with the
+  human `source = skillopt-ab` row on the same run/item (the conflict key differs
+  by reviewer+source) and is **weighted below human** by the source tag.
+- The judge is **evidence-only**: it **never** increments the promotion
+  Beta-Bernoulli bandit and **never** changes `P(challenger > champion)`. Promotion
+  stays manual + human-driven. **No contract struct changes — `ContractVersion`
+  stays `1`** (the only new differentiator is the source/reviewer tag value).
+- **Trust is gated on measure-the-judge (#344):** the judge row is judge-tagged
+  and weighted low here and is **not** calibrated against human gold in this slice
+  — judge-tagged now, calibrated later.
 
 ## Ranked Exploration Workflow
 

@@ -214,6 +214,65 @@ auto_promote_min_samples = lots
 	}
 }
 
+// TestLoadSkillOptPolicyModeBJudgeDefaultsOff proves the #483 cross-family
+// LLM-judge auto-pairwise knob defaults OFF (byte-identical to #473 when unset).
+func TestLoadSkillOptPolicyModeBJudgeDefaultsOff(t *testing.T) {
+	policy := DefaultSkillOptPolicy()
+	if policy.ModeBJudgeEnabled {
+		t.Fatalf("mode_b_judge_enabled must default false, got %+v", policy)
+	}
+}
+
+// TestLoadSkillOptPolicyParsesModeBJudge proves mode_b_judge_enabled round-trips:
+// true parses on, false parses off, an absent key leaves the default (off), and a
+// non-bool value surfaces a parse error (fail-safe).
+func TestLoadSkillOptPolicyParsesModeBJudge(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"true", "[skillopt]\nmode_b_judge_enabled = true\n", true},
+		{"false", "[skillopt]\nmode_b_judge_enabled = false\n", false},
+		{"absent leaves default off", "[skillopt]\nauto_trace_enabled = true\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			paths := PathsForHome(t.TempDir())
+			if err := Initialize(paths); err != nil {
+				t.Fatalf("Initialize returned error: %v", err)
+			}
+			if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+"\n"+tc.body), 0o600); err != nil {
+				t.Fatalf("write config returned error: %v", err)
+			}
+			policy, err := LoadSkillOptPolicy(paths)
+			if err != nil {
+				t.Fatalf("LoadSkillOptPolicy returned error: %v", err)
+			}
+			if policy.ModeBJudgeEnabled != tc.want {
+				t.Fatalf("ModeBJudgeEnabled = %v, want %v", policy.ModeBJudgeEnabled, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadSkillOptPolicyRejectsBadModeBJudge proves a non-bool mode_b_judge_enabled
+// surfaces a parse error rather than silently turning the judge on/off.
+func TestLoadSkillOptPolicyRejectsBadModeBJudge(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[skillopt]
+mode_b_judge_enabled = sometimes
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	if _, err := LoadSkillOptPolicy(paths); err == nil {
+		t.Fatal("expected an error for a non-bool mode_b_judge_enabled")
+	}
+}
+
 // TestLoadSkillOptPolicyIgnoresOtherSections proves a config that only sets
 // [events]/[orchestrate] leaves the trace-harvester at its disabled default.
 func TestLoadSkillOptPolicyIgnoresOtherSections(t *testing.T) {

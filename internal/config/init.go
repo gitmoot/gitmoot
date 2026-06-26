@@ -100,6 +100,14 @@ escalation_ttl = ""
 #     auto A/B loop. Below it the bandit still records preferences and updates its
 #     posterior but never auto-runs/auto-promotes off thin evidence. The manual
 #     'skillopt ab' CLI is always allowed regardless. (default 30)
+#   mode_b_judge_enabled (#483 Mode B): OFF by default. When true (or with the
+#     per-invocation 'skillopt ab --judge' flag), in addition to the human pick a
+#     CROSS-FAMILY LLM judge (a DIFFERENT runtime family than the agent under test)
+#     also picks the better of the two shuffled A/B answers and records a SEPARATE
+#     skillopt-ab-judge feedback row that COEXISTS with (and weights BELOW) the human
+#     row. The judge is cross-family ONLY (skipped — never same-family — when no other
+#     family is available), NEVER touches the promotion bandit, and is never the sole
+#     gate; its trust is DEFERRED to MEASURE-THE-JUDGE (#344). Off ⇒ byte-identical.
 # [skillopt]
 # auto_trace_enabled = false
 # cross_family_review_enabled = false
@@ -111,6 +119,7 @@ escalation_ttl = ""
 # auto_promote_canary = false
 # auto_promote_min_confidence = 0.95
 # bandit_min_samples = 30
+# mode_b_judge_enabled = false
 
 # [admission] is an OPT-IN, off-by-default host-global concurrency budget the
 # daemon applies BEFORE starting each agent session, on top of --workers/pool
