@@ -135,6 +135,84 @@ cap; when it would exceed the cap it is truncated on a UTF-8 boundary with a
 trailing `… (truncated)` marker. When no textual signal is present, `feedback`
 is empty.
 
+## Automatic trace-harvested feedback (Mode A, off by default)
+
+Gitmoot can derive training feedback from the **verifiable outcomes** an
+implement job already reaches — a PR that merged with passing external CI vs. one
+that was blocked at the merge gate, a review that requested changes, or a later
+revert — and write it as synthetic feedback into the **existing** feedback tables
+without any human ranking. This is **Mode A** of the trace-harvester (issue
+#465). It is **off by default** and **strictly additive**: `contract_version`
+stays `1`, no new field is added to any package struct, and **promotion stays
+100% manual** — the harvester writes only `eval_runs`, `eval_review_items`, and
+`feedback_events`; a human still promotes a candidate with
+`gitmoot skillopt candidate promote`.
+
+**Enabling.** Add a `[skillopt]` section to the gitmoot config:
+
+```toml
+[skillopt]
+auto_trace_enabled = true   # default false
+```
+
+With the key unset or `false`, no harvester is constructed and behavior — and
+every human-run training package — is **byte-identical**. The admission knob
+mirrors the off-by-default `[events]` stream.
+
+**What gets written.** On a verifiable implement-job outcome the harvester:
+
+- Resolves the job's template version from its `template_id` +
+  `template_resolved_commit` attribution.
+- Upserts one dedicated **auto-trace `eval_run` per template version**, with id
+  `auto-trace:<template_version_id>`, `mode = validate`, and
+  `metadata_json` carrying `feedback_source = automatic_trace`.
+- Upserts a per-PR `eval_review_item` (item id `<repo>#<pr>`).
+- Upserts one `FeedbackEvent` (not a ranked event — a single implement diff has
+  no paired second artifact) tagged `source = auto-trace`,
+  `reviewer = gitmoot-auto`, with the verifiable-outcome `score`/`feedback`
+  assembled by `skillopt.ProjectSignal` (above). A **positive** outcome is
+  `choice = a` (the current promoted template as the implicit baseline champion);
+  a **negative** is `choice = b`. The textual `reasoning` is the projected
+  `NormalizedSignal.feedback`.
+
+**Outcome → score.**
+
+- **Merged with real CI** (a passing non-`gitmoot/` external status/check at the
+  merged head) → strong positive (`soft = 1.0`, `choice = a`).
+- **Merged through an empty gate** (the synthetic `gitmoot/ci` context, or no
+  external CI at head) → **near-neutral** (`soft ≈ 0.5`, `choice = a`), never a
+  strong positive. Rewarding an empty gate would optimize toward "merges that
+  pass no real CI"; the no-CI guard reads the combined status at the merged head
+  SHA and demotes it.
+- **Blocked at the merge gate** → authoritative gate-fail (`hard = 0`,
+  `choice = b`).
+- **Review changes_requested** → graded negative (`choice = b`) whose score
+  decreases with the fix-round count.
+- **Reverted** → corrective negative. A later revert of a previously-merged PR
+  **re-upserts the same** `UNIQUE(run_id, item_id, reviewer, source, source_url)`
+  row, flipping the earlier positive `choice = a` to `choice = b` **in place**
+  (the row count is unchanged). **Not yet wired:** the projection and the
+  in-place corrective upsert are implemented and unit-tested, but no engine or
+  daemon path detects a revert and fires the `reverted` outcome today, so in a
+  running daemon a merged-then-reverted PR keeps its prior positive until revert
+  detection is wired (a follow-on). The corrective-overwrite mechanics above are
+  reachable only by invoking the harvester directly with a `reverted` outcome.
+
+**Scope.** Only implement-family jobs that carry a template attribution are
+harvested; coordinator continuation jobs (which produce no diff of their own) and
+non-implement jobs are skipped. Only genuine outcome transitions are harvested —
+operational job events (`runtime_lock_wait`, `repair_retry`,
+`comment_post_failed`, `advance_retry`, …) never produce feedback. Harvesting is
+**best-effort**: a harvest error never blocks or fails a job; it is swallowed and
+recorded as an `auto_trace_harvest_failed` job event.
+
+**Export side.** When `ExportTrainingPackage` runs over an auto-trace run, the
+run-level `feedback_context.feedback_source` is `automatic_trace` (rather than the
+human default `imported_human_review`), and the run lives in its own
+`auto-trace:<version>` namespace, so a consumer can filter or down-weight
+automatic feedback independently of sparse human gold. A human run never carries
+the `feedback_source` metadata key, so its export is byte-identical.
+
 ## Ranked Exploration Workflow
 
 Use ranked exploration when the template is still ambiguous and humans need to

@@ -72,7 +72,7 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	}
 	headSHA := strings.TrimSpace(pr.HeadSHA)
 	if headSHA == "" {
-		return g.block(ctx, request, "", "pull request head SHA is missing")
+		return g.block(ctx, request, "", "pull request head SHA is missing", MergeBlockTransient)
 	}
 	releaseCheckoutLock, err := g.acquireLocalCheckoutMutationLock(ctx, request)
 	if err != nil {
@@ -91,7 +91,7 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 		return g.finishMerged(ctx, request, pr, strings.TrimSpace(pr.MergeSHA))
 	}
 	if strings.TrimSpace(pr.State) == "closed" {
-		return g.block(ctx, request, headSHA, "pull request is closed without being merged")
+		return g.block(ctx, request, headSHA, "pull request is closed without being merged", MergeBlockQuality)
 	}
 	if g.Git != nil {
 		clean, err := g.Git.WorktreeClean(ctx)
@@ -99,12 +99,20 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 			return MergeDecision{}, err
 		}
 		if !clean {
-			return g.block(ctx, request, headSHA, "local worktree is not clean")
+			return g.block(ctx, request, headSHA, "local worktree is not clean", MergeBlockTransient)
 		}
 	}
 	if !request.ReviewOptional {
 		if err := g.ensureFinalReviewCaptured(ctx, request, headSHA); err != nil {
-			return g.block(ctx, request, headSHA, err.Error())
+			// A captured blocking review (mergeBlocked) is a template-quality rejection;
+			// every other review error (approval missing / not yet captured / head
+			// mismatch) is a transient/process condition the harvester must not score.
+			class := MergeBlockTransient
+			var blocked mergeBlocked
+			if errors.As(err, &blocked) {
+				class = MergeBlockQuality
+			}
+			return g.block(ctx, request, headSHA, err.Error(), class)
 		}
 	}
 	releaseMergeQueueLock, err := g.acquireMergeQueueLock(ctx, request, pr)
@@ -124,7 +132,7 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 		return decision, nil
 	}
 	if pr.Mergeable != nil && !*pr.Mergeable {
-		return g.block(ctx, request, headSHA, "pull request is not mergeable; rebase or update the branch")
+		return g.block(ctx, request, headSHA, "pull request is not mergeable; rebase or update the branch", MergeBlockTransient)
 	}
 	if err := g.ensureStatuses(ctx, repo, int64(request.PullRequest), headSHA); err != nil {
 		var pending mergePending
@@ -133,7 +141,8 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 		}
 		var blocked mergeBlocked
 		if errors.As(err, &blocked) {
-			return g.block(ctx, request, headSHA, blocked.reason)
+			// An external CI failure is an authoritative template-quality rejection.
+			return g.block(ctx, request, headSHA, blocked.reason, MergeBlockQuality)
 		}
 		return MergeDecision{}, err
 	}
@@ -344,7 +353,11 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		case "approved":
 			approved = true
 		case "changes_requested", "blocked", "failed":
-			return fmt.Errorf("latest review round has blocking result from %s", job.Agent)
+			// A captured blocking review is an authoritative template-quality rejection
+			// (mergeBlocked), distinct from the transient/process review errors below
+			// (missing approval, not-yet-captured), so the trace-harvester scores only
+			// this one as a negative (#465 INFRA-NOISE-FILTERED).
+			return mergeBlocked{reason: fmt.Sprintf("latest review round has blocking result from %s", job.Agent)}
 		}
 	}
 	if !approved {
@@ -359,7 +372,7 @@ func (g PolicyMergeGate) ensureBranchFresh(ctx context.Context, repo github.Repo
 		base = strings.TrimSpace(pr.BaseSHA)
 	}
 	if base == "" {
-		decision, err := g.block(ctx, request, headSHA, "pull request base ref is missing")
+		decision, err := g.block(ctx, request, headSHA, "pull request base ref is missing", MergeBlockTransient)
 		return decision, true, err
 	}
 	compare, err := g.GitHub.CompareCommits(ctx, repo, base, headSHA)
@@ -384,10 +397,10 @@ func (g PolicyMergeGate) ensureBranchFresh(ctx context.Context, repo github.Repo
 		case github.IsUpdatePullRequestBranchError(err, github.UpdatePullRequestBranchErrorConflict):
 			reason := fmt.Sprintf("branch update conflicts with %s; manual or agent fix required", base)
 			_ = g.postMergeConflictComment(ctx, repo, request, pr, reason)
-			decision, blockErr := g.block(ctx, request, headSHA, reason)
+			decision, blockErr := g.block(ctx, request, headSHA, reason, MergeBlockTransient)
 			return decision, true, blockErr
 		case github.IsUpdatePullRequestBranchError(err, github.UpdatePullRequestBranchErrorUnsupported):
-			decision, blockErr := g.block(ctx, request, headSHA, fmt.Sprintf("GitHub cannot update this pull request branch automatically: %s", err))
+			decision, blockErr := g.block(ctx, request, headSHA, fmt.Sprintf("GitHub cannot update this pull request branch automatically: %s", err), MergeBlockTransient)
 			return decision, true, blockErr
 		default:
 			decision, pendingErr := g.pending(ctx, request, headSHA, fmt.Sprintf("GitHub branch update failed transiently: %s; daemon will retry", err))
@@ -395,7 +408,7 @@ func (g PolicyMergeGate) ensureBranchFresh(ctx context.Context, repo github.Repo
 		}
 	}
 	if status != "" && status != "ahead" && status != "identical" {
-		decision, err := g.block(ctx, request, headSHA, fmt.Sprintf("pull request branch freshness is unknown: compare status %q", compare.Status))
+		decision, err := g.block(ctx, request, headSHA, fmt.Sprintf("pull request branch freshness is unknown: compare status %q", compare.Status), MergeBlockTransient)
 		return decision, true, err
 	}
 	return MergeDecision{}, false, nil
@@ -541,7 +554,12 @@ func reviewRoundAfter(left string, right string) bool {
 	return left > right
 }
 
-func (g PolicyMergeGate) block(ctx context.Context, request MergeRequest, sha string, reason string) (MergeDecision, error) {
+// block records a not-ready block at the given quality classification (#465). The
+// class is advisory metadata for the Mode-A trace-harvester only; it never changes
+// the block transition itself. Call sites pass MergeBlockQuality for authoritative
+// template-quality rejections (external CI failed, blocking review captured, closed
+// without merge) and MergeBlockTransient for branch-staleness/infra conditions.
+func (g PolicyMergeGate) block(ctx context.Context, request MergeRequest, sha string, reason string, class MergeBlockClass) (MergeDecision, error) {
 	if err := g.Store.UpsertMergeGate(ctx, db.MergeGate{RepoFullName: request.Repo, PullRequest: int64(request.PullRequest), State: "blocked", Reason: reason}); err != nil {
 		return MergeDecision{}, err
 	}
@@ -560,7 +578,7 @@ func (g PolicyMergeGate) block(ctx context.Context, request MergeRequest, sha st
 			return MergeDecision{}, err
 		}
 	}
-	return MergeDecision{Reason: reason}, nil
+	return MergeDecision{Reason: reason, BlockClass: class}, nil
 }
 
 func (g PolicyMergeGate) pending(ctx context.Context, request MergeRequest, sha string, reason string) (MergeDecision, error) {

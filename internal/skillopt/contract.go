@@ -792,6 +792,11 @@ func evaluatorConfigFromRunMetadata(metadata json.RawMessage) (json.RawMessage, 
 			delete(decoded, "mode")
 		}
 	}
+	// The run-level feedback_source override (set by the Mode-A auto-trace
+	// harvester, #465) is run metadata, not evaluator config — strip it so an
+	// auto-trace run does not surface a spurious evaluator_config. A human run
+	// never carries this key, so its export is unaffected.
+	delete(decoded, feedbackSourceMetadataKey)
 	if len(decoded) == 0 {
 		return nil, nil
 	}
@@ -811,12 +816,30 @@ func isTrainingMode(value string) bool {
 	}
 }
 
+// FeedbackSourceHumanReview is the run-level feedback_source the export stamps on
+// a human-ranked run (the historical default).
+const FeedbackSourceHumanReview = "imported_human_review"
+
+// FeedbackSourceAutomaticTrace is the run-level feedback_source the export stamps
+// on a Mode-A auto-trace run (#465). The harvester sets this in the auto-trace
+// eval_run's metadata_json under feedbackSourceMetadataKey so the optimizer/export
+// side can filter or down-weight automatic feedback independently of sparse human
+// gold, WITHOUT a new contract field or a ContractVersion bump. A human run never
+// carries this key, so its exported feedback_context stays byte-identical.
+const FeedbackSourceAutomaticTrace = "automatic_trace"
+
+// feedbackSourceMetadataKey is the eval_run metadata_json key the export reads to
+// override the run-level feedback_source. It is set only by the auto-trace
+// harvester; a human run omits it (so the default FeedbackSourceHumanReview is
+// used and the bytes are unchanged).
+const feedbackSourceMetadataKey = "feedback_source"
+
 func buildTrainingFeedbackContext(run db.EvalRun, feedback []FeedbackEvent, ranked []RankedFeedbackEvent) (json.RawMessage, error) {
 	if len(feedback) == 0 && len(ranked) == 0 {
 		return nil, nil
 	}
 	context := map[string]any{
-		"feedback_source":        "imported_human_review",
+		"feedback_source":        runFeedbackSource(run),
 		"feedback_target":        "baseline_review_outputs",
 		"review_run_id":          run.ID,
 		"reviewed_skill_version": run.TemplateVersionID,
@@ -832,6 +855,35 @@ func buildTrainingFeedbackContext(run db.EvalRun, feedback []FeedbackEvent, rank
 		return nil, err
 	}
 	return raw, nil
+}
+
+// runFeedbackSource resolves the run-level feedback_source the export stamps into
+// feedback_context. It defaults to FeedbackSourceHumanReview and is overridden
+// ONLY when the run's metadata_json carries a non-empty feedbackSourceMetadataKey
+// (set by the Mode-A auto-trace harvester). This keeps every human run's export
+// byte-identical (its metadata never carries the key) while letting an auto-trace
+// run surface feedback_source=automatic_trace.
+func runFeedbackSource(run db.EvalRun) string {
+	metadata := strings.TrimSpace(run.MetadataJSON)
+	if metadata == "" {
+		return FeedbackSourceHumanReview
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(metadata), &decoded); err != nil {
+		return FeedbackSourceHumanReview
+	}
+	raw, ok := decoded[feedbackSourceMetadataKey]
+	if !ok {
+		return FeedbackSourceHumanReview
+	}
+	var source string
+	if err := json.Unmarshal(raw, &source); err != nil {
+		return FeedbackSourceHumanReview
+	}
+	if source = strings.TrimSpace(source); source != "" {
+		return source
+	}
+	return FeedbackSourceHumanReview
 }
 
 func reviewIssueFromFeedback(feedback []FeedbackEvent, ranked []RankedFeedbackEvent) string {

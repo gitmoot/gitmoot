@@ -361,3 +361,74 @@ func validateEventsPolicy(policy EventsPolicy) error {
 	}
 	return nil
 }
+
+// SkillOptPolicy is the host-level template-learning policy read from the
+// [skillopt] section of the gitmoot config (#465, Mode A). It gates the
+// off-by-default automatic trace-harvester: when AutoTraceEnabled is false (the
+// default) NO OutcomeHarvester is constructed and behavior is byte-identical
+// (no synthetic feedback rows are ever written). It mirrors EventsPolicy's
+// off-by-default admission knob; the daemon uses it to decide whether to wire a
+// best-effort harvester into the workflow engine. Promotion stays 100% manual
+// regardless of this knob — the harvester only writes eval/feedback rows.
+type SkillOptPolicy struct {
+	// AutoTraceEnabled opts the daemon into Mode A automatic trace-harvested
+	// feedback (#465): when true, an implement job's verifiable terminal outcome
+	// (merge merged/blocked, review decision, revert) is projected into a synthetic
+	// FeedbackEvent in a dedicated auto-trace eval_run. Empty/false (the default)
+	// means OFF: no harvester is constructed and the daemon writes nothing extra.
+	AutoTraceEnabled bool
+}
+
+func DefaultSkillOptPolicy() SkillOptPolicy {
+	return SkillOptPolicy{
+		AutoTraceEnabled: false,
+	}
+}
+
+// Enabled reports whether the automatic trace-harvester is configured on. With
+// no [skillopt] config (the default) it is OFF and no harvester is constructed.
+func (p SkillOptPolicy) Enabled() bool {
+	return p.AutoTraceEnabled
+}
+
+func LoadSkillOptPolicy(paths Paths) (SkillOptPolicy, error) {
+	content, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		return SkillOptPolicy{}, err
+	}
+	policy := DefaultSkillOptPolicy()
+	current := false
+	for _, raw := range strings.Split(string(content), "\n") {
+		line := strings.TrimSpace(stripConfigComment(raw))
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section := strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
+			current = strings.TrimSpace(section) == "skillopt"
+			continue
+		}
+		if !current {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		if err := applySkillOptPolicyField(&policy, strings.TrimSpace(key), strings.TrimSpace(value)); err != nil {
+			return SkillOptPolicy{}, fmt.Errorf("parse [skillopt].%s: %w", strings.TrimSpace(key), err)
+		}
+	}
+	return policy, nil
+}
+
+func applySkillOptPolicyField(policy *SkillOptPolicy, key string, value string) error {
+	switch key {
+	case "auto_trace_enabled":
+		parsed, err := strconv.ParseBool(value)
+		policy.AutoTraceEnabled = parsed
+		return err
+	default:
+		return nil
+	}
+}

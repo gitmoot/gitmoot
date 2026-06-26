@@ -46,6 +46,18 @@ type Engine struct {
 	// terminal cases it owns through the SAME sink so the whole terminal set is
 	// covered. #445 (the ask-gate) rides this seam to emit its job.needs_attention.
 	EventSink events.Sink
+	// OutcomeHarvester is the injected, best-effort, nil-by-default seam (#465,
+	// Mode A) the engine calls after a verifiable implement-job outcome transition
+	// (merge merged/blocked, review changes_requested, revert) to harvest a
+	// synthetic {score, feedback} FeedbackEvent for the job's template version. It
+	// mirrors EventSink/EscalationNotifier: optional and nil-safe (when nil — the
+	// default, no [skillopt].auto_trace_enabled — NO Outcome is constructed and
+	// Harvest is never called, so behavior is byte-identical), and best-effort (a
+	// Harvest error is swallowed and recorded as an auto_trace_harvest_failed job
+	// event, never returned up). It writes ONLY eval/feedback rows and never
+	// promotes. The concrete impl lives in internal/skillopt and is wired only in
+	// cli (daemonWorkflowEngine), keeping the engine free of skillopt coupling.
+	OutcomeHarvester OutcomeHarvester
 	// Home is the resolved GITMOOT_HOME root used to place per-delegation
 	// worktrees. DelegationWorktrees is the checkout-bound git client that
 	// performs the worktree-add. Both are optional: when either is unset, the
@@ -274,7 +286,36 @@ type MergeDecision struct {
 	Merged         bool
 	MergeCommitSHA string
 	Reason         string
+	// BlockClass classifies a not-ready block (Ready=false) so the Mode-A
+	// trace-harvester (#465) only scores AUTHORITATIVE template-quality rejections as
+	// a negative and skips transient/infra blocks (branch staleness, dirty local
+	// worktree, missing-SHA/base, freshness-unknown). It is the zero value
+	// (MergeBlockNone) for a ready/merged decision and is purely advisory — it never
+	// changes the block/merge transition itself, so behavior is byte-identical when
+	// the harvester is off.
+	BlockClass MergeBlockClass
 }
+
+// MergeBlockClass classifies a merge-gate block (#465 INFRA-NOISE-FILTERED).
+type MergeBlockClass int
+
+const (
+	// MergeBlockNone is the zero value (a ready/merged decision, or a block whose
+	// class was not set). The harvester treats an unclassified block conservatively
+	// as transient (no negative) so a missed classification under-rewards rather than
+	// pollutes the corpus with a false negative.
+	MergeBlockNone MergeBlockClass = iota
+	// MergeBlockQuality is an authoritative template-quality rejection — external CI
+	// failed, the latest review captured a blocking result, or the PR was closed
+	// without merging. These are the only blocks the harvester scores as a negative.
+	MergeBlockQuality
+	// MergeBlockTransient is an operational/branch-staleness/infra condition (not
+	// mergeable; rebase, dirty local worktree, missing head/base SHA, branch update
+	// conflict, freshness unknown) that says nothing about template quality. The
+	// harvester skips it so branch-staleness and daemon-machine state are not
+	// mis-attributed to the template.
+	MergeBlockTransient
+)
 
 type MergeGate interface {
 	Evaluate(ctx context.Context, request MergeRequest) (MergeDecision, error)
@@ -322,6 +363,108 @@ type EscalationRequest struct {
 // comment that @-tags the human with the resume instructions.
 type EscalationNotifier interface {
 	NotifyEscalation(ctx context.Context, request EscalationRequest) error
+}
+
+// OutcomeKind enumerates the verifiable terminal/outcome transitions the engine
+// reports to the OutcomeHarvester (#465, Mode A). Only GENUINE outcome
+// transitions are reported; operational job_events (runtime_lock_wait,
+// repair_retry, comment_post_failed, advance_retry, …) are structurally excluded
+// because the harvester is hooked at the outcome seams (runMergeGate result,
+// dispatchFix), not the job_events firehose.
+type OutcomeKind string
+
+const (
+	// OutcomeMerged is reported after a PR merges through the merge gate (a
+	// positive). The harvester applies the no-CI guard at the PR HEAD SHA (where the
+	// gate posted statuses/checks) before scoring it as a strong positive.
+	OutcomeMerged OutcomeKind = "merged"
+	// OutcomeBlocked is reported when the merge gate rejects the action
+	// (decision not ready) — an authoritative gate-fail negative.
+	OutcomeBlocked OutcomeKind = "blocked"
+	// OutcomeChangesRequested is reported on a review changes_requested decision
+	// that dispatches a fix round — a graded negative whose severity grows with the
+	// fix-round count.
+	OutcomeChangesRequested OutcomeKind = "changes_requested"
+	// OutcomeReverted is reported when a previously-merged PR's work is later
+	// reverted — a delayed, corrective negative that overwrites the prior positive
+	// in place on the same UNIQUE feedback key.
+	//
+	// NOT YET WIRED (#465): the harvester's projection + corrective in-place upsert
+	// for this kind are implemented and unit-tested (the same per-PR item_id
+	// re-upserts and flips choice a->b), but NO engine/daemon code path constructs
+	// an Outcome{Kind: OutcomeReverted} today — there is no revert detection in
+	// AdvanceJob, runMergeGate, or the daemon PR-watcher. The corrective-on-revert
+	// flow is therefore reachable only via a direct Harvest call (tests); a
+	// production revert does not yet overwrite the prior positive. Wiring real
+	// revert detection (the daemon observing a revert PR/commit of a previously
+	// harvested merge, re-firing harvestOutcomeForMergeGate for the reverted PR) is
+	// a follow-on; see CORRECTIVE-ON-REVERT in docs/skillopt-exchange-contract.md.
+	OutcomeReverted OutcomeKind = "reverted"
+)
+
+// Outcome carries the verifiable signal the engine derives at an outcome seam and
+// hands to the OutcomeHarvester (#465). The engine fills only the fields it
+// already knows from the transition (kind, merge/review context, the merged head
+// SHA, the PR URL); the harvester owns the no-CI guard read and the projection
+// into a {score, feedback} FeedbackEvent. It is a pure value with no behavior so
+// the engine stays free of any skillopt/db-write coupling.
+type Outcome struct {
+	// Kind is the verifiable transition that fired.
+	Kind OutcomeKind
+	// Repo is the "owner/name" the PR lives in.
+	Repo string
+	// PullRequest is the PR number, used (with Repo) to build the deterministic
+	// per-PR feedback item_id / source_url UNIQUE key.
+	PullRequest int
+	// HeadSHA is the PR HEAD SHA (for OutcomeMerged) the harvester reads the combined
+	// status / check-runs at for the no-CI guard — the SHA the merge gate evaluated
+	// and posted statuses/checks at, NOT the merge commit (GitHub does not copy
+	// statuses/checks onto the merge commit). It falls back to the merge commit SHA
+	// only when the payload head SHA is empty.
+	HeadSHA string
+	// Reason is the merge-gate rejection reason for OutcomeBlocked (free text from
+	// merge_gates.Reason), surfaced verbatim in the negative feedback reasoning.
+	Reason string
+	// FixRounds is the review-round number at a changes_requested decision (round 1
+	// is the first), used to grade the negative: more rounds => worse score.
+	FixRounds int
+}
+
+// OutcomeHarvester is the injected, best-effort, nil-by-default seam (#465, Mode
+// A) the engine calls AFTER a verifiable implement-job outcome transition. The
+// concrete implementation lives in internal/skillopt and writes a synthetic
+// FeedbackEvent (and its eval_run/eval_review_item) into the EXISTING feedback
+// tables so a template accrues training signal from verifiable outcomes without
+// human ranking. It NEVER promotes — a human still promotes a candidate.
+//
+// It mirrors EventSink/EscalationNotifier: optional and nil-safe (when nil — the
+// default, no [skillopt].auto_trace_enabled — the engine neither constructs an
+// Outcome nor calls Harvest, so behavior is byte-identical), and best-effort (a
+// Harvest error never blocks or fails a job — the engine swallows it and records
+// an auto_trace_harvest_failed job event). The harvester itself decides whether a
+// job is in scope (implement-family with a resolvable template version, skipping
+// coordinator continuations) and returns nil for out-of-scope jobs.
+type OutcomeHarvester interface {
+	Harvest(ctx context.Context, job db.Job, payload JobPayload, outcome Outcome) error
+}
+
+// harvestOutcome calls the injected OutcomeHarvester best-effort: it is nil-safe
+// (no harvester => no-op), and a harvester error is swallowed and recorded as a
+// best-effort auto_trace_harvest_failed job event — it is NEVER returned up, so a
+// harvest failure can never block or fail a job (mirrors emitDaemonTerminalEvent /
+// EscalationNotifier). It must only be called on a GENUINE verifiable outcome
+// transition (#465).
+func (e Engine) harvestOutcome(ctx context.Context, job db.Job, payload JobPayload, outcome Outcome) {
+	if e.OutcomeHarvester == nil {
+		return
+	}
+	if err := e.OutcomeHarvester.Harvest(ctx, job, payload, outcome); err != nil {
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "auto_trace_harvest_failed",
+			Message: string(outcome.Kind) + ": " + err.Error(),
+		})
+	}
 }
 
 type BlockedError struct {
@@ -828,7 +971,23 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 			if err := e.setTaskState(ctx, ref, TaskChangesRequested); err != nil {
 				return err
 			}
-			return e.dispatchFix(ctx, reviewer, payload, *payload.Result, ref)
+			if err := e.dispatchFix(ctx, reviewer, payload, *payload.Result, ref); err != nil {
+				return err
+			}
+			// Verifiable graded negative (#465): a review asked for changes, so the
+			// implement job's diff did not pass review. Harvested AFTER dispatchFix so a
+			// harvest error can never affect the (already-completed) fix dispatch. The
+			// fix-round count (the review round number, round 1 = first) grades severity:
+			// more rounds => a worse score.
+			e.harvestOutcomeForMergeGate(ctx, payload, Outcome{
+				Kind:        OutcomeChangesRequested,
+				Repo:        payload.Repo,
+				PullRequest: payload.PullRequest,
+				HeadSHA:     payload.HeadSHA,
+				Reason:      strings.TrimSpace(payload.Result.Summary),
+				FixRounds:   reviewRoundCount(payload.ReviewRound),
+			})
+			return nil
 		case "approved":
 			ready, err := e.allRequiredReviewersApproved(ctx, reviewer, payload)
 			if err != nil {
@@ -3837,6 +3996,18 @@ func reviewRoundNumber(round string) (int, bool) {
 	return number, true
 }
 
+// reviewRoundCount maps a review-round label to a 1-based fix-round count for the
+// Mode-A harvester's graded changes_requested negative (#465): "review-1" => 1,
+// "review-3" => 3. An empty or unparseable round (a first/legacy review with no
+// numbered round) counts as 1, so a single changes_requested is always at least
+// the first fix round. The harvester turns a higher count into a worse score.
+func reviewRoundCount(round string) int {
+	if number, ok := reviewRoundNumber(strings.TrimSpace(round)); ok && number >= 1 {
+		return number
+	}
+	return 1
+}
+
 func (e Engine) requiredReviewers(payload JobPayload) []string {
 	reviewers := compactStrings(append([]string{}, payload.Reviewers...))
 	if len(reviewers) == 0 {
@@ -4084,12 +4255,118 @@ func (e Engine) runMergeGate(ctx context.Context, reviewer string, payload JobPa
 		if reason == "" {
 			reason = "merge gate rejected action"
 		}
-		return decision, e.block(ctx, ref, reason)
+		// e.block returns a BlockedError on SUCCESS (the task is durably blocked) and
+		// a plain error only on a store failure. Harvest the verifiable negative (#465)
+		// only when the block transition itself succeeded — i.e. the returned error is
+		// a BlockedError — AND the block is an AUTHORITATIVE template-quality rejection
+		// (external CI failed, blocking review captured, closed-without-merge). A
+		// transient/infra block (branch staleness, dirty local worktree, missing
+		// head/base SHA, freshness-unknown) says nothing about template quality, so it
+		// is NOT harvested — otherwise branch-staleness/infra noise would be
+		// mis-attributed to the template as a false Hard=0 negative (#465
+		// INFRA-NOISE-FILTERED). A real store error skips the harvest and returns up.
+		// Best-effort and nil-safe: a harvest error can never affect the (already-
+		// durable) block.
+		err := e.block(ctx, ref, reason)
+		var blocked BlockedError
+		if errors.As(err, &blocked) && decision.BlockClass == MergeBlockQuality {
+			e.harvestOutcomeForMergeGate(ctx, payload, Outcome{
+				Kind:        OutcomeBlocked,
+				Repo:        payload.Repo,
+				PullRequest: payload.PullRequest,
+				HeadSHA:     payload.HeadSHA,
+				Reason:      reason,
+			})
+		}
+		return decision, err
 	}
 	if decision.Merged {
-		return decision, e.setTaskState(ctx, ref, TaskMerged)
+		if err := e.setTaskState(ctx, ref, TaskMerged); err != nil {
+			return decision, err
+		}
+		// Verifiable positive (#465): a merge through the gate. Carry the PR HEAD SHA
+		// (not the merge commit) so the harvester's no-CI guard can read
+		// GetCombinedStatus/ListPullRequestChecks at the SHA the merge gate actually
+		// evaluated and posted statuses/checks at — GitHub does not copy them onto the
+		// new merge commit, so reading the merge commit would always look like no CI.
+		// Fall back to the merge commit only if the head SHA is somehow empty.
+		mergedHead := strings.TrimSpace(payload.HeadSHA)
+		if mergedHead == "" {
+			mergedHead = strings.TrimSpace(decision.MergeCommitSHA)
+		}
+		e.harvestOutcomeForMergeGate(ctx, payload, Outcome{
+			Kind:        OutcomeMerged,
+			Repo:        payload.Repo,
+			PullRequest: payload.PullRequest,
+			HeadSHA:     mergedHead,
+		})
+		return decision, nil
 	}
 	return decision, e.setTaskState(ctx, ref, TaskReadyToMerge)
+}
+
+// harvestOutcomeForMergeGate resolves the implement job that owns this PR/task and
+// harvests the merge-gate outcome against it (#465). runMergeGate runs in the
+// context of the APPROVING REVIEW job (or a merge-gate re-run), so the outcome
+// must be attributed to the implement job that produced the diff/PR — the one
+// carrying the TemplateID/TemplateResolvedCommit. When no implement job can be
+// resolved (best-effort), the harvest is skipped. Nil-safe: a nil harvester
+// short-circuits before any lookup.
+func (e Engine) harvestOutcomeForMergeGate(ctx context.Context, reviewPayload JobPayload, outcome Outcome) {
+	if e.OutcomeHarvester == nil {
+		return
+	}
+	job, payload, ok := e.implementJobForTask(ctx, reviewPayload)
+	if !ok {
+		return
+	}
+	e.harvestOutcome(ctx, job, payload, outcome)
+}
+
+// implementJobForTask finds the implement job that produced the diff/PR for the
+// task the given payload belongs to, so a merge-gate outcome fired from a review
+// job is attributed to the right template version (#465). It prefers the most
+// recent implement job for the same task/PR. Returns ok=false when none exists
+// (e.g. a PR opened outside the implement flow) so the caller skips the harvest.
+func (e Engine) implementJobForTask(ctx context.Context, reviewPayload JobPayload) (db.Job, JobPayload, bool) {
+	jobs, err := e.Store.ListJobs(ctx)
+	if err != nil {
+		return db.Job{}, JobPayload{}, false
+	}
+	var best db.Job
+	var bestPayload JobPayload
+	found := false
+	for _, job := range jobs {
+		if job.Type != "implement" {
+			continue
+		}
+		payload, err := unmarshalPayload(job.Payload)
+		if err != nil {
+			continue
+		}
+		if !sameTask(reviewPayload, payload) {
+			continue
+		}
+		// Prefer the latest implement job so the freshest diff's template version is
+		// the one credited. ListJobs orders by id and populates UpdatedAt; compare by
+		// UpdatedAt then id as a stable, deterministic tiebreak.
+		if !found || implementJobNewer(job, best) {
+			best = job
+			bestPayload = payload
+			found = true
+		}
+	}
+	return best, bestPayload, found
+}
+
+// implementJobNewer reports whether candidate is a later implement job than
+// current, ordering by UpdatedAt then id so the harvester credits the freshest
+// diff's template version deterministically.
+func implementJobNewer(candidate db.Job, current db.Job) bool {
+	if candidate.UpdatedAt != current.UpdatedAt {
+		return candidate.UpdatedAt > current.UpdatedAt
+	}
+	return candidate.ID > current.ID
 }
 
 func (e Engine) mergeGateReviewRequired(ctx context.Context, payload JobPayload) (bool, error) {
