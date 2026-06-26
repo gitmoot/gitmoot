@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 )
@@ -146,5 +147,119 @@ func TestKillDelegationTreeResolvesChildToRoot(t *testing.T) {
 	}
 	if got := countJobEvents(t, store, "root", "delegation_killed"); got != 1 {
 		t.Fatalf("delegation_killed events on root = %d, want 1", got)
+	}
+}
+
+// TestKillDelegationTreeReleasesLocksAndTerminalizesQueuedChildren pins the
+// companion cleanup defects #479 + #480: a kill releases the resource/branch
+// locks owned by every tree job and eagerly cancels the tree's QUEUED child
+// legs, while leaving running children and queued continuations untouched.
+func TestKillDelegationTreeReleasesLocksAndTerminalizesQueuedChildren(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "w", []string{"ask"}, "jerryfane/gitmoot")
+
+	// Root coordinator (self-roots; succeeded).
+	insertCompletedJob(t, store, db.Job{ID: "root", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo: "jerryfane/gitmoot", TaskID: "task-9", Sender: "coord",
+		Result: &AgentResult{Decision: "approved", Summary: "tree"},
+	})
+
+	mustCreateJob := func(id, state string, payload JobPayload) {
+		t.Helper()
+		encoded, err := marshalPayload(payload)
+		if err != nil {
+			t.Fatalf("marshalPayload(%s) returned error: %v", id, err)
+		}
+		if err := store.CreateJob(ctx, db.Job{ID: id, Agent: "w", Type: "ask", State: state, Payload: encoded}); err != nil {
+			t.Fatalf("CreateJob(%s) returned error: %v", id, err)
+		}
+	}
+
+	// QUEUED child leg — must be cancelled.
+	mustCreateJob("root/delegation/c1", string(JobQueued), JobPayload{
+		Repo: "jerryfane/gitmoot", Sender: "w", RootJobID: "root", DelegationID: "d1",
+	})
+	// RUNNING child leg — must stay running (graceful).
+	mustCreateJob("root/delegation/c2", string(JobRunning), JobPayload{
+		Repo: "jerryfane/gitmoot", Sender: "w", RootJobID: "root", DelegationID: "d2",
+	})
+	// QUEUED continuation (DelegationID == "") — must stay queued to drive the
+	// #305 graceful finalize.
+	mustCreateJob("root/continuation", string(JobQueued), JobPayload{
+		Repo: "jerryfane/gitmoot", Sender: "w", RootJobID: "root", DelegationID: "",
+	})
+
+	// Acquire locks owned by the root and two child legs.
+	now := time.Now()
+	expires := now.Add(time.Hour).Format(time.RFC3339Nano)
+	for _, lk := range []struct{ key, owner string }{
+		{"repo:a", "root"},
+		{"repo:b", "root/delegation/c1"},
+		{"branch:c", "root/delegation/c2"},
+	} {
+		acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+			ResourceKey: lk.key, OwnerJobID: lk.owner, OwnerToken: "t", ExpiresAt: expires,
+		}, now)
+		if err != nil {
+			t.Fatalf("AcquireResourceLock(%s) returned error: %v", lk.key, err)
+		}
+		if !acquired {
+			t.Fatalf("AcquireResourceLock(%s) = false, want true", lk.key)
+		}
+	}
+
+	if _, err := KillDelegationTree(ctx, store, "root"); err != nil {
+		t.Fatalf("KillDelegationTree returned error: %v", err)
+	}
+
+	// (#480) Queued child leg terminalized with a cancelled event.
+	if got := mustJob(t, store, "root/delegation/c1").State; got != string(JobCancelled) {
+		t.Fatalf("queued child leg state = %q, want %q", got, JobCancelled)
+	}
+	if got := countJobEvents(t, store, "root/delegation/c1", "cancelled"); got != 1 {
+		t.Fatalf("queued child cancelled events = %d, want 1", got)
+	}
+	// Running leg unchanged.
+	if got := mustJob(t, store, "root/delegation/c2").State; got != string(JobRunning) {
+		t.Fatalf("running child leg state = %q, want %q (must run to completion)", got, JobRunning)
+	}
+	// Continuation unchanged.
+	if got := mustJob(t, store, "root/continuation").State; got != string(JobQueued) {
+		t.Fatalf("continuation state = %q, want %q (must still run finalize)", got, JobQueued)
+	}
+
+	// (#479) No locks remain owned by any tree job.
+	locks, err := store.ListResourceLocks(ctx)
+	if err != nil {
+		t.Fatalf("ListResourceLocks returned error: %v", err)
+	}
+	treeOwners := map[string]bool{"root": true, "root/delegation/c1": true, "root/delegation/c2": true}
+	for _, l := range locks {
+		if treeOwners[l.OwnerJobID] {
+			t.Fatalf("lock %q still owned by tree job %q after kill", l.ResourceKey, l.OwnerJobID)
+		}
+	}
+
+	// Existing behavior preserved.
+	if got := countJobEvents(t, store, "root", "delegation_killed"); got != 1 {
+		t.Fatalf("delegation_killed events = %d, want 1", got)
+	}
+
+	// Idempotency: a second kill must not error or duplicate events.
+	if _, err := KillDelegationTree(ctx, store, "root"); err != nil {
+		t.Fatalf("second KillDelegationTree returned error: %v", err)
+	}
+	if got := countJobEvents(t, store, "root", "delegation_killed"); got != 2 {
+		// SetRootJobKilled + delegation_killed are emitted unconditionally on each
+		// call; what must stay stable is the child cancellation, asserted below.
+		t.Logf("delegation_killed events after re-kill = %d", got)
+	}
+	if got := mustJob(t, store, "root/delegation/c1").State; got != string(JobCancelled) {
+		t.Fatalf("queued child leg state after re-kill = %q, want %q", got, JobCancelled)
+	}
+	if got := countJobEvents(t, store, "root/delegation/c1", "cancelled"); got != 1 {
+		t.Fatalf("queued child cancelled events after re-kill = %d, want 1 (no dup)", got)
 	}
 }

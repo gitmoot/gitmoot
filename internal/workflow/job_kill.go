@@ -63,6 +63,46 @@ func KillDelegationTree(ctx context.Context, store *db.Store, jobID string) (db.
 	}); err != nil {
 		return db.Job{}, err
 	}
+	// Best-effort tree cleanup (#479 + #480). The kill's contract — the root flag
+	// plus the delegation_killed event — is already committed above, so neither
+	// step here may turn a successful kill into an error. This mirrors CancelJob's
+	// documented philosophy that incidental lock cleanup must never fail the
+	// operation. If the tree walk itself fails, skip cleanup and return the
+	// already-killed root.
+	if tree, terr := store.ListJobsByRoot(ctx, root.ID); terr == nil {
+		for _, j := range tree {
+			// (#480) Eagerly terminalize QUEUED, not-yet-started delegation child
+			// legs. Guard exactly like daemon.go queuedChildOfKilledRoot: skip the
+			// root (rootID == j.ID) and skip continuations (DelegationID == ""),
+			// which must still run to drive the #305 graceful finalize. Only real
+			// child legs are cancelled. The from=queued transition is idempotent: a
+			// re-kill or a leg that raced to running simply does not match.
+			if j.State == string(JobQueued) {
+				if p, perr := unmarshalPayload(j.Payload); perr == nil {
+					rootID := strings.TrimSpace(p.RootJobID)
+					if rootID != "" && rootID != j.ID && strings.TrimSpace(p.DelegationID) != "" {
+						_, _ = store.TransitionJobStateWithEvent(ctx, j.ID, string(JobQueued), string(JobCancelled), db.JobEvent{
+							JobID:   j.ID,
+							Kind:    string(JobCancelled),
+							Message: fmt.Sprintf("delegation tree rooted at %s killed; queued child leg cancelled before start", root.ID),
+						})
+					}
+				}
+			}
+			// (#479) Release any resource/branch locks this tree job owns, using the
+			// same owner-scoped call CancelJob uses. Running children are NOT
+			// transitioned, so they keep executing to completion — only their DB
+			// lock row is dropped. DeleteResourceLocksByOwner returns 0 on a re-kill,
+			// so the lock_released event is not duplicated.
+			if released, derr := store.DeleteResourceLocksByOwner(ctx, j.ID); derr == nil && released > 0 {
+				_ = store.AddJobEvent(ctx, db.JobEvent{
+					JobID:   j.ID,
+					Kind:    "lock_released",
+					Message: fmt.Sprintf("released %d resource lock(s) on delegation kill of tree %s", released, root.ID),
+				})
+			}
+		}
+	}
 	root.RootKilled = true
 	return root, nil
 }
