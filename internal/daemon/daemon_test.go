@@ -2308,6 +2308,7 @@ func testStore(t *testing.T) *db.Store {
 type fakeGitHub struct {
 	pulls                 []github.PullRequest
 	pullsByState          map[string][]github.PullRequest
+	pullsByNumber         map[int64]github.PullRequest
 	issues                []github.Issue
 	comments              map[int64][]github.IssueComment
 	posted                []postedComment
@@ -2423,7 +2424,12 @@ func (f *fakeGitHub) UpdatePullRequestBranch(context.Context, github.UpdatePullR
 	return github.UpdatePullRequestBranchResult{}, errors.New("not implemented")
 }
 
-func (f *fakeGitHub) GetPullRequest(context.Context, github.Repository, int64) (github.PullRequest, error) {
+func (f *fakeGitHub) GetPullRequest(_ context.Context, _ github.Repository, number int64) (github.PullRequest, error) {
+	if f.pullsByNumber != nil {
+		if pull, ok := f.pullsByNumber[number]; ok {
+			return pull, nil
+		}
+	}
 	return github.PullRequest{}, errors.New("not implemented")
 }
 

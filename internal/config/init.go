@@ -65,7 +65,11 @@ escalation_ttl = ""
 # event emission, and promotion stays fully MANUAL. auto_trace_enabled opts the
 # daemon into harvesting an implement job's verifiable terminal outcome into a
 # synthetic feedback event; cross_family_review_enabled (requires auto_trace) adds
-# a down-weighted cross-family review soft signal. auto_promote (#471) opts into
+# a down-weighted cross-family review soft signal. revert_detection_enabled (#467,
+# requires auto_trace; UNSET = on) lets the daemon detect a merged GitHub
+# Revert-button PR (body "Reverts owner/repo#NN") and CORRECT the original PR's
+# auto-trace positive to a negative in place; set it false to keep the harvester on
+# but turn the (delayed, corrective) revert overwrites OFF. auto_promote (#471) opts into
 # AUTO-PROMOTING a newly-pending candidate, but ONLY when every configured
 # guardrail below holds — any uncertainty fails safe to notify-only (no promote).
 # A pending candidate ALWAYS emits candidate.awaiting_promotion when [events] is
@@ -103,6 +107,7 @@ escalation_ttl = ""
 # [skillopt]
 # auto_trace_enabled = false
 # cross_family_review_enabled = false
+# revert_detection_enabled = true
 # auto_promote = false
 # auto_promote_min_samples = 0
 # auto_promote_min_score = 0.0

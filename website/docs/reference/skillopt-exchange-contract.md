@@ -206,12 +206,22 @@ mirrors the off-by-default `[events]` stream.
 - **Reverted** → corrective negative. A later revert of a previously-merged PR
   **re-upserts the same** `UNIQUE(run_id, item_id, reviewer, source, source_url)`
   row, flipping the earlier positive `choice = a` to `choice = b` **in place**
-  (the row count is unchanged). **Not yet wired:** the projection and the
-  in-place corrective upsert are implemented and unit-tested, but no engine or
-  daemon path detects a revert and fires the `reverted` outcome today, so in a
-  running daemon a merged-then-reverted PR keeps its prior positive until revert
-  detection is wired (a follow-on). The corrective-overwrite mechanics above are
-  reachable only by invoking the harvester directly with a `reverted` outcome.
+  (the row count is unchanged). **Wired (#467):** the daemon PR-watcher detects a
+  GitHub Revert-button PR — whose body is `Reverts owner/repo#NN` / `Reverts #NN`,
+  same-repo only — being **merged**, parses the **original** PR number, and (via
+  `Engine.HandlePullRequestReverted` → `implementJobForTask` → the harvester)
+  fires the `reverted` outcome against the original PR's auto-trace row, attributed
+  to the original implement job's template version. It is gated off-by-default on
+  `auto_trace_enabled` **and** the optional opt-out `revert_detection_enabled`
+  (unset = on whenever the harvester is on; set `false` to keep the harvester
+  running but turn the corrective revert overwrites off). It is best-effort and
+  fail-safe: a malformed/cross-repo body, an unresolvable original implement job,
+  or a harvest error never blocks or fails the poll. Re-polling the persistent
+  revert PR is idempotent (the in-place upsert re-writes the same `choice = b`
+  row). **Not detected** (best-effort v1): a revert opened without the
+  `Reverts #NN` body line, or a `git revert` pushed straight to the default branch
+  with no PR. With `auto_trace_enabled` off (the default) **no PR body is parsed**
+  and behavior is byte-identical.
 
 **Scope.** Only implement-family jobs that carry a template attribution are
 harvested; coordinator continuation jobs (which produce no diff of their own) and

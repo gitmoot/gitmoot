@@ -60,11 +60,16 @@ func (r Repository) FullName() string {
 }
 
 type PullRequest struct {
-	Number    int64  `json:"number"`
-	Title     string `json:"title"`
-	State     string `json:"state"`
-	URL       string `json:"html_url"`
-	Merged    bool   `json:"merged"`
+	Number int64  `json:"number"`
+	Title  string `json:"title"`
+	State  string `json:"state"`
+	URL    string `json:"html_url"`
+	Merged bool   `json:"merged"`
+	// Body is the PR description. It is additive (#467): the daemon's revert
+	// detection reads it for a GitHub Revert-button body (`Reverts owner/repo#NN`)
+	// to map a revert back to the original PR. It defaults to "" so every existing
+	// caller that ignores it is byte-identical.
+	Body      string `json:"body"`
 	HeadRef   string
 	BaseRef   string
 	BaseSHA   string
@@ -80,6 +85,7 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 		State     string `json:"state"`
 		URL       string `json:"html_url"`
 		Merged    bool   `json:"merged"`
+		Body      string `json:"body"`
 		Mergeable *bool  `json:"mergeable"`
 		MergeSHA  string `json:"merge_commit_sha"`
 		Head      struct {
@@ -100,6 +106,7 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 	p.State = decoded.State
 	p.URL = decoded.URL
 	p.Merged = decoded.Merged
+	p.Body = decoded.Body
 	p.Mergeable = decoded.Mergeable
 	p.HeadRef = decoded.Head.Ref
 	p.HeadSHA = decoded.Head.SHA

@@ -235,3 +235,118 @@ webhook_url = "https://example.test/hook"
 		t.Fatalf("SkillOptPolicy must stay disabled when only [events] is set, got %+v", policy)
 	}
 }
+
+// TestRevertDetectionDefaultsOnWithAutoTrace: the #467 sub-knob is UNSET by default
+// (nil) and rides AutoTraceEnabled — RevertDetectionEnabled() is true whenever the
+// harvester is on with no extra config, but false when auto_trace is off.
+func TestRevertDetectionDefaultsOnWithAutoTrace(t *testing.T) {
+	policy := DefaultSkillOptPolicy()
+	if policy.RevertDetection != nil {
+		t.Fatalf("revert_detection must default UNSET (nil), got %+v", policy.RevertDetection)
+	}
+	// auto_trace off (the default) => detection off, byte-identical.
+	if policy.RevertDetectionEnabled() {
+		t.Fatal("RevertDetectionEnabled() must be false with auto_trace off")
+	}
+	// auto_trace on, knob unset => detection ON (nil = on-when-harvester-on).
+	policy.AutoTraceEnabled = true
+	if !policy.RevertDetectionEnabled() {
+		t.Fatal("RevertDetectionEnabled() must be true with auto_trace on and the knob unset")
+	}
+}
+
+// TestRevertDetectionRequiresAutoTrace: revert_detection_enabled = true alone
+// (without auto_trace) is OFF — RevertDetectionEnabled() requires the harvester.
+func TestRevertDetectionRequiresAutoTrace(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[skillopt]
+revert_detection_enabled = true
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	policy, err := LoadSkillOptPolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadSkillOptPolicy returned error: %v", err)
+	}
+	if policy.RevertDetection == nil || !*policy.RevertDetection {
+		t.Fatalf("revert_detection_enabled = true should parse to *true, got %+v", policy.RevertDetection)
+	}
+	if policy.RevertDetectionEnabled() {
+		t.Fatal("RevertDetectionEnabled() must be false without auto_trace_enabled (requires the harvester)")
+	}
+}
+
+// TestRevertDetectionOptOutWithAutoTrace: auto_trace on but
+// revert_detection_enabled = false keeps the harvester on while turning the
+// corrective revert overwrites OFF.
+func TestRevertDetectionOptOutWithAutoTrace(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[skillopt]
+auto_trace_enabled = true
+revert_detection_enabled = false
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	policy, err := LoadSkillOptPolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadSkillOptPolicy returned error: %v", err)
+	}
+	if !policy.Enabled() {
+		t.Fatal("auto_trace_enabled = true should keep the harvester on")
+	}
+	if policy.RevertDetection == nil || *policy.RevertDetection {
+		t.Fatalf("revert_detection_enabled = false should parse to *false, got %+v", policy.RevertDetection)
+	}
+	if policy.RevertDetectionEnabled() {
+		t.Fatal("RevertDetectionEnabled() must be false when explicitly opted out")
+	}
+}
+
+// TestRevertDetectionEnabledWithAutoTraceExplicitTrue: both auto_trace and
+// revert_detection_enabled = true => RevertDetectionEnabled().
+func TestRevertDetectionEnabledWithAutoTraceExplicitTrue(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[skillopt]
+auto_trace_enabled = true
+revert_detection_enabled = true
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	policy, err := LoadSkillOptPolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadSkillOptPolicy returned error: %v", err)
+	}
+	if !policy.RevertDetectionEnabled() {
+		t.Fatalf("RevertDetectionEnabled() must be true with both knobs on, got %+v", policy)
+	}
+}
+
+// TestRevertDetectionRejectsBadBool: a non-bool revert_detection_enabled is a load
+// error (the daemon fail-safes to disabled around it).
+func TestRevertDetectionRejectsBadBool(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[skillopt]
+revert_detection_enabled = maybe
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	if _, err := LoadSkillOptPolicy(paths); err == nil {
+		t.Fatal("expected an error for a non-bool revert_detection_enabled")
+	}
+}

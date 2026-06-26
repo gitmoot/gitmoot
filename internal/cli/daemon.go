@@ -271,13 +271,14 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		defaultJobWorker(store, stdout, *home).applyOrchestratePolicy(&engine)
 		fmt.Fprintf(stdout, "watching %s every %s\n", repo.FullName(), poll.String())
 		return runSingleRepoSupervisor(ctx, *home, daemon.Daemon{
-			Repo:          repo,
-			PollInterval:  *poll,
-			Store:         store,
-			GitHub:        gh,
-			Workflow:      &engine,
-			WatchIssues:   *watchIssues,
-			EscalationTTL: resolveEscalationTTL(*home),
+			Repo:                   repo,
+			PollInterval:           *poll,
+			Store:                  store,
+			GitHub:                 gh,
+			Workflow:               &engine,
+			WatchIssues:            *watchIssues,
+			EscalationTTL:          resolveEscalationTTL(*home),
+			RevertDetectionEnabled: resolveRevertDetectionEnabled(*home),
 		}, store, *workers, usePool, session, stdout)
 	})
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -1292,16 +1293,17 @@ func (s registeredRepoSchedule) ensure() registeredRepoSchedule {
 }
 
 type registeredRepoPoller struct {
-	Store           *db.Store
-	Workers         int
-	DryRun          bool
-	Stdout          io.Writer
-	RecoveryOnly    bool
-	WatchIssues     bool
-	EscalationTTL   time.Duration
-	CheckoutLocks   *repoCheckoutLocks
-	GitHubClient    func(checkout string) github.Client
-	WorkflowFactory func(store *db.Store, gh github.Client, checkout string) *workflow.Engine
+	Store                  *db.Store
+	Workers                int
+	DryRun                 bool
+	Stdout                 io.Writer
+	RecoveryOnly           bool
+	WatchIssues            bool
+	EscalationTTL          time.Duration
+	RevertDetectionEnabled bool
+	CheckoutLocks          *repoCheckoutLocks
+	GitHubClient           func(checkout string) github.Client
+	WorkflowFactory        func(store *db.Store, gh github.Client, checkout string) *workflow.Engine
 }
 
 // defaultRegisteredRepoPoller wires the registered-repo supervisor's per-tick
@@ -1321,12 +1323,13 @@ type registeredRepoPoller struct {
 // leaves ArtifactRoot/Home/EventSink unset.
 func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdout io.Writer, rawHome, resolvedRoot string) registeredRepoPoller {
 	return registeredRepoPoller{
-		Store:         store,
-		Workers:       workers,
-		DryRun:        dryRun,
-		Stdout:        stdout,
-		EscalationTTL: resolveEscalationTTL(rawHome),
-		GitHubClient:  func(checkout string) github.Client { return github.NewClient(checkout) },
+		Store:                  store,
+		Workers:                workers,
+		DryRun:                 dryRun,
+		Stdout:                 stdout,
+		EscalationTTL:          resolveEscalationTTL(rawHome),
+		RevertDetectionEnabled: resolveRevertDetectionEnabled(rawHome),
+		GitHubClient:           func(checkout string) github.Client { return github.NewClient(checkout) },
 		WorkflowFactory: func(store *db.Store, gh github.Client, checkout string) *workflow.Engine {
 			engine := daemonWorkflowEngine(store, gh, checkout, resolvedRoot)
 			// Apply only the escalate_human notifier handle from policy (#340),
@@ -1448,12 +1451,13 @@ func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, 
 		}
 	}
 	d := daemon.Daemon{
-		Repo:          repo,
-		Store:         store,
-		GitHub:        gh,
-		Workflow:      engine,
-		WatchIssues:   p.WatchIssues,
-		EscalationTTL: p.EscalationTTL,
+		Repo:                   repo,
+		Store:                  store,
+		GitHub:                 gh,
+		Workflow:               engine,
+		WatchIssues:            p.WatchIssues,
+		EscalationTTL:          p.EscalationTTL,
+		RevertDetectionEnabled: p.RevertDetectionEnabled,
 	}
 	if recoveryOnly {
 		err = d.PollRecoveryCommandsOnce(ctx)

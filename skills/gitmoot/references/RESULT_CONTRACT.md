@@ -474,15 +474,18 @@ table is intentionally **not** implemented yet; the budget is in raw tokens.
 When `[skillopt].auto_trace_enabled = true` (default `false`), gitmoot derives
 template-learning feedback from the **verifiable outcomes** an implement job
 reaches — merged with passing CI vs. blocked at the merge gate, review
-`changes_requested` (a later revert is supported by the harvester but not yet
-fired by any engine/daemon path — see the contract doc) — and writes a synthetic
-`FeedbackEvent` (`source = auto-trace`, `reviewer = gitmoot-auto`, A/B `choice`,
-`feedback_source = automatic_trace`) into a dedicated per-template-version
-`auto-trace:<version>` eval run. This is **additive** (`contract_version` stays
-`1`, no new result field), **best-effort** (a harvest error never blocks or fails
-a job; it records an `auto_trace_harvest_failed` job event), and **never
-promotes** — a human still promotes a candidate. With the knob unset, no
-harvester runs and behavior is byte-identical. See
+`changes_requested`, and a later **revert** (wired #467: the daemon detects a
+merged GitHub Revert-button PR whose body is `Reverts owner/repo#NN`, maps it back
+to the original PR's auto-trace row, and overwrites the prior positive with a
+negative in place — gated additionally on the optional opt-out
+`revert_detection_enabled`, unset = on whenever the harvester is on) — and writes
+a synthetic `FeedbackEvent` (`source = auto-trace`, `reviewer = gitmoot-auto`, A/B
+`choice`, `feedback_source = automatic_trace`) into a dedicated
+per-template-version `auto-trace:<version>` eval run. This is **additive**
+(`contract_version` stays `1`, no new result field), **best-effort** (a harvest
+error never blocks or fails a job; it records an `auto_trace_harvest_failed` job
+event), and **never promotes** — a human still promotes a candidate. With the knob
+unset, no harvester runs and behavior is byte-identical. See
 `docs/skillopt-exchange-contract.md` for the outcome→score mapping, the no-CI
 guard, and the corrective-on-revert overwrite.
 

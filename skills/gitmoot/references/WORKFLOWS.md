@@ -389,10 +389,15 @@ ranking. Enable it per host in `[skillopt]`:
 [skillopt]
 auto_trace_enabled = true            # off by default
 cross_family_review_enabled = false  # off by default; also needs auto_trace_enabled
+revert_detection_enabled = true      # unset = on when auto_trace_enabled; set false to opt out (#467)
 ```
 
 With `auto_trace_enabled = true`, a merge (passing CI vs. empty-gate), a
-merge-gate block, or a review `changes_requested` is projected into a synthetic
+merge-gate block, a review `changes_requested`, or a later **revert** (the daemon
+detects a merged GitHub Revert-button PR — body `Reverts owner/repo#NN` — and
+overwrites the original PR's positive with a negative in place; gated additionally
+on `revert_detection_enabled`, unset = on, set `false` to keep the harvester on
+but turn revert overwrites off) is projected into a synthetic
 `FeedbackEvent` (`reviewer = gitmoot-auto`, `feedback_source = automatic_trace`)
 in a per-template-version `auto-trace:<version>` eval run. It is additive
 (`contract_version` stays `1`), best-effort (a failure records an

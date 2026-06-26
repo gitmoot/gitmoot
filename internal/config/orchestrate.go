@@ -390,6 +390,21 @@ type SkillOptPolicy struct {
 	// per merge is a real cost surface, so it must be opt-in.
 	CrossFamilyReviewEnabled bool
 
+	// RevertDetectionEnabled is the optional opt-OUT sub-knob for the corrective
+	// OutcomeReverted harvest (#467): the daemon detects a GitHub Revert-button PR
+	// (`Reverts owner/repo#NN`) being merged, maps it to the ORIGINAL PR's auto-trace
+	// row, and overwrites the prior positive with a negative in place. It is a
+	// *bool: nil (unset, the default) means ON whenever the harvester is on — so it
+	// rides AutoTraceEnabled with no extra config. An explicit false turns the
+	// (delayed, corrective) revert overwrites OFF while keeping the harvester running
+	// for merge/block/changes-requested. RevertDetectionEnabled() encodes the
+	// dependency (AutoTraceEnabled AND (nil || *ptr)), mirroring ReviewEnabled().
+	// With AutoTraceEnabled false this is irrelevant — no detection ever runs and no
+	// PR body is parsed (byte-identical default). The field is named RevertDetection
+	// (not …Enabled) because Go forbids a field and method sharing a name; the
+	// RevertDetectionEnabled() method below is the resolved accessor callers use.
+	RevertDetection *bool
+
 	// AutoPromote opts into the off-by-default auto-promote policy (#471): when
 	// false (the default) a newly-pending candidate is ONLY notified
 	// (candidate.awaiting_promotion) and NEVER auto-promoted — promotion stays
@@ -450,6 +465,7 @@ func DefaultSkillOptPolicy() SkillOptPolicy {
 	return SkillOptPolicy{
 		AutoTraceEnabled:                false,
 		CrossFamilyReviewEnabled:        false,
+		RevertDetection:                 nil,
 		AutoPromote:                     false,
 		AutoPromoteMinSamples:           nil,
 		AutoPromoteMinScore:             nil,
@@ -473,6 +489,17 @@ func (p SkillOptPolicy) Enabled() bool {
 // so enabling the review knob alone — without the auto-trace harvester — is OFF.
 func (p SkillOptPolicy) ReviewEnabled() bool {
 	return p.AutoTraceEnabled && p.CrossFamilyReviewEnabled
+}
+
+// RevertDetectionEnabled reports whether the corrective OutcomeReverted harvest
+// (#467) is configured on. It requires AutoTraceEnabled (a revert overwrite only
+// makes sense inside the auto-trace run) AND the optional opt-OUT sub-knob
+// revert_detection_enabled: nil (unset, the default) is ON-when-the-harvester-is-on,
+// an explicit false turns ONLY the revert overwrites off. With AutoTraceEnabled
+// false this is always false — no detection runs and no PR body is parsed
+// (byte-identical default), mirroring ReviewEnabled()'s dependency on AutoTraceEnabled.
+func (p SkillOptPolicy) RevertDetectionEnabled() bool {
+	return p.AutoTraceEnabled && (p.RevertDetection == nil || *p.RevertDetection)
 }
 
 func LoadSkillOptPolicy(paths Paths) (SkillOptPolicy, error) {
@@ -516,6 +543,13 @@ func applySkillOptPolicyField(policy *SkillOptPolicy, key string, value string) 
 		parsed, err := strconv.ParseBool(value)
 		policy.CrossFamilyReviewEnabled = parsed
 		return err
+	case "revert_detection_enabled":
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return err
+		}
+		policy.RevertDetection = &parsed
+		return nil
 	case "auto_promote":
 		parsed, err := strconv.ParseBool(value)
 		policy.AutoPromote = parsed

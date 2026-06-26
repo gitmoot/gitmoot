@@ -483,6 +483,51 @@ func TestGetPullRequestDecodesBaseSHA(t *testing.T) {
 	runner.wantArgs(t, 0, "api", "repos/jerryfane/gitmoot/pulls/2")
 }
 
+// TestGetPullRequestDecodesBody proves PullRequest.UnmarshalJSON decodes the wire
+// `body` field into the additive PullRequest.Body (#467) so the daemon's revert
+// detection can read a GitHub Revert-button body (`Reverts owner/repo#NN`).
+func TestGetPullRequestDecodesBody(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{
+			Stdout: `{"number": 9, "title": "Revert \"Add feature\"", "state": "closed", "merged": true, "html_url": "https://github.com/jerryfane/gitmoot/pull/9", "body": "Reverts jerryfane/gitmoot#7", "head": {"ref": "revert-7", "sha": "rev123"}, "base": {"ref": "main", "sha": "base123"}}`,
+		}},
+	}
+	client := GhClient{Runner: runner}
+
+	pr, err := client.GetPullRequest(context.Background(), Repository{Owner: "jerryfane", Name: "gitmoot"}, 9)
+
+	if err != nil {
+		t.Fatalf("GetPullRequest returned error: %v", err)
+	}
+	if pr.Body != "Reverts jerryfane/gitmoot#7" {
+		t.Fatalf("pull request body = %q, want the Reverts anchor", pr.Body)
+	}
+	if !pr.Merged {
+		t.Fatalf("pull request merged = %v, want true", pr.Merged)
+	}
+}
+
+// TestGetPullRequestBodyDefaultsEmpty proves Body defaults to "" when the wire
+// payload omits `body` — the additive field is byte-identical for every existing
+// caller that ignores it.
+func TestGetPullRequestBodyDefaultsEmpty(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{
+			Stdout: `{"number": 2, "title": "Task", "state": "open", "html_url": "https://github.com/jerryfane/gitmoot/pull/2", "head": {"ref": "task", "sha": "head123"}, "base": {"ref": "main", "sha": "base123"}}`,
+		}},
+	}
+	client := GhClient{Runner: runner}
+
+	pr, err := client.GetPullRequest(context.Background(), Repository{Owner: "jerryfane", Name: "gitmoot"}, 2)
+
+	if err != nil {
+		t.Fatalf("GetPullRequest returned error: %v", err)
+	}
+	if pr.Body != "" {
+		t.Fatalf("pull request body = %q, want empty default", pr.Body)
+	}
+}
+
 func TestCompareCommitsUsesEscapedCompareEndpoint(t *testing.T) {
 	runner := &fakeRunner{
 		results: []subprocess.Result{{
