@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jerryfane/gitmoot/internal/agenttemplate"
 	"github.com/jerryfane/gitmoot/internal/artifact"
@@ -472,6 +473,209 @@ type CandidateImportOptions struct {
 	SourcePath  string
 	ArtifactDir string
 	BlobStore   artifact.Store
+}
+
+// feedbackByteCap bounds the assembled NormalizedSignal.Feedback string so a
+// read-side projection of very verbose trait/reasoning fields stays human- and
+// optimizer-readable. The cap is documented in the SkillOpt exchange contract
+// docs (8 KiB). When the assembled text exceeds the cap it is truncated and a
+// trailing marker is appended.
+const feedbackByteCap = 8 * 1024
+
+// feedbackTruncationMarker is appended when Feedback is truncated at the byte
+// cap so consumers can tell the tail was clipped.
+const feedbackTruncationMarker = "… (truncated)"
+
+// NormalizedSignal is a pure, read-side projection of the scalar quality signal
+// and the textual feedback that the SkillOpt contract already carries across
+// several optional fields. It is a view/return type only: it is NOT embedded in
+// any wire package (TrainingPackage/CandidatePackage), adds no field to any
+// existing contract struct, and does not change ContractVersion or the bytes the
+// optimizer subprocess reads.
+//
+// Score is in the range [0,1] when HasScore is true. When HasScore is false the
+// scalar signal was genuinely absent and Score is meaningless (do not treat it
+// as a neutral midpoint). Feedback is a single bounded string assembled in a
+// fixed section order; it is empty when no textual signal was present.
+type NormalizedSignal struct {
+	Score    float64 `json:"score"`
+	HasScore bool    `json:"has_score"`
+	Feedback string  `json:"feedback,omitempty"`
+}
+
+// ProjectSignal projects the already-present scalar and textual fields into one
+// uniform {Score, Feedback} view so consumers read a single signal instead of N
+// optional fields. All inputs are pointers and nil-tolerant, so callers pass
+// whatever subset they hold. It is pure and total: it never panics and has no
+// side effects.
+//
+// Scalar precedence (see normalizedScore): a present Hard == 0 is an
+// authoritative gate-fail 0 (HasScore=true); otherwise the quality component is
+// Soft, else the mean of DimensionScores, else Hard > 0; genuinely-absent data
+// yields HasScore=false. Textual assembly (see normalizedFeedback) concatenates
+// the non-empty parts in a fixed, deterministic order, bounded by a byte cap.
+func ProjectSignal(score *EvaluatorScore, ranked *RankedFeedbackEvent, failure *EvaluatorFailurePacket) NormalizedSignal {
+	value, ok := normalizedScore(score)
+	return NormalizedSignal{
+		Score:    value,
+		HasScore: ok,
+		Feedback: normalizedFeedback(ranked, failure),
+	}
+}
+
+// normalizedScore fuses EvaluatorScore.Hard/Soft/DimensionScores into a single
+// score in [0,1] and reports whether any usable scalar field existed.
+//
+// Rules:
+//  1. Hard present and == 0 (gate failed) → (0, true): a hard-fail dominates and
+//     is a real, informative 0, not "missing".
+//  2. Otherwise the quality component is Soft if present, else the arithmetic
+//     mean of DimensionScores if the map is non-empty, else Hard if Hard > 0,
+//     else unknown. Hard > 0 is a gate, not a weight, so it does not scale the
+//     quality component.
+//  3. A usable quality component → (clamp(quality), true).
+//  4. No usable field (Hard nil, Soft nil, DimensionScores empty) → (0, false):
+//     absent, not a fabricated neutral 0.5.
+//
+// Every returned score is clamped to [0,1].
+func normalizedScore(score *EvaluatorScore) (float64, bool) {
+	if score == nil {
+		return 0, false
+	}
+	// A hard-fail gate (Hard == 0) is an authoritative, informative 0.
+	if score.Hard != nil && *score.Hard == 0 {
+		return 0, true
+	}
+	// Quality component precedence: Soft > mean(DimensionScores) > Hard.
+	if score.Soft != nil {
+		return clampUnit(*score.Soft), true
+	}
+	if len(score.DimensionScores) > 0 {
+		var sum float64
+		for _, value := range score.DimensionScores {
+			sum += value
+		}
+		return clampUnit(sum / float64(len(score.DimensionScores))), true
+	}
+	if score.Hard != nil && *score.Hard > 0 {
+		return clampUnit(*score.Hard), true
+	}
+	return 0, false
+}
+
+func clampUnit(value float64) float64 {
+	if value < 0 {
+		return 0
+	}
+	if value > 1 {
+		return 1
+	}
+	return value
+}
+
+// normalizedFeedback deterministically concatenates the non-empty textual parts
+// into one bounded string, in a fixed section order:
+//
+//	OptimizerHint, RequiredImprovements, UsefulTraits, RejectedTraits, Reasoning
+//
+// Each section gets a stable header. json.RawMessage trait fields are best-effort
+// decoded into the known shapes (map[string][]string keyed by option label, or
+// []string); map keys are sorted for determinism, and an undecodable section is
+// skipped rather than dumped raw (the function never panics and never emits raw
+// braces). The whole string is truncated to feedbackByteCap with a trailing
+// marker. Empty inputs yield "".
+func normalizedFeedback(ranked *RankedFeedbackEvent, failure *EvaluatorFailurePacket) string {
+	var sections []string
+	if failure != nil {
+		if hint := strings.TrimSpace(failure.OptimizerHint); hint != "" {
+			sections = append(sections, "Optimizer hint:\n"+hint)
+		}
+	}
+	if ranked != nil {
+		if section := feedbackListSection("Required improvements:", ranked.RequiredImprovements); section != "" {
+			sections = append(sections, section)
+		}
+		if section := feedbackTraitsSection("Useful traits:", ranked.UsefulTraits); section != "" {
+			sections = append(sections, section)
+		}
+		if section := feedbackTraitsSection("Rejected traits:", ranked.RejectedTraits); section != "" {
+			sections = append(sections, section)
+		}
+		if reasoning := strings.TrimSpace(ranked.Reasoning); reasoning != "" {
+			sections = append(sections, "Reasoning:\n"+reasoning)
+		}
+	}
+	return truncateFeedback(strings.Join(sections, "\n\n"))
+}
+
+// feedbackListSection renders a RequiredImprovements-shaped json.RawMessage
+// ([]string) as a bulleted section, or "" when empty/undecodable.
+func feedbackListSection(header string, raw json.RawMessage) string {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return ""
+	}
+	var items []string
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return ""
+	}
+	lines := make([]string, 0, len(items))
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			lines = append(lines, "- "+item)
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return header + "\n" + strings.Join(lines, "\n")
+}
+
+// feedbackTraitsSection renders a trait-shaped json.RawMessage
+// (map[string][]string keyed by option label) as deterministic "label: trait"
+// lines with sorted keys, or "" when empty/undecodable.
+func feedbackTraitsSection(header string, raw json.RawMessage) string {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return ""
+	}
+	var traits map[string][]string
+	if err := json.Unmarshal(raw, &traits); err != nil {
+		return ""
+	}
+	labels := make([]string, 0, len(traits))
+	for label := range traits {
+		labels = append(labels, label)
+	}
+	sort.Strings(labels)
+	lines := make([]string, 0, len(labels))
+	for _, label := range labels {
+		for _, trait := range traits[label] {
+			trait = strings.TrimSpace(trait)
+			if trait != "" {
+				lines = append(lines, label+": "+trait)
+			}
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return header + "\n" + strings.Join(lines, "\n")
+}
+
+// truncateFeedback bounds text to feedbackByteCap, appending a marker when it
+// clips. It cuts on a UTF-8 rune boundary so the output stays valid UTF-8.
+func truncateFeedback(text string) string {
+	if len(text) <= feedbackByteCap {
+		return text
+	}
+	limit := feedbackByteCap - len(feedbackTruncationMarker)
+	if limit < 0 {
+		limit = 0
+	}
+	for limit > 0 && !utf8.RuneStart(text[limit]) {
+		limit--
+	}
+	return text[:limit] + feedbackTruncationMarker
 }
 
 func ExportTrainingPackage(ctx context.Context, store *db.Store, runID string) (TrainingPackage, error) {

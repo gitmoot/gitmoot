@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/jerryfane/gitmoot/internal/agenttemplate"
 	"github.com/jerryfane/gitmoot/internal/artifact"
@@ -1384,5 +1385,296 @@ func TestEvaluatorScoreJudgePromptFieldsOmitEmpty(t *testing.T) {
 		if strings.Contains(string(encoded), field) {
 			t.Errorf("empty EvaluatorScore must omit %q, got %s", field, encoded)
 		}
+	}
+}
+
+func projectFloatPtr(v float64) *float64 { return &v }
+
+func TestProjectSignalScalar(t *testing.T) {
+	tests := []struct {
+		name    string
+		score   *EvaluatorScore
+		want    float64
+		wantHas bool
+	}{
+		{name: "nil score is absent", score: nil, wantHas: false},
+		{name: "empty score is absent", score: &EvaluatorScore{}, wantHas: false},
+		{
+			name:    "hard-fail zero is an authoritative 0",
+			score:   &EvaluatorScore{Hard: projectFloatPtr(0), Soft: projectFloatPtr(0.12)},
+			want:    0,
+			wantHas: true,
+		},
+		{
+			name:    "soft wins over dimensions and hard",
+			score:   &EvaluatorScore{Hard: projectFloatPtr(1), Soft: projectFloatPtr(0.42), DimensionScores: map[string]float64{"a": 0.1}},
+			want:    0.42,
+			wantHas: true,
+		},
+		{
+			name:    "mean of dimensions when soft absent",
+			score:   &EvaluatorScore{DimensionScores: map[string]float64{"a": 0.4, "b": 0.8}},
+			want:    0.6,
+			wantHas: true,
+		},
+		{
+			name:    "hard above zero used when only signal",
+			score:   &EvaluatorScore{Hard: projectFloatPtr(1.0)},
+			want:    1.0,
+			wantHas: true,
+		},
+		{
+			name:    "soft clamped to upper bound",
+			score:   &EvaluatorScore{Soft: projectFloatPtr(1.4)},
+			want:    1.0,
+			wantHas: true,
+		},
+		{
+			name:    "soft clamped to lower bound",
+			score:   &EvaluatorScore{Soft: projectFloatPtr(-0.2)},
+			want:    0.0,
+			wantHas: true,
+		},
+		{
+			name:    "dimension mean clamped",
+			score:   &EvaluatorScore{DimensionScores: map[string]float64{"a": 1.5, "b": 1.5}},
+			want:    1.0,
+			wantHas: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			signal := ProjectSignal(tt.score, nil, nil)
+			if signal.HasScore != tt.wantHas {
+				t.Fatalf("HasScore = %v, want %v", signal.HasScore, tt.wantHas)
+			}
+			if diff := signal.Score - tt.want; tt.wantHas && (diff > 1e-9 || diff < -1e-9) {
+				t.Fatalf("Score = %v, want %v", signal.Score, tt.want)
+			}
+			if signal.Score < 0 || signal.Score > 1 {
+				t.Fatalf("Score %v out of [0,1]", signal.Score)
+			}
+		})
+	}
+}
+
+func TestProjectSignalAbsentScoreIsNotFabricatedMidpoint(t *testing.T) {
+	signal := ProjectSignal(&EvaluatorScore{}, nil, nil)
+	if signal.HasScore {
+		t.Fatalf("HasScore = true, want false for absent score")
+	}
+	if signal.Score == 0.5 {
+		t.Fatalf("absent score must not fabricate a neutral 0.5")
+	}
+}
+
+func TestProjectSignalTextualOrderAndContent(t *testing.T) {
+	useful, err := json.Marshal(map[string][]string{"c": {"clearest explanation"}, "a": {"crisp hero"}})
+	if err != nil {
+		t.Fatalf("marshal useful traits: %v", err)
+	}
+	rejected, err := json.Marshal(map[string][]string{"b": {"too generic"}})
+	if err != nil {
+		t.Fatalf("marshal rejected traits: %v", err)
+	}
+	required, err := json.Marshal([]string{"stronger visual identity", "responsive hero"})
+	if err != nil {
+		t.Fatalf("marshal required improvements: %v", err)
+	}
+	ranked := &RankedFeedbackEvent{
+		UsefulTraits:         useful,
+		RejectedTraits:       rejected,
+		RequiredImprovements: required,
+		Reasoning:            "C is the clearest direction.",
+	}
+	failure := &EvaluatorFailurePacket{OptimizerHint: "Return serialized bundle JSON."}
+
+	feedback := ProjectSignal(nil, ranked, failure).Feedback
+
+	for _, section := range []string{"Optimizer hint:", "Required improvements:", "Useful traits:", "Rejected traits:", "Reasoning:"} {
+		if !strings.Contains(feedback, section) {
+			t.Fatalf("feedback missing section %q:\n%s", section, feedback)
+		}
+	}
+	order := []string{"Optimizer hint:", "Required improvements:", "Useful traits:", "Rejected traits:", "Reasoning:"}
+	last := -1
+	for _, section := range order {
+		idx := strings.Index(feedback, section)
+		if idx <= last {
+			t.Fatalf("section %q out of order in:\n%s", section, feedback)
+		}
+		last = idx
+	}
+	// Sorted map keys: useful traits label "a" must render before "c".
+	usefulIdx := strings.Index(feedback, "Useful traits:")
+	aIdx := strings.Index(feedback[usefulIdx:], "a: crisp hero")
+	cIdx := strings.Index(feedback[usefulIdx:], "c: clearest explanation")
+	if aIdx == -1 || cIdx == -1 || aIdx > cIdx {
+		t.Fatalf("useful trait keys not sorted:\n%s", feedback)
+	}
+	// Required improvements bulleted.
+	if !strings.Contains(feedback, "- stronger visual identity") || !strings.Contains(feedback, "- responsive hero") {
+		t.Fatalf("required improvements not bulleted:\n%s", feedback)
+	}
+}
+
+func TestProjectSignalTextualDeterministic(t *testing.T) {
+	useful, err := json.Marshal(map[string][]string{"z": {"z trait"}, "m": {"m trait"}, "a": {"a trait"}})
+	if err != nil {
+		t.Fatalf("marshal useful traits: %v", err)
+	}
+	ranked := &RankedFeedbackEvent{UsefulTraits: useful}
+	first := ProjectSignal(nil, ranked, nil).Feedback
+	for i := 0; i < 20; i++ {
+		if got := ProjectSignal(nil, ranked, nil).Feedback; got != first {
+			t.Fatalf("feedback not deterministic across runs:\n%q\n!=\n%q", got, first)
+		}
+	}
+	// Explicit sorted order a < m < z.
+	aIdx := strings.Index(first, "a: a trait")
+	mIdx := strings.Index(first, "m: m trait")
+	zIdx := strings.Index(first, "z: z trait")
+	if !(aIdx >= 0 && aIdx < mIdx && mIdx < zIdx) {
+		t.Fatalf("trait keys not in sorted order:\n%s", first)
+	}
+}
+
+func TestProjectSignalTextualSkipsUndecodable(t *testing.T) {
+	ranked := &RankedFeedbackEvent{
+		// A JSON string is valid JSON but neither map[string][]string nor
+		// []string, so the section must be skipped, not dumped raw.
+		UsefulTraits:         json.RawMessage(`"not an object"`),
+		RequiredImprovements: json.RawMessage(`{"oops":"not a list"}`),
+		RejectedTraits:       json.RawMessage(`not even json`),
+		Reasoning:            "Only reasoning survives.",
+	}
+	feedback := ProjectSignal(nil, ranked, nil).Feedback
+	if strings.Contains(feedback, "Useful traits:") || strings.Contains(feedback, "Required improvements:") || strings.Contains(feedback, "Rejected traits:") {
+		t.Fatalf("undecodable sections were not skipped:\n%s", feedback)
+	}
+	if strings.ContainsAny(feedback, "{}") {
+		t.Fatalf("feedback leaked raw braces:\n%s", feedback)
+	}
+	if !strings.Contains(feedback, "Reasoning:\nOnly reasoning survives.") {
+		t.Fatalf("decodable section dropped:\n%s", feedback)
+	}
+}
+
+func TestProjectSignalTextualTruncatesAtCap(t *testing.T) {
+	improvements := make([]string, 0, 4000)
+	for i := 0; i < 4000; i++ {
+		improvements = append(improvements, "improve the responsive hero layout substantially")
+	}
+	required, err := json.Marshal(improvements)
+	if err != nil {
+		t.Fatalf("marshal required improvements: %v", err)
+	}
+	feedback := ProjectSignal(nil, &RankedFeedbackEvent{RequiredImprovements: required}, nil).Feedback
+	if len(feedback) > feedbackByteCap {
+		t.Fatalf("feedback length %d exceeds cap %d", len(feedback), feedbackByteCap)
+	}
+	if !strings.HasSuffix(feedback, feedbackTruncationMarker) {
+		t.Fatalf("truncated feedback missing marker, suffix = %q", feedback[len(feedback)-len(feedbackTruncationMarker):])
+	}
+	if !utf8.ValidString(feedback) {
+		t.Fatalf("truncated feedback is not valid UTF-8")
+	}
+}
+
+func TestProjectSignalAllEmpty(t *testing.T) {
+	signal := ProjectSignal(nil, &RankedFeedbackEvent{}, &EvaluatorFailurePacket{})
+	if signal.Feedback != "" {
+		t.Fatalf("Feedback = %q, want empty", signal.Feedback)
+	}
+	if signal.HasScore {
+		t.Fatalf("HasScore = true, want false for all-empty inputs")
+	}
+	encoded, err := json.Marshal(signal)
+	if err != nil {
+		t.Fatalf("marshal NormalizedSignal: %v", err)
+	}
+	if strings.Contains(string(encoded), "feedback") {
+		t.Fatalf("empty Feedback must be omitted from JSON, got %s", encoded)
+	}
+}
+
+// TestProjectSignalDoesNotChangeWirePackages pins the exact JSON bytes of an
+// unchanged TrainingPackage and CandidatePackage. ProjectSignal is a return type
+// only; it adds no field to any wire struct, so these golden bytes must remain
+// byte-identical and must never carry the NormalizedSignal keys (score/
+// has_score). This guards the additive / byte-identical optimizer-input contract.
+func TestProjectSignalDoesNotChangeWirePackages(t *testing.T) {
+	hard := 0.0
+	soft := 0.12
+	training := TrainingPackage{
+		Kind:            TrainingPackageKind,
+		ContractVersion: ContractVersion,
+		Template:        TemplateSnapshot{ID: "planner"},
+		EvalRun:         EvalRun{ID: "run-1", TemplateID: "planner", State: "review"},
+		RankedFeedbackEvents: []RankedFeedbackEvent{{
+			ID:                   "ranked-1",
+			RunID:                "run-1",
+			ItemID:               "item-1",
+			Ranking:              []string{"a", "b"},
+			Winner:               "a",
+			UsefulTraits:         json.RawMessage(`{"a":["clear"]}`),
+			RejectedTraits:       json.RawMessage(`{"b":["generic"]}`),
+			RequiredImprovements: json.RawMessage(`["stronger hero"]`),
+			Reasoning:            "A is clearer.",
+			Reviewer:             "jerry",
+			Source:               "github",
+			CreatedAt:            "2026-06-02T10:00:00Z",
+		}},
+	}
+	candidate := CandidatePackage{
+		Kind:            CandidatePackageKind,
+		ContractVersion: ContractVersion,
+		TemplateID:      "planner",
+		Candidate:       CandidateTemplate{Content: "Plan carefully."},
+		Summary: CandidateSummary{
+			EvaluatorScore: &EvaluatorScore{
+				Hard:            &hard,
+				Soft:            &soft,
+				DimensionScores: map[string]float64{"artifact_contract": 0},
+				Failure:         &EvaluatorFailurePacket{OptimizerHint: "Return bundle JSON."},
+			},
+		},
+	}
+
+	const wantTraining = `{"kind":"gitmoot-skillopt-training-package","contract_version":1,"template":{"id":"planner","version_id":"","version_number":0,"version_state":"","content_hash":"","source_repo":"","source_ref":"","source_path":"","resolved_commit":"","metadata":{"id":"","name":"","description":"","kind":"","version":0,"capabilities":null,"runtime_compatibility":null,"tags":null,"inputs":null,"outputs":null},"content":""},"eval_run":{"id":"run-1","template_id":"planner","template_version_id":"","target_repo":"","state":"review"},"items":null,"artifacts":null,"feedback_events":null,"ranked_feedback_events":[{"id":"ranked-1","run_id":"run-1","item_id":"item-1","ranking":["a","b"],"winner":"a","useful_traits":{"a":["clear"]},"rejected_traits":{"b":["generic"]},"required_improvements":["stronger hero"],"reasoning":"A is clearer.","reviewer":"jerry","source":"github","created_at":"2026-06-02T10:00:00Z"}]}`
+	const wantCandidate = `{"kind":"gitmoot-skillopt-candidate-package","contract_version":1,"template_id":"planner","candidate":{"content":"Plan carefully.","metadata":{"id":"","name":"","description":"","kind":"","version":0,"capabilities":null,"runtime_compatibility":null,"tags":null,"inputs":null,"outputs":null}},"summary":{"evaluator_score":{"hard":0,"soft":0.12,"dimension_scores":{"artifact_contract":0},"failure":{"optimizer_hint":"Return bundle JSON."}}}}`
+
+	trainingBytes, err := json.Marshal(training)
+	if err != nil {
+		t.Fatalf("marshal training package: %v", err)
+	}
+	if string(trainingBytes) != wantTraining {
+		t.Fatalf("training package bytes changed:\n got %s\nwant %s", trainingBytes, wantTraining)
+	}
+	candidateBytes, err := json.Marshal(candidate)
+	if err != nil {
+		t.Fatalf("marshal candidate package: %v", err)
+	}
+	if string(candidateBytes) != wantCandidate {
+		t.Fatalf("candidate package bytes changed:\n got %s\nwant %s", candidateBytes, wantCandidate)
+	}
+	for _, key := range []string{`"has_score"`} {
+		if strings.Contains(string(trainingBytes), key) || strings.Contains(string(candidateBytes), key) {
+			t.Fatalf("NormalizedSignal key %s leaked into a wire package", key)
+		}
+	}
+
+	// The projection still reads exactly these fields (sanity: it is callable and
+	// derives from the same bytes) without mutating them.
+	signal := ProjectSignal(candidate.Summary.EvaluatorScore, &training.RankedFeedbackEvents[0], candidate.Summary.EvaluatorScore.Failure)
+	if !signal.HasScore || signal.Score != 0 {
+		t.Fatalf("ProjectSignal over hard-fail score = %+v", signal)
+	}
+	reMarshaled, err := json.Marshal(candidate)
+	if err != nil {
+		t.Fatalf("re-marshal candidate package: %v", err)
+	}
+	if string(reMarshaled) != wantCandidate {
+		t.Fatalf("ProjectSignal mutated the candidate package")
 	}
 }

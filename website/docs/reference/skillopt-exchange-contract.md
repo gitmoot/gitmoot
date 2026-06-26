@@ -111,6 +111,45 @@ includes `ranked_event_id`, which matches the corresponding
 feedback event so a future optimizer can combine useful traits across multiple
 winning options rather than only copying the top option.
 
+## Normalized {score, feedback} projection
+
+The training package already carries a scalar quality signal and rich textual
+feedback, but they are spread across several optional fields. Gitmoot exposes a
+pure, read-side helper, `skillopt.ProjectSignal`, that fuses those existing
+fields into one uniform `NormalizedSignal{score, has_score, feedback}` view so a
+consumer reads one signal instead of N optional fields.
+
+This projection is **read-side only**: it is a return type, not a wire field. It
+adds no field to any package, does not change the JSON the optimizer subprocess
+reads, and leaves `contract_version` at `1`. The training and candidate packages
+are byte-identical with or without it.
+
+**Scalar (`score` in `[0,1]`, with `has_score`).** Precedence is
+`soft > mean(dimension_scores) > hard`:
+
+- If `hard` is present and equal to `0` (the gate failed), `score = 0` and
+  `has_score = true` — a hard-fail is an authoritative, informative `0`, not
+  "missing".
+- Otherwise the quality component is `soft` if present, else the arithmetic mean
+  of `dimension_scores` when that map is non-empty, else `hard` when `hard > 0`.
+  A positive `hard` is a gate, not a weight, so it does not scale the component.
+- If a quality component exists, `score` is that value clamped to `[0,1]` and
+  `has_score = true`.
+- If no usable field exists (`hard`, `soft`, and `dimension_scores` all absent),
+  `has_score = false`. The projection reports genuine absence rather than
+  fabricating a neutral `0.5`, so consumers can omit rather than invent a value.
+
+**Textual (`feedback`).** Non-empty parts are concatenated in a fixed section
+order — `optimizer_hint`, then `required_improvements`, then `useful_traits`,
+then `rejected_traits`, then `reasoning` — each under a stable header. Trait
+fields are best-effort decoded into their known shapes (`map[string][]string`
+keyed by option label, or `[]string`); map keys are rendered in sorted order for
+deterministic, byte-stable output, and any section that fails to decode is
+skipped rather than dumped raw. The assembled string is bounded to an 8 KiB byte
+cap; when it would exceed the cap it is truncated on a UTF-8 boundary with a
+trailing `… (truncated)` marker. When no textual signal is present, `feedback`
+is empty.
+
 ## Ranked Exploration Workflow
 
 Use ranked exploration when the template is still ambiguous and humans need to
