@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
@@ -56,7 +60,7 @@ func TestRunCandidateNotifyEmitsAwaitingExactlyOnce(t *testing.T) {
 	store, version, candidate, _ := candidateNotifyFixture(t)
 	sink := &recordingSink{}
 
-	if err := runCandidateNotify(ctx, store, sink, config.DefaultSkillOptPolicy(), candidate, version, nil); err != nil {
+	if err := runCandidateNotify(ctx, store, sink, config.DefaultSkillOptPolicy(), candidate, version, nil, false); err != nil {
 		t.Fatalf("runCandidateNotify returned error: %v", err)
 	}
 
@@ -92,7 +96,7 @@ func TestRunCandidateNotifyNilSinkIsNoOp(t *testing.T) {
 	ctx := context.Background()
 	store, version, candidate, _ := candidateNotifyFixture(t)
 
-	if err := runCandidateNotify(ctx, store, nil, config.DefaultSkillOptPolicy(), candidate, version, nil); err != nil {
+	if err := runCandidateNotify(ctx, store, nil, config.DefaultSkillOptPolicy(), candidate, version, nil, false); err != nil {
 		t.Fatalf("runCandidateNotify with nil sink returned error: %v", err)
 	}
 	after, err := store.GetAgentTemplateVersionByID(ctx, version.ID)
@@ -154,6 +158,57 @@ func TestRunSkillOptImportOffByDefaultByteIdentical(t *testing.T) {
 	}
 	if len(pending) != 1 || pending[0].State != "pending" {
 		t.Fatalf("expected exactly one pending candidate, got %+v", pending)
+	}
+}
+
+// TestNotifyAndMaybeAutoPromoteFlushesPerInvocationSink proves the HIGH #471 fix
+// end to end: the SHORT-LIVED CLI path (notifyAndMaybeAutoPromoteCandidate) builds
+// its OWN per-invocation webhook sink and FLUSHES it before returning, so the
+// candidate.awaiting_promotion POST lands even though the "process" (here, the
+// helper) returns immediately after. Without the deferred flush the queued event
+// would be destroyed when the drain goroutine never gets to run.
+func TestNotifyAndMaybeAutoPromoteFlushesPerInvocationSink(t *testing.T) {
+	ctx := context.Background()
+	store, version, candidate, home := candidateNotifyFixture(t)
+
+	var delivered atomic.Int64
+	got := make(chan events.Event, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var ev events.Event
+		_ = json.NewDecoder(r.Body).Decode(&ev)
+		delivered.Add(1)
+		got <- ev
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// Configure [events] for this home so buildDaemonEventSink yields a real webhook
+	// sink pointed at the test server. The fixture returns the already-resolved
+	// <home>/.gitmoot ROOT, so the config.toml lives directly under it.
+	cfgPath := filepath.Join(home, config.ConfigName)
+	if err := os.WriteFile(cfgPath, []byte("[events]\nwebhook_url = \""+srv.URL+"\"\n"), 0o644); err != nil {
+		t.Fatalf("write events config: %v", err)
+	}
+
+	if err := notifyAndMaybeAutoPromoteCandidate(ctx, store, home, candidate, version, ""); err != nil {
+		t.Fatalf("notifyAndMaybeAutoPromoteCandidate returned error: %v", err)
+	}
+
+	// The flush must have delivered the awaiting_promotion event by the time the
+	// helper returned — no post-return sleep needed.
+	if n := delivered.Load(); n != 1 {
+		t.Fatalf("delivered = %d immediately after return, want 1 (the per-invocation sink must flush before exit)", n)
+	}
+	select {
+	case ev := <-got:
+		if ev.Type != events.EventCandidateAwaitingPromotion {
+			t.Fatalf("event type = %q, want candidate.awaiting_promotion", ev.Type)
+		}
+		if ev.JobID != version.ID || ev.RootID != version.TemplateID {
+			t.Fatalf("event ids = %q/%q, want %q/%q", ev.JobID, ev.RootID, version.ID, version.TemplateID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected the delivered awaiting_promotion event")
 	}
 }
 

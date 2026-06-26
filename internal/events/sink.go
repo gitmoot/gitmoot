@@ -157,6 +157,31 @@ func EmitEvent(ctx context.Context, sink Sink, event Event) {
 	sink.Emit(ctx, event)
 }
 
+// Flusher is the OPTIONAL drain-and-wait extension a Sink may implement when its
+// Emit is asynchronous (the webhook sink hands events to a background goroutine).
+// Flush blocks — bounded — until the already-enqueued events are delivered, so a
+// SHORT-LIVED caller (a CLI command) does not exit and destroy them before the
+// goroutine runs. The long-lived engine/daemon never need it; only per-invocation
+// sinks do. A synchronous Sink need not implement it.
+type Flusher interface {
+	Flush(ctx context.Context)
+}
+
+// FlushSink drains a sink that implements Flusher and is a no-op for a nil sink or
+// a synchronous one (so callers can defer it unconditionally over a sink that may
+// be nil when [events] is OFF). It is the seam a short-lived CLI command uses to
+// guarantee a candidate.* webhook POST lands before the process exits. The daemon,
+// which shares one long-lived cached sink for the whole process, must NOT call it
+// per-invocation.
+func FlushSink(ctx context.Context, sink Sink) {
+	if sink == nil {
+		return
+	}
+	if f, ok := sink.(Flusher); ok {
+		f.Flush(ctx)
+	}
+}
+
 func redactString(value string, redact RedactFunc) string {
 	if redact == nil {
 		return value

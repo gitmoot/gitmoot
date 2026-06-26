@@ -23,10 +23,16 @@ func autoPromotePolicy(minSamples int, minScore float64) config.SkillOptPolicy {
 	return policy
 }
 
-// realCIFeedbackEvent mirrors a harvested real-CI positive (choice "a" + the
-// shared marker phrase) the external-CI guardrail accepts.
+// realCIFeedbackEvent mirrors a harvested real-CI positive: choice "a" + the
+// shared marker phrase AND the harvester provenance (reviewer/source) the hardened
+// external-CI guardrail now requires so a human-typed review row can never spoof it.
 func realCIFeedbackEvent() db.FeedbackEvent {
-	return db.FeedbackEvent{Choice: "a", Reasoning: "PR #7 merged with passing external CI."}
+	return db.FeedbackEvent{
+		Choice:    "a",
+		Reviewer:  skillopt.AutoTraceReviewer,
+		Source:    skillopt.AutoTraceSource,
+		Reasoning: "PR #7 merged with passing external CI.",
+	}
 }
 
 // TestRunCandidateNotifyAutoPromoteOffStaysPending proves auto_promote=false (the
@@ -38,7 +44,7 @@ func TestRunCandidateNotifyAutoPromoteOffStaysPending(t *testing.T) {
 	autoPromoteCandidateScore(&candidate, 0.99)
 	sink := &recordingSink{}
 
-	if err := runCandidateNotify(ctx, store, sink, config.DefaultSkillOptPolicy(), candidate, version, []db.FeedbackEvent{realCIFeedbackEvent()}); err != nil {
+	if err := runCandidateNotify(ctx, store, sink, config.DefaultSkillOptPolicy(), candidate, version, []db.FeedbackEvent{realCIFeedbackEvent()}, false); err != nil {
 		t.Fatalf("runCandidateNotify returned error: %v", err)
 	}
 
@@ -66,7 +72,7 @@ func TestRunCandidateNotifyAutoPromoteGuardrailsPass(t *testing.T) {
 	autoPromoteCandidateScore(&candidate, 0.96)
 	sink := &recordingSink{}
 
-	if err := runCandidateNotify(ctx, store, sink, autoPromotePolicy(1, 0.9), candidate, version, []db.FeedbackEvent{realCIFeedbackEvent()}); err != nil {
+	if err := runCandidateNotify(ctx, store, sink, autoPromotePolicy(1, 0.9), candidate, version, []db.FeedbackEvent{realCIFeedbackEvent()}, false); err != nil {
 		t.Fatalf("runCandidateNotify returned error: %v", err)
 	}
 
@@ -100,7 +106,7 @@ func TestRunCandidateNotifyAutoPromoteGuardrailFailStaysPending(t *testing.T) {
 
 	// A near-neutral (no external CI) feedback event fails require_external_ci.
 	nearNeutral := db.FeedbackEvent{Choice: "a", Reasoning: "PR #7 merged through an empty gate (no external CI); near-neutral, not a strong positive."}
-	if err := runCandidateNotify(ctx, store, sink, autoPromotePolicy(1, 0.9), candidate, version, []db.FeedbackEvent{nearNeutral}); err != nil {
+	if err := runCandidateNotify(ctx, store, sink, autoPromotePolicy(1, 0.9), candidate, version, []db.FeedbackEvent{nearNeutral}, false); err != nil {
 		t.Fatalf("runCandidateNotify returned error: %v", err)
 	}
 

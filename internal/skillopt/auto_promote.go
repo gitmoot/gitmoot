@@ -38,10 +38,17 @@ func notifyOnly(reason string) AutoPromoteDecision {
 //
 // FAIL-SAFE DISCIPLINE (every uncertainty returns Promote=false):
 //   - policy.AutoPromote off (the default) -> notify only (manual, byte-identical).
+//   - feedbackUnavailable=true (the caller could not resolve/read the eval_run, e.g.
+//     a ListFeedbackEvents error or a missing run id) -> hard do-not-promote: we can
+//     never promote on evidence we failed to read, regardless of the configured
+//     min_samples floor.
 //   - require_measured_judge=true -> DEFERRED (#344): no judge<->human calibration
 //     source exists, so honoring it now would lie; fail safe.
 //   - canary=true -> DEFERRED (canary follow-on): the sampled-traffic + regression
 //     infrastructure does not exist; fail safe.
+//   - ZERO feedback samples -> a HARD do-not-promote (an absolute floor of at least
+//     one real sample), even when min_samples is explicitly 0: we never promote on
+//     zero verifiable evidence.
 //   - min_samples unset (nil) -> a HARD do-not-promote, NOT 0 (a user who flips
 //     auto_promote without a sample floor must never promote a sparse candidate).
 //   - min_score unset (nil) OR a nil candidate Summary.Score -> hard do-not-promote.
@@ -49,9 +56,16 @@ func notifyOnly(reason string) AutoPromoteDecision {
 //
 // On a pass the reason names the guardrails that held (score, samples, external CI)
 // so the candidate.auto_promoted event explains the decision.
-func EvaluateAutoPromote(policy config.SkillOptPolicy, candidate CandidatePackage, feedbackEvents []db.FeedbackEvent) AutoPromoteDecision {
+func EvaluateAutoPromote(policy config.SkillOptPolicy, candidate CandidatePackage, feedbackEvents []db.FeedbackEvent, feedbackUnavailable bool) AutoPromoteDecision {
 	if !policy.AutoPromote {
 		return notifyOnly("auto_promote is off; notify only (manual promotion)")
+	}
+
+	// A read error or an unresolvable eval_run is uncertainty, not "zero samples":
+	// promoting on evidence we could not read would defeat every downstream
+	// guardrail, so fail safe outright.
+	if feedbackUnavailable {
+		return notifyOnly("candidate eval_run feedback is unavailable (unresolved run or read error); notify only")
 	}
 
 	// Deferred knobs (#471): parsed for forward-compat, but they have no honest
@@ -70,6 +84,13 @@ func EvaluateAutoPromote(policy config.SkillOptPolicy, candidate CandidatePackag
 		return notifyOnly("auto_promote_min_samples is not set; refusing to promote without a sample floor (notify only)")
 	}
 	samples := len(feedbackEvents)
+	// Absolute floor: a configured auto_promote_min_samples=0 is a LEGAL value, but
+	// `0 < 0` is false, so without this an explicit 0 would let a zero-evidence
+	// candidate promote. We never auto-promote on zero verifiable samples regardless
+	// of the configured minimum.
+	if samples == 0 {
+		return notifyOnly("no eval_run feedback samples; refusing to auto-promote on zero evidence (notify only)")
+	}
 	if samples < *policy.AutoPromoteMinSamples {
 		return notifyOnly(fmt.Sprintf("only %d feedback sample(s), below auto_promote_min_samples=%d; notify only", samples, *policy.AutoPromoteMinSamples))
 	}

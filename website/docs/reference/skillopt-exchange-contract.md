@@ -312,16 +312,30 @@ auto_promote_require_measured_judge = false  # PARSED but DEFERRED (#344): true 
 auto_promote_canary = false               # PARSED but DEFERRED (canary follow-on): true => fail safe to no-promote
 ```
 
+The guardrails read the candidate's **harvester auto-trace run**
+(`auto-trace:<template_version_id>`) — the run the OutcomeHarvester writes the
+verifiable `{score, feedback}` signal into — **not** the human/markdown review
+run. A feedback read error (or an unresolvable run) is treated as *feedback
+unavailable* → notify-only (we never promote on evidence we could not read), and
+**zero feedback samples is always a hard do-not-promote** regardless of the
+configured `auto_promote_min_samples` (so a sparse `skillopt import` with no
+auto-trace evidence fails safe to notify-only).
+
 - `auto_promote_min_samples` — the count of `feedback_events` in the candidate's
-  eval_run must meet this floor. **Unset is a hard do-not-promote, never `0`**, so
-  flipping `auto_promote` on without a sample floor never promotes (a sparse
-  `skillopt import` with no resolvable eval_run also fails safe to notify-only).
+  auto-trace run must meet this floor. **Unset is a hard do-not-promote, never
+  `0`**, so flipping `auto_promote` on without a sample floor never promotes. Even
+  an explicit `auto_promote_min_samples = 0` cannot promote a zero-evidence
+  candidate — there is an absolute floor of at least one real sample.
 - `auto_promote_min_score` — the candidate's `summary.score` must be `>=` this.
   **Unset, or a candidate with no score, is a hard do-not-promote.**
-- `auto_promote_require_external_ci` — at least one eval_run feedback event must
+- `auto_promote_require_external_ci` — at least one auto-trace feedback event must
   record a merge that passed **genuine external CI** (not the no-CI near-neutral
-  band). It reuses the harvester's own real-CI vocabulary, so it never rewards an
-  empty gate.
+  band). The predicate keys off the harvester's own provenance (the `auto-trace`
+  source + `gitmoot-auto` reviewer) AND its real-CI marker phrase, so it reads
+  only the harvester's verifiable rows and a sibling cross-family review row's
+  free-text findings can never spoof it. It therefore applies only to **Mode A
+  (auto-trace) runs**; a candidate with no harvested external-CI evidence fails
+  safe to notify-only.
 - `auto_promote_require_measured_judge` and `auto_promote_canary` are **parsed but
   deferred**: there is no judge↔human calibration source yet (gated on #344) and
   the sampled-traffic canary + auto-rollback do not exist, so setting either to

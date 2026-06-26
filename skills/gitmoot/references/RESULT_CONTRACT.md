@@ -550,13 +550,17 @@ returns and, on a guardrails pass, calls the existing promote machinery.
   (read-only), so they are visible locally even with `[events]` off. Nil-safe:
   with `[events]` unset, nothing is emitted and behavior is byte-identical.
 - **`[skillopt].auto_promote`** (default `false` = manual, byte-identical) gates
-  auto-promotion on **checkable guardrails**: `auto_promote_min_samples`
-  (feedback-event count in the candidate's eval_run), `auto_promote_min_score`
+  auto-promotion on **checkable guardrails** read from the candidate's HARVESTER
+  auto-trace run (`auto-trace:<version>`), not the human/markdown review run:
+  `auto_promote_min_samples` (feedback-event count), `auto_promote_min_score`
   (`summary.score >=` threshold), and `auto_promote_require_external_ci` (≥1 real
-  external-CI feedback event). **ALL configured guardrails must hold**, and **any**
-  uncertainty — nil score, unset/garbled threshold, unresolvable eval_run, a store
-  read error, `auto_promote_require_measured_judge = true` (deferred, gated on
-  #344), or `auto_promote_canary = true` (deferred) — **fails safe to notify, do
+  external-CI feedback event, keyed off the harvester's `auto-trace`/`gitmoot-auto`
+  provenance so a cross-family review row cannot spoof it). **ALL configured
+  guardrails must hold**, and **any** uncertainty — nil score, unset/garbled
+  threshold, an unresolvable run or a store read error (treated as *feedback
+  unavailable*), **zero feedback samples** (an absolute floor even when
+  `min_samples = 0`), `auto_promote_require_measured_judge = true` (deferred, gated
+  on #344), or `auto_promote_canary = true` (deferred) — **fails safe to notify, do
   not promote**. An unset `min_samples`/`min_score` is a **hard do-not-promote, not
   `0`**. On a pass it promotes via the existing path and emits
   **`candidate.auto_promoted`** so a human can review or roll back even in full-auto.

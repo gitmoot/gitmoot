@@ -12,15 +12,16 @@ func intPtr(v int) *int           { return &v }
 func floatPtr(v float64) *float64 { return &v }
 
 // realCIFeedback is a feedback event the harvester would write for a merge that
-// passed genuine external CI (choice "a", the real-CI marker phrase).
+// passed genuine external CI (choice "a", the real-CI marker phrase, AND the
+// harvester provenance the hardened predicate now requires).
 func realCIFeedback() db.FeedbackEvent {
-	return db.FeedbackEvent{Choice: "a", Reasoning: "PR #7 merged with " + realExternalCIPhrase + "."}
+	return db.FeedbackEvent{Choice: "a", Reviewer: autoTraceReviewer, Source: autoTraceSource, Reasoning: "PR #7 merged with " + realExternalCIPhrase + "."}
 }
 
 // noCIFeedback is a feedback event for a near-neutral empty-gate merge (choice
 // "a" but NO external CI) — it must NOT count as a real-CI positive.
 func noCIFeedback() db.FeedbackEvent {
-	return db.FeedbackEvent{Choice: "a", Reasoning: "PR #7 merged through an empty gate (no external CI); near-neutral, not a strong positive."}
+	return db.FeedbackEvent{Choice: "a", Reviewer: autoTraceReviewer, Source: autoTraceSource, Reasoning: "PR #7 merged through an empty gate (no external CI); near-neutral, not a strong positive."}
 }
 
 func candidateWithScore(score float64) CandidatePackage {
@@ -29,12 +30,13 @@ func candidateWithScore(score float64) CandidatePackage {
 
 func TestEvaluateAutoPromote(t *testing.T) {
 	cases := []struct {
-		name        string
-		policy      config.SkillOptPolicy
-		candidate   CandidatePackage
-		feedback    []db.FeedbackEvent
-		wantPromote bool
-		reasonHas   string
+		name                string
+		policy              config.SkillOptPolicy
+		candidate           CandidatePackage
+		feedback            []db.FeedbackEvent
+		feedbackUnavailable bool
+		wantPromote         bool
+		reasonHas           string
 	}{
 		{
 			name:        "off by default never promotes",
@@ -83,6 +85,28 @@ func TestEvaluateAutoPromote(t *testing.T) {
 			feedback:    []db.FeedbackEvent{realCIFeedback()},
 			wantPromote: false,
 			reasonHas:   "auto_promote_min_samples is not set",
+		},
+		{
+			// An explicit min_samples=0 is legal, but the absolute zero-evidence floor
+			// must still reject a candidate with no feedback (0 < 0 == false would have
+			// let it through before the fix).
+			name:        "explicit min_samples zero still rejects zero evidence",
+			policy:      config.SkillOptPolicy{AutoPromote: true, AutoPromoteMinSamples: intPtr(0), AutoPromoteMinScore: floatPtr(0.5)},
+			candidate:   candidateWithScore(0.96),
+			feedback:    nil,
+			wantPromote: false,
+			reasonHas:   "zero evidence",
+		},
+		{
+			// A read error / unresolvable eval_run is uncertainty, not "zero samples":
+			// it fails safe even with an otherwise-satisfiable min_samples=0.
+			name:                "feedback unavailable fails safe even at min_samples zero",
+			policy:              config.SkillOptPolicy{AutoPromote: true, AutoPromoteMinSamples: intPtr(0), AutoPromoteMinScore: floatPtr(0.5)},
+			candidate:           candidateWithScore(0.96),
+			feedback:            nil,
+			feedbackUnavailable: true,
+			wantPromote:         false,
+			reasonHas:           "feedback is unavailable",
 		},
 		{
 			name:        "unset min_score is hard do-not-promote",
@@ -136,7 +160,7 @@ func TestEvaluateAutoPromote(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			decision := EvaluateAutoPromote(tc.policy, tc.candidate, tc.feedback)
+			decision := EvaluateAutoPromote(tc.policy, tc.candidate, tc.feedback, tc.feedbackUnavailable)
 			if decision.Promote != tc.wantPromote {
 				t.Fatalf("Promote = %v, want %v (reason: %q)", decision.Promote, tc.wantPromote, decision.Reason)
 			}
@@ -155,7 +179,20 @@ func TestFeedbackEventIsRealExternalCIPositive(t *testing.T) {
 		t.Fatalf("near-neutral empty-gate merge must NOT count as real CI")
 	}
 	// A negative (choice "b") carrying the phrase still must not count.
-	if FeedbackEventIsRealExternalCIPositive(db.FeedbackEvent{Choice: "b", Reasoning: realExternalCIPhrase}) {
+	if FeedbackEventIsRealExternalCIPositive(db.FeedbackEvent{Choice: "b", Reviewer: autoTraceReviewer, Source: autoTraceSource, Reasoning: realExternalCIPhrase}) {
 		t.Fatalf("a negative choice must never be a real-CI positive")
+	}
+	// Provenance guard: the marker phrase WITHOUT the harvester's reviewer/source
+	// (e.g. a raw human-typed review row) must NOT count — only the harvester writes
+	// the real-CI marker.
+	if FeedbackEventIsRealExternalCIPositive(db.FeedbackEvent{Choice: "a", Reasoning: realExternalCIPhrase}) {
+		t.Fatalf("the marker without harvester provenance must NOT count as real CI")
+	}
+	// Spoof guard: a cross-family review row shares the auto-trace source but carries
+	// the DISTINCT gitmoot-review reviewer and FREE-TEXT findings; even if its prose
+	// mentions the phrase it must NEVER satisfy the real-CI gate.
+	spoof := db.FeedbackEvent{Choice: "a", Reviewer: reviewReviewerID, Source: autoTraceSource, Reasoning: "merged after " + realExternalCIPhrase}
+	if FeedbackEventIsRealExternalCIPositive(spoof) {
+		t.Fatalf("a cross-family review row must never spoof the real-CI marker")
 	}
 }

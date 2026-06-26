@@ -24,19 +24,31 @@ import (
 //
 //  1. Builds the best-effort event sink the SAME way the daemon does
 //     (buildDaemonEventSink, nil when [events] is OFF), so emission is nil-safe and
-//     byte-identical when the event stream is unset.
-//  2. Loads the candidate's eval_run feedback events (when an evalRunID is
-//     resolvable; unresolvable -> empty -> the sample-count guardrail fails safe).
+//     byte-identical when the event stream is unset. Unlike the daemon's CACHED
+//     long-lived sink, this CLI command is short-lived, so the webhook sink it
+//     builds is FLUSHED before return (defer) — otherwise the queued candidate.*
+//     POST is destroyed when the process exits before the drain goroutine delivers.
+//  2. Loads the candidate's HARVESTER auto-trace eval_run feedback events
+//     (skillopt.AutoTraceRunID(version.ID)) — the run the harvester writes the
+//     verifiable {score, feedback} signal (incl. the real external-CI marker) into,
+//     NOT the human/markdown review run. A read error marks feedback UNAVAILABLE
+//     (fail safe: never promote on evidence we could not read); an unset run id
+//     yields no samples (the zero-evidence floor fails safe too).
 //  3. Emits candidate.awaiting_promotion EXACTLY ONCE (independent of the promote
 //     policy), carrying the version id (JobID), template id (RootID), and a
 //     score/samples/CI reason in Detail.
 //  4. Evaluates the pure skillopt.EvaluateAutoPromote guardrails; on a pass it calls
 //     the EXISTING store.PromoteAgentTemplateVersion and emits candidate.auto_promoted.
 //
-// It is best-effort and NEVER fails the import: a sink build error, a feedback
-// read error, or an emit are all swallowed (the candidate is already durably
-// pending). A promote error IS surfaced (it is a real, requested mutation that
-// failed), but only AFTER the awaiting_promotion notify already fired.
+// It is best-effort and NEVER fails the import: a sink build error or an emit are
+// swallowed (the candidate is already durably pending); a feedback read error fails
+// SAFE to notify-only rather than promoting on unread evidence. A promote error IS
+// surfaced (it is a real, requested mutation that failed), but only AFTER the
+// awaiting_promotion notify already fired.
+//
+// evalRunID is the candidate's human/markdown review run id (or "" for a plain
+// import). The auto-promote guardrails read the HARVESTER run derived from
+// version.ID, not evalRunID, so evalRunID is retained only for parity/logging.
 func notifyAndMaybeAutoPromoteCandidate(ctx context.Context, store *db.Store, home string, candidate skillopt.CandidatePackage, version db.AgentTemplateVersion, evalRunID string) error {
 	policy, perr := loadSkillOptPolicy(home)
 	if perr != nil {
@@ -45,31 +57,46 @@ func notifyAndMaybeAutoPromoteCandidate(ctx context.Context, store *db.Store, ho
 		policy = config.DefaultSkillOptPolicy()
 	}
 
-	// Resolve the candidate's eval_run feedback events. A read error or an empty/
-	// unresolvable run id degrades to no samples, which the min_samples guardrail
-	// treats as a hard do-not-promote (notify only) — a sparse import never promotes.
+	// Resolve the candidate's HARVESTER auto-trace eval_run feedback events: the
+	// real external-CI marker and the verifiable samples live in
+	// auto-trace:<versionID> (written by the OutcomeHarvester), NOT in the
+	// human/markdown review run that evalRunID points at. A ListFeedbackEvents error
+	// degrades to feedbackUnavailable=true so EvaluateAutoPromote fails SAFE (never
+	// promote on evidence we failed to read) instead of silently passing a
+	// min_samples=0 floor with samples=0. An empty/unresolvable run id is NOT an
+	// error: it yields no samples, which the absolute zero-evidence floor rejects.
 	var feedbackEvents []db.FeedbackEvent
-	if runID := strings.TrimSpace(evalRunID); runID != "" && store != nil {
-		if list, err := store.ListFeedbackEvents(ctx, runID); err == nil {
+	feedbackUnavailable := false
+	if runID := skillopt.AutoTraceRunID(version.ID); runID != "" && store != nil {
+		list, err := store.ListFeedbackEvents(ctx, runID)
+		if err != nil {
+			feedbackUnavailable = true
+		} else {
 			feedbackEvents = list
 		}
 	}
 
 	// Build the sink the SAME way the daemon does (nil when [events] is OFF), so the
-	// emit path is nil-safe and byte-identical when the event stream is unset.
+	// emit path is nil-safe and byte-identical when the event stream is unset. This
+	// is a PER-INVOCATION sink (buildDaemonEventSink, not the daemon's cached
+	// daemonEventSink), so we own its drain goroutine and MUST flush it before this
+	// short-lived CLI command exits, or the candidate.* POST never lands.
 	sink := buildDaemonEventSink(store, home)
-	return runCandidateNotify(ctx, store, sink, policy, candidate, version, feedbackEvents)
+	defer events.FlushSink(ctx, sink)
+	return runCandidateNotify(ctx, store, sink, policy, candidate, version, feedbackEvents, feedbackUnavailable)
 }
 
 // runCandidateNotify is the testable core of the post-import notify+auto-promote
 // step: given a resolved sink, the [skillopt] policy, the candidate, the pending
-// version, and the eval_run feedback events, it (3) emits candidate.awaiting_promotion
-// EXACTLY ONCE and (4) on a guardrails pass calls the existing
-// PromoteAgentTemplateVersion then emits candidate.auto_promoted. Splitting it from
-// the home/sink/feedback resolution lets a recording sink assert the exactly-once
-// emit and the no-double-emit invariant deterministically.
-func runCandidateNotify(ctx context.Context, store *db.Store, sink events.Sink, policy config.SkillOptPolicy, candidate skillopt.CandidatePackage, version db.AgentTemplateVersion, feedbackEvents []db.FeedbackEvent) error {
-	decision := skillopt.EvaluateAutoPromote(policy, candidate, feedbackEvents)
+// version, the eval_run feedback events, and a feedbackUnavailable flag (true when
+// the caller could not READ the eval_run — a read error vs. a legitimately empty
+// run), it (3) emits candidate.awaiting_promotion EXACTLY ONCE and (4) on a
+// guardrails pass calls the existing PromoteAgentTemplateVersion then emits
+// candidate.auto_promoted. Splitting it from the home/sink/feedback resolution lets
+// a recording sink assert the exactly-once emit and the no-double-emit invariant
+// deterministically.
+func runCandidateNotify(ctx context.Context, store *db.Store, sink events.Sink, policy config.SkillOptPolicy, candidate skillopt.CandidatePackage, version db.AgentTemplateVersion, feedbackEvents []db.FeedbackEvent, feedbackUnavailable bool) error {
+	decision := skillopt.EvaluateAutoPromote(policy, candidate, feedbackEvents, feedbackUnavailable)
 
 	// (3) Always-on notify (when [events] is configured), independent of the
 	// promotion policy: emit candidate.awaiting_promotion exactly once.
