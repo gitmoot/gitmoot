@@ -99,6 +99,18 @@ func (c Client) RemoveWorktreeForce(ctx context.Context, path string) error {
 	return err
 }
 
+// DeleteBranch force-deletes a local branch (git branch -D). It is used to tear
+// down a terminal implement delegation's gitmoot-delegation-* branch so it does
+// not linger in the shared checkout and contaminate a later coordinator's
+// planning. Force (-D) because the branch may be unmerged in the shared checkout.
+func (c Client) DeleteBranch(ctx context.Context, branch string) error {
+	if err := validateBranch(branch); err != nil {
+		return err
+	}
+	_, err := c.run(ctx, "branch", "-D", branch)
+	return err
+}
+
 // MergeBranches sequentially merges each branch into the worktree at dir (its
 // current HEAD). It is used to integrate the per-delegation branches of parallel
 // implement legs into one tree before a dependent verify/review step runs

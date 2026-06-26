@@ -834,6 +834,13 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 	// pending retries). No-op for jobs that did not allocate a read-only worktree.
 	defer e.cleanupReadOnlyDelegationWorktree(ctx, jobID, job.Type, payload)
 
+	// An implement delegation child runs in a per-delegation worktree on its own
+	// gitmoot-delegation-* branch; tear both down once the child is terminal so they
+	// do not accumulate in the shared checkout and mislead a later coordinator (#478).
+	// No-op for non-implement / non-delegation jobs and (idempotently) for already
+	// cleaned ones. Skips succeeded legs still feeding a pending integration (#332).
+	defer e.cleanupImplementDelegationWorktree(ctx, jobID, job.Type, payload)
+
 	// Commit a succeeded implement leg's work to its own branch BEFORE advancing
 	// the parent's delegation DAG. The parent advance below may enqueue a dependent
 	// that integrates this leg (#332); if the commit ran later (in the switch), the
