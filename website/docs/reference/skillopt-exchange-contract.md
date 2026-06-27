@@ -111,7 +111,7 @@ includes `ranked_event_id`, which matches the corresponding
 feedback event so a future optimizer can combine useful traits across multiple
 winning options rather than only copying the top option.
 
-## Normalized {score, feedback} projection
+## Normalized \{score, feedback\} projection
 
 The training package already carries a scalar quality signal and rich textual
 feedback, but they are spread across several optional fields. Gitmoot exposes a
