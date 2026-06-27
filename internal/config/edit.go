@@ -68,20 +68,25 @@ func SetConfigScalar(paths Paths, keyPath []string, value ConfigScalar) error {
 // ConfigScalar is a typed scalar value to write, so the caller need not build
 // TOML literals (and get quoting wrong).
 type ConfigScalar struct {
-	str  *string
-	num  *int
-	list []string
+	str   *string
+	num   *int
+	float *float64
+	list  []string
 }
 
-// StringScalar / IntScalar / StringListScalar construct a ConfigScalar.
+// StringScalar / IntScalar / FloatScalar / StringListScalar construct a
+// ConfigScalar.
 func StringScalar(v string) ConfigScalar       { return ConfigScalar{str: &v} }
 func IntScalar(v int) ConfigScalar             { return ConfigScalar{num: &v} }
+func FloatScalar(v float64) ConfigScalar       { return ConfigScalar{float: &v} }
 func StringListScalar(v []string) ConfigScalar { return ConfigScalar{list: v} }
 
 func (c ConfigScalar) toml() string {
 	switch {
 	case c.num != nil:
 		return strconv.Itoa(*c.num)
+	case c.float != nil:
+		return strconv.FormatFloat(*c.float, 'g', -1, 64)
 	case c.list != nil:
 		quoted := make([]string, len(c.list))
 		for i, item := range c.list {
@@ -104,6 +109,9 @@ func validateConfigFile(paths Paths) error {
 		return err
 	}
 	if _, err := LoadDefaultFeedbackRepo(paths); err != nil {
+		return err
+	}
+	if _, err := LoadSkillOptABPolicy(paths); err != nil {
 		return err
 	}
 	return nil

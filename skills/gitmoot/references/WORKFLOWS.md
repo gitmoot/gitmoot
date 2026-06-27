@@ -465,9 +465,40 @@ else fail safe to notify-only) — supplying the promotion confidence Mode A cou
 not provide for ask agents. For a genuine ask candidate (no harvester score or
 feedback rows) the bandit pulls stand in for the Mode A sample/score floors, so the
 confidence gate alone can auto-promote it. `bandit_min_samples` (default 30) gates
-only the **deferred** auto loop; the manual A/B is always allowed. Live
-interception, the cross-family LLM-judge auto-pairwise, canary, and the auto A/B
-loop are deferred.
+both the manual-floor read and live interception; the manual A/B is always allowed.
+
+### Live-traffic A/B (off by default, #482)
+
+The same champion-vs-challenger comparison can fire **automatically** on a
+**sampled fraction** of real foreground `gitmoot agent ask` traffic, so templates
+self-improve as you use them — no operator has to remember to run `skillopt ab`:
+
+```toml
+[skillopt]
+live_ab_sample_rate = 0.1   # 10% of qualifying asks are intercepted; 0.0 (default) = never
+bandit_min_samples  = 30    # only agents whose champion arm has >= 30 bandit pulls
+```
+
+`live_ab_sample_rate` is **0.0 by default** (and unset with no `[skillopt]`
+section), which makes the foreground ask path **byte-identical**: no extra
+`Deliver`, no A/B record, no bandit update — the hot path is untouched when off.
+When set `> 0`, a foreground ask on a **managed** agent whose champion bandit arm
+is **at or above `bandit_min_samples`** is intercepted with probability
+`live_ab_sample_rate`: it runs the champion (the canonical answer you receive) and
+then a single pending challenger **serialized under the one runtime-session lock
+already held** (no second lock, no `session is busy`), presents both answers, and
+routes the human pick through the **exact same** `recordSkillOptABPick` path as the
+manual A/B (same `source = skillopt-ab` `RankedFeedbackEvent`, same bandit update).
+
+Low-traffic / bespoke agents (e.g. `researcher`) below `bandit_min_samples` are
+**never** auto-A/B'd. It is **fail-safe**: a challenger error, no pending
+challenger, or no pick captured degrades to the normal single champion answer and
+logs a `live_ab_skipped` job event — the primary ask is never blocked or
+degraded. Each intercepted ask runs the runtime **twice** (the sampled cost), and
+`contract_version` stays `1`. **Promotion stays MANUAL**: live A/B only writes
+feedback + updates the posterior; it never auto-promotes or rolls back a version.
+The cross-family LLM-judge auto-pairwise, canary, and the unattended auto A/B loop
+remain deferred.
 
 ## Execution Model
 

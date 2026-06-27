@@ -454,6 +454,14 @@ type SkillOptPolicy struct {
 	// is ALWAYS allowed regardless of this floor; it only governs the deferred
 	// automatic path. The promotion side reuses AutoPromoteMinSamples.
 	BanditMinSamples *int
+
+	// LiveABSampleRate is the live-traffic A/B (#482) sampling probability in
+	// [0,1]: the fraction of foreground `agent ask` calls (on a managed agent
+	// above BanditMinSamples) that are intercepted into a champion-vs-challenger
+	// A/B. nil (unset, the default) and 0.0 both mean NEVER intercept — the
+	// foreground ask path is byte-identical when this is absent. It is the ONLY
+	// new knob #482 adds; it reuses the existing bandit_min_samples as its floor.
+	LiveABSampleRate *float64
 }
 
 // DefaultBanditMinSamples is the documented default low-traffic floor for the
@@ -474,6 +482,7 @@ func DefaultSkillOptPolicy() SkillOptPolicy {
 		AutoPromoteCanary:               false,
 		AutoPromoteMinConfidence:        nil,
 		BanditMinSamples:                nil,
+		LiveABSampleRate:                nil,
 	}
 }
 
@@ -593,6 +602,13 @@ func applySkillOptPolicyField(policy *SkillOptPolicy, key string, value string) 
 			return err
 		}
 		policy.BanditMinSamples = &parsed
+		return nil
+	case "live_ab_sample_rate":
+		parsed, err := parseConfigFloat(value)
+		if err != nil {
+			return err
+		}
+		policy.LiveABSampleRate = &parsed
 		return nil
 	default:
 		return nil

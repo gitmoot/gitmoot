@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -201,6 +202,22 @@ func parseConfigString(value string) (string, error) {
 	parsed, err := strconv.Unquote(strings.TrimSpace(value))
 	if err != nil {
 		return "", err
+	}
+	return parsed, nil
+}
+
+// parseConfigFloat parses a bare TOML float scalar (e.g. 0.25) into a float64.
+// It rejects NaN and the infinities so a malformed [skillopt] knob can never
+// produce a sampling rate that bypasses the [0,1] bound check downstream. Unlike
+// parseConfigString it does NOT unquote: a sampling rate is a number, not a
+// quoted string. Callers (the [skillopt] loader) apply the range validation.
+func parseConfigFloat(value string) (float64, error) {
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return 0, fmt.Errorf("not a finite number: %q", strings.TrimSpace(value))
 	}
 	return parsed, nil
 }

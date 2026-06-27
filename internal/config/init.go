@@ -100,10 +100,20 @@ escalation_ttl = ""
 #     entirely (byte-identical to #471). When SET, auto-promote additionally
 #     requires a non-nil confidence >= this floor; a nil/low confidence FAILS SAFE
 #     to notify-only.
-#   bandit_min_samples (#473 Mode B): per-agent low-traffic floor for the DEFERRED
-#     auto A/B loop. Below it the bandit still records preferences and updates its
-#     posterior but never auto-runs/auto-promotes off thin evidence. The manual
-#     'skillopt ab' CLI is always allowed regardless. (default 30)
+#   bandit_min_samples (#473 Mode B): per-agent low-traffic floor. Below it the
+#     bandit still records preferences and updates its posterior but live-traffic
+#     A/B never auto-runs and the confidence is never trusted to auto-promote off
+#     thin evidence. The manual 'skillopt ab' CLI is always allowed regardless.
+#     (default 30)
+#   live_ab_sample_rate (#482 Mode B live A/B): probability in [0,1] that a single
+#     foreground 'agent ask' (on a MANAGED agent whose champion arm is already at
+#     or above bandit_min_samples) is intercepted into a champion-vs-challenger
+#     A/B — running both variants serially, presenting both answers, and recording
+#     the human pick through the SAME bandit + RankedFeedbackEvent path as the
+#     manual 'skillopt ab'. UNSET / 0.0 (the default) NEVER intercepts — the ask
+#     path is byte-identical. It only writes feedback + updates the posterior;
+#     promotion stays MANUAL. Each intercepted ask runs the runtime twice (cost),
+#     which is why it is sampled and floored.
 # [skillopt]
 # auto_trace_enabled = false
 # cross_family_review_enabled = false
@@ -116,6 +126,7 @@ escalation_ttl = ""
 # auto_promote_canary = false
 # auto_promote_min_confidence = 0.95
 # bandit_min_samples = 30
+# live_ab_sample_rate = 0.0
 
 # [admission] is an OPT-IN, off-by-default host-global concurrency budget the
 # daemon applies BEFORE starting each agent session, on top of --workers/pool

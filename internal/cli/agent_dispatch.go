@@ -45,6 +45,12 @@ type localAgentDispatchRequest struct {
 	SelectedAction         string
 	SelectedActionReason   string
 	ExecutionPath          string
+	// JSONOutput is true when the caller will emit machine-readable JSON (e.g.
+	// `agent ask --json`). The live-A/B interceptor (#482) MUST stay byte-clean for
+	// these consumers: it never presents the A/B block (which would prepend
+	// "[live A/B] ..." to the JSON object and break parsing) and never runs the
+	// second challenger Deliver, falling through to the plain single ask.
+	JSONOutput bool
 }
 
 type localAgentJobOutput struct {
@@ -221,8 +227,22 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		defer cancel()
 	}
 	if request.Action == "ask" {
-		if _, err := (workflow.Mailbox{Store: store}).Run(runCtx, job.ID, runtimeAgent(agent), adapter); err != nil {
-			return localAgentJobOutput{}, err
+		// Live-traffic A/B interception (#482). Off by default: when
+		// [skillopt].live_ab_sample_rate is 0 (every existing home + DefaultConfig),
+		// the agent is unmanaged, the bandit floor is not met, or the sampling die
+		// misses, maybeRunLiveAB returns handled=false and the EXACT single
+		// Mailbox.Run below runs unchanged (byte-identical, no extra Deliver). It
+		// reuses the runtime-session lock already held from acquireRuntimeSessionLock
+		// above — no second lock acquisition — so the two serialized Deliver calls
+		// can never self-deadlock on "session is busy".
+		handled, abErr := maybeRunLiveAB(runCtx, store, request, agent, job, adapter, managed.OK)
+		if abErr != nil {
+			return localAgentJobOutput{}, abErr
+		}
+		if !handled {
+			if _, err := (workflow.Mailbox{Store: store}).Run(runCtx, job.ID, runtimeAgent(agent), adapter); err != nil {
+				return localAgentJobOutput{}, err
+			}
 		}
 		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_completed", Message: "workflow advancement completed"}); err != nil {
 			return localAgentJobOutput{}, err

@@ -145,6 +145,7 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 			SelectedAction:       "ask",
 			SelectedActionReason: "explicit agent ask",
 			ExecutionPath:        "agent_ask",
+			JSONOutput:           options.jsonOutput,
 		})
 		return err
 	}); err != nil {
