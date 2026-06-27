@@ -760,6 +760,82 @@ func TestMailboxRunRetriesMalformedOutputOnce(t *testing.T) {
 	}
 }
 
+func TestMailboxRunSalvagesMissingEnvelopeAfterSecondRepair(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "jerryfane/gitmoot", Role: "reviewer"}
+	adapter := &fakeDelivery{outputs: []string{
+		"findings posted, no json",
+		"still no json",
+		`{"gitmoot_result":{"decision":"approved","summary":"salvaged after second repair","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+	}}
+
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "review", Repo: "jerryfane/gitmoot"}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+	result, err := mailbox.Run(ctx, "job-1", agent, adapter)
+
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Summary != "salvaged after second repair" {
+		t.Fatalf("summary = %q", result.Summary)
+	}
+	if len(adapter.prompts) != 3 {
+		t.Fatalf("deliveries = %d, want 3", len(adapter.prompts))
+	}
+	if !strings.Contains(adapter.prompts[1], "Previous raw output") {
+		t.Fatalf("first repair prompt = %s", adapter.prompts[1])
+	}
+	if !strings.Contains(adapter.prompts[2], "Previous raw output") {
+		t.Fatalf("second repair prompt = %s", adapter.prompts[2])
+	}
+	stored, err := store.GetJob(ctx, "job-1")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if stored.State != string(JobSucceeded) {
+		t.Fatalf("state = %q, want succeeded", stored.State)
+	}
+	events, err := store.ListJobEvents(ctx, "job-1")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !hasEvent(events, "malformed_output") || !hasEvent(events, "repair_retry") {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestMailboxRunFailsAfterExhaustingRepairs(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "jerryfane/gitmoot", Role: "reviewer"}
+	adapter := &fakeDelivery{outputs: []string{
+		"no json here",
+		"still no json",
+		"and again no json",
+	}}
+
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "review", Repo: "jerryfane/gitmoot"}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err == nil {
+		t.Fatal("Run succeeded despite exhausting all repair attempts")
+	}
+	if len(adapter.prompts) != 3 {
+		t.Fatalf("deliveries = %d, want 3 (initial + maxRepairAttempts)", len(adapter.prompts))
+	}
+	stored, err := store.GetJob(ctx, "job-1")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if stored.State != string(JobFailed) {
+		t.Fatalf("state = %q, want failed", stored.State)
+	}
+}
+
 func TestMailboxRunMarksBlockedDecision(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
