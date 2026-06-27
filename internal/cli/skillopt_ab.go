@@ -54,6 +54,27 @@ const (
 	skillOptABJudgeReviewer = "skillopt-ab-judge"
 )
 
+// skillOptABJurorSource / skillOptABJurorReviewerPrefix tag the PER-JUROR detail
+// rows of a cross-family judge JURY (#349). The AGGREGATED jury verdict reuses the
+// canonical skillopt-ab-judge reviewer/source above (so a jury strictly upgrades
+// the single-judge evidence under the SAME tag — a downstream consumer that reads
+// the judge row gets the better, aggregated verdict for free). Each individual
+// juror's pick is recorded SEPARATELY under this DISTINCT source (reviewer
+// skillopt-ab-juror:<family>) so the per-juror transparency rows coexist with the
+// aggregate without being double-counted as extra judge votes. Like the single
+// judge, NONE of these ever touch the promotion bandit (evidence-only).
+const (
+	skillOptABJurorSource         = "skillopt-ab-juror"
+	skillOptABJurorReviewerPrefix = "skillopt-ab-juror:"
+	// skillOptABJuryItemID is a DEDICATED eval_review_item id that carries ONLY the
+	// jury aggregation metadata (disagreement flag, tallies, per-juror picks). It is
+	// distinct from the shared "ab" item so the human/single-judge path's idempotent
+	// ensureSkillOptABRunRows (which re-upserts the "ab" item without jury metadata)
+	// can never clobber it. The per-juror ranked rows still reference the shared "ab"
+	// item (with the real options); this item is metadata-only.
+	skillOptABJuryItemID = skillOptABItemID + "-jury"
+)
+
 // skillOptABVariant is one resolved A/B arm: the version being served plus its
 // human-readable role label (champion|challenger).
 type skillOptABVariant struct {
@@ -158,6 +179,11 @@ type skillOptABOptions struct {
 	// judgeOnly skips soliciting the human pick and records ONLY the judge row
 	// (mirrors the --pick non-interactive escape). It implies --judge.
 	judgeOnly bool
+	// jurySize turns the cross-family judge into a JURY of this many DISTINCT-family
+	// judges (#349); >= 2 implies --judge. 0 (the default) defers to the
+	// [skillopt].mode_b_jury_size config knob; an explicit flag overrides it. < 2
+	// (after resolution) is the single-judge path (byte-identical).
+	jurySize int
 }
 
 func runSkillOptAB(args []string, stdout, stderr io.Writer) int {
@@ -198,6 +224,7 @@ func parseSkillOptABOptions(args []string, stderr io.Writer) (skillOptABOptions,
 	seed := fs.Int64("seed", 0, "deterministic seed for the label shuffle and the P(>) Monte Carlo")
 	judge := fs.Bool("judge", false, "also have a cross-family LLM judge pick A/B and record a separate skillopt-ab-judge row (#483; off by default)")
 	judgeOnly := fs.Bool("judge-only", false, "record ONLY the cross-family judge row, skipping the human pick prompt (implies --judge)")
+	jurySize := fs.Int("jury-size", 0, "run a cross-family judge JURY of N distinct-family judges instead of one (#349; >=2 implies --judge; 0 defers to [skillopt].mode_b_jury_size)")
 	// Separate the leading positionals (agent, prompt) from flags. flag.Parse stops
 	// at the first non-flag, so collect positionals manually to allow them anywhere.
 	positionals := []string{}
@@ -207,7 +234,7 @@ func parseSkillOptABOptions(args []string, stderr io.Writer) (skillOptABOptions,
 		if strings.HasPrefix(arg, "-") {
 			rest = append(rest, arg)
 			// flags that take a value consume the next token unless --flag=value.
-			if !strings.Contains(arg, "=") && (arg == "--home" || arg == "--challenger" || arg == "--pick" || arg == "--seed") && i+1 < len(args) {
+			if !strings.Contains(arg, "=") && (arg == "--home" || arg == "--challenger" || arg == "--pick" || arg == "--seed" || arg == "--jury-size") && i+1 < len(args) {
 				i++
 				rest = append(rest, args[i])
 			}
@@ -234,9 +261,10 @@ func parseSkillOptABOptions(args []string, stderr io.Writer) (skillOptABOptions,
 		fmt.Fprintln(stderr, "skillopt ab --pick must be a or b")
 		return skillOptABOptions{}, false
 	}
-	// --judge-only implies --judge: recording only the judge row still requires the
-	// judge path to be admitted.
-	judgeOn := *judge || *judgeOnly
+	// --judge-only implies --judge; --jury-size >= 2 implies --judge (the jury runs
+	// inside the judge seam): recording any judge/jury row requires the judge path
+	// to be admitted.
+	judgeOn := *judge || *judgeOnly || *jurySize >= 2
 	return skillOptABOptions{
 		home:       strings.TrimSpace(*home),
 		agent:      strings.TrimSpace(positionals[0]),
@@ -247,6 +275,7 @@ func parseSkillOptABOptions(args []string, stderr io.Writer) (skillOptABOptions,
 		seedSet:    seedSet,
 		judge:      judgeOn,
 		judgeOnly:  *judgeOnly,
+		jurySize:   *jurySize,
 	}, true
 }
 
@@ -699,7 +728,39 @@ func skillOptABJudgeEnabled(paths config.Paths, options skillOptABOptions) bool 
 	if err != nil {
 		return false
 	}
-	return policy.ModeBJudgeEnabled
+	// A configured jury (mode_b_jury_size >= 2) admits the judge seam too: the jury
+	// runs INSIDE it, so enabling the jury alone is enough to turn it on (#349).
+	return policy.ModeBJudgeEnabled || policy.ModeBJurySize >= 2
+}
+
+// skillOptABJuryConfig resolves the effective jury parameters (#349): the
+// per-invocation --jury-size flag wins when set (>0), else the persistent
+// [skillopt].mode_b_jury_* config knobs. A size < 2 means the single-judge path
+// (the jury is off / byte-identical). A config read error fails safe to size 0
+// (single judge) so a malformed config never silently fans out judges.
+func skillOptABJuryConfig(paths config.Paths, options skillOptABOptions) skillopt.JuryConfig {
+	cfg := skillopt.JuryConfig{}
+	policy, err := config.LoadSkillOptPolicy(paths)
+	if err == nil {
+		cfg.VetoDimensions = policy.ModeBJuryVetoDimensions
+		cfg.VetoFloor = policy.ModeBJuryVetoFloor
+		cfg.DisagreementTau = policy.ModeBJuryDisagreementTau
+	}
+	return cfg
+}
+
+// skillOptABJurySize resolves the effective jury size: the --jury-size flag when
+// set (>0), else [skillopt].mode_b_jury_size, else 0 (single judge). A config read
+// error fails safe to the single-judge path.
+func skillOptABJurySize(paths config.Paths, options skillOptABOptions) int {
+	if options.jurySize > 0 {
+		return options.jurySize
+	}
+	policy, err := config.LoadSkillOptPolicy(paths)
+	if err != nil {
+		return 0
+	}
+	return policy.ModeBJurySize
 }
 
 // runSkillOptABJudge runs the off-by-default cross-family LLM-judge auto-pairwise
@@ -720,6 +781,26 @@ func runSkillOptABJudge(ctx context.Context, store *db.Store, paths config.Paths
 	if probe := skillOptABJudgeAuthedRuntimes(agent.RepoScope); probe != nil {
 		authed = probe(ctx)
 	}
+
+	// JURY (#349): when a jury of >= 2 distinct families is configured AND >= 2
+	// distinct families are actually available, run the cross-family judge JURY and
+	// return. With the jury OFF (size < 2) or fewer than 2 distinct families
+	// available, fall through to the EXISTING single cross-family judge path below —
+	// byte-identical to #483. The authed probe is computed once above and shared.
+	if size := skillOptABJurySize(paths, options); size >= 2 {
+		jury, err := workflow.PickCrossFamilyJury(ctx, store, agent.Runtime, agent.RepoScope, authed, size)
+		if err != nil {
+			log.Printf("skillopt ab jury: select cross-family jury: %v", err)
+			return
+		}
+		if len(jury) >= 2 {
+			runSkillOptABJudgeJury(ctx, store, paths, runID, templateID, champion, challenger, optionA, optionB, options, jury, stdout)
+			return
+		}
+		// < 2 distinct families: graceful degradation to the single-judge path.
+		fmt.Fprintf(stdout, "skillopt ab: only %d distinct cross-family judge(s) available; falling back to a single judge\n", len(jury))
+	}
+
 	reviewer, ok, err := workflow.PickCrossFamilyReviewer(ctx, store, agent.Runtime, agent.RepoScope, authed)
 	if err != nil {
 		log.Printf("skillopt ab judge: select cross-family judge: %v", err)
@@ -781,6 +862,161 @@ func runSkillOptABJudge(ctx context.Context, store *db.Store, paths config.Paths
 	// the promotion Beta-Bernoulli bandit — promotion stays manual + human-driven.
 	fmt.Fprintf(stdout, "Judge (%s, cross-family): %s (Option %s) — recorded as %s (evidence-only, does not move the promotion bandit)\n",
 		reviewer.Runtime, winnerLabel, strings.ToUpper(pick), skillOptABJudgeSource)
+}
+
+// skillOptABJuror is one surviving jury member's parsed verdict: its resolved
+// family, the role it picked (champion|challenger), and whether that pick means
+// the challenger won (the boolean the pure aggregator votes on).
+type skillOptABJuror struct {
+	family         string
+	winnerLabel    string
+	challengerWins bool
+}
+
+// runSkillOptABJudgeJury runs the off-by-default cross-family judge JURY (#349)
+// best-effort: it delivers the SAME blind shuffled Option A/B to EACH distinct-family
+// juror (SERIALIZED — one Deliver at a time so per-runtime session locks never
+// overlap), DROPS any juror that errors or returns an unparseable pick (fail-safe —
+// the jury proceeds with the rest), aggregates the survivors' picks via the PURE
+// skillopt.EvaluateJury (majority vote + disagreement flag), and records the
+// aggregated verdict (under the canonical skillopt-ab-judge tag) PLUS one per-juror
+// detail row (under the distinct skillopt-ab-juror source). It NEVER touches the
+// promotion bandit and NEVER fails the command (every error path logs/prints and
+// returns, leaving the human path intact). Candidate origin is blinded to every
+// juror exactly as the single judge blinds it. When NO juror survives it writes no
+// row (same as the single judge's unparseable drop).
+func runSkillOptABJudgeJury(ctx context.Context, store *db.Store, paths config.Paths, runID, templateID string, champion, challenger skillOptABVariant, optionA, optionB skillOptABDelivery, options skillOptABOptions, jury []workflow.CrossFamilyReviewer, stdout io.Writer) {
+	prompt := buildSkillOptABJudgePrompt(options.prompt, optionA.answer, optionB.answer)
+
+	var jurors []skillOptABJuror
+	for _, reviewer := range jury {
+		judgeAgent := skillOptABJudgeAgent(reviewer)
+		raw, err := skillOptABJudgeDeliver(ctx, judgeAgent, prompt)
+		if err != nil {
+			// Fail-safe: a juror that errors is DROPPED; the jury proceeds with the rest.
+			log.Printf("skillopt ab jury: juror %s deliver: %v", reviewer.Runtime, err)
+			continue
+		}
+		pick, parsed := parseSkillOptABJudgePick(raw)
+		if !parsed {
+			log.Printf("skillopt ab jury: juror %s returned no usable pick; dropping", reviewer.Runtime)
+			continue
+		}
+		// Map the juror's a/b pick back to the role via the SAME shuffle mapping the
+		// human/single-judge use (the juror saw the SAME blind Option A/B).
+		pickedDelivery := optionA
+		if pick == "b" {
+			pickedDelivery = optionB
+		}
+		jurors = append(jurors, skillOptABJuror{
+			family:         reviewer.Runtime,
+			winnerLabel:    pickedDelivery.label,
+			challengerWins: pickedDelivery.label == skillOptABChallengerLabel,
+		})
+	}
+
+	if len(jurors) == 0 {
+		fmt.Fprintln(stdout, "skillopt ab: no jury member returned a usable pick; skipping jury rows")
+		return
+	}
+
+	// Pure aggregation: majority vote on "challenger wins" + disagreement flag. The
+	// pairwise A/B path carries no rubric dimensions, so the median/veto outputs are
+	// inert here; the same aggregator serves a future promotion-boundary rubric jury.
+	verdicts := make([]skillopt.JuryJudgeVerdict, 0, len(jurors))
+	for _, j := range jurors {
+		verdicts = append(verdicts, skillopt.JuryJudgeVerdict{Decision: j.challengerWins})
+	}
+	decision := skillopt.EvaluateJury(skillOptABJuryConfig(paths, options), verdicts)
+
+	// Ensure the shared run/item/options exist (idempotent), then stamp the jury
+	// aggregation onto the eval_review_item metadata (existing MetadataJSON — no new
+	// contract field) so the disagreement flag + tallies ride existing eval metadata.
+	if err := ensureSkillOptABRunRows(ctx, store, paths, runID, skillOptABItemID, templateID, champion, challenger, optionAToDelivery(optionA, optionB, champion), optionAToDelivery(optionA, optionB, challenger), options.prompt, skillOptABSource, skillOptABFeedbackSource); err != nil {
+		log.Printf("skillopt ab jury: ensure run rows: %v", err)
+		return
+	}
+	if err := store.UpsertEvalReviewItem(ctx, db.EvalReviewItem{
+		RunID:        runID,
+		ItemID:       skillOptABJuryItemID,
+		Title:        "jury aggregation: " + options.prompt,
+		MetadataJSON: skillOptABJuryMetadata(decision, jurors),
+	}); err != nil {
+		log.Printf("skillopt ab jury: stamp jury metadata: %v", err)
+		return
+	}
+
+	// Per-juror transparency rows (distinct skillopt-ab-juror source so they coexist
+	// with the aggregate without being double-counted as judge votes).
+	for _, j := range jurors {
+		loserLabel := skillOptABChampionLabel
+		if j.winnerLabel == skillOptABChampionLabel {
+			loserLabel = skillOptABChallengerLabel
+		}
+		reviewer := skillOptABJurorReviewerPrefix + j.family
+		sourceURL := skillOptABJurorSourceURL(challenger.version.ID, j.family)
+		if err := upsertSkillOptABRankedEvent(ctx, store, runID, skillOptABItemID, j.winnerLabel, loserLabel, reviewer, skillOptABJurorSource, sourceURL); err != nil {
+			log.Printf("skillopt ab jury: record juror %s row: %v", j.family, err)
+			return
+		}
+	}
+
+	// Aggregated verdict under the CANONICAL judge tag (a jury upgrades the single
+	// judge's evidence in place). Majority "challenger wins" => challenger is the
+	// winner; a tie/veto resolves to champion (fail-safe baseline).
+	aggWinner := skillOptABChampionLabel
+	aggLoser := skillOptABChallengerLabel
+	if decision.Decision {
+		aggWinner, aggLoser = skillOptABChallengerLabel, skillOptABChampionLabel
+	}
+	if err := upsertSkillOptABRankedEvent(ctx, store, runID, skillOptABItemID, aggWinner, aggLoser, skillOptABJudgeReviewer, skillOptABJudgeSource, skillOptABJudgeSourceURL(challenger.version.ID)); err != nil {
+		log.Printf("skillopt ab jury: record aggregate verdict: %v", err)
+		return
+	}
+
+	fmt.Fprintf(stdout, "Jury (%d cross-family judges): %s wins %d:%d — recorded as %s (evidence-only, does not move the promotion bandit)\n",
+		len(jurors), aggWinner, decision.Approve, decision.Reject, skillOptABJudgeSource)
+	if decision.Disagreement {
+		// Route to a human (and feed #345): a split jury is the load-this-to-a-human
+		// signal the issue mandates.
+		fmt.Fprintf(stdout, "Jury DISAGREEMENT (%s): routing to human review (recorded for judge<->human calibration, #345)\n", decision.DisagreementReason)
+	}
+}
+
+// skillOptABJuryMetadata serializes the jury aggregation onto the eval_review_item
+// metadata (#349) — existing MetadataJSON, NO new contract field — so the
+// disagreement flag, the vote tally, and the per-juror picks ride the existing eval
+// metadata the export/optimizer (and #345 capture) already read.
+func skillOptABJuryMetadata(decision skillopt.JuryDecision, jurors []skillOptABJuror) string {
+	picks := make([]map[string]any, 0, len(jurors))
+	for _, j := range jurors {
+		picks = append(picks, map[string]any{"family": j.family, "winner": j.winnerLabel})
+	}
+	meta := map[string]any{
+		"jury":              true,
+		"jury_size":         len(jurors),
+		"jury_approve":      decision.Approve,
+		"jury_reject":       decision.Reject,
+		"jury_disagreement": decision.Disagreement,
+		"jury_jurors":       picks,
+	}
+	if decision.Disagreement {
+		meta["jury_disagreement_reason"] = decision.DisagreementReason
+	}
+	if decision.Vetoed {
+		meta["jury_vetoed"] = true
+		meta["jury_veto_reason"] = decision.VetoReason
+	}
+	raw, _ := json.Marshal(meta)
+	return string(raw)
+}
+
+// skillOptABJurorSourceURL mints a unique-per-juror SourceURL embedding the juror
+// family so each juror's detail row has a distinct (run,item,reviewer,source,url)
+// conflict key and repeated jury runs each persist without colliding.
+func skillOptABJurorSourceURL(versionID, family string) string {
+	seq := atomic.AddUint64(&skillOptABPickSeq, 1)
+	return fmt.Sprintf("%s%s:juror:%s#%d-%d", skillOptABRunIDPrefix, versionID, family, time.Now().UnixNano(), seq)
 }
 
 // optionAToDelivery recovers the champion/challenger delivery from the shuffled

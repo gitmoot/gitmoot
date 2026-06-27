@@ -133,6 +133,24 @@ escalation_ttl = ""
 #     row. The judge is cross-family ONLY (skipped — never same-family — when no other
 #     family is available), NEVER touches the promotion bandit, and is never the sole
 #     gate; its trust is DEFERRED to MEASURE-THE-JUDGE (#344). Off ⇒ byte-identical.
+#   mode_b_jury_size (#349 Mode B): turns the single cross-family judge above into a
+#     cross-family judge JURY — up to this many judges from DISTINCT model families
+#     judge the same blind A/B, and their picks are aggregated by MAJORITY vote with
+#     a DISAGREEMENT flag (non-unanimous vote, or per-dimension std > tau) that routes
+#     to a human and feeds #345. 0/1 (the default) ⇒ jury OFF, byte-identical to the
+#     single judge. Families are DEDUPED (diversity over headcount): a host with only
+#     2 families caps the jury at 2; with < 2 distinct families it falls back to the
+#     single judge (never fails the eval). Like the single judge, the jury is EVIDENCE
+#     only — it NEVER promotes and NEVER touches the bandit.
+#   mode_b_jury_veto_dimensions (#349): optional comma list of safety / hard-correctness
+#     rubric dimensions subject to the jury's MINORITY-VETO — one judge below
+#     mode_b_jury_veto_floor on any of these BLOCKS (fail-closed). UNSET/empty ⇒ no
+#     veto. Inert on the pairwise A/B path (no rubric); applies to a rubric jury.
+#   mode_b_jury_veto_floor (#349): the [0,1] floor for the veto dimensions. 0.0 (the
+#     default) makes the veto inert (a clamped score is never < 0).
+#   mode_b_jury_disagreement_tau (#349): per-dimension population-std threshold above
+#     which the jury flags disagreement. 0.0 (the default) disables the std check,
+#     leaving only the vote-split check (a non-unanimous vote always flags).
 #   deterministic_checkers_enabled (#485): OFF by default; requires auto_trace. When
 #     true, a MERGED implement job additionally runs a best-effort, DETACHED leg of
 #     plain external TOOLS (code duplication, lint, cyclomatic complexity) plus a
@@ -167,6 +185,10 @@ escalation_ttl = ""
 # bandit_min_samples = 30
 # live_ab_sample_rate = 0.0
 # mode_b_judge_enabled = false
+# mode_b_jury_size = 1
+# mode_b_jury_veto_dimensions =
+# mode_b_jury_veto_floor = 0.0
+# mode_b_jury_disagreement_tau = 0.0
 
 # [admission] is an OPT-IN, off-by-default host-global concurrency budget the
 # daemon applies BEFORE starting each agent session, on top of --workers/pool

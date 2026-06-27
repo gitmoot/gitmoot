@@ -174,6 +174,95 @@ func pickCrossFamilyReviewer(ctx context.Context, store AgentLister, implementer
 	return CrossFamilyReviewer{}, false, nil
 }
 
+// crossFamilyJuryUniverse is the fixed, deterministic family universe the
+// N-diverse-family jury picker iterates (#349): the three known runtime families
+// in a stable order. PickCrossFamilyJury draws DISTINCT families from this list
+// (skipping the implementer's own family), so the resulting jury is cross-family
+// AND family-deduped by construction — diversity over headcount, never two
+// near-identical judges of the same family.
+var crossFamilyJuryUniverse = []string{
+	runtime.ClaudeRuntime,
+	runtime.CodexRuntime,
+	runtime.KimiRuntime,
+}
+
+// PickCrossFamilyJury selects up to `size` cross-family reviewers from DISTINCT
+// model families for the judge-jury (#349), generalizing PickCrossFamilyReviewer
+// from one reviewer to N diverse ones. It is the diversity-first picker the issue
+// mandates: every returned reviewer is a DIFFERENT family from the implementer
+// AND from every other returned reviewer (deduped by family), because correlated
+// same-family judges undermine a panel — so it NEVER pads with a near-identical
+// family to reach `size`.
+//
+// Selection per candidate family (iterating crossFamilyJuryUniverse minus the
+// implementer's family, deterministically):
+//  1. a registered, review-capable agent of that family whose repo scope covers
+//     repo (deterministic by name), else
+//  2. an EPHEMERAL read-only review leg on that family — but ONLY when that family
+//     is actually authed/available (so the leg can really run).
+//
+// A family with neither is skipped. The result is the available distinct families
+// (0..size). GRACEFUL DEGRADATION: when fewer than `size` distinct families are
+// available it returns as many as exist; the CALLER falls back to the single
+// PickCrossFamilyReviewer path when fewer than 2 are returned (a jury of one is
+// just the single judge). An unknown/unrecoverable implementer family yields nil
+// (skip — never a possibly-same-family jury), and size < 2 yields nil (the jury
+// is off; the caller takes the single-judge path) so the off-by-default behavior
+// is byte-identical to today's single cross-family judge.
+func PickCrossFamilyJury(ctx context.Context, store AgentLister, implementerRuntime string, repo string, authedRuntimes map[string]bool, size int) ([]CrossFamilyReviewer, error) {
+	implementerRuntime = strings.TrimSpace(implementerRuntime)
+	if _, known := crossFamilyRotation[implementerRuntime]; !known {
+		// Unknown implementer family: skip rather than risk a same-family jury.
+		return nil, nil
+	}
+	if size < 2 {
+		// A jury needs at least two distinct families; below that the caller uses the
+		// existing single cross-family judge path (byte-identical off-by-default).
+		return nil, nil
+	}
+
+	agents, err := listReviewAgents(ctx, store, repo)
+	if err != nil {
+		return nil, err
+	}
+
+	var jury []CrossFamilyReviewer
+	for _, family := range crossFamilyJuryUniverse {
+		if strings.EqualFold(family, implementerRuntime) {
+			// Cross-family ONLY: never include the agent's own family (preference-leakage
+			// guard), which also keeps the panel's families distinct.
+			continue
+		}
+
+		// 1. A registered DIFFERENT-family review-capable agent of this family.
+		var picked *CrossFamilyReviewer
+		for _, agent := range agents {
+			if strings.EqualFold(agent.Runtime, family) {
+				picked = &CrossFamilyReviewer{
+					Runtime:         family,
+					RegisteredAgent: agent.Name,
+				}
+				break
+			}
+		}
+		// 2. Else an ephemeral DIFFERENT-family leg, but only if that family is authed.
+		if picked == nil && authedRuntimes[family] {
+			picked = &CrossFamilyReviewer{
+				Runtime:   family,
+				Ephemeral: ephemeralReviewerSpec(family),
+			}
+		}
+		if picked == nil {
+			continue
+		}
+		jury = append(jury, *picked)
+		if len(jury) >= size {
+			break
+		}
+	}
+	return jury, nil
+}
+
 // listReviewAgents returns the registered review-capable agents that can access
 // repo, sorted deterministically by name (ListAgents already orders by name; this
 // re-sorts defensively so the first-match selection is stable regardless of the

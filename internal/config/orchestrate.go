@@ -482,6 +482,35 @@ type SkillOptPolicy struct {
 	// and is NEVER the sole gate; its trust is explicitly deferred to MEASURE-THE-JUDGE
 	// (#344) — judge-tagged + weighted-low now, calibrated later.
 	ModeBJudgeEnabled bool
+
+	// ModeBJurySize opts the off-by-default cross-family judge (#483) into a
+	// cross-family judge JURY (#349): instead of ONE judge, up to this many judges
+	// from DISTINCT model families judge the same blind A/B and their verdicts are
+	// aggregated (majority vote + disagreement flag). 0 or 1 (the default) means the
+	// jury is OFF and behavior is BYTE-IDENTICAL to the single cross-family judge.
+	// The jury only activates at >= 2 AND when >= 2 distinct families are actually
+	// available; with fewer distinct families it gracefully degrades to as many as
+	// exist, and below 2 it falls back to the single judge (never fails the eval).
+	// Diversity over headcount: families are deduped, so a host with only 2 families
+	// caps the jury at 2 no matter how high this is set. The jury is EVIDENCE only —
+	// like the single judge it NEVER promotes and NEVER touches the bandit.
+	ModeBJurySize int
+	// ModeBJuryVetoDimensions is the optional set of safety / hard-correctness
+	// rubric dimensions subject to the jury's MINORITY-VETO (#349): a single judge
+	// scoring below ModeBJuryVetoFloor on any of these BLOCKS (fail-closed), even
+	// when the majority would promote. nil/empty (the default) disables the veto.
+	// It is inert on the pairwise A/B path (which carries no rubric dimensions) and
+	// applies to a future promotion-boundary rubric jury.
+	ModeBJuryVetoDimensions []string
+	// ModeBJuryVetoFloor is the [0,1] floor for the veto dimensions (#349). 0.0
+	// (the default) makes the veto inert (a clamped score is never < 0), so a veto
+	// only ever fires when an operator sets BOTH a floor AND the dimensions.
+	ModeBJuryVetoFloor float64
+	// ModeBJuryDisagreementTau is the per-dimension population-std threshold above
+	// which the jury flags DISAGREEMENT (routes to a human, feeds #345). 0.0 (the
+	// default) disables the std-based check, leaving only the vote-split check (a
+	// non-unanimous boolean vote always flags disagreement regardless of tau).
+	ModeBJuryDisagreementTau float64
 	// LiveABSampleRate is the live-traffic A/B (#482) sampling probability in
 	// [0,1]: the fraction of foreground `agent ask` calls (on a managed agent
 	// above BanditMinSamples) that are intercepted into a champion-vs-challenger
@@ -544,6 +573,10 @@ func DefaultSkillOptPolicy() SkillOptPolicy {
 		AutoPromoteMinConfidence:        nil,
 		BanditMinSamples:                nil,
 		ModeBJudgeEnabled:               false,
+		ModeBJurySize:                   0,
+		ModeBJuryVetoDimensions:         nil,
+		ModeBJuryVetoFloor:              0,
+		ModeBJuryDisagreementTau:        0,
 		LiveABSampleRate:                nil,
 		DeterministicCheckers:           false,
 		DeterministicCheckerList:        nil,
@@ -723,6 +756,30 @@ func applySkillOptPolicyField(policy *SkillOptPolicy, key string, value string) 
 		parsed, err := strconv.ParseBool(value)
 		policy.ModeBJudgeEnabled = parsed
 		return err
+	case "mode_b_jury_size":
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		policy.ModeBJurySize = parsed
+		return nil
+	case "mode_b_jury_veto_dimensions":
+		policy.ModeBJuryVetoDimensions = parseConfigStringList(value)
+		return nil
+	case "mode_b_jury_veto_floor":
+		parsed, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return err
+		}
+		policy.ModeBJuryVetoFloor = parsed
+		return nil
+	case "mode_b_jury_disagreement_tau":
+		parsed, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return err
+		}
+		policy.ModeBJuryDisagreementTau = parsed
+		return nil
 	case "live_ab_sample_rate":
 		parsed, err := parseConfigFloat(value)
 		if err != nil {
@@ -749,6 +806,14 @@ func applySkillOptPolicyField(policy *SkillOptPolicy, key string, value string) 
 // errors: an unknown name is simply ignored downstream (best-effort), so a typo
 // degrades to fewer dimensions rather than failing the daemon's config load.
 func parseDeterministicCheckerList(value string) []string {
+	return parseConfigStringList(value)
+}
+
+// parseConfigStringList parses a plain comma list (e.g. "a, b ,c") into a
+// trimmed, non-empty slice; an empty value (or only blanks) yields nil. It is the
+// shared parser for comma-list config knobs (deterministic_checkers,
+// mode_b_jury_veto_dimensions) and never errors.
+func parseConfigStringList(value string) []string {
 	var out []string
 	for _, part := range strings.Split(value, ",") {
 		if name := strings.TrimSpace(part); name != "" {
