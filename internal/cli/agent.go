@@ -126,9 +126,8 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if !options.force && looksLikeWorkflowOrchestration(options.message) {
-		fmt.Fprintln(stderr, "This looks like implementation workflow orchestration.")
-		fmt.Fprintln(stderr, "Use `gitmoot agent run` or `gitmoot agent implement` so Gitmoot can manage worktrees, branches, commits, and PRs safely.")
-		return 2
+		fmt.Fprintln(stderr, "note: this reads like implementation workflow orchestration, but `agent ask` is read-only and will only answer/analyze.")
+		fmt.Fprintln(stderr, "If you want Gitmoot to manage worktrees, branches, commits, and PRs, use `gitmoot agent run` or `gitmoot agent implement`.")
 	}
 	var output localAgentJobOutput
 	if err := withStore(options.home, func(store *db.Store) error {

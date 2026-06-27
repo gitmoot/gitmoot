@@ -341,8 +341,9 @@ This uses the same agent registry, repo access grants, cached template snapshot,
 runtime adapter, and local job history as PR-comment jobs. `agent run` is the
 default coordinator-safe entrypoint because it routes to `ask`, `review`, or
 `implement` and keeps branch, worktree, commit, push, PR, and workflow lifecycle
-inside Gitmoot. `agent ask` is for analysis, planning, and questions only; it
-blocks obvious branch/commit/push/PR orchestration unless `--force` is supplied.
+inside Gitmoot. `agent ask` is for analysis, planning, and questions only; it is
+read-only, so when the message reads like branch/commit/push/PR orchestration it
+prints a non-fatal note and still runs (pass `--force` to suppress the note).
 The runtime
 plugin helps Codex or Claude Code discover Gitmoot guidance, but it does not
 replace the Gitmoot CLI. Synchronous jobs and queued jobs both use the same

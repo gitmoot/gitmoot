@@ -250,11 +250,11 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		// can never self-deadlock on "session is busy".
 		handled, abErr := maybeRunLiveAB(runCtx, store, request, agent, job, adapter, managed.OK)
 		if abErr != nil {
-			return localAgentJobOutput{}, abErr
+			return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, abErr)
 		}
 		if !handled {
 			if _, err := (workflow.Mailbox{Store: store}).Run(runCtx, job.ID, runtimeAgent(agent), adapter); err != nil {
-				return localAgentJobOutput{}, err
+				return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, err)
 			}
 		}
 		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_completed", Message: "workflow advancement completed"}); err != nil {
@@ -278,6 +278,18 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		return localAgentJobOutput{}, err
 	}
 	return buildLocalAgentJobOutput(latest, request)
+}
+
+// foregroundAskTimeoutError turns a JobTimeout-driven context cancel into an
+// actionable message instead of the confusing "job ... is cancelled, not running".
+func foregroundAskTimeoutError(runCtx context.Context, jobTimeout time.Duration, err error) error {
+	if err == nil {
+		return nil
+	}
+	if jobTimeout > 0 && errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("ask timed out after %s; re-run with --background", jobTimeout)
+	}
+	return err
 }
 
 // recoverAdvanceErrorOutput salvages the persisted result when a post-success
