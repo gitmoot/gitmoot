@@ -38,6 +38,7 @@ func TestEvaluateAutoPromote(t *testing.T) {
 		confidence          *float64
 		confidenceSamples   int
 		wantPromote         bool
+		wantCanary          bool
 		reasonHas           string
 	}{
 		{
@@ -151,12 +152,48 @@ func TestEvaluateAutoPromote(t *testing.T) {
 			reasonHas:   "require_measured_judge",
 		},
 		{
-			name:        "canary fails safe deferred",
+			// #484: canary requested but auto_promote_canary_sample UNSET => notify-only
+			// fail-safe (never a bare direct promote, never a canary).
+			name:        "canary without sample fails safe to notify-only",
 			policy:      config.SkillOptPolicy{AutoPromote: true, AutoPromoteMinSamples: intPtr(1), AutoPromoteMinScore: floatPtr(0.5), AutoPromoteCanary: true},
 			candidate:   candidateWithScore(0.96),
 			feedback:    []db.FeedbackEvent{realCIFeedback()},
 			wantPromote: false,
-			reasonHas:   "canary",
+			wantCanary:  false,
+			reasonHas:   "auto_promote_canary_sample is unset",
+		},
+		{
+			// #484: canary + a valid sample + all guardrails pass => Promote=true AND
+			// Canary=true (route to the canary state, NOT a direct full promote).
+			name:        "canary with valid sample and guardrails pass routes to canary",
+			policy:      config.SkillOptPolicy{AutoPromote: true, AutoPromoteMinSamples: intPtr(1), AutoPromoteMinScore: floatPtr(0.5), AutoPromoteCanary: true, AutoPromoteCanarySample: floatPtr(0.1)},
+			candidate:   candidateWithScore(0.96),
+			feedback:    []db.FeedbackEvent{realCIFeedback()},
+			wantPromote: true,
+			wantCanary:  true,
+			reasonHas:   "canary-promoted",
+		},
+		{
+			// #484: canary + a valid sample but a guardrail FAILS => notify-only (no
+			// canary): the canary path never bypasses the guardrails.
+			name:        "canary with valid sample but failing guardrail stays pending",
+			policy:      config.SkillOptPolicy{AutoPromote: true, AutoPromoteMinSamples: intPtr(1), AutoPromoteMinScore: floatPtr(0.9), AutoPromoteCanary: true, AutoPromoteCanarySample: floatPtr(0.1)},
+			candidate:   candidateWithScore(0.4),
+			feedback:    []db.FeedbackEvent{realCIFeedback()},
+			wantPromote: false,
+			wantCanary:  false,
+			reasonHas:   "below auto_promote_min_score",
+		},
+		{
+			// #484 off-by-default: a guardrails-pass with canary OFF stays the #471
+			// direct promote (Promote=true, Canary=false) — byte-identical.
+			name:        "canary off stays direct promote",
+			policy:      config.SkillOptPolicy{AutoPromote: true, AutoPromoteMinSamples: intPtr(1), AutoPromoteMinScore: floatPtr(0.5)},
+			candidate:   candidateWithScore(0.96),
+			feedback:    []db.FeedbackEvent{realCIFeedback()},
+			wantPromote: true,
+			wantCanary:  false,
+			reasonHas:   "auto-promoted",
 		},
 		{
 			// MODE B (#473): a GENUINE ask-agent candidate has NO harvester feedback rows
@@ -229,6 +266,9 @@ func TestEvaluateAutoPromote(t *testing.T) {
 			decision := EvaluateAutoPromote(tc.policy, tc.candidate, tc.feedback, tc.feedbackUnavailable, tc.confidence, tc.confidenceSamples)
 			if decision.Promote != tc.wantPromote {
 				t.Fatalf("Promote = %v, want %v (reason: %q)", decision.Promote, tc.wantPromote, decision.Reason)
+			}
+			if decision.Canary != tc.wantCanary {
+				t.Fatalf("Canary = %v, want %v (reason: %q)", decision.Canary, tc.wantCanary, decision.Reason)
 			}
 			if tc.reasonHas != "" && !strings.Contains(decision.Reason, tc.reasonHas) {
 				t.Fatalf("reason %q does not contain %q", decision.Reason, tc.reasonHas)

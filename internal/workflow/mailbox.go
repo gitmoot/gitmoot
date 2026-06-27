@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/agenttemplate"
@@ -27,6 +28,15 @@ type Mailbox struct {
 	// constructed or emitted and behavior is byte-identical. The hook is
 	// fire-and-forget — it must never block or fail the finish.
 	emitTerminal func(ctx context.Context, jobID string, state JobState, payload JobPayload)
+	// CanaryRand, when set, is the per-resolution random draw in [0,1) the canary
+	// routing seam uses (#484) so tests can force a deterministic route (0.0 always
+	// hits the canary, a value >= sample always resolves the champion). When nil
+	// (the default, every production construction site) it falls back to the
+	// concurrency-safe global rand.Float64, so concurrent Enqueues each draw
+	// independently and safely. It is ONLY consulted when an active canary row
+	// exists for the resolved template, so when the feature is off the rng is never
+	// drawn and resolution is byte-identical.
+	CanaryRand func() float64
 }
 
 type JobRequest struct {
@@ -246,7 +256,63 @@ func (m Mailbox) templateSnapshot(ctx context.Context, agentName string) (db.Age
 		}
 		return db.AgentTemplate{}, err
 	}
+	// Canary routing (#484): a sampled fraction of resolutions that WOULD resolve the
+	// champion (the default/current reference, NOT a pinned version) route to the
+	// active canary version instead. The champion `template` resolved above is the
+	// always-valid fallback: any miss, error, or no-canary case returns it unchanged,
+	// so a mid-canary/half-promoted/missing canary or concurrent resolve can NEVER
+	// return no-template or a broken version. Off-by-default: with no canary row the
+	// lookup is one indexed miss, no rng is drawn, and the result is byte-identical.
+	if canary, ok := m.routeCanary(ctx, agent.TemplateID, template); ok {
+		return canary, nil
+	}
 	return template, nil
+}
+
+// routeCanary decides, for one resolution, whether to swap the resolved champion
+// snapshot for the template's active canary version (#484). It returns ok=false
+// (resolve the champion) in EVERY uncertain case — a pinned version reference, no
+// active canary, an out-of-range sample, a draw at/above the sample, or any store
+// error — so the champion (already resolved by the caller) is the guaranteed valid
+// fallback and resolution is never broken. The random draw is taken ONLY when an
+// active canary actually exists, keeping the no-canary path byte-identical.
+func (m Mailbox) routeCanary(ctx context.Context, agentTemplateRef string, champion db.AgentTemplate) (db.AgentTemplate, bool) {
+	templateID, versionRef := db.SplitAgentTemplateReference(agentTemplateRef)
+	// Only the default/current resolution participates in the canary; an explicit
+	// version pin (latest / @vN) is honored verbatim.
+	if versionRef != "" && versionRef != "current" {
+		return db.AgentTemplate{}, false
+	}
+	canary, found, err := m.Store.GetActiveCanaryVersion(ctx, templateID)
+	if err != nil || !found {
+		return db.AgentTemplate{}, false
+	}
+	sample := canary.CanarySample
+	if sample <= 0 || sample > 1 {
+		return db.AgentTemplate{}, false
+	}
+	if m.canaryDraw() >= sample {
+		return db.AgentTemplate{}, false
+	}
+	// Resolve the canary version's snapshot through the EXISTING reference path
+	// (canary.ID is "templateID@vN"), so its distinct ResolvedCommit/Content flow
+	// into the payload unchanged and the #465 harvester attributes the outcome to
+	// the canary version. A resolve error falls back to the champion (never break).
+	snap, err := m.Store.GetAgentTemplateReference(ctx, canary.ID)
+	if err != nil || strings.TrimSpace(snap.VersionID) == "" {
+		return db.AgentTemplate{}, false
+	}
+	return snap, true
+}
+
+// canaryDraw returns a per-resolution random draw in [0,1) for canary routing,
+// using the injected CanaryRand when set (deterministic tests) and the
+// concurrency-safe global rand.Float64 otherwise.
+func (m Mailbox) canaryDraw() float64 {
+	if m.CanaryRand != nil {
+		return m.CanaryRand()
+	}
+	return rand.Float64()
 }
 
 func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, adapter DeliveryAdapter) (AgentResult, error) {

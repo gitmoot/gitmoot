@@ -365,7 +365,8 @@ auto_promote_min_samples = 0              # UNSET = hard "do not promote" (NOT 0
 auto_promote_min_score = 0.0              # UNSET, or a candidate with no score = do not promote
 auto_promote_require_external_ci = false  # require >= 1 real-external-CI feedback event in the eval_run
 auto_promote_require_measured_judge = false  # PARSED but DEFERRED (#344): true => fail safe to no-promote
-auto_promote_canary = false               # PARSED but DEFERRED (canary follow-on): true => fail safe to no-promote
+auto_promote_canary = false               # #484: true + a valid sample => promote to a CANARY (sampled) instead of direct; false = direct promote
+auto_promote_canary_sample = 0.1          # #484: canary sampled-traffic fraction in (0,1]; UNSET disables the canary (notify-only fail-safe when canary on)
 auto_promote_min_confidence = 0.95        # #473 Mode B: UNSET = ignore; SET = require bandit P(>) >= floor (+ enough samples)
 bandit_min_samples = 30                   # #473/#482 Mode B low-traffic floor (manual `skillopt ab` always allowed)
 live_ab_sample_rate = 0.0                 # #482 Mode B live A/B: 0.0 (default) = never intercept; fraction of foreground asks to A/B
@@ -395,11 +396,25 @@ auto-trace evidence fails safe to notify-only).
   free-text findings can never spoof it. It therefore applies only to **Mode A
   (auto-trace) runs**; a candidate with no harvested external-CI evidence fails
   safe to notify-only.
-- `auto_promote_require_measured_judge` and `auto_promote_canary` are **parsed but
-  deferred**: there is no judge↔human calibration source yet (gated on #344) and
-  the sampled-traffic canary + auto-rollback do not exist, so setting either to
-  `true` **forces notify-only** today. They are documented so a user can write the
-  knob forward-compatibly.
+- `auto_promote_require_measured_judge` is **parsed but deferred**: there is no
+  judge↔human calibration source yet (gated on #344), so setting it `true` **forces
+  notify-only** today. It is documented so a user can write the knob
+  forward-compatibly.
+- `auto_promote_canary` + `auto_promote_canary_sample` (#484) turn a guardrails-pass
+  promotion into a **canary** instead of a direct promote. When `auto_promote_canary`
+  is on **and** `auto_promote_canary_sample` is a fraction in `(0,1]`, the candidate
+  is promoted to the `canary` state behind the live champion (which stays `current`,
+  so non-sampled resolutions are byte-identical) and that fraction of new job
+  resolutions route to the canary version. A bounded daemon **regression window**
+  then reuses the candidate's auto-trace outcomes (no new evaluator) to compare the
+  canary against the prior champion: parity-or-better **graduates** it to `current`
+  (`candidate.auto_promoted`); a material regression **auto-rolls-back** (champion
+  stays current, canary rejected, `candidate.rolled_back`). It is **fail-safe** —
+  too few canary outcomes, no champion baseline, or unread feedback all **hold**
+  (keep sampling), never rolling back on unread evidence and never graduating without
+  confirming non-regression. `auto_promote_canary` on with the sample **unset/invalid
+  forces notify-only** (a misconfigured canary never promotes). Off (the default) is
+  byte-identical to the direct promote.
 - `auto_promote_min_confidence` (#473 Mode B) is **additive and optional**. **Unset
   ignores it entirely** — the auto-promote decision is byte-identical to the
   guardrails above. When **set**, auto-promote additionally requires a non-nil

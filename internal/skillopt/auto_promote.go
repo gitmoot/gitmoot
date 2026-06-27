@@ -22,6 +22,14 @@ type AutoPromoteDecision struct {
 	// first blocking reason on a fail). It is redacted/path-scrubbed at the event
 	// seam before it leaves the box.
 	Reason string
+	// Canary (#484) is true ONLY on a Promote=true decision when canary mode is
+	// fully configured (auto_promote_canary AND a valid auto_promote_canary_sample):
+	// the candidate should be promoted to the `canary` state behind the live
+	// champion rather than directly to current. It is additive and internal (NOT a
+	// wire/contract field): when false (the default, including canary unset or
+	// misconfigured) the notify seam takes the existing #471 direct-promote path, so
+	// behavior is byte-identical. It is only ever consulted when Promote is true.
+	Canary bool
 }
 
 // notifyOnly is the canonical fail-safe decision: never promote, carry the reason.
@@ -102,8 +110,16 @@ func EvaluateAutoPromote(policy config.SkillOptPolicy, candidate CandidatePackag
 	if policy.AutoPromoteRequireMeasuredJudge {
 		return notifyOnly("auto_promote_require_measured_judge is set but judge calibration is unavailable (deferred, #344); notify only")
 	}
-	if policy.AutoPromoteCanary {
-		return notifyOnly("auto_promote_canary is set but canary promotion is deferred; notify only")
+	// Canary mode (#484): when auto_promote_canary is set, promotion must go through
+	// a sampled canary + regression window rather than a direct promote. That path
+	// REQUIRES a valid auto_promote_canary_sample in (0,1]; without it the canary
+	// cannot route any traffic, so we FAIL SAFE to notify-only (never promote)
+	// rather than silently falling back to a direct full promote the operator did
+	// not ask for. When it IS valid, evaluation proceeds through the SAME guardrails
+	// below and the final pass sets Decision.Canary so the notify seam routes to the
+	// canary state instead of current.
+	if policy.AutoPromoteCanary && !policy.CanaryEnabled() {
+		return notifyOnly("auto_promote_canary is set but auto_promote_canary_sample is unset/invalid; notify only (canary needs a fraction in (0,1])")
 	}
 
 	// min_samples must always be set (the unset-is-hard-no discipline holds for both
@@ -198,6 +214,17 @@ func EvaluateAutoPromote(policy config.SkillOptPolicy, candidate CandidatePackag
 		passed = append(passed, fmt.Sprintf("confidence %.0f%% >= %.4g over %d samples", *confidence*100, floor, confidenceSamples))
 	}
 
+	// On a pass, route to the canary state (#484) when canary mode is fully
+	// configured; otherwise take the existing #471 direct-promote path. The reason
+	// names the destination so the candidate.* event explains whether the candidate
+	// went to canary or straight to current.
+	if policy.CanaryEnabled() {
+		return AutoPromoteDecision{
+			Promote: true,
+			Canary:  true,
+			Reason:  fmt.Sprintf("canary-promoted (sample %.3g): %s", *policy.AutoPromoteCanarySample, strings.Join(passed, ", ")),
+		}
+	}
 	return AutoPromoteDecision{
 		Promote: true,
 		Reason:  "auto-promoted: " + strings.Join(passed, ", "),

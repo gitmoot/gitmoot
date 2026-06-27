@@ -432,10 +432,24 @@ type SkillOptPolicy struct {
 	// there is no judge<->human calibration source yet, so when true it FAILS SAFE
 	// to notify-don't-promote. Documented so a user can set it forward-compatibly.
 	AutoPromoteRequireMeasuredJudge bool
-	// AutoPromoteCanary is PARSED but DEFERRED (#471 canary follow-on): the sampled
-	// traffic + regression-window infrastructure does not exist yet, so when true it
-	// FAILS SAFE to notify-don't-promote. Documented as deferred.
+	// AutoPromoteCanary opts the auto-promote pass into CANARY promotion (#484):
+	// when true (AND a valid AutoPromoteCanarySample is set), a guardrails-pass
+	// candidate is promoted to the new `canary` version state — routed a sampled
+	// fraction of runtime resolutions while the prior champion stays the live
+	// current version — instead of being promoted directly to current. A bounded
+	// regression window then graduates or auto-rolls-back the canary. false (the
+	// default) is byte-identical to #471's direct promote. When true but
+	// AutoPromoteCanarySample is unset/invalid, the auto-promote pass FAILS SAFE to
+	// notify-only (never promotes), preserving the fail-safe envelope.
 	AutoPromoteCanary bool
+	// AutoPromoteCanarySample is the canary's sampled-traffic fraction in (0,1]
+	// (#484): the per-resolution probability a job routes to the active canary
+	// version instead of the champion. nil (unset, the default) means the canary
+	// path is OFF — with AutoPromoteCanary also requiring a valid sample, an unset
+	// sample makes the canary a no-op (notify-only fail-safe). It is the canary's
+	// defining parameter, kept as a separate required-when-on knob so the existing
+	// AutoPromoteCanary boolean's meaning stays intact and additive.
+	AutoPromoteCanarySample *float64
 
 	// AutoPromoteMinConfidence is the minimum Mode B bandit confidence
 	// P(challenger>champion) required to auto-promote (#473). nil (unset, the
@@ -526,6 +540,7 @@ func DefaultSkillOptPolicy() SkillOptPolicy {
 		AutoPromoteRequireExternalCI:    false,
 		AutoPromoteRequireMeasuredJudge: false,
 		AutoPromoteCanary:               false,
+		AutoPromoteCanarySample:         nil,
 		AutoPromoteMinConfidence:        nil,
 		BanditMinSamples:                nil,
 		ModeBJudgeEnabled:               false,
@@ -568,6 +583,23 @@ func (p SkillOptPolicy) RevertDetectionEnabled() bool {
 // guarantees byte-identical behavior with no config.
 func (p SkillOptPolicy) DeterministicCheckersEnabled() bool {
 	return p.AutoTraceEnabled && p.DeterministicCheckers
+}
+
+// CanaryEnabled reports whether the canary-promotion path (#484) is fully
+// configured: AutoPromoteCanary is set AND a valid sample fraction in (0,1] is
+// present. When false — the default, or AutoPromoteCanary on with the sample
+// unset/invalid — the canary path is OFF and the auto-promote pass behaves
+// exactly as #471 (direct promote when guardrails pass) or fails safe to
+// notify-only (canary requested but misconfigured). The validation in
+// applySkillOptPolicyField already rejects an out-of-range sample at load, so a
+// non-nil pointer here is always in (0,1]; the explicit range check keeps this
+// total even for a hand-built policy in a test.
+func (p SkillOptPolicy) CanaryEnabled() bool {
+	if !p.AutoPromoteCanary || p.AutoPromoteCanarySample == nil {
+		return false
+	}
+	sample := *p.AutoPromoteCanarySample
+	return sample > 0 && sample <= 1
 }
 
 // ResolvedDeterministicCheckers returns the per-checker selector resolved against
@@ -659,6 +691,20 @@ func applySkillOptPolicyField(policy *SkillOptPolicy, key string, value string) 
 		parsed, err := strconv.ParseBool(value)
 		policy.AutoPromoteCanary = parsed
 		return err
+	case "auto_promote_canary_sample":
+		parsed, err := parseConfigFloat(value)
+		if err != nil {
+			return err
+		}
+		// The sample is a probability fraction: it must be in (0,1]. A 0 or
+		// negative rate would route nothing (a silently-broken canary) and a >1
+		// rate is nonsensical, so both are hard errors rather than a clamp — a
+		// misconfigured canary fails the config load loudly instead of degrading.
+		if parsed <= 0 || parsed > 1 {
+			return fmt.Errorf("auto_promote_canary_sample %v must be in (0,1]", parsed)
+		}
+		policy.AutoPromoteCanarySample = &parsed
+		return nil
 	case "auto_promote_min_confidence":
 		parsed, err := strconv.ParseFloat(value, 64)
 		if err != nil {

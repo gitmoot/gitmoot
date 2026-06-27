@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1014,5 +1015,149 @@ func TestParseJobPayloadExported(t *testing.T) {
 	// Empty/malformed input errors (caller treats as no detail).
 	if _, err := ParseJobPayload(""); err == nil {
 		t.Fatal("empty payload should error")
+	}
+}
+
+// seedCanaryAgent installs a "planner" template (v1 current champion) + a pending
+// v2 candidate with a DISTINCT resolved_commit, promotes v2 to a canary at the
+// given sample, and binds an agent "planner-agent" to the template (unpinned). It
+// returns the store ready for an Enqueue with an injected CanaryRand.
+func seedCanaryAgent(t *testing.T, store *db.Store, sample float64) {
+	t.Helper()
+	ctx := context.Background()
+	base := db.AgentTemplate{ID: "planner", Name: "Planner", SourceRepo: "o/r", SourceRef: "main", SourcePath: "p.md", ResolvedCommit: "commit-v1", Content: "v1 content"}
+	if err := store.UpsertAgentTemplate(ctx, base); err != nil {
+		t.Fatalf("upsert template: %v", err)
+	}
+	v2 := base
+	v2.ResolvedCommit = "commit-v2"
+	v2.Content = "v2 content"
+	pending, err := store.AddPendingAgentTemplateVersion(ctx, v2)
+	if err != nil {
+		t.Fatalf("add v2: %v", err)
+	}
+	if _, err := store.CanaryPromoteAgentTemplateVersion(ctx, pending.ID, sample); err != nil {
+		t.Fatalf("canary promote: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{Name: "planner-agent", Role: "planner", Runtime: "codex", RuntimeRef: "last", RepoScope: "o/r", TemplateID: "planner", Capabilities: []string{"ask"}}); err != nil {
+		t.Fatalf("upsert agent: %v", err)
+	}
+}
+
+func enqueueAndResolve(t *testing.T, mailbox Mailbox, jobID string) JobPayload {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: jobID, Agent: "planner-agent", Action: "ask", Repo: "o/r"}); err != nil {
+		t.Fatalf("Enqueue %s: %v", jobID, err)
+	}
+	stored, err := mailbox.Store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob %s: %v", jobID, err)
+	}
+	payload, err := unmarshalPayload(stored.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload %s: %v", jobID, err)
+	}
+	return payload
+}
+
+// TestMailboxCanaryRoutingHitsCanary proves a draw BELOW the sample routes the
+// resolution to the canary version's snapshot (its distinct resolved_commit +
+// content), so the #465 harvester later attributes the outcome to the canary.
+func TestMailboxCanaryRoutingHitsCanary(t *testing.T) {
+	store := openTestStore(t)
+	seedCanaryAgent(t, store, 1.0)
+	mailbox := Mailbox{Store: store, CanaryRand: func() float64 { return 0.0 }}
+	payload := enqueueAndResolve(t, mailbox, "job-canary")
+	if payload.TemplateResolvedCommit != "commit-v2" || payload.TemplateContent != "v2 content" {
+		t.Fatalf("draw below sample must route to canary, got commit=%q content=%q", payload.TemplateResolvedCommit, payload.TemplateContent)
+	}
+	if payload.TemplateID != "planner" {
+		t.Fatalf("template id = %q, want planner", payload.TemplateID)
+	}
+}
+
+// TestMailboxCanaryRoutingMissesCanary proves a draw AT/ABOVE the sample resolves
+// the champion (byte-identical to the no-canary champion snapshot).
+func TestMailboxCanaryRoutingMissesCanary(t *testing.T) {
+	store := openTestStore(t)
+	seedCanaryAgent(t, store, 0.5)
+	mailbox := Mailbox{Store: store, CanaryRand: func() float64 { return 0.9 }}
+	payload := enqueueAndResolve(t, mailbox, "job-champ")
+	if payload.TemplateResolvedCommit != "commit-v1" || payload.TemplateContent != "v1 content" {
+		t.Fatalf("draw at/above sample must route to champion, got commit=%q content=%q", payload.TemplateResolvedCommit, payload.TemplateContent)
+	}
+}
+
+// TestMailboxCanaryOffByDefaultByteIdentical proves that with NO canary row the
+// resolution is byte-identical to today even when a CanaryRand that would always
+// hit (0.0) is injected: no canary exists, so no routing path is taken.
+func TestMailboxCanaryOffByDefaultByteIdentical(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	base := db.AgentTemplate{ID: "planner", Name: "Planner", SourceRepo: "o/r", SourceRef: "main", SourcePath: "p.md", ResolvedCommit: "commit-v1", Content: "v1 content"}
+	if err := store.UpsertAgentTemplate(ctx, base); err != nil {
+		t.Fatalf("upsert template: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{Name: "planner-agent", Role: "planner", Runtime: "codex", RuntimeRef: "last", RepoScope: "o/r", TemplateID: "planner", Capabilities: []string{"ask"}}); err != nil {
+		t.Fatalf("upsert agent: %v", err)
+	}
+	// Default mailbox (nil CanaryRand) and a forced-hit mailbox must resolve the SAME
+	// champion snapshot when no canary row exists.
+	def := enqueueAndResolve(t, Mailbox{Store: store}, "job-default")
+	forced := enqueueAndResolve(t, Mailbox{Store: store, CanaryRand: func() float64 { return 0.0 }}, "job-forced")
+	if def.TemplateResolvedCommit != "commit-v1" || def.TemplateContent != "v1 content" {
+		t.Fatalf("default resolution changed: %+v", def)
+	}
+	if forced.TemplateResolvedCommit != def.TemplateResolvedCommit || forced.TemplateContent != def.TemplateContent {
+		t.Fatalf("forced-hit resolution differs with no canary row: %+v vs %+v", forced, def)
+	}
+}
+
+// TestMailboxCanaryRoutingConcurrent proves the routing seam is concurrency-safe
+// and ALWAYS resolves a valid version under concurrent Enqueues against an active
+// canary (a mid-canary concurrent resolve never returns no-template/broken).
+func TestMailboxCanaryRoutingConcurrent(t *testing.T) {
+	store := openTestStore(t)
+	seedCanaryAgent(t, store, 0.5)
+	mailbox := Mailbox{Store: store} // real global rng — concurrency-safe
+	const n = 40
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			ctx := context.Background()
+			id := fmt.Sprintf("job-conc-%d", i)
+			if _, err := mailbox.Enqueue(ctx, JobRequest{ID: id, Agent: "planner-agent", Action: "ask", Repo: "o/r"}); err != nil {
+				errs <- err
+				return
+			}
+			stored, err := store.GetJob(ctx, id)
+			if err != nil {
+				errs <- err
+				return
+			}
+			payload, err := unmarshalPayload(stored.Payload)
+			if err != nil {
+				errs <- err
+				return
+			}
+			// EVERY resolution must be a valid version — either the champion or the
+			// canary, never empty/broken.
+			commit := payload.TemplateResolvedCommit
+			if commit != "commit-v1" && commit != "commit-v2" {
+				errs <- fmt.Errorf("job %s resolved invalid commit %q", id, commit)
+				return
+			}
+			if payload.TemplateContent == "" {
+				errs <- fmt.Errorf("job %s resolved empty template content", id)
+				return
+			}
+			errs <- nil
+		}(i)
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent enqueue: %v", err)
+		}
 	}
 }

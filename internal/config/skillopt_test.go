@@ -195,6 +195,67 @@ auto_promote_canary = true
 	}
 }
 
+// TestLoadSkillOptPolicyCanarySampleDefaultsOff proves the #484 canary sample knob
+// defaults nil (unset) so CanaryEnabled() is OFF by default — byte-identical to
+// #471, and a bare auto_promote_canary (sample unset) is a no-op canary.
+func TestLoadSkillOptPolicyCanarySampleDefaultsOff(t *testing.T) {
+	policy := DefaultSkillOptPolicy()
+	if policy.AutoPromoteCanarySample != nil {
+		t.Fatalf("auto_promote_canary_sample must default nil (unset), got %v", policy.AutoPromoteCanarySample)
+	}
+	if policy.CanaryEnabled() {
+		t.Fatalf("CanaryEnabled() must be false by default, got %+v", policy)
+	}
+	// auto_promote_canary alone (no sample) is NOT enabled (fail-safe).
+	if (SkillOptPolicy{AutoPromoteCanary: true}).CanaryEnabled() {
+		t.Fatal("CanaryEnabled() must be false when the sample is unset")
+	}
+}
+
+// TestLoadSkillOptPolicyParsesCanarySample proves auto_promote_canary_sample parses
+// into the *float64 and that, with auto_promote_canary, CanaryEnabled() is true.
+func TestLoadSkillOptPolicyParsesCanarySample(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[skillopt]
+auto_promote_canary = true
+auto_promote_canary_sample = 0.25
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	policy, err := LoadSkillOptPolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadSkillOptPolicy returned error: %v", err)
+	}
+	if policy.AutoPromoteCanarySample == nil || *policy.AutoPromoteCanarySample != 0.25 {
+		t.Fatalf("auto_promote_canary_sample = %v, want 0.25", policy.AutoPromoteCanarySample)
+	}
+	if !policy.CanaryEnabled() {
+		t.Fatalf("CanaryEnabled() must be true with canary + valid sample, got %+v", policy)
+	}
+}
+
+// TestLoadSkillOptPolicyRejectsBadCanarySample proves an out-of-range sample
+// (<=0 or >1) and a garbled value both surface a parse error (fail loud, never a
+// silently-broken canary).
+func TestLoadSkillOptPolicyRejectsBadCanarySample(t *testing.T) {
+	for _, bad := range []string{"0", "-0.1", "1.5", "lots"} {
+		paths := PathsForHome(t.TempDir())
+		if err := Initialize(paths); err != nil {
+			t.Fatalf("Initialize returned error: %v", err)
+		}
+		if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+"\n[skillopt]\nauto_promote_canary_sample = "+bad+"\n"), 0o600); err != nil {
+			t.Fatalf("write config returned error: %v", err)
+		}
+		if _, err := LoadSkillOptPolicy(paths); err == nil {
+			t.Fatalf("expected an error for auto_promote_canary_sample = %q", bad)
+		}
+	}
+}
+
 // TestLoadSkillOptPolicyRejectsBadAutoPromoteThreshold proves a garbled numeric
 // threshold surfaces a parse error (fail-safe: the policy is not silently kept).
 func TestLoadSkillOptPolicyRejectsBadAutoPromoteThreshold(t *testing.T) {

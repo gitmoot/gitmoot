@@ -21,7 +21,9 @@ The pilot emits a tight allowlist of event types over the webhook transport:
 | `job.blocked`                   | a job reaches the `blocked` terminal state                                         |
 | `job.needs_attention`           | a tree pauses awaiting a human (the `escalate_human` pause today)                  |
 | `candidate.awaiting_promotion`  | a SkillOpt template candidate becomes `pending` after import (always, off the auto-promote policy) |
-| `candidate.auto_promoted`       | the off-by-default `[skillopt].auto_promote` policy auto-promoted a candidate to `current`          |
+| `candidate.auto_promoted`       | the off-by-default `[skillopt].auto_promote` policy auto-promoted a candidate to `current` (also the canary GRADUATE event) |
+| `candidate.canary_started`      | the off-by-default `[skillopt].auto_promote_canary` policy promoted a candidate to the `canary` state behind the live champion |
+| `candidate.rolled_back`         | the canary regression window auto-rolled-back a canary on a material regression (champion stays current, canary rejected) |
 
 Each terminal transition emits **exactly once**. The engine owns the
 succeeded/failed/blocked emit on its `Mailbox` terminal path; the daemon owns the
@@ -39,6 +41,22 @@ holds, the candidate is promoted via the existing promote path and
 `candidate.auto_promoted` fires so the change can be reviewed or rolled back. The
 adjacent dashboard **Attention** page also lists every pending candidate
 (read-only), so candidates are visible locally even with `[events]` off.
+
+When `[skillopt].auto_promote_canary` is on **and** `auto_promote_canary_sample`
+is a fraction in `(0,1]`, a guardrails-pass candidate is promoted to a **canary**
+instead of straight to `current`: it routes that sampled fraction of new job
+resolutions while the prior champion stays the live current version, and
+`candidate.canary_started` fires (carrying the canary version id, template id, and
+the sample fraction). The daemon then watches a bounded regression window over the
+canary's harvested verifiable outcomes (reusing the Mode A trace signal, no new
+evaluator) and compares it to the prior champion: on parity-or-better it
+**graduates** the canary to `current` and emits `candidate.auto_promoted`; on a
+**material regression** it auto-rolls-back — the champion stays current, the canary
+is rejected, and `candidate.rolled_back` fires. It is **fail-safe**: too few canary
+outcomes, no champion baseline, or feedback it could not read all **hold** (keep
+sampling), never rolling back on unread evidence and never graduating without
+confirming non-regression. With the knob off (the default) promotion is the
+unchanged direct path and no canary event is ever emitted.
 
 The following `event_type` values are **reserved** for the graduate step. They
 are enumerated in the contract so a consumer can `switch` over them

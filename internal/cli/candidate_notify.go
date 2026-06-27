@@ -154,6 +154,21 @@ func runCandidateNotify(ctx context.Context, store *db.Store, sink events.Sink, 
 	if store == nil {
 		return nil
 	}
+	// (4a) Canary path (#484): instead of promoting straight to current, promote the
+	// candidate to the `canary` state behind the live champion (the champion stays
+	// current, so non-sampled resolutions are byte-identical) and emit
+	// candidate.canary_started. The daemon regression window later graduates it
+	// (candidate.auto_promoted) or auto-rolls-back (candidate.rolled_back). The
+	// sample is validated by EvaluateAutoPromote (decision.Canary is only set when
+	// CanaryEnabled()), so the pointer deref is safe.
+	if decision.Canary && policy.AutoPromoteCanarySample != nil {
+		canary, err := store.CanaryPromoteAgentTemplateVersion(ctx, version.ID, *policy.AutoPromoteCanarySample)
+		if err != nil {
+			return fmt.Errorf("canary-promote candidate %s: %w", version.ID, err)
+		}
+		emitCandidateEvent(ctx, sink, events.EventCandidateCanaryStarted, canary, "canary_started", decision.Reason)
+		return nil
+	}
 	promoted, err := store.PromoteAgentTemplateVersion(ctx, version.ID)
 	if err != nil {
 		return fmt.Errorf("auto-promote candidate %s: %w", version.ID, err)

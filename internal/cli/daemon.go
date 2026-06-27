@@ -3986,8 +3986,18 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 		// returns nil unless [skillopt].auto_trace_enabled is set, so with no config
 		// NO harvester is constructed and behavior — and every human-run
 		// TrainingPackage — is byte-identical. The harvester writes ONLY
-		// eval/feedback rows; promotion stays 100% manual.
-		OutcomeHarvester: daemonOutcomeHarvester(store, gh, home),
+		// eval/feedback rows; promotion stays 100% manual (the #484 canary wrapper
+		// below is the only path that may graduate/roll back, and only when canary
+		// mode is configured AND a live canary exists).
+		//
+		// Off-by-default #484 canary regression window: when [skillopt].auto_promote_canary
+		// is configured with a valid sample, the base harvester is wrapped so that AFTER
+		// a verifiable outcome it loads the active canary + prior champion auto-trace runs
+		// and graduates (-> current) or auto-rolls-back (reusing RevertAgentTemplateVersion
+		// to keep the champion live + rejecting the canary) on a material regression.
+		// daemonOutcomeHarvesterWithCanary returns the bare base harvester when canary is
+		// off and nil when auto_trace is off, so both default paths stay byte-identical.
+		OutcomeHarvester: daemonOutcomeHarvesterWithCanary(store, gh, home),
 		// Off-by-default cross-family review-agent soft signal (#469): on a MERGE the
 		// engine additionally runs a read-only CROSS-FAMILY review leg (off the
 		// blocking merge path, best-effort) whose subjective-quality + scope-fidelity

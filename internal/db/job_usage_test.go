@@ -119,6 +119,15 @@ CREATE TABLE jobs (
 	delegated_by TEXT NOT NULL DEFAULT '',
 	root_killed INTEGER NOT NULL DEFAULT 0
 );
+-- A minimal agent_template_versions table (as it existed at the input_tokens
+-- migration point) so the later #484 canary ALTER ADD COLUMN has its table; the
+-- real table was created by an earlier (here pre-seeded-as-applied) migration.
+CREATE TABLE agent_template_versions (
+	id TEXT PRIMARY KEY,
+	template_id TEXT NOT NULL,
+	version INTEGER NOT NULL,
+	state TEXT NOT NULL
+);
 CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
 INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'succeeded', '{}');
 `); err != nil {

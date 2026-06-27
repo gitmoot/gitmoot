@@ -81,6 +81,15 @@ type AgentTemplateVersion struct {
 	CreatedAt      string
 	UpdatedAt      string
 	PromotedAt     string
+	// CanarySample is the active canary's sampled-traffic fraction in (0,1] (#484),
+	// recorded only on a `canary`-state version; 0 (the column DEFAULT) for every
+	// other state so existing rows read identically. The routing seam draws a
+	// per-resolution random < CanarySample to route to the canary.
+	CanarySample float64
+	// CanaryStartedAt is the RFC3339 window-start of the active canary (#484), set
+	// when a version transitions to `canary`; "" (the DEFAULT) otherwise. It bounds
+	// the daemon's regression-window comparator.
+	CanaryStartedAt string
 }
 
 type AgentTemplateCandidateReview struct {
@@ -1176,7 +1185,7 @@ func (s *Store) GetAgentTemplateReference(ctx context.Context, ref string) (Agen
 }
 
 func (s *Store) GetLatestAgentTemplateVersion(ctx context.Context, templateID string) (AgentTemplate, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT v.id, v.template_id, v.version, v.state, v.name, v.description, v.source_repo, v.source_ref, v.source_path, v.resolved_commit, v.content_hash, v.content, v.metadata_json, v.created_at, v.updated_at, v.promoted_at
+	row := s.db.QueryRowContext(ctx, `SELECT v.id, v.template_id, v.version, v.state, v.name, v.description, v.source_repo, v.source_ref, v.source_path, v.resolved_commit, v.content_hash, v.content, v.metadata_json, v.created_at, v.updated_at, v.promoted_at, v.canary_sample, v.canary_started_at
 		FROM agent_templates t
 		JOIN agent_template_versions v ON v.id = t.latest_version_id
 		WHERE t.id = ?`, strings.TrimSpace(templateID))
@@ -1193,20 +1202,20 @@ func (s *Store) GetAgentTemplateVersion(ctx context.Context, templateID string, 
 	if strings.HasPrefix(versionRef, "v") && len(versionRef) > 1 {
 		versionRef = versionRef[1:]
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, created_at, updated_at, promoted_at
+	row := s.db.QueryRowContext(ctx, `SELECT id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, created_at, updated_at, promoted_at, canary_sample, canary_started_at
 		FROM agent_template_versions
 		WHERE template_id = ? AND (id = ? OR CAST(version AS TEXT) = ?)`, templateID, templateID+"@v"+versionRef, versionRef)
 	return scanAgentTemplateVersion(row)
 }
 
 func (s *Store) GetAgentTemplateVersionByID(ctx context.Context, versionID string) (AgentTemplateVersion, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, created_at, updated_at, promoted_at
+	row := s.db.QueryRowContext(ctx, `SELECT id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, created_at, updated_at, promoted_at, canary_sample, canary_started_at
 		FROM agent_template_versions WHERE id = ?`, strings.TrimSpace(versionID))
 	return scanAgentTemplateVersion(row)
 }
 
 func (s *Store) ListAgentTemplateVersions(ctx context.Context, templateID string) ([]AgentTemplateVersion, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, created_at, updated_at, promoted_at
+	rows, err := s.db.QueryContext(ctx, `SELECT id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, created_at, updated_at, promoted_at, canary_sample, canary_started_at
 		FROM agent_template_versions WHERE template_id = ? ORDER BY version`, templateID)
 	if err != nil {
 		return nil, err
@@ -1225,7 +1234,7 @@ func (s *Store) ListAgentTemplateVersions(ctx context.Context, templateID string
 
 func (s *Store) ListPendingAgentTemplateVersions(ctx context.Context, templateID string) ([]AgentTemplateVersion, error) {
 	templateID = strings.TrimSpace(templateID)
-	query := `SELECT id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, created_at, updated_at, promoted_at
+	query := `SELECT id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, created_at, updated_at, promoted_at, canary_sample, canary_started_at
 		FROM agent_template_versions WHERE state = 'pending'`
 	args := []any{}
 	if templateID != "" {
@@ -1379,8 +1388,11 @@ func (s *Store) PromoteAgentTemplateVersion(ctx context.Context, versionID strin
 	if err != nil {
 		return AgentTemplateVersion{}, err
 	}
-	if target.State != "pending" {
-		return AgentTemplateVersion{}, fmt.Errorf("agent template version %s is %s, not pending", target.ID, target.State)
+	// A `pending` candidate promotes directly (#471); a `canary` candidate (#484)
+	// GRADUATES through the SAME state-machine writes (supersede champion, become
+	// current, clear the canary fraction/window). Any other state is a hard error.
+	if target.State != "pending" && target.State != "canary" {
+		return AgentTemplateVersion{}, fmt.Errorf("agent template version %s is %s, not pending or canary", target.ID, target.State)
 	}
 	current, hasCurrent, err := getCurrentAgentTemplateVersion(ctx, tx, target.TemplateID)
 	if err != nil {
@@ -1391,7 +1403,10 @@ func (s *Store) PromoteAgentTemplateVersion(ctx context.Context, versionID strin
 			return AgentTemplateVersion{}, err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE agent_template_versions SET state = 'current', promoted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, target.ID); err != nil {
+	// Clear canary_sample/canary_started_at on the target so a graduated canary
+	// carries no stale window state; pending targets already have the 0/'' defaults,
+	// so this is a no-op for the #471 path.
+	if _, err := tx.ExecContext(ctx, `UPDATE agent_template_versions SET state = 'current', promoted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, canary_sample = 0, canary_started_at = '' WHERE id = ?`, target.ID); err != nil {
 		return AgentTemplateVersion{}, err
 	}
 	latestID, err := latestSelectableVersionID(ctx, tx, target.TemplateID)
@@ -1469,10 +1484,24 @@ func (s *Store) RejectAgentTemplateVersion(ctx context.Context, versionID string
 	if err != nil {
 		return AgentTemplateVersion{}, err
 	}
-	if target.State != "pending" {
-		return AgentTemplateVersion{}, fmt.Errorf("agent template version %s is %s, not pending", target.ID, target.State)
+	// Idempotent: an already-rejected target is a no-op success so the #484 canary
+	// auto-rollback (which rejects the regressing canary) can be re-run safely after
+	// a crash without erroring.
+	if target.State == "rejected" {
+		if err := tx.Commit(); err != nil {
+			return AgentTemplateVersion{}, err
+		}
+		return target, nil
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE agent_template_versions SET state = 'rejected', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, target.ID); err != nil {
+	// A `pending` candidate rejects directly (#471); a `canary` candidate (#484) is
+	// retired by the auto-rollback. A canary never holds current_version_id (the
+	// champion stays current throughout the canary), so rejecting it leaves the
+	// champion live — no current pointer changes. The canary fraction/window are
+	// cleared so no stale routing state remains.
+	if target.State != "pending" && target.State != "canary" {
+		return AgentTemplateVersion{}, fmt.Errorf("agent template version %s is %s, not pending or canary", target.ID, target.State)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE agent_template_versions SET state = 'rejected', updated_at = CURRENT_TIMESTAMP, canary_sample = 0, canary_started_at = '' WHERE id = ?`, target.ID); err != nil {
 		return AgentTemplateVersion{}, err
 	}
 	latestID, err := latestSelectableVersionID(ctx, tx, target.TemplateID)
@@ -1547,6 +1576,99 @@ func (s *Store) RevertAgentTemplateVersion(ctx context.Context, templateID strin
 		return AgentTemplateVersion{}, err
 	}
 	return s.GetAgentTemplateVersionByID(ctx, target.ID)
+}
+
+// CanaryPromoteAgentTemplateVersion transitions a PENDING candidate to the new
+// `canary` state (#484) WITHOUT touching the template's current_version_id: the
+// prior champion stays the live current version, so every non-sampled resolution
+// is byte-identical and the routing seam (templateSnapshot) opts only a sampled
+// fraction onto the canary. It records the active canary's sample fraction and
+// window-start for the daemon regression comparator, and recomputes
+// latest_version_id (which excludes the `canary` state) so the canary never leaks
+// into latest_version_id. It enforces at most ONE active canary per template and
+// requires an existing current champion (a canary only makes sense behind a live
+// champion). It mirrors PromoteAgentTemplateVersion's state-machine writes but
+// leaves the champion current — the defining safety property of the canary.
+func (s *Store) CanaryPromoteAgentTemplateVersion(ctx context.Context, versionID string, sample float64) (AgentTemplateVersion, error) {
+	if sample <= 0 || sample > 1 {
+		return AgentTemplateVersion{}, fmt.Errorf("canary sample %v must be in (0,1]", sample)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	defer tx.Rollback()
+	target, err := getAgentTemplateVersionByIDTx(ctx, tx, versionID)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if target.State != "pending" {
+		return AgentTemplateVersion{}, fmt.Errorf("agent template version %s is %s, not pending; only a pending candidate can become a canary", target.ID, target.State)
+	}
+	// A canary sits BEHIND a live champion; refuse if there is no current version so
+	// non-sampled traffic always has a champion to resolve to.
+	_, hasCurrent, err := getCurrentAgentTemplateVersion(ctx, tx, target.TemplateID)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if !hasCurrent {
+		return AgentTemplateVersion{}, fmt.Errorf("template %s has no current champion; refusing to start a canary without one", target.TemplateID)
+	}
+	// At most one active canary per template: a second concurrent canary would make
+	// routing ambiguous and the regression window unattributable.
+	var existing int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_template_versions WHERE template_id = ? AND state = 'canary'`, target.TemplateID).Scan(&existing); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if existing > 0 {
+		return AgentTemplateVersion{}, fmt.Errorf("template %s already has an active canary; resolve it before starting another", target.TemplateID)
+	}
+	startedAt := time.Now().UTC().Format(time.RFC3339)
+	if _, err := tx.ExecContext(ctx, `UPDATE agent_template_versions SET state = 'canary', canary_sample = ?, canary_started_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, sample, startedAt, target.ID); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	// Recompute latest_version_id: latestSelectableVersionID only considers
+	// current/pending, so the now-canary version is excluded and latest falls back
+	// to the champion (or a higher pending) — the canary never becomes latest.
+	latestID, err := latestSelectableVersionID(ctx, tx, target.TemplateID)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE agent_templates SET latest_version_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, latestID, target.TemplateID)
+	if err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if err := requireAffected(result, "agent template", target.TemplateID); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AgentTemplateVersion{}, err
+	}
+	return s.GetAgentTemplateVersionByID(ctx, target.ID)
+}
+
+// GetActiveCanaryVersion returns the template's single active `canary`-state
+// version (#484), or ok=false when none is canarying. It is the indexed lookup
+// (idx_atv_canary) the routing seam and the daemon regression comparator use to
+// discover the active canary. An unresolvable/empty template yields ok=false, not
+// an error.
+func (s *Store) GetActiveCanaryVersion(ctx context.Context, templateID string) (AgentTemplateVersion, bool, error) {
+	templateID = strings.TrimSpace(templateID)
+	if templateID == "" {
+		return AgentTemplateVersion{}, false, nil
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, created_at, updated_at, promoted_at, canary_sample, canary_started_at
+		FROM agent_template_versions
+		WHERE template_id = ? AND state = 'canary'
+		ORDER BY version DESC LIMIT 1`, templateID)
+	version, err := scanAgentTemplateVersion(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AgentTemplateVersion{}, false, nil
+	}
+	if err != nil {
+		return AgentTemplateVersion{}, false, err
+	}
+	return version, true, nil
 }
 
 func (s *Store) DecideSkillOptTrainCandidate(ctx context.Context, session SkillOptTrainSession, iteration SkillOptTrainIteration, candidateID string, decision string) (AgentTemplateVersion, error) {
@@ -5008,7 +5130,7 @@ func scanAgentTemplateWithVersion(scanner agentTemplateScanner) (AgentTemplate, 
 
 func scanAgentTemplateVersion(scanner agentTemplateScanner) (AgentTemplateVersion, error) {
 	var version AgentTemplateVersion
-	if err := scanner.Scan(&version.ID, &version.TemplateID, &version.VersionNumber, &version.State, &version.Name, &version.Description, &version.SourceRepo, &version.SourceRef, &version.SourcePath, &version.ResolvedCommit, &version.ContentHash, &version.Content, &version.MetadataJSON, &version.CreatedAt, &version.UpdatedAt, &version.PromotedAt); err != nil {
+	if err := scanner.Scan(&version.ID, &version.TemplateID, &version.VersionNumber, &version.State, &version.Name, &version.Description, &version.SourceRepo, &version.SourceRef, &version.SourcePath, &version.ResolvedCommit, &version.ContentHash, &version.Content, &version.MetadataJSON, &version.CreatedAt, &version.UpdatedAt, &version.PromotedAt, &version.CanarySample, &version.CanaryStartedAt); err != nil {
 		return AgentTemplateVersion{}, err
 	}
 	if version.ContentHash == "" {
@@ -5557,7 +5679,7 @@ func SplitAgentTemplateReference(ref string) (string, string) {
 }
 
 func getCurrentAgentTemplateVersion(ctx context.Context, tx *sql.Tx, templateID string) (AgentTemplateVersion, bool, error) {
-	row := tx.QueryRowContext(ctx, `SELECT v.id, v.template_id, v.version, v.state, v.name, v.description, v.source_repo, v.source_ref, v.source_path, v.resolved_commit, v.content_hash, v.content, v.metadata_json, v.created_at, v.updated_at, v.promoted_at
+	row := tx.QueryRowContext(ctx, `SELECT v.id, v.template_id, v.version, v.state, v.name, v.description, v.source_repo, v.source_ref, v.source_path, v.resolved_commit, v.content_hash, v.content, v.metadata_json, v.created_at, v.updated_at, v.promoted_at, v.canary_sample, v.canary_started_at
 		FROM agent_templates t
 		JOIN agent_template_versions v ON v.id = t.current_version_id
 		WHERE t.id = ?`, templateID)
@@ -5572,7 +5694,7 @@ func getCurrentAgentTemplateVersion(ctx context.Context, tx *sql.Tx, templateID 
 }
 
 func getAgentTemplateVersionByIDTx(ctx context.Context, tx *sql.Tx, versionID string) (AgentTemplateVersion, error) {
-	row := tx.QueryRowContext(ctx, `SELECT id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, created_at, updated_at, promoted_at
+	row := tx.QueryRowContext(ctx, `SELECT id, template_id, version, state, name, description, source_repo, source_ref, source_path, resolved_commit, content_hash, content, metadata_json, created_at, updated_at, promoted_at, canary_sample, canary_started_at
 		FROM agent_template_versions WHERE id = ?`, strings.TrimSpace(versionID))
 	return scanAgentTemplateVersion(row)
 }
@@ -6206,5 +6328,20 @@ CREATE TABLE skillopt_bandit_arms (
 	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	PRIMARY KEY (template_id, template_version_id)
 );
+	`,
+	// #484 canary promotion: a new `canary` version state plus two columns that
+	// record the active canary's sampled-traffic fraction and window-start so the
+	// routing seam and the daemon regression comparator can find/parametrize it.
+	// The state column is already free-text TEXT, so no structural change is needed;
+	// these columns carry DEFAULTs (0 / '') so every existing row reads identically
+	// and this migration is a pure additive append (it does not renumber or alter
+	// any prior migration). The partial index makes the "active canary for this
+	// template" lookup a single indexed probe (at most one canary row per template
+	// at a time) and indexes no non-canary rows.
+	`
+ALTER TABLE agent_template_versions ADD COLUMN canary_sample REAL NOT NULL DEFAULT 0;
+ALTER TABLE agent_template_versions ADD COLUMN canary_started_at TEXT NOT NULL DEFAULT '';
+
+CREATE INDEX idx_atv_canary ON agent_template_versions(template_id) WHERE state = 'canary';
 	`,
 }

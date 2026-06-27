@@ -61,6 +61,21 @@ const (
 	// redacted reason naming the guardrails that passed, so a human can review or
 	// roll back even in full-auto.
 	EventCandidateAutoPromoted EventType = "candidate.auto_promoted"
+	// EventCandidateCanaryStarted is emitted once when the off-by-default
+	// [skillopt].auto_promote_canary path promotes a pending candidate to the
+	// `canary` state (#484) behind the live champion, AFTER the
+	// CanaryPromoteAgentTemplateVersion write. JobID is the canary version id,
+	// RootID the template id, Status "canary_started", Detail a redacted reason
+	// naming the guardrails that passed and the sample fraction — so a human sees a
+	// canary went live and can watch the regression window.
+	EventCandidateCanaryStarted EventType = "candidate.canary_started"
+	// EventCandidateRolledBack is emitted once when the #484 daemon regression
+	// window AUTO-ROLLS-BACK a canary on a material regression vs the prior
+	// champion: the champion stays the live current version and the canary is
+	// rejected. JobID is the rolled-back canary version id, RootID the template id,
+	// Status "rolled_back", Detail a redacted reason naming the score comparison, so
+	// a human sees the auto-rollback happened.
+	EventCandidateRolledBack EventType = "candidate.rolled_back"
 
 	// Reserved for the graduate step (parsed/enumerated but NOT emitted by the
 	// pilot). Listed so downstream consumers can switch over them forward-

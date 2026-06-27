@@ -92,8 +92,19 @@ escalation_ttl = ""
 #   auto_promote_require_measured_judge: PARSED but DEFERRED (gated on #344) — there
 #     is no judge<->human calibration source yet, so when true it FAILS SAFE to
 #     notify-only.
-#   auto_promote_canary: PARSED but DEFERRED (canary follow-on) — sampled traffic +
-#     auto-rollback do not exist yet, so when true it FAILS SAFE to notify-only.
+#   auto_promote_canary (#484): OFF by default. When true AND auto_promote_canary_sample
+#     is a valid fraction, a guardrails-pass candidate is promoted to a CANARY version
+#     (routed a sampled fraction of resolutions while the prior champion stays the live
+#     current version) instead of directly to current; a bounded regression window then
+#     graduates it (-> current, candidate.auto_promoted) or auto-rolls-back on a real
+#     regression vs the prior champion (champion stays current, canary rejected,
+#     candidate.rolled_back). Off ⇒ byte-identical to #471's direct promote. When true
+#     but auto_promote_canary_sample is unset/invalid it FAILS SAFE to notify-only.
+#   auto_promote_canary_sample (#484): the canary's sampled-traffic fraction in (0,1] —
+#     the per-resolution probability a job routes to the active canary version instead of
+#     the champion. UNSET (the default) disables the canary path (notify-only fail-safe
+#     when auto_promote_canary is on). 1.0 routes ALL traffic to the canary (useful for
+#     a deterministic test); a small value (e.g. 0.1) routes about a tenth of traffic.
 #   auto_promote_min_confidence (#473 Mode B): minimum bandit confidence
 #     P(challenger>champion) — supplied by the manual 'skillopt ab' champion-
 #     challenger A/B — required to auto-promote. UNSET ignores the guardrail
@@ -151,6 +162,7 @@ escalation_ttl = ""
 # auto_promote_require_external_ci = false
 # auto_promote_require_measured_judge = false
 # auto_promote_canary = false
+# auto_promote_canary_sample = 0.1
 # auto_promote_min_confidence = 0.95
 # bandit_min_samples = 30
 # live_ab_sample_rate = 0.0
