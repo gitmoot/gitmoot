@@ -185,6 +185,15 @@ func runSkillOptPairwiseImport(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "skillopt pairwise import: secret map run_id %q does not match packet run_id %q\n", secret.RunID, reviewPacket.RunID)
 		return 1
 	}
+	// The picks are the artifact that decides each winner, so they MUST also describe
+	// the same run as the packet; a foreign picks file whose items happen to share
+	// generic ids (item-1, …) would otherwise be joined by item_id alone and silently
+	// unblind the WRONG reviewer preferences for THIS run. Picks supplied as a bare
+	// map shape carry no run_id (RunID stays empty) and therefore skip this check.
+	if strings.TrimSpace(pairwisePicks.RunID) != "" && strings.TrimSpace(pairwisePicks.RunID) != strings.TrimSpace(reviewPacket.RunID) {
+		fmt.Fprintf(stderr, "skillopt pairwise import: picks run_id %q does not match packet run_id %q\n", pairwisePicks.RunID, reviewPacket.RunID)
+		return 1
+	}
 
 	exit := 0
 	if err := withStoreAndPaths(options.home, func(paths config.Paths, store *db.Store) error {

@@ -157,6 +157,41 @@ func TestRunSkillOptPairwiseImportUnblindOrientations(t *testing.T) {
 	}
 }
 
+// TestRunSkillOptPairwiseImportForeignPicksRunID asserts a picks file whose
+// run_id names a DIFFERENT pairwise run is rejected before any unblind, even when
+// the packet and secret map agree on the run and the items share generic ids.
+// Picks are the artifact that decides each winner, so a silent item_id-only join
+// against foreign preferences would unblind the wrong winners; the guard makes the
+// import fail (exit 1) and persist nothing.
+func TestRunSkillOptPairwiseImportForeignPicksRunID(t *testing.T) {
+	home, store, championID := skillOptPairwiseHome(t)
+	dir := writePairwisePacketDir(t, championID, true, "A")
+	// Overwrite the picks file so its run_id points at a foreign run while keeping
+	// the same generic item_id the packet/secret map use.
+	foreignPicks := skillopt.PairwisePicks{
+		Kind:  skillopt.PairwisePicksKind,
+		RunID: "run-OTHER",
+		Picks: []skillopt.PairwisePick{{ItemID: "item-1", Pick: "A"}},
+	}
+	writePairwiseJSON(t, filepath.Join(dir, pairwisePicksFileName), foreignPicks)
+
+	var stdout, stderr bytes.Buffer
+	code := runSkillOptPairwise([]string{"import", dir, "--home", home}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("foreign-picks import exit = %d, want 1 (rejected); stderr: %s", code, stderr.String())
+	}
+	if !bytes.Contains(stderr.Bytes(), []byte("picks run_id")) {
+		t.Fatalf("stderr = %q, want a picks run_id mismatch error", stderr.String())
+	}
+	events, err := store.ListRankedFeedbackEvents(context.Background(), skillOptPairwiseRunIDPrefix+"run-1")
+	if err != nil {
+		t.Fatalf("ListRankedFeedbackEvents: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("events = %d, want 0: a foreign-picks import must persist nothing", len(events))
+	}
+}
+
 // TestRunSkillOptPairwiseImportIdempotent asserts re-importing the same reviewed
 // packet does NOT double-count: the stable per-item source_url keeps the conflict
 // key identical so the row is upserted in place.
