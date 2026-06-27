@@ -111,6 +111,47 @@ func (m Model) activityRows() []activityRow {
 	return rows
 }
 
+// activeJobsSection renders standalone in-flight jobs (queued/running) that are
+// not part of a delegation tree — e.g. a live `@agent ask`. It mirrors the
+// locks-section style: a bold "active jobs" header then one compact line per job
+// (agent · state · id, with repo/type when present), coloured by job state.
+// Returns the empty string when there are no active jobs so the orchestras keep
+// the full window; the empty hint is shown by activityContent's empty state.
+func (m Model) activeJobsSection() string {
+	if len(m.snap.ActiveJobs) == 0 {
+		return ""
+	}
+	// Jobs that belong to a delegation tree are already rendered as orchestras
+	// below, so exclude them here to avoid showing the same in-flight job twice.
+	inTree := map[string]bool{}
+	for _, r := range m.snap.Activity {
+		inTree[r.JobID] = true
+		if r.ContinuationID != "" {
+			inTree[r.ContinuationID] = true
+		}
+		for _, c := range r.Children {
+			inTree[c.ID] = true
+		}
+	}
+	var b strings.Builder
+	for _, j := range m.snap.ActiveJobs {
+		if inTree[j.ID] {
+			continue
+		}
+		if b.Len() == 0 {
+			b.WriteString(headerStyle.Render("active jobs"))
+			b.WriteByte('\n')
+		}
+		line := dash(j.Agent) + "  " + jobStateColor(j.State) + "  " + mutedStyle.Render(truncate(j.ID, 12))
+		if detail := strings.TrimSpace(j.Type + " " + j.Repo); detail != "" {
+			line += "  " + mutedStyle.Render(detail)
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
 // activityContent renders the Activity page: delegation trees with
 // queued/running work, newest first. Each root shows the coordinator line, a
 // progress summary, and the delegation children (which agent is doing what, and
@@ -120,12 +161,42 @@ func (m Model) activityRows() []activityRow {
 // visible — even for a single wide fan-out — with "↑/↓ N more rows" markers for
 // what is scrolled off.
 func (m Model) activityContent() string {
+	var b strings.Builder
+
+	// A standalone in-flight job (a live `@agent ask`) is not a delegation tree,
+	// so it gets its own section above the orchestras.
+	section := m.activeJobsSection()
+	if section != "" {
+		b.WriteString(section)
+		b.WriteByte('\n')
+	}
+
 	if len(m.snap.Activity) == 0 {
-		return m.loadingOr("No active jobs — nothing is running right now.", !m.loadedAt.IsZero())
+		if section == "" {
+			// Nothing standalone is running either: make the empty state explicit.
+			b.WriteString(headerStyle.Render("active jobs"))
+			b.WriteByte('\n')
+			b.WriteString(m.loadingOr("No in-flight jobs.", !m.loadedAt.IsZero()))
+			b.WriteString("\n\n")
+			b.WriteString(m.loadingOr("No active jobs — nothing is running right now.", !m.loadedAt.IsZero()))
+		} else {
+			// Standalone jobs are running, but no delegation trees: refer to the
+			// orchestras here rather than contradicting the section above.
+			b.WriteString(mutedStyle.Render("No delegation trees running."))
+		}
+		return b.String()
 	}
 
 	rows := m.activityRows()
+	// The active-jobs section eats into the tree window so the combined page
+	// still fits the viewport.
 	capacity := activityWindowCap(m.height)
+	if section != "" {
+		capacity -= strings.Count(section, "\n") + 1
+		if capacity < 3 {
+			capacity = 3
+		}
+	}
 
 	// Clamp the effective cursor into the selectable range so the row search
 	// below always matches — even if a future code path mutates m.snap.Activity
@@ -168,7 +239,6 @@ func (m Model) activityContent() string {
 		end = len(rows)
 	}
 
-	var b strings.Builder
 	b.WriteString(mutedStyle.Render("Orchestras — live delegation trees with queued/running work (refreshes every 5s).") + "\n\n")
 	if start > 0 {
 		b.WriteString(mutedStyle.Render("  ↑ "+strconv.Itoa(start)+" more rows above") + "\n")

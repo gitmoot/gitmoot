@@ -32,8 +32,21 @@ type Snapshot struct {
 	JobRows           []JobRow
 	AwaitingHuman     []AwaitingHumanTask
 	PendingCandidates []PendingCandidate
+	ActiveJobs        []ActiveJob
 	Activity          []ActivityRoot
 	Config            ConfigView
+}
+
+// ActiveJob mirrors cli.dashboardActiveJob: one in-flight (queued/running) job
+// surfaced on the Activity page so a standalone `@agent ask` is visible while it
+// runs — distinct from the delegation trees in Activity, since a lone ask is not
+// a tree.
+type ActiveJob struct {
+	ID    string
+	Agent string
+	Repo  string
+	Type  string
+	State string
 }
 
 // AwaitingHumanTask is one delegation tree paused at awaiting_human (#340), shown

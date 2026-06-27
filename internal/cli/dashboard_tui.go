@@ -569,9 +569,15 @@ func toTUISnapshot(s dashboardSnapshot) tui.Snapshot {
 	for _, l := range s.ResourceLocks {
 		out.ResourceLocks = append(out.ResourceLocks, tui.ResourceLock{Key: l.Key, Owner: l.Owner, Stale: l.Stale})
 	}
-	// Note: s.ActiveJobs (in-flight jobs) is rendered only in the plain/--json
-	// dashboard; surfacing it in the interactive TUI is deferred (the Activity
-	// page already covers live delegation trees).
+	for _, j := range s.ActiveJobs {
+		out.ActiveJobs = append(out.ActiveJobs, tui.ActiveJob{
+			ID:    j.ID,
+			Agent: j.Agent,
+			Repo:  j.Repo,
+			Type:  j.Type,
+			State: j.State,
+		})
+	}
 	out.Config = s.configView
 	jobs := make([]db.Job, 0, len(s.jobRows))
 	for _, row := range s.jobRows {

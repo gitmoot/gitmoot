@@ -63,6 +63,38 @@ func TestActivityPageEmpty(t *testing.T) {
 	}
 }
 
+// TestActivityPageRendersActiveJob guards that a standalone in-flight job (a live
+// `@agent ask`, not a delegation tree) surfaces in the Activity page's "active
+// jobs" section with its agent, state, and (truncated) id.
+func TestActivityPageRendersActiveJob(t *testing.T) {
+	snap := Snapshot{
+		Daemon: Daemon{Running: true},
+		ActiveJobs: []ActiveJob{{
+			ID: "job-abcdef123456", Agent: "researcher", Repo: "o/r", Type: "ask", State: "running",
+		}},
+	}
+	m := activityPageModel(t, snap)
+	view := m.View()
+	for _, want := range []string{"active jobs", "researcher", "running", "job-abcdef1"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("active-jobs view missing %q:\n%s", want, view)
+		}
+	}
+	// With a live job present, the page must not also claim nothing is running.
+	if strings.Contains(view, "No active jobs") {
+		t.Fatalf("active-jobs view contradicts itself with the empty hint:\n%s", view)
+	}
+}
+
+// TestActivityPageActiveJobsEmpty guards that a nil ActiveJobs renders the empty
+// hint and does not panic.
+func TestActivityPageActiveJobsEmpty(t *testing.T) {
+	m := activityPageModel(t, Snapshot{Daemon: Daemon{Running: true}, ActiveJobs: nil})
+	if !strings.Contains(m.View(), "No in-flight jobs.") {
+		t.Fatalf("empty active-jobs section should show its hint:\n%s", m.View())
+	}
+}
+
 // TestActivityPageShowsCorrectiveContinuation guards that a live continuation is
 // rendered even when the root has no fresh delegation children (Total == 0) — the
 // engine's corrective-continuation path, where the continuation is the only live
