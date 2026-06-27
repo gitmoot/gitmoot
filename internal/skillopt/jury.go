@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 )
 
 // JuryJudgeVerdict is ONE judge's contribution to the pure jury aggregation
@@ -152,8 +153,18 @@ func EvaluateJury(cfg JuryConfig, verdicts []JuryJudgeVerdict) JuryDecision {
 	// dimension BLOCKS, forcing Decision=false regardless of the majority. It is
 	// independent of the disagreement flag (a unanimous below-floor reject vetoes
 	// without being a disagreement).
+	// Build a case/space-insensitive lookup so a veto dimension configured as
+	// "Safety" still matches a judge dimension key "safety": the minority-veto is a
+	// fail-CLOSED safety control and must never silently fail OPEN on a mere
+	// name-casing/whitespace mismatch between the config and the rubric keys. Merge
+	// over the already-sorted dims for a deterministic VetoReason.
+	normValues := map[string][]float64{}
+	for _, k := range dims {
+		nk := normalizeDimKey(k)
+		normValues[nk] = append(normValues[nk], dimValues[k]...)
+	}
 	for _, dim := range cfg.VetoDimensions {
-		vals, ok := dimValues[dim]
+		vals, ok := normValues[normalizeDimKey(dim)]
 		if !ok {
 			continue
 		}
@@ -173,6 +184,14 @@ func EvaluateJury(cfg JuryConfig, verdicts []JuryJudgeVerdict) JuryDecision {
 	}
 
 	return decision
+}
+
+// normalizeDimKey canonicalizes a dimension name for veto matching so the
+// configured veto set and the judges' dimension keys compare case- and
+// whitespace-insensitively (a fail-closed safety control must not depend on the
+// operator matching the rubric's exact casing).
+func normalizeDimKey(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
 }
 
 // medianFloat returns the median of vals (the caller guarantees len>0). Odd N is

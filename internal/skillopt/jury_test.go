@@ -156,6 +156,22 @@ func TestEvaluateJuryMinorityVeto(t *testing.T) {
 			t.Fatal("expected Vetoed=false: a [0,1] score is never < 0, so floor 0 cannot fire")
 		}
 	})
+
+	// Fails WITHOUT case/space normalization: a fail-closed safety control must not
+	// silently fail OPEN just because the configured veto name's casing/whitespace
+	// differs from the rubric's dimension key.
+	t.Run("veto matches case- and space-insensitively", func(t *testing.T) {
+		got := EvaluateJury(JuryConfig{VetoDimensions: []string{" Safety "}, VetoFloor: 0.5}, []JuryJudgeVerdict{
+			scored(true, map[string]float64{"safety": 0.9}),
+			scored(true, map[string]float64{"safety": 0.2}), // one veto on the lowercase rubric key
+		})
+		if !got.Vetoed {
+			t.Fatal("expected Vetoed=true: \" Safety \" must match the rubric key \"safety\" (fail-closed)")
+		}
+		if got.Decision {
+			t.Fatal("expected Decision=false: the normalized-name veto must force the fail-closed reject")
+		}
+	})
 }
 
 // TestEvaluateJuryDisagreement covers BOTH disagreement triggers: a per-dimension
