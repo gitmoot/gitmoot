@@ -197,31 +197,47 @@ func diffSizeNormalize(changedLines int) float64 {
 // duplicationScore runs the code-duplication tool (dupl, else jscpd) against the
 // checkout and normalizes its reported duplicate count to [0,1] (#485). It
 // DEGRADE-SKIPS (ok=false) when no checkout is available, neither tool binary is on
-// PATH, or the tool errors/times out — so a tool-less host omits the dimension
-// rather than failing.
+// PATH, or the tool truly failed (errored with no usable output) — so a tool-less
+// host omits the dimension rather than failing.
+//
+// CRITICAL (#485 review): jscpd (and some dupl wrappers) exit NON-ZERO precisely
+// when duplication EXCEEDS a threshold — i.e. exactly when there ARE clones to
+// report, which is the signal the metric exists to capture. subprocess.Run returns a
+// non-nil error for any non-zero exit, so blanket-skipping on err!=nil would drop
+// the dimension on the WORST diffs and keep it (scoring 1.0) only on clean ones,
+// biasing the objective upward. Instead we treat parseable stdout as a real signal
+// regardless of exit code, and only SKIP when the run produced no usable output AND
+// errored (binary crash / context timeout).
 func (d *deterministicCheckerDispatcher) duplicationScore(ctx context.Context) (float64, bool) {
 	if strings.TrimSpace(d.checkout) == "" || d.runner == nil {
 		return 0, false
 	}
 	// Prefer dupl; fall back to jscpd. The leg only needs a clones COUNT, which both
-	// can report; absence/err => SKIP.
-	if tool, ok := d.firstAvailable("dupl", "jscpd"); ok {
-		var args []string
-		switch tool {
-		case "dupl":
-			args = []string{"-plumbing", "."}
-		case "jscpd":
-			args = []string{"--silent", "."}
-		}
-		res, err := d.runner.Run(ctx, d.checkout, tool, args...)
+	// can report; absence => SKIP.
+	tool, ok := d.firstAvailable("dupl", "jscpd")
+	if !ok {
+		return 0, false
+	}
+	var args []string
+	switch tool {
+	case "dupl":
+		args = []string{"-plumbing", "."}
+	case "jscpd":
+		args = []string{"--silent", "."}
+	}
+	res, err := d.runner.Run(ctx, d.checkout, tool, args...)
+	out := strings.TrimSpace(res.Stdout)
+	if out == "" {
+		// No usable output: a real failure (err) SKIPS; a genuinely clean exit with no
+		// clones scores 1.0.
 		if err != nil {
-			// A non-zero exit OR a real run error degrades to SKIP: we never trust a
-			// partial/garbled output to fabricate a score.
 			return 0, false
 		}
-		return duplicationNormalize(countNonEmptyLines(res.Stdout)), true
+		return 1.0, true
 	}
-	return 0, false
+	// Parseable clone listing (one clone/finding per line) is a real signal even when
+	// the tool exits non-zero to flag "duplication found".
+	return duplicationNormalize(countNonEmptyLines(out)), true
 }
 
 // duplicationNormalize maps a reported duplicate-clone count to [0,1]: zero clones
@@ -240,11 +256,20 @@ func duplicationNormalize(clones int) float64 {
 
 // lintScore runs golangci-lint against the checkout and normalizes the issue count
 // to [0,1] (#485). It DEGRADE-SKIPS (ok=false) when no checkout is available, the
-// binary is absent, or the run errors — never failing the leg on a tool-less host.
+// binary is absent, or the tool truly failed (errored with no usable output) — never
+// failing the leg on a tool-less host.
 //
-// golangci-lint exits non-zero WHEN it finds issues, which is NOT a tool error: we
-// still parse the issue count from its output, so a non-zero exit with parseable
-// output is a real signal, while an unparseable result degrades to SKIP.
+// CRITICAL (#485 review): golangci-lint exits non-zero for TWO distinct reasons:
+//  1. it FOUND lint issues (exit 1, with the issues on stdout), and
+//  2. a genuine tool FAILURE (a compile/typecheck error in the tree, an invalid
+//     .golangci.yml, an OOM/panic, an incompatible flag, or a context timeout —
+//     exit >=2 with the diagnostic on stderr and STDOUT empty).
+//
+// We must NOT swallow case 2 and fabricate a perfect 1.0 "clean lint" signal from a
+// linter that never actually linted (that violates DEGRADE-GRACEFULLY and corrupts
+// the objective auto-trace dimension). So we honor the error: parseable stdout is a
+// real issue-count signal regardless of exit code, an empty stdout with NO error is a
+// genuinely clean lint (1.0), and an empty/unparseable stdout WITH an error SKIPS.
 func (d *deterministicCheckerDispatcher) lintScore(ctx context.Context) (float64, bool) {
 	if strings.TrimSpace(d.checkout) == "" || d.runner == nil {
 		return 0, false
@@ -253,13 +278,19 @@ func (d *deterministicCheckerDispatcher) lintScore(ctx context.Context) (float64
 		return 0, false
 	}
 	// `run` prints one issue per line; we count non-empty output lines as a coarse
-	// issue count. The exit code is ignored (non-zero just means issues were found).
-	res, _ := d.runner.Run(ctx, d.checkout, "golangci-lint", "run")
+	// issue count.
+	res, err := d.runner.Run(ctx, d.checkout, "golangci-lint", "run")
 	out := strings.TrimSpace(res.Stdout)
 	if out == "" {
-		// No issues reported: a clean lint scores 1.0.
+		// No usable output: a real failure (err) SKIPS rather than fabricating a 1.0;
+		// a clean run (no err, no issues) scores 1.0.
+		if err != nil {
+			return 0, false
+		}
 		return 1.0, true
 	}
+	// Non-empty parseable output: a real issue count even if the exit was non-zero
+	// (non-zero merely flags "issues found").
 	return lintNormalize(countNonEmptyLines(out)), true
 }
 
@@ -280,7 +311,16 @@ func lintNormalize(issues int) float64 {
 // complexityScore runs the cyclomatic-complexity tool (gocyclo) against the checkout
 // and normalizes the over-threshold function count to [0,1] (#485). It
 // DEGRADE-SKIPS (ok=false) when no checkout is available, the binary is absent, or
-// the run errors.
+// the tool truly failed (errored with no usable output).
+//
+// CRITICAL (#485 review): `gocyclo -over 15` exits NON-ZERO precisely WHEN
+// over-threshold functions exist — i.e. exactly the case the complexity dimension
+// exists to penalize. subprocess.Run returns a non-nil error for that non-zero exit,
+// so blanket-skipping on err!=nil would emit the dimension ONLY on a clean tree
+// (scoring 1.0) and drop it whenever there is real complexity to flag — silently
+// inverting the metric. Instead the function list on stdout is the signal of truth:
+// parse it regardless of exit code, and only SKIP when the run produced no usable
+// output AND errored (binary crash / context timeout).
 func (d *deterministicCheckerDispatcher) complexityScore(ctx context.Context) (float64, bool) {
 	if strings.TrimSpace(d.checkout) == "" || d.runner == nil {
 		return 0, false
@@ -289,12 +329,21 @@ func (d *deterministicCheckerDispatcher) complexityScore(ctx context.Context) (f
 		return 0, false
 	}
 	// `gocyclo -over 15 .` lists every function whose complexity exceeds 15, one per
-	// line; an empty list means no over-threshold function. A run error => SKIP.
+	// line, and exits non-zero when that list is non-empty; an empty list means no
+	// over-threshold function.
 	res, err := d.runner.Run(ctx, d.checkout, "gocyclo", "-over", "15", ".")
-	if err != nil {
-		return 0, false
+	out := strings.TrimSpace(res.Stdout)
+	if out == "" {
+		// No usable output: a real failure (err) SKIPS; a clean tree (no err, no
+		// over-threshold functions) scores 1.0.
+		if err != nil {
+			return 0, false
+		}
+		return 1.0, true
 	}
-	return complexityNormalize(countNonEmptyLines(res.Stdout)), true
+	// The over-threshold function listing is a real signal even though gocyclo exits
+	// non-zero to flag that such functions exist.
+	return complexityNormalize(countNonEmptyLines(out)), true
 }
 
 // complexityNormalize maps the over-threshold function count to [0,1]: none is best

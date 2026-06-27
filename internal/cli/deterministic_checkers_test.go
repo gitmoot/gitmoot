@@ -46,10 +46,11 @@ func (r *fakeCheckerRunner) LookPath(file string) (string, error) {
 
 func (r *fakeCheckerRunner) Run(_ context.Context, _ string, command string, _ ...string) (subprocess.Result, error) {
 	r.calls = append(r.calls, command)
-	if err := r.runErr[command]; err != nil {
-		return subprocess.Result{}, err
-	}
-	return subprocess.Result{Command: command, Stdout: r.stdout[command]}, nil
+	// Faithful to subprocess.Run: a non-zero exit returns BOTH the buffered stdout
+	// (e.g. golangci-lint's issue list / gocyclo's function list / jscpd's clone
+	// listing) AND a non-nil error. Tools that "report findings via a non-zero exit"
+	// still populate stdout, so the fake must too.
+	return subprocess.Result{Command: command, Stdout: r.stdout[command]}, r.runErr[command]
 }
 
 var _ subprocess.Runner = (*fakeCheckerRunner)(nil)
@@ -226,6 +227,128 @@ func TestToolCheckerErrorDegradesToSkip(t *testing.T) {
 	}
 	if ok {
 		t.Fatal("a sole-checker error must yield ok=false (no producible dimension, no row)")
+	}
+}
+
+// runToolChecker runs a single tool checker through Check and returns its rubric
+// score and whether the dimension was produced (present in the rubric).
+func runToolChecker(t *testing.T, runner *fakeCheckerRunner, checker string) (float64, bool) {
+	t.Helper()
+	d := &deterministicCheckerDispatcher{
+		diff:     checkerDiffStub{err: errors.New("no diff in this fixture")}, // isolate the tool dim
+		runner:   runner,
+		checkout: t.TempDir(),
+		checkers: []string{checker},
+	}
+	outcome, _, err := d.Check(context.Background(), db.Job{ID: "implement-job"}, canonicalImplementPayload(), "head123")
+	if err != nil {
+		t.Fatalf("a tool checker must NEVER error the leg, got: %v", err)
+	}
+	score, present := outcome.Rubric[checker]
+	return score, present
+}
+
+// TestLintErrorWithEmptyStdoutSkips guards the #485 HIGH finding: a genuinely BROKEN
+// golangci-lint (compile/typecheck failure, invalid .golangci.yml, OOM, version
+// mismatch, or a context timeout) writes its diagnostic to STDERR, leaves STDOUT
+// empty, and exits non-zero. lintScore must DEGRADE-SKIP (omit the dimension) rather
+// than fabricate a perfect 1.0 "clean lint" from a linter that never linted.
+func TestLintErrorWithEmptyStdoutSkips(t *testing.T) {
+	runner := &fakeCheckerRunner{
+		present: map[string]bool{"golangci-lint": true},
+		stdout:  map[string]string{"golangci-lint": ""}, // diagnostic went to stderr
+		runErr:  map[string]error{"golangci-lint": errors.New("exit status 2: typecheck failed")},
+	}
+	if score, present := runToolChecker(t, runner, checkerLint); present {
+		t.Fatalf("a broken golangci-lint (err + empty stdout) must SKIP, not score %v", score)
+	}
+}
+
+// TestLintIssuesOnNonZeroExitStillScores: golangci-lint exits non-zero WHEN it finds
+// issues, with the issues on stdout. That is a real signal, not a failure — the
+// dimension must be produced from the issue count even though Run returned an error.
+func TestLintIssuesOnNonZeroExitStillScores(t *testing.T) {
+	runner := &fakeCheckerRunner{
+		present: map[string]bool{"golangci-lint": true},
+		stdout:  map[string]string{"golangci-lint": "a.go:1:1: issue one\na.go:2:1: issue two\n"},
+		runErr:  map[string]error{"golangci-lint": errors.New("exit status 1")}, // "issues found"
+	}
+	score, present := runToolChecker(t, runner, checkerLint)
+	if !present {
+		t.Fatal("lint with issues on stdout (non-zero exit) must still produce a dimension")
+	}
+	// 2 issues => 1.0 - 2*0.05 = 0.9.
+	if score < 0.89 || score > 0.91 {
+		t.Fatalf("lint with 2 issues must score ~0.9, got %v", score)
+	}
+}
+
+// TestComplexityOverThresholdOnNonZeroExitStillScores guards the #485 complexity
+// finding: `gocyclo -over 15` exits NON-ZERO precisely when over-threshold functions
+// exist (the case the metric exists to penalize). The function list on stdout is the
+// signal of truth — the dimension must be produced from it, NOT skipped on the
+// non-zero exit (which would silently reward complex code by omission).
+func TestComplexityOverThresholdOnNonZeroExitStillScores(t *testing.T) {
+	runner := &fakeCheckerRunner{
+		present: map[string]bool{"gocyclo": true},
+		stdout:  map[string]string{"gocyclo": "20 pkg fnA file.go:1:1\n18 pkg fnB file.go:9:1\n"},
+		runErr:  map[string]error{"gocyclo": errors.New("exit status 1")}, // over-threshold funcs present
+	}
+	score, present := runToolChecker(t, runner, checkerComplexity)
+	if !present {
+		t.Fatal("complexity with over-threshold funcs on stdout (non-zero exit) must still produce a dimension")
+	}
+	// 2 over-threshold funcs => 1.0 - 2*0.1 = 0.8.
+	if score < 0.79 || score > 0.81 {
+		t.Fatalf("complexity with 2 over-threshold funcs must score ~0.8, got %v", score)
+	}
+}
+
+// TestDuplicationFoundOnNonZeroExitStillScores guards the #485 duplication finding:
+// jscpd exits NON-ZERO when duplication exceeds its threshold — i.e. exactly when
+// there ARE clones to report. The clone listing on stdout is a real signal; the
+// dimension must be produced from it, NOT skipped on the non-zero exit (which would
+// drop duplication exactly on the worst diffs and bias the objective upward).
+func TestDuplicationFoundOnNonZeroExitStillScores(t *testing.T) {
+	runner := &fakeCheckerRunner{
+		present: map[string]bool{"jscpd": true},
+		stdout:  map[string]string{"jscpd": "clone a\nclone b\nclone c\n"},
+		runErr:  map[string]error{"jscpd": errors.New("exit status 1")}, // threshold breached
+	}
+	score, present := runToolChecker(t, runner, checkerDuplication)
+	if !present {
+		t.Fatal("duplication clones on stdout (non-zero exit) must still produce a dimension")
+	}
+	// 3 clones => 1.0 - 3*0.1 = 0.7.
+	if score < 0.69 || score > 0.71 {
+		t.Fatalf("duplication with 3 clones must score ~0.7, got %v", score)
+	}
+}
+
+// TestDuplicationErrorWithEmptyStdoutSkips: a duplication tool that truly fails
+// (binary crash / context timeout) leaves stdout empty and errors — that SKIPS,
+// never fabricating a 1.0.
+func TestDuplicationErrorWithEmptyStdoutSkips(t *testing.T) {
+	runner := &fakeCheckerRunner{
+		present: map[string]bool{"jscpd": true},
+		stdout:  map[string]string{"jscpd": ""},
+		runErr:  map[string]error{"jscpd": errors.New("jscpd crashed")},
+	}
+	if score, present := runToolChecker(t, runner, checkerDuplication); present {
+		t.Fatalf("a crashed duplication tool (err + empty stdout) must SKIP, not score %v", score)
+	}
+}
+
+// TestDuplicationCleanScores: a duplication tool that exits 0 with no clones (empty
+// stdout, no err) is a genuinely clean diff and scores 1.0.
+func TestDuplicationCleanScores(t *testing.T) {
+	runner := &fakeCheckerRunner{
+		present: map[string]bool{"dupl": true},
+		stdout:  map[string]string{"dupl": ""},
+	}
+	score, present := runToolChecker(t, runner, checkerDuplication)
+	if !present || score != 1.0 {
+		t.Fatalf("a clean duplication run must score 1.0, got score=%v present=%v", score, present)
 	}
 }
 
