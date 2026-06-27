@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/subprocess"
 )
@@ -375,10 +376,18 @@ func codexSandboxArgs(agent Agent) []string {
 	}
 }
 
+// defaultClaudeRetryBackoff is the pause between Claude delivery attempts when a
+// transient socket-closed failure is retried. ClaudeAdapter.RetryBackoff
+// overrides it; tests inject a near-zero value to stay fast.
+const defaultClaudeRetryBackoff = 500 * time.Millisecond
+
 type ClaudeAdapter struct {
 	Runner        subprocess.Runner
 	Dir           string
 	NewRuntimeRef func() (string, error)
+	// RetryBackoff is the pause before retrying a transient socket-closed
+	// delivery failure. When zero it defaults to defaultClaudeRetryBackoff.
+	RetryBackoff time.Duration
 }
 
 func (a ClaudeAdapter) Name() string { return ClaudeRuntime }
@@ -412,10 +421,23 @@ func (a ClaudeAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Resul
 		return Result{}, err
 	}
 	model := effectiveModel(agent, job)
-	args := claudeArgs(agent, job.Prompt, true, model)
-	result, err := a.runner().Run(ctx, a.Dir, "claude", args...)
-	if err != nil && isClaudeJSONUnsupported(result) {
-		result, err = a.runner().Run(ctx, a.Dir, "claude", claudeArgs(agent, job.Prompt, false, model)...)
+	// The Claude CLI intermittently fails a delivery with a transient
+	// "401 socket connection was closed unexpectedly" under sustained
+	// concurrency; a byte-identical retry typically clears it. Retry once on
+	// that signature only, never on a permanent failure (e.g. an invalid token).
+	// The retry is safe because the 401 fails before the model turn runs, so the
+	// failed attempt mutates no partial session state.
+	const maxAttempts = 2
+	var result subprocess.Result
+	var err error
+	for attempt := 1; ; attempt++ {
+		result, err = a.runClaude(ctx, agent, job, model)
+		if attempt >= maxAttempts || !isTransientClaudeDeliveryError(result, err) {
+			break
+		}
+		if waitErr := a.waitRetryBackoff(ctx); waitErr != nil {
+			break
+		}
 	}
 	// Self-heal a dead pinned session (#443): when a pinned --resume delivery
 	// fails before any model turn because the conversation no longer exists, mint
@@ -448,6 +470,66 @@ func (a ClaudeAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Resul
 	parsed.InputTokens = inTok
 	parsed.OutputTokens = outTok
 	return parsed, nil
+}
+
+// runClaude performs a single Claude delivery attempt, including the JSON
+// output-format fallback re-run for older CLIs that reject --output-format.
+func (a ClaudeAdapter) runClaude(ctx context.Context, agent Agent, job Job, model string) (subprocess.Result, error) {
+	result, err := a.runner().Run(ctx, a.Dir, "claude", claudeArgs(agent, job.Prompt, true, model)...)
+	if err != nil && isClaudeJSONUnsupported(result) {
+		result, err = a.runner().Run(ctx, a.Dir, "claude", claudeArgs(agent, job.Prompt, false, model)...)
+	}
+	return result, err
+}
+
+// waitRetryBackoff pauses before the next delivery attempt, returning early if
+// the context is cancelled so a killed job stops promptly. It uses a stopped
+// timer (not time.After) so the timer is released when ctx wins the race.
+func (a ClaudeAdapter) waitRetryBackoff(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	backoff := a.RetryBackoff
+	if backoff == 0 {
+		backoff = defaultClaudeRetryBackoff
+	}
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// isTransientClaudeDeliveryError reports whether a failed Claude delivery is the
+// known intermittent "401 socket connection was closed unexpectedly" transient,
+// which a byte-identical retry typically clears. It returns false when the run
+// succeeded (err == nil) and for permanent failures (e.g. an invalid token,
+// which carries no socket-closed signature). The signature shows up in the JSON
+// result on stdout in practice, so it matches both stdout and stderr; the
+// err != nil gate keeps a successful run from ever being treated as transient.
+//
+// The match also requires a "401" status so the retry is confined to the
+// provably-safe pre-turn handshake case the safety note in Deliver relies on: a
+// 401 fails before the model turn runs, so the failed attempt mutates no partial
+// session state and a byte-identical --resume retry cannot duplicate side
+// effects. A bare "socket connection was closed unexpectedly" (the underlying
+// Node/undici fetch error) can also be thrown on a MID-STREAM drop after the
+// turn has already executed tool calls or file edits, where a retry would be a
+// duplicate-execution hazard; such mid-stream drops carry no status code, so the
+// "401" requirement correctly excludes them.
+func isTransientClaudeDeliveryError(result subprocess.Result, err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(result.Stdout + "\n" + result.Stderr)
+	if !strings.Contains(text, "401") {
+		return false
+	}
+	return strings.Contains(text, "socket connection was closed unexpectedly") ||
+		strings.Contains(text, "socket connection closed unexpectedly")
 }
 
 // claudeFreshSessionArgs builds the args for a brand-new dedicated session,

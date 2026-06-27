@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/subprocess"
 )
@@ -694,6 +695,130 @@ func TestClaudeDeliverClassifiesAuthFailure(t *testing.T) {
 	}
 }
 
+func TestClaudeDeliverRetriesTransientSocketError(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{
+			{Stderr: "API Error: 401 The socket connection was closed unexpectedly"},
+			{Stdout: `{"result":"recovered"}`},
+		},
+		errs: []error{errors.New("exit 1"), nil},
+	}
+	adapter := ClaudeAdapter{Runner: runner, RetryBackoff: time.Nanosecond}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "jerryfane/gitmoot"}
+
+	result, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"})
+
+	if err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	if result.Summary != "recovered" {
+		t.Fatalf("summary = %q, want %q", result.Summary, "recovered")
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("runner called %d times, want exactly 2 (one retry): %v", len(runner.calls), runner.calls)
+	}
+	runner.want(t, 0, "claude", "--resume", "550e8400-e29b-41d4-a716-446655440002", "-p", "--output-format", "json", "--", "review")
+	runner.want(t, 1, "claude", "--resume", "550e8400-e29b-41d4-a716-446655440002", "-p", "--output-format", "json", "--", "review")
+}
+
+func TestClaudeDeliverDoesNotRetryPermanentError(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{Stderr: "401 Invalid authentication credentials"}},
+		errs:    []error{errors.New("exit 1")},
+	}
+	adapter := ClaudeAdapter{Runner: runner, RetryBackoff: time.Nanosecond}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "jerryfane/gitmoot"}
+
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err == nil {
+		t.Fatal("Deliver accepted permanent error")
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("runner called %d times, want exactly 1 (no retry on permanent error): %v", len(runner.calls), runner.calls)
+	}
+}
+
+func TestClaudeDeliverSucceedsWithoutRetry(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"result":"done"}`}}}
+	adapter := ClaudeAdapter{Runner: runner, RetryBackoff: time.Nanosecond}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "jerryfane/gitmoot"}
+
+	result, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"})
+
+	if err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	if result.Summary != "done" {
+		t.Fatalf("summary = %q", result.Summary)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("runner called %d times, want exactly 1: %v", len(runner.calls), runner.calls)
+	}
+}
+
+func TestClaudeDeliverRetriesExhausted(t *testing.T) {
+	// Both attempts hit the transient: the bound (maxAttempts=2) must stop after
+	// exactly one retry and surface the final error rather than loop forever.
+	runner := &fakeRunner{
+		results: []subprocess.Result{
+			{Stderr: "401 The socket connection was closed unexpectedly"},
+			{Stderr: "401 The socket connection was closed unexpectedly"},
+		},
+		errs: []error{errors.New("exit 1"), errors.New("exit 1")},
+	}
+	adapter := ClaudeAdapter{Runner: runner, RetryBackoff: time.Nanosecond}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "jerryfane/gitmoot"}
+
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err == nil {
+		t.Fatal("Deliver accepted a transient that persisted across all attempts")
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("runner called %d times, want exactly 2 (maxAttempts bound): %v", len(runner.calls), runner.calls)
+	}
+}
+
+func TestClaudeDeliverStopsRetryOnContextCancellation(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{Stderr: "401 The socket connection was closed unexpectedly"}},
+		errs:    []error{errors.New("exit 1")},
+	}
+	// A large backoff would hang for an hour if cancellation were ignored.
+	adapter := ClaudeAdapter{Runner: runner, RetryBackoff: time.Hour}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "jerryfane/gitmoot"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := adapter.Deliver(ctx, agent, Job{Prompt: "review"}); err == nil {
+		t.Fatal("Deliver accepted transient error under cancelled context")
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("runner called %d times, want exactly 1 (cancelled ctx must skip backoff/retry): %v", len(runner.calls), runner.calls)
+	}
+}
+
+func TestIsTransientClaudeDeliveryError(t *testing.T) {
+	runErr := errors.New("exit 1")
+	for _, tt := range []struct {
+		name   string
+		result subprocess.Result
+		err    error
+		want   bool
+	}{
+		{name: "socket_was_closed_on_stderr", result: subprocess.Result{Stderr: "401 The socket connection was closed unexpectedly"}, err: runErr, want: true},
+		{name: "socket_closed_alt_wording_on_stdout", result: subprocess.Result{Stdout: "API Error: 401 socket connection closed unexpectedly"}, err: runErr, want: true},
+		{name: "mixed_case", result: subprocess.Result{Stderr: "401 Socket Connection Was Closed Unexpectedly"}, err: runErr, want: true},
+		{name: "socket_closed_without_401_mid_stream", result: subprocess.Result{Stderr: "socket connection was closed unexpectedly"}, err: runErr, want: false},
+		{name: "permanent_auth_error", result: subprocess.Result{Stderr: "401 Invalid authentication credentials"}, err: runErr, want: false},
+		{name: "nil_error_even_with_signature", result: subprocess.Result{Stderr: "401 socket connection was closed unexpectedly"}, err: nil, want: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isTransientClaudeDeliveryError(tt.result, tt.err); got != tt.want {
+				t.Fatalf("isTransientClaudeDeliveryError = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestClaudeHealthUsesRegisteredSession(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"result":"OK"}`}}}
 	adapter := ClaudeAdapter{Runner: runner}
@@ -1051,7 +1176,6 @@ func TestKimiDeliverCommandResumesSession(t *testing.T) {
 	}
 	runner.want(t, 0, "kimi", "-S", "session_550e8400-e29b-41d4-a716-446655440001", "-p", "review", "--output-format", "stream-json")
 }
-
 
 func TestKimiDeliverCommandUsesJobModel(t *testing.T) {
 	stdout := `{"role":"assistant","content":"done"}` + "\n"
