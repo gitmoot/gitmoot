@@ -26,6 +26,10 @@ type Client interface {
 	DeleteRepository(ctx context.Context, repo Repository) error
 	ListUserRepositories(ctx context.Context, limit int) ([]RepoSummary, error)
 	ListPullRequests(ctx context.Context, repo Repository, state string) ([]PullRequest, error)
+	// ListRecentClosedPullRequests returns a bounded page of the most-recently-
+	// updated closed PRs (#467) so the per-tick revert scan never re-paginates the
+	// repo's entire closed-PR history.
+	ListRecentClosedPullRequests(ctx context.Context, repo Repository) ([]PullRequest, error)
 	ListIssues(ctx context.Context, repo Repository, state string) ([]Issue, error)
 	GetPullRequest(ctx context.Context, repo Repository, number int64) (PullRequest, error)
 	GetOpenPullRequestByHead(ctx context.Context, repo Repository, head string, base string) (PullRequest, bool, error)
@@ -60,11 +64,25 @@ func (r Repository) FullName() string {
 }
 
 type PullRequest struct {
-	Number    int64  `json:"number"`
-	Title     string `json:"title"`
-	State     string `json:"state"`
-	URL       string `json:"html_url"`
-	Merged    bool   `json:"merged"`
+	Number int64  `json:"number"`
+	Title  string `json:"title"`
+	State  string `json:"state"`
+	URL    string `json:"html_url"`
+	Merged bool   `json:"merged"`
+	// MergedAt is the PR's merge timestamp (RFC3339), or "" if not merged. It is
+	// additive (#467): the GitHub LIST endpoint (GET /pulls?state=closed) reports
+	// merged PRs as state="closed" and OMITS the top-level `merged` boolean —
+	// `merged` is computed only on the single-PR GET endpoint. `merged_at` is the
+	// ONLY merged signal the list carries, so revert detection treats a non-empty
+	// MergedAt as merged (revertPullMerged) rather than trusting list `merged`,
+	// which is always false on the list. It defaults to "" so callers that ignore
+	// it are byte-identical.
+	MergedAt string `json:"merged_at"`
+	// Body is the PR description. It is additive (#467): the daemon's revert
+	// detection reads it for a GitHub Revert-button body (`Reverts owner/repo#NN`)
+	// to map a revert back to the original PR. It defaults to "" so every existing
+	// caller that ignores it is byte-identical.
+	Body      string `json:"body"`
 	HeadRef   string
 	BaseRef   string
 	BaseSHA   string
@@ -80,6 +98,8 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 		State     string `json:"state"`
 		URL       string `json:"html_url"`
 		Merged    bool   `json:"merged"`
+		MergedAt  string `json:"merged_at"`
+		Body      string `json:"body"`
 		Mergeable *bool  `json:"mergeable"`
 		MergeSHA  string `json:"merge_commit_sha"`
 		Head      struct {
@@ -100,6 +120,8 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 	p.State = decoded.State
 	p.URL = decoded.URL
 	p.Merged = decoded.Merged
+	p.MergedAt = decoded.MergedAt
+	p.Body = decoded.Body
 	p.Mergeable = decoded.Mergeable
 	p.HeadRef = decoded.Head.Ref
 	p.HeadSHA = decoded.Head.SHA
@@ -463,6 +485,30 @@ func (c *GhClient) ListPullRequests(ctx context.Context, repo Repository, state 
 		state = "open"
 	}
 	return apiPaginatedJSON[PullRequest](ctx, c, "-X", "GET", endpoint(repo, "pulls"), "-f", "state="+state)
+}
+
+// recentClosedPullRequestsPerPage caps the bounded closed-PR scan (#467) at one
+// page of the most-recently-updated closed PRs. GitHub's pulls list allows up to
+// 100 per page; 100 keeps the per-tick GitHub cost a single, fixed request even on
+// a repo with thousands of closed PRs. A merged GitHub Revert-button PR is freshly
+// updated when it lands, so sort=updated&direction=desc puts it at the top of this
+// window — far more than enough to catch a revert between poll ticks.
+const recentClosedPullRequestsPerPage = 100
+
+// ListRecentClosedPullRequests returns ONE page of the most-recently-updated
+// CLOSED PRs (sort=updated&direction=desc, no --paginate), bounding the per-tick
+// cost of the revert scan (#467) to a single fixed GitHub request instead of
+// walking the repo's entire closed-PR history every poll. It is the bounded
+// counterpart to ListPullRequests(state="closed"); revert detection only needs
+// recently-landed reverts, so a single recent page is sufficient.
+func (c *GhClient) ListRecentClosedPullRequests(ctx context.Context, repo Repository) ([]PullRequest, error) {
+	return apiPageJSON[PullRequest](ctx, c,
+		"-X", "GET", endpoint(repo, "pulls"),
+		"-f", "state=closed",
+		"-f", "sort=updated",
+		"-f", "direction=desc",
+		"-f", "per_page="+strconv.Itoa(recentClosedPullRequestsPerPage),
+	)
 }
 
 // ListIssues lists repository issues via GET /repos/{owner}/{repo}/issues. That
@@ -1006,6 +1052,22 @@ func apiPaginatedJSON[T any](ctx context.Context, c *GhClient, args ...string) (
 	return values, nil
 }
 
+// apiPageJSON fetches a SINGLE page (no --paginate), so the caller controls the
+// page size and never walks the entire result set. It is the bounded counterpart
+// to apiPaginatedJSON, used by ListRecentClosedPullRequests (#467) so the per-tick
+// revert scan does not re-paginate a repo's entire closed-PR history.
+func apiPageJSON[T any](ctx context.Context, c *GhClient, args ...string) ([]T, error) {
+	result, err := c.run(ctx, false, append([]string{"api"}, args...)...)
+	if err != nil {
+		return nil, err
+	}
+	var values []T
+	if err := json.Unmarshal([]byte(result.Stdout), &values); err != nil {
+		return nil, fmt.Errorf("decode gh api response: %w", err)
+	}
+	return values, nil
+}
+
 func decodePaginatedJSON[T any](output string) ([]T, error) {
 	decoder := json.NewDecoder(strings.NewReader(output))
 	var values []T
@@ -1204,6 +1266,10 @@ func (NoopClient) Preflight(context.Context, Repository) error {
 }
 
 func (NoopClient) ListPullRequests(context.Context, Repository, string) ([]PullRequest, error) {
+	return nil, errors.ErrUnsupported
+}
+
+func (NoopClient) ListRecentClosedPullRequests(context.Context, Repository) ([]PullRequest, error) {
 	return nil, errors.ErrUnsupported
 }
 

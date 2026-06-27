@@ -2308,6 +2308,7 @@ func testStore(t *testing.T) *db.Store {
 type fakeGitHub struct {
 	pulls                 []github.PullRequest
 	pullsByState          map[string][]github.PullRequest
+	pullsByNumber         map[int64]github.PullRequest
 	issues                []github.Issue
 	comments              map[int64][]github.IssueComment
 	posted                []postedComment
@@ -2316,6 +2317,7 @@ type fakeGitHub struct {
 	listPullRequestsCalls int
 	listPullRequestsErrs  []error
 	listIssuesCalls       int
+	recentClosedCalls     int
 }
 
 type postedComment struct {
@@ -2362,6 +2364,18 @@ func (f *fakeGitHub) ListPullRequests(_ context.Context, _ github.Repository, st
 	}
 	if f.pullsByState != nil {
 		return append([]github.PullRequest(nil), f.pullsByState[state]...), nil
+	}
+	return append([]github.PullRequest(nil), f.pulls...), nil
+}
+
+// ListRecentClosedPullRequests models the bounded closed-PR scan (#467): the fake
+// simply returns the "closed"-state fixtures (the test fixtures are already small,
+// so a single page covers them). It counts calls so the off-path byte-identical
+// test can prove no closed read happens when revert detection is disabled.
+func (f *fakeGitHub) ListRecentClosedPullRequests(_ context.Context, _ github.Repository) ([]github.PullRequest, error) {
+	f.recentClosedCalls++
+	if f.pullsByState != nil {
+		return append([]github.PullRequest(nil), f.pullsByState["closed"]...), nil
 	}
 	return append([]github.PullRequest(nil), f.pulls...), nil
 }
@@ -2423,7 +2437,12 @@ func (f *fakeGitHub) UpdatePullRequestBranch(context.Context, github.UpdatePullR
 	return github.UpdatePullRequestBranchResult{}, errors.New("not implemented")
 }
 
-func (f *fakeGitHub) GetPullRequest(context.Context, github.Repository, int64) (github.PullRequest, error) {
+func (f *fakeGitHub) GetPullRequest(_ context.Context, _ github.Repository, number int64) (github.PullRequest, error) {
+	if f.pullsByNumber != nil {
+		if pull, ok := f.pullsByNumber[number]; ok {
+			return pull, nil
+		}
+	}
 	return github.PullRequest{}, errors.New("not implemented")
 }
 

@@ -1423,6 +1423,56 @@ func TestDeleteResourceLocksByOwner(t *testing.T) {
 	}
 }
 
+func TestDeleteResourceLocksByOwnerIfNotRunning(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	// Two owners: job-running is RUNNING, job-queued is QUEUED.
+	if err := store.CreateJob(ctx, Job{ID: "job-running", Agent: "w", Type: "ask", State: "running", Payload: "{}"}); err != nil {
+		t.Fatalf("CreateJob(job-running) returned error: %v", err)
+	}
+	if err := store.CreateJob(ctx, Job{ID: "job-queued", Agent: "w", Type: "ask", State: "queued", Payload: "{}"}); err != nil {
+		t.Fatalf("CreateJob(job-queued) returned error: %v", err)
+	}
+
+	now := time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC)
+	for _, lock := range []ResourceLock{
+		{ResourceKey: "runtime:codex:session-r", OwnerJobID: "job-running", OwnerToken: "tok-r", ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano)},
+		{ResourceKey: "runtime:codex:session-q", OwnerJobID: "job-queued", OwnerToken: "tok-q", ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano)},
+	} {
+		if acquired, err := store.AcquireResourceLock(ctx, lock, now); err != nil || !acquired {
+			t.Fatalf("AcquireResourceLock(%s) acquired=%v err=%v", lock.ResourceKey, acquired, err)
+		}
+	}
+
+	// Empty owner id is a no-op.
+	if released, err := store.DeleteResourceLocksByOwnerIfNotRunning(ctx, "  "); err != nil || released != 0 {
+		t.Fatalf("DeleteResourceLocksByOwnerIfNotRunning(empty) released=%d err=%v, want 0/nil", released, err)
+	}
+
+	// A RUNNING owner's lock is NOT released: this is the #479 TOCTOU guard. A
+	// child that raced queued->running after a stale snapshot was read keeps its
+	// live runtime-session / checkout lock.
+	if released, err := store.DeleteResourceLocksByOwnerIfNotRunning(ctx, "job-running"); err != nil || released != 0 {
+		t.Fatalf("DeleteResourceLocksByOwnerIfNotRunning(job-running) released=%d err=%v, want 0/nil", released, err)
+	}
+	if _, err := store.GetResourceLock(ctx, "runtime:codex:session-r"); err != nil {
+		t.Fatalf("running owner's lock must survive: GetResourceLock returned error: %v", err)
+	}
+
+	// A non-running owner's lock IS released.
+	if released, err := store.DeleteResourceLocksByOwnerIfNotRunning(ctx, "job-queued"); err != nil || released != 1 {
+		t.Fatalf("DeleteResourceLocksByOwnerIfNotRunning(job-queued) released=%d err=%v, want 1/nil", released, err)
+	}
+	if _, err := store.GetResourceLock(ctx, "runtime:codex:session-q"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetResourceLock(session-q) error = %v, want sql.ErrNoRows", err)
+	}
+}
+
 func TestResourceLockRecoversExpiredLock(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))

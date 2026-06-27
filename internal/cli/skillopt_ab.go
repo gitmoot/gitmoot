@@ -107,10 +107,29 @@ var skillOptABJudgeAuthedRuntimes = func(repoScope string) reviewAuthedRuntimes 
 // and synchronous; runSkillOptAB invokes it twice in series so the second call
 // only starts after the first returns — never concurrently — which keeps any
 // per-runtime session usage cleanly serialized.
+//
+// Session isolation (#482): an EMPTY agent.RuntimeRef is the "forked/throwaway
+// session" signal. The live-AB challenger sets it so its Deliver never resumes
+// the agent's live session (codex always `exec resume`s in Deliver; claude/kimi
+// resume a pinned ref), which would otherwise inject the challenger turn into the
+// user's real conversation and poison the next genuine ask. On an empty ref we
+// mint a fresh throwaway session via adapter.Start instead — a brand-new
+// conversation the challenger answers on, leaving the agent's live session (and
+// its resume_hint) untouched. A non-empty ref (the manual `skillopt ab` path)
+// keeps its existing resume behavior unchanged.
 func realSkillOptABDeliver(ctx context.Context, agent runtime.Agent, prompt string) (string, error) {
 	adapter, err := runtimeStartAdapterFor(newRuntimeFactory(), agent.Runtime, agent.RepoScope)
 	if err != nil {
 		return "", err
+	}
+	if strings.TrimSpace(agent.RuntimeRef) == "" {
+		// Forked/throwaway session: Start opens a fresh conversation and answers the
+		// prompt in one shot, never touching the agent's live session.
+		started, startErr := adapter.Start(ctx, runtime.StartRequest{Agent: agent, Prompt: prompt})
+		if startErr != nil {
+			return "", startErr
+		}
+		return strings.TrimSpace(started.Raw), nil
 	}
 	result, err := adapter.Deliver(ctx, agent, runtime.Job{AgentName: agent.Name, Action: "ask", Prompt: prompt, Model: agent.Model})
 	if err != nil {

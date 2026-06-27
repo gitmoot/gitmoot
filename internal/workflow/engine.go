@@ -304,6 +304,27 @@ type PullRequestEvent struct {
 	SkipReviewFanout bool
 }
 
+// RevertEvent locates the ORIGINAL PR that a (now-merged) revert PR undid (#467).
+// The daemon PR-watcher fills it after parsing a GitHub Revert-button body
+// (`Reverts owner/repo#NN`) back to the original PR number; HandlePullRequestReverted
+// resolves the original implement job from these fields and fires the corrective
+// OutcomeReverted harvest. It carries ONLY what the Reverted projection needs
+// (Repo + the original PR number); OriginalBranch/OriginalTaskID are optional
+// attribution hints that improve implementJobForTask's sameTask match.
+type RevertEvent struct {
+	// Repo is the "owner/name" the original PR lives in (same-repo as the revert).
+	Repo string
+	// OriginalPullRequest is the number of the PR that was reverted — the anchor for
+	// the harvester's per-PR item_id / source_url UNIQUE corrective-overwrite key.
+	OriginalPullRequest int
+	// OriginalBranch is the original PR's head branch, if known, used as an
+	// attribution hint for implementJobForTask. Optional.
+	OriginalBranch string
+	// OriginalTaskID is the original PR's task id, if known, used as a strong
+	// attribution hint for implementJobForTask (sameTask prefers TaskID). Optional.
+	OriginalTaskID string
+}
+
 type MergeRequest struct {
 	Repo           string
 	Branch         string
@@ -422,16 +443,16 @@ const (
 	// reverted — a delayed, corrective negative that overwrites the prior positive
 	// in place on the same UNIQUE feedback key.
 	//
-	// NOT YET WIRED (#465): the harvester's projection + corrective in-place upsert
-	// for this kind are implemented and unit-tested (the same per-PR item_id
-	// re-upserts and flips choice a->b), but NO engine/daemon code path constructs
-	// an Outcome{Kind: OutcomeReverted} today — there is no revert detection in
-	// AdvanceJob, runMergeGate, or the daemon PR-watcher. The corrective-on-revert
-	// flow is therefore reachable only via a direct Harvest call (tests); a
-	// production revert does not yet overwrite the prior positive. Wiring real
-	// revert detection (the daemon observing a revert PR/commit of a previously
-	// harvested merge, re-firing harvestOutcomeForMergeGate for the reverted PR) is
-	// a follow-on; see CORRECTIVE-ON-REVERT in docs/skillopt-exchange-contract.md.
+	// WIRED (#467): the daemon PR-watcher detects a GitHub Revert-button PR (whose
+	// body is `Reverts owner/repo#NN` / `Reverts #NN`) being merged, parses the
+	// ORIGINAL PR number, and — gated off-by-default on
+	// [skillopt].auto_trace_enabled AND revert_detection_enabled — calls
+	// HandlePullRequestReverted, which resolves the original implement job via
+	// implementJobForTask and fires harvestOutcome with this kind. The harvester's
+	// in-place corrective upsert re-writes the SAME per-PR item_id row, flipping the
+	// prior positive choice a->b (row count unchanged). It is best-effort: a
+	// malformed/cross-repo/unresolvable revert never blocks the poll. See
+	// CORRECTIVE-ON-REVERT in docs/skillopt-exchange-contract.md.
 	OutcomeReverted OutcomeKind = "reverted"
 	// OutcomeReviewed is the SOFT, down-weighted, judge-tagged secondary signal a
 	// cross-family review leg produces (#469). Unlike the verifiable kinds above it
@@ -833,6 +854,21 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 	// below (the delegation DAG early-returns for policy-handled failures and
 	// pending retries). No-op for jobs that did not allocate a read-only worktree.
 	defer e.cleanupReadOnlyDelegationWorktree(ctx, jobID, job.Type, payload)
+
+	// An implement delegation child runs in a per-delegation worktree on its own
+	// gitmoot-delegation-* branch; tear both down once the child is terminal so they
+	// do not accumulate in the shared checkout and mislead a later coordinator (#478).
+	// No-op for non-implement / non-delegation jobs and (idempotently) for already
+	// cleaned ones. Skips succeeded legs still feeding a pending integration (#332).
+	defer e.cleanupImplementDelegationWorktree(ctx, jobID, job.Type, payload)
+
+	// When an integration step (#332) that consumed implement legs via its Deps
+	// reaches a terminal state, tear down those consumed legs' worktrees+branches:
+	// each leg's own terminal advance preserved its branch while this consumer was
+	// still pending/running, and nothing else ever reclaims an integration-fed leg
+	// (the merge gate cleans only the task worktree), so they would otherwise
+	// accumulate forever (#478). No-op for a job with no parent/deps.
+	defer e.cleanupConsumedImplementLegWorktrees(ctx, payload)
 
 	// Commit a succeeded implement leg's work to its own branch BEFORE advancing
 	// the parent's delegation DAG. The parent advance below may enqueue a dependent
@@ -4476,6 +4512,54 @@ func (e Engine) harvestOutcomeForMergeGate(ctx context.Context, reviewPayload Jo
 		return
 	}
 	e.harvestOutcome(ctx, job, payload, outcome)
+}
+
+// HandlePullRequestReverted fires the corrective OutcomeReverted harvest for an
+// ORIGINAL PR that a (now-merged) revert PR undid (#467). It mirrors
+// harvestOutcomeForMergeGate exactly: it resolves the original implement job via
+// implementJobForTask (so the revert is attributed to the right template version,
+// matched by Repo+PR or TaskID) and calls harvestOutcome with Outcome{Kind:
+// OutcomeReverted, Repo, PullRequest}; the Reverted projection needs only
+// Repo+PullRequest (no HeadSHA / no CI read), so the daemon need not fetch the
+// original head.
+//
+// It is best-effort and FAIL-SAFE end to end: a nil harvester (the default —
+// auto_trace off) short-circuits to no-op, an invalid event or an unresolvable
+// original implement job returns nil (skip, no rows written), and a Harvest error
+// is swallowed inside harvestOutcome and recorded as an auto_trace_harvest_failed
+// job event — so a revert-detection call can NEVER block or fail the daemon poll.
+// Re-firing is naturally idempotent: the harvester's per-PR item_id re-upserts the
+// SAME UNIQUE feedback row in place (corrective overwrite, row count unchanged),
+// so repeated polls of the same persistent revert PR are harmless.
+func (e Engine) HandlePullRequestReverted(ctx context.Context, event RevertEvent) error {
+	if e.OutcomeHarvester == nil {
+		// No harvester (auto_trace off) => byte-identical no-op, no lookup.
+		return nil
+	}
+	repo := strings.TrimSpace(event.Repo)
+	if repo == "" || event.OriginalPullRequest <= 0 {
+		// Nothing to anchor the corrective overwrite to; skip rather than guess.
+		return nil
+	}
+	reviewPayload := JobPayload{
+		Repo:        repo,
+		PullRequest: event.OriginalPullRequest,
+		Branch:      strings.TrimSpace(event.OriginalBranch),
+		TaskID:      strings.TrimSpace(event.OriginalTaskID),
+	}
+	job, payload, ok := e.implementJobForTask(ctx, reviewPayload)
+	if !ok {
+		// No implement job owns the original PR (e.g. it was opened outside the
+		// implement flow, or auto-trace was enabled only after the original merge):
+		// skip rather than create a spurious fresh negative row.
+		return nil
+	}
+	e.harvestOutcome(ctx, job, payload, Outcome{
+		Kind:        OutcomeReverted,
+		Repo:        repo,
+		PullRequest: event.OriginalPullRequest,
+	})
+	return nil
 }
 
 // implementJobForTask finds the implement job that produced the diff/PR for the

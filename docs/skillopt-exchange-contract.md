@@ -191,12 +191,22 @@ mirrors the off-by-default `[events]` stream.
 - **Reverted** → corrective negative. A later revert of a previously-merged PR
   **re-upserts the same** `UNIQUE(run_id, item_id, reviewer, source, source_url)`
   row, flipping the earlier positive `choice = a` to `choice = b` **in place**
-  (the row count is unchanged). **Not yet wired:** the projection and the
-  in-place corrective upsert are implemented and unit-tested, but no engine or
-  daemon path detects a revert and fires the `reverted` outcome today, so in a
-  running daemon a merged-then-reverted PR keeps its prior positive until revert
-  detection is wired (a follow-on). The corrective-overwrite mechanics above are
-  reachable only by invoking the harvester directly with a `reverted` outcome.
+  (the row count is unchanged). **Wired (#467):** the daemon PR-watcher detects a
+  GitHub Revert-button PR — whose body is `Reverts owner/repo#NN` / `Reverts #NN`,
+  same-repo only — being **merged**, parses the **original** PR number, and (via
+  `Engine.HandlePullRequestReverted` → `implementJobForTask` → the harvester)
+  fires the `reverted` outcome against the original PR's auto-trace row, attributed
+  to the original implement job's template version. It is gated off-by-default on
+  `auto_trace_enabled` **and** the optional opt-out `revert_detection_enabled`
+  (unset = on whenever the harvester is on; set `false` to keep the harvester
+  running but turn the corrective revert overwrites off). It is best-effort and
+  fail-safe: a malformed/cross-repo body, an unresolvable original implement job,
+  or a harvest error never blocks or fails the poll. Re-polling the persistent
+  revert PR is idempotent (the in-place upsert re-writes the same `choice = b`
+  row). **Not detected** (best-effort v1): a revert opened without the
+  `Reverts #NN` body line, or a `git revert` pushed straight to the default branch
+  with no PR. With `auto_trace_enabled` off (the default) **no PR body is parsed**
+  and behavior is byte-identical.
 
 **Scope.** Only implement-family jobs that carry a template attribution are
 harvested; coordinator continuation jobs (which produce no diff of their own) and
@@ -296,7 +306,8 @@ auto_promote_require_external_ci = false  # require >= 1 real-external-CI feedba
 auto_promote_require_measured_judge = false  # PARSED but DEFERRED (#344): true => fail safe to no-promote
 auto_promote_canary = false               # PARSED but DEFERRED (canary follow-on): true => fail safe to no-promote
 auto_promote_min_confidence = 0.95        # #473 Mode B: UNSET = ignore; SET = require bandit P(>) >= floor (+ enough samples)
-bandit_min_samples = 30                   # #473 Mode B low-traffic floor for the DEFERRED auto loop (manual `skillopt ab` always allowed)
+bandit_min_samples = 30                   # #473/#482 Mode B low-traffic floor (manual `skillopt ab` always allowed)
+live_ab_sample_rate = 0.0                 # #482 Mode B live A/B: 0.0 (default) = never intercept; fraction of foreground asks to A/B
 ```
 
 The guardrails read the candidate's **harvester auto-trace run**
@@ -386,11 +397,45 @@ confidence carried into `candidate.awaiting_promotion`'s detail and into the
 auto-promote guardrails.
 
 **Tiering.** Below `bandit_min_samples` (default 30) the bandit still records
-preferences and updates the posterior but the **deferred** auto A/B loop never
-runs and the confidence is never trusted to auto-promote (the promotion-side floor
+preferences and updates the posterior but live-traffic interception never fires
+and the confidence is never trusted to auto-promote (the promotion-side floor
 reuses `auto_promote_min_samples`). The **manual** `skillopt ab` CLI is always
-allowed. Live-traffic interception, canary, and the auto A/B scheduling loop are
-**deferred** to follow-ons.
+allowed regardless of the floor.
+
+### Live-traffic A/B interception (off by default, #482)
+
+The same champion-vs-challenger pick can fire **automatically** on a **sampled
+fraction** of real foreground `gitmoot agent ask` traffic, so a template
+self-improves the more you use it — no operator has to remember to run
+`skillopt ab`. It is purely an **additional caller** of the #473 surface above: it
+adds **no new bandit math and no new contract field** (`ContractVersion` stays
+`1`), only a sampling decision, the `bandit_min_samples` traffic floor, and a
+serialized double-`Deliver` at the ask seam.
+
+- **Off by default.** `live_ab_sample_rate` is `0.0` (and unset with no
+  `[skillopt]` section), which makes the foreground ask path **byte-identical** —
+  no extra `Deliver`, no A/B row, no bandit update; the hot path is untouched when
+  off.
+- When `live_ab_sample_rate > 0`, a foreground ask on a **managed** agent whose
+  **champion bandit arm** has accrued `>= bandit_min_samples` pulls is intercepted
+  with probability `live_ab_sample_rate`. Low-traffic / bespoke agents (e.g. the
+  `researcher`) below the floor are **never** auto-A/B'd.
+- An intercepted ask runs the **champion** (the canonical answer you receive, via
+  the normal job path) and then a single pending **challenger** strictly
+  **serialized under the one runtime-session lock already held** by the foreground
+  ask — never a second lock, so it can never self-deadlock on `session is busy`. It
+  presents both answers and routes the human pick through the **exact same**
+  `recordSkillOptABPick` path as the manual A/B (same `source = skillopt-ab`
+  `RankedFeedbackEvent`, same Beta-Bernoulli bandit update).
+- It is **fail-safe**: a challenger `Deliver` error, no single pending challenger,
+  or no pick captured degrades to the normal single champion answer and logs a
+  `live_ab_skipped` job event — the primary ask is never blocked or degraded. Each
+  intercepted ask runs the runtime **twice** (the sampled cost, bounded by the rate
+  + floor).
+- **Promotion stays MANUAL.** Live A/B only writes feedback + updates the
+  posterior; it never auto-promotes or rolls back a version. The bandit confidence
+  still flows into `auto_promote_min_confidence` as a **suggestion**, gated by an
+  explicit human `promote`.
 
 ### Cross-family LLM-judge auto-pairwise (off by default, #483)
 
@@ -428,6 +473,8 @@ gitmoot skillopt ab <agent> "<prompt>" --judge-only # only the judge row (skip t
 - **Trust is gated on measure-the-judge (#344):** the judge row is judge-tagged
   and weighted low here and is **not** calibrated against human gold in this slice
   — judge-tagged now, calibrated later.
+
+Canary and the unattended auto A/B scheduling loop remain **deferred** to follow-ons.
 
 ## Ranked Exploration Workflow
 

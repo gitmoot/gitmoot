@@ -65,7 +65,11 @@ escalation_ttl = ""
 # event emission, and promotion stays fully MANUAL. auto_trace_enabled opts the
 # daemon into harvesting an implement job's verifiable terminal outcome into a
 # synthetic feedback event; cross_family_review_enabled (requires auto_trace) adds
-# a down-weighted cross-family review soft signal. auto_promote (#471) opts into
+# a down-weighted cross-family review soft signal. revert_detection_enabled (#467,
+# requires auto_trace; UNSET = on) lets the daemon detect a merged GitHub
+# Revert-button PR (body "Reverts owner/repo#NN") and CORRECT the original PR's
+# auto-trace positive to a negative in place; set it false to keep the harvester on
+# but turn the (delayed, corrective) revert overwrites OFF. auto_promote (#471) opts into
 # AUTO-PROMOTING a newly-pending candidate, but ONLY when every configured
 # guardrail below holds — any uncertainty fails safe to notify-only (no promote).
 # A pending candidate ALWAYS emits candidate.awaiting_promotion when [events] is
@@ -96,10 +100,20 @@ escalation_ttl = ""
 #     entirely (byte-identical to #471). When SET, auto-promote additionally
 #     requires a non-nil confidence >= this floor; a nil/low confidence FAILS SAFE
 #     to notify-only.
-#   bandit_min_samples (#473 Mode B): per-agent low-traffic floor for the DEFERRED
-#     auto A/B loop. Below it the bandit still records preferences and updates its
-#     posterior but never auto-runs/auto-promotes off thin evidence. The manual
-#     'skillopt ab' CLI is always allowed regardless. (default 30)
+#   bandit_min_samples (#473 Mode B): per-agent low-traffic floor. Below it the
+#     bandit still records preferences and updates its posterior but live-traffic
+#     A/B never auto-runs and the confidence is never trusted to auto-promote off
+#     thin evidence. The manual 'skillopt ab' CLI is always allowed regardless.
+#     (default 30)
+#   live_ab_sample_rate (#482 Mode B live A/B): probability in [0,1] that a single
+#     foreground 'agent ask' (on a MANAGED agent whose champion arm is already at
+#     or above bandit_min_samples) is intercepted into a champion-vs-challenger
+#     A/B — running both variants serially, presenting both answers, and recording
+#     the human pick through the SAME bandit + RankedFeedbackEvent path as the
+#     manual 'skillopt ab'. UNSET / 0.0 (the default) NEVER intercepts — the ask
+#     path is byte-identical. It only writes feedback + updates the posterior;
+#     promotion stays MANUAL. Each intercepted ask runs the runtime twice (cost),
+#     which is why it is sampled and floored.
 #   mode_b_judge_enabled (#483 Mode B): OFF by default. When true (or with the
 #     per-invocation 'skillopt ab --judge' flag), in addition to the human pick a
 #     CROSS-FAMILY LLM judge (a DIFFERENT runtime family than the agent under test)
@@ -111,6 +125,7 @@ escalation_ttl = ""
 # [skillopt]
 # auto_trace_enabled = false
 # cross_family_review_enabled = false
+# revert_detection_enabled = true
 # auto_promote = false
 # auto_promote_min_samples = 0
 # auto_promote_min_score = 0.0
@@ -119,6 +134,7 @@ escalation_ttl = ""
 # auto_promote_canary = false
 # auto_promote_min_confidence = 0.95
 # bandit_min_samples = 30
+# live_ab_sample_rate = 0.0
 # mode_b_judge_enabled = false
 
 # [admission] is an OPT-IN, off-by-default host-global concurrency budget the

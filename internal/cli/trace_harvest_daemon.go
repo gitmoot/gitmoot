@@ -44,6 +44,21 @@ func loadSkillOptPolicy(home string) (config.SkillOptPolicy, error) {
 	return config.LoadSkillOptPolicy(config.Paths{ConfigFile: cfg})
 }
 
+// resolveRevertDetectionEnabled resolves the daemon's corrective revert-detection
+// gate for a home (#467): true only when [skillopt].auto_trace_enabled AND the
+// optional opt-out revert_detection_enabled (nil=on) both hold. It is FAIL-SAFE to
+// false on any config-load error, so a malformed config never turns the (delayed,
+// corrective) revert overwrites on — matching daemonOutcomeHarvester's
+// fail-safe-to-disabled gate. With auto_trace off (the default) this is always
+// false, so the daemon parses no PR bodies — byte-identical default.
+func resolveRevertDetectionEnabled(home string) bool {
+	policy, err := loadSkillOptPolicy(home)
+	if err != nil {
+		return false
+	}
+	return policy.RevertDetectionEnabled()
+}
+
 // daemonReviewLegDispatcher returns the best-effort cross-family review-leg
 // dispatcher for this home (#469), or nil when the review knob is OFF — the
 // default, or any config-load failure (fail-safe to disabled). ReviewEnabled()

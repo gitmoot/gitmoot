@@ -483,6 +483,92 @@ func TestGetPullRequestDecodesBaseSHA(t *testing.T) {
 	runner.wantArgs(t, 0, "api", "repos/jerryfane/gitmoot/pulls/2")
 }
 
+// TestGetPullRequestDecodesBody proves PullRequest.UnmarshalJSON decodes the wire
+// `body` field into the additive PullRequest.Body (#467) so the daemon's revert
+// detection can read a GitHub Revert-button body (`Reverts owner/repo#NN`).
+func TestGetPullRequestDecodesBody(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{
+			Stdout: `{"number": 9, "title": "Revert \"Add feature\"", "state": "closed", "merged": true, "html_url": "https://github.com/jerryfane/gitmoot/pull/9", "body": "Reverts jerryfane/gitmoot#7", "head": {"ref": "revert-7", "sha": "rev123"}, "base": {"ref": "main", "sha": "base123"}}`,
+		}},
+	}
+	client := GhClient{Runner: runner}
+
+	pr, err := client.GetPullRequest(context.Background(), Repository{Owner: "jerryfane", Name: "gitmoot"}, 9)
+
+	if err != nil {
+		t.Fatalf("GetPullRequest returned error: %v", err)
+	}
+	if pr.Body != "Reverts jerryfane/gitmoot#7" {
+		t.Fatalf("pull request body = %q, want the Reverts anchor", pr.Body)
+	}
+	if !pr.Merged {
+		t.Fatalf("pull request merged = %v, want true", pr.Merged)
+	}
+}
+
+// TestGetPullRequestBodyDefaultsEmpty proves Body defaults to "" when the wire
+// payload omits `body` — the additive field is byte-identical for every existing
+// caller that ignores it.
+func TestGetPullRequestBodyDefaultsEmpty(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{
+			Stdout: `{"number": 2, "title": "Task", "state": "open", "html_url": "https://github.com/jerryfane/gitmoot/pull/2", "head": {"ref": "task", "sha": "head123"}, "base": {"ref": "main", "sha": "base123"}}`,
+		}},
+	}
+	client := GhClient{Runner: runner}
+
+	pr, err := client.GetPullRequest(context.Background(), Repository{Owner: "jerryfane", Name: "gitmoot"}, 2)
+
+	if err != nil {
+		t.Fatalf("GetPullRequest returned error: %v", err)
+	}
+	if pr.Body != "" {
+		t.Fatalf("pull request body = %q, want empty default", pr.Body)
+	}
+}
+
+// TestListRecentClosedPullRequestsDecodesMergedAt proves the bounded closed-PR
+// scan (#467) decodes the LIST endpoint's real merged shape: a merged PR comes
+// back as state="closed" with merged_at set and NO `merged` boolean. revert
+// detection gates on merged_at, so this field must survive decoding.
+func TestListRecentClosedPullRequestsDecodesMergedAt(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{
+			Stdout: `[{"number": 20, "title": "Revert \"Task 7\"", "state": "closed", "merged_at": "2026-06-27T12:00:00Z", "html_url": "https://github.com/jerryfane/gitmoot/pull/20", "body": "Reverts #7", "head": {"ref": "revert-task-7"}, "base": {"ref": "main"}}]`,
+		}},
+	}
+	client := GhClient{Runner: runner}
+
+	pulls, err := client.ListRecentClosedPullRequests(context.Background(), Repository{Owner: "jerryfane", Name: "gitmoot"})
+	if err != nil {
+		t.Fatalf("ListRecentClosedPullRequests returned error: %v", err)
+	}
+	if len(pulls) != 1 {
+		t.Fatalf("pulls = %d, want 1", len(pulls))
+	}
+	if pulls[0].MergedAt != "2026-06-27T12:00:00Z" {
+		t.Fatalf("merged_at = %q, want the merge timestamp", pulls[0].MergedAt)
+	}
+	if pulls[0].Merged {
+		t.Fatalf("list endpoint must not set Merged; got %v", pulls[0].Merged)
+	}
+
+	// The scan must be BOUNDED: a single page (no --paginate) sorted by recency.
+	if len(runner.calls) != 1 {
+		t.Fatalf("runner calls = %d, want 1", len(runner.calls))
+	}
+	args := strings.Join(runner.calls[0], " ")
+	if strings.Contains(args, "--paginate") {
+		t.Fatalf("recent closed scan must NOT paginate the whole history; args = %q", args)
+	}
+	for _, want := range []string{"state=closed", "sort=updated", "direction=desc", "per_page="} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("recent closed scan args missing %q; args = %q", want, args)
+		}
+	}
+}
+
 func TestCompareCommitsUsesEscapedCompareEndpoint(t *testing.T) {
 	runner := &fakeRunner{
 		results: []subprocess.Result{{
