@@ -14,6 +14,16 @@ import (
 	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
+// maxRepairAttempts bounds how many times a malformed (missing gitmoot_result
+// envelope) output is re-asked with the repair prompt before the job is failed
+// terminally. The initial delivery plus up to this many repair re-asks salvages a
+// recoverable missing envelope — where the agent already produced useful work but
+// omitted the JSON contract — instead of driving the job straight to JobFailed,
+// which would make automation treat delivered work as a failure and re-run it
+// (causing duplicate side effects). It is intentionally small and bounded so the
+// loop can never spin (#495).
+const maxRepairAttempts = 2
+
 type Mailbox struct {
 	Store *db.Store
 	// emitTerminal, when set, is called best-effort AFTER a genuine running->
@@ -294,32 +304,57 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 
 	result, parseErr := ExtractAgentResult(firstRaw)
 	if parseErr != nil {
+		// The agent may have delivered useful work but omitted the required
+		// gitmoot_result envelope. Re-ask with the repair prompt up to
+		// maxRepairAttempts times to salvage a recoverable missing envelope before
+		// failing terminally (#495). Persist the malformed output and emit the
+		// malformed_output event once, preserving the existing event semantics, then
+		// loop the (previously single) repair re-ask.
 		if err := m.savePayload(ctx, job.ID, payload); err != nil {
 			return AgentResult{}, err
 		}
 		if err := m.addEvent(ctx, job.ID, "malformed_output", parseErr.Error()); err != nil {
 			return AgentResult{}, err
 		}
-		if err := m.ensureRunning(ctx, job.ID); err != nil {
-			return AgentResult{}, err
-		}
-		if err := m.addEvent(ctx, job.ID, "repair_retry", "retrying once with repair prompt"); err != nil {
-			return AgentResult{}, err
-		}
 
-		repairPrompt := prompts.RenderRepairPrompt(firstRaw, parseErr)
-		secondRaw, secondRefreshedRef, secondErr := m.deliver(ctx, adapter, agent, job, payload, repairPrompt)
-		if secondErr != nil {
-			_ = m.fail(ctx, job.ID, fmt.Sprintf("repair delivery failed: %v", secondErr))
-			return AgentResult{}, secondErr
-		}
-		m.persistRefreshedRuntimeRef(ctx, job.ID, agent, secondRefreshedRef)
-		payload.RawOutputs = append(payload.RawOutputs, secondRaw)
-		result, parseErr = ExtractAgentResult(secondRaw)
-		if parseErr != nil {
+		lastRaw := firstRaw
+		for attempt := 1; attempt <= maxRepairAttempts; attempt++ {
+			// Re-check cancellation before each repair delivery so a job cancelled
+			// during the repair window is not re-asked (preserves the cancellation
+			// guards).
+			if err := m.ensureRunning(ctx, job.ID); err != nil {
+				return AgentResult{}, err
+			}
+			if err := m.addEvent(ctx, job.ID, "repair_retry", fmt.Sprintf("retrying with repair prompt (attempt %d of %d)", attempt, maxRepairAttempts)); err != nil {
+				return AgentResult{}, err
+			}
+
+			repairPrompt := prompts.RenderRepairPrompt(lastRaw, parseErr)
+			repairRaw, repairRefreshedRef, repairErr := m.deliver(ctx, adapter, agent, job, payload, repairPrompt)
+			if repairErr != nil {
+				_ = m.fail(ctx, job.ID, fmt.Sprintf("repair delivery failed: %v", repairErr))
+				return AgentResult{}, repairErr
+			}
+			m.persistRefreshedRuntimeRef(ctx, job.ID, agent, repairRefreshedRef)
+			// Adopt a freshly minted session ref so the next repair re-ask resumes the
+			// new session rather than re-resuming a dead UUID (mirrors the first
+			// delivery's self-heal adoption above).
+			if repairRefreshedRef != "" {
+				agent.RuntimeRef = repairRefreshedRef
+			}
+			payload.RawOutputs = append(payload.RawOutputs, repairRaw)
+			lastRaw = repairRaw
+
+			result, parseErr = ExtractAgentResult(repairRaw)
+			if parseErr == nil {
+				break
+			}
 			if err := m.savePayload(ctx, job.ID, payload); err != nil {
 				return AgentResult{}, err
 			}
+		}
+
+		if parseErr != nil {
 			_ = m.fail(ctx, job.ID, fmt.Sprintf("repair output malformed: %v", parseErr))
 			return AgentResult{}, parseErr
 		}
