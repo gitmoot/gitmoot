@@ -375,6 +375,85 @@ func TestMailboxEnqueueSnapshotsAgentTemplate(t *testing.T) {
 	}
 }
 
+func TestMailboxEnqueueAppliesTemplateOverride(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+	// The agent carries its own template; a --recipe override should win over it
+	// in the enqueued payload without rebinding the agent's identity.
+	if err := store.UpsertAgentTemplate(ctx, db.AgentTemplate{
+		ID:             "agent-own",
+		Name:           "Agent Own",
+		SourceRepo:     "jerryfane/gitmoot",
+		SourceRef:      "main",
+		ResolvedCommit: "own123",
+		Content:        "Agent's own prompt.",
+	}); err != nil {
+		t.Fatalf("UpsertAgentTemplate own returned error: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:         "planner",
+		Role:         "coordinator",
+		Runtime:      "codex",
+		RuntimeRef:   "last",
+		RepoScope:    "jerryfane/gitmoot",
+		TemplateID:   "agent-own",
+		Capabilities: []string{"ask"},
+	}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+
+	override := db.AgentTemplate{
+		ID:             "review-panel",
+		Name:           "Review Panel",
+		SourceRepo:     "jerryfane/gitmoot",
+		SourceRef:      "main",
+		ResolvedCommit: "recipe456",
+		Content:        "Recipe prompt.",
+	}
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID:               "job-override",
+		Agent:            "planner",
+		Action:           "ask",
+		Repo:             "jerryfane/gitmoot",
+		TemplateOverride: &override,
+	}); err != nil {
+		t.Fatalf("Enqueue with override returned error: %v", err)
+	}
+	stored, err := store.GetJob(ctx, "job-override")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	payload, err := unmarshalPayload(stored.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	if payload.TemplateID != "review-panel" || payload.TemplateResolvedCommit != "recipe456" || payload.TemplateContent != "Recipe prompt." {
+		t.Fatalf("override payload template snapshot = %+v, want the recipe override", payload)
+	}
+
+	// Without an override the agent's own template still wins.
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID:     "job-no-override",
+		Agent:  "planner",
+		Action: "ask",
+		Repo:   "jerryfane/gitmoot",
+	}); err != nil {
+		t.Fatalf("Enqueue without override returned error: %v", err)
+	}
+	baselineJob, err := store.GetJob(ctx, "job-no-override")
+	if err != nil {
+		t.Fatalf("GetJob baseline returned error: %v", err)
+	}
+	baseline, err := unmarshalPayload(baselineJob.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload baseline returned error: %v", err)
+	}
+	if baseline.TemplateID != "agent-own" || baseline.TemplateContent != "Agent's own prompt." {
+		t.Fatalf("baseline payload template snapshot = %+v, want the agent's own template", baseline)
+	}
+}
+
 func TestMailboxRunIncludesTemplateSnapshotInPrompt(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)

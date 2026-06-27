@@ -46,6 +46,11 @@ type JobRequest struct {
 	Sender                 string
 	Instructions           string
 	Constraints            []string
+	// TemplateOverride, when non-nil, replaces the agent's own template snapshot
+	// for this job only (the agent's identity is unchanged). Used by the
+	// orchestrate/run --recipe flag to route a coordinator to a built-in recipe
+	// template's prompt without rebinding the agent.
+	TemplateOverride       *db.AgentTemplate
 	ParentJobID            string
 	DelegationID           string
 	DelegationDepth        int
@@ -147,6 +152,11 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 	snapshot, err := m.templateSnapshot(ctx, request.Agent)
 	if err != nil {
 		return db.Job{}, err
+	}
+	// A --recipe override swaps in the recipe template's content while leaving the
+	// agent's identity untouched; the snapshot fields below then carry it.
+	if request.TemplateOverride != nil {
+		snapshot = *request.TemplateOverride
 	}
 
 	payload, err := marshalPayload(JobPayload{
