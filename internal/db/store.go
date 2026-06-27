@@ -4689,6 +4689,31 @@ func (s *Store) DeleteResourceLocksByOwner(ctx context.Context, ownerJobID strin
 	return result.RowsAffected()
 }
 
+// DeleteResourceLocksByOwnerIfNotRunning releases an owner's resource locks
+// only while that owner job is not currently running, evaluated atomically in
+// the DELETE itself. This mirrors DeleteExpiredResourceLocks's
+// `NOT EXISTS (... jobs.state='running')` guard and closes the TOCTOU race in
+// the delegation-kill cleanup path (#479): a child that raced queued->running
+// after a stale snapshot was read keeps its live runtime-session / checkout
+// lock instead of having it deleted out from under its in-flight process.
+func (s *Store) DeleteResourceLocksByOwnerIfNotRunning(ctx context.Context, ownerJobID string) (int64, error) {
+	ownerJobID = strings.TrimSpace(ownerJobID)
+	if ownerJobID == "" {
+		return 0, nil
+	}
+	result, err := s.db.ExecContext(ctx, `DELETE FROM resource_locks
+		WHERE owner_job_id = ?
+			AND NOT EXISTS (
+				SELECT 1 FROM jobs
+				WHERE jobs.id = resource_locks.owner_job_id
+					AND jobs.state = 'running'
+			)`, ownerJobID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 func (s *Store) DeleteExpiredResourceLocks(ctx context.Context, now time.Time) (int64, error) {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM resource_locks
 		WHERE expires_at <= ?

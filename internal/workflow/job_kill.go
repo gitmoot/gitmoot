@@ -89,28 +89,33 @@ func KillDelegationTree(ctx context.Context, store *db.Store, jobID string) (db.
 					}
 				}
 			}
-			// (#479) Release any resource/branch locks this tree job owns, using the
-			// same owner-scoped call CancelJob uses, but ONLY for jobs that are not
-			// still running. Resource locks are job-ID-owned (the runtime-session lock
-			// in internal/cli/runtime_lock.go and the checkout-mutation lock in
-			// checkout_lock.go), so dropping a RUNNING child's lock while its process
-			// is mid-flight would let a competing same-key job (a continuation, or a
-			// foreground `agent ask`/`agent run`) acquire it and run concurrently
-			// against the same runtime session / working tree — risking session or
-			// git-index corruption. The kill is graceful: running children keep
-			// executing and release their own locks via their token-scoped deferred
-			// ReleaseResourceLock when they finish. A just-cancelled queued child still
-			// reads State == queued on this local row (it was transitioned to cancelled
-			// just above), so it is now terminal and its lock is correctly released; the
-			// root and any already-terminal descendants release too — only in-flight
-			// (running) legs are kept.
-			// DeleteResourceLocksByOwner returns 0 on a re-kill, so the lock_released
-			// event is not duplicated. This mirrors CancelJob, which only frees locks
-			// for the job it is STOPPING.
-			if j.State == string(JobRunning) {
-				continue
-			}
-			if released, derr := store.DeleteResourceLocksByOwner(ctx, j.ID); derr == nil && released > 0 {
+			// (#479) Release any resource/branch locks this tree job owns, but ONLY
+			// for jobs that are not still running. Resource locks are job-ID-owned (the
+			// runtime-session lock in internal/cli/runtime_lock.go and the
+			// checkout-mutation lock in checkout_lock.go), so dropping a RUNNING child's
+			// lock while its process is mid-flight would let a competing same-key job (a
+			// continuation, or a foreground `agent ask`/`agent run`) acquire it and run
+			// concurrently against the same runtime session / working tree — risking
+			// session or git-index corruption. The kill is graceful: running children
+			// keep executing and release their own locks via their token-scoped deferred
+			// ReleaseResourceLock when they finish.
+			//
+			// The running-or-not test MUST be evaluated atomically against the CURRENT
+			// job state, not the j.State captured in the ListJobsByRoot snapshot above:
+			// a child selected by an in-flight daemon tick (e.g. the barrier scheduler
+			// built it into `pending` before root_killed committed) can transition
+			// queued->running AFTER its snapshot row was read. Trusting the stale
+			// snapshot state would delete that now-running child's live lock. So we use
+			// DeleteResourceLocksByOwnerIfNotRunning, whose `NOT EXISTS (... state=
+			// 'running')` clause mirrors DeleteExpiredResourceLocks and skips the delete
+			// in the same statement that reads the live state. A just-cancelled queued
+			// child (transitioned to cancelled just above) is terminal, so its lock is
+			// correctly released; the root and any already-terminal descendants release
+			// too — only in-flight (running) legs are kept.
+			// The call returns 0 on a re-kill, so the lock_released event is not
+			// duplicated. This mirrors CancelJob, which only frees locks for the job it
+			// is STOPPING.
+			if released, derr := store.DeleteResourceLocksByOwnerIfNotRunning(ctx, j.ID); derr == nil && released > 0 {
 				_ = store.AddJobEvent(ctx, db.JobEvent{
 					JobID:   j.ID,
 					Kind:    "lock_released",
