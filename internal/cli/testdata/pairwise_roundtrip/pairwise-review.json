@@ -70,8 +70,78 @@
           }
         }
       ],
-      "prompt": "## Task\nTemplate: planner (planner@v1)\nEval run: run-1\nItem: val-2\nTitle: Val item 2\n\n## Item Metadata\n{\n  \"expected_hard\": false,\n  \"expected_soft\": 0.25,\n  \"mock_response\": \"second val\",\n  \"split\": \"val\"\n}\n\n## Baseline Artifact\nArtifact id: baseline\nBaseline plan\n\n\n## Candidate Artifact\nArtifact id: candidate\nCandidate plan\n\n\nUse the current skill to produce the requested improved response. Ground the response in the artifacts and feedback above.",
+      "prompt": "## Task\nTemplate: planner (planner@v1)\nEval run: run-1\nItem: val-2\nTitle: Val item 2\n\n## Item Metadata\n{\n  \"expected_hard\": false,\n  \"expected_soft\": 0.25,\n  \"mock_response\": \"val 2\",\n  \"split\": \"val\"\n}\n\n## Baseline Artifact\nArtifact id: baseline\nBaseline plan\n\n\n## Candidate Artifact\nArtifact id: candidate\nCandidate plan\n\n\nUse the current skill to produce the requested improved response. Ground the response in the artifacts and feedback above.",
       "title": "Val item 2"
+    },
+    {
+      "item_id": "val-3",
+      "outputs": [
+        {
+          "fail_reason": "",
+          "failed": false,
+          "label": "A",
+          "response": "PROMOTED-OUTPUT::val-3",
+          "runtime": {
+            "blocker": "",
+            "n_turns": 1
+          },
+          "target_status": "passed",
+          "token_usage": {
+            "total_tokens": 90
+          }
+        },
+        {
+          "fail_reason": "",
+          "failed": false,
+          "label": "B",
+          "response": "CANDIDATE-OUTPUT::val-3",
+          "runtime": {
+            "blocker": "",
+            "n_turns": 1
+          },
+          "target_status": "passed",
+          "token_usage": {
+            "total_tokens": 100
+          }
+        }
+      ],
+      "prompt": "## Task\nTemplate: planner (planner@v1)\nEval run: run-1\nItem: val-3\nTitle: Val item 3\n\n## Item Metadata\n{\n  \"expected_hard\": false,\n  \"expected_soft\": 0.25,\n  \"mock_response\": \"val 3\",\n  \"split\": \"val\"\n}\n\n## Baseline Artifact\nArtifact id: baseline\nBaseline plan\n\n\n## Candidate Artifact\nArtifact id: candidate\nCandidate plan\n\n\nUse the current skill to produce the requested improved response. Ground the response in the artifacts and feedback above.",
+      "title": "Val item 3"
+    },
+    {
+      "item_id": "val-4",
+      "outputs": [
+        {
+          "fail_reason": "",
+          "failed": false,
+          "label": "A",
+          "response": "PROMOTED-OUTPUT::val-4",
+          "runtime": {
+            "blocker": "",
+            "n_turns": 1
+          },
+          "target_status": "passed",
+          "token_usage": {
+            "total_tokens": 90
+          }
+        },
+        {
+          "fail_reason": "",
+          "failed": false,
+          "label": "B",
+          "response": "CANDIDATE-OUTPUT::val-4",
+          "runtime": {
+            "blocker": "",
+            "n_turns": 1
+          },
+          "target_status": "passed",
+          "token_usage": {
+            "total_tokens": 100
+          }
+        }
+      ],
+      "prompt": "## Task\nTemplate: planner (planner@v1)\nEval run: run-1\nItem: val-4\nTitle: Val item 4\n\n## Item Metadata\n{\n  \"expected_hard\": false,\n  \"expected_soft\": 0.25,\n  \"mock_response\": \"val 4\",\n  \"split\": \"val\"\n}\n\n## Baseline Artifact\nArtifact id: baseline\nBaseline plan\n\n\n## Candidate Artifact\nArtifact id: candidate\nCandidate plan\n\n\nUse the current skill to produce the requested improved response. Ground the response in the artifacts and feedback above.",
+      "title": "Val item 4"
     }
   ],
   "kind": "gitmoot-skillopt-pairwise-review-packet",
@@ -79,7 +149,7 @@
   "run_id": "run-1",
   "summary": {
     "failed_sides": 0,
-    "item_count": 2
+    "item_count": 4
   },
   "template_id": "planner"
 }

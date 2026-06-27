@@ -8,6 +8,14 @@
     {
       "item_id": "val-2",
       "pick": "A"
+    },
+    {
+      "item_id": "val-3",
+      "pick": "A"
+    },
+    {
+      "item_id": "val-4",
+      "pick": "B"
     }
   ],
   "reviewer": "human",

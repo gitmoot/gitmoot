@@ -42,7 +42,13 @@ from pathlib import Path
 
 SEED = 42
 RUN_ID = "run-1"  # comes from the training package's eval_run.id below
-VAL_IDS = ["val-1", "val-2"]
+# Four val items so the fork's per-item placement RNG (seeded from seed+run_id)
+# yields BOTH champion-on-A and champion-on-B items. With seed=42/run-1 the
+# placements are ['B','B','A','A'], so no single hardcoded A/B mapping can satisfy
+# every item — the Go importer is forced to consult the per-item secret map. A
+# two-item fixture happened to be ['B','B'] (degenerate), which a hardcoded
+# importer would pass; see the regen-time guard in generate().
+VAL_IDS = ["val-1", "val-2", "val-3", "val-4"]
 
 
 def _stub_run_batch(*, items, skill_content, out_root, evaluator_config=None,
@@ -81,27 +87,32 @@ def _stub_run_batch(*, items, skill_content, out_root, evaluator_config=None,
 
 
 def _write_training_package(tmp_path: Path):
-    """Build a two-val-item training package using the fork's own test helper."""
+    """Build a four-val-item training package using the fork's own test helper."""
     from tests.test_gitmoot_dataloader import write_training_package
 
     package_path, artifact_root = write_training_package(tmp_path)
     package = json.loads(package_path.read_text(encoding="utf-8"))
-    # The base helper emits one val item (val-1); add a second so the fixture
-    # exercises multiple items (and both unblind directions).
-    package["items"].append(
-        {
-            "id": "val-2",
-            "title": "Val item 2",
-            "baseline_artifact_id": "baseline",
-            "candidate_artifact_id": "candidate",
-            "metadata": {
-                "split": "val",
-                "mock_response": "second val",
-                "expected_hard": False,
-                "expected_soft": 0.25,
-            },
-        }
-    )
+    # The base helper emits one val item (val-1); add three more so the fixture
+    # exercises multiple items AND both A/B placements. The fork seeds its per-item
+    # placement RNG from (seed, run_id), so with seed=42/run-1 the four placements
+    # are ['B','B','A','A'] — i.e. at least one champion-on-A and one champion-on-B
+    # item. That forces the Go importer to consult the per-item secret map: no
+    # single hardcoded "B=champion" mapping can satisfy every item.
+    for n in range(2, len(VAL_IDS) + 1):
+        package["items"].append(
+            {
+                "id": f"val-{n}",
+                "title": f"Val item {n}",
+                "baseline_artifact_id": "baseline",
+                "candidate_artifact_id": "candidate",
+                "metadata": {
+                    "split": "val",
+                    "mock_response": f"val {n}",
+                    "expected_hard": False,
+                    "expected_soft": 0.25,
+                },
+            }
+        )
     package_path.write_text(json.dumps(package), encoding="utf-8")
     return package_path, artifact_root
 
@@ -151,6 +162,20 @@ def generate(fork: Path, out: Path) -> None:
         (out / "pairwise-secret-map.json").write_text(secret_raw, encoding="utf-8")
 
         secret_by_id = {s["item_id"]: s for s in secret["items"]}
+
+        # Guard the load-bearing property of this fixture: it MUST contain BOTH
+        # champion-on-A and champion-on-B items. Otherwise a Go importer that
+        # ignores the per-item secret map and hardcodes a single A/B->role mapping
+        # would still satisfy every assertion, and the round-trip would silently
+        # stop proving per-item secret-map consultation. If a future seed/run_id
+        # ever yields a degenerate single-placement set, fail loudly here rather
+        # than committing a hollow fixture.
+        placements = {s["champion_label"] for s in secret["items"]}
+        assert placements == {"A", "B"}, (
+            "fixture must exercise BOTH A/B placements (champion-on-A AND "
+            f"champion-on-B); got champion_labels={sorted(placements)}. Adjust "
+            "VAL_IDS/SEED/RUN_ID so the fork's placement RNG produces both."
+        )
 
         # Author reviewer picks (A/B labels only) and compute the GROUND-TRUTH
         # expected unblind outcome from the fork's REAL secret map. To exercise

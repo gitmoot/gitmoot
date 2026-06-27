@@ -16,6 +16,20 @@
       "item_id": "val-2",
       "pick": "A",
       "promoted_output": "PROMOTED-OUTPUT::val-2"
+    },
+    {
+      "candidate_output": "CANDIDATE-OUTPUT::val-3",
+      "expected_winner": "champion",
+      "item_id": "val-3",
+      "pick": "A",
+      "promoted_output": "PROMOTED-OUTPUT::val-3"
+    },
+    {
+      "candidate_output": "CANDIDATE-OUTPUT::val-4",
+      "expected_winner": "challenger",
+      "item_id": "val-4",
+      "pick": "B",
+      "promoted_output": "PROMOTED-OUTPUT::val-4"
     }
   ],
   "run_id": "run-1",

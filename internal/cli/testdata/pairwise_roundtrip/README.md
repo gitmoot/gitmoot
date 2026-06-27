@@ -14,6 +14,28 @@ is to catch a contract-shape mismatch between:
 The two were built against an *assumed* shared shape on each side and never run
 as one real round-trip. This fixture closes that gap.
 
+The fixture contains **four** val items. With the fixed seed/run_id the fork's
+per-item A/B placement RNG yields champion-on-**B** for two items and
+champion-on-**A** for the other two. Both placements are required: if every item
+shared one placement, a Go importer that ignored the per-item secret map and
+hardcoded a single `A/B -> role` mapping would still pass every assertion, and
+the round-trip would stop proving per-item secret-map consultation. `regen.py`
+asserts both placements are present so a future seed/run_id change can't silently
+revert to a degenerate single-placement (hollow) fixture.
+
+## CI scope / what this does and does NOT catch
+
+CI runs **Go only** and the JSON here is **committed/frozen** — `regen.py` is
+never run in CI. So the round-trip test validates the *frozen* fork shape (as of
+the last manual regen) against the Go importer. It does **not** automatically
+catch a *new* fork-side shape change that lands without someone re-running
+`regen.py` to refresh this fixture. The one drift axis pinned in CI without a
+regen is the **contract version**:
+`TestSkillOptPairwiseRoundTripContractVersionPinned` asserts the committed
+`contract_version` equals the Go `skillopt.ContractVersion`, so a bump on either
+side that leaves this fixture stale turns the build red. Whenever the fork's wire
+shape changes, re-run `regen.py` (below).
+
 ## Files
 
 | file | origin |
@@ -38,5 +60,6 @@ python3 internal/cli/testdata/pairwise_roundtrip/regen.py
 
 `regen.py` stubs the live rollout, so it runs fully **offline** (no LLM, no
 network) and is deterministic (the fork seeds A/B placement from a fixed
-seed + run_id). CI never runs `regen.py`: the committed fixture means the Go
+seed + run_id). It also asserts the regenerated fixture exercises both A/B
+placements. CI never runs `regen.py`: the committed fixture means the Go
 round-trip test runs with Go only, no Python required.

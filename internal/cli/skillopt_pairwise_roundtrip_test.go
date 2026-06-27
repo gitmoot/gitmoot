@@ -12,6 +12,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/artifact"
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/skillopt"
 )
 
 // Cross-repo pairwise round-trip E2E (#507/#508).
@@ -32,6 +33,16 @@ import (
 // parser silently gets zero values, the unblind cannot resolve, items are
 // skipped, the import exits non-zero, and these assertions FAIL — which is
 // exactly the contract-shape mismatch this E2E exists to catch.
+//
+// SCOPE / what this does NOT catch: CI runs Go only and the fixture JSON is
+// committed/frozen — `regen.py` is never run in CI. So this E2E validates the
+// FROZEN fork-shape (as of the last manual regen) against the Go importer; it
+// does NOT automatically catch a NEW fork-side shape change that lands without a
+// regen of this fixture. The one drift axis we DO pin in CI without a regen is
+// the contract version: TestSkillOptPairwiseRoundTripContractVersionPinned
+// asserts the committed fixture's contract_version equals skillopt.ContractVersion,
+// so a contract bump on either side that leaves the fixture stale turns red.
+// When the fork's wire shape changes, re-run regen.py (see the testdata README).
 
 const pairwiseRoundTripFixtureDir = "testdata/pairwise_roundtrip"
 
@@ -247,5 +258,36 @@ func TestSkillOptPairwiseRoundTripDetectsShapeDrift(t *testing.T) {
 	}
 	if len(events) != 0 {
 		t.Fatalf("shape-drifted import persisted %d events, want 0", len(events))
+	}
+}
+
+// TestSkillOptPairwiseRoundTripContractVersionPinned pins the ONE drift axis this
+// Go-only, frozen-fixture E2E can guard in CI without re-running regen.py: the
+// contract version. CI never executes the fork's regen.py, so if the fork (or the
+// Go side) bumps the contract version and this committed fixture is NOT
+// regenerated, the round-trip would otherwise stay green against a stale shape.
+// Asserting the committed packet/secret-map contract_version equals the Go
+// skillopt.ContractVersion constant turns that staleness red: a bump on either
+// side without a matching regen of this fixture fails here. (The fork emits these
+// integers; this is a real fork->Go value, not a hand-authored Go assumption.)
+func TestSkillOptPairwiseRoundTripContractVersionPinned(t *testing.T) {
+	type versioned struct {
+		ContractVersion int `json:"contract_version"`
+	}
+	for _, name := range []string{pairwisePacketFileName, pairwiseSecretMapFileName} {
+		data, err := os.ReadFile(filepath.Join(pairwiseRoundTripFixtureDir, name))
+		if err != nil {
+			t.Fatalf("read fixture %s: %v", name, err)
+		}
+		var v versioned
+		if err := json.Unmarshal(data, &v); err != nil {
+			t.Fatalf("decode %s: %v", name, err)
+		}
+		if v.ContractVersion != skillopt.ContractVersion {
+			t.Fatalf("fixture %s contract_version = %d, want %d (skillopt.ContractVersion); "+
+				"a contract bump without re-running regen.py left this fixture stale — "+
+				"regenerate it (see testdata/pairwise_roundtrip/README.md)",
+				name, v.ContractVersion, skillopt.ContractVersion)
+		}
 	}
 }
