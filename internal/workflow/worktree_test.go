@@ -658,6 +658,8 @@ type fakeWorktreeManager struct {
 	detachedCalls    []worktreeCall // AddDetachedWorktree: path in .path, ref in .base
 	removedForce     []string       // RemoveWorktreeForce paths
 	removeErr        error
+	deletedBranches  []string // DeleteBranch branches
+	deleteErr        error
 	mergeCalls       []mergeCall // MergeBranches calls
 	mergeErr         error
 	committedDirs    []string // CommitWorktree dirs
@@ -717,6 +719,11 @@ func (f *fakeWorktreeManager) CommitWorktree(_ context.Context, dir string, _ st
 func (f *fakeWorktreeManager) RemoveWorktreeForce(_ context.Context, path string) error {
 	f.removedForce = append(f.removedForce, path)
 	return f.removeErr
+}
+
+func (f *fakeWorktreeManager) DeleteBranch(_ context.Context, branch string) error {
+	f.deletedBranches = append(f.deletedBranches, branch)
+	return f.deleteErr
 }
 
 func TestTaskWorktreePathSegmentSanitizesSlashedIDs(t *testing.T) {
