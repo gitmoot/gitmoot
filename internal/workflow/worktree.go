@@ -501,17 +501,24 @@ func (e Engine) cleanupImplementDelegationWorktree(ctx context.Context, jobID st
 	opCtx := context.WithoutCancel(ctx)
 	path := strings.TrimSpace(payload.WorktreePath)
 	branch := strings.TrimSpace(payload.Branch)
-	// Idempotency: if the worktree dir is already gone AND the branch is already
-	// gone (prior advance cleaned it), do nothing (no lock, no spurious event).
+	// Idempotency: short-circuit (no lock, no spurious event) once there is nothing
+	// left to do. The pending work is (a) removing the worktree if it still exists
+	// and (b) deleting the branch if a BranchDeleter is wired and the branch is not
+	// already gone. A branch delete can only be pending when BOTH a deleter and a
+	// checker are available: without a checker we cannot prove the branch survived,
+	// so a `git branch -D` on every re-advance would error on a missing branch and
+	// emit a spurious cleanup_failed event. In that case (and when no deleter
+	// exists at all) treat an already-removed worktree as sufficient.
 	_, statErr := os.Stat(path)
 	worktreeGone := os.IsNotExist(statErr)
-	branchGone := false
+	branchKnownGone := false
 	if checker != nil {
 		if exists, err := checker.BranchExists(opCtx, branch); err == nil {
-			branchGone = !exists
+			branchKnownGone = !exists
 		}
 	}
-	if worktreeGone && branchGone {
+	branchCleanupPending := deleter != nil && checker != nil && !branchKnownGone
+	if worktreeGone && !branchCleanupPending {
 		return
 	}
 	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(opCtx, e.Store, e.DelegationCheckout, "worktree-cleanup:"+jobID, time.Now().UTC())
@@ -530,18 +537,40 @@ func (e Engine) cleanupImplementDelegationWorktree(ctx context.Context, jobID st
 			return
 		}
 	}
-	if deleter != nil && !branchGone {
+	branchDeleted := false
+	if deleter != nil && !branchKnownGone {
 		if err := deleter.DeleteBranch(opCtx, branch); err != nil {
 			_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_cleanup_failed", Message: fmt.Sprintf("implement branch %s delete failed: %v", branch, err)})
 			return
 		}
+		branchDeleted = true
 	}
-	_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_removed", Message: fmt.Sprintf("implement worktree %s and branch %s removed", path, branch)})
+	// Only claim the branch was removed when a delete actually occurred this pass
+	// (or the checker confirmed it already gone). With no BranchDeleter the branch
+	// is intentionally kept, so the event must not say it was removed.
+	message := fmt.Sprintf("implement worktree %s removed", path)
+	if branchDeleted || branchKnownGone {
+		message = fmt.Sprintf("implement worktree %s and branch %s removed", path, branch)
+	}
+	_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_removed", Message: message})
 }
 
-// implementLegBranchMayBeMerged reports whether some sibling delegation lists
-// this leg's delegation id in its Deps, meaning a dependent integration step
-// (#332) may still merge the leg's branch. It reads the parent's result.
+// implementLegBranchMayBeMerged reports whether a succeeded implement leg's
+// branch must be PRESERVED because a dependent integration step (#332) may still
+// merge it. A sibling delegation that lists this leg in its Deps consumes the
+// leg's branch (integrationDepBranches requires the leg JobSucceeded), but only
+// until that consumer reaches a terminal state: once every consumer is terminal
+// the merge has already run (or failed terminally) and the branch can be torn
+// down (#478). cleanupConsumedImplementLegWorktrees re-fires this leg's cleanup
+// from the consumer's terminal advance so an integration-fed leg is reclaimed
+// rather than accumulating forever.
+//
+// Cleanup is DESTRUCTIVE (git branch -D + force worktree removal), so on any
+// uncertainty it fails safe by returning true (preserve): a missing/unreadable
+// parent result, a not-yet-dispatched consumer, or an inability to read consumer
+// job states all mean "cannot prove the branch is unneeded". It returns false
+// (safe to clean) only when the parent result was read AND either no sibling
+// lists this leg in its Deps or every such consumer is terminal.
 func (e Engine) implementLegBranchMayBeMerged(ctx context.Context, payload JobPayload) bool {
 	parentID := strings.TrimSpace(payload.ParentJobID)
 	if parentID == "" {
@@ -549,16 +578,65 @@ func (e Engine) implementLegBranchMayBeMerged(ctx context.Context, payload JobPa
 	}
 	_, parentPayload, err := e.jobPayload(ctx, parentID)
 	if err != nil || parentPayload.Result == nil {
-		return false // best-effort; don't block cleanup on a fetch error
+		return true // cannot determine -> preserve (destructive op fails safe)
 	}
+	legID := strings.TrimSpace(payload.DelegationID)
+	var consumerIDs []string
 	for _, sib := range parentPayload.Result.Delegations {
 		for _, dep := range sib.Deps {
-			if strings.TrimSpace(dep) == strings.TrimSpace(payload.DelegationID) {
-				return true
+			if strings.TrimSpace(dep) == legID {
+				consumerIDs = append(consumerIDs, strings.TrimSpace(sib.ID))
+				break
 			}
 		}
 	}
-	return false
+	if len(consumerIDs) == 0 {
+		return false // no integration consumer -> always safe to clean
+	}
+	children, err := e.childDelegationJobs(ctx, parentID)
+	if err != nil {
+		return true // cannot read consumer job states -> preserve
+	}
+	for _, consumerID := range consumerIDs {
+		consumer, ok := children[consumerID]
+		if !ok || !isTerminalJobState(consumer.State) {
+			return true // consumer not yet dispatched or still running -> preserve
+		}
+	}
+	return false // every consumer is terminal: the merge is done -> clean the leg
+}
+
+// cleanupConsumedImplementLegWorktrees tears down the per-delegation worktrees
+// and branches of the implement legs that THIS now-terminal integration step
+// consumed via its Deps (#332/#478). A leg's own terminal advance preserves its
+// branch while a consumer is still pending/running (implementLegBranchMayBeMerged),
+// and the merge gate only cleans the task worktree, so without this nothing would
+// ever reclaim an integration-fed leg and its gitmoot-delegation-* branch and
+// worktree would accumulate forever after the tree finished. It re-runs each
+// leg's cleanup, whose #332 guard now observes this consumer terminal and (absent
+// another live consumer) proceeds. Best-effort and idempotent: a no-op for a job
+// with no parent/deps and for already-cleaned legs.
+func (e Engine) cleanupConsumedImplementLegWorktrees(ctx context.Context, payload JobPayload) {
+	parentID := strings.TrimSpace(payload.ParentJobID)
+	deps := compactStrings(payload.Deps)
+	if parentID == "" || len(deps) == 0 {
+		return
+	}
+	children, err := e.childDelegationJobs(ctx, parentID)
+	if err != nil {
+		return
+	}
+	for _, dep := range deps {
+		legJob, ok := children[strings.TrimSpace(dep)]
+		if !ok {
+			continue
+		}
+		legPayload, err := unmarshalPayload(legJob.Payload)
+		if err != nil {
+			continue
+		}
+		e.cleanupImplementDelegationWorktree(ctx, legJob.ID, legJob.Type, legPayload)
+	}
 }
 
 func addTaskWorktree(ctx context.Context, manager WorktreeManager, branch string, path string, base string) error {

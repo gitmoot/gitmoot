@@ -841,6 +841,14 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 	// cleaned ones. Skips succeeded legs still feeding a pending integration (#332).
 	defer e.cleanupImplementDelegationWorktree(ctx, jobID, job.Type, payload)
 
+	// When an integration step (#332) that consumed implement legs via its Deps
+	// reaches a terminal state, tear down those consumed legs' worktrees+branches:
+	// each leg's own terminal advance preserved its branch while this consumer was
+	// still pending/running, and nothing else ever reclaims an integration-fed leg
+	// (the merge gate cleans only the task worktree), so they would otherwise
+	// accumulate forever (#478). No-op for a job with no parent/deps.
+	defer e.cleanupConsumedImplementLegWorktrees(ctx, payload)
+
 	// Commit a succeeded implement leg's work to its own branch BEFORE advancing
 	// the parent's delegation DAG. The parent advance below may enqueue a dependent
 	// that integrates this leg (#332); if the commit ran later (in the switch), the
