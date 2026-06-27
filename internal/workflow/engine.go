@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -1435,6 +1436,33 @@ const MaxDelegationDepth = 8
 // refuses further children and records a delegation_budget_exceeded event.
 const MaxDelegationTotalJobs = 64
 
+// envIntOr returns the POSITIVE integer value of env var name, else def.
+func envIntOr(name string, def int) int {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+// effectiveMaxDelegationDepth / effectiveMaxDelegationTotalJobs let a deployment
+// whose coordinator legitimately runs LONG continuation chains (e.g. a council
+// coordinator that drives 6 rounds plus up to 4 fix cycles — each round and each
+// fix-cycle continuation increments DelegationDepth, so the default 8 is exhausted
+// after ~1 fix cycle) raise the bounds via env, WITHOUT weakening the safe default
+// for every other gitmoot user. The other backstops (width, wall-clock, token/cost
+// budgets) still bound runaway recursion. Env (positive ints):
+//
+//	GITMOOT_MAX_DELEGATION_DEPTH       (default MaxDelegationDepth = 8)
+//	GITMOOT_MAX_DELEGATION_TOTAL_JOBS  (default MaxDelegationTotalJobs = 64)
+func effectiveMaxDelegationDepth() int {
+	return envIntOr("GITMOOT_MAX_DELEGATION_DEPTH", MaxDelegationDepth)
+}
+func effectiveMaxDelegationTotalJobs() int {
+	return envIntOr("GITMOOT_MAX_DELEGATION_TOTAL_JOBS", MaxDelegationTotalJobs)
+}
+
 // MaxDelegationWidth bounds how many delegations a single coordinator result may
 // fan out in one generation. The total-jobs budget is checked before a batch is
 // dispatched, so it cannot stop one enormous fan-out on its own; this caps the
@@ -1669,26 +1697,28 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 		return e.enqueueFinalizeContinuation(ctx, job, payload, "delegation tree killed by operator")
 	}
 
-	if payload.DelegationDepth >= MaxDelegationDepth {
+	maxDepth := effectiveMaxDelegationDepth()
+	if payload.DelegationDepth >= maxDepth {
 		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    "delegation_depth_exceeded",
-			Message: fmt.Sprintf("delegation depth %d reached the limit of %d; not dispatching %d delegation(s)", payload.DelegationDepth, MaxDelegationDepth, len(payload.Result.Delegations)),
+			Message: fmt.Sprintf("delegation depth %d reached the limit of %d; not dispatching %d delegation(s)", payload.DelegationDepth, maxDepth, len(payload.Result.Delegations)),
 		})
-		return e.enqueueFinalizeContinuation(ctx, job, payload, fmt.Sprintf("delegation depth limit of %d reached", MaxDelegationDepth))
+		return e.enqueueFinalizeContinuation(ctx, job, payload, fmt.Sprintf("delegation depth limit of %d reached", maxDepth))
 	}
 
 	total, err := e.countRootDelegationJobs(ctx, rootID)
 	if err != nil {
 		return err
 	}
-	if total >= MaxDelegationTotalJobs {
+	maxJobs := effectiveMaxDelegationTotalJobs()
+	if total >= maxJobs {
 		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    "delegation_budget_exceeded",
-			Message: fmt.Sprintf("delegation tree for root %s reached the job budget of %d (%d jobs); not dispatching %d delegation(s)", rootID, MaxDelegationTotalJobs, total, len(payload.Result.Delegations)),
+			Message: fmt.Sprintf("delegation tree for root %s reached the job budget of %d (%d jobs); not dispatching %d delegation(s)", rootID, maxJobs, total, len(payload.Result.Delegations)),
 		})
-		return e.enqueueFinalizeContinuation(ctx, job, payload, fmt.Sprintf("per-root job budget of %d reached", MaxDelegationTotalJobs))
+		return e.enqueueFinalizeContinuation(ctx, job, payload, fmt.Sprintf("per-root job budget of %d reached", maxJobs))
 	}
 
 	if exceeded, elapsed := e.rootWallClockExceeded(ctx, rootID); exceeded {
