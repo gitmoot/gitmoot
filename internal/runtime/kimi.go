@@ -74,7 +74,14 @@ func (a KimiAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result,
 	if model != "" {
 		args = append(args, "--model", model)
 	}
-	args = append(args, "-S", agent.RuntimeRef, "-p", job.Prompt, "--output-format", "stream-json")
+	// Kimi Code sessions are DIRECTORY-SCOPED, and Gitmoot runs each job in its own
+	// worktree, so resuming a session created elsewhere fails ("Session ... was created
+	// under a different directory"). Gitmoot jobs are independent (the full context is in
+	// job.Prompt), so start a FRESH session per job (no -S). This works in any worktree
+	// and keeps Kimi a native runtime seat. agent.RuntimeRef stays validated but is not
+	// used to resume across directories.
+	_ = agent.RuntimeRef
+	args = append(args, "-p", job.Prompt, "--output-format", "stream-json")
 	result, err := a.runner().Run(ctx, a.Dir, "kimi", args...)
 	if err != nil {
 		return Result{Raw: result.Stdout + result.Stderr}, kimiCommandError(result, err)

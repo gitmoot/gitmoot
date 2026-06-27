@@ -1243,7 +1243,7 @@ func TestKimiStartFallsBackToGeneratedRefWhenSessionIDMissing(t *testing.T) {
 	}
 }
 
-func TestKimiDeliverCommandResumesSession(t *testing.T) {
+func TestKimiDeliverCommandStartsFreshSession(t *testing.T) {
 	stdout := `{"role":"assistant","content":"done"}` + "\n" +
 		`{"role":"meta","type":"session.resume_hint","session_id":"session_550e8400-e29b-41d4-a716-446655440001","command":"kimi -r session_550e8400-e29b-41d4-a716-446655440001","content":"To resume this session: kimi -r session_550e8400-e29b-41d4-a716-446655440001"}` + "\n"
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
@@ -1260,7 +1260,7 @@ func TestKimiDeliverCommandResumesSession(t *testing.T) {
 	if result.Raw != "done" {
 		t.Fatalf("raw = %q", result.Raw)
 	}
-	runner.want(t, 0, "kimi", "-S", "session_550e8400-e29b-41d4-a716-446655440001", "-p", "review", "--output-format", "stream-json")
+	runner.want(t, 0, "kimi", "-p", "review", "--output-format", "stream-json")
 }
 
 func TestKimiDeliverCommandUsesJobModel(t *testing.T) {
@@ -1272,7 +1272,7 @@ func TestKimiDeliverCommandUsesJobModel(t *testing.T) {
 	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review", Model: "opus"}); err != nil {
 		t.Fatalf("Deliver returned error: %v", err)
 	}
-	runner.want(t, 0, "kimi", "--model", "opus", "-S", "session_550e8400-e29b-41d4-a716-446655440001", "-p", "review", "--output-format", "stream-json")
+	runner.want(t, 0, "kimi", "--model", "opus", "-p", "review", "--output-format", "stream-json")
 }
 
 func TestKimiDeliverCommandFallsBackToAgentModel(t *testing.T) {
@@ -1284,7 +1284,7 @@ func TestKimiDeliverCommandFallsBackToAgentModel(t *testing.T) {
 	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err != nil {
 		t.Fatalf("Deliver returned error: %v", err)
 	}
-	runner.want(t, 0, "kimi", "--model", "sonnet", "-S", "session_550e8400-e29b-41d4-a716-446655440001", "-p", "review", "--output-format", "stream-json")
+	runner.want(t, 0, "kimi", "--model", "sonnet", "-p", "review", "--output-format", "stream-json")
 }
 
 func TestKimiStartCommandUsesAgentModel(t *testing.T) {
@@ -1304,7 +1304,7 @@ func TestKimiStartCommandUsesAgentModel(t *testing.T) {
 	runner.want(t, 0, "kimi", "--model", "opus", "-p", "initialize", "--output-format", "stream-json")
 }
 
-func TestKimiHealthUsesRegisteredSession(t *testing.T) {
+func TestKimiHealthRunsFreshSession(t *testing.T) {
 	stdout := `{"role":"assistant","content":"OK"}` + "\n" +
 		`{"role":"meta","type":"session.resume_hint","session_id":"session_550e8400-e29b-41d4-a716-446655440002","command":"kimi -r session_550e8400-e29b-41d4-a716-446655440002","content":"To resume this session: kimi -r session_550e8400-e29b-41d4-a716-446655440002"}` + "\n"
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
@@ -1314,7 +1314,7 @@ func TestKimiHealthUsesRegisteredSession(t *testing.T) {
 	if err := adapter.Health(context.Background(), agent); err != nil {
 		t.Fatalf("Health returned error: %v", err)
 	}
-	runner.want(t, 0, "kimi", "-S", "session_550e8400-e29b-41d4-a716-446655440002", "-p", KimiLiveCheckPrompt, "--output-format", "stream-json")
+	runner.want(t, 0, "kimi", "-p", KimiLiveCheckPrompt, "--output-format", "stream-json")
 }
 
 func TestKimiHealthClassifiesAuthFailure(t *testing.T) {
@@ -1345,5 +1345,5 @@ func TestKimiHealthRejectsBrokenSession(t *testing.T) {
 	if err := adapter.Health(context.Background(), agent); err == nil {
 		t.Fatal("Health accepted broken Kimi session")
 	}
-	runner.want(t, 0, "kimi", "-S", "session_550e8400-e29b-41d4-a716-446655440002", "-p", KimiLiveCheckPrompt, "--output-format", "stream-json")
+	runner.want(t, 0, "kimi", "-p", KimiLiveCheckPrompt, "--output-format", "stream-json")
 }
