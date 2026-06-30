@@ -98,6 +98,31 @@ func TestPickCrossFamilyReviewerEphemeralFallback(t *testing.T) {
 	}
 }
 
+// TestPickCrossFamilyReviewerKimiCLINormalizesToKimiFamily (#546): the opt-in
+// legacy kimi-cli runtime is the SAME family as kimi. A kimi-cli IMPLEMENTER must
+// (a) still get a cross-family review — claude via the rotation — not silently
+// skip, and (b) NOT be cross-family-reviewed by a kimi agent (same family).
+func TestPickCrossFamilyReviewerKimiCLINormalizesToKimiFamily(t *testing.T) {
+	// (a) kimi-cli implementer, only claude authed -> cross-family ephemeral claude.
+	r, ok, err := PickCrossFamilyReviewer(context.Background(), stubAgentLister{}, runtime.KimiCLIRuntime, "owner/repo", map[string]bool{runtime.ClaudeRuntime: true})
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if !ok || r.SelfFamily || r.Runtime != runtime.ClaudeRuntime {
+		t.Fatalf("kimi-cli implementer must get a cross-family claude reviewer, got ok=%v self=%v runtime=%q", ok, r.SelfFamily, r.Runtime)
+	}
+	// (b) a registered kimi agent is SAME family as a kimi-cli implementer: it must
+	// be tagged SelfFamily, not treated as a different-family cross reviewer.
+	store := reviewListerGrant("owner/repo", db.Agent{Name: "kimi-rev", Runtime: runtime.KimiRuntime, Capabilities: []string{"review"}})
+	r2, ok2, err2 := PickCrossFamilyReviewer(context.Background(), store, runtime.KimiCLIRuntime, "owner/repo", nil)
+	if err2 != nil {
+		t.Fatalf("error: %v", err2)
+	}
+	if !ok2 || !r2.SelfFamily {
+		t.Fatalf("a kimi reviewer for a kimi-cli implementer must be SAME-family (SelfFamily=true), got ok=%v self=%v", ok2, r2.SelfFamily)
+	}
+}
+
 // TestPickCrossFamilyReviewerSameFamilyFallbackWithWarning (REFINEMENT #1): when
 // NO different family is available (no different-family agent, rotation target NOT
 // authed) but the implementer's own family IS authed, fall back to a SAME-family

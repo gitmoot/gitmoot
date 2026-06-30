@@ -59,6 +59,20 @@ var crossFamilyRotation = map[string]string{
 	runtime.KimiRuntime:   runtime.ClaudeRuntime,
 }
 
+// reviewerFamily collapses a runtime to its model FAMILY for cross-family
+// comparisons. The opt-in legacy kimi-cli runtime (#546) is the SAME model family
+// as kimi, so it must normalize to kimi here: otherwise a kimi-cli IMPLEMENTER
+// would miss the rotation lookup and silently skip cross-family review/jury, and a
+// kimi reviewer would be wrongly treated as a DIFFERENT family from a kimi-cli
+// implementer. All other runtimes are their own family.
+func reviewerFamily(runtimeName string) string {
+	r := strings.TrimSpace(runtimeName)
+	if strings.EqualFold(r, runtime.KimiCLIRuntime) {
+		return runtime.KimiRuntime
+	}
+	return r
+}
+
 // reviewCapability is the capability a registered agent must declare to be picked
 // as a cross-family reviewer.
 const reviewCapability = "review"
@@ -121,7 +135,8 @@ func PickCrossFamilyReviewer(ctx context.Context, store AgentLister, implementer
 // possibly-same-family review is never emitted by accident.
 func pickCrossFamilyReviewer(ctx context.Context, store AgentLister, implementerRuntime string, repo string, authedRuntimes map[string]bool) (CrossFamilyReviewer, bool, error) {
 	implementerRuntime = strings.TrimSpace(implementerRuntime)
-	if _, known := crossFamilyRotation[implementerRuntime]; !known {
+	family := reviewerFamily(implementerRuntime)
+	if _, known := crossFamilyRotation[family]; !known {
 		// Unknown/unrecoverable implementer family: skip rather than guess and risk a
 		// silent same-family review (#469 risk note: SKIP-not-guess).
 		return CrossFamilyReviewer{}, false, nil
@@ -134,7 +149,7 @@ func pickCrossFamilyReviewer(ctx context.Context, store AgentLister, implementer
 
 	// 1. A registered DIFFERENT-family review-capable agent (deterministic by name).
 	for _, agent := range agents {
-		if !strings.EqualFold(agent.Runtime, implementerRuntime) {
+		if !strings.EqualFold(reviewerFamily(agent.Runtime), family) {
 			return CrossFamilyReviewer{
 				Runtime:         strings.TrimSpace(agent.Runtime),
 				RegisteredAgent: agent.Name,
@@ -143,7 +158,7 @@ func pickCrossFamilyReviewer(ctx context.Context, store AgentLister, implementer
 	}
 
 	// 2. An ephemeral DIFFERENT-family leg, but only if that family is authed.
-	if target := crossFamilyRotation[implementerRuntime]; authedRuntimes[target] {
+	if target := crossFamilyRotation[family]; authedRuntimes[target] {
 		return CrossFamilyReviewer{
 			Runtime:   target,
 			Ephemeral: ephemeralReviewerSpec(target),
@@ -154,7 +169,7 @@ func pickCrossFamilyReviewer(ctx context.Context, store AgentLister, implementer
 	//    Prefer a registered same-family review-capable agent, else an ephemeral
 	//    same-family leg — but only if the implementer's own family is authed.
 	for _, agent := range agents {
-		if strings.EqualFold(agent.Runtime, implementerRuntime) {
+		if strings.EqualFold(reviewerFamily(agent.Runtime), family) {
 			return CrossFamilyReviewer{
 				Runtime:         strings.TrimSpace(agent.Runtime),
 				RegisteredAgent: agent.Name,
@@ -211,7 +226,8 @@ var crossFamilyJuryUniverse = []string{
 // is byte-identical to today's single cross-family judge.
 func PickCrossFamilyJury(ctx context.Context, store AgentLister, implementerRuntime string, repo string, authedRuntimes map[string]bool, size int) ([]CrossFamilyReviewer, error) {
 	implementerRuntime = strings.TrimSpace(implementerRuntime)
-	if _, known := crossFamilyRotation[implementerRuntime]; !known {
+	implementerFamily := reviewerFamily(implementerRuntime)
+	if _, known := crossFamilyRotation[implementerFamily]; !known {
 		// Unknown implementer family: skip rather than risk a same-family jury.
 		return nil, nil
 	}
@@ -228,7 +244,7 @@ func PickCrossFamilyJury(ctx context.Context, store AgentLister, implementerRunt
 
 	var jury []CrossFamilyReviewer
 	for _, family := range crossFamilyJuryUniverse {
-		if strings.EqualFold(family, implementerRuntime) {
+		if strings.EqualFold(family, implementerFamily) {
 			// Cross-family ONLY: never include the agent's own family (preference-leakage
 			// guard), which also keeps the panel's families distinct.
 			continue
