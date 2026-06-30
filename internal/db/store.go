@@ -4690,7 +4690,7 @@ func (s *Store) GetHeartbeatState(ctx context.Context, agent, name string) (Hear
 
 // UpsertHeartbeatState writes (or replaces) a heartbeat's full state. Times are
 // stored as RFC3339Nano UTC text (a zero time becomes empty text, mirroring the
-// table's DEFAULT '').
+// table's DEFAULT ”).
 func (s *Store) UpsertHeartbeatState(ctx context.Context, state HeartbeatState) error {
 	state.Agent = strings.TrimSpace(state.Agent)
 	state.Name = strings.TrimSpace(state.Name)
@@ -4974,6 +4974,26 @@ func (s *Store) ListResourceLocks(ctx context.Context) ([]ResourceLock, error) {
 	return locks, rows.Err()
 }
 
+func (s *Store) ListExpiredRuntimeSessionLocks(ctx context.Context, now time.Time) ([]ResourceLock, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT resource_key, owner_job_id, owner_token, owner_pid, owner_hostname, command_hash, acquired_at, updated_at, expires_at
+		FROM resource_locks
+		WHERE resource_key LIKE ? AND expires_at <= ?
+		ORDER BY resource_key`, RuntimeSessionLockKeyPrefix+"%", formatResourceLockTime(now))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var locks []ResourceLock
+	for rows.Next() {
+		var lock ResourceLock
+		if err := rows.Scan(&lock.ResourceKey, &lock.OwnerJobID, &lock.OwnerToken, &lock.OwnerPID, &lock.OwnerHostname, &lock.CommandHash, &lock.AcquiredAt, &lock.UpdatedAt, &lock.ExpiresAt); err != nil {
+			return nil, err
+		}
+		locks = append(locks, lock)
+	}
+	return locks, rows.Err()
+}
+
 func (s *Store) HeartbeatResourceLock(ctx context.Context, resourceKey string, ownerJobID string, ownerToken string, now time.Time, expiresAt time.Time) (bool, error) {
 	result, err := s.db.ExecContext(ctx, `UPDATE resource_locks
 		SET updated_at = ?, expires_at = ?
@@ -5041,8 +5061,7 @@ func (s *Store) DeleteResourceLocksByOwnerIfNotRunning(ctx context.Context, owne
 	return result.RowsAffected()
 }
 
-// DeleteExpiredResourceLocks reaps lock rows whose lease has elapsed, guarding
-// against deleting a lock out from under an owner job that is still 'running'.
+// DeleteExpiredResourceLocks reaps lock rows whose lease has elapsed.
 //
 // The owner_pid<=0 clause keeps the historical conservatism for NON-runtime locks
 // (e.g. skillopt-train-generation): a lock that records a live-process owner PID is
@@ -5052,16 +5071,17 @@ func (s *Store) DeleteResourceLocksByOwnerIfNotRunning(ctx context.Context, owne
 // a daemon restart and must NOT keep an expired lease alive forever. Without this
 // exception an expired runtime-session lock (which always sets owner_pid>0) would
 // NEVER be reaped here — stranding the job's recovery and worktree cleanup (#536
-// finding 2). The not-running guard still protects an actively-running owner.
+// finding 2). Once a runtime lease expires, the daemon may requeue the running
+// owner job from the same recovery tick.
 func (s *Store) DeleteExpiredResourceLocks(ctx context.Context, now time.Time) (int64, error) {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM resource_locks
 		WHERE expires_at <= ?
 			AND (owner_pid <= 0 OR resource_key LIKE 'runtime:%')
-			AND NOT EXISTS (
+			AND (resource_key LIKE 'runtime:%' OR NOT EXISTS (
 				SELECT 1 FROM jobs
 				WHERE jobs.id = resource_locks.owner_job_id
 					AND jobs.state = 'running'
-			)`, formatResourceLockTime(now))
+			))`, formatResourceLockTime(now))
 	if err != nil {
 		return 0, err
 	}
@@ -6588,5 +6608,11 @@ CREATE TABLE heartbeat_state (
 	last_status TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (agent, name)
 );
+	`,
+	// Running-job stale recovery queries `state = running AND updated_at < ?` on
+	// every daemon worker tick. Index only running rows so long-lived databases do
+	// not scan terminal jobs once per second.
+	`
+CREATE INDEX idx_jobs_running_updated_at ON jobs(updated_at) WHERE state = 'running';
 	`,
 }

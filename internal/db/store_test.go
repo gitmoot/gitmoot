@@ -61,6 +61,13 @@ func TestOpenMigratesSchema(t *testing.T) {
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatalf("second Migrate returned error: %v", err)
 	}
+	var indexSQL string
+	if err := store.db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_jobs_running_updated_at'`).Scan(&indexSQL); err != nil {
+		t.Fatalf("running-job partial index missing: %v", err)
+	}
+	if !strings.Contains(indexSQL, "WHERE state = 'running'") {
+		t.Fatalf("running-job index sql = %q, want partial running-only index", indexSQL)
+	}
 }
 
 func TestOpenConfiguresSQLiteContentionPragmas(t *testing.T) {
@@ -1594,7 +1601,36 @@ func TestDeleteExpiredResourceLocksReapsPIDBackedRuntimeLock(t *testing.T) {
 	}
 }
 
-func TestResourceLockDoesNotRecoverExpiredRunningOwner(t *testing.T) {
+func TestListExpiredRuntimeSessionLocks(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	for _, lock := range []ResourceLock{
+		{ResourceKey: "runtime:codex:expired", OwnerJobID: "job-expired", OwnerToken: "token-expired", ExpiresAt: now.Add(-time.Minute).Format(time.RFC3339Nano)},
+		{ResourceKey: "runtime:codex:future", OwnerJobID: "job-future", OwnerToken: "token-future", ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano)},
+		{ResourceKey: "checkout:owner/repo", OwnerJobID: "job-checkout", OwnerToken: "token-checkout", ExpiresAt: now.Add(-time.Minute).Format(time.RFC3339Nano)},
+	} {
+		acquired, err := store.AcquireResourceLock(ctx, lock, now.Add(-2*time.Minute))
+		if err != nil || !acquired {
+			t.Fatalf("AcquireResourceLock(%s) acquired=%v err=%v", lock.ResourceKey, acquired, err)
+		}
+	}
+
+	locks, err := store.ListExpiredRuntimeSessionLocks(ctx, now)
+	if err != nil {
+		t.Fatalf("ListExpiredRuntimeSessionLocks returned error: %v", err)
+	}
+	if len(locks) != 1 || locks[0].ResourceKey != "runtime:codex:expired" || locks[0].OwnerJobID != "job-expired" {
+		t.Fatalf("expired runtime locks = %+v, want only runtime:codex:expired", locks)
+	}
+}
+
+func TestExpiredRuntimeLockReaperCanRecoverRunningOwner(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
@@ -1630,18 +1666,11 @@ func TestResourceLockDoesNotRecoverExpiredRunningOwner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeleteExpiredResourceLocks returned error: %v", err)
 	}
-	if deleted != 0 {
-		t.Fatalf("expired running-owner locks deleted = %d, want 0", deleted)
-	}
-	if err := store.UpdateJobState(ctx, "job-a", "queued"); err != nil {
-		t.Fatalf("UpdateJobState returned error: %v", err)
-	}
-	deleted, err = store.DeleteExpiredResourceLocks(ctx, now.Add(2*time.Minute))
-	if err != nil {
-		t.Fatalf("DeleteExpiredResourceLocks after requeue returned error: %v", err)
-	}
 	if deleted != 1 {
-		t.Fatalf("expired non-running-owner locks deleted = %d, want 1", deleted)
+		t.Fatalf("expired runtime lock with running owner deleted = %d, want 1", deleted)
+	}
+	if _, err := store.GetResourceLock(ctx, "runtime:codex:session-a"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetResourceLock after expired runtime reap = %v, want sql.ErrNoRows", err)
 	}
 }
 

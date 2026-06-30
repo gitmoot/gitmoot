@@ -4918,6 +4918,73 @@ func TestRecoverRunningJobsKeepsRecentRunningJobsOnStartup(t *testing.T) {
 	}
 }
 
+func TestRecoverRunningJobsUsesConfiguredStaleWindow(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("GITMOOT_STALE_RUNNING_AFTER", "2m")
+	store := daemonWorkerStore(t)
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-running", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
+	if err := store.UpdateJobState(ctx, "job-running", string(workflow.JobRunning)); err != nil {
+		t.Fatalf("UpdateJobState returned error: %v", err)
+	}
+	worker := defaultJobWorker(store, io.Discard)
+
+	if err := runDaemonWorkerTick(ctx, store, worker, 0, false, "owner/repo", "", io.Discard, time.Now().UTC().Add(3*time.Minute)); err != nil {
+		t.Fatalf("runDaemonWorkerTick returned error: %v", err)
+	}
+
+	job, err := store.GetJob(ctx, "job-running")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobQueued) {
+		t.Fatalf("job state = %q, want queued", job.State)
+	}
+}
+
+func TestRecoverExpiredRuntimeSessionLocksRequeuesOwnerBeforeGlobalStaleWindow(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-running", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1, JobTimeout: "10m"})
+	if err := store.UpdateJobState(ctx, "job-running", string(workflow.JobRunning)); err != nil {
+		t.Fatalf("UpdateJobState returned error: %v", err)
+	}
+	now := time.Now().UTC()
+	acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+		ResourceKey:   "runtime:codex:session-timeout",
+		OwnerJobID:    "job-running",
+		OwnerToken:    "token-timeout",
+		OwnerPID:      int64(os.Getpid()),
+		OwnerHostname: thisHostname(t),
+		ExpiresAt:     now.Add(10 * time.Minute).Format(time.RFC3339Nano),
+	}, now)
+	if err != nil || !acquired {
+		t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
+	}
+	worker := defaultJobWorker(store, io.Discard)
+
+	if err := runDaemonWorkerTick(ctx, store, worker, 0, false, "owner/repo", "", io.Discard, now.Add(3*time.Minute)); err != nil {
+		t.Fatalf("runDaemonWorkerTick before timeout returned error: %v", err)
+	}
+	job, err := store.GetJob(ctx, "job-running")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobRunning) {
+		t.Fatalf("job state after short wait = %q, want running", job.State)
+	}
+
+	if err := runDaemonWorkerTick(ctx, store, worker, 0, false, "owner/repo", "", io.Discard, now.Add(11*time.Minute)); err != nil {
+		t.Fatalf("runDaemonWorkerTick after timeout returned error: %v", err)
+	}
+	job, err = store.GetJob(ctx, "job-running")
+	if err != nil {
+		t.Fatalf("GetJob after timeout returned error: %v", err)
+	}
+	if job.State != string(workflow.JobQueued) {
+		t.Fatalf("job state after job timeout = %q, want queued", job.State)
+	}
+}
+
 // TestRecoverRunningJobsHonorsLiveRuntimeLease is the #536 regression: a
 // long-running job (e.g. a 4h delegation) holds a runtime-session lock whose LEASE
 // reflects its real job timeout. The coarse `updated_at < before` staleness
@@ -5265,7 +5332,7 @@ func TestDaemonWorkerTickRechecksStaleRunningJobs(t *testing.T) {
 		t.Fatalf("UpdateJobState returned error: %v", err)
 	}
 	worker := defaultJobWorker(store, io.Discard)
-	now := time.Now().UTC().Add(daemonRunningJobStaleAfter + time.Second)
+	now := time.Now().UTC().Add(defaultDaemonRunningJobStaleAfter + time.Second)
 
 	if err := runDaemonWorkerTick(ctx, store, worker, 0, false, "", "", io.Discard, now); err != nil {
 		t.Fatalf("runDaemonWorkerTick returned error: %v", err)
