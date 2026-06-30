@@ -20,6 +20,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/cli/tui"
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/runtime"
 	"github.com/jerryfane/gitmoot/internal/skillopt"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
@@ -458,7 +459,7 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 				Runtime:     instance.Runtime,
 				Repo:        instance.RepoFullName,
 				State:       instance.State,
-				Stale:       dashboardSessionStale(instance.State, instance.ExpiresAt, now),
+				Stale:       runningSessionStale(ctx, store, instance, now),
 				sessionType: instance.Type,
 				role:        instance.Role,
 				templateID:  instance.TemplateID,
@@ -857,12 +858,49 @@ func groupedRuntimeSessions(sessions []dashboardSession) []string {
 	return lines
 }
 
-// dashboardSessionStale reports a phantom "running" runtime session: an
-// agent_instance still at state=running whose lease (expires_at) has elapsed
-// (#505 gap 2). A daemon that dies mid-job never runs its deferred
-// TouchAgentInstance, so the row keeps advertising a session that no longer
-// exists. It reuses the same expiry test as resource_locks; a normal idle row
-// past its lease (the idle GC reclaims it) is deliberately NOT flagged.
+// runningSessionStale reports a phantom "running" runtime session (#505 gap 2)
+// using TWO independent signals, so a daemon that crashed EARLY in a long job —
+// and thus still holds a FUTURE lease — is not mistaken for live:
+//
+//   - lease elapsed (dashboardSessionStale): the deferred TouchAgentInstance never
+//     ran and the lease aged out — the "long after completion" case; and
+//   - the resumable runtime-session lock (runtime:<rt>:<ref>) is no longer held by
+//     a live owner: the daemon that marked the session running has died, so even
+//     WITHIN the lease window the session is dead. This closes the crash-soon-
+//     after-start gap the lease-only check missed (a 1-minute-in crash of a
+//     30-minute job left a ~29-minute future lease and showed as healthy).
+//
+// For a non-resumable runtime / empty ref (no session lock exists) there is no
+// liveness signal, so it falls back to the lease check alone. It never flags a
+// genuinely live session: a running job marks the instance running AFTER acquiring
+// the lock and clears it to idle BEFORE releasing the lock (LIFO defers), so a
+// running row always coincides with a live-owner lock; and any lock-lookup error
+// fails safe to "not stale" rather than mislabeling a live session.
+func runningSessionStale(ctx context.Context, store *db.Store, instance db.AgentInstance, now time.Time) bool {
+	if dashboardSessionStale(instance.State, instance.ExpiresAt, now) {
+		return true
+	}
+	if instance.State != "running" || store == nil {
+		return false
+	}
+	agent := runtime.Agent{Runtime: instance.Runtime, RuntimeRef: instance.RuntimeRef}
+	if _, ok := runtimeSessionResourceKey(agent); !ok {
+		return false // non-resumable / no ref: the lease is the only available signal
+	}
+	held, _, err := runtimeSessionHeldByLiveOwner(ctx, store, agent)
+	if err != nil {
+		return false // never mislabel a live session on a transient lookup error
+	}
+	return !held
+}
+
+// dashboardSessionStale reports a phantom "running" runtime session whose lease
+// (expires_at) has already elapsed (#505 gap 2) — the lease-based half of the
+// signal (see runningSessionStale for the within-lease liveness half). A daemon
+// that dies mid-job never runs its deferred TouchAgentInstance, so the row keeps
+// advertising a session that no longer exists. It reuses the same expiry test as
+// resource_locks; a normal idle row past its lease (the idle GC reclaims it) is
+// deliberately NOT flagged.
 func dashboardSessionStale(state, expiresAt string, now time.Time) bool {
 	return state == "running" && dashboardLockStale(expiresAt, now)
 }

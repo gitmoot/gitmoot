@@ -236,20 +236,11 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	// launched directly (e.g. under `systemd --user`), not only one spawned by
 	// `daemon start` (#505 gap 3), and reconcile any phantom "running" runtime
 	// sessions a previously-crashed daemon left behind (#505 gap 2). Both are
-	// best-effort: a failure here never blocks the daemon from running.
-	if paths, perr := initializedPaths(*home); perr == nil {
-		state := daemonProcessState(paths)
-		workDir, _ := os.Getwd()
-		if registered, regErr := registerDaemonRunState(state, os.Args, workDir); regErr == nil && registered {
-			defer deregisterDaemonRunState(state)
-		}
-		_ = withStore(*home, func(store *db.Store) error {
-			if n, err := store.ReconcileOrphanedRunningInstances(ctx, time.Now().UTC()); err == nil && n > 0 {
-				writeLine(stdout, "reconciled %d orphaned running runtime session(s)", n)
-			}
-			return nil
-		})
-	}
+	// best-effort: a failure here never blocks the daemon from running. The work
+	// lives in daemonRunStartupReconcile so the integration — daemon run actually
+	// self-registers AND reconciles at startup — is exercised by a test, not only
+	// the leaf helpers (a revert of this wiring would otherwise stay green).
+	defer daemonRunStartupReconcile(ctx, *home, os.Args, stdout)()
 
 	if *repoFlag == "" {
 		err := runRegisteredRepoSupervisor(ctx, *home, *poll, *workers, *dryRun, *watchSkillOptReviews, *watchIssues, usePool, session, stdout)
@@ -973,6 +964,37 @@ func writeDaemonState(state daemonState, meta daemonMeta) error {
 	return os.WriteFile(state.MetaFile, append(encoded, '\n'), 0o600)
 }
 
+// daemonRunStartupReconcile performs the two #505 startup steps for a directly
+// launched `daemon run`: it self-registers THIS process's pid/meta so `daemon
+// status` and the dashboard recognize it (gap 3), and it reconciles phantom
+// "running" runtime sessions a previously-crashed daemon left behind (gap 2).
+// Both are best-effort — a failure never blocks the daemon. It returns a cleanup
+// func (never nil) the caller defers: it deregisters this process's state on exit
+// only when this process actually self-registered (so a `daemon start`-spawned
+// child, whose parent already owns the pid, is a no-op). Keeping the logic here —
+// rather than inline in runDaemonRun — lets a test bind the regression to the
+// integration point (status flips to "running", an orphaned row resets to idle),
+// not just the leaf helpers it calls.
+func daemonRunStartupReconcile(ctx context.Context, home string, argv []string, stdout io.Writer) func() {
+	cleanup := func() {}
+	paths, err := initializedPaths(home)
+	if err != nil {
+		return cleanup
+	}
+	state := daemonProcessState(paths)
+	workDir, _ := os.Getwd()
+	if registered, regErr := registerDaemonRunState(state, argv, workDir); regErr == nil && registered {
+		cleanup = func() { deregisterDaemonRunState(state) }
+	}
+	_ = withStore(home, func(store *db.Store) error {
+		if n, err := store.ReconcileOrphanedRunningInstances(ctx, time.Now().UTC()); err == nil && n > 0 {
+			writeLine(stdout, "reconciled %d orphaned running runtime session(s)", n)
+		}
+		return nil
+	})
+	return cleanup
+}
+
 // registerDaemonRunState records THIS process as the running daemon so `daemon
 // status` and the dashboard recognize a `daemon run` launched directly — e.g. as
 // the ExecStart of a `systemd --user` unit — and not only one spawned by `daemon
@@ -1009,16 +1031,23 @@ func registerDaemonRunState(state daemonState, argv []string, workDir string) (o
 	return true, nil
 }
 
-// deregisterDaemonRunState removes the pid/meta written by registerDaemonRunState
-// when the daemon-run process exits, but ONLY when they still point at THIS
-// process — so a daemon that was restarted out from under us (a fresh pid already
-// recorded) never has its live state clobbered on our shutdown.
+// deregisterDaemonRunState clears the running marker written by
+// registerDaemonRunState when the daemon-run process exits, but ONLY when the
+// recorded state still points at THIS process — so a daemon that was restarted out
+// from under us (a fresh pid already recorded) never has its live state clobbered
+// on our shutdown.
+//
+// It removes ONLY the PIDFile, mirroring `daemon stop` (which also leaves the meta
+// in place): currentDaemonPID already treats an absent/dead pid as stopped, so a
+// status check correctly reports "stopped" with the meta retained, and keeping
+// daemon.json preserves `daemon restart`'s recovery of the prior daemon's
+// --repo/--watch-issues/--workers/workdir (readDaemonMeta) that worked on main.
+// Deleting the meta here would silently break that restart path (#505 review).
 func deregisterDaemonRunState(state daemonState) {
 	if meta, err := readDaemonMeta(state); err != nil || meta.PID != os.Getpid() {
 		return
 	}
 	_ = os.Remove(state.PIDFile)
-	_ = os.Remove(state.MetaFile)
 }
 
 func stopDaemonPID(pid int) error {

@@ -13,6 +13,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/cli/style"
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
 func dashboardTestHome(t *testing.T) string {
@@ -507,6 +508,120 @@ func TestDashboardFlagsPhantomRunningSession(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("dashboard output missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// seedAgentInstanceWithLock seeds a state=running agent_instance with a future
+// (within-)lease and a held runtime:<rt>:<ref> session lock owned by ownerPID.
+func seedAgentInstanceWithLock(t *testing.T, home, name, ref string, ownerPID int64) {
+	t.Helper()
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	future := now.Add(29 * time.Minute).Format("2006-01-02T15:04:05.000000000Z")
+	nowStr := now.Format("2006-01-02T15:04:05.000000000Z")
+	if err := store.UpsertAgentInstance(context.Background(), db.AgentInstance{
+		Name:           name,
+		Type:           "researcher",
+		Runtime:        "claude",
+		RuntimeRef:     ref,
+		RepoFullName:   "owner/repo",
+		Role:           "researcher",
+		AutonomyPolicy: "read-only",
+		State:          "running",
+		CreatedAt:      nowStr,
+		LastUsedAt:     nowStr,
+		ExpiresAt:      future,
+	}); err != nil {
+		t.Fatalf("UpsertAgentInstance returned error: %v", err)
+	}
+	key, ok := runtimeSessionResourceKey(runtime.Agent{Runtime: "claude", RuntimeRef: ref})
+	if !ok {
+		t.Fatalf("expected a runtime session key for ref %q", ref)
+	}
+	acquired, err := store.AcquireResourceLock(context.Background(), db.ResourceLock{
+		ResourceKey:   key,
+		OwnerJobID:    "job-" + ref,
+		OwnerToken:    "tok-" + ref,
+		OwnerPID:      ownerPID,
+		OwnerHostname: "", // empty host = treated as this host by the liveness check
+		ExpiresAt:     now.Add(29 * time.Minute).Format(time.RFC3339Nano),
+	}, now)
+	if err != nil || !acquired {
+		t.Fatalf("AcquireResourceLock acquired=%v err=%v", acquired, err)
+	}
+}
+
+// TestRunningSessionStaleWithinLeaseDeadLock is the #505-review regression for the
+// within-lease phantom gap: a daemon that crashes SOON after starting a long job
+// leaves the instance state=running with a FUTURE lease, so the lease-only check
+// treats the dead session as live. The liveness-aware check flags it stale when
+// the held runtime-session lock has no live owner, and leaves a genuinely live
+// (this-process-owned) session alone.
+func TestRunningSessionStaleWithinLeaseDeadLock(t *testing.T) {
+	home := dashboardTestHome(t)
+	seedAgentInstanceWithLock(t, home, "researcher-bg-crashed", "ref-crashed", deadPID(t))
+	seedAgentInstanceWithLock(t, home, "researcher-bg-live", "ref-live", int64(os.Getpid()))
+
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	dead, err := store.GetAgentInstance(ctx, "researcher-bg-crashed")
+	if err != nil {
+		t.Fatalf("GetAgentInstance dead: %v", err)
+	}
+	live, err := store.GetAgentInstance(ctx, "researcher-bg-live")
+	if err != nil {
+		t.Fatalf("GetAgentInstance live: %v", err)
+	}
+
+	// Lease-only signal misses it (future lease) — this is the gap.
+	if dashboardSessionStale(dead.State, dead.ExpiresAt, now) {
+		t.Fatalf("within-lease running session should not be lease-stale")
+	}
+	// Liveness-aware signal flags the dead-owner session...
+	if !runningSessionStale(ctx, store, dead, now) {
+		t.Fatalf("within-lease running session with a dead-owner lock must be stale")
+	}
+	// ...but never a live-owner session.
+	if runningSessionStale(ctx, store, live, now) {
+		t.Fatalf("within-lease running session held by a live owner must not be stale")
+	}
+}
+
+// TestDashboardFlagsWithinLeasePhantomViaDeadLock binds the within-lease liveness
+// fix to the snapshot/render boundary: a running session with a future lease but a
+// dead-owner session lock must render as "(stale)", not as a plainly-live session.
+func TestDashboardFlagsWithinLeasePhantomViaDeadLock(t *testing.T) {
+	home := dashboardTestHome(t)
+	seedAgentInstanceWithLock(t, home, "researcher-bg-crashed", "ref-crashed", deadPID(t))
+
+	paths, err := initializedPaths(home)
+	if err != nil {
+		t.Fatalf("initializedPaths returned error: %v", err)
+	}
+	snap, err := buildDashboardSnapshot(home, paths)
+	if err != nil {
+		t.Fatalf("buildDashboardSnapshot returned error: %v", err)
+	}
+	if len(snap.RuntimeSessions) != 1 || !snap.RuntimeSessions[0].Stale {
+		t.Fatalf("within-lease dead-lock session should be stale: %+v", snap.RuntimeSessions)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"dashboard", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("dashboard exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "(stale)") {
+		t.Fatalf("within-lease phantom not rendered stale:\n%s", stdout.String())
 	}
 }
 
