@@ -1238,6 +1238,85 @@ func TestEngineAdvanceReviewChangesRequestedDispatchesFix(t *testing.T) {
 	}
 }
 
+func TestEngineAdvanceReviewSkipsPullRequestFlowWhenNoPullRequest(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+	// A non-nil merge gate that fails the test if it is ever evaluated: a PR-less
+	// approved review must not route into the merge gate (the daemon wires a real
+	// gate, so this mirrors that configuration).
+	engine.MergeGate = &fakeMergeGate{onEvaluate: func(MergeRequest) {
+		t.Fatalf("merge gate evaluated for a PR-less review; want skip")
+	}}
+	insertCompletedJob(t, store, db.Job{
+		ID:    "review-job",
+		Agent: "audit",
+		Type:  "review",
+	}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		TaskID:    "task-7",
+		TaskTitle: "Workflow Engine",
+		// PullRequest=0 / Branch="" as a review heartbeat enqueues it.
+		Result: &AgentResult{Decision: "changes_requested", Summary: "review stands as a comment"},
+	})
+
+	err := engine.AdvanceJob(ctx, "review-job")
+
+	if err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	// No fix job is dispatched from a context-free review.
+	if _, err := store.GetJob(ctx, "implement-lead-task-7"); err == nil {
+		t.Fatalf("a PR-less review dispatched a fix job; want none")
+	}
+	events, err := store.ListJobEvents(ctx, "review-job")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	for _, event := range events {
+		if event.Kind == "advance_skipped_no_pr" {
+			return
+		}
+	}
+	t.Fatalf("events = %+v, want advance_skipped_no_pr", events)
+}
+
+func TestEngineAdvanceReviewApprovedSkipsMergeGateWhenNoPullRequest(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "audit", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+	engine.MergeGate = &fakeMergeGate{onEvaluate: func(MergeRequest) {
+		t.Fatalf("merge gate evaluated for a PR-less review; want skip")
+	}}
+	insertCompletedJob(t, store, db.Job{
+		ID:    "review-job",
+		Agent: "audit",
+		Type:  "review",
+	}, JobPayload{
+		Repo:      "jerryfane/gitmoot",
+		TaskID:    "task-7",
+		TaskTitle: "Workflow Engine",
+		Result:    &AgentResult{Decision: "approved", Summary: "looks good"},
+	})
+
+	if err := engine.AdvanceJob(ctx, "review-job"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	events, err := store.ListJobEvents(ctx, "review-job")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	for _, event := range events {
+		if event.Kind == "advance_skipped_no_pr" {
+			return
+		}
+	}
+	t.Fatalf("events = %+v, want advance_skipped_no_pr", events)
+}
+
 func TestEngineAdvanceReviewChangesRequestedReplayIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

@@ -1315,6 +1315,16 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 		}
 		return e.HandlePullRequestOpened(ctx, event)
 	case "review":
+		// A PR-less review (e.g. a review heartbeat enqueues Action="review" with
+		// PullRequest=0/Branch="") has no PR-only machinery to route into: a
+		// "changes_requested" decision would call dispatchFix -> leadAgent() ->
+		// GetBranchLock(repo, "") -> ErrNoRows ("lead agent is required"), and an
+		// "approved" decision would runMergeGate against PR #0. Both error every
+		// tick and drop the review outcome. Mirror the implement arm's guard:
+		// treat the delivered review (the agent's comments) as terminal, like ask.
+		if payload.PullRequest <= 0 {
+			return e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_skipped_no_pr", Message: "no pull request is attached; skipping review advancement"})
+		}
 		reviewer := reviewDecisionAgent(job, payload)
 		switch payload.Result.Decision {
 		case "changes_requested":
