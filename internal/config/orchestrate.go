@@ -81,6 +81,16 @@ type OrchestratePolicy struct {
 	// default behavior is unchanged. The daemon wires this into
 	// Engine.MaxVerifyReplanAttempts at startup.
 	MaxVerifyReplanAttempts int
+	// Default*Timeout are optional child delegation job timeout defaults. Empty
+	// strings mean unbounded. Explicit per-delegation timeout values win, then the
+	// phase-specific default, then DefaultDelegationTimeout, then unbounded. These
+	// are ordinary orchestrator defaults; they are not tied to an agent name.
+	DefaultDelegationTimeout string
+	DefaultPlanTimeout       string
+	DefaultImplementTimeout  string
+	DefaultReviewTimeout     string
+	DefaultGateTimeout       string
+	DefaultRepairTimeout     string
 }
 
 // DefaultEscalationTTL is the fallback time a paused-for-human tree may sit
@@ -102,6 +112,12 @@ func DefaultOrchestratePolicy() OrchestratePolicy {
 		EscalationTTL:                  "",
 		MaxDelegationNonProgressStreak: 0,
 		MaxVerifyReplanAttempts:        0,
+		DefaultDelegationTimeout:       "",
+		DefaultPlanTimeout:             "",
+		DefaultImplementTimeout:        "",
+		DefaultReviewTimeout:           "",
+		DefaultGateTimeout:             "",
+		DefaultRepairTimeout:           "",
 	}
 }
 
@@ -193,6 +209,30 @@ func applyOrchestratePolicyField(policy *OrchestratePolicy, key string, value st
 		parsed, err := strconv.Atoi(value)
 		policy.MaxVerifyReplanAttempts = parsed
 		return err
+	case "default_delegation_timeout":
+		parsed, err := parseConfigString(value)
+		policy.DefaultDelegationTimeout = strings.TrimSpace(parsed)
+		return err
+	case "default_plan_timeout":
+		parsed, err := parseConfigString(value)
+		policy.DefaultPlanTimeout = strings.TrimSpace(parsed)
+		return err
+	case "default_implement_timeout":
+		parsed, err := parseConfigString(value)
+		policy.DefaultImplementTimeout = strings.TrimSpace(parsed)
+		return err
+	case "default_review_timeout":
+		parsed, err := parseConfigString(value)
+		policy.DefaultReviewTimeout = strings.TrimSpace(parsed)
+		return err
+	case "default_gate_timeout":
+		parsed, err := parseConfigString(value)
+		policy.DefaultGateTimeout = strings.TrimSpace(parsed)
+		return err
+	case "default_repair_timeout":
+		parsed, err := parseConfigString(value)
+		policy.DefaultRepairTimeout = strings.TrimSpace(parsed)
+		return err
 	default:
 		return nil
 	}
@@ -232,6 +272,33 @@ func validateOrchestratePolicy(policy OrchestratePolicy) error {
 	}
 	if policy.MaxVerifyReplanAttempts < 0 {
 		return fmt.Errorf("orchestrate.max_verify_replan_attempts must be 0 (engine default) or positive")
+	}
+	for key, value := range map[string]string{
+		"default_delegation_timeout": policy.DefaultDelegationTimeout,
+		"default_plan_timeout":       policy.DefaultPlanTimeout,
+		"default_implement_timeout":  policy.DefaultImplementTimeout,
+		"default_review_timeout":     policy.DefaultReviewTimeout,
+		"default_gate_timeout":       policy.DefaultGateTimeout,
+		"default_repair_timeout":     policy.DefaultRepairTimeout,
+	} {
+		if err := validateOptionalDuration("orchestrate."+key, value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateOptionalDuration(name string, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return fmt.Errorf("%s %q is invalid: %w", name, value, err)
+	}
+	if parsed <= 0 {
+		return fmt.Errorf("%s must be positive when set", name)
 	}
 	return nil
 }

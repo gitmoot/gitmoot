@@ -17,7 +17,7 @@ import (
 // agentRestartFakeAdapter is a runtime.Adapter test double for `agent restart`:
 // it records whether Start was called and returns a deterministic, configurable
 // new runtime_ref (or an error). Runtime-agnostic — the adapter the restart path
-// builds is replaced wholesale via runtimeStartAdapterFor so codex/claude/kimi
+// builds is replaced wholesale via runtimeStartAdapterFor so codex/claude/kimi/kimi-cli
 // all funnel through this one fake without depending on each adapter's
 // runtime-specific ref generation.
 type agentRestartFakeAdapter struct {

@@ -63,7 +63,7 @@ func runtimeSessionResourceKey(agent runtime.Agent) (string, bool) {
 	runtimeName := strings.TrimSpace(agent.Runtime)
 	runtimeRef := strings.TrimSpace(agent.RuntimeRef)
 	switch runtimeName {
-	case runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime:
+	case runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime, runtime.KimiCLIRuntime:
 	default:
 		return "", false
 	}

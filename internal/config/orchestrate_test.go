@@ -50,6 +50,49 @@ func TestLoadOrchestratePolicyDefaults(t *testing.T) {
 	if policy.MaxVerifyReplanAttempts != 0 {
 		t.Fatalf("MaxVerifyReplanAttempts = %d, want 0 (engine default) by default", policy.MaxVerifyReplanAttempts)
 	}
+	if policy.DefaultDelegationTimeout != "" || policy.DefaultPlanTimeout != "" || policy.DefaultImplementTimeout != "" || policy.DefaultReviewTimeout != "" || policy.DefaultGateTimeout != "" || policy.DefaultRepairTimeout != "" {
+		t.Fatalf("delegation timeout defaults = %+v, want all empty by default", policy)
+	}
+}
+
+func TestLoadOrchestratePolicyDelegationTimeoutDefaults(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[orchestrate]
+default_delegation_timeout = "45m"
+default_plan_timeout = "15m"
+default_implement_timeout = "75m"
+default_review_timeout = "25m"
+default_gate_timeout = "10m"
+default_repair_timeout = "5m"
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+
+	policy, err := LoadOrchestratePolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadOrchestratePolicy returned error: %v", err)
+	}
+	if policy.DefaultDelegationTimeout != "45m" || policy.DefaultPlanTimeout != "15m" || policy.DefaultImplementTimeout != "75m" || policy.DefaultReviewTimeout != "25m" || policy.DefaultGateTimeout != "10m" || policy.DefaultRepairTimeout != "5m" {
+		t.Fatalf("delegation timeout defaults = %+v", policy)
+	}
+
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[orchestrate]
+default_review_timeout = ""
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	policy, err = LoadOrchestratePolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadOrchestratePolicy returned error: %v", err)
+	}
+	if policy.DefaultReviewTimeout != "" {
+		t.Fatalf("empty default_review_timeout = %q, want empty/unbounded", policy.DefaultReviewTimeout)
+	}
 }
 
 // TestLoadOrchestratePolicyMaxDelegationNonProgressStreak pins #339: the
@@ -468,6 +511,22 @@ max_verify_replan_attempts = lots
 max_verify_replan_attempts = -1
 `,
 			wantErr: "max_verify_replan_attempts must be 0 (engine default) or positive",
+		},
+		{
+			name: "default_delegation_timeout_invalid",
+			body: `
+[orchestrate]
+default_delegation_timeout = "banana"
+`,
+			wantErr: "orchestrate.default_delegation_timeout",
+		},
+		{
+			name: "default_review_timeout_zero",
+			body: `
+[orchestrate]
+default_review_timeout = "0s"
+`,
+			wantErr: "orchestrate.default_review_timeout must be positive",
 		},
 	}
 	for _, tt := range tests {

@@ -126,6 +126,11 @@ type Engine struct {
 	// left behind by a since-disabled run is never sampled, so it can never serve
 	// traffic without the comparator that would graduate or roll it back.
 	CanaryEnabled bool
+	// DelegationTimeoutDefaults carries optional [orchestrate] default child-job
+	// timeouts. Empty fields mean unbounded. Explicit per-delegation timeout values
+	// still win, so an engine with the zero value is byte-identical to historical
+	// behavior.
+	DelegationTimeoutDefaults DelegationTimeoutDefaults
 	// ArtifactRoot is the filesystem root under which delegation artifacts
 	// (delegations/<parent-job-id>/brief.md and context-manifest.json) are
 	// written when a coordinator returns delegations that request artifacts.
@@ -247,6 +252,54 @@ type Engine struct {
 	// spawns a goroutine; tests inject a synchronous runner so the checker leg is
 	// deterministic. It mirrors ReviewSpawner.
 	CheckerSpawner func(func())
+}
+
+// DelegationTimeoutDefaults are optional fallback timeouts for child delegation
+// jobs. They are intentionally generic orchestration policy, not tied to any
+// particular external coordinator or agent naming convention.
+type DelegationTimeoutDefaults struct {
+	Default   string
+	Plan      string
+	Implement string
+	Review    string
+	Gate      string
+	Repair    string
+}
+
+func (d DelegationTimeoutDefaults) timeoutFor(del Delegation) string {
+	switch strings.ToLower(strings.TrimSpace(del.Phase)) {
+	case "plan":
+		if d.Plan != "" {
+			return d.Plan
+		}
+	case "implement":
+		if d.Implement != "" {
+			return d.Implement
+		}
+	case "review", "review-prep", "review-dispatch":
+		if d.Review != "" {
+			return d.Review
+		}
+	case "gate":
+		if d.Gate != "" {
+			return d.Gate
+		}
+	case "repair", "continue":
+		if d.Repair != "" {
+			return d.Repair
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(del.Action)) {
+	case "implement":
+		if d.Implement != "" {
+			return d.Implement
+		}
+	case "review":
+		if d.Review != "" {
+			return d.Review
+		}
+	}
+	return d.Default
 }
 
 // defaultMaxDelegationNonProgressStreak is the streak threshold used when the
@@ -792,6 +845,115 @@ func (e Engine) HandlePullRequestReadyToMerge(ctx context.Context, event PullReq
 		Reviewers:   compactStrings(append([]string{}, event.RequiredReviewers...)),
 	}, ref)
 	return err
+}
+
+// HandleReviewPullRequestClosed reconciles a task wedged in `reviewing` whose
+// pull request is no longer open on GitHub (#543). The daemon poll loop only
+// lists OPEN pull requests, so once a reviewing task's PR is closed — most often
+// a duplicate/superseded PR that a cleanup job closed on GitHub — nothing
+// re-routes the task and it stays in `reviewing` pointing at a stale `open`
+// local PR row forever.
+//
+// It is idempotent and narrowly scoped: it acts ONLY when the task is still in
+// `reviewing`, so any already-advanced task (a genuinely-open PR still under
+// review, or one already merged/blocked) is left untouched and the healthy
+// merge/open paths are never regressed. It transitions the task out of
+// `reviewing` and rewrites the stale local PR row to its true state: a merged PR
+// resolves the task to `merged`; a closed-unmerged PR resolves it to the
+// terminal `blocked` state (there is no open PR left to review or merge, so it
+// surfaces to a human). Existing PR row fields (url/base/merge SHA) are
+// preserved — only the state (and, when merged, head SHA) is reconciled.
+func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullRequestEvent, merged bool) error {
+	if err := e.validate(); err != nil {
+		return err
+	}
+	if err := validatePullRequestEvent(event); err != nil {
+		return err
+	}
+	ref := taskRefFromPullRequest(event)
+	task, err := e.Store.GetTask(ctx, ref.ID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if task.State != string(TaskReviewing) {
+		return nil
+	}
+	prState := "closed"
+	taskState := TaskBlocked
+	if merged {
+		prState = "merged"
+		taskState = TaskMerged
+	}
+	if err := e.setTaskState(ctx, ref, taskState); err != nil {
+		return err
+	}
+	pr := db.PullRequest{
+		RepoFullName: event.Repo,
+		Number:       int64(event.PullRequest),
+		HeadBranch:   event.Branch,
+		HeadSHA:      event.HeadSHA,
+		State:        prState,
+	}
+	if existing, err := e.Store.GetPullRequest(ctx, event.Repo, int64(event.PullRequest)); err == nil {
+		pr.URL = existing.URL
+		pr.BaseBranch = existing.BaseBranch
+		pr.MergeCommitSHA = existing.MergeCommitSHA
+		if strings.TrimSpace(pr.HeadSHA) == "" {
+			pr.HeadSHA = existing.HeadSHA
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err := e.Store.UpsertPullRequest(ctx, pr); err != nil {
+		return err
+	}
+	if merged {
+		// An externally-merged PR detected by the reconciler must release the branch
+		// lock and remove the task worktree, exactly as the canonical merge path
+		// (PolicyMergeGate.finishMerged) does. Without this the reconcile method
+		// would set TaskMerged but strand the branch lock (held forever) and leak
+		// the task worktree on disk — the "strands a lock / leaves a worktree" class
+		// that accumulates under unattended automation. The blocked branch
+		// deliberately keeps the worktree/lock for human resumption, so only the
+		// merged branch cleans up.
+		e.reconcileMergedCleanup(ctx, event.Repo, task)
+	}
+	return nil
+}
+
+// reconcileMergedCleanup releases the branch lock and removes the task worktree
+// after HandleReviewPullRequestClosed resolves an externally-merged reviewing
+// task to `merged` (#543). It mirrors PolicyMergeGate.finishMerged's post-merge
+// cleanup so the self-heal reconcile path does not leak a held branch lock or an
+// on-disk worktree. Every step is best-effort and nil-safe: failures are
+// swallowed so the already-durable terminal `merged` transition is never undone,
+// matching finishMerged's treatment of these as non-fatal post-merge warnings.
+func (e Engine) reconcileMergedCleanup(ctx context.Context, repo string, task db.Task) {
+	if branch := strings.TrimSpace(task.Branch); branch != "" {
+		if lock, err := e.Store.GetBranchLock(ctx, repo, branch); err == nil {
+			_, _ = e.Store.ReleaseLockWithEvent(ctx, lock, db.BranchLockEvent{
+				Kind:    "released",
+				Message: "released after pull request merged (reconciled #543)",
+			})
+		}
+	}
+	path := strings.TrimSpace(task.WorktreePath)
+	if path == "" {
+		return
+	}
+	// Force-remove: the work is already merged, so a leftover dirty/locked worktree
+	// (the common reason a non-force removal fails) must not block reclaiming it.
+	manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager)
+	if !ok {
+		return
+	}
+	if err := manager.RemoveWorktreeForce(ctx, path); err != nil {
+		return
+	}
+	_ = e.Store.ClearTaskWorktreePath(ctx, task.ID)
 }
 
 func (e Engine) RunJob(ctx context.Context, jobID string, agent runtime.Agent, adapter DeliveryAdapter) (AgentResult, error) {
@@ -1386,6 +1548,13 @@ func parseJobTimestamp(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unrecognized job timestamp %q", s)
 }
 
+func effectiveDelegationTimeout(d Delegation, defaults DelegationTimeoutDefaults) string {
+	if timeout := strings.TrimSpace(d.Timeout); timeout != "" {
+		return timeout
+	}
+	return defaults.timeoutFor(d)
+}
+
 // delegationRequest builds the canonical child JobRequest for a delegation,
 // inheriting the parent's repo/branch/PR context and stamping the DAG fields
 // (ParentJobID/DelegationID/DelegationDepth/DelegatedBy/RootJobID/Deps). It is
@@ -1404,6 +1573,7 @@ func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) 
 		agent = ephemeralAgentName(d.ID, job.ID)
 		ephemeral = d.Ephemeral
 	}
+	rootID := e.rootJobID(job, payload)
 	return JobRequest{
 		ID:              job.ID + "/delegation/" + d.ID,
 		Agent:           agent,
@@ -1426,9 +1596,9 @@ func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) 
 		DelegationID:    d.ID,
 		DelegationDepth: payload.DelegationDepth + 1,
 		DelegatedBy:     job.Agent,
-		RootJobID:       e.rootJobID(job, payload),
+		RootJobID:       rootID,
 		Deps:            compactStrings(d.Deps),
-		JobTimeout:      strings.TrimSpace(d.Timeout),
+		JobTimeout:      effectiveDelegationTimeout(d, e.DelegationTimeoutDefaults),
 		Fingerprint:     strings.TrimSpace(d.Fingerprint),
 		FailurePolicy:   strings.TrimSpace(d.FailurePolicy),
 		SynthesisRule:   strings.TrimSpace(d.SynthesisRule),

@@ -1562,7 +1562,7 @@ func TestRunAgentTypeSetRejectsNonStartableRuntime(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("agent type set shell exit code = %d, want 2", code)
 	}
-	if !strings.Contains(stderr.String(), "managed agent types support codex, claude, or kimi") {
+	if !strings.Contains(stderr.String(), "managed agent types support codex, claude, kimi, or kimi-cli") {
 		t.Fatalf("stderr = %q", stderr.String())
 	}
 }
@@ -3287,11 +3287,11 @@ func TestCockpitAutoEnabled(t *testing.T) {
 		env      string
 		want     bool
 	}{
-		{false, "", false},     // outside Herdr, no flag -> off
-		{false, "1", true},     // inside a Herdr session -> auto on
-		{false, "  ", false},   // whitespace HERDR_ENV -> off
-		{true, "", true},       // explicit --cockpit -> on even outside Herdr
-		{true, "1", true},      // explicit + in Herdr -> on
+		{false, "", false},   // outside Herdr, no flag -> off
+		{false, "1", true},   // inside a Herdr session -> auto on
+		{false, "  ", false}, // whitespace HERDR_ENV -> off
+		{true, "", true},     // explicit --cockpit -> on even outside Herdr
+		{true, "1", true},    // explicit + in Herdr -> on
 	}
 	for _, c := range cases {
 		if got := cockpitAutoEnabled(c.explicit, c.env); got != c.want {

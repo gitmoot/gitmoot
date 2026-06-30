@@ -164,7 +164,7 @@ func (m *Model) openSessionDetail() {
 func (m Model) sessionsContent() string {
 	var b strings.Builder
 	// Kept as short lines so the key phrases survive viewport wrapping.
-	b.WriteString(mutedStyle.Render("Live runtime processes (codex/claude/kimi) that execute jobs for your agents.") + "\n")
+	b.WriteString(mutedStyle.Render("Live runtime processes (codex/claude/kimi/kimi-cli) that execute jobs for your agents.") + "\n")
 	b.WriteString(mutedStyle.Render("Each row shows its owning agent type.") + "\n")
 	b.WriteString(mutedStyle.Render("Stopping one frees the warm process; it does NOT cancel a running job.") + "\n")
 	b.WriteString(mutedStyle.Render("Idle sessions expire on their own.") + "\n")

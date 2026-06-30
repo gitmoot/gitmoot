@@ -1247,17 +1247,21 @@ func TestCodexCommandError(t *testing.T) {
 	})
 }
 
-func TestValidateAgentAcceptsKimi(t *testing.T) {
-	agent := Agent{Name: "audit", Role: "reviewer", Runtime: KimiRuntime, RuntimeRef: "session_550e8400-e29b-41d4-a716-446655440000", RepoScope: "jerryfane/gitmoot"}
-	if err := ValidateAgent(agent); err != nil {
-		t.Fatalf("ValidateAgent rejected valid Kimi agent: %v", err)
+func TestValidateAgentAcceptsKimiRuntimes(t *testing.T) {
+	for _, runtimeName := range []string{KimiRuntime, KimiCLIRuntime} {
+		agent := Agent{Name: "audit", Role: "reviewer", Runtime: runtimeName, RuntimeRef: "session_550e8400-e29b-41d4-a716-446655440000", RepoScope: "jerryfane/gitmoot"}
+		if err := ValidateAgent(agent); err != nil {
+			t.Fatalf("ValidateAgent rejected valid %s agent: %v", runtimeName, err)
+		}
 	}
 }
 
 func TestValidateAgentRejectsInvalidKimiRef(t *testing.T) {
-	agent := Agent{Name: "audit", Role: "reviewer", Runtime: KimiRuntime, RuntimeRef: "not-a-session", RepoScope: "jerryfane/gitmoot"}
-	if err := ValidateAgent(agent); err == nil {
-		t.Fatal("ValidateAgent accepted invalid Kimi runtime ref")
+	for _, runtimeName := range []string{KimiRuntime, KimiCLIRuntime} {
+		agent := Agent{Name: "audit", Role: "reviewer", Runtime: runtimeName, RuntimeRef: "not-a-session", RepoScope: "jerryfane/gitmoot"}
+		if err := ValidateAgent(agent); err == nil {
+			t.Fatalf("ValidateAgent accepted invalid %s runtime ref", runtimeName)
+		}
 	}
 }
 
@@ -1265,6 +1269,9 @@ func TestKimiAdapterValidateRejectsRuntimeMismatch(t *testing.T) {
 	agent := Agent{Name: "audit", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: "session_550e8400-e29b-41d4-a716-446655440000", RepoScope: "jerryfane/gitmoot"}
 	if err := (KimiAdapter{}).Validate(context.Background(), agent); err == nil {
 		t.Fatal("KimiAdapter accepted a Claude agent")
+	}
+	if err := (KimiCLIAdapter{}).Validate(context.Background(), agent); err == nil {
+		t.Fatal("KimiCLIAdapter accepted a Claude agent")
 	}
 }
 
@@ -1358,6 +1365,39 @@ func TestKimiDeliverCommandStartsFreshSession(t *testing.T) {
 	runner.want(t, 0, "kimi", "-p", "review", "--output-format", "stream-json")
 }
 
+func TestKimiDeliverAcceptsArrayContentParts(t *testing.T) {
+	stdout := "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"prefix\\n```json\\n{\\\"gitmoot_result\\\":{\\\"decision\\\":\\\"approved\\\",\\\"summary\\\":\\\"ok\\\",\\\"findings\\\":[],\\\"changes_made\\\":[],\\\"tests_run\\\":[],\\\"needs\\\":[],\\\"delegations\\\":[]}}\\n```\\n\"}]}\n"
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
+	adapter := KimiAdapter{Runner: runner}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: KimiRuntime, RuntimeRef: "session_550e8400-e29b-41d4-a716-446655440001", RepoScope: "jerryfane/gitmoot", AutonomyPolicy: AutonomyPolicyReadOnly}
+
+	result, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"})
+	if err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	if !strings.Contains(result.Raw, `"gitmoot_result"`) {
+		t.Fatalf("raw output missing gitmoot_result: %q", result.Raw)
+	}
+	runner.want(t, 0, "kimi", "-p", "review", "--output-format", "stream-json")
+}
+
+func TestKimiDeliverDoesNotProbePrintFallback(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{Stderr: "unknown option '--print'"}},
+		errs:    []error{errors.New("exit 1")},
+	}
+	adapter := KimiAdapter{Runner: runner}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: KimiRuntime, RuntimeRef: "session_550e8400-e29b-41d4-a716-446655440001", RepoScope: "jerryfane/gitmoot", AutonomyPolicy: AutonomyPolicyReadOnly}
+
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err == nil {
+		t.Fatal("Deliver accepted command failure")
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("runner calls = %d, want 1 (no probe/fallback)", len(runner.calls))
+	}
+	runner.want(t, 0, "kimi", "-p", "review", "--output-format", "stream-json")
+}
+
 func TestKimiDeliverCommandUsesJobModel(t *testing.T) {
 	stdout := `{"role":"assistant","content":"done"}` + "\n"
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
@@ -1441,4 +1481,37 @@ func TestKimiHealthRejectsBrokenSession(t *testing.T) {
 		t.Fatal("Health accepted broken Kimi session")
 	}
 	runner.want(t, 0, "kimi", "-p", KimiLiveCheckPrompt, "--output-format", "stream-json")
+}
+
+func TestKimiCLIStartCommandUsesPrintRuntime(t *testing.T) {
+	stdout := `{"role":"assistant","content":"ready"}` + "\n" +
+		`{"role":"meta","type":"session.resume_hint","session_id":"session_550e8400-e29b-41d4-a716-446655440003"}` + "\n"
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
+	adapter := KimiCLIAdapter{Runner: runner, Dir: "/repo"}
+	agent := Agent{Name: "lead", Role: "implementer", Runtime: KimiCLIRuntime, RepoScope: "jerryfane/gitmoot", AutonomyPolicy: AutonomyPolicyReadOnly}
+
+	result, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "initialize"})
+	if err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	if result.RuntimeRef != "session_550e8400-e29b-41d4-a716-446655440003" {
+		t.Fatalf("runtime ref = %q", result.RuntimeRef)
+	}
+	runner.want(t, 0, "kimi", "--print", "-p", "initialize", "--output-format", "stream-json")
+}
+
+func TestKimiCLIDeliverCommandUsesPrintRuntime(t *testing.T) {
+	stdout := `{"role":"assistant","content":"done"}` + "\n"
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
+	adapter := KimiCLIAdapter{Runner: runner}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: KimiCLIRuntime, RuntimeRef: "session_550e8400-e29b-41d4-a716-446655440001", RepoScope: "jerryfane/gitmoot", AutonomyPolicy: AutonomyPolicyReadOnly, Model: "agent-default"}
+
+	result, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review", Model: "opus"})
+	if err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	if result.Summary != "done" {
+		t.Fatalf("summary = %q", result.Summary)
+	}
+	runner.want(t, 0, "kimi", "--model", "opus", "--print", "-p", "review", "--output-format", "stream-json")
 }

@@ -2745,6 +2745,94 @@ func TestEngineDelegationTimeoutPlumbedToChildPayload(t *testing.T) {
 	}
 }
 
+func TestEngineDelegationDefaultTimeoutsAppliedFromPolicy(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "conductor", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "planner", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "reviewer", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+	engine.DelegationTimeoutDefaults = DelegationTimeoutDefaults{
+		Default: "45m",
+		Plan:    "15m",
+		Review:  "20m",
+	}
+
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "conductor", Type: "ask"}, JobPayload{
+		Repo:   "jerryfane/gitmoot",
+		Branch: "task-005",
+		Sender: "conductor",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "plan", Agent: "planner", Action: "ask", Phase: "plan", Prompt: "plan"},
+				{ID: "review", Agent: "reviewer", Action: "review", Phase: "review", Prompt: "review"},
+				{ID: "fallback", Agent: "planner", Action: "ask", Prompt: "fallback"},
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	planPayload, err := unmarshalPayload(mustJob(t, store, "parent-job/delegation/plan").Payload)
+	if err != nil {
+		t.Fatalf("unmarshal plan payload returned error: %v", err)
+	}
+	if planPayload.JobTimeout != "15m" {
+		t.Fatalf("plan JobTimeout = %q, want 15m", planPayload.JobTimeout)
+	}
+	reviewPayload, err := unmarshalPayload(mustJob(t, store, "parent-job/delegation/review").Payload)
+	if err != nil {
+		t.Fatalf("unmarshal review payload returned error: %v", err)
+	}
+	if reviewPayload.JobTimeout != "20m" {
+		t.Fatalf("review JobTimeout = %q, want 20m", reviewPayload.JobTimeout)
+	}
+	fallbackPayload, err := unmarshalPayload(mustJob(t, store, "parent-job/delegation/fallback").Payload)
+	if err != nil {
+		t.Fatalf("unmarshal fallback payload returned error: %v", err)
+	}
+	if fallbackPayload.JobTimeout != "45m" {
+		t.Fatalf("fallback JobTimeout = %q, want 45m", fallbackPayload.JobTimeout)
+	}
+}
+
+func TestEngineDelegationWithoutTimeoutDefaultStaysUnbounded(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "audit", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "helper", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "audit", Type: "ask"}, JobPayload{
+		Repo:   "jerryfane/gitmoot",
+		Branch: "task-005",
+		Sender: "audit",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "del-1", Agent: "helper", Action: "review", Prompt: "review this"},
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	payload, err := unmarshalPayload(mustJob(t, store, "parent-job/delegation/del-1").Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	if payload.JobTimeout != "" {
+		t.Fatalf("non-council child JobTimeout = %q, want empty", payload.JobTimeout)
+	}
+}
+
 func TestEngineDelegationModelPlumbedToChildPayload(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

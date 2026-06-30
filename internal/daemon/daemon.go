@@ -142,6 +142,9 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	if err := d.retryClosedReadyToMerge(ctx, openBranches); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	if err := d.reconcileClosedReviewingTasks(ctx, openBranches); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if d.WatchIssues {
 		if err := d.PollIssuesOnce(ctx); err != nil && firstErr == nil {
 			firstErr = err
@@ -562,6 +565,147 @@ func (d Daemon) retryClosedReadyToMerge(ctx context.Context, openBranches map[st
 	return nil
 }
 
+// reconcileClosedReviewingTasks self-heals tasks wedged in `reviewing` whose PR
+// is no longer open on GitHub (#543). The main poll loop only iterates OPEN PRs,
+// and the closed-PR retry path (retryClosedReadyToMerge) only covers
+// `ready_to_merge` tasks, so a `reviewing` task whose duplicate/superseded PR was
+// closed (e.g. by a cleanup job) is never reconciled and stays stuck forever with
+// a stale local `open` PR row.
+//
+// It mirrors retryClosedReadyToMerge's shape and cheap short-circuit: it only
+// consults GitHub's closed-PR list when a reviewing task has a branch with NO
+// currently-open PR (the wedge), so the healthy path — where a reviewing task's
+// PR is open and thus present in openBranches — makes zero extra GitHub reads.
+// A genuinely-open PR is in openBranches and skipped, so the normal review path
+// is never disturbed. Matching is by branch + PR number (+ head SHA when known);
+// the engine transition is no-op unless the task is still `reviewing`.
+func (d Daemon) reconcileClosedReviewingTasks(ctx context.Context, openBranches map[string]struct{}) error {
+	if d.Workflow == nil {
+		return nil
+	}
+	tasks, err := d.Store.ListTasksByRepoState(ctx, d.Repo.FullName(), string(workflow.TaskReviewing))
+	if err != nil {
+		return err
+	}
+	if len(tasks) == 0 {
+		return nil
+	}
+	type reviewingPullRequest struct {
+		task    db.Task
+		number  int64
+		headSHA string
+	}
+	candidates := map[string]reviewingPullRequest{}
+	for _, task := range tasks {
+		if task.Branch == "" {
+			continue
+		}
+		if _, open := openBranches[task.Branch]; open {
+			continue
+		}
+		stored, err := d.Store.GetPullRequestByRepoBranch(ctx, d.Repo.FullName(), task.Branch)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return err
+		}
+		candidates[task.Branch] = reviewingPullRequest{task: task, number: stored.Number, headSHA: stored.HeadSHA}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	closed, err := d.GitHub.ListPullRequests(ctx, d.Repo, "closed")
+	if err != nil {
+		return err
+	}
+	// Group the closed list by head ref so a candidate branch sees ALL of its
+	// closed PRs at once. This is essential for the literal #543 scenario: the
+	// real PR was MERGED while a duplicate on the SAME branch was closed unmerged.
+	// The local row only ever recorded the duplicate (GetPullRequestByRepoBranch
+	// returns the highest number = the duplicate), so matching only the pinned
+	// number would resolve to `blocked` and re-surface already-merged work to a
+	// human, even though the merge signal is already in this same list.
+	closedByBranch := map[string][]github.PullRequest{}
+	for _, pull := range closed {
+		if _, ok := candidates[pull.HeadRef]; !ok {
+			continue
+		}
+		closedByBranch[pull.HeadRef] = append(closedByBranch[pull.HeadRef], pull)
+	}
+	for branch, candidate := range candidates {
+		pull, merged, ok := selectReconciledPull(candidate.number, candidate.headSHA, closedByBranch[branch])
+		if !ok {
+			continue
+		}
+		task := candidate.task
+		leadAgent := "github"
+		if lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), task.Branch); err == nil {
+			if owner := strings.TrimSpace(lock.Owner); owner != "" {
+				leadAgent = owner
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if err := d.Workflow.HandleReviewPullRequestClosed(ctx, workflow.PullRequestEvent{
+			Repo:        d.Repo.FullName(),
+			Branch:      task.Branch,
+			PullRequest: int(pull.Number),
+			HeadSHA:     pull.HeadSHA,
+			GoalID:      task.GoalID,
+			TaskID:      task.ID,
+			TaskTitle:   task.Title,
+			LeadAgent:   leadAgent,
+			Sender:      "github",
+		}, merged); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// selectReconciledPull picks which closed PR resolves a wedged reviewing task and
+// whether that resolution is a merge (#543). A MERGED PR on the task's branch
+// wins over the pinned-but-closed PR the stale local row points at: in the bug,
+// the real PR was merged while a duplicate on the same branch was closed
+// unmerged, so resolving only the pinned duplicate would drive the task to a
+// spurious `blocked` and report completed work as unfinished. Head SHA is matched
+// only when known on BOTH sides (a duplicate on the same branch normally shares
+// the head SHA); a merged sibling whose SHA is unknown on either side is still
+// preferred over a closed-unmerged pin. When no merged PR is present it falls
+// back to reconciling the exact pinned PR (closed-unmerged -> blocked).
+func selectReconciledPull(pinnedNumber int64, pinnedHeadSHA string, pulls []github.PullRequest) (github.PullRequest, bool, bool) {
+	for _, pull := range pulls {
+		if !pullRequestListedAsMerged(pull) {
+			continue
+		}
+		if pinnedHeadSHA != "" && pull.HeadSHA != "" && pull.HeadSHA != pinnedHeadSHA {
+			continue
+		}
+		return pull, true, true
+	}
+	for _, pull := range pulls {
+		if pull.Number != pinnedNumber {
+			continue
+		}
+		if pinnedHeadSHA != "" && pull.HeadSHA != "" && pull.HeadSHA != pinnedHeadSHA {
+			continue
+		}
+		return pull, false, true
+	}
+	return github.PullRequest{}, false, false
+}
+
+// pullRequestListedAsMerged reports whether a PR from the GitHub list endpoint is
+// merged. That endpoint reports merged PRs as state="closed" and omits the
+// top-level `merged` boolean, carrying `merged_at` as the only reliable merge
+// signal — so any of those three is treated as merged and the rest as
+// closed-unmerged.
+func pullRequestListedAsMerged(pull github.PullRequest) bool {
+	return strings.TrimSpace(pull.MergedAt) != "" || pull.Merged ||
+		strings.EqualFold(strings.TrimSpace(pull.State), "merged")
+}
+
 func (d Daemon) lookupPullRequestTask(ctx context.Context, repoFullName string, branch string) (db.Task, error) {
 	task, err := d.Store.GetTaskByRepoBranch(ctx, repoFullName, branch)
 	if err == nil {
@@ -697,13 +841,7 @@ func (d Daemon) harvestRevertIfAny(ctx context.Context, pull github.PullRequest)
 // Merged flag and "merged" state string are kept only as belt-and-suspenders for
 // the single-PR shape and never fire on a list item.
 func revertPullMerged(pull github.PullRequest) bool {
-	if strings.TrimSpace(pull.MergedAt) != "" {
-		return true
-	}
-	if pull.Merged {
-		return true
-	}
-	return strings.EqualFold(strings.TrimSpace(pull.State), "merged")
+	return pullRequestListedAsMerged(pull)
 }
 
 func (d Daemon) workflowReviewers(ctx context.Context) ([]string, error) {

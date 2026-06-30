@@ -889,7 +889,7 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agent type set", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, or kimi")
+	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, or kimi-cli")
 	templateID := fs.String("template", "", "agent template")
 	model := fs.String("model", "", "default runtime model for this agent type")
 	role := fs.String("role", "", "agent role")
@@ -941,7 +941,7 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if entry.Runtime == runtime.ShellRuntime {
-		fmt.Fprintln(stderr, "invalid runtime: managed agent types support codex, claude, or kimi")
+		fmt.Fprintln(stderr, "invalid runtime: managed agent types support codex, claude, kimi, or kimi-cli")
 		return 2
 	}
 	if strings.TrimSpace(*templateID) != "" {
@@ -1093,7 +1093,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agent start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, or kimi")
+	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, or kimi-cli")
 	repoFlag := fs.String("repo", "", "allowed repo as owner/repo")
 	path := fs.String("path", ".", "local checkout path")
 	role := fs.String("role", "", "agent role")
@@ -1246,7 +1246,7 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agent subscribe", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, or shell")
+	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, kimi-cli, or shell")
 	session := fs.String("session", "", "runtime session reference, last, or shell command")
 	role := fs.String("role", "", "agent role")
 	templateID := fs.String("template", "", "agent template")
@@ -1481,6 +1481,8 @@ func runtimeStartAdapter(factory runtime.Factory, runtimeName string, checkout s
 		return runtime.ClaudeAdapter{Runner: factory.Runner, Dir: checkout}, nil
 	case runtime.KimiRuntime:
 		return runtime.KimiAdapter{Runner: factory.Runner, Dir: checkout}, nil
+	case runtime.KimiCLIRuntime:
+		return runtime.KimiCLIAdapter{Runner: factory.Runner, Dir: checkout}, nil
 	case runtime.ShellRuntime:
 		return runtime.ShellAdapter{Runner: factory.Runner, Dir: checkout}, nil
 	default:

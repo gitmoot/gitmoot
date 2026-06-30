@@ -59,6 +59,15 @@ cockpit_pane_key = "job"
 # (Go duration; default 24h). Both optional.
 escalation_handle = ""
 escalation_ttl = ""
+# Optional default timeouts for child delegation jobs. Empty means unbounded,
+# preserving historical behavior. Per-delegation timeout always wins; otherwise
+# phase-specific defaults apply, then default_delegation_timeout, then unbounded.
+default_delegation_timeout = ""
+default_plan_timeout = ""
+default_implement_timeout = ""
+default_review_timeout = ""
+default_gate_timeout = ""
+default_repair_timeout = ""
 
 # [skillopt] is the OFF-BY-DEFAULT template-learning policy (#465 Mode A, #471).
 # With no [skillopt] section behavior is byte-identical: no trace harvesting, no

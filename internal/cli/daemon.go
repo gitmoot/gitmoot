@@ -230,6 +230,19 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	// Singleton guard (#550). `daemon run` is the inner worker that `daemon start`
+	// execs, but it is ALSO a public command and the ExecStart of `systemd --user`
+	// units, so a stray `daemon run` could previously coexist silently with the
+	// managed daemon: two daemons polling the same repos and racing on the same
+	// WAL'd SQLite store, with the newcomer clobbering daemon.json so the prior one
+	// ran untracked for days. `daemon start` already refuses when a live daemon is
+	// registered; extend the SAME check to `daemon run` so the second one refuses
+	// up front instead of entering its loop. The check must run BEFORE the deferred
+	// self-registration so a refused run never touches the existing daemon's state.
+	if code := guardDaemonRunSingleton(*home, stderr); code != 0 {
+		return code
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -872,6 +885,40 @@ func withDaemonBoolFlagArg(args []string, name string, enabled bool) []string {
 		return append(cleaned, flagName)
 	}
 	return cleaned
+}
+
+// guardDaemonRunSingleton refuses to start a second daemon against the same home
+// (#550). It reuses currentDaemonPID — the exact liveness check `daemon start`
+// uses and the #505 definition of "running": an owner-pid that is alive AND whose
+// /proc cmdline still matches the recorded daemon meta (processLooksLikeDaemon).
+// Reusing that check is what makes this correct at the right depth:
+//   - a STALE pidfile from a dead (or non-daemon) pid is treated as not-running,
+//     so it is silently cleared and never blocks a fresh start; and
+//   - a genuinely live registered daemon is detected and the new run refuses.
+//
+// A recorded pid equal to our own is never a conflict: when `daemon start` forks
+// the detached child it writes the pidfile with the CHILD's pid, so the child's
+// own `daemon run` guard sees itself and proceeds (the healthy start path).
+//
+// Returns 0 to proceed, or a non-zero exit code (with a clear message on stderr)
+// to refuse.
+func guardDaemonRunSingleton(home string, stderr io.Writer) int {
+	paths, err := initializedPaths(home)
+	if err != nil {
+		fmt.Fprintf(stderr, "daemon run: %v\n", err)
+		return 1
+	}
+	state := daemonProcessState(paths)
+	pid, _, err := currentDaemonPID(state)
+	if err != nil {
+		fmt.Fprintf(stderr, "daemon run: %v\n", err)
+		return 1
+	}
+	if pid > 0 && pid != os.Getpid() {
+		fmt.Fprintf(stderr, "daemon already running with pid %d\n", pid)
+		return 1
+	}
+	return 0
 }
 
 func currentDaemonPID(state daemonState) (pid int, stale bool, err error) {
@@ -2057,24 +2104,35 @@ func (w jobWorker) delegationWorktreeCleanupPending(ctx context.Context, jobID s
 // owner's lock releases or its lease expires (recoverExpiredRuntimeSessionLocks
 // runs earlier in the tick), the preserved worktree+branch are reclaimed rather
 // than leaked forever.
+//
+// It is BOUNDED, not a full-table scan (#549): rather than list every job and
+// re-read each terminal job's full event history (ListJobEvents) on every 1s
+// supervisor tick — O(jobs × events), which burned a core once a few hundred
+// terminal jobs had accumulated — it asks the store for ONLY the (small) set of
+// jobs whose latest cleanup outcome is still an unreconciled preserve marker, and
+// reads just those. Correctness is unchanged: a worktree that genuinely needs
+// reclaiming still carries that marker and is still reclaimed; once reclaimed it
+// emits delegation_worktree_removed and drops out of the candidate set.
 func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string) error {
-	jobs, err := worker.Store.ListJobs(ctx)
+	jobIDs, err := worker.Store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
 	if err != nil {
 		return err
 	}
-	for _, job := range jobs {
-		if !jobStateCanRetryAdvancement(job.State) || !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+	for _, jobID := range jobIDs {
+		job, err := worker.Store.GetJob(ctx, jobID)
+		if errors.Is(err, sql.ErrNoRows) {
+			// A cleanup-marker event with no surviving job row (e.g. a pruned job):
+			// nothing to reclaim, and erroring here would abort the whole tick.
 			continue
 		}
-		pending, err := worker.delegationWorktreeCleanupPending(ctx, job.ID)
 		if err != nil {
 			return err
 		}
-		if !pending {
+		if !jobStateCanRetryAdvancement(job.State) || !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
 			continue
 		}
 		engine := worker.WorkflowFactory(worker.delegationParentCheckout(ctx, job))
-		if err := engine.ReclaimTerminalDelegationWorktree(ctx, job.ID); err != nil {
+		if err := engine.ReclaimTerminalDelegationWorktree(ctx, jobID); err != nil {
 			return err
 		}
 	}
@@ -3207,7 +3265,7 @@ func perJobAdmissionEstimate(ctx context.Context, store *db.Store, job db.Job, p
 		return admissionEstimate{session: true, memGB: policy.CodexMemoryGB}
 	case runtime.ClaudeRuntime:
 		return admissionEstimate{session: true, memGB: policy.ClaudeMemoryGB}
-	case runtime.KimiRuntime:
+	case runtime.KimiRuntime, runtime.KimiCLIRuntime:
 		return admissionEstimate{session: true, memGB: policy.KimiMemoryGB}
 	default:
 		return admissionEstimate{session: true, memGB: policy.DefaultMemoryGB}
@@ -3556,7 +3614,7 @@ func tempWorkerEligible(ctx context.Context, store *db.Store, job db.Job, payloa
 		return tempWorkerEligibility{Reason: "parallel_sessions.same_session is queue"}
 	}
 	switch agent.Runtime {
-	case runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime:
+	case runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime, runtime.KimiCLIRuntime:
 	default:
 		return tempWorkerEligibility{Reason: fmt.Sprintf("runtime %s does not support temp workers", agent.Runtime)}
 	}
@@ -4276,6 +4334,8 @@ func buildRuntimeAdapter(agent runtime.Agent, checkout string, runner subprocess
 		return runtime.ClaudeAdapter{Dir: checkout, Runner: runner}, nil
 	case runtime.KimiRuntime:
 		return runtime.KimiAdapter{Dir: checkout, Runner: runner}, nil
+	case runtime.KimiCLIRuntime:
+		return runtime.KimiCLIAdapter{Dir: checkout, Runner: runner}, nil
 	case runtime.ShellRuntime:
 		return runtime.ShellAdapter{Dir: checkout, Runner: runner}, nil
 	default:
@@ -4313,6 +4373,14 @@ func (w jobWorker) applyOrchestratePolicy(engine *workflow.Engine) {
 	engine.MaxDelegationCostUSD = policy.MaxDelegationCostUSD
 	engine.MaxDelegationNonProgressStreak = policy.MaxDelegationNonProgressStreak
 	engine.MaxVerifyReplanAttempts = policy.MaxVerifyReplanAttempts
+	engine.DelegationTimeoutDefaults = workflow.DelegationTimeoutDefaults{
+		Default:   policy.DefaultDelegationTimeout,
+		Plan:      policy.DefaultPlanTimeout,
+		Implement: policy.DefaultImplementTimeout,
+		Review:    policy.DefaultReviewTimeout,
+		Gate:      policy.DefaultGateTimeout,
+		Repair:    policy.DefaultRepairTimeout,
+	}
 	if notifier, ok := engine.EscalationNotifier.(*daemonEscalationNotifier); ok && notifier != nil {
 		notifier.Handle = policy.EscalationHandle
 	}

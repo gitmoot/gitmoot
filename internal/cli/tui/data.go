@@ -367,7 +367,7 @@ type Deps struct {
 	// queued/running jobs, plus any unexpected error.
 	DeleteAgents   func(names []string) (deleted int, skipped []string, err error)
 	RevertTemplate func(templateID, versionID string) error
-	// SetAgentRuntime switches a registered agent's runtime (codex/claude/kimi),
+	// SetAgentRuntime switches a registered agent's runtime (codex/claude/kimi/kimi-cli),
 	// preserving its role/capabilities/repos and clearing the warm session.
 	SetAgentRuntime func(name, runtime string) error
 

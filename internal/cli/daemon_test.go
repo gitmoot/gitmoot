@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -5105,6 +5106,93 @@ func TestReclaimSkippedDelegationWorktrees(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestReclaimSkippedDelegationWorktreesBoundedToMarkedJobs is the #549 wiring
+// guard: the reclaim pass must source its candidates from the store's bounded
+// pending-marker query, so a large backlog of terminal jobs WITHOUT a preserve
+// marker (the ~95% steady-state majority) is never event-scanned and never
+// touched — only the one genuinely-pending child is reclaimed. The fix replaced
+// ListJobs + per-job ListJobEvents (O(jobs × events) every 1s tick) with
+// JobIDsWithPendingDelegationWorktreeReclaim + a per-candidate GetJob.
+func TestReclaimSkippedDelegationWorktreesBoundedToMarkedJobs(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+
+	// A large backlog of terminal jobs with rich, immutable event history but NO
+	// cleanup marker. These must stay out of the candidate set entirely.
+	for i := 0; i < 50; i++ {
+		id := "terminal-no-marker-" + strconv.Itoa(i)
+		if err := store.CreateJobWithEvent(ctx, db.Job{
+			ID: id, Agent: "producer", Type: "implement", State: string(workflow.JobSucceeded),
+		}, db.JobEvent{Kind: string(workflow.JobSucceeded), Message: "seed"}); err != nil {
+			t.Fatalf("CreateJobWithEvent(%s) returned error: %v", id, err)
+		}
+		for _, kind := range []string{"queued", "running", "advance_succeeded"} {
+			if err := store.AddJobEvent(ctx, db.JobEvent{JobID: id, Kind: kind, Message: "noise"}); err != nil {
+				t.Fatalf("AddJobEvent returned error: %v", err)
+			}
+		}
+	}
+	// A job whose preserve was already reconciled (skip then removed): not pending.
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: "reconciled", Agent: "producer", Type: "implement", State: string(workflow.JobFailed),
+	}, db.JobEvent{Kind: string(workflow.JobFailed), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent(reconciled) returned error: %v", err)
+	}
+	for _, kind := range []string{"delegation_worktree_cleanup_skipped", "delegation_worktree_removed"} {
+		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: "reconciled", Kind: kind, Message: "m"}); err != nil {
+			t.Fatalf("AddJobEvent returned error: %v", err)
+		}
+	}
+
+	// The one genuinely-pending delegation child.
+	branch := "gitmoot-delegation-x-d1"
+	wt := t.TempDir()
+	pendingID := "parent/delegation/d1"
+	payload := workflow.JobPayload{
+		Repo: "owner/repo", DelegationID: "d1", WorktreePath: wt, Branch: branch,
+		Result: &workflow.AgentResult{Decision: "failed"},
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal payload returned error: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: pendingID, Agent: "producer", Type: "implement", State: string(workflow.JobFailed),
+		ParentJobID: "parent", DelegationID: "d1", Payload: string(encoded),
+	}, db.JobEvent{Kind: string(workflow.JobFailed), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent(pending) returned error: %v", err)
+	}
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: pendingID, Kind: "delegation_worktree_cleanup_skipped", Message: "preserved"}); err != nil {
+		t.Fatalf("AddJobEvent returned error: %v", err)
+	}
+
+	manager := &fakeReclaimWorktreeManager{branches: map[string]bool{branch: true}}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.WorkflowFactory = func(string) workflow.Engine {
+		return workflow.Engine{
+			Store:               store,
+			DelegationCheckout:  t.TempDir(),
+			DelegationWorktrees: manager,
+			OwnerPIDLive:        func(int64) bool { return false },
+		}
+	}
+
+	if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", ""); err != nil {
+		t.Fatalf("reclaimSkippedDelegationWorktrees returned error: %v", err)
+	}
+
+	if len(manager.removed) != 1 || manager.removed[0] != wt {
+		t.Fatalf("only the marked pending worktree must be reclaimed: removed=%+v", manager.removed)
+	}
+	pending, err := worker.delegationWorktreeCleanupPending(ctx, pendingID)
+	if err != nil {
+		t.Fatalf("delegationWorktreeCleanupPending returned error: %v", err)
+	}
+	if pending {
+		t.Fatalf("cleanup pending must clear after reclaim")
 	}
 }
 

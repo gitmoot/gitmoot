@@ -16,9 +16,10 @@ const (
 )
 
 // KimiAdapter delivers Gitmoot jobs to the local Kimi Code CLI.
-// Kimi supports non-interactive prompt mode (`-p`), structured stream-json output,
-// and session resume (`-S <session_id>`). The adapter extracts the assistant
-// response and the session id from the JSONL stream.
+// Kimi Code supports non-interactive prompt mode (`-p`), structured stream-json
+// output, and session resume (`-S <session_id>`). The adapter extracts the
+// assistant response and the session id from the JSONL stream. Keep this runtime
+// print-less: kimi-code does not support `--print`.
 type KimiAdapter struct {
 	Runner        subprocess.Runner
 	Dir           string
@@ -119,25 +120,124 @@ func (a KimiAdapter) newRuntimeRef() (string, error) {
 	return newUUID()
 }
 
+// KimiCLIAdapter delivers jobs to the opt-in legacy Kimi CLI runtime. This
+// runtime is intentionally separate from `kimi`: it uses the older `--print`
+// command shape without probing or changing the default Kimi Code path.
+type KimiCLIAdapter struct {
+	Runner        subprocess.Runner
+	Dir           string
+	NewRuntimeRef func() (string, error)
+}
+
+func (a KimiCLIAdapter) Name() string { return KimiCLIRuntime }
+
+func (a KimiCLIAdapter) Start(ctx context.Context, request StartRequest) (StartResult, error) {
+	if err := validateStartRequest(request.Agent, a.Name(), request.Prompt); err != nil {
+		return StartResult{}, err
+	}
+	runtimeRef, err := a.newRuntimeRef()
+	if err != nil {
+		return StartResult{}, err
+	}
+	args := kimiCLIPromptArgs(request.Agent, request.Agent.Model, request.Prompt)
+	result, err := a.runner().Run(ctx, a.Dir, "kimi", args...)
+	if err != nil {
+		return StartResult{Raw: result.Stdout + result.Stderr}, kimiCommandError(result, err)
+	}
+	content, sessionID, _, parseErr := parseKimiStreamJSON(result.Stdout)
+	if parseErr != nil {
+		return StartResult{Raw: result.Stdout}, fmt.Errorf("parse kimi stream-json output: %w", parseErr)
+	}
+	if sessionID == "" {
+		sessionID = runtimeRef
+	}
+	return StartResult{RuntimeRef: sessionID, Raw: content}, nil
+}
+
+func (a KimiCLIAdapter) Validate(_ context.Context, agent Agent) error {
+	if err := validateRuntime(agent, a.Name()); err != nil {
+		return err
+	}
+	if agent.RuntimeRef != "" && !isKimiSessionID(agent.RuntimeRef) {
+		return fmt.Errorf("kimi runtime reference %q must be a Kimi session id or empty", agent.RuntimeRef)
+	}
+	return nil
+}
+
+func (a KimiCLIAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, error) {
+	if err := a.Validate(ctx, agent); err != nil {
+		return Result{}, err
+	}
+	_ = agent.RuntimeRef
+	result, err := a.runner().Run(ctx, a.Dir, "kimi", kimiCLIPromptArgs(agent, effectiveModel(agent, job), job.Prompt)...)
+	if err != nil {
+		return Result{Raw: result.Stdout + result.Stderr}, kimiCommandError(result, err)
+	}
+	content, _, usage, parseErr := parseKimiStreamJSON(result.Stdout)
+	if parseErr != nil {
+		return Result{Raw: result.Stdout}, fmt.Errorf("parse kimi stream-json output: %w", parseErr)
+	}
+	return Result{Raw: content, Summary: strings.TrimSpace(content), InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens}, nil
+}
+
+func (a KimiCLIAdapter) Health(ctx context.Context, agent Agent) error {
+	if err := a.Validate(ctx, agent); err != nil {
+		return err
+	}
+	_, err := a.Deliver(ctx, agent, Job{Prompt: KimiLiveCheckPrompt})
+	return err
+}
+
+func (a KimiCLIAdapter) Capabilities(context.Context) ([]string, error) {
+	return []string{"review", "implement", "ask"}, nil
+}
+
+func (a KimiCLIAdapter) runner() subprocess.Runner {
+	if a.Runner != nil {
+		return a.Runner
+	}
+	return subprocess.GroupRunner{}
+}
+
+func (a KimiCLIAdapter) newRuntimeRef() (string, error) {
+	if a.NewRuntimeRef != nil {
+		return a.NewRuntimeRef()
+	}
+	return newUUID()
+}
+
+func kimiCLIPromptArgs(agent Agent, model string, prompt string) []string {
+	args := kimiPermissionArgs(agent)
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+	return append(args, "--print", "-p", prompt, "--output-format", "stream-json")
+}
+
 func kimiPermissionArgs(agent Agent) []string {
-	// Kimi's `-p` prompt mode already runs non-interactively and auto-approves
-	// tool calls. The --yolo and --auto flags cannot be combined with -p, so we
-	// pass no extra permission flags. Read-only enforcement is handled by the
-	// agent's capabilities and Gitmoot's dispatch/lock logic.
+	// Kimi's prompt mode already runs non-interactively. The --yolo and --auto
+	// flags cannot be combined with -p, so we pass no extra permission flags.
+	// Read-only enforcement is handled by the agent's capabilities and Gitmoot's
+	// dispatch/lock logic.
 	_ = agent
 	return nil
 }
 
 type kimiStreamEvent struct {
-	Role      string `json:"role"`
-	Type      string `json:"type"`
-	Content   string `json:"content"`
-	SessionID string `json:"session_id"`
+	Role      string          `json:"role"`
+	Type      string          `json:"type"`
+	Content   json.RawMessage `json:"content"`
+	SessionID string          `json:"session_id"`
 	// Usage carries best-effort token counts when Kimi's stream emits a usage or
 	// result event (#338 Part B). The field set mirrors the common LLM-CLI shape
 	// (input_tokens/output_tokens). It is nil/zero on events that carry no usage,
 	// so a runtime that never reports usage simply contributes 0 to the budget.
 	Usage *kimiUsage `json:"usage"`
+}
+
+type kimiContentPart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 // kimiUsage holds the best-effort token counts extracted from a Kimi stream-json
@@ -173,7 +273,9 @@ func parseKimiStreamJSON(output string) (string, string, kimiUsage, error) {
 		}
 		switch event.Role {
 		case "assistant":
-			contentParts = append(contentParts, event.Content)
+			if content := kimiEventContentText(event.Content); content != "" {
+				contentParts = append(contentParts, content)
+			}
 		case "meta":
 			if event.Type == "session.resume_hint" && event.SessionID != "" {
 				sessionID = event.SessionID
@@ -186,8 +288,38 @@ func parseKimiStreamJSON(output string) (string, string, kimiUsage, error) {
 	return strings.Join(contentParts, ""), sessionID, usage, nil
 }
 
+func kimiEventContentText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return text
+	}
+	var parts []kimiContentPart
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, part := range parts {
+		if part.Type == "text" {
+			b.WriteString(part.Text)
+		}
+	}
+	return b.String()
+}
+
 func isKimiSessionID(ref string) bool {
 	return strings.HasPrefix(ref, "session_")
+}
+
+func isKimiRuntime(runtimeName string) bool {
+	switch runtimeName {
+	case KimiRuntime, KimiCLIRuntime:
+		return true
+	default:
+		return false
+	}
 }
 
 func kimiCommandError(result subprocess.Result, err error) error {
