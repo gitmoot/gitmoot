@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 )
@@ -19,7 +20,9 @@ type roOnlyWorktreeManager struct{ removed []string }
 func (m *roOnlyWorktreeManager) AddWorktree(context.Context, string, string, string) error {
 	return nil
 }
-func (m *roOnlyWorktreeManager) AddDetachedWorktree(context.Context, string, string) error { return nil }
+func (m *roOnlyWorktreeManager) AddDetachedWorktree(context.Context, string, string) error {
+	return nil
+}
 func (m *roOnlyWorktreeManager) RemoveWorktreeForce(_ context.Context, path string) error {
 	m.removed = append(m.removed, path)
 	return nil
@@ -311,6 +314,110 @@ func TestAdvanceJobTerminalImplementLegFiresCleanup(t *testing.T) {
 	})
 }
 
+// TestAdvanceJobTerminalImplementLegCleansWhileSelfHoldsLock is the HIGH #478
+// regression that the original #536 fix introduced: cleanupImplementDelegationWorktree
+// is deferred inside AdvanceJob, which runs inside RunJob WHILE the daemon still
+// holds the job's OWN runtime-session lock (the daemon releases it only after RunJob
+// returns). The earlier liveness gate keyed on ANY held lock, so on a perfectly
+// healthy completion the run's own live lock made the gate refuse cleanup, leaking
+// the worktree + gitmoot-delegation-* branch for EVERY normally-completing child.
+//
+// The fix excludes the run's OWN lock (matched by the owner token threaded through
+// the run context). This test reproduces the healthy path: the child's runtime lock
+// is held by THIS process (live PID, unexpired lease) AND the run context carries
+// that lock's owner token, then AdvanceJob drives the child to terminal. The
+// worktree+branch MUST be removed.
+//
+// The companion sub-case (no self token in ctx, same live lock) pins that a FOREIGN
+// live owner still blocks the destructive cleanup — i.e. the test fails if the gate
+// is simply removed, not just if the self-exclusion is added. Before the fix the
+// first sub-case fails (cleanup refused despite the lock being the run's own).
+func TestAdvanceJobTerminalImplementLegCleansWhileSelfHoldsLock(t *testing.T) {
+	const ownerToken = "self-owner-token-536"
+	acquireSelfLock := func(t *testing.T, store *db.Store, jobID string) {
+		t.Helper()
+		now := time.Now().UTC()
+		acquired, err := store.AcquireResourceLock(context.Background(), db.ResourceLock{
+			ResourceKey: "runtime:codex:session-self",
+			OwnerJobID:  jobID,
+			OwnerToken:  ownerToken,
+			OwnerPID:    int64(os.Getpid()),
+			ExpiresAt:   now.Add(4 * time.Hour).Format(time.RFC3339Nano),
+		}, now)
+		if err != nil || !acquired {
+			t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
+		}
+	}
+
+	newEngine := func(t *testing.T, store *db.Store, branch string) (Engine, *fakeWorktreeManager) {
+		t.Helper()
+		engine := testEngine(store)
+		engine.Home = t.TempDir()
+		engine.DelegationCheckout = t.TempDir()
+		engine.OwnerPIDLive = func(int64) bool { return true } // own daemon PID is live
+		manager := &fakeWorktreeManager{existingBranches: map[string]bool{branch: true}}
+		engine.DelegationWorktrees = manager
+		return engine, manager
+	}
+
+	t.Run("self-held lock does not block healthy cleanup", func(t *testing.T) {
+		store := openEngineStore(t)
+		branch := "gitmoot-delegation-x-self"
+		engine, manager := newEngine(t, store, branch)
+		wt := t.TempDir()
+		jobID := "leg-self"
+		insertCompletedJob(t, store, db.Job{ID: jobID, Agent: "producer", Type: "implement", DelegationID: "d1"}, JobPayload{
+			DelegationID: "d1", WorktreePath: wt, Branch: branch,
+			Result: &AgentResult{Decision: "implemented", Summary: "done"},
+		})
+		acquireSelfLock(t, store, jobID)
+
+		// The daemon threads the run's lock owner token into the run context; AdvanceJob
+		// (and its deferred cleanup) inherits it.
+		ctx := WithRuntimeSelfOwnerToken(context.Background(), ownerToken)
+		if err := engine.AdvanceJob(ctx, jobID); err != nil {
+			t.Fatalf("AdvanceJob(%s) returned error: %v", jobID, err)
+		}
+		if len(manager.removedForce) != 1 || manager.removedForce[0] != wt {
+			t.Fatalf("healthy completion must force-remove the worktree even with the run's own lock held: removedForce=%+v", manager.removedForce)
+		}
+		if len(manager.deletedBranches) != 1 || manager.deletedBranches[0] != branch {
+			t.Fatalf("healthy completion must delete the branch: deletedBranches=%+v", manager.deletedBranches)
+		}
+		if got := countJobEvents(t, store, jobID, "delegation_worktree_cleanup_skipped"); got != 0 {
+			t.Fatalf("healthy completion must not skip cleanup, got %d skip events", got)
+		}
+	})
+
+	t.Run("foreign live lock still blocks cleanup", func(t *testing.T) {
+		store := openEngineStore(t)
+		branch := "gitmoot-delegation-x-foreign"
+		engine, manager := newEngine(t, store, branch)
+		wt := t.TempDir()
+		jobID := "leg-foreign"
+		insertCompletedJob(t, store, db.Job{ID: jobID, Agent: "producer", Type: "implement", DelegationID: "d2"}, JobPayload{
+			DelegationID: "d2", WorktreePath: wt, Branch: branch,
+			Result: &AgentResult{Decision: "implemented", Summary: "done"},
+		})
+		acquireSelfLock(t, store, jobID)
+
+		// No self token in ctx: the held lock is a FOREIGN live owner (e.g. a recovery /
+		// retry path advancing the job while the original worker still holds the lock).
+		if err := engine.AdvanceJob(context.Background(), jobID); err != nil {
+			t.Fatalf("AdvanceJob(%s) returned error: %v", jobID, err)
+		}
+		if len(manager.removedForce) != 0 || len(manager.deletedBranches) != 0 {
+			t.Fatalf("foreign live owner must block destructive cleanup: removedForce=%+v deletedBranches=%+v", manager.removedForce, manager.deletedBranches)
+		}
+		if got := countJobEvents(t, store, jobID, "delegation_worktree_cleanup_skipped"); got != 1 {
+			t.Fatalf("foreign live owner must skip cleanup once, got %d skip events", got)
+		}
+		if _, err := os.Stat(wt); err != nil {
+			t.Fatalf("worktree must be preserved on disk: stat err = %v", err)
+		}
+	})
+}
+
 func TestCleanupImplementDelegationWorktreeSkipsIntegrationDep(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -348,10 +455,190 @@ func TestCleanupImplementDelegationWorktreeSkipsIntegrationDep(t *testing.T) {
 	}
 }
 
+// TestCleanupImplementDelegationWorktreeRefusesWhileRuntimeOwnerActive is the
+// #536 regression: when a delegation child's terminal state was synthesized by
+// stale recovery / dirty-checkout validation WHILE the original runtime worker was
+// still running, the worker's runtime-session lock lingers with an unexpired lease
+// (and possibly a live owner PID). The DESTRUCTIVE cleanup must REFUSE to
+// force-remove the worktree (and delete its branch) in that window so the live
+// worker is not orphaned onto a deleted cwd and its dirty work is preserved for
+// salvage. Once the lock has expired/released (the healthy case), cleanup runs.
+//
+// Without the liveness gate the first row ("live owner") would force-remove the
+// worktree out from under the running worker.
+func TestCleanupImplementDelegationWorktreeRefusesWhileRuntimeOwnerActive(t *testing.T) {
+	cases := []struct {
+		name        string
+		acquireLock bool
+		pidLive     bool
+		expiresIn   time.Duration
+		wantRemoved bool
+	}{
+		{name: "live owner unexpired lease preserves worktree", acquireLock: true, pidLive: true, expiresIn: 4 * time.Hour, wantRemoved: false},
+		{name: "unexpired lease dead pid preserves worktree", acquireLock: true, pidLive: false, expiresIn: 4 * time.Hour, wantRemoved: false},
+		{name: "expired lease dead pid cleans worktree", acquireLock: true, pidLive: false, expiresIn: -time.Minute, wantRemoved: true},
+		{name: "no runtime lock cleans worktree", acquireLock: false, wantRemoved: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			engine := testEngine(store)
+			engine.OwnerPIDLive = func(int64) bool { return tc.pidLive }
+			branch := "gitmoot-delegation-x-d1"
+			manager := &fakeWorktreeManager{existingBranches: map[string]bool{branch: true}}
+			engine.DelegationCheckout = t.TempDir()
+			engine.DelegationWorktrees = manager
+
+			wt := t.TempDir()
+			// Decision "failed" mirrors the bug: the recovered copy fails on the dirty
+			// checkout. Failed legs are always merge-safe, so the merge guard does not
+			// short-circuit and the liveness guard is exercised.
+			payload := JobPayload{DelegationID: "d1", WorktreePath: wt, Branch: branch, Result: &AgentResult{Decision: "failed"}}
+
+			jobID := "parent-job/delegation/task-7302"
+			if tc.acquireLock {
+				now := time.Now().UTC()
+				acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+					ResourceKey: "runtime:codex:session-536",
+					OwnerJobID:  jobID,
+					OwnerToken:  "token-536",
+					OwnerPID:    4242,
+					ExpiresAt:   now.Add(tc.expiresIn).Format(time.RFC3339Nano),
+				}, now)
+				if err != nil || !acquired {
+					t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
+				}
+			}
+
+			engine.cleanupImplementDelegationWorktree(ctx, jobID, "implement", payload)
+
+			if tc.wantRemoved {
+				if len(manager.removedForce) != 1 || manager.removedForce[0] != wt {
+					t.Fatalf("removedForce = %+v, want one force-remove of %q", manager.removedForce, wt)
+				}
+				if got := countJobEvents(t, store, jobID, "delegation_worktree_cleanup_skipped"); got != 0 {
+					t.Fatalf("cleanup must not be skipped, got %d skip events", got)
+				}
+			} else {
+				if len(manager.removedForce) != 0 || len(manager.deletedBranches) != 0 {
+					t.Fatalf("cleanup must be refused while owner active: removedForce=%+v deletedBranches=%+v", manager.removedForce, manager.deletedBranches)
+				}
+				if got := countJobEvents(t, store, jobID, "delegation_worktree_cleanup_skipped"); got != 1 {
+					t.Fatalf("delegation_worktree_cleanup_skipped event count = %d, want 1", got)
+				}
+				if _, err := os.Stat(wt); err != nil {
+					t.Fatalf("worktree must be preserved on disk: stat err = %v", err)
+				}
+			}
+		})
+	}
+}
+
 // TestCleanupImplementDelegationWorktreeNoBranchDeleter pins that when the manager
 // cannot delete branches (no BranchDeleter), the worktree is removed, the branch
 // is intentionally kept, and the emitted event does NOT falsely claim the branch
 // was removed. Re-advances are silent no-ops (no repeated removed event).
+// TestCleanupImplementDelegationWorktreeLeaseExpiryBoundary is the #536 finding 1
+// regression: the lock-based gate alone is lease-bound, so PAST lease expiry (when
+// recoverExpiredRuntimeSessionLocks has reaped the runtime-session lock) it no
+// longer fires. But a daemon-crash-reparented worker can still be writing to the
+// worktree past its lease. Force-removing it then is the original #536 corruption
+// shifted to the lease boundary. The physical worktree-process probe must hold the
+// line: a live process with its cwd in the worktree preserves it even with NO lock;
+// once that worker has actually exited, the worktree is reclaimed (never stranded).
+func TestCleanupImplementDelegationWorktreeLeaseExpiryBoundary(t *testing.T) {
+	cases := []struct {
+		name        string
+		liveProcess bool
+		wantRemoved bool
+	}{
+		{name: "live worker past lease preserves worktree", liveProcess: true, wantRemoved: false},
+		{name: "dead worker past lease reclaims worktree", liveProcess: false, wantRemoved: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			engine := testEngine(store)
+			// No runtime-session lock is held (the lease has expired and the lock was
+			// reaped). The ONLY remaining never-clobber signal is the physical probe.
+			engine.WorktreeHasLiveProcess = func(string) bool { return tc.liveProcess }
+			branch := "gitmoot-delegation-x-boundary"
+			manager := &fakeWorktreeManager{existingBranches: map[string]bool{branch: true}}
+			engine.DelegationCheckout = t.TempDir()
+			engine.DelegationWorktrees = manager
+
+			wt := t.TempDir()
+			jobID := "parent-job/delegation/task-7302"
+			payload := JobPayload{DelegationID: "d1", WorktreePath: wt, Branch: branch, Result: &AgentResult{Decision: "failed"}}
+			engine.cleanupImplementDelegationWorktree(ctx, jobID, "implement", payload)
+
+			if tc.wantRemoved {
+				if len(manager.removedForce) != 1 || manager.removedForce[0] != wt {
+					t.Fatalf("dead worker must reclaim the worktree: removedForce=%+v", manager.removedForce)
+				}
+				if got := countJobEvents(t, store, jobID, "delegation_worktree_cleanup_skipped"); got != 0 {
+					t.Fatalf("reclaim must not skip, got %d skip events", got)
+				}
+			} else {
+				if len(manager.removedForce) != 0 || len(manager.deletedBranches) != 0 {
+					t.Fatalf("live worker past lease must NOT be force-removed: removedForce=%+v deletedBranches=%+v", manager.removedForce, manager.deletedBranches)
+				}
+				if got := countJobEvents(t, store, jobID, "delegation_worktree_cleanup_skipped"); got != 1 {
+					t.Fatalf("live worker must skip cleanup once, got %d skip events", got)
+				}
+				if _, err := os.Stat(wt); err != nil {
+					t.Fatalf("worktree must be preserved on disk: stat err = %v", err)
+				}
+			}
+		})
+	}
+}
+
+// TestCleanupImplementDelegationWorktreeSkipIsIdempotent is the #536 finding 3
+// regression: reclaimSkippedDelegationWorktrees re-fires the cleanup every 1s tick
+// while the owner stays active. Emitting a fresh delegation_worktree_cleanup_skipped
+// event each call would grow the job event log without bound and make every
+// ListJobEvents scan O(n^2). Repeated cleanups against a still-active owner must emit
+// AT MOST ONE skip event, and once the owner clears, the worktree is reclaimed.
+func TestCleanupImplementDelegationWorktreeSkipIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	branch := "gitmoot-delegation-x-idem"
+	manager := &fakeWorktreeManager{existingBranches: map[string]bool{branch: true}}
+	engine.DelegationCheckout = t.TempDir()
+	engine.DelegationWorktrees = manager
+
+	wt := t.TempDir()
+	jobID := "parent-job/delegation/task-idem"
+	payload := JobPayload{DelegationID: "d1", WorktreePath: wt, Branch: branch, Result: &AgentResult{Decision: "failed"}}
+
+	// Owner active: a live process holds the worktree.
+	live := true
+	engine.WorktreeHasLiveProcess = func(string) bool { return live }
+	for i := 0; i < 5; i++ {
+		engine.cleanupImplementDelegationWorktree(ctx, jobID, "implement", payload)
+	}
+	if got := countJobEvents(t, store, jobID, "delegation_worktree_cleanup_skipped"); got != 1 {
+		t.Fatalf("repeated cleanup against an active owner must emit at most one skip event, got %d", got)
+	}
+	if len(manager.removedForce) != 0 {
+		t.Fatalf("worktree must be preserved while owner active: removedForce=%+v", manager.removedForce)
+	}
+
+	// Owner clears: the next cleanup reclaims and emits a single removed event.
+	live = false
+	engine.cleanupImplementDelegationWorktree(ctx, jobID, "implement", payload)
+	if len(manager.removedForce) != 1 || manager.removedForce[0] != wt {
+		t.Fatalf("worktree must be reclaimed once the owner clears: removedForce=%+v", manager.removedForce)
+	}
+	if got := countJobEvents(t, store, jobID, "delegation_worktree_removed"); got != 1 {
+		t.Fatalf("removed event count = %d, want 1", got)
+	}
+}
+
 func TestCleanupImplementDelegationWorktreeNoBranchDeleter(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

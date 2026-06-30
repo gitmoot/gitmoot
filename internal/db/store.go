@@ -589,7 +589,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 }
 
 // backfillJobRootID populates the denormalized root_id column for any pre-#420
-// jobs row that still has the migration's DEFAULT '' (every row inserted after
+// jobs row that still has the migration's DEFAULT ” (every row inserted after
 // #420 gets root_id at write time, so this only ever touches the historical
 // backlog once). It is the Go-side equivalent of the spec's in-migration
 // backfill SQL, chosen because modernc's json_extract raises a SQL error on a
@@ -597,7 +597,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 // Go lets a malformed or root_job_id-less payload self-root to the job's own id,
 // matching the engine's rootJobID() fallback exactly.
 //
-// It is idempotent: the WHERE root_id = '' filter means a second run touches
+// It is idempotent: the WHERE root_id = ” filter means a second run touches
 // nothing, and a job whose true root is genuinely "" is impossible because the
 // fallback is always the non-empty job id. Done outside applyMigration so it can
 // re-converge a partially-backfilled DB on any startup without bumping a version.
@@ -2296,7 +2296,7 @@ func (s *Store) MarkCommentSeenIfNew(ctx context.Context, comment Comment) (bool
 
 // rootIDFromPayload extracts the payload's root_job_id (the engine's rootJobID()
 // value source of truth) from a job payload JSON string. A malformed or
-// root_job_id-less payload yields "" — the caller's COALESCE(NULLIF(?,''), ?)
+// root_job_id-less payload yields "" — the caller's COALESCE(NULLIF(?,”), ?)
 // then self-roots the row to job.ID, matching rootJobID()'s fallback (#420).
 func rootIDFromPayload(payload string) string {
 	var p struct {
@@ -4854,10 +4854,22 @@ func (s *Store) DeleteResourceLocksByOwnerIfNotRunning(ctx context.Context, owne
 	return result.RowsAffected()
 }
 
+// DeleteExpiredResourceLocks reaps lock rows whose lease has elapsed, guarding
+// against deleting a lock out from under an owner job that is still 'running'.
+//
+// The owner_pid<=0 clause keeps the historical conservatism for NON-runtime locks
+// (e.g. skillopt-train-generation): a lock that records a live-process owner PID is
+// reclaimed by a PID-liveness check elsewhere, not by blind expiry. Runtime-session
+// locks (resource_key LIKE 'runtime:%') are the explicit exception: their recorded
+// PID is the gitmoot DAEMON's, not the spawned worker's, so it is meaningless after
+// a daemon restart and must NOT keep an expired lease alive forever. Without this
+// exception an expired runtime-session lock (which always sets owner_pid>0) would
+// NEVER be reaped here — stranding the job's recovery and worktree cleanup (#536
+// finding 2). The not-running guard still protects an actively-running owner.
 func (s *Store) DeleteExpiredResourceLocks(ctx context.Context, now time.Time) (int64, error) {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM resource_locks
 		WHERE expires_at <= ?
-			AND owner_pid <= 0
+			AND (owner_pid <= 0 OR resource_key LIKE 'runtime:%')
 			AND NOT EXISTS (
 				SELECT 1 FROM jobs
 				WHERE jobs.id = resource_locks.owner_job_id

@@ -15,17 +15,25 @@ import (
 	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
-func acquireRuntimeSessionLock(ctx context.Context, store *db.Store, jobID string, agent runtime.Agent, now time.Time, ttl time.Duration) (func(context.Context) error, bool, string, error) {
+// acquireRuntimeSessionLock acquires the per-job runtime-session lock and returns
+// a release closure, whether it was acquired, the resource key, the owner token
+// recorded on the lock, and any error. The owner token is surfaced so the caller
+// can thread it into the run context (workflow.WithRuntimeSelfOwnerToken): the
+// terminal worktree cleanup runs while this lock is still held (it is released
+// only after the run returns), so cleanup must be able to recognize the run's OWN
+// lock and not treat it as a foreign live owner (#536). A non-resumable runtime
+// (no resource key) returns an empty token and a no-op release.
+func acquireRuntimeSessionLock(ctx context.Context, store *db.Store, jobID string, agent runtime.Agent, now time.Time, ttl time.Duration) (func(context.Context) error, bool, string, string, error) {
 	key, ok := runtimeSessionResourceKey(agent)
 	if !ok {
-		return func(context.Context) error { return nil }, true, "", nil
+		return func(context.Context) error { return nil }, true, "", "", nil
 	}
 	if ttl <= 0 {
-		return nil, false, key, fmt.Errorf("runtime lock ttl must be positive")
+		return nil, false, key, "", fmt.Errorf("runtime lock ttl must be positive")
 	}
 	ownerToken, err := newRuntimeLockOwnerToken()
 	if err != nil {
-		return nil, false, key, err
+		return nil, false, key, "", err
 	}
 	// Record the acquiring process's identity (additive metadata) so a later
 	// liveness check — e.g. `agent restart`'s session-lock guard (#425) — can tell
@@ -43,12 +51,12 @@ func acquireRuntimeSessionLock(ctx context.Context, store *db.Store, jobID strin
 		ExpiresAt:     now.UTC().Add(ttl).Format(time.RFC3339Nano),
 	}, now)
 	if err != nil || !acquired {
-		return func(context.Context) error { return nil }, acquired, key, err
+		return func(context.Context) error { return nil }, acquired, key, "", err
 	}
 	return func(releaseCtx context.Context) error {
 		_, err := store.ReleaseResourceLock(releaseCtx, key, jobID, ownerToken)
 		return err
-	}, true, key, nil
+	}, true, key, ownerToken, nil
 }
 
 func runtimeSessionResourceKey(agent runtime.Agent) (string, bool) {
@@ -119,6 +127,34 @@ func runtimeSessionHeldByLiveOwner(ctx context.Context, store *db.Store, agent r
 		// Cross-host owner we cannot liveness-check locally: refuse conservatively.
 		return true, fmt.Sprintf("held by pid %d on %s (cross-host; liveness unverifiable)", lock.OwnerPID, hostText), nil
 	}
+}
+
+// runtimeOwnerLeaseHeld reports whether the running job jobID still holds a
+// runtime-session lock whose LEASE has not elapsed (or whose owner is on an
+// unverifiable cross-host). It is the gate stale-running-job recovery consults so
+// a long-running job is not requeued while its real job timeout — encoded in the
+// lease — has not elapsed (#536).
+//
+// It deliberately keys on the lease, NOT on owner-PID liveness: the lock records
+// the gitmoot DAEMON's PID, not the spawned runtime worker's, so on a daemon
+// restart the recorded PID is the dead prior daemon even while the reparented
+// worker is still progressing. Honoring the lease is therefore correct across a
+// restart and immune to PID reuse; see db.ResourceLockLiveness.LeaseHeld. A job
+// with no runtime lock (released on a normal terminal, or a non-resumable runtime)
+// is never lease-held, so it is recovered as before; once a lease expires
+// (recoverExpiredRuntimeSessionLocks reclaims it) the job is recovered too.
+func runtimeOwnerLeaseHeld(ctx context.Context, store *db.Store, jobID string, now time.Time) (bool, error) {
+	thisHost, _ := os.Hostname()
+	// excludeOwnerToken is "" — recovery runs from a daemon tick/startup that holds
+	// no runtime-session lock of its own, so there is nothing to exclude.
+	liveness, err := store.JobRuntimeLockLiveness(ctx, jobID, now, thisHost, skillOptOwnerPIDLive, "")
+	if err != nil {
+		return false, err
+	}
+	if liveness == nil {
+		return false, nil
+	}
+	return liveness.LeaseHeld(), nil
 }
 
 func newRuntimeLockOwnerToken() (string, error) {

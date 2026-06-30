@@ -49,11 +49,16 @@ jobs:
       - name: Test
         run: go test ./...
 
-      - name: Test (race detector, workflow engine + cli)
+      - name: Test (race detector, workflow engine + cli + db + daemon)
         # internal/cli is race-tested too because the #484 canary auto-rollback
         # decorator (canary_daemon.go) carries a concurrency contract — the daemon
         # runs jobs in a parallel worker pool, so two same-template harvests can
         # race to roll back the same canary and `candidate.rolled_back` must still
         # fire exactly once. TestCanaryLifecycleE2E's concurrent subtest asserts
         # that dedup, so it belongs under the detector.
-        run: go test -race ./internal/workflow/ ./internal/cli/
+        #
+        # internal/db and internal/daemon are race-tested because the #536 stale-
+        # recovery / worktree-cleanup fix adds concurrency-sensitive resource_locks
+        # reads (JobRuntimeLockLiveness, DeleteExpiredResourceLocks) that the daemon
+        # worker pool exercises from multiple goroutines.
+        run: go test -race ./internal/workflow/ ./internal/cli/ ./internal/db/ ./internal/daemon/

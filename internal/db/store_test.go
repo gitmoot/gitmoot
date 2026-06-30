@@ -1554,6 +1554,46 @@ func TestResourceLockCleanupSkipsPIDBackedLease(t *testing.T) {
 	}
 }
 
+// TestDeleteExpiredResourceLocksReapsPIDBackedRuntimeLock is the #536 finding 2
+// regression: a runtime-session lock always records owner_pid>0 (the daemon PID),
+// so the historical `owner_pid <= 0` reap guard meant DeleteExpiredResourceLocks
+// NEVER reaped expired runtime-session locks — stranding recovery after a daemon
+// restart (especially under a new hostname). An EXPIRED runtime: lock whose owner
+// job is not running must now be reaped regardless of owner_pid; a non-runtime
+// pid-backed lock is still protected (TestResourceLockCleanupSkipsPIDBackedLease).
+func TestDeleteExpiredResourceLocksReapsPIDBackedRuntimeLock(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	if acquired, err := store.AcquireResourceLock(ctx, ResourceLock{
+		ResourceKey:   "runtime:codex:session-pid",
+		OwnerJobID:    "job-restarted",
+		OwnerToken:    "token-a",
+		OwnerPID:      694433, // a prior daemon PID, dead after restart
+		OwnerHostname: "pod-before-restart",
+		ExpiresAt:     now.Add(time.Minute).Format(time.RFC3339Nano),
+	}, now); err != nil || !acquired {
+		t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
+	}
+	// Before expiry: not reaped.
+	if deleted, err := store.DeleteExpiredResourceLocks(ctx, now); err != nil || deleted != 0 {
+		t.Fatalf("pre-expiry DeleteExpiredResourceLocks deleted=%d err=%v, want 0", deleted, err)
+	}
+	// After expiry, owner job not running: reaped despite owner_pid>0.
+	deleted, err := store.DeleteExpiredResourceLocks(ctx, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("DeleteExpiredResourceLocks returned error: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expired pid-backed runtime lock deleted = %d, want 1", deleted)
+	}
+}
+
 func TestResourceLockDoesNotRecoverExpiredRunningOwner(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))

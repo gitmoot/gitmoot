@@ -203,7 +203,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	} else if jobTimeout > 0 {
 		lockTTL = jobTimeout
 	}
-	releaseLock, acquired, lockKey, err := acquireRuntimeSessionLock(ctx, store, job.ID, runtimeAgent(agent), time.Now().UTC(), lockTTL)
+	releaseLock, acquired, lockKey, ownerToken, err := acquireRuntimeSessionLock(ctx, store, job.ID, runtimeAgent(agent), time.Now().UTC(), lockTTL)
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
@@ -220,6 +220,10 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	defer func() {
 		_ = releaseLock(context.Background())
 	}()
+	// Thread the owner token so a foreground run's terminal cleanup (RunJob ->
+	// AdvanceJob, which fires while this lock is still held) recognizes its own lock
+	// and does not refuse the healthy-path cleanup as a foreign live owner (#536).
+	ctx = workflow.WithRuntimeSelfOwnerToken(ctx, ownerToken)
 	adapter, err := runtimeStartAdapter(newRuntimeFactory(), agent.Runtime, checkoutPath)
 	if err != nil {
 		return localAgentJobOutput{}, err

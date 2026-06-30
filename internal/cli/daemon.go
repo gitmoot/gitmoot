@@ -1595,7 +1595,8 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 }
 
 func recoverRunningJobs(ctx context.Context, store *db.Store, stdout io.Writer) error {
-	return recoverRunningJobsBeforeForRepo(ctx, store, stdout, time.Now().UTC().Add(-daemonRunningJobStaleAfter), "", "")
+	now := time.Now().UTC()
+	return recoverRunningJobsBeforeForRepo(ctx, store, stdout, now, now.Add(-daemonRunningJobStaleAfter), "", "")
 }
 
 func recoverExpiredRuntimeSessionLocks(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time) error {
@@ -1610,11 +1611,12 @@ func recoverExpiredRuntimeSessionLocks(ctx context.Context, store *db.Store, std
 }
 
 func recoverRunningJobsBefore(ctx context.Context, store *db.Store, stdout io.Writer, before time.Time) error {
-	return recoverRunningJobsBeforeForRepo(ctx, store, stdout, before, "", "")
+	return recoverRunningJobsBeforeForRepo(ctx, store, stdout, time.Now().UTC(), before, "", "")
 }
 
 func recoverRunningJobsForRepo(ctx context.Context, store *db.Store, stdout io.Writer, repoFilter string, rootFilter string) error {
-	return recoverRunningJobsBeforeForRepo(ctx, store, stdout, time.Now().UTC().Add(-daemonRunningJobStaleAfter), repoFilter, rootFilter)
+	now := time.Now().UTC()
+	return recoverRunningJobsBeforeForRepo(ctx, store, stdout, now, now.Add(-daemonRunningJobStaleAfter), repoFilter, rootFilter)
 }
 
 func recoverCancelledRunningJobsForEnabledRepos(ctx context.Context, store *db.Store, rootFilter string, stdout io.Writer) error {
@@ -1653,13 +1655,36 @@ func recoverCancelledRunningJobsForRepo(ctx context.Context, store *db.Store, st
 	return nil
 }
 
-func recoverRunningJobsBeforeForRepo(ctx context.Context, store *db.Store, stdout io.Writer, before time.Time, repoFilter string, rootFilter string) error {
+func recoverRunningJobsBeforeForRepo(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time, before time.Time, repoFilter string, rootFilter string) error {
 	jobs, err := store.ListRunningJobsUpdatedBefore(ctx, before)
 	if err != nil {
 		return err
 	}
 	for _, job := range jobs {
 		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+			continue
+		}
+		// Liveness gate (#536): the coarse `updated_at < before` threshold (30m) is a
+		// crash backstop, NOT a timeout. A long-running job (e.g. a 4h delegation)
+		// holds a runtime-session lock whose LEASE reflects its real job timeout. If
+		// that lease has not elapsed the job's timeout has not elapsed, so leave it
+		// running — requeuing it would start a second copy that fails on the dirty
+		// in-flight worktree and then force-cleans it out from under the live worker.
+		//
+		// This keys on the lease, NOT on the lock's owner PID: the recorded PID is the
+		// gitmoot DAEMON's, not the spawned runtime worker's, so on a daemon restart it
+		// is the dead prior daemon even while the reparented worker keeps running — the
+		// exact path this recovery is named for. Honoring the lease is correct across a
+		// restart (the lease survives in the DB) and immune to PID reuse. The trade-off:
+		// a genuinely-crashed worker whose daemon also died is recovered only once its
+		// lease expires (recoverExpiredRuntimeSessionLocks reclaims it, then a later
+		// tick requeues it) rather than at the 30m threshold — promptness traded for
+		// never failing live work, the unattended-reliability goal of #536.
+		leaseHeld, err := runtimeOwnerLeaseHeld(ctx, store, job.ID, now)
+		if err != nil {
+			return err
+		}
+		if leaseHeld {
 			continue
 		}
 		recovered, err := store.TransitionJobStateWithEvent(ctx, job.ID, string(workflow.JobRunning), string(workflow.JobQueued), db.JobEvent{
@@ -1704,17 +1729,75 @@ func retryPendingJobAdvancements(ctx context.Context, worker jobWorker, repoFilt
 	return nil
 }
 
+// delegationWorktreeCleanupPending reports whether jobID's last terminal cleanup
+// outcome was a PRESERVE (delegation_worktree_cleanup_skipped) with no subsequent
+// reclamation (delegation_worktree_removed) — i.e. its per-delegation worktree and
+// gitmoot-delegation-* branch are still on disk awaiting reclaim once the foreign
+// runtime owner that blocked the cleanup releases/expires (#536). The order of the
+// two event kinds matters (a worktree can be preserved, then later removed), so the
+// LAST one wins.
+func (w jobWorker) delegationWorktreeCleanupPending(ctx context.Context, jobID string) (bool, error) {
+	events, err := w.Store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	pending := false
+	for _, event := range events {
+		switch event.Kind {
+		case "delegation_worktree_cleanup_skipped":
+			pending = true
+		case "delegation_worktree_removed":
+			pending = false
+		}
+	}
+	return pending, nil
+}
+
+// reclaimSkippedDelegationWorktrees re-fires the terminal worktree cleanup for any
+// terminal delegation child whose cleanup was previously SKIPPED because a foreign
+// runtime owner was still active (#536). The cleanup is idempotent and itself
+// liveness-gated, so this is a no-op while the owner remains active; once the
+// owner's lock releases or its lease expires (recoverExpiredRuntimeSessionLocks
+// runs earlier in the tick), the preserved worktree+branch are reclaimed rather
+// than leaked forever.
+func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string) error {
+	jobs, err := worker.Store.ListJobs(ctx)
+	if err != nil {
+		return err
+	}
+	for _, job := range jobs {
+		if !jobStateCanRetryAdvancement(job.State) || !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+			continue
+		}
+		pending, err := worker.delegationWorktreeCleanupPending(ctx, job.ID)
+		if err != nil {
+			return err
+		}
+		if !pending {
+			continue
+		}
+		engine := worker.WorkflowFactory(worker.delegationParentCheckout(ctx, job))
+		if err := engine.ReclaimTerminalDelegationWorktree(ctx, job.ID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func runDaemonWorkerTick(ctx context.Context, store *db.Store, worker jobWorker, workers int, dryRun bool, repoFilter string, rootFilter string, stdout io.Writer, now time.Time) error {
 	if dryRun {
 		return nil
 	}
-	if err := recoverRunningJobsBeforeForRepo(ctx, store, stdout, now.Add(-daemonRunningJobStaleAfter), repoFilter, rootFilter); err != nil {
+	if err := recoverRunningJobsBeforeForRepo(ctx, store, stdout, now, now.Add(-daemonRunningJobStaleAfter), repoFilter, rootFilter); err != nil {
 		return err
 	}
 	if err := recoverExpiredRuntimeSessionLocks(ctx, store, stdout, now); err != nil {
 		return err
 	}
 	if err := retryPendingJobAdvancements(ctx, worker, repoFilter, rootFilter); err != nil {
+		return err
+	}
+	if err := reclaimSkippedDelegationWorktrees(ctx, worker, repoFilter, rootFilter); err != nil {
 		return err
 	}
 	if err := retryPendingJobComments(ctx, worker, repoFilter, rootFilter); err != nil {
@@ -2593,7 +2676,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if jobTimeout > 0 {
 		lockTTL = jobTimeout
 	}
-	releaseLock, acquired, lockKey, err := acquireRuntimeSessionLock(ctx, w.Store, job.ID, agent, time.Now().UTC(), lockTTL)
+	releaseLock, acquired, lockKey, ownerToken, err := acquireRuntimeSessionLock(ctx, w.Store, job.ID, agent, time.Now().UTC(), lockTTL)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -2632,6 +2715,13 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			writeLine(w.Stdout, "job %s runtime lock release failed: %v", job.ID, err)
 		}
 	}()
+	// Thread the owner token into the context so the terminal worktree cleanup
+	// (which runs inside RunJob -> AdvanceJob while THIS lock is still held — it is
+	// released only by the defer above, after RunJob returns) recognizes the run's
+	// OWN lock and does not refuse the healthy-path cleanup as if a foreign live
+	// owner held it (#536 / #478). Covers RunJob and the handleRunJobError finalize
+	// path below, both of which derive from this ctx.
+	ctx = workflow.WithRuntimeSelfOwnerToken(ctx, ownerToken)
 	// Cockpit wrapping happens AFTER the runtime-session lock + checkout
 	// resolution so at most one live pane exists per held runtime session and the
 	// pane's CWD is the resolved worktree. It is strictly opt-in and best-effort:
@@ -3271,7 +3361,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		return nil
 	}
 	writeLine(w.Stdout, "running job %s for temporary worker %s in %s", job.ID, started.Agent.Name, payload.Repo)
-	releaseLock, acquired, lockKey, err := acquireRuntimeSessionLock(ctx, w.Store, delegatedJob.ID, started.Agent, time.Now().UTC(), started.JobTimeout)
+	releaseLock, acquired, lockKey, ownerToken, err := acquireRuntimeSessionLock(ctx, w.Store, delegatedJob.ID, started.Agent, time.Now().UTC(), started.JobTimeout)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -3292,6 +3382,9 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 			writeLine(w.Stdout, "job %s temp runtime lock release failed: %v", delegatedJob.ID, err)
 		}
 	}()
+	// See runQueuedJob: thread the owner token so terminal cleanup recognizes this
+	// run's own still-held lock and does not refuse the healthy-path cleanup (#536).
+	ctx = workflow.WithRuntimeSelfOwnerToken(ctx, ownerToken)
 	if err := w.Store.MarkAgentInstanceRunning(ctx, started.Agent.Name, time.Now().UTC(), started.JobTimeout); err != nil {
 		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
