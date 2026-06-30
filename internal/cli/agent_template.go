@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/agenttemplate"
+	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
 )
 
@@ -30,6 +31,12 @@ func runAgentTemplate(args []string, stdout, stderr io.Writer) int {
 		return runAgentTemplateAdd(args[1:], stdout, stderr)
 	case "export":
 		return runAgentTemplateExport(args[1:], stdout, stderr)
+	case "publish":
+		return runAgentTemplatePublish(args[1:], stdout, stderr)
+	case "pull":
+		return runAgentTemplatePull(args[1:], stdout, stderr)
+	case "remote":
+		return runAgentTemplateRemote(args[1:], stdout, stderr)
 	case "draft":
 		return runAgentTemplateDraft(args[1:], stdout, stderr)
 	case "list":
@@ -56,6 +63,10 @@ func printAgentTemplateUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot agent template add <template-id> --file ./agents/<template-id>.md [--name <name>] [--description <text>]")
 	fmt.Fprintln(w, "  gitmoot agent template add <template-id> --from-repo <owner/repo> [--ref <ref>] [--path <file>]")
 	fmt.Fprintln(w, "  gitmoot agent template export [<template-id>...] [--all] [--to <dir>] [--dry-run]")
+	fmt.Fprintln(w, "  gitmoot agent template publish [<template-id>...] [--all] [--repo <owner/repo>] [--path <subdir>] [--ref <branch>] [--message <msg>] [--create] [--dry-run]")
+	fmt.Fprintln(w, "  gitmoot agent template pull [<template-id>...] [--all] [--repo <owner/repo>] [--ref <ref>] [--path <subdir>] [--dry-run]")
+	fmt.Fprintln(w, "  gitmoot agent template remote set <owner/repo> [--ref <ref>] [--path <subdir>]")
+	fmt.Fprintln(w, "  gitmoot agent template remote show")
 	fmt.Fprintln(w, "  gitmoot agent template draft <template-id> [--output .gitmoot/templates/<template-id>.md] [--force]")
 	fmt.Fprintln(w, "  gitmoot agent template validate <file>")
 	fmt.Fprintln(w, "  gitmoot agent template list")
@@ -132,6 +143,22 @@ func runAgentTemplateAdd(args []string, stdout, stderr io.Writer) int {
 	if hasFile && hasRepo {
 		fmt.Fprintln(stderr, "agent template add accepts either --file or --from-repo, not both")
 		return 2
+	}
+	// With neither source given, fall back to the configured [template_remote]
+	// default (#476). This is additive/off-by-default: it only fires when a remote
+	// is configured; with no remote, hasRepo stays false and the existing
+	// "requires --file or --from-repo" error path below is byte-identical.
+	if !hasFile && !hasRepo {
+		if remote, ok := configuredTemplateRemote(*home); ok {
+			*fromRepo = remote.Repo
+			if strings.TrimSpace(*ref) == "" {
+				*ref = remote.Ref
+			}
+			if strings.TrimSpace(*path) == "" && strings.TrimSpace(remote.Path) != "" {
+				*path = strings.Trim(remote.Path, "/") + "/" + id + ".md"
+			}
+			hasRepo = true
+		}
 	}
 	if hasRepo {
 		fmt.Fprintln(stderr, "note: pulled templates are stored verbatim; only pull from repos you trust, and keep private prompts in a private repo")
@@ -543,27 +570,45 @@ func runAgentTemplateDiff(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprint(stdout, agenttemplate.DiffExact(cached.Content, file.Content))
 			return nil
 		}
-		definition, ok := agenttemplate.Lookup(id)
-		if !ok {
-			return fmt.Errorf("agent template %s is not a local custom template and has no built-in source", id)
+		if definition, ok := agenttemplate.Lookup(id); ok {
+			fetcher := newAgentTemplateFetcher()
+			resolvedCommit, err := fetcher.ResolveRef(context.Background(), definition.SourceRepo, definition.SourceRef)
+			if err != nil {
+				return err
+			}
+			upstream, err := fetcher.FetchFile(context.Background(), definition.SourceRepo, resolvedCommit, definition.SourcePath)
+			if err != nil {
+				return err
+			}
+			upstreamContent, err := agenttemplate.ContentForDefinition(definition, upstream.Content)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(stdout, "cached:   %s\n", cached.ResolvedCommit)
+			fmt.Fprintf(stdout, "upstream: %s\n", resolvedCommit)
+			fmt.Fprint(stdout, agenttemplate.Diff(cached.Content, upstreamContent))
+			return nil
 		}
-		fetcher := newAgentTemplateFetcher()
-		resolvedCommit, err := fetcher.ResolveRef(context.Background(), definition.SourceRepo, definition.SourceRef)
-		if err != nil {
-			return err
+		// A pulled (remote-sourced) row carries a real owner/repo and is
+		// re-fetchable: mirror the built-in branch against its stored
+		// SourceRepo/SourceRef/SourcePath so `diff` works for pulled templates
+		// (#476). Gated on IsRemote so local rows never reach here.
+		if agenttemplate.IsRemote(cached) {
+			fetcher := newAgentTemplateFetcher()
+			resolvedCommit, err := fetcher.ResolveRef(context.Background(), cached.SourceRepo, cached.SourceRef)
+			if err != nil {
+				return err
+			}
+			upstream, err := fetcher.FetchFile(context.Background(), cached.SourceRepo, resolvedCommit, cached.SourcePath)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(stdout, "cached:   %s\n", cached.ResolvedCommit)
+			fmt.Fprintf(stdout, "upstream: %s\n", resolvedCommit)
+			fmt.Fprint(stdout, agenttemplate.Diff(cached.Content, upstream.Content))
+			return nil
 		}
-		upstream, err := fetcher.FetchFile(context.Background(), definition.SourceRepo, resolvedCommit, definition.SourcePath)
-		if err != nil {
-			return err
-		}
-		upstreamContent, err := agenttemplate.ContentForDefinition(definition, upstream.Content)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(stdout, "cached:   %s\n", cached.ResolvedCommit)
-		fmt.Fprintf(stdout, "upstream: %s\n", resolvedCommit)
-		fmt.Fprint(stdout, agenttemplate.Diff(cached.Content, upstreamContent))
-		return nil
+		return fmt.Errorf("agent template %s is not a local custom template and has no built-in source", id)
 	})
 }
 
@@ -733,6 +778,14 @@ func shortCommit(commit string) string {
 
 func withStoreExit(home string, stderr io.Writer, label string, fn func(*db.Store) error) int {
 	if err := withStore(home, fn); err != nil {
+		fmt.Fprintf(stderr, "%s: %v\n", label, err)
+		return 1
+	}
+	return 0
+}
+
+func withStoreAndPathsExit(home string, stderr io.Writer, label string, fn func(config.Paths, *db.Store) error) int {
+	if err := withStoreAndPaths(home, fn); err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", label, err)
 		return 1
 	}
