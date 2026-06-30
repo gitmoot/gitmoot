@@ -128,6 +128,15 @@ CREATE TABLE agent_template_versions (
 	version INTEGER NOT NULL,
 	state TEXT NOT NULL
 );
+-- job_events as it existed at an earlier (here pre-seeded-as-applied) migration,
+-- so the #549 job_events index migration that runs in this pass has its table.
+CREATE TABLE job_events (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	job_id TEXT NOT NULL,
+	kind TEXT NOT NULL,
+	message TEXT NOT NULL,
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
 INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'succeeded', '{}');
 `); err != nil {

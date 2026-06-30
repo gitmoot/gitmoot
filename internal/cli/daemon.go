@@ -1856,24 +1856,35 @@ func (w jobWorker) delegationWorktreeCleanupPending(ctx context.Context, jobID s
 // owner's lock releases or its lease expires (recoverExpiredRuntimeSessionLocks
 // runs earlier in the tick), the preserved worktree+branch are reclaimed rather
 // than leaked forever.
+//
+// It is BOUNDED, not a full-table scan (#549): rather than list every job and
+// re-read each terminal job's full event history (ListJobEvents) on every 1s
+// supervisor tick — O(jobs × events), which burned a core once a few hundred
+// terminal jobs had accumulated — it asks the store for ONLY the (small) set of
+// jobs whose latest cleanup outcome is still an unreconciled preserve marker, and
+// reads just those. Correctness is unchanged: a worktree that genuinely needs
+// reclaiming still carries that marker and is still reclaimed; once reclaimed it
+// emits delegation_worktree_removed and drops out of the candidate set.
 func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string) error {
-	jobs, err := worker.Store.ListJobs(ctx)
+	jobIDs, err := worker.Store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
 	if err != nil {
 		return err
 	}
-	for _, job := range jobs {
-		if !jobStateCanRetryAdvancement(job.State) || !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+	for _, jobID := range jobIDs {
+		job, err := worker.Store.GetJob(ctx, jobID)
+		if errors.Is(err, sql.ErrNoRows) {
+			// A cleanup-marker event with no surviving job row (e.g. a pruned job):
+			// nothing to reclaim, and erroring here would abort the whole tick.
 			continue
 		}
-		pending, err := worker.delegationWorktreeCleanupPending(ctx, job.ID)
 		if err != nil {
 			return err
 		}
-		if !pending {
+		if !jobStateCanRetryAdvancement(job.State) || !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
 			continue
 		}
 		engine := worker.WorkflowFactory(worker.delegationParentCheckout(ctx, job))
-		if err := engine.ReclaimTerminalDelegationWorktree(ctx, job.ID); err != nil {
+		if err := engine.ReclaimTerminalDelegationWorktree(ctx, jobID); err != nil {
 			return err
 		}
 	}

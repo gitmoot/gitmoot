@@ -2763,6 +2763,49 @@ func (s *Store) JobIDsWithEventKind(ctx context.Context, kind string) (map[strin
 	return out, rows.Err()
 }
 
+// JobIDsWithPendingDelegationWorktreeReclaim returns the IDs of jobs whose most
+// recent terminal delegation-worktree cleanup outcome was a PRESERVE
+// (delegation_worktree_cleanup_skipped) NOT yet followed by a removal
+// (delegation_worktree_removed) — i.e. their per-delegation worktree and
+// gitmoot-delegation-* branch are still on disk awaiting reclaim (#536/#549).
+//
+// This is a single indexed query so the daemon's reclaim pass can iterate only
+// the (small) set of jobs that genuinely carry an unreconciled preserve marker,
+// instead of listing EVERY terminal job and re-reading each one's FULL event
+// history (ListJobEvents) on every 1s supervisor tick — which was O(jobs ×
+// events) and burned a core once a few hundred terminal jobs had accumulated.
+//
+// The order of the two cleanup-outcome kinds matters (a worktree can be
+// preserved, then later removed), so the LAST one wins: a job is "pending" iff
+// the highest-id event among the two kinds is a skip. The MAX(id) subquery picks
+// that latest outcome per job and the outer filter keeps only the jobs where it
+// is a skip — exactly mirroring the per-job lastCleanupOutcomeIsSkip walk, but
+// set-at-once.
+func (s *Store) JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT job_id FROM job_events
+		WHERE kind = 'delegation_worktree_cleanup_skipped'
+		  AND id IN (
+			SELECT MAX(id) FROM job_events
+			WHERE kind IN ('delegation_worktree_cleanup_skipped', 'delegation_worktree_removed')
+			GROUP BY job_id
+		)
+		ORDER BY job_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobIDs []string
+	for rows.Next() {
+		var jobID string
+		if err := rows.Scan(&jobID); err != nil {
+			return nil, err
+		}
+		jobIDs = append(jobIDs, jobID)
+	}
+	return jobIDs, rows.Err()
+}
+
 func (s *Store) UpsertEvalArtifact(ctx context.Context, artifact EvalArtifact) error {
 	artifact, err := normalizeEvalArtifact(artifact)
 	if err != nil {
@@ -6400,5 +6443,16 @@ ALTER TABLE agent_template_versions ADD COLUMN canary_sample REAL NOT NULL DEFAU
 ALTER TABLE agent_template_versions ADD COLUMN canary_started_at TEXT NOT NULL DEFAULT '';
 
 CREATE INDEX idx_atv_canary ON agent_template_versions(template_id) WHERE state = 'canary';
+	`,
+	// #549: index job_events so per-job and per-kind lookups stop full-scanning
+	// the table. job_events had NO index, so every ListJobEvents(jobID) (one per
+	// job in several daemon passes) and the cleanup-marker queries scanned the
+	// whole table. idx_job_events_job_id covers the WHERE job_id=? ORDER BY id
+	// read; idx_job_events_kind covers the kind-filtered marker queries
+	// (JobIDsWithEventKind / JobIDsWithPendingDelegationWorktreeReclaim). Both are
+	// pure additive indexes — no row reads differently, only faster.
+	`
+CREATE INDEX idx_job_events_job_id ON job_events(job_id);
+CREATE INDEX idx_job_events_kind ON job_events(kind);
 	`,
 }

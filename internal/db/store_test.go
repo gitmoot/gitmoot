@@ -3848,3 +3848,138 @@ func TestGetOrCreateWorkspaceForRootConcurrent(t *testing.T) {
 		t.Fatalf("post-race bound id = %q, want %q", final, winner)
 	}
 }
+
+// TestJobIDsWithPendingDelegationWorktreeReclaim is the #549 regression guard:
+// the daemon's reclaim pass must find the (small) set of jobs whose latest
+// delegation-worktree cleanup outcome is still an unreconciled PRESERVE marker
+// via ONE bounded query, instead of listing every job and re-reading each
+// terminal job's full event history every tick (O(jobs × events)). It asserts
+// the marker bookkeeping (skip vs removed, last-one-wins) end-to-end against a
+// real temp Store, and that jobs with no marker — the ~95% terminal majority —
+// never enter the candidate set regardless of how much OTHER event history they
+// carry.
+func TestJobIDsWithPendingDelegationWorktreeReclaim(t *testing.T) {
+	const (
+		skipKind   = "delegation_worktree_cleanup_skipped"
+		removeKind = "delegation_worktree_removed"
+	)
+	cases := []struct {
+		name        string
+		events      []string // in insertion order
+		wantPending bool
+	}{
+		{name: "no events", events: nil, wantPending: false},
+		{name: "unrelated events only", events: []string{"queued", "running", "succeeded"}, wantPending: false},
+		{name: "preserve marker pending", events: []string{"failed", skipKind}, wantPending: true},
+		{name: "preserve then removed reconciled", events: []string{skipKind, removeKind}, wantPending: false},
+		{name: "removed only not pending", events: []string{removeKind}, wantPending: false},
+		{name: "preserve removed preserve last wins", events: []string{skipKind, removeKind, skipKind}, wantPending: true},
+		{name: "removed after preserve with trailing noise", events: []string{skipKind, removeKind, "succeeded"}, wantPending: false},
+		{name: "preserve with trailing noise still pending", events: []string{skipKind, "succeeded"}, wantPending: true},
+	}
+
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	want := map[string]bool{}
+	for i, tc := range cases {
+		jobID := "job-" + tc.name + "-" + string(rune('a'+i))
+		if err := store.CreateJob(ctx, Job{ID: jobID, Agent: "producer", Type: "implement", State: string("failed")}); err != nil {
+			t.Fatalf("CreateJob(%s) returned error: %v", jobID, err)
+		}
+		for _, kind := range tc.events {
+			if err := store.AddJobEvent(ctx, JobEvent{JobID: jobID, Kind: kind, Message: "m"}); err != nil {
+				t.Fatalf("AddJobEvent(%s, %s) returned error: %v", jobID, kind, err)
+			}
+		}
+		if tc.wantPending {
+			want[jobID] = true
+		}
+	}
+
+	got, err := store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+	if err != nil {
+		t.Fatalf("JobIDsWithPendingDelegationWorktreeReclaim returned error: %v", err)
+	}
+	gotSet := map[string]bool{}
+	for _, id := range got {
+		if gotSet[id] {
+			t.Fatalf("duplicate job id %q in result %v", id, got)
+		}
+		gotSet[id] = true
+	}
+	if len(gotSet) != len(want) {
+		t.Fatalf("pending set = %v, want exactly %v", got, want)
+	}
+	for id := range want {
+		if !gotSet[id] {
+			t.Fatalf("expected job %q in pending set, got %v", id, got)
+		}
+	}
+}
+
+// TestJobIDsWithPendingDelegationWorktreeReclaimRaceSafe exercises the bounded
+// reclaim query concurrently with writers that emit and reconcile markers, the
+// way the daemon supervisor tick reads while RunJob/ReclaimTerminalDelegationWorktree
+// write. It must never error or deadlock under -race.
+func TestJobIDsWithPendingDelegationWorktreeReclaimRaceSafe(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	const n = 12
+	for i := 0; i < n; i++ {
+		jobID := "race-job-" + string(rune('a'+i))
+		if err := store.CreateJob(ctx, Job{ID: jobID, Agent: "producer", Type: "implement", State: "failed"}); err != nil {
+			t.Fatalf("CreateJob returned error: %v", err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			jobID := "race-job-" + string(rune('a'+i))
+			_ = store.AddJobEvent(ctx, JobEvent{JobID: jobID, Kind: "delegation_worktree_cleanup_skipped", Message: "preserve"})
+			if i%2 == 0 {
+				_ = store.AddJobEvent(ctx, JobEvent{JobID: jobID, Kind: "delegation_worktree_removed", Message: "removed"})
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			if _, err := store.JobIDsWithPendingDelegationWorktreeReclaim(ctx); err != nil {
+				t.Errorf("concurrent JobIDsWithPendingDelegationWorktreeReclaim returned error: %v", err)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+
+	// Final steady state: odd-indexed jobs kept their preserve marker (pending),
+	// even-indexed jobs reconciled with a removal (not pending).
+	got, err := store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+	if err != nil {
+		t.Fatalf("JobIDsWithPendingDelegationWorktreeReclaim returned error: %v", err)
+	}
+	gotSet := map[string]bool{}
+	for _, id := range got {
+		gotSet[id] = true
+	}
+	for i := 0; i < n; i++ {
+		jobID := "race-job-" + string(rune('a'+i))
+		wantPending := i%2 == 1
+		if gotSet[jobID] != wantPending {
+			t.Fatalf("job %s pending=%v, want %v (set=%v)", jobID, gotSet[jobID], wantPending, got)
+		}
+	}
+}
