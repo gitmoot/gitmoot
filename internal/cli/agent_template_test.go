@@ -280,6 +280,84 @@ func TestAgentTemplateAddRejectsConflictingSources(t *testing.T) {
 	}
 }
 
+// TestAgentTemplateAddWithoutSourceAndNoRemoteIsByteIdenticalError proves the
+// off-by-default no-regression invariant for the [template_remote] fallback
+// (#476): with NO remote configured, `agent template add <id>` (neither --file
+// nor --from-repo) must still hard-error with the documented guidance and exit
+// 2, exactly as before the fallback existed. It also exercises
+// configuredTemplateRemote returning not-configured for a fresh home.
+func TestAgentTemplateAddWithoutSourceAndNoRemoteIsByteIdenticalError(t *testing.T) {
+	// Fail loudly if the fallback ever silently reaches the network when no
+	// remote is configured.
+	restore := replaceAgentTemplateFetcher(explodingFetcher{t: t})
+	defer restore()
+	var stdout, stderr bytes.Buffer
+	home := t.TempDir()
+
+	if _, ok := configuredTemplateRemote(home); ok {
+		t.Fatalf("configuredTemplateRemote on a fresh home should report not-configured")
+	}
+
+	code := Run([]string{"agent", "template", "add", "--home", home, "someid"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("add with no source and no remote exit code = %d (want 2), stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "requires --file or --from-repo") {
+		t.Fatalf("stderr missing flag-required guidance:\n%s", stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) != "" {
+		t.Fatalf("add with no source should not print to stdout:\n%s", stdout.String())
+	}
+}
+
+// TestAgentTemplateAddFallsBackToConfiguredRemote proves the additive fallback
+// branch (#476): after `remote set jerry/templates --path agents`, a bare
+// `agent template add frontend-reviewer` (no --file/--from-repo) fetches
+// agents/frontend-reviewer.md from the configured remote and installs it,
+// confirming the fallback wires repo/ref/path correctly.
+func TestAgentTemplateAddFallsBackToConfiguredRemote(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	home := t.TempDir()
+
+	if code := Run([]string{"agent", "template", "remote", "set", "jerry/templates", "--home", home, "--path", "agents"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("remote set exit code = %d, stderr=%s", code, stderr.String())
+	}
+
+	recorder := &recordingAgentTemplateFetcher{
+		commit:  "remote-sha",
+		content: testLocalTemplateContent("frontend-reviewer", "Review frontend changes.\n"),
+	}
+	restore := replaceAgentTemplateFetcher(recorder)
+	defer restore()
+
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{"agent", "template", "add", "--home", home, "frontend-reviewer"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("add via configured remote exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "added frontend-reviewer at remote-sha") {
+		t.Fatalf("add via configured remote stdout = %s", stdout.String())
+	}
+	if recorder.fetchedRepo != "jerry/templates" {
+		t.Fatalf("fallback fetched repo = %q, want jerry/templates", recorder.fetchedRepo)
+	}
+	if recorder.fetchedPath != "agents/frontend-reviewer.md" {
+		t.Fatalf("fallback fetched path = %q, want agents/frontend-reviewer.md", recorder.fetchedPath)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"agent", "template", "show", "--home", home, "frontend-reviewer"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("template show exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{"source: jerry/templates@main:agents/frontend-reviewer.md", "installed: yes", "Review frontend changes."} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("show output missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
 func TestAgentTemplateExportWritesCustomTemplatesAndSkipsBuiltins(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	home := t.TempDir()
@@ -994,6 +1072,29 @@ func (f explodingFetcher) FetchFile(context.Context, string, string, string) (ag
 type fakeAgentTemplateFetcher struct {
 	commit  string
 	content string
+}
+
+// recordingAgentTemplateFetcher serves content like fakeAgentTemplateFetcher but
+// records the repo/ref/path it was asked to fetch, so tests can assert the caller
+// wired the source correctly.
+type recordingAgentTemplateFetcher struct {
+	commit      string
+	content     string
+	fetchedRepo string
+	fetchedRef  string
+	fetchedPath string
+}
+
+func (f *recordingAgentTemplateFetcher) ResolveRef(_ context.Context, repo string, ref string) (string, error) {
+	f.fetchedRepo = repo
+	f.fetchedRef = ref
+	return f.commit, nil
+}
+
+func (f *recordingAgentTemplateFetcher) FetchFile(_ context.Context, repo string, _ string, path string) (agenttemplate.File, error) {
+	f.fetchedRepo = repo
+	f.fetchedPath = path
+	return agenttemplate.File{Content: f.content}, nil
 }
 
 func (f fakeAgentTemplateFetcher) ResolveRef(context.Context, string, string) (string, error) {
