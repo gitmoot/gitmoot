@@ -51,6 +51,8 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 		return runAgentImplement(args[1:], stdout, stderr)
 	case "type":
 		return runAgentType(args[1:], stdout, stderr)
+	case "heartbeat":
+		return runAgentHeartbeat(args[1:], stdout, stderr)
 	case "template":
 		return runAgentTemplate(args[1:], stdout, stderr)
 	case "prompt":
@@ -90,6 +92,7 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background] [--type type] [--model model] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--branch branch] [--background] [--type type] [--model model] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
+	fmt.Fprintln(w, "  gitmoot agent heartbeat add|list|show|enable|disable|remove ...")
 	fmt.Fprintln(w, "  gitmoot agent template list|show|add|draft|validate|update|diff ...")
 	fmt.Fprintln(w, "  gitmoot agent prompt <agent-or-template> [--json]")
 	fmt.Fprintln(w, "  gitmoot agent gc")

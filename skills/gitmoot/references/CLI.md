@@ -362,6 +362,22 @@ gitmoot agent gc
 `agent type set --model <name>` (or `[agents.<type>].model` in config) sets the
 default runtime model for that managed agent type.
 
+Schedule recurring agent work (heartbeats, off by default):
+
+```sh
+gitmoot agent heartbeat add repo-maintainer daily-status \
+  --repo owner/repo --interval 24h --prompt "Daily status report." --enabled
+gitmoot agent heartbeat list
+gitmoot agent heartbeat show repo-maintainer daily-status
+gitmoot agent heartbeat enable|disable repo-maintainer daily-status
+gitmoot agent heartbeat remove repo-maintainer daily-status
+```
+
+A heartbeat enqueues a normal background job on its `interval` (read-only `ask` or
+`review` action; `review` needs the agent's `review` capability). `gitmoot daemon
+status` surfaces each schedule's last-run/next-due/last-status. See
+`docs/heartbeats.md` for the full reference.
+
 A registered single instance **shadows** a managed type of the same name:
 dispatch resolves `gitmoot agent <name>` to a registered single instance before a
 type, so force the type with `--type <name>` (or do not register a single

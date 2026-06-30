@@ -458,7 +458,69 @@ func runDaemonStatus(args []string, stdout, stderr io.Writer) int {
 	}
 	writeLine(stdout, "%s", daemonAdmissionLine(paths))
 	writeLine(stdout, "%s", daemonPreflightFailureLine(*home))
+	for _, line := range daemonHeartbeatLines(paths, *home) {
+		writeLine(stdout, "%s", line)
+	}
 	return 0
+}
+
+// daemonHeartbeatLines surfaces the configured heartbeat schedules and their
+// last-run/next-due/last-status for `gitmoot daemon status` (#533). It is
+// OFF BY DEFAULT: with no [agents.<agent>.heartbeats.<name>] sections it returns
+// no lines, so status output is byte-identical for users without heartbeats. A
+// config-parse or store error degrades to a single "unavailable" line rather than
+// failing status. Each schedule renders as one line so it composes with the other
+// additive status lines.
+func daemonHeartbeatLines(paths config.Paths, home string) []string {
+	heartbeats, err := config.LoadHeartbeats(paths)
+	if err != nil {
+		return []string{"heartbeats: unavailable"}
+	}
+	if len(heartbeats) == 0 {
+		return nil
+	}
+	states := map[string]db.HeartbeatState{}
+	if storeErr := withStore(home, func(store *db.Store) error {
+		for _, heartbeat := range heartbeats {
+			state, ok, err := store.GetHeartbeatState(context.Background(), heartbeat.Agent, heartbeat.Name)
+			if err != nil {
+				return err
+			}
+			if ok {
+				states[heartbeat.Agent+"/"+heartbeat.Name] = state
+			}
+		}
+		return nil
+	}); storeErr != nil {
+		return []string{"heartbeats: unavailable"}
+	}
+	lines := make([]string, 0, len(heartbeats)+1)
+	lines = append(lines, fmt.Sprintf("heartbeats: %d configured", len(heartbeats)))
+	for _, heartbeat := range heartbeats {
+		enabled := "disabled"
+		if heartbeat.Enabled {
+			enabled = "enabled"
+		}
+		line := fmt.Sprintf("  %s/%s: %s action=%s interval=%s repo=%s",
+			heartbeat.Agent, heartbeat.Name, enabled, heartbeat.Action, heartbeat.Interval, heartbeat.Repo)
+		if state, ok := states[heartbeat.Agent+"/"+heartbeat.Name]; ok {
+			line += fmt.Sprintf(" last_run=%s next_due=%s last_status=%s",
+				heartbeatTimeForStatus(state.LastRunAt), heartbeatTimeForStatus(state.NextDueAt), firstNonEmpty(state.LastStatus, "-"))
+		} else {
+			line += " last_run=never"
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// heartbeatTimeForStatus renders a heartbeat-state timestamp for `daemon status`,
+// printing "-" for the zero time (never run / not yet scheduled).
+func heartbeatTimeForStatus(value time.Time) string {
+	if value.IsZero() {
+		return "-"
+	}
+	return value.UTC().Format(time.RFC3339)
 }
 
 // daemonSchedulerStatusLine reports the running daemon's worker count and
@@ -1385,6 +1447,21 @@ func heartbeatRepoManaged(ctx context.Context, store *db.Store, repo string) (bo
 	return record.Enabled && strings.TrimSpace(record.CheckoutPath) != "", nil
 }
 
+// heartbeatAgentHasCapability reports whether the named agent currently holds the
+// given capability (e.g. "review"). A missing agent is NOT an error: it returns
+// false so a review heartbeat for an unknown/unstarted agent is skipped rather
+// than aborting the whole scan. A real store error propagates.
+func heartbeatAgentHasCapability(ctx context.Context, store *db.Store, agent, capability string) (bool, error) {
+	record, err := store.GetAgent(ctx, strings.TrimSpace(agent))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return agentHasCapability(record.Capabilities, capability), nil
+}
+
 func heartbeatJobID(agent, name string, now time.Time) string {
 	return fmt.Sprintf("heartbeat-%s-%s-%x", agent, name, now.UTC().UnixNano())
 }
@@ -1470,6 +1547,27 @@ func runOneHeartbeat(ctx context.Context, store *db.Store, enqueue heartbeatEnqu
 		state.NextDueAt = now.Add(interval + heartbeatJitter(jitter))
 		state.LastStatus = "repo_unmanaged"
 		return store.UpsertHeartbeatState(ctx, state)
+	}
+	// Capability guard: a review heartbeat enqueues an Action="review" job, which
+	// the worker only runs for an agent that HOLDS the review capability. Validate
+	// here (the enqueue path bypasses ensureLocalAgentAccess) so we never enqueue a
+	// review job the agent is not permitted to run. Skip but ADVANCE next_due with a
+	// clear status so it self-recovers once the capability is granted (rather than
+	// hot-looping or wedging). LoadHeartbeats already rejects any action other than
+	// ask/review at config-load; this is the agent-aware half of that check.
+	if heartbeat.Action == "review" {
+		hasReview, err := heartbeatAgentHasCapability(ctx, store, heartbeat.Agent, "review")
+		if err != nil {
+			return err
+		}
+		if !hasReview {
+			state.Agent = heartbeat.Agent
+			state.Name = heartbeat.Name
+			state.LastRunAt = now
+			state.NextDueAt = now.Add(interval + heartbeatJitter(jitter))
+			state.LastStatus = "capability_missing"
+			return store.UpsertHeartbeatState(ctx, state)
+		}
 	}
 	// Overlap protection: a still-active heartbeat job (>= max_concurrent) means the
 	// previous run has not finished. Skip WITHOUT advancing so it is retried next

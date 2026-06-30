@@ -86,6 +86,21 @@ func LoadHeartbeats(paths Paths) ([]Heartbeat, error) {
 	return heartbeats, nil
 }
 
+// HeartbeatActions lists the actions a heartbeat may schedule, both read-only:
+// "ask" (the conservative default) and "review". "implement" is deliberately
+// excluded — recurring unattended code-change PRs are a separate safety pass.
+func HeartbeatActions() []string { return []string{"ask", "review"} }
+
+// HeartbeatActionSupported reports whether action is one a heartbeat may use.
+func HeartbeatActionSupported(action string) bool {
+	switch strings.TrimSpace(action) {
+	case "ask", "review":
+		return true
+	default:
+		return false
+	}
+}
+
 // parseHeartbeatSection extracts the agent and the heartbeat name from a section
 // of the form agents.<agent>.heartbeats.<name>. It returns ok=false for any other
 // section (including a deeper sub-subsection under <name>), so unrelated sections
@@ -185,10 +200,14 @@ func validateHeartbeat(entry Heartbeat) error {
 	if _, err := time.ParseDuration(entry.Jitter); err != nil {
 		return fmt.Errorf("heartbeat [agents.%s.heartbeats.%s]: jitter %q: %w", entry.Agent, entry.Name, entry.Jitter, err)
 	}
-	// MVP scope: only the conservative read-only "ask" action is supported.
-	// review/implement heartbeats are a deferred follow-up.
-	if entry.Action != "ask" {
-		return fmt.Errorf("heartbeat [agents.%s.heartbeats.%s]: unsupported action %q; only \"ask\" is supported", entry.Agent, entry.Name, entry.Action)
+	// Supported actions are the conservative read-only ones: "ask" (analyze/answer)
+	// and "review" (read-only PR/code review). A "review" heartbeat additionally
+	// requires the target agent to HOLD the review capability; that check needs the
+	// agent registry, so it lives in the daemon scan (runOneHeartbeat) and the CLI
+	// write path, not here. "implement" heartbeats stay deferred: recurring
+	// unattended code-change PRs are a separate safety pass.
+	if !HeartbeatActionSupported(entry.Action) {
+		return fmt.Errorf("heartbeat [agents.%s.heartbeats.%s]: unsupported action %q; only %q and %q are supported", entry.Agent, entry.Name, entry.Action, "ask", "review")
 	}
 	if entry.Prompt == "" {
 		return fmt.Errorf("heartbeat [agents.%s.heartbeats.%s]: prompt is required", entry.Agent, entry.Name)

@@ -250,6 +250,83 @@ func TestHeartbeatScanSkipsUnmanagedRepo(t *testing.T) {
 	}
 }
 
+const reviewHeartbeatBody = `
+[agents.reviewer]
+runtime = "codex"
+role = "reviewer"
+capabilities = ["ask", "review"]
+max_background = 2
+
+[agents.reviewer.heartbeats.stale-prs]
+enabled = true
+repo = "jerryfane/gitmoot"
+interval = "12h"
+action = "review"
+prompt = "Review stale open PRs."
+max_concurrent = 1
+`
+
+// TestHeartbeatScanEnqueuesReviewJob proves a review heartbeat whose target agent
+// HOLDS the review capability enqueues exactly one Action="review" job.
+func TestHeartbeatScanEnqueuesReviewJob(t *testing.T) {
+	paths, store := heartbeatScanFixture(t, reviewHeartbeatBody)
+	ctx := context.Background()
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name: "reviewer", Runtime: "codex", RepoScope: "jerryfane/gitmoot",
+		Capabilities: []string{"ask", "review"}, RuntimeRef: "last",
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	enq, seen := recordingEnqueuer()
+	now := time.Date(2026, 6, 30, 9, 0, 0, 0, time.UTC)
+	if err := runHeartbeatScanOnce(ctx, paths, store, enq, now); err != nil {
+		t.Fatalf("runHeartbeatScanOnce: %v", err)
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("expected 1 review job, got %d", len(*seen))
+	}
+	if req := (*seen)[0]; req.Action != "review" || req.Agent != "reviewer" || req.Sender != "heartbeat" {
+		t.Fatalf("unexpected review request shape: %+v", req)
+	}
+	state, found, err := store.GetHeartbeatState(ctx, "reviewer", "stale-prs")
+	if err != nil || !found || state.LastStatus != "enqueued" {
+		t.Fatalf("review heartbeat state not advanced: found=%v err=%v state=%+v", found, err, state)
+	}
+}
+
+// TestHeartbeatScanReviewRejectsMissingCapability proves a review heartbeat for an
+// agent that LACKS the review capability never enqueues, and advances next_due
+// with last_status=capability_missing so it self-recovers (no wedge, no hot-loop).
+func TestHeartbeatScanReviewRejectsMissingCapability(t *testing.T) {
+	paths, store := heartbeatScanFixture(t, reviewHeartbeatBody)
+	ctx := context.Background()
+	// Register the agent WITHOUT the review capability.
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name: "reviewer", Runtime: "codex", RepoScope: "jerryfane/gitmoot",
+		Capabilities: []string{"ask"}, RuntimeRef: "last",
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	enq, seen := recordingEnqueuer()
+	now := time.Date(2026, 6, 30, 9, 0, 0, 0, time.UTC)
+	if err := runHeartbeatScanOnce(ctx, paths, store, enq, now); err != nil {
+		t.Fatalf("runHeartbeatScanOnce: %v", err)
+	}
+	if len(*seen) != 0 {
+		t.Fatalf("review heartbeat without capability enqueued %d jobs", len(*seen))
+	}
+	state, found, err := store.GetHeartbeatState(ctx, "reviewer", "stale-prs")
+	if err != nil || !found {
+		t.Fatalf("expected state row, found=%v err=%v", found, err)
+	}
+	if state.LastStatus != "capability_missing" {
+		t.Fatalf("last_status = %q, want capability_missing", state.LastStatus)
+	}
+	if !state.NextDueAt.Equal(now.Add(12 * time.Hour)) {
+		t.Fatalf("capability skip must advance next_due (no wedge): %+v", state)
+	}
+}
+
 // TestHeartbeatScanCoalescesMissedTicks proves a long outage replays only ONCE:
 // next_due is anchored to now (not the stale due time), so one scan after many
 // missed intervals enqueues a single job and schedules the next from now.

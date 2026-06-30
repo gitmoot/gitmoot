@@ -120,6 +120,26 @@ prompt = "p"
 	}
 }
 
+// TestLoadHeartbeatsAcceptsReviewAction asserts the review action now loads
+// (the ask/review pair), while implement stays rejected (covered above).
+func TestLoadHeartbeatsAcceptsReviewAction(t *testing.T) {
+	paths := writeHeartbeatConfig(t, `
+[agents.reviewer.heartbeats.stale-prs]
+enabled = true
+repo = "o/r"
+interval = "12h"
+action = "review"
+prompt = "Review stale PRs."
+`)
+	heartbeats, err := LoadHeartbeats(paths)
+	if err != nil {
+		t.Fatalf("LoadHeartbeats returned error: %v", err)
+	}
+	if len(heartbeats) != 1 || heartbeats[0].Action != "review" {
+		t.Fatalf("expected one review heartbeat, got %+v", heartbeats)
+	}
+}
+
 // TestLoadAgentTypesGuardIgnoresHeartbeatSubsections is the critical parser guard
 // (#533): the agent-types line scanner must NOT register a phantom agent named
 // "x.heartbeats.h" when it encounters a heartbeat subsection header.
