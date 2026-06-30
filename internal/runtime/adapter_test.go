@@ -756,8 +756,84 @@ func TestClaudeDeliverSucceedsWithoutRetry(t *testing.T) {
 }
 
 func TestClaudeDeliverRetriesExhausted(t *testing.T) {
-	// Every attempt hits the transient: the bound (claudeDeliveryMaxAttempts) must
-	// stop after exactly that many tries and surface the final error, never loop.
+	// Every attempt hits the transient, INCLUDING the final fresh-session
+	// escalation (#509): the bounds must stop after exactly
+	// claudeDeliveryMaxAttempts re-resume attempts plus one fresh-session attempt
+	// and surface the final error, never loop.
+	results := make([]subprocess.Result, claudeDeliveryMaxAttempts+1)
+	errs := make([]error, claudeDeliveryMaxAttempts+1)
+	for i := range results {
+		results[i] = subprocess.Result{Stderr: "401 The socket connection was closed unexpectedly"}
+		errs[i] = errors.New("exit 1")
+	}
+	runner := &fakeRunner{results: results, errs: errs}
+	adapter := ClaudeAdapter{
+		Runner:        runner,
+		RetryBackoff:  time.Nanosecond,
+		NewRuntimeRef: func() (string, error) { return "550e8400-e29b-41d4-a716-446655440099", nil },
+	}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "jerryfane/gitmoot"}
+
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err == nil {
+		t.Fatal("Deliver accepted a transient that persisted across all attempts")
+	}
+	if len(runner.calls) != claudeDeliveryMaxAttempts+1 {
+		t.Fatalf("runner called %d times, want exactly %d (retries + one fresh-session escalation): %v", len(runner.calls), claudeDeliveryMaxAttempts+1, runner.calls)
+	}
+}
+
+func TestClaudeDeliverEscalatesToFreshSessionOnPersistentTransient(t *testing.T) {
+	// Regression for #509: a byte-identical --resume retry empirically does NOT
+	// clear the intermittent socket-closed 401 (every in-call attempt fails
+	// together), but a fresh, later delivery does. So after the in-call retries
+	// exhaust on the transient, Deliver must make ONE final attempt on a
+	// brand-new --session-id to get this delivery past the flake.
+	//
+	// CRUCIALLY, the transient (#509) session is still ALIVE (a later --resume of
+	// the same ref recovers), so the agent must NOT be permanently re-pinned:
+	// RefreshedRuntimeRef must stay EMPTY so the agent keeps its original,
+	// context-bearing session and the next delivery resumes it. (Re-pinning is
+	// reserved for the dead-session class (#443) — see TestClaudeDeliverSelfHealsDeadSession.)
+	results := make([]subprocess.Result, claudeDeliveryMaxAttempts+1)
+	errs := make([]error, claudeDeliveryMaxAttempts+1)
+	for i := 0; i < claudeDeliveryMaxAttempts; i++ {
+		results[i] = subprocess.Result{Stderr: "API Error: 401 The socket connection was closed unexpectedly"}
+		errs[i] = errors.New("exit 1")
+	}
+	results[claudeDeliveryMaxAttempts] = subprocess.Result{Stdout: `{"result":"recovered"}`}
+	runner := &fakeRunner{results: results, errs: errs}
+	adapter := ClaudeAdapter{
+		Runner:        runner,
+		RetryBackoff:  time.Nanosecond,
+		NewRuntimeRef: func() (string, error) { return "550e8400-e29b-41d4-a716-446655440099", nil },
+	}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "jerryfane/gitmoot"}
+
+	result, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"})
+	if err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	if result.Summary != "recovered" {
+		t.Fatalf("summary = %q, want %q", result.Summary, "recovered")
+	}
+	// The transient session is still alive, so the agent stays pinned to it: a
+	// transport blip must never silently discard accumulated conversation context.
+	if result.RefreshedRuntimeRef != "" {
+		t.Fatalf("RefreshedRuntimeRef = %q, want empty (a still-alive transient session must NOT be re-pinned away, or the agent loses its context)", result.RefreshedRuntimeRef)
+	}
+	if len(runner.calls) != claudeDeliveryMaxAttempts+1 {
+		t.Fatalf("runner called %d times, want %d (retries + one fresh-session escalation): %v", len(runner.calls), claudeDeliveryMaxAttempts+1, runner.calls)
+	}
+	// The in-call retries re-resume the wedged session...
+	runner.want(t, 0, "claude", "--resume", "550e8400-e29b-41d4-a716-446655440002", "-p", "--output-format", "json", "--", "review")
+	// ...and the final escalation uses a brand-new --session-id, never --resume.
+	runner.want(t, claudeDeliveryMaxAttempts, "claude", "--session-id", "550e8400-e29b-41d4-a716-446655440099", "-p", "--output-format", "json", "--", "review")
+}
+
+func TestClaudeDeliverDoesNotEscalateLastSessionOnTransient(t *testing.T) {
+	// A "last" (--continue) agent shares the rolling session and must never be
+	// re-pinned onto a fresh --session-id, even when the transient persists across
+	// every attempt — escalation is reserved for pinned-UUID sessions.
 	results := make([]subprocess.Result, claudeDeliveryMaxAttempts)
 	errs := make([]error, claudeDeliveryMaxAttempts)
 	for i := range results {
@@ -765,14 +841,29 @@ func TestClaudeDeliverRetriesExhausted(t *testing.T) {
 		errs[i] = errors.New("exit 1")
 	}
 	runner := &fakeRunner{results: results, errs: errs}
-	adapter := ClaudeAdapter{Runner: runner, RetryBackoff: time.Nanosecond}
-	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "jerryfane/gitmoot"}
+	adapter := ClaudeAdapter{
+		Runner:        runner,
+		RetryBackoff:  time.Nanosecond,
+		NewRuntimeRef: func() (string, error) { return "550e8400-e29b-41d4-a716-446655440099", nil },
+	}
+	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: LastRef, RepoScope: "jerryfane/gitmoot"}
 
-	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err == nil {
+	result, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"})
+	if err == nil {
 		t.Fatal("Deliver accepted a transient that persisted across all attempts")
 	}
+	if result.RefreshedRuntimeRef != "" {
+		t.Fatalf("RefreshedRuntimeRef = %q, want empty (a last/--continue session must never be re-pinned)", result.RefreshedRuntimeRef)
+	}
 	if len(runner.calls) != claudeDeliveryMaxAttempts {
-		t.Fatalf("runner called %d times, want exactly %d (claudeDeliveryMaxAttempts bound): %v", len(runner.calls), claudeDeliveryMaxAttempts, runner.calls)
+		t.Fatalf("runner called %d times, want exactly %d (no fresh-session escalation on --continue): %v", len(runner.calls), claudeDeliveryMaxAttempts, runner.calls)
+	}
+	for i, call := range runner.calls {
+		for _, arg := range call {
+			if arg == "--session-id" {
+				t.Fatalf("call %d minted a fresh --session-id for a last/--continue agent: %v", i, call)
+			}
+		}
 	}
 }
 
@@ -895,6 +986,10 @@ func TestIsTransientClaudeDeliveryError(t *testing.T) {
 		{name: "mixed_case", result: subprocess.Result{Stderr: "401 Socket Connection Was Closed Unexpectedly"}, err: runErr, want: true},
 		{name: "socket_closed_without_401_mid_stream", result: subprocess.Result{Stderr: "socket connection was closed unexpectedly"}, err: runErr, want: false},
 		{name: "permanent_auth_error", result: subprocess.Result{Stderr: "401 Invalid authentication credentials"}, err: runErr, want: false},
+		// A genuine auth failure (#486) must never be retried as a transient even
+		// if its message also carries a socket-closed phrase: retrying an invalid
+		// token wastes minutes and masks the real "fix your token" signal.
+		{name: "auth_error_with_socket_noise_not_transient", result: subprocess.Result{Stderr: `{"error":{"type":"authentication_error"}} 401 The socket connection was closed unexpectedly`}, err: runErr, want: false},
 		{name: "nil_error_even_with_signature", result: subprocess.Result{Stderr: "401 socket connection was closed unexpectedly"}, err: nil, want: false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
