@@ -229,6 +229,19 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	// Singleton guard (#550). `daemon run` is the inner worker that `daemon start`
+	// execs, but it is ALSO a public command and the ExecStart of `systemd --user`
+	// units, so a stray `daemon run` could previously coexist silently with the
+	// managed daemon: two daemons polling the same repos and racing on the same
+	// WAL'd SQLite store, with the newcomer clobbering daemon.json so the prior one
+	// ran untracked for days. `daemon start` already refuses when a live daemon is
+	// registered; extend the SAME check to `daemon run` so the second one refuses
+	// up front instead of entering its loop. The check must run BEFORE the deferred
+	// self-registration so a refused run never touches the existing daemon's state.
+	if code := guardDaemonRunSingleton(*home, stderr); code != 0 {
+		return code
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -871,6 +884,40 @@ func withDaemonBoolFlagArg(args []string, name string, enabled bool) []string {
 		return append(cleaned, flagName)
 	}
 	return cleaned
+}
+
+// guardDaemonRunSingleton refuses to start a second daemon against the same home
+// (#550). It reuses currentDaemonPID — the exact liveness check `daemon start`
+// uses and the #505 definition of "running": an owner-pid that is alive AND whose
+// /proc cmdline still matches the recorded daemon meta (processLooksLikeDaemon).
+// Reusing that check is what makes this correct at the right depth:
+//   - a STALE pidfile from a dead (or non-daemon) pid is treated as not-running,
+//     so it is silently cleared and never blocks a fresh start; and
+//   - a genuinely live registered daemon is detected and the new run refuses.
+//
+// A recorded pid equal to our own is never a conflict: when `daemon start` forks
+// the detached child it writes the pidfile with the CHILD's pid, so the child's
+// own `daemon run` guard sees itself and proceeds (the healthy start path).
+//
+// Returns 0 to proceed, or a non-zero exit code (with a clear message on stderr)
+// to refuse.
+func guardDaemonRunSingleton(home string, stderr io.Writer) int {
+	paths, err := initializedPaths(home)
+	if err != nil {
+		fmt.Fprintf(stderr, "daemon run: %v\n", err)
+		return 1
+	}
+	state := daemonProcessState(paths)
+	pid, _, err := currentDaemonPID(state)
+	if err != nil {
+		fmt.Fprintf(stderr, "daemon run: %v\n", err)
+		return 1
+	}
+	if pid > 0 && pid != os.Getpid() {
+		fmt.Fprintf(stderr, "daemon already running with pid %d\n", pid)
+		return 1
+	}
+	return 0
 }
 
 func currentDaemonPID(state daemonState) (pid int, stale bool, err error) {
