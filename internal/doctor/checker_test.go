@@ -210,12 +210,14 @@ func TestClaudeAuthEnvLiveProbeValidatesSetToken486(t *testing.T) {
 		wantOK      bool
 		wantDetail  string
 		wantNoMatch string
+		wantRuns    int
 	}{
 		{
 			name:       "valid token authenticates",
 			result:     subprocess.Result{Stdout: `{"result":"OK"}`},
 			wantOK:     true,
 			wantDetail: runtime.ClaudeBackgroundTokenMessage,
+			wantRuns:   1,
 		},
 		{
 			name:        "invalid token is rejected not ok",
@@ -224,6 +226,20 @@ func TestClaudeAuthEnvLiveProbeValidatesSetToken486(t *testing.T) {
 			wantOK:      false,
 			wantDetail:  runtime.ClaudeSessionAuthFailedMessage,
 			wantNoMatch: "could not validate",
+			wantRuns:    1,
+		},
+		{
+			// The EXACT documented #486 symptom of an invalid CLAUDE_CODE_OAUTH_TOKEN:
+			// it carries "authenticate" + "401" but NOT "authentication", so the prior
+			// probe classified it Unknown and doctor reported OK:true. The probe retries
+			// the 401-socket-closed once (wantRuns 2) and, persisting, reports OK:false.
+			name:        "documented invalid-token socket-closed 401 is rejected",
+			result:      subprocess.Result{Stderr: "Failed to authenticate. API Error: 401 The socket connection was closed unexpectedly"},
+			err:         fmt.Errorf("exit 1"),
+			wantOK:      false,
+			wantDetail:  runtime.ClaudeSessionAuthFailedMessage,
+			wantNoMatch: "could not validate",
+			wantRuns:    2,
 		},
 		{
 			name:        "transient error is unknown not invalid",
@@ -232,6 +248,7 @@ func TestClaudeAuthEnvLiveProbeValidatesSetToken486(t *testing.T) {
 			wantOK:      true,
 			wantDetail:  "could not validate the token",
 			wantNoMatch: runtime.ClaudeSessionAuthFailedMessage,
+			wantRuns:    1,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -245,8 +262,8 @@ func TestClaudeAuthEnvLiveProbeValidatesSetToken486(t *testing.T) {
 				runs: &runs,
 			}
 			check := Checker{Runner: runner, LiveProbe: true}.claudeAuthEnv(context.Background())
-			if runs != 1 {
-				t.Fatalf("probe ran %d times, want exactly 1 (a set token must be validated, not trusted)", runs)
+			if runs != tt.wantRuns {
+				t.Fatalf("probe ran %d times, want exactly %d (a set token must be validated, not trusted)", runs, tt.wantRuns)
 			}
 			if check.OK != tt.wantOK {
 				t.Fatalf("claude auth check = %+v, want OK=%t", check, tt.wantOK)

@@ -157,14 +157,21 @@ func InspectDaemonClaudeAuth(paths config.Paths) DaemonAuthSnapshot {
 	return snapshot
 }
 
-// DaemonClaudeCredEnv returns the running daemon's set Claude credential
-// variables as KEY=VALUE entries, for injecting into a live validation probe so
-// the doctor validates the token the daemon will actually use rather than the
-// doctor process's own credential. Unlike DaemonAuthSnapshot (which exposes only
-// set/unset booleans), this returns the secret VALUES — callers must use them
-// solely as subprocess env and never print or persist them. It is best-effort
-// and fail-open: a missing daemon, unreadable /proc, or non-Linux host yields
-// (nil, false). Only non-empty values are returned.
+// DaemonClaudeCredEnv returns the env entries needed to validate the token the
+// running daemon will ACTUALLY use, for injecting into a live probe so the doctor
+// checks the daemon's credential rather than the doctor process's own. It returns
+// the daemon's set Claude credential VALUES as KEY=VALUE entries AND, critically,
+// NAME= (empty) for each Claude credential var the daemon does NOT set — so when
+// the entries are appended onto the doctor process's environment (RunEnv), they
+// NEUTRALIZE any competing credential the doctor shell carries but the daemon
+// lacks (claude treats empty as unset). Without this, a doctor-shell
+// ANTHROPIC_API_KEY (which outranks OAuth) could validate the WRONG credential and
+// mask a bad daemon token (#486). Unlike DaemonAuthSnapshot (set/unset booleans
+// only) this returns secret VALUES — callers must use them solely as subprocess
+// env and never print or persist them. It is best-effort and fail-open: a missing
+// daemon, unreadable /proc, or non-Linux host yields (nil, false); a detected
+// daemon with no Claude credential at all also yields (nil, false) so the caller
+// falls back to the presence-only report.
 func DaemonClaudeCredEnv(paths config.Paths) ([]string, bool) {
 	daemon := InspectDaemon(paths)
 	if daemon.State != DaemonRunning || daemon.PID <= 0 {
@@ -174,7 +181,19 @@ func DaemonClaudeCredEnv(paths config.Paths) ([]string, bool) {
 	if !ok {
 		return nil, false
 	}
-	var env []string
+	return claudeCredEnvFromLookup(lookup)
+}
+
+// claudeCredEnvFromLookup builds the isolated Claude credential env from a
+// lookup func (split out from DaemonClaudeCredEnv so the neutralization contract
+// is testable without a live daemon / readable /proc). Returns (nil, false) when
+// the lookup carries no non-empty Claude credential.
+func claudeCredEnvFromLookup(lookup func(string) (string, bool)) ([]string, bool) {
+	if lookup == nil {
+		return nil, false
+	}
+	hasCred := false
+	env := make([]string, 0, 3)
 	for _, name := range []string{
 		runtime.ClaudeOAuthTokenEnv,
 		runtime.AnthropicAPIKeyEnv,
@@ -182,9 +201,14 @@ func DaemonClaudeCredEnv(paths config.Paths) ([]string, bool) {
 	} {
 		if value, present := lookup(name); present && strings.TrimSpace(value) != "" {
 			env = append(env, name+"="+value)
+			hasCred = true
+			continue
 		}
+		// The daemon does not set this credential: neutralize the doctor's own value
+		// so it cannot leak into the probe and validate the wrong credential.
+		env = append(env, name+"=")
 	}
-	if len(env) == 0 {
+	if !hasCred {
 		return nil, false
 	}
 	return env, true

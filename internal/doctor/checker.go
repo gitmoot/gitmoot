@@ -177,6 +177,15 @@ func (c Checker) claudeAuthDaemon(ctx context.Context) (Check, bool) {
 		// may differ from the daemon's and would give a misleading verdict.
 		return base, true
 	}
+	// Isolate the probe to the injected daemon token: point claude at a throwaway
+	// empty CLAUDE_CONFIG_DIR so cached ~/.claude credentials in the doctor's HOME
+	// cannot mask a bad daemon token — the decisive token-only test for #486. If the
+	// throwaway dir can't be created, fall through with the (already neutralized)
+	// credEnv rather than skipping the probe.
+	if probeDir, err := os.MkdirTemp("", "gitmoot-claude-probe-"); err == nil {
+		defer os.RemoveAll(probeDir)
+		credEnv = append(credEnv, runtime.ClaudeConfigDirEnv+"="+probeDir)
+	}
 	masked := "running daemon (pid " + strconv.Itoa(snap.PID) + "): " + snap.Auth.MaskedDetail()
 	probeErr := runtime.ClaudeLiveCheckEnv(ctx, c.runner(), "", credEnv)
 	return claudeProbeCheck("claude auth (daemon)", masked, "live token check passed", true, probeErr), true

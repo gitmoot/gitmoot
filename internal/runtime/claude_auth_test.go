@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/subprocess"
 )
@@ -203,6 +204,84 @@ func TestClaudeLiveCheckEnvInjectsCredential(t *testing.T) {
 		t.Fatalf("probe env = %v, want the injected daemon credential %v", runner.gotEnv, cred)
 	}
 	runner.want(t, 0, "claude", "-p", "--output-format", "json", "--", ClaudeLiveCheckPrompt)
+}
+
+// TestClaudeLiveCheckClassifiesSocketClosed401AsInvalid486 is the #486 regression
+// for the DOCUMENTED invalid-token symptom: an invalid CLAUDE_CODE_OAUTH_TOKEN
+// manifests as `Failed to authenticate. API Error: 401 The socket connection was
+// closed unexpectedly`. That string carries "authenticate" and "401" but NOT
+// "authentication", so isClaudeAuthFailure misses it and the prior probe returned
+// Unknown — which left `gitmoot doctor` reporting OK:true for the exact scenario
+// the fix exists to catch. The isolated probe retries the 401-socket-closed
+// signature once and, when it PERSISTS, must classify Invalid.
+func TestClaudeLiveCheckClassifiesSocketClosed401AsInvalid486(t *testing.T) {
+	const symptom = "Failed to authenticate. API Error: 401 The socket connection was closed unexpectedly"
+	runner := &fakeRunner{
+		results: []subprocess.Result{{Stderr: symptom}, {Stderr: symptom}},
+		errs:    []error{errors.New("exit 1"), errors.New("exit 1")},
+	}
+	err := ClaudeLiveCheck(context.Background(), runner, "/repo")
+	if ClaudeClassifyProbe(err) != ClaudeTokenInvalid {
+		t.Fatalf("socket-closed 401 classified %v, want invalid\nerr=%v", ClaudeClassifyProbe(err), err)
+	}
+	if !errors.Is(err, ErrClaudeAuthFailed) {
+		t.Fatalf("persistent socket-closed 401 must satisfy errors.Is(err, ErrClaudeAuthFailed):\n%v", err)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("probe made %d calls, want 2 (one retry of the 401-socket-closed)", len(runner.calls))
+	}
+}
+
+// TestClaudeLiveCheckSocketClosed401RetryClears486 guards the other side: a one-off
+// 401-socket-closed that CLEARS on the byte-identical retry is the concurrency
+// transient the daemon path tolerates, so the isolated probe must report Valid, not
+// flip a healthy token to Invalid.
+func TestClaudeLiveCheckSocketClosed401RetryClears486(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{
+			{Stderr: "API Error: 401 The socket connection was closed unexpectedly"},
+			{Stdout: `{"result":"OK"}`},
+		},
+		errs: []error{errors.New("exit 1"), nil},
+	}
+	if err := ClaudeLiveCheck(context.Background(), runner, "/repo"); err != nil {
+		t.Fatalf("a cleared socket-closed retry must be valid, got %v", err)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("probe made %d calls, want 2 (the cleared retry)", len(runner.calls))
+	}
+}
+
+// blockingRunner blocks until the context is cancelled, simulating a hung/slow
+// `claude -p`, so a test can prove the probe bounds an unbounded caller.
+type blockingRunner struct{}
+
+func (blockingRunner) Run(ctx context.Context, _ string, _ string, _ ...string) (subprocess.Result, error) {
+	<-ctx.Done()
+	return subprocess.Result{}, ctx.Err()
+}
+
+func (blockingRunner) LookPath(file string) (string, error) { return "/usr/bin/" + file, nil }
+
+// TestClaudeLiveCheckBoundsUnboundedContext486 proves the probe bounds an unbounded
+// (context.Background) caller — the regression #486 introduced by always probing in
+// doctor — so a stalled claude can't block forever. With a hung runner the probe
+// returns within its own timeout, and the timeout maps to Unknown (never Invalid),
+// so a SET token degrades to set-but-unvalidated rather than flipping doctor red.
+func TestClaudeLiveCheckBoundsUnboundedContext486(t *testing.T) {
+	old := ClaudeLiveProbeTimeout
+	ClaudeLiveProbeTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { ClaudeLiveProbeTimeout = old })
+	done := make(chan error, 1)
+	go func() { done <- ClaudeLiveCheck(context.Background(), blockingRunner{}, "/repo") }()
+	select {
+	case err := <-done:
+		if ClaudeClassifyProbe(err) != ClaudeTokenUnknown {
+			t.Fatalf("timed-out probe classified %v, want unknown\nerr=%v", ClaudeClassifyProbe(err), err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ClaudeLiveCheck did not honor its bounded timeout (hung)")
+	}
 }
 
 func TestClaudeLiveCheckFallsBackToText(t *testing.T) {
