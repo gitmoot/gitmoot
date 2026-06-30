@@ -312,6 +312,110 @@ func TestAdvanceJobTerminalImplementLegFiresCleanup(t *testing.T) {
 	})
 }
 
+// TestAdvanceJobTerminalImplementLegCleansWhileSelfHoldsLock is the HIGH #478
+// regression that the original #536 fix introduced: cleanupImplementDelegationWorktree
+// is deferred inside AdvanceJob, which runs inside RunJob WHILE the daemon still
+// holds the job's OWN runtime-session lock (the daemon releases it only after RunJob
+// returns). The earlier liveness gate keyed on ANY held lock, so on a perfectly
+// healthy completion the run's own live lock made the gate refuse cleanup, leaking
+// the worktree + gitmoot-delegation-* branch for EVERY normally-completing child.
+//
+// The fix excludes the run's OWN lock (matched by the owner token threaded through
+// the run context). This test reproduces the healthy path: the child's runtime lock
+// is held by THIS process (live PID, unexpired lease) AND the run context carries
+// that lock's owner token, then AdvanceJob drives the child to terminal. The
+// worktree+branch MUST be removed.
+//
+// The companion sub-case (no self token in ctx, same live lock) pins that a FOREIGN
+// live owner still blocks the destructive cleanup — i.e. the test fails if the gate
+// is simply removed, not just if the self-exclusion is added. Before the fix the
+// first sub-case fails (cleanup refused despite the lock being the run's own).
+func TestAdvanceJobTerminalImplementLegCleansWhileSelfHoldsLock(t *testing.T) {
+	const ownerToken = "self-owner-token-536"
+	acquireSelfLock := func(t *testing.T, store *db.Store, jobID string) {
+		t.Helper()
+		now := time.Now().UTC()
+		acquired, err := store.AcquireResourceLock(context.Background(), db.ResourceLock{
+			ResourceKey: "runtime:codex:session-self",
+			OwnerJobID:  jobID,
+			OwnerToken:  ownerToken,
+			OwnerPID:    int64(os.Getpid()),
+			ExpiresAt:   now.Add(4 * time.Hour).Format(time.RFC3339Nano),
+		}, now)
+		if err != nil || !acquired {
+			t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
+		}
+	}
+
+	newEngine := func(t *testing.T, store *db.Store, branch string) (Engine, *fakeWorktreeManager) {
+		t.Helper()
+		engine := testEngine(store)
+		engine.Home = t.TempDir()
+		engine.DelegationCheckout = t.TempDir()
+		engine.OwnerPIDLive = func(int64) bool { return true } // own daemon PID is live
+		manager := &fakeWorktreeManager{existingBranches: map[string]bool{branch: true}}
+		engine.DelegationWorktrees = manager
+		return engine, manager
+	}
+
+	t.Run("self-held lock does not block healthy cleanup", func(t *testing.T) {
+		store := openEngineStore(t)
+		branch := "gitmoot-delegation-x-self"
+		engine, manager := newEngine(t, store, branch)
+		wt := t.TempDir()
+		jobID := "leg-self"
+		insertCompletedJob(t, store, db.Job{ID: jobID, Agent: "producer", Type: "implement", DelegationID: "d1"}, JobPayload{
+			DelegationID: "d1", WorktreePath: wt, Branch: branch,
+			Result: &AgentResult{Decision: "implemented", Summary: "done"},
+		})
+		acquireSelfLock(t, store, jobID)
+
+		// The daemon threads the run's lock owner token into the run context; AdvanceJob
+		// (and its deferred cleanup) inherits it.
+		ctx := WithRuntimeSelfOwnerToken(context.Background(), ownerToken)
+		if err := engine.AdvanceJob(ctx, jobID); err != nil {
+			t.Fatalf("AdvanceJob(%s) returned error: %v", jobID, err)
+		}
+		if len(manager.removedForce) != 1 || manager.removedForce[0] != wt {
+			t.Fatalf("healthy completion must force-remove the worktree even with the run's own lock held: removedForce=%+v", manager.removedForce)
+		}
+		if len(manager.deletedBranches) != 1 || manager.deletedBranches[0] != branch {
+			t.Fatalf("healthy completion must delete the branch: deletedBranches=%+v", manager.deletedBranches)
+		}
+		if got := countJobEvents(t, store, jobID, "delegation_worktree_cleanup_skipped"); got != 0 {
+			t.Fatalf("healthy completion must not skip cleanup, got %d skip events", got)
+		}
+	})
+
+	t.Run("foreign live lock still blocks cleanup", func(t *testing.T) {
+		store := openEngineStore(t)
+		branch := "gitmoot-delegation-x-foreign"
+		engine, manager := newEngine(t, store, branch)
+		wt := t.TempDir()
+		jobID := "leg-foreign"
+		insertCompletedJob(t, store, db.Job{ID: jobID, Agent: "producer", Type: "implement", DelegationID: "d2"}, JobPayload{
+			DelegationID: "d2", WorktreePath: wt, Branch: branch,
+			Result: &AgentResult{Decision: "implemented", Summary: "done"},
+		})
+		acquireSelfLock(t, store, jobID)
+
+		// No self token in ctx: the held lock is a FOREIGN live owner (e.g. a recovery /
+		// retry path advancing the job while the original worker still holds the lock).
+		if err := engine.AdvanceJob(context.Background(), jobID); err != nil {
+			t.Fatalf("AdvanceJob(%s) returned error: %v", jobID, err)
+		}
+		if len(manager.removedForce) != 0 || len(manager.deletedBranches) != 0 {
+			t.Fatalf("foreign live owner must block destructive cleanup: removedForce=%+v deletedBranches=%+v", manager.removedForce, manager.deletedBranches)
+		}
+		if got := countJobEvents(t, store, jobID, "delegation_worktree_cleanup_skipped"); got != 1 {
+			t.Fatalf("foreign live owner must skip cleanup once, got %d skip events", got)
+		}
+		if _, err := os.Stat(wt); err != nil {
+			t.Fatalf("worktree must be preserved on disk: stat err = %v", err)
+		}
+	})
+}
+
 func TestCleanupImplementDelegationWorktreeSkipsIntegrationDep(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

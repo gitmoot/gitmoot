@@ -49,13 +49,37 @@ func (l ResourceLockLiveness) Active() bool {
 }
 
 // LiveAndUnexpired reports a STRICT live owner: an unexpired lease whose owner is
-// provably alive (a live same-host PID) or on an unverifiable remote host. It
-// gates stale-running-job recovery so a long-running job whose runtime lease has
-// not elapsed and whose owner process is still alive is not wrongly requeued as
-// stale. A dead same-host owner (an unexpired lease left by a crashed worker) is
-// NOT strict-live, so legitimate restart recovery still proceeds.
+// provably alive (a live same-host PID) or on an unverifiable remote host. A dead
+// same-host owner (an unexpired lease left by a crashed worker) is NOT strict-live.
+//
+// NOTE: this is NO LONGER the gate stale-running-job recovery consults — see
+// LeaseHeld for why the PID signal is unsafe on the daemon-restart path. It is
+// retained for callers that genuinely need a provably-live owner (and for the
+// liveness classification table test).
 func (l ResourceLockLiveness) LiveAndUnexpired() bool {
 	return l.LeaseUnexpired && (l.OwnerPIDLive || l.CrossHost)
+}
+
+// LeaseHeld reports whether the lock's timeout contract is still in force: its
+// lease has not elapsed, or the owner is on an unverifiable remote host. This is
+// the gate stale-running-job recovery consults (#536).
+//
+// Crucially it does NOT consult OwnerPIDLive. The lock records the PID of the
+// gitmoot DAEMON process that acquired it, NOT the spawned codex/claude/kimi
+// runtime worker. On a daemon restart (crash/redeploy/OOM) the runtime worker is
+// reparented to init and keeps running, but the lock still carries the OLD, now
+// dead daemon PID. A PID-based "is it alive?" check therefore reports the wrong
+// answer exactly on the restart path this recovery is named for, and would requeue
+// a job whose worker is still progressing — the original #536 failure. The lease,
+// by contrast, encodes the effective job timeout and survives the restart in the
+// DB, so it is the correct (PID-reuse-immune) contract: do not requeue while the
+// lease is unexpired; once it expires (recoverExpiredRuntimeSessionLocks reclaims
+// it) the job is requeued. The trade-off is that a genuinely-crashed worker whose
+// daemon also died is not requeued until its lease expires rather than at the
+// coarse 30m threshold — promptness traded for never failing live work, which is
+// the unattended-reliability goal.
+func (l ResourceLockLiveness) LeaseHeld() bool {
+	return l.LeaseUnexpired || l.CrossHost
 }
 
 // classifyResourceLockLiveness applies the host/PID/lease classification used by
@@ -108,11 +132,19 @@ func resourceLockLivenessScore(l ResourceLockLiveness) int {
 // terminal transition has released it). When a job holds more than one runtime
 // lock the strongest live signal is returned. pidAlive is the same-host process
 // liveness probe; thisHost is the local hostname used for the host comparison.
-func (s *Store) JobRuntimeLockLiveness(ctx context.Context, ownerJobID string, now time.Time, thisHost string, pidAlive func(int64) bool) (*ResourceLockLiveness, error) {
+//
+// excludeOwnerToken, when non-empty, drops any lock the CALLER itself currently
+// holds (matched by owner token) from the classification. This lets an in-flight
+// run that is finishing normally — which still holds its OWN runtime-session lock
+// because the daemon releases it only AFTER engine.RunJob (and thus AdvanceJob's
+// terminal worktree cleanup) returns — distinguish its own about-to-be-released
+// lock from a FOREIGN live owner. Recovery/retry paths that hold no lock pass "".
+func (s *Store) JobRuntimeLockLiveness(ctx context.Context, ownerJobID string, now time.Time, thisHost string, pidAlive func(int64) bool, excludeOwnerToken string) (*ResourceLockLiveness, error) {
 	ownerJobID = strings.TrimSpace(ownerJobID)
 	if ownerJobID == "" {
 		return nil, nil
 	}
+	excludeOwnerToken = strings.TrimSpace(excludeOwnerToken)
 	rows, err := s.db.QueryContext(ctx, `SELECT resource_key, owner_job_id, owner_token, owner_pid, owner_hostname, command_hash, acquired_at, updated_at, expires_at
 		FROM resource_locks
 		WHERE owner_job_id = ? AND resource_key LIKE ?
@@ -127,6 +159,9 @@ func (s *Store) JobRuntimeLockLiveness(ctx context.Context, ownerJobID string, n
 		var lock ResourceLock
 		if err := rows.Scan(&lock.ResourceKey, &lock.OwnerJobID, &lock.OwnerToken, &lock.OwnerPID, &lock.OwnerHostname, &lock.CommandHash, &lock.AcquiredAt, &lock.UpdatedAt, &lock.ExpiresAt); err != nil {
 			return nil, err
+		}
+		if excludeOwnerToken != "" && strings.TrimSpace(lock.OwnerToken) == excludeOwnerToken {
+			continue
 		}
 		liveness := classifyResourceLockLiveness(lock, now, thisHost, pidAlive)
 		if score := resourceLockLivenessScore(liveness); score > bestScore {

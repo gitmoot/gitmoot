@@ -489,14 +489,18 @@ func (e Engine) cleanupImplementDelegationWorktree(ctx context.Context, jobID st
 		return
 	}
 	// Liveness gate (#536): NEVER force-remove a worktree (and delete its branch)
-	// while a live runtime worker still owns it. On a healthy terminal the job's
-	// runtime-session lock is already released, so this is a no-op and cleanup runs
-	// unchanged. But when the terminal state was synthesized by stale recovery /
-	// dirty-checkout validation while the original worker was still running, the
-	// runtime-session lock lingers with an unexpired lease (and possibly a live
-	// owner PID). Refuse the destructive removal in that window and preserve the
-	// dirty worktree for salvage rather than orphaning the live process onto a
-	// deleted cwd. A later re-advance (after the lock expires/releases) reclaims it.
+	// while a FOREIGN live runtime worker still owns it. On a healthy terminal the
+	// run's OWN runtime-session lock is still held here (the daemon releases it only
+	// after RunJob -> AdvanceJob returns), but it is excluded by owner token via the
+	// run context (runtimeOwnerActive), so cleanup proceeds unchanged. The gate fires
+	// only when the terminal state was synthesized by stale recovery / dirty-checkout
+	// validation while a DIFFERENT worker's lock lingers with an unexpired lease (and
+	// possibly a live owner PID). Refuse the destructive removal in that window and
+	// preserve the dirty worktree for salvage rather than orphaning the live process
+	// onto a deleted cwd. The daemon's reclaimSkippedDelegationWorktrees pass re-fires
+	// this cleanup on a later tick once the foreign lock releases/expires
+	// (recoverExpiredRuntimeSessionLocks reclaims an expired lease), so the preserved
+	// worktree is reclaimed rather than leaked forever.
 	if active, reason := e.runtimeOwnerActive(ctx, jobID); active {
 		_ = e.Store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{JobID: jobID, Kind: "delegation_worktree_cleanup_skipped", Message: fmt.Sprintf("implement worktree %s cleanup skipped: runtime owner still active (%s)", strings.TrimSpace(payload.WorktreePath), reason)})
 		return
@@ -566,6 +570,27 @@ func (e Engine) cleanupImplementDelegationWorktree(ctx context.Context, jobID st
 		message = fmt.Sprintf("implement worktree %s and branch %s removed", path, branch)
 	}
 	_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_removed", Message: message})
+}
+
+// ReclaimTerminalDelegationWorktree re-attempts the terminal implement-delegation
+// worktree+branch cleanup for an already-terminal child whose earlier terminal
+// advance PRESERVED it because a foreign runtime owner was still active (it emitted
+// delegation_worktree_cleanup_skipped). It is the daemon's lock-expiry-driven
+// reclamation (#536): once that foreign owner releases its lock or its lease
+// expires, the worktree is no longer owned and must be torn down rather than
+// leaked. It simply re-runs the same idempotent, liveness-gated cleanup, so it is a
+// no-op when the owner is still active, when the worktree is already gone, or for a
+// non-implement / non-delegation job.
+func (e Engine) ReclaimTerminalDelegationWorktree(ctx context.Context, jobID string) error {
+	if err := e.validate(); err != nil {
+		return err
+	}
+	job, payload, err := e.jobPayload(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	e.cleanupImplementDelegationWorktree(ctx, jobID, job.Type, payload)
+	return nil
 }
 
 // implementLegBranchMayBeMerged reports whether a succeeded implement leg's

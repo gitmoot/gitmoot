@@ -20,9 +20,11 @@ func TestJobRuntimeLockLiveness(t *testing.T) {
 		hostname   string
 		expiresIn  time.Duration
 		pidAlive   func(int64) bool
+		exclude    string
 		wantNil    bool
 		wantActive bool
 		wantStrict bool
+		wantLease  bool
 	}{
 		{
 			name:    "no lock is not active",
@@ -49,9 +51,13 @@ func TestJobRuntimeLockLiveness(t *testing.T) {
 			pidAlive:   livePID,
 			wantActive: true,
 			wantStrict: true,
+			wantLease:  true,
 		},
 		{
-			name:       "unexpired lease dead pid is active but not strict-live",
+			// The daemon-restart shape: an unexpired lease but a DEAD owner PID (the
+			// prior daemon). NOT strict-live (PID dead), but the lease is still held —
+			// recovery must honor the lease and leave the job running (#536).
+			name:       "unexpired lease dead pid is active and lease-held but not strict-live",
 			acquire:    true,
 			key:        "runtime:codex:s1",
 			pid:        4242,
@@ -60,9 +66,10 @@ func TestJobRuntimeLockLiveness(t *testing.T) {
 			pidAlive:   deadPID,
 			wantActive: true,
 			wantStrict: false,
+			wantLease:  true,
 		},
 		{
-			name:       "expired lease live pid is active but not strict-live",
+			name:       "expired lease live pid is active but neither strict-live nor lease-held",
 			acquire:    true,
 			key:        "runtime:codex:s1",
 			pid:        4242,
@@ -71,9 +78,10 @@ func TestJobRuntimeLockLiveness(t *testing.T) {
 			pidAlive:   livePID,
 			wantActive: true,
 			wantStrict: false,
+			wantLease:  false,
 		},
 		{
-			name:       "expired lease dead pid is neither active nor strict-live",
+			name:       "expired lease dead pid is neither active nor strict-live nor lease-held",
 			acquire:    true,
 			key:        "runtime:codex:s1",
 			pid:        4242,
@@ -82,9 +90,10 @@ func TestJobRuntimeLockLiveness(t *testing.T) {
 			pidAlive:   deadPID,
 			wantActive: false,
 			wantStrict: false,
+			wantLease:  false,
 		},
 		{
-			name:       "cross-host unexpired lease is strict-live (unverifiable)",
+			name:       "cross-host unexpired lease is strict-live and lease-held (unverifiable)",
 			acquire:    true,
 			key:        "runtime:codex:s1",
 			pid:        4242,
@@ -93,6 +102,7 @@ func TestJobRuntimeLockLiveness(t *testing.T) {
 			pidAlive:   deadPID,
 			wantActive: true,
 			wantStrict: true,
+			wantLease:  true,
 		},
 		{
 			name:       "empty hostname treated as this host",
@@ -104,6 +114,21 @@ func TestJobRuntimeLockLiveness(t *testing.T) {
 			pidAlive:   livePID,
 			wantActive: true,
 			wantStrict: true,
+			wantLease:  true,
+		},
+		{
+			// excludeOwnerToken drops the caller's OWN held lock: a run finishing
+			// normally still holds its runtime-session lock (released after AdvanceJob),
+			// so excluding it by token yields nil — cleanup proceeds (#536).
+			name:      "self-owned lock excluded by token yields nil",
+			acquire:   true,
+			key:       "runtime:codex:s1",
+			pid:       4242,
+			hostname:  host,
+			expiresIn: 4 * time.Hour,
+			pidAlive:  livePID,
+			exclude:   "tok",
+			wantNil:   true,
 		},
 	}
 
@@ -128,7 +153,7 @@ func TestJobRuntimeLockLiveness(t *testing.T) {
 					t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
 				}
 			}
-			liveness, err := store.JobRuntimeLockLiveness(ctx, "job-1", now, host, tc.pidAlive)
+			liveness, err := store.JobRuntimeLockLiveness(ctx, "job-1", now, host, tc.pidAlive, tc.exclude)
 			if err != nil {
 				t.Fatalf("JobRuntimeLockLiveness returned error: %v", err)
 			}
@@ -146,6 +171,9 @@ func TestJobRuntimeLockLiveness(t *testing.T) {
 			}
 			if liveness.LiveAndUnexpired() != tc.wantStrict {
 				t.Fatalf("LiveAndUnexpired() = %v, want %v (%+v)", liveness.LiveAndUnexpired(), tc.wantStrict, liveness)
+			}
+			if liveness.LeaseHeld() != tc.wantLease {
+				t.Fatalf("LeaseHeld() = %v, want %v (%+v)", liveness.LeaseHeld(), tc.wantLease, liveness)
 			}
 		})
 	}

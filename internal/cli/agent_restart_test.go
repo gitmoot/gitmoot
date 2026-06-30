@@ -329,7 +329,7 @@ func TestRunAgentRestartRejectsLiveSessionOwner(t *testing.T) {
 	// Acquire the session lock for runtime:codex:<r1> via the real path.
 	store := openCLIJobStore(t, home)
 	defer store.Close()
-	release, acquired, key, err := acquireRuntimeSessionLock(
+	release, acquired, key, _, err := acquireRuntimeSessionLock(
 		context.Background(), store, "live-ask-job",
 		runtimeAgentForRef(agent.Runtime, agent.RuntimeRef),
 		time.Now().UTC(), 30*time.Minute,
@@ -448,7 +448,7 @@ func TestAcquireRuntimeSessionLockRecordsOwnerIdentity(t *testing.T) {
 	defer store.Close()
 
 	agent := runtimeAgentForRef("codex", "550e8400-e29b-41d4-a716-446655440071")
-	release, acquired, key, err := acquireRuntimeSessionLock(
+	release, acquired, key, _, err := acquireRuntimeSessionLock(
 		context.Background(), store, "identity-job", agent, time.Now().UTC(), time.Minute,
 	)
 	if err != nil || !acquired {

@@ -4898,14 +4898,18 @@ func TestRecoverRunningJobsKeepsRecentRunningJobsOnStartup(t *testing.T) {
 }
 
 // TestRecoverRunningJobsHonorsLiveRuntimeLease is the #536 regression: a
-// long-running job (e.g. a 4h delegation) holds a runtime-session lock whose lease
-// reflects its real timeout. The coarse `updated_at < before` staleness threshold
-// must NOT requeue such a job while its runtime owner is still strict-live (an
-// unexpired lease AND a live owner PID). A crashed worker (dead PID) or a job with
-// no runtime lock must still be recovered so legacy/restart recovery is preserved.
+// long-running job (e.g. a 4h delegation) holds a runtime-session lock whose LEASE
+// reflects its real job timeout. The coarse `updated_at < before` staleness
+// threshold must NOT requeue such a job while its lease is unexpired — regardless
+// of the lock's owner PID. The lock records the gitmoot DAEMON's PID, not the
+// spawned runtime worker's, so on a daemon restart the recorded PID is the DEAD
+// prior daemon even while the reparented worker keeps running; keying recovery on
+// the lease (not the PID) is what makes the restart path correct. A job whose lease
+// has expired, or that holds no runtime lock at all, is still recovered.
 //
-// Without the liveness gate the first row ("live owner, unexpired lease") would be
-// requeued (state -> queued); with it, the live job stays running.
+// The "dead owner, unexpired lease" row is the daemon-restart scenario the recovery
+// is named for: it MUST stay running (a PID-liveness gate would wrongly requeue it
+// and fail the still-progressing worker — the original bug).
 func TestRecoverRunningJobsHonorsLiveRuntimeLease(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -4915,8 +4919,9 @@ func TestRecoverRunningJobsHonorsLiveRuntimeLease(t *testing.T) {
 		wantState   string
 	}{
 		{name: "live owner unexpired lease stays running", acquireLock: true, ownerPID: int64(os.Getpid()), expiresIn: 4 * time.Hour, wantState: string(workflow.JobRunning)},
-		{name: "dead owner unexpired lease recovers", acquireLock: true, ownerPID: 0, expiresIn: 4 * time.Hour, wantState: string(workflow.JobQueued)},
+		{name: "dead owner unexpired lease stays running (daemon restart)", acquireLock: true, ownerPID: 0, expiresIn: 4 * time.Hour, wantState: string(workflow.JobRunning)},
 		{name: "live owner expired lease recovers", acquireLock: true, ownerPID: int64(os.Getpid()), expiresIn: -time.Minute, wantState: string(workflow.JobQueued)},
+		{name: "dead owner expired lease recovers", acquireLock: true, ownerPID: 0, expiresIn: -time.Minute, wantState: string(workflow.JobQueued)},
 		{name: "no runtime lock recovers", acquireLock: false, wantState: string(workflow.JobQueued)},
 	}
 	for _, tc := range cases {
@@ -4958,6 +4963,126 @@ func TestRecoverRunningJobsHonorsLiveRuntimeLease(t *testing.T) {
 			}
 			if job.State != tc.wantState {
 				t.Fatalf("job state = %q, want %q", job.State, tc.wantState)
+			}
+		})
+	}
+}
+
+// fakeReclaimWorktreeManager is a worktree manager used by the
+// reclaim-skipped-worktrees test: it satisfies the cleanup's type-asserted
+// interfaces (force-remove + branch delete + branch existence) and records calls.
+type fakeReclaimWorktreeManager struct {
+	removed  []string
+	deleted  []string
+	branches map[string]bool
+}
+
+func (m *fakeReclaimWorktreeManager) AddWorktree(context.Context, string, string, string) error {
+	return nil
+}
+func (m *fakeReclaimWorktreeManager) AddDetachedWorktree(context.Context, string, string) error {
+	return nil
+}
+func (m *fakeReclaimWorktreeManager) RemoveWorktreeForce(_ context.Context, path string) error {
+	m.removed = append(m.removed, path)
+	return nil
+}
+func (m *fakeReclaimWorktreeManager) DeleteBranch(_ context.Context, branch string) error {
+	m.deleted = append(m.deleted, branch)
+	m.branches[branch] = false
+	return nil
+}
+func (m *fakeReclaimWorktreeManager) BranchExists(_ context.Context, branch string) (bool, error) {
+	return m.branches[branch], nil
+}
+
+// TestReclaimSkippedDelegationWorktrees is the #536 leak regression: when a
+// terminal delegation child's worktree cleanup was SKIPPED because a foreign
+// runtime owner was active (delegation_worktree_cleanup_skipped), nothing
+// re-advances the terminal job, so the preserved worktree + branch would leak
+// forever. The daemon's reclaim pass must re-fire the (idempotent, liveness-gated)
+// cleanup: a no-op while the owner is still active, a real reclaim once it is gone.
+func TestReclaimSkippedDelegationWorktrees(t *testing.T) {
+	cases := []struct {
+		name        string
+		acquireLock bool
+		expiresIn   time.Duration
+		wantRemoved bool
+	}{
+		{name: "owner gone reclaims preserved worktree", acquireLock: false, wantRemoved: true},
+		{name: "expired lease reclaims preserved worktree", acquireLock: true, expiresIn: -time.Minute, wantRemoved: true},
+		{name: "active foreign owner keeps preserving", acquireLock: true, expiresIn: 4 * time.Hour, wantRemoved: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := daemonWorkerStore(t)
+			branch := "gitmoot-delegation-x-d1"
+			wt := t.TempDir()
+			jobID := "parent/delegation/d1"
+			payload := workflow.JobPayload{
+				Repo: "owner/repo", DelegationID: "d1", WorktreePath: wt, Branch: branch,
+				Result: &workflow.AgentResult{Decision: "failed"},
+			}
+			encoded, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatalf("Marshal payload returned error: %v", err)
+			}
+			if err := store.CreateJobWithEvent(ctx, db.Job{
+				ID: jobID, Agent: "producer", Type: "implement", State: string(workflow.JobFailed),
+				ParentJobID: "parent", DelegationID: "d1", Payload: string(encoded),
+			}, db.JobEvent{Kind: string(workflow.JobFailed), Message: "seed"}); err != nil {
+				t.Fatalf("CreateJobWithEvent returned error: %v", err)
+			}
+			// Prior terminal advance preserved the worktree (foreign owner was active).
+			if err := store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_cleanup_skipped", Message: "preserved"}); err != nil {
+				t.Fatalf("AddJobEvent returned error: %v", err)
+			}
+			if tc.acquireLock {
+				now := time.Now().UTC()
+				acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+					ResourceKey: "runtime:codex:session-536", OwnerJobID: jobID, OwnerToken: "foreign-tok",
+					OwnerPID: deadPID(t), OwnerHostname: thisHostname(t),
+					ExpiresAt: now.Add(tc.expiresIn).Format(time.RFC3339Nano),
+				}, now)
+				if err != nil || !acquired {
+					t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
+				}
+			}
+
+			manager := &fakeReclaimWorktreeManager{branches: map[string]bool{branch: true}}
+			worker := defaultJobWorker(store, io.Discard)
+			worker.WorkflowFactory = func(string) workflow.Engine {
+				return workflow.Engine{
+					Store:               store,
+					DelegationCheckout:  t.TempDir(),
+					DelegationWorktrees: manager,
+					OwnerPIDLive:        func(int64) bool { return false },
+				}
+			}
+
+			if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", ""); err != nil {
+				t.Fatalf("reclaimSkippedDelegationWorktrees returned error: %v", err)
+			}
+
+			pending, err := worker.delegationWorktreeCleanupPending(ctx, jobID)
+			if err != nil {
+				t.Fatalf("delegationWorktreeCleanupPending returned error: %v", err)
+			}
+			if tc.wantRemoved {
+				if len(manager.removed) != 1 || manager.removed[0] != wt {
+					t.Fatalf("preserved worktree must be reclaimed: removed=%+v", manager.removed)
+				}
+				if pending {
+					t.Fatalf("cleanup pending must clear after reclaim")
+				}
+			} else {
+				if len(manager.removed) != 0 {
+					t.Fatalf("active foreign owner must keep preserving: removed=%+v", manager.removed)
+				}
+				if !pending {
+					t.Fatalf("cleanup must still be pending while owner active")
+				}
 			}
 		})
 	}
