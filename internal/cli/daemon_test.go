@@ -5730,14 +5730,82 @@ func TestEffectiveJobTimeout(t *testing.T) {
 		t.Fatalf("effectiveJobTimeout(zero payload) = %v, want 10m", got)
 	}
 
-	// With no managed config, an empty payload timeout yields zero (no deadline).
-	if got := effectiveJobTimeout(workflow.JobPayload{}, managedJobRuntimeConfig{}); got != 0 {
-		t.Fatalf("effectiveJobTimeout(unmanaged, empty) = %v, want 0", got)
+	// With no managed config, an empty payload timeout falls back to the daemon
+	// stale window so an unmanaged job still has a watchdog.
+	if got := effectiveJobTimeout(workflow.JobPayload{}, managedJobRuntimeConfig{}); got != daemonRunningJobStaleAfter {
+		t.Fatalf("effectiveJobTimeout(unmanaged, empty) = %v, want %v", got, daemonRunningJobStaleAfter)
 	}
 
 	// With no managed config, a valid payload timeout still applies.
 	if got := effectiveJobTimeout(workflow.JobPayload{JobTimeout: "45s"}, managedJobRuntimeConfig{}); got != 45*time.Second {
 		t.Fatalf("effectiveJobTimeout(unmanaged, payload) = %v, want 45s", got)
+	}
+}
+
+func TestStartSupervisorWorkerLoopReportsErrorByDefault(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := startSupervisorWorkerLoop(ctx, time.Millisecond, func(time.Time) error {
+		return errors.New("boom")
+	})
+
+	select {
+	case err, ok := <-errCh:
+		if !ok {
+			t.Fatal("worker loop closed without reporting the run error")
+		}
+		if err == nil || err.Error() != "boom" {
+			t.Fatalf("worker loop error = %v, want boom", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker loop did not report the run error")
+	}
+}
+
+func TestStartSupervisorWorkerLoopRecoveringRetriesAfterRunError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls int
+	var mu sync.Mutex
+	errCh := startSupervisorWorkerLoopRecovering(ctx, time.Millisecond, io.Discard, func(time.Time) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		if calls == 1 {
+			return errors.New("transient")
+		}
+		cancel()
+		return nil
+	})
+
+	select {
+	case err, ok := <-errCh:
+		if ok && err != nil {
+			t.Fatalf("recovering worker loop reported error = %v, want silent retry", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recovering worker loop did not retry after the run error")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls < 2 {
+		t.Fatalf("recovering worker loop calls = %d, want at least 2", calls)
+	}
+}
+
+func TestRunDaemonPollWithTimeoutCancelsPoll(t *testing.T) {
+	start := time.Now()
+	err := runDaemonPollWithTimeout(context.Background(), time.Millisecond, func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("runDaemonPollWithTimeout error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("runDaemonPollWithTimeout took %v, want bounded", elapsed)
 	}
 }
 

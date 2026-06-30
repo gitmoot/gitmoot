@@ -1298,7 +1298,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 			if err := recoverCancelledRunningJobsForEnabledRepos(ctx, store, rootFilter, stdout); err != nil {
 				return err
 			}
-			workerErr = startSupervisorWorkerLoop(ctx, daemonWorkerLoopInterval, func(now time.Time) error {
+			workerErr = startSupervisorWorkerLoopRecovering(ctx, daemonWorkerLoopInterval, stdout, func(now time.Time) error {
 				return runEnabledRepoWorkerTicksWithLocks(ctx, store, worker, workers, rootFilter, stdout, now, checkoutLocks)
 			})
 			startCockpitReconcileLoop(ctx, store, paths.Home, stdout)
@@ -1360,7 +1360,7 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	worker.UsePool = usePool
 	worker.Admission = worker.loadAdmissionBudget()
 	var checkoutLock sync.Mutex
-	workerErr := startSupervisorWorkerLoop(ctx, daemonWorkerLoopInterval, func(now time.Time) error {
+	workerErr := startSupervisorWorkerLoopRecovering(ctx, daemonWorkerLoopInterval, stdout, func(now time.Time) error {
 		checkoutLock.Lock()
 		defer checkoutLock.Unlock()
 		return runDaemonWorkerTick(ctx, store, worker, workers, false, d.Repo.FullName(), rootFilter, stdout, now)
@@ -1383,10 +1383,10 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 			return err
 		}
 		if checkoutLock.TryLock() {
-			_ = d.PollOnce(ctx)
+			_ = runDaemonPollWithTimeout(ctx, daemonRunningJobStaleAfter, d.PollOnce)
 			checkoutLock.Unlock()
 		} else {
-			_ = d.PollRecoveryCommandsOnce(ctx)
+			_ = runDaemonPollWithTimeout(ctx, daemonRunningJobStaleAfter, d.PollRecoveryCommandsOnce)
 		}
 		if heartbeatPathsErr == nil {
 			if err := runHeartbeatScanOnce(ctx, heartbeatPaths, store, heartbeatEnqueue, time.Now().UTC()); err != nil {
@@ -1622,6 +1622,14 @@ func runOneHeartbeat(ctx context.Context, store *db.Store, enqueue heartbeatEnqu
 }
 
 func startSupervisorWorkerLoop(ctx context.Context, interval time.Duration, run func(time.Time) error) <-chan error {
+	return startSupervisorWorkerLoopInternal(ctx, interval, nil, run, false)
+}
+
+func startSupervisorWorkerLoopRecovering(ctx context.Context, interval time.Duration, stdout io.Writer, run func(time.Time) error) <-chan error {
+	return startSupervisorWorkerLoopInternal(ctx, interval, stdout, run, true)
+}
+
+func startSupervisorWorkerLoopInternal(ctx context.Context, interval time.Duration, stdout io.Writer, run func(time.Time) error, recoverErrors bool) <-chan error {
 	errCh := make(chan error, 1)
 	if interval <= 0 {
 		interval = daemonWorkerLoopInterval
@@ -1633,19 +1641,33 @@ func startSupervisorWorkerLoop(ctx context.Context, interval time.Duration, run 
 				return
 			}
 			if err := run(time.Now().UTC()); err != nil {
+				if recoverErrors {
+					writeLine(stdout, "daemon worker tick error: %v; retrying", err)
+					if sleepErr := sleepSupervisorWorkerLoop(ctx, interval); sleepErr != nil {
+						return
+					}
+					continue
+				}
 				errCh <- err
 				return
 			}
-			timer := time.NewTimer(interval)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
+			if err := sleepSupervisorWorkerLoop(ctx, interval); err != nil {
 				return
-			case <-timer.C:
 			}
 		}
 	}()
 	return errCh
+}
+
+func sleepSupervisorWorkerLoop(ctx context.Context, interval time.Duration) error {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func receiveSupervisorWorkerError(errCh <-chan error) error {
@@ -2050,6 +2072,15 @@ func recoverExpiredRuntimeSessionLocks(ctx context.Context, store *db.Store, std
 		writeLine(stdout, "recovered %d expired runtime session locks", deleted)
 	}
 	return nil
+}
+
+func runDaemonPollWithTimeout(ctx context.Context, timeout time.Duration, poll func(context.Context) error) error {
+	if timeout <= 0 {
+		return poll(ctx)
+	}
+	pollCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return poll(pollCtx)
 }
 
 func recoverRunningJobsBefore(ctx context.Context, store *db.Store, stdout io.Writer, before time.Time) error {
@@ -4256,14 +4287,17 @@ func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (mana
 
 // effectiveJobTimeout returns the timeout to enforce for a job: the
 // per-delegation payload.JobTimeout when it parses to a positive duration,
-// otherwise the agent-type managed.JobTimeout (which is zero when the agent is
-// not managed). The same value drives both the runtime-session lock TTL and the
-// run context deadline so the lock cannot expire before the job does.
+// otherwise the agent-type managed.JobTimeout, otherwise the daemon stale window
+// for unmanaged jobs. The same value drives both the runtime-session lock TTL and
+// the run context deadline so a job cannot outlive the lease that guards it.
 func effectiveJobTimeout(payload workflow.JobPayload, managed managedJobRuntimeConfig) time.Duration {
 	if d, err := time.ParseDuration(strings.TrimSpace(payload.JobTimeout)); err == nil && d > 0 {
 		return d
 	}
-	return managed.JobTimeout
+	if managed.JobTimeout > 0 {
+		return managed.JobTimeout
+	}
+	return daemonRunningJobStaleAfter
 }
 
 func originalAgentForTempWorkerType(typ string) string {
