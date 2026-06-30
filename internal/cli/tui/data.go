@@ -199,6 +199,8 @@ type Session struct {
 	Template string
 	LastUsed string
 	Expires  string
+	// Stale marks a phantom running session whose lease has elapsed (#505 gap 2).
+	Stale bool
 }
 
 // Jobs mirrors cli.dashboardJobs.

@@ -22,14 +22,17 @@ type sessionRow struct {
 // type/runtime/state into one counted line (mirroring cli.groupedRuntimeSessions)
 // while keeping each row's representative session for the detail view.
 func (m Model) sessionRows() []sessionRow {
-	type groupKey struct{ prefix, runtime, state string }
+	type groupKey struct {
+		prefix, runtime, state string
+		stale                  bool
+	}
 	order := []groupKey{}
 	counts := map[groupKey]int{}
 	rep := map[groupKey]Session{}
 	singles := []Session{}
 	for _, s := range m.snap.Sessions {
 		if prefix, ok := style.GroupSuffix(s.Name); ok {
-			key := groupKey{prefix: prefix, runtime: s.Runtime, state: s.State}
+			key := groupKey{prefix: prefix, runtime: s.Runtime, state: s.State, stale: s.Stale}
 			if counts[key] == 0 {
 				order = append(order, key)
 				rep[key] = s
@@ -42,19 +45,28 @@ func (m Model) sessionRows() []sessionRow {
 	rows := make([]sessionRow, 0, len(order)+len(singles))
 	for _, key := range order {
 		rows = append(rows, sessionRow{
-			label:   fmt.Sprintf("%s [%s] ×%d %s", key.prefix, key.runtime, counts[key], key.state),
+			label:   fmt.Sprintf("%s [%s] ×%d %s", key.prefix, key.runtime, counts[key], sessionStateText(key.state, key.stale)),
 			session: rep[key],
 			count:   counts[key],
 		})
 	}
 	for _, s := range singles {
 		rows = append(rows, sessionRow{
-			label:   fmt.Sprintf("%s (%s) [%s] %s %s", s.Name, dash(s.Type), s.Runtime, dash(s.Repo), s.State),
+			label:   fmt.Sprintf("%s (%s) [%s] %s %s", s.Name, dash(s.Type), s.Runtime, dash(s.Repo), sessionStateText(s.State, s.Stale)),
 			session: s,
 			count:   1,
 		})
 	}
 	return rows
+}
+
+// sessionStateText appends "(stale)" to a phantom running session's state so the
+// Sessions page never shows a dead runtime session as plainly live (#505 gap 2).
+func sessionStateText(state string, stale bool) string {
+	if stale {
+		return state + " (stale)"
+	}
+	return state
 }
 
 // updateSessionOverlay handles keys in the session detail and stop-confirm

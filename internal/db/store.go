@@ -2003,6 +2003,33 @@ func (s *Store) DeleteExpiredAgentInstances(ctx context.Context, now time.Time) 
 	return result.RowsAffected()
 }
 
+// ReconcileOrphanedRunningInstances resets to 'idle' any agent_instance left at
+// state='running' whose lease (expires_at) has already elapsed and that has NO
+// active (queued/running) job (#505 gap 2). Such a row is a phantom: a daemon
+// that died mid-job never ran its deferred TouchAgentInstance, so the instance is
+// stuck advertising a runtime session that no longer exists and the existing
+// idle-only GC never reclaims it. It never disturbs a genuinely live session: an
+// in-flight job within its timeout keeps a FUTURE expires_at (set to
+// now+jobTimeout by MarkAgentInstanceRunning), and the active-job guard protects
+// queued/running work — so this is safe to call from any number of concurrent
+// daemons. Resetting (rather than deleting) keeps the row reusable and lets the
+// normal idle GC reclaim it. Returns the number of rows reconciled.
+func (s *Store) ReconcileOrphanedRunningInstances(ctx context.Context, now time.Time) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE agent_instances
+		SET state = 'idle'
+		WHERE state = 'running'
+			AND expires_at <= ?
+			AND NOT EXISTS (
+				SELECT 1 FROM jobs
+				WHERE jobs.agent = agent_instances.name
+					AND jobs.state IN ('queued', 'running')
+			)`, formatResourceLockTime(now))
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 func scanAgentInstance(row interface{ Scan(dest ...any) error }) (AgentInstance, error) {
 	var instance AgentInstance
 	var capabilities string

@@ -232,6 +232,25 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Self-register so `daemon status` / the dashboard recognize a `daemon run`
+	// launched directly (e.g. under `systemd --user`), not only one spawned by
+	// `daemon start` (#505 gap 3), and reconcile any phantom "running" runtime
+	// sessions a previously-crashed daemon left behind (#505 gap 2). Both are
+	// best-effort: a failure here never blocks the daemon from running.
+	if paths, perr := initializedPaths(*home); perr == nil {
+		state := daemonProcessState(paths)
+		workDir, _ := os.Getwd()
+		if registered, regErr := registerDaemonRunState(state, os.Args, workDir); regErr == nil && registered {
+			defer deregisterDaemonRunState(state)
+		}
+		_ = withStore(*home, func(store *db.Store) error {
+			if n, err := store.ReconcileOrphanedRunningInstances(ctx, time.Now().UTC()); err == nil && n > 0 {
+				writeLine(stdout, "reconciled %d orphaned running runtime session(s)", n)
+			}
+			return nil
+		})
+	}
+
 	if *repoFlag == "" {
 		err := runRegisteredRepoSupervisor(ctx, *home, *poll, *workers, *dryRun, *watchSkillOptReviews, *watchIssues, usePool, session, stdout)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -952,6 +971,54 @@ func writeDaemonState(state daemonState, meta daemonMeta) error {
 		return err
 	}
 	return os.WriteFile(state.MetaFile, append(encoded, '\n'), 0o600)
+}
+
+// registerDaemonRunState records THIS process as the running daemon so `daemon
+// status` and the dashboard recognize a `daemon run` launched directly — e.g. as
+// the ExecStart of a `systemd --user` unit — and not only one spawned by `daemon
+// start` (#505 gap 3). `daemon start` forks a detached child and writes the
+// pid/meta from the PARENT; a systemd-managed `daemon run` has no such parent, so
+// without this self-registration daemon.json is never written and status falsely
+// reports "stopped" while the daemon is alive and processing.
+//
+// args MUST be the process's own argv (os.Args) so the recorded meta.Executable
+// (argv[0]) and meta.Args (argv[1:]) match /proc/<pid>/cmdline and pass
+// processLooksLikeDaemon. It refuses to clobber a DIFFERENT live daemon's state
+// (returns ok=false), so the existing "daemon start then child self-registers"
+// flow stays idempotent (the child owns the pid it finds) and an unrelated daemon
+// is never overwritten.
+func registerDaemonRunState(state daemonState, argv []string, workDir string) (ok bool, err error) {
+	if existing, _, perr := currentDaemonPID(state); perr == nil && existing > 0 && existing != os.Getpid() {
+		return false, nil
+	}
+	executable := ""
+	if len(argv) > 0 {
+		executable = argv[0]
+	}
+	meta := daemonMeta{
+		PID:        os.Getpid(),
+		StartedAt:  time.Now().UTC().Format(time.RFC3339),
+		Args:       argv[1:],
+		LogFile:    state.LogFile,
+		Executable: executable,
+		WorkingDir: workDir,
+	}
+	if err := writeDaemonState(state, meta); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// deregisterDaemonRunState removes the pid/meta written by registerDaemonRunState
+// when the daemon-run process exits, but ONLY when they still point at THIS
+// process — so a daemon that was restarted out from under us (a fresh pid already
+// recorded) never has its live state clobbered on our shutdown.
+func deregisterDaemonRunState(state daemonState) {
+	if meta, err := readDaemonMeta(state); err != nil || meta.PID != os.Getpid() {
+		return
+	}
+	_ = os.Remove(state.PIDFile)
+	_ = os.Remove(state.MetaFile)
 }
 
 func stopDaemonPID(pid int) error {

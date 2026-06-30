@@ -139,6 +139,10 @@ type dashboardSession struct {
 	Runtime string `json:"runtime"`
 	Repo    string `json:"repo,omitempty"`
 	State   string `json:"state,omitempty"`
+	// Stale marks a phantom "running" session — an agent_instance still at
+	// state=running whose lease (expires_at) has elapsed (#505 gap 2). omitempty
+	// keeps the --json shape byte-identical for healthy sessions (no new key).
+	Stale bool `json:"stale,omitempty"`
 
 	// Detail fields shown only in the interactive session detail view. They are
 	// unexported so the --json/--plain output stays byte-stable (mirrors how
@@ -454,6 +458,7 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 				Runtime:     instance.Runtime,
 				Repo:        instance.RepoFullName,
 				State:       instance.State,
+				Stale:       dashboardSessionStale(instance.State, instance.ExpiresAt, now),
 				sessionType: instance.Type,
 				role:        instance.Role,
 				templateID:  instance.TemplateID,
@@ -674,7 +679,7 @@ func printDashboardSnapshot(stdout io.Writer, st style.Style, snapshot dashboard
 		}
 	} else {
 		for _, session := range snapshot.RuntimeSessions {
-			writeLine(stdout, "  %s [%s] %s %s", session.Name, session.Runtime, emptyText(session.Repo), session.State)
+			writeLine(stdout, "  %s [%s] %s %s", session.Name, session.Runtime, emptyText(session.Repo), dashboardSessionStateText(session))
 		}
 	}
 
@@ -742,6 +747,11 @@ func printDashboardAttention(stdout io.Writer, st style.Style, snapshot dashboar
 			lines = append(lines, st.Red("stale lock")+" "+lock.Key)
 		}
 	}
+	for _, session := range snapshot.RuntimeSessions {
+		if session.Stale {
+			lines = append(lines, st.Red("stale session")+" "+session.Name)
+		}
+	}
 	if len(lines) == 0 {
 		return
 	}
@@ -800,17 +810,31 @@ func dashboardDeadTrainPhase(phase string) bool {
 	}
 }
 
+// dashboardSessionStateText renders a session's state, appending "(stale)" for a
+// phantom running session (#505 gap 2) so a dead runtime session is never
+// silently shown as live.
+func dashboardSessionStateText(session dashboardSession) string {
+	if session.Stale {
+		return session.State + " (stale)"
+	}
+	return session.State
+}
+
 // groupedRuntimeSessions collapses generated "<type>-bg-<hex>" sessions sharing
 // a type/runtime/state into a single counted line, leaving other sessions
-// individual.
+// individual. Stale (phantom running) sessions group separately so they are not
+// hidden inside a healthy "running" count (#505 gap 2).
 func groupedRuntimeSessions(sessions []dashboardSession) []string {
-	type groupKey struct{ prefix, runtime, state string }
+	type groupKey struct {
+		prefix, runtime, state string
+		stale                  bool
+	}
 	order := []groupKey{}
 	counts := map[groupKey]int{}
 	singles := []dashboardSession{}
 	for _, session := range sessions {
 		if prefix, ok := style.GroupSuffix(session.Name); ok {
-			key := groupKey{prefix: prefix, runtime: session.Runtime, state: session.State}
+			key := groupKey{prefix: prefix, runtime: session.Runtime, state: session.State, stale: session.Stale}
 			if counts[key] == 0 {
 				order = append(order, key)
 			}
@@ -821,12 +845,26 @@ func groupedRuntimeSessions(sessions []dashboardSession) []string {
 	}
 	lines := make([]string, 0, len(order)+len(singles))
 	for _, key := range order {
-		lines = append(lines, fmt.Sprintf("%s [%s] ×%d %s", key.prefix, key.runtime, counts[key], key.state))
+		state := key.state
+		if key.stale {
+			state += " (stale)"
+		}
+		lines = append(lines, fmt.Sprintf("%s [%s] ×%d %s", key.prefix, key.runtime, counts[key], state))
 	}
 	for _, session := range singles {
-		lines = append(lines, fmt.Sprintf("%s [%s] %s %s", session.Name, session.Runtime, emptyText(session.Repo), session.State))
+		lines = append(lines, fmt.Sprintf("%s [%s] %s %s", session.Name, session.Runtime, emptyText(session.Repo), dashboardSessionStateText(session)))
 	}
 	return lines
+}
+
+// dashboardSessionStale reports a phantom "running" runtime session: an
+// agent_instance still at state=running whose lease (expires_at) has elapsed
+// (#505 gap 2). A daemon that dies mid-job never runs its deferred
+// TouchAgentInstance, so the row keeps advertising a session that no longer
+// exists. It reuses the same expiry test as resource_locks; a normal idle row
+// past its lease (the idle GC reclaims it) is deliberately NOT flagged.
+func dashboardSessionStale(state, expiresAt string, now time.Time) bool {
+	return state == "running" && dashboardLockStale(expiresAt, now)
 }
 
 func dashboardLockStale(expiresAt string, now time.Time) bool {

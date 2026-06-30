@@ -550,6 +550,7 @@ func toTUISnapshot(s dashboardSnapshot) tui.Snapshot {
 			Runtime:  sess.Runtime,
 			Repo:     sess.Repo,
 			State:    sess.State,
+			Stale:    sess.Stale,
 			Type:     sess.sessionType,
 			Role:     sess.role,
 			Template: sess.templateID,

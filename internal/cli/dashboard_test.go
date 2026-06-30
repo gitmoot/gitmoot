@@ -429,6 +429,87 @@ func TestBuildDashboardActiveJobsEmpty(t *testing.T) {
 	}
 }
 
+func TestDashboardSessionStale(t *testing.T) {
+	now := time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC)
+	past := "2026-06-27T11:00:00.000000000Z"
+	future := "2026-06-27T13:00:00.000000000Z"
+	cases := []struct {
+		name    string
+		state   string
+		expires string
+		want    bool
+	}{
+		{name: "running and lease elapsed is a phantom", state: "running", expires: past, want: true},
+		{name: "running within lease is live", state: "running", expires: future, want: false},
+		{name: "idle past lease is normal GC, not phantom", state: "idle", expires: past, want: false},
+		{name: "running with unparseable lease is not flagged", state: "running", expires: "nope", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dashboardSessionStale(tc.state, tc.expires, now); got != tc.want {
+				t.Fatalf("dashboardSessionStale(%q,%q) = %v, want %v", tc.state, tc.expires, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDashboardFlagsPhantomRunningSession is the #505 gap-2 regression at the
+// snapshot/render boundary: an agent_instance left at state=running with an
+// elapsed lease must surface as "(stale)" (and on the needs-attention list), not
+// as a plainly-live "running" session.
+func TestDashboardFlagsPhantomRunningSession(t *testing.T) {
+	home := dashboardTestHome(t)
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	// expires_at is far in the past, so the running lease has elapsed → phantom.
+	past := time.Now().UTC().Add(-time.Hour).Format("2006-01-02T15:04:05.000000000Z")
+	nowStr := time.Now().UTC().Format("2006-01-02T15:04:05.000000000Z")
+	if err := store.UpsertAgentInstance(context.Background(), db.AgentInstance{
+		Name:           "researcher-bg-dead",
+		Type:           "researcher",
+		Runtime:        "claude",
+		RuntimeRef:     "ref-dead",
+		RepoFullName:   "owner/repo",
+		Role:           "researcher",
+		Capabilities:   []string{"ask"},
+		AutonomyPolicy: "read-only",
+		State:          "running",
+		CreatedAt:      nowStr,
+		LastUsedAt:     nowStr,
+		ExpiresAt:      past,
+	}); err != nil {
+		t.Fatalf("UpsertAgentInstance returned error: %v", err)
+	}
+	store.Close()
+
+	// Snapshot carries the Stale flag.
+	paths, err := initializedPaths(home)
+	if err != nil {
+		t.Fatalf("initializedPaths returned error: %v", err)
+	}
+	snap, err := buildDashboardSnapshot(home, paths)
+	if err != nil {
+		t.Fatalf("buildDashboardSnapshot returned error: %v", err)
+	}
+	if len(snap.RuntimeSessions) != 1 || !snap.RuntimeSessions[0].Stale {
+		t.Fatalf("expected one stale runtime session, got %+v", snap.RuntimeSessions)
+	}
+
+	// Plain render shows "(stale)" and flags it for attention.
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"dashboard", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("dashboard exit code = %d, stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{"(stale)", "stale session", "researcher-bg-dead"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("dashboard output missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestDashboardRendersActiveJobsSection(t *testing.T) {
 	home := dashboardTestHome(t)
 	store, err := db.Open(config.PathsForHome(home).Database)

@@ -1775,6 +1775,103 @@ func TestAgentInstanceMethods(t *testing.T) {
 	}
 }
 
+// TestReconcileOrphanedRunningInstances is the #505 gap-2 regression: a daemon
+// that dies mid-job never runs its deferred TouchAgentInstance, leaving the row
+// stuck at state='running' with an elapsed lease — a phantom session the existing
+// idle-only GC (DeleteExpiredAgentInstances) never reclaims. ReconcileOrphaned-
+// RunningInstances resets only those phantoms to idle while leaving genuinely live
+// sessions (future lease, or an active queued/running job) untouched.
+func TestReconcileOrphanedRunningInstances(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC)
+
+	base := func(name, state string, expires time.Time) AgentInstance {
+		return AgentInstance{
+			Name:           name,
+			Type:           "planner",
+			Runtime:        "codex",
+			RuntimeRef:     "ref-" + name,
+			RepoFullName:   "owner/repo",
+			Role:           "planner",
+			Capabilities:   []string{"ask"},
+			AutonomyPolicy: "read-only",
+			State:          state,
+			CreatedAt:      formatResourceLockTime(now.Add(-time.Hour)),
+			LastUsedAt:     formatResourceLockTime(now.Add(-time.Hour)),
+			ExpiresAt:      formatResourceLockTime(expires),
+		}
+	}
+
+	cases := []struct {
+		name        string
+		instance    AgentInstance
+		job         *Job
+		wantReset   bool
+		wantDeleted int64
+	}{
+		{
+			name:        "phantom running with elapsed lease and no job is reconciled",
+			instance:    base("phantom", "running", now.Add(-time.Minute)),
+			wantReset:   true,
+			wantDeleted: 1,
+		},
+		{
+			name:        "live running within lease is left alone",
+			instance:    base("live-lease", "running", now.Add(time.Minute)),
+			wantReset:   false,
+			wantDeleted: 0,
+		},
+		{
+			name:        "running with an active job is left alone even past lease",
+			instance:    base("busy", "running", now.Add(-time.Minute)),
+			job:         &Job{ID: "j-busy", Agent: "busy", Type: "ask", State: "running", Payload: "{}"},
+			wantReset:   false,
+			wantDeleted: 0,
+		},
+		{
+			name:        "idle past lease is not this reconciler's job",
+			instance:    base("idle-old", "idle", now.Add(-time.Minute)),
+			wantReset:   false,
+			wantDeleted: 0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+			if err != nil {
+				t.Fatalf("Open returned error: %v", err)
+			}
+			defer store.Close()
+			if err := store.UpsertAgentInstance(ctx, tc.instance); err != nil {
+				t.Fatalf("UpsertAgentInstance returned error: %v", err)
+			}
+			if tc.job != nil {
+				if err := store.CreateJob(ctx, *tc.job); err != nil {
+					t.Fatalf("CreateJob returned error: %v", err)
+				}
+			}
+			deleted, err := store.ReconcileOrphanedRunningInstances(ctx, now)
+			if err != nil {
+				t.Fatalf("ReconcileOrphanedRunningInstances returned error: %v", err)
+			}
+			if deleted != tc.wantDeleted {
+				t.Fatalf("reconciled rows = %d, want %d", deleted, tc.wantDeleted)
+			}
+			got, err := store.GetAgentInstance(ctx, tc.instance.Name)
+			if err != nil {
+				t.Fatalf("GetAgentInstance returned error: %v", err)
+			}
+			if tc.wantReset && got.State != "idle" {
+				t.Fatalf("instance state = %q, want idle (reconciled)", got.State)
+			}
+			if !tc.wantReset && got.State != tc.instance.State {
+				t.Fatalf("instance state = %q, want unchanged %q", got.State, tc.instance.State)
+			}
+		})
+	}
+}
+
 func TestRepositoryMethods(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
