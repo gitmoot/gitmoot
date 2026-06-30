@@ -114,6 +114,9 @@ func validateConfigFile(paths Paths) error {
 	if _, err := LoadSkillOptABPolicy(paths); err != nil {
 		return err
 	}
+	if _, err := LoadTemplateRemote(paths); err != nil {
+		return err
+	}
 	return nil
 }
 

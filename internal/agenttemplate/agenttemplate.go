@@ -3,6 +3,7 @@ package agenttemplate
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/db"
@@ -61,6 +63,30 @@ type File struct {
 type Fetcher interface {
 	ResolveRef(ctx context.Context, repo string, ref string) (string, error)
 	FetchFile(ctx context.Context, repo string, ref string, path string) (File, error)
+}
+
+// DirEntry is one entry in a remote directory listing (a subset of the GitHub
+// contents API entry shape), used by bulk pull to discover the template .md
+// files under a remote subdir.
+type DirEntry struct {
+	Name string
+	Path string
+	Type string
+}
+
+// DirLister lists a directory on a remote repo. It is the bulk-pull counterpart
+// to Fetcher's single-file FetchFile; GHFetcher implements both.
+type DirLister interface {
+	ListDir(ctx context.Context, repo string, ref string, path string) ([]DirEntry, error)
+}
+
+// RemoteSource is the combined read surface bulk pull needs: resolve a ref,
+// fetch a file, and list a directory. GHFetcher satisfies it. It is a separate
+// interface from Fetcher so existing single-file callers and their test fakes
+// are unaffected (additive).
+type RemoteSource interface {
+	Fetcher
+	DirLister
 }
 
 var builtins = []Definition{
@@ -561,6 +587,145 @@ func Export(template db.AgentTemplate) (string, error) {
 	return FormatTemplateContent(metadata, InstructionsForContent(template.Content)), nil
 }
 
+// PullOutcome is the per-template result of a bulk pull.
+type PullOutcome string
+
+const (
+	// PullInstalled means the template was not present locally and was installed.
+	PullInstalled PullOutcome = "installed"
+	// PullUpdated means a divergent local row was re-fetched as a new version
+	// (UpsertAgentTemplate auto-versions — conflict-as-new-version).
+	PullUpdated PullOutcome = "updated"
+	// PullUnchanged means the remote content matched the local row byte-for-byte;
+	// nothing was written (identical-content no-op).
+	PullUnchanged PullOutcome = "unchanged"
+	// PullSkipped means the id was deliberately not pulled (built-in or retired).
+	PullSkipped PullOutcome = "skipped"
+	// PullFailed means this one template failed; the batch continues (partial).
+	PullFailed PullOutcome = "failed"
+)
+
+// PullResult reports the outcome of pulling one template id.
+type PullResult struct {
+	ID      string
+	Outcome PullOutcome
+	Commit  string
+	Detail  string
+}
+
+// ListRemoteTemplateIDs lists path on repo@ref and returns the ids of the .md
+// files it contains (basename without the .md suffix), sorted and de-duplicated
+// of non-template entries. It is the discovery half of bulk pull.
+func ListRemoteTemplateIDs(ctx context.Context, lister DirLister, repo string, ref string, path string) ([]string, error) {
+	if lister == nil {
+		return nil, errors.New("agent template directory lister is required")
+	}
+	entries, err := lister.ListDir(ctx, repo, ref, path)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !strings.EqualFold(strings.TrimSpace(entry.Type), "file") {
+			continue
+		}
+		name := strings.TrimSpace(entry.Name)
+		if !strings.HasSuffix(name, ".md") {
+			continue
+		}
+		id := strings.TrimSuffix(name, ".md")
+		if ValidateID(id) != nil {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
+// Pull bulk-installs templates from a remote subdir, routing each through the
+// same fetch core AddRemote/UpdateRemote use and the auto-versioning
+// UpsertAgentTemplate. When ids is empty it discovers every .md file under path
+// via ListRemoteTemplateIDs. Conflicts become a new version; identical content
+// is a no-op; built-in and retired ids are skipped; a per-file error fails only
+// that entry (the batch continues, so a partial result is reported clearly). It
+// only touches the network when invoked. dryRun fetches and compares but writes
+// nothing.
+func Pull(ctx context.Context, store *db.Store, source RemoteSource, repo string, ref string, path string, ids []string, dryRun bool) ([]PullResult, error) {
+	if store == nil {
+		return nil, errors.New("agent template store is required")
+	}
+	if source == nil {
+		return nil, errors.New("agent template source is required")
+	}
+	repo = strings.TrimSpace(repo)
+	if !IsRemoteRepo(repo) {
+		return nil, fmt.Errorf("template source repo %q must be a GitHub owner/repo", repo)
+	}
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		ref = "main"
+	}
+	path = strings.Trim(strings.TrimSpace(path), "/")
+	if path == "" {
+		path = "templates"
+	}
+	selected := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if trimmed := strings.TrimSpace(id); trimmed != "" {
+			selected = append(selected, trimmed)
+		}
+	}
+	if len(selected) == 0 {
+		discovered, err := ListRemoteTemplateIDs(ctx, source, repo, ref, path)
+		if err != nil {
+			return nil, err
+		}
+		selected = discovered
+	}
+	results := make([]PullResult, 0, len(selected))
+	for _, id := range selected {
+		results = append(results, pullOne(ctx, store, source, repo, ref, path, id, dryRun))
+	}
+	return results, nil
+}
+
+func pullOne(ctx context.Context, store *db.Store, source RemoteSource, repo string, ref string, path string, id string, dryRun bool) PullResult {
+	if _, ok := Lookup(id); ok {
+		return PullResult{ID: id, Outcome: PullSkipped, Detail: "built-in template; already lives upstream"}
+	}
+	if IsRetired(id) {
+		return PullResult{ID: id, Outcome: PullSkipped, Detail: "retired template"}
+	}
+	if err := ValidateID(id); err != nil {
+		return PullResult{ID: id, Outcome: PullFailed, Detail: err.Error()}
+	}
+	filePath := path + "/" + id + ".md"
+	fetched, err := fetchRemoteTemplate(ctx, source, id, repo, ref, filePath)
+	if err != nil {
+		return PullResult{ID: id, Outcome: PullFailed, Detail: err.Error()}
+	}
+	existing, err := store.GetAgentTemplate(ctx, id)
+	hasExisting := err == nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return PullResult{ID: id, Outcome: PullFailed, Detail: err.Error()}
+	}
+	if hasExisting && existing.Content == fetched.Content {
+		return PullResult{ID: id, Outcome: PullUnchanged, Commit: fetched.ResolvedCommit}
+	}
+	outcome := PullInstalled
+	if hasExisting {
+		outcome = PullUpdated
+	}
+	if dryRun {
+		return PullResult{ID: id, Outcome: outcome, Commit: fetched.ResolvedCommit, Detail: "dry-run"}
+	}
+	if err := store.UpsertAgentTemplate(ctx, fetched); err != nil {
+		return PullResult{ID: id, Outcome: PullFailed, Detail: err.Error()}
+	}
+	return PullResult{ID: id, Outcome: outcome, Commit: fetched.ResolvedCommit}
+}
+
 func ContentForDefinition(definition Definition, content string) (string, error) {
 	content, _, err := ContentAndMetadataForDefinition(definition, content)
 	return content, err
@@ -683,6 +848,36 @@ func (f GHFetcher) FetchFile(ctx context.Context, repo string, ref string, path 
 		return File{}, fmt.Errorf("decode github contents: %w", err)
 	}
 	return File{Content: string(decoded)}, nil
+}
+
+// ListDir lists path on repo@ref via `gh api repos/<repo>/contents/<path>`,
+// returning the directory's entries. It is the bulk-pull discovery call that
+// finds the template .md files under a remote subdir; per-file content is then
+// fetched via FetchFile.
+func (f GHFetcher) ListDir(ctx context.Context, repo string, ref string, path string) ([]DirEntry, error) {
+	repo = strings.TrimSpace(repo)
+	ref = strings.TrimSpace(ref)
+	path = strings.Trim(strings.TrimSpace(path), "/")
+	if repo == "" || ref == "" || path == "" {
+		return nil, errors.New("repo, ref, and path are required")
+	}
+	result, err := f.run(ctx, "api", "-X", "GET", "repos/"+repo+"/contents/"+path, "-f", "ref="+ref)
+	if err != nil {
+		return nil, err
+	}
+	var entries []struct {
+		Name string `json:"name"`
+		Path string `json:"path"`
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal([]byte(result.Stdout), &entries); err != nil {
+		return nil, fmt.Errorf("decode github directory listing: %w", err)
+	}
+	out := make([]DirEntry, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, DirEntry{Name: entry.Name, Path: entry.Path, Type: entry.Type})
+	}
+	return out, nil
 }
 
 func (f GHFetcher) run(ctx context.Context, args ...string) (subprocess.Result, error) {
