@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 )
@@ -345,6 +346,86 @@ func TestCleanupImplementDelegationWorktreeSkipsIntegrationDep(t *testing.T) {
 
 	if len(manager.removedForce) != 0 || len(manager.deletedBranches) != 0 {
 		t.Fatalf("succeeded leg feeding a pending integration must be kept: removedForce=%+v deletedBranches=%+v", manager.removedForce, manager.deletedBranches)
+	}
+}
+
+// TestCleanupImplementDelegationWorktreeRefusesWhileRuntimeOwnerActive is the
+// #536 regression: when a delegation child's terminal state was synthesized by
+// stale recovery / dirty-checkout validation WHILE the original runtime worker was
+// still running, the worker's runtime-session lock lingers with an unexpired lease
+// (and possibly a live owner PID). The DESTRUCTIVE cleanup must REFUSE to
+// force-remove the worktree (and delete its branch) in that window so the live
+// worker is not orphaned onto a deleted cwd and its dirty work is preserved for
+// salvage. Once the lock has expired/released (the healthy case), cleanup runs.
+//
+// Without the liveness gate the first row ("live owner") would force-remove the
+// worktree out from under the running worker.
+func TestCleanupImplementDelegationWorktreeRefusesWhileRuntimeOwnerActive(t *testing.T) {
+	cases := []struct {
+		name        string
+		acquireLock bool
+		pidLive     bool
+		expiresIn   time.Duration
+		wantRemoved bool
+	}{
+		{name: "live owner unexpired lease preserves worktree", acquireLock: true, pidLive: true, expiresIn: 4 * time.Hour, wantRemoved: false},
+		{name: "unexpired lease dead pid preserves worktree", acquireLock: true, pidLive: false, expiresIn: 4 * time.Hour, wantRemoved: false},
+		{name: "expired lease dead pid cleans worktree", acquireLock: true, pidLive: false, expiresIn: -time.Minute, wantRemoved: true},
+		{name: "no runtime lock cleans worktree", acquireLock: false, wantRemoved: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			engine := testEngine(store)
+			engine.OwnerPIDLive = func(int64) bool { return tc.pidLive }
+			branch := "gitmoot-delegation-x-d1"
+			manager := &fakeWorktreeManager{existingBranches: map[string]bool{branch: true}}
+			engine.DelegationCheckout = t.TempDir()
+			engine.DelegationWorktrees = manager
+
+			wt := t.TempDir()
+			// Decision "failed" mirrors the bug: the recovered copy fails on the dirty
+			// checkout. Failed legs are always merge-safe, so the merge guard does not
+			// short-circuit and the liveness guard is exercised.
+			payload := JobPayload{DelegationID: "d1", WorktreePath: wt, Branch: branch, Result: &AgentResult{Decision: "failed"}}
+
+			jobID := "parent-job/delegation/task-7302"
+			if tc.acquireLock {
+				now := time.Now().UTC()
+				acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+					ResourceKey: "runtime:codex:session-536",
+					OwnerJobID:  jobID,
+					OwnerToken:  "token-536",
+					OwnerPID:    4242,
+					ExpiresAt:   now.Add(tc.expiresIn).Format(time.RFC3339Nano),
+				}, now)
+				if err != nil || !acquired {
+					t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
+				}
+			}
+
+			engine.cleanupImplementDelegationWorktree(ctx, jobID, "implement", payload)
+
+			if tc.wantRemoved {
+				if len(manager.removedForce) != 1 || manager.removedForce[0] != wt {
+					t.Fatalf("removedForce = %+v, want one force-remove of %q", manager.removedForce, wt)
+				}
+				if got := countJobEvents(t, store, jobID, "delegation_worktree_cleanup_skipped"); got != 0 {
+					t.Fatalf("cleanup must not be skipped, got %d skip events", got)
+				}
+			} else {
+				if len(manager.removedForce) != 0 || len(manager.deletedBranches) != 0 {
+					t.Fatalf("cleanup must be refused while owner active: removedForce=%+v deletedBranches=%+v", manager.removedForce, manager.deletedBranches)
+				}
+				if got := countJobEvents(t, store, jobID, "delegation_worktree_cleanup_skipped"); got != 1 {
+					t.Fatalf("delegation_worktree_cleanup_skipped event count = %d, want 1", got)
+				}
+				if _, err := os.Stat(wt); err != nil {
+					t.Fatalf("worktree must be preserved on disk: stat err = %v", err)
+				}
+			}
+		})
 	}
 }
 

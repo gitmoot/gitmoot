@@ -488,6 +488,19 @@ func (e Engine) cleanupImplementDelegationWorktree(ctx context.Context, jobID st
 		e.implementLegBranchMayBeMerged(ctx, payload) {
 		return
 	}
+	// Liveness gate (#536): NEVER force-remove a worktree (and delete its branch)
+	// while a live runtime worker still owns it. On a healthy terminal the job's
+	// runtime-session lock is already released, so this is a no-op and cleanup runs
+	// unchanged. But when the terminal state was synthesized by stale recovery /
+	// dirty-checkout validation while the original worker was still running, the
+	// runtime-session lock lingers with an unexpired lease (and possibly a live
+	// owner PID). Refuse the destructive removal in that window and preserve the
+	// dirty worktree for salvage rather than orphaning the live process onto a
+	// deleted cwd. A later re-advance (after the lock expires/releases) reclaims it.
+	if active, reason := e.runtimeOwnerActive(ctx, jobID); active {
+		_ = e.Store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{JobID: jobID, Kind: "delegation_worktree_cleanup_skipped", Message: fmt.Sprintf("implement worktree %s cleanup skipped: runtime owner still active (%s)", strings.TrimSpace(payload.WorktreePath), reason)})
+		return
+	}
 	manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager) // RemoveWorktreeForce
 	if !ok || manager == nil {
 		return

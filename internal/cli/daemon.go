@@ -1662,6 +1662,22 @@ func recoverRunningJobsBeforeForRepo(ctx context.Context, store *db.Store, stdou
 		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
 			continue
 		}
+		// Liveness gate (#536): the coarse `updated_at < before` threshold (30m) is a
+		// crash backstop, NOT a timeout. A long-running job (e.g. a 4h delegation)
+		// holds a runtime-session lock whose lease reflects its real timeout and whose
+		// owner PID is recorded. If that owner is still strict-live — an unexpired
+		// lease AND a provably-alive (or unverifiable cross-host) owner — the job is
+		// progressing, not stale, so leave it running. Requeuing it would start a
+		// second copy that fails on the dirty in-flight worktree and then force-cleans
+		// it out from under the live worker. A crashed worker (dead PID) leaves an
+		// unexpired-but-not-strict-live lock, so legitimate restart recovery proceeds.
+		live, err := runtimeOwnerStrictLive(ctx, store, job.ID, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		if live {
+			continue
+		}
 		recovered, err := store.TransitionJobStateWithEvent(ctx, job.ID, string(workflow.JobRunning), string(workflow.JobQueued), db.JobEvent{
 			JobID:   job.ID,
 			Kind:    string(workflow.JobQueued),

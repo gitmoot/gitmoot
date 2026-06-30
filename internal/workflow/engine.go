@@ -94,6 +94,16 @@ type Engine struct {
 	Home                string
 	DelegationWorktrees WorktreeManager
 	DelegationCheckout  string
+	// OwnerPIDLive reports whether a recorded owner PID is a live process on this
+	// host. It gates the DESTRUCTIVE implement-delegation worktree/branch cleanup so
+	// a worktree still owned by a live runtime worker is never force-removed out from
+	// under it (#536): a job whose terminal state was synthesized by stale recovery
+	// while its worker was still running keeps an unexpired/live runtime-session
+	// lock, and cleanup refuses while that lock is active. Optional and nil-safe:
+	// when nil the engine uses the default same-host syscall probe; tests inject a
+	// fake. On a healthy terminal the lock is already released, so cleanup is
+	// byte-identical to before this field existed.
+	OwnerPIDLive func(pid int64) bool
 	// CanaryEnabled gates the #484 canary ROUTING seam (Mailbox.routeCanary) on the
 	// SAME [skillopt] policy.CanaryEnabled() the daemon's regression comparator
 	// (daemonOutcomeHarvesterWithCanary) is gated on, so both seams turn on/off

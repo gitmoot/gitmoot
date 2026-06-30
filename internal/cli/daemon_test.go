@@ -4897,6 +4897,72 @@ func TestRecoverRunningJobsKeepsRecentRunningJobsOnStartup(t *testing.T) {
 	}
 }
 
+// TestRecoverRunningJobsHonorsLiveRuntimeLease is the #536 regression: a
+// long-running job (e.g. a 4h delegation) holds a runtime-session lock whose lease
+// reflects its real timeout. The coarse `updated_at < before` staleness threshold
+// must NOT requeue such a job while its runtime owner is still strict-live (an
+// unexpired lease AND a live owner PID). A crashed worker (dead PID) or a job with
+// no runtime lock must still be recovered so legacy/restart recovery is preserved.
+//
+// Without the liveness gate the first row ("live owner, unexpired lease") would be
+// requeued (state -> queued); with it, the live job stays running.
+func TestRecoverRunningJobsHonorsLiveRuntimeLease(t *testing.T) {
+	cases := []struct {
+		name        string
+		acquireLock bool
+		ownerPID    int64
+		expiresIn   time.Duration
+		wantState   string
+	}{
+		{name: "live owner unexpired lease stays running", acquireLock: true, ownerPID: int64(os.Getpid()), expiresIn: 4 * time.Hour, wantState: string(workflow.JobRunning)},
+		{name: "dead owner unexpired lease recovers", acquireLock: true, ownerPID: 0, expiresIn: 4 * time.Hour, wantState: string(workflow.JobQueued)},
+		{name: "live owner expired lease recovers", acquireLock: true, ownerPID: int64(os.Getpid()), expiresIn: -time.Minute, wantState: string(workflow.JobQueued)},
+		{name: "no runtime lock recovers", acquireLock: false, wantState: string(workflow.JobQueued)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := daemonWorkerStore(t)
+			enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-running", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
+			if err := store.UpdateJobState(ctx, "job-running", string(workflow.JobRunning)); err != nil {
+				t.Fatalf("UpdateJobState returned error: %v", err)
+			}
+			now := time.Now().UTC()
+			if tc.acquireLock {
+				ownerPID := tc.ownerPID
+				if ownerPID == 0 {
+					ownerPID = deadPID(t)
+				}
+				acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+					ResourceKey:   "runtime:codex:session-536",
+					OwnerJobID:    "job-running",
+					OwnerToken:    "token-536",
+					OwnerPID:      ownerPID,
+					OwnerHostname: thisHostname(t),
+					ExpiresAt:     now.Add(tc.expiresIn).Format(time.RFC3339Nano),
+				}, now)
+				if err != nil || !acquired {
+					t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
+				}
+			}
+
+			// before = now+time so the running job (updated_at ~ now) is past the coarse
+			// staleness threshold; only the liveness gate may keep it running.
+			if err := recoverRunningJobsBefore(ctx, store, io.Discard, now.Add(time.Minute)); err != nil {
+				t.Fatalf("recoverRunningJobsBefore returned error: %v", err)
+			}
+
+			job, err := store.GetJob(ctx, "job-running")
+			if err != nil {
+				t.Fatalf("GetJob returned error: %v", err)
+			}
+			if job.State != tc.wantState {
+				t.Fatalf("job state = %q, want %q", job.State, tc.wantState)
+			}
+		})
+	}
+}
+
 func TestRecoverCancelledRunningJobsSettlesAbandonedCancellation(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)

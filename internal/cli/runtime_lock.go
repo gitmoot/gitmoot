@@ -121,6 +121,26 @@ func runtimeSessionHeldByLiveOwner(ctx context.Context, store *db.Store, agent r
 	}
 }
 
+// runtimeOwnerStrictLive reports whether the running job jobID still has a
+// strict-live runtime-session owner: an unexpired lease whose owner process is
+// provably alive on this host (or on an unverifiable cross-host). It is the gate
+// stale-running-job recovery consults so a long-running job is not requeued while
+// its worker is still progressing (#536). A job with no runtime lock (released on
+// a normal terminal, or a non-resumable runtime) is never strict-live, so legacy
+// recovery behavior is preserved. A same-host dead-PID owner (a crashed worker)
+// is likewise not strict-live, so legitimate restart recovery still proceeds.
+func runtimeOwnerStrictLive(ctx context.Context, store *db.Store, jobID string, now time.Time) (bool, error) {
+	thisHost, _ := os.Hostname()
+	liveness, err := store.JobRuntimeLockLiveness(ctx, jobID, now, thisHost, skillOptOwnerPIDLive)
+	if err != nil {
+		return false, err
+	}
+	if liveness == nil {
+		return false, nil
+	}
+	return liveness.LiveAndUnexpired(), nil
+}
+
 func newRuntimeLockOwnerToken() (string, error) {
 	var bytes [16]byte
 	if _, err := rand.Read(bytes[:]); err != nil {
