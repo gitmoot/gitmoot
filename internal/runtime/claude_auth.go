@@ -7,14 +7,27 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/subprocess"
 )
+
+// ClaudeLiveProbeTimeout bounds a single live `claude -p` probe so a hung or slow
+// claude (or a network stall) can never block the caller — notably `gitmoot
+// doctor`, which after #486 always probes — indefinitely. It is a var so tests can
+// shrink it; production callers pass context.Background(), and WithTimeout honors a
+// shorter caller deadline if one is already set.
+var ClaudeLiveProbeTimeout = 30 * time.Second
 
 const (
 	ClaudeOAuthTokenEnv   = "CLAUDE_CODE_OAUTH_TOKEN"
 	AnthropicAPIKeyEnv    = "ANTHROPIC_API_KEY"
 	AnthropicAuthTokenEnv = "ANTHROPIC_AUTH_TOKEN"
+	// ClaudeConfigDirEnv points the Claude CLI at a config directory. The doctor's
+	// daemon-token probe sets it to a throwaway empty dir so cached ~/.claude
+	// credentials cannot mask a bad injected token — the decisive token-only test
+	// for #486.
+	ClaudeConfigDirEnv = "CLAUDE_CONFIG_DIR"
 	// ClaudeBackgroundTokenMessage is the warn-path caveat: foreground Claude
 	// authenticates fine via cached credentials, but daemon background jobs run
 	// non-interactively and need an explicit token in the daemon env.
@@ -77,21 +90,94 @@ func (e ClaudeAuthEnv) Warning() string {
 }
 
 func ClaudeLiveCheck(ctx context.Context, runner subprocess.Runner, dir string) error {
+	return ClaudeLiveCheckEnv(ctx, runner, dir, nil)
+}
+
+// ClaudeLiveCheckEnv is ClaudeLiveCheck with extraEnv (KEY=VALUE entries)
+// appended to the probe's environment. The doctor uses it to validate a SPECIFIC
+// credential — e.g. the running daemon's CLAUDE_CODE_OAUTH_TOKEN read from /proc —
+// rather than whatever the doctor process happens to carry. extraEnv is honored
+// only when runner implements subprocess.EnvRunner; otherwise (fakes, plain
+// runners) it falls back to the same command+args so the override is invisible to
+// arg-keyed test doubles. A nil extraEnv is exactly the prior behavior.
+func ClaudeLiveCheckEnv(ctx context.Context, runner subprocess.Runner, dir string, extraEnv []string) error {
 	if runner == nil {
 		runner = subprocess.ExecRunner{}
 	}
-	result, err := runner.Run(ctx, dir, "claude", "-p", "--output-format", "json", "--", ClaudeLiveCheckPrompt)
+	// Bound the live probe so a hung/slow claude or a network stall degrades to a
+	// transient/Unknown verdict instead of hanging the caller forever. Before #486
+	// a set token short-circuited with zero subprocess; now doctor always probes,
+	// so an unbounded probe would let a stalled claude block `gitmoot doctor`
+	// indefinitely. WithTimeout respects an already-shorter caller deadline.
+	ctx, cancel := context.WithTimeout(ctx, ClaudeLiveProbeTimeout)
+	defer cancel()
+	run := func(args ...string) (subprocess.Result, error) {
+		if env, ok := runner.(subprocess.EnvRunner); ok && len(extraEnv) > 0 {
+			return env.RunEnv(ctx, dir, extraEnv, "claude", args...)
+		}
+		return runner.Run(ctx, dir, "claude", args...)
+	}
+	jsonArgs := []string{"-p", "--output-format", "json", "--", ClaudeLiveCheckPrompt}
+	result, err := run(jsonArgs...)
 	if err != nil && isClaudeJSONUnsupported(result) {
-		result, err = runner.Run(ctx, dir, "claude", "-p", "--", ClaudeLiveCheckPrompt)
+		result, err = run("-p", "--", ClaudeLiveCheckPrompt)
 		if err != nil {
-			return ClassifyClaudeCommandError(result, err)
+			return classifyClaudeProbeError(result, err)
 		}
 		return validateClaudeLiveText(result.Stdout)
 	}
+	// A "401 socket connection was closed unexpectedly" is the concurrency
+	// transient the daemon path retries; this probe is a single isolated run, so
+	// retry once and only persist the verdict if the signature survives — at which
+	// point classifyClaudeProbeError treats it as the documented #486 invalid-token
+	// symptom (Invalid) rather than leaving it Unknown (which kept doctor green).
+	if isClaude401SocketClosed(result, err) {
+		result, err = run(jsonArgs...)
+	}
 	if err != nil {
-		return ClassifyClaudeCommandError(result, err)
+		return classifyClaudeProbeError(result, err)
 	}
 	return validateClaudeLiveJSON(result.Stdout)
+}
+
+// ClaudeTokenStatus is the tri-state verdict of validating a Claude credential
+// with a live probe: it either authenticated (Valid), was rejected (Invalid), or
+// could not be determined (Unknown — a transient/network error, or the probe
+// could not run at all). A merely-SET token is not Valid until a probe says so.
+type ClaudeTokenStatus int
+
+const (
+	ClaudeTokenUnknown ClaudeTokenStatus = iota
+	ClaudeTokenValid
+	ClaudeTokenInvalid
+)
+
+func (s ClaudeTokenStatus) String() string {
+	switch s {
+	case ClaudeTokenValid:
+		return "valid"
+	case ClaudeTokenInvalid:
+		return "invalid"
+	default:
+		return "unknown"
+	}
+}
+
+// ClaudeClassifyProbe maps a ClaudeLiveCheck/ClaudeLiveCheckEnv error to a
+// tri-state status. A nil error is Valid; a classified credential rejection
+// (errors.Is ErrClaudeAuthFailed) is Invalid; everything else — a missing/
+// unrunnable binary or a transient/network/timeout error — is Unknown and MUST
+// NOT be reported as Invalid, so a network blip can never flip doctor red or
+// claim the token is bad.
+func ClaudeClassifyProbe(err error) ClaudeTokenStatus {
+	switch {
+	case err == nil:
+		return ClaudeTokenValid
+	case errors.Is(err, ErrClaudeAuthFailed):
+		return ClaudeTokenInvalid
+	default:
+		return ClaudeTokenUnknown
+	}
 }
 
 // ClaudeProbeUnavailable reports whether a ClaudeLiveCheck error means the probe

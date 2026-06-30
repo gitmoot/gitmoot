@@ -13,7 +13,58 @@ import (
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
+	gmruntime "github.com/jerryfane/gitmoot/internal/runtime"
 )
+
+// TestClaudeCredEnvFromLookupNeutralizesAbsentVars is the #486 credential-isolation
+// regression: the daemon-token probe env must carry the daemon's set credential
+// AND an empty NAME= for every Claude credential the daemon does NOT set, so when
+// the entries are appended onto the doctor process's own environment a competing
+// doctor-shell credential (e.g. a valid ANTHROPIC_API_KEY the daemon lacks, which
+// outranks OAuth) is neutralized rather than leaking in and validating the wrong
+// credential. Without the empty-neutralization this asserts fails: a missing var
+// would be omitted, letting the doctor's value survive.
+func TestClaudeCredEnvFromLookupNeutralizesAbsentVars(t *testing.T) {
+	lookup := func(name string) (string, bool) {
+		if name == gmruntime.ClaudeOAuthTokenEnv {
+			return "daemon-secret", true
+		}
+		return "", false
+	}
+	env, ok := claudeCredEnvFromLookup(lookup)
+	if !ok {
+		t.Fatal("claudeCredEnvFromLookup ok=false for a daemon with an OAuth token")
+	}
+	got := make(map[string]string, len(env))
+	for _, e := range env {
+		k, v, _ := strings.Cut(e, "=")
+		got[k] = v
+	}
+	if got[gmruntime.ClaudeOAuthTokenEnv] != "daemon-secret" {
+		t.Fatalf("OAuth token = %q, want the daemon's value", got[gmruntime.ClaudeOAuthTokenEnv])
+	}
+	for _, name := range []string{gmruntime.AnthropicAPIKeyEnv, gmruntime.AnthropicAuthTokenEnv} {
+		v, present := got[name]
+		if !present {
+			t.Fatalf("%s missing from probe env; an absent daemon var must be neutralized with NAME=, not omitted (it would let the doctor's value leak in)", name)
+		}
+		if v != "" {
+			t.Fatalf("%s = %q, want empty (neutralized)", name, v)
+		}
+	}
+}
+
+// TestClaudeCredEnvFromLookupNoCredentialSkips guards the fail-open contract: a
+// daemon with no Claude credential at all yields (nil, false) so the caller falls
+// back to the presence-only report instead of probing an all-empty env.
+func TestClaudeCredEnvFromLookupNoCredentialSkips(t *testing.T) {
+	if env, ok := claudeCredEnvFromLookup(func(string) (string, bool) { return "", false }); ok || env != nil {
+		t.Fatalf("claudeCredEnvFromLookup = (%v, %t), want (nil, false) for a credential-less daemon", env, ok)
+	}
+	if env, ok := claudeCredEnvFromLookup(nil); ok || env != nil {
+		t.Fatalf("claudeCredEnvFromLookup(nil) = (%v, %t), want (nil, false)", env, ok)
+	}
+}
 
 func TestBuildSnapshotCountsRepoLocalState(t *testing.T) {
 	paths := testPaths(t)

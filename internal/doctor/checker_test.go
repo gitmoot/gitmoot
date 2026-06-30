@@ -192,23 +192,92 @@ func TestClaudeAuthEnvDashboardNeverProbes(t *testing.T) {
 	}
 }
 
-func TestClaudeAuthEnvReadySkipsProbe(t *testing.T) {
-	withClaudeAuthEnv(t, map[string]string{runtime.ClaudeOAuthTokenEnv: "secret-token"})
-	runs := 0
-	runner := countingRunner{
-		fakeRunner: fakeRunner{
-			runs: map[string]subprocess.Result{claudeProbeKey: {Stderr: "should not run"}},
-			errs: map[string]error{claudeProbeKey: fmt.Errorf("should not run")},
+// TestClaudeAuthEnvLiveProbeValidatesSetToken486 is the #486 regression: with an
+// env token PRESENT and LiveProbe on, `gitmoot doctor` must actually validate the
+// token instead of short-circuiting a set credential to OK:true. The prior code
+// trusted presence and never probed, so an invalid CLAUDE_CODE_OAUTH_TOKEN
+// reported "ok" while it 401'd fresh sessions. Each case asserts the probe RAN
+// (runs==1) and that valid/invalid/transient map to OK / not-OK / set-but-
+// unvalidated, with transient never reported as invalid (no flaky red).
+//
+// Reverting claudeAuthEnv to the set-token instant path makes the invalid case
+// assert OK:false against the old OK:true — a failing-then-passing guard.
+func TestClaudeAuthEnvLiveProbeValidatesSetToken486(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		result      subprocess.Result
+		err         error
+		wantOK      bool
+		wantDetail  string
+		wantNoMatch string
+		wantRuns    int
+	}{
+		{
+			name:       "valid token authenticates",
+			result:     subprocess.Result{Stdout: `{"result":"OK"}`},
+			wantOK:     true,
+			wantDetail: runtime.ClaudeBackgroundTokenMessage,
+			wantRuns:   1,
 		},
-		runs: &runs,
-	}
-	// Even with LiveProbe true, an env token present takes the instant path.
-	check := Checker{Runner: runner, LiveProbe: true}.claudeAuthEnv(context.Background())
-	if !check.OK {
-		t.Fatalf("claude auth check = %+v, want OK:true when env token present", check)
-	}
-	if runs != 0 {
-		t.Fatalf("env-Ready path ran the runner %d times, want 0", runs)
+		{
+			name:        "invalid token is rejected not ok",
+			result:      subprocess.Result{Stderr: "401 Invalid authentication credentials"},
+			err:         fmt.Errorf("exit 1"),
+			wantOK:      false,
+			wantDetail:  runtime.ClaudeSessionAuthFailedMessage,
+			wantNoMatch: "could not validate",
+			wantRuns:    1,
+		},
+		{
+			// The EXACT documented #486 symptom of an invalid CLAUDE_CODE_OAUTH_TOKEN:
+			// it carries "authenticate" + "401" but NOT "authentication", so the prior
+			// probe classified it Unknown and doctor reported OK:true. The probe retries
+			// the 401-socket-closed once (wantRuns 2) and, persisting, reports OK:false.
+			name:        "documented invalid-token socket-closed 401 is rejected",
+			result:      subprocess.Result{Stderr: "Failed to authenticate. API Error: 401 The socket connection was closed unexpectedly"},
+			err:         fmt.Errorf("exit 1"),
+			wantOK:      false,
+			wantDetail:  runtime.ClaudeSessionAuthFailedMessage,
+			wantNoMatch: "could not validate",
+			wantRuns:    2,
+		},
+		{
+			name:        "transient error is unknown not invalid",
+			result:      subprocess.Result{Stderr: "could not connect: network is unreachable"},
+			err:         fmt.Errorf("exit 1"),
+			wantOK:      true,
+			wantDetail:  "could not validate the token",
+			wantNoMatch: runtime.ClaudeSessionAuthFailedMessage,
+			wantRuns:    1,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			withClaudeAuthEnv(t, map[string]string{runtime.ClaudeOAuthTokenEnv: "secret-token"})
+			runs := 0
+			runner := countingRunner{
+				fakeRunner: fakeRunner{
+					runs: map[string]subprocess.Result{claudeProbeKey: tt.result},
+					errs: map[string]error{claudeProbeKey: tt.err},
+				},
+				runs: &runs,
+			}
+			check := Checker{Runner: runner, LiveProbe: true}.claudeAuthEnv(context.Background())
+			if runs != tt.wantRuns {
+				t.Fatalf("probe ran %d times, want exactly %d (a set token must be validated, not trusted)", runs, tt.wantRuns)
+			}
+			if check.OK != tt.wantOK {
+				t.Fatalf("claude auth check = %+v, want OK=%t", check, tt.wantOK)
+			}
+			if !strings.Contains(check.Detail, tt.wantDetail) {
+				t.Fatalf("claude auth detail = %q, want substring %q", check.Detail, tt.wantDetail)
+			}
+			if tt.wantNoMatch != "" && strings.Contains(check.Detail, tt.wantNoMatch) {
+				t.Fatalf("claude auth detail = %q, must not contain %q", check.Detail, tt.wantNoMatch)
+			}
+			if strings.Contains(check.Detail, "secret-token") {
+				t.Fatalf("claude auth detail = %q must never print the token", check.Detail)
+			}
+		})
 	}
 }
 
@@ -379,7 +448,7 @@ func TestClaudeAuthEnvLabeledAsShellScoped(t *testing.T) {
 // Paths the daemon-aware check is skipped (ok=false) and callers fall back to the
 // shell-local check, so GlobalChecks never invents a daemon check it can't back.
 func TestClaudeAuthDaemonSkippedWithoutPaths(t *testing.T) {
-	if _, ok := (Checker{}).claudeAuthDaemon(); ok {
+	if _, ok := (Checker{}).claudeAuthDaemon(context.Background()); ok {
 		t.Fatalf("claudeAuthDaemon returned a check without Paths set; want skip")
 	}
 }

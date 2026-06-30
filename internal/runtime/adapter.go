@@ -590,6 +590,19 @@ func (a ClaudeAdapter) retryBackoff(attempt int) time.Duration {
 // duplicate-execution hazard; such mid-stream drops carry no status code, so the
 // "401" requirement correctly excludes them.
 func isTransientClaudeDeliveryError(result subprocess.Result, err error) bool {
+	return isClaude401SocketClosed(result, err)
+}
+
+// isClaude401SocketClosed reports whether a failed run carries the
+// "401 socket connection was closed unexpectedly" signature. In the Deliver path
+// this is the concurrency transient a byte-identical retry clears
+// (isTransientClaudeDeliveryError); in the isolated doctor probe path (no
+// concurrency) a signature that SURVIVES a retry is instead the documented #486
+// invalid-token symptom — `Failed to authenticate. API Error: 401 The socket
+// connection was closed unexpectedly` — which carries "401" and "socket connection
+// was closed unexpectedly" but NOT "authentication", so isClaudeAuthFailure alone
+// would miss it. The err != nil gate keeps a successful run from ever matching.
+func isClaude401SocketClosed(result subprocess.Result, err error) bool {
 	if err == nil {
 		return false
 	}
@@ -807,13 +820,52 @@ func claudeCommandError(result subprocess.Result, err error) error {
 	return ClassifyClaudeCommandError(result, err)
 }
 
+// classifyClaudeProbeError classifies the error from an ISOLATED doctor live
+// probe (a single `claude -p`, no concurrency). It is ClassifyClaudeCommandError
+// plus one extra Invalid signature: a 401 "socket connection was closed
+// unexpectedly" that survived the probe's retry is the documented #486
+// invalid-token symptom rather than a concurrency transient, so it must be tagged
+// ErrClaudeAuthFailed (→ ClaudeClassifyProbe Invalid) instead of falling through
+// to Unknown, which kept `gitmoot doctor` green for the exact bug it exists to
+// catch. The Deliver path keeps treating the same signature as transient (it
+// never calls this), so retry behavior there is unchanged.
+func classifyClaudeProbeError(result subprocess.Result, err error) error {
+	if !isClaudeAuthFailure(result) && isClaude401SocketClosed(result, err) {
+		base := commandError(result, err)
+		msg := fmt.Errorf("Claude Code authentication failed. %s: %w", ClaudeSessionAuthFailedMessage, base)
+		return &claudeAuthFailedError{wrapped: msg}
+	}
+	return ClassifyClaudeCommandError(result, err)
+}
+
 func ClassifyClaudeCommandError(result subprocess.Result, err error) error {
 	base := commandError(result, err)
 	if !isClaudeAuthFailure(result) {
 		return base
 	}
-	return fmt.Errorf("Claude Code authentication failed. %s: %w", ClaudeSessionAuthFailedMessage, base)
+	msg := fmt.Errorf("Claude Code authentication failed. %s: %w", ClaudeSessionAuthFailedMessage, base)
+	// Tag the classified auth failure with ErrClaudeAuthFailed so callers can
+	// distinguish a genuine credential rejection (401/invalid) from a transient
+	// or network error via errors.Is, without re-matching stderr strings. The
+	// wrapper's Error() is the message verbatim, so existing text assertions and
+	// the wrapped exec error remain reachable.
+	return &claudeAuthFailedError{wrapped: msg}
 }
+
+// ErrClaudeAuthFailed marks an error chain produced by ClassifyClaudeCommandError
+// for a genuine Claude credential rejection. Use errors.Is(err, ErrClaudeAuthFailed)
+// to tell "the token was rejected" (Invalid) apart from "the probe could not
+// reach a verdict" (transient/network/binary-missing → Unknown).
+var ErrClaudeAuthFailed = errors.New("Claude authentication failed")
+
+// claudeAuthFailedError tags wrapped with ErrClaudeAuthFailed while preserving
+// wrapped's message and chain. Go's errors.Is walks the slice returned by
+// Unwrap() []error, so both wrapped (and through it the exec error) and the
+// sentinel stay reachable.
+type claudeAuthFailedError struct{ wrapped error }
+
+func (e *claudeAuthFailedError) Error() string   { return e.wrapped.Error() }
+func (e *claudeAuthFailedError) Unwrap() []error { return []error{e.wrapped, ErrClaudeAuthFailed} }
 
 // claudeSessionMissingMarker is the exact stderr signature emitted by `claude
 // --resume <uuid>` when the pinned conversation no longer exists (captured from
