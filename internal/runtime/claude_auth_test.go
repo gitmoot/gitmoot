@@ -137,6 +137,74 @@ func TestClaudeProbeUnavailableClassifiesMissingBinary(t *testing.T) {
 	}
 }
 
+// envFakeRunner is a fakeRunner that also implements subprocess.EnvRunner,
+// recording the extra environment passed to RunEnv so a test can prove the
+// daemon's actual credential is what gets injected into the validation probe.
+type envFakeRunner struct {
+	fakeRunner
+	gotEnv []string
+}
+
+func (f *envFakeRunner) RunEnv(ctx context.Context, dir string, env []string, command string, args ...string) (subprocess.Result, error) {
+	f.gotEnv = append([]string(nil), env...)
+	return f.fakeRunner.Run(ctx, dir, command, args...)
+}
+
+// TestClaudeClassifyProbe486 is the tri-state core of the #486 fix: a live-probe
+// outcome must map to valid / invalid / unknown so doctor can stop reporting a
+// set-but-unvalidated token as ok, while never flipping a transient/network blip
+// (or a missing binary) to a hard "invalid".
+func TestClaudeClassifyProbe486(t *testing.T) {
+	authErr := ClassifyClaudeCommandError(
+		subprocess.Result{Stderr: "401 Invalid authentication credentials"},
+		errors.New("exit 1"),
+	)
+	for _, tt := range []struct {
+		name string
+		err  error
+		want ClaudeTokenStatus
+	}{
+		{name: "nil is valid", err: nil, want: ClaudeTokenValid},
+		{name: "classified auth failure is invalid", err: authErr, want: ClaudeTokenInvalid},
+		{name: "transient/network is unknown not invalid", err: errors.New("network is unreachable"), want: ClaudeTokenUnknown},
+		{name: "missing binary is unknown", err: &exec.Error{Name: "claude", Err: exec.ErrNotFound}, want: ClaudeTokenUnknown},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ClaudeClassifyProbe(tt.err); got != tt.want {
+				t.Fatalf("ClaudeClassifyProbe(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+	if !errors.Is(authErr, ErrClaudeAuthFailed) {
+		t.Fatal("a classified auth failure must satisfy errors.Is(err, ErrClaudeAuthFailed)")
+	}
+	if errors.Is(errors.New("boom"), ErrClaudeAuthFailed) {
+		t.Fatal("a plain error must not satisfy errors.Is(err, ErrClaudeAuthFailed)")
+	}
+}
+
+// TestClaudeLiveCheckEnvInjectsCredential proves the daemon-token validation seam:
+// ClaudeLiveCheckEnv passes the supplied credential env to an EnvRunner probe (so
+// doctor validates the daemon's own token, not the doctor process's), and a 401
+// from that probe classifies Invalid.
+func TestClaudeLiveCheckEnvInjectsCredential(t *testing.T) {
+	runner := &envFakeRunner{
+		fakeRunner: fakeRunner{
+			results: []subprocess.Result{{Stderr: "401 Invalid authentication credentials"}},
+			errs:    []error{errors.New("exit 1")},
+		},
+	}
+	cred := []string{ClaudeOAuthTokenEnv + "=daemon-secret"}
+	err := ClaudeLiveCheckEnv(context.Background(), runner, "", cred)
+	if ClaudeClassifyProbe(err) != ClaudeTokenInvalid {
+		t.Fatalf("ClaudeLiveCheckEnv error = %v, want classified invalid", err)
+	}
+	if len(runner.gotEnv) != 1 || runner.gotEnv[0] != cred[0] {
+		t.Fatalf("probe env = %v, want the injected daemon credential %v", runner.gotEnv, cred)
+	}
+	runner.want(t, 0, "claude", "-p", "--output-format", "json", "--", ClaudeLiveCheckPrompt)
+}
+
 func TestClaudeLiveCheckFallsBackToText(t *testing.T) {
 	runner := &fakeRunner{
 		results: []subprocess.Result{

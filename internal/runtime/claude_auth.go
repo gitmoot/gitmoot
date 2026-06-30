@@ -77,12 +77,29 @@ func (e ClaudeAuthEnv) Warning() string {
 }
 
 func ClaudeLiveCheck(ctx context.Context, runner subprocess.Runner, dir string) error {
+	return ClaudeLiveCheckEnv(ctx, runner, dir, nil)
+}
+
+// ClaudeLiveCheckEnv is ClaudeLiveCheck with extraEnv (KEY=VALUE entries)
+// appended to the probe's environment. The doctor uses it to validate a SPECIFIC
+// credential — e.g. the running daemon's CLAUDE_CODE_OAUTH_TOKEN read from /proc —
+// rather than whatever the doctor process happens to carry. extraEnv is honored
+// only when runner implements subprocess.EnvRunner; otherwise (fakes, plain
+// runners) it falls back to the same command+args so the override is invisible to
+// arg-keyed test doubles. A nil extraEnv is exactly the prior behavior.
+func ClaudeLiveCheckEnv(ctx context.Context, runner subprocess.Runner, dir string, extraEnv []string) error {
 	if runner == nil {
 		runner = subprocess.ExecRunner{}
 	}
-	result, err := runner.Run(ctx, dir, "claude", "-p", "--output-format", "json", "--", ClaudeLiveCheckPrompt)
+	run := func(args ...string) (subprocess.Result, error) {
+		if env, ok := runner.(subprocess.EnvRunner); ok && len(extraEnv) > 0 {
+			return env.RunEnv(ctx, dir, extraEnv, "claude", args...)
+		}
+		return runner.Run(ctx, dir, "claude", args...)
+	}
+	result, err := run("-p", "--output-format", "json", "--", ClaudeLiveCheckPrompt)
 	if err != nil && isClaudeJSONUnsupported(result) {
-		result, err = runner.Run(ctx, dir, "claude", "-p", "--", ClaudeLiveCheckPrompt)
+		result, err = run("-p", "--", ClaudeLiveCheckPrompt)
 		if err != nil {
 			return ClassifyClaudeCommandError(result, err)
 		}
@@ -92,6 +109,46 @@ func ClaudeLiveCheck(ctx context.Context, runner subprocess.Runner, dir string) 
 		return ClassifyClaudeCommandError(result, err)
 	}
 	return validateClaudeLiveJSON(result.Stdout)
+}
+
+// ClaudeTokenStatus is the tri-state verdict of validating a Claude credential
+// with a live probe: it either authenticated (Valid), was rejected (Invalid), or
+// could not be determined (Unknown — a transient/network error, or the probe
+// could not run at all). A merely-SET token is not Valid until a probe says so.
+type ClaudeTokenStatus int
+
+const (
+	ClaudeTokenUnknown ClaudeTokenStatus = iota
+	ClaudeTokenValid
+	ClaudeTokenInvalid
+)
+
+func (s ClaudeTokenStatus) String() string {
+	switch s {
+	case ClaudeTokenValid:
+		return "valid"
+	case ClaudeTokenInvalid:
+		return "invalid"
+	default:
+		return "unknown"
+	}
+}
+
+// ClaudeClassifyProbe maps a ClaudeLiveCheck/ClaudeLiveCheckEnv error to a
+// tri-state status. A nil error is Valid; a classified credential rejection
+// (errors.Is ErrClaudeAuthFailed) is Invalid; everything else — a missing/
+// unrunnable binary or a transient/network/timeout error — is Unknown and MUST
+// NOT be reported as Invalid, so a network blip can never flip doctor red or
+// claim the token is bad.
+func ClaudeClassifyProbe(err error) ClaudeTokenStatus {
+	switch {
+	case err == nil:
+		return ClaudeTokenValid
+	case errors.Is(err, ErrClaudeAuthFailed):
+		return ClaudeTokenInvalid
+	default:
+		return ClaudeTokenUnknown
+	}
 }
 
 // ClaudeProbeUnavailable reports whether a ClaudeLiveCheck error means the probe

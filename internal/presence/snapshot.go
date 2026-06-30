@@ -157,6 +157,39 @@ func InspectDaemonClaudeAuth(paths config.Paths) DaemonAuthSnapshot {
 	return snapshot
 }
 
+// DaemonClaudeCredEnv returns the running daemon's set Claude credential
+// variables as KEY=VALUE entries, for injecting into a live validation probe so
+// the doctor validates the token the daemon will actually use rather than the
+// doctor process's own credential. Unlike DaemonAuthSnapshot (which exposes only
+// set/unset booleans), this returns the secret VALUES — callers must use them
+// solely as subprocess env and never print or persist them. It is best-effort
+// and fail-open: a missing daemon, unreadable /proc, or non-Linux host yields
+// (nil, false). Only non-empty values are returned.
+func DaemonClaudeCredEnv(paths config.Paths) ([]string, bool) {
+	daemon := InspectDaemon(paths)
+	if daemon.State != DaemonRunning || daemon.PID <= 0 {
+		return nil, false
+	}
+	lookup, ok := readProcessEnviron(daemon.PID)
+	if !ok {
+		return nil, false
+	}
+	var env []string
+	for _, name := range []string{
+		runtime.ClaudeOAuthTokenEnv,
+		runtime.AnthropicAPIKeyEnv,
+		runtime.AnthropicAuthTokenEnv,
+	} {
+		if value, present := lookup(name); present && strings.TrimSpace(value) != "" {
+			env = append(env, name+"="+value)
+		}
+	}
+	if len(env) == 0 {
+		return nil, false
+	}
+	return env, true
+}
+
 func InspectDaemon(paths config.Paths) DaemonSnapshot {
 	paths = normalizePaths(paths)
 	snapshot := DaemonSnapshot{

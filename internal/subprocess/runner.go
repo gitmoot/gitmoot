@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"os/exec"
 	"sync"
 )
@@ -18,6 +19,17 @@ type Result struct {
 type Runner interface {
 	Run(ctx context.Context, dir string, command string, args ...string) (Result, error)
 	LookPath(file string) (string, error)
+}
+
+// EnvRunner is an optional Runner capability: it runs a command with extra
+// environment variables (KEY=VALUE entries) appended to the inherited
+// environment. It is opt-in so callers that only need the env override (e.g. the
+// doctor probing a specific Claude credential) can type-assert for it and fall
+// back to a plain Run when the runner does not implement it — fakes that key on
+// command+args therefore need no change.
+type EnvRunner interface {
+	Runner
+	RunEnv(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error)
 }
 
 // StreamRunner additionally tees the child's stdout and stderr to a writer as
@@ -41,6 +53,10 @@ func (ExecRunner) RunStream(ctx context.Context, dir string, out io.Writer, comm
 
 func (ExecRunner) LookPath(file string) (string, error) {
 	return exec.LookPath(file)
+}
+
+func (ExecRunner) RunEnv(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error) {
+	return RunEnv(ctx, dir, env, command, args...)
 }
 
 // TeeRunner adapts a stream-capable runner into a plain Runner that always tees
@@ -166,8 +182,20 @@ func runStreamingCmd(cmd *exec.Cmd, out io.Writer, command string, args []string
 }
 
 func Run(ctx context.Context, dir string, command string, args ...string) (Result, error) {
+	return RunEnv(ctx, dir, nil, command, args...)
+}
+
+// RunEnv runs like Run but appends extraEnv (KEY=VALUE entries) to the inherited
+// process environment, letting later entries override earlier ones per the os/exec
+// last-wins rule. A nil extraEnv leaves the environment untouched (cmd.Env nil →
+// inherit os.Environ), so RunEnv(ctx, dir, nil, …) is byte-identical to the prior
+// Run.
+func RunEnv(ctx context.Context, dir string, extraEnv []string, command string, args ...string) (Result, error) {
 	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Dir = dir
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

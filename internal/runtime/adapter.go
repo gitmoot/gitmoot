@@ -766,8 +766,29 @@ func ClassifyClaudeCommandError(result subprocess.Result, err error) error {
 	if !isClaudeAuthFailure(result) {
 		return base
 	}
-	return fmt.Errorf("Claude Code authentication failed. %s: %w", ClaudeSessionAuthFailedMessage, base)
+	msg := fmt.Errorf("Claude Code authentication failed. %s: %w", ClaudeSessionAuthFailedMessage, base)
+	// Tag the classified auth failure with ErrClaudeAuthFailed so callers can
+	// distinguish a genuine credential rejection (401/invalid) from a transient
+	// or network error via errors.Is, without re-matching stderr strings. The
+	// wrapper's Error() is the message verbatim, so existing text assertions and
+	// the wrapped exec error remain reachable.
+	return &claudeAuthFailedError{wrapped: msg}
 }
+
+// ErrClaudeAuthFailed marks an error chain produced by ClassifyClaudeCommandError
+// for a genuine Claude credential rejection. Use errors.Is(err, ErrClaudeAuthFailed)
+// to tell "the token was rejected" (Invalid) apart from "the probe could not
+// reach a verdict" (transient/network/binary-missing → Unknown).
+var ErrClaudeAuthFailed = errors.New("Claude authentication failed")
+
+// claudeAuthFailedError tags wrapped with ErrClaudeAuthFailed while preserving
+// wrapped's message and chain. Go's errors.Is walks the slice returned by
+// Unwrap() []error, so both wrapped (and through it the exec error) and the
+// sentinel stay reachable.
+type claudeAuthFailedError struct{ wrapped error }
+
+func (e *claudeAuthFailedError) Error() string   { return e.wrapped.Error() }
+func (e *claudeAuthFailedError) Unwrap() []error { return []error{e.wrapped, ErrClaudeAuthFailed} }
 
 // claudeSessionMissingMarker is the exact stderr signature emitted by `claude
 // --resume <uuid>` when the pinned conversation no longer exists (captured from
