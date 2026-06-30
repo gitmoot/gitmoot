@@ -2810,7 +2810,7 @@ recommended install path is:
 ```sh
 python3 -m pip install --user pipx
 python3 -m pipx ensurepath
-pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.4.0/gitmoot_skillopt-0.4.0-py3-none-any.whl
+pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.4.1/gitmoot_skillopt-0.4.1-py3-none-any.whl
 gitmoot-skillopt --version
 gitmoot-skillopt optimize --help
 ```
@@ -6600,7 +6600,7 @@ training.json --artifact-root ~/.gitmoot/evals/blobs --out-root
 to validate the contract without model calls.
 Before real model-backed optimization, check `gitmoot-skillopt --version` and
 `gitmoot-skillopt optimize --help`, or install it with
-`pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.4.0/gitmoot_skillopt-0.4.0-py3-none-any.whl`.
+`pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.4.1/gitmoot_skillopt-0.4.1-py3-none-any.whl`.
 Verify required model/backend environment variables for the installed optimizer
 version. `skillopt import` validates a candidate package and stores the
 candidate template as a pending version; it never promotes the candidate
