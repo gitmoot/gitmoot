@@ -272,6 +272,20 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		return code
 	}
 
+	// Seed the persisted runtime-auth file from THIS process's inherited
+	// environment (#578). `daemon start` persists before spawning the child, but
+	// the production, systemd-managed daemon is launched DIRECTLY via `daemon run`
+	// (the unit's ExecStart, token from EnvironmentFile) and never goes through
+	// that path — so without this the file is never seeded in the primary
+	// deployment and the #559 recovery could not trigger there. Best-effort: a
+	// persist failure never blocks the daemon, and the token value never touches
+	// stdout/stderr (only the env-var name and file name are ever named).
+	if paths, err := initializedPaths(*home); err == nil {
+		if perr := persistDaemonRuntimeAuth(paths.Home, claudeAuthEnvLookup); perr != nil {
+			fmt.Fprintf(stderr, "daemon run: warning: could not persist runtime auth: %v\n", perr)
+		}
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

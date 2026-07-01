@@ -193,6 +193,63 @@ func TestPersistDaemonRuntimeAuth_NoTokenNoFile(t *testing.T) {
 	}
 }
 
+// TestRecoverDaemonChildAuthEnv_LiveAuthSuppressesStalePersisted — the
+// all-or-nothing recovery guard: when the live env already carries ANY runtime
+// auth, a DIFFERENT stale var still on disk must NOT be resurrected into the
+// child. Concretely, a stale ANTHROPIC_API_KEY (which overrides OAuth
+// billing/precedence) must not be injected alongside the operator's current
+// OAuth token after they migrated to OAuth-only.
+func TestRecoverDaemonChildAuthEnv_LiveAuthSuppressesStalePersisted(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeDaemonRuntimeAuthFile(daemonRuntimeAuthFilePath(dir), map[string]string{
+		runtime.AnthropicAPIKeyEnv: "stale-api-key",
+	}); err != nil {
+		t.Fatalf("seed stale file: %v", err)
+	}
+	// Live env carries ONLY an OAuth token (operator migrated to OAuth-only).
+	live := func(k string) (string, bool) {
+		if k == runtime.ClaudeOAuthTokenEnv {
+			return secretToken, true
+		}
+		return "", false
+	}
+	if got := recoverDaemonChildAuthEnv(dir, live); len(got) != 0 {
+		t.Fatalf("live auth present: stale persisted vars must NOT be resurrected; got %v (redacted)", redactEnvKeys(got))
+	}
+}
+
+// TestPersistDaemonRuntimeAuth_PrunesRemovedVars — persistence is a full replace,
+// not a merge: a var present on an earlier start but REMOVED from the environment
+// by a later start must be pruned from the file so it can never be resurrected.
+func TestPersistDaemonRuntimeAuth_PrunesRemovedVars(t *testing.T) {
+	dir := t.TempDir()
+	// Day 1: only ANTHROPIC_API_KEY present.
+	if err := persistDaemonRuntimeAuth(dir, func(k string) (string, bool) {
+		if k == runtime.AnthropicAPIKeyEnv {
+			return "day1-api-key", true
+		}
+		return "", false
+	}); err != nil {
+		t.Fatalf("day1 persist: %v", err)
+	}
+	// Day 2: operator removed the API key and switched to OAuth-only.
+	if err := persistDaemonRuntimeAuth(dir, func(k string) (string, bool) {
+		if k == runtime.ClaudeOAuthTokenEnv {
+			return secretToken, true
+		}
+		return "", false
+	}); err != nil {
+		t.Fatalf("day2 persist: %v", err)
+	}
+	got := loadDaemonRuntimeAuthFile(daemonRuntimeAuthFilePath(dir))
+	if _, stale := got[runtime.AnthropicAPIKeyEnv]; stale {
+		t.Fatalf("removed ANTHROPIC_API_KEY must be pruned from the persisted file; got keys=%v", keysOf(got))
+	}
+	if got[runtime.ClaudeOAuthTokenEnv] != secretToken {
+		t.Fatalf("current OAuth token must be persisted; got keys=%v", keysOf(got))
+	}
+}
+
 // assertNoTokenLeak fails if the secret token appears in any captured diagnostic
 // stream — the SECURITY-CRITICAL non-leak requirement.
 func assertNoTokenLeak(t *testing.T, streams ...string) {

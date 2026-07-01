@@ -18,6 +18,12 @@ import (
 // WITHOUT the token, the persisted value is loaded and injected into the child
 // daemon's environment so auth is preserved automatically.
 //
+// Persistence is a full REPLACE of the file with the currently-present auth vars
+// (not a merge), and recovery is ALL-OR-NOTHING (only fires when the live env has
+// no runtime auth at all): together these ensure a credential the operator
+// deliberately removed is pruned rather than resurrected, and a present token is
+// never supplemented by a stale persisted one that could flip billing/precedence.
+//
 // SECURITY: the token value NEVER touches stdout/stderr, the log, or the
 // world-readable daemon.json/meta. It lives only in this 0600 file and in the
 // child process environment. Diagnostics name the env var and the file, never
@@ -70,8 +76,14 @@ func collectRuntimeAuthEnv(lookup func(string) (string, bool)) map[string]string
 //   - Only persist when a token is actually present: an environment with NO
 //     runtime auth token leaves any existing file untouched — a good persisted
 //     token is NEVER overwritten with an empty/unset env.
-//   - Prefer the live env over the file: when a var is set in both, the live
-//     value wins; vars only in the file are preserved (merge, not replace).
+//   - Rewrite the file to EXACTLY the runtime auth vars currently present in the
+//     live env (a full replace, NOT a merge with prior on-disk state). A merge
+//     would preserve any var ever seen forever, so a credential the operator
+//     deliberately removed from the environment — e.g. switching from
+//     ANTHROPIC_API_KEY (which per runtime.ClaudeAuthEnv.Warning() overrides
+//     OAuth billing/precedence) to OAuth-only — would stick on disk and later be
+//     resurrected into the child. Replacing prunes removed vars; recovery only
+//     fires on a genuine total gap (see recoverDaemonChildAuthEnv).
 //   - The file is created/re-secured to 0600, owner read/write only.
 func persistDaemonRuntimeAuth(homeDir string, lookup func(string) (string, bool)) error {
 	present := collectRuntimeAuthEnv(lookup)
@@ -79,31 +91,34 @@ func persistDaemonRuntimeAuth(homeDir string, lookup func(string) (string, bool)
 		// Nothing to persist; never clobber a previously-persisted good token.
 		return nil
 	}
-	path := daemonRuntimeAuthFilePath(homeDir)
-	merged := loadDaemonRuntimeAuthFile(path) // best-effort; missing/unreadable => empty
-	for name, value := range present {         // live env wins over the file
-		merged[name] = value
-	}
-	return writeDaemonRuntimeAuthFile(path, merged)
+	// Write exactly the currently-present set so intentionally-removed
+	// credentials are pruned rather than carried forward.
+	return writeDaemonRuntimeAuthFile(daemonRuntimeAuthFilePath(homeDir), present)
 }
 
 // recoverDaemonChildAuthEnv returns the KEY=VALUE env entries to inject into the
-// (re)started daemon child: for each runtime auth var that the launching
-// environment LACKS but the persisted file HAS, one entry is returned. Vars
-// already present in the live env are omitted (the child inherits them via
-// os.Environ()), honoring "prefer the live env over the file". The result is
-// sorted for determinism and is empty when nothing needs recovering.
+// (re)started daemon child from the persisted file. Recovery is ALL-OR-NOTHING and
+// scoped to a genuine total auth gap: if the launching environment already carries
+// ANY runtime auth, the live env is authoritative and nothing is injected — a
+// present token is never supplemented by a stale persisted var. This prevents a
+// deliberately-removed credential (e.g. a stale ANTHROPIC_API_KEY, which per
+// runtime.ClaudeAuthEnv.Warning() overrides OAuth billing/precedence) from being
+// silently resurrected alongside the operator's current token. Only when the live
+// env has NO runtime auth at all (the #559 token-less restart) are all persisted
+// vars injected. The result is sorted for determinism and empty when nothing needs
+// recovering.
 func recoverDaemonChildAuthEnv(homeDir string, lookup func(string) (string, bool)) []string {
 	persisted := loadDaemonRuntimeAuthFile(daemonRuntimeAuthFilePath(homeDir))
 	if len(persisted) == 0 {
 		return nil
 	}
-	live := collectRuntimeAuthEnv(lookup)
+	// If the launching env already has any auth, treat it as authoritative and do
+	// not gap-fill individual vars from stale on-disk state.
+	if len(collectRuntimeAuthEnv(lookup)) > 0 {
+		return nil
+	}
 	var extra []string
 	for _, name := range daemonRuntimeAuthEnvVars {
-		if _, inLive := live[name]; inLive {
-			continue
-		}
 		if value, ok := persisted[name]; ok {
 			extra = append(extra, name+"="+value)
 		}
