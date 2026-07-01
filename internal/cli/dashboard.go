@@ -211,6 +211,8 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 	plain := fs.Bool("plain", false, "print a one-shot snapshot instead of launching the interactive TUI")
 	watch := fs.Bool("watch", false, "refresh the snapshot on an interval until interrupted (terminal only)")
 	interval := fs.Duration("interval", 5*time.Second, "refresh interval for --watch")
+	web := fs.Bool("web", false, "serve the read-only web dashboard (live orchestration graph) until interrupted")
+	webAddr := fs.String("addr", "127.0.0.1:8080", "address for --web to listen on")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -235,6 +237,11 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		return runDashboardWatch(stdout, *home, *all, *interval)
+	}
+	// The web dashboard is a separate read-only HTTP server (never the daemon
+	// path); branch out before the TUI/one-shot decision, mirroring --watch.
+	if *web {
+		return runDashboardWeb(*home, *webAddr, stdout, stderr)
 	}
 
 	// On a real terminal with no machine-output or mutation flags, launch the
