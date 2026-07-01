@@ -127,7 +127,7 @@ func runDaemonStartWithWorkDirRestart(args []string, workDir string, restart boo
 
 	warnIfDaemonStartLosesClaudeAuth(stderr, restart, priorDaemonHadClaudeAuth)
 
-	started, err := startDaemonChild(cfg.Home, cfg.Poll.String(), cfg.Workers, cfg.WatchSkillOptReviews, cfg.WatchIssues, cfg.Scheduler, cfg.RepoFlag, cfg.Session, state, resolvedWorkDir)
+	started, err := startDaemonChildFn(cfg.Home, cfg.Poll.String(), cfg.Workers, cfg.WatchSkillOptReviews, cfg.WatchIssues, cfg.Scheduler, cfg.RepoFlag, cfg.Session, state, resolvedWorkDir)
 	if err != nil {
 		fmt.Fprintf(stderr, "daemon start: %v\n", err)
 		return 1
@@ -445,6 +445,11 @@ func runDaemonRestart(args []string, stdout, stderr io.Writer) int {
 // that same environment BEFORE launch. It is a package var so tests can seed the
 // auth-readiness seam deterministically instead of depending on real host creds.
 var claudeAuthEnvLookup = os.LookupEnv
+
+// startDaemonChildFn is the daemon child-spawn indirection. It defaults to the
+// real startDaemonChild; tests swap it so the start/restart command body can be
+// driven end-to-end without launching an actual daemon process.
+var startDaemonChildFn = startDaemonChild
 
 // warnIfDaemonStartLosesClaudeAuth prints a prominent, non-fatal stderr warning
 // when the daemon about to (re)start will inherit an environment WITHOUT Claude
