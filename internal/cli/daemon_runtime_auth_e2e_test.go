@@ -93,6 +93,13 @@ func TestDaemonRestartOnlyRecovery_E2E(t *testing.T) {
 		if !strings.Contains(stderr.String(), "STALE or REVOKED") {
 			t.Fatalf("RESTART recovery must emit the stale-token note; stderr=%q", stderr.String())
 		}
+		// The stale note must steer operators at a LIVE validity probe (`gitmoot
+		// doctor`), not at `daemon status`, which only confirms a token is SET
+		// (not valid) and would report a revoked recovered token as "ok" — the
+		// silent-auth-failure class #588 exists to eliminate.
+		if !strings.Contains(stderr.String(), "gitmoot doctor") {
+			t.Fatalf("stale note must recommend the live `gitmoot doctor` probe; stderr=%q", stderr.String())
+		}
 		assertNoTokenLeak(t, stdout.String(), stderr.String())
 	})
 

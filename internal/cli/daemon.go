@@ -578,10 +578,16 @@ func warnIfDaemonStartLosesClaudeAuth(w io.Writer, restart bool, priorDaemonHadC
 // Claude auth, but the persisted value carries NO expiry or validation metadata,
 // so it may be STALE or REVOKED. This deliberately does not fully suppress the
 // #581 "no auth" signal — it substitutes a softer note. The token VALUE is never
-// printed; only the fact of recovery and how to verify it.
+// printed; only the fact of recovery and how to verify it. It points at
+// `gitmoot doctor` (a LIVE token probe) rather than `gitmoot daemon status`,
+// which only confirms a token is SET, not valid, and would still report a revoked
+// recovered token as "ok" — the exact silent-auth-failure class #559/#581/#588
+// set out to eliminate.
 func noteRecoveredRuntimeAuthMayBeStale(w io.Writer) {
 	fmt.Fprintln(w, "ℹ️  NOTE: the recovered Claude auth token was restored from persisted state and has NO")
-	fmt.Fprintln(w, "    expiry/validation metadata — it may be STALE or REVOKED. Verify with `gitmoot daemon status`.")
+	fmt.Fprintln(w, "    expiry/validation metadata — it may be STALE or REVOKED. `gitmoot daemon status` only")
+	fmt.Fprintln(w, "    confirms a token is PRESENT, not that it is valid; run `gitmoot doctor` for a live")
+	fmt.Fprintln(w, "    validity probe that surfaces a revoked token.")
 }
 
 func runDaemonStatus(args []string, stdout, stderr io.Writer) int {
