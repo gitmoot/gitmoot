@@ -729,6 +729,15 @@ scopes the report to one template, and `--home` reads from a non-default Gitmoot
 home. Use it to decide whether the judge is well-calibrated enough to trust at
 the gate before relying on it for candidate decisions.
 
+`gitmoot skillopt judge agreement [--template <id>] [--json]` extends the
+measurement to the **pairwise** slice: it joins the A/B judge rows
+(`skillopt ab --judge` / jury) against the human ranked/pairwise picks on the
+same items (per-item majority; ties skipped and counted) and reports Cohen's κ
+as the headline metric, raw agreement, per-human-source and per-juror-family
+breakdowns, and a position-bias audit over judge rows carrying the recorded raw
+a/b pick (`|P(pick=a) − 0.5|`). Small samples get a loud warning — sample size
+is the limiter. It is read-only; `--json` emits the machine-readable report.
+
 ### Optimizing the judge prompt
 
 The captured outcomes are the substrate for tuning the judge itself. The

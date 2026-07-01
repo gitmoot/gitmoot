@@ -593,7 +593,7 @@ func recordSkillOptABPick(ctx context.Context, store *db.Store, paths config.Pat
 	if err := ensureSkillOptABRunRows(ctx, store, paths, runID, skillOptABItemID, templateID, champion, challenger, championDelivery, challengerDelivery, prompt, skillOptABSource, skillOptABFeedbackSource); err != nil {
 		return err
 	}
-	return upsertSkillOptABRankedEvent(ctx, store, runID, skillOptABItemID, winnerLabel, loserLabel, "human", skillOptABSource, pickSourceURL)
+	return upsertSkillOptABRankedEvent(ctx, store, runID, skillOptABItemID, winnerLabel, loserLabel, "human", skillOptABSource, pickSourceURL, "")
 }
 
 // ensureSkillOptABRunRows idempotently upserts the shared pairwise scaffolding for
@@ -668,8 +668,10 @@ func ensureSkillOptABRunRows(ctx context.Context, store *db.Store, paths config.
 // row (reviewer=human,source=skillopt-ab) and the judge row
 // (reviewer=skillopt-ab-judge,source=skillopt-ab-judge) as SEPARATE coexisting
 // rows on the same run/item, and what makes repeated picks each persist via a
-// distinct per-pick source_url.
-func upsertSkillOptABRankedEvent(ctx context.Context, store *db.Store, runID, itemID, winnerLabel, loserLabel, reviewer, source, sourceURL string) error {
+// distinct per-pick source_url. reasoning is stored verbatim (the judge/juror
+// paths pass the machine-readable position blob from
+// skillOptABJudgePickPositionJSON; the human paths pass "").
+func upsertSkillOptABRankedEvent(ctx context.Context, store *db.Store, runID, itemID, winnerLabel, loserLabel, reviewer, source, sourceURL, reasoning string) error {
 	ranking, err := json.Marshal([]string{winnerLabel, loserLabel})
 	if err != nil {
 		return err
@@ -684,10 +686,52 @@ func upsertSkillOptABRankedEvent(ctx context.Context, store *db.Store, runID, it
 		RankingJSON:   string(ranking),
 		TieGroupsJSON: string(tieGroups),
 		Winner:        winnerLabel,
+		Reasoning:     reasoning,
 		Reviewer:      reviewer,
 		Source:        source,
 		SourceURL:     sourceURL,
 	})
+}
+
+// skillOptABJudgePickPositionJSON encodes the judge's RAW presented-position
+// pick (a|b) as a tiny machine-readable JSON blob carried on the judge/juror
+// RankedFeedbackEvent.Reasoning field. This is the MINIMAL ADDITIVE persistence
+// the position-bias audit needs (#344, "Reliability without Validity"): the
+// stored Winner is the UNBLINDED role (champion|challenger), so without this
+// blob the presented position is unrecoverable and |P(pick=a) - 0.5| cannot be
+// measured. Reasoning is an existing opaque passthrough (no schema change), it
+// was previously always empty on judge/juror rows, and judge rows are
+// source-tagged + weighted below human downstream, so filling it changes no
+// existing flow.
+func skillOptABJudgePickPositionJSON(pick string) string {
+	data, err := json.Marshal(map[string]string{"judge_pick_position": pick})
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+// skillOptABJudgePickPosition decodes the position blob written by
+// skillOptABJudgePickPositionJSON. ok is false for rows that predate the
+// position capture (empty/free-text reasoning) or carry anything other than a
+// valid a|b position, so the audit silently skips unmeasurable rows instead of
+// fabricating positions.
+func skillOptABJudgePickPosition(reasoning string) (string, bool) {
+	reasoning = strings.TrimSpace(reasoning)
+	if reasoning == "" {
+		return "", false
+	}
+	var decoded struct {
+		JudgePickPosition string `json:"judge_pick_position"`
+	}
+	if err := json.Unmarshal([]byte(reasoning), &decoded); err != nil {
+		return "", false
+	}
+	pick := strings.ToLower(strings.TrimSpace(decoded.JudgePickPosition))
+	if pick != "a" && pick != "b" {
+		return "", false
+	}
+	return pick, true
 }
 
 // skillOptABPickSourceURL mints a unique-per-pick SourceURL for the Mode B
@@ -852,7 +896,11 @@ func runSkillOptABJudge(ctx context.Context, store *db.Store, paths config.Paths
 		return
 	}
 	judgeSourceURL := skillOptABJudgeSourceURL(challenger.version.ID)
-	if err := upsertSkillOptABRankedEvent(ctx, store, runID, skillOptABItemID, winnerLabel, loserLabel, skillOptABJudgeReviewer, skillOptABJudgeSource, judgeSourceURL); err != nil {
+	// The reasoning blob records the judge's RAW presented-position pick so the
+	// position-bias audit (`skillopt judge agreement`, #344) can measure
+	// |P(pick=a) - 0.5| — the stored Winner alone is the unblinded role and
+	// cannot recover the position.
+	if err := upsertSkillOptABRankedEvent(ctx, store, runID, skillOptABItemID, winnerLabel, loserLabel, skillOptABJudgeReviewer, skillOptABJudgeSource, judgeSourceURL, skillOptABJudgePickPositionJSON(pick)); err != nil {
 		log.Printf("skillopt ab judge: record judge pick: %v", err)
 		return
 	}
@@ -865,10 +913,12 @@ func runSkillOptABJudge(ctx context.Context, store *db.Store, paths config.Paths
 }
 
 // skillOptABJuror is one surviving jury member's parsed verdict: its resolved
-// family, the role it picked (champion|challenger), and whether that pick means
-// the challenger won (the boolean the pure aggregator votes on).
+// family, the RAW presented position it picked (a|b — persisted for the #344
+// position-bias audit), the role it picked (champion|challenger), and whether
+// that pick means the challenger won (the boolean the pure aggregator votes on).
 type skillOptABJuror struct {
 	family         string
+	pick           string
 	winnerLabel    string
 	challengerWins bool
 }
@@ -910,6 +960,7 @@ func runSkillOptABJudgeJury(ctx context.Context, store *db.Store, paths config.P
 		}
 		jurors = append(jurors, skillOptABJuror{
 			family:         reviewer.Runtime,
+			pick:           pick,
 			winnerLabel:    pickedDelivery.label,
 			challengerWins: pickedDelivery.label == skillOptABChallengerLabel,
 		})
@@ -955,7 +1006,9 @@ func runSkillOptABJudgeJury(ctx context.Context, store *db.Store, paths config.P
 		}
 		reviewer := skillOptABJurorReviewerPrefix + j.family
 		sourceURL := skillOptABJurorSourceURL(challenger.version.ID, j.family)
-		if err := upsertSkillOptABRankedEvent(ctx, store, runID, skillOptABItemID, j.winnerLabel, loserLabel, reviewer, skillOptABJurorSource, sourceURL); err != nil {
+		// Each juror row carries its RAW presented-position pick for the #344
+		// position-bias audit, exactly like the single-judge row.
+		if err := upsertSkillOptABRankedEvent(ctx, store, runID, skillOptABItemID, j.winnerLabel, loserLabel, reviewer, skillOptABJurorSource, sourceURL, skillOptABJudgePickPositionJSON(j.pick)); err != nil {
 			log.Printf("skillopt ab jury: record juror %s row: %v", j.family, err)
 			return
 		}
@@ -969,7 +1022,10 @@ func runSkillOptABJudgeJury(ctx context.Context, store *db.Store, paths config.P
 	if decision.Decision {
 		aggWinner, aggLoser = skillOptABChallengerLabel, skillOptABChampionLabel
 	}
-	if err := upsertSkillOptABRankedEvent(ctx, store, runID, skillOptABItemID, aggWinner, aggLoser, skillOptABJudgeReviewer, skillOptABJudgeSource, skillOptABJudgeSourceURL(challenger.version.ID)); err != nil {
+	// The jury AGGREGATE verdict is a majority over jurors, not one positional
+	// pick, so it carries no position blob (reasoning "") — only the per-juror
+	// rows above are position-auditable.
+	if err := upsertSkillOptABRankedEvent(ctx, store, runID, skillOptABItemID, aggWinner, aggLoser, skillOptABJudgeReviewer, skillOptABJudgeSource, skillOptABJudgeSourceURL(challenger.version.ID), ""); err != nil {
 		log.Printf("skillopt ab jury: record aggregate verdict: %v", err)
 		return
 	}

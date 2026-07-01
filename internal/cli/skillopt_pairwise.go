@@ -280,7 +280,7 @@ func importPairwisePacket(ctx context.Context, store *db.Store, paths config.Pat
 		// re-import of the same reviewed packet, so the ranked event is upserted in
 		// place and never double-counted.
 		sourceURL := skillOptPairwiseSourceURL(packet.RunID, result.ItemID)
-		if err := upsertSkillOptABRankedEvent(ctx, store, runID, result.ItemID, result.WinnerLabel, result.LoserLabel, options.reviewer, skillOptPairwiseSource, sourceURL); err != nil {
+		if err := upsertSkillOptABRankedEvent(ctx, store, runID, result.ItemID, result.WinnerLabel, result.LoserLabel, options.reviewer, skillOptPairwiseSource, sourceURL, ""); err != nil {
 			itemResult.Status = "skipped"
 			itemResult.Message = fmt.Sprintf("record pick: %v", err)
 			summary.Skipped++

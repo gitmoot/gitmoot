@@ -106,6 +106,7 @@ func printSkillOptUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot skillopt ab <agent> \"<prompt>\" [--challenger <versionId>] [--pick a|b] [--seed N] [--judge] [--judge-only] [--home path]")
 	fmt.Fprintln(w, "  gitmoot skillopt pairwise import <packet-dir> [--packet path] [--secret-map path] [--picks path] [--reviewer name] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot skillopt judge-report [--template id]")
+	fmt.Fprintln(w, "  gitmoot skillopt judge agreement [--template <id>] [--home <h>] [--json]")
 	fmt.Fprintln(w, "  gitmoot skillopt judge promote --template <id> --task-kind <kind> --file <pkg.json> [--home <h>] [--yes] [--json]")
 	fmt.Fprintln(w, "  gitmoot skillopt train init --name <name> --template <id> --review-repo owner/repo --artifact-kind kind --preview kind (--request text|--request-file path)")
 	fmt.Fprintln(w, "  gitmoot skillopt train init templates --json")
@@ -11848,6 +11849,8 @@ func runSkillOptJudge(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "promote":
 		return runSkillOptJudgePromote(args[1:], stdout, stderr)
+	case "agreement":
+		return runSkillOptJudgeAgreement(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown skillopt judge command %q\n\n", args[0])
 		printSkillOptJudgeUsage(stderr)
@@ -11858,6 +11861,7 @@ func runSkillOptJudge(args []string, stdout, stderr io.Writer) int {
 func printSkillOptJudgeUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot skillopt judge promote --template <id> --task-kind <kind> --file <pkg.json> [--home <h>] [--yes] [--json]")
+	fmt.Fprintln(w, "  gitmoot skillopt judge agreement [--template <id>] [--home <h>] [--json]")
 }
 
 // skillOptJudgePromoteResult is the machine-readable preview/apply summary for

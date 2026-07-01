@@ -4644,6 +4644,52 @@ func scanRankedFeedbackEvent(row interface{ Scan(dest ...any) error }) (RankedFe
 	return event, nil
 }
 
+// RankedFeedbackEventWithTemplate pairs a ranked feedback event with the
+// template id of the eval run it belongs to, so cross-run measurement joins
+// (`skillopt judge agreement`, #344) can scope by template without a second
+// per-run lookup loop.
+type RankedFeedbackEventWithTemplate struct {
+	RankedFeedbackEvent
+	TemplateID string
+}
+
+// ListRankedFeedbackEventsAcrossRuns returns every ranked feedback event joined
+// with its eval run's template id, ordered deterministically, optionally
+// filtered to one template (templateID == "" lists all). It is read-only and
+// exists for the judge<->human agreement measurement harness (#344): the
+// pairwise judge rows (source=skillopt-ab-judge) and the human rows they must
+// be compared against live in the SAME (run_id, item_id) but across MANY runs,
+// so the per-run ListRankedFeedbackEvents cannot serve the whole-store join.
+func (s *Store) ListRankedFeedbackEventsAcrossRuns(ctx context.Context, templateID string) ([]RankedFeedbackEventWithTemplate, error) {
+	query := `SELECT e.id, e.run_id, e.item_id, e.ranking_json, e.tie_groups_json, e.winner, e.useful_traits_json, e.rejected_traits_json,
+			e.required_improvements_json, e.quality, e.continue_mode, e.promote, e.reasoning, e.reviewer, e.source, e.source_url, e.created_at,
+			r.template_id
+		FROM ranked_feedback_events e
+		JOIN eval_runs r ON r.id = e.run_id`
+	args := []any{}
+	if trimmed := strings.TrimSpace(templateID); trimmed != "" {
+		query += ` WHERE r.template_id = ?`
+		args = append(args, trimmed)
+	}
+	query += ` ORDER BY e.run_id, e.item_id, e.reviewer, e.source, e.source_url`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var events []RankedFeedbackEventWithTemplate
+	for rows.Next() {
+		var event RankedFeedbackEventWithTemplate
+		if err := rows.Scan(&event.ID, &event.RunID, &event.ItemID, &event.RankingJSON, &event.TieGroupsJSON, &event.Winner, &event.UsefulTraitsJSON, &event.RejectedTraitsJSON,
+			&event.RequiredImprovementsJSON, &event.Quality, &event.ContinueMode, &event.Promote, &event.Reasoning, &event.Reviewer, &event.Source, &event.SourceURL, &event.CreatedAt,
+			&event.TemplateID); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
+}
+
 // GetBanditArm reads the #473 Mode B bandit arm for a (templateID,
 // versionID) variant. A missing row is NOT an error: it returns ok=false with a
 // zero arm, and the caller treats that as the uniform Beta(1,1) prior

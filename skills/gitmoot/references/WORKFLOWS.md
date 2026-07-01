@@ -294,6 +294,13 @@ soft-score versus the human decision), and per-dimension disagreement — useful
 to tell whether the LLM judge is well-calibrated against human verdicts before
 you trust it to gate candidates.
 
+`gitmoot skillopt judge agreement [--template <id>] [--json]` extends the
+measurement to the pairwise slice: it joins the A/B judge rows (`skillopt ab
+--judge` / jury) against human ranked/pairwise picks on the same items and
+reports Cohen's κ as the headline, raw agreement, per-source/per-juror
+breakdowns, and a position-bias audit (`|P(pick=a) − 0.5|`), with a loud
+small-sample warning. Read-only.
+
 Those captured outcomes feed judge-prompt optimization. The contract carries a
 per-`task_kind` judge prompt
 (`evaluator_profile.judge.config.judge_prompt_templates[task_kind]` +

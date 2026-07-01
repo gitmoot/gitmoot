@@ -577,6 +577,7 @@ gitmoot skillopt train continue --session <id> [--generator-type skillopt-genera
 gitmoot skillopt train recover --session <id> [--out-root path] [--generation [--abort | --advance-state]] [--json]
 gitmoot skillopt train stop --session <id> --reason <text>
 gitmoot skillopt judge-report [--template <id>] [--home <path>]
+gitmoot skillopt judge agreement [--template <id>] [--home <path>] [--json]
 gitmoot skillopt judge promote --template <id> --task-kind <kind> --file <pkg.json> [--home <path>] [--yes] [--json]
 ```
 
@@ -695,6 +696,18 @@ LLM judge is calibrated against human verdicts. It prints a confusion matrix
 buckets (judge soft-score versus the human decision), and per-dimension
 disagreement. Pass `--template <id>` to scope the report to one template, and
 `--home <path>` to read from a non-default Gitmoot home. It is read-only.
+
+`skillopt judge agreement` is the judge↔human agreement measurement harness
+(#344). It joins the stored A/B judge verdicts (`skillopt ab --judge` /
+jury rows) against the human ranked/pairwise feedback on the same items
+(per-item majority; internal ties are skipped and counted) and reports Cohen's
+κ as the **headline** metric (raw agreement overstates judge quality because
+it does not correct for chance), the raw agreement rate, per-human-source and
+per-juror-family breakdowns, a position-bias audit over judge rows that carry
+the recorded raw a/b pick (`|P(pick=a) − 0.5|`), and a summary of the
+candidate-level judge outcomes above. Small samples get a loud warning —
+sample size is the limiter. `--json` emits the machine-readable report. It is
+read-only.
 
 `skillopt judge promote` closes the judge-prompt optimization loop: it applies an
 **accepted** judge-prompt variant (from the judge-prompt optimizer's
