@@ -2768,7 +2768,17 @@ func jobStateCanRetryComment(state string) bool {
 	}
 }
 
+// dispatchLimitObserver, when non-nil, is invoked with the concurrency limit that
+// each repo dispatch pass actually uses, at the exact point production dispatch
+// reads it. Test-only seam (#577): it lets a warm-reload E2E prove a SIGHUP change
+// to the live worker count is what the RUNNING dispatch reads on its next pass,
+// without a restart. It is nil in production, so the dispatch path is byte-identical.
+var dispatchLimitObserver func(limit int)
+
 func runQueuedJobsForRepo(ctx context.Context, worker jobWorker, limit int, repoFilter string, rootFilter string) error {
+	if obs := dispatchLimitObserver; obs != nil {
+		obs(limit)
+	}
 	if limit <= 0 {
 		return nil
 	}
