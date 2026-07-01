@@ -198,10 +198,15 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	lockTTL := daemonRunningJobStaleAfter
 	jobTimeout := request.JobTimeout
 	if managed.OK {
-		lockTTL = managed.JobTimeout
 		jobTimeout = managed.JobTimeout
-	} else if jobTimeout > 0 {
-		lockTTL = jobTimeout
+	}
+	// Mirror run()/runWithTempWorker(): size the runtime-session lease to
+	// jobTimeout + a teardown grace so a foreground `agent ask` that hits its
+	// timeout releases the lock before the lease expires. Otherwise the lease
+	// (== the run-context deadline) would expire mid-teardown and the stale
+	// reaper could requeue the still-live job — the #536 double-run window.
+	if jobTimeout > 0 {
+		lockTTL = jobTimeout + runtimeLeaseTeardownGrace
 	}
 	releaseLock, acquired, lockKey, ownerToken, err := acquireRuntimeSessionLock(ctx, store, job.ID, runtimeAgent(agent), time.Now().UTC(), lockTTL)
 	if err != nil {

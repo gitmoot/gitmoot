@@ -2203,21 +2203,18 @@ func recoverExpiredRuntimeSessionLocks(ctx context.Context, store *db.Store, std
 	if err != nil {
 		return err
 	}
-	deleted, err := store.DeleteExpiredResourceLocks(ctx, now)
-	if err != nil {
-		return err
-	}
-	if deleted > 0 {
-		writeLine(stdout, "recovered %d expired runtime session locks", deleted)
-	}
+	// Requeue owners BEFORE reaping the lock rows. An expired runtime lease means
+	// the job's real timeout + teardown grace has elapsed, so a still-'running'
+	// owner is genuinely stale (a normally-terminating worker releases its lock
+	// before the grace-padded lease expires — see runtimeLeaseTeardownGrace).
+	// Ordering requeue-then-delete keeps the two durable: if a mid-loop DB error
+	// aborts the sweep, the un-processed locks are still expired and get retried
+	// next tick, instead of being deleted up front and losing the requeue signal
+	// (which would strand those owners as 'running' until the coarse 30m window).
+	// TransitionJobStateWithEvent is a no-op unless the owner is still 'running'.
 	for _, lock := range expiredRuntimeLocks {
 		if strings.TrimSpace(lock.OwnerJobID) == "" {
 			continue
-		}
-		if _, err := store.GetResourceLock(ctx, lock.ResourceKey); err == nil {
-			continue
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return err
 		}
 		recovered, err := store.TransitionJobStateWithEvent(ctx, lock.OwnerJobID, string(workflow.JobRunning), string(workflow.JobQueued), db.JobEvent{
 			JobID:   lock.OwnerJobID,
@@ -2230,6 +2227,13 @@ func recoverExpiredRuntimeSessionLocks(ctx context.Context, store *db.Store, std
 		if recovered {
 			writeLine(stdout, "requeued running job %s after runtime session lock expired", lock.OwnerJobID)
 		}
+	}
+	deleted, err := store.DeleteExpiredResourceLocks(ctx, now)
+	if err != nil {
+		return err
+	}
+	if deleted > 0 {
+		writeLine(stdout, "recovered %d expired runtime session locks", deleted)
 	}
 	return nil
 }
