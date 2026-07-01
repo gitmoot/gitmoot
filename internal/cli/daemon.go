@@ -1480,6 +1480,15 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 			if err := recoverCancelledRunningJobsForEnabledRepos(ctx, store, rootFilter, stdout); err != nil {
 				return err
 			}
+			// The in-flight tracker (#562) keeps one hung/long job on any repo
+			// from wedging the whole sweep: ticks claim + dispatch async and
+			// return promptly. The poller consults it so a repo with in-flight
+			// jobs degrades to the recovery-only poll instead of mutating the
+			// checkout under a running job. The deferred drain cancels + waits
+			// (bounded) for in-flight jobs on exit.
+			tracker := newInflightJobTracker(ctx)
+			defer tracker.drain(stdout, daemonShutdownDrainTimeout)
+			poller.Inflight = tracker
 			workerErr = startSupervisorWorkerLoopRecovering(ctx, daemonWorkerLoopInterval, stdout, func(now time.Time) error {
 				// Read the warm-reloadable worker count + scheduler mode each tick
 				// (#577). The worker is copied per tick so setting UsePool is race-free
@@ -1488,7 +1497,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 				_, workers, usePool := live.snapshot()
 				w := worker
 				w.UsePool = usePool
-				return runEnabledRepoWorkerTicksWithLocks(ctx, store, w, workers, rootFilter, stdout, now, checkoutLocks)
+				return runEnabledRepoWorkerTicksTracked(ctx, store, w, workers, rootFilter, stdout, now, checkoutLocks, tracker)
 			})
 			startCockpitReconcileLoop(ctx, store, paths.Home, stdout)
 		}
@@ -1544,17 +1553,13 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	worker.CommenterFactory = worker.defaultCommenter
 	worker.Admission = worker.loadAdmissionBudget()
 	var checkoutLock sync.Mutex
-	workerErr := startSupervisorWorkerLoopRecovering(ctx, daemonWorkerLoopInterval, stdout, func(now time.Time) error {
-		checkoutLock.Lock()
-		defer checkoutLock.Unlock()
-		// Read the warm-reloadable worker count + scheduler mode each tick (#577);
-		// the worker is copied per tick so UsePool is race-free with the SIGHUP
-		// reload goroutine.
-		_, workers, usePool := live.snapshot()
-		w := worker
-		w.UsePool = usePool
-		return runDaemonWorkerTick(ctx, store, w, workers, false, d.Repo.FullName(), rootFilter, stdout, now)
-	})
+	// The in-flight tracker (#562) is what keeps ONE hung/long job from wedging
+	// this whole loop: ticks claim + dispatch async and return, while the tracker
+	// preserves same-repo serialization, concurrency caps, and poller exclusion.
+	// The deferred drain cancels + waits (bounded) for in-flight jobs on exit.
+	tracker := newInflightJobTracker(ctx)
+	defer tracker.drain(stdout, daemonShutdownDrainTimeout)
+	workerErr := startSingleRepoWorkerLoop(ctx, daemonWorkerLoopInterval, store, worker, live, &checkoutLock, tracker, d.Repo.FullName(), rootFilter, stdout)
 	startCockpitReconcileLoop(ctx, store, home, stdout)
 	// Heartbeat schedules (#533) must also fire in the single-repo daemon, or a
 	// single-repo daemon would silently never run them. Off-by-default: with no
@@ -1572,10 +1577,21 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		if err := receiveSupervisorWorkerError(workerErr); err != nil {
 			return err
 		}
+		// A full PollOnce may mutate the shared checkout (merge retries, task
+		// reconciles), so it needs BOTH the checkout lock (excludes the tick, and
+		// — because dispatch happens under that lock — excludes NEW jobs starting
+		// mid-poll) AND an idle tracker (excludes already in-flight jobs, which
+		// the tick no longer holds the lock for while they run, #562). Otherwise
+		// fall back to the recovery-command-only poll, exactly as before.
+		polledFull := false
 		if checkoutLock.TryLock() {
-			_ = runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollOnce)
+			if !tracker.busy(d.Repo.FullName()) {
+				_ = runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollOnce)
+				polledFull = true
+			}
 			checkoutLock.Unlock()
-		} else {
+		}
+		if !polledFull {
 			_ = runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollRecoveryCommandsOnce)
 		}
 		if heartbeatPathsErr == nil {
@@ -1818,6 +1834,31 @@ func runOneHeartbeat(ctx context.Context, store *db.Store, enqueue heartbeatEnqu
 	return enqueueErr
 }
 
+// startSingleRepoWorkerLoop wires the single-repo supervisor's per-tick worker
+// closure — the checkout-lock discipline, the warm-reloadable worker/scheduler
+// snapshot (#577), and the tracked worker tick (#562) — and starts it on the
+// recovering loop. It is the ONE production wiring runSingleRepoSupervisor
+// uses; the #562 wedge E2E drives this exact function so the tested loop can
+// never drift from the deployed one.
+func startSingleRepoWorkerLoop(ctx context.Context, interval time.Duration, store *db.Store, worker jobWorker, live *daemonReloadableConfig, checkoutLock *sync.Mutex, tracker *inflightJobTracker, repo string, rootFilter string, stdout io.Writer) <-chan error {
+	return startSupervisorWorkerLoopRecovering(ctx, interval, stdout, func(now time.Time) error {
+		// The checkout lock now guards the TICK (maintenance + claim/dispatch),
+		// not whole job runs: dispatched jobs execute on their own goroutines
+		// after this returns, tracked by the in-flight tracker (#562). Holding it
+		// across dispatch is still what makes the poller's full-PollOnce gate
+		// race-free (no new checkout-occupying job can start mid-poll).
+		checkoutLock.Lock()
+		defer checkoutLock.Unlock()
+		// Read the warm-reloadable worker count + scheduler mode each tick (#577);
+		// the worker is copied per tick so UsePool is race-free with the SIGHUP
+		// reload goroutine.
+		_, workers, usePool := live.snapshot()
+		w := worker
+		w.UsePool = usePool
+		return runDaemonWorkerTickTracked(ctx, store, w, workers, false, repo, rootFilter, stdout, now, tracker)
+	})
+}
+
 func startSupervisorWorkerLoop(ctx context.Context, interval time.Duration, run func(time.Time) error) <-chan error {
 	return startSupervisorWorkerLoopInternal(ctx, interval, nil, run, false)
 }
@@ -2022,8 +2063,14 @@ type registeredRepoPoller struct {
 	EscalationTTL          time.Duration
 	RevertDetectionEnabled bool
 	CheckoutLocks          *repoCheckoutLocks
-	GitHubClient           func(checkout string) github.Client
-	WorkflowFactory        func(store *db.Store, gh github.Client, checkout string) *workflow.Engine
+	// Inflight is the supervisor's in-flight job tracker (#562). A repo with
+	// dispatched jobs still running gets the recovery-command-only poll: a full
+	// PollOnce may mutate the shared checkout, which used to be excluded by the
+	// per-repo lock being held for entire job runs. nil (legacy/test callers)
+	// behaves as always-idle.
+	Inflight        *inflightJobTracker
+	GitHubClient    func(checkout string) github.Client
+	WorkflowFactory func(store *db.Store, gh github.Client, checkout string) *workflow.Engine
 }
 
 // defaultRegisteredRepoPoller wires the registered-repo supervisor's per-tick
@@ -2169,6 +2216,15 @@ func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, 
 		} else {
 			recoveryOnly = true
 		}
+	}
+	// In-flight gate (#562): jobs no longer run under the per-repo lock, so a
+	// held lock alone can't prove the checkout is quiet. While this repo has
+	// dispatched jobs still running, degrade to the recovery-only poll — the
+	// same exclusion inline execution used to give. Checked AFTER TryLock: new
+	// checkout-occupying jobs dispatch only under the lock we now hold, so an
+	// idle verdict cannot be raced by a fresh dispatch mid-poll.
+	if p.Inflight.busy(repoRecord.FullName()) {
+		recoveryOnly = true
 	}
 	d := daemon.Daemon{
 		Repo:                   repo,
@@ -2396,6 +2452,17 @@ func recoverRunningJobs(ctx context.Context, store *db.Store, stdout io.Writer) 
 }
 
 func recoverExpiredRuntimeSessionLocks(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time) error {
+	return recoverExpiredRuntimeSessionLocksSkipping(ctx, store, stdout, now, nil)
+}
+
+// recoverExpiredRuntimeSessionLocksSkipping is recoverExpiredRuntimeSessionLocks
+// with an in-flight owner exclusion (#562): a lock whose owner job is currently
+// being run BY THIS PROCESS is neither requeued nor reaped even if its lease has
+// expired — the owning goroutine is still alive (a ctx-deaf runtime overrunning
+// its timeout), and releasing its lock would let a second run of the same
+// session start beside it (the #536 hazard). A nil skip set is byte-identical
+// to the unskipped recovery.
+func recoverExpiredRuntimeSessionLocksSkipping(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time, skipOwners map[string]bool) error {
 	expiredRuntimeLocks, err := store.ListExpiredRuntimeSessionLocks(ctx, now)
 	if err != nil {
 		return err
@@ -2410,7 +2477,7 @@ func recoverExpiredRuntimeSessionLocks(ctx context.Context, store *db.Store, std
 	// (which would strand those owners as 'running' until the coarse 30m window).
 	// TransitionJobStateWithEvent is a no-op unless the owner is still 'running'.
 	for _, lock := range expiredRuntimeLocks {
-		if strings.TrimSpace(lock.OwnerJobID) == "" {
+		if strings.TrimSpace(lock.OwnerJobID) == "" || skipOwners[lock.OwnerJobID] {
 			continue
 		}
 		recovered, err := store.TransitionJobStateWithEvent(ctx, lock.OwnerJobID, string(workflow.JobRunning), string(workflow.JobQueued), db.JobEvent{
@@ -2425,7 +2492,7 @@ func recoverExpiredRuntimeSessionLocks(ctx context.Context, store *db.Store, std
 			writeLine(stdout, "requeued running job %s after runtime session lock expired", lock.OwnerJobID)
 		}
 	}
-	deleted, err := store.DeleteExpiredResourceLocks(ctx, now)
+	deleted, err := store.DeleteExpiredResourceLocksExcludingOwners(ctx, now, sortedStringSetKeys(skipOwners))
 	if err != nil {
 		return err
 	}
@@ -2490,11 +2557,24 @@ func recoverCancelledRunningJobsForRepo(ctx context.Context, store *db.Store, st
 }
 
 func recoverRunningJobsBeforeForRepo(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time, before time.Time, repoFilter string, rootFilter string) error {
+	return recoverRunningJobsBeforeForRepoSkipping(ctx, store, stdout, now, before, repoFilter, rootFilter, nil)
+}
+
+// recoverRunningJobsBeforeForRepoSkipping is recoverRunningJobsBeforeForRepo
+// with an in-flight exclusion (#562): a job THIS process is currently running is
+// never treated as crashed-stale, even past the coarse 30m backstop with no
+// runtime lease (e.g. a long shell-runtime job holds no lease at all). Inline
+// execution used to guarantee this by never scanning while a job ran; the async
+// dispatcher must guarantee it explicitly. A nil skip set is byte-identical.
+func recoverRunningJobsBeforeForRepoSkipping(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time, before time.Time, repoFilter string, rootFilter string, skipJobs map[string]bool) error {
 	jobs, err := store.ListRunningJobsUpdatedBefore(ctx, before)
 	if err != nil {
 		return err
 	}
 	for _, job := range jobs {
+		if skipJobs[job.ID] {
+			continue
+		}
 		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
 			continue
 		}
@@ -2637,23 +2717,46 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 }
 
 func runDaemonWorkerTick(ctx context.Context, store *db.Store, worker jobWorker, workers int, dryRun bool, repoFilter string, rootFilter string, stdout io.Writer, now time.Time) error {
+	return runDaemonWorkerTickTracked(ctx, store, worker, workers, dryRun, repoFilter, rootFilter, stdout, now, nil)
+}
+
+// runDaemonWorkerTickTracked is the per-tick worker pass. With a nil tracker it
+// is byte-identical to the historical runDaemonWorkerTick: maintenance scans,
+// then a BLOCKING runQueuedJobsForRepo dispatch. The supervisors pass a live
+// tracker (#562), which changes the tick to claim-and-dispatch-async:
+//
+//   - recovery scans skip jobs THIS process is running (an in-flight >30m job
+//     with no runtime lease — e.g. a shell-runtime job — must not be requeued
+//     out from under its own live worker by its own daemon's tick);
+//   - the expired runtime-lock reaper likewise skips locks owned by in-flight
+//     jobs (their goroutine is alive; releasing the lock could double-run the
+//     session);
+//   - checkout-mutating maintenance (advancement retries, delegation worktree
+//     reclaims, comment retries) runs only on an IDLE tick — the same cadence
+//     inline execution used to allow, made explicit — so it never mutates the
+//     checkout under a running job;
+//   - dispatch goes through dispatchQueuedJobsTracked, which returns promptly.
+func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker jobWorker, workers int, dryRun bool, repoFilter string, rootFilter string, stdout io.Writer, now time.Time, tracker *inflightJobTracker) error {
 	if dryRun {
 		return nil
 	}
-	if err := recoverRunningJobsBeforeForRepo(ctx, store, stdout, now, now.Add(-configuredDaemonRunningJobStaleAfter(stdout)), repoFilter, rootFilter); err != nil {
+	inflightIDs := tracker.inflightIDs()
+	if err := recoverRunningJobsBeforeForRepoSkipping(ctx, store, stdout, now, now.Add(-configuredDaemonRunningJobStaleAfter(stdout)), repoFilter, rootFilter, inflightIDs); err != nil {
 		return err
 	}
-	if err := recoverExpiredRuntimeSessionLocks(ctx, store, stdout, now); err != nil {
+	if err := recoverExpiredRuntimeSessionLocksSkipping(ctx, store, stdout, now, inflightIDs); err != nil {
 		return err
 	}
-	if err := retryPendingJobAdvancements(ctx, worker, repoFilter, rootFilter); err != nil {
-		return err
-	}
-	if err := reclaimSkippedDelegationWorktrees(ctx, worker, repoFilter, rootFilter); err != nil {
-		return err
-	}
-	if err := retryPendingJobComments(ctx, worker, repoFilter, rootFilter); err != nil {
-		return err
+	if !tracker.busy(repoFilter) {
+		if err := retryPendingJobAdvancements(ctx, worker, repoFilter, rootFilter); err != nil {
+			return err
+		}
+		if err := reclaimSkippedDelegationWorktrees(ctx, worker, repoFilter, rootFilter); err != nil {
+			return err
+		}
+		if err := retryPendingJobComments(ctx, worker, repoFilter, rootFilter); err != nil {
+			return err
+		}
 	}
 	// Per-repo concurrency override (#576): a [repos."owner/repo"] section caps
 	// THIS repo's in-flight concurrency (and may flip its scheduler) without a
@@ -2664,14 +2767,21 @@ func runDaemonWorkerTick(ctx context.Context, store *db.Store, worker jobWorker,
 	// local to this tick's dispatch and never leaks to sibling repos.
 	limit, usePool := worker.resolveRepoScheduler(repoFilter, workers)
 	worker.UsePool = usePool
-	return runQueuedJobsForRepo(ctx, worker, limit, repoFilter, rootFilter)
+	if tracker == nil {
+		return runQueuedJobsForRepo(ctx, worker, limit, repoFilter, rootFilter)
+	}
+	return dispatchQueuedJobsTracked(ctx, worker, limit, repoFilter, rootFilter, tracker)
 }
 
 func runEnabledRepoWorkerTicks(ctx context.Context, store *db.Store, worker jobWorker, workers int, stdout io.Writer, now time.Time) error {
-	return runEnabledRepoWorkerTicksWithLocks(ctx, store, worker, workers, "", stdout, now, nil)
+	return runEnabledRepoWorkerTicksTracked(ctx, store, worker, workers, "", stdout, now, nil, nil)
 }
 
 func runEnabledRepoWorkerTicksWithLocks(ctx context.Context, store *db.Store, worker jobWorker, workers int, rootFilter string, stdout io.Writer, now time.Time, locks *repoCheckoutLocks) error {
+	return runEnabledRepoWorkerTicksTracked(ctx, store, worker, workers, rootFilter, stdout, now, locks, nil)
+}
+
+func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, worker jobWorker, workers int, rootFilter string, stdout io.Writer, now time.Time, locks *repoCheckoutLocks, tracker *inflightJobTracker) error {
 	repos, err := store.ListRepos(ctx)
 	if err != nil {
 		return err
@@ -2697,7 +2807,7 @@ func runEnabledRepoWorkerTicksWithLocks(ctx context.Context, store *db.Store, wo
 		if lock != nil {
 			lock.Lock()
 		}
-		tickErr := runDaemonWorkerTick(ctx, store, worker, workers, false, repo.FullName(), rootFilter, stdout, now)
+		tickErr := runDaemonWorkerTickTracked(ctx, store, worker, workers, false, repo.FullName(), rootFilter, stdout, now, tracker)
 		if lock != nil {
 			lock.Unlock()
 		}
@@ -3018,6 +3128,17 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 // dispatcher goroutine; worker goroutines communicate only via the done channel,
 // so no lock is required.
 func runQueuedJobsForRepoPool(ctx context.Context, worker jobWorker, limit int, repoFilter string, rootFilter string) error {
+	return runQueuedJobsForRepoPoolTracked(ctx, worker, limit, repoFilter, rootFilter, nil)
+}
+
+// runQueuedJobsForRepoPoolTracked is the pool pass with the supervisor's
+// in-flight tracker mirrored in (#562): each dispatched job is registered so the
+// poller/maintenance gates and the shutdown drain see pool work, the tracker's
+// keys are unioned into the selection seeds so a pool pass never dispatches
+// beside a tracked non-pool job holding the same checkout/runtime key (a warm
+// scheduler flip mid-run), and jobs already in flight are filtered out. A nil
+// tracker is byte-identical to the historical pool.
+func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limit int, repoFilter string, rootFilter string, tracker *inflightJobTracker) error {
 	if limit <= 0 {
 		return nil
 	}
@@ -3045,6 +3166,7 @@ func runQueuedJobsForRepoPool(ctx context.Context, worker jobWorker, limit int, 
 		if f.runtimeKey != "" {
 			delete(inflightRuntimes, f.runtimeKey)
 		}
+		tracker.end(f.jobID)
 		// Release the host-global admission reservation (#365) keyed by job ID,
 		// alongside the checkout/runtime release. Release is idempotent and a nil
 		// budget is a no-op, so this is safe on every reap path incl. panic
@@ -3088,7 +3210,26 @@ func runQueuedJobsForRepoPool(ctx context.Context, worker jobWorker, limit int, 
 			if err != nil {
 				firstErr = err
 			} else if slots := limit - running; slots > 0 {
-				queued, remaining := selectRunnableQueuedJobsSeeded(ctx, worker.Store, pending, slots, policy, inflightCheckouts, inflightRuntimes)
+				// Union in the supervisor tracker's in-flight keys (#562): a tracked
+				// non-pool job (e.g. dispatched before a warm scheduler flip) must
+				// block same-key pool dispatch exactly like a pool-local one. Jobs
+				// already in flight anywhere in this process are filtered by ID.
+				// The union is a fresh per-pass COPY: the pool's own maps stay
+				// reap-owned, so a foreign key never lingers after its job ends.
+				seedCheckouts, seedRuntimes := inflightCheckouts, inflightRuntimes
+				if tracker != nil {
+					trackerCheckouts, trackerRuntimes := tracker.seeds()
+					eligible := pending[:0]
+					for _, job := range pending {
+						if !tracker.inflightJob(job.ID) {
+							eligible = append(eligible, job)
+						}
+					}
+					pending = eligible
+					seedCheckouts = unionStringSets(inflightCheckouts, trackerCheckouts)
+					seedRuntimes = unionStringSets(inflightRuntimes, trackerRuntimes)
+				}
+				queued, remaining := selectRunnableQueuedJobsSeeded(ctx, worker.Store, pending, slots, policy, seedCheckouts, seedRuntimes)
 				for _, job := range queued {
 					job := job
 					// Host-global admission gate (#365): reserve a session slot + RAM
@@ -3097,10 +3238,17 @@ func runQueuedJobsForRepoPool(ctx context.Context, worker jobWorker, limit int, 
 					// pool re-queries on the next pass once a reap frees a slot — never
 					// failed/dropped. A nil budget always admits ⇒ byte-identical default.
 					if !worker.Admission.Reserve(job.ID, func() admissionEstimate { return worker.admissionEstimate(ctx, job) }) {
+						if tracker != nil {
+							warnJobHeldBack(worker.Stdout, job.ID, admissionSkipReason(worker.Admission, worker.admissionEstimate(ctx, job)))
+						}
 						continue
 					}
 					checkoutKey := queuedJobCheckoutKey(ctx, worker.Store, job)
 					runtimeKey := queuedJobRuntimeResourceKey(ctx, worker.Store, job)
+					if !tracker.begin(job.ID, repoFilter, checkoutKey, runtimeKey) {
+						worker.Admission.Release(job.ID)
+						continue
+					}
 					inflightCheckouts[checkoutKey] = true
 					if runtimeKey != "" {
 						inflightRuntimes[runtimeKey] = true
@@ -3124,21 +3272,29 @@ func runQueuedJobsForRepoPool(ctx context.Context, worker jobWorker, limit int, 
 					if perr != nil || !poolIsolationEligible(job, payload) {
 						continue
 					}
-					if queuedJobCheckoutKey(ctx, worker.Store, job) != "repo:"+payload.Repo || !inflightCheckouts["repo:"+payload.Repo] {
+					if queuedJobCheckoutKey(ctx, worker.Store, job) != "repo:"+payload.Repo || !seedCheckouts["repo:"+payload.Repo] {
 						continue // not blocked by a contended same-repo checkout
 					}
 					runtimeKey := queuedJobRuntimeResourceKey(ctx, worker.Store, job)
-					if runtimeKey != "" && (inflightRuntimes[runtimeKey] || runtimeResourceLocked(ctx, worker.Store, runtimeKey)) {
+					if runtimeKey != "" && (seedRuntimes[runtimeKey] || runtimeResourceLocked(ctx, worker.Store, runtimeKey)) {
 						continue // also runtime-contended; leave it to the runtime/temp-worker path
 					}
 					// Host-global admission gate (#365): reserve before creating the
 					// isolation worktree so a deferred job leaves no orphan worktree behind.
 					if !worker.Admission.Reserve(job.ID, func() admissionEstimate { return worker.admissionEstimate(ctx, job) }) {
+						if tracker != nil {
+							warnJobHeldBack(worker.Stdout, job.ID, admissionSkipReason(worker.Admission, worker.admissionEstimate(ctx, job)))
+						}
 						continue
 					}
 					iso, ok := worker.allocatePoolIsolationWorktree(ctx, job, payload)
 					if !ok {
 						worker.Admission.Release(job.ID)
+						continue
+					}
+					if !tracker.begin(iso.job.ID, repoFilter, iso.checkoutKey, iso.runtimeKey) {
+						worker.Admission.Release(iso.job.ID)
+						_ = gitutil.Client{Dir: iso.repoCheckout}.RemoveWorktreeForce(context.WithoutCancel(ctx), iso.worktreePath)
 						continue
 					}
 					inflightCheckouts[iso.checkoutKey] = true
