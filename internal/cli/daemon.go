@@ -293,6 +293,24 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	if code := guardDaemonRunSingleton(*home, stderr); code != 0 {
 		return code
 	}
+	// Test seam (#556): deterministically widen the window between the liveness
+	// guard above and the flock/self-registration below so the singleton E2E can
+	// observe the simultaneous-launch TOCTOU. No-op outside tests (env unset).
+	daemonRunWidenGuardWindow()
+
+	// Airtight singleton backstop (#556). The liveness guard above is friendly
+	// diagnostics but racy: two `daemon run` launched simultaneously on a clean
+	// home can BOTH pass it before either self-registers. flock(LOCK_EX|LOCK_NB)
+	// on a dedicated lockfile is atomic in the kernel — exactly one process ever
+	// holds it — and the fd stays open for the process lifetime, so the kernel
+	// releases the lock on ANY death (SIGKILL included): no stale-lock lockout,
+	// no unlink dance. The loser exits with the same "daemon already running"
+	// UX as the guard.
+	releaseDaemonRunLock, lockCode := acquireDaemonRunLock(*home, stderr)
+	if lockCode != 0 {
+		return lockCode
+	}
+	defer releaseDaemonRunLock()
 
 	// Seed the persisted runtime-auth file from THIS process's inherited
 	// environment (#578). `daemon start` persists before spawning the child, but
@@ -1155,6 +1173,87 @@ func guardDaemonRunSingleton(home string, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// daemonRunLockPath is the flock target for the daemon-run singleton backstop
+// (#556): a dedicated sibling file under the resolved daemon home. Deliberately
+// NOT gitmoot.db itself — SQLite manages its own fcntl/WAL locking on the
+// database file and an unrelated flock there is asking for interference.
+func daemonRunLockPath(paths config.Paths) string {
+	return filepath.Join(paths.Home, "daemon.lock")
+}
+
+// daemonRunWidenGuardWindowEnv, when set to a positive Go duration, makes
+// `daemon run` sleep between passing the liveness guard and taking the flock /
+// self-registering. Test-only seam (#556): the guard→register TOCTOU window is
+// normally microseconds, so the singleton E2E widens it deterministically to
+// prove the flock backstop (and to fail loudly if the flock is ever removed).
+const daemonRunWidenGuardWindowEnv = "GITMOOT_TEST_WIDEN_DAEMON_RUN_GUARD_WINDOW"
+
+func daemonRunWidenGuardWindow() {
+	raw := os.Getenv(daemonRunWidenGuardWindowEnv)
+	if raw == "" {
+		return
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+		time.Sleep(d)
+	}
+}
+
+// acquireDaemonRunLock closes the residual #550 TOCTOU (#556): two `daemon run`
+// launched simultaneously on a clean home can both pass guardDaemonRunSingleton
+// before either self-registers. flock(LOCK_EX|LOCK_NB) on <home>/daemon.lock is
+// atomic, so exactly one acquires; the loser refuses with the guard's "daemon
+// already running" UX. The winner keeps the fd open for its whole lifetime (the
+// returned release closes it on clean shutdown) and the kernel drops the lock on
+// ANY process death — SIGKILL included — so a stale lockfile can never lock a
+// fresh daemon out, and no unlink is ever needed (flock on an existing file just
+// works). The lockfile's pid content is best-effort diagnostics only; the LOCK
+// is what is authoritative.
+func acquireDaemonRunLock(home string, stderr io.Writer) (release func(), code int) {
+	paths, err := initializedPaths(home)
+	if err != nil {
+		fmt.Fprintf(stderr, "daemon run: %v\n", err)
+		return nil, 1
+	}
+	lockPath := daemonRunLockPath(paths)
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		fmt.Fprintf(stderr, "daemon run: open daemon lock: %v\n", err)
+		return nil, 1
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		holder := daemonRunLockHolder(f)
+		_ = f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			fmt.Fprintf(stderr, "daemon already running%s (%s is flock-held by another daemon run)\n", holder, lockPath)
+			return nil, 1
+		}
+		fmt.Fprintf(stderr, "daemon run: lock %s: %v\n", lockPath, err)
+		return nil, 1
+	}
+	// Record the holder's pid for the loser's message. Best-effort: a loser can
+	// race this write (empty read) or see a SIGKILLed predecessor's pid; either
+	// way only the diagnostic suffix degrades, never the mutual exclusion.
+	_ = f.Truncate(0)
+	_, _ = f.WriteAt([]byte(strconv.Itoa(os.Getpid())+"\n"), 0)
+	return func() { _ = f.Close() }, 0
+}
+
+// daemonRunLockHolder reads the pid the current lock holder recorded in the
+// lockfile, returning a " with pid N" suffix for the refusal message, or "" when
+// the content is absent/unreadable (best-effort diagnostics only).
+func daemonRunLockHolder(f *os.File) string {
+	buf := make([]byte, 32)
+	n, _ := f.ReadAt(buf, 0)
+	if n <= 0 {
+		return ""
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(buf[:n])))
+	if err != nil || pid <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" with pid %d", pid)
 }
 
 func currentDaemonPID(state daemonState) (pid int, stale bool, err error) {
