@@ -276,6 +276,12 @@ func buildDashboardNode(job db.Job, payload workflow.JobPayload, events []db.Job
 	if payload.PullRequest > 0 && strings.TrimSpace(payload.Repo) != "" {
 		node.PRURL = fmt.Sprintf("https://github.com/%s/pull/%d", payload.Repo, payload.PullRequest)
 	}
+	node.Prompt = strings.TrimSpace(payload.Instructions)
+	if payload.Result != nil && strings.TrimSpace(payload.Result.Summary) != "" {
+		node.Output = strings.TrimSpace(payload.Result.Summary)
+	} else if len(payload.RawOutputs) > 0 {
+		node.Output = strings.TrimSpace(payload.RawOutputs[len(payload.RawOutputs)-1])
+	}
 	if t := parseJobTimeMillis(job.UpdatedAt); t > 0 && isTerminalJobState(job.State) {
 		node.EndedAt = t
 	}
