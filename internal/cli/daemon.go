@@ -125,9 +125,23 @@ func runDaemonStartWithWorkDirRestart(args []string, workDir string, restart boo
 		}
 	}
 
-	warnIfDaemonStartLosesClaudeAuth(stderr, restart, priorDaemonHadClaudeAuth)
+	// Persist the runtime auth token present in this environment, and recover any
+	// the launching shell LACKS from the owner-only daemon-runtime.env, so a
+	// restart can't silently drop Claude auth (#578 — the #559 root cause; #581
+	// only warns). recoveredEnv is injected into the child so a restart from a
+	// token-less shell keeps auth automatically; when we recover it we suppress the
+	// #581 warning (there is no drop) and note the recovery instead.
+	if err := persistDaemonRuntimeAuth(paths.Home, claudeAuthEnvLookup); err != nil {
+		fmt.Fprintf(stderr, "daemon start: warning: could not persist runtime auth: %v\n", err)
+	}
+	recoveredEnv := recoverDaemonChildAuthEnv(paths.Home, claudeAuthEnvLookup)
+	if len(recoveredEnv) > 0 {
+		writeLine(stdout, "recovered persisted runtime auth from %s (launching env lacked it)", daemonRuntimeAuthFileName)
+	} else {
+		warnIfDaemonStartLosesClaudeAuth(stderr, restart, priorDaemonHadClaudeAuth)
+	}
 
-	started, err := startDaemonChildFn(cfg.Home, cfg.Poll.String(), cfg.Workers, cfg.WatchSkillOptReviews, cfg.WatchIssues, cfg.Scheduler, cfg.RepoFlag, cfg.Session, state, resolvedWorkDir)
+	started, err := startDaemonChildFn(cfg.Home, cfg.Poll.String(), cfg.Workers, cfg.WatchSkillOptReviews, cfg.WatchIssues, cfg.Scheduler, cfg.RepoFlag, cfg.Session, state, resolvedWorkDir, recoveredEnv)
 	if err != nil {
 		fmt.Fprintf(stderr, "daemon start: %v\n", err)
 		return 1
@@ -256,6 +270,20 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	// self-registration so a refused run never touches the existing daemon's state.
 	if code := guardDaemonRunSingleton(*home, stderr); code != 0 {
 		return code
+	}
+
+	// Seed the persisted runtime-auth file from THIS process's inherited
+	// environment (#578). `daemon start` persists before spawning the child, but
+	// the production, systemd-managed daemon is launched DIRECTLY via `daemon run`
+	// (the unit's ExecStart, token from EnvironmentFile) and never goes through
+	// that path — so without this the file is never seeded in the primary
+	// deployment and the #559 recovery could not trigger there. Best-effort: a
+	// persist failure never blocks the daemon, and the token value never touches
+	// stdout/stderr (only the env-var name and file name are ever named).
+	if paths, err := initializedPaths(*home); err == nil {
+		if perr := persistDaemonRuntimeAuth(paths.Home, claudeAuthEnvLookup); perr != nil {
+			fmt.Fprintf(stderr, "daemon run: warning: could not persist runtime auth: %v\n", perr)
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -1073,7 +1101,7 @@ func currentDaemonPID(state daemonState) (pid int, stale bool, err error) {
 	return pid, false, nil
 }
 
-func startDaemonChild(home string, poll string, workers int, watchSkillOptReviews bool, watchIssues bool, scheduler string, repo string, session string, state daemonState, workDir string) (daemonMeta, error) {
+func startDaemonChild(home string, poll string, workers int, watchSkillOptReviews bool, watchIssues bool, scheduler string, repo string, session string, state daemonState, workDir string, extraEnv []string) (daemonMeta, error) {
 	executable, err := os.Executable()
 	if err != nil {
 		return daemonMeta{}, err
@@ -1088,6 +1116,14 @@ func startDaemonChild(home string, poll string, workers int, watchSkillOptReview
 	cmd.Dir = workDir
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+	// By default the child inherits THIS process's environment (cmd.Env unset).
+	// When extraEnv carries runtime auth recovered from the persisted 0600 file
+	// (#578), start from the current environ and append it so the restarted daemon
+	// keeps auth even though the launching shell lacked the token. The token is
+	// never written to args/meta/log — only to the child's live environment.
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		return daemonMeta{}, err
