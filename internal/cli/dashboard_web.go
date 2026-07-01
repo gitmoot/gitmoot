@@ -401,8 +401,13 @@ func summarizeRuns(jobs []db.Job) []dashboard.RunSummary {
 		a := byRoot[root]
 		payload, _ := workflow.ParseJobPayload(a.root.Payload)
 		nodeCount := len(a.states)
+		// An orchestration is a genuine delegation tree: a coordinator delegated to
+		// children, so some job sits below the root (DelegationDepth > 0). Native
+		// review-fanout jobs and ask continuations share the root but add no
+		// delegation depth, so counting nodes alone would mislabel a one-shot
+		// implement/ask (which spawns review jobs) as an orchestration.
 		significance := "one-shot"
-		if nodeCount > 1 {
+		if a.maxDepth > 0 {
 			significance = "orchestration"
 		}
 		kind, agent := parseRunKindAgent(root, a.root)
@@ -671,9 +676,16 @@ func firstInstructionLine(instructions string) string {
 // is a 12+ hex suffix; the agent segment may itself contain hyphens). IDs that
 // don't fit that shape (e.g. task-rooted runs) fall back to the root job's Type
 // and Agent columns.
+// knownRunKinds is the set of single-token run entrypoints the id parser trusts
+// as parts[1]. Multi-token internal actions (e.g. "skillopt-train-candidate-
+// review") are deliberately absent, so their ids fall through to the root job's
+// Type/Agent columns instead of being mis-split (kind="skillopt", agent absorbs
+// the rest).
+var knownRunKinds = map[string]bool{"ask": true, "review": true, "implement": true, "orchestrate": true, "goal": true}
+
 func parseRunKindAgent(rootID string, root db.Job) (kind, agent string) {
 	parts := strings.Split(strings.TrimSpace(rootID), "-")
-	if len(parts) >= 4 && (parts[0] == "local" || parts[0] == "gh") && isHexHash(parts[len(parts)-1]) {
+	if len(parts) >= 4 && (parts[0] == "local" || parts[0] == "gh") && isHexHash(parts[len(parts)-1]) && knownRunKinds[parts[1]] {
 		kind = parts[1]
 		agent = strings.Join(parts[2:len(parts)-1], "-")
 	}

@@ -362,6 +362,9 @@ func TestParseRunKindAgent(t *testing.T) {
 		// no hash suffix / not the local-<kind>-<agent>-<hash> shape => fall back to
 		// the root job's Type + Agent columns.
 		{"task-294-presence-docs", db.Job{Type: "Coordination", Agent: "presence-docs"}, "coordination", "presence-docs"},
+		// a multi-token internal action (parts[1] not a known kind) must NOT be
+		// mis-split into kind/agent; it falls back to the root Type/Agent columns.
+		{"local-skillopt-train-candidate-review-sess-abcdef123456", db.Job{Type: "Train", Agent: "skillopt-worker"}, "train", "skillopt-worker"},
 	}
 	for _, c := range cases {
 		gotKind, gotAgent := parseRunKindAgent(c.rootID, c.root)
