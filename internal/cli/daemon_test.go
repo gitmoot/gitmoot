@@ -5714,31 +5714,36 @@ func writeRepoConcurrencyConfigHome(t *testing.T, body string) string {
 
 // runRepoConcurrencyTickPeak drives the REAL per-repo run path
 // (runDaemonWorkerTick -> resolveRepoScheduler -> runQueuedJobsForRepo) for one
-// repo and returns the observed peak concurrent deliveries. The two seeded jobs
-// carry DISTINCT worktree paths, so their checkout keys differ and nothing but
-// the scheduler's concurrency limit can serialize them — which is exactly what a
-// [repos."owner/repo"] max_parallel override changes.
-func runRepoConcurrencyTickPeak(t *testing.T, configHome string, repo string) int {
+// repo and returns the observed peak concurrent deliveries. It seeds `jobs`
+// parallelizable queued jobs (each with a DISTINCT worktree path, so their
+// checkout keys differ and nothing but the scheduler's concurrency limit can
+// serialize them) and runs the global pool at globalWorkers — which is exactly
+// what a [repos."owner/repo"] max_parallel override overrides per repo.
+func runRepoConcurrencyTickPeak(t *testing.T, configHome, repo string, jobs, globalWorkers int) int {
 	t.Helper()
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	seedDaemonWorkerRepo(t, store, repo, t.TempDir())
 	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, repo)
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-1", Agent: "audit", Action: "ask", Repo: repo, Branch: "main", PullRequest: 1, WorktreePath: filepath.Join(t.TempDir(), "wt-1")})
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-2", Agent: "audit", Action: "ask", Repo: repo, Branch: "main", PullRequest: 2, WorktreePath: filepath.Join(t.TempDir(), "wt-2")})
+	ids := make([]string, 0, jobs)
+	for i := 0; i < jobs; i++ {
+		id := "job-" + strconv.Itoa(i+1)
+		ids = append(ids, id)
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: id, Agent: "audit", Action: "ask", Repo: repo, Branch: "main", PullRequest: i + 1, WorktreePath: filepath.Join(t.TempDir(), "wt-"+id)})
+	}
 
 	tracker := &poolConcurrencyTracker{}
 	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
 	adapter.onDeliver = tracker.span
-	// Global config: pool scheduler, workers=2 (would run both in parallel).
+	// Global config: pool scheduler at globalWorkers (would run all in parallel).
 	worker := poolSchedulerWorker(t, store, adapter, true)
 	worker.ConfigHome = configHome
 	worker.ConfigHomeExplicit = true
 
-	if err := runDaemonWorkerTick(ctx, store, worker, 2, false, repo, "", io.Discard, time.Now().UTC()); err != nil {
+	if err := runDaemonWorkerTick(ctx, store, worker, globalWorkers, false, repo, "", io.Discard, time.Now().UTC()); err != nil {
 		t.Fatalf("runDaemonWorkerTick(%s): %v", repo, err)
 	}
-	for _, id := range []string{"job-1", "job-2"} {
+	for _, id := range ids {
 		job, err := store.GetJob(ctx, id)
 		if err != nil {
 			t.Fatalf("GetJob %s: %v", id, err)
@@ -5753,7 +5758,7 @@ func runRepoConcurrencyTickPeak(t *testing.T, configHome string, repo string) in
 // TestRunDaemonWorkerTickHonorsPerRepoMaxParallel pins the #576 daemon half: a
 // [repos."owner/repo"] max_parallel=1 override caps THAT repo's in-flight
 // concurrency to serial, while a repo with no override is unaffected by the same
-// override file and keeps the global pool/workers=2 parallelism. Same config
+// override file and keeps the global pool/workers parallelism. Same config
 // home, same job shape — the ONLY difference is which repo the section names, so
 // the peak split proves the override is what serializes repo-a.
 func TestRunDaemonWorkerTickHonorsPerRepoMaxParallel(t *testing.T) {
@@ -5761,12 +5766,25 @@ func TestRunDaemonWorkerTickHonorsPerRepoMaxParallel(t *testing.T) {
 [repos."owner/repo-a"]
 max_parallel = 1
 `)
-	if peak := runRepoConcurrencyTickPeak(t, configHome, "owner/repo-a"); peak != 1 {
+	if peak := runRepoConcurrencyTickPeak(t, configHome, "owner/repo-a", 2, 2); peak != 1 {
 		t.Fatalf("owner/repo-a peak concurrency = %d, want 1 (max_parallel=1 must serialize)", peak)
 	}
-	if peak := runRepoConcurrencyTickPeak(t, configHome, "owner/repo-b"); peak != 2 {
+	if peak := runRepoConcurrencyTickPeak(t, configHome, "owner/repo-b", 2, 2); peak != 2 {
 		t.Fatalf("owner/repo-b peak concurrency = %d, want 2 (no override ⇒ global pool/workers=2 unaffected)", peak)
 	}
+	// Wider fan-out (3-way): with workers=3 the capped repo STILL serializes
+	// (peak 1) while an unconfigured repo fans all 3 jobs out at once (peak 3).
+	// The peak-3 leg proves the pool really can parallelize under this exact
+	// on-disk config, so the capped repo's peak 1 is the file override doing its
+	// job — not a pool that simply failed to fan out.
+	t.Run("WiderFanOut", func(t *testing.T) {
+		if peak := runRepoConcurrencyTickPeak(t, configHome, "owner/repo-b", 3, 3); peak != 3 {
+			t.Fatalf("owner/repo-b peak concurrency = %d, want 3 (no override ⇒ global pool/workers=3 must fan out)", peak)
+		}
+		if peak := runRepoConcurrencyTickPeak(t, configHome, "owner/repo-a", 3, 3); peak != 1 {
+			t.Fatalf("owner/repo-a peak concurrency = %d, want 1 (max_parallel=1 caps a 3-way fan-out)", peak)
+		}
+	})
 }
 
 // TestRunDaemonWorkerTickNoRepoConfigIsUnchanged pins behavior preservation
@@ -5774,7 +5792,7 @@ max_parallel = 1
 // global limit exactly as today — the override plumbing is inert when unset.
 func TestRunDaemonWorkerTickNoRepoConfigIsUnchanged(t *testing.T) {
 	configHome := writeRepoConcurrencyConfigHome(t, "")
-	if peak := runRepoConcurrencyTickPeak(t, configHome, "owner/repo-a"); peak != 2 {
+	if peak := runRepoConcurrencyTickPeak(t, configHome, "owner/repo-a", 2, 2); peak != 2 {
 		t.Fatalf("no-config peak concurrency = %d, want 2 (global pool/workers=2 unchanged)", peak)
 	}
 }
