@@ -196,6 +196,53 @@ func TestListIssueCommentsDedupesByID(t *testing.T) {
 	runner.wantArgs(t, 0, "api", "--paginate", "repos/jerryfane/gitmoot/issues/2/comments")
 }
 
+func TestListRepoIssueCommentsPassesSinceAndGroupsByIssue(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{
+			// Single-page (apiPageJSON) repo-wide payload: comments for a plain issue
+			// (#41) AND a PR (#42, every PR is an issue), each carrying issue_url.
+			Stdout: `[
+				{"id": 11, "body": "@a ask on issue", "issue_url": "https://api.github.com/repos/jerryfane/gitmoot/issues/41", "updated_at": "2026-06-27T10:00:00Z", "user": {"login": "alice"}},
+				{"id": 12, "body": "@a ask on PR", "issue_url": "https://api.github.com/repos/jerryfane/gitmoot/issues/42", "updated_at": "2026-06-27T11:00:00Z", "user": {"login": "bob"}},
+				{"id": 11, "body": "duplicate", "issue_url": "https://api.github.com/repos/jerryfane/gitmoot/issues/41", "updated_at": "2026-06-27T10:00:00Z", "user": {"login": "alice"}}
+			]`,
+		}},
+	}
+	client := GhClient{Runner: runner}
+
+	since := time.Date(2026, 6, 27, 9, 30, 0, 0, time.UTC)
+	comments, err := client.ListRepoIssueComments(context.Background(), Repository{Owner: "jerryfane", Name: "gitmoot"}, since)
+	if err != nil {
+		t.Fatalf("ListRepoIssueComments returned error: %v", err)
+	}
+	if len(comments) != 2 {
+		t.Fatalf("comments length = %d, want 2 (deduped by id): %+v", len(comments), comments)
+	}
+	// PR conversation comments are INCLUDED (the @mention command channel).
+	if comments[0].IssueNumber != 41 || comments[1].IssueNumber != 42 {
+		t.Fatalf("IssueNumber not parsed from issue_url: %+v", comments)
+	}
+	if comments[1].Author != "bob" {
+		t.Fatalf("author decode: %+v", comments[1])
+	}
+	// One bounded page (no --paginate), since passthrough as RFC3339, oldest-first.
+	runner.wantArgs(t, 0, "api", "-X", "GET", "repos/jerryfane/gitmoot/issues/comments",
+		"-f", "sort=updated", "-f", "direction=asc", "-f", "per_page=100",
+		"-f", "since=2026-06-27T09:30:00Z")
+}
+
+func TestListRepoIssueCommentsZeroSinceOmitsFilter(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `[]`}}}
+	client := GhClient{Runner: runner}
+
+	if _, err := client.ListRepoIssueComments(context.Background(), Repository{Owner: "jerryfane", Name: "gitmoot"}, time.Time{}); err != nil {
+		t.Fatalf("ListRepoIssueComments returned error: %v", err)
+	}
+	// A zero since omits the since= arg entirely (no whole-history backfill trigger).
+	runner.wantArgs(t, 0, "api", "-X", "GET", "repos/jerryfane/gitmoot/issues/comments",
+		"-f", "sort=updated", "-f", "direction=asc", "-f", "per_page=100")
+}
+
 func TestPostIssueCommentUsesIssueCommentsEndpoint(t *testing.T) {
 	runner := &fakeRunner{
 		results: []subprocess.Result{{

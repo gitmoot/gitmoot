@@ -887,3 +887,14 @@ func (f *fakeFeedbackGitHub) PostIssueComment(_ context.Context, repo github.Rep
 func (f *fakeFeedbackGitHub) ListIssueComments(_ context.Context, _ github.Repository, issueNumber int64) ([]github.IssueComment, error) {
 	return append([]github.IssueComment(nil), f.comments[issueNumber]...), nil
 }
+
+func (f *fakeFeedbackGitHub) ListRepoIssueComments(_ context.Context, _ github.Repository, _ time.Time) ([]github.IssueComment, error) {
+	var out []github.IssueComment
+	for number, list := range f.comments {
+		for _, c := range list {
+			c.IssueNumber = number
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}

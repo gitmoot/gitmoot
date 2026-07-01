@@ -2305,6 +2305,126 @@ func TestPollIssuesOnceRoutesAskAndDedupes(t *testing.T) {
 	}
 }
 
+// TestPollIssuesOnceCollapsesToSingleRepoWideCommentCall is the #566 regression
+// guard: PollIssuesOnce must make ONE repo-wide ListRepoIssueComments call per
+// tick (not N per-issue ListIssueComments calls), group the flat result back by
+// issue number, route each open non-PR issue's comments through the unchanged
+// handleIssueComment path, advance a persisted since cursor, and dedup an
+// already-seen/edited comment on the next tick.
+func TestPollIssuesOnceCollapsesToSingleRepoWideCommentCall(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "researcher",
+		Role:           "researcher",
+		Runtime:        "claude",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"ask"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+
+	now := time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC)
+	client := &fakeGitHub{
+		issues: []github.Issue{
+			{Number: 42, Title: "Question A", State: "open"},
+			{Number: 7, Title: "Question B", State: "open"},
+			// A PR in the issue listing: its comments must be skipped here (owned by
+			// the PR loop), even though the repo-wide endpoint returns them.
+			{Number: 43, Title: "A PR", State: "open", IsPullRequest: true},
+		},
+		repoComments: []github.IssueComment{
+			{ID: 900, IssueNumber: 42, Body: "/gitmoot researcher ask question one", Author: "alice", UpdatedAt: "2026-06-27T12:00:30Z"},
+			{ID: 901, IssueNumber: 7, Body: "/gitmoot researcher ask question two", Author: "alice", UpdatedAt: "2026-06-27T12:00:45Z"},
+			// PR comment (issue 43) and a comment on an unknown/closed issue (99):
+			// both must be skipped by the grouping.
+			{ID: 902, IssueNumber: 43, Body: "/gitmoot researcher ask on a PR", Author: "alice", UpdatedAt: "2026-06-27T12:00:20Z"},
+			{ID: 903, IssueNumber: 99, Body: "/gitmoot researcher ask on unknown", Author: "alice", UpdatedAt: "2026-06-27T12:00:20Z"},
+		},
+	}
+	d := Daemon{Repo: repo, Store: store, GitHub: client, WatchIssues: true, Now: func() time.Time { return now }}
+
+	if err := d.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+
+	// ONE repo-wide comment call, ZERO per-issue comment calls (no open PRs, so the
+	// PR loop makes none either).
+	if client.listRepoCommentsCalls != 1 {
+		t.Fatalf("ListRepoIssueComments calls = %d, want 1 per tick", client.listRepoCommentsCalls)
+	}
+	if client.listIssueCommentsCalls != 0 {
+		t.Fatalf("per-issue ListIssueComments calls = %d, want 0 (collapsed into the repo-wide call)", client.listIssueCommentsCalls)
+	}
+	// since seeded from now minus the skew overlap on the first poll.
+	if len(client.repoCommentsSince) != 1 || !client.repoCommentsSince[0].Equal(now.Add(-issueCommentPollOverlap)) {
+		t.Fatalf("first since = %v, want %v", client.repoCommentsSince, now.Add(-issueCommentPollOverlap))
+	}
+
+	// Grouping/routing: jobs for issue 42 and issue 7; none for the PR or unknown.
+	if _, err := store.GetJob(ctx, issueJobID(repo, 42, 900, 0, "researcher", "ask")); err != nil {
+		t.Fatalf("issue 42 comment was not routed: %v", err)
+	}
+	if _, err := store.GetJob(ctx, issueJobID(repo, 7, 901, 0, "researcher", "ask")); err != nil {
+		t.Fatalf("issue 7 comment was not routed: %v", err)
+	}
+	if _, err := store.GetJob(ctx, issueJobID(repo, 43, 902, 0, "researcher", "ask")); err == nil {
+		t.Fatal("PR comment was routed by the issue watcher; must be skipped")
+	}
+	if _, err := store.GetJob(ctx, issueJobID(repo, 99, 903, 0, "researcher", "ask")); err == nil {
+		t.Fatal("comment on an unknown issue was routed; must be skipped")
+	}
+	if len(client.posted) != 2 {
+		t.Fatalf("acks = %d, want 2 (issues 42 and 7)", len(client.posted))
+	}
+
+	// Cursor advanced to the newest comment updated_at seen (12:00:45).
+	cursor, ok, err := store.GetIssueCommentPollCursor(ctx, repo.FullName())
+	if err != nil || !ok {
+		t.Fatalf("GetIssueCommentPollCursor ok=%v err=%v", ok, err)
+	}
+	wantCursor := time.Date(2026, 6, 27, 12, 0, 45, 0, time.UTC)
+	if !cursor.Equal(wantCursor) {
+		t.Fatalf("cursor = %v, want %v", cursor, wantCursor)
+	}
+
+	// Second poll: an EDITED replay of comment 900 (newer updated_at, so it passes
+	// the since filter) plus a genuinely new comment 904. The edit is already seen
+	// and must be deduped; only 904 routes.
+	client.repoComments = []github.IssueComment{
+		{ID: 900, IssueNumber: 42, Body: "/gitmoot researcher ask question one edited", Author: "alice", UpdatedAt: "2026-06-27T12:01:00Z"},
+		{ID: 904, IssueNumber: 7, Body: "/gitmoot researcher ask question three", Author: "alice", UpdatedAt: "2026-06-27T12:01:10Z"},
+	}
+	if err := d.PollOnce(ctx); err != nil {
+		t.Fatalf("second PollOnce returned error: %v", err)
+	}
+	if client.listRepoCommentsCalls != 2 {
+		t.Fatalf("ListRepoIssueComments calls = %d after 2 ticks, want 2", client.listRepoCommentsCalls)
+	}
+	// Second since = advanced cursor (12:00:45) minus overlap.
+	if !client.repoCommentsSince[1].Equal(wantCursor.Add(-issueCommentPollOverlap)) {
+		t.Fatalf("second since = %v, want %v", client.repoCommentsSince[1], wantCursor.Add(-issueCommentPollOverlap))
+	}
+	// Edited already-seen comment 900 produced no second ack; only 904 did.
+	if len(client.posted) != 3 {
+		t.Fatalf("acks after 2nd poll = %d, want 3 (edited 900 deduped, only 904 new)", len(client.posted))
+	}
+	if _, err := store.GetJob(ctx, issueJobID(repo, 7, 904, 0, "researcher", "ask")); err != nil {
+		t.Fatalf("new comment 904 was not routed: %v", err)
+	}
+	cursor2, _, err := store.GetIssueCommentPollCursor(ctx, repo.FullName())
+	if err != nil {
+		t.Fatalf("GetIssueCommentPollCursor: %v", err)
+	}
+	if !cursor2.Equal(time.Date(2026, 6, 27, 12, 1, 10, 0, time.UTC)) {
+		t.Fatalf("cursor after 2nd poll = %v, want 12:01:10", cursor2)
+	}
+}
+
 func TestPollIssuesOnceIgnoresNonAskAndUnknownAgent(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
@@ -2413,18 +2533,22 @@ func testStore(t *testing.T) *db.Store {
 }
 
 type fakeGitHub struct {
-	pulls                 []github.PullRequest
-	pullsByState          map[string][]github.PullRequest
-	pullsByNumber         map[int64]github.PullRequest
-	issues                []github.Issue
-	comments              map[int64][]github.IssueComment
-	posted                []postedComment
-	permissions           map[string]string
-	postErrs              []error
-	listPullRequestsCalls int
-	listPullRequestsErrs  []error
-	listIssuesCalls       int
-	recentClosedCalls     int
+	pulls                  []github.PullRequest
+	pullsByState           map[string][]github.PullRequest
+	pullsByNumber          map[int64]github.PullRequest
+	issues                 []github.Issue
+	comments               map[int64][]github.IssueComment
+	repoComments           []github.IssueComment
+	repoCommentsSince      []time.Time
+	listRepoCommentsCalls  int
+	listIssueCommentsCalls int
+	posted                 []postedComment
+	permissions            map[string]string
+	postErrs               []error
+	listPullRequestsCalls  int
+	listPullRequestsErrs   []error
+	listIssuesCalls        int
+	recentClosedCalls      int
 }
 
 type postedComment struct {
@@ -2513,7 +2637,44 @@ func (f *fakeGitHub) CloseIssue(context.Context, github.Repository, int64) (gith
 }
 
 func (f *fakeGitHub) ListIssueComments(_ context.Context, _ github.Repository, issueNumber int64) ([]github.IssueComment, error) {
+	f.listIssueCommentsCalls++
 	return append([]github.IssueComment(nil), f.comments[issueNumber]...), nil
+}
+
+// ListRepoIssueComments models the repo-wide comment endpoint (#566). It counts
+// calls (so a test can prove ONE call per repo per tick, not N per-issue) and
+// records the `since` cursor it was handed. Fixtures can be supplied two ways:
+//   - repoComments: an explicit flat list (each carries its own IssueNumber and
+//     UpdatedAt); comments with a parseable UpdatedAt strictly before `since` are
+//     filtered out, mirroring the real endpoint's since= behavior.
+//   - comments map (issue-number keyed): flattened with IssueNumber set to the
+//     key. Map fixtures carry no timestamps, so they are always returned (the
+//     since filter only applies to comments that declare an UpdatedAt).
+func (f *fakeGitHub) ListRepoIssueComments(_ context.Context, _ github.Repository, since time.Time) ([]github.IssueComment, error) {
+	f.listRepoCommentsCalls++
+	f.repoCommentsSince = append(f.repoCommentsSince, since)
+	var out []github.IssueComment
+	appendIfAfter := func(c github.IssueComment) {
+		if !since.IsZero() && strings.TrimSpace(c.UpdatedAt) != "" {
+			if t, err := time.Parse(time.RFC3339, c.UpdatedAt); err == nil && t.Before(since) {
+				return
+			}
+		}
+		out = append(out, c)
+	}
+	if f.repoComments != nil {
+		for _, c := range f.repoComments {
+			appendIfAfter(c)
+		}
+		return out, nil
+	}
+	for number, list := range f.comments {
+		for _, c := range list {
+			c.IssueNumber = number
+			appendIfAfter(c)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeGitHub) PostIssueComment(_ context.Context, _ github.Repository, issueNumber int64, body string) (github.IssueComment, error) {

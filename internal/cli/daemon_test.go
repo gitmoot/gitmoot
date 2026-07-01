@@ -5491,6 +5491,17 @@ func (f *cliPollFakeGitHub) ListIssueComments(_ context.Context, _ github.Reposi
 	return append([]github.IssueComment(nil), f.comments[issueNumber]...), nil
 }
 
+func (f *cliPollFakeGitHub) ListRepoIssueComments(_ context.Context, _ github.Repository, _ time.Time) ([]github.IssueComment, error) {
+	var out []github.IssueComment
+	for number, list := range f.comments {
+		for _, c := range list {
+			c.IssueNumber = number
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
 func (f *cliPollFakeGitHub) PostIssueComment(_ context.Context, _ github.Repository, issueNumber int64, body string) (github.IssueComment, error) {
 	if f.postErr != nil {
 		return github.IssueComment{}, f.postErr

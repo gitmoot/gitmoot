@@ -4750,6 +4750,56 @@ func (s *Store) UpsertHeartbeatState(ctx context.Context, state HeartbeatState) 
 	return err
 }
 
+// GetIssueCommentPollCursor returns the newest issue/PR comment updated_at the
+// --watch-issues poller has persisted for a repo (#566). A missing row is NOT an
+// error: it returns ok=false with a zero time, which the daemon treats as a
+// first-ever poll and seeds a bounded window from `now` (no history backfill).
+func (s *Store) GetIssueCommentPollCursor(ctx context.Context, repoFullName string) (time.Time, bool, error) {
+	repoFullName = strings.TrimSpace(repoFullName)
+	if repoFullName == "" {
+		return time.Time{}, false, errors.New("repo full name is required")
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT last_seen_comment_at FROM issue_comment_poll_state WHERE repo_full_name = ?`, repoFullName)
+	var raw string
+	if err := row.Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return time.Time{}, false, nil
+		}
+		return time.Time{}, false, err
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, false, nil
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		// A malformed persisted cursor is treated as "no cursor" rather than a hard
+		// error so a poison row can't wedge the poller; the next write repairs it.
+		return time.Time{}, false, nil
+	}
+	return parsed, true, nil
+}
+
+// UpsertIssueCommentPollCursor persists the newest observed comment updated_at for
+// a repo (#566). The time is stored as RFC3339Nano UTC text.
+func (s *Store) UpsertIssueCommentPollCursor(ctx context.Context, repoFullName string, lastSeen time.Time) error {
+	repoFullName = strings.TrimSpace(repoFullName)
+	if repoFullName == "" {
+		return errors.New("repo full name is required")
+	}
+	raw := ""
+	if !lastSeen.IsZero() {
+		raw = lastSeen.UTC().Format(time.RFC3339Nano)
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO issue_comment_poll_state(repo_full_name, last_seen_comment_at, updated_at)
+		VALUES (?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(repo_full_name) DO UPDATE SET
+			last_seen_comment_at = excluded.last_seen_comment_at,
+			updated_at = CURRENT_TIMESTAMP`,
+		repoFullName, raw)
+	return err
+}
+
 // CountActiveJobsByFingerprint counts queued/running jobs whose stored payload
 // carries the given fingerprint — the heartbeat overlap guard (#533), a cousin of
 // countActiveJobsTx that filters on the payload fingerprint instead of the agent
@@ -6654,5 +6704,19 @@ CREATE TABLE heartbeat_state (
 	// not scan terminal jobs once per second.
 	`
 CREATE INDEX idx_jobs_running_updated_at ON jobs(updated_at) WHERE state = 'running';
+	`,
+	// #566 --watch-issues bounded polling: one row per repo tracking the newest
+	// issue/PR comment updated_at the issue-comment watcher has observed. The
+	// daemon passes it (minus a small overlap) as the `since` bound to the repo-wide
+	// comment endpoint, collapsing the former O(open-issues) per-issue comment
+	// fan-out into a single since-bounded call per repo per tick. Pure additive
+	// append (CREATE TABLE only); the table stays empty until --watch-issues runs,
+	// so every existing DB reads identically.
+	`
+CREATE TABLE issue_comment_poll_state (
+	repo_full_name TEXT PRIMARY KEY,
+	last_seen_comment_at TEXT NOT NULL DEFAULT '',
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 	`,
 }

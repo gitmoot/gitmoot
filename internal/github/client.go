@@ -38,6 +38,10 @@ type Client interface {
 	CreateIssue(ctx context.Context, input CreateIssueInput) (Issue, error)
 	CloseIssue(ctx context.Context, repo Repository, issueNumber int64) (Issue, error)
 	ListIssueComments(ctx context.Context, repo Repository, issueNumber int64) ([]IssueComment, error)
+	// ListRepoIssueComments returns one bounded page of the repo's issue/PR
+	// conversation comments updated at/after `since` (#566), collapsing the
+	// per-issue comment fan-out into a single repo-wide call.
+	ListRepoIssueComments(ctx context.Context, repo Repository, since time.Time) ([]IssueComment, error)
 	PostIssueComment(ctx context.Context, repo Repository, issueNumber int64, body string) (IssueComment, error)
 	GetUserPermission(ctx context.Context, repo Repository, username string) (UserPermission, error)
 	MergePullRequest(ctx context.Context, input MergePullRequestInput) (MergeResult, error)
@@ -138,6 +142,15 @@ type IssueComment struct {
 	Author    string
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
+	// IssueNumber is the issue/PR number this comment belongs to. The per-issue
+	// endpoint omits it (the caller already knows the number), but the REPO-WIDE
+	// endpoint (GET /repos/{owner}/{repo}/issues/comments, #566) returns comments
+	// for every issue AND PR at once, carrying only an `issue_url`. It is parsed
+	// from that `issue_url` so ListRepoIssueComments callers can group the flat
+	// result back by issue/PR number. It is 0 when the source payload carried no
+	// parseable issue_url (the per-issue endpoint), so existing callers that ignore
+	// it are byte-identical.
+	IssueNumber int64
 }
 
 type UserPermission struct {
@@ -150,6 +163,7 @@ func (c *IssueComment) UnmarshalJSON(data []byte) error {
 		ID        int64  `json:"id"`
 		Body      string `json:"body"`
 		URL       string `json:"html_url"`
+		IssueURL  string `json:"issue_url"`
 		CreatedAt string `json:"created_at"`
 		UpdatedAt string `json:"updated_at"`
 		User      struct {
@@ -166,7 +180,30 @@ func (c *IssueComment) UnmarshalJSON(data []byte) error {
 	c.Author = decoded.User.Login
 	c.CreatedAt = decoded.CreatedAt
 	c.UpdatedAt = decoded.UpdatedAt
+	c.IssueNumber = issueNumberFromURL(decoded.IssueURL)
 	return nil
+}
+
+// issueNumberFromURL extracts the trailing issue/PR number from a GitHub
+// `issue_url` (e.g. https://api.github.com/repos/owner/repo/issues/123 -> 123).
+// It returns 0 for an empty or unparseable URL, which the repo-wide comment
+// grouping treats as "unknown issue" and skips. Every comment (issue OR PR) on
+// the /issues/comments endpoint carries this shape; PR review/diff comments live
+// on a different endpoint and are not returned here.
+func issueNumberFromURL(issueURL string) int64 {
+	issueURL = strings.TrimRight(strings.TrimSpace(issueURL), "/")
+	if issueURL == "" {
+		return 0
+	}
+	idx := strings.LastIndex(issueURL, "/")
+	if idx < 0 || idx == len(issueURL)-1 {
+		return 0
+	}
+	number, err := strconv.ParseInt(issueURL[idx+1:], 10, 64)
+	if err != nil || number <= 0 {
+		return 0
+	}
+	return number
 }
 
 type Issue struct {
@@ -652,6 +689,40 @@ func isPullRequestAlreadyExists(err error) bool {
 
 func (c *GhClient) ListIssueComments(ctx context.Context, repo Repository, issueNumber int64) ([]IssueComment, error) {
 	comments, err := apiPaginatedJSON[IssueComment](ctx, c, endpoint(repo, "issues", issueNumber, "comments"))
+	return dedupeComments(comments), err
+}
+
+// ListRepoIssueComments returns a SINGLE bounded page of the repo's issue/PR
+// conversation comments updated at or after `since` (#566), ordered oldest-first
+// (sort=updated&direction=asc) so the poller always makes forward progress and can
+// advance its `since` cursor to the newest comment it saw.
+//
+// It hits GET /repos/{owner}/{repo}/issues/comments — the REPO-WIDE endpoint that
+// returns comments for EVERY issue AND pull request in one paginated call
+// (excluding only PR review/diff comments, which the @mention command flow does
+// not use). This collapses the daemon's former O(issues) per-issue comment
+// fan-out into ONE gh call per repo per tick. Each returned comment carries its
+// IssueNumber (parsed from `issue_url`) so callers can group the flat result back
+// by issue/PR.
+//
+// BOUNDED COST: like ListRecentClosedPullRequests (#467) it fetches ONE page
+// (apiPageJSON, no --paginate) with per_page=100. With direction=asc a backlog
+// larger than one page is drained across successive ticks as the caller advances
+// `since`, so steady-state polling is a single fixed request rather than
+// re-paginating the repo's entire comment history. A zero `since` omits the
+// filter (the caller seeds a bounded window on first poll, so this is only a
+// safety fallback).
+func (c *GhClient) ListRepoIssueComments(ctx context.Context, repo Repository, since time.Time) ([]IssueComment, error) {
+	args := []string{
+		"-X", "GET", endpoint(repo, "issues", "comments"),
+		"-f", "sort=updated",
+		"-f", "direction=asc",
+		"-f", "per_page=100",
+	}
+	if !since.IsZero() {
+		args = append(args, "-f", "since="+since.UTC().Format(time.RFC3339))
+	}
+	comments, err := apiPageJSON[IssueComment](ctx, c, args...)
 	return dedupeComments(comments), err
 }
 
@@ -1306,6 +1377,10 @@ func (NoopClient) CloseIssue(context.Context, Repository, int64) (Issue, error) 
 }
 
 func (NoopClient) ListIssueComments(context.Context, Repository, int64) ([]IssueComment, error) {
+	return nil, errors.ErrUnsupported
+}
+
+func (NoopClient) ListRepoIssueComments(context.Context, Repository, time.Time) ([]IssueComment, error) {
 	return nil, errors.ErrUnsupported
 }
 

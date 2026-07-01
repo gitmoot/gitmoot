@@ -19,6 +19,13 @@ import (
 
 const defaultPollInterval = 30 * time.Second
 
+// issueCommentPollOverlap is subtracted from the persisted last-seen cursor when
+// computing the `since` bound for the repo-wide issue-comment fetch (#566). It
+// re-fetches a few seconds of boundary comments each tick to absorb local/GitHub
+// clock skew and same-second comments straddling the cursor; the seen_comments
+// dedup makes the replay a no-op.
+const issueCommentPollOverlap = 5 * time.Second
+
 type Daemon struct {
 	Repo         github.Repository
 	PollInterval time.Duration
@@ -26,6 +33,9 @@ type Daemon struct {
 	GitHub       github.Client
 	Workflow     *workflow.Engine
 	Sleep        func(context.Context, time.Duration) error
+	// Now is an injectable clock (test seam). It defaults to time.Now and is used
+	// to seed/advance the #566 issue-comment `since` cursor deterministically.
+	Now func() time.Time
 	// WatchIssues opts in to the issue-comment workflow (#389): when true,
 	// PollOnce also polls open non-PR issues and routes `@<agent> ask …`
 	// comments to jobs. Default false keeps the PR-only behavior unchanged.
@@ -161,12 +171,30 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	return firstErr
 }
 
-// PollIssuesOnce is the opt-in issue-comment workflow (#389). It lists open
-// non-PR issues (PRs are filtered out by github.ListIssues so the PR-watcher is
-// not duplicated) and, for each, routes `@<agent> ask …` comments to jobs via
-// the shared comment->job->reply core. It reuses the seen_comments dedup, the
+// PollIssuesOnce is the opt-in issue-comment workflow (#389, bounded by #566). It
+// lists open non-PR issues (PRs are filtered out by github.ListIssues so the
+// PR-watcher is not duplicated) and routes `@<agent> ask …` comments to jobs via
+// the shared comment->job->reply core, reusing the seen_comments dedup, the
 // authorize-commenter gate, and PostIssueComment exactly like the PR path; an
 // `ask` needs no branch/HeadSHA, so those are left empty.
+//
+// #566 collapses the former O(open-issues) per-issue ListIssueComments fan-out
+// (one full paginated gh call per open issue every tick) into ONE repo-wide
+// ListRepoIssueComments(repo, since) call per tick: it fetches only comments
+// updated since the persisted cursor, groups them back by issue number, and feeds
+// each open non-PR issue's comments through the UNCHANGED handleIssueComment path.
+// The repo-wide endpoint also returns PR conversation comments; those are owned by
+// PollOnce's per-PR loop and are skipped here (their number is not in the open
+// non-PR issue set). NEW-issue enumeration still uses ListIssues, so nothing that
+// depends on issue listing changes — only the comment pagination is collapsed.
+//
+// FIRST-POLL SEMANTICS (intentional #566 difference): with no persisted cursor the
+// `since` window is seeded from `now` (minus the skew overlap), so a fresh watcher
+// does NOT backfill the entire repo's comment history. The prior code paginated
+// every open issue's full comment thread on the first tick (acting only on unseen
+// comments); the new code instead ignores comments older than daemon start. In
+// steady state both behave identically because every processed comment is recorded
+// in seen_comments and the cursor advances monotonically.
 func (d Daemon) PollIssuesOnce(ctx context.Context) error {
 	if err := d.validate(); err != nil {
 		return err
@@ -175,25 +203,82 @@ func (d Daemon) PollIssuesOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var firstErr error
+	// Index open non-PR issues by number so repo-wide comments can be routed back
+	// to their issue (handleIssueComment needs the issue's title). PR comments and
+	// comments on issues not in this set are skipped.
+	openIssues := make(map[int64]github.Issue, len(issues))
 	for _, issue := range issues {
 		if issue.IsPullRequest {
 			continue
 		}
-		comments, err := d.GitHub.ListIssueComments(ctx, d.Repo, issue.Number)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
+		openIssues[issue.Number] = issue
+	}
+
+	// Resolve the `since` bound. base is the prior cursor, or `now` on the first
+	// ever poll (bounded initial fetch — no history backfill). since re-fetches a
+	// small overlap window for clock skew; seen_comments dedups the replay.
+	base, hasCursor, err := d.Store.GetIssueCommentPollCursor(ctx, d.Repo.FullName())
+	if err != nil {
+		return err
+	}
+	if !hasCursor {
+		base = d.now()
+	}
+	since := base.Add(-issueCommentPollOverlap)
+
+	comments, err := d.GitHub.ListRepoIssueComments(ctx, d.Repo, since)
+	if err != nil {
+		return err
+	}
+
+	var firstErr error
+	newCursor := base // monotonic: never regress below the prior cursor / seed
+	for _, comment := range comments {
+		if t, ok := parseCommentUpdatedAt(comment.UpdatedAt); ok && t.After(newCursor) {
+			newCursor = t
+		}
+		issue, ok := openIssues[comment.IssueNumber]
+		if !ok {
+			// PR comment (owned by the PR loop) or a comment on a closed/unknown
+			// issue: not routed here.
 			continue
 		}
-		for _, comment := range comments {
-			if err := d.handleIssueComment(ctx, issue, comment); err != nil && firstErr == nil {
-				firstErr = err
-			}
+		if err := d.handleIssueComment(ctx, issue, comment); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
+
+	// Persist the advanced cursor so the next tick's `since` moves forward. Done
+	// even on an error above so a single bad comment never re-scans the backlog.
+	if err := d.Store.UpsertIssueCommentPollCursor(ctx, d.Repo.FullName(), newCursor); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	return firstErr
+}
+
+// parseCommentUpdatedAt parses a GitHub comment updated_at (RFC3339) timestamp.
+// It returns ok=false for an empty/unparseable value so the cursor simply does
+// not advance on that comment rather than regressing.
+func parseCommentUpdatedAt(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return t, true
+	}
+	if t, err := time.Parse(time.RFC3339, value); err == nil {
+		return t, true
+	}
+	return time.Time{}, false
+}
+
+// now returns the daemon's clock, defaulting to time.Now when unset.
+func (d Daemon) now() time.Time {
+	if d.Now != nil {
+		return d.Now()
+	}
+	return time.Now()
 }
 
 func (d Daemon) PollRecoveryCommandsOnce(ctx context.Context) error {
