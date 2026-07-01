@@ -63,7 +63,7 @@ func printDaemonUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot daemon start [--repo owner/repo] [--poll 30s] [--workers 1 | --parallel N] [--scheduler barrier|pool] [--watch-skillopt-reviews] [--watch-issues]")
 	fmt.Fprintln(w, "  gitmoot daemon run [--repo owner/repo] [--poll 30s] [--workers 1 | --parallel N] [--scheduler barrier|pool] [--watch-skillopt-reviews] [--watch-issues]")
-	fmt.Fprintln(w, "  gitmoot daemon stop")
+	fmt.Fprintln(w, "  gitmoot daemon stop [--forget-runtime-auth]")
 	fmt.Fprintln(w, "  gitmoot daemon restart")
 	fmt.Fprintln(w, "  gitmoot daemon status")
 	fmt.Fprintln(w, "  gitmoot daemon logs")
@@ -127,27 +127,45 @@ func runDaemonStartWithWorkDirRestart(args []string, workDir string, restart boo
 
 	// Persist and recover runtime auth so a `daemon restart` from a shell that no
 	// longer carries the token cannot silently disable Claude auth (#578; #581 only
-	// warns). Persist first (the live env wins) so a start that DOES carry a token
-	// records it 0600; then compute the child-env injection so a start whose shell
-	// LACKS the token but whose 0600 file has one recovers it into the child. Both
-	// steps are best-effort: a persistence/load failure is a masked warning and
-	// never blocks the start, and the token value is never logged.
+	// warns). Persist ALWAYS (start and restart) so a start that DOES carry a token
+	// records it 0600 for a later restart to recover; the live env always wins, so
+	// this never overwrites a good token with an empty env. Both steps are
+	// best-effort: a persistence/load failure is a masked warning and never blocks
+	// the start, and the token value is never logged.
 	runtimeAuthFile := daemonRuntimeAuthFile(paths)
 	if _, err := runtime.PersistRuntimeAuthEnv(runtimeAuthFile, claudeAuthEnvLookup); err != nil {
 		fmt.Fprintf(stderr, "daemon start: warning: could not persist runtime auth: %v\n", err)
 	}
-	childRuntimeEnv, err := runtime.RuntimeAuthChildEnv(runtimeAuthFile, claudeAuthEnvLookup)
-	if err != nil {
-		fmt.Fprintf(stderr, "daemon start: warning: could not load persisted runtime auth: %v\n", err)
+
+	// Recovery (injecting the persisted token into the child) is RESTART-ONLY
+	// (#578 review): a plain `daemon start` must honor an intentionally-unset token
+	// — e.g. an operator switching a previously-Claude-authed box to a Codex/Kimi
+	// -only daemon — instead of silently re-injecting the old persisted token. Only
+	// a restart from a shell that has since LOST the token (the #578 target) recovers
+	// it; `daemon stop --forget-runtime-auth` deletes the file for an explicit reset.
+	var childRuntimeEnv []string
+	if restart {
+		childRuntimeEnv, err = runtime.RuntimeAuthChildEnv(runtimeAuthFile, claudeAuthEnvLookup)
+		if err != nil {
+			fmt.Fprintf(stderr, "daemon restart: warning: could not load persisted runtime auth: %v\n", err)
+		}
 	}
 
-	// #581's auth-drop warning is only relevant when nothing will supply the token:
-	// if #578 recovers it from the persisted file (childRuntimeEnv non-empty) the
-	// restarted daemon keeps auth, so the warning correctly stays silent. When the
-	// live env already carries the token, childRuntimeEnv is empty and the warn
+	// #581's auth-drop warning is only relevant when nothing will supply the token.
+	// When #578 recovers it from the persisted file (childRuntimeEnv non-empty) the
+	// restarted daemon keeps auth — but the persisted token has NO expiry/validation
+	// and may be stale or revoked, so do NOT treat "recovered something" as "auth is
+	// fine" and silently swallow the warning (#578 review). Emit an informational
+	// note instead so a silent 401 storm from a dead token is at least traceable. If
+	// the live env already carries the token, childRuntimeEnv is empty and the warn
 	// helper short-circuits on Ready() anyway.
 	if len(childRuntimeEnv) == 0 {
 		warnIfDaemonStartLosesClaudeAuth(stderr, restart, priorDaemonHadClaudeAuth)
+	} else {
+		fmt.Fprintln(stderr, "ℹ️  using PERSISTED runtime auth recovered from daemon-runtime.env (this shell lacks the token).")
+		fmt.Fprintln(stderr, "    It has no expiry or validation and may be STALE or REVOKED — if Claude-runtime jobs")
+		fmt.Fprintln(stderr, "    start failing auth, verify with `gitmoot daemon status`.")
+		fmt.Fprintln(stderr, "    To invalidate the persisted token, run `gitmoot daemon stop --forget-runtime-auth`.")
 	}
 
 	started, err := startDaemonChildFn(cfg.Home, cfg.Poll.String(), cfg.Workers, cfg.WatchSkillOptReviews, cfg.WatchIssues, cfg.Scheduler, cfg.RepoFlag, cfg.Session, state, resolvedWorkDir, childRuntimeEnv)
@@ -357,6 +375,7 @@ func runDaemonStop(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("daemon stop", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	forgetRuntimeAuth := fs.Bool("forget-runtime-auth", false, "also delete the persisted runtime-auth file (daemon-runtime.env) so a revoked/stale token is NOT recovered on the next restart (#578)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -371,6 +390,21 @@ func runDaemonStop(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "daemon stop: %v\n", err)
 		return 1
+	}
+	// --forget-runtime-auth is the explicit invalidation path for a revoked/stale
+	// persisted token (#578 review): delete the 0600 file so the next restart does
+	// not silently recover a dead token. Best-effort and independent of whether the
+	// daemon is actually running; the token value is never printed. The internal
+	// restart's stop call deliberately does NOT pass this flag, so restart recovery
+	// still works.
+	if *forgetRuntimeAuth {
+		if err := os.Remove(daemonRuntimeAuthFile(paths)); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				fmt.Fprintf(stderr, "daemon stop: warning: could not remove persisted runtime auth: %v\n", err)
+			}
+		} else {
+			writeLine(stdout, "removed persisted runtime auth (daemon-runtime.env)")
+		}
 	}
 	state := daemonProcessState(paths)
 	pid, stale, err := currentDaemonPID(state)
