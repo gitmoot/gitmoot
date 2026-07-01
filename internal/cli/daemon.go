@@ -1383,10 +1383,10 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 			return err
 		}
 		if checkoutLock.TryLock() {
-			_ = runDaemonPollWithTimeout(ctx, daemonRunningJobStaleAfter, d.PollOnce)
+			_ = runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollOnce)
 			checkoutLock.Unlock()
 		} else {
-			_ = runDaemonPollWithTimeout(ctx, daemonRunningJobStaleAfter, d.PollRecoveryCommandsOnce)
+			_ = runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollRecoveryCommandsOnce)
 		}
 		if heartbeatPathsErr == nil {
 			if err := runHeartbeatScanOnce(ctx, heartbeatPaths, store, heartbeatEnqueue, time.Now().UTC()); err != nil {
@@ -1989,9 +1989,9 @@ func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, 
 	// bounds the poll; the lock's per-repo checkout semantics are unchanged
 	// because Unlock still runs via defer once the (now-bounded) poll returns.
 	if recoveryOnly {
-		err = runDaemonPollWithTimeout(ctx, daemonRunningJobStaleAfter, d.PollRecoveryCommandsOnce)
+		err = runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollRecoveryCommandsOnce)
 	} else {
-		err = runDaemonPollWithTimeout(ctx, daemonRunningJobStaleAfter, d.PollOnce)
+		err = runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollOnce)
 	}
 	lastError := ""
 	if err != nil {
@@ -2094,6 +2094,19 @@ func (w jobWorker) eventSink() events.Sink {
 const daemonRunningJobStaleAfter = 30 * time.Minute
 const daemonJobCancelPollInterval = 250 * time.Millisecond
 const daemonWorkerLoopInterval = 1 * time.Second
+
+// daemonPollTimeout bounds a single repo's PollOnce / PollRecoveryCommandsOnce.
+// The poll runs while HOLDING that repo's checkout lock, and both supervisors
+// take each repo's lock SEQUENTIALLY, so a wedged (ctx-respecting-but-slow)
+// poll on one repo freezes that repo's — and, in the multi-repo sweep, every
+// later repo's — worker ticks until it returns (#555 / #536). It is therefore a
+// hard STALL bound, not the expected poll duration: reusing
+// daemonRunningJobStaleAfter (30 min) here left the sweep frozen for up to half
+// an hour, largely defeating #555's anti-stall goal, so it is deliberately much
+// tighter. A healthy poll finishes well inside this; exceeding it means the poll
+// is wedged and cancelling it (the deferred checkout Unlock still runs, so no
+// lock leak) is the correct recovery.
+const daemonPollTimeout = 2 * time.Minute
 
 // cockpitReconcileInterval is the low-frequency cadence of the cockpit reconcile
 // GC sweep (Task 7): it drops cockpit_pane rows whose herdr pane is gone and whose
@@ -2364,23 +2377,49 @@ func runEnabledRepoWorkerTicksWithLocks(ctx context.Context, store *db.Store, wo
 	if err != nil {
 		return err
 	}
+	// Scope tick faults per repo (#555 follow-up): the recovering supervisor
+	// treats a returned error as one fleet-wide failure unit and, after a bounded
+	// streak, exits the WHOLE daemon. Returning on the first repo's error would
+	// let a single repo-local fault (e.g. a broken/permission-denied checkout
+	// dir) both starve every later repo in ListRepos order AND escalate/kill the
+	// healthy repos' daemon with it. So log a single repo's tick error and keep
+	// sweeping; only a fault hitting EVERY enabled repo — a shared/store-level
+	// fault such as locked/corrupt SQLite or disk-full, the genuine global fault
+	// #555's escalation targets — is returned so the supervisor can escalate.
+	enabled := 0
+	failed := 0
+	var lastErr error
 	for _, repo := range repos {
 		if !repo.Enabled {
 			continue
 		}
+		enabled++
 		lock := locks.For(repo.FullName())
 		if lock != nil {
 			lock.Lock()
 		}
-		if err := runDaemonWorkerTick(ctx, store, worker, workers, false, repo.FullName(), rootFilter, stdout, now); err != nil {
-			if lock != nil {
-				lock.Unlock()
-			}
-			return err
-		}
+		tickErr := runDaemonWorkerTick(ctx, store, worker, workers, false, repo.FullName(), rootFilter, stdout, now)
 		if lock != nil {
 			lock.Unlock()
 		}
+		if tickErr != nil {
+			// A cancellation observed mid-sweep is a clean shutdown, not a repo
+			// fault: propagate it immediately so the supervisor treats it as such
+			// (and it never counts toward or masks the escalation streak).
+			if errors.Is(tickErr, context.Canceled) || ctx.Err() != nil {
+				return tickErr
+			}
+			failed++
+			lastErr = tickErr
+			writeLine(stdout, "%s: worker tick error: %v", repo.FullName(), tickErr)
+		}
+	}
+	// Every enabled repo failing is the global-fault signal: return it so the
+	// recovering supervisor's streak can trip and escalate. A single-repo daemon
+	// (enabled==1) still escalates on its own persistent fault, matching the
+	// single-repo supervisor.
+	if enabled > 0 && failed == enabled {
+		return lastErr
 	}
 	return nil
 }
