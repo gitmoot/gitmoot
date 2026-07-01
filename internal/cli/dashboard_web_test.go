@@ -348,3 +348,59 @@ func TestSummarizeRunsSortedAndCapped(t *testing.T) {
 		}
 	}
 }
+
+func TestParseRunKindAgent(t *testing.T) {
+	cases := []struct {
+		rootID     string
+		root       db.Job
+		wantKind   string
+		wantAgent  string
+	}{
+		{"local-ask-project-lead-18bde5e13a42d5a7", db.Job{}, "ask", "project-lead"},
+		{"local-review-acme-reviewer-abcdef123456", db.Job{}, "review", "acme-reviewer"},
+		{"gh-implement-worker-0123456789ab", db.Job{}, "implement", "worker"},
+		// no hash suffix / not the local-<kind>-<agent>-<hash> shape => fall back to
+		// the root job's Type + Agent columns.
+		{"task-294-presence-docs", db.Job{Type: "Coordination", Agent: "presence-docs"}, "coordination", "presence-docs"},
+	}
+	for _, c := range cases {
+		gotKind, gotAgent := parseRunKindAgent(c.rootID, c.root)
+		if gotKind != c.wantKind || gotAgent != c.wantAgent {
+			t.Errorf("parseRunKindAgent(%q) = (%q,%q), want (%q,%q)", c.rootID, gotKind, gotAgent, c.wantKind, c.wantAgent)
+		}
+	}
+}
+
+func TestSummarizeRunsEnriched(t *testing.T) {
+	root := "local-ask-project-lead-18bde5e13a42d5a7"
+	jobs := []db.Job{
+		{ID: root, State: "succeeded", DelegationDepth: 0, CreatedAt: "2026-06-01 10:00:00", UpdatedAt: "2026-06-01 10:05:00"},
+		{ID: "c1", ParentJobID: root, State: "succeeded", DelegationDepth: 1, CreatedAt: "2026-06-01 10:01:00", UpdatedAt: "2026-06-01 10:04:00"},
+		{ID: "c2", ParentJobID: root, State: "running", DelegationDepth: 1, CreatedAt: "2026-06-01 10:01:00", UpdatedAt: "2026-06-01 10:02:00"},
+	}
+	runs := summarizeRuns(jobs)
+	if len(runs) != 1 {
+		t.Fatalf("run count = %d, want 1", len(runs))
+	}
+	r := runs[0]
+	if r.Significance != "orchestration" {
+		t.Errorf("significance = %q, want orchestration", r.Significance)
+	}
+	if r.NodeCount != 3 {
+		t.Errorf("nodeCount = %d, want 3", r.NodeCount)
+	}
+	if r.Depth != 2 {
+		t.Errorf("depth = %d, want 2 (max delegation depth 1 + 1 level)", r.Depth)
+	}
+	if r.DoneCount != 2 {
+		t.Errorf("doneCount = %d, want 2 (two terminal jobs)", r.DoneCount)
+	}
+	if r.Kind != "ask" || r.Agent != "project-lead" {
+		t.Errorf("kind/agent = %q/%q, want ask/project-lead", r.Kind, r.Agent)
+	}
+	// a single-node run is a one-shot, not an orchestration.
+	solo := summarizeRuns([]db.Job{{ID: "local-ask-x-abcabcabcabc", State: "succeeded"}})
+	if solo[0].Significance != "one-shot" || solo[0].NodeCount != 1 {
+		t.Errorf("solo run = %q/%d, want one-shot/1", solo[0].Significance, solo[0].NodeCount)
+	}
+}
