@@ -1629,6 +1629,24 @@ func startSupervisorWorkerLoopRecovering(ctx context.Context, interval time.Dura
 	return startSupervisorWorkerLoopInternal(ctx, interval, stdout, run, true)
 }
 
+// maxConsecutiveWorkerTickFailures bounds how many CONSECUTIVE recovering
+// worker-tick failures the supervisor tolerates before it stops retrying and
+// surfaces the error on its channel so the caller (the daemon) exits and
+// systemd restarts/alerts. gaijinjoe's #555 made a single transient tick error
+// survivable (the daemon no longer wedges), but retry-forever turned a
+// PERMANENT infra fault — job-level failures already return nil, so what bubbles
+// up here is disk-full / corrupt-or-locked SQLite / a failed migration — into a
+// silent false-green daemon: status still "running", zero progress, ~86k log
+// lines/day. The streak resets to 0 on any successful tick, so only a genuinely
+// stuck daemon escalates. At the capped backoff below this spans a few minutes
+// before escalating (1+2+4+8+16 then 30s each ≈ 4m for a 1s base interval).
+const maxConsecutiveWorkerTickFailures = 12
+
+// maxWorkerTickBackoff caps the exponential retry sleep applied to a persistent
+// recovering-loop fault, so a permanent error backs off to the poll cadence
+// instead of spinning at the 1s base interval and flooding the journal.
+const maxWorkerTickBackoff = 30 * time.Second
+
 func startSupervisorWorkerLoopInternal(ctx context.Context, interval time.Duration, stdout io.Writer, run func(time.Time) error, recoverErrors bool) <-chan error {
 	errCh := make(chan error, 1)
 	if interval <= 0 {
@@ -1636,27 +1654,68 @@ func startSupervisorWorkerLoopInternal(ctx context.Context, interval time.Durati
 	}
 	go func() {
 		defer close(errCh)
+		consecutiveFailures := 0
 		for {
 			if err := ctx.Err(); err != nil {
 				return
 			}
 			if err := run(time.Now().UTC()); err != nil {
-				if recoverErrors {
-					writeLine(stdout, "daemon worker tick error: %v; retrying", err)
-					if sleepErr := sleepSupervisorWorkerLoop(ctx, interval); sleepErr != nil {
-						return
-					}
-					continue
+				// A cancellation observed mid-tick is a clean shutdown, never a
+				// fault: return WITHOUT logging or counting it toward the
+				// escalation streak, so graceful shutdown stays quiet and never
+				// pushes context.Canceled onto errCh.
+				if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+					return
 				}
-				errCh <- err
-				return
+				if !recoverErrors {
+					errCh <- err
+					return
+				}
+				consecutiveFailures++
+				// A PERSISTENT fault (a bounded streak of consecutive tick
+				// errors) is infra-level, not a transient blip: escalate it so
+				// the daemon exits instead of spinning silently forever.
+				if consecutiveFailures >= maxConsecutiveWorkerTickFailures {
+					writeLine(stdout, "daemon worker tick error: %v; %d consecutive failures, escalating", err, consecutiveFailures)
+					errCh <- err
+					return
+				}
+				writeLine(stdout, "daemon worker tick error: %v; retrying (%d/%d)", err, consecutiveFailures, maxConsecutiveWorkerTickFailures)
+				if sleepErr := sleepSupervisorWorkerLoop(ctx, workerTickBackoff(interval, consecutiveFailures)); sleepErr != nil {
+					return
+				}
+				continue
 			}
+			// A successful tick clears the streak: only CONSECUTIVE failures
+			// escalate, so one bad pass between good ones never trips the ceiling.
+			consecutiveFailures = 0
 			if err := sleepSupervisorWorkerLoop(ctx, interval); err != nil {
 				return
 			}
 		}
 	}()
 	return errCh
+}
+
+// workerTickBackoff returns the retry sleep for the Nth consecutive recovering
+// worker-tick failure: the base interval doubled per failure, capped at
+// maxWorkerTickBackoff. consecutiveFailures==1 returns the base interval (his
+// original single-transient-error cadence is preserved).
+func workerTickBackoff(base time.Duration, consecutiveFailures int) time.Duration {
+	if base <= 0 {
+		base = daemonWorkerLoopInterval
+	}
+	backoff := base
+	for i := 1; i < consecutiveFailures; i++ {
+		if backoff >= maxWorkerTickBackoff {
+			return maxWorkerTickBackoff
+		}
+		backoff *= 2
+	}
+	if backoff > maxWorkerTickBackoff {
+		return maxWorkerTickBackoff
+	}
+	return backoff
 }
 
 func sleepSupervisorWorkerLoop(ctx context.Context, interval time.Duration) error {
@@ -1923,10 +1982,16 @@ func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, 
 		EscalationTTL:          p.EscalationTTL,
 		RevertDetectionEnabled: p.RevertDetectionEnabled,
 	}
+	// Bound the poll the same way the single-repo supervisor does (#555 / #536):
+	// this call runs while HOLDING the per-repo checkout lock (deferred Unlock
+	// above), so a wedged PollOnce would hold that lock forever and freeze this
+	// repo's worker ticks — the exact stall #555 targets. The timeout only
+	// bounds the poll; the lock's per-repo checkout semantics are unchanged
+	// because Unlock still runs via defer once the (now-bounded) poll returns.
 	if recoveryOnly {
-		err = d.PollRecoveryCommandsOnce(ctx)
+		err = runDaemonPollWithTimeout(ctx, daemonRunningJobStaleAfter, d.PollRecoveryCommandsOnce)
 	} else {
-		err = d.PollOnce(ctx)
+		err = runDaemonPollWithTimeout(ctx, daemonRunningJobStaleAfter, d.PollOnce)
 	}
 	lastError := ""
 	if err != nil {
