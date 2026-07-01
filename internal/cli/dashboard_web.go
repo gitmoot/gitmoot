@@ -362,9 +362,12 @@ func summarizeRuns(jobs []db.Job) []dashboard.RunSummary {
 		jobByID[j.ID] = j
 	}
 	type agg struct {
-		updated string
-		states  []string
-		root    db.Job
+		updated  string
+		created  string
+		states   []string
+		maxDepth int
+		done     int
+		root     db.Job
 	}
 	byRoot := map[string]*agg{}
 	var order []string
@@ -380,6 +383,15 @@ func summarizeRuns(jobs []db.Job) []dashboard.RunSummary {
 		if j.UpdatedAt > a.updated {
 			a.updated = j.UpdatedAt
 		}
+		if a.created == "" || (j.CreatedAt != "" && j.CreatedAt < a.created) {
+			a.created = j.CreatedAt
+		}
+		if j.DelegationDepth > a.maxDepth {
+			a.maxDepth = j.DelegationDepth
+		}
+		if isTerminalJobState(j.State) {
+			a.done++
+		}
 		if j.ID == root {
 			a.root = j
 		}
@@ -388,11 +400,39 @@ func summarizeRuns(jobs []db.Job) []dashboard.RunSummary {
 	for _, root := range order {
 		a := byRoot[root]
 		payload, _ := workflow.ParseJobPayload(a.root.Payload)
+		nodeCount := len(a.states)
+		// An orchestration is a genuine delegation tree: a coordinator delegated to
+		// children, so some job sits below the root (DelegationDepth > 0). Native
+		// review-fanout jobs and ask continuations share the root but add no
+		// delegation depth, so counting nodes alone would mislabel a one-shot
+		// implement/ask (which spawns review jobs) as an orchestration.
+		significance := "one-shot"
+		if a.maxDepth > 0 {
+			significance = "orchestration"
+		}
+		kind, agent := parseRunKindAgent(root, a.root)
+		started := parseJobTimeMillis(a.created)
+		updated := parseJobTimeMillis(a.updated)
+		var duration int64
+		if started > 0 && updated > started {
+			duration = updated - started
+		}
 		out = append(out, dashboard.RunSummary{
-			RunID:   root,
-			Title:   runTitle(payload, a.root),
-			State:   aggregateRunState(a.states),
-			Updated: parseJobTimeMillis(a.updated),
+			RunID:        root,
+			Title:        runTitle(payload, a.root),
+			State:        aggregateRunState(a.states),
+			Kind:         kind,
+			Significance: significance,
+			Agent:        agent,
+			Repo:         strings.TrimSpace(payload.Repo),
+			PR:           payload.PullRequest,
+			NodeCount:    nodeCount,
+			Depth:        a.maxDepth + 1, // delegation levels (root = level 1)
+			DoneCount:    a.done,
+			Snippet:      firstInstructionLine(payload.Instructions),
+			Started:      started,
+			Updated:      updated,
+			Duration:     duration,
 		})
 	}
 	// Active (non-terminal) runs sort first, then most-recent activity, then id
@@ -628,6 +668,47 @@ func firstInstructionLine(instructions string) string {
 		return line
 	}
 	return ""
+}
+
+// parseRunKindAgent extracts a run's entrypoint kind (ask/review/implement/
+// orchestrate/goal) and coordinator/agent name from the root job id, which the
+// engine mints as "<origin>-<kind>-<agent...>-<hash>" (origin is local|gh, hash
+// is a 12+ hex suffix; the agent segment may itself contain hyphens). IDs that
+// don't fit that shape (e.g. task-rooted runs) fall back to the root job's Type
+// and Agent columns.
+// knownRunKinds is the set of single-token run entrypoints the id parser trusts
+// as parts[1]. Multi-token internal actions (e.g. "skillopt-train-candidate-
+// review") are deliberately absent, so their ids fall through to the root job's
+// Type/Agent columns instead of being mis-split (kind="skillopt", agent absorbs
+// the rest).
+var knownRunKinds = map[string]bool{"ask": true, "review": true, "implement": true, "orchestrate": true, "goal": true}
+
+func parseRunKindAgent(rootID string, root db.Job) (kind, agent string) {
+	parts := strings.Split(strings.TrimSpace(rootID), "-")
+	if len(parts) >= 4 && (parts[0] == "local" || parts[0] == "gh") && isHexHash(parts[len(parts)-1]) && knownRunKinds[parts[1]] {
+		kind = parts[1]
+		agent = strings.Join(parts[2:len(parts)-1], "-")
+	}
+	if kind == "" {
+		kind = strings.ToLower(strings.TrimSpace(root.Type))
+	}
+	if agent == "" {
+		agent = strings.TrimSpace(root.Agent)
+	}
+	return kind, agent
+}
+
+// isHexHash reports whether s is a run-id hash suffix: 12+ lowercase hex digits.
+func isHexHash(s string) bool {
+	if len(s) < 12 {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 // isAllDigits reports whether s is non-empty and every rune is an ASCII digit.
