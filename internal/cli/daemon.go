@@ -125,9 +125,32 @@ func runDaemonStartWithWorkDirRestart(args []string, workDir string, restart boo
 		}
 	}
 
-	warnIfDaemonStartLosesClaudeAuth(stderr, restart, priorDaemonHadClaudeAuth)
+	// Persist and recover runtime auth so a `daemon restart` from a shell that no
+	// longer carries the token cannot silently disable Claude auth (#578; #581 only
+	// warns). Persist first (the live env wins) so a start that DOES carry a token
+	// records it 0600; then compute the child-env injection so a start whose shell
+	// LACKS the token but whose 0600 file has one recovers it into the child. Both
+	// steps are best-effort: a persistence/load failure is a masked warning and
+	// never blocks the start, and the token value is never logged.
+	runtimeAuthFile := daemonRuntimeAuthFile(paths)
+	if _, err := runtime.PersistRuntimeAuthEnv(runtimeAuthFile, claudeAuthEnvLookup); err != nil {
+		fmt.Fprintf(stderr, "daemon start: warning: could not persist runtime auth: %v\n", err)
+	}
+	childRuntimeEnv, err := runtime.RuntimeAuthChildEnv(runtimeAuthFile, claudeAuthEnvLookup)
+	if err != nil {
+		fmt.Fprintf(stderr, "daemon start: warning: could not load persisted runtime auth: %v\n", err)
+	}
 
-	started, err := startDaemonChildFn(cfg.Home, cfg.Poll.String(), cfg.Workers, cfg.WatchSkillOptReviews, cfg.WatchIssues, cfg.Scheduler, cfg.RepoFlag, cfg.Session, state, resolvedWorkDir)
+	// #581's auth-drop warning is only relevant when nothing will supply the token:
+	// if #578 recovers it from the persisted file (childRuntimeEnv non-empty) the
+	// restarted daemon keeps auth, so the warning correctly stays silent. When the
+	// live env already carries the token, childRuntimeEnv is empty and the warn
+	// helper short-circuits on Ready() anyway.
+	if len(childRuntimeEnv) == 0 {
+		warnIfDaemonStartLosesClaudeAuth(stderr, restart, priorDaemonHadClaudeAuth)
+	}
+
+	started, err := startDaemonChildFn(cfg.Home, cfg.Poll.String(), cfg.Workers, cfg.WatchSkillOptReviews, cfg.WatchIssues, cfg.Scheduler, cfg.RepoFlag, cfg.Session, state, resolvedWorkDir, childRuntimeEnv)
 	if err != nil {
 		fmt.Fprintf(stderr, "daemon start: %v\n", err)
 		return 1
@@ -448,8 +471,18 @@ var claudeAuthEnvLookup = os.LookupEnv
 
 // startDaemonChildFn is the daemon child-spawn indirection. It defaults to the
 // real startDaemonChild; tests swap it so the start/restart command body can be
-// driven end-to-end without launching an actual daemon process.
+// driven end-to-end without launching an actual daemon process. The trailing
+// extraEnv is the runtime-auth recovered from the persisted 0600 file (#578);
+// tests swap the seam to capture it and assert the token reaches the child.
 var startDaemonChildFn = startDaemonChild
+
+// daemonRuntimeAuthFile is the 0600 file into which the daemon persists its
+// runtime auth (#578) so a `daemon restart` from a shell missing the token can
+// recover it. It lives in the daemon home alongside daemon.json — but, unlike
+// daemon.json, it is owner-read/write only and MUST never be world-readable.
+func daemonRuntimeAuthFile(paths config.Paths) string {
+	return filepath.Join(paths.Home, "daemon-runtime.env")
+}
 
 // warnIfDaemonStartLosesClaudeAuth prints a prominent, non-fatal stderr warning
 // when the daemon about to (re)start will inherit an environment WITHOUT Claude
@@ -1073,7 +1106,7 @@ func currentDaemonPID(state daemonState) (pid int, stale bool, err error) {
 	return pid, false, nil
 }
 
-func startDaemonChild(home string, poll string, workers int, watchSkillOptReviews bool, watchIssues bool, scheduler string, repo string, session string, state daemonState, workDir string) (daemonMeta, error) {
+func startDaemonChild(home string, poll string, workers int, watchSkillOptReviews bool, watchIssues bool, scheduler string, repo string, session string, state daemonState, workDir string, extraEnv []string) (daemonMeta, error) {
 	executable, err := os.Executable()
 	if err != nil {
 		return daemonMeta{}, err
@@ -1088,6 +1121,14 @@ func startDaemonChild(home string, poll string, workers int, watchSkillOptReview
 	cmd.Dir = workDir
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+	// Recover runtime auth the launching shell has lost (#578). Historically the
+	// child was spawned with cmd.Env unset so it inherited this process's env; when
+	// extraEnv is empty that inheritance is preserved exactly (leaving cmd.Env nil).
+	// When extraEnv carries persisted tokens, set the child env to this process's
+	// environment PLUS those tokens so the restarted daemon keeps Claude auth.
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		return daemonMeta{}, err

@@ -15,7 +15,7 @@ import (
 func withStubbedDaemonChild(t *testing.T) {
 	t.Helper()
 	prev := startDaemonChildFn
-	startDaemonChildFn = func(home, poll string, workers int, watchSkillOptReviews, watchIssues bool, scheduler, repo, session string, state daemonState, workDir string) (daemonMeta, error) {
+	startDaemonChildFn = func(home, poll string, workers int, watchSkillOptReviews, watchIssues bool, scheduler, repo, session string, state daemonState, workDir string, extraEnv []string) (daemonMeta, error) {
 		return daemonMeta{PID: 424242, LogFile: filepath.Join(home, "daemon.log")}, nil
 	}
 	t.Cleanup(func() { startDaemonChildFn = prev })
