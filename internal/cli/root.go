@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -118,6 +119,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	repoDir := fs.String("repo", ".", "repository directory to check")
+	jsonOutput := fs.Bool("json", false, "print the checks as a JSON array instead of the text table")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -134,6 +136,37 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	// Paths zero, which skips the daemon check and keeps the shell-local one.
 	paths, _ := config.DefaultPaths()
 	checks := doctor.Checker{Dir: *repoDir, LiveProbe: true, Paths: paths}.Run(context.Background())
+	if *jsonOutput {
+		type checkJSON struct {
+			Name     string `json:"name"`
+			Status   string `json:"status"`
+			OK       bool   `json:"ok"`
+			Required bool   `json:"required"`
+			Detail   string `json:"detail"`
+		}
+		out := make([]checkJSON, 0, len(checks))
+		for _, check := range checks {
+			status := "ok"
+			if !check.OK {
+				if check.Required {
+					status = "fail"
+				} else {
+					status = "warn"
+				}
+			}
+			out = append(out, checkJSON{Name: check.Name, Status: status, OK: check.OK, Required: check.Required, Detail: check.Detail})
+		}
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(out); err != nil {
+			fmt.Fprintf(stderr, "doctor: %v\n", err)
+			return 1
+		}
+		if err := doctor.FailedRequired(checks); err != nil {
+			return 1
+		}
+		return 0
+	}
 	for _, check := range checks {
 		status := "ok"
 		if !check.OK {
