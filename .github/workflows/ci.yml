@@ -61,4 +61,9 @@ jobs:
         # recovery / worktree-cleanup fix adds concurrency-sensitive resource_locks
         # reads (JobRuntimeLockLiveness, DeleteExpiredResourceLocks) that the daemon
         # worker pool exercises from multiple goroutines.
-        run: go test -race ./internal/workflow/ ./internal/cli/ ./internal/db/ ./internal/daemon/
+        #
+        # -timeout 20m: internal/cli is a large suite and the race detector runs
+        # it ~10x slower, so it sits right on Go's default 10m/package deadline —
+        # adding a handful of new tests intermittently tips it over (a timeout, not
+        # a real race). The explicit bound gives headroom without masking a hang.
+        run: go test -race -timeout 20m ./internal/workflow/ ./internal/cli/ ./internal/db/ ./internal/daemon/
