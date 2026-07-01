@@ -121,6 +121,9 @@ func validateConfigFile(paths Paths) error {
 	if _, err := LoadHeartbeats(paths); err != nil {
 		return err
 	}
+	if _, err := LoadRepoConcurrency(paths); err != nil {
+		return err
+	}
 	if _, err := LoadTemplateRemote(paths); err != nil {
 		return err
 	}

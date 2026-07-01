@@ -2602,7 +2602,16 @@ func runDaemonWorkerTick(ctx context.Context, store *db.Store, worker jobWorker,
 	if err := retryPendingJobComments(ctx, worker, repoFilter, rootFilter); err != nil {
 		return err
 	}
-	return runQueuedJobsForRepo(ctx, worker, workers, repoFilter, rootFilter)
+	// Per-repo concurrency override (#576): a [repos."owner/repo"] section caps
+	// THIS repo's in-flight concurrency (and may flip its scheduler) without a
+	// global daemon restart. With no matching section this returns (workers,
+	// worker.UsePool) unchanged, so the run path is byte-identical to today. The
+	// override is re-read here every tick, which is precisely what makes it
+	// tunable live. worker is passed by value, so the per-repo UsePool flip is
+	// local to this tick's dispatch and never leaks to sibling repos.
+	limit, usePool := worker.resolveRepoScheduler(repoFilter, workers)
+	worker.UsePool = usePool
+	return runQueuedJobsForRepo(ctx, worker, limit, repoFilter, rootFilter)
 }
 
 func runEnabledRepoWorkerTicks(ctx context.Context, store *db.Store, worker jobWorker, workers int, stdout io.Writer, now time.Time) error {
@@ -3696,6 +3705,56 @@ func (w jobWorker) parallelSessionPolicy() (config.ParallelSessionPolicy, error)
 		return config.ParallelSessionPolicy{}, err
 	}
 	return config.LoadParallelSessionPolicy(paths)
+}
+
+// repoConcurrency loads the per-repo [repos."owner/repo"] scheduler overrides
+// (#576), mirroring parallelSessionPolicy: an implicit/empty config home has no
+// overrides (nil ⇒ every repo uses the global default), and an explicit home
+// loads them from the config file. Errors are surfaced to the caller, which
+// fails safe to the global default.
+func (w jobWorker) repoConcurrency() ([]config.RepoConcurrency, error) {
+	if !w.ConfigHomeExplicit && strings.TrimSpace(w.ConfigHome) == "" {
+		return nil, nil
+	}
+	paths, err := w.configPaths()
+	if err != nil {
+		return nil, err
+	}
+	return config.LoadRepoConcurrency(paths)
+}
+
+// resolveRepoScheduler resolves the effective worker limit and pool toggle for a
+// repo's queued-job run (#576). It is behavior-preserving by default: with no
+// repoFilter, no [repos."owner/repo"] section, an implicit config home, or a
+// config-load error, it returns (globalLimit, w.UsePool) unchanged. A configured
+// max_parallel>0 caps THAT repo's concurrency; max_parallel<=0/missing keeps the
+// global default (never zero ⇒ never a stalled repo). A configured scheduler
+// ("pool"/"barrier") overrides the pool toggle for that repo only.
+func (w jobWorker) resolveRepoScheduler(repoFilter string, globalLimit int) (int, bool) {
+	limit := globalLimit
+	usePool := w.UsePool
+	repo := strings.TrimSpace(repoFilter)
+	if repo == "" {
+		return limit, usePool
+	}
+	configs, err := w.repoConcurrency()
+	if err != nil || len(configs) == 0 {
+		return limit, usePool
+	}
+	entry, ok := config.RepoConcurrencyFor(configs, repo)
+	if !ok {
+		return limit, usePool
+	}
+	if entry.MaxParallel > 0 {
+		limit = entry.MaxParallel
+	}
+	switch entry.Scheduler {
+	case "pool":
+		usePool = true
+	case "barrier":
+		usePool = false
+	}
+	return limit, usePool
 }
 
 // admissionPolicy loads the host-level [admission] budget config, mirroring

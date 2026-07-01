@@ -5696,6 +5696,121 @@ func enqueueDaemonWorkerJob(t *testing.T, store *db.Store, request workflow.JobR
 	}
 }
 
+// writeRepoConcurrencyConfigHome initializes a config home and appends body to
+// its default config, returning the raw --home. Used to drive the per-repo
+// concurrency override (#576) through the real jobWorker config loaders.
+func writeRepoConcurrencyConfigHome(t *testing.T, body string) string {
+	t.Helper()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return home
+}
+
+// runRepoConcurrencyTickPeak drives the REAL per-repo run path
+// (runDaemonWorkerTick -> resolveRepoScheduler -> runQueuedJobsForRepo) for one
+// repo and returns the observed peak concurrent deliveries. The two seeded jobs
+// carry DISTINCT worktree paths, so their checkout keys differ and nothing but
+// the scheduler's concurrency limit can serialize them — which is exactly what a
+// [repos."owner/repo"] max_parallel override changes.
+func runRepoConcurrencyTickPeak(t *testing.T, configHome string, repo string) int {
+	t.Helper()
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, repo, t.TempDir())
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, repo)
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-1", Agent: "audit", Action: "ask", Repo: repo, Branch: "main", PullRequest: 1, WorktreePath: filepath.Join(t.TempDir(), "wt-1")})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-2", Agent: "audit", Action: "ask", Repo: repo, Branch: "main", PullRequest: 2, WorktreePath: filepath.Join(t.TempDir(), "wt-2")})
+
+	tracker := &poolConcurrencyTracker{}
+	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
+	adapter.onDeliver = tracker.span
+	// Global config: pool scheduler, workers=2 (would run both in parallel).
+	worker := poolSchedulerWorker(t, store, adapter, true)
+	worker.ConfigHome = configHome
+	worker.ConfigHomeExplicit = true
+
+	if err := runDaemonWorkerTick(ctx, store, worker, 2, false, repo, "", io.Discard, time.Now().UTC()); err != nil {
+		t.Fatalf("runDaemonWorkerTick(%s): %v", repo, err)
+	}
+	for _, id := range []string{"job-1", "job-2"} {
+		job, err := store.GetJob(ctx, id)
+		if err != nil {
+			t.Fatalf("GetJob %s: %v", id, err)
+		}
+		if job.State != string(workflow.JobSucceeded) {
+			t.Fatalf("%s state = %q, want succeeded", id, job.State)
+		}
+	}
+	return tracker.peak()
+}
+
+// TestRunDaemonWorkerTickHonorsPerRepoMaxParallel pins the #576 daemon half: a
+// [repos."owner/repo"] max_parallel=1 override caps THAT repo's in-flight
+// concurrency to serial, while a repo with no override is unaffected by the same
+// override file and keeps the global pool/workers=2 parallelism. Same config
+// home, same job shape — the ONLY difference is which repo the section names, so
+// the peak split proves the override is what serializes repo-a.
+func TestRunDaemonWorkerTickHonorsPerRepoMaxParallel(t *testing.T) {
+	configHome := writeRepoConcurrencyConfigHome(t, `
+[repos."owner/repo-a"]
+max_parallel = 1
+`)
+	if peak := runRepoConcurrencyTickPeak(t, configHome, "owner/repo-a"); peak != 1 {
+		t.Fatalf("owner/repo-a peak concurrency = %d, want 1 (max_parallel=1 must serialize)", peak)
+	}
+	if peak := runRepoConcurrencyTickPeak(t, configHome, "owner/repo-b"); peak != 2 {
+		t.Fatalf("owner/repo-b peak concurrency = %d, want 2 (no override ⇒ global pool/workers=2 unaffected)", peak)
+	}
+}
+
+// TestRunDaemonWorkerTickNoRepoConfigIsUnchanged pins behavior preservation
+// (#576): with NO [repos.*] section anywhere, the per-repo tick runs at the
+// global limit exactly as today — the override plumbing is inert when unset.
+func TestRunDaemonWorkerTickNoRepoConfigIsUnchanged(t *testing.T) {
+	configHome := writeRepoConcurrencyConfigHome(t, "")
+	if peak := runRepoConcurrencyTickPeak(t, configHome, "owner/repo-a"); peak != 2 {
+		t.Fatalf("no-config peak concurrency = %d, want 2 (global pool/workers=2 unchanged)", peak)
+	}
+}
+
+// TestJobWorkerResolveRepoSchedulerFallsBackToGlobal pins the resolver's
+// fail-safe defaults (#576): an implicit config home, an empty repo filter, and
+// an unmatched repo all return the global limit and the worker's UsePool
+// unchanged, so the run path is byte-identical to today when the feature is off.
+func TestJobWorkerResolveRepoSchedulerFallsBackToGlobal(t *testing.T) {
+	// Implicit config home (no explicit --home) ⇒ no overrides possible.
+	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard)
+	worker.UsePool = true
+	if limit, usePool := worker.resolveRepoScheduler("owner/repo-a", 3); limit != 3 || !usePool {
+		t.Fatalf("implicit home: got (%d, %v), want (3, true)", limit, usePool)
+	}
+	// Explicit home with a section for a DIFFERENT repo ⇒ unmatched ⇒ global.
+	configHome := writeRepoConcurrencyConfigHome(t, `
+[repos."owner/repo-a"]
+max_parallel = 1
+scheduler = "barrier"
+`)
+	worker2 := defaultJobWorker(daemonWorkerStore(t), io.Discard, configHome)
+	worker2.UsePool = true
+	if limit, usePool := worker2.resolveRepoScheduler("owner/repo-b", 4); limit != 4 || !usePool {
+		t.Fatalf("unmatched repo: got (%d, %v), want (4, true)", limit, usePool)
+	}
+	// Empty repo filter ⇒ global default (never reads config).
+	if limit, usePool := worker2.resolveRepoScheduler("", 4); limit != 4 || !usePool {
+		t.Fatalf("empty repo: got (%d, %v), want (4, true)", limit, usePool)
+	}
+	// Matched repo ⇒ capped limit and scheduler flip (pool -> barrier).
+	if limit, usePool := worker2.resolveRepoScheduler("owner/repo-a", 4); limit != 1 || usePool {
+		t.Fatalf("matched repo: got (%d, %v), want (1, false)", limit, usePool)
+	}
+}
+
 // TestRunQueuedJobsForRepoSkipsChildrenOfKilledRoot pins the #341 daemon half of
 // the operator kill switch: once a tree's root is marked killed, a queued CHILD
 // of that root is skipped by runQueuedJobsForRepo (never delivered, stays
