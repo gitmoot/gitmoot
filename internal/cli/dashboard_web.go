@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -109,13 +110,20 @@ func (d *webDataSource) State(ctx context.Context, runID string) (dashboard.Stat
 			jobByID[j.ID] = j
 		}
 
-		target := strings.TrimSpace(runID)
+		requested := strings.TrimSpace(runID)
+		target := requested
 		if target == "" {
 			target = mostRecentRunRoot(jobs, jobByID)
 		} else {
 			target = jobRootID(jobByID, target)
 		}
-		if target == "" {
+		if _, ok := jobByID[target]; target == "" || !ok {
+			// An explicitly requested run that does not resolve to a real job is
+			// a 404; an empty request against an empty store is just an empty
+			// snapshot.
+			if requested != "" {
+				return dashboard.ErrRunNotFound
+			}
 			return nil
 		}
 
@@ -156,6 +164,9 @@ func (d *webDataSource) Job(ctx context.Context, jobID string) (dashboard.Node, 
 	err := withStore(d.home, func(store *db.Store) error {
 		job, err := store.GetJob(ctx, jobID)
 		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return dashboard.ErrJobNotFound
+			}
 			return err
 		}
 		payload, _ := workflow.ParseJobPayload(job.Payload)

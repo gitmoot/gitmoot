@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	dashboard "github.com/jerryfane/gitmoot-dashboard"
@@ -55,6 +56,25 @@ func seedWebDashboardTree(t *testing.T, home string) {
 	// Continuation job carries no delegation id.
 	contPayload := workflow.JobPayload{Repo: "jerryfane/noted", TaskTitle: "synthesize"}
 	mustCreateJob(t, store, db.Job{ID: "coord-cont", Agent: "project-lead", Type: "orchestrate", State: "queued", Payload: mustJSON(t, contPayload), ParentJobID: "coord"}, "", "")
+}
+
+// TestWebDataSourceNotFound asserts the DataSource maps an unknown job/run to the
+// dashboard sentinels (so the API returns 404, not 500), while a real run resolves.
+func TestWebDataSourceNotFound(t *testing.T) {
+	home := dashboardTestHome(t)
+	seedWebDashboardTree(t, home)
+	ds := &webDataSource{home: home}
+	ctx := context.Background()
+
+	if _, err := ds.Job(ctx, "no-such-job"); !errors.Is(err, dashboard.ErrJobNotFound) {
+		t.Fatalf("Job(unknown) err = %v, want ErrJobNotFound", err)
+	}
+	if _, err := ds.State(ctx, "no-such-run"); !errors.Is(err, dashboard.ErrRunNotFound) {
+		t.Fatalf("State(unknown) err = %v, want ErrRunNotFound", err)
+	}
+	if _, err := ds.State(ctx, "coord"); err != nil {
+		t.Fatalf("State(coord) err = %v, want nil", err)
+	}
 }
 
 func mustCreateJob(t *testing.T, store *db.Store, job db.Job, eventKind, eventMsg string) {
