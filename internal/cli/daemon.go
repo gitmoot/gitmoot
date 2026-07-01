@@ -213,9 +213,11 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "daemon run does not accept positional arguments")
 		return 2
 	}
-	explicitWorkers, explicitScheduler, explicitParallel := false, false, false
+	explicitPoll, explicitWorkers, explicitScheduler, explicitParallel := false, false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
+		case "poll":
+			explicitPoll = true
 		case "workers":
 			explicitWorkers = true
 		case "scheduler":
@@ -236,6 +238,10 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		}
 		*workers = *parallel
 		*scheduler = "pool"
+		// --parallel makes BOTH knobs explicit for warm-reload override purposes
+		// (#577): the operator named the goal, so a start-time [daemon].workers /
+		// scheduler must not silently override the launch flag.
+		explicitWorkers = true
 		explicitScheduler = true
 	}
 	if *poll <= 0 {
@@ -289,6 +295,27 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Warm-reconfigure path (#577): the live supervisor settings (poll, worker-pool
+	// size, scheduler mode) are held behind a mutex so a SIGHUP can re-read the
+	// [daemon] config section and apply the changes WITHOUT a `daemon restart`. A
+	// restart tears down in-flight supervision and re-inherits the launching shell's
+	// environment, dropping runtime auth (the #559 disaster); a warm reload never
+	// touches the process, its env, or in-flight jobs. CLI flags remain the initial
+	// value: a start-time [daemon] key is applied only where the operator did not pass
+	// the matching flag (flag = override). SIGHUP is deliberately kept OUT of the
+	// SIGINT/SIGTERM shutdown context above so a reload never cancels the daemon.
+	live := newDaemonReloadableConfig(*poll, *workers, usePool)
+	if reloadPaths, reloadErr := initializedPaths(*home); reloadErr == nil {
+		if start, cfgErr := config.LoadDaemonRuntimeConfig(reloadPaths); cfgErr != nil {
+			writeLine(stdout, "daemon: [daemon] config load error, using CLI flags: %v", cfgErr)
+		} else if applied := live.applyStart(start, explicitPoll, explicitWorkers, explicitScheduler); applied != "" {
+			writeLine(stdout, "daemon: applied [daemon] config at start (%s); CLI flags override", applied)
+		}
+		installDaemonReloadHandler(ctx, reloadPaths, live, stdout)
+	} else {
+		writeLine(stdout, "daemon: warm reload disabled (paths unavailable): %v", reloadErr)
+	}
+
 	// Self-register so `daemon status` / the dashboard recognize a `daemon run`
 	// launched directly (e.g. under `systemd --user`), not only one spawned by
 	// `daemon start` (#505 gap 3), and reconcile any phantom "running" runtime
@@ -300,7 +327,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	defer daemonRunStartupReconcile(ctx, *home, os.Args, stdout)()
 
 	if *repoFlag == "" {
-		err := runRegisteredRepoSupervisor(ctx, *home, *poll, *workers, *dryRun, *watchSkillOptReviews, *watchIssues, usePool, session, stdout)
+		err := runRegisteredRepoSupervisor(ctx, *home, live, *dryRun, *watchSkillOptReviews, *watchIssues, session, stdout)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return 0
 		}
@@ -346,7 +373,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 			WatchIssues:            *watchIssues,
 			EscalationTTL:          resolveEscalationTTL(*home),
 			RevertDetectionEnabled: resolveRevertDetectionEnabled(*home),
-		}, store, *workers, usePool, session, stdout)
+		}, store, live, session, stdout)
 	})
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return 0
@@ -1374,21 +1401,21 @@ func hasWhitespace(value string) bool {
 	return strings.ContainsAny(value, " \t\r\n")
 }
 
-func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Duration, workers int, dryRun bool, watchSkillOptReviews bool, watchIssues bool, usePool bool, rootFilter string, stdout io.Writer) error {
+func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonReloadableConfig, dryRun bool, watchSkillOptReviews bool, watchIssues bool, rootFilter string, stdout io.Writer) error {
 	return withStoreAndPaths(home, func(paths config.Paths, store *db.Store) error {
 		schedule := registeredRepoSchedule{
 			NextPoll:    map[string]time.Time{},
 			ErrorStreak: map[string]int{},
 		}
+		_, initialWorkers, _ := live.snapshot()
 		// rawHome (the function's own param) feeds the read-only policy loaders;
 		// paths.Home (the resolved <home>/.gitmoot root) feeds the engine wiring (#459).
-		poller := defaultRegisteredRepoPoller(store, workers, dryRun, stdout, home, paths.Home)
+		poller := defaultRegisteredRepoPoller(store, initialWorkers, dryRun, stdout, home, paths.Home)
 		poller.WatchIssues = watchIssues
 		blobStore := artifact.NewStore(paths.ArtifactBlobs)
 		reviewGitHub := newSkillOptGitHubClient()
 		worker := defaultJobWorker(store, stdout, home)
 		worker.CommenterFactory = worker.defaultCommenter
-		worker.UsePool = usePool
 		worker.Admission = worker.loadAdmissionBudget()
 		checkoutLocks := &repoCheckoutLocks{}
 		poller.CheckoutLocks = checkoutLocks
@@ -1401,7 +1428,14 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 				return err
 			}
 			workerErr = startSupervisorWorkerLoopRecovering(ctx, daemonWorkerLoopInterval, stdout, func(now time.Time) error {
-				return runEnabledRepoWorkerTicksWithLocks(ctx, store, worker, workers, rootFilter, stdout, now, checkoutLocks)
+				// Read the warm-reloadable worker count + scheduler mode each tick
+				// (#577). The worker is copied per tick so setting UsePool is race-free
+				// with the SIGHUP reload goroutine, and the pool is re-dispatched each
+				// tick so a resize applies live without disturbing in-flight jobs.
+				_, workers, usePool := live.snapshot()
+				w := worker
+				w.UsePool = usePool
+				return runEnabledRepoWorkerTicksWithLocks(ctx, store, w, workers, rootFilter, stdout, now, checkoutLocks)
 			})
 			startCockpitReconcileLoop(ctx, store, paths.Home, stdout)
 		}
@@ -1413,7 +1447,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 			if err := receiveSupervisorWorkerError(workerErr); err != nil {
 				return err
 			}
-			wait, err := pollRegisteredReposWithPoller(ctx, poller, schedule, time.Now().UTC(), poll)
+			wait, err := pollRegisteredReposWithPoller(ctx, poller, schedule, time.Now().UTC(), live.pollInterval())
 			if err != nil {
 				return err
 			}
@@ -1443,7 +1477,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 	})
 }
 
-func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, store *db.Store, workers int, usePool bool, rootFilter string, stdout io.Writer) error {
+func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, store *db.Store, live *daemonReloadableConfig, rootFilter string, stdout io.Writer) error {
 	if err := recoverExpiredRuntimeSessionLocks(ctx, store, stdout, time.Now().UTC()); err != nil {
 		return err
 	}
@@ -1453,19 +1487,20 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	if err := recoverCancelledRunningJobsForRepo(ctx, store, stdout, d.Repo.FullName(), rootFilter); err != nil {
 		return err
 	}
-	interval := d.PollInterval
-	if interval <= 0 {
-		interval = 30 * time.Second
-	}
 	worker := defaultJobWorker(store, stdout, home)
 	worker.CommenterFactory = worker.defaultCommenter
-	worker.UsePool = usePool
 	worker.Admission = worker.loadAdmissionBudget()
 	var checkoutLock sync.Mutex
 	workerErr := startSupervisorWorkerLoopRecovering(ctx, daemonWorkerLoopInterval, stdout, func(now time.Time) error {
 		checkoutLock.Lock()
 		defer checkoutLock.Unlock()
-		return runDaemonWorkerTick(ctx, store, worker, workers, false, d.Repo.FullName(), rootFilter, stdout, now)
+		// Read the warm-reloadable worker count + scheduler mode each tick (#577);
+		// the worker is copied per tick so UsePool is race-free with the SIGHUP
+		// reload goroutine.
+		_, workers, usePool := live.snapshot()
+		w := worker
+		w.UsePool = usePool
+		return runDaemonWorkerTick(ctx, store, w, workers, false, d.Repo.FullName(), rootFilter, stdout, now)
 	})
 	startCockpitReconcileLoop(ctx, store, home, stdout)
 	// Heartbeat schedules (#533) must also fire in the single-repo daemon, or a
@@ -1494,6 +1529,13 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 			if err := runHeartbeatScanOnce(ctx, heartbeatPaths, store, heartbeatEnqueue, time.Now().UTC()); err != nil {
 				writeLine(stdout, "heartbeat scan error: %s", err)
 			}
+		}
+		// Read the warm-reloadable poll interval each cycle (#577) so a SIGHUP
+		// change takes effect on the next tick. Fall back to the historical 30s
+		// default if it was somehow left non-positive.
+		interval := live.pollInterval()
+		if interval <= 0 {
+			interval = 30 * time.Second
 		}
 		timer := time.NewTimer(interval)
 		select {

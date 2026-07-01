@@ -37,6 +37,21 @@ workspaces = %q
 evals = %q
 artifact_blobs = %q
 
+# [daemon] is the OPTIONAL warm-reloadable runtime config (issue #577). CLI flags to
+# "daemon start" / "daemon run" remain the initial value; a key here is applied only
+# where the matching flag was NOT passed (flag = override). Its real purpose is WARM
+# RELOAD: send the running daemon SIGHUP (kill -HUP <pid>) and it RE-READS this section
+# and applies poll/workers/scheduler to the live supervisor WITHOUT a restart — a
+# restart tears down in-flight supervision and re-inherits the launching shell's env,
+# dropping runtime auth (#559). With no [daemon] section behavior is byte-identical.
+# poll is a Go duration; workers is the worker-pool size (applied live — the pool is
+# re-dispatched each tick); scheduler is barrier|pool. "parallel = N" is sugar for
+# workers=N + scheduler=pool and conflicts with an explicit workers/scheduler here.
+# [daemon]
+# poll = "30s"
+# workers = 1
+# scheduler = "barrier"
+
 [parallel_sessions]
 same_session = "fork_temp_session"
 merge_back = "summary"
