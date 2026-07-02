@@ -21,13 +21,21 @@ import (
 )
 
 type localAgentDispatchRequest struct {
-	RepoFlag               string
-	Agent                  string
-	Action                 string
-	Instructions           string
-	Background             bool
-	Type                   string
-	Model                  string
+	RepoFlag     string
+	Agent        string
+	Action       string
+	Instructions string
+	Background   bool
+	Type         string
+	Model        string
+	// Runtime, when non-empty, is the per-job runtime override (#531): this one
+	// job runs through the named runtime while the agent's registered default
+	// runtime (and its session) stays untouched. RuntimeSession optionally names
+	// the session on the OVERRIDE runtime (required for shell, whose sessions
+	// are commands); when empty a fresh per-job session ref is minted so the
+	// overridden job can never resume the agent's default-runtime session.
+	Runtime                string
+	RuntimeSession         string
 	Home                   string
 	AllowManagedSync       bool
 	JobTimeout             time.Duration
@@ -76,6 +84,13 @@ type localAgentJobOutput struct {
 }
 
 func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAgentDispatchRequest) (localAgentJobOutput, error) {
+	// Validate a requested per-job runtime override FIRST — an unknown runtime
+	// (or a shell override without a session command) must fail with a clear
+	// error before any job is enqueued or any repo/agent state is touched.
+	overrideRuntime, overrideRef, err := resolveJobRuntimeOverride(request.Runtime, request.RuntimeSession)
+	if err != nil {
+		return localAgentJobOutput{}, err
+	}
 	repo, record, err := resolveLocalAgentRepo(ctx, store, request.RepoFlag)
 	if err != nil {
 		return localAgentJobOutput{}, err
@@ -112,7 +127,17 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		return localAgentJobOutput{}, err
 	}
 	request.Agent = agent.Name
-	if readOnlyImplementationBlocked(request.Action, runtimeAgent(agent)) {
+	// The EFFECTIVE runtime agent this job runs as: identical to the registered
+	// agent unless a per-job runtime override is present (#531), in which case
+	// it carries the override runtime + the job's own session ref (never the
+	// agent's default-runtime session) and no default model.
+	effectiveAgent := applyJobRuntimeOverride(runtimeAgent(agent), workflow.JobPayload{RuntimeOverride: overrideRuntime, RuntimeOverrideRef: overrideRef})
+	if overrideRuntime != "" {
+		if err := runtime.ValidateAgent(effectiveAgent); err != nil {
+			return localAgentJobOutput{}, fmt.Errorf("runtime override: %w", err)
+		}
+	}
+	if readOnlyImplementationBlocked(request.Action, effectiveAgent) {
 		return enqueuePermissionBlockedLocalAgentJob(ctx, store, request, repo.FullName(), record.DefaultBranch, agent.Name)
 	}
 	switch request.Action {
@@ -164,6 +189,8 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		Sender:                 "local",
 		Instructions:           request.Instructions,
 		Model:                  request.Model,
+		RuntimeOverride:        overrideRuntime,
+		RuntimeOverrideRef:     overrideRef,
 		Cockpit:                request.Cockpit,
 		CockpitSession:         request.CockpitSession,
 		SkipNativeReviewFanout: request.SkipNativeReviewFanout,
@@ -208,7 +235,10 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if jobTimeout > 0 {
 		lockTTL = jobTimeout + runtimeLeaseTeardownGrace
 	}
-	releaseLock, acquired, lockKey, ownerToken, err := acquireRuntimeSessionLock(ctx, store, job.ID, runtimeAgent(agent), time.Now().UTC(), lockTTL)
+	// SESSION SAFETY (#531): the lock is taken on the EFFECTIVE agent, so an
+	// overridden job locks the OVERRIDE runtime's session key and can never
+	// collide with (or occupy) the agent's default-runtime session lock.
+	releaseLock, acquired, lockKey, ownerToken, err := acquireJobRuntimeSessionLock(ctx, store, job.ID, effectiveAgent, overrideRuntime != "", time.Now().UTC(), lockTTL)
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
@@ -229,9 +259,16 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	// AdvanceJob, which fires while this lock is still held) recognizes its own lock
 	// and does not refuse the healthy-path cleanup as a foreign live owner (#536).
 	ctx = workflow.WithRuntimeSelfOwnerToken(ctx, ownerToken)
-	adapter, err := runtimeStartAdapter(newRuntimeFactory(), agent.Runtime, checkoutPath)
+	// Adapter selection uses the EFFECTIVE runtime: this is the seam that makes
+	// a --runtime override actually deliver through the override adapter (#531).
+	adapter, err := runtimeStartAdapter(newRuntimeFactory(), effectiveAgent.Runtime, checkoutPath)
 	if err != nil {
 		return localAgentJobOutput{}, err
+	}
+	if overrideRuntime != "" {
+		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_override", Message: jobRuntimeOverrideEventMessage(agent.Runtime, effectiveAgent, lockKey)}); err != nil {
+			return localAgentJobOutput{}, err
+		}
 	}
 	runCtx := ctx
 	if managed.OK {
@@ -257,12 +294,19 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		// reuses the runtime-session lock already held from acquireRuntimeSessionLock
 		// above — no second lock acquisition — so the two serialized Deliver calls
 		// can never self-deadlock on "session is busy".
-		handled, abErr := maybeRunLiveAB(runCtx, store, request, agent, job, adapter, managed.OK)
-		if abErr != nil {
-			return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, abErr)
+		// A runtime-overridden ask skips the live-A/B interceptor: the A/B
+		// compares template variants on the agent's OWN runtime session, which an
+		// override job deliberately does not run on.
+		handled := false
+		if overrideRuntime == "" {
+			var abErr error
+			handled, abErr = maybeRunLiveAB(runCtx, store, request, agent, job, adapter, managed.OK)
+			if abErr != nil {
+				return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, abErr)
+			}
 		}
 		if !handled {
-			if _, err := (workflow.Mailbox{Store: store}).Run(runCtx, job.ID, runtimeAgent(agent), adapter); err != nil {
+			if _, err := (workflow.Mailbox{Store: store}).Run(runCtx, job.ID, effectiveAgent, adapter); err != nil {
 				return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, err)
 			}
 		}
@@ -275,7 +319,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			workflowHome = paths.Home
 		}
 		engine := daemonWorkflowEngine(store, github.NewClient(checkoutPath), checkoutPath, workflowHome)
-		if _, err := engine.RunJob(runCtx, job.ID, runtimeAgent(agent), adapter); err != nil {
+		if _, err := engine.RunJob(runCtx, job.ID, effectiveAgent, adapter); err != nil {
 			if out, ok, _ := recoverAdvanceErrorOutput(ctx, store, job.ID, request, err); ok {
 				return out, nil
 			}
@@ -404,7 +448,11 @@ func routeSelectedMessage(request localAgentDispatchRequest) string {
 	if path == "" {
 		path = "local_agent"
 	}
-	return fmt.Sprintf("selected %s via %s: %s", action, path, reason)
+	message := fmt.Sprintf("selected %s via %s: %s", action, path, reason)
+	if override := strings.TrimSpace(request.Runtime); override != "" {
+		message += fmt.Sprintf("; runtime override: %s", override)
+	}
+	return message
 }
 
 func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, record db.Repo, repo github.Repository, request localAgentDispatchRequest) (localAgentDispatchRequest, string, error) {

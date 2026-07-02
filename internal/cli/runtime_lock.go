@@ -25,6 +25,25 @@ import (
 // (no resource key) returns an empty token and a no-op release.
 func acquireRuntimeSessionLock(ctx context.Context, store *db.Store, jobID string, agent runtime.Agent, now time.Time, ttl time.Duration) (func(context.Context) error, bool, string, string, error) {
 	key, ok := runtimeSessionResourceKey(agent)
+	return acquireRuntimeSessionLockWithKey(ctx, store, jobID, key, ok, now, ttl)
+}
+
+// acquireJobRuntimeSessionLock is the override-aware variant of
+// acquireRuntimeSessionLock: a job running under a per-job runtime override
+// (#531) locks the OVERRIDE runtime's session key (see
+// overrideRuntimeSessionResourceKey) — the effective agent already carries the
+// override runtime + per-job ref — so it can never collide with (or take) the
+// agent's default-runtime session lock. A non-overridden job is byte-identical
+// to acquireRuntimeSessionLock.
+func acquireJobRuntimeSessionLock(ctx context.Context, store *db.Store, jobID string, agent runtime.Agent, overridden bool, now time.Time, ttl time.Duration) (func(context.Context) error, bool, string, string, error) {
+	if !overridden {
+		return acquireRuntimeSessionLock(ctx, store, jobID, agent, now, ttl)
+	}
+	key, ok := overrideRuntimeSessionResourceKey(agent)
+	return acquireRuntimeSessionLockWithKey(ctx, store, jobID, key, ok, now, ttl)
+}
+
+func acquireRuntimeSessionLockWithKey(ctx context.Context, store *db.Store, jobID string, key string, ok bool, now time.Time, ttl time.Duration) (func(context.Context) error, bool, string, string, error) {
 	if !ok {
 		return func(context.Context) error { return nil }, true, "", "", nil
 	}

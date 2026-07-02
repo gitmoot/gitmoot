@@ -63,22 +63,22 @@ type Mailbox struct {
 }
 
 type JobRequest struct {
-	ID                     string
-	Agent                  string
-	Action                 string
-	Repo                   string
-	Branch                 string
-	PullRequest            int
-	HeadSHA                string
-	GoalID                 string
-	TaskID                 string
-	TaskTitle              string
-	LeadAgent              string
-	Reviewers              []string
-	ReviewRound            string
-	Sender                 string
-	Instructions           string
-	Constraints            []string
+	ID           string
+	Agent        string
+	Action       string
+	Repo         string
+	Branch       string
+	PullRequest  int
+	HeadSHA      string
+	GoalID       string
+	TaskID       string
+	TaskTitle    string
+	LeadAgent    string
+	Reviewers    []string
+	ReviewRound  string
+	Sender       string
+	Instructions string
+	Constraints  []string
 	// TemplateOverride, when non-nil, replaces the agent's own template snapshot
 	// for this job only (the agent's identity is unchanged). Used by the
 	// orchestrate/run --recipe flag to route a coordinator to a built-in recipe
@@ -107,6 +107,13 @@ type JobRequest struct {
 	VerifyAttempt          int
 	DelegationFinalize     bool
 	Model                  string
+	// RuntimeOverride, when non-empty, runs THIS job through the named runtime
+	// instead of the agent's registered default runtime (#531). The agent's
+	// stored runtime/session are untouched: the job runs on RuntimeOverrideRef
+	// (an explicit session on the override runtime, or a minted fresh ref), and
+	// the engine never persists a refreshed session ref for an overridden job.
+	RuntimeOverride        string
+	RuntimeOverrideRef     string
 	Phase                  string
 	Cockpit                bool
 	CockpitSession         string
@@ -159,6 +166,8 @@ type JobPayload struct {
 	VerifyAttempt          int            `json:"verify_attempt,omitempty"`
 	DelegationFinalize     bool           `json:"delegation_finalize,omitempty"`
 	Model                  string         `json:"model,omitempty"`
+	RuntimeOverride        string         `json:"runtime_override,omitempty"`
+	RuntimeOverrideRef     string         `json:"runtime_override_ref,omitempty"`
 	Phase                  string         `json:"phase,omitempty"`
 	Cockpit                bool           `json:"cockpit,omitempty"`
 	CockpitSession         string         `json:"cockpit_session,omitempty"`
@@ -232,6 +241,8 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		VerifyAttempt:          request.VerifyAttempt,
 		DelegationFinalize:     request.DelegationFinalize,
 		Model:                  request.Model,
+		RuntimeOverride:        strings.TrimSpace(request.RuntimeOverride),
+		RuntimeOverrideRef:     strings.TrimSpace(request.RuntimeOverrideRef),
 		Phase:                  request.Phase,
 		Cockpit:                request.Cockpit,
 		CockpitSession:         strings.TrimSpace(request.CockpitSession),
@@ -380,7 +391,14 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		_ = m.fail(ctx, job.ID, fmt.Sprintf("delivery failed: %v", firstErr))
 		return AgentResult{}, firstErr
 	}
-	m.persistRefreshedRuntimeRef(ctx, job.ID, agent, firstRefreshedRef)
+	// SESSION SAFETY (#531): a job running under a per-job runtime override must
+	// never write back to the agent's stored resume state — the stored ref
+	// belongs to the DEFAULT runtime, and persisting an override-runtime ref
+	// there would corrupt the agent's session identity. The refreshed ref is
+	// still adopted in-memory below so repair retries stay coherent.
+	if payload.RuntimeOverride == "" {
+		m.persistRefreshedRuntimeRef(ctx, job.ID, agent, firstRefreshedRef)
+	}
 	// If the first delivery self-healed a dead session (#443), adopt the freshly
 	// minted ref in-memory so a subsequent repair retry resumes the new session
 	// rather than re-resuming the dead UUID (which would self-heal a second time
@@ -423,7 +441,11 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 				_ = m.fail(ctx, job.ID, fmt.Sprintf("repair delivery failed: %v", repairErr))
 				return AgentResult{}, repairErr
 			}
-			m.persistRefreshedRuntimeRef(ctx, job.ID, agent, repairRefreshedRef)
+			// Same #531 override guard as the first delivery: never persist an
+			// override-runtime ref onto the agent's default-runtime resume state.
+			if payload.RuntimeOverride == "" {
+				m.persistRefreshedRuntimeRef(ctx, job.ID, agent, repairRefreshedRef)
+			}
 			// Adopt a freshly minted session ref so the next repair re-ask resumes the
 			// new session rather than re-resuming a dead UUID (mirrors the first
 			// delivery's self-heal adoption above).
@@ -661,6 +683,32 @@ func validateJobRequest(request JobRequest) error {
 		return errors.New("job action is required")
 	case strings.TrimSpace(request.Repo) == "":
 		return errors.New("job repo is required")
+	}
+	return validateJobRuntimeOverrideRequest(request)
+}
+
+// validateJobRuntimeOverrideRequest rejects an invalid per-job runtime
+// override (#531) at the enqueue chokepoint, BEFORE a job row exists, so every
+// producer (CLI dispatch, daemon re-enqueues, future delegation runtime) fails
+// fast with an actionable error instead of enqueuing a job the worker cannot
+// run. Empty override = no override = always valid.
+func validateJobRuntimeOverrideRequest(request JobRequest) error {
+	override := strings.TrimSpace(request.RuntimeOverride)
+	ref := strings.TrimSpace(request.RuntimeOverrideRef)
+	if override == "" {
+		if ref != "" {
+			return errors.New("job runtime override session requires a runtime override")
+		}
+		return nil
+	}
+	if _, err := (runtime.Factory{}).Adapter(override); err != nil {
+		return err
+	}
+	if ref == "" {
+		return fmt.Errorf("job runtime override %q requires a session reference", override)
+	}
+	if override == runtime.ShellRuntime && runtime.IsFreshRef(ref) {
+		return errors.New("shell runtime override requires an explicit session command (shell sessions are commands, not resumable sessions)")
 	}
 	return nil
 }

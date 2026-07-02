@@ -111,19 +111,52 @@ func (f Factory) Adapter(name string) (Adapter, error) {
 	case ShellRuntime:
 		return ShellAdapter{Runner: f.Runner}, nil
 	default:
-		return nil, fmt.Errorf("unsupported runtime: %s", name)
+		return nil, fmt.Errorf("unsupported runtime: %s (supported: %s)", name, strings.Join(SupportedRuntimes(), ", "))
 	}
+}
+
+// SupportedRuntimes enumerates every runtime name the adapter Factory can
+// construct — the single source of truth callers (e.g. the per-job --runtime
+// override validation) use instead of hard-coding runtime names. Keep it in
+// lockstep with Factory.Adapter; TestSupportedRuntimesMatchFactory proves the
+// coupling both ways.
+func SupportedRuntimes() []string {
+	return []string{CodexRuntime, ClaudeRuntime, KimiRuntime, KimiCLIRuntime, ShellRuntime}
+}
+
+// FreshRefPrefix marks a runtime reference that names no existing session:
+// "fresh:<uuid>". A delivery against a fresh ref must start a brand-new
+// session on its runtime and must never resume (or write back to) any stored
+// session. The uuid suffix exists so each fresh ref — and therefore each
+// runtime-session lock key derived from it — is unique per job; adapters do
+// not reuse it as the actual CLI session id. Minted by the per-job --runtime
+// override path (#531) when no explicit session is given.
+const FreshRefPrefix = "fresh:"
+
+// NewFreshRef mints a unique fresh-session runtime reference (see
+// FreshRefPrefix).
+func NewFreshRef() (string, error) {
+	id, err := newUUID()
+	if err != nil {
+		return "", err
+	}
+	return FreshRefPrefix + id, nil
+}
+
+// IsFreshRef reports whether ref is a fresh-session reference.
+func IsFreshRef(ref string) bool {
+	return strings.HasPrefix(ref, FreshRefPrefix)
 }
 
 func ValidateAgent(agent Agent) error {
 	if err := validateAgentFields(agent, true); err != nil {
 		return err
 	}
-	if agent.Runtime == ClaudeRuntime && agent.RuntimeRef != LastRef && !isUUID(agent.RuntimeRef) {
-		return fmt.Errorf("claude runtime reference %q must be a UUID or last", agent.RuntimeRef)
+	if agent.Runtime == ClaudeRuntime && agent.RuntimeRef != LastRef && !isUUID(agent.RuntimeRef) && !IsFreshRef(agent.RuntimeRef) {
+		return fmt.Errorf("claude runtime reference %q must be a UUID, last, or fresh:<uuid>", agent.RuntimeRef)
 	}
-	if isKimiRuntime(agent.Runtime) && agent.RuntimeRef != "" && !isKimiSessionID(agent.RuntimeRef) {
-		return fmt.Errorf("kimi runtime reference %q must be a Kimi session id or empty", agent.RuntimeRef)
+	if isKimiRuntime(agent.Runtime) && agent.RuntimeRef != "" && !isKimiSessionID(agent.RuntimeRef) && !IsFreshRef(agent.RuntimeRef) {
+		return fmt.Errorf("kimi runtime reference %q must be a Kimi session id, fresh:<uuid>, or empty", agent.RuntimeRef)
 	}
 	return nil
 }
@@ -292,12 +325,26 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 	if err := a.Validate(ctx, agent); err != nil {
 		return Result{}, err
 	}
+	args := append([]string{"exec"}, codexSandboxArgs(agent)...)
+	model := effectiveModel(agent, job)
+	// A fresh ref (per-job --runtime override, #531) starts a brand-new exec
+	// session — never `resume` — so an overridden job cannot read or pollute any
+	// stored session's state.
+	if IsFreshRef(agent.RuntimeRef) {
+		if model != "" {
+			args = append(args, "--model", model)
+		}
+		args = append(args, "--", job.Prompt)
+		result, err := a.runner().Run(ctx, a.Dir, "codex", args...)
+		if err != nil {
+			return Result{Raw: result.Stdout + result.Stderr}, codexCommandError(result, err)
+		}
+		return Result{Raw: result.Stdout}, nil
+	}
 	if err := a.verifySession(ctx, agent); err != nil {
 		return Result{}, err
 	}
-	args := append([]string{"exec"}, codexSandboxArgs(agent)...)
 	args = append(args, "resume")
-	model := effectiveModel(agent, job)
 	if model != "" {
 		args = append(args, "--model", model)
 	}
@@ -437,6 +484,12 @@ func (a ClaudeAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Resul
 		return Result{}, err
 	}
 	model := effectiveModel(agent, job)
+	// A fresh ref (per-job --runtime override, #531) delivers on a brand-new
+	// dedicated --session-id — never --resume/--continue — so an overridden job
+	// cannot read or pollute any stored session's state.
+	if IsFreshRef(agent.RuntimeRef) {
+		return a.deliverFresh(ctx, agent, job, model)
+	}
 	// The Claude CLI intermittently fails a delivery with a transient
 	// "401 socket connection was closed unexpectedly" under sustained
 	// concurrency; a byte-identical retry typically clears it. Retry on that
@@ -513,6 +566,44 @@ func (a ClaudeAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Resul
 		return Result{Raw: result.Stdout + result.Stderr}, claudeCommandError(result, err)
 	}
 	parsed := Result{Raw: result.Stdout, RefreshedRuntimeRef: refreshedRef}
+	summary, inTok, outTok := parseClaudeJSONResult(result.Stdout)
+	if summary != "" {
+		parsed.Summary = summary
+	} else {
+		parsed.Summary = strings.TrimSpace(result.Stdout)
+	}
+	parsed.InputTokens = inTok
+	parsed.OutputTokens = outTok
+	return parsed, nil
+}
+
+// deliverFresh delivers one job on a brand-new dedicated Claude session (the
+// fresh-ref path, #531). Each attempt mints a NEW session id, mirroring the
+// #443 self-heal shape (claudeFreshSessionArgs — never --resume/--continue),
+// so a transient-401 retry can never trip over an already-created session id.
+// It intentionally returns no RefreshedRuntimeRef: a fresh-ref delivery is
+// one-shot and must never re-pin the agent's stored session.
+func (a ClaudeAdapter) deliverFresh(ctx context.Context, agent Agent, job Job, model string) (Result, error) {
+	var result subprocess.Result
+	var err error
+	for attempt := 1; ; attempt++ {
+		var sessionID string
+		sessionID, err = a.newRuntimeRef()
+		if err != nil {
+			return Result{}, err
+		}
+		result, err = a.runner().Run(ctx, a.Dir, "claude", claudeFreshSessionArgs(agent, job.Prompt, model, sessionID)...)
+		if attempt >= claudeDeliveryMaxAttempts || !isTransientClaudeDeliveryError(result, err) {
+			break
+		}
+		if waitErr := a.waitRetryBackoff(ctx, attempt); waitErr != nil {
+			break
+		}
+	}
+	if err != nil {
+		return Result{Raw: result.Stdout + result.Stderr}, claudeCommandError(result, err)
+	}
+	parsed := Result{Raw: result.Stdout}
 	summary, inTok, outTok := parseClaudeJSONResult(result.Stdout)
 	if summary != "" {
 		parsed.Summary = summary
@@ -728,6 +819,12 @@ func (a ShellAdapter) Validate(_ context.Context, agent Agent) error {
 func (a ShellAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, error) {
 	if err := a.Validate(ctx, agent); err != nil {
 		return Result{}, err
+	}
+	// Shell "sessions" are commands, so there is no such thing as minting a
+	// fresh one; a fresh ref reaching this adapter means a caller forgot to
+	// require an explicit session command for a shell override.
+	if IsFreshRef(agent.RuntimeRef) {
+		return Result{}, errors.New("shell runtime cannot mint a fresh session; provide an explicit session command")
 	}
 	result, err := a.runner().Run(ctx, a.Dir, "sh", "-c", agent.RuntimeRef, "gitmoot", job.Prompt)
 	if err != nil {

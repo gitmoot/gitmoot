@@ -4082,6 +4082,16 @@ func queuedJobRuntimeResourceKey(ctx context.Context, store *db.Store, job db.Jo
 	if store == nil {
 		return ""
 	}
+	// A per-job runtime override (#531) runs on ITS OWN session key, so schedule
+	// it under that key (fully payload-derived — no GetAgent needed) rather than
+	// the agent's default-runtime session it will never take.
+	if payload, err := daemonJobPayload(job); err == nil && strings.TrimSpace(payload.RuntimeOverride) != "" {
+		key, ok := overrideRuntimeSessionResourceKey(applyJobRuntimeOverride(runtime.Agent{}, payload))
+		if !ok {
+			return ""
+		}
+		return key
+	}
 	agent, err := store.GetAgent(ctx, job.Agent)
 	if err != nil {
 		return ""
@@ -4127,6 +4137,22 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		return nil
 	}
 	agent := runtimeAgent(dbAgent)
+	// Per-job runtime override (#531): the payload carries the override, so a
+	// background/daemon job honors it identically to a foreground dispatch. The
+	// effective agent swaps in the override runtime + the job's own session ref;
+	// the stored agent row (and its default-runtime session) is never touched.
+	defaultRuntime := agent.Runtime
+	overridden := strings.TrimSpace(payload.RuntimeOverride) != ""
+	if overridden {
+		agent = applyJobRuntimeOverride(agent, payload)
+		if err := runtime.ValidateAgent(agent); err != nil {
+			if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+				return finishErr
+			}
+			_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
+			return nil
+		}
+	}
 	if readOnlyImplementationBlocked(job.Type, agent) {
 		transitioned, err := markJobPermissionBlocked(ctx, w.Store, job.ID)
 		if err != nil {
@@ -4197,7 +4223,10 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if jobTimeout > 0 {
 		lockTTL = jobTimeout + runtimeLeaseTeardownGrace
 	}
-	releaseLock, acquired, lockKey, ownerToken, err := acquireRuntimeSessionLock(ctx, w.Store, job.ID, agent, time.Now().UTC(), lockTTL)
+	// SESSION SAFETY (#531): the lock is taken on the EFFECTIVE agent, so an
+	// overridden job locks the OVERRIDE runtime's session key and can never
+	// collide with (or occupy) the agent's default-runtime session lock.
+	releaseLock, acquired, lockKey, ownerToken, err := acquireJobRuntimeSessionLock(ctx, w.Store, job.ID, agent, overridden, time.Now().UTC(), lockTTL)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -4243,6 +4272,13 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// owner held it (#536 / #478). Covers RunJob and the handleRunJobError finalize
 	// path below, both of which derive from this ctx.
 	ctx = workflow.WithRuntimeSelfOwnerToken(ctx, ownerToken)
+	// Expose the effective runtime (and the session lock it runs under) in job
+	// history so an overridden background job is observable (#531).
+	if overridden {
+		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_override", Message: jobRuntimeOverrideEventMessage(defaultRuntime, agent, lockKey)}); eventErr != nil {
+			writeLine(w.Stdout, "job %s runtime_override event failed: %v", job.ID, eventErr)
+		}
+	}
 	// Cockpit wrapping happens AFTER the runtime-session lock + checkout
 	// resolution so at most one live pane exists per held runtime session and the
 	// pane's CWD is the resolved worktree. It is strictly opt-in and best-effort:
@@ -4819,6 +4855,12 @@ func tempWorkerEligible(ctx context.Context, store *db.Store, job db.Job, payloa
 		// An ephemeral job already runs directly on its own throwaway worker;
 		// forking it into a second temp worker would double-spawn.
 		return tempWorkerEligibility{Reason: "ephemeral worker runs directly"}
+	}
+	if strings.TrimSpace(payload.RuntimeOverride) != "" {
+		// An override job already runs on its own per-job session (a fresh ref or
+		// an explicit --session); forking a temp worker from the effective agent
+		// would re-derive a second session for the same one-shot job.
+		return tempWorkerEligibility{Reason: "runtime override runs on its own session"}
 	}
 	if payload.DelegationReason == "temp_worker_merge_back" {
 		return tempWorkerEligibility{Reason: "merge-back waits for original runtime session"}
