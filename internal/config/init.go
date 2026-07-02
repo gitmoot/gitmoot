@@ -208,17 +208,28 @@ path = ""
 #     opt heavy tools (jscpd/golangci-lint) in. An unknown name is ignored.
 #   hard_verifiers_enabled (#474): OFF by default; requires auto_trace AND at least one
 #     hard_verifier_commands line. When true, a MERGED implement job runs the configured
-#     build/test/lint COMMANDS in a FRESH clean sandbox checkout at the merged head (a
-#     detached git worktree — no external sandbox dep), exit 0 == pass. The binary
-#     verdict is the authoritative EvaluatorScore.Hard (pass ⇒ hard=1.0/choice a, fail
-#     ⇒ hard=0.0/choice b) — an un-gameable FOURTH coexisting row (reviewer
-#     gitmoot-verifier, item hard#repo#pr) that catches a merge whose code fails a clean
-#     build/test even through an empty (no-CI) gate. DETACHED + best-effort: an
-#     unprovisionable sandbox or empty command list writes no row and never blocks the
-#     merge. Off ⇒ byte-identical. Promotion stays MANUAL.
+#     build/test/lint COMMANDS in a FRESH clean sandbox checkout at the merged head (an
+#     INDEPENDENT local 'git clone' of the daemon checkout — its own git dir, so a
+#     verifier that shells out to git cannot touch the live repo; no external sandbox
+#     dep), exit 0 == pass. The binary verdict is the authoritative EvaluatorScore.Hard
+#     (pass ⇒ hard=1.0/choice a, fail ⇒ hard=0.0/choice b) — an un-gameable FOURTH
+#     coexisting row (reviewer gitmoot-verifier, item hard#repo#pr) that catches a merge
+#     whose code fails a clean build/test even through an empty (no-CI) gate. DETACHED +
+#     best-effort: an unprovisionable sandbox or empty command list writes no row and
+#     never blocks the merge. Off ⇒ byte-identical. Promotion stays MANUAL.
 #   hard_verifier_commands (#474): REPEATABLE — one verifier command per line (so a
 #     command may contain commas / shell operators). The run PASSES only when EVERY
 #     command exits 0. UNSET/empty ⇒ the tier is a no-op (no safe universal default).
+#     IMPORTANT: the sandbox is a BARE checkout of the merged code — it has NO installed
+#     dependencies, build artifacts, or generated files, and inherits only the daemon's
+#     ambient PATH. Each command MUST self-provision what it needs (e.g.
+#     'npm ci && npm test', 'pip install -e . && pytest', or 'go test ./...' which
+#     fetches modules on its own) — a command that assumes a pre-installed
+#     node_modules/venv will FAIL every merge and record a false hard=0. A command that
+#     cannot be RUN at all (its interpreter/binary is absent, exit 127) is treated as an
+#     environment failure and SKIPS the run (no row) instead of recording a negative, but
+#     a command that runs and exits non-zero because deps were missing is an honest FAIL
+#     — so keep each command self-contained.
 # [skillopt]
 # auto_trace_enabled = false
 # cross_family_review_enabled = false

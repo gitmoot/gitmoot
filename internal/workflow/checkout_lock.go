@@ -20,6 +20,20 @@ const (
 	checkoutMutationBusyMessage = "This checkout is already being mutated by another Gitmoot task. Run tasks sequentially or enable per-task worktrees for parallel implementation."
 )
 
+// AcquireCheckoutMutationLock is the EXPORTED seam for out-of-package callers (the
+// CLI hard-verifier sandbox provisioner, #474/#617) to serialize a shared-checkout
+// operation on the SAME resource key every in-package worktree/checkout mutation uses
+// (AllocateTaskWorktree, AllocateReadOnlyDelegationWorktree, the merge gate). It waits
+// up to the standard budget for a concurrent holder, then returns a release the caller
+// MUST call to drop the lock. An empty checkoutPath is a no-op that returns a no-op
+// release (nothing to serialize). Callers hold it only around the short shared-repo
+// op (e.g. a local clone that reads the base .git) and release it before any long,
+// self-contained work, so the leg never stalls a real job for more than that op.
+func AcquireCheckoutMutationLock(ctx context.Context, store *db.Store, checkoutPath string, ownerID string, now time.Time) (func(context.Context) error, error) {
+	release, _, err := acquireCheckoutMutationLockWithWait(ctx, store, checkoutPath, ownerID, now)
+	return release, err
+}
+
 func acquireCheckoutMutationLock(ctx context.Context, store *db.Store, checkoutPath string, ownerID string, now time.Time) (func(context.Context) error, string, error) {
 	key, err := checkoutMutationLockKey(checkoutPath)
 	if err != nil {

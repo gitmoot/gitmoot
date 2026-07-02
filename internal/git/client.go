@@ -66,6 +66,58 @@ func (c Client) AddDetachedWorktree(ctx context.Context, path string, ref string
 	return err
 }
 
+// CloneLocalNoCheckout makes an INDEPENDENT local clone of this repo (c.Dir) into
+// dest via `git clone --local --no-checkout`. Because the source is local, git
+// HARDLINKS everything under objects/ (fast, space-cheap) and copies refs, but the
+// clone gets its OWN git directory: its own object DB directory, refs, config, HEAD,
+// and worktree registry. A command later run INSIDE the clone (`git config`,
+// `git update-ref`, `git gc`, `git worktree prune`) therefore mutates only the
+// clone's git state, never the source repo's — the containment property a detached
+// `git worktree` off the source CANNOT provide (a worktree shares the source's
+// object DB, refs, and config). --no-checkout leaves the working tree empty for a
+// subsequent CheckoutDetach at a specific ref. Because objects are copied wholesale
+// (not just reachable ones), any SHA present in the source's object DB stays
+// checkoutable in the clone, so it preserves the availability of a raw
+// `git worktree add --detach <sha>`.
+func (c Client) CloneLocalNoCheckout(ctx context.Context, dest string) error {
+	dest, err := validateWorktreePath(dest)
+	if err != nil {
+		return err
+	}
+	src := strings.TrimSpace(c.Dir)
+	if src == "" {
+		return errors.New("clone source (client dir) is required")
+	}
+	_, err = c.run(ctx, "clone", "--local", "--no-checkout", src, dest)
+	return err
+}
+
+// CheckoutDetach checks out ref as a detached HEAD (`git checkout --detach <ref>`).
+// It accepts a raw SHA even when unreachable from any ref, so it pairs with
+// CloneLocalNoCheckout to materialize an exact merged head in a fresh clone.
+func (c Client) CheckoutDetach(ctx context.Context, ref string) error {
+	if err := validateRef(ref); err != nil {
+		return err
+	}
+	_, err := c.run(ctx, "checkout", "--detach", ref)
+	return err
+}
+
+// RemoveRemote drops a configured remote (`git remote remove <name>`). It is used to
+// sever a throwaway sandbox clone from its origin (the daemon checkout) so a verifier
+// command can never `git fetch`/`git push` back against the live repo.
+func (c Client) RemoveRemote(ctx context.Context, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("remote name is required")
+	}
+	if strings.HasPrefix(name, "-") {
+		return fmt.Errorf("remote name %q must not start with '-'", name)
+	}
+	_, err := c.run(ctx, "remote", "remove", name)
+	return err
+}
+
 func (c Client) BranchExists(ctx context.Context, branch string) (bool, error) {
 	if err := validateBranch(branch); err != nil {
 		return false, err

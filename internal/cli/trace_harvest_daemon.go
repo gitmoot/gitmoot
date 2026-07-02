@@ -137,8 +137,10 @@ func daemonDeterministicCheckerDispatcher(store *db.Store, gh github.Client, che
 // verifiers to run. When nil, the engine constructs no verifier leg and writes no
 // hard row, so daemon behavior is byte-identical. It mirrors
 // daemonDeterministicCheckerDispatcher's off-by-default gate. The sandbox is a fresh
-// detached worktree off the daemon's checkout at the merged head (reusing gitmoot's
-// worktree isolation, no external sandbox dep).
+// INDEPENDENT local clone of the daemon's checkout, detached at the merged head — its
+// own git dir (config/refs/gc/worktree registry), so a verifier that shells out to git
+// cannot escape into the live checkout (reusing gitmoot's single-binary git tooling, no
+// external sandbox dep).
 func daemonHardVerifierDispatcher(store *db.Store, checkout string, home string) workflow.HardVerifierDispatcher {
 	if store == nil {
 		return nil
@@ -152,12 +154,15 @@ func daemonHardVerifierDispatcher(store *db.Store, checkout string, home string)
 		// GroupRunner (process-group SIGTERM→SIGKILL) reaps a wedged verifier AND its
 		// grandchildren (a `go test` spawns test binaries, `npm test` spawns node), so
 		// the leg's bounded context can never leave an orphaned suite running. The
-		// short-lived git worktree calls keep the plain ExecRunner (no grandchildren).
+		// short-lived git clone/checkout calls keep the plain ExecRunner (no grandchildren).
 		runner: subprocess.GroupRunner{},
-		sandbox: worktreeSandboxProvisioner{
+		sandbox: cloneSandboxProvisioner{
 			base:   checkout,
 			home:   home,
 			runner: subprocess.ExecRunner{},
+			// store backs the checkout-mutation lock that serializes the sandbox clone's
+			// base read against concurrent real jobs on the same daemon checkout (#617).
+			store: store,
 		},
 		commands: policy.ResolvedHardVerifierCommands(),
 	}
