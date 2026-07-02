@@ -73,13 +73,19 @@ func classifyCheckoutContention(cause error) (checkoutContentionKind, string) {
 		return checkoutContentionNone, ""
 	}
 	text := cause.Error()
+	// Match ONLY the three daemon-owned pre-flight string families the #532 design
+	// names: branch-lock contention, a dirty checkout, and a wrong HEAD. The
+	// branch-identity guard ("checkout branch is X, not job branch Y") is
+	// deliberately NOT matched — it is a routing/config mismatch (a job resolving a
+	// checkout on the wrong branch), not a self-healing or human-clean-the-checkout
+	// condition, so it keeps its existing terminal path.
 	switch {
 	case strings.Contains(text, "is locked by"):
 		return checkoutContentionLock, ""
 	case strings.Contains(text, "has uncommitted changes"):
 		return checkoutContentionDirty, "the registered checkout has uncommitted changes; commit, stash, or discard them (git checkout -- .) so the job's pre-flight can pass, then it auto-retries"
-	case strings.Contains(text, "checkout head is"), strings.Contains(text, "checkout branch is"):
-		return checkoutContentionDirty, "the registered checkout is on the wrong branch/commit; reset it to the branch/head the job expects (git checkout <branch> / git reset --hard <sha>), then it auto-retries"
+	case strings.Contains(text, "checkout head is"):
+		return checkoutContentionDirty, "the registered checkout is on the wrong commit; sync it to the head the job expects (git fetch && git reset --hard <sha>), then it auto-retries"
 	}
 	return checkoutContentionNone, ""
 }
