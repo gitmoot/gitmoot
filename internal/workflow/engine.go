@@ -5874,21 +5874,43 @@ func (e Engine) AutoFinalizeExpiredEscalations(ctx context.Context, ttl time.Dur
 	if ttl <= 0 {
 		return 0, nil
 	}
-	jobs, err := e.Store.ListJobs(ctx)
+	// BOUNDED (#598): iterate ONLY the coordinators with an open escalation round
+	// (requested > resolved) instead of listing EVERY job and re-reading each one's
+	// full event history twice. Zero candidates => the loop body never runs, so this
+	// is an immediate return with no per-job GetJob/ListJobEvents on the overwhelming
+	// common case (no tree paused awaiting a human). The retained per-candidate
+	// exists/resolved gates below are always-pass for a candidate but kept verbatim,
+	// both to defend against an event added between this query and the walk and to
+	// keep the finalization logic byte-identical.
+	jobIDs, err := e.Store.JobIDsWithOpenEscalation(ctx)
 	if err != nil {
 		return 0, err
 	}
 	now := e.now().UTC()
 	finalized := 0
-	for _, job := range jobs {
-		rec, exists, err := e.loadEscalation(ctx, job.ID)
+	for _, jobID := range jobIDs {
+		// A candidate escalation event whose job row was pruned would make the
+		// payload load below fail; skip it here on sql.ErrNoRows, mirroring the
+		// reclaim/retry bounded passes (#598). Unreachable today (nothing prunes
+		// jobs), but keeps the pattern and the PollOnce caller robust to a future
+		// job-pruning feature. The fetched job is reused for the payload below, so a
+		// finalized candidate costs a single GetJob rather than the old
+		// GetJob-then-jobPayload double read (#615 review).
+		job, err := e.Store.GetJob(ctx, jobID)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return finalized, err
+		}
+		rec, exists, err := e.loadEscalation(ctx, jobID)
 		if err != nil {
 			return finalized, err
 		}
 		if !exists {
 			continue
 		}
-		resolved, err := e.escalationResolved(ctx, job.ID)
+		resolved, err := e.escalationResolved(ctx, jobID)
 		if err != nil {
 			return finalized, err
 		}
@@ -5904,7 +5926,7 @@ func (e Engine) AutoFinalizeExpiredEscalations(ctx context.Context, ttl time.Dur
 		if now.Sub(pausedAt) < ttl {
 			continue
 		}
-		coordinatorJob, payload, err := e.jobPayload(ctx, job.ID)
+		payload, err := unmarshalPayload(job.Payload)
 		if err != nil {
 			return finalized, err
 		}
@@ -5912,7 +5934,7 @@ func (e Engine) AutoFinalizeExpiredEscalations(ctx context.Context, ttl time.Dur
 			continue
 		}
 		reason := fmt.Sprintf("escalation TTL of %s elapsed with no human response", ttl)
-		if err := e.enqueueFinalizeContinuation(ctx, coordinatorJob, payload, reason); err != nil {
+		if err := e.enqueueFinalizeContinuation(ctx, job, payload, reason); err != nil {
 			return finalized, err
 		}
 		if err := e.setTaskState(ctx, taskRefFromPayload(payload), TaskPlanned); err != nil {
@@ -5929,7 +5951,7 @@ func (e Engine) AutoFinalizeExpiredEscalations(ctx context.Context, ttl time.Dur
 			message = string(encoded)
 		}
 		if err := e.Store.AddJobEvent(ctx, db.JobEvent{
-			JobID:   job.ID,
+			JobID:   jobID,
 			Kind:    escalationResolvedEvent,
 			Message: message,
 		}); err != nil {

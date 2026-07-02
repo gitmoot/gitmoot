@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"math/rand"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -4081,6 +4083,479 @@ func TestJobIDsWithPendingDelegationWorktreeReclaimRaceSafe(t *testing.T) {
 		wantPending := i%2 == 1
 		if gotSet[jobID] != wantPending {
 			t.Fatalf("job %s pending=%v, want %v (set=%v)", jobID, gotSet[jobID], wantPending, got)
+		}
+	}
+}
+
+// referenceJobNeedsAdvanceRetry mirrors jobWorker.jobNeedsAdvanceRetry
+// (internal/cli/daemon.go) exactly: a last-one-wins walk over the tracked
+// advancement kinds, every other kind ignored. It is the source-of-truth the
+// bounded JobIDsWithPendingAdvanceRetry candidate query must reproduce set-at-once
+// — the mutation guard below cross-checks the two agree (#598). Keeping a copy here
+// (package db cannot import package cli) is deliberate: if a future edit adds a
+// positive kind to the daemon predicate without updating the store literals, the
+// TestJobIDsWithPendingAdvanceRetry cases that seed that kind flip red.
+func referenceJobNeedsAdvanceRetry(kinds []string) bool {
+	needsRetry := false
+	for _, kind := range kinds {
+		switch kind {
+		case "advance_started", "advance_retry":
+			needsRetry = true
+		case "advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped":
+			needsRetry = false
+		case "retry_queued":
+			needsRetry = false
+		}
+	}
+	return needsRetry
+}
+
+// referenceJobNeedsCommentRetry mirrors jobWorker.jobNeedsCommentRetry.
+func referenceJobNeedsCommentRetry(kinds []string) bool {
+	needsRetry := false
+	for _, kind := range kinds {
+		switch kind {
+		case "comment_post_failed":
+			needsRetry = true
+		case "comment_posted":
+			needsRetry = false
+		case "retry_queued":
+			needsRetry = false
+		}
+	}
+	return needsRetry
+}
+
+func TestJobIDsWithPendingAdvanceRetry(t *testing.T) {
+	cases := []struct {
+		name        string
+		events      []string // in insertion order
+		wantPending bool
+	}{
+		{name: "no events", events: nil, wantPending: false},
+		{name: "unrelated events only", events: []string{"queued", "running", "succeeded"}, wantPending: false},
+		{name: "advance started pending", events: []string{"advance_started"}, wantPending: true},
+		{name: "advance retry pending", events: []string{"advance_retry"}, wantPending: true},
+		{name: "started then completed", events: []string{"advance_started", "advance_completed"}, wantPending: false},
+		{name: "started then retry last wins pending", events: []string{"advance_started", "advance_retry"}, wantPending: true},
+		{name: "retry then retried", events: []string{"advance_retry", "advance_retried"}, wantPending: false},
+		{name: "started then blocked", events: []string{"advance_started", "advance_blocked"}, wantPending: false},
+		{name: "started then retry skipped", events: []string{"advance_started", "advance_retry_skipped"}, wantPending: false},
+		{name: "started then retry_queued 602 reset", events: []string{"advance_started", "retry_queued"}, wantPending: false},
+		{name: "completed then started reopened pending", events: []string{"advance_completed", "advance_started"}, wantPending: true},
+		{name: "started trailing noise ignored still pending", events: []string{"advance_started", "queued", "route_selected"}, wantPending: true},
+		{name: "completed trailing noise ignored not pending", events: []string{"advance_started", "advance_completed", "queued", "succeeded"}, wantPending: false},
+	}
+
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	want := map[string]bool{}
+	for i, tc := range cases {
+		jobID := "adv-job-" + string(rune('a'+i))
+		if err := store.CreateJob(ctx, Job{ID: jobID, Agent: "producer", Type: "implement", State: "failed"}); err != nil {
+			t.Fatalf("CreateJob(%s) returned error: %v", jobID, err)
+		}
+		for _, kind := range tc.events {
+			if err := store.AddJobEvent(ctx, JobEvent{JobID: jobID, Kind: kind, Message: "m"}); err != nil {
+				t.Fatalf("AddJobEvent(%s, %s) returned error: %v", jobID, kind, err)
+			}
+		}
+		// Mutation guard: the crafted expectation must equal the Go predicate.
+		if got := referenceJobNeedsAdvanceRetry(tc.events); got != tc.wantPending {
+			t.Fatalf("case %q: reference predicate = %v, wantPending %v", tc.name, got, tc.wantPending)
+		}
+		if tc.wantPending {
+			want[jobID] = true
+		}
+	}
+
+	got, err := store.JobIDsWithPendingAdvanceRetry(ctx)
+	if err != nil {
+		t.Fatalf("JobIDsWithPendingAdvanceRetry returned error: %v", err)
+	}
+	assertJobIDSet(t, got, want)
+}
+
+func TestJobIDsWithPendingCommentRetry(t *testing.T) {
+	cases := []struct {
+		name        string
+		events      []string
+		wantPending bool
+	}{
+		{name: "no events", events: nil, wantPending: false},
+		{name: "unrelated only", events: []string{"queued", "succeeded"}, wantPending: false},
+		{name: "failed pending", events: []string{"comment_post_failed"}, wantPending: true},
+		{name: "failed then posted", events: []string{"comment_post_failed", "comment_posted"}, wantPending: false},
+		{name: "failed then retry_queued reset", events: []string{"comment_post_failed", "retry_queued"}, wantPending: false},
+		{name: "posted then failed last wins pending", events: []string{"comment_posted", "comment_post_failed"}, wantPending: true},
+		{name: "failed trailing noise still pending", events: []string{"comment_post_failed", "queued", "succeeded"}, wantPending: true},
+	}
+
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	want := map[string]bool{}
+	for i, tc := range cases {
+		jobID := "cmt-job-" + string(rune('a'+i))
+		if err := store.CreateJob(ctx, Job{ID: jobID, Agent: "producer", Type: "implement", State: "failed"}); err != nil {
+			t.Fatalf("CreateJob(%s) returned error: %v", jobID, err)
+		}
+		for _, kind := range tc.events {
+			if err := store.AddJobEvent(ctx, JobEvent{JobID: jobID, Kind: kind, Message: "m"}); err != nil {
+				t.Fatalf("AddJobEvent(%s, %s) returned error: %v", jobID, kind, err)
+			}
+		}
+		if got := referenceJobNeedsCommentRetry(tc.events); got != tc.wantPending {
+			t.Fatalf("case %q: reference predicate = %v, wantPending %v", tc.name, got, tc.wantPending)
+		}
+		if tc.wantPending {
+			want[jobID] = true
+		}
+	}
+
+	got, err := store.JobIDsWithPendingCommentRetry(ctx)
+	if err != nil {
+		t.Fatalf("JobIDsWithPendingCommentRetry returned error: %v", err)
+	}
+	assertJobIDSet(t, got, want)
+}
+
+// TestJobIDsWithPendingRetryMutationGuard seeds many jobs with random sequences
+// drawn from the predicate kinds plus benign noise and asserts the two bounded
+// candidate queries return EXACTLY the set the corresponding Go last-one-wins
+// predicate marks pending. This is the divergence guard called for by the #598
+// review: it fails if the SQL kind literals ever drift from the daemon predicates.
+func TestJobIDsWithPendingRetryMutationGuard(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	advKinds := []string{
+		"advance_started", "advance_retry", "advance_completed", "advance_retried",
+		"advance_blocked", "advance_retry_skipped", "retry_queued",
+		"queued", "route_selected", "blocker_deferred", // noise
+	}
+	cmtKinds := []string{
+		"comment_post_failed", "comment_posted", "retry_queued",
+		"queued", "succeeded", "runtime_lock_wait", // noise
+	}
+
+	rng := rand.New(rand.NewSource(598))
+	const jobs = 200
+	wantAdv := map[string]bool{}
+	wantCmt := map[string]bool{}
+	for i := 0; i < jobs; i++ {
+		jobID := "mut-job-" + strings.Repeat("x", i%3) + string(rune('a'+i%26)) + string(rune('0'+i/26))
+		if err := store.CreateJob(ctx, Job{ID: jobID, Agent: "producer", Type: "implement", State: "failed"}); err != nil {
+			t.Fatalf("CreateJob returned error: %v", err)
+		}
+		var seq []string
+		n := rng.Intn(6)
+		for j := 0; j < n; j++ {
+			var kind string
+			// Interleave advancement and comment kinds so both predicates are exercised
+			// on the same job (their tracked sets are disjoint, so they never interfere).
+			if rng.Intn(2) == 0 {
+				kind = advKinds[rng.Intn(len(advKinds))]
+			} else {
+				kind = cmtKinds[rng.Intn(len(cmtKinds))]
+			}
+			seq = append(seq, kind)
+			if err := store.AddJobEvent(ctx, JobEvent{JobID: jobID, Kind: kind, Message: "m"}); err != nil {
+				t.Fatalf("AddJobEvent returned error: %v", err)
+			}
+		}
+		if referenceJobNeedsAdvanceRetry(seq) {
+			wantAdv[jobID] = true
+		}
+		if referenceJobNeedsCommentRetry(seq) {
+			wantCmt[jobID] = true
+		}
+	}
+
+	gotAdv, err := store.JobIDsWithPendingAdvanceRetry(ctx)
+	if err != nil {
+		t.Fatalf("JobIDsWithPendingAdvanceRetry returned error: %v", err)
+	}
+	assertJobIDSet(t, gotAdv, wantAdv)
+
+	gotCmt, err := store.JobIDsWithPendingCommentRetry(ctx)
+	if err != nil {
+		t.Fatalf("JobIDsWithPendingCommentRetry returned error: %v", err)
+	}
+	assertJobIDSet(t, gotCmt, wantCmt)
+}
+
+// TestJobIDsWithPendingAdvanceRetryRaceSafe reads the bounded advancement-candidate
+// query concurrently with writers emitting attempt/reconcile markers, the way the
+// worker tick reads while advanceJob writes. It must never error or deadlock under
+// -race.
+func TestJobIDsWithPendingAdvanceRetryRaceSafe(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	const n = 12
+	for i := 0; i < n; i++ {
+		jobID := "adv-race-" + string(rune('a'+i))
+		if err := store.CreateJob(ctx, Job{ID: jobID, Agent: "producer", Type: "implement", State: "failed"}); err != nil {
+			t.Fatalf("CreateJob returned error: %v", err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			jobID := "adv-race-" + string(rune('a'+i))
+			_ = store.AddJobEvent(ctx, JobEvent{JobID: jobID, Kind: "advance_started", Message: "attempt"})
+			if i%2 == 0 {
+				_ = store.AddJobEvent(ctx, JobEvent{JobID: jobID, Kind: "advance_completed", Message: "done"})
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			if _, err := store.JobIDsWithPendingAdvanceRetry(ctx); err != nil {
+				t.Errorf("concurrent JobIDsWithPendingAdvanceRetry returned error: %v", err)
+				return
+			}
+			if _, err := store.JobIDsWithPendingCommentRetry(ctx); err != nil {
+				t.Errorf("concurrent JobIDsWithPendingCommentRetry returned error: %v", err)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+
+	got, err := store.JobIDsWithPendingAdvanceRetry(ctx)
+	if err != nil {
+		t.Fatalf("JobIDsWithPendingAdvanceRetry returned error: %v", err)
+	}
+	gotSet := map[string]bool{}
+	for _, id := range got {
+		gotSet[id] = true
+	}
+	for i := 0; i < n; i++ {
+		jobID := "adv-race-" + string(rune('a'+i))
+		wantPending := i%2 == 1 // odd-indexed kept only advance_started
+		if gotSet[jobID] != wantPending {
+			t.Fatalf("job %s pending=%v, want %v (set=%v)", jobID, gotSet[jobID], wantPending, got)
+		}
+	}
+}
+
+// assertJobIDSet asserts got is exactly want (as a set) with no duplicate ids.
+func assertJobIDSet(t *testing.T, got []string, want map[string]bool) {
+	t.Helper()
+	gotSet := map[string]bool{}
+	for _, id := range got {
+		if gotSet[id] {
+			t.Fatalf("duplicate job id %q in result %v", id, got)
+		}
+		gotSet[id] = true
+	}
+	if len(gotSet) != len(want) {
+		t.Fatalf("candidate set = %v (n=%d), want exactly %v (n=%d)", got, len(gotSet), want, len(want))
+	}
+	for id := range want {
+		if !gotSet[id] {
+			t.Fatalf("expected job %q in candidate set, got %v", id, got)
+		}
+	}
+}
+
+// referenceEscalationOpen mirrors Engine.escalationOpen (internal/workflow/engine.go):
+// a coordinator's escalation round is OPEN iff it has strictly more
+// delegation_escalation_requested than delegation_escalation_resolved events, every
+// other kind ignored. It is the source-of-truth JobIDsWithOpenEscalation must
+// reproduce set-at-once (#598). Package db cannot import package workflow, so the
+// constant strings are pinned by the workflow-side test
+// TestJobIDsWithOpenEscalationMatchesEngineConstants.
+func referenceEscalationOpen(kinds []string) bool {
+	requested, resolved := 0, 0
+	for _, kind := range kinds {
+		switch kind {
+		case "delegation_escalation_requested":
+			requested++
+		case "delegation_escalation_resolved":
+			resolved++
+		}
+	}
+	return requested > resolved
+}
+
+func TestJobIDsWithOpenEscalation(t *testing.T) {
+	const (
+		reqKind = "delegation_escalation_requested"
+		resKind = "delegation_escalation_resolved"
+	)
+	cases := []struct {
+		name     string
+		events   []string
+		wantOpen bool
+	}{
+		{name: "no events", events: nil, wantOpen: false},
+		{name: "unrelated only", events: []string{"queued", "succeeded"}, wantOpen: false},
+		{name: "requested only open", events: []string{reqKind}, wantOpen: true},
+		{name: "balanced closed", events: []string{reqKind, resKind}, wantOpen: false},
+		{name: "two requested one resolved open", events: []string{reqKind, resKind, reqKind}, wantOpen: true},
+		{name: "resolved only excluded", events: []string{resKind}, wantOpen: false},
+		{name: "resolved exceeds requested excluded", events: []string{reqKind, resKind, resKind}, wantOpen: false},
+		{name: "reopened round open", events: []string{reqKind, resKind, reqKind, "succeeded"}, wantOpen: true},
+		{name: "mixed noise ignored open", events: []string{"queued", reqKind, "route_selected"}, wantOpen: true},
+	}
+
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	want := map[string]bool{}
+	for i, tc := range cases {
+		jobID := "esc-job-" + string(rune('a'+i))
+		if err := store.CreateJob(ctx, Job{ID: jobID, Agent: "coord", Type: "ask", State: "succeeded"}); err != nil {
+			t.Fatalf("CreateJob(%s) returned error: %v", jobID, err)
+		}
+		for _, kind := range tc.events {
+			if err := store.AddJobEvent(ctx, JobEvent{JobID: jobID, Kind: kind, Message: "m"}); err != nil {
+				t.Fatalf("AddJobEvent(%s, %s) returned error: %v", jobID, kind, err)
+			}
+		}
+		if got := referenceEscalationOpen(tc.events); got != tc.wantOpen {
+			t.Fatalf("case %q: reference open = %v, wantOpen %v", tc.name, got, tc.wantOpen)
+		}
+		if tc.wantOpen {
+			want[jobID] = true
+		}
+	}
+
+	got, err := store.JobIDsWithOpenEscalation(ctx)
+	if err != nil {
+		t.Fatalf("JobIDsWithOpenEscalation returned error: %v", err)
+	}
+	assertJobIDSet(t, got, want)
+}
+
+// TestJobIDsWithOpenEscalationMutationGuard seeds random requested/resolved/noise
+// sequences and cross-checks the candidate set against referenceEscalationOpen, so
+// a drift between the store literals and the engine's requested>resolved rule is
+// caught (#598).
+func TestJobIDsWithOpenEscalationMutationGuard(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	kinds := []string{
+		"delegation_escalation_requested", "delegation_escalation_resolved",
+		"queued", "succeeded", "delegation_continuation_enqueued", // noise
+	}
+	rng := rand.New(rand.NewSource(340))
+	const jobs = 200
+	want := map[string]bool{}
+	for i := 0; i < jobs; i++ {
+		jobID := "escmut-" + strconv.Itoa(i)
+		if err := store.CreateJob(ctx, Job{ID: jobID, Agent: "coord", Type: "ask", State: "succeeded"}); err != nil {
+			t.Fatalf("CreateJob returned error: %v", err)
+		}
+		var seq []string
+		n := rng.Intn(6)
+		for j := 0; j < n; j++ {
+			kind := kinds[rng.Intn(len(kinds))]
+			seq = append(seq, kind)
+			if err := store.AddJobEvent(ctx, JobEvent{JobID: jobID, Kind: kind, Message: "m"}); err != nil {
+				t.Fatalf("AddJobEvent returned error: %v", err)
+			}
+		}
+		if referenceEscalationOpen(seq) {
+			want[jobID] = true
+		}
+	}
+
+	got, err := store.JobIDsWithOpenEscalation(ctx)
+	if err != nil {
+		t.Fatalf("JobIDsWithOpenEscalation returned error: %v", err)
+	}
+	assertJobIDSet(t, got, want)
+}
+
+// TestJobIDsWithOpenEscalationRaceSafe reads the candidate query concurrently with
+// escalation writers, mirroring the daemon poll reading while the engine
+// requests/resolves escalations. Must not error or deadlock under -race.
+func TestJobIDsWithOpenEscalationRaceSafe(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	const n = 12
+	for i := 0; i < n; i++ {
+		jobID := "esc-race-" + string(rune('a'+i))
+		if err := store.CreateJob(ctx, Job{ID: jobID, Agent: "coord", Type: "ask", State: "succeeded"}); err != nil {
+			t.Fatalf("CreateJob returned error: %v", err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			jobID := "esc-race-" + string(rune('a'+i))
+			_ = store.AddJobEvent(ctx, JobEvent{JobID: jobID, Kind: "delegation_escalation_requested", Message: "req"})
+			if i%2 == 0 {
+				_ = store.AddJobEvent(ctx, JobEvent{JobID: jobID, Kind: "delegation_escalation_resolved", Message: "res"})
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			if _, err := store.JobIDsWithOpenEscalation(ctx); err != nil {
+				t.Errorf("concurrent JobIDsWithOpenEscalation returned error: %v", err)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+
+	got, err := store.JobIDsWithOpenEscalation(ctx)
+	if err != nil {
+		t.Fatalf("JobIDsWithOpenEscalation returned error: %v", err)
+	}
+	gotSet := map[string]bool{}
+	for _, id := range got {
+		gotSet[id] = true
+	}
+	for i := 0; i < n; i++ {
+		jobID := "esc-race-" + string(rune('a'+i))
+		wantOpen := i%2 == 1 // odd-indexed kept only a requested event
+		if gotSet[jobID] != wantOpen {
+			t.Fatalf("job %s open=%v, want %v (set=%v)", jobID, gotSet[jobID], wantOpen, got)
 		}
 	}
 }

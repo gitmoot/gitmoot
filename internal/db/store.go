@@ -2811,6 +2811,28 @@ func (s *Store) LatestJobEventsOfKinds(ctx context.Context, kinds []string) (map
 	return out, rows.Err()
 }
 
+// jobIDsByQuery runs a query whose rows are each a single job_id column and
+// collects them into a slice. The bounded-candidate passes (#598) and the
+// delegation-worktree reclaim pass all share this identical rows-scan boilerplate;
+// each supplies its own SELECT and defers the row handling here.
+func (s *Store) jobIDsByQuery(ctx context.Context, query string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobIDs []string
+	for rows.Next() {
+		var jobID string
+		if err := rows.Scan(&jobID); err != nil {
+			return nil, err
+		}
+		jobIDs = append(jobIDs, jobID)
+	}
+	return jobIDs, rows.Err()
+}
+
 // JobIDsWithPendingDelegationWorktreeReclaim returns the IDs of jobs whose most
 // recent terminal delegation-worktree cleanup outcome was a PRESERVE
 // (delegation_worktree_cleanup_skipped) NOT yet followed by a removal
@@ -2830,7 +2852,7 @@ func (s *Store) LatestJobEventsOfKinds(ctx context.Context, kinds []string) (map
 // is a skip — exactly mirroring the per-job lastCleanupOutcomeIsSkip walk, but
 // set-at-once.
 func (s *Store) JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT job_id FROM job_events
+	return s.jobIDsByQuery(ctx, `SELECT job_id FROM job_events
 		WHERE kind = 'delegation_worktree_cleanup_skipped'
 		  AND id IN (
 			SELECT MAX(id) FROM job_events
@@ -2838,20 +2860,77 @@ func (s *Store) JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) 
 			GROUP BY job_id
 		)
 		ORDER BY job_id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+}
 
-	var jobIDs []string
-	for rows.Next() {
-		var jobID string
-		if err := rows.Scan(&jobID); err != nil {
-			return nil, err
-		}
-		jobIDs = append(jobIDs, jobID)
-	}
-	return jobIDs, rows.Err()
+// JobIDsWithPendingAdvanceRetry returns the IDs of jobs whose LATEST post-delivery
+// advancement event (by id) is still an unreconciled attempt marker
+// (advance_started/advance_retry) — exactly jobWorker.jobNeedsAdvanceRetry's
+// last-one-wins rule (daemon.go), evaluated set-at-once so the retry pass iterates
+// only genuine candidates instead of a full ListJobs + a per-terminal-job
+// ListJobEvents on every 1s worker tick — which was O(jobs × events) and burned a
+// core once a few hundred terminal jobs had accumulated (#598). The pass
+// re-verifies each candidate with the Go predicate, so this only has to be a
+// superset; it is in fact exact.
+//
+// The order of the tracked kinds matters (a job can be started, then completed,
+// then retried), so the LAST one wins: a job is a candidate iff the highest-id
+// event among exactly the predicate's tracked kinds is a positive attempt marker.
+// The MAX(id) subquery is restricted to those tracked kinds only (mirroring the Go
+// switch's default: no-op for every other kind) and the outer filter keeps a job
+// iff that latest tracked event is positive. One row per job (its unique MAX id).
+func (s *Store) JobIDsWithPendingAdvanceRetry(ctx context.Context) ([]string, error) {
+	return s.jobIDsByQuery(ctx, `SELECT job_id FROM job_events
+		WHERE kind IN ('advance_started', 'advance_retry')
+		  AND id IN (
+			SELECT MAX(id) FROM job_events
+			WHERE kind IN ('advance_started', 'advance_retry', 'advance_completed',
+			               'advance_retried', 'advance_blocked', 'advance_retry_skipped', 'retry_queued')
+			GROUP BY job_id
+		)
+		ORDER BY job_id`)
+}
+
+// JobIDsWithPendingCommentRetry returns the IDs of jobs whose LATEST comment event
+// (by id) is comment_post_failed with no subsequent comment_posted or retry_queued
+// — exactly jobWorker.jobNeedsCommentRetry's last-one-wins rule (daemon.go),
+// evaluated set-at-once so the comment-retry pass iterates only genuine candidates
+// instead of a full ListJobs + per-terminal-job ListJobEvents on every 1s worker
+// tick (#598). The pass re-verifies each candidate with the Go predicate, so this
+// only has to be a superset; it is in fact exact.
+func (s *Store) JobIDsWithPendingCommentRetry(ctx context.Context) ([]string, error) {
+	return s.jobIDsByQuery(ctx, `SELECT job_id FROM job_events
+		WHERE kind = 'comment_post_failed'
+		  AND id IN (
+			SELECT MAX(id) FROM job_events
+			WHERE kind IN ('comment_post_failed', 'comment_posted', 'retry_queued')
+			GROUP BY job_id
+		)
+		ORDER BY job_id`)
+}
+
+// JobIDsWithOpenEscalation returns the IDs of coordinator jobs with an OPEN
+// escalation round — strictly more delegation_escalation_requested than
+// delegation_escalation_resolved events — the same requested>resolved rule
+// Engine.escalationOpen applies per job (engine.go), evaluated set-at-once over
+// idx_job_events_kind. It lets AutoFinalizeExpiredEscalations iterate only the
+// (small) set of trees currently paused awaiting a human instead of listing EVERY
+// job and re-reading each one's full event history TWICE on every repo poll — which
+// sustained ~37MB/s and ~1108 queries per poll x18 repos (#598/#340). Zero rows =>
+// the caller returns with no further per-job queries.
+//
+// Both ask-gate (#445) and failure escalations ride these same two kinds, and the
+// per-job candidate gate is purely count-based on them (never branching on the
+// record's Kind), so this count reproduces the exact candidate set the original
+// loadEscalation(exists) + !escalationResolved(open) gates passed. The literal
+// strings MUST equal the escalationRequestedEvent/escalationResolvedEvent constants;
+// a store test pins this.
+func (s *Store) JobIDsWithOpenEscalation(ctx context.Context) ([]string, error) {
+	return s.jobIDsByQuery(ctx, `SELECT job_id FROM job_events
+		WHERE kind IN ('delegation_escalation_requested', 'delegation_escalation_resolved')
+		GROUP BY job_id
+		HAVING SUM(CASE WHEN kind = 'delegation_escalation_requested' THEN 1 ELSE 0 END)
+		     > SUM(CASE WHEN kind = 'delegation_escalation_resolved' THEN 1 ELSE 0 END)
+		ORDER BY job_id`)
 }
 
 func (s *Store) UpsertEvalArtifact(ctx context.Context, artifact EvalArtifact) error {

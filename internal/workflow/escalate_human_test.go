@@ -595,3 +595,162 @@ func containsSubstr(haystack, needle string) bool {
 	}
 	return false
 }
+
+// TestJobIDsWithOpenEscalationMatchesEngineConstants pins the store query's literal
+// event-kind strings to the engine constants: seeding events via the constants and
+// asserting the bounded candidate query returns the open coordinator proves a
+// rename of escalationRequestedEvent/escalationResolvedEvent (engine.go) without
+// updating internal/db/store.go would be caught, not silently drop candidates (#598).
+func TestJobIDsWithOpenEscalationMatchesEngineConstants(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+
+	insertCompletedJob(t, store, db.Job{ID: "open-coord", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo: "jerryfane/gitmoot", TaskID: "task-open", Sender: "coord",
+		Result: &AgentResult{Decision: "approved", Summary: "x"},
+	})
+	insertCompletedJob(t, store, db.Job{ID: "closed-coord", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo: "jerryfane/gitmoot", TaskID: "task-closed", Sender: "coord",
+		Result: &AgentResult{Decision: "approved", Summary: "x"},
+	})
+	addEscalationEvent(t, store, "open-coord", escalationRequestedEvent, EscalationRecord{DelegationID: "api"})
+	addEscalationEvent(t, store, "closed-coord", escalationRequestedEvent, EscalationRecord{DelegationID: "api"})
+	addEscalationEvent(t, store, "closed-coord", escalationResolvedEvent, EscalationRecord{DelegationID: "api"})
+
+	ids, err := store.JobIDsWithOpenEscalation(ctx)
+	if err != nil {
+		t.Fatalf("JobIDsWithOpenEscalation returned error: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != "open-coord" {
+		t.Fatalf("open-escalation candidates = %v, want exactly [open-coord] (store literals must equal the engine constants)", ids)
+	}
+}
+
+// TestAutoFinalizeExpiredEscalationsBoundedToOpenRounds proves the bounded (#598)
+// finalize scan acts on ONLY coordinators with an open escalation round: a large
+// backlog of closed (resolved) and never-escalated jobs — all past TTL with a
+// stored result — are never finalized (no new resolved event), an orphan candidate
+// event whose job row is absent is skipped instead of aborting the scan, and only
+// the genuinely-open past-TTL coordinator is finalized.
+func TestAutoFinalizeExpiredEscalationsBoundedToOpenRounds(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "api", []string{"review"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "ui", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+	engine.EscalationNotifier = &recordingNotifier{}
+
+	base := time.Now().UTC()
+	engine.Now = func() time.Time { return base }
+	// The one genuinely-open coordinator, paused awaiting a human.
+	seedEscalateHumanCoordinator(t, store, engine)
+	if err := engine.AdvanceJob(ctx, "parent-job/delegation/api"); err == nil {
+		t.Fatal("expected AwaitingHumanError")
+	}
+
+	// Backlog: never-escalated + closed-escalation coordinators, all with a stored
+	// result and (once the clock advances) past TTL. None are candidates.
+	oldPause := base.Add(-72 * time.Hour).Format(time.RFC3339)
+	for i := 0; i < 30; i++ {
+		neverID := "never-esc-" + string(rune('a'+i%26)) + string(rune('0'+i/26))
+		insertCompletedJob(t, store, db.Job{ID: neverID, Agent: "coord", Type: "ask"}, JobPayload{
+			Repo: "jerryfane/gitmoot", TaskID: "task-never-" + neverID, Sender: "coord",
+			Result: &AgentResult{Decision: "approved", Summary: "x"},
+		})
+		closedID := "closed-esc-" + string(rune('a'+i%26)) + string(rune('0'+i/26))
+		insertCompletedJob(t, store, db.Job{ID: closedID, Agent: "coord", Type: "ask"}, JobPayload{
+			Repo: "jerryfane/gitmoot", TaskID: "task-closed-" + closedID, Sender: "coord",
+			Result: &AgentResult{Decision: "approved", Summary: "x"},
+		})
+		addEscalationEvent(t, store, closedID, escalationRequestedEvent, EscalationRecord{DelegationID: "api", PausedAt: oldPause})
+		addEscalationEvent(t, store, closedID, escalationResolvedEvent, EscalationRecord{DelegationID: "api", PausedAt: oldPause})
+	}
+
+	// An orphan open-escalation event whose job row is absent: a candidate the
+	// query returns but that must be SKIPPED (not abort the scan via jobPayload's
+	// non-errors.Is "job not found"). Sorts after "parent-job" so parent-job would
+	// already be finalized before a would-be abort — the assertion below (nil error,
+	// finalized == 1) fails if the skip is removed.
+	addEscalationEvent(t, store, "zzz-orphan-open", escalationRequestedEvent, EscalationRecord{DelegationID: "api", PausedAt: oldPause})
+
+	// Sanity: the candidate set is exactly the open coordinator + the orphan.
+	ids, err := store.JobIDsWithOpenEscalation(ctx)
+	if err != nil {
+		t.Fatalf("JobIDsWithOpenEscalation returned error: %v", err)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("candidate ids = %v, want exactly 2 (parent-job + orphan)", ids)
+	}
+
+	engine.Now = func() time.Time { return base.Add(49 * time.Hour) }
+	finalized, err := engine.AutoFinalizeExpiredEscalations(ctx, 48*time.Hour)
+	if err != nil {
+		t.Fatalf("AutoFinalizeExpiredEscalations returned error: %v", err)
+	}
+	if finalized != 1 {
+		t.Fatalf("finalized = %d, want exactly 1 (only the open past-TTL coordinator)", finalized)
+	}
+	if got := countJobEvents(t, store, "parent-job", escalationResolvedEvent); got != 1 {
+		t.Fatalf("parent-job %s events = %d, want 1", escalationResolvedEvent, got)
+	}
+	// No backlog job was finalized: the closed ones keep their single seeded
+	// resolved event, the never-escalated ones stay at zero.
+	for i := 0; i < 30; i++ {
+		closedID := "closed-esc-" + string(rune('a'+i%26)) + string(rune('0'+i/26))
+		if got := countJobEvents(t, store, closedID, escalationResolvedEvent); got != 1 {
+			t.Fatalf("closed job %s resolved events = %d, want 1 (never re-finalized)", closedID, got)
+		}
+		neverID := "never-esc-" + string(rune('a'+i%26)) + string(rune('0'+i/26))
+		if got := countJobEvents(t, store, neverID, escalationResolvedEvent); got != 0 {
+			t.Fatalf("never-escalated job %s resolved events = %d, want 0", neverID, got)
+		}
+	}
+}
+
+// TestAutoFinalizeExpiredEscalationsZeroCandidatesNoWalk proves the immediate-return
+// win: with no open escalation round anywhere, the bounded candidate query returns
+// zero ids so the finalize loop body never runs — no per-job GetJob/ListJobEvents,
+// no finalize (#598).
+func TestAutoFinalizeExpiredEscalationsZeroCandidatesNoWalk(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+
+	base := time.Now().UTC()
+	engine.Now = func() time.Time { return base.Add(49 * time.Hour) }
+	oldPause := base.Add(-72 * time.Hour).Format(time.RFC3339)
+	// A backlog of never-escalated and closed-escalation jobs, all past TTL: zero
+	// open rounds.
+	for i := 0; i < 25; i++ {
+		neverID := "never-" + string(rune('a'+i%26)) + string(rune('0'+i/26))
+		insertCompletedJob(t, store, db.Job{ID: neverID, Agent: "coord", Type: "ask"}, JobPayload{
+			Repo: "jerryfane/gitmoot", TaskID: "t-never-" + neverID, Sender: "coord",
+			Result: &AgentResult{Decision: "approved", Summary: "x"},
+		})
+		closedID := "closed-" + string(rune('a'+i%26)) + string(rune('0'+i/26))
+		insertCompletedJob(t, store, db.Job{ID: closedID, Agent: "coord", Type: "ask"}, JobPayload{
+			Repo: "jerryfane/gitmoot", TaskID: "t-closed-" + closedID, Sender: "coord",
+			Result: &AgentResult{Decision: "approved", Summary: "x"},
+		})
+		addEscalationEvent(t, store, closedID, escalationRequestedEvent, EscalationRecord{DelegationID: "api", PausedAt: oldPause})
+		addEscalationEvent(t, store, closedID, escalationResolvedEvent, EscalationRecord{DelegationID: "api", PausedAt: oldPause})
+	}
+
+	// The candidate query returns nothing, so the loop iterates zero times.
+	ids, err := store.JobIDsWithOpenEscalation(ctx)
+	if err != nil {
+		t.Fatalf("JobIDsWithOpenEscalation returned error: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("candidate ids = %v, want none (no open escalation round)", ids)
+	}
+
+	finalized, err := engine.AutoFinalizeExpiredEscalations(ctx, 48*time.Hour)
+	if err != nil {
+		t.Fatalf("AutoFinalizeExpiredEscalations returned error: %v", err)
+	}
+	if finalized != 0 {
+		t.Fatalf("finalized = %d, want 0 with zero candidates", finalized)
+	}
+}

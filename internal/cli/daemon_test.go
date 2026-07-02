@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1628,6 +1629,7 @@ func TestRunQueuedJobsAllowsDifferentRuntimeSessionsAcrossRepos(t *testing.T) {
 }
 
 func TestRunQueuedJobsLeavesBusyRuntimeSessionQueued(t *testing.T) {
+	resetRuntimeLockWaitEpisodes() // #598: the runtime_lock_wait dedup is package-global; a neighbor reusing job-a could otherwise suppress our write.
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	home := t.TempDir()
@@ -1685,6 +1687,7 @@ func TestRunQueuedJobsLeavesBusyRuntimeSessionQueued(t *testing.T) {
 }
 
 func TestRunQueuedJobsDelegatesBusyRuntimeToTempWorker(t *testing.T) {
+	resetRuntimeLockWaitEpisodes() // #598: package-global runtime_lock_wait dedup; reset so a neighbor reusing job-a-merge-back can't suppress our write.
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	checkout := t.TempDir()
@@ -6817,5 +6820,383 @@ func TestBuildAskGateComment(t *testing.T) {
 	// Same command-injection guard as the failure comment.
 	if cmds := daemon.ParseCommands(body); len(cmds) != 0 {
 		t.Fatalf("ask-gate comment parsed into %d command(s); want 0: %+v\nbody:\n%s", len(cmds), cmds, body)
+	}
+}
+
+// TestRetryPendingJobAdvancementsBoundedToCandidates proves the bounded (#598)
+// advancement retry pass acts on ONLY the jobs whose latest advancement event is a
+// pending marker: a large backlog of terminal jobs whose advancement already
+// completed is never GetJob'd or advanced, a #602-deferred (state=queued) job with
+// an unresolved advance_started is filtered by state, and a candidate id whose job
+// row was pruned is skipped without aborting the tick.
+func TestRetryPendingJobAdvancementsBoundedToCandidates(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
+	seedDaemonWorkerAgent(t, store, "reviewer", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
+
+	validPayload := func(pr int) string {
+		encoded, err := json.Marshal(workflow.JobPayload{
+			Repo: "owner/repo", Branch: "task-1", PullRequest: pr, TaskID: "task-1",
+			Result: &workflow.AgentResult{Decision: "approved", Summary: "ok"},
+		})
+		if err != nil {
+			t.Fatalf("Marshal payload returned error: %v", err)
+		}
+		return string(encoded)
+	}
+
+	// Large backlog of terminal jobs whose advancement already reconciled
+	// (advance_started -> advance_completed): NOT candidates.
+	for i := 0; i < 50; i++ {
+		id := "adv-done-" + strconv.Itoa(i)
+		if err := store.CreateJobWithEvent(ctx, db.Job{
+			ID: id, Agent: "reviewer", Type: "review", State: string(workflow.JobSucceeded), Payload: validPayload(1000 + i),
+		}, db.JobEvent{Kind: string(workflow.JobSucceeded), Message: "seed"}); err != nil {
+			t.Fatalf("CreateJobWithEvent(%s) returned error: %v", id, err)
+		}
+		for _, kind := range []string{"advance_started", "advance_completed", "queued"} {
+			if err := store.AddJobEvent(ctx, db.JobEvent{JobID: id, Kind: kind, Message: "noise"}); err != nil {
+				t.Fatalf("AddJobEvent returned error: %v", err)
+			}
+		}
+	}
+
+	// The one genuinely-pending advancement (latest tracked event = advance_started).
+	pendingID := "adv-pending"
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: pendingID, Agent: "reviewer", Type: "review", State: string(workflow.JobSucceeded), Payload: validPayload(7),
+	}, db.JobEvent{Kind: string(workflow.JobSucceeded), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent(pending) returned error: %v", err)
+	}
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: pendingID, Kind: "advance_started", Message: "started"}); err != nil {
+		t.Fatalf("AddJobEvent returned error: %v", err)
+	}
+
+	// #602: a job deferred back to queued still carries an unresolved advance_started
+	// so the candidate query returns it, but the state filter rejects it (identical
+	// to the old ListJobs gate).
+	deferredID := "adv-deferred-queued"
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: deferredID, Agent: "reviewer", Type: "review", State: string(workflow.JobQueued), Payload: validPayload(8),
+	}, db.JobEvent{Kind: string(workflow.JobQueued), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent(deferred) returned error: %v", err)
+	}
+	for _, kind := range []string{"advance_started", "blocker_deferred"} {
+		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: deferredID, Kind: kind, Message: "m"}); err != nil {
+			t.Fatalf("AddJobEvent returned error: %v", err)
+		}
+	}
+
+	// Pruned row: a candidate marker with no surviving jobs row.
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: "adv-pruned-orphan", Kind: "advance_started", Message: "orphan"}); err != nil {
+		t.Fatalf("AddJobEvent(orphan) returned error: %v", err)
+	}
+
+	var advanced []string
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(_ context.Context, job db.Job, _ workflow.JobPayload, _ runtime.Agent) (string, error) {
+		advanced = append(advanced, job.ID)
+		// Short-circuit before any workflow engine call; advanceJob records an
+		// advance_retry event and returns nil. The spy captured the job id, which
+		// is all this bounded-dispatch test asserts.
+		return "", errors.New("stop after capture")
+	}
+
+	if err := retryPendingJobAdvancements(ctx, worker, "owner/repo", "", nil); err != nil {
+		t.Fatalf("retryPendingJobAdvancements returned error: %v", err)
+	}
+
+	if len(advanced) != 1 || advanced[0] != pendingID {
+		t.Fatalf("advanceJob reached %v, want exactly [%s]", advanced, pendingID)
+	}
+}
+
+// TestRetryPendingJobCommentsBoundedToCandidates is the comment-retry analogue: the
+// bounded pass re-posts ONLY the jobs whose latest comment event is
+// comment_post_failed, ignoring a backlog of already-posted jobs, a #602-deferred
+// queued job, and a pruned-row candidate.
+func TestRetryPendingJobCommentsBoundedToCandidates(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
+
+	payloadFor := func(pr int) string {
+		encoded, err := json.Marshal(workflow.JobPayload{
+			Repo: "owner/repo", Branch: "main", PullRequest: pr,
+			Result: &workflow.AgentResult{Decision: "approved", Summary: "ok"},
+		})
+		if err != nil {
+			t.Fatalf("Marshal payload returned error: %v", err)
+		}
+		return string(encoded)
+	}
+
+	// Backlog of jobs whose comment already posted (failed -> posted): NOT candidates.
+	for i := 0; i < 40; i++ {
+		id := "cmt-done-" + strconv.Itoa(i)
+		if err := store.CreateJobWithEvent(ctx, db.Job{
+			ID: id, Agent: "audit", Type: "ask", State: string(workflow.JobFailed), Payload: payloadFor(2000 + i),
+		}, db.JobEvent{Kind: string(workflow.JobFailed), Message: "seed"}); err != nil {
+			t.Fatalf("CreateJobWithEvent(%s) returned error: %v", id, err)
+		}
+		for _, kind := range []string{"comment_post_failed", "comment_posted"} {
+			if err := store.AddJobEvent(ctx, db.JobEvent{JobID: id, Kind: kind, Message: "noise"}); err != nil {
+				t.Fatalf("AddJobEvent returned error: %v", err)
+			}
+		}
+	}
+
+	// The one genuinely-pending comment retry.
+	pendingID := "cmt-pending"
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: pendingID, Agent: "audit", Type: "ask", State: string(workflow.JobFailed), Payload: payloadFor(9),
+	}, db.JobEvent{Kind: string(workflow.JobFailed), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent(pending) returned error: %v", err)
+	}
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: pendingID, Kind: "comment_post_failed", Message: "temporary github error"}); err != nil {
+		t.Fatalf("AddJobEvent returned error: %v", err)
+	}
+
+	// #602: comment_post_failed but state=queued → rejected by state filter.
+	deferredID := "cmt-deferred-queued"
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: deferredID, Agent: "audit", Type: "ask", State: string(workflow.JobQueued), Payload: payloadFor(10),
+	}, db.JobEvent{Kind: string(workflow.JobQueued), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent(deferred) returned error: %v", err)
+	}
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: deferredID, Kind: "comment_post_failed", Message: "m"}); err != nil {
+		t.Fatalf("AddJobEvent returned error: %v", err)
+	}
+
+	// Pruned row: candidate marker with no surviving job row.
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: "cmt-pruned-orphan", Kind: "comment_post_failed", Message: "orphan"}); err != nil {
+		t.Fatalf("AddJobEvent(orphan) returned error: %v", err)
+	}
+
+	comments := &cliPollFakeGitHub{}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CommenterFactory = func(string) github.Client { return comments }
+
+	if err := retryPendingJobComments(ctx, worker, "owner/repo", ""); err != nil {
+		t.Fatalf("retryPendingJobComments returned error: %v", err)
+	}
+
+	if len(comments.posted) != 1 || comments.posted[0].issueNumber != 9 {
+		t.Fatalf("posted comments = %+v, want exactly one on PR 9 (the pending candidate)", comments.posted)
+	}
+}
+
+// queuePolicyBusyRuntimeStore builds a worker whose parallel-session policy is
+// "queue" (so a runtime-busy job bounces errRuntimeSessionBusy instead of forking a
+// temp worker) with the codex "audit" agent's runtime session runtime:codex:session-1
+// already externally locked. Each returned dispatch attempt bounces busy. Used by
+// the #598 spin/dedup tests.
+func queuePolicyBusyRuntimeStore(t *testing.T) (*db.Store, jobWorker, *int64) {
+	t.Helper()
+	store := daemonWorkerStore(t)
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	content := strings.Replace(config.DefaultConfig(paths), `same_session = "fork_temp_session"`, `same_session = "queue"`, 1)
+	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile config returned error: %v", err)
+	}
+	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
+	seedDaemonWorkerAgent(t, store, "audit", runtime.CodexRuntime, "session-1", []string{"ask"}, "owner/repo")
+	if acquired, err := store.AcquireResourceLock(context.Background(), db.ResourceLock{
+		ResourceKey: "runtime:codex:session-1",
+		OwnerJobID:  "other-job",
+		OwnerToken:  "other-token",
+		ExpiresAt:   time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano),
+	}, time.Now().UTC()); err != nil || !acquired {
+		t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
+	}
+	var attempts int64
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		atomic.AddInt64(&attempts, 1)
+		return t.TempDir(), nil
+	}
+	return store, worker, &attempts
+}
+
+// resetRuntimeLockWaitEpisodes clears the #598 runtime_lock_wait dedup state. Test-
+// only (it mutates the package-global map), which is why it lives here rather than in
+// daemon.go: the map persists across tests in a package run, so a test that asserts a
+// runtime_lock_wait row is written must reset it first (a neighboring test reusing the
+// same job id could otherwise leave an open episode that suppresses the write).
+func resetRuntimeLockWaitEpisodes() {
+	runtimeLockWaitMu.Lock()
+	defer runtimeLockWaitMu.Unlock()
+	runtimeLockWaitEpisodes = map[string]time.Time{}
+}
+
+// TestRuntimeLockWaitEventDedupedPerEpisode proves the #598 dedup: repeated busy
+// dispatch attempts of the same job write exactly ONE runtime_lock_wait row per wait
+// episode, and closing the episode (a successful acquire) lets the next wait record
+// a fresh row.
+func TestRuntimeLockWaitEventDedupedPerEpisode(t *testing.T) {
+	resetRuntimeLockWaitEpisodes()
+	ctx := context.Background()
+	store, worker, _ := queuePolicyBusyRuntimeStore(t)
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
+
+	// Five dispatch attempts, all bounce busy → exactly ONE runtime_lock_wait row.
+	for i := 0; i < 5; i++ {
+		if err := runQueuedJobs(ctx, worker, 1); err != nil {
+			t.Fatalf("runQueuedJobs attempt %d returned error: %v", i, err)
+		}
+	}
+	if n := countWorkerJobEvents(t, store, "job-a", "runtime_lock_wait"); n != 1 {
+		t.Fatalf("runtime_lock_wait rows after 5 busy attempts = %d, want 1 (deduped per episode)", n)
+	}
+
+	// A successful acquire closes the episode; the next busy wait is a fresh episode.
+	endRuntimeLockWaitEpisode("job-a")
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs after episode end returned error: %v", err)
+	}
+	if n := countWorkerJobEvents(t, store, "job-a", "runtime_lock_wait"); n != 2 {
+		t.Fatalf("runtime_lock_wait rows after new episode = %d, want 2", n)
+	}
+}
+
+// TestRuntimeLockWaitEpisodeMarkAfterWrite pins the #615-review helper contract
+// directly (no store mocking): the episode is opened only by an explicit mark (which
+// the call sites run ONLY after AddJobEvent succeeds), so a failed write — modeled by
+// simply not calling mark — leaves the episode closed and the next bounce re-attempts
+// the write. Once marked the episode dedups further bounces until its recorded emit
+// ages past the TTL, at which point it re-opens as a liveness re-emit.
+func TestRuntimeLockWaitEpisodeMarkAfterWrite(t *testing.T) {
+	resetRuntimeLockWaitEpisodes()
+	defer resetRuntimeLockWaitEpisodes()
+
+	const jobID = "job-mark-after-write"
+	if runtimeLockWaitEpisodeOpen(jobID) {
+		t.Fatal("episode should be closed before any event is emitted")
+	}
+	// Simulate a FAILED AddJobEvent: the call site would return without marking.
+	// The episode must stay closed so the next bounce retries the write.
+	if runtimeLockWaitEpisodeOpen(jobID) {
+		t.Fatal("episode must stay closed when the event write failed (mark not called)")
+	}
+	// Successful write → mark. Now the episode is open and dedups further bounces.
+	markRuntimeLockWaitEpisode(jobID)
+	if !runtimeLockWaitEpisodeOpen(jobID) {
+		t.Fatal("episode should be open after a successful write is marked")
+	}
+	// Age the recorded emit past the TTL: the episode re-opens (liveness re-emit).
+	runtimeLockWaitMu.Lock()
+	runtimeLockWaitEpisodes[jobID] = time.Now().Add(-2 * runtimeLockWaitEpisodeTTL)
+	runtimeLockWaitMu.Unlock()
+	if runtimeLockWaitEpisodeOpen(jobID) {
+		t.Fatal("episode should re-open once the recorded emit is older than the TTL")
+	}
+}
+
+// TestRuntimeLockWaitEpisodePrunesExpired proves the #615-review map bound: a job that
+// hits contention and then terminates WITHOUT ever acquiring (so
+// endRuntimeLockWaitEpisode never clears its entry) leaves a stale timestamp behind,
+// and mark's over-cap sweep drops it once it is older than the TTL — so such jobs can
+// no longer grow the episode map unboundedly.
+func TestRuntimeLockWaitEpisodePrunesExpired(t *testing.T) {
+	resetRuntimeLockWaitEpisodes()
+	defer resetRuntimeLockWaitEpisodes()
+
+	runtimeLockWaitMu.Lock()
+	// The terminal-without-acquire leftover, emitted long ago.
+	runtimeLockWaitEpisodes["terminal-no-acquire"] = time.Now().Add(-2 * runtimeLockWaitEpisodeTTL)
+	// Fill up to the cap with fresh entries so the next mark pushes len over the
+	// threshold and triggers the expiry sweep.
+	for i := 0; i < runtimeLockWaitEpisodeMax; i++ {
+		runtimeLockWaitEpisodes[fmt.Sprintf("fresh-%d", i)] = time.Now()
+	}
+	runtimeLockWaitMu.Unlock()
+
+	// This mark takes len past runtimeLockWaitEpisodeMax, triggering the sweep.
+	markRuntimeLockWaitEpisode("trigger")
+
+	runtimeLockWaitMu.Lock()
+	_, stale := runtimeLockWaitEpisodes["terminal-no-acquire"]
+	_, fresh := runtimeLockWaitEpisodes["fresh-0"]
+	runtimeLockWaitMu.Unlock()
+	if stale {
+		t.Fatal("expected the expired terminal-without-acquire entry to be pruned")
+	}
+	if !fresh {
+		t.Fatal("a still-fresh entry must NOT be pruned (only entries older than the TTL)")
+	}
+}
+
+// TestPoolDoesNotRespinRuntimeBusyJob proves the #598 spin-stop: a queued job whose
+// runtime session is externally locked bounces busy, and the pool dispatcher must
+// dispatch it at most once per invocation and then RETURN, instead of re-selecting
+// it every pass in a tight spin. Mutation proof: dropping the excludeBouncedBusy
+// call makes the attempt count unbounded (the goroutine below never returns and the
+// wall-clock guard trips).
+func TestPoolDoesNotRespinRuntimeBusyJob(t *testing.T) {
+	resetRuntimeLockWaitEpisodes()
+	ctx := context.Background()
+	store, worker, attempts := queuePolicyBusyRuntimeStore(t)
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runQueuedJobsForRepoPoolTracked(ctx, worker, 1, 1, "owner/repo", "", nil)
+	}()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("runQueuedJobsForRepoPoolTracked returned error: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("pool did not return within 15s (busy job re-spinning); attempts so far = %d", atomic.LoadInt64(attempts))
+	}
+	if got := atomic.LoadInt64(attempts); got != 1 {
+		t.Fatalf("dispatch attempts = %d, want exactly 1 (busy job re-selected)", got)
+	}
+	if n := countWorkerJobEvents(t, store, "job-a", "runtime_lock_wait"); n != 1 {
+		t.Fatalf("runtime_lock_wait rows = %d, want 1", n)
+	}
+	job, err := store.GetJob(ctx, "job-a")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobQueued) {
+		t.Fatalf("job state = %q, want queued (held for a later tick)", job.State)
+	}
+}
+
+// TestSameSessionSiblingsHeldBackOnBusy proves the #598 runtime-key holdback: two
+// queued jobs share a runtime session; once the first bounces busy, its sibling
+// (same session key) must NOT be dispatched in the same invocation. With only the
+// job-id set (no bouncedBusyRuntimes) the sibling would be dispatched after the
+// first is reaped, giving 2 attempts; the runtime-key holdback keeps it at 1.
+func TestSameSessionSiblingsHeldBackOnBusy(t *testing.T) {
+	resetRuntimeLockWaitEpisodes()
+	ctx := context.Background()
+	store, worker, attempts := queuePolicyBusyRuntimeStore(t)
+	// Both jobs use the same audit agent ⇒ the same runtime:codex:session-1 key.
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-b", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 2})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runQueuedJobsForRepoPoolTracked(ctx, worker, 2, 2, "owner/repo", "", nil)
+	}()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("runQueuedJobsForRepoPoolTracked returned error: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("pool did not return within 15s; attempts so far = %d", atomic.LoadInt64(attempts))
+	}
+	if got := atomic.LoadInt64(attempts); got != 1 {
+		t.Fatalf("dispatch attempts = %d, want exactly 1 (same-session sibling must be held back)", got)
 	}
 }
