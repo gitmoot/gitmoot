@@ -5232,6 +5232,38 @@ func (s *Store) DeleteExpiredResourceLocks(ctx context.Context, now time.Time) (
 	return result.RowsAffected()
 }
 
+// DeleteExpiredResourceLocksExcludingOwners is DeleteExpiredResourceLocks minus
+// locks held by the given owner job IDs (#562): the daemon's recovery tick skips
+// reaping a lock whose owner job is in flight in this very process (its worker
+// goroutine is alive — e.g. a ctx-deaf runtime overrunning its lease), because
+// deleting it would let a second run of the same session start beside the live
+// one. An empty exclusion list is byte-identical to DeleteExpiredResourceLocks.
+func (s *Store) DeleteExpiredResourceLocksExcludingOwners(ctx context.Context, now time.Time, excludeOwners []string) (int64, error) {
+	if len(excludeOwners) == 0 {
+		return s.DeleteExpiredResourceLocks(ctx, now)
+	}
+	placeholders := strings.Repeat("?,", len(excludeOwners))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]any, 0, len(excludeOwners)+1)
+	args = append(args, formatResourceLockTime(now))
+	for _, owner := range excludeOwners {
+		args = append(args, owner)
+	}
+	result, err := s.db.ExecContext(ctx, `DELETE FROM resource_locks
+		WHERE expires_at <= ?
+			AND (owner_pid <= 0 OR resource_key LIKE 'runtime:%')
+			AND (resource_key LIKE 'runtime:%' OR NOT EXISTS (
+				SELECT 1 FROM jobs
+				WHERE jobs.id = resource_locks.owner_job_id
+					AND jobs.state = 'running'
+			))
+			AND owner_job_id NOT IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 func formatResourceLockTime(value time.Time) string {
 	return value.UTC().Format("2006-01-02T15:04:05.000000000Z")
 }

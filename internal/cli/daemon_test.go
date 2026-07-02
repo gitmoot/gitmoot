@@ -4570,7 +4570,7 @@ func TestRunQueuedJobsRecordsPostDeliveryWorkflowErrorForRetry(t *testing.T) {
 	}
 	gate.err = nil
 	gate.decision = workflow.MergeDecision{Ready: true}
-	if err := retryPendingJobAdvancements(ctx, worker, "", ""); err != nil {
+	if err := retryPendingJobAdvancements(ctx, worker, "", "", nil); err != nil {
 		t.Fatalf("retryPendingJobAdvancements returned error: %v", err)
 	}
 	if adapter.calls != 1 {
@@ -4627,7 +4627,7 @@ func TestRetryPendingJobAdvancementsRecoversStartedAdvancement(t *testing.T) {
 		return workflow.Engine{Store: store, MergeGate: gate}
 	}
 
-	if err := retryPendingJobAdvancements(ctx, worker, "", ""); err != nil {
+	if err := retryPendingJobAdvancements(ctx, worker, "", "", nil); err != nil {
 		t.Fatalf("retryPendingJobAdvancements returned error: %v", err)
 	}
 
@@ -4681,7 +4681,7 @@ func TestRetryPendingJobAdvancementsAdvancesFailedStoredResult(t *testing.T) {
 		return workflow.Engine{Store: store}
 	}
 
-	if err := retryPendingJobAdvancements(ctx, worker, "", ""); err != nil {
+	if err := retryPendingJobAdvancements(ctx, worker, "", "", nil); err != nil {
 		t.Fatalf("retryPendingJobAdvancements returned error: %v", err)
 	}
 
@@ -4789,7 +4789,7 @@ func TestRetryPendingJobAdvancementsRefreshesImplementedHeadBeforePreflight(t *t
 		return daemonWorkflowEngine(store, github.NoopClient{}, checkout, "")
 	}
 
-	if err := retryPendingJobAdvancements(ctx, worker, "", ""); err != nil {
+	if err := retryPendingJobAdvancements(ctx, worker, "", "", nil); err != nil {
 		t.Fatalf("retryPendingJobAdvancements returned error: %v", err)
 	}
 
@@ -5149,7 +5149,7 @@ func TestReclaimSkippedDelegationWorktrees(t *testing.T) {
 				}
 			}
 
-			if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", ""); err != nil {
+			if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", "", nil); err != nil {
 				t.Fatalf("reclaimSkippedDelegationWorktrees returned error: %v", err)
 			}
 
@@ -5247,7 +5247,7 @@ func TestReclaimSkippedDelegationWorktreesBoundedToMarkedJobs(t *testing.T) {
 		}
 	}
 
-	if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", ""); err != nil {
+	if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", "", nil); err != nil {
 		t.Fatalf("reclaimSkippedDelegationWorktrees returned error: %v", err)
 	}
 
