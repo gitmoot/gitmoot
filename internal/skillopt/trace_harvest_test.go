@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jerryfane/gitmoot/internal/db"
@@ -178,10 +179,13 @@ func TestHarvestMergedRealCIWritesStrongPositive(t *testing.T) {
 	}
 }
 
-// TestHarvestMergedNoCINearNeutral asserts a merge through the empty gate (only
-// the synthetic gitmoot/ci context) is scored near-neutral (~0.5), NOT a strong
-// positive — the no-CI guard.
-func TestHarvestMergedNoCINearNeutral(t *testing.T) {
+// TestHarvestMergedNoCIAbsentQuality asserts a merge through the empty gate (only
+// the synthetic gitmoot/ci context) records the merge EVENT (choice "a") but carries
+// a genuinely-ABSENT quality score (HasScore=false), NOT a fabricated 0.5 (#474): the
+// harvester refuses to invent a quality midpoint with no verifiable evidence. Because
+// the #614 gitmoot/ci "no external CI" stamp is present, the reasoning is the
+// CONFIRMED-empty-gate wording.
+func TestHarvestMergedNoCIAbsentQuality(t *testing.T) {
 	ctx := context.Background()
 	store := newTraceStore(t)
 	version, payload := installTraceTemplate(t, store, "planner")
@@ -193,13 +197,14 @@ func TestHarvestMergedNoCINearNeutral(t *testing.T) {
 	}
 	signal, choice := h.project(ctx, payload, outcome)
 	if choice != "a" {
-		t.Fatalf("merged+no-CI choice = %q, want a (positive but weak)", choice)
+		t.Fatalf("merged+no-CI choice = %q, want a (the merge event is real)", choice)
 	}
-	if !signal.HasScore || signal.Score != scoreMergedNoCI {
-		t.Fatalf("merged+no-CI score = %v (has=%v), want %v", signal.Score, signal.HasScore, scoreMergedNoCI)
+	if signal.HasScore {
+		t.Fatalf("merged+no-CI must carry NO fabricated quality score, got score=%v has=%v", signal.Score, signal.HasScore)
 	}
-	if signal.Score >= scoreMergedRealCI {
-		t.Fatalf("no-CI merge must not score a strong positive, got %v", signal.Score)
+	// #614-confirmed empty gate (the gitmoot/ci success stamp is present at head).
+	if !strings.Contains(signal.Feedback, "confirmed empty gate") {
+		t.Fatalf("merged+confirmed-no-CI reasoning = %q, want the confirmed-empty-gate wording", signal.Feedback)
 	}
 	events := feedbackForVersion(t, store, version.ID)
 	if len(events) != 1 || events[0].Choice != "a" {
@@ -245,8 +250,8 @@ func TestHarvestMergedActionsCheckIsStrongPositive(t *testing.T) {
 
 // TestHarvestMergedFailingActionsCheckIsNotRealCI asserts a FAILING (or only
 // gitmoot/) check-run is NOT treated as real CI, so a no-external-success merge
-// stays near-neutral. This guards against rewarding a merge whose only check did
-// not pass.
+// carries no fabricated quality score (HasScore=false), choice "a" (#474). This
+// guards against rewarding a merge whose only check did not pass.
 func TestHarvestMergedFailingActionsCheckIsNotRealCI(t *testing.T) {
 	ctx := context.Background()
 	store := newTraceStore(t)
@@ -262,22 +267,27 @@ func TestHarvestMergedFailingActionsCheckIsNotRealCI(t *testing.T) {
 
 	outcome := workflow.Outcome{Kind: workflow.OutcomeMerged, Repo: "owner/repo", PullRequest: 7, HeadSHA: "deadbeef"}
 	signal, choice := h.project(ctx, payload, outcome)
-	if choice != "a" || signal.Score != scoreMergedNoCI {
-		t.Fatalf("failing-check merge score = %v choice=%q, want near-neutral %v choice=a", signal.Score, choice, scoreMergedNoCI)
+	if choice != "a" || signal.HasScore {
+		t.Fatalf("failing-check merge = score %v has=%v choice=%q, want absent-quality choice=a", signal.Score, signal.HasScore, choice)
 	}
 }
 
-// TestHarvestMergedNoStatusReaderIsNearNeutral asserts a nil status reader (or a
-// status read failure) conservatively degrades a merge to near-neutral rather
-// than rewarding it as a strong positive.
-func TestHarvestMergedNoStatusReaderIsNearNeutral(t *testing.T) {
+// TestHarvestMergedNoStatusReaderIsAbsentQuality asserts a nil status reader (or a
+// status read failure) conservatively degrades a merge to an ABSENT quality score
+// (HasScore=false) rather than rewarding it as a strong positive OR fabricating a
+// 0.5 (#474). With no reader the empty gate cannot be #614-confirmed, so the
+// reasoning is the unconfirmed wording.
+func TestHarvestMergedNoStatusReaderIsAbsentQuality(t *testing.T) {
 	ctx := context.Background()
 	store := newTraceStore(t)
 	_, payload := installTraceTemplate(t, store, "planner")
 	h := NewOutcomeHarvester(store, nil)
-	signal, _ := h.project(ctx, payload, workflow.Outcome{Kind: workflow.OutcomeMerged, Repo: "owner/repo", PullRequest: 7, HeadSHA: "deadbeef"})
-	if signal.Score != scoreMergedNoCI {
-		t.Fatalf("nil status reader merge score = %v, want near-neutral %v", signal.Score, scoreMergedNoCI)
+	signal, choice := h.project(ctx, payload, workflow.Outcome{Kind: workflow.OutcomeMerged, Repo: "owner/repo", PullRequest: 7, HeadSHA: "deadbeef"})
+	if choice != "a" || signal.HasScore {
+		t.Fatalf("nil status reader merge = score %v has=%v choice=%q, want absent-quality choice=a", signal.Score, signal.HasScore, choice)
+	}
+	if !strings.Contains(signal.Feedback, "no external CI observed at head") {
+		t.Fatalf("nil-reader no-CI reasoning = %q, want the unconfirmed-empty-gate wording", signal.Feedback)
 	}
 }
 

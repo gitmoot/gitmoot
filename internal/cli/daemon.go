@@ -6121,6 +6121,18 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 		// byte-identical. A missing tool/checkout/timeout SKIPS that dimension and never
 		// blocks or fails the merge; promotion stays manual.
 		DeterministicCheckerDispatcher: daemonDeterministicCheckerDispatcher(store, gh, checkout, home),
+		// Off-by-default deterministic HARD-verifier tier (#474): on a MERGE the engine
+		// additionally runs the operator's configured build/test/lint commands in a
+		// FRESH sandbox checkout at the merged head (exit 0 == pass), best-effort and
+		// DETACHED, and projects the binary pass/fail as the authoritative
+		// EvaluatorScore.Hard into the SAME auto-trace run — an un-gameable gate distinct
+		// from the verifiable floor, the subjective review, and the objective checker.
+		// daemonHardVerifierDispatcher returns nil unless [skillopt].hard_verifiers_enabled
+		// AND auto_trace_enabled are set AND at least one command is configured, so with
+		// no config NO verifier leg runs and NO hard row is written — byte-identical. A
+		// slow suite / unprovisionable sandbox never blocks or fails the merge; promotion
+		// stays manual.
+		HardVerifierDispatcher: daemonHardVerifierDispatcher(store, checkout, home),
 		PayloadRefresher: func(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
 			return refreshDaemonJobPayload(ctx, store, checkout, job, payload)
 		},

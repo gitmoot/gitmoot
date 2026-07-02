@@ -48,6 +48,30 @@ type DeterministicCheckerDispatcher interface {
 	Check(ctx context.Context, implementJob db.Job, implementPayload JobPayload, mergedHead string) (Outcome, bool, error)
 }
 
+// HardVerifierDispatcher is the injected, best-effort, nil-by-default seam (#474)
+// the engine calls after a merge to run the deterministic HARD-verifier tier: the
+// operator's configured build/test/lint COMMANDS run in a FRESH, clean sandbox
+// checkout at the merged head — exit 0 == pass. It returns an
+// Outcome{Kind: OutcomeReviewed, HardVerifier: true, HardPassed: <all-passed>} the
+// engine harvests into the SAME auto-trace run, mapping the binary verdict onto the
+// authoritative EvaluatorScore.Hard (1.0 pass / 0.0 fail) — an un-gameable gate the
+// LLM judge's prose can never move.
+//
+// It mirrors DeterministicCheckerDispatcher EXACTLY: nil-safe (when nil — the
+// default, no hard_verifiers_enabled — NO verifier leg runs and NO hard row is
+// written, byte-identical), DETACHED off the blocking AdvanceJob path (a slow test
+// suite can never stall job advancement or the daemon checkoutLock), and
+// best-effort (a dispatch error is swallowed and recorded as a hard_verifiers_failed
+// job event, never returned up). ok=false means NO verdict was producible at all
+// (the sandbox could not be provisioned, or the command list was empty) so the
+// engine writes no hard row; ok=true returns the binary verdict. The concrete impl
+// is wired only in cli (gated by hard_verifiers_enabled AND auto_trace_enabled AND a
+// non-empty command list), keeping the engine free of subprocess/skillopt/git
+// coupling.
+type HardVerifierDispatcher interface {
+	Verify(ctx context.Context, implementJob db.Job, implementPayload JobPayload, mergedHead string) (Outcome, bool, error)
+}
+
 // crossFamilyRotation is the fixed, deterministic family rotation used when no
 // registered different-family reviewer exists and the dispatcher materializes an
 // ephemeral different-family review leg (#469): codex→claude, claude→codex,

@@ -71,9 +71,12 @@ const (
 	// scoreMergedRealCI is the strong-positive Soft score for a merge that passed a
 	// genuine external CI (a non-gitmoot/ status or check that succeeded).
 	scoreMergedRealCI = 1.0
-	// scoreMergedNoCI is the near-neutral Soft score for a merge through an empty
-	// gate (the synthetic gitmoot/ci context, or no external CI at head): not a
-	// strong positive, but not a negative either — absence of verifiable evidence.
+	// scoreMergedNoCI is the defensive midpoint used ONLY by the unreachable
+	// unknown-outcome-kind branch of project(). It is NO LONGER the merge-through-an-
+	// empty-gate reward: as of #474 an empty-gate merge yields a genuinely-ABSENT
+	// quality score (HasScore=false) instead of this fabricated midpoint — see the
+	// OutcomeMerged branch. The constant survives only so the impossible default arm
+	// keeps a bounded, non-panicking value.
 	scoreMergedNoCI = 0.5
 	// scoreChangesRequestedBase is the first-fix-round Soft score for a
 	// changes_requested negative; each additional fix round subtracts
@@ -189,6 +192,14 @@ func (h *OutcomeHarvester) Harvest(ctx context.Context, job db.Job, payload work
 		return nil
 	}
 	if outcome.Kind == workflow.OutcomeReviewed {
+		if outcome.HardVerifier {
+			// Deterministic HARD-verifier signal (#474): a FOURTH coexisting, un-gameable
+			// FeedbackEvent in the SAME auto-trace run under a DISTINCT item id (hard#repo#pr)
+			// + reviewer (gitmoot-verifier), carrying the authoritative EvaluatorScore.Hard
+			// (1.0 pass / 0.0 fail) so it coexists with the verifiable floor, the objective
+			// checker, AND the subjective review instead of overwriting any of them.
+			return h.writeHardVerifierFeedback(ctx, version, outcome, projectHardVerifier(outcome))
+		}
 		if outcome.Objective {
 			// OBJECTIVE deterministic-checker signal (#485): a THIRD, tool-measured,
 			// non-LLM FeedbackEvent in the SAME auto-trace run under a DISTINCT item id
@@ -293,8 +304,20 @@ func (h *OutcomeHarvester) project(ctx context.Context, payload workflow.JobPayl
 			return positiveSignal(scoreMergedRealCI,
 				fmt.Sprintf("PR #%d merged with %s.", outcome.PullRequest, realExternalCIPhrase)), "a"
 		}
-		return positiveSignal(scoreMergedNoCI,
-			fmt.Sprintf("PR #%d merged through an empty gate (no external CI); near-neutral, not a strong positive.", outcome.PullRequest)), "a"
+		// No external CI at head: the merge EVENT is real (choice "a"), but there is NO
+		// verifiable QUALITY evidence, so we refuse to invent a midpoint reward. The
+		// merge row records the merge with a genuinely-ABSENT quality score
+		// (HasScore=false) — matching how the rest of the read-side projection returns
+		// absence rather than a fabricated 0.5 (#474; obsoletes the old scoreMergedNoCI
+		// punt). The reasoning is grounded in what the harvester can actually observe: a
+		// #614-confirmed empty gate (the grace window elapsed with the gitmoot/ci "no
+		// external CI" stamp at head → genuinely no CI) reads differently from a
+		// still-racing/unread zero.
+		detail := fmt.Sprintf("PR #%d merged through an empty gate (no external CI observed at head); no verifiable quality evidence — recorded as a merge event without a fabricated quality score.", outcome.PullRequest)
+		if h.mergeConfirmedNoCI(ctx, outcome) {
+			detail = fmt.Sprintf("PR #%d merged through a confirmed empty gate (grace window elapsed; genuinely no external CI at head); no verifiable quality evidence — recorded as a merge event without a fabricated quality score.", outcome.PullRequest)
+		}
+		return absentQualitySignal(detail), "a"
 	case workflow.OutcomeBlocked:
 		reason := strings.TrimSpace(outcome.Reason)
 		if reason == "" {
@@ -437,6 +460,52 @@ func gradedSignal(score float64, feedback string) NormalizedSignal {
 func negativeSignal(hard float64, feedback string) NormalizedSignal {
 	h := hard
 	return ProjectSignal(&EvaluatorScore{Hard: &h}, nil, &EvaluatorFailurePacket{OptimizerHint: feedback})
+}
+
+// absentQualitySignal builds a NormalizedSignal that records the textual feedback
+// but carries NO scalar quality score (HasScore=false), via ProjectSignal over a
+// nil EvaluatorScore (#474). It is the honest projection for a merge with no
+// verifiable evidence: the merge EVENT is still recorded by the caller's choice,
+// but the quality score is genuinely absent rather than a fabricated 0.5 — matching
+// how the rest of the read-side projection returns HasScore=false when a signal is
+// truly missing.
+func absentQualitySignal(feedback string) NormalizedSignal {
+	return ProjectSignal(nil, &RankedFeedbackEvent{Reasoning: feedback}, nil)
+}
+
+// mergeConfirmedNoCI reports whether the merged PR head carries the #614/#596
+// synthetic gitmoot/ci "no external CI" success stamp — the merge gate writes it
+// ONLY after the grace/max window elapses with the head unchanged and still zero
+// external CI, so its presence means the empty gate was CONFIRMED (genuinely no CI
+// at this head), NOT a still-racing Actions creation lag. It is best-effort and
+// read-only: a nil reader, a read error, a malformed repo, or an empty head all
+// degrade to false (unconfirmed), so this only ever SHARPENS the no-CI reasoning
+// text and never changes the (absent) score. It is consulted only from the no-CI
+// branch (after mergeHasRealCI already returned false), so a "success" gitmoot/ci
+// context here is exactly the confirmed-empty-gate stamp.
+func (h *OutcomeHarvester) mergeConfirmedNoCI(ctx context.Context, outcome workflow.Outcome) bool {
+	if h.Status == nil {
+		return false
+	}
+	head := strings.TrimSpace(outcome.HeadSHA)
+	if head == "" {
+		return false
+	}
+	repo, ok := parseRepo(outcome.Repo)
+	if !ok {
+		return false
+	}
+	status, err := h.Status.GetCombinedStatus(ctx, repo, head)
+	if err != nil {
+		return false
+	}
+	for _, item := range status.Statuses {
+		if strings.TrimSpace(item.Context) == gitmootNoCIContext &&
+			strings.EqualFold(strings.TrimSpace(item.State), "success") {
+			return true
+		}
+	}
+	return false
 }
 
 // writeFeedback upserts the dedicated per-template-version auto-trace eval_run,

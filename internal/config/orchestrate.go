@@ -611,6 +611,34 @@ type SkillOptPolicy struct {
 	// always-available, tool-less diff_size on a host without dupl/golangci-lint/
 	// gocyclo. An unknown name is ignored (best-effort), never an error.
 	DeterministicCheckerList []string
+
+	// HardVerifiers opts the daemon into the Mode A deterministic HARD-verifier tier
+	// (#474): when true (AND AutoTraceEnabled is also true), a merged implement job
+	// additionally runs the operator's configured verifier COMMANDS (build/test/lint,
+	// e.g. `go build ./...`, `go test ./...`) in a FRESH, clean sandbox checkout at
+	// the merged head — exit 0 == pass. The binary pass/fail verdict is the
+	// authoritative HARD score (EvaluatorScore.Hard) for the run: it CANNOT be gamed
+	// by an LLM judge's prose because it is a plain exit code from an isolated
+	// checkout (slime-style cheat-proofing). Empty/false (the default) means OFF: NO
+	// verifier leg runs and NO hard row is written — byte-identical to the
+	// verifiable-floor-only behavior. It additionally requires AutoTraceEnabled (a
+	// hard row only makes sense inside the auto-trace run); HardVerifiersEnabled()
+	// encodes that dependency, mirroring DeterministicCheckersEnabled(). The field is
+	// named …Verifiers (not …Enabled) because Go forbids a field and method sharing a
+	// name; HardVerifiersEnabled() below is the resolved accessor callers use.
+	HardVerifiers bool
+
+	// HardVerifierCommands is the operator's ordered list of hard-verifier shell
+	// commands (#474): each entry is a full command line (`go build ./...`,
+	// `go test ./...`, `npm test`) run via `sh -c` in the fresh sandbox checkout,
+	// exit 0 == pass. The run PASSES only when EVERY configured command exits 0
+	// (fail-closed set membership, slime's fail_to_pass ∪ pass_to_pass ⊆ passed).
+	// nil/empty (the default) means the leg has NOTHING to run: even with
+	// HardVerifiers on, an empty command list is a no-op (no hard row) — there is no
+	// safe universal default verifier command, so the operator MUST supply at least
+	// one. Parsed from repeatable `hard_verifier_commands = <one command>` lines so a
+	// command may itself contain commas without ambiguity.
+	HardVerifierCommands []string
 }
 
 // DefaultDeterministicCheckers is the safe default checker set used when the
@@ -647,6 +675,8 @@ func DefaultSkillOptPolicy() SkillOptPolicy {
 		LiveABSampleRate:                nil,
 		DeterministicCheckers:           false,
 		DeterministicCheckerList:        nil,
+		HardVerifiers:                   false,
+		HardVerifierCommands:            nil,
 	}
 }
 
@@ -711,6 +741,31 @@ func (p SkillOptPolicy) ResolvedDeterministicCheckers() []string {
 		return p.DeterministicCheckerList
 	}
 	return DefaultDeterministicCheckers
+}
+
+// HardVerifiersEnabled reports whether the deterministic HARD-verifier tier (#474)
+// is configured on. It requires BOTH hard_verifiers_enabled AND auto_trace_enabled
+// (a hard row only makes sense inside the auto-trace run) AND at least one
+// configured command (an empty command list has nothing to run), so enabling the
+// knob without commands — or without the auto-trace harvester — is OFF, mirroring
+// DeterministicCheckersEnabled()'s AND-dependency. Default false + the AND-gate +
+// the required-command guard guarantee byte-identical behavior with no config.
+func (p SkillOptPolicy) HardVerifiersEnabled() bool {
+	return p.AutoTraceEnabled && p.HardVerifiers && len(p.ResolvedHardVerifierCommands()) > 0
+}
+
+// ResolvedHardVerifierCommands returns the trimmed, non-empty hard-verifier command
+// list (#474). There is NO safe universal default verifier command (unlike the
+// diff_size checker), so an unset list stays empty and HardVerifiersEnabled() gates
+// the leg off — the operator must supply at least one command.
+func (p SkillOptPolicy) ResolvedHardVerifierCommands() []string {
+	out := make([]string, 0, len(p.HardVerifierCommands))
+	for _, cmd := range p.HardVerifierCommands {
+		if trimmed := strings.TrimSpace(cmd); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 func LoadSkillOptPolicy(paths Paths) (SkillOptPolicy, error) {
@@ -860,6 +915,18 @@ func applySkillOptPolicyField(policy *SkillOptPolicy, key string, value string) 
 		return err
 	case "deterministic_checkers":
 		policy.DeterministicCheckerList = parseDeterministicCheckerList(value)
+		return nil
+	case "hard_verifiers_enabled":
+		parsed, err := strconv.ParseBool(value)
+		policy.HardVerifiers = parsed
+		return err
+	case "hard_verifier_commands":
+		// APPEND one command per occurrence (a repeatable line), so a verifier command
+		// may itself contain commas / shell operators without a delimiter ambiguity.
+		// A blank value is ignored (best-effort); ResolvedHardVerifierCommands trims.
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			policy.HardVerifierCommands = append(policy.HardVerifierCommands, trimmed)
+		}
 		return nil
 	default:
 		return nil

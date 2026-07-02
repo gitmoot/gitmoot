@@ -129,6 +129,36 @@ func daemonDeterministicCheckerDispatcher(store *db.Store, gh github.Client, che
 	}
 }
 
+// daemonHardVerifierDispatcher returns the best-effort deterministic HARD-verifier
+// dispatcher for this home (#474), or nil when the tier is OFF — the default, or any
+// config-load failure (fail-safe to disabled). HardVerifiersEnabled() requires BOTH
+// hard_verifiers_enabled AND auto_trace_enabled AND at least one configured command,
+// so the hard row is only ever written inside an enabled auto-trace run with real
+// verifiers to run. When nil, the engine constructs no verifier leg and writes no
+// hard row, so daemon behavior is byte-identical. It mirrors
+// daemonDeterministicCheckerDispatcher's off-by-default gate. The sandbox is a fresh
+// detached worktree off the daemon's checkout at the merged head (reusing gitmoot's
+// worktree isolation, no external sandbox dep).
+func daemonHardVerifierDispatcher(store *db.Store, checkout string, home string) workflow.HardVerifierDispatcher {
+	if store == nil {
+		return nil
+	}
+	policy, err := loadSkillOptPolicy(home)
+	if err != nil || !policy.HardVerifiersEnabled() {
+		return nil
+	}
+	return &hardVerifierDispatcher{
+		store:  store,
+		runner: subprocess.ExecRunner{},
+		sandbox: worktreeSandboxProvisioner{
+			base:   checkout,
+			home:   home,
+			runner: subprocess.ExecRunner{},
+		},
+		commands: policy.ResolvedHardVerifierCommands(),
+	}
+}
+
 // daemonAuthedRuntimes probes which of the cross-family runtimes (codex/claude/
 // kimi) are authed/available, best-effort, via each adapter's Health check with a
 // synthetic read-only agent. A runtime that errors (not installed / not authed) is

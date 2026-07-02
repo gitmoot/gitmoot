@@ -86,6 +86,21 @@ type Engine struct {
 	// by deterministic_checkers_enabled AND auto_trace_enabled), keeping the engine
 	// free of subprocess/skillopt coupling.
 	DeterministicCheckerDispatcher DeterministicCheckerDispatcher
+	// HardVerifierDispatcher is the injected, best-effort, nil-by-default seam (#474)
+	// the engine calls AFTER a merge harvest to run the deterministic HARD-verifier
+	// tier: the operator's configured build/test/lint COMMANDS run in a FRESH clean
+	// sandbox checkout at the merged head (exit 0 == pass), producing a BINARY
+	// pass/fail verdict the harvester maps onto the authoritative EvaluatorScore.Hard.
+	// It mirrors DeterministicCheckerDispatcher EXACTLY: optional and nil-safe (when
+	// nil — the default, no [skillopt].hard_verifiers_enabled — NO verifier leg runs
+	// and NO hard row is written, byte-identical), DETACHED off the blocking merge
+	// path (a slow test suite can never stall AdvanceJob or the daemon checkoutLock),
+	// and best-effort (a dispatch error is swallowed and recorded as a
+	// hard_verifiers_failed job event, never returned up). The concrete impl is wired
+	// only in cli (gated by hard_verifiers_enabled AND auto_trace_enabled AND a
+	// non-empty command list), keeping the engine free of subprocess/skillopt/git
+	// coupling.
+	HardVerifierDispatcher HardVerifierDispatcher
 	// Home is the resolved GITMOOT_HOME root used to place per-delegation
 	// worktrees. DelegationWorktrees is the checkout-bound git client that
 	// performs the worktree-add. Both are optional: when either is unset, the
@@ -252,6 +267,19 @@ type Engine struct {
 	// spawns a goroutine; tests inject a synchronous runner so the checker leg is
 	// deterministic. It mirrors ReviewSpawner.
 	CheckerSpawner func(func())
+	// HardVerifierLegTimeout bounds the DETACHED hard-verifier leg (#474): the leg
+	// provisions a fresh sandbox and runs the operator's build/test/lint commands,
+	// which can be slow, so it must never run unbounded. The detached goroutine's
+	// context is wrapped in this timeout so a wedged verifier is reaped rather than
+	// leaking forever. <= 0 means defaultHardVerifierLegTimeout. It only matters when
+	// a HardVerifierDispatcher is wired (off by default).
+	HardVerifierLegTimeout time.Duration
+	// HardVerifierSpawner runs the detached hard-verifier leg OFF the AdvanceJob /
+	// daemon-poll path so a slow, possibly-wedged test suite can never block
+	// AdvanceJob, the worker tick, or the daemon's checkoutLock. The default (nil)
+	// spawns a goroutine; tests inject a synchronous runner so the verifier leg is
+	// deterministic. It mirrors CheckerSpawner.
+	HardVerifierSpawner func(func())
 }
 
 // DelegationTimeoutDefaults are optional fallback timeouts for child delegation
@@ -325,6 +353,14 @@ const defaultReviewLegTimeout = 10 * time.Minute
 // take a few minutes — whose only job is to reap a wedged tool so the detached
 // goroutine cannot leak forever.
 const defaultCheckerLegTimeout = 10 * time.Minute
+
+// defaultHardVerifierLegTimeout bounds the detached hard-verifier leg (#474) when
+// the engine's HardVerifierLegTimeout is unset (<= 0). It is a generous ceiling —
+// a real build + full test suite in a fresh checkout can legitimately take many
+// minutes — whose only job is to reap a wedged verifier so the detached goroutine
+// cannot leak forever. A verifier that runs past this is treated as a FAIL (the
+// context-cancelled command returns a non-zero exit), never a hang.
+const defaultHardVerifierLegTimeout = 15 * time.Minute
 
 // nonProgressStreakThreshold returns the configured result-aware non-progress
 // streak threshold, falling back to defaultMaxDelegationNonProgressStreak when
@@ -654,6 +690,27 @@ type Outcome struct {
 	// byte-identical to before this field existed (ADDITIVE: Outcome is an internal
 	// non-wire struct, so this touches no exported contract field or ContractVersion).
 	Objective bool
+
+	// HardVerifier distinguishes a deterministic HARD-verifier outcome (#474) from
+	// BOTH the OBJECTIVE deterministic-checker outcome (#485, Objective:true) and the
+	// SUBJECTIVE cross-family review outcome (#469), again WITHOUT a new OutcomeKind.
+	// It shares Kind == OutcomeReviewed but carries a BINARY pass/fail verdict
+	// (HardPassed) the harvester maps onto EvaluatorScore.Hard (1.0 pass / 0.0 fail) —
+	// an authoritative, un-gameable gate the LLM judge's prose can never move — and
+	// writes under a DISTINCT reviewer sentinel (gitmoot-verifier) + item-id prefix
+	// (hard#) so it coexists with the verifiable floor, the objective checker, and the
+	// subjective review instead of overwriting any of them. It is zero (false) for
+	// every existing path, so those outcomes are byte-identical (ADDITIVE: Outcome is
+	// an internal non-wire struct).
+	HardVerifier bool
+	// HardPassed is the deterministic hard-verifier verdict (#474), meaningful ONLY
+	// when HardVerifier is true: true when EVERY configured verifier command exited 0
+	// in the fresh sandbox (fail-closed set membership), false when ANY command failed
+	// or timed out. The harvester projects true → EvaluatorScore.Hard = 1.0 (strong,
+	// evidence-backed positive) and false → Hard = 0.0 (authoritative gate-fail
+	// negative), so a merge whose code actually fails a clean build/test is caught
+	// even when it merged through an empty (no-CI) gate.
+	HardPassed bool
 }
 
 // OutcomeHarvester is the injected, best-effort, nil-by-default seam (#465, Mode
@@ -4795,6 +4852,15 @@ func (e Engine) runMergeGate(ctx context.Context, reviewer string, payload JobPa
 		// checker-leg failure is swallowed so it can never block or fail the
 		// (already-completed) merge.
 		e.checkDeterministicForMergeGate(ctx, payload, mergedHead)
+		// Deterministic HARD-verifier tier (#474), DETACHED off the blocking AdvanceJob
+		// / daemon-poll path and strictly best-effort, mirroring the review + checker
+		// legs above: a nil dispatcher (the default, no hard_verifiers_enabled) is a
+		// no-op, the operator's build/test commands run in a FRESH sandbox in their own
+		// bounded, cancellation-detached goroutine so a slow suite can never stall
+		// AdvanceJob / the worker tick / the daemon's checkoutLock, and any verifier-leg
+		// failure is swallowed so it can never block or fail the (already-completed)
+		// merge. Its binary pass/fail becomes the authoritative EvaluatorScore.Hard.
+		e.verifyHardForMergeGate(ctx, payload, mergedHead)
 		return decision, nil
 	}
 	return decision, e.setTaskState(ctx, ref, TaskReadyToMerge)
@@ -4951,6 +5017,84 @@ func (e Engine) checkerLegTimeout() time.Duration {
 func (e Engine) spawnCheckerLeg(fn func()) {
 	if e.CheckerSpawner != nil {
 		e.CheckerSpawner(fn)
+		return
+	}
+	go fn()
+}
+
+// verifyHardForMergeGate runs the deterministic HARD-verifier leg for a just-merged
+// PR and harvests its BINARY pass/fail verdict into the SAME auto-trace run as the
+// authoritative EvaluatorScore.Hard (#474). It is nil-safe (no dispatcher => no-op,
+// byte-identical) and best-effort, and mirrors checkDeterministicForMergeGate EXACTLY.
+//
+// CRITICAL: the verifier leg provisions a fresh sandbox and runs the operator's
+// build/test commands, which can take minutes, so it is DETACHED from the caller's
+// path — it runs in its own goroutine (via spawnHardVerifierLeg) under a fresh,
+// cancellation-decoupled context bounded by HardVerifierLegTimeout. This guarantees a
+// slow/wedged verifier can NEVER stall AdvanceJob, the daemon worker tick, or the
+// daemon's checkoutLock, and is reaped by the timeout rather than leaking. A dispatch
+// error is swallowed + recorded as a hard_verifiers_failed job event, NEVER returned
+// up, so a verifier failure can never block or fail a job. The outcome is attributed
+// to the IMPLEMENT job that produced the diff (the same implementJobForTask
+// attribution the merge-gate harvest, review leg, and checker leg use), so the hard
+// row lands on the implementer's template version next to the verifiable floor.
+func (e Engine) verifyHardForMergeGate(ctx context.Context, reviewPayload JobPayload, mergedHead string) {
+	if e.HardVerifierDispatcher == nil || e.OutcomeHarvester == nil {
+		return
+	}
+	// Resolve the owning implement job up front (a cheap store read, no sandbox) so the
+	// detached closure is self-contained. If none resolves, there is nothing to
+	// verify/attribute.
+	job, payload, ok := e.implementJobForTask(ctx, reviewPayload)
+	if !ok {
+		return
+	}
+	e.spawnHardVerifierLeg(func() {
+		// Fresh context decoupled from the caller's ctx (which is cancelled the moment
+		// AdvanceJob returns) yet bounded so a wedged verifier is reaped, not leaked.
+		verifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), e.hardVerifierLegTimeout())
+		defer cancel()
+		e.runHardVerifierLeg(verifyCtx, job, payload, mergedHead)
+	})
+}
+
+// runHardVerifierLeg performs the actual hard-verifier dispatch + harvest. It is
+// called from the DETACHED goroutine (never on the AdvanceJob path) so its
+// sandbox provision + command runs cannot block job advancement (#474).
+func (e Engine) runHardVerifierLeg(ctx context.Context, job db.Job, payload JobPayload, mergedHead string) {
+	outcome, ok, err := e.HardVerifierDispatcher.Verify(ctx, job, payload, mergedHead)
+	if err != nil {
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "hard_verifiers_failed",
+			Message: err.Error(),
+		})
+		return
+	}
+	if !ok {
+		// No verdict producible (sandbox could not be provisioned, or no commands):
+		// skip silently (no hard row).
+		return
+	}
+	e.harvestOutcome(ctx, job, payload, outcome)
+}
+
+// hardVerifierLegTimeout returns the configured detached-hard-verifier-leg ceiling,
+// defaulting to defaultHardVerifierLegTimeout when unset so a zero-valued Engine
+// keeps a bounded verifier.
+func (e Engine) hardVerifierLegTimeout() time.Duration {
+	if e.HardVerifierLegTimeout > 0 {
+		return e.HardVerifierLegTimeout
+	}
+	return defaultHardVerifierLegTimeout
+}
+
+// spawnHardVerifierLeg runs fn off the caller's path. The default spawns a goroutine
+// (fire-and-forget, like spawnCheckerLeg); tests inject a synchronous runner via the
+// HardVerifierSpawner hook so the detached verifier leg is deterministic.
+func (e Engine) spawnHardVerifierLeg(fn func()) {
+	if e.HardVerifierSpawner != nil {
+		e.HardVerifierSpawner(fn)
 		return
 	}
 	go fn()

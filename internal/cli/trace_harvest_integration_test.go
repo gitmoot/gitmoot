@@ -343,10 +343,10 @@ func TestTraceHarvestFullChainMergedRealCI(t *testing.T) {
 }
 
 // TestTraceHarvestFullChainMergedNoCI drives case (b): a MERGE whose head carries
-// ONLY the synthetic gitmoot/ci context (no real external CI). The no-CI guard
-// must demote it to the near-neutral band — still choice "a", but NOT the strong
-// positive that case (a) earns. Asserted by comparing the two real runs' rows:
-// both are choice "a", and the no-CI reasoning explicitly marks it near-neutral.
+// ONLY the synthetic gitmoot/ci context (no real external CI). The no-CI guard must
+// record the merge EVENT (still choice "a") but WITHOUT fabricating a quality score,
+// and the persisted reasoning marks it a #614-confirmed empty gate — NOT the strong
+// positive that case (a) earns (#474). Asserted on the real persisted row.
 func TestTraceHarvestFullChainMergedNoCI(t *testing.T) {
 	ctx := context.Background()
 	store := openTraceChainStore(t)
@@ -369,16 +369,17 @@ func TestTraceHarvestFullChainMergedNoCI(t *testing.T) {
 	}
 	event := events[0]
 	if event.Choice != "a" {
-		t.Fatalf("merged+no-CI choice = %q, want a (positive but weak)", event.Choice)
+		t.Fatalf("merged+no-CI choice = %q, want a (the merge event is real)", event.Choice)
 	}
-	// The no-CI guard's near-neutral reasoning is the persisted, observable marker
-	// that this merge was NOT rewarded as a strong positive (the strong-positive
-	// reasoning instead says "merged with passing external CI"). Asserting on the
-	// real persisted reasoning keeps the test reading the store, not a mock, while
-	// still proving the no-CI demotion fired end-to-end.
+	// The honest no-CI reasoning (#474) is the persisted, observable marker that this
+	// merge was recorded WITHOUT a fabricated quality score — the #614 gitmoot/ci stamp
+	// makes it a CONFIRMED empty gate. The strong-positive reasoning instead says
+	// "merged with passing external CI". Asserting on the real persisted reasoning
+	// keeps the test reading the store, not a mock, while still proving the honest no-CI
+	// path fired end-to-end.
 	if got := event.Reasoning; got == "" ||
-		!strings.Contains(got, "no external CI") || !strings.Contains(got, "near-neutral") {
-		t.Fatalf("merged+no-CI reasoning = %q, want the near-neutral no-CI marker", got)
+		!strings.Contains(got, "no external CI") || !strings.Contains(got, "confirmed empty gate") {
+		t.Fatalf("merged+no-CI reasoning = %q, want the honest confirmed-empty-gate marker", got)
 	}
 	if strings.Contains(event.Reasoning, "passing external CI") {
 		t.Fatalf("merged+no-CI must not carry the strong-positive reasoning: %q", event.Reasoning)
