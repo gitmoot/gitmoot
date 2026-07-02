@@ -81,11 +81,29 @@ func KillDelegationTree(ctx context.Context, store *db.Store, jobID string) (db.
 				if p, perr := unmarshalPayload(j.Payload); perr == nil {
 					rootID := strings.TrimSpace(p.RootJobID)
 					if rootID != "" && rootID != j.ID && strings.TrimSpace(p.DelegationID) != "" {
-						_, _ = store.TransitionJobStateWithEvent(ctx, j.ID, string(JobQueued), string(JobCancelled), db.JobEvent{
+						cancelled, _ := store.TransitionJobStateWithEvent(ctx, j.ID, string(JobQueued), string(JobCancelled), db.JobEvent{
 							JobID:   j.ID,
 							Kind:    string(JobCancelled),
 							Message: fmt.Sprintf("delegation tree rooted at %s killed; queued child leg cancelled before start", root.ID),
 						})
+						// (#617) A queued implement leg already allocated its
+						// per-delegation worktree + branch lock at dispatch (allocation
+						// precedes enqueue), and a cancel-before-start bypasses the engine's
+						// terminal cleanupImplementDelegationWorktree, so release the branch
+						// lock here — symmetric with AllocateDelegationWorktree — or the
+						// killed burst strands gitmoot-delegation-* locks that block the next
+						// same-repo orchestration. Only when the transition actually landed:
+						// a leg that raced to running keeps its lock and releases it via its
+						// own terminal cleanup when it finishes. Best-effort.
+						if cancelled {
+							if released, rerr := releaseDelegationBranchLock(ctx, store, j.Type, p); rerr == nil && released {
+								_ = store.AddJobEvent(ctx, db.JobEvent{
+									JobID:   j.ID,
+									Kind:    "delegation_branch_lock_released",
+									Message: fmt.Sprintf("released delegation branch lock %s on delegation kill of tree %s (#617)", strings.TrimSpace(p.Branch), root.ID),
+								})
+							}
+						}
 					}
 				}
 			}

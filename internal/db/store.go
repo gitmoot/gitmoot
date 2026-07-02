@@ -5508,6 +5508,65 @@ func (s *Store) ListBranchLocks(ctx context.Context, repoFullName string) ([]Bra
 	return locks, rows.Err()
 }
 
+// BranchLockInfo is a branch lock plus its acquisition timestamps, surfaced by
+// ListBranchLocksWithAge for observability (#617): a stranded lock is only obvious
+// when its owner AND age are visible, so `gitmoot lock list` can show how long each
+// lock has been held and by whom — turning a silent stale-lock mystery into a
+// diagnosable one. CreatedAt/UpdatedAt are parsed best-effort; an unparseable stored
+// timestamp yields a zero time rather than an error.
+type BranchLockInfo struct {
+	BranchLock
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// parseStoredTimestamp parses a stored SQLite timestamp. Columns defaulted to
+// CURRENT_TIMESTAMP are UTC in "2006-01-02 15:04:05" form; RFC3339[Nano] is also
+// accepted defensively for columns written explicitly. An unrecognized value yields
+// the zero time (callers treat that as "age unknown") rather than an error.
+func parseStoredTimestamp(s string) time.Time {
+	s = strings.TrimSpace(s)
+	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC()
+		}
+	}
+	return time.Time{}
+}
+
+// ListBranchLocksWithAge returns the branch locks for repoFullName (all repos when
+// empty) alongside their created_at/updated_at timestamps, ordered like
+// ListBranchLocks. It exists so callers that need to reason about lock AGE (stale
+// stranded-lock detection, #617) do not have to widen the lean BranchLock struct
+// every read path already scans.
+func (s *Store) ListBranchLocksWithAge(ctx context.Context, repoFullName string) ([]BranchLockInfo, error) {
+	query := `SELECT repo_full_name, branch, owner, skip_native_review_fanout, created_at, updated_at FROM branch_locks`
+	args := []any{}
+	if strings.TrimSpace(repoFullName) != "" {
+		query += ` WHERE repo_full_name = ?`
+		args = append(args, repoFullName)
+	}
+	query += ` ORDER BY repo_full_name, branch`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var infos []BranchLockInfo
+	for rows.Next() {
+		var info BranchLockInfo
+		var createdAt, updatedAt string
+		if err := rows.Scan(&info.RepoFullName, &info.Branch, &info.Owner, &info.SkipNativeReviewFanout, &createdAt, &updatedAt); err != nil {
+			return nil, err
+		}
+		info.CreatedAt = parseStoredTimestamp(createdAt)
+		info.UpdatedAt = parseStoredTimestamp(updatedAt)
+		infos = append(infos, info)
+	}
+	return infos, rows.Err()
+}
+
 // SetBranchLockReviewFanout persists the skip_native_review_fanout flag onto the
 // branch lock for (repoFullName, branch). It is a no-op when no lock exists for
 // the pair. The flag is never written at lock creation (CreateLock defaults it to

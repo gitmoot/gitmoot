@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
@@ -59,19 +60,36 @@ func runLockList(args []string, stdout, stderr io.Writer) int {
 	if !ok {
 		return 2
 	}
-	var locks []db.BranchLock
+	var locks []db.BranchLockInfo
 	if err := withStore(*home, func(store *db.Store) error {
 		var err error
-		locks, err = store.ListBranchLocks(context.Background(), repoFullName)
+		locks, err = store.ListBranchLocksWithAge(context.Background(), repoFullName)
 		return err
 	}); err != nil {
 		fmt.Fprintf(stderr, "lock list: %v\n", err)
 		return 1
 	}
+	// repo, branch, owner, age — surfacing the owner AND how long each lock has been
+	// held makes a stranded lock (e.g. a crashed/departed ephemeral delegation worker,
+	// #617) diagnosable at a glance instead of a silent mystery.
+	now := time.Now().UTC()
 	for _, lock := range locks {
-		fmt.Fprintf(stdout, "%s\t%s\t%s\n", lock.RepoFullName, lock.Branch, lock.Owner)
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\n", lock.RepoFullName, lock.Branch, lock.Owner, lockAge(lock.CreatedAt, now))
 	}
 	return 0
+}
+
+// lockAge renders a human-readable age for a branch lock's created_at relative to
+// now. A zero/failed-to-parse timestamp renders "age?" rather than a bogus duration.
+func lockAge(createdAt, now time.Time) string {
+	if createdAt.IsZero() {
+		return "age?"
+	}
+	d := now.Sub(createdAt)
+	if d < 0 {
+		d = 0
+	}
+	return d.Round(time.Second).String() + " old"
 }
 
 func runLockShow(args []string, stdout, stderr io.Writer) int {

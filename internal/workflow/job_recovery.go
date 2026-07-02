@@ -167,6 +167,23 @@ func CancelJob(ctx context.Context, store *db.Store, jobID string) (db.Job, erro
 	// larger change). We swallow the error on purpose: lock cleanup is incidental
 	// and must never make a successful cancel fail.
 	_, _ = store.DeleteResourceLocksByOwner(ctx, job.ID)
+	// Best-effort: an implement delegation leg cancelled here never runs the engine's
+	// terminal cleanupImplementDelegationWorktree (that fires from AdvanceJob, which a
+	// cancel bypasses), so its per-delegation branch lock would otherwise leak exactly
+	// like the success path did before #617. Release it symmetric with
+	// AllocateDelegationWorktree's CreateLock so a cancelled burst does not strand
+	// gitmoot-delegation-* locks that block the next same-repo orchestration. Gated to
+	// worktree-isolated implement legs and swallowed on error: lock cleanup is
+	// incidental and must never make a successful cancel fail.
+	if payload, perr := unmarshalPayload(job.Payload); perr == nil {
+		if released, rerr := releaseDelegationBranchLock(ctx, store, job.Type, payload); rerr == nil && released {
+			_ = store.AddJobEvent(ctx, db.JobEvent{
+				JobID:   job.ID,
+				Kind:    "delegation_branch_lock_released",
+				Message: fmt.Sprintf("released delegation branch lock %s on cancel (#617)", strings.TrimSpace(payload.Branch)),
+			})
+		}
+	}
 	return store.GetJob(ctx, job.ID)
 }
 

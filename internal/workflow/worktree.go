@@ -467,10 +467,40 @@ func isImplementDelegationWorktree(jobType string, payload JobPayload) bool {
 		!readOnlyDelegationAction(jobType) // i.e. jobType == "implement"
 }
 
+// releaseDelegationBranchLock releases the branch lock a worktree-isolated
+// implement delegation leg acquired in AllocateDelegationWorktree (#617), once
+// the leg has reached a terminal state. It is force-scoped by (repo, branch): a
+// gitmoot-delegation-<parent-short>-<id>[-retry-N] branch is unique to exactly one
+// leg, so a force release cannot clobber another job's lock and is robust to any
+// owner drift, while an owner-scoped release could silently miss a lock whose
+// recorded owner no longer matches. It is gated by isImplementDelegationWorktree so
+// it fires ONLY for worktree-isolated implement legs — whose Branch is a real
+// per-delegation branch — and NEVER for the shared-checkout fallback leg, whose
+// Branch is the PARENT branch the coordinator still owns. Best-effort and
+// idempotent: a no-op (released=false, no branch_locks event) once the lock is gone
+// or when the payload lacks the repo/branch identity. Returns whether a lock was
+// actually released this call.
+func releaseDelegationBranchLock(ctx context.Context, store *db.Store, jobType string, payload JobPayload) (bool, error) {
+	if store == nil || !isImplementDelegationWorktree(jobType, payload) {
+		return false, nil
+	}
+	repo := strings.TrimSpace(payload.Repo)
+	branch := strings.TrimSpace(payload.Branch)
+	if repo == "" || branch == "" {
+		return false, nil
+	}
+	_, released, err := store.ForceReleaseLockWithEvent(ctx, repo, branch, db.BranchLockEvent{
+		Kind:    "released",
+		Message: "released after delegation leg reached a terminal state (#617)",
+	})
+	return released, err
+}
+
 // cleanupImplementDelegationWorktree disposes the per-delegation worktree AND
 // deletes the gitmoot-delegation-* branch allocated for an implement delegation
 // child once the child job is terminal, so they do not accumulate in the shared
-// checkout and mislead a later coordinator (#478). It is best-effort and
+// checkout and mislead a later coordinator (#478). It also releases the child's
+// per-delegation branch lock, symmetric with AllocateDelegationWorktree (#617). It is best-effort and
 // idempotent: an already-gone worktree+branch short-circuit to a no-op. Removal
 // and branch deletion mutate the shared .git, so it holds the checkout mutation
 // lock like allocation does. The worktree is removed FIRST so the branch is no
@@ -514,19 +544,36 @@ func (e Engine) cleanupImplementDelegationWorktree(ctx context.Context, jobID st
 		e.recordCleanupSkippedOnce(ctx, jobID, payload, reason)
 		return
 	}
+	// Detach from the caller's cancellation: this runs on the child's terminal
+	// AdvanceJob, which may carry a job context already cancelled by a run timeout.
+	// The worktree must still be disposed, so keep context values but drop the
+	// deadline/cancel.
+	opCtx := context.WithoutCancel(ctx)
+	branch := strings.TrimSpace(payload.Branch)
+	// #617: release the per-delegation branch lock now that this leg is terminal and
+	// has cleared the preserve-guards above (no integration consumer still needs its
+	// branch, no live runtime owner may still push). Symmetric with the CreateLock
+	// AllocateDelegationWorktree took at dispatch — an ephemeral leg's owner process
+	// is gone by the time it is terminal, so nothing else would ever release it. The
+	// leak stranded a gitmoot-delegation-* lock on EVERY terminal state (success
+	// included), and the next same-repo burst mis-read those stale locks as live
+	// workers and was refused. This is a pure branch_locks DELETE (no checkout
+	// mutation lock needed), placed BEFORE the worktree-manager and on-disk
+	// idempotency checks below so the lock is reclaimed even when no manager is wired
+	// or the worktree/branch are already gone. Idempotent: once released it is a
+	// no-op and emits nothing further.
+	if released, rerr := releaseDelegationBranchLock(opCtx, e.Store, jobType, payload); rerr != nil {
+		_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_cleanup_failed", Message: fmt.Sprintf("delegation branch lock %s release failed: %v", branch, rerr)})
+	} else if released {
+		_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_branch_lock_released", Message: fmt.Sprintf("released delegation branch lock %s after terminal state (#617)", branch)})
+	}
 	manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager) // RemoveWorktreeForce
 	if !ok || manager == nil {
 		return
 	}
 	deleter, _ := e.DelegationWorktrees.(BranchDeleter)
 	checker, _ := e.DelegationWorktrees.(BranchExistenceChecker)
-	// Detach from the caller's cancellation: this runs on the child's terminal
-	// AdvanceJob, which may carry a job context already cancelled by a run timeout.
-	// The worktree must still be disposed, so keep context values but drop the
-	// deadline/cancel.
-	opCtx := context.WithoutCancel(ctx)
 	path := strings.TrimSpace(payload.WorktreePath)
-	branch := strings.TrimSpace(payload.Branch)
 	// Idempotency: short-circuit (no lock, no spurious event) once there is nothing
 	// left to do. The pending work is (a) removing the worktree if it still exists
 	// and (b) deleting the branch if a BranchDeleter is wired and the branch is not
