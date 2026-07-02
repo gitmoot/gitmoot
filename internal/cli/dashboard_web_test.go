@@ -349,6 +349,133 @@ func TestSummarizeRunsSortedAndCapped(t *testing.T) {
 	}
 }
 
+// TestWebDataSourceGraph asserts the galaxy Graph unions all jobs, adds repo +
+// agent hub nodes, wires parent/dep/repo/agent links, and that a repo filter
+// narrows the visible nodes while Repos stays the full list.
+func TestWebDataSourceGraph(t *testing.T) {
+	home := dashboardTestHome(t)
+	seedWebDashboardTree(t, home)
+	// A second job in a different repo, so the repo filter has something to hide
+	// and Repos has more than one entry.
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	otherPayload := workflow.JobPayload{Repo: "jerryfane/other", TaskTitle: "other work"}
+	if err := store.CreateJob(context.Background(), db.Job{ID: "other-root", Agent: "project-lead", Type: "ask", State: "succeeded", Payload: mustJSON(t, otherPayload)}); err != nil {
+		t.Fatalf("CreateJob other: %v", err)
+	}
+	store.Close()
+
+	ds := &webDataSource{home: home}
+	ctx := context.Background()
+
+	g, err := ds.Graph(ctx, "")
+	if err != nil {
+		t.Fatalf("Graph: %v", err)
+	}
+
+	graphNode := func(nodes []dashboard.GraphNode, id string) (dashboard.GraphNode, bool) {
+		for _, n := range nodes {
+			if n.ID == id {
+				return n, true
+			}
+		}
+		return dashboard.GraphNode{}, false
+	}
+	hasLink := func(links []dashboard.GraphLink, src, tgt, kind string) bool {
+		for _, l := range links {
+			if l.Source == src && l.Target == tgt && l.Kind == kind {
+				return true
+			}
+		}
+		return false
+	}
+	kindCount := func(links []dashboard.GraphLink, kind string) int {
+		n := 0
+		for _, l := range links {
+			if l.Kind == kind {
+				n++
+			}
+		}
+		return n
+	}
+
+	// Job nodes: all five seeded jobs are present as type "job".
+	for _, id := range []string{"coord", "child-search", "child-export", "coord-cont", "other-root"} {
+		n, ok := graphNode(g.Nodes, id)
+		if !ok {
+			t.Fatalf("job node %q missing", id)
+		}
+		if n.Type != "job" {
+			t.Fatalf("node %q type = %q, want job", id, n.Type)
+		}
+	}
+	if n, _ := graphNode(g.Nodes, "coord"); n.Run != "coord" {
+		t.Fatalf("coord Run = %q, want coord", n.Run)
+	}
+	if n, _ := graphNode(g.Nodes, "child-search"); n.Run != "coord" {
+		t.Fatalf("child-search Run = %q, want coord (root)", n.Run)
+	}
+
+	// Repo hub + agent hubs.
+	if n, ok := graphNode(g.Nodes, "repo::jerryfane/noted"); !ok || n.Type != "repo" || n.Repo != "jerryfane/noted" {
+		t.Fatalf("repo hub node bad: %+v ok=%v", n, ok)
+	}
+	if n, ok := graphNode(g.Nodes, "agent::builder"); !ok || n.Type != "agent" || n.Agent != "builder" {
+		t.Fatalf("agent hub builder bad: %+v ok=%v", n, ok)
+	}
+	if _, ok := graphNode(g.Nodes, "agent::project-lead"); !ok {
+		t.Fatalf("agent hub project-lead missing")
+	}
+
+	// Links: parent + sibling-mesh (dep) + repo + agent all present.
+	if !hasLink(g.Links, "coord", "child-search", "parent") {
+		t.Fatalf("missing parent link coord->child-search")
+	}
+	// child-search and child-export share (root=coord, parent=coord) => a dep link.
+	if !hasLink(g.Links, "child-export", "child-search", "dep") && !hasLink(g.Links, "child-search", "child-export", "dep") {
+		t.Fatalf("missing sibling-mesh dep link between child-search and child-export")
+	}
+	if !hasLink(g.Links, "child-search", "repo::jerryfane/noted", "repo") {
+		t.Fatalf("missing repo spoke for child-search")
+	}
+	if !hasLink(g.Links, "child-search", "agent::builder", "agent") {
+		t.Fatalf("missing agent spoke for child-search")
+	}
+	if kindCount(g.Links, "dep") == 0 {
+		t.Fatalf("expected at least one sibling-mesh dep link")
+	}
+
+	// Repos: full distinct set, sorted.
+	if len(g.Repos) != 2 || g.Repos[0] != "jerryfane/noted" || g.Repos[1] != "jerryfane/other" {
+		t.Fatalf("Repos = %v, want [jerryfane/noted jerryfane/other]", g.Repos)
+	}
+
+	// Repo filter narrows the job nodes to the one repo but keeps the full Repos list.
+	filtered, err := ds.Graph(ctx, "jerryfane/noted")
+	if err != nil {
+		t.Fatalf("Graph(filter): %v", err)
+	}
+	if _, ok := graphNode(filtered.Nodes, "other-root"); ok {
+		t.Fatalf("filtered graph should not contain other-root")
+	}
+	if _, ok := graphNode(filtered.Nodes, "repo::jerryfane/other"); ok {
+		t.Fatalf("filtered graph should not contain the other repo hub")
+	}
+	if _, ok := graphNode(filtered.Nodes, "coord"); !ok {
+		t.Fatalf("filtered graph should still contain coord")
+	}
+	if len(filtered.Repos) != 2 {
+		t.Fatalf("filtered Repos = %v, want full 2-entry list", filtered.Repos)
+	}
+	for _, l := range filtered.Links {
+		if l.Target == "repo::jerryfane/other" || l.Source == "other-root" || l.Target == "other-root" {
+			t.Fatalf("filtered graph leaked a link to hidden node: %+v", l)
+		}
+	}
+}
+
 func TestParseRunKindAgent(t *testing.T) {
 	cases := []struct {
 		rootID     string

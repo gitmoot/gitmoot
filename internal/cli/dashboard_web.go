@@ -197,6 +197,190 @@ func (d *webDataSource) Job(ctx context.Context, jobID string) (dashboard.Node, 
 	return node, err
 }
 
+// Graph returns the whole-history "galaxy" graph: a union of every job across
+// every run in the store, plus synthetic repo/agent hub nodes that cluster the
+// jobs. Links are delegation parentage, a per-parent-group sibling mesh (the
+// density lever, capped so one huge fan-out can't dominate), and job->repo /
+// job->agent spokes. A non-empty repo scopes the visible jobs (and their hubs)
+// to that repository; Repos always lists the full distinct-repo set so the UI
+// filter dropdown stays complete. Read-only; output is sorted for determinism.
+func (d *webDataSource) Graph(ctx context.Context, repo string) (dashboard.Graph, error) {
+	out := dashboard.Graph{Nodes: []dashboard.GraphNode{}, Links: []dashboard.GraphLink{}, Repos: []string{}}
+	filter := strings.TrimSpace(repo)
+	err := withStore(d.home, func(store *db.Store) error {
+		jobs, err := store.ListJobs(ctx)
+		if err != nil {
+			return err
+		}
+		if len(jobs) == 0 {
+			return nil
+		}
+		jobByID := make(map[string]db.Job, len(jobs))
+		for _, j := range jobs {
+			jobByID[j.ID] = j
+		}
+
+		// Parse each job's payload once and record its repo/root.
+		payloadByID := make(map[string]workflow.JobPayload, len(jobs))
+		repoByID := make(map[string]string, len(jobs))
+		allRepos := map[string]bool{}
+		for _, j := range jobs {
+			p, _ := workflow.ParseJobPayload(j.Payload)
+			payloadByID[j.ID] = p
+			r := strings.TrimSpace(p.Repo)
+			repoByID[j.ID] = r
+			if r != "" {
+				allRepos[r] = true
+			}
+		}
+
+		// The visible job set: everything, or only jobs in the filtered repo.
+		visible := func(id string) bool {
+			if filter == "" {
+				return true
+			}
+			return repoByID[id] == filter
+		}
+
+		// Job nodes + collect the hubs referenced by visible jobs.
+		repoHubs := map[string]bool{}
+		agentHubs := map[string]bool{}
+		for _, j := range jobs {
+			if !visible(j.ID) {
+				continue
+			}
+			p := payloadByID[j.ID]
+			r := repoByID[j.ID]
+			agent := strings.TrimSpace(j.Agent)
+			// Run points at the job's root. Under an active repo filter that root
+			// may belong to a different repo and thus be absent from Nodes; fall
+			// back to self-root so no node attribute references a missing node.
+			run := jobRootID(jobByID, j.ID)
+			if filter != "" && !visible(run) {
+				run = j.ID
+			}
+			out.Nodes = append(out.Nodes, dashboard.GraphNode{
+				ID:    j.ID,
+				Type:  "job",
+				Label: nodeTitle(p, j, ""),
+				State: mapNodeState(j.State),
+				Agent: agent,
+				Repo:  r,
+				Run:   run,
+			})
+			if r != "" {
+				repoHubs[r] = true
+			}
+			if agent != "" {
+				agentHubs[agent] = true
+			}
+		}
+
+		// Hub nodes (sorted, appended after the job nodes).
+		hubRepos := sortedSetKeys(repoHubs)
+		for _, r := range hubRepos {
+			out.Nodes = append(out.Nodes, dashboard.GraphNode{ID: "repo::" + r, Type: "repo", Label: r, Repo: r})
+		}
+		for _, a := range sortedSetKeys(agentHubs) {
+			out.Nodes = append(out.Nodes, dashboard.GraphNode{ID: "agent::" + a, Type: "agent", Label: a, Agent: a})
+		}
+
+		// Delegation (parent) links + repo/agent spokes.
+		for _, j := range jobs {
+			if !visible(j.ID) {
+				continue
+			}
+			if pj := strings.TrimSpace(j.ParentJobID); pj != "" {
+				if _, ok := jobByID[pj]; ok && visible(pj) {
+					out.Links = append(out.Links, dashboard.GraphLink{Source: pj, Target: j.ID, Kind: "parent"})
+				}
+			}
+			if r := repoByID[j.ID]; r != "" {
+				out.Links = append(out.Links, dashboard.GraphLink{Source: j.ID, Target: "repo::" + r, Kind: "repo"})
+			}
+			if a := strings.TrimSpace(j.Agent); a != "" {
+				out.Links = append(out.Links, dashboard.GraphLink{Source: j.ID, Target: "agent::" + a, Kind: "agent"})
+			}
+		}
+
+		// Sibling mesh: group visible jobs by (root, parent) and add a dep link
+		// between every pair in each group of >=2 (capped at siblingMeshCap so a
+		// single huge fan-out can't dominate the density).
+		type groupKey struct{ root, parent string }
+		groups := map[groupKey][]string{}
+		for _, j := range jobs {
+			if !visible(j.ID) {
+				continue
+			}
+			key := groupKey{root: jobRootID(jobByID, j.ID), parent: strings.TrimSpace(j.ParentJobID)}
+			groups[key] = append(groups[key], j.ID)
+		}
+		for _, members := range groups {
+			if len(members) < 2 {
+				continue
+			}
+			sort.Strings(members)
+			if len(members) > siblingMeshCap {
+				members = members[:siblingMeshCap]
+			}
+			for i := 0; i < len(members); i++ {
+				for k := i + 1; k < len(members); k++ {
+					out.Links = append(out.Links, dashboard.GraphLink{Source: members[i], Target: members[k], Kind: "dep"})
+				}
+			}
+		}
+
+		out.Repos = sortedSetKeys(allRepos)
+
+		sort.SliceStable(out.Nodes, func(i, j int) bool {
+			return graphNodeLess(out.Nodes[i], out.Nodes[j])
+		})
+		sort.SliceStable(out.Links, func(i, j int) bool {
+			a, b := out.Links[i], out.Links[j]
+			if a.Source != b.Source {
+				return a.Source < b.Source
+			}
+			if a.Target != b.Target {
+				return a.Target < b.Target
+			}
+			return a.Kind < b.Kind
+		})
+		return nil
+	})
+	return out, err
+}
+
+// siblingMeshCap bounds the number of members of a single (root, parent) group
+// that participate in the sibling mesh, so one large fan-out cannot dominate the
+// galaxy graph's edge density.
+const siblingMeshCap = 24
+
+// graphNodeLess orders galaxy nodes deterministically: job nodes first (by id),
+// then the repo/agent hubs, so a stable graph is returned regardless of store
+// iteration order.
+func graphNodeLess(a, b dashboard.GraphNode) bool {
+	rank := func(t string) int {
+		if t == "job" {
+			return 0
+		}
+		return 1
+	}
+	if ra, rb := rank(a.Type), rank(b.Type); ra != rb {
+		return ra < rb
+	}
+	return a.ID < b.ID
+}
+
+// sortedSetKeys returns the keys of a string-set as a sorted slice.
+func sortedSetKeys(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Subscribe polls State for the requested run and pushes a fresh snapshot to the
 // returned channel whenever it changes (plus one initial snapshot). It is a
 // read-only poller — no store writes — and stops when the caller invokes the
