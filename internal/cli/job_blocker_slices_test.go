@@ -197,7 +197,7 @@ func TestAuthProbeAllowsRedispatchOnlyGatesAuth(t *testing.T) {
 		probed = true
 		return authProbeInvalid
 	}
-	if !authProbeAllowsRedispatch(ctx, worker, job, time.Now().UTC()) {
+	if !authProbeAllowsRedispatch(ctx, worker, job, time.Now().UTC(), nil) {
 		t.Fatal("a runtime_quota deferral was probe-gated; only runtime_auth should be")
 	}
 	if probed {

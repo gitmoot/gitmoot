@@ -202,6 +202,16 @@ type JobPayload struct {
 	// sees what condition must change; auth/quota/network deferrals leave it empty
 	// because they clear on their own. Additive/omitempty (byte-identical when unset).
 	BlockerSuggestedAction string `json:"blocker_suggested_action,omitempty"`
+	// BlockerPreDelivery marks a deferral that happened BEFORE the agent was ever
+	// delivered a prompt — currently only the daemon pre-flight checkout_contention
+	// hold (#532 slice C), which trips at checkout validation before Mailbox.Run
+	// claims the job and delivers. A pre-delivery deferral means the agent never
+	// executed, so a re-dispatch is a FIRST run with NO prior side effects to
+	// reconcile: the slice-F reconciliation notice must be suppressed for it. The
+	// mid-delivery seam (deferOperationalBlockerPreTerminal) clears this flag so a
+	// later runtime_auth/quota/network deferral still carries the at-least-once
+	// side-effect warning. Additive/omitempty (byte-identical when unset).
+	BlockerPreDelivery bool `json:"blocker_pre_delivery,omitempty"`
 }
 
 type DeliveryAdapter interface {
@@ -481,12 +491,15 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	}
 
 	prompt := prompts.RenderJob(payload.prompt(job.Type))
-	if payload.BlockerAttempts > 0 && strings.TrimSpace(payload.BlockerClass) != "" {
+	if payload.BlockerAttempts > 0 && strings.TrimSpace(payload.BlockerClass) != "" && !payload.BlockerPreDelivery {
 		// This run is an automatic operational-blocker retry (#532): the previous
 		// attempt died on an environment condition, not on its own output, and may
 		// have executed side effects before the blocker hit — so warn the agent its
 		// prior approach was sound and ask it to reconcile prior artifacts rather than
-		// duplicate them (slice F).
+		// duplicate them (slice F). Suppressed for a PRE-DELIVERY deferral
+		// (BlockerPreDelivery, e.g. a checkout_contention hold): that deferral tripped
+		// at the daemon pre-flight before any delivery, so the agent never executed and
+		// there are zero prior artifacts to reconcile — this is its first real run.
 		prompt = blockerRetryReconciliationNotice(payload.BlockerClass, payload.BlockerAttempts) + "\n\n" + prompt
 	}
 	firstRaw, firstRefreshedRef, firstErr := m.deliver(ctx, adapter, agent, job, payload, prompt)

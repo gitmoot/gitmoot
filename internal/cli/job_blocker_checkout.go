@@ -145,6 +145,12 @@ func (w jobWorker) deferCheckoutContention(ctx context.Context, job db.Job, payl
 	payload.BlockerAttempts = attempt
 	payload.BlockerRetryAt = retryAt
 	payload.BlockerSuggestedAction = action
+	// PRE-DELIVERY (#532): this hold trips at the daemon pre-flight, BEFORE Mailbox.Run
+	// delivers a prompt, so the agent never executed — a re-dispatch is a first run with
+	// no side effects to reconcile. Mark it so Mailbox.Run suppresses the slice-F
+	// reconciliation notice (which would otherwise falsely tell the agent a prior
+	// attempt ran and may have pushed branches / opened PRs).
+	payload.BlockerPreDelivery = true
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return false, err

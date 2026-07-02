@@ -390,6 +390,11 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 	payload.BlockerAttempts = attempt
 	payload.BlockerRetryAt = retryAt
 	payload.BlockerSuggestedAction = classification.SuggestedAction
+	// MID-DELIVERY (#532): the agent WAS delivered a prompt and may have executed side
+	// effects before the blocker cut it off, so this retry is at-least-once — clear any
+	// pre-delivery marker a prior checkout_contention hold left so Mailbox.Run still
+	// prepends the slice-F reconciliation notice.
+	payload.BlockerPreDelivery = false
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return false, err
@@ -446,6 +451,7 @@ func restorePreIsolationPayloadForDeferredJob(ctx context.Context, store *db.Sto
 	restored.BlockerAttempts = current.BlockerAttempts
 	restored.BlockerRetryAt = current.BlockerRetryAt
 	restored.BlockerSuggestedAction = current.BlockerSuggestedAction
+	restored.BlockerPreDelivery = current.BlockerPreDelivery
 	encoded, err := json.Marshal(restored)
 	if err != nil {
 		return

@@ -189,7 +189,7 @@ printf '%%s' '%s'`, countFile, marker, marker, promptFile, blockerE2EApprovedRes
 	// While inside the hold window, the queue gate must keep the job out of the
 	// pending listing and re-dispatch attempts must not deliver.
 	if time.Now().UTC().Before(retryAt) {
-		pending, err := listPendingQueuedJobs(ctx, worker, "", "")
+		pending, err := listPendingQueuedJobs(ctx, worker, "", "", true)
 		if err != nil {
 			t.Fatalf("listPendingQueuedJobs returned error: %v", err)
 		}

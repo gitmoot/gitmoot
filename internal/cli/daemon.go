@@ -3555,7 +3555,7 @@ func runQueuedJobsForRepo(ctx context.Context, worker jobWorker, limit int, repo
 	if worker.UsePool {
 		return runQueuedJobsForRepoPool(ctx, worker, limit, repoFilter, rootFilter)
 	}
-	pending, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter)
+	pending, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter, true)
 	if err != nil {
 		return err
 	}
@@ -3628,7 +3628,11 @@ func serializingConfig(usePool bool, limit int) bool {
 // returned signature uniquely identifies the parallelizable session set so the
 // preflight can de-duplicate an unchanged backlog across ticks.
 func parallelizableSerialJobs(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string) (int, string) {
-	pending, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter)
+	// forDispatch=false: this is a preflight COUNT for the serialization warning, not
+	// a dispatch. It must stay a pure read — no live auth probe (`claude -p`
+	// subprocess) and no payload mutation — so the warning path keeps its documented
+	// off-hot-path contract (#532).
+	pending, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter, false)
 	if err != nil {
 		return 0, ""
 	}
@@ -3743,10 +3747,22 @@ const daemonRestartEnvCaveat = "note: a restart RE-INHERITS the launching shell'
 // engine can route through the graceful finalize path; in-flight children finish
 // normally. Only children (payload.RootJobID points at another root) are skipped
 // here — the root job itself is never skipped.
-func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string) ([]db.Job, error) {
+//
+// forDispatch (#532 slice B) gates the LIVE runtime_auth credential probe: only a
+// caller that is actually about to dispatch jobs runs it. The preflight
+// serialization-warning path (parallelizableSerialJobs) passes false so counting
+// queued jobs stays a pure read — no `claude -p` subprocess, no job-payload
+// mutation — keeping that path off the DB/subprocess hot path as its contract
+// promises. A within-pass cache dedupes the probe across auth-held jobs of the same
+// runtime so one outage costs at most one live probe per pass.
+func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string, forDispatch bool) ([]db.Job, error) {
 	jobs, err := worker.Store.ListQueuedJobs(ctx)
 	if err != nil {
 		return nil, err
+	}
+	var probeCache authProbeCache
+	if forDispatch {
+		probeCache = authProbeCache{}
 	}
 	pending := make([]db.Job, 0, len(jobs))
 	for _, job := range jobs {
@@ -3767,8 +3783,10 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 		// elapses, only re-dispatch when a live doctor-style probe says the credential
 		// is VALID again — an Invalid verdict extends the hold (re-probe next cadence,
 		// no attempt burned). Non-auth deferrals and jobs with no probe wired pass
-		// straight through (coarse cadence only, byte-identical to slice A).
-		if !authProbeAllowsRedispatch(ctx, worker, job, time.Now().UTC()) {
+		// straight through (coarse cadence only, byte-identical to slice A). The live
+		// probe runs ONLY for a dispatching caller (forDispatch); the warning-count
+		// path skips it so it never spawns a subprocess or mutates the payload.
+		if forDispatch && !authProbeAllowsRedispatch(ctx, worker, job, time.Now().UTC(), probeCache) {
 			continue
 		}
 		pending = append(pending, job)
@@ -3937,7 +3955,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 
 		dispatched := 0
 		if firstErr == nil {
-			pending, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter)
+			pending, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter, true)
 			if err != nil {
 				firstErr = err
 			} else if slots := poolDispatchSlots(limit, running, hostCap, tracker); slots > 0 {
