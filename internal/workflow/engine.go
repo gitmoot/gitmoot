@@ -5977,6 +5977,23 @@ func (e Engine) setTaskState(ctx context.Context, ref taskRef, state TaskState) 
 			task.Branch = existing.Branch
 		}
 	}
+	// One task per (repo, branch) is enforced by the tasks(repo_full_name, branch)
+	// partial-unique index. If this ref carries a non-empty branch already owned by a
+	// DIFFERENT task -- e.g. workflow advancement re-running a phase on the same branch
+	// under a fresh task id -- upserting `task` would fail with
+	// "UNIQUE constraint failed: tasks.repo_full_name, tasks.branch" and wedge the
+	// advancement. Advance the branch's canonical task in place instead of inserting a
+	// duplicate (mirrors StartTaskBranch's reuse check).
+	if task.Branch != "" {
+		byBranch, berr := e.Store.GetTaskByRepoBranch(ctx, task.RepoFullName, task.Branch)
+		if berr != nil && !errors.Is(berr, sql.ErrNoRows) {
+			return berr
+		}
+		if berr == nil && byBranch.ID != task.ID {
+			byBranch.State = string(state)
+			return e.Store.UpsertTask(ctx, byBranch)
+		}
+	}
 	return e.Store.UpsertTask(ctx, task)
 }
 
