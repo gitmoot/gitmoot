@@ -2687,6 +2687,16 @@ type jobWorker struct {
 	// a config file / webhook. When nil (production), eventSink() resolves the
 	// shared process-global webhook sink from [events] config instead.
 	EventSinkOverride events.Sink
+	// AuthProbe is the injected doctor-style live credential probe (#532 slice B).
+	// It gates re-dispatch of a runtime_auth deferral: once the coarse hold elapses
+	// the scheduler only releases the job when the probe reports the credential is
+	// VALID again (an Invalid verdict extends the hold WITHOUT burning a retry
+	// attempt; an Unknown/transient verdict falls back to the coarse cadence). When
+	// nil (foreground CLI, and every construction that does not opt in) the gate is
+	// byte-identical to slice A: the coarse cadence alone governs re-dispatch. Tests
+	// inject a fake verdict; the daemon wires defaultAuthProbe (a bounded
+	// runtime.ClaudeLiveCheck for claude agents, Unknown for other runtimes).
+	AuthProbe func(context.Context, db.Job, workflow.JobPayload) authProbeVerdict
 }
 
 // eventSink resolves the best-effort outbound event Sink (#446) for the
@@ -2852,6 +2862,7 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 	worker.StartAdapterFactory = worker.defaultStartAdapter
 	worker.CheckoutValidator = worker.defaultCheckout
 	worker.WorkflowFactory = worker.defaultWorkflow
+	worker.AuthProbe = worker.defaultAuthProbe
 	return worker
 }
 
@@ -3750,6 +3761,14 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 		// schedulers (barrier and pool) funnel through this listing, so the hold
 		// is honored everywhere; jobs without the payload field are unaffected.
 		if queuedJobBlockerHeld(job, time.Now().UTC()) {
+			continue
+		}
+		// Auth-probe gate (#532 slice B): once a runtime_auth deferral's coarse hold
+		// elapses, only re-dispatch when a live doctor-style probe says the credential
+		// is VALID again — an Invalid verdict extends the hold (re-probe next cadence,
+		// no attempt burned). Non-auth deferrals and jobs with no probe wired pass
+		// straight through (coarse cadence only, byte-identical to slice A).
+		if !authProbeAllowsRedispatch(ctx, worker, job, time.Now().UTC()) {
 			continue
 		}
 		pending = append(pending, job)
