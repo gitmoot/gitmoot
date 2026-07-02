@@ -296,10 +296,15 @@ you trust it to gate candidates.
 
 `gitmoot skillopt judge agreement [--template <id>] [--json]` extends the
 measurement to the pairwise slice: it joins the A/B judge rows (`skillopt ab
---judge` / jury) against human ranked/pairwise picks on the same items and
-reports Cohen's κ as the headline, raw agreement, per-source/per-juror
-breakdowns, and a position-bias audit (`|P(pick=a) − 0.5|`), with a loud
-small-sample warning. Read-only.
+--judge` / jury) against human ranked/pairwise picks on the same
+**comparison** (each `skillopt ab` invocation stamps a shared per-comparison
+token on all of its rows; older tokenless rows are excluded and counted as
+unmeasurable, never pooled by challenger) and reports Cohen's κ as the
+headline, raw agreement, per-source/per-juror breakdowns, and an
+assignment-corrected position-bias audit (stratified by the champion's
+presented position, reported alongside `P(pick=a)` and
+`P(option A = champion)`; undefined when a fixed `--seed` pinned the champion
+to one position), with a loud small-sample warning. Read-only.
 
 Those captured outcomes feed judge-prompt optimization. The contract carries a
 per-`task_kind` judge prompt

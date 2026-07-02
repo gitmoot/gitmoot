@@ -711,12 +711,18 @@ disagreement. Pass `--template <id>` to scope the report to one template, and
 
 `skillopt judge agreement` is the judge↔human agreement measurement harness
 (#344). It joins the stored A/B judge verdicts (`skillopt ab --judge` /
-jury rows) against the human ranked/pairwise feedback on the same items
-(per-item majority; internal ties are skipped and counted) and reports Cohen's
-κ as the **headline** metric (raw agreement overstates judge quality because
-it does not correct for chance), the raw agreement rate, per-human-source and
-per-juror-family breakdowns, a position-bias audit over judge rows that carry
-the recorded raw a/b pick (`|P(pick=a) − 0.5|`), and a summary of the
+jury rows) against the human ranked/pairwise feedback on the same
+**comparison**: each `skillopt ab` invocation stamps a shared per-comparison
+token on all of its rows, so repeated A/Bs of one challenger stay separate
+observations (older tokenless rows are excluded and counted as unmeasurable,
+never pooled; internal ties within one comparison are skipped and counted).
+It reports Cohen's κ as the **headline** metric (raw agreement overstates
+judge quality because it does not correct for chance), the raw agreement
+rate, per-human-source and per-juror-family breakdowns, an
+assignment-corrected position-bias audit over judge rows that carry the
+recorded raw a/b pick (`P(pick=a)` stratified by the champion's presented
+position and reported alongside `P(option A = champion)`; undefined when a
+fixed `--seed` pinned the champion to one position), and a summary of the
 candidate-level judge outcomes above. Small samples get a loud warning —
 sample size is the limiter. `--json` emits the machine-readable report. It is
 read-only.

@@ -25,14 +25,27 @@ import (
 // Two slices are measured:
 //
 //  1. PAIRWISE slice — Mode B A/B judge rows (source=skillopt-ab-judge, single
-//     judge or jury aggregate) joined per (run_id, item_id) against the human
-//     ranked rows (source=skillopt-ab, live-pairwise, markdown, github, ...)
-//     on the same item. This is the slice skillopt_ab.go explicitly defers as
-//     "NOT calibrated against human gold ... until a judge<->human agreement
-//     capture lands (#344)". Multiple rows per rater side collapse to a
-//     per-item MAJORITY verdict (ties are skipped and counted) so repeated
-//     picks never inflate N. It also runs the position-bias audit over judge
-//     rows carrying the recorded raw a|b pick: |P(pick=a) - 0.5|.
+//     judge or jury aggregate) joined against the human ranked rows
+//     (source=skillopt-ab, live-pairwise, markdown, github, ...) on the SAME
+//     COMPARISON. For skillopt-ab runs the join key is (run_id, item_id,
+//     comparison_token): run_id is "skillopt-ab:<challengerVersion>" and
+//     item_id is always "ab", so (run_id, item_id) alone identifies the
+//     CHALLENGER, not the comparison — every repeated A/B of one challenger
+//     (its own prompt, freshly regenerated answers, its own shuffle, its own
+//     champion resolution) would pool into one bucket and pair judge verdicts
+//     against human verdicts made on DIFFERENT comparisons. The per-invocation
+//     token embedded in each row's SourceURL is what restores the true
+//     granularity; legacy skillopt-ab rows without it are EXCLUDED and counted
+//     loudly (unmeasurable — distinct from "no overlap yet") instead of being
+//     pooled. Rows on other run families keep the (run_id, item_id) join
+//     (there each item IS one comparison). This is the slice skillopt_ab.go
+//     explicitly defers as "NOT calibrated against human gold ... until a
+//     judge<->human agreement capture lands (#344)". Multiple rows per rater
+//     side within one comparison collapse to a MAJORITY verdict (ties are
+//     skipped and counted) so true re-votes never inflate N. It also runs the
+//     position-bias audit over judge rows carrying the recorded raw a|b pick
+//     (see skillOptJudgeAgreementPosition for the assignment-corrected
+//     estimator).
 //  2. CANDIDATE slice — the #345 skillopt_judge_outcomes capture (judge
 //     accept/reject vs human promote/reject), summarized here with the SAME
 //     kappa-headline framing; `skillopt judge-report` remains the full
@@ -69,27 +82,55 @@ type skillOptJudgeAgreementBreakdown struct {
 }
 
 // skillOptJudgeAgreementPosition is the position-bias audit over judge/juror
-// rows that carry the recorded raw presented-position pick: P(pick=a) should
-// hover near 0.5 under the randomized label shuffle; a large |P(a) - 0.5| is
-// position bias ("Reliability without Validity": a stable-but-biased judge is
-// a failure mode, not a strength).
+// rows that carry the recorded raw presented-position pick ("Reliability
+// without Validity": a stable-but-biased judge is a failure mode, not a
+// strength).
+//
+// Raw |P(pick=a) - 0.5| is only a bias measure when the position ASSIGNMENT is
+// balanced — under a fixed --seed (a documented flag; seed 0 pins the champion
+// at Option A on every run) it reports the judge's genuine CONTENT preference
+// as "position bias". The champion's presented position IS recoverable per row
+// (champion was at Option A iff (Winner==champion) == (pick=="a"), because the
+// stored Winner was unblinded through that same mapping), so the audit
+// stratifies by it:
+//
+//	Bias = |(P(pick=a | champion at A) + P(pick=a | champion at B) - 1) / 2|
+//
+// For a content-only judge with champion-preference p the two conditionals are
+// p and 1-p, so the estimate is 0 regardless of the assignment split; a judge
+// that always picks Option A scores 0.5; and under a perfectly balanced
+// assignment the estimate equals the old |P(pick=a) - 0.5| exactly. When every
+// measured row presented the champion at the SAME position (e.g. a fixed
+// --seed) one stratum is empty and the bias is reported as UNDEFINED
+// (BiasDefined=false, mirroring the kappa degenerate-marginals stance) instead
+// of a fabricated number. PChampionA (the assignment split) is always reported
+// alongside P(pick=a) so a skewed shuffle is visible at a glance.
 type skillOptJudgeAgreementPosition struct {
-	N      int     `json:"n"`
-	PickA  int     `json:"pick_a"`
-	PPickA float64 `json:"p_pick_a"`
-	Bias   float64 `json:"bias"`
+	N           int     `json:"n"`
+	PickA       int     `json:"pick_a"`
+	PPickA      float64 `json:"p_pick_a"`
+	ChampionA   int     `json:"champion_a"`
+	PChampionA  float64 `json:"p_champion_a"`
+	Bias        float64 `json:"bias"`
+	BiasDefined bool    `json:"bias_defined"`
+	BiasNote    string  `json:"bias_note,omitempty"`
 }
 
 // skillOptJudgeAgreementPairwise is the pairwise-slice report.
+// LegacyRowsExcluded counts skillopt-ab rows written BEFORE the per-comparison
+// token existed: their (run_id, item_id) is the challenger, not the comparison,
+// so they cannot be joined truthfully and are excluded loudly (unmeasurable —
+// a different condition than "no overlap yet") rather than pooled.
 type skillOptJudgeAgreementPairwise struct {
 	skillOptJudgeAgreementStats
-	JudgeRows      int                               `json:"judge_rows"`
-	HumanRows      int                               `json:"human_rows"`
-	JurorRows      int                               `json:"juror_rows"`
-	TiesSkipped    int                               `json:"ties_skipped"`
-	PerSource      []skillOptJudgeAgreementBreakdown `json:"per_source,omitempty"`
-	PerJurorFamily []skillOptJudgeAgreementBreakdown `json:"per_juror_family,omitempty"`
-	Position       *skillOptJudgeAgreementPosition   `json:"position,omitempty"`
+	JudgeRows          int                               `json:"judge_rows"`
+	HumanRows          int                               `json:"human_rows"`
+	JurorRows          int                               `json:"juror_rows"`
+	TiesSkipped        int                               `json:"ties_skipped"`
+	LegacyRowsExcluded int                               `json:"legacy_rows_excluded"`
+	PerSource          []skillOptJudgeAgreementBreakdown `json:"per_source,omitempty"`
+	PerJurorFamily     []skillOptJudgeAgreementBreakdown `json:"per_juror_family,omitempty"`
+	Position           *skillOptJudgeAgreementPosition   `json:"position,omitempty"`
 }
 
 // skillOptJudgeAgreementReport is the full machine-readable report (--json).
@@ -190,8 +231,10 @@ func classifySkillOptAgreementRow(event db.RankedFeedbackEvent) string {
 	return skillOptAgreementRowHuman
 }
 
-// skillOptAgreementItem is the per-(run_id, item_id) join bucket: all judge,
-// juror, and human winner votes on one item.
+// skillOptAgreementItem is the per-comparison join bucket — keyed by
+// (run_id, item_id, comparison_token) for skillopt-ab runs and by
+// (run_id, item_id) elsewhere: all judge, juror, and human winner votes on ONE
+// comparison.
 type skillOptAgreementItem struct {
 	judgeWinners []string
 	humanWinners []string
@@ -272,21 +315,61 @@ func skillOptAgreementStats(pairs [][2]string) skillOptJudgeAgreementStats {
 }
 
 // buildSkillOptJudgeAgreementPairwise runs the pairwise-slice join: bucket
-// rows by (run_id, item_id), collapse each side to its per-item majority,
-// pair judge-vs-human per item, then compute overall/per-source/per-juror
-// stats and the position audit.
+// rows by comparison — (run_id, item_id, comparison_token) for skillopt-ab
+// runs (where run/item alone is the challenger, not the comparison), plain
+// (run_id, item_id) elsewhere — collapse each side to its per-comparison
+// majority, pair judge-vs-human per comparison, then compute
+// overall/per-source/per-juror stats and the position audit. Legacy
+// skillopt-ab rows without a comparison token are excluded and counted, never
+// pooled. The position audit is PER ROW (a judge row's presented pick and
+// recovered champion position are valid measurements whether or not the row
+// joins a human verdict), so it runs before the join-eligibility check.
 func buildSkillOptJudgeAgreementPairwise(events []db.RankedFeedbackEventWithTemplate) skillOptJudgeAgreementPairwise {
 	pairwise := skillOptJudgeAgreementPairwise{}
 	items := map[string]*skillOptAgreementItem{}
 	itemKeys := []string{}
 	position := skillOptJudgeAgreementPosition{}
 	positionSeen := false
+	positionPickAChampionA := 0
 	for _, event := range events {
 		kind := classifySkillOptAgreementRow(event.RankedFeedbackEvent)
 		if kind == skillOptAgreementRowOther || strings.TrimSpace(event.Winner) == "" {
 			continue
 		}
+		// Position audit: any judge/juror row carrying a recorded raw pick whose
+		// Winner is one of the two role labels (which is what makes the champion's
+		// presented position recoverable: champion at A iff the unblinded winner
+		// and the raw pick point the same way).
+		if kind == skillOptAgreementRowJudge || kind == skillOptAgreementRowJuror {
+			if pick, ok := skillOptABJudgePickPosition(event.Reasoning); ok &&
+				(event.Winner == skillOptABChampionLabel || event.Winner == skillOptABChallengerLabel) {
+				positionSeen = true
+				position.N++
+				championAtA := (event.Winner == skillOptABChampionLabel) == (pick == "a")
+				if pick == "a" {
+					position.PickA++
+				}
+				if championAtA {
+					position.ChampionA++
+					if pick == "a" {
+						positionPickAChampionA++
+					}
+				}
+			}
+		}
 		key := event.RunID + "\x00" + event.ItemID
+		if strings.HasPrefix(event.RunID, skillOptABRunIDPrefix) {
+			// skillopt-ab runs: (run_id, item_id) is the CHALLENGER (item is always
+			// "ab"), so the per-invocation comparison token is REQUIRED to identify
+			// the comparison. A tokenless row is a legacy row: unmeasurable, counted,
+			// and never pooled with other comparisons of the same challenger.
+			token, ok := skillOptABComparisonTokenFromSourceURL(event.SourceURL)
+			if !ok {
+				pairwise.LegacyRowsExcluded++
+				continue
+			}
+			key += "\x00" + token
+		}
 		item := items[key]
 		if item == nil {
 			item = &skillOptAgreementItem{humanSources: map[string][]string{}, jurorWinners: map[string][]string{}}
@@ -305,16 +388,6 @@ func buildSkillOptJudgeAgreementPairwise(events []db.RankedFeedbackEventWithTemp
 			pairwise.HumanRows++
 			item.humanWinners = append(item.humanWinners, event.Winner)
 			item.humanSources[event.Source] = append(item.humanSources[event.Source], event.Winner)
-		}
-		// Position audit: any judge/juror row carrying a recorded raw pick.
-		if kind == skillOptAgreementRowJudge || kind == skillOptAgreementRowJuror {
-			if pick, ok := skillOptABJudgePickPosition(event.Reasoning); ok {
-				positionSeen = true
-				position.N++
-				if pick == "a" {
-					position.PickA++
-				}
-			}
 		}
 	}
 	sort.Strings(itemKeys)
@@ -358,7 +431,22 @@ func buildSkillOptJudgeAgreementPairwise(events []db.RankedFeedbackEventWithTemp
 	pairwise.PerJurorFamily = skillOptAgreementBreakdowns(jurorPairs)
 	if positionSeen {
 		position.PPickA = float64(position.PickA) / float64(position.N)
-		position.Bias = math.Abs(position.PPickA - 0.5)
+		position.PChampionA = float64(position.ChampionA) / float64(position.N)
+		// Assignment-corrected position bias (see skillOptJudgeAgreementPosition):
+		// stratify P(pick=a) by the champion's recovered presented position so a
+		// content preference under a skewed assignment (e.g. a fixed --seed pinning
+		// the champion at Option A) is never reported as position bias. With an
+		// empty stratum the bias is UNDEFINED — reported as such, never fabricated.
+		championAtA := position.ChampionA
+		championAtB := position.N - position.ChampionA
+		if championAtA > 0 && championAtB > 0 {
+			pPickAChampionA := float64(positionPickAChampionA) / float64(championAtA)
+			pPickAChampionB := float64(position.PickA-positionPickAChampionA) / float64(championAtB)
+			position.Bias = math.Abs((pPickAChampionA + pPickAChampionB - 1) / 2)
+			position.BiasDefined = true
+		} else {
+			position.BiasNote = "degenerate position assignment: the champion was presented at the same position in every measured row (e.g. a fixed --seed pins the shuffle), so position bias cannot be separated from content preference"
+		}
 		pairwise.Position = &position
 	}
 	return pairwise
@@ -420,11 +508,14 @@ func renderSkillOptJudgeAgreementReport(stdout io.Writer, report skillOptJudgeAg
 	writeLine(stdout, "")
 
 	pairwise := report.Pairwise
-	writeLine(stdout, "pairwise slice (A/B judge vs human ranked feedback, per-item majority join)")
-	writeLine(stdout, "  items joined: %d (judge rows: %d, human rows: %d, juror rows: %d, tied items skipped: %d)",
+	writeLine(stdout, "pairwise slice (A/B judge vs human ranked feedback, per-comparison majority join)")
+	writeLine(stdout, "  comparisons joined: %d (judge rows: %d, human rows: %d, juror rows: %d, tied comparisons skipped: %d)",
 		pairwise.N, pairwise.JudgeRows, pairwise.HumanRows, pairwise.JurorRows, pairwise.TiesSkipped)
+	if pairwise.LegacyRowsExcluded > 0 {
+		writeLine(stdout, "  legacy rows excluded: %d (written before the per-comparison token; unmeasurable — these cannot be joined truthfully and are NEVER pooled by challenger)", pairwise.LegacyRowsExcluded)
+	}
 	if pairwise.N == 0 {
-		writeLine(stdout, "  no overlap yet: no item carries BOTH a judge verdict and a human verdict")
+		writeLine(stdout, "  no overlap yet: no comparison carries BOTH a judge verdict and a human verdict")
 	} else {
 		writeLine(stdout, "  cohen's kappa (headline): %s", skillOptAgreementKappaText(pairwise.skillOptJudgeAgreementStats))
 		writeLine(stdout, "  raw agreement: %.3f (%d/%d)", pairwise.Agreement, pairwise.Agreements, pairwise.N)
@@ -443,7 +534,11 @@ func renderSkillOptJudgeAgreementReport(stdout io.Writer, report skillOptJudgeAg
 	}
 	if pairwise.Position != nil {
 		writeLine(stdout, "  position audit (judge/juror rows with a recorded raw pick):")
-		writeLine(stdout, "    N=%d  P(pick=a)=%.3f  position bias |P(a)-0.5|=%.3f", pairwise.Position.N, pairwise.Position.PPickA, pairwise.Position.Bias)
+		if pairwise.Position.BiasDefined {
+			writeLine(stdout, "    N=%d  P(pick=a)=%.3f  P(option A=champion)=%.3f  position bias=%.3f (assignment-corrected)", pairwise.Position.N, pairwise.Position.PPickA, pairwise.Position.PChampionA, pairwise.Position.Bias)
+		} else {
+			writeLine(stdout, "    N=%d  P(pick=a)=%.3f  P(option A=champion)=%.3f  position bias: n/a (%s)", pairwise.Position.N, pairwise.Position.PPickA, pairwise.Position.PChampionA, pairwise.Position.BiasNote)
+		}
 	} else {
 		writeLine(stdout, "  position audit: no judge rows carry a recorded pick position yet (rows written before this capture are not measurable)")
 	}

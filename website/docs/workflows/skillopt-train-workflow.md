@@ -732,11 +732,20 @@ the gate before relying on it for candidate decisions.
 `gitmoot skillopt judge agreement [--template <id>] [--json]` extends the
 measurement to the **pairwise** slice: it joins the A/B judge rows
 (`skillopt ab --judge` / jury) against the human ranked/pairwise picks on the
-same items (per-item majority; ties skipped and counted) and reports Cohen's κ
-as the headline metric, raw agreement, per-human-source and per-juror-family
-breakdowns, and a position-bias audit over judge rows carrying the recorded raw
-a/b pick (`|P(pick=a) − 0.5|`). Small samples get a loud warning — sample size
-is the limiter. It is read-only; `--json` emits the machine-readable report.
+same **comparison** — each `skillopt ab` invocation stamps a shared
+per-comparison token on all of its rows, so repeated A/Bs of one challenger
+never pool into a single bucket; older tokenless rows are excluded and counted
+as unmeasurable, never pooled (majority collapse applies only to true re-votes
+of one comparison; ties skipped and counted). It reports Cohen's κ as the
+headline metric, raw agreement, per-human-source and per-juror-family
+breakdowns, and an assignment-corrected position-bias audit over judge rows
+carrying the recorded raw a/b pick: `P(pick=a)` is stratified by the champion's
+presented position (recovered per row) and reported alongside
+`P(option A = champion)`, so a content preference under a skewed shuffle (e.g.
+a fixed `--seed`) is never mislabeled as position bias — a single-position
+assignment reports the bias as undefined instead. Small samples get a loud
+warning — sample size is the limiter. It is read-only; `--json` emits the
+machine-readable report.
 
 ### Optimizing the judge prompt
 
