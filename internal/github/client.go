@@ -905,6 +905,28 @@ func (c *GhClient) GetCombinedStatus(ctx context.Context, repo Repository, ref s
 	return status, err
 }
 
+// WorkflowsExistAtRef reports whether the repository has a `.github/workflows`
+// directory at the given ref (#596). The merge gate uses it as a cheap, one-read
+// workflow-awareness signal: if the head tree demonstrably carries workflow
+// files, a zero-external-CI observation means GitHub Actions has not created the
+// run yet (or it is queued), so the gate must NOT conclude "no CI". A 404 (no
+// such path) reports false; any other error is returned so the caller can fail
+// safe toward the grace path rather than instant-stamping.
+func (c *GhClient) WorkflowsExistAtRef(ctx context.Context, repo Repository, ref string) (bool, error) {
+	args := []string{"api", "-X", "GET", endpoint(repo, "contents", ".github/workflows")}
+	if r := strings.TrimSpace(ref); r != "" {
+		args = append(args, "-f", "ref="+r)
+	}
+	result, err := c.run(ctx, false, args...)
+	if err == nil {
+		return true, nil
+	}
+	if isNotFound(result) {
+		return false, nil
+	}
+	return false, err
+}
+
 func (c *GhClient) CompareCommits(ctx context.Context, repo Repository, base string, head string) (CompareResult, error) {
 	var result CompareResult
 	err := c.apiJSON(ctx, false, &result, endpoint(repo, "compare", url.PathEscape(base+"..."+head)))

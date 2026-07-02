@@ -1119,6 +1119,52 @@ func TestEnsurePullRequest(t *testing.T) {
 	})
 }
 
+func TestWorkflowsExistAtRef(t *testing.T) {
+	repo := Repository{Owner: "o", Name: "r"}
+
+	t.Run("present", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: `[{"name":"ci.yml"}]`}}}
+		client := GhClient{Runner: runner}
+		exists, err := client.WorkflowsExistAtRef(context.Background(), repo, "d342f97")
+		if err != nil {
+			t.Fatalf("WorkflowsExistAtRef returned error: %v", err)
+		}
+		if !exists {
+			t.Fatalf("exists = false, want true")
+		}
+		args := strings.Join(runner.calls[0], " ")
+		if !strings.Contains(args, "repos/o/r/contents/.github/workflows") || !strings.Contains(args, "ref=d342f97") {
+			t.Fatalf("call args = %q, want contents/.github/workflows at ref", args)
+		}
+	})
+
+	t.Run("absent 404 is false not error", func(t *testing.T) {
+		runner := &fakeRunner{
+			results: []subprocess.Result{{Stderr: "HTTP 404: Not Found (https://api.github.com/repos/o/r/contents/.github/workflows)"}},
+			errs:    []error{errors.New("exit status 1")},
+		}
+		client := GhClient{Runner: runner}
+		exists, err := client.WorkflowsExistAtRef(context.Background(), repo, "d342f97")
+		if err != nil {
+			t.Fatalf("WorkflowsExistAtRef 404 returned error: %v", err)
+		}
+		if exists {
+			t.Fatalf("exists = true on 404, want false")
+		}
+	})
+
+	t.Run("other error surfaces", func(t *testing.T) {
+		runner := &fakeRunner{
+			results: []subprocess.Result{{Stderr: "HTTP 500: Server Error"}},
+			errs:    []error{errors.New("exit status 1")},
+		}
+		client := GhClient{Runner: runner, MaxRetries: 0}
+		if _, err := client.WorkflowsExistAtRef(context.Background(), repo, "d342f97"); err == nil {
+			t.Fatal("WorkflowsExistAtRef swallowed a non-404 error; caller must be able to fail safe")
+		}
+	})
+}
+
 type fakeRunner struct {
 	results []subprocess.Result
 	errs    []error

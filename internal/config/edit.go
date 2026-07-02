@@ -130,6 +130,9 @@ func validateConfigFile(paths Paths) error {
 	if _, err := LoadDaemonRuntimeConfig(paths); err != nil {
 		return err
 	}
+	if _, err := LoadMergeGatePolicy(paths); err != nil {
+		return err
+	}
 	return nil
 }
 
