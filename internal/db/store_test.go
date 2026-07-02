@@ -4602,10 +4602,12 @@ func TestJobIDsWithOpenEscalationRaceSafe(t *testing.T) {
 
 // explainQueryPlan runs EXPLAIN QUERY PLAN for query and returns the plan's detail
 // lines joined by newline so index-choice assertions read cleanly. store_test is
-// package db (white-box), so it can reach store.db directly.
-func explainQueryPlan(t *testing.T, store *Store, query string) string {
+// package db (white-box), so it can reach store.db directly. args binds any `?`
+// placeholders in query so production SQL consts carrying parameters (e.g.
+// listRunningJobsUpdatedBeforeSQL) can be EXPLAINed verbatim.
+func explainQueryPlan(t *testing.T, store *Store, query string, args ...any) string {
 	t.Helper()
-	rows, err := store.db.QueryContext(context.Background(), "EXPLAIN QUERY PLAN "+query)
+	rows, err := store.db.QueryContext(context.Background(), "EXPLAIN QUERY PLAN "+query, args...)
 	if err != nil {
 		t.Fatalf("EXPLAIN QUERY PLAN returned error: %v", err)
 	}
@@ -4627,8 +4629,10 @@ func explainQueryPlan(t *testing.T, store *Store, query string) string {
 
 // TestJobEventsKindJobIDCoveringIndexPlan pins the #619 covering index: each of the
 // three per-tick candidate GROUP BY queries must be served index-only by
-// idx_job_events_kind_job_id, with no fall-through to the non-covering
-// idx_job_events_kind (which forced a table row fetch per candidate row).
+// idx_job_events_kind_job_id. It also pins FIX-E: the redundant single-column
+// idx_job_events_kind is dropped by the migrations, so the composite (whose leading
+// column is `kind`) is now the SOLE kind index — every kind-filtered query still
+// plans through it after the drop.
 func TestJobEventsKindJobIDCoveringIndexPlan(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
@@ -4636,44 +4640,26 @@ func TestJobEventsKindJobIDCoveringIndexPlan(t *testing.T) {
 	}
 	defer store.Close()
 
+	// FIX-E: the migrations dropped idx_job_events_kind; confirm it is gone so the
+	// covering-index assertions below prove the composite carries these queries alone.
+	var kindIndexes int
+	if err := store.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_job_events_kind'`).Scan(&kindIndexes); err != nil {
+		t.Fatalf("query sqlite_master returned error: %v", err)
+	}
+	if kindIndexes != 0 {
+		t.Fatalf("idx_job_events_kind still exists; FIX-E migration should have dropped it")
+	}
+
+	// EXPLAIN the PRODUCTION query text (the exported consts), not hand-copied SQL, so
+	// a change to any candidate query is what this covering-index plan is asserted for.
 	cases := []struct {
 		name  string
 		query string
 	}{
-		{
-			name: "advance",
-			query: `SELECT job_id FROM job_events
-				WHERE kind IN ('advance_started', 'advance_retry')
-				  AND id IN (
-					SELECT MAX(id) FROM job_events
-					WHERE kind IN ('advance_started', 'advance_retry', 'advance_completed',
-					               'advance_retried', 'advance_blocked', 'advance_retry_skipped', 'retry_queued')
-					GROUP BY job_id
-				)
-				ORDER BY job_id`,
-		},
-		{
-			name: "comment",
-			query: `SELECT job_id FROM job_events
-				WHERE kind = 'comment_post_failed'
-				  AND id IN (
-					SELECT MAX(id) FROM job_events
-					WHERE kind IN ('comment_post_failed', 'comment_posted', 'retry_queued')
-					GROUP BY job_id
-				)
-				ORDER BY job_id`,
-		},
-		{
-			name: "reclaim",
-			query: `SELECT job_id FROM job_events
-				WHERE kind = 'delegation_worktree_cleanup_skipped'
-				  AND id IN (
-					SELECT MAX(id) FROM job_events
-					WHERE kind IN ('delegation_worktree_cleanup_skipped', 'delegation_worktree_removed')
-					GROUP BY job_id
-				)
-				ORDER BY job_id`,
-		},
+		{name: "advance", query: jobIDsWithPendingAdvanceRetrySQL},
+		{name: "comment", query: jobIDsWithPendingCommentRetrySQL},
+		{name: "reclaim", query: jobIDsWithPendingDelegationWorktreeReclaimSQL},
 	}
 
 	for _, tc := range cases {
@@ -4682,11 +4668,12 @@ func TestJobEventsKindJobIDCoveringIndexPlan(t *testing.T) {
 			if !strings.Contains(plan, "COVERING INDEX idx_job_events_kind_job_id") {
 				t.Fatalf("plan does not use the covering index:\n%s", plan)
 			}
-			// The non-covering idx_job_events_kind renders "USING INDEX
-			// idx_job_events_kind (kind=? AND rowid=?)" — its trailing "(" plus a
-			// table row fetch is exactly what the covering index removes.
+			// Guard against any fall-through to a non-covering kind index (the dropped
+			// idx_job_events_kind rendered "USING INDEX idx_job_events_kind (kind=? AND
+			// rowid=?)" — its trailing "(" plus a table row fetch is what the covering
+			// index removes).
 			if strings.Contains(plan, "USING INDEX idx_job_events_kind (") {
-				t.Fatalf("plan still row-fetches via the non-covering idx_job_events_kind:\n%s", plan)
+				t.Fatalf("plan still row-fetches via a non-covering idx_job_events_kind:\n%s", plan)
 			}
 		})
 	}
@@ -4789,8 +4776,7 @@ func TestListQueuedJobsUsesQueuedIndex(t *testing.T) {
 		}
 	}
 
-	plan := explainQueryPlan(t, store, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens
-		FROM jobs WHERE state = 'queued' ORDER BY created_at, rowid`)
+	plan := explainQueryPlan(t, store, listQueuedJobsSQL)
 	if !strings.Contains(plan, "USING INDEX idx_jobs_queued_created") {
 		t.Fatalf("ListQueuedJobs plan does not use idx_jobs_queued_created:\n%s", plan)
 	}
@@ -4866,8 +4852,7 @@ func TestListRunningJobsUpdatedBeforeOrder(t *testing.T) {
 		}
 	}
 
-	plan := explainQueryPlan(t, store, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens
-		FROM jobs WHERE state = 'running' AND updated_at < '2026-02-01 00:00:00' ORDER BY updated_at`)
+	plan := explainQueryPlan(t, store, listRunningJobsUpdatedBeforeSQL, "2026-02-01 00:00:00")
 	if !strings.Contains(plan, "idx_jobs_running_updated_at") {
 		t.Fatalf("ListRunningJobsUpdatedBefore plan does not use idx_jobs_running_updated_at:\n%s", plan)
 	}

@@ -3,7 +3,9 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jerryfane/gitmoot/internal/db"
@@ -71,6 +73,67 @@ func reviewPull(headSHA string) github.PullRequest {
 	}
 }
 
+// countingReviewLister wraps a real *db.Store and counts ListJobsByType calls,
+// delegating so the query still returns the real rows. It backs
+// TestPollOnceFetchesReviewJobsOncePerPoll's proof that PollOnce's reviewJobsMemo
+// fetches the review-job list once per poll, not once (or ~2×) per open PR.
+type countingReviewLister struct {
+	inner *db.Store
+	calls int32
+}
+
+func (c *countingReviewLister) ListJobsByType(ctx context.Context, jobType string) ([]db.Job, error) {
+	atomic.AddInt32(&c.calls, 1)
+	return c.inner.ListJobsByType(ctx, jobType)
+}
+
+// TestPollOnceFetchesReviewJobsOncePerPoll pins FIX-F (#620 review): PollOnce fetches
+// the review-job list AT MOST ONCE per poll and shares that snapshot across every open
+// PR's review-job consumers, instead of re-running ListJobsByType("review") per PR. A
+// regression that dropped the per-poll memo (fetching per consumer/per PR) fires the
+// counting lister once per PR and trips the assert.
+func TestPollOnceFetchesReviewJobsOncePerPoll(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+
+	// Three open PRs, each already stored with a matching head, so pullRequestChanged
+	// takes the unchanged-head path that inspects the review-job list for staleness on
+	// EVERY PR — exactly the per-PR fetch the memo collapses to one.
+	var pulls []github.PullRequest
+	for i := int64(1); i <= 3; i++ {
+		pull := github.PullRequest{
+			Number: i, Title: fmt.Sprintf("Task %d", i), State: "open",
+			URL:     fmt.Sprintf("https://github.com/jerryfane/gitmoot/pull/%d", i),
+			HeadRef: fmt.Sprintf("task-%d", i), BaseRef: "main", HeadSHA: fmt.Sprintf("head-%d", i),
+		}
+		pulls = append(pulls, pull)
+		if err := store.UpsertPullRequest(ctx, db.PullRequest{
+			RepoFullName: repo.FullName(), Number: pull.Number, HeadBranch: pull.HeadRef,
+			BaseBranch: pull.BaseRef, HeadSHA: pull.HeadSHA, State: "open",
+		}); err != nil {
+			t.Fatalf("UpsertPullRequest(%d) returned error: %v", i, err)
+		}
+	}
+	// A large non-review job the memo must never materialize, plus one review job that
+	// matches none of the PRs (keeps the list non-empty without changing any routing).
+	seedLargeNonReviewJob(t, store)
+	seedReviewJob(t, store, repo.FullName(), "review-unrelated", "other-head", workflow.JobQueued, nil)
+
+	counter := &countingReviewLister{inner: store}
+	realNewReviewJobsMemo := newReviewJobsMemo
+	newReviewJobsMemo = func(reviewJobLister) *reviewJobsMemo { return realNewReviewJobsMemo(counter) }
+	defer func() { newReviewJobsMemo = realNewReviewJobsMemo }()
+
+	client := &fakeGitHub{pulls: pulls}
+	if err := (Daemon{Repo: repo, Store: store, GitHub: client}).PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&counter.calls); got != 1 {
+		t.Fatalf("ListJobsByType(review) ran %d times across %d PRs, want 1 (memoized once per poll)", got, len(pulls))
+	}
+}
+
 // TestSupersedeStaleReviewJobsSkipsLargeNonReviewPayload proves the #619 projection
 // swap did not change supersession behavior: a stale-head review job is still
 // superseded even with a large non-review payload present that ListJobsByType now
@@ -83,7 +146,7 @@ func TestSupersedeStaleReviewJobsSkipsLargeNonReviewPayload(t *testing.T) {
 	seedReviewJob(t, store, repo.FullName(), "review-stale", "old-head", workflow.JobQueued, nil)
 
 	d := Daemon{Repo: repo, Store: store, Workflow: &workflow.Engine{Store: store}}
-	if err := d.supersedeStaleReviewJobs(ctx, reviewPull("new-head")); err != nil {
+	if err := d.supersedeStaleReviewJobs(ctx, reviewPull("new-head"), nil); err != nil {
 		t.Fatalf("supersedeStaleReviewJobs returned error: %v", err)
 	}
 
@@ -128,7 +191,7 @@ func TestPullRequestWorkflowRoutingStaleAmongLargeNonReviewPayload(t *testing.T)
 		seedLargeNonReviewJob(t, store)
 		seedReviewJob(t, store, repo.FullName(), "review-stale", "old-head", workflow.JobQueued, nil)
 		d := Daemon{Repo: repo, Store: store, Workflow: &workflow.Engine{Store: store}}
-		routing, err := d.pullRequestWorkflowRouting(ctx, reviewPull("new-head"))
+		routing, err := d.pullRequestWorkflowRouting(ctx, reviewPull("new-head"), nil)
 		if err != nil {
 			t.Fatalf("pullRequestWorkflowRouting returned error: %v", err)
 		}
@@ -142,7 +205,7 @@ func TestPullRequestWorkflowRoutingStaleAmongLargeNonReviewPayload(t *testing.T)
 		seedLargeNonReviewJob(t, store)
 		seedReviewJob(t, store, repo.FullName(), "review-current", "cur-head", workflow.JobQueued, nil)
 		d := Daemon{Repo: repo, Store: store, Workflow: &workflow.Engine{Store: store}}
-		routing, err := d.pullRequestWorkflowRouting(ctx, reviewPull("cur-head"))
+		routing, err := d.pullRequestWorkflowRouting(ctx, reviewPull("cur-head"), nil)
 		if err != nil {
 			t.Fatalf("pullRequestWorkflowRouting returned error: %v", err)
 		}
@@ -196,7 +259,7 @@ func TestReconcileReviewingPullRequestAdvancesAmongLargeNonReviewPayload(t *test
 	engine := workflow.Engine{Store: store, MergeGate: gate}
 	d := Daemon{Repo: repo, Store: store, Workflow: &engine}
 
-	if err := d.reconcileReviewingPullRequest(ctx, reviewPull("abc123")); err != nil {
+	if err := d.reconcileReviewingPullRequest(ctx, reviewPull("abc123"), nil); err != nil {
 		t.Fatalf("reconcileReviewingPullRequest returned error: %v", err)
 	}
 	task, err := store.GetTask(ctx, "task-007")

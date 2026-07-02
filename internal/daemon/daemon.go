@@ -89,14 +89,19 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 		return err
 	}
 	openBranches := map[string]struct{}{}
+	// Fetch the repo's review-job list AT MOST ONCE for this whole poll and share the
+	// snapshot across every open PR's review-job consumers, instead of re-running
+	// ListJobsByType("review") up to ~2× per PR (#619). Lazy: computed on the first
+	// consumer that needs it, never retained beyond this poll.
+	reviewMemo := newReviewJobsMemo(d.Store)
 	for _, pull := range pulls {
 		openBranches[pull.HeadRef] = struct{}{}
-		changed, err := d.pullRequestChanged(ctx, pull)
+		changed, err := d.pullRequestChanged(ctx, pull, reviewMemo)
 		if err != nil {
 			return err
 		}
 		if changed {
-			if err := d.handlePullRequestWorkflow(ctx, pull); err != nil {
+			if err := d.handlePullRequestWorkflow(ctx, pull, reviewMemo); err != nil {
 				if firstErr == nil {
 					firstErr = err
 				}
@@ -135,7 +140,7 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 				return err
 			}
 		}
-		if err := d.reconcileReviewingPullRequest(ctx, pull); err != nil && firstErr == nil {
+		if err := d.reconcileReviewingPullRequest(ctx, pull, reviewMemo); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -316,14 +321,69 @@ func (d Daemon) validate() error {
 	return nil
 }
 
-func (d Daemon) pullRequestChanged(ctx context.Context, pull github.PullRequest) (bool, error) {
+// reviewJobLister is the narrow store dependency reviewJobsMemo needs (satisfied by
+// *db.Store). It exists purely so a counting fake can pin the once-per-poll fetch
+// property in tests; production always threads the real *db.Store.
+type reviewJobLister interface {
+	ListJobsByType(ctx context.Context, jobType string) ([]db.Job, error)
+}
+
+// reviewJobsMemo fetches the repo's review-job list AT MOST ONCE per PollOnce and
+// shares that snapshot across the poll's review-job consumers
+// (pullRequestWorkflowRouting, supersedeStaleReviewJobs, reconcileReviewingPullRequest).
+// Those consumers previously each ran ListJobsByType("review") per open PR — up to
+// ~2× per PR — re-decoding every review payload each time (#619). The list is a
+// point-in-time snapshot for the duration of ONE poll: the same staleness class as
+// the old per-call fetches, which likewise observed only whatever review rows existed
+// at their moment of call. Like the per-tick candidate memo it caches SUCCESS only — a
+// failed fetch is returned and left unset so a later consumer re-fetches (in practice
+// a fetch error aborts the whole poll). Lazy: a poll that reaches no consumer fetches
+// nothing. Consumed only on the synchronous poll goroutine, so it needs no locking.
+type reviewJobsMemo struct {
+	store reviewJobLister
+	done  bool
+	jobs  []db.Job
+}
+
+func (m *reviewJobsMemo) get(ctx context.Context) ([]db.Job, error) {
+	if m.done {
+		return m.jobs, nil
+	}
+	jobs, err := m.store.ListJobsByType(ctx, "review")
+	if err != nil {
+		return nil, err
+	}
+	m.jobs = jobs
+	m.done = true
+	return m.jobs, nil
+}
+
+// newReviewJobsMemo is a package var (not a plain func) only so the once-per-poll
+// regression test can substitute a memo backed by a counting store; production never
+// reassigns it.
+var newReviewJobsMemo = func(store reviewJobLister) *reviewJobsMemo {
+	return &reviewJobsMemo{store: store}
+}
+
+// reviewJobs returns the poll's shared review-job snapshot via memo when one is
+// threaded (the PollOnce path), and otherwise fetches fresh from the store. The nil
+// case covers standalone/test calls to a single consumer, which fetch exactly as they
+// did before the per-poll memo (#619).
+func (d Daemon) reviewJobs(ctx context.Context, memo *reviewJobsMemo) ([]db.Job, error) {
+	if memo != nil {
+		return memo.get(ctx)
+	}
+	return d.Store.ListJobsByType(ctx, "review")
+}
+
+func (d Daemon) pullRequestChanged(ctx context.Context, pull github.PullRequest, memo *reviewJobsMemo) (bool, error) {
 	previous, err := d.Store.GetPullRequest(ctx, d.Repo.FullName(), pull.Number)
 	switch {
 	case err == nil:
 		if previous.HeadSHA != pull.HeadSHA {
 			return true, nil
 		}
-		routing, err := d.pullRequestWorkflowRouting(ctx, pull)
+		routing, err := d.pullRequestWorkflowRouting(ctx, pull, memo)
 		if err != nil {
 			return false, err
 		}
@@ -339,10 +399,11 @@ type pullRequestRouting struct {
 	stale bool
 }
 
-func (d Daemon) pullRequestWorkflowRouting(ctx context.Context, pull github.PullRequest) (pullRequestRouting, error) {
+func (d Daemon) pullRequestWorkflowRouting(ctx context.Context, pull github.PullRequest, memo *reviewJobsMemo) (pullRequestRouting, error) {
 	// Only review jobs are inspected below; ListJobsByType filters in SQL so this
-	// poll path stops materializing every non-review job's payload (#619).
-	jobs, err := d.Store.ListJobsByType(ctx, "review")
+	// poll path stops materializing every non-review job's payload (#619). The list is
+	// shared across the poll's review-job consumers via memo (fetched once per poll).
+	jobs, err := d.reviewJobs(ctx, memo)
 	if err != nil {
 		return pullRequestRouting{}, err
 	}
@@ -388,11 +449,11 @@ func (d Daemon) pullRequestStoredMerged(ctx context.Context, pull github.PullReq
 	return strings.TrimSpace(stored.State) == "merged", nil
 }
 
-func (d Daemon) handlePullRequestWorkflow(ctx context.Context, pull github.PullRequest) error {
+func (d Daemon) handlePullRequestWorkflow(ctx context.Context, pull github.PullRequest, memo *reviewJobsMemo) error {
 	if d.Workflow == nil {
 		return nil
 	}
-	if err := d.supersedeStaleReviewJobs(ctx, pull); err != nil {
+	if err := d.supersedeStaleReviewJobs(ctx, pull, memo); err != nil {
 		return err
 	}
 	lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef)
@@ -439,10 +500,11 @@ func (d Daemon) handlePullRequestWorkflow(ctx context.Context, pull github.PullR
 	})
 }
 
-func (d Daemon) supersedeStaleReviewJobs(ctx context.Context, pull github.PullRequest) error {
+func (d Daemon) supersedeStaleReviewJobs(ctx context.Context, pull github.PullRequest, memo *reviewJobsMemo) error {
 	// Only review jobs can be superseded here; ListJobsByType filters in SQL so this
-	// poll path stops materializing every non-review job's payload (#619).
-	jobs, err := d.Store.ListJobsByType(ctx, "review")
+	// poll path stops materializing every non-review job's payload (#619). The list is
+	// shared across the poll's review-job consumers via memo (fetched once per poll).
+	jobs, err := d.reviewJobs(ctx, memo)
 	if err != nil {
 		return err
 	}
@@ -529,7 +591,7 @@ func (d Daemon) handleReadyToMergeWorkflow(ctx context.Context, pull github.Pull
 	})
 }
 
-func (d Daemon) reconcileReviewingPullRequest(ctx context.Context, pull github.PullRequest) error {
+func (d Daemon) reconcileReviewingPullRequest(ctx context.Context, pull github.PullRequest, memo *reviewJobsMemo) error {
 	if d.Workflow == nil {
 		return nil
 	}
@@ -544,8 +606,9 @@ func (d Daemon) reconcileReviewingPullRequest(ctx context.Context, pull github.P
 		return nil
 	}
 	// Only review jobs advance the reviewing PR here; ListJobsByType filters in SQL
-	// so this poll path stops materializing every non-review job's payload (#619).
-	jobs, err := d.Store.ListJobsByType(ctx, "review")
+	// so this poll path stops materializing every non-review job's payload (#619). The
+	// list is shared across the poll's review-job consumers via memo (once per poll).
+	jobs, err := d.reviewJobs(ctx, memo)
 	if err != nil {
 		return err
 	}
@@ -593,7 +656,7 @@ func (d Daemon) reconcileReviewingPullRequest(ctx context.Context, pull github.P
 	if hasCurrentReview {
 		return nil
 	}
-	return d.handlePullRequestWorkflow(ctx, pull)
+	return d.handlePullRequestWorkflow(ctx, pull, memo)
 }
 
 func (d Daemon) retryClosedReadyToMerge(ctx context.Context, openBranches map[string]struct{}) error {

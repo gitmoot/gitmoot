@@ -7294,3 +7294,92 @@ func TestTickCandidatesComputedOncePerTick(t *testing.T) {
 		t.Fatalf("dry-run ran %d candidate queries, want 0", got)
 	}
 }
+
+// flakyCandidateStore returns an error on the first call to each candidate query and
+// the memoized success on every later call, counting total calls per query. It backs
+// TestTickCandidatesRetriesOnError's proof that tickCandidates memoizes SUCCESSES
+// only: a query that errors on one repo's pass must be re-attempted (not replayed as
+// the same error) on the next pass within the same tick.
+type flakyCandidateStore struct {
+	advanceCalls int32
+	commentCalls int32
+	reclaimCalls int32
+}
+
+var errCandidateTransient = errors.New("transient store fault")
+
+func (s *flakyCandidateStore) JobIDsWithPendingAdvanceRetry(context.Context) ([]string, error) {
+	if atomic.AddInt32(&s.advanceCalls, 1) == 1 {
+		return nil, errCandidateTransient
+	}
+	return []string{"advance-job"}, nil
+}
+
+func (s *flakyCandidateStore) JobIDsWithPendingCommentRetry(context.Context) ([]string, error) {
+	if atomic.AddInt32(&s.commentCalls, 1) == 1 {
+		return nil, errCandidateTransient
+	}
+	return []string{"comment-job"}, nil
+}
+
+func (s *flakyCandidateStore) JobIDsWithPendingDelegationWorktreeReclaim(context.Context) ([]string, error) {
+	if atomic.AddInt32(&s.reclaimCalls, 1) == 1 {
+		return nil, errCandidateTransient
+	}
+	return []string{"reclaim-job"}, nil
+}
+
+// TestTickCandidatesRetriesOnError pins FIX-A (#620 review): the per-tick carrier
+// memoizes SUCCESSES only. The first access to each query returns the store's
+// transient error WITHOUT memoizing it; the second access re-runs the query and
+// returns the now-successful result. A regression that memoized the error (the old
+// done=true-on-error behavior) would replay the first error on every later access
+// and never re-query — exactly the failure that turned one SQLITE_BUSY into a
+// whole-sweep error and fed the daemon self-exit streak.
+func TestTickCandidatesRetriesOnError(t *testing.T) {
+	ctx := context.Background()
+	store := &flakyCandidateStore{}
+	cand := newTickCandidates(store)
+
+	// advance-retry: first access errors and is not memoized; second retries and wins.
+	if _, err := cand.advanceRetryCandidates(ctx); !errors.Is(err, errCandidateTransient) {
+		t.Fatalf("first advanceRetryCandidates err = %v, want transient", err)
+	}
+	ids, err := cand.advanceRetryCandidates(ctx)
+	if err != nil {
+		t.Fatalf("second advanceRetryCandidates err = %v, want nil (retry succeeds)", err)
+	}
+	if len(ids) != 1 || ids[0] != "advance-job" {
+		t.Fatalf("second advanceRetryCandidates ids = %v, want [advance-job]", ids)
+	}
+	if got := atomic.LoadInt32(&store.advanceCalls); got != 2 {
+		t.Fatalf("advance query ran %d times, want 2 (error not memoized ⇒ retried)", got)
+	}
+	// A third access reuses the memoized success — no further store call.
+	if _, err := cand.advanceRetryCandidates(ctx); err != nil {
+		t.Fatalf("third advanceRetryCandidates err = %v, want nil", err)
+	}
+	if got := atomic.LoadInt32(&store.advanceCalls); got != 2 {
+		t.Fatalf("advance query ran %d times after a cached success, want still 2", got)
+	}
+
+	// The same retry-on-error / memoize-on-success contract holds for the other two.
+	if _, err := cand.commentRetryCandidates(ctx); !errors.Is(err, errCandidateTransient) {
+		t.Fatalf("first commentRetryCandidates err = %v, want transient", err)
+	}
+	if ids, err := cand.commentRetryCandidates(ctx); err != nil || len(ids) != 1 || ids[0] != "comment-job" {
+		t.Fatalf("second commentRetryCandidates ids=%v err=%v, want [comment-job] nil", ids, err)
+	}
+	if got := atomic.LoadInt32(&store.commentCalls); got != 2 {
+		t.Fatalf("comment query ran %d times, want 2", got)
+	}
+	if _, err := cand.delegationReclaimCandidates(ctx); !errors.Is(err, errCandidateTransient) {
+		t.Fatalf("first delegationReclaimCandidates err = %v, want transient", err)
+	}
+	if ids, err := cand.delegationReclaimCandidates(ctx); err != nil || len(ids) != 1 || ids[0] != "reclaim-job" {
+		t.Fatalf("second delegationReclaimCandidates ids=%v err=%v, want [reclaim-job] nil", ids, err)
+	}
+	if got := atomic.LoadInt32(&store.reclaimCalls); got != 2 {
+		t.Fatalf("reclaim query ran %d times, want 2", got)
+	}
+}

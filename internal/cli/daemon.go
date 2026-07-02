@@ -3079,13 +3079,26 @@ func runQueuedJobs(ctx context.Context, worker jobWorker, limit int) error {
 // keeps per-repo filtering exactly where it was (in Go, in the retry passes) while
 // collapsing the shared query to one execution.
 //
+// Two memoization properties, both implemented once in candidateMemo.get:
+//
+//  1. SUCCESSES are computed once per tick and shared across every repo's pass, so
+//     each query runs once per tick, not once per enabled repo. A job that begins
+//     qualifying mid-sweep is therefore not observed until the next tick's fresh
+//     carrier — a deliberate, bounded one-tick staleness that self-corrects on the
+//     following tick. The carrier is created FRESH each tick (so a candidate that
+//     stops qualifying next tick is re-evaluated) and MUST NOT be stored on the
+//     long-lived tracker/worker.
+//  2. ERRORS are NOT memoized. A failed query leaves the memo unset so the next
+//     repo's pass RE-RUNS it. This preserves the per-repo fault isolation the
+//     pre-#619 per-repo queries had: a transient store fault (e.g. a single
+//     SQLITE_BUSY) fails only the repo that hit it and can self-heal for the rest
+//     of the sweep, instead of being replayed to all 18 repos — which would make
+//     failed==enabled, error the whole sweep, and feed the consecutive-tick daemon
+//     self-exit streak #619 is closing.
+//
 // No mutex/sync.Once: it is consumed ONLY on the synchronous tick goroutine — the
 // per-repo loop in runEnabledRepoWorkerTicksTracked is sequential, and dispatched
-// jobs run on their own goroutines and never touch it. It is created FRESH each
-// tick (so a candidate that stops qualifying next tick is re-evaluated) and MUST
-// NOT be stored on the long-lived tracker/worker. A query error is memoized like a
-// result: within one tick a transient store fault fails every repo's pass
-// identically, and the next tick's fresh carrier re-queries.
+// jobs run on their own goroutines and never touch it.
 //
 // The store dependency is the narrow tickCandidateStore interface (satisfied by
 // *db.Store) purely so a counting fake can pin the once-per-tick property in tests;
@@ -3096,17 +3109,35 @@ type tickCandidateStore interface {
 	JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) ([]string, error)
 }
 
+// candidateMemo lazily runs one per-tick candidate query and shares its RESULT
+// across the tick's repos, memoizing ONLY a success: get caches the ids on the first
+// successful fetch and returns them on every later call, but on a query error it
+// returns the error and leaves the memo unset so the next call RE-RUNS fetch
+// (retry-on-error — see tickCandidates for why per-repo fault isolation matters). It
+// is consumed only on the synchronous tick goroutine, so it needs no synchronization.
+type candidateMemo struct {
+	done bool
+	ids  []string
+}
+
+func (m *candidateMemo) get(fetch func() ([]string, error)) ([]string, error) {
+	if m.done {
+		return m.ids, nil
+	}
+	ids, err := fetch()
+	if err != nil {
+		return nil, err
+	}
+	m.ids = ids
+	m.done = true
+	return m.ids, nil
+}
+
 type tickCandidates struct {
-	store       tickCandidateStore
-	advanceDone bool
-	advanceIDs  []string
-	advanceErr  error
-	commentDone bool
-	commentIDs  []string
-	commentErr  error
-	reclaimDone bool
-	reclaimIDs  []string
-	reclaimErr  error
+	store   tickCandidateStore
+	advance candidateMemo
+	comment candidateMemo
+	reclaim candidateMemo
 }
 
 // newTickCandidates is a package var (not a plain func) only so the once-per-tick
@@ -3117,27 +3148,21 @@ var newTickCandidates = func(store tickCandidateStore) *tickCandidates {
 }
 
 func (c *tickCandidates) advanceRetryCandidates(ctx context.Context) ([]string, error) {
-	if !c.advanceDone {
-		c.advanceIDs, c.advanceErr = c.store.JobIDsWithPendingAdvanceRetry(ctx)
-		c.advanceDone = true
-	}
-	return c.advanceIDs, c.advanceErr
+	return c.advance.get(func() ([]string, error) {
+		return c.store.JobIDsWithPendingAdvanceRetry(ctx)
+	})
 }
 
 func (c *tickCandidates) commentRetryCandidates(ctx context.Context) ([]string, error) {
-	if !c.commentDone {
-		c.commentIDs, c.commentErr = c.store.JobIDsWithPendingCommentRetry(ctx)
-		c.commentDone = true
-	}
-	return c.commentIDs, c.commentErr
+	return c.comment.get(func() ([]string, error) {
+		return c.store.JobIDsWithPendingCommentRetry(ctx)
+	})
 }
 
 func (c *tickCandidates) delegationReclaimCandidates(ctx context.Context) ([]string, error) {
-	if !c.reclaimDone {
-		c.reclaimIDs, c.reclaimErr = c.store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
-		c.reclaimDone = true
-	}
-	return c.reclaimIDs, c.reclaimErr
+	return c.reclaim.get(func() ([]string, error) {
+		return c.store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+	})
 }
 
 // retryPendingJobAdvancements re-fires the post-delivery advancement for any

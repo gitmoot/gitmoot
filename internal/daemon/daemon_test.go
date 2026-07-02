@@ -286,7 +286,7 @@ func TestHandlePullRequestWorkflowSkipsReviewFanoutWhenLockSet(t *testing.T) {
 		BaseRef: "main",
 		HeadSHA: "abc123",
 	}
-	if err := daemon.handlePullRequestWorkflow(ctx, pull); err != nil {
+	if err := daemon.handlePullRequestWorkflow(ctx, pull, nil); err != nil {
 		t.Fatalf("handlePullRequestWorkflow returned error: %v", err)
 	}
 
@@ -368,7 +368,7 @@ func TestHandlePullRequestWorkflowFansOutWhenLockUnset(t *testing.T) {
 		BaseRef: "main",
 		HeadSHA: "abc123",
 	}
-	if err := daemon.handlePullRequestWorkflow(ctx, pull); err != nil {
+	if err := daemon.handlePullRequestWorkflow(ctx, pull, nil); err != nil {
 		t.Fatalf("handlePullRequestWorkflow returned error: %v", err)
 	}
 	if _, err := store.GetJob(ctx, "review-audit-task-007-review-1"); err != nil {
