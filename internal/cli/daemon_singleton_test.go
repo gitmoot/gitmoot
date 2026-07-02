@@ -127,6 +127,58 @@ func TestGuardDaemonRunSingleton(t *testing.T) {
 	}
 }
 
+// TestAcquireDaemonRunLock covers the in-process seams of the #556 flock
+// backstop: a second acquire on the same home must refuse with the "daemon
+// already running" UX while the first holds the lock (flock conflicts across
+// separate open file descriptions even within one process), and releasing must
+// free it for the next acquire — including when the lockfile already exists
+// (no stale-lockfile unlink dance is ever needed). The process-scoped kill -9
+// semantics are covered by TestDaemonRunFlockSingletonE2E.
+//
+// Deliberately NOT t.Parallel(), and the post-release re-acquire retries
+// briefly: flock lives on the open file description, and a concurrently
+// fork+exec'ing test (several in this package launch real child processes)
+// briefly shares every fd between fork and exec — during that window the lock
+// survives the parent's close, so an instant re-acquire can transiently see
+// EWOULDBLOCK. The kernel guarantees release once no reference remains; only
+// the test's timing needs the slack, not the daemon (whose children exec with
+// CLOEXEC and whose lock dies with the process).
+func TestAcquireDaemonRunLock(t *testing.T) {
+	home := t.TempDir()
+
+	var stderr bytes.Buffer
+	release, code := acquireDaemonRunLock(home, &stderr)
+	if code != 0 {
+		t.Fatalf("first acquire code = %d, stderr=%q", code, stderr.String())
+	}
+
+	var stderr2 bytes.Buffer
+	release2, code2 := acquireDaemonRunLock(home, &stderr2)
+	if code2 == 0 {
+		release2()
+		t.Fatalf("second acquire succeeded while the lock was held")
+	}
+	if !strings.Contains(stderr2.String(), "daemon already running") {
+		t.Fatalf("second acquire stderr = %q, want 'daemon already running'", stderr2.String())
+	}
+
+	release()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var stderr3 bytes.Buffer
+		release3, code3 := acquireDaemonRunLock(home, &stderr3)
+		if code3 == 0 {
+			release3()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("re-acquire after release code = %d, stderr=%q", code3, stderr3.String())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // TestDaemonRunCommandRefusesSecondDaemon binds the regression to the real command
 // surface: with a live daemon already registered, `gitmoot daemon run` must return
 // promptly with a non-zero exit and a clear message instead of entering its

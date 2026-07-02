@@ -121,6 +121,17 @@ func runDaemonStartWithWorkDirRestart(args []string, workDir string, restart boo
 	if stale {
 		writeLine(stdout, "removed stale daemon pid file")
 	}
+	// #556 aftermath (#597 review): the pidfile check above cannot see a live
+	// daemon that flock-holds <home>/daemon.lock WITHOUT being registered (e.g.
+	// the corpse of a concurrent-start race clobbered daemon.pid, which the
+	// next status check then removed as stale). Spawning against such a holder
+	// produces a child that instantly loses the flock and dies with its refusal
+	// visible only in daemon.log while this parent printed "daemon started" —
+	// a false green. Probe the flock the same way the child will and refuse up
+	// front, naming the holder, instead of spawning a doomed child.
+	if code := refuseWhenDaemonRunLockHeld("daemon start", cfg.Home, stderr); code != 0 {
+		return code
+	}
 	if cfg.RepoSet {
 		if err := preflightDaemonRepoStart(context.Background(), cfg.Home, cfg.Repo, cfg.Poll.String(), resolvedWorkDir); err != nil {
 			fmt.Fprintf(stderr, "daemon start: %v\n", err)
@@ -293,6 +304,24 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	if code := guardDaemonRunSingleton(*home, stderr); code != 0 {
 		return code
 	}
+	// Test seam (#556): deterministically widen the window between the liveness
+	// guard above and the flock/self-registration below so the singleton E2E can
+	// observe the simultaneous-launch TOCTOU. No-op outside tests (env unset).
+	daemonRunWidenGuardWindow()
+
+	// Airtight singleton backstop (#556). The liveness guard above is friendly
+	// diagnostics but racy: two `daemon run` launched simultaneously on a clean
+	// home can BOTH pass it before either self-registers. flock(LOCK_EX|LOCK_NB)
+	// on a dedicated lockfile is atomic in the kernel — exactly one process ever
+	// holds it — and the fd stays open for the process lifetime, so the kernel
+	// releases the lock on ANY death (SIGKILL included): no stale-lock lockout,
+	// no unlink dance. The loser exits with the same "daemon already running"
+	// UX as the guard.
+	releaseDaemonRunLock, lockCode := acquireDaemonRunLock(*home, stderr)
+	if lockCode != 0 {
+		return lockCode
+	}
+	defer releaseDaemonRunLock()
 
 	// Seed the persisted runtime-auth file from THIS process's inherited
 	// environment (#578). `daemon start` persists before spawning the child, but
@@ -442,13 +471,24 @@ func runDaemonStop(args []string, stdout, stderr io.Writer) int {
 		}
 		writeLine(stdout, "forgot persisted runtime auth (%s)", daemonRuntimeAuthFileName)
 	}
-	if stale {
-		writeLine(stdout, "removed stale daemon pid file")
-		forgetPersistedRuntimeAuth()
-		return 0
-	}
-	if pid == 0 {
-		writeLine(stdout, "daemon not running")
+	if stale || pid == 0 {
+		if stale {
+			writeLine(stdout, "removed stale daemon pid file")
+		}
+		// #597 review: an absent/stale pidfile is NOT proof no daemon is running
+		// — an untracked `daemon run` may still flock-hold <home>/daemon.lock
+		// (e.g. after a concurrent-start race clobbered its registration). Stop
+		// the verified holder instead of lying "daemon not running", so `daemon
+		// restart` can actually terminate it.
+		if handled, code := stopUntrackedDaemonLockHolder(paths, stdout, stderr); handled {
+			if code == 0 {
+				forgetPersistedRuntimeAuth()
+			}
+			return code
+		}
+		if pid == 0 && !stale {
+			writeLine(stdout, "daemon not running")
+		}
 		forgetPersistedRuntimeAuth()
 		return 0
 	}
@@ -1157,6 +1197,312 @@ func guardDaemonRunSingleton(home string, stderr io.Writer) int {
 	return 0
 }
 
+// daemonRunLockPath is the flock target for the daemon-run singleton backstop
+// (#556): a dedicated sibling file under the resolved daemon home. Deliberately
+// NOT gitmoot.db itself — SQLite manages its own fcntl/WAL locking on the
+// database file and an unrelated flock there is asking for interference.
+func daemonRunLockPath(paths config.Paths) string {
+	return filepath.Join(paths.Home, "daemon.lock")
+}
+
+// daemonRunWidenGuardWindowEnv, when set to a positive Go duration, makes
+// `daemon run` sleep between passing the liveness guard and taking the flock /
+// self-registering. Test-only seam (#556): the guard→register TOCTOU window is
+// normally microseconds, so the singleton E2E widens it deterministically to
+// prove the flock backstop (and to fail loudly if the flock is ever removed).
+const daemonRunWidenGuardWindowEnv = "GITMOOT_TEST_WIDEN_DAEMON_RUN_GUARD_WINDOW"
+
+func daemonRunWidenGuardWindow() {
+	raw := os.Getenv(daemonRunWidenGuardWindowEnv)
+	if raw == "" {
+		return
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+		time.Sleep(d)
+	}
+}
+
+// acquireDaemonRunLock closes the residual #550 TOCTOU (#556): two `daemon run`
+// launched simultaneously on a clean home can both pass guardDaemonRunSingleton
+// before either self-registers. flock(LOCK_EX|LOCK_NB) on <home>/daemon.lock is
+// atomic, so exactly one acquires; the loser refuses with the guard's "daemon
+// already running" UX. The winner keeps the fd open for its whole lifetime (the
+// returned release closes it on clean shutdown) and the kernel drops the lock on
+// ANY process death — SIGKILL included — so a stale lockfile can never lock a
+// fresh daemon out, and no unlink is ever needed (flock on an existing file just
+// works). The lockfile's pid content is best-effort diagnostics only; the LOCK
+// is what is authoritative.
+func acquireDaemonRunLock(home string, stderr io.Writer) (release func(), code int) {
+	paths, err := initializedPaths(home)
+	if err != nil {
+		fmt.Fprintf(stderr, "daemon run: %v\n", err)
+		return nil, 1
+	}
+	lockPath := daemonRunLockPath(paths)
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		fmt.Fprintf(stderr, "daemon run: open daemon lock: %v\n", err)
+		return nil, 1
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		holder := daemonRunLockHolder(f)
+		_ = f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			fmt.Fprintf(stderr, "daemon already running%s (%s is flock-held by another daemon run)\n", holder, lockPath)
+			return nil, 1
+		}
+		fmt.Fprintf(stderr, "daemon run: lock %s: %v\n", lockPath, err)
+		return nil, 1
+	}
+	// Record the holder's pid for the loser's message. Best-effort: a loser can
+	// race this write (empty read) or see a SIGKILLed predecessor's pid; either
+	// way only the diagnostic suffix degrades, never the mutual exclusion.
+	_ = f.Truncate(0)
+	_, _ = f.WriteAt([]byte(strconv.Itoa(os.Getpid())+"\n"), 0)
+	return func() { _ = f.Close() }, 0
+}
+
+// daemonRunLockHolder reads the pid the current lock holder recorded in the
+// lockfile, returning a " with pid N" suffix for the refusal message, or "" when
+// the content is absent/unreadable (best-effort diagnostics only).
+func daemonRunLockHolder(f *os.File) string {
+	pid := daemonRunLockHolderPID(f)
+	if pid <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" with pid %d", pid)
+}
+
+// daemonRunLockHolderPID reads the pid the current lock holder recorded in the
+// lockfile, or 0 when the content is absent/unreadable (best-effort
+// diagnostics only — the flock itself is what is authoritative).
+func daemonRunLockHolderPID(f *os.File) int {
+	buf := make([]byte, 32)
+	n, _ := f.ReadAt(buf, 0)
+	if n <= 0 {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(buf[:n])))
+	if err != nil || pid <= 0 {
+		return 0
+	}
+	return pid
+}
+
+// tryDaemonRunLock probes <home>/daemon.lock without keeping it: it reports
+// whether the flock is currently held by another process — i.e. a `daemon run`
+// is alive on this home regardless of what the registration files say — and
+// the holder's best-effort recorded pid. When the probe acquires the lock it
+// releases it immediately (held=false): the caller is NOT the daemon and must
+// not keep it. flock is on the open file description, so the deferred Close
+// releases an acquired probe with no residue.
+func tryDaemonRunLock(paths config.Paths) (held bool, holderPID int, err error) {
+	lockPath := daemonRunLockPath(paths)
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return false, 0, fmt.Errorf("open daemon lock: %w", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return true, daemonRunLockHolderPID(f), nil
+		}
+		return false, 0, fmt.Errorf("lock %s: %w", lockPath, err)
+	}
+	return false, 0, nil
+}
+
+// refuseWhenDaemonRunLockHeld is the `daemon start`/`daemon restart` parent's
+// pre-spawn probe (#597 review): it checks <home>/daemon.lock the same way the
+// spawned `daemon run` child will and refuses — with the untracked holder's
+// pid and the same "daemon already running" UX as the child's own #556 flock
+// refusal — instead of spawning a child that is guaranteed to lose the flock
+// and die with the refusal visible only in daemon.log. Returns 0 to proceed.
+func refuseWhenDaemonRunLockHeld(cmdName, home string, stderr io.Writer) int {
+	paths, err := initializedPaths(home)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s: %v\n", cmdName, err)
+		return 1
+	}
+	held, holderPID, err := tryDaemonRunLock(paths)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s: %v\n", cmdName, err)
+		return 1
+	}
+	if !held {
+		return 0
+	}
+	holder := ""
+	if holderPID > 0 {
+		holder = fmt.Sprintf(" with pid %d", holderPID)
+	}
+	fmt.Fprintf(stderr, "daemon already running%s (%s is flock-held by another daemon run)\n", holder, daemonRunLockPath(paths))
+	return 1
+}
+
+// daemonStartConfirmWindow bounds how long `daemon start` waits to confirm the
+// spawned `daemon run` child survived its startup guards. The healthy path
+// exits the window in milliseconds (the child self-registers, which is the
+// early-out), and a flock loser dies in milliseconds (wait4 reaps it, which is
+// the failure-out). The full window is only ever paid in the pathological
+// "alive but never self-registered" case, where proceeding as success is the
+// correct fail-safe: registration is best-effort inside the child.
+const daemonStartConfirmWindow = 3 * time.Second
+
+// confirmDaemonRunChildSurvived verifies a freshly spawned `daemon run` child
+// did not die inside its startup guards (#597 review — the flock loser exits 1
+// within milliseconds, refusal only in daemon.log). It polls wait4(WNOHANG):
+// even after Process.Release the child is still OUR direct child (Setsid
+// detaches the session, not the parent link), so a plain kill(pid, 0) liveness
+// probe would see the unreaped zombie as "running" forever; wait4 both detects
+// and reaps the corpse. Success is the child's self-registration (daemon.pid
+// records its pid) or still-alive at the deadline; failure returns an error
+// carrying the child's exit cause and the daemon.log tail (where its refusal
+// was written).
+func confirmDaemonRunChildSurvived(pid int, state daemonState) error {
+	deadline := time.Now().Add(daemonStartConfirmWindow)
+	for {
+		var status syscall.WaitStatus
+		reaped, err := syscall.Wait4(pid, &status, syscall.WNOHANG, nil)
+		if err == nil && reaped == pid {
+			detail := fmt.Sprintf("exit status %d", status.ExitStatus())
+			if status.Signaled() {
+				detail = "signal " + status.Signal().String()
+			}
+			return fmt.Errorf("daemon run child pid %d exited immediately (%s) — daemon NOT started%s", pid, detail, daemonLogTail(state.LogFile))
+		}
+		if raw, rerr := os.ReadFile(state.PIDFile); rerr == nil {
+			if registered, perr := strconv.Atoi(strings.TrimSpace(string(raw))); perr == nil && registered == pid {
+				return nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// daemonLogTail returns a "; <log> tail:\n..." suffix with the trailing bytes
+// of the daemon log for start-failure errors — the dead child's stdout/stderr
+// (including the #556 "daemon already running ... flock-held" refusal) go only
+// there. Best-effort: an unreadable or empty log yields a pointer to the file.
+func daemonLogTail(logFile string) string {
+	const maxTail = 2048
+	fallback := fmt.Sprintf("; see %s", logFile)
+	f, err := os.Open(logFile)
+	if err != nil {
+		return fallback
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.Size() == 0 {
+		return fallback
+	}
+	offset := int64(0)
+	if info.Size() > maxTail {
+		offset = info.Size() - maxTail
+	}
+	buf := make([]byte, info.Size()-offset)
+	n, _ := f.ReadAt(buf, offset)
+	text := strings.TrimSpace(string(buf[:n]))
+	if text == "" {
+		return fallback
+	}
+	return fmt.Sprintf("; %s tail:\n%s", logFile, text)
+}
+
+// stopUntrackedDaemonLockHolder handles `daemon stop` for the "live but
+// untracked daemon" state (#597 review): the registration files say nothing is
+// running (pidfile absent or stale) yet <home>/daemon.lock is flock-held by a
+// live `daemon run` — e.g. the aftermath of a concurrent-start race that
+// clobbered daemon.pid. Reporting "daemon not running" there is a lie that
+// also makes `daemon restart` a silent no-op against the real daemon.
+//
+// It returns handled=false when the lock is free or unprobeable (the normal
+// "daemon not running" path proceeds). When the lock IS held it either stops
+// the holder — but ONLY when the recorded pid can be positively verified as a
+// gitmoot `daemon run` process (the lockfile's pid content is best-effort, and
+// SIGTERMing an unverified pid risks hitting a recycled one) — or reports the
+// untracked holder truthfully with a non-zero code.
+func stopUntrackedDaemonLockHolder(paths config.Paths, stdout, stderr io.Writer) (handled bool, code int) {
+	held, holderPID, err := tryDaemonRunLock(paths)
+	if err != nil || !held {
+		return false, 0
+	}
+	lockPath := daemonRunLockPath(paths)
+	if holderPID > 0 && processIsGitmootDaemonRun(holderPID, lockPath) {
+		if err := stopDaemonPID(holderPID); err != nil {
+			fmt.Fprintf(stderr, "daemon stop: %v\n", err)
+			return true, 1
+		}
+		writeLine(stdout, "daemon stopped pid %d (untracked %s holder)", holderPID, lockPath)
+		return true, 0
+	}
+	fmt.Fprintf(stderr, "daemon stop: %s is flock-held by a live but UNTRACKED daemon (recorded holder pid %d could not be verified); refusing to signal an unverified pid — find and stop it manually\n", lockPath, holderPID)
+	return true, 1
+}
+
+// processIsGitmootDaemonRun reports whether pid is positively identifiable as a
+// live gitmoot `daemon run` process. It is a KILL-guard, so it errs on the side
+// of false: the argv must contain adjacent "daemon run" tokens, and — where the
+// host exposes /proc/<pid>/fd — the process must actually hold lockPath open
+// (closing the microscopic window where the lockfile still carries a dead
+// predecessor's since-recycled pid).
+func processIsGitmootDaemonRun(pid int, lockPath string) bool {
+	if running, err := processRunning(pid); err != nil || !running {
+		return false
+	}
+	argv := processArgv(pid)
+	looksLikeDaemonRun := false
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] == "daemon" && argv[i+1] == "run" {
+			looksLikeDaemonRun = true
+			break
+		}
+	}
+	if !looksLikeDaemonRun {
+		return false
+	}
+	if holds, verifiable := processHoldsFileOpen(pid, lockPath); verifiable && !holds {
+		return false
+	}
+	return true
+}
+
+// processArgv returns pid's argv via /proc (exact) or a ps fallback
+// (whitespace-split, best-effort), or nil when neither is available.
+func processArgv(pid int) []string {
+	if raw, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline")); err == nil {
+		return strings.Split(strings.TrimRight(string(raw), "\x00"), "\x00")
+	}
+	if out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output(); err == nil {
+		return strings.Fields(strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// processHoldsFileOpen reports whether pid has path among its open file
+// descriptors, via /proc/<pid>/fd. verifiable=false when the host cannot
+// answer (no /proc, or the fd table is unreadable) so callers can fall back to
+// weaker evidence instead of hard-failing on non-Linux hosts.
+func processHoldsFileOpen(pid int, path string) (holds bool, verifiable bool) {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	fdDir := filepath.Join("/proc", strconv.Itoa(pid), "fd")
+	entries, err := os.ReadDir(fdDir)
+	if err != nil {
+		return false, false
+	}
+	for _, entry := range entries {
+		if target, err := os.Readlink(filepath.Join(fdDir, entry.Name())); err == nil && target == path {
+			return true, true
+		}
+	}
+	return false, true
+}
+
 func currentDaemonPID(state daemonState) (pid int, stale bool, err error) {
 	contents, err := os.ReadFile(state.PIDFile)
 	if errors.Is(err, os.ErrNotExist) {
@@ -1210,6 +1556,15 @@ func startDaemonChild(home string, poll string, workers int, watchSkillOptReview
 	}
 	pid := cmd.Process.Pid
 	if err := cmd.Process.Release(); err != nil {
+		return daemonMeta{}, err
+	}
+	// #597 review: a child that loses the daemon.lock flock (#556) — or dies for
+	// any other startup reason — exits within milliseconds, with its refusal
+	// written only to daemon.log. Without this check the caller would print
+	// "daemon started pid N", exit 0, and register the corpse's pid, leaving an
+	// operator with a false green and (in the flock case) a live daemon no CLI
+	// command can see. Confirm the child survived before declaring success.
+	if err := confirmDaemonRunChildSurvived(pid, state); err != nil {
 		return daemonMeta{}, err
 	}
 	return daemonMeta{
