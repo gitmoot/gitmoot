@@ -167,7 +167,23 @@ kimi --help
 ```
 
 Fix: prefer explicit session UUIDs or thread names over `last`, then
-re-subscribe the agent with the correct session reference.
+re-subscribe the agent with the correct session reference — or, for a
+registered agent whose session is genuinely dead or stranded, rebind it in
+place without re-registering:
+
+```sh
+gitmoot agent restart <agent>
+```
+
+`agent restart` abandons the old runtime session and starts a fresh one for the
+same agent; it refuses while the session is live or the agent has in-flight
+jobs (finish or cancel those first).
+
+Note that some session failures self-heal without your intervention: a dead
+Claude `--resume` target is retried on a fresh session and re-pinned (#443),
+and a transient 401 ("socket connection closed unexpectedly") under sustained
+concurrency is retried with backoff (#487/#509). A job whose events show one of
+these errors followed by a success worked as designed.
 
 ## Daemon Not Running
 
@@ -188,19 +204,42 @@ gitmoot status --repo owner/repo
 Fix:
 
 ```sh
-gitmoot daemon start --repo owner/repo --poll 30s --workers 1
+gitmoot daemon start --poll 30s --workers 1
 ```
 
 Use `gitmoot daemon run` only when you intentionally want a foreground process.
 
-If queued jobs for one repo never move while another repo's jobs do, check
-whether the daemon was started with `--repo`: `gitmoot daemon start --repo
-owner/repo` scopes the background daemon to that one repo and skips jobs for
-every other repo. Start it without `--repo` to supervise all enabled repos, or
-start a daemon per repo. Likewise, a daemon started with `--session <root-job-id>`
-(alias `--root`) runs only jobs whose `root_job_id` matches that orchestration
-run plus the root coordinator job itself, AND-combined with any `--repo` filter;
-restart it without `--session` to drain unrelated jobs.
+`--repo owner/repo` **scopes** the daemon to a single repo: it polls only that
+repo's PRs and claims only that repo's queued jobs. Omit `--repo` to supervise
+every enabled registered repo from one daemon (#581). If queued jobs for one
+repo never move while another repo's jobs do, check whether the daemon was
+started with `--repo` scoping it to a different repo, or with a `--session
+<root-job-id>` (alias `--root`) filter: a daemon started with `--session` runs
+only jobs whose `root_job_id` matches that orchestration run plus the root
+coordinator job itself. Restart it without `--repo`/`--session` to drain
+unrelated jobs.
+Also check the repo is enabled in `gitmoot repo list`.
+
+To restart the daemon without losing its Claude token, use `gitmoot daemon
+restart` — it recovers the token persisted in the owner-only
+`daemon-runtime.env` file, while a plain `stop` + `start` re-inherits the
+launching shell's environment (and warns loudly on stderr when that would come
+up auth-less). Verify runtime auth with `gitmoot doctor` afterwards.
+
+## Daemon Already Running
+
+Symptom: `gitmoot daemon start`/`run` refuses with `daemon already running with
+pid …`.
+
+Likely cause: a daemon is already supervising this Gitmoot home. One daemon per
+home is enforced with a pidfile plus a flock backstop (#550/#556); starting a
+second one is refused by design (a stale pidfile whose owner is dead is
+liveness-checked and recovered automatically, so restarts after a crash work).
+
+Fix: use the running daemon — it supervises all subscribed repos. To change its
+settings, send `kill -HUP <pid>` for a live `[daemon]` config reload (#577), or
+use `gitmoot daemon restart`. Scripts that start daemons should treat this
+refusal as success, not an error.
 
 ## Job Stuck Or Failed
 
@@ -209,14 +248,33 @@ Symptom: a job is queued, blocked, failed, or no longer changing state.
 Likely cause: runtime delivery failed, worker is read-only, GitHub auth failed,
 or another lock is active.
 
-Check:
+Check — read the stuck reason first:
 
 ```sh
-gitmoot job show <job-id>
+gitmoot job list --repo owner/repo   # WHY: column on queued/blocked jobs
+gitmoot job show <job-id>            # why_stuck: / next_retry_at: lines
 gitmoot job events <job-id>
 gitmoot agent show <agent>
 gitmoot lock list --repo owner/repo
 ```
+
+`gitmoot job list` appends a `WHY:` column and `gitmoot job show` prints a
+`why_stuck:` line for queued/blocked jobs (#552) — e.g. a runtime-session lock
+wait (naming the holder), `blocked: awaiting human`, `auth failing: …`,
+`throttled: …`, or `retrying: …` with the attempt schedule.
+
+Deferred jobs recover on their own (#532): a delivery failure classified as a
+retryable operational blocker (runtime auth, provider rate limit/quota) is
+re-queued with a bounded retry budget instead of failing terminally — `job show
+--json` carries the `blocker_class` and attempt count. A job that "failed then
+reappeared as queued" is the deferral working; only act when the retry budget
+is spent and the job stays failed.
+
+A job stuck in `running` is recovered automatically once it shows no lease
+progress past the staleness window (default 30m; tune with the
+`GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value
+is 1m — below-1m, malformed, or non-positive values are rejected in favor of the
+30m default rather than clamped, #560).
 
 Fix: resolve the underlying runtime/auth/lock issue, then retry when safe:
 

@@ -355,6 +355,11 @@ auto_promote_canary_sample = 0.1          # #484: canary sampled-traffic fractio
 auto_promote_min_confidence = 0.95        # #473 Mode B: UNSET = ignore; SET = require bandit P(>) >= floor (+ enough samples)
 bandit_min_samples = 30                   # #473/#482 Mode B low-traffic floor (manual `skillopt ab` always allowed)
 live_ab_sample_rate = 0.0                 # #482 Mode B live A/B: 0.0 (default) = never intercept; fraction of foreground asks to A/B
+mode_b_judge_enabled = false              # #483: opt the A/B into a cross-family LLM judge row (same as `skillopt ab --judge`)
+mode_b_jury_size = 1                      # #349: >= 2 = a cross-family judge JURY (distinct families, majority vote); 0/1 = single judge, byte-identical
+mode_b_jury_veto_dimensions =             # #349: comma list of rubric dimensions subject to minority-veto (e.g. safety,correctness); empty (default) disables the veto
+mode_b_jury_veto_floor = 0.0              # #349: [0,1] floor for the veto dimensions; 0.0 (default) makes the veto inert
+mode_b_jury_disagreement_tau = 0.0        # #349: per-dimension std threshold that flags jury DISAGREEMENT; 0.0 disables the std check
 ```
 
 The guardrails read the candidate's **harvester auto-trace run**
@@ -535,7 +540,22 @@ gitmoot skillopt ab <agent> "<prompt>" --judge-only # only the judge row (skip t
   and weighted low here and is **not** calibrated against human gold in this slice
   — judge-tagged now, calibrated later.
 
-Canary and the unattended auto A/B scheduling loop remain **deferred** to follow-ons.
+The jury variant of the judge (`mode_b_jury_size >= 2`, #349) convenes up to N
+judges from **distinct** model families on the same blind A/B and aggregates
+their verdicts (majority vote + a disagreement flag governed by
+`mode_b_jury_disagreement_tau`); `mode_b_jury_veto_dimensions` +
+`mode_b_jury_veto_floor` add an optional fail-closed minority veto on
+safety/correctness rubric dimensions. Like the single judge it is evidence-only
+and never promotes.
+
+A reviewer's blinded paired-review packet (the fork's `pairwise-review.json` +
+secret map + picks) is imported with `gitmoot skillopt pairwise import
+<packet-dir> [--packet] [--secret-map] [--picks] [--reviewer] [--json]`, which
+de-blinds it and stores the pairwise-preference feedback events.
+
+The canary path shipped as `[skillopt].auto_promote_canary` +
+`auto_promote_canary_sample` (#484, documented above); the unattended auto A/B
+scheduling loop remains **deferred** to follow-ons.
 
 ## Ranked Exploration Workflow
 

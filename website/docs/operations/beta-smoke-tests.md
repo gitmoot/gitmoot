@@ -937,8 +937,8 @@ gitmoot dashboard
 
 Expected signals:
 
-- The cockpit opens with the Attention, Trains, Agents, Runtime sessions, Jobs,
-  and Locks pages.
+- The cockpit opens with the Attention, Activity, Trains, Agents, Workers,
+  Jobs, Locks, Health, and Config pages.
 - Pending prompts (for example a coordinator awaiting input) appear under the
   Attention page.
 - Job, lock, agent, and runtime-session state matches the equivalent
@@ -946,8 +946,8 @@ Expected signals:
   session views.
 
 > The interactive `gitmoot dashboard` is a TUI cockpit. Its pages are
-> Attention, Trains, Agents, Runtime sessions, Jobs, and Locks; pending prompts
-> live under the Attention page.
+> Attention, Activity, Trains, Agents, Workers, Jobs, Locks, Health, and
+> Config; pending prompts live under the Attention page.
 
 ## Recovery Checks
 

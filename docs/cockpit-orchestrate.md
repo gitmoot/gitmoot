@@ -78,6 +78,12 @@ inline_artifact_max_bytes = 32768  # per-body cap (bytes) when inlining is on
 inject_upstream_dep_context = false  # inject succeeded upstream dependency results into a dependent leg's prompt; default off
 max_delegation_token_budget = 0  # per-root delegation token budget (input+output); 0 = unlimited (off)
 max_delegation_cost_usd = 0      # per-root delegation dollar-cost budget (USD); 0 = unlimited (off)
+default_delegation_timeout = ""  # default child-job timeout when a delegation omits one; "" = unbounded
+default_plan_timeout = ""        # per-phase defaults (plan/implement/review/gate/repair) that
+default_implement_timeout = ""   # win over default_delegation_timeout for legs tagged with
+default_review_timeout = ""      # the matching phase (or action)
+default_gate_timeout = ""
+default_repair_timeout = ""
 ```
 
 - `cockpit_mode = "off"` disables the cockpit even if `--cockpit` was passed;
@@ -125,6 +131,13 @@ max_delegation_cost_usd = 0      # per-root delegation dollar-cost budget (USD);
   capture and a hardcoded price table, it is a coarse runaway-cost backstop, not a
   precise spend meter. Leaving it at `0` is byte-identical to before the knob
   existed.
+- `default_delegation_timeout` and the per-phase `default_plan_timeout` /
+  `default_implement_timeout` / `default_review_timeout` / `default_gate_timeout`
+  / `default_repair_timeout` (#548, all empty = unbounded by default) supply a
+  child-job timeout when a delegation omits its own `timeout` field. Precedence:
+  per-delegation `timeout` > the phase default matching the delegation's `phase`
+  (falling back to its `action`) > `default_delegation_timeout` > unbounded (the
+  historical behavior). Values are Go durations (e.g. `"30m"`).
 
 ## Constrained hosts
 

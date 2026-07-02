@@ -91,7 +91,15 @@ Delegation fields:
 - `deps` (optional): array of sibling delegation `id`s. This delegation runs
   only after every listed sibling succeeds. Each entry must reference a known
   sibling in the same result, may not be self-referential, and may not form a
-  cycle — delegations form a DAG, and cycles are rejected.
+  cycle — delegations form a DAG, and cycles are rejected. By default a
+  dependent leg runs *blind* to its deps' outputs. The opt-in
+  `[orchestrate].inject_upstream_dep_context = true` (#419) makes `deps[]` real
+  dataflow: when a ready dependent leg is enqueued, each succeeded direct dep's
+  result (decision, summary preview, PR link, `changes_made` count, short
+  HeadSHA, then the fenced `artifact_body`) is appended to the dependent's
+  prompt as a byte-budgeted "Upstream dependency results" block (same size caps
+  as artifact-body inlining). Off by default; with the flag off the enqueued
+  prompt is byte-identical.
 - `failure_policy` (optional): one of `block_parent`, `continue`, `escalate`, or
   `escalate_human`. Defaults to `block_parent` when omitted.
   - `block_parent` — a failed child blocks the shared parent task (terminal).
@@ -179,6 +187,13 @@ Delegation fields:
     the self-correction loop guaranteed and bounded by the engine; use the template
     pattern when you want full coordinator control over how the failure is routed.
 - `timeout` (optional): a Go duration string and must be positive (e.g. `10m`).
+  When omitted, the child job's timeout falls back to the `[orchestrate]`
+  defaults (#548), with precedence **per-delegation `timeout` > phase default
+  (`default_plan_timeout` / `default_implement_timeout` /
+  `default_review_timeout` / `default_gate_timeout` / `default_repair_timeout`,
+  keyed by the delegation's `phase`, falling back to its `action`) >
+  `default_delegation_timeout` > unbounded** (the historical behavior; all keys
+  are empty by default).
 - `retry` (optional): integer `>= 0`.
 - `worktree` (optional): worktree path for the child job.
 - `artifacts` (optional): named artifact handles passed to the child. When any
@@ -235,6 +250,10 @@ Delegation fields:
   `implement`, `verify`). Like `model`, it is metadata only: it does **not**
   affect scheduling, loop detection, or termination, and it is not part of the
   delegation-set signature used for loop detection. There is no allow-list.
+  **One exception (#548):** when the delegation omits `timeout`, a recognized
+  phase value (`plan`, `implement`, `review`/`review-prep`/`review-dispatch`,
+  `gate`, `repair`/`continue`) selects the matching `[orchestrate]`
+  phase-default timeout — see the `timeout` bullet above.
 - `ephemeral` (optional): an inline worker spec that spawns a throwaway child
   agent on demand instead of routing to a pre-registered one. It is **mutually
   exclusive** with `agent`: a delegation must set exactly one of `agent` or
@@ -309,9 +328,11 @@ Delegation trees are bounded so they cannot run forever:
 
 - Depth cap: `MaxDelegationDepth = 8`. Each delegation child and each
   coordinator continuation increments `delegation_depth`; a job at or beyond
-  this depth may not delegate further.
+  this depth may not delegate further. Override per host with the
+  `GITMOOT_MAX_DELEGATION_DEPTH` env var (positive integer).
 - Per-root job budget: `MaxDelegationTotalJobs = 64`. The whole delegation tree
-  under one root is capped at this many jobs.
+  under one root is capped at this many jobs. Override per host with the
+  `GITMOOT_MAX_DELEGATION_TOTAL_JOBS` env var (positive integer).
 - Per-root wall-clock budget: `MaxDelegationWallClock = 2h`. The whole tree under
   one root is bounded in duration (measured from the root job's creation); a
   coordinator that tries to fan out after the tree has run this long is refused
@@ -403,8 +424,9 @@ a job whose runtime reports no usage contributes `0` to the sum, so the budget
 
 Because of this, a tree made up mostly of Codex jobs will accumulate little or no
 counted usage — set the budget with that in mind, and prefer it as a coarse
-runaway-cost backstop rather than a precise spend limit. A `$`-denominated price
-table is intentionally **not** implemented yet; the budget is in raw tokens.
+runaway-cost backstop rather than a precise spend limit. The same capture also
+feeds the `$`-denominated `[orchestrate].max_delegation_cost_usd` budget — see
+the dollar-cost bullet in [Termination bounds](#termination-bounds) above.
 
 ### Top-level fields
 
@@ -593,10 +615,23 @@ returns and, on a guardrails pass, calls the existing promote machinery.
   threshold, an unresolvable run or a store read error (treated as *feedback
   unavailable*), **zero feedback samples** (an absolute floor even when
   `min_samples = 0`), `auto_promote_require_measured_judge = true` (deferred, gated
-  on #344), or `auto_promote_canary = true` (deferred) — **fails safe to notify, do
-  not promote**. An unset `min_samples`/`min_score` is a **hard do-not-promote, not
-  `0`**. On a pass it promotes via the existing path and emits
-  **`candidate.auto_promoted`** so a human can review or roll back even in full-auto.
+  on #344), or `auto_promote_canary = true` with an unset/invalid
+  `auto_promote_canary_sample` — **fails safe to notify, do not promote**. An unset
+  `min_samples`/`min_score` is a **hard do-not-promote, not `0`**. On a pass it
+  promotes via the existing path and emits **`candidate.auto_promoted`** so a human
+  can review or roll back even in full-auto.
+- **`[skillopt].auto_promote_canary`** (#484, default `false`) makes a
+  guardrails-pass candidate a **canary** behind the live champion instead of
+  promoting it straight to `current`: `auto_promote_canary_sample` (a fraction in
+  `(0,1]`; `1.0` = all traffic) is the per-resolution probability a job routes to
+  the canary version, and `candidate.canary_started` is emitted when it goes
+  live. The daemon then watches a bounded regression window over the canary's
+  harvested verifiable outcomes versus the prior champion: on parity-or-better it
+  graduates the canary to `current` (`candidate.auto_promoted`); on a **material
+  regression** it auto-rolls-back — champion stays current, canary rejected,
+  **`candidate.rolled_back`** emitted. Fail-safe: too few outcomes, no champion
+  baseline, or unreadable feedback **hold** (keep sampling); `auto_promote_canary
+  = true` with `auto_promote_canary_sample` unset degrades to notify-only.
 
 ### Champion-challenger A/B preferences (Mode B, off by default)
 

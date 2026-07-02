@@ -207,7 +207,14 @@ the same `delegations` field, `coordinator`, and `continuation` mechanics.
     self-correction loop guaranteed and bounded by the engine; use the template
     pattern when you want full coordinator control over how the failure is routed.
 - `timeout` (optional): a Go duration string that must be positive (for example,
-  `10m`).
+  `10m`). When omitted, the child job's timeout falls back to the
+  `[orchestrate]` defaults (#548), with precedence **per-delegation `timeout` >
+  phase default (`default_plan_timeout` / `default_implement_timeout` /
+  `default_review_timeout` / `default_gate_timeout` / `default_repair_timeout`,
+  keyed by the delegation's `phase`, falling back to its `action`) >
+  `default_delegation_timeout` > unbounded** (the historical behavior; all keys
+  are empty by default). See the
+  [`[orchestrate]` configuration](../workflows/cockpit-orchestrate-workflow.md#configuration-the-orchestrate-section).
 - `retry` (optional): an integer that must be `>= 0`.
 - `worktree` (optional): the worktree path for the child job.
 - `artifacts` (optional): named artifact handles passed to the child. When any
@@ -265,6 +272,10 @@ the same `delegations` field, `coordinator`, and `continuation` mechanics.
   `implement`, `verify`). Like `model`, it is metadata only: it does **not**
   affect scheduling, loop detection, or termination, and it is not part of the
   delegation-set signature used for loop detection. There is no allow-list.
+  **One exception (#548):** when the delegation omits `timeout`, a recognized
+  phase value (`plan`, `implement`, `review`/`review-prep`/`review-dispatch`,
+  `gate`, `repair`/`continue`) selects the matching `[orchestrate]`
+  phase-default timeout — see the `timeout` bullet above.
 - `ephemeral` (optional): an inline worker spec that spawns a throwaway child
   agent on demand instead of routing to a pre-registered one. It is **mutually
   exclusive** with `agent` — a delegation must set exactly one of `agent` or
@@ -428,12 +439,15 @@ trips, the offending delegations are dropped rather than dispatched.
 
 - **Depth cap (`MaxDelegationDepth = 8`)**: each delegation child and each
   coordinator continuation increments `delegation_depth`. A job at or beyond this
-  depth may not delegate further.
+  depth may not delegate further. Override per host with the
+  `GITMOOT_MAX_DELEGATION_DEPTH` environment variable (positive integer).
 - **Per-root job budget (`MaxDelegationTotalJobs = 64`)**: the whole delegation
   tree under one root — all children and continuations sharing that root — is
   capped at this many jobs. When a batch of delegations would exceed the budget,
   it is dropped, and the parent receives a lifecycle event such as "delegation
-  tree for root &lt;id&gt; reached the job budget of 64".
+  tree for root &lt;id&gt; reached the job budget of 64". Override per host with
+  the `GITMOOT_MAX_DELEGATION_TOTAL_JOBS` environment variable (positive
+  integer).
 - **Wall-clock budget (`MaxDelegationWallClock = 2h`)**: the whole delegation
   tree under one root is bounded in duration, measured from the root job's
   creation. When a coordinator tries to fan out after the tree has run longer
@@ -451,6 +465,16 @@ trips, the offending delegations are dropped rather than dispatched.
   below), so the budget can under-count a runtime that does not report usage — it
   never over-counts. Leaving the knob at `0` skips the check entirely (behavior is
   byte-identical to before the knob existed).
+- **Per-root dollar-cost budget (`[orchestrate].max_delegation_cost_usd`, off by
+  default — `0` = unlimited, #380)**: the cost analogue of the token budget. It
+  bounds the same tree by *measured spend*, derived from the same per-job token
+  usage priced through a built-in per-model price table (Haiku/Sonnet/Opus list
+  prices matched by substring; unknown/empty models priced at the mid-tier
+  Sonnet default so they are never free). When the tree's accumulated cost
+  reaches the budget, the next fan-out is refused with a
+  `delegation_cost_usd_exceeded` event and routed through the graceful finalize
+  continuation — never hard-killed. A coarse runaway-cost backstop, not a
+  precise spend meter.
 - **Per-coordinator width (`MaxDelegationWidth = 16`)**: a single coordinator
   result may request at most this many delegations in one generation; a wider set
   is refused with a `delegation_width_exceeded` event and routed through the same
@@ -519,8 +543,9 @@ than failing:
 
 Because of this, a tree made up mostly of Codex jobs accumulates little or no
 counted usage — set the budget accordingly and treat it as a coarse runaway-cost
-backstop, not a precise spend limit. A `$`-denominated price table is not
-implemented yet; the budget is in raw tokens.
+backstop, not a precise spend limit. The same capture also feeds the
+`$`-denominated `[orchestrate].max_delegation_cost_usd` budget — see the
+dollar-cost bullet under [Termination bounds](#termination-bounds).
 
 For the in-repo source of truth, see
 [`skills/gitmoot/references/RESULT_CONTRACT.md`](https://github.com/jerryfane/gitmoot/blob/main/skills/gitmoot/references/RESULT_CONTRACT.md)

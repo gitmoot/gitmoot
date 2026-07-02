@@ -16,6 +16,12 @@ agent template and rendered job prompt before handing work to an adapter.
   stream-json output. Select it with `gitmoot agent start <name> --runtime
   kimi`. Authenticate once with `kimi login`, then restart the Gitmoot daemon so
   it inherits the session.
+- **Kimi CLI (legacy)** is the opt-in `--runtime kimi-cli` adapter (#546) for
+  the **older** Kimi CLI, which requires the `--print` command shape the
+  current Kimi Code CLI does not support. It is intentionally separate from
+  `kimi` so the default Kimi Code path is never probed or changed. Choose
+  `kimi` unless you specifically run the legacy CLI; the two count as the same
+  runtime *family* for cross-family review.
 - **Shell** invokes a configured shell command and is mainly for smoke tests,
   demos, and adapter contract checks.
 
@@ -26,6 +32,7 @@ agent template and rendered job prompt before handing work to an adapter.
 - Codex accepts a session UUID, thread name, or `last`.
 - Claude accepts a UUID or `last`.
 - Kimi accepts a session id of the form `session_<uuid>` or an empty value.
+- Kimi CLI (legacy) accepts a session UUID or an empty value.
 - Shell uses the configured command.
 
 Prefer explicit runtime session ids over `last` for durable agents. Use

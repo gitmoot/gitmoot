@@ -51,3 +51,32 @@ run:
 gitmoot agent template diff release-planner
 gitmoot agent template update release-planner
 ```
+
+## Back Up And Share Templates Via GitHub
+
+Installed templates can be backed up to — and installed from — a GitHub repo
+(#476), so a template survives the machine and can be shared across homes:
+
+```sh
+# One-time: store a default remote (ref defaults to main, path to templates/).
+gitmoot agent template remote set owner/my-templates
+gitmoot agent template remote show
+
+# Back up: export to a local dir, or publish (commit) straight to the remote.
+gitmoot agent template export release-planner --to ./backup
+gitmoot agent template publish release-planner            # or --all
+gitmoot agent template publish --all --repo owner/my-templates --create
+
+# Restore / share: pull from the remote, or install one file from any repo.
+gitmoot agent template pull release-planner               # or --all
+gitmoot agent template add release-planner --from-repo owner/my-templates
+```
+
+The default remote lives in the `[template_remote]` config section (`repo`;
+`ref` defaults to `main`; `path` defaults to `templates`); with no remote
+configured, publish/pull/add require an explicit `--repo`. All commands accept
+`--dry-run`.
+
+**Caution: templates are stored and published VERBATIM (prompt body +
+metadata). Point the remote at a PRIVATE repo unless the prompts are meant to
+be public.**

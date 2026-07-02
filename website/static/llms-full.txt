@@ -37,8 +37,9 @@ trail. Gitmoot makes the repository and its pull requests the shared surface:
 
 - PR comments become agent tasks, review requests, retries, and merge signals.
 - Local SQLite records agents, repos, jobs, goals, tasks, PRs, and branch locks.
-- Runtime adapters keep Codex, Claude Code, Kimi Code, and future runtimes
-  behind the same Gitmoot agent model.
+- Runtime adapters keep Codex, Claude Code, Kimi Code (plus the legacy
+  `kimi-cli`, a deterministic `shell` adapter), and future runtimes behind the
+  same Gitmoot agent model.
 - **Orchestra** is Gitmoot's name for structured multi-agent delegation: a
   conductor (coordinator) returns a validated `delegations[]` DAG that Gitmoot
   dispatches as child jobs (the players), then enqueues one continuation job
@@ -49,8 +50,13 @@ trail. Gitmoot makes the repository and its pull requests the shared surface:
   bound trips, the engine enqueues one graceful finalize continuation so the
   coordinator synthesizes a best-effort result instead of recursing forever or
   dropping work silently.
-- Agent Templates and job snapshots make agent instructions explicit and reproducible.
-- Humans can follow progress from GitHub while agents keep working locally.
+- Agent Templates and job snapshots make agent instructions explicit and
+  reproducible — and can be backed up to / pulled from a GitHub repo.
+- Heartbeat schedules run recurring agent work without an external cron, and an
+  opt-in `[events]` webhook streams job/candidate lifecycle events to your own
+  systems.
+- Humans can follow progress from GitHub while agents keep working locally —
+  in the PR thread, the terminal TUI, or the read-only web dashboard.
 
 ## How It Works
 
@@ -75,6 +81,13 @@ gitmoot version
 gh auth status
 ```
 
+Later, self-update from GitHub Releases:
+
+```sh
+gitmoot update --check
+gitmoot update --restart-daemon
+```
+
 Install runtime plugin guidance when you want Codex or Claude Code to discover
 Gitmoot's Agent Skill from their plugin systems:
 
@@ -96,7 +109,14 @@ gitmoot plugin codex-launch --repo .
 
 ## Quick Start
 
-From a project checkout:
+One command registers the repo, subscribes an agent, and launches a
+tagging-ready daemon (`--watch-issues` defaults on):
+
+```sh
+gitmoot setup --repo owner/repo --path . --agent helper --runtime claude --session last --start-daemon
+```
+
+Or step through the manual path from a project checkout:
 
 ```sh
 gitmoot init
@@ -115,9 +135,9 @@ gitmoot agent start project-planner \
   --start-daemon
 ```
 
-`--runtime` accepts `codex`, `claude`, or `kimi`. For Kimi Code, run
-`kimi login` and restart the Gitmoot daemon so it inherits the session, then
-start the agent with `--runtime kimi`.
+`--runtime` accepts `codex`, `claude`, `kimi`, or `kimi-cli` (the opt-in legacy
+Kimi CLI adapter). For Kimi Code, run `kimi login` and restart the Gitmoot
+daemon so it inherits the session, then start the agent with `--runtime kimi`.
 
 For fast planning in the current Codex or Claude chat, ask the runtime:
 
@@ -134,6 +154,14 @@ planning job:
 ```sh
 gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
 gitmoot job watch <job-id>
+```
+
+Run one job through a different runtime (or model) without re-registering the
+agent — the agent's default runtime and session are untouched:
+
+```sh
+gitmoot agent ask project-planner --repo owner/repo --runtime claude "Compare the approaches."
+gitmoot agent run lead --repo owner/repo --model gpt-5-codex "Implement this task."
 ```
 
 For coordinator delegation (the Orchestra pattern) where the request may require
@@ -154,16 +182,21 @@ checkout locks protect local checkouts, branch locks protect implementation
 ownership, and busy Codex/Claude runtime sessions can fork bounded temporary
 workers when `[parallel_sessions]` allows it. Temp workers still require
 checkout/worktree safety and write-capable agents for implementation jobs.
+`gitmoot daemon start --parallel N` runs a repo's queued jobs N-wide
+(auto-selecting the pool scheduler); see
+[docs/parallel-jobs.md](docs/parallel-jobs.md).
 
-`gitmoot daemon start --repo owner/repo` scopes the background daemon to that one
-repo; `gitmoot daemon start` with no `--repo` supervises every enabled repo. Both
-`daemon run` and `daemon start` accept `--session <root-job-id>` (alias `--root`)
-to pin the worker to a single orchestration run — it then runs only jobs whose
-`root_job_id` matches that value plus the root coordinator job itself, AND-combined
-with any `--repo` filter:
+`daemon start --repo owner/repo` scopes the daemon to a **single** repo: it
+polls only that repo's PRs and claims only that repo's queued jobs. Omit
+`--repo` and one daemon supervises every enabled repo; cap an individual repo's
+parallelism on that shared daemon with the `[repos."owner/repo"] max_parallel`
+config key. Both `daemon run` and `daemon start` accept
+`--session <root-job-id>` (alias `--root`) to pin the worker to a single
+orchestration run — it then runs only jobs whose `root_job_id` matches that
+value plus the root coordinator job itself:
 
 ```sh
-gitmoot daemon start --repo owner/repo --session <root-job-id>
+gitmoot daemon start --session <root-job-id>
 ```
 
 Route work through PR comments:
@@ -172,17 +205,48 @@ Route work through PR comments:
 /gitmoot project-planner ask Write a task-by-task implementation plan for this PR.
 /gitmoot thermo-review review
 /gitmoot retry <job-id>
+/gitmoot resume <job-id> retry|continue|abort|answer [instructions]
+@project-planner ask What is blocking this PR?
 ```
 
+A bare `@<agent> <action>` mention works as the same command; with the daemon's
+`--watch-issues` flag (on by default in `gitmoot setup`) mentions on **issues**
+are routed too. `/gitmoot resume` continues a delegation tree paused for a
+human (`escalate_human` failures or ask-gate questions) — the daemon @-tags you
+with the exact resume command when a tree pauses.
+
 For the full walkthrough, see [docs/local-workflow.md](docs/local-workflow.md).
+
+### Operate the daemon
+
+```sh
+gitmoot daemon status                 # scheduler mode, workers, runtime auth
+gitmoot daemon start --parallel 5     # run queued jobs 5-wide (pool scheduler)
+kill -HUP <daemon-pid>                # live-reload [daemon] poll/workers/scheduler — no restart
+gitmoot daemon restart                # restart WITHOUT losing the persisted Claude token
+gitmoot daemon stop [--forget-runtime-auth]
+```
+
+Reconfigure live with SIGHUP (#577) instead of restarting: the running daemon
+re-reads the `[daemon]` config keys with no teardown, dropped jobs, or env
+re-inheritance. Cap a single repo from config with `[repos."owner/repo"]
+max_parallel = N` (#576) — applied live, no relaunch. Runtime auth survives
+restarts (#578): the daemon persists its Claude token to a 0600
+`daemon-runtime.env` file, `daemon restart` recovers it even from a token-less
+shell (plain `stop`+`start` does not), and `--forget-runtime-auth` deletes it.
+An opt-in `[events]` webhook streams `job.finished/failed/blocked/
+needs_attention/deferred` and `candidate.*` events to one HTTP endpoint
+([docs/events.md](docs/events.md)).
 
 ## Core Concepts
 
 - **Repo**: a GitHub repository plus local checkout path that Gitmoot is allowed
   to monitor and mutate.
 - **Daemon**: the local background process that polls GitHub PRs and routes
-  queued jobs. By default it supervises every enabled repo; `--repo` scopes it to
-  one repo and `--session <root-job-id>` scopes it to one orchestration run.
+  queued jobs. Passing `--repo owner/repo` scopes it to that single repo
+  (polling + job claims); omit `--repo` and it supervises every enabled repo
+  (cap one repo via `[repos."owner/repo"] max_parallel`).
+  `--session <root-job-id>` scopes it to one orchestration run.
 - **Agent**: a named Gitmoot identity with repo access, role, capabilities, and
   a runtime adapter.
 - **Runtime adapter**: the bridge from Gitmoot jobs to Codex, Claude Code,
@@ -240,11 +304,15 @@ one command. Each runs a coordinator that fans work out to ephemeral workers (no
 pre-registration) and reconvenes them in a single continuation. `review-panel`
 convenes a panel of diverse-lens reviewers over a PR and synthesizes one verdict;
 `decompose-and-verify` splits an implementation task into parallel, file-disjoint
-legs and runs a verify step that depends on all of them.
+legs and runs a verify step that depends on all of them; `verifier` is the
+minimal produce-vs-independent-check pair (one producer leg plus one read-only
+verify leg on a different runtime). Route any coordinator agent through a
+recipe with `--recipe`:
 
 ```sh
-gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
-gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
+gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
+gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify
+gitmoot orchestrate project-planner "Implement the rate limiter and prove it works." --repo owner/repo --recipe verifier
 ```
 
 ### Custom Prompt Agents
@@ -287,6 +355,18 @@ gitmoot agent template list --runtime codex --output goal_file
 gitmoot agent template list --tag review --capability ask
 gitmoot agent template show frontend-reviewer
 ```
+
+Back up and share templates via a GitHub repo (#476):
+
+```sh
+gitmoot agent template remote set owner/my-templates   # default remote ([template_remote]; ref=main, path=templates/)
+gitmoot agent template publish --all                   # commit templates to the remote (--create makes the repo)
+gitmoot agent template pull frontend-reviewer          # install/refresh from the remote
+gitmoot agent template add frontend-reviewer --from-repo owner/my-templates
+```
+
+Templates are stored and published **verbatim** (prompt body + metadata) —
+point the remote at a private repo unless the prompts are meant to be public.
 
 Reuse a custom agent prompt in the current Codex or Claude chat without
 starting a background job:
@@ -346,10 +426,28 @@ for its keys. Piped/`--plain`/`--json` output is unchanged and script-stable.
 ```sh
 gitmoot dashboard           # interactive cockpit
 gitmoot dashboard --json    # one-shot snapshot for scripts
+gitmoot dashboard --web [--addr 127.0.0.1:8080]   # read-only web dashboard
 ```
+
+`gitmoot dashboard --web` serves a read-only browser view — a live
+orchestration/delegation graph with run summaries and prompt/output
+inspection — until interrupted.
 
 Agents should answer directly from the SessionStart snapshot or read-only CLI
 checks first. The dashboard remains the live cockpit for humans.
+
+### Heartbeat Schedules
+
+Heartbeats let the daemon run recurring agent work itself — cron-like
+background jobs without an external cron (off by default):
+
+```sh
+gitmoot agent heartbeat add repo-maintainer daily-status \
+  --repo owner/repo --interval 24h --prompt "Daily status report." --enabled
+gitmoot agent heartbeat list
+```
+
+See [docs/heartbeats.md](docs/heartbeats.md).
 
 ### Jobs, Locks, And Recovery
 
@@ -358,14 +456,21 @@ gitmoot status --repo owner/repo
 gitmoot events --repo owner/repo
 gitmoot job list --repo owner/repo
 gitmoot job show <job-id>
+gitmoot job events <job-id>
 gitmoot job retry <job-id>
 gitmoot job cancel <job-id>
+gitmoot job kill <root-job-id>
 gitmoot report bug --job <job-id> [--preview]
 gitmoot report bug --job <job-id> --create --yes
 gitmoot daemon logs
 gitmoot lock list --repo owner/repo
 gitmoot lock release owner/repo <branch> --owner <agent>
 ```
+
+`gitmoot job kill <root-job-id>` is the operator kill switch for a whole
+delegation tree: in-flight jobs finish, the coordinator's next continuation is
+routed through the graceful finalize path, and the daemon stops starting queued
+children of that root.
 
 `gitmoot report bug` builds a redacted issue draft with job context, selected
 error, recent events, redaction notes, labels, and a duplicate-detection
@@ -500,6 +605,10 @@ for install details and troubleshooting.
 - [CLI reference](skills/gitmoot/references/CLI.md)
 - [Codex and Claude plugins](docs/plugins.md)
 - [Local workflow walkthrough](docs/local-workflow.md)
+- [Run jobs in parallel](docs/parallel-jobs.md)
+- [Heartbeat schedules](docs/heartbeats.md)
+- [Outbound event stream](docs/events.md)
+- [Cockpit and the [orchestrate] config](docs/cockpit-orchestrate.md)
 - [Beta smoke tests](docs/beta-smoke-tests.md)
 - [Runtime adapter authoring](docs/adapters.md)
 - [Troubleshooting](docs/troubleshooting.md)
@@ -540,12 +649,12 @@ request: build, vet, and test, plus the race detector on `internal/workflow`.
 
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, PR comments, daemon jobs, branch locks, agent templates, template capture, custom prompt agents, and Codex, Claude Code, or Kimi Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, PR comments, daemon jobs, stuck jobs, branch locks, agent templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, event webhooks, the web dashboard, and Codex, Claude Code, or Kimi Code runtime workflows.
 version: 0.1.0
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
-  gitmoot-version: "0.4.2"
+  gitmoot-version: "0.8.1"
   source: "jerryfane/gitmoot"
   openclaw:
     requires:
@@ -603,9 +712,11 @@ The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
 
 For runtime selection, `gitmoot agent start <name> --runtime <runtime>` accepts
-`codex`, `claude`, or `kimi`. Kimi Code is a first-class runtime adapter
-alongside Codex and Claude Code. To use it, run `kimi login`, then restart the
-Gitmoot daemon so it inherits the session.
+`codex`, `claude`, `kimi`, or `kimi-cli` (the opt-in legacy Kimi CLI adapter).
+Kimi Code is a first-class runtime adapter alongside Codex and Claude Code. To
+use it, run `kimi login`, then restart the Gitmoot daemon so it inherits the
+session. `agent subscribe` additionally accepts `--runtime shell`, whose
+session is a command (for deterministic tests).
 
 For Gitmoot health or status questions, run the relevant read-only Gitmoot CLI
 checks and answer directly from the results. Mention `gitmoot dashboard` only
@@ -670,10 +781,12 @@ gitmoot plugin doctor
 ```sh
 gitmoot status --repo owner/repo
 gitmoot events --repo owner/repo
-gitmoot daemon start --repo owner/repo --poll 30s
-gitmoot daemon start --repo owner/repo --session <root-job-id>
+gitmoot daemon start --poll 30s
+gitmoot daemon start --session <root-job-id>
 gitmoot daemon start
 gitmoot daemon status
+gitmoot daemon restart
+gitmoot daemon stop [--forget-runtime-auth]
 gitmoot plugin doctor
 gitmoot agent list
 gitmoot agent doctor <agent>
@@ -702,13 +815,15 @@ gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issu
 ```
 
 Use `gitmoot daemon start` for the background daemon. Use `gitmoot daemon run`
-only when the user explicitly wants a foreground process. `gitmoot daemon start
---repo owner/repo` scopes the background daemon to that one repo; `gitmoot daemon
-start` with no `--repo` supervises every enabled repo. Both `daemon run` and
-`daemon start` accept `--session <root-job-id>` (alias `--root`) to pin the
-worker to one orchestration run: it then runs only jobs whose `root_job_id`
-matches that value plus the root coordinator job itself, AND-combined with any
-`--repo` filter.
+only when the user explicitly wants a foreground process. `--repo owner/repo`
+SCOPES the daemon to a single repo: it polls only that repo's PRs and claims
+only that repo's queued jobs. Omit `--repo` to supervise every enabled
+registered repo from one daemon (#581). Both `daemon run` and `daemon start` accept `--session <root-job-id>`
+(alias `--root`) to pin the worker to one orchestration run: it then runs only
+jobs whose `root_job_id` matches that value plus the root coordinator job
+itself. To restart the daemon without losing its persisted Claude token, use
+`gitmoot daemon restart` (not stop + start); `gitmoot daemon stop
+--forget-runtime-auth` deletes the persisted token file.
 
 Use `gitmoot agent prompt <agent-or-template>` when the user wants to reuse a
 Gitmoot agent prompt in the current chat. Use `gitmoot agent run` for
@@ -759,6 +874,8 @@ Use GitHub PR comments as the public audit trail:
 /gitmoot retry <job-id>
 /gitmoot cancel <job-id>
 /gitmoot merge
+/gitmoot resume <job-id> retry|continue|abort|answer [instructions]
+@<agent> ask|review|implement [instructions]
 ```
 
 ## Template Agents
@@ -779,12 +896,13 @@ coordinator that fans work out to ephemeral workers (no pre-registration) and
 reconvenes them in one continuation. `review-panel` convenes a panel of
 diverse-lens reviewers over a PR and synthesizes their verdict;
 `decompose-and-verify` splits an implementation task into parallel file-disjoint
-legs and runs a verify step that depends on all of them. Run them with
-`gitmoot orchestrate`:
+legs and runs a verify step that depends on all of them; `verifier` is the
+minimal one-producer + independent-verify pair. Route any coordinator agent
+through a recipe with the `--recipe` flag on `gitmoot orchestrate`:
 
 ```sh
-gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
-gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
+gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
+gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify
 ```
 
 Create a local custom prompt template:
@@ -1195,24 +1313,23 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    --start-daemon` runs this same background start path for the selected
    checkout.
 
-   `gitmoot daemon start --repo owner/project` also scopes the background daemon
-   to that one repo: it only polls and runs jobs for `owner/project`. Use
-   `gitmoot daemon start` without `--repo` after registering all intended repos
-   if one daemon should supervise the whole Gitmoot home; that supervises every
-   enabled repo.
+   `--repo owner/repo` **scopes** the daemon to a single repo: it polls only
+   that repo's PRs and claims only that repo's queued jobs. Omit `--repo` to
+   supervise every enabled registered repo from one daemon (#581). To cap one
+   repo's parallelism on a shared (no-`--repo`) daemon, use the
+   `[repos."owner/repo"].max_parallel` config key instead (see
+   [parallel-jobs.md](./parallel-jobs.md)).
 
    To pin a worker to a single orchestration run, pass `--session <root-job-id>`
    (alias `--root`) to `daemon run` or `daemon start`:
 
    ```sh
-   gitmoot daemon start --repo owner/project --session <root-job-id>
+   gitmoot daemon start --session <root-job-id>
    ```
 
    With `--session` set, the worker runs only jobs whose `root_job_id` matches
    that value, plus the root coordinator job itself, and ignores every other
-   queued job. `--session` composes with `--repo` (AND): a job must match both
-   filters to run. Leaving both empty keeps the default of matching all enabled
-   repos and all jobs.
+   queued job. Leaving it empty keeps the default of matching all jobs.
 
    ### Set up a GitHub "tagging" agent
 
@@ -1236,8 +1353,9 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
 
    - **Run the daemon from a shell that holds the runtime token.** The daemon
      inherits the environment of the shell that (re)started it, so start it where
-     the runtime (e.g. Claude) is authenticated. (Daemon-aware auth validation is
-     tracked in #427.)
+     the runtime (e.g. Claude) is authenticated. Verify with `gitmoot doctor`,
+     which live-probes the daemon's Claude auth; `gitmoot daemon restart`
+     recovers the persisted token even from an unauthenticated shell (#578).
    - **On issues only the `ask` action is acted on.** Post the tag as the first
      token of a line:
 
@@ -1761,7 +1879,8 @@ type Agent struct {
 
 `RuntimeRef` is runtime-specific. Codex accepts a session UUID, thread name, or
 `last`. Claude accepts a UUID or `last`. Kimi accepts a Kimi session id of the
-form `session_<uuid>` or empty. Shell uses the configured command.
+form `session_<uuid>` or empty. Kimi CLI (legacy, `kimi-cli`) accepts a session
+UUID or empty. Shell uses the configured command.
 `TemplateID` is Gitmoot-owned metadata. Adapters do not fetch or interpret template
 content; Gitmoot snapshots cached template instructions into the rendered prompt
 before delivery.
@@ -1812,6 +1931,18 @@ kimi -S <session-id> -p '<job-prompt>' --output-format stream-json
 
 Kimi runs against a logged-in Kimi CLI. Run `kimi login`, then restart the
 Gitmoot daemon so it inherits the session.
+
+The opt-in `kimi-cli` runtime (#546) targets the **legacy** Kimi CLI, which
+requires the older `--print` command shape the current Kimi Code CLI does not
+support:
+
+```sh
+kimi --print -p '<prompt>' --output-format stream-json
+```
+
+It is intentionally a separate runtime name so the default `kimi` (Kimi Code)
+path is never probed or changed; choose `kimi` unless you specifically run the
+legacy CLI. The two count as the same runtime family for cross-family review.
 
 Shell adapters do not support `agent start`; register shell commands with
 `agent subscribe`.
@@ -2162,6 +2293,23 @@ Fixes:
 - If JSON mode is unsupported, the adapter falls back to plain output, but the
   output still must contain the `gitmoot_result` object.
 
+What Gitmoot already retries for you (no action needed when the events show a
+failure followed by a success):
+
+- A dead pinned session — the `--resume` target no longer exists — is retried
+  on a fresh session and the agent is re-pinned to it (#443).
+- A transient 401 ("socket connection closed unexpectedly") under sustained
+  concurrency is retried with backoff without abandoning the session
+  (#487/#509).
+
+Daemon restarts and Claude auth: the daemon persists its Claude token into an
+owner-only (0600) `daemon-runtime.env` file in the Gitmoot home (#578/#588).
+`gitmoot daemon restart` recovers that token even when the invoking shell lacks
+`CLAUDE_CODE_OAUTH_TOKEN`; a plain `stop` + `start` re-inherits the launching
+shell's environment (and warns loudly when that would come up auth-less). A
+recovered token may be stale — verify with `gitmoot doctor`. `gitmoot daemon
+stop --forget-runtime-auth` deletes the persisted file.
+
 ## Repo Remotes
 
 Symptoms:
@@ -2183,6 +2331,25 @@ Fixes:
 - Start the daemon from the intended checkout.
 - Correct the `origin` remote or pass the matching `--repo`.
 - Avoid running one daemon from a parent folder that contains multiple repos.
+
+Note that `--repo owner/repo` **scopes** the daemon to a single repo: it polls
+only that repo's PRs and claims only that repo's queued jobs. Omit `--repo` to
+supervise every enabled registered repo from one daemon (#581).
+
+## Daemon Already Running
+
+Symptoms:
+
+- `gitmoot daemon start`/`run` refuses with `daemon already running with pid …`.
+
+Fixes:
+
+- One daemon per Gitmoot home is enforced with a pidfile plus a flock backstop
+  (#550/#556); a second daemon is refused by design, and a stale pidfile whose
+  owner is dead is liveness-checked and recovered automatically. Use the
+  running daemon — it supervises all subscribed repos. To change its settings,
+  send `kill -HUP <pid>` for a live `[daemon]` config reload (#577) or use
+  `gitmoot daemon restart`. Scripts should treat the refusal as success.
 
 ## Permissions
 
@@ -2265,6 +2432,42 @@ Fixes:
   different registered agent or managed background instance when the work is
   independent.
 - Use `gitmoot agent gc` to remove expired managed background instances.
+- For a registered agent whose session is genuinely dead or stranded, rebind it
+  in place with `gitmoot agent restart <agent>` (refused while the session is
+  live or the agent has in-flight jobs).
+
+## Stuck Or Deferred Jobs
+
+Symptoms:
+
+- A queued/blocked job is not moving, or a job "failed then reappeared as
+  queued".
+- A job sits in `running` long after its worker died.
+
+Checks — read the stuck reason first:
+
+```sh
+gitmoot job list --repo owner/repo   # WHY: column on queued/blocked jobs
+gitmoot job show <job-id>            # why_stuck: / next_retry_at: lines
+gitmoot job events <job-id>
+```
+
+Fixes:
+
+- `gitmoot job list` appends a `WHY:` column and `gitmoot job show` prints a
+  `why_stuck:` line for queued/blocked jobs (#552) — a runtime-session lock
+  wait (naming the holder), `blocked: awaiting human`, `auth failing: …`,
+  `throttled: …`, or `retrying: …` with the attempt schedule.
+- Deferred jobs recover on their own (#532): a delivery failure classified as
+  a retryable operational blocker (runtime auth, provider rate limit/quota) is
+  re-queued with a bounded retry budget instead of failing terminally —
+  `job show --json` carries the `blocker_class` and attempt count. Only act
+  when the retry budget is spent and the job stays failed.
+- A job stuck in `running` is recovered automatically once it shows no lease
+  progress past the staleness window (default 30m; tune with the
+  `GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value
+  is 1m — below-1m, malformed, or non-positive values are rejected in favor of
+  the 30m default rather than clamped, #560).
 
 ## Parallel Implementation And Worktrees
 
@@ -2329,6 +2532,11 @@ Fixes:
   `blocked`, `implemented`, or `failed`.
 - Keep `summary` non-empty.
 
+Gitmoot already retries this for you: output missing the `gitmoot_result`
+envelope records a `malformed_output` event and is re-asked with the repair
+prompt a bounded number of times before failing terminally (#495). A job whose
+events show `malformed_output` followed by a success worked as designed.
+
 ## Rate Limits
 
 Symptoms:
@@ -2375,6 +2583,633 @@ Fixes:
 - If a merged task reports a worktree cleanup warning, inspect the stored task
   worktree path, clean or remove that worktree manually, then clear stale local
   state only after confirming the path is no longer needed.
+- When an **external** system owns the merge decision, set
+  `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1` (also `true`/`yes`/`on`; #545): Gitmoot
+  then abstains from its native merge gate — fail-closed, it never merges
+  gatelessly; the external gate makes the call.
+
+---
+
+# Source: docs/events.md
+
+# Outbound Event Stream (`[events]`)
+
+Gitmoot can push a small, versioned, redacted JSON event to one HTTP endpoint
+whenever a job reaches a terminal state or pauses awaiting a human. This is an
+**off-by-default, best-effort** outbound seam (#446): with no `[events]` config
+nothing is constructed and behavior is byte-identical to a build without it.
+
+It complements — it does not replace — the existing observability surfaces
+(`gitmoot job watch`, the local dashboard, PR comments). The typed lifecycle
+events recorded in SQLite (`job_events`) are unchanged; this is an additional
+fan-out, not a migration.
+
+## What it emits
+
+The pilot emits a tight allowlist of event types over the webhook transport:
+
+| `event_type`                    | When                                                                              |
+| ------------------------------- | --------------------------------------------------------------------------------- |
+| `job.finished`                  | a job reaches the `succeeded` terminal state                                       |
+| `job.failed`                    | a job reaches the `failed` terminal state                                          |
+| `job.blocked`                   | a job reaches the `blocked` terminal state                                         |
+| `job.needs_attention`           | a tree pauses awaiting a human (the `escalate_human` pause today)                  |
+| `job.deferred`                  | the daemon re-queued a job that just emitted `job.failed` because the failure classified as a retryable operational blocker (runtime auth, rate limit/quota) — it will be re-dispatched automatically |
+| `candidate.awaiting_promotion`  | a SkillOpt template candidate becomes `pending` after import (always, off the auto-promote policy) |
+| `candidate.auto_promoted`       | the off-by-default `[skillopt].auto_promote` policy auto-promoted a candidate to `current` (also the canary GRADUATE event) |
+| `candidate.canary_started`      | the off-by-default `[skillopt].auto_promote_canary` policy promoted a candidate to the `canary` state behind the live champion |
+| `candidate.rolled_back`         | the canary regression window auto-rolled-back a canary on a material regression (champion stays current, canary rejected) |
+
+Each terminal transition emits **exactly once**. The engine owns the
+succeeded/failed/blocked emit on its `Mailbox` terminal path; the daemon owns the
+pre-flight (`queued -> failed|blocked`) and permission-blocked cases that never
+pass through that path. `job.needs_attention` is emitted once per fresh
+escalation round (a re-advance does not re-emit).
+
+**`job.failed` followed by `job.deferred` is NOT terminal.** When a run fails on
+a classified operational blocker (runtime auth rejected, provider rate
+limit/quota), the engine has already emitted `job.failed` for that run before the
+daemon decides to defer; the daemon then emits `job.deferred` for the same
+`job_id` (detail carries the blocker class, the `attempt N/M` retry budget, and
+the earliest `retry at` timestamp) and silently re-dispatches the job after the
+hold. Consumers acting on `job.failed` (recovery, alerting, cleanup) should
+suppress terminal handling for a job whose `job.failed` is followed by a
+`job.deferred`, and treat only a `job.failed` with no subsequent `job.deferred`
+as final.
+
+The two `candidate.*` events come from the `skillopt import` / `train continue`
+CLI path, NOT the daemon (#471). When a candidate becomes `pending`,
+`candidate.awaiting_promotion` is emitted **once** carrying the version id
+(`job_id`), the template id (`root_id`), and a redacted score/samples/CI reason —
+independent of the auto-promote policy, so a human is notified even in the manual
+default. If `[skillopt].auto_promote` is on **and** every configured guardrail
+holds, the candidate is promoted via the existing promote path and
+`candidate.auto_promoted` fires so the change can be reviewed or rolled back. The
+adjacent dashboard **Attention** page also lists every pending candidate
+(read-only), so candidates are visible locally even with `[events]` off.
+
+When `[skillopt].auto_promote_canary` is on **and** `auto_promote_canary_sample`
+is a fraction in `(0,1]`, a guardrails-pass candidate is promoted to a **canary**
+instead of straight to `current`: it routes that sampled fraction of new job
+resolutions while the prior champion stays the live current version, and
+`candidate.canary_started` fires (carrying the canary version id, template id, and
+the sample fraction). The daemon then watches a bounded regression window over the
+canary's harvested verifiable outcomes (reusing the #465 Mode A signal, no new
+evaluator) and compares it to the prior champion: on parity-or-better it
+**graduates** the canary to `current` and emits `candidate.auto_promoted`; on a
+**material regression** it auto-rolls-back — the champion stays current, the canary
+is rejected, and `candidate.rolled_back` fires. It is **fail-safe**: too few canary
+outcomes, no champion baseline, or feedback it could not read all **hold** (keep
+sampling), never rolling back on unread evidence and never graduating without
+confirming non-regression. With the knob off (the default) promotion is the
+unchanged direct path and no canary event is ever emitted.
+
+The following `event_type` values are **reserved** for the graduate step. They
+are enumerated in the contract so a consumer can `switch` over them
+forward-compatibly without a schema bump when they start arriving, but the pilot
+does **not** emit them: `job.started`, `delegation.escalation`,
+`delegation.finalized`, `orchestration.finished`.
+
+## The event contract (`schema_version = 1`)
+
+Every event is a single JSON object:
+
+```json
+{
+  "schema_version": 1,
+  "event_type": "job.finished",
+  "job_id": "implement-task-7",
+  "root_id": "coordinator-job-id",
+  "repo": "owner/repo",
+  "status": "succeeded",
+  "ts": "2026-06-16T12:00:00Z",
+  "detail": "Opened PR #42"
+}
+```
+
+| Field            | Type   | Notes                                                                       |
+| ---------------- | ------ | --------------------------------------------------------------------------- |
+| `schema_version` | int    | Contract version. Currently `1`. A breaking field change bumps it.          |
+| `event_type`     | string | The enum above.                                                             |
+| `job_id`         | string | Opaque job id this event is about.                                          |
+| `root_id`        | string | The coordination tree's root id, so a consumer can aggregate a run client-side. |
+| `repo`           | string | `owner/repo` only — never an absolute checkout path.                        |
+| `status`         | string | Terminal/lifecycle state (`succeeded`/`failed`/`blocked`/`awaiting_human`). |
+| `ts`             | string | RFC3339 emit time.                                                          |
+| `detail`         | string | Short redacted human-facing string (failure summary, the escalation question). |
+
+There is **no** synthetic `orchestration.finished` in the pilot — every event
+carries `root_id`, so a consumer groups a run client-side. Server-side
+tree-convergence aggregation is a documented graduate item.
+
+## Redaction
+
+Every outbound string field is redacted at event construction through the same
+redactor Gitmoot uses for off-box PR/issue comments and bug reports
+(`workflow.RedactCommentText`): GitHub tokens, OpenAI keys, AWS secrets, and
+`api_key`/`token`/`secret`/`password` assignments are replaced with
+`[REDACTED]`. The `detail` field is then additionally scrubbed of absolute
+filesystem paths — host home layout, checkout and worktree paths embedded in
+pre-flight failure detail (e.g. `git worktree add /root/.gitmoot/...`) collapse
+to `<path>` — so host layout and usernames never leak. `repo` is reduced to
+`owner/repo` only. No absolute paths, raw runtime output, or secrets leave the
+box.
+
+## Best-effort delivery
+
+Delivery is **fire-and-forget**. A slow, hung, erroring, or full consumer never
+blocks or fails a job — this mirrors the `escalate_human` notifier contract:
+
+- Each event is handed to a small buffered channel drained by **one** background
+  goroutine, so concurrent emits from many workers serialize cleanly.
+- Each POST is bounded by `[events].timeout` (default `2s`). A hung consumer
+  times out and the event is dropped.
+- On a full buffer, a transport error, or a non-2xx response the event is
+  **dropped** and a single best-effort `event_sink_drop` job event is recorded
+  locally (so a drop is observable without coupling delivery to the job).
+
+There is **no** outbox / retry in the pilot: at-least-once delivery and an
+outbox table are the explicit graduate step.
+
+## Configuration
+
+Add an `[events]` section to the Gitmoot config file:
+
+```toml
+[events]
+# The single endpoint each event is POSTed to as application/json.
+# Empty (the default) means the event stream is OFF: no sink, no goroutine,
+# no emits, byte-identical behavior.
+webhook_url = "https://example.com/gitmoot-events"
+
+# Per-POST timeout (Go duration). Default 2s. Bounds a hung consumer.
+timeout = "2s"
+
+# RESERVED for the graduate Unix-socket transport. Parsed and validated but
+# UNUSED by the pilot (webhook-only).
+# socket_path = "/run/gitmoot/events.sock"
+```
+
+| Key           | Default | Meaning                                                          |
+| ------------- | ------- | ---------------------------------------------------------------- |
+| `webhook_url` | `""`    | HTTP(S) endpoint. Empty = OFF.                                   |
+| `timeout`     | `2s`    | Per-POST timeout (Go duration). Must be positive.               |
+| `socket_path` | `""`    | Reserved for the graduate Unix-socket transport (unused today). |
+
+`webhook_url` must be an `http://` or `https://` URL. An invalid `timeout`
+duration or a non-http(s) URL is rejected at config load.
+
+## Graduate (go/no-go)
+
+The pilot validates the contract and the best-effort guarantee with the least
+scaffolding. The following are out of scope and gated behind an explicit go/no-go
+on the tracking issue:
+
+- The Unix-socket transport (`socket_path`), behind the same `Sink` seam.
+- More event types (`job.started`, `delegation.*`, `orchestration.finished`).
+- An outbox table for at-least-once / durable delivery.
+- A server-side synthetic `orchestration.finished` (reliable tree convergence).
+
+---
+
+# Source: docs/heartbeats.md
+
+# Agent heartbeat schedules
+
+Heartbeats let the gitmoot daemon schedule **recurring agent work** itself —
+cron-like background jobs — without relying on an external cron. They reuse the
+normal job queue and background-agent path (no separate runner): a due heartbeat
+enqueues an ordinary job that the existing worker tick runs.
+
+Heartbeats are **off by default**. With no heartbeat sections in your config, the
+daemon's scan returns immediately and nothing changes.
+
+## Configuration
+
+A heartbeat is one `[agents.<agent>.heartbeats.<name>]` section per schedule,
+scoped to a named agent. Manage these with the CLI (below) rather than hand-editing
+TOML — the CLI edits the section through the lossless config writer, so it never
+clobbers your agent-type blocks or sibling heartbeats. The resulting section looks
+like:
+
+```toml
+[agents.repo-maintainer.heartbeats.daily-status]
+enabled = true
+repo = "jerryfane/gitmoot"
+interval = "24h"
+jitter = "15m"
+action = "ask"
+prompt = "Review open issues, PRs, and recent jobs. Return a concise status report with blockers and suggested next actions."
+max_concurrent = 1
+```
+
+| Field            | Required | Default | Notes                                                        |
+| ---------------- | -------- | ------- | ------------------------------------------------------------ |
+| `enabled`        | no       | `false` | A disabled heartbeat never runs.                             |
+| `repo`           | yes      | —       | `owner/name` the job runs against. Must be a registered, enabled daemon repo with a checkout (see note below). |
+| `interval`       | yes      | —       | Go duration (e.g. `24h`, `1h30m`). Validated at load.        |
+| `jitter`         | no       | `0s`    | Random `[0, jitter]` added to each `next_due` to de-thunder. |
+| `action`         | no       | `ask`   | `ask` (read-only analysis) or `review` (read-only PR/code review). A `review` heartbeat requires the agent to hold the `review` capability. `implement` is deliberately not supported. |
+| `prompt`         | yes      | —       | Instructions passed to the agent.                            |
+| `max_concurrent` | no       | `1`     | Overlap cap; a new run is skipped while this many are active.|
+
+Invalid intervals/jitter or an unsupported action produce a clear validation
+error at config load.
+
+## CLI
+
+Create and manage heartbeats programmatically (no hand-edited TOML):
+
+```sh
+# Create (or update) a heartbeat. Omit --enabled to add it disabled.
+gitmoot agent heartbeat add repo-maintainer daily-status \
+  --repo jerryfane/gitmoot --interval 24h --jitter 15m \
+  --prompt "Review open issues, PRs, and recent jobs." --enabled
+
+# A review heartbeat requires the agent to hold the review capability.
+gitmoot agent heartbeat add reviewer stale-prs \
+  --repo jerryfane/gitmoot --interval 12h --action review \
+  --prompt "Review stale open PRs and summarize blockers."
+
+gitmoot agent heartbeat list [--agent repo-maintainer]
+gitmoot agent heartbeat show repo-maintainer daily-status
+gitmoot agent heartbeat enable repo-maintainer daily-status
+gitmoot agent heartbeat disable repo-maintainer daily-status
+gitmoot agent heartbeat remove repo-maintainer daily-status
+```
+
+`add` validates the action, repo, interval, jitter, and prompt before writing, and
+(for `action = review`) refuses to write a heartbeat for an agent lacking the
+review capability. `enable`/`disable` flip just the `enabled` flag in place,
+preserving the rest of the block and its comments.
+
+## Observability
+
+`gitmoot daemon status` surfaces every configured heartbeat with its enabled
+state, action, interval, repo, and — once it has fired — its `last_run`,
+`next_due`, and `last_status` (from the local `heartbeat_state`). With no
+heartbeats configured the section is omitted entirely (status is unchanged).
+
+## Behavior
+
+- The daemon checks heartbeat schedules during its existing poll loop (both the
+  registered-repo and single-repo daemons).
+- When a heartbeat is due, gitmoot enqueues one normal background job. Heartbeat
+  jobs are visible in the usual job/status surfaces (sender `heartbeat`,
+  fingerprint `heartbeat:<agent>/<name>`).
+- gitmoot records heartbeat state locally: last run time, next due time, last job
+  id, and last status.
+- **No duplicate jobs:** a new run is skipped while a prior heartbeat job is still
+  active (the `max_concurrent` cap), and the persisted `next_due` means a daemon
+  restart does not re-fire an active heartbeat.
+- **Capacity-aware:** a heartbeat is skipped for this tick when the agent is
+  already at its `max_background`; it retries once capacity frees up.
+- **Missed ticks coalesce:** after a long outage the schedule replays only once
+  (`next_due` is re-anchored to now), not a backlog of every missed interval.
+- **Repo must be managed:** `repo` has to be a repo the daemon actually manages —
+  registered (added to the daemon), enabled, and with a local checkout. A
+  heartbeat pointing at an unmanaged/disabled repo is skipped each tick with
+  `last_status = repo_unmanaged` (it does not enqueue a job no worker would claim),
+  and starts running on its own once the repo becomes managed.
+
+## Safety notes
+
+- Both supported actions are **read-only**: `ask` (the conservative default) and
+  `review`. Heartbeats do **not** auto-implement code — recurring unattended
+  code-change PRs are intentionally out of scope.
+- A `review` heartbeat only enqueues for an agent that holds the `review`
+  capability; the check runs both when the heartbeat is written (CLI) and when it
+  is due (daemon scan). A review heartbeat for an agent without the capability is
+  skipped with `last_status = capability_missing` and self-recovers if the
+  capability is later granted.
+- `repo` must be a repo the daemon **manages** (registered, enabled, with a
+  checkout). This keeps heartbeats from enqueuing jobs no worker would run.
+- Heartbeats respect existing agent/runtime capacity limits (`max_background`),
+  runtime locks, and repo policy — they enqueue through the same path as any other
+  job.
+- Keep `interval` sane: every due tick consumes a background slot and runtime
+  budget.
+
+## Not yet supported (deferred)
+
+- `action = "implement"` heartbeats (recurring unattended code-change PRs).
+- Agent-**type** scoping (only named agents today).
+- Per-job runtime override (see #531).
+
+---
+
+# Source: docs/parallel-jobs.md
+
+# Run Jobs In Parallel On A Repo
+
+By default the daemon runs queued jobs **one at a time per repo**: `--workers`
+defaults to `1` and the scheduler defaults to `barrier` (a per-tick batch that
+serializes same-repo jobs on one checkout lock). That is the safe, conservative
+default — but a fan-out of independent jobs on one repo runs serially unless you
+opt in to parallelism.
+
+## The short version
+
+```sh
+# Intent-level: workers + the pool scheduler together, named for the goal.
+gitmoot daemon start --parallel 5
+
+# Equivalent, explicit form:
+gitmoot daemon start --workers 5 --scheduler pool
+```
+
+`--parallel N` sets `--workers N` **and** `--scheduler pool` in one flag. It is
+sugar for the explicit pair and cannot be combined with `--workers` or
+`--scheduler`.
+
+If you raise `--workers` above 1 and do **not** pass `--scheduler`, the daemon
+**auto-selects `pool`** — requesting multiple workers under the serializing
+`barrier` is almost never what anyone wants:
+
+```sh
+gitmoot daemon start --workers 5     # auto-selects --scheduler pool
+```
+
+An explicit `--scheduler barrier` is always honored, preserving the old per-tick
+semantics:
+
+```sh
+gitmoot daemon start --workers 5 --scheduler barrier
+```
+
+## Confirm and discover
+
+- `gitmoot daemon status` reports the scheduler mode and worker count (e.g.
+  `scheduler: pool, workers: 5`), so you can confirm the daemon is configured for
+  the parallelism you asked for without reading launch flags.
+- When a parallelizable workload is queued under a serializing config, the daemon
+  logs an actionable warning with the exact relaunch command instead of silently
+  serializing the work:
+
+  ```text
+  warning: 3 parallelizable jobs queued for owner/repo will run serially under the
+  current scheduler config; relaunch with: gitmoot daemon restart --parallel 3
+  ```
+
+  "Parallelizable" is counted conservatively: same repo, dependency-unblocked, and
+  **distinct runtime sessions** (see below). Two jobs on the same agent session are
+  not counted, because they serialize regardless of the scheduler. The warning is
+  rate-limited — it is re-logged only when the parallelizable set changes, not on
+  every poll — so a steady backlog does not spam the daemon log.
+
+## What actually runs in parallel (two serialization layers)
+
+Parallelism under `pool` is bounded by **two** independent locks:
+
+1. **Checkout lock (per worktree).** Jobs run concurrently only when they have
+   distinct checkout keys. Delegation / orchestra `implement` children already get
+   their own worktree from the workflow engine, so they parallelize; read-only
+   `ask`/`review` jobs can be auto-isolated into an ephemeral detached worktree. A
+   plain, top-level same-repo `implement` job with no worktree still shares the
+   `repo:<repo>` key and serializes even under `pool`.
+2. **Runtime session lock (`runtime:<runtime>:<ref>`).** Two jobs that use the
+   **same** agent/runtime session serialize on the session lock even when their
+   checkouts differ. So same-repo parallelism is bounded by **distinct runtime
+   sessions** — spread the work across distinct sessions (or distinct agents). This
+   applies to resumable runtimes (Codex `thread_id`, Claude, Kimi); the checkout
+   lock is runtime-agnostic, the session lock is not.
+
+The practical recipe for N-wide same-repo work today: **N delegation/orchestra
+legs** (each engine-isolated into its own worktree) under **distinct runtime
+sessions**, with `--parallel N`.
+
+## Reconfigure without restarting (SIGHUP)
+
+Changing workers/scheduler/poll no longer needs a daemon restart (#577):
+`kill -HUP <daemon-pid>` re-reads the `[daemon]` config section (`poll`,
+`workers`, `scheduler`, parallelism) live — no teardown, no dropped jobs, no
+environment re-inheritance (so the daemon's runtime auth is untouched). Values
+pinned by explicit launch flags win over the re-read config. When a full
+restart is genuinely needed, prefer `gitmoot daemon restart`, which recovers
+the persisted Claude token (#578).
+
+## Cap one repo's parallelism from config
+
+To cap a single repo on a shared daemon — without touching the global worker
+count or relaunching anything — add a `[repos."owner/repo"]` section (#576):
+
+```toml
+[repos."owner/repo"]
+max_parallel = 1          # cap this repo's in-flight jobs; 0/unset = global default
+# scheduler = "barrier"   # optional per-repo scheduler override
+```
+
+`max_parallel = 0` (or an absent section) means "use the global default"; a
+positive value caps that repo's concurrent jobs. The keys are re-read every
+tick, so edits apply live.
+
+## Host-wide admission budget
+
+On a memory-constrained host, the opt-in `[admission]` section adds a second,
+host-global gate the daemon applies **before** starting each agent session, on
+top of `--workers`/pool and the per-repo locks (#365):
+
+```toml
+[admission]
+max_concurrent_sessions = 0   # cap total in-flight sessions; 0 = off
+max_memory_gb = 0             # cap summed per-runtime RAM estimate; 0 = off
+# codex_memory_gb = 0.2       # operator-tunable per-runtime RAM priors
+# claude_memory_gb = 0.85
+# kimi_memory_gb = 0.5
+# default_memory_gb = 0.5
+```
+
+With both caps `0` (the default) the budget is disabled and scheduling is
+byte-identical to a config without the section. A job that does not fit BOTH
+caps is left **queued** and retried next tick — never failed — so "jobs stay
+queued for no visible reason" on a small host can mean the admission budget is
+holding them. The budget is enforced per daemon process (host-global for the
+normal single-daemon deployment).
+
+## Not yet automatic (follow-ups)
+
+- **Top-level `implement` auto-isolation.** `pool` does not auto-isolate plain
+  same-repo `implement` jobs into worktrees — only read-only `ask`/`review` jobs.
+  Parallelizing independent top-level `implement` jobs via the daemon needs
+  implement-eligible auto-isolation (a real branch worktree + branch-lock handling
+  + a worktree cap and disposal sweep); intentionally deferred.
+
+See [`local-workflow.md`](./local-workflow.md) for the broader daemon model.
+
+---
+
+# Source: docs/cockpit-orchestrate.md
+
+# Watching an orchestra: `gitmoot orchestrate --cockpit`
+
+`gitmoot orchestrate --cockpit` renders one live [Herdr](https://github.com/jerryfane/herdr)
+pane per delegation subagent so you can watch a fan-out as it runs — in the
+terminal, and (through [herdres](https://github.com/jerryfane/herdr)) mirrored to
+Telegram. It is **opt-in and fail-open**: with `--cockpit` off, or when Herdr is
+absent or unreachable, orchestration is byte-identical to today. Gitmoot imports
+no Herdr code; the cockpit is purely compositional, driving Herdr over its CLI
+only.
+
+## Turning it on
+
+`--cockpit` (alias `--herdr`) is a flag on `gitmoot orchestrate`:
+
+```sh
+gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo --cockpit
+```
+
+When the flag is set, every child job in the delegation tree opens its own pane:
+the coordinator splits a workspace for the run, each delegation subagent gets a
+pane labeled `<agent> · d<depth> · <branch>`, and that pane streams the child's
+progress while the job runs. Children inherit the cockpit setting from their
+parent, so a single `--cockpit` on the root lights up the whole orchestra.
+
+**Auto-detect:** running `gitmoot orchestrate` from inside a Herdr session
+(`HERDR_ENV` set) turns the cockpit on automatically — no `--cockpit` needed. An
+explicit flag works anywhere; `[orchestrate] cockpit_mode = off` is the host-level
+veto; outside a Herdr session it stays off unless you pass the flag.
+
+Pick where the run lands with `--cockpit-session`:
+
+```sh
+gitmoot orchestrate decompose-and-verify "Implement the export feature." \
+  --repo owner/repo --cockpit --cockpit-session feature-export
+```
+
+### Terminal and Telegram
+
+The same panes are visible two ways:
+
+- **Terminal** — open the Herdr workspace to watch the panes split and update
+  live as each subagent works.
+- **Telegram** — with [herdres](https://github.com/jerryfane/herdr) bridging
+  Herdr to Telegram, each pane surfaces as a forum topic / agent status you can
+  read (and, in later phases, steer) from your phone. See the `herdres` skill for
+  bridge setup.
+
+## Close pane ≠ cancel job
+
+A cockpit pane is a **view**, not the job. Closing a pane (in the terminal or
+from Telegram) tears down the visible surface but does **not** cancel the
+underlying job — the child keeps running in the daemon and its result is still
+captured and synthesized. To actually stop work, cancel the job through the
+record path:
+
+```sh
+gitmoot job list --repo owner/repo     # find the child job id
+gitmoot job cancel <job-id>            # cancel via the record, pane teardown follows
+```
+
+This separation is deliberate: a herdr call must never fail or stall a job, so
+panes are best-effort and disposable while the job lifecycle stays owned by the
+engine.
+
+## Configuration: the `[orchestrate]` section
+
+Defaults live in `~/.gitmoot/config.toml` under `[orchestrate]` and can be
+overridden per run by the flags above:
+
+```toml
+[orchestrate]
+cockpit_mode = "auto"      # on | off | auto (auto = on when launched in a Herdr session)
+cockpit_session = ""       # default Herdr session/workspace label ("" = per-run)
+cockpit_max_panes = 4      # cap on simultaneous panes per run
+cockpit_pane_key = "job"   # job (one pane per job) | seat (reuse a pane per role)
+inline_artifact_bodies = false   # inline each child's artifact_body into the coordinator continuation
+inline_artifact_max_bytes = 32768  # per-body cap (bytes) when inlining is on
+inject_upstream_dep_context = false  # inject succeeded upstream dependency results into a dependent leg's prompt; default off
+max_delegation_token_budget = 0  # per-root delegation token budget (input+output); 0 = unlimited (off)
+max_delegation_cost_usd = 0      # per-root delegation dollar-cost budget (USD); 0 = unlimited (off)
+default_delegation_timeout = ""  # default child-job timeout when a delegation omits one; "" = unbounded
+default_plan_timeout = ""        # per-phase defaults (plan/implement/review/gate/repair) that
+default_implement_timeout = ""   # win over default_delegation_timeout for legs tagged with
+default_review_timeout = ""      # the matching phase (or action)
+default_gate_timeout = ""
+default_repair_timeout = ""
+```
+
+- `cockpit_mode = "off"` disables the cockpit even if `--cockpit` was passed;
+  `"auto"` (the default) auto-enables it when `orchestrate` runs from inside a
+  Herdr session and honors an explicit `--cockpit` anywhere. A pane is only opened
+  when `herdr status` is ok; otherwise a requested run emits one
+  `cockpit_unavailable` job event and proceeds without panes.
+- `cockpit_pane_key = "job"` opens one pane per child job. `seat` mode reuses a
+  single pane per logical role across phases (a later phase) so a long run does
+  not accumulate panes.
+- `inline_artifact_bodies` (default `false`) inlines each child's `artifact_body`
+  into the coordinator continuation prompt as a fenced block, so the coordinator
+  reads the briefs without re-fetching them from disk. Off by default, the
+  continuation is byte-identical to before.
+- `inline_artifact_max_bytes` (default `32768`, i.e. 32 KiB per body) caps how
+  many bytes of each child's body are inlined; longer bodies are rune-safe
+  truncated with a marker pointing at the full on-disk brief. A per-continuation
+  aggregate cap also bounds the total inlined across all children.
+- `inject_upstream_dep_context` (default `false`) injects succeeded upstream
+  dependency results into a dependent leg's prompt; default off.
+- `max_delegation_token_budget` (default `0` = unlimited/off) bounds a delegation
+  tree by **cost** in addition to depth/width/total-jobs/wall-clock. When set to a
+  positive value, the whole tree under one root is capped at that many cumulative
+  tokens (input + output, summed across every job in the tree). A coordinator that
+  tries to fan out after the tree has already used at least the budget is refused
+  with a `delegation_cost_exceeded` event and routed to the graceful finalize
+  continuation (synthesize what completed, then stop). Token capture is
+  **best-effort per runtime**: Claude reports usage via its `--output-format json`
+  envelope, Kimi reports it when its stream emits a `usage` object, and Codex runs
+  delivery without `--json` so it contributes `0` (the budget under-counts Codex
+  rather than failing). Treat it as a coarse runaway-cost backstop, not a precise
+  spend limit; the budget is in raw tokens. Leaving it at `0` is byte-identical to
+  before the knob existed.
+- `max_delegation_cost_usd` (default `0` = unlimited/off) is the **dollar-cost**
+  analogue of the token budget (#380): it bounds the same tree by its *measured
+  spend* rather than raw token count. Cost is derived from the same per-job token
+  usage the token budget already sums, priced through a small built-in per-model
+  price table (per-1M-token list prices — Haiku `0.25/1.25`, Sonnet `3/15`, Opus
+  `15/75` input/output USD — matched by substring against each job's model id;
+  an empty or unrecognized model id is priced at the mid-tier Sonnet default so it
+  is never free). When the tree's accumulated cost reaches the budget, the next
+  fan-out is refused with a `delegation_cost_usd_exceeded` event and routed to the
+  same graceful finalize continuation (synthesize what completed, then stop) — it
+  is **never hard-killed**. Because cost rides on the same best-effort token
+  capture and a hardcoded price table, it is a coarse runaway-cost backstop, not a
+  precise spend meter. Leaving it at `0` is byte-identical to before the knob
+  existed.
+- `default_delegation_timeout` and the per-phase `default_plan_timeout` /
+  `default_implement_timeout` / `default_review_timeout` / `default_gate_timeout`
+  / `default_repair_timeout` (#548, all empty = unbounded by default) supply a
+  child-job timeout when a delegation omits its own `timeout` field. Precedence:
+  per-delegation `timeout` > the phase default matching the delegation's `phase`
+  (falling back to its `action`) > `default_delegation_timeout` > unbounded (the
+  historical behavior). Values are Go durations (e.g. `"30m"`).
+
+## Constrained hosts
+
+On a small box (few cores, limited terminal real estate, a shared daemon) the
+pane count is what bites, not the jobs. Keep it bounded:
+
+- **Lower `cockpit_max_panes`.** The default is `4`; set it to `2` (or `1`) on a
+  constrained host. Beyond the cap, extra subagents run **status-only** — they
+  still report state to Herdr but do not split a new pane, so the work fans out
+  exactly as without the cockpit while the visible surface stays small.
+- **Prefer `cockpit_pane_key = "seat"`** for long multi-phase runs so panes are
+  reused per role instead of accumulating one-per-job.
+- **The cockpit never changes the engine.** The delegation DAG, the result
+  contract, the runtime-session locks, and the checkout keys are all unchanged
+  whether the cockpit is on, off, or unavailable — so capping panes only changes
+  what you *see*, never how the orchestra runs.
+
+If Herdr is not installed or `herdr status` is not ok, `--cockpit` is a no-op
+beyond a single `cockpit_unavailable` event on the root job; the run proceeds
+unwrapped.
+
+## Smoke test
+
+An optional smoke script,
+[`scripts/cockpit-smoke.sh`](../scripts/cockpit-smoke.sh), confirms the cockpit
+is opt-in and fail-open. It runs against an isolated `--home`, exercises the
+`--cockpit` wrap path when `herdr` is reachable, and **skips cleanly** (exit 0)
+when `herdr` or `gitmoot` is unavailable, so it never fails a normal checkout
+that has no Herdr installed. Set `GITMOOT_COCKPIT_SMOKE_AGENT=<coordinator>` for
+a live end-to-end pane run.
 
 ---
 
@@ -3556,6 +4391,11 @@ auto_promote_canary_sample = 0.1          # #484: canary sampled-traffic fractio
 auto_promote_min_confidence = 0.95        # #473 Mode B: UNSET = ignore; SET = require bandit P(>) >= floor (+ enough samples)
 bandit_min_samples = 30                   # #473/#482 Mode B low-traffic floor (manual `skillopt ab` always allowed)
 live_ab_sample_rate = 0.0                 # #482 Mode B live A/B: 0.0 (default) = never intercept; fraction of foreground asks to A/B
+mode_b_judge_enabled = false              # #483: opt the A/B into a cross-family LLM judge row (same as `skillopt ab --judge`)
+mode_b_jury_size = 1                      # #349: >= 2 = a cross-family judge JURY (distinct families, majority vote); 0/1 = single judge, byte-identical
+mode_b_jury_veto_dimensions =             # #349: comma list of rubric dimensions subject to minority-veto (e.g. safety,correctness); empty (default) disables the veto
+mode_b_jury_veto_floor = 0.0              # #349: [0,1] floor for the veto dimensions; 0.0 (default) makes the veto inert
+mode_b_jury_disagreement_tau = 0.0        # #349: per-dimension std threshold that flags jury DISAGREEMENT; 0.0 disables the std check
 ```
 
 The guardrails read the candidate's **harvester auto-trace run**
@@ -3736,7 +4576,22 @@ gitmoot skillopt ab <agent> "<prompt>" --judge-only # only the judge row (skip t
   and weighted low here and is **not** calibrated against human gold in this slice
   — judge-tagged now, calibrated later.
 
-Canary and the unattended auto A/B scheduling loop remain **deferred** to follow-ons.
+The jury variant of the judge (`mode_b_jury_size >= 2`, #349) convenes up to N
+judges from **distinct** model families on the same blind A/B and aggregates
+their verdicts (majority vote + a disagreement flag governed by
+`mode_b_jury_disagreement_tau`); `mode_b_jury_veto_dimensions` +
+`mode_b_jury_veto_floor` add an optional fail-closed minority veto on
+safety/correctness rubric dimensions. Like the single judge it is evidence-only
+and never promotes.
+
+A reviewer's blinded paired-review packet (the fork's `pairwise-review.json` +
+secret map + picks) is imported with `gitmoot skillopt pairwise import
+<packet-dir> [--packet] [--secret-map] [--picks] [--reviewer] [--json]`, which
+de-blinds it and stores the pairwise-preference feedback events.
+
+The canary path shipped as `[skillopt].auto_promote_canary` +
+`auto_promote_canary_sample` (#484, documented above); the unattended auto A/B
+scheduling loop remains **deferred** to follow-ons.
 
 ## Ranked Exploration Workflow
 
@@ -5608,15 +6463,552 @@ Assets: `gitmoot_linux_amd64`, `gitmoot_darwin_amd64`, `gitmoot_darwin_arm64`,
 
 ---
 
+# Source: docs/release-notes/v0.5.0.md
+
+# Gitmoot v0.5.0
+
+Headline: an opt-in **continuous worker-pool scheduler** (`--scheduler pool`)
+plus a batch of workflow/daemon fixes. The new scheduler is opt-in and the
+default per-tick scheduler is unchanged, so upgrading is safe.
+
+## What's new since v0.4.2
+
+- **feat(daemon): opt-in continuous worker-pool scheduler** (#394) —
+  `gitmoot daemon run|start --scheduler pool` keeps up to `--workers` jobs busy
+  and re-queries the queue as workers free (so a job queued *after* dispatch
+  began is picked up without waiting for the in-flight batch), with live
+  in-flight checkout accounting for working-tree safety. A read-only follow-up
+  (`ask`/`review`) blocked only by a contended same-repo checkout is auto-isolated
+  into an ephemeral detached worktree so it runs beside the holder instead of
+  deadlocking. Default stays the existing barrier.
+- **fix(daemon): `--skip-native-review-fanout` TOCTOU** (#390) — the skip flag is
+  now persisted onto the branch lock *before* the PR is opened, so the daemon's
+  PR-watcher never fans out native reviews in the gap.
+- **fix(workflow): keep the terminal-success result on a post-advance error +
+  idempotent PR create** (#387) — `agent implement --json` no longer drops the
+  result envelope when the post-implement PR advance errors; PR creation adopts a
+  concurrent/out-of-band PR instead of erroring.
+- **fix(workflow): release the cancelled job's runtime-session lock on cancel**
+  (#391) — cancelling a job no longer strands its runtime-session lock for the TTL.
+- **fix(workflow): sanitize unsafe worktree path segments** (#384) — multi-round
+  coordinators can dispatch implement again. Thanks @gaijinjoe.
+- **feat(workflow): operator kill switch for delegation trees** (#341) — stop a
+  runaway tree; the coordinator still finalizes gracefully.
+- **feat(workflow): per-root token budget for delegation trees** (#338).
+- **feat(skillopt): apply the accepted judge prompt to production** (#354).
+- **docs: running one agent's jobs concurrently** (#396); **pin the SkillOpt
+  install wheel to gitmoot-skillopt v0.3.1** (#346).
+
+All additive / opt-in (default behavior byte-identical), shipped via squash-merge
+with the CI gate green and adversarial `/code-review`. The pool scheduler and the
+#390 fix were validated end-to-end with live Codex against a real daemon.
+
+---
+
+# Source: docs/release-notes/v0.5.1.md
+
+# Gitmoot v0.5.1
+
+Five issues from the orchestration / @gaijinjoe backlog: a daemon issue-mention
+watcher, foreground managed-type dispatch, a merge-gate deadlock fix, a per-root
+cost budget, and a model-tier scoring helper. All additive / opt-in or bug fixes
+— default behavior unchanged.
+
+## What's new since v0.5.0
+
+- **feat(daemon): watch open issues for `@<agent>` mentions** (#389) — opt-in
+  `gitmoot daemon run|start --watch-issues` watches open **issues** for
+  `@<agent> ask …` mentions and routes them to jobs (mirroring the PR-comment
+  watcher), posting the result back as an issue comment. Default off. It also
+  fixed the bare `@<agent>` mention form — the documented way to summon an agent
+  — which now parses on **PR** comments too (it previously required a `/gitmoot`
+  prefix and silently did nothing).
+- **feat(cli): foreground `agent ask` dispatches to a managed agent type** (#395)
+  — a foreground `gitmoot agent ask <type>` (the `ask` action) now spins or
+  reuses a managed instance up to `max_background` instead of erroring
+  `agent not found`, so you no longer hand-clone agents for inline parallel use.
+  Single-instance-shadows-type precedence is preserved; `review`/`implement` to a
+  type still use `--background`.
+- **fix(workflow): advance integration-worktree reviews instead of deadlocking**
+  (#388) — the merge gate no longer deadlocks on a #332 decompose-and-verify
+  review whose HeadSHA was intentionally cleared. A narrow carve-out accepts the
+  empty SHA only for integration-worktree reviews; normal head-match safety is
+  intact (a mismatched head is still rejected).
+- **feat(workflow): per-root cost ($) budget + circuit breaker** (#380) — opt-in
+  `[orchestrate] max_delegation_cost_usd` trips a delegation tree to graceful
+  finalize when accumulated cost (priced from token usage via a built-in model
+  price table) exceeds the bound — the dollar parallel of the #338 token budget.
+  Default off; fail-open.
+- **feat(workflow): model-tier complexity-scoring helper + routing guidance**
+  (#379) — a pure `ScoreComplexity`/`TierFor` primitive (mechanical / cheap /
+  standard / deep) plus result-contract guidance a coordinator can use to pick a
+  `model` per delegation. Additive and inert (the engine never calls it); the
+  concrete tier→model map is deliberately left to operators.
+
+All shipped via squash-merge with the CI gate green and adversarial `/code-review`.
+#395 and #389 were verified end-to-end with live Codex (including a real GitHub
+repo for the issue watcher — which caught two live bugs the unit tests missed);
+#388 and #380 were validated by unit + `-race` + review.
+
+---
+
+# Source: docs/release-notes/v0.5.2.md
+
+# Gitmoot v0.5.2
+
+A large orchestration + runtime-robustness release: a smarter multi-agent
+"Orchestra" (goal-anchored synthesis, dependency dataflow, independent
+verification, human-in-the-loop pauses), more resilient agent/runtime
+management, and automated cross-platform releases. All changes are additive /
+opt-in or bug fixes — default behavior is unchanged.
+
+## What's new since v0.5.1
+
+### Orchestra — multi-agent delegation
+
+- **feat(workflow): goal-anchored finale continuations** (#418) — when delegated
+  jobs finish, the coordinator's continuation now restates the original goal
+  (resolved depth-stably from the root job) and synthesizes an answer to *that
+  goal* — reconciling child conflicts and flagging gaps — instead of a generic
+  "decide the next step." Termination semantics are unchanged.
+- **feat(workflow): deps[] as dataflow** (#419) — a dependent leg can now receive
+  its succeeded upstream dependencies' results (decision, summary, PR, changes,
+  artifact body) injected into its prompt, so legs build on each other instead of
+  only knowing a dep *finished*. Opt-in via
+  `[orchestrate].inject_upstream_dep_context` (default off; flag-off output is
+  byte-identical).
+- **docs(orchestra): verifier delegation pattern + built-in template** (#421) — a
+  new built-in `verifier` coordinator recipe for **independent** (different-model,
+  read-only) checking of delegated work against the goal, generalizing the
+  decompose-and-verify verify leg. Cross-evaluation beats self-grading; documented
+  in both doc trees.
+- **feat(workflow): result-aware non-progress loop detection** (#339) —
+  delegation trees that perturb the work set each round but produce no new
+  verifiable side effects now trip the loop ladder after a configurable streak
+  (`[orchestrate].max_delegation_non_progress_streak`, default 2), not just the
+  blunt depth cap.
+- **feat(workflow): escalate_human failure_policy** (#340) — a delegation can
+  pause the whole tree durably for a human (`awaiting_human`), @-tag them on the
+  PR/issue + surface it in the dashboard Attention list, and resume via
+  `/gitmoot resume <jobID> retry|continue|abort`. Zero tokens while waiting; a TTL
+  auto-finalizes a never-answered escalation; paused time is excluded from the
+  per-root wall-clock budget.
+- **fix(daemon): pre-flight failures advance the parent DAG** (#409, #413) — a
+  delegation child that fails *before its agent runs* (checkout / branch-lock /
+  permission / etc.) now still advances the parent so its `failure_policy` fires
+  (including `escalate_human`), instead of stranding the tree silently. The
+  checkout guard was also relaxed so a worktree-less delegation child isn't
+  false-failed.
+- **perf(db): index the delegation tree by root_id** (#420) — root-scoped engine
+  lookups now use an indexed `root_id` column instead of full-table scans that
+  re-parsed every job, removing an O(n) cost on every child completion under large
+  trees. Behavior is identical.
+- **refactor(prompts): single-source the gitmoot_result contract** (#422) — the
+  agent JSON contract is generated from the Go structs at build time with a
+  drift-guard test, so the prompt can't silently diverge from the code; the
+  delegation field docs are now complete (15/15 fields).
+
+### Agents & runtimes
+
+- **feat(cli): `gitmoot agent restart`** (#414) — rebind a registered agent to a
+  fresh runtime session **in place** (preserving role / repo / template /
+  capabilities), instead of remove-and-recreate; refuses while a live session or
+  queued/running jobs are in flight.
+- **fix(doctor): accurate Claude auth health** (#414, #427) — `agent doctor`,
+  `gitmoot doctor`, and `plugin doctor` now run a live Claude probe instead of
+  false-failing when only an env token is missing (foreground works via cached
+  credentials), with daemon-aware guidance that background jobs still need a token
+  in the daemon env. The status is `warn` (not a hard fail) when the box is
+  actually authenticated.
+- **feat(cli): record owner PID+host on runtime-session locks** (#425) — so
+  `gitmoot agent restart` (and recovery tooling) can distinguish a live foreground
+  session from a stranded lock.
+- **feat(skillopt): `recover --generation`** (#303) — reclaim a stranded SkillOpt
+  option-generation lock (left by a killed `train continue`) and salvage the
+  already-persisted options; `--advance-state` completes the iteration.
+
+### CLI, setup & comments
+
+- **feat(cli): tagging-ready `gitmoot setup`** (#428) — `setup` now defaults to
+  `--watch-issues`, so `@<agent> ask …` mentions on issues route to jobs out of
+  the box.
+- **feat(workflow): readable findings in posted comments** (#429) — `findings[]`
+  objects render as readable markdown in PR/issue comments instead of raw JSON.
+
+### Release & install
+
+- **ci(release): automated cross-platform releases + linux/arm64** (#412) —
+  release binaries (linux/darwin × amd64/arm64, static, CGO-off) are now built,
+  checksummed (`sha256sums.txt`), and attached by a GitHub Actions workflow on
+  release publish; the one-line installer supports `linux/arm64` (e.g. Raspberry
+  Pi).
+
+## Install / upgrade
+
+- Existing install: `gitmoot update`
+- Fresh install: `curl -fsSL https://gitmoot.io/install.sh | sh`
+
+---
+
+# Source: docs/release-notes/v0.6.0.md
+
+# Gitmoot v0.6.0
+
+A large orchestration release. The Orchestra delegation engine gains an
+engine-level `verify` rule, structured upstream-dependency context, a mid-run
+human **ask** gate, and actionable preflight errors. The daemon gains an
+off-by-default outbound **event stream**, a host-global **memory-aware admission
+budget**, and **discoverable same-repo parallel jobs**. Runtimes now **self-heal**
+dead Claude sessions and **fail closed** on implement-without-write. Plus
+event-stream and home-resolution fixes found by a live end-to-end test.
+
+## What's new since v0.5.2
+
+### Orchestration engine — the delegations DAG
+
+- **feat(workflow): engine-level `verify` synthesis_rule + bounded verify→replan** (#439) —
+  a new `verify` synthesis rule lets the engine itself derive a pass/fail verdict
+  from a verification leg's children and, on failure, enqueue a **bounded
+  verify→replan corrective continuation** instead of dead-ending. Bounded by a new
+  `[orchestrate].max_verify_replan_attempts` cap (default 2); on exhaustion it
+  routes to the graceful finalize continuation. The verify→replan loop is now
+  enforced by the engine, not left to the coordinator.
+- **feat(workflow): structured upstream-dependency context manifest** (#438) —
+  `deps[]` dataflow now carries a structured manifest of upstream sibling results
+  (decision, summary preview, changes count, PR link, artifact path, derived-from)
+  into a child's prompt, instead of only inlined text — so a child can reference
+  upstream outputs precisely. The manifest write is atomic (no torn reads under the
+  parallel read-only fan-out).
+- **feat(workflow): mid-run non-failure "ask" decision gate** (#445) — a healthy
+  job can return `human_questions[]` to **pause the tree at `awaiting_human`**
+  without failing a leg; a human answers on the PR with
+  `/gitmoot resume <job> answer "<id>: ..."` and the answer is injected into the
+  coordinator continuation. It reuses the `escalate_human` pause + TTL machinery
+  and is budget-neutral. (The `answer` resume verb sits alongside the existing
+  `retry`/`continue`/`abort`.)
+- **feat(workflow): actionable delegation preflight errors + corrective continuation** (#451) —
+  a fan-out that names a runtime instead of a registered agent no longer
+  terminal-blocks the coordinator; it produces an actionable preflight error and a
+  corrective continuation so the coordinator can fix and proceed. A
+  `delegation preflight failures: N` line is surfaced in `daemon status`.
+
+### Daemon
+
+- **feat(daemon): same-repo parallel jobs made discoverable** (#444) — requesting
+  multiple workers now actually delivers parallelism. `--workers > 1` with an unset
+  scheduler **auto-selects `--scheduler pool`** (a behavior change only when you
+  asked for multiple workers; the single-worker default is unchanged, and explicit
+  `--scheduler barrier` always forces the old per-tick behavior). A new
+  `--parallel N` convenience flag sets workers + pool together. `daemon status`
+  reports `scheduler: <barrier|pool>, workers: <n>`, and a preflight warning logs
+  the exact relaunch command when ≥2 parallelizable jobs (distinct runtime
+  sessions) meet a serializing config. A new "Run jobs in parallel on a repo" guide
+  covers the two serialization layers (checkout lock + `runtime:<runtime>:<ref>`
+  session lock).
+- **feat(daemon): host-global, memory-aware admission budget (off by default)** (#365) —
+  an opt-in `[admission]` budget caps total in-flight agent **sessions** and the
+  summed **per-runtime RAM** estimate across all repos in the daemon process, on
+  top of `--workers`/scheduler and the per-repo locks. A job is admitted only if it
+  fits **both** caps; one that doesn't is left queued and retried, never failed.
+  Both caps default to 0 (disabled) — scheduling is byte-identical to no
+  `[admission]` section.
+
+### Outbound events
+
+- **feat(events): off-by-default outbound event stream + EventSink seam** (#446) —
+  a stable, **versioned JSON event contract** (`job.finished` / `job.failed` /
+  `job.blocked` / `job.needs_attention`) emitted over a webhook when
+  `[events].webhook_url` is set. Off by default, best-effort (a slow or dead
+  consumer never blocks or fails a job), with secret + absolute-path redaction.
+  Closes the "local-only, no remote control plane" gap — a Telegram/herdr bridge,
+  dashboard, or future mobile monitor can subscribe without polling. (The ask-gate
+  pause above rides this as a `job.needs_attention` event.)
+
+### Runtimes & sessions
+
+- **feat(runtime): self-heal dead Claude `--resume` sessions** (#443) — a
+  background agent pinned to a Claude conversation UUID that died on a runtime
+  restart used to fail **instantly, before any work**, with an opaque
+  `delivery failed` error that read like broken auth. It now self-heals with a
+  single bounded retry on a fresh session instead of dead-ending.
+- **feat(cli,runtime): fail closed on implement without a write policy** (#452) —
+  an agent (or ephemeral worker) carrying the `implement` capability while its
+  autonomy policy grants no headless write (`auto`/empty or `read-only`) is now
+  **refused early with actionable guidance** instead of running a whole job and
+  silently writing nothing. The check fires at `agent start`, `agent subscribe`,
+  implement-job dispatch, and ephemeral delegation specs. The docs now carry the
+  full policy → `--permission-mode` mapping.
+
+### Fixes
+
+- **fix(events): the event stream now actually fires** (#458) — the daemon
+  double-resolved the `[events]` config home (reading a phantom
+  `.gitmoot/.gitmoot/config.toml`), so the stream silently never emitted even when
+  configured. Now resolved robustly for both daemon home shapes, side-effect-free.
+  Found by a live end-to-end test (the unit tests had mocked the sink and missed
+  it).
+- **fix(daemon): no more phantom `.gitmoot/.gitmoot`** (#459) — the registered-repo
+  supervisor reused the resolved home for two raw-`--home` helpers
+  (`resolveEscalationTTL` and the supervisor worker's policy read), whose
+  initialization created a doubled home directory. The home convention is
+  normalized and `resolveEscalationTTL` is now side-effect-free (reads config,
+  never initializes).
+
+## Upgrade notes
+
+Two opt-in behavior changes, and only when you've asked for them:
+
+- **`--workers > 1` now auto-selects `--scheduler pool`** (#444). If you run the
+  daemon with multiple workers and rely on `barrier` semantics, add an explicit
+  `--scheduler barrier` to keep the old behavior.
+- **`implement` + a non-write policy is now refused** (#452) with actionable
+  guidance. Use `--policy danger-full-access` for a full headless implement (file
+  writes plus `go`/`git`/`gh` via Bash) or `--policy workspace-write` for
+  edits-only (note: `workspace-write` maps to Claude `acceptEdits`, which does
+  **not** unblock Bash). `read-only`/`ask`/`review` agents are unaffected.
+
+## Install / upgrade
+
+- Existing install: `gitmoot update`
+- Fresh install: `curl -fsSL https://gitmoot.io/install.sh | sh`
+
+---
+
+# Source: docs/release-notes/v0.7.0.md
+
+# Gitmoot v0.7.0
+
+The complete **automatic template-optimization loop** for SkillOpt, plus
+runtime-reliability and orchestration improvements. Agent templates can now
+self-improve from real usage — feeding the existing `gitmoot-skillopt` optimizer,
+with **no weight training** and **manual promotion preserved**. Every new SkillOpt
+capability is **off by default** and additive.
+
+Pairs with **gitmoot-skillopt v0.4.0** (the judge's trajectory digest and the
+live-pairwise producer ship there).
+
+## What's new since v0.6.0
+
+### SkillOpt — automatic template optimization (new, off by default)
+
+- **Mode A — outcome harvest** (#465, #468) — verifiable job outcomes (PR merged
+  vs blocked, external CI, review decision, fix-round count) become auto-trace
+  feedback for the template version that produced them. **Automatic revert
+  detection** flips an earlier positive when a merged PR is later reverted (#467),
+  and **deterministic tool checkers** (dupl/jscpd/golangci-lint/gocyclo/diff-size)
+  add objective `[0,1]` dimensions that the LLM can't game (#485).
+- **Cross-family review signal** (#469, #470) — a reviewer from a *different model
+  family* scores quality **and scope-fidelity** (intended scope vs actual diff) as a
+  soft, secondary signal; the verifiable outcomes stay the floor.
+- **Mode B — champion/challenger** (#473) — a Thompson-sampling Beta-Bernoulli
+  bandit + a `gitmoot skillopt ab` command, **live-traffic A/B interception** for
+  ask agents on a sampled fraction (#482), and a **cross-family LLM-judge
+  auto-pairwise** that records evidence without touching the bandit (#483).
+- **Promotion** (#471, #472) — configurable auto-promote with a **confidence
+  guardrail** and `candidate.*` notifications; **promotion canary + auto-rollback**
+  (#484) routes a sampled fraction of traffic to a canary version and rolls back via
+  the existing rollback API if it regresses over a bounded window.
+- **Judge hardening (epic #344)** — a cross-family **judge jury** with
+  median / majority / minority-veto aggregation + a disagreement flag (#349); and
+  **live pairwise** evaluation — the fork emits a blinded paired review packet and
+  `gitmoot skillopt pairwise import` ingests it into canonical feedback (#508),
+  unblinding each pick to champion/challenger.
+
+### Runtime reliability
+
+- **Claude transient-401 retry** with exponential backoff for the intermittent
+  "socket connection closed" error under sustained concurrency (#487, #509).
+- **Bounded re-ask loop on malformed agent output** instead of a hard failure
+  (#495).
+- **More reliable read-only `agent ask`** — no implement-guard block, clearer
+  timeout (#496).
+
+### Orchestration & dashboard
+
+- **`--recipe` flag** for deterministic fan-out (#477).
+- **Delegation worktree + branch cleanup** (#492); **job-kill releases stranded
+  locks** and terminalizes orphaned queued children (#491).
+- **Dashboard `active_jobs` view** — in-flight jobs surfaced in the interactive TUI
+  Activity page (#505).
+
+### Tests
+
+- Full-chain end-to-end tests: the **canary lifecycle** (#504), the **Mode A
+  harvester** (#465), and a **cross-repo pairwise round-trip** validating the fork
+  producer ↔ Go importer contract (#514).
+
+## Upgrade notes
+
+No breaking changes. Every new SkillOpt feature is off by default (a nil/false
+config knob ⇒ byte-identical behavior) and promotion stays manual unless you opt in.
+
+## Install / upgrade
+
+- Existing install: `gitmoot update`
+- Fresh install: `curl -fsSL https://gitmoot.io/install.sh | sh`
+
+---
+
+# Source: docs/release-notes/v0.8.0.md
+
+# Gitmoot v0.8.0
+
+A reliability-and-features release. The headline is **daemon hardening** for
+lights-out operation, plus two new opt-in features. Everything new is additive
+and off by default.
+
+## What's new since v0.7.0
+
+### Daemon reliability (lights-out operation)
+
+- **Singleton guard for `daemon run`** (#550) — a stray or second daemon launched
+  on the same home is now **refused** (`daemon already running with pid …`) instead
+  of silently coexisting and racing the SQLite store. Detection uses a real
+  owner-pid liveness check, so a stale pidfile from a dead daemon still allows a
+  clean restart. (Follow-up #556 tracks a `flock` backstop for the rare
+  simultaneous-launch window.)
+- **Bounded supervisor reclaim scan** (#549) — the ~1s worker tick no longer
+  re-scans the entire jobs table (and every job's event history) each tick. The
+  scan is now proportional to in-flight work, ending the per-second CPU core-burn
+  that long-lived daemons accumulated.
+- **Reconcile a task wedged by a closed duplicate PR** (#543) — a task no longer
+  gets stuck in `reviewing` pointing at stale open-PR state; it detects a merged
+  sibling PR on the branch and finalizes (releasing the branch lock + worktree),
+  instead of re-surfacing completed work to a human.
+
+### Contributor reliability fixes (unattended operation)
+
+- Clear stale read-only delegation worktrees on manual retry so a retry doesn't
+  die on a deleted checkout (#544).
+- Council/external-owned PRs can skip Gitmoot's native merge gate — fail-closed
+  (Gitmoot abstains, never a gateless merge), off by default (#545).
+- **Kimi split into two runtimes** — the default `kimi` runtime is unchanged
+  (kimi-code: no `--print`, structured `stream-json`), and the older CLI is an
+  opt-in `kimi-cli` runtime for hosts that need it (#546), with cross-family review
+  treating `kimi-cli` as the kimi family (#561).
+- Generic, off-by-default `[orchestrate]` delegation-timeout defaults — no private
+  naming conventions in core (#548).
+
+### New features (opt-in, off by default)
+
+- **GitHub-backed agent templates** (#476, MVP) — `gitmoot agent template export`
+  writes your custom templates to files, and `gitmoot agent template add <id>
+  --from-repo <owner/repo>` restores one on another machine. Back up and move
+  templates across machines via GitHub. (Publish/bulk-pull/config remote are
+  follow-ons.)
+- **Agent heartbeat schedules** (#533, MVP) — an `[agents.<agent>.heartbeats.<name>]`
+  config section runs an agent on a recurring schedule (e.g. a daily stale-PR
+  sweep), reusing the existing job/worker path. Restart-safe (never double-fires),
+  missed-tick-coalescing, and byte-identical when no heartbeat is configured.
+
+## Upgrade notes
+
+No breaking changes. The new daemon behavior is automatic; the two new features are
+opt-in. Re-launching a daemon on the same home is now refused (intended) — stop the
+existing one first, or use a different `--home` for a genuinely separate daemon.
+
+## Install / upgrade
+
+- Existing install: `gitmoot update`
+- Fresh install: `curl -fsSL https://gitmoot.io/install.sh | sh`
+
+---
+
+# Source: docs/release-notes/v0.8.1.md
+
+# Gitmoot v0.8.1
+
+The daemon becomes **tunable without restarts** — and restarts become **safe**.
+This release closes the #559 footgun end-to-end, hardens job recovery, and ships
+the first version of the web dashboard. Everything new is additive; defaults are
+unchanged.
+
+## What's new since v0.8.0
+
+### Tune the daemon live (#559, closed)
+
+- **Per-repo concurrency** (#576) — cap one repo's parallelism from config,
+  without restarting the shared daemon:
+
+  ```toml
+  [repos."owner/repo"]
+  max_parallel = 1
+  ```
+
+  Repos without a section keep the global `--workers`/`--parallel` behavior. The
+  old "relaunch with `--parallel N`" hint now points at this knob instead of a
+  destructive restart.
+- **Warm SIGHUP reload** (#577) — `kill -HUP <daemon-pid>` re-reads `[daemon]`
+  config and applies `workers`/`scheduler`/`poll` to the **running** daemon: no
+  teardown, no dropped in-flight jobs, no environment re-inheritance. The live
+  worker limit is picked up on the next dispatch pass. Explicit launch flags stay
+  pinned across reloads.
+- **Runtime auth survives restarts** (#578, hardened by #588) — the daemon
+  persists its Claude token to an owner-only `0600` file and a `daemon restart`
+  from a token-less shell recovers it automatically. Recovery is restart-only (a
+  deliberately token-less `daemon start` won't resurrect it), a recovered token
+  is flagged as possibly stale/revoked (verify with `gitmoot doctor`, which live-
+  probes validity), and `daemon stop --forget-runtime-auth` invalidates it.
+- **Loud auth-drop warning** (#581) — if a (re)start would still come up without
+  Claude auth, the daemon says so at start time instead of failing jobs silently
+  hours later. `--repo` on `daemon run`/`start` is documented accurately: it
+  scopes the daemon to that single repo (polling + job claims); omit it to
+  supervise every enabled repo.
+
+### Daemon reliability
+
+- **Worker loops survive transient errors, escalate persistent ones** (#555) — a
+  single failing tick no longer kills the supervisor, while a persistent infra
+  fault (disk full, corrupt store) still escalates to systemd instead of spinning
+  silently. Polls are time-bounded so a wedged poll can't hold the checkout lock
+  forever.
+- **Stale-running recovery: configurable + #536-safe** (#560) — the recovery
+  window is tunable (`GITMOOT_STALE_RUNNING_AFTER`; the smallest honored value
+  is 1m — below-1m/malformed values fall back to the 30m default), recovery is
+  prompt at lease expiry, and runtime leases now carry a teardown grace margin so
+  a live worker finishing up can never be requeued onto its own dirty worktree.
+- **`--watch-issues` polling no longer burns a core** (#566) — per-issue comment
+  pagination collapses into one `since=`-bounded repo-wide call per repo per
+  tick; unchanged repos cost almost nothing.
+- **See why a job is stuck** (#552) — `job list`/`job show` surface a concise
+  reason for queued/blocked jobs (lock wait, retry schedule, auth) and `doctor`
+  validates runtime auth proactively.
+
+### Web dashboard (#503)
+
+- `gitmoot dashboard --web` serves a live orchestration view: the delegation
+  graph with real node timing, run summaries, prompt/output inspection, and an
+  auto-refreshing run list.
+
+### Templates & heartbeats, finalized
+
+- **GitHub-backed templates** (#476) — `agent template publish`, bulk `pull`,
+  `[template_remote]` default config, and `diff` against the pulled source
+  complete the backup/share round-trip started in v0.8.0.
+- **Heartbeat schedules** (#533) — write-side CLI (`agent heartbeat
+  add/list/enable/disable/remove`), the `review` action (fixed end-to-end by its
+  own E2E), and per-heartbeat observability.
+
+### Verification
+
+- Mutation-proven full-chain E2Es now cover the template round-trip, the live
+  heartbeat loop, restart auth warning/recovery, warm reload, and per-repo caps
+  (#567 #568 #581 #591 #592 #593). The CI race step is explicitly bounded (#573).
+
+Thanks @gaijinjoe — the wedged-worker and stale-recovery fixes build directly on
+his PRs (#555, #560), co-authored.
+
+---
+
 # Source: skills/gitmoot/SKILL.md
 
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, jobs, branch locks, agent-templates, template capture, custom prompt agents, and Codex, Claude Code, or Kimi Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, event webhooks, the web dashboard, per-job runtime overrides, and Codex, Claude Code, or Kimi Code runtime workflows.
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
-  gitmoot-version: "0.4.2"
+  gitmoot-version: "0.8.1"
   source: "jerryfane/gitmoot"
 ---
 
@@ -5649,6 +7041,9 @@ Use `gitmoot agent template draft <id>` for a blank scaffold,
 `gitmoot agent template validate <file>` for a structural check,
 `gitmoot agent template add <id> --file <file>` to install a snapshot, and
 `gitmoot agent prompt <id>` to reuse the installed template in the current chat.
+"Publish", "back up", or "pull" agent templates means the GitHub-backed
+`gitmoot agent template export/publish/pull/remote set` commands — see CLI.md
+§ Agent Templates.
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
@@ -5656,11 +7051,15 @@ same Codex, Claude, or Kimi session, and branch locks protect implementation
 ownership.
 The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
+To restart the daemon without losing its Claude token, use
+`gitmoot daemon restart` (not stop + start); see CLI.md § Repo And Daemon
+Status for the runtime-auth persistence model.
 
 For Gitmoot health or status questions, first use the injected SessionStart
 snapshot when it is present and sufficient. If more detail is needed, run the
 relevant read-only Gitmoot CLI checks and answer directly from the results.
-Mention `gitmoot dashboard` only after that answer, as a live monitoring
+Mention `gitmoot dashboard` (or `gitmoot dashboard --web` for a browser view of
+a running orchestration) only after that answer, as a live monitoring
 follow-up. Do not start daemons, create agents, change subscriptions, update
 templates, or release locks unless the user asks for that action.
 
@@ -5957,6 +7356,7 @@ curl -fsSL https://gitmoot.io/install.sh | sh
 gitmoot version
 gitmoot update --check
 gitmoot update --restart-daemon
+gitmoot doctor [--repo <path>]
 ```
 
 Verify GitHub access before PR workflows:
@@ -5964,6 +7364,27 @@ Verify GitHub access before PR workflows:
 ```sh
 gh auth status
 ```
+
+`gitmoot doctor` is the environment preflight: it validates `gh auth` (with an
+actionable remediation hint) and the runtime credentials — including a
+daemon-aware live probe of the Claude token — so a bad credential is caught
+before jobs stall. Run it after install and before starting the daemon.
+
+One-shot onboarding: `gitmoot setup` registers the repo and an agent in one
+command (`--repo owner/repo --agent <name> --runtime codex|claude|shell
+--session <ref> [--role <role>] [--path .] [--start-daemon]`). `--repo`,
+`--agent`, `--runtime`, and `--session` are all **required** — setup errors out
+if any is missing; `--session` takes a runtime session reference, `last`, or a
+shell command.
+`--watch-issues` is **on by default** in setup, so the daemon comes up
+tagging-ready for `@<agent>` issue mentions.
+
+Home and config: local state lives in the Gitmoot home (default `~/.gitmoot`) —
+the SQLite store, `logs/`, `workspaces/`, `evals/`, `artifact_blobs/`, and
+`config.toml`. `gitmoot init` creates it, `gitmoot config path` prints the
+config file location, and `gitmoot config show` prints the effective config.
+Set `GITMOOT_HOME` (or pass the global `--home <path>` flag, accepted by nearly
+every command) to relocate everything — useful for isolated test homes.
 
 ## Runtime Plugins
 
@@ -6001,41 +7422,57 @@ snippet with `--config-snippet`.
 ```sh
 gitmoot status --repo owner/repo
 gitmoot events --repo owner/repo
-gitmoot daemon start --repo owner/repo --poll 30s --workers 1
-gitmoot daemon start --repo owner/repo --session <root-job-id>
+gitmoot repo add owner/repo --path <path> [--poll 30s]
+gitmoot repo list
+gitmoot repo remove owner/repo
+gitmoot repo doctor owner/repo
+gitmoot daemon start --poll 30s --workers 1
+gitmoot daemon start --session <root-job-id>
 gitmoot daemon start
 gitmoot daemon status
 gitmoot daemon logs
-gitmoot daemon stop
+gitmoot daemon restart
+gitmoot daemon stop [--forget-runtime-auth]
 ```
 
 For structured local state, use `gitmoot dashboard --json` or
 `gitmoot task list --repo owner/repo --json`. `gitmoot status --json` and
 `gitmoot task show` are not valid commands.
 
+The `gitmoot repo` commands manage the **watched-repo registry**: one daemon
+per Gitmoot home supervises every **enabled** registered repo (each with its
+own `--poll` interval). `repo doctor owner/repo` checks a single repo's
+checkout/config health.
+
 Use `daemon start` for the background daemon. Use `daemon run` only when the
 user explicitly wants a foreground process. Keep the default `--workers 1`
 unless the Gitmoot home has multiple independent runtime sessions or managed
 agent types with `max_background` greater than one.
 
-`daemon start --repo owner/repo` scopes the background daemon to a single repo:
-it only polls and runs jobs for that repo. `daemon start` with no `--repo` still
-supervises every enabled repo in the Gitmoot home.
+`daemon start --repo owner/repo` **scopes** the daemon to a single repo: it
+polls only that repo's PRs and claims only that repo's queued jobs. Omit
+`--repo` to supervise every enabled registered repo from one daemon (#581). Do
+not start one daemon per repo on the same home expecting parallel isolation: a
+second daemon on the same home is **refused** (`daemon already running with pid
+…`; a stale pidfile from a dead owner is liveness-checked, so restarts work
+cleanly). To cap one repo's parallelism on a shared (no-`--repo`) daemon, use
+the per-repo config keys below instead.
 
 Both `daemon run` and `daemon start` accept `--session <root-job-id>` (alias
 `--root`) to pin the worker to one orchestration run. With `--session` set, the
 worker runs only jobs whose `root_job_id` matches that value plus the root
-coordinator job itself, and ignores every other queued job. `--session` composes
-with `--repo` (AND): a job must match both filters to run. Leaving both empty
-keeps the default behavior of matching all enabled repos and all jobs.
+coordinator job itself, and ignores every other queued job. Leaving it empty
+keeps the default behavior of matching all jobs.
 
-Both `daemon run` and `daemon start` also accept two opt-in flags (both off by
+Both `daemon run` and `daemon start` also accept three opt-in flags (all off by
 default, so leaving them unset is byte-identical to before): `--watch-issues`
 watches open **issues** for `@<agent> ask …` mentions and routes them to jobs,
 mirroring the PR-comment watcher; `--scheduler pool` selects the continuous
 worker-pool scheduler that re-queries the queue as workers free and auto-isolates
 a contended same-repo read job into an ephemeral worktree (fixing a same-repo
-dependent-job deadlock), versus the default `--scheduler barrier`.
+dependent-job deadlock), versus the default `--scheduler barrier`;
+`--watch-skillopt-reviews` polls watched SkillOpt review issue comments and
+imports valid feedback automatically (see the SkillOpt Exchange section).
 
 To run a repo's queued jobs N-wide, use `--parallel N` (sugar for `--workers N
 --scheduler pool`; it cannot be combined with `--workers` or `--scheduler`).
@@ -6047,13 +7484,47 @@ the daemon logs a preflight warning — with the exact relaunch command — when
 parallelizable jobs are queued under a serializing config. Same-repo parallelism
 is bounded by **distinct runtime sessions** as well as distinct checkouts.
 
+One repo's concurrency can also be capped **from config, without any relaunch**
+(#576): a `[repos."owner/repo"]` section with `max_parallel = N` caps that
+repo's in-flight jobs (`0` or unset = use the global worker count), and an
+optional `scheduler = "pool"|"barrier"` overrides that repo's scheduler. The
+keys are re-read every tick, so edits apply live.
+
+Reconfigure the running daemon without a restart: `kill -HUP <daemon-pid>`
+re-reads the `[daemon]` config section (`poll`, `workers`, `scheduler`,
+parallelism) live (#577) — no teardown, no dropped jobs, no environment
+re-inheritance. Values pinned by explicit launch flags win over the re-read
+config. Prefer SIGHUP over a restart when only tuning throughput.
+
+Runtime auth across restarts (#578/#588): the daemon persists its Claude token
+into an owner-only (0600) `daemon-runtime.env` file in the Gitmoot home.
+`gitmoot daemon restart` recovers that token even when the invoking shell lacks
+`CLAUDE_CODE_OAUTH_TOKEN`; a plain `daemon stop` + `daemon start` does **not**
+recover it (start re-inherits the launching shell's environment). A recovered
+token may be stale — verify with `gitmoot doctor`. A (re)start that would come
+up without Claude auth warns loudly on stderr (non-fatal). `gitmoot daemon stop
+--forget-runtime-auth` deletes the persisted file so a later restart cannot
+recover the token.
+
+An opt-in, off-by-default `[admission]` config section adds a host-global
+concurrency budget the daemon applies **before** starting each agent session,
+on top of `--workers`/pool and the per-repo locks (#365):
+`max_concurrent_sessions` caps total in-flight sessions across all repos, and
+`max_memory_gb` caps the summed per-runtime RAM estimate (tunable priors:
+`codex_memory_gb`, `claude_memory_gb`, `kimi_memory_gb`, `default_memory_gb`).
+With both caps `0` (the default) it is disabled. A job that does not fit is
+left **queued** and retried next tick — never failed — so on a small host
+"jobs stay queued" can mean the admission budget is holding them. The budget is
+enforced per daemon process.
+
 `gitmoot dashboard` shows local state — daemon health, repos, agents and runtime
 sessions, jobs by state, worktrees, branch locks, SkillOpt train phase/candidate,
 and pending interactive prompts.
 
 On a real terminal (stdin and stdout both a TTY) and with no other output/mutation
 flag, `gitmoot dashboard` launches an **interactive TUI**: a sidebar of pages
-(Attention, Trains, Agents, Runtime sessions, Jobs, Locks) that auto-refreshes.
+(Attention, Activity, Trains, Agents, Workers, Jobs, Locks, Health, Config)
+that auto-refreshes.
 Navigate with `tab`/`shift+tab` or `←/→`; `↑/↓` selects a row; `?` opens a
 per-page key reference; `r` refreshes, `q` quits. The TUI is the cockpit — every
 page can act, and each action runs the same store/workflow code as its CLI
@@ -6063,6 +7534,10 @@ equivalent:
   actual blocked/failed/cancelled jobs with their latest event message
   (`enter` detail, `R` retry, `B` report bug). A red banner appears when the
   daemon is stopped; `s` restarts it with its previously persisted flags.
+- **Activity** shows the **live orchestras**: each active delegation root with
+  its children, so "what are my agents working on right now" is answered at a
+  glance; `enter` opens the request/result detail of a root or a specific
+  delegate.
 - **Trains** lists every train session: `enter` opens ANY session's live phase
   view (not just the newest), `s` stops a live session (a reason is required;
   same path as `skillopt train stop`), `d` deletes a finished session and its
@@ -6093,6 +7568,10 @@ equivalent:
   owning process died; a running daemon reclaims them automatically); active
   locks collapse to a count. Branch locks are released with
   `gitmoot lock release owner/repo <branch> --owner <agent>`.
+- **Workers** lists runtime workers (agent sessions). **Health** shows the
+  daemon block (running state, persisted flags, log error tail) plus
+  environment checks. **Config** renders the effective config with inline
+  edits for scalar fields (or `$EDITOR` for the full file).
 
 Form questions are also published as interactive prompt records, so an agent can
 answer them with `gitmoot interactive answer` while the form is open. Inline
@@ -6112,12 +7591,45 @@ gitmoot dashboard --answer <prompt-id> --value <value>
 gitmoot dashboard --dismiss <prompt-id>
 gitmoot dashboard --watch          # plain redraw until Ctrl-C (terminal only)
 gitmoot dashboard --watch --interval 2s
+gitmoot dashboard --web [--addr 127.0.0.1:8080]
 ```
+
+`gitmoot dashboard --web` serves the **read-only web dashboard** (a live
+orchestration/delegation graph with run summaries and prompt/output inspection)
+until interrupted; `--addr` sets the listen address (default
+`127.0.0.1:8080`). Use it when the user wants a browser view of a running
+orchestration.
 
 In the one-shot styled output the dashboard leads with a "needs attention" block,
 colors and truncates long lists, and groups near-identical runtime sessions;
 `--all` shows everything. `--watch` redraws on an interval (default 5s) and cannot
 be combined with `--json`, `--answer`, or `--dismiss`.
+
+## Event Stream (Webhooks)
+
+To notify an external system when jobs finish, configure the off-by-default
+`[events]` section in the Gitmoot config — it is **not** in the generated
+default config, so this documentation is its discovery surface:
+
+```toml
+[events]
+webhook_url = "https://example.com/gitmoot-events"  # empty (default) = OFF
+timeout = "2s"                                       # per-POST timeout
+# socket_path = ""                                   # reserved, unused today
+```
+
+With `webhook_url` set, Gitmoot POSTs a small, versioned (`schema_version = 1`),
+redacted JSON event to that endpoint for: `job.finished`, `job.failed`,
+`job.blocked`, `job.needs_attention` (an `escalate_human` pause),
+`job.deferred`, and the SkillOpt candidate events
+(`candidate.awaiting_promotion`, `candidate.auto_promoted`,
+`candidate.canary_started`, `candidate.rolled_back`). Delivery is best-effort
+(bounded buffer + timeout; drops are recorded as a local `event_sink_drop` job
+event, never blocking the job). Consumer rule: **`job.failed` followed by
+`job.deferred` for the same job id is NOT terminal** — the daemon classified the
+failure as a retryable operational blocker and will re-dispatch it; treat only
+a `job.failed` with no subsequent `job.deferred` as final. See `docs/events.md`
+for the full contract.
 
 ## Bug Reports
 
@@ -6166,8 +7678,14 @@ gitmoot agent start reviewer \
   --start-daemon
 ```
 
-`--runtime` accepts `codex`, `claude`, or `kimi`. For `kimi`, run `kimi login`
-first and restart the Gitmoot daemon so it inherits the session.
+`--runtime` accepts `codex`, `claude`, `kimi`, or `kimi-cli`. `kimi` is the
+current Kimi Code CLI (the default choice); `kimi-cli` is the opt-in legacy
+Kimi CLI adapter (#546) — the two are the same runtime *family* for
+cross-family review purposes. For either, run `kimi login` first and restart
+the Gitmoot daemon so it inherits the session. `agent subscribe` additionally
+accepts `--runtime shell`, the deterministic no-LLM adapter whose `--session`
+is a **command** (the job prompt arrives as `$1`; stdout must carry the
+`gitmoot_result` envelope) — the workhorse for deterministic E2E tests.
 
 `agent start`, `agent subscribe`, and `agent type set` accept an optional
 `--model <name>` flag that sets the agent's default runtime model. It is a
@@ -6206,9 +7724,17 @@ gitmoot agent subscribe reviewer \
   --capability ask \
   --capability review \
   --model gpt-5-codex
+
+# Deterministic shell runtime: the session is a command, not a session id.
+gitmoot agent subscribe stub-agent \
+  --runtime shell \
+  --session '/path/to/answer.sh' \
+  --repo owner/repo \
+  --role agent \
+  --capability ask
 ```
 
-Inspect agents:
+Inspect and manage agents:
 
 ```sh
 gitmoot agent list
@@ -6216,7 +7742,15 @@ gitmoot agent show reviewer
 gitmoot agent show reviewer --json
 gitmoot agent repos reviewer
 gitmoot agent doctor reviewer
+gitmoot agent restart reviewer
+gitmoot agent remove reviewer
 ```
+
+`gitmoot agent restart <name>` abandons the agent's runtime session and binds a
+fresh one **in place** — the fix for a dead or stranded session that would
+otherwise tempt a re-register. It refuses while the session is live or the
+agent has in-flight jobs (finish or cancel those first). `gitmoot agent remove
+<name>` unregisters the agent.
 
 Delegate to a registered agent from the current local chat:
 
@@ -6238,6 +7772,32 @@ overriding the agent's configured default. It is a free-form, runtime-scoped
 string (a Codex, Claude Code, or Kimi Code model name) with no allow-list; an
 omitted `--model` leaves the agent's default model in effect. Both `--model X`
 and `--model=X` are accepted.
+
+The same commands accept an optional per-job `--runtime
+codex|claude|kimi|kimi-cli|shell` override: that ONE job runs through the named
+runtime while the agent's registered default runtime stays untouched (`agent
+show` is unchanged afterwards). An overridden job never resumes — and never
+writes back to — the agent's default-runtime session: it runs on a fresh
+session of the override runtime, or on an explicit `--session <ref>` (a
+Codex/Claude session id, a Kimi session id, or — required for `shell` — a
+command; `last` is rejected because it resumes whichever session is most
+recent rather than a concrete one), and its runtime-session lock names the
+override runtime so it cannot collide with the default session's lock. Model
+rule: `--model` combined with `--runtime` is interpreted for the OVERRIDE
+runtime; an override without `--model` uses the override runtime's default
+model — the agent's configured default model is never applied to a different
+runtime. An unknown
+`--runtime` fails before any job is enqueued, background (daemon) jobs honor
+the override identically to foreground, and a coordinator's delegation-tree
+continuations (synthesis, corrective, replan, finalize) inherit the override,
+so an `orchestrate --runtime` tree stays on the override runtime across
+generations:
+
+```sh
+# Retry a hard review through Claude without re-registering the reviewer:
+gitmoot agent review reviewer --repo owner/repo --pr 123 "Re-review this PR." --runtime claude
+gitmoot agent ask reviewer "Compare the approaches." --repo owner/repo --runtime kimi --model kimi-k2
+```
 
 `gitmoot orchestrate`, `agent run`, and `agent implement` also accept an optional
 `--skip-native-review-fanout` flag. By default an `implement` job that opens a
@@ -6269,14 +7829,25 @@ gitmoot orchestrate project-planner "Plan and split this work across agents." --
 gitmoot orchestrate project-planner "Plan and split this work." --repo owner/repo --model gpt-5-codex
 ```
 
-The built-in coordinator recipes `review-panel` and `decompose-and-verify` are
-orchestrate-ready: each runs a coordinator that fans work out to ephemeral
-workers and reconvenes them in a continuation, with no agent pre-registration:
+The built-in coordinator recipes `review-panel`, `decompose-and-verify`, and
+`verifier` run a coordinator that fans work out to ephemeral workers and
+reconvenes them in a continuation, with no agent pre-registration. The primary
+invocation is the `--recipe` flag (also accepted on `agent run`), which routes
+**any existing coordinator agent** through the named built-in recipe prompt
+without changing the agent's identity or registration:
 
 ```sh
-gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
-gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
+gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
+gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify
+gitmoot orchestrate project-planner "Implement the rate limiter and prove it works." --repo owner/repo --recipe verifier
 ```
+
+The bare `gitmoot orchestrate <recipe-id> "..."` form also works, but the
+positional argument must resolve to a **registered agent** (or configured
+managed type) — so it requires an agent registered under the recipe name
+(e.g. after `agent template update review-panel` + `agent start review-panel
+--template review-panel …`). On a fresh install without that registration it
+fails with "agent not found"; prefer `--recipe`.
 
 `gitmoot orchestrate <agent> "..." [--repo R]` is sugar for
 `gitmoot agent run <agent> --background "..."`. It starts a conductor
@@ -6308,6 +7879,22 @@ gitmoot agent gc
 
 `agent type set --model <name>` (or `[agents.<type>].model` in config) sets the
 default runtime model for that managed agent type.
+
+Schedule recurring agent work (heartbeats, off by default):
+
+```sh
+gitmoot agent heartbeat add repo-maintainer daily-status \
+  --repo owner/repo --interval 24h --prompt "Daily status report." --enabled
+gitmoot agent heartbeat list
+gitmoot agent heartbeat show repo-maintainer daily-status
+gitmoot agent heartbeat enable|disable repo-maintainer daily-status
+gitmoot agent heartbeat remove repo-maintainer daily-status
+```
+
+A heartbeat enqueues a normal background job on its `interval` (read-only `ask` or
+`review` action; `review` needs the agent's `review` capability). `gitmoot daemon
+status` surfaces each schedule's last-run/next-due/last-status. See
+`docs/heartbeats.md` for the full reference.
 
 A registered single instance **shadows** a managed type of the same name:
 dispatch resolves `gitmoot agent <name>` to a registered single instance before a
@@ -6343,15 +7930,16 @@ gitmoot agent start project-planner \
 ```
 
 Install or refresh the built-in coordinator recipe templates. These are
-coordinator prompts for the Orchestra pattern, run with `gitmoot orchestrate`
-rather than started as long-lived agents:
+coordinator prompts for the Orchestra pattern, run with `gitmoot orchestrate
+<agent> "..." --recipe <id>` (no re-registration needed) rather than started as
+long-lived agents:
 
 ```sh
 gitmoot agent template update review-panel
 gitmoot agent template update decompose-and-verify
 gitmoot agent template show review-panel
-gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
-gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
+gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
+gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify
 ```
 
 For fast current-chat planning, use the Gitmoot skill with the same packaged
@@ -6427,6 +8015,29 @@ gitmoot agent template list --tag review --capability ask
 gitmoot agent template show frontend-reviewer
 ```
 
+### Back Up And Share Templates Via GitHub
+
+Templates can be backed up to and pulled from a GitHub repo (#476):
+
+```sh
+gitmoot agent template export [<id>...] [--all] [--to <dir>] [--dry-run]
+gitmoot agent template publish [<id>...] [--all] [--repo <owner/repo>] [--path <subdir>] [--ref <branch>] [--message <msg>] [--create] [--dry-run]
+gitmoot agent template pull [<id>...] [--all] [--repo <owner/repo>] [--ref <ref>] [--path <subdir>] [--dry-run]
+gitmoot agent template add <id> --from-repo <owner/repo> [--ref <ref>] [--path <file>]
+gitmoot agent template remote set <owner/repo> [--ref <ref>] [--path <subdir>]
+gitmoot agent template remote show
+```
+
+`export` writes template `.md` files to a local directory; `publish` commits
+them to a GitHub repo (`--create` creates a missing repo); `pull` installs or
+refreshes templates from that repo; `add --from-repo` installs a single
+template file directly from a repo. `remote set` stores a default remote in the
+`[template_remote]` config section (`repo`; `ref` defaults to `main`; `path`
+defaults to `templates`) so publish/pull/add can omit `--repo`; with no remote
+configured, those commands require an explicit `--repo`. **Caution: templates
+are stored and published VERBATIM (prompt body + metadata) — point the remote
+at a PRIVATE repo unless the prompts are meant to be public.**
+
 ## Goals
 
 Print the standard Gitmoot goal prompt template:
@@ -6466,13 +8077,23 @@ Use GitHub PR comments as the public audit trail:
 /gitmoot retry <job-id>
 /gitmoot cancel <job-id>
 /gitmoot merge
+/gitmoot resume <job-id> retry|continue|abort|answer [instructions]
+@<agent> ask|review|implement [instructions]
 ```
+
+A bare `@<agent> <action> …` mention on a PR comment (or, with the daemon's
+`--watch-issues` flag, an issue comment) is treated as the same command as the
+`/gitmoot <agent> <action>` form (#389). `/gitmoot resume <jobID>
+retry|continue|abort|answer` resumes a delegation tree paused by
+`escalate_human` or an ask-gate `human_questions` pause — see
+`references/RESULT_CONTRACT.md` for the pause/resume semantics (`answer` is
+PR-comment-only).
 
 ## Jobs And Locks
 
 ```sh
-gitmoot job list --repo owner/repo
-gitmoot job show <job-id>
+gitmoot job list --repo owner/repo   # add --json for machine-readable rows
+gitmoot job show <job-id>            # add --json for the full job + why-stuck detail
 gitmoot job watch <job-id>
 gitmoot job events <job-id>
 gitmoot job retry <job-id>
@@ -6488,6 +8109,32 @@ gracefully. In-flight jobs finish normally; the coordinator's next continuation
 is routed through the graceful finalize path (synthesize what completed → stop)
 and the daemon stops starting queued children of that root. See
 `references/SAFETY.md` for how it relates to the other termination bounds.
+
+For a `queued` or `blocked` job, `gitmoot job list` appends a `WHY:` column and
+`gitmoot job show` prints a `why_stuck:` (and, when a lease applies, a
+`next_retry_at:`) line explaining what the job is waiting on — e.g. `waiting on
+runtime session lock runtime:codex:<ref> (held by job <id>)`, `blocked: awaiting
+human`, `auth failing: …`, `throttled: …`, or `retrying: …`. The reason is
+derived from the most authoritative existing signal (the latest reason-bearing
+`job events` entry plus the owning resource lock's lease); a healthy job's output
+is unchanged. `gitmoot doctor` proactively validates `gh auth` (with an
+actionable remediation hint) and the Claude runtime token so a bad credential is
+caught before a job stalls on it.
+
+Operational blockers auto-retry (#532): a delivery failure classified as
+`runtime_auth` or `runtime_quota` does **not** fail the job terminally — the
+daemon re-queues it as **deferred** with a bounded retry budget and a hold
+until the earliest retry time. `gitmoot job show --json` carries the
+`blocker_class` and attempt count, and over the `[events]` stream a
+`job.deferred` follows the `job.failed` (making it non-terminal). So a job that
+"failed then reappeared as queued" is the deferral working, not a bug.
+
+Jobs stuck in `running` are also backstopped: a running job with no lease
+progress past the staleness window (default 30m) is assumed orphaned by a dead
+worker and recovered/re-queued. The window is tunable via the
+`GITMOOT_STALE_RUNNING_AFTER` env var; the smallest honored value is 1m —
+below-1m, malformed, or non-positive values are rejected (with a one-time
+warning) in favor of the 30m default rather than clamped (#560).
 
 `gitmoot job cancel <job-id>` also releases any resource locks the cancelled job
 still owned — including a stranded `runtime:<rt>:<session>` lock left behind when
@@ -6514,6 +8161,7 @@ gitmoot skillopt candidate show <version-id>
 gitmoot skillopt candidate promote <version-id>
 gitmoot skillopt candidate reject <version-id> [--reason text]
 gitmoot skillopt ab <agent> "<prompt>" [--challenger <versionId>] [--pick a|b] [--seed N] [--judge] [--judge-only] [--home path]
+gitmoot skillopt pairwise import <packet-dir> [--packet path] [--secret-map path] [--picks path] [--reviewer name] [--json]
 gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>
 gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id> [--reviewer name]
 gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]
@@ -6525,6 +8173,7 @@ gitmoot skillopt train continue --session <id> [--generator-type skillopt-genera
 gitmoot skillopt train recover --session <id> [--out-root path] [--generation [--abort | --advance-state]] [--json]
 gitmoot skillopt train stop --session <id> --reason <text>
 gitmoot skillopt judge-report [--template <id>] [--home <path>]
+gitmoot skillopt judge agreement [--template <id>] [--home <path>] [--json]
 gitmoot skillopt judge promote --template <id> --task-kind <kind> --file <pkg.json> [--home <path>] [--yes] [--json]
 ```
 
@@ -6612,6 +8261,13 @@ version. `skillopt candidate promote` makes a pending candidate current, while
 `skillopt candidate reject` records an auditable rejection and prevents that
 version from being selected by `@latest`.
 
+`skillopt pairwise import <packet-dir>` ingests a **blinded paired-review
+packet** produced by the gitmoot-skillopt fork (the `pairwise-review.json`
+packet plus its secret map and the reviewer's picks), de-blinds it, and stores
+the pairwise-preference feedback events — the import path for Mode B's
+paired-review evidence. The daemon can also import review-issue feedback
+automatically when started with `--watch-skillopt-reviews`.
+
 At the manual promote/reject gate, Gitmoot records every judge↔human outcome
 into a local store — all four directions: `agree_accept`, `agree_reject`,
 `judge_accept_human_reject` (judge accepts, human rejects — a false positive),
@@ -6627,6 +8283,24 @@ LLM judge is calibrated against human verdicts. It prints a confusion matrix
 buckets (judge soft-score versus the human decision), and per-dimension
 disagreement. Pass `--template <id>` to scope the report to one template, and
 `--home <path>` to read from a non-default Gitmoot home. It is read-only.
+
+`skillopt judge agreement` is the judge↔human agreement measurement harness
+(#344). It joins the stored A/B judge verdicts (`skillopt ab --judge` /
+jury rows) against the human ranked/pairwise feedback on the same
+**comparison**: each `skillopt ab` invocation stamps a shared per-comparison
+token on all of its rows, so repeated A/Bs of one challenger stay separate
+observations (older tokenless rows are excluded and counted as unmeasurable,
+never pooled; internal ties within one comparison are skipped and counted).
+It reports Cohen's κ as the **headline** metric (raw agreement overstates
+judge quality because it does not correct for chance), the raw agreement
+rate, per-human-source and per-juror-family breakdowns, an
+assignment-corrected position-bias audit over judge rows that carry the
+recorded raw a/b pick (`P(pick=a)` stratified by the champion's presented
+position and reported alongside `P(option A = champion)`; undefined when a
+fixed `--seed` pinned the champion to one position), and a summary of the
+candidate-level judge outcomes above. Small samples get a loud warning —
+sample size is the limiter. `--json` emits the machine-readable report. It is
+read-only.
 
 `skillopt judge promote` closes the judge-prompt optimization loop: it applies an
 **accepted** judge-prompt variant (from the judge-prompt optimizer's
@@ -6675,15 +8349,30 @@ validation for final promotion decisions on fresh items.
 
 ## First Repo Setup
 
+The supported one-liner is `gitmoot setup`, which registers the repo and an
+agent in one command (`--watch-issues` defaults on, so the daemon comes up
+tagging-ready). `--repo`, `--agent`, `--runtime`, and `--session` are all
+**required** (setup exits with an error if any is missing); `--session` takes a
+runtime session reference, `last`, or a shell command:
+
+```sh
+gitmoot setup --repo owner/repo --agent reviewer --runtime codex --session last --start-daemon
+```
+
+Or the manual path:
+
 1. Confirm the repo identity and GitHub auth.
-2. Start the daemon for the repo.
-3. Start or subscribe at least one agent.
-4. Verify the agent is healthy before asking PR comments to route jobs.
+2. Run `gitmoot doctor` to validate `gh auth` and runtime credentials before
+   anything can stall on them.
+3. Start the daemon.
+4. Start or subscribe at least one agent.
+5. Verify the agent is healthy before asking PR comments to route jobs.
 
 ```sh
 gh repo view --json nameWithOwner
 gh auth status
-gitmoot daemon start --repo owner/repo
+gitmoot doctor
+gitmoot daemon start
 gitmoot agent start reviewer --runtime codex --repo owner/repo --role reviewer --capability ask --capability review --start-daemon
 gitmoot agent doctor reviewer
 ```
@@ -6967,6 +8656,18 @@ soft-score versus the human decision), and per-dimension disagreement — useful
 to tell whether the LLM judge is well-calibrated against human verdicts before
 you trust it to gate candidates.
 
+`gitmoot skillopt judge agreement [--template <id>] [--json]` extends the
+measurement to the pairwise slice: it joins the A/B judge rows (`skillopt ab
+--judge` / jury) against human ranked/pairwise picks on the same
+**comparison** (each `skillopt ab` invocation stamps a shared per-comparison
+token on all of its rows; older tokenless rows are excluded and counted as
+unmeasurable, never pooled by challenger) and reports Cohen's κ as the
+headline, raw agreement, per-source/per-juror breakdowns, and an
+assignment-corrected position-bias audit (stratified by the champion's
+presented position, reported alongside `P(pick=a)` and
+`P(option A = champion)`; undefined when a fixed `--seed` pinned the champion
+to one position), with a loud small-sample warning. Read-only.
+
 Those captured outcomes feed judge-prompt optimization. The contract carries a
 per-`task_kind` judge prompt
 (`evaluator_profile.judge.config.judge_prompt_templates[task_kind]` +
@@ -7189,10 +8890,22 @@ Low-traffic / bespoke agents (e.g. `researcher`) below `bandit_min_samples` are
 challenger, or no pick captured degrades to the normal single champion answer and
 logs a `live_ab_skipped` job event — the primary ask is never blocked or
 degraded. Each intercepted ask runs the runtime **twice** (the sampled cost), and
-`contract_version` stays `1`. **Promotion stays MANUAL**: live A/B only writes
-feedback + updates the posterior; it never auto-promotes or rolls back a version.
-The cross-family LLM-judge auto-pairwise, canary, and the unattended auto A/B loop
-remain deferred.
+`contract_version` stays `1`. **Promotion stays MANUAL by default**: live A/B
+only writes feedback + updates the posterior; it never auto-promotes or rolls
+back a version on its own.
+
+Canary auto-promotion is a separate, off-by-default policy (#484): with
+`[skillopt].auto_promote_canary = true` **and** `auto_promote_canary_sample`
+set to a fraction in `(0,1]`, a guardrails-pass candidate is promoted to a
+**canary** behind the live champion — the sample fraction is the per-resolution
+probability a job routes to the canary version — and the daemon watches a
+bounded regression window over the canary's harvested verifiable outcomes: on
+parity-or-better it graduates the canary to `current`
+(`candidate.auto_promoted` event); on a **material regression** it
+**auto-rolls-back** (champion stays current, canary rejected,
+`candidate.rolled_back` event). `candidate.canary_started` fires when the
+canary goes live. It fails safe: `auto_promote_canary = true` with an
+unset/invalid sample degrades to notify-only.
 
 Pass **`--judge`** (or set `[skillopt].mode_b_judge_enabled = true`, both **off by
 default**, #483) to ALSO have a **cross-family LLM judge** (a different runtime
@@ -7217,6 +8930,18 @@ Background jobs are scheduled against three distinct resources:
 - runtime session locks keyed as `runtime:<runtime>:<runtime_ref>` for Codex,
   Claude, and Kimi delivery;
 - branch locks for implementation ownership and merge safety.
+
+Delivery is self-healing — a job whose events show one of these errors and then
+a success is working as designed, not flaky:
+
+- **Dead pinned session (#443):** when a Claude `--resume` target no longer
+  exists, delivery retries on a fresh session and re-pins the agent to it.
+- **Transient auth errors (#487/#509):** a transient 401 ("socket connection
+  closed unexpectedly") under concurrency is retried with backoff; the old
+  session is not abandoned.
+- **Malformed output (#495):** an agent reply missing the `gitmoot_result`
+  envelope records a `malformed_output` event and is re-asked with a repair
+  prompt a bounded number of times before failing terminally.
 
 The daemon default is `--workers 1`. Users can raise it when jobs target
 different runtime sessions, managed agent types with `max_background` greater
@@ -7373,8 +9098,12 @@ Coordinator recipes are built-in agent templates that turn the Orchestra pattern
 into one-command workflows. Each recipe is a coordinator prompt that emits a
 `delegations[]` of **ephemeral** workers (no pre-registration), runs them in the
 daemon, then reconvenes their results in a single continuation. Start one with
-`gitmoot orchestrate <recipe-id> "..." --repo owner/repo`; the daemon runs the
-coordinator in the background and dispatches its delegations.
+`gitmoot orchestrate <agent> "..." --repo owner/repo --recipe <recipe-id>`
+(#477): the `--recipe` flag routes any existing coordinator agent through the
+named recipe prompt without changing the agent's identity. The bare
+`gitmoot orchestrate <recipe-id> "..."` form requires an agent **registered
+under the recipe name** first; on a fresh install it fails with "agent not
+found", so prefer `--recipe`.
 
 Three recipes ship built in:
 
@@ -7411,9 +9140,9 @@ feedback`, vendored at `repos/ROMA`); it uses only shipped primitives
 **produce vs. independent check** note in `RESULT_CONTRACT.md`.
 
 ```sh
-gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
-gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
-gitmoot orchestrate verifier "Implement the rate limiter described in the task and prove it works." --repo owner/repo
+gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
+gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify
+gitmoot orchestrate project-planner "Implement the rate limiter described in the task and prove it works." --repo owner/repo --recipe verifier
 ```
 
 The panelists in `review-panel` and every producer and verify leg in
@@ -7440,9 +9169,9 @@ to today. Gitmoot imports no Herdr code; it drives Herdr over its CLI only, and 
 herdr call never fails or stalls a job.
 
 ```sh
-gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo --cockpit
-gitmoot orchestrate decompose-and-verify "Implement the export feature." \
-  --repo owner/repo --cockpit --cockpit-session feature-export
+gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel --cockpit
+gitmoot orchestrate project-planner "Implement the export feature." \
+  --repo owner/repo --recipe decompose-and-verify --cockpit --cockpit-session feature-export
 ```
 
 Each child job opens a pane labeled `<agent> · d<depth> · <branch>` and streams
@@ -7627,7 +9356,10 @@ Do not ask child agents to run PR lifecycle commands such as `git pull`,
 Gitmoot owns the final merge gate. It serializes merge attempts per base branch,
 updates stale PR branches through GitHub when possible, retries pending states
 through the daemon, and blocks clearly when GitHub reports a real merge
-conflict.
+conflict. When an **external** system owns the merge decision instead, set
+`GITMOOT_DISABLE_NATIVE_MERGE_GATE=1` (also `true`/`yes`/`on`; #545): Gitmoot
+then **abstains** from its native merge gate — fail-closed, meaning it never
+merges gatelessly; the external gate makes the call.
 
 Useful commands:
 
@@ -7904,7 +9636,15 @@ Delegation fields:
 - `deps` (optional): array of sibling delegation `id`s. This delegation runs
   only after every listed sibling succeeds. Each entry must reference a known
   sibling in the same result, may not be self-referential, and may not form a
-  cycle — delegations form a DAG, and cycles are rejected.
+  cycle — delegations form a DAG, and cycles are rejected. By default a
+  dependent leg runs *blind* to its deps' outputs. The opt-in
+  `[orchestrate].inject_upstream_dep_context = true` (#419) makes `deps[]` real
+  dataflow: when a ready dependent leg is enqueued, each succeeded direct dep's
+  result (decision, summary preview, PR link, `changes_made` count, short
+  HeadSHA, then the fenced `artifact_body`) is appended to the dependent's
+  prompt as a byte-budgeted "Upstream dependency results" block (same size caps
+  as artifact-body inlining). Off by default; with the flag off the enqueued
+  prompt is byte-identical.
 - `failure_policy` (optional): one of `block_parent`, `continue`, `escalate`, or
   `escalate_human`. Defaults to `block_parent` when omitted.
   - `block_parent` — a failed child blocks the shared parent task (terminal).
@@ -7992,6 +9732,13 @@ Delegation fields:
     the self-correction loop guaranteed and bounded by the engine; use the template
     pattern when you want full coordinator control over how the failure is routed.
 - `timeout` (optional): a Go duration string and must be positive (e.g. `10m`).
+  When omitted, the child job's timeout falls back to the `[orchestrate]`
+  defaults (#548), with precedence **per-delegation `timeout` > phase default
+  (`default_plan_timeout` / `default_implement_timeout` /
+  `default_review_timeout` / `default_gate_timeout` / `default_repair_timeout`,
+  keyed by the delegation's `phase`, falling back to its `action`) >
+  `default_delegation_timeout` > unbounded** (the historical behavior; all keys
+  are empty by default).
 - `retry` (optional): integer `>= 0`.
 - `worktree` (optional): worktree path for the child job.
 - `artifacts` (optional): named artifact handles passed to the child. When any
@@ -8048,6 +9795,10 @@ Delegation fields:
   `implement`, `verify`). Like `model`, it is metadata only: it does **not**
   affect scheduling, loop detection, or termination, and it is not part of the
   delegation-set signature used for loop detection. There is no allow-list.
+  **One exception (#548):** when the delegation omits `timeout`, a recognized
+  phase value (`plan`, `implement`, `review`/`review-prep`/`review-dispatch`,
+  `gate`, `repair`/`continue`) selects the matching `[orchestrate]`
+  phase-default timeout — see the `timeout` bullet above.
 - `ephemeral` (optional): an inline worker spec that spawns a throwaway child
   agent on demand instead of routing to a pre-registered one. It is **mutually
   exclusive** with `agent`: a delegation must set exactly one of `agent` or
@@ -8122,9 +9873,11 @@ Delegation trees are bounded so they cannot run forever:
 
 - Depth cap: `MaxDelegationDepth = 8`. Each delegation child and each
   coordinator continuation increments `delegation_depth`; a job at or beyond
-  this depth may not delegate further.
+  this depth may not delegate further. Override per host with the
+  `GITMOOT_MAX_DELEGATION_DEPTH` env var (positive integer).
 - Per-root job budget: `MaxDelegationTotalJobs = 64`. The whole delegation tree
-  under one root is capped at this many jobs.
+  under one root is capped at this many jobs. Override per host with the
+  `GITMOOT_MAX_DELEGATION_TOTAL_JOBS` env var (positive integer).
 - Per-root wall-clock budget: `MaxDelegationWallClock = 2h`. The whole tree under
   one root is bounded in duration (measured from the root job's creation); a
   coordinator that tries to fan out after the tree has run this long is refused
@@ -8216,8 +9969,9 @@ a job whose runtime reports no usage contributes `0` to the sum, so the budget
 
 Because of this, a tree made up mostly of Codex jobs will accumulate little or no
 counted usage — set the budget with that in mind, and prefer it as a coarse
-runaway-cost backstop rather than a precise spend limit. A `$`-denominated price
-table is intentionally **not** implemented yet; the budget is in raw tokens.
+runaway-cost backstop rather than a precise spend limit. The same capture also
+feeds the `$`-denominated `[orchestrate].max_delegation_cost_usd` budget — see
+the dollar-cost bullet in [Termination bounds](#termination-bounds) above.
 
 ### Top-level fields
 
@@ -8406,10 +10160,23 @@ returns and, on a guardrails pass, calls the existing promote machinery.
   threshold, an unresolvable run or a store read error (treated as *feedback
   unavailable*), **zero feedback samples** (an absolute floor even when
   `min_samples = 0`), `auto_promote_require_measured_judge = true` (deferred, gated
-  on #344), or `auto_promote_canary = true` (deferred) — **fails safe to notify, do
-  not promote**. An unset `min_samples`/`min_score` is a **hard do-not-promote, not
-  `0`**. On a pass it promotes via the existing path and emits
-  **`candidate.auto_promoted`** so a human can review or roll back even in full-auto.
+  on #344), or `auto_promote_canary = true` with an unset/invalid
+  `auto_promote_canary_sample` — **fails safe to notify, do not promote**. An unset
+  `min_samples`/`min_score` is a **hard do-not-promote, not `0`**. On a pass it
+  promotes via the existing path and emits **`candidate.auto_promoted`** so a human
+  can review or roll back even in full-auto.
+- **`[skillopt].auto_promote_canary`** (#484, default `false`) makes a
+  guardrails-pass candidate a **canary** behind the live champion instead of
+  promoting it straight to `current`: `auto_promote_canary_sample` (a fraction in
+  `(0,1]`; `1.0` = all traffic) is the per-resolution probability a job routes to
+  the canary version, and `candidate.canary_started` is emitted when it goes
+  live. The daemon then watches a bounded regression window over the canary's
+  harvested verifiable outcomes versus the prior champion: on parity-or-better it
+  graduates the canary to `current` (`candidate.auto_promoted`); on a **material
+  regression** it auto-rolls-back — champion stays current, canary rejected,
+  **`candidate.rolled_back`** emitted. Fail-safe: too few outcomes, no champion
+  baseline, or unreadable feedback **hold** (keep sampling); `auto_promote_canary
+  = true` with `auto_promote_canary_sample` unset degrades to notify-only.
 
 ### Champion-challenger A/B preferences (Mode B, off by default)
 

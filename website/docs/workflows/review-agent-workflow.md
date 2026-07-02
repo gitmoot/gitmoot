@@ -13,9 +13,10 @@ gitmoot agent start thermo-review \
   --start-daemon
 ```
 
-`--runtime` accepts `codex`, `claude`, or `kimi` (Kimi Code CLI). The optional
-`--model <name>` flag sets the agent's default runtime model; an omitted
-`--model` preserves the runtime's own default.
+`--runtime` accepts `codex`, `claude`, `kimi` (Kimi Code CLI), or `kimi-cli`
+(the opt-in legacy Kimi CLI adapter). The optional `--model <name>` flag sets
+the agent's default runtime model; an omitted `--model` preserves the runtime's
+own default.
 
 Ask it from a PR comment:
 

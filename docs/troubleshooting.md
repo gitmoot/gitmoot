@@ -243,6 +243,23 @@ Fixes:
 - If JSON mode is unsupported, the adapter falls back to plain output, but the
   output still must contain the `gitmoot_result` object.
 
+What Gitmoot already retries for you (no action needed when the events show a
+failure followed by a success):
+
+- A dead pinned session — the `--resume` target no longer exists — is retried
+  on a fresh session and the agent is re-pinned to it (#443).
+- A transient 401 ("socket connection closed unexpectedly") under sustained
+  concurrency is retried with backoff without abandoning the session
+  (#487/#509).
+
+Daemon restarts and Claude auth: the daemon persists its Claude token into an
+owner-only (0600) `daemon-runtime.env` file in the Gitmoot home (#578/#588).
+`gitmoot daemon restart` recovers that token even when the invoking shell lacks
+`CLAUDE_CODE_OAUTH_TOKEN`; a plain `stop` + `start` re-inherits the launching
+shell's environment (and warns loudly when that would come up auth-less). A
+recovered token may be stale — verify with `gitmoot doctor`. `gitmoot daemon
+stop --forget-runtime-auth` deletes the persisted file.
+
 ## Repo Remotes
 
 Symptoms:
@@ -264,6 +281,25 @@ Fixes:
 - Start the daemon from the intended checkout.
 - Correct the `origin` remote or pass the matching `--repo`.
 - Avoid running one daemon from a parent folder that contains multiple repos.
+
+Note that `--repo owner/repo` **scopes** the daemon to a single repo: it polls
+only that repo's PRs and claims only that repo's queued jobs. Omit `--repo` to
+supervise every enabled registered repo from one daemon (#581).
+
+## Daemon Already Running
+
+Symptoms:
+
+- `gitmoot daemon start`/`run` refuses with `daemon already running with pid …`.
+
+Fixes:
+
+- One daemon per Gitmoot home is enforced with a pidfile plus a flock backstop
+  (#550/#556); a second daemon is refused by design, and a stale pidfile whose
+  owner is dead is liveness-checked and recovered automatically. Use the
+  running daemon — it supervises all subscribed repos. To change its settings,
+  send `kill -HUP <pid>` for a live `[daemon]` config reload (#577) or use
+  `gitmoot daemon restart`. Scripts should treat the refusal as success.
 
 ## Permissions
 
@@ -346,6 +382,42 @@ Fixes:
   different registered agent or managed background instance when the work is
   independent.
 - Use `gitmoot agent gc` to remove expired managed background instances.
+- For a registered agent whose session is genuinely dead or stranded, rebind it
+  in place with `gitmoot agent restart <agent>` (refused while the session is
+  live or the agent has in-flight jobs).
+
+## Stuck Or Deferred Jobs
+
+Symptoms:
+
+- A queued/blocked job is not moving, or a job "failed then reappeared as
+  queued".
+- A job sits in `running` long after its worker died.
+
+Checks — read the stuck reason first:
+
+```sh
+gitmoot job list --repo owner/repo   # WHY: column on queued/blocked jobs
+gitmoot job show <job-id>            # why_stuck: / next_retry_at: lines
+gitmoot job events <job-id>
+```
+
+Fixes:
+
+- `gitmoot job list` appends a `WHY:` column and `gitmoot job show` prints a
+  `why_stuck:` line for queued/blocked jobs (#552) — a runtime-session lock
+  wait (naming the holder), `blocked: awaiting human`, `auth failing: …`,
+  `throttled: …`, or `retrying: …` with the attempt schedule.
+- Deferred jobs recover on their own (#532): a delivery failure classified as
+  a retryable operational blocker (runtime auth, provider rate limit/quota) is
+  re-queued with a bounded retry budget instead of failing terminally —
+  `job show --json` carries the `blocker_class` and attempt count. Only act
+  when the retry budget is spent and the job stays failed.
+- A job stuck in `running` is recovered automatically once it shows no lease
+  progress past the staleness window (default 30m; tune with the
+  `GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value
+  is 1m — below-1m, malformed, or non-positive values are rejected in favor of
+  the 30m default rather than clamped, #560).
 
 ## Parallel Implementation And Worktrees
 
@@ -410,6 +482,11 @@ Fixes:
   `blocked`, `implemented`, or `failed`.
 - Keep `summary` non-empty.
 
+Gitmoot already retries this for you: output missing the `gitmoot_result`
+envelope records a `malformed_output` event and is re-asked with the repair
+prompt a bounded number of times before failing terminally (#495). A job whose
+events show `malformed_output` followed by a success worked as designed.
+
 ## Rate Limits
 
 Symptoms:
@@ -456,3 +533,7 @@ Fixes:
 - If a merged task reports a worktree cleanup warning, inspect the stored task
   worktree path, clean or remove that worktree manually, then clear stale local
   state only after confirming the path is no longer needed.
+- When an **external** system owns the merge decision, set
+  `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1` (also `true`/`yes`/`on`; #545): Gitmoot
+  then abstains from its native merge gate — fail-closed, it never merges
+  gatelessly; the external gate makes the call.

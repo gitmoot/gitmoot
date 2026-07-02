@@ -30,6 +30,11 @@ gitmoot repo add owner/repo --path . --poll 30s
 gitmoot doctor --repo .
 ```
 
+`gitmoot init` creates the Gitmoot home (default `~/.gitmoot`; relocate with
+`GITMOOT_HOME` or the global `--home` flag); `gitmoot config path` and
+`gitmoot config show` locate and print the effective config — see
+[Home And Config](../reference/cli.md#home-and-config).
+
 Start a Gitmoot-managed planner agent and the background daemon:
 
 ```sh
@@ -41,9 +46,11 @@ gitmoot agent start project-planner \
   --start-daemon
 ```
 
-The `--runtime` flag accepts `codex`, `claude`, or `kimi`. To use the Kimi Code
-runtime, run `kimi login` first, then restart the Gitmoot daemon so it inherits
-the session.
+The `--runtime` flag accepts `codex`, `claude`, `kimi`, or `kimi-cli` (the
+opt-in legacy Kimi CLI adapter; choose `kimi` unless you specifically run the
+legacy CLI — see [Runtime Adapters](../reference/runtime-adapters.md)). To use
+the Kimi Code runtime, run `kimi login` first, then restart the Gitmoot daemon
+so it inherits the session.
 
 ## Set up a GitHub "tagging" agent
 
@@ -68,8 +75,9 @@ Two things to know when tagging on issues:
 
 - **Run the daemon from a shell that holds the runtime token.** The daemon
   inherits the environment of the shell that (re)started it, so start it where
-  the runtime (for example Claude) is authenticated. Daemon-aware auth
-  validation is tracked in #427.
+  the runtime (for example Claude) is authenticated. Verify with
+  `gitmoot doctor`, which live-probes the daemon's Claude auth; `gitmoot daemon
+  restart` recovers the persisted token even from an unauthenticated shell.
 - **On issues only the `ask` action is acted on.** Post the tag as the first
   token of a line:
 
@@ -124,10 +132,11 @@ Use `gitmoot agent run` for coordinator delegation that may route to ask,
 review, or implement. Use `gitmoot agent ask` for analysis and planning only.
 
 On a real terminal, `gitmoot dashboard` launches an interactive TUI cockpit with
-pages for Attention, Trains, Agents, Runtime sessions, Jobs, and Locks (pending
-prompts live under Attention). Use `gitmoot dashboard --plain` for a one-shot
-snapshot and `gitmoot dashboard --json` for scripts and noninteractive agent
-checks.
+pages for Attention, Activity (live orchestras), Trains, Agents, Workers, Jobs,
+Locks, Health, and Config (pending prompts live under Attention). Use
+`gitmoot dashboard --plain` for a one-shot snapshot, `gitmoot dashboard --json`
+for scripts and noninteractive agent checks, and `gitmoot dashboard --web` for
+a read-only browser view of a running orchestration.
 
 To kick off an orchestra of agents — a conductor (coordinator) that returns a
 `delegations[]` score, players (child agents) that run in parallel or in

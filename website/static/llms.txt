@@ -2,7 +2,9 @@
 
 Gitmoot is a local-first coordinator for AI agents working across repositories,
 goals, reviews, pull request comments, daemon jobs, branch locks, agent
-templates, current-chat prompt import, and Codex or Claude Code runtime
+templates (including GitHub-backed publish/pull), current-chat prompt import,
+multi-agent orchestration (the Orchestra delegations DAG), heartbeat schedules,
+an outbound event stream, and Codex, Claude Code, Kimi Code, or shell runtime
 workflows.
 
 This file is the machine-readable index of the Gitmoot docs — agents should
@@ -14,20 +16,32 @@ full expanded context.
 - [Introduction](https://gitmoot.io/docs/intro): What Gitmoot is and when to use it.
 - [Install](https://gitmoot.io/docs/getting-started/install): Install and verify Gitmoot.
 - [Quick Start](https://gitmoot.io/docs/getting-started/quick-start): Ask an agent to install Gitmoot, register a repo, start a planner, and route work.
-- [PR Comment Workflow](https://gitmoot.io/docs/workflows/pr-comment-workflow): Route auditable work from GitHub comments.
+- [PR Comment Workflow](https://gitmoot.io/docs/workflows/pr-comment-workflow): Route auditable work from GitHub comments — `/gitmoot` commands, bare `@agent` mentions, and resuming paused orchestrations.
 - [Planner And Goal Workflow](https://gitmoot.io/docs/workflows/planner-goal-workflow): Create structured plans and goal files.
-- [Template Capture Workflow](https://gitmoot.io/docs/workflows/template-capture-workflow): Turn a current chat workflow into a reviewed reusable template.
+- [Template Capture Workflow](https://gitmoot.io/docs/workflows/template-capture-workflow): Turn a current chat workflow into a reviewed reusable template, and back templates up to a GitHub repo (publish/pull).
+- [Review Agent Workflow](https://gitmoot.io/docs/workflows/review-agent-workflow): Register a strict review-only agent and route PR reviews to it.
+- [Coordinator Recipes Workflow](https://gitmoot.io/docs/workflows/coordinator-recipes-workflow): One-command orchestras via `orchestrate --recipe review-panel|decompose-and-verify|verifier` with ephemeral workers.
+- [Cockpit Orchestrate Workflow](https://gitmoot.io/docs/workflows/cockpit-orchestrate-workflow): Watch an orchestra live in Herdr panes (`--cockpit`) plus the `[orchestrate]` config reference (budgets, timeouts, artifact inlining).
+- [Run Jobs In Parallel On A Repo](https://gitmoot.io/docs/workflows/parallel-jobs-workflow): Use `--parallel N` (or `--workers N`, now auto-`pool`) to run a repo's queued jobs N-wide; the two serialization layers (checkout lock + runtime session lock); SIGHUP warm reload, per-repo `max_parallel`, and the `[admission]` host budget.
+- [Heartbeat Schedules Workflow](https://gitmoot.io/docs/workflows/heartbeat-schedules-workflow): Recurring agent work — `gitmoot agent heartbeat add` enqueues a read-only ask/review job on an interval.
 - [SkillOpt Train Workflow](https://gitmoot.io/docs/workflows/skillopt-train-workflow): Run the full feedback, optimizer, candidate-review, and promotion loop, including judge↔human outcome capture, `judge-report`, and judge-prompt optimization.
-- [Run Jobs In Parallel On A Repo](https://gitmoot.io/docs/workflows/parallel-jobs-workflow): Use `--parallel N` (or `--workers N`, now auto-`pool`) to run a repo's queued jobs N-wide; the two serialization layers (checkout lock + runtime session lock).
+
+## Concepts
+
+- [Local-First Coordination](https://gitmoot.io/docs/concepts/local-first-coordination): Why state lives in local SQLite and GitHub stays the audit surface.
+- [Agents, Agent Templates, Jobs, And Locks](https://gitmoot.io/docs/concepts/agents-templates-jobs-locks): The core object model — agent identities, template snapshots, job lifecycle, and the three lock kinds.
 
 ## References
 
-- [CLI Reference](https://gitmoot.io/docs/reference/cli): Commands for install, dashboard/TUI, agents, jobs, bug reports, locks, goals, and SkillOpt.
-- [Runtime Adapters](https://gitmoot.io/docs/reference/runtime-adapters): Codex, Claude Code, Kimi Code, shell, and future runtimes.
+- [CLI Reference](https://gitmoot.io/docs/reference/cli): Commands for install, home/config, daemon operations (restart, SIGHUP reload, runtime-auth persistence), watched repos, dashboard/TUI/web, agents (incl. heartbeats and template publish/pull), orchestrate, jobs, bug reports, locks, goals, interactive prompts, and SkillOpt.
+- [Runtime Adapters](https://gitmoot.io/docs/reference/runtime-adapters): Codex, Claude Code, Kimi Code, legacy kimi-cli, shell, and future runtimes.
 - [Result Contract](https://gitmoot.io/docs/reference/result-contract): gitmoot_result shape, the delegations DAG (Orchestration), continuation, and termination bounds.
+- [Event Stream](https://gitmoot.io/docs/reference/event-stream): The `[events]` webhook contract — job.finished/failed/blocked/needs_attention/deferred and candidate.* events, schema_version 1, best-effort delivery.
 - [Codex And Claude Plugins](https://gitmoot.io/docs/plugins/codex-claude): Plugin discovery and runtime skill setup.
 - [SkillOpt Exchange Contract](https://gitmoot.io/docs/reference/skillopt-exchange-contract): Training and candidate package boundary for the external optimizer.
-- [Troubleshooting](https://gitmoot.io/docs/operations/troubleshooting): Diagnose GitHub auth, bug reports, runtimes, agent templates, remotes, permissions, and locks.
+- [Troubleshooting](https://gitmoot.io/docs/operations/troubleshooting): Diagnose GitHub auth, bug reports, runtimes, agent templates, remotes, permissions, daemon lifecycle, stuck/deferred jobs, and locks.
+- [Beta Smoke Tests](https://gitmoot.io/docs/operations/beta-smoke-tests): Deterministic smoke checklists for release validation.
+- [Docs Deployment](https://gitmoot.io/docs/operations/deployment): How the docs site itself is built and published.
 - [Release Notes](https://gitmoot.io/docs/release-notes/v0.8.1): Latest release (v0.8.1) — the daemon becomes tunable without restarts, and restarts become safe. Per-repo concurrency config (`[repos."owner/repo"] max_parallel`) caps one repo without bouncing the shared daemon (#576); warm SIGHUP reload applies workers/scheduler/poll to the running daemon with no teardown or env re-inheritance (#577); runtime auth persists to a 0600 file so a restart from a token-less shell can't silently drop Claude auth, with restart-only recovery, a stale/revoked-token note pointing at `gitmoot doctor`, and `daemon stop --forget-runtime-auth` (#578/#588/#581). Reliability: worker loops survive transient tick errors but escalate persistent faults, stale-running recovery is configurable and #536-safe via a lease teardown grace, --watch-issues polling collapses to one since-bounded call per repo, and `job list` says why a job is stuck. Plus `gitmoot dashboard --web` (live orchestration graph) and finalized GitHub-backed templates publish/pull + heartbeat write-CLI/review action. Mutation-proven E2Es across all of it.
 - [Raw SKILL.md](https://gitmoot.io/SKILL.md): Agent skill entrypoint.
 - [Full LLM Context](https://gitmoot.io/llms-full.txt): Expanded Markdown context for agents.

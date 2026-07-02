@@ -52,7 +52,8 @@ type Agent struct {
 
 `RuntimeRef` is runtime-specific. Codex accepts a session UUID, thread name, or
 `last`. Claude accepts a UUID or `last`. Kimi accepts a Kimi session id of the
-form `session_<uuid>` or empty. Shell uses the configured command.
+form `session_<uuid>` or empty. Kimi CLI (legacy, `kimi-cli`) accepts a session
+UUID or empty. Shell uses the configured command.
 `TemplateID` is Gitmoot-owned metadata. Adapters do not fetch or interpret template
 content; Gitmoot snapshots cached template instructions into the rendered prompt
 before delivery.
@@ -103,6 +104,18 @@ kimi -S <session-id> -p '<job-prompt>' --output-format stream-json
 
 Kimi runs against a logged-in Kimi CLI. Run `kimi login`, then restart the
 Gitmoot daemon so it inherits the session.
+
+The opt-in `kimi-cli` runtime (#546) targets the **legacy** Kimi CLI, which
+requires the older `--print` command shape the current Kimi Code CLI does not
+support:
+
+```sh
+kimi --print -p '<prompt>' --output-format stream-json
+```
+
+It is intentionally a separate runtime name so the default `kimi` (Kimi Code)
+path is never probed or changed; choose `kimi` unless you specifically run the
+legacy CLI. The two count as the same runtime family for cross-family review.
 
 Shell adapters do not support `agent start`; register shell commands with
 `agent subscribe`.

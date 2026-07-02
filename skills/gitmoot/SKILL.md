@@ -1,10 +1,10 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, jobs, branch locks, agent-templates, template capture, custom prompt agents, and Codex, Claude Code, or Kimi Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, event webhooks, the web dashboard, per-job runtime overrides, and Codex, Claude Code, or Kimi Code runtime workflows.
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
-  gitmoot-version: "0.4.2"
+  gitmoot-version: "0.8.1"
   source: "jerryfane/gitmoot"
 ---
 
@@ -37,6 +37,9 @@ Use `gitmoot agent template draft <id>` for a blank scaffold,
 `gitmoot agent template validate <file>` for a structural check,
 `gitmoot agent template add <id> --file <file>` to install a snapshot, and
 `gitmoot agent prompt <id>` to reuse the installed template in the current chat.
+"Publish", "back up", or "pull" agent templates means the GitHub-backed
+`gitmoot agent template export/publish/pull/remote set` commands — see CLI.md
+§ Agent Templates.
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
@@ -44,11 +47,15 @@ same Codex, Claude, or Kimi session, and branch locks protect implementation
 ownership.
 The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
+To restart the daemon without losing its Claude token, use
+`gitmoot daemon restart` (not stop + start); see CLI.md § Repo And Daemon
+Status for the runtime-auth persistence model.
 
 For Gitmoot health or status questions, first use the injected SessionStart
 snapshot when it is present and sufficient. If more detail is needed, run the
 relevant read-only Gitmoot CLI checks and answer directly from the results.
-Mention `gitmoot dashboard` only after that answer, as a live monitoring
+Mention `gitmoot dashboard` (or `gitmoot dashboard --web` for a browser view of
+a running orchestration) only after that answer, as a live monitoring
 follow-up. Do not start daemons, create agents, change subscriptions, update
 templates, or release locks unless the user asks for that action.
 

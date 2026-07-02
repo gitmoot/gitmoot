@@ -27,8 +27,9 @@ trail. Gitmoot makes the repository and its pull requests the shared surface:
 
 - PR comments become agent tasks, review requests, retries, and merge signals.
 - Local SQLite records agents, repos, jobs, goals, tasks, PRs, and branch locks.
-- Runtime adapters keep Codex, Claude Code, Kimi Code, and future runtimes
-  behind the same Gitmoot agent model.
+- Runtime adapters keep Codex, Claude Code, Kimi Code (plus the legacy
+  `kimi-cli`, a deterministic `shell` adapter), and future runtimes behind the
+  same Gitmoot agent model.
 - **Orchestra** is Gitmoot's name for structured multi-agent delegation: a
   conductor (coordinator) returns a validated `delegations[]` DAG that Gitmoot
   dispatches as child jobs (the players), then enqueues one continuation job
@@ -39,8 +40,13 @@ trail. Gitmoot makes the repository and its pull requests the shared surface:
   bound trips, the engine enqueues one graceful finalize continuation so the
   coordinator synthesizes a best-effort result instead of recursing forever or
   dropping work silently.
-- Agent Templates and job snapshots make agent instructions explicit and reproducible.
-- Humans can follow progress from GitHub while agents keep working locally.
+- Agent Templates and job snapshots make agent instructions explicit and
+  reproducible — and can be backed up to / pulled from a GitHub repo.
+- Heartbeat schedules run recurring agent work without an external cron, and an
+  opt-in `[events]` webhook streams job/candidate lifecycle events to your own
+  systems.
+- Humans can follow progress from GitHub while agents keep working locally —
+  in the PR thread, the terminal TUI, or the read-only web dashboard.
 
 ## How It Works
 
@@ -65,6 +71,13 @@ gitmoot version
 gh auth status
 ```
 
+Later, self-update from GitHub Releases:
+
+```sh
+gitmoot update --check
+gitmoot update --restart-daemon
+```
+
 Install runtime plugin guidance when you want Codex or Claude Code to discover
 Gitmoot's Agent Skill from their plugin systems:
 
@@ -86,7 +99,14 @@ gitmoot plugin codex-launch --repo .
 
 ## Quick Start
 
-From a project checkout:
+One command registers the repo, subscribes an agent, and launches a
+tagging-ready daemon (`--watch-issues` defaults on):
+
+```sh
+gitmoot setup --repo owner/repo --path . --agent helper --runtime claude --session last --start-daemon
+```
+
+Or step through the manual path from a project checkout:
 
 ```sh
 gitmoot init
@@ -105,9 +125,9 @@ gitmoot agent start project-planner \
   --start-daemon
 ```
 
-`--runtime` accepts `codex`, `claude`, or `kimi`. For Kimi Code, run
-`kimi login` and restart the Gitmoot daemon so it inherits the session, then
-start the agent with `--runtime kimi`.
+`--runtime` accepts `codex`, `claude`, `kimi`, or `kimi-cli` (the opt-in legacy
+Kimi CLI adapter). For Kimi Code, run `kimi login` and restart the Gitmoot
+daemon so it inherits the session, then start the agent with `--runtime kimi`.
 
 For fast planning in the current Codex or Claude chat, ask the runtime:
 
@@ -124,6 +144,14 @@ planning job:
 ```sh
 gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
 gitmoot job watch <job-id>
+```
+
+Run one job through a different runtime (or model) without re-registering the
+agent — the agent's default runtime and session are untouched:
+
+```sh
+gitmoot agent ask project-planner --repo owner/repo --runtime claude "Compare the approaches."
+gitmoot agent run lead --repo owner/repo --model gpt-5-codex "Implement this task."
 ```
 
 For coordinator delegation (the Orchestra pattern) where the request may require
@@ -144,16 +172,21 @@ checkout locks protect local checkouts, branch locks protect implementation
 ownership, and busy Codex/Claude runtime sessions can fork bounded temporary
 workers when `[parallel_sessions]` allows it. Temp workers still require
 checkout/worktree safety and write-capable agents for implementation jobs.
+`gitmoot daemon start --parallel N` runs a repo's queued jobs N-wide
+(auto-selecting the pool scheduler); see
+[docs/parallel-jobs.md](docs/parallel-jobs.md).
 
-`gitmoot daemon start --repo owner/repo` scopes the background daemon to that one
-repo; `gitmoot daemon start` with no `--repo` supervises every enabled repo. Both
-`daemon run` and `daemon start` accept `--session <root-job-id>` (alias `--root`)
-to pin the worker to a single orchestration run — it then runs only jobs whose
-`root_job_id` matches that value plus the root coordinator job itself, AND-combined
-with any `--repo` filter:
+`daemon start --repo owner/repo` scopes the daemon to a **single** repo: it
+polls only that repo's PRs and claims only that repo's queued jobs. Omit
+`--repo` and one daemon supervises every enabled repo; cap an individual repo's
+parallelism on that shared daemon with the `[repos."owner/repo"] max_parallel`
+config key. Both `daemon run` and `daemon start` accept
+`--session <root-job-id>` (alias `--root`) to pin the worker to a single
+orchestration run — it then runs only jobs whose `root_job_id` matches that
+value plus the root coordinator job itself:
 
 ```sh
-gitmoot daemon start --repo owner/repo --session <root-job-id>
+gitmoot daemon start --session <root-job-id>
 ```
 
 Route work through PR comments:
@@ -162,17 +195,48 @@ Route work through PR comments:
 /gitmoot project-planner ask Write a task-by-task implementation plan for this PR.
 /gitmoot thermo-review review
 /gitmoot retry <job-id>
+/gitmoot resume <job-id> retry|continue|abort|answer [instructions]
+@project-planner ask What is blocking this PR?
 ```
 
+A bare `@<agent> <action>` mention works as the same command; with the daemon's
+`--watch-issues` flag (on by default in `gitmoot setup`) mentions on **issues**
+are routed too. `/gitmoot resume` continues a delegation tree paused for a
+human (`escalate_human` failures or ask-gate questions) — the daemon @-tags you
+with the exact resume command when a tree pauses.
+
 For the full walkthrough, see [docs/local-workflow.md](docs/local-workflow.md).
+
+### Operate the daemon
+
+```sh
+gitmoot daemon status                 # scheduler mode, workers, runtime auth
+gitmoot daemon start --parallel 5     # run queued jobs 5-wide (pool scheduler)
+kill -HUP <daemon-pid>                # live-reload [daemon] poll/workers/scheduler — no restart
+gitmoot daemon restart                # restart WITHOUT losing the persisted Claude token
+gitmoot daemon stop [--forget-runtime-auth]
+```
+
+Reconfigure live with SIGHUP (#577) instead of restarting: the running daemon
+re-reads the `[daemon]` config keys with no teardown, dropped jobs, or env
+re-inheritance. Cap a single repo from config with `[repos."owner/repo"]
+max_parallel = N` (#576) — applied live, no relaunch. Runtime auth survives
+restarts (#578): the daemon persists its Claude token to a 0600
+`daemon-runtime.env` file, `daemon restart` recovers it even from a token-less
+shell (plain `stop`+`start` does not), and `--forget-runtime-auth` deletes it.
+An opt-in `[events]` webhook streams `job.finished/failed/blocked/
+needs_attention/deferred` and `candidate.*` events to one HTTP endpoint
+([docs/events.md](docs/events.md)).
 
 ## Core Concepts
 
 - **Repo**: a GitHub repository plus local checkout path that Gitmoot is allowed
   to monitor and mutate.
 - **Daemon**: the local background process that polls GitHub PRs and routes
-  queued jobs. By default it supervises every enabled repo; `--repo` scopes it to
-  one repo and `--session <root-job-id>` scopes it to one orchestration run.
+  queued jobs. Passing `--repo owner/repo` scopes it to that single repo
+  (polling + job claims); omit `--repo` and it supervises every enabled repo
+  (cap one repo via `[repos."owner/repo"] max_parallel`).
+  `--session <root-job-id>` scopes it to one orchestration run.
 - **Agent**: a named Gitmoot identity with repo access, role, capabilities, and
   a runtime adapter.
 - **Runtime adapter**: the bridge from Gitmoot jobs to Codex, Claude Code,
@@ -230,11 +294,15 @@ one command. Each runs a coordinator that fans work out to ephemeral workers (no
 pre-registration) and reconvenes them in a single continuation. `review-panel`
 convenes a panel of diverse-lens reviewers over a PR and synthesizes one verdict;
 `decompose-and-verify` splits an implementation task into parallel, file-disjoint
-legs and runs a verify step that depends on all of them.
+legs and runs a verify step that depends on all of them; `verifier` is the
+minimal produce-vs-independent-check pair (one producer leg plus one read-only
+verify leg on a different runtime). Route any coordinator agent through a
+recipe with `--recipe`:
 
 ```sh
-gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
-gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
+gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
+gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify
+gitmoot orchestrate project-planner "Implement the rate limiter and prove it works." --repo owner/repo --recipe verifier
 ```
 
 ### Custom Prompt Agents
@@ -277,6 +345,18 @@ gitmoot agent template list --runtime codex --output goal_file
 gitmoot agent template list --tag review --capability ask
 gitmoot agent template show frontend-reviewer
 ```
+
+Back up and share templates via a GitHub repo (#476):
+
+```sh
+gitmoot agent template remote set owner/my-templates   # default remote ([template_remote]; ref=main, path=templates/)
+gitmoot agent template publish --all                   # commit templates to the remote (--create makes the repo)
+gitmoot agent template pull frontend-reviewer          # install/refresh from the remote
+gitmoot agent template add frontend-reviewer --from-repo owner/my-templates
+```
+
+Templates are stored and published **verbatim** (prompt body + metadata) —
+point the remote at a private repo unless the prompts are meant to be public.
 
 Reuse a custom agent prompt in the current Codex or Claude chat without
 starting a background job:
@@ -336,10 +416,28 @@ for its keys. Piped/`--plain`/`--json` output is unchanged and script-stable.
 ```sh
 gitmoot dashboard           # interactive cockpit
 gitmoot dashboard --json    # one-shot snapshot for scripts
+gitmoot dashboard --web [--addr 127.0.0.1:8080]   # read-only web dashboard
 ```
+
+`gitmoot dashboard --web` serves a read-only browser view — a live
+orchestration/delegation graph with run summaries and prompt/output
+inspection — until interrupted.
 
 Agents should answer directly from the SessionStart snapshot or read-only CLI
 checks first. The dashboard remains the live cockpit for humans.
+
+### Heartbeat Schedules
+
+Heartbeats let the daemon run recurring agent work itself — cron-like
+background jobs without an external cron (off by default):
+
+```sh
+gitmoot agent heartbeat add repo-maintainer daily-status \
+  --repo owner/repo --interval 24h --prompt "Daily status report." --enabled
+gitmoot agent heartbeat list
+```
+
+See [docs/heartbeats.md](docs/heartbeats.md).
 
 ### Jobs, Locks, And Recovery
 
@@ -348,14 +446,21 @@ gitmoot status --repo owner/repo
 gitmoot events --repo owner/repo
 gitmoot job list --repo owner/repo
 gitmoot job show <job-id>
+gitmoot job events <job-id>
 gitmoot job retry <job-id>
 gitmoot job cancel <job-id>
+gitmoot job kill <root-job-id>
 gitmoot report bug --job <job-id> [--preview]
 gitmoot report bug --job <job-id> --create --yes
 gitmoot daemon logs
 gitmoot lock list --repo owner/repo
 gitmoot lock release owner/repo <branch> --owner <agent>
 ```
+
+`gitmoot job kill <root-job-id>` is the operator kill switch for a whole
+delegation tree: in-flight jobs finish, the coordinator's next continuation is
+routed through the graceful finalize path, and the daemon stops starting queued
+children of that root.
 
 `gitmoot report bug` builds a redacted issue draft with job context, selected
 error, recent events, redaction notes, labels, and a duplicate-detection
@@ -490,6 +595,10 @@ for install details and troubleshooting.
 - [CLI reference](skills/gitmoot/references/CLI.md)
 - [Codex and Claude plugins](docs/plugins.md)
 - [Local workflow walkthrough](docs/local-workflow.md)
+- [Run jobs in parallel](docs/parallel-jobs.md)
+- [Heartbeat schedules](docs/heartbeats.md)
+- [Outbound event stream](docs/events.md)
+- [Cockpit and the [orchestrate] config](docs/cockpit-orchestrate.md)
 - [Beta smoke tests](docs/beta-smoke-tests.md)
 - [Runtime adapter authoring](docs/adapters.md)
 - [Troubleshooting](docs/troubleshooting.md)

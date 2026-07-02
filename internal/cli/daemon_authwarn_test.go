@@ -111,10 +111,10 @@ func TestDaemonUsage_ClarifiesRepoScope(t *testing.T) {
 	var buf bytes.Buffer
 	printDaemonUsage(&buf)
 	out := buf.String()
-	if !strings.Contains(out, "LAUNCH CONTEXT") {
-		t.Fatalf("usage should clarify --repo sets the launch context, got:\n%s", out)
+	if !strings.Contains(out, "SCOPES the daemon to a SINGLE repo") {
+		t.Fatalf("usage should clarify --repo scopes the daemon to a single repo, got:\n%s", out)
 	}
-	if !strings.Contains(out, "does NOT") || !strings.Contains(out, "ALL subscribed repos") {
-		t.Fatalf("usage should clarify --repo does not scope supervision, got:\n%s", out)
+	if !strings.Contains(out, "Omit --repo to supervise ALL enabled") {
+		t.Fatalf("usage should clarify omitting --repo supervises all enabled repos, got:\n%s", out)
 	}
 }

@@ -311,24 +311,23 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    --start-daemon` runs this same background start path for the selected
    checkout.
 
-   `gitmoot daemon start --repo owner/project` also scopes the background daemon
-   to that one repo: it only polls and runs jobs for `owner/project`. Use
-   `gitmoot daemon start` without `--repo` after registering all intended repos
-   if one daemon should supervise the whole Gitmoot home; that supervises every
-   enabled repo.
+   `--repo owner/repo` **scopes** the daemon to a single repo: it polls only
+   that repo's PRs and claims only that repo's queued jobs. Omit `--repo` to
+   supervise every enabled registered repo from one daemon (#581). To cap one
+   repo's parallelism on a shared (no-`--repo`) daemon, use the
+   `[repos."owner/repo"].max_parallel` config key instead (see
+   [parallel-jobs.md](./parallel-jobs.md)).
 
    To pin a worker to a single orchestration run, pass `--session <root-job-id>`
    (alias `--root`) to `daemon run` or `daemon start`:
 
    ```sh
-   gitmoot daemon start --repo owner/project --session <root-job-id>
+   gitmoot daemon start --session <root-job-id>
    ```
 
    With `--session` set, the worker runs only jobs whose `root_job_id` matches
    that value, plus the root coordinator job itself, and ignores every other
-   queued job. `--session` composes with `--repo` (AND): a job must match both
-   filters to run. Leaving both empty keeps the default of matching all enabled
-   repos and all jobs.
+   queued job. Leaving it empty keeps the default of matching all jobs.
 
    ### Set up a GitHub "tagging" agent
 
@@ -352,8 +351,9 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
 
    - **Run the daemon from a shell that holds the runtime token.** The daemon
      inherits the environment of the shell that (re)started it, so start it where
-     the runtime (e.g. Claude) is authenticated. (Daemon-aware auth validation is
-     tracked in #427.)
+     the runtime (e.g. Claude) is authenticated. Verify with `gitmoot doctor`,
+     which live-probes the daemon's Claude auth; `gitmoot daemon restart`
+     recovers the persisted token even from an unauthenticated shell (#578).
    - **On issues only the `ask` action is acted on.** Post the tag as the first
      token of a line:
 

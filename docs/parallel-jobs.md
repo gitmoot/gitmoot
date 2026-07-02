@@ -76,6 +76,54 @@ The practical recipe for N-wide same-repo work today: **N delegation/orchestra
 legs** (each engine-isolated into its own worktree) under **distinct runtime
 sessions**, with `--parallel N`.
 
+## Reconfigure without restarting (SIGHUP)
+
+Changing workers/scheduler/poll no longer needs a daemon restart (#577):
+`kill -HUP <daemon-pid>` re-reads the `[daemon]` config section (`poll`,
+`workers`, `scheduler`, parallelism) live — no teardown, no dropped jobs, no
+environment re-inheritance (so the daemon's runtime auth is untouched). Values
+pinned by explicit launch flags win over the re-read config. When a full
+restart is genuinely needed, prefer `gitmoot daemon restart`, which recovers
+the persisted Claude token (#578).
+
+## Cap one repo's parallelism from config
+
+To cap a single repo on a shared daemon — without touching the global worker
+count or relaunching anything — add a `[repos."owner/repo"]` section (#576):
+
+```toml
+[repos."owner/repo"]
+max_parallel = 1          # cap this repo's in-flight jobs; 0/unset = global default
+# scheduler = "barrier"   # optional per-repo scheduler override
+```
+
+`max_parallel = 0` (or an absent section) means "use the global default"; a
+positive value caps that repo's concurrent jobs. The keys are re-read every
+tick, so edits apply live.
+
+## Host-wide admission budget
+
+On a memory-constrained host, the opt-in `[admission]` section adds a second,
+host-global gate the daemon applies **before** starting each agent session, on
+top of `--workers`/pool and the per-repo locks (#365):
+
+```toml
+[admission]
+max_concurrent_sessions = 0   # cap total in-flight sessions; 0 = off
+max_memory_gb = 0             # cap summed per-runtime RAM estimate; 0 = off
+# codex_memory_gb = 0.2       # operator-tunable per-runtime RAM priors
+# claude_memory_gb = 0.85
+# kimi_memory_gb = 0.5
+# default_memory_gb = 0.5
+```
+
+With both caps `0` (the default) the budget is disabled and scheduling is
+byte-identical to a config without the section. A job that does not fit BOTH
+caps is left **queued** and retried next tick — never failed — so "jobs stay
+queued for no visible reason" on a small host can mean the admission budget is
+holding them. The budget is enforced per daemon process (host-global for the
+normal single-daemon deployment).
+
 ## Not yet automatic (follow-ups)
 
 - **Top-level `implement` auto-isolation.** `pool` does not auto-isolate plain
@@ -83,7 +131,5 @@ sessions**, with `--parallel N`.
   Parallelizing independent top-level `implement` jobs via the daemon needs
   implement-eligible auto-isolation (a real branch worktree + branch-lock handling
   + a worktree cap and disposal sweep); intentionally deferred.
-- **`daemon reconfigure`.** Changing workers/scheduler today still needs a restart;
-  a drain-not-drop reconfigure that preserves daemon auth is a planned follow-up.
 
 See [`local-workflow.md`](./local-workflow.md) for the broader daemon model.

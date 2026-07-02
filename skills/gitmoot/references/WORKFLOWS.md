@@ -2,15 +2,30 @@
 
 ## First Repo Setup
 
+The supported one-liner is `gitmoot setup`, which registers the repo and an
+agent in one command (`--watch-issues` defaults on, so the daemon comes up
+tagging-ready). `--repo`, `--agent`, `--runtime`, and `--session` are all
+**required** (setup exits with an error if any is missing); `--session` takes a
+runtime session reference, `last`, or a shell command:
+
+```sh
+gitmoot setup --repo owner/repo --agent reviewer --runtime codex --session last --start-daemon
+```
+
+Or the manual path:
+
 1. Confirm the repo identity and GitHub auth.
-2. Start the daemon for the repo.
-3. Start or subscribe at least one agent.
-4. Verify the agent is healthy before asking PR comments to route jobs.
+2. Run `gitmoot doctor` to validate `gh auth` and runtime credentials before
+   anything can stall on them.
+3. Start the daemon.
+4. Start or subscribe at least one agent.
+5. Verify the agent is healthy before asking PR comments to route jobs.
 
 ```sh
 gh repo view --json nameWithOwner
 gh auth status
-gitmoot daemon start --repo owner/repo
+gitmoot doctor
+gitmoot daemon start
 gitmoot agent start reviewer --runtime codex --repo owner/repo --role reviewer --capability ask --capability review --start-daemon
 gitmoot agent doctor reviewer
 ```
@@ -528,10 +543,22 @@ Low-traffic / bespoke agents (e.g. `researcher`) below `bandit_min_samples` are
 challenger, or no pick captured degrades to the normal single champion answer and
 logs a `live_ab_skipped` job event — the primary ask is never blocked or
 degraded. Each intercepted ask runs the runtime **twice** (the sampled cost), and
-`contract_version` stays `1`. **Promotion stays MANUAL**: live A/B only writes
-feedback + updates the posterior; it never auto-promotes or rolls back a version.
-The cross-family LLM-judge auto-pairwise, canary, and the unattended auto A/B loop
-remain deferred.
+`contract_version` stays `1`. **Promotion stays MANUAL by default**: live A/B
+only writes feedback + updates the posterior; it never auto-promotes or rolls
+back a version on its own.
+
+Canary auto-promotion is a separate, off-by-default policy (#484): with
+`[skillopt].auto_promote_canary = true` **and** `auto_promote_canary_sample`
+set to a fraction in `(0,1]`, a guardrails-pass candidate is promoted to a
+**canary** behind the live champion — the sample fraction is the per-resolution
+probability a job routes to the canary version — and the daemon watches a
+bounded regression window over the canary's harvested verifiable outcomes: on
+parity-or-better it graduates the canary to `current`
+(`candidate.auto_promoted` event); on a **material regression** it
+**auto-rolls-back** (champion stays current, canary rejected,
+`candidate.rolled_back` event). `candidate.canary_started` fires when the
+canary goes live. It fails safe: `auto_promote_canary = true` with an
+unset/invalid sample degrades to notify-only.
 
 Pass **`--judge`** (or set `[skillopt].mode_b_judge_enabled = true`, both **off by
 default**, #483) to ALSO have a **cross-family LLM judge** (a different runtime
@@ -556,6 +583,18 @@ Background jobs are scheduled against three distinct resources:
 - runtime session locks keyed as `runtime:<runtime>:<runtime_ref>` for Codex,
   Claude, and Kimi delivery;
 - branch locks for implementation ownership and merge safety.
+
+Delivery is self-healing — a job whose events show one of these errors and then
+a success is working as designed, not flaky:
+
+- **Dead pinned session (#443):** when a Claude `--resume` target no longer
+  exists, delivery retries on a fresh session and re-pins the agent to it.
+- **Transient auth errors (#487/#509):** a transient 401 ("socket connection
+  closed unexpectedly") under concurrency is retried with backoff; the old
+  session is not abandoned.
+- **Malformed output (#495):** an agent reply missing the `gitmoot_result`
+  envelope records a `malformed_output` event and is re-asked with a repair
+  prompt a bounded number of times before failing terminally.
 
 The daemon default is `--workers 1`. Users can raise it when jobs target
 different runtime sessions, managed agent types with `max_background` greater
@@ -712,8 +751,12 @@ Coordinator recipes are built-in agent templates that turn the Orchestra pattern
 into one-command workflows. Each recipe is a coordinator prompt that emits a
 `delegations[]` of **ephemeral** workers (no pre-registration), runs them in the
 daemon, then reconvenes their results in a single continuation. Start one with
-`gitmoot orchestrate <recipe-id> "..." --repo owner/repo`; the daemon runs the
-coordinator in the background and dispatches its delegations.
+`gitmoot orchestrate <agent> "..." --repo owner/repo --recipe <recipe-id>`
+(#477): the `--recipe` flag routes any existing coordinator agent through the
+named recipe prompt without changing the agent's identity. The bare
+`gitmoot orchestrate <recipe-id> "..."` form requires an agent **registered
+under the recipe name** first; on a fresh install it fails with "agent not
+found", so prefer `--recipe`.
 
 Three recipes ship built in:
 
@@ -750,9 +793,9 @@ feedback`, vendored at `repos/ROMA`); it uses only shipped primitives
 **produce vs. independent check** note in `RESULT_CONTRACT.md`.
 
 ```sh
-gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
-gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
-gitmoot orchestrate verifier "Implement the rate limiter described in the task and prove it works." --repo owner/repo
+gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
+gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify
+gitmoot orchestrate project-planner "Implement the rate limiter described in the task and prove it works." --repo owner/repo --recipe verifier
 ```
 
 The panelists in `review-panel` and every producer and verify leg in
@@ -779,9 +822,9 @@ to today. Gitmoot imports no Herdr code; it drives Herdr over its CLI only, and 
 herdr call never fails or stalls a job.
 
 ```sh
-gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo --cockpit
-gitmoot orchestrate decompose-and-verify "Implement the export feature." \
-  --repo owner/repo --cockpit --cockpit-session feature-export
+gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel --cockpit
+gitmoot orchestrate project-planner "Implement the export feature." \
+  --repo owner/repo --recipe decompose-and-verify --cockpit --cockpit-session feature-export
 ```
 
 Each child job opens a pane labeled `<agent> · d<depth> · <branch>` and streams

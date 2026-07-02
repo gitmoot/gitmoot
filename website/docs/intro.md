@@ -31,8 +31,9 @@ context in one file.
   `gitmoot agent prompt <agent-or-template>`.
 - Track jobs, branch locks, goals, tasks, reviews, and merges locally.
 - Open `gitmoot dashboard`, an interactive TUI cockpit with pages for Attention,
-  Trains, Agents, Runtime sessions, Jobs, and Locks (pending prompts live under
-  Attention).
+  Activity (live orchestras), Trains, Agents, Workers, Jobs, Locks, Health, and
+  Config (pending prompts live under Attention) — or `gitmoot dashboard --web`
+  for a read-only browser view of a running orchestration.
 - Run SkillOpt training loops that collect human feedback, call the external
   optimizer, and keep promotion decisions explicit.
 

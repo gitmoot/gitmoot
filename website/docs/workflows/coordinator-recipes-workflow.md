@@ -8,14 +8,24 @@ run once, then auto-disposed — so you do not pre-register any agents. Gitmoot 
 the panelists or legs in the daemon, then reconvenes their results in a single
 continuation back to the coordinator.
 
-Start a recipe with `gitmoot orchestrate <recipe-id> "..." --repo owner/repo`,
-which is sugar for a background `gitmoot agent run`:
+There are two invocation styles. The primary one is the `--recipe` flag on
+`gitmoot orchestrate` (also accepted on `gitmoot agent run`), which routes
+**any existing coordinator agent** through the named built-in recipe prompt
+without changing the agent's identity or registration (#477):
 
 ```sh
-gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
-gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
-gitmoot orchestrate verifier "Implement the rate limiter described in the task and prove it works." --repo owner/repo
+gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
+gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify
+gitmoot orchestrate project-planner "Implement the rate limiter described in the task and prove it works." --repo owner/repo --recipe verifier
 ```
+
+The second style passes the recipe id as the agent positional —
+`gitmoot orchestrate review-panel "..." --repo owner/repo` — but the positional
+must resolve to a **registered agent** (or configured managed type), so it only
+works after registering an agent under the recipe name (install the template
+with `agent template update review-panel`, then `agent start review-panel
+--template review-panel …`). On a fresh install without that registration it
+fails with "agent not found"; prefer `--recipe`.
 
 Three recipes ship built in. Install or refresh any template the same way as any
 built-in template:
@@ -39,7 +49,7 @@ share one model's blind spots (point a panelist at an installed review template
 such as `thermo-nuclear-code-quality-review` only if you want).
 
 ```sh
-gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
+gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
 ```
 
 Once every panelist is terminal, Gitmoot enqueues one continuation that
@@ -56,7 +66,7 @@ verify step whose `deps` list every implementation leg, forming a small DAG, so
 the gate runs only after all the legs finish.
 
 ```sh
-gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
+gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify
 ```
 
 After verify finishes, Gitmoot enqueues one continuation. The coordinator reads
@@ -87,7 +97,7 @@ a re-plan rather than trusting the producer. `decompose-and-verify` is the
 parallel-producers form of the same idea; `verifier` is its one-producer form.
 
 ```sh
-gitmoot orchestrate verifier "Implement the rate limiter described in the task and prove it works." --repo owner/repo
+gitmoot orchestrate project-planner "Implement the rate limiter described in the task and prove it works." --repo owner/repo --recipe verifier
 ```
 
 A failed verdict routes through the verify leg's `failure_policy: escalate` back
@@ -111,7 +121,7 @@ review orchestration to the coordinator:
 
 ```sh
 gitmoot agent implement lead --repo owner/repo --task task-001 --skip-native-review-fanout "Implement this task."
-gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo --skip-native-review-fanout
+gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify --skip-native-review-fanout
 ```
 
 With the flag set, the implement→PR step still records the PR baseline, runs the
