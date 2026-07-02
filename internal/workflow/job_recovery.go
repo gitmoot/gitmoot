@@ -37,6 +37,14 @@ func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error
 		return db.Job{}, err
 	}
 	payload.Result = nil
+	// A human-requested retry is a fresh lifecycle for the operational-blocker
+	// machinery (#532): drop any deferral hold so the retried job dispatches now
+	// (a stale blocker_retry_at would silently park a cancel→retried job behind
+	// the old hold with a contradictory stuck reason), and reset the attempt
+	// budget so a post-exhaustion manual retry regains full deferral tolerance.
+	payload.BlockerClass = ""
+	payload.BlockerAttempts = 0
+	payload.BlockerRetryAt = ""
 	if manualRetryShouldClearReadOnlyWorktree(job, payload) {
 		payload.WorktreePath = ""
 		payload.HeadSHA = ""

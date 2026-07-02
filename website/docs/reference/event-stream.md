@@ -20,6 +20,7 @@ The pilot emits a tight allowlist of event types over the webhook transport:
 | `job.failed`                    | a job reaches the `failed` terminal state                                          |
 | `job.blocked`                   | a job reaches the `blocked` terminal state                                         |
 | `job.needs_attention`           | a tree pauses awaiting a human (the `escalate_human` pause today)                  |
+| `job.deferred`                  | the daemon re-queued a job that just emitted `job.failed` because the failure classified as a retryable operational blocker (runtime auth, rate limit/quota) — it will be re-dispatched automatically |
 | `candidate.awaiting_promotion`  | a SkillOpt template candidate becomes `pending` after import (always, off the auto-promote policy) |
 | `candidate.auto_promoted`       | the off-by-default `[skillopt].auto_promote` policy auto-promoted a candidate to `current` (also the canary GRADUATE event) |
 | `candidate.canary_started`      | the off-by-default `[skillopt].auto_promote_canary` policy promoted a candidate to the `canary` state behind the live champion |
@@ -30,6 +31,17 @@ succeeded/failed/blocked emit on its `Mailbox` terminal path; the daemon owns th
 pre-flight (`queued -> failed|blocked`) and permission-blocked cases that never
 pass through that path. `job.needs_attention` is emitted once per fresh
 escalation round (a re-advance does not re-emit).
+
+**`job.failed` followed by `job.deferred` is NOT terminal.** When a run fails on
+a classified operational blocker (runtime auth rejected, provider rate
+limit/quota), the engine has already emitted `job.failed` for that run before the
+daemon decides to defer; the daemon then emits `job.deferred` for the same
+`job_id` (detail carries the blocker class, the `attempt N/M` retry budget, and
+the earliest `retry at` timestamp) and silently re-dispatches the job after the
+hold. Consumers acting on `job.failed` (recovery, alerting, cleanup) should
+suppress terminal handling for a job whose `job.failed` is followed by a
+`job.deferred`, and treat only a `job.failed` with no subsequent `job.deferred`
+as final.
 
 The two `candidate.*` events come from the `skillopt import` / `train continue`
 CLI path, NOT the daemon. When a candidate becomes `pending`,

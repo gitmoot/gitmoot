@@ -47,6 +47,40 @@ func TestRetryJobRequeuesTerminalJobAndPreservesPayload(t *testing.T) {
 	}
 }
 
+// TestRetryJobClearsOperationalBlockerContext proves a human-requested retry is
+// a fresh lifecycle for the #532 machinery: (a) a cancel→retry of a held job
+// must not silently re-enter the old hold (a stale blocker_retry_at hours out
+// would park the retried job with a contradictory #552 stuck reason), and (b) a
+// post-exhaustion retry must regain the full deferral budget instead of
+// terminally failing on its first ordinary transient 429.
+func TestRetryJobClearsOperationalBlockerContext(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	hold := time.Now().UTC().Add(6 * time.Hour).Format(time.RFC3339Nano)
+	payload := `{"repo":"owner/repo","branch":"main","blocker_class":"runtime_quota","blocker_attempts":3,"blocker_retry_at":"` + hold + `"}`
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-held", Agent: "audit", Type: "ask", State: string(JobFailed), Payload: payload}, db.JobEvent{
+		Kind:    string(JobFailed),
+		Message: "operational blocker exhausted",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+
+	job, err := RetryJob(ctx, store, "job-held")
+	if err != nil {
+		t.Fatalf("RetryJob returned error: %v", err)
+	}
+	if job.State != string(JobQueued) {
+		t.Fatalf("job after retry = %+v", job)
+	}
+	stored, err := unmarshalPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	if stored.BlockerClass != "" || stored.BlockerAttempts != 0 || stored.BlockerRetryAt != "" {
+		t.Fatalf("payload after manual retry still carries blocker context: %+v", stored)
+	}
+}
+
 func TestRetryJobClearsReadOnlyNoTaskWorktreePath(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
