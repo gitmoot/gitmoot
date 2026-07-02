@@ -1203,7 +1203,7 @@ func TestDaemonWorkerTickRetriesFailedResultCommentPost(t *testing.T) {
 	}
 
 	comments.postErr = nil
-	if err := retryPendingJobComments(ctx, worker, "owner/repo", ""); err != nil {
+	if err := retryPendingJobComments(ctx, worker, "owner/repo", "", newTickCandidates(worker.Store)); err != nil {
 		t.Fatalf("retryPendingJobComments returned error: %v", err)
 	}
 	if len(comments.posted) != 1 {
@@ -1245,7 +1245,7 @@ func TestRetryPendingJobCommentsPreservesStoredFailureDiagnostic(t *testing.T) {
 		return comments
 	}
 
-	if err := retryPendingJobComments(ctx, worker, "owner/repo", ""); err != nil {
+	if err := retryPendingJobComments(ctx, worker, "owner/repo", "", newTickCandidates(worker.Store)); err != nil {
 		t.Fatalf("retryPendingJobComments returned error: %v", err)
 	}
 
@@ -4573,7 +4573,7 @@ func TestRunQueuedJobsRecordsPostDeliveryWorkflowErrorForRetry(t *testing.T) {
 	}
 	gate.err = nil
 	gate.decision = workflow.MergeDecision{Ready: true}
-	if err := retryPendingJobAdvancements(ctx, worker, "", "", nil); err != nil {
+	if err := retryPendingJobAdvancements(ctx, worker, "", "", nil, newTickCandidates(worker.Store)); err != nil {
 		t.Fatalf("retryPendingJobAdvancements returned error: %v", err)
 	}
 	if adapter.calls != 1 {
@@ -4630,7 +4630,7 @@ func TestRetryPendingJobAdvancementsRecoversStartedAdvancement(t *testing.T) {
 		return workflow.Engine{Store: store, MergeGate: gate}
 	}
 
-	if err := retryPendingJobAdvancements(ctx, worker, "", "", nil); err != nil {
+	if err := retryPendingJobAdvancements(ctx, worker, "", "", nil, newTickCandidates(worker.Store)); err != nil {
 		t.Fatalf("retryPendingJobAdvancements returned error: %v", err)
 	}
 
@@ -4684,7 +4684,7 @@ func TestRetryPendingJobAdvancementsAdvancesFailedStoredResult(t *testing.T) {
 		return workflow.Engine{Store: store}
 	}
 
-	if err := retryPendingJobAdvancements(ctx, worker, "", "", nil); err != nil {
+	if err := retryPendingJobAdvancements(ctx, worker, "", "", nil, newTickCandidates(worker.Store)); err != nil {
 		t.Fatalf("retryPendingJobAdvancements returned error: %v", err)
 	}
 
@@ -4792,7 +4792,7 @@ func TestRetryPendingJobAdvancementsRefreshesImplementedHeadBeforePreflight(t *t
 		return daemonWorkflowEngine(store, github.NoopClient{}, checkout, "")
 	}
 
-	if err := retryPendingJobAdvancements(ctx, worker, "", "", nil); err != nil {
+	if err := retryPendingJobAdvancements(ctx, worker, "", "", nil, newTickCandidates(worker.Store)); err != nil {
 		t.Fatalf("retryPendingJobAdvancements returned error: %v", err)
 	}
 
@@ -5152,7 +5152,7 @@ func TestReclaimSkippedDelegationWorktrees(t *testing.T) {
 				}
 			}
 
-			if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", "", nil); err != nil {
+			if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(worker.Store)); err != nil {
 				t.Fatalf("reclaimSkippedDelegationWorktrees returned error: %v", err)
 			}
 
@@ -5250,7 +5250,7 @@ func TestReclaimSkippedDelegationWorktreesBoundedToMarkedJobs(t *testing.T) {
 		}
 	}
 
-	if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", "", nil); err != nil {
+	if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(worker.Store)); err != nil {
 		t.Fatalf("reclaimSkippedDelegationWorktrees returned error: %v", err)
 	}
 
@@ -6903,7 +6903,7 @@ func TestRetryPendingJobAdvancementsBoundedToCandidates(t *testing.T) {
 		return "", errors.New("stop after capture")
 	}
 
-	if err := retryPendingJobAdvancements(ctx, worker, "owner/repo", "", nil); err != nil {
+	if err := retryPendingJobAdvancements(ctx, worker, "owner/repo", "", nil, newTickCandidates(worker.Store)); err != nil {
 		t.Fatalf("retryPendingJobAdvancements returned error: %v", err)
 	}
 
@@ -6979,7 +6979,7 @@ func TestRetryPendingJobCommentsBoundedToCandidates(t *testing.T) {
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CommenterFactory = func(string) github.Client { return comments }
 
-	if err := retryPendingJobComments(ctx, worker, "owner/repo", ""); err != nil {
+	if err := retryPendingJobComments(ctx, worker, "owner/repo", "", newTickCandidates(worker.Store)); err != nil {
 		t.Fatalf("retryPendingJobComments returned error: %v", err)
 	}
 
@@ -7198,5 +7198,99 @@ func TestSameSessionSiblingsHeldBackOnBusy(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(attempts); got != 1 {
 		t.Fatalf("dispatch attempts = %d, want exactly 1 (same-session sibling must be held back)", got)
+	}
+}
+
+// countingCandidateStore wraps a real *db.Store and counts how many times each of
+// the three per-tick candidate GROUP BY queries executes, delegating to the store
+// so the query still runs (returning the real, empty result on a job-free DB). It
+// backs TestTickCandidatesComputedOncePerTick's proof that the #619 hoist runs each
+// candidate query once per tick, not once per enabled repo.
+type countingCandidateStore struct {
+	inner   *db.Store
+	advance int32
+	comment int32
+	reclaim int32
+}
+
+func (c *countingCandidateStore) JobIDsWithPendingAdvanceRetry(ctx context.Context) ([]string, error) {
+	atomic.AddInt32(&c.advance, 1)
+	return c.inner.JobIDsWithPendingAdvanceRetry(ctx)
+}
+
+func (c *countingCandidateStore) JobIDsWithPendingCommentRetry(ctx context.Context) ([]string, error) {
+	atomic.AddInt32(&c.comment, 1)
+	return c.inner.JobIDsWithPendingCommentRetry(ctx)
+}
+
+func (c *countingCandidateStore) JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) ([]string, error) {
+	atomic.AddInt32(&c.reclaim, 1)
+	return c.inner.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+}
+
+// TestTickCandidatesComputedOncePerTick pins the #619 hoist: the three repo-agnostic
+// candidate GROUP BY queries must run ONCE per supervisor tick, not once per enabled
+// repo. It substitutes a carrier over a shared counter for every newTickCandidates
+// call the tick makes; a regression that rebuilds the carrier per repo fires the
+// constructor (and thus the shared counter) once per repo and trips the asserts.
+func TestTickCandidatesComputedOncePerTick(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	const repoCount = 3
+	for i := 0; i < repoCount; i++ {
+		seedDaemonWorkerRepo(t, store, fmt.Sprintf("owner/repo%d", i), t.TempDir())
+	}
+	worker := defaultJobWorker(store, io.Discard)
+
+	counter := &countingCandidateStore{inner: store}
+	realNewTickCandidates := newTickCandidates
+	newTickCandidates = func(tickCandidateStore) *tickCandidates {
+		return realNewTickCandidates(counter)
+	}
+	defer func() { newTickCandidates = realNewTickCandidates }()
+
+	reset := func() {
+		atomic.StoreInt32(&counter.advance, 0)
+		atomic.StoreInt32(&counter.comment, 0)
+		atomic.StoreInt32(&counter.reclaim, 0)
+	}
+	now := time.Now().UTC()
+
+	// Multi-repo sweep: each candidate query runs exactly once for the whole sweep.
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, nil); err != nil {
+		t.Fatalf("runEnabledRepoWorkerTicksTracked returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&counter.advance); got != 1 {
+		t.Fatalf("advance-retry query ran %d times across %d repos, want 1", got, repoCount)
+	}
+	if got := atomic.LoadInt32(&counter.comment); got != 1 {
+		t.Fatalf("comment-retry query ran %d times across %d repos, want 1", got, repoCount)
+	}
+	if got := atomic.LoadInt32(&counter.reclaim); got != 1 {
+		t.Fatalf("delegation-reclaim query ran %d times across %d repos, want 1", got, repoCount)
+	}
+
+	// Single-repo tick with a nil carrier self-computes each query at most once.
+	reset()
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 1, false, "owner/repo0", "", io.Discard, now, nil, nil); err != nil {
+		t.Fatalf("runDaemonWorkerTickTracked returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&counter.advance); got != 1 {
+		t.Fatalf("single-repo advance-retry query ran %d times, want 1", got)
+	}
+	if got := atomic.LoadInt32(&counter.comment); got != 1 {
+		t.Fatalf("single-repo comment-retry query ran %d times, want 1", got)
+	}
+	if got := atomic.LoadInt32(&counter.reclaim); got != 1 {
+		t.Fatalf("single-repo delegation-reclaim query ran %d times, want 1", got)
+	}
+
+	// A dry-run tick returns before computing any candidate set.
+	reset()
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 1, true, "owner/repo0", "", io.Discard, now, nil, nil); err != nil {
+		t.Fatalf("dry-run runDaemonWorkerTickTracked returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&counter.advance) + atomic.LoadInt32(&counter.comment) + atomic.LoadInt32(&counter.reclaim); got != 0 {
+		t.Fatalf("dry-run ran %d candidate queries, want 0", got)
 	}
 }

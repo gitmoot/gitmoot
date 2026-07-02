@@ -618,7 +618,7 @@ func TestTrackedTickMaintenanceNotStarvedByInFlightJobs(t *testing.T) {
 		return daemonWorkerHasEvent(events, kind)
 	}
 
-	if err := runDaemonWorkerTickTracked(ctx, store, worker, 2, false, "owner/repo", "", io.Discard, time.Now().UTC(), tracker); err != nil {
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 2, false, "owner/repo", "", io.Discard, time.Now().UTC(), tracker, nil); err != nil {
 		t.Fatalf("tick (busy repo): %v", err)
 	}
 	if len(comments.posted) != 1 {
@@ -633,7 +633,7 @@ func TestTrackedTickMaintenanceNotStarvedByInFlightJobs(t *testing.T) {
 
 	// Holder finishes -> the shared-checkout advancement is retried next tick.
 	tracker.end("job-live")
-	if err := runDaemonWorkerTickTracked(ctx, store, worker, 2, false, "owner/repo", "", io.Discard, time.Now().UTC(), tracker); err != nil {
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 2, false, "owner/repo", "", io.Discard, time.Now().UTC(), tracker, nil); err != nil {
 		t.Fatalf("tick (idle repo): %v", err)
 	}
 	if !hasEvent("job-adv-repo", "advance_retried") {

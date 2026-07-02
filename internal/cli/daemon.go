@@ -2212,7 +2212,9 @@ func startSingleRepoWorkerLoop(ctx context.Context, interval time.Duration, stor
 		_, workers, usePool := live.snapshot()
 		w := worker
 		w.UsePool = usePool
-		return runDaemonWorkerTickTracked(ctx, store, w, workers, false, repo, rootFilter, stdout, now, tracker)
+		// nil carrier: this single-repo supervisor tick self-computes the shared
+		// candidate sets once for its own tick (#619).
+		return runDaemonWorkerTickTracked(ctx, store, w, workers, false, repo, rootFilter, stdout, now, tracker, nil)
 	})
 }
 
@@ -3065,6 +3067,79 @@ func runQueuedJobs(ctx context.Context, worker jobWorker, limit int) error {
 	return runQueuedJobsForRepo(ctx, worker, limit, "", "")
 }
 
+// tickCandidates memoizes the three per-tick job-candidate GROUP BY queries
+// (advance-retry / comment-retry / delegation-worktree-reclaim) so they run ONCE
+// per supervisor tick instead of once per enabled repo (#619). Each query takes
+// NO repo argument — they scan the whole job_events table and return the global
+// candidate set — yet the retry passes ran them inside runDaemonWorkerTickTracked,
+// which the multi-repo supervisor invokes once per enabled repo (18×/tick on the
+// affected VPS). The most expensive of the three (JobIDsWithPendingAdvanceRetry)
+// materialized ~23.67 MiB of row fetches per call, so re-running it per repo was
+// the single largest source of the daemon's idle read volume. Hoisting it here
+// keeps per-repo filtering exactly where it was (in Go, in the retry passes) while
+// collapsing the shared query to one execution.
+//
+// No mutex/sync.Once: it is consumed ONLY on the synchronous tick goroutine — the
+// per-repo loop in runEnabledRepoWorkerTicksTracked is sequential, and dispatched
+// jobs run on their own goroutines and never touch it. It is created FRESH each
+// tick (so a candidate that stops qualifying next tick is re-evaluated) and MUST
+// NOT be stored on the long-lived tracker/worker. A query error is memoized like a
+// result: within one tick a transient store fault fails every repo's pass
+// identically, and the next tick's fresh carrier re-queries.
+//
+// The store dependency is the narrow tickCandidateStore interface (satisfied by
+// *db.Store) purely so a counting fake can pin the once-per-tick property in tests;
+// production always threads the real *db.Store, so behavior is byte-identical.
+type tickCandidateStore interface {
+	JobIDsWithPendingAdvanceRetry(ctx context.Context) ([]string, error)
+	JobIDsWithPendingCommentRetry(ctx context.Context) ([]string, error)
+	JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) ([]string, error)
+}
+
+type tickCandidates struct {
+	store       tickCandidateStore
+	advanceDone bool
+	advanceIDs  []string
+	advanceErr  error
+	commentDone bool
+	commentIDs  []string
+	commentErr  error
+	reclaimDone bool
+	reclaimIDs  []string
+	reclaimErr  error
+}
+
+// newTickCandidates is a package var (not a plain func) only so the once-per-tick
+// regression test can substitute a carrier backed by a counting store; production
+// never reassigns it.
+var newTickCandidates = func(store tickCandidateStore) *tickCandidates {
+	return &tickCandidates{store: store}
+}
+
+func (c *tickCandidates) advanceRetryCandidates(ctx context.Context) ([]string, error) {
+	if !c.advanceDone {
+		c.advanceIDs, c.advanceErr = c.store.JobIDsWithPendingAdvanceRetry(ctx)
+		c.advanceDone = true
+	}
+	return c.advanceIDs, c.advanceErr
+}
+
+func (c *tickCandidates) commentRetryCandidates(ctx context.Context) ([]string, error) {
+	if !c.commentDone {
+		c.commentIDs, c.commentErr = c.store.JobIDsWithPendingCommentRetry(ctx)
+		c.commentDone = true
+	}
+	return c.commentIDs, c.commentErr
+}
+
+func (c *tickCandidates) delegationReclaimCandidates(ctx context.Context) ([]string, error) {
+	if !c.reclaimDone {
+		c.reclaimIDs, c.reclaimErr = c.store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+		c.reclaimDone = true
+	}
+	return c.reclaimIDs, c.reclaimErr
+}
+
 // retryPendingJobAdvancements re-fires the post-delivery advancement for any
 // terminal job whose latest advancement event is still an unreconciled attempt
 // marker (advance_started/advance_retry). It is BOUNDED, not a full-table scan
@@ -3075,6 +3150,8 @@ func runQueuedJobs(ctx context.Context, worker jobWorker, limit int) error {
 // marker, and GetJob's just those. Each candidate is then re-verified with the Go
 // predicate jobNeedsAdvanceRetry, so behavior is identical to the old per-job walk;
 // the state/repo/session filters and the checkoutHeld gate are preserved verbatim.
+// The candidate set comes from the per-tick tickCandidates carrier (#619) so the
+// underlying GROUP BY query runs once per tick, not once per enabled repo.
 //
 // checkoutHeld (nil ⇒ no gate, the legacy inline-tick behavior) reports whether an
 // in-flight dispatched job currently holds a checkout key: a candidate whose own
@@ -3083,8 +3160,8 @@ func runQueuedJobs(ctx context.Context, worker jobWorker, limit int) error {
 // retried on a later tick once the key frees, instead of gating ALL retries on
 // whole-repo idleness (which a steady backlog can prevent indefinitely, freezing
 // merge retries).
-func retryPendingJobAdvancements(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string, checkoutHeld func(string) bool) error {
-	jobIDs, err := worker.Store.JobIDsWithPendingAdvanceRetry(ctx)
+func retryPendingJobAdvancements(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string, checkoutHeld func(string) bool, cand *tickCandidates) error {
+	jobIDs, err := cand.advanceRetryCandidates(ctx)
 	if err != nil {
 		return err
 	}
@@ -3166,8 +3243,8 @@ func (w jobWorker) delegationWorktreeCleanupPending(ctx context.Context, jobID s
 // marker and are reclaimed on a later tick, so under a steady backlog preserved
 // worktrees are still reclaimed instead of leaking until full idleness (#562
 // review).
-func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string, checkoutHeld func(string) bool) error {
-	jobIDs, err := worker.Store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string, checkoutHeld func(string) bool, cand *tickCandidates) error {
+	jobIDs, err := cand.delegationReclaimCandidates(ctx)
 	if err != nil {
 		return err
 	}
@@ -3201,7 +3278,7 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 }
 
 func runDaemonWorkerTick(ctx context.Context, store *db.Store, worker jobWorker, workers int, dryRun bool, repoFilter string, rootFilter string, stdout io.Writer, now time.Time) error {
-	return runDaemonWorkerTickTracked(ctx, store, worker, workers, dryRun, repoFilter, rootFilter, stdout, now, nil)
+	return runDaemonWorkerTickTracked(ctx, store, worker, workers, dryRun, repoFilter, rootFilter, stdout, now, nil, nil)
 }
 
 // runDaemonWorkerTickTracked is the per-tick worker pass. With a nil tracker it
@@ -3223,9 +3300,17 @@ func runDaemonWorkerTick(ctx context.Context, store *db.Store, worker jobWorker,
 //   - dispatch goes through dispatchQueuedJobsTracked, which returns promptly
 //     and bounds in-flight jobs by both the repo limit and the host-global
 //     --workers cap.
-func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker jobWorker, workers int, dryRun bool, repoFilter string, rootFilter string, stdout io.Writer, now time.Time, tracker *inflightJobTracker) error {
+func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker jobWorker, workers int, dryRun bool, repoFilter string, rootFilter string, stdout io.Writer, now time.Time, tracker *inflightJobTracker, cand *tickCandidates) error {
 	if dryRun {
 		return nil
+	}
+	// A nil carrier means this is a standalone tick (single-repo supervisor or the
+	// runDaemonWorkerTick wrapper): compute the shared candidate sets once for THIS
+	// tick. The multi-repo supervisor passes a carrier it created once per tick, so
+	// the three GROUP BY queries run once per tick rather than once per enabled repo
+	// (#619).
+	if cand == nil {
+		cand = newTickCandidates(worker.Store)
 	}
 	inflightIDs := tracker.inflightIDs()
 	if err := recoverRunningJobsBeforeForRepoSkipping(ctx, store, stdout, now, now.Add(-configuredDaemonRunningJobStaleAfter(stdout)), repoFilter, rootFilter, inflightIDs); err != nil {
@@ -3247,10 +3332,10 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	// on its own goroutine, so it still defers the whole block (matching main,
 	// where a live pool pass blocked the tick entirely).
 	if !tracker.poolRunning(repoFilter) {
-		if err := retryPendingJobAdvancements(ctx, worker, repoFilter, rootFilter, tracker.checkoutHeld); err != nil {
+		if err := retryPendingJobAdvancements(ctx, worker, repoFilter, rootFilter, tracker.checkoutHeld, cand); err != nil {
 			return err
 		}
-		if err := reclaimSkippedDelegationWorktrees(ctx, worker, repoFilter, rootFilter, tracker.checkoutHeld); err != nil {
+		if err := reclaimSkippedDelegationWorktrees(ctx, worker, repoFilter, rootFilter, tracker.checkoutHeld, cand); err != nil {
 			return err
 		}
 	}
@@ -3260,7 +3345,7 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	// Gating them on an idle repo would let one multi-hour in-flight job delay a
 	// transiently-failed result comment (and any downstream automation waiting
 	// on it) for the job's whole duration.
-	if err := retryPendingJobComments(ctx, worker, repoFilter, rootFilter); err != nil {
+	if err := retryPendingJobComments(ctx, worker, repoFilter, rootFilter, cand); err != nil {
 		return err
 	}
 	// Per-repo concurrency override (#576): a [repos."owner/repo"] section caps
@@ -3291,6 +3376,13 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 	if err != nil {
 		return err
 	}
+	// Compute the shared per-tick job-candidate sets ONCE for this whole sweep and
+	// pass the carrier into every enabled repo's tick (#619). The three GROUP BY
+	// candidate queries take no repo argument — they return the global candidate set
+	// that each repo's retry pass then filters in Go — so running them once here
+	// instead of once inside each runDaemonWorkerTickTracked collapses 18×/tick down
+	// to 1×/tick on a multi-repo daemon. Fresh each sweep; never retained.
+	cand := newTickCandidates(worker.Store)
 	// Scope tick faults per repo (#555 follow-up): the recovering supervisor
 	// treats a returned error as one fleet-wide failure unit and, after a bounded
 	// streak, exits the WHOLE daemon. Returning on the first repo's error would
@@ -3312,7 +3404,7 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 		if lock != nil {
 			lock.Lock()
 		}
-		tickErr := runDaemonWorkerTickTracked(ctx, store, worker, workers, false, repo.FullName(), rootFilter, stdout, now, tracker)
+		tickErr := runDaemonWorkerTickTracked(ctx, store, worker, workers, false, repo.FullName(), rootFilter, stdout, now, tracker, cand)
 		if lock != nil {
 			lock.Unlock()
 		}
@@ -3355,8 +3447,8 @@ func jobStateCanRetryAdvancement(state string) bool {
 // with the Go predicate jobNeedsCommentRetry, so behavior is identical. Comment
 // retries never touch a checkout, so (unlike advancements) they take no checkoutHeld
 // gate.
-func retryPendingJobComments(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string) error {
-	jobIDs, err := worker.Store.JobIDsWithPendingCommentRetry(ctx)
+func retryPendingJobComments(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string, cand *tickCandidates) error {
+	jobIDs, err := cand.commentRetryCandidates(ctx)
 	if err != nil {
 		return err
 	}
