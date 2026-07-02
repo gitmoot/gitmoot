@@ -183,7 +183,10 @@ mirrors the off-by-default `[events]` stream.
   external CI at head) → **near-neutral** (`soft ≈ 0.5`, `choice = a`), never a
   strong positive. Rewarding an empty gate would optimize toward "merges that
   pass no real CI"; the no-CI guard reads the combined status at the merged head
-  SHA and demotes it.
+  SHA and demotes it. (On the merge side, an empty gate is itself deferred by a
+  grace window and workflow-awareness before it ever stamps `gitmoot/ci` — see
+  [`SAFETY.md`](../skills/gitmoot/references/SAFETY.md); #596 — so this
+  near-neutral band applies only to genuinely CI-less heads.)
 - **Blocked at the merge gate** → authoritative gate-fail (`hard = 0`,
   `choice = b`).
 - **Review changes_requested** → graded negative (`choice = b`) whose score

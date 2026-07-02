@@ -45,7 +45,10 @@ func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 				{Context: gitmootMergeGateContext, State: "failure"},
 			},
 		},
-		checks:      []github.PullRequestCheck{{Name: gitmootMergeGateContext, Bucket: "fail", State: "FAILURE"}},
+		checks: []github.PullRequestCheck{
+			{Name: gitmootMergeGateContext, Bucket: "fail", State: "FAILURE"},
+			{Name: "ci", Bucket: "pass", State: "SUCCESS"},
+		},
 		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
 	}
 	git := &fakeMergeGateGit{clean: true}
@@ -62,7 +65,10 @@ func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 	if len(gh.merges) != 1 || gh.merges[0].Method != "squash" || gh.merges[0].MatchHeadCommit != "head123" || !gh.merges[0].DeleteBranch {
 		t.Fatalf("merge inputs = %+v", gh.merges)
 	}
-	if !hasStatus(gh.statuses, gitmootNoCIContext, "success") || !hasStatus(gh.statuses, gitmootMergeGateContext, "success") {
+	// A PR with a passing external check merges through the gate WITHOUT the
+	// synthetic gitmoot/ci no-CI stamp (#596: that stamp is only for genuinely
+	// CI-less heads, and only after the grace window).
+	if !hasStatus(gh.statuses, gitmootMergeGateContext, "success") || hasStatus(gh.statuses, gitmootNoCIContext, "success") {
 		t.Fatalf("statuses = %+v", gh.statuses)
 	}
 	if _, err := store.GetBranchLock(ctx, "jerryfane/gitmoot", "task-9"); !errors.Is(err, sql.ErrNoRows) {
@@ -108,7 +114,7 @@ func TestPolicyMergeGateCleansTaskWorktreeAfterMerge(t *testing.T) {
 	mergeable := true
 	gh := &fakeMergeGateGitHub{
 		pr:          github.PullRequest{Number: 9, State: "open", URL: "https://github.com/jerryfane/gitmoot/pull/9", HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
-		status:      github.CombinedStatus{State: "success"},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
 		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
 	}
 	cleaner := &fakeWorktreeCleaner{}
@@ -155,7 +161,7 @@ func TestPolicyMergeGateReportsWorktreeCleanupWarning(t *testing.T) {
 	mergeable := true
 	gh := &fakeMergeGateGitHub{
 		pr:          github.PullRequest{Number: 9, State: "open", URL: "https://github.com/jerryfane/gitmoot/pull/9", HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
-		status:      github.CombinedStatus{State: "success"},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
 		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
 	}
 	cleaner := &fakeWorktreeCleaner{err: errors.New("worktree has uncommitted files")}
@@ -199,7 +205,7 @@ func TestPolicyMergeGateDoesNotCleanWorktreeForMismatchedTaskBranch(t *testing.T
 	mergeable := true
 	gh := &fakeMergeGateGitHub{
 		pr:          github.PullRequest{Number: 9, State: "open", URL: "https://github.com/jerryfane/gitmoot/pull/9", HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
-		status:      github.CombinedStatus{State: "success"},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
 		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
 	}
 	cleaner := &fakeWorktreeCleaner{}
@@ -248,7 +254,7 @@ func TestPolicyMergeGateLocksCheckoutDuringLocalBaseUpdate(t *testing.T) {
 	mergeable := true
 	gh := &fakeMergeGateGitHub{
 		pr:          github.PullRequest{Number: 9, State: "open", URL: "https://github.com/jerryfane/gitmoot/pull/9", HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
-		status:      github.CombinedStatus{State: "success"},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
 		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
 	}
 	git := &fakeMergeGateGit{clean: true, onUpdate: func() {
@@ -298,7 +304,7 @@ func TestPolicyMergeGateReturnsRetryableErrorForBusyCheckout(t *testing.T) {
 	mergeable := true
 	gh := &fakeMergeGateGitHub{
 		pr:          github.PullRequest{Number: 9, State: "open", URL: "https://github.com/jerryfane/gitmoot/pull/9", HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
-		status:      github.CombinedStatus{State: "success"},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
 		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
 	}
 	git := &fakeMergeGateGit{clean: true}
@@ -354,7 +360,7 @@ func TestPolicyMergeGateDoesNotRecordPreMergeSyntheticSHA(t *testing.T) {
 			MergeSHA:  "synthetic-premerge-sha",
 			Mergeable: &mergeable,
 		},
-		status:      github.CombinedStatus{State: "success"},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
 		mergeResult: github.MergeResult{Merged: true},
 	}
 	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
@@ -706,7 +712,7 @@ func TestPolicyMergeGateKeepsQueuedMergePending(t *testing.T) {
 	mergeable := true
 	gh := &fakeMergeGateGitHub{
 		pr:          github.PullRequest{Number: 9, HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
-		status:      github.CombinedStatus{State: "success"},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
 		mergeResult: github.MergeResult{Message: "pull request merge is pending"},
 	}
 	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
@@ -736,7 +742,7 @@ func TestPolicyMergeGateAllowsReviewOptionalPullRequest(t *testing.T) {
 	mergeable := true
 	gh := &fakeMergeGateGitHub{
 		pr:          github.PullRequest{Number: 9, HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
-		status:      github.CombinedStatus{State: "success"},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
 		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
 	}
 	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
@@ -843,7 +849,7 @@ func TestPolicyMergeGateUsesLatestNumericReviewRound(t *testing.T) {
 	mergeable := true
 	gh := &fakeMergeGateGitHub{
 		pr:          github.PullRequest{Number: 9, HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
-		status:      github.CombinedStatus{State: "success"},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
 		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
 	}
 	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
@@ -910,7 +916,7 @@ func TestPolicyMergeGateBlocksLegacyReviewWithoutHeadSHA(t *testing.T) {
 	mergeable := true
 	gh := &fakeMergeGateGitHub{
 		pr:          github.PullRequest{Number: 9, HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
-		status:      github.CombinedStatus{State: "success"},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
 		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
 	}
 	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
@@ -959,7 +965,7 @@ func TestPolicyMergeGateAdvancesIntegrationWorktreeReviewWithoutHeadSHA(t *testi
 	mergeable := true
 	gh := &fakeMergeGateGitHub{
 		pr:          github.PullRequest{Number: 9, HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
-		status:      github.CombinedStatus{State: "success"},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
 		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
 	}
 	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}

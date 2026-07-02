@@ -490,6 +490,21 @@ type MergeGate struct {
 	Reason       string
 }
 
+// NoCIObservation records the first merge-gate evaluation that saw zero external
+// CI (no external commit-statuses AND no check-runs) at a given head SHA (#596).
+// The merge gate uses it to defer concluding "no CI" until a second consecutive
+// zero-external observation at the SAME head, at least a grace window later, so a
+// fresh head cannot merge before GitHub Actions has created its check run. A new
+// head resets the observation.
+type NoCIObservation struct {
+	RepoFullName string
+	PullRequest  int64
+	HeadSHA      string
+	// FirstZeroAt is the RFC3339Nano timestamp of the first zero-external
+	// observation at HeadSHA.
+	FirstZeroAt string
+}
+
 type Pinger interface {
 	Close() error
 	Ping(ctx context.Context) error
@@ -5567,6 +5582,34 @@ func (s *Store) GetMergeGate(ctx context.Context, repoFullName string, pullReque
 	return gate, nil
 }
 
+// UpsertNoCIObservation records (or refreshes) the first zero-external CI
+// observation for a PR (#596). Recording at a new head SHA overwrites the prior
+// observation, which is exactly the reset-on-new-head semantics the merge gate
+// relies on.
+func (s *Store) UpsertNoCIObservation(ctx context.Context, obs NoCIObservation) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO merge_gate_ci_observations(repo_full_name, pull_request, head_sha, first_zero_at, updated_at)
+		VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(repo_full_name, pull_request) DO UPDATE SET
+			head_sha = excluded.head_sha,
+			first_zero_at = excluded.first_zero_at,
+			updated_at = CURRENT_TIMESTAMP`,
+		obs.RepoFullName, obs.PullRequest, obs.HeadSHA, obs.FirstZeroAt)
+	return err
+}
+
+// GetNoCIObservation returns the recorded first zero-external CI observation for
+// a PR, or sql.ErrNoRows if none has been recorded yet (#596).
+func (s *Store) GetNoCIObservation(ctx context.Context, repoFullName string, pullRequest int64) (NoCIObservation, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT repo_full_name, pull_request, head_sha, first_zero_at
+		FROM merge_gate_ci_observations WHERE repo_full_name = ? AND pull_request = ?`,
+		repoFullName, pullRequest)
+	var obs NoCIObservation
+	if err := row.Scan(&obs.RepoFullName, &obs.PullRequest, &obs.HeadSHA, &obs.FirstZeroAt); err != nil {
+		return NoCIObservation{}, err
+	}
+	return obs, nil
+}
+
 func (s *Store) HasTable(ctx context.Context, name string) (bool, error) {
 	if strings.ContainsAny(name, "'\"`;") {
 		return false, fmt.Errorf("unsafe table name: %s", name)
@@ -6882,6 +6925,25 @@ CREATE TABLE issue_comment_poll_state (
 	repo_full_name TEXT PRIMARY KEY,
 	last_seen_comment_at TEXT NOT NULL DEFAULT '',
 	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+	`,
+	// #596 merge-gate no-CI race: one row per PR recording the FIRST evaluation at
+	// which the merge gate saw zero external commit-statuses AND zero check-runs at
+	// a given head. The gate defers concluding "this repo has no CI" until a SECOND
+	// consecutive zero-external observation at the SAME head, at least min_ci_wait
+	// later — closing the window where a fresh head merges before GitHub Actions has
+	// created its check run. A new head resets the observation. Pure additive append
+	// (CREATE TABLE only); the table stays empty until a zero-external evaluation
+	// occurs and is read only on the no-CI path, so every existing DB reads
+	// identically.
+	`
+CREATE TABLE merge_gate_ci_observations (
+	repo_full_name TEXT NOT NULL,
+	pull_request INTEGER NOT NULL,
+	head_sha TEXT NOT NULL DEFAULT '',
+	first_zero_at TEXT NOT NULL DEFAULT '',
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE(repo_full_name, pull_request)
 );
 	`,
 }

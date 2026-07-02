@@ -246,5 +246,22 @@ path = ""
 # claude_memory_gb = 0.85
 # kimi_memory_gb = 0.5
 # default_memory_gb = 0.5
+
+# [merge_gate] tunes how the native merge gate handles a PR head that reports NO
+# external CI (issue #596). By default (no section) the gate defers concluding
+# "no CI" until a SECOND consecutive zero-external observation at the same head,
+# at least min_ci_wait later, so a fresh head cannot merge before GitHub Actions
+# creates its check run. When .github/workflows/ exists at the head it instead
+# waits up to max_ci_wait (default 10m) for a check to appear, then concludes
+# no-CI so a PR whose workflows never trigger for it (docs-only under paths
+# filters, tag-only or workflow_dispatch-only workflows, a non-targeted branch)
+# still merges rather than wedging forever. Set require_external_ci = true to
+# instead HARD-BLOCK an empty gate once that window elapses (for repos you know
+# always have CI). All keys can be set globally and overridden per repo under
+# [repos."owner/repo".merge_gate].
+# [merge_gate]
+# require_external_ci = false
+# min_ci_wait = "60s"
+# max_ci_wait = "10m"
 `, paths.Database, paths.Logs, paths.Workspaces, paths.Evals, paths.ArtifactBlobs)
 }

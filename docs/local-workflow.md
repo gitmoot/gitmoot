@@ -441,6 +441,20 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    the PR branch with the expected head SHA and leaves the merge gate pending so
    the daemon can reload the new head and checks on a later poll tick.
 
+   When a head reports **no** external CI at all (zero commit-statuses and zero
+   check-runs), Gitmoot does not conclude "this repo has no CI" from a single
+   observation — GitHub Actions creates a check-run a few seconds after a push,
+   so the gate stays **pending** and only stamps the synthetic `gitmoot/ci`
+   success after a second consecutive zero-external observation at the same head,
+   at least `[merge_gate] min_ci_wait` (default `60s`) later. When
+   `.github/workflows/` exists at the head tree it instead waits up to
+   `[merge_gate] max_ci_wait` (default `10m`) for a check to appear, then concludes
+   no-CI so a PR whose workflows never trigger for it still merges rather than
+   wedging forever. Set `[merge_gate] require_external_ci = true` (global or
+   per-repo) to hard-block an empty gate once that window elapses instead of ever
+   stamping `gitmoot/ci` (see
+   [`skills/gitmoot/references/SAFETY.md`](../skills/gitmoot/references/SAFETY.md)).
+
 9. Merge and continue.
 
    By default Gitmoot merges with a squash merge guarded by the current head SHA.

@@ -529,6 +529,19 @@ Fixes:
   `gitmoot task list` / `gitmoot job events <job-id>`. Resolve the conflict
   manually or run an explicit implement/fix job, then rerun review/merge.
 - Fix failing external CI or Gitmoot statuses.
+- If the reason reads `waiting to confirm no external CI` (or `waiting … for CI
+  to be created`), the gate saw **zero** external commit-statuses and check-runs
+  at the head and is deferring rather than merging before GitHub Actions creates
+  its run (#596). A genuinely CI-less repo merges on the next tick after
+  `[merge_gate] min_ci_wait` (default `60s`) has elapsed with the head unchanged.
+  A CI-configured repo (has `.github/workflows/`) stays pending until the real
+  check appears, but only up to `[merge_gate] max_ci_wait` (default `10m`) — past
+  that bound, with the head unchanged and still no check, the gate concludes no-CI
+  and merges anyway, so a PR whose workflows never trigger for it (docs-only under
+  paths filters, tag-only / `workflow_dispatch`-only workflows, a non-targeted
+  branch) is not wedged forever. Set `[merge_gate] require_external_ci = true`
+  (global or per-repo `[repos."owner/repo".merge_gate]`) to hard-block an empty
+  gate instead of stamping `gitmoot/ci` once that window elapses.
 - Rerun reviews after the PR head SHA changes.
 - If a merged task reports a worktree cleanup warning, inspect the stored task
   worktree path, clean or remove that worktree manually, then clear stale local

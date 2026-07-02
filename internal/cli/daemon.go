@@ -400,9 +400,11 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		}
 		checkout := repoRecord.CheckoutPath
 		gh := github.NewClient(checkout)
+		mergeGate := newDaemonPolicyMergeGate(store, gh, checkout)
+		applyMergeGatePolicy(&mergeGate, *home, repo.FullName())
 		engine := workflow.Engine{
 			Store:     store,
-			MergeGate: newDaemonPolicyMergeGate(store, gh, checkout),
+			MergeGate: mergeGate,
 		}
 		// Honor the opt-in [orchestrate] policy (artifact-body inlining + per-root
 		// delegation token budget) on this single-repo engine too; fail-safe to the
@@ -5949,7 +5951,7 @@ var (
 func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, home string) workflow.Engine {
 	engine := workflow.Engine{
 		Store:                   store,
-		MergeGate:               daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout},
+		MergeGate:               daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout, Home: home},
 		ImplementationFinalizer: daemonImplementationFinalizer{Store: store, GitHub: gh, FallbackCheckout: checkout},
 		// escalate_human (#340): @-tag the human on the tree's PR/issue when a leg
 		// pauses awaiting a decision. Best-effort and nil-safe in the engine; the
@@ -6370,6 +6372,9 @@ type daemonMergeGate struct {
 	Store            *db.Store
 	GitHub           github.Client
 	FallbackCheckout string
+	// Home is the resolved <home>/.gitmoot root (or raw --home) used to load the
+	// [merge_gate] policy (#596). Empty => the off-by-default merge-gate behavior.
+	Home string
 }
 
 func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeRequest) (workflow.MergeDecision, error) {
@@ -6383,7 +6388,9 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 	if err != nil {
 		return workflow.MergeDecision{}, err
 	}
-	return newDaemonPolicyMergeGate(g.Store, g.githubClient(checkout), checkout).Evaluate(ctx, request)
+	gate := newDaemonPolicyMergeGate(g.Store, g.githubClient(checkout), checkout)
+	applyMergeGatePolicy(&gate, g.Home, request.Repo)
+	return gate.Evaluate(ctx, request)
 }
 
 func nativeMergeGateDisabled() bool {

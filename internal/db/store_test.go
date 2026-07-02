@@ -50,6 +50,7 @@ func TestOpenMigratesSchema(t *testing.T) {
 		"skillopt_review_watches",
 		"skillopt_judge_outcomes",
 		"interactive_prompts",
+		"merge_gate_ci_observations",
 	} {
 		ok, err := store.HasTable(ctx, table)
 		if err != nil {
@@ -107,6 +108,44 @@ func TestOpenConfiguresSQLiteContentionPragmas(t *testing.T) {
 	}
 	if busyTimeout != sqliteBusyTimeoutMillis {
 		t.Fatalf("read-only busy_timeout = %d, want %d", busyTimeout, sqliteBusyTimeoutMillis)
+	}
+}
+
+func TestNoCIObservationRoundTripAndReset(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	if _, err := store.GetNoCIObservation(ctx, "jerryfane/noted", 11); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetNoCIObservation on empty table error = %v, want sql.ErrNoRows", err)
+	}
+
+	first := NoCIObservation{RepoFullName: "jerryfane/noted", PullRequest: 11, HeadSHA: "aaaa111", FirstZeroAt: "2026-07-01T22:23:32Z"}
+	if err := store.UpsertNoCIObservation(ctx, first); err != nil {
+		t.Fatalf("UpsertNoCIObservation returned error: %v", err)
+	}
+	got, err := store.GetNoCIObservation(ctx, "jerryfane/noted", 11)
+	if err != nil {
+		t.Fatalf("GetNoCIObservation returned error: %v", err)
+	}
+	if got != first {
+		t.Fatalf("observation = %+v, want %+v", got, first)
+	}
+
+	// A new head overwrites the prior observation in place (reset-on-new-head).
+	second := NoCIObservation{RepoFullName: "jerryfane/noted", PullRequest: 11, HeadSHA: "bbbb222", FirstZeroAt: "2026-07-01T22:25:00Z"}
+	if err := store.UpsertNoCIObservation(ctx, second); err != nil {
+		t.Fatalf("second UpsertNoCIObservation returned error: %v", err)
+	}
+	got, err = store.GetNoCIObservation(ctx, "jerryfane/noted", 11)
+	if err != nil {
+		t.Fatalf("GetNoCIObservation after reset returned error: %v", err)
+	}
+	if got != second {
+		t.Fatalf("observation after reset = %+v, want %+v", got, second)
 	}
 }
 
