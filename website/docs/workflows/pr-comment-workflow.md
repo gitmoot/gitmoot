@@ -51,7 +51,9 @@ Use `gitmoot job list --repo owner/repo` and
 When a delegation tree pauses for a human — an `escalate_human` failure pause,
 or an ask-gate `human_questions` pause — the daemon @-tags the escalation
 handle in a comment with the resume instructions, and a comment on the tree's
-**open** PR (or issue) resumes it:
+**open** PR resumes it. Resume commands are PR-comment-only: the issue watcher
+routes only the `ask` action, so `/gitmoot resume` posted on an issue is
+silently ignored — always resume on the tree's open PR:
 
 ```text
 /gitmoot resume <coordinator-job-id> retry [instructions]   # re-run the failing leg

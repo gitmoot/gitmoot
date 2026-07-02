@@ -4,10 +4,12 @@
 
 The supported one-liner is `gitmoot setup`, which registers the repo and an
 agent in one command (`--watch-issues` defaults on, so the daemon comes up
-tagging-ready):
+tagging-ready). `--repo`, `--agent`, `--runtime`, and `--session` are all
+**required** (setup exits with an error if any is missing); `--session` takes a
+runtime session reference, `last`, or a shell command:
 
 ```sh
-gitmoot setup --repo owner/repo --agent reviewer --runtime codex --start-daemon
+gitmoot setup --repo owner/repo --agent reviewer --runtime codex --session last --start-daemon
 ```
 
 Or the manual path:

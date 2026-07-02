@@ -68,8 +68,8 @@ func printDaemonUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot daemon status")
 	fmt.Fprintln(w, "  gitmoot daemon logs")
 	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "  --repo sets the daemon's LAUNCH CONTEXT (working dir / preflight checkout) only; it does NOT")
-	fmt.Fprintln(w, "  scope supervision — the daemon supervises ALL subscribed repos regardless.")
+	fmt.Fprintln(w, "  --repo owner/repo SCOPES the daemon to a SINGLE repo: it polls only that repo's PRs and")
+	fmt.Fprintln(w, "  claims only that repo's queued jobs. Omit --repo to supervise ALL enabled registered repos.")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "  --forget-runtime-auth (stop) deletes the persisted owner-only daemon-runtime.env so a later")
 	fmt.Fprintln(w, "  restart cannot recover the token; a plain restart still recovers it.")
@@ -219,7 +219,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("daemon run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	repoFlag := fs.String("repo", "", "GitHub repository as owner/repo (sets the daemon launch context: working dir / preflight checkout; does NOT scope supervision — the daemon supervises ALL subscribed repos)")
+	repoFlag := fs.String("repo", "", "GitHub repository as owner/repo: scopes the daemon to a SINGLE repo (polls only that repo's PRs; claims only that repo's queued jobs). Omit to supervise ALL enabled registered repos")
 	var session string
 	fs.StringVar(&session, "session", "", "scope the daemon worker to a delegation root job id")
 	fs.StringVar(&session, "root", "", "alias for --session")
@@ -911,7 +911,7 @@ func parseDaemonStartConfig(command string, args []string, stderr io.Writer) (da
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	repoFlag := fs.String("repo", "", "GitHub repository as owner/repo (sets the daemon launch context: working dir / preflight checkout; does NOT scope supervision — the daemon supervises ALL subscribed repos)")
+	repoFlag := fs.String("repo", "", "GitHub repository as owner/repo: scopes the daemon to a SINGLE repo (polls only that repo's PRs; claims only that repo's queued jobs). Omit to supervise ALL enabled registered repos")
 	var session string
 	fs.StringVar(&session, "session", "", "scope the daemon worker to a delegation root job id")
 	fs.StringVar(&session, "root", "", "alias for --session")

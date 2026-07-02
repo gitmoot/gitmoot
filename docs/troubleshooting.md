@@ -282,9 +282,9 @@ Fixes:
 - Correct the `origin` remote or pass the matching `--repo`.
 - Avoid running one daemon from a parent folder that contains multiple repos.
 
-Note that `--repo` only sets the daemon's launch context (working dir /
-preflight checkout); it does **not** scope supervision — the daemon supervises
-ALL subscribed repos regardless (#581).
+Note that `--repo owner/repo` **scopes** the daemon to a single repo: it polls
+only that repo's PRs and claims only that repo's queued jobs. Omit `--repo` to
+supervise every enabled registered repo from one daemon (#581).
 
 ## Daemon Already Running
 
@@ -415,7 +415,9 @@ Fixes:
   when the retry budget is spent and the job stays failed.
 - A job stuck in `running` is recovered automatically once it shows no lease
   progress past the staleness window (default 30m; tune with the
-  `GITMOOT_STALE_RUNNING_AFTER` environment variable, floored at 1m, #560).
+  `GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value
+  is 1m — below-1m, malformed, or non-positive values are rejected in favor of
+  the 30m default rather than clamped, #560).
 
 ## Parallel Implementation And Worktrees
 

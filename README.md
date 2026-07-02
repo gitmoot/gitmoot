@@ -103,7 +103,7 @@ One command registers the repo, subscribes an agent, and launches a
 tagging-ready daemon (`--watch-issues` defaults on):
 
 ```sh
-gitmoot setup --repo owner/repo --path . --agent helper --runtime claude --start-daemon
+gitmoot setup --repo owner/repo --path . --agent helper --runtime claude --session last --start-daemon
 ```
 
 Or step through the manual path from a project checkout:
@@ -176,10 +176,11 @@ checkout/worktree safety and write-capable agents for implementation jobs.
 (auto-selecting the pool scheduler); see
 [docs/parallel-jobs.md](docs/parallel-jobs.md).
 
-One daemon supervises every enabled repo. `--repo` only sets the daemon's
-launch context (working dir / preflight checkout) — it does **not** scope
-supervision; per-repo scoping is done with the `[repos."owner/repo"]
-max_parallel` config key instead. Both `daemon run` and `daemon start` accept
+`daemon start --repo owner/repo` scopes the daemon to a **single** repo: it
+polls only that repo's PRs and claims only that repo's queued jobs. Omit
+`--repo` and one daemon supervises every enabled repo; cap an individual repo's
+parallelism on that shared daemon with the `[repos."owner/repo"] max_parallel`
+config key. Both `daemon run` and `daemon start` accept
 `--session <root-job-id>` (alias `--root`) to pin the worker to a single
 orchestration run — it then runs only jobs whose `root_job_id` matches that
 value plus the root coordinator job itself:
@@ -232,8 +233,9 @@ needs_attention/deferred` and `candidate.*` events to one HTTP endpoint
 - **Repo**: a GitHub repository plus local checkout path that Gitmoot is allowed
   to monitor and mutate.
 - **Daemon**: the local background process that polls GitHub PRs and routes
-  queued jobs. It supervises every enabled repo (`--repo` only sets its launch
-  context; cap one repo via `[repos."owner/repo"] max_parallel`) and
+  queued jobs. Passing `--repo owner/repo` scopes it to that single repo
+  (polling + job claims); omit `--repo` and it supervises every enabled repo
+  (cap one repo via `[repos."owner/repo"] max_parallel`).
   `--session <root-job-id>` scopes it to one orchestration run.
 - **Agent**: a named Gitmoot identity with repo access, role, capabilities, and
   a runtime adapter.

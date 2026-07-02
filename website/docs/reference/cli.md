@@ -25,8 +25,11 @@ daemon-aware live probe of the Claude token — so a bad credential is caught
 before jobs stall on it. Run it after install and before starting the daemon.
 
 One-shot onboarding: `gitmoot setup` registers the repo and an agent in one
-command (`--repo owner/repo --agent <name> --role <role> --runtime
-codex|claude|shell [--session ref] [--path .] [--start-daemon]`).
+command (`--repo owner/repo --agent <name> --runtime codex|claude|shell
+--session <ref> [--role <role>] [--path .] [--start-daemon]`). `--repo`,
+`--agent`, `--runtime`, and `--session` are all **required** — setup errors out
+if any is missing; `--session` takes a runtime session reference, `last`, or a
+shell command.
 `--watch-issues` is **on by default** in setup, so the daemon comes up
 tagging-ready for `@<agent>` issue mentions.
 
@@ -113,12 +116,13 @@ user explicitly wants a foreground process. Keep the default `--workers 1`
 unless the Gitmoot home has multiple independent runtime sessions or managed
 agent types with `max_background` greater than one.
 
-`daemon start --repo owner/repo` sets the daemon's **launch context** (working
-dir / preflight checkout) only; it does **not** scope supervision — the daemon
-supervises ALL subscribed repos regardless (#581). Do not start one daemon per
-repo expecting isolation: a second daemon on the same home is **refused**
-(`daemon already running with pid …`; a stale pidfile from a dead owner is
-liveness-checked, so restarts work cleanly). To cap one repo's parallelism, use
+`daemon start --repo owner/repo` **scopes** the daemon to a single repo: it
+polls only that repo's PRs and claims only that repo's queued jobs. Omit
+`--repo` to supervise every enabled registered repo from one daemon (#581). Do
+not start one daemon per repo on the same home expecting parallel isolation: a
+second daemon on the same home is **refused** (`daemon already running with pid
+…`; a stale pidfile from a dead owner is liveness-checked, so restarts work
+cleanly). To cap one repo's parallelism on a shared (no-`--repo`) daemon, use
 the per-repo config keys below instead.
 
 Both `daemon run` and `daemon start` accept `--session <root-job-id>` (alias
@@ -744,7 +748,9 @@ is the deferral working, not a bug.
 Jobs stuck in `running` are backstopped too: a running job with no lease
 progress past the staleness window (default 30m) is assumed orphaned by a dead
 worker and recovered/re-queued. The window is tunable via the
-`GITMOOT_STALE_RUNNING_AFTER` environment variable, floored at 1m (#560).
+`GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value
+is 1m — below-1m, malformed, or non-positive values are rejected (with a
+one-time warning) in favor of the 30m default rather than clamped (#560).
 
 `gitmoot job kill <root-job-id>` is the operator kill switch for a runaway
 delegation tree: it terminates the tree identified by its **root** job id

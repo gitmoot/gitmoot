@@ -166,10 +166,10 @@ gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issu
 ```
 
 Use `gitmoot daemon start` for the background daemon. Use `gitmoot daemon run`
-only when the user explicitly wants a foreground process. `--repo` sets the
-daemon's launch context (working dir / preflight checkout) only; it does NOT
-scope supervision — the daemon supervises ALL subscribed repos regardless
-(#581). Both `daemon run` and `daemon start` accept `--session <root-job-id>`
+only when the user explicitly wants a foreground process. `--repo owner/repo`
+SCOPES the daemon to a single repo: it polls only that repo's PRs and claims
+only that repo's queued jobs. Omit `--repo` to supervise every enabled
+registered repo from one daemon (#581). Both `daemon run` and `daemon start` accept `--session <root-job-id>`
 (alias `--root`) to pin the worker to one orchestration run: it then runs only
 jobs whose `root_job_id` matches that value plus the root coordinator job
 itself. To restart the daemon without losing its persisted Claude token, use

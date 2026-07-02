@@ -311,11 +311,12 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    --start-daemon` runs this same background start path for the selected
    checkout.
 
-   `--repo` sets the daemon's launch context (working dir / preflight checkout)
-   only; it does **not** scope supervision — the daemon supervises ALL
-   subscribed repos regardless (#581). To cap one repo's parallelism on a
-   shared daemon, use the `[repos."owner/repo"].max_parallel` config key
-   instead (see [parallel-jobs.md](./parallel-jobs.md)).
+   `--repo owner/repo` **scopes** the daemon to a single repo: it polls only
+   that repo's PRs and claims only that repo's queued jobs. Omit `--repo` to
+   supervise every enabled registered repo from one daemon (#581). To cap one
+   repo's parallelism on a shared (no-`--repo`) daemon, use the
+   `[repos."owner/repo"].max_parallel` config key instead (see
+   [parallel-jobs.md](./parallel-jobs.md)).
 
    To pin a worker to a single orchestration run, pass `--session <root-job-id>`
    (alias `--root`) to `daemon run` or `daemon start`:

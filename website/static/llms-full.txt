@@ -113,7 +113,7 @@ One command registers the repo, subscribes an agent, and launches a
 tagging-ready daemon (`--watch-issues` defaults on):
 
 ```sh
-gitmoot setup --repo owner/repo --path . --agent helper --runtime claude --start-daemon
+gitmoot setup --repo owner/repo --path . --agent helper --runtime claude --session last --start-daemon
 ```
 
 Or step through the manual path from a project checkout:
@@ -186,10 +186,11 @@ checkout/worktree safety and write-capable agents for implementation jobs.
 (auto-selecting the pool scheduler); see
 [docs/parallel-jobs.md](docs/parallel-jobs.md).
 
-One daemon supervises every enabled repo. `--repo` only sets the daemon's
-launch context (working dir / preflight checkout) — it does **not** scope
-supervision; per-repo scoping is done with the `[repos."owner/repo"]
-max_parallel` config key instead. Both `daemon run` and `daemon start` accept
+`daemon start --repo owner/repo` scopes the daemon to a **single** repo: it
+polls only that repo's PRs and claims only that repo's queued jobs. Omit
+`--repo` and one daemon supervises every enabled repo; cap an individual repo's
+parallelism on that shared daemon with the `[repos."owner/repo"] max_parallel`
+config key. Both `daemon run` and `daemon start` accept
 `--session <root-job-id>` (alias `--root`) to pin the worker to a single
 orchestration run — it then runs only jobs whose `root_job_id` matches that
 value plus the root coordinator job itself:
@@ -242,8 +243,9 @@ needs_attention/deferred` and `candidate.*` events to one HTTP endpoint
 - **Repo**: a GitHub repository plus local checkout path that Gitmoot is allowed
   to monitor and mutate.
 - **Daemon**: the local background process that polls GitHub PRs and routes
-  queued jobs. It supervises every enabled repo (`--repo` only sets its launch
-  context; cap one repo via `[repos."owner/repo"] max_parallel`) and
+  queued jobs. Passing `--repo owner/repo` scopes it to that single repo
+  (polling + job claims); omit `--repo` and it supervises every enabled repo
+  (cap one repo via `[repos."owner/repo"] max_parallel`).
   `--session <root-job-id>` scopes it to one orchestration run.
 - **Agent**: a named Gitmoot identity with repo access, role, capabilities, and
   a runtime adapter.
@@ -813,10 +815,10 @@ gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issu
 ```
 
 Use `gitmoot daemon start` for the background daemon. Use `gitmoot daemon run`
-only when the user explicitly wants a foreground process. `--repo` sets the
-daemon's launch context (working dir / preflight checkout) only; it does NOT
-scope supervision — the daemon supervises ALL subscribed repos regardless
-(#581). Both `daemon run` and `daemon start` accept `--session <root-job-id>`
+only when the user explicitly wants a foreground process. `--repo owner/repo`
+SCOPES the daemon to a single repo: it polls only that repo's PRs and claims
+only that repo's queued jobs. Omit `--repo` to supervise every enabled
+registered repo from one daemon (#581). Both `daemon run` and `daemon start` accept `--session <root-job-id>`
 (alias `--root`) to pin the worker to one orchestration run: it then runs only
 jobs whose `root_job_id` matches that value plus the root coordinator job
 itself. To restart the daemon without losing its persisted Claude token, use
@@ -1311,11 +1313,12 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    --start-daemon` runs this same background start path for the selected
    checkout.
 
-   `--repo` sets the daemon's launch context (working dir / preflight checkout)
-   only; it does **not** scope supervision — the daemon supervises ALL
-   subscribed repos regardless (#581). To cap one repo's parallelism on a
-   shared daemon, use the `[repos."owner/repo"].max_parallel` config key
-   instead (see [parallel-jobs.md](./parallel-jobs.md)).
+   `--repo owner/repo` **scopes** the daemon to a single repo: it polls only
+   that repo's PRs and claims only that repo's queued jobs. Omit `--repo` to
+   supervise every enabled registered repo from one daemon (#581). To cap one
+   repo's parallelism on a shared (no-`--repo`) daemon, use the
+   `[repos."owner/repo"].max_parallel` config key instead (see
+   [parallel-jobs.md](./parallel-jobs.md)).
 
    To pin a worker to a single orchestration run, pass `--session <root-job-id>`
    (alias `--root`) to `daemon run` or `daemon start`:
@@ -2329,9 +2332,9 @@ Fixes:
 - Correct the `origin` remote or pass the matching `--repo`.
 - Avoid running one daemon from a parent folder that contains multiple repos.
 
-Note that `--repo` only sets the daemon's launch context (working dir /
-preflight checkout); it does **not** scope supervision — the daemon supervises
-ALL subscribed repos regardless (#581).
+Note that `--repo owner/repo` **scopes** the daemon to a single repo: it polls
+only that repo's PRs and claims only that repo's queued jobs. Omit `--repo` to
+supervise every enabled registered repo from one daemon (#581).
 
 ## Daemon Already Running
 
@@ -2462,7 +2465,9 @@ Fixes:
   when the retry budget is spent and the job stays failed.
 - A job stuck in `running` is recovered automatically once it shows no lease
   progress past the staleness window (default 30m; tune with the
-  `GITMOOT_STALE_RUNNING_AFTER` environment variable, floored at 1m, #560).
+  `GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value
+  is 1m — below-1m, malformed, or non-positive values are rejected in favor of
+  the 30m default rather than clamped, #560).
 
 ## Parallel Implementation And Worktrees
 
@@ -4388,7 +4393,7 @@ bandit_min_samples = 30                   # #473/#482 Mode B low-traffic floor (
 live_ab_sample_rate = 0.0                 # #482 Mode B live A/B: 0.0 (default) = never intercept; fraction of foreground asks to A/B
 mode_b_judge_enabled = false              # #483: opt the A/B into a cross-family LLM judge row (same as `skillopt ab --judge`)
 mode_b_jury_size = 1                      # #349: >= 2 = a cross-family judge JURY (distinct families, majority vote); 0/1 = single judge, byte-identical
-mode_b_jury_veto_dimensions = []          # #349: rubric dimensions subject to minority-veto; empty (default) disables the veto
+mode_b_jury_veto_dimensions =             # #349: comma list of rubric dimensions subject to minority-veto (e.g. safety,correctness); empty (default) disables the veto
 mode_b_jury_veto_floor = 0.0              # #349: [0,1] floor for the veto dimensions; 0.0 (default) makes the veto inert
 mode_b_jury_disagreement_tau = 0.0        # #349: per-dimension std threshold that flags jury DISAGREEMENT; 0.0 disables the std check
 ```
@@ -6946,8 +6951,9 @@ unchanged.
   probes validity), and `daemon stop --forget-runtime-auth` invalidates it.
 - **Loud auth-drop warning** (#581) — if a (re)start would still come up without
   Claude auth, the daemon says so at start time instead of failing jobs silently
-  hours later. `--repo` on `daemon run`/`start` is clarified: it sets launch
-  context and does **not** scope supervision.
+  hours later. `--repo` on `daemon run`/`start` is documented accurately: it
+  scopes the daemon to that single repo (polling + job claims); omit it to
+  supervise every enabled repo.
 
 ### Daemon reliability
 
@@ -6957,7 +6963,8 @@ unchanged.
   silently. Polls are time-bounded so a wedged poll can't hold the checkout lock
   forever.
 - **Stale-running recovery: configurable + #536-safe** (#560) — the recovery
-  window is tunable (`GITMOOT_STALE_RUNNING_AFTER`, floored at 1m), recovery is
+  window is tunable (`GITMOOT_STALE_RUNNING_AFTER`; the smallest honored value
+  is 1m — below-1m/malformed values fall back to the 30m default), recovery is
   prompt at lease expiry, and runtime leases now carry a teardown grace margin so
   a live worker finishing up can never be requeued onto its own dirty worktree.
 - **`--watch-issues` polling no longer burns a core** (#566) — per-issue comment
@@ -7364,8 +7371,11 @@ daemon-aware live probe of the Claude token — so a bad credential is caught
 before jobs stall. Run it after install and before starting the daemon.
 
 One-shot onboarding: `gitmoot setup` registers the repo and an agent in one
-command (`--repo owner/repo --agent <name> --role <role> --runtime
-codex|claude|shell [--session ref] [--path .] [--start-daemon]`).
+command (`--repo owner/repo --agent <name> --runtime codex|claude|shell
+--session <ref> [--role <role>] [--path .] [--start-daemon]`). `--repo`,
+`--agent`, `--runtime`, and `--session` are all **required** — setup errors out
+if any is missing; `--session` takes a runtime session reference, `last`, or a
+shell command.
 `--watch-issues` is **on by default** in setup, so the daemon comes up
 tagging-ready for `@<agent>` issue mentions.
 
@@ -7439,12 +7449,13 @@ user explicitly wants a foreground process. Keep the default `--workers 1`
 unless the Gitmoot home has multiple independent runtime sessions or managed
 agent types with `max_background` greater than one.
 
-`daemon start --repo owner/repo` sets the daemon's **launch context** (working
-dir / preflight checkout) only; it does **not** scope supervision — the daemon
-supervises ALL subscribed repos regardless (#581). Do not start one daemon per
-repo expecting isolation: a second daemon on the same home is **refused**
-(`daemon already running with pid …`; a stale pidfile from a dead owner is
-liveness-checked, so restarts work cleanly). To cap one repo's parallelism, use
+`daemon start --repo owner/repo` **scopes** the daemon to a single repo: it
+polls only that repo's PRs and claims only that repo's queued jobs. Omit
+`--repo` to supervise every enabled registered repo from one daemon (#581). Do
+not start one daemon per repo on the same home expecting parallel isolation: a
+second daemon on the same home is **refused** (`daemon already running with pid
+…`; a stale pidfile from a dead owner is liveness-checked, so restarts work
+cleanly). To cap one repo's parallelism on a shared (no-`--repo`) daemon, use
 the per-repo config keys below instead.
 
 Both `daemon run` and `daemon start` accept `--session <root-job-id>` (alias
@@ -8121,7 +8132,9 @@ until the earliest retry time. `gitmoot job show --json` carries the
 Jobs stuck in `running` are also backstopped: a running job with no lease
 progress past the staleness window (default 30m) is assumed orphaned by a dead
 worker and recovered/re-queued. The window is tunable via the
-`GITMOOT_STALE_RUNNING_AFTER` env var, floored at 1m (#560).
+`GITMOOT_STALE_RUNNING_AFTER` env var; the smallest honored value is 1m —
+below-1m, malformed, or non-positive values are rejected (with a one-time
+warning) in favor of the 30m default rather than clamped (#560).
 
 `gitmoot job cancel <job-id>` also releases any resource locks the cancelled job
 still owned — including a stranded `runtime:<rt>:<session>` lock left behind when
@@ -8338,10 +8351,12 @@ validation for final promotion decisions on fresh items.
 
 The supported one-liner is `gitmoot setup`, which registers the repo and an
 agent in one command (`--watch-issues` defaults on, so the daemon comes up
-tagging-ready):
+tagging-ready). `--repo`, `--agent`, `--runtime`, and `--session` are all
+**required** (setup exits with an error if any is missing); `--session` takes a
+runtime session reference, `last`, or a shell command:
 
 ```sh
-gitmoot setup --repo owner/repo --agent reviewer --runtime codex --start-daemon
+gitmoot setup --repo owner/repo --agent reviewer --runtime codex --session last --start-daemon
 ```
 
 Or the manual path:

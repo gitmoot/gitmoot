@@ -209,13 +209,15 @@ gitmoot daemon start --poll 30s --workers 1
 
 Use `gitmoot daemon run` only when you intentionally want a foreground process.
 
-`--repo` does **not** scope which repos the daemon supervises — it only sets the
-daemon's launch context (working dir / preflight checkout); the daemon
-supervises ALL subscribed repos regardless (#581). If queued jobs for one repo
-never move while another repo's jobs do, check for a `--session <root-job-id>`
-(alias `--root`) filter instead: a daemon started with `--session` runs only
-jobs whose `root_job_id` matches that orchestration run plus the root
-coordinator job itself; restart it without `--session` to drain unrelated jobs.
+`--repo owner/repo` **scopes** the daemon to a single repo: it polls only that
+repo's PRs and claims only that repo's queued jobs. Omit `--repo` to supervise
+every enabled registered repo from one daemon (#581). If queued jobs for one
+repo never move while another repo's jobs do, check whether the daemon was
+started with `--repo` scoping it to a different repo, or with a `--session
+<root-job-id>` (alias `--root`) filter: a daemon started with `--session` runs
+only jobs whose `root_job_id` matches that orchestration run plus the root
+coordinator job itself. Restart it without `--repo`/`--session` to drain
+unrelated jobs.
 Also check the repo is enabled in `gitmoot repo list`.
 
 To restart the daemon without losing its Claude token, use `gitmoot daemon
@@ -270,7 +272,9 @@ is spent and the job stays failed.
 
 A job stuck in `running` is recovered automatically once it shows no lease
 progress past the staleness window (default 30m; tune with the
-`GITMOOT_STALE_RUNNING_AFTER` environment variable, floored at 1m, #560).
+`GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value
+is 1m — below-1m, malformed, or non-positive values are rejected in favor of the
+30m default rather than clamped, #560).
 
 Fix: resolve the underlying runtime/auth/lock issue, then retry when safe:
 

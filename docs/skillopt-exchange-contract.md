@@ -357,7 +357,7 @@ bandit_min_samples = 30                   # #473/#482 Mode B low-traffic floor (
 live_ab_sample_rate = 0.0                 # #482 Mode B live A/B: 0.0 (default) = never intercept; fraction of foreground asks to A/B
 mode_b_judge_enabled = false              # #483: opt the A/B into a cross-family LLM judge row (same as `skillopt ab --judge`)
 mode_b_jury_size = 1                      # #349: >= 2 = a cross-family judge JURY (distinct families, majority vote); 0/1 = single judge, byte-identical
-mode_b_jury_veto_dimensions = []          # #349: rubric dimensions subject to minority-veto; empty (default) disables the veto
+mode_b_jury_veto_dimensions =             # #349: comma list of rubric dimensions subject to minority-veto (e.g. safety,correctness); empty (default) disables the veto
 mode_b_jury_veto_floor = 0.0              # #349: [0,1] floor for the veto dimensions; 0.0 (default) makes the veto inert
 mode_b_jury_disagreement_tau = 0.0        # #349: per-dimension std threshold that flags jury DISAGREEMENT; 0.0 disables the std check
 ```
