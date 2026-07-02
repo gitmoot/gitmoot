@@ -200,8 +200,12 @@ func runLiveABChallenger(ctx context.Context, store *db.Store, request localAgen
 
 	// Route through the EXACT #473 record path: same RankedFeedbackEvent shape,
 	// source tag, run-id prefix, and per-pick SourceURL as a manual `skillopt ab`.
+	// Each intercepted ask is its OWN comparison (its own live prompt, its own
+	// challenger answer, the champion resolved right now), so it mints its own
+	// comparison token — the live path is exactly the many-picks-per-challenger
+	// shape that makes per-comparison joining in the #344 harness mandatory.
 	runID := skillOptABRunIDPrefix + challenger.version.ID
-	pickSourceURL := skillOptABPickSourceURL(challenger.version.ID)
+	pickSourceURL := skillOptABPickSourceURL(challenger.version.ID, skillOptABComparisonToken())
 	if err := recordSkillOptABPick(ctx, store, paths, runID, pickSourceURL, templateID, champion, challenger, championDelivery, challengerDelivery, winnerLabel, loserLabel, prompt); err != nil {
 		return fmt.Errorf("live_ab record pick: %w", err)
 	}

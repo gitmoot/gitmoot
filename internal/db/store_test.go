@@ -741,6 +741,78 @@ func TestRankedReviewStorageAndPairwisePreferences(t *testing.T) {
 	}
 }
 
+// TestListRankedFeedbackEventsAcrossRuns proves the cross-run measurement join
+// (#344): events from runs of DIFFERENT templates come back with the correct
+// eval-run template id attached, the template filter scopes correctly, and the
+// stored Reasoning (the judge position blob channel) round-trips verbatim.
+func TestListRankedFeedbackEventsAcrossRuns(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	seedRun := func(runID, templateID, reviewer, source, winner, loser, reasoning string) {
+		t.Helper()
+		if err := store.UpsertEvalRun(ctx, EvalRun{ID: runID, TemplateID: templateID, State: "complete", Mode: EvalRunModeValidate, OptionsCount: 2}); err != nil {
+			t.Fatalf("UpsertEvalRun %s returned error: %v", runID, err)
+		}
+		if err := store.UpsertEvalReviewItem(ctx, EvalReviewItem{RunID: runID, ItemID: "ab", Title: "prompt"}); err != nil {
+			t.Fatalf("UpsertEvalReviewItem %s returned error: %v", runID, err)
+		}
+		for _, label := range []string{winner, loser} {
+			if err := store.UpsertEvalReviewOption(ctx, EvalReviewOption{RunID: runID, ItemID: "ab", Label: label, ArtifactID: "artifact-" + label}); err != nil {
+				t.Fatalf("UpsertEvalReviewOption %s/%s returned error: %v", runID, label, err)
+			}
+		}
+		ranking, _ := json.Marshal([]string{winner, loser})
+		if err := store.UpsertRankedFeedbackEvent(ctx, RankedFeedbackEvent{
+			RunID:       runID,
+			ItemID:      "ab",
+			RankingJSON: string(ranking),
+			Winner:      winner,
+			Reasoning:   reasoning,
+			Reviewer:    reviewer,
+			Source:      source,
+			SourceURL:   "sourceurl-" + runID,
+		}); err != nil {
+			t.Fatalf("UpsertRankedFeedbackEvent %s returned error: %v", runID, err)
+		}
+	}
+	seedRun("run-planner", "planner", "human", "skillopt-ab", "champion", "challenger", "")
+	seedRun("run-writer", "writer", "skillopt-ab-judge", "skillopt-ab-judge", "challenger", "champion", `{"judge_pick_position":"b"}`)
+
+	all, err := store.ListRankedFeedbackEventsAcrossRuns(ctx, "")
+	if err != nil {
+		t.Fatalf("ListRankedFeedbackEventsAcrossRuns returned error: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("all events = %d, want 2: %+v", len(all), all)
+	}
+	byRun := map[string]RankedFeedbackEventWithTemplate{}
+	for _, event := range all {
+		byRun[event.RunID] = event
+	}
+	if byRun["run-planner"].TemplateID != "planner" || byRun["run-writer"].TemplateID != "writer" {
+		t.Fatalf("template join wrong: planner=%q writer=%q", byRun["run-planner"].TemplateID, byRun["run-writer"].TemplateID)
+	}
+	if byRun["run-writer"].Reasoning != `{"judge_pick_position":"b"}` {
+		t.Fatalf("reasoning did not round-trip: %q", byRun["run-writer"].Reasoning)
+	}
+	if byRun["run-writer"].Winner != "challenger" || byRun["run-writer"].Source != "skillopt-ab-judge" {
+		t.Fatalf("event fields wrong: %+v", byRun["run-writer"])
+	}
+
+	filtered, err := store.ListRankedFeedbackEventsAcrossRuns(ctx, "planner")
+	if err != nil {
+		t.Fatalf("ListRankedFeedbackEventsAcrossRuns(planner) returned error: %v", err)
+	}
+	if len(filtered) != 1 || filtered[0].RunID != "run-planner" || filtered[0].TemplateID != "planner" {
+		t.Fatalf("filtered events = %+v, want the single planner event", filtered)
+	}
+}
+
 func TestRankedReviewTieGroupsSkipInGroupPairwisePreferences(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))

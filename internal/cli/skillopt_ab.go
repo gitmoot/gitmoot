@@ -368,6 +368,18 @@ func runSkillOptABWithStore(ctx context.Context, store *db.Store, paths config.P
 	// and item so it coexists with the human row instead of forming a parallel run.
 	runID := skillOptABRunIDPrefix + challenger.version.ID
 
+	// comparisonToken identifies THIS invocation's single comparison. (run_id,
+	// item_id) alone is the CHALLENGER, not the comparison — run_id is
+	// "skillopt-ab:<challengerVersion>" and item_id is always "ab", so every
+	// repeated A/B of one challenger (each with its own prompt, freshly
+	// regenerated answers, its own shuffle, and the champion resolved at
+	// invocation time) would collide into one bucket. The token is embedded in
+	// the SourceURL of EVERY row this invocation records (human pick, judge
+	// aggregate, per-juror details) so the #344 agreement harness can join judge
+	// vs human PER COMPARISON instead of pooling verdicts made on different
+	// comparisons (cross-item contamination).
+	comparisonToken := skillOptABComparisonToken()
+
 	// OFF-BY-DEFAULT cross-family LLM-judge auto-pairwise (#483). When neither the
 	// --judge flag nor [skillopt].mode_b_judge_enabled is set, judgeEnabled is false
 	// and this whole branch is skipped — no cross-family reviewer is selected, no
@@ -377,7 +389,7 @@ func runSkillOptABWithStore(ctx context.Context, store *db.Store, paths config.P
 	// sees the SAME shuffled Option A/B as the human (it never learns champion vs
 	// challenger), and its pick maps back through the SAME optionA/optionB mapping.
 	if skillOptABJudgeEnabled(paths, options) {
-		runSkillOptABJudge(ctx, store, paths, runtimeAgent, agent, runID, templateID, champion, challenger, optionA, optionB, options, stdout, stderr)
+		runSkillOptABJudge(ctx, store, paths, runtimeAgent, agent, runID, comparisonToken, templateID, champion, challenger, optionA, optionB, options, stdout, stderr)
 	}
 
 	// --judge-only records ONLY the judge row above and skips the human pick + bandit
@@ -408,8 +420,10 @@ func runSkillOptABWithStore(ctx context.Context, store *db.Store, paths config.P
 	// (run_id, item_id, reviewer, source, source_url), and the first four are
 	// identical across repeated A/Bs of the same challenger, so without a unique
 	// source_url an ON CONFLICT DO UPDATE would overwrite every prior pick and only
-	// the last preference would survive as evidence.
-	pickSourceURL := skillOptABPickSourceURL(challenger.version.ID)
+	// the last preference would survive as evidence. It carries the SHARED
+	// per-invocation comparison token so the human row and this invocation's
+	// judge/juror rows join as ONE comparison in the #344 harness.
+	pickSourceURL := skillOptABPickSourceURL(challenger.version.ID, comparisonToken)
 	if err := recordSkillOptABPick(ctx, store, paths, runID, pickSourceURL, templateID, champion, challenger, championDelivery, challengerDelivery, winnerLabel, loserLabel, options.prompt); err != nil {
 		fmt.Fprintf(stderr, "skillopt ab: record pick: %v\n", err)
 		return 1
@@ -593,7 +607,7 @@ func recordSkillOptABPick(ctx context.Context, store *db.Store, paths config.Pat
 	if err := ensureSkillOptABRunRows(ctx, store, paths, runID, skillOptABItemID, templateID, champion, challenger, championDelivery, challengerDelivery, prompt, skillOptABSource, skillOptABFeedbackSource); err != nil {
 		return err
 	}
-	return upsertSkillOptABRankedEvent(ctx, store, runID, skillOptABItemID, winnerLabel, loserLabel, "human", skillOptABSource, pickSourceURL)
+	return upsertSkillOptABRankedEvent(ctx, store, runID, skillOptABItemID, winnerLabel, loserLabel, "human", skillOptABSource, pickSourceURL, "")
 }
 
 // ensureSkillOptABRunRows idempotently upserts the shared pairwise scaffolding for
@@ -668,8 +682,10 @@ func ensureSkillOptABRunRows(ctx context.Context, store *db.Store, paths config.
 // row (reviewer=human,source=skillopt-ab) and the judge row
 // (reviewer=skillopt-ab-judge,source=skillopt-ab-judge) as SEPARATE coexisting
 // rows on the same run/item, and what makes repeated picks each persist via a
-// distinct per-pick source_url.
-func upsertSkillOptABRankedEvent(ctx context.Context, store *db.Store, runID, itemID, winnerLabel, loserLabel, reviewer, source, sourceURL string) error {
+// distinct per-pick source_url. reasoning is stored verbatim (the judge/juror
+// paths pass the machine-readable position blob from
+// skillOptABJudgePickPositionJSON; the human paths pass "").
+func upsertSkillOptABRankedEvent(ctx context.Context, store *db.Store, runID, itemID, winnerLabel, loserLabel, reviewer, source, sourceURL, reasoning string) error {
 	ranking, err := json.Marshal([]string{winnerLabel, loserLabel})
 	if err != nil {
 		return err
@@ -684,25 +700,103 @@ func upsertSkillOptABRankedEvent(ctx context.Context, store *db.Store, runID, it
 		RankingJSON:   string(ranking),
 		TieGroupsJSON: string(tieGroups),
 		Winner:        winnerLabel,
+		Reasoning:     reasoning,
 		Reviewer:      reviewer,
 		Source:        source,
 		SourceURL:     sourceURL,
 	})
 }
 
-// skillOptABPickSourceURL mints a unique-per-pick SourceURL for the Mode B
-// RankedFeedbackEvent. The run id, item id, reviewer, and source are constant
-// across repeated A/Bs of one challenger, so this token is what differentiates
-// each pick's conflict key; it embeds the version id for separability and a
-// strictly increasing nanosecond+counter suffix so a tight loop of picks never
-// collides on a single row.
-func skillOptABPickSourceURL(versionID string) string {
+// skillOptABJudgePickPositionJSON encodes the judge's RAW presented-position
+// pick (a|b) as a tiny machine-readable JSON blob carried on the judge/juror
+// RankedFeedbackEvent.Reasoning field. This is the MINIMAL ADDITIVE persistence
+// the position-bias audit needs (#344, "Reliability without Validity"): the
+// stored Winner is the UNBLINDED role (champion|challenger), so without this
+// blob the presented position is unrecoverable and |P(pick=a) - 0.5| cannot be
+// measured. Reasoning is an existing opaque passthrough (no schema change), it
+// was previously always empty on judge/juror rows, and judge rows are
+// source-tagged + weighted below human downstream, so filling it changes no
+// existing flow.
+func skillOptABJudgePickPositionJSON(pick string) string {
+	data, err := json.Marshal(map[string]string{"judge_pick_position": pick})
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+// skillOptABJudgePickPosition decodes the position blob written by
+// skillOptABJudgePickPositionJSON. ok is false for rows that predate the
+// position capture (empty/free-text reasoning) or carry anything other than a
+// valid a|b position, so the audit silently skips unmeasurable rows instead of
+// fabricating positions.
+func skillOptABJudgePickPosition(reasoning string) (string, bool) {
+	reasoning = strings.TrimSpace(reasoning)
+	if reasoning == "" {
+		return "", false
+	}
+	var decoded struct {
+		JudgePickPosition string `json:"judge_pick_position"`
+	}
+	if err := json.Unmarshal([]byte(reasoning), &decoded); err != nil {
+		return "", false
+	}
+	pick := strings.ToLower(strings.TrimSpace(decoded.JudgePickPosition))
+	if pick != "a" && pick != "b" {
+		return "", false
+	}
+	return pick, true
+}
+
+// skillOptABComparisonMarker is the SourceURL fragment marker that carries the
+// per-invocation comparison token. It is deliberately distinct from the legacy
+// "#<nano>-<seq>" suffix (which was minted PER ROW, so the human row and the
+// judge row of the same comparison never shared it): a SourceURL without this
+// marker is a legacy row the #344 agreement harness must treat as unmeasurable
+// rather than pool by challenger.
+const skillOptABComparisonMarker = "#cmp:"
+
+// skillOptABComparisonToken mints ONE token per `skillopt ab` invocation — i.e.
+// per COMPARISON: one prompt, one pair of freshly generated answers, one
+// shuffle, one champion resolved at that instant. Every row the invocation
+// records (human pick, judge aggregate, per-juror details) embeds this SAME
+// token in its SourceURL, which is what lets the agreement harness join judge
+// verdicts against human verdicts of the SAME comparison. The
+// nanosecond+counter shape also keeps each invocation's conflict keys distinct
+// (the uniqueness role the old per-row suffix played).
+func skillOptABComparisonToken() string {
 	seq := atomic.AddUint64(&skillOptABPickSeq, 1)
-	return fmt.Sprintf("%s%s#%d-%d", skillOptABRunIDPrefix, versionID, time.Now().UnixNano(), seq)
+	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), seq)
+}
+
+// skillOptABComparisonTokenFromSourceURL recovers the per-invocation comparison
+// token from a recorded SourceURL. ok=false for legacy rows written before the
+// token existed (their "#<nano>-<seq>" suffix carries no marker), so the
+// agreement harness can exclude them loudly instead of fabricating a join.
+func skillOptABComparisonTokenFromSourceURL(sourceURL string) (string, bool) {
+	index := strings.LastIndex(sourceURL, skillOptABComparisonMarker)
+	if index < 0 {
+		return "", false
+	}
+	token := strings.TrimSpace(sourceURL[index+len(skillOptABComparisonMarker):])
+	if token == "" {
+		return "", false
+	}
+	return token, true
+}
+
+// skillOptABPickSourceURL mints the human pick's SourceURL for the Mode B
+// RankedFeedbackEvent. The run id, item id, reviewer, and source are constant
+// across repeated A/Bs of one challenger, so the embedded per-invocation
+// comparison token is what differentiates each pick's conflict key (a tight
+// loop of picks never collides on a single row) AND what joins this pick with
+// the same invocation's judge/juror rows in the #344 agreement harness.
+func skillOptABPickSourceURL(versionID, comparisonToken string) string {
+	return fmt.Sprintf("%s%s%s%s", skillOptABRunIDPrefix, versionID, skillOptABComparisonMarker, comparisonToken)
 }
 
 // skillOptABPickSeq is a process-local monotonic counter that guarantees two
-// picks recorded within the same nanosecond still get distinct SourceURLs.
+// comparison tokens minted within the same nanosecond are still distinct.
 var skillOptABPickSeq uint64
 
 // answerOrPlaceholder guarantees a non-empty artifact body (the blob path rejects
@@ -773,7 +867,7 @@ func skillOptABJurySize(paths config.Paths, options skillOptABOptions) int {
 // skillopt-ab-judge RankedFeedbackEvent that coexists with the human row. It NEVER
 // touches the promotion bandit and NEVER fails the command: every error path logs a
 // best-effort note and returns, leaving the human path intact (fail-safe).
-func runSkillOptABJudge(ctx context.Context, store *db.Store, paths config.Paths, runtimeAgent runtime.Agent, agent db.Agent, runID, templateID string, champion, challenger skillOptABVariant, optionA, optionB skillOptABDelivery, options skillOptABOptions, stdout, stderr io.Writer) {
+func runSkillOptABJudge(ctx context.Context, store *db.Store, paths config.Paths, runtimeAgent runtime.Agent, agent db.Agent, runID, comparisonToken, templateID string, champion, challenger skillOptABVariant, optionA, optionB skillOptABDelivery, options skillOptABOptions, stdout, stderr io.Writer) {
 	// authedRuntimes probes which families can actually run, so an ephemeral judge
 	// leg is only materialized on an authed DIFFERENT family. The probe is injectable
 	// so unit tests stay deterministic/offline.
@@ -794,7 +888,7 @@ func runSkillOptABJudge(ctx context.Context, store *db.Store, paths config.Paths
 			return
 		}
 		if len(jury) >= 2 {
-			runSkillOptABJudgeJury(ctx, store, paths, runID, templateID, champion, challenger, optionA, optionB, options, jury, stdout)
+			runSkillOptABJudgeJury(ctx, store, paths, runID, comparisonToken, templateID, champion, challenger, optionA, optionB, options, jury, stdout)
 			return
 		}
 		// < 2 distinct families: graceful degradation to the single-judge path.
@@ -851,8 +945,12 @@ func runSkillOptABJudge(ctx context.Context, store *db.Store, paths config.Paths
 		log.Printf("skillopt ab judge: ensure run rows: %v", err)
 		return
 	}
-	judgeSourceURL := skillOptABJudgeSourceURL(challenger.version.ID)
-	if err := upsertSkillOptABRankedEvent(ctx, store, runID, skillOptABItemID, winnerLabel, loserLabel, skillOptABJudgeReviewer, skillOptABJudgeSource, judgeSourceURL); err != nil {
+	judgeSourceURL := skillOptABJudgeSourceURL(challenger.version.ID, comparisonToken)
+	// The reasoning blob records the judge's RAW presented-position pick so the
+	// position-bias audit (`skillopt judge agreement`, #344) can measure
+	// |P(pick=a) - 0.5| — the stored Winner alone is the unblinded role and
+	// cannot recover the position.
+	if err := upsertSkillOptABRankedEvent(ctx, store, runID, skillOptABItemID, winnerLabel, loserLabel, skillOptABJudgeReviewer, skillOptABJudgeSource, judgeSourceURL, skillOptABJudgePickPositionJSON(pick)); err != nil {
 		log.Printf("skillopt ab judge: record judge pick: %v", err)
 		return
 	}
@@ -865,10 +963,12 @@ func runSkillOptABJudge(ctx context.Context, store *db.Store, paths config.Paths
 }
 
 // skillOptABJuror is one surviving jury member's parsed verdict: its resolved
-// family, the role it picked (champion|challenger), and whether that pick means
-// the challenger won (the boolean the pure aggregator votes on).
+// family, the RAW presented position it picked (a|b — persisted for the #344
+// position-bias audit), the role it picked (champion|challenger), and whether
+// that pick means the challenger won (the boolean the pure aggregator votes on).
 type skillOptABJuror struct {
 	family         string
+	pick           string
 	winnerLabel    string
 	challengerWins bool
 }
@@ -885,7 +985,7 @@ type skillOptABJuror struct {
 // returns, leaving the human path intact). Candidate origin is blinded to every
 // juror exactly as the single judge blinds it. When NO juror survives it writes no
 // row (same as the single judge's unparseable drop).
-func runSkillOptABJudgeJury(ctx context.Context, store *db.Store, paths config.Paths, runID, templateID string, champion, challenger skillOptABVariant, optionA, optionB skillOptABDelivery, options skillOptABOptions, jury []workflow.CrossFamilyReviewer, stdout io.Writer) {
+func runSkillOptABJudgeJury(ctx context.Context, store *db.Store, paths config.Paths, runID, comparisonToken, templateID string, champion, challenger skillOptABVariant, optionA, optionB skillOptABDelivery, options skillOptABOptions, jury []workflow.CrossFamilyReviewer, stdout io.Writer) {
 	prompt := buildSkillOptABJudgePrompt(options.prompt, optionA.answer, optionB.answer)
 
 	var jurors []skillOptABJuror
@@ -910,6 +1010,7 @@ func runSkillOptABJudgeJury(ctx context.Context, store *db.Store, paths config.P
 		}
 		jurors = append(jurors, skillOptABJuror{
 			family:         reviewer.Runtime,
+			pick:           pick,
 			winnerLabel:    pickedDelivery.label,
 			challengerWins: pickedDelivery.label == skillOptABChallengerLabel,
 		})
@@ -954,8 +1055,10 @@ func runSkillOptABJudgeJury(ctx context.Context, store *db.Store, paths config.P
 			loserLabel = skillOptABChallengerLabel
 		}
 		reviewer := skillOptABJurorReviewerPrefix + j.family
-		sourceURL := skillOptABJurorSourceURL(challenger.version.ID, j.family)
-		if err := upsertSkillOptABRankedEvent(ctx, store, runID, skillOptABItemID, j.winnerLabel, loserLabel, reviewer, skillOptABJurorSource, sourceURL); err != nil {
+		sourceURL := skillOptABJurorSourceURL(challenger.version.ID, j.family, comparisonToken)
+		// Each juror row carries its RAW presented-position pick for the #344
+		// position-bias audit, exactly like the single-judge row.
+		if err := upsertSkillOptABRankedEvent(ctx, store, runID, skillOptABItemID, j.winnerLabel, loserLabel, reviewer, skillOptABJurorSource, sourceURL, skillOptABJudgePickPositionJSON(j.pick)); err != nil {
 			log.Printf("skillopt ab jury: record juror %s row: %v", j.family, err)
 			return
 		}
@@ -969,7 +1072,10 @@ func runSkillOptABJudgeJury(ctx context.Context, store *db.Store, paths config.P
 	if decision.Decision {
 		aggWinner, aggLoser = skillOptABChallengerLabel, skillOptABChampionLabel
 	}
-	if err := upsertSkillOptABRankedEvent(ctx, store, runID, skillOptABItemID, aggWinner, aggLoser, skillOptABJudgeReviewer, skillOptABJudgeSource, skillOptABJudgeSourceURL(challenger.version.ID)); err != nil {
+	// The jury AGGREGATE verdict is a majority over jurors, not one positional
+	// pick, so it carries no position blob (reasoning "") — only the per-juror
+	// rows above are position-auditable.
+	if err := upsertSkillOptABRankedEvent(ctx, store, runID, skillOptABItemID, aggWinner, aggLoser, skillOptABJudgeReviewer, skillOptABJudgeSource, skillOptABJudgeSourceURL(challenger.version.ID, comparisonToken), ""); err != nil {
 		log.Printf("skillopt ab jury: record aggregate verdict: %v", err)
 		return
 	}
@@ -1011,12 +1117,13 @@ func skillOptABJuryMetadata(decision skillopt.JuryDecision, jurors []skillOptABJ
 	return string(raw)
 }
 
-// skillOptABJurorSourceURL mints a unique-per-juror SourceURL embedding the juror
+// skillOptABJurorSourceURL mints a per-juror SourceURL embedding the juror
 // family so each juror's detail row has a distinct (run,item,reviewer,source,url)
-// conflict key and repeated jury runs each persist without colliding.
-func skillOptABJurorSourceURL(versionID, family string) string {
-	seq := atomic.AddUint64(&skillOptABPickSeq, 1)
-	return fmt.Sprintf("%s%s:juror:%s#%d-%d", skillOptABRunIDPrefix, versionID, family, time.Now().UnixNano(), seq)
+// conflict key and repeated jury runs each persist without colliding. Like the
+// human and judge URLs it carries the invocation's SHARED comparison token so
+// every juror verdict joins the same single comparison in the #344 harness.
+func skillOptABJurorSourceURL(versionID, family, comparisonToken string) string {
+	return fmt.Sprintf("%s%s:juror:%s%s%s", skillOptABRunIDPrefix, versionID, family, skillOptABComparisonMarker, comparisonToken)
 }
 
 // optionAToDelivery recovers the champion/challenger delivery from the shuffled
@@ -1101,11 +1208,12 @@ func parseSkillOptABJudgePick(raw string) (string, bool) {
 	return "", false
 }
 
-// skillOptABJudgeSourceURL mints a unique-per-judgment SourceURL for the judge's
-// RankedFeedbackEvent, mirroring skillOptABPickSourceURL but with a distinct judge
-// prefix so the judge row's (run_id,item_id,reviewer,source,source_url) conflict key
-// never collides with a human pick's and repeated judge runs each persist.
-func skillOptABJudgeSourceURL(versionID string) string {
-	seq := atomic.AddUint64(&skillOptABPickSeq, 1)
-	return fmt.Sprintf("%s%s:judge#%d-%d", skillOptABRunIDPrefix, versionID, time.Now().UnixNano(), seq)
+// skillOptABJudgeSourceURL mints the judge's SourceURL, mirroring
+// skillOptABPickSourceURL but with a distinct :judge segment so the judge row's
+// (run_id,item_id,reviewer,source,source_url) conflict key never collides with a
+// human pick's and repeated judge runs each persist. It embeds the SAME
+// per-invocation comparison token as the human pick it was made alongside, which
+// is the join key the #344 agreement harness pairs the two verdicts on.
+func skillOptABJudgeSourceURL(versionID, comparisonToken string) string {
+	return fmt.Sprintf("%s%s:judge%s%s", skillOptABRunIDPrefix, versionID, skillOptABComparisonMarker, comparisonToken)
 }
