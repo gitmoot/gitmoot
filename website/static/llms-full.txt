@@ -647,12 +647,12 @@ request: build, vet, and test, plus the race detector on `internal/workflow`.
 
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, PR comments, daemon jobs, branch locks, agent templates, template capture, custom prompt agents, and Codex, Claude Code, or Kimi Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, PR comments, daemon jobs, stuck jobs, branch locks, agent templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, event webhooks, the web dashboard, and Codex, Claude Code, or Kimi Code runtime workflows.
 version: 0.1.0
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
-  gitmoot-version: "0.4.2"
+  gitmoot-version: "0.8.1"
   source: "jerryfane/gitmoot"
   openclaw:
     requires:
@@ -710,9 +710,11 @@ The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
 
 For runtime selection, `gitmoot agent start <name> --runtime <runtime>` accepts
-`codex`, `claude`, or `kimi`. Kimi Code is a first-class runtime adapter
-alongside Codex and Claude Code. To use it, run `kimi login`, then restart the
-Gitmoot daemon so it inherits the session.
+`codex`, `claude`, `kimi`, or `kimi-cli` (the opt-in legacy Kimi CLI adapter).
+Kimi Code is a first-class runtime adapter alongside Codex and Claude Code. To
+use it, run `kimi login`, then restart the Gitmoot daemon so it inherits the
+session. `agent subscribe` additionally accepts `--runtime shell`, whose
+session is a command (for deterministic tests).
 
 For Gitmoot health or status questions, run the relevant read-only Gitmoot CLI
 checks and answer directly from the results. Mention `gitmoot dashboard` only
@@ -777,10 +779,12 @@ gitmoot plugin doctor
 ```sh
 gitmoot status --repo owner/repo
 gitmoot events --repo owner/repo
-gitmoot daemon start --repo owner/repo --poll 30s
-gitmoot daemon start --repo owner/repo --session <root-job-id>
+gitmoot daemon start --poll 30s
+gitmoot daemon start --session <root-job-id>
 gitmoot daemon start
 gitmoot daemon status
+gitmoot daemon restart
+gitmoot daemon stop [--forget-runtime-auth]
 gitmoot plugin doctor
 gitmoot agent list
 gitmoot agent doctor <agent>
@@ -809,13 +813,15 @@ gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issu
 ```
 
 Use `gitmoot daemon start` for the background daemon. Use `gitmoot daemon run`
-only when the user explicitly wants a foreground process. `gitmoot daemon start
---repo owner/repo` scopes the background daemon to that one repo; `gitmoot daemon
-start` with no `--repo` supervises every enabled repo. Both `daemon run` and
-`daemon start` accept `--session <root-job-id>` (alias `--root`) to pin the
-worker to one orchestration run: it then runs only jobs whose `root_job_id`
-matches that value plus the root coordinator job itself, AND-combined with any
-`--repo` filter.
+only when the user explicitly wants a foreground process. `--repo` sets the
+daemon's launch context (working dir / preflight checkout) only; it does NOT
+scope supervision — the daemon supervises ALL subscribed repos regardless
+(#581). Both `daemon run` and `daemon start` accept `--session <root-job-id>`
+(alias `--root`) to pin the worker to one orchestration run: it then runs only
+jobs whose `root_job_id` matches that value plus the root coordinator job
+itself. To restart the daemon without losing its persisted Claude token, use
+`gitmoot daemon restart` (not stop + start); `gitmoot daemon stop
+--forget-runtime-auth` deletes the persisted token file.
 
 Use `gitmoot agent prompt <agent-or-template>` when the user wants to reuse a
 Gitmoot agent prompt in the current chat. Use `gitmoot agent run` for
@@ -866,6 +872,8 @@ Use GitHub PR comments as the public audit trail:
 /gitmoot retry <job-id>
 /gitmoot cancel <job-id>
 /gitmoot merge
+/gitmoot resume <job-id> retry|continue|abort|answer [instructions]
+@<agent> ask|review|implement [instructions]
 ```
 
 ## Template Agents
@@ -886,12 +894,13 @@ coordinator that fans work out to ephemeral workers (no pre-registration) and
 reconvenes them in one continuation. `review-panel` convenes a panel of
 diverse-lens reviewers over a PR and synthesizes their verdict;
 `decompose-and-verify` splits an implementation task into parallel file-disjoint
-legs and runs a verify step that depends on all of them. Run them with
-`gitmoot orchestrate`:
+legs and runs a verify step that depends on all of them; `verifier` is the
+minimal one-producer + independent-verify pair. Route any coordinator agent
+through a recipe with the `--recipe` flag on `gitmoot orchestrate`:
 
 ```sh
-gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/repo
-gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo
+gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
+gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify
 ```
 
 Create a local custom prompt template:
