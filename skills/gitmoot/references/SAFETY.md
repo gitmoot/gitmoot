@@ -19,7 +19,10 @@ Do not ask child agents to run PR lifecycle commands such as `git pull`,
 Gitmoot owns the final merge gate. It serializes merge attempts per base branch,
 updates stale PR branches through GitHub when possible, retries pending states
 through the daemon, and blocks clearly when GitHub reports a real merge
-conflict.
+conflict. When an **external** system owns the merge decision instead, set
+`GITMOOT_DISABLE_NATIVE_MERGE_GATE=1` (also `true`/`yes`/`on`; #545): Gitmoot
+then **abstains** from its native merge gate — fail-closed, meaning it never
+merges gatelessly; the external gate makes the call.
 
 Useful commands:
 
