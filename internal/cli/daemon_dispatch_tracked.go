@@ -29,15 +29,21 @@ import (
 //     shared checkout (the barrier used to get this from one wg.Wait()).
 //   - concurrency caps: dispatch slots are limit minus the repo's tracked
 //     in-flight count, so --workers / per-repo max_parallel (#576) still bound
-//     TOTAL in-flight jobs, not just per-batch ones.
+//     TOTAL in-flight jobs, not just per-batch ones — AND the shared tracker's
+//     host-global count clamps the sum across repos, so a multi-repo daemon
+//     never runs more than max(--workers, the repo's explicit override)
+//     jobs host-wide (main's inline sweep gave this for free by blocking).
 //   - poller exclusion: the poller only runs a full PollOnce when the tracker is
 //     idle for the repo, so PollOnce never mutates a checkout under a running job
 //     (previously guaranteed by the tick holding the checkout lock for the whole
 //     run).
-//   - maintenance exclusion: checkout-mutating tick maintenance (advancement
-//     retries, worktree reclaims, comment retries) runs only on an idle tick,
-//     exactly the cadence inline execution allowed; DB-only recovery scans keep
-//     running every tick but skip jobs this process is itself running.
+//   - maintenance exclusion: comment retries never touch a checkout and run
+//     every tick (main's cadence); checkout-mutating maintenance (advancement
+//     retries, worktree reclaims) is gated per candidate on the checkout key it
+//     would mutate being free of in-flight holders — NOT on whole-repo
+//     idleness, which a steady staggered backlog could prevent indefinitely,
+//     starving merge retries forever. DB-only recovery scans keep running
+//     every tick but skip jobs this process is itself running.
 //   - #570 escalation: an async infra error (job-level failures already resolve
 //     to nil inside worker.run) is recorded per repo and surfaced as the NEXT
 //     tick's error, so a persistent store fault still trips the ceiling.
@@ -106,6 +112,17 @@ func (t *inflightJobTracker) jobContext(fallback context.Context) context.Contex
 // double-dispatch guard for the window in which a claimed job is still 'queued'
 // in the DB.
 func (t *inflightJobTracker) begin(jobID, repo, checkoutKey, runtimeKey string) bool {
+	return t.beginWithin(0, jobID, repo, checkoutKey, runtimeKey)
+}
+
+// beginWithin is begin with an ATOMIC host-global admission check: when
+// hostCap > 0 it refuses (registering nothing) if the tracker already has
+// hostCap jobs in flight across all repos. The check must live under the same
+// mutex as the registration: concurrent per-repo pool passes each compute
+// their slot budgets from a snapshot, so two passes could both see one slot of
+// host headroom and both dispatch past the cap if the check were external.
+// hostCap <= 0 means unbounded (plain begin).
+func (t *inflightJobTracker) beginWithin(hostCap int, jobID, repo, checkoutKey, runtimeKey string) bool {
 	if t == nil {
 		return true
 	}
@@ -116,6 +133,15 @@ func (t *inflightJobTracker) begin(jobID, repo, checkoutKey, runtimeKey string) 
 	}
 	if _, exists := t.jobs[jobID]; exists {
 		return false
+	}
+	if hostCap > 0 {
+		total := 0
+		for _, count := range t.perRepo {
+			total += count
+		}
+		if total >= hostCap {
+			return false
+		}
 	}
 	t.jobs[jobID] = inflightDispatch{repo: repo, checkoutKey: checkoutKey, runtimeKey: runtimeKey}
 	if checkoutKey != "" {
@@ -224,6 +250,37 @@ func (t *inflightJobTracker) inflight(repo string) int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.perRepo[repo]
+}
+
+// total reports the in-flight dispatched jobs across ALL repos — the host-global
+// counterpart of inflight(repo). The registered-repo supervisor shares one
+// tracker across every enabled repo, and clamping dispatch by this keeps
+// --workers a HOST-wide bound: without it, per-repo async dispatch would
+// multiply the cap by the number of enabled repos (main's inline sweep ran one
+// repo's batch at a time, so at most `workers` jobs ever ran host-wide).
+func (t *inflightJobTracker) total() int {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	n := 0
+	for _, count := range t.perRepo {
+		n += count
+	}
+	return n
+}
+
+// checkoutHeld reports whether an in-flight dispatched job currently holds the
+// given checkout key. Nil-receiver safe (a nil tracker never holds anything),
+// so a method value taken from a nil tracker is a valid always-false predicate.
+func (t *inflightJobTracker) checkoutHeld(key string) bool {
+	if t == nil || key == "" {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.checkouts[key] > 0
 }
 
 // busy reports whether the repo has any in-flight dispatched job or a live
@@ -469,16 +526,31 @@ func explainHeldBackJobs(ctx context.Context, worker jobWorker, tracker *infligh
 // returns promptly (surfacing any async error a previously dispatched job
 // recorded) so the supervisor worker loop keeps ticking while jobs run.
 //
+// limit is the repo's resolved concurrency (global --workers or a per-repo
+// max_parallel override, #576); globalLimit is the daemon-wide --workers count.
+// Dispatch is clamped by BOTH the per-repo limit and the host-global remainder
+// max(globalLimit, limit) − tracker.total(): the registered-repo supervisor
+// runs this pass for every enabled repo with a shared tracker, and without the
+// global clamp each repo would independently fill `limit` slots — up to
+// workers × repos in-flight runtime subprocesses where main's inline sweep
+// never exceeded `workers` host-wide. Taking the max keeps an EXPLICIT
+// per-repo override able to raise its own repo's share (main's inline batch
+// honored it); with no override the host cap is exactly `workers`.
+//
 // Pool mode starts runQueuedJobsForRepoPool as a SINGLE-FLIGHT background pass
 // per repo: the pool already re-queries continuously and does its own in-flight
 // accounting (which it mirrors into the tracker for poller/maintenance gating),
 // so one live pass is both necessary and sufficient.
-func dispatchQueuedJobsTracked(ctx context.Context, worker jobWorker, limit int, repoFilter string, rootFilter string, tracker *inflightJobTracker) error {
+func dispatchQueuedJobsTracked(ctx context.Context, worker jobWorker, limit int, globalLimit int, repoFilter string, rootFilter string, tracker *inflightJobTracker) error {
 	if obs := dispatchLimitObserver; obs != nil {
 		obs(limit)
 	}
 	if limit <= 0 {
 		return tracker.takeErr(repoFilter)
+	}
+	hostCap := globalLimit
+	if limit > hostCap {
+		hostCap = limit
 	}
 	if serializingConfig(worker.UsePool, limit) {
 		warnSerializedParallelJobs(ctx, worker, limit, repoFilter, rootFilter)
@@ -488,7 +560,7 @@ func dispatchQueuedJobsTracked(ctx context.Context, worker jobWorker, limit int,
 			runCtx := tracker.jobContext(ctx)
 			go func() {
 				defer tracker.endPool(repoFilter)
-				err := runQueuedJobsForRepoPoolTracked(runCtx, worker, limit, repoFilter, rootFilter, tracker)
+				err := runQueuedJobsForRepoPoolTracked(runCtx, worker, limit, hostCap, repoFilter, rootFilter, tracker)
 				if err != nil && !errors.Is(err, context.Canceled) {
 					tracker.recordErr(repoFilter, err)
 				}
@@ -521,6 +593,11 @@ func dispatchQueuedJobsTracked(ctx context.Context, worker jobWorker, limit int,
 		}
 	}
 	slots := limit - tracker.inflight(repoFilter)
+	// Host-global clamp: never dispatch past the daemon-wide in-flight budget,
+	// whatever this repo's own remainder is (see the function comment).
+	if hostSlots := hostCap - tracker.total(); hostSlots < slots {
+		slots = hostSlots
+	}
 	if slots <= 0 || len(eligible) == 0 {
 		return tracker.takeErr(repoFilter)
 	}
@@ -540,7 +617,10 @@ func dispatchQueuedJobsTracked(ctx context.Context, worker jobWorker, limit int,
 		}
 		checkoutKey := queuedJobCheckoutKey(ctx, worker.Store, job)
 		runtimeKey := queuedJobRuntimeResourceKey(ctx, worker.Store, job)
-		if !tracker.begin(job.ID, repoFilter, checkoutKey, runtimeKey) {
+		// beginWithin re-checks the host-global cap atomically with registration:
+		// a concurrent pool pass for another repo may have consumed the headroom
+		// this pass's slot computation saw.
+		if !tracker.beginWithin(hostCap, job.ID, repoFilter, checkoutKey, runtimeKey) {
 			worker.Admission.Release(job.ID)
 			continue
 		}

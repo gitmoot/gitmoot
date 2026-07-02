@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/github"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
@@ -208,7 +211,7 @@ func TestTrackedBarrierDefersToLivePoolPass(t *testing.T) {
 	}
 
 	// While the pool pass is live, the barrier dispatch must claim nothing.
-	if err := dispatchQueuedJobsTracked(ctx, worker, 2, "owner/repo", "", tracker); err != nil {
+	if err := dispatchQueuedJobsTracked(ctx, worker, 2, 2, "owner/repo", "", tracker); err != nil {
 		t.Fatalf("dispatchQueuedJobsTracked (pool live): %v", err)
 	}
 	time.Sleep(100 * time.Millisecond)
@@ -222,7 +225,7 @@ func TestTrackedBarrierDefersToLivePoolPass(t *testing.T) {
 
 	// Once the pool pass drains, the same barrier dispatch runs the job.
 	tracker.endPool("owner/repo")
-	if err := dispatchQueuedJobsTracked(ctx, worker, 2, "owner/repo", "", tracker); err != nil {
+	if err := dispatchQueuedJobsTracked(ctx, worker, 2, 2, "owner/repo", "", tracker); err != nil {
 		t.Fatalf("dispatchQueuedJobsTracked (pool drained): %v", err)
 	}
 	if got := waitForJobState(t, store, "job-a", string(workflow.JobSucceeded), 10*time.Second); got != string(workflow.JobSucceeded) {
@@ -382,7 +385,7 @@ func TestTrackedDispatchLogsAdmissionNeverFit(t *testing.T) {
 	worker.Admission = newAdmissionBudget(config.AdmissionPolicy{MaxMemoryGB: 0.1})
 	tracker := newInflightJobTracker(ctx)
 
-	if err := dispatchQueuedJobsTracked(ctx, worker, 2, "owner/repo", "", tracker); err != nil {
+	if err := dispatchQueuedJobsTracked(ctx, worker, 2, 2, "owner/repo", "", tracker); err != nil {
 		t.Fatalf("dispatchQueuedJobsTracked: %v", err)
 	}
 	out := stdout.String()
@@ -395,5 +398,245 @@ func TestTrackedDispatchLogsAdmissionNeverFit(t *testing.T) {
 	}
 	if job.State != string(workflow.JobQueued) {
 		t.Fatalf("job-big state = %q, want queued (admission skip must leave it queued)", job.State)
+	}
+}
+
+// TestTrackedDispatchBoundsHostTotalAcrossRepos pins the #562 review fix for
+// registered-repo mode: every enabled repo shares ONE tracker, and dispatch is
+// clamped by the HOST-global in-flight count, so --workers bounds total
+// in-flight jobs across repos. Main's inline sweep gave this for free (one
+// repo's blocking batch at a time); per-repo slots alone would allow
+// workers × repos concurrent runtime subprocesses. Four parallelizable
+// (distinct-worktree) jobs across two repos at workers=2 must never exceed 2
+// concurrent deliveries — for the tracked barrier and the tracked pool alike.
+func TestTrackedDispatchBoundsHostTotalAcrossRepos(t *testing.T) {
+	for _, usePool := range []bool{false, true} {
+		name := "Barrier"
+		if usePool {
+			name = "Pool"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			store := daemonWorkerStore(t)
+			seedDaemonWorkerRepo(t, store, "owner/repo-a", t.TempDir())
+			seedDaemonWorkerRepo(t, store, "owner/repo-b", t.TempDir())
+			seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo-a")
+			if err := store.AllowAgentRepo(ctx, "audit", "owner/repo-b"); err != nil {
+				t.Fatalf("AllowAgentRepo: %v", err)
+			}
+			concurrency := &poolConcurrencyTracker{}
+			adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
+			adapter.onDeliver = concurrency.span
+			ids := make([]string, 0, 4)
+			for i, repo := range []string{"owner/repo-a", "owner/repo-a", "owner/repo-b", "owner/repo-b"} {
+				id := fmt.Sprintf("job-%d", i+1)
+				ids = append(ids, id)
+				enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: id, Agent: "audit", Action: "ask", Repo: repo, Branch: "main", PullRequest: i + 1, WorktreePath: filepath.Join(t.TempDir(), "wt-"+id)})
+			}
+			worker := poolSchedulerWorker(t, store, adapter, usePool)
+			tracker := newInflightJobTracker(ctx)
+			t.Cleanup(func() { tracker.drain(io.Discard, 5*time.Second) })
+			locks := &repoCheckoutLocks{}
+			// The REAL registered-repo per-tick sweep, at a fast interval.
+			_ = startSupervisorWorkerLoopRecovering(ctx, 2*time.Millisecond, io.Discard, func(now time.Time) error {
+				return runEnabledRepoWorkerTicksTracked(ctx, store, worker, 2, "", io.Discard, now, locks, tracker)
+			})
+			for _, id := range ids {
+				if got := waitForJobState(t, store, id, string(workflow.JobSucceeded), 15*time.Second); got != string(workflow.JobSucceeded) {
+					t.Fatalf("%s state = %q, want succeeded (usePool=%v)", id, got, usePool)
+				}
+			}
+			if peak := concurrency.peak(); peak > 2 {
+				t.Fatalf("host-wide peak concurrency = %d, want <= 2 (--workers must bound TOTAL in-flight jobs across repos, not per repo)", peak)
+			}
+		})
+	}
+}
+
+// TestTrackedPoolIsolationHonorsSamePassRuntimeSibling pins the #562 review fix
+// for the pool's isolation loop: the loop must consult the LIVE in-flight maps,
+// not just the per-pass seed-union copies. A same-runtime-session sibling
+// dispatched moments earlier IN THE SAME PASS is invisible in the stale copies
+// (and its DB session lock may not be acquired yet), so before the fix the
+// contended no-worktree job could be isolation-dispatched beside it — the loser
+// of the session-lock race then bounced busy with its payload rewritten to an
+// isolation worktree that reap() deletes. Here: while job-wt (session sess-1)
+// is in flight, job-iso (same session, blocked on the externally-held shared
+// checkout) must stay queued with an untouched payload; once job-wt finishes,
+// job-iso must run — via an isolation worktree, since the shared checkout stays
+// held — proving the fix holds it back without starving it.
+func TestTrackedPoolIsolationHonorsSamePassRuntimeSibling(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := daemonWorkerStore(t)
+	home := t.TempDir()
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	// ONE codex agent with a session ref: both jobs share runtime key
+	// "runtime:codex:sess-1", so only one may run at a time.
+	seedDaemonWorkerAgent(t, store, "coder", runtime.CodexRuntime, "sess-1", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-wt", Agent: "coder", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1, WorktreePath: filepath.Join(t.TempDir(), "wt-job-wt")})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-iso", Agent: "coder", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 2})
+
+	adapter := newWedgeBlockingAdapter("job-wt")
+	worker := poolSchedulerWorker(t, store, adapter, true)
+	worker.ConfigHome = home // enable pool isolation worktrees
+	tracker := newInflightJobTracker(ctx)
+	// An external in-flight job holds the shared checkout for the whole test, so
+	// job-iso is always checkout-contended (isolation is its only way to run).
+	if !tracker.begin("external-hold", "owner/repo", "repo:owner/repo", "") {
+		t.Fatalf("begin(external-hold) refused on a fresh tracker")
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- runQueuedJobsForRepoPoolTracked(ctx, worker, 2, 8, "owner/repo", "", tracker) }()
+
+	if !waitForCondition(t, 5*time.Second, adapter.stillBlocked) {
+		t.Fatalf("job-wt never started delivering; delivered=%v", adapter.deliveredJobs())
+	}
+	// While the same-session sibling is in flight, job-iso must NOT be
+	// isolation-dispatched: still queued, payload untouched, never delivered.
+	time.Sleep(250 * time.Millisecond)
+	job, err := store.GetJob(ctx, "job-iso")
+	if err != nil {
+		t.Fatalf("GetJob job-iso: %v", err)
+	}
+	if job.State != string(workflow.JobQueued) {
+		t.Fatalf("job-iso state = %q while its same-session sibling runs, want queued", job.State)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatalf("payload job-iso: %v", err)
+	}
+	if payload.WorktreePath != "" {
+		t.Fatalf("job-iso payload was rewritten to isolation worktree %q beside a live same-session sibling (stale-seed isolation dispatch)", payload.WorktreePath)
+	}
+	if delivered := adapter.deliveredJobs(); len(delivered) != 1 || delivered[0] != "job-wt" {
+		t.Fatalf("delivered = %v, want only job-wt while it holds runtime session sess-1", delivered)
+	}
+
+	// Sibling finishes -> the session frees -> job-iso must now run via an
+	// isolation worktree (the shared checkout is STILL externally held).
+	close(adapter.release)
+	if got := waitForJobState(t, store, "job-wt", string(workflow.JobSucceeded), 10*time.Second); got != string(workflow.JobSucceeded) {
+		t.Fatalf("job-wt state = %q after release, want succeeded", got)
+	}
+	if got := waitForJobState(t, store, "job-iso", string(workflow.JobSucceeded), 10*time.Second); got != string(workflow.JobSucceeded) {
+		t.Fatalf("job-iso state = %q after the session freed, want succeeded (held back forever instead of isolated)", got)
+	}
+	job, err = store.GetJob(ctx, "job-iso")
+	if err != nil {
+		t.Fatalf("GetJob job-iso (final): %v", err)
+	}
+	if payload, err = daemonJobPayload(job); err != nil || payload.WorktreePath == "" {
+		t.Fatalf("job-iso final payload worktree = %q err=%v, want an isolation worktree (must have run beside the held shared checkout)", payload.WorktreePath, err)
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("pool pass returned error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("pool pass did not return after the queue drained")
+	}
+	tracker.end("external-hold")
+	tracker.drain(io.Discard, 5*time.Second)
+}
+
+// TestTrackedTickMaintenanceNotStarvedByInFlightJobs pins the #562 review fix
+// for tick maintenance: it must not be gated on WHOLE-repo idleness, which a
+// steady staggered backlog can prevent indefinitely (main's blocking barrier
+// guaranteed an idle point between batches). While an in-flight job holds the
+// shared repo checkout:
+//   - a transiently-failed result comment IS retried (comments never touch a
+//     checkout),
+//   - a pending advancement whose own checkout key is FREE (its worktree) IS
+//     retried,
+//   - a pending advancement that would mutate the HELD shared checkout is
+//     skipped (the safety half) — and retried once the holder finishes.
+func TestTrackedTickMaintenanceNotStarvedByInFlightJobs(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
+	seedDaemonWorkerAgent(t, store, "reviewer", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
+
+	mustCreateTerminalJob := func(id string, state string, payload workflow.JobPayload, extraEvents ...db.JobEvent) {
+		t.Helper()
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("Marshal %s: %v", id, err)
+		}
+		if err := store.CreateJobWithEvent(ctx, db.Job{ID: id, Agent: "reviewer", Type: "review", State: state, Payload: string(encoded)}, db.JobEvent{JobID: id, Kind: state, Message: "seed"}); err != nil {
+			t.Fatalf("CreateJobWithEvent %s: %v", id, err)
+		}
+		for _, event := range extraEvents {
+			event.JobID = id
+			if err := store.AddJobEvent(ctx, event); err != nil {
+				t.Fatalf("AddJobEvent %s: %v", id, err)
+			}
+		}
+	}
+	approved := &workflow.AgentResult{Decision: "approved", Summary: "approved"}
+	// Failed result comment awaiting retry (posting is GitHub-API-only).
+	mustCreateTerminalJob("job-comment", string(workflow.JobFailed),
+		workflow.JobPayload{Repo: "owner/repo", Branch: "main", PullRequest: 7},
+		db.JobEvent{Kind: "comment_post_failed", Message: "temporary github error"})
+	// Pending advancement keyed on its OWN worktree (free while job-live runs).
+	mustCreateTerminalJob("job-adv-wt", string(workflow.JobSucceeded),
+		workflow.JobPayload{Repo: "owner/repo", Branch: "task-wt", PullRequest: 1, TaskID: "task-wt", WorktreePath: filepath.Join(t.TempDir(), "wt-adv"), Result: approved},
+		db.JobEvent{Kind: "advance_started", Message: "workflow advancement started"})
+	// Pending advancement keyed on the SHARED repo checkout (held by job-live).
+	mustCreateTerminalJob("job-adv-repo", string(workflow.JobSucceeded),
+		workflow.JobPayload{Repo: "owner/repo", Branch: "task-repo", PullRequest: 2, TaskID: "task-repo", Result: approved},
+		db.JobEvent{Kind: "advance_started", Message: "workflow advancement started"})
+
+	comments := &cliPollFakeGitHub{}
+	gate := &cliWorkerFakeMergeGate{decision: workflow.MergeDecision{Ready: true}}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return t.TempDir(), nil
+	}
+	worker.WorkflowFactory = func(string) workflow.Engine {
+		return workflow.Engine{Store: store, MergeGate: gate}
+	}
+	worker.CommenterFactory = func(string) github.Client {
+		return comments
+	}
+
+	tracker := newInflightJobTracker(ctx)
+	// A long-running in-flight job occupying the shared checkout — on the old
+	// whole-repo busy gate this starved ALL maintenance below.
+	if !tracker.begin("job-live", "owner/repo", "repo:owner/repo", "") {
+		t.Fatalf("begin(job-live) refused on a fresh tracker")
+	}
+
+	hasEvent := func(jobID, kind string) bool {
+		events, err := store.ListJobEvents(ctx, jobID)
+		if err != nil {
+			t.Fatalf("ListJobEvents %s: %v", jobID, err)
+		}
+		return daemonWorkerHasEvent(events, kind)
+	}
+
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 2, false, "owner/repo", "", io.Discard, time.Now().UTC(), tracker); err != nil {
+		t.Fatalf("tick (busy repo): %v", err)
+	}
+	if len(comments.posted) != 1 {
+		t.Fatalf("posted comments = %d, want 1 (comment retry starved by an in-flight job)", len(comments.posted))
+	}
+	if !hasEvent("job-adv-wt", "advance_retried") {
+		t.Fatalf("job-adv-wt not advanced while its own worktree key is free (advancement starved by an in-flight job)")
+	}
+	if hasEvent("job-adv-repo", "advance_retried") {
+		t.Fatalf("job-adv-repo advanced while an in-flight job holds the shared checkout it would mutate")
+	}
+
+	// Holder finishes -> the shared-checkout advancement is retried next tick.
+	tracker.end("job-live")
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 2, false, "owner/repo", "", io.Discard, time.Now().UTC(), tracker); err != nil {
+		t.Fatalf("tick (idle repo): %v", err)
+	}
+	if !hasEvent("job-adv-repo", "advance_retried") {
+		t.Fatalf("job-adv-repo still not advanced after the shared checkout freed")
 	}
 }
