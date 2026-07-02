@@ -134,8 +134,16 @@ func TestGuardDaemonRunSingleton(t *testing.T) {
 // free it for the next acquire — including when the lockfile already exists
 // (no stale-lockfile unlink dance is ever needed). The process-scoped kill -9
 // semantics are covered by TestDaemonRunFlockSingletonE2E.
+//
+// Deliberately NOT t.Parallel(), and the post-release re-acquire retries
+// briefly: flock lives on the open file description, and a concurrently
+// fork+exec'ing test (several in this package launch real child processes)
+// briefly shares every fd between fork and exec — during that window the lock
+// survives the parent's close, so an instant re-acquire can transiently see
+// EWOULDBLOCK. The kernel guarantees release once no reference remains; only
+// the test's timing needs the slack, not the daemon (whose children exec with
+// CLOEXEC and whose lock dies with the process).
 func TestAcquireDaemonRunLock(t *testing.T) {
-	t.Parallel()
 	home := t.TempDir()
 
 	var stderr bytes.Buffer
@@ -156,12 +164,19 @@ func TestAcquireDaemonRunLock(t *testing.T) {
 
 	release()
 
-	var stderr3 bytes.Buffer
-	release3, code3 := acquireDaemonRunLock(home, &stderr3)
-	if code3 != 0 {
-		t.Fatalf("re-acquire after release code = %d, stderr=%q", code3, stderr3.String())
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var stderr3 bytes.Buffer
+		release3, code3 := acquireDaemonRunLock(home, &stderr3)
+		if code3 == 0 {
+			release3()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("re-acquire after release code = %d, stderr=%q", code3, stderr3.String())
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	release3()
 }
 
 // TestDaemonRunCommandRefusesSecondDaemon binds the regression to the real command
