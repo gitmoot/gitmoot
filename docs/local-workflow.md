@@ -446,10 +446,13 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    observation — GitHub Actions creates a check-run a few seconds after a push,
    so the gate stays **pending** and only stamps the synthetic `gitmoot/ci`
    success after a second consecutive zero-external observation at the same head,
-   at least `[merge_gate] min_ci_wait` (default `60s`) later. It also never
-   concludes no-CI when `.github/workflows/` exists at the head tree. Set
-   `[merge_gate] require_external_ci = true` (global or per-repo) to hard-block an
-   empty gate instead of ever stamping `gitmoot/ci` (see
+   at least `[merge_gate] min_ci_wait` (default `60s`) later. When
+   `.github/workflows/` exists at the head tree it instead waits up to
+   `[merge_gate] max_ci_wait` (default `10m`) for a check to appear, then concludes
+   no-CI so a PR whose workflows never trigger for it still merges rather than
+   wedging forever. Set `[merge_gate] require_external_ci = true` (global or
+   per-repo) to hard-block an empty gate once that window elapses instead of ever
+   stamping `gitmoot/ci` (see
    [`skills/gitmoot/references/SAFETY.md`](../skills/gitmoot/references/SAFETY.md)).
 
 9. Merge and continue.

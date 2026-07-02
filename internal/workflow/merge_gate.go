@@ -61,6 +61,13 @@ type PolicyMergeGate struct {
 	// zero-external observation at the same head before the gate concludes no-CI
 	// (#596, layer 1). Zero means use the built-in default (defaultMinCIWait).
 	MinCIWait time.Duration
+	// MaxCIWait BOUNDS layer 2 (#596): when `.github/workflows/` exists at the head
+	// but no external check ever appears (docs-only PRs under paths filters,
+	// tag-only / workflow_dispatch-only workflows, or a branch the workflows do not
+	// target), the gate stays pending only until MaxCIWait has elapsed with the head
+	// unchanged, then falls through to conclude no-CI so such PRs still merge instead
+	// of wedging forever. Zero means use the built-in default (defaultMaxCIWait).
+	MaxCIWait time.Duration
 	// Clock is injectable for deterministic tests. Nil means time.Now.
 	Clock func() time.Time
 }
@@ -69,6 +76,14 @@ type PolicyMergeGate struct {
 // mirrors config.DefaultMinCIWait; the workflow package keeps its own copy to
 // avoid a config import cycle.
 const defaultMinCIWait = 60 * time.Second
+
+// defaultMaxCIWait is the built-in upper bound for layer 2 (workflow-awareness)
+// used when MaxCIWait is unset. It mirrors config.DefaultMaxCIWait. It is
+// deliberately wide (GitHub Actions creates a check-run within seconds even when
+// the run itself is slow, so the only way to stay empty this long is that the
+// workflows genuinely do not run for this head), yet finite so a workflow-present
+// repo whose workflows never trigger for a given PR still merges.
+const defaultMaxCIWait = 10 * time.Minute
 
 func (g PolicyMergeGate) now() time.Time {
 	if g.Clock != nil {
@@ -82,6 +97,13 @@ func (g PolicyMergeGate) minCIWait() time.Duration {
 		return g.MinCIWait
 	}
 	return defaultMinCIWait
+}
+
+func (g PolicyMergeGate) maxCIWait() time.Duration {
+	if g.MaxCIWait > 0 {
+		return g.MaxCIWait
+	}
+	return defaultMaxCIWait
 }
 
 // workflowAwareGitHub is an OPTIONAL capability the merge gate probes for on its
@@ -178,8 +200,17 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 		}
 		var blocked mergeBlocked
 		if errors.As(err, &blocked) {
-			// An external CI failure is an authoritative template-quality rejection.
-			return g.block(ctx, request, headSHA, blocked.reason, MergeBlockQuality)
+			// An external CI FAILURE is an authoritative template-quality rejection
+			// (MergeBlockQuality, the default class). A require_external_ci empty-gate
+			// block instead carries an explicit MergeBlockTransient class: an ABSENT
+			// external CI is a repo-config/operator-policy condition, not a template
+			// defect, so the trace-harvester must not score it as a false Hard=0
+			// negative (#465 INFRA-NOISE-FILTERED).
+			class := MergeBlockQuality
+			if blocked.class != MergeBlockNone {
+				class = blocked.class
+			}
+			return g.block(ctx, request, headSHA, blocked.reason, class)
 		}
 		return MergeDecision{}, err
 	}
@@ -574,80 +605,77 @@ func (g PolicyMergeGate) ensureStatuses(ctx context.Context, repo github.Reposit
 
 // concludeNoExternalCI is the layered defense for the #596 no-CI race. When a
 // head reports zero external commit-statuses AND zero check-runs, it decides —
-// across daemon polls — whether that truly means "this repo has no CI" or merely
-// "GitHub Actions has not created the run yet".
-//
-// Layer 3 (require_external_ci): if the operator requires external CI, an empty
-// gate hard-blocks rather than ever stamping gitmoot/ci.
+// across daemon polls — whether that truly means "this repo has no CI at this
+// head" or merely "GitHub Actions has not created the run yet". Every layer is
+// TIME-BOUNDED and measured from a SINGLE persisted first-zero observation at the
+// head (recordOrLoadFirstZero), so no path can hold the gate pending forever and
+// a new head resets every window together.
 //
 // Layer 2 (workflow-awareness): if `.github/workflows/` demonstrably exists at
-// the head tree, a zero observation means Actions is lagging, so the gate never
-// concludes no-CI (stays pending). A read error fails SAFE toward the grace path
-// (treated as workflows-unknown), never toward an instant stamp.
+// the head tree, a zero observation is most likely an Actions creation lag, so
+// the gate stays pending — but only until MaxCIWait has elapsed with the head
+// unchanged. Past that bound the workflows demonstrably never produce a check for
+// this head (docs-only PRs under paths filters, tag-only / workflow_dispatch-only
+// workflows, or a branch the workflows do not target), so the gate falls through
+// and concludes no-CI rather than wedging the merge forever. A workflow-read error
+// fails SAFE toward the grace path (treated as workflows-unknown), never toward an
+// instant stamp.
 //
 // Layer 1 (grace deferral): otherwise, require TWO consecutive zero-external
-// observations at the SAME head, at least MinCIWait apart, before stamping the
-// synthetic gitmoot/ci success. The first observation (head SHA + time) is
-// persisted; a new head resets it. The gate is retried every daemon poll, so a
-// pending return is cheap and a genuinely CI-less repo merges exactly one grace
-// window later.
+// observations at the SAME head, at least MinCIWait apart, before concluding. The
+// gate is retried every daemon poll, so a pending return is cheap and a genuinely
+// CI-less repo merges exactly one grace window later.
+//
+// Layer 3 (require_external_ci): reached only AFTER the window above elapses with
+// still-zero external CI (i.e. NOT during the creation-lag race). If the operator
+// requires external CI, the empty gate hard-blocks rather than ever stamping
+// gitmoot/ci — but as a MergeBlockTransient (an absent external CI is a
+// repo-config/operator-policy condition, not a template-quality defect), so the
+// trace-harvester never scores it as a false negative (#465).
 func (g PolicyMergeGate) concludeNoExternalCI(ctx context.Context, repo github.Repository, pullRequest int64, headSHA string) error {
 	shortHead := shortSHA(headSHA)
-
-	// Layer 3: operator requires external CI — never stamp the empty gate.
-	if g.RequireExternalCI {
-		return mergeBlocked{reason: fmt.Sprintf("merge gate requires external CI but head %s reports none; set [merge_gate] require_external_ci = false to allow no-CI merges, or ensure the CI workflow runs on this pull request", shortHead)}
-	}
-
-	// Layer 2: the repo demonstrably has workflows at this head — a zero
-	// observation is an Actions creation lag, not a CI-less repo.
-	if g.headHasWorkflows(ctx, repo, headSHA) {
-		return mergePending{reason: fmt.Sprintf("repository has GitHub Actions workflows but no check run has appeared yet at head %s; waiting for CI to be created", shortHead)}
-	}
-
-	// Layer 1: grace deferral — need a second zero-external observation at the same
-	// head, at least MinCIWait later, before concluding no external CI.
-	repoFullName := repo.FullName()
 	now := g.now()
-	obs, err := g.Store.GetNoCIObservation(ctx, repoFullName, pullRequest)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+
+	// Persist (or read) the first zero-external observation at this head. All layers
+	// measure their windows from this single persisted clock, and a new head resets
+	// it — so no layer can conclude in the Actions creation-lag window and none can
+	// hold pending forever.
+	firstZero, err := g.recordOrLoadFirstZero(ctx, repo.FullName(), pullRequest, headSHA, now)
+	if err != nil {
 		return err
 	}
-	if errors.Is(err, sql.ErrNoRows) || obs.HeadSHA != headSHA {
-		// First zero observation at this head (no prior row, or the head changed):
-		// record & defer.
-		if recordErr := g.Store.UpsertNoCIObservation(ctx, db.NoCIObservation{
-			RepoFullName: repoFullName,
-			PullRequest:  pullRequest,
-			HeadSHA:      headSHA,
-			FirstZeroAt:  now.Format(time.RFC3339Nano),
-		}); recordErr != nil {
-			return recordErr
-		}
-		return mergePending{reason: fmt.Sprintf("waiting to confirm no external CI at head %s; will re-check after the grace window in case GitHub Actions is still creating the run", shortHead)}
-	}
+	elapsed := now.Sub(firstZero)
 
-	firstZero, parseErr := time.Parse(time.RFC3339Nano, obs.FirstZeroAt)
-	if parseErr != nil {
-		// A corrupt timestamp must fail SAFE toward the grace path: re-record and
-		// defer rather than instant-stamp.
-		if recordErr := g.Store.UpsertNoCIObservation(ctx, db.NoCIObservation{
-			RepoFullName: repoFullName,
-			PullRequest:  pullRequest,
-			HeadSHA:      headSHA,
-			FirstZeroAt:  now.Format(time.RFC3339Nano),
-		}); recordErr != nil {
-			return recordErr
+	// Layer 2: workflows demonstrably exist at this head — a zero observation is
+	// almost certainly an Actions creation lag, so stay pending, BOUNDED by
+	// MaxCIWait. Past that bound with the head unchanged and still zero external CI,
+	// the workflows genuinely never produce a check for this head, so fall through.
+	if g.headHasWorkflows(ctx, repo, headSHA) {
+		if elapsed < g.maxCIWait() {
+			return mergePending{reason: fmt.Sprintf("repository has GitHub Actions workflows but no check run has appeared yet at head %s; waiting up to %s for CI to be created", shortHead, g.maxCIWait())}
 		}
-		return mergePending{reason: fmt.Sprintf("re-confirming no external CI at head %s after an unreadable observation timestamp", shortHead)}
-	}
-
-	if now.Sub(firstZero) < g.minCIWait() {
+		// Bound elapsed: conclude no external CI for this head.
+	} else if elapsed < g.minCIWait() {
+		// Layer 1: grace deferral — no workflows detected, but wait one grace window
+		// in case GitHub Actions simply has not created the run yet.
 		return mergePending{reason: fmt.Sprintf("waiting to confirm no external CI at head %s; grace window has not elapsed since the first zero observation", shortHead)}
 	}
 
-	// Two consecutive zero-external observations at the same head, grace elapsed:
-	// this repo genuinely reports no external CI at this head.
+	// Confident that no external CI will appear at this head (the workflow/grace
+	// window elapsed with the head unchanged and still zero external observations).
+
+	// Layer 3: operator requires external CI — never stamp the empty gate. This is
+	// a repo-config/operator-policy condition, not a template defect, so it blocks
+	// as MergeBlockTransient (unharvested), and only here — never during the
+	// creation-lag race handled above.
+	if g.RequireExternalCI {
+		return mergeBlocked{
+			reason: fmt.Sprintf("merge gate requires external CI but head %s still reports none after waiting for CI to appear; set [merge_gate] require_external_ci = false to allow no-CI merges, or ensure the CI workflow runs on this pull request", shortHead),
+			class:  MergeBlockTransient,
+		}
+	}
+
+	// Genuinely no external CI at this head: stamp the synthetic gitmoot/ci success.
 	_, err = g.GitHub.CreateCommitStatus(ctx, github.CommitStatusInput{
 		Repo:        repo,
 		SHA:         headSHA,
@@ -656,6 +684,34 @@ func (g PolicyMergeGate) concludeNoExternalCI(ctx context.Context, repo github.R
 		Description: "No external CI reported",
 	})
 	return err
+}
+
+// recordOrLoadFirstZero persists (or reads) the first zero-external CI observation
+// at headSHA and returns the effective first-zero timestamp used to measure the
+// grace/max windows. A missing row, a head change, or an unreadable stored
+// timestamp all (re)record `now` and return it — the fail-SAFE direction, so the
+// caller measures a full window from a trustworthy clock instead of concluding
+// early off a stale or corrupt observation.
+func (g PolicyMergeGate) recordOrLoadFirstZero(ctx context.Context, repoFullName string, pullRequest int64, headSHA string, now time.Time) (time.Time, error) {
+	obs, err := g.Store.GetNoCIObservation(ctx, repoFullName, pullRequest)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, err
+	}
+	if err == nil && obs.HeadSHA == headSHA {
+		if firstZero, parseErr := time.Parse(time.RFC3339Nano, obs.FirstZeroAt); parseErr == nil {
+			return firstZero, nil
+		}
+		// Corrupt timestamp: fall through to re-record `now`.
+	}
+	if recordErr := g.Store.UpsertNoCIObservation(ctx, db.NoCIObservation{
+		RepoFullName: repoFullName,
+		PullRequest:  pullRequest,
+		HeadSHA:      headSHA,
+		FirstZeroAt:  now.Format(time.RFC3339Nano),
+	}); recordErr != nil {
+		return time.Time{}, recordErr
+	}
+	return now, nil
 }
 
 // headHasWorkflows reports whether the head tree carries a `.github/workflows/`
@@ -775,6 +831,13 @@ func (g PolicyMergeGate) recordMerged(ctx context.Context, request MergeRequest,
 
 type mergeBlocked struct {
 	reason string
+	// class, when non-zero (MergeBlockNone), overrides the default MergeBlockQuality
+	// classification the ensureStatuses handler assigns a mergeBlocked. It lets the
+	// require_external_ci empty-gate block surface as MergeBlockTransient so the
+	// trace-harvester does not score an absent-CI/operator-policy condition as a
+	// template-quality negative (#465 INFRA-NOISE-FILTERED). Zero means "use the
+	// default classification for this error site".
+	class MergeBlockClass
 }
 
 type mergePending struct {

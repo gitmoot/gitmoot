@@ -24,6 +24,9 @@ func TestApplyMergeGatePolicyOffByDefault(t *testing.T) {
 	if gate.MinCIWait != config.DefaultMinCIWait {
 		t.Fatalf("MinCIWait = %v, want default %v", gate.MinCIWait, config.DefaultMinCIWait)
 	}
+	if gate.MaxCIWait != config.DefaultMaxCIWait {
+		t.Fatalf("MaxCIWait = %v, want default %v", gate.MaxCIWait, config.DefaultMaxCIWait)
+	}
 }
 
 func TestApplyMergeGatePolicyReadsPerRepoKnob(t *testing.T) {
@@ -35,6 +38,7 @@ func TestApplyMergeGatePolicyReadsPerRepoKnob(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+`
 [merge_gate]
 min_ci_wait = "45s"
+max_ci_wait = "7m"
 
 [repos."jerryfane/noted".merge_gate]
 require_external_ci = true
@@ -50,6 +54,9 @@ require_external_ci = true
 	if noted.MinCIWait != 45*time.Second {
 		t.Fatalf("noted MinCIWait = %v, want inherited 45s", noted.MinCIWait)
 	}
+	if noted.MaxCIWait != 7*time.Minute {
+		t.Fatalf("noted MaxCIWait = %v, want inherited 7m", noted.MaxCIWait)
+	}
 
 	other := workflow.PolicyMergeGate{}
 	applyMergeGatePolicy(&other, paths.Home, "jerryfane/gitmoot")
@@ -59,12 +66,15 @@ require_external_ci = true
 	if other.MinCIWait != 45*time.Second {
 		t.Fatalf("non-override repo MinCIWait = %v, want global 45s", other.MinCIWait)
 	}
+	if other.MaxCIWait != 7*time.Minute {
+		t.Fatalf("non-override repo MaxCIWait = %v, want global 7m", other.MaxCIWait)
+	}
 }
 
 func TestApplyMergeGatePolicyEmptyHomeIsNoop(t *testing.T) {
 	gate := workflow.PolicyMergeGate{}
 	applyMergeGatePolicy(&gate, "", "jerryfane/noted")
-	if gate.RequireExternalCI || gate.MinCIWait != 0 {
+	if gate.RequireExternalCI || gate.MinCIWait != 0 || gate.MaxCIWait != 0 {
 		t.Fatalf("empty home must leave the gate untouched, got %+v", gate)
 	}
 }

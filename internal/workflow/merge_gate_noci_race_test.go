@@ -2,7 +2,6 @@ package workflow
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"strings"
 	"testing"
@@ -231,37 +230,101 @@ func TestPolicyMergeGateNoCIObservationResetsOnNewHead(t *testing.T) {
 	}
 }
 
-// TestPolicyMergeGateWorkflowAwarenessNeverConcludesNoCI pins layer 2: when the
-// head tree demonstrably carries .github/workflows, a zero-external observation is
-// an Actions creation lag, so the gate NEVER concludes no-CI — even long past the
-// grace window — and never stamps gitmoot/ci.
-func TestPolicyMergeGateWorkflowAwarenessNeverConcludesNoCI(t *testing.T) {
+// TestPolicyMergeGateWorkflowAwarenessBoundsPendingThenConcludes pins the bounded
+// layer 2 (#596 review fix): when the head tree demonstrably carries
+// .github/workflows, a zero-external observation is treated as an Actions creation
+// lag and the gate stays pending — but only until MaxCIWait elapses with the head
+// unchanged. Past that bound the workflows demonstrably never produce a check for
+// this head (docs-only under paths filters, tag-only / dispatch-only workflows, a
+// non-targeted branch), so the gate concludes no-CI, stamps gitmoot/ci, and merges
+// instead of wedging forever. This restores the liveness main had while keeping the
+// creation-lag protection.
+func TestPolicyMergeGateWorkflowAwarenessBoundsPendingThenConcludes(t *testing.T) {
 	resetWorkflowPresenceCache()
 	ctx := context.Background()
 	store := openEngineStore(t)
 	base := setupApprovedNoCIPR(t, store, "wfhead1")
 	gh := &workflowAwareFakeGitHub{fakeMergeGateGitHub: base, workflowsExist: true}
 	clock := &fakeClock{now: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)}
-	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), MinCIWait: time.Minute, Clock: clock.Now}
+	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), MinCIWait: time.Minute, MaxCIWait: 10 * time.Minute, Clock: clock.Now}
 
-	for i, wait := range []time.Duration{0, 5 * time.Minute, 30 * time.Minute} {
+	// Within the MaxCIWait bound: stay pending on the workflow-awareness reason and
+	// never stamp gitmoot/ci, even well past the (shorter) grace window.
+	for i, wait := range []time.Duration{0, 5 * time.Minute} {
 		clock.advance(wait)
 		d, err := gate.Evaluate(ctx, noCIRequest())
 		if err != nil {
 			t.Fatalf("evaluation %d returned error: %v", i+1, err)
 		}
 		if d.Merged {
-			t.Fatalf("evaluation %d merged a workflow-configured repo with no check run yet", i+1)
+			t.Fatalf("evaluation %d merged a workflow-configured repo inside the CI-creation bound", i+1)
 		}
 		if !strings.Contains(d.Reason, "workflows") {
 			t.Fatalf("evaluation %d reason = %q, want a workflow-awareness pending reason", i+1, d.Reason)
 		}
+		if hasStatus(base.statuses, gitmootNoCIContext, "success") {
+			t.Fatalf("evaluation %d stamped gitmoot/ci inside the CI-creation bound, statuses=%+v", i+1, base.statuses)
+		}
 	}
-	if hasStatus(base.statuses, gitmootNoCIContext, "success") {
-		t.Fatalf("workflow-aware repo stamped gitmoot/ci, statuses=%+v", base.statuses)
+
+	// Past MaxCIWait with the head unchanged and still zero external CI: the gate
+	// falls through, stamps gitmoot/ci once, and merges (liveness restored).
+	clock.advance(6 * time.Minute) // total ~11m > MaxCIWait
+	d, err := gate.Evaluate(ctx, noCIRequest())
+	if err != nil {
+		t.Fatalf("final evaluation returned error: %v", err)
+	}
+	if !d.Merged {
+		t.Fatalf("final evaluation decision = %+v, want merged after the CI-creation bound elapsed", d)
+	}
+	if !hasStatus(base.statuses, gitmootNoCIContext, "success") {
+		t.Fatalf("bounded workflow-aware repo should stamp gitmoot/ci once past MaxCIWait, statuses=%+v", base.statuses)
 	}
 	if gh.workflowCalls != 1 {
 		t.Fatalf("workflow-awareness reads = %d, want 1 (cached per head)", gh.workflowCalls)
+	}
+}
+
+// TestPolicyMergeGateWorkflowAwarenessRequireExternalCIBlocksAfterBound pins that a
+// workflow-present head under require_external_ci waits out the MaxCIWait bound
+// (rather than hard-blocking during the Actions creation-lag race) and only then
+// hard-blocks — as a TRANSIENT block the harvester ignores, never a gitmoot/ci stamp.
+func TestPolicyMergeGateWorkflowAwarenessRequireExternalCIBlocksAfterBound(t *testing.T) {
+	resetWorkflowPresenceCache()
+	ctx := context.Background()
+	store := openEngineStore(t)
+	base := setupApprovedNoCIPR(t, store, "wfreq01")
+	gh := &workflowAwareFakeGitHub{fakeMergeGateGitHub: base, workflowsExist: true}
+	clock := &fakeClock{now: time.Date(2026, 7, 1, 6, 0, 0, 0, time.UTC)}
+	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), MinCIWait: time.Minute, MaxCIWait: 10 * time.Minute, RequireExternalCI: true, Clock: clock.Now}
+
+	// Inside the bound: pending (waiting for CI), NOT a hard block during the race.
+	d1, err := gate.Evaluate(ctx, noCIRequest())
+	if err != nil {
+		t.Fatalf("evaluation 1 returned error: %v", err)
+	}
+	if !d1.Ready || d1.Merged {
+		t.Fatalf("evaluation 1 decision = %+v, want pending (not blocked) inside the CI-creation bound", d1)
+	}
+
+	// Past the bound: hard-block, but as MergeBlockTransient (unharvested) and with
+	// no gitmoot/ci stamp.
+	clock.advance(11 * time.Minute)
+	d2, err := gate.Evaluate(ctx, noCIRequest())
+	if err != nil {
+		t.Fatalf("evaluation 2 returned error: %v", err)
+	}
+	if d2.Ready || d2.Merged {
+		t.Fatalf("evaluation 2 decision = %+v, want a hard block past the bound", d2)
+	}
+	if !strings.Contains(d2.Reason, "requires external CI") {
+		t.Fatalf("evaluation 2 reason = %q, want a require-external-CI message", d2.Reason)
+	}
+	if d2.BlockClass != MergeBlockTransient {
+		t.Fatalf("evaluation 2 block class = %v, want MergeBlockTransient (unharvested)", d2.BlockClass)
+	}
+	if hasStatus(base.statuses, gitmootNoCIContext, "success") {
+		t.Fatalf("require_external_ci stamped gitmoot/ci, statuses=%+v", base.statuses)
 	}
 }
 
@@ -296,34 +359,53 @@ func TestPolicyMergeGateWorkflowReadErrorFailsSafeToGrace(t *testing.T) {
 	}
 }
 
-// TestPolicyMergeGateRequireExternalCIHardBlocks pins layer 3: with
-// require_external_ci, an empty gate hard-blocks with an actionable reason rather
-// than ever stamping gitmoot/ci.
-func TestPolicyMergeGateRequireExternalCIHardBlocks(t *testing.T) {
+// TestPolicyMergeGateRequireExternalCIWaitsThenHardBlocks pins layer 3 (#596 review
+// fix): with require_external_ci and a head with no detectable workflows, an empty
+// gate first WAITS the grace window (rather than hard-blocking during the Actions
+// creation-lag race, which would strand the task in the un-re-driven blocked state
+// and be harvested as a false template negative). Only once the window elapses with
+// still-zero external CI does it hard-block — with an actionable reason, as a
+// TRANSIENT block the harvester ignores, and never stamping gitmoot/ci.
+func TestPolicyMergeGateRequireExternalCIWaitsThenHardBlocks(t *testing.T) {
 	resetWorkflowPresenceCache()
 	ctx := context.Background()
 	store := openEngineStore(t)
 	gh := setupApprovedNoCIPR(t, store, "reqci01")
-	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), RequireExternalCI: true}
+	clock := &fakeClock{now: time.Date(2026, 7, 1, 5, 0, 0, 0, time.UTC)}
+	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), MinCIWait: time.Minute, RequireExternalCI: true, Clock: clock.Now}
 
-	d, err := gate.Evaluate(ctx, noCIRequest())
+	// Evaluation 1 (inside the grace window): pending, NOT a hard block — this is the
+	// creation-lag race window #596 targets. No gitmoot/ci stamp, no merge.
+	d1, err := gate.Evaluate(ctx, noCIRequest())
 	if err != nil {
-		t.Fatalf("Evaluate returned error: %v", err)
+		t.Fatalf("evaluation 1 returned error: %v", err)
 	}
-	if d.Ready || d.Merged {
-		t.Fatalf("decision = %+v, want a hard block (not ready, not merged)", d)
+	if !d1.Ready || d1.Merged {
+		t.Fatalf("evaluation 1 decision = %+v, want pending (not a hard block) inside the grace window", d1)
 	}
-	if !strings.Contains(d.Reason, "requires external CI") {
-		t.Fatalf("block reason = %q, want an actionable require-external-CI message", d.Reason)
+	if d1.BlockClass != MergeBlockNone {
+		t.Fatalf("evaluation 1 block class = %v, want MergeBlockNone for a pending decision", d1.BlockClass)
 	}
-	if d.BlockClass != MergeBlockQuality {
-		t.Fatalf("block class = %v, want MergeBlockQuality", d.BlockClass)
+
+	// Evaluation 2 (grace elapsed, still zero external CI): hard block.
+	clock.advance(90 * time.Second)
+	d2, err := gate.Evaluate(ctx, noCIRequest())
+	if err != nil {
+		t.Fatalf("evaluation 2 returned error: %v", err)
+	}
+	if d2.Ready || d2.Merged {
+		t.Fatalf("evaluation 2 decision = %+v, want a hard block (not ready, not merged)", d2)
+	}
+	if !strings.Contains(d2.Reason, "requires external CI") {
+		t.Fatalf("block reason = %q, want an actionable require-external-CI message", d2.Reason)
+	}
+	// Absent-CI + operator policy is an infra/config condition, NOT a template defect:
+	// it must be MergeBlockTransient so the trace-harvester does not score it (#465).
+	if d2.BlockClass != MergeBlockTransient {
+		t.Fatalf("block class = %v, want MergeBlockTransient (unharvested infra/config block)", d2.BlockClass)
 	}
 	if hasStatus(gh.statuses, gitmootNoCIContext, "success") {
 		t.Fatalf("require_external_ci stamped gitmoot/ci, statuses=%+v", gh.statuses)
-	}
-	if _, err := store.GetNoCIObservation(ctx, "jerryfane/noted", 11); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("require_external_ci recorded a grace observation; err=%v", err)
 	}
 }
 

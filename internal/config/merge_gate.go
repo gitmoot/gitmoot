@@ -16,6 +16,16 @@ import (
 // window later.
 const DefaultMinCIWait = 60 * time.Second
 
+// DefaultMaxCIWait is the upper bound the merge gate waits when `.github/workflows/`
+// exists at the head but no external check ever appears (#596, layer 2). Past this
+// window with the head unchanged and still zero external CI, the gate concludes
+// no-CI and stamps the synthetic gitmoot/ci success instead of staying pending
+// forever, so a PR whose workflows never trigger for it (docs-only under paths
+// filters, tag-only / workflow_dispatch-only workflows, or a non-targeted branch)
+// still merges. It is wide (GitHub Actions creates a check-run within seconds) yet
+// finite to restore liveness.
+const DefaultMaxCIWait = 10 * time.Minute
+
 // MergeGatePolicy is the resolved merge-gate behavior for a repo (#596). It is
 // OFF BY DEFAULT in the sense that the historical behavior — conclude "no CI"
 // from a zero-external observation — still happens, just deferred by one grace
@@ -28,14 +38,20 @@ type MergeGatePolicy struct {
 	RequireExternalCI bool
 	// MinCIWait is the grace window between the first and second zero-external
 	// observation at the same head before the gate concludes no-CI. Default
-	// DefaultMinCIWait (60s). It is ignored when RequireExternalCI is true.
+	// DefaultMinCIWait (60s).
 	MinCIWait time.Duration
+	// MaxCIWait is the upper bound the gate waits when `.github/workflows/` exists at
+	// the head but no external check appears (#596, layer 2). Past it the gate
+	// concludes no-CI instead of staying pending forever. Default DefaultMaxCIWait
+	// (10m).
+	MaxCIWait time.Duration
 }
 
 // DefaultMergeGatePolicy returns the off-by-default policy: no external CI is not
-// required, and the no-CI conclusion is deferred by the default grace window.
+// required, and the no-CI conclusion is deferred by the default grace window (and
+// bounded by the default max window when workflows exist at the head).
 func DefaultMergeGatePolicy() MergeGatePolicy {
-	return MergeGatePolicy{RequireExternalCI: false, MinCIWait: DefaultMinCIWait}
+	return MergeGatePolicy{RequireExternalCI: false, MinCIWait: DefaultMinCIWait, MaxCIWait: DefaultMaxCIWait}
 }
 
 // MergeGateConfig is the parsed [merge_gate] configuration: a global default plus
@@ -53,6 +69,7 @@ type MergeGateConfig struct {
 type mergeGateOverride struct {
 	requireExternalCI *bool
 	minCIWait         *time.Duration
+	maxCIWait         *time.Duration
 }
 
 // For resolves the effective policy for a repo: the global default with any
@@ -63,6 +80,9 @@ func (c MergeGateConfig) For(repo string) MergeGatePolicy {
 	if policy.MinCIWait <= 0 {
 		policy.MinCIWait = DefaultMinCIWait
 	}
+	if policy.MaxCIWait <= 0 {
+		policy.MaxCIWait = DefaultMaxCIWait
+	}
 	override, ok := c.repos[strings.TrimSpace(repo)]
 	if !ok {
 		return policy
@@ -72,6 +92,9 @@ func (c MergeGateConfig) For(repo string) MergeGatePolicy {
 	}
 	if override.minCIWait != nil {
 		policy.MinCIWait = *override.minCIWait
+	}
+	if override.maxCIWait != nil {
+		policy.MaxCIWait = *override.maxCIWait
 	}
 	return policy
 }
@@ -182,6 +205,13 @@ func applyMergeGateGlobalField(policy *MergeGatePolicy, key string, value string
 		}
 		policy.MinCIWait = parsed
 		return nil
+	case "max_ci_wait":
+		parsed, err := parseConfigDuration(value)
+		if err != nil {
+			return err
+		}
+		policy.MaxCIWait = parsed
+		return nil
 	default:
 		return nil
 	}
@@ -203,6 +233,13 @@ func applyMergeGateOverrideField(override *mergeGateOverride, key string, value 
 		}
 		override.minCIWait = &parsed
 		return nil
+	case "max_ci_wait":
+		parsed, err := parseConfigDuration(value)
+		if err != nil {
+			return err
+		}
+		override.maxCIWait = &parsed
+		return nil
 	default:
 		return nil
 	}
@@ -211,6 +248,9 @@ func applyMergeGateOverrideField(override *mergeGateOverride, key string, value 
 func validateMergeGatePolicy(label string, policy MergeGatePolicy) error {
 	if policy.MinCIWait < 0 {
 		return fmt.Errorf("%s: min_ci_wait must be a non-negative duration", label)
+	}
+	if policy.MaxCIWait < 0 {
+		return fmt.Errorf("%s: max_ci_wait must be a non-negative duration", label)
 	}
 	return nil
 }

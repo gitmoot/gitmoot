@@ -37,15 +37,21 @@ at the same head**, at least `min_ci_wait` (default `60s`) later. The gate is
 re-evaluated every daemon poll, so a genuinely CI-less repo merges exactly one
 grace window later. Two extra guards layer on top:
 
-- **Workflow-aware:** if `.github/workflows/` exists at the head tree, the gate
-  never concludes no-CI from a zero observation — it stays pending until a real
-  check appears (a demonstrably CI-configured repo whose Actions run is merely
-  queued must never merge gatelessly).
+- **Workflow-aware (bounded):** if `.github/workflows/` exists at the head tree,
+  the gate treats a zero observation as an Actions creation lag and stays pending
+  — but only up to `max_ci_wait` (default `10m`) with the head unchanged. Past
+  that bound it concludes no-CI, so a PR whose workflows never produce a check for
+  it (docs-only under paths filters, tag-only / `workflow_dispatch`-only
+  workflows, a non-targeted branch) still merges instead of wedging forever, while
+  the ~seconds creation lag is still covered.
 - **`[merge_gate] require_external_ci`** (global, or per-repo under
   `[repos."owner/repo".merge_gate]`; default `false`): when `true`, an empty gate
-  **hard-blocks** with an actionable reason instead of ever stamping `gitmoot/ci`
-  — use it for repos you know always have CI. Optionally tune `min_ci_wait` in the
-  same section.
+  **hard-blocks** with an actionable reason — *after* the wait window above, never
+  during the creation-lag race — instead of ever stamping `gitmoot/ci`. Use it for
+  repos you know always have CI. The block is classified transient (it is a
+  repo-config/operator-policy condition, not a template defect), so it is not
+  scored against the implement template. Optionally tune `min_ci_wait` /
+  `max_ci_wait` in the same section.
 
 Useful commands:
 

@@ -14,6 +14,9 @@ func TestDefaultMergeGatePolicyOff(t *testing.T) {
 	if policy.MinCIWait != DefaultMinCIWait {
 		t.Fatalf("default MinCIWait = %v, want %v", policy.MinCIWait, DefaultMinCIWait)
 	}
+	if policy.MaxCIWait != DefaultMaxCIWait {
+		t.Fatalf("default MaxCIWait = %v, want %v", policy.MaxCIWait, DefaultMaxCIWait)
+	}
 }
 
 func TestLoadMergeGatePolicyAbsentKeepsDefaults(t *testing.T) {
@@ -40,6 +43,7 @@ func TestLoadMergeGatePolicyGlobalSection(t *testing.T) {
 [merge_gate]
 require_external_ci = true
 min_ci_wait = "90s"
+max_ci_wait = "5m"
 `), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
@@ -54,6 +58,9 @@ min_ci_wait = "90s"
 	if got.MinCIWait != 90*time.Second {
 		t.Fatalf("global MinCIWait = %v, want 90s", got.MinCIWait)
 	}
+	if got.MaxCIWait != 5*time.Minute {
+		t.Fatalf("global MaxCIWait = %v, want 5m", got.MaxCIWait)
+	}
 }
 
 func TestLoadMergeGatePolicyPerRepoOverride(t *testing.T) {
@@ -67,6 +74,7 @@ min_ci_wait = "30s"
 
 [repos."jerryfane/noted".merge_gate]
 require_external_ci = true
+max_ci_wait = "3m"
 `), 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
@@ -75,7 +83,8 @@ require_external_ci = true
 		t.Fatalf("LoadMergeGatePolicy returned error: %v", err)
 	}
 
-	// The override repo inherits the global min_ci_wait but flips require_external_ci.
+	// The override repo inherits the global min_ci_wait, flips require_external_ci,
+	// and sets its own max_ci_wait.
 	noted := cfg.For("jerryfane/noted")
 	if !noted.RequireExternalCI {
 		t.Fatalf("override require_external_ci = false, want true")
@@ -83,14 +92,21 @@ require_external_ci = true
 	if noted.MinCIWait != 30*time.Second {
 		t.Fatalf("override MinCIWait = %v, want inherited 30s", noted.MinCIWait)
 	}
+	if noted.MaxCIWait != 3*time.Minute {
+		t.Fatalf("override MaxCIWait = %v, want 3m", noted.MaxCIWait)
+	}
 
-	// A repo with no override keeps the global default (require_external_ci off).
+	// A repo with no override keeps the global default (require_external_ci off) and
+	// the default max_ci_wait.
 	other := cfg.For("jerryfane/gitmoot")
 	if other.RequireExternalCI {
 		t.Fatalf("non-override repo require_external_ci = true, want false")
 	}
 	if other.MinCIWait != 30*time.Second {
 		t.Fatalf("non-override repo MinCIWait = %v, want 30s", other.MinCIWait)
+	}
+	if other.MaxCIWait != DefaultMaxCIWait {
+		t.Fatalf("non-override repo MaxCIWait = %v, want default %v", other.MaxCIWait, DefaultMaxCIWait)
 	}
 }
 
