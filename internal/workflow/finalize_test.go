@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
 // TestEngineBackstopTripEnqueuesFinalizeContinuation pins the #305 "Later"
@@ -24,8 +25,16 @@ func TestEngineBackstopTripEnqueuesFinalizeContinuation(t *testing.T) {
 	for i := 0; i <= MaxDelegationWidth; i++ {
 		dels = append(dels, Delegation{ID: fmt.Sprintf("d%d", i), Agent: "w", Action: "ask", Prompt: "work"})
 	}
+	freshRef, err := runtime.NewFreshRef()
+	if err != nil {
+		t.Fatalf("NewFreshRef: %v", err)
+	}
 	insertCompletedJob(t, store, db.Job{ID: "wide", Agent: "coord", Type: "ask"}, JobPayload{
 		Repo: "jerryfane/gitmoot", Branch: "task-005", TaskID: "task-5", Sender: "coord",
+		// A coordinator running under a per-job runtime override (#531): the
+		// finalize continuation must stay on the override, never revert to (and
+		// resume) the agent's default-runtime session.
+		RuntimeOverride: runtime.ClaudeRuntime, RuntimeOverrideRef: freshRef,
 		Result: &AgentResult{Decision: "approved", Summary: "too wide", Delegations: dels},
 	})
 	if err := engine.AdvanceJob(ctx, "wide"); err != nil {
@@ -40,6 +49,9 @@ func TestEngineBackstopTripEnqueuesFinalizeContinuation(t *testing.T) {
 	}
 	if !cont.DelegationFinalize {
 		t.Fatalf("finalize continuation must carry DelegationFinalize: %+v", cont)
+	}
+	if cont.RuntimeOverride != runtime.ClaudeRuntime || cont.RuntimeOverrideRef != freshRef {
+		t.Fatalf("finalize continuation must stay on the per-job runtime override (#531), got %q/%q", cont.RuntimeOverride, cont.RuntimeOverrideRef)
 	}
 	if got := countJobEvents(t, store, "wide", "delegation_finalize_enqueued"); got != 1 {
 		t.Fatalf("delegation_finalize_enqueued events = %d, want 1", got)

@@ -311,6 +311,32 @@ string (a Codex, Claude Code, or Kimi Code model name) with no allow-list; an
 omitted `--model` leaves the agent's default model in effect. Both `--model X`
 and `--model=X` are accepted.
 
+The same commands accept an optional per-job `--runtime
+codex|claude|kimi|kimi-cli|shell` override: that ONE job runs through the named
+runtime while the agent's registered default runtime stays untouched (`agent
+show` is unchanged afterwards). An overridden job never resumes — and never
+writes back to — the agent's default-runtime session: it runs on a fresh
+session of the override runtime, or on an explicit `--session <ref>` (a
+Codex/Claude session id, a Kimi session id, or — required for `shell` — a
+command; `last` is rejected because it resumes whichever session is most
+recent rather than a concrete one), and its runtime-session lock names the
+override runtime so it cannot collide with the default session's lock. Model
+rule: `--model` combined with `--runtime` is interpreted for the OVERRIDE
+runtime; an override without `--model` uses the override runtime's default
+model — the agent's configured default model is never applied to a different
+runtime. An unknown
+`--runtime` fails before any job is enqueued, background (daemon) jobs honor
+the override identically to foreground, and a coordinator's delegation-tree
+continuations (synthesis, corrective, replan, finalize) inherit the override,
+so an `orchestrate --runtime` tree stays on the override runtime across
+generations:
+
+```sh
+# Retry a hard review through Claude without re-registering the reviewer:
+gitmoot agent review reviewer --repo owner/repo --pr 123 "Re-review this PR." --runtime claude
+gitmoot agent ask reviewer "Compare the approaches." --repo owner/repo --runtime kimi --model kimi-k2
+```
+
 `gitmoot orchestrate`, `agent run`, and `agent implement` also accept an optional
 `--skip-native-review-fanout` flag. By default an `implement` job that opens a
 pull request fans the PR out to Gitmoot's native reviewers (the configured

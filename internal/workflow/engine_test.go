@@ -2342,6 +2342,61 @@ func TestEngineContinuationCarriesParentModel(t *testing.T) {
 	}
 }
 
+// TestEngineContinuationCarriesRuntimeOverride guards the #531 session-safety
+// invariant across delegation generations: a coordinator running under a
+// per-job runtime override must enqueue its synthesis continuation WITH the
+// override. Dropping it would run the continuation as the DEFAULT agent —
+// resuming (and writing into) the agent's default-runtime session the override
+// exists to stay off, and passing the override-runtime --model to the default
+// runtime's CLI, which rejects it and strands the tree after every child
+// already succeeded.
+func TestEngineContinuationCarriesRuntimeOverride(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "api", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	freshRef, err := runtime.NewFreshRef()
+	if err != nil {
+		t.Fatalf("NewFreshRef: %v", err)
+	}
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:               "jerryfane/gitmoot",
+		Branch:             "task-005",
+		Sender:             "coord",
+		Model:              "claude-opus-4-5",
+		RuntimeOverride:    runtime.ClaudeRuntime,
+		RuntimeOverrideRef: freshRef,
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "api", Agent: "api", Action: "review", Prompt: "build api"},
+			},
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob(parent): %v", err)
+	}
+	completeDelegationChild(t, store, "parent-job/delegation/api", JobSucceeded, AgentResult{Decision: "approved", Summary: "api ok"})
+	if err := engine.AdvanceJob(ctx, "parent-job/delegation/api"); err != nil {
+		t.Fatalf("AdvanceJob(api): %v", err)
+	}
+	continuation := mustJob(t, store, delegationContinuationID("parent-job"))
+	cp, err := unmarshalPayload(continuation.Payload)
+	if err != nil {
+		t.Fatalf("unmarshal continuation payload: %v", err)
+	}
+	if cp.RuntimeOverride != runtime.ClaudeRuntime || cp.RuntimeOverrideRef != freshRef {
+		t.Fatalf("continuation payload override = %q/%q, want %q/%q (the override must carry into the synthesis continuation)",
+			cp.RuntimeOverride, cp.RuntimeOverrideRef, runtime.ClaudeRuntime, freshRef)
+	}
+	if cp.Model != "claude-opus-4-5" {
+		t.Fatalf("continuation payload Model = %q, want the override-runtime model to stay with its override", cp.Model)
+	}
+}
+
 // TestEngineContinuationInheritsCockpit guards that a coordinator's cockpit
 // settings carry into the post-synthesis continuation so the continuation
 // renders its pane under the same workspace/session as the rest of the tree.
