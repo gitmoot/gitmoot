@@ -2811,6 +2811,28 @@ func (s *Store) LatestJobEventsOfKinds(ctx context.Context, kinds []string) (map
 	return out, rows.Err()
 }
 
+// jobIDsByQuery runs a query whose rows are each a single job_id column and
+// collects them into a slice. The bounded-candidate passes (#598) and the
+// delegation-worktree reclaim pass all share this identical rows-scan boilerplate;
+// each supplies its own SELECT and defers the row handling here.
+func (s *Store) jobIDsByQuery(ctx context.Context, query string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobIDs []string
+	for rows.Next() {
+		var jobID string
+		if err := rows.Scan(&jobID); err != nil {
+			return nil, err
+		}
+		jobIDs = append(jobIDs, jobID)
+	}
+	return jobIDs, rows.Err()
+}
+
 // JobIDsWithPendingDelegationWorktreeReclaim returns the IDs of jobs whose most
 // recent terminal delegation-worktree cleanup outcome was a PRESERVE
 // (delegation_worktree_cleanup_skipped) NOT yet followed by a removal
@@ -2830,7 +2852,7 @@ func (s *Store) LatestJobEventsOfKinds(ctx context.Context, kinds []string) (map
 // is a skip — exactly mirroring the per-job lastCleanupOutcomeIsSkip walk, but
 // set-at-once.
 func (s *Store) JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT job_id FROM job_events
+	return s.jobIDsByQuery(ctx, `SELECT job_id FROM job_events
 		WHERE kind = 'delegation_worktree_cleanup_skipped'
 		  AND id IN (
 			SELECT MAX(id) FROM job_events
@@ -2838,20 +2860,6 @@ func (s *Store) JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) 
 			GROUP BY job_id
 		)
 		ORDER BY job_id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var jobIDs []string
-	for rows.Next() {
-		var jobID string
-		if err := rows.Scan(&jobID); err != nil {
-			return nil, err
-		}
-		jobIDs = append(jobIDs, jobID)
-	}
-	return jobIDs, rows.Err()
 }
 
 // JobIDsWithPendingAdvanceRetry returns the IDs of jobs whose LATEST post-delivery
@@ -2871,7 +2879,7 @@ func (s *Store) JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) 
 // switch's default: no-op for every other kind) and the outer filter keeps a job
 // iff that latest tracked event is positive. One row per job (its unique MAX id).
 func (s *Store) JobIDsWithPendingAdvanceRetry(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT job_id FROM job_events
+	return s.jobIDsByQuery(ctx, `SELECT job_id FROM job_events
 		WHERE kind IN ('advance_started', 'advance_retry')
 		  AND id IN (
 			SELECT MAX(id) FROM job_events
@@ -2880,20 +2888,6 @@ func (s *Store) JobIDsWithPendingAdvanceRetry(ctx context.Context) ([]string, er
 			GROUP BY job_id
 		)
 		ORDER BY job_id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var jobIDs []string
-	for rows.Next() {
-		var jobID string
-		if err := rows.Scan(&jobID); err != nil {
-			return nil, err
-		}
-		jobIDs = append(jobIDs, jobID)
-	}
-	return jobIDs, rows.Err()
 }
 
 // JobIDsWithPendingCommentRetry returns the IDs of jobs whose LATEST comment event
@@ -2904,7 +2898,7 @@ func (s *Store) JobIDsWithPendingAdvanceRetry(ctx context.Context) ([]string, er
 // tick (#598). The pass re-verifies each candidate with the Go predicate, so this
 // only has to be a superset; it is in fact exact.
 func (s *Store) JobIDsWithPendingCommentRetry(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT job_id FROM job_events
+	return s.jobIDsByQuery(ctx, `SELECT job_id FROM job_events
 		WHERE kind = 'comment_post_failed'
 		  AND id IN (
 			SELECT MAX(id) FROM job_events
@@ -2912,20 +2906,6 @@ func (s *Store) JobIDsWithPendingCommentRetry(ctx context.Context) ([]string, er
 			GROUP BY job_id
 		)
 		ORDER BY job_id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var jobIDs []string
-	for rows.Next() {
-		var jobID string
-		if err := rows.Scan(&jobID); err != nil {
-			return nil, err
-		}
-		jobIDs = append(jobIDs, jobID)
-	}
-	return jobIDs, rows.Err()
 }
 
 // JobIDsWithOpenEscalation returns the IDs of coordinator jobs with an OPEN
@@ -2945,26 +2925,12 @@ func (s *Store) JobIDsWithPendingCommentRetry(ctx context.Context) ([]string, er
 // strings MUST equal the escalationRequestedEvent/escalationResolvedEvent constants;
 // a store test pins this.
 func (s *Store) JobIDsWithOpenEscalation(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT job_id FROM job_events
+	return s.jobIDsByQuery(ctx, `SELECT job_id FROM job_events
 		WHERE kind IN ('delegation_escalation_requested', 'delegation_escalation_resolved')
 		GROUP BY job_id
 		HAVING SUM(CASE WHEN kind = 'delegation_escalation_requested' THEN 1 ELSE 0 END)
 		     > SUM(CASE WHEN kind = 'delegation_escalation_resolved' THEN 1 ELSE 0 END)
 		ORDER BY job_id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var jobIDs []string
-	for rows.Next() {
-		var jobID string
-		if err := rows.Scan(&jobID); err != nil {
-			return nil, err
-		}
-		jobIDs = append(jobIDs, jobID)
-	}
-	return jobIDs, rows.Err()
 }
 
 func (s *Store) UpsertEvalArtifact(ctx context.Context, artifact EvalArtifact) error {

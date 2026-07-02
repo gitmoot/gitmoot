@@ -5889,13 +5889,19 @@ func (e Engine) AutoFinalizeExpiredEscalations(ctx context.Context, ttl time.Dur
 	now := e.now().UTC()
 	finalized := 0
 	for _, jobID := range jobIDs {
-		// A candidate escalation event whose job row was pruned would make
-		// jobPayload (below) return a non-errors.Is-able "job not found" that aborts
-		// the whole scan; skip it here, mirroring the reclaim/retry bounded passes
-		// (#598). Unreachable today (nothing prunes jobs), but keeps the pattern and
-		// the PollOnce caller robust to a future job-pruning feature.
-		if _, err := e.Store.GetJob(ctx, jobID); errors.Is(err, sql.ErrNoRows) {
+		// A candidate escalation event whose job row was pruned would make the
+		// payload load below fail; skip it here on sql.ErrNoRows, mirroring the
+		// reclaim/retry bounded passes (#598). Unreachable today (nothing prunes
+		// jobs), but keeps the pattern and the PollOnce caller robust to a future
+		// job-pruning feature. The fetched job is reused for the payload below, so a
+		// finalized candidate costs a single GetJob rather than the old
+		// GetJob-then-jobPayload double read (#615 review).
+		job, err := e.Store.GetJob(ctx, jobID)
+		if errors.Is(err, sql.ErrNoRows) {
 			continue
+		}
+		if err != nil {
+			return finalized, err
 		}
 		rec, exists, err := e.loadEscalation(ctx, jobID)
 		if err != nil {
@@ -5920,7 +5926,7 @@ func (e Engine) AutoFinalizeExpiredEscalations(ctx context.Context, ttl time.Dur
 		if now.Sub(pausedAt) < ttl {
 			continue
 		}
-		coordinatorJob, payload, err := e.jobPayload(ctx, jobID)
+		payload, err := unmarshalPayload(job.Payload)
 		if err != nil {
 			return finalized, err
 		}
@@ -5928,7 +5934,7 @@ func (e Engine) AutoFinalizeExpiredEscalations(ctx context.Context, ttl time.Dur
 			continue
 		}
 		reason := fmt.Sprintf("escalation TTL of %s elapsed with no human response", ttl)
-		if err := e.enqueueFinalizeContinuation(ctx, coordinatorJob, payload, reason); err != nil {
+		if err := e.enqueueFinalizeContinuation(ctx, job, payload, reason); err != nil {
 			return finalized, err
 		}
 		if err := e.setTaskState(ctx, taskRefFromPayload(payload), TaskPlanned); err != nil {

@@ -2755,28 +2755,72 @@ var errRuntimeSessionBusy = errors.New("runtime session is busy")
 // first busy since it last acquired its runtime lock, or since daemon start — not
 // one per attempt. Before #598 a permanently-contended job wrote a runtime_lock_wait
 // row on EVERY dispatch pass (~76k rows / 56% of the whole job_events table), which
-// then bloated every per-job ListJobEvents scan the retry/recovery passes run. A
-// job id is present in the map while it has an open, already-emitted wait episode;
-// it is cleared when the job actually acquires its runtime lock so the next wait
-// re-emits. In-memory ⇒ resets on daemon start (matching the "since daemon start"
-// episode boundary), and bounded by the number of distinct waiting jobs. Mirrors
-// the preflightWarnByRepo/preflightWarnMu throttle style above.
-var (
-	runtimeLockWaitMu       sync.Mutex
-	runtimeLockWaitEpisodes = map[string]bool{}
+// then bloated every per-job ListJobEvents scan the retry/recovery passes run.
+//
+// The map records, per job id, WHEN that job's episode event was last EMITTED. An
+// episode is "open" (suppress further writes) while an entry exists AND is younger
+// than runtimeLockWaitEpisodeTTL; the id is cleared outright when the job acquires
+// its runtime lock, so the next wait re-emits immediately. For a job that stays
+// contended longer than the TTL the episode re-opens and re-emits at most one event
+// per TTL — a deliberate liveness signal that the wait is still ongoing, not a
+// per-pass flood. Entries also expire: a job that terminates WITHOUT ever acquiring
+// (so endRuntimeLockWaitEpisode never runs for it) leaves a stale entry that ages
+// past the "open" window and is pruned once the map grows beyond
+// runtimeLockWaitEpisodeMax, so terminal-without-acquire jobs can no longer grow the
+// map unboundedly. In-memory ⇒ resets on daemon start (matching the "since daemon
+// start" episode boundary). Mirrors the preflightWarnByRepo/preflightWarnMu throttle
+// style above.
+const (
+	// runtimeLockWaitEpisodeTTL re-opens a still-contended job's wait episode after
+	// this long, so a very long wait re-emits one liveness event per TTL rather than
+	// staying silent forever.
+	runtimeLockWaitEpisodeTTL = 15 * time.Minute
+	// runtimeLockWaitEpisodeMax bounds the episode map: once it exceeds this many
+	// entries, markRuntimeLockWaitEpisode prunes every entry older than the TTL
+	// (terminal-without-acquire leftovers that endRuntimeLockWaitEpisode will never
+	// clear).
+	runtimeLockWaitEpisodeMax = 512
 )
 
-// beginRuntimeLockWaitEpisode reports whether a runtime_lock_wait event should be
-// WRITTEN for jobID now — true exactly once per episode (the first busy bounce),
-// false for every subsequent bounce until endRuntimeLockWaitEpisode clears it.
-func beginRuntimeLockWaitEpisode(jobID string) bool {
+var (
+	runtimeLockWaitMu       sync.Mutex
+	runtimeLockWaitEpisodes = map[string]time.Time{}
+)
+
+// runtimeLockWaitEpisodeOpen reports whether jobID currently has an open, already-
+// emitted wait episode: an entry exists AND its event was emitted within the last
+// runtimeLockWaitEpisodeTTL. It is READ-ONLY — it never mutates the map — so a
+// failed event write (which skips markRuntimeLockWaitEpisode) leaves the episode
+// closed and the next bounce re-attempts the write. Call it BEFORE writing; write
+// the event iff it returns false.
+func runtimeLockWaitEpisodeOpen(jobID string) bool {
 	runtimeLockWaitMu.Lock()
 	defer runtimeLockWaitMu.Unlock()
-	if runtimeLockWaitEpisodes[jobID] {
+	emitted, ok := runtimeLockWaitEpisodes[jobID]
+	if !ok {
 		return false
 	}
-	runtimeLockWaitEpisodes[jobID] = true
-	return true
+	return time.Since(emitted) < runtimeLockWaitEpisodeTTL
+}
+
+// markRuntimeLockWaitEpisode records that a runtime_lock_wait event was just emitted
+// for jobID, opening (or refreshing) its wait episode. Call it ONLY AFTER AddJobEvent
+// succeeds, so a failed write is retried on the next bounce instead of being
+// suppressed. It also opportunistically bounds the map: once it exceeds
+// runtimeLockWaitEpisodeMax entries, every entry older than the TTL is dropped (these
+// are terminal-without-acquire leftovers past their liveness window — a live episode
+// is refreshed on each re-emit and so never ages out here).
+func markRuntimeLockWaitEpisode(jobID string) {
+	runtimeLockWaitMu.Lock()
+	defer runtimeLockWaitMu.Unlock()
+	runtimeLockWaitEpisodes[jobID] = time.Now()
+	if len(runtimeLockWaitEpisodes) > runtimeLockWaitEpisodeMax {
+		for id, emitted := range runtimeLockWaitEpisodes {
+			if time.Since(emitted) >= runtimeLockWaitEpisodeTTL {
+				delete(runtimeLockWaitEpisodes, id)
+			}
+		}
+	}
 }
 
 // endRuntimeLockWaitEpisode clears jobID's wait episode once it acquires its
@@ -2785,16 +2829,6 @@ func endRuntimeLockWaitEpisode(jobID string) {
 	runtimeLockWaitMu.Lock()
 	defer runtimeLockWaitMu.Unlock()
 	delete(runtimeLockWaitEpisodes, jobID)
-}
-
-// resetRuntimeLockWaitEpisodes clears the dedup state. Test-only: the package-global
-// map persists across tests in a package run, so tests that assert a
-// runtime_lock_wait row is written must reset it first (a neighboring test reusing
-// the same job id could otherwise leave an open episode that suppresses the write).
-func resetRuntimeLockWaitEpisodes() {
-	runtimeLockWaitMu.Lock()
-	defer runtimeLockWaitMu.Unlock()
-	runtimeLockWaitEpisodes = map[string]bool{}
 }
 
 type tempWorkerEligibility struct {
@@ -3029,14 +3063,6 @@ func runQueuedJobs(ctx context.Context, worker jobWorker, limit int) error {
 	return runQueuedJobsForRepo(ctx, worker, limit, "", "")
 }
 
-// retryPendingJobAdvancements re-runs the post-delivery workflow for terminal
-// jobs whose advancement previously failed. checkoutHeld (nil ⇒ no gate, the
-// legacy inline-tick behavior) reports whether an in-flight dispatched job
-// currently holds a checkout key: a candidate whose own checkout key is held is
-// skipped this tick (#562 review) — advancement mutates that checkout, and the
-// live path only ever runs it under the job's own key — and retried on a later
-// tick once the key frees, instead of gating ALL retries on whole-repo idleness
-// (which a steady backlog can prevent indefinitely, freezing merge retries).
 // retryPendingJobAdvancements re-fires the post-delivery advancement for any
 // terminal job whose latest advancement event is still an unreconciled attempt
 // marker (advance_started/advance_retry). It is BOUNDED, not a full-table scan
@@ -3047,6 +3073,14 @@ func runQueuedJobs(ctx context.Context, worker jobWorker, limit int) error {
 // marker, and GetJob's just those. Each candidate is then re-verified with the Go
 // predicate jobNeedsAdvanceRetry, so behavior is identical to the old per-job walk;
 // the state/repo/session filters and the checkoutHeld gate are preserved verbatim.
+//
+// checkoutHeld (nil ⇒ no gate, the legacy inline-tick behavior) reports whether an
+// in-flight dispatched job currently holds a checkout key: a candidate whose own
+// checkout key is held is skipped this tick (#562 review) — advancement mutates that
+// checkout, and the live path only ever runs it under the job's own key — and
+// retried on a later tick once the key frees, instead of gating ALL retries on
+// whole-repo idleness (which a steady backlog can prevent indefinitely, freezing
+// merge retries).
 func retryPendingJobAdvancements(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string, checkoutHeld func(string) bool) error {
 	jobIDs, err := worker.Store.JobIDsWithPendingAdvanceRetry(ctx)
 	if err != nil {
@@ -3680,6 +3714,14 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 	// is retried on a later worker tick.
 	bouncedBusy := map[string]bool{}
 	bouncedBusyRuntimes := map[string]bool{}
+	// runtimeKeyMemo caches queuedJobRuntimeResourceKey per job id for the lifetime of
+	// this dispatcher invocation (#615 review). excludeBouncedBusy re-derives the key
+	// for every still-pending job on every dispatch pass, and each miss is a GetAgent
+	// read, so a job that stays pending across N passes otherwise costs N GetAgent
+	// reads. The key is stable while a job sits queued (it depends only on the job's
+	// agent + payload runtime override), so caching it bounds the cost at one read per
+	// job per invocation. Dispatcher-goroutine-owned like the sets above.
+	runtimeKeyMemo := map[string]string{}
 	done := make(chan finished, limit)
 	var firstErr error
 
@@ -3769,7 +3811,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 				// re-incremented for it: once every remaining pending job is
 				// busy-excluded the loop reaches dispatched==0 && running==0 and
 				// returns, so "busy must not count as progress" holds structurally.
-				pending = excludeBouncedBusy(ctx, worker, pending, bouncedBusy, bouncedBusyRuntimes)
+				pending = excludeBouncedBusy(ctx, worker, pending, bouncedBusy, bouncedBusyRuntimes, runtimeKeyMemo)
 				// Union in the supervisor tracker's in-flight keys (#562): a tracked
 				// non-pool job (e.g. dispatched before a warm scheduler flip) must
 				// block same-key pool dispatch exactly like a pool-local one. Jobs
@@ -4050,7 +4092,11 @@ func copyStringSet(src map[string]bool) map[string]bool {
 // and are retried on a later worker tick (a fresh invocation, fresh sets), instead
 // of being re-selected every pass in a tight, event-table-poisoning spin. Empty
 // sets ⇒ pending is returned unchanged, so the no-busy common case pays nothing.
-func excludeBouncedBusy(ctx context.Context, worker jobWorker, pending []db.Job, bouncedIDs, bouncedRuntimes map[string]bool) []db.Job {
+//
+// runtimeKeyMemo caches queuedJobRuntimeResourceKey across the invocation's dispatch
+// passes so each still-pending job costs at most one GetAgent read per invocation
+// (#615 review) rather than one per pass; a nil memo disables caching.
+func excludeBouncedBusy(ctx context.Context, worker jobWorker, pending []db.Job, bouncedIDs, bouncedRuntimes map[string]bool, runtimeKeyMemo map[string]string) []db.Job {
 	if len(bouncedIDs) == 0 && len(bouncedRuntimes) == 0 {
 		return pending
 	}
@@ -4060,13 +4106,29 @@ func excludeBouncedBusy(ctx context.Context, worker jobWorker, pending []db.Job,
 			continue
 		}
 		if len(bouncedRuntimes) > 0 {
-			if rk := queuedJobRuntimeResourceKey(ctx, worker.Store, job); rk != "" && bouncedRuntimes[rk] {
+			if rk := memoizedRuntimeResourceKey(ctx, worker.Store, job, runtimeKeyMemo); rk != "" && bouncedRuntimes[rk] {
 				continue
 			}
 		}
 		kept = append(kept, job)
 	}
 	return kept
+}
+
+// memoizedRuntimeResourceKey returns queuedJobRuntimeResourceKey for job, caching the
+// result in memo keyed by job id so repeated lookups for the same job across a
+// dispatcher invocation's passes reuse the single GetAgent read. A nil memo bypasses
+// the cache and calls through directly.
+func memoizedRuntimeResourceKey(ctx context.Context, store *db.Store, job db.Job, memo map[string]string) string {
+	if memo == nil {
+		return queuedJobRuntimeResourceKey(ctx, store, job)
+	}
+	if key, ok := memo[job.ID]; ok {
+		return key
+	}
+	key := queuedJobRuntimeResourceKey(ctx, store, job)
+	memo[job.ID] = key
+	return key
 }
 
 func (s queuedJobResourceSelector) selects(ctx context.Context, store *db.Store, job db.Job, selected int) bool {
@@ -4410,10 +4472,11 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		// (#598): a permanently-contended job otherwise wrote one row per dispatch
 		// pass. The busy error is returned UNCONDITIONALLY (outside the episode
 		// gate) so the pool dispatcher still sees the bounce and holds the job back.
-		if beginRuntimeLockWaitEpisode(job.ID) {
+		if !runtimeLockWaitEpisodeOpen(job.ID) {
 			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_lock_wait", Message: message}); eventErr != nil {
 				return eventErr
 			}
+			markRuntimeLockWaitEpisode(job.ID)
 			writeLine(w.Stdout, "job %s waiting: %s", job.ID, message)
 		}
 		return fmt.Errorf("%w: %s", errRuntimeSessionBusy, message)
@@ -5110,10 +5173,11 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		waitMessage := fmt.Sprintf("%s; temp worker start failed: %v", reason, err)
 		// Once per wait episode (#598); busy error returned unconditionally so the
 		// pool dispatcher observes the bounce.
-		if beginRuntimeLockWaitEpisode(job.ID) {
+		if !runtimeLockWaitEpisodeOpen(job.ID) {
 			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_lock_wait", Message: waitMessage}); eventErr != nil {
 				return eventErr
 			}
+			markRuntimeLockWaitEpisode(job.ID)
 			writeLine(w.Stdout, "job %s waiting: %s", job.ID, waitMessage)
 		}
 		return fmt.Errorf("%w: %s", errRuntimeSessionBusy, waitMessage)
@@ -5175,10 +5239,11 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		message := fmt.Sprintf("runtime session %s is busy", lockKey)
 		// Once per wait episode (#598); busy error returned unconditionally so the
 		// pool dispatcher observes the bounce.
-		if beginRuntimeLockWaitEpisode(delegatedJob.ID) {
+		if !runtimeLockWaitEpisodeOpen(delegatedJob.ID) {
 			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: delegatedJob.ID, Kind: "runtime_lock_wait", Message: message}); eventErr != nil {
 				return eventErr
 			}
+			markRuntimeLockWaitEpisode(delegatedJob.ID)
 			writeLine(w.Stdout, "job %s waiting: %s", delegatedJob.ID, message)
 		}
 		return fmt.Errorf("%w: %s", errRuntimeSessionBusy, message)

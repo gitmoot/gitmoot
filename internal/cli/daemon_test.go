@@ -7024,19 +7024,15 @@ func queuePolicyBusyRuntimeStore(t *testing.T) (*db.Store, jobWorker, *int64) {
 	return store, worker, &attempts
 }
 
-func countDaemonWorkerEvents(t *testing.T, store *db.Store, jobID, kind string) int {
-	t.Helper()
-	events, err := store.ListJobEvents(context.Background(), jobID)
-	if err != nil {
-		t.Fatalf("ListJobEvents(%s) returned error: %v", jobID, err)
-	}
-	n := 0
-	for _, e := range events {
-		if e.Kind == kind {
-			n++
-		}
-	}
-	return n
+// resetRuntimeLockWaitEpisodes clears the #598 runtime_lock_wait dedup state. Test-
+// only (it mutates the package-global map), which is why it lives here rather than in
+// daemon.go: the map persists across tests in a package run, so a test that asserts a
+// runtime_lock_wait row is written must reset it first (a neighboring test reusing the
+// same job id could otherwise leave an open episode that suppresses the write).
+func resetRuntimeLockWaitEpisodes() {
+	runtimeLockWaitMu.Lock()
+	defer runtimeLockWaitMu.Unlock()
+	runtimeLockWaitEpisodes = map[string]time.Time{}
 }
 
 // TestRuntimeLockWaitEventDedupedPerEpisode proves the #598 dedup: repeated busy
@@ -7055,7 +7051,7 @@ func TestRuntimeLockWaitEventDedupedPerEpisode(t *testing.T) {
 			t.Fatalf("runQueuedJobs attempt %d returned error: %v", i, err)
 		}
 	}
-	if n := countDaemonWorkerEvents(t, store, "job-a", "runtime_lock_wait"); n != 1 {
+	if n := countWorkerJobEvents(t, store, "job-a", "runtime_lock_wait"); n != 1 {
 		t.Fatalf("runtime_lock_wait rows after 5 busy attempts = %d, want 1 (deduped per episode)", n)
 	}
 
@@ -7064,8 +7060,75 @@ func TestRuntimeLockWaitEventDedupedPerEpisode(t *testing.T) {
 	if err := runQueuedJobs(ctx, worker, 1); err != nil {
 		t.Fatalf("runQueuedJobs after episode end returned error: %v", err)
 	}
-	if n := countDaemonWorkerEvents(t, store, "job-a", "runtime_lock_wait"); n != 2 {
+	if n := countWorkerJobEvents(t, store, "job-a", "runtime_lock_wait"); n != 2 {
 		t.Fatalf("runtime_lock_wait rows after new episode = %d, want 2", n)
+	}
+}
+
+// TestRuntimeLockWaitEpisodeMarkAfterWrite pins the #615-review helper contract
+// directly (no store mocking): the episode is opened only by an explicit mark (which
+// the call sites run ONLY after AddJobEvent succeeds), so a failed write — modeled by
+// simply not calling mark — leaves the episode closed and the next bounce re-attempts
+// the write. Once marked the episode dedups further bounces until its recorded emit
+// ages past the TTL, at which point it re-opens as a liveness re-emit.
+func TestRuntimeLockWaitEpisodeMarkAfterWrite(t *testing.T) {
+	resetRuntimeLockWaitEpisodes()
+	defer resetRuntimeLockWaitEpisodes()
+
+	const jobID = "job-mark-after-write"
+	if runtimeLockWaitEpisodeOpen(jobID) {
+		t.Fatal("episode should be closed before any event is emitted")
+	}
+	// Simulate a FAILED AddJobEvent: the call site would return without marking.
+	// The episode must stay closed so the next bounce retries the write.
+	if runtimeLockWaitEpisodeOpen(jobID) {
+		t.Fatal("episode must stay closed when the event write failed (mark not called)")
+	}
+	// Successful write → mark. Now the episode is open and dedups further bounces.
+	markRuntimeLockWaitEpisode(jobID)
+	if !runtimeLockWaitEpisodeOpen(jobID) {
+		t.Fatal("episode should be open after a successful write is marked")
+	}
+	// Age the recorded emit past the TTL: the episode re-opens (liveness re-emit).
+	runtimeLockWaitMu.Lock()
+	runtimeLockWaitEpisodes[jobID] = time.Now().Add(-2 * runtimeLockWaitEpisodeTTL)
+	runtimeLockWaitMu.Unlock()
+	if runtimeLockWaitEpisodeOpen(jobID) {
+		t.Fatal("episode should re-open once the recorded emit is older than the TTL")
+	}
+}
+
+// TestRuntimeLockWaitEpisodePrunesExpired proves the #615-review map bound: a job that
+// hits contention and then terminates WITHOUT ever acquiring (so
+// endRuntimeLockWaitEpisode never clears its entry) leaves a stale timestamp behind,
+// and mark's over-cap sweep drops it once it is older than the TTL — so such jobs can
+// no longer grow the episode map unboundedly.
+func TestRuntimeLockWaitEpisodePrunesExpired(t *testing.T) {
+	resetRuntimeLockWaitEpisodes()
+	defer resetRuntimeLockWaitEpisodes()
+
+	runtimeLockWaitMu.Lock()
+	// The terminal-without-acquire leftover, emitted long ago.
+	runtimeLockWaitEpisodes["terminal-no-acquire"] = time.Now().Add(-2 * runtimeLockWaitEpisodeTTL)
+	// Fill up to the cap with fresh entries so the next mark pushes len over the
+	// threshold and triggers the expiry sweep.
+	for i := 0; i < runtimeLockWaitEpisodeMax; i++ {
+		runtimeLockWaitEpisodes[fmt.Sprintf("fresh-%d", i)] = time.Now()
+	}
+	runtimeLockWaitMu.Unlock()
+
+	// This mark takes len past runtimeLockWaitEpisodeMax, triggering the sweep.
+	markRuntimeLockWaitEpisode("trigger")
+
+	runtimeLockWaitMu.Lock()
+	_, stale := runtimeLockWaitEpisodes["terminal-no-acquire"]
+	_, fresh := runtimeLockWaitEpisodes["fresh-0"]
+	runtimeLockWaitMu.Unlock()
+	if stale {
+		t.Fatal("expected the expired terminal-without-acquire entry to be pruned")
+	}
+	if !fresh {
+		t.Fatal("a still-fresh entry must NOT be pruned (only entries older than the TTL)")
 	}
 }
 
@@ -7096,7 +7159,7 @@ func TestPoolDoesNotRespinRuntimeBusyJob(t *testing.T) {
 	if got := atomic.LoadInt64(attempts); got != 1 {
 		t.Fatalf("dispatch attempts = %d, want exactly 1 (busy job re-selected)", got)
 	}
-	if n := countDaemonWorkerEvents(t, store, "job-a", "runtime_lock_wait"); n != 1 {
+	if n := countWorkerJobEvents(t, store, "job-a", "runtime_lock_wait"); n != 1 {
 		t.Fatalf("runtime_lock_wait rows = %d, want 1", n)
 	}
 	job, err := store.GetJob(ctx, "job-a")
