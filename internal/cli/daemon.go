@@ -2687,6 +2687,16 @@ type jobWorker struct {
 	// a config file / webhook. When nil (production), eventSink() resolves the
 	// shared process-global webhook sink from [events] config instead.
 	EventSinkOverride events.Sink
+	// AuthProbe is the injected doctor-style live credential probe (#532 slice B).
+	// It gates re-dispatch of a runtime_auth deferral: once the coarse hold elapses
+	// the scheduler only releases the job when the probe reports the credential is
+	// VALID again (an Invalid verdict extends the hold WITHOUT burning a retry
+	// attempt; an Unknown/transient verdict falls back to the coarse cadence). When
+	// nil (foreground CLI, and every construction that does not opt in) the gate is
+	// byte-identical to slice A: the coarse cadence alone governs re-dispatch. Tests
+	// inject a fake verdict; the daemon wires defaultAuthProbe (a bounded
+	// runtime.ClaudeLiveCheck for claude agents, Unknown for other runtimes).
+	AuthProbe func(context.Context, db.Job, workflow.JobPayload) authProbeVerdict
 }
 
 // eventSink resolves the best-effort outbound event Sink (#446) for the
@@ -2852,6 +2862,7 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 	worker.StartAdapterFactory = worker.defaultStartAdapter
 	worker.CheckoutValidator = worker.defaultCheckout
 	worker.WorkflowFactory = worker.defaultWorkflow
+	worker.AuthProbe = worker.defaultAuthProbe
 	return worker
 }
 
@@ -3544,7 +3555,7 @@ func runQueuedJobsForRepo(ctx context.Context, worker jobWorker, limit int, repo
 	if worker.UsePool {
 		return runQueuedJobsForRepoPool(ctx, worker, limit, repoFilter, rootFilter)
 	}
-	pending, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter)
+	pending, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter, true)
 	if err != nil {
 		return err
 	}
@@ -3617,7 +3628,11 @@ func serializingConfig(usePool bool, limit int) bool {
 // returned signature uniquely identifies the parallelizable session set so the
 // preflight can de-duplicate an unchanged backlog across ticks.
 func parallelizableSerialJobs(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string) (int, string) {
-	pending, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter)
+	// forDispatch=false: this is a preflight COUNT for the serialization warning, not
+	// a dispatch. It must stay a pure read — no live auth probe (`claude -p`
+	// subprocess) and no payload mutation — so the warning path keeps its documented
+	// off-hot-path contract (#532).
+	pending, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter, false)
 	if err != nil {
 		return 0, ""
 	}
@@ -3732,10 +3747,22 @@ const daemonRestartEnvCaveat = "note: a restart RE-INHERITS the launching shell'
 // engine can route through the graceful finalize path; in-flight children finish
 // normally. Only children (payload.RootJobID points at another root) are skipped
 // here — the root job itself is never skipped.
-func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string) ([]db.Job, error) {
+//
+// forDispatch (#532 slice B) gates the LIVE runtime_auth credential probe: only a
+// caller that is actually about to dispatch jobs runs it. The preflight
+// serialization-warning path (parallelizableSerialJobs) passes false so counting
+// queued jobs stays a pure read — no `claude -p` subprocess, no job-payload
+// mutation — keeping that path off the DB/subprocess hot path as its contract
+// promises. A within-pass cache dedupes the probe across auth-held jobs of the same
+// runtime so one outage costs at most one live probe per pass.
+func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string, forDispatch bool) ([]db.Job, error) {
 	jobs, err := worker.Store.ListQueuedJobs(ctx)
 	if err != nil {
 		return nil, err
+	}
+	var probeCache authProbeCache
+	if forDispatch {
+		probeCache = authProbeCache{}
 	}
 	pending := make([]db.Job, 0, len(jobs))
 	for _, job := range jobs {
@@ -3750,6 +3777,16 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 		// schedulers (barrier and pool) funnel through this listing, so the hold
 		// is honored everywhere; jobs without the payload field are unaffected.
 		if queuedJobBlockerHeld(job, time.Now().UTC()) {
+			continue
+		}
+		// Auth-probe gate (#532 slice B): once a runtime_auth deferral's coarse hold
+		// elapses, only re-dispatch when a live doctor-style probe says the credential
+		// is VALID again — an Invalid verdict extends the hold (re-probe next cadence,
+		// no attempt burned). Non-auth deferrals and jobs with no probe wired pass
+		// straight through (coarse cadence only, byte-identical to slice A). The live
+		// probe runs ONLY for a dispatching caller (forDispatch); the warning-count
+		// path skips it so it never spawns a subprocess or mutates the payload.
+		if forDispatch && !authProbeAllowsRedispatch(ctx, worker, job, time.Now().UTC(), probeCache) {
 			continue
 		}
 		pending = append(pending, job)
@@ -3918,7 +3955,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 
 		dispatched := 0
 		if firstErr == nil {
-			pending, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter)
+			pending, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter, true)
 			if err != nil {
 				firstErr = err
 			} else if slots := poolDispatchSlots(limit, running, hostCap, tracker); slots > 0 {
@@ -4522,6 +4559,19 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	checkout, err := w.CheckoutValidator(ctx, job, payload, agent)
 	if err != nil {
+		// Checkout-contention deferral (#532 slice C): a NON-delegation job whose
+		// daemon pre-flight checkout failed on a classified contention string (a
+		// branch-lock conflict that self-heals, or a dirty/wrong-head checkout that
+		// needs a human) is HELD with a backoff instead of terminally failing —
+		// pre-terminal, so no job.failed precedes the additive job.deferred. Every
+		// other checkout error (and every delegation child) falls through to the
+		// existing terminal path byte-identically.
+		if deferred, deferErr := w.deferCheckoutContention(ctx, job, payload, err); deferErr != nil {
+			writeLine(w.Stdout, "job %s checkout-contention deferral failed: %v", job.ID, deferErr)
+		} else if deferred {
+			writeLine(w.Stdout, "job %s deferred on checkout contention: %v", job.ID, err)
+			return nil
+		}
 		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
@@ -4707,6 +4757,12 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	writeLine(w.Stdout, "running job %s for %s in %s", job.ID, agent.Name, payload.Repo)
 	engine := w.WorkflowFactory(checkout)
+	// Wire the PRE-TERMINAL operational-blocker deferrer (#532 slice E) on the LIVE
+	// worker (not the WorkflowFactory-captured copy) so it observes this worker's
+	// EventSink for the first-class job.deferred emit. When a delivery-seam failure
+	// classifies as a retryable operational blocker the mailbox re-queues the job
+	// BEFORE the terminal transition, so no job.failed reaches the [events] sink.
+	engine.BlockerDeferrer = w.deferOperationalBlockerPreTerminal
 	runCtx, stopRun := w.runningJobContext(ctx, job.ID)
 	defer stopRun()
 	if jobTimeout > 0 {
@@ -4716,25 +4772,20 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	_, err = engine.RunJob(runCtx, job.ID, agent, adapter)
 	if err != nil {
+		// Operational-blocker deferral (#532 slice E): a run whose delivery failed on
+		// a classified OPERATIONAL blocker (runtime auth rejected, rate limit/quota,
+		// network/GitHub outage) is re-queued PRE-terminally by the mailbox's injected
+		// BlockerDeferrer — running→queued with a hold + a first-class job.deferred,
+		// and NO job.failed. RunJob reports ErrJobDeferred; short-circuit the entire
+		// terminal path (no handleRunJobError, no failure comment) since the run
+		// already resolved to a deferral. Every other failure takes the path below
+		// byte-identically.
+		if errors.Is(err, workflow.ErrJobDeferred) {
+			writeLine(w.Stdout, "job %s deferred on operational blocker (pre-terminal): %v", job.ID, err)
+			return nil
+		}
 		if markErr := w.handleRunJobError(ctx, job.ID, err); markErr != nil {
 			return markErr
-		}
-		// Operational-blocker deferral (#532): a run that terminally failed on a
-		// classified OPERATIONAL blocker (runtime auth rejected, rate limit/quota)
-		// is re-queued with an earliest-retry-at hold instead of staying failed
-		// indistinguishably from a product failure. Strictly additive and off the
-		// hot path: deferOperationalBlocker only diverts when the error is a typed
-		// delivery-seam failure matching a classified blocker AND the job failed
-		// without a stored result AND no delivery ever completed (no persisted raw
-		// outputs — the duplicate-side-effect gate) AND it is not a delegation
-		// child; every other failure takes the path below byte-identically. A
-		// deferral error is logged and falls through so the job is never left in
-		// limbo.
-		if deferred, deferErr := w.deferOperationalBlocker(ctx, job.ID, err); deferErr != nil {
-			writeLine(w.Stdout, "job %s blocker deferral failed: %v", job.ID, deferErr)
-		} else if deferred {
-			writeLine(w.Stdout, "job %s deferred on operational blocker: %v", job.ID, err)
-			return nil
 		}
 		commentErr := err
 		if job.Type == "implement" && runtimePermissionFailure(err) {

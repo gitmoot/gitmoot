@@ -43,6 +43,21 @@ func (r *recordingSink) count() int {
 	return len(r.events)
 }
 
+// orderedForJob returns, in emission order, the event types recorded for a given
+// job id — used to assert that a deferral never emits job.failed before
+// job.deferred (#532 slice E's pre-terminal property).
+func (r *recordingSink) orderedForJob(jobID string) []events.EventType {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []events.EventType
+	for _, e := range r.events {
+		if e.JobID == jobID {
+			out = append(out, e.Type)
+		}
+	}
+	return out
+}
+
 // TestFinishQueuedJobEmitsJobFailed proves the DAEMON-owned pre-flight terminal
 // path (a queued->failed transition that never reaches the engine's Mailbox
 // chokepoint) fans a job.failed out through the sink, carrying repo/root_id from

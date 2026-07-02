@@ -579,7 +579,7 @@ func dispatchQueuedJobsTracked(ctx context.Context, worker jobWorker, limit int,
 		return tracker.takeErr(repoFilter)
 	}
 
-	pending, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter)
+	pending, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter, true)
 	if err != nil {
 		return err
 	}

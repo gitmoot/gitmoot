@@ -47,6 +47,16 @@ type Mailbox struct {
 	// exists for the resolved template, so when the feature is off the rng is never
 	// drawn and resolution is byte-identical.
 	CanaryRand func() float64
+	// deferBlocker, when set, is the injected PRE-TERMINAL operational-blocker
+	// deferrer (#532 slice E). On a DELIVERY-seam failure (adapter.Deliver errored)
+	// Run consults it BEFORE m.fail: if it re-queues the job (running->queued +
+	// job.deferred), Run returns an ErrJobDeferred error and NEVER calls m.fail, so
+	// a deferred job never emits job.failed to the [events] sink first (slice A
+	// deferred AFTER the terminal transition, producing a failed→deferred flap). It
+	// is nil-safe: when unset (the default, foreground/ask paths) Run is
+	// byte-identical. The cause it receives is always a DeliveryError so the
+	// classifier's #602 contract gate still refuses agent-authored text.
+	deferBlocker func(ctx context.Context, jobID string, cause error) (bool, error)
 	// CanaryEnabled gates the #484 canary ROUTING seam on the SAME policy the
 	// daemon's regression comparator uses (config.SkillOptPolicy.CanaryEnabled()),
 	// so the two seams turn on and off together. When false (the default, every
@@ -186,6 +196,22 @@ type JobPayload struct {
 	BlockerClass    string `json:"blocker_class,omitempty"`
 	BlockerAttempts int    `json:"blocker_attempts,omitempty"`
 	BlockerRetryAt  string `json:"blocker_retry_at,omitempty"`
+	// BlockerSuggestedAction is a concrete human-facing remedy for a deferral that
+	// usually needs manual intervention (a dirty/wrong-head checkout, #532 slice C).
+	// It is surfaced through the #552 stuck surface (job list/show) so an operator
+	// sees what condition must change; auth/quota/network deferrals leave it empty
+	// because they clear on their own. Additive/omitempty (byte-identical when unset).
+	BlockerSuggestedAction string `json:"blocker_suggested_action,omitempty"`
+	// BlockerPreDelivery marks a deferral that happened BEFORE the agent was ever
+	// delivered a prompt — currently only the daemon pre-flight checkout_contention
+	// hold (#532 slice C), which trips at checkout validation before Mailbox.Run
+	// claims the job and delivers. A pre-delivery deferral means the agent never
+	// executed, so a re-dispatch is a FIRST run with NO prior side effects to
+	// reconcile: the slice-F reconciliation notice must be suppressed for it. The
+	// mid-delivery seam (deferOperationalBlockerPreTerminal) clears this flag so a
+	// later runtime_auth/quota/network deferral still carries the at-least-once
+	// side-effect warning. Additive/omitempty (byte-identical when unset).
+	BlockerPreDelivery bool `json:"blocker_pre_delivery,omitempty"`
 }
 
 type DeliveryAdapter interface {
@@ -382,16 +408,59 @@ type DeliveryError struct{ Err error }
 func (e DeliveryError) Error() string { return e.Err.Error() }
 func (e DeliveryError) Unwrap() error { return e.Err }
 
+// ErrJobDeferred is reported by Mailbox.Run (and Engine.RunJob) when a
+// delivery-seam failure was classified as an operational blocker and the injected
+// deferBlocker re-queued the job PRE-terminally (#532 slice E): the job is now
+// JobQueued with a hold and a job.deferred event/emit, and NO job.failed was
+// emitted. The daemon recognizes it via errors.Is to short-circuit the terminal
+// failure path (no handleRunJobError, no failure comment) — the run already
+// resolved to a first-class deferral. The wrapped cause stays inspectable
+// (errors.As DeliveryError) for logging.
+var ErrJobDeferred = errors.New("operational blocker: job deferred pre-terminally")
+
+type deferredError struct{ cause error }
+
+func (e deferredError) Error() string { return e.cause.Error() }
+
+func (e deferredError) Unwrap() []error { return []error{e.cause, ErrJobDeferred} }
+
+// tryDeferBlocker consults the injected pre-terminal deferrer, if any, for a
+// delivery-seam failure. It returns (true, nil) exactly when the job was
+// re-queued behind an operational blocker (so Run must skip m.fail); every other
+// case — no deferrer wired, not classifiable, ineligible, budget spent, or a
+// deferral error — returns false so Run takes its existing terminal path.
+func (m Mailbox) tryDeferBlocker(ctx context.Context, jobID string, cause error) bool {
+	if m.deferBlocker == nil {
+		return false
+	}
+	deferred, err := m.deferBlocker(ctx, jobID, cause)
+	return err == nil && deferred
+}
+
 // blockerRetryReconciliationNotice is prepended to the prompt of a job the
-// daemon re-dispatches after an operational-blocker deferral (#532). The
-// auto-retry is AT-LEAST-ONCE for side effects: a blocker that hit mid-turn may
-// have interrupted an attempt that already pushed branches, opened PRs, or
-// posted comments, and (for ephemeral/fresh-session workers) the retried run
-// has no memory of it — so tell the agent to reconcile instead of duplicating.
-func blockerRetryReconciliationNotice(class string) string {
-	return fmt.Sprintf("IMPORTANT: a previous attempt of this exact job was interrupted by an operational blocker (%s) "+
-		"and may have already performed side effects — pushed branches, opened pull requests, posted comments, or made commits. "+
-		"Before doing any work, check for artifacts from that interrupted attempt and reuse/reconcile them instead of redoing or duplicating the work.", class)
+// daemon re-dispatches after an operational-blocker deferral (#532). It composes
+// two concerns onto the retry prompt (the InjectUpstreamDepContext prompt-prefix
+// pattern):
+//
+//   - WARN level (#532 slice F): tell the agent the previous attempt died
+//     OPERATIONALLY — a runtime auth/quota/network/checkout condition in the
+//     environment — and NOT on the merits of its own output, so it does not
+//     second-guess an approach that was actually sound and get pulled off course.
+//   - AT-LEAST-ONCE side effects (#602's side-effect gate): a blocker that hit
+//     mid-turn may have interrupted an attempt that already pushed branches,
+//     opened PRs, or posted comments, and (for ephemeral/fresh-session workers)
+//     the retried run has no memory of it — so tell the agent to reconcile
+//     instead of duplicating.
+//
+// attempt is the deferral count (payload.BlockerAttempts) so the agent sees this
+// is a bounded operational retry, not an open-ended loop.
+func blockerRetryReconciliationNotice(class string, attempt int) string {
+	return fmt.Sprintf("NOTE (operational retry, attempt %d): the PREVIOUS attempt of this exact job did NOT fail on the merits of your work — "+
+		"it was interrupted by an operational blocker (%s) in the environment (a runtime auth/quota/network/checkout condition), "+
+		"not by anything wrong in your own output. The daemon automatically re-dispatched it now that the condition cleared, so treat "+
+		"your prior approach as still valid rather than a product failure. That interrupted attempt may already have performed side "+
+		"effects — pushed branches, opened pull requests, posted comments, or made commits — so before doing any work, check for those "+
+		"artifacts and reuse/reconcile them instead of redoing or duplicating the work.", attempt, class)
 }
 
 func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, adapter DeliveryAdapter) (AgentResult, error) {
@@ -422,18 +491,33 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	}
 
 	prompt := prompts.RenderJob(payload.prompt(job.Type))
-	if payload.BlockerAttempts > 0 && strings.TrimSpace(payload.BlockerClass) != "" {
+	if payload.BlockerAttempts > 0 && strings.TrimSpace(payload.BlockerClass) != "" && !payload.BlockerPreDelivery {
 		// This run is an automatic operational-blocker retry (#532): the previous
-		// attempt may have executed side effects before the blocker hit, so ask the
-		// agent to reconcile prior artifacts rather than duplicate them.
-		prompt = blockerRetryReconciliationNotice(payload.BlockerClass) + "\n\n" + prompt
+		// attempt died on an environment condition, not on its own output, and may
+		// have executed side effects before the blocker hit — so warn the agent its
+		// prior approach was sound and ask it to reconcile prior artifacts rather than
+		// duplicate them (slice F). Suppressed for a PRE-DELIVERY deferral
+		// (BlockerPreDelivery, e.g. a checkout_contention hold): that deferral tripped
+		// at the daemon pre-flight before any delivery, so the agent never executed and
+		// there are zero prior artifacts to reconcile — this is its first real run.
+		prompt = blockerRetryReconciliationNotice(payload.BlockerClass, payload.BlockerAttempts) + "\n\n" + prompt
 	}
 	firstRaw, firstRefreshedRef, firstErr := m.deliver(ctx, adapter, agent, job, payload, prompt)
 	if firstErr != nil {
+		deliveryErr := DeliveryError{Err: firstErr}
+		// PRE-TERMINAL operational-blocker classification (#532 slice E): consult the
+		// injected deferrer BEFORE failing. If it re-queues the job (running->queued +
+		// job.deferred), do NOT call m.fail — no job.failed reaches the [events] sink
+		// first. At the FIRST delivery no RawOutputs are persisted yet, so an eligible
+		// job (no result, not a child, budget left) defers here; the deferrer's own
+		// guards refuse everything else and this falls through to the terminal path.
+		if m.tryDeferBlocker(ctx, job.ID, deliveryErr) {
+			return AgentResult{}, deferredError{cause: deliveryErr}
+		}
 		_ = m.fail(ctx, job.ID, fmt.Sprintf("delivery failed: %v", firstErr))
 		// Typed DeliveryError: this error is FROM the delivery seam (not about the
 		// agent's output), the precondition for #532 operational classification.
-		return AgentResult{}, DeliveryError{Err: firstErr}
+		return AgentResult{}, deliveryErr
 	}
 	// SESSION SAFETY (#531): a job running under a per-job runtime override must
 	// never write back to the agent's stored resume state — the stored ref
@@ -482,11 +566,17 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			repairPrompt := prompts.RenderRepairPrompt(lastRaw, parseErr)
 			repairRaw, repairRefreshedRef, repairErr := m.deliver(ctx, adapter, agent, job, payload, repairPrompt)
 			if repairErr != nil {
+				deliveryErr := DeliveryError{Err: repairErr}
+				// Same pre-terminal seam as the first delivery, but the deferrer's
+				// duplicate-side-effect guard REFUSES this job: the persisted RawOutputs
+				// from the completed first delivery prove side-effectful execution, so it
+				// returns false and this takes the terminal path (no flap to avoid — the
+				// job genuinely fails). Consulting it here keeps a single seam.
+				if m.tryDeferBlocker(ctx, job.ID, deliveryErr) {
+					return AgentResult{}, deferredError{cause: deliveryErr}
+				}
 				_ = m.fail(ctx, job.ID, fmt.Sprintf("repair delivery failed: %v", repairErr))
-				// Typed like the first-delivery failure. Note the #532 deferral still
-				// refuses this job: the persisted RawOutputs from the completed first
-				// delivery prove side-effectful execution (see deferOperationalBlocker).
-				return AgentResult{}, DeliveryError{Err: repairErr}
+				return AgentResult{}, deliveryErr
 			}
 			// Same #531 override guard as the first delivery: never persist an
 			// override-runtime ref onto the agent's default-runtime resume state.

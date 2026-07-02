@@ -261,14 +261,20 @@ gitmoot lock list --repo owner/repo
 `gitmoot job list` appends a `WHY:` column and `gitmoot job show` prints a
 `why_stuck:` line for queued/blocked jobs (#552) — e.g. a runtime-session lock
 wait (naming the holder), `blocked: awaiting human`, `auth failing: …`,
-`throttled: …`, or `retrying: …` with the attempt schedule.
+`throttled: …`, `retrying: …`, or a `blocked-operational: <class>` deferral with
+the attempt schedule. A deferral that needs a human (dirty/wrong-head checkout)
+also prints a `suggested_action` naming the fix.
 
 Deferred jobs recover on their own (#532): a delivery failure classified as a
-retryable operational blocker (runtime auth, provider rate limit/quota) is
-re-queued with a bounded retry budget instead of failing terminally — `job show
---json` carries the `blocker_class` and attempt count. A job that "failed then
-reappeared as queued" is the deferral working; only act when the retry budget
-is spent and the job stays failed.
+retryable operational blocker — `runtime_auth`, `runtime_quota`,
+`network_outage`, or `checkout_contention` — is re-queued with a bounded retry
+budget instead of failing terminally. `job show --json` carries the
+`blocker_class`, attempt count, and `suggested_action`. A `runtime_auth` deferral
+only re-dispatches once a live doctor-style credential probe passes (a failing
+probe extends the hold without spending a retry), and over `[events]` the
+deferral is a first-class `job.deferred` emitted instead of `job.failed`. A job
+that "failed then reappeared as queued" is the deferral working; only act when
+the retry budget is spent and the job stays failed.
 
 A job stuck in `running` is recovered automatically once it shows no lease
 progress past the staleness window (default 30m; tune with the

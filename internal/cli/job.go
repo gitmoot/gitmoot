@@ -118,6 +118,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 				PreflightFailed: strings.TrimSpace(preflightFailed[job.ID]),
 				WhyStuck:        reason.Reason,
 				NextRetryAt:     reason.NextRetryAt,
+				SuggestedAction: reason.SuggestedAction,
 			})
 		}
 		if err := writeJSON(stdout, entries); err != nil {
@@ -138,6 +139,9 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 			if reason.NextRetryAt != "" {
 				fmt.Fprintf(stdout, " (next retry %s)", reason.NextRetryAt)
 			}
+			if reason.SuggestedAction != "" {
+				fmt.Fprintf(stdout, " [action: %s]", reason.SuggestedAction)
+			}
 		}
 		fmt.Fprintln(stdout)
 	}
@@ -157,6 +161,7 @@ type jobListEntry struct {
 	PreflightFailed string `json:"preflight_failed,omitempty"`
 	WhyStuck        string `json:"why_stuck,omitempty"`
 	NextRetryAt     string `json:"next_retry_at,omitempty"`
+	SuggestedAction string `json:"suggested_action,omitempty"`
 }
 
 func runJobShow(args []string, stdout, stderr io.Writer) int {
@@ -191,7 +196,7 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if *jsonOutput {
-		out := jobShowOutput{Job: job, Payload: payload, WhyStuck: reason.Reason, NextRetryAt: reason.NextRetryAt}
+		out := jobShowOutput{Job: job, Payload: payload, WhyStuck: reason.Reason, NextRetryAt: reason.NextRetryAt, SuggestedAction: reason.SuggestedAction}
 		if err := writeJSON(stdout, out); err != nil {
 			fmt.Fprintf(stderr, "job show: %v\n", err)
 			return 1
@@ -206,10 +211,11 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 // payload, and the additive why-stuck detail (#552). The stuck fields are omitted
 // when empty so a healthy job's JSON is unchanged in spirit.
 type jobShowOutput struct {
-	Job         db.Job              `json:"job"`
-	Payload     workflow.JobPayload `json:"payload"`
-	WhyStuck    string              `json:"why_stuck,omitempty"`
-	NextRetryAt string              `json:"next_retry_at,omitempty"`
+	Job             db.Job              `json:"job"`
+	Payload         workflow.JobPayload `json:"payload"`
+	WhyStuck        string              `json:"why_stuck,omitempty"`
+	NextRetryAt     string              `json:"next_retry_at,omitempty"`
+	SuggestedAction string              `json:"suggested_action,omitempty"`
 }
 
 // loadStuckReason derives a queued/blocked job's why-stuck reason from its full
@@ -498,6 +504,9 @@ func printJob(stdout io.Writer, job db.Job, payload workflow.JobPayload, reason 
 		fmt.Fprintf(stdout, "why_stuck: %s\n", reason.Reason)
 		if reason.NextRetryAt != "" {
 			fmt.Fprintf(stdout, "next_retry_at: %s\n", reason.NextRetryAt)
+		}
+		if reason.SuggestedAction != "" {
+			fmt.Fprintf(stdout, "suggested_action: %s\n", reason.SuggestedAction)
 		}
 	}
 	fmt.Fprintf(stdout, "type: %s\n", job.Type)

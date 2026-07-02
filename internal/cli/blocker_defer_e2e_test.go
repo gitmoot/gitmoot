@@ -23,7 +23,7 @@ import (
 // script fails the FIRST delivery with a fabricated 429-with-reset and succeeds
 // on the second, driven through the REAL daemon dispatch entry
 // (runQueuedJobsForRepo → listPendingQueuedJobs → jobWorker.run → engine.RunJob
-// → ShellAdapter → real subprocess → Mailbox.fail → deferOperationalBlocker).
+// → ShellAdapter → real subprocess → Mailbox.Run's pre-terminal BlockerDeferrer).
 //
 // MUTATION PROOF: disable the classification match (make
 // classifyOperationalBlocker return false, or drop the "throttled" case) and
@@ -189,7 +189,7 @@ printf '%%s' '%s'`, countFile, marker, marker, promptFile, blockerE2EApprovedRes
 	// While inside the hold window, the queue gate must keep the job out of the
 	// pending listing and re-dispatch attempts must not deliver.
 	if time.Now().UTC().Before(retryAt) {
-		pending, err := listPendingQueuedJobs(ctx, worker, "", "")
+		pending, err := listPendingQueuedJobs(ctx, worker, "", "", true)
 		if err != nil {
 			t.Fatalf("listPendingQueuedJobs returned error: %v", err)
 		}

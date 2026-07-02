@@ -47,6 +47,19 @@ type Engine struct {
 	// terminal cases it owns through the SAME sink so the whole terminal set is
 	// covered. #445 (the ask-gate) rides this seam to emit its job.needs_attention.
 	EventSink events.Sink
+	// BlockerDeferrer is the injected, best-effort, nil-by-default PRE-TERMINAL
+	// operational-blocker deferrer (#532 slice E). When set, the engine's Mailbox
+	// consults it on a delivery-seam failure BEFORE the terminal transition: if it
+	// re-queues the job behind a classified operational blocker (runtime auth/quota/
+	// network), Run reports ErrJobDeferred and never emits job.failed, so the
+	// [events] stream sees the deferral as a first-class transition instead of a
+	// failed→deferred flap. It mirrors EventSink: optional and nil-safe (when nil —
+	// foreground/ask paths and every non-daemon construction — Run is byte-identical),
+	// and best-effort (a deferrer error is treated as "not deferred" so the job takes
+	// its normal terminal path). The concrete impl lives in cli (it classifies with
+	// the #602 matcher and writes the payload hold fields), keeping the engine free of
+	// the classification coupling; it is wired only on the daemon run path.
+	BlockerDeferrer func(ctx context.Context, jobID string, cause error) (bool, error)
 	// OutcomeHarvester is the injected, best-effort, nil-by-default seam (#465,
 	// Mode A) the engine calls after a verifiable implement-job outcome transition
 	// (merge merged/blocked, review changes_requested, revert) to harvest a
@@ -360,7 +373,7 @@ func (e Engine) now() time.Time {
 // path is byte-identical. The hook maps the terminal JobState to the event_type,
 // resolves root_id from the payload, and ships a redacted event fire-and-forget.
 func (e Engine) mailbox() Mailbox {
-	mb := Mailbox{Store: e.Store, CanaryEnabled: e.CanaryEnabled}
+	mb := Mailbox{Store: e.Store, CanaryEnabled: e.CanaryEnabled, deferBlocker: e.BlockerDeferrer}
 	if e.EventSink == nil {
 		return mb
 	}

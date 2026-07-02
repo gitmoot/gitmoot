@@ -279,11 +279,12 @@ redacted JSON event to that endpoint for: `job.finished`, `job.failed`,
 (`candidate.awaiting_promotion`, `candidate.auto_promoted`,
 `candidate.canary_started`, `candidate.rolled_back`). Delivery is best-effort
 (bounded buffer + timeout; drops are recorded as a local `event_sink_drop` job
-event, never blocking the job). Consumer rule: **`job.failed` followed by
-`job.deferred` for the same job id is NOT terminal** — the daemon classified the
-failure as a retryable operational blocker and will re-dispatch it; treat only
-a `job.failed` with no subsequent `job.deferred` as final. See `docs/events.md`
-for the full contract.
+event, never blocking the job). Consumer rule: **treat a `job.failed` as final
+only when it is NOT immediately followed by a `job.deferred` for the same job
+id.** Since #532 slice E a deferred run emits `job.deferred` as a first-class
+transition **instead of** `job.failed` (no preceding `job.failed`); the rule
+still holds and is forward-compatible with the older `job.failed`→`job.deferred`
+flap. See `docs/events.md` for the full contract.
 
 ## Bug Reports
 
@@ -768,20 +769,30 @@ For a `queued` or `blocked` job, `gitmoot job list` appends a `WHY:` column and
 `gitmoot job show` prints a `why_stuck:` (and, when a lease applies, a
 `next_retry_at:`) line explaining what the job is waiting on — e.g. `waiting on
 runtime session lock runtime:codex:<ref> (held by job <id>)`, `blocked: awaiting
-human`, `auth failing: …`, `throttled: …`, or `retrying: …`. The reason is
-derived from the most authoritative existing signal (the latest reason-bearing
-`job events` entry plus the owning resource lock's lease); a healthy job's output
-is unchanged. `gitmoot doctor` proactively validates `gh auth` (with an
-actionable remediation hint) and the Claude runtime token so a bad credential is
-caught before a job stalls on it.
+human`, `auth failing: …`, `throttled: …`, `retrying: …`, or a
+`blocked-operational: <class>` deferral. The reason is derived from the most
+authoritative existing signal (the latest reason-bearing `job events` entry plus
+the owning resource lock's lease); a healthy job's output is unchanged. When a
+deferral usually needs a human (a dirty or wrong-head checkout), the row/`job
+show` also carries a `suggested_action` naming the concrete fix. `gitmoot doctor`
+proactively validates `gh auth` (with an actionable remediation hint) and the
+Claude runtime token so a bad credential is caught before a job stalls on it.
 
-Operational blockers auto-retry (#532): a delivery failure classified as
-`runtime_auth` or `runtime_quota` does **not** fail the job terminally — the
-daemon re-queues it as **deferred** with a bounded retry budget and a hold
-until the earliest retry time. `gitmoot job show --json` carries the
-`blocker_class` and attempt count, and over the `[events]` stream a
-`job.deferred` follows the `job.failed` (making it non-terminal). So a job that
-"failed then reappeared as queued" is the deferral working, not a bug.
+Operational blockers auto-retry (#532): a delivery failure classified as an
+operational blocker — `runtime_auth`, `runtime_quota`, `network_outage`
+(transient network/GitHub outage), or `checkout_contention` (a self-healing
+branch-lock conflict, or a dirty/wrong-head checkout that carries a
+`suggested_action`) — does **not** fail the job terminally. The daemon re-queues
+it as **deferred** with a bounded retry budget and a hold until the earliest
+retry time, shown as `blocked-operational: <class>: attempt n/3`. `gitmoot job
+show --json` carries the `blocker_class`, attempt count, and `suggested_action`.
+Over the `[events]` stream the deferral is now a **first-class** `job.deferred`
+transition emitted **instead of** `job.failed` (no preceding `job.failed` for
+that run). A `runtime_auth` deferral only re-dispatches once a live doctor-style
+credential probe passes; the probe failing just extends the hold without spending
+a retry. So a job that "failed then reappeared as queued" is the deferral
+working, not a bug. Product failures (the agent answered with a `gitmoot_result`,
+including `decision=failed`) are never auto-retried.
 
 Jobs stuck in `running` are also backstopped: a running job with no lease
 progress past the staleness window (default 30m) is assumed orphaned by a dead

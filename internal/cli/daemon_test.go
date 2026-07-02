@@ -3754,7 +3754,10 @@ func TestRunQueuedJobsFailsReviewOnWrongCheckoutBranchBeforeDelivery(t *testing.
 	}
 }
 
-func TestRunQueuedJobsFailsReviewOnWrongCheckoutHeadBeforeDelivery(t *testing.T) {
+// A wrong-checkout-HEAD review pre-flight is a checkout_contention (#532 slice C):
+// it DEFERS (queued with a suggested_action) instead of failing terminally, since
+// the checkout may just be mid-sync — pre-flight still stops delivery.
+func TestRunQueuedJobsDefersReviewOnWrongCheckoutHeadBeforeDelivery(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	checkout := t.TempDir()
@@ -3790,12 +3793,21 @@ func TestRunQueuedJobsFailsReviewOnWrongCheckoutHeadBeforeDelivery(t *testing.T)
 	if err != nil {
 		t.Fatalf("GetJob returned error: %v", err)
 	}
-	if job.State != string(workflow.JobFailed) {
-		t.Fatalf("job state = %q, want failed", job.State)
+	if job.State != string(workflow.JobQueued) {
+		t.Fatalf("job state = %q, want queued (checkout_contention deferral)", job.State)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	if payload.BlockerClass != string(blockerClassCheckoutContention) || strings.TrimSpace(payload.BlockerSuggestedAction) == "" {
+		t.Fatalf("wrong-head review did not defer as checkout_contention with an action: %+v", payload)
 	}
 }
 
-func TestRunQueuedJobsFailsPRScopedAskOnWrongCheckoutHeadBeforeDelivery(t *testing.T) {
+// A wrong-checkout-HEAD PR-scoped ask pre-flight also DEFERS as
+// checkout_contention (#532 slice C) rather than failing terminally.
+func TestRunQueuedJobsDefersPRScopedAskOnWrongCheckoutHeadBeforeDelivery(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	checkout := t.TempDir()
@@ -3831,8 +3843,15 @@ func TestRunQueuedJobsFailsPRScopedAskOnWrongCheckoutHeadBeforeDelivery(t *testi
 	if err != nil {
 		t.Fatalf("GetJob returned error: %v", err)
 	}
-	if job.State != string(workflow.JobFailed) {
-		t.Fatalf("job state = %q, want failed", job.State)
+	if job.State != string(workflow.JobQueued) {
+		t.Fatalf("job state = %q, want queued (checkout_contention deferral)", job.State)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	if payload.BlockerClass != string(blockerClassCheckoutContention) {
+		t.Fatalf("wrong-head ask did not defer as checkout_contention: %+v", payload)
 	}
 }
 

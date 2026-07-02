@@ -1202,7 +1202,12 @@ func (c *GhClient) run(ctx context.Context, mutate bool, args ...string) (subpro
 		}
 	}
 	if err != nil {
-		return result, commandError(result, err)
+		// Tag a network/GitHub-outage failure with the transparent TransientError
+		// marker (#532 slice D) so a caller that propagates it to a TERMINAL job
+		// failure can be classified as network_outage and short-backoff deferred.
+		// Non-outage failures (and every failure's exact text) are untouched, and
+		// best-effort callers that swallow the error are byte-identical.
+		return result, classifyTransientError(result, commandError(result, err))
 	}
 	return result, nil
 }

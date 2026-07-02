@@ -49,6 +49,10 @@ var stuckReasonEventKinds = []string{
 type stuckReason struct {
 	Reason      string // e.g. "waiting on runtime session lock ...", "blocked: awaiting human", "auth failing: ..."
 	NextRetryAt string // an RFC3339 lease expiry when one applies (a runtime-session lock), else ""
+	// SuggestedAction is a concrete human-facing remedy for a deferral that usually
+	// needs manual intervention (a dirty/wrong-head checkout, #532 slice C). Empty
+	// for self-healing holds; callers render it only when non-empty.
+	SuggestedAction string
 }
 
 func (r stuckReason) empty() bool { return strings.TrimSpace(r.Reason) == "" }
@@ -82,10 +86,12 @@ func deriveStuckReason(job db.Job, reasonEvent db.JobEvent, hasReasonEvent bool,
 		// The event message already names the class + attempt budget; the payload
 		// carries the authoritative earliest-retry-at the queue gate honors.
 		next := ""
+		action := ""
 		if payload, err := daemonJobPayload(job); err == nil {
 			next = strings.TrimSpace(payload.BlockerRetryAt)
+			action = strings.TrimSpace(payload.BlockerSuggestedAction)
 		}
-		return stuckReason{Reason: withDetail("blocked-operational", msg), NextRetryAt: next}
+		return stuckReason{Reason: withDetail("blocked-operational", msg), NextRetryAt: next, SuggestedAction: action}
 	case "runtime_lock_wait":
 		reason := "waiting on runtime session lock"
 		next := ""
