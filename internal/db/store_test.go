@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math/rand"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -4688,5 +4689,73 @@ func TestJobEventsKindJobIDCoveringIndexPlan(t *testing.T) {
 				t.Fatalf("plan still row-fetches via the non-covering idx_job_events_kind:\n%s", plan)
 			}
 		})
+	}
+}
+
+// TestListJobsByType pins the #619 poll-path projection: ListJobsByType returns
+// exactly the rows of the requested type — with the full ListJobs projection
+// (payload included) — in id order, and nil for a type with no rows.
+func TestListJobsByType(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	seed := []Job{
+		{ID: "job-a-review", Agent: "reviewer", Type: "review", State: "queued", Payload: `{"repo":"owner/repo","kind":"review-a"}`},
+		{ID: "job-b-implement", Agent: "coder", Type: "implement", State: "running", Payload: `{"repo":"owner/repo","kind":"implement-b"}`},
+		{ID: "job-c-review", Agent: "reviewer", Type: "review", State: "succeeded", Payload: `{"repo":"owner/repo","kind":"review-c"}`},
+		{ID: "job-d-ask", Agent: "asker", Type: "ask", State: "queued", Payload: `{"repo":"owner/repo","kind":"ask-d"}`},
+	}
+	for _, job := range seed {
+		if err := store.CreateJob(ctx, job); err != nil {
+			t.Fatalf("CreateJob(%s) returned error: %v", job.ID, err)
+		}
+	}
+
+	got, err := store.ListJobsByType(ctx, "review")
+	if err != nil {
+		t.Fatalf("ListJobsByType returned error: %v", err)
+	}
+	wantIDs := []string{"job-a-review", "job-c-review"}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("ListJobsByType(review) returned %d jobs, want %d: %+v", len(got), len(wantIDs), got)
+	}
+	for i, job := range got {
+		if job.ID != wantIDs[i] {
+			t.Fatalf("job[%d].ID = %q, want %q (order must be by id)", i, job.ID, wantIDs[i])
+		}
+		if job.Type != "review" {
+			t.Fatalf("job[%d].Type = %q, want review", i, job.Type)
+		}
+		if job.Payload == "" {
+			t.Fatalf("job[%d].Payload is empty; the projection must materialize payload", i)
+		}
+		if job.State == "" || job.Agent == "" {
+			t.Fatalf("job[%d] missing fields: %+v", i, job)
+		}
+	}
+
+	// ListJobsByType must equal ListJobs filtered by type in Go (byte-identical rows).
+	all, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	var wantReview []Job
+	for _, job := range all {
+		if job.Type == "review" {
+			wantReview = append(wantReview, job)
+		}
+	}
+	if !reflect.DeepEqual(got, wantReview) {
+		t.Fatalf("ListJobsByType(review) = %+v, want ListJobs-filtered %+v", got, wantReview)
+	}
+
+	if unknown, err := store.ListJobsByType(ctx, "nonexistent"); err != nil {
+		t.Fatalf("ListJobsByType(nonexistent) returned error: %v", err)
+	} else if unknown != nil {
+		t.Fatalf("ListJobsByType(nonexistent) = %+v, want nil", unknown)
 	}
 }

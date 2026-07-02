@@ -2460,6 +2460,36 @@ func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
 	return jobs, rows.Err()
 }
 
+// ListJobsByType returns every job of the given type, with the SAME 14-column
+// projection and ORDER BY id as ListJobs, filtered in SQL by `type = ?`. The PR
+// poll path (#619) only ever needs review jobs, but was calling ListJobs and
+// discarding non-review rows in Go — materializing the whole 37.8MB payload column
+// (including one 11MB implement payload) on every open PR every sweep. Because the
+// `type` column precedes `payload` in the row record, SQLite's `type = ?` filter
+// decides to keep a row before it ever touches the payload's overflow pages, so
+// this decodes payload only for matching rows (~237KB of review payloads vs 37.8MB
+// total on the affected DB). Behavior is byte-identical to ListJobs + a Go type
+// filter; only the avoided payload reads differ. EQP: `SCAN jobs USING INDEX
+// sqlite_autoindex_jobs_1` over the same rows — a dedicated jobs(type) index was
+// not worth its per-insert write cost and is deferred.
+func (s *Store) ListJobsByType(ctx context.Context, jobType string) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, updated_at, created_at FROM jobs WHERE type = ? ORDER BY id`, jobType)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []Job
+	for rows.Next() {
+		var job Job
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
 // ListJobsByParent returns the direct children of parentJobID (delegation
 // children and the coordinator continuation job), ordered by delegation_id then
 // id for a stable tree. It selects updated_at like ListJobs so callers can show

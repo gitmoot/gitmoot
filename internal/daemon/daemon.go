@@ -340,7 +340,9 @@ type pullRequestRouting struct {
 }
 
 func (d Daemon) pullRequestWorkflowRouting(ctx context.Context, pull github.PullRequest) (pullRequestRouting, error) {
-	jobs, err := d.Store.ListJobs(ctx)
+	// Only review jobs are inspected below; ListJobsByType filters in SQL so this
+	// poll path stops materializing every non-review job's payload (#619).
+	jobs, err := d.Store.ListJobsByType(ctx, "review")
 	if err != nil {
 		return pullRequestRouting{}, err
 	}
@@ -438,7 +440,9 @@ func (d Daemon) handlePullRequestWorkflow(ctx context.Context, pull github.PullR
 }
 
 func (d Daemon) supersedeStaleReviewJobs(ctx context.Context, pull github.PullRequest) error {
-	jobs, err := d.Store.ListJobs(ctx)
+	// Only review jobs can be superseded here; ListJobsByType filters in SQL so this
+	// poll path stops materializing every non-review job's payload (#619).
+	jobs, err := d.Store.ListJobsByType(ctx, "review")
 	if err != nil {
 		return err
 	}
@@ -539,7 +543,9 @@ func (d Daemon) reconcileReviewingPullRequest(ctx context.Context, pull github.P
 	if task.State != string(workflow.TaskReviewing) {
 		return nil
 	}
-	jobs, err := d.Store.ListJobs(ctx)
+	// Only review jobs advance the reviewing PR here; ListJobsByType filters in SQL
+	// so this poll path stops materializing every non-review job's payload (#619).
+	jobs, err := d.Store.ListJobsByType(ctx, "review")
 	if err != nil {
 		return err
 	}
