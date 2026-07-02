@@ -168,6 +168,15 @@ type JobPayload struct {
 	HumanAnswer            string         `json:"human_answer,omitempty"`
 	RawOutputs             []string       `json:"raw_outputs,omitempty"`
 	Result                 *AgentResult   `json:"result,omitempty"`
+	// Operational-blocker deferral context (#532, additive — all omitempty, so a
+	// job that never hit a classified blocker serializes byte-identically).
+	// BlockerClass is the last classified blocker (e.g. "runtime_auth",
+	// "runtime_quota"); BlockerAttempts counts classified deferrals over the
+	// job's lifetime (hard-bounded by the daemon); BlockerRetryAt is the
+	// RFC3339Nano earliest automatic re-dispatch time the queue gate honors.
+	BlockerClass    string `json:"blocker_class,omitempty"`
+	BlockerAttempts int    `json:"blocker_attempts,omitempty"`
+	BlockerRetryAt  string `json:"blocker_retry_at,omitempty"`
 }
 
 type DeliveryAdapter interface {

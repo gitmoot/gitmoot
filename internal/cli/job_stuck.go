@@ -21,6 +21,7 @@ var authWordRe = regexp.MustCompile(`\bauth\b`)
 // deliberately excluded so a healthy queued job stays silent and its `job list`
 // row keeps its existing shape.
 var stuckReasonEventKinds = []string{
+	blockerDeferredEventKind,
 	"runtime_lock_wait",
 	"advance_blocked",
 	"advance_awaiting_human",
@@ -75,6 +76,16 @@ func deriveStuckReason(job db.Job, reasonEvent db.JobEvent, hasReasonEvent bool,
 	}
 	msg := firstLineTrimmed(reasonEvent.Message)
 	switch reasonEvent.Kind {
+	case blockerDeferredEventKind:
+		// Operational-blocker deferral (#532): the job is held awaiting an
+		// external condition (auth fixed, quota reset), then auto re-dispatched.
+		// The event message already names the class + attempt budget; the payload
+		// carries the authoritative earliest-retry-at the queue gate honors.
+		next := ""
+		if payload, err := daemonJobPayload(job); err == nil {
+			next = strings.TrimSpace(payload.BlockerRetryAt)
+		}
+		return stuckReason{Reason: withDetail("blocked-operational", msg), NextRetryAt: next}
 	case "runtime_lock_wait":
 		reason := "waiting on runtime session lock"
 		next := ""

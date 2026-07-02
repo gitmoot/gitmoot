@@ -3509,6 +3509,13 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 		if queuedChildOfKilledRoot(ctx, worker.Store, job) {
 			continue
 		}
+		// Operational-blocker hold (#532): a job deferred behind a classified
+		// blocker is not eligible until its earliest-retry-at passes. Both
+		// schedulers (barrier and pool) funnel through this listing, so the hold
+		// is honored everywhere; jobs without the payload field are unaffected.
+		if queuedJobBlockerHeld(job, time.Now().UTC()) {
+			continue
+		}
 		pending = append(pending, job)
 	}
 	return pending, nil
@@ -4339,6 +4346,21 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if err != nil {
 		if markErr := w.handleRunJobError(ctx, job.ID, err); markErr != nil {
 			return markErr
+		}
+		// Operational-blocker deferral (#532): a run that terminally failed on a
+		// classified OPERATIONAL blocker (runtime auth rejected, rate limit/quota)
+		// is re-queued with an earliest-retry-at hold instead of staying failed
+		// indistinguishably from a product failure. Strictly additive and off the
+		// hot path: deferOperationalBlocker only diverts when the error matches a
+		// classified blocker AND the job failed without a stored result AND it is
+		// not a delegation child; every other failure takes the path below
+		// byte-identically. A deferral error is logged and falls through so the
+		// job is never left in limbo.
+		if deferred, deferErr := w.deferOperationalBlocker(ctx, job.ID, err); deferErr != nil {
+			writeLine(w.Stdout, "job %s blocker deferral failed: %v", job.ID, deferErr)
+		} else if deferred {
+			writeLine(w.Stdout, "job %s deferred on operational blocker: %v", job.ID, err)
+			return nil
 		}
 		commentErr := err
 		if job.Type == "implement" && runtimePermissionFailure(err) {
