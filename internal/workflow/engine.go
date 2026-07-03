@@ -1506,17 +1506,19 @@ func goalSynthesisClosing(goal string) string {
 // a tree with plenty of headroom prints no line (keeping the prompt clean). A
 // non-positive jobs (the count was unavailable) suppresses the job clause.
 func budgetPressureLine(depth, jobs int) string {
-	nearDepth := depth >= MaxDelegationDepth-budgetPressureSlack
-	nearJobs := jobs > 0 && jobs >= MaxDelegationTotalJobs-budgetPressureSlack
+	maxDepth := effectiveMaxDelegationDepth()
+	maxJobs := effectiveMaxDelegationTotalJobs()
+	nearDepth := depth >= maxDepth-budgetPressureSlack
+	nearJobs := jobs > 0 && jobs >= maxJobs-budgetPressureSlack
 	if !nearDepth && !nearJobs {
 		return ""
 	}
 	if jobs > 0 {
 		return fmt.Sprintf("You are at depth %d/%d and %d/%d jobs — prefer finishing (synthesize now) over re-delegating.\n\n",
-			depth, MaxDelegationDepth, jobs, MaxDelegationTotalJobs)
+			depth, maxDepth, jobs, maxJobs)
 	}
 	return fmt.Sprintf("You are at depth %d/%d — prefer finishing (synthesize now) over re-delegating.\n\n",
-		depth, MaxDelegationDepth)
+		depth, maxDepth)
 }
 
 // budgetPressureSlack is how close to a termination bound (depth or per-root job

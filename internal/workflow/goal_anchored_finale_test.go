@@ -143,6 +143,16 @@ func TestBudgetPressureLine(t *testing.T) {
 	if !strings.Contains(depthOnly, "depth") || strings.Contains(depthOnly, "jobs") {
 		t.Fatalf("expected depth-only nudge with unavailable job count, got %q", depthOnly)
 	}
+
+	t.Setenv("GITMOOT_MAX_DELEGATION_DEPTH", "32")
+	t.Setenv("GITMOOT_MAX_DELEGATION_TOTAL_JOBS", "128")
+	if got := budgetPressureLine(9, 22); got != "" {
+		t.Fatalf("expected no pressure with env-raised limits and headroom, got %q", got)
+	}
+	nearRaised := budgetPressureLine(30, 126)
+	if !strings.Contains(nearRaised, "depth 30/32") || !strings.Contains(nearRaised, "126/128 jobs") {
+		t.Fatalf("expected pressure line to use env-raised limits, got %q", nearRaised)
+	}
 }
 
 // TestNestedContinuationAnchorsGoalFromRoot is the load-bearing depth-stability
