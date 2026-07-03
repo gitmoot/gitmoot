@@ -501,6 +501,285 @@ func TestParseRunKindAgent(t *testing.T) {
 	}
 }
 
+// jobByID returns the first JobSummary with the given id.
+func jobSummaryByID(jobs []dashboard.JobSummary, id string) (dashboard.JobSummary, bool) {
+	for _, j := range jobs {
+		if j.ID == id {
+			return j, true
+		}
+	}
+	return dashboard.JobSummary{}, false
+}
+
+// agentByName returns the first AgentSummary with the given name.
+func agentSummaryByName(agents []dashboard.AgentSummary, name string) (dashboard.AgentSummary, bool) {
+	for _, a := range agents {
+		if a.Name == name {
+			return a, true
+		}
+	}
+	return dashboard.AgentSummary{}, false
+}
+
+// TestWebDataSourceJobs asserts Jobs() flattens every job (no cap), sorts newest
+// activity first with an id tie-break, and maps each field: title/repo/PR/kind/
+// depth/run/state/runtime and token usage.
+func TestWebDataSourceJobs(t *testing.T) {
+	home := dashboardTestHome(t)
+	seedWebDashboardTree(t, home)
+
+	// Give one job real token usage (CreateJob defaults tokens to 0).
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := store.UpdateJobUsage(context.Background(), "child-search", 2000, 500); err != nil {
+		t.Fatalf("UpdateJobUsage: %v", err)
+	}
+	store.Close()
+
+	// Deterministic times so the sort and duration are exact.
+	setJobTimes(t, home, "coord", "2026-05-23 10:00:00", "2026-05-23 10:00:00")
+	setJobTimes(t, home, "coord-cont", "2026-05-23 10:05:00", "2026-05-23 10:10:00")
+	setJobTimes(t, home, "child-export", "2026-05-23 10:05:00", "2026-05-23 10:20:00")
+	setJobTimes(t, home, "child-search", "2026-05-23 10:05:00", "2026-05-23 10:30:00")
+
+	ds := &webDataSource{home: home}
+	jobs, err := ds.Jobs(context.Background())
+	if err != nil {
+		t.Fatalf("Jobs: %v", err)
+	}
+	// All four seeded jobs, no cap.
+	if len(jobs) != 4 {
+		t.Fatalf("job count = %d, want 4: %+v", len(jobs), jobs)
+	}
+	// Newest activity first: child-search(10:30) > child-export(10:20) >
+	// coord-cont(10:10) > coord(10:00).
+	wantOrder := []string{"child-search", "child-export", "coord-cont", "coord"}
+	for i, id := range wantOrder {
+		if jobs[i].ID != id {
+			t.Fatalf("jobs[%d].ID = %q, want %q (order %v)", i, jobs[i].ID, id,
+				[]string{jobs[0].ID, jobs[1].ID, jobs[2].ID, jobs[3].ID})
+		}
+	}
+
+	search, _ := jobSummaryByID(jobs, "child-search")
+	if search.Agent != "builder" {
+		t.Errorf("child-search agent = %q, want builder", search.Agent)
+	}
+	if search.Runtime != "claude" {
+		t.Errorf("child-search runtime = %q, want claude (registered)", search.Runtime)
+	}
+	if search.Repo != "jerryfane/noted" {
+		t.Errorf("child-search repo = %q, want jerryfane/noted", search.Repo)
+	}
+	if search.Kind != "implement" {
+		t.Errorf("child-search kind = %q, want implement (Type fallback)", search.Kind)
+	}
+	if search.State != "succeeded" {
+		t.Errorf("child-search state = %q, want succeeded", search.State)
+	}
+	if search.Depth != 1 {
+		t.Errorf("child-search depth = %d, want 1", search.Depth)
+	}
+	if search.Run != "coord" {
+		t.Errorf("child-search run = %q, want coord", search.Run)
+	}
+	if search.PR != 12 {
+		t.Errorf("child-search pr = %d, want 12", search.PR)
+	}
+	if search.TokensIn != 2000 || search.TokensOut != 500 {
+		t.Errorf("child-search tokens = (%d,%d), want (2000,500)", search.TokensIn, search.TokensOut)
+	}
+	wantStart := parseJobTimeMillis("2026-05-23 10:05:00")
+	wantUpdated := parseJobTimeMillis("2026-05-23 10:30:00")
+	if search.Started != wantStart || search.Updated != wantUpdated {
+		t.Errorf("child-search times = (%d,%d), want (%d,%d)", search.Started, search.Updated, wantStart, wantUpdated)
+	}
+	if search.Duration != wantUpdated-wantStart {
+		t.Errorf("child-search duration = %d, want %d", search.Duration, wantUpdated-wantStart)
+	}
+
+	// The root coordinator: depth 0, kind from its Type column, self-rooted.
+	coord, _ := jobSummaryByID(jobs, "coord")
+	if coord.Depth != 0 {
+		t.Errorf("coord depth = %d, want 0", coord.Depth)
+	}
+	if coord.Kind != "orchestrate" {
+		t.Errorf("coord kind = %q, want orchestrate", coord.Kind)
+	}
+	if coord.Run != "coord" {
+		t.Errorf("coord run = %q, want coord (self-root)", coord.Run)
+	}
+}
+
+// TestWebDataSourceJobsEphemeralRuntime asserts a delegated ephemeral worker
+// (no registered agent row) resolves its runtime off the payload's ephemeral
+// spec rather than the registry.
+func TestWebDataSourceJobsEphemeralRuntime(t *testing.T) {
+	home := dashboardTestHome(t)
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ephPayload := workflow.JobPayload{
+		Repo:      "jerryfane/noted",
+		Ephemeral: &workflow.EphemeralSpec{Runtime: "kimi", Model: "k2"},
+	}
+	if err := store.CreateJob(context.Background(), db.Job{
+		ID: "eph-job", Agent: "task-9-ephemeral-abc123", Type: "implement",
+		State: "running", Payload: mustJSON(t, ephPayload),
+	}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	store.Close()
+
+	ds := &webDataSource{home: home}
+	jobs, err := ds.Jobs(context.Background())
+	if err != nil {
+		t.Fatalf("Jobs: %v", err)
+	}
+	eph, ok := jobSummaryByID(jobs, "eph-job")
+	if !ok {
+		t.Fatalf("eph-job missing")
+	}
+	if eph.Runtime != "kimi" {
+		t.Fatalf("ephemeral runtime = %q, want kimi (from payload spec)", eph.Runtime)
+	}
+}
+
+// TestJobTitle covers the JobSummary title rule: the first non-empty prompt line,
+// else the job id — and that (unlike nodeTitle) it does NOT use the task title.
+func TestJobTitle(t *testing.T) {
+	got := jobTitle(workflow.JobPayload{Instructions: "\n  Do the thing\nsecond line"}, db.Job{ID: "x"})
+	if got != "Do the thing" {
+		t.Errorf("title = %q, want %q", got, "Do the thing")
+	}
+	if got := jobTitle(workflow.JobPayload{TaskTitle: "Fancy Title"}, db.Job{ID: "job-1"}); got != "job-1" {
+		t.Errorf("title = %q, want job-1 (task title is not used; id fallback)", got)
+	}
+	if got := jobTitle(workflow.JobPayload{}, db.Job{ID: "job-2"}); got != "job-2" {
+		t.Errorf("title = %q, want job-2 (id fallback)", got)
+	}
+}
+
+// TestSplitRepoScope covers the comma-separated repo_scope -> []string split.
+func TestSplitRepoScope(t *testing.T) {
+	if got := splitRepoScope(""); got != nil {
+		t.Errorf("empty scope = %v, want nil", got)
+	}
+	if got := splitRepoScope("  , ,  "); got != nil {
+		t.Errorf("blank scope = %v, want nil", got)
+	}
+	got := splitRepoScope("jerryfane/noted , jerryfane/other")
+	if len(got) != 2 || got[0] != "jerryfane/noted" || got[1] != "jerryfane/other" {
+		t.Errorf("scope = %v, want [jerryfane/noted jerryfane/other]", got)
+	}
+}
+
+// TestWebDataSourceAgents asserts Agents() emits one row per registered agent
+// (with repo-scope split and per-agent job aggregation) plus one synthetic
+// ephemeral rollup last, and that registered rows sort most-recently-active
+// first (never-active last).
+func TestWebDataSourceAgents(t *testing.T) {
+	home := dashboardTestHome(t)
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ctx := context.Background()
+
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name: "builder", Role: "coder", Runtime: "claude",
+		RepoScope: "jerryfane/noted, jerryfane/other", Model: "sonnet",
+		Capabilities: []string{"implement", "review"}, AutonomyPolicy: "auto", HealthStatus: "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent builder: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{Name: "project-lead", Runtime: "codex"}); err != nil {
+		t.Fatalf("UpsertAgent project-lead: %v", err)
+	}
+	// A registered agent that never runs a job (LastActive stays 0 -> sorts last).
+	if err := store.UpsertAgent(ctx, db.Agent{Name: "idle-agent", Runtime: "codex"}); err != nil {
+		t.Fatalf("UpsertAgent idle-agent: %v", err)
+	}
+
+	mustCreateJob(t, store, db.Job{ID: "b1", Agent: "builder", Type: "implement", State: "succeeded", Payload: mustJSON(t, workflow.JobPayload{})}, "", "")
+	mustCreateJob(t, store, db.Job{ID: "b2", Agent: "builder", Type: "implement", State: "running", Payload: mustJSON(t, workflow.JobPayload{})}, "", "")
+	mustCreateJob(t, store, db.Job{ID: "p1", Agent: "project-lead", Type: "orchestrate", State: "succeeded", Payload: mustJSON(t, workflow.JobPayload{})}, "", "")
+	// Two ephemeral-worker jobs (names carry the "-ephemeral-" infix) fold into one rollup.
+	mustCreateJob(t, store, db.Job{ID: "e1", Agent: "task-1-ephemeral-aaa111", Type: "implement", State: "succeeded", Payload: mustJSON(t, workflow.JobPayload{})}, "", "")
+	mustCreateJob(t, store, db.Job{ID: "e2", Agent: "task-2-ephemeral-bbb222", Type: "review", State: "failed", Payload: mustJSON(t, workflow.JobPayload{})}, "", "")
+	store.Close()
+
+	// LastActive ordering: builder(10:30) > project-lead(10:20) > idle-agent(0).
+	// The ephemeral rollup has the newest activity (10:40) yet must still sort LAST.
+	setJobTimes(t, home, "b1", "2026-05-23 10:00:00", "2026-05-23 10:15:00")
+	setJobTimes(t, home, "b2", "2026-05-23 10:00:00", "2026-05-23 10:30:00")
+	setJobTimes(t, home, "p1", "2026-05-23 10:00:00", "2026-05-23 10:20:00")
+	setJobTimes(t, home, "e1", "2026-05-23 10:00:00", "2026-05-23 10:35:00")
+	setJobTimes(t, home, "e2", "2026-05-23 10:00:00", "2026-05-23 10:40:00")
+
+	ds := &webDataSource{home: home}
+	agents, err := ds.Agents(ctx)
+	if err != nil {
+		t.Fatalf("Agents: %v", err)
+	}
+	// 3 registered + 1 ephemeral rollup.
+	if len(agents) != 4 {
+		t.Fatalf("agent count = %d, want 4: %+v", len(agents), agents)
+	}
+	wantOrder := []string{"builder", "project-lead", "idle-agent", "ephemeral workers"}
+	for i, name := range wantOrder {
+		if agents[i].Name != name {
+			t.Fatalf("agents[%d].Name = %q, want %q (order %v)", i, agents[i].Name, name,
+				[]string{agents[0].Name, agents[1].Name, agents[2].Name, agents[3].Name})
+		}
+	}
+
+	builder, _ := agentSummaryByName(agents, "builder")
+	if builder.Runtime != "claude" || builder.Role != "coder" || builder.Model != "sonnet" {
+		t.Errorf("builder identity = %+v", builder)
+	}
+	if len(builder.RepoScope) != 2 || builder.RepoScope[0] != "jerryfane/noted" || builder.RepoScope[1] != "jerryfane/other" {
+		t.Errorf("builder repoScope = %v, want split [jerryfane/noted jerryfane/other]", builder.RepoScope)
+	}
+	if len(builder.Capabilities) != 2 {
+		t.Errorf("builder capabilities = %v, want 2", builder.Capabilities)
+	}
+	if builder.JobCount != 2 || builder.RunningCount != 1 || builder.SucceededCount != 1 || builder.FailedCount != 0 {
+		t.Errorf("builder counts = job%d run%d ok%d fail%d, want 2/1/1/0",
+			builder.JobCount, builder.RunningCount, builder.SucceededCount, builder.FailedCount)
+	}
+	if builder.LastActive != parseJobTimeMillis("2026-05-23 10:30:00") {
+		t.Errorf("builder lastActive = %d, want %d", builder.LastActive, parseJobTimeMillis("2026-05-23 10:30:00"))
+	}
+	if builder.Ephemeral {
+		t.Errorf("builder must not be flagged ephemeral")
+	}
+
+	idle, _ := agentSummaryByName(agents, "idle-agent")
+	if idle.JobCount != 0 || idle.LastActive != 0 {
+		t.Errorf("idle-agent = job%d lastActive%d, want 0/0", idle.JobCount, idle.LastActive)
+	}
+
+	// The synthetic ephemeral rollup: both ephemeral jobs, blank runtime, last row.
+	rollup := agents[len(agents)-1]
+	if !rollup.Ephemeral || rollup.Name != "ephemeral workers" {
+		t.Fatalf("last row = %+v, want ephemeral rollup", rollup)
+	}
+	if rollup.Runtime != "" {
+		t.Errorf("ephemeral rollup runtime = %q, want empty", rollup.Runtime)
+	}
+	if rollup.JobCount != 2 || rollup.SucceededCount != 1 || rollup.FailedCount != 1 || rollup.RunningCount != 0 {
+		t.Errorf("ephemeral counts = job%d run%d ok%d fail%d, want 2/0/1/1",
+			rollup.JobCount, rollup.RunningCount, rollup.SucceededCount, rollup.FailedCount)
+	}
+	if rollup.LastActive != parseJobTimeMillis("2026-05-23 10:40:00") {
+		t.Errorf("ephemeral lastActive = %d, want %d", rollup.LastActive, parseJobTimeMillis("2026-05-23 10:40:00"))
+	}
+}
+
 func TestSummarizeRunsEnriched(t *testing.T) {
 	root := "local-ask-project-lead-18bde5e13a42d5a7"
 	jobs := []db.Job{

@@ -197,6 +197,216 @@ func (d *webDataSource) Job(ctx context.Context, jobID string) (dashboard.Node, 
 	return node, err
 }
 
+// Jobs returns every job across every run, flattened into one JobSummary each,
+// sorted newest-activity first. It is a single read-only ListJobs pass: each
+// job's payload is parsed once for its title/repo/PR, its kind is derived the
+// same way summarizeRuns derives a run's kind (from the id shape, else the Type
+// column), its runtime is resolved through the agent registry with the ephemeral
+// worker fallback, and its Run is its delegation-tree root. No cap — the Jobs
+// page filters client-side.
+func (d *webDataSource) Jobs(ctx context.Context) ([]dashboard.JobSummary, error) {
+	out := []dashboard.JobSummary{}
+	err := withStore(d.home, func(store *db.Store) error {
+		jobs, err := store.ListJobs(ctx)
+		if err != nil {
+			return err
+		}
+		if len(jobs) == 0 {
+			return nil
+		}
+		jobByID := make(map[string]db.Job, len(jobs))
+		for _, j := range jobs {
+			jobByID[j.ID] = j
+		}
+		runtimeByAgent := agentRuntimeMap(ctx, store)
+
+		out = make([]dashboard.JobSummary, 0, len(jobs))
+		for _, j := range jobs {
+			payload, _ := workflow.ParseJobPayload(j.Payload)
+			// Kind mirrors summarizeRuns: parse the id's "<origin>-<kind>-<agent>-
+			// <hash>" shape (root jobs), else fall back to the lowercased Type column
+			// (delegation children, whose ids don't carry that shape).
+			kind, _ := parseRunKindAgent(j.ID, j)
+			started := parseJobTimeMillis(j.CreatedAt)
+			updated := parseJobTimeMillis(j.UpdatedAt)
+			var duration int64
+			if started > 0 && updated > started {
+				duration = updated - started
+			}
+			out = append(out, dashboard.JobSummary{
+				ID:        j.ID,
+				Title:     jobTitle(payload, j),
+				Agent:     strings.TrimSpace(j.Agent),
+				Runtime:   resolveJobRuntime(j, payload, runtimeByAgent),
+				Repo:      strings.TrimSpace(payload.Repo),
+				Kind:      kind,
+				State:     mapNodeState(j.State),
+				Depth:     j.DelegationDepth,
+				Run:       jobRootID(jobByID, j.ID),
+				PR:        payload.PullRequest,
+				Started:   started,
+				Updated:   updated,
+				Duration:  duration,
+				TokensIn:  j.InputTokens,
+				TokensOut: j.OutputTokens,
+			})
+		}
+		// Newest activity first, deterministic tie-break on id.
+		sort.SliceStable(out, func(i, j int) bool {
+			if out[i].Updated != out[j].Updated {
+				return out[i].Updated > out[j].Updated
+			}
+			return out[i].ID < out[j].ID
+		})
+		return nil
+	})
+	return out, err
+}
+
+// Agents lists the registered agents (one AgentSummary each) plus one synthetic
+// rollup row for the fleet of ephemeral workers. It is a single read-only pass:
+// ListAgents supplies the registered rows' identity/config, and the SAME
+// ListJobs scan aggregates each agent's job counts and last-active time. Every
+// job whose agent name carries the engine's "-ephemeral-" infix folds into the
+// one rollup row (Ephemeral == true, blank Runtime). Registered rows sort
+// most-recently-active first (never-active last, alphabetical); the ephemeral
+// rollup is always last.
+func (d *webDataSource) Agents(ctx context.Context) ([]dashboard.AgentSummary, error) {
+	out := []dashboard.AgentSummary{}
+	err := withStore(d.home, func(store *db.Store) error {
+		agents, err := store.ListAgents(ctx)
+		if err != nil {
+			return err
+		}
+		jobs, err := store.ListJobs(ctx)
+		if err != nil {
+			return err
+		}
+
+		// Aggregate per-agent job stats from the single ListJobs pass. Ephemeral
+		// workers (name carries the "-ephemeral-" infix) fold into one rollup.
+		byAgent := map[string]*agentJobStat{}
+		var ephemeral agentJobStat
+		hasEphemeral := false
+		for _, j := range jobs {
+			name := strings.TrimSpace(j.Agent)
+			var s *agentJobStat
+			if strings.Contains(name, "-ephemeral-") {
+				s = &ephemeral
+				hasEphemeral = true
+			} else {
+				s = byAgent[name]
+				if s == nil {
+					s = &agentJobStat{}
+					byAgent[name] = s
+				}
+			}
+			s.observe(j)
+		}
+
+		out = make([]dashboard.AgentSummary, 0, len(agents)+1)
+		for _, a := range agents {
+			summary := dashboard.AgentSummary{
+				Name:           a.Name,
+				Role:           strings.TrimSpace(a.Role),
+				Runtime:        strings.TrimSpace(a.Runtime),
+				RepoScope:      splitRepoScope(a.RepoScope),
+				Model:          strings.TrimSpace(a.Model),
+				Capabilities:   a.Capabilities,
+				AutonomyPolicy: strings.TrimSpace(a.AutonomyPolicy),
+				Health:         strings.TrimSpace(a.HealthStatus),
+			}
+			if s := byAgent[a.Name]; s != nil {
+				s.applyTo(&summary)
+			}
+			out = append(out, summary)
+		}
+		// Registered agents: most-recently-active first; never-active (LastActive
+		// == 0) fall to the end, alphabetical. The ephemeral rollup is appended
+		// after this sort so it is always last.
+		sort.SliceStable(out, func(i, j int) bool {
+			if out[i].LastActive != out[j].LastActive {
+				return out[i].LastActive > out[j].LastActive
+			}
+			return out[i].Name < out[j].Name
+		})
+		if hasEphemeral {
+			rollup := dashboard.AgentSummary{Name: "ephemeral workers", Ephemeral: true}
+			ephemeral.applyTo(&rollup)
+			out = append(out, rollup)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// agentJobStat accumulates one agent's job tallies across the ListJobs pass:
+// total jobs, live/terminal counts, and the most-recent update time (epoch ms).
+type agentJobStat struct {
+	jobCount, running, succeeded, failed int
+	lastActive                           int64
+}
+
+// observe folds one job's state and update time into the running tally.
+func (s *agentJobStat) observe(job db.Job) {
+	s.jobCount++
+	switch mapNodeState(job.State) {
+	case "running":
+		s.running++
+	case "succeeded":
+		s.succeeded++
+	case "failed":
+		s.failed++
+	}
+	if u := parseJobTimeMillis(job.UpdatedAt); u > s.lastActive {
+		s.lastActive = u
+	}
+}
+
+// applyTo copies the accumulated tallies onto an AgentSummary.
+func (s *agentJobStat) applyTo(summary *dashboard.AgentSummary) {
+	summary.JobCount = s.jobCount
+	summary.RunningCount = s.running
+	summary.SucceededCount = s.succeeded
+	summary.FailedCount = s.failed
+	summary.LastActive = s.lastActive
+}
+
+// splitRepoScope splits the store's comma-separated repo_scope string into a
+// trimmed, non-empty slice for the AgentSummary contract's []string RepoScope.
+// Returns nil (an omitted field) when the scope is empty.
+func splitRepoScope(scope string) []string {
+	var out []string
+	for _, part := range strings.Split(scope, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// jobTitle titles a JobSummary from its payload: the first non-empty line of the
+// job's prompt, falling back to the job id when there is none — the JobSummary
+// contract's "first line of prompt, fallback id".
+func jobTitle(payload workflow.JobPayload, job db.Job) string {
+	if t := firstInstructionLine(payload.Instructions); t != "" {
+		return t
+	}
+	return job.ID
+}
+
+// resolveJobRuntime resolves a job's runtime family (codex|claude|kimi|shell)
+// from the agent registry, falling back to the payload's ephemeral worker spec
+// for a delegated ephemeral worker that has no registered agent row. Returns ""
+// when neither source names a runtime.
+func resolveJobRuntime(job db.Job, payload workflow.JobPayload, runtimeByAgent map[string]string) string {
+	rt := strings.TrimSpace(runtimeByAgent[job.Agent])
+	if rt == "" && payload.Ephemeral != nil {
+		rt = strings.TrimSpace(payload.Ephemeral.Runtime)
+	}
+	return rt
+}
+
 // Graph returns the whole-history "galaxy" graph: a union of every job across
 // every run in the store, plus synthetic repo/agent hub nodes that cluster the
 // jobs. Links are delegation parentage, a per-parent-group sibling mesh (the
@@ -446,14 +656,11 @@ func buildDashboardNode(job db.Job, payload workflow.JobPayload, events []db.Job
 		Deps:     deps,
 		Title:    nodeTitle(payload, job, action),
 		Agent:    job.Agent,
-		Runtime:  runtimeByAgent[job.Agent],
+		Runtime:  resolveJobRuntime(job, payload, runtimeByAgent),
 		Model:    strings.TrimSpace(payload.Model),
 		State:    mapNodeState(job.State),
 		Depth:    job.DelegationDepth,
 		Events:   []dashboard.Event{},
-	}
-	if node.Runtime == "" && payload.Ephemeral != nil {
-		node.Runtime = strings.TrimSpace(payload.Ephemeral.Runtime)
 	}
 	if node.Model == "" && payload.Ephemeral != nil {
 		node.Model = strings.TrimSpace(payload.Ephemeral.Model)
