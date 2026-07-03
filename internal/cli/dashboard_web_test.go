@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"testing"
+	"time"
 
 	dashboard "github.com/jerryfane/gitmoot-dashboard"
 
@@ -811,5 +814,324 @@ func TestSummarizeRunsEnriched(t *testing.T) {
 	solo := summarizeRuns([]db.Job{{ID: "local-ask-x-abcabcabcabc", State: "succeeded"}})
 	if solo[0].Significance != "one-shot" || solo[0].NodeCount != 1 {
 		t.Errorf("solo run = %q/%d, want one-shot/1", solo[0].Significance, solo[0].NodeCount)
+	}
+}
+
+// TestBuildChartsBucketingAndZeroFill asserts jobs bucket by their CreatedAt UTC
+// day (respecting the midnight edge), that an activity gap is zero-filled, and
+// that totals/agents/repos aggregate over the (days==0) full-history window.
+func TestBuildChartsBucketingAndZeroFill(t *testing.T) {
+	noted := mustJSON(t, workflow.JobPayload{Repo: "jerryfane/noted"})
+	other := mustJSON(t, workflow.JobPayload{Repo: "jerryfane/other"})
+	jobs := []db.Job{
+		{ID: "j1", Agent: "builder", State: "succeeded", CreatedAt: "2026-05-23 08:00:00", Payload: noted, InputTokens: 100, OutputTokens: 20},
+		// 23:59:59 UTC still buckets to the 23rd, not the 24th.
+		{ID: "j2", Agent: "builder", State: "failed", CreatedAt: "2026-05-23 23:59:59", Payload: noted, InputTokens: 5, OutputTokens: 7},
+		// 00:00:00 UTC opens the 25th; the 24th has no jobs and must zero-fill.
+		{ID: "j3", Agent: "project-lead", State: "running", CreatedAt: "2026-05-25 00:00:00", Payload: other, InputTokens: 1, OutputTokens: 2},
+	}
+	runtimes := map[string]string{"builder": "claude", "project-lead": "codex"}
+
+	// days=0 spans earliest job day .. today (the right edge extends past the
+	// last job's day so the all-history view shares its edge with the windowed
+	// ones even on idle days). now is pinned two days after the last job to
+	// assert that extension deterministically.
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	charts := buildCharts(jobs, 0, now, runtimes)
+
+	if len(charts.Days) != 5 {
+		t.Fatalf("days = %d, want 5 (05-23..05-27 continuous, extended to today): %+v", len(charts.Days), charts.Days)
+	}
+	if charts.Days[0].Date != "2026-05-23" || charts.Days[1].Date != "2026-05-24" || charts.Days[2].Date != "2026-05-25" {
+		t.Fatalf("day dates = %q/%q/%q, want 05-23/05-24/05-25", charts.Days[0].Date, charts.Days[1].Date, charts.Days[2].Date)
+	}
+	if charts.Days[3] != (dashboard.ChartDay{Date: "2026-05-26"}) || charts.Days[4] != (dashboard.ChartDay{Date: "2026-05-27"}) {
+		t.Fatalf("trailing idle days = %+v/%+v, want zero-filled 05-26/05-27", charts.Days[3], charts.Days[4])
+	}
+	d0 := charts.Days[0]
+	if d0.Succeeded != 1 || d0.Failed != 1 || d0.TokensIn != 105 || d0.TokensOut != 27 {
+		t.Fatalf("05-23 bucket = %+v, want succeeded1 failed1 in105 out27", d0)
+	}
+	d1 := charts.Days[1]
+	if d1 != (dashboard.ChartDay{Date: "2026-05-24"}) {
+		t.Fatalf("05-24 bucket = %+v, want zero-filled", d1)
+	}
+	d2 := charts.Days[2]
+	if d2.Running != 1 || d2.TokensIn != 1 || d2.TokensOut != 2 {
+		t.Fatalf("05-25 bucket = %+v, want running1 in1 out2", d2)
+	}
+
+	tot := charts.Totals
+	if tot.Jobs != 3 || tot.Succeeded != 1 || tot.Failed != 1 || tot.TokensIn != 106 || tot.TokensOut != 29 || tot.ActiveAgents != 2 {
+		t.Fatalf("totals = %+v, want jobs3 ok1 fail1 in106 out29 active2", tot)
+	}
+
+	if len(charts.Agents) != 2 || charts.Agents[0].Name != "builder" {
+		t.Fatalf("agents = %+v, want builder leading (2 jobs)", charts.Agents)
+	}
+	if charts.Agents[0].Runtime != "claude" || charts.Agents[0].Jobs != 2 || charts.Agents[0].TokensOut != 27 {
+		t.Fatalf("builder agent = %+v, want claude jobs2 out27", charts.Agents[0])
+	}
+	if len(charts.Repos) != 2 || charts.Repos[0].Repo != "jerryfane/noted" || charts.Repos[0].Jobs != 2 {
+		t.Fatalf("repos = %+v, want jerryfane/noted leading (2 jobs)", charts.Repos)
+	}
+}
+
+// TestBuildChartsDaysWindow asserts the days param sizes the window to the last N
+// days ending today (UTC), zero-filled to exactly N entries, excluding jobs older
+// than the window while counting the in-window ones.
+func TestBuildChartsDaysWindow(t *testing.T) {
+	now := time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC)
+	noted := mustJSON(t, workflow.JobPayload{Repo: "jerryfane/noted"})
+	jobs := []db.Job{
+		{ID: "today", Agent: "builder", State: "succeeded", CreatedAt: "2026-05-30 09:00:00", Payload: noted},
+		{ID: "recent", Agent: "builder", State: "succeeded", CreatedAt: "2026-05-27 09:00:00", Payload: noted},
+		{ID: "ancient", Agent: "builder", State: "succeeded", CreatedAt: "2026-04-20 09:00:00", Payload: noted},
+	}
+
+	seven := buildCharts(jobs, 7, now, nil)
+	if len(seven.Days) != 7 {
+		t.Fatalf("days=7 series length = %d, want 7", len(seven.Days))
+	}
+	if seven.Days[0].Date != "2026-05-24" || seven.Days[6].Date != "2026-05-30" {
+		t.Fatalf("days=7 window = %s..%s, want 2026-05-24..2026-05-30", seven.Days[0].Date, seven.Days[6].Date)
+	}
+	if seven.Totals.Jobs != 2 {
+		t.Fatalf("days=7 totals.Jobs = %d, want 2 (ancient job is out of window)", seven.Totals.Jobs)
+	}
+
+	thirty := buildCharts(jobs, 30, now, nil)
+	if len(thirty.Days) != 30 {
+		t.Fatalf("days=30 series length = %d, want 30", len(thirty.Days))
+	}
+	if thirty.Days[29].Date != "2026-05-30" {
+		t.Fatalf("days=30 last day = %s, want 2026-05-30 (today)", thirty.Days[29].Date)
+	}
+	if thirty.Totals.Jobs != 2 {
+		t.Fatalf("days=30 totals.Jobs = %d, want 2 (ancient job predates the window)", thirty.Totals.Jobs)
+	}
+
+	// An empty store still returns a full zero-filled window for a positive days.
+	empty := buildCharts(nil, 7, now, nil)
+	if len(empty.Days) != 7 || empty.Totals.Jobs != 0 {
+		t.Fatalf("empty days=7 = %d days / %d jobs, want 7/0", len(empty.Days), empty.Totals.Jobs)
+	}
+}
+
+// TestBuildChartsTopN asserts the agent/repo breakdowns cap at chartTopN, order by
+// jobs desc, and tie-break on name/repo ascending.
+func TestBuildChartsTopN(t *testing.T) {
+	var jobs []db.Job
+	// 15 agents/repos with one job each (all tie at 1 job) plus one clear leader
+	// with two jobs, so the cap keeps the leader + the 11 name-smallest of the ties.
+	for i := 0; i < 15; i++ {
+		agent := fmt.Sprintf("agent-%02d", i)
+		repo := fmt.Sprintf("acme/repo-%02d", i)
+		jobs = append(jobs, db.Job{
+			ID: fmt.Sprintf("j-%02d", i), Agent: agent, State: "succeeded",
+			CreatedAt: "2026-05-23 08:00:00", Payload: mustJSON(t, workflow.JobPayload{Repo: repo}),
+		})
+	}
+	jobs = append(jobs,
+		db.Job{ID: "top-a", Agent: "zzz-top", State: "succeeded", CreatedAt: "2026-05-23 08:00:00", Payload: mustJSON(t, workflow.JobPayload{Repo: "acme/repo-top"})},
+		db.Job{ID: "top-b", Agent: "zzz-top", State: "succeeded", CreatedAt: "2026-05-23 08:00:00", Payload: mustJSON(t, workflow.JobPayload{Repo: "acme/repo-top"})},
+	)
+
+	charts := buildCharts(jobs, 0, time.Now().UTC(), nil)
+
+	if len(charts.Agents) != chartTopN {
+		t.Fatalf("agents = %d, want %d (capped)", len(charts.Agents), chartTopN)
+	}
+	if charts.Agents[0].Name != "zzz-top" || charts.Agents[0].Jobs != 2 {
+		t.Fatalf("top agent = %+v, want zzz-top with 2 jobs", charts.Agents[0])
+	}
+	// The remaining 11 slots are the name-smallest of the single-job ties.
+	if charts.Agents[1].Name != "agent-00" || charts.Agents[chartTopN-1].Name != "agent-10" {
+		t.Fatalf("tie ordering = %q..%q, want agent-00..agent-10", charts.Agents[1].Name, charts.Agents[chartTopN-1].Name)
+	}
+	if len(charts.Repos) != chartTopN {
+		t.Fatalf("repos = %d, want %d (capped)", len(charts.Repos), chartTopN)
+	}
+	if charts.Repos[0].Repo != "acme/repo-top" || charts.Repos[0].Jobs != 2 {
+		t.Fatalf("top repo = %+v, want acme/repo-top with 2 jobs", charts.Repos[0])
+	}
+	if charts.Repos[chartTopN-1].Repo != "acme/repo-10" {
+		t.Fatalf("last repo = %q, want acme/repo-10 (name tie-break)", charts.Repos[chartTopN-1].Repo)
+	}
+}
+
+// TestHealthStuckSince covers the wedged-job predicate directly: blocked is always
+// stuck, queued is stuck only once its "since" sits at/behind the 10-min cutoff,
+// other states never are, and since falls back from UpdatedAt to CreatedAt.
+func TestHealthStuckSince(t *testing.T) {
+	cutoff := parseJobTimeMillis("2026-05-23 10:00:00")
+	cases := []struct {
+		name      string
+		job       db.Job
+		wantStuck bool
+		wantSince int64
+	}{
+		{"blocked always stuck", db.Job{State: "blocked", UpdatedAt: "2026-05-23 11:00:00"}, true, parseJobTimeMillis("2026-05-23 11:00:00")},
+		{"queued past cutoff", db.Job{State: "queued", UpdatedAt: "2026-05-23 09:59:00"}, true, parseJobTimeMillis("2026-05-23 09:59:00")},
+		{"queued at cutoff", db.Job{State: "queued", UpdatedAt: "2026-05-23 10:00:00"}, true, cutoff},
+		{"queued within threshold", db.Job{State: "queued", UpdatedAt: "2026-05-23 10:05:00"}, false, parseJobTimeMillis("2026-05-23 10:05:00")},
+		{"running never stuck", db.Job{State: "running", UpdatedAt: "2026-05-23 08:00:00"}, false, parseJobTimeMillis("2026-05-23 08:00:00")},
+		{"queued no timestamps", db.Job{State: "queued"}, false, 0},
+		{"blocked created-at fallback", db.Job{State: "blocked", CreatedAt: "2026-05-23 08:00:00"}, true, parseJobTimeMillis("2026-05-23 08:00:00")},
+	}
+	for _, c := range cases {
+		since, stuck := healthStuckSince(c.job, cutoff)
+		if stuck != c.wantStuck || since != c.wantSince {
+			t.Errorf("%s: healthStuckSince = (since=%d, stuck=%v), want (since=%d, stuck=%v)", c.name, since, stuck, c.wantSince, c.wantStuck)
+		}
+	}
+}
+
+// seedHealthHome seeds a store with the shapes the Health page reports: a blocked
+// job carrying a reason event, a stale (>10 min) queued job, a fresh queued job, two
+// failures at distinct times, a running job, plus one branch lock and one resource
+// lock.
+func seedHealthHome(t *testing.T, home string) {
+	t.Helper()
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ctx := context.Background()
+	noted := mustJSON(t, workflow.JobPayload{Repo: "jerryfane/noted"})
+
+	mustCreateJob(t, store, db.Job{ID: "blk", Agent: "builder", Type: "implement", State: "blocked", Payload: noted}, "advance_awaiting_human", "needs your approval")
+	mustCreateJob(t, store, db.Job{ID: "stale-q", Agent: "builder", Type: "implement", State: "queued", Payload: noted}, "", "")
+	mustCreateJob(t, store, db.Job{ID: "fresh-q", Agent: "builder", Type: "implement", State: "queued", Payload: noted}, "", "")
+	mustCreateJob(t, store, db.Job{ID: "run1", Agent: "builder", Type: "implement", State: "running", Payload: noted}, "", "")
+	mustCreateJob(t, store, db.Job{ID: "f1", Agent: "builder", Type: "implement", State: "failed", Payload: noted}, "", "")
+	mustCreateJob(t, store, db.Job{ID: "f2", Agent: "builder", Type: "implement", State: "failed", Payload: noted}, "", "")
+
+	if _, err := store.CreateLock(ctx, db.BranchLock{RepoFullName: "jerryfane/noted", Branch: "feature/x", Owner: "blk"}); err != nil {
+		t.Fatalf("CreateLock: %v", err)
+	}
+	expires := time.Now().UTC().Add(30 * time.Minute).Format(time.RFC3339Nano)
+	if _, err := store.AcquireResourceLock(ctx, db.ResourceLock{ResourceKey: "runtime:codex:sess", OwnerJobID: "blk", OwnerToken: "tok", ExpiresAt: expires}, time.Now().UTC()); err != nil {
+		t.Fatalf("AcquireResourceLock: %v", err)
+	}
+	store.Close()
+
+	// stale-q's UpdatedAt is far in the past -> stuck; the failures get distinct
+	// UpdatedAt so newest-first ordering is exact. fresh-q keeps its CURRENT_TIMESTAMP
+	// (~now) so it stays under the threshold.
+	setJobTimes(t, home, "stale-q", "2020-01-01 00:00:00", "2020-01-01 00:00:00")
+	setJobTimes(t, home, "f1", "2026-05-23 10:00:00", "2026-05-23 10:10:00")
+	setJobTimes(t, home, "f2", "2026-05-23 10:00:00", "2026-05-23 10:20:00")
+}
+
+func stuckByID(stuck []dashboard.HealthStuckJob, id string) (dashboard.HealthStuckJob, bool) {
+	for _, s := range stuck {
+		if s.ID == id {
+			return s, true
+		}
+	}
+	return dashboard.HealthStuckJob{}, false
+}
+
+// TestWebDataSourceHealth asserts Health() rolls up state totals, surfaces blocked
+// + stale-queued jobs (with the blocked job's reason) while hiding a fresh queued
+// job, orders recent failures newest-first, and maps the branch + resource locks.
+// The daemon is unregistered here so it must read as a zero-value (not running).
+func TestWebDataSourceHealth(t *testing.T) {
+	home := dashboardTestHome(t)
+	seedHealthHome(t, home)
+
+	ds := &webDataSource{home: home}
+	h, err := ds.Health(context.Background())
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+
+	// Daemon zero-value: no daemon.pid/json in this fresh home.
+	if h.Daemon.Running || h.Daemon.PID != 0 || h.Daemon.StartedAt != 0 {
+		t.Fatalf("daemon = %+v, want zero-value (not running)", h.Daemon)
+	}
+
+	tot := h.Totals
+	if tot.Queued != 2 || tot.Running != 1 || tot.Blocked != 1 || tot.Failed != 2 || tot.Succeeded != 0 || tot.Cancelled != 0 {
+		t.Fatalf("totals = %+v, want queued2 running1 blocked1 failed2", tot)
+	}
+
+	// Stuck: blocked (blk) + stale queued (stale-q); fresh queued excluded. Oldest
+	// first => stale-q (2020) before blk (~now).
+	if len(h.Stuck) != 2 {
+		t.Fatalf("stuck = %d, want 2: %+v", len(h.Stuck), h.Stuck)
+	}
+	if h.Stuck[0].ID != "stale-q" {
+		t.Fatalf("stuck[0] = %q, want stale-q (oldest first)", h.Stuck[0].ID)
+	}
+	if _, ok := stuckByID(h.Stuck, "fresh-q"); ok {
+		t.Fatalf("fresh queued job must not be reported stuck")
+	}
+	blk, ok := stuckByID(h.Stuck, "blk")
+	if !ok {
+		t.Fatalf("blocked job blk missing from stuck")
+	}
+	if blk.State != "blocked" {
+		t.Fatalf("blk state = %q, want blocked", blk.State)
+	}
+	if blk.Reason == "" || !strings.Contains(blk.Reason, "awaiting human") {
+		t.Fatalf("blk reason = %q, want it to carry the awaiting-human signal", blk.Reason)
+	}
+
+	// Recent failures newest-first: f2 (10:20) before f1 (10:10).
+	if len(h.RecentFailures) != 2 || h.RecentFailures[0].ID != "f2" || h.RecentFailures[1].ID != "f1" {
+		t.Fatalf("recent failures = %+v, want [f2 f1] newest-first", h.RecentFailures)
+	}
+
+	// Branch lock mapping.
+	if len(h.Locks) != 1 {
+		t.Fatalf("locks = %d, want 1: %+v", len(h.Locks), h.Locks)
+	}
+	lock := h.Locks[0]
+	if lock.Repo != "jerryfane/noted" || lock.Branch != "feature/x" || lock.Owner != "blk" {
+		t.Fatalf("lock = %+v, want jerryfane/noted feature/x blk", lock)
+	}
+	if lock.AcquiredAt <= 0 {
+		t.Fatalf("lock AcquiredAt = %d, want > 0 (mapped from created_at)", lock.AcquiredAt)
+	}
+
+	// Resource lock mapping.
+	if len(h.ResourceLocks) != 1 {
+		t.Fatalf("resourceLocks = %d, want 1: %+v", len(h.ResourceLocks), h.ResourceLocks)
+	}
+	rl := h.ResourceLocks[0]
+	if rl.Key != "runtime:codex:sess" || rl.Owner != "blk" {
+		t.Fatalf("resource lock = %+v, want runtime:codex:sess owner blk", rl)
+	}
+	if rl.AcquiredAt <= 0 || rl.ExpiresAt <= rl.AcquiredAt {
+		t.Fatalf("resource lock times = acquired %d expires %d, want acquired>0 and expires>acquired", rl.AcquiredAt, rl.ExpiresAt)
+	}
+}
+
+// TestWebDataSourceHealthDaemonRunning uses the same self-registration fixture the
+// daemon tests use (registerDaemonRunState with this process's argv) to prove
+// Health reads the live daemon's pid + start time off d.home.
+func TestWebDataSourceHealthDaemonRunning(t *testing.T) {
+	home := dashboardTestHome(t)
+	seedHealthHome(t, home)
+
+	state := daemonProcessState(config.PathsForHome(home))
+	wd, _ := os.Getwd()
+	if ok, err := registerDaemonRunState(state, os.Args, wd); err != nil || !ok {
+		t.Fatalf("registerDaemonRunState ok=%v err=%v, want true nil", ok, err)
+	}
+	defer deregisterDaemonRunState(state)
+
+	ds := &webDataSource{home: home}
+	h, err := ds.Health(context.Background())
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if !h.Daemon.Running || h.Daemon.PID != os.Getpid() {
+		t.Fatalf("daemon = %+v, want running pid=%d", h.Daemon, os.Getpid())
+	}
+	if h.Daemon.StartedAt <= 0 {
+		t.Fatalf("daemon StartedAt = %d, want > 0 (from daemon.json meta)", h.Daemon.StartedAt)
 	}
 }

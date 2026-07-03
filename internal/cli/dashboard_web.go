@@ -591,6 +591,391 @@ func sortedSetKeys(set map[string]bool) []string {
 	return out
 }
 
+// Charts returns the per-day time series plus top-agent/top-repo/totals
+// breakdowns for the Charts page. It is a single read-only ListJobs pass handed
+// to buildCharts: each job buckets into its CreatedAt UTC day, states map via
+// mapNodeState, and InputTokens/OutputTokens sum into that day's bucket. days
+// selects the window (7/30/90 => the last N days ending today UTC; 0 => the full
+// earliest..latest history envelope) which buildCharts zero-fills continuously.
+func (d *webDataSource) Charts(ctx context.Context, days int) (dashboard.Charts, error) {
+	out := dashboard.Charts{Days: []dashboard.ChartDay{}, Agents: []dashboard.ChartAgent{}, Repos: []dashboard.ChartRepo{}}
+	err := withStore(d.home, func(store *db.Store) error {
+		jobs, err := store.ListJobs(ctx)
+		if err != nil {
+			return err
+		}
+		out = buildCharts(jobs, days, time.Now().UTC(), agentRuntimeMap(ctx, store))
+		return nil
+	})
+	return out, err
+}
+
+// chartTopN bounds the per-agent and per-repo breakdowns so a busy home does not
+// return an unbounded leaderboard.
+const chartTopN = 12
+
+// buildCharts aggregates a job slice into the Charts contract: a continuous,
+// zero-filled per-day series (oldest->newest), the top-N agents/repos by job
+// count, and range totals. It is pure (now and the agent-runtime map are passed
+// in) so it is unit-tested directly, mirroring summarizeRuns. A job with no
+// parseable CreatedAt has no day bucket and is omitted from the series/totals.
+func buildCharts(jobs []db.Job, days int, now time.Time, runtimeByAgent map[string]string) dashboard.Charts {
+	out := dashboard.Charts{Days: []dashboard.ChartDay{}, Agents: []dashboard.ChartAgent{}, Repos: []dashboard.ChartRepo{}}
+
+	// Resolve each job's UTC day-start from CreatedAt once, tracking the observed
+	// min/max day for the all-history (days==0) window.
+	type jobDay struct {
+		job db.Job
+		day time.Time
+		ok  bool
+	}
+	parsed := make([]jobDay, 0, len(jobs))
+	var minDay, maxDay time.Time
+	haveRange := false
+	for _, j := range jobs {
+		jd := jobDay{job: j}
+		if ms := parseJobTimeMillis(j.CreatedAt); ms > 0 {
+			jd.day = utcDayStart(time.UnixMilli(ms))
+			jd.ok = true
+			if !haveRange || jd.day.Before(minDay) {
+				minDay = jd.day
+			}
+			if !haveRange || jd.day.After(maxDay) {
+				maxDay = jd.day
+			}
+			haveRange = true
+		}
+		parsed = append(parsed, jd)
+	}
+
+	// Resolve the window [start, end] as UTC day-starts. days>0 is the last N days
+	// ending today; days==0 is the full earliest..latest envelope (empty when no
+	// job carries a parseable day), extended to today so the all-history view
+	// shares its right edge with the windowed views (and the fake feed) even on
+	// an idle day with no jobs created today.
+	var start, end time.Time
+	switch {
+	case days > 0:
+		end = utcDayStart(now)
+		start = end.AddDate(0, 0, -(days - 1))
+	case haveRange:
+		start, end = minDay, maxDay
+		if today := utcDayStart(now); today.After(end) {
+			end = today
+		}
+	default:
+		return out
+	}
+	inWindow := func(day time.Time) bool { return !day.Before(start) && !day.After(end) }
+
+	dayBuckets := map[string]*dashboard.ChartDay{}
+	agentAgg := map[string]*dashboard.ChartAgent{}
+	repoAgg := map[string]int{}
+	activeAgents := map[string]bool{}
+	var totals dashboard.ChartTotals
+
+	for _, jd := range parsed {
+		if !jd.ok || !inWindow(jd.day) {
+			continue
+		}
+		j := jd.job
+		payload, _ := workflow.ParseJobPayload(j.Payload)
+
+		key := jd.day.Format("2006-01-02")
+		b := dayBuckets[key]
+		if b == nil {
+			b = &dashboard.ChartDay{Date: key}
+			dayBuckets[key] = b
+		}
+		switch mapNodeState(j.State) {
+		case "succeeded":
+			b.Succeeded++
+			totals.Succeeded++
+		case "failed":
+			b.Failed++
+			totals.Failed++
+		case "cancelled":
+			b.Cancelled++
+		case "blocked":
+			b.Blocked++
+		case "queued":
+			b.Queued++
+		case "running":
+			b.Running++
+		}
+		b.TokensIn += j.InputTokens
+		b.TokensOut += j.OutputTokens
+
+		totals.Jobs++
+		totals.TokensIn += j.InputTokens
+		totals.TokensOut += j.OutputTokens
+
+		if name := strings.TrimSpace(j.Agent); name != "" {
+			activeAgents[name] = true
+			a := agentAgg[name]
+			if a == nil {
+				// Runtime is resolved once (first job seen for the name) via the same
+				// registry+ephemeral-fallback path Jobs() uses; a registered agent's
+				// runtime is stable across its jobs.
+				a = &dashboard.ChartAgent{Name: name, Runtime: resolveJobRuntime(j, payload, runtimeByAgent)}
+				agentAgg[name] = a
+			}
+			a.Jobs++
+			a.TokensOut += j.OutputTokens
+		}
+		if repo := strings.TrimSpace(payload.Repo); repo != "" {
+			repoAgg[repo]++
+		}
+	}
+	totals.ActiveAgents = len(activeAgents)
+
+	// Continuous zero-filled series, oldest->newest.
+	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
+		key := d.Format("2006-01-02")
+		if b := dayBuckets[key]; b != nil {
+			out.Days = append(out.Days, *b)
+		} else {
+			out.Days = append(out.Days, dashboard.ChartDay{Date: key})
+		}
+	}
+
+	// Top-N agents by jobs desc, name tie-break.
+	agents := make([]dashboard.ChartAgent, 0, len(agentAgg))
+	for _, a := range agentAgg {
+		agents = append(agents, *a)
+	}
+	sort.SliceStable(agents, func(i, j int) bool {
+		if agents[i].Jobs != agents[j].Jobs {
+			return agents[i].Jobs > agents[j].Jobs
+		}
+		return agents[i].Name < agents[j].Name
+	})
+	if len(agents) > chartTopN {
+		agents = agents[:chartTopN]
+	}
+	out.Agents = agents
+
+	// Top-N repos by jobs desc, repo tie-break.
+	repos := make([]dashboard.ChartRepo, 0, len(repoAgg))
+	for repo, n := range repoAgg {
+		repos = append(repos, dashboard.ChartRepo{Repo: repo, Jobs: n})
+	}
+	sort.SliceStable(repos, func(i, j int) bool {
+		if repos[i].Jobs != repos[j].Jobs {
+			return repos[i].Jobs > repos[j].Jobs
+		}
+		return repos[i].Repo < repos[j].Repo
+	})
+	if len(repos) > chartTopN {
+		repos = repos[:chartTopN]
+	}
+	out.Repos = repos
+
+	out.Totals = totals
+	return out
+}
+
+// utcDayStart returns the UTC midnight that begins t's day, the bucket key for
+// the per-day chart series.
+func utcDayStart(t time.Time) time.Time {
+	t = t.UTC()
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+}
+
+// stuckQueuedThreshold is how long a job may sit queued before the Health page
+// treats it as wedged (blocked jobs are surfaced regardless of age).
+const stuckQueuedThreshold = 10 * time.Minute
+
+// Health returns the daemon liveness, fleet totals, held locks, wedged jobs and
+// recent failures behind the Health page. The daemon block mirrors
+// buildDashboardSnapshot (currentDaemonPID + daemon.json meta over d.home);
+// everything else is a single read-only ListJobs pass plus the lock listings.
+// Stuck reasons reuse loadStuckReason/deriveStuckReason unchanged.
+func (d *webDataSource) Health(ctx context.Context) (dashboard.Health, error) {
+	out := dashboard.Health{
+		Locks:          []dashboard.HealthLock{},
+		ResourceLocks:  []dashboard.HealthResourceLock{},
+		Stuck:          []dashboard.HealthStuckJob{},
+		RecentFailures: []dashboard.HealthFailure{},
+	}
+	paths, err := initializedPaths(d.home)
+	if err != nil {
+		return out, err
+	}
+
+	// Daemon liveness — same readers buildDashboardSnapshot uses. StartedAt comes
+	// off the running daemon's persisted meta (RFC3339 -> epoch ms); a stopped
+	// daemon reports 0.
+	state := daemonProcessState(paths)
+	if pid, _, perr := currentDaemonPID(state); perr == nil && pid > 0 {
+		out.Daemon.Running = true
+		out.Daemon.PID = pid
+		if meta, merr := readDaemonMeta(state); merr == nil {
+			out.Daemon.StartedAt = parseJobTimeMillis(meta.StartedAt)
+		}
+	}
+
+	err = withStore(d.home, func(store *db.Store) error {
+		jobs, err := store.ListJobs(ctx)
+		if err != nil {
+			return err
+		}
+
+		// Non-branch resource locks (runtime sessions etc.) are listed ONCE and
+		// shared: they feed both out.ResourceLocks below and every stuck job's
+		// deriveStuckReason. Going through loadStuckReason instead would re-scan
+		// the resource_locks table per stuck job on every 12s /api/health poll —
+		// an N+1 that grows with the blocked-job count in unattended operation.
+		resourceLocks, err := store.ListResourceLocks(ctx)
+		if err != nil {
+			return err
+		}
+
+		cutoff := time.Now().UTC().Add(-stuckQueuedThreshold).UnixMilli()
+		var stuck []dashboard.HealthStuckJob
+		var failures []dashboard.HealthFailure
+		for _, j := range jobs {
+			ns := mapNodeState(j.State)
+			switch ns {
+			case "queued":
+				out.Totals.Queued++
+			case "running":
+				out.Totals.Running++
+			case "blocked":
+				out.Totals.Blocked++
+			case "succeeded":
+				out.Totals.Succeeded++
+			case "failed":
+				out.Totals.Failed++
+			case "cancelled":
+				out.Totals.Cancelled++
+			}
+
+			if since, isStuck := healthStuckSince(j, cutoff); isStuck {
+				payload, _ := workflow.ParseJobPayload(j.Payload)
+				// Mirror loadStuckReason but reuse the preloaded resource locks
+				// (per-job events are inherently per-job and stay).
+				reason := ""
+				if events, eerr := store.ListJobEvents(ctx, j.ID); eerr == nil {
+					ev, ok := latestReasonEvent(events)
+					reason = deriveStuckReason(j, ev, ok, resourceLocks).Reason
+				}
+				stuck = append(stuck, dashboard.HealthStuckJob{
+					ID:     j.ID,
+					Title:  jobTitle(payload, j),
+					Agent:  strings.TrimSpace(j.Agent),
+					Repo:   strings.TrimSpace(payload.Repo),
+					State:  string(ns),
+					Reason: reason,
+					Since:  since,
+				})
+			}
+
+			if ns == "failed" {
+				payload, _ := workflow.ParseJobPayload(j.Payload)
+				at := parseJobTimeMillis(j.UpdatedAt)
+				if at == 0 {
+					at = parseJobTimeMillis(j.CreatedAt)
+				}
+				failures = append(failures, dashboard.HealthFailure{
+					ID:    j.ID,
+					Title: jobTitle(payload, j),
+					Agent: strings.TrimSpace(j.Agent),
+					Repo:  strings.TrimSpace(payload.Repo),
+					At:    at,
+				})
+			}
+		}
+
+		// Wedged jobs oldest-first (id tie-break).
+		sort.SliceStable(stuck, func(i, j int) bool {
+			if stuck[i].Since != stuck[j].Since {
+				return stuck[i].Since < stuck[j].Since
+			}
+			return stuck[i].ID < stuck[j].ID
+		})
+		out.Stuck = stuck
+
+		// Recent failures newest-first (id tie-break), capped at 10.
+		sort.SliceStable(failures, func(i, j int) bool {
+			if failures[i].At != failures[j].At {
+				return failures[i].At > failures[j].At
+			}
+			return failures[i].ID > failures[j].ID
+		})
+		if len(failures) > 10 {
+			failures = failures[:10]
+		}
+		out.RecentFailures = failures
+
+		// Branch/checkout locks (all repos), oldest acquisition first.
+		branchLocks, err := store.ListBranchLocksWithAge(ctx, "")
+		if err != nil {
+			return err
+		}
+		locks := make([]dashboard.HealthLock, 0, len(branchLocks))
+		for _, l := range branchLocks {
+			hl := dashboard.HealthLock{Repo: l.RepoFullName, Branch: l.Branch, Owner: l.Owner}
+			if !l.CreatedAt.IsZero() {
+				hl.AcquiredAt = l.CreatedAt.UnixMilli()
+			}
+			locks = append(locks, hl)
+		}
+		sort.SliceStable(locks, func(i, j int) bool {
+			if locks[i].AcquiredAt != locks[j].AcquiredAt {
+				return locks[i].AcquiredAt < locks[j].AcquiredAt
+			}
+			if locks[i].Repo != locks[j].Repo {
+				return locks[i].Repo < locks[j].Repo
+			}
+			return locks[i].Branch < locks[j].Branch
+		})
+		out.Locks = locks
+
+		// Non-branch resource locks (runtime sessions etc.), oldest acquisition
+		// first — mapped from the slice preloaded before the jobs loop.
+		rlocks := make([]dashboard.HealthResourceLock, 0, len(resourceLocks))
+		for _, l := range resourceLocks {
+			rlocks = append(rlocks, dashboard.HealthResourceLock{
+				Key:        l.ResourceKey,
+				Owner:      strings.TrimSpace(l.OwnerJobID),
+				AcquiredAt: parseJobTimeMillis(l.AcquiredAt),
+				ExpiresAt:  parseJobTimeMillis(l.ExpiresAt),
+			})
+		}
+		sort.SliceStable(rlocks, func(i, j int) bool {
+			if rlocks[i].AcquiredAt != rlocks[j].AcquiredAt {
+				return rlocks[i].AcquiredAt < rlocks[j].AcquiredAt
+			}
+			return rlocks[i].Key < rlocks[j].Key
+		})
+		out.ResourceLocks = rlocks
+		return nil
+	})
+	return out, err
+}
+
+// healthStuckSince reports whether a job is wedged for the Health page and its
+// "since" epoch-ms timestamp (UpdatedAt, else CreatedAt). A blocked job is always
+// stuck; a queued job is stuck once its since falls at/behind cutoffMillis (the
+// 10-minute threshold). Any other state is never stuck. Pure, so the threshold is
+// unit-tested directly.
+func healthStuckSince(job db.Job, cutoffMillis int64) (since int64, stuck bool) {
+	since = parseJobTimeMillis(job.UpdatedAt)
+	if since == 0 {
+		since = parseJobTimeMillis(job.CreatedAt)
+	}
+	switch mapNodeState(job.State) {
+	case "blocked":
+		return since, true
+	case "queued":
+		if since > 0 && since <= cutoffMillis {
+			return since, true
+		}
+	}
+	return since, false
+}
+
 // Subscribe polls State for the requested run and pushes a fresh snapshot to the
 // returned channel whenever it changes (plus one initial snapshot). It is a
 // read-only poller — no store writes — and stops when the caller invokes the
