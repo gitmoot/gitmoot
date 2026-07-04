@@ -57,19 +57,19 @@ func printSkillOptGateUsage(w io.Writer) {
 
 // skillOptGateRunReport is the machine-readable result of one `gate run` (#627).
 type skillOptGateRunReport struct {
-	CandidateVersionID string                  `json:"candidate_version_id"`
-	ChampionVersionID  string                  `json:"champion_version_id"`
-	TemplateID         string                  `json:"template_id"`
-	CorpusPath         string                  `json:"corpus_path"`
-	CorpusVersion      int                     `json:"corpus_version"`
-	CorpusItems        int                     `json:"corpus_items"`
-	Accepted           bool                    `json:"accepted"`
-	Attempts           int                     `json:"attempts"`
-	ChampionMean       float64                 `json:"champion_mean"`
-	CandidateMean      float64                 `json:"candidate_mean"`
-	Reason             string                  `json:"reason"`
+	CandidateVersionID string                   `json:"candidate_version_id"`
+	ChampionVersionID  string                   `json:"champion_version_id"`
+	TemplateID         string                   `json:"template_id"`
+	CorpusPath         string                   `json:"corpus_path"`
+	CorpusVersion      int                      `json:"corpus_version"`
+	CorpusItems        int                      `json:"corpus_items"`
+	Accepted           bool                     `json:"accepted"`
+	Attempts           int                      `json:"attempts"`
+	ChampionMean       float64                  `json:"champion_mean"`
+	CandidateMean      float64                  `json:"candidate_mean"`
+	Reason             string                   `json:"reason"`
 	Deltas             []skillopt.GateItemDelta `json:"deltas"`
-	GateRunID          string                  `json:"gate_run_id"`
+	GateRunID          string                   `json:"gate_run_id"`
 }
 
 func runSkillOptGateRun(args []string, stdout, stderr io.Writer) int {
