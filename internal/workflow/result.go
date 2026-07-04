@@ -94,6 +94,24 @@ type HumanQuestion struct {
 	Choices []string `json:"choices,omitempty"`
 }
 
+// Learning is one durable, keyed fact an agent may return in gitmoot_result at
+// job end (#626). Each entry is a single self-contained fact ("this repo's
+// arm64 CI is flaky"), NOT a directive. Key is a short stable handle used for
+// keyed dedup/upsert in the memory store; Scope is "repo" (a fact about this
+// repository, the default) or "general" (a fact that travels with the owner
+// into every repository); Content is the fact itself. In Phase 1 (observation
+// mode) returned learnings are SHADOW-logged to memory_observations only — never
+// injected back into any prompt and never promoted.
+type Learning struct {
+	Key     string `json:"key"`
+	Scope   string `json:"scope,omitempty"`
+	Content string `json:"content"`
+}
+
+// LearningScopes are the allowed values of Learning.Scope (the empty string
+// falls back to the default "repo" and is accepted separately).
+var LearningScopes = []string{"repo", "general"}
+
 type AgentResult struct {
 	Decision     string            `json:"decision"`
 	Summary      string            `json:"summary"`
@@ -103,6 +121,13 @@ type AgentResult struct {
 	Needs        []string          `json:"needs"`
 	Delegations  []Delegation      `json:"delegations"`
 	ArtifactBody string            `json:"artifact_body,omitempty"`
+	// Learnings, when non-empty, carries durable keyed facts the agent chose to
+	// record for its persistent memory (#626). It is fully additive: a result that
+	// omits it (the overwhelming common case) behaves byte-identically (omitempty),
+	// and in Phase 1 the entries are shadow-logged to memory_observations only —
+	// never injected, never promoted. Each entry is validated (non-blank key and
+	// content; scope in {repo,general} or empty→repo).
+	Learnings []Learning `json:"learnings,omitempty"`
 	// HumanQuestions, when non-empty, asks the engine to pause the parent task at
 	// awaiting_human for a specific human answer (#445) — a non-failure sibling of
 	// the escalate_human pause. It is fully additive: a result that omits it
@@ -166,6 +191,7 @@ func validateAgentResultFields(raw json.RawMessage) error {
 		"delegations":     {},
 		"artifact_body":   {},
 		"human_questions": {},
+		"learnings":       {},
 	}
 	for field := range fields {
 		if _, ok := allowed[field]; !ok {
@@ -209,6 +235,9 @@ func validateAgentResult(result AgentResult) error {
 		return errors.New("gitmoot_result summary is required")
 	}
 	if err := validateHumanQuestions(result.HumanQuestions); err != nil {
+		return err
+	}
+	if err := validateLearnings(result.Learnings); err != nil {
 		return err
 	}
 	var errs []error
@@ -281,6 +310,31 @@ func validateHumanQuestions(questions []HumanQuestion) error {
 			return fmt.Errorf("human_questions[%d] id %q is not unique", i, id)
 		}
 		seen[id] = struct{}{}
+	}
+	return nil
+}
+
+// validateLearnings validates the optional #626 learnings field: each entry
+// must carry a non-blank key and non-blank content, and scope (when set) must be
+// one of {repo,general}. An empty/absent slice is valid (the field is fully
+// optional and the byte-identical default when omitted).
+func validateLearnings(learnings []Learning) error {
+	if len(learnings) == 0 {
+		return nil
+	}
+	scopes := allowedSet(LearningScopes)
+	for i, l := range learnings {
+		if strings.TrimSpace(l.Key) == "" {
+			return fmt.Errorf("learnings[%d] key is required", i)
+		}
+		if strings.TrimSpace(l.Content) == "" {
+			return fmt.Errorf("learnings[%d] (key %q) content is required", i, strings.TrimSpace(l.Key))
+		}
+		if scope := strings.ToLower(strings.TrimSpace(l.Scope)); scope != "" {
+			if _, ok := scopes[scope]; !ok {
+				return fmt.Errorf("learnings[%d] (key %q) scope %q is invalid; expected repo or general", i, strings.TrimSpace(l.Key), l.Scope)
+			}
+		}
 	}
 	return nil
 }

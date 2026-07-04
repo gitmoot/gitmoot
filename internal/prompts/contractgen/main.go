@@ -59,6 +59,7 @@ var resultFieldAnnotations = map[string]fieldAnnotation{
 	"delegations":   {example: "[]"},
 	"artifact_body": {help: `top-level artifact_body (string) is required when any delegation requests artifacts.`},
 	"human_questions": {help: `top-level human_questions (object[], optional): use SPARINGLY to pause for a specific human decision instead of guessing; each entry is {id (string, required, unique), prompt (string, required), choices (string[], optional)}. Returning it pauses the tree awaiting a human answer (no leg fails, no continuation runs); a human replies with /gitmoot resume <job> answer "<id>: ...". Leave it absent when you can proceed.`},
+	"learnings":       {help: `top-level learnings (object[], optional): use RARELY to record a durable, keyed FACT worth remembering next time (e.g. "this repo's arm64 CI is flaky"), NOT a directive and NOT for this job only. Each entry is {key (string, required, short stable handle), scope (string, optional: "repo" for a fact about this repository — the default — or "general" for a fact true everywhere), content (string, required, the fact itself)}. Most jobs return none; leave it absent unless you learned something that will help a future job.`},
 }
 
 // delegationFieldAnnotations covers every JSON field of workflow.Delegation.
@@ -220,6 +221,12 @@ func renderDelegationHelp() string {
 	// but it composes with delegations (a coordinator can fan out AND ask), so it is
 	// documented in the same prompt block the runtime agent actually receives.
 	if h := resultFieldAnnotations["human_questions"].help; h != "" {
+		b.WriteString("- " + h + "\n")
+	}
+	// learnings is a top-level persistent-memory field (#626), not a delegation
+	// field, but like human_questions it is documented in the same prompt block the
+	// runtime agent actually receives so it can choose to record a durable fact.
+	if h := resultFieldAnnotations["learnings"].help; h != "" {
 		b.WriteString("- " + h + "\n")
 	}
 	return b.String()

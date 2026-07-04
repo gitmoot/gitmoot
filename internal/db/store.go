@@ -7123,4 +7123,55 @@ CREATE INDEX idx_jobs_queued_created ON jobs(created_at) WHERE state='queued';
 	`
 DROP INDEX IF EXISTS idx_job_events_kind;
 	`,
+	// #626 agent persistent memory (Phase 0 storage): the two-table evidence/
+	// upsert split plus a standalone FTS5 index over confirmed content. A single
+	// keyed-upsert table cannot both deduplicate and count witnesses, so pending
+	// evidence (memory_observations) and injectable facts (confirmed_memories)
+	// live apart. Owner identity is STRUCTURED (owner_kind/owner_ref/owner_version)
+	// so template upgrades never inherit stale pools and role variants never
+	// collide. repo is NULLABLE (NULL == a general-scope fact); partial unique
+	// indexes enforce one keyed confirmed row per (owner, repo, key) with correct
+	// NULL semantics. The FTS table is a PLAIN (non-external-content) fts5 table
+	// managed transactionally from Go (UpsertConfirmedMemory keeps it in sync),
+	// avoiding trigger-body parsing in the multi-statement migration string. This
+	// is a pure additive append — CREATE TABLE/INDEX only, no ALTER/renumber of any
+	// prior migration — and every table stays empty until an agent is enrolled in
+	// [memory] (default off), so behavior is byte-identical when the feature is off.
+	`
+CREATE TABLE memory_observations (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	owner_kind TEXT NOT NULL,
+	owner_ref TEXT NOT NULL,
+	owner_version TEXT NOT NULL DEFAULT '',
+	repo TEXT,
+	scope TEXT NOT NULL,
+	key TEXT NOT NULL,
+	content TEXT NOT NULL,
+	provenance TEXT NOT NULL DEFAULT '',
+	trust_mark TEXT NOT NULL DEFAULT '',
+	source_job TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_memory_obs_owner ON memory_observations(owner_kind, owner_ref, owner_version, key);
+
+CREATE TABLE confirmed_memories (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	owner_kind TEXT NOT NULL,
+	owner_ref TEXT NOT NULL,
+	owner_version TEXT NOT NULL DEFAULT '',
+	repo TEXT,
+	scope TEXT NOT NULL,
+	key TEXT NOT NULL,
+	content TEXT NOT NULL,
+	provenance TEXT NOT NULL DEFAULT '',
+	source_job TEXT NOT NULL DEFAULT '',
+	first_confirmed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	superseded_by INTEGER
+);
+CREATE UNIQUE INDEX idx_confirmed_repo_key ON confirmed_memories(owner_kind, owner_ref, owner_version, repo, key) WHERE repo IS NOT NULL;
+CREATE UNIQUE INDEX idx_confirmed_general_key ON confirmed_memories(owner_kind, owner_ref, owner_version, key) WHERE repo IS NULL;
+
+CREATE VIRTUAL TABLE confirmed_memories_fts USING fts5(content, key, tokenize='porter');
+	`,
 }
