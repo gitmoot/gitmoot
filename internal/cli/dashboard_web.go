@@ -440,6 +440,9 @@ func agentTemplateInfo(tmpl db.AgentTemplate) *dashboard.AgentTemplateInfo {
 		SourceRef:      strings.TrimSpace(tmpl.SourceRef),
 		SourcePath:     strings.TrimSpace(tmpl.SourcePath),
 		ResolvedCommit: strings.TrimSpace(tmpl.ResolvedCommit),
+		// Content is the full resolved prompt body; passed verbatim (no trim) so the
+		// detail view shows the exact template text an agent runs.
+		Content: tmpl.Content,
 	}
 }
 
@@ -471,6 +474,8 @@ func agentTemplateVersions(ctx context.Context, store *db.Store, tmpl db.AgentTe
 			PromotedAt:     parseJobTimeMillis(v.PromotedAt),
 			CanarySample:   v.CanarySample,
 			Current:        currentID != "" && v.ID == currentID,
+			// Content is this version's full prompt body; passed verbatim (no trim).
+			Content: v.Content,
 		})
 	}
 	sort.SliceStable(out, func(i, j int) bool {
