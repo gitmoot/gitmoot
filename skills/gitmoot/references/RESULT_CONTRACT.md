@@ -479,6 +479,10 @@ the dollar-cost bullet in [Termination bounds](#termination-bounds) above.
 - `approved`: review found no blocking issues.
 - `changes_requested`: review found issues that should be fixed before merge.
 - `blocked`: work cannot continue without human input or an external state change.
+  A blocked job is *settled* (a delegation barrier will not wait on it and a
+  `job watch` stops tailing it) but not *final*: it can be resumed via retry, so
+  subsystems that stamp an end time or tear down live resources treat it as still
+  live. See `internal/workflow` `IsSettledJobState` vs `IsFinalJobState` (#632).
 - `implemented`: the requested implementation work was completed.
 - `failed`: the attempted action errored or could not complete.
 

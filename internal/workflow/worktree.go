@@ -746,7 +746,7 @@ func (e Engine) implementLegBranchMayBeMerged(ctx context.Context, payload JobPa
 	}
 	for _, consumerID := range consumerIDs {
 		consumer, ok := children[consumerID]
-		if !ok || !isTerminalJobState(consumer.State) {
+		if !ok || !IsSettledJobState(consumer.State) {
 			return true // consumer not yet dispatched or still running -> preserve
 		}
 	}

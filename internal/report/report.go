@@ -564,13 +564,12 @@ func latestTerminalJobEventIndex(events []db.JobEvent) int {
 	return -1
 }
 
+// isTerminalJobEvent reports whether an event kind names a settled job state.
+// Event kinds mirror job-state strings for terminal transitions, so it uses
+// SETTLED (barrier) semantics — blocked included — to locate the latest
+// terminal event. See workflow.IsSettledJobState (#632).
 func isTerminalJobEvent(kind string) bool {
-	switch strings.TrimSpace(kind) {
-	case string(workflow.JobSucceeded), string(workflow.JobFailed), string(workflow.JobBlocked), string(workflow.JobCancelled):
-		return true
-	default:
-		return false
-	}
+	return workflow.IsSettledJobState(strings.TrimSpace(kind))
 }
 
 func isPriorityDiagnosticEvent(kind string) bool {

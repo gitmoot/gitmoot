@@ -289,6 +289,35 @@ func TestWebDataSourceNodeTiming(t *testing.T) {
 	}
 }
 
+// TestPinDashboardBlockedDoesNotStampEndedAt pins the web dashboard's terminal
+// semantics (#632): buildDashboardNode stamps EndedAt only for FINAL states
+// (succeeded/failed/cancelled) and NOT for `blocked`, because a blocked job can
+// still resume. This exclusion must hold identically before and after the
+// predicate refactor.
+func TestPinDashboardBlockedDoesNotStampEndedAt(t *testing.T) {
+	const updated = "2026-05-23 07:00:00"
+	wantEnd := parseJobTimeMillis(updated)
+	if wantEnd == 0 {
+		t.Fatalf("test timestamp did not parse")
+	}
+
+	// A blocked job carries an UpdatedAt but must NOT get EndedAt stamped.
+	blocked := buildDashboardNode(
+		db.Job{ID: "j-blocked", Agent: "a", Type: "implement", State: "blocked", UpdatedAt: updated},
+		workflow.JobPayload{}, nil, nil, nil, "implement")
+	if blocked.EndedAt != 0 {
+		t.Fatalf("blocked node EndedAt = %d, want 0 (blocked is not final; can resume)", blocked.EndedAt)
+	}
+
+	// A failed job, by contrast, is final and does get EndedAt stamped.
+	failed := buildDashboardNode(
+		db.Job{ID: "j-failed", Agent: "a", Type: "implement", State: "failed", UpdatedAt: updated},
+		workflow.JobPayload{}, nil, nil, nil, "implement")
+	if failed.EndedAt != wantEnd {
+		t.Fatalf("failed node EndedAt = %d, want %d (failed is final)", failed.EndedAt, wantEnd)
+	}
+}
+
 // TestNodeTitleDescriptive covers the descriptive-title preference order beyond
 // the plain task-title case: a humanized delegation id and an instructions line.
 func TestNodeTitleDescriptive(t *testing.T) {

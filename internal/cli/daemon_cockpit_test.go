@@ -475,6 +475,29 @@ func TestRootTreeTerminal(t *testing.T) {
 	}
 }
 
+// TestPinRootTreeBlockedNotTerminal pins the cockpit's terminal semantics (#632):
+// a `blocked` in-tree job keeps the root tree NON-terminal, so the daemon does
+// not finalize (tear down panes + seat logs) while a blocked job can still
+// resume. This "blocked is live" behavior must hold identically before and after
+// the predicate refactor.
+func TestPinRootTreeBlockedNotTerminal(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	worker := defaultJobWorker(store, io.Discard)
+
+	mustCreate := func(id, state string, payload workflow.JobPayload) {
+		if err := store.CreateJob(ctx, db.Job{ID: id, Agent: "a", Type: "implement", State: state, Payload: cockpitTestJobPayload(t, payload)}); err != nil {
+			t.Fatalf("CreateJob %s: %v", id, err)
+		}
+	}
+	mustCreate("root-b", string(workflow.JobSucceeded), workflow.JobPayload{})
+	mustCreate("child-blocked", string(workflow.JobBlocked), workflow.JobPayload{RootJobID: "root-b"})
+
+	if done, err := worker.rootTreeTerminal(ctx, "root-b"); err != nil || done {
+		t.Fatalf("rootTreeTerminal with a blocked child = (%v, %v), want (false, nil) — blocked is not terminal for the cockpit", done, err)
+	}
+}
+
 // TestFinalizeCockpitRootIfDoneJobMode is the bug-2 daemon case: in JOB mode the
 // per-Deliver teardown deletes the pane rows, so at root-terminal no pane rows
 // remain — but the per-root workspace (recorded in cockpit_workspaces) must still
@@ -516,21 +539,24 @@ func TestFinalizeCockpitRootIfDoneJobMode(t *testing.T) {
 	worker.finalizeCockpitRootIfDone(cp, db.Job{ID: "root-job"}, workflow.JobPayload{}, "root-job")
 }
 
+// TestCockpitJobStateTerminal pins the cockpit's terminal predicate, now sourced
+// from workflow.IsFinalJobState (#632): root-tree finalization uses FINAL
+// (resumability) semantics, so blocked is NOT terminal.
 func TestCockpitJobStateTerminal(t *testing.T) {
 	terminal := []string{
 		string(workflow.JobSucceeded), string(workflow.JobFailed),
 		string(workflow.JobCancelled),
 	}
 	for _, s := range terminal {
-		if !cockpitJobStateTerminal(s) {
-			t.Errorf("cockpitJobStateTerminal(%q) = false, want true", s)
+		if !workflow.IsFinalJobState(s) {
+			t.Errorf("IsFinalJobState(%q) = false, want true", s)
 		}
 	}
-	// JobBlocked is NOT terminal: a blocked job can resume, so finalizing the root
+	// JobBlocked is NOT final: a blocked job can resume, so finalizing the root
 	// (closing panes + removing seat logs) while blocked would be premature.
 	for _, s := range []string{string(workflow.JobQueued), string(workflow.JobRunning), string(workflow.JobBlocked), "", "weird"} {
-		if cockpitJobStateTerminal(s) {
-			t.Errorf("cockpitJobStateTerminal(%q) = true, want false", s)
+		if workflow.IsFinalJobState(s) {
+			t.Errorf("IsFinalJobState(%q) = true, want false", s)
 		}
 	}
 }

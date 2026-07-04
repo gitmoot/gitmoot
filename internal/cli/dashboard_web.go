@@ -1409,7 +1409,9 @@ func buildDashboardNode(job db.Job, payload workflow.JobPayload, events []db.Job
 	if t := parseJobTimeMillis(job.CreatedAt); t > 0 {
 		node.StartedAt = t
 	}
-	if t := parseJobTimeMillis(job.UpdatedAt); t > 0 && isTerminalJobState(job.State) {
+	// EndedAt uses FINAL (resumability) semantics: a blocked job is deliberately
+	// NOT stamped with an end time because it can resume via RetryJob (#632).
+	if t := parseJobTimeMillis(job.UpdatedAt); t > 0 && workflow.IsFinalJobState(strings.TrimSpace(job.State)) {
 		node.EndedAt = t
 	}
 	// Event.T is epoch millis from the event's created_at when the row carries
@@ -1512,7 +1514,10 @@ func summarizeRuns(jobs []db.Job) []dashboard.RunSummary {
 		if j.DelegationDepth > a.maxDepth {
 			a.maxDepth = j.DelegationDepth
 		}
-		if isTerminalJobState(j.State) {
+		// A run's "done" count uses FINAL (resumability) semantics: a blocked job is
+		// not counted as done because it can still resume via RetryJob (#632),
+		// keeping the run active — mirroring runStateActive and the cockpit.
+		if workflow.IsFinalJobState(strings.TrimSpace(j.State)) {
 			a.done++
 		}
 		if j.ID == root {
@@ -1586,12 +1591,10 @@ const maxRunSummaries = 60
 // settled terminal state), so active runs can be surfaced ahead of finished
 // ones in the run list.
 func runStateActive(state dashboard.NodeState) bool {
-	switch string(state) {
-	case "succeeded", "failed", "cancelled":
-		return false
-	default:
-		return true
-	}
+	// Active is the negation of FINAL (resumability) semantics: a blocked run is
+	// still "active" because it can resume via RetryJob (#632). Uses IsFinalJobState
+	// (not IsSettledJobState) so blocked surfaces as live, matching the cockpit.
+	return !workflow.IsFinalJobState(string(state))
 }
 
 // mostRecentRunRoot returns the run root to show when no run is requested: the
@@ -1712,16 +1715,6 @@ func mapNodeState(state string) dashboard.NodeState {
 		return "queued"
 	default:
 		return dashboard.NodeState(strings.TrimSpace(state))
-	}
-}
-
-// isTerminalJobState reports whether a job has settled (used to stamp EndedAt).
-func isTerminalJobState(state string) bool {
-	switch strings.TrimSpace(state) {
-	case "succeeded", "failed", "cancelled":
-		return true
-	default:
-		return false
 	}
 }
 

@@ -5276,7 +5276,13 @@ func (w jobWorker) rootTreeTerminal(ctx context.Context, rootJobID string) (bool
 		if !inTree {
 			continue
 		}
-		if !cockpitJobStateTerminal(j.State) {
+		// Root-tree finalization uses FINAL (resumability) semantics, NOT settled:
+		// a blocked job is deliberately non-final (it can resume via RetryJob), so
+		// the tree is not terminal while any in-tree job is blocked. Finalizing then
+		// would tear down a pane + seat log the job still needs. The engine's
+		// graceful-finalize continuation provides the real terminal signal for a
+		// stuck tree. See #632 (IsFinalJobState vs IsSettledJobState).
+		if !workflow.IsFinalJobState(j.State) {
 			return false, nil
 		}
 	}
@@ -5309,23 +5315,6 @@ func (w jobWorker) isReconveneContinuation(ctx context.Context, job db.Job, payl
 		return false
 	}
 	return true
-}
-
-// cockpitJobStateTerminal reports whether a job state is terminal for the purpose
-// of root-tree finalization: nothing more will run for it.
-func cockpitJobStateTerminal(state string) bool {
-	switch state {
-	case string(workflow.JobSucceeded), string(workflow.JobFailed),
-		string(workflow.JobCancelled):
-		return true
-	default:
-		// JobBlocked is deliberately NOT terminal: a blocked job (e.g. awaiting a
-		// permission/approval or interactive answer) can resume, and finalizing the
-		// root then would tear down a pane + seat log the job still needs. The
-		// engine's graceful-finalize continuation provides the real terminal signal
-		// for a stuck tree.
-		return false
-	}
 }
 
 // maybeWrapCockpit decides whether a job's delivery is wrapped in a herdr pane.

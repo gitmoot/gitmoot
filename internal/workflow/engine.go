@@ -2821,7 +2821,7 @@ func (e Engine) advanceDelegations(ctx context.Context, parentJob db.Job, parent
 	retried := false
 	for _, d := range parentResult.Delegations {
 		child, ok := children[d.ID]
-		if !ok || !isTerminalJobState(child.State) || child.State == string(JobSucceeded) {
+		if !ok || !IsSettledJobState(child.State) || child.State == string(JobSucceeded) {
 			continue
 		}
 		// #419: a retried dependent must not run blind to its upstream deps. The
@@ -2870,7 +2870,7 @@ func (e Engine) advanceDelegations(ctx context.Context, parentJob db.Job, parent
 	escalate := false
 	for _, d := range parentResult.Delegations {
 		child, ok := children[d.ID]
-		if !ok || !isTerminalJobState(child.State) || child.State == string(JobSucceeded) {
+		if !ok || !IsSettledJobState(child.State) || child.State == string(JobSucceeded) {
 			continue
 		}
 		switch delegationFailurePolicy(d) {
@@ -3495,13 +3495,13 @@ func allDelegationsResolved(delegations []Delegation, children map[string]db.Job
 
 func delegationResolved(d Delegation, children map[string]db.Job, byID map[string]Delegation, dedupWinners map[string]db.Job) bool {
 	if child, ok := children[d.ID]; ok {
-		return isTerminalJobState(child.State)
+		return IsSettledJobState(child.State)
 	}
 	// A fingerprint-deduped delegation never gets its own child; it is resolved
 	// when its winning sibling (the same-fingerprint delegation that did get a
 	// child) reaches a terminal state, so it cannot stall the continuation.
 	if winner, ok := dedupWinners[d.ID]; ok {
-		return isTerminalJobState(winner.State)
+		return IsSettledJobState(winner.State)
 	}
 	// No child job yet: the delegation is resolved only if it can never run
 	// because one of its dependencies is permanently unrunnable.
@@ -3522,13 +3522,13 @@ func delegationPermanentlyBlocked(d Delegation, children map[string]db.Job, byID
 	defer delete(visiting, d.ID)
 	for _, dep := range compactStrings(d.Deps) {
 		if winner, ok := dedupWinners[dep]; ok {
-			if isTerminalJobState(winner.State) && winner.State != string(JobSucceeded) {
+			if IsSettledJobState(winner.State) && winner.State != string(JobSucceeded) {
 				return true
 			}
 			continue
 		}
 		if child, ok := children[dep]; ok {
-			if isTerminalJobState(child.State) && child.State != string(JobSucceeded) {
+			if IsSettledJobState(child.State) && child.State != string(JobSucceeded) {
 				return true
 			}
 			continue
@@ -3551,15 +3551,6 @@ func delegationsByID(delegations []Delegation) map[string]Delegation {
 		byID[d.ID] = d
 	}
 	return byID
-}
-
-func isTerminalJobState(state string) bool {
-	switch state {
-	case string(JobSucceeded), string(JobFailed), string(JobBlocked), string(JobCancelled):
-		return true
-	default:
-		return false
-	}
 }
 
 func delegationFailurePolicy(d Delegation) string {
@@ -3609,7 +3600,7 @@ func (e Engine) delegationRetryPending(ctx context.Context, parentJobID, delegat
 	if !ok {
 		return false, nil
 	}
-	return !isTerminalJobState(child.State), nil
+	return !IsSettledJobState(child.State), nil
 }
 
 func childFailureReason(child db.Job) string {

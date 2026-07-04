@@ -321,7 +321,7 @@ func runJobWatch(args []string, stdout, stderr io.Writer) int {
 					nextEvent++
 				}
 			}
-			if jobStateIsTerminal(job.State) {
+			if workflow.IsSettledJobState(job.State) {
 				output = jobWatchOutput{Job: job, Events: events}
 				return nil
 			}
@@ -713,15 +713,6 @@ func parseSingleJobIDExitCode(args []string) int {
 		return 0
 	}
 	return 2
-}
-
-func jobStateIsTerminal(state string) bool {
-	switch state {
-	case string(workflow.JobSucceeded), string(workflow.JobFailed), string(workflow.JobBlocked), string(workflow.JobCancelled):
-		return true
-	default:
-		return false
-	}
 }
 
 func filterJobs(jobs []db.Job, repoFilter string, stateFilter string) []db.Job {
