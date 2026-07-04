@@ -50,6 +50,8 @@ github.com/jerryfane/gitmoot-dashboard v0.0.0-20260703234049-cf7bc058fcd2 h1:pI8
 github.com/jerryfane/gitmoot-dashboard v0.0.0-20260703234049-cf7bc058fcd2/go.mod h1:ER6dhQXboKZYEaNaw8TwvHpN1aJdo2bIAeasMnZksHg=
 github.com/jerryfane/gitmoot-dashboard v0.0.0-20260704002226-35fdadaa94d4 h1:l5XQiBqGSejug+QxdtahCrN5/f9a7GqQog3UA8soPig=
 github.com/jerryfane/gitmoot-dashboard v0.0.0-20260704002226-35fdadaa94d4/go.mod h1:ER6dhQXboKZYEaNaw8TwvHpN1aJdo2bIAeasMnZksHg=
+github.com/jerryfane/gitmoot-dashboard v0.0.0-20260704122215-8e8c88f3dead h1:0RpQOKKiUSdTanfMW+HGLOQawDdMWjBT2Lxa6T6SRnY=
+github.com/jerryfane/gitmoot-dashboard v0.0.0-20260704122215-8e8c88f3dead/go.mod h1:ER6dhQXboKZYEaNaw8TwvHpN1aJdo2bIAeasMnZksHg=
 github.com/lucasb-eyer/go-colorful v1.3.0 h1:2/yBRLdWBZKrf7gB40FoiKfAWYQ0lqNcbuQwVHXptag=
 github.com/lucasb-eyer/go-colorful v1.3.0/go.mod h1:R4dSotOR9KMtayYi1e77YzuveK+i7ruzyGqttikkLy0=
 github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWEY=

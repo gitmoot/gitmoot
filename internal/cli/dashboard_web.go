@@ -3,22 +3,27 @@ package cli
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode"
 
 	dashboard "github.com/jerryfane/gitmoot-dashboard"
 
+	"github.com/jerryfane/gitmoot/internal/buildinfo"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/update"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
@@ -69,6 +74,26 @@ func runDashboardWeb(home, addr string, stdout, stderr io.Writer) int {
 // touches workflow state.
 type webDataSource struct {
 	home string
+
+	// mu guards the Health() caches below (Health can be called concurrently and
+	// its resolvers run in goroutines). Everything else on the source is stateless
+	// per call, so only the caches need protection.
+	mu sync.Mutex
+	// daemonVersionKey/daemonVersion cache the running daemon binary's reported
+	// version, keyed by (executable path, file mtime) so SEQUENTIAL 12s health
+	// polls never re-exec an unchanged binary (there is no singleflight, so
+	// concurrent cold requests may each exec once). An empty daemonVersion is a
+	// valid (negative) cache entry — resolution is fail-open.
+	daemonVersionKey string
+	daemonVersion    string
+	// updateResult/updateFetchedAt/updateOK cache the daemon-binary update check.
+	// updateResult is the last SUCCESSFUL HealthUpdate (nil when the check yielded
+	// no usable data); it is retained across failures so a stale-but-good result is
+	// served while a refresh fails. A success is honored for updateSuccessTTL, a
+	// failure re-tried after updateFailureTTL.
+	updateResult    *dashboard.HealthUpdate
+	updateFetchedAt time.Time
+	updateOK        bool
 }
 
 var _ dashboard.DataSource = (*webDataSource)(nil)
@@ -283,39 +308,13 @@ func (d *webDataSource) Agents(ctx context.Context) ([]dashboard.AgentSummary, e
 			return err
 		}
 
-		// Aggregate per-agent job stats from the single ListJobs pass. Ephemeral
-		// workers (name carries the "-ephemeral-" infix) fold into one rollup.
-		byAgent := map[string]*agentJobStat{}
-		var ephemeral agentJobStat
-		hasEphemeral := false
-		for _, j := range jobs {
-			name := strings.TrimSpace(j.Agent)
-			var s *agentJobStat
-			if strings.Contains(name, "-ephemeral-") {
-				s = &ephemeral
-				hasEphemeral = true
-			} else {
-				s = byAgent[name]
-				if s == nil {
-					s = &agentJobStat{}
-					byAgent[name] = s
-				}
-			}
-			s.observe(j)
-		}
+		// Aggregate per-agent job stats from the single ListJobs pass (shared with
+		// Agent()). Ephemeral workers fold into one rollup.
+		byAgent, ephemeral, hasEphemeral := aggregateAgentJobStats(jobs)
 
 		out = make([]dashboard.AgentSummary, 0, len(agents)+1)
 		for _, a := range agents {
-			summary := dashboard.AgentSummary{
-				Name:           a.Name,
-				Role:           strings.TrimSpace(a.Role),
-				Runtime:        strings.TrimSpace(a.Runtime),
-				RepoScope:      splitRepoScope(a.RepoScope),
-				Model:          strings.TrimSpace(a.Model),
-				Capabilities:   a.Capabilities,
-				AutonomyPolicy: strings.TrimSpace(a.AutonomyPolicy),
-				Health:         strings.TrimSpace(a.HealthStatus),
-			}
+			summary := newAgentSummary(a)
 			if s := byAgent[a.Name]; s != nil {
 				s.applyTo(&summary)
 			}
@@ -338,6 +337,149 @@ func (d *webDataSource) Agents(ctx context.Context) ([]dashboard.AgentSummary, e
 		return nil
 	})
 	return out, err
+}
+
+// Agent returns the click-through detail for a single agent by name: the same
+// AgentSummary Agents() builds for that one row, plus its template (nil when the
+// agent has no template or the template lookup fails — fail-open, never an error)
+// and the template's version history newest-first. An unknown name maps to the
+// dashboard's not-found sentinel (mirroring how Job() maps an unknown job id), so
+// the API layer returns 404 rather than 500.
+func (d *webDataSource) Agent(ctx context.Context, name string) (dashboard.AgentDetail, error) {
+	detail := dashboard.AgentDetail{Versions: []dashboard.TemplateVersionInfo{}}
+	err := withStore(d.home, func(store *db.Store) error {
+		agent, err := store.GetAgent(ctx, name)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return dashboard.ErrAgentNotFound
+			}
+			return err
+		}
+		jobs, err := store.ListJobs(ctx)
+		if err != nil {
+			return err
+		}
+
+		// Build the summary exactly as Agents() does for one row: identity from the
+		// registered agent, tallies from the shared per-agent aggregation.
+		summary := newAgentSummary(agent)
+		byAgent, _, _ := aggregateAgentJobStats(jobs)
+		if s := byAgent[agent.Name]; s != nil {
+			s.applyTo(&summary)
+		}
+		detail.AgentSummary = summary
+
+		// Template + version history. Fail-open: a missing/broken template leaves the
+		// detail's Template nil and Versions the initialized empty slice rather than
+		// erroring the endpoint.
+		if tid := strings.TrimSpace(agent.TemplateID); tid != "" {
+			if tmpl, terr := store.GetAgentTemplate(ctx, tid); terr == nil {
+				detail.Template = agentTemplateInfo(tmpl)
+				if versions := agentTemplateVersions(ctx, store, tmpl); versions != nil {
+					detail.Versions = versions
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return dashboard.AgentDetail{}, err
+	}
+	return detail, nil
+}
+
+// newAgentSummary builds the identity portion of an AgentSummary (everything but
+// the job tallies) from a registered agent row. Shared by Agents() and Agent()
+// so the two views map the same fields identically.
+func newAgentSummary(a db.Agent) dashboard.AgentSummary {
+	return dashboard.AgentSummary{
+		Name:           a.Name,
+		Role:           strings.TrimSpace(a.Role),
+		Runtime:        strings.TrimSpace(a.Runtime),
+		RepoScope:      splitRepoScope(a.RepoScope),
+		Model:          strings.TrimSpace(a.Model),
+		Capabilities:   a.Capabilities,
+		AutonomyPolicy: strings.TrimSpace(a.AutonomyPolicy),
+		Health:         strings.TrimSpace(a.HealthStatus),
+	}
+}
+
+// aggregateAgentJobStats folds a job slice into per-registered-agent tallies plus
+// one rollup for the fleet of ephemeral workers (names carrying the "-ephemeral-"
+// infix). It is the single aggregation both Agents() (which walks byAgent for
+// every registered row and appends the ephemeral rollup) and Agent() (which picks
+// one byAgent entry) share, so their counts can never diverge.
+func aggregateAgentJobStats(jobs []db.Job) (byAgent map[string]*agentJobStat, ephemeral agentJobStat, hasEphemeral bool) {
+	byAgent = map[string]*agentJobStat{}
+	for _, j := range jobs {
+		name := strings.TrimSpace(j.Agent)
+		var s *agentJobStat
+		if strings.Contains(name, "-ephemeral-") {
+			s = &ephemeral
+			hasEphemeral = true
+		} else {
+			s = byAgent[name]
+			if s == nil {
+				s = &agentJobStat{}
+				byAgent[name] = s
+			}
+		}
+		s.observe(j)
+	}
+	return byAgent, ephemeral, hasEphemeral
+}
+
+// agentTemplateInfo maps the store's AgentTemplate onto the dashboard's
+// AgentTemplateInfo (identity + source/resolved provenance).
+func agentTemplateInfo(tmpl db.AgentTemplate) *dashboard.AgentTemplateInfo {
+	return &dashboard.AgentTemplateInfo{
+		ID:             tmpl.ID,
+		Name:           strings.TrimSpace(tmpl.Name),
+		Description:    strings.TrimSpace(tmpl.Description),
+		SourceRepo:     strings.TrimSpace(tmpl.SourceRepo),
+		SourceRef:      strings.TrimSpace(tmpl.SourceRef),
+		SourcePath:     strings.TrimSpace(tmpl.SourcePath),
+		ResolvedCommit: strings.TrimSpace(tmpl.ResolvedCommit),
+	}
+}
+
+// agentTemplateVersions lists a template's version history newest-first (version
+// number descending, id tie-break) and marks the version the template currently
+// resolves to. Current is keyed on the template's current_version_id
+// (tmpl.VersionID from GetAgentTemplate) — the version an agent pinned to the
+// default "current" ref actually runs — NOT the latest_version_id, which only
+// applies to an explicit "@latest" ref and can point at an unpromoted candidate.
+// Timestamps go through parseJobTimeMillis (epoch ms, 0 when unknown). Returns nil
+// on a lookup error so the caller can keep the detail's Versions empty (fail-open).
+func agentTemplateVersions(ctx context.Context, store *db.Store, tmpl db.AgentTemplate) []dashboard.TemplateVersionInfo {
+	rows, err := store.ListAgentTemplateVersions(ctx, tmpl.ID)
+	if err != nil {
+		return nil
+	}
+	currentID := strings.TrimSpace(tmpl.VersionID)
+	out := make([]dashboard.TemplateVersionInfo, 0, len(rows))
+	for _, v := range rows {
+		out = append(out, dashboard.TemplateVersionInfo{
+			ID:             v.ID,
+			Number:         v.VersionNumber,
+			State:          strings.TrimSpace(v.State),
+			Name:           strings.TrimSpace(v.Name),
+			Description:    strings.TrimSpace(v.Description),
+			SourceRef:      strings.TrimSpace(v.SourceRef),
+			ResolvedCommit: strings.TrimSpace(v.ResolvedCommit),
+			CreatedAt:      parseJobTimeMillis(v.CreatedAt),
+			PromotedAt:     parseJobTimeMillis(v.PromotedAt),
+			CanarySample:   v.CanarySample,
+			Current:        currentID != "" && v.ID == currentID,
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Number != out[j].Number {
+			return out[i].Number > out[j].Number
+		}
+		return out[i].ID > out[j].ID
+	})
+	return out
 }
 
 // agentJobStat accumulates one agent's job tallies across the ListJobs pass:
@@ -805,15 +947,39 @@ func (d *webDataSource) Health(ctx context.Context) (dashboard.Health, error) {
 
 	// Daemon liveness — same readers buildDashboardSnapshot uses. StartedAt comes
 	// off the running daemon's persisted meta (RFC3339 -> epoch ms); a stopped
-	// daemon reports 0.
+	// daemon reports 0. The persisted meta also carries the daemon binary's path,
+	// which the version probe execs.
 	state := daemonProcessState(paths)
+	var executable string
 	if pid, _, perr := currentDaemonPID(state); perr == nil && pid > 0 {
 		out.Daemon.Running = true
 		out.Daemon.PID = pid
 		if meta, merr := readDaemonMeta(state); merr == nil {
 			out.Daemon.StartedAt = parseJobTimeMillis(meta.StartedAt)
+			executable = strings.TrimSpace(meta.Executable)
 		}
 	}
+
+	// The daemon-version probe (execs the binary) and the update check (hits
+	// GitHub) are the only slow parts of Health. Run them CONCURRENTLY — and with
+	// the local store read — so a cold cache never serially stacks their 3s + 4s
+	// timeouts past the health endpoint's latency budget. Both fail-open: a
+	// resolution error leaves the field empty/nil, never an error. The update
+	// check compares buildinfo.Current() (the exact documented shape); its
+	// displayed Current is overridden with the running daemon's version below,
+	// since that is the binary the operator actually runs.
+	var probes sync.WaitGroup
+	var daemonVersion string
+	var updateInfo *dashboard.HealthUpdate
+	probes.Add(2)
+	go func() {
+		defer probes.Done()
+		daemonVersion = d.resolveDaemonVersion(ctx, executable)
+	}()
+	go func() {
+		defer probes.Done()
+		updateInfo = d.checkUpdate(ctx, executable)
+	}()
 
 	err = withStore(d.home, func(store *db.Store) error {
 		jobs, err := store.ListJobs(ctx)
@@ -952,7 +1118,188 @@ func (d *webDataSource) Health(ctx context.Context) (dashboard.Health, error) {
 		out.ResourceLocks = rlocks
 		return nil
 	})
+
+	// Join the concurrent probes. Prefer the running daemon's version for the
+	// update check's displayed Current (that is what the operator runs); fall back
+	// to the check's own current (buildinfo.Current().Version) when the daemon
+	// version is unavailable.
+	probes.Wait()
+	out.Daemon.Version = daemonVersion
+	out.Update = updateInfo
+	if out.Update != nil && daemonVersion != "" {
+		// The update check ran against this dashboard-web process's OWN compiled
+		// version, but the operator runs the daemon binary — so make both the
+		// displayed Current AND the availability verdict daemon-relative,
+		// otherwise a divergent-binary deployment reports the wrong badge.
+		out.Update.Current = daemonVersion
+		out.Update.UpdateAvailable = out.Update.Latest != "" && !sameDaemonVersion(daemonVersion, out.Update.Latest)
+	}
 	return out, err
+}
+
+// daemonVersionTimeout and updateCheckTimeout bound the two slow Health probes.
+// They run concurrently, so the health endpoint's cold-cache wall-clock is the
+// max of the two (< 5s), never their sum.
+const (
+	daemonVersionTimeout = 3 * time.Second
+	updateCheckTimeout   = 4 * time.Second
+	// updateSuccessTTL/updateFailureTTL age the cached update check: a good result
+	// is trusted for an hour; a failed refresh is retried after ten minutes (the
+	// last good result is served meanwhile).
+	updateSuccessTTL = time.Hour
+	updateFailureTTL = 10 * time.Minute
+)
+
+// resolveDaemonVersion returns the running daemon binary's reported version, or
+// "" when it cannot be determined (fail-open). It execs "<executable> version
+// --json" (preferred) or the plain-text form, under a hard timeout, and caches
+// the result keyed by the executable's path+mtime so SEQUENTIAL 12s health polls
+// never re-exec an unchanged binary (there is no singleflight, so concurrent cold
+// requests may each exec once). Only a regular, executable, existing file is ever
+// run.
+func (d *webDataSource) resolveDaemonVersion(ctx context.Context, executable string) string {
+	executable = strings.TrimSpace(executable)
+	if executable == "" {
+		return ""
+	}
+	info, err := os.Stat(executable)
+	if err != nil || info.IsDir() || info.Mode().Perm()&0o111 == 0 {
+		return ""
+	}
+	key := fmt.Sprintf("%s\x00%d", executable, info.ModTime().UnixNano())
+
+	d.mu.Lock()
+	if d.daemonVersionKey == key {
+		v := d.daemonVersion
+		d.mu.Unlock()
+		return v
+	}
+	d.mu.Unlock()
+
+	version := execDaemonVersion(ctx, executable)
+
+	d.mu.Lock()
+	d.daemonVersionKey = key
+	d.daemonVersion = version
+	d.mu.Unlock()
+	return version
+}
+
+// execDaemonVersion runs the binary's version subcommand with a hard timeout and
+// returns the reported version. It prefers the JSON form ("version --json" ->
+// {"version": "..."}); on any failure it falls back to the plain-text form
+// ("version" -> "gitmoot <ver>", from which the "gitmoot" prefix is trimmed).
+// Returns "" on any error (fail-open).
+func execDaemonVersion(ctx context.Context, executable string) string {
+	// Both attempts share ONE budget so the whole probe is bounded by
+	// daemonVersionTimeout, never 2× it (a wedged binary must not stack).
+	ctx, cancel := context.WithTimeout(ctx, daemonVersionTimeout)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, executable, "version", "--json").Output(); err == nil {
+		var parsed struct {
+			Version string `json:"version"`
+		}
+		if json.Unmarshal(out, &parsed) == nil {
+			if v := strings.TrimSpace(parsed.Version); v != "" {
+				return v
+			}
+		}
+	}
+	out, err := exec.CommandContext(ctx, executable, "version").Output()
+	if err != nil {
+		return ""
+	}
+	line := strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
+	return strings.TrimSpace(strings.TrimPrefix(line, "gitmoot"))
+}
+
+// updateCheckFn is the seam the Health update check goes through so tests can
+// stub the GitHub release lookup without a network. It defaults to update.Check
+// against the default repo.
+var updateCheckFn = func(ctx context.Context, current buildinfo.Info, executable string) (update.CheckResult, error) {
+	return update.Check(ctx, update.GhReleaseClient{}, update.DefaultRepo, current, "", "", executable)
+}
+
+// checkUpdate returns the daemon-binary update check for the Health page, served
+// from a TTL cache (updateSuccessTTL on success, updateFailureTTL on failure) so
+// SEQUENTIAL 12s polls never re-hit GitHub (there is no singleflight, so
+// concurrent cold requests may each fetch once) and a fresh success is reused for
+// an hour.
+// It is fail-open and never blocks past updateCheckTimeout: on a failed refresh
+// it serves the last good result (nil if there was none), and a "no release"
+// answer is cached as a definite nil (no data). The returned pointer is always a
+// fresh copy — the internal cached value is never handed out — so callers may
+// mutate it (e.g. to override Current) safely.
+func (d *webDataSource) checkUpdate(ctx context.Context, executable string) *dashboard.HealthUpdate {
+	d.mu.Lock()
+	ttl := updateFailureTTL
+	if d.updateOK {
+		ttl = updateSuccessTTL
+	}
+	if !d.updateFetchedAt.IsZero() && time.Since(d.updateFetchedAt) < ttl {
+		cached := cloneUpdate(d.updateResult)
+		d.mu.Unlock()
+		return cached
+	}
+	d.mu.Unlock()
+
+	checkCtx, cancel := context.WithTimeout(ctx, updateCheckTimeout)
+	defer cancel()
+	res, err := updateCheckFn(checkCtx, buildinfo.Current(), executable)
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.updateFetchedAt = time.Now()
+	if err != nil {
+		// Fail-open: keep the last good result and re-try after updateFailureTTL.
+		d.updateOK = false
+		return cloneUpdate(d.updateResult)
+	}
+	d.updateOK = true
+	d.updateResult = buildHealthUpdate(res, d.updateFetchedAt)
+	return cloneUpdate(d.updateResult)
+}
+
+// sameDaemonVersion reports whether two version strings denote the same release,
+// ignoring a leading "v" and surrounding whitespace; both must be non-empty (an
+// unknown version never counts as "same"). It mirrors update.sameVersion (which
+// is unexported) so Health can make the update verdict daemon-relative.
+func sameDaemonVersion(a, b string) bool {
+	a = strings.TrimPrefix(strings.TrimSpace(a), "v")
+	b = strings.TrimPrefix(strings.TrimSpace(b), "v")
+	return a != "" && b != "" && a == b
+}
+
+// buildHealthUpdate maps a settled update-check result onto the HealthUpdate
+// contract, or nil when there is no usable data ("no release" / no latest tag) so
+// the field is omitted entirely. UpdateAvailable is true only when a real newer
+// release exists (!UpToDate, with a latest tag). Current defaults to the check's
+// current version; the caller overrides it with the daemon's version.
+func buildHealthUpdate(res update.CheckResult, at time.Time) *dashboard.HealthUpdate {
+	if res.NoRelease {
+		return nil
+	}
+	latest := strings.TrimSpace(res.LatestVersion)
+	if latest == "" {
+		return nil
+	}
+	return &dashboard.HealthUpdate{
+		Current:         strings.TrimSpace(res.CurrentVersion),
+		Latest:          latest,
+		ReleaseURL:      strings.TrimSpace(res.ReleaseURL),
+		UpdateAvailable: !res.UpToDate,
+		CheckedAt:       at.UnixMilli(),
+	}
+}
+
+// cloneUpdate returns a shallow copy of a HealthUpdate (or nil), so the cached
+// value is never aliased into a response the caller may mutate.
+func cloneUpdate(u *dashboard.HealthUpdate) *dashboard.HealthUpdate {
+	if u == nil {
+		return nil
+	}
+	cp := *u
+	return &cp
 }
 
 // healthStuckSince reports whether a job is wedged for the Health page and its

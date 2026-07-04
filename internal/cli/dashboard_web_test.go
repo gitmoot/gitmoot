@@ -7,14 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	dashboard "github.com/jerryfane/gitmoot-dashboard"
 
+	"github.com/jerryfane/gitmoot/internal/buildinfo"
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/update"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
@@ -1133,5 +1136,337 @@ func TestWebDataSourceHealthDaemonRunning(t *testing.T) {
 	}
 	if h.Daemon.StartedAt <= 0 {
 		t.Fatalf("daemon StartedAt = %d, want > 0 (from daemon.json meta)", h.Daemon.StartedAt)
+	}
+}
+
+// seedTemplatedAgent registers an agent bound to a template that has a current
+// v1 plus a newer pending v2 (so version ordering and the Current marker are both
+// exercised), and gives the agent two jobs. It returns the current v1 version id
+// and the pending v2 version id.
+func seedTemplatedAgent(t *testing.T, home string) (v1ID, v2ID string) {
+	t.Helper()
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	base := db.AgentTemplate{
+		ID: "planner", Name: "Planner Template", Description: "plans the work",
+		SourceRepo: "jerryfane/noted", SourceRef: "main", SourcePath: "agents/planner.md",
+		ResolvedCommit: "aaaaaaaaaaaa", Content: "v1 content",
+	}
+	if err := store.UpsertAgentTemplate(ctx, base); err != nil {
+		t.Fatalf("UpsertAgentTemplate: %v", err)
+	}
+	// current_version_id (what the template resolves to) is v1 at this point.
+	tmpl, err := store.GetAgentTemplate(ctx, "planner")
+	if err != nil {
+		t.Fatalf("GetAgentTemplate: %v", err)
+	}
+	v1ID = tmpl.VersionID
+
+	v2 := base
+	v2.Content = "v2 content"
+	v2.ResolvedCommit = "bbbbbbbbbbbb"
+	v2.SourceRef = "candidate"
+	pending, err := store.AddPendingAgentTemplateVersion(ctx, v2)
+	if err != nil {
+		t.Fatalf("AddPendingAgentTemplateVersion: %v", err)
+	}
+	v2ID = pending.ID
+
+	if err := store.UpsertAgent(ctx, db.Agent{Name: "planner-agent", Runtime: "codex", TemplateID: "planner"}); err != nil {
+		t.Fatalf("UpsertAgent planner-agent: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{Name: "plain-agent", Runtime: "claude"}); err != nil {
+		t.Fatalf("UpsertAgent plain-agent: %v", err)
+	}
+	// A registered agent pointing at a template that does not exist -> fail-open.
+	if err := store.UpsertAgent(ctx, db.Agent{Name: "ghost-agent", Runtime: "codex", TemplateID: "no-such-template"}); err != nil {
+		t.Fatalf("UpsertAgent ghost-agent: %v", err)
+	}
+
+	mustCreateJob(t, store, db.Job{ID: "pa1", Agent: "planner-agent", Type: "orchestrate", State: "succeeded", Payload: mustJSON(t, workflow.JobPayload{})}, "", "")
+	mustCreateJob(t, store, db.Job{ID: "pa2", Agent: "planner-agent", Type: "orchestrate", State: "running", Payload: mustJSON(t, workflow.JobPayload{})}, "", "")
+	return v1ID, v2ID
+}
+
+// TestWebDataSourceAgentDetail asserts Agent() builds the same summary as Agents()
+// for one row, maps the template, and returns the version history newest-first
+// with Current marking the version the template currently resolves to
+// (current_version_id = v1), not the newer pending candidate (v2).
+func TestWebDataSourceAgentDetail(t *testing.T) {
+	home := dashboardTestHome(t)
+	v1ID, v2ID := seedTemplatedAgent(t, home)
+
+	ds := &webDataSource{home: home}
+	detail, err := ds.Agent(context.Background(), "planner-agent")
+	if err != nil {
+		t.Fatalf("Agent: %v", err)
+	}
+
+	// Summary: identity + job tallies (same as Agents()).
+	if detail.Name != "planner-agent" || detail.Runtime != "codex" {
+		t.Fatalf("summary identity = %+v", detail.AgentSummary)
+	}
+	if detail.JobCount != 2 || detail.RunningCount != 1 || detail.SucceededCount != 1 {
+		t.Fatalf("summary counts = job%d run%d ok%d, want 2/1/1", detail.JobCount, detail.RunningCount, detail.SucceededCount)
+	}
+
+	// Template mapping.
+	if detail.Template == nil {
+		t.Fatalf("template is nil, want the planner template")
+	}
+	if detail.Template.ID != "planner" || detail.Template.Name != "Planner Template" {
+		t.Fatalf("template identity = %+v", detail.Template)
+	}
+	if detail.Template.SourceRepo != "jerryfane/noted" || detail.Template.SourceRef != "main" ||
+		detail.Template.SourcePath != "agents/planner.md" || detail.Template.ResolvedCommit != "aaaaaaaaaaaa" {
+		t.Fatalf("template source fields = %+v", detail.Template)
+	}
+
+	// Versions newest-first: v2 (pending) before v1 (current). Current marks v1.
+	if len(detail.Versions) != 2 {
+		t.Fatalf("versions = %d, want 2: %+v", len(detail.Versions), detail.Versions)
+	}
+	newest := detail.Versions[0]
+	if newest.ID != v2ID || newest.Number != 2 {
+		t.Fatalf("versions[0] = %+v, want v2 (number 2, id %s)", newest, v2ID)
+	}
+	if newest.State != "pending" {
+		t.Fatalf("versions[0].State = %q, want pending", newest.State)
+	}
+	if newest.Current {
+		t.Fatalf("newest pending v2 must not be marked Current")
+	}
+	oldest := detail.Versions[1]
+	if oldest.ID != v1ID || oldest.Number != 1 {
+		t.Fatalf("versions[1] = %+v, want v1 (number 1, id %s)", oldest, v1ID)
+	}
+	if !oldest.Current {
+		t.Fatalf("current v1 must be marked Current (template resolves to current_version_id)")
+	}
+	if oldest.State != "current" {
+		t.Fatalf("versions[1].State = %q, want current", oldest.State)
+	}
+	if oldest.CreatedAt <= 0 {
+		t.Fatalf("versions[1].CreatedAt = %d, want > 0 (parsed epoch ms)", oldest.CreatedAt)
+	}
+}
+
+// TestWebDataSourceAgentNoTemplate asserts an agent with no template (or a
+// dangling template id) returns a nil Template and a non-nil empty Versions slice
+// rather than erroring the endpoint.
+func TestWebDataSourceAgentNoTemplate(t *testing.T) {
+	home := dashboardTestHome(t)
+	seedTemplatedAgent(t, home)
+	ds := &webDataSource{home: home}
+	ctx := context.Background()
+
+	plain, err := ds.Agent(ctx, "plain-agent")
+	if err != nil {
+		t.Fatalf("Agent(plain-agent): %v", err)
+	}
+	if plain.Template != nil {
+		t.Fatalf("plain-agent template = %+v, want nil", plain.Template)
+	}
+	if plain.Versions == nil || len(plain.Versions) != 0 {
+		t.Fatalf("plain-agent versions = %+v, want non-nil empty", plain.Versions)
+	}
+
+	// A dangling template id must fail open (template absent), not 500.
+	ghost, err := ds.Agent(ctx, "ghost-agent")
+	if err != nil {
+		t.Fatalf("Agent(ghost-agent) errored on a missing template, want fail-open: %v", err)
+	}
+	if ghost.Template != nil || len(ghost.Versions) != 0 {
+		t.Fatalf("ghost-agent detail = %+v, want template nil + empty versions", ghost)
+	}
+}
+
+// TestWebDataSourceAgentUnknown asserts an unknown agent name maps to the
+// not-found sentinel (so the API returns 404, mirroring Job()).
+func TestWebDataSourceAgentUnknown(t *testing.T) {
+	home := dashboardTestHome(t)
+	seedTemplatedAgent(t, home)
+	ds := &webDataSource{home: home}
+	if _, err := ds.Agent(context.Background(), "no-such-agent"); !errors.Is(err, dashboard.ErrAgentNotFound) {
+		t.Fatalf("Agent(unknown) err = %v, want ErrAgentNotFound", err)
+	}
+}
+
+// writeFakeVersionBin writes an executable shell script that appends one byte to
+// counterFile on every run (so exec count is observable) and prints stdoutBody.
+func writeFakeVersionBin(t *testing.T, path, counterFile, stdoutBody string) {
+	t.Helper()
+	script := "#!/bin/sh\nprintf 'x' >> " + counterFile + "\nprintf '%s\\n' '" + stdoutBody + "'\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake bin: %v", err)
+	}
+}
+
+func execCount(t *testing.T, counterFile string) int {
+	t.Helper()
+	data, err := os.ReadFile(counterFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		t.Fatalf("read counter: %v", err)
+	}
+	return len(data)
+}
+
+// TestWebDataSourceDaemonVersionCache asserts resolveDaemonVersion execs the
+// binary's "version --json" once, parses the JSON version, serves subsequent
+// calls from the mtime-keyed cache WITHOUT re-execing, and re-execs after the
+// binary's mtime changes. A missing/non-executable path yields "" (fail-open).
+func TestWebDataSourceDaemonVersionCache(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "gitmoot-fake")
+	counter := filepath.Join(dir, "calls")
+	writeFakeVersionBin(t, bin, counter, `{"version":"v1.2.3"}`)
+
+	ds := &webDataSource{}
+	ctx := context.Background()
+
+	if v := ds.resolveDaemonVersion(ctx, bin); v != "v1.2.3" {
+		t.Fatalf("version = %q, want v1.2.3", v)
+	}
+	if n := execCount(t, counter); n != 1 {
+		t.Fatalf("exec count = %d after first resolve, want 1", n)
+	}
+	// Cache hit: same binary/mtime -> no re-exec.
+	if v := ds.resolveDaemonVersion(ctx, bin); v != "v1.2.3" {
+		t.Fatalf("cached version = %q, want v1.2.3", v)
+	}
+	if n := execCount(t, counter); n != 1 {
+		t.Fatalf("exec count = %d after cache hit, want 1 (must not re-exec)", n)
+	}
+
+	// New content + new mtime -> cache miss -> re-exec, new version.
+	writeFakeVersionBin(t, bin, counter, `{"version":"v4.5.6"}`)
+	future := time.Now().Add(2 * time.Hour)
+	if err := os.Chtimes(bin, future, future); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+	if v := ds.resolveDaemonVersion(ctx, bin); v != "v4.5.6" {
+		t.Fatalf("version after mtime change = %q, want v4.5.6", v)
+	}
+	if n := execCount(t, counter); n != 2 {
+		t.Fatalf("exec count = %d after mtime change, want 2 (must re-exec)", n)
+	}
+
+	// Fail-open on a path that does not exist.
+	if v := ds.resolveDaemonVersion(ctx, filepath.Join(dir, "nope")); v != "" {
+		t.Fatalf("missing binary version = %q, want empty", v)
+	}
+}
+
+// TestWebDataSourceDaemonVersionTextFallback asserts resolveDaemonVersion falls
+// back to the plain-text "gitmoot <ver>" form (trimming the prefix) when the JSON
+// form does not parse.
+func TestWebDataSourceDaemonVersionTextFallback(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "gitmoot-text")
+	counter := filepath.Join(dir, "calls")
+	// Prints non-JSON for every invocation, so "version --json" fails to parse and
+	// the plain-text fallback is used.
+	writeFakeVersionBin(t, bin, counter, `gitmoot v7.8.9`)
+
+	ds := &webDataSource{}
+	if v := ds.resolveDaemonVersion(context.Background(), bin); v != "v7.8.9" {
+		t.Fatalf("text fallback version = %q, want v7.8.9", v)
+	}
+}
+
+// TestWebDataSourceUpdateCheckCache stubs the GitHub release check and asserts the
+// update result is cached (a second call within TTL does not re-invoke the
+// checker), and that a stale cache whose refresh FAILS still serves the last good
+// result (fail-open).
+func TestWebDataSourceUpdateCheckCache(t *testing.T) {
+	orig := updateCheckFn
+	t.Cleanup(func() { updateCheckFn = orig })
+
+	calls := 0
+	updateCheckFn = func(ctx context.Context, current buildinfo.Info, executable string) (update.CheckResult, error) {
+		calls++
+		return update.CheckResult{
+			CurrentVersion: "v1.0.0", LatestVersion: "v2.0.0",
+			ReleaseURL: "https://github.com/jerryfane/gitmoot/releases/tag/v2.0.0", UpToDate: false,
+		}, nil
+	}
+
+	ds := &webDataSource{}
+	ctx := context.Background()
+
+	u := ds.checkUpdate(ctx, "")
+	if u == nil {
+		t.Fatalf("update = nil, want a HealthUpdate")
+	}
+	if !u.UpdateAvailable || u.Latest != "v2.0.0" || u.Current != "v1.0.0" {
+		t.Fatalf("update = %+v, want UpdateAvailable/latest v2.0.0/current v1.0.0", u)
+	}
+	if u.CheckedAt <= 0 {
+		t.Fatalf("update CheckedAt = %d, want > 0", u.CheckedAt)
+	}
+	if calls != 1 {
+		t.Fatalf("checker calls = %d after first checkUpdate, want 1", calls)
+	}
+	// Cache hit within TTL: no re-invoke.
+	if u2 := ds.checkUpdate(ctx, ""); u2 == nil || u2.Latest != "v2.0.0" {
+		t.Fatalf("cached update = %+v, want the same result", u2)
+	}
+	if calls != 1 {
+		t.Fatalf("checker calls = %d after cache hit, want 1 (must not re-check)", calls)
+	}
+	// Returned pointer must be a copy, not the cached value (caller may mutate).
+	u.Current = "mutated"
+	if u3 := ds.checkUpdate(ctx, ""); u3.Current != "v1.0.0" {
+		t.Fatalf("mutating a returned update leaked into the cache: %q", u3.Current)
+	}
+
+	// Force the cache stale, then fail the refresh: the last good result is served.
+	ds.updateFetchedAt = time.Now().Add(-2 * time.Hour)
+	updateCheckFn = func(ctx context.Context, current buildinfo.Info, executable string) (update.CheckResult, error) {
+		calls++
+		return update.CheckResult{}, errors.New("github unreachable")
+	}
+	u4 := ds.checkUpdate(ctx, "")
+	if calls != 2 {
+		t.Fatalf("checker calls = %d, want 2 (stale cache should attempt a refresh)", calls)
+	}
+	if u4 == nil || u4.Latest != "v2.0.0" {
+		t.Fatalf("failed refresh update = %+v, want the last good result served", u4)
+	}
+}
+
+// TestWebDataSourceUpdateCheckColdFailure asserts a failing check with no prior
+// success is fail-open (nil Update, never an error).
+func TestWebDataSourceUpdateCheckColdFailure(t *testing.T) {
+	orig := updateCheckFn
+	t.Cleanup(func() { updateCheckFn = orig })
+	updateCheckFn = func(ctx context.Context, current buildinfo.Info, executable string) (update.CheckResult, error) {
+		return update.CheckResult{}, errors.New("offline")
+	}
+	ds := &webDataSource{}
+	if u := ds.checkUpdate(context.Background(), ""); u != nil {
+		t.Fatalf("cold failure update = %+v, want nil (fail-open)", u)
+	}
+}
+
+// TestWebDataSourceUpdateNoRelease asserts a "no release" answer is treated as no
+// data (nil Update), so the field is omitted rather than reporting a bogus update.
+func TestWebDataSourceUpdateNoRelease(t *testing.T) {
+	orig := updateCheckFn
+	t.Cleanup(func() { updateCheckFn = orig })
+	updateCheckFn = func(ctx context.Context, current buildinfo.Info, executable string) (update.CheckResult, error) {
+		return update.CheckResult{CurrentVersion: "v1.0.0", LatestVersion: "none", NoRelease: true}, nil
+	}
+	ds := &webDataSource{}
+	if u := ds.checkUpdate(context.Background(), ""); u != nil {
+		t.Fatalf("no-release update = %+v, want nil", u)
 	}
 }
