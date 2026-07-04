@@ -17,6 +17,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'concepts/local-first-coordination',
         'concepts/agents-templates-jobs-locks',
+        'concepts/agent-memory',
       ],
     },
     {

@@ -1037,3 +1037,47 @@ unrelated comments safely.
 Ranked GitHub comments can use `item-001 ranking: C > A > D > B` plus trait
 notes. Use the ranked workflow for exploration/refinement and return to A/B
 validation for final promotion decisions on fresh items.
+
+## Agent Memory
+
+Agent persistent memory (#626) gives an enrolled agent a repo-filtered pool of
+durable *facts* ("this repo's arm64 CI is flaky") that Gitmoot injects into the
+job prompt as a reference-only block. It is **off by default** and, in the
+current phase, runs in **observation mode**: the injectable ("confirmed") tier
+is populated only by Gitmoot's own deterministic mechanical facts, while
+agent-returned learnings are logged for measurement but never injected.
+
+Enrollment is per agent, plus optional global knobs:
+
+```toml
+[agents.builder]
+runtime = "codex"
+memory = true          # enroll this agent (default off)
+
+[memory]
+disabled = false       # global kill switch (overrides every enrollment)
+token_budget = 1500    # cap on injected block size (estimated tokens)
+max_entries = 15       # cap on confirmed rows considered for injection
+```
+
+An agent returns durable facts via the optional top-level `learnings` field in
+`gitmoot_result` — each entry is `{key, scope ("repo"|"general"), content}`.
+Most jobs return none. Returned learnings are shadow-logged only (never injected
+in this phase) and pass deterministic pre-filters that reject directive-phrased,
+executable, secret-shaped, or non-repo-agnostic content.
+
+Inspect and measure the store (all read-only):
+
+```sh
+gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo] [--json]
+gitmoot memory replay [--agent NAME] [--repo owner/repo] [--limit N] [--json]
+gitmoot memory eval --fixtures fixtures.json [--k N] [--json]
+```
+
+`memory list` shows confirmed memories and/or pending observations. `memory
+replay` is an offline A/B: it re-renders recent real jobs' prompts with and
+without the learnings block and reports the injection delta (added tokens,
+entries injected) — it measures injection *mechanics*, not outcome quality
+(running real agents twice is a later-phase gate). `memory eval` computes
+recall/precision@K of retrieval over a labeled fixtures file whose cases are
+`{agent, repo, instructions, expected_keys}`.

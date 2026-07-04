@@ -42,6 +42,7 @@ var rootCommands = []command{
 	{name: "interactive", summary: "inspect and answer interactive prompts", run: runInteractive},
 	{name: "dashboard", summary: "show a snapshot of local Gitmoot state", run: runDashboard},
 	{name: "skillopt", summary: "export and import SkillOpt packages", run: runSkillOpt},
+	{name: "memory", summary: "inspect and measure agent persistent memory", run: runMemory},
 }
 
 func Run(args []string, stdout, stderr io.Writer) int {
