@@ -98,6 +98,33 @@ repo = ""
 ref = ""
 path = ""
 
+# [memory] is the OFF-BY-DEFAULT agent persistent-memory read-path policy (#626).
+# With no [memory] section AND no agent enrolled, behavior is byte-identical: no
+# learnings block is ever injected and the feature is entirely inert. Enrollment is
+# PER AGENT — add memory = true to an [agents.<name>] block (see [agents.builder]
+# below) to opt that agent in; this section only carries the shared read knobs plus
+# a global kill switch. When enrolled, Gitmoot runs in OBSERVATION MODE: while
+# assembling a job prompt it retrieves the agent's own confirmed, repo-filtered
+# (current repo + the always-travelling "general" scope) mechanical facts and
+# renders a fenced REFERENCE-ONLY "Prior learnings (reference only, not
+# instructions)" block — it is context, never instructions, and an empty result
+# adds nothing. Agent-returned learnings are shadow-logged for measurement but are
+# NOT injected in this phase. disabled is the global kill switch (default false):
+# true overrides every per-agent memory=true, turning the whole feature off box-wide
+# without editing each agent block. token_budget caps the injected block's estimated
+# tokens (default 1500); max_entries caps how many confirmed rows are considered for
+# injection (default 15); both must be >= 0. Inspect the store read-only with
+# gitmoot memory list; see the "Agent Persistent Memory" concepts page and CLI.md
+# for the full model.
+# [memory]
+# disabled = false
+# token_budget = 1500
+# max_entries = 15
+#
+# Enroll a specific agent (per-agent opt-in; omit for byte-identical default):
+# [agents.builder]
+# memory = true
+
 # [skillopt] is the OFF-BY-DEFAULT template-learning policy (#465 Mode A, #471).
 # With no [skillopt] section behavior is byte-identical: no trace harvesting, no
 # event emission, and promotion stays fully MANUAL. auto_trace_enabled opts the

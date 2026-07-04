@@ -41,6 +41,15 @@ Use `gitmoot agent template draft <id>` for a blank scaffold,
 `gitmoot agent template export/publish/pull/remote set` commands — see CLI.md
 § Agent Templates.
 
+For agent persistent memory, phrases like "give this agent persistent memory",
+"why does my agent keep forgetting things about this repo", or "what has this
+agent learned" map to Gitmoot's off-by-default agent memory feature (#626): an
+enrolled agent gets a repo-filtered pool of durable facts injected into its job
+prompt as a read-only "Prior learnings" reference block (never instructions).
+Enrollment is per agent via `[agents.<name>].memory = true` plus an optional
+`[memory]` section; inspect the store read-only with `gitmoot memory list`. See
+CLI.md § Agent Memory and the "Agent Persistent Memory" concepts page for depth.
+
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
 same Codex, Claude, or Kimi session, and branch locks protect implementation
