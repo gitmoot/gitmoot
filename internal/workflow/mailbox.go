@@ -70,6 +70,16 @@ type Mailbox struct {
 	// auto-rollback. It is wired true only where the daemon-resolved policy reports
 	// CanaryEnabled().
 	CanaryEnabled bool
+	// injectMemory, when set, returns the "Prior learnings" block (#626) to append
+	// to the rendered job prompt. Nil (default, every path with no enrolled agent)
+	// => byte-identical: no query runs and nothing is appended. It is wired from
+	// Engine.Memory via mailbox(). Best-effort: it never errors up.
+	injectMemory func(ctx context.Context, agent runtime.Agent, payload JobPayload) string
+	// recordMemory, when set, shadow-logs the agent's returned learnings to
+	// memory_observations and writes any gitmoot-authored mechanical fact to
+	// confirmed_memories at job terminal (#626). Nil (default) => no-op, so the
+	// terminal path is byte-identical. Best-effort: it never fails the job.
+	recordMemory func(ctx context.Context, jobID string, agent runtime.Agent, payload JobPayload, result AgentResult)
 }
 
 type JobRequest struct {
@@ -491,6 +501,15 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	}
 
 	prompt := prompts.RenderJob(payload.prompt(job.Type))
+	// Append the off-by-default "Prior learnings" memory block (#626 READ path).
+	// When the memory hook is unset (every non-enrolled path) or returns "" (no
+	// enrolled agent, empty sanitized query, or no confirmed match), the prompt is
+	// byte-identical.
+	if m.injectMemory != nil {
+		if block := m.injectMemory(ctx, agent, payload); block != "" {
+			prompt = prompt + "\n\n" + block
+		}
+	}
 	if payload.BlockerAttempts > 0 && strings.TrimSpace(payload.BlockerClass) != "" && !payload.BlockerPreDelivery {
 		// This run is an automatic operational-blocker retry (#532): the previous
 		// attempt died on an environment condition, not on its own output, and may
@@ -611,6 +630,12 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		return AgentResult{}, err
 	}
 	payload.Result = &result
+	// Shadow-log returned learnings + write any mechanical fact at job terminal
+	// (#626 WRITE path). No-op when the hook is unset or the agent is not enrolled,
+	// so the terminal path is byte-identical. Best-effort — it never fails the job.
+	if m.recordMemory != nil {
+		m.recordMemory(ctx, job.ID, agent, payload, result)
+	}
 	state := stateForDecision(result.Decision)
 	if err := m.finishWithPayload(ctx, job.ID, state, fmt.Sprintf("job %s", state), payload); err != nil {
 		return AgentResult{}, err

@@ -293,6 +293,14 @@ type Engine struct {
 	// spawns a goroutine; tests inject a synchronous runner so the verifier leg is
 	// deterministic. It mirrors CheckerSpawner.
 	HardVerifierSpawner func(func())
+	// Memory is the injected, off-by-default agent persistent-memory controller
+	// (#626). When set (only when at least one agent is enrolled and the global
+	// kill switch is off), the engine's Mailbox injects a "Prior learnings" block
+	// into the job prompt (READ path) and shadow-logs returned learnings + writes
+	// mechanical facts at job terminal (WRITE path). When nil (the default, every
+	// path with no enrolled agent), the Mailbox is built with nil memory hooks and
+	// both prompt assembly and the terminal path are byte-identical.
+	Memory *MemoryController
 }
 
 // DelegationTimeoutDefaults are optional fallback timeouts for child delegation
@@ -410,6 +418,14 @@ func (e Engine) now() time.Time {
 // resolves root_id from the payload, and ships a redacted event fire-and-forget.
 func (e Engine) mailbox() Mailbox {
 	mb := Mailbox{Store: e.Store, CanaryEnabled: e.CanaryEnabled, deferBlocker: e.BlockerDeferrer}
+	// Wire the off-by-default memory hooks (#626). When e.Memory is nil (every
+	// non-enrolled path) both hooks stay nil, so Run's prompt assembly and terminal
+	// path are byte-identical. The hooks themselves also no-op when the executor
+	// agent is not enrolled, so a controller shared across mixed agents is safe.
+	if e.Memory != nil {
+		mb.injectMemory = e.Memory.injectBlock
+		mb.recordMemory = e.Memory.record
+	}
 	if e.EventSink == nil {
 		return mb
 	}
