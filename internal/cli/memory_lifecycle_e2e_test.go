@@ -148,7 +148,7 @@ func memoryLifecycleJobState(t *testing.T, store *db.Store, jobID string) string
 func TestMemoryObservationLifecycleFullChainE2E(t *testing.T) {
 	ctx := context.Background()
 	home, _, store := memoryLifecycleHome(t, enrolledMemoryConfig)
-	checkout := createDaemonWorkerGitCheckout(t, "main")
+	checkout := t.TempDir()
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 
 	promptFile := filepath.Join(t.TempDir(), "prompt")
@@ -323,7 +323,7 @@ func memoryListJSON(t *testing.T, home, tierFlag string) []memoryListEntry {
 func TestMemoryDisabledByteIdenticalE2E(t *testing.T) {
 	ctx := context.Background()
 	home, _, store := memoryLifecycleHome(t, disabledMemoryConfig)
-	checkout := createDaemonWorkerGitCheckout(t, "main")
+	checkout := t.TempDir()
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 
 	// Seed a confirmed fact whose content matches the job instructions — an ENABLED
@@ -402,7 +402,7 @@ func TestMemoryDisabledByteIdenticalE2E(t *testing.T) {
 func TestMemoryProducerAtBlockedTerminalE2E(t *testing.T) {
 	ctx := context.Background()
 	home, _, store := memoryLifecycleHome(t, enrolledMemoryConfig)
-	checkout := createDaemonWorkerGitCheckout(t, "main")
+	checkout := t.TempDir()
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 
 	blockedResult := `{"gitmoot_result":{"decision":"blocked","summary":"needs human approval","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
