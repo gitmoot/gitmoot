@@ -996,3 +996,23 @@ unrelated comments safely.
 Ranked GitHub comments can use `item-001 ranking: C > A > D > B` plus trait
 notes. Use the ranked workflow for exploration/refinement and return to A/B
 validation for final promotion decisions on fresh items.
+
+## Agent Memory
+
+Agent persistent memory is **off by default** and enrolled per agent
+(`[agents.<name>].memory = true`), with optional `[memory]` knobs (`disabled`,
+`token_budget`, `max_entries`). See
+[Agent Persistent Memory](../concepts/agent-memory.md) for the full model. The
+CLI is read-only:
+
+```sh
+gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo] [--json]
+gitmoot memory replay [--agent NAME] [--repo owner/repo] [--limit N] [--json]
+gitmoot memory eval --fixtures fixtures.json [--k N] [--json]
+```
+
+`memory list` shows confirmed memories and/or pending observations. `memory
+replay` re-renders recent real jobs' prompts with and without the injected
+learnings block and reports the token/entry delta. `memory eval` computes
+recall/precision@K of retrieval over a labeled `{agent, repo, instructions,
+expected_keys}` fixtures file.

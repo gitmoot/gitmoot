@@ -474,6 +474,21 @@ the dollar-cost bullet in [Termination bounds](#termination-bounds) above.
   sparingly**: ask only when you genuinely cannot proceed without a human decision,
   not on every result.
 
+- `learnings` (optional): durable, keyed **facts** worth remembering for future
+  jobs (agent persistent memory, #626). Each entry is
+  `{ "key": "...", "scope": "repo"|"general", "content": "..." }` where `key` is a
+  short stable handle (required), `content` is the fact itself (required), and
+  `scope` is optional — `"repo"` (about this repository, the default) or
+  `"general"` (true everywhere). It is **fully additive**: a result that omits it
+  behaves byte-identically, and **most jobs should omit it**. Record a fact only
+  when you learned something a future job would benefit from (e.g. "this repo's
+  arm64 CI is flaky"), state it as a **fact, not a directive** ("always…"/"you
+  must…" is rejected), and never put commands or secrets in it. Memory is **off by
+  default** (opt in per agent with `[agents.<name>].memory = true`); when off,
+  returning `learnings` is harmless and simply ignored. In the current observation
+  phase, returned learnings are logged for measurement but are **not** injected
+  into any prompt. See the *Agent Persistent Memory* concept doc.
+
 ## Decisions
 
 - `approved`: review found no blocking issues.

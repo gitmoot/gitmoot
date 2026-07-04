@@ -30,6 +30,7 @@ full expanded context.
 
 - [Local-First Coordination](https://gitmoot.io/docs/concepts/local-first-coordination): Why state lives in local SQLite and GitHub stays the audit surface.
 - [Agents, Agent Templates, Jobs, And Locks](https://gitmoot.io/docs/concepts/agents-templates-jobs-locks): The core object model — agent identities, template snapshots, job lifecycle, and the three lock kinds.
+- [Agent Persistent Memory](https://gitmoot.io/docs/concepts/agent-memory): Off-by-default repo-filtered fact memory (SQLite + FTS5); observation-mode read/write model, enrollment, and the memory CLI.
 
 ## References
 
