@@ -178,6 +178,33 @@ func TestRunJobWatchPrintsEventsUntilTerminal(t *testing.T) {
 	}
 }
 
+// TestPinRunJobWatchStopsOnBlocked pins `job watch`'s terminal semantics (#632):
+// a `blocked` job is treated as SETTLED, so the watch loop stops tailing it and
+// returns exit 0 immediately rather than polling forever. If blocked were not
+// terminal here, this test would hang. This "settled includes blocked" behavior
+// must hold identically before and after the predicate refactor.
+func TestPinRunJobWatchStopsOnBlocked(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	seedCLIJob(t, store, db.Job{
+		ID:      "job-watch-blocked",
+		Agent:   "audit",
+		Type:    "ask",
+		State:   string(workflow.JobBlocked),
+		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Branch: "main"}),
+	}, "blocked")
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"job", "watch", "job-watch-blocked", "--home", home, "--poll", "1ms"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("job watch on blocked job exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "state: blocked") {
+		t.Fatalf("job watch on blocked job did not report terminal state:\n%s", stdout.String())
+	}
+}
+
 func TestRunJobWatchJSON(t *testing.T) {
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)
