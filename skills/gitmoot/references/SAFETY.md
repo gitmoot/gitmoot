@@ -182,7 +182,15 @@ cannot recurse or fan out forever:
   not a hard stop — in-flight jobs finish normally, the coordinator's next
   continuation routes through the same finalize path below (a
   `delegation_killed` event is emitted), and the daemon stops starting queued
-  children of the killed root.
+  children of the killed root. Kill is for a whole **tree**; to abandon a single
+  job (including one blocked awaiting a human) use `gitmoot job cancel <job-id>`
+  instead — or clear a stale backlog of blocked jobs with `gitmoot job cancel
+  --state blocked --older-than 7d --yes` (dry-run without `--yes`). Cancel is a
+  single-row transition that never propagates to siblings or the coordinator, so
+  it must not be routed through the kill machinery (#631). Setting a positive
+  `[orchestrate].blocked_ttl` (off by default) lets the daemon auto-dismiss a
+  blocked job idle longer than the TTL through that same cancel path — the
+  single-job counterpart to the tree-wide `escalation_ttl` below.
 - Human-in-the-loop pause (`escalate_human` failure_policy, #340): when a child
   fails under `escalate_human`, the parent task enters the resumable
   `awaiting_human` state, a one-shot `delegation_escalation_requested` event is

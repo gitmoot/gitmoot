@@ -50,6 +50,9 @@ func TestLoadOrchestratePolicyDefaults(t *testing.T) {
 	if policy.MaxVerifyReplanAttempts != 0 {
 		t.Fatalf("MaxVerifyReplanAttempts = %d, want 0 (engine default) by default", policy.MaxVerifyReplanAttempts)
 	}
+	if policy.BlockedTTL != "" {
+		t.Fatalf("BlockedTTL = %q, want empty (disabled) by default", policy.BlockedTTL)
+	}
 	if policy.DefaultDelegationTimeout != "" || policy.DefaultPlanTimeout != "" || policy.DefaultImplementTimeout != "" || policy.DefaultReviewTimeout != "" || policy.DefaultGateTimeout != "" || policy.DefaultRepairTimeout != "" {
 		t.Fatalf("delegation timeout defaults = %+v, want all empty by default", policy)
 	}
@@ -301,6 +304,80 @@ escalation_ttl = "soon"
 	}
 	if _, err := LoadOrchestratePolicy(paths); err == nil {
 		t.Fatal("LoadOrchestratePolicy accepted an invalid escalation_ttl")
+	}
+}
+
+// TestLoadOrchestratePolicyBlockedTTL pins #631: blocked_ttl parses from
+// [orchestrate]; it is DISABLED (empty) by default; a positive duration is
+// accepted; an explicit zero is accepted (still disabled); and a negative or
+// non-duration value is rejected.
+func TestLoadOrchestratePolicyBlockedTTL(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+
+	// Disabled by default: an [orchestrate] section without blocked_ttl keeps it empty.
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[orchestrate]
+cockpit_mode = "auto"
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	policy, err := LoadOrchestratePolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadOrchestratePolicy returned error: %v", err)
+	}
+	if policy.BlockedTTL != "" {
+		t.Fatalf("BlockedTTL = %q, want empty (disabled) by default", policy.BlockedTTL)
+	}
+
+	// A positive duration parses.
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[orchestrate]
+blocked_ttl = "48h"
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	policy, err = LoadOrchestratePolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadOrchestratePolicy returned error: %v", err)
+	}
+	if policy.BlockedTTL != "48h" {
+		t.Fatalf("BlockedTTL = %q, want 48h", policy.BlockedTTL)
+	}
+
+	// An explicit zero is accepted (it is another spelling of disabled).
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[orchestrate]
+blocked_ttl = "0s"
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	if _, err := LoadOrchestratePolicy(paths); err != nil {
+		t.Fatalf("LoadOrchestratePolicy rejected blocked_ttl = 0s: %v", err)
+	}
+
+	// A negative duration is rejected.
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[orchestrate]
+blocked_ttl = "-1h"
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	if _, err := LoadOrchestratePolicy(paths); err == nil {
+		t.Fatal("LoadOrchestratePolicy accepted a negative blocked_ttl")
+	}
+
+	// A non-duration value is rejected.
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[orchestrate]
+blocked_ttl = "soon"
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	if _, err := LoadOrchestratePolicy(paths); err == nil {
+		t.Fatal("LoadOrchestratePolicy accepted an invalid blocked_ttl")
 	}
 }
 

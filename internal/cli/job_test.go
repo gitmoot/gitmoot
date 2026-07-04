@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
@@ -277,6 +278,214 @@ func TestRunJobKill(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "job kill:") {
 		t.Fatalf("job kill missing-root stderr = %q", stderr.String())
+	}
+}
+
+// seedJobCancelBulkFixtures seeds the standard #631 bulk-cancel fixture set: a
+// spread of blocked jobs (assorted ages, repos, agents) plus queued/running/
+// failed decoys that must never be selected. Ages are stamped onto updated_at so
+// the age filter has deterministic values. The seeding store is closed so the
+// later setJobTimes (and the CLI commands) own the file.
+func seedJobCancelBulkFixtures(t *testing.T, home string) {
+	t.Helper()
+	store := openCLIJobStore(t, home)
+	now := time.Now().UTC()
+	const layout = "2006-01-02 15:04:05"
+	fixtures := []struct {
+		id, state, repo, agent string
+		age                    time.Duration
+	}{
+		{"blocked-old-a", string(workflow.JobBlocked), "owner/repo", "audit", 10 * 24 * time.Hour},
+		{"blocked-old-b", string(workflow.JobBlocked), "owner/repo", "builder", 30 * 24 * time.Hour},
+		{"blocked-old-c", string(workflow.JobBlocked), "other/repo", "audit", 12 * 24 * time.Hour},
+		{"blocked-recent", string(workflow.JobBlocked), "owner/repo", "audit", time.Hour},
+		{"queued-old", string(workflow.JobQueued), "owner/repo", "audit", 20 * 24 * time.Hour},
+		{"running-old", string(workflow.JobRunning), "owner/repo", "audit", 20 * 24 * time.Hour},
+		{"failed-old", string(workflow.JobFailed), "owner/repo", "audit", 20 * 24 * time.Hour},
+	}
+	for _, f := range fixtures {
+		seedCLIJob(t, store, db.Job{
+			ID:      f.id,
+			Agent:   f.agent,
+			Type:    "ask",
+			State:   f.state,
+			Payload: mustJobPayload(t, workflow.JobPayload{Repo: f.repo, Branch: "main"}),
+		}, f.state)
+	}
+	store.Close()
+	for _, f := range fixtures {
+		ts := now.Add(-f.age).Format(layout)
+		setJobTimes(t, home, f.id, ts, ts)
+	}
+}
+
+func jobStateForTest(t *testing.T, home, id string) string {
+	t.Helper()
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	job, err := store.GetJob(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetJob(%s) returned error: %v", id, err)
+	}
+	return job.State
+}
+
+func TestRunJobCancelBulkDryRunSelectsBlockedAndOlder(t *testing.T) {
+	home := t.TempDir()
+	seedJobCancelBulkFixtures(t, home)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"job", "cancel", "--home", home, "--state", "blocked", "--older-than", "7d"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("bulk dry-run exit code = %d, stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{"blocked-old-a", "blocked-old-b", "blocked-old-c", "run again with --yes to cancel 3 jobs"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("dry-run output missing %q:\n%s", want, out)
+		}
+	}
+	for _, absent := range []string{"blocked-recent", "queued-old", "running-old", "failed-old"} {
+		if strings.Contains(out, absent) {
+			t.Fatalf("dry-run selected a job it should not have (%q):\n%s", absent, out)
+		}
+	}
+	// Oldest first with an id tie-break: b (30d) before c (12d) before a (10d).
+	ib, ic, ia := strings.Index(out, "blocked-old-b"), strings.Index(out, "blocked-old-c"), strings.Index(out, "blocked-old-a")
+	if !(ib < ic && ic < ia) {
+		t.Fatalf("dry-run order not oldest-first (b=%d c=%d a=%d):\n%s", ib, ic, ia, out)
+	}
+	// A dry-run must not mutate anything.
+	for _, id := range []string{"blocked-old-a", "blocked-old-b", "blocked-old-c", "blocked-recent"} {
+		if got := jobStateForTest(t, home, id); got != string(workflow.JobBlocked) {
+			t.Fatalf("dry-run mutated %s to %q, want still blocked", id, got)
+		}
+	}
+}
+
+func TestRunJobCancelBulkYesCancelsSelection(t *testing.T) {
+	home := t.TempDir()
+	seedJobCancelBulkFixtures(t, home)
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"job", "cancel", "--home", home, "--state", "blocked", "--older-than", "7d", "--yes"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("bulk --yes exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "cancelled 3 of 3") {
+		t.Fatalf("bulk --yes summary missing:\n%s", stdout.String())
+	}
+	for _, id := range []string{"blocked-old-a", "blocked-old-b", "blocked-old-c"} {
+		if got := jobStateForTest(t, home, id); got != string(workflow.JobCancelled) {
+			t.Fatalf("job %s state = %q, want cancelled", id, got)
+		}
+	}
+	// The too-new blocked job and the non-blocked decoys are untouched.
+	if got := jobStateForTest(t, home, "blocked-recent"); got != string(workflow.JobBlocked) {
+		t.Fatalf("blocked-recent state = %q, want still blocked", got)
+	}
+	for id, want := range map[string]string{
+		"queued-old":  string(workflow.JobQueued),
+		"running-old": string(workflow.JobRunning),
+		"failed-old":  string(workflow.JobFailed),
+	} {
+		if got := jobStateForTest(t, home, id); got != want {
+			t.Fatalf("decoy %s state = %q, want %q", id, got, want)
+		}
+	}
+}
+
+func TestRunJobCancelBulkFiltersCompose(t *testing.T) {
+	home := t.TempDir()
+	seedJobCancelBulkFixtures(t, home)
+
+	// --older-than in Go-duration form (168h == 7d) composed with repo + agent:
+	// only blocked-old-a is owner/repo + audit + old enough.
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"job", "cancel", "--home", home, "--state", "blocked", "--older-than", "168h", "--repo", "owner/repo", "--agent", "audit"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("bulk compose exit code = %d, stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "blocked-old-a") || !strings.Contains(out, "run again with --yes to cancel 1 jobs") {
+		t.Fatalf("compose selection = %q, want only blocked-old-a", out)
+	}
+	for _, absent := range []string{"blocked-old-b", "blocked-old-c", "blocked-recent"} {
+		if strings.Contains(out, absent) {
+			t.Fatalf("compose selected %q it should have filtered out:\n%s", absent, out)
+		}
+	}
+}
+
+func TestRunJobCancelBulkStateValidation(t *testing.T) {
+	home := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"job", "cancel", "--home", home, "--state", "failed"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("bulk --state failed exit code = %d, want 2; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `only "blocked"`) {
+		t.Fatalf("bulk --state failed stderr = %q, want a blocked-only message", stderr.String())
+	}
+}
+
+func TestRunJobCancelIDStateMutuallyExclusive(t *testing.T) {
+	home := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"job", "cancel", "some-id", "--home", home, "--state", "blocked"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("id + --state exit code = %d, want 2; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "mutually exclusive") {
+		t.Fatalf("id + --state stderr = %q, want a mutual-exclusion message", stderr.String())
+	}
+}
+
+func TestRunJobCancelBulkFiltersRequireState(t *testing.T) {
+	home := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"job", "cancel", "--home", home, "--older-than", "7d"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("--older-than without --state exit code = %d, want 2; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "require --state") {
+		t.Fatalf("--older-than without --state stderr = %q, want a require-state message", stderr.String())
+	}
+}
+
+func TestParseOlderThanDuration(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    time.Duration
+		wantErr bool
+	}{
+		{"", 0, false},
+		{"7d", 7 * 24 * time.Hour, false},
+		{"168h", 168 * time.Hour, false},
+		{"0", 0, false},
+		{"90m", 90 * time.Minute, false},
+		{"-3d", 0, true},
+		{"-1h", 0, true},
+		{"bogus", 0, true},
+		{"5x", 0, true},
+	}
+	for _, tc := range cases {
+		got, err := parseOlderThanDuration(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Fatalf("parseOlderThanDuration(%q) err = nil, want error", tc.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("parseOlderThanDuration(%q) returned error: %v", tc.in, err)
+		}
+		if got != tc.want {
+			t.Fatalf("parseOlderThanDuration(%q) = %v, want %v", tc.in, got, tc.want)
+		}
 	}
 }
 

@@ -424,6 +424,30 @@ Fixes:
   `GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value
   is 1m — below-1m, malformed, or non-positive values are rejected in favor of
   the 30m default rather than clamped, #560).
+- A backlog of `blocked` jobs (each paused awaiting a human) never clears on its
+  own. Dismiss one with `gitmoot job cancel <job-id>` (cancel now abandons a
+  `blocked` job as well as a `queued`/`running` one; #631), or clear a stale
+  batch with the bulk form:
+
+  ```sh
+  gitmoot job cancel --state blocked --older-than 7d   # dry-run preview
+  gitmoot job cancel --state blocked --older-than 7d --yes
+  ```
+
+  The bulk form is a dry-run by default (it prints id/agent/repo/age and cancels
+  nothing) until you pass `--yes`; narrow it with `--older-than` (a Go duration
+  like `168h`, or a `<N>d` days suffix), `--repo owner/repo`, and `--agent name`.
+  `gitmoot doctor` warns when blocked jobs older than 30d have piled up and prints
+  the exact command. A dismissed job is not lost — `gitmoot job retry` accepts a
+  cancelled job and resurrects it.
+- To sweep the backlog automatically, set `[orchestrate].blocked_ttl` to a
+  positive Go duration (e.g. `blocked_ttl = "168h"`): the daemon then dismisses
+  any blocked job idle longer than the TTL through the same cancel path, recording
+  a `blocked_ttl_expired` job event. It is **off by default** (empty or `0s`
+  disables it; a negative value is rejected), because a blocked job is a
+  human-awaiting decision that is never auto-discarded unless you opt in. This is
+  the single-job counterpart of `[orchestrate].escalation_ttl`, which
+  auto-finalizes a whole paused delegation tree and is on by default (24h).
 
 ## Parallel Implementation And Worktrees
 

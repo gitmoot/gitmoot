@@ -2504,6 +2504,33 @@ func resolveEscalationTTL(home string) time.Duration {
 	return ttl
 }
 
+// resolveBlockedTTL reads the [orchestrate].blocked_ttl policy (#631) and returns
+// the blocked-job sweep window, or 0 when the sweep is DISABLED. Unlike
+// resolveEscalationTTL it has NO default fallback: an unset/empty (or zero, or
+// unparseable) value resolves to 0 so the sweep stays OFF by default — a blocked
+// job is a human-awaiting decision and is never auto-dismissed unless the operator
+// opted in with a positive duration. It mirrors resolveEscalationTTL's read-only,
+// shape-tolerant config resolution (resolveConfigFile + LoadOrchestratePolicy,
+// never config.Initialize) so it is phantom-free for either a raw --home or an
+// already-resolved <home>/.gitmoot root.
+func resolveBlockedTTL(home string) time.Duration {
+	policy := config.DefaultOrchestratePolicy()
+	if cfg := resolveConfigFile(home); cfg != "" {
+		if loaded, err := config.LoadOrchestratePolicy(config.Paths{ConfigFile: cfg}); err == nil {
+			policy = loaded
+		}
+	}
+	raw := strings.TrimSpace(policy.BlockedTTL)
+	if raw == "" {
+		return 0
+	}
+	ttl, err := time.ParseDuration(raw)
+	if err != nil || ttl <= 0 {
+		return 0
+	}
+	return ttl
+}
+
 func pollRegisteredReposWithPoller(ctx context.Context, poller registeredRepoPoller, schedule registeredRepoSchedule, now time.Time, fallbackPoll time.Duration) (time.Duration, error) {
 	schedule = schedule.ensure()
 	repos, err := poller.Store.ListRepos(ctx)
@@ -2953,6 +2980,72 @@ func recoverExpiredRuntimeSessionLocksSkipping(ctx context.Context, store *db.St
 	return nil
 }
 
+// jobEventBlockedTTLExpired is the job_event kind the blocked_ttl sweep appends
+// after it dismisses a blocked job (#631). It is DISTINCT from the bare
+// "cancelled" event workflow.CancelJob writes so a job's history tells a TTL
+// auto-expiry apart from an operator's explicit `job cancel`.
+const jobEventBlockedTTLExpired = "blocked_ttl_expired"
+
+// sweepExpiredBlockedJobs is the opt-in blocked-job TTL reaper (#631), mirroring
+// recoverExpiredRuntimeSessionLocks's tick cadence. With ttl <= 0 — the DEFAULT,
+// [orchestrate].blocked_ttl unset — it is an immediate no-op: a blocked job is
+// paused awaiting a human, so it is NEVER auto-dismissed unless the operator opted
+// in with a positive duration (so the default path is byte-identical).
+//
+// Otherwise it dismisses every blocked job whose last transition — updated_at,
+// stamped by the blocked transition, falling back to created_at — is older than
+// now-ttl. It routes each dismissal through workflow.CancelJob, the SAME single-row
+// abandon verb an operator's `job cancel` uses, so the job's best-effort lock
+// releases fire; it NEVER raw-writes the cancelled state, which would strand those
+// locks. Each successful dismissal appends a distinct jobEventBlockedTTLExpired
+// event naming the TTL.
+//
+// It is resilient: one job's cancel (or event-append) failure is logged and
+// skipped so it can never abort the rest of the sweep. A job with no parseable
+// timestamp is left alone rather than treated as infinitely old.
+func sweepExpiredBlockedJobs(ctx context.Context, store *db.Store, ttl time.Duration, stdout io.Writer, now time.Time) error {
+	if ttl <= 0 {
+		return nil
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		return err
+	}
+	cutoff := now.Add(-ttl).UnixMilli()
+	swept := 0
+	for _, job := range jobs {
+		if job.State != string(workflow.JobBlocked) {
+			continue
+		}
+		stamped := parseJobTimeMillis(job.UpdatedAt)
+		if stamped == 0 {
+			stamped = parseJobTimeMillis(job.CreatedAt)
+		}
+		if stamped == 0 || stamped >= cutoff {
+			continue
+		}
+		if _, err := workflow.CancelJob(ctx, store, job.ID); err != nil {
+			writeLine(stdout, "blocked_ttl sweep: cancel of blocked job %s failed: %v", job.ID, err)
+			continue
+		}
+		// The cancel already succeeded; the history marker is best-effort (like
+		// CancelJob's own lock-release events) so a failed append is logged but never
+		// undoes the dismissal or aborts the rest of the sweep.
+		if err := store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    jobEventBlockedTTLExpired,
+			Message: fmt.Sprintf("dismissed after blocked_ttl %s elapsed", ttl),
+		}); err != nil {
+			writeLine(stdout, "blocked_ttl sweep: recording expiry event for job %s failed: %v", job.ID, err)
+		}
+		swept++
+	}
+	if swept > 0 {
+		writeLine(stdout, "blocked_ttl sweep: dismissed %d blocked job(s) idle longer than %s", swept, ttl)
+	}
+	return nil
+}
+
 func runDaemonPollWithTimeout(ctx context.Context, timeout time.Duration, poll func(context.Context) error) error {
 	if timeout <= 0 {
 		return poll(ctx)
@@ -3354,6 +3447,16 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	}
 	if err := recoverExpiredRuntimeSessionLocksSkipping(ctx, store, stdout, now, inflightIDs); err != nil {
 		return err
+	}
+	// Opt-in blocked-job TTL reaper (#631): dismiss blocked jobs (paused awaiting a
+	// human) idle longer than [orchestrate].blocked_ttl. Disabled by default (ttl 0
+	// ⇒ immediate no-op), so the default path is byte-identical. A sweep fault is
+	// LOGGED, not returned: this optional housekeeping reaper must never abort the
+	// tick's dispatch or escalate the daemon the way the store-fault recovery scans
+	// above (deliberately) do. Resolved per tick, so the TTL is live-tunable like the
+	// per-repo scheduler override below.
+	if err := sweepExpiredBlockedJobs(ctx, store, resolveBlockedTTL(worker.workflowHome()), stdout, now); err != nil {
+		writeLine(stdout, "blocked_ttl sweep failed: %v", err)
 	}
 	// Checkout-mutating maintenance (advancement/merge retries, delegation
 	// worktree reclaims) is gated on the ACTUAL mutation hazard — each

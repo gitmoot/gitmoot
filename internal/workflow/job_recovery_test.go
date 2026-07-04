@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -300,5 +301,135 @@ func TestCancelJobRejectsTerminalJob(t *testing.T) {
 	}
 	if _, err := CancelJob(ctx, store, "job-1"); err == nil {
 		t.Fatal("CancelJob accepted succeeded job")
+	}
+}
+
+// TestCancelJobDismissesBlockedJob covers the #631 abandon verb: a blocked job
+// (paused awaiting a human) cancels like a queued/running one — the transition
+// lands, the event records "cancel requested from blocked", and the job's
+// resource locks are released so a stranded gate does not hold them out.
+func TestCancelJobDismissesBlockedJob(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-1", Agent: "audit", Type: "ask", State: string(JobBlocked)}, db.JobEvent{Kind: string(JobBlocked), Message: "awaiting a human"}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+
+	now := time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC)
+	const lockKey = "runtime:codex:session-1"
+	acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+		ResourceKey: lockKey,
+		OwnerJobID:  "job-1",
+		OwnerToken:  "token-1",
+		ExpiresAt:   now.Add(30 * time.Minute).Format(time.RFC3339Nano),
+	}, now)
+	if err != nil {
+		t.Fatalf("AcquireResourceLock returned error: %v", err)
+	}
+	if !acquired {
+		t.Fatal("AcquireResourceLock did not acquire the lock")
+	}
+
+	job, err := CancelJob(ctx, store, "job-1")
+	if err != nil {
+		t.Fatalf("CancelJob returned error: %v", err)
+	}
+	if job.State != string(JobCancelled) {
+		t.Fatalf("job state = %q, want cancelled", job.State)
+	}
+	events, err := store.ListJobEvents(ctx, "job-1")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if len(events) != 2 || events[1].Kind != string(JobCancelled) || events[1].Message != "cancel requested from blocked" {
+		t.Fatalf("events = %+v, want a cancellation event recorded from blocked", events)
+	}
+	if _, err := store.GetResourceLock(ctx, lockKey); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetResourceLock after cancel error = %v, want sql.ErrNoRows (lock should be released)", err)
+	}
+}
+
+// TestCancelJobRefusesNonCancellableStates proves the widened guard still admits
+// only queued/running/blocked: the three terminal states are refused with the
+// updated message.
+func TestCancelJobRefusesNonCancellableStates(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	for _, state := range []JobState{JobSucceeded, JobFailed, JobCancelled} {
+		id := "job-" + string(state)
+		if err := store.CreateJobWithEvent(ctx, db.Job{ID: id, Agent: "audit", Type: "ask", State: string(state)}, db.JobEvent{Kind: string(state), Message: string(state)}); err != nil {
+			t.Fatalf("CreateJobWithEvent %s returned error: %v", state, err)
+		}
+		_, err := CancelJob(ctx, store, id)
+		if err == nil {
+			t.Fatalf("CancelJob accepted %s job", state)
+		}
+		if !strings.Contains(err.Error(), "cancel requires queued, running or blocked") {
+			t.Fatalf("CancelJob %s error = %q, want the widened refuse message", state, err)
+		}
+	}
+}
+
+// TestCancelJobLostCASRaceRefuses covers the recheck at the CAS seam: several
+// concurrent cancels race one blocked job that lands terminal mid-flight. Exactly
+// one wins (a single cancellation event, no double-cancel); every loser — whether
+// it lost the CAS (recheck path) or read the already-cancelled row (initial
+// guard) — is refused with the widened message.
+func TestCancelJobLostCASRaceRefuses(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-1", Agent: "audit", Type: "ask", State: string(JobBlocked)}, db.JobEvent{Kind: string(JobBlocked), Message: "awaiting a human"}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+
+	const racers = 6
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		start   = make(chan struct{})
+		success int
+		errs    []error
+	)
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := CancelJob(ctx, store, "job-1")
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, err)
+				return
+			}
+			success++
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if success != 1 {
+		t.Fatalf("concurrent cancels succeeded %d times, want exactly 1", success)
+	}
+	if len(errs) != racers-1 {
+		t.Fatalf("got %d refusals, want %d", len(errs), racers-1)
+	}
+	for _, err := range errs {
+		if !strings.Contains(err.Error(), "cancel requires queued, running or blocked") {
+			t.Fatalf("loser error = %q, want the widened refuse message", err)
+		}
+	}
+	events, err := store.ListJobEvents(ctx, "job-1")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	cancelled := 0
+	for _, ev := range events {
+		if ev.Kind == string(JobCancelled) {
+			cancelled++
+		}
+	}
+	if cancelled != 1 {
+		t.Fatalf("recorded %d cancellation events, want exactly 1 (no double-cancel)", cancelled)
 	}
 }

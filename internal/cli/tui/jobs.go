@@ -100,7 +100,7 @@ func jobReportable(state string) bool {
 }
 
 func jobCancelable(state string) bool {
-	return state == "queued" || state == "running"
+	return state == "queued" || state == "running" || state == "blocked"
 }
 
 // updateJobOverlay handles keys in the job detail and confirm modes.

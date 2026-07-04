@@ -213,7 +213,7 @@ equivalent:
   previous version (same as `gitmoot agent template revert`).
 - **Jobs** lists every job with a state summary: `enter` shows the event
   history, `R` retries failed/blocked/cancelled jobs (same path as
-  `gitmoot job retry`), `c` cancels queued AND running jobs (same as
+  `gitmoot job retry`), `c` cancels queued, running, AND blocked jobs (same as
   `gitmoot job cancel`; running ones show `cancelling…` until the daemon
   settles them), and `B` opens a redacted bug-report preview for
   failed/blocked/cancelled jobs. In the preview, `g` creates or reuses the
@@ -752,7 +752,8 @@ gitmoot job show <job-id>            # add --json for the full job + why-stuck d
 gitmoot job watch <job-id>
 gitmoot job events <job-id>
 gitmoot job retry <job-id>
-gitmoot job cancel <job-id>
+gitmoot job cancel <job-id>                                        # one queued|running|blocked job
+gitmoot job cancel --state blocked [--older-than 7d] [--repo owner/repo] [--agent name] [--yes]
 gitmoot job kill <root-job-id>
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
@@ -801,10 +802,41 @@ worker and recovered/re-queued. The window is tunable via the
 below-1m, malformed, or non-positive values are rejected (with a one-time
 warning) in favor of the 30m default rather than clamped (#560).
 
-`gitmoot job cancel <job-id>` also releases any resource locks the cancelled job
-still owned — including a stranded `runtime:<rt>:<session>` lock left behind when
-a foreground `gitmoot agent ask` was killed — so the next ask on that agent does
-not wait out the lock TTL before it can run.
+`gitmoot job cancel <job-id>` is the single-job **abandon** verb. It dismisses a
+`queued`, `running`, **or `blocked`** job (a blocked job is one paused awaiting a
+human — an operator permission gate or an unrecoverable blocker — so dismissing it
+is the same abandon intent as cancelling a queued/running one; #631). Cancel is a
+single-row transition: it does **not** propagate to a delegation tree, touch task
+state, or set the killed flag — abandoning a whole tree is `gitmoot job kill`.
+Cancelling also releases any resource locks the cancelled job still owned —
+including a stranded `runtime:<rt>:<session>` lock left behind when a foreground
+`gitmoot agent ask` was killed — so the next ask on that agent does not wait out
+the lock TTL before it can run. Dismissal is reversible: `gitmoot job retry`
+accepts a cancelled job (its accepted source states are failed/blocked/cancelled),
+so a mistakenly dismissed job can be resurrected.
+
+`gitmoot job cancel --state blocked` is the **bulk** form for clearing a backlog
+of blocked jobs. Only `blocked` is accepted for `--state` (queued/running jobs use
+single-job cancel; terminal jobs use retry). Narrow the selection with
+`--older-than` (a Go duration like `168h`, or a convenience `<N>d` days suffix like
+`7d`; age is measured from when each job became blocked), `--repo owner/repo`
+(matches the job's payload repo), and `--agent name`. The bulk form is a **dry-run
+by default** — it prints the matching jobs (id, agent, repo, age) and exits without
+cancelling anything; pass `--yes` to actually cancel the selection. Each selected
+job is dismissed through the same per-job cancel path, so its locks are released
+too. `<id>` and `--state` are mutually exclusive, and `--older-than`/`--repo`/
+`--agent` require `--state`. `gitmoot doctor` warns when blocked jobs older than
+30d have piled up and prints this exact command as the remediation.
+
+To automate the sweep, set `[orchestrate].blocked_ttl` to a positive Go duration
+(e.g. `blocked_ttl = "168h"`): the daemon's housekeeping tick then dismisses any
+blocked job whose blocked-transition timestamp (updated_at, created_at fallback)
+is older than the TTL, through the same `CancelJob` abandon path, recording a
+distinct `blocked_ttl_expired` job event so a TTL auto-expiry is distinguishable
+from a manual `job cancel`. It is **off by default** — an empty or `0s` value
+disables it (a negative value is rejected). Unlike `[orchestrate].escalation_ttl`
+(which auto-finalizes a whole paused delegation *tree* and is on by default, 24h),
+`blocked_ttl` dismisses a *single* blocked job and is off by default.
 
 Merge-gate retries are automatic while the daemon is running. Retryable states,
 such as a busy base-branch merge queue or a GitHub branch update in progress,

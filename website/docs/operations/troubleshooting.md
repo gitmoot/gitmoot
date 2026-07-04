@@ -288,11 +288,37 @@ Fix: resolve the underlying runtime/auth/lock issue, then retry when safe:
 gitmoot job retry <job-id>
 ```
 
-Cancel only when the job should not continue:
+Cancel (abandon) only when the job should not continue. Cancel now dismisses a
+`blocked` job — one paused awaiting a human — as well as a `queued`/`running` one
+(#631); a dismissed job is not lost, since `gitmoot job retry` accepts a cancelled
+job and resurrects it:
 
 ```sh
 gitmoot job cancel <job-id>
 ```
+
+A backlog of `blocked` jobs never clears on its own. Clear a stale batch with the
+bulk form, which is a **dry-run by default** (it prints id/agent/repo/age and
+cancels nothing) until you pass `--yes`:
+
+```sh
+gitmoot job cancel --state blocked --older-than 7d          # preview the selection
+gitmoot job cancel --state blocked --older-than 7d --yes    # cancel it
+```
+
+Only `blocked` is accepted for `--state`; narrow the selection with `--older-than`
+(a Go duration like `168h`, or a `<N>d` days suffix), `--repo owner/repo`, and
+`--agent name`. `gitmoot doctor` warns when blocked jobs older than 30d have piled
+up and prints the exact command to dismiss them.
+
+To sweep the backlog automatically, set `[orchestrate].blocked_ttl` to a positive
+Go duration (e.g. `blocked_ttl = "168h"`): the daemon then dismisses any blocked
+job idle longer than the TTL through the same cancel path, recording a
+`blocked_ttl_expired` job event. It is **off by default** (empty or `0s` disables
+it; a negative value is rejected), because a blocked job is a human-awaiting
+decision that is never auto-discarded unless you opt in. This is the single-job
+counterpart of `[orchestrate].escalation_ttl`, which auto-finalizes a whole paused
+delegation tree and is on by default (24h).
 
 ## Stale Lock
 

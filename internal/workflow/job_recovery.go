@@ -130,6 +130,24 @@ func SettleCancelledRunningJob(ctx context.Context, store *db.Store, jobID strin
 	return true, store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "cancel_settled", Message: message})
 }
 
+// CancelJob is the single-job abandon verb (#631). It transitions a queued,
+// running, or blocked job to cancelled and best-effort releases the locks the
+// job still owns. A blocked job is one paused awaiting a human (an operator
+// permission gate or an unrecoverable BlockedError), so dismissing it is the
+// same abandon intent as cancelling a queued/running one — cancel is that verb.
+//
+// Scope is deliberately a single row: cancel does NOT propagate to a delegation
+// tree, touch task locks/state, or set the RootKilled flag. Abandoning a whole
+// delegation tree is a different verb (job kill / KillDelegationTree); routing
+// dismissal through the kill machinery would over-reach a lone blocked leg into
+// its siblings and coordinator. isTerminalJobState already treats blocked and
+// cancelled identically, so a blocked->cancelled move changes no delegation
+// barrier disposition.
+//
+// Dismissal is retry-reversible: RetryJob accepts cancelled jobs, so a dismissed
+// blocked job can be resurrected. That is accepted behavior — the settle gate
+// that guards retry after a running-cancel does not apply to a cancel from
+// blocked (a blocked job has no active worker to outrace).
 func CancelJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error) {
 	if store == nil {
 		return db.Job{}, fmt.Errorf("store is required")
@@ -139,9 +157,9 @@ func CancelJob(ctx context.Context, store *db.Store, jobID string) (db.Job, erro
 		return db.Job{}, err
 	}
 	switch job.State {
-	case string(JobQueued), string(JobRunning):
+	case string(JobQueued), string(JobRunning), string(JobBlocked):
 	default:
-		return db.Job{}, fmt.Errorf("job %s is %s; cancel requires queued or running", job.ID, job.State)
+		return db.Job{}, fmt.Errorf("job %s is %s; cancel requires queued, running or blocked", job.ID, job.State)
 	}
 	transitioned, err := store.TransitionJobStateWithEvent(ctx, job.ID, job.State, string(JobCancelled), db.JobEvent{
 		JobID:   job.ID,
@@ -156,7 +174,7 @@ func CancelJob(ctx context.Context, store *db.Store, jobID string) (db.Job, erro
 		if getErr != nil {
 			return db.Job{}, getErr
 		}
-		return db.Job{}, fmt.Errorf("job %s is %s; cancel requires queued or running", latest.ID, latest.State)
+		return db.Job{}, fmt.Errorf("job %s is %s; cancel requires queued, running or blocked", latest.ID, latest.State)
 	}
 	// Best-effort: release any resource locks the cancelled job still owns (e.g. a
 	// stranded runtime-session lock whose deferred release never ran because the

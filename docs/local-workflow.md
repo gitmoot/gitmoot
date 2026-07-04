@@ -43,7 +43,8 @@ gitmoot job list
 gitmoot job show <job-id>
 gitmoot job watch <job-id>
 gitmoot job retry <job-id>
-gitmoot job cancel <job-id>
+gitmoot job cancel <job-id>               # abandon one queued|running|blocked job
+gitmoot job cancel --state blocked --older-than 7d --yes   # bulk-dismiss a blocked backlog (dry-run without --yes)
 gitmoot job kill <root-job-id>            # operator kill switch for a runaway delegation tree
 gitmoot status --repo owner/repo
 gitmoot version --json

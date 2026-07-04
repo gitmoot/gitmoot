@@ -1045,7 +1045,8 @@ gitmoot job list
 gitmoot job show <job-id>
 gitmoot job watch <job-id>
 gitmoot job retry <job-id>
-gitmoot job cancel <job-id>
+gitmoot job cancel <job-id>               # abandon one queued|running|blocked job
+gitmoot job cancel --state blocked --older-than 7d --yes   # bulk-dismiss a blocked backlog (dry-run without --yes)
 gitmoot job kill <root-job-id>            # operator kill switch for a runaway delegation tree
 gitmoot status --repo owner/repo
 gitmoot version --json
@@ -1442,6 +1443,20 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    base branch because another PR merged first, Gitmoot asks GitHub to update
    the PR branch with the expected head SHA and leaves the merge gate pending so
    the daemon can reload the new head and checks on a later poll tick.
+
+   When a head reports **no** external CI at all (zero commit-statuses and zero
+   check-runs), Gitmoot does not conclude "this repo has no CI" from a single
+   observation — GitHub Actions creates a check-run a few seconds after a push,
+   so the gate stays **pending** and only stamps the synthetic `gitmoot/ci`
+   success after a second consecutive zero-external observation at the same head,
+   at least `[merge_gate] min_ci_wait` (default `60s`) later. When
+   `.github/workflows/` exists at the head tree it instead waits up to
+   `[merge_gate] max_ci_wait` (default `10m`) for a check to appear, then concludes
+   no-CI so a PR whose workflows never trigger for it still merges rather than
+   wedging forever. Set `[merge_gate] require_external_ci = true` (global or
+   per-repo) to hard-block an empty gate once that window elapses instead of ever
+   stamping `gitmoot/ci` (see
+   [`skills/gitmoot/references/SAFETY.md`](../skills/gitmoot/references/SAFETY.md)).
 
 9. Merge and continue.
 
@@ -2457,17 +2472,47 @@ Fixes:
 - `gitmoot job list` appends a `WHY:` column and `gitmoot job show` prints a
   `why_stuck:` line for queued/blocked jobs (#552) — a runtime-session lock
   wait (naming the holder), `blocked: awaiting human`, `auth failing: …`,
-  `throttled: …`, or `retrying: …` with the attempt schedule.
-- Deferred jobs recover on their own (#532): a delivery failure classified as
-  a retryable operational blocker (runtime auth, provider rate limit/quota) is
-  re-queued with a bounded retry budget instead of failing terminally —
-  `job show --json` carries the `blocker_class` and attempt count. Only act
-  when the retry budget is spent and the job stays failed.
+  `throttled: …`, `retrying: …`, or a `blocked-operational: <class>` deferral
+  with the attempt schedule. A deferral that needs a human (dirty/wrong-head
+  checkout) also prints a `suggested_action` naming the fix.
+- Deferred jobs recover on their own (#532): a delivery failure classified as a
+  retryable operational blocker — `runtime_auth`, `runtime_quota`,
+  `network_outage`, or `checkout_contention` — is re-queued with a bounded
+  retry budget instead of failing terminally. `job show --json` carries the
+  `blocker_class`, attempt count, and `suggested_action`. A `runtime_auth`
+  deferral only re-dispatches once a live doctor-style credential probe passes
+  (a failing probe extends the hold without spending a retry). Over `[events]`
+  the deferral is a first-class `job.deferred` emitted instead of `job.failed`.
+  Only act when the retry budget is spent and the job stays failed.
 - A job stuck in `running` is recovered automatically once it shows no lease
   progress past the staleness window (default 30m; tune with the
   `GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value
   is 1m — below-1m, malformed, or non-positive values are rejected in favor of
   the 30m default rather than clamped, #560).
+- A backlog of `blocked` jobs (each paused awaiting a human) never clears on its
+  own. Dismiss one with `gitmoot job cancel <job-id>` (cancel now abandons a
+  `blocked` job as well as a `queued`/`running` one; #631), or clear a stale
+  batch with the bulk form:
+
+  ```sh
+  gitmoot job cancel --state blocked --older-than 7d   # dry-run preview
+  gitmoot job cancel --state blocked --older-than 7d --yes
+  ```
+
+  The bulk form is a dry-run by default (it prints id/agent/repo/age and cancels
+  nothing) until you pass `--yes`; narrow it with `--older-than` (a Go duration
+  like `168h`, or a `<N>d` days suffix), `--repo owner/repo`, and `--agent name`.
+  `gitmoot doctor` warns when blocked jobs older than 30d have piled up and prints
+  the exact command. A dismissed job is not lost — `gitmoot job retry` accepts a
+  cancelled job and resurrects it.
+- To sweep the backlog automatically, set `[orchestrate].blocked_ttl` to a
+  positive Go duration (e.g. `blocked_ttl = "168h"`): the daemon then dismisses
+  any blocked job idle longer than the TTL through the same cancel path, recording
+  a `blocked_ttl_expired` job event. It is **off by default** (empty or `0s`
+  disables it; a negative value is rejected), because a blocked job is a
+  human-awaiting decision that is never auto-discarded unless you opt in. This is
+  the single-job counterpart of `[orchestrate].escalation_ttl`, which
+  auto-finalizes a whole paused delegation tree and is on by default (24h).
 
 ## Parallel Implementation And Worktrees
 
@@ -2579,6 +2624,19 @@ Fixes:
   `gitmoot task list` / `gitmoot job events <job-id>`. Resolve the conflict
   manually or run an explicit implement/fix job, then rerun review/merge.
 - Fix failing external CI or Gitmoot statuses.
+- If the reason reads `waiting to confirm no external CI` (or `waiting … for CI
+  to be created`), the gate saw **zero** external commit-statuses and check-runs
+  at the head and is deferring rather than merging before GitHub Actions creates
+  its run (#596). A genuinely CI-less repo merges on the next tick after
+  `[merge_gate] min_ci_wait` (default `60s`) has elapsed with the head unchanged.
+  A CI-configured repo (has `.github/workflows/`) stays pending until the real
+  check appears, but only up to `[merge_gate] max_ci_wait` (default `10m`) — past
+  that bound, with the head unchanged and still no check, the gate concludes no-CI
+  and merges anyway, so a PR whose workflows never trigger for it (docs-only under
+  paths filters, tag-only / `workflow_dispatch`-only workflows, a non-targeted
+  branch) is not wedged forever. Set `[merge_gate] require_external_ci = true`
+  (global or per-repo `[repos."owner/repo".merge_gate]`) to hard-block an empty
+  gate instead of stamping `gitmoot/ci` once that window elapses.
 - Rerun reviews after the PR head SHA changes.
 - If a merged task reports a worktree cleanup warning, inspect the stored task
   worktree path, clean or remove that worktree manually, then clear stale local
@@ -2614,7 +2672,7 @@ The pilot emits a tight allowlist of event types over the webhook transport:
 | `job.failed`                    | a job reaches the `failed` terminal state                                          |
 | `job.blocked`                   | a job reaches the `blocked` terminal state                                         |
 | `job.needs_attention`           | a tree pauses awaiting a human (the `escalate_human` pause today)                  |
-| `job.deferred`                  | the daemon re-queued a job that just emitted `job.failed` because the failure classified as a retryable operational blocker (runtime auth, rate limit/quota) — it will be re-dispatched automatically |
+| `job.deferred`                  | the daemon re-queued a run whose delivery failed on a retryable operational blocker (runtime auth, rate limit/quota, network/GitHub outage, checkout contention) — it will be re-dispatched automatically. Since #532 slice E this is a **first-class** transition emitted INSTEAD of `job.failed` (no preceding `job.failed` for that run) |
 | `candidate.awaiting_promotion`  | a SkillOpt template candidate becomes `pending` after import (always, off the auto-promote policy) |
 | `candidate.auto_promoted`       | the off-by-default `[skillopt].auto_promote` policy auto-promoted a candidate to `current` (also the canary GRADUATE event) |
 | `candidate.canary_started`      | the off-by-default `[skillopt].auto_promote_canary` policy promoted a candidate to the `canary` state behind the live champion |
@@ -2626,16 +2684,24 @@ pre-flight (`queued -> failed|blocked`) and permission-blocked cases that never
 pass through that path. `job.needs_attention` is emitted once per fresh
 escalation round (a re-advance does not re-emit).
 
-**`job.failed` followed by `job.deferred` is NOT terminal.** When a run fails on
-a classified operational blocker (runtime auth rejected, provider rate
-limit/quota), the engine has already emitted `job.failed` for that run before the
-daemon decides to defer; the daemon then emits `job.deferred` for the same
-`job_id` (detail carries the blocker class, the `attempt N/M` retry budget, and
-the earliest `retry at` timestamp) and silently re-dispatches the job after the
-hold. Consumers acting on `job.failed` (recovery, alerting, cleanup) should
-suppress terminal handling for a job whose `job.failed` is followed by a
-`job.deferred`, and treat only a `job.failed` with no subsequent `job.deferred`
-as final.
+**`job.deferred` is a first-class transition — a deferred run does NOT emit
+`job.failed` first.** When a run's delivery fails on a classified operational
+blocker (runtime auth rejected, provider rate limit/quota, network/GitHub outage,
+or a self-healing checkout contention), the classification now happens
+**pre-terminally** in the mailbox seam (#532 slice E): the run is re-queued
+directly and the daemon emits **only** `job.deferred` for that `job_id` (detail
+carries the blocker class, the `attempt N/M` retry budget, and the earliest
+`retry at` timestamp), then silently re-dispatches after the hold. Product
+failures (the agent answered with a `gitmoot_result`, including
+`decision=failed`) still emit `job.failed` and are never auto-retried.
+
+Migration note: before slice E the daemon emitted `job.failed` **then**
+`job.deferred` for the same run (the accepted first-slice flap); consumers had to
+suppress terminal handling for a `job.failed` followed by a `job.deferred`. That
+flap is gone. A `job.failed` with no following `job.deferred` was already the only
+"final" signal, so the safe consumer rule is unchanged and forward-compatible:
+**treat `job.failed` as final only when it is not immediately followed by a
+`job.deferred` for the same `job_id`.**
 
 The two `candidate.*` events come from the `skillopt import` / `train continue`
 CLI path, NOT the daemon (#471). When a candidate becomes `pending`,
@@ -4216,10 +4282,19 @@ mirrors the off-by-default `[events]` stream.
 - **Merged with real CI** (a passing non-`gitmoot/` external status/check at the
   merged head) → strong positive (`soft = 1.0`, `choice = a`).
 - **Merged through an empty gate** (the synthetic `gitmoot/ci` context, or no
-  external CI at head) → **near-neutral** (`soft ≈ 0.5`, `choice = a`), never a
-  strong positive. Rewarding an empty gate would optimize toward "merges that
-  pass no real CI"; the no-CI guard reads the combined status at the merged head
-  SHA and demotes it.
+  external CI at head) → the merge **event** is recorded (`choice = a`) but the
+  quality **score is genuinely absent** (`has_score = false`), **never a
+  fabricated `0.5`** (#474). Rewarding an empty gate would optimize toward "merges
+  that pass no real CI", and inventing a `0.5` midpoint violates the rest of the
+  projection's rule (it returns `has_score = false` when a signal is truly
+  missing). The no-CI guard reads the combined status at the merged head SHA; when
+  the #614/#596 `gitmoot/ci` "no external CI" stamp is present, the reasoning marks
+  it a **confirmed** empty gate (the grace/workflow window elapsed → genuinely no
+  CI, vs. a still-racing zero). To turn a no-CI merge back into a real `0`/`1`
+  quality signal, enable the **hard-verifier tier** below. (On the merge side, an
+  empty gate is itself deferred by a grace window and workflow-awareness before it
+  ever stamps `gitmoot/ci` — see
+  [`SAFETY.md`](../skills/gitmoot/references/SAFETY.md); #596.)
 - **Blocked at the merge gate** → authoritative gate-fail (`hard = 0`,
   `choice = b`).
 - **Review changes_requested** → graded negative (`choice = b`) whose score
@@ -4354,6 +4429,78 @@ swallowed. Promotion stays manual (the leg writes only `eval_runs` /
 > the PR head, so the tool-backed dimensions are effectively produced only when such
 > a checkout happens to be available; `diff_size` always runs. Plumbing a PR-head
 > worktree through to the tool runners is a documented follow-on.
+
+### Deterministic hard-verifier tier (off by default)
+
+Where the `diff_size`/`lint`/`complexity` checkers above produce **soft** quality
+priors, the **hard-verifier tier** (#474, RFC-informed by THUDM/slime's coding-agent
+grading loop) produces a single **un-gameable `0`/`1`** — the authoritative
+`EvaluatorScore.Hard`. Setting **all three** of `[skillopt].auto_trace_enabled = true`,
+`[skillopt].hard_verifiers_enabled = true`, **and at least one**
+`hard_verifier_commands` line (all default off/empty) runs the operator's configured
+verifier commands in a **fresh, clean sandbox checkout at the merged head** — an
+**independent local `git clone`** of the daemon checkout (`git clone --local`, so
+objects are hardlinked but the clone gets its **own** git directory: config, refs, gc,
+worktree registry), reusing gitmoot's single-binary git tooling (no E2B / containers /
+network fetch). Because the clone is git-independent, a verifier that shells out to git
+(`git config`, `git update-ref`, `git gc`, `git worktree prune`) is confined to the
+throwaway clone and **cannot mutate the live daemon checkout** — the containment a
+detached `git worktree` off the base could not give (a worktree shares the base's
+object DB, refs, and config). Each command runs via `sh -c` with its **working
+directory set to the throwaway sandbox**, so relative writes and git state alike stay
+inside it; `exit 0 == pass`:
+
+```toml
+[skillopt]
+auto_trace_enabled = true
+hard_verifiers_enabled = true
+hard_verifier_commands = go build ./...
+hard_verifier_commands = go test ./...
+```
+
+`hard_verifier_commands` is **repeatable** — one command per line — so a command may
+itself contain commas / shell operators. The verdict is **fail-closed**: it PASSES
+only when **every** command exits `0` (slime's `fail_to_pass ∪ pass_to_pass ⊆
+passed`). The binary verdict maps onto `EvaluatorScore.Hard`: **pass → `hard = 1.0`**
+(a strong, evidence-backed positive, `choice = a`), **fail → `hard = 0.0`** (an
+authoritative gate-fail, `choice = b`) — a merge whose code actually fails a clean
+build/test is caught **even when it merged through an empty gate**, and no LLM judge's
+prose can move it.
+
+> **The sandbox is a BARE checkout — commands must self-provision.** It carries only
+> the merged code: **no installed dependencies, build artifacts, or generated files**,
+> and only the daemon's ambient PATH. Write each command self-contained
+> (`npm ci && npm test`, `pip install -e . && pytest`; `go test ./...` fetches modules
+> itself) — a command that assumes a pre-existing `node_modules`/`venv` will fail every
+> merge and record a **false `hard = 0`** against a genuinely-good implementer, which
+> would poison the optimizer's training signal. Guard rail: a command that cannot be
+> **run at all** (its interpreter/binary is absent — a POSIX exit `127`
+> command-not-found, or a missing `sh`) is treated as an **environment failure and
+> SKIPS the whole run** (no hard row), so a missing toolchain never fabricates a
+> negative. But a command that *runs* and exits non-zero *because* deps were missing is
+> an honest `hard = 0` — the skip only covers un-runnable commands, so keep each command
+> self-provisioning.
+
+The verdict is written as a **fourth** `FeedbackEvent` in the SAME
+`auto-trace:<version>` run under a distinct item id (`hard#<repo>#<pr>`) and the fixed
+`gitmoot-verifier` reviewer sentinel — so it **coexists with** (never overwrites) the
+verifiable floor (`gitmoot-auto`), the cross-family review (`gitmoot-review`), and the
+objective checker (`gitmoot-checker`) under the run's UNIQUE
+`(run_id,item_id,reviewer,source,source_url)` key; a re-verification re-upserts the
+SAME hard row in place. The hard eval item carries `hard_verifier = true`,
+`hard_passed`, the projected `hard_score`, and the per-command `command_results`
+(which command failed), while the run keeps `feedback_source = automatic_trace` —
+additive, **no new contract field, `contract_version` stays `1`**.
+
+The leg runs **off the blocking merge path** (detached, `HardVerifierLegTimeout`-bounded,
+process-group killed so a wedged suite and its grandchildren are reaped) and is
+**fail-safe throughout**: an unprovisionable sandbox (the merged head not present in
+the base checkout), an empty command list, or a command that could not be run at all
+(missing toolchain) yields **no hard row** and never errors the harvest, blocks the
+merge, or stalls `AdvanceJob`; a dispatch failure records a `hard_verifiers_failed` job
+event and is swallowed. Because it re-runs the tests, it
+only maps onto **testable** implement legs — subjective review-quality kinds keep the
+soft cross-family signal. Promotion stays manual.
 
 ### Promotion policy + notifications (off by default)
 
@@ -5985,9 +6132,9 @@ gitmoot lock list --repo owner/project
 gitmoot lock show owner/project <branch>
 ```
 
-Only retry failed, blocked, or cancelled jobs. Only cancel queued or running
-jobs. Use `gitmoot lock release owner/project <branch> --owner <agent>` for an
-exact-owner stale lock; use `--force` only when the stored owner is stale.
+Only retry failed, blocked, or cancelled jobs. Only cancel queued, running, or
+blocked jobs. Use `gitmoot lock release owner/project <branch> --owner <agent>`
+for an exact-owner stale lock; use `--force` only when the stored owner is stale.
 
 ## Known V1 Limits
 
@@ -7559,7 +7706,7 @@ equivalent:
   previous version (same as `gitmoot agent template revert`).
 - **Jobs** lists every job with a state summary: `enter` shows the event
   history, `R` retries failed/blocked/cancelled jobs (same path as
-  `gitmoot job retry`), `c` cancels queued AND running jobs (same as
+  `gitmoot job retry`), `c` cancels queued, running, AND blocked jobs (same as
   `gitmoot job cancel`; running ones show `cancelling…` until the daemon
   settles them), and `B` opens a redacted bug-report preview for
   failed/blocked/cancelled jobs. In the preview, `g` creates or reuses the
@@ -7625,11 +7772,12 @@ redacted JSON event to that endpoint for: `job.finished`, `job.failed`,
 (`candidate.awaiting_promotion`, `candidate.auto_promoted`,
 `candidate.canary_started`, `candidate.rolled_back`). Delivery is best-effort
 (bounded buffer + timeout; drops are recorded as a local `event_sink_drop` job
-event, never blocking the job). Consumer rule: **`job.failed` followed by
-`job.deferred` for the same job id is NOT terminal** — the daemon classified the
-failure as a retryable operational blocker and will re-dispatch it; treat only
-a `job.failed` with no subsequent `job.deferred` as final. See `docs/events.md`
-for the full contract.
+event, never blocking the job). Consumer rule: **treat a `job.failed` as final
+only when it is NOT immediately followed by a `job.deferred` for the same job
+id.** Since #532 slice E a deferred run emits `job.deferred` as a first-class
+transition **instead of** `job.failed` (no preceding `job.failed`); the rule
+still holds and is forward-compatible with the older `job.failed`→`job.deferred`
+flap. See `docs/events.md` for the full contract.
 
 ## Bug Reports
 
@@ -8097,7 +8245,8 @@ gitmoot job show <job-id>            # add --json for the full job + why-stuck d
 gitmoot job watch <job-id>
 gitmoot job events <job-id>
 gitmoot job retry <job-id>
-gitmoot job cancel <job-id>
+gitmoot job cancel <job-id>                                        # one queued|running|blocked job
+gitmoot job cancel --state blocked [--older-than 7d] [--repo owner/repo] [--agent name] [--yes]
 gitmoot job kill <root-job-id>
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
@@ -8114,20 +8263,30 @@ For a `queued` or `blocked` job, `gitmoot job list` appends a `WHY:` column and
 `gitmoot job show` prints a `why_stuck:` (and, when a lease applies, a
 `next_retry_at:`) line explaining what the job is waiting on — e.g. `waiting on
 runtime session lock runtime:codex:<ref> (held by job <id>)`, `blocked: awaiting
-human`, `auth failing: …`, `throttled: …`, or `retrying: …`. The reason is
-derived from the most authoritative existing signal (the latest reason-bearing
-`job events` entry plus the owning resource lock's lease); a healthy job's output
-is unchanged. `gitmoot doctor` proactively validates `gh auth` (with an
-actionable remediation hint) and the Claude runtime token so a bad credential is
-caught before a job stalls on it.
+human`, `auth failing: …`, `throttled: …`, `retrying: …`, or a
+`blocked-operational: <class>` deferral. The reason is derived from the most
+authoritative existing signal (the latest reason-bearing `job events` entry plus
+the owning resource lock's lease); a healthy job's output is unchanged. When a
+deferral usually needs a human (a dirty or wrong-head checkout), the row/`job
+show` also carries a `suggested_action` naming the concrete fix. `gitmoot doctor`
+proactively validates `gh auth` (with an actionable remediation hint) and the
+Claude runtime token so a bad credential is caught before a job stalls on it.
 
-Operational blockers auto-retry (#532): a delivery failure classified as
-`runtime_auth` or `runtime_quota` does **not** fail the job terminally — the
-daemon re-queues it as **deferred** with a bounded retry budget and a hold
-until the earliest retry time. `gitmoot job show --json` carries the
-`blocker_class` and attempt count, and over the `[events]` stream a
-`job.deferred` follows the `job.failed` (making it non-terminal). So a job that
-"failed then reappeared as queued" is the deferral working, not a bug.
+Operational blockers auto-retry (#532): a delivery failure classified as an
+operational blocker — `runtime_auth`, `runtime_quota`, `network_outage`
+(transient network/GitHub outage), or `checkout_contention` (a self-healing
+branch-lock conflict, or a dirty/wrong-head checkout that carries a
+`suggested_action`) — does **not** fail the job terminally. The daemon re-queues
+it as **deferred** with a bounded retry budget and a hold until the earliest
+retry time, shown as `blocked-operational: <class>: attempt n/3`. `gitmoot job
+show --json` carries the `blocker_class`, attempt count, and `suggested_action`.
+Over the `[events]` stream the deferral is now a **first-class** `job.deferred`
+transition emitted **instead of** `job.failed` (no preceding `job.failed` for
+that run). A `runtime_auth` deferral only re-dispatches once a live doctor-style
+credential probe passes; the probe failing just extends the hold without spending
+a retry. So a job that "failed then reappeared as queued" is the deferral
+working, not a bug. Product failures (the agent answered with a `gitmoot_result`,
+including `decision=failed`) are never auto-retried.
 
 Jobs stuck in `running` are also backstopped: a running job with no lease
 progress past the staleness window (default 30m) is assumed orphaned by a dead
@@ -8136,10 +8295,41 @@ worker and recovered/re-queued. The window is tunable via the
 below-1m, malformed, or non-positive values are rejected (with a one-time
 warning) in favor of the 30m default rather than clamped (#560).
 
-`gitmoot job cancel <job-id>` also releases any resource locks the cancelled job
-still owned — including a stranded `runtime:<rt>:<session>` lock left behind when
-a foreground `gitmoot agent ask` was killed — so the next ask on that agent does
-not wait out the lock TTL before it can run.
+`gitmoot job cancel <job-id>` is the single-job **abandon** verb. It dismisses a
+`queued`, `running`, **or `blocked`** job (a blocked job is one paused awaiting a
+human — an operator permission gate or an unrecoverable blocker — so dismissing it
+is the same abandon intent as cancelling a queued/running one; #631). Cancel is a
+single-row transition: it does **not** propagate to a delegation tree, touch task
+state, or set the killed flag — abandoning a whole tree is `gitmoot job kill`.
+Cancelling also releases any resource locks the cancelled job still owned —
+including a stranded `runtime:<rt>:<session>` lock left behind when a foreground
+`gitmoot agent ask` was killed — so the next ask on that agent does not wait out
+the lock TTL before it can run. Dismissal is reversible: `gitmoot job retry`
+accepts a cancelled job (its accepted source states are failed/blocked/cancelled),
+so a mistakenly dismissed job can be resurrected.
+
+`gitmoot job cancel --state blocked` is the **bulk** form for clearing a backlog
+of blocked jobs. Only `blocked` is accepted for `--state` (queued/running jobs use
+single-job cancel; terminal jobs use retry). Narrow the selection with
+`--older-than` (a Go duration like `168h`, or a convenience `<N>d` days suffix like
+`7d`; age is measured from when each job became blocked), `--repo owner/repo`
+(matches the job's payload repo), and `--agent name`. The bulk form is a **dry-run
+by default** — it prints the matching jobs (id, agent, repo, age) and exits without
+cancelling anything; pass `--yes` to actually cancel the selection. Each selected
+job is dismissed through the same per-job cancel path, so its locks are released
+too. `<id>` and `--state` are mutually exclusive, and `--older-than`/`--repo`/
+`--agent` require `--state`. `gitmoot doctor` warns when blocked jobs older than
+30d have piled up and prints this exact command as the remediation.
+
+To automate the sweep, set `[orchestrate].blocked_ttl` to a positive Go duration
+(e.g. `blocked_ttl = "168h"`): the daemon's housekeeping tick then dismisses any
+blocked job whose blocked-transition timestamp (updated_at, created_at fallback)
+is older than the TTL, through the same `CancelJob` abandon path, recording a
+distinct `blocked_ttl_expired` job event so a TTL auto-expiry is distinguishable
+from a manual `job cancel`. It is **off by default** — an empty or `0s` value
+disables it (a negative value is rejected). Unlike `[orchestrate].escalation_ttl`
+(which auto-finalizes a whole paused delegation *tree* and is on by default, 24h),
+`blocked_ttl` dismisses a *single* blocked job and is off by default.
 
 Merge-gate retries are automatic while the daemon is running. Retryable states,
 such as a busy base-branch merge queue or a GitHub branch update in progress,
@@ -9361,6 +9551,35 @@ conflict. When an **external** system owns the merge decision instead, set
 then **abstains** from its native merge gate — fail-closed, meaning it never
 merges gatelessly; the external gate makes the call.
 
+### No external CI: grace window, not instant pass (#596)
+
+When a PR head reports **zero** external commit-statuses **and** zero check-runs,
+Gitmoot does **not** immediately treat the repo as CI-less and stamp the
+synthetic `gitmoot/ci` success. GitHub Actions creates a check-run a few seconds
+*after* a head is pushed, so a single zero observation cannot distinguish "no CI
+configured" from "CI not created yet" — and a fast approve path could otherwise
+merge inside that window before CI exists. Instead the gate returns **pending**
+and only concludes "no CI" after a **second consecutive zero-external observation
+at the same head**, at least `min_ci_wait` (default `60s`) later. The gate is
+re-evaluated every daemon poll, so a genuinely CI-less repo merges exactly one
+grace window later. Two extra guards layer on top:
+
+- **Workflow-aware (bounded):** if `.github/workflows/` exists at the head tree,
+  the gate treats a zero observation as an Actions creation lag and stays pending
+  — but only up to `max_ci_wait` (default `10m`) with the head unchanged. Past
+  that bound it concludes no-CI, so a PR whose workflows never produce a check for
+  it (docs-only under paths filters, tag-only / `workflow_dispatch`-only
+  workflows, a non-targeted branch) still merges instead of wedging forever, while
+  the ~seconds creation lag is still covered.
+- **`[merge_gate] require_external_ci`** (global, or per-repo under
+  `[repos."owner/repo".merge_gate]`; default `false`): when `true`, an empty gate
+  **hard-blocks** with an actionable reason — *after* the wait window above, never
+  during the creation-lag race — instead of ever stamping `gitmoot/ci`. Use it for
+  repos you know always have CI. The block is classified transient (it is a
+  repo-config/operator-policy condition, not a template defect), so it is not
+  scored against the implement template. Optionally tune `min_ci_wait` /
+  `max_ci_wait` in the same section.
+
 Useful commands:
 
 ```sh
@@ -9490,7 +9709,15 @@ cannot recurse or fan out forever:
   not a hard stop — in-flight jobs finish normally, the coordinator's next
   continuation routes through the same finalize path below (a
   `delegation_killed` event is emitted), and the daemon stops starting queued
-  children of the killed root.
+  children of the killed root. Kill is for a whole **tree**; to abandon a single
+  job (including one blocked awaiting a human) use `gitmoot job cancel <job-id>`
+  instead — or clear a stale backlog of blocked jobs with `gitmoot job cancel
+  --state blocked --older-than 7d --yes` (dry-run without `--yes`). Cancel is a
+  single-row transition that never propagates to siblings or the coordinator, so
+  it must not be routed through the kill machinery (#631). Setting a positive
+  `[orchestrate].blocked_ttl` (off by default) lets the daemon auto-dismiss a
+  blocked job idle longer than the TTL through that same cancel path — the
+  single-job counterpart to the tree-wide `escalation_ttl` below.
 - Human-in-the-loop pause (`escalate_human` failure_policy, #340): when a child
   fails under `escalate_human`, the parent task enters the resumable
   `awaiting_human` state, a one-shot `delegation_escalation_requested` event is

@@ -44,6 +44,24 @@ func initHomeWithEscalationTTL(t *testing.T, ttl string) string {
 	return home
 }
 
+// initHomeWithBlockedTTL writes a real, initialized home with an
+// [orchestrate].blocked_ttl set, returning the raw home root. It writes the
+// config directly (bypassing LoadOrchestratePolicy validation) so a negative or
+// unparseable value can be pinned for the off-by-default resolveBlockedTTL cases.
+func initHomeWithBlockedTTL(t *testing.T, ttl string) string {
+	t.Helper()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	body := "[orchestrate]\nblocked_ttl = \"" + ttl + "\"\n"
+	if err := os.WriteFile(paths.ConfigFile, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return home
+}
+
 func assertNoPhantom(t *testing.T, home string) {
 	t.Helper()
 	if _, err := os.Stat(phantomDir(home)); !os.IsNotExist(err) {
@@ -120,6 +138,61 @@ func TestResolveEscalationTTLTable(t *testing.T) {
 	// Zero filesystem side effects: neither home grew a phantom doubled root.
 	assertNoPhantom(t, present)
 	assertNoPhantom(t, absent)
+}
+
+// BLOCKED TTL (#631): resolveBlockedTTL shares resolveEscalationTTL's shape-tolerant,
+// side-effect-free config resolution but has NO default fallback — the sweep is OFF
+// unless the operator opted in with a positive duration. This pins that contract
+// (positive -> duration; unset/zero/negative/unparseable -> 0) AND the home-shape
+// invariant the #446/#459 seam shares: a raw --home and the already-resolved
+// <home>/.gitmoot root resolve identically with no phantom doubled home.
+func TestResolveBlockedTTLShapeTolerantNoPhantom(t *testing.T) {
+	// A positive TTL resolves identically for BOTH the raw --home and the resolved
+	// <home>/.gitmoot root, creating no phantom in either case.
+	positive := initHomeWithBlockedTTL(t, "48h")
+	positiveResolved := config.PathsForHome(positive).Home
+
+	rawTTL := resolveBlockedTTL(positive)
+	if rawTTL != 48*time.Hour {
+		t.Fatalf("resolveBlockedTTL(raw) = %s, want 48h", rawTTL)
+	}
+	assertNoPhantom(t, positive)
+
+	resolvedTTL := resolveBlockedTTL(positiveResolved)
+	if resolvedTTL != 48*time.Hour {
+		t.Fatalf("resolveBlockedTTL(resolved) = %s, want 48h", resolvedTTL)
+	}
+	assertNoPhantom(t, positive)
+	if rawTTL != resolvedTTL {
+		t.Fatalf("blocked_ttl differs across home shapes: raw=%s resolved=%s", rawTTL, resolvedTTL)
+	}
+
+	// Off-by-default: an unset value, an explicit zero, a negative (rejected by
+	// LoadOrchestratePolicy, leaving the empty default), and an unparseable duration
+	// all resolve to 0 so the sweep stays disabled.
+	unset := t.TempDir()
+	if err := config.Initialize(config.PathsForHome(unset)); err != nil {
+		t.Fatalf("Initialize unset: %v", err)
+	}
+	cases := []struct {
+		name string
+		home string
+	}{
+		{"unset-raw", unset},
+		{"unset-resolved", config.PathsForHome(unset).Home},
+		{"zero", initHomeWithBlockedTTL(t, "0s")},
+		{"negative", initHomeWithBlockedTTL(t, "-1h")},
+		{"unparseable", initHomeWithBlockedTTL(t, "soon")},
+		{"empty", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveBlockedTTL(tc.home); got != 0 {
+				t.Fatalf("resolveBlockedTTL(%q) = %s, want 0 (sweep disabled)", tc.home, got)
+			}
+		})
+	}
+	assertNoPhantom(t, unset)
 }
 
 // PHANTOM producer #2 (durable hardening): the read-only policy loaders must

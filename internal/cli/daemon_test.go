@@ -5007,6 +5007,188 @@ func TestRecoverExpiredRuntimeSessionLocksRequeuesOwnerBeforeGlobalStaleWindow(t
 	}
 }
 
+// blockedTTLTestStore builds a fresh store on a retained home so the blocked_ttl
+// sweep tests can backdate a blocked job's updated_at through a second raw
+// connection (there is no store setter for updated_at; the blocked transition
+// stamps CURRENT_TIMESTAMP). It mirrors daemonWorkerStore but returns paths.
+func blockedTTLTestStore(t *testing.T) (*db.Store, config.Paths) {
+	t.Helper()
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	})
+	return store, paths
+}
+
+// backdateJobUpdatedAt rewrites a job's updated_at to an explicit SQLite-UTC
+// timestamp through a raw connection, so a blocked job can be aged past the sweep
+// window deterministically without a wall-clock sleep.
+func backdateJobUpdatedAt(t *testing.T, dbPath, jobID string, when time.Time) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open returned error: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.ExecContext(context.Background(), `UPDATE jobs SET updated_at = ? WHERE id = ?`, when.UTC().Format("2006-01-02 15:04:05"), jobID); err != nil {
+		t.Fatalf("backdate updated_at returned error: %v", err)
+	}
+}
+
+// TestSweepExpiredBlockedJobsCancelsOnlyOlderThanTTL pins #631: with a positive
+// TTL the sweep dismisses only the blocked job aged past now-ttl (via CancelJob,
+// so it lands in cancelled with a distinct blocked_ttl_expired history event),
+// leaving a recently-blocked job and its history untouched.
+func TestSweepExpiredBlockedJobsCancelsOnlyOlderThanTTL(t *testing.T) {
+	ctx := context.Background()
+	store, paths := blockedTTLTestStore(t)
+	for _, id := range []string{"job-old", "job-recent"} {
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: id, Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
+		if err := store.UpdateJobState(ctx, id, string(workflow.JobBlocked)); err != nil {
+			t.Fatalf("UpdateJobState(%s) returned error: %v", id, err)
+		}
+	}
+	now := time.Now().UTC()
+	// job-old blocked two hours ago (past the 1h TTL); job-recent stays at ~now.
+	backdateJobUpdatedAt(t, paths.Database, "job-old", now.Add(-2*time.Hour))
+
+	if err := sweepExpiredBlockedJobs(ctx, store, time.Hour, io.Discard, now); err != nil {
+		t.Fatalf("sweepExpiredBlockedJobs returned error: %v", err)
+	}
+
+	old, err := store.GetJob(ctx, "job-old")
+	if err != nil {
+		t.Fatalf("GetJob(job-old) returned error: %v", err)
+	}
+	if old.State != string(workflow.JobCancelled) {
+		t.Fatalf("job-old state = %q, want cancelled", old.State)
+	}
+	oldEvents, err := store.ListJobEvents(ctx, "job-old")
+	if err != nil {
+		t.Fatalf("ListJobEvents(job-old) returned error: %v", err)
+	}
+	if !daemonWorkerHasEvent(oldEvents, jobEventBlockedTTLExpired) {
+		t.Fatalf("job-old events = %+v, want a %s event", oldEvents, jobEventBlockedTTLExpired)
+	}
+	if !daemonWorkerHasEvent(oldEvents, string(workflow.JobCancelled)) {
+		t.Fatalf("job-old events = %+v, want the CancelJob cancelled event too", oldEvents)
+	}
+
+	recent, err := store.GetJob(ctx, "job-recent")
+	if err != nil {
+		t.Fatalf("GetJob(job-recent) returned error: %v", err)
+	}
+	if recent.State != string(workflow.JobBlocked) {
+		t.Fatalf("job-recent state = %q, want blocked (untouched)", recent.State)
+	}
+	recentEvents, err := store.ListJobEvents(ctx, "job-recent")
+	if err != nil {
+		t.Fatalf("ListJobEvents(job-recent) returned error: %v", err)
+	}
+	if daemonWorkerHasEvent(recentEvents, jobEventBlockedTTLExpired) {
+		t.Fatalf("job-recent events = %+v, want no %s event", recentEvents, jobEventBlockedTTLExpired)
+	}
+}
+
+// TestSweepExpiredBlockedJobsDisabledSweepsNothing pins the off-by-default
+// contract (#631): with ttl <= 0 the sweep is an immediate no-op even for a
+// long-blocked job, so a human-awaiting decision is never silently discarded.
+func TestSweepExpiredBlockedJobsDisabledSweepsNothing(t *testing.T) {
+	ctx := context.Background()
+	store, paths := blockedTTLTestStore(t)
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-blocked", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
+	if err := store.UpdateJobState(ctx, "job-blocked", string(workflow.JobBlocked)); err != nil {
+		t.Fatalf("UpdateJobState returned error: %v", err)
+	}
+	now := time.Now().UTC()
+	backdateJobUpdatedAt(t, paths.Database, "job-blocked", now.Add(-30*24*time.Hour))
+
+	if err := sweepExpiredBlockedJobs(ctx, store, 0, io.Discard, now); err != nil {
+		t.Fatalf("sweepExpiredBlockedJobs returned error: %v", err)
+	}
+
+	job, err := store.GetJob(ctx, "job-blocked")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobBlocked) {
+		t.Fatalf("job state = %q, want blocked (sweep disabled)", job.State)
+	}
+	events, err := store.ListJobEvents(ctx, "job-blocked")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if daemonWorkerHasEvent(events, jobEventBlockedTTLExpired) {
+		t.Fatalf("events = %+v, want no %s event when disabled", events, jobEventBlockedTTLExpired)
+	}
+}
+
+// TestRunDaemonWorkerTickBlockedTTLSweepsAgedBlockedJob closes the config-path
+// wiring gap for #631: the direct sweep tests above pass the TTL in literally, so
+// they never exercise resolveBlockedTTL(worker.workflowHome()) or the tick call that
+// feeds it. Here a configured [orchestrate].blocked_ttl must reach the tick's sweep
+// end-to-end and cancel a blocked job aged past the window — proving the config ->
+// resolve -> sweep seam (the #446/#459 home-resolution path) is wired, not just that
+// sweepExpiredBlockedJobs works when handed a TTL.
+func TestRunDaemonWorkerTickBlockedTTLSweepsAgedBlockedJob(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	// Opt into the sweep with a 1h window (disabled by default).
+	if err := os.WriteFile(paths.ConfigFile, []byte("[orchestrate]\nblocked_ttl = \"1h\"\n"), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	})
+
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-blocked", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
+	if err := store.UpdateJobState(ctx, "job-blocked", string(workflow.JobBlocked)); err != nil {
+		t.Fatalf("UpdateJobState returned error: %v", err)
+	}
+	now := time.Now().UTC()
+	// Aged two hours ago, past the configured 1h window.
+	backdateJobUpdatedAt(t, paths.Database, "job-blocked", now.Add(-2*time.Hour))
+
+	worker := defaultJobWorker(store, io.Discard, home)
+	if err := runDaemonWorkerTick(ctx, store, worker, 0, false, "", "", io.Discard, now); err != nil {
+		t.Fatalf("runDaemonWorkerTick returned error: %v", err)
+	}
+
+	job, err := store.GetJob(ctx, "job-blocked")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobCancelled) {
+		t.Fatalf("job state = %q, want cancelled (blocked_ttl sweep driven by tick)", job.State)
+	}
+	events, err := store.ListJobEvents(ctx, "job-blocked")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !daemonWorkerHasEvent(events, jobEventBlockedTTLExpired) {
+		t.Fatalf("events = %+v, want a %s event", events, jobEventBlockedTTLExpired)
+	}
+}
+
 // TestRecoverRunningJobsHonorsLiveRuntimeLease is the #536 regression: a
 // long-running job (e.g. a 4h delegation) holds a runtime-session lock whose LEASE
 // reflects its real job timeout. The coarse `updated_at < before` staleness

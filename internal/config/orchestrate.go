@@ -67,6 +67,16 @@ type OrchestratePolicy struct {
 	// daemon's background scan auto-finalizes it (#340), as a Go duration string.
 	// Empty (the default) uses DefaultEscalationTTL (24h); the daemon parses it.
 	EscalationTTL string
+	// BlockedTTL is the opt-in maximum time a job may sit BLOCKED — paused awaiting a
+	// human (an operator permission gate or an unrecoverable BlockedError) — before
+	// the daemon's housekeeping sweep dismisses it via CancelJob (#631), as a Go
+	// duration string. Empty or zero (the DEFAULT) means the sweep is DISABLED: a
+	// blocked job is a human-awaiting decision and is NEVER auto-discarded unless the
+	// operator opts in with a positive duration; a negative value is rejected. Unlike
+	// EscalationTTL — which auto-finalizes a whole paused delegation TREE and is ON by
+	// default — this dismisses a SINGLE blocked job and is OFF by default. The daemon
+	// resolves it per tick via resolveBlockedTTL.
+	BlockedTTL string
 	// MaxDelegationNonProgressStreak is the per-root threshold for the result-aware
 	// non-progress loop detector (#339): how many consecutive continuation
 	// generations a delegation tree may produce with no new durable side effect
@@ -110,6 +120,7 @@ func DefaultOrchestratePolicy() OrchestratePolicy {
 		MaxDelegationCostUSD:           0,
 		EscalationHandle:               "",
 		EscalationTTL:                  "",
+		BlockedTTL:                     "",
 		MaxDelegationNonProgressStreak: 0,
 		MaxVerifyReplanAttempts:        0,
 		DefaultDelegationTimeout:       "",
@@ -201,6 +212,10 @@ func applyOrchestratePolicyField(policy *OrchestratePolicy, key string, value st
 		parsed, err := parseConfigString(value)
 		policy.EscalationTTL = strings.TrimSpace(parsed)
 		return err
+	case "blocked_ttl":
+		parsed, err := parseConfigString(value)
+		policy.BlockedTTL = strings.TrimSpace(parsed)
+		return err
 	case "max_delegation_non_progress_streak":
 		parsed, err := strconv.Atoi(value)
 		policy.MaxDelegationNonProgressStreak = parsed
@@ -265,6 +280,18 @@ func validateOrchestratePolicy(policy OrchestratePolicy) error {
 		}
 		if parsed <= 0 {
 			return fmt.Errorf("orchestrate.escalation_ttl must be positive")
+		}
+	}
+	if ttl := strings.TrimSpace(policy.BlockedTTL); ttl != "" {
+		parsed, err := time.ParseDuration(ttl)
+		if err != nil {
+			return fmt.Errorf("orchestrate.blocked_ttl %q is invalid: %w", ttl, err)
+		}
+		// Zero is the explicit "disabled" form (like an empty value); only a
+		// NEGATIVE duration is a misconfiguration to reject, since the blocked_ttl
+		// sweep is off-by-default and a non-positive value simply keeps it off.
+		if parsed < 0 {
+			return fmt.Errorf("orchestrate.blocked_ttl must be zero (disabled) or a positive duration")
 		}
 	}
 	if policy.MaxDelegationNonProgressStreak < 0 {

@@ -902,9 +902,9 @@ gitmoot lock list --repo owner/project
 gitmoot lock show owner/project <branch>
 ```
 
-Only retry failed, blocked, or cancelled jobs. Only cancel queued or running
-jobs. Use `gitmoot lock release owner/project <branch> --owner <agent>` for an
-exact-owner stale lock; use `--force` only when the stored owner is stale.
+Only retry failed, blocked, or cancelled jobs. Only cancel queued, running, or
+blocked jobs. Use `gitmoot lock release owner/project <branch> --owner <agent>`
+for an exact-owner stale lock; use `--force` only when the stored owner is stale.
 
 ## Known V1 Limits
 

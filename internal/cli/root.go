@@ -136,6 +136,13 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	// Paths zero, which skips the daemon check and keeps the shell-local one.
 	paths, _ := config.DefaultPaths()
 	checks := doctor.Checker{Dir: *repoDir, LiveProbe: true, Paths: paths}.Run(context.Background())
+	// #631: surface a stale backlog of blocked jobs (each paused awaiting a human)
+	// so an operator knows they can be bulk-dismissed. Best-effort and appended to
+	// both the text table and the --json array; the dashboard's cheaper
+	// GlobalChecks path deliberately omits it so a refresh never opens the store.
+	if check, ok := blockedBacklogDoctorCheck(paths); ok {
+		checks = append(checks, check)
+	}
 	if *jsonOutput {
 		type checkJSON struct {
 			Name     string `json:"name"`
