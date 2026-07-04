@@ -37,6 +37,14 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
+      label: 'Dashboard',
+      items: [
+        'dashboard/overview',
+        'dashboard/views',
+      ],
+    },
+    {
+      type: 'category',
       label: 'Plugins',
       items: [
         'plugins/codex-claude',

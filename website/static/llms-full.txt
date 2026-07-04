@@ -3919,6 +3919,103 @@ and classifies the run as `generation_complete`, `generation_incomplete`, or
 missing items remains `train continue`'s job). `--abort` reclaims the lock and
 leaves the phase at `items_ready`, keeping persisted items.
 
+## Pre-Canary Replay Gate
+
+The replay gate (`#627`, AutoMem A.2) is an **off-by-default**, deterministic
+check that runs **before** a candidate reaches canary. It replays a candidate
+template against a **fixed, versioned job corpus** and accepts the candidate only
+on **strict improvement** over the current champion on the **same** corpus — a
+tie (parity) or any regression fails. It reuses the existing deterministic
+scorers (the `#474` hard-verifier tier and the `#485` deterministic checkers) on
+the corpus outputs, so it invents no new judge and runs **no live LLM in the gate
+itself**: the replay driver is a deterministic `sh -c` command.
+
+### Corpus
+
+A corpus is a plain, versioned JSON file — the same fixed seeds every replay runs
+on:
+
+```json
+{
+  "kind": "gitmoot-skillopt-gate-corpus",
+  "version": 1,
+  "replay_command": "sh .gitmoot/skillopt/gate-replay.sh",
+  "items": [
+    { "id": "widget-a", "prompt": "implement widget A", "expected": "builds" },
+    { "id": "widget-b", "prompt": "implement widget B", "expected": "builds" }
+  ]
+}
+```
+
+Every item needs a unique non-empty `id` and a non-empty `prompt`. `version` is
+`>= 1` so a scoring change is auditable. `replay_command` is optional here and can
+instead come from `--replay-command` or `[skillopt].gate_replay_command`.
+
+### Replay driver contract
+
+For each corpus item the gate runs the replay command via `sh -c` with the
+candidate template staged to a temp file and the item passed in the environment:
+
+- `GITMOOT_GATE_TEMPLATE_FILE` — path to the candidate template content;
+- `GITMOOT_GATE_PROMPT` — the item prompt;
+- `GITMOOT_GATE_EXPECTED` — the item's expected/verifiable outcome;
+- `GITMOOT_GATE_ITEM_ID` — the item id.
+
+The command emits a deterministic per-item result JSON on stdout, in the same
+shape the hard-verifier / deterministic-checker tiers produce, so the existing
+scorers project it into a `[0,1]` score:
+
+```json
+{ "rubric": { "build": 1.0, "test": 0.5 } }
+```
+
+or a binary hard verdict:
+
+```json
+{ "hard_verifier": true, "hard_passed": true }
+```
+
+Because the command is the deterministic map, two replays over the same corpus +
+template yield **identical** scores.
+
+### Running the gate
+
+```sh
+gitmoot skillopt gate run --candidate planner@v2 --corpus .gitmoot/skillopt/gate-corpus.json
+gitmoot skillopt gate run --candidate planner@v2 --json   # machine-readable pass/fail + per-item deltas
+gitmoot skillopt gate history --candidate planner@v2      # persisted audit trail
+```
+
+`gate run` scores the champion and candidate on the corpus, prints pass/fail plus
+per-item deltas, and **persists** the run (additive `skillopt_gate_runs` table)
+for audit. It exits non-zero on a rejected gate so a script can branch on the
+verdict.
+
+### One-retry protocol
+
+On a gate failure the protocol takes **exactly one** retry that feeds the failing
+replay log back to the optimizer step and re-gates the revised candidate; a
+**second** failure is a reject (a clean restart is the operator's choice). The CLI
+`gate run` is a single evaluation (attempt 1); the optimizer-fed retry runs where
+the optimizer is available in the train workflow.
+
+### Config and promotion blocking
+
+The gate is wired as an optional, off-by-default step. Turn it on in `[skillopt]`:
+
+```toml
+[skillopt]
+gate_enabled = true
+gate_corpus = .gitmoot/skillopt/gate-corpus.json
+gate_replay_command = sh .gitmoot/skillopt/gate-replay.sh
+```
+
+When `gate_enabled` is on, a candidate must carry a **passing** gate run before it
+may be promoted to canary or current; otherwise the promotion seam blocks with a
+`gate_blocked` notify and takes no promotion action. The gate is standalone (no
+`auto_trace_enabled` dependency), and with it off the promote path is
+byte-identical to before. Promotion itself stays manual.
+
 ## Candidate Review And Next Iteration
 
 The candidate review step publishes the candidate summary, preview/PR links
@@ -5151,6 +5248,250 @@ would run the current promoted template and the pending candidate live for every
 validation item before collecting blind A/B feedback. The tradeoff is more
 faithful comparisons and better protection against stale baseline outputs, at
 the cost of higher latency, token spend, and runtime/session complexity.
+
+---
+
+# Source: website/docs/dashboard/overview.md
+
+# Dashboard Overview
+
+The web dashboard is a **read-only, live browser view** over your local Gitmoot
+store. It renders the same state the `gitmoot dashboard` TUI shows — runs, jobs,
+agents, locks, daemon health — but as an orchestration graph you can watch update
+in real time, with click-through to each job's prompt and output.
+
+It is strictly read-only: it never mutates workflow state, never touches the
+daemon path, and exposes no action controls. To *act* on a job (retry, cancel,
+answer a prompt) use the CLI or the interactive TUI — see the
+[CLI Reference](../reference/cli.md#jobs-and-locks).
+
+## Launching it
+
+```sh
+gitmoot dashboard --web                       # serve on 127.0.0.1:8080
+gitmoot dashboard --web --addr 127.0.0.1:9000 # pick another localhost port
+```
+
+`--web` starts a foreground HTTP server and blocks until interrupted (Ctrl-C).
+On start it prints the bound address:
+
+```
+gitmoot dashboard serving read-only at http://127.0.0.1:8080 (Ctrl-C to stop)
+```
+
+- `--addr` sets the listen address. The default is **`127.0.0.1:8080`**
+  (localhost only).
+- The server is separate from the daemon — it reads the store directly, so it
+  works whether or not the daemon is running (a stopped daemon simply shows as
+  stopped on the Health page).
+- `--web` is one mode of `gitmoot dashboard`; without it the command runs the
+  interactive TUI or a one-shot snapshot instead. See the
+  [`dashboard` command](../reference/cli.md#repo-and-daemon-status) for the full
+  flag set.
+
+## Routes
+
+The UI is a single-page app with client-side routing (the browser URL updates as
+you navigate, so every view is linkable and reloadable):
+
+| Route | View |
+| --- | --- |
+| `/` | Graph — the delegation DAG of the most-recent active run |
+| `/?run=<id>` | Graph scoped to a specific run |
+| `/galaxy` | Galaxy — the whole-history force graph |
+| `/jobs` | Jobs — every job across every run |
+| `/jobs?agent=<name>` | Jobs pre-filtered to one agent |
+| `/agents` | Agents — one card per registered agent |
+| `/agents/<name>` | Agent detail (template, prompt, version history) |
+| `/charts` | Charts — activity time series |
+| `/health` | Health — daemon status, totals, stuck jobs, locks, failures |
+
+Unknown paths normalize back to `/`. Each view is backed by a small read-only
+JSON API (`/api/runs`, `/api/jobs`, `/api/agents`, `/api/agent/{name}`,
+`/api/charts`, `/api/health`, `/api/state`, `/api/job/{id}`, `/api/graph`) plus a
+Server-Sent Events stream at `/events`.
+
+See [Dashboard Views](./views.md) for what each view shows.
+
+## Auto-refresh
+
+The dashboard stays live without a manual reload:
+
+- **Graph** — the runs column reloads every **15s**; the selected run's graph
+  streams over **SSE** (`/events?run=<id>`), so nodes change state as the
+  orchestra runs (running nodes pulse).
+- **Galaxy, Jobs, Agents, Charts, Health** — each polls its data every **12s**
+  while it is the active view (background views do not poll).
+- **Health** additionally re-renders its relative-time cells every second, so
+  "stuck for N minutes" and daemon uptime tick live between polls.
+
+## Mobile
+
+The UI is responsive at a **768px** breakpoint (also treating coarse-pointer
+devices as touch). On a phone the 216px left nav rail is replaced by a 60px
+**bottom tab bar**, detail panels (node, job, agent) open as **full-screen
+sheets**, the Jobs table collapses to cards, and the Graph runs column becomes a
+full-screen drawer reachable from a floating "Runs" tab. Desktop rendering is
+unchanged.
+
+| Health (mobile) | Jobs (mobile) |
+| --- | --- |
+| ![Dashboard Health view on mobile](/img/dashboard/mobile-health.png) | ![Dashboard Jobs view on mobile](/img/dashboard/mobile-jobs.png) |
+
+## Security
+
+The dashboard serves **private data**: job prompts, agent outputs, template
+bodies, repo names and lock owners are all visible to anyone who can reach the
+port. There is **no authentication** built in.
+
+By default `--web` binds to `127.0.0.1:8080`, reachable only from the local
+machine — keep it that way for normal use. If you must expose it beyond
+localhost, do **not** bind it to a public interface directly. Bind it to an
+internal address and put an authenticating layer in front of it — a reverse
+proxy that enforces auth, or a zero-trust access proxy (e.g. an identity-aware
+proxy or a private tunnel). The dashboard trusts every request it receives.
+
+---
+
+# Source: website/docs/dashboard/views.md
+
+# Dashboard Views
+
+The web dashboard has six views, reachable from the left nav rail (or the mobile
+bottom tab bar). Each is described below with its screenshot. See
+[Dashboard Overview](./overview.md) for launching, routes, refresh cadences, and
+security.
+
+## Graph
+
+Route: `/` (or `/?run=<id>`)
+
+![Graph view: a per-run delegation DAG with the runs column and a node detail aside](/img/dashboard/graph.png)
+
+The Graph view is a **single run's delegation DAG**. Nodes are the jobs in that
+run's tree; edges are delegation parentage plus each child's declared
+dependencies resolved to its sibling jobs. Node color tracks state, and the
+selected run streams over SSE — running nodes pulse and settle live.
+
+- **Runs column** (left): every orchestration run, active (running/queued) runs
+  first. A search box matches over run title and prompt snippet, and facets
+  filter by **status, kind, agent, and repo** (AND across categories, OR within
+  one). Selecting a run loads its graph and updates the URL to `/?run=<id>`.
+- **Node detail aside** (right): click a node to open its prompt, output, event
+  timeline, agent/runtime/model, state, depth, and a link to its pull request
+  when one exists.
+
+## Galaxy
+
+Route: `/galaxy`
+
+![Galaxy view: a whole-history force graph with repo and agent hubs](/img/dashboard/galaxy.png)
+
+Galaxy is the **whole-history force graph** — every job across every run in one
+canvas, clustered around synthetic **repo** and **agent** hub nodes. Links are
+delegation parentage, a per-parent sibling mesh (capped so one huge fan-out can't
+dominate the density), and job-to-repo / job-to-agent spokes.
+
+- Running jobs render as live **beacons** (floored to a minimum on-screen size so
+  they stay visible when zoomed out) and pulse.
+- **Flowing particles** travel the links touching a running job (bright and fast),
+  with a subtle slow particle on ordinary delegation links, so active work is
+  legible from the zoomed-out view.
+- A **repository** filter scopes the visible jobs and their hubs to one repo; the
+  filter list always stays complete regardless of the current scope.
+- Clicking a node opens the same detail panel (pinned right on desktop, a
+  full-screen sheet on mobile). A readout shows how many nodes and links are
+  currently drawn.
+
+## Jobs
+
+Route: `/jobs` (or `/jobs?agent=<name>`)
+
+![Jobs view: a filterable table of every job across all runs](/img/dashboard/jobs.png)
+
+Jobs is a flat, filterable view of **every job across every run**, newest activity
+first. It renders as a table on desktop (columns: Title, Agent, Repo, Kind, Depth,
+Tokens, Started, Duration) and as cards on mobile.
+
+- A search box matches over **title, agent, id, and repo**; facets filter by
+  **State, Repo, and Agent** (the `?agent=` route pre-selects the agent facet).
+- The table is capped at **400 rows** after filtering; when more match, a footer
+  reads `showing 400 of N — refine filters`, and a running `showing X of Y`
+  count sits in the header.
+- Clicking a row (or card) opens a detail panel with the job's prompt, output,
+  and event history.
+
+## Agents
+
+Route: `/agents` (or `/agents/<name>`)
+
+![Agents view: a grid of agent cards with per-agent stats](/img/dashboard/agents.png)
+
+Agents is a grid of cards — one per registered agent, plus a single rollup card
+for the fleet of ephemeral workers. Each card shows the agent's runtime, role,
+model, repo scope, and job tallies (total, running, succeeded, failed) with its
+last-active time.
+
+Clicking a card opens the agent detail (`/agents/<name>`):
+
+![Agent detail: the template card and full prompt viewer with a copy button](/img/dashboard/agent-detail.png)
+
+- **Template card** — the agent's template identity (name, description, source
+  repo/ref/path, resolved commit) and the **full prompt viewer**: the exact
+  resolved prompt body an agent runs, with a **copy** button.
+- **Version history** — every template version, newest first, with the version
+  Gitmoot currently resolves to marked. Each version carries its own full prompt
+  and a collapsed-by-default **diff** toggle that shows a **unified diff against
+  its predecessor version** (long unchanged runs collapse to their first and last
+  few lines):
+
+![Agent detail: a unified diff between two template versions](/img/dashboard/agent-diff.png)
+
+## Charts
+
+Route: `/charts`
+
+![Charts view: activity time series and top agents/repos](/img/dashboard/charts.png)
+
+Charts summarizes activity over a selectable window — **7d, 30d, 90d, or all**
+history (default 30d):
+
+- **Jobs per day**, stacked by state (succeeded, failed, cancelled, blocked,
+  queued, running), zero-filled continuously across the range.
+- **Tokens per day** (input and output).
+- **Top agents** and **Top repos** by job count (each capped at the busiest 12).
+
+The series and totals reflect the selected range and refresh on the standard 12s
+cadence.
+
+## Health
+
+Route: `/health`
+
+![Health view: daemon status, state totals, stuck jobs, locks, and recent failures](/img/dashboard/health.png)
+
+Health is the operability view for unattended runs:
+
+- **Daemon** — running/stopped, PID, uptime, the running binary's version, and an
+  update chip (`up to date`, or `update available: <version>` linking to the
+  release).
+- **State totals** — a chip per state (queued, running, blocked, succeeded,
+  failed, cancelled).
+- **Stuck jobs** — blocked jobs (surfaced at any age) plus queued jobs older than
+  10 minutes, each with a **derived why-stuck reason** (from the job's latest
+  reason event and any resource lock it is waiting on) and how long it has been
+  wedged.
+- **Locks** — branch/checkout locks (`repo@branch`, owner, acquired time) and
+  non-branch resource locks such as runtime sessions (key, owner, acquired,
+  expires).
+- **Recent failures** — the ten newest failed jobs.
+
+A blocked job stays blocked until you clear it or a sweep does. Use
+`gitmoot job cancel <job-id>` to abandon one, or `gitmoot job cancel --state
+blocked` to clear a backlog; set `[orchestrate].blocked_ttl` to sweep old blocked
+jobs automatically, and run `gitmoot doctor` for the environment preflight that
+warns about a blocked-job pileup. All of these are documented under
+[Jobs And Locks](../reference/cli.md#jobs-and-locks).
 
 ---
 
@@ -8350,6 +8691,8 @@ gitmoot skillopt candidate list [--template id]
 gitmoot skillopt candidate show <version-id>
 gitmoot skillopt candidate promote <version-id>
 gitmoot skillopt candidate reject <version-id> [--reason text]
+gitmoot skillopt gate run --candidate <version-id> [--corpus path] [--replay-command cmd] [--config path] [--json]
+gitmoot skillopt gate history --candidate <version-id> [--json]
 gitmoot skillopt ab <agent> "<prompt>" [--challenger <versionId>] [--pick a|b] [--seed N] [--judge] [--judge-only] [--home path]
 gitmoot skillopt pairwise import <packet-dir> [--packet path] [--secret-map path] [--picks path] [--reviewer name] [--json]
 gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>
@@ -8451,6 +8794,21 @@ version. `skillopt candidate promote` makes a pending candidate current, while
 `skillopt candidate reject` records an auditable rejection and prevents that
 version from being selected by `@latest`.
 
+`skillopt gate run --candidate <version-id>` runs the off-by-default,
+deterministic **pre-canary replay gate** (`#627`, AutoMem A.2): it replays the
+candidate against a **fixed, versioned job corpus** and accepts it only on
+**strict improvement** over the current champion on the same corpus (a tie
+fails). It reuses the `#474`/`#485` deterministic scorers on the corpus outputs —
+no new judge, no live LLM in the gate itself; the replay driver is a deterministic
+`sh -c` command that reads `GITMOOT_GATE_TEMPLATE_FILE`/`GITMOOT_GATE_PROMPT`/
+`GITMOOT_GATE_EXPECTED`/`GITMOOT_GATE_ITEM_ID` and emits a per-item result JSON.
+The command prints pass/fail plus per-item deltas, exits non-zero on a rejected
+gate, and **persists** the run for audit (`skillopt gate history --candidate
+<version-id>`). When `[skillopt].gate_enabled` is on, a candidate must carry a
+passing gate run before it may be promoted to canary or current; otherwise the
+promotion seam blocks. On a gate failure the protocol allows exactly one retry
+feeding the failing replay log back to the optimizer, then rejects.
+
 `skillopt pairwise import <packet-dir>` ingests a **blinded paired-review
 packet** produced by the gitmoot-skillopt fork (the `pairwise-review.json`
 packet plus its secret map and the reviewer's picks), de-blinds it, and stores
@@ -8530,6 +8888,50 @@ unrelated comments safely.
 Ranked GitHub comments can use `item-001 ranking: C > A > D > B` plus trait
 notes. Use the ranked workflow for exploration/refinement and return to A/B
 validation for final promotion decisions on fresh items.
+
+## Agent Memory
+
+Agent persistent memory (#626) gives an enrolled agent a repo-filtered pool of
+durable *facts* ("this repo's arm64 CI is flaky") that Gitmoot injects into the
+job prompt as a reference-only block. It is **off by default** and, in the
+current phase, runs in **observation mode**: the injectable ("confirmed") tier
+is populated only by Gitmoot's own deterministic mechanical facts, while
+agent-returned learnings are logged for measurement but never injected.
+
+Enrollment is per agent, plus optional global knobs:
+
+```toml
+[agents.builder]
+runtime = "codex"
+memory = true          # enroll this agent (default off)
+
+[memory]
+disabled = false       # global kill switch (overrides every enrollment)
+token_budget = 1500    # cap on injected block size (estimated tokens)
+max_entries = 15       # cap on confirmed rows considered for injection
+```
+
+An agent returns durable facts via the optional top-level `learnings` field in
+`gitmoot_result` — each entry is `{key, scope ("repo"|"general"), content}`.
+Most jobs return none. Returned learnings are shadow-logged only (never injected
+in this phase) and pass deterministic pre-filters that reject directive-phrased,
+executable, secret-shaped, or non-repo-agnostic content.
+
+Inspect and measure the store (all read-only):
+
+```sh
+gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo] [--json]
+gitmoot memory replay [--agent NAME] [--repo owner/repo] [--limit N] [--json]
+gitmoot memory eval --fixtures fixtures.json [--k N] [--json]
+```
+
+`memory list` shows confirmed memories and/or pending observations. `memory
+replay` is an offline A/B: it re-renders recent real jobs' prompts with and
+without the learnings block and reports the injection delta (added tokens,
+entries injected) — it measures injection *mechanics*, not outcome quality
+(running real agents twice is a later-phase gate). `memory eval` computes
+recall/precision@K of retrieval over a labeled fixtures file whose cases are
+`{agent, repo, instructions, expected_keys}`.
 
 ---
 
@@ -10246,11 +10648,30 @@ the dollar-cost bullet in [Termination bounds](#termination-bounds) above.
   sparingly**: ask only when you genuinely cannot proceed without a human decision,
   not on every result.
 
+- `learnings` (optional): durable, keyed **facts** worth remembering for future
+  jobs (agent persistent memory, #626). Each entry is
+  `{ "key": "...", "scope": "repo"|"general", "content": "..." }` where `key` is a
+  short stable handle (required), `content` is the fact itself (required), and
+  `scope` is optional — `"repo"` (about this repository, the default) or
+  `"general"` (true everywhere). It is **fully additive**: a result that omits it
+  behaves byte-identically, and **most jobs should omit it**. Record a fact only
+  when you learned something a future job would benefit from (e.g. "this repo's
+  arm64 CI is flaky"), state it as a **fact, not a directive** ("always…"/"you
+  must…" is rejected), and never put commands or secrets in it. Memory is **off by
+  default** (opt in per agent with `[agents.<name>].memory = true`); when off,
+  returning `learnings` is harmless and simply ignored. In the current observation
+  phase, returned learnings are logged for measurement but are **not** injected
+  into any prompt. See the *Agent Persistent Memory* concept doc.
+
 ## Decisions
 
 - `approved`: review found no blocking issues.
 - `changes_requested`: review found issues that should be fixed before merge.
 - `blocked`: work cannot continue without human input or an external state change.
+  A blocked job is *settled* (a delegation barrier will not wait on it and a
+  `job watch` stops tailing it) but not *final*: it can be resumed via retry, so
+  subsystems that stamp an end time or tear down live resources treat it as still
+  live. See `internal/workflow` `IsSettledJobState` vs `IsFinalJobState` (#632).
 - `implemented`: the requested implementation work was completed.
 - `failed`: the attempted action errored or could not complete.
 

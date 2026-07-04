@@ -32,6 +32,11 @@ full expanded context.
 - [Agents, Agent Templates, Jobs, And Locks](https://gitmoot.io/docs/concepts/agents-templates-jobs-locks): The core object model — agent identities, template snapshots, job lifecycle, and the three lock kinds.
 - [Agent Persistent Memory](https://gitmoot.io/docs/concepts/agent-memory): Off-by-default repo-filtered fact memory (SQLite + FTS5); observation-mode read/write model, enrollment, and the memory CLI.
 
+## Dashboard
+
+- [Dashboard Overview](https://gitmoot.io/docs/dashboard/overview): The read-only live web dashboard (`gitmoot dashboard --web [--addr host:port]`) over the local store — launching, the URL route table, auto-refresh cadences (12s polls, 15s runs, SSE per-run graph), mobile support, and the localhost-default/no-auth security model.
+- [Dashboard Views](https://gitmoot.io/docs/dashboard/views): The six views — Graph (per-run delegation DAG), Galaxy (whole-history force graph), Jobs (filterable table, 400-row cap), Agents (cards + detail with template prompt, version history, and per-version diff), Charts (7d/30d/90d/all series), and Health (daemon status, stuck jobs with reasons, locks, recent failures).
+
 ## References
 
 - [CLI Reference](https://gitmoot.io/docs/reference/cli): Commands for install, home/config, daemon operations (restart, SIGHUP reload, runtime-auth persistence), watched repos, dashboard/TUI/web, agents (incl. heartbeats and template publish/pull), orchestrate, jobs, bug reports, locks, goals, interactive prompts, and SkillOpt.

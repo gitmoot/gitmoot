@@ -258,11 +258,14 @@ colors and truncates long lists, and groups near-identical runtime sessions;
 be combined with `--json`, `--answer`, or `--dismiss`.
 
 `gitmoot dashboard --web` serves the **read-only web dashboard** until
-interrupted: a live orchestration/delegation graph with run summaries and
-prompt/output inspection — the browser view of a running orchestration.
+interrupted: a live orchestration/delegation graph plus whole-history Galaxy,
+Jobs, Agents, Charts, and Health views with run summaries and prompt/output
+inspection — the browser view of a running orchestration.
 `--addr` sets the listen address (default `127.0.0.1:8080`). To expose it
 beyond localhost, bind to an internal address and put an authenticating
-reverse proxy in front — the dashboard itself has no authentication.
+reverse proxy in front — the dashboard itself has no authentication. See the
+[Dashboard section](../dashboard/overview.md) for the views, routes, refresh
+cadences, and mobile support.
 
 ## Bug Reports
 

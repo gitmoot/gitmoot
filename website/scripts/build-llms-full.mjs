@@ -19,6 +19,8 @@ const sources = [
   'docs/cockpit-orchestrate.md',
   'docs/skillopt-train-workflow.md',
   'docs/skillopt-exchange-contract.md',
+  'website/docs/dashboard/overview.md',
+  'website/docs/dashboard/views.md',
   'docs/herdr-composable-train-init.md',
   'docs/beta-smoke-tests.md',
   'docs/release-notes/v0.1.0-beta.1.md',
