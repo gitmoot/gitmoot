@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"strings"
+
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/workflow"
@@ -51,13 +53,22 @@ func daemonMemoryController(store *db.Store, home string) *workflow.MemoryContro
 	}
 }
 
-// memoryPathsForHome resolves config paths for a home the same way the other
-// home-scoped seams do (config.PathsForHome when a home is given, else the
-// default paths), so it works both under GITMOOT_HOME isolation and on the live
-// home.
+// memoryPathsForHome resolves the config paths for a home the SAME dual-mode way
+// the other home-scoped daemon seams do (via resolveConfigFile), so it works both
+// when handed the RAW --home and when handed the already-RESOLVED <home>/.gitmoot
+// root. The daemon wiring path (defaultWorkflow -> daemonWorkflowEngine ->
+// daemonMemoryController) passes w.workflowHome(), which is config.Paths.Home —
+// i.e. <home>/.gitmoot — so a naive config.PathsForHome(home) here re-appended
+// ".gitmoot" a SECOND time and read a phantom <home>/.gitmoot/.gitmoot/config.toml
+// with no [memory]/[agents.*] section, leaving daemonMemoryController nil and
+// silently disabling memory for EVERY enrolled agent through the live daemon
+// (the same #446/#459 double-resolution the [events] seam was fixed for). Only
+// daemonMemoryController's two config loaders (LoadMemorySettings/LoadAgentTypes)
+// read the returned Paths, and both use only ConfigFile, so resolving that one
+// field is sufficient.
 func memoryPathsForHome(home string) (config.Paths, error) {
-	if home != "" {
-		return config.PathsForHome(home), nil
+	if strings.TrimSpace(home) == "" {
+		return config.DefaultPaths()
 	}
-	return config.DefaultPaths()
+	return config.Paths{ConfigFile: resolveConfigFile(home)}, nil
 }
