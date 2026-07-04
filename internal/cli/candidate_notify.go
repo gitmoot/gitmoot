@@ -154,6 +154,23 @@ func runCandidateNotify(ctx context.Context, store *db.Store, sink events.Sink, 
 	if store == nil {
 		return nil
 	}
+	// (4z) Pre-canary replay gate (#627): when [skillopt].gate_enabled is on, a
+	// guardrails-pass candidate must ALSO carry a PASSING deterministic replay-gate
+	// run before it may be promoted (to canary OR current). This is additive and off
+	// by default — with the gate off, GatePromotionGuard never blocks and the
+	// promotion path below is byte-identical to pre-#627. When it blocks, the
+	// awaiting_promotion notify above already fired; we emit a gate_blocked detail and
+	// stop short of promotion so the operator runs `gitmoot skillopt gate run` first.
+	if policy.GateEnabled() {
+		hasAccepted, err := store.HasAcceptedSkillOptGateRun(ctx, version.ID)
+		if err != nil {
+			return fmt.Errorf("resolve replay-gate status for candidate %s: %w", version.ID, err)
+		}
+		if blocked, reason := skillopt.GatePromotionGuard(true, hasAccepted); blocked {
+			emitCandidateEvent(ctx, sink, events.EventCandidateAwaitingPromotion, version, "gate_blocked", reason)
+			return nil
+		}
+	}
 	// (4a) Canary path (#484): instead of promoting straight to current, promote the
 	// candidate to the `canary` state behind the live champion (the champion stays
 	// current, so non-sampled resolutions are byte-identical) and emit

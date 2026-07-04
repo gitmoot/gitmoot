@@ -857,6 +857,8 @@ gitmoot skillopt candidate list [--template id]
 gitmoot skillopt candidate show <version-id>
 gitmoot skillopt candidate promote <version-id>
 gitmoot skillopt candidate reject <version-id> [--reason text]
+gitmoot skillopt gate run --candidate <version-id> [--corpus path] [--replay-command cmd] [--config path] [--json]
+gitmoot skillopt gate history --candidate <version-id> [--json]
 gitmoot skillopt ab <agent> "<prompt>" [--challenger <versionId>] [--pick a|b] [--seed N] [--judge] [--judge-only] [--home path]
 gitmoot skillopt pairwise import <packet-dir> [--packet path] [--secret-map path] [--picks path] [--reviewer name] [--json]
 gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>
@@ -957,6 +959,21 @@ report JSON, preference summary, and a content diff against the base/current
 version. `skillopt candidate promote` makes a pending candidate current, while
 `skillopt candidate reject` records an auditable rejection and prevents that
 version from being selected by `@latest`.
+
+`skillopt gate run --candidate <version-id>` runs the off-by-default,
+deterministic **pre-canary replay gate** (`#627`, AutoMem A.2): it replays the
+candidate against a **fixed, versioned job corpus** and accepts it only on
+**strict improvement** over the current champion on the same corpus (a tie
+fails). It reuses the `#474`/`#485` deterministic scorers on the corpus outputs —
+no new judge, no live LLM in the gate itself; the replay driver is a deterministic
+`sh -c` command that reads `GITMOOT_GATE_TEMPLATE_FILE`/`GITMOOT_GATE_PROMPT`/
+`GITMOOT_GATE_EXPECTED`/`GITMOOT_GATE_ITEM_ID` and emits a per-item result JSON.
+The command prints pass/fail plus per-item deltas, exits non-zero on a rejected
+gate, and **persists** the run for audit (`skillopt gate history --candidate
+<version-id>`). When `[skillopt].gate_enabled` is on, a candidate must carry a
+passing gate run before it may be promoted to canary or current; otherwise the
+promotion seam blocks. On a gate failure the protocol allows exactly one retry
+feeding the failing replay log back to the optimizer, then rejects.
 
 `skillopt pairwise import <packet-dir>` ingests a **blinded paired-review
 packet** produced by the gitmoot-skillopt fork (the `pairwise-review.json`

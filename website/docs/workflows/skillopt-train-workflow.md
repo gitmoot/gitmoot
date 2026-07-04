@@ -651,6 +651,103 @@ and classifies the run as `generation_complete`, `generation_incomplete`, or
 missing items remains `train continue`'s job). `--abort` reclaims the lock and
 leaves the phase at `items_ready`, keeping persisted items.
 
+## Pre-Canary Replay Gate
+
+The replay gate (`#627`, AutoMem A.2) is an **off-by-default**, deterministic
+check that runs **before** a candidate reaches canary. It replays a candidate
+template against a **fixed, versioned job corpus** and accepts the candidate only
+on **strict improvement** over the current champion on the **same** corpus — a
+tie (parity) or any regression fails. It reuses the existing deterministic
+scorers (the `#474` hard-verifier tier and the `#485` deterministic checkers) on
+the corpus outputs, so it invents no new judge and runs **no live LLM in the gate
+itself**: the replay driver is a deterministic `sh -c` command.
+
+### Corpus
+
+A corpus is a plain, versioned JSON file — the same fixed seeds every replay runs
+on:
+
+```json
+{
+  "kind": "gitmoot-skillopt-gate-corpus",
+  "version": 1,
+  "replay_command": "sh .gitmoot/skillopt/gate-replay.sh",
+  "items": [
+    { "id": "widget-a", "prompt": "implement widget A", "expected": "builds" },
+    { "id": "widget-b", "prompt": "implement widget B", "expected": "builds" }
+  ]
+}
+```
+
+Every item needs a unique non-empty `id` and a non-empty `prompt`. `version` is
+`>= 1` so a scoring change is auditable. `replay_command` is optional here and can
+instead come from `--replay-command` or `[skillopt].gate_replay_command`.
+
+### Replay driver contract
+
+For each corpus item the gate runs the replay command via `sh -c` with the
+candidate template staged to a temp file and the item passed in the environment:
+
+- `GITMOOT_GATE_TEMPLATE_FILE` — path to the candidate template content;
+- `GITMOOT_GATE_PROMPT` — the item prompt;
+- `GITMOOT_GATE_EXPECTED` — the item's expected/verifiable outcome;
+- `GITMOOT_GATE_ITEM_ID` — the item id.
+
+The command emits a deterministic per-item result JSON on stdout, in the same
+shape the hard-verifier / deterministic-checker tiers produce, so the existing
+scorers project it into a `[0,1]` score:
+
+```json
+{ "rubric": { "build": 1.0, "test": 0.5 } }
+```
+
+or a binary hard verdict:
+
+```json
+{ "hard_verifier": true, "hard_passed": true }
+```
+
+Because the command is the deterministic map, two replays over the same corpus +
+template yield **identical** scores.
+
+### Running the gate
+
+```sh
+gitmoot skillopt gate run --candidate planner@v2 --corpus .gitmoot/skillopt/gate-corpus.json
+gitmoot skillopt gate run --candidate planner@v2 --json   # machine-readable pass/fail + per-item deltas
+gitmoot skillopt gate history --candidate planner@v2      # persisted audit trail
+```
+
+`gate run` scores the champion and candidate on the corpus, prints pass/fail plus
+per-item deltas, and **persists** the run (additive `skillopt_gate_runs` table)
+for audit. It exits non-zero on a rejected gate so a script can branch on the
+verdict.
+
+### One-retry protocol
+
+On a gate failure the protocol takes **exactly one** retry that feeds the failing
+replay log back to the optimizer step and re-gates the revised candidate; a
+**second** failure is a reject (a clean restart is the operator's choice). The CLI
+`gate run` is a single evaluation (attempt 1); the optimizer-fed retry runs where
+the optimizer is available in the train workflow.
+
+### Config and promotion blocking
+
+The gate is wired as an optional, off-by-default step. Turn it on in `[skillopt]`:
+
+```toml
+[skillopt]
+gate_enabled = true
+gate_corpus = .gitmoot/skillopt/gate-corpus.json
+gate_replay_command = sh .gitmoot/skillopt/gate-replay.sh
+```
+
+When `gate_enabled` is on, a candidate must carry a **passing** gate run before it
+may be promoted to canary or current; otherwise the promotion seam blocks with a
+`gate_blocked` notify and takes no promotion action. The gate is standalone (no
+`auto_trace_enabled` dependency), and with it off the promote path is
+byte-identical to before. Promotion itself stays manual.
+
 ## Candidate Review And Next Iteration
 
 The candidate review step publishes the candidate summary, preview/PR links

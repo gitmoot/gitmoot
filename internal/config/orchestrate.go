@@ -666,6 +666,34 @@ type SkillOptPolicy struct {
 	// one. Parsed from repeatable `hard_verifier_commands = <one command>` lines so a
 	// command may itself contain commas without ambiguity.
 	HardVerifierCommands []string
+
+	// Gate opts into the OFF-by-default deterministic fixed-corpus replay gate
+	// (#627, AutoMem A.2): a pre-canary gate that replays a candidate template
+	// against a fixed job corpus and accepts it only on STRICT improvement over the
+	// champion on the same corpus. When true, GatePromotionGuard blocks a
+	// candidate->canary promotion until the candidate has a passing gate run on
+	// record. false (the default) is byte-identical to the pre-#627 promote path (the
+	// gate is never consulted). The field is named Gate (not …Enabled) because Go
+	// forbids a field and method sharing a name; GateEnabled() below is the resolved
+	// accessor callers use. The gate is standalone — it does NOT require
+	// AutoTraceEnabled — so it can guard promotions independent of the harvester.
+	Gate bool
+
+	// GateCorpusPath is the default fixed-corpus file path used by
+	// `gitmoot skillopt gate run` when no --corpus flag is supplied (#627). Empty
+	// (the default) means a corpus MUST be supplied on the command line.
+	GateCorpusPath string
+
+	// GateReplayCommand is the default deterministic replay driver command run via
+	// `sh -c` for each corpus item (#627): it receives the candidate template file
+	// (GITMOOT_GATE_TEMPLATE_FILE), the corpus item prompt (GITMOOT_GATE_PROMPT),
+	// expected outcome (GITMOOT_GATE_EXPECTED), and item id (GITMOOT_GATE_ITEM_ID) in
+	// the environment, and emits a deterministic per-item GateReplayResult JSON on
+	// stdout. There is no live LLM in the gate itself — the command is the
+	// deterministic map. A corpus's own replay_command overrides this default. Empty
+	// (the default) means a command MUST be supplied on the command line or in the
+	// corpus.
+	GateReplayCommand string
 }
 
 // DefaultDeterministicCheckers is the safe default checker set used when the
@@ -704,7 +732,18 @@ func DefaultSkillOptPolicy() SkillOptPolicy {
 		DeterministicCheckerList:        nil,
 		HardVerifiers:                   false,
 		HardVerifierCommands:            nil,
+		Gate:                            false,
+		GateCorpusPath:                  "",
+		GateReplayCommand:               "",
 	}
+}
+
+// GateEnabled reports whether the deterministic fixed-corpus replay gate (#627) is
+// configured on. It is standalone (no AutoTraceEnabled dependency): the gate guards
+// candidate->canary promotion on its own. Default false means byte-identical
+// behavior with no config — the gate is never consulted.
+func (p SkillOptPolicy) GateEnabled() bool {
+	return p.Gate
 }
 
 // Enabled reports whether the automatic trace-harvester is configured on. With
@@ -954,6 +993,16 @@ func applySkillOptPolicyField(policy *SkillOptPolicy, key string, value string) 
 		if trimmed := strings.TrimSpace(value); trimmed != "" {
 			policy.HardVerifierCommands = append(policy.HardVerifierCommands, trimmed)
 		}
+		return nil
+	case "gate_enabled":
+		parsed, err := strconv.ParseBool(value)
+		policy.Gate = parsed
+		return err
+	case "gate_corpus":
+		policy.GateCorpusPath = strings.TrimSpace(value)
+		return nil
+	case "gate_replay_command":
+		policy.GateReplayCommand = strings.TrimSpace(value)
 		return nil
 	default:
 		return nil

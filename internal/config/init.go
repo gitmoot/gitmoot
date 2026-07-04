@@ -230,6 +230,23 @@ path = ""
 #     environment failure and SKIPS the run (no row) instead of recording a negative, but
 #     a command that runs and exits non-zero because deps were missing is an honest FAIL
 #     — so keep each command self-contained.
+#   gate_enabled (#627): OFF by default; STANDALONE (no auto_trace dependency). The
+#     deterministic fixed-corpus REPLAY GATE (AutoMem A.2): a pre-canary check that
+#     replays a candidate template against a FIXED job corpus and accepts it only on
+#     STRICT improvement over the champion on the SAME corpus (a tie fails). When on, a
+#     candidate must carry a PASSING gate run ('gitmoot skillopt gate run --candidate
+#     <id>') before it may be promoted to canary/current — otherwise promotion is
+#     blocked with a gate_blocked notify. Off ⇒ byte-identical (the gate is never
+#     consulted). It reuses the #474/#485 deterministic scorers on the corpus outputs
+#     (no new judge, no live LLM in the gate itself); promotion stays MANUAL.
+#   gate_corpus (#627): default fixed-corpus file path used by 'gitmoot skillopt gate
+#     run' when no --corpus is passed. UNSET ⇒ a corpus must be supplied on the CLI.
+#   gate_replay_command (#627): default deterministic replay driver run via 'sh -c' per
+#     corpus item. It receives GITMOOT_GATE_TEMPLATE_FILE (the candidate template),
+#     GITMOOT_GATE_PROMPT, GITMOOT_GATE_EXPECTED, and GITMOOT_GATE_ITEM_ID in the env
+#     and emits a per-item GateReplayResult JSON ({"rubric":{...}} or
+#     {"hard_verifier":true,"hard_passed":bool}) on stdout — the command IS the
+#     deterministic map. A corpus's own replay_command overrides this default.
 # [skillopt]
 # auto_trace_enabled = false
 # cross_family_review_enabled = false
@@ -239,6 +256,9 @@ path = ""
 # hard_verifiers_enabled = false
 # hard_verifier_commands = go build ./...
 # hard_verifier_commands = go test ./...
+# gate_enabled = false
+# gate_corpus = .gitmoot/skillopt/gate-corpus.json
+# gate_replay_command = sh .gitmoot/skillopt/gate-replay.sh
 # auto_promote = false
 # auto_promote_min_samples = 0
 # auto_promote_min_score = 0.0

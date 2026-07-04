@@ -5743,6 +5743,114 @@ func (s *Store) GetNoCIObservation(ctx context.Context, repoFullName string, pul
 	return obs, nil
 }
 
+// SkillOptGateRun is one persisted deterministic replay-gate run for a candidate
+// (#627). It is an additive audit record: the champion the candidate was compared
+// against, the fixed corpus (path + version + item count), the two aggregate corpus
+// means, the accept/reject verdict, the attempt count (1, or 2 after the single
+// retry), the reason, and the per-item deltas serialized as JSON. It NEVER drives
+// promotion by itself — the promotion guard reads Accepted, but a human/operator
+// still promotes.
+type SkillOptGateRun struct {
+	ID                 string
+	TemplateID         string
+	CandidateVersionID string
+	ChampionVersionID  string
+	CorpusPath         string
+	CorpusVersion      int
+	CorpusItems        int
+	Attempts           int
+	Accepted           bool
+	ChampionMean       float64
+	CandidateMean      float64
+	Reason             string
+	DeltasJSON         string
+	CreatedAt          string
+}
+
+// InsertSkillOptGateRun appends a gate-run audit record (#627). It is additive and
+// never mutates a prior run (each gate execution is its own immutable row keyed by a
+// fresh id).
+func (s *Store) InsertSkillOptGateRun(ctx context.Context, run SkillOptGateRun) error {
+	accepted := 0
+	if run.Accepted {
+		accepted = 1
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO skillopt_gate_runs(
+			id, template_id, candidate_version_id, champion_version_id, corpus_path,
+			corpus_version, corpus_items, attempts, accepted, champion_mean,
+			candidate_mean, reason, deltas_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		run.ID, run.TemplateID, run.CandidateVersionID, run.ChampionVersionID, run.CorpusPath,
+		run.CorpusVersion, run.CorpusItems, run.Attempts, accepted, run.ChampionMean,
+		run.CandidateMean, run.Reason, run.DeltasJSON)
+	return err
+}
+
+// ListSkillOptGateRuns returns the gate-run audit records for a candidate version,
+// newest first (#627).
+func (s *Store) ListSkillOptGateRuns(ctx context.Context, candidateVersionID string) ([]SkillOptGateRun, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, template_id, candidate_version_id, champion_version_id, corpus_path,
+			corpus_version, corpus_items, attempts, accepted, champion_mean, candidate_mean, reason, deltas_json, created_at
+		FROM skillopt_gate_runs WHERE candidate_version_id = ? ORDER BY created_at DESC, rowid DESC`,
+		strings.TrimSpace(candidateVersionID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	runs := []SkillOptGateRun{}
+	for rows.Next() {
+		run, err := scanSkillOptGateRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, run)
+	}
+	return runs, rows.Err()
+}
+
+// HasAcceptedSkillOptGateRun reports whether a candidate version has at least one
+// ACCEPTED gate run on record (#627) — the fact the promotion guard consults.
+func (s *Store) HasAcceptedSkillOptGateRun(ctx context.Context, candidateVersionID string) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM skillopt_gate_runs WHERE candidate_version_id = ? AND accepted = 1`,
+		strings.TrimSpace(candidateVersionID)).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func scanSkillOptGateRun(scanner interface{ Scan(...any) error }) (SkillOptGateRun, error) {
+	var run SkillOptGateRun
+	var accepted int
+	if err := scanner.Scan(&run.ID, &run.TemplateID, &run.CandidateVersionID, &run.ChampionVersionID, &run.CorpusPath,
+		&run.CorpusVersion, &run.CorpusItems, &run.Attempts, &accepted, &run.ChampionMean, &run.CandidateMean,
+		&run.Reason, &run.DeltasJSON, &run.CreatedAt); err != nil {
+		return SkillOptGateRun{}, err
+	}
+	run.Accepted = accepted == 1
+	return run, nil
+}
+
+// GetCurrentAgentTemplateVersion returns the current champion version for a template
+// and whether one exists (#627). It is the public, tx-free counterpart of
+// getCurrentAgentTemplateVersion so the replay gate can resolve the champion the
+// candidate is compared against without opening a write transaction.
+func (s *Store) GetCurrentAgentTemplateVersion(ctx context.Context, templateID string) (AgentTemplateVersion, bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT v.id, v.template_id, v.version, v.state, v.name, v.description, v.source_repo, v.source_ref, v.source_path, v.resolved_commit, v.content_hash, v.content, v.metadata_json, v.created_at, v.updated_at, v.promoted_at, v.canary_sample, v.canary_started_at
+		FROM agent_templates t
+		JOIN agent_template_versions v ON v.id = t.current_version_id
+		WHERE t.id = ?`, strings.TrimSpace(templateID))
+	version, err := scanAgentTemplateVersion(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AgentTemplateVersion{}, false, nil
+	}
+	if err != nil {
+		return AgentTemplateVersion{}, false, err
+	}
+	return version, true, nil
+}
+
 func (s *Store) HasTable(ctx context.Context, name string) (bool, error) {
 	if strings.ContainsAny(name, "'\"`;") {
 		return false, fmt.Errorf("unsafe table name: %s", name)
@@ -7173,5 +7281,32 @@ CREATE UNIQUE INDEX idx_confirmed_repo_key ON confirmed_memories(owner_kind, own
 CREATE UNIQUE INDEX idx_confirmed_general_key ON confirmed_memories(owner_kind, owner_ref, owner_version, key) WHERE repo IS NULL;
 
 CREATE VIRTUAL TABLE confirmed_memories_fts USING fts5(content, key, tokenize='porter');
+	`,
+	// #627 deterministic fixed-corpus replay-gate audit trail. Each row records one
+	// terminal gate protocol run for a candidate: the champion it was compared
+	// against, the corpus (path + version), the two aggregate corpus means, the
+	// per-item deltas (JSON), the accept/reject verdict, and how many attempts (1 or
+	// the single retry -> 2) it took. Pure additive append (CREATE TABLE only): the
+	// table stays empty until a `gitmoot skillopt gate run` executes, and it is read
+	// only by the gate-run history + the promotion guard, so every existing DB reads
+	// identically. It NEVER promotes — promotion stays a separate, guarded action.
+	`
+CREATE TABLE skillopt_gate_runs (
+	id TEXT PRIMARY KEY,
+	template_id TEXT NOT NULL DEFAULT '',
+	candidate_version_id TEXT NOT NULL DEFAULT '',
+	champion_version_id TEXT NOT NULL DEFAULT '',
+	corpus_path TEXT NOT NULL DEFAULT '',
+	corpus_version INTEGER NOT NULL DEFAULT 0,
+	corpus_items INTEGER NOT NULL DEFAULT 0,
+	attempts INTEGER NOT NULL DEFAULT 0,
+	accepted INTEGER NOT NULL DEFAULT 0,
+	champion_mean REAL NOT NULL DEFAULT 0,
+	candidate_mean REAL NOT NULL DEFAULT 0,
+	reason TEXT NOT NULL DEFAULT '',
+	deltas_json TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_skillopt_gate_runs_candidate ON skillopt_gate_runs(candidate_version_id);
 	`,
 }

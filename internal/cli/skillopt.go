@@ -80,6 +80,8 @@ func runSkillOpt(args []string, stdout, stderr io.Writer) int {
 		return runSkillOptAB(args[1:], stdout, stderr)
 	case "pairwise":
 		return runSkillOptPairwise(args[1:], stdout, stderr)
+	case "gate":
+		return runSkillOptGate(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown skillopt command %q\n\n", args[0])
 		printSkillOptUsage(stderr)
@@ -99,6 +101,8 @@ func printSkillOptUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot skillopt candidate show <version-id>")
 	fmt.Fprintln(w, "  gitmoot skillopt candidate promote <version-id>")
 	fmt.Fprintln(w, "  gitmoot skillopt candidate reject <version-id> [--reason text]")
+	fmt.Fprintln(w, "  gitmoot skillopt gate run --candidate <version-id> [--corpus path] [--replay-command cmd] [--config path] [--json]")
+	fmt.Fprintln(w, "  gitmoot skillopt gate history --candidate <version-id> [--json]")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id> [--reviewer name]")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]")
