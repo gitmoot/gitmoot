@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/memory"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
@@ -183,7 +184,7 @@ func TestMemoryShadowWriteAppliesFilters(t *testing.T) {
 			{Key: "directive", Scope: "repo", Content: "You must always run the race suite"},
 		},
 	}
-	ctrl.record(ctx, "job-1", memAgent(), payload, result)
+	ctrl.record(ctx, "job-1", memAgent(), "implement", payload, result)
 
 	obs, err := store.ListMemoryObservations(ctx, "audit", "acme/widget")
 	if err != nil {
@@ -220,7 +221,7 @@ func TestMemoryMechanicalProducerWritesConfirmed(t *testing.T) {
 	ctrl := memController(store, 1500, 15, "audit")
 	payload := JobPayload{Repo: "acme/widget", Instructions: "ship it", VerifyAttempt: 2}
 	result := AgentResult{Decision: "implemented", Summary: "done"}
-	ctrl.record(ctx, "job-1", memAgent(), payload, result)
+	ctrl.record(ctx, "job-1", memAgent(), "implement", payload, result)
 
 	confirmed, err := store.ListConfirmedMemories(ctx, "audit", "acme/widget")
 	if err != nil {
@@ -250,7 +251,7 @@ func TestMemoryMechanicalProducerSilentWithoutFixRounds(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 	ctrl := memController(store, 1500, 15, "audit")
-	ctrl.record(ctx, "job-1", memAgent(), JobPayload{Repo: "acme/widget"}, AgentResult{Decision: "approved", Summary: "ok"})
+	ctrl.record(ctx, "job-1", memAgent(), "ask", JobPayload{Repo: "acme/widget"}, AgentResult{Decision: "approved", Summary: "ok"})
 	confirmed, err := store.ListConfirmedMemories(ctx, "audit", "acme/widget")
 	if err != nil {
 		t.Fatalf("list: %v", err)
@@ -266,13 +267,170 @@ func TestMemoryNotEnrolledNoWrites(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 	ctrl := memController(store, 1500, 15 /* nobody enrolled */)
-	ctrl.record(ctx, "job-1", memAgent(), JobPayload{Repo: "acme/widget", VerifyAttempt: 3}, AgentResult{
+	ctrl.record(ctx, "job-1", memAgent(), "implement", JobPayload{Repo: "acme/widget", VerifyAttempt: 3}, AgentResult{
 		Decision: "implemented", Summary: "s", Learnings: []Learning{{Key: "k", Content: "arm64 CI is flaky"}},
 	})
 	obs, _ := store.ListMemoryObservations(ctx, "audit", "acme/widget")
 	confirmed, _ := store.ListConfirmedMemories(ctx, "audit", "acme/widget")
 	if len(obs) != 0 || len(confirmed) != 0 {
 		t.Fatalf("un-enrolled agent must not write memory; obs=%d confirmed=%d", len(obs), len(confirmed))
+	}
+}
+
+// TestMemoryTerminalOutcomeProducerWritesForNotable proves the #645 fix at the
+// record() seam: an ORDINARY terminal job (VerifyAttempt=0, RetryCount=0 — the
+// shape agent ask/run/review enqueue, which fixRoundsFact never fires on) that
+// ends on the NOTABLE, non-anomalous decision (changes_requested) writes an
+// (action,outcome)-keyed confirmed fact. The SUCCESS decisions write nothing
+// (anti-flood), and — per the #645 review — the ANOMALOUS one-off outcomes
+// (failed, blocked) ALSO write nothing until a recurrence gate exists, so a single
+// flaky failure cannot become a durable repo fact. A free-form delegation action
+// collapses to the bounded generic "recent" bucket rather than leaking into the
+// key. Before the fix the confirmed pool stayed empty for the common usage shape.
+func TestMemoryTerminalOutcomeProducerWritesForNotable(t *testing.T) {
+	cases := []struct {
+		action   string
+		decision string
+		wantKey  string // "" => no fact expected
+	}{
+		{"review", "changes_requested", "outcome:review:changes_requested"},
+		// Free-form, LLM-authored delegation action → generic "recent" bucket, so
+		// distinct phrasings can never bloat the key space (the bounded-key contract).
+		{"review the payment webhook retry logic", "changes_requested", "outcome:recent:changes_requested"},
+		{"ask", "blocked", ""},           // anomalous one-off → excluded until a recurrence gate
+		{"implement", "failed", ""},      // anomalous one-off → excluded until a recurrence gate
+		{"ask", "approved", ""},          // routine success → nothing
+		{"implement", "implemented", ""}, // routine success → nothing
+	}
+	for _, tc := range cases {
+		t.Run(tc.action+"/"+tc.decision, func(t *testing.T) {
+			store := openTestStore(t)
+			ctx := context.Background()
+			ctrl := memController(store, 1500, 15, "audit")
+			// Ordinary job shape: NO verify/retry rounds, so fixRoundsFact is silent
+			// and only the terminal-outcome producer can fire.
+			ctrl.record(ctx, "job-1", memAgent(), tc.action,
+				JobPayload{Repo: "acme/widget"},
+				AgentResult{Decision: tc.decision, Summary: "s"})
+			confirmed, err := store.ListConfirmedMemories(ctx, "audit", "acme/widget")
+			if err != nil {
+				t.Fatalf("list confirmed: %v", err)
+			}
+			if tc.wantKey == "" {
+				if len(confirmed) != 0 {
+					t.Fatalf("routine %s/%s wrote a confirmed fact (anti-flood violated): %+v", tc.action, tc.decision, confirmed)
+				}
+				return
+			}
+			var got db.ConfirmedMemory
+			for _, c := range confirmed {
+				if c.Key == tc.wantKey {
+					got = c
+				}
+			}
+			if got.Key == "" {
+				t.Fatalf("ordinary %s/%s wrote no %q fact; have %+v", tc.action, tc.decision, tc.wantKey, confirmed)
+			}
+			if got.Provenance != "gitmoot-mechanical" {
+				t.Fatalf("outcome fact provenance = %q, want gitmoot-mechanical", got.Provenance)
+			}
+			if got.SourceJob != "job-1" {
+				t.Fatalf("outcome fact source_job = %q, want job-1", got.SourceJob)
+			}
+			// No fix-rounds fact: this job needed no corrective rounds.
+			for _, c := range confirmed {
+				if strings.HasPrefix(c.Key, "fix-rounds:") {
+					t.Fatalf("ordinary (0-round) job wrote a fix-rounds fact: %+v", c)
+				}
+			}
+		})
+	}
+}
+
+// TestMemoryOutcomeProducerUpsertsBoundedKey proves repeated notable jobs of the
+// same (action,decision) UPSERT the single keyed row rather than accumulating —
+// the bounded-cardinality contract (constraint #2). Two changes_requested review
+// jobs leave exactly one outcome row, refreshed to the latest source job.
+func TestMemoryOutcomeProducerUpsertsBoundedKey(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	ctrl := memController(store, 1500, 15, "audit")
+	for _, jobID := range []string{"job-1", "job-2", "job-3"} {
+		ctrl.record(ctx, jobID, memAgent(), "review",
+			JobPayload{Repo: "acme/widget"},
+			AgentResult{Decision: "changes_requested", Summary: "s"})
+	}
+	confirmed, err := store.ListConfirmedMemories(ctx, "audit", "acme/widget")
+	if err != nil {
+		t.Fatalf("list confirmed: %v", err)
+	}
+	count := 0
+	var row db.ConfirmedMemory
+	for _, c := range confirmed {
+		if c.Key == "outcome:review:changes_requested" {
+			count++
+			row = c
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly one upserted outcome row, got %d: %+v", count, confirmed)
+	}
+	if row.SourceJob != "job-3" {
+		t.Fatalf("upsert should refresh source_job to the latest (job-3), got %q", row.SourceJob)
+	}
+}
+
+// TestMemoryMechanicalFactsPassPreFilter proves constraint #3: every fact any
+// mechanical producer can emit, across the full (action × decision × rounds)
+// matrix, passes the SAME deterministic write filters (directive/secret/
+// executable) as agent-returned learnings — so no producer content is ever a
+// directive or secret shape.
+func TestMemoryMechanicalFactsPassPreFilter(t *testing.T) {
+	actions := []string{"ask", "run", "review", "implement", "orchestrate", ""}
+	for _, action := range actions {
+		for _, decision := range append([]string{"approved", "implemented"}, ResultDecisions...) {
+			for _, rounds := range []int{0, 3} {
+				facts := mechanicalFacts(action, JobPayload{Repo: "acme/widget", VerifyAttempt: rounds}, AgentResult{Decision: decision})
+				for _, f := range facts {
+					if ok, reason := memory.PreFilter(f.Content, f.Scope); !ok {
+						t.Fatalf("mechanical fact rejected by PreFilter (%s): action=%q decision=%q key=%q content=%q", reason, action, decision, f.Key, f.Content)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestMemoryActionTokenBounded proves memoryActionToken collapses the action to a
+// CLOSED allowlist: a recognized canonical action passes through (lowercased), and
+// EVERYTHING else — blank, free-form delegation prose, injection-shaped or
+// arbitrarily long strings — maps to the single generic "recent" bucket. This is
+// what actually bounds the key space (constraint #2): unlike the prior
+// strip-and-cap, no distinct free-form phrasing can ever become a distinct key or
+// leak mangled content, and two long strings can never collide at a length cap.
+func TestMemoryActionTokenBounded(t *testing.T) {
+	if got := memoryActionToken("Review"); got != "review" {
+		t.Fatalf("canonical action passes through lowercased: got %q", got)
+	}
+	if got := memoryActionToken("implement"); got != "implement" {
+		t.Fatalf("canonical action passes through: got %q", got)
+	}
+	if got := memoryActionToken("  "); got != "recent" {
+		t.Fatalf("blank action should map to the generic bucket, got %q", got)
+	}
+	// The exact free-form delegation actions from the #645 review: distinct
+	// phrasings MUST collapse to the same bounded bucket, not distinct keys.
+	if got := memoryActionToken("review the payment webhook retry logic"); got != "recent" {
+		t.Fatalf("free-form delegation action must bucket to recent, got %q", got)
+	}
+	if got := memoryActionToken("review the auth token refresh path"); got != "recent" {
+		t.Fatalf("a second free-form action must bucket to the SAME recent key, got %q", got)
+	}
+	if got := memoryActionToken("ask; DROP TABLE x -- /etc/passwd"); got != "recent" {
+		t.Fatalf("injection-shaped action must bucket to recent, got %q", got)
+	}
+	if got := memoryActionToken(strings.Repeat("a", 100)); got != "recent" {
+		t.Fatalf("unbounded-length action must bucket to recent (no length-cap collisions), got %q", got)
 	}
 }
 
@@ -284,4 +442,3 @@ func memContains(haystack []string, needle string) bool {
 	}
 	return false
 }
-

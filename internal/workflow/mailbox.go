@@ -76,10 +76,12 @@ type Mailbox struct {
 	// Engine.Memory via mailbox(). Best-effort: it never errors up.
 	injectMemory func(ctx context.Context, agent runtime.Agent, payload JobPayload) string
 	// recordMemory, when set, shadow-logs the agent's returned learnings to
-	// memory_observations and writes any gitmoot-authored mechanical fact to
-	// confirmed_memories at job terminal (#626). Nil (default) => no-op, so the
-	// terminal path is byte-identical. Best-effort: it never fails the job.
-	recordMemory func(ctx context.Context, jobID string, agent runtime.Agent, payload JobPayload, result AgentResult)
+	// memory_observations and writes any gitmoot-authored mechanical facts to
+	// confirmed_memories at job terminal (#626/#645). It is passed the job action
+	// (job.Type) so the mechanical producers can key facts by (action, outcome).
+	// Nil (default) => no-op, so the terminal path is byte-identical. Best-effort:
+	// it never fails the job.
+	recordMemory func(ctx context.Context, jobID string, agent runtime.Agent, action string, payload JobPayload, result AgentResult)
 }
 
 type JobRequest struct {
@@ -634,7 +636,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	// (#626 WRITE path). No-op when the hook is unset or the agent is not enrolled,
 	// so the terminal path is byte-identical. Best-effort — it never fails the job.
 	if m.recordMemory != nil {
-		m.recordMemory(ctx, job.ID, agent, payload, result)
+		m.recordMemory(ctx, job.ID, agent, job.Type, payload, result)
 	}
 	state := stateForDecision(result.Decision)
 	if err := m.finishWithPayload(ctx, job.ID, state, fmt.Sprintf("job %s", state), payload); err != nil {

@@ -133,11 +133,12 @@ func (c *MemoryController) PreviewBlock(ctx context.Context, agentName, repo, in
 
 // record is the Phase-1 WRITE path, run at job terminal. It (a) SHADOW-logs the
 // agent's returned learnings to memory_observations after the deterministic
-// pre-filters, and (b) writes any gitmoot-authored mechanical fact to
-// confirmed_memories (the ONLY Phase-1 confirmed producer — deterministic, no
-// LLM). Every write is best-effort: a failure is swallowed so memory can never
-// fail an otherwise-successful job.
-func (c *MemoryController) record(ctx context.Context, jobID string, agent runtime.Agent, payload JobPayload, result AgentResult) {
+// pre-filters, and (b) writes any gitmoot-authored mechanical facts to
+// confirmed_memories (the ONLY Phase-1 confirmed producers — deterministic, no
+// LLM). It takes the job action so the mechanical producers can key facts by
+// (action, outcome). Every write is best-effort: a failure is swallowed so
+// memory can never fail an otherwise-successful job.
+func (c *MemoryController) record(ctx context.Context, jobID string, agent runtime.Agent, action string, payload JobPayload, result AgentResult) {
 	if !c.enabledFor(agent.Name) {
 		return
 	}
@@ -171,9 +172,11 @@ func (c *MemoryController) record(ctx context.Context, jobID string, agent runti
 		})
 	}
 
-	// (b) Gitmoot-authored mechanical fact — deterministic, no LLM. This is the
-	// only Phase-1 producer of confirmed (injectable) memories.
-	if fact, ok := mechanicalFact(payload, result); ok {
+	// (b) Gitmoot-authored mechanical facts — deterministic, no LLM. These are the
+	// only Phase-1 producers of confirmed (injectable) memories. Each is GATED on a
+	// real terminal signal (never one-fact-per-job) and keyed by a BOUNDED category
+	// so the pool cannot grow unbounded and repeated jobs UPSERT the keyed row.
+	for _, fact := range mechanicalFacts(action, payload, result) {
 		_, _ = c.Store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
 			Owner:      owner,
 			Repo:       payload.Repo,
@@ -196,25 +199,141 @@ func normalizeLearningScope(scope string) string {
 	return memory.ScopeRepo
 }
 
-// mechanicalFact derives a deterministic, no-LLM repo fact from a terminal job's
-// payload. The Phase-1 producer records the FIX-ROUND count: when a job reached
-// its terminal decision only after one or more corrective rounds (verify or
-// retry), that is durable repo knowledge ("implement jobs here have needed up to
-// N fix rounds"). The key is stable per action so repeated jobs UPSERT the
-// latest count rather than accumulating rows. A job that needed zero fix rounds
-// produces nothing (ok=false), so trivial jobs write no confirmed memory.
-func mechanicalFact(payload JobPayload, result AgentResult) (memory.Entry, bool) {
+// mechanicalFacts derives the deterministic, no-LLM repo facts a terminal job
+// yields. It returns ZERO OR MORE confirmed-memory entries — one per genuine
+// terminal signal — so a single dispatch point can fan out several small,
+// independently-gated producers (#645). The contract every producer obeys:
+//
+//   - GATED, never one-fact-per-job: a trivial first-try success carrying no
+//     notable signal returns nothing, preserving the original "no signal → write
+//     nothing" restraint (constraint #1).
+//   - BOUNDED keys: every key is a low-cardinality CATEGORY (action × outcome),
+//     never free-form content, so the pool cannot grow unbounded and repeated
+//     jobs UPSERT the keyed row rather than accumulate (constraint #2).
+//   - DURABLE, reference-phrased content that passes the SAME deterministic write
+//     filters as agent-returned learnings: every entry is re-checked through
+//     memory.PreFilter, so a producer can never emit directive- or secret-shaped
+//     content even if a content template later drifts (constraint #3).
+func mechanicalFacts(action string, payload JobPayload, result AgentResult) []memory.Entry {
+	candidates := make([]memory.Entry, 0, 2)
+	if e, ok := fixRoundsFact(payload, result); ok {
+		candidates = append(candidates, e)
+	}
+	if e, ok := terminalOutcomeFact(action, result); ok {
+		candidates = append(candidates, e)
+	}
+	// Deterministic write filter: mechanical content is gitmoot-authored, but
+	// running it through the same PreFilter as agent learnings guarantees the
+	// directive/secret/executable gates hold for every producer (constraint #3).
+	kept := candidates[:0]
+	for _, e := range candidates {
+		if ok, _ := memory.PreFilter(e.Content, e.Scope); ok {
+			kept = append(kept, e)
+		}
+	}
+	return kept
+}
+
+// fixRoundsFact records the FIX-ROUND count when a job reached its terminal
+// decision only after one or more corrective rounds (verify or retry) — durable
+// repo knowledge ("<decision> jobs here needed up to N fix rounds"). The key is
+// stable per decision so repeated jobs UPSERT the latest count rather than
+// accumulating rows. A job that needed zero fix rounds produces nothing
+// (ok=false). This is the ORIGINAL Phase-1 producer, kept unchanged — but note
+// it only fires inside verify/retry loops, a path ordinary agent ask/run/review
+// jobs never reach, which is exactly the #645 coverage gap the outcome producer
+// below closes.
+func fixRoundsFact(payload JobPayload, result AgentResult) (memory.Entry, bool) {
 	rounds := memoryFixRounds(payload)
 	if rounds <= 0 {
 		return memory.Entry{}, false
 	}
-	action := strings.TrimSpace(result.Decision)
-	if action == "" {
-		action = "recent"
+	decision := strings.TrimSpace(result.Decision)
+	if decision == "" {
+		decision = "recent"
 	}
-	key := "fix-rounds:" + action
-	content := fmt.Sprintf("Recent %s jobs in this repository needed up to %d corrective fix round(s) before completing.", action, rounds)
+	key := "fix-rounds:" + decision
+	content := fmt.Sprintf("Recent %s jobs in this repository needed up to %d corrective fix round(s) before completing.", decision, rounds)
 	return memory.Entry{Scope: memory.ScopeRepo, Key: key, Content: content}, true
+}
+
+// notableOutcomes maps the terminal decisions the outcome producer AUTO-PROMOTES
+// to a reference-phrased fact fragment. The set is deliberately narrow:
+//
+//   - SUCCESS decisions (approved, implemented) are ABSENT: a routine success is
+//     not a signal, so an ordinary first-try success produces nothing (the
+//     anti-flood restraint, constraint #1).
+//   - The ANOMALOUS terminal states (failed, blocked) are ALSO absent. Those are
+//     the outcomes most likely to be a ONE-OFF — a single flaky failure, a single
+//     task blocked pending external input — and this producer promotes on the
+//     FIRST occurrence with no recurrence threshold and no decay. Auto-promoting
+//     them would let ONE anomalous job become a durable, injected repo "fact" that
+//     biases every future prompt toward expecting failure, long after the next 500
+//     jobs succeed. Until a recurrence gate exists (promote only after the same
+//     (owner,repo,action,decision) has recurred N>=2 times) they stay OUT of the
+//     auto-promoted set. See #645 review (the misleading-durable-fact finding).
+//
+// What remains — changes_requested — is a NORMAL, repeatable review conclusion
+// (not an anomaly): a review asking for changes is an expected outcome, so its
+// hedged "Some ... have" fact is accurate and non-biasing even at a low count.
+// Every key is drawn from the validated closed ResultDecisions set, keeping
+// outcome-fact cardinality bounded.
+var notableOutcomes = map[string]string{
+	"changes_requested": "concluded with changes requested rather than approval",
+}
+
+// terminalOutcomeFact records a repo fact when an ORDINARY job (the shape
+// agent ask/run/review/implement enqueue — no verify/retry loop required, so
+// fixRoundsFact above stays silent) terminates on a NOTABLE decision. This is
+// the #645 fix: it fires on terminal states ordinary CLI jobs actually reach, so
+// the confirmed pool populates under normal usage. It is keyed by
+// (action, decision) where BOTH sides are CLOSED categories: the decision is a
+// value from the validated ResultDecisions set, and the action is collapsed by
+// memoryActionToken to a fixed allowlist plus a single generic bucket. That
+// bounding is load-bearing because job.Type for a DELEGATION child is the
+// coordinator's free-form, LLM-authored d.Action (validated only as non-empty),
+// which must NEVER inflate key cardinality, collide at a length boundary, or leak
+// mangled content into a key or the injected prose. A non-notable decision yields
+// nothing (ok=false).
+func terminalOutcomeFact(action string, result AgentResult) (memory.Entry, bool) {
+	decision := strings.TrimSpace(result.Decision)
+	phrase, ok := notableOutcomes[decision]
+	if !ok {
+		return memory.Entry{}, false
+	}
+	act := memoryActionToken(action)
+	key := "outcome:" + act + ":" + decision
+	content := fmt.Sprintf("Some %s jobs in this repository have %s.", act, phrase)
+	return memory.Entry{Scope: memory.ScopeRepo, Key: key, Content: content}, true
+}
+
+// canonicalActions is the CLOSED allowlist of job actions the outcome producer
+// keys on. Top-level CLI jobs carry one of these as job.Type; a delegation child
+// instead carries its free-form, LLM-authored d.Action (validated only as
+// non-empty at result.go), which is precisely why memoryActionToken maps anything
+// NOT in this set to a single generic bucket instead of passing it through.
+var canonicalActions = map[string]bool{
+	"ask":       true,
+	"review":    true,
+	"implement": true,
+}
+
+// memoryActionToken maps a job action to a BOUNDED, key-safe token drawn from a
+// CLOSED set. A recognized canonical action passes through (lowercased); ANY other
+// value — an empty action, an unknown internal type, or a delegation's free-form
+// d.Action such as "review the payment webhook retry logic" — collapses to the
+// single generic "recent" bucket. Stripping-and-capping the raw string (the prior
+// behavior) was NOT enough: distinct free-form phrasings still produced distinct
+// keys (pool bloat, upsert defeated) and injected mangled prose, and long strings
+// could collide at the length cap. Collapsing to a closed allowlist keeps the
+// outcome key space a genuine closed category (constraint #2): free-form input can
+// neither inflate cardinality nor leak mangled content into a key or the prose.
+func memoryActionToken(action string) string {
+	a := strings.ToLower(strings.TrimSpace(action))
+	if canonicalActions[a] {
+		return a
+	}
+	return "recent"
 }
 
 // memoryFixRounds is the deterministic corrective-round count for a terminal
