@@ -1255,6 +1255,11 @@ func TestWebDataSourceAgentDetail(t *testing.T) {
 		detail.Template.SourcePath != "agents/planner.md" || detail.Template.ResolvedCommit != "aaaaaaaaaaaa" {
 		t.Fatalf("template source fields = %+v", detail.Template)
 	}
+	// Content is the full body of the version the template currently resolves to
+	// (current_version_id = v1), mapped verbatim from GetAgentTemplate().Content.
+	if detail.Template.Content != "v1 content" {
+		t.Fatalf("template content = %q, want %q (the current v1 body)", detail.Template.Content, "v1 content")
+	}
 
 	// Versions newest-first: v2 (pending) before v1 (current). Current marks v1.
 	if len(detail.Versions) != 2 {
@@ -1270,6 +1275,10 @@ func TestWebDataSourceAgentDetail(t *testing.T) {
 	if newest.Current {
 		t.Fatalf("newest pending v2 must not be marked Current")
 	}
+	// Each version carries its own body, mapped verbatim from the store row's Content.
+	if newest.Content != "v2 content" {
+		t.Fatalf("versions[0].Content = %q, want %q (the v2 body)", newest.Content, "v2 content")
+	}
 	oldest := detail.Versions[1]
 	if oldest.ID != v1ID || oldest.Number != 1 {
 		t.Fatalf("versions[1] = %+v, want v1 (number 1, id %s)", oldest, v1ID)
@@ -1279,6 +1288,9 @@ func TestWebDataSourceAgentDetail(t *testing.T) {
 	}
 	if oldest.State != "current" {
 		t.Fatalf("versions[1].State = %q, want current", oldest.State)
+	}
+	if oldest.Content != "v1 content" {
+		t.Fatalf("versions[1].Content = %q, want %q (the v1 body)", oldest.Content, "v1 content")
 	}
 	if oldest.CreatedAt <= 0 {
 		t.Fatalf("versions[1].CreatedAt = %d, want > 0 (parsed epoch ms)", oldest.CreatedAt)
