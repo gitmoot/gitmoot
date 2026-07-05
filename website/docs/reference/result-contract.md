@@ -443,11 +443,14 @@ trips, the offending delegations are dropped rather than dispatched.
   `GITMOOT_MAX_DELEGATION_DEPTH` environment variable (positive integer).
 - **Per-root job budget (`MaxDelegationTotalJobs = 64`)**: the whole delegation
   tree under one root — all children and continuations sharing that root — is
-  capped at this many jobs. When a batch of delegations would exceed the budget,
-  it is dropped, and the parent receives a lifecycle event such as "delegation
-  tree for root &lt;id&gt; reached the job budget of 64". Override per host with
-  the `GITMOOT_MAX_DELEGATION_TOTAL_JOBS` environment variable (positive
-  integer).
+  capped at this many jobs. The check is projected: the new jobs a batch would
+  add (ready and deferred legs, minus already-enqueued or fingerprint-deduped
+  ones) are counted before any child is enqueued, so the whole batch is dropped
+  if it would cross the cap — a wide fan-out from just under the limit is refused
+  whole rather than overshooting. The parent receives a lifecycle event such as
+  "delegation batch of &lt;n&gt; new job(s) would exceed the per-root job budget
+  of 64". Override per host with the `GITMOOT_MAX_DELEGATION_TOTAL_JOBS`
+  environment variable (positive integer).
 - **Wall-clock budget (`MaxDelegationWallClock = 2h`)**: the whole delegation
   tree under one root is bounded in duration, measured from the root job's
   creation. When a coordinator tries to fan out after the tree has run longer

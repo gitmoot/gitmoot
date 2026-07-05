@@ -3752,6 +3752,262 @@ func TestEngineDelegationWidthCapStopsDispatch(t *testing.T) {
 	}
 }
 
+// TestEngineDelegationBudgetProjectedRefusesBatchJustUnderCap is the #649 core
+// acceptance test: a tree at total = maxJobs-1 that returns a width-2 dep-free
+// batch would cross the cap, so the WHOLE batch is refused BEFORE any child is
+// enqueued (the old reactive `total >= maxJobs` guard let it through and
+// overshot). Fails on unpatched main, where the dep-free legs would enqueue.
+func TestEngineDelegationBudgetProjectedRefusesBatchJustUnderCap(t *testing.T) {
+	t.Setenv("GITMOOT_MAX_DELEGATION_TOTAL_JOBS", "3")
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "w", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	// Tree at total = maxJobs-1 = 2: the coordinator (self-roots) plus one filler.
+	insertCompletedJob(t, store, db.Job{ID: "root-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo: "jerryfane/gitmoot", Branch: "task-005", TaskID: "task-5", TaskTitle: "Parent", Sender: "coord",
+		Result: &AgentResult{
+			Decision: "approved", Summary: "done",
+			Delegations: []Delegation{
+				{ID: "w1", Agent: "w", Action: "review", Prompt: "do work a"},
+				{ID: "w2", Agent: "w", Action: "review", Prompt: "do work b"},
+			},
+		},
+	})
+	insertCompletedJob(t, store, db.Job{ID: "root-job/filler/1", Agent: "w", Type: "review"}, JobPayload{
+		Repo: "jerryfane/gitmoot", Branch: "task-005", TaskID: "task-5", Sender: "coord", RootJobID: "root-job",
+	})
+	if count, err := engine.countRootDelegationJobs(ctx, "root-job"); err != nil || count != 2 {
+		t.Fatalf("precondition countRootDelegationJobs = %d (err %v), want 2", count, err)
+	}
+
+	if err := engine.AdvanceJob(ctx, "root-job"); err != nil {
+		t.Fatalf("AdvanceJob(root): %v", err)
+	}
+
+	// A width-2 batch would push the tree to 4 > 3: nothing in the batch enqueues.
+	if jobExists(t, store, "root-job/delegation/w1") || jobExists(t, store, "root-job/delegation/w2") {
+		t.Fatal("projected admission must refuse the whole batch before any child is enqueued")
+	}
+	// The tree grew only by the finalize continuation (+1), never by a child.
+	if count, err := engine.countRootDelegationJobs(ctx, "root-job"); err != nil || count != 3 {
+		t.Fatalf("countRootDelegationJobs after refusal = %d (err %v), want 3 (2 + finalize continuation)", count, err)
+	}
+	if !jobExists(t, store, delegationContinuationID("root-job")) {
+		t.Fatal("refusal must enqueue the finalize continuation")
+	}
+	if got := countJobEvents(t, store, "root-job", "delegation_budget_exceeded"); got != 1 {
+		t.Fatalf("delegation_budget_exceeded event count = %d, want 1", got)
+	}
+	if got := countJobEvents(t, store, "root-job", "delegation_finalize_enqueued"); got != 1 {
+		t.Fatalf("delegation_finalize_enqueued event count = %d, want 1", got)
+	}
+}
+
+// TestEngineDelegationBudgetProjectedAdmitsExactFit pins the boundary: a batch
+// whose projected new jobs bring the tree to EXACTLY maxJobs is admitted whole
+// (reach-but-not-exceed), so every leg enqueues.
+func TestEngineDelegationBudgetProjectedAdmitsExactFit(t *testing.T) {
+	t.Setenv("GITMOOT_MAX_DELEGATION_TOTAL_JOBS", "4")
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "w", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	// Tree at total = maxJobs-2 = 2: coordinator + one filler.
+	insertCompletedJob(t, store, db.Job{ID: "root-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo: "jerryfane/gitmoot", Branch: "task-005", TaskID: "task-5", TaskTitle: "Parent", Sender: "coord",
+		Result: &AgentResult{
+			Decision: "approved", Summary: "done",
+			Delegations: []Delegation{
+				{ID: "w1", Agent: "w", Action: "review", Prompt: "do work a"},
+				{ID: "w2", Agent: "w", Action: "review", Prompt: "do work b"},
+			},
+		},
+	})
+	insertCompletedJob(t, store, db.Job{ID: "root-job/filler/1", Agent: "w", Type: "review"}, JobPayload{
+		Repo: "jerryfane/gitmoot", Branch: "task-005", TaskID: "task-5", Sender: "coord", RootJobID: "root-job",
+	})
+
+	if err := engine.AdvanceJob(ctx, "root-job"); err != nil {
+		t.Fatalf("AdvanceJob(root): %v", err)
+	}
+
+	// 2 + 2 == 4 == maxJobs: both legs enqueue; the tree reaches but does not exceed.
+	if !jobExists(t, store, "root-job/delegation/w1") || !jobExists(t, store, "root-job/delegation/w2") {
+		t.Fatal("an exact-fit batch (total+projected == maxJobs) must admit every leg")
+	}
+	if count, err := engine.countRootDelegationJobs(ctx, "root-job"); err != nil || count != 4 {
+		t.Fatalf("countRootDelegationJobs after admit = %d (err %v), want 4 (== maxJobs)", count, err)
+	}
+	if got := countJobEvents(t, store, "root-job", "delegation_budget_exceeded"); got != 0 {
+		t.Fatalf("delegation_budget_exceeded event count = %d, want 0 (admitted)", got)
+	}
+	if got := countJobEvents(t, store, "root-job", "delegation_finalize_enqueued"); got != 0 {
+		t.Fatalf("delegation_finalize_enqueued event count = %d, want 0 (admitted)", got)
+	}
+}
+
+// TestEngineDelegationBudgetProjectedCountsDeferredLegs covers the critical
+// secondary path: deferred (deps-bearing) legs escape every later budget check,
+// so the projection must count them at admission. A tree at total = maxJobs-1
+// with a batch of 1 ready + 1 deferred leg projects 2 → the whole batch is
+// refused, and NOT EVEN the ready leg enqueues. On unpatched main the ready leg
+// would enqueue (total 2 < 3) and the deferred leg would later escape the cap.
+func TestEngineDelegationBudgetProjectedCountsDeferredLegs(t *testing.T) {
+	t.Setenv("GITMOOT_MAX_DELEGATION_TOTAL_JOBS", "3")
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "w", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	// Tree at total = maxJobs-1 = 2.
+	insertCompletedJob(t, store, db.Job{ID: "root-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo: "jerryfane/gitmoot", Branch: "task-005", TaskID: "task-5", TaskTitle: "Parent", Sender: "coord",
+		Result: &AgentResult{
+			Decision: "approved", Summary: "done",
+			Delegations: []Delegation{
+				{ID: "ready", Agent: "w", Action: "review", Prompt: "ready leg"},
+				{ID: "deferred", Agent: "w", Action: "review", Prompt: "deferred leg", Deps: []string{"ready"}},
+			},
+		},
+	})
+	insertCompletedJob(t, store, db.Job{ID: "root-job/filler/1", Agent: "w", Type: "review"}, JobPayload{
+		Repo: "jerryfane/gitmoot", Branch: "task-005", TaskID: "task-5", Sender: "coord", RootJobID: "root-job",
+	})
+
+	if err := engine.AdvanceJob(ctx, "root-job"); err != nil {
+		t.Fatalf("AdvanceJob(root): %v", err)
+	}
+
+	// projected counts the deferred leg (2 total > 1 slot): whole batch refused,
+	// so even the dep-free ready leg does not enqueue.
+	if jobExists(t, store, "root-job/delegation/ready") {
+		t.Fatal("counting the deferred leg must refuse the whole batch, including the ready leg")
+	}
+	if jobExists(t, store, "root-job/delegation/deferred") {
+		t.Fatal("the deferred leg must not enqueue")
+	}
+	if got := countJobEvents(t, store, "root-job", "delegation_budget_exceeded"); got != 1 {
+		t.Fatalf("delegation_budget_exceeded event count = %d, want 1", got)
+	}
+	if got := countJobEvents(t, store, "root-job", "delegation_finalize_enqueued"); got != 1 {
+		t.Fatalf("delegation_finalize_enqueued event count = %d, want 1", got)
+	}
+}
+
+// TestEngineDelegationBudgetProjectedDedupNearBoundary pins that the projection
+// dedups shared-fingerprint legs (parity with enqueueDelegation): a width-3
+// batch with two same-fingerprint legs projects 2 unique children, which fits
+// the remaining budget and is admitted. A naive projected = len(dels) would
+// count 3 and wrongly refuse the batch.
+func TestEngineDelegationBudgetProjectedDedupNearBoundary(t *testing.T) {
+	t.Setenv("GITMOOT_MAX_DELEGATION_TOTAL_JOBS", "4")
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "w", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	// Tree at total = maxJobs-2 = 2.
+	insertCompletedJob(t, store, db.Job{ID: "root-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo: "jerryfane/gitmoot", Branch: "task-005", TaskID: "task-5", TaskTitle: "Parent", Sender: "coord",
+		Result: &AgentResult{
+			Decision: "approved", Summary: "done",
+			Delegations: []Delegation{
+				{ID: "d1", Agent: "w", Action: "review", Prompt: "work", Fingerprint: "shared-fp"},
+				{ID: "d2", Agent: "w", Action: "review", Prompt: "work again", Fingerprint: "shared-fp"},
+				{ID: "d3", Agent: "w", Action: "review", Prompt: "distinct", Fingerprint: "other-fp"},
+			},
+		},
+	})
+	insertCompletedJob(t, store, db.Job{ID: "root-job/filler/1", Agent: "w", Type: "review"}, JobPayload{
+		Repo: "jerryfane/gitmoot", Branch: "task-005", TaskID: "task-5", Sender: "coord", RootJobID: "root-job",
+	})
+
+	if err := engine.AdvanceJob(ctx, "root-job"); err != nil {
+		t.Fatalf("AdvanceJob(root): %v", err)
+	}
+
+	// projected = 2 (d2 folds into d1's fingerprint); 2 + 2 == 4 == maxJobs: admit.
+	if !jobExists(t, store, "root-job/delegation/d1") {
+		t.Fatal("the first same-fingerprint leg must enqueue")
+	}
+	if jobExists(t, store, "root-job/delegation/d2") {
+		t.Fatal("the second same-fingerprint leg must be deduped, not enqueued")
+	}
+	if !jobExists(t, store, "root-job/delegation/d3") {
+		t.Fatal("the distinct-fingerprint leg must enqueue (dedup must not over-refuse the batch)")
+	}
+	if got := countJobEvents(t, store, "root-job", "delegation_deduped"); got != 1 {
+		t.Fatalf("delegation_deduped event count = %d, want 1", got)
+	}
+	if got := countJobEvents(t, store, "root-job", "delegation_budget_exceeded"); got != 0 {
+		t.Fatalf("delegation_budget_exceeded event count = %d, want 0 (dedup keeps it under the cap)", got)
+	}
+	if got := countJobEvents(t, store, "root-job", "delegation_finalize_enqueued"); got != 0 {
+		t.Fatalf("delegation_finalize_enqueued event count = %d, want 0", got)
+	}
+}
+
+// TestEngineDelegationBudgetProjectedIdempotentReadvance guards the
+// skip-existing-children rule: after a successful admit, re-advancing the
+// coordinator must project 0 new jobs (every leg already has a child) so the
+// tree neither grows nor spuriously finalizes. A projection that forgot to skip
+// already-enqueued children would double-count them and falsely trip the budget.
+func TestEngineDelegationBudgetProjectedIdempotentReadvance(t *testing.T) {
+	t.Setenv("GITMOOT_MAX_DELEGATION_TOTAL_JOBS", "4")
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "w", []string{"review"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	insertCompletedJob(t, store, db.Job{ID: "root-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo: "jerryfane/gitmoot", Branch: "task-005", TaskID: "task-5", TaskTitle: "Parent", Sender: "coord",
+		Result: &AgentResult{
+			Decision: "approved", Summary: "done",
+			Delegations: []Delegation{
+				{ID: "w1", Agent: "w", Action: "review", Prompt: "do work a"},
+				{ID: "w2", Agent: "w", Action: "review", Prompt: "do work b"},
+			},
+		},
+	})
+	insertCompletedJob(t, store, db.Job{ID: "root-job/filler/1", Agent: "w", Type: "review"}, JobPayload{
+		Repo: "jerryfane/gitmoot", Branch: "task-005", TaskID: "task-5", Sender: "coord", RootJobID: "root-job",
+	})
+
+	// First advance: admits both legs, tree reaches maxJobs (4).
+	if err := engine.AdvanceJob(ctx, "root-job"); err != nil {
+		t.Fatalf("AdvanceJob(root) first: %v", err)
+	}
+	if !jobExists(t, store, "root-job/delegation/w1") || !jobExists(t, store, "root-job/delegation/w2") {
+		t.Fatal("first advance must enqueue both legs")
+	}
+	if count, err := engine.countRootDelegationJobs(ctx, "root-job"); err != nil || count != 4 {
+		t.Fatalf("countRootDelegationJobs after first advance = %d (err %v), want 4", count, err)
+	}
+
+	// Re-advance the coordinator: projected == 0 (both legs already have children),
+	// so the tree is at the cap but admits (nothing new) — no spurious finalize.
+	if err := engine.AdvanceJob(ctx, "root-job"); err != nil {
+		t.Fatalf("AdvanceJob(root) re-advance: %v", err)
+	}
+	if count, err := engine.countRootDelegationJobs(ctx, "root-job"); err != nil || count != 4 {
+		t.Fatalf("countRootDelegationJobs after re-advance = %d (err %v), want 4 (unchanged)", count, err)
+	}
+	if got := countJobEvents(t, store, "root-job", "delegation_budget_exceeded"); got != 0 {
+		t.Fatalf("delegation_budget_exceeded event count = %d, want 0 (idempotent re-advance must not trip the budget)", got)
+	}
+	if jobExists(t, store, delegationContinuationID("root-job")) {
+		t.Fatal("an idempotent re-advance at the cap must NOT enqueue a finalize continuation")
+	}
+}
+
 // TestEngineDelegationEscalateThenBlockParentFoldsIntoContinuation pins the
 // contradictory-state fix: once an escalate failure has enqueued the
 // continuation, a later block_parent sibling failure must NOT also block the
