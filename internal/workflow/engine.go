@@ -2708,6 +2708,17 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 			// may have advanced past the inherited HeadSHA. Clear it so the child
 			// validates against its own fresh worktree HEAD (see isDelegationWorktreeChild).
 			request.HeadSHA = ""
+			// The worktree is the committed tip: it omits gitignored (repos/**) and
+			// uncommitted working-tree files. Point the child at the canonical base
+			// checkout so an analysis task does not silently report working-tree state
+			// as missing (#654). Appending to Instructions keeps the payload
+			// deterministic for the idempotent-enqueue equality check, matching the
+			// #419 upstream-context pattern. Scoped to this branch only: the
+			// single-read-only, no-manager-fallback, and integration-worktree cases
+			// must NOT be pointed at the base checkout.
+			if note := readOnlyWorktreeContextNote(e.DelegationCheckout); note != "" {
+				request.Instructions += note
+			}
 		}
 	}
 

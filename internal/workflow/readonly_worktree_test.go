@@ -254,6 +254,28 @@ func TestDispatchDelegationsTwoReadOnlySiblingsGetSeparateDetachedWorktrees(t *t
 			t.Fatalf("detached worktree ref = %q, want parent branch task-005", c.base)
 		}
 	}
+	// #654: each read-only fan-out child keeps its original prompt AND gains a
+	// worktree-context note pointing at the canonical base checkout, so a codex
+	// (or absolute-path-aware) worker reads gitignored/uncommitted files there
+	// instead of reporting them missing from the committed-tip worktree.
+	for _, tc := range []struct {
+		id      string
+		payload JobPayload
+		prompt  string
+	}{
+		{"d1", payloadOne, "audit one"},
+		{"d2", payloadTwo, "audit two"},
+	} {
+		if !strings.HasPrefix(tc.payload.Instructions, tc.prompt) {
+			t.Fatalf("%s instructions must start with the original prompt %q, got %q", tc.id, tc.prompt, tc.payload.Instructions)
+		}
+		if !strings.Contains(tc.payload.Instructions, engine.DelegationCheckout) {
+			t.Fatalf("%s instructions must carry the base-checkout path %q, got %q", tc.id, engine.DelegationCheckout, tc.payload.Instructions)
+		}
+		if !strings.Contains(tc.payload.Instructions, "COMMITTED TIP") || !strings.Contains(tc.payload.Instructions, "gitignored") {
+			t.Fatalf("%s instructions must warn about the committed-tip / gitignored worktree, got %q", tc.id, tc.payload.Instructions)
+		}
+	}
 }
 
 func TestDispatchDelegationsSingleReadOnlyDelegationStaysInSharedCheckout(t *testing.T) {
@@ -297,6 +319,12 @@ func TestDispatchDelegationsSingleReadOnlyDelegationStaysInSharedCheckout(t *tes
 	if len(manager.detachedCalls) != 0 {
 		t.Fatalf("single read-only delegation must not allocate a worktree: %+v", manager.detachedCalls)
 	}
+	// #654: a single read-only delegation runs in the base checkout and already
+	// sees gitignored/uncommitted files, so it must NOT carry the committed-tip
+	// worktree note; its prompt stays byte-identical to the delegation prompt.
+	if payload.Instructions != "audit one" {
+		t.Fatalf("single read-only delegation instructions = %q, want the bare prompt with no worktree note", payload.Instructions)
+	}
 }
 
 func TestDispatchDelegationsReadOnlyFanoutWithoutManagerEmitsSkippedEvent(t *testing.T) {
@@ -336,8 +364,44 @@ func TestDispatchDelegationsReadOnlyFanoutWithoutManagerEmitsSkippedEvent(t *tes
 		if strings.TrimSpace(payload.WorktreePath) != "" {
 			t.Fatalf("fallback child %s unexpectedly got worktree path %q", id, payload.WorktreePath)
 		}
+		// #654: the fallback children run serialized in the shared base checkout,
+		// so they already see gitignored/uncommitted files and must NOT carry the
+		// committed-tip worktree note (which is scoped to the worktree branch).
+		if strings.Contains(payload.Instructions, "COMMITTED TIP") {
+			t.Fatalf("fallback child %s must not carry the worktree-context note, got %q", id, payload.Instructions)
+		}
 	}
 	if got := countJobEvents(t, store, "parent-job", "delegation_worktree_skipped"); got != 2 {
 		t.Fatalf("delegation_worktree_skipped event count = %d, want 2", got)
+	}
+}
+
+func TestReadOnlyWorktreeContextNote(t *testing.T) {
+	// Blank base checkout → "" so ask-path / test engines that never set
+	// Engine.DelegationCheckout produce byte-identical prompts (#654).
+	if got := readOnlyWorktreeContextNote(""); got != "" {
+		t.Fatalf("readOnlyWorktreeContextNote(\"\") = %q, want empty", got)
+	}
+	if got := readOnlyWorktreeContextNote("   "); got != "" {
+		t.Fatalf("readOnlyWorktreeContextNote(blank) = %q, want empty", got)
+	}
+
+	base := "/root/gitmoot"
+	note := readOnlyWorktreeContextNote(base)
+	if note == "" {
+		t.Fatal("readOnlyWorktreeContextNote with a base checkout returned empty")
+	}
+	if !strings.Contains(note, base) {
+		t.Fatalf("note must contain the base checkout path %q: %q", base, note)
+	}
+	for _, want := range []string{"COMMITTED TIP", "gitignored", "read-only"} {
+		if !strings.Contains(note, want) {
+			t.Fatalf("note must mention %q: %q", want, note)
+		}
+	}
+	// Deterministic: identical input → byte-identical output, so a re-dispatch or
+	// retry recomputes the same payload for the idempotent-enqueue equality check.
+	if again := readOnlyWorktreeContextNote(base); again != note {
+		t.Fatalf("note is non-deterministic: %q != %q", again, note)
 	}
 }

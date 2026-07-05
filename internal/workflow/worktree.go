@@ -406,6 +406,26 @@ func readOnlyFanoutNeedsWorktree(payload JobPayload, d Delegation) bool {
 	return false
 }
 
+// readOnlyWorktreeContextNote returns a deterministic prompt appendix warning a
+// read-only fan-out delegation child that its detached worktree is the COMMITTED
+// TIP of the base branch and therefore omits gitignored paths (e.g. vendored
+// clones under repos/**) and any uncommitted working-tree changes. It points the
+// child at the canonical base checkout so an analysis task reads those files
+// there instead of silently reporting a working-tree feature as absent (#654).
+// It returns "" for a blank baseCheckout so the ask-path and any engine that does
+// not set Engine.DelegationCheckout produce byte-identical prompts. The text is
+// built only from static strings and baseCheckout, so a re-dispatch/retry
+// recomputes it identically — required by the idempotent-enqueue payload-equality
+// check (payloadMatchesRequest compares Instructions); this mirrors the #419
+// upstream-context append.
+func readOnlyWorktreeContextNote(baseCheckout string) string {
+	base := strings.TrimSpace(baseCheckout)
+	if base == "" {
+		return ""
+	}
+	return "\n\nWorktree context (read-only): you are running in a detached git worktree checked out at the COMMITTED TIP of the base branch. It does NOT contain gitignored paths (for example vendored clones under repos/**) or any uncommitted working-tree changes. If a path this task references is absent from your working directory, read it from the canonical base checkout at " + base + " before concluding it is missing — do not report a working-tree feature as absent without checking there. This is a read-only analysis; do not write outside your worktree."
+}
+
 // isReadOnlyDelegationWorktree reports whether a job ran in a detached read-only
 // delegation worktree that must be disposed. Only read-only delegation children
 // allocate one; implement children carry a branch and are cleaned through the
