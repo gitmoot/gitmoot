@@ -150,6 +150,11 @@ func TestClaudeDeliverFreshRef(t *testing.T) {
 	if result.RefreshedRuntimeRef != minted {
 		t.Fatalf("RefreshedRuntimeRef = %q, want minted fresh session %q", result.RefreshedRuntimeRef, minted)
 	}
+	// A fresh-ref session is ephemeral by design (#665): adopted in-memory for
+	// same-job repair, never persisted onto the agent's stored ref.
+	if !result.SessionEphemeral {
+		t.Fatalf("SessionEphemeral = false, want true for a fresh-ref delivery")
+	}
 	runner.want(t, 0, "claude", "--model", "claude-opus-4", "--session-id", minted, "-p", "--output-format", "json", "--", "do the thing")
 	for _, arg := range runner.calls[0] {
 		if arg == "--resume" || arg == "--continue" {

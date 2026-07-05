@@ -906,6 +906,128 @@ func TestMailboxRunFreshRefRepairUsesConcreteSessionWithoutPersisting(t *testing
 	}
 }
 
+// TestMailboxRunEphemeralRefAdoptedButNotPersisted pins F1 (#665): a delivery
+// that mints a by-design per-job session (SessionEphemeral=true — the
+// last+template coordinator path and the #531 fresh-ref path route through
+// deliverFresh) must ADOPT the concrete session in-memory so a same-job repair
+// resumes it, but must NEVER persist it onto the agent's stored "last"
+// registration, and must NOT emit the dead-session self-heal event. Without the
+// ephemeral guard the "last" agent (registeredFreshRef=false) would be re-pinned
+// to the minted UUID and lose isolation after job 1.
+func TestMailboxRunEphemeralRefAdoptedButNotPersisted(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+	concreteRef := "claude-ephemeral-session-1"
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:       "coordinator",
+		Role:       "agent",
+		Runtime:    runtime.ClaudeRuntime,
+		RuntimeRef: runtime.LastRef,
+		RepoScope:  "jerryfane/gitmoot",
+	}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+	agent := runtime.Agent{Name: "coordinator", Runtime: runtime.ClaudeRuntime, RuntimeRef: runtime.LastRef, RepoScope: "jerryfane/gitmoot", Role: "agent", TemplateID: "coordinator"}
+	adapter := &fakeDelivery{
+		// First delivery mints an ephemeral session but is malformed; the repair
+		// delivery must resume that concrete session, not "last".
+		outputs: []string{
+			"ephemeral session but no json",
+			`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["x"],"tests_run":[],"needs":[],"delegations":[]}}`,
+		},
+		refreshedRefs: []string{concreteRef},
+		ephemeral:     []bool{true},
+	}
+
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "coordinator", Action: "implement", Repo: "jerryfane/gitmoot"}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	if len(adapter.agentRefs) != 2 {
+		t.Fatalf("deliveries = %d, want 2", len(adapter.agentRefs))
+	}
+	if adapter.agentRefs[0] != runtime.LastRef {
+		t.Fatalf("first delivery ref = %q, want %q", adapter.agentRefs[0], runtime.LastRef)
+	}
+	if adapter.agentRefs[1] != concreteRef {
+		t.Fatalf("repair delivery ref = %q, want in-memory-adopted concrete session %q", adapter.agentRefs[1], concreteRef)
+	}
+	stored, err := store.GetAgent(ctx, "coordinator")
+	if err != nil {
+		t.Fatalf("GetAgent returned error: %v", err)
+	}
+	if stored.RuntimeRef != runtime.LastRef {
+		t.Fatalf("stored runtime_ref = %q, want unchanged %q — an ephemeral session must never be persisted", stored.RuntimeRef, runtime.LastRef)
+	}
+	events, err := store.ListJobEvents(ctx, "job-1")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	for _, e := range events {
+		if e.Kind == "session_refresh_retry" {
+			t.Fatalf("unexpected session_refresh_retry event on a healthy ephemeral delivery: %+v", events)
+		}
+	}
+}
+
+// TestMailboxRunEphemeralRefStaysFreshAcrossJobs pins the user-visible F1 (#665)
+// invariant: after a first ephemeral delivery, a SECOND job for the same agent
+// must again take the fresh path. Because job 1 never persisted its minted UUID,
+// the agent's stored ref stays "last", so job 2 (loaded from the store, as the
+// daemon does) delivers on "last" again — never resuming job 1's session.
+func TestMailboxRunEphemeralRefStaysFreshAcrossJobs(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:       "coordinator",
+		Role:       "agent",
+		Runtime:    runtime.ClaudeRuntime,
+		RuntimeRef: runtime.LastRef,
+		RepoScope:  "jerryfane/gitmoot",
+	}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+	adapter := &fakeDelivery{
+		outputs:       []string{okDeliveryResult, okDeliveryResult},
+		refreshedRefs: []string{"claude-ephemeral-job1", "claude-ephemeral-job2"},
+		ephemeral:     []bool{true, true},
+	}
+
+	for _, jobID := range []string{"job-1", "job-2"} {
+		// Reload the agent from the store before each job, exactly as the daemon
+		// does: if job 1 had persisted its minted UUID, job 2 would load it here and
+		// resume the wrong session.
+		stored, err := store.GetAgent(ctx, "coordinator")
+		if err != nil {
+			t.Fatalf("GetAgent before %s returned error: %v", jobID, err)
+		}
+		if stored.RuntimeRef != runtime.LastRef {
+			t.Fatalf("stored runtime_ref before %s = %q, want %q — an ephemeral session leaked into the stored ref", jobID, stored.RuntimeRef, runtime.LastRef)
+		}
+		agent := runtime.Agent{Name: "coordinator", Runtime: runtime.ClaudeRuntime, RuntimeRef: stored.RuntimeRef, RepoScope: "jerryfane/gitmoot", Role: "agent", TemplateID: "coordinator"}
+		if _, err := mailbox.Enqueue(ctx, JobRequest{ID: jobID, Agent: "coordinator", Action: "implement", Repo: "jerryfane/gitmoot"}); err != nil {
+			t.Fatalf("Enqueue %s returned error: %v", jobID, err)
+		}
+		if _, err := mailbox.Run(ctx, jobID, agent, adapter); err != nil {
+			t.Fatalf("Run %s returned error: %v", jobID, err)
+		}
+	}
+
+	if len(adapter.agentRefs) != 2 {
+		t.Fatalf("deliveries = %d, want 2 (one per job)", len(adapter.agentRefs))
+	}
+	for i, ref := range adapter.agentRefs {
+		if ref != runtime.LastRef {
+			t.Fatalf("delivery %d ref = %q, want %q — job 2 must not resume job 1's ephemeral session", i, ref, runtime.LastRef)
+		}
+	}
+}
+
 func TestMailboxRunNoRefreshLeavesRefUnchanged(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
@@ -1209,6 +1331,7 @@ type fakeDelivery struct {
 	outputs       []string
 	summaries     []string
 	refreshedRefs []string
+	ephemeral     []bool
 	inputTokens   []int
 	outputTokens  []int
 	cumulative    []bool
@@ -1240,6 +1363,9 @@ func (f *fakeDelivery) Deliver(_ context.Context, agent runtime.Agent, job runti
 	}
 	if index < len(f.refreshedRefs) {
 		result.RefreshedRuntimeRef = f.refreshedRefs[index]
+	}
+	if index < len(f.ephemeral) {
+		result.SessionEphemeral = f.ephemeral[index]
 	}
 	if index < len(f.inputTokens) {
 		result.InputTokens = f.inputTokens[index]

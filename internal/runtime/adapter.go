@@ -92,11 +92,25 @@ type Result struct {
 	// session's cumulative == this job's usage — and are recorded verbatim (#664).
 	// Only codex sets this today; other adapters leave it false.
 	CumulativeUsage bool
-	// RefreshedRuntimeRef is non-empty only when the adapter self-healed a dead
-	// pre-execution session and re-pinned the agent to a fresh runtime reference
-	// (#443). The mailbox persists it through the Store so subsequent jobs use the
-	// new ref. Other adapters and the happy path leave it empty.
+	// RefreshedRuntimeRef is non-empty when the adapter delivered on a runtime
+	// reference other than the agent's stored one: either a #443 dead-session
+	// self-heal that re-pinned the agent to a fresh reference, or a by-design
+	// per-job session minted for an isolated delivery (the #531 fresh-ref path and
+	// the last+template coordinator path). The mailbox adopts it in-memory so a
+	// same-job repair delivery resumes the same session; whether it is also
+	// PERSISTED onto the agent's stored ref is gated by SessionEphemeral. Other
+	// adapters and the happy path leave it empty.
 	RefreshedRuntimeRef string
+	// SessionEphemeral reports that RefreshedRuntimeRef names a per-job session the
+	// adapter minted BY DESIGN — the isolated Claude sessions from deliverFresh (the
+	// #531 fresh-ref path and the last+template coordinator path) — and NOT a #443
+	// dead-session self-heal re-pin. The mailbox must adopt an ephemeral ref
+	// in-memory (so same-job repair stays coherent) but must NEVER persist it onto
+	// the agent's stored runtime_ref: persisting it would rewrite a "last"/fresh
+	// registration to the minted UUID and end the per-job isolation after job 1. The
+	// self-heal path (a genuinely dead pinned session, replaced permanently) leaves
+	// this false so its re-pin IS persisted.
+	SessionEphemeral bool
 }
 
 type StartRequest struct {
@@ -730,7 +744,11 @@ func (a ClaudeAdapter) deliverFresh(ctx context.Context, agent Agent, job Job, m
 	if err != nil {
 		return Result{Raw: result.Stdout + result.Stderr}, claudeCommandError(result, err)
 	}
-	parsed := Result{Raw: result.Stdout, RefreshedRuntimeRef: sessionID}
+	// SessionEphemeral marks this session as by-design per-job (fresh-ref #531 or
+	// last+template coordinator): the mailbox adopts sessionID in-memory for
+	// same-job repair but must NOT persist it onto the agent's stored ref, or the
+	// isolation would end after job 1.
+	parsed := Result{Raw: result.Stdout, RefreshedRuntimeRef: sessionID, SessionEphemeral: true}
 	summary, inTok, outTok := parseClaudeJSONResult(result.Stdout)
 	if summary != "" {
 		parsed.Summary = summary
