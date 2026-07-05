@@ -62,10 +62,13 @@ type Result struct {
 	// InputTokens and OutputTokens are best-effort runtime token usage captured
 	// from the CLI's structured output where it exposes one (#338 Part B). They
 	// default to 0. Per-runtime status today: claude reports usage via its
-	// --output-format json envelope; kimi reports usage if its stream-json emits a
-	// usage/result event; codex Deliver runs without --json (plain text) so it
-	// contributes 0. A 0 here means "not captured", and the per-root delegation
-	// token budget simply under-counts that job rather than failing.
+	// --output-format json envelope; kimi-code 0.19.2 emits no usage event so it
+	// contributes 0; codex Deliver reads the last turn.completed usage from its
+	// `exec --json` JSONL output (#658) for FRESH sessions only — resumed
+	// sessions contribute 0 because codex reports session-cumulative usage there
+	// (see codexDeliverResult) — falling back to 0 on an older CLI that predates
+	// --json. A 0 here means "not captured", and the per-root delegation token
+	// budget simply under-counts that job rather than failing.
 	InputTokens  int
 	OutputTokens int
 	// RefreshedRuntimeRef is non-empty only when the adapter self-healed a dead
@@ -325,24 +328,40 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 	if err := a.Validate(ctx, agent); err != nil {
 		return Result{}, err
 	}
-	args := append([]string{"exec"}, codexSandboxArgs(agent)...)
 	model := effectiveModel(agent, job)
 	// A fresh ref (per-job --runtime override, #531) starts a brand-new exec
 	// session — never `resume` — so an overridden job cannot read or pollute any
-	// stored session's state.
+	// stored session's state. Every other ref resumes an existing session, which
+	// we first verify still exists.
+	if !IsFreshRef(agent.RuntimeRef) {
+		if err := a.verifySession(ctx, agent); err != nil {
+			return Result{}, err
+		}
+	}
+	result, err := a.runCodex(ctx, agent, job.Prompt, model)
+	if err != nil {
+		return Result{Raw: result.Stdout + result.Stderr}, codexCommandError(result, err)
+	}
+	return codexDeliverResult(result.Stdout, IsFreshRef(agent.RuntimeRef)), nil
+}
+
+// codexDeliverArgs builds the `codex exec` argument vector for a Deliver call.
+// jsonOutput adds --json so codex streams JSONL events (thread/turn/item) on
+// stdout, which is what lets a delivery capture token usage (#658). --json is an
+// `exec` option that codex accepts before the `resume` subcommand, which is where
+// we place it. jsonOutput=false is the older-CLI fallback (see runCodex): it
+// reproduces the pre-#658 plain-text command exactly. A fresh ref (#531) always
+// starts a brand-new exec session and never resumes.
+func codexDeliverArgs(agent Agent, prompt, model string, jsonOutput bool) []string {
+	args := append([]string{"exec"}, codexSandboxArgs(agent)...)
+	if jsonOutput {
+		args = append(args, "--json")
+	}
 	if IsFreshRef(agent.RuntimeRef) {
 		if model != "" {
 			args = append(args, "--model", model)
 		}
-		args = append(args, "--", job.Prompt)
-		result, err := a.runner().Run(ctx, a.Dir, "codex", args...)
-		if err != nil {
-			return Result{Raw: result.Stdout + result.Stderr}, codexCommandError(result, err)
-		}
-		return Result{Raw: result.Stdout}, nil
-	}
-	if err := a.verifySession(ctx, agent); err != nil {
-		return Result{}, err
+		return append(args, "--", prompt)
 	}
 	args = append(args, "resume")
 	if model != "" {
@@ -353,12 +372,50 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 	} else {
 		args = append(args, agent.RuntimeRef)
 	}
-	args = append(args, "--", job.Prompt)
-	result, err := a.runner().Run(ctx, a.Dir, "codex", args...)
-	if err != nil {
-		return Result{Raw: result.Stdout + result.Stderr}, codexCommandError(result, err)
+	return append(args, "--", prompt)
+}
+
+// runCodex performs a single codex Deliver run with --json (for token capture),
+// re-running once WITHOUT --json when an older codex CLI rejects the flag
+// (mirrors runClaude's --output-format fallback). The plain-text re-run keeps the
+// pre-#658 semantics; codexDeliverResult then fails open on the non-JSONL stdout
+// and contributes 0 usage. Only the JSON re-run is retried — a genuine delivery
+// failure surfaces unchanged.
+func (a CodexAdapter) runCodex(ctx context.Context, agent Agent, prompt, model string) (subprocess.Result, error) {
+	result, err := a.runner().Run(ctx, a.Dir, "codex", codexDeliverArgs(agent, prompt, model, true)...)
+	if err != nil && isCodexJSONUnsupported(result) {
+		result, err = a.runner().Run(ctx, a.Dir, "codex", codexDeliverArgs(agent, prompt, model, false)...)
 	}
-	return Result{Raw: result.Stdout}, nil
+	return result, err
+}
+
+// codexDeliverResult turns codex `exec --json` stdout into a Deliver Result: the
+// joined agent_message text becomes Raw — the exact text the engine scans for the
+// gitmoot_result blob, just as the plain-text stdout was before #658 — plus the
+// last turn.completed usage as best-effort token counts. It fails open: stdout
+// carrying no agent_message event (older CLI, the plain-text --json fallback, or
+// an unexpected shape) is returned verbatim as Raw with 0 usage, so a delivery is
+// never lost because usage parsing changed.
+//
+// Usage is reported ONLY for fresh sessions (per-job --runtime overrides and
+// ephemeral delegation workers — the #338 budget's primary target). On RESUMED
+// sessions codex's turn.completed usage is SESSION-CUMULATIVE, not per-turn:
+// probed live on codex-cli 0.142.4, three one-word turns on one thread reported
+// input 16504 -> 85681 -> 103779 and output 20 -> 40 -> 45 (monotonically
+// accumulating), and a single resumed ask on a long-lived agent reported 22.4M
+// input tokens — orders of magnitude beyond any single turn. Attributing the
+// whole session history to each job would corrupt per-root budgets and usage
+// charts, so resumed deliveries contribute 0 until per-session delta tracking
+// exists (follow-up issue).
+func codexDeliverResult(stdout string, freshSession bool) Result {
+	raw, inputTokens, outputTokens, ok := parseCodexJSONResult(stdout)
+	if !ok {
+		return Result{Raw: stdout, Summary: strings.TrimSpace(stdout)}
+	}
+	if !freshSession {
+		inputTokens, outputTokens = 0, 0
+	}
+	return Result{Raw: raw, Summary: strings.TrimSpace(raw), InputTokens: inputTokens, OutputTokens: outputTokens}
 }
 
 func (a CodexAdapter) Health(ctx context.Context, agent Agent) error {
@@ -914,6 +971,79 @@ func parseCodexErrorMessage(output string) string {
 		}
 	}
 	return message
+}
+
+// codexUsage mirrors the usage object on codex's turn.completed --json event.
+// input_tokens already includes cached_input_tokens, so we read only the billed
+// input/output totals and deliberately ignore cached_input_tokens and
+// reasoning_output_tokens — the per-root delegation token budget sums those two.
+type codexUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+}
+
+// parseCodexJSONResult extracts the deliverable text and best-effort token usage
+// from codex `exec --json` JSONL output. It joins the .text of every
+// item.completed agent_message event with a blank line (the agent's full reply,
+// which carries the gitmoot_result blob the engine scans for) and reads the LAST
+// turn.completed usage (the final turn is authoritative if codex emits several).
+//
+// ok reports whether at least one agent_message was seen; ok=false means the
+// stream is not the expected JSONL shape (older CLI, the plain-text --json
+// fallback, or an error-only turn), so the caller fails open on the raw stdout
+// with 0 usage. Usage is best-effort: agent_messages with no turn.completed leave
+// the counts at 0 rather than erroring. It mirrors parseCodexErrorMessage's
+// narrow, unmarshal-per-line style so unrelated schema additions stay harmless.
+func parseCodexJSONResult(output string) (raw string, inputTokens int, outputTokens int, ok bool) {
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var messages []string
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var event struct {
+			Type string `json:"type"`
+			Item struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"item"`
+			Usage codexUsage `json:"usage"`
+		}
+		if json.Unmarshal([]byte(line), &event) != nil {
+			continue
+		}
+		switch event.Type {
+		case "item.completed":
+			if event.Item.Type == "agent_message" {
+				messages = append(messages, event.Item.Text)
+			}
+		case "turn.completed":
+			inputTokens = event.Usage.InputTokens
+			outputTokens = event.Usage.OutputTokens
+		}
+	}
+	if len(messages) == 0 {
+		return "", 0, 0, false
+	}
+	return strings.Join(messages, "\n\n"), inputTokens, outputTokens, true
+}
+
+// isCodexJSONUnsupported reports whether a failed codex run rejected --json, i.e.
+// an older CLI that predates JSONL event output. codex (clap) prints e.g.
+// "error: unexpected argument '--json' found" to stderr with a nonzero exit;
+// runCodex re-runs plain-text on this signal (mirrors isClaudeJSONUnsupported).
+func isCodexJSONUnsupported(result subprocess.Result) bool {
+	text := strings.ToLower(result.Stdout + "\n" + result.Stderr)
+	if !strings.Contains(text, "--json") {
+		return false
+	}
+	return strings.Contains(text, "unexpected argument") ||
+		strings.Contains(text, "unknown") ||
+		strings.Contains(text, "unrecognized") ||
+		strings.Contains(text, "unsupported") ||
+		strings.Contains(text, "invalid")
 }
 
 func claudeCommandError(result subprocess.Result, err error) error {

@@ -539,13 +539,13 @@ than failing:
 | --- | --- | --- |
 | **Claude Code** | Yes | Parsed from `usage.{input,output}_tokens` of the `--output-format json` envelope. |
 | **Kimi Code** | Best-effort | Captured if the `--output-format stream-json` stream emits a `usage` object; otherwise `0`. |
-| **Codex** | No (contributes `0`) | Delivery runs `codex exec resume … -- <prompt>` without `--json` (plain text), so no machine-readable usage is exposed. |
+| **Codex** | Fresh sessions only | Read from the last `turn.completed` usage of the `codex exec --json` JSONL stream (#658) for fresh sessions (ephemeral delegation workers, per-job `--runtime` overrides). Resumed sessions contribute `0`: codex reports session-cumulative usage there, which would attribute the whole session history to each job. Older CLIs that predate `--json` fall back to plain text and contribute `0`. |
 
-Because of this, a tree made up mostly of Codex jobs accumulates little or no
-counted usage — set the budget accordingly and treat it as a coarse runaway-cost
-backstop, not a precise spend limit. The same capture also feeds the
-`$`-denominated `[orchestrate].max_delegation_cost_usd` budget — see the
-dollar-cost bullet under [Termination bounds](#termination-bounds).
+Capture is best-effort, so treat the budget as a coarse runaway-cost backstop,
+not a precise spend limit — a runtime that reports nothing (or an older codex CLI
+that predates `--json`) contributes `0` and is silently under-counted. The same
+capture also feeds the `$`-denominated `[orchestrate].max_delegation_cost_usd`
+budget — see the dollar-cost bullet under [Termination bounds](#termination-bounds).
 
 For the in-repo source of truth, see
 [`skills/gitmoot/references/RESULT_CONTRACT.md`](https://github.com/jerryfane/gitmoot/blob/main/skills/gitmoot/references/RESULT_CONTRACT.md)

@@ -253,6 +253,14 @@ type kimiUsage struct {
 // that carried a usage object (if any). Usage capture is best-effort: when no
 // event reports usage the returned kimiUsage is zero-valued and the job
 // contributes 0 to the per-root token budget.
+//
+// UPSTREAM LIMITATION (#659): kimi-code 0.19.2 — the CLI Gitmoot targets today —
+// emits NO usage event anywhere in its stream. A prompt-mode run yields only an
+// `assistant` event and a `meta` session.resume_hint event, so every kimi job
+// reports 0/0 by upstream limitation, not a parser bug (confirmed against
+// `kimi --help`: 0.19.2 has no --verbose/--stats/--include-usage flag that would
+// enable usage in the stream). The usage extraction below is retained for
+// older/newer Kimi CLIs that DO emit a usage/result event.
 func parseKimiStreamJSON(output string) (string, string, kimiUsage, error) {
 	scanner := bufio.NewScanner(strings.NewReader(output))
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)

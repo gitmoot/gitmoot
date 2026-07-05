@@ -94,7 +94,7 @@ func TestCodexDeliverFreshRef(t *testing.T) {
 	if result.Raw != "fresh output" {
 		t.Fatalf("Raw = %q", result.Raw)
 	}
-	runner.want(t, 0, "codex", "exec", "--model", "gpt-5.5-codex", "--", "do the thing")
+	runner.want(t, 0, "codex", "exec", "--json", "--model", "gpt-5.5-codex", "--", "do the thing")
 	for _, arg := range runner.calls[0] {
 		if arg == "resume" {
 			t.Fatalf("fresh-ref delivery must not resume any session: %v", runner.calls[0])

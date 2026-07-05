@@ -127,7 +127,7 @@ func TestCodexDeliverCommand(t *testing.T) {
 	if result.Raw != "done" {
 		t.Fatalf("raw = %q", result.Raw)
 	}
-	runner.want(t, 0, "codex", "exec", "resume", "550e8400-e29b-41d4-a716-446655440001", "--", "review this")
+	runner.want(t, 0, "codex", "exec", "--json", "resume", "550e8400-e29b-41d4-a716-446655440001", "--", "review this")
 }
 
 func TestCodexDeliverCommandUsesJobModel(t *testing.T) {
@@ -138,7 +138,7 @@ func TestCodexDeliverCommandUsesJobModel(t *testing.T) {
 	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review this", Model: "opus"}); err != nil {
 		t.Fatalf("Deliver returned error: %v", err)
 	}
-	runner.want(t, 0, "codex", "exec", "resume", "--model", "opus", "550e8400-e29b-41d4-a716-446655440001", "--", "review this")
+	runner.want(t, 0, "codex", "exec", "--json", "resume", "--model", "opus", "550e8400-e29b-41d4-a716-446655440001", "--", "review this")
 }
 
 func TestCodexDeliverCommandFallsBackToAgentModel(t *testing.T) {
@@ -149,7 +149,7 @@ func TestCodexDeliverCommandFallsBackToAgentModel(t *testing.T) {
 	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review this"}); err != nil {
 		t.Fatalf("Deliver returned error: %v", err)
 	}
-	runner.want(t, 0, "codex", "exec", "resume", "--model", "sonnet", "550e8400-e29b-41d4-a716-446655440001", "--", "review this")
+	runner.want(t, 0, "codex", "exec", "--json", "resume", "--model", "sonnet", "550e8400-e29b-41d4-a716-446655440001", "--", "review this")
 }
 
 func TestCodexStartCommandUsesAgentModel(t *testing.T) {
@@ -221,7 +221,7 @@ func TestCodexDeliverLastSessionCommand(t *testing.T) {
 	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "continue"}); err != nil {
 		t.Fatalf("Deliver returned error: %v", err)
 	}
-	runner.want(t, 0, "codex", "exec", "resume", "--last", "--", "continue")
+	runner.want(t, 0, "codex", "exec", "--json", "resume", "--last", "--", "continue")
 }
 
 func TestCodexDeliverCommandAppliesAutonomyPolicy(t *testing.T) {
@@ -242,7 +242,7 @@ func TestCodexDeliverCommandAppliesAutonomyPolicy(t *testing.T) {
 			if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err != nil {
 				t.Fatalf("Deliver returned error: %v", err)
 			}
-			runner.want(t, 0, "codex", "exec", "--sandbox", tt.sandbox, "resume", "550e8400-e29b-41d4-a716-446655440001", "--", "review")
+			runner.want(t, 0, "codex", "exec", "--sandbox", tt.sandbox, "--json", "resume", "550e8400-e29b-41d4-a716-446655440001", "--", "review")
 		})
 	}
 }
@@ -255,7 +255,7 @@ func TestCodexDeliverVerifiesNamedSession(t *testing.T) {
 	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err != nil {
 		t.Fatalf("Deliver returned error: %v", err)
 	}
-	runner.want(t, 0, "codex", "exec", "resume", "review-thread", "--", "review")
+	runner.want(t, 0, "codex", "exec", "--json", "resume", "review-thread", "--", "review")
 }
 
 func TestCodexDeliverRejectsMissingNamedSession(t *testing.T) {
@@ -279,7 +279,7 @@ func TestCodexDeliverAllowsMissingUUIDSessionToReachCodex(t *testing.T) {
 	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err != nil {
 		t.Fatalf("Deliver returned error: %v", err)
 	}
-	runner.want(t, 0, "codex", "exec", "resume", "550e8400-e29b-41d4-a716-446655440001", "--", "review")
+	runner.want(t, 0, "codex", "exec", "--json", "resume", "550e8400-e29b-41d4-a716-446655440001", "--", "review")
 }
 
 func TestCodexHealthUsesRegisteredSession(t *testing.T) {
@@ -290,7 +290,7 @@ func TestCodexHealthUsesRegisteredSession(t *testing.T) {
 	if err := adapter.Health(context.Background(), agent); err != nil {
 		t.Fatalf("Health returned error: %v", err)
 	}
-	runner.want(t, 0, "codex", "exec", "resume", "550e8400-e29b-41d4-a716-446655440001", "--", healthPrompt)
+	runner.want(t, 0, "codex", "exec", "--json", "resume", "550e8400-e29b-41d4-a716-446655440001", "--", healthPrompt)
 }
 
 func TestCodexHealthRejectsBrokenSession(t *testing.T) {
@@ -301,7 +301,7 @@ func TestCodexHealthRejectsBrokenSession(t *testing.T) {
 	if err := adapter.Health(context.Background(), agent); err == nil {
 		t.Fatal("Health accepted broken codex session")
 	}
-	runner.want(t, 0, "codex", "exec", "resume", "550e8400-e29b-41d4-a716-446655440001", "--", healthPrompt)
+	runner.want(t, 0, "codex", "exec", "--json", "resume", "550e8400-e29b-41d4-a716-446655440001", "--", healthPrompt)
 }
 
 func TestClaudeDeliverCommand(t *testing.T) {
