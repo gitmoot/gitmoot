@@ -1928,6 +1928,68 @@ func (e Engine) rootJobCountForPressure(ctx context.Context, rootID string) int 
 	return count
 }
 
+// projectedNewDelegationJobs computes how many NEW child jobs the given
+// delegation batch would add to a coordination tree — the count used by the
+// #649 projected, all-or-nothing job-budget admission in dispatchDelegations.
+// Unlike the reactive token/cost budgets (which cannot know an unspawned child's
+// usage), the job count is exactly projectable before enqueue, so the whole
+// batch is admitted or refused as one unit against the live tree count.
+//
+// A leg contributes 0 when it is already accounted for in that live count, so
+// re-advancing a coordinator (AdvanceJob is idempotent and re-runs
+// dispatchDelegations) never double-counts children already enqueued:
+//
+//   - a leg whose child already exists under this parent is skipped — it is
+//     already inside countRootDelegationJobs;
+//   - a leg whose non-empty fingerprint already appears among an existing
+//     sibling, or earlier in THIS batch, is skipped — it folds into the winning
+//     sibling via the same dedup enqueueDelegation performs (engine.go ~2440),
+//     so it never spawns its own child.
+//
+// Deferred (deps-bearing) legs ARE counted: they escape every later job-budget
+// check (advanceDelegations/enqueueDelegation/allocateAndEnqueueDelegation do
+// not re-check the per-root job count), so the entire batch — ready and
+// deferred — must be pre-authorized here as a single unit.
+func (e Engine) projectedNewDelegationJobs(ctx context.Context, parentJobID string, dels []Delegation) (int, error) {
+	children, err := e.childDelegationJobs(ctx, parentJobID)
+	if err != nil {
+		return 0, err
+	}
+	// One scan of the existing sibling children collects the fingerprints already
+	// present, instead of a per-leg delegationFingerprintSeen query.
+	existingFingerprints := make(map[string]struct{})
+	for _, child := range children {
+		childPayload, err := unmarshalPayload(child.Payload)
+		if err != nil {
+			return 0, err
+		}
+		if fingerprint := strings.TrimSpace(childPayload.Fingerprint); fingerprint != "" {
+			existingFingerprints[fingerprint] = struct{}{}
+		}
+	}
+	batchFingerprints := make(map[string]struct{})
+	projected := 0
+	for _, d := range dels {
+		if _, exists := children[d.ID]; exists {
+			// Already enqueued on an earlier advance; counted in the live total.
+			continue
+		}
+		if fingerprint := strings.TrimSpace(d.Fingerprint); fingerprint != "" {
+			if _, seen := existingFingerprints[fingerprint]; seen {
+				// Folds into an existing same-fingerprint sibling child.
+				continue
+			}
+			if _, seen := batchFingerprints[fingerprint]; seen {
+				// Folds into an earlier same-fingerprint leg in this same batch.
+				continue
+			}
+			batchFingerprints[fingerprint] = struct{}{}
+		}
+		projected++
+	}
+	return projected, nil
+}
+
 // sumRootDelegationTokens sums the runtime token usage (input + output) across an
 // entire coordination tree: the originating coordinator itself (self-rooted to
 // rootID) plus every child or continuation whose root_id points back at it. Used
@@ -2002,12 +2064,28 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 	if err != nil {
 		return err
 	}
+	// #649: PROJECTED, all-or-nothing job-budget admission. The old guard was
+	// reactive (`total >= maxJobs`) and only tripped once the tree was ALREADY at
+	// the cap, so a wide fan-out launched from just under the limit enqueued its
+	// whole batch and overshot MaxDelegationTotalJobs by up to (batch_width - 1).
+	// The job count is the one backstop that is exactly projectable before
+	// enqueue, so count the NEW jobs this batch would add (ready AND deferred legs
+	// — deferred legs escape every later budget check — minus already-enqueued /
+	// fingerprint-deduped legs) and refuse the WHOLE batch when the tree would
+	// cross the cap. total+projected == maxJobs ADMITS (may reach but not exceed);
+	// > maxJobs refuses. When projected == 0 (an idempotent re-advance whose legs
+	// all already have children) this admits and the enqueue loop below adds
+	// nothing new — the correct idempotent outcome, where the old guard finalized.
+	projected, err := e.projectedNewDelegationJobs(ctx, job.ID, payload.Result.Delegations)
+	if err != nil {
+		return err
+	}
 	maxJobs := effectiveMaxDelegationTotalJobs()
-	if total >= maxJobs {
+	if total+projected > maxJobs {
 		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    "delegation_budget_exceeded",
-			Message: fmt.Sprintf("delegation tree for root %s reached the job budget of %d (%d jobs); not dispatching %d delegation(s)", rootID, maxJobs, total, len(payload.Result.Delegations)),
+			Message: fmt.Sprintf("delegation batch of %d new job(s) would exceed the per-root job budget of %d (tree at %d); not dispatching %d delegation(s)", projected, maxJobs, total, len(payload.Result.Delegations)),
 		})
 		return e.enqueueFinalizeContinuation(ctx, job, payload, fmt.Sprintf("per-root job budget of %d reached", maxJobs))
 	}
@@ -2945,6 +3023,12 @@ func (e Engine) advanceDelegations(ctx context.Context, parentJob db.Job, parent
 			if e.InjectUpstreamDepContext {
 				upstreamContext = e.buildUpstreamDepBlock(d, children, dedupWinners)
 			}
+			// No per-root job-budget re-check here: the whole batch (ready +
+			// deferred) was pre-authorized as one unit by the #649 projected
+			// admission in dispatchDelegations (projectedNewDelegationJobs counts
+			// deferred legs), so this deferred enqueue is intentionally uncapped —
+			// a late refusal here would strand a deferred leg whose refused
+			// sibling deps can never satisfy.
 			if err := e.enqueueDelegation(ctx, parentJob, parentPayload, d, artifactDir, upstreamContext, ref); err != nil {
 				return err
 			}

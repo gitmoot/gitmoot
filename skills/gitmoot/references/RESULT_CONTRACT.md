@@ -331,7 +331,10 @@ Delegation trees are bounded so they cannot run forever:
   this depth may not delegate further. Override per host with the
   `GITMOOT_MAX_DELEGATION_DEPTH` env var (positive integer).
 - Per-root job budget: `MaxDelegationTotalJobs = 64`. The whole delegation tree
-  under one root is capped at this many jobs. Override per host with the
+  under one root is capped at this many jobs. The check is projected: a batch's
+  new jobs are counted before any child is enqueued and the whole batch is
+  refused if it would cross the cap, so a wide fan-out from just under the limit
+  does not overshoot. Override per host with the
   `GITMOOT_MAX_DELEGATION_TOTAL_JOBS` env var (positive integer).
 - Per-root wall-clock budget: `MaxDelegationWallClock = 2h`. The whole tree under
   one root is bounded in duration (measured from the root job's creation); a

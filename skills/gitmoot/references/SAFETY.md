@@ -133,7 +133,10 @@ cannot recurse or fan out forever:
   not delegate further.
 - Per-root job budget `MaxDelegationTotalJobs = 64`: the whole delegation tree
   under one root (all children and continuations sharing that root) is capped.
-  When a batch would exceed it, the delegations are not dispatched.
+  The check is projected: the new jobs a batch would add (ready and deferred
+  legs, minus already-enqueued/fingerprint-deduped ones) are counted before any
+  child is enqueued, so a wide fan-out from just under the cap is refused whole
+  rather than overshooting it.
 - Per-root wall-clock budget `MaxDelegationWallClock = 2h`: the whole tree under
   one root is bounded in duration (measured from the root job's creation); a
   coordinator that tries to fan out after the tree has run this long is refused
