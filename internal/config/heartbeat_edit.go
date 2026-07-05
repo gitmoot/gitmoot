@@ -84,6 +84,13 @@ func SaveHeartbeat(paths Paths, entry Heartbeat) error {
 				return err
 			}
 		}
+		// A re-save WITHOUT a runtime override (#611) must CLEAR any prior `runtime`
+		// key rather than silently leave it in place: the fields slice omits `runtime`
+		// when empty, so the setSectionScalar loop above never touched it. Without this,
+		// re-adding a heartbeat sans --runtime would keep a stale override.
+		if entry.Runtime == "" {
+			removeSectionScalar(section, "runtime")
+		}
 	}
 	return formatAndValidateConfig(paths, doc, original)
 }
@@ -202,6 +209,22 @@ func setSectionScalar(section *tomledit.Section, key string, value ConfigScalar)
 	}
 	section.Items = append(section.Items, &parser.KeyValue{Name: parser.Key{key}, Value: parsed})
 	return nil
+}
+
+// removeSectionScalar drops the first key mapping from section, reporting whether
+// it removed anything. It is the delete cousin of setSectionScalar, used to clear
+// a heartbeat's optional `runtime` override when the block is re-saved without one
+// (#611) so a stale override cannot silently persist.
+func removeSectionScalar(section *tomledit.Section, key string) bool {
+	for i, item := range section.Items {
+		kv, ok := item.(*parser.KeyValue)
+		if !ok || len(kv.Name) != 1 || kv.Name[0] != key {
+			continue
+		}
+		section.Items = append(section.Items[:i], section.Items[i+1:]...)
+		return true
+	}
+	return false
 }
 
 // formatAndValidateConfig serializes doc, writes it atomically, then re-validates

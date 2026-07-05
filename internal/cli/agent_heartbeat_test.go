@@ -343,3 +343,50 @@ prompt = "p"
 		t.Fatalf("status lines missing expected detail: %q", joined)
 	}
 }
+
+// TestDaemonHeartbeatLinesSurfacesRuntimeOverride asserts the #611 runtime override
+// (#611) is surfaced as `runtime=<X>` on the status line of the heartbeat that
+// carries one, and is ABSENT from a sibling heartbeat that runs on the agent default
+// (the byte-identical pre-#611 line).
+func TestDaemonHeartbeatLinesSurfacesRuntimeOverride(t *testing.T) {
+	home := t.TempDir()
+	paths, err := initializedPaths(home)
+	if err != nil {
+		t.Fatalf("initializedPaths: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+`
+[agents.repo-maintainer.heartbeats.override]
+enabled = true
+repo = "jerryfane/gitmoot"
+interval = "24h"
+runtime = "claude"
+prompt = "p"
+
+[agents.repo-maintainer.heartbeats.plain]
+enabled = true
+repo = "jerryfane/gitmoot"
+interval = "24h"
+prompt = "p"
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	lines := daemonHeartbeatLines(paths, home)
+	var overrideLine, plainLine string
+	for _, line := range lines {
+		if strings.Contains(line, "repo-maintainer/override") {
+			overrideLine = line
+		}
+		if strings.Contains(line, "repo-maintainer/plain") {
+			plainLine = line
+		}
+	}
+	if overrideLine == "" || plainLine == "" {
+		t.Fatalf("expected both heartbeat lines, got:\n%s", strings.Join(lines, "\n"))
+	}
+	if !strings.Contains(overrideLine, "runtime=claude") {
+		t.Fatalf("override heartbeat line must surface runtime=claude: %q", overrideLine)
+	}
+	if strings.Contains(plainLine, "runtime=") {
+		t.Fatalf("default heartbeat line must NOT surface a runtime: %q", plainLine)
+	}
+}

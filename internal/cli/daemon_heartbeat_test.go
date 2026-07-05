@@ -2,12 +2,15 @@ package cli
 
 import (
 	"context"
+	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/runtime"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
@@ -272,6 +275,15 @@ max_concurrent = 1
 func TestHeartbeatScanEnqueuesImplementJob(t *testing.T) {
 	paths, store := heartbeatScanFixture(t, implementHeartbeatBody)
 	ctx := context.Background()
+	// The implement heartbeat now allocates a real task worktree (#611), so the
+	// target repo needs a real git checkout on its default branch — not the fixture's
+	// bare temp dir. Re-register jerryfane/gitmoot onto one.
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	if err := store.UpsertRepo(ctx, db.Repo{
+		Owner: "jerryfane", Name: "gitmoot", CheckoutPath: checkout, DefaultBranch: "main", PollInterval: "30s",
+	}); err != nil {
+		t.Fatalf("UpsertRepo: %v", err)
+	}
 	if err := store.UpsertAgent(ctx, db.Agent{
 		Name: "builder", Runtime: "codex", RepoScope: "jerryfane/gitmoot",
 		Capabilities: []string{"ask", "implement"}, AutonomyPolicy: "danger-full-access", RuntimeRef: "last",
@@ -286,12 +298,130 @@ func TestHeartbeatScanEnqueuesImplementJob(t *testing.T) {
 	if len(*seen) != 1 {
 		t.Fatalf("expected 1 implement job, got %d", len(*seen))
 	}
-	if req := (*seen)[0]; req.Action != "implement" || req.Agent != "builder" || req.Sender != "heartbeat" {
+	req := (*seen)[0]
+	if req.Action != "implement" || req.Agent != "builder" || req.Sender != "heartbeat" {
 		t.Fatalf("unexpected implement request shape: %+v", req)
+	}
+	// The fix (#611): the implement heartbeat allocates a task/branch/worktree so the
+	// enqueued job carries the identity the daemon worker's checkout pre-flight needs.
+	// A bare enqueue (Branch/TaskID/HeadSHA empty) was the false-green the bug produced.
+	if req.Branch == "" || req.TaskID == "" || req.HeadSHA == "" {
+		t.Fatalf("implement heartbeat job missing allocated identity: branch=%q task=%q head=%q", req.Branch, req.TaskID, req.HeadSHA)
+	}
+	if !strings.HasPrefix(req.Branch, "gitmoot/") {
+		t.Fatalf("implement heartbeat branch = %q, want a gitmoot/<task> branch", req.Branch)
+	}
+	// The task row backs the worktree the worker resolves; it must exist on that branch.
+	task, err := store.GetTask(ctx, req.TaskID)
+	if err != nil {
+		t.Fatalf("GetTask(%s): %v", req.TaskID, err)
+	}
+	if task.Branch != req.Branch || strings.TrimSpace(task.WorktreePath) == "" {
+		t.Fatalf("task not allocated on the job branch with a worktree: %+v", task)
 	}
 	state, found, err := store.GetHeartbeatState(ctx, "builder", "nightly")
 	if err != nil || !found || state.LastStatus != "enqueued" {
 		t.Fatalf("implement heartbeat state not advanced: found=%v err=%v state=%+v", found, err, state)
+	}
+}
+
+// TestHeartbeatImplementJobPassesWorkerCheckout is the WORKER-LEVEL guard for #611:
+// it drives the REAL daemon worker checkout pre-flight (defaultCheckout →
+// taskWorktreeCheckout + validateTargetCheckout + validateImplementationLock) for
+// the job a policy-passing implement heartbeat enqueues, and asserts it RESOLVES the
+// isolated on-branch worktree instead of failing "checkout branch is main, not job
+// branch " on the shared checkout. Against pre-fix code (a bare enqueue with
+// Branch/TaskID empty) defaultCheckout returns that error and the job goes straight
+// to JobFailed — the exact false-green the scan+enqueue tests could never catch
+// because they stop at a fake enqueuer and never reach the worker.
+func TestHeartbeatImplementJobPassesWorkerCheckout(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	paths, err := initializedPaths(home)
+	if err != nil {
+		t.Fatalf("initializedPaths: %v", err)
+	}
+	// A real git checkout whose origin is owner/repo, so the worker's
+	// preflightDaemonRepoCheckout (origin must equal the registered repo) and
+	// validateTargetCheckout both pass against the resolved worktree.
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+`
+[agents.builder]
+runtime = "codex"
+role = "builder"
+capabilities = ["ask", "implement"]
+max_background = 2
+
+[agents.builder.heartbeats.nightly]
+enabled = true
+repo = "owner/repo"
+interval = "24h"
+action = "implement"
+prompt = "Fix the top lint error and open a small PR."
+max_concurrent = 1
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	if err := store.UpsertRepo(ctx, db.Repo{
+		Owner: "owner", Name: "repo", CheckoutPath: checkout, DefaultBranch: "main", PollInterval: "30s",
+	}); err != nil {
+		t.Fatalf("UpsertRepo: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name: "builder", Runtime: "codex", RepoScope: "owner/repo",
+		Capabilities: []string{"ask", "implement"}, AutonomyPolicy: "danger-full-access", RuntimeRef: "last",
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	// Enqueue through the PRODUCTION heartbeat enqueuer so the job lands in the store
+	// exactly as the daemon writes it.
+	now := time.Date(2026, 6, 30, 9, 0, 0, 0, time.UTC)
+	if err := runHeartbeatScanOnce(ctx, paths, store, newHeartbeatEnqueuer(store, home), now); err != nil {
+		t.Fatalf("runHeartbeatScanOnce: %v", err)
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 enqueued heartbeat job, got %d", len(jobs))
+	}
+	job := jobs[0]
+	if job.Type != "implement" {
+		t.Fatalf("enqueued job type = %q, want implement", job.Type)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatalf("daemonJobPayload: %v", err)
+	}
+	if payload.Branch == "" || payload.TaskID == "" || payload.HeadSHA == "" {
+		t.Fatalf("enqueued implement payload missing identity: %+v", payload)
+	}
+	// Drive the REAL worker checkout pre-flight. Pre-fix this returned "checkout
+	// branch is main, not job branch "; post-fix it resolves the on-branch worktree.
+	worker := defaultJobWorker(store, io.Discard, home)
+	got, err := worker.defaultCheckout(ctx, job, payload, runtime.Agent{Name: "builder"})
+	if err != nil {
+		t.Fatalf("defaultCheckout rejected the implement heartbeat job (the #611 false-green): %v", err)
+	}
+	if got == checkout {
+		t.Fatalf("defaultCheckout resolved the SHARED checkout %q, not the isolated task worktree", checkout)
+	}
+	task, err := store.GetTask(ctx, payload.TaskID)
+	if err != nil {
+		t.Fatalf("GetTask(%s): %v", payload.TaskID, err)
+	}
+	wantWorktree, err := normalizeTaskWorktreePath(task.WorktreePath)
+	if err != nil {
+		t.Fatalf("normalizeTaskWorktreePath: %v", err)
+	}
+	if got != wantWorktree {
+		t.Fatalf("defaultCheckout = %q, want isolated task worktree %q", got, wantWorktree)
 	}
 }
 

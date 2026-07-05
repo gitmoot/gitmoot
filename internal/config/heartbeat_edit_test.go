@@ -103,6 +103,42 @@ func TestSaveHeartbeatRuntimeOverride(t *testing.T) {
 	}
 }
 
+// TestSaveHeartbeatClearsRuntimeOnResaveWithoutOverride pins the #611 review LOW:
+// re-saving an existing heartbeat WITHOUT a runtime must CLEAR a prior `runtime`
+// key, not silently keep the stale override (the update path omits `runtime` from
+// its field set when empty, so it is not overwritten — it must be removed).
+func TestSaveHeartbeatClearsRuntimeOnResaveWithoutOverride(t *testing.T) {
+	paths := newHeartbeatEditPaths(t, "")
+	// First save WITH an override.
+	if err := SaveHeartbeat(paths, Heartbeat{
+		Agent: "builder", Name: "nightly", Enabled: true, Repo: "o/r",
+		Interval: "24h", Action: "implement", Runtime: "codex", Prompt: "tidy",
+	}); err != nil {
+		t.Fatalf("SaveHeartbeat with runtime: %v", err)
+	}
+	// Re-save the SAME heartbeat WITHOUT a runtime: the override must be cleared.
+	if err := SaveHeartbeat(paths, Heartbeat{
+		Agent: "builder", Name: "nightly", Enabled: true, Repo: "o/r",
+		Interval: "24h", Action: "implement", Prompt: "tidy",
+	}); err != nil {
+		t.Fatalf("SaveHeartbeat without runtime: %v", err)
+	}
+	raw, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(raw), "runtime =") {
+		t.Fatalf("re-save without --runtime must clear the prior override, got:\n%s", string(raw))
+	}
+	got, err := LoadHeartbeats(paths)
+	if err != nil {
+		t.Fatalf("LoadHeartbeats: %v", err)
+	}
+	if len(got) != 1 || got[0].Runtime != "" {
+		t.Fatalf("runtime override not cleared: %+v", got)
+	}
+}
+
 func TestSaveHeartbeatUpdateExisting(t *testing.T) {
 	paths := newHeartbeatEditPaths(t, `
 [agents.x.heartbeats.h]

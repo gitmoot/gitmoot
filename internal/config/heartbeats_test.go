@@ -180,18 +180,22 @@ prompt = "Fix the top lint error."
 
 // TestHeartbeatRuntimesExcludesShell asserts the per-heartbeat runtime allow-list
 // is derived from the adapter registry but never offers shell (heartbeats mint a
-// fresh session; shell sessions are whole commands).
+// fresh session; shell sessions are whole commands) nor kimi-cli (the legacy Kimi
+// CLI), so the accepted set equals the documented codex|claude|kimi (#611).
 func TestHeartbeatRuntimesExcludesShell(t *testing.T) {
 	for _, rt := range HeartbeatRuntimes() {
-		if rt == "shell" {
-			t.Fatalf("HeartbeatRuntimes must not include shell: %v", HeartbeatRuntimes())
+		if rt == "shell" || rt == "kimi-cli" {
+			t.Fatalf("HeartbeatRuntimes must not include %q: %v", rt, HeartbeatRuntimes())
 		}
+	}
+	if got, want := strings.Join(HeartbeatRuntimes(), "|"), "codex|claude|kimi"; got != want {
+		t.Fatalf("HeartbeatRuntimes = %q, want %q (accepted must equal the documented set)", got, want)
 	}
 	if !HeartbeatRuntimeSupported("codex") || !HeartbeatRuntimeSupported("") {
 		t.Fatalf("codex and empty must be supported runtimes")
 	}
-	if HeartbeatRuntimeSupported("shell") || HeartbeatRuntimeSupported("bogus") {
-		t.Fatalf("shell and bogus must be rejected runtimes")
+	if HeartbeatRuntimeSupported("shell") || HeartbeatRuntimeSupported("kimi-cli") || HeartbeatRuntimeSupported("bogus") {
+		t.Fatalf("shell, kimi-cli, and bogus must be rejected runtimes")
 	}
 }
 
