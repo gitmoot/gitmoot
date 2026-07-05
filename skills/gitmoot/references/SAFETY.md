@@ -227,9 +227,9 @@ cannot recurse or fan out forever:
   `human_questions[]` is byte-identical to today's behavior.
 
 When a bound trips, the offending delegations are not dispatched and the parent
-receives a typed lifecycle event explaining why (for example, the delegation tree
-for a root reached the job budget of 64). Rather than stopping silently, the
-engine then enqueues one **graceful finalize continuation**
+receives a typed lifecycle event explaining why (for example, a delegation batch
+of new jobs would exceed the per-root job budget of 64). Rather than stopping
+silently, the engine then enqueues one **graceful finalize continuation**
 (`delegation_finalize_enqueued`) back to the coordinator — told it cannot
 delegate further and asked to synthesize a best-effort final result and return
 empty delegations. That continuation is terminal: any delegations it returns are

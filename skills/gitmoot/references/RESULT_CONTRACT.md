@@ -404,7 +404,7 @@ Delegation trees are bounded so they cannot run forever:
 
 When a bound trips (a budget cap or confirmed loop), the offending delegations
 are not dispatched and the parent receives a typed lifecycle event explaining why
-(for example, "delegation tree for root <id> reached the job budget of 64").
+(for example, "delegation batch of <n> new job(s) would exceed the per-root job budget of 64").
 Rather than stopping silently, the engine then enqueues one **graceful finalize
 continuation** back to the coordinator (`delegation_finalize_enqueued`): it is
 told it cannot delegate further and asked to synthesize a best-effort final
