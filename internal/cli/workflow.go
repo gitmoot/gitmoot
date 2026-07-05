@@ -23,6 +23,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
 	gitutil "github.com/jerryfane/gitmoot/internal/git"
+	"github.com/jerryfane/gitmoot/internal/github"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 	"github.com/jerryfane/gitmoot/skills"
 )
@@ -248,6 +249,8 @@ func runTask(args []string, stdout, stderr io.Writer) int {
 		return runTaskRun(args[1:], stdout, stderr)
 	case "list":
 		return runTaskList(args[1:], stdout, stderr)
+	case "recover":
+		return runTaskRecover(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown task command %q\n\n", args[0])
 		printTaskUsage(stderr)
@@ -258,6 +261,7 @@ func runTask(args []string, stdout, stderr io.Writer) int {
 func printTaskUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot task run <id> --repo owner/repo --owner <agent> [--branch <branch>] [--base <branch>]")
+	fmt.Fprintln(w, "  gitmoot task recover <id> --repo owner/repo [--owner <agent>] [--skip-native-review-fanout] [--json]")
 	fmt.Fprintln(w, "  gitmoot task list [--repo owner/repo] [--state state] [--json]")
 }
 
@@ -425,6 +429,21 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fmt.Errorf("resolve task worktree head: %w", err)
 		}
+		recoverCmd := taskRecoverCommand(task.ID, *home, requestRepo, strings.TrimSpace(*owner))
+		dirty, err := taskWorktreeDirty(context.Background(), started)
+		if err != nil {
+			return err
+		}
+		request := taskRunImplementJobRequest(taskRunImplementJobID(started.ID, strings.TrimSpace(*owner)), started, strings.TrimSpace(*owner), headSHA)
+		if active, ok, err := findActiveTaskRunJob(context.Background(), store, request); err != nil {
+			return err
+		} else if ok {
+			startedJob = active
+			return nil
+		}
+		if dirty {
+			return fmt.Errorf("task %s worktree has uncommitted changes at %s; inspect it, then run %s to commit/push/open a PR, or clean/stash it before retrying task run", started.ID, started.WorktreePath, recoverCmd)
+		}
 		startedJob, err = enqueueTaskRunImplementJob(context.Background(), store, started, strings.TrimSpace(*owner), headSHA, paths.Home)
 		return err
 	}); err != nil {
@@ -444,6 +463,160 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	return 0
+}
+
+type taskRecoverOutput struct {
+	TaskID      string `json:"task_id"`
+	Repo        string `json:"repo"`
+	Branch      string `json:"branch"`
+	PullRequest int    `json:"pull_request"`
+	HeadSHA     string `json:"head_sha"`
+	Summary     string `json:"summary"`
+}
+
+func runTaskRecover(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("task recover", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	repo := fs.String("repo", "", "repo scope as owner/repo")
+	owner := fs.String("owner", "", "agent/operator attributed as recovery lead")
+	skipFanout := fs.Bool("skip-native-review-fanout", false, "persist skip-native-review-fanout before opening the PR")
+	jsonOutput := fs.Bool("json", false, "print recovery result as JSON")
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fs.Usage()
+		if len(args) == 0 {
+			fmt.Fprintln(stderr, "task recover requires exactly one id")
+			return 2
+		}
+		return 0
+	}
+	taskID := args[0]
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "task recover requires exactly one id")
+		return 2
+	}
+	var output taskRecoverOutput
+	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
+		payload, err := recoverTaskImplementation(context.Background(), store, taskID, strings.TrimSpace(*repo), strings.TrimSpace(*owner), *skipFanout, nil)
+		if err != nil {
+			return err
+		}
+		output = taskRecoverOutput{
+			TaskID:      payload.TaskID,
+			Repo:        payload.Repo,
+			Branch:      payload.Branch,
+			PullRequest: payload.PullRequest,
+			HeadSHA:     payload.HeadSHA,
+			Summary:     "recovered implementation worktree and opened/adopted PR",
+		}
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "recover task: %v\n", err)
+		return 1
+	}
+	if *jsonOutput {
+		if err := writeJSON(stdout, output); err != nil {
+			fmt.Fprintf(stderr, "recover task: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	fmt.Fprintf(stdout, "recovered %s on %s\n", output.TaskID, output.Branch)
+	if output.PullRequest > 0 {
+		fmt.Fprintf(stdout, "pull_request: #%d\n", output.PullRequest)
+	}
+	if output.HeadSHA != "" {
+		fmt.Fprintf(stdout, "head_sha: %s\n", output.HeadSHA)
+	}
+	return 0
+}
+
+func recoverTaskImplementation(ctx context.Context, store *db.Store, taskID string, repoFlag string, owner string, skipFanout bool, gh github.Client) (workflow.JobPayload, error) {
+	task, err := store.GetTask(ctx, strings.TrimSpace(taskID))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return workflow.JobPayload{}, fmt.Errorf("task %q not found", taskID)
+		}
+		return workflow.JobPayload{}, err
+	}
+	requestRepo := firstNonEmpty(repoFlag, task.RepoFullName)
+	if strings.TrimSpace(requestRepo) == "" {
+		return workflow.JobPayload{}, errors.New("task recover requires --repo when task has no repo")
+	}
+	if strings.TrimSpace(repoFlag) != "" && strings.TrimSpace(task.RepoFullName) != "" && repoFlag != task.RepoFullName {
+		return workflow.JobPayload{}, fmt.Errorf("task %s belongs to repo %s, not %s", task.ID, task.RepoFullName, repoFlag)
+	}
+	if _, err := daemon.ParseRepository(requestRepo); err != nil {
+		return workflow.JobPayload{}, fmt.Errorf("invalid repo: %w", err)
+	}
+	if _, err := store.GetRepo(ctx, requestRepo); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return workflow.JobPayload{}, err
+		}
+		return workflow.JobPayload{}, fmt.Errorf("repo %s is not registered; run gitmoot repo add from the checkout before task recover", requestRepo)
+	}
+	if strings.TrimSpace(task.WorktreePath) == "" {
+		return workflow.JobPayload{}, errors.New("task has no worktree path; rerun through gitmoot task run or gitmoot agent implement")
+	}
+	headSHA, err := (gitutil.Client{Dir: task.WorktreePath}).HeadSHA(ctx)
+	if err != nil {
+		return workflow.JobPayload{}, fmt.Errorf("resolve task worktree head: %w", err)
+	}
+	if strings.TrimSpace(owner) == "" {
+		owner = "task recover"
+	}
+	job := db.Job{
+		ID:    taskRecoverJobID(task.ID, owner),
+		Agent: owner,
+		Type:  "implement",
+	}
+	payload := workflow.JobPayload{
+		Repo:                   requestRepo,
+		Branch:                 task.Branch,
+		GoalID:                 task.GoalID,
+		TaskID:                 task.ID,
+		TaskTitle:              task.Title,
+		LeadAgent:              owner,
+		HeadSHA:                headSHA,
+		SkipNativeReviewFanout: skipFanout,
+	}
+	finalizer := daemonImplementationFinalizer{Store: store, GitHub: gh}
+	return finalizer.FinalizeImplementation(ctx, job, payload)
+}
+
+func taskWorktreeDirty(ctx context.Context, task db.Task) (bool, error) {
+	if strings.TrimSpace(task.WorktreePath) == "" {
+		return false, nil
+	}
+	status, err := (gitutil.Client{Dir: task.WorktreePath}).StatusPorcelain(ctx)
+	if err != nil {
+		return false, fmt.Errorf("inspect task worktree %s: %w", task.WorktreePath, err)
+	}
+	return strings.TrimSpace(status) != "", nil
+}
+
+func taskRecoverCommand(taskID string, home string, repo string, owner string) string {
+	args := []string{"gitmoot", "task", "recover", taskID}
+	if strings.TrimSpace(home) != "" {
+		args = append(args, "--home", home)
+	}
+	if strings.TrimSpace(repo) != "" {
+		args = append(args, "--repo", repo)
+	}
+	if strings.TrimSpace(owner) != "" {
+		args = append(args, "--owner", owner)
+	}
+	return shellArgs(args)
+}
+
+func taskRecoverJobID(taskID string, owner string) string {
+	return slug("task-" + taskID + "-recover-" + owner)
 }
 
 func enqueueTaskRunImplementJob(ctx context.Context, store *db.Store, task db.Task, owner string, headSHA string, home string) (db.Job, error) {

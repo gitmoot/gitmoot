@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/github"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
@@ -652,6 +653,127 @@ func TestTaskRunJobMatchesDelegatedImplementJob(t *testing.T) {
 
 	if !taskRunJobMatchesRequest(job, request) {
 		t.Fatalf("taskRunJobMatchesRequest returned false for delegated task-run job")
+	}
+}
+
+func TestRunTaskRunDirtyTaskWorktreeSuggestsRecover(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot Test")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	writeFile(t, filepath.Join(repoDir, "README.md"), "main\n")
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "initial")
+	withWorkingDirectory(t, repoDir)
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepo(context.Background(), db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir, PollInterval: "30s"}); err != nil {
+		t.Fatalf("UpsertRepo returned error: %v", err)
+	}
+	if err := store.UpsertAgent(context.Background(), db.Agent{Name: "lead", Runtime: "shell", RuntimeRef: "true", RepoScope: "owner/repo", Capabilities: []string{"implement"}, AutonomyPolicy: "workspace-write", HealthStatus: "ok"}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+	paths, err := initializedPaths(home)
+	if err != nil {
+		t.Fatalf("initializedPaths returned error: %v", err)
+	}
+	worktree, err := workflow.TaskWorktreePath(paths.Home, "owner/repo", "task-001")
+	if err != nil {
+		t.Fatalf("TaskWorktreePath returned error: %v", err)
+	}
+	runGit(t, repoDir, "worktree", "add", "-b", "task-001-bootstrap", worktree, "main")
+	writeFile(t, filepath.Join(worktree, "feature.txt"), "partial work\n")
+	if err := store.UpsertTask(context.Background(), db.Task{ID: "task-001", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Bootstrap", State: string(workflow.TaskImplementing), Branch: "task-001-bootstrap", WorktreePath: worktree}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"task", "run", "task-001", "--home", home, "--repo", "owner/repo", "--owner", "lead"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("task run exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "worktree has uncommitted changes") || !strings.Contains(stderr.String(), "gitmoot task recover task-001") {
+		t.Fatalf("stderr missing recovery guidance:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "UNIQUE constraint") || strings.Contains(stderr.String(), "checkout_contention") {
+		t.Fatalf("stderr contains the old failure mode:\n%s", stderr.String())
+	}
+}
+
+type stubTaskRecoverGitHub struct {
+	github.NoopClient
+	input github.CreatePullRequestInput
+}
+
+func (s *stubTaskRecoverGitHub) EnsurePullRequest(_ context.Context, input github.CreatePullRequestInput) (github.PullRequest, error) {
+	s.input = input
+	return github.PullRequest{
+		Number:  4,
+		URL:     "https://github.com/owner/repo/pull/4",
+		HeadRef: input.Head,
+		BaseRef: input.Base,
+		State:   "open",
+	}, nil
+}
+
+func TestRecoverTaskImplementationFinalizesDirtyWorktree(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	remoteDir := filepath.Join(home, "remote.git")
+	repoDir := filepath.Join(home, "repo")
+	runGit(t, home, "init", "--bare", remoteDir)
+	runGit(t, home, "clone", remoteDir, repoDir)
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot Test")
+	writeFile(t, filepath.Join(repoDir, "README.md"), "main\n")
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "initial")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "push", "-u", "origin", "main")
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", RemoteURL: remoteDir, CheckoutPath: repoDir, PollInterval: "30s"}); err != nil {
+		t.Fatalf("UpsertRepo returned error: %v", err)
+	}
+	worktree, err := workflow.TaskWorktreePath(home, "owner/repo", "task-001")
+	if err != nil {
+		t.Fatalf("TaskWorktreePath returned error: %v", err)
+	}
+	runGit(t, repoDir, "worktree", "add", "-b", "task-001-bootstrap", worktree, "main")
+	writeFile(t, filepath.Join(worktree, "feature.txt"), "partial work\n")
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-001", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Bootstrap", State: string(workflow.TaskImplementing), Branch: "task-001-bootstrap", WorktreePath: worktree}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+
+	gh := &stubTaskRecoverGitHub{}
+	payload, err := recoverTaskImplementation(ctx, store, "task-001", "owner/repo", "lead", false, gh)
+	if err != nil {
+		t.Fatalf("recoverTaskImplementation returned error: %v", err)
+	}
+	if payload.PullRequest != 4 || payload.Branch != "task-001-bootstrap" || payload.HeadSHA == "" {
+		t.Fatalf("payload = %+v", payload)
+	}
+	if gh.input.Head != "task-001-bootstrap" || gh.input.Base != "main" {
+		t.Fatalf("EnsurePullRequest input = %+v", gh.input)
+	}
+	if status := strings.TrimSpace(runGitOutput(t, worktree, "status", "--porcelain")); status != "" {
+		t.Fatalf("worktree still dirty after recover:\n%s", status)
+	}
+	remoteHead := strings.TrimSpace(runGitOutput(t, repoDir, "ls-remote", "origin", "refs/heads/task-001-bootstrap"))
+	if !strings.Contains(remoteHead, payload.HeadSHA) {
+		t.Fatalf("remote task branch %q does not contain recovered head %q", remoteHead, payload.HeadSHA)
+	}
+	pr, err := store.GetPullRequestByRepoBranch(ctx, "owner/repo", "task-001-bootstrap")
+	if err != nil {
+		t.Fatalf("GetPullRequestByRepoBranch returned error: %v", err)
+	}
+	if pr.Number != 4 || pr.HeadSHA != payload.HeadSHA {
+		t.Fatalf("stored PR = %+v, payload=%+v", pr, payload)
 	}
 }
 
