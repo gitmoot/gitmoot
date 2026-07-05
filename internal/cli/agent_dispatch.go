@@ -564,6 +564,20 @@ func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, 
 			return db.Task{}, localAgentDispatchRequest{}, err
 		}
 		if err == nil {
+			if !taskBranchReusableForImplement(existing.State) {
+				return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s belongs to task %s in state %s; choose a fresh branch or recover/review the existing task", branchHint, existing.ID, existing.State)
+			}
+			if active, ok, err := findActiveImplementJobForTask(ctx, store, repo.FullName(), branchHint, existing.ID); err != nil {
+				return db.Task{}, localAgentDispatchRequest{}, err
+			} else if ok {
+				return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s already has active implement job %s for task %s", branchHint, active.ID, existing.ID)
+			}
+			if dirty, err := taskWorktreeDirty(ctx, existing); err != nil {
+				return db.Task{}, localAgentDispatchRequest{}, err
+			} else if dirty {
+				skipFanout := taskRecoverSkipFanout(ctx, store, repo.FullName(), branchHint)
+				return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s has uncommitted changes in task worktree %s; inspect it, then run %s to commit/push/open a PR, or clean/stash it before retrying implement", branchHint, existing.WorktreePath, taskRecoverCommand(existing.ID, request.Home, repo.FullName(), request.Agent, skipFanout))
+			}
 			taskID = existing.ID
 			taskTitle = firstNonEmpty(taskTitle, existing.Title)
 			goalID = firstNonEmpty(goalID, existing.GoalID)

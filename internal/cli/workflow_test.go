@@ -687,7 +687,7 @@ func TestRunTaskRunDirtyTaskWorktreeSuggestsRecover(t *testing.T) {
 	}
 	runGit(t, repoDir, "worktree", "add", "-b", "task-001-bootstrap", worktree, "main")
 	writeFile(t, filepath.Join(worktree, "feature.txt"), "partial work\n")
-	if err := store.UpsertTask(context.Background(), db.Task{ID: "task-001", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Bootstrap", State: string(workflow.TaskImplementing), Branch: "task-001-bootstrap", WorktreePath: worktree}); err != nil {
+	if err := store.UpsertTask(context.Background(), db.Task{ID: "task-001", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Bootstrap", State: string(workflow.TaskPlanned), Branch: "task-001-bootstrap", WorktreePath: worktree}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
 
@@ -701,6 +701,16 @@ func TestRunTaskRunDirtyTaskWorktreeSuggestsRecover(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), "UNIQUE constraint") || strings.Contains(stderr.String(), "checkout_contention") {
 		t.Fatalf("stderr contains the old failure mode:\n%s", stderr.String())
+	}
+	task, err := store.GetTask(context.Background(), "task-001")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskPlanned) {
+		t.Fatalf("task state mutated to %q, want planned", task.State)
+	}
+	if _, err := store.GetBranchLock(context.Background(), "owner/repo", "task-001-bootstrap"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("dirty refusal created branch lock, err=%v", err)
 	}
 }
 
@@ -740,6 +750,9 @@ func TestRecoverTaskImplementationFinalizesDirtyWorktree(t *testing.T) {
 	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", RemoteURL: remoteDir, CheckoutPath: repoDir, PollInterval: "30s"}); err != nil {
 		t.Fatalf("UpsertRepo returned error: %v", err)
 	}
+	if err := store.UpsertAgent(ctx, db.Agent{Name: "lead", Runtime: "shell", RuntimeRef: "true", RepoScope: "owner/repo", Capabilities: []string{"implement"}, AutonomyPolicy: "workspace-write", HealthStatus: "ok"}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
 	worktree, err := workflow.TaskWorktreePath(home, "owner/repo", "task-001")
 	if err != nil {
 		t.Fatalf("TaskWorktreePath returned error: %v", err)
@@ -751,7 +764,7 @@ func TestRecoverTaskImplementationFinalizesDirtyWorktree(t *testing.T) {
 	}
 
 	gh := &stubTaskRecoverGitHub{}
-	payload, err := recoverTaskImplementation(ctx, store, "task-001", "owner/repo", "lead", false, gh)
+	payload, err := recoverTaskImplementation(ctx, store, "task-001", "owner/repo", "lead", true, gh)
 	if err != nil {
 		t.Fatalf("recoverTaskImplementation returned error: %v", err)
 	}
@@ -774,6 +787,116 @@ func TestRecoverTaskImplementationFinalizesDirtyWorktree(t *testing.T) {
 	}
 	if pr.Number != 4 || pr.HeadSHA != payload.HeadSHA {
 		t.Fatalf("stored PR = %+v, payload=%+v", pr, payload)
+	}
+	if lock, err := store.GetBranchLock(ctx, "owner/repo", "task-001-bootstrap"); err != nil || lock.Owner != "lead" || !lock.SkipNativeReviewFanout {
+		t.Fatalf("branch lock = %+v err=%v, want owner lead with skip native fanout", lock, err)
+	}
+	job, err := store.GetJob(ctx, "task-task-001-recover-lead")
+	if err != nil {
+		t.Fatalf("GetJob recovery audit row returned error: %v", err)
+	}
+	if job.State != string(workflow.JobSucceeded) {
+		t.Fatalf("recovery job state = %q, want succeeded", job.State)
+	}
+}
+
+func TestRecoverTaskImplementationFinalizesCleanCommittedWorktree(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	remoteDir := filepath.Join(home, "remote.git")
+	repoDir := filepath.Join(home, "repo")
+	runGit(t, home, "init", "--bare", remoteDir)
+	runGit(t, home, "clone", remoteDir, repoDir)
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot Test")
+	writeFile(t, filepath.Join(repoDir, "README.md"), "main\n")
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "initial")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "push", "-u", "origin", "main")
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", RemoteURL: remoteDir, CheckoutPath: repoDir, PollInterval: "30s"}); err != nil {
+		t.Fatalf("UpsertRepo returned error: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{Name: "lead", Runtime: "shell", RuntimeRef: "true", RepoScope: "owner/repo", Capabilities: []string{"implement"}, AutonomyPolicy: "workspace-write", HealthStatus: "ok"}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+	worktree, err := workflow.TaskWorktreePath(home, "owner/repo", "task-001")
+	if err != nil {
+		t.Fatalf("TaskWorktreePath returned error: %v", err)
+	}
+	runGit(t, repoDir, "worktree", "add", "-b", "task-001-bootstrap", worktree, "main")
+	writeFile(t, filepath.Join(worktree, "feature.txt"), "committed work\n")
+	runGit(t, worktree, "add", "feature.txt")
+	runGit(t, worktree, "commit", "-m", "finished work")
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-001", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Bootstrap", State: string(workflow.TaskImplementing), Branch: "task-001-bootstrap", WorktreePath: worktree}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+
+	gh := &stubTaskRecoverGitHub{}
+	payload, err := recoverTaskImplementation(ctx, store, "task-001", "owner/repo", "lead", false, gh)
+	if err != nil {
+		t.Fatalf("recoverTaskImplementation returned error: %v", err)
+	}
+	if payload.PullRequest != 4 || payload.HeadSHA == "" {
+		t.Fatalf("payload = %+v", payload)
+	}
+	remoteHead := strings.TrimSpace(runGitOutput(t, repoDir, "ls-remote", "origin", "refs/heads/task-001-bootstrap"))
+	if !strings.Contains(remoteHead, payload.HeadSHA) {
+		t.Fatalf("remote task branch %q does not contain recovered head %q", remoteHead, payload.HeadSHA)
+	}
+}
+
+func TestRecoverTaskImplementationBlocksActiveJobAndWrongLockOwner(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot Test")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	writeFile(t, filepath.Join(repoDir, "README.md"), "main\n")
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "initial")
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir, PollInterval: "30s"}); err != nil {
+		t.Fatalf("UpsertRepo returned error: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{Name: "lead", Runtime: "shell", RuntimeRef: "true", RepoScope: "owner/repo", Capabilities: []string{"implement"}, AutonomyPolicy: "workspace-write", HealthStatus: "ok"}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+	worktree, err := workflow.TaskWorktreePath(home, "owner/repo", "task-001")
+	if err != nil {
+		t.Fatalf("TaskWorktreePath returned error: %v", err)
+	}
+	runGit(t, repoDir, "worktree", "add", "-b", "task-001-bootstrap", worktree, "main")
+	writeFile(t, filepath.Join(worktree, "feature.txt"), "partial work\n")
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-001", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Bootstrap", State: string(workflow.TaskImplementing), Branch: "task-001-bootstrap", WorktreePath: worktree}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	activePayload, err := json.Marshal(workflow.JobPayload{Repo: "owner/repo", Branch: "task-001-bootstrap", TaskID: "task-001"})
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "active-implement", Agent: "lead", Type: "implement", State: string(workflow.JobRunning), Payload: string(activePayload)}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	if _, err := recoverTaskImplementation(ctx, store, "task-001", "owner/repo", "lead", false, &stubTaskRecoverGitHub{}); err == nil || !strings.Contains(err.Error(), "active implement job") {
+		t.Fatalf("recover with active job err = %v, want active implement job", err)
+	}
+	if err := store.UpdateJobState(ctx, "active-implement", string(workflow.JobFailed)); err != nil {
+		t.Fatalf("UpdateJobState returned error: %v", err)
+	}
+	if _, err := store.CreateLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: "task-001-bootstrap", Owner: "other"}); err != nil {
+		t.Fatalf("CreateLock returned error: %v", err)
+	}
+	if _, err := recoverTaskImplementation(ctx, store, "task-001", "owner/repo", "lead", false, &stubTaskRecoverGitHub{}); err == nil || !strings.Contains(err.Error(), "locked by other") {
+		t.Fatalf("recover with wrong lock owner err = %v, want locked by other", err)
 	}
 }
 

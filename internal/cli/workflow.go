@@ -6,6 +6,7 @@ import (
 	"crypto/sha1"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -383,12 +384,12 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 			}
 			return err
 		}
-		requestRepo := firstNonEmpty(*repo, task.RepoFullName)
+		requestRepo, err := resolveTaskRepoFlag(*repo, task.RepoFullName, "task run")
+		if err != nil {
+			return err
+		}
 		if strings.TrimSpace(requestRepo) == "" {
 			return errors.New("task run requires --repo when task has no repo")
-		}
-		if strings.TrimSpace(*repo) != "" && strings.TrimSpace(task.RepoFullName) != "" && *repo != task.RepoFullName {
-			return fmt.Errorf("task %s belongs to repo %s, not %s", task.ID, task.RepoFullName, *repo)
 		}
 		repo, err := daemon.ParseRepository(requestRepo)
 		if err != nil {
@@ -410,6 +411,32 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 		}
 		checkout := repoRecord.CheckoutPath
 		requestBranch := firstNonEmpty(*branch, task.Branch, task.ID)
+		if strings.TrimSpace(task.WorktreePath) != "" {
+			candidate := task
+			candidate.RepoFullName = requestRepo
+			candidate.Branch = requestBranch
+			headSHA, err := (gitutil.Client{Dir: candidate.WorktreePath}).HeadSHA(context.Background())
+			if err != nil {
+				return fmt.Errorf("resolve task worktree head: %w", err)
+			}
+			request := taskRunImplementJobRequest(taskRunImplementJobID(candidate.ID, strings.TrimSpace(*owner)), candidate, strings.TrimSpace(*owner), headSHA)
+			if active, ok, err := findActiveTaskRunJob(context.Background(), store, request); err != nil {
+				return err
+			} else if ok {
+				started = candidate
+				startedJob = active
+				return nil
+			}
+			dirty, err := taskWorktreeDirty(context.Background(), candidate)
+			if err != nil {
+				return err
+			}
+			if dirty {
+				skipFanout := taskRecoverSkipFanout(context.Background(), store, requestRepo, requestBranch)
+				recoverCmd := taskRecoverCommand(task.ID, *home, requestRepo, strings.TrimSpace(*owner), skipFanout)
+				return fmt.Errorf("task %s worktree has uncommitted changes at %s; inspect it, then run %s to commit/push/open a PR, or clean/stash it before retrying task run", task.ID, candidate.WorktreePath, recoverCmd)
+			}
+		}
 		engine := workflow.Engine{Store: store}
 		started, err = engine.AllocateTaskWorktree(context.Background(), workflow.TaskWorktreeRequest{
 			Home:       paths.Home,
@@ -429,20 +456,12 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fmt.Errorf("resolve task worktree head: %w", err)
 		}
-		recoverCmd := taskRecoverCommand(task.ID, *home, requestRepo, strings.TrimSpace(*owner))
-		dirty, err := taskWorktreeDirty(context.Background(), started)
-		if err != nil {
-			return err
-		}
 		request := taskRunImplementJobRequest(taskRunImplementJobID(started.ID, strings.TrimSpace(*owner)), started, strings.TrimSpace(*owner), headSHA)
 		if active, ok, err := findActiveTaskRunJob(context.Background(), store, request); err != nil {
 			return err
 		} else if ok {
 			startedJob = active
 			return nil
-		}
-		if dirty {
-			return fmt.Errorf("task %s worktree has uncommitted changes at %s; inspect it, then run %s to commit/push/open a PR, or clean/stash it before retrying task run", started.ID, started.WorktreePath, recoverCmd)
 		}
 		startedJob, err = enqueueTaskRunImplementJob(context.Background(), store, started, strings.TrimSpace(*owner), headSHA, paths.Home)
 		return err
@@ -479,7 +498,7 @@ func runTaskRecover(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	repo := fs.String("repo", "", "repo scope as owner/repo")
-	owner := fs.String("owner", "", "agent/operator attributed as recovery lead")
+	owner := fs.String("owner", "", "registered implement-capable agent attributed as recovery lead")
 	skipFanout := fs.Bool("skip-native-review-fanout", false, "persist skip-native-review-fanout before opening the PR")
 	jsonOutput := fs.Bool("json", false, "print recovery result as JSON")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
@@ -499,6 +518,10 @@ func runTaskRecover(args []string, stdout, stderr io.Writer) int {
 	}
 	if fs.NArg() != 0 {
 		fmt.Fprintln(stderr, "task recover requires exactly one id")
+		return 2
+	}
+	if strings.TrimSpace(*owner) == "" {
+		fmt.Fprintln(stderr, "task recover requires --owner")
 		return 2
 	}
 	var output taskRecoverOutput
@@ -545,12 +568,12 @@ func recoverTaskImplementation(ctx context.Context, store *db.Store, taskID stri
 		}
 		return workflow.JobPayload{}, err
 	}
-	requestRepo := firstNonEmpty(repoFlag, task.RepoFullName)
+	requestRepo, err := resolveTaskRepoFlag(repoFlag, task.RepoFullName, "task recover")
+	if err != nil {
+		return workflow.JobPayload{}, err
+	}
 	if strings.TrimSpace(requestRepo) == "" {
 		return workflow.JobPayload{}, errors.New("task recover requires --repo when task has no repo")
-	}
-	if strings.TrimSpace(repoFlag) != "" && strings.TrimSpace(task.RepoFullName) != "" && repoFlag != task.RepoFullName {
-		return workflow.JobPayload{}, fmt.Errorf("task %s belongs to repo %s, not %s", task.ID, task.RepoFullName, repoFlag)
 	}
 	if _, err := daemon.ParseRepository(requestRepo); err != nil {
 		return workflow.JobPayload{}, fmt.Errorf("invalid repo: %w", err)
@@ -564,17 +587,51 @@ func recoverTaskImplementation(ctx context.Context, store *db.Store, taskID stri
 	if strings.TrimSpace(task.WorktreePath) == "" {
 		return workflow.JobPayload{}, errors.New("task has no worktree path; rerun through gitmoot task run or gitmoot agent implement")
 	}
+	if strings.TrimSpace(task.Branch) == "" {
+		return workflow.JobPayload{}, errors.New("task has no branch; cannot recover implementation")
+	}
+	agent, err := store.GetAgent(ctx, strings.TrimSpace(owner))
+	if err != nil {
+		return workflow.JobPayload{}, fmt.Errorf("load recovery owner agent %q: %w", strings.TrimSpace(owner), err)
+	}
+	if err := ensureLocalAgentAccess(ctx, store, agent, requestRepo, "implement"); err != nil {
+		return workflow.JobPayload{}, err
+	}
+	if active, ok, err := findActiveImplementJobForTask(ctx, store, requestRepo, task.Branch, task.ID); err != nil {
+		return workflow.JobPayload{}, err
+	} else if ok {
+		return workflow.JobPayload{}, fmt.Errorf("task %s still has active implement job %s; wait for it, cancel it, or resolve it before recovering", task.ID, active.ID)
+	}
+	lock, err := ensureTaskRecoverBranchLock(ctx, store, requestRepo, task.Branch, strings.TrimSpace(owner))
+	if err != nil {
+		return workflow.JobPayload{}, err
+	}
 	headSHA, err := (gitutil.Client{Dir: task.WorktreePath}).HeadSHA(ctx)
 	if err != nil {
 		return workflow.JobPayload{}, fmt.Errorf("resolve task worktree head: %w", err)
 	}
-	if strings.TrimSpace(owner) == "" {
-		owner = "task recover"
+	payloadHead := headSHA
+	if dirty, err := taskWorktreeDirty(ctx, task); err != nil {
+		return workflow.JobPayload{}, err
+	} else if !dirty {
+		baseHead := previousTaskImplementHeadSHA(ctx, store, task.ID, requestRepo, task.Branch, headSHA)
+		if strings.TrimSpace(baseHead) == "" {
+			baseHead, err = taskRecoverBaseHead(ctx, store, task, requestRepo)
+			if err != nil {
+				return workflow.JobPayload{}, err
+			}
+		}
+		if strings.TrimSpace(baseHead) == "" || baseHead == headSHA {
+			return workflow.JobPayload{}, workflow.BlockedError{Reason: "task worktree is clean and has no recoverable commit ahead of its base"}
+		}
+		payloadHead = baseHead
 	}
+	skipFanout = skipFanout || lock.SkipNativeReviewFanout
 	job := db.Job{
-		ID:    taskRecoverJobID(task.ID, owner),
+		ID:    uniqueTaskRecoverJobID(ctx, store, task.ID, owner),
 		Agent: owner,
 		Type:  "implement",
+		State: string(workflow.JobRunning),
 	}
 	payload := workflow.JobPayload{
 		Repo:                   requestRepo,
@@ -583,11 +640,42 @@ func recoverTaskImplementation(ctx context.Context, store *db.Store, taskID stri
 		TaskID:                 task.ID,
 		TaskTitle:              task.Title,
 		LeadAgent:              owner,
-		HeadSHA:                headSHA,
+		HeadSHA:                payloadHead,
+		Sender:                 "task recover",
+		Instructions:           "Recover task " + task.ID + " from its existing implementation worktree.",
 		SkipNativeReviewFanout: skipFanout,
 	}
+	encoded, err := encodeWorkflowJobPayload(payload)
+	if err != nil {
+		return workflow.JobPayload{}, err
+	}
+	if err := store.CreateExternallyDrivenJobWithEvent(ctx, db.Job{
+		ID:      job.ID,
+		Agent:   job.Agent,
+		Type:    job.Type,
+		State:   job.State,
+		Payload: encoded,
+	}, db.JobEvent{Kind: string(workflow.JobRunning), Message: "task recovery started"}); err != nil {
+		return workflow.JobPayload{}, err
+	}
 	finalizer := daemonImplementationFinalizer{Store: store, GitHub: gh}
-	return finalizer.FinalizeImplementation(ctx, job, payload)
+	finalized, err := finalizer.FinalizeImplementation(ctx, job, payload)
+	if err != nil {
+		state := string(workflow.JobFailed)
+		var blocked workflow.BlockedError
+		if errors.As(err, &blocked) {
+			state = string(workflow.JobBlocked)
+			finalized = payload
+			finalized.Result = &workflow.AgentResult{Decision: "blocked", Summary: blocked.Reason}
+		}
+		_ = finishTaskRecoverJob(ctx, store, job.ID, state, finalized, err.Error())
+		return workflow.JobPayload{}, err
+	}
+	finalized.Result = &workflow.AgentResult{Decision: "implemented", Summary: "Recovered implementation worktree and opened/adopted PR."}
+	if err := finishTaskRecoverJob(ctx, store, job.ID, string(workflow.JobSucceeded), finalized, "task recovery finalized implementation"); err != nil {
+		return workflow.JobPayload{}, err
+	}
+	return finalized, nil
 }
 
 func taskWorktreeDirty(ctx context.Context, task db.Task) (bool, error) {
@@ -601,7 +689,167 @@ func taskWorktreeDirty(ctx context.Context, task db.Task) (bool, error) {
 	return strings.TrimSpace(status) != "", nil
 }
 
-func taskRecoverCommand(taskID string, home string, repo string, owner string) string {
+func taskBranchReusableForImplement(state string) bool {
+	switch workflow.TaskState(strings.TrimSpace(state)) {
+	case "", workflow.TaskPlanned, workflow.TaskImplementing, workflow.TaskChangesRequested, workflow.TaskBlocked, workflow.TaskAwaitingHuman:
+		return true
+	default:
+		return false
+	}
+}
+
+func resolveTaskRepoFlag(repoFlag string, taskRepo string, command string) (string, error) {
+	repoFlag = strings.TrimSpace(repoFlag)
+	taskRepo = strings.TrimSpace(taskRepo)
+	if repoFlag == "" {
+		if taskRepo == "" {
+			return "", nil
+		}
+		return normalizeRepoFlag(taskRepo)
+	}
+	repo, err := normalizeRepoFlag(repoFlag)
+	if err != nil {
+		return "", fmt.Errorf("invalid repo: %w", err)
+	}
+	if taskRepo != "" {
+		taskRepo, err = normalizeRepoFlag(taskRepo)
+		if err != nil {
+			return "", fmt.Errorf("invalid task repo: %w", err)
+		}
+		if repo != taskRepo {
+			return "", fmt.Errorf("task belongs to repo %s, not %s", taskRepo, repo)
+		}
+	}
+	return repo, nil
+}
+
+func findActiveImplementJobForTask(ctx context.Context, store *db.Store, repo string, branch string, taskID string) (db.Job, bool, error) {
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		return db.Job{}, false, err
+	}
+	for _, job := range jobs {
+		if job.State != string(workflow.JobQueued) && job.State != string(workflow.JobRunning) {
+			continue
+		}
+		if job.Type != "implement" {
+			continue
+		}
+		payload, err := daemonJobPayload(job)
+		if err != nil {
+			continue
+		}
+		if payload.TaskID == taskID && payload.Repo == repo && payload.Branch == branch {
+			return job, true, nil
+		}
+	}
+	return db.Job{}, false, nil
+}
+
+func previousTaskImplementHeadSHA(ctx context.Context, store *db.Store, taskID string, repo string, branch string, currentHead string) string {
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		return ""
+	}
+	head := ""
+	for _, job := range jobs {
+		if job.Type != "implement" {
+			continue
+		}
+		payload, err := daemonJobPayload(job)
+		if err != nil {
+			continue
+		}
+		if payload.TaskID != taskID || payload.Repo != repo || payload.Branch != branch {
+			continue
+		}
+		if strings.TrimSpace(payload.HeadSHA) == "" || payload.HeadSHA == currentHead {
+			continue
+		}
+		head = payload.HeadSHA
+	}
+	return head
+}
+
+func taskRecoverBaseHead(ctx context.Context, store *db.Store, task db.Task, repo string) (string, error) {
+	record, err := store.GetRepo(ctx, repo)
+	if err != nil {
+		return "", err
+	}
+	base := strings.TrimSpace(record.DefaultBranch)
+	if base == "" {
+		base = "main"
+	}
+	git := gitutil.Client{Dir: task.WorktreePath}
+	var lastErr error
+	for _, rev := range []string{base, "origin/" + base} {
+		sha, err := git.RevParse(ctx, rev)
+		if err == nil {
+			return sha, nil
+		}
+		lastErr = err
+	}
+	return "", fmt.Errorf("resolve task recovery base %s: %w", base, lastErr)
+}
+
+func ensureTaskRecoverBranchLock(ctx context.Context, store *db.Store, repo string, branch string, owner string) (db.BranchLock, error) {
+	if strings.TrimSpace(branch) == "" {
+		return db.BranchLock{}, errors.New("task recover requires a branch")
+	}
+	lock := db.BranchLock{RepoFullName: repo, Branch: branch, Owner: owner}
+	if _, err := store.CreateLock(ctx, lock); err != nil {
+		return db.BranchLock{}, err
+	}
+	current, err := store.GetBranchLock(ctx, repo, branch)
+	if err != nil {
+		return db.BranchLock{}, err
+	}
+	if current.Owner != owner {
+		return db.BranchLock{}, fmt.Errorf("branch %s is locked by %s, not %s", branch, current.Owner, owner)
+	}
+	return current, nil
+}
+
+func taskRecoverSkipFanout(ctx context.Context, store *db.Store, repo string, branch string) bool {
+	lock, err := store.GetBranchLock(ctx, repo, branch)
+	return err == nil && lock.SkipNativeReviewFanout
+}
+
+func uniqueTaskRecoverJobID(ctx context.Context, store *db.Store, taskID string, owner string) string {
+	base := taskRecoverJobID(taskID, owner)
+	if _, err := store.GetJob(ctx, base); errors.Is(err, sql.ErrNoRows) {
+		return base
+	}
+	return base + "-" + shortHash(time.Now().UTC().Format(time.RFC3339Nano))
+}
+
+func encodeWorkflowJobPayload(payload workflow.JobPayload) (string, error) {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
+}
+
+func finishTaskRecoverJob(ctx context.Context, store *db.Store, jobID string, state string, payload workflow.JobPayload, message string) error {
+	encoded, err := encodeWorkflowJobPayload(payload)
+	if err != nil {
+		return err
+	}
+	ok, err := store.TransitionJobStatePayloadWithEvent(ctx, jobID, string(workflow.JobRunning), state, encoded, db.JobEvent{Kind: state, Message: message})
+	if err != nil {
+		return err
+	}
+	if !ok {
+		if err := store.UpdateJobPayload(ctx, jobID, encoded); err != nil {
+			return err
+		}
+		return store.UpdateJobState(ctx, jobID, state)
+	}
+	return nil
+}
+
+func taskRecoverCommand(taskID string, home string, repo string, owner string, skipFanout bool) string {
 	args := []string{"gitmoot", "task", "recover", taskID}
 	if strings.TrimSpace(home) != "" {
 		args = append(args, "--home", home)
@@ -612,11 +860,18 @@ func taskRecoverCommand(taskID string, home string, repo string, owner string) s
 	if strings.TrimSpace(owner) != "" {
 		args = append(args, "--owner", owner)
 	}
+	if skipFanout {
+		args = append(args, "--skip-native-review-fanout")
+	}
 	return shellArgs(args)
 }
 
 func taskRecoverJobID(taskID string, owner string) string {
-	return slug("task-" + taskID + "-recover-" + owner)
+	value := slug("task-" + taskID + "-recover-" + owner)
+	if value == "" {
+		return "task-recover-" + shortHash(taskID+"\x00"+owner)
+	}
+	return value
 }
 
 func enqueueTaskRunImplementJob(ctx context.Context, store *db.Store, task db.Task, owner string, headSHA string, home string) (db.Job, error) {

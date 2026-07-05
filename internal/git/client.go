@@ -318,6 +318,22 @@ func (c Client) HeadSHA(ctx context.Context) (string, error) {
 	return sha, nil
 }
 
+func (c Client) RevParse(ctx context.Context, rev string) (string, error) {
+	rev = strings.TrimSpace(rev)
+	if rev == "" {
+		return "", errors.New("git revision is required")
+	}
+	result, err := c.run(ctx, "rev-parse", rev)
+	if err != nil {
+		return "", err
+	}
+	sha := strings.TrimSpace(result.Stdout)
+	if sha == "" {
+		return "", errors.New("git revision SHA is empty")
+	}
+	return sha, nil
+}
+
 func (c Client) UpdateBase(ctx context.Context, remote string, branch string) error {
 	if strings.TrimSpace(remote) == "" {
 		remote = "origin"
