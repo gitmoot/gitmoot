@@ -432,6 +432,97 @@ func TestMailboxDeliverCumulativeAmbiguousRefContributesZero(t *testing.T) {
 	}
 }
 
+// TestMailboxDeliverSeedsBaselineForAdoptedThread pins F2 (#665/#669 interaction):
+// a fresh codex delivery reports PER-JOB usage (non-cumulative, recorded verbatim,
+// #664) AND adopts its concrete thread in-memory for same-job repair (#665). If
+// turn 1 is malformed, the repair delivery resumes that thread and reports
+// SESSION-CUMULATIVE usage. The fresh delivery must SEED the runtime_session_usage
+// baseline with turn 1's counts so the repair deltas against turn 1, not a zero
+// baseline — otherwise turn 1 is double-counted. Turn 1 = 100/10 verbatim; the
+// repair reports cumulative 150/15 -> delta 50/5; job total 150/15 (NOT 250/25).
+// This is the double-count pin: it fails without the seed.
+func TestMailboxDeliverSeedsBaselineForAdoptedThread(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+	agent := runtime.Agent{Name: "impl", Runtime: runtime.CodexRuntime, RuntimeRef: "fresh:codex-solo", RepoScope: "jerryfane/gitmoot", Role: "implementer"}
+	adapter := &fakeDelivery{
+		outputs: []string{
+			"fresh codex turn but no json",
+			okDeliveryResult,
+		},
+		refreshedRefs: []string{"codex-thread-adopted"},
+		inputTokens:   []int{100, 150},
+		outputTokens:  []int{10, 15},
+		cumulative:    []bool{false, true},
+	}
+
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "impl", Action: "implement", Repo: "jerryfane/gitmoot"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	job, err := store.GetJob(ctx, "job-1")
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if job.InputTokens != 150 || job.OutputTokens != 15 {
+		t.Fatalf("job usage = (%d, %d), want (150, 15) — turn 1 must not be double-counted (a zero baseline would give 250/25)", job.InputTokens, job.OutputTokens)
+	}
+	// The seeded baseline must advance to the repair's cumulative (150/15) — a probe
+	// with the same cumulative deltas to 0, confirming the key matched byte-for-byte.
+	dIn, dOut, err := store.RecordRuntimeSessionUsageDelta(ctx, runtime.CodexRuntime+":codex-thread-adopted", 150, 15)
+	if err != nil {
+		t.Fatalf("probe RecordRuntimeSessionUsageDelta: %v", err)
+	}
+	if dIn != 0 || dOut != 0 {
+		t.Fatalf("post-run baseline probe delta = (%d, %d), want (0, 0) — baseline should equal the repair cumulative", dIn, dOut)
+	}
+}
+
+// TestMailboxDeliverDoesNotSeedBaselineWithoutAdoptedThread pins that the F2 seed
+// fires ONLY when a concrete thread was adopted: a fresh/single-use codex delivery
+// that produced no adoptable thread (RefreshedRuntimeRef empty) records verbatim
+// and writes NO baseline row.
+func TestMailboxDeliverDoesNotSeedBaselineWithoutAdoptedThread(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+	freshRef := "fresh:codex-single"
+	agent := runtime.Agent{Name: "impl", Runtime: runtime.CodexRuntime, RuntimeRef: freshRef, RepoScope: "jerryfane/gitmoot", Role: "implementer"}
+	adapter := &fakeDelivery{
+		outputs:      []string{okDeliveryResult},
+		inputTokens:  []int{100},
+		outputTokens: []int{10},
+		cumulative:   []bool{false},
+	}
+
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "impl", Action: "implement", Repo: "jerryfane/gitmoot"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	job, err := store.GetJob(ctx, "job-1")
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if job.InputTokens != 100 || job.OutputTokens != 10 {
+		t.Fatalf("job usage = (%d, %d), want (100, 10) verbatim", job.InputTokens, job.OutputTokens)
+	}
+	// No thread was adopted, so no baseline may have been seeded. Probe the key the
+	// seed would have used had it (wrongly) keyed on the agent's own ref: a fresh
+	// probe returns the full cumulative, proving the baseline was 0 (no row).
+	dIn, dOut, err := store.RecordRuntimeSessionUsageDelta(ctx, runtime.CodexRuntime+":"+freshRef, 777, 77)
+	if err != nil {
+		t.Fatalf("probe RecordRuntimeSessionUsageDelta: %v", err)
+	}
+	if dIn != 777 || dOut != 77 {
+		t.Fatalf("probe delta = (%d, %d), want (777, 77) — a baseline was unexpectedly seeded", dIn, dOut)
+	}
+}
+
 func TestMailboxEnqueuePersistsRootJobID(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)

@@ -679,6 +679,20 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 			inTok, outTok, _ = m.Store.RecordRuntimeSessionUsageDelta(ctx, agent.Runtime+":"+agent.RuntimeRef, result.InputTokens, result.OutputTokens)
 		} else if result.CumulativeUsage {
 			inTok, outTok = 0, 0
+		} else if agent.Runtime == runtime.CodexRuntime && result.RefreshedRuntimeRef != "" && result.RefreshedRuntimeRef != runtime.LastRef {
+			// A fresh codex delivery reports PER-JOB (non-cumulative) usage and skips the
+			// delta table by design (#664), so the runtime_session_usage baseline for its
+			// thread is never seeded. But a fresh codex delivery ALSO adopts its concrete
+			// thread in-memory for same-job repair (#665): if turn 1 is malformed, the
+			// repair delivery resumes that thread, reports SESSION-CUMULATIVE usage, and
+			// (turn1+turn2) would delta against a ZERO baseline — re-counting turn 1 on
+			// top of the verbatim record below (#669 interaction). SEED the baseline with
+			// turn 1's counts, keyed byte-identically to the key the repair path computes
+			// from the adopted ref (runtime+RefreshedRuntimeRef), so a repair delta =
+			// (turn1+turn2)-turn1 = turn2. The returned delta is discarded; the verbatim
+			// UpdateJobUsage below records this turn. Errors are swallowed like the delta
+			// call — usage accounting never fails a delivery.
+			_, _, _ = m.Store.RecordRuntimeSessionUsageDelta(ctx, agent.Runtime+":"+result.RefreshedRuntimeRef, result.InputTokens, result.OutputTokens)
 		}
 		// Only persist when a positive count remains so runtimes that report nothing
 		// (e.g. the shell runtime) or a delta that resolved to 0 leave the columns at
