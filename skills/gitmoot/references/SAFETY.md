@@ -147,9 +147,10 @@ cannot recurse or fan out forever:
   every job in the tree). A coordinator that tries to fan out after the tree has
   already used at least the budget is refused with a `delegation_cost_exceeded`
   event. Token capture is **best-effort per runtime** (Claude reports usage; Kimi
-  reports it if its stream emits it; Codex `Deliver` runs without `--json` and so
-  contributes `0`), so the budget can under-count but never over-counts. Leaving
-  the knob at `0` skips the check entirely.
+  reports it if its stream emits it; Codex reads usage from its `codex exec --json`
+  JSONL stream for fresh sessions only — resumed sessions contribute `0` because
+  codex reports session-cumulative usage there — falling back to `0` on an older CLI), so the budget can under-count
+  but never over-counts. Leaving the knob at `0` skips the check entirely.
 - Per-root **dollar-cost** budget `[orchestrate].max_delegation_cost_usd`,
   **off by default** (`0` = unlimited): the cost analogue of the token budget
   (#380). It bounds the same tree by *measured spend* — the same per-job token

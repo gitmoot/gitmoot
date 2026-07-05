@@ -3220,11 +3220,12 @@ default_repair_timeout = ""
   with a `delegation_cost_exceeded` event and routed to the graceful finalize
   continuation (synthesize what completed, then stop). Token capture is
   **best-effort per runtime**: Claude reports usage via its `--output-format json`
-  envelope, Kimi reports it when its stream emits a `usage` object, and Codex runs
-  delivery without `--json` so it contributes `0` (the budget under-counts Codex
-  rather than failing). Treat it as a coarse runaway-cost backstop, not a precise
-  spend limit; the budget is in raw tokens. Leaving it at `0` is byte-identical to
-  before the knob existed.
+  envelope, Kimi reports it when its stream emits a `usage` object, and Codex reads
+  usage from its `codex exec --json` JSONL stream for fresh sessions only
+  (resumed sessions contribute `0` — codex reports session-cumulative usage
+  there; older CLIs that predate the flag also fall back to `0`). Treat it as a coarse runaway-cost backstop, not a
+  precise spend limit; the budget is in raw tokens. Leaving it at `0` is
+  byte-identical to before the knob existed.
 - `max_delegation_cost_usd` (default `0` = unlimited/off) is the **dollar-cost**
   analogue of the token budget (#380): it bounds the same tree by its *measured
   spend* rather than raw token count. Cost is derived from the same per-job token
@@ -10076,9 +10077,10 @@ cannot recurse or fan out forever:
   every job in the tree). A coordinator that tries to fan out after the tree has
   already used at least the budget is refused with a `delegation_cost_exceeded`
   event. Token capture is **best-effort per runtime** (Claude reports usage; Kimi
-  reports it if its stream emits it; Codex `Deliver` runs without `--json` and so
-  contributes `0`), so the budget can under-count but never over-counts. Leaving
-  the knob at `0` skips the check entirely.
+  reports it if its stream emits it; Codex reads usage from its `codex exec --json`
+  JSONL stream for fresh sessions only — resumed sessions contribute `0` because
+  codex reports session-cumulative usage there — falling back to `0` on an older CLI), so the budget can under-count
+  but never over-counts. Leaving the knob at `0` skips the check entirely.
 - Per-root **dollar-cost** budget `[orchestrate].max_delegation_cost_usd`,
   **off by default** (`0` = unlimited): the cost analogue of the token budget
   (#380). It bounds the same tree by *measured spend* — the same per-job token
@@ -10594,13 +10596,14 @@ a job whose runtime reports no usage contributes `0` to the sum, so the budget
 | --- | --- | --- |
 | **Claude Code** | Yes | Parsed from the `usage.{input,output}_tokens` of the `--output-format json` envelope on delivery. |
 | **Kimi Code** | Best-effort | Captured if the `--output-format stream-json` stream emits a `usage` object; otherwise `0`. |
-| **Codex** | No (contributes `0`) | `codex exec resume … -- <prompt>` runs without `--json` (plain text), so delivery exposes no machine-readable usage. |
+| **Codex** | Fresh sessions only | Read from the last `turn.completed` usage of the `codex exec --json` JSONL stream (#658) for fresh sessions (ephemeral delegation workers, per-job `--runtime` overrides). Resumed sessions contribute `0`: codex reports session-cumulative usage there, which would attribute the whole session history to each job. Older CLIs that predate `--json` fall back to plain text and contribute `0`. |
 
-Because of this, a tree made up mostly of Codex jobs will accumulate little or no
-counted usage — set the budget with that in mind, and prefer it as a coarse
-runaway-cost backstop rather than a precise spend limit. The same capture also
-feeds the `$`-denominated `[orchestrate].max_delegation_cost_usd` budget — see
-the dollar-cost bullet in [Termination bounds](#termination-bounds) above.
+Capture is best-effort, so treat the budget as a coarse runaway-cost backstop
+rather than a precise spend limit — a runtime that reports nothing (or an older
+codex CLI that predates `--json`) contributes `0` and is silently under-counted.
+The same capture also feeds the `$`-denominated
+`[orchestrate].max_delegation_cost_usd` budget — see the dollar-cost bullet in
+[Termination bounds](#termination-bounds) above.
 
 ### Top-level fields
 
