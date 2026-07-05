@@ -520,15 +520,25 @@ Schedule recurring agent work (heartbeats, off by default):
 ```sh
 gitmoot agent heartbeat add repo-maintainer daily-status \
   --repo owner/repo --interval 24h --prompt "Daily status report." --enabled
+# implement is policy-gated; --runtime pins a runtime for this schedule.
+gitmoot agent heartbeat add builder nightly-tidy \
+  --repo owner/repo --interval 24h --action implement --runtime codex \
+  --prompt "Fix the top lint error and open a small PR."
 gitmoot agent heartbeat list [--agent <agent>]
 gitmoot agent heartbeat show repo-maintainer daily-status
 gitmoot agent heartbeat enable|disable repo-maintainer daily-status
 gitmoot agent heartbeat remove repo-maintainer daily-status
 ```
 
-A heartbeat enqueues a normal background job on its `interval` (read-only `ask`
-or `review` action; `review` needs the agent's `review` capability). `gitmoot
-daemon status` surfaces each schedule's last-run/next-due/last-status. See
+A heartbeat enqueues a normal background job on its `interval`. Actions: read-only
+`ask` (default) or `review` (`review` needs the agent's `review` capability), plus
+the **policy-gated** write action `implement` — it only runs for an agent that
+holds the `implement` capability AND a write-granting policy (`--policy
+workspace-write` or `danger-full-access`); otherwise it is refused at `add` and
+no-op'd (`last_status = policy_readonly`) by the daemon scan. An optional
+`--runtime codex|claude|kimi` runs the scheduled job on that runtime (fresh
+session) instead of the agent default. `gitmoot daemon status` surfaces each
+schedule's last-run/next-due/last-status. See
 [Heartbeat Schedules](../workflows/heartbeat-schedules-workflow.md) for the
 full reference.
 

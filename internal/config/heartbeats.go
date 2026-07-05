@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
 // Heartbeat is one named recurring agent schedule parsed from an
@@ -23,6 +25,13 @@ type Heartbeat struct {
 	Action        string
 	Prompt        string
 	MaxConcurrent int
+	// Runtime, when non-empty, runs this heartbeat's job through the named runtime
+	// instead of the target agent's registered default runtime (#611, reusing the
+	// per-job override machinery from #531). It is OPTIONAL: an empty Runtime leaves
+	// every existing heartbeat byte-identical and runs on the agent default. Only a
+	// resumable runtime (codex/claude/kimi) is allowed — a heartbeat mints a fresh
+	// session, and shell sessions are whole commands, so shell is rejected.
+	Runtime string
 }
 
 // LoadHeartbeats collects every [agents.<agent>.heartbeats.<name>] section from
@@ -86,19 +95,56 @@ func LoadHeartbeats(paths Paths) ([]Heartbeat, error) {
 	return heartbeats, nil
 }
 
-// HeartbeatActions lists the actions a heartbeat may schedule, both read-only:
-// "ask" (the conservative default) and "review". "implement" is deliberately
-// excluded — recurring unattended code-change PRs are a separate safety pass.
-func HeartbeatActions() []string { return []string{"ask", "review"} }
+// HeartbeatActions lists the actions a heartbeat may schedule: the read-only
+// "ask" (the conservative default) and "review", plus the WRITE action
+// "implement". "implement" is structurally valid here but POLICY-GATED (#611):
+// it only runs for a target agent whose autonomy policy grants headless writes
+// (workspace-write / danger-full-access) and that holds the "implement"
+// capability. That gate is agent-aware (it needs the agent registry), so it is
+// enforced at the CLI write path and the daemon scan, mirroring how the "review"
+// capability check lives outside this pure config loader.
+func HeartbeatActions() []string { return []string{"ask", "review", "implement"} }
 
 // HeartbeatActionSupported reports whether action is one a heartbeat may use.
 func HeartbeatActionSupported(action string) bool {
 	switch strings.TrimSpace(action) {
-	case "ask", "review":
+	case "ask", "review", "implement":
 		return true
 	default:
 		return false
 	}
+}
+
+// HeartbeatRuntimes lists the runtimes a per-heartbeat runtime override may name
+// (#611): every resumable runtime the adapter Factory supports EXCEPT shell (a
+// heartbeat mints a fresh session, and shell sessions are whole commands, not
+// resumable sessions). It is derived from runtime.SupportedRuntimes so the set
+// stays in lockstep with the actual adapter registry.
+func HeartbeatRuntimes() []string {
+	allowed := make([]string, 0, 4)
+	for _, name := range runtime.SupportedRuntimes() {
+		if name == runtime.ShellRuntime {
+			continue
+		}
+		allowed = append(allowed, name)
+	}
+	return allowed
+}
+
+// HeartbeatRuntimeSupported reports whether rt is a valid per-heartbeat runtime
+// override (a resumable runtime, never shell). The empty string is valid: it
+// means "no override; run on the agent default".
+func HeartbeatRuntimeSupported(rt string) bool {
+	rt = strings.TrimSpace(rt)
+	if rt == "" {
+		return true
+	}
+	for _, name := range HeartbeatRuntimes() {
+		if name == rt {
+			return true
+		}
+	}
+	return false
 }
 
 // parseHeartbeatSection extracts the agent and the heartbeat name from a section
@@ -155,6 +201,10 @@ func applyHeartbeatField(entry *Heartbeat, key string, value string) error {
 		parsed, err := parseConfigString(value)
 		entry.Prompt = parsed
 		return err
+	case "runtime":
+		parsed, err := parseConfigString(value)
+		entry.Runtime = parsed
+		return err
 	case "max_concurrent":
 		parsed, err := strconv.Atoi(value)
 		entry.MaxConcurrent = parsed
@@ -178,6 +228,7 @@ func applyHeartbeatDefaults(entry *Heartbeat) {
 		entry.Action = "ask"
 	}
 	entry.Prompt = strings.TrimSpace(entry.Prompt)
+	entry.Runtime = strings.TrimSpace(entry.Runtime)
 	if entry.MaxConcurrent <= 0 {
 		entry.MaxConcurrent = 1
 	}
@@ -200,14 +251,21 @@ func validateHeartbeat(entry Heartbeat) error {
 	if _, err := time.ParseDuration(entry.Jitter); err != nil {
 		return fmt.Errorf("heartbeat [agents.%s.heartbeats.%s]: jitter %q: %w", entry.Agent, entry.Name, entry.Jitter, err)
 	}
-	// Supported actions are the conservative read-only ones: "ask" (analyze/answer)
-	// and "review" (read-only PR/code review). A "review" heartbeat additionally
-	// requires the target agent to HOLD the review capability; that check needs the
-	// agent registry, so it lives in the daemon scan (runOneHeartbeat) and the CLI
-	// write path, not here. "implement" heartbeats stay deferred: recurring
-	// unattended code-change PRs are a separate safety pass.
+	// Supported actions are the read-only "ask" (analyze/answer) and "review"
+	// (read-only PR/code review), plus the WRITE action "implement" (#611). A
+	// "review" heartbeat additionally requires the target agent to HOLD the review
+	// capability, and an "implement" heartbeat requires the agent to hold the
+	// implement capability AND carry a write-granting autonomy policy; both checks
+	// need the agent registry, so they live in the daemon scan (runOneHeartbeat) and
+	// the CLI write path, not in this pure config loader.
 	if !HeartbeatActionSupported(entry.Action) {
-		return fmt.Errorf("heartbeat [agents.%s.heartbeats.%s]: unsupported action %q; only %q and %q are supported", entry.Agent, entry.Name, entry.Action, "ask", "review")
+		return fmt.Errorf("heartbeat [agents.%s.heartbeats.%s]: unsupported action %q; supported actions are %s", entry.Agent, entry.Name, entry.Action, strings.Join(HeartbeatActions(), ", "))
+	}
+	// A per-heartbeat runtime override (#611) must name a resumable runtime the
+	// adapter Factory supports (codex/claude/kimi), never shell. An empty runtime is
+	// valid and means "run on the agent default" (the byte-identical default).
+	if !HeartbeatRuntimeSupported(entry.Runtime) {
+		return fmt.Errorf("heartbeat [agents.%s.heartbeats.%s]: unsupported runtime %q; supported runtimes are %s", entry.Agent, entry.Name, entry.Runtime, strings.Join(HeartbeatRuntimes(), ", "))
 	}
 	if entry.Prompt == "" {
 		return fmt.Errorf("heartbeat [agents.%s.heartbeats.%s]: prompt is required", entry.Agent, entry.Name)

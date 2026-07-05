@@ -98,7 +98,23 @@ interval = "1h"
 enabled = true
 repo = "o/r"
 interval = "1h"
-action = "implement"
+action = "deploy"
+prompt = "p"
+`,
+		"unsupported runtime": `
+[agents.x.heartbeats.h]
+enabled = true
+repo = "o/r"
+interval = "1h"
+runtime = "bogus"
+prompt = "p"
+`,
+		"shell runtime rejected": `
+[agents.x.heartbeats.h]
+enabled = true
+repo = "o/r"
+interval = "1h"
+runtime = "shell"
 prompt = "p"
 `,
 		"bad jitter": `
@@ -120,8 +136,7 @@ prompt = "p"
 	}
 }
 
-// TestLoadHeartbeatsAcceptsReviewAction asserts the review action now loads
-// (the ask/review pair), while implement stays rejected (covered above).
+// TestLoadHeartbeatsAcceptsReviewAction asserts the review action loads.
 func TestLoadHeartbeatsAcceptsReviewAction(t *testing.T) {
 	paths := writeHeartbeatConfig(t, `
 [agents.reviewer.heartbeats.stale-prs]
@@ -137,6 +152,46 @@ prompt = "Review stale PRs."
 	}
 	if len(heartbeats) != 1 || heartbeats[0].Action != "review" {
 		t.Fatalf("expected one review heartbeat, got %+v", heartbeats)
+	}
+}
+
+// TestLoadHeartbeatsAcceptsImplementActionAndRuntime asserts the write action
+// "implement" and a per-heartbeat runtime override now load structurally (#611).
+// The agent-aware policy/capability gate lives in the CLI + daemon scan, not this
+// pure loader, so config-load only checks the action/runtime are valid enums.
+func TestLoadHeartbeatsAcceptsImplementActionAndRuntime(t *testing.T) {
+	paths := writeHeartbeatConfig(t, `
+[agents.builder.heartbeats.nightly]
+enabled = true
+repo = "o/r"
+interval = "24h"
+action = "implement"
+runtime = "codex"
+prompt = "Fix the top lint error."
+`)
+	heartbeats, err := LoadHeartbeats(paths)
+	if err != nil {
+		t.Fatalf("LoadHeartbeats returned error: %v", err)
+	}
+	if len(heartbeats) != 1 || heartbeats[0].Action != "implement" || heartbeats[0].Runtime != "codex" {
+		t.Fatalf("expected one implement/codex heartbeat, got %+v", heartbeats)
+	}
+}
+
+// TestHeartbeatRuntimesExcludesShell asserts the per-heartbeat runtime allow-list
+// is derived from the adapter registry but never offers shell (heartbeats mint a
+// fresh session; shell sessions are whole commands).
+func TestHeartbeatRuntimesExcludesShell(t *testing.T) {
+	for _, rt := range HeartbeatRuntimes() {
+		if rt == "shell" {
+			t.Fatalf("HeartbeatRuntimes must not include shell: %v", HeartbeatRuntimes())
+		}
+	}
+	if !HeartbeatRuntimeSupported("codex") || !HeartbeatRuntimeSupported("") {
+		t.Fatalf("codex and empty must be supported runtimes")
+	}
+	if HeartbeatRuntimeSupported("shell") || HeartbeatRuntimeSupported("bogus") {
+		t.Fatalf("shell and bogus must be rejected runtimes")
 	}
 }
 

@@ -39,7 +39,9 @@ func SaveHeartbeat(paths Paths, entry Heartbeat) error {
 	tableName := parser.Key{"agents", entry.Agent, "heartbeats", entry.Name}
 	section := findSection(doc, tableName)
 	// Field order mirrors the documented config example so a freshly written block
-	// reads top-to-bottom as enabled→repo→interval→jitter→action→prompt→concurrency.
+	// reads top-to-bottom as enabled→repo→interval→jitter→action→[runtime]→prompt→
+	// concurrency. The optional `runtime` override (#611) is written ONLY when set,
+	// so a heartbeat without an override stays byte-identical to the pre-#611 shape.
 	fields := []struct {
 		key   string
 		value ConfigScalar
@@ -49,9 +51,23 @@ func SaveHeartbeat(paths Paths, entry Heartbeat) error {
 		{"interval", StringScalar(entry.Interval)},
 		{"jitter", StringScalar(entry.Jitter)},
 		{"action", StringScalar(entry.Action)},
-		{"prompt", StringScalar(entry.Prompt)},
-		{"max_concurrent", IntScalar(entry.MaxConcurrent)},
 	}
+	if entry.Runtime != "" {
+		fields = append(fields, struct {
+			key   string
+			value ConfigScalar
+		}{"runtime", StringScalar(entry.Runtime)})
+	}
+	fields = append(fields,
+		struct {
+			key   string
+			value ConfigScalar
+		}{"prompt", StringScalar(entry.Prompt)},
+		struct {
+			key   string
+			value ConfigScalar
+		}{"max_concurrent", IntScalar(entry.MaxConcurrent)},
+	)
 	if section == nil {
 		section = &tomledit.Section{Heading: &parser.Heading{Name: tableName}}
 		for _, field := range fields {

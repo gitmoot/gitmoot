@@ -50,6 +50,59 @@ func TestSaveHeartbeatCreateRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSaveHeartbeatRuntimeOverride asserts a runtime override round-trips, and
+// that OMITTING it (the default) writes NO runtime key — keeping a heartbeat
+// without an override byte-identical to the pre-#611 shape.
+func TestSaveHeartbeatRuntimeOverride(t *testing.T) {
+	paths := newHeartbeatEditPaths(t, "")
+	// With a runtime override: the key is written and round-trips.
+	if err := SaveHeartbeat(paths, Heartbeat{
+		Agent: "builder", Name: "nightly", Enabled: true, Repo: "o/r",
+		Interval: "24h", Action: "implement", Runtime: "codex", Prompt: "tidy",
+	}); err != nil {
+		t.Fatalf("SaveHeartbeat with runtime: %v", err)
+	}
+	// Without a runtime override: the section must contain no `runtime =` line.
+	if err := SaveHeartbeat(paths, Heartbeat{
+		Agent: "planner", Name: "daily", Enabled: true, Repo: "o/r",
+		Interval: "24h", Action: "ask", Prompt: "status",
+	}); err != nil {
+		t.Fatalf("SaveHeartbeat without runtime: %v", err)
+	}
+	raw, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "runtime = \"codex\"") {
+		t.Fatalf("expected runtime override written, got:\n%s", text)
+	}
+	// The planner (no override) section must not carry a runtime key.
+	plannerIdx := strings.Index(text, "[agents.planner.heartbeats.daily]")
+	if plannerIdx < 0 {
+		t.Fatalf("planner heartbeat section missing:\n%s", text)
+	}
+	if strings.Contains(text[plannerIdx:], "runtime =") {
+		t.Fatalf("planner heartbeat (no override) must not write a runtime key:\n%s", text[plannerIdx:])
+	}
+	got, err := LoadHeartbeats(paths)
+	if err != nil {
+		t.Fatalf("LoadHeartbeats: %v", err)
+	}
+	var builder, planner Heartbeat
+	for _, hb := range got {
+		switch hb.Agent {
+		case "builder":
+			builder = hb
+		case "planner":
+			planner = hb
+		}
+	}
+	if builder.Runtime != "codex" || planner.Runtime != "" {
+		t.Fatalf("runtime round-trip mismatch: builder=%q planner=%q", builder.Runtime, planner.Runtime)
+	}
+}
+
 func TestSaveHeartbeatUpdateExisting(t *testing.T) {
 	paths := newHeartbeatEditPaths(t, `
 [agents.x.heartbeats.h]
@@ -258,10 +311,26 @@ prompt = "p"
 func TestSaveHeartbeatRejectsInvalid(t *testing.T) {
 	paths := newHeartbeatEditPaths(t, "")
 	err := SaveHeartbeat(paths, Heartbeat{
-		Agent: "x", Name: "h", Repo: "o/r", Interval: "1h", Action: "implement", Prompt: "p",
+		Agent: "x", Name: "h", Repo: "o/r", Interval: "1h", Action: "deploy", Prompt: "p",
 	})
 	if err == nil {
-		t.Fatalf("expected validation error for implement action")
+		t.Fatalf("expected validation error for unsupported action")
+	}
+	content, _ := os.ReadFile(paths.ConfigFile)
+	if strings.Contains(string(content), "heartbeats.h") {
+		t.Fatalf("invalid heartbeat was written to disk:\n%s", string(content))
+	}
+}
+
+// TestSaveHeartbeatRejectsBadRuntime asserts an unsupported runtime override never
+// reaches disk (#611).
+func TestSaveHeartbeatRejectsBadRuntime(t *testing.T) {
+	paths := newHeartbeatEditPaths(t, "")
+	err := SaveHeartbeat(paths, Heartbeat{
+		Agent: "x", Name: "h", Repo: "o/r", Interval: "1h", Action: "ask", Runtime: "shell", Prompt: "p",
+	})
+	if err == nil {
+		t.Fatalf("expected validation error for shell runtime override")
 	}
 	content, _ := os.ReadFile(paths.ConfigFile)
 	if strings.Contains(string(content), "heartbeats.h") {

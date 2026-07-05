@@ -719,6 +719,11 @@ func daemonHeartbeatLines(paths config.Paths, home string) []string {
 		}
 		line := fmt.Sprintf("  %s/%s: %s action=%s interval=%s repo=%s",
 			heartbeat.Agent, heartbeat.Name, enabled, heartbeat.Action, heartbeat.Interval, heartbeat.Repo)
+		// A runtime override (#611) is surfaced only when set, so heartbeats without
+		// one print byte-identically to the pre-#611 status line.
+		if heartbeat.Runtime != "" {
+			line += fmt.Sprintf(" runtime=%s", heartbeat.Runtime)
+		}
 		if state, ok := states[heartbeat.Agent+"/"+heartbeat.Name]; ok {
 			line += fmt.Sprintf(" last_run=%s next_due=%s last_status=%s",
 				heartbeatTimeForStatus(state.LastRunAt), heartbeatTimeForStatus(state.NextDueAt), firstNonEmpty(state.LastStatus, "-"))
@@ -2038,6 +2043,27 @@ func heartbeatAgentHasCapability(ctx context.Context, store *db.Store, agent, ca
 	return agentHasCapability(record.Capabilities, capability), nil
 }
 
+// heartbeatImplementPermitted reports whether the named agent may run an implement
+// heartbeat: it must hold the "implement" capability AND carry a write-granting
+// autonomy policy (workspace-write / danger-full-access). A missing agent is NOT
+// an error — it returns false so an implement heartbeat for an unknown/unstarted
+// agent is skipped (and next_due advanced) rather than aborting the scan. It
+// reuses the exact runtime predicate the direct-implement dispatch gate uses, so
+// the two can never drift. A real store error propagates (#611).
+func heartbeatImplementPermitted(ctx context.Context, store *db.Store, agent string) (bool, error) {
+	record, err := store.GetAgent(ctx, strings.TrimSpace(agent))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !agentHasCapability(record.Capabilities, "implement") {
+		return false, nil
+	}
+	return runtime.PolicyGrantsImplementWrite(record.AutonomyPolicy), nil
+}
+
 func heartbeatJobID(agent, name string, now time.Time) string {
 	return fmt.Sprintf("heartbeat-%s-%s-%x", agent, name, now.UTC().UnixNano())
 }
@@ -2145,6 +2171,29 @@ func runOneHeartbeat(ctx context.Context, store *db.Store, enqueue heartbeatEnqu
 			return store.UpsertHeartbeatState(ctx, state)
 		}
 	}
+	// Policy gate: an implement heartbeat enqueues a WRITE job. The worker only
+	// produces files for an agent that holds the implement capability AND carries a
+	// write-granting autonomy policy (workspace-write / danger-full-access); under
+	// auto/read-only the job runs and produces nothing (and is separately blocked by
+	// readOnlyImplementationBlocked at dispatch). Validate here — the enqueue path
+	// bypasses ensureLocalAgentAccess — so an implement heartbeat for a read-only
+	// agent NO-OPs rather than churning doomed jobs. Skip but ADVANCE next_due with a
+	// clear status so it self-recovers once a write policy is granted. This is the
+	// agent-aware half of the config-level action gate (#611).
+	if heartbeat.Action == "implement" {
+		permitted, err := heartbeatImplementPermitted(ctx, store, heartbeat.Agent)
+		if err != nil {
+			return err
+		}
+		if !permitted {
+			state.Agent = heartbeat.Agent
+			state.Name = heartbeat.Name
+			state.LastRunAt = now
+			state.NextDueAt = now.Add(interval + heartbeatJitter(jitter))
+			state.LastStatus = "policy_readonly"
+			return store.UpsertHeartbeatState(ctx, state)
+		}
+	}
 	// Overlap protection: a still-active heartbeat job (>= max_concurrent) means the
 	// previous run has not finished. Skip WITHOUT advancing so it is retried next
 	// tick (this is also the restart-safe dedup: a restart sees the active job).
@@ -2168,14 +2217,36 @@ func runOneHeartbeat(ctx context.Context, store *db.Store, enqueue heartbeatEnqu
 			return nil
 		}
 	}
+	// Per-heartbeat runtime override (#611): when the heartbeat names a runtime,
+	// resolve it through the same seam the per-job --runtime override uses (#531) —
+	// it validates the runtime and mints a FRESH session ref so the scheduled job
+	// neither resumes nor writes the agent's default-runtime session. An empty
+	// heartbeat runtime yields ("", "") and the job runs on the agent default,
+	// byte-identical to a pre-#611 heartbeat.
+	overrideRuntime, overrideRef, overrideErr := resolveJobRuntimeOverride(heartbeat.Runtime, "")
+	if overrideErr != nil {
+		// A bad runtime override is a config error; skip but ADVANCE next_due so a
+		// broken heartbeat does not hot-loop, and self-recovers once corrected.
+		state.Agent = heartbeat.Agent
+		state.Name = heartbeat.Name
+		state.LastRunAt = now
+		state.NextDueAt = now.Add(interval + heartbeatJitter(jitter))
+		state.LastStatus = "runtime_invalid"
+		if err := store.UpsertHeartbeatState(ctx, state); err != nil {
+			return err
+		}
+		return overrideErr
+	}
 	job, enqueueErr := enqueue(ctx, workflow.JobRequest{
-		ID:           heartbeatJobID(heartbeat.Agent, heartbeat.Name, now),
-		Agent:        heartbeat.Agent,
-		Action:       heartbeat.Action,
-		Repo:         heartbeat.Repo,
-		Sender:       "heartbeat",
-		Instructions: heartbeat.Prompt,
-		Fingerprint:  fingerprint,
+		ID:                 heartbeatJobID(heartbeat.Agent, heartbeat.Name, now),
+		Agent:              heartbeat.Agent,
+		Action:             heartbeat.Action,
+		Repo:               heartbeat.Repo,
+		Sender:             "heartbeat",
+		Instructions:       heartbeat.Prompt,
+		Fingerprint:        fingerprint,
+		RuntimeOverride:    overrideRuntime,
+		RuntimeOverrideRef: overrideRef,
 	})
 	// Advance exactly one interval whether or not the enqueue succeeded. Anchoring
 	// next_due to `now` (not the old due time) coalesces missed ticks into a single

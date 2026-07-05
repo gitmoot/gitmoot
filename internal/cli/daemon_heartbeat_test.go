@@ -250,6 +250,171 @@ func TestHeartbeatScanSkipsUnmanagedRepo(t *testing.T) {
 	}
 }
 
+const implementHeartbeatBody = `
+[agents.builder]
+runtime = "codex"
+role = "builder"
+capabilities = ["ask", "implement"]
+max_background = 2
+
+[agents.builder.heartbeats.nightly]
+enabled = true
+repo = "jerryfane/gitmoot"
+interval = "24h"
+action = "implement"
+prompt = "Fix the top lint error and open a small PR."
+max_concurrent = 1
+`
+
+// TestHeartbeatScanEnqueuesImplementJob proves a policy-gated implement heartbeat
+// enqueues an Action="implement" job when its agent holds the implement capability
+// AND a write-granting autonomy policy (#611).
+func TestHeartbeatScanEnqueuesImplementJob(t *testing.T) {
+	paths, store := heartbeatScanFixture(t, implementHeartbeatBody)
+	ctx := context.Background()
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name: "builder", Runtime: "codex", RepoScope: "jerryfane/gitmoot",
+		Capabilities: []string{"ask", "implement"}, AutonomyPolicy: "danger-full-access", RuntimeRef: "last",
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	enq, seen := recordingEnqueuer()
+	now := time.Date(2026, 6, 30, 9, 0, 0, 0, time.UTC)
+	if err := runHeartbeatScanOnce(ctx, paths, store, enq, now); err != nil {
+		t.Fatalf("runHeartbeatScanOnce: %v", err)
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("expected 1 implement job, got %d", len(*seen))
+	}
+	if req := (*seen)[0]; req.Action != "implement" || req.Agent != "builder" || req.Sender != "heartbeat" {
+		t.Fatalf("unexpected implement request shape: %+v", req)
+	}
+	state, found, err := store.GetHeartbeatState(ctx, "builder", "nightly")
+	if err != nil || !found || state.LastStatus != "enqueued" {
+		t.Fatalf("implement heartbeat state not advanced: found=%v err=%v state=%+v", found, err, state)
+	}
+}
+
+// TestHeartbeatScanImplementRejectsReadOnlyPolicy proves a due implement heartbeat
+// for an agent that holds the implement capability but carries a read-only-ish
+// policy (the default auto) NO-OPs: it never enqueues, and advances next_due with
+// last_status=policy_readonly so it self-recovers once a write policy is granted.
+func TestHeartbeatScanImplementRejectsReadOnlyPolicy(t *testing.T) {
+	paths, store := heartbeatScanFixture(t, implementHeartbeatBody)
+	ctx := context.Background()
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name: "builder", Runtime: "codex", RepoScope: "jerryfane/gitmoot",
+		Capabilities: []string{"ask", "implement"}, AutonomyPolicy: "auto", RuntimeRef: "last",
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	enq, seen := recordingEnqueuer()
+	now := time.Date(2026, 6, 30, 9, 0, 0, 0, time.UTC)
+	if err := runHeartbeatScanOnce(ctx, paths, store, enq, now); err != nil {
+		t.Fatalf("runHeartbeatScanOnce: %v", err)
+	}
+	if len(*seen) != 0 {
+		t.Fatalf("implement heartbeat under read-only policy enqueued %d jobs", len(*seen))
+	}
+	state, found, err := store.GetHeartbeatState(ctx, "builder", "nightly")
+	if err != nil || !found {
+		t.Fatalf("expected state row, found=%v err=%v", found, err)
+	}
+	if state.LastStatus != "policy_readonly" {
+		t.Fatalf("last_status = %q, want policy_readonly", state.LastStatus)
+	}
+	if !state.NextDueAt.Equal(now.Add(24 * time.Hour)) {
+		t.Fatalf("policy skip must advance next_due (no wedge): %+v", state)
+	}
+}
+
+// TestHeartbeatScanImplementRejectsMissingCapability proves an implement heartbeat
+// for a write-policy agent that nonetheless LACKS the implement capability also
+// no-ops with last_status=policy_readonly.
+func TestHeartbeatScanImplementRejectsMissingCapability(t *testing.T) {
+	paths, store := heartbeatScanFixture(t, implementHeartbeatBody)
+	ctx := context.Background()
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name: "builder", Runtime: "codex", RepoScope: "jerryfane/gitmoot",
+		Capabilities: []string{"ask"}, AutonomyPolicy: "danger-full-access", RuntimeRef: "last",
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	enq, seen := recordingEnqueuer()
+	now := time.Date(2026, 6, 30, 9, 0, 0, 0, time.UTC)
+	if err := runHeartbeatScanOnce(ctx, paths, store, enq, now); err != nil {
+		t.Fatalf("runHeartbeatScanOnce: %v", err)
+	}
+	if len(*seen) != 0 {
+		t.Fatalf("implement heartbeat without capability enqueued %d jobs", len(*seen))
+	}
+	state, _, err := store.GetHeartbeatState(ctx, "builder", "nightly")
+	if err != nil {
+		t.Fatalf("GetHeartbeatState: %v", err)
+	}
+	if state.LastStatus != "policy_readonly" {
+		t.Fatalf("last_status = %q, want policy_readonly", state.LastStatus)
+	}
+}
+
+const runtimeOverrideHeartbeatBody = `
+[agents.repo-maintainer]
+runtime = "codex"
+role = "repo-maintainer"
+max_background = 1
+
+[agents.repo-maintainer.heartbeats.daily]
+enabled = true
+repo = "jerryfane/gitmoot"
+interval = "24h"
+action = "ask"
+runtime = "claude"
+prompt = "Review open issues and PRs."
+max_concurrent = 1
+`
+
+// TestHeartbeatScanRuntimeOverride proves a per-heartbeat runtime override (#611)
+// flows onto the enqueued job as a RuntimeOverride plus a freshly-minted override
+// ref, so the scheduled job runs on the named runtime on its own session.
+func TestHeartbeatScanRuntimeOverride(t *testing.T) {
+	paths, store := heartbeatScanFixture(t, runtimeOverrideHeartbeatBody)
+	ctx := context.Background()
+	enq, seen := recordingEnqueuer()
+	now := time.Date(2026, 6, 30, 9, 0, 0, 0, time.UTC)
+	if err := runHeartbeatScanOnce(ctx, paths, store, enq, now); err != nil {
+		t.Fatalf("runHeartbeatScanOnce: %v", err)
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("expected 1 job, got %d", len(*seen))
+	}
+	req := (*seen)[0]
+	if req.RuntimeOverride != "claude" {
+		t.Fatalf("expected RuntimeOverride=claude, got %q", req.RuntimeOverride)
+	}
+	if req.RuntimeOverrideRef == "" {
+		t.Fatalf("expected a minted RuntimeOverrideRef for the override, got empty")
+	}
+}
+
+// TestHeartbeatScanNoRuntimeOverrideByDefault is the byte-identical-default guard:
+// a heartbeat WITHOUT a runtime override enqueues a job carrying no override, so
+// it runs on the agent default exactly as before #611.
+func TestHeartbeatScanNoRuntimeOverrideByDefault(t *testing.T) {
+	paths, store := heartbeatScanFixture(t, enabledHeartbeatBody)
+	ctx := context.Background()
+	enq, seen := recordingEnqueuer()
+	now := time.Date(2026, 6, 30, 9, 0, 0, 0, time.UTC)
+	if err := runHeartbeatScanOnce(ctx, paths, store, enq, now); err != nil {
+		t.Fatalf("runHeartbeatScanOnce: %v", err)
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("expected 1 job, got %d", len(*seen))
+	}
+	if req := (*seen)[0]; req.RuntimeOverride != "" || req.RuntimeOverrideRef != "" {
+		t.Fatalf("default heartbeat must carry no runtime override: %+v", req)
+	}
+}
+
 const reviewHeartbeatBody = `
 [agents.reviewer]
 runtime = "codex"
