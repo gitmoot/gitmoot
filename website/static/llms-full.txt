@@ -360,7 +360,7 @@ Back up and share templates via a GitHub repo (#476):
 
 ```sh
 gitmoot agent template remote set owner/my-templates   # default remote ([template_remote]; ref=main, path=templates/)
-gitmoot agent template publish --all                   # commit templates to the remote (--create makes the repo)
+gitmoot agent template publish --all                   # commit custom templates to the remote (built-ins skipped; --create makes a PRIVATE repo)
 gitmoot agent template pull frontend-reviewer          # install/refresh from the remote
 gitmoot agent template add frontend-reviewer --from-repo owner/my-templates
 ```
@@ -8518,9 +8518,10 @@ gitmoot agent template remote show
 ```
 
 `export` writes template `.md` files to a local directory; `publish` commits
-them to a GitHub repo (`--create` creates a missing repo); `pull` installs or
-refreshes templates from that repo; `add --from-repo` installs a single
-template file directly from a repo. `remote set` stores a default remote in the
+them to a GitHub repo (`--create` creates a missing **private** repo); `pull`
+installs or refreshes templates from that repo; `add --from-repo` installs a
+single template file directly from a repo. `--all` on `export`/`publish` covers
+only your custom templates — built-ins are skipped. `remote set` stores a default remote in the
 `[template_remote]` config section (`repo`; `ref` defaults to `main`; `path`
 defaults to `templates`) so publish/pull/add can omit `--repo`; with no remote
 configured, those commands require an explicit `--repo`. **Caution: templates
@@ -8897,6 +8898,27 @@ job prompt as a reference-only block. It is **off by default** and, in the
 current phase, runs in **observation mode**: the injectable ("confirmed") tier
 is populated only by Gitmoot's own deterministic mechanical facts, while
 agent-returned learnings are logged for measurement but never injected.
+
+Gitmoot writes a mechanical fact only when a terminal job carries a genuine,
+bounded signal — never one fact per job (#645):
+
+- **Fix-round facts** — when a job reached its decision only after one or more
+  corrective verify/retry rounds ("recent implement jobs here needed up to N fix
+  rounds"), keyed by decision.
+- **Terminal-outcome facts** — when an *ordinary* job (the shape `agent
+  ask`/`agent run`/`review`/`implement` enqueue, no verify/retry loop) ends on the
+  **notable**, non-anomalous decision `changes_requested` ("some review jobs here
+  concluded with changes requested") — keyed by `(action, outcome)`. A routine
+  first-try success (`approved`/`implemented`) writes nothing, and the *anomalous*
+  one-off terminals (`failed`, `blocked`) are **not** auto-promoted: without a
+  recurrence threshold, a single flaky failure must not become a durable, injected
+  repo fact.
+
+Facts are keyed by low-cardinality **closed** categories, never free-form
+content: the outcome is a validated decision value and the action is collapsed to
+a small fixed allowlist (a delegation's free-form action buckets to a generic
+token). So repeated jobs UPSERT the same row rather than growing the pool, and
+every fact passes the same deterministic write filters as agent learnings.
 
 Enrollment is per agent, plus optional global knobs:
 

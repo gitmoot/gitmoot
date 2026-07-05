@@ -350,7 +350,7 @@ Back up and share templates via a GitHub repo (#476):
 
 ```sh
 gitmoot agent template remote set owner/my-templates   # default remote ([template_remote]; ref=main, path=templates/)
-gitmoot agent template publish --all                   # commit templates to the remote (--create makes the repo)
+gitmoot agent template publish --all                   # commit custom templates to the remote (built-ins skipped; --create makes a PRIVATE repo)
 gitmoot agent template pull frontend-reviewer          # install/refresh from the remote
 gitmoot agent template add frontend-reviewer --from-repo owner/my-templates
 ```

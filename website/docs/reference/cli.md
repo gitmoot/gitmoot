@@ -653,9 +653,10 @@ gitmoot agent template remote show
 ```
 
 `export` writes template `.md` files to a local directory; `publish` commits
-them to a GitHub repo (`--create` creates a missing repo); `pull` installs or
-refreshes templates from that repo; `add --from-repo` installs a single
-template file directly from a repo. `remote set` stores a default remote in the
+them to a GitHub repo (`--create` creates a missing **private** repo); `pull`
+installs or refreshes templates from that repo; `add --from-repo` installs a
+single template file directly from a repo. `--all` on `export`/`publish` covers
+only your custom templates — built-ins are skipped. `remote set` stores a default remote in the
 `[template_remote]` config section (`repo`; `ref` defaults to `main`; `path`
 defaults to `templates`) so publish/pull/add can omit `--repo`; with no remote
 configured, those commands require an explicit `--repo`. **Caution: templates
