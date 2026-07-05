@@ -3221,9 +3221,9 @@ default_repair_timeout = ""
   continuation (synthesize what completed, then stop). Token capture is
   **best-effort per runtime**: Claude reports usage via its `--output-format json`
   envelope, Kimi reports it when its stream emits a `usage` object, and Codex reads
-  usage from its `codex exec --json` JSONL stream for fresh sessions only
-  (resumed sessions contribute `0` — codex reports session-cumulative usage
-  there; older CLIs that predate the flag also fall back to `0`). Treat it as a coarse runaway-cost backstop, not a
+  usage from its `codex exec --json` JSONL stream — a resumed session's usage is
+  session-cumulative, so it records only the per-session delta (#661); older CLIs
+  that predate the flag fall back to `0`. Treat it as a coarse runaway-cost backstop, not a
   precise spend limit; the budget is in raw tokens. Leaving it at `0` is
   byte-identical to before the knob existed.
 - `max_delegation_cost_usd` (default `0` = unlimited/off) is the **dollar-cost**
@@ -7534,6 +7534,15 @@ Use `gitmoot agent template draft <id>` for a blank scaffold,
 `gitmoot agent template export/publish/pull/remote set` commands — see CLI.md
 § Agent Templates.
 
+For agent persistent memory, phrases like "give this agent persistent memory",
+"why does my agent keep forgetting things about this repo", or "what has this
+agent learned" map to Gitmoot's off-by-default agent memory feature (#626): an
+enrolled agent gets a repo-filtered pool of durable facts injected into its job
+prompt as a read-only "Prior learnings" reference block (never instructions).
+Enrollment is per agent via `[agents.<name>].memory = true` plus an optional
+`[memory]` section; inspect the store read-only with `gitmoot memory list`. See
+CLI.md § Agent Memory and the "Agent Persistent Memory" concepts page for depth.
+
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
 same Codex, Claude, or Kimi session, and branch locks protect implementation
@@ -10100,8 +10109,8 @@ cannot recurse or fan out forever:
   already used at least the budget is refused with a `delegation_cost_exceeded`
   event. Token capture is **best-effort per runtime** (Claude reports usage; Kimi
   reports it if its stream emits it; Codex reads usage from its `codex exec --json`
-  JSONL stream for fresh sessions only — resumed sessions contribute `0` because
-  codex reports session-cumulative usage there — falling back to `0` on an older CLI), so the budget can under-count
+  JSONL stream — a resumed session's usage is session-cumulative, so it records only
+  the per-session delta (#661) — falling back to `0` on an older CLI), so the budget can under-count
   but never over-counts. Leaving the knob at `0` skips the check entirely.
 - Per-root **dollar-cost** budget `[orchestrate].max_delegation_cost_usd`,
   **off by default** (`0` = unlimited): the cost analogue of the token budget
@@ -10618,7 +10627,7 @@ a job whose runtime reports no usage contributes `0` to the sum, so the budget
 | --- | --- | --- |
 | **Claude Code** | Yes | Parsed from the `usage.{input,output}_tokens` of the `--output-format json` envelope on delivery. |
 | **Kimi Code** | Best-effort | Captured if the `--output-format stream-json` stream emits a `usage` object; otherwise `0`. |
-| **Codex** | Fresh sessions only | Read from the last `turn.completed` usage of the `codex exec --json` JSONL stream (#658) for fresh sessions (ephemeral delegation workers, per-job `--runtime` overrides). Resumed sessions contribute `0`: codex reports session-cumulative usage there, which would attribute the whole session history to each job. Older CLIs that predate `--json` fall back to plain text and contribute `0`. |
+| **Codex** | Yes | Read from the last `turn.completed` usage of the `codex exec --json` JSONL stream (#658). Fresh sessions (ephemeral delegation workers, per-job `--runtime` overrides) and single-use workers report a per-job count directly. On a resumed session codex's usage is session-cumulative, so gitmoot records only the per-session delta — `max(0, cumulative_now − last_seen)`, tracked in the `runtime_session_usage` table (#661); a session reset that rolls the counter backwards clamps the delta to `0` and resyncs. Older CLIs that predate `--json` fall back to plain text and contribute `0`. |
 
 Capture is best-effort, so treat the budget as a coarse runaway-cost backstop
 rather than a precise spend limit — a runtime that reports nothing (or an older

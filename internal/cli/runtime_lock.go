@@ -67,7 +67,12 @@ func acquireRuntimeSessionLockWithKey(ctx context.Context, store *db.Store, jobI
 		OwnerToken:    ownerToken,
 		OwnerPID:      int64(os.Getpid()),
 		OwnerHostname: strings.TrimSpace(hostname),
-		ExpiresAt:     now.UTC().Add(ttl).Format(time.RFC3339Nano),
+		// Stamp the acquiring host's boot id (#651) so cross-boot recovery can
+		// reclaim this runtime-session lock immediately after a reboot instead of
+		// waiting out its (reboot-surviving) lease. "" off Linux => legacy lease-only
+		// behavior, unchanged.
+		OwnerBootID: db.BootID(),
+		ExpiresAt:   now.UTC().Add(ttl).Format(time.RFC3339Nano),
 	}, now)
 	if err != nil || !acquired {
 		return func(context.Context) error { return nil }, acquired, key, "", err

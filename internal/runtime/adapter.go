@@ -74,14 +74,24 @@ type Result struct {
 	// default to 0. Per-runtime status today: claude reports usage via its
 	// --output-format json envelope; kimi-code 0.19.2 emits no usage event so it
 	// contributes 0; codex Deliver reads the last turn.completed usage from its
-	// `exec --json` JSONL output (#658) for single-job sessions only (fresh
-	// refs and SingleUseSession ephemeral/temp workers) — sessions shared
-	// across jobs contribute 0 because codex reports session-cumulative usage
-	// there (see codexDeliverResult) — falling back to 0 on an older CLI that
-	// predates --json. A 0 here means "not captured", and the per-root delegation token
-	// budget simply under-counts that job rather than failing.
+	// `exec --json` JSONL output (#658), falling back to 0 on an older CLI that
+	// predates --json. For codex these counts are SESSION-CUMULATIVE on a resumed
+	// thread — the session's whole running total, not this job's usage — so the
+	// caller must delta them (see CumulativeUsage and codexDeliverResult); fresh
+	// and single-use sessions already report a per-job count. A 0 here means "not
+	// captured", and the per-root delegation token budget simply under-counts that
+	// job rather than failing.
 	InputTokens  int
 	OutputTokens int
+	// CumulativeUsage reports that InputTokens/OutputTokens are runtime-session
+	// cumulative — the session's whole running total, not this job's usage (codex
+	// resumed threads report turn.completed usage this way, #661). When true the
+	// caller must subtract the last-seen counters for the runtime session (keyed by
+	// runtime+ref) and record only the delta. False means the counts are already
+	// per-job — fresh sessions and single-use ephemeral/temp workers, where the
+	// session's cumulative == this job's usage — and are recorded verbatim (#664).
+	// Only codex sets this today; other adapters leave it false.
+	CumulativeUsage bool
 	// RefreshedRuntimeRef is non-empty only when the adapter self-healed a dead
 	// pre-execution session and re-pinned the agent to a fresh runtime reference
 	// (#443). The mailbox persists it through the Store so subsequent jobs use the
@@ -423,27 +433,29 @@ func (a CodexAdapter) runCodex(ctx context.Context, agent Agent, prompt, model s
 // an unexpected shape) is returned verbatim as Raw with 0 usage, so a delivery is
 // never lost because usage parsing changed.
 //
-// Usage is reported ONLY for sessions that belong to a single job: fresh refs
-// (per-job --runtime overrides) and single-use sessions (ephemeral delegation
-// workers and per-job temp workers — the #338 budget's primary target). On
-// sessions SHARED across jobs codex's turn.completed usage is SESSION-CUMULATIVE,
-// not per-turn:
-// probed live on codex-cli 0.142.4, three one-word turns on one thread reported
-// input 16504 -> 85681 -> 103779 and output 20 -> 40 -> 45 (monotonically
+// codex's turn.completed usage is SESSION-CUMULATIVE on a resumed thread, not
+// per-turn: probed live on codex-cli 0.142.4, three one-word turns on one thread
+// reported input 16504 -> 85681 -> 103779 and output 20 -> 40 -> 45 (monotonically
 // accumulating), and a single resumed ask on a long-lived agent reported 22.4M
-// input tokens — orders of magnitude beyond any single turn. Attributing the
-// whole session history to each job would corrupt per-root budgets and usage
-// charts, so resumed deliveries contribute 0 until per-session delta tracking
-// exists (follow-up issue).
+// input tokens — orders of magnitude beyond any single turn. So the parsed counts
+// are always returned, with CumulativeUsage set to !freshSession: a resumed
+// (shared) session flags them cumulative so the caller records only the
+// per-session delta (#661), while a fresh ref or single-use session — its
+// cumulative == this job's cost, the #338 budget's primary target — flags them
+// per-job so they are recorded verbatim (#664). The fail-open branch (no
+// agent_message event) returns 0 usage with CumulativeUsage=false, unchanged.
 func codexDeliverResult(stdout string, freshSession bool) Result {
 	raw, inputTokens, outputTokens, ok := parseCodexJSONResult(stdout)
 	if !ok {
 		return Result{Raw: stdout, Summary: strings.TrimSpace(stdout)}
 	}
-	if !freshSession {
-		inputTokens, outputTokens = 0, 0
+	return Result{
+		Raw:             raw,
+		Summary:         strings.TrimSpace(raw),
+		InputTokens:     inputTokens,
+		OutputTokens:    outputTokens,
+		CumulativeUsage: !freshSession,
 	}
-	return Result{Raw: raw, Summary: strings.TrimSpace(raw), InputTokens: inputTokens, OutputTokens: outputTokens}
 }
 
 func parseCodexThreadID(output string) string {

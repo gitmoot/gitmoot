@@ -5049,8 +5049,11 @@ func acquireSkillOptTrainOptimizerLock(ctx context.Context, store *db.Store, ses
 		OwnerToken:    token,
 		OwnerPID:      int64(os.Getpid()),
 		OwnerHostname: hostname,
-		CommandHash:   skillOptTrainOptimizerRequestHash(request),
-		ExpiresAt:     now.Add(leaseTTL).Format(time.RFC3339Nano),
+		// Boot id (#651) so a same-host owner from a prior boot is provably dead
+		// without trusting a possibly-reused pid.
+		OwnerBootID: db.BootID(),
+		CommandHash: skillOptTrainOptimizerRequestHash(request),
+		ExpiresAt:   now.Add(leaseTTL).Format(time.RFC3339Nano),
 	}
 	lockMetadata.ResourceKey = newKey
 	acquired, err := store.AcquireResourceLock(ctx, lockMetadata, now)
@@ -5316,7 +5319,10 @@ func acquireSkillOptTrainGenerationLock(ctx context.Context, store *db.Store, se
 		OwnerToken:    token,
 		OwnerPID:      int64(os.Getpid()),
 		OwnerHostname: hostname,
-		ExpiresAt:     now.Add(ttl).Format(time.RFC3339Nano),
+		// Boot id (#651): recover --generation treats a same-host owner from a
+		// different boot as definitively dead (PID-reuse-immune, no kill(2)).
+		OwnerBootID: db.BootID(),
+		ExpiresAt:   now.Add(ttl).Format(time.RFC3339Nano),
 	}, now)
 	if err != nil {
 		return noopAgentReservationRelease, skillOptTrainNoopExtend, false, err
@@ -9031,7 +9037,6 @@ func recoverSkillOptTrainGenerationLock(ctx context.Context, paths config.Paths,
 		result.LockOwnerJobID = strings.TrimSpace(lock.OwnerJobID)
 		result.LockOwnerPID = lock.OwnerPID
 		result.LockOwnerHostname = strings.TrimSpace(lock.OwnerHostname)
-		ownerLive := skillOptOwnerPIDLive(lock.OwnerPID)
 		host := strings.TrimSpace(lock.OwnerHostname)
 		// Treat an empty/unrecorded owner_hostname as same-host-eligible: skillopt
 		// train is a local-first workflow (one local SQLite home), and an empty
@@ -9041,6 +9046,20 @@ func recoverSkillOptTrainGenerationLock(ctx context.Context, paths config.Paths,
 		// PID-dead gate still applies: a LIVE owner is always refused (never steal a
 		// live owner); only a DEAD PID with an empty/this-host hostname is reclaimable.
 		sameHost := host == "" || strings.EqualFold(host, strings.TrimSpace(thisHost))
+		// Boot-aware liveness (#651): on the SAME host, an owner boot id that differs
+		// from the current boot proves the host rebooted since the lock was taken, so
+		// the owning process is dead — and its pid may since have been reused, so the
+		// bare kill(2) probe (skillOptOwnerPIDLive) could wrongly report a reused pid
+		// as the still-live owner. Short-circuit to "dead" BEFORE the syscall in that
+		// case. The boot check is scoped to same-host: a different host has an
+		// unrelated boot id, so cross-host still relies on the TTL rule below.
+		ownerBoot, bootErr := store.ResourceLockOwnerBootID(ctx, lockKey)
+		if bootErr != nil {
+			return result, bootErr
+		}
+		currentBoot := db.BootID()
+		bootProvesDead := sameHost && ownerBoot != "" && currentBoot != "" && ownerBoot != currentBoot
+		ownerLive := !bootProvesDead && skillOptOwnerPIDLive(lock.OwnerPID)
 		expired := !skillOptResourceLockActive(lock, now)
 		switch {
 		case ownerLive:

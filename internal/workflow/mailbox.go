@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/agenttemplate"
@@ -657,13 +658,29 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		Model:       payload.Model,
 	})
 	// Record best-effort runtime token usage so the per-root delegation token
-	// budget (#338 Part B) can sum a tree's cost. Only persist when the runtime
-	// actually reported usage (a positive count) so runtimes that report nothing
-	// (e.g. the shell runtime) leave the columns at their 0 default rather than
-	// taking a no-op write. Usage accounting must never fail a delivery, so a
-	// write error is swallowed.
-	if err == nil && (result.InputTokens > 0 || result.OutputTokens > 0) {
-		_ = m.Store.UpdateJobUsage(ctx, job.ID, result.InputTokens, result.OutputTokens)
+	// budget (#338 Part B) can sum a tree's cost. Usage accounting must never fail
+	// a delivery, so every write error here is swallowed.
+	if err == nil {
+		inTok, outTok := result.InputTokens, result.OutputTokens
+		// codex reports SESSION-CUMULATIVE counts on a resumed thread (#661): the
+		// session's whole running total, not this job's usage. When the adapter flags
+		// them cumulative, convert to this job's per-session delta keyed by the
+		// runtime session (runtime+ref) before persisting. Only a concrete, stable
+		// ref names a session we can key on; an empty or "last" ref does not, so —
+		// as today — it contributes 0 rather than being mis-attributed. A false flag
+		// (fresh/single-use, and every non-codex runtime) skips the delta table
+		// entirely and records the count verbatim (#664).
+		if result.CumulativeUsage && agent.RuntimeRef != "" && agent.RuntimeRef != runtime.LastRef {
+			inTok, outTok, _ = m.Store.RecordRuntimeSessionUsageDelta(ctx, agent.Runtime+":"+agent.RuntimeRef, result.InputTokens, result.OutputTokens)
+		} else if result.CumulativeUsage {
+			inTok, outTok = 0, 0
+		}
+		// Only persist when a positive count remains so runtimes that report nothing
+		// (e.g. the shell runtime) or a delta that resolved to 0 leave the columns at
+		// their 0 default rather than taking a no-op write.
+		if inTok > 0 || outTok > 0 {
+			_ = m.Store.UpdateJobUsage(ctx, job.ID, inTok, outTok)
+		}
 	}
 	if strings.TrimSpace(result.Summary) != "" {
 		return result.Summary, result.RefreshedRuntimeRef, err
@@ -787,11 +804,16 @@ func (m Mailbox) claim(ctx context.Context, job db.Job) error {
 	if job.State != string(JobQueued) {
 		return fmt.Errorf("job %q is %s, not queued", job.ID, job.State)
 	}
-	claimed, err := m.Store.TransitionJobStateWithEvent(ctx, job.ID, string(JobQueued), string(JobRunning), db.JobEvent{
+	// Stamp the claiming process's identity in the SAME atomic queued->running
+	// UPDATE (#651): runner_boot_id (db.BootID) is the cross-boot liveness signal
+	// that lets the daemon recover this job immediately after a reboot, and
+	// runner_pid is recorded for observability only. Off Linux BootID() is "", so
+	// the row is identity-less and only the existing age/lease recovery applies.
+	claimed, err := m.Store.ClaimRunningJob(ctx, job.ID, string(JobQueued), string(JobRunning), db.JobEvent{
 		JobID:   job.ID,
 		Kind:    string(JobRunning),
 		Message: "job started",
-	})
+	}, os.Getpid(), db.BootID())
 	if err != nil {
 		return err
 	}

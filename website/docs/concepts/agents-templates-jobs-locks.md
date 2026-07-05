@@ -149,3 +149,25 @@ mutate branches when Gitmoot assigned the job and the branch lock is held.
 The daemon defaults to `--workers 1`. Raise workers only when jobs use
 independent runtime sessions or managed agent types with `max_background`
 greater than one.
+
+### Recovery after a crash or reboot
+
+When a running job's worker dies, the daemon recovers it so work is never
+stranded. Recovery is **boot-aware**:
+
+- **Same boot** (a daemon restart or crash where the host stayed up): a running
+  job that still holds a runtime session lock whose lease has not elapsed is left
+  running — its real timeout has not passed, and its reparented worker may still
+  be making progress. Only once the lease expires (or the coarse
+  `GITMOOT_STALE_RUNNING_AFTER` backstop trips for a job holding no lease) is it
+  requeued. This is what stops a long job (for example a multi-hour delegation)
+  from being requeued and double-run.
+- **After a reboot**: the machine's kernel boot id changes, which is a definitive
+  "every process from the previous boot is dead" signal. On its next startup and
+  every tick the daemon immediately requeues any job claimed on a previous boot
+  and reclaims its stranded runtime session lock — regardless of how long the
+  lease still had to run — so a rebooted host resumes work at once instead of
+  waiting the lease or the stale-running window out.
+
+On platforms without a kernel boot id (non-Linux), the boot-aware step is a no-op
+and recovery falls back to the lease/age behavior above.

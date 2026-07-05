@@ -137,6 +137,16 @@ CREATE TABLE job_events (
 	message TEXT NOT NULL,
 	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+-- A minimal resource_locks table (created by an earlier, here pre-seeded-as-
+-- applied migration) so the #651 owner_boot_id ALTER ADD COLUMN that runs in this
+-- pass has its table.
+CREATE TABLE resource_locks (
+	resource_key TEXT PRIMARY KEY,
+	owner_job_id TEXT NOT NULL,
+	acquired_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL,
+	expires_at TEXT NOT NULL
+);
 CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
 INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'succeeded', '{}');
 `); err != nil {

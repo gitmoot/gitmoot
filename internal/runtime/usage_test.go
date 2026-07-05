@@ -169,6 +169,11 @@ func TestCodexDeliverCapturesUsage(t *testing.T) {
 	if result.InputTokens != 16504 || result.OutputTokens != 20 {
 		t.Fatalf("codex usage = (%d, %d), want (16504, 20)", result.InputTokens, result.OutputTokens)
 	}
+	// A fresh session's cumulative == this job's usage, so it is per-job, not
+	// cumulative: the mailbox records it verbatim and must NOT delta it (#664).
+	if result.CumulativeUsage {
+		t.Fatal("fresh session CumulativeUsage = true, want false")
+	}
 	runner.want(t, 0, "codex", "exec", "--json", "--", "implement")
 }
 
@@ -189,17 +194,24 @@ func TestCodexDeliverSingleUseSessionCapturesUsage(t *testing.T) {
 	if result.InputTokens != 16504 || result.OutputTokens != 20 {
 		t.Fatalf("single-use codex usage = (%d, %d), want (16504, 20)", result.InputTokens, result.OutputTokens)
 	}
+	// A single-use session is disposed after one job, so its cumulative == this
+	// job's cost: per-job, not cumulative. The mailbox records it verbatim and must
+	// NOT route it through the delta table (#664 non-regression guard).
+	if result.CumulativeUsage {
+		t.Fatal("single-use session CumulativeUsage = true, want false")
+	}
 	runner.want(t, 0, "codex", "exec", "--json", "resume", "--last", "--", "implement")
 }
 
-// TestCodexDeliverResumeReportsZeroUsage pins the resumed-session exclusion:
-// codex's turn.completed usage on a resumed thread is SESSION-CUMULATIVE, not
-// per-turn (probed live on codex-cli 0.142.4: three one-word turns reported
+// TestCodexDeliverResumeReportsCumulativeUsage pins the resumed-session capture
+// (#661): codex's turn.completed usage on a resumed thread is SESSION-CUMULATIVE,
+// not per-turn (probed live on codex-cli 0.142.4: three one-word turns reported
 // input 16504 -> 85681 -> 103779, and one resumed ask on a long-lived agent
-// reported 22.4M input tokens). Attributing the whole session history to each
-// job would corrupt per-root budgets, so a resumed delivery keeps the parsed
-// text but contributes 0 usage until per-session delta tracking exists.
-func TestCodexDeliverResumeReportsZeroUsage(t *testing.T) {
+// reported 22.4M input tokens). Rather than dropping it to 0, a resumed delivery
+// now surfaces the raw cumulative counts AND flags them CumulativeUsage=true, so
+// the mailbox subtracts the last-seen per-session baseline and records only this
+// job's delta. This repurposes the old exclusion test.
+func TestCodexDeliverResumeReportsCumulativeUsage(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: codexUsageTranscript}}}
 	adapter := CodexAdapter{Runner: runner}
 	agent := Agent{Name: "impl", Role: "implementer", Runtime: CodexRuntime, RuntimeRef: LastRef, RepoScope: "jerryfane/gitmoot"}
@@ -211,11 +223,36 @@ func TestCodexDeliverResumeReportsZeroUsage(t *testing.T) {
 	if result.Raw != "hi" || result.Summary != "hi" {
 		t.Fatalf("raw/summary = (%q, %q), want (\"hi\", \"hi\")", result.Raw, result.Summary)
 	}
-	if result.InputTokens != 0 || result.OutputTokens != 0 {
-		t.Fatalf("resumed codex usage = (%d, %d), want (0, 0) — session-cumulative upstream", result.InputTokens, result.OutputTokens)
+	if result.InputTokens != 16504 || result.OutputTokens != 20 {
+		t.Fatalf("resumed codex usage = (%d, %d), want (16504, 20) — raw cumulative surfaced for delta tracking", result.InputTokens, result.OutputTokens)
+	}
+	if !result.CumulativeUsage {
+		t.Fatal("resumed session CumulativeUsage = false, want true — caller must delta the cumulative counts")
 	}
 	// --json is an `exec` option and sits before the resume subcommand.
 	runner.want(t, 0, "codex", "exec", "--json", "resume", "--last", "--", "implement")
+}
+
+// TestCodexDeliverResultFlagMatrix unit-tests the codexDeliverResult seam directly
+// across the flag matrix: a fresh (single-job) session reports its parsed counts
+// per-job (CumulativeUsage=false), a resumed session reports the same parsed counts
+// but flagged cumulative (CumulativeUsage=true), and non-JSONL stdout fails open to
+// 0 usage with CumulativeUsage=false.
+func TestCodexDeliverResultFlagMatrix(t *testing.T) {
+	fresh := codexDeliverResult(codexUsageTranscript, true)
+	if fresh.InputTokens != 16504 || fresh.OutputTokens != 20 || fresh.CumulativeUsage {
+		t.Fatalf("fresh = (%d, %d, cum=%v), want (16504, 20, false)", fresh.InputTokens, fresh.OutputTokens, fresh.CumulativeUsage)
+	}
+	resumed := codexDeliverResult(codexUsageTranscript, false)
+	if resumed.InputTokens != 16504 || resumed.OutputTokens != 20 || !resumed.CumulativeUsage {
+		t.Fatalf("resumed = (%d, %d, cum=%v), want (16504, 20, true)", resumed.InputTokens, resumed.OutputTokens, resumed.CumulativeUsage)
+	}
+	// Fail-open: non-JSONL stdout keeps the verbatim text, 0 usage, never flagged
+	// cumulative (so the mailbox never routes a fail-open delivery to the delta table).
+	failOpen := codexDeliverResult("not json at all", false)
+	if failOpen.Raw != "not json at all" || failOpen.InputTokens != 0 || failOpen.OutputTokens != 0 || failOpen.CumulativeUsage {
+		t.Fatalf("fail-open = (%q, %d, %d, cum=%v), want (\"not json at all\", 0, 0, false)", failOpen.Raw, failOpen.InputTokens, failOpen.OutputTokens, failOpen.CumulativeUsage)
+	}
 }
 
 // TestCodexDeliverJoinsAgentMessages pins that a turn emitting several

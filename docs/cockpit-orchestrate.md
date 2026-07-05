@@ -113,9 +113,9 @@ default_repair_timeout = ""
   continuation (synthesize what completed, then stop). Token capture is
   **best-effort per runtime**: Claude reports usage via its `--output-format json`
   envelope, Kimi reports it when its stream emits a `usage` object, and Codex reads
-  usage from its `codex exec --json` JSONL stream for fresh sessions only
-  (resumed sessions contribute `0` — codex reports session-cumulative usage
-  there; older CLIs that predate the flag also fall back to `0`). Treat it as a coarse runaway-cost backstop, not a
+  usage from its `codex exec --json` JSONL stream — a resumed session's usage is
+  session-cumulative, so it records only the per-session delta (#661); older CLIs
+  that predate the flag fall back to `0`. Treat it as a coarse runaway-cost backstop, not a
   precise spend limit; the budget is in raw tokens. Leaving it at `0` is
   byte-identical to before the knob existed.
 - `max_delegation_cost_usd` (default `0` = unlimited/off) is the **dollar-cost**

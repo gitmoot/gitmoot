@@ -133,7 +133,10 @@ cannot recurse or fan out forever:
   not delegate further.
 - Per-root job budget `MaxDelegationTotalJobs = 64`: the whole delegation tree
   under one root (all children and continuations sharing that root) is capped.
-  When a batch would exceed it, the delegations are not dispatched.
+  The check is projected: the new jobs a batch would add (ready and deferred
+  legs, minus already-enqueued/fingerprint-deduped ones) are counted before any
+  child is enqueued, so a wide fan-out from just under the cap is refused whole
+  rather than overshooting it.
 - Per-root wall-clock budget `MaxDelegationWallClock = 2h`: the whole tree under
   one root is bounded in duration (measured from the root job's creation); a
   coordinator that tries to fan out after the tree has run this long is refused
@@ -148,8 +151,8 @@ cannot recurse or fan out forever:
   already used at least the budget is refused with a `delegation_cost_exceeded`
   event. Token capture is **best-effort per runtime** (Claude reports usage; Kimi
   reports it if its stream emits it; Codex reads usage from its `codex exec --json`
-  JSONL stream for fresh sessions only — resumed sessions contribute `0` because
-  codex reports session-cumulative usage there — falling back to `0` on an older CLI), so the budget can under-count
+  JSONL stream — a resumed session's usage is session-cumulative, so it records only
+  the per-session delta (#661) — falling back to `0` on an older CLI), so the budget can under-count
   but never over-counts. Leaving the knob at `0` skips the check entirely.
 - Per-root **dollar-cost** budget `[orchestrate].max_delegation_cost_usd`,
   **off by default** (`0` = unlimited): the cost analogue of the token budget
@@ -224,9 +227,9 @@ cannot recurse or fan out forever:
   `human_questions[]` is byte-identical to today's behavior.
 
 When a bound trips, the offending delegations are not dispatched and the parent
-receives a typed lifecycle event explaining why (for example, the delegation tree
-for a root reached the job budget of 64). Rather than stopping silently, the
-engine then enqueues one **graceful finalize continuation**
+receives a typed lifecycle event explaining why (for example, a delegation batch
+of new jobs would exceed the per-root job budget of 64). Rather than stopping
+silently, the engine then enqueues one **graceful finalize continuation**
 (`delegation_finalize_enqueued`) back to the coordinator — told it cannot
 delegate further and asked to synthesize a best-effort final result and return
 empty delegations. That continuation is terminal: any delegations it returns are
