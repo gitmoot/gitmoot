@@ -64,8 +64,8 @@ gitmoot agent template remote show
 
 # Back up: export to a local dir, or publish (commit) straight to the remote.
 gitmoot agent template export release-planner --to ./backup
-gitmoot agent template publish release-planner            # or --all
-gitmoot agent template publish --all --repo owner/my-templates --create
+gitmoot agent template publish release-planner            # or --all (custom only; built-ins skipped)
+gitmoot agent template publish --all --repo owner/my-templates --create   # --create makes a PRIVATE repo
 
 # Restore / share: pull from the remote, or install one file from any repo.
 gitmoot agent template pull release-planner               # or --all
