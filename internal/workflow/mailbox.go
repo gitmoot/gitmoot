@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/agenttemplate"
@@ -786,11 +787,16 @@ func (m Mailbox) claim(ctx context.Context, job db.Job) error {
 	if job.State != string(JobQueued) {
 		return fmt.Errorf("job %q is %s, not queued", job.ID, job.State)
 	}
-	claimed, err := m.Store.TransitionJobStateWithEvent(ctx, job.ID, string(JobQueued), string(JobRunning), db.JobEvent{
+	// Stamp the claiming process's identity in the SAME atomic queued->running
+	// UPDATE (#651): runner_boot_id (db.BootID) is the cross-boot liveness signal
+	// that lets the daemon recover this job immediately after a reboot, and
+	// runner_pid is recorded for observability only. Off Linux BootID() is "", so
+	// the row is identity-less and only the existing age/lease recovery applies.
+	claimed, err := m.Store.ClaimRunningJob(ctx, job.ID, string(JobQueued), string(JobRunning), db.JobEvent{
 		JobID:   job.ID,
 		Kind:    string(JobRunning),
 		Message: "job started",
-	})
+	}, os.Getpid(), db.BootID())
 	if err != nil {
 		return err
 	}

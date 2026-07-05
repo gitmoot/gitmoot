@@ -423,7 +423,14 @@ Fixes:
   progress past the staleness window (default 30m; tune with the
   `GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value
   is 1m — below-1m, malformed, or non-positive values are rejected in favor of
-  the 30m default rather than clamped, #560).
+  the 30m default rather than clamped, #560). This window is a same-boot crash
+  backstop, not a timeout: a job holding a runtime session lock whose lease has
+  not elapsed is left running regardless of the window (its real timeout has not
+  passed). After a **reboot** you do not wait it out at all — the kernel boot id
+  changes, so on its next startup and every tick the daemon immediately requeues
+  every job claimed on the previous boot and reclaims its stranded runtime session
+  lock, regardless of any unexpired lease (#651). Boot-aware recovery is Linux
+  only; elsewhere recovery falls back to the lease/age window above.
 - A backlog of `blocked` jobs (each paused awaiting a human) never clears on its
   own. Dismiss one with `gitmoot job cancel <job-id>` (cancel now abandons a
   `blocked` job as well as a `queued`/`running` one; #631), or clear a stale

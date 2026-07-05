@@ -865,7 +865,14 @@ progress past the staleness window (default 30m) is assumed orphaned by a dead
 worker and recovered/re-queued. The window is tunable via the
 `GITMOOT_STALE_RUNNING_AFTER` env var; the smallest honored value is 1m —
 below-1m, malformed, or non-positive values are rejected (with a one-time
-warning) in favor of the 30m default rather than clamped (#560).
+warning) in favor of the 30m default rather than clamped (#560). That window is a
+same-boot crash backstop, not a timeout: a running job whose runtime-session lease
+has not elapsed is left held regardless of the window. After a **reboot** there is
+no wait at all — the daemon detects the changed kernel boot id and, on its next
+startup and every tick, immediately requeues every job claimed on a previous boot
+and reclaims its stranded `runtime:<rt>:<session>` lock, regardless of any
+unexpired lease (Linux only; elsewhere recovery falls back to the lease/age window;
+#651).
 
 `gitmoot job cancel <job-id>` is the single-job **abandon** verb. It dismisses a
 `queued`, `running`, **or `blocked`** job (a blocked job is one paused awaiting a

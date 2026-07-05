@@ -123,6 +123,49 @@ func seedStrandedGenerationLock(t *testing.T, home string, ownerPID int64, owner
 	}
 }
 
+// seedStrandedGenerationLockBoot is seedStrandedGenerationLock plus an
+// owner_boot_id, used to exercise the #651 cross-boot liveness short-circuit.
+func seedStrandedGenerationLockBoot(t *testing.T, home string, ownerPID int64, ownerHost string, ownerBoot string, expiresAt time.Time) {
+	t.Helper()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	acquired, err := store.AcquireResourceLock(context.Background(), db.ResourceLock{
+		ResourceKey:   skillOptTrainGenerationLockKey("landing-train", "landing-train-001"),
+		OwnerJobID:    "local-skillopt-train-generation-landing-train-deadbeef",
+		OwnerToken:    "stranded-token",
+		OwnerPID:      ownerPID,
+		OwnerHostname: ownerHost,
+		OwnerBootID:   ownerBoot,
+		ExpiresAt:     expiresAt.Format(time.RFC3339Nano),
+	}, time.Now().UTC())
+	if err != nil || !acquired {
+		t.Fatalf("AcquireResourceLock stranded returned acquired=%v err=%v", acquired, err)
+	}
+}
+
+// TestSkillOptTrainRecoverGenerationReclaimsForeignBootLiveLock pins the #651
+// short-circuit: a generation lock whose owner PID is LIVE (this very process) on
+// this host with an unexpired lease would normally be refused as an active owner —
+// but a recorded owner_boot_id from a DIFFERENT boot proves the host rebooted, so
+// the (possibly-reused) pid is definitively not the owner and the lock is
+// reclaimed without a kill(2) probe. Without the boot check this refuses (busy).
+func TestSkillOptTrainRecoverGenerationReclaimsForeignBootLiveLock(t *testing.T) {
+	if db.BootID() == "" {
+		t.Skip("kernel boot id unavailable on this platform")
+	}
+	home, _ := seedSkillOptTrainItemsReady(t, 2)
+	seedStrandedGenerationLockBoot(t, home, int64(os.Getpid()), thisHostname(t), "prior-boot-651", time.Now().UTC().Add(time.Hour))
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "train", "recover", "--home", home, "--session", "landing-train", "--generation"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("recover --generation exit code = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if out := stdout.String(); !strings.Contains(out, "lock_reclaimed: true") {
+		t.Fatalf("stdout = %s, want lock_reclaimed: true (foreign boot proves the live-looking pid is dead)", out)
+	}
+}
+
 // deadPID returns a PID that is (almost certainly) not a running process.
 func deadPID(t *testing.T) int64 {
 	t.Helper()

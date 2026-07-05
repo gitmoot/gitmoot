@@ -1834,6 +1834,9 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 			if err := recoverExpiredRuntimeSessionLocks(ctx, store, stdout, time.Now().UTC()); err != nil {
 				return err
 			}
+			if err := recoverForeignBootRunners(ctx, store, stdout); err != nil {
+				return err
+			}
 			if err := recoverCancelledRunningJobsForEnabledRepos(ctx, store, rootFilter, stdout); err != nil {
 				return err
 			}
@@ -1898,6 +1901,9 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 
 func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, store *db.Store, live *daemonReloadableConfig, rootFilter string, stdout io.Writer) error {
 	if err := recoverExpiredRuntimeSessionLocks(ctx, store, stdout, time.Now().UTC()); err != nil {
+		return err
+	}
+	if err := recoverForeignBootRunners(ctx, store, stdout); err != nil {
 		return err
 	}
 	if err := recoverRunningJobsForRepo(ctx, store, stdout, d.Repo.FullName(), rootFilter); err != nil {
@@ -2933,6 +2939,44 @@ func recoverExpiredRuntimeSessionLocks(ctx context.Context, store *db.Store, std
 	return recoverExpiredRuntimeSessionLocksSkipping(ctx, store, stdout, now, nil)
 }
 
+// recoverForeignBootRunners is the #651 cross-boot recovery pass, run at daemon
+// startup AND every worker tick. When this host's boot id differs from the boot id
+// recorded on a running job / held runtime-session lock, that owner was claimed on
+// a PREVIOUS boot and its in-process worker died when the host rebooted — so it is
+// recovered IMMEDIATELY, regardless of any runtime-session lease (which survives a
+// reboot in the DB and would otherwise keep the job "held" until it expired: the
+// AC2 gap #536's lease gate cannot close by itself).
+//
+// It requeues the foreign-boot running jobs (this covers non-resumable/shell jobs
+// too, which hold no lease at all) and reclaims the foreign-boot runtime-session
+// locks so a requeued resumable owner can re-acquire its session on re-dispatch.
+// It is a STRICT no-op off Linux (BootID()=="") — preserving today's age/lease
+// behavior — and never touches a SAME-boot owner, so a live in-process worker is
+// never double-run (the #536 protection is untouched). Cheap and idempotent: after
+// the first pass reclaims them there are no foreign-boot rows left, so re-running
+// it per repo per tick is a near-empty indexed scan.
+func recoverForeignBootRunners(ctx context.Context, store *db.Store, stdout io.Writer) error {
+	bootID := db.BootID()
+	if bootID == "" {
+		return nil
+	}
+	requeued, err := store.RequeueRunningJobsFromForeignBoot(ctx, bootID)
+	if err != nil {
+		return err
+	}
+	for _, id := range requeued {
+		writeLine(stdout, "requeued running job %s claimed on a previous boot (host rebooted)", id)
+	}
+	released, err := store.ReleaseRuntimeSessionLocksFromForeignBoot(ctx, bootID)
+	if err != nil {
+		return err
+	}
+	if released > 0 {
+		writeLine(stdout, "reclaimed %d runtime session lock(s) held on a previous boot", released)
+	}
+	return nil
+}
+
 // recoverExpiredRuntimeSessionLocksSkipping is recoverExpiredRuntimeSessionLocks
 // with an in-flight owner exclusion (#562): a lock whose owner job is currently
 // being run BY THIS PROCESS is neither requeued nor reaped even if its lease has
@@ -3442,6 +3486,14 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 		cand = newTickCandidates(worker.Store)
 	}
 	inflightIDs := tracker.inflightIDs()
+	// Cross-boot recovery (#651): requeue jobs / reclaim runtime-session locks whose
+	// recorded boot id proves a reboot happened, before the lease-gated recovery
+	// below (which alone would leave a rebooted long-lease job "held"). It is
+	// boot-scoped and repo-agnostic — no in-flight skip is needed because a foreign
+	// boot id can never belong to a job this process is currently running.
+	if err := recoverForeignBootRunners(ctx, store, stdout); err != nil {
+		return err
+	}
 	if err := recoverRunningJobsBeforeForRepoSkipping(ctx, store, stdout, now, now.Add(-configuredDaemonRunningJobStaleAfter(stdout)), repoFilter, rootFilter, inflightIDs); err != nil {
 		return err
 	}

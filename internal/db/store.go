@@ -486,10 +486,19 @@ type ResourceLock struct {
 	OwnerToken    string
 	OwnerPID      int64
 	OwnerHostname string
-	CommandHash   string
-	AcquiredAt    string
-	UpdatedAt     string
-	ExpiresAt     string
+	// OwnerBootID is the acquiring host's kernel boot identifier (db.BootID) at
+	// acquire time (#651). "" means no boot identity was recorded (a non-Linux
+	// host, or a lock acquired before this column existed / by a non-pid-stamping
+	// acquire); such locks fall back to the existing lease/TTL behavior. A recorded
+	// boot id that differs from the current one proves the owning process died with
+	// its boot, so the lock is reclaimable regardless of an unexpired lease. It is
+	// deliberately kept OUT of the shared 9-column lock SELECTs (targeted reads
+	// only) so their scan arity is unchanged.
+	OwnerBootID string
+	CommandHash string
+	AcquiredAt  string
+	UpdatedAt   string
+	ExpiresAt   string
 }
 
 type MergeGate struct {
@@ -2729,6 +2738,163 @@ func (s *Store) TransitionJobStateWithEvent(ctx context.Context, id string, from
 		return false, err
 	}
 	return true, tx.Commit()
+}
+
+// ClaimRunningJob is TransitionJobStateWithEvent specialized for the queued->
+// running CLAIM, additionally stamping the claiming process's identity
+// (runner_pid, runner_boot_id) in the SAME atomic UPDATE (#651). runner_pid is
+// recorded for observability only — cross-boot recovery keys on runner_boot_id,
+// never on the pid, because the daemon runs jobs in-process so the pid is the
+// daemon's own, not the reparented worker's. runnerBootID is db.BootID(): "" off
+// Linux, in which case the row is identity-less and only the existing age/lease
+// recovery applies. It returns false (no event written) when the row was not in
+// `from` state, exactly like TransitionJobStateWithEvent.
+func (s *Store) ClaimRunningJob(ctx context.Context, id string, from string, to string, event JobEvent, runnerPID int, runnerBootID string) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, runner_pid = ?, runner_boot_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, runnerPID, strings.TrimSpace(runnerBootID), id, from)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, tx.Commit()
+	}
+	if event.JobID == "" {
+		event.JobID = id
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+// RequeueRunningJobsFromForeignBoot requeues (running->queued) every running job
+// whose recorded runner_boot_id proves it was claimed on a PREVIOUS boot of this
+// host (#651): the host has since rebooted, so its in-process worker is
+// definitively dead and the job must be re-dispatched immediately — regardless of
+// any unexpired runtime-session lease, which survives a reboot in the DB and would
+// otherwise keep the job "held" until it expired (the AC2 gap this closes). Each
+// requeue appends a job_event for the audit trail. It returns the ids actually
+// requeued so the daemon can log them.
+//
+// It is a STRICT no-op when currentBootID is "" (a non-Linux host or a boot id
+// that could not be read): with no boot identity there is nothing to compare
+// against, so behavior is byte-identical to before this feature. The `!= ''`
+// guard likewise never touches identity-less legacy rows (pre-upgrade running
+// jobs), leaving them to the existing age/lease recovery. It NEVER touches a
+// same-boot job — same-boot liveness stays governed by the age/lease gate, so no
+// live in-process worker is ever double-run.
+func (s *Store) RequeueRunningJobsFromForeignBoot(ctx context.Context, currentBootID string) ([]string, error) {
+	currentBootID = strings.TrimSpace(currentBootID)
+	if currentBootID == "" {
+		return nil, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM jobs
+		WHERE state = 'running' AND runner_boot_id != '' AND runner_boot_id != ?
+		ORDER BY id`, currentBootID)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	requeued := make([]string, 0, len(ids))
+	for _, id := range ids {
+		res, err := tx.ExecContext(ctx, `UPDATE jobs SET state = 'queued', updated_at = CURRENT_TIMESTAMP
+			WHERE id = ? AND state = 'running' AND runner_boot_id != '' AND runner_boot_id != ?`, id, currentBootID)
+		if err != nil {
+			return nil, err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if affected == 0 {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
+			id, "queued", "recovered running job claimed on a previous boot (host rebooted)"); err != nil {
+			return nil, err
+		}
+		requeued = append(requeued, id)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return requeued, nil
+}
+
+// ReleaseRuntimeSessionLocksFromForeignBoot deletes every runtime-session lock
+// (resource_key LIKE 'runtime:%') whose owner_boot_id proves it was acquired on a
+// PREVIOUS boot of this host (#651). After a reboot such a lock's owning process
+// is dead, but its lease survives in the DB and would otherwise block the requeued
+// owner job from re-acquiring its session lock on re-dispatch — so it is reclaimed
+// regardless of lease. The owner job itself is requeued by
+// RequeueRunningJobsFromForeignBoot (its runner_boot_id matches this lock's
+// foreign boot), so this method only reclaims the lock row. It returns the number
+// of locks released.
+//
+// It is a STRICT no-op when currentBootID is "" and, via the `!= ''` guard, never
+// reclaims an identity-less lock (a non-pid-stamping acquire or a legacy row),
+// which stays governed by its lease/TTL. Because a foreign boot id can only have
+// been written by a process on a prior boot, it can never match an in-flight owner
+// in THIS process, so no live session is ever reclaimed out from under it.
+func (s *Store) ReleaseRuntimeSessionLocksFromForeignBoot(ctx context.Context, currentBootID string) (int64, error) {
+	currentBootID = strings.TrimSpace(currentBootID)
+	if currentBootID == "" {
+		return 0, nil
+	}
+	result, err := s.db.ExecContext(ctx, `DELETE FROM resource_locks
+		WHERE resource_key LIKE ? AND owner_boot_id != '' AND owner_boot_id != ?`,
+		RuntimeSessionLockKeyPrefix+"%", currentBootID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+// ResourceLockOwnerBootID returns the recorded owner_boot_id for a held lock, or
+// "" when the lock is absent or its boot id was never stamped (#651). It is a
+// targeted single-column read kept deliberately OUT of the shared 9-column lock
+// SELECTs so their scan arity is unchanged; the skillopt generation-lock recovery
+// path uses it to prove a same-host owner from a different boot is dead without a
+// kill(2) syscall (and PID-reuse-immune).
+func (s *Store) ResourceLockOwnerBootID(ctx context.Context, resourceKey string) (string, error) {
+	var bootID string
+	err := s.db.QueryRowContext(ctx, `SELECT owner_boot_id FROM resource_locks WHERE resource_key = ?`, strings.TrimSpace(resourceKey)).Scan(&bootID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(bootID), nil
 }
 
 func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id string, from string, to string, payload string, event JobEvent, extraEvents ...JobEvent) (bool, error) {
@@ -5298,8 +5464,8 @@ func (s *Store) AcquireResourceLock(ctx context.Context, lock ResourceLock, now 
 			)`, resourceKey, nowText); err != nil {
 		return false, err
 	}
-	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO resource_locks(resource_key, owner_job_id, owner_token, owner_pid, owner_hostname, command_hash, acquired_at, updated_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, resourceKey, ownerJobID, ownerToken, lock.OwnerPID, strings.TrimSpace(lock.OwnerHostname), strings.TrimSpace(lock.CommandHash), nowText, nowText, expiresAt)
+	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO resource_locks(resource_key, owner_job_id, owner_token, owner_pid, owner_hostname, owner_boot_id, command_hash, acquired_at, updated_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, resourceKey, ownerJobID, ownerToken, lock.OwnerPID, strings.TrimSpace(lock.OwnerHostname), strings.TrimSpace(lock.OwnerBootID), strings.TrimSpace(lock.CommandHash), nowText, nowText, expiresAt)
 	if err != nil {
 		return false, err
 	}
@@ -7373,5 +7539,19 @@ CREATE INDEX idx_skillopt_gate_runs_candidate ON skillopt_gate_runs(candidate_ve
 	// unless the new commands are used.
 	`
 ALTER TABLE jobs ADD COLUMN externally_driven INTEGER NOT NULL DEFAULT 0;
+	`,
+	// #651 cross-boot process-liveness recovery: stamp the claiming process's
+	// identity onto a running job (runner_pid for observability; runner_boot_id the
+	// load-bearing cross-boot signal) and the acquiring process's boot id onto a
+	// pid-backed resource lock. All three carry DEFAULTs (0 / '') so every existing
+	// row reads identically and this is a pure additive append that does NOT
+	// renumber or alter any prior migration — mirroring the owner_pid/owner_hostname
+	// precedent above. A daemon upgraded mid-flight sees pre-upgrade running jobs as
+	// identity-less ('' boot) and safely leaves them to the existing age/lease
+	// recovery, then stamps identity on every subsequently-claimed job — no backfill.
+	`
+ALTER TABLE jobs ADD COLUMN runner_pid INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN runner_boot_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE resource_locks ADD COLUMN owner_boot_id TEXT NOT NULL DEFAULT '';
 	`,
 }

@@ -280,7 +280,14 @@ A job stuck in `running` is recovered automatically once it shows no lease
 progress past the staleness window (default 30m; tune with the
 `GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value
 is 1m — below-1m, malformed, or non-positive values are rejected in favor of the
-30m default rather than clamped, #560).
+30m default rather than clamped, #560). The window is a same-boot crash backstop,
+not a timeout: a job holding a runtime session lock whose lease has not elapsed is
+left running regardless of the window. After a **reboot** there is no wait at
+all — the kernel boot id changes, so on its next startup and every tick the daemon
+immediately requeues every job claimed on the previous boot and reclaims its
+stranded runtime session lock, regardless of any unexpired lease (#651).
+Boot-aware recovery is Linux only; elsewhere recovery falls back to the lease/age
+window above.
 
 Fix: resolve the underlying runtime/auth/lock issue, then retry when safe:
 

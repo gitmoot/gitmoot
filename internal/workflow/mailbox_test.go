@@ -128,6 +128,55 @@ func TestMailboxEnqueuePersistsEphemeralSpec(t *testing.T) {
 	}
 }
 
+// TestMailboxClaimStampsRunnerBootID pins that the queued->running claim stamps
+// the claiming process's boot id (#651), routing through Store.ClaimRunningJob. It
+// asserts behaviorally via the foreign-boot requeue predicate: a claimed job looks
+// "same-boot" to the current boot (never requeued) but "foreign" to a different
+// boot id (requeued) — which can only hold if claim recorded a concrete, non-empty
+// runner_boot_id. On the unpatched claim (plain TransitionJobStateWithEvent)
+// runner_boot_id stays '' and the foreign-boot requeue matches nothing, so this
+// test fails without the fix.
+func TestMailboxClaimStampsRunnerBootID(t *testing.T) {
+	if db.BootID() == "" {
+		t.Skip("kernel boot id unavailable on this platform")
+	}
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+
+	job, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-claim", Agent: "audit", Action: "ask", Repo: "jerryfane/gitmoot"})
+	if err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+	if err := mailbox.claim(ctx, job); err != nil {
+		t.Fatalf("claim returned error: %v", err)
+	}
+	running, err := store.GetJob(ctx, "job-claim")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if running.State != string(JobRunning) {
+		t.Fatalf("job state after claim = %q, want running", running.State)
+	}
+
+	// Same boot: the claimed job is NOT foreign, so it is protected.
+	if requeued, err := store.RequeueRunningJobsFromForeignBoot(ctx, db.BootID()); err != nil {
+		t.Fatalf("RequeueRunningJobsFromForeignBoot(current) returned error: %v", err)
+	} else if len(requeued) != 0 {
+		t.Fatalf("same-boot requeue = %v, want none (claim must stamp the CURRENT boot)", requeued)
+	}
+
+	// A different boot proves claim stamped a concrete boot id: the job now looks
+	// foreign and is requeued.
+	requeued, err := store.RequeueRunningJobsFromForeignBoot(ctx, "foreign-"+db.BootID())
+	if err != nil {
+		t.Fatalf("RequeueRunningJobsFromForeignBoot(foreign) returned error: %v", err)
+	}
+	if len(requeued) != 1 || requeued[0] != "job-claim" {
+		t.Fatalf("foreign-boot requeue = %v, want [job-claim] (claim must stamp runner_boot_id)", requeued)
+	}
+}
+
 func TestMailboxEnqueuePersistsModel(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
