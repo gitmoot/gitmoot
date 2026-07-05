@@ -18,14 +18,33 @@ implementation plans, standard goal files, agent template workflows, custom
 prompt agents, template capture, job status, or branch lock inspection.
 
 For current-chat prompt import, "use <agent> here" or "use Gitmoot agent
-<agent> here" means run `gitmoot agent prompt <agent>` and apply the returned
-prompt content in this current chat. This is prompt import, not true
-system-prompt injection. The natural phrase "use the Gitmoot planner here" maps
-to the same `planner` template used by managed planner agents. If the planner
-template is not cached, read and apply the packaged
-`agent-templates/planner.md` instructions directly. Do not route a "here"
-request through a background `gitmoot agent ask` unless the user explicitly
-asks for background execution, PR-comment routing, or job tracking.
+<agent> here" means import the agent's prompt into this current chat and apply
+it. This is prompt import, not true system-prompt injection. The natural phrase
+"use the Gitmoot planner here" maps to the same `planner` template used by
+managed planner agents. If the planner template is not cached, read and apply
+the packaged `agent-templates/planner.md` instructions directly. Do not route a
+"here" request through a background `gitmoot agent ask` unless the user
+explicitly asks for background execution, PR-comment routing, or job tracking.
+
+By DEFAULT, the "here" flow tracks the work: run
+`gitmoot agent prompt <agent> --record [--repo owner/repo]`, which opens a
+session job on import and returns the prompt with a header line naming its job
+id. Apply the prompt, do the work, then — this is REQUIRED — clock out with
+`gitmoot job close <id> --decision <approved|changes_requested|implemented|blocked|failed> --summary "..."`
+so the work shows in `job list`, the dashboard, and the event stream just like
+an engine-run job (no runtime is spawned; gitmoot is only the record-keeper).
+`--record` needs a **registered agent** with a repo scope — a bare template id is
+rejected. When "here" resolves to a **template that has no registered agent** (e.g.
+the packaged `planner` above, when no `planner` agent exists), import it with plain
+`gitmoot agent prompt <template>` (untracked); to still track it, register the agent
+first or log it explicitly with `gitmoot job record --agent <name> --repo owner/repo`.
+`--record` also defaults the job `--type` to `implement` — pass `--type ask` for
+advisory "here" work (planning, research) so it is not mislabeled.
+For a plain read-only peek — "just show me the prompt" — use
+`gitmoot agent prompt <agent>` WITHOUT `--record`, which opens no job. You can
+also clock in/out manually with `gitmoot job open` / `gitmoot job close`, or log
+already-finished work in one shot with `gitmoot job record` (see
+`references/CLI.md` → Session jobs).
 
 For template capture, phrases like "capture this session as a Gitmoot agent
 template", "turn this workflow into a Gitmoot template", or "draft a reusable

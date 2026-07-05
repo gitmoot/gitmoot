@@ -18,6 +18,15 @@ func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error
 	if err != nil {
 		return db.Job{}, err
 	}
+	// A session job (#657) is executed by the calling session, never the engine, so
+	// it must never be re-queued: retry transitions the job to 'queued', which the
+	// daemon would then claim and Deliver to a real runtime with an empty session
+	// payload (a session *implement* job could push a spurious branch/PR). Refuse
+	// the retry outright, before any state transition. GetJob scans the
+	// externally_driven column into the struct, so this predicate is reliable.
+	if job.ExternallyDriven {
+		return db.Job{}, fmt.Errorf("job %s is a session job (externally driven) and cannot be retried", job.ID)
+	}
 	switch job.State {
 	case string(JobFailed), string(JobBlocked), string(JobCancelled):
 	default:

@@ -582,7 +582,25 @@ gitmoot agent prompt frontend-reviewer --json
 
 This prints the prompt content for the current chat to apply locally. It does
 not create a job, start a daemon, resume a runtime session, or post a PR
-comment.
+comment — a free read-only peek.
+
+To track the here-method work by default, add `--record`: it opens a session
+job on import (see "Session jobs" below) and returns the prompt with a header
+line naming the job id, so the imported work shows in `job list` / the dashboard
+once you clock out:
+
+```sh
+gitmoot agent prompt frontend-reviewer --record [--repo owner/repo] [--type ask|review|implement] [--json]
+# prints:  [gitmoot session job <id> — when this work is complete, run:
+#           gitmoot job close <id> --decision <approved|changes_requested|implemented|blocked|failed> --summary "..."]
+# followed by the prompt body.
+```
+
+`--record` requires an **agent** (not a bare template id); the repo comes from
+`--repo`, else the agent's `repo_scope` (error if neither is set). `--type`
+defaults to `implement`. When the imported work is done, close the job with
+`gitmoot job close <id> --decision …`. `--json` includes the opened `job_id`.
+Without `--record`, behavior is unchanged (no job).
 
 Draft and validate a captured template before installing it:
 
@@ -731,6 +749,52 @@ gitmoot job kill <root-job-id>
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
+
+### Session jobs (record "here"-method work)
+
+The "here" method — importing an agent's prompt into your calling session with
+`gitmoot agent prompt <agent>` — does the real work in your session but creates
+**no gitmoot job**, so the dashboard / `job list` / event stream never reflect it.
+Session jobs record that work as a first-class tracked job **without gitmoot
+spawning a runtime** — a clock-in / clock-out pair (plus a one-shot recorder):
+
+```sh
+# Clock in: create a RUNNING, externally-driven job (no dispatch); prints its id.
+gitmoot job open --agent <name> --repo owner/repo --type ask|review|implement \
+                 [--title "..."] [--task <id>] [--pr <n>] [--json]
+
+# Clock out: apply the result and move the job to its terminal state.
+gitmoot job close <id> --decision approved|changes_requested|blocked|implemented|failed \
+                 [--summary "..."] [--pr <n>] [--branch <name>] [--json]
+
+# One-shot post-hoc: create an already-terminal job (open + close in one).
+gitmoot job record --agent <name> --repo owner/repo --type ask|review|implement \
+                 --decision <decision> [--title "..."] [--summary "..."] \
+                 [--task <id>] [--pr <n>] [--branch <name>] [--json]
+```
+
+An `externally_driven` job is created directly in `running` (it never queues, so
+the daemon never claims or Delivers it — no runtime subprocess, no runtime-session
+or checkout lock) and the stuck-`running` reaper **skips** it, so a session may
+hold it open for as long as the work takes. `close` reuses the exact result path an
+engine-run job uses: `--decision` maps to the same terminal state
+(`approved`/`changes_requested`/`implemented` → succeeded, `blocked` → blocked,
+`failed` → failed) and emits the same finished/failed/blocked event, so a recorded
+job is indistinguishable from an engine-run one in the dashboard and events. A job
+can be closed **once** (it must be a running session job); an orphaned open job
+stays `running` (reaper-exempt) until you `job close --decision failed` or `job
+cancel <id>` it. A session job is never engine-executed, so `job retry` **refuses**
+it (retrying would re-queue it for a real runtime with an empty payload) — recover
+one by opening a fresh session job instead. The agent and repo must exist.
+
+**Make in-chat / "here" work show on the dashboard.** The one-step default is
+`gitmoot agent prompt <agent> --record`: it opens the session job *as you import
+the prompt* and prints a header naming the job id (see the `agent prompt`
+section above). Apply the prompt, do the work, then clock out with
+`gitmoot job close <id> --decision …`. That is all it takes for otherwise-invisible
+current-chat ("here") work to appear in `job list`, the dashboard, and the event
+stream — no daemon, no runtime, no PR comment. Use plain `agent prompt` (no
+`--record`) only when you just want to read a prompt without tracking it.
 
 For a `queued` or `blocked` job, `gitmoot job list` appends a `WHY:` column and
 `gitmoot job show` prints a `why_stuck:` (and, when a lease applies, a

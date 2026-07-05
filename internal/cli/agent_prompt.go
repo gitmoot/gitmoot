@@ -11,7 +11,9 @@ import (
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/agenttemplate"
+	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
 type agentPromptOutput struct {
@@ -23,6 +25,11 @@ type agentPromptOutput struct {
 	Capabilities   []string `json:"capabilities,omitempty"`
 	ResolvedCommit string   `json:"resolved_commit"`
 	Content        string   `json:"content"`
+	// JobID is set only when the prompt is imported with --record: it carries the
+	// session job opened for this import so the JSON consumer can close it later.
+	// Without --record it stays empty and is omitted, keeping the plain-inspection
+	// output byte-identical to the historical behavior.
+	JobID string `json:"job_id,omitempty"`
 }
 
 func runAgentPrompt(args []string, stdout, stderr io.Writer) int {
@@ -30,6 +37,9 @@ func runAgentPrompt(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOutput := fs.Bool("json", false, "print prompt metadata and content as JSON")
+	record := fs.Bool("record", false, "open a session job for this import so the here-method work is tracked (#657); print the job id in the header and close it with `gitmoot job close`")
+	repo := fs.String("repo", "", "repo scope as owner/repo for the recorded session job (default: the agent's repo_scope); only used with --record")
+	typeName := fs.String("type", "implement", "session job type when recording: ask|review|implement; only used with --record")
 	id, flagArgs := leadingID(args)
 	if len(args) == 0 || containsHelpFlag(args) {
 		fs.Usage()
@@ -56,6 +66,10 @@ func runAgentPrompt(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "agent prompt requires exactly one agent or template id")
 		return 2
 	}
+	if *record {
+		return runAgentPromptRecord(*home, id, *repo, *typeName, *jsonOutput, stdout, stderr)
+	}
+
 	var output agentPromptOutput
 	if err := withReadOnlyStore(*home, func(store *db.Store) error {
 		resolved, err := resolveAgentPrompt(context.Background(), store, id)
@@ -75,6 +89,84 @@ func runAgentPrompt(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
+	fmt.Fprintln(stdout, strings.TrimRight(output.Content, "\n"))
+	return 0
+}
+
+// sessionCloseHint is the exact header line printed above a --record'd prompt so
+// the importing agent knows the session job id it must close when the here-method
+// work is done (#657). The decision list mirrors workflow.ResultDecisions.
+func sessionCloseHint(jobID string) string {
+	return fmt.Sprintf(`[gitmoot session job %s — when this work is complete, run: gitmoot job close %s --decision <approved|changes_requested|implemented|blocked|failed> --summary "..."]`, jobID, jobID)
+}
+
+// runAgentPromptRecord implements `agent prompt <agent> --record`: it opens a
+// session job (the same OpenExternalJob/Mailbox clock-in `job open` uses) for the
+// agent + repo and returns the prompt with a header that names the job id so the
+// importing session tracks the here-method work by default. Unlike the plain
+// prompt path this needs a writable store, and the id MUST resolve to an agent
+// (a bare template has no repo_scope and cannot own a session job).
+func runAgentPromptRecord(home, id, repoFlag, typeName string, jsonOutput bool, stdout, stderr io.Writer) int {
+	action, ok := validateSessionAction(typeName, stderr)
+	if !ok {
+		return 2
+	}
+	ctx := context.Background()
+	var (
+		output agentPromptOutput
+		jobID  string
+	)
+	if err := withStoreAndPaths(home, func(paths config.Paths, store *db.Store) error {
+		agent, err := store.GetAgent(ctx, strings.TrimSpace(id))
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("agent %q not found; --record requires an existing agent (a bare template id has no repo scope to record against)", id)
+			}
+			return err
+		}
+		resolved, err := promptForAgent(ctx, store, agent)
+		if err != nil {
+			return err
+		}
+		repoScope := strings.TrimSpace(repoFlag)
+		if repoScope == "" {
+			repoScope = strings.TrimSpace(agent.RepoScope)
+		}
+		if repoScope == "" {
+			return fmt.Errorf("no repo to record against: pass --repo owner/repo or set agent %q's repo_scope", agent.Name)
+		}
+		fullName, err := validateSessionAgentRepo(ctx, store, agent.Name, repoScope)
+		if err != nil {
+			return err
+		}
+		engine := sessionWorkflowEngine(store, paths.Home)
+		job, err := engine.OpenExternalJob(ctx, workflow.JobRequest{
+			ID:     sessionJobID(action, agent.Name),
+			Agent:  agent.Name,
+			Action: action,
+			Repo:   fullName,
+			Sender: "session",
+		})
+		if err != nil {
+			return err
+		}
+		jobID = job.ID
+		resolved.JobID = job.ID
+		output = resolved
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "agent prompt --record: %v\n", promptReadError(err))
+		return 1
+	}
+	if jsonOutput {
+		if err := writeJSON(stdout, output); err != nil {
+			fmt.Fprintf(stderr, "agent prompt --record: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	fmt.Fprintln(stdout, sessionCloseHint(jobID))
+	fmt.Fprintln(stdout)
 	fmt.Fprintln(stdout, strings.TrimRight(output.Content, "\n"))
 	return 0
 }

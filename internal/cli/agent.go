@@ -95,7 +95,7 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
 	fmt.Fprintln(w, "  gitmoot agent heartbeat add|list|show|enable|disable|remove ...")
 	fmt.Fprintln(w, "  gitmoot agent template list|show|add|draft|validate|update|diff ...")
-	fmt.Fprintln(w, "  gitmoot agent prompt <agent-or-template> [--json]")
+	fmt.Fprintln(w, "  gitmoot agent prompt <agent-or-template> [--json] [--record [--repo owner/repo] [--type ask|review|implement]]")
 	fmt.Fprintln(w, "  gitmoot agent gc")
 	fmt.Fprintln(w, "  gitmoot agent subscribe <name> --runtime codex|claude|kimi|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] [--model model] --capability <capability>")
 	fmt.Fprintln(w, "    Codex sessions may use a UUID, thread name, or last. Claude sessions may use a UUID or last. Kimi sessions may use a Kimi session id. Shell sessions are commands.")
