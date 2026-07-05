@@ -149,6 +149,78 @@ WHERE owner_kind = ? AND owner_ref = ?`, ownerKind, ownerRef).Scan(&n)
 	return n, nil
 }
 
+// ListConfirmedMemoriesByOwnerKind returns every confirmed_memories row owned by
+// the given owner kind (e.g. memory.OwnerKindAgent), across every repo/scope/owner
+// version, and INCLUDING superseded rows — surfaced with SupersededBy populated
+// (COALESCEd from the nullable superseded_by column, 0 == not superseded). It is
+// the dashboard brain-graph read path: unlike QueryConfirmedMemories (the
+// injectable set, which drops superseded rows) and CountConfirmedMemoriesForOwner
+// (which counts only injectable rows), the graph deliberately shows superseded
+// "ghost" facts so it can draw supersede edges, so this MUST NOT filter them. Rows
+// come back ordered by id for a stable, deterministic traversal. Plain read, no FTS.
+func (s *Store) ListConfirmedMemoriesByOwnerKind(ctx context.Context, ownerKind string) ([]ConfirmedMemory, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, owner_kind, owner_ref, owner_version, repo, scope, key, content,
+	provenance, source_job, first_confirmed_at, updated_at, COALESCE(superseded_by, 0)
+FROM confirmed_memories
+WHERE owner_kind = ?
+ORDER BY id`, ownerKind)
+	if err != nil {
+		return nil, fmt.Errorf("list confirmed memories by owner kind: %w", err)
+	}
+	defer rows.Close()
+	var out []ConfirmedMemory
+	for rows.Next() {
+		var c ConfirmedMemory
+		var repoNull sql.NullString
+		if err := rows.Scan(&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &repoNull,
+			&c.Scope, &c.Key, &c.Content, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt, &c.UpdatedAt, &c.SupersededBy); err != nil {
+			return nil, err
+		}
+		c.Repo = repoNull.String
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ObservationKeyWitnesses is a per-(owner_ref, repo, key) tally of how many
+// append-only observation sightings back that triple — the "witness" count a
+// confirmed fact on the same key accumulated. Repo is normalized ("" == general /
+// NULL repo).
+type ObservationKeyWitnesses struct {
+	OwnerRef string
+	Repo     string
+	Key      string
+	Count    int
+}
+
+// CountObservationWitnessesByKey groups memory_observations for the given owner
+// kind by (owner_ref, repo, key) and returns each triple's sighting count in ONE
+// pass, so the brain graph can attach a witness count to every fact without an N+1
+// per-fact query. A NULL repo (general scope) is normalized to "".
+func (s *Store) CountObservationWitnessesByKey(ctx context.Context, ownerKind string) ([]ObservationKeyWitnesses, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT owner_ref, repo, key, COUNT(*)
+FROM memory_observations
+WHERE owner_kind = ?
+GROUP BY owner_ref, repo, key`, ownerKind)
+	if err != nil {
+		return nil, fmt.Errorf("count observation witnesses by key: %w", err)
+	}
+	defer rows.Close()
+	var out []ObservationKeyWitnesses
+	for rows.Next() {
+		var w ObservationKeyWitnesses
+		var repoNull sql.NullString
+		if err := rows.Scan(&w.OwnerRef, &repoNull, &w.Key, &w.Count); err != nil {
+			return nil, err
+		}
+		w.Repo = repoNull.String
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
 // UpsertConfirmedMemory writes or updates the single keyed confirmed row for a
 // fact and keeps the FTS index in sync, all in one transaction. Writes are
 // serialized by the store (MaxOpenConns=1) so a manual select-then-insert/update
