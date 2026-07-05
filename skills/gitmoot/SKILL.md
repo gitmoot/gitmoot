@@ -25,7 +25,11 @@ to the same `planner` template used by managed planner agents. If the planner
 template is not cached, read and apply the packaged
 `agent-templates/planner.md` instructions directly. Do not route a "here"
 request through a background `gitmoot agent ask` unless the user explicitly
-asks for background execution, PR-comment routing, or job tracking.
+asks for background execution, PR-comment routing, or job tracking. To make
+"here"-method work auditable without gitmoot spawning a runtime, record it as a
+session job: `gitmoot job open` clocks in a tracked running job, `gitmoot job
+close <id> --decision …` clocks out with the result, and `gitmoot job record`
+does both in one shot (see `references/CLI.md` → Session jobs).
 
 For template capture, phrases like "capture this session as a Gitmoot agent
 template", "turn this workflow into a Gitmoot template", or "draft a reusable

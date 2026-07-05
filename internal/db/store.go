@@ -248,6 +248,15 @@ type Job struct {
 	// report usage contributes 0 — the budget still works, it just under-counts.
 	InputTokens  int
 	OutputTokens int
+	// ExternallyDriven marks a job whose execution happens OUTSIDE the engine —
+	// the "here"/prompt-import calling session does the real work and clocks it in
+	// via `job open`/`record` (#657). It changes exactly three behaviors: the job
+	// is created directly in `running` (never queued, so the daemon never claims or
+	// Delivers it), the stuck-running reaper skips it (a session may hold it open
+	// for minutes), and it is closed via the CLI rather than a runtime result.
+	// Defaults false, so every engine-driven job and the whole normal dispatch/
+	// reaper path is byte-identical. Populated by GetJob/ListJobs.
+	ExternallyDriven bool
 	// UpdatedAt is populated by ListJobs (for age display in the dashboard);
 	// other readers may leave it zero.
 	UpdatedAt string
@@ -2396,6 +2405,37 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent)
 	return tx.Commit()
 }
 
+// CreateExternallyDrivenJobWithEvent creates a session job (#657) whose execution
+// happens OUTSIDE the engine: it sets externally_driven = 1 so the daemon's
+// queued selector never claims it and the stuck-running reaper skips it. It
+// mirrors CreateJobWithEvent (same root_id denormalization, same in-tx event) but
+// stamps the extra column; the caller supplies job.State = 'running' so the job
+// is created directly running, never queued. This is the ONLY insert site that
+// sets externally_driven — every other job insert leaves it at its DEFAULT 0, so
+// the normal dispatch path is byte-identical.
+func (s *Store) CreateExternallyDrivenJobWithEvent(ctx context.Context, job Job, event JobEvent) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, externally_driven, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), 1, CURRENT_TIMESTAMP)`,
+		job.ID, job.Agent, job.Type, job.State, job.Payload,
+		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy,
+		rootIDFromPayload(job.Payload), job.ID); err != nil {
+		return err
+	}
+	if event.JobID == "" {
+		event.JobID = job.ID
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // JobCreatedAt returns a job's created_at timestamp string (SQLite UTC format,
 // "2006-01-02 15:04:05"). Used by the delegation wall-clock backstop to measure a
 // tree's age from its root job. Returns sql.ErrNoRows if the job is unknown.
@@ -2434,18 +2474,18 @@ func (s *Store) IsRootJobKilled(ctx context.Context, rootID string) (bool, error
 }
 
 func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, updated_at, created_at FROM jobs WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven FROM jobs WHERE id = ?`, id)
 	var job Job
-	if err := row.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt); err != nil {
+	if err := row.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ExternallyDriven); err != nil {
 		return Job{}, err
 	}
 	return job, nil
 }
 
-// jobColumns is the 14-column projection ListJobs and ListJobsByType both read (the
+// jobColumns is the 15-column projection ListJobs and ListJobsByType both read (the
 // full jobs row except root_id), kept as one const so their SELECT lists — and the
 // scanJobs scan order below — can never drift apart.
-const jobColumns = `id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, updated_at, created_at`
+const jobColumns = `id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven`
 
 // scanJobs reads every row of a *sql.Rows produced by a `SELECT `+jobColumns+`
 // FROM jobs …` query into Jobs, in jobColumns order, and closes rows. Shared by
@@ -2455,7 +2495,7 @@ func scanJobs(rows *sql.Rows) ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ExternallyDriven); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -2597,8 +2637,14 @@ func (s *Store) ListQueuedJobs(ctx context.Context) ([]Job, error) {
 // exported as a package-level const so the plan test (TestListRunningJobsUpdatedBeforeOrder)
 // EXPLAINs the PRODUCTION text (binding the threshold as its `?` parameter) instead of
 // a hand-copied duplicate.
+// The `externally_driven = 0` predicate exempts session jobs (#657) from the
+// stuck-running reaper: a "here"/prompt-import job is created directly running and
+// held open by the calling session for as long as the work takes, so the daemon
+// must never time it out and requeue it (which would try to Deliver work the
+// engine never owned). Engine-driven jobs default externally_driven = 0, so their
+// reaping is byte-identical.
 const listRunningJobsUpdatedBeforeSQL = `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens
-		FROM jobs WHERE state = 'running' AND updated_at < ? ORDER BY updated_at`
+		FROM jobs WHERE state = 'running' AND externally_driven = 0 AND updated_at < ? ORDER BY updated_at`
 
 // ListRunningJobsUpdatedBefore returns the running jobs whose updated_at predates
 // the crash-backstop threshold. It orders by updated_at (not id) so the partial
@@ -7308,5 +7354,16 @@ CREATE TABLE skillopt_gate_runs (
 	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_skillopt_gate_runs_candidate ON skillopt_gate_runs(candidate_version_id);
+	`,
+	// #657 session jobs: mark a job whose execution happens OUTSIDE the engine (the
+	// "here"/prompt-import calling session drives the real work via `job open`/
+	// `close`/`record`). A session job is created directly `running` and flagged so
+	// (1) the daemon's queued selector never claims it, (2) the stuck-running reaper
+	// skips it, and (3) it is closed via the CLI result path. Pure additive append —
+	// ALTER TABLE ADD COLUMN with a NOT NULL DEFAULT 0, so SQLite backfills every
+	// existing row to 0 and the whole normal dispatch/reaper path is byte-identical
+	// unless the new commands are used.
+	`
+ALTER TABLE jobs ADD COLUMN externally_driven INTEGER NOT NULL DEFAULT 0;
 	`,
 }

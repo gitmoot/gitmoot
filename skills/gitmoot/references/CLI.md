@@ -760,6 +760,41 @@ gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
 
+### Session jobs (record "here"-method work)
+
+The "here" method — importing an agent's prompt into your calling session with
+`gitmoot agent prompt <agent>` — does the real work in your session but creates
+**no gitmoot job**, so the dashboard / `job list` / event stream never reflect it.
+Session jobs record that work as a first-class tracked job **without gitmoot
+spawning a runtime** — a clock-in / clock-out pair (plus a one-shot recorder):
+
+```sh
+# Clock in: create a RUNNING, externally-driven job (no dispatch); prints its id.
+gitmoot job open --agent <name> --repo owner/repo --type ask|review|implement \
+                 [--title "..."] [--task <id>] [--pr <n>] [--json]
+
+# Clock out: apply the result and move the job to its terminal state.
+gitmoot job close <id> --decision approved|changes_requested|blocked|implemented|failed \
+                 [--summary "..."] [--pr <n>] [--branch <name>] [--json]
+
+# One-shot post-hoc: create an already-terminal job (open + close in one).
+gitmoot job record --agent <name> --repo owner/repo --type ask|review|implement \
+                 --decision <decision> [--title "..."] [--summary "..."] \
+                 [--task <id>] [--pr <n>] [--branch <name>] [--json]
+```
+
+An `externally_driven` job is created directly in `running` (it never queues, so
+the daemon never claims or Delivers it — no runtime subprocess, no runtime-session
+or checkout lock) and the stuck-`running` reaper **skips** it, so a session may
+hold it open for as long as the work takes. `close` reuses the exact result path an
+engine-run job uses: `--decision` maps to the same terminal state
+(`approved`/`changes_requested`/`implemented` → succeeded, `blocked` → blocked,
+`failed` → failed) and emits the same finished/failed/blocked event, so a recorded
+job is indistinguishable from an engine-run one in the dashboard and events. A job
+can be closed **once** (it must be a running session job); an orphaned open job
+stays `running` (reaper-exempt) until you `job close --decision failed` or `job
+cancel <id>` it. The agent and repo must exist.
+
 `gitmoot job kill <root-job-id>` is the operator kill switch for a runaway
 delegation tree: it terminates the tree identified by its **root** job id
 gracefully. In-flight jobs finish normally; the coordinator's next continuation
