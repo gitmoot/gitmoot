@@ -325,18 +325,22 @@ path = ""
 # (issue #652). Gitmoot ships built-in metadata for each compiled runtime (codex,
 # claude, kimi, kimi-cli, shell) — capabilities, default/known models, and where
 # token usage is read from — that reproduces today's behavior. A [runtimes.<name>]
-# section OVERRIDES that metadata for a BUILT-IN runtime WITHOUT a recompile: point
-# a runtime at a new model id, record its known-valid models, or adjust its
-# advertised capabilities. It is METADATA ONLY — adapter behavior (auth, sandbox,
-# session resume, stream parsing) stays in Go. In particular models is ADVISORY:
-# Gitmoot never REJECTS a --model based on it, so populating it cannot change how a
-# job runs. Inspect the resolved registry with 'gitmoot runtime list'. With no
-# [runtimes.*] section behavior is byte-identical. NOTE: this section can only tweak
-# a BUILT-IN runtime's metadata — it cannot add a new first-class runtime (that is a
-# code change); an unknown runtime name here is an error. default_model overrides the
-# model used when neither the agent nor the job pins one (empty = the CLI's own
-# default); models is the advisory known-valid list; capabilities is a subset of
-# review/implement/ask; usage_source is a human-readable descriptor.
+# section OVERRIDES that recorded metadata for a BUILT-IN runtime WITHOUT a
+# recompile: record which models a runtime accepts, note its declared default, or
+# adjust its advertised capabilities. It is INSPECTION-ONLY METADATA — adapter
+# behavior (auth, sandbox, session resume, stream parsing, AND which model a job
+# actually runs on) stays in Go and is NEVER consulted at job delivery. Every field
+# here is surfaced by 'gitmoot runtime list' but changes nothing at runtime: setting
+# default_model does NOT retarget the model a job uses (a job's model still comes
+# from the agent/job --model or the runtime CLI's own config), models is advisory
+# (Gitmoot never REJECTS a --model based on it), and capabilities gates nothing at
+# dispatch (agent capabilities do). With no [runtimes.*] section behavior is
+# byte-identical. NOTE: this section can only tweak a BUILT-IN runtime's metadata —
+# it cannot add a new first-class runtime (that is a code change); an unknown runtime
+# name here is an error. default_model is the DECLARED default surfaced by 'runtime
+# list' (empty = none recorded); models is the advisory known-valid list;
+# capabilities is a subset of review/implement/ask; usage_source is a human-readable
+# descriptor.
 # [runtimes.codex]
 # default_model = "gpt-5.5-codex"
 # models = ["gpt-5.5-codex", "gpt-5.4-codex"]

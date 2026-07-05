@@ -32,9 +32,12 @@ type RuntimeMetadata struct {
 	// Capabilities are the job actions the runtime's adapter advertises. Every
 	// built-in advertises review/implement/ask today; the registry mirrors that.
 	Capabilities []string
-	// DefaultModel is the model used when neither the agent nor the job pins one.
-	// Empty (the default for every built-in) means "no --model arg" — the runtime
-	// CLI's own configured default, exactly as today.
+	// DefaultModel is the runtime's DECLARED default model, surfaced by
+	// `gitmoot runtime list`. It is inspection-only metadata and is NEVER consulted
+	// at delivery time: setting it does NOT retarget the model a job runs on — a
+	// job's model still comes from the agent/job --model or the runtime CLI's own
+	// configured default. Empty (the default for every built-in) means "none
+	// recorded", exactly as today.
 	DefaultModel string
 	// Models is an ADVISORY list of known-valid model ids for the runtime. Empty
 	// (the default for every built-in) means "unrestricted": Gitmoot passes any
