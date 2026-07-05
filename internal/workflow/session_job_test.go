@@ -207,6 +207,44 @@ func TestCloseExternalJobErrors(t *testing.T) {
 	}
 }
 
+// TestRetryJobRefusesSessionJob proves the retry invariant hardening (#657): a
+// session job that has reached a retry-eligible terminal state (failed here) must
+// NOT be re-queued by RetryJob — re-queuing it would let the daemon claim it and
+// Deliver an empty session payload to a real runtime (a session implement job could
+// push a spurious branch/PR). Retry must refuse before any state transition, and
+// the job must stay in its terminal state (never queued).
+func TestRetryJobRefusesSessionJob(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "jerryfane/gitmoot")
+
+	mb := Mailbox{Store: store}
+	if _, err := mb.OpenExternalJob(ctx, JobRequest{ID: "sess-retry", Agent: "lead", Action: "implement", Repo: "jerryfane/gitmoot"}); err != nil {
+		t.Fatalf("OpenExternalJob returned error: %v", err)
+	}
+	// Close it into a retry-eligible terminal state (failed).
+	if _, err := mb.CloseExternalJob(ctx, "sess-retry", AgentResult{Decision: "failed"}, 0, ""); err != nil {
+		t.Fatalf("CloseExternalJob returned error: %v", err)
+	}
+
+	_, err := RetryJob(ctx, store, "sess-retry")
+	if err == nil || !strings.Contains(err.Error(), "session job") {
+		t.Fatalf("RetryJob(session job) err = %v, want a session-job refusal", err)
+	}
+
+	after := mustJob(t, store, "sess-retry")
+	if after.State != string(JobFailed) {
+		t.Fatalf("session job state after refused retry = %q, want failed (never re-queued)", after.State)
+	}
+	queued, err := store.ListQueuedJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListQueuedJobs returned error: %v", err)
+	}
+	if len(queued) != 0 {
+		t.Fatalf("queued jobs = %d, want 0 (refused retry must not queue the session job)", len(queued))
+	}
+}
+
 func hasEventKind(events []db.JobEvent, kind string) bool {
 	for _, ev := range events {
 		if ev.Kind == kind {

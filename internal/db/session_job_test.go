@@ -105,6 +105,40 @@ func TestListRunningJobsUpdatedBeforeSkipsExternallyDriven(t *testing.T) {
 	}
 }
 
+// TestListQueuedJobsSkipsExternallyDriven is the belt-and-suspenders dispatch guard
+// (#657): even if some path forces an externally_driven row to state='queued', the
+// daemon's queued selector must never return it, so it can never be claimed and
+// Delivered to a runtime with an empty session payload. A normal queued job on the
+// same DB is still returned.
+func TestListQueuedJobsSkipsExternallyDriven(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.CreateJob(ctx, Job{ID: "engine-queued", Agent: "a", Type: "implement", State: "queued"}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	// A session job is created directly running; force it to 'queued' to simulate a
+	// hypothetical path that put it on the queue, and assert the selector still skips it.
+	if err := store.CreateExternallyDrivenJobWithEvent(ctx, Job{ID: "session-forced-queued", Agent: "lead", Type: "implement", State: "running"}, JobEvent{Kind: "running", Message: "job started"}); err != nil {
+		t.Fatalf("CreateExternallyDrivenJobWithEvent returned error: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET state = 'queued' WHERE id = 'session-forced-queued'`); err != nil {
+		t.Fatalf("force queued returned error: %v", err)
+	}
+
+	got, err := store.ListQueuedJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListQueuedJobs returned error: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "engine-queued" {
+		t.Fatalf("queued candidates = %+v, want only engine-queued (session job must be exempt)", got)
+	}
+}
+
 // TestExternallyDrivenColumnMigratesOnPreExistingDB proves the migration is correct
 // on a pre-existing DB: a job written on a first Open reads externally_driven=0 and
 // a re-open (idempotent re-migration) neither errors nor changes it.

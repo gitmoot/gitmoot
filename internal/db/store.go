@@ -2606,7 +2606,7 @@ func (s *Store) SumJobTokensByRoot(ctx context.Context, rootID string) (int, err
 // PRODUCTION text rather than a hand-copied duplicate — a change to this query is then
 // what the test actually asserts a plan for.
 const listQueuedJobsSQL = `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens
-		FROM jobs WHERE state = 'queued' ORDER BY created_at, rowid`
+		FROM jobs WHERE state = 'queued' AND externally_driven = 0 ORDER BY created_at, rowid`
 
 // ListQueuedJobs returns the queued jobs in created_at (then rowid) order. The
 // state predicate is the SQL literal 'queued' — not a bound parameter — so SQLite
@@ -2615,6 +2615,14 @@ const listQueuedJobsSQL = `SELECT id, agent, type, state, payload, parent_job_id
 // leaves the planner unable to prove the partial predicate, so it full-scans jobs
 // and builds a temp b-tree for the ORDER BY every worker tick (#619, verified by
 // EXPLAIN QUERY PLAN). 'queued' is a fixed constant, so inlining it is safe.
+//
+// The `externally_driven = 0` predicate defends the session-job invariant (#657):
+// a "here"/prompt-import job is executed by the calling session, never the engine,
+// so it must never be claimed off the queue and Delivered to a runtime even if some
+// path forced an externally_driven row to state='queued'. Session jobs are created
+// directly running so they normally never reach the queue at all; this is the
+// belt-and-suspenders guard mirroring the reaper's exemption below. It is a residual
+// filter on top of the partial-index scan, so the query plan is unchanged.
 func (s *Store) ListQueuedJobs(ctx context.Context) ([]Job, error) {
 	rows, err := s.db.QueryContext(ctx, listQueuedJobsSQL)
 	if err != nil {
