@@ -709,6 +709,42 @@ gitmoot task list --repo owner/repo --state implementing --json
 `$GITMOOT_HOME/worktrees/<owner>--<repo>/<task-id>/` and leaves the registered
 checkout on its current branch.
 
+### Recover a dead implement
+
+If an implementer dies mid-work — its process exits after editing the task
+worktree but before it commits, pushes, and opens a PR — the changes are left
+uncommitted in the worktree. `task run` (and `agent implement`) refuse to
+restart over that state rather than silently discard the work, and point you at
+`task recover`:
+
+```sh
+gitmoot task recover task-001 --owner lead
+gitmoot task recover task-001 --owner lead --repo owner/repo --skip-native-review-fanout --json
+```
+
+`--owner <agent>` is required and names a registered implement-capable agent,
+attributed as the recovery lead. `--repo owner/repo` is optional and falls back
+to the task's stored repo, so it is only needed when the task carries none.
+`--skip-native-review-fanout` persists that flag before the PR is opened, and
+`--json` prints the machine-readable recovery result.
+
+`task recover` commits the full worktree state (`git add -A`, including
+untracked non-ignored files), pushes the task branch, and opens or adopts the
+task's PR — the finalize steps the dead implementer never reached. When the
+worktree is already clean it recovers the commit already ahead of the base, and
+refuses when there is nothing ahead to recover.
+
+Two refusals guard recovery (and the `task run` / `agent implement` restart that
+points to it):
+
+- **Dirty worktree without an active job** — a restart refuses when the task
+  worktree has uncommitted changes and no in-flight job. Inspect it, then run
+  `task recover` to commit/push/open the PR, or clean/stash the worktree before
+  retrying.
+- **Live process still in the worktree** — `task recover` refuses while a live
+  process is still inside the task worktree. Wait for it to exit, or stop the
+  orphaned implementer, before recovering.
+
 ## PR Comments
 
 Use GitHub PR comments as the public audit trail:

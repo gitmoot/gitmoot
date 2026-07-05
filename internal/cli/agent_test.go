@@ -847,6 +847,201 @@ func TestPrepareLocalReviewDispatchRequestDoesNotReuseStaleReviewWorktree(t *tes
 	}
 }
 
+func TestPrepareLocalImplementDispatchRequestReusesExistingBranchTask(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "initial")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-existing",
+		RepoFullName: "owner/repo",
+		GoalID:       "goal-existing",
+		Title:        "Existing branch task",
+		State:        string(workflow.TaskImplementing),
+		Branch:       "feature/retry",
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir}
+	task, request, err := prepareLocalImplementDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
+		Home:         home,
+		Agent:        "builder",
+		Action:       "implement",
+		Instructions: "Continue the existing implementation branch.",
+		Branch:       "feature/retry",
+	})
+	if err != nil {
+		t.Fatalf("prepareLocalImplementDispatchRequest returned error: %v", err)
+	}
+	if task.ID != "task-existing" || request.TaskID != "task-existing" {
+		t.Fatalf("task.ID=%q request.TaskID=%q, want task-existing", task.ID, request.TaskID)
+	}
+	if task.Branch != "feature/retry" || request.Branch != "feature/retry" {
+		t.Fatalf("task.Branch=%q request.Branch=%q, want feature/retry", task.Branch, request.Branch)
+	}
+	if task.WorktreePath == "" {
+		t.Fatal("task worktree path was not allocated")
+	}
+	if currentBranch := strings.TrimSpace(runGitOutput(t, task.WorktreePath, "branch", "--show-current")); currentBranch != "feature/retry" {
+		t.Fatalf("task worktree branch = %q, want feature/retry", currentBranch)
+	}
+	stored, err := store.GetTask(ctx, "task-existing")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if stored.WorktreePath != task.WorktreePath || stored.State != string(workflow.TaskImplementing) {
+		t.Fatalf("stored task = %+v, returned task = %+v", stored, task)
+	}
+}
+
+func TestPrepareLocalImplementDispatchRequestRejectsDirtyExistingBranchTask(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	worktree := filepath.Join(home, "dirty-task")
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "initial")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	runGit(t, repoDir, "worktree", "add", "-b", "feature/retry", worktree, "main")
+	if err := os.WriteFile(filepath.Join(worktree, "feature.txt"), []byte("partial work\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-existing",
+		RepoFullName: "owner/repo",
+		GoalID:       "goal-existing",
+		Title:        "Existing branch task",
+		State:        string(workflow.TaskImplementing),
+		Branch:       "feature/retry",
+		WorktreePath: worktree,
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir}
+	_, _, err := prepareLocalImplementDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
+		Home:         home,
+		Agent:        "builder",
+		Action:       "implement",
+		Instructions: "Continue the existing implementation branch.",
+		Branch:       "feature/retry",
+	})
+	if err == nil || !strings.Contains(err.Error(), "uncommitted changes") || !strings.Contains(err.Error(), "gitmoot task recover task-existing") {
+		t.Fatalf("prepareLocalImplementDispatchRequest err = %v, want recover guidance", err)
+	}
+	if _, err := store.GetBranchLock(ctx, "owner/repo", "feature/retry"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("dirty dispatch refusal created branch lock, err=%v", err)
+	}
+}
+
+func TestPrepareLocalImplementDispatchRequestRejectsLiveExistingBranchTask(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	worktree := filepath.Join(home, "live-task")
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "initial")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-existing",
+		RepoFullName: "owner/repo",
+		GoalID:       "goal-existing",
+		Title:        "Existing branch task",
+		State:        string(workflow.TaskImplementing),
+		Branch:       "feature/retry",
+		WorktreePath: worktree,
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	prev := taskWorktreeHasLiveProcess
+	taskWorktreeHasLiveProcess = func(path string) bool { return path == worktree }
+	defer func() { taskWorktreeHasLiveProcess = prev }()
+
+	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir}
+	_, _, err := prepareLocalImplementDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
+		Home:         home,
+		Agent:        "builder",
+		Action:       "implement",
+		Instructions: "Continue the existing implementation branch.",
+		Branch:       "feature/retry",
+	})
+	if err == nil || !strings.Contains(err.Error(), "live process") {
+		t.Fatalf("prepareLocalImplementDispatchRequest err = %v, want live process", err)
+	}
+	if _, err := store.GetBranchLock(ctx, "owner/repo", "feature/retry"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("live dispatch refusal created branch lock, err=%v", err)
+	}
+}
+
+func TestPrepareLocalImplementDispatchRequestRejectsCompletedBranchTask(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "initial")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-existing",
+		RepoFullName: "owner/repo",
+		State:        string(workflow.TaskMerged),
+		Branch:       "feature/retry",
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir}
+	_, _, err := prepareLocalImplementDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
+		Home:         home,
+		Agent:        "builder",
+		Action:       "implement",
+		Instructions: "Implement a new task on a reused branch.",
+		Branch:       "feature/retry",
+	})
+	if err == nil || !strings.Contains(err.Error(), "state merged") {
+		t.Fatalf("prepareLocalImplementDispatchRequest err = %v, want completed task rejection", err)
+	}
+}
+
 func TestRunAgentAskBackgroundQueuesWithoutRuntimeDelivery(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()

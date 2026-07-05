@@ -396,6 +396,11 @@ func TestClaudeDeliverSelfHealsDeadSession(t *testing.T) {
 	if result.RefreshedRuntimeRef != "550e8400-e29b-41d4-a716-446655440099" {
 		t.Fatalf("RefreshedRuntimeRef = %q, want the fresh UUID", result.RefreshedRuntimeRef)
 	}
+	// A #443 dead-session self-heal re-pin is NOT ephemeral (#665): the mailbox
+	// MUST persist it — the old pinned session is genuinely gone.
+	if result.SessionEphemeral {
+		t.Fatalf("SessionEphemeral = true, want false for a #443 self-heal re-pin (it must be persisted)")
+	}
 	if len(runner.calls) != 2 {
 		t.Fatalf("expected exactly 2 runner calls (single bounded retry), got %d: %v", len(runner.calls), runner.calls)
 	}
@@ -619,6 +624,48 @@ func TestClaudeDeliverLastSessionCommand(t *testing.T) {
 		t.Fatalf("Deliver returned error: %v", err)
 	}
 	runner.want(t, 0, "claude", "--continue", "-p", "--output-format", "json", "--", "review")
+}
+
+func TestClaudeTemplateAgentIgnoresLastSession(t *testing.T) {
+	minted := "550e8400-e29b-41d4-a716-446655440099"
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"result":"coordinated"}`}}}
+	adapter := ClaudeAdapter{
+		Runner: runner,
+		NewRuntimeRef: func() (string, error) {
+			return minted, nil
+		},
+	}
+	agent := Agent{
+		Name:       "lead",
+		Role:       "agent",
+		Runtime:    ClaudeRuntime,
+		RuntimeRef: LastRef,
+		RepoScope:  "jerryfane/gitmoot",
+		TemplateID: "coordinator",
+		Model:      "opus",
+	}
+
+	result, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "coordinate"})
+	if err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	if result.Summary != "coordinated" {
+		t.Fatalf("Summary = %q, want coordinated", result.Summary)
+	}
+	// The minted session is ephemeral by design (#665): the mailbox adopts it for
+	// same-job repair but must never persist it onto the "last" registration.
+	if !result.SessionEphemeral {
+		t.Fatalf("SessionEphemeral = false, want true for a last+template coordinator session")
+	}
+	if result.RefreshedRuntimeRef != minted {
+		t.Fatalf("RefreshedRuntimeRef = %q, want the minted session %q", result.RefreshedRuntimeRef, minted)
+	}
+	runner.want(t, 0, "claude", "--model", "opus", "--session-id", minted, "-p", "--output-format", "json", "--", "coordinate")
+	for _, arg := range runner.calls[0] {
+		if arg == "--continue" || arg == "--resume" {
+			t.Fatalf("template-backed Claude last agent must use an isolated session, got %v", runner.calls[0])
+		}
+	}
 }
 
 func TestClaudeDeliverCommandAppliesAutonomyPolicy(t *testing.T) {

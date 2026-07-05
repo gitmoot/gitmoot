@@ -85,6 +85,18 @@ func applyJobRuntimeOverride(agent runtime.Agent, payload workflow.JobPayload) r
 	return agent
 }
 
+// scopeRegisteredFreshRefForJob rewrites a stored fresh:<seat> ref to a
+// deterministic fresh:<job> ref for the actual execution. This keeps fresh
+// registered agents isolated per job and gives their runtime-session lock a
+// job-scoped key. Runtime overrides already mint a unique fresh ref per job at
+// enqueue time, so callers use this only for non-overridden jobs.
+func scopeRegisteredFreshRefForJob(agent runtime.Agent, jobID string) runtime.Agent {
+	if runtime.IsFreshRef(agent.RuntimeRef) {
+		agent.RuntimeRef = runtime.FreshRefForJob(jobID)
+	}
+	return agent
+}
+
 // overrideRuntimeSessionResourceKey computes the runtime-session lock key for
 // a job running under a runtime override. Resumable runtimes keep the normal
 // "runtime:<rt>:<ref>" key (an explicit session serializes with other users

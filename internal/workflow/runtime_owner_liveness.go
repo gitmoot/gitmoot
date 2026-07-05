@@ -83,6 +83,14 @@ func (e Engine) worktreeHasLiveProcess(path string) bool {
 	return defaultWorktreeHasLiveProcess(path)
 }
 
+// WorktreeHasLiveProcess exposes the same conservative /proc cwd liveness probe
+// used by destructive worktree cleanup to CLI recovery/dispatch paths. It is
+// intentionally best-effort: false means "no same-host cwd owner observed", not a
+// proof that no external process can write.
+func WorktreeHasLiveProcess(path string) bool {
+	return defaultWorktreeHasLiveProcess(path)
+}
+
 // defaultWorktreeHasLiveProcess is a best-effort Linux /proc scan: it returns true
 // when any process's cwd symlink resolves to path or a descendant of it. The codex
 // resume worker in #536 ran with cwd == the delegation worktree, so its presence is

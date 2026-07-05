@@ -503,6 +503,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		return AgentResult{}, err
 	}
 
+	registeredFreshRef := runtime.IsFreshRef(agent.RuntimeRef)
 	prompt := prompts.RenderJob(payload.prompt(job.Type))
 	// Append the off-by-default "Prior learnings" memory block (#626 READ path).
 	// When the memory hook is unset (every non-enrolled path) or returns "" (no
@@ -524,7 +525,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		// there are zero prior artifacts to reconcile — this is its first real run.
 		prompt = blockerRetryReconciliationNotice(payload.BlockerClass, payload.BlockerAttempts) + "\n\n" + prompt
 	}
-	firstRaw, firstRefreshedRef, firstErr := m.deliver(ctx, adapter, agent, job, payload, prompt)
+	firstRaw, firstRefreshedRef, firstEphemeral, firstErr := m.deliver(ctx, adapter, agent, job, payload, prompt)
 	if firstErr != nil {
 		deliveryErr := DeliveryError{Err: firstErr}
 		// PRE-TERMINAL operational-blocker classification (#532 slice E): consult the
@@ -544,9 +545,13 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	// SESSION SAFETY (#531): a job running under a per-job runtime override must
 	// never write back to the agent's stored resume state — the stored ref
 	// belongs to the DEFAULT runtime, and persisting an override-runtime ref
-	// there would corrupt the agent's session identity. The refreshed ref is
-	// still adopted in-memory below so repair retries stay coherent.
-	if payload.RuntimeOverride == "" {
+	// there would corrupt the agent's session identity. An ephemeral by-design
+	// session (deliverFresh: the #531 fresh-ref path and the last+template
+	// coordinator path, #665) is likewise never persisted — persisting the minted
+	// UUID would rewrite a "last"/fresh registration and end the per-job isolation
+	// after job 1. Both refs are still adopted in-memory below so repair retries
+	// stay coherent. Only a genuine #443 dead-session self-heal re-pin persists.
+	if payload.RuntimeOverride == "" && !registeredFreshRef && !firstEphemeral {
 		m.persistRefreshedRuntimeRef(ctx, job.ID, agent, firstRefreshedRef)
 	}
 	// If the first delivery self-healed a dead session (#443), adopt the freshly
@@ -586,7 +591,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			}
 
 			repairPrompt := prompts.RenderRepairPrompt(lastRaw, parseErr)
-			repairRaw, repairRefreshedRef, repairErr := m.deliver(ctx, adapter, agent, job, payload, repairPrompt)
+			repairRaw, repairRefreshedRef, repairEphemeral, repairErr := m.deliver(ctx, adapter, agent, job, payload, repairPrompt)
 			if repairErr != nil {
 				deliveryErr := DeliveryError{Err: repairErr}
 				// Same pre-terminal seam as the first delivery, but the deferrer's
@@ -600,9 +605,10 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 				_ = m.fail(ctx, job.ID, fmt.Sprintf("repair delivery failed: %v", repairErr))
 				return AgentResult{}, deliveryErr
 			}
-			// Same #531 override guard as the first delivery: never persist an
-			// override-runtime ref onto the agent's default-runtime resume state.
-			if payload.RuntimeOverride == "" {
+			// Same #531 override + #665 ephemeral guard as the first delivery: never
+			// persist an override-runtime ref or a by-design per-job session onto the
+			// agent's default-runtime resume state.
+			if payload.RuntimeOverride == "" && !registeredFreshRef && !repairEphemeral {
 				m.persistRefreshedRuntimeRef(ctx, job.ID, agent, repairRefreshedRef)
 			}
 			// Adopt a freshly minted session ref so the next repair re-ask resumes the
@@ -646,7 +652,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	return result, nil
 }
 
-func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent runtime.Agent, job db.Job, payload JobPayload, prompt string) (string, string, error) {
+func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent runtime.Agent, job db.Job, payload JobPayload, prompt string) (string, string, bool, error) {
 	result, err := adapter.Deliver(ctx, agent, runtime.Job{
 		ID:          job.ID,
 		AgentName:   agent.Name,
@@ -673,6 +679,20 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 			inTok, outTok, _ = m.Store.RecordRuntimeSessionUsageDelta(ctx, agent.Runtime+":"+agent.RuntimeRef, result.InputTokens, result.OutputTokens)
 		} else if result.CumulativeUsage {
 			inTok, outTok = 0, 0
+		} else if agent.Runtime == runtime.CodexRuntime && result.RefreshedRuntimeRef != "" && result.RefreshedRuntimeRef != runtime.LastRef {
+			// A fresh codex delivery reports PER-JOB (non-cumulative) usage and skips the
+			// delta table by design (#664), so the runtime_session_usage baseline for its
+			// thread is never seeded. But a fresh codex delivery ALSO adopts its concrete
+			// thread in-memory for same-job repair (#665): if turn 1 is malformed, the
+			// repair delivery resumes that thread, reports SESSION-CUMULATIVE usage, and
+			// (turn1+turn2) would delta against a ZERO baseline — re-counting turn 1 on
+			// top of the verbatim record below (#669 interaction). SEED the baseline with
+			// turn 1's counts, keyed byte-identically to the key the repair path computes
+			// from the adopted ref (runtime+RefreshedRuntimeRef), so a repair delta =
+			// (turn1+turn2)-turn1 = turn2. The returned delta is discarded; the verbatim
+			// UpdateJobUsage below records this turn. Errors are swallowed like the delta
+			// call — usage accounting never fails a delivery.
+			_, _, _ = m.Store.RecordRuntimeSessionUsageDelta(ctx, agent.Runtime+":"+result.RefreshedRuntimeRef, result.InputTokens, result.OutputTokens)
 		}
 		// Only persist when a positive count remains so runtimes that report nothing
 		// (e.g. the shell runtime) or a delta that resolved to 0 leave the columns at
@@ -682,9 +702,9 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		}
 	}
 	if strings.TrimSpace(result.Summary) != "" {
-		return result.Summary, result.RefreshedRuntimeRef, err
+		return result.Summary, result.RefreshedRuntimeRef, result.SessionEphemeral, err
 	}
-	return result.Raw, result.RefreshedRuntimeRef, err
+	return result.Raw, result.RefreshedRuntimeRef, result.SessionEphemeral, err
 }
 
 // persistRefreshedRuntimeRef re-pins an agent that self-healed a dead session

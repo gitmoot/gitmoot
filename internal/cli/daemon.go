@@ -4686,6 +4686,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			return nil
 		}
 	}
+	if !overridden {
+		agent = scopeRegisteredFreshRefForJob(agent, job.ID)
+	}
 	if readOnlyImplementationBlocked(job.Type, agent) {
 		transitioned, err := markJobPermissionBlocked(ctx, w.Store, job.ID)
 		if err != nil {

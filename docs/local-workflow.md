@@ -38,6 +38,7 @@ gitmoot agent show <name>
 gitmoot agent doctor <name>
 gitmoot goal import --file GOAL.md --repo owner/repo
 gitmoot task run task-001 --repo owner/repo --owner lead --base main
+gitmoot task recover task-001 --owner lead   # finalize a dead implement's dirty worktree
 gitmoot task list --repo owner/repo
 gitmoot job list
 gitmoot job show <job-id>
@@ -57,6 +58,17 @@ gitmoot daemon status
 Goal import turns Markdown headings shaped like `### Task N: Title` into local
 planned tasks. `task run` starts one task branch in a dedicated worktree,
 records its branch lock, and stores the worktree path on the task.
+
+If an implementer dies mid-work — after editing the task worktree but before it
+commits, pushes, and opens a PR — the edits are left uncommitted. `task run`
+(and `agent implement`) refuse to restart over a dirty worktree with no active
+job, rather than silently discard the work, and point at `task recover <id>
+--owner <agent>`. `task recover` commits the full worktree state (`git add -A`,
+including untracked non-ignored files), pushes the branch, and opens or adopts
+the task's PR — the finalize steps the dead implementer never reached. `--repo`
+is optional (it falls back to the task's stored repo). Recovery refuses while a
+live process is still inside the task worktree; wait for it to exit or stop the
+orphaned implementer first.
 
 ## Runtime Plugin Setup
 

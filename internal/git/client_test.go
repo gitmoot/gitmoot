@@ -331,6 +331,31 @@ func TestClientHeadSHA(t *testing.T) {
 	runner.wantArgs(t, 0, "git", "rev-parse", "HEAD")
 }
 
+func TestClientRevParse(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "def456\n"}}}
+	sha, err := (Client{Runner: runner, Dir: "/repo"}).RevParse(context.Background(), "origin/main")
+	if err != nil {
+		t.Fatalf("RevParse returned error: %v", err)
+	}
+	if sha != "def456" {
+		t.Fatalf("sha = %q, want def456", sha)
+	}
+	runner.wantArgs(t, 0, "git", "rev-parse", "origin/main")
+}
+
+// TestClientRevParseRejectsDashRev guards against argument injection: a rev
+// starting with '-' would be parsed by git as a flag, so RevParse must reject it
+// before ever invoking git (no runner call). Mirrors validateBranch's dash guard.
+func TestClientRevParseRejectsDashRev(t *testing.T) {
+	runner := &fakeRunner{}
+	if _, err := (Client{Runner: runner, Dir: "/repo"}).RevParse(context.Background(), "--upload-pack=evil"); err == nil {
+		t.Fatal("RevParse accepted a rev starting with '-', want an error")
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("RevParse invoked git for a rejected rev; calls=%v", runner.calls)
+	}
+}
+
 func TestClientCreateBranchSmoke(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")

@@ -596,6 +596,15 @@ a success is working as designed, not flaky:
   envelope records a `malformed_output` event and is re-asked with a repair
   prompt a bounded number of times before failing terminally.
 
+**Dead implement recovery (manual):** if an implementer's process dies after
+editing the task worktree but before it commits/pushes/opens a PR, the edits sit
+uncommitted. `gitmoot task run` and `gitmoot agent implement` refuse to restart
+over a dirty worktree with no active job (so nothing is discarded) and point at
+`gitmoot task recover <task-id> --owner <agent>`, which commits the full
+worktree state (`git add -A`, incl. untracked non-ignored files), pushes the
+branch, and opens or adopts the PR. `--repo` is optional (falls back to the
+task's repo). Recovery refuses while a live process is still inside the worktree.
+
 The daemon default is `--workers 1`. Users can raise it when jobs target
 different runtime sessions, managed agent types with `max_background` greater
 than one, or forkable temporary workers. By default `[parallel_sessions]` uses

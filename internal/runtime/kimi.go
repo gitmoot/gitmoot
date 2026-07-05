@@ -61,7 +61,7 @@ func (a KimiAdapter) Validate(_ context.Context, agent Agent) error {
 		return err
 	}
 	if agent.RuntimeRef != "" && !isKimiSessionID(agent.RuntimeRef) && !IsFreshRef(agent.RuntimeRef) {
-		return fmt.Errorf("kimi runtime reference %q must be a Kimi session id, fresh:<uuid>, or empty", agent.RuntimeRef)
+		return fmt.Errorf("kimi runtime reference %q must be a Kimi session id, fresh:<suffix>, or empty", agent.RuntimeRef)
 	}
 	return nil
 }
@@ -159,7 +159,7 @@ func (a KimiCLIAdapter) Validate(_ context.Context, agent Agent) error {
 		return err
 	}
 	if agent.RuntimeRef != "" && !isKimiSessionID(agent.RuntimeRef) && !IsFreshRef(agent.RuntimeRef) {
-		return fmt.Errorf("kimi runtime reference %q must be a Kimi session id, fresh:<uuid>, or empty", agent.RuntimeRef)
+		return fmt.Errorf("kimi runtime reference %q must be a Kimi session id, fresh:<suffix>, or empty", agent.RuntimeRef)
 	}
 	return nil
 }

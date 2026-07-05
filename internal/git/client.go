@@ -318,6 +318,28 @@ func (c Client) HeadSHA(ctx context.Context) (string, error) {
 	return sha, nil
 }
 
+func (c Client) RevParse(ctx context.Context, rev string) (string, error) {
+	rev = strings.TrimSpace(rev)
+	if rev == "" {
+		return "", errors.New("git revision is required")
+	}
+	// Defense-in-depth against argument injection: a rev starting with '-' would be
+	// parsed by git as a flag, not a revision. No legitimate revision (SHA, HEAD,
+	// HEAD~1, refs/…, owner/branch) starts with '-'. Mirrors validateBranch.
+	if strings.HasPrefix(rev, "-") {
+		return "", fmt.Errorf("git revision %q must not start with '-'", rev)
+	}
+	result, err := c.run(ctx, "rev-parse", rev)
+	if err != nil {
+		return "", err
+	}
+	sha := strings.TrimSpace(result.Stdout)
+	if sha == "" {
+		return "", errors.New("git revision SHA is empty")
+	}
+	return sha, nil
+}
+
 func (c Client) UpdateBase(ctx context.Context, remote string, branch string) error {
 	if strings.TrimSpace(remote) == "" {
 		remote = "origin"

@@ -205,6 +205,9 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "route_selected", Message: routeSelectedMessage(request)}); err != nil {
 		return localAgentJobOutput{}, err
 	}
+	if overrideRuntime == "" {
+		effectiveAgent = scopeRegisteredFreshRefForJob(effectiveAgent, job.ID)
+	}
 	if request.Background {
 		return localAgentJobOutput{
 			JobID:                job.ID,
@@ -554,6 +557,38 @@ func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, 
 	taskID := strings.TrimSpace(request.TaskID)
 	taskTitle := strings.TrimSpace(request.TaskTitle)
 	goalID := strings.TrimSpace(request.GoalID)
+	branchHint := strings.TrimSpace(request.Branch)
+	if taskID == "" && branchHint != "" {
+		existing, err := store.GetTaskByRepoBranch(ctx, repo.FullName(), branchHint)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return db.Task{}, localAgentDispatchRequest{}, err
+		}
+		if err == nil {
+			if !taskBranchReusableForImplement(existing.State) {
+				return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s belongs to task %s in state %s; choose a fresh branch or recover/review the existing task", branchHint, existing.ID, existing.State)
+			}
+			if active, ok, err := findActiveImplementJobForTask(ctx, store, repo.FullName(), branchHint, existing.ID); err != nil {
+				return db.Task{}, localAgentDispatchRequest{}, err
+			} else if ok {
+				return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s already has active implement job %s for task %s", branchHint, active.ID, existing.ID)
+			}
+			if strings.TrimSpace(existing.WorktreePath) != "" && taskWorktreeHasLiveProcess(existing.WorktreePath) {
+				return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s has a live process still inside task worktree %s; wait for it to exit or stop the orphaned implementer before retrying implement", branchHint, existing.WorktreePath)
+			}
+			if dirty, err := taskWorktreeDirty(ctx, existing); err != nil {
+				return db.Task{}, localAgentDispatchRequest{}, err
+			} else if dirty {
+				skipFanout := taskRecoverSkipFanout(ctx, store, repo.FullName(), branchHint)
+				return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s has uncommitted changes in task worktree %s; inspect it, then run %s to commit/push/open a PR, or clean/stash it before retrying implement", branchHint, existing.WorktreePath, taskRecoverCommand(existing.ID, request.Home, repo.FullName(), request.Agent, skipFanout))
+			}
+			taskID = existing.ID
+			taskTitle = firstNonEmpty(taskTitle, existing.Title)
+			goalID = firstNonEmpty(goalID, existing.GoalID)
+			request.TaskID = taskID
+			request.TaskTitle = taskTitle
+			request.GoalID = goalID
+		}
+	}
 	if taskID == "" {
 		taskID = "adhoc-" + shortHash(request.Instructions+"\x00"+time.Now().UTC().Format(time.RFC3339Nano))
 		taskTitle = firstNonEmpty(taskTitle, shortTaskTitle(request.Instructions))

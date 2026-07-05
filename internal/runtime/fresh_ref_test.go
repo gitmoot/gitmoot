@@ -60,6 +60,22 @@ func TestNewFreshRef(t *testing.T) {
 	}
 }
 
+func TestFreshRefForJob(t *testing.T) {
+	ref := FreshRefForJob("local-ask-a/delegation/review-codex")
+	if !IsFreshRef(ref) {
+		t.Fatalf("FreshRefForJob() = %q, want fresh ref", ref)
+	}
+	if !strings.HasPrefix(ref, FreshRefPrefix+"job:") {
+		t.Fatalf("FreshRefForJob() = %q, want job-scoped suffix", ref)
+	}
+	if other := FreshRefForJob("local-ask-b/delegation/review-codex"); other == ref {
+		t.Fatalf("different jobs must get different fresh refs: %q", ref)
+	}
+	if again := FreshRefForJob("local-ask-a/delegation/review-codex"); again != ref {
+		t.Fatalf("FreshRefForJob must be deterministic: %q != %q", again, ref)
+	}
+}
+
 // TestValidateAgentAcceptsFreshRefs: the session-safety path mints fresh refs
 // for claude/kimi override jobs; agent validation must accept them.
 func TestValidateAgentAcceptsFreshRefs(t *testing.T) {
@@ -83,7 +99,12 @@ func TestCodexDeliverFreshRef(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFreshRef returned error: %v", err)
 	}
-	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "fresh output"}}}
+	stdout := strings.Join([]string{
+		`{"type":"thread.started","thread_id":"codex-thread-123"}`,
+		`{"type":"item.completed","item":{"type":"agent_message","text":"fresh output"}}`,
+		`{"type":"turn.completed","usage":{"input_tokens":7,"output_tokens":5}}`,
+	}, "\n")
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
 	adapter := CodexAdapter{Runner: runner}
 	agent := Agent{Name: "audit", Role: "reviewer", Runtime: CodexRuntime, RuntimeRef: ref, RepoScope: "jerryfane/gitmoot"}
 
@@ -94,6 +115,9 @@ func TestCodexDeliverFreshRef(t *testing.T) {
 	if result.Raw != "fresh output" {
 		t.Fatalf("Raw = %q", result.Raw)
 	}
+	if result.RefreshedRuntimeRef != "codex-thread-123" {
+		t.Fatalf("RefreshedRuntimeRef = %q, want codex thread id", result.RefreshedRuntimeRef)
+	}
 	runner.want(t, 0, "codex", "exec", "--json", "--model", "gpt-5.5-codex", "--", "do the thing")
 	for _, arg := range runner.calls[0] {
 		if arg == "resume" {
@@ -103,8 +127,9 @@ func TestCodexDeliverFreshRef(t *testing.T) {
 }
 
 // TestClaudeDeliverFreshRef: a fresh ref must deliver on a brand-new dedicated
-// --session-id (never --resume/--continue), never return a RefreshedRuntimeRef
-// (nothing may be re-pinned), and pass the per-job model through.
+// --session-id (never --resume/--continue), return that concrete session id so
+// same-job repair prompts resume the isolated job session, and pass the per-job
+// model through.
 func TestClaudeDeliverFreshRef(t *testing.T) {
 	ref, err := NewFreshRef()
 	if err != nil {
@@ -122,8 +147,13 @@ func TestClaudeDeliverFreshRef(t *testing.T) {
 	if result.Summary != "fresh claude output" {
 		t.Fatalf("Summary = %q", result.Summary)
 	}
-	if result.RefreshedRuntimeRef != "" {
-		t.Fatalf("fresh-ref delivery must not re-pin any session, got RefreshedRuntimeRef = %q", result.RefreshedRuntimeRef)
+	if result.RefreshedRuntimeRef != minted {
+		t.Fatalf("RefreshedRuntimeRef = %q, want minted fresh session %q", result.RefreshedRuntimeRef, minted)
+	}
+	// A fresh-ref session is ephemeral by design (#665): adopted in-memory for
+	// same-job repair, never persisted onto the agent's stored ref.
+	if !result.SessionEphemeral {
+		t.Fatalf("SessionEphemeral = false, want true for a fresh-ref delivery")
 	}
 	runner.want(t, 0, "claude", "--model", "claude-opus-4", "--session-id", minted, "-p", "--output-format", "json", "--", "do the thing")
 	for _, arg := range runner.calls[0] {

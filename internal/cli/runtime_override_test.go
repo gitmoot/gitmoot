@@ -113,6 +113,35 @@ func TestApplyJobRuntimeOverride(t *testing.T) {
 	}
 }
 
+func TestScopeRegisteredFreshRefForJob(t *testing.T) {
+	agent := runtime.Agent{
+		Name:       "council-codex",
+		Runtime:    runtime.CodexRuntime,
+		RuntimeRef: "fresh:council-codex",
+	}
+
+	scoped := scopeRegisteredFreshRefForJob(agent, "local-ask-root/delegation/review-codex")
+	if !runtime.IsFreshRef(scoped.RuntimeRef) {
+		t.Fatalf("scoped ref = %q, want fresh ref", scoped.RuntimeRef)
+	}
+	if scoped.RuntimeRef == agent.RuntimeRef {
+		t.Fatalf("registered fresh ref was not job-scoped: %q", scoped.RuntimeRef)
+	}
+	again := scopeRegisteredFreshRefForJob(agent, "local-ask-root/delegation/review-codex")
+	if again.RuntimeRef != scoped.RuntimeRef {
+		t.Fatalf("job scoping must be deterministic: %q != %q", again.RuntimeRef, scoped.RuntimeRef)
+	}
+	other := scopeRegisteredFreshRefForJob(agent, "local-ask-other/delegation/review-codex")
+	if other.RuntimeRef == scoped.RuntimeRef {
+		t.Fatalf("different jobs must not share fresh lock refs: %q", scoped.RuntimeRef)
+	}
+
+	pinned := runtime.Agent{Name: "reviewer", Runtime: runtime.ClaudeRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440000"}
+	if got := scopeRegisteredFreshRefForJob(pinned, "job-1"); got.RuntimeRef != pinned.RuntimeRef {
+		t.Fatalf("non-fresh ref changed: %q", got.RuntimeRef)
+	}
+}
+
 // TestOverrideRuntimeSessionResourceKey: the lock key always names the
 // OVERRIDE runtime — resumable runtimes keep the normal runtime:<rt>:<ref>
 // shape, and shell (normally lock-less) gets an override-scoped hashed key —

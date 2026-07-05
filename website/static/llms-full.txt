@@ -1040,6 +1040,7 @@ gitmoot agent show <name>
 gitmoot agent doctor <name>
 gitmoot goal import --file GOAL.md --repo owner/repo
 gitmoot task run task-001 --repo owner/repo --owner lead --base main
+gitmoot task recover task-001 --owner lead   # finalize a dead implement's dirty worktree
 gitmoot task list --repo owner/repo
 gitmoot job list
 gitmoot job show <job-id>
@@ -1059,6 +1060,17 @@ gitmoot daemon status
 Goal import turns Markdown headings shaped like `### Task N: Title` into local
 planned tasks. `task run` starts one task branch in a dedicated worktree,
 records its branch lock, and stores the worktree path on the task.
+
+If an implementer dies mid-work — after editing the task worktree but before it
+commits, pushes, and opens a PR — the edits are left uncommitted. `task run`
+(and `agent implement`) refuse to restart over a dirty worktree with no active
+job, rather than silently discard the work, and point at `task recover <id>
+--owner <agent>`. `task recover` commits the full worktree state (`git add -A`,
+including untracked non-ignored files), pushes the branch, and opens or adopts
+the task's PR — the finalize steps the dead implementer never reached. `--repo`
+is optional (it falls back to the task's stored repo). Recovery refuses while a
+live process is still inside the task worktree; wait for it to exit or stop the
+orphaned implementer first.
 
 ## Runtime Plugin Setup
 
@@ -2488,7 +2500,14 @@ Fixes:
   progress past the staleness window (default 30m; tune with the
   `GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value
   is 1m — below-1m, malformed, or non-positive values are rejected in favor of
-  the 30m default rather than clamped, #560).
+  the 30m default rather than clamped, #560). This window is a same-boot crash
+  backstop, not a timeout: a job holding a runtime session lock whose lease has
+  not elapsed is left running regardless of the window (its real timeout has not
+  passed). After a **reboot** you do not wait it out at all — the kernel boot id
+  changes, so on its next startup and every tick the daemon immediately requeues
+  every job claimed on the previous boot and reclaims its stranded runtime session
+  lock, regardless of any unexpired lease (#651). Boot-aware recovery is Linux
+  only; elsewhere recovery falls back to the lease/age window above.
 - A backlog of `blocked` jobs (each paused awaiting a human) never clears on its
   own. Dismiss one with `gitmoot job cancel <job-id>` (cancel now abandons a
   `blocked` job as well as a `queued`/`running` one; #631), or clear a stale
@@ -3033,6 +3052,20 @@ Parallelism under `pool` is bounded by **two** independent locks:
    `ask`/`review` jobs can be auto-isolated into an ephemeral detached worktree. A
    plain, top-level same-repo `implement` job with no worktree still shares the
    `repo:<repo>` key and serializes even under `pool`.
+
+   **Read-only fan-out worktrees are the committed tip.** An auto-isolated
+   read-only worktree is a detached `git worktree add` at the **committed tip** of
+   the base branch, so it does **not** contain gitignored paths (e.g. vendored
+   clones under `repos/**`) or any uncommitted working-tree changes. This only
+   kicks in for **two or more** read-only siblings (the fan-out that would
+   otherwise serialize); a **single** read-only delegation stays in the shared
+   base checkout and sees everything. Each fan-out child's prompt now carries a
+   note with the canonical base-checkout absolute path, so a worker whose sandbox
+   can read it (e.g. codex) reaches the real tree instead of reporting a
+   working-tree feature as missing. For whole-working-tree analysis that must see
+   gitignored or uncommitted state, either run a **single** read-only delegation
+   (no fan-out → stays in the base checkout) or pass an **absolute** path to the
+   file/dir under analysis.
 2. **Runtime session lock (`runtime:<runtime>:<ref>`).** Two jobs that use the
    **same** agent/runtime session serialize on the session lock even when their
    checkouts differ. So same-repo parallelism is bounded by **distinct runtime
@@ -7511,14 +7544,33 @@ implementation plans, standard goal files, agent template workflows, custom
 prompt agents, template capture, job status, or branch lock inspection.
 
 For current-chat prompt import, "use <agent> here" or "use Gitmoot agent
-<agent> here" means run `gitmoot agent prompt <agent>` and apply the returned
-prompt content in this current chat. This is prompt import, not true
-system-prompt injection. The natural phrase "use the Gitmoot planner here" maps
-to the same `planner` template used by managed planner agents. If the planner
-template is not cached, read and apply the packaged
-`agent-templates/planner.md` instructions directly. Do not route a "here"
-request through a background `gitmoot agent ask` unless the user explicitly
-asks for background execution, PR-comment routing, or job tracking.
+<agent> here" means import the agent's prompt into this current chat and apply
+it. This is prompt import, not true system-prompt injection. The natural phrase
+"use the Gitmoot planner here" maps to the same `planner` template used by
+managed planner agents. If the planner template is not cached, read and apply
+the packaged `agent-templates/planner.md` instructions directly. Do not route a
+"here" request through a background `gitmoot agent ask` unless the user
+explicitly asks for background execution, PR-comment routing, or job tracking.
+
+By DEFAULT, the "here" flow tracks the work: run
+`gitmoot agent prompt <agent> --record [--repo owner/repo]`, which opens a
+session job on import and returns the prompt with a header line naming its job
+id. Apply the prompt, do the work, then — this is REQUIRED — clock out with
+`gitmoot job close <id> --decision <approved|changes_requested|implemented|blocked|failed> --summary "..."`
+so the work shows in `job list`, the dashboard, and the event stream just like
+an engine-run job (no runtime is spawned; gitmoot is only the record-keeper).
+`--record` needs a **registered agent** with a repo scope — a bare template id is
+rejected. When "here" resolves to a **template that has no registered agent** (e.g.
+the packaged `planner` above, when no `planner` agent exists), import it with plain
+`gitmoot agent prompt <template>` (untracked); to still track it, register the agent
+first or log it explicitly with `gitmoot job record --agent <name> --repo owner/repo`.
+`--record` also defaults the job `--type` to `implement` — pass `--type ask` for
+advisory "here" work (planning, research) so it is not mislabeled.
+For a plain read-only peek — "just show me the prompt" — use
+`gitmoot agent prompt <agent>` WITHOUT `--record`, which opens no job. You can
+also clock in/out manually with `gitmoot job open` / `gitmoot job close`, or log
+already-finished work in one shot with `gitmoot job record` (see
+`references/CLI.md` → Session jobs).
 
 For template capture, phrases like "capture this session as a Gitmoot agent
 template", "turn this workflow into a Gitmoot template", or "draft a reusable
@@ -8457,7 +8509,25 @@ gitmoot agent prompt frontend-reviewer --json
 
 This prints the prompt content for the current chat to apply locally. It does
 not create a job, start a daemon, resume a runtime session, or post a PR
-comment.
+comment — a free read-only peek.
+
+To track the here-method work by default, add `--record`: it opens a session
+job on import (see "Session jobs" below) and returns the prompt with a header
+line naming the job id, so the imported work shows in `job list` / the dashboard
+once you clock out:
+
+```sh
+gitmoot agent prompt frontend-reviewer --record [--repo owner/repo] [--type ask|review|implement] [--json]
+# prints:  [gitmoot session job <id> — when this work is complete, run:
+#           gitmoot job close <id> --decision <approved|changes_requested|implemented|blocked|failed> --summary "..."]
+# followed by the prompt body.
+```
+
+`--record` requires an **agent** (not a bare template id); the repo comes from
+`--repo`, else the agent's `repo_scope` (error if neither is set). `--type`
+defaults to `implement`. When the imported work is done, close the job with
+`gitmoot job close <id> --decision …`. `--json` includes the opened `job_id`.
+Without `--record`, behavior is unchanged (no job).
 
 Draft and validate a captured template before installing it:
 
@@ -8564,6 +8634,42 @@ gitmoot task list --repo owner/repo --state implementing --json
 `$GITMOOT_HOME/worktrees/<owner>--<repo>/<task-id>/` and leaves the registered
 checkout on its current branch.
 
+### Recover A Dead Implement
+
+When an implementer dies mid-work — its process exits after editing the task
+worktree but before it commits, pushes, and opens a PR — the edits are left
+uncommitted in the worktree. `task run` (and `agent implement`) refuse to
+restart over that state so nothing is silently discarded, and point you at
+`task recover`:
+
+```sh
+gitmoot task recover task-001 --owner lead
+gitmoot task recover task-001 --owner lead --repo owner/repo --skip-native-review-fanout --json
+```
+
+`--owner <agent>` is required (a registered implement-capable agent, attributed
+as the recovery lead). `--repo owner/repo` is optional — it falls back to the
+task's stored repo and is only required when the task carries none.
+`--skip-native-review-fanout` persists that flag before the PR is opened;
+`--json` prints the machine-readable recovery result.
+
+`task recover` commits the full worktree state (`git add -A`, including
+untracked non-ignored files), pushes the task branch, and opens or adopts the
+task's PR — the exact finalize steps the dead implementer never reached. If the
+worktree is already clean it recovers the commit already ahead of the base
+(and refuses when there is nothing ahead to recover).
+
+Two refusals guard `task recover` (and the `task run` / `agent implement`
+restart that points to it):
+
+- **Dirty worktree without an active job** — `task run`/`agent implement` refuse
+  to restart a task whose worktree has uncommitted changes and no in-flight job;
+  inspect it, then `task recover` to commit/push/open the PR, or clean/stash the
+  worktree before retrying.
+- **Live process still in the worktree** — `task recover` refuses while a live
+  process is still inside the task worktree; wait for it to exit or stop the
+  orphaned implementer before recovering.
+
 ## PR Comments
 
 Use GitHub PR comments as the public audit trail:
@@ -8603,6 +8709,52 @@ gitmoot job kill <root-job-id>
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
+
+### Session jobs (record "here"-method work)
+
+The "here" method — importing an agent's prompt into your calling session with
+`gitmoot agent prompt <agent>` — does the real work in your session but creates
+**no gitmoot job**, so the dashboard / `job list` / event stream never reflect it.
+Session jobs record that work as a first-class tracked job **without gitmoot
+spawning a runtime** — a clock-in / clock-out pair (plus a one-shot recorder):
+
+```sh
+# Clock in: create a RUNNING, externally-driven job (no dispatch); prints its id.
+gitmoot job open --agent <name> --repo owner/repo --type ask|review|implement \
+                 [--title "..."] [--task <id>] [--pr <n>] [--json]
+
+# Clock out: apply the result and move the job to its terminal state.
+gitmoot job close <id> --decision approved|changes_requested|blocked|implemented|failed \
+                 [--summary "..."] [--pr <n>] [--branch <name>] [--json]
+
+# One-shot post-hoc: create an already-terminal job (open + close in one).
+gitmoot job record --agent <name> --repo owner/repo --type ask|review|implement \
+                 --decision <decision> [--title "..."] [--summary "..."] \
+                 [--task <id>] [--pr <n>] [--branch <name>] [--json]
+```
+
+An `externally_driven` job is created directly in `running` (it never queues, so
+the daemon never claims or Delivers it — no runtime subprocess, no runtime-session
+or checkout lock) and the stuck-`running` reaper **skips** it, so a session may
+hold it open for as long as the work takes. `close` reuses the exact result path an
+engine-run job uses: `--decision` maps to the same terminal state
+(`approved`/`changes_requested`/`implemented` → succeeded, `blocked` → blocked,
+`failed` → failed) and emits the same finished/failed/blocked event, so a recorded
+job is indistinguishable from an engine-run one in the dashboard and events. A job
+can be closed **once** (it must be a running session job); an orphaned open job
+stays `running` (reaper-exempt) until you `job close --decision failed` or `job
+cancel <id>` it. A session job is never engine-executed, so `job retry` **refuses**
+it (retrying would re-queue it for a real runtime with an empty payload) — recover
+one by opening a fresh session job instead. The agent and repo must exist.
+
+**Make in-chat / "here" work show on the dashboard.** The one-step default is
+`gitmoot agent prompt <agent> --record`: it opens the session job *as you import
+the prompt* and prints a header naming the job id (see the `agent prompt`
+section above). Apply the prompt, do the work, then clock out with
+`gitmoot job close <id> --decision …`. That is all it takes for otherwise-invisible
+current-chat ("here") work to appear in `job list`, the dashboard, and the event
+stream — no daemon, no runtime, no PR comment. Use plain `agent prompt` (no
+`--record`) only when you just want to read a prompt without tracking it.
 
 `gitmoot job kill <root-job-id>` is the operator kill switch for a runaway
 delegation tree: it terminates the tree identified by its **root** job id
@@ -8645,7 +8797,14 @@ progress past the staleness window (default 30m) is assumed orphaned by a dead
 worker and recovered/re-queued. The window is tunable via the
 `GITMOOT_STALE_RUNNING_AFTER` env var; the smallest honored value is 1m —
 below-1m, malformed, or non-positive values are rejected (with a one-time
-warning) in favor of the 30m default rather than clamped (#560).
+warning) in favor of the 30m default rather than clamped (#560). That window is a
+same-boot crash backstop, not a timeout: a running job whose runtime-session lease
+has not elapsed is left held regardless of the window. After a **reboot** there is
+no wait at all — the daemon detects the changed kernel boot id and, on its next
+startup and every tick, immediately requeues every job claimed on a previous boot
+and reclaims its stranded `runtime:<rt>:<session>` lock, regardless of any
+unexpired lease (Linux only; elsewhere recovery falls back to the lease/age window;
+#651).
 
 `gitmoot job cancel <job-id>` is the single-job **abandon** verb. It dismisses a
 `queued`, `running`, **or `blocked`** job (a blocked job is one paused awaiting a
@@ -9567,6 +9726,15 @@ a success is working as designed, not flaky:
   envelope records a `malformed_output` event and is re-asked with a repair
   prompt a bounded number of times before failing terminally.
 
+**Dead implement recovery (manual):** if an implementer's process dies after
+editing the task worktree but before it commits/pushes/opens a PR, the edits sit
+uncommitted. `gitmoot task run` and `gitmoot agent implement` refuse to restart
+over a dirty worktree with no active job (so nothing is discarded) and point at
+`gitmoot task recover <task-id> --owner <agent>`, which commits the full
+worktree state (`git add -A`, incl. untracked non-ignored files), pushes the
+branch, and opens or adopts the PR. `--repo` is optional (falls back to the
+task's repo). Recovery refuses while a live process is still inside the worktree.
+
 The daemon default is `--workers 1`. Users can raise it when jobs target
 different runtime sessions, managed agent types with `max_background` greater
 than one, or forkable temporary workers. By default `[parallel_sessions]` uses
@@ -9692,6 +9860,20 @@ Each child job carries job-tree linkage fields — `parent_job_id`,
 `delegation_id`, `root_job_id`, `delegation_depth`, and `task_id` — so a child
 can be traced back to its parent, its originating delegation, and the root of the
 tree. See `RESULT_CONTRACT.md` for the full delegation field reference.
+
+**Read-only fan-out runs at the committed tip.** When a coordinator emits **two
+or more** read-only (`ask`/`review`) siblings, Gitmoot auto-isolates each into a
+detached `git worktree` at the **committed tip** of the base branch so they run
+in parallel instead of serializing on the shared checkout. That worktree does
+**not** contain gitignored paths (e.g. vendored clones under `repos/**`) or any
+uncommitted working-tree changes, so an analysis/research leg cannot see the
+operator's live working tree there. Each such child's prompt now carries a note
+with the canonical base-checkout absolute path so a worker whose sandbox can read
+it (e.g. codex) reaches the real tree instead of reporting a working-tree feature
+as absent. A **single** read-only delegation stays in the shared base checkout
+and sees everything, so for whole-working-tree analysis (auditing gitignored
+vendored repos, or in-flight uncommitted WIP) either fan out to exactly **one**
+read-only leg or pass an **absolute** path to the file/dir under analysis.
 
 ## Coordinator-Owned Review
 
@@ -10094,7 +10276,10 @@ cannot recurse or fan out forever:
   not delegate further.
 - Per-root job budget `MaxDelegationTotalJobs = 64`: the whole delegation tree
   under one root (all children and continuations sharing that root) is capped.
-  When a batch would exceed it, the delegations are not dispatched.
+  The check is projected: the new jobs a batch would add (ready and deferred
+  legs, minus already-enqueued/fingerprint-deduped ones) are counted before any
+  child is enqueued, so a wide fan-out from just under the cap is refused whole
+  rather than overshooting it.
 - Per-root wall-clock budget `MaxDelegationWallClock = 2h`: the whole tree under
   one root is bounded in duration (measured from the root job's creation); a
   coordinator that tries to fan out after the tree has run this long is refused
@@ -10185,9 +10370,9 @@ cannot recurse or fan out forever:
   `human_questions[]` is byte-identical to today's behavior.
 
 When a bound trips, the offending delegations are not dispatched and the parent
-receives a typed lifecycle event explaining why (for example, the delegation tree
-for a root reached the job budget of 64). Rather than stopping silently, the
-engine then enqueues one **graceful finalize continuation**
+receives a typed lifecycle event explaining why (for example, a delegation batch
+of new jobs would exceed the per-root job budget of 64). Rather than stopping
+silently, the engine then enqueues one **graceful finalize continuation**
 (`delegation_finalize_enqueued`) back to the coordinator — told it cannot
 delegate further and asked to synthesize a best-effort final result and return
 empty delegations. That continuation is terminal: any delegations it returns are
@@ -10538,7 +10723,10 @@ Delegation trees are bounded so they cannot run forever:
   this depth may not delegate further. Override per host with the
   `GITMOOT_MAX_DELEGATION_DEPTH` env var (positive integer).
 - Per-root job budget: `MaxDelegationTotalJobs = 64`. The whole delegation tree
-  under one root is capped at this many jobs. Override per host with the
+  under one root is capped at this many jobs. The check is projected: a batch's
+  new jobs are counted before any child is enqueued and the whole batch is
+  refused if it would cross the cap, so a wide fan-out from just under the limit
+  does not overshoot. Override per host with the
   `GITMOOT_MAX_DELEGATION_TOTAL_JOBS` env var (positive integer).
 - Per-root wall-clock budget: `MaxDelegationWallClock = 2h`. The whole tree under
   one root is bounded in duration (measured from the root job's creation); a
@@ -10608,7 +10796,7 @@ Delegation trees are bounded so they cannot run forever:
 
 When a bound trips (a budget cap or confirmed loop), the offending delegations
 are not dispatched and the parent receives a typed lifecycle event explaining why
-(for example, "delegation tree for root <id> reached the job budget of 64").
+(for example, "delegation batch of <n> new job(s) would exceed the per-root job budget of 64").
 Rather than stopping silently, the engine then enqueues one **graceful finalize
 continuation** back to the coordinator (`delegation_finalize_enqueued`): it is
 told it cannot delegate further and asked to synthesize a best-effort final
