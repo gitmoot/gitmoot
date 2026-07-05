@@ -116,6 +116,39 @@ WHERE owner_kind = ? AND owner_ref = ? AND owner_version = ?
 	return n, nil
 }
 
+// CountConfirmedMemoriesForOwner returns how many confirmed_memories rows an
+// owner owns, across ALL owner versions and every repo/scope (owner_version is
+// deliberately not filtered — an agent owner always writes owner_version=''), so
+// it answers "how many injectable facts does this agent own". It backs the
+// dashboard's per-agent memory count and is a plain read (no FTS). Superseded
+// rows are excluded (superseded_by IS NULL) so the count matches the injectable
+// set surfaced by QueryConfirmedMemories.
+func (s *Store) CountConfirmedMemoriesForOwner(ctx context.Context, ownerKind, ownerRef string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM confirmed_memories
+WHERE owner_kind = ? AND owner_ref = ? AND superseded_by IS NULL`, ownerKind, ownerRef).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count confirmed memories for owner: %w", err)
+	}
+	return n, nil
+}
+
+// CountMemoryObservationsForOwner returns how many memory_observations rows an
+// owner owns, across ALL owner versions and every repo/scope/key. Observations
+// are append-only, so this is the raw sighting-report volume for the owner. It
+// backs the dashboard's per-agent observation count.
+func (s *Store) CountMemoryObservationsForOwner(ctx context.Context, ownerKind, ownerRef string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM memory_observations
+WHERE owner_kind = ? AND owner_ref = ?`, ownerKind, ownerRef).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count memory observations for owner: %w", err)
+	}
+	return n, nil
+}
+
 // UpsertConfirmedMemory writes or updates the single keyed confirmed row for a
 // fact and keeps the FTS index in sync, all in one transaction. Writes are
 // serialized by the store (MaxOpenConns=1) so a manual select-then-insert/update

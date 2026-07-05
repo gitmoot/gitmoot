@@ -22,7 +22,9 @@ import (
 	dashboard "github.com/jerryfane/gitmoot-dashboard"
 
 	"github.com/jerryfane/gitmoot/internal/buildinfo"
+	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/memory"
 	"github.com/jerryfane/gitmoot/internal/update"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
@@ -298,7 +300,7 @@ func (d *webDataSource) Jobs(ctx context.Context) ([]dashboard.JobSummary, error
 // rollup is always last.
 func (d *webDataSource) Agents(ctx context.Context) ([]dashboard.AgentSummary, error) {
 	out := []dashboard.AgentSummary{}
-	err := withStore(d.home, func(store *db.Store) error {
+	err := withStoreAndPaths(d.home, func(paths config.Paths, store *db.Store) error {
 		agents, err := store.ListAgents(ctx)
 		if err != nil {
 			return err
@@ -308,6 +310,11 @@ func (d *webDataSource) Agents(ctx context.Context) ([]dashboard.AgentSummary, e
 			return err
 		}
 
+		// The [agents.<name>] config sections drive the per-agent memory chip. Load
+		// them ONCE per call, fail-open: a config-load error yields a nil map (no
+		// chips) rather than failing the endpoint (mirrors Health()'s fail-open path).
+		agentTypes := loadAgentTypesFailOpen(paths)
+
 		// Aggregate per-agent job stats from the single ListJobs pass (shared with
 		// Agent()). Ephemeral workers fold into one rollup.
 		byAgent, ephemeral, hasEphemeral := aggregateAgentJobStats(jobs)
@@ -315,6 +322,9 @@ func (d *webDataSource) Agents(ctx context.Context) ([]dashboard.AgentSummary, e
 		out = make([]dashboard.AgentSummary, 0, len(agents)+1)
 		for _, a := range agents {
 			summary := newAgentSummary(a)
+			if at, ok := agentTypes[a.Name]; ok {
+				summary.MemoryEnabled = at.Memory
+			}
 			if s := byAgent[a.Name]; s != nil {
 				s.applyTo(&summary)
 			}
@@ -347,7 +357,7 @@ func (d *webDataSource) Agents(ctx context.Context) ([]dashboard.AgentSummary, e
 // the API layer returns 404 rather than 500.
 func (d *webDataSource) Agent(ctx context.Context, name string) (dashboard.AgentDetail, error) {
 	detail := dashboard.AgentDetail{Versions: []dashboard.TemplateVersionInfo{}}
-	err := withStore(d.home, func(store *db.Store) error {
+	err := withStoreAndPaths(d.home, func(paths config.Paths, store *db.Store) error {
 		agent, err := store.GetAgent(ctx, name)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -367,7 +377,25 @@ func (d *webDataSource) Agent(ctx context.Context, name string) (dashboard.Agent
 		if s := byAgent[agent.Name]; s != nil {
 			s.applyTo(&summary)
 		}
+
+		// Config-section visibility. Load the [agents.<name>] sections ONCE, fail-open
+		// (a config-load error => no section, Config nil, no chip — never an endpoint
+		// error). Config is nil unless this agent has its own section; the memory chip
+		// mirrors that section's memory flag so the summary matches Agents().
+		if at, ok := loadAgentTypesFailOpen(paths)[agent.Name]; ok {
+			summary.MemoryEnabled = at.Memory
+			detail.Config = agentConfigInfo(at)
+		}
 		detail.AgentSummary = summary
+
+		// Owned memory pool sizes (all owner versions). Fail-open: a query error
+		// leaves the count at 0 rather than failing the endpoint.
+		if n, cerr := store.CountConfirmedMemoriesForOwner(ctx, memory.OwnerKindAgent, agent.Name); cerr == nil {
+			detail.MemoryFacts = n
+		}
+		if n, cerr := store.CountMemoryObservationsForOwner(ctx, memory.OwnerKindAgent, agent.Name); cerr == nil {
+			detail.MemoryObservations = n
+		}
 
 		// Template + version history. Fail-open: a missing/broken template leaves the
 		// detail's Template nil and Versions the initialized empty slice rather than
@@ -401,6 +429,37 @@ func newAgentSummary(a db.Agent) dashboard.AgentSummary {
 		Capabilities:   a.Capabilities,
 		AutonomyPolicy: strings.TrimSpace(a.AutonomyPolicy),
 		Health:         strings.TrimSpace(a.HealthStatus),
+	}
+}
+
+// loadAgentTypesFailOpen loads the [agents.<name>] config sections for the memory
+// chip / config panel, returning nil on ANY error (missing/unreadable/malformed
+// config) so both Agents() and Agent() degrade to "no config visibility" rather
+// than failing the endpoint. Indexing the nil result is safe (a missing key
+// yields the zero AgentType, ok=false), so callers gate on the comma-ok.
+func loadAgentTypesFailOpen(paths config.Paths) map[string]config.AgentType {
+	types, err := config.LoadAgentTypes(paths)
+	if err != nil {
+		return nil
+	}
+	return types
+}
+
+// agentConfigInfo maps a resolved config.AgentType onto the dashboard's
+// AgentConfigInfo. The values are the [agents.<name>] section as LoadAgentTypes
+// resolves it — parse-time defaults INCLUDED (capabilities default ["ask"],
+// max_background 1, idle_timeout 20m, job_timeout 10m) — surfaced as-is per the
+// contract. Only ever called for an agent that has a config section (a non-nil
+// return is meaningful presence).
+func agentConfigInfo(at config.AgentType) *dashboard.AgentConfigInfo {
+	return &dashboard.AgentConfigInfo{
+		Memory:        at.Memory,
+		MaxBackground: at.MaxBackground,
+		IdleTimeout:   strings.TrimSpace(at.IdleTimeout),
+		JobTimeout:    strings.TrimSpace(at.JobTimeout),
+		Model:         strings.TrimSpace(at.Model),
+		Template:      strings.TrimSpace(at.Template),
+		Capabilities:  at.Capabilities,
 	}
 }
 
