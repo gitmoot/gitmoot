@@ -4610,6 +4610,14 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		return nil
 	}
 	agent := runtimeAgent(dbAgent)
+	// An ephemeral worker's runtime session exists solely for this job — it was
+	// started by startEphemeralWorker above and disposed by the cleanup defer.
+	// Mark it single-use so adapters whose CLIs report session-cumulative usage
+	// (codex, #658) can attribute that usage to the job: the whole session is
+	// this job's cost. In-memory only — GetAgent never returns the flag.
+	if payload.Ephemeral != nil {
+		agent.SingleUseSession = true
+	}
 	// Per-job runtime override (#531): the payload carries the override, so a
 	// background/daemon job honors it identically to a foreground dispatch. The
 	// effective agent swaps in the override runtime + the job's own session ref;
@@ -5669,6 +5677,9 @@ func (w jobWorker) startTempWorker(ctx context.Context, job db.Job, payload work
 	tempAgent := original
 	tempAgent.Name = tempWorkerInstanceName(original.Name, job.ID)
 	tempAgent.RuntimeRef = ""
+	// A temp worker's session is started for this one job and disposed after it
+	// — single-use, so session-cumulative usage (codex, #658) is the job's cost.
+	tempAgent.SingleUseSession = true
 	var cachedTemplate db.AgentTemplate
 	if tempAgent.TemplateID != "" {
 		var err error

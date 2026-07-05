@@ -172,6 +172,26 @@ func TestCodexDeliverCapturesUsage(t *testing.T) {
 	runner.want(t, 0, "codex", "exec", "--json", "--", "implement")
 }
 
+// TestCodexDeliverSingleUseSessionCapturesUsage pins the ephemeral/temp-worker
+// case (#658): the worker's session is started for one job and disposed after
+// it, so even though delivery RESUMES that session, codex's session-cumulative
+// usage is exactly the job's cost and must be captured. The daemon sets
+// SingleUseSession when materializing ephemeral and temp workers.
+func TestCodexDeliverSingleUseSessionCapturesUsage(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: codexUsageTranscript}}}
+	adapter := CodexAdapter{Runner: runner}
+	agent := Agent{Name: "impl-x-ephemeral-abc", Role: "implementer", Runtime: CodexRuntime, RuntimeRef: LastRef, RepoScope: "jerryfane/gitmoot", SingleUseSession: true}
+
+	result, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "implement"})
+	if err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	if result.InputTokens != 16504 || result.OutputTokens != 20 {
+		t.Fatalf("single-use codex usage = (%d, %d), want (16504, 20)", result.InputTokens, result.OutputTokens)
+	}
+	runner.want(t, 0, "codex", "exec", "--json", "resume", "--last", "--", "implement")
+}
+
 // TestCodexDeliverResumeReportsZeroUsage pins the resumed-session exclusion:
 // codex's turn.completed usage on a resumed thread is SESSION-CUMULATIVE, not
 // per-turn (probed live on codex-cli 0.142.4: three one-word turns reported

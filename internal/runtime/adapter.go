@@ -43,6 +43,15 @@ type Agent struct {
 	AutonomyPolicy string
 	HealthStatus   string
 	Model          string
+	// SingleUseSession marks an agent whose runtime session exists solely for
+	// the current job (ephemeral delegation workers and per-job temp workers:
+	// the session is started for the job and disposed after it). Adapters whose
+	// CLIs report SESSION-CUMULATIVE usage on resumed sessions (codex, see
+	// codexDeliverResult) may attribute that cumulative usage to the job when
+	// this is set — the whole session belongs to the job, so cumulative IS the
+	// per-job cost. Never set for long-lived registered agents, whose sessions
+	// span many jobs. In-memory only; not persisted on the agents table.
+	SingleUseSession bool
 }
 
 type Job struct {
@@ -64,10 +73,11 @@ type Result struct {
 	// default to 0. Per-runtime status today: claude reports usage via its
 	// --output-format json envelope; kimi-code 0.19.2 emits no usage event so it
 	// contributes 0; codex Deliver reads the last turn.completed usage from its
-	// `exec --json` JSONL output (#658) for FRESH sessions only — resumed
-	// sessions contribute 0 because codex reports session-cumulative usage there
-	// (see codexDeliverResult) — falling back to 0 on an older CLI that predates
-	// --json. A 0 here means "not captured", and the per-root delegation token
+	// `exec --json` JSONL output (#658) for single-job sessions only (fresh
+	// refs and SingleUseSession ephemeral/temp workers) — sessions shared
+	// across jobs contribute 0 because codex reports session-cumulative usage
+	// there (see codexDeliverResult) — falling back to 0 on an older CLI that
+	// predates --json. A 0 here means "not captured", and the per-root delegation token
 	// budget simply under-counts that job rather than failing.
 	InputTokens  int
 	OutputTokens int
@@ -342,7 +352,10 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 	if err != nil {
 		return Result{Raw: result.Stdout + result.Stderr}, codexCommandError(result, err)
 	}
-	return codexDeliverResult(result.Stdout, IsFreshRef(agent.RuntimeRef)), nil
+	// Usage is attributable to this job when the session belongs to it alone:
+	// a fresh ref (brand-new session, no resume) or a single-use session
+	// (ephemeral/temp workers — started for the job, disposed after it).
+	return codexDeliverResult(result.Stdout, IsFreshRef(agent.RuntimeRef) || agent.SingleUseSession), nil
 }
 
 // codexDeliverArgs builds the `codex exec` argument vector for a Deliver call.
@@ -397,9 +410,11 @@ func (a CodexAdapter) runCodex(ctx context.Context, agent Agent, prompt, model s
 // an unexpected shape) is returned verbatim as Raw with 0 usage, so a delivery is
 // never lost because usage parsing changed.
 //
-// Usage is reported ONLY for fresh sessions (per-job --runtime overrides and
-// ephemeral delegation workers — the #338 budget's primary target). On RESUMED
-// sessions codex's turn.completed usage is SESSION-CUMULATIVE, not per-turn:
+// Usage is reported ONLY for sessions that belong to a single job: fresh refs
+// (per-job --runtime overrides) and single-use sessions (ephemeral delegation
+// workers and per-job temp workers — the #338 budget's primary target). On
+// sessions SHARED across jobs codex's turn.completed usage is SESSION-CUMULATIVE,
+// not per-turn:
 // probed live on codex-cli 0.142.4, three one-word turns on one thread reported
 // input 16504 -> 85681 -> 103779 and output 20 -> 40 -> 45 (monotonically
 // accumulating), and a single resumed ask on a long-lived agent reported 22.4M
