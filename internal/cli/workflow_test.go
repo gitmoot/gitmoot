@@ -910,6 +910,33 @@ func TestRecoverTaskImplementationReleasesCreatedLockOnBlockedRecovery(t *testin
 	}
 }
 
+func TestRecoverTaskImplementationBlocksLiveWorktreeProcess(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: t.TempDir(), PollInterval: "30s"}); err != nil {
+		t.Fatalf("UpsertRepo returned error: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{Name: "lead", Runtime: "shell", RuntimeRef: "true", RepoScope: "owner/repo", Capabilities: []string{"implement"}, AutonomyPolicy: "workspace-write", HealthStatus: "ok"}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+	worktree := filepath.Join(home, "live-worktree")
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-001", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Bootstrap", State: string(workflow.TaskImplementing), Branch: "task-001-bootstrap", WorktreePath: worktree}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	prev := taskWorktreeHasLiveProcess
+	taskWorktreeHasLiveProcess = func(path string) bool { return path == worktree }
+	defer func() { taskWorktreeHasLiveProcess = prev }()
+
+	if _, err := recoverTaskImplementation(ctx, store, "task-001", "owner/repo", "lead", false, &stubTaskRecoverGitHub{}); err == nil || !strings.Contains(err.Error(), "live process") {
+		t.Fatalf("recover live worktree err = %v, want live process", err)
+	}
+	if _, err := store.GetBranchLock(ctx, "owner/repo", "task-001-bootstrap"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("live worktree recovery created branch lock, err=%v", err)
+	}
+}
+
 func TestRecoverTaskImplementationBlocksActiveJobAndWrongLockOwner(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()

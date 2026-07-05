@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jerryfane/gitmoot/internal/agenttemplate"
@@ -469,10 +471,16 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 	if executionPath == "orchestrate" {
 		errLabel = "orchestrate"
 	}
+	dispatchCtx := context.Background()
+	var stopSignals context.CancelFunc
+	if !options.background {
+		dispatchCtx, stopSignals = signal.NotifyContext(dispatchCtx, os.Interrupt, syscall.SIGTERM)
+		defer stopSignals()
+	}
 	var output localAgentJobOutput
 	if err := withStore(options.home, func(store *db.Store) error {
 		var err error
-		output, err = dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
+		output, err = dispatchLocalAgentJob(dispatchCtx, store, localAgentDispatchRequest{
 			RepoFlag:               options.repo,
 			Agent:                  options.agent,
 			Action:                 action,

@@ -955,6 +955,55 @@ func TestPrepareLocalImplementDispatchRequestRejectsDirtyExistingBranchTask(t *t
 	}
 }
 
+func TestPrepareLocalImplementDispatchRequestRejectsLiveExistingBranchTask(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	worktree := filepath.Join(home, "live-task")
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "initial")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-existing",
+		RepoFullName: "owner/repo",
+		GoalID:       "goal-existing",
+		Title:        "Existing branch task",
+		State:        string(workflow.TaskImplementing),
+		Branch:       "feature/retry",
+		WorktreePath: worktree,
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	prev := taskWorktreeHasLiveProcess
+	taskWorktreeHasLiveProcess = func(path string) bool { return path == worktree }
+	defer func() { taskWorktreeHasLiveProcess = prev }()
+
+	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir}
+	_, _, err := prepareLocalImplementDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
+		Home:         home,
+		Agent:        "builder",
+		Action:       "implement",
+		Instructions: "Continue the existing implementation branch.",
+		Branch:       "feature/retry",
+	})
+	if err == nil || !strings.Contains(err.Error(), "live process") {
+		t.Fatalf("prepareLocalImplementDispatchRequest err = %v, want live process", err)
+	}
+	if _, err := store.GetBranchLock(ctx, "owner/repo", "feature/retry"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("live dispatch refusal created branch lock, err=%v", err)
+	}
+}
+
 func TestPrepareLocalImplementDispatchRequestRejectsCompletedBranchTask(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
