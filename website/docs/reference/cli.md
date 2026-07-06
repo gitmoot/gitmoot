@@ -1250,3 +1250,73 @@ replay` re-renders recent real jobs' prompts with and without the injected
 learnings block and reports the token/entry delta. `memory eval` computes
 recall/precision@K of retrieval over a labeled `{agent, repo, instructions,
 expected_keys}` fixtures file.
+
+## Pipelines
+
+A pipeline (#681) runs a **declared DAG of shell stages** — a fixed, repeatable
+multi-step flow — on demand or on an interval schedule. Each stage is an ordinary
+queued job run through the **shell runtime**; a scan-based advancer folds each
+stage's `gitmoot_result` **decision** and enqueues the stages whose `needs` have all
+succeeded. Pipelines reuse the job queue, the result contract, and the heartbeat
+scheduling idiom (durable `next_due`, overlap guard, missed-ticks-coalesce), and are
+**off by default**.
+
+Define a pipeline in a YAML file, then register and run it:
+
+```yaml
+name: nightly-sync          # required, name-safe token (letters, digits, - _)
+repo: owner/repo            # optional to register; REQUIRED to run
+schedule:                   # optional interval schedule (no cron in v1)
+  interval: 24h
+  jitter: 15m
+stages:                     # the DAG, keyed by unique id and wired by needs
+  - id: source
+    cmd: "curl -sf https://example.com/data > data.json"
+  - id: score
+    cmd: "python score.py data.json"
+    needs: [source]         # runs only after source SUCCEEDS
+  - id: deploy
+    cmd: "rclone copy out/ r2:bucket"
+    needs: [score]
+    timeout: 30m            # optional per-stage job timeout
+    retry: 2                # optional; re-attempt a FAILED stage up to N times
+```
+
+```sh
+gitmoot pipeline add nightly-sync.yaml --enable   # validate + store; omit --enable to add disabled
+gitmoot pipeline list [--json]
+gitmoot pipeline show nightly-sync [--json]        # registry view for a name
+gitmoot pipeline run nightly-sync                  # start a manual run; prints the run id
+gitmoot pipeline show <run-id> [--json]            # run funnel for a "prun-…" id
+gitmoot pipeline resume <run-id> [--from <stage>]
+gitmoot pipeline cancel <run-id>
+gitmoot pipeline enable|disable nightly-sync
+gitmoot pipeline remove nightly-sync
+```
+
+`pipeline add` validates the whole spec at add time and stores the raw YAML
+**verbatim** plus a content hash; each run snapshots the hash and executes its
+snapshot, so editing the file later never mutates an in-flight run. It also
+auto-creates one hidden shell runner agent (`pipeline-<name>-runner`) that owns the
+stage jobs — hidden from `agent list` and disposed by `pipeline remove`.
+
+A stage signals its outcome by printing a `gitmoot_result` blob to stdout; the
+advancer folds by the **decision**, never the job's exit state (`changes_requested`
+is a succeeded job but folds as a stage **failure** by default):
+
+- a decision in the stage's `success_decisions` (default `approved`/`implemented`) →
+  **succeeded**, dependents enqueue;
+- `blocked` → the stage blocks, its `needs` persist, the run **parks blocked**
+  (downstream never enqueues, zero compute while parked);
+- `failed` / any other decision / a cancelled job / no `gitmoot_result` → the stage
+  **fails** (retried if budget remains), else the run **parks failed**.
+
+`pipeline run` prints only the run id (script-stable), ignores the `enabled` flag but
+still needs a `repo` and refuses to start while a run is active. `pipeline show
+<run-id>` renders the **text funnel** (`source OK -> score BLOCKED (needs: R2 token)
+-> deploy SKIPPED`); a **failed** run also prints the exact `gitmoot report bug --job
+<stage-job>` command (never auto-filed). `pipeline resume` re-runs a **parked** run
+from its halted stage (or `--from`) plus its transitive dependents while **never**
+re-running a succeeded stage. A pipeline stage is a **leaf**: a stage result carrying
+`delegations[]` never spawns children. See
+[Pipelines](../workflows/pipelines-workflow.md) for the full workflow.

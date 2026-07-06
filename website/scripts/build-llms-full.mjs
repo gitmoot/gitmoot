@@ -15,6 +15,7 @@ const sources = [
   'docs/troubleshooting.md',
   'docs/events.md',
   'docs/heartbeats.md',
+  'docs/pipelines.md',
   'docs/parallel-jobs.md',
   'docs/cockpit-orchestrate.md',
   'docs/skillopt-train-workflow.md',

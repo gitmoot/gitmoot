@@ -115,6 +115,23 @@ plan explicitly says they are intended tracked fixtures or release assets.
 Redact secrets from GitHub comments, job summaries, raw examples, and copied
 command output.
 
+## Pipeline Stages Run With Daemon Permissions
+
+`gitmoot pipeline add` (#681) is an **operator-trust action**. A pipeline stage's
+`cmd` is run **verbatim** via `sh -c` with the daemon's own permissions — there is
+no sandbox, allowlist, or policy gate around a stage command the way there is around
+an `implement` job. Registering a spec is exactly as privileged as pasting its stage
+commands into the daemon host's shell, so only add specs you would run yourself, and
+treat `pipeline add` from an untrusted source as arbitrary code execution.
+
+The spec is stored **verbatim** (the raw YAML bytes plus a content hash), so a spec
+that embeds private hostnames, filesystem paths, tokens-by-reference, or repo names
+is retained in the local store as-is — the same private-repo caveat as a captured
+agent template or a published template. Do not register a spec carrying a secret in
+a stage command; provision the secret out of band and have the stage read it from
+the environment, and let the stage return `blocked` (with its `needs`) until the
+secret is present rather than baking it into the DAG.
+
 ## External Contracts
 
 If the work depends on external APIs, CLIs, env vars, generated scripts, service

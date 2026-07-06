@@ -892,3 +892,84 @@ The optional `scripts/cockpit-smoke.sh` confirms the cockpit is opt-in and
 fail-open: it runs against an isolated `--home`, exercises the `--cockpit` wrap
 path when `herdr` is reachable, and skips cleanly when `herdr` or `gitmoot` is
 unavailable. See `../../../docs/cockpit-orchestrate.md` for the full reference.
+
+## Pipelines
+
+When the work is a **fixed, repeatable sequence of shell steps** with explicit
+dependencies — not a decomposition an LLM should reason about — declare a pipeline
+(#681) instead of orchestrating. A pipeline is a declared DAG of shell stages; each
+stage is an ordinary queued job run through the shell runtime, and a scan-based
+advancer folds each stage's `gitmoot_result` decision and enqueues the stages whose
+`needs` have all succeeded. Pipelines are off by default and reuse the same job
+queue and (heartbeat-style) scheduling as everything else.
+
+Write the DAG as YAML, register it, and run it:
+
+```yaml
+# nightly-sync.yaml
+name: nightly-sync
+repo: owner/repo            # required to run (stages need a managed repo)
+schedule:                   # optional; auto-runs every interval once enabled
+  interval: 24h
+  jitter: 15m
+stages:
+  - id: source
+    cmd: "curl -sf https://example.com/data > data.json"
+  - id: score
+    cmd: "python score.py data.json"
+    needs: [source]         # runs only after source SUCCEEDS
+  - id: deploy
+    cmd: "rclone copy out/ r2:bucket"
+    needs: [score]
+    retry: 2
+```
+
+```sh
+gitmoot pipeline add nightly-sync.yaml --enable   # validate + store; --enable turns on the schedule
+RUN=$(gitmoot pipeline run nightly-sync)          # or trigger a manual run now
+gitmoot pipeline show "$RUN"                       # watch the text funnel
+```
+
+A stage prints a `gitmoot_result` blob to stdout to signal its decision; the
+advancer folds by that **decision**, never the job's exit state:
+
+```sh
+printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"synced"}}'
+printf '%s' '{"gitmoot_result":{"decision":"blocked","summary":"secret missing","needs":["R2 token"]}}'
+```
+
+### Park and resume
+
+The core story is **park-then-resume**. When a stage returns `blocked`, the run
+parks: its `needs` are persisted and downstream stages are never enqueued, so the
+run consumes zero compute while it waits. `pipeline show <run-id>` makes the halt
+obvious as a funnel:
+
+```
+source OK -> score BLOCKED (needs: R2 token) -> deploy SKIPPED
+```
+
+The operator provisions what the stage needs out of band (here, an R2 token), then
+resumes — which re-runs the halted stage and everything downstream of it, while the
+already-landed upstream stages are left untouched:
+
+```sh
+gitmoot pipeline resume "$RUN"          # re-runs score + deploy; source is NOT re-run
+gitmoot pipeline resume "$RUN" --from source   # re-run from an explicit stage instead
+```
+
+A stage that returns `failed` (or any non-success decision, a cancelled job, or no
+`gitmoot_result`) parks the run **failed** after exhausting its `retry` budget;
+`pipeline show` then prints the exact `gitmoot report bug --job <stage-job>` command
+for the halted stage (it never files the bug for you). Approval gates that resume a
+blocked run automatically are a follow-up (#682) — v1 is the manual `resume` verb.
+
+### Stages are leaves
+
+A pipeline is **not** an orchestra. Each stage is a leaf: it runs a shell command
+and returns a decision, full stop. A stage result that carries `delegations[]` does
+**not** spawn children — the advancer ignores them and the engine strips them for a
+pipeline stage job, so a pipeline can never fan out into a delegation tree. Reach
+for an orchestra (a coordinator returning `delegations[]`) when you want dynamic,
+model-driven decomposition; reach for a pipeline when the steps and their wiring are
+known up front. See `../../../docs/pipelines.md` for the full reference.

@@ -136,6 +136,13 @@ func MaybeResumeOnGatesCleared(ctx context.Context, store *db.Store, jobID strin
 	if job.ExternallyDriven {
 		return GateResumeOutcome{Reason: "session job (externally driven) is not auto-resumed"}, nil
 	}
+	// Pipeline stage jobs (#681) resume at the RUN level (ResumePipelineRun mints
+	// attempt+1 with a new job id); retrying the old stage job here would orphan
+	// its re-execution outside the run's stage rows. Refuse, even for gate rows
+	// recorded before the mailbox-side exclusion existed.
+	if payload, perr := ParseJobPayload(job.Payload); perr == nil && payload.Sender == PipelineJobSender {
+		return GateResumeOutcome{Reason: "pipeline stage job; resume the run via `gitmoot pipeline resume`, job gates do not re-run stages"}, nil
+	}
 	awaiting, err := blockedJobAwaitingHuman(ctx, store, job)
 	if err != nil {
 		return GateResumeOutcome{}, err

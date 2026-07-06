@@ -1,0 +1,563 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/pipeline"
+	"github.com/jerryfane/gitmoot/internal/workflow"
+)
+
+// pipelineAdvanceStore opens an isolated store for advancer unit tests. The
+// advancer reads/writes real rows (run/stage/job), so a real store — not a mock —
+// is the honest test double; it never touches a user home.
+func pipelineAdvanceStore(t *testing.T) *db.Store {
+	t.Helper()
+	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	return store
+}
+
+// newTestPipeline stores a pipeline record built from spec YAML and returns the
+// canonical stored record plus the parsed spec.
+func newTestPipeline(t *testing.T, store *db.Store, name, specYAML string) (db.Pipeline, pipeline.Spec) {
+	t.Helper()
+	spec, err := pipeline.Load([]byte(specYAML))
+	if err != nil {
+		t.Fatalf("pipeline.Load: %v", err)
+	}
+	rec := db.Pipeline{Name: name, Repo: "owner/repo", SpecYAML: specYAML, SpecHash: pipeline.Hash([]byte(specYAML))}
+	if err := store.CreateOrUpdatePipeline(context.Background(), rec); err != nil {
+		t.Fatalf("CreateOrUpdatePipeline: %v", err)
+	}
+	got, ok, err := store.GetPipeline(context.Background(), name)
+	if err != nil || !ok {
+		t.Fatalf("GetPipeline: ok=%v err=%v", ok, err)
+	}
+	return got, spec
+}
+
+// testStageEnqueuer is a real Mailbox-backed enqueuer: it persists a queued job
+// row so the advancer's later GetJob(stage.JobID) fold works. It requires no
+// agent (Mailbox tolerates a missing agent) — the unit tests exercise the
+// advancer's decision logic, not the worker.
+func testStageEnqueuer(store *db.Store) pipelineStageEnqueuer {
+	mailbox := workflow.Mailbox{Store: store}
+	return func(ctx context.Context, request workflow.JobRequest) (db.Job, error) {
+		return mailbox.Enqueue(ctx, request)
+	}
+}
+
+// settleStageJob transitions a stage's enqueued job to the terminal state the real
+// mailbox would produce for a given decision (stateForDecision), attaching the
+// result. It faithfully reproduces the changes_requested TRAP: a changes_requested
+// job settles to jobs.state = SUCCEEDED, so an advancer that folded on jobs.state
+// would wrongly advance it.
+func settleStageJob(t *testing.T, store *db.Store, jobID, decision, summary string, needs []string) {
+	t.Helper()
+	ctx := context.Background()
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob(%s): %v", jobID, err)
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload: %v", err)
+	}
+	payload.Result = &workflow.AgentResult{Decision: decision, Summary: summary, Needs: needs}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	to := jobStateForDecision(decision)
+	ok, err := store.TransitionJobStatePayloadWithEvent(ctx, jobID, job.State, to, string(encoded),
+		db.JobEvent{JobID: jobID, Kind: to, Message: "settled by test"})
+	if err != nil || !ok {
+		t.Fatalf("settle %s -> %s: ok=%v err=%v", jobID, to, ok, err)
+	}
+}
+
+// jobStateForDecision mirrors workflow.stateForDecision (unexported): blocked and
+// failed are their own terminal states; everything else (approved, implemented,
+// AND changes_requested) is a SUCCEEDED job.
+func jobStateForDecision(decision string) string {
+	switch decision {
+	case "blocked":
+		return string(workflow.JobBlocked)
+	case "failed":
+		return string(workflow.JobFailed)
+	default:
+		return string(workflow.JobSucceeded)
+	}
+}
+
+func stageRow(t *testing.T, store *db.Store, runID, stageID string) db.PipelineRunStage {
+	t.Helper()
+	stage, ok, err := store.GetPipelineRunStage(context.Background(), runID, stageID)
+	if err != nil || !ok {
+		t.Fatalf("GetPipelineRunStage(%s/%s): ok=%v err=%v", runID, stageID, ok, err)
+	}
+	return stage
+}
+
+func startTestRun(t *testing.T, store *db.Store, rec db.Pipeline, spec pipeline.Spec, enqueue pipelineStageEnqueuer, now time.Time) db.PipelineRun {
+	t.Helper()
+	run, err := createPipelineRun(context.Background(), store, rec, spec, "manual", now)
+	if err != nil {
+		t.Fatalf("createPipelineRun: %v", err)
+	}
+	run, err = advancePipelineRun(context.Background(), store, enqueue, rec, spec, run, now)
+	if err != nil {
+		t.Fatalf("initial advance: %v", err)
+	}
+	return run
+}
+
+func advance(t *testing.T, store *db.Store, rec db.Pipeline, spec pipeline.Spec, enqueue pipelineStageEnqueuer, run db.PipelineRun, now time.Time) db.PipelineRun {
+	t.Helper()
+	updated, err := advancePipelineRun(context.Background(), store, enqueue, rec, spec, run, now)
+	if err != nil {
+		t.Fatalf("advance: %v", err)
+	}
+	return updated
+}
+
+const linearChainSpec = `name: chain
+repo: owner/repo
+stages:
+  - id: a
+    cmd: echo a
+  - id: b
+    cmd: echo b
+    needs: [a]
+  - id: c
+    cmd: echo c
+    needs: [b]
+`
+
+// TestAdvancerLinearChain proves a linear a->b->c chain advances one layer per
+// scan: each stage is enqueued only after its single dependency succeeds, and the
+// run reaches succeeded exactly when the last stage does.
+func TestAdvancerLinearChain(t *testing.T) {
+	store := pipelineAdvanceStore(t)
+	enqueue := testStageEnqueuer(store)
+	rec, spec := newTestPipeline(t, store, "chain", linearChainSpec)
+	now := time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC)
+
+	run := startTestRun(t, store, rec, spec, enqueue, now)
+	// Only the root is enqueued; b/c wait on their deps.
+	if got := stageRow(t, store, run.ID, "a"); got.State != pipeline.StageQueued || got.JobID == "" {
+		t.Fatalf("stage a = %+v, want queued with job", got)
+	}
+	if got := stageRow(t, store, run.ID, "b"); got.State != pipeline.StagePending || got.JobID != "" {
+		t.Fatalf("stage b = %+v, want pending with no job", got)
+	}
+
+	settleStageJob(t, store, stageRow(t, store, run.ID, "a").JobID, "approved", "a ok", nil)
+	run = advance(t, store, rec, spec, enqueue, run, now)
+	if got := stageRow(t, store, run.ID, "a"); got.State != pipeline.StageSucceeded {
+		t.Fatalf("stage a = %s, want succeeded", got.State)
+	}
+	if got := stageRow(t, store, run.ID, "b"); got.State != pipeline.StageQueued || got.JobID == "" {
+		t.Fatalf("stage b = %+v, want queued after a succeeded", got)
+	}
+	if run.State != pipeline.RunRunning {
+		t.Fatalf("run = %s, want running", run.State)
+	}
+
+	settleStageJob(t, store, stageRow(t, store, run.ID, "b").JobID, "implemented", "b ok", nil)
+	run = advance(t, store, rec, spec, enqueue, run, now)
+	if got := stageRow(t, store, run.ID, "c"); got.State != pipeline.StageQueued {
+		t.Fatalf("stage c = %s, want queued after b succeeded", got.State)
+	}
+
+	settleStageJob(t, store, stageRow(t, store, run.ID, "c").JobID, "approved", "c ok", nil)
+	run = advance(t, store, rec, spec, enqueue, run, now)
+	if run.State != pipeline.RunSucceeded {
+		t.Fatalf("run = %s, want succeeded", run.State)
+	}
+	if got := stageRow(t, store, run.ID, "c"); got.State != pipeline.StageSucceeded {
+		t.Fatalf("stage c = %s, want succeeded", got.State)
+	}
+	// The pipeline row mirrors the terminal status.
+	if rec2, _, _ := store.GetPipeline(context.Background(), "chain"); rec2.LastStatus != pipeline.RunSucceeded {
+		t.Fatalf("pipeline last_status = %q, want succeeded", rec2.LastStatus)
+	}
+}
+
+const diamondSpec = `name: diamond
+repo: owner/repo
+stages:
+  - id: a
+    cmd: echo a
+  - id: b
+    cmd: echo b
+    needs: [a]
+  - id: c
+    cmd: echo c
+    needs: [a]
+  - id: d
+    cmd: echo d
+    needs: [b, c]
+`
+
+// TestAdvancerDiamond proves fan-out/fan-in: a fans out to b AND c, and d waits
+// for BOTH before it is enqueued.
+func TestAdvancerDiamond(t *testing.T) {
+	store := pipelineAdvanceStore(t)
+	enqueue := testStageEnqueuer(store)
+	rec, spec := newTestPipeline(t, store, "diamond", diamondSpec)
+	now := time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC)
+
+	run := startTestRun(t, store, rec, spec, enqueue, now)
+	settleStageJob(t, store, stageRow(t, store, run.ID, "a").JobID, "approved", "a", nil)
+	run = advance(t, store, rec, spec, enqueue, run, now)
+	// Fan-out: both b and c enqueue off a.
+	if got := stageRow(t, store, run.ID, "b"); got.State != pipeline.StageQueued {
+		t.Fatalf("stage b = %s, want queued", got.State)
+	}
+	if got := stageRow(t, store, run.ID, "c"); got.State != pipeline.StageQueued {
+		t.Fatalf("stage c = %s, want queued", got.State)
+	}
+	if got := stageRow(t, store, run.ID, "d"); got.State != pipeline.StagePending {
+		t.Fatalf("stage d = %s, want pending", got.State)
+	}
+
+	// Only b succeeds: d must NOT enqueue (c still in flight).
+	settleStageJob(t, store, stageRow(t, store, run.ID, "b").JobID, "approved", "b", nil)
+	run = advance(t, store, rec, spec, enqueue, run, now)
+	if got := stageRow(t, store, run.ID, "d"); got.State != pipeline.StagePending {
+		t.Fatalf("stage d = %s, want still pending (c not done)", got.State)
+	}
+	if run.State != pipeline.RunRunning {
+		t.Fatalf("run = %s, want running", run.State)
+	}
+
+	// c succeeds: now d is ready.
+	settleStageJob(t, store, stageRow(t, store, run.ID, "c").JobID, "approved", "c", nil)
+	run = advance(t, store, rec, spec, enqueue, run, now)
+	if got := stageRow(t, store, run.ID, "d"); got.State != pipeline.StageQueued {
+		t.Fatalf("stage d = %s, want queued (both deps done)", got.State)
+	}
+
+	settleStageJob(t, store, stageRow(t, store, run.ID, "d").JobID, "approved", "d", nil)
+	run = advance(t, store, rec, spec, enqueue, run, now)
+	if run.State != pipeline.RunSucceeded {
+		t.Fatalf("run = %s, want succeeded", run.State)
+	}
+}
+
+// TestAdvancerBlockedPark proves a blocked stage parks the run: needs are
+// persisted at stage AND run level, and the downstream stage is never enqueued.
+func TestAdvancerBlockedPark(t *testing.T) {
+	store := pipelineAdvanceStore(t)
+	enqueue := testStageEnqueuer(store)
+	rec, spec := newTestPipeline(t, store, "chain", linearChainSpec)
+	now := time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC)
+
+	run := startTestRun(t, store, rec, spec, enqueue, now)
+	settleStageJob(t, store, stageRow(t, store, run.ID, "a").JobID, "approved", "a ok", nil)
+	run = advance(t, store, rec, spec, enqueue, run, now)
+
+	settleStageJob(t, store, stageRow(t, store, run.ID, "b").JobID, "blocked", "needs a secret", []string{"R2 token"})
+	run = advance(t, store, rec, spec, enqueue, run, now)
+
+	if run.State != pipeline.RunBlocked {
+		t.Fatalf("run = %s, want blocked", run.State)
+	}
+	if run.HaltStage != "b" {
+		t.Fatalf("halt_stage = %q, want b", run.HaltStage)
+	}
+	if got := decodePipelineNeeds(run.NeedsJSON); len(got) != 1 || got[0] != "R2 token" {
+		t.Fatalf("run needs = %v, want [R2 token]", got)
+	}
+	b := stageRow(t, store, run.ID, "b")
+	if b.State != pipeline.StageBlocked {
+		t.Fatalf("stage b = %s, want blocked", b.State)
+	}
+	if got := decodePipelineNeeds(b.NeedsJSON); len(got) != 1 || got[0] != "R2 token" {
+		t.Fatalf("stage b needs = %v, want [R2 token]", got)
+	}
+	c := stageRow(t, store, run.ID, "c")
+	if c.JobID != "" {
+		t.Fatalf("stage c job = %q, want never enqueued", c.JobID)
+	}
+	if c.State != pipeline.StageSkipped {
+		t.Fatalf("stage c = %s, want skipped", c.State)
+	}
+}
+
+const independentBranchSpec = `name: fork
+repo: owner/repo
+stages:
+  - id: a
+    cmd: echo a
+  - id: b
+    cmd: echo b
+  - id: c
+    cmd: echo c
+    needs: [b]
+`
+
+// TestAdvancerIndependentBranchRunsWhenSiblingBlocks proves per-branch (not
+// run-wide) halting: two independent roots a and b, with c depending only on b.
+// When a blocks, c's branch (b -> c) is fully reachable and MUST still run to
+// completion; the run parks blocked only because of a, and only once nothing is in
+// flight. A run-wide fail-fast would wrongly skip c even though its dep b succeeded.
+func TestAdvancerIndependentBranchRunsWhenSiblingBlocks(t *testing.T) {
+	store := pipelineAdvanceStore(t)
+	enqueue := testStageEnqueuer(store)
+	rec, spec := newTestPipeline(t, store, "fork", independentBranchSpec)
+	now := time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC)
+
+	// Both roots enqueue immediately; c waits on b.
+	run := startTestRun(t, store, rec, spec, enqueue, now)
+	if got := stageRow(t, store, run.ID, "a"); got.State != pipeline.StageQueued {
+		t.Fatalf("stage a = %s, want queued", got.State)
+	}
+	if got := stageRow(t, store, run.ID, "b"); got.State != pipeline.StageQueued {
+		t.Fatalf("stage b = %s, want queued", got.State)
+	}
+
+	// a blocks, b succeeds: the block must NOT halt b's independent branch.
+	settleStageJob(t, store, stageRow(t, store, run.ID, "a").JobID, "blocked", "a needs a secret", []string{"R2 token"})
+	settleStageJob(t, store, stageRow(t, store, run.ID, "b").JobID, "approved", "b ok", nil)
+	run = advance(t, store, rec, spec, enqueue, run, now)
+
+	// c's dep b succeeded, so c is enqueued and the run stays running (c in flight).
+	c := stageRow(t, store, run.ID, "c")
+	if c.State != pipeline.StageQueued || c.JobID == "" {
+		t.Fatalf("stage c = %+v, want queued after b succeeded (independent of blocked a)", c)
+	}
+	if run.State != pipeline.RunRunning {
+		t.Fatalf("run = %s, want still running while c is in flight", run.State)
+	}
+	if got := stageRow(t, store, run.ID, "a"); got.State != pipeline.StageBlocked {
+		t.Fatalf("stage a = %s, want blocked", got.State)
+	}
+
+	// c completes: only now, with nothing in flight, does the run park blocked on a.
+	settleStageJob(t, store, c.JobID, "approved", "c ok", nil)
+	run = advance(t, store, rec, spec, enqueue, run, now)
+	if got := stageRow(t, store, run.ID, "c"); got.State != pipeline.StageSucceeded {
+		t.Fatalf("stage c = %s, want succeeded (reachable branch ran to completion)", got.State)
+	}
+	if run.State != pipeline.RunBlocked {
+		t.Fatalf("run = %s, want blocked (parks on a once nothing is in flight)", run.State)
+	}
+	if run.HaltStage != "a" {
+		t.Fatalf("halt_stage = %q, want a", run.HaltStage)
+	}
+	if got := decodePipelineNeeds(run.NeedsJSON); len(got) != 1 || got[0] != "R2 token" {
+		t.Fatalf("run needs = %v, want [R2 token]", got)
+	}
+}
+
+const retrySpec = `name: retry
+repo: owner/repo
+stages:
+  - id: a
+    cmd: echo a
+    retry: 1
+  - id: b
+    cmd: echo b
+    needs: [a]
+`
+
+// TestAdvancerFailedRetryBudget proves a failed stage is retried while its budget
+// lasts (a fresh attempt/job id), then parks the run failed once exhausted.
+func TestAdvancerFailedRetryBudget(t *testing.T) {
+	store := pipelineAdvanceStore(t)
+	enqueue := testStageEnqueuer(store)
+	rec, spec := newTestPipeline(t, store, "retry", retrySpec)
+	now := time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC)
+
+	run := startTestRun(t, store, rec, spec, enqueue, now)
+	firstJob := stageRow(t, store, run.ID, "a").JobID
+
+	// First failure: budget (retry:1) remains, so a re-attempts under a new id.
+	settleStageJob(t, store, firstJob, "failed", "boom", nil)
+	run = advance(t, store, rec, spec, enqueue, run, now)
+	a := stageRow(t, store, run.ID, "a")
+	if a.State != pipeline.StageQueued {
+		t.Fatalf("stage a = %s, want re-queued after retry", a.State)
+	}
+	if a.Attempt != 1 {
+		t.Fatalf("stage a attempt = %d, want 1", a.Attempt)
+	}
+	if a.JobID == firstJob || a.JobID == "" {
+		t.Fatalf("retry job id = %q, want a fresh id (was %q)", a.JobID, firstJob)
+	}
+	if run.State != pipeline.RunRunning {
+		t.Fatalf("run = %s, want still running during retry", run.State)
+	}
+
+	// Second failure: budget exhausted, run parks failed and b is skipped.
+	settleStageJob(t, store, a.JobID, "failed", "boom again", nil)
+	run = advance(t, store, rec, spec, enqueue, run, now)
+	if run.State != pipeline.RunFailed {
+		t.Fatalf("run = %s, want failed", run.State)
+	}
+	if run.HaltStage != "a" {
+		t.Fatalf("halt_stage = %q, want a", run.HaltStage)
+	}
+	if got := stageRow(t, store, run.ID, "a"); got.State != pipeline.StageFailed || got.Attempt != 1 {
+		t.Fatalf("stage a = %+v, want failed attempt 1", got)
+	}
+	if got := stageRow(t, store, run.ID, "b"); got.State != pipeline.StageSkipped || got.JobID != "" {
+		t.Fatalf("stage b = %+v, want skipped never-enqueued", got)
+	}
+}
+
+const changesRequestedSpec = `name: cr
+repo: owner/repo
+stages:
+  - id: a
+    cmd: echo a
+  - id: b
+    cmd: echo b
+    needs: [a]
+`
+
+// TestAdvancerChangesRequestedDoesNotAdvance is the stateForDecision TRAP: a
+// changes_requested stage job is jobs.state=SUCCEEDED, but changes_requested is
+// NOT a default success_decision, so the advancer must treat the stage as failed
+// (not advance). Folding on jobs.state would wrongly succeed it and enqueue b.
+func TestAdvancerChangesRequestedDoesNotAdvance(t *testing.T) {
+	store := pipelineAdvanceStore(t)
+	enqueue := testStageEnqueuer(store)
+	rec, spec := newTestPipeline(t, store, "cr", changesRequestedSpec)
+	now := time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC)
+
+	run := startTestRun(t, store, rec, spec, enqueue, now)
+	aJob := stageRow(t, store, run.ID, "a").JobID
+	settleStageJob(t, store, aJob, "changes_requested", "needs work", nil)
+
+	// Guard the trap premise: the underlying JOB really is succeeded.
+	if job, _ := store.GetJob(context.Background(), aJob); job.State != string(workflow.JobSucceeded) {
+		t.Fatalf("precondition: job state = %s, want succeeded (the trap)", job.State)
+	}
+
+	run = advance(t, store, rec, spec, enqueue, run, now)
+	if got := stageRow(t, store, run.ID, "a"); got.State != pipeline.StageFailed {
+		t.Fatalf("stage a = %s, want failed (changes_requested must NOT advance)", got.State)
+	}
+	if got := stageRow(t, store, run.ID, "b"); got.JobID != "" || got.State == pipeline.StageQueued {
+		t.Fatalf("stage b = %+v, want never enqueued", got)
+	}
+	if run.State != pipeline.RunFailed {
+		t.Fatalf("run = %s, want failed", run.State)
+	}
+}
+
+// TestAdvancerChangesRequestedHonorsSuccessOverride proves the same
+// changes_requested decision DOES advance when the stage opts it into
+// success_decisions — the decision, not jobs.state, is what the advancer keys on.
+func TestAdvancerChangesRequestedHonorsSuccessOverride(t *testing.T) {
+	store := pipelineAdvanceStore(t)
+	enqueue := testStageEnqueuer(store)
+	const spec = `name: cr2
+repo: owner/repo
+stages:
+  - id: a
+    cmd: echo a
+    success_decisions: [approved, changes_requested]
+  - id: b
+    cmd: echo b
+    needs: [a]
+`
+	rec, parsed := newTestPipeline(t, store, "cr2", spec)
+	now := time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC)
+
+	run := startTestRun(t, store, rec, parsed, enqueue, now)
+	settleStageJob(t, store, stageRow(t, store, run.ID, "a").JobID, "changes_requested", "ok enough", nil)
+	run = advance(t, store, rec, parsed, enqueue, run, now)
+	if got := stageRow(t, store, run.ID, "a"); got.State != pipeline.StageSucceeded {
+		t.Fatalf("stage a = %s, want succeeded (override lists changes_requested)", got.State)
+	}
+	if got := stageRow(t, store, run.ID, "b"); got.State != pipeline.StageQueued {
+		t.Fatalf("stage b = %s, want queued", got.State)
+	}
+}
+
+// TestAdvancerSkippedPropagation proves a failed stage's transitive dependents are
+// all marked skipped (never enqueued), giving a clean terminal picture.
+func TestAdvancerSkippedPropagation(t *testing.T) {
+	store := pipelineAdvanceStore(t)
+	enqueue := testStageEnqueuer(store)
+	rec, spec := newTestPipeline(t, store, "chain", linearChainSpec)
+	now := time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC)
+
+	run := startTestRun(t, store, rec, spec, enqueue, now)
+	// a fails with no retry budget -> b and c can never run.
+	settleStageJob(t, store, stageRow(t, store, run.ID, "a").JobID, "failed", "root broke", nil)
+	run = advance(t, store, rec, spec, enqueue, run, now)
+
+	if run.State != pipeline.RunFailed {
+		t.Fatalf("run = %s, want failed", run.State)
+	}
+	for _, id := range []string{"b", "c"} {
+		got := stageRow(t, store, run.ID, id)
+		if got.State != pipeline.StageSkipped || got.JobID != "" {
+			t.Fatalf("stage %s = %+v, want skipped never-enqueued", id, got)
+		}
+	}
+}
+
+// TestAdvancerIdempotentRescan proves a re-scan with nothing newly settled makes
+// no new enqueues and no state change: the deterministic ids + stage-state gating
+// make advancement safe to run every tick.
+func TestAdvancerIdempotentRescan(t *testing.T) {
+	store := pipelineAdvanceStore(t)
+	enqueue := testStageEnqueuer(store)
+	rec, spec := newTestPipeline(t, store, "chain", linearChainSpec)
+	now := time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC)
+
+	run := startTestRun(t, store, rec, spec, enqueue, now)
+	beforeJobs := countRunJobs(t, store, run.ID)
+	beforeA := stageRow(t, store, run.ID, "a")
+
+	// Re-advance with no settled job: pure no-op.
+	run = advance(t, store, rec, spec, enqueue, run, now)
+	run = advance(t, store, rec, spec, enqueue, run, now)
+	if got := countRunJobs(t, store, run.ID); got != beforeJobs {
+		t.Fatalf("re-scan enqueued jobs: before=%d after=%d", beforeJobs, got)
+	}
+	afterA := stageRow(t, store, run.ID, "a")
+	if afterA.State != beforeA.State || afterA.JobID != beforeA.JobID {
+		t.Fatalf("re-scan changed stage a: before=%+v after=%+v", beforeA, afterA)
+	}
+	if run.State != pipeline.RunRunning {
+		t.Fatalf("run = %s, want still running", run.State)
+	}
+
+	// Advance one real layer, then prove the settled layer is also idempotent.
+	settleStageJob(t, store, afterA.JobID, "approved", "a", nil)
+	run = advance(t, store, rec, spec, enqueue, run, now)
+	midJobs := countRunJobs(t, store, run.ID)
+	bJob := stageRow(t, store, run.ID, "b").JobID
+	run = advance(t, store, rec, spec, enqueue, run, now)
+	if got := countRunJobs(t, store, run.ID); got != midJobs {
+		t.Fatalf("re-scan after a-settled enqueued jobs: before=%d after=%d", midJobs, got)
+	}
+	if got := stageRow(t, store, run.ID, "b").JobID; got != bJob {
+		t.Fatalf("re-scan changed stage b job id: before=%q after=%q", bJob, got)
+	}
+}
+
+// countRunJobs counts persisted jobs belonging to a run (root == run id).
+func countRunJobs(t *testing.T, store *db.Store, runID string) int {
+	t.Helper()
+	jobs, err := store.ListJobsByRoot(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListJobsByRoot: %v", err)
+	}
+	return len(jobs)
+}

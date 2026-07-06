@@ -1,0 +1,184 @@
+package pipeline
+
+import (
+	"reflect"
+	"strings"
+	"testing"
+)
+
+const validSpec = `
+name: deploy-flow
+repo: jerryfane/gitmoot
+schedule:
+  interval: 24h
+  jitter: 15m
+success_decisions: [approved, implemented]
+stages:
+  - id: source
+    cmd: git fetch --all
+  - id: score
+    cmd: ./score.sh
+    needs: [source]
+    timeout: 10m
+    retry: 2
+  - id: deploy
+    cmd: ./deploy.sh
+    needs: [score]
+    success_decisions: [approved]
+`
+
+func TestLoadValidSpec(t *testing.T) {
+	spec, err := Load([]byte(validSpec))
+	if err != nil {
+		t.Fatalf("Load valid spec: %v", err)
+	}
+	if spec.Name != "deploy-flow" || spec.Repo != "jerryfane/gitmoot" {
+		t.Fatalf("unexpected header: %+v", spec)
+	}
+	if spec.Schedule == nil || spec.Schedule.Interval != "24h" || spec.Schedule.Jitter != "15m" {
+		t.Fatalf("unexpected schedule: %+v", spec.Schedule)
+	}
+	if len(spec.Stages) != 3 {
+		t.Fatalf("stages = %d, want 3", len(spec.Stages))
+	}
+	if spec.Stages[1].ID != "score" || spec.Stages[1].Retry != 2 || spec.Stages[1].Timeout != "10m" {
+		t.Fatalf("unexpected score stage: %+v", spec.Stages[1])
+	}
+	if !reflect.DeepEqual(spec.Stages[1].Needs, []string{"source"}) {
+		t.Fatalf("score needs = %v", spec.Stages[1].Needs)
+	}
+}
+
+func TestLoadValidationErrors(t *testing.T) {
+	cases := []struct {
+		name    string
+		spec    string
+		wantSub string
+	}{
+		{
+			name:    "missing name",
+			spec:    "stages:\n  - {id: a, cmd: echo}\n",
+			wantSub: "pipeline name is required",
+		},
+		{
+			name:    "bad name",
+			spec:    "name: bad name\nstages:\n  - {id: a, cmd: echo}\n",
+			wantSub: "name-safe token",
+		},
+		{
+			name:    "no stages",
+			spec:    "name: p\n",
+			wantSub: "has no stages",
+		},
+		{
+			name:    "duplicate id",
+			spec:    "name: p\nstages:\n  - {id: a, cmd: echo}\n  - {id: a, cmd: echo}\n",
+			wantSub: `stage id "a" is not unique`,
+		},
+		{
+			name:    "missing cmd",
+			spec:    "name: p\nstages:\n  - {id: a, cmd: \"\"}\n",
+			wantSub: `stage "a" has no cmd`,
+		},
+		{
+			name:    "unknown need",
+			spec:    "name: p\nstages:\n  - {id: a, cmd: echo, needs: [zzz]}\n",
+			wantSub: `references unknown need "zzz"`,
+		},
+		{
+			name:    "self dependency",
+			spec:    "name: p\nstages:\n  - {id: a, cmd: echo, needs: [a]}\n",
+			wantSub: `stage "a" depends on itself`,
+		},
+		{
+			name:    "cycle",
+			spec:    "name: p\nstages:\n  - {id: a, cmd: echo, needs: [b]}\n  - {id: b, cmd: echo, needs: [a]}\n",
+			wantSub: "dependency cycle",
+		},
+		{
+			name:    "bad timeout",
+			spec:    "name: p\nstages:\n  - {id: a, cmd: echo, timeout: nope}\n",
+			wantSub: `timeout "nope" is invalid`,
+		},
+		{
+			name:    "non-positive timeout",
+			spec:    "name: p\nstages:\n  - {id: a, cmd: echo, timeout: 0s}\n",
+			wantSub: "must be positive",
+		},
+		{
+			name:    "negative retry",
+			spec:    "name: p\nstages:\n  - {id: a, cmd: echo, retry: -1}\n",
+			wantSub: "retry must be >= 0",
+		},
+		{
+			name:    "bad success decision",
+			spec:    "name: p\nsuccess_decisions: [blocked]\nstages:\n  - {id: a, cmd: echo}\n",
+			wantSub: `success_decisions "blocked" is invalid`,
+		},
+		{
+			name:    "schedule without interval",
+			spec:    "name: p\nschedule:\n  jitter: 5m\nstages:\n  - {id: a, cmd: echo}\n",
+			wantSub: "schedule requires an interval",
+		},
+		{
+			name:    "bad schedule interval",
+			spec:    "name: p\nschedule:\n  interval: soon\nstages:\n  - {id: a, cmd: echo}\n",
+			wantSub: `interval "soon" is invalid`,
+		},
+		{
+			name:    "unknown field",
+			spec:    "name: p\nstages:\n  - {id: a, cmd: echo, need: [b]}\n",
+			wantSub: "field need not found",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load([]byte(tc.spec))
+			if err == nil {
+				t.Fatalf("expected error for %s", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("error %q does not contain %q", err.Error(), tc.wantSub)
+			}
+		})
+	}
+}
+
+func TestHashDeterministicAndSensitive(t *testing.T) {
+	a := []byte("name: p\nstages:\n  - {id: a, cmd: echo}\n")
+	b := []byte("name: p\nstages:\n  - {id: a, cmd: echo}\n")
+	c := []byte("name: p\nstages:\n  - {id: a, cmd: echo2}\n")
+	if Hash(a) != Hash(b) {
+		t.Fatalf("identical bytes hashed differently")
+	}
+	if Hash(a) == Hash(c) {
+		t.Fatalf("different bytes hashed identically")
+	}
+	if len(Hash(a)) != 64 {
+		t.Fatalf("hash length = %d, want 64 hex chars", len(Hash(a)))
+	}
+}
+
+func TestEffectiveSuccessDecisions(t *testing.T) {
+	spec := Spec{SuccessDecisions: []string{"approved"}}
+	// Stage override wins.
+	got := spec.EffectiveSuccessDecisions(Stage{SuccessDecisions: []string{"changes_requested"}})
+	if !reflect.DeepEqual(got, []string{"changes_requested"}) {
+		t.Fatalf("stage override = %v", got)
+	}
+	// Top-level override when the stage has none.
+	got = spec.EffectiveSuccessDecisions(Stage{})
+	if !reflect.DeepEqual(got, []string{"approved"}) {
+		t.Fatalf("top-level override = %v", got)
+	}
+	// Package default when neither is set.
+	got = Spec{}.EffectiveSuccessDecisions(Stage{})
+	if !reflect.DeepEqual(got, DefaultSuccessDecisions) {
+		t.Fatalf("default = %v, want %v", got, DefaultSuccessDecisions)
+	}
+	// The returned slice is a copy — mutating it must not corrupt the defaults.
+	got[0] = "mutated"
+	if DefaultSuccessDecisions[0] == "mutated" {
+		t.Fatalf("EffectiveSuccessDecisions leaked the shared default slice")
+	}
+}

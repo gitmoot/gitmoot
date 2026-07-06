@@ -7761,4 +7761,72 @@ CREATE TABLE job_gates (
 );
 CREATE INDEX idx_job_gates_job ON job_gates(job_id);
 	`,
+	// #681 pipeline registry: one row per named pipeline holding the verbatim spec
+	// YAML + its content hash (a run snapshots the hash it was created from), the
+	// interval/jitter schedule fields (heartbeat idiom), and the durable schedule
+	// state (last_run_at/next_due_at/last_run_id/last_status) that makes an
+	// interval schedule restart-safe. name is the primary key and the stem of the
+	// pipeline's hidden shell runner agent. Pure additive append (CREATE TABLE
+	// only): the table stays empty until `gitmoot pipeline add` runs, so every
+	// existing DB reads identically. The per-run and per-stage tables are separate
+	// additive migrations appended by the run/advancer step.
+	`
+CREATE TABLE pipelines (
+	name TEXT PRIMARY KEY,
+	repo TEXT NOT NULL DEFAULT '',
+	spec_yaml TEXT NOT NULL DEFAULT '',
+	spec_hash TEXT NOT NULL DEFAULT '',
+	enabled INTEGER NOT NULL DEFAULT 0,
+	interval TEXT NOT NULL DEFAULT '',
+	jitter TEXT NOT NULL DEFAULT '',
+	last_run_at TEXT NOT NULL DEFAULT '',
+	next_due_at TEXT NOT NULL DEFAULT '',
+	last_run_id TEXT NOT NULL DEFAULT '',
+	last_status TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+	`,
+	// #681 pipeline runs + stages: the per-run execution state the scan-based
+	// advancer folds and drives. A pipeline_runs row is one execution of a
+	// pipeline; it snapshots spec_hash so a run always executes the spec content it
+	// was created from (the pipelines row's spec_yaml is resolved back and its hash
+	// verified against this column). pipeline_run_stages holds one row per stage of
+	// that run, keyed by (run_id, stage_id): the stage's advancement state, the job
+	// id the advancer enqueued for it, the current attempt (deterministic stage job
+	// ids embed it), the blocked needs persisted verbatim, and a short summary.
+	// Pure additive append (CREATE TABLE/INDEX only): both tables stay empty until
+	// `gitmoot pipeline run` creates a run, so every existing DB reads identically.
+	// idx_pipeline_run_stages_run_id backs the per-run stage fold
+	// (ListPipelineRunStages). Times are RFC3339Nano UTC text (empty == zero),
+	// mirroring the pipelines/heartbeat_state schedule columns.
+	`
+CREATE TABLE pipeline_runs (
+	id TEXT PRIMARY KEY,
+	pipeline TEXT NOT NULL DEFAULT '',
+	trigger TEXT NOT NULL DEFAULT 'manual',
+	spec_hash TEXT NOT NULL DEFAULT '',
+	state TEXT NOT NULL DEFAULT 'running',
+	halt_stage TEXT NOT NULL DEFAULT '',
+	halt_reason TEXT NOT NULL DEFAULT '',
+	needs_json TEXT NOT NULL DEFAULT '',
+	started_at TEXT NOT NULL DEFAULT '',
+	finished_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE pipeline_run_stages (
+	run_id TEXT NOT NULL,
+	stage_id TEXT NOT NULL,
+	state TEXT NOT NULL DEFAULT 'pending',
+	job_id TEXT NOT NULL DEFAULT '',
+	attempt INTEGER NOT NULL DEFAULT 0,
+	needs_json TEXT NOT NULL DEFAULT '',
+	summary TEXT NOT NULL DEFAULT '',
+	started_at TEXT NOT NULL DEFAULT '',
+	finished_at TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY (run_id, stage_id)
+);
+
+CREATE INDEX idx_pipeline_run_stages_run_id ON pipeline_run_stages(run_id);
+	`,
 }

@@ -1935,6 +1935,11 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 		// no heartbeat sections the scan returns before any store touch. Skip it under
 		// --dry-run (no worker loop runs there, so an enqueued job would just sit).
 		heartbeatEnqueue := newHeartbeatEnqueuer(store, home)
+		// Pipeline schedules (#681) run the same way: the scan advances in-flight runs
+		// and fires due interval schedules, reusing the normal job queue. Off-by-default
+		// (no pipelines => an empty list before any state touch) and skipped under
+		// --dry-run for the same reason.
+		pipelineEnqueue := newPipelineStageEnqueuer(store, home)
 		for {
 			if err := receiveSupervisorWorkerError(workerErr); err != nil {
 				return err
@@ -1946,6 +1951,9 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 			if !dryRun {
 				if err := runHeartbeatScanOnce(ctx, paths, store, heartbeatEnqueue, time.Now().UTC()); err != nil {
 					writeLine(stdout, "heartbeat scan error: %s", err)
+				}
+				if err := runPipelineScanOnce(ctx, store, pipelineEnqueue, time.Now().UTC()); err != nil {
+					writeLine(stdout, "pipeline scan error: %s", err)
 				}
 			}
 			if watchSkillOptReviews {
@@ -2003,6 +2011,12 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		writeLine(stdout, "heartbeat scan disabled: %s", heartbeatPathsErr)
 	}
 	heartbeatEnqueue := newHeartbeatEnqueuer(store, home)
+	// Pipeline schedules (#681) fire in the single-repo daemon too, or a single-repo
+	// daemon would silently never advance/schedule pipelines. Off-by-default: with no
+	// pipelines the scan returns an empty list before any state touch. Unlike the
+	// heartbeat scan it needs no config paths (it reads the DB), so a paths failure
+	// does not disable it.
+	pipelineEnqueue := newPipelineStageEnqueuer(store, home)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -2031,6 +2045,9 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 			if err := runHeartbeatScanOnce(ctx, heartbeatPaths, store, heartbeatEnqueue, time.Now().UTC()); err != nil {
 				writeLine(stdout, "heartbeat scan error: %s", err)
 			}
+		}
+		if err := runPipelineScanOnce(ctx, store, pipelineEnqueue, time.Now().UTC()); err != nil {
+			writeLine(stdout, "pipeline scan error: %s", err)
 		}
 		// Read the warm-reloadable poll interval each cycle (#577) so a SIGHUP
 		// change takes effect on the next tick. Fall back to the historical 30s

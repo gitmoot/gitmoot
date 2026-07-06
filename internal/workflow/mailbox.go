@@ -648,6 +648,15 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	if err := m.ensureRunning(ctx, job.ID); err != nil {
 		return AgentResult{}, err
 	}
+	// A #681 pipeline stage is a LEAF: it runs a shell command and returns a
+	// decision. Its ParentJobID is empty, so any delegations[] the stage command
+	// emitted would otherwise dispatch as TOP-LEVEL jobs in AdvanceJob. Strip them
+	// for a pipeline-sender job so a stage can never spawn phantom children; the
+	// advancer already ignores stage delegations, and this makes stages-as-leaves
+	// hold at the engine seam too. Cheap and byte-identical for every other sender.
+	if payload.Sender == PipelineJobSender && len(result.Delegations) > 0 {
+		result.Delegations = nil
+	}
 	payload.Result = &result
 	// Shadow-log returned learnings + write any mechanical fact at job terminal
 	// (#626 WRITE path). No-op when the hook is unset or the agent is not enrolled,
@@ -834,7 +843,13 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 	// non-empty needs list, so every non-blocked terminal — and a blocked result
 	// with no needs — writes nothing and is byte-identical. Best-effort: a gate
 	// write must never turn a successfully-recorded blocked transition into an error.
-	if state == JobBlocked && payload.Result != nil && len(payload.Result.Needs) > 0 {
+	// Pipeline stage jobs (#681) are excluded: their needs are persisted on the
+	// pipeline run/stage rows and resumed at the RUN level via ResumePipelineRun
+	// (attempt+1, new job id). Recording job gates here would let `job gates
+	// clear` RetryJob the OLD stage job id — an orphaned re-execution the
+	// pipeline advancer never folds, and a double execution once the run is
+	// properly resumed.
+	if state == JobBlocked && payload.Result != nil && len(payload.Result.Needs) > 0 && payload.Sender != PipelineJobSender {
 		if _, gateErr := m.Store.RecordJobGates(ctx, jobID, payload.Result.Needs); gateErr == nil {
 			_ = m.addEvent(ctx, jobID, "gates_recorded", fmt.Sprintf("recorded %d resumable gate(s) from needs", len(payload.Result.Needs)))
 		}

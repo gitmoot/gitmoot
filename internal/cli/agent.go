@@ -1649,6 +1649,9 @@ func runAgentList(args []string, stdout, stderr io.Writer) int {
 		if isEphemeralAgentName(agent.Name) {
 			continue // transient spawn-from-spec workers are not part of the registry
 		}
+		if isPipelineRunnerAgentName(agent.Name) {
+			continue // hidden per-pipeline shell runners (#681) are an executor detail
+		}
 		fmt.Fprintf(stdout, "%-16s %-8s %-12s %-20s %s\n", agent.Name, agent.Runtime, agent.Role, strings.Join(agentRepos[agent.Name], ","), strings.Join(agent.Capabilities, ","))
 	}
 	return 0

@@ -14,6 +14,15 @@ import (
 
 const resultKey = `"gitmoot_result"`
 
+// PipelineJobSender is the Sender stamped on every #681 pipeline stage job. It is
+// the single source of truth shared by the CLI (which builds the stage
+// JobRequest) and the mailbox (which strips a stage result's delegations[] so a
+// pipeline stage is provably a LEAF — see Mailbox.Run). A pipeline stage carries
+// an EMPTY ParentJobID, so its own result-borne delegations would otherwise
+// dispatch as top-level jobs; stripping them here keeps stages leaves and matches
+// the advancer, which ignores stage delegations entirely.
+const PipelineJobSender = "pipeline"
+
 // The following slices are the single source of truth for the enum-valued
 // fields of the gitmoot_result contract. The validator below checks against
 // them, and the build-time contract generator (internal/prompts/contractgen)

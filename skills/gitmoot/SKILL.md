@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, event webhooks, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, or Kimi Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, pipelines, event webhooks, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, or Kimi Code runtime workflows.
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
@@ -159,6 +159,15 @@ draft for failed, blocked, or cancelled jobs; use
 `gitmoot report bug --job <job-id> --create --yes` only when the user
 explicitly asks you to file it or the active workflow policy permits automatic
 bug filing.
+
+For a fixed, repeatable multi-step shell flow (not a model-driven decomposition),
+prefer a **pipeline** (#681) over an orchestra: `gitmoot pipeline add <spec.yaml>`
+registers a declared DAG of shell stages that the daemon runs on demand
+(`pipeline run`) or on an interval schedule. Each stage is an ordinary shell-runtime
+job whose `gitmoot_result` decision drives advancement; a `blocked` stage parks the
+run (resume with `pipeline resume <run-id>`), and a stage is a leaf (its
+`delegations[]` never spawn children). Pipelines are off by default. See CLI.md
+§ Pipelines, WORKFLOWS.md § Pipelines, and `docs/pipelines.md`.
 
 The plugin is only the runtime discovery surface for this skill. Local agent
 invocation still goes through the `gitmoot` CLI and the same registered agent,
