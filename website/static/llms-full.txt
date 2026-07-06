@@ -2891,18 +2891,19 @@ Parallelism under `pool` is bounded by **two** independent locks:
    plain, top-level same-repo `implement` job with no worktree still shares the
    `repo:<repo>` key and serializes even under `pool`.
 
-   **Read-only fan-out worktrees are the committed tip.** An auto-isolated
+   **Auto-isolated read-only worktrees are the committed tip.** An auto-isolated
    read-only worktree is a detached `git worktree add` at the **committed tip** of
    the base branch, so it does **not** contain gitignored paths (e.g. vendored
-   clones under `repos/**`) or any uncommitted working-tree changes. This only
-   kicks in for **two or more** read-only siblings (the fan-out that would
-   otherwise serialize); a **single** read-only delegation stays in the shared
-   base checkout and sees everything. Each fan-out child's prompt now carries a
+   clones under `repos/**`) or any uncommitted working-tree changes. Isolation only
+   kicks in when a same-repo read-only job is **contended** — a fan-out of **two or
+   more** read-only siblings, or two-plus independently-fired top-level `ask`/`review`
+   jobs on one repo; a **single**, uncontended read-only job stays in the shared
+   base checkout and sees everything. Every auto-isolated job's prompt now carries a
    note with the canonical base-checkout absolute path, so a worker whose sandbox
    can read it (e.g. codex) reaches the real tree instead of reporting a
    working-tree feature as missing. For whole-working-tree analysis that must see
-   gitignored or uncommitted state, either run a **single** read-only delegation
-   (no fan-out → stays in the base checkout) or pass an **absolute** path to the
+   gitignored or uncommitted state, either keep the job uncontended (a lone
+   read-only job stays in the base checkout) or pass an **absolute** path to the
    file/dir under analysis.
 2. **Runtime session lock (`runtime:<runtime>:<ref>`).** Two jobs that use the
    **same** agent/runtime session serialize on the session lock even when their
@@ -2962,6 +2963,43 @@ caps is left **queued** and retried next tick — never failed — so "jobs stay
 queued for no visible reason" on a small host can mean the admission budget is
 holding them. The budget is enforced per daemon process (host-global for the
 normal single-daemon deployment).
+
+## GitHub rate-limit-aware scheduling
+
+The daemon's polling and every agent's `gh`/API calls share one GitHub account.
+GitHub's **secondary** (abuse-detection) rate limit fires on **burstiness and
+concurrency**, not total volume, so concurrent bursts can trip it (HTTP 403
+"secondary rate limit") and freeze all GitHub ops even while the primary quota is
+fine — the only manual workaround being to stop the daemon and wait out the
+cooldown (#683).
+
+The opt-in `[github]` section installs a **GitHub call budget + adaptive backoff**
+that is **in-process to the daemon** — it covers the `gh`/API calls gitmoot itself
+issues from the daemon process (polling, comments, merges, status), enforced per
+daemon process (host-global for the normal single-daemon deployment). It does
+**not** reach separate foreground processes (a foreground `gitmoot
+orchestrate`/`pool`/`review`/`pr comment`) or the `gh` calls a codex/claude runtime
+subprocess makes on its own:
+
+```toml
+[github]
+max_concurrent = 0        # cap in-flight gh calls; 0 = unlimited (default)
+min_interval = "0s"       # min spacing between call starts; 0 = off (Go duration or bare seconds)
+secondary_backoff = true  # pause all GitHub calls on a secondary/abuse limit (default true)
+backoff_base = "60s"      # exponential fallback base when no Retry-After (default 60s)
+backoff_max = "5m"        # exponential fallback cap (default 5m)
+```
+
+**Safe defaults:** the proactive caps (`max_concurrent`, `min_interval`) default
+off, so single-call latency and steady-state throughput are unchanged; only the
+reactive `secondary_backoff` is on, and it is invisible on the happy path — it
+engages **only after** a `gh` call actually fails with a secondary/abuse limit.
+On a hit the limiter pauses **all** GitHub calls process-wide (respecting the
+response's `Retry-After`, else the exponential fallback) rather than retry-storming
+the abuse detector, which only prolongs the block. Calls are never dropped — they
+queue/delay until the window passes. On a busy host, set `max_concurrent` (e.g.
+`6`) and/or a small `min_interval` (e.g. `250ms`) to also smooth bursts
+proactively. `gitmoot daemon status` shows the configured budget.
 
 ## Not yet automatic (follow-ups)
 
@@ -3887,6 +3925,32 @@ may be promoted to canary or current; otherwise the promotion seam blocks with a
 `gate_blocked` notify and takes no promotion action. The gate is standalone (no
 `auto_trace_enabled` dependency), and with it off the promote path is
 byte-identical to before. Promotion itself stays manual.
+
+### PACE anytime-valid commit gate (#687)
+
+`pace_enabled` adds an **additional**, off-by-default promotion gate on the
+auto-promote path. When on, a guardrails-pass candidate is auto-promoted only when
+a **model-free** testing-by-betting e-process over its recorded
+candidate-vs-champion pairwise outcomes (the Mode B bandit arm's win/loss tally,
+`#481`/`#482`) crosses the commit threshold `1/pace_alpha`:
+
+```toml
+[skillopt]
+pace_enabled = true
+pace_alpha = 0.05      # target false-commit probability; threshold = 1/alpha = 20
+pace_lambda = 0.5      # bet fraction: win → wealth ×(1+λ), loss → ×(1−λ)
+pace_max_pairs = 200   # discordant-pair budget before a non-decisive stream rejects
+```
+
+Each discordant pair updates wealth `E ← E·(1+λ(2w−1))` (ties discarded). The gate
+**stops early** the moment it is decisive and **rejects** once `pace_max_pairs`
+pairs are spent without crossing, so peeking-until-you-win cannot p-hack a
+promotion — Ville's inequality bounds the false-commit probability by `pace_alpha`
+at any stopping time. PACE is **strictly additional**: every existing guardrail
+(`auto_promote_min_samples`/`_min_score`/`require_external_ci`/`_min_confidence`/
+canary/replay gate) still applies, and a non-decisive or budget-exhausted stream
+**fails safe** to a `pace_blocked` notify (no promotion). Off (the default) it is
+never consulted — byte-identical.
 
 ## Candidate Review And Next Iteration
 
@@ -7443,6 +7507,16 @@ To restart the daemon without losing its Claude token, use
 `gitmoot daemon restart` (not stop + start); see CLI.md § Repo And Daemon
 Status for the runtime-auth persistence model.
 
+When a job is **blocked** and the user asks to "resume a blocked job", "clear a
+blocker", or "what does this job need" (#682), route to
+`gitmoot job gates <id>` to list the open resource gates — one per `needs[]` entry
+a blocked job recorded — then `gitmoot job gates clear <id> --need "<text>"` (or
+`--all`) to satisfy them. Clearing the **last** open gate auto-re-runs the blocked
+job via the same machinery as `gitmoot job retry` (resume on clear, no polling). A
+job whose tree is **paused awaiting a human** (`escalate_human` / ask-gate) is
+never auto-resumed by clearing gates — that still needs a `gitmoot resume`
+decision. See CLI.md § Resumable gates.
+
 For Gitmoot health or status questions, first use the injected SessionStart
 snapshot when it is present and sufficient. If more detail is needed, run the
 relevant read-only Gitmoot CLI checks and answer directly from the results.
@@ -7962,6 +8036,28 @@ left **queued** and retried next tick — never failed — so on a small host
 "jobs stay queued" can mean the admission budget is holding them. The budget is
 enforced per daemon process.
 
+A `[github]` config section installs a **GitHub call budget + secondary-rate-limit
+backoff** over the `gh`/API calls gitmoot issues **from the daemon process** —
+polling, comments, merges, status (#683). It is enforced **per daemon process**
+(like the admission budget), so it does not reach separate foreground processes (a
+foreground `gitmoot orchestrate`/`pool`/`review`/`pr comment`) or the `gh` calls a
+codex/claude runtime subprocess makes on its own. GitHub's **secondary**
+(abuse-detection) rate limit fires on burstiness/concurrency — not total volume —
+so a busy daemon plus concurrent in-process calls can trip it (HTTP 403 "secondary
+rate limit") and freeze all GitHub ops even while the primary quota is fine. The limiter smooths bursts and, on a
+secondary hit, **pauses all GitHub calls process-wide** (respecting `Retry-After`,
+else exponential backoff) instead of retry-storming the abuse detector. Knobs:
+`max_concurrent` caps in-flight `gh` calls (0 = unlimited, the default),
+`min_interval` spaces successive call starts (0 = off; accepts a Go duration or a
+bare integer of seconds), `secondary_backoff` toggles the reactive pause (default
+`true`), and `backoff_base`/`backoff_max` bound the exponential fallback
+(defaults `60s`/`5m`). **Safe defaults:** the proactive caps are off (single-call
+latency and steady-state throughput unchanged) and only the invisible reactive
+backoff is on. Set `max_concurrent` (e.g. `6`) and/or a small `min_interval`
+(e.g. `250ms`) to also smooth bursts proactively on a busy host. Calls are never
+dropped — they queue/delay. `gitmoot daemon status` shows the configured budget
+(`github limiter: max_concurrent=… min_interval=… secondary_backoff=…`).
+
 `gitmoot dashboard` shows local state — daemon health, repos, agents and runtime
 sessions, jobs by state, worktrees, branch locks, SkillOpt train phase/candidate,
 and pending interactive prompts.
@@ -8267,6 +8363,21 @@ is none), prints `advance warning: …` to stderr, and shows an `advance_error:`
 line in human output. Genuine non-terminal failures (the job did not reach
 `succeeded`) still exit non-zero as before. A normal success with no advance error
 is byte-identical to prior behavior — no `advance_error` field is emitted.
+
+**Review resilience under branch churn.** A review job is pinned to the PR head
+SHA it was queued against; in an active dev loop the branch often advances (a new
+commit is pushed) before the queued review runs, leaving the registered checkout
+on a newer head. Rather than failing the review on that head-SHA mismatch, Gitmoot
+**re-syncs** it: when the PR is still **open**, the review is re-targeted to the
+checkout's current head — reviewing the newest commit is exactly what a human
+reviewer does — and a `review_head_resynced` job event records the old→new head.
+The mismatch is only allowed to fail cleanly when the PR is **closed/merged** (a
+stale review of a dead PR is not useful) or when the checkout is dirty. Relatedly,
+when a foreground `agent review` finds the agent's serialized runtime session
+**busy**, the review is now **left queued** for the daemon to run when the session
+frees (a `requeued_runtime_busy` event is recorded) instead of being cancelled and
+dropped; `agent ask`/`implement` stay synchronous and keep their existing
+busy-session cancel behavior.
 
 Start an orchestra of agents with `gitmoot orchestrate`:
 
@@ -8615,12 +8726,36 @@ gitmoot job show <job-id>            # add --json for the full job + why-stuck d
 gitmoot job watch <job-id>
 gitmoot job events <job-id>
 gitmoot job retry <job-id>
+gitmoot job gates <job-id>                                         # list resumable gates; add --json
+gitmoot job gates clear <job-id> --need "<text>"|--all             # satisfy gate(s); auto-resume on last
 gitmoot job cancel <job-id>                                        # one queued|running|blocked job
 gitmoot job cancel --state blocked [--older-than 7d] [--repo owner/repo] [--agent name] [--yes]
 gitmoot job kill <root-job-id>
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
+
+### Resumable gates (make `blocked` + `needs` actionable)
+
+When a stage returns `blocked` with a `needs` list (e.g. `needs: ["Maps API key"]`),
+gitmoot persists each need as a **gate** attached to the blocked job. `gitmoot job
+gates <job-id>` lists them (open / satisfied). Clearing a gate marks the blocker
+resolved:
+
+```sh
+gitmoot job gates clear <job-id> --need "Maps API key"   # satisfy one need
+gitmoot job gates clear <job-id> --all                   # satisfy every open gate
+```
+
+When the **last** gate is cleared, the blocked stage **auto-re-runs** via the same
+`RetryJob` machinery `gitmoot job retry` uses (re-queued, then dispatched by the
+daemon; downstream stages follow the normal delegation DAG) — no polling, resume
+happens on clear. Two cases are deliberately **never** auto-resumed even with all
+gates cleared: a **session job** (externally driven, #657) and a stage whose tree is
+**paused awaiting a human** (`escalate_human` / ask-gate, #305/#340/#445) — a
+resource gate must not bypass the human's `gitmoot resume` decision; the command
+reports `not resumed: …` with the reason. A blocked job with **no** `needs` records
+no gates and is byte-identical to before this feature.
 
 ### Session jobs (record "here"-method work)
 
@@ -8892,6 +9027,23 @@ gate, and **persists** the run for audit (`skillopt gate history --candidate
 passing gate run before it may be promoted to canary or current; otherwise the
 promotion seam blocks. On a gate failure the protocol allows exactly one retry
 feeding the failing replay log back to the optimizer, then rejects.
+
+When `[skillopt].pace_enabled` is on, an **additional** off-by-default
+**PACE anytime-valid commit gate** (`#687`) sits on the auto-promote path: a
+guardrails-pass candidate is auto-promoted only when a model-free
+testing-by-betting e-process over its recorded candidate-vs-champion pairwise
+outcomes (the Mode B bandit arm's win/loss tally, `#481`/`#482`) crosses the
+commit threshold `1/pace_alpha`. Each discordant pair bets `pace_lambda` of the
+wealth (`E ← E·(1+λ(2w−1))`, ties discarded); the gate **stops early** the moment
+it is decisive and **rejects** once `pace_max_pairs` discordant pairs are spent
+without crossing — so peeking-until-you-win cannot p-hack a promotion (Ville's
+inequality bounds the false-commit probability by `pace_alpha`). It is a strictly
+additional gate: **every** existing guardrail (`auto_promote_min_samples`/
+`_min_score`/`require_external_ci`/`_min_confidence`/canary/replay gate) still
+applies, and a non-decisive or budget-exhausted stream **fails safe** to a
+`pace_blocked` notify (no promotion). Off (the default) it is never consulted —
+byte-identical. Knobs: `pace_alpha` (default `0.05` → threshold 20), `pace_lambda`
+(default `0.5`), `pace_max_pairs` (default `200`).
 
 `skillopt pairwise import <packet-dir>` ingests a **blinded paired-review
 packet** produced by the gitmoot-skillopt fork (the `pairwise-review.json`
@@ -9864,19 +10016,21 @@ Each child job carries job-tree linkage fields — `parent_job_id`,
 can be traced back to its parent, its originating delegation, and the root of the
 tree. See `RESULT_CONTRACT.md` for the full delegation field reference.
 
-**Read-only fan-out runs at the committed tip.** When a coordinator emits **two
-or more** read-only (`ask`/`review`) siblings, Gitmoot auto-isolates each into a
-detached `git worktree` at the **committed tip** of the base branch so they run
-in parallel instead of serializing on the shared checkout. That worktree does
-**not** contain gitignored paths (e.g. vendored clones under `repos/**`) or any
-uncommitted working-tree changes, so an analysis/research leg cannot see the
-operator's live working tree there. Each such child's prompt now carries a note
-with the canonical base-checkout absolute path so a worker whose sandbox can read
-it (e.g. codex) reaches the real tree instead of reporting a working-tree feature
-as absent. A **single** read-only delegation stays in the shared base checkout
-and sees everything, so for whole-working-tree analysis (auditing gitignored
-vendored repos, or in-flight uncommitted WIP) either fan out to exactly **one**
-read-only leg or pass an **absolute** path to the file/dir under analysis.
+**Contended read-only jobs run at the committed tip.** When a same-repo read-only
+(`ask`/`review`) job would otherwise serialize on the shared checkout — a
+coordinator emits **two or more** read-only siblings, or two-plus
+independently-fired top-level read-only jobs land on one repo — Gitmoot
+auto-isolates each into a detached `git worktree` at the **committed tip** of the
+base branch so they run in parallel. That worktree does **not** contain gitignored
+paths (e.g. vendored clones under `repos/**`) or any uncommitted working-tree
+changes, so an analysis/research leg cannot see the operator's live working tree
+there. Every auto-isolated job's prompt now carries a note with the canonical
+base-checkout absolute path so a worker whose sandbox can read it (e.g. codex)
+reaches the real tree instead of reporting a working-tree feature as absent. A
+**single**, uncontended read-only job stays in the shared base checkout and sees
+everything, so for whole-working-tree analysis (auditing gitignored vendored
+repos, or in-flight uncommitted WIP) either keep the job uncontended or pass an
+**absolute** path to the file/dir under analysis.
 
 ## Coordinator-Owned Review
 

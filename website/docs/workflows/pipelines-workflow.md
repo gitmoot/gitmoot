@@ -192,4 +192,3 @@ stage command — provision them out of band and have the stage read them from t
 environment, letting it return `blocked` until they are present.
 
 See the in-repo reference at `docs/pipelines.md` for the full field reference.
-</content>
