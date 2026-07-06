@@ -155,6 +155,38 @@ queued for no visible reason" on a small host can mean the admission budget is
 holding them. The budget is enforced per daemon process (host-global for the
 normal single-daemon deployment).
 
+## GitHub rate-limit-aware scheduling
+
+The daemon's polling and every agent's `gh`/API calls share one GitHub account.
+GitHub's **secondary** (abuse-detection) rate limit fires on **burstiness and
+concurrency**, not total volume, so concurrent bursts can trip it (HTTP 403
+"secondary rate limit") and freeze all GitHub ops even while the primary quota is
+fine — the only manual workaround being to stop the daemon and wait out the
+cooldown (#683).
+
+The opt-in `[github]` section installs a **process-wide GitHub call budget +
+adaptive backoff** shared across the daemon and all agents:
+
+```toml
+[github]
+max_concurrent = 0        # cap in-flight gh calls; 0 = unlimited (default)
+min_interval = "0s"       # min spacing between call starts; 0 = off (Go duration or bare seconds)
+secondary_backoff = true  # pause all GitHub calls on a secondary/abuse limit (default true)
+backoff_base = "60s"      # exponential fallback base when no Retry-After (default 60s)
+backoff_max = "5m"        # exponential fallback cap (default 5m)
+```
+
+**Safe defaults:** the proactive caps (`max_concurrent`, `min_interval`) default
+off, so single-call latency and steady-state throughput are unchanged; only the
+reactive `secondary_backoff` is on, and it is invisible on the happy path — it
+engages **only after** a `gh` call actually fails with a secondary/abuse limit.
+On a hit the limiter pauses **all** GitHub calls process-wide (respecting the
+response's `Retry-After`, else the exponential fallback) rather than retry-storming
+the abuse detector, which only prolongs the block. Calls are never dropped — they
+queue/delay until the window passes. On a busy host, set `max_concurrent` (e.g.
+`6`) and/or a small `min_interval` (e.g. `250ms`) to also smooth bursts
+proactively. `gitmoot daemon status` shows the configured budget.
+
 ## Not yet automatic (follow-ups)
 
 - **Top-level `implement` auto-isolation.** `pool` does *not* auto-isolate plain

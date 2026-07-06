@@ -212,6 +212,25 @@ left **queued** and retried next tick — never failed — so on a small host
 "jobs stay queued" can mean the admission budget is holding them. The budget is
 enforced per daemon process.
 
+A `[github]` config section installs a **process-wide GitHub call budget +
+secondary-rate-limit backoff** shared by the daemon's polling and every agent's
+`gh`/API call (#683). GitHub's **secondary** (abuse-detection) rate limit fires
+on burstiness/concurrency — not total volume — so a busy daemon plus concurrent
+agent calls can trip it (HTTP 403 "secondary rate limit") and freeze all GitHub
+ops even while the primary quota is fine. The limiter smooths bursts and, on a
+secondary hit, **pauses all GitHub calls process-wide** (respecting `Retry-After`,
+else exponential backoff) instead of retry-storming the abuse detector. Knobs:
+`max_concurrent` caps in-flight `gh` calls (0 = unlimited, the default),
+`min_interval` spaces successive call starts (0 = off; accepts a Go duration or a
+bare integer of seconds), `secondary_backoff` toggles the reactive pause (default
+`true`), and `backoff_base`/`backoff_max` bound the exponential fallback
+(defaults `60s`/`5m`). **Safe defaults:** the proactive caps are off (single-call
+latency and steady-state throughput unchanged) and only the invisible reactive
+backoff is on. Set `max_concurrent` (e.g. `6`) and/or a small `min_interval`
+(e.g. `250ms`) to also smooth bursts proactively on a busy host. Calls are never
+dropped — they queue/delay. `gitmoot daemon status` shows the configured budget
+(`github limiter: max_concurrent=… min_interval=… secondary_backoff=…`).
+
 `gitmoot dashboard` shows local state — daemon health, repos, agents and runtime
 sessions, jobs by state, worktrees, branch locks, SkillOpt train phase/candidate,
 and pending interactive prompts.

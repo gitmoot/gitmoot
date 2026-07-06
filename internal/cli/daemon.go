@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -356,6 +357,9 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		} else if applied := live.applyStart(start, explicitPoll, explicitWorkers, explicitScheduler); applied != "" {
 			writeLine(stdout, "daemon: applied [daemon] config at start (%s); CLI flags override", applied)
 		}
+		// Install the process-wide GitHub call budget + secondary-rate-limit backoff
+		// (#683) so the daemon's polling and every agent gh call share one limiter.
+		configureGitHubLimiter(reloadPaths, stdout)
 		installDaemonReloadHandler(ctx, reloadPaths, live, stdout)
 	} else {
 		writeLine(stdout, "daemon: warm reload disabled (paths unavailable): %v", reloadErr)
@@ -676,6 +680,7 @@ func runDaemonStatus(args []string, stdout, stderr io.Writer) int {
 		writeLine(stdout, "%s", daemonClaudeAuthLine(paths))
 	}
 	writeLine(stdout, "%s", daemonAdmissionLine(paths))
+	writeLine(stdout, "%s", daemonGitHubLimiterLine(paths))
 	writeLine(stdout, "%s", daemonPreflightFailureLine(*home))
 	for _, line := range daemonHeartbeatLines(paths, *home) {
 		writeLine(stdout, "%s", line)
@@ -806,6 +811,59 @@ func daemonPreflightFailureLine(home string) string {
 		return "delegation preflight failures: unavailable"
 	}
 	return fmt.Sprintf("delegation preflight failures: %d", count)
+}
+
+// configureGitHubLimiter installs the process-wide GitHub call budget + secondary-
+// rate-limit backoff (#683) from the [github] config section onto the shared
+// github.DefaultLimiter used by every gh call in the daemon. It is best-effort: a
+// config-load error leaves the inert default (byte-identical, no backoff) and logs
+// a warning rather than blocking the daemon. On success it logs one line so an
+// operator can see the active budget.
+func configureGitHubLimiter(paths config.Paths, stdout io.Writer) {
+	policy, err := config.LoadGitHubLimiterPolicy(paths)
+	if err != nil {
+		writeLine(stdout, "daemon: [github] limiter config error, using defaults: %v", err)
+		policy = config.DefaultGitHubLimiterPolicy()
+	}
+	github.ConfigureDefault(github.RateLimiterConfig{
+		MaxConcurrent:  policy.MaxConcurrent,
+		MinInterval:    policy.MinInterval,
+		BackoffEnabled: policy.SecondaryBackoffEnabled,
+		BaseBackoff:    policy.BackoffBase,
+		MaxBackoff:     policy.BackoffMax,
+		Logf:           log.Printf,
+	})
+	writeLine(stdout, "daemon: %s", githubLimiterSummary(policy))
+}
+
+// githubLimiterSummary renders the [github] limiter policy as one status/log line.
+func githubLimiterSummary(policy config.GitHubLimiterPolicy) string {
+	concurrent := "unlimited"
+	if policy.MaxConcurrent > 0 {
+		concurrent = fmt.Sprintf("%d", policy.MaxConcurrent)
+	}
+	interval := "off"
+	if policy.MinInterval > 0 {
+		interval = policy.MinInterval.String()
+	}
+	backoff := "off"
+	if policy.SecondaryBackoffEnabled {
+		backoff = fmt.Sprintf("on (base=%s max=%s)", policy.BackoffBase, policy.BackoffMax)
+	}
+	return fmt.Sprintf("github limiter: max_concurrent=%s min_interval=%s secondary_backoff=%s",
+		concurrent, interval, backoff)
+}
+
+// daemonGitHubLimiterLine reports the configured [github] call budget (#683) for
+// `gitmoot daemon status`. Like daemonAdmissionLine it is a single additive line
+// showing the CONFIGURED policy; the live backoff window lives in the running
+// daemon process (github.DefaultLimiterSnapshot), not this separate status CLI.
+func daemonGitHubLimiterLine(paths config.Paths) string {
+	policy, err := config.LoadGitHubLimiterPolicy(paths)
+	if err != nil {
+		return "github limiter: unavailable"
+	}
+	return githubLimiterSummary(policy)
 }
 
 // daemonAdmissionLine reports the configured host-global admission budget caps
