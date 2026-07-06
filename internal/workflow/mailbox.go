@@ -843,7 +843,13 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 	// non-empty needs list, so every non-blocked terminal — and a blocked result
 	// with no needs — writes nothing and is byte-identical. Best-effort: a gate
 	// write must never turn a successfully-recorded blocked transition into an error.
-	if state == JobBlocked && payload.Result != nil && len(payload.Result.Needs) > 0 {
+	// Pipeline stage jobs (#681) are excluded: their needs are persisted on the
+	// pipeline run/stage rows and resumed at the RUN level via ResumePipelineRun
+	// (attempt+1, new job id). Recording job gates here would let `job gates
+	// clear` RetryJob the OLD stage job id — an orphaned re-execution the
+	// pipeline advancer never folds, and a double execution once the run is
+	// properly resumed.
+	if state == JobBlocked && payload.Result != nil && len(payload.Result.Needs) > 0 && payload.Sender != PipelineJobSender {
 		if _, gateErr := m.Store.RecordJobGates(ctx, jobID, payload.Result.Needs); gateErr == nil {
 			_ = m.addEvent(ctx, jobID, "gates_recorded", fmt.Sprintf("recorded %d resumable gate(s) from needs", len(payload.Result.Needs)))
 		}
