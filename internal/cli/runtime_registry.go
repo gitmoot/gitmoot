@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -56,6 +57,37 @@ func runtimeMetadataOverrides(overrides []config.RuntimeOverride) []runtime.Meta
 	return out
 }
 
+// resolveRuntimeRegistryResilient builds the effective runtime metadata registry
+// the same way resolveRuntimeRegistry does, but is PER-SECTION resilient: a single
+// malformed [runtimes.<name>] section (an unknown-runtime typo like
+// [runtimes.codxe], or an invalid capability) is SKIPPED with a logged warning
+// naming the offending section instead of failing the whole config. Every VALID
+// [runtimes.<name>] section's overrides still take effect. This is the DELIVERY
+// path: it must never drop otherwise-valid default_model overrides just because one
+// unrelated section has a typo. A missing config file (fresh box), an empty home,
+// or a file-level parse error yields the built-in registry unchanged (fail-safe:
+// nothing is forced). Overrides are applied one section at a time so a rejected
+// section cannot poison the accumulated valid ones.
+func resolveRuntimeRegistryResilient(paths config.Paths) runtime.Registry {
+	registry := runtime.BuiltinRuntimeRegistry()
+	overrides, err := config.LoadRuntimeOverrides(paths)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("runtime registry: ignoring config overrides for delivery model resolution: %v", err)
+		}
+		return registry
+	}
+	for _, o := range overrides {
+		patched, err := registry.ApplyOverrides(runtimeMetadataOverrides([]config.RuntimeOverride{o}))
+		if err != nil {
+			log.Printf("runtime registry: skipping invalid [runtimes.%s] section for delivery model resolution: %v", o.Name, err)
+			continue
+		}
+		registry = patched
+	}
+	return registry
+}
+
 // runtimeDefaultModelResolver returns a HOME-AWARE resolver for a runtime's
 // configured registry default_model (#652), suitable for wiring into
 // workflow.Engine.RuntimeDefaultModel / workflow.Mailbox.RuntimeDefaultModel so a
@@ -63,16 +95,15 @@ func runtimeMetadataOverrides(overrides []config.RuntimeOverride) []runtime.Meta
 // the built-in registry overlaid with any [runtimes.<name>] config overrides for
 // `home` (which may be an already-resolved <home>/.gitmoot root OR a raw --home;
 // resolveConfigFile handles both), then returns the resolved DefaultModel for the
-// named runtime. It is FAIL-OPEN: a resolution error, a missing config, an empty
-// home, or an unknown runtime all yield "", so delivery forces nothing and is
-// byte-identical to before #652. It re-reads config on each call, so a warm-reloaded
+// named runtime. It is FAIL-SAFE and PER-SECTION resilient: a missing config, an
+// empty home, or an unknown runtime yields ""; a single malformed [runtimes.<name>]
+// section is skipped with a logged warning while OTHER valid sections'
+// default_model overrides still resolve (so one typo can no longer silently drop
+// every override at delivery). It re-reads config on each call, so a warm-reloaded
 // (SIGHUP) default_model edit takes effect without a full restart.
 func runtimeDefaultModelResolver(home string) func(string) string {
 	return func(runtimeName string) string {
-		registry, err := resolveRuntimeRegistry(config.Paths{ConfigFile: resolveConfigFile(home)})
-		if err != nil {
-			return ""
-		}
+		registry := resolveRuntimeRegistryResilient(config.Paths{ConfigFile: resolveConfigFile(home)})
 		meta, ok := registry.Metadata(strings.TrimSpace(runtimeName))
 		if !ok {
 			return ""

@@ -225,8 +225,11 @@ the same `delegations` field, `coordinator`, and `continuation` mechanics.
   are de-duplicated, so the same delegation is not dispatched twice.
 - `model` (optional): a free-form, runtime-scoped model string for the child job
   (for example a Codex, Claude Code, or Kimi Code model name). When omitted, the
-  delegated agent's configured default model is used. There is no allow-list;
-  Gitmoot passes the value through to the runtime as-is.
+  model resolves in order: this `model` field (the child's job `--model`), then
+  the delegated agent's `--model`, then the runtime's registry `default_model`
+  (the `[runtimes.<name>].default_model` config), then the runtime CLI's own
+  default. There is no allow-list; Gitmoot passes the value through to the
+  runtime as-is.
 
   **Model-tier routing (recommendation).** Picking a per-delegation `model` is
   the coordinator's call — Gitmoot does not choose or override it. As a costing

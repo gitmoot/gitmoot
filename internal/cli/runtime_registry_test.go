@@ -168,6 +168,54 @@ func TestRuntimeDefaultModelResolverAbsentConfigByteIdentical(t *testing.T) {
 	}
 }
 
+// TestRuntimeDefaultModelResolverSkipsBadSection proves the DELIVERY path is
+// PER-SECTION resilient (#652 LOW): a config with one VALID [runtimes.codex]
+// default_model plus one bad section (an unknown-runtime typo) still resolves the
+// codex override — a single bad section is skipped, not a whole-config failure that
+// silently drops every valid override at delivery.
+func TestRuntimeDefaultModelResolverSkipsBadSection(t *testing.T) {
+	src := writeCLIConfig(t, `
+[runtimes.codex]
+default_model = "gpt-5.5"
+
+[runtimes.codxe]
+default_model = "typo-runtime"
+`)
+	home := homeFromConfig(t, src)
+	resolve := runtimeDefaultModelResolver(home)
+	// The valid codex override still takes effect despite the bad sibling section.
+	if got := resolve(runtime.CodexRuntime); got != "gpt-5.5" {
+		t.Fatalf("resolve(codex) = %q, want gpt-5.5 (bad sibling section must not drop it)", got)
+	}
+	// The bad section is skipped entirely, not surfaced as a phantom runtime.
+	if got := resolve("codxe"); got != "" {
+		t.Fatalf("resolve(codxe) = %q, want empty (bad section skipped)", got)
+	}
+}
+
+// TestRuntimeDefaultModelResolverSkipsBadCapabilitySection proves the same
+// per-section resilience for an invalid-capability section: the whole-config apply
+// would reject it, but the delivery resolver skips only that section and keeps a
+// valid sibling's default_model.
+func TestRuntimeDefaultModelResolverSkipsBadCapabilitySection(t *testing.T) {
+	src := writeCLIConfig(t, `
+[runtimes.codex]
+default_model = "gpt-5.5"
+
+[runtimes.claude]
+capabilities = ["review", "bogus"]
+`)
+	home := homeFromConfig(t, src)
+	resolve := runtimeDefaultModelResolver(home)
+	if got := resolve(runtime.CodexRuntime); got != "gpt-5.5" {
+		t.Fatalf("resolve(codex) = %q, want gpt-5.5 (bad capability sibling must not drop it)", got)
+	}
+	// The claude section is skipped, so it records no default (byte-identical).
+	if got := resolve(runtime.ClaudeRuntime); got != "" {
+		t.Fatalf("resolve(claude) = %q, want empty (bad capability section skipped)", got)
+	}
+}
+
 // homeFromConfig writes the given config body into a home layout so a --home flag
 // resolves ConfigFile to it. The CLI resolves --home via config.PathsForHome, so
 // place the file at <home>/.gitmoot/config.toml.
