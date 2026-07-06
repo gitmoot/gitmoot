@@ -173,6 +173,40 @@ func TestSecondaryLimitRespectsRetryAfter(t *testing.T) {
 	}
 }
 
+func TestSecondaryLimitClampsPathologicalRetryAfter(t *testing.T) {
+	clock := newFakeClock()
+	l := NewRateLimiter(RateLimiterConfig{
+		BackoffEnabled: true,
+		BaseBackoff:    60 * time.Second,
+		MaxBackoff:     5 * time.Minute,
+		Now:            clock.Now,
+		Sleep:          clock.Sleep,
+	})
+	// A spurious/misparsed 24h Retry-After must NOT freeze GitHub I/O for a day: it is
+	// clamped to max(maxBackoff, RetryAfterCeiling) = 30m so the daemon self-recovers.
+	l.NoteSecondaryLimit(24 * time.Hour)
+	if state := l.Snapshot(); state.BackoffRemaining != RetryAfterCeiling {
+		t.Fatalf("remaining = %s, want %s (pathological Retry-After clamped)", state.BackoffRemaining, RetryAfterCeiling)
+	}
+}
+
+func TestSecondaryLimitClampCeilingHonorsLargerMaxBackoff(t *testing.T) {
+	clock := newFakeClock()
+	// An operator who deliberately configures a MaxBackoff larger than the ceiling is
+	// never clamped below their own choice.
+	l := NewRateLimiter(RateLimiterConfig{
+		BackoffEnabled: true,
+		BaseBackoff:    60 * time.Second,
+		MaxBackoff:     45 * time.Minute,
+		Now:            clock.Now,
+		Sleep:          clock.Sleep,
+	})
+	l.NoteSecondaryLimit(24 * time.Hour)
+	if state := l.Snapshot(); state.BackoffRemaining != 45*time.Minute {
+		t.Fatalf("remaining = %s, want 45m (clamp ceiling respects larger MaxBackoff)", state.BackoffRemaining)
+	}
+}
+
 func TestConcurrentSecondaryHitsDoNotEscalateStreak(t *testing.T) {
 	clock := newFakeClock()
 	l := NewRateLimiter(RateLimiterConfig{

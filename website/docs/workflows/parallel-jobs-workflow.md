@@ -164,8 +164,14 @@ concurrency**, not total volume, so concurrent bursts can trip it (HTTP 403
 fine — the only manual workaround being to stop the daemon and wait out the
 cooldown (#683).
 
-The opt-in `[github]` section installs a **process-wide GitHub call budget +
-adaptive backoff** shared across the daemon and all agents:
+The opt-in `[github]` section installs a **GitHub call budget + adaptive backoff**
+that is **in-process to the daemon** — it covers the `gh`/API calls gitmoot itself
+issues from the daemon process (polling, comments, merges, status). It is enforced
+per daemon process (host-global for the normal single-daemon deployment), the same
+scope as the admission budget above. It does **not** reach into separate foreground
+processes (a foreground `gitmoot orchestrate`/`pool`/`review`/`pr comment`) or the
+`gh` calls a codex/claude runtime subprocess makes on its own — those run outside the
+daemon process and never touch the shared limiter.
 
 ```toml
 [github]

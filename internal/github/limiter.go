@@ -68,6 +68,19 @@ const (
 	DefaultMaxBackoff  = 5 * time.Minute
 )
 
+// RetryAfterCeiling is the hard upper bound on a server-supplied Retry-After that
+// the limiter will honor. A Retry-After is normally trusted verbatim (the server
+// knows how long its abuse window is), but an unbounded value — a pathological or
+// misparsed 'Retry-After: 86400', a proxy error body, a corrupted string — would
+// otherwise freeze EVERY GitHub call process-wide for that entire duration with no
+// self-recovery (NoteSuccess can't fire while all calls are paused), a self-inflicted
+// outage for an unattended-reliability tool. Clamping to 30m keeps the daemon
+// resuming on its own within a bounded window while still comfortably covering any
+// real GitHub secondary cooldown (seconds to a few minutes). The effective ceiling is
+// max(maxBackoff, RetryAfterCeiling) so an operator who deliberately configures a
+// larger MaxBackoff is never clamped below their own choice.
+const RetryAfterCeiling = 30 * time.Minute
+
 // RateLimiterConfig is the resolved, code-level limiter configuration. The config
 // package (which must not import this package) builds it from the [github] section
 // and hands it to ConfigureDefault; tests build it directly with fake clocks.
@@ -222,8 +235,10 @@ func (l *RateLimiter) Release() {
 }
 
 // NoteSecondaryLimit records a process-wide secondary-rate-limit pause after a gh
-// call ultimately failed with one. retryAfter, when > 0, is honored verbatim (the
-// server told us how long); otherwise an exponential fallback (baseBackoff shifted
+// call ultimately failed with one. retryAfter, when > 0, is honored (the server told
+// us how long) but clamped to max(maxBackoff, RetryAfterCeiling) so a pathological
+// value cannot freeze GitHub I/O indefinitely; otherwise an exponential fallback
+// (baseBackoff shifted
 // by the episode streak, capped at maxBackoff) is used. Concurrent duplicate
 // reports inside an already-active window extend it (to cover a larger Retry-After)
 // but do not escalate the streak, so a burst of simultaneous failures does not blow
@@ -260,6 +275,19 @@ func (l *RateLimiter) NoteSecondaryLimit(retryAfter time.Duration) {
 		}
 		if delay > l.maxBackoff {
 			delay = l.maxBackoff
+		}
+	} else {
+		// A server-supplied Retry-After is trusted over the exponential fallback, but
+		// clamped to a sane ceiling so a pathological/misparsed value cannot freeze the
+		// whole GitHub subsystem indefinitely (see RetryAfterCeiling).
+		ceiling := l.maxBackoff
+		if RetryAfterCeiling > ceiling {
+			ceiling = RetryAfterCeiling
+		}
+		if delay > ceiling {
+			l.logf("github: Retry-After %s exceeds ceiling %s; clamping",
+				delay.Round(time.Second), ceiling.Round(time.Second))
+			delay = ceiling
 		}
 	}
 	until := now.Add(delay)

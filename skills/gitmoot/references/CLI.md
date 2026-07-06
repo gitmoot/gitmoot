@@ -212,12 +212,15 @@ left **queued** and retried next tick — never failed — so on a small host
 "jobs stay queued" can mean the admission budget is holding them. The budget is
 enforced per daemon process.
 
-A `[github]` config section installs a **process-wide GitHub call budget +
-secondary-rate-limit backoff** shared by the daemon's polling and every agent's
-`gh`/API call (#683). GitHub's **secondary** (abuse-detection) rate limit fires
-on burstiness/concurrency — not total volume — so a busy daemon plus concurrent
-agent calls can trip it (HTTP 403 "secondary rate limit") and freeze all GitHub
-ops even while the primary quota is fine. The limiter smooths bursts and, on a
+A `[github]` config section installs a **GitHub call budget + secondary-rate-limit
+backoff** over the `gh`/API calls gitmoot issues **from the daemon process** —
+polling, comments, merges, status (#683). It is enforced **per daemon process**
+(like the admission budget), so it does not reach separate foreground processes (a
+foreground `gitmoot orchestrate`/`pool`/`review`/`pr comment`) or the `gh` calls a
+codex/claude runtime subprocess makes on its own. GitHub's **secondary**
+(abuse-detection) rate limit fires on burstiness/concurrency — not total volume —
+so a busy daemon plus concurrent in-process calls can trip it (HTTP 403 "secondary
+rate limit") and freeze all GitHub ops even while the primary quota is fine. The limiter smooths bursts and, on a
 secondary hit, **pauses all GitHub calls process-wide** (respecting `Retry-After`,
 else exponential backoff) instead of retry-storming the abuse detector. Knobs:
 `max_concurrent` caps in-flight `gh` calls (0 = unlimited, the default),

@@ -357,8 +357,10 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		} else if applied := live.applyStart(start, explicitPoll, explicitWorkers, explicitScheduler); applied != "" {
 			writeLine(stdout, "daemon: applied [daemon] config at start (%s); CLI flags override", applied)
 		}
-		// Install the process-wide GitHub call budget + secondary-rate-limit backoff
-		// (#683) so the daemon's polling and every agent gh call share one limiter.
+		// Install the GitHub call budget + secondary-rate-limit backoff (#683) so the
+		// gh calls gitmoot issues from THIS daemon process (polling, comments, merges,
+		// status) share one limiter. It is in-process: foreground gitmoot processes and
+		// runtime-subprocess gh calls run outside it.
 		configureGitHubLimiter(reloadPaths, stdout)
 		installDaemonReloadHandler(ctx, reloadPaths, live, stdout)
 	} else {
@@ -815,7 +817,9 @@ func daemonPreflightFailureLine(home string) string {
 
 // configureGitHubLimiter installs the process-wide GitHub call budget + secondary-
 // rate-limit backoff (#683) from the [github] config section onto the shared
-// github.DefaultLimiter used by every gh call in the daemon. It is best-effort: a
+// github.DefaultLimiter used by every gh call this daemon PROCESS issues (it does
+// not extend to foreground gitmoot processes or runtime subprocesses). It is
+// best-effort: a
 // config-load error leaves the inert default (byte-identical, no backoff) and logs
 // a warning rather than blocking the daemon. On success it logs one line so an
 // operator can see the active budget.
