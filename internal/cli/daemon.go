@@ -1955,6 +1955,18 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 				if err := runPipelineScanOnce(ctx, store, pipelineEnqueue, time.Now().UTC()); err != nil {
 					writeLine(stdout, "pipeline scan error: %s", err)
 				}
+				// Decouple the pipeline-advance cadence from the repo-poll backoff
+				// (#697): `wait` is the poller's cadence, which grows to minutes when
+				// repo polling backs off, and it would otherwise throttle the pipeline
+				// advancer to that same rate. While any run is in flight, cap the sleep
+				// to the configured (non-backed-off) poll interval so settled stages
+				// fold promptly; when idle, leave `wait` untouched so the daemon still
+				// sleeps out the full backoff. Only reduces the sleep, never extends it.
+				if inFlight, err := pipelineRunsInFlight(ctx, store); err != nil {
+					writeLine(stdout, "pipeline in-flight check error: %s", err)
+				} else {
+					wait = pipelineAdvanceWait(wait, live.pollInterval(), inFlight)
+				}
 			}
 			if watchSkillOptReviews {
 				if _, err := pollSkillOptReviewWatches(ctx, paths, store, blobStore, reviewGitHub, stdout, dryRun, home); err != nil {

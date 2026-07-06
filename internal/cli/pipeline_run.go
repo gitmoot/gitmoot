@@ -160,6 +160,43 @@ func runPipelineScanOnce(ctx context.Context, store *db.Store, enqueue pipelineS
 	return firstErr
 }
 
+// pipelineRunsInFlight reports whether any pipeline run is still in flight
+// (state='running'). The registered-repo supervisor calls it once per cycle,
+// AFTER runPipelineScanOnce, to decide whether the pipeline advancer needs a
+// prompt next tick (#697). Off-by-default cheap: with no pipelines / no active
+// runs the active-run query returns an empty slice before any further work, so
+// an idle daemon pays only one indexed SELECT per cycle.
+func pipelineRunsInFlight(ctx context.Context, store *db.Store) (bool, error) {
+	runs, err := store.ListActivePipelineRuns(ctx)
+	if err != nil {
+		return false, err
+	}
+	return len(runs) > 0, nil
+}
+
+// pipelineAdvanceWait decouples the pipeline-advance cadence from the repo-poll
+// backoff (#697). The registered-repo supervisor sleeps for the wait the poller
+// returns, which grows to minutes when repo polling backs off (persistent repo
+// errors / a 404 repo / a GitHub secondary rate-limit; base 1m, max 5m). That
+// backoff must not throttle pipeline-run advancement, or a settled stage folds
+// only once per (now minutes-long) tick. When a run is in flight this caps the
+// sleep to the configured, NON-backed-off poll interval (pollFloor) so the next
+// pipeline scan runs promptly; otherwise (no run in flight, or a non-positive
+// floor, or a poll wait already shorter than the floor) it returns the poll wait
+// unchanged, so an idle daemon still sleeps out the full backoff exactly as
+// before. The repo poller is unaffected: it re-checks each repo's own NextPoll
+// due time and skips repos not yet due, so an early wake never re-polls a
+// backed-off repo.
+func pipelineAdvanceWait(pollWait, pollFloor time.Duration, runsInFlight bool) time.Duration {
+	if !runsInFlight {
+		return pollWait
+	}
+	if pollFloor > 0 && pollFloor < pollWait {
+		return pollFloor
+	}
+	return pollWait
+}
+
 // schedulePipelineRuns is runPipelineScanOnce's SCHEDULE pass (#681): it creates a
 // run for each enabled pipeline whose interval schedule is due and has no active
 // run. A per-pipeline error is collected (first wins) but never stops the rest.
