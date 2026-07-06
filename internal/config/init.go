@@ -321,6 +321,29 @@ path = ""
 # kimi_memory_gb = 0.5
 # default_memory_gb = 0.5
 
+# [github] tunes the PROCESS-WIDE GitHub call budget + secondary-rate-limit backoff
+# the daemon installs at startup (issue #683). GitHub's SECONDARY (abuse-detection)
+# rate limit fires on burstiness/concurrency — NOT total volume — so a busy daemon +
+# many concurrent agent gh calls can trip it (HTTP 403 "secondary rate limit") and
+# freeze all GitHub ops even while the PRIMARY quota is fine. This limiter smooths
+# bursts and, on a secondary hit, pauses all GitHub calls process-wide (respecting
+# Retry-After, else exponential backoff) instead of retry-storming the abuse detector.
+#
+# SAFE DEFAULTS (no [github] section): max_concurrent = 0 (unlimited) and
+# min_interval = 0 (no spacing) leave single-call latency and steady-state throughput
+# byte-identical — the PROACTIVE smoothing is OPT-IN. secondary_backoff defaults TRUE:
+# it is invisible on the happy path (it engages only after a gh call actually fails
+# with a secondary/abuse limit) and is the protection the incident needed. To also
+# smooth bursts proactively on a busy host, set a concurrency cap (e.g. 6) and/or a
+# small min_interval (e.g. "250ms"). Durations accept a Go duration ("250ms", "2s")
+# or a bare integer read as whole seconds.
+# [github]
+# max_concurrent = 0
+# min_interval = "0s"
+# secondary_backoff = true
+# backoff_base = "60s"
+# backoff_max = "5m"
+
 # [runtimes.<name>] is the OPTIONAL config-driven runtime metadata registry
 # (issue #652). Gitmoot ships built-in metadata for each compiled runtime (codex,
 # claude, kimi, kimi-cli, shell) — capabilities, default/known models, and where

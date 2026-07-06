@@ -387,6 +387,11 @@ type GhClient struct {
 	Dir        string
 	Sleep      func(context.Context, time.Duration) error
 	MaxRetries int
+	// Limiter is the process-wide GitHub-call scheduler (#683). When nil the client
+	// uses the package-global DefaultLimiter() so every GhClient constructed via
+	// NewClient shares one budget + one secondary-rate-limit backoff window. Tests
+	// set it to an isolated limiter (fake clock) to exercise smoothing/backoff.
+	Limiter *RateLimiter
 
 	mutateMu sync.Mutex
 }
@@ -1190,16 +1195,43 @@ func (c *GhClient) run(ctx context.Context, mutate bool, args ...string) (subpro
 	if retries == 0 {
 		retries = 2
 	}
+	limiter := c.Limiter
+	if limiter == nil {
+		limiter = DefaultLimiter()
+	}
 	var result subprocess.Result
 	var err error
+	sawSecondary := false
 	for attempt := 0; attempt <= retries; attempt++ {
+		// Acquire smooths bursts (concurrency cap + min-interval) and, critically,
+		// waits out any active process-wide secondary-rate-limit backoff so a fresh
+		// gh call does not fire into an abuse window that another call already tripped.
+		if acqErr := limiter.Acquire(ctx); acqErr != nil {
+			return result, acqErr
+		}
 		result, err = runner.Run(ctx, c.Dir, "gh", args...)
-		if err == nil || !isRateLimit(result) || attempt == retries {
+		limiter.Release()
+		if err == nil {
+			limiter.NoteSuccess()
+			break
+		}
+		// A recovered retry never pauses the whole process; only a call that
+		// ULTIMATELY fails with a secondary limit engages the process-wide backoff,
+		// so a transient hit that the retry below clears stays byte-identical.
+		if isSecondaryRateLimit(result) {
+			sawSecondary = true
+		}
+		if !isRateLimit(result) || attempt == retries {
 			break
 		}
 		if sleepErr := c.sleep(ctx, time.Duration(attempt+1)*time.Second); sleepErr != nil {
 			return result, sleepErr
 		}
+	}
+	if err != nil && sawSecondary {
+		// Pause further GitHub calls process-wide (respecting Retry-After, else
+		// exponential fallback) rather than retry-storming the abuse detector.
+		limiter.NoteSecondaryLimit(parseRetryAfter(result))
 	}
 	if err != nil {
 		// Tag a network/GitHub-outage failure with the transparent TransientError
