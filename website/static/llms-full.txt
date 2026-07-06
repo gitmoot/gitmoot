@@ -2894,12 +2894,32 @@ max_concurrent = 1
 | `repo`           | yes      | —       | `owner/name` the job runs against. Must be a registered, enabled daemon repo with a checkout (see note below). |
 | `interval`       | yes      | —       | Go duration (e.g. `24h`, `1h30m`). Validated at load.        |
 | `jitter`         | no       | `0s`    | Random `[0, jitter]` added to each `next_due` to de-thunder. |
-| `action`         | no       | `ask`   | `ask` (read-only analysis) or `review` (read-only PR/code review). A `review` heartbeat requires the agent to hold the `review` capability. `implement` is deliberately not supported. |
+| `action`         | no       | `ask`   | `ask` (read-only analysis), `review` (read-only PR/code review), or `implement` (write). A `review` heartbeat requires the agent to hold the `review` capability. `implement` is **policy-gated** — see below. |
+| `runtime`        | no       | —       | Optional per-heartbeat runtime override (`codex`/`claude`/`kimi`). When set, the scheduled job runs on that runtime instead of the agent's registered default, on a fresh session (reuses the per-job override from #531). Empty ⇒ agent default. |
 | `prompt`         | yes      | —       | Instructions passed to the agent.                            |
 | `max_concurrent` | no       | `1`     | Overlap cap; a new run is skipped while this many are active.|
 
-Invalid intervals/jitter or an unsupported action produce a clear validation
-error at config load.
+Invalid intervals/jitter, an unsupported action, or an unsupported runtime
+override produce a clear validation error at config load.
+
+### Policy-gated `implement` action
+
+An `implement` heartbeat enqueues a **write** job (it can change code and open
+PRs), so it is deliberately gated and off by default. It only runs when the
+target agent both:
+
+- holds the `implement` capability, **and**
+- carries a write-granting autonomy policy — `--policy workspace-write` or
+  `--policy danger-full-access`.
+
+This mirrors `agent start` / `agent implement` exactly: under the default `auto`
+policy (or `read-only`) a headless implement job would run and produce no files,
+so gitmoot **fails closed**. The gate is enforced twice: `agent heartbeat add`
+refuses to write an `implement` heartbeat for an agent without a write policy or
+the implement capability, and the daemon scan skips a due `implement` heartbeat
+(advancing `next_due` with `last_status = policy_readonly`) if the agent no longer
+qualifies — it self-recovers once a write policy is granted. Implement heartbeats
+respect branch locks and the merge gate like any other implement job.
 
 ## CLI
 
@@ -2916,6 +2936,13 @@ gitmoot agent heartbeat add reviewer stale-prs \
   --repo jerryfane/gitmoot --interval 12h --action review \
   --prompt "Review stale open PRs and summarize blockers."
 
+# An implement heartbeat requires the agent to hold the implement capability AND
+# a write-granting policy (workspace-write / danger-full-access). Add --runtime to
+# pin a specific runtime for this schedule.
+gitmoot agent heartbeat add builder nightly-tidy \
+  --repo jerryfane/gitmoot --interval 24h --action implement --runtime codex \
+  --prompt "Fix the top lint/type error and open a small PR."
+
 gitmoot agent heartbeat list [--agent repo-maintainer]
 gitmoot agent heartbeat show repo-maintainer daily-status
 gitmoot agent heartbeat enable repo-maintainer daily-status
@@ -2923,17 +2950,20 @@ gitmoot agent heartbeat disable repo-maintainer daily-status
 gitmoot agent heartbeat remove repo-maintainer daily-status
 ```
 
-`add` validates the action, repo, interval, jitter, and prompt before writing, and
-(for `action = review`) refuses to write a heartbeat for an agent lacking the
-review capability. `enable`/`disable` flip just the `enabled` flag in place,
-preserving the rest of the block and its comments.
+`add` validates the action, runtime, repo, interval, jitter, and prompt before
+writing; refuses (for `action = review`) a heartbeat for an agent lacking the
+review capability; and refuses (for `action = implement`) a heartbeat for an agent
+lacking the implement capability or a write-granting policy. `enable`/`disable`
+flip just the `enabled` flag in place, preserving the rest of the block and its
+comments.
 
 ## Observability
 
 `gitmoot daemon status` surfaces every configured heartbeat with its enabled
-state, action, interval, repo, and — once it has fired — its `last_run`,
-`next_due`, and `last_status` (from the local `heartbeat_state`). With no
-heartbeats configured the section is omitted entirely (status is unchanged).
+state, action, interval, repo, its `runtime` override (only when one is set), and
+— once it has fired — its `last_run`, `next_due`, and `last_status` (from the
+local `heartbeat_state`). With no heartbeats configured the section is omitted
+entirely (status is unchanged).
 
 ## Behavior
 
@@ -2959,14 +2989,23 @@ heartbeats configured the section is omitted entirely (status is unchanged).
 
 ## Safety notes
 
-- Both supported actions are **read-only**: `ask` (the conservative default) and
-  `review`. Heartbeats do **not** auto-implement code — recurring unattended
-  code-change PRs are intentionally out of scope.
+- The default action `ask` and `review` are **read-only**. `implement` is a
+  **write** action and is off by default; it is policy-gated (see above) so a
+  recurring unattended code-change PR can only run for an agent an operator has
+  deliberately given a write-granting policy.
 - A `review` heartbeat only enqueues for an agent that holds the `review`
   capability; the check runs both when the heartbeat is written (CLI) and when it
   is due (daemon scan). A review heartbeat for an agent without the capability is
   skipped with `last_status = capability_missing` and self-recovers if the
   capability is later granted.
+- An `implement` heartbeat only enqueues for an agent that holds the `implement`
+  capability AND a write-granting policy; the same two-place check (CLI write +
+  daemon scan) applies. A due implement heartbeat that no longer qualifies is
+  skipped with `last_status = policy_readonly` and self-recovers once a write
+  policy is granted.
+- A per-heartbeat `runtime` override runs the scheduled job on a **fresh** session
+  of the named runtime; it never resumes or writes the agent's default-runtime
+  session, so it cannot collide with the agent's own runtime lock.
 - `repo` must be a repo the daemon **manages** (registered, enabled, with a
   checkout). This keeps heartbeats from enqueuing jobs no worker would run.
 - Heartbeats respect existing agent/runtime capacity limits (`max_background`),
@@ -2977,9 +3016,7 @@ heartbeats configured the section is omitted entirely (status is unchanged).
 
 ## Not yet supported (deferred)
 
-- `action = "implement"` heartbeats (recurring unattended code-change PRs).
 - Agent-**type** scoping (only named agents today).
-- Per-job runtime override (see #531).
 
 ---
 
@@ -7526,7 +7563,7 @@ his PRs (#555, #560), co-authored.
 
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, event webhooks, the web dashboard, per-job runtime overrides, and Codex, Claude Code, or Kimi Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, event webhooks, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, or Kimi Code runtime workflows.
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
@@ -7666,7 +7703,14 @@ self-evaluation; see the `verifier` and `decompose-and-verify` recipes and the
 [RESULT_CONTRACT.md](references/RESULT_CONTRACT.md)). An agent (via `--model` on start/subscribe/type set) and an
 individual job or delegation (via `--model` on run/ask/review/implement or the
 delegation `model` field) can pin a runtime model, with the per-job/delegation
-value overriding the agent default. Use
+value overriding the agent default. When neither pins one, a job falls back to the
+runtime's configured `[runtimes.<name>].default_model` (the one behavioral registry
+field), then the runtime CLI's own default. Use `gitmoot runtime list` to inspect
+each built-in runtime's resolved metadata (capabilities, default/known models, and
+where token usage is read from); operators can override a built-in runtime's
+metadata without recompiling via a `[runtimes.<name>]` config section — `default_model`
+retargets delivery, `models`/`capabilities` stay advisory (see CLI.md
+§ Runtime Metadata Registry). Use
 `gitmoot plugin doctor` when checking whether Codex, Claude Code, or Kimi Code
 can discover Gitmoot through an installed runtime plugin. Use
 `gitmoot plugin codex-launch --repo <path>` to print a Codex launch command that
@@ -7966,6 +8010,47 @@ Use `plugin codex-launch` when Codex needs sandbox access to the resolved
 Gitmoot home on Linux, macOS, or Windows. It prints a `codex-face --cd ...
 --add-dir ... -s workspace-write` launch command, or a persistent config
 snippet with `--config-snippet`.
+
+## Runtime Metadata Registry
+
+Gitmoot drives four built-in runtimes (`codex`, `claude`, `kimi`, plus the
+subscribe-only `shell`; the legacy `kimi-cli` is also compiled in). Each carries
+declarative metadata — advertised capabilities, a default model, an advisory list
+of known-valid models, and a descriptor of where token usage is read from. Inspect
+the resolved registry:
+
+```sh
+gitmoot runtime list
+gitmoot runtime list --json
+```
+
+The values come from the compiled built-in defaults, overlaid with any
+`[runtimes.<name>]` overrides in the config file. Override a built-in runtime's
+recorded metadata **without recompiling** — for example to retarget its default
+model or record its known models:
+
+```toml
+[runtimes.codex]
+default_model = "gpt-5.5-codex"
+models = ["gpt-5.5-codex", "gpt-5.4-codex"]
+capabilities = ["review", "implement", "ask"]
+usage_source = "codex exec --json turn.completed usage"
+```
+
+Exactly one field is **behavioral**: `default_model` is consulted at job **delivery**
+as the model fallback when **neither the agent nor the job pins a `--model`** — so
+setting it **does** retarget the model those jobs run on. The resolution order is:
+the agent/job `--model` win, then this `default_model`, then the runtime CLI's own
+default. Every other field is **inspection-only**, surfaced by `gitmoot runtime list`
+but changing nothing at runtime: `models` is **advisory** (Gitmoot never rejects a
+`--model` based on it), and `capabilities` gates nothing at dispatch. Adapter
+behavior (auth, sandbox policy, session resume, stream parsing) always stays in Go.
+With no `[runtimes.*]` section — and with `default_model` unset — behavior is
+byte-identical: no model is forced.
+
+A `[runtimes.<name>]` section can only tweak a **built-in** runtime's metadata; it
+cannot add a new first-class runtime (that requires a code change). An unknown
+runtime name is a config error surfaced by `gitmoot runtime list`.
 
 ## Repo And Daemon Status
 
@@ -8436,16 +8521,26 @@ Schedule recurring agent work (heartbeats, off by default):
 ```sh
 gitmoot agent heartbeat add repo-maintainer daily-status \
   --repo owner/repo --interval 24h --prompt "Daily status report." --enabled
+# implement is policy-gated; --runtime pins a runtime for this schedule.
+gitmoot agent heartbeat add builder nightly-tidy \
+  --repo owner/repo --interval 24h --action implement --runtime codex \
+  --prompt "Fix the top lint error and open a small PR."
 gitmoot agent heartbeat list
 gitmoot agent heartbeat show repo-maintainer daily-status
 gitmoot agent heartbeat enable|disable repo-maintainer daily-status
 gitmoot agent heartbeat remove repo-maintainer daily-status
 ```
 
-A heartbeat enqueues a normal background job on its `interval` (read-only `ask` or
-`review` action; `review` needs the agent's `review` capability). `gitmoot daemon
-status` surfaces each schedule's last-run/next-due/last-status. See
-`docs/heartbeats.md` for the full reference.
+A heartbeat enqueues a normal background job on its `interval`. Actions: read-only
+`ask` (default) or `review` (`review` needs the agent's `review` capability), plus
+the **policy-gated** write action `implement` — it only runs for an agent that
+holds the `implement` capability AND a write-granting policy (`--policy
+workspace-write` or `danger-full-access`); otherwise it is refused at `add` and
+no-op'd (`last_status = policy_readonly`) by the daemon scan. An optional
+`--runtime codex|claude|kimi` runs the scheduled job on that runtime (fresh
+session) instead of the agent default. `gitmoot daemon status` surfaces each
+schedule's last-run/next-due/last-status. See `docs/heartbeats.md` for the full
+reference.
 
 A registered single instance **shadows** a managed type of the same name:
 dispatch resolves `gitmoot agent <name>` to a registered single instance before a
