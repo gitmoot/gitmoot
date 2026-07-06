@@ -305,6 +305,60 @@ func TestMailboxRunDeliversModelOverride(t *testing.T) {
 	}
 }
 
+// TestMailboxRunThreadsRuntimeDefaultModel proves the #652 wiring: the Mailbox's
+// home-aware RuntimeDefaultModel hook is consulted at delivery and threaded onto the
+// delivered runtime.Job as the FINAL model fallback. With no agent --model and no
+// job --model, the job carries the runtime's configured default (RuntimeDefaultModel
+// set) while its explicit Model pin stays empty — so effectiveModel uses the default,
+// yet an agent/job pin (which would populate job.Model) still wins.
+func TestMailboxRunThreadsRuntimeDefaultModel(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store, RuntimeDefaultModel: func(rt string) string {
+		if rt == runtime.ShellRuntime {
+			return "gpt-5.5"
+		}
+		return ""
+	}}
+	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "jerryfane/gitmoot", Role: "reviewer"}
+	adapter := &fakeDelivery{outputs: []string{okDeliveryResult}}
+
+	// No agent Model, no job Model: the registry default_model must be threaded in.
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "implement", Repo: "jerryfane/gitmoot"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(adapter.models) != 1 || adapter.models[0] != "" {
+		t.Fatalf("delivered job.Model = %+v, want no explicit pin []", adapter.models)
+	}
+	if len(adapter.runtimeDefault) != 1 || adapter.runtimeDefault[0] != "gpt-5.5" {
+		t.Fatalf("delivered job.RuntimeDefaultModel = %+v, want [gpt-5.5]", adapter.runtimeDefault)
+	}
+}
+
+// TestMailboxRunNilRuntimeDefaultHookByteIdentical proves the byte-identical
+// default: with NO RuntimeDefaultModel hook (every pre-#652 construction site), the
+// delivered runtime.Job carries an empty RuntimeDefaultModel, so nothing is forced.
+func TestMailboxRunNilRuntimeDefaultHookByteIdentical(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "jerryfane/gitmoot", Role: "reviewer"}
+	adapter := &fakeDelivery{outputs: []string{okDeliveryResult}}
+
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "implement", Repo: "jerryfane/gitmoot"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(adapter.runtimeDefault) != 1 || adapter.runtimeDefault[0] != "" {
+		t.Fatalf("delivered job.RuntimeDefaultModel = %+v, want empty (byte-identical)", adapter.runtimeDefault)
+	}
+}
+
 // okDeliveryResult is a minimal well-formed gitmoot_result so a fake delivery
 // classifies to a terminal state and the job persists its recorded usage.
 const okDeliveryResult = `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
@@ -1426,16 +1480,18 @@ type fakeDelivery struct {
 	inputTokens   []int
 	outputTokens  []int
 	cumulative    []bool
-	prompts       []string
-	models        []string
-	agentRefs     []string
-	onDeliver     func()
-	err           error
+	prompts        []string
+	models         []string
+	runtimeDefault []string
+	agentRefs      []string
+	onDeliver      func()
+	err            error
 }
 
 func (f *fakeDelivery) Deliver(_ context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error) {
 	f.prompts = append(f.prompts, job.Prompt)
 	f.models = append(f.models, job.Model)
+	f.runtimeDefault = append(f.runtimeDefault, job.RuntimeDefaultModel)
 	f.agentRefs = append(f.agentRefs, agent.RuntimeRef)
 	if f.onDeliver != nil {
 		f.onDeliver()

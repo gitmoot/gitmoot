@@ -12,14 +12,16 @@ import (
 // list of known-valid model ids, and a human-readable descriptor of where the
 // adapter reads token usage from the CLI's structured output.
 //
-// It is METADATA ONLY. The adapter *behavior* — auth/token handling, sandbox
-// policy, session resume, stream parsing, transient-retry — stays in Go and is
-// unaffected by this type. The registry is a single source of truth consulted for
-// runtime enumeration (SupportedRuntimes) and surfaced by `gitmoot runtime list`;
-// it is NEVER consulted at delivery time, so seeding it (from the built-in
-// defaults below or from operator config) is byte-identical at runtime. In
-// particular Models is advisory: Gitmoot never REJECTS a --model based on it, so
-// populating it cannot change how a job is delivered.
+// The adapter *behavior* — auth/token handling, sandbox policy, session resume,
+// stream parsing, transient-retry — stays in Go and is unaffected by this type.
+// The registry is a single source of truth consulted for runtime enumeration
+// (SupportedRuntimes) and surfaced by `gitmoot runtime list`. Exactly ONE field is
+// behavioral: DefaultModel is consulted at delivery as the model fallback when
+// neither the agent nor the job pins a --model (#652). Every other field is
+// inspection-only, so seeding it (from the built-in defaults below or from
+// operator config) is byte-identical at runtime. In particular Models is advisory:
+// Gitmoot never REJECTS a --model based on it, so populating it cannot change how a
+// job is delivered.
 type RuntimeMetadata struct {
 	// Name is the runtime id (codex, claude, kimi, kimi-cli, shell).
 	Name string
@@ -32,12 +34,14 @@ type RuntimeMetadata struct {
 	// Capabilities are the job actions the runtime's adapter advertises. Every
 	// built-in advertises review/implement/ask today; the registry mirrors that.
 	Capabilities []string
-	// DefaultModel is the runtime's DECLARED default model, surfaced by
-	// `gitmoot runtime list`. It is inspection-only metadata and is NEVER consulted
-	// at delivery time: setting it does NOT retarget the model a job runs on — a
-	// job's model still comes from the agent/job --model or the runtime CLI's own
-	// configured default. Empty (the default for every built-in) means "none
-	// recorded", exactly as today.
+	// DefaultModel is the runtime's configured default model, surfaced by
+	// `gitmoot runtime list` AND consulted at delivery (#652): when NEITHER the
+	// agent NOR the job pins a --model, a delivered job falls back to this value as
+	// the model passed to the runtime (resolution order: agent/job --model win, then
+	// this registry default, then the runtime CLI's own default). It is the ONLY
+	// metadata field that is behavioral — Models and Capabilities stay advisory.
+	// Empty (the built-in default for every runtime) means "none recorded": nothing
+	// is forced, so delivery is byte-identical to before #652.
 	DefaultModel string
 	// Models is an ADVISORY list of known-valid model ids for the runtime. Empty
 	// (the default for every built-in) means "unrestricted": Gitmoot passes any

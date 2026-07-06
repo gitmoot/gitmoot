@@ -309,7 +309,11 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			}
 		}
 		if !handled {
-			if _, err := (workflow.Mailbox{Store: store}).Run(runCtx, job.ID, effectiveAgent, adapter); err != nil {
+			// #652: wire the home-aware registry default_model fallback so a
+			// foreground ask with no agent/job --model honors [runtimes.<rt>].default_model
+			// too. Fail-open/empty by default => byte-identical; an agent/job pin wins.
+			mailbox := workflow.Mailbox{Store: store, RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home)}
+			if _, err := mailbox.Run(runCtx, job.ID, effectiveAgent, adapter); err != nil {
 				return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, err)
 			}
 		}

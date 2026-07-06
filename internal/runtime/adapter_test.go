@@ -152,6 +152,87 @@ func TestCodexDeliverCommandFallsBackToAgentModel(t *testing.T) {
 	runner.want(t, 0, "codex", "exec", "--json", "resume", "--model", "sonnet", "550e8400-e29b-41d4-a716-446655440001", "--", "review this")
 }
 
+// TestCodexDeliverCommandFallsBackToRuntimeDefaultModel proves the #652 behavioral
+// registry default: with NO agent --model and NO job --model, a delivered job runs
+// on Job.RuntimeDefaultModel (the runtime's configured default_model, threaded in
+// by the dispatch layer). This is the real resolution seam — the --model arg the
+// runtime CLI actually receives.
+func TestCodexDeliverCommandFallsBackToRuntimeDefaultModel(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "done"}}}
+	adapter := CodexAdapter{Runner: runner, SessionResolver: staticCodexSessions{exists: true}}
+	agent := Agent{Name: "lead", Role: "implementer", Runtime: CodexRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440001", RepoScope: "jerryfane/gitmoot"}
+
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review this", RuntimeDefaultModel: "gpt-5.5"}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	runner.want(t, 0, "codex", "exec", "--json", "resume", "--model", "gpt-5.5", "550e8400-e29b-41d4-a716-446655440001", "--", "review this")
+}
+
+// TestCodexDeliverCommandJobModelWinsOverRuntimeDefault proves a job --model pin
+// still WINS over the registry default_model (#652 resolution order).
+func TestCodexDeliverCommandJobModelWinsOverRuntimeDefault(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "done"}}}
+	adapter := CodexAdapter{Runner: runner, SessionResolver: staticCodexSessions{exists: true}}
+	agent := Agent{Name: "lead", Role: "implementer", Runtime: CodexRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440001", RepoScope: "jerryfane/gitmoot"}
+
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review this", Model: "opus", RuntimeDefaultModel: "gpt-5.5"}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	runner.want(t, 0, "codex", "exec", "--json", "resume", "--model", "opus", "550e8400-e29b-41d4-a716-446655440001", "--", "review this")
+}
+
+// TestCodexDeliverCommandAgentModelWinsOverRuntimeDefault proves an agent --model
+// pin still WINS over the registry default_model when the job pins none (#652).
+func TestCodexDeliverCommandAgentModelWinsOverRuntimeDefault(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "done"}}}
+	adapter := CodexAdapter{Runner: runner, SessionResolver: staticCodexSessions{exists: true}}
+	agent := Agent{Name: "lead", Role: "implementer", Runtime: CodexRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440001", RepoScope: "jerryfane/gitmoot", Model: "sonnet"}
+
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review this", RuntimeDefaultModel: "gpt-5.5"}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	runner.want(t, 0, "codex", "exec", "--json", "resume", "--model", "sonnet", "550e8400-e29b-41d4-a716-446655440001", "--", "review this")
+}
+
+// TestCodexDeliverCommandNoRuntimeDefaultIsByteIdentical proves the byte-identical
+// default: an EMPTY RuntimeDefaultModel (the built-in default for every runtime, and
+// the value when no config sets it) forces NO --model arg — exactly as before #652.
+func TestCodexDeliverCommandNoRuntimeDefaultIsByteIdentical(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "done"}}}
+	adapter := CodexAdapter{Runner: runner, SessionResolver: staticCodexSessions{exists: true}}
+	agent := Agent{Name: "lead", Role: "implementer", Runtime: CodexRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440001", RepoScope: "jerryfane/gitmoot"}
+
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review this", RuntimeDefaultModel: ""}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	runner.want(t, 0, "codex", "exec", "--json", "resume", "550e8400-e29b-41d4-a716-446655440001", "--", "review this")
+}
+
+// TestEffectiveModelResolutionOrder locks the exact #652 precedence directly at the
+// resolution function: job --model > agent --model > runtime default_model > "".
+func TestEffectiveModelResolutionOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		agentModel string
+		jobModel   string
+		rtDefault  string
+		want       string
+	}{
+		{"job wins over all", "sonnet", "opus", "gpt-5.5", "opus"},
+		{"agent wins over rt default", "sonnet", "", "gpt-5.5", "sonnet"},
+		{"rt default when neither pins", "", "", "gpt-5.5", "gpt-5.5"},
+		{"empty when nothing set (byte-identical)", "", "", "", ""},
+		{"rt default trimmed", "", "", "  gpt-5.5  ", "gpt-5.5"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := effectiveModel(Agent{Model: tc.agentModel}, Job{Model: tc.jobModel, RuntimeDefaultModel: tc.rtDefault})
+			if got != tc.want {
+				t.Fatalf("effectiveModel(agent=%q, job=%q, rtDefault=%q) = %q, want %q", tc.agentModel, tc.jobModel, tc.rtDefault, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCodexStartCommandUsesAgentModel(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440009"}` + "\n"}}}
 	adapter := CodexAdapter{Runner: runner}

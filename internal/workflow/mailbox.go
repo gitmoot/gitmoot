@@ -83,6 +83,16 @@ type Mailbox struct {
 	// Nil (default) => no-op, so the terminal path is byte-identical. Best-effort:
 	// it never fails the job.
 	recordMemory func(ctx context.Context, jobID string, agent runtime.Agent, action string, payload JobPayload, result AgentResult)
+	// RuntimeDefaultModel, when set, resolves a runtime's configured default model
+	// (the registry default_model, HOME-AWARE: built-in defaults overlaid with any
+	// [runtimes.<name>] config) for the runtime named by the argument (#652). It is
+	// consulted at delivery ONLY as the final model fallback — after the job --model
+	// (payload.Model) and the agent --model (agent.Model) — so an agent/job pin
+	// always wins. Wired from the CLI layer (which owns the home-aware resolver) via
+	// Engine.RuntimeDefaultModel or directly on a CLI-constructed Mailbox. Nil (the
+	// default, and any error/empty result) forces nothing, so delivery is
+	// byte-identical to before #652.
+	RuntimeDefaultModel func(runtimeName string) string
 }
 
 type JobRequest struct {
@@ -653,7 +663,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 }
 
 func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent runtime.Agent, job db.Job, payload JobPayload, prompt string) (string, string, bool, error) {
-	result, err := adapter.Deliver(ctx, agent, runtime.Job{
+	delivery := runtime.Job{
 		ID:          job.ID,
 		AgentName:   agent.Name,
 		Action:      job.Type,
@@ -661,7 +671,17 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		Repository:  payload.Repo,
 		PullRequest: payload.PullRequest,
 		Model:       payload.Model,
-	})
+	}
+	// #652: thread in the runtime's configured registry default_model as the FINAL
+	// model fallback. effectiveModel applies the precedence (job.Model > agent.Model
+	// > this default), so an agent/job --model always wins; a nil hook or empty
+	// default forces nothing and is byte-identical. Resolved for the agent's
+	// EFFECTIVE runtime, so a #531 per-job runtime override picks up the override
+	// runtime's default.
+	if m.RuntimeDefaultModel != nil {
+		delivery.RuntimeDefaultModel = m.RuntimeDefaultModel(agent.Runtime)
+	}
+	result, err := adapter.Deliver(ctx, agent, delivery)
 	// Record best-effort runtime token usage so the per-root delegation token
 	// budget (#338 Part B) can sum a tree's cost. Usage accounting must never fail
 	// a delivery, so every write error here is swallowed.

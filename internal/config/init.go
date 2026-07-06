@@ -326,21 +326,23 @@ path = ""
 # claude, kimi, kimi-cli, shell) — capabilities, default/known models, and where
 # token usage is read from — that reproduces today's behavior. A [runtimes.<name>]
 # section OVERRIDES that recorded metadata for a BUILT-IN runtime WITHOUT a
-# recompile: record which models a runtime accepts, note its declared default, or
-# adjust its advertised capabilities. It is INSPECTION-ONLY METADATA — adapter
-# behavior (auth, sandbox, session resume, stream parsing, AND which model a job
-# actually runs on) stays in Go and is NEVER consulted at job delivery. Every field
-# here is surfaced by 'gitmoot runtime list' but changes nothing at runtime: setting
-# default_model does NOT retarget the model a job uses (a job's model still comes
-# from the agent/job --model or the runtime CLI's own config), models is advisory
+# recompile: retarget the default model, record which models a runtime accepts, or
+# adjust its advertised capabilities. Exactly ONE field is BEHAVIORAL: default_model
+# is consulted at job DELIVERY (#652) as the model fallback when NEITHER the agent
+# NOR the job pins a --model — so setting it DOES retarget the model those jobs run
+# on (resolution order: agent/job --model win, then this default_model, then the
+# runtime CLI's own default). Every other field is inspection-only, surfaced by
+# 'gitmoot runtime list' but changing nothing at runtime: models is advisory
 # (Gitmoot never REJECTS a --model based on it), and capabilities gates nothing at
-# dispatch (agent capabilities do). With no [runtimes.*] section behavior is
-# byte-identical. NOTE: this section can only tweak a BUILT-IN runtime's metadata —
-# it cannot add a new first-class runtime (that is a code change); an unknown runtime
-# name here is an error. default_model is the DECLARED default surfaced by 'runtime
-# list' (empty = none recorded); models is the advisory known-valid list;
-# capabilities is a subset of review/implement/ask; usage_source is a human-readable
-# descriptor.
+# dispatch (agent capabilities do). Adapter behavior (auth, sandbox, session resume,
+# stream parsing) always stays in Go. With no [runtimes.*] section — and with
+# default_model unset (empty = none recorded, the built-in default) — behavior is
+# byte-identical: no model is forced. NOTE: this section can only tweak a BUILT-IN
+# runtime's metadata — it cannot add a new first-class runtime (that is a code
+# change); an unknown runtime name here is an error. default_model is the configured
+# default surfaced by 'runtime list' AND the delivery fallback; models is the
+# advisory known-valid list; capabilities is a subset of review/implement/ask;
+# usage_source is a human-readable descriptor.
 # [runtimes.codex]
 # default_model = "gpt-5.5-codex"
 # models = ["gpt-5.5-codex", "gpt-5.4-codex"]

@@ -135,6 +135,39 @@ func TestRunRuntimeListUnknownRuntimeExits(t *testing.T) {
 	}
 }
 
+// TestRuntimeDefaultModelResolverReadsConfig proves the HOME-AWARE delivery hook
+// (#652) returns the configured [runtimes.<rt>].default_model for a runtime, and
+// resolves NOTHING (byte-identical) for a runtime with no override.
+func TestRuntimeDefaultModelResolverReadsConfig(t *testing.T) {
+	src := writeCLIConfig(t, "[runtimes.codex]\ndefault_model = \"gpt-5.5\"\n")
+	home := homeFromConfig(t, src)
+	resolve := runtimeDefaultModelResolver(home)
+	if got := resolve(runtime.CodexRuntime); got != "gpt-5.5" {
+		t.Fatalf("resolve(codex) = %q, want gpt-5.5", got)
+	}
+	// A runtime with no override records no default: the hook forces nothing.
+	if got := resolve(runtime.ClaudeRuntime); got != "" {
+		t.Fatalf("resolve(claude) = %q, want empty (no override)", got)
+	}
+}
+
+// TestRuntimeDefaultModelResolverAbsentConfigByteIdentical proves the fail-open
+// contract: with no config file (fresh box), an empty home, or an unknown runtime,
+// the hook resolves "" so delivery forces no model — byte-identical to before #652.
+func TestRuntimeDefaultModelResolverAbsentConfigByteIdentical(t *testing.T) {
+	missingHome := t.TempDir() // no config.toml written anywhere under it
+	if got := runtimeDefaultModelResolver(missingHome)(runtime.CodexRuntime); got != "" {
+		t.Fatalf("missing-config resolve(codex) = %q, want empty", got)
+	}
+	if got := runtimeDefaultModelResolver("")(runtime.CodexRuntime); got != "" {
+		t.Fatalf("empty-home resolve(codex) = %q, want empty", got)
+	}
+	src := writeCLIConfig(t, "[runtimes.codex]\ndefault_model = \"gpt-5.5\"\n")
+	if got := runtimeDefaultModelResolver(homeFromConfig(t, src))("nonexistent-runtime"); got != "" {
+		t.Fatalf("unknown-runtime resolve = %q, want empty", got)
+	}
+}
+
 // homeFromConfig writes the given config body into a home layout so a --home flag
 // resolves ConfigFile to it. The CLI resolves --home via config.PathsForHome, so
 // place the file at <home>/.gitmoot/config.toml.

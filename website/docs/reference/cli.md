@@ -94,8 +94,8 @@ gitmoot runtime list --json
 
 The values come from the compiled built-in defaults, overlaid with any
 `[runtimes.<name>]` overrides in `config.toml`. Override a built-in runtime's
-recorded **metadata without recompiling** — for example to record its known models
-or note its declared default model:
+recorded metadata **without recompiling** — for example to retarget its default
+model or record its known models:
 
 ```toml
 [runtimes.codex]
@@ -105,14 +105,16 @@ capabilities = ["review", "implement", "ask"]
 usage_source = "codex exec --json turn.completed usage"
 ```
 
-This is **inspection-only metadata** — adapter behavior (auth, sandbox policy,
-session resume, stream parsing, **and which model a job actually runs on**) stays in
-Go and is never consulted at delivery. Every field is surfaced by `gitmoot runtime
-list` but changes nothing at runtime: `default_model` does **not** retarget the
-model a job uses (a job's model still comes from the agent/job `--model` or the
-runtime CLI's own config), `models` is **advisory** (Gitmoot never rejects a
-`--model` based on it), and `capabilities` gates nothing at dispatch. With no
-`[runtimes.*]` section behavior is byte-identical.
+Exactly one field is **behavioral**: `default_model` is consulted at job **delivery**
+as the model fallback when **neither the agent nor the job pins a `--model`** — so
+setting it **does** retarget the model those jobs run on. The resolution order is:
+the agent/job `--model` win, then this `default_model`, then the runtime CLI's own
+default. Every other field is **inspection-only**, surfaced by `gitmoot runtime list`
+but changing nothing at runtime: `models` is **advisory** (Gitmoot never rejects a
+`--model` based on it), and `capabilities` gates nothing at dispatch. Adapter
+behavior (auth, sandbox policy, session resume, stream parsing) always stays in Go.
+With no `[runtimes.*]` section — and with `default_model` unset — behavior is
+byte-identical: no model is forced.
 
 A `[runtimes.<name>]` section can only tweak a **built-in** runtime's metadata; it
 cannot add a new first-class runtime (that requires a code change). An unknown

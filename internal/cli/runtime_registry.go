@@ -56,6 +56,31 @@ func runtimeMetadataOverrides(overrides []config.RuntimeOverride) []runtime.Meta
 	return out
 }
 
+// runtimeDefaultModelResolver returns a HOME-AWARE resolver for a runtime's
+// configured registry default_model (#652), suitable for wiring into
+// workflow.Engine.RuntimeDefaultModel / workflow.Mailbox.RuntimeDefaultModel so a
+// delivered job with no agent --model and no job --model falls back to it. It reads
+// the built-in registry overlaid with any [runtimes.<name>] config overrides for
+// `home` (which may be an already-resolved <home>/.gitmoot root OR a raw --home;
+// resolveConfigFile handles both), then returns the resolved DefaultModel for the
+// named runtime. It is FAIL-OPEN: a resolution error, a missing config, an empty
+// home, or an unknown runtime all yield "", so delivery forces nothing and is
+// byte-identical to before #652. It re-reads config on each call, so a warm-reloaded
+// (SIGHUP) default_model edit takes effect without a full restart.
+func runtimeDefaultModelResolver(home string) func(string) string {
+	return func(runtimeName string) string {
+		registry, err := resolveRuntimeRegistry(config.Paths{ConfigFile: resolveConfigFile(home)})
+		if err != nil {
+			return ""
+		}
+		meta, ok := registry.Metadata(strings.TrimSpace(runtimeName))
+		if !ok {
+			return ""
+		}
+		return strings.TrimSpace(meta.DefaultModel)
+	}
+}
+
 func runRuntime(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		printRuntimeUsage(stdout)

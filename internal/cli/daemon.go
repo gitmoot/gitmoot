@@ -405,6 +405,9 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		engine := workflow.Engine{
 			Store:     store,
 			MergeGate: mergeGate,
+			// Registry default_model behavioral fallback (#652), home-aware and
+			// fail-open — see daemonWorkflowEngine. Empty by default => byte-identical.
+			RuntimeDefaultModel: runtimeDefaultModelResolver(*home),
 		}
 		// Honor the opt-in [orchestrate] policy (artifact-body inlining + per-root
 		// delegation token budget) on this single-repo engine too; fail-safe to the
@@ -6352,6 +6355,13 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 		// the terminal path are byte-identical. Non-enrolled agents are never touched
 		// even when the controller is present.
 		Memory: daemonMemoryController(store, home),
+		// Registry default_model behavioral fallback (#652): when a delivered job
+		// pins no agent --model and no job --model, fall back to the runtime's
+		// configured default_model from the HOME-AWARE resolved runtime registry
+		// (built-in defaults overlaid with [runtimes.<name>] config). Fail-open and
+		// empty by default, so with no config NO model is forced and delivery is
+		// byte-identical; an agent/job --model always wins.
+		RuntimeDefaultModel: runtimeDefaultModelResolver(home),
 		PayloadRefresher: func(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
 			return refreshDaemonJobPayload(ctx, store, checkout, job, payload)
 		},

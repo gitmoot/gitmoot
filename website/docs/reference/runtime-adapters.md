@@ -28,11 +28,12 @@ agent template and rendered job prompt before handing work to an adapter.
 ## Metadata Registry
 
 Each built-in runtime carries declarative metadata — advertised capabilities, a
-declared default model, an advisory list of known-valid models, and a descriptor of
-where token usage is read from — seeded from compiled defaults that reproduce
-Gitmoot's historical behavior. This metadata is **inspection-only**: it is surfaced
-by `gitmoot runtime list` (add `--json` for machine output) and is never consulted
-at job delivery.
+default model, an advisory list of known-valid models, and a descriptor of where
+token usage is read from — seeded from compiled defaults that reproduce Gitmoot's
+historical behavior. All of it is surfaced by `gitmoot runtime list` (add `--json`
+for machine output). Exactly one field is **behavioral**: `default_model` is
+consulted at job delivery as the model fallback when neither the agent nor the job
+pins a `--model`. Every other field is inspection-only.
 
 Operators can override a built-in runtime's recorded metadata **without
 recompiling** via a `[runtimes.<name>]` section in `config.toml`:
@@ -44,15 +45,16 @@ models = ["gpt-5.5-codex", "gpt-5.4-codex"]
 capabilities = ["review", "implement", "ask"]
 ```
 
-This is inspection-only metadata — adapter *behavior* (auth, sandbox, session
-resume, stream parsing, **and which model a job actually runs on**) stays in Go and
-is never consulted at delivery. Setting `default_model` does **not** retarget the
-model a job uses (a job's model still comes from the agent/job `--model` or the
-runtime CLI's own config); `models` is advisory (Gitmoot never rejects a `--model`
-based on it); and `capabilities` gates nothing at dispatch. With no `[runtimes.*]`
-section behavior is byte-identical. The section can only tweak a **built-in**
-runtime; adding a new first-class runtime is a code change, and an unknown runtime
-name is a config error.
+Setting `default_model` **does** retarget the model a job runs on **when that job
+pins no model itself** — the resolution order is: the agent/job `--model` win, then
+this `default_model`, then the runtime CLI's own default. So an agent/job `--model`
+always wins, and with `default_model` unset (the built-in default) no model is
+forced. Every other field is inspection-only: `models` is advisory (Gitmoot never
+rejects a `--model` based on it); `capabilities` gates nothing at dispatch; and
+adapter *behavior* (auth, sandbox, session resume, stream parsing) always stays in
+Go. With no `[runtimes.*]` section behavior is byte-identical. The section can only
+tweak a **built-in** runtime; adding a new first-class runtime is a code change, and
+an unknown runtime name is a config error.
 
 ## Agent Session Values
 

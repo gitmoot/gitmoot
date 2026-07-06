@@ -301,6 +301,13 @@ type Engine struct {
 	// path with no enrolled agent), the Mailbox is built with nil memory hooks and
 	// both prompt assembly and the terminal path are byte-identical.
 	Memory *MemoryController
+	// RuntimeDefaultModel, when set, resolves a runtime's configured registry
+	// default_model (HOME-AWARE) for the runtime named by the argument (#652). It is
+	// copied onto the Mailbox in mailbox() and consulted at delivery ONLY as the
+	// final model fallback — after the job --model and the agent --model — so an
+	// agent/job pin always wins. Nil (the default) forces nothing, so delivery is
+	// byte-identical to before #652.
+	RuntimeDefaultModel func(runtimeName string) string
 }
 
 // DelegationTimeoutDefaults are optional fallback timeouts for child delegation
@@ -417,7 +424,7 @@ func (e Engine) now() time.Time {
 // path is byte-identical. The hook maps the terminal JobState to the event_type,
 // resolves root_id from the payload, and ships a redacted event fire-and-forget.
 func (e Engine) mailbox() Mailbox {
-	mb := Mailbox{Store: e.Store, CanaryEnabled: e.CanaryEnabled, deferBlocker: e.BlockerDeferrer}
+	mb := Mailbox{Store: e.Store, CanaryEnabled: e.CanaryEnabled, deferBlocker: e.BlockerDeferrer, RuntimeDefaultModel: e.RuntimeDefaultModel}
 	// Wire the off-by-default memory hooks (#626). When e.Memory is nil (every
 	// non-enrolled path) both hooks stay nil, so Run's prompt assembly and terminal
 	// path are byte-identical. The hooks themselves also no-op when the executor

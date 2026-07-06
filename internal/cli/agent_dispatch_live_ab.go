@@ -133,7 +133,7 @@ func maybeRunLiveAB(ctx context.Context, store *db.Store, request localAgentDisp
 	// === Past this point we ARE intercepting (handled=true regardless of outcome). ===
 	// 1) Champion: the canonical answer the user receives, via the normal
 	//    Mailbox.Run path so the job/result are identical to a plain ask.
-	championResult, runErr := (workflow.Mailbox{Store: store}).Run(ctx, job.ID, runtimeAgent(agent), adapter)
+	championResult, runErr := (workflow.Mailbox{Store: store, RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home)}).Run(ctx, job.ID, runtimeAgent(agent), adapter)
 	if runErr != nil {
 		// The primary ask itself failed — surface it exactly as the non-intercepted
 		// path would (the caller propagates the same error).
