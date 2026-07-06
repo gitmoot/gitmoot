@@ -294,6 +294,72 @@ func TestAdvancerBlockedPark(t *testing.T) {
 	}
 }
 
+const independentBranchSpec = `name: fork
+repo: owner/repo
+stages:
+  - id: a
+    cmd: echo a
+  - id: b
+    cmd: echo b
+  - id: c
+    cmd: echo c
+    needs: [b]
+`
+
+// TestAdvancerIndependentBranchRunsWhenSiblingBlocks proves per-branch (not
+// run-wide) halting: two independent roots a and b, with c depending only on b.
+// When a blocks, c's branch (b -> c) is fully reachable and MUST still run to
+// completion; the run parks blocked only because of a, and only once nothing is in
+// flight. A run-wide fail-fast would wrongly skip c even though its dep b succeeded.
+func TestAdvancerIndependentBranchRunsWhenSiblingBlocks(t *testing.T) {
+	store := pipelineAdvanceStore(t)
+	enqueue := testStageEnqueuer(store)
+	rec, spec := newTestPipeline(t, store, "fork", independentBranchSpec)
+	now := time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC)
+
+	// Both roots enqueue immediately; c waits on b.
+	run := startTestRun(t, store, rec, spec, enqueue, now)
+	if got := stageRow(t, store, run.ID, "a"); got.State != pipeline.StageQueued {
+		t.Fatalf("stage a = %s, want queued", got.State)
+	}
+	if got := stageRow(t, store, run.ID, "b"); got.State != pipeline.StageQueued {
+		t.Fatalf("stage b = %s, want queued", got.State)
+	}
+
+	// a blocks, b succeeds: the block must NOT halt b's independent branch.
+	settleStageJob(t, store, stageRow(t, store, run.ID, "a").JobID, "blocked", "a needs a secret", []string{"R2 token"})
+	settleStageJob(t, store, stageRow(t, store, run.ID, "b").JobID, "approved", "b ok", nil)
+	run = advance(t, store, rec, spec, enqueue, run, now)
+
+	// c's dep b succeeded, so c is enqueued and the run stays running (c in flight).
+	c := stageRow(t, store, run.ID, "c")
+	if c.State != pipeline.StageQueued || c.JobID == "" {
+		t.Fatalf("stage c = %+v, want queued after b succeeded (independent of blocked a)", c)
+	}
+	if run.State != pipeline.RunRunning {
+		t.Fatalf("run = %s, want still running while c is in flight", run.State)
+	}
+	if got := stageRow(t, store, run.ID, "a"); got.State != pipeline.StageBlocked {
+		t.Fatalf("stage a = %s, want blocked", got.State)
+	}
+
+	// c completes: only now, with nothing in flight, does the run park blocked on a.
+	settleStageJob(t, store, c.JobID, "approved", "c ok", nil)
+	run = advance(t, store, rec, spec, enqueue, run, now)
+	if got := stageRow(t, store, run.ID, "c"); got.State != pipeline.StageSucceeded {
+		t.Fatalf("stage c = %s, want succeeded (reachable branch ran to completion)", got.State)
+	}
+	if run.State != pipeline.RunBlocked {
+		t.Fatalf("run = %s, want blocked (parks on a once nothing is in flight)", run.State)
+	}
+	if run.HaltStage != "a" {
+		t.Fatalf("halt_stage = %q, want a", run.HaltStage)
+	}
+	if got := decodePipelineNeeds(run.NeedsJSON); len(got) != 1 || got[0] != "R2 token" {
+		t.Fatalf("run needs = %v, want [R2 token]", got)
+	}
+}
+
 const retrySpec = `name: retry
 repo: owner/repo
 stages:

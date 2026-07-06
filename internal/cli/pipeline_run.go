@@ -287,7 +287,8 @@ func advancePipelineRuns(ctx context.Context, store *db.Store, enqueue pipelineS
 
 // advancePipelineRun is the per-run advancer (decision 6). It is a single
 // idempotent pass: FOLD every settled stage job into its stage row by DECISION,
-// ENQUEUE newly-ready stages (unless the run is halting on a block/fail), then, if
+// ENQUEUE every newly-ready stage (deps all succeeded — a blocked/failed branch
+// halts only ITSELF, so independent branches keep running), then, if
 // nothing is in flight, SETTLE the run — succeeded, or parked blocked/failed with
 // the halt stage + reason + (for blocked) the aggregated needs persisted verbatim.
 // It writes only rows that actually change, so a re-scan on an unchanged run makes
@@ -362,27 +363,28 @@ func advancePipelineRun(ctx context.Context, store *db.Store, enqueue pipelineSt
 	}
 
 	// --- ENQUEUE: launch newly-ready stages ----------------------------------
-	// Once any stage is blocked or failed the run is halting: stop launching new
-	// work and let the in-flight stages drain, then park.
-	halting := anyPipelineStageInState(byID, pipeline.StageBlocked, pipeline.StageFailed)
-	if !halting {
-		for _, stage := range spec.Stages {
-			row := byID[stage.ID]
-			if row.State != pipeline.StagePending || !pipelineStageDepsSucceeded(stage, byID) {
-				continue
-			}
-			job, err := enqueuePipelineStageJob(ctx, store, enqueue, pipelineStageJobRequest(rec, stage, run, row.Attempt))
-			if err != nil {
-				return run, err
-			}
-			row.State = pipeline.StageQueued
-			row.JobID = job.ID
-			row.StartedAt = now
-			if err := persistPipelineStage(ctx, store, byID[stage.ID], row); err != nil {
-				return run, err
-			}
-			byID[stage.ID] = row
+	// Per-branch reachability, NOT a run-wide fail-fast: a stage whose needs have
+	// ALL succeeded is enqueued even when an INDEPENDENT branch has already blocked
+	// or failed. Only a stage that (transitively) depends on the halted stage never
+	// becomes ready — its dep never reaches succeeded — so a blocked/failed branch
+	// halts itself while its siblings run to completion (decision 6: "dependents
+	// never ready"). The run does not park until nothing is in flight below.
+	for _, stage := range spec.Stages {
+		row := byID[stage.ID]
+		if row.State != pipeline.StagePending || !pipelineStageDepsSucceeded(stage, byID) {
+			continue
 		}
+		job, err := enqueuePipelineStageJob(ctx, store, enqueue, pipelineStageJobRequest(rec, stage, run, row.Attempt))
+		if err != nil {
+			return run, err
+		}
+		row.State = pipeline.StageQueued
+		row.JobID = job.ID
+		row.StartedAt = now
+		if err := persistPipelineStage(ctx, store, byID[stage.ID], row); err != nil {
+			return run, err
+		}
+		byID[stage.ID] = row
 	}
 
 	// --- SETTLE: park or finish once nothing is in flight --------------------
@@ -390,21 +392,22 @@ func advancePipelineRun(ctx context.Context, store *db.Store, enqueue pipelineSt
 		return run, nil
 	}
 
-	if halting {
-		// Nothing more can run: every still-pending stage is unreachable (a dep chain
-		// is broken by a blocked/failed stage), so mark them skipped for a clean
-		// terminal picture — this is also why a blocked run's downstream stages are
-		// never enqueued.
-		for _, stage := range spec.Stages {
-			row := byID[stage.ID]
-			if row.State == pipeline.StagePending {
-				row.State = pipeline.StageSkipped
-				row.FinishedAt = now
-				if err := persistPipelineStage(ctx, store, byID[stage.ID], row); err != nil {
-					return run, err
-				}
-				byID[stage.ID] = row
+	// Nothing is in flight, so no stage will ever reach succeeded again. Any stage
+	// still pending here therefore has a dep that can NEVER all-succeed — the ENQUEUE
+	// pass above already launched every pending stage whose deps had all succeeded,
+	// so a leftover pending stage is transitively downstream of a blocked/failed (or
+	// itself-skipped) stage. Mark it skipped for a clean terminal picture; this is
+	// exactly why a blocked/failed branch's downstream stages are never enqueued,
+	// while a reachable independent branch was already run above.
+	for _, stage := range spec.Stages {
+		row := byID[stage.ID]
+		if row.State == pipeline.StagePending {
+			row.State = pipeline.StageSkipped
+			row.FinishedAt = now
+			if err := persistPipelineStage(ctx, store, byID[stage.ID], row); err != nil {
+				return run, err
 			}
+			byID[stage.ID] = row
 		}
 	}
 
