@@ -276,6 +276,21 @@ type JobEvent struct {
 	CreatedAt string
 }
 
+// JobGate is one resumable gate row (#682): a single entry from a blocked job's
+// gitmoot_result `needs` list, persisted so the blocker becomes actionable. A
+// blocked stage records one gate per need; when every gate for the job is
+// satisfied the blocked stage auto-re-runs via RetryJob. Satisfied is 0 (open)
+// until an operator clears it; SatisfiedAt is the clear timestamp (empty while
+// open).
+type JobGate struct {
+	ID          int64
+	JobID       string
+	Need        string
+	Satisfied   bool
+	CreatedAt   string
+	SatisfiedAt string
+}
+
 type EvalArtifact struct {
 	ID        string
 	Hash      string
@@ -3294,6 +3309,103 @@ func (s *Store) JobIDsWithOpenEscalation(ctx context.Context) ([]string, error) 
 		HAVING SUM(CASE WHEN kind = 'delegation_escalation_requested' THEN 1 ELSE 0 END)
 		     > SUM(CASE WHEN kind = 'delegation_escalation_resolved' THEN 1 ELSE 0 END)
 		ORDER BY job_id`)
+}
+
+// RecordJobGates persists one resumable gate per non-blank need for a blocked job
+// (#682). It is an UPSERT keyed on (job_id, need): a fresh need inserts an OPEN
+// gate; a re-blocked job that repeats a need REOPENS the existing row (resets
+// satisfied to 0 and clears satisfied_at) so a stage that blocks → clears →
+// re-runs → blocks again does not strand a permanently-satisfied gate. It returns
+// the number of needs written. An empty (or all-blank) list is a no-op that
+// writes nothing, so a blocked job with no `needs` is byte-identical to before
+// this feature (no rows, no behavior change).
+func (s *Store) RecordJobGates(ctx context.Context, jobID string, needs []string) (int, error) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return 0, fmt.Errorf("job id is required")
+	}
+	written := 0
+	for _, need := range needs {
+		need = strings.TrimSpace(need)
+		if need == "" {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO job_gates(job_id, need, satisfied, created_at, satisfied_at)
+			VALUES (?, ?, 0, CURRENT_TIMESTAMP, '')
+			ON CONFLICT(job_id, need) DO UPDATE SET satisfied = 0, satisfied_at = ''`,
+			jobID, need); err != nil {
+			return written, err
+		}
+		written++
+	}
+	return written, nil
+}
+
+// ListJobGates returns every gate recorded for a job, oldest-first by insertion
+// id. Zero rows (the common case) yields an empty slice.
+func (s *Store) ListJobGates(ctx context.Context, jobID string) ([]JobGate, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, job_id, need, satisfied, created_at, satisfied_at
+		FROM job_gates WHERE job_id = ? ORDER BY id`, strings.TrimSpace(jobID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var gates []JobGate
+	for rows.Next() {
+		var g JobGate
+		var satisfied int
+		if err := rows.Scan(&g.ID, &g.JobID, &g.Need, &satisfied, &g.CreatedAt, &g.SatisfiedAt); err != nil {
+			return nil, err
+		}
+		g.Satisfied = satisfied != 0
+		gates = append(gates, g)
+	}
+	return gates, rows.Err()
+}
+
+// SatisfyJobGate marks a single open gate satisfied by exact need text. It returns
+// whether an OPEN gate with that need existed and was cleared (false when no such
+// need is recorded or it was already satisfied), so the caller can report an
+// unknown --need rather than silently succeeding.
+func (s *Store) SatisfyJobGate(ctx context.Context, jobID, need string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE job_gates SET satisfied = 1, satisfied_at = CURRENT_TIMESTAMP
+		WHERE job_id = ? AND need = ? AND satisfied = 0`,
+		strings.TrimSpace(jobID), strings.TrimSpace(need))
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
+// SatisfyAllJobGates marks every still-open gate for a job satisfied and returns
+// how many it cleared.
+func (s *Store) SatisfyAllJobGates(ctx context.Context, jobID string) (int, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE job_gates SET satisfied = 1, satisfied_at = CURRENT_TIMESTAMP
+		WHERE job_id = ? AND satisfied = 0`, strings.TrimSpace(jobID))
+	if err != nil {
+		return 0, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(affected), nil
+}
+
+// CountJobGates returns (total, open) gate counts for a job in one query. open is
+// the number still unsatisfied; total==0 means the job never recorded any gate.
+func (s *Store) CountJobGates(ctx context.Context, jobID string) (total int, open int, err error) {
+	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*), SUM(CASE WHEN satisfied = 0 THEN 1 ELSE 0 END)
+		FROM job_gates WHERE job_id = ?`, strings.TrimSpace(jobID))
+	var openNull sql.NullInt64
+	if err := row.Scan(&total, &openNull); err != nil {
+		return 0, 0, err
+	}
+	return total, int(openNull.Int64), nil
 }
 
 func (s *Store) UpsertEvalArtifact(ctx context.Context, artifact EvalArtifact) error {
@@ -7626,5 +7738,27 @@ CREATE TABLE runtime_session_usage (
 	output_cum INTEGER NOT NULL DEFAULT 0,
 	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+	`,
+	// #682 resumable blocked/needs gates. When a stage returns `blocked` with a
+	// `needs` list, each need is persisted here as a gate attached to the blocked
+	// job; when every gate is satisfied the blocked stage auto-re-runs via RetryJob.
+	// UNIQUE(job_id, need) makes RecordJobGates' UPSERT idempotent and lets a
+	// re-blocked job REOPEN a repeated need. Pure additive append (CREATE
+	// TABLE/INDEX only, no ALTER/renumber of any prior migration): the table stays
+	// empty until a blocked-with-needs result is recorded, so a blocked job with no
+	// `needs` — and every existing DB — reads byte-identically. Rows are keyed by
+	// job id (not FK-constrained) so a retried/cancelled job's history is retained;
+	// there is no GC in v1 (a satisfied gate is tens of bytes).
+	`
+CREATE TABLE job_gates (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	job_id TEXT NOT NULL,
+	need TEXT NOT NULL,
+	satisfied INTEGER NOT NULL DEFAULT 0,
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	satisfied_at TEXT NOT NULL DEFAULT '',
+	UNIQUE(job_id, need)
+);
+CREATE INDEX idx_job_gates_job ON job_gates(job_id);
 	`,
 }

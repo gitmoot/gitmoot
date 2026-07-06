@@ -852,12 +852,35 @@ gitmoot job watch <job-id>
 gitmoot job events <job-id>
 gitmoot job run <job-id>
 gitmoot job retry <job-id>
+gitmoot job gates <job-id>                                         # list resumable gates; add --json
+gitmoot job gates clear <job-id> --need "<text>"|--all             # satisfy gate(s); auto-resume on last
 gitmoot job cancel <job-id>                                        # one queued|running|blocked job
 gitmoot job cancel --state blocked [--older-than 7d] [--repo owner/repo] [--agent name] [--yes]
 gitmoot job kill <root-job-id>
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
+
+### Resumable gates (make `blocked` + `needs` actionable)
+
+When a stage returns `blocked` with a `needs` list (e.g. `needs: ["Maps API key"]`),
+gitmoot persists each need as a **gate** attached to the blocked job. `gitmoot job
+gates <job-id>` lists them (open / satisfied); clearing a gate marks the blocker
+resolved:
+
+```sh
+gitmoot job gates clear <job-id> --need "Maps API key"   # satisfy one need
+gitmoot job gates clear <job-id> --all                   # satisfy every open gate
+```
+
+When the **last** gate is cleared, the blocked stage **auto-re-runs** via the same
+`RetryJob` machinery `gitmoot job retry` uses (re-queued, then dispatched by the
+daemon; downstream stages follow the normal delegation DAG) — resume happens on
+clear, no polling. A **session job** (externally driven) and a stage whose tree is
+**paused awaiting a human** (`escalate_human` / ask-gate) are never auto-resumed
+even with all gates cleared — a resource gate must not bypass the human's `gitmoot
+resume` decision; the command reports `not resumed: …` with the reason. A blocked
+job with **no** `needs` records no gates and is byte-identical to before.
 
 ### Session jobs (record "here"-method work)
 

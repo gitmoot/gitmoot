@@ -82,6 +82,108 @@ func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error
 	return store.GetJob(ctx, job.ID)
 }
 
+// GateResumeOutcome is the result of MaybeResumeOnGatesCleared (#682): whether the
+// blocked stage was auto-re-queued and, if not, why the resume was withheld.
+type GateResumeOutcome struct {
+	// Resumed is true iff the blocked job was re-queued through RetryJob.
+	Resumed bool
+	// Reason is a human-readable explanation of the outcome — the re-queue on
+	// success, or why the resume was skipped (no gates, gates still open, session
+	// job, or an awaiting-human pause that must not be bypassed).
+	Reason string
+}
+
+// MaybeResumeOnGatesCleared auto-re-runs a blocked stage the moment its LAST gate
+// is satisfied (#682), reusing the existing RetryJob machinery (which already
+// resurrects blocked jobs) so the resumed stage — and, via the normal delegation
+// DAG, everything downstream — wakes back up without any polling. It is the
+// resume-on-clear seam the `gitmoot job gates clear` command calls after marking a
+// gate satisfied; it is idempotent and safe to call when nothing should happen.
+//
+// It deliberately does NOT resume in three cases so the gate feature complements,
+// never replaces, the human-escalation path:
+//   - a job that still has an open gate (the blocker is only partially cleared);
+//   - a session job (ExternallyDriven, #657) — RetryJob refuses these outright, and
+//     resurrecting one would let the daemon Deliver an empty session payload;
+//   - a stage whose delegation tree is paused awaiting a human (escalate_human /
+//     ask-gate, #305/#340/#445) — clearing a resource gate must not bypass the
+//     human's retry|continue|abort decision, which is driven from the coordinator
+//     via `gitmoot resume`, not this child.
+//
+// A job that recorded no gates at all is a no-op (Resumed=false), so callers that
+// invoke it unconditionally stay byte-identical for the non-gated path.
+func MaybeResumeOnGatesCleared(ctx context.Context, store *db.Store, jobID string) (GateResumeOutcome, error) {
+	if store == nil {
+		return GateResumeOutcome{}, fmt.Errorf("store is required")
+	}
+	total, open, err := store.CountJobGates(ctx, jobID)
+	if err != nil {
+		return GateResumeOutcome{}, err
+	}
+	if total == 0 {
+		return GateResumeOutcome{Reason: "no gates recorded for this job"}, nil
+	}
+	if open > 0 {
+		return GateResumeOutcome{Reason: fmt.Sprintf("%d of %d gate(s) still open", open, total)}, nil
+	}
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		return GateResumeOutcome{}, err
+	}
+	if job.State != string(JobBlocked) {
+		return GateResumeOutcome{Reason: fmt.Sprintf("job is %s, not blocked; not auto-resumed", job.State)}, nil
+	}
+	if job.ExternallyDriven {
+		return GateResumeOutcome{Reason: "session job (externally driven) is not auto-resumed"}, nil
+	}
+	awaiting, err := blockedJobAwaitingHuman(ctx, store, job)
+	if err != nil {
+		return GateResumeOutcome{}, err
+	}
+	if awaiting {
+		return GateResumeOutcome{Reason: "tree is paused awaiting a human; resume via `gitmoot resume`, gates do not bypass the human"}, nil
+	}
+	if _, err := RetryJob(ctx, store, jobID); err != nil {
+		return GateResumeOutcome{}, err
+	}
+	_ = store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   jobID,
+		Kind:    "gates_cleared_resume",
+		Message: "all gates satisfied; re-queued the blocked stage (#682)",
+	})
+	return GateResumeOutcome{Resumed: true, Reason: "all gates satisfied; re-queued the blocked stage"}, nil
+}
+
+// blockedJobAwaitingHuman reports whether a blocked job's delegation tree is paused
+// awaiting a human (#305/#340/#445), so a cleared resource gate does not bypass the
+// human. It checks both the durable signals: the SHARED task state
+// (awaiting_human), and an OPEN escalation round on the job or its coordinator
+// parent (requested > resolved). A normal block_parent/blocked stage sets its task
+// to `blocked` (not awaiting_human) with no escalation, so this returns false and
+// the stage auto-resumes.
+func blockedJobAwaitingHuman(ctx context.Context, store *db.Store, job db.Job) (bool, error) {
+	payload, err := unmarshalPayload(job.Payload)
+	if err == nil {
+		if taskID := strings.TrimSpace(payload.TaskID); taskID != "" {
+			task, terr := store.GetTask(ctx, taskID)
+			if terr == nil && task.State == string(TaskAwaitingHuman) {
+				return true, nil
+			}
+		}
+	}
+	openIDs, err := store.JobIDsWithOpenEscalation(ctx)
+	if err != nil {
+		return false, err
+	}
+	parentID := strings.TrimSpace(payload.ParentJobID)
+	for _, id := range openIDs {
+		if id == job.ID || (parentID != "" && id == parentID) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func manualRetryShouldClearReadOnlyWorktree(job db.Job, payload JobPayload) bool {
 	if strings.TrimSpace(payload.WorktreePath) == "" {
 		return false

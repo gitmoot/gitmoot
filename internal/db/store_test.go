@@ -52,6 +52,7 @@ func TestOpenMigratesSchema(t *testing.T) {
 		"skillopt_judge_outcomes",
 		"interactive_prompts",
 		"merge_gate_ci_observations",
+		"job_gates",
 	} {
 		ok, err := store.HasTable(ctx, table)
 		if err != nil {
@@ -4855,5 +4856,86 @@ func TestListRunningJobsUpdatedBeforeOrder(t *testing.T) {
 	plan := explainQueryPlan(t, store, listRunningJobsUpdatedBeforeSQL, "2026-02-01 00:00:00")
 	if !strings.Contains(plan, "idx_jobs_running_updated_at") {
 		t.Fatalf("ListRunningJobsUpdatedBefore plan does not use idx_jobs_running_updated_at:\n%s", plan)
+	}
+}
+
+func TestJobGatesRecordListSatisfyCount(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	// Empty/blank needs write nothing — the byte-identical non-gated path.
+	if n, err := store.RecordJobGates(ctx, "job-1", nil); err != nil || n != 0 {
+		t.Fatalf("RecordJobGates(nil) = (%d, %v), want (0, nil)", n, err)
+	}
+	if n, err := store.RecordJobGates(ctx, "job-1", []string{"  ", ""}); err != nil || n != 0 {
+		t.Fatalf("RecordJobGates(blank) = (%d, %v), want (0, nil)", n, err)
+	}
+	if total, open, err := store.CountJobGates(ctx, "job-1"); err != nil || total != 0 || open != 0 {
+		t.Fatalf("CountJobGates(empty) = (%d,%d,%v), want (0,0,nil)", total, open, err)
+	}
+
+	if n, err := store.RecordJobGates(ctx, "job-1", []string{"API key", "R2 token"}); err != nil || n != 2 {
+		t.Fatalf("RecordJobGates = (%d, %v), want (2, nil)", n, err)
+	}
+	gates, err := store.ListJobGates(ctx, "job-1")
+	if err != nil {
+		t.Fatalf("ListJobGates returned error: %v", err)
+	}
+	if len(gates) != 2 || gates[0].Need != "API key" || gates[0].Satisfied || gates[1].Need != "R2 token" {
+		t.Fatalf("ListJobGates = %+v, want two open gates ordered API key, R2 token", gates)
+	}
+
+	// Clearing one leaves the other open.
+	ok, err := store.SatisfyJobGate(ctx, "job-1", "API key")
+	if err != nil || !ok {
+		t.Fatalf("SatisfyJobGate(API key) = (%v, %v), want (true, nil)", ok, err)
+	}
+	if total, open, err := store.CountJobGates(ctx, "job-1"); err != nil || total != 2 || open != 1 {
+		t.Fatalf("CountJobGates after one = (%d,%d,%v), want (2,1,nil)", total, open, err)
+	}
+	// A second clear of the same need reports not-matched (already satisfied).
+	if ok, err := store.SatisfyJobGate(ctx, "job-1", "API key"); err != nil || ok {
+		t.Fatalf("SatisfyJobGate(already satisfied) = (%v, %v), want (false, nil)", ok, err)
+	}
+	// An unknown need reports not-matched.
+	if ok, err := store.SatisfyJobGate(ctx, "job-1", "nope"); err != nil || ok {
+		t.Fatalf("SatisfyJobGate(unknown) = (%v, %v), want (false, nil)", ok, err)
+	}
+
+	// SatisfyAll clears the remainder.
+	if cleared, err := store.SatisfyAllJobGates(ctx, "job-1"); err != nil || cleared != 1 {
+		t.Fatalf("SatisfyAllJobGates = (%d, %v), want (1, nil)", cleared, err)
+	}
+	if total, open, err := store.CountJobGates(ctx, "job-1"); err != nil || total != 2 || open != 0 {
+		t.Fatalf("CountJobGates after all = (%d,%d,%v), want (2,0,nil)", total, open, err)
+	}
+}
+
+func TestRecordJobGatesReopensRepeatedNeedOnReblock(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	if _, err := store.RecordJobGates(ctx, "job-1", []string{"API key"}); err != nil {
+		t.Fatalf("RecordJobGates returned error: %v", err)
+	}
+	if _, err := store.SatisfyAllJobGates(ctx, "job-1"); err != nil {
+		t.Fatalf("SatisfyAllJobGates returned error: %v", err)
+	}
+	// Re-block with the SAME need must REOPEN the gate (not be swallowed by the
+	// UNIQUE constraint), or the stage would strand permanently satisfied.
+	if _, err := store.RecordJobGates(ctx, "job-1", []string{"API key"}); err != nil {
+		t.Fatalf("re-RecordJobGates returned error: %v", err)
+	}
+	total, open, err := store.CountJobGates(ctx, "job-1")
+	if err != nil || total != 1 || open != 1 {
+		t.Fatalf("CountJobGates after reblock = (%d,%d,%v), want (1,1,nil)", total, open, err)
 	}
 }

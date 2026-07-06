@@ -35,6 +35,8 @@ func runJob(args []string, stdout, stderr io.Writer) int {
 		return runJobRun(args[1:], stdout, stderr)
 	case "retry":
 		return runJobRetry(args[1:], stdout, stderr)
+	case "gates":
+		return runJobGates(args[1:], stdout, stderr)
 	case "cancel":
 		return runJobCancel(args[1:], stdout, stderr)
 	case "kill":
@@ -60,6 +62,8 @@ func printJobUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot job watch <id> [--poll 1s] [--json]")
 	fmt.Fprintln(w, "  gitmoot job run <id>")
 	fmt.Fprintln(w, "  gitmoot job retry <id>")
+	fmt.Fprintln(w, "  gitmoot job gates <id> [--json]")
+	fmt.Fprintln(w, "  gitmoot job gates clear <id> --need \"<text>\"|--all")
 	fmt.Fprintln(w, "  gitmoot job cancel <id>")
 	fmt.Fprintln(w, "  gitmoot job cancel --state blocked [--older-than 168h|7d] [--repo owner/repo] [--agent name] [--yes]")
 	fmt.Fprintln(w, "  gitmoot job kill <root-job-id>")

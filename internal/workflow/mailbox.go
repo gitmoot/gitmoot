@@ -825,6 +825,20 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 	if m.emitTerminal != nil {
 		m.emitTerminal(ctx, jobID, state, payload)
 	}
+	// Record resumable gates for a blocked stage that carries a `needs` list (#682)
+	// so the blocker becomes actionable: `gitmoot job gates` lists them and clearing
+	// them all auto-re-runs the stage. This is the single result-bearing terminal
+	// chokepoint (an agent-returned blocked decision routes here via
+	// stateForDecision), so the daemon-owned permission/pre-flight blocked paths
+	// (Result nil, no needs) never reach it. Gated on state==JobBlocked and a
+	// non-empty needs list, so every non-blocked terminal — and a blocked result
+	// with no needs — writes nothing and is byte-identical. Best-effort: a gate
+	// write must never turn a successfully-recorded blocked transition into an error.
+	if state == JobBlocked && payload.Result != nil && len(payload.Result.Needs) > 0 {
+		if _, gateErr := m.Store.RecordJobGates(ctx, jobID, payload.Result.Needs); gateErr == nil {
+			_ = m.addEvent(ctx, jobID, "gates_recorded", fmt.Sprintf("recorded %d resumable gate(s) from needs", len(payload.Result.Needs)))
+		}
+	}
 	return nil
 }
 
