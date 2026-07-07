@@ -741,18 +741,30 @@ type ChatThreadParticipant struct {
 }
 
 // ListChatThreadParticipants returns, per thread, the distinct participant names
-// in ONE bounded UNION query: message authors (non-empty author_name — the
-// authorless `system` message is excluded) unioned with resolved @mention targets
-// (an agent tagged but not yet a poster is still a participant). Rows come sorted
-// by (thread_id, name); the caller groups them per thread. No per-thread N+1.
+// in ONE bounded UNION query: real message authors (human/agent) unioned with
+// resolved @mention targets (an agent tagged but not yet a poster is still a
+// participant). `system` messages are excluded by author_kind — the authorless
+// ask-gate post is a system event, not a participant (chat_link.go stamps it with
+// author_name "system", so a plain non-empty filter would leak a bogus "system"
+// chip). The mention side is scoped to this DB's home_id (agent_origin) — the same
+// "no read path assumes origin == self" discipline CountUnreadMentionsByThread /
+// InboxForAgent / MarkThreadRead use — so a mention delivered for `agent@other-home`
+// (once the #705 bridge lands) never joins a local thread's participant set. In V1
+// every local mention carries agent_origin == home_id, so it is a no-op filter.
+// Rows come sorted by (thread_id, name); the caller groups them per thread. No
+// per-thread N+1.
 func (s *Store) ListChatThreadParticipants(ctx context.Context) ([]ChatThreadParticipant, error) {
+	origin, err := s.HomeID(ctx)
+	if err != nil {
+		return nil, err
+	}
 	const query = `SELECT DISTINCT thread_id, author_name AS name FROM chat_messages
-			WHERE TRIM(author_name) != ''
+			WHERE TRIM(author_name) != '' AND author_kind != ?
 		UNION
 		SELECT DISTINCT thread_id, agent AS name FROM chat_mentions
-			WHERE resolved = 1 AND TRIM(agent) != ''
+			WHERE agent_origin = ? AND resolved = 1 AND TRIM(agent) != ''
 		ORDER BY thread_id, name`
-	rows, err := s.db.QueryContext(ctx, query)
+	rows, err := s.db.QueryContext(ctx, query, ChatAuthorKindSystem, origin)
 	if err != nil {
 		return nil, err
 	}
@@ -764,6 +776,58 @@ func (s *Store) ListChatThreadParticipants(ctx context.Context) ([]ChatThreadPar
 			return nil, err
 		}
 		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// CountUnreadMentionsForThread returns ONE thread's resolved+unread mention count
+// with a thread-scoped WHERE (no full-corpus GROUP BY), for the single-thread
+// detail path. Origin-scoped like CountUnreadMentionsByThread, so the detail badge
+// equals the list badge.
+func (s *Store) CountUnreadMentionsForThread(ctx context.Context, threadID string) (int, error) {
+	origin, err := s.HomeID(ctx)
+	if err != nil {
+		return 0, err
+	}
+	const query = `SELECT COUNT(*) FROM chat_mentions
+		WHERE thread_id = ? AND agent_origin = ? AND resolved = 1 AND unread = 1`
+	var n int
+	if err := s.db.QueryRowContext(ctx, query, strings.TrimSpace(threadID), origin).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// ListChatThreadParticipantsForThread returns ONE thread's distinct participant
+// names with a thread-scoped WHERE (no full-corpus UNION scan), for the
+// single-thread detail path. It derives the set the SAME way
+// ListChatThreadParticipants does — real authors (system excluded) ∪ resolved,
+// origin-scoped @mention targets — so the detail and the list agree. Rows come
+// sorted by name.
+func (s *Store) ListChatThreadParticipantsForThread(ctx context.Context, threadID string) ([]string, error) {
+	origin, err := s.HomeID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	tid := strings.TrimSpace(threadID)
+	const query = `SELECT author_name AS name FROM chat_messages
+			WHERE thread_id = ? AND TRIM(author_name) != '' AND author_kind != ?
+		UNION
+		SELECT agent AS name FROM chat_mentions
+			WHERE thread_id = ? AND agent_origin = ? AND resolved = 1 AND TRIM(agent) != ''
+		ORDER BY name`
+	rows, err := s.db.QueryContext(ctx, query, tid, ChatAuthorKindSystem, tid, origin)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
 	}
 	return out, rows.Err()
 }

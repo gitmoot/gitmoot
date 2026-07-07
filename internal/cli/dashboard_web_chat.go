@@ -21,9 +21,12 @@ import (
 // The threads list is built from FOUR bounded queries (ListChatThreads plus one
 // window-function stats pass, one GROUP BY over chat_mentions, and one UNION over
 // authors/mentions) — never a per-thread lookup — so a busy home with many threads
-// stays cheap (the Health resource-locks lesson: no N+1). Snippet truncation is
-// done server-side so the client never re-truncates, mirroring the dashboard fake
-// feed's chatSnippet.
+// stays cheap (the Health resource-locks lesson: no N+1). The single-thread detail
+// path is symmetric: it reads its unread count and participant set through
+// thread-scoped (WHERE thread_id = ?) store queries, so an open-thread poll never
+// rescans the whole chat corpus to render one thread. Snippet truncation is done
+// server-side so the client never re-truncates, mirroring the dashboard fake feed's
+// chatSnippet.
 
 // dashChatSnippetCap is the rune cap for a thread's last-message preview. It
 // matches the dashboard fake feed's cap so the live feed and standalone dev render
@@ -109,8 +112,8 @@ func (d *webDataSource) ChatThreads(ctx context.Context) ([]dashboard.ChatThread
 // dashboard.ErrChatThreadNotFound (the API layer serves that as a 404), mirroring
 // how Agent/PipelineRun/PipelineDetail signal not-found. The summary rollup is
 // derived from the loaded messages (so the list and the detail can never disagree),
-// with unread-mention count and participants read from the same bounded aggregate
-// queries the list uses.
+// with unread-mention count and participants read via thread-scoped queries that
+// derive the same values the list's corpus-wide aggregates do.
 func (d *webDataSource) ChatThread(ctx context.Context, id string) (*dashboard.ChatThreadDetail, error) {
 	id = strings.TrimSpace(id)
 	var out *dashboard.ChatThreadDetail
@@ -172,37 +175,20 @@ func (d *webDataSource) ChatThread(ctx context.Context, id string) (*dashboard.C
 	return out, nil
 }
 
-// dashUnreadForThread returns the resolved+unread mention count for one thread by
-// reusing the same bounded aggregate the list uses (origin-scoped), so the detail
-// badge equals the list badge.
+// dashUnreadForThread returns the resolved+unread mention count for one thread via
+// a thread-scoped query (origin-scoped, no full-corpus GROUP BY), so the detail
+// badge equals the list badge without rescanning the whole chat_mentions table on
+// every ~12s detail poll.
 func dashUnreadForThread(ctx context.Context, store *db.Store, threadID string) (int, error) {
-	counts, err := store.CountUnreadMentionsByThread(ctx)
-	if err != nil {
-		return 0, err
-	}
-	for _, c := range counts {
-		if c.ThreadID == threadID {
-			return c.Count, nil
-		}
-	}
-	return 0, nil
+	return store.CountUnreadMentionsForThread(ctx, threadID)
 }
 
-// dashParticipantsForThread returns one thread's participant names, derived the
-// SAME way the list derives them (authors ∪ resolved mentions) so the detail and
-// the list agree.
+// dashParticipantsForThread returns one thread's participant names via a
+// thread-scoped query, derived the SAME way the list derives them (real authors,
+// system excluded, ∪ resolved origin-scoped mentions) so the detail and the list
+// agree — without a full-corpus UNION scan per detail poll.
 func dashParticipantsForThread(ctx context.Context, store *db.Store, threadID string) ([]string, error) {
-	parts, err := store.ListChatThreadParticipants(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var out []string
-	for _, p := range parts {
-		if p.ThreadID == threadID {
-			out = append(out, p.Name)
-		}
-	}
-	return out, nil
+	return store.ListChatThreadParticipantsForThread(ctx, threadID)
 }
 
 // dashChatThreadSummary projects a store thread plus its aggregates into the
