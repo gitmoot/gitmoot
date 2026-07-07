@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -588,6 +589,44 @@ func TestWebDataSourcePipelineDetailMarksOrdering(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("mixed hashes in one history order per run", func(t *testing.T) {
+		// One history containing BOTH a current-spec run and a stale-spec run:
+		// the ordering decision must be made per run, not hoisted — the matching
+		// run keeps spec order while the stale one falls back to stage_id order
+		// in the same PipelineDetail response.
+		home := dashboardTestHome(t)
+		seedDiamondBlockedRun(t, home, "prun-mixed-1-match", "")
+		seedDiamondBlockedRun(t, home, "prun-mixed-2-stale", "sha256-stale-mismatch")
+
+		ds := &webDataSource{home: home}
+		detail, err := ds.PipelineDetail(context.Background(), "listing-refresh")
+		if err != nil {
+			t.Fatalf("PipelineDetail: %v", err)
+		}
+		if len(detail.Runs) != 2 {
+			t.Fatalf("len(Runs) = %d, want 2", len(detail.Runs))
+		}
+		// Identical StartedAt (the seed helper's fixed instant) → ID-desc tie-break.
+		if detail.Runs[0].ID != "prun-mixed-2-stale" || detail.Runs[1].ID != "prun-mixed-1-match" {
+			t.Fatalf("run order = %s, %s; want stale (ID desc) then match", detail.Runs[0].ID, detail.Runs[1].ID)
+		}
+		ids := func(marks []dashboard.PipelineStageMark) []string {
+			out := make([]string, len(marks))
+			for i, m := range marks {
+				out[i] = m.ID
+			}
+			return out
+		}
+		wantStale := []string{"ascore", "bdedupe", "publish", "zfetch"} // stage_id fallback
+		wantMatch := []string{"zfetch", "ascore", "bdedupe", "publish"} // spec order
+		if got := ids(detail.Runs[0].Stages); !slices.Equal(got, wantStale) {
+			t.Fatalf("stale run marks = %v, want stage_id order %v", got, wantStale)
+		}
+		if got := ids(detail.Runs[1].Stages); !slices.Equal(got, wantMatch) {
+			t.Fatalf("matching run marks = %v, want spec order %v", got, wantMatch)
+		}
+	})
 }
 
 // TestWebDataSourcePipelineDetailRetry pins that the spec's per-stage retry budget
@@ -639,6 +678,42 @@ func TestWebDataSourcePipelineDetailRetry(t *testing.T) {
 	}
 	if runByID["test"].Retry != 2 || runByID["test"].Attempt != 2 {
 		t.Fatalf("run test = %+v, want retry 2 / attempt 2", runByID["test"])
+	}
+}
+
+// TestWebDataSourcePipelineRunRetryAbsentOnHashMismatch pins the other half of
+// the retry hash gate: a run whose SpecHash no longer matches the pipeline's
+// stored spec gets NO spec-merged fields — Retry stays 0 alongside the already
+// gated Cmd/Deps, because stale-spec data would be wrong data.
+func TestWebDataSourcePipelineRunRetryAbsentOnHashMismatch(t *testing.T) {
+	home := dashboardTestHome(t)
+	store := openPipelineTestStore(t, home)
+	seedTestPipeline(t, store, db.Pipeline{
+		Name: "bench-suite", Repo: "acme/bench", SpecYAML: retrySpecYAML, Enabled: false,
+	})
+	started := time.UnixMilli(1_751_400_000_000).UTC()
+	seedTestRun(t, store, db.PipelineRun{
+		ID: "prun-bench-stale", Pipeline: "bench-suite", Trigger: "manual", SpecHash: "sha256-stale-mismatch",
+		State: pipeline.RunSucceeded, StartedAt: started, FinishedAt: started.Add(time.Minute),
+	}, []db.PipelineRunStage{
+		{StageID: "build", State: pipeline.StageSucceeded, JobID: "job-build"},
+		{StageID: "test", State: pipeline.StageSucceeded, JobID: "job-test", Attempt: 2},
+	})
+	store.Close()
+
+	ds := &webDataSource{home: home}
+	run, err := ds.PipelineRun(context.Background(), "prun-bench-stale")
+	if err != nil {
+		t.Fatalf("PipelineRun: %v", err)
+	}
+	for _, s := range run.Stages {
+		if s.Retry != 0 || s.Cmd != "" || len(s.Deps) != 0 {
+			t.Fatalf("stale-spec stage %s carries spec-merged fields (%+v); retry/cmd/deps must be absent on a hash mismatch", s.ID, s)
+		}
+	}
+	// The run-level data is untouched by the gate.
+	if run.Stages[0].Attempt+run.Stages[1].Attempt != 2 {
+		t.Fatalf("store-side stage fields must survive: %+v", run.Stages)
 	}
 }
 
