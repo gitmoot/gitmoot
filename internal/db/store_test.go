@@ -4916,6 +4916,46 @@ func TestJobGatesRecordListSatisfyCount(t *testing.T) {
 	}
 }
 
+func TestListOpenJobGates(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	// Empty store: no open gates.
+	if gates, err := store.ListOpenJobGates(ctx); err != nil || len(gates) != 0 {
+		t.Fatalf("ListOpenJobGates(empty) = (%+v, %v), want ([], nil)", gates, err)
+	}
+
+	if _, err := store.RecordJobGates(ctx, "job-a", []string{"need-1", "need-2"}); err != nil {
+		t.Fatalf("RecordJobGates job-a: %v", err)
+	}
+	if _, err := store.RecordJobGates(ctx, "job-b", []string{"need-3"}); err != nil {
+		t.Fatalf("RecordJobGates job-b: %v", err)
+	}
+	// Satisfy one of job-a's gates: it must drop out of the open list.
+	if ok, err := store.SatisfyJobGate(ctx, "job-a", "need-1"); err != nil || !ok {
+		t.Fatalf("SatisfyJobGate: ok=%v err=%v", ok, err)
+	}
+
+	gates, err := store.ListOpenJobGates(ctx)
+	if err != nil {
+		t.Fatalf("ListOpenJobGates: %v", err)
+	}
+	// Two remain open (job-a/need-2 and job-b/need-3), oldest-first by insertion id.
+	if len(gates) != 2 {
+		t.Fatalf("open gates = %d, want 2: %+v", len(gates), gates)
+	}
+	if gates[0].JobID != "job-a" || gates[0].Need != "need-2" || gates[0].Satisfied {
+		t.Fatalf("first open gate wrong: %+v", gates[0])
+	}
+	if gates[1].JobID != "job-b" || gates[1].Need != "need-3" {
+		t.Fatalf("second open gate wrong: %+v", gates[1])
+	}
+}
+
 func TestRecordJobGatesReopensRepeatedNeedOnReblock(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))

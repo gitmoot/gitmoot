@@ -50,10 +50,12 @@ you navigate, so every view is linkable and reloadable):
 | `/agents/<name>` | Agent detail (template, prompt, version history) |
 | `/charts` | Charts — activity time series |
 | `/health` | Health — daemon status, totals, stuck jobs, locks, failures |
+| `/attention` | Needs a human — blocked gates, pending approvals, candidates |
 
 Unknown paths normalize back to `/`. Each view is backed by a small read-only
 JSON API (`/api/runs`, `/api/jobs`, `/api/agents`, `/api/agent/{name}`,
-`/api/charts`, `/api/health`, `/api/state`, `/api/job/{id}`, `/api/graph`) plus a
+`/api/charts`, `/api/health`, `/api/attention`, `/api/job/{id}/checks`,
+`/api/run/{id}/verdicts`, `/api/state`, `/api/job/{id}`, `/api/graph`) plus a
 Server-Sent Events stream at `/events`.
 
 See [Dashboard Views](./views.md) for what each view shows.

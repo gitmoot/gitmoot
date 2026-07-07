@@ -3373,6 +3373,30 @@ func (s *Store) ListJobGates(ctx context.Context, jobID string) ([]JobGate, erro
 	return gates, rows.Err()
 }
 
+// ListOpenJobGates returns every still-open (unsatisfied) job gate across all
+// jobs, oldest-first by insertion id, so the dashboard "Needs a human" view
+// (#528) can list every job parked on a human decision in one query. It is a
+// read-only projection; a home with no gates yields an empty slice.
+func (s *Store) ListOpenJobGates(ctx context.Context) ([]JobGate, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, job_id, need, satisfied, created_at, satisfied_at
+		FROM job_gates WHERE satisfied = 0 ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var gates []JobGate
+	for rows.Next() {
+		var g JobGate
+		var satisfied int
+		if err := rows.Scan(&g.ID, &g.JobID, &g.Need, &satisfied, &g.CreatedAt, &g.SatisfiedAt); err != nil {
+			return nil, err
+		}
+		g.Satisfied = satisfied != 0
+		gates = append(gates, g)
+	}
+	return gates, rows.Err()
+}
+
 // SatisfyJobGate marks a single open gate satisfied by exact need text. It returns
 // whether an OPEN gate with that need existed and was cleared (false when no such
 // need is recorded or it was already satisfied), so the caller can report an
