@@ -411,3 +411,87 @@ func TestRecentPromotionRequestExists(t *testing.T) {
 }
 
 const chatMinuteMs = 60_000
+
+// TestChatThreadRollupHelpers proves the three dashboard-facing aggregate helpers
+// (ListChatThreadMessageStats, CountUnreadMentionsByThread,
+// ListChatThreadParticipants) return correct per-thread rollups in bounded queries:
+// message counts + the last message (greatest (ts_ms, seq)), resolved+unread
+// mention counts (origin-scoped), and the author ∪ resolved-mention participant set.
+func TestChatThreadRollupHelpers(t *testing.T) {
+	ctx := context.Background()
+	store := openChatTestStore(t)
+
+	busy, _ := store.CreateChatThread(ctx, ChatThread{Slug: "busy", Repo: "o/r"})
+	empty, _ := store.CreateChatThread(ctx, ChatThread{Slug: "empty", Repo: "o/r"})
+
+	m1, err := store.AddChatMessage(ctx, ChatMessage{ThreadID: busy.ID, AuthorKind: ChatAuthorKindHuman, AuthorName: "jerry", Body: "@codex-b @ghost"})
+	if err != nil {
+		t.Fatalf("AddChatMessage m1: %v", err)
+	}
+	if err := store.AddChatMentions(ctx, []ChatMention{
+		{MessageID: m1.ID, ThreadID: busy.ID, Agent: "codex-b", Resolved: true, Unread: true},
+		{MessageID: m1.ID, ThreadID: busy.ID, Agent: "ghost", Resolved: false, Unread: true},
+	}); err != nil {
+		t.Fatalf("AddChatMentions: %v", err)
+	}
+	if _, err := store.AddChatMessage(ctx, ChatMessage{ThreadID: busy.ID, AuthorKind: ChatAuthorKindAgent, AuthorName: "codex-b", Kind: ChatKindJobResult, Body: "done"}); err != nil {
+		t.Fatalf("AddChatMessage m2: %v", err)
+	}
+
+	// Message stats: busy has 2 messages, last is codex-b's job_result; empty absent.
+	stats, err := store.ListChatThreadMessageStats(ctx)
+	if err != nil {
+		t.Fatalf("ListChatThreadMessageStats: %v", err)
+	}
+	byThread := map[string]ChatThreadMessageStat{}
+	for _, s := range stats {
+		byThread[s.ThreadID] = s
+	}
+	if _, ok := byThread[empty.ID]; ok {
+		t.Fatal("empty thread must be absent from message stats")
+	}
+	bs := byThread[busy.ID]
+	if bs.MessageCount != 2 || bs.LastAuthorName != "codex-b" || bs.LastKind != ChatKindJobResult || bs.LastBody != "done" {
+		t.Fatalf("busy stats = %+v, want count 2 / last codex-b job_result 'done'", bs)
+	}
+
+	// Unread mentions: only the resolved @codex-b counts.
+	counts, err := store.CountUnreadMentionsByThread(ctx)
+	if err != nil {
+		t.Fatalf("CountUnreadMentionsByThread: %v", err)
+	}
+	unread := map[string]int{}
+	for _, c := range counts {
+		unread[c.ThreadID] = c.Count
+	}
+	if unread[busy.ID] != 1 {
+		t.Fatalf("busy unread = %d, want 1 (resolved only)", unread[busy.ID])
+	}
+
+	// Marking the thread read clears the unread badge.
+	if _, err := store.MarkThreadRead(ctx, "codex-b", busy.ID); err != nil {
+		t.Fatalf("MarkThreadRead: %v", err)
+	}
+	counts, _ = store.CountUnreadMentionsByThread(ctx)
+	for _, c := range counts {
+		if c.ThreadID == busy.ID && c.Count != 0 {
+			t.Fatalf("busy unread after read = %d, want 0", c.Count)
+		}
+	}
+
+	// Participants: authors (jerry, codex-b) ∪ resolved mentions (codex-b); @ghost
+	// excluded. Sorted (thread_id, name).
+	parts, err := store.ListChatThreadParticipants(ctx)
+	if err != nil {
+		t.Fatalf("ListChatThreadParticipants: %v", err)
+	}
+	var busyParts []string
+	for _, p := range parts {
+		if p.ThreadID == busy.ID {
+			busyParts = append(busyParts, p.Name)
+		}
+	}
+	if len(busyParts) != 2 || busyParts[0] != "codex-b" || busyParts[1] != "jerry" {
+		t.Fatalf("busy participants = %v, want [codex-b jerry]", busyParts)
+	}
+}

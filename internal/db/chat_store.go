@@ -649,6 +649,125 @@ func (s *Store) MarkThreadRead(ctx context.Context, agent, threadID string) (int
 	return res.RowsAffected()
 }
 
+// ChatThreadMessageStat is one thread's message rollup: the total message count
+// plus the fields of its most-recent message (the greatest (ts_ms, seq)). It lets
+// the dashboard render the threads list — count + a last-message preview per
+// thread — without loading every thread's full history (no per-thread N+1).
+type ChatThreadMessageStat struct {
+	ThreadID       string
+	MessageCount   int
+	LastSeq        int64
+	LastTsMs       int64
+	LastAuthorKind string
+	LastAuthorName string
+	LastKind       string
+	LastBody       string
+}
+
+// ListChatThreadMessageStats returns, for every thread that has at least one
+// message, its message count and its last message in ONE bounded query (window
+// functions over chat_messages): a threads-list rollup with no per-thread N+1.
+// The "last" message is the greatest (ts_ms DESC, seq DESC) — the same ordering
+// key ListChatMessages renders by, so the list preview and the detail's final
+// message never disagree. Threads with no messages are simply absent (the caller
+// falls back to the thread row's updated_at).
+func (s *Store) ListChatThreadMessageStats(ctx context.Context) ([]ChatThreadMessageStat, error) {
+	const query = `SELECT thread_id, seq, ts_ms, author_kind, author_name, kind, body, cnt FROM (
+			SELECT thread_id, seq, ts_ms, author_kind, author_name, kind, body,
+				ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY ts_ms DESC, seq DESC) AS rn,
+				COUNT(*) OVER (PARTITION BY thread_id) AS cnt
+			FROM chat_messages
+		) WHERE rn = 1
+		ORDER BY thread_id`
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ChatThreadMessageStat
+	for rows.Next() {
+		var st ChatThreadMessageStat
+		if err := rows.Scan(&st.ThreadID, &st.LastSeq, &st.LastTsMs, &st.LastAuthorKind,
+			&st.LastAuthorName, &st.LastKind, &st.LastBody, &st.MessageCount); err != nil {
+			return nil, err
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
+// ChatThreadMentionCount is one thread's count of resolved, unread mentions,
+// scoped to this DB's home_id (agent_origin).
+type ChatThreadMentionCount struct {
+	ThreadID string
+	Count    int
+}
+
+// CountUnreadMentionsByThread returns, per thread, the number of resolved+unread
+// @mentions in ONE GROUP BY over chat_mentions. It is scoped to this DB's home_id
+// (agent_origin) — the same "no read path assumes origin == self" discipline
+// InboxForAgent uses — so a mention delivered for `agent@other-home` (once the
+// #705 bridge lands) never inflates the local thread's unread badge. In V1 every
+// local mention carries agent_origin == home_id, so this is a no-op filter.
+func (s *Store) CountUnreadMentionsByThread(ctx context.Context) ([]ChatThreadMentionCount, error) {
+	origin, err := s.HomeID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	const query = `SELECT thread_id, COUNT(*) FROM chat_mentions
+		WHERE agent_origin = ? AND resolved = 1 AND unread = 1
+		GROUP BY thread_id ORDER BY thread_id`
+	rows, err := s.db.QueryContext(ctx, query, origin)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ChatThreadMentionCount
+	for rows.Next() {
+		var c ChatThreadMentionCount
+		if err := rows.Scan(&c.ThreadID, &c.Count); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ChatThreadParticipant is one (thread, participant-name) pair used to derive a
+// thread's participant set.
+type ChatThreadParticipant struct {
+	ThreadID string
+	Name     string
+}
+
+// ListChatThreadParticipants returns, per thread, the distinct participant names
+// in ONE bounded UNION query: message authors (non-empty author_name — the
+// authorless `system` message is excluded) unioned with resolved @mention targets
+// (an agent tagged but not yet a poster is still a participant). Rows come sorted
+// by (thread_id, name); the caller groups them per thread. No per-thread N+1.
+func (s *Store) ListChatThreadParticipants(ctx context.Context) ([]ChatThreadParticipant, error) {
+	const query = `SELECT DISTINCT thread_id, author_name AS name FROM chat_messages
+			WHERE TRIM(author_name) != ''
+		UNION
+		SELECT DISTINCT thread_id, agent AS name FROM chat_mentions
+			WHERE resolved = 1 AND TRIM(agent) != ''
+		ORDER BY thread_id, name`
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ChatThreadParticipant
+	for rows.Next() {
+		var p ChatThreadParticipant
+		if err := rows.Scan(&p.ThreadID, &p.Name); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // ---- helpers ---------------------------------------------------------------
 
 const chatThreadSelect = `SELECT id, slug, name, repo, origin, state, created_by, created_at, updated_at FROM chat_threads`
