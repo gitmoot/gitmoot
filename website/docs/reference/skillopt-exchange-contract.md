@@ -44,6 +44,12 @@ The exported package has:
   reasoning
 - `pairwise_preferences`: derived pairwise preferences expanded from ranked
   feedback, for example `C > A > D > B` becomes six ordered preferences
+- `binary_verdicts`: **optional** BINEVAL binary-evaluation verdicts (`#525`),
+  present only when a `gitmoot skillopt binary run` recorded them for the run.
+  Each entry carries `question_id`, `dimension`, `verdict` (`yes`/`no`),
+  `explanation`, and `created_at`. The section is `omitempty` — a run with no
+  binary verdicts exports the pre-existing packet shape byte-for-byte, and no
+  `contract_version` bump is required.
 - `evaluator_config`: evaluator and run metadata used by the external
   optimizer. Top-level workflow mode is exported as `training_mode`, not as
   `evaluator_config.mode`; `evaluator_config.mode` is reserved for evaluator
@@ -415,6 +421,57 @@ records a `hard_verifiers_failed` job event and is swallowed. Because it re-runs
 tests, it only maps onto **testable** implement
 legs — subjective review-quality kinds keep the soft cross-family signal. Promotion
 stays manual.
+
+### Binary evaluation (BINEVAL, off by default)
+
+`gitmoot skillopt binary run --set <file> --run <run-id> --source <file>` runs an
+additive, opt-in **BINEVAL-style binary evaluation** (`#525`, after
+[arXiv:2606.27226](https://arxiv.org/abs/2606.27226)). Instead of one opaque
+scalar judge score, a rubric is decomposed into small, **independent yes/no
+questions**; each is answered on its own with a `verdict` (`yes`/`no`) plus an
+`explanation`, and the per-question verdicts aggregate into a per-dimension
+**weighted yes-fraction** and a weighted-mean **overall** score.
+
+The **question set** is a YAML or JSON file:
+
+```yaml
+version: 1
+template_or_task_kind: bugfix
+dimensions:
+  - name: correctness
+    weight: 2
+    questions:
+      - id: has_test
+        text: Does the output add a test?
+        violation_example: A change with no accompanying test.
+        weight: 1
+        contains: "func Test"     # deterministic-mode assertion only
+```
+
+Question ids must be unique across the whole set; dimension and question weights
+default to `1`. Two runners are provided:
+
+- **Deterministic (`--deterministic`)** — a rule-based runner that answers each
+  question purely from optional `contains` / `not_contains` / `regex` /
+  `not_regex` assertions on the question, applied to the `--source` output. This
+  is the reproducible/test mode (no LLM).
+- **LLM-backed (`--reviewer <runtime>`)** — an opt-in runner wired through the
+  **same cross-family judge plumbing** as `skillopt ab --judge`, so every
+  question is answered by a *different* runtime family (never a self-preference),
+  read-only, one question at a time.
+
+Verdicts persist to the additive `skillopt_binary_verdicts` table keyed by
+`(run_id, question_id)` (a re-run upserts in place) and are re-read by
+`gitmoot skillopt binary show --run <run-id>`. Each persisted row carries the
+`question_weight` and `dimension_weight` the run used (both default to `1`), so
+`show` re-aggregates with the **same weighted logic** and reports the identical
+per-dimension/overall scores the `run` emitted — even when weights are
+non-uniform — and exported packets can reproduce them too. The per-dimension scores map onto
+the existing `EvaluatorScore.DimensionScores` shape with **no contract change**,
+and the verdicts ride the training-package export as the optional
+`binary_verdicts` section described above. The whole surface is inert unless a
+`skillopt binary` command is invoked — every existing review/optimize flow is
+byte-identical when it is unused.
 
 ### Promotion policy + notifications (off by default)
 

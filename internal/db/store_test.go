@@ -51,6 +51,7 @@ func TestOpenMigratesSchema(t *testing.T) {
 		"skillopt_review_watches",
 		"skillopt_judge_outcomes",
 		"interactive_prompts",
+		"skillopt_binary_verdicts",
 		"merge_gate_ci_observations",
 		"job_gates",
 	} {

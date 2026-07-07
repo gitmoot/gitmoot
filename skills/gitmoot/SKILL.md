@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, pipelines, event webhooks, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, or Kimi Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, pipelines, routing telemetry, event webhooks, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, or Kimi Code runtime workflows.
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
@@ -72,6 +72,15 @@ prompt as a read-only "Prior learnings" reference block (never instructions).
 Enrollment is per agent via `[agents.<name>].memory = true` plus an optional
 `[memory]` section; inspect the store read-only with `gitmoot memory list`. See
 CLI.md § Agent Memory and the "Agent Persistent Memory" concepts page for depth.
+
+For routing telemetry, phrases like "which runtime/model works best here",
+"show observed routing performance", or "should I route Go tasks to Codex" map to
+Gitmoot's execution-grounded routing telemetry (#530): every job records an
+additive `routing_telemetry` row at terminal, and `gitmoot router summary` reports
+local observed success/approval rates by `(action, runtime, model, template)`. It
+is **advisory only** — nothing auto-overrides routing — and labeled "local observed
+performance, not a benchmark". An optional `[router] context_enabled = true` feeds a
+bounded table into coordinator prompts. See CLI.md § Routing Telemetry.
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
@@ -221,7 +230,17 @@ continuing. For optimizer-phase recovery, use
 `gitmoot skillopt train recover --session <id> [--out-root path] [--json]`,
 which re-imports or repairs the optimizer candidate package and classifies the
 iteration; it does not release the generation lock or rebuild generation
-options.
+options. To improve the *judge's rubric* (not the model) from accumulated human
+feedback, run `gitmoot skillopt rubric induce --template <id>` — an offline,
+deterministic tool that induces a criterion-separated rubric from captured
+trait feedback, meta-evaluates it for coverage/redundancy, and writes a frozen
+JSON for human review; it never auto-injects. To generate Autodata-style
+synthetic review items, use the explicit, off-by-default `gitmoot skillopt synth
+--template <id> --repo owner/repo --weak <agent> --strong <agent> [--judge
+<agent>]`: it keeps only items a strong agent beats a weak agent on and a judge
+deems well-formed, stores them `pending_human_approval`, and requires
+`gitmoot skillopt synth approve <item-id>` before an item may be used — nothing
+runs it automatically.
 
 For complete command examples, read [CLI.md](references/CLI.md).
 For end-to-end workflows, read [WORKFLOWS.md](references/WORKFLOWS.md).

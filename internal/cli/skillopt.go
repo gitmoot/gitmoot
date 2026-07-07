@@ -80,8 +80,14 @@ func runSkillOpt(args []string, stdout, stderr io.Writer) int {
 		return runSkillOptAB(args[1:], stdout, stderr)
 	case "pairwise":
 		return runSkillOptPairwise(args[1:], stdout, stderr)
+	case "rubric":
+		return runSkillOptRubric(args[1:], stdout, stderr)
 	case "gate":
 		return runSkillOptGate(args[1:], stdout, stderr)
+	case "binary":
+		return runSkillOptBinary(args[1:], stdout, stderr)
+	case "synth":
+		return runSkillOptSynth(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown skillopt command %q\n\n", args[0])
 		printSkillOptUsage(stderr)
@@ -103,12 +109,19 @@ func printSkillOptUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot skillopt candidate reject <version-id> [--reason text]")
 	fmt.Fprintln(w, "  gitmoot skillopt gate run --candidate <version-id> [--corpus path] [--replay-command cmd] [--config path] [--json]")
 	fmt.Fprintln(w, "  gitmoot skillopt gate history --candidate <version-id> [--json]")
+	fmt.Fprintln(w, "  gitmoot skillopt binary run --set <file> --run <run-id> --source <file> [--deterministic] [--reviewer runtime] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot skillopt binary show --run <run-id> [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot skillopt synth --template <id> --repo owner/repo --weak <agent> --strong <agent> [--judge <agent>] [--challenger <agent>] [--max-items N] [--max-rounds-per-item M] [--gap F] [--out dir] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot skillopt synth list [--status pending_human_approval|approved|rejected] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot skillopt synth approve <item-id> [--home path]")
+	fmt.Fprintln(w, "  gitmoot skillopt synth reject <item-id> [--home path]")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id> [--reviewer name]")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]")
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)")
 	fmt.Fprintln(w, "  gitmoot skillopt ab <agent> \"<prompt>\" [--challenger <versionId>] [--pick a|b] [--seed N] [--judge] [--judge-only] [--home path]")
 	fmt.Fprintln(w, "  gitmoot skillopt pairwise import <packet-dir> [--packet path] [--secret-map path] [--picks path] [--reviewer name] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot skillopt rubric induce --template <id> [--out <dir>] [--holdout 0.2] [--min-events N] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot skillopt judge-report [--template id]")
 	fmt.Fprintln(w, "  gitmoot skillopt judge agreement [--template <id>] [--home <h>] [--json]")
 	fmt.Fprintln(w, "  gitmoot skillopt judge promote --template <id> --task-kind <kind> --file <pkg.json> [--home <h>] [--yes] [--json]")

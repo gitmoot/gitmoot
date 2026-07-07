@@ -381,6 +381,27 @@ subscribe`, and at implement-job dispatch with an actionable message. Set
 `go`/`git`/`gh`), or `--policy workspace-write` for edits-only (Bash stays
 blocked). `read-only`/`ask`/`review` agents are unaffected.
 
+`agent subscribe` accepts `--preset-delivery full|referenced|auto` (default
+`full`), and `agent update <name> --preset-delivery <mode>` flips it in place on
+an already-registered agent. The mode is a sticky per-agent preference:
+re-running `agent subscribe` on an existing agent WITHOUT `--preset-delivery`
+(e.g. to refresh its session/repo) preserves the stored mode; only brand-new
+agents default to `full`. It controls how the agent's installed preset
+(template) prompt is delivered on each job:
+
+| mode | behavior |
+|---|---|
+| `full` (default) | always inline the full preset prompt every job — the pre-existing behavior, byte-identical |
+| `referenced` | send a short "use your installed `<preset>` preset (commit `<c>`)" reference instead of the whole body, but only when Gitmoot has recorded that the exact resumed session already loaded the same preset at the same commit; any doubt (a new / `last` / fresh session, an unknown session, or a changed commit) falls back to full |
+| `auto` | like `referenced`, and additionally only when the runtime persists sessions (`codex`/`claude`); `shell`/`kimi`/custom always send full |
+
+The optimization is correctness-first and additive: the job payload **always**
+snapshots the exact preset id, resolved commit, and content regardless of mode,
+so auditability and retry determinism are unchanged, and a preset commit change
+invalidates the recorded loaded-state so the next job re-sends the full preset.
+Leave it at `full` unless you repeatedly resume a stable persisted session and
+want to save preset tokens.
+
 `--runtime` accepts `codex`, `claude`, `kimi`, or `kimi-cli`. Kimi Code is a
 first-class runtime adapter alongside Codex and Claude Code; `kimi` targets the
 current Kimi Code CLI (stream-json output) while `kimi-cli` is the opt-in
@@ -1020,6 +1041,42 @@ gitmoot interactive answer <id> <value> [--source source]
 gitmoot interactive clear <id> [<id>...] | --resolved | --all
 ```
 
+## Result Checks
+
+After a daemon-run job's `gitmoot_result` is parsed, Gitmoot runs a set of
+**deterministic, LLM-free binary checks** over the parsed result — a
+contract-hygiene audit that catches results that are technically valid but vague
+or missing evidence. Each check is a yes/no question with an explanation:
+
+- **implement** — a result whose decision is `implemented` must list its
+  `changes_made` and its `tests_run`.
+- **review** — a `changes_requested` review must carry `findings` (evidence).
+- **ask** — the answer (`summary`/`artifact_body`) must be non-empty and
+  actionable.
+- **blocked** (any action) — a `blocked` result must list actionable `needs`.
+- **coordinator finalize** — a finalize continuation must produce a substantive
+  reconciliation summary.
+
+The mode is set in `config.toml` and is **warn by default**:
+
+```toml
+[workflow]
+result_checks = "warn"   # off | warn | block (default: warn)
+```
+
+- `warn` (default) — failing checks are recorded as a `result_checks_failed`
+  job event (visible in `gitmoot job events <id>` and `gitmoot job show <id>`)
+  and attached to the job detail (`job show --json` `payload.result_checks` and
+  the web dashboard), but the job still finishes on its own decision.
+- `block` — a failing check additionally fails the job through the same terminal
+  path a malformed result takes (opt-in, for strict workflows).
+- `off` — the audit is disabled entirely, restoring byte-identical pre-feature
+  behavior (no event, no payload field, no stored record).
+
+A result that passes every applicable check records nothing, so the audit is
+quiet on healthy jobs. Failed checks are also stored durably for later SkillOpt
+consumption as structured feedback; there is no SkillOpt behavior change today.
+
 ## SkillOpt Exchange
 
 ```sh
@@ -1036,6 +1093,7 @@ gitmoot skillopt candidate promote <version-id>
 gitmoot skillopt candidate reject <version-id> [--reason text]
 gitmoot skillopt ab <agent> "<prompt>" [--challenger <versionId>] [--pick a|b] [--seed N] [--judge] [--judge-only] [--home path]
 gitmoot skillopt pairwise import <packet-dir> [--packet path] [--secret-map path] [--picks path] [--reviewer name] [--json]
+gitmoot skillopt rubric induce --template <id> [--out <dir>] [--holdout 0.2] [--min-events N] [--home path] [--json]
 gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>
 gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id> [--reviewer name]
 gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]
@@ -1191,6 +1249,43 @@ fixed `--seed` pinned the champion to one position), and a summary of the
 candidate-level judge outcomes above. Small samples get a loud warning —
 sample size is the limiter. `--json` emits the machine-readable report. It is
 read-only.
+
+`skillopt rubric induce` is the **offline, deterministic rubric-induction**
+tool (#344/#347, AutoLibra-style — 2505.02820). It reads the human feedback
+already captured for a template (the `useful_traits` / `rejected_traits` /
+`required_improvements` on ranked feedback events, across all of that
+template's runs) and **induces a criterion-separated rubric** from it, then
+freezes it as reviewed static JSON. The pipeline is fully offline — no LLM
+calls, so it is reproducible and testable: (1) **ground** each trait string
+into an aspect `{text, sign +/-, source_event_id}`; (2) **cluster** aspects by
+normalized token-overlap (Jaccard, greedy single-linkage, stable ordering)
+into up to six metrics, each `{name, definition, positive_examples,
+negative_examples, source_event_ids}`; (3) **meta-evaluate** on a held-out
+split — `coverage` (fraction of held-out aspects a metric matches) and
+`redundancy` (max inter-metric similarity, lower is better); (4) **write**
+`rubric.json` (the frozen rubric, `{version, template, metrics[...]}`),
+`report.json`, and a human-readable `report.txt` under `--out` (default
+`<home>/skillopt/rubrics/<template>`). Flags: `--template <id>` (required),
+`--holdout 0.2` (fraction reserved for coverage; `0` keeps in-sample),
+`--min-events N` (minimum usable feedback events, hard floor 3),
+`--home <path>`, and `--json` (emits the report plus the artifact paths). It
+errors with an actionable message and a non-zero exit when there are fewer than
+three usable feedback events or fewer than two separable metric clusters. The
+token-overlap clusterer is the deterministic v1; swapping in AutoLibra's LLM
+thematic clustering is a clearly-marked extension point that changes only the
+clustering step, leaving grounding, the held-out meta-eval, and the emitted
+contract identical.
+
+The tool is **read-only over the store and human-gated**: it only writes files
+and never injects anywhere. To adopt an induced rubric, a human reviews
+`rubric.json` and maps its metrics onto gitmoot-skillopt's
+`evaluator_config['rubric']` — one dimension per metric, using the metric
+`name` as the dimension key and its `definition` (plus the positive/negative
+examples) as the description, with a weight the reviewer chooses. Because the
+judge's `_compose_evaluator_rubric` already merges arbitrary
+`evaluator_config['rubric']` dimensions and `_normalize_dimension_list`
+accepts arbitrary names, adopting an induced rubric needs **zero judge-code
+change and no result-contract bump**.
 
 `skillopt judge promote` closes the judge-prompt optimization loop: it applies an
 **accepted** judge-prompt variant (from the judge-prompt optimizer's
@@ -1372,3 +1467,39 @@ stamped with a generated stable per-DB `home_id` (never the literal `self`) and 
 versioned canonical envelope — schema discipline that keeps a future cross-machine
 bridge additive without changing any V1 behavior. See
 [Chat](../workflows/chat-workflow.md) for the full workflow.
+## Routing Telemetry (Advisory)
+
+Gitmoot records lightweight **execution-grounded routing telemetry**: one additive
+row per job at its terminal transition capturing which combination actually ran and
+how it turned out — `repo`, `action`, `phase`, `runtime`, `model`, `agent`, resolved
+`template_id` + commit, terminal `job_state`, result `decision` + approval flag, a
+coarse tests-run count, `duration_ms`, and input/output tokens (best-effort). Capture
+is **always on, additive, and fail-safe**: it writes only to the new
+`routing_telemetry` table and a telemetry error can never fail a job.
+
+**v1 is advisory only** — nothing reads this back to change routing, and no automatic
+model/runtime override happens anywhere. It is a local feedback loop you inspect, not
+a global benchmark.
+
+Inspect observed performance (read-only), grouped by `(action, runtime, model,
+template)`:
+
+```sh
+gitmoot router summary [--repo owner/repo] [--action ask|review|implement] [--since 30d] [--json]
+```
+
+It reports per-group count, success rate, approval rate, median duration, and summed
+tokens, always labeled **"local observed performance, not a benchmark"**. `--since`
+accepts a Go duration or an `<N>d` days suffix.
+
+Optionally inject a **bounded** (≤12-line) observed-performance table into a
+**coordinator's** prompt. It is **off by default**; with it off, coordinator prompt
+assembly is byte-identical and no telemetry query runs during a job:
+
+```toml
+[router]
+context_enabled = true   # inject the advisory table into top-level coordinator prompts (default false)
+```
+
+The injected block carries the same "not a benchmark" disclaimer, is added only to
+top-level (coordinator) jobs, and never forces a route — routing stays advisory.

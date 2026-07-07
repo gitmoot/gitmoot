@@ -128,6 +128,18 @@ CREATE TABLE agent_template_versions (
 	version INTEGER NOT NULL,
 	state TEXT NOT NULL
 );
+-- A minimal agents table (as it existed at the input_tokens migration point) so
+-- the later #33 preset_delivery ALTER ADD COLUMN that runs in this pass has its
+-- table; the real table was created by an earlier (here pre-seeded-as-applied)
+-- migration.
+CREATE TABLE agents (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	name TEXT NOT NULL UNIQUE,
+	role TEXT NOT NULL,
+	runtime TEXT NOT NULL,
+	runtime_ref TEXT NOT NULL,
+	repo_scope TEXT NOT NULL
+);
 -- job_events as it existed at an earlier (here pre-seeded-as-applied) migration,
 -- so the #549 job_events index migration that runs in this pass has its table.
 CREATE TABLE job_events (

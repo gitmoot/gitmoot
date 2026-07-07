@@ -2,3 +2,5 @@
 /GOALS/
 /dist/
 /.gitmoot/evals/
+/gitmoot
+/*.log

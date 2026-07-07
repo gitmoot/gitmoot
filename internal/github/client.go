@@ -93,6 +93,27 @@ type PullRequest struct {
 	HeadSHA   string
 	MergeSHA  string
 	Mergeable *bool `json:"mergeable"`
+	// Labels carries the PR's GitHub labels (parsed from the list/get JSON, no
+	// extra API call). It is additive (#650): existing callers that ignore it are
+	// byte-identical; the opt-in risk classifier reads label names from it.
+	Labels []PullRequestLabel `json:"labels,omitempty"`
+}
+
+// PullRequestLabel is a single GitHub label on a PR (only the name is used).
+type PullRequestLabel struct {
+	Name string `json:"name"`
+}
+
+// LabelNames returns the PR's label names, dropping blanks. It is the input the
+// risk classifier consumes.
+func (p PullRequest) LabelNames() []string {
+	names := make([]string, 0, len(p.Labels))
+	for _, l := range p.Labels {
+		if name := strings.TrimSpace(l.Name); name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 func (p *PullRequest) UnmarshalJSON(data []byte) error {
@@ -114,6 +135,7 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 			Ref string `json:"ref"`
 			SHA string `json:"sha"`
 		} `json:"base"`
+		Labels []PullRequestLabel `json:"labels"`
 	}
 	var decoded wire
 	if err := json.Unmarshal(data, &decoded); err != nil {
@@ -132,6 +154,7 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 	p.MergeSHA = decoded.MergeSHA
 	p.BaseRef = decoded.Base.Ref
 	p.BaseSHA = decoded.Base.SHA
+	p.Labels = decoded.Labels
 	return nil
 }
 

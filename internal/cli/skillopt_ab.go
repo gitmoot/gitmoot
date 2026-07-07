@@ -139,7 +139,17 @@ var skillOptABJudgeAuthedRuntimes = func(repoScope string) reviewAuthedRuntimes 
 // its resume_hint) untouched. A non-empty ref (the manual `skillopt ab` path)
 // keeps its existing resume behavior unchanged.
 func realSkillOptABDeliver(ctx context.Context, agent runtime.Agent, prompt string) (string, error) {
-	adapter, err := runtimeStartAdapterFor(newRuntimeFactory(), agent.Runtime, agent.RepoScope)
+	// Adapter Dir must be a real filesystem checkout, NOT the "owner/repo"
+	// RepoScope form. Callers that resolved the repo to its registered
+	// db.Repo.CheckoutPath set agent.WorkingDir; prefer it so real (non-stubbed)
+	// deliveries chdir into an existing directory. When unset we fall back to
+	// RepoScope, preserving the legacy behavior of callers that never resolve a
+	// checkout (the manual `skillopt ab`/#483 judge paths, which are test-stubbed).
+	adapterDir := strings.TrimSpace(agent.WorkingDir)
+	if adapterDir == "" {
+		adapterDir = agent.RepoScope
+	}
+	adapter, err := runtimeStartAdapterFor(newRuntimeFactory(), agent.Runtime, adapterDir)
 	if err != nil {
 		return "", err
 	}

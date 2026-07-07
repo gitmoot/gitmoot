@@ -456,6 +456,100 @@ func validateEventsPolicy(policy EventsPolicy) error {
 	return nil
 }
 
+// ReviewPolicy is the host-level review policy read from the [review] section of
+// the gitmoot config (#650). It gates the OPT-IN risk-tiered adaptive review:
+// when RiskTiersEnabled is false (the default) the workflow engine never
+// classifies a PR and the single-review fan-out is byte-identical. HighRiskPaths,
+// RiskLabelHigh, and RiskLabelRoutine are only consulted when risk tiers are on.
+type ReviewPolicy struct {
+	// RiskTiersEnabled opts the engine into risk-tiered review. Default false = OFF.
+	RiskTiersEnabled bool
+	// HighRiskPaths is the changed-path glob list that resolves the `high` tier.
+	// Empty falls back to the engine's built-in defaults.
+	HighRiskPaths []string
+	// RiskLabelHigh / RiskLabelRoutine are the PR label names that force a tier
+	// (winning over path heuristics). Empty falls back to the engine defaults
+	// (risk:high / risk:routine).
+	RiskLabelHigh    string
+	RiskLabelRoutine string
+}
+
+func DefaultReviewPolicy() ReviewPolicy {
+	return ReviewPolicy{RiskTiersEnabled: false}
+}
+
+// LoadReviewPolicy parses the [review] section. A missing config file or section
+// yields the default (risk tiers OFF), so the caller never has to distinguish
+// "no config" from "explicitly off".
+func LoadReviewPolicy(paths Paths) (ReviewPolicy, error) {
+	content, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return DefaultReviewPolicy(), nil
+		}
+		return ReviewPolicy{}, err
+	}
+	policy := DefaultReviewPolicy()
+	current := false
+	for _, raw := range strings.Split(string(content), "\n") {
+		line := strings.TrimSpace(stripConfigComment(raw))
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section := strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
+			current = strings.TrimSpace(section) == "review"
+			continue
+		}
+		if !current {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		if err := applyReviewPolicyField(&policy, strings.TrimSpace(key), strings.TrimSpace(value)); err != nil {
+			return ReviewPolicy{}, fmt.Errorf("parse [review].%s: %w", strings.TrimSpace(key), err)
+		}
+	}
+	return policy, nil
+}
+
+func applyReviewPolicyField(policy *ReviewPolicy, key string, value string) error {
+	switch key {
+	case "risk_tiers_enabled":
+		parsed, err := parseConfigBool(value)
+		if err != nil {
+			return err
+		}
+		policy.RiskTiersEnabled = parsed
+		return nil
+	case "high_risk_paths":
+		parsed, err := parseConfigStringArray(value)
+		if err != nil {
+			return err
+		}
+		policy.HighRiskPaths = parsed
+		return nil
+	case "risk_label_high":
+		parsed, err := parseConfigString(value)
+		if err != nil {
+			return err
+		}
+		policy.RiskLabelHigh = strings.TrimSpace(parsed)
+		return nil
+	case "risk_label_routine":
+		parsed, err := parseConfigString(value)
+		if err != nil {
+			return err
+		}
+		policy.RiskLabelRoutine = strings.TrimSpace(parsed)
+		return nil
+	default:
+		return nil
+	}
+}
+
 // SkillOptPolicy is the host-level template-learning policy read from the
 // [skillopt] section of the gitmoot config (#465, Mode A). It gates the
 // off-by-default automatic trace-harvester: when AutoTraceEnabled is false (the

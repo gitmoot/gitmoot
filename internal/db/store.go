@@ -44,6 +44,12 @@ type Agent struct {
 	Capabilities   []string
 	AutonomyPolicy string
 	HealthStatus   string
+	// PresetDelivery is the per-agent prompt preset delivery mode (#33): one of
+	// full (the default and pre-#33 behavior — always inline the whole preset),
+	// referenced, or auto. Backed by the additive agents.preset_delivery column
+	// (DEFAULT 'full'), so every existing row and every agent that never sets it
+	// reads 'full' and behaves byte-identically.
+	PresetDelivery string
 }
 
 type AgentTemplate struct {
@@ -830,8 +836,8 @@ func (s *Store) UpsertAgent(ctx context.Context, agent Agent) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO agents(name, role, runtime, runtime_ref, repo_scope, template_id, model, capabilities_json, autonomy_policy, health_status, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO agents(name, role, runtime, runtime_ref, repo_scope, template_id, model, capabilities_json, autonomy_policy, health_status, preset_delivery, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 			ON CONFLICT(name) DO UPDATE SET
 				role = excluded.role,
 				runtime = excluded.runtime,
@@ -842,8 +848,9 @@ func (s *Store) UpsertAgent(ctx context.Context, agent Agent) error {
 				capabilities_json = excluded.capabilities_json,
 				autonomy_policy = excluded.autonomy_policy,
 				health_status = excluded.health_status,
+				preset_delivery = excluded.preset_delivery,
 				updated_at = CURRENT_TIMESTAMP`,
-		agent.Name, agent.Role, agent.Runtime, agent.RuntimeRef, agent.RepoScope, agent.TemplateID, agent.Model, string(capabilities), agent.AutonomyPolicy, agent.HealthStatus); err != nil {
+		agent.Name, agent.Role, agent.Runtime, agent.RuntimeRef, agent.RepoScope, agent.TemplateID, agent.Model, string(capabilities), agent.AutonomyPolicy, agent.HealthStatus, normalizePresetDeliveryStored(agent.PresetDelivery)); err != nil {
 		return err
 	}
 	if strings.TrimSpace(agent.RepoScope) != "" {
@@ -865,7 +872,7 @@ func (s *Store) UpdateAgentRuntime(ctx context.Context, name, runtime string) er
 	if runtime != "codex" && runtime != "claude" && runtime != "kimi" {
 		return fmt.Errorf("unknown runtime %q (want codex, claude, or kimi)", runtime)
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, model, capabilities_json, autonomy_policy, health_status
+	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, model, capabilities_json, autonomy_policy, health_status, preset_delivery
 		FROM agents WHERE name = ?`, name)
 	agent, err := scanAgent(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -902,7 +909,7 @@ func (s *Store) UpdateAgentRuntimeRef(ctx context.Context, name, ref string) err
 }
 
 func (s *Store) GetAgent(ctx context.Context, name string) (Agent, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, model, capabilities_json, autonomy_policy, health_status
+	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, model, capabilities_json, autonomy_policy, health_status, preset_delivery
 		FROM agents WHERE name = ?`, name)
 	agent, err := scanAgent(row)
 	if err == nil {
@@ -930,11 +937,14 @@ func (s *Store) GetAgent(ctx context.Context, name string) (Agent, error) {
 		Capabilities:   instance.Capabilities,
 		AutonomyPolicy: policy,
 		HealthStatus:   instance.State,
+		// Ephemeral/temp-worker instances have no preset_delivery column; they
+		// always deliver the full preset (#33), matching the 'full' default.
+		PresetDelivery: PresetDeliveryFull,
 	}, nil
 }
 
 func (s *Store) ListAgents(ctx context.Context) ([]Agent, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, model, capabilities_json, autonomy_policy, health_status
+	rows, err := s.db.QueryContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, model, capabilities_json, autonomy_policy, health_status, preset_delivery
 		FROM agents ORDER BY name`)
 	if err != nil {
 		return nil, err
@@ -4860,6 +4870,76 @@ func (s *Store) UpsertFeedbackEvent(ctx context.Context, event FeedbackEvent) er
 	return err
 }
 
+// BinaryVerdict is one persisted BINEVAL binary-evaluation verdict (#525): a
+// yes/no answer + explanation for a single question of an eval run.
+type BinaryVerdict struct {
+	RunID           string
+	QuestionID      string
+	Dimension       string
+	Verdict         string
+	Explanation     string
+	QuestionWeight  float64
+	DimensionWeight float64
+	CreatedAt       string
+}
+
+// UpsertBinaryVerdict inserts or replaces one binary verdict keyed by
+// (run_id, question_id) so a re-run of the same question set against the same
+// run overwrites verdicts in place (stable row count).
+func (s *Store) UpsertBinaryVerdict(ctx context.Context, v BinaryVerdict) error {
+	if strings.TrimSpace(v.RunID) == "" {
+		return errors.New("binary verdict run id is required")
+	}
+	if strings.TrimSpace(v.QuestionID) == "" {
+		return errors.New("binary verdict question id is required")
+	}
+	if strings.TrimSpace(v.Verdict) == "" {
+		v.Verdict = "no"
+	}
+	// Weights default to 1 so an unweighted caller (and the DB DEFAULT) agree,
+	// and so aggregation over the persisted rows reproduces the run's scores.
+	if v.QuestionWeight <= 0 {
+		v.QuestionWeight = 1
+	}
+	if v.DimensionWeight <= 0 {
+		v.DimensionWeight = 1
+	}
+	if strings.TrimSpace(v.CreatedAt) == "" {
+		v.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO skillopt_binary_verdicts(run_id, question_id, dimension, verdict, explanation, question_weight, dimension_weight, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(run_id, question_id) DO UPDATE SET
+			dimension = excluded.dimension,
+			verdict = excluded.verdict,
+			explanation = excluded.explanation,
+			question_weight = excluded.question_weight,
+			dimension_weight = excluded.dimension_weight,
+			created_at = excluded.created_at`,
+		v.RunID, v.QuestionID, v.Dimension, v.Verdict, v.Explanation, v.QuestionWeight, v.DimensionWeight, v.CreatedAt)
+	return err
+}
+
+// ListBinaryVerdicts returns every binary verdict for a run, ordered by
+// (dimension, question_id) for a deterministic read.
+func (s *Store) ListBinaryVerdicts(ctx context.Context, runID string) ([]BinaryVerdict, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT run_id, question_id, dimension, verdict, explanation, question_weight, dimension_weight, created_at
+		FROM skillopt_binary_verdicts WHERE run_id = ? ORDER BY dimension, question_id`, strings.TrimSpace(runID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var verdicts []BinaryVerdict
+	for rows.Next() {
+		var v BinaryVerdict
+		if err := rows.Scan(&v.RunID, &v.QuestionID, &v.Dimension, &v.Verdict, &v.Explanation, &v.QuestionWeight, &v.DimensionWeight, &v.CreatedAt); err != nil {
+			return nil, err
+		}
+		verdicts = append(verdicts, v)
+	}
+	return verdicts, rows.Err()
+}
+
 func (s *Store) ListFeedbackEvents(ctx context.Context, runID string) ([]FeedbackEvent, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, item_id, choice, reasoning, reviewer, source, source_url, created_at
 		FROM feedback_events WHERE run_id = ? ORDER BY item_id, reviewer, source, source_url`, runID)
@@ -6253,7 +6333,7 @@ type agentScanner interface {
 func scanAgent(scanner agentScanner) (Agent, error) {
 	var agent Agent
 	var capabilities string
-	if err := scanner.Scan(&agent.Name, &agent.Role, &agent.Runtime, &agent.RuntimeRef, &agent.RepoScope, &agent.TemplateID, &agent.Model, &capabilities, &agent.AutonomyPolicy, &agent.HealthStatus); err != nil {
+	if err := scanner.Scan(&agent.Name, &agent.Role, &agent.Runtime, &agent.RuntimeRef, &agent.RepoScope, &agent.TemplateID, &agent.Model, &capabilities, &agent.AutonomyPolicy, &agent.HealthStatus, &agent.PresetDelivery); err != nil {
 		return Agent{}, err
 	}
 	if err := json.Unmarshal([]byte(capabilities), &agent.Capabilities); err != nil {
@@ -7919,5 +7999,142 @@ CREATE TABLE chat_mentions (
 	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_chat_mentions_agent_unread ON chat_mentions(agent, unread);
+	`,
+	// #525 BINEVAL binary evaluation: one row per (eval run, binary question)
+	// recording the yes/no verdict + explanation and the dimension the question
+	// belongs to. Keyed by (run_id, question_id) so re-running a question set
+	// against the same run upserts each verdict in place (stable row count,
+	// corrective overwrite). Pure additive append (CREATE TABLE/INDEX only, no
+	// ALTER/renumber of any prior migration): the table stays empty until
+	// `gitmoot skillopt binary run` executes, so every existing DB — and every
+	// existing SkillOpt review/optimize flow — reads byte-identically.
+	`
+CREATE TABLE skillopt_binary_verdicts (
+	run_id TEXT NOT NULL,
+	question_id TEXT NOT NULL,
+	dimension TEXT NOT NULL DEFAULT '',
+	verdict TEXT NOT NULL DEFAULT 'no',
+	explanation TEXT NOT NULL DEFAULT '',
+	question_weight REAL NOT NULL DEFAULT 1,
+	dimension_weight REAL NOT NULL DEFAULT 1,
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (run_id, question_id)
+);
+CREATE INDEX idx_skillopt_binary_verdicts_run ON skillopt_binary_verdicts(run_id);
+	`,
+	// #535 Autodata-style synthetic SkillOpt review items. One row per ACCEPTED
+	// synthetic item generated by `gitmoot skillopt synth` (an explicit, opt-in
+	// command — NO daemon/auto integration). Every row is created
+	// status='pending_human_approval' and is only ever moved to approved/rejected
+	// by the explicit human gate (`synth approve`/`synth reject`); NOTHING in the
+	// promotion/training path reads this table, so a pending item is structurally
+	// incapable of affecting a promotion. Pure additive append (CREATE TABLE/INDEX
+	// only): the table stays empty until `skillopt synth` accepts an item, so every
+	// existing DB reads identically. Times are RFC3339Nano UTC text.
+	// idx_skillopt_synth_items_status backs the status-filtered `synth list`.
+	`
+CREATE TABLE skillopt_synth_items (
+	id TEXT PRIMARY KEY,
+	template_id TEXT NOT NULL DEFAULT '',
+	repo TEXT NOT NULL DEFAULT '',
+	status TEXT NOT NULL DEFAULT 'pending_human_approval',
+	context TEXT NOT NULL DEFAULT '',
+	question TEXT NOT NULL DEFAULT '',
+	rubric TEXT NOT NULL DEFAULT '',
+	weak_agent TEXT NOT NULL DEFAULT '',
+	strong_agent TEXT NOT NULL DEFAULT '',
+	judge_agent TEXT NOT NULL DEFAULT '',
+	weak_answer TEXT NOT NULL DEFAULT '',
+	strong_answer TEXT NOT NULL DEFAULT '',
+	weak_score REAL NOT NULL DEFAULT 0,
+	strong_score REAL NOT NULL DEFAULT 0,
+	gap REAL NOT NULL DEFAULT 0,
+	rounds INTEGER NOT NULL DEFAULT 0,
+	diagnostic TEXT NOT NULL DEFAULT '',
+	out_path TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT '',
+	updated_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX idx_skillopt_synth_items_status ON skillopt_synth_items(status);
+	`,
+	// #33 preset prompt delivery modes. Additive-only: the agents column carries a
+	// 'full' DEFAULT so every existing row (and every agent that never opts in)
+	// keeps delivering the whole preset exactly as before. preset_session_state
+	// records, per (runtime, session_id, preset_id, preset_commit), that a resumed
+	// session already received a preset at a specific commit; it stays EMPTY until
+	// an agent set to referenced/auto completes a full delivery, so every existing
+	// DB reads identically. The composite PK is the exact-match key the delivery
+	// decision queries; a preset commit change simply fails to match (and
+	// RecordPresetSessionState overwrites the prior commit row for the tuple).
+	`
+ALTER TABLE agents ADD COLUMN preset_delivery TEXT NOT NULL DEFAULT 'full';
+
+CREATE TABLE preset_session_state (
+	runtime TEXT NOT NULL,
+	session_id TEXT NOT NULL,
+	preset_id TEXT NOT NULL,
+	preset_commit TEXT NOT NULL DEFAULT '',
+	delivered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (runtime, session_id, preset_id, preset_commit)
+);
+	`,
+	// #530 execution-grounded routing telemetry: one row per job terminal
+	// transition capturing which (action, runtime, model, template) combination ran
+	// and how it turned out (state/decision/approval + coarse tests-run + duration +
+	// tokens). Pure additive append (CREATE TABLE/INDEX only): the table stays empty
+	// until a job finishes AFTER this migration, so every existing DB reads
+	// identically, and the row write is best-effort/fail-safe (a telemetry error
+	// never fails a job). Consumed read-only by `gitmoot router summary` and the
+	// optional (off-by-default) coordinator context block; NOTHING reads it back to
+	// change routing behavior in v1 — it is advisory only. The two indexes back the
+	// summary's repo/action filters and the --since lower bound.
+	`
+CREATE TABLE routing_telemetry (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	job_id TEXT NOT NULL DEFAULT '',
+	repo TEXT NOT NULL DEFAULT '',
+	action TEXT NOT NULL DEFAULT '',
+	phase TEXT NOT NULL DEFAULT '',
+	runtime TEXT NOT NULL DEFAULT '',
+	model TEXT NOT NULL DEFAULT '',
+	agent TEXT NOT NULL DEFAULT '',
+	template_id TEXT NOT NULL DEFAULT '',
+	template_commit TEXT NOT NULL DEFAULT '',
+	job_state TEXT NOT NULL DEFAULT '',
+	decision TEXT NOT NULL DEFAULT '',
+	approved INTEGER NOT NULL DEFAULT 0,
+	tests_run INTEGER NOT NULL DEFAULT 0,
+	duration_ms INTEGER NOT NULL DEFAULT 0,
+	input_tokens INTEGER NOT NULL DEFAULT 0,
+	output_tokens INTEGER NOT NULL DEFAULT 0,
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_routing_telemetry_repo_action ON routing_telemetry(repo, action);
+CREATE INDEX idx_routing_telemetry_created ON routing_telemetry(created_at);
+	`,
+	// #526 result-check feed-forward stub: one row per FAILED deterministic
+	// binary-checklist audit of a job's parsed gitmoot_result, stored so SkillOpt
+	// can later consume them as structured feedback. Nothing reads this table
+	// tonight beyond tests and the job-detail cross-check — there is NO SkillOpt
+	// behavior change. Pure additive append (CREATE TABLE/INDEX only, no ALTER or
+	// renumber of any prior migration): the table stays empty until [workflow]
+	// result_checks is warn/block AND a result actually fails a check, so every
+	// existing DB and every off-mode job reads byte-identically. Rows are keyed by
+	// job id (not FK-constrained) so a retried/cancelled job's history is retained;
+	// there is no GC in v1 (a failure row is tens of bytes).
+	`
+CREATE TABLE result_check_failures (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	job_id TEXT NOT NULL,
+	root_id TEXT NOT NULL DEFAULT '',
+	action TEXT NOT NULL DEFAULT '',
+	check_id TEXT NOT NULL DEFAULT '',
+	question TEXT NOT NULL DEFAULT '',
+	explanation TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_result_check_failures_job ON result_check_failures(job_id);
 	`,
 }

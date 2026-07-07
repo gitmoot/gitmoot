@@ -1038,3 +1038,70 @@ Manual smoke scenarios for review operations:
   Use a disposable/reset session for dry-runs; run the production session
   without `--dry-run` and expect preflight to require working
   credentials/backends.
+
+## Synthetic Review Items (Opt-In)
+
+`gitmoot skillopt synth` is an explicit, off-by-default prototype for generating
+Autodata-style synthetic review items — review items where a weak/default agent
+struggles, a strong agent succeeds, and a judge confirms the item is meaningful.
+It has **no daemon or auto integration**: it runs only when you invoke it, and
+its output never enters any training or review pool automatically.
+
+```sh
+gitmoot skillopt synth \
+  --template planner \
+  --repo owner/repo \
+  --weak planner-default \
+  --strong planner-deep \
+  --judge cross-family-judge \
+  --max-items 3 \
+  --max-rounds-per-item 3 \
+  --gap 0.2 \
+  --out .gitmoot/skillopt/synth
+```
+
+For each item slot (up to `--max-items`, default 3) the command runs a bounded
+loop through the same runtime-adapter invocation path the manual A/B command
+uses:
+
+1. A **Challenger** (`--challenger`, default the strong agent) writes a
+   `{context, question, rubric}` triple designed to be hard for a weaker agent.
+2. The `--weak` and `--strong` agents each attempt the item.
+3. The `--judge` (default the strong agent) scores both answers against the
+   rubric and reports whether the item is well-formed.
+
+An item is **accepted** only when the strong agent meaningfully beats the weak
+agent — the judged score gap is at least `--gap` (default 0.20) — **and** the
+judge confirms the item is well-formed. Otherwise the round records a diagnostic
+and the Challenger regenerates with targeted feedback until an item is accepted
+or `--max-rounds-per-item` (default 3) is exhausted. The diagnostics are:
+
+- `too_easy` — the weak agent already solves it (or comes within the gap).
+- `too_hard` — even the strong agent fails.
+- `strong_failed` — the strong agent scored below the weak agent.
+- `bad_rubric` — the item was not well-formed or could not be parsed.
+- `context_leak` — the judge found the context gives the answer away.
+
+Every skipped or rejected candidate is logged with its diagnostic; only accepted
+items are persisted. Cost is hard-bounded by `--max-items` and
+`--max-rounds-per-item`.
+
+### The Human Approval Gate
+
+Accepted items are written to `--out` (default `<home>/evals/synth`) and stored
+in the database with status `pending_human_approval`. This is a load-bearing
+governance boundary: **nothing in the promotion or training path reads the synth
+table**, so a pending item is structurally incapable of affecting a promotion.
+
+Inspect and act on pending items with:
+
+```sh
+gitmoot skillopt synth list --status pending_human_approval
+gitmoot skillopt synth approve <item-id>
+gitmoot skillopt synth reject <item-id>
+```
+
+Only an operator's explicit `approve` clears an item; approval is required before
+a synthetic item may later be included, by hand, in a review pool. `reject`
+records an auditable rejection. The command never promotes a template or feeds an
+optimizer on its own.

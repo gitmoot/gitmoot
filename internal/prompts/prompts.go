@@ -21,13 +21,29 @@ type JobPrompt struct {
 	TemplateID             string
 	TemplateResolvedCommit string
 	TemplateInstructions   string
+	// TemplateReferenceOnly, when true, replaces the full "Template instructions"
+	// block with a short reference line (#33 referenced/auto delivery): the resumed
+	// session is known to already hold this preset, so the whole body is not
+	// re-pasted. It only takes effect when TemplateID is set; otherwise the prompt
+	// is byte-identical to the full path.
+	TemplateReferenceOnly bool
 }
 
 func RenderJob(prompt JobPrompt) string {
 	var builder strings.Builder
 	builder.WriteString("Gitmoot job\n\n")
 
-	if strings.TrimSpace(prompt.TemplateInstructions) != "" {
+	if prompt.TemplateReferenceOnly && strings.TrimSpace(prompt.TemplateID) != "" {
+		// #33 referenced/auto delivery: the resumed session already loaded this
+		// preset, so send a short reference instead of re-pasting the whole body.
+		writeField(&builder, "Template", prompt.TemplateID)
+		writeField(&builder, "Template source commit", prompt.TemplateResolvedCommit)
+		commit := strings.TrimSpace(prompt.TemplateResolvedCommit)
+		if commit == "" {
+			commit = "unknown"
+		}
+		builder.WriteString(fmt.Sprintf("Use your installed %s preset (commit %s) that this resumed session already has loaded. Do not expect the full preset text below.\n\n", strings.TrimSpace(prompt.TemplateID), commit))
+	} else if strings.TrimSpace(prompt.TemplateInstructions) != "" {
 		writeField(&builder, "Template", prompt.TemplateID)
 		writeField(&builder, "Template source commit", prompt.TemplateResolvedCommit)
 		builder.WriteString("Template instructions:\n")

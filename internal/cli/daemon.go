@@ -414,11 +414,17 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 			// Registry default_model behavioral fallback (#652), home-aware and
 			// fail-open — see daemonWorkflowEngine. Empty by default => byte-identical.
 			RuntimeDefaultModel: runtimeDefaultModelResolver(*home),
+			// Result-check audit (#526), home-aware and fail-safe to the default warn.
+			ResultCheckMode: resultChecksMode(*home),
 		}
 		// Honor the opt-in [orchestrate] policy (artifact-body inlining + per-root
 		// delegation token budget) on this single-repo engine too; fail-safe to the
 		// defaults if the policy cannot load.
 		defaultJobWorker(store, stdout, *home).applyOrchestratePolicy(&engine)
+		// Opt-in risk-tiered adaptive review (#650); off by default so this is a
+		// no-op unless the home config enables it.
+		applyReviewPolicy(&engine, *home)
+		wireReviewRiskSignals(&engine, gh)
 		fmt.Fprintf(stdout, "watching %s every %s\n", repo.FullName(), poll.String())
 		return runSingleRepoSupervisor(ctx, *home, daemon.Daemon{
 			Repo:                   repo,
@@ -6617,6 +6623,13 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 		// empty by default, so with no config NO model is forced and delivery is
 		// byte-identical; an agent/job --model always wins.
 		RuntimeDefaultModel: runtimeDefaultModelResolver(home),
+		// Off-restores-byte-identical result-check audit (#526): the deterministic
+		// binary-checklist audit of a job's parsed gitmoot_result. resultChecksMode
+		// resolves the [workflow] result_checks knob (default warn) from the
+		// home-aware config; result_checks = off restores the exact pre-feature
+		// terminal path (no event, no payload field, no feed-forward row). Fail-safe
+		// to the documented default warn on any load error.
+		ResultCheckMode: resultChecksMode(home),
 		PayloadRefresher: func(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
 			return refreshDaemonJobPayload(ctx, store, checkout, job, payload)
 		},
@@ -6626,7 +6639,19 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 		// returns before its query, byte-identical) AND no comparator runs, so a
 		// stranded canary row can never keep serving traffic with no auto-rollback.
 		CanaryEnabled: canaryRoutingEnabled(home),
+		// Off-by-default #530 coordinator routing-context injection: when [router]
+		// context_enabled is set, the engine's Mailbox appends a bounded advisory
+		// observed-performance table to a top-level coordinator job's prompt.
+		// routerContextEnabled returns false with no config (or any load error), so
+		// with no config NO telemetry query runs during a job and prompt assembly is
+		// byte-identical. Capture (routing_telemetry rows) is always on and additive.
+		RouterContextEnabled: routerContextEnabled(home),
 	}
+	// Opt-in risk-tiered adaptive review (#650): copy the [review] policy onto the
+	// engine. Off by default (RiskTiersEnabled false), so the review fan-out is
+	// byte-identical unless a home config turns it on.
+	applyReviewPolicy(&engine, home)
+	wireReviewRiskSignals(&engine, gh)
 	if strings.TrimSpace(home) != "" {
 		// Root delegation artifacts under GITMOOT_HOME (alongside worktrees)
 		// rather than inside the repo checkout, so generated briefs stay out of
