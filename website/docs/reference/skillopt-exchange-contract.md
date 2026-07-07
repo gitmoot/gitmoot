@@ -473,6 +473,30 @@ and the verdicts ride the training-package export as the optional
 `skillopt binary` command is invoked — every existing review/optimize flow is
 byte-identical when it is unused.
 
+### Binary-disagreement lessons (#527)
+
+`gitmoot skillopt binary lessons --template <id>` turns those per-question
+verdicts into **optimizer-consumable prompt-update lessons** (BINEVAL §3.3/§3.4).
+It compares verdicts across every run of the template — candidate-vs-champion
+(different versions) **and** repeated runs of one version (instability) — and
+classifies each question:
+
+- a verdict that **flips** across runs → an unstable, targeted improvement signal;
+- a **stable NO** (no in every run) → a concrete failure lesson;
+- a **stable YES** (yes in every run) → a trait worth preserving.
+
+The command **previews by default and writes nothing**. With `--apply` it projects
+the lessons onto `RankedFeedbackEvent` rows via the existing store API
+(`source=binary-disagreement`): negative lessons become `required_improvements`
+and stable-pass traits become `useful_traits`, so the **existing** optimizer and
+`skillopt rubric induce` consume them with **zero contract change**. `--set <file>`
+supplies the question set so a lesson recovers the question's own wording (the
+verdicts table stores only ids); `--run <id>` (repeatable) restricts to specific
+runs; `--no-passes` drops the stable-pass traits. There is **no daemon or
+automatic path** — writes are CLI-explicit only, mirroring the `skillopt synth`
+approval gate, and re-applying is idempotent (a deterministic per-template
+synthetic run, upserted in place).
+
 ### Promotion policy + notifications (off by default)
 
 When a candidate becomes **pending** (after `skillopt import` or `train

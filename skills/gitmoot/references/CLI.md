@@ -1178,6 +1178,7 @@ gitmoot skillopt gate run --candidate <version-id> [--corpus path] [--replay-com
 gitmoot skillopt gate history --candidate <version-id> [--json]
 gitmoot skillopt binary run --set <file> --run <run-id> --source <file> [--deterministic] [--reviewer runtime] [--home path] [--json]
 gitmoot skillopt binary show --run <run-id> [--home path] [--json]
+gitmoot skillopt binary lessons --template <id> [--set <file>] [--run <run-id> ...] [--no-passes] [--apply] [--home path] [--json]
 gitmoot skillopt synth --template <id> --repo owner/repo --weak <agent> --strong <agent> [--judge <agent>] [--challenger <agent>] [--max-items N] [--max-rounds-per-item M] [--gap F] [--out dir] [--json]
 gitmoot skillopt synth list [--status pending_human_approval|approved|rejected] [--json]
 gitmoot skillopt synth approve <item-id>
@@ -1341,6 +1342,24 @@ packets are byte-identical). The per-dimension scores map onto the existing
 `EvaluatorScore.DimensionScores` shape with **no contract change**. Nothing here
 runs unless a `skillopt binary` command is invoked — every existing SkillOpt
 review/optimize flow is byte-identical when it is unused.
+
+`skillopt binary lessons --template <id>` turns the per-question verdicts already
+recorded for a template into **optimizer-consumable prompt-update lessons**
+(`#527`, BINEVAL §3.3/§3.4). It compares verdicts across every run of the
+template — candidate-vs-champion (different versions) **and** repeated runs of one
+version (instability) — and classifies each question: a verdict that **flips**
+across runs is an unstable, targeted improvement signal; a **stable NO** is a
+concrete failure lesson; a **stable YES** is a trait to preserve. It **previews by
+default and writes nothing**. With `--apply` it projects the lessons onto
+`RankedFeedbackEvent` rows via the existing store API (`source=binary-disagreement`;
+negative lessons → `required_improvements`, stable-pass traits → `useful_traits`)
+so the **existing** optimizer + `skillopt rubric induce` consume them with **zero
+contract change**. `--set <file>` supplies the question set so lessons recover the
+question wording (the verdicts table stores only ids); `--run <id>` (repeatable)
+restricts to specific runs; `--no-passes` drops the stable-pass traits. There is
+**no daemon or automatic path** — writes are CLI-explicit only, mirroring the
+`skillopt synth` approval gate, and re-applying is idempotent (a deterministic
+per-template synthetic run, upserted in place).
 
 `skillopt pairwise import <packet-dir>` ingests a **blinded paired-review
 packet** produced by the gitmoot-skillopt fork (the `pairwise-review.json`

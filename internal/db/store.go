@@ -2812,7 +2812,7 @@ func (s *Store) ClaimRunningJob(ctx context.Context, id string, from string, to 
 //
 // It is a STRICT no-op when currentBootID is "" (a non-Linux host or a boot id
 // that could not be read): with no boot identity there is nothing to compare
-// against, so behavior is byte-identical to before this feature. The `!= ''`
+// against, so behavior is byte-identical to before this feature. The `!= ”`
 // guard likewise never touches identity-less legacy rows (pre-upgrade running
 // jobs), leaving them to the existing age/lease recovery. It NEVER touches a
 // same-boot job — same-boot liveness stays governed by the age/lease gate, so no
@@ -2885,7 +2885,7 @@ func (s *Store) RequeueRunningJobsFromForeignBoot(ctx context.Context, currentBo
 // foreign boot), so this method only reclaims the lock row. It returns the number
 // of locks released.
 //
-// It is a STRICT no-op when currentBootID is "" and, via the `!= ''` guard, never
+// It is a STRICT no-op when currentBootID is "" and, via the `!= ”` guard, never
 // reclaims an identity-less lock (a non-pid-stamping acquire or a legacy row),
 // which stays governed by its lease/TTL. Because a foreign boot id can only have
 // been written by a process on a prior boot, it can never match an in-flight owner
@@ -4938,6 +4938,50 @@ func (s *Store) ListBinaryVerdicts(ctx context.Context, runID string) ([]BinaryV
 		verdicts = append(verdicts, v)
 	}
 	return verdicts, rows.Err()
+}
+
+// BinaryVerdictWithRun is one persisted binary verdict joined with the template
+// id and version id of the eval run it belongs to. It is the read shape the
+// #527 binary-disagreement lesson derivation consumes: to compare verdicts
+// across candidate-vs-champion runs (different versions) and repeated runs of
+// the same version, the derivation needs every verdict for a template together
+// with which run/version produced it.
+type BinaryVerdictWithRun struct {
+	BinaryVerdict
+	TemplateID        string
+	TemplateVersionID string
+}
+
+// ListBinaryVerdictsForTemplate returns every binary verdict for every eval run
+// of a template, joined with the run's template/version ids, ordered
+// deterministically by (run_id, dimension, question_id). It is read-only and
+// additive — it exists for the #527 disagreement view and touches no existing
+// path. An empty/whitespace templateID returns no rows.
+func (s *Store) ListBinaryVerdictsForTemplate(ctx context.Context, templateID string) ([]BinaryVerdictWithRun, error) {
+	templateID = strings.TrimSpace(templateID)
+	if templateID == "" {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT v.run_id, v.question_id, v.dimension, v.verdict, v.explanation, v.question_weight, v.dimension_weight, v.created_at,
+			r.template_id, r.template_version_id
+		FROM skillopt_binary_verdicts v
+		JOIN eval_runs r ON r.id = v.run_id
+		WHERE r.template_id = ?
+		ORDER BY v.run_id, v.dimension, v.question_id`, templateID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BinaryVerdictWithRun
+	for rows.Next() {
+		var v BinaryVerdictWithRun
+		if err := rows.Scan(&v.RunID, &v.QuestionID, &v.Dimension, &v.Verdict, &v.Explanation, &v.QuestionWeight, &v.DimensionWeight, &v.CreatedAt,
+			&v.TemplateID, &v.TemplateVersionID); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) ListFeedbackEvents(ctx context.Context, runID string) ([]FeedbackEvent, error) {
