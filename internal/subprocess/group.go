@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"os/exec"
 	"syscall"
 	"time"
@@ -25,6 +26,15 @@ func (GroupRunner) Run(ctx context.Context, dir string, command string, args ...
 	return RunGroup(ctx, dir, command, args...)
 }
 
+// RunEnv gives GroupRunner the EnvRunner contract: process-group kill semantics
+// PLUS extra KEY=VALUE env vars appended to the inherited environment. It is what
+// the #732 chat relay uses to inject a moot seat's GITMOOT_CHAT_RELAY[_AUTH] into
+// the runtime subprocess without losing whole-tree cancellation. A nil/empty env
+// is byte-identical to Run.
+func (GroupRunner) RunEnv(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error) {
+	return RunGroupEnv(ctx, dir, env, command, args...)
+}
+
 // RunStream gives GroupRunner the StreamRunner contract: process-group kill
 // semantics PLUS a live line-tee of the child's stdout/stderr to out. It is what
 // TeeRunner{} defaults to, so teeing a runtime adapter's output into a per-job
@@ -43,7 +53,17 @@ func (GroupRunner) LookPath(file string) (string, error) {
 // group, Go's WaitDelay reaps a stuck main child after the grace period, and a
 // final best-effort SIGKILL sweeps any group members that ignored SIGTERM.
 func RunGroup(ctx context.Context, dir string, command string, args ...string) (Result, error) {
+	return RunGroupEnv(ctx, dir, nil, command, args...)
+}
+
+// RunGroupEnv is RunGroup with extra KEY=VALUE env vars appended to the inherited
+// environment. A nil extraEnv leaves cmd.Env unset (the child inherits os.Environ
+// exactly as RunGroup did), so the env path is byte-identical when unused.
+func RunGroupEnv(ctx context.Context, dir string, extraEnv []string, command string, args ...string) (Result, error) {
 	cmd, sweep := newGroupCmd(ctx, dir, command, args)
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

@@ -59,6 +59,11 @@ type localAgentDispatchRequest struct {
 	// empty for every other dispatch, so the enqueued payload is byte-identical.
 	ThreadID      string
 	ChatMessageID string
+	// MootSeat marks a `gitmoot moot` conversing seat (#732). Set ONLY by the moot
+	// dispatch — never by `chat task` or any other chat-linked dispatch — so only a
+	// real seat is elevated + relay-injected by the daemon. Additive: false leaves
+	// the enqueued payload byte-identical.
+	MootSeat bool
 	// JSONOutput is true when the caller will emit machine-readable JSON (e.g.
 	// `agent ask --json`). The live-A/B interceptor (#482) MUST stay byte-clean for
 	// these consumers: it never presents the A/B block (which would prepend
@@ -202,6 +207,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		TemplateOverride:       recipeTemplate,
 		ThreadID:               request.ThreadID,
 		ChatMessageID:          request.ChatMessageID,
+		MootSeat:               request.MootSeat,
 	})
 	if err != nil {
 		return localAgentJobOutput{}, err

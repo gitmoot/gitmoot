@@ -87,6 +87,29 @@ func (t TeeRunner) LookPath(file string) (string, error) {
 	return t.inner().LookPath(file)
 }
 
+// EnvInjectingRunner wraps GroupRunner to always append Env (KEY=VALUE entries)
+// to the runtime subprocess environment while preserving process-group kill. The
+// #732 daemon dispatches a moot seat's runtime adapter with one of these so the
+// seat's GITMOOT_CHAT_RELAY[_AUTH] reaches its `gitmoot chat send/wait` subprocess
+// — ONLY for moot seats; a normal job's adapter keeps a nil runner (plain
+// GroupRunner) and is byte-identical. Env is applied on every Run/RunEnv call.
+type EnvInjectingRunner struct {
+	Env []string
+}
+
+func (r EnvInjectingRunner) Run(ctx context.Context, dir string, command string, args ...string) (Result, error) {
+	return RunGroupEnv(ctx, dir, r.Env, command, args...)
+}
+
+func (r EnvInjectingRunner) RunEnv(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error) {
+	merged := append(append([]string{}, r.Env...), env...)
+	return RunGroupEnv(ctx, dir, merged, command, args...)
+}
+
+func (r EnvInjectingRunner) LookPath(file string) (string, error) {
+	return exec.LookPath(file)
+}
+
 // SyncWriter serializes writes to w. Stream tees and any sibling writers
 // (e.g. a heartbeat ticker) sharing one destination should share one
 // SyncWriter, since destinations like bytes.Buffer are not safe for

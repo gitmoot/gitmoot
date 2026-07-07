@@ -377,6 +377,33 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	// the leaf helpers (a revert of this wiring would otherwise stay green).
 	defer daemonRunStartupReconcile(ctx, *home, os.Args, stdout)()
 
+	// #732 chat relay: start a daemon-owned unix-socket relay so a sandboxed moot
+	// seat (whose read-only home blocks a direct `gitmoot chat send`) can route
+	// send/wait to THIS daemon, which owns the store unsandboxed. It uses a
+	// dedicated store bound to the daemon ctx (the per-repo supervisors open their
+	// own stores per pass) and is torn down on ctx.Done. Best-effort: a relay start
+	// failure never blocks the daemon — a moot simply degrades to the pre-#732
+	// parallel-conclusions behavior.
+	if relayPaths, perr := initializedPaths(*home); perr != nil {
+		writeLine(stdout, "daemon: chat relay disabled (paths unavailable): %v", perr)
+	} else if relayStore, serr := db.Open(relayPaths.Database); serr != nil {
+		writeLine(stdout, "daemon: chat relay disabled (store unavailable): %v", serr)
+	} else {
+		relay := newChatRelayServer(relayStore, chatRelaySocketDir(relayPaths.Home), stdout)
+		if rerr := relay.Start(ctx); rerr != nil {
+			writeLine(stdout, "daemon: chat relay disabled: %v", rerr)
+			_ = relayStore.Close()
+		} else {
+			setActiveChatRelayServer(relay)
+			writeLine(stdout, "daemon: chat relay listening at %s", relay.SocketPath())
+			go func() {
+				<-ctx.Done()
+				setActiveChatRelayServer(nil)
+				_ = relayStore.Close()
+			}()
+		}
+	}
+
 	if *repoFlag == "" {
 		err := runRegisteredRepoSupervisor(ctx, *home, live, *dryRun, *watchSkillOptReviews, *watchIssues, session, stdout)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -2985,6 +3012,13 @@ type jobWorker struct {
 	// a config file / webhook. When nil (production), eventSink() resolves the
 	// shared process-global webhook sink from [events] config instead.
 	EventSinkOverride events.Sink
+	// RelayServer is the daemon's #732 chat relay. When non-nil AND a job payload is
+	// a `gitmoot moot` seat (payload.MootSeat), run() mints a per-seat token on it and
+	// injects GITMOOT_CHAT_RELAY[_AUTH] into the seat's runtime subprocess so the
+	// sandboxed seat's `gitmoot chat send/wait` routes through the (unsandboxed)
+	// daemon. nil (foreground CLI, and every non-daemon construction) means no relay
+	// injection — the job's adapter is byte-identical to pre-#732.
+	RelayServer *chatRelayServer
 	// AuthProbe is the injected doctor-style live credential probe (#532 slice B).
 	// It gates re-dispatch of a runtime_auth deferral: once the coarse hold elapses
 	// the scheduler only releases the job when the probe reports the credential is
@@ -3156,6 +3190,7 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 		configHomeExplicit = true
 	}
 	worker := jobWorker{Store: store, Stdout: stdout, ConfigHome: configHome, ConfigHomeExplicit: configHomeExplicit}
+	worker.RelayServer = activeChatRelayServer()
 	worker.AdapterFactory = worker.defaultAdapter
 	worker.StartAdapterFactory = worker.defaultStartAdapter
 	worker.CheckoutValidator = worker.defaultCheckout
@@ -5020,7 +5055,23 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
 		return nil
 	}
-	adapter, err := w.AdapterFactory(agent, checkout)
+	// #732 moot-seat relay injection: a `gitmoot moot` SEAT (payload.MootSeat) must
+	// converse via `gitmoot chat send/wait` mid-run, but its runtime sandbox makes
+	// the home read-only. buildSeatAwareAdapter mints a per-seat token bound to
+	// (agent, thread), builds the adapter with an env-injecting runner so the seat's
+	// runtime subprocess inherits GITMOOT_CHAT_RELAY[_AUTH] and routes those writes
+	// to this daemon, AND — only when it actually injects that relay env — elevates
+	// the agent to ChatSeat (a codex seat then gets workspace-write+network to reach
+	// the socket; the home stays read-only, so the relay does the write). Coupling
+	// the elevation to real injection is deliberate: a seat is NEVER left with the
+	// extra codex privilege but no working relay (the pre-#732-review bug). Gating on
+	// MootSeat — not ThreadID — keeps chat-task promotions and ThreadID-carrying
+	// continuations/children byte-identical (unelevated, no relay env). The token is
+	// released on every exit path so it cannot be replayed after the seat ends.
+	adapter, relayToken, err := w.buildSeatAwareAdapter(&agent, checkout, payload)
+	if relayToken != "" {
+		defer w.RelayServer.ReleaseSeat(relayToken)
+	}
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -6447,6 +6498,55 @@ func (w jobWorker) refreshImplementedPayloadForRetry(ctx context.Context, job db
 
 func (w jobWorker) defaultAdapter(agent runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
 	return buildRuntimeAdapter(agent, checkout, nil)
+}
+
+// buildSeatAwareAdapter builds the job's runtime adapter, injecting the #732 chat
+// relay env for a `gitmoot moot` SEAT (payload.MootSeat) when a relay is running.
+// For a seat that gets a working relay it mints a per-seat token bound to (agent,
+// thread), returns an adapter whose runner appends GITMOOT_CHAT_RELAY[_AUTH] to the
+// runtime subprocess env, and — only then — sets agent.ChatSeat so a codex seat is
+// elevated to workspace-write+network to reach the socket. It takes *agent so this
+// elevation propagates to the agent that RunJob delivers. Elevation is coupled to
+// injection on PURPOSE: a seat is never granted the extra codex privilege without a
+// working relay to use it (a no-relay / mint-failure seat stays unelevated and
+// degrades to a job_result conclusion, exactly like a non-seat). For every non-seat
+// job (or when no relay is running) it returns the byte-identical AdapterFactory
+// adapter, no elevation, and an empty token.
+//
+// NOTE: moot seats are dispatched WITHOUT cockpit (runMoot sets no Cockpit flag),
+// so the cockpit adapter-rebuild path in run() — which would replace this adapter
+// and drop the env runner — never fires for a seat. If that ever changes, thread
+// the relay env into the cockpit rebuild too.
+func (w jobWorker) buildSeatAwareAdapter(agent *runtime.Agent, checkout string, payload workflow.JobPayload) (workflow.DeliveryAdapter, string, error) {
+	if w.RelayServer == nil || !payload.MootSeat || strings.TrimSpace(payload.ThreadID) == "" {
+		adapter, err := w.AdapterFactory(*agent, checkout)
+		return adapter, "", err
+	}
+	token, err := w.RelayServer.RegisterSeat(agent.Name, payload.ThreadID)
+	if err != nil {
+		// Fail-open: without a token the seat cannot relay, but a normal adapter
+		// still lets the seat run (and degrade to a job_result conclusion). Leave the
+		// agent UNELEVATED — elevation without a relay buys nothing and would leave a
+		// codex seat with write+network it cannot use. Do not fail the job over a mint
+		// error.
+		writeLine(w.Stdout, "job seat %s relay token mint failed: %v", agent.Name, err)
+		adapter, aerr := w.AdapterFactory(*agent, checkout)
+		return adapter, "", aerr
+	}
+	relayEnv := []string{
+		chatRelayEnvSocket + "=" + w.RelayServer.SocketPath(),
+		chatRelayEnvToken + "=" + token,
+	}
+	// Elevate ONLY now that the seat will get a working relay env (see the coupling
+	// rationale above). Mutates the caller's agent so RunJob delivers with ChatSeat.
+	agent.ChatSeat = true
+	adapter, err := buildRuntimeAdapter(*agent, checkout, subprocess.EnvInjectingRunner{Env: relayEnv})
+	if err != nil {
+		agent.ChatSeat = false
+		w.RelayServer.ReleaseSeat(token)
+		return nil, "", err
+	}
+	return adapter, token, nil
 }
 
 // buildRuntimeAdapter constructs the concrete runtime adapter for a job. A nil

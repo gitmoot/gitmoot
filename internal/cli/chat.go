@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -341,81 +342,46 @@ func runChatSend(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	authorKind := db.ChatAuthorKindHuman
-	authorName := "human"
-	if a := strings.TrimSpace(*as); a != "" {
-		authorKind = db.ChatAuthorKindAgent
-		authorName = a
+	params := chatSendParams{
+		Ref:  ref,
+		Repo: strings.TrimSpace(*repo),
+		As:   strings.TrimSpace(*as),
+		Body: body,
+		Refs: refs,
 	}
 
-	var out chatMessageOutput
-	if err := withStore(*home, func(store *db.Store) error {
+	var (
+		out      chatMessageOutput
+		warnings []string
+	)
+	// Relay branch (#732): inside a sandboxed agent (moot seat) the gitmoot home is
+	// read-only, so a direct store write fails. When GITMOOT_CHAT_RELAY is set the
+	// daemon injected a socket path + auth token, so route the send over the socket
+	// and let the (unsandboxed) daemon perform the DB write. A human/CLI without the
+	// env set takes the byte-identical direct path below.
+	if sock := os.Getenv(chatRelayEnvSocket); sock != "" {
+		msg, w, err := chatRelaySendClient(sock, os.Getenv(chatRelayEnvToken), params)
+		if err != nil {
+			fmt.Fprintf(stderr, "chat send: %v\n", err)
+			return 1
+		}
+		out = msg
+		warnings = w
+	} else if err := withStore(*home, func(store *db.Store) error {
 		ctx := context.Background()
-		thread, err := resolveChatThread(ctx, store, ref, strings.TrimSpace(*repo))
+		msg, w, err := chatSendViaStore(ctx, store, params)
 		if err != nil {
 			return err
 		}
-		if thread.State == db.ChatThreadStateArchived {
-			return fmt.Errorf("thread %q is archived; reopen it before sending", thread.Slug)
-		}
-		if authorKind == db.ChatAuthorKindAgent {
-			if _, err := store.GetAgent(ctx, authorName); err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					return fmt.Errorf("agent %q not found (use a registered agent for --as)", authorName)
-				}
-				return err
-			}
-			// Moot cap HARD-STOP (#534 V1.5): once a moot thread has reached its
-			// agent-message cap, refuse further agent-authored turns and post ONE
-			// idempotent visible overrun message. Human sends and the seats' final
-			// job_result conclusions are never blocked by this gate.
-			if err := enforceMootSendCap(ctx, store, thread); err != nil {
-				return err
-			}
-		}
-		mentions := mention.Parse(body)
-		msg, err := store.AddChatMessage(ctx, db.ChatMessage{
-			ThreadID:   thread.ID,
-			AuthorKind: authorKind,
-			AuthorName: authorName,
-			Kind:       db.ChatKindChat,
-			Body:       body,
-			Mentions:   mentions,
-			Refs:       refsToChatRefs(refs, thread.Repo),
-		})
-		if err != nil {
-			return err
-		}
-		// Resolve each mention against the registry: known -> unread inbox row;
-		// unknown -> recorded resolved=0 for audit + a stderr warning. A bad
-		// mention NEVER fails the send.
-		mentionRows := make([]db.ChatMention, 0, len(mentions))
-		for _, name := range mentions {
-			known := true
-			if _, err := store.GetAgent(ctx, name); err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					known = false
-					fmt.Fprintf(stderr, "warning: @%s is not a registered agent; mention recorded but not delivered\n", name)
-				} else {
-					return err
-				}
-			}
-			mentionRows = append(mentionRows, db.ChatMention{
-				MessageID: msg.ID,
-				ThreadID:  thread.ID,
-				Agent:     name,
-				Resolved:  known,
-				Unread:    true,
-			})
-		}
-		if err := store.AddChatMentions(ctx, mentionRows); err != nil {
-			return err
-		}
-		out = chatMessageFromDB(msg)
+		out = msg
+		warnings = w
 		return nil
 	}); err != nil {
 		fmt.Fprintf(stderr, "chat send: %v\n", err)
 		return 1
+	}
+	for _, w := range warnings {
+		fmt.Fprintln(stderr, w)
 	}
 	if *jsonOut {
 		_ = writeJSON(stdout, out)
@@ -520,7 +486,29 @@ func runChatWait(args []string, stdout, stderr io.Writer) int {
 		lastSeq    = *sinceSeq
 		capReached bool
 	)
-	if err := withStore(*home, func(store *db.Store) error {
+	// Relay branch (#732): a sandboxed seat's home is read-only, but even READS go
+	// through the daemon here for uniformity — the daemon injected GITMOOT_CHAT_RELAY.
+	// The daemon handler returns ONE snapshot per call; the poll/deadline loop lives
+	// client-side so the visible behavior + output are byte-identical to the direct
+	// path. A human/CLI without the env set takes the direct store path below.
+	if sock := os.Getenv(chatRelayEnvSocket); sock != "" {
+		token := os.Getenv(chatRelayEnvToken)
+		deadline := time.Now().Add(*timeout)
+		for {
+			snap, err := chatRelayWaitClient(sock, token, ref, strings.TrimSpace(*repo), *sinceSeq)
+			if err != nil {
+				fmt.Fprintf(stderr, "chat wait: %v\n", err)
+				return 1
+			}
+			newMsgs = snap.Messages
+			lastSeq = snap.LastSeq
+			capReached = snap.CapReached
+			if len(newMsgs) > 0 || capReached || !time.Now().Before(deadline) {
+				break
+			}
+			time.Sleep(chatWaitPollInterval)
+		}
+	} else if err := withStore(*home, func(store *db.Store) error {
 		ctx := context.Background()
 		thread, err := resolveChatThread(ctx, store, ref, strings.TrimSpace(*repo))
 		if err != nil {
@@ -528,34 +516,13 @@ func runChatWait(args []string, stdout, stderr io.Writer) int {
 		}
 		deadline := time.Now().Add(*timeout)
 		for {
-			msgs, err := store.ListChatMessages(ctx, thread.ID, 0)
+			snap, err := chatWaitSnapshot(ctx, store, thread, *sinceSeq)
 			if err != nil {
 				return err
 			}
-			newMsgs = newMsgs[:0]
-			lastSeq = *sinceSeq
-			for _, m := range msgs {
-				if m.Seq > lastSeq {
-					lastSeq = m.Seq
-				}
-				if m.Seq > *sinceSeq {
-					newMsgs = append(newMsgs, chatMessageFromDB(m))
-				}
-			}
-			// Moot cap signalling is independent of new messages: a capped moot with
-			// no fresh turn still tells the seat to wrap up.
-			isMoot, messageCap, err := store.ChatThreadMoot(ctx, thread.ID)
-			if err != nil {
-				return err
-			}
-			capReached = false
-			if isMoot && messageCap > 0 {
-				count, err := store.CountChatMootMessages(ctx, thread.ID)
-				if err != nil {
-					return err
-				}
-				capReached = count >= messageCap
-			}
+			newMsgs = snap.Messages
+			lastSeq = snap.LastSeq
+			capReached = snap.CapReached
 			if len(newMsgs) > 0 || capReached || !time.Now().Before(deadline) {
 				return nil
 			}
@@ -1059,6 +1026,138 @@ func chatMessageFromDB(m db.ChatMessage) chatMessageOutput {
 		AuthorOrigin: m.AuthorOrigin, Kind: m.Kind, Body: m.Body, Mentions: m.Mentions,
 		Refs: m.Refs, ReplyTo: m.ReplyTo, PromotedJobID: m.PromotedJobID,
 	}
+}
+
+// chatSendParams is the resolved input to a `chat send`, shared by the direct CLI
+// path and the #732 daemon relay handler so both run the SAME validated store
+// closure (archived refusal, --as registration, moot cap hard-stop, mentions).
+type chatSendParams struct {
+	Ref  string // thread id or slug
+	Repo string // optional repo scope to disambiguate a slug
+	As   string // author as this registered agent; "" => human
+	Body string
+	Refs chatRefFlags
+}
+
+// chatSendViaStore is the EXACT `chat send` store transaction (#732 extraction):
+// resolve the thread, refuse an archived thread, validate an --as agent + enforce
+// the moot cap, append the message, then resolve mentions (unknown -> a returned
+// warning string, never a failure). It returns the created message plus any
+// non-fatal mention warnings so the caller prints them to stderr. Both the direct
+// CLI path (runChatSend) and the relay handler call it, so the gate is single-sourced.
+func chatSendViaStore(ctx context.Context, store *db.Store, p chatSendParams) (chatMessageOutput, []string, error) {
+	thread, err := resolveChatThread(ctx, store, p.Ref, strings.TrimSpace(p.Repo))
+	if err != nil {
+		return chatMessageOutput{}, nil, err
+	}
+	if thread.State == db.ChatThreadStateArchived {
+		return chatMessageOutput{}, nil, fmt.Errorf("thread %q is archived; reopen it before sending", thread.Slug)
+	}
+	authorKind := db.ChatAuthorKindHuman
+	authorName := "human"
+	if a := strings.TrimSpace(p.As); a != "" {
+		authorKind = db.ChatAuthorKindAgent
+		authorName = a
+	}
+	if authorKind == db.ChatAuthorKindAgent {
+		if _, err := store.GetAgent(ctx, authorName); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return chatMessageOutput{}, nil, fmt.Errorf("agent %q not found (use a registered agent for --as)", authorName)
+			}
+			return chatMessageOutput{}, nil, err
+		}
+		// Moot cap HARD-STOP (#534 V1.5): once a moot thread has reached its
+		// agent-message cap, refuse further agent-authored turns and post ONE
+		// idempotent visible overrun message. Human sends and the seats' final
+		// job_result conclusions are never blocked by this gate.
+		if err := enforceMootSendCap(ctx, store, thread); err != nil {
+			return chatMessageOutput{}, nil, err
+		}
+	}
+	mentions := mention.Parse(p.Body)
+	msg, err := store.AddChatMessage(ctx, db.ChatMessage{
+		ThreadID:   thread.ID,
+		AuthorKind: authorKind,
+		AuthorName: authorName,
+		Kind:       db.ChatKindChat,
+		Body:       p.Body,
+		Mentions:   mentions,
+		Refs:       refsToChatRefs(p.Refs, thread.Repo),
+	})
+	if err != nil {
+		return chatMessageOutput{}, nil, err
+	}
+	// Resolve each mention against the registry: known -> unread inbox row;
+	// unknown -> recorded resolved=0 for audit + a returned warning. A bad
+	// mention NEVER fails the send.
+	var warnings []string
+	mentionRows := make([]db.ChatMention, 0, len(mentions))
+	for _, name := range mentions {
+		known := true
+		if _, err := store.GetAgent(ctx, name); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				known = false
+				warnings = append(warnings, fmt.Sprintf("warning: @%s is not a registered agent; mention recorded but not delivered", name))
+			} else {
+				return chatMessageOutput{}, nil, err
+			}
+		}
+		mentionRows = append(mentionRows, db.ChatMention{
+			MessageID: msg.ID,
+			ThreadID:  thread.ID,
+			Agent:     name,
+			Resolved:  known,
+			Unread:    true,
+		})
+	}
+	if err := store.AddChatMentions(ctx, mentionRows); err != nil {
+		return chatMessageOutput{}, nil, err
+	}
+	return chatMessageFromDB(msg), warnings, nil
+}
+
+// chatWaitResult is one `chat wait` snapshot: the messages with seq > since, the
+// highest seq seen, and whether the moot cap is reached. It is shared by the
+// direct poll loop and the #732 relay (the daemon returns one snapshot per call;
+// the client loops).
+type chatWaitResult struct {
+	Messages   []chatMessageOutput `json:"messages"`
+	LastSeq    int64               `json:"last_seq"`
+	CapReached bool                `json:"cap_reached"`
+}
+
+// chatWaitSnapshot is one non-blocking `chat wait` poll against the store: it
+// returns the new messages (seq > sinceSeq), the max seq, and the moot cap state.
+// The blocking poll loop that repeats it until a new message / cap / deadline
+// lives in the caller (byte-identical for direct + relay).
+func chatWaitSnapshot(ctx context.Context, store *db.Store, thread db.ChatThread, sinceSeq int64) (chatWaitResult, error) {
+	msgs, err := store.ListChatMessages(ctx, thread.ID, 0)
+	if err != nil {
+		return chatWaitResult{}, err
+	}
+	res := chatWaitResult{LastSeq: sinceSeq}
+	for _, m := range msgs {
+		if m.Seq > res.LastSeq {
+			res.LastSeq = m.Seq
+		}
+		if m.Seq > sinceSeq {
+			res.Messages = append(res.Messages, chatMessageFromDB(m))
+		}
+	}
+	// Moot cap signalling is independent of new messages: a capped moot with
+	// no fresh turn still tells the seat to wrap up.
+	isMoot, messageCap, err := store.ChatThreadMoot(ctx, thread.ID)
+	if err != nil {
+		return chatWaitResult{}, err
+	}
+	if isMoot && messageCap > 0 {
+		count, err := store.CountChatMootMessages(ctx, thread.ID)
+		if err != nil {
+			return chatWaitResult{}, err
+		}
+		res.CapReached = count >= messageCap
+	}
+	return res, nil
 }
 
 // resolveChatThread turns a user-supplied <thread> (a thread id OR a slug) into a

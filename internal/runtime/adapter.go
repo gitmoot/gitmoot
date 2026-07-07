@@ -59,6 +59,18 @@ type Agent struct {
 	// per-job cost. Never set for long-lived registered agents, whose sessions
 	// span many jobs. In-memory only; not persisted on the agents table.
 	SingleUseSession bool
+	// ChatSeat marks a moot/chat SEAT job (#732): its whole purpose is to converse
+	// via `gitmoot chat send/wait`, which under the default read-only codex sandbox
+	// cannot even reach the daemon relay unix socket (the read-only seccomp filter
+	// blocks the connect() syscall itself, regardless of the socket's path). A seat
+	// is therefore dispatched with codex workspace-write + network_access=true so it
+	// can reach the socket; the gitmoot home stays OUTSIDE workspace-write's
+	// writable roots ([workdir, /tmp, $TMPDIR]), so the read-only-home invariant is
+	// preserved — the relay, not the seat, performs the DB write. The daemon sets
+	// this in-memory for a `gitmoot moot` seat (payload.MootSeat) — and ONLY when it
+	// also injects a working relay env, so a seat is never elevated without a relay;
+	// never persisted.
+	ChatSeat bool
 	// WorkingDir is the resolved filesystem checkout directory the runtime
 	// adapter should chdir into for a delivery. It is DISTINCT from RepoScope,
 	// which stays in "owner/repo" form (and is validated as such). Callers that
@@ -600,6 +612,16 @@ func effectiveModel(agent Agent, job Job) string {
 }
 
 func codexSandboxArgs(agent Agent) []string {
+	// #732: a moot/chat seat must reach the daemon chat-relay unix socket, but a
+	// codex read-only sandbox blocks the connect() syscall itself (empirically
+	// probed on codex-cli 0.142.4 bubblewrap+seccomp). Dispatch the seat with
+	// workspace-write + network so it can connect; the gitmoot home is NOT in
+	// workspace-write's writable roots (workdir + /tmp + $TMPDIR), so the home stays
+	// read-only — the relay, not the seat, does the write. This is self-contained
+	// (does not depend on the operator's global ~/.codex/config.toml).
+	if agent.ChatSeat {
+		return []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"}
+	}
 	switch NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
 	case AutonomyPolicyReadOnly:
 		return []string{"--sandbox", "read-only"}

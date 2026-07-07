@@ -255,6 +255,10 @@ func runMoot(args []string, stdout, stderr io.Writer) int {
 				Home:          *home,
 				ThreadID:      thread.ID,
 				ChatMessageID: announce.ID,
+				// The ONLY dispatch that flags a conversing seat (#732): the daemon
+				// relay-injects + elevates strictly on this, never on ThreadID (which
+				// chat-task promotions + continuations also carry).
+				MootSeat: true,
 			})
 			if derr != nil {
 				out.Seats = append(out.Seats, mootSeatOutput{Agent: a, Error: derr.Error()})

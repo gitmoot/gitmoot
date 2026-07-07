@@ -284,6 +284,39 @@ func TestCodexStartCommandAppliesAutonomyPolicy(t *testing.T) {
 	}
 }
 
+// TestCodexDeliverChatSeatSandbox pins the #732 sandbox override: a moot/chat
+// seat (ChatSeat=true) is dispatched workspace-write + network_access=true — the
+// only substrate that can reach the daemon chat-relay unix socket — REGARDLESS of
+// the agent's stored read-only policy, so it can connect while its gitmoot home
+// stays read-only (outside workspace-write's writable roots).
+func TestCodexDeliverChatSeatSandbox(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "ok"}}}
+	adapter := CodexAdapter{Runner: runner}
+	agent := Agent{
+		Name: "planner", Role: "planner", Runtime: CodexRuntime, RepoScope: "jerryfane/gitmoot",
+		RuntimeRef: "last", AutonomyPolicy: AutonomyPolicyReadOnly, ChatSeat: true,
+	}
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "converse"}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	runner.want(t, 0, "codex", "exec", "--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "--json", "resume", "--last", "--", "converse")
+}
+
+// TestCodexDeliverNonSeatSandboxUnchanged proves a NON-seat read-only job keeps
+// the exact pre-#732 read-only sandbox args (byte-identical).
+func TestCodexDeliverNonSeatSandboxUnchanged(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "ok"}}}
+	adapter := CodexAdapter{Runner: runner}
+	agent := Agent{
+		Name: "planner", Role: "planner", Runtime: CodexRuntime, RepoScope: "jerryfane/gitmoot",
+		RuntimeRef: "last", AutonomyPolicy: AutonomyPolicyReadOnly,
+	}
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "converse"}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	runner.want(t, 0, "codex", "exec", "--sandbox", "read-only", "--json", "resume", "--last", "--", "converse")
+}
+
 func TestCodexStartRejectsMissingThreadID(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"type":"turn.completed"}` + "\n"}}}
 	adapter := CodexAdapter{Runner: runner}

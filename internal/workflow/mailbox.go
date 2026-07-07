@@ -181,6 +181,14 @@ type JobRequest struct {
 	// daemon terminal back-link posts the result into ThreadID when it is set.
 	ThreadID      string
 	ChatMessageID string
+	// MootSeat marks the job as a `gitmoot moot` conversing SEAT (#732) — the ONLY
+	// job class whose whole purpose is to run `gitmoot chat send/wait` mid-run and
+	// therefore needs the daemon relay (and, for codex, the sandbox elevation that
+	// reaches it). It is distinct from ThreadID, which every chat-linked job carries
+	// (chat-task promotions, ask-gate coordinator continuations, delegation children
+	// inheriting it for back-linking) but which must NOT trigger seat elevation. Set
+	// only by the moot dispatch; never inherited by continuations/children.
+	MootSeat bool
 }
 
 type JobPayload struct {
@@ -236,6 +244,12 @@ type JobPayload struct {
 	// message. Additive/omitempty: a non-chat job serializes byte-identically.
 	ThreadID      string       `json:"thread_id,omitempty"`
 	ChatMessageID string       `json:"chat_message_id,omitempty"`
+	// MootSeat marks a `gitmoot moot` conversing seat (#732): the daemon elevates
+	// ONLY these jobs (codex workspace-write+network to reach the relay socket) and
+	// injects the relay env into them. Additive/omitempty so every non-seat job —
+	// including chat-task promotions and continuations that carry ThreadID — is
+	// byte-identical. Never inherited by delegation children or continuations.
+	MootSeat bool `json:"moot_seat,omitempty"`
 	RawOutputs    []string     `json:"raw_outputs,omitempty"`
 	Result        *AgentResult `json:"result,omitempty"`
 	// ResultChecks, when non-empty, carries the deterministic binary-checklist
@@ -350,6 +364,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		RiskTier:               strings.TrimSpace(request.RiskTier),
 		ThreadID:               strings.TrimSpace(request.ThreadID),
 		ChatMessageID:          strings.TrimSpace(request.ChatMessageID),
+		MootSeat:               request.MootSeat,
 	})
 	if err != nil {
 		return db.Job{}, err
