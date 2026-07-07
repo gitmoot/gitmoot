@@ -315,6 +315,16 @@ type Engine struct {
 	// agent/job pin always wins. Nil (the default) forces nothing, so delivery is
 	// byte-identical to before #652.
 	RuntimeDefaultModel func(runtimeName string) string
+	// ResultCheckMode is the resolved [workflow] result_checks policy (#526): the
+	// deterministic binary-checklist audit run on a job's parsed gitmoot_result.
+	// It is copied onto every Mailbox the engine builds (mailbox()). The zero
+	// value ("") and "off" disable the audit entirely, so an Engine built with a
+	// bare struct literal (every test, the ask/foreground path) is byte-identical;
+	// the daemon resolves the real mode (default warn) from config and sets it
+	// here. "warn" records failures as a job event + job-detail field + feed-
+	// forward row; "block" additionally fails the job via the contract-violation
+	// path.
+	ResultCheckMode ResultCheckMode
 }
 
 // DelegationTimeoutDefaults are optional fallback timeouts for child delegation
@@ -431,7 +441,7 @@ func (e Engine) now() time.Time {
 // path is byte-identical. The hook maps the terminal JobState to the event_type,
 // resolves root_id from the payload, and ships a redacted event fire-and-forget.
 func (e Engine) mailbox() Mailbox {
-	mb := Mailbox{Store: e.Store, CanaryEnabled: e.CanaryEnabled, deferBlocker: e.BlockerDeferrer, RuntimeDefaultModel: e.RuntimeDefaultModel, routerContextEnabled: e.RouterContextEnabled}
+	mb := Mailbox{Store: e.Store, CanaryEnabled: e.CanaryEnabled, deferBlocker: e.BlockerDeferrer, RuntimeDefaultModel: e.RuntimeDefaultModel, routerContextEnabled: e.RouterContextEnabled, resultCheckMode: normalizeResultCheckMode(e.ResultCheckMode)}
 	// Wire the off-by-default memory hooks (#626). When e.Memory is nil (every
 	// non-enrolled path) both hooks stay nil, so Run's prompt assembly and terminal
 	// path are byte-identical. The hooks themselves also no-op when the executor

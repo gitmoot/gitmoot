@@ -100,6 +100,12 @@ type Mailbox struct {
 	// construction site that does not opt in) no telemetry query runs and the prompt
 	// is byte-identical. Wired from Engine.RouterContextEnabled via mailbox().
 	routerContextEnabled bool
+	// resultCheckMode is the resolved [workflow] result_checks policy (#526). The
+	// zero value ("") and "off" both disable the deterministic post-parse audit,
+	// so every Mailbox built without explicitly setting it — every test, the ask/
+	// foreground path — is byte-identical. The daemon resolves the real mode
+	// (default warn) from config and wires it through Engine.ResultCheckMode.
+	resultCheckMode ResultCheckMode
 }
 
 type JobRequest struct {
@@ -217,6 +223,12 @@ type JobPayload struct {
 	HumanAnswer            string         `json:"human_answer,omitempty"`
 	RawOutputs             []string       `json:"raw_outputs,omitempty"`
 	Result                 *AgentResult   `json:"result,omitempty"`
+	// ResultChecks, when non-empty, carries the deterministic binary-checklist
+	// audit FAILURES for this job's parsed result (#526). It is the job-detail
+	// surface the dashboard and `gitmoot job show --json` read. Fully additive
+	// (omitempty): a job whose result passed every applicable check — and every
+	// job when [workflow] result_checks = off — serializes byte-identically.
+	ResultChecks []ResultCheck `json:"result_checks,omitempty"`
 	// Operational-blocker deferral context (#532, additive — all omitempty, so a
 	// job that never hit a classified blocker serializes byte-identically).
 	// BlockerClass is the last classified blocker (e.g. "runtime_auth",
@@ -709,6 +721,45 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		result.Delegations = nil
 	}
 	payload.Result = &result
+	// #526 deterministic binary-checklist audit of the parsed result. Off (the
+	// zero value and "off") => no checks run, no event, no payload field, no feed-
+	// forward row, so the terminal path is byte-identical. warn => failures are
+	// recorded (job event + job-detail field + feed-forward row) but the job still
+	// finishes on its own decision. block => a failure additionally routes the job
+	// down the same terminal path a malformed result takes (m.fail), reusing the
+	// contract-violation machinery. The audit itself is pure and LLM-free.
+	if mode := normalizeResultCheckMode(m.resultCheckMode); mode != ResultChecksOff {
+		if failed := FailedResultChecks(ResultCheckInput{Action: job.Type, IsFinalize: payload.DelegationFinalize, Result: result}); len(failed) > 0 {
+			payload.ResultChecks = failed
+			summary := SummarizeResultChecks(failed)
+			// Surface in `gitmoot job events`/`job show`. Best-effort in block mode
+			// (the fail path below is authoritative); required in warn mode so the
+			// failure is visible, hence the error is returned there.
+			if err := m.addEvent(ctx, job.ID, ResultChecksFailedEventKind, summary); err != nil && mode != ResultChecksBlock {
+				return AgentResult{}, err
+			}
+			// Feed-forward stub for SkillOpt (#526): persist the failures so the
+			// optimizer can later consume them as structured feedback. Best-effort —
+			// it must never fail the job, and it does nothing tonight beyond storing.
+			rootID := strings.TrimSpace(payload.RootJobID)
+			if rootID == "" {
+				rootID = job.ID
+			}
+			_ = m.Store.RecordResultCheckFailures(ctx, job.ID, rootID, job.Type, toDBResultCheckFailures(failed))
+			if mode == ResultChecksBlock {
+				// Persist the payload (carrying ResultChecks + Result) BEFORE failing so
+				// the job-detail surface shows exactly which checks failed, then map the
+				// audit failure onto the terminal contract-violation path via m.fail.
+				if err := m.savePayload(ctx, job.ID, payload); err != nil {
+					return AgentResult{}, err
+				}
+				if err := m.fail(ctx, job.ID, "result checks failed: "+summary); err != nil {
+					return AgentResult{}, err
+				}
+				return AgentResult{}, &ResultChecksError{Failed: failed}
+			}
+		}
+	}
 	// Shadow-log returned learnings + write any mechanical fact at job terminal
 	// (#626 WRITE path). No-op when the hook is unset or the agent is not enrolled,
 	// so the terminal path is byte-identical. Best-effort — it never fails the job.

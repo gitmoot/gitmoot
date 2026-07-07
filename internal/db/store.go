@@ -8023,4 +8023,27 @@ CREATE TABLE routing_telemetry (
 CREATE INDEX idx_routing_telemetry_repo_action ON routing_telemetry(repo, action);
 CREATE INDEX idx_routing_telemetry_created ON routing_telemetry(created_at);
 	`,
+	// #526 result-check feed-forward stub: one row per FAILED deterministic
+	// binary-checklist audit of a job's parsed gitmoot_result, stored so SkillOpt
+	// can later consume them as structured feedback. Nothing reads this table
+	// tonight beyond tests and the job-detail cross-check — there is NO SkillOpt
+	// behavior change. Pure additive append (CREATE TABLE/INDEX only, no ALTER or
+	// renumber of any prior migration): the table stays empty until [workflow]
+	// result_checks is warn/block AND a result actually fails a check, so every
+	// existing DB and every off-mode job reads byte-identically. Rows are keyed by
+	// job id (not FK-constrained) so a retried/cancelled job's history is retained;
+	// there is no GC in v1 (a failure row is tens of bytes).
+	`
+CREATE TABLE result_check_failures (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	job_id TEXT NOT NULL,
+	root_id TEXT NOT NULL DEFAULT '',
+	action TEXT NOT NULL DEFAULT '',
+	check_id TEXT NOT NULL DEFAULT '',
+	question TEXT NOT NULL DEFAULT '',
+	explanation TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_result_check_failures_job ON result_check_failures(job_id);
+	`,
 }

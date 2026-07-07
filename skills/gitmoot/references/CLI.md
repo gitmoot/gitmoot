@@ -1093,6 +1093,43 @@ such as a busy base-branch merge queue or a GitHub branch update in progress,
 are retried on the next daemon poll tick. The default poll interval is `30s`
 unless the daemon was started with a different `--poll`.
 
+## Result Checks
+
+After a daemon-run job's `gitmoot_result` is parsed, Gitmoot runs a set of
+**deterministic, LLM-free binary checks** over the parsed result (#526) — a
+contract-hygiene audit that catches results that are technically valid but vague
+or missing evidence. Each check is a yes/no question with an explanation, e.g.:
+
+- **implement** — a result whose decision is `implemented` must list its
+  `changes_made` and its `tests_run`.
+- **review** — a `changes_requested` review must carry `findings` (evidence).
+- **ask** — the answer (`summary`/`artifact_body`) must be non-empty and
+  actionable.
+- **blocked** (any action) — a `blocked` result must list actionable `needs`.
+- **coordinator finalize** — a finalize continuation must produce a substantive
+  reconciliation summary.
+
+The mode is set in `config.toml` and is **warn by default**:
+
+```toml
+[workflow]
+result_checks = "warn"   # off | warn | block (default: warn)
+```
+
+- `warn` (default) — failing checks are recorded as a `result_checks_failed`
+  job event (visible in `gitmoot job events <id>` and `gitmoot job show <id>`)
+  and attached to the job detail (`job show --json` `payload.result_checks`, and
+  the web dashboard), but the job still finishes on its own decision.
+- `block` — a failing check additionally fails the job through the same terminal
+  path a malformed result takes (opt-in, for strict workflows).
+- `off` — the audit is disabled entirely, restoring byte-identical pre-feature
+  behavior (no event, no payload field, no stored record).
+
+A result that passes every applicable check records nothing, so the audit is
+quiet on healthy jobs. Failed checks are also stored durably so a later SkillOpt
+pass can consume them as structured feedback; there is no SkillOpt behavior
+change today.
+
 ## SkillOpt Exchange
 
 ```sh

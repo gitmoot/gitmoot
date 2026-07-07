@@ -414,6 +414,8 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 			// Registry default_model behavioral fallback (#652), home-aware and
 			// fail-open — see daemonWorkflowEngine. Empty by default => byte-identical.
 			RuntimeDefaultModel: runtimeDefaultModelResolver(*home),
+			// Result-check audit (#526), home-aware and fail-safe to the default warn.
+			ResultCheckMode: resultChecksMode(*home),
 		}
 		// Honor the opt-in [orchestrate] policy (artifact-body inlining + per-root
 		// delegation token budget) on this single-repo engine too; fail-safe to the
@@ -6617,6 +6619,13 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 		// empty by default, so with no config NO model is forced and delivery is
 		// byte-identical; an agent/job --model always wins.
 		RuntimeDefaultModel: runtimeDefaultModelResolver(home),
+		// Off-restores-byte-identical result-check audit (#526): the deterministic
+		// binary-checklist audit of a job's parsed gitmoot_result. resultChecksMode
+		// resolves the [workflow] result_checks knob (default warn) from the
+		// home-aware config; result_checks = off restores the exact pre-feature
+		// terminal path (no event, no payload field, no feed-forward row). Fail-safe
+		// to the documented default warn on any load error.
+		ResultCheckMode: resultChecksMode(home),
 		PayloadRefresher: func(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
 			return refreshDaemonJobPayload(ctx, store, checkout, job, payload)
 		},
