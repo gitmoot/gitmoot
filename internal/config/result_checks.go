@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -78,11 +79,21 @@ func LoadResultChecksMode(paths Paths) (ResultChecksMode, error) {
 	return mode, nil
 }
 
-// ParseResultChecksMode validates and normalizes a result_checks value. The empty
+// ParseResultChecksMode validates and normalizes a result_checks value. It
+// accepts both the bare (result_checks = off) and quoted (result_checks = "off")
+// TOML styles — the docs and the default-config writer use the quoted form, which
+// matches the sibling cockpit_mode/daemon-runtime convention (see
+// parseConfigDuration) — so a quoted value is unquoted before matching. The empty
 // string falls back to the default (warn) so an operator can clear the key; any
 // other unrecognized value is an error.
 func ParseResultChecksMode(value string) (ResultChecksMode, error) {
-	switch ResultChecksMode(strings.ToLower(strings.TrimSpace(value))) {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "\"") {
+		if unquoted, err := strconv.Unquote(value); err == nil {
+			value = strings.TrimSpace(unquoted)
+		}
+	}
+	switch ResultChecksMode(strings.ToLower(value)) {
 	case "":
 		return DefaultResultChecksMode, nil
 	case ResultChecksOff:

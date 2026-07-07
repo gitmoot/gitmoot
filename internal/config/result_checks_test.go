@@ -42,6 +42,13 @@ func TestLoadResultChecksModeMatrix(t *testing.T) {
 		{"warn", ResultChecksWarn},
 		{"block", ResultChecksBlock},
 		{"  BLOCK  ", ResultChecksBlock}, // trimmed + case-insensitive
+		// Quoted TOML form — the exact style the docs and DefaultConfig writer
+		// use (result_checks = "off"). Must parse identically to the bare form,
+		// otherwise the feature cannot be disabled/blocked via the docs (#526).
+		{`"off"`, ResultChecksOff},
+		{`"warn"`, ResultChecksWarn},
+		{`"block"`, ResultChecksBlock},
+		{`  "BLOCK"  `, ResultChecksBlock}, // quoted + padded + case-insensitive
 	} {
 		paths := PathsForHome(t.TempDir())
 		if err := Initialize(paths); err != nil {
