@@ -7524,8 +7524,9 @@ implementation plans, standard goal files, agent template workflows, custom
 prompt agents, template capture, native agent chat threads, job status, or branch
 lock inspection. When the user wants agents and humans to converse in a durable
 repo thread, tag an agent, answer a paused job's question, or turn a chat message
-into a real job, use `gitmoot chat` (see CLI.md § Native Chat and WORKFLOWS.md
-§ Chat).
+into a real job, use `gitmoot chat`; to convene several agents in one bounded,
+hard-capped brainstorm, use `gitmoot moot` (see CLI.md § Native Chat and
+WORKFLOWS.md § Chat).
 
 For current-chat prompt import, "use <agent> here" or "use Gitmoot agent
 <agent> here" means import the agent's prompt into this current chat and apply
@@ -7706,7 +7707,12 @@ the agent's inbox. A message is a row (free); a job is compute (explicit) — a 
 `gitmoot chat task <thread> "@agent …" [--action ask|review|implement]` (the job's
 result is posted back into the thread), and answer a job paused at `awaiting_human`
 with `gitmoot chat answer <thread> "<question-id>: …"`. Chat is local-only (no
-network). See CLI.md § Native Chat and WORKFLOWS.md § Chat.
+network). For the agent-to-agent V1.5 layer, an enrolled agent can auto-answer an
+`@mention` via the off-by-default `[chat] auto_respond` sweep (one bounded read-only
+`ask` per mention, hard-capped), and `gitmoot moot <name> "topic" --agents a,b,c
+--repo owner/repo` convenes agents as seats in one brainstorm — one job per seat,
+hard-stopping at a message cap (`moot_max_seats` default 6, `moot_message_cap`
+default 30). See CLI.md § Native Chat (V1.5) and WORKFLOWS.md § Chat.
 
 The plugin is only the runtime discovery surface for this skill. Local agent
 invocation still goes through the `gitmoot` CLI and the same registered agent,
@@ -9673,6 +9679,78 @@ The injected block carries the same "not a benchmark" disclaimer and is only add
 to top-level (coordinator) jobs — a delegation child inherits its coordinator's
 routing decision. Routing stays advisory: the block never forces a route.
 
+### V1.5 — auto-respond, `chat wait`, and `moot`
+
+V1.5 (#534) adds the **agent-to-agent** layer on top of the V1 ledger. Both
+additions are **off by default** and keep anti-ping-pong **structural**: only a
+`kind=chat` message with a resolved mention ever triggers work, and every
+back-linked reply is a non-triggering `kind=job_result`.
+
+**Auto-respond sweep** — an opt-in daemon-tick sweep that lets an enrolled agent
+answer an `@mention` without a human running `chat task`. It enqueues **one**
+bounded read-only `ask` job per unread mention, through the same dispatch gate as
+`chat task`. It is gated three ways and is a no-op (zero chat-table queries on the
+tick) unless **both** the global switch and a per-agent opt-in are set:
+
+- Global: `[chat] auto_respond = true` (default `false`).
+- Per agent: `[agents.<name>] chat_autorespond = true` (default `false`).
+
+Bounds (all in `[chat]`, warm-reloadable per tick / on SIGHUP):
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `auto_respond` | `false` | Global kill switch; `false` overrides every per-agent opt-in. |
+| `auto_respond_cap` | `4` | HARD cap on auto-responses per (thread, agent). At the cap the sweep **hard-stops** — no auto-extension — parks the trigger, and posts **one** visible `needs a human` system message. |
+| `auto_respond_cooldown` | `2m` | Minimum spacing between auto-responses for the same (thread, agent). A trigger inside the window is deferred (left unread to re-fire), never dropped. |
+
+A dispatched reply back-links as a `job_result` and marks the trigger mention read,
+so the same mention can never double-fire; a failed enqueue leaves it unread to
+retry next tick.
+
+**`chat wait`** — a blocking read verb (the moot turn-taking primitive): it polls
+until the thread has a message with `seq > --since-seq`, then prints the new
+messages plus a `last-seq: N` line (feed `N` as the next `--since-seq`). On a capped
+moot thread it returns immediately with the wrap-up line instead of spinning to the
+timeout.
+
+```sh
+gitmoot chat wait <thread> [--since-seq N] [--timeout 90s] [--repo owner/repo] [--json]
+```
+
+**`gitmoot moot`** — convene N registered agents as **seats** in one bounded
+brainstorm. Each seat is **one** background read-only `ask` job dispatched through
+the same validate → repo-scope → capability → policy gate as `chat task`; seats
+converse in the thread by running `chat send` / `chat wait` as subprocesses, so the
+compute cost is exactly **one job per seat** regardless of how many messages they
+exchange. Messages are rows (free).
+
+```sh
+gitmoot moot <name> "topic" --agents a,b,c --repo owner/repo [--max-messages N] [--home ...] [--json]
+```
+
+- Roster validation is up front: every seat must be **registered**, **repo-scoped**,
+  and carry the **`ask`** capability, or the whole moot is rejected before any
+  thread is created or seat dispatched.
+- The moot creates (or reuses an **open**) thread named `<name>`, stamps its hard
+  cap, and posts a visible `MOOT convened` system message naming the seats + cap.
+- The moot **HARD-STOPS** at its agent-message cap (owner design decision): there is
+  **no** auto-extension. Once the thread hits the cap, `chat send --as` is refused
+  with a distinctive error and **one** visible `MOOT CAP REACHED` overrun system
+  message is posted; each seat then wraps up by returning its **partial conclusions**
+  (what it knows / is unsure of / would ask next) as its `gitmoot_result`, which
+  arrives via the `job_result` back-link path (the cap never blocks those). Human
+  sends and seat conclusions are never gated by the cap.
+
+Moot bounds (in `[chat]`, warm-reloadable):
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `moot_max_seats` | `6` | Max agents one moot may convene; a larger roster is rejected. |
+| `moot_message_cap` | `30` | Default HARD cap on agent-authored turns (overridable per-moot with `--max-messages`). |
+
+`[chat]` is entirely optional: with no `[chat]` section every knob resolves to its
+default, `auto_respond` stays off, and the daemon tick is byte-identical.
+
 ---
 
 # Source: skills/gitmoot/references/WORKFLOWS.md
@@ -10249,6 +10327,47 @@ family is available), **never** touches the promotion bandit, drops fail-safe on
 unparseable output, and its trust is **deferred to measure-the-judge (#344)**.
 `--judge-only` records only the judge row (skips the human prompt). Off ⇒
 byte-identical.
+
+## Chat
+
+Native chat (#534, V1 local-only) is a durable, repo-aware conversation ledger
+where registered agents and the human converse in threads, `@`-tag one another,
+answer a job that paused for a decision, and explicitly promote a message into
+real work. It lives entirely in gitmoot's local SQLite — zero network, zero
+entmoot dependency. The one rule that shapes everything: **a message is a row
+(free); a job is compute (explicit)**. Tagging `@codex-b` creates an inbox item;
+it does not start work. Work happens only when you explicitly `chat task`
+(promotion) or `chat answer` (the ask-gate resume), which makes runaway agent
+ping-pong structurally impossible.
+
+```sh
+# A durable, repo-scoped thread; leave an @-tagged note (starts nothing).
+gitmoot chat create release-room --repo owner/repo --topic "Release coordination"
+gitmoot chat send release-room "@codex-b can you inspect the runtime adapter?"
+gitmoot chat inbox codex-b --unread          # the mention landed here; no job ran
+
+# Promote a message into a real job — the ONE promotion verb.
+gitmoot chat task release-room "@codex-b implement the adapter" --action implement
+gitmoot chat show release-room               # promotion_request, then later the job_result
+```
+
+`chat task` requires exactly one registered `@agent`, records a
+`promotion_request`, dispatches a background job through the same validate →
+repo-scope → capability → autonomy-policy gate the daemon uses, and back-links the
+job; when the job reaches a terminal state its result is appended back into the
+thread as a `job_result` message (never promotable, never mention-scanned). An
+identical `(thread, body)` promotion that actually produced a job within a 60 s
+window is refused (anti-ping-pong); a promotion whose dispatch failed does not
+block a retry.
+
+The keystone scenario is the **ask-gate answer channel**. When an agent returns
+`human_questions[]`, the engine pauses the tree at `awaiting_human` (#445) and
+auto-links a `job-<hash>` thread carrying the questions as a `system` message.
+`gitmoot chat answer <thread> "<id>: text"` routes the answer onto the existing
+resume path (`ResolveEscalation(answer)`), enqueuing the coordinator continuation
+that carries the answer, inherits the thread link, and posts its result back into
+the same thread. Answering an already-resolved pause is a clear no-op, not a false
+success. See `CLI.md § Native Chat` for every flag.
 
 ## Execution Model
 
