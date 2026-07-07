@@ -1,6 +1,6 @@
 # Dashboard Views
 
-The web dashboard has eight views, reachable from the left nav rail (or the mobile
+The web dashboard has nine views, reachable from the left nav rail (or the mobile
 bottom tab bar). Each is described below with its screenshot. See
 [Dashboard Overview](./overview.md) for launching, routes, refresh cadences, and
 security.
@@ -203,3 +203,34 @@ blocked` to clear a backlog; set `[orchestrate].blocked_ttl` to sweep old blocke
 jobs automatically, and run `gitmoot doctor` for the environment preflight that
 warns about a blocked-job pileup. All of these are documented under
 [Jobs And Locks](../reference/cli.md#jobs-and-locks).
+
+## Needs a human
+
+Route: `/attention`
+
+Needs a human is the fleet-wide roll-up of everything parked on an **explicit human
+decision** — the one place to see what is waiting on you, grouped by the action
+required. Three buckets:
+
+- **Blocked job gates** — jobs blocked on a human-satisfiable gate (a `--need`
+  recorded against the job). Each row carries the job's title, agent, repo and PR,
+  the exact need, and how long it has been waiting. Clear one with
+  `gitmoot job gates clear <job-id> --need "<need>"`. Expand a row to see that job's
+  **failed result checks** — the deterministic checks its result failed, each with
+  the question asked and the evaluator's explanation, plus the home-wide
+  `[workflow] result_checks` policy in force (`warn` or `block`).
+- **Pending synth approvals** — synthesized SkillOpt review items awaiting the
+  human approval gate (the challenger/weak-vs-strong items, each with its question,
+  the weak→strong agents, the judge, and the score gap).
+- **Candidates awaiting promotion** — agent-template candidate versions in the
+  `pending` state, waiting to be promoted (version number and its review score).
+
+Human approval stays **explicit** for these ambiguous or high-stakes evaluator
+outcomes: the view surfaces them and links to the action, but nothing is auto-approved.
+
+The same failed-check and binary-verdict payloads back the planned Slack/media
+bridge ([#519](https://github.com/jerryfane/gitmoot/issues/519)), which needs
+compact human-action status to post into a thread. Two read-only endpoints expose
+them for bridge consumers: `GET /api/job/{id}/checks` (a job's failed result checks
++ policy mode) and `GET /api/run/{id}/verdicts` (a SkillOpt run's per-question
+binary verdicts with pass/fail counts).
