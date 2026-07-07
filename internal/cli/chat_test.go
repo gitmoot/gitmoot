@@ -9,6 +9,7 @@ import (
 
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/runtime"
+	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
 func seedChatAgent(t *testing.T, store *db.Store, name string) {
@@ -178,5 +179,265 @@ func TestChatRenameKeepsSlug(t *testing.T) {
 	}
 	if out.Name != "New Name" || out.Slug != "room" {
 		t.Fatalf("rename = %+v, want name updated and slug immutable", out)
+	}
+}
+
+func TestChatTaskPromotesSingleAgent(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	seedChatAgent(t, store, "codex-b")
+	if code := Run([]string{"chat", "create", "room", "--repo", "owner/repo", "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
+		t.Fatal("chat create failed")
+	}
+
+	var captured localAgentDispatchRequest
+	orig := chatTaskDispatch
+	chatTaskDispatch = func(ctx context.Context, store *db.Store, request localAgentDispatchRequest) (localAgentJobOutput, error) {
+		captured = request
+		return localAgentJobOutput{JobID: "job-xyz", State: "queued", Agent: request.Agent, Action: request.Action}, nil
+	}
+	defer func() { chatTaskDispatch = orig }()
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"chat", "task", "room", "@codex-b implement the adapter", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("chat task exit = %d, stderr=%s", code, stderr.String())
+	}
+	if !captured.Background || captured.RepoFlag != "owner/repo" || captured.Agent != "codex-b" || captured.Action != "ask" {
+		t.Fatalf("dispatch request = %+v, want background ask on owner/repo for codex-b", captured)
+	}
+	if captured.ThreadID == "" || captured.ChatMessageID == "" {
+		t.Fatalf("dispatch request missing chat linkage: %+v", captured)
+	}
+	if !strings.Contains(captured.Instructions, "implement the adapter") {
+		t.Fatalf("instructions missing the task body: %q", captured.Instructions)
+	}
+	// The promotion_request message was recorded and back-linked to the job.
+	thread, err := store.GetChatThreadBySlug(context.Background(), "owner/repo", "room")
+	if err != nil {
+		t.Fatalf("GetChatThreadBySlug: %v", err)
+	}
+	msgs, _ := store.ListChatMessages(context.Background(), thread.ID, 0)
+	var promo *db.ChatMessage
+	for i := range msgs {
+		if msgs[i].Kind == db.ChatKindPromotionRequest {
+			promo = &msgs[i]
+		}
+	}
+	if promo == nil {
+		t.Fatalf("no promotion_request message recorded, got %+v", msgs)
+	}
+	if promo.PromotedJobID != "job-xyz" {
+		t.Fatalf("promotion message promoted_job_id = %q, want job-xyz", promo.PromotedJobID)
+	}
+}
+
+func TestChatTaskRequiresExactlyOneAgent(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	seedChatAgent(t, store, "a")
+	seedChatAgent(t, store, "b")
+	if code := Run([]string{"chat", "create", "room", "--repo", "owner/repo", "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
+		t.Fatal("chat create failed")
+	}
+	orig := chatTaskDispatch
+	chatTaskDispatch = func(ctx context.Context, store *db.Store, request localAgentDispatchRequest) (localAgentJobOutput, error) {
+		t.Fatal("dispatch must NOT run when agent resolution fails")
+		return localAgentJobOutput{}, nil
+	}
+	defer func() { chatTaskDispatch = orig }()
+
+	// Zero registered mentions.
+	if code := Run([]string{"chat", "task", "room", "please do this", "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code != 1 {
+		t.Fatalf("chat task with no @agent should exit 1")
+	}
+	// Two registered mentions.
+	if code := Run([]string{"chat", "task", "room", "@a and @b both", "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code != 1 {
+		t.Fatalf("chat task with two @agents should exit 1")
+	}
+}
+
+// TestChatTaskIgnoresJobResultMentions proves job_result messages are never
+// addressed: a prior job_result message that mentions an agent does not make a
+// mention-less task body promotable (structural anti-ping-pong).
+func TestChatTaskIgnoresJobResultMentions(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	seedChatAgent(t, store, "codex-b")
+	if code := Run([]string{"chat", "create", "room", "--repo", "owner/repo", "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
+		t.Fatal("chat create failed")
+	}
+	thread, _ := store.GetChatThreadBySlug(context.Background(), "owner/repo", "room")
+	if _, err := store.AddChatMessage(context.Background(), db.ChatMessage{
+		ThreadID: thread.ID, AuthorKind: db.ChatAuthorKindAgent, AuthorName: "codex-b",
+		Kind: db.ChatKindJobResult, Body: "@codex-b done — see PR",
+	}); err != nil {
+		t.Fatalf("seed job_result: %v", err)
+	}
+	orig := chatTaskDispatch
+	chatTaskDispatch = func(ctx context.Context, store *db.Store, request localAgentDispatchRequest) (localAgentJobOutput, error) {
+		t.Fatal("a mention-less task body must never dispatch")
+		return localAgentJobOutput{}, nil
+	}
+	defer func() { chatTaskDispatch = orig }()
+	// The task body itself carries no @mention; the prior job_result's mention must
+	// not be scanned.
+	if code := Run([]string{"chat", "task", "room", "carry on", "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code != 1 {
+		t.Fatalf("chat task must not promote from a job_result mention")
+	}
+}
+
+func TestChatTaskDedupes(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	seedChatAgent(t, store, "codex-b")
+	if code := Run([]string{"chat", "create", "room", "--repo", "owner/repo", "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
+		t.Fatal("chat create failed")
+	}
+	calls := 0
+	orig := chatTaskDispatch
+	chatTaskDispatch = func(ctx context.Context, store *db.Store, request localAgentDispatchRequest) (localAgentJobOutput, error) {
+		calls++
+		return localAgentJobOutput{JobID: "job-1", State: "queued", Agent: request.Agent, Action: request.Action}, nil
+	}
+	defer func() { chatTaskDispatch = orig }()
+
+	if code := Run([]string{"chat", "task", "room", "@codex-b ship it", "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
+		t.Fatal("first chat task should succeed")
+	}
+	var stderr bytes.Buffer
+	if code := Run([]string{"chat", "task", "room", "@codex-b ship it", "--home", home}, &bytes.Buffer{}, &stderr); code != 1 {
+		t.Fatalf("identical second chat task should be refused, exit=%d", code)
+	}
+	if calls != 1 {
+		t.Fatalf("dispatch ran %d times, want exactly 1 (the dup was refused)", calls)
+	}
+}
+
+func TestChatAnswerRoutesToResume(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if code := Run([]string{"chat", "create", "job-thread", "--repo", "owner/repo", "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
+		t.Fatal("chat create failed")
+	}
+	thread, _ := store.GetChatThreadBySlug(context.Background(), "owner/repo", "job-thread")
+	// Simulate the ask-gate auto-link: a system message carrying the paused job ref.
+	if _, err := store.AddChatMessage(context.Background(), db.ChatMessage{
+		ThreadID: thread.ID, AuthorKind: db.ChatAuthorKindSystem, AuthorName: "system",
+		Kind: db.ChatKindSystem, Body: "- q1: which port?",
+		Refs: []db.ChatRef{{Kind: "job", Repo: "owner/repo", ID: "coord-1"}},
+	}); err != nil {
+		t.Fatalf("seed system message: %v", err)
+	}
+
+	var gotJob, gotInstr string
+	orig := chatAnswerResolveEscalation
+	chatAnswerResolveEscalation = func(ctx context.Context, store *db.Store, jobID, instructions string) error {
+		gotJob, gotInstr = jobID, instructions
+		return nil
+	}
+	defer func() { chatAnswerResolveEscalation = orig }()
+
+	var stderr bytes.Buffer
+	if code := Run([]string{"chat", "answer", "job-thread", "q1: 8080", "--home", home}, &bytes.Buffer{}, &stderr); code != 0 {
+		t.Fatalf("chat answer exit = %d, stderr=%s", code, stderr.String())
+	}
+	if gotJob != "coord-1" || gotInstr != "q1: 8080" {
+		t.Fatalf("resume routed job=%q instr=%q, want coord-1 / q1: 8080", gotJob, gotInstr)
+	}
+	// The human's answer is recorded as a durable chat message.
+	msgs, _ := store.ListChatMessages(context.Background(), thread.ID, 0)
+	found := false
+	for _, m := range msgs {
+		if m.Kind == db.ChatKindChat && m.AuthorKind == db.ChatAuthorKindHuman && strings.Contains(m.Body, "8080") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("human answer message not recorded, got %+v", msgs)
+	}
+}
+
+func TestChatAnswerWithoutLinkedJobFails(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if code := Run([]string{"chat", "create", "room", "--repo", "owner/repo", "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
+		t.Fatal("chat create failed")
+	}
+	var stderr bytes.Buffer
+	if code := Run([]string{"chat", "answer", "room", "q1: hi", "--home", home}, &bytes.Buffer{}, &stderr); code != 1 {
+		t.Fatalf("chat answer on an unlinked thread should exit 1")
+	}
+	if !strings.Contains(stderr.String(), "not linked") {
+		t.Fatalf("expected a 'not linked' error, got: %s", stderr.String())
+	}
+}
+
+func TestPostChatThreadResultBackLinksAndIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	thread, err := store.CreateChatThread(ctx, db.ChatThread{Slug: "room", Repo: "owner/repo"})
+	if err != nil {
+		t.Fatalf("CreateChatThread: %v", err)
+	}
+	// The promoting message the result should reply to.
+	promo, err := store.AddChatMessage(ctx, db.ChatMessage{
+		ThreadID: thread.ID, AuthorName: "human", Kind: db.ChatKindPromotionRequest, Body: "@codex-b go",
+	})
+	if err != nil {
+		t.Fatalf("AddChatMessage: %v", err)
+	}
+	payload := workflow.JobPayload{
+		Repo:          "owner/repo",
+		ThreadID:      thread.ID,
+		ChatMessageID: promo.ID,
+		Result:        &workflow.AgentResult{Decision: "implemented", Summary: "did the thing"},
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "job-1", Agent: "codex-b", Type: "ask", State: "succeeded", Payload: string(encoded)}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+
+	w := jobWorker{Store: store}
+	if err := w.postChatThreadResult(ctx, "job-1", runtime.Agent{Name: "codex-b", Runtime: "shell"}, nil); err != nil {
+		t.Fatalf("postChatThreadResult: %v", err)
+	}
+	msgs, _ := store.ListChatMessages(ctx, thread.ID, 0)
+	var result *db.ChatMessage
+	for i := range msgs {
+		if msgs[i].Kind == db.ChatKindJobResult {
+			result = &msgs[i]
+		}
+	}
+	if result == nil {
+		t.Fatalf("no job_result message posted, got %+v", msgs)
+	}
+	if result.AuthorKind != db.ChatAuthorKindAgent || result.AuthorName != "codex-b" {
+		t.Fatalf("job_result authored wrong: %+v", result)
+	}
+	if result.ReplyTo != promo.ID {
+		t.Fatalf("job_result reply_to = %q, want the promoting message %q", result.ReplyTo, promo.ID)
+	}
+	if !strings.Contains(result.Body, "did the thing") {
+		t.Fatalf("job_result body missing summary: %q", result.Body)
+	}
+
+	// Idempotent: a second call (retry/re-advance) posts nothing new.
+	if err := w.postChatThreadResult(ctx, "job-1", runtime.Agent{Name: "codex-b", Runtime: "shell"}, nil); err != nil {
+		t.Fatalf("postChatThreadResult (2nd): %v", err)
+	}
+	msgs2, _ := store.ListChatMessages(ctx, thread.ID, 0)
+	if len(msgs2) != len(msgs) {
+		t.Fatalf("second post added messages: %d -> %d (must be idempotent)", len(msgs), len(msgs2))
 	}
 }

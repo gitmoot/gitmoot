@@ -293,3 +293,75 @@ func TestChatThreadLifecycle(t *testing.T) {
 		t.Fatalf("reopened thread should appear in open list, got %+v", reopened)
 	}
 }
+
+// TestSetChatMessagePromotedJob proves the promotion → job back-reference write
+// (#534) and that a missing message id is a clear error.
+func TestSetChatMessagePromotedJob(t *testing.T) {
+	ctx := context.Background()
+	store := openChatTestStore(t)
+	thread, err := store.CreateChatThread(ctx, ChatThread{Slug: "room", Repo: "o/r"})
+	if err != nil {
+		t.Fatalf("CreateChatThread: %v", err)
+	}
+	msg, err := store.AddChatMessage(ctx, ChatMessage{
+		ThreadID: thread.ID, AuthorName: "human", Kind: ChatKindPromotionRequest, Body: "@a go",
+	})
+	if err != nil {
+		t.Fatalf("AddChatMessage: %v", err)
+	}
+	if err := store.SetChatMessagePromotedJob(ctx, msg.ID, "job-123"); err != nil {
+		t.Fatalf("SetChatMessagePromotedJob: %v", err)
+	}
+	got, err := store.ListChatMessages(ctx, thread.ID, 0)
+	if err != nil {
+		t.Fatalf("ListChatMessages: %v", err)
+	}
+	if len(got) != 1 || got[0].PromotedJobID != "job-123" {
+		t.Fatalf("promoted_job_id not persisted: %+v", got)
+	}
+	if err := store.SetChatMessagePromotedJob(ctx, "nope", "job-x"); err == nil {
+		t.Fatal("SetChatMessagePromotedJob on a missing message should error")
+	}
+}
+
+// TestRecentPromotionRequestExists proves the fingerprint dedupe: an identical
+// (thread, body) promotion_request is detected within the window and not across a
+// different body / thread / message kind (#534 anti-ping-pong).
+func TestRecentPromotionRequestExists(t *testing.T) {
+	ctx := context.Background()
+	store := openChatTestStore(t)
+	thread, _ := store.CreateChatThread(ctx, ChatThread{Slug: "room", Repo: "o/r"})
+	other, _ := store.CreateChatThread(ctx, ChatThread{Slug: "room2", Repo: "o/r"})
+
+	if _, err := store.AddChatMessage(ctx, ChatMessage{
+		ThreadID: thread.ID, AuthorName: "human", Kind: ChatKindPromotionRequest, Body: "@a ship it",
+	}); err != nil {
+		t.Fatalf("AddChatMessage: %v", err)
+	}
+	// A plain chat message with the same body must NOT count as a promotion.
+	if _, err := store.AddChatMessage(ctx, ChatMessage{
+		ThreadID: thread.ID, AuthorName: "human", Kind: ChatKindChat, Body: "@a ship it different",
+	}); err != nil {
+		t.Fatalf("AddChatMessage: %v", err)
+	}
+
+	dup, err := store.RecentPromotionRequestExists(ctx, thread.ID, "@a ship it", chatMinuteMs)
+	if err != nil {
+		t.Fatalf("RecentPromotionRequestExists: %v", err)
+	}
+	if !dup {
+		t.Fatal("identical promotion should be detected as a duplicate")
+	}
+	if none, _ := store.RecentPromotionRequestExists(ctx, thread.ID, "@a other body", chatMinuteMs); none {
+		t.Fatal("a different body must not dedupe")
+	}
+	if none, _ := store.RecentPromotionRequestExists(ctx, other.ID, "@a ship it", chatMinuteMs); none {
+		t.Fatal("a different thread must not dedupe")
+	}
+	// windowMs <= 0 disables the check.
+	if any, _ := store.RecentPromotionRequestExists(ctx, thread.ID, "@a ship it", 0); any {
+		t.Fatal("a zero window must disable dedupe")
+	}
+}
+
+const chatMinuteMs = 60_000

@@ -12,6 +12,7 @@ import (
 
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/mention"
+	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
 // runChat is the `gitmoot chat` command group (#534, V1 local-only): a durable,
@@ -35,6 +36,10 @@ func runChat(args []string, stdout, stderr io.Writer) int {
 		return runChatSend(args[1:], stdout, stderr)
 	case "inbox":
 		return runChatInbox(args[1:], stdout, stderr)
+	case "task":
+		return runChatTask(args[1:], stdout, stderr)
+	case "answer":
+		return runChatAnswer(args[1:], stdout, stderr)
 	case "close":
 		return runChatSetState(args[1:], stdout, stderr, db.ChatThreadStateArchived)
 	case "reopen":
@@ -57,11 +62,13 @@ func printChatUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot chat show <thread> [--repo owner/repo] [--limit N] [--json]")
 	fmt.Fprintln(w, "  gitmoot chat send <thread> \"message\" [--as agent] [--repo owner/repo] [--ref kind:value ...] [--json]")
 	fmt.Fprintln(w, "  gitmoot chat inbox <agent> [--unread] [--json]")
+	fmt.Fprintln(w, "  gitmoot chat task <thread> \"@agent message\" [--action ask|review|implement] [--repo owner/repo] [--json]")
+	fmt.Fprintln(w, "  gitmoot chat answer <thread> \"<question-id>: answer text\" [--repo owner/repo] [--json]")
 	fmt.Fprintln(w, "  gitmoot chat close|reopen <thread> [--repo owner/repo] [--json]")
 	fmt.Fprintln(w, "  gitmoot chat rename <thread> \"new name\" [--repo owner/repo] [--json]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "  <name> is the topic-path-safe slug ([a-z0-9-]); <thread> is a slug or thread id.")
-	fmt.Fprintln(w, "  A message never starts work — promotion (`chat task`) and `chat answer` are stage 2.")
+	fmt.Fprintln(w, "  A plain message never starts work — only `chat task` explicitly promotes one into a job.")
 }
 
 // slugRe is the topic-path-safe thread slug: lowercase alphanumerics with single
@@ -580,6 +587,307 @@ func runChatRename(args []string, stdout, stderr io.Writer) int {
 	writeLine(stdout, "thread: %s", out.Slug)
 	writeLine(stdout, "name: %s", out.Name)
 	return 0
+}
+
+// ---- task (promotion) ------------------------------------------------------
+
+// chatTaskContextMessages is how many recent thread messages are rendered as
+// context into a promoted job's prompt (the "last N" transcript, #534).
+const chatTaskContextMessages = 20
+
+// chatPromotionDedupeWindowMs is the fingerprint-dedupe window: an identical
+// (thread, body) promotion within this window is refused so a double-run of the
+// same `chat task` cannot fan out two jobs (#534 anti-ping-pong).
+const chatPromotionDedupeWindowMs = 60_000
+
+// chatTaskActions is the fixed set of promotable actions, mirroring the daemon /
+// session-job action vocabulary. A mention alone never executes — only these
+// explicit promotions do.
+var chatTaskActions = map[string]bool{"ask": true, "review": true, "implement": true}
+
+// chatTaskDispatch is the seam `chat task` promotes through. It defaults to the
+// real local dispatch path (the SAME Validate → GetAgent → repo-scope →
+// capability → autonomy/policy gate the daemon uses); tests override it to assert
+// the promotion gating/back-linking without spinning a runtime.
+var chatTaskDispatch = dispatchLocalAgentJob
+
+func runChatTask(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("chat task", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	repo := fs.String("repo", "", "repo scope to disambiguate a slug across repos")
+	action := fs.String("action", "ask", "promotion action: ask|review|implement")
+	jsonOut := fs.Bool("json", false, "print the enqueued job as JSON")
+	// <thread> and "@agent message" are two positionals before the flags.
+	if len(args) < 2 || args[0] == "-h" || args[0] == "--help" {
+		if len(args) >= 1 && (args[0] == "-h" || args[0] == "--help") {
+			return 0
+		}
+		fmt.Fprintln(stderr, "chat task requires a <thread> and a \"@agent message\"")
+		return 2
+	}
+	ref := strings.TrimSpace(args[0])
+	body := args[1]
+	if ref == "" || strings.HasPrefix(ref, "-") {
+		fmt.Fprintln(stderr, "chat task requires a <thread> as the first argument")
+		return 2
+	}
+	if err := fs.Parse(args[2:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "chat task accepts exactly one <thread> and one \"@agent message\"")
+		return 2
+	}
+	if strings.TrimSpace(body) == "" {
+		fmt.Fprintln(stderr, "chat task requires a non-empty message")
+		return 2
+	}
+	act := strings.ToLower(strings.TrimSpace(*action))
+	if !chatTaskActions[act] {
+		fmt.Fprintf(stderr, "chat task --action must be ask|review|implement, got %q\n", *action)
+		return 2
+	}
+
+	var out localAgentJobOutput
+	if err := withStore(*home, func(store *db.Store) error {
+		ctx := context.Background()
+		thread, err := resolveChatThread(ctx, store, ref, strings.TrimSpace(*repo))
+		if err != nil {
+			return err
+		}
+		if thread.State == db.ChatThreadStateArchived {
+			return fmt.Errorf("thread %q is archived; reopen it before promoting", thread.Slug)
+		}
+		// Resolve exactly one registered @agent from the task body. A job_result
+		// message is never the input here (the body is a fresh human-authored task,
+		// and job_result rows carry no scanned mentions), so promotion can only ever
+		// be human-initiated — the structural anti-ping-pong root.
+		agentName, err := resolveSingleTaskAgent(ctx, store, body)
+		if err != nil {
+			return err
+		}
+		// Fingerprint dedupe: refuse an identical (thread, body) promotion inside the
+		// window so a re-run cannot double-dispatch.
+		if dup, err := store.RecentPromotionRequestExists(ctx, thread.ID, body, chatPromotionDedupeWindowMs); err != nil {
+			return err
+		} else if dup {
+			return fmt.Errorf("an identical promotion was already requested in this thread within the last %ds; not re-dispatching", chatPromotionDedupeWindowMs/1000)
+		}
+
+		// Record the promotion_request message (author human) BEFORE dispatch so the
+		// thread durably shows the intent even if dispatch fails.
+		promoMsg, err := store.AddChatMessage(ctx, db.ChatMessage{
+			ThreadID:   thread.ID,
+			AuthorKind: db.ChatAuthorKindHuman,
+			AuthorName: "human",
+			Kind:       db.ChatKindPromotionRequest,
+			Body:       body,
+			Mentions:   []string{agentName},
+		})
+		if err != nil {
+			return err
+		}
+
+		instructions := renderThreadContext(ctx, store, thread, body)
+		output, derr := chatTaskDispatch(ctx, store, localAgentDispatchRequest{
+			RepoFlag:      thread.Repo,
+			Agent:         agentName,
+			Action:        act,
+			Instructions:  instructions,
+			Background:    true,
+			Home:          *home,
+			ThreadID:      thread.ID,
+			ChatMessageID: promoMsg.ID,
+		})
+		if derr != nil {
+			return derr
+		}
+		// Back-link the promoting message to the enqueued job.
+		if err := store.SetChatMessagePromotedJob(ctx, promoMsg.ID, output.JobID); err != nil {
+			return err
+		}
+		out = output
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "chat task: %v\n", err)
+		return 1
+	}
+	if *jsonOut {
+		_ = writeJSON(stdout, out)
+		return 0
+	}
+	writeLine(stdout, "promoted job: %s", out.JobID)
+	writeLine(stdout, "state: %s", out.State)
+	writeLine(stdout, "agent: %s", out.Agent)
+	writeLine(stdout, "action: %s", out.Action)
+	return 0
+}
+
+// resolveSingleTaskAgent extracts the mentions from a task body and requires
+// EXACTLY ONE that resolves to a registered agent (#534). Zero resolvable
+// mentions or more than one is a clear error — a promotion targets one agent.
+func resolveSingleTaskAgent(ctx context.Context, store *db.Store, body string) (string, error) {
+	mentions := mention.Parse(body)
+	var resolved []string
+	for _, name := range mentions {
+		if _, err := store.GetAgent(ctx, name); err == nil {
+			resolved = append(resolved, name)
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+	}
+	switch len(resolved) {
+	case 0:
+		return "", errors.New("chat task requires exactly one @agent mention that names a registered agent")
+	case 1:
+		return resolved[0], nil
+	default:
+		return "", fmt.Errorf("chat task requires exactly one registered @agent, found %d: %s", len(resolved), strings.Join(resolved, ", "))
+	}
+}
+
+// renderThreadContext renders the last chatTaskContextMessages of a thread as a
+// compact transcript, then appends the promotion task body — the prompt a
+// promoted job receives (#534). It gives the agent the conversation that led to
+// the promotion without hauling the whole (possibly long) thread.
+func renderThreadContext(ctx context.Context, store *db.Store, thread db.ChatThread, taskBody string) string {
+	var b strings.Builder
+	msgs, err := store.ListChatMessages(ctx, thread.ID, chatTaskContextMessages)
+	if err == nil && len(msgs) > 0 {
+		fmt.Fprintf(&b, "Chat thread %q (%s) — recent messages:\n", thread.Slug, thread.Repo)
+		for _, m := range msgs {
+			fmt.Fprintf(&b, "[%s] %s: %s\n", m.Kind, m.AuthorName, strings.TrimSpace(m.Body))
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("Task (promoted from the chat thread above):\n")
+	b.WriteString(strings.TrimSpace(taskBody))
+	return b.String()
+}
+
+// ---- answer (ask-gate resume) ----------------------------------------------
+
+// chatAnswerResolveEscalation is the seam `chat answer` resumes through. It calls
+// the SAME Engine.ResolveEscalation the daemon's PR-comment `answer` verb uses,
+// with the local store (a bare Store engine is sufficient — the ask-gate answer
+// path only enqueues a continuation). Tests override it to assert routing without
+// a full engine.
+var chatAnswerResolveEscalation = func(ctx context.Context, store *db.Store, jobID, instructions string) error {
+	return workflow.Engine{Store: store}.ResolveEscalation(ctx, jobID, workflow.ResumeAnswer, instructions)
+}
+
+func runChatAnswer(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("chat answer", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	repo := fs.String("repo", "", "repo scope to disambiguate a slug across repos")
+	jsonOut := fs.Bool("json", false, "print the linked job + thread as JSON")
+	// <thread> and "<id>: answer" are two positionals before the flags.
+	if len(args) < 2 || args[0] == "-h" || args[0] == "--help" {
+		if len(args) >= 1 && (args[0] == "-h" || args[0] == "--help") {
+			return 0
+		}
+		fmt.Fprintln(stderr, "chat answer requires a <thread> and a \"<question-id>: answer text\"")
+		return 2
+	}
+	ref := strings.TrimSpace(args[0])
+	body := args[1]
+	if ref == "" || strings.HasPrefix(ref, "-") {
+		fmt.Fprintln(stderr, "chat answer requires a <thread> as the first argument")
+		return 2
+	}
+	if err := fs.Parse(args[2:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "chat answer accepts exactly one <thread> and one \"<id>: answer\"")
+		return 2
+	}
+	if strings.TrimSpace(body) == "" {
+		fmt.Fprintln(stderr, "chat answer requires a non-empty answer")
+		return 2
+	}
+
+	type answerOutput struct {
+		ThreadSlug string `json:"thread_slug"`
+		JobID      string `json:"job_id"`
+	}
+	var out answerOutput
+	if err := withStore(*home, func(store *db.Store) error {
+		ctx := context.Background()
+		thread, err := resolveChatThread(ctx, store, ref, strings.TrimSpace(*repo))
+		if err != nil {
+			return err
+		}
+		jobID, err := linkedPausedJobID(ctx, store, thread.ID)
+		if err != nil {
+			return err
+		}
+		// Route the answer through the SAME resume path the daemon's PR-comment
+		// `answer` verb uses: Engine.ResolveEscalation(ResumeAnswer). It parses the
+		// "<id>: text" body via parseHumanAnswers and enqueues the coordinator
+		// continuation carrying the answer; the daemon then runs that continuation and
+		// its result back-links into this thread (the continuation inherits ThreadID).
+		if err := chatAnswerResolveEscalation(ctx, store, jobID, body); err != nil {
+			return err
+		}
+		// Record the human's answer as a durable chat message.
+		if _, err := store.AddChatMessage(ctx, db.ChatMessage{
+			ThreadID:   thread.ID,
+			AuthorKind: db.ChatAuthorKindHuman,
+			AuthorName: "human",
+			Kind:       db.ChatKindChat,
+			Body:       body,
+			Refs:       []db.ChatRef{{Kind: "job", Repo: thread.Repo, ID: jobID}},
+		}); err != nil {
+			return err
+		}
+		out = answerOutput{ThreadSlug: thread.Slug, JobID: jobID}
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "chat answer: %v\n", err)
+		return 1
+	}
+	if *jsonOut {
+		_ = writeJSON(stdout, out)
+		return 0
+	}
+	writeLine(stdout, "answered job: %s", out.JobID)
+	writeLine(stdout, "thread: %s", out.ThreadSlug)
+	return 0
+}
+
+// linkedPausedJobID finds the paused job a chat thread is the answer channel for
+// (#534): the newest `system` message carrying a {kind:job} ref names it. The
+// ask-gate auto-link (workflow.linkAskGateChatThread) posts exactly that message
+// when a job pauses at awaiting_human.
+func linkedPausedJobID(ctx context.Context, store *db.Store, threadID string) (string, error) {
+	msgs, err := store.ListChatMessages(ctx, threadID, 0)
+	if err != nil {
+		return "", err
+	}
+	jobID := ""
+	for _, m := range msgs {
+		if m.Kind != db.ChatKindSystem {
+			continue
+		}
+		for _, r := range m.Refs {
+			if r.Kind == "job" && strings.TrimSpace(r.ID) != "" {
+				jobID = strings.TrimSpace(r.ID)
+			}
+		}
+	}
+	if jobID == "" {
+		return "", errors.New("this thread is not linked to a paused job (no system message with a job ref)")
+	}
+	return jobID, nil
 }
 
 // ---- shared helpers --------------------------------------------------------

@@ -518,6 +518,38 @@ func (s *Store) InboxForAgent(ctx context.Context, agent string, unreadOnly bool
 	return entries, rows.Err()
 }
 
+// SetChatMessagePromotedJob records the job id a promotion_request message was
+// promoted into (#534). The CLI writes it after `chat task` enqueues the job, so
+// `chat show` can render the promotion → job back-reference.
+func (s *Store) SetChatMessagePromotedJob(ctx context.Context, messageID, jobID string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE chat_messages SET promoted_job_id = ? WHERE id = ?`,
+		strings.TrimSpace(jobID), strings.TrimSpace(messageID))
+	if err != nil {
+		return err
+	}
+	return chatRowsAffected(res, "chat message")
+}
+
+// RecentPromotionRequestExists reports whether an identical promotion_request
+// (same thread, same body) was recorded within the last windowMs milliseconds —
+// the structural anti-ping-pong fingerprint dedupe (#534). A promotion body
+// carries the "@agent message" verbatim, so an identical (thread, body) is an
+// identical (thread, agent, body) promotion. windowMs <= 0 disables the check.
+func (s *Store) RecentPromotionRequestExists(ctx context.Context, threadID, body string, windowMs int64) (bool, error) {
+	if windowMs <= 0 {
+		return false, nil
+	}
+	cutoff := time.Now().UTC().UnixMilli() - windowMs
+	var count int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM chat_messages WHERE thread_id = ? AND kind = ? AND body = ? AND ts_ms >= ?`,
+		strings.TrimSpace(threadID), ChatKindPromotionRequest, body, cutoff).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 // MarkThreadRead clears the unread flag on all of an agent's mentions in a
 // thread (the "I've seen this conversation" action). Returns the number of
 // mentions cleared.
