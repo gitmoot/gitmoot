@@ -6626,6 +6626,13 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 		// returns before its query, byte-identical) AND no comparator runs, so a
 		// stranded canary row can never keep serving traffic with no auto-rollback.
 		CanaryEnabled: canaryRoutingEnabled(home),
+		// Off-by-default #530 coordinator routing-context injection: when [router]
+		// context_enabled is set, the engine's Mailbox appends a bounded advisory
+		// observed-performance table to a top-level coordinator job's prompt.
+		// routerContextEnabled returns false with no config (or any load error), so
+		// with no config NO telemetry query runs during a job and prompt assembly is
+		// byte-identical. Capture (routing_telemetry rows) is always on and additive.
+		RouterContextEnabled: routerContextEnabled(home),
 	}
 	if strings.TrimSpace(home) != "" {
 		// Root delegation artifacts under GITMOOT_HOME (alongside worktrees)

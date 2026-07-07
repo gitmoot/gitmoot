@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/agenttemplate"
 	"github.com/jerryfane/gitmoot/internal/db"
@@ -93,6 +94,12 @@ type Mailbox struct {
 	// default, and any error/empty result) forces nothing, so delivery is
 	// byte-identical to before #652.
 	RuntimeDefaultModel func(runtimeName string) string
+	// routerContextEnabled gates the off-by-default #530 coordinator context block.
+	// When true, Run appends a bounded (<=12 line) observed-performance table to a
+	// TOP-LEVEL (coordinator) job's prompt. When false (the default, every
+	// construction site that does not opt in) no telemetry query runs and the prompt
+	// is byte-identical. Wired from Engine.RouterContextEnabled via mailbox().
+	routerContextEnabled bool
 }
 
 type JobRequest struct {
@@ -512,6 +519,9 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	if err := m.claim(ctx, job); err != nil {
 		return AgentResult{}, err
 	}
+	// Execution clock for #530 routing telemetry: measured from the claim (the real
+	// start of this run) to the terminal transition below. Advisory only.
+	runStart := time.Now()
 
 	registeredFreshRef := runtime.IsFreshRef(agent.RuntimeRef)
 	prompt := prompts.RenderJob(payload.prompt(job.Type))
@@ -521,6 +531,17 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	// byte-identical.
 	if m.injectMemory != nil {
 		if block := m.injectMemory(ctx, agent, payload); block != "" {
+			prompt = prompt + "\n\n" + block
+		}
+	}
+	// Append the off-by-default #530 coordinator routing-context block. Gated on the
+	// [router] context_enabled knob (routerContextEnabled) AND on the job being a
+	// top-level coordinator (no parent) — a delegation child inherits its
+	// coordinator's routing decision, so it needs no table. When the knob is off no
+	// telemetry query runs and the prompt is byte-identical; when on-but-empty the
+	// builder returns "" and the prompt is still byte-identical.
+	if m.routerContextEnabled && strings.TrimSpace(payload.ParentJobID) == "" {
+		if block := m.buildRouterContextBlock(ctx, payload); block != "" {
 			prompt = prompt + "\n\n" + block
 		}
 	}
@@ -668,6 +689,10 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	if err := m.finishWithPayload(ctx, job.ID, state, fmt.Sprintf("job %s", state), payload); err != nil {
 		return AgentResult{}, err
 	}
+	// Record advisory routing telemetry (#530) at the settled terminal state.
+	// Best-effort and fail-safe: it swallows every error internally, so a telemetry
+	// write can never turn a successfully-finished job into a failure.
+	m.recordRoutingTelemetry(ctx, job, agent, payload, result, state, time.Since(runStart))
 	return result, nil
 }
 
