@@ -38,6 +38,38 @@ func TestIsTransientMessage(t *testing.T) {
 	}
 }
 
+func TestIsDefinitiveRejectionMessage(t *testing.T) {
+	definitive := []string{
+		"gh: Validation Failed (HTTP 422)",
+		"HTTP 422: Validation Failed",
+		"HTTP 404: Not Found",
+		"HTTP 403: Resource not accessible by integration",
+		"body is too long (maximum is 65536 characters) validation failed",
+	}
+	for _, s := range definitive {
+		if !IsDefinitiveRejectionMessage(s) {
+			t.Errorf("IsDefinitiveRejectionMessage(%q) = false, want true", s)
+		}
+	}
+	ambiguous := []string{
+		"dial tcp 140.82.121.3:443: connect: connection refused",
+		"HTTP 502 Bad Gateway",
+		"HTTP 503 Service Unavailable",
+		"HTTP 504 Gateway Timeout",
+		"context deadline exceeded",
+		"signal: killed",
+		"unexpected EOF",
+		"gh: authentication required",
+		"nothing to commit",
+		"",
+	}
+	for _, s := range ambiguous {
+		if IsDefinitiveRejectionMessage(s) {
+			t.Errorf("IsDefinitiveRejectionMessage(%q) = true, want false", s)
+		}
+	}
+}
+
 func TestClassifyTransientError(t *testing.T) {
 	base := errors.New("boom: exit status 1")
 	t.Run("network signature is tagged transient and stays transparent", func(t *testing.T) {

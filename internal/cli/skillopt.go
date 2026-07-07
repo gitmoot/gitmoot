@@ -2421,11 +2421,20 @@ func continueSkillOptTrain(ctx context.Context, paths config.Paths, store *db.St
 			return skillOptTrainContinueOutput{}, err
 		}
 		updatedSummary := skillopt.BuildTrainStatusSummary(updatedSession, updatedIteration, updatedCounts)
-		lines := []string{
-			fmt.Sprintf("review: %s", result.URL),
-			fmt.Sprintf("review_repo: %s", result.Repo.FullName()),
-			fmt.Sprintf("preview_urls: %d", result.PreviewURLs),
-			"next: wait for feedback, then run train continue after sync",
+		var lines []string
+		if result.LocalSurface {
+			lines = []string{
+				"review_surface: local",
+				"review: local markdown import (feedback already imported)",
+				"next: run train continue to sync the imported feedback",
+			}
+		} else {
+			lines = []string{
+				fmt.Sprintf("review: %s", result.URL),
+				fmt.Sprintf("review_repo: %s", result.Repo.FullName()),
+				fmt.Sprintf("preview_urls: %d", result.PreviewURLs),
+				"next: wait for feedback, then run train continue after sync",
+			}
 		}
 		return skillOptTrainContinueOutput{Summary: updatedSummary, Counts: updatedCounts, ContinueReady: true, Lines: lines}, nil
 	case skillopt.TrainStateReviewPublished:
@@ -6065,6 +6074,10 @@ type skillOptTrainReviewPublishResult struct {
 	IssueNumber int64
 	URL         string
 	PreviewURLs int
+	// LocalSurface is set when the review was recorded against the local markdown
+	// surface (#738) — the human already imported feedback (TrainingReady) before
+	// the publish step, so no GitHub issue was created and no watch was registered.
+	LocalSurface bool
 }
 
 type skillOptPreviewPublication struct {
@@ -6126,12 +6139,71 @@ func autoSyncSkillOptTrainReviewFeedback(ctx context.Context, paths config.Paths
 	return lines, result.Count() > 0
 }
 
+// maybePublishSkillOptTrainReviewLocally records the review against the local
+// markdown surface and advances to review_published when the iteration's eval run
+// already reports TrainingReady — i.e. the human imported feedback locally before
+// the publish step (#738). It reports ok=true only when it took the local path.
+//
+// When feedback is not yet ready it returns (_, false, nil) so the caller falls
+// through to the byte-identical GitHub publish path. It also declines the local
+// path (returns false) when a prior GitHub post actually completed but its state
+// update was interrupted (a published_external recovery marker): that real issue
+// must be honored via recover, not shadowed by a local record. Unlike the GitHub
+// path it registers NO review watch (there is no issue to poll) and writes review
+// metadata {status: published, review_surface: local}.
+func maybePublishSkillOptTrainReviewLocally(ctx context.Context, paths config.Paths, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration) (skillOptTrainReviewPublishResult, bool, error) {
+	status, err := loadSkillOptReviewStatus(ctx, store, artifact.NewStore(paths.ArtifactBlobs), iteration.EvalRunID)
+	if err != nil {
+		return skillOptTrainReviewPublishResult{}, false, err
+	}
+	if !status.TrainingReady {
+		return skillOptTrainReviewPublishResult{}, false, nil
+	}
+	if review, ok, rerr := readSkillOptTrainReviewRecovery(paths, session, iteration); rerr == nil && ok {
+		if metadataString(review, "status") == "published_external" {
+			return skillOptTrainReviewPublishResult{}, false, nil
+		}
+	}
+	localMetadata := map[string]any{
+		"status":         "published",
+		"review_surface": "local",
+		"preview_urls":   0,
+		"published_at":   time.Now().UTC().Format(time.RFC3339Nano),
+		"source":         "gitmoot skillopt train continue",
+	}
+	session.State = skillopt.TrainStateReviewPublished
+	iteration.State = skillopt.TrainStateReviewPublished
+	session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "review", localMetadata)
+	iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "review", localMetadata)
+	if err := store.UpsertSkillOptTrainSessionAndIteration(ctx, session, iteration); err != nil {
+		return skillOptTrainReviewPublishResult{}, false, err
+	}
+	_ = removeSkillOptTrainReviewRecovery(paths, session, iteration)
+	return skillOptTrainReviewPublishResult{LocalSurface: true}, true, nil
+}
+
 func publishSkillOptTrainReview(ctx context.Context, paths config.Paths, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration) (skillOptTrainReviewPublishResult, error) {
 	if err := skillopt.CanTransitionTrainIteration(iteration.State, skillopt.TrainStateReviewPublished); err != nil {
 		return skillOptTrainReviewPublishResult{}, err
 	}
 	if strings.TrimSpace(iteration.EvalRunID) == "" {
 		return skillOptTrainReviewPublishResult{}, fmt.Errorf("train iteration %s has no eval run id", iteration.ID)
+	}
+	// Local-review short-circuit (#738): publish is a review SURFACE, and the local
+	// markdown surface is already first-class for feedback import. If the human
+	// already imported feedback locally (the eval run reports TrainingReady) BEFORE
+	// this publish step, there is nothing to post — a GitHub issue would only be a
+	// doomed duplicate (its packet exceeds GitHub's 64KB issue-body limit anyway).
+	// Record the review as published against the local surface and advance to
+	// review_published without any GitHub call or watch registration; the next
+	// continue hop takes the existing TrainingReady -> feedback_synced path. This
+	// runs BEFORE recover, so it also unwedges a session whose prior GitHub attempt
+	// left a stale posting_external marker. When feedback is not yet ready this is a
+	// no-op and GitHub stays the default publish surface (byte-identical).
+	if local, ok, err := maybePublishSkillOptTrainReviewLocally(ctx, paths, store, session, iteration); err != nil {
+		return skillOptTrainReviewPublishResult{}, err
+	} else if ok {
+		return local, nil
 	}
 	if recovered, ok, err := recoverSkillOptTrainReviewPublication(ctx, paths, store, session, iteration); err != nil {
 		return skillOptTrainReviewPublishResult{}, err
@@ -6174,6 +6246,11 @@ func publishSkillOptTrainReview(ctx context.Context, paths config.Paths, store *
 	if err != nil {
 		return skillOptTrainReviewPublishResult{}, err
 	}
+	// TODO(#738 part 3): when body exceeds GitHub's ~64KB issue-body limit, degrade
+	// gracefully instead of letting CreateIssue 422 — post a summary issue plus the
+	// packet as trailing comments (each <=64KB) or a linked artifact. Until then a
+	// 422 is caught below and the marker is downgraded (part 2) so the retry falls
+	// through to the local surface when feedback is already imported (part 1).
 	postingMetadata := make(map[string]any, len(publishingMetadata)+2)
 	for key, value := range publishingMetadata {
 		postingMetadata[key] = value
@@ -6340,25 +6417,56 @@ func isExecLaunchFailure(err error) bool {
 }
 
 // downgradeReviewMarkerOnLaunchFailure clears the conservative posting_external
-// latch when the gh publish call failed to launch (fork/exec / ARG_MAX / missing
-// binary). Because the external GitHub post never started, no duplicate issue can
-// exist, so leaving the posting_external marker — which recover treats as "the
-// post may have happened, a human must inspect before retrying" — would wedge the
-// session behind a phantom duplicate. It rewrites the marker as failed_pre_exec,
-// which recover treats as "no external post occurred", so the next attempt
-// proceeds fresh. For every other error class (a timeout, a kill mid-flight) the
-// request may have reached GitHub, so the latch is deliberately left intact.
+// latch when the gh publish failed in a way that PROVES no GitHub issue was
+// created, so the next attempt can proceed fresh instead of wedging behind a
+// phantom duplicate. recover treats the posting_external marker as "the post may
+// have happened, a human must inspect before retrying"; both downgraded statuses
+// below fall outside {posting_external, published_external}, so recover reports
+// "no external post occurred" and lets the retry through.
+//
+// Two failure classes qualify:
+//   - an exec-launch failure (#734/#735): fork/exec / ARG_MAX / a missing binary —
+//     the gh child never started, so the request never left this machine. Marker
+//     rewritten as failed_pre_exec.
+//   - a definitive 4xx API rejection (#738): HTTP 422 validation (e.g. a body over
+//     GitHub's 64KB issue-body limit), 404, or 403 — gh ran and GitHub declined the
+//     request outright, so nothing was created. Marker rewritten as
+//     failed_external_rejected.
+//
+// Every ambiguous failure (a timeout, a mid-flight kill, a 5xx, a dropped socket)
+// may have reached GitHub and mutated state, so the latch is deliberately left
+// intact and a human must inspect before retrying.
 func downgradeReviewMarkerOnLaunchFailure(paths config.Paths, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, postingMetadata map[string]any, err error) {
-	if !isExecLaunchFailure(err) {
+	downgraded, ok := reviewMarkerDowngradeStatus(err)
+	if !ok {
 		return
 	}
 	failed := make(map[string]any, len(postingMetadata)+2)
 	for key, value := range postingMetadata {
 		failed[key] = value
 	}
-	failed["status"] = "failed_pre_exec"
-	failed["failed_pre_exec_at"] = time.Now().UTC().Format(time.RFC3339Nano)
+	failed["status"] = downgraded
+	failed["downgraded_at"] = time.Now().UTC().Format(time.RFC3339Nano)
 	_ = writeSkillOptTrainReviewRecovery(paths, session, iteration, failed)
+}
+
+// reviewMarkerDowngradeStatus reports the recovery-marker status a failed gh
+// publish should be downgraded to, and whether it qualifies for a downgrade at
+// all. It maps an exec-launch failure to failed_pre_exec and a definitive 4xx API
+// rejection to failed_external_rejected; every ambiguous failure returns ok=false
+// so the conservative posting_external latch is preserved (see
+// downgradeReviewMarkerOnLaunchFailure).
+func reviewMarkerDowngradeStatus(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	if isExecLaunchFailure(err) {
+		return "failed_pre_exec", true
+	}
+	if github.IsDefinitiveRejectionMessage(err.Error()) {
+		return "failed_external_rejected", true
+	}
+	return "", false
 }
 
 func writeSkillOptTrainReviewRecovery(paths config.Paths, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, metadata map[string]any) error {
