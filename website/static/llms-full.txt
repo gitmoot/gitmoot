@@ -2796,6 +2796,16 @@ of `gitmoot agent list`**; `pipeline remove` disposes them.
 - Stage jobs are ordinary jobs (sender `pipeline`), so they also appear in the usual
   job/status surfaces.
 
+### Web dashboard
+
+The web dashboard (`gitmoot dashboard --web`) has a dedicated, read-only
+**Pipelines** view: a list of every declared pipeline with its schedule state,
+next-due countdown, and recent-run outcomes, and a per-run detail that renders the
+stage DAG in spec (topological) order with the same halt/needs information the
+`pipeline show <run-id>` funnel prints. It surfaces the resume / bug-report
+commands for a parked run as copyable text but never mutates anything. See
+[Dashboard Views → Pipelines](https://gitmoot.io/docs/dashboard/views#pipelines).
+
 ## Safety
 
 `pipeline add` is an **operator-trust action**: a stage's `cmd` runs verbatim via
@@ -5293,7 +5303,7 @@ proxy or a private tunnel). The dashboard trusts every request it receives.
 
 # Dashboard Views
 
-The web dashboard has six views, reachable from the left nav rail (or the mobile
+The web dashboard has eight views, reachable from the left nav rail (or the mobile
 bottom tab bar). Each is described below with its screenshot. See
 [Dashboard Overview](./overview.md) for launching, routes, refresh cadences, and
 security.
@@ -5356,6 +5366,57 @@ Tokens, Started, Duration) and as cards on mobile.
   count sits in the header.
 - Clicking a row (or card) opens a detail panel with the job's prompt, output,
   and event history.
+
+## Pipelines
+
+Route: `/pipelines` (or `/pipelines/<name>`)
+
+Pipelines is the read-only view of the declared **shell-stage pipelines** — the
+scheduled/manual DAGs defined with `gitmoot pipeline add`. It is **strictly
+read-only**: every action it surfaces is a **copyable command**, never a mutation.
+When no pipeline is declared yet, the view shows an empty state prompting
+`gitmoot pipeline add <spec.yaml>`.
+
+**List view** — a table, one row per pipeline (columns: **Name**, **Repo**,
+**Enabled** chip, **Schedule** rendered as `every 24h +15m`, **Last run** state
+chip, **Next due** countdown rendered from the schedule as e.g. `due in 6h 12m`
+and recomputed each poll, and a **Recent** outcomes strip of the last ≤10 runs as
+small state-colored squares, oldest→newest left to right). Clicking a row opens
+that pipeline's detail (`/pipelines/<name>`).
+
+**Detail view** — a back link, a pipeline header (name, repo, enabled, schedule,
+next due), and a **run-history strip** of recent runs (each a chip: state color,
+short run id, relative time). Selecting a run (newest by default) renders that
+run's **stage DAG** and, when the run parked, a banner:
+
+- a **blocked** run shows an amber banner with the halt stage, halt reason, the
+  outstanding **needs**, and a copyable `gitmoot pipeline resume <run-id>`;
+- a **failed** run shows a red banner with the halt reason and a copyable
+  `gitmoot report bug --job <failing-stage-job-id>`.
+
+The **stage DAG** lays stages out in dependency (depth) columns, left to right,
+edges following the spec's `needs`. Each stage chip shows its id, state, attempt
+(when it retried), elapsed time, and a one-line summary; pending and skipped
+stages render dimmed. Clicking a stage opens a side panel: stages with a job show
+the full job detail (prompt, output, events) fetched from `/api/job/<id>`; a
+pending or skipped stage (no job yet) shows a minimal card with its id, state,
+command, and dependencies. An in-flight run's stages flip live as the dashboard
+polls (every 12s).
+
+## Learning
+
+Route: `/learning` (opens `/learning/skills`; second tab `/learning/knowledge`)
+
+Learning is one nav item with two tabs telling one story: what the agents are
+learning. **Skills** is the SkillOpt evolution overview — one row per agent
+template with its version history as an inline score-trend sparkline, the
+current version, any active canary, and pending candidates (each expandable to
+a copy-paste `gitmoot skillopt candidate promote` command). Clicking a row
+jumps to that agent's detail panel. **Knowledge** is the memory brain graph —
+enrolled agents as wells, their remembered facts as nodes sized by how often
+they were reinforced, and owner/category/supersede edges between them; clicking
+a fact or agent opens its detail panel. Both tabs are read-only and poll every
+12 seconds.
 
 ## Agents
 

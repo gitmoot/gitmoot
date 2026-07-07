@@ -240,6 +240,16 @@ of `gitmoot agent list`**; `pipeline remove` disposes them.
 - Stage jobs are ordinary jobs (sender `pipeline`), so they also appear in the usual
   job/status surfaces.
 
+### Web dashboard
+
+The web dashboard (`gitmoot dashboard --web`) has a dedicated, read-only
+**Pipelines** view: a list of every declared pipeline with its schedule state,
+next-due countdown, and recent-run outcomes, and a per-run detail that renders the
+stage DAG in spec (topological) order with the same halt/needs information the
+`pipeline show <run-id>` funnel prints. It surfaces the resume / bug-report
+commands for a parked run as copyable text but never mutates anything. See
+[Dashboard Views → Pipelines](https://gitmoot.io/docs/dashboard/views#pipelines).
+
 ## Safety
 
 `pipeline add` is an **operator-trust action**: a stage's `cmd` runs verbatim via
