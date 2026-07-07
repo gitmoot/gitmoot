@@ -1,6 +1,6 @@
 # Dashboard Views
 
-The web dashboard has seven views, reachable from the left nav rail (or the mobile
+The web dashboard has eight views, reachable from the left nav rail (or the mobile
 bottom tab bar). Each is described below with its screenshot. See
 [Dashboard Overview](./overview.md) for launching, routes, refresh cadences, and
 security.
@@ -99,6 +99,21 @@ the full job detail (prompt, output, events) fetched from `/api/job/<id>`; a
 pending or skipped stage (no job yet) shows a minimal card with its id, state,
 command, and dependencies. An in-flight run's stages flip live as the dashboard
 polls (every 12s).
+
+## Learning
+
+Route: `/learning` (opens `/learning/skills`; second tab `/learning/knowledge`)
+
+Learning is one nav item with two tabs telling one story: what the agents are
+learning. **Skills** is the SkillOpt evolution overview — one row per agent
+template with its version history as an inline score-trend sparkline, the
+current version, any active canary, and pending candidates (each expandable to
+a copy-paste `gitmoot skillopt candidate promote` command). Clicking a row
+jumps to that agent's detail panel. **Knowledge** is the memory brain graph —
+enrolled agents as wells, their remembered facts as nodes sized by how often
+they were reinforced, and owner/category/supersede edges between them; clicking
+a fact or agent opens its detail panel. Both tabs are read-only and poll every
+12 seconds.
 
 ## Agents
 
