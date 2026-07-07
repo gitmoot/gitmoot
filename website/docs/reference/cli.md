@@ -1320,3 +1320,55 @@ from its halted stage (or `--from`) plus its transitive dependents while **never
 re-running a succeeded stage. A pipeline stage is a **leaf**: a stage result carrying
 `delegations[]` never spawns children. See
 [Pipelines](../workflows/pipelines-workflow.md) for the full workflow.
+
+## Native Chat (agent threads)
+
+`gitmoot chat` (#534, V1 local-only) is a durable, repo-aware **conversation
+ledger** where registered agents and the human talk in threads, `@`-tag each
+other, and (explicitly) promote a message into a real job. It lives in local
+SQLite — **zero network, zero entmoot dependency**. The core rule: **a message is
+a row (free); a job is compute (explicit)**. A plain `chat send` never starts
+work — only `chat task` (promotion) and `chat answer` (ask-gate resume) touch the
+dispatch path.
+
+```sh
+gitmoot chat create <name> --repo owner/repo [--topic "title"] [--json]
+gitmoot chat list [--repo owner/repo] [--all] [--json]      # open threads; --all includes archived
+gitmoot chat show <thread> [--repo owner/repo] [--limit N] [--json]
+gitmoot chat send <thread> "message" [--as agent] [--repo owner/repo] [--ref kind:value ...] [--json]
+gitmoot chat inbox <agent> [--unread] [--json]
+gitmoot chat task <thread> "@agent message" [--action ask|review|implement] [--repo owner/repo] [--json]
+gitmoot chat answer <thread> "<question-id>: answer text" [--repo owner/repo] [--json]
+gitmoot chat close|reopen <thread> [--repo owner/repo] [--json]
+gitmoot chat rename <thread> "new name" [--repo owner/repo] [--json]
+```
+
+- **`create`** — `<name>` is slugified to a topic-path-safe handle (`[a-z0-9-]`,
+  no `+`/`#`/`/`; unique per repo). `--repo` is required; `--topic` sets the human
+  display title. The slug is the stable handle — a later `rename` changes only the
+  title.
+- **`send`** — appends a `chat` message. `@agent` mentions land in a **registered**
+  agent's unread **inbox**; an unknown mention is recorded for audit with a stderr
+  warning and **never fails the send**. `--as <agent>` authors as a registered
+  agent (default: the human); `--ref kind:value` attaches structured refs.
+- **`inbox`** — an agent's mentions, newest first; `--unread` restricts to unread.
+- **`task`** — the one promotion verb. The body must name **exactly one**
+  registered `@agent`; it records a `promotion_request` message, then dispatches a
+  background job through the **same** validate → repo-scope → capability →
+  autonomy-policy gate the daemon uses (`--action` defaults to `ask`). The message
+  is back-linked (`promoted_job_id`), and the terminal result is appended into the
+  thread as a **`job_result`** message (non-promotable, `reply_to` the promotion).
+  An identical `(thread, body)` promotion within 60 s is refused (anti-ping-pong).
+- **`answer`** — the local answer channel for the **ask-gate** (#445). When a job
+  pauses at `awaiting_human`, the engine auto-links a `job-<hash>` thread and posts
+  the questions as a **`system`** message with a `{kind:job}` ref; `chat answer`
+  routes the answer onto the existing resume path and enqueues the coordinator
+  continuation that carries it.
+- **`close`/`reopen`** — archive (audit-preserving) / restore a thread.
+
+**Message kinds** are a fixed vocabulary: `chat`, `promotion_request`,
+`job_result` (never promotable), and `system`. Every row carries an `origin`
+stamped with a generated stable per-DB `home_id` (never the literal `self`) and a
+versioned canonical envelope — schema discipline that keeps a future cross-machine
+bridge additive without changing any V1 behavior. See
+[Chat](../workflows/chat-workflow.md) for the full workflow.

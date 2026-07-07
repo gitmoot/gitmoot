@@ -54,6 +54,11 @@ type localAgentDispatchRequest struct {
 	SelectedAction         string
 	SelectedActionReason   string
 	ExecutionPath          string
+	// ThreadID / ChatMessageID link a chat-promoted job (#534) back to the thread
+	// and the promotion_request message it came from. Set only by `chat task`;
+	// empty for every other dispatch, so the enqueued payload is byte-identical.
+	ThreadID      string
+	ChatMessageID string
 	// JSONOutput is true when the caller will emit machine-readable JSON (e.g.
 	// `agent ask --json`). The live-A/B interceptor (#482) MUST stay byte-clean for
 	// these consumers: it never presents the A/B block (which would prepend
@@ -195,6 +200,8 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		CockpitSession:         request.CockpitSession,
 		SkipNativeReviewFanout: request.SkipNativeReviewFanout,
 		TemplateOverride:       recipeTemplate,
+		ThreadID:               request.ThreadID,
+		ChatMessageID:          request.ChatMessageID,
 	})
 	if err != nil {
 		return localAgentJobOutput{}, err

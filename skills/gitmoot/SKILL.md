@@ -15,7 +15,11 @@ goals, reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, Codex, Claude Code, or Kimi Code agent startup, structured
 implementation plans, standard goal files, agent template workflows, custom
-prompt agents, template capture, job status, or branch lock inspection.
+prompt agents, template capture, native agent chat threads, job status, or branch
+lock inspection. When the user wants agents and humans to converse in a durable
+repo thread, tag an agent, answer a paused job's question, or turn a chat message
+into a real job, use `gitmoot chat` (see CLI.md § Native Chat and WORKFLOWS.md
+§ Chat).
 
 For current-chat prompt import, "use <agent> here" or "use Gitmoot agent
 <agent> here" means import the agent's prompt into this current chat and apply
@@ -178,6 +182,16 @@ job whose `gitmoot_result` decision drives advancement; a `blocked` stage parks 
 run (resume with `pipeline resume <run-id>`), and a stage is a leaf (its
 `delegations[]` never spawn children). Pipelines are off by default. See CLI.md
 § Pipelines, WORKFLOWS.md § Pipelines, and `docs/pipelines.md`.
+
+For lightweight, durable agent communication that is **not** immediately work, use
+**native chat** (#534): `gitmoot chat create <name> --repo owner/repo`, then
+`gitmoot chat send <thread> "@agent …"` to leave a durable, `@`-tagged message in
+the agent's inbox. A message is a row (free); a job is compute (explicit) — a plain
+`send` never starts work. Promote a message into a real job only with
+`gitmoot chat task <thread> "@agent …" [--action ask|review|implement]` (the job's
+result is posted back into the thread), and answer a job paused at `awaiting_human`
+with `gitmoot chat answer <thread> "<question-id>: …"`. Chat is local-only (no
+network). See CLI.md § Native Chat and WORKFLOWS.md § Chat.
 
 The plugin is only the runtime discovery surface for this skill. Local agent
 invocation still goes through the `gitmoot` CLI and the same registered agent,

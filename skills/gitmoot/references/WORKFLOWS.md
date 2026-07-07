@@ -571,6 +571,47 @@ unparseable output, and its trust is **deferred to measure-the-judge (#344)**.
 `--judge-only` records only the judge row (skips the human prompt). Off ⇒
 byte-identical.
 
+## Chat
+
+Native chat (#534, V1 local-only) is a durable, repo-aware conversation ledger
+where registered agents and the human converse in threads, `@`-tag one another,
+answer a job that paused for a decision, and explicitly promote a message into
+real work. It lives entirely in gitmoot's local SQLite — zero network, zero
+entmoot dependency. The one rule that shapes everything: **a message is a row
+(free); a job is compute (explicit)**. Tagging `@codex-b` creates an inbox item;
+it does not start work. Work happens only when you explicitly `chat task`
+(promotion) or `chat answer` (the ask-gate resume), which makes runaway agent
+ping-pong structurally impossible.
+
+```sh
+# A durable, repo-scoped thread; leave an @-tagged note (starts nothing).
+gitmoot chat create release-room --repo owner/repo --topic "Release coordination"
+gitmoot chat send release-room "@codex-b can you inspect the runtime adapter?"
+gitmoot chat inbox codex-b --unread          # the mention landed here; no job ran
+
+# Promote a message into a real job — the ONE promotion verb.
+gitmoot chat task release-room "@codex-b implement the adapter" --action implement
+gitmoot chat show release-room               # promotion_request, then later the job_result
+```
+
+`chat task` requires exactly one registered `@agent`, records a
+`promotion_request`, dispatches a background job through the same validate →
+repo-scope → capability → autonomy-policy gate the daemon uses, and back-links the
+job; when the job reaches a terminal state its result is appended back into the
+thread as a `job_result` message (never promotable, never mention-scanned). An
+identical `(thread, body)` promotion that actually produced a job within a 60 s
+window is refused (anti-ping-pong); a promotion whose dispatch failed does not
+block a retry.
+
+The keystone scenario is the **ask-gate answer channel**. When an agent returns
+`human_questions[]`, the engine pauses the tree at `awaiting_human` (#445) and
+auto-links a `job-<hash>` thread carrying the questions as a `system` message.
+`gitmoot chat answer <thread> "<id>: text"` routes the answer onto the existing
+resume path (`ResolveEscalation(answer)`), enqueuing the coordinator continuation
+that carries the answer, inherits the thread link, and posts its result back into
+the same thread. Answering an already-resolved pause is a clear no-op, not a false
+success. See `CLI.md § Native Chat` for every flag.
+
 ## Execution Model
 
 Use `here` when the current chat should answer directly from the Gitmoot skill.

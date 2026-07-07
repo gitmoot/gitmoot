@@ -3,6 +3,8 @@ package daemon
 import (
 	"fmt"
 	"strings"
+
+	"github.com/jerryfane/gitmoot/internal/mention"
 )
 
 type Command struct {
@@ -39,7 +41,7 @@ func ParseCommand(line string) (Command, bool) {
 		if len(fields) < 2 {
 			return Command{}, false
 		}
-		return Command{Action: fields[1], Agent: cleanAgent(fields[0]), Instructions: trailing(fields, 2)}, true
+		return Command{Action: fields[1], Agent: mention.Clean(fields[0]), Instructions: trailing(fields, 2)}, true
 	}
 	if fields[0] != "/gitmoot" {
 		return Command{}, false
@@ -68,12 +70,12 @@ func ParseCommand(line string) (Command, bool) {
 		if len(fields) < 3 {
 			return Command{}, false
 		}
-		return Command{Action: "ask", Agent: cleanAgent(fields[2]), Instructions: trailing(fields, 3)}, true
+		return Command{Action: "ask", Agent: mention.Clean(fields[2]), Instructions: trailing(fields, 3)}, true
 	default:
 		if len(fields) < 3 {
 			return Command{}, false
 		}
-		return Command{Action: fields[2], Agent: cleanAgent(fields[1]), Instructions: trailing(fields, 3)}, true
+		return Command{Action: fields[2], Agent: mention.Clean(fields[1]), Instructions: trailing(fields, 3)}, true
 	}
 }
 
@@ -97,10 +99,6 @@ func (c Command) Validate() error {
 		return fmt.Errorf("command %q requires an agent", c.Action)
 	}
 	return nil
-}
-
-func cleanAgent(agent string) string {
-	return strings.TrimPrefix(strings.TrimSpace(agent), "@")
 }
 
 func trailing(fields []string, start int) string {

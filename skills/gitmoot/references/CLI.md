@@ -1454,3 +1454,61 @@ spawn children — the advancer ignores them and the engine strips them for a pi
 stage job. Use an orchestra for dynamic fan-out, a pipeline for a fixed shell DAG.
 See `docs/pipelines.md` for the full reference and `WORKFLOWS.md → Pipelines` for the
 end-to-end story.
+
+## Native Chat (agent threads)
+
+`gitmoot chat` (#534, V1 local-only) is a durable, repo-aware **conversation
+ledger** where registered agents and the human talk in threads, `@`-tag each
+other, and (explicitly) promote a message into a real job. It is stored in local
+SQLite alongside the rest of gitmoot state — **zero network, zero entmoot
+dependency**. The core rule: **a message is a row (free); a job is compute
+(explicit)**. A plain `chat send` never starts work — only `chat task` (promotion)
+and `chat answer` (ask-gate resume) touch the dispatch path.
+
+```sh
+gitmoot chat create <name> --repo owner/repo [--topic "title"] [--json]
+gitmoot chat list [--repo owner/repo] [--all] [--json]      # open threads; --all includes archived
+gitmoot chat show <thread> [--repo owner/repo] [--limit N] [--json]
+gitmoot chat send <thread> "message" [--as agent] [--repo owner/repo] [--ref kind:value ...] [--json]
+gitmoot chat inbox <agent> [--unread] [--json]
+gitmoot chat task <thread> "@agent message" [--action ask|review|implement] [--repo owner/repo] [--json]
+gitmoot chat answer <thread> "<question-id>: answer text" [--repo owner/repo] [--json]
+gitmoot chat close|reopen <thread> [--repo owner/repo] [--json]
+gitmoot chat rename <thread> "new name" [--repo owner/repo] [--json]
+```
+
+- **`create`** — `<name>` is slugified to a topic-path-safe handle (`[a-z0-9-]`, no
+  `+`/`#`/`/`; unique per repo); a name that slugifies to nothing is rejected.
+  `--repo` is required. `--topic` sets the human display title (defaults to the
+  slug). The slug is the stable handle; a later `rename` changes only the title.
+- **`send`** — appends a `chat` message. `@agent` mentions are parsed and, for
+  **registered** agents, delivered as an unread **inbox** row; an unknown mention
+  is recorded for audit with a stderr warning and **never fails the send**.
+  `--as <agent>` authors the message as a registered agent (default: the human);
+  `--ref kind:value` attaches structured refs (e.g. `--ref pr:42`). Sending to an
+  archived thread is refused until you `reopen` it.
+- **`inbox`** — an agent's mentions, newest first; `--unread` restricts to unread.
+- **`task`** — the one promotion verb. The body must name **exactly one**
+  registered `@agent`; it records a `promotion_request` message, then dispatches a
+  background job through the **same** validate → repo-scope → capability →
+  autonomy-policy gate the daemon uses (`--action` defaults to `ask`). The message
+  is back-linked to the job (`promoted_job_id`), and when the job reaches a terminal
+  state the daemon appends its result into the thread as a **`job_result`** message
+  (non-promotable, `reply_to` the promotion, with a `{kind:job}` ref). An identical
+  `(thread, body)` promotion inside a 60 s window is refused (anti-ping-pong).
+- **`answer`** — the local answer channel for the **#445 ask-gate**. When a job
+  pauses at `awaiting_human` (its `human_questions[]`), the engine auto-creates (or
+  reuses) a thread named `job-<hash>` and posts the questions as a **`system`**
+  message carrying a `{kind:job}` ref. `chat answer <thread> "<id>: text"` routes
+  that answer onto the existing resume path (`ResolveEscalation(answer)`), enqueuing
+  the coordinator continuation that carries the answer and inherits the thread link.
+- **`close`/`reopen`** — archive (audit-preserving) / restore a thread.
+
+**Message kinds** are a fixed vocabulary: `chat` (a normal message),
+`promotion_request` (a `task`), `job_result` (a back-linked terminal result —
+never promotable, never mention-scanned), and `system` (engine-authored, e.g. the
+ask-gate questions). Every thread/message/mention carries an **`origin`** stamped
+with a generated stable per-DB `home_id` (never the literal `self`), and each
+message stores a versioned canonical **envelope** — schema discipline that keeps a
+future cross-machine bridge purely additive without changing any V1 runtime
+behavior. See `WORKFLOWS.md → Chat` for the human↔agent thread story.

@@ -7829,4 +7829,95 @@ CREATE TABLE pipeline_run_stages (
 
 CREATE INDEX idx_pipeline_run_stages_run_id ON pipeline_run_stages(run_id);
 	`,
+	// #534 native agent chat (V1, local-only): a durable, repo-aware chat ledger
+	// where registered agents + the human converse in threads, tag each other, and
+	// later promote selected messages into real jobs. This is the ONLY net-new
+	// storage the feature needs; promotion/mention-parsing/back-links all reuse
+	// existing seams. Pure additive append (CREATE TABLE/INDEX only, no ALTER or
+	// renumber of any prior migration): every table stays empty until `gitmoot
+	// chat …` runs, so every existing DB reads byte-identically.
+	//
+	// The schema shape is deliberately federation-ready even though V1 is local-
+	// only and zero-network (#705 is the parked bridge). These are column shapes
+	// and naming rules, not features — they cost nothing at runtime:
+	//   * `origin` columns on threads/messages/mentions and origin-qualified refs.
+	//     V1 populates them with a generated stable per-DB home_id (chat_meta) — the
+	//     "self"-equivalent — and NO code path assumes origin == "self". This is
+	//     what makes `agent@machine-A` addressable from machine-B later and prevents
+	//     bridge echo loops.
+	//   * a structured author triple (author_kind|author_name|author_origin), never
+	//     a bare agent name.
+	//   * a versioned canonical envelope_json ({schema_version, kind, body,
+	//     mentions[], refs[], reply_to}) — the deterministic self-describing unit a
+	//     future bridge hashes/signs into opaque wire content. Additive-only.
+	//   * topic-path-safe thread slugs ([a-z0-9-], no '+'/'#'), unique per repo, so
+	//     a slug always derives a valid MQTT topic later.
+	//   * an explicit (ts_ms, seq) ordering key (ts_ms is unix-millis); seq is the
+	//     per-thread gapless LOCAL insertion order used as the deterministic
+	//     same-timestamp tiebreak — a local rendering key, never a cross-origin
+	//     federation assumption.
+	//   * reserved NULLABLE content_hash/signature/signer_pubkey columns (content-
+	//     addressing + signing land in the bridge, not here), with a partial UNIQUE
+	//     index on non-NULL content_hash so a bridged content-addressed id can be
+	//     stored verbatim and re-delivery is schema-enforced idempotent.
+	//   * a fixed kind vocabulary chat|system|job_result|promotion_request, with
+	//     promotion_request distinct and (per the interaction model) always locally
+	//     re-authorized; job_result messages are non-promotable.
+	`
+CREATE TABLE chat_meta (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE chat_threads (
+	id TEXT PRIMARY KEY,
+	slug TEXT NOT NULL,
+	name TEXT NOT NULL DEFAULT '',
+	repo TEXT NOT NULL DEFAULT '',
+	origin TEXT NOT NULL DEFAULT '',
+	state TEXT NOT NULL DEFAULT 'open',
+	created_by TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE(repo, slug)
+);
+
+CREATE TABLE chat_messages (
+	id TEXT PRIMARY KEY,
+	origin TEXT NOT NULL DEFAULT '',
+	thread_id TEXT NOT NULL,
+	seq INTEGER NOT NULL,
+	ts_ms INTEGER NOT NULL DEFAULT 0,
+	author_kind TEXT NOT NULL DEFAULT '',
+	author_name TEXT NOT NULL DEFAULT '',
+	author_origin TEXT NOT NULL DEFAULT '',
+	kind TEXT NOT NULL DEFAULT 'chat',
+	body TEXT NOT NULL DEFAULT '',
+	envelope_json TEXT NOT NULL DEFAULT '',
+	refs_json TEXT NOT NULL DEFAULT '',
+	reply_to TEXT NOT NULL DEFAULT '',
+	promoted_job_id TEXT NOT NULL DEFAULT '',
+	content_hash TEXT,
+	signature TEXT,
+	signer_pubkey TEXT,
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE(thread_id, seq)
+);
+CREATE INDEX idx_chat_messages_thread_seq ON chat_messages(thread_id, seq);
+CREATE INDEX idx_chat_messages_promoted_job ON chat_messages(promoted_job_id);
+CREATE UNIQUE INDEX idx_chat_messages_content_hash ON chat_messages(content_hash) WHERE content_hash IS NOT NULL;
+
+CREATE TABLE chat_mentions (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	message_id TEXT NOT NULL,
+	thread_id TEXT NOT NULL,
+	agent TEXT NOT NULL,
+	agent_origin TEXT NOT NULL DEFAULT '',
+	resolved INTEGER NOT NULL DEFAULT 1,
+	unread INTEGER NOT NULL DEFAULT 1,
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_chat_mentions_agent_unread ON chat_mentions(agent, unread);
+	`,
 }

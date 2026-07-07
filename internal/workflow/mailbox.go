@@ -157,6 +157,12 @@ type JobRequest struct {
 	// coordinator continuation enqueued by the `answer` resume verb. Empty for
 	// every other job, so the stored payload is byte-identical by default.
 	HumanAnswer string
+	// ThreadID / ChatMessageID link a job back to the chat message it was
+	// promoted from (#534). Populated only by `chat task` promotion; empty for
+	// every non-chat job, so the stored payload is byte-identical by default. The
+	// daemon terminal back-link posts the result into ThreadID when it is set.
+	ThreadID      string
+	ChatMessageID string
 }
 
 type JobPayload struct {
@@ -208,6 +214,10 @@ type JobPayload struct {
 	SkipNativeReviewFanout bool           `json:"skip_native_review_fanout,omitempty"`
 	Ephemeral              *EphemeralSpec `json:"ephemeral,omitempty"`
 	HumanAnswer            string         `json:"human_answer,omitempty"`
+	// ThreadID / ChatMessageID back-link a chat-promoted job (#534) to its origin
+	// message. Additive/omitempty: a non-chat job serializes byte-identically.
+	ThreadID               string         `json:"thread_id,omitempty"`
+	ChatMessageID          string         `json:"chat_message_id,omitempty"`
 	RawOutputs             []string       `json:"raw_outputs,omitempty"`
 	Result                 *AgentResult   `json:"result,omitempty"`
 	// Operational-blocker deferral context (#532, additive — all omitempty, so a
@@ -308,6 +318,8 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		SkipNativeReviewFanout: request.SkipNativeReviewFanout,
 		Ephemeral:              request.Ephemeral,
 		HumanAnswer:            request.HumanAnswer,
+		ThreadID:               strings.TrimSpace(request.ThreadID),
+		ChatMessageID:          strings.TrimSpace(request.ChatMessageID),
 	})
 	if err != nil {
 		return db.Job{}, err

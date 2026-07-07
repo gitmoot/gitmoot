@@ -2471,6 +2471,8 @@ func (e Engine) enqueueFinalizeContinuation(ctx context.Context, job db.Job, pay
 		DelegatedBy:        job.Agent,
 		RootJobID:          e.rootJobID(job, payload),
 		DelegationFinalize: true,
+		ThreadID:           payload.ThreadID,
+		ChatMessageID:      payload.ChatMessageID,
 		// Inherit the coordinator's cockpit settings so the finalize continuation
 		// renders its pane under the same workspace/session as the rest of the tree.
 		Cockpit:        payload.Cockpit,
@@ -3211,6 +3213,8 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 			LeadAgent:          parentPayload.LeadAgent,
 			Reviewers:          parentPayload.Reviewers,
 			Sender:             parentJob.Agent,
+			ThreadID:           parentPayload.ThreadID,
+			ChatMessageID:      parentPayload.ChatMessageID,
 			Instructions:       buildCorrectiveContinuationPrompt(goal, parentResult),
 			Constraints:        parentPayload.Constraints,
 			ParentJobID:        parentJob.ID,
@@ -3377,6 +3381,12 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		// it at the top of the prompt. Empty (the default) for every non-answer path,
 		// so omitempty keeps the stored payload byte-identical.
 		HumanAnswer: cfg.humanAnswer,
+		// Chat back-link (#534): a continuation of a chat-promoted (or ask-gate
+		// auto-linked) coordinator inherits the thread linkage so its terminal
+		// result posts back into the originating thread. Empty for every non-chat
+		// coordinator, so omitempty keeps the stored payload byte-identical.
+		ThreadID:      parentPayload.ThreadID,
+		ChatMessageID: parentPayload.ChatMessageID,
 		// Increment depth per continuation generation so a coordinator whose
 		// continuation re-delegates is bounded by MaxDelegationDepth instead of
 		// looping forever (the continuation reused the parent's depth before).
@@ -5555,6 +5565,11 @@ func (e Engine) pauseAwaitingHuman(ctx context.Context, parentJob db.Job, parent
 		RedactCommentText,
 	))
 
+	// Auto-link a local chat thread as the answer channel (#534): best-effort and
+	// swallow-all, so a chat failure never affects the pause. Participant is the
+	// coordinator agent (whose resume the human drives).
+	e.linkAskGateChatThread(ctx, parentJob.ID, firstNonEmptyString(ref.Repo, parentPayload.Repo), parentJob.Agent, awaitErr.Reason)
+
 	return awaitErr
 }
 
@@ -5692,6 +5707,11 @@ func (e Engine) pauseAwaitingHumanAnswer(ctx context.Context, job db.Job, payloa
 		RedactCommentText,
 	))
 
+	// Auto-link a local chat thread carrying the questions as the answer channel
+	// (#534 keystone): best-effort and swallow-all. Keyed on the resume target
+	// (coordinator for a child ask); participant is the asking job's agent.
+	e.linkAskGateChatThread(ctx, targetID, firstNonEmptyString(targetRef.Repo, payload.Repo), job.Agent, renderHumanQuestions(questions))
+
 	return true, nil
 }
 
@@ -5797,6 +5817,31 @@ func (e Engine) escalationResolved(ctx context.Context, coordinatorJobID string)
 		return false, err
 	}
 	return !open, nil
+}
+
+// EscalationPending reports whether coordinatorJobID has an UNRESOLVED human
+// escalation round right now: a round was requested and not yet
+// answered/aborted/TTL-finalized. It is the read-side companion to
+// ResolveEscalation, whose already-resolved branch is a silent idempotent no-op.
+// A caller like `chat answer` checks this first so it does not report a false
+// success (and record a duplicate answer message) when the round was already
+// resolved. Returns false when the job never had an escalation at all.
+func (e Engine) EscalationPending(ctx context.Context, coordinatorJobID string) (bool, error) {
+	if err := e.validate(); err != nil {
+		return false, err
+	}
+	_, exists, err := e.loadEscalation(ctx, coordinatorJobID)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, nil
+	}
+	resolved, err := e.escalationResolved(ctx, coordinatorJobID)
+	if err != nil {
+		return false, err
+	}
+	return !resolved, nil
 }
 
 // ResumeDecision is one of the three human resume verbs for a paused tree (#340).

@@ -7756,6 +7756,14 @@ func (w jobWorker) postJobResultComment(ctx context.Context, jobID string, agent
 	if err != nil {
 		return err
 	}
+	// Chat back-link (#534): a chat-promoted (or ask-gate auto-linked) job posts
+	// its result into the originating thread at the SAME terminal call sites as
+	// the PR comment. It runs BEFORE the PR-scope guard below because a chat job
+	// often has no PR; it is best-effort (a chat failure never fails the worker)
+	// and idempotent (a chat_result_posted job event, mirroring comment_posted).
+	// Gated on payload.ThreadID, so a non-chat job is byte-identical. We pass the
+	// already-fetched (job, payload) so it does not re-read + re-parse the payload.
+	_ = w.postChatThreadResult(ctx, job, payload, agent, cause)
 	if job.State == string(workflow.JobCancelled) {
 		return nil
 	}
@@ -7794,6 +7802,88 @@ func (w jobWorker) postJobResultComment(ctx context.Context, jobID string, agent
 		return nil
 	}
 	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "comment_posted", Message: "posted attributed PR result comment"})
+}
+
+// postChatThreadResult appends a compact, attributed job-result message into the
+// chat thread a chat-promoted (or ask-gate auto-linked) job carries on its
+// payload (#534). It reuses workflow.RenderJobResultComment for the body, authors
+// the message as the agent with kind='job_result' (structurally non-promotable),
+// links it back to the promoting message via reply_to, and attaches an
+// origin-qualified job ref. It is idempotent via a chat_result_posted job event
+// that mirrors the comment_posted bookkeeping EXACTLY (a retry_queued clears it),
+// so a retried/re-advanced job posts at most once. Every step is best-effort: a
+// chat write failure is recorded and swallowed, never failing the worker.
+//
+// It takes the already-fetched (job, payload) from the caller so the terminal
+// path parses the payload once, not twice.
+func (w jobWorker) postChatThreadResult(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, cause error) error {
+	// A job PAUSING at awaiting_human is NOT terminal: it returned an
+	// AwaitingHumanError and its answer-driven *continuation* (a separate job that
+	// inherits ThreadID) posts the real result once the human answers. Posting here
+	// would drop a misleading, out-of-order "job result" into the answer thread
+	// BEFORE the human has even answered — corrupting the keystone answer channel.
+	var awaiting workflow.AwaitingHumanError
+	if errors.As(cause, &awaiting) {
+		return nil
+	}
+	threadID := strings.TrimSpace(payload.ThreadID)
+	if threadID == "" {
+		return nil
+	}
+	if job.State == string(workflow.JobCancelled) {
+		return nil
+	}
+	posted, err := w.chatThreadResultPosted(ctx, job.ID)
+	if err != nil {
+		return err
+	}
+	if posted {
+		return nil
+	}
+	diagnostic := jobResultDiagnostic(cause)
+	if diagnostic == "" && payload.Result == nil {
+		diagnostic = w.storedJobFailureDiagnostic(ctx, job)
+	}
+	agentName := firstNonEmpty(agent.Name, job.Agent)
+	body := workflow.RenderJobResultComment(workflow.JobResultComment{
+		AgentName:  agentName,
+		Runtime:    agent.Runtime,
+		JobID:      job.ID,
+		JobState:   job.State,
+		Payload:    payload,
+		Result:     payload.Result,
+		Diagnostic: diagnostic,
+	})
+	if _, err := w.Store.AddChatMessage(ctx, db.ChatMessage{
+		ThreadID:   threadID,
+		AuthorKind: db.ChatAuthorKindAgent,
+		AuthorName: agentName,
+		Kind:       db.ChatKindJobResult,
+		Body:       body,
+		ReplyTo:    strings.TrimSpace(payload.ChatMessageID),
+		Refs:       []db.ChatRef{{Kind: "job", Repo: payload.Repo, ID: job.ID}},
+	}); err != nil {
+		_ = w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "chat_result_post_failed", Message: err.Error()})
+		return nil
+	}
+	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "chat_result_posted", Message: "posted job result into chat thread " + threadID})
+}
+
+func (w jobWorker) chatThreadResultPosted(ctx context.Context, jobID string) (bool, error) {
+	events, err := w.Store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	posted := false
+	for _, event := range events {
+		switch event.Kind {
+		case "retry_queued":
+			posted = false
+		case "chat_result_posted":
+			posted = true
+		}
+	}
+	return posted, nil
 }
 
 func (w jobWorker) jobResultCommentPosted(ctx context.Context, jobID string) (bool, error) {
