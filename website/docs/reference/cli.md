@@ -1379,3 +1379,40 @@ from its halted stage (or `--from`) plus its transitive dependents while **never
 re-running a succeeded stage. A pipeline stage is a **leaf**: a stage result carrying
 `delegations[]` never spawns children. See
 [Pipelines](../workflows/pipelines-workflow.md) for the full workflow.
+
+## Routing Telemetry (Advisory)
+
+Gitmoot records lightweight **execution-grounded routing telemetry**: one additive
+row per job at its terminal transition capturing which combination actually ran and
+how it turned out — `repo`, `action`, `phase`, `runtime`, `model`, `agent`, resolved
+`template_id` + commit, terminal `job_state`, result `decision` + approval flag, a
+coarse tests-run count, `duration_ms`, and input/output tokens (best-effort). Capture
+is **always on, additive, and fail-safe**: it writes only to the new
+`routing_telemetry` table and a telemetry error can never fail a job.
+
+**v1 is advisory only** — nothing reads this back to change routing, and no automatic
+model/runtime override happens anywhere. It is a local feedback loop you inspect, not
+a global benchmark.
+
+Inspect observed performance (read-only), grouped by `(action, runtime, model,
+template)`:
+
+```sh
+gitmoot router summary [--repo owner/repo] [--action ask|review|implement] [--since 30d] [--json]
+```
+
+It reports per-group count, success rate, approval rate, median duration, and summed
+tokens, always labeled **"local observed performance, not a benchmark"**. `--since`
+accepts a Go duration or an `<N>d` days suffix.
+
+Optionally inject a **bounded** (≤12-line) observed-performance table into a
+**coordinator's** prompt. It is **off by default**; with it off, coordinator prompt
+assembly is byte-identical and no telemetry query runs during a job:
+
+```toml
+[router]
+context_enabled = true   # inject the advisory table into top-level coordinator prompts (default false)
+```
+
+The injected block carries the same "not a benchmark" disclaimer, is added only to
+top-level (coordinator) jobs, and never forces a route — routing stays advisory.

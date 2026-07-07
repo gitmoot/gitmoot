@@ -1570,3 +1570,46 @@ spawn children — the advancer ignores them and the engine strips them for a pi
 stage job. Use an orchestra for dynamic fan-out, a pipeline for a fixed shell DAG.
 See `docs/pipelines.md` for the full reference and `WORKFLOWS.md → Pipelines` for the
 end-to-end story.
+
+## Routing Telemetry (Advisory)
+
+Gitmoot records lightweight **execution-grounded routing telemetry** (#530): one
+additive row per job at its terminal transition, capturing which combination
+actually ran and how it turned out — `repo`, `action` (ask/review/implement/
+continuation/…), `phase`, `runtime`, `model`, `agent`, resolved `template_id` +
+commit, terminal `job_state` (succeeded/failed/blocked), result `decision` +
+approval flag, a coarse tests-run count, `duration_ms`, and `input`/`output`
+tokens (best-effort; a runtime that reports no usage contributes 0). Capture is
+**always on, additive, and fail-safe**: it writes only to the new
+`routing_telemetry` table and a telemetry error can never fail a job, so wire
+output is unchanged.
+
+**v1 is advisory only.** Nothing reads this back to change routing — no automatic
+model/runtime override happens anywhere. It is a local feedback loop you inspect,
+not a global benchmark. (This capture slice subsumes the phase-aware capability
+telemetry proposed in #522.)
+
+Inspect observed performance (read-only), grouped by `(action, runtime, model,
+template)`:
+
+```sh
+gitmoot router summary [--repo owner/repo] [--action ask|review|implement] [--since 30d] [--json]
+```
+
+It reports per-group count, success rate, approval rate, median duration, and
+summed tokens, always labeled **"local observed performance, not a benchmark"**.
+`--since` accepts a Go duration or an `<N>d` days suffix.
+
+Optionally feed a **bounded** (≤12-line) observed-performance table into a
+**coordinator's** prompt so it can weigh which runtime/model/template has done
+well on the repo. It is **off by default**; with it off, coordinator prompt
+assembly is byte-identical and no telemetry query runs during a job:
+
+```toml
+[router]
+context_enabled = true   # inject the advisory table into top-level coordinator prompts (default false)
+```
+
+The injected block carries the same "not a benchmark" disclaimer and is only added
+to top-level (coordinator) jobs — a delegation child inherits its coordinator's
+routing decision. Routing stays advisory: the block never forces a route.

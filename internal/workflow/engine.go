@@ -194,6 +194,13 @@ type Engine struct {
 	// maxInlineArtifactTotalBytes aggregate budget (no new knob). With the flag
 	// off the enqueued prompt is byte-identical to before this field existed.
 	InjectUpstreamDepContext bool
+	// RouterContextEnabled, when true, appends the bounded (<=12 line) advisory
+	// observed-performance table (#530) to a TOP-LEVEL coordinator job's prompt so
+	// the coordinator can weigh which runtime/model/template has done well on this
+	// repo. It is opt-in via [router] context_enabled (default false); with the flag
+	// off no telemetry query runs and prompt assembly is byte-identical. Routing
+	// stays advisory in v1 — the block never forces a route.
+	RouterContextEnabled bool
 	// MaxDelegationTokenBudget is the cumulative per-root token budget (input +
 	// output, summed across a coordination tree) that bounds a delegation tree by
 	// cost in addition to depth/width/total-jobs/wall-clock (#338 Part B). When a
@@ -424,7 +431,7 @@ func (e Engine) now() time.Time {
 // path is byte-identical. The hook maps the terminal JobState to the event_type,
 // resolves root_id from the payload, and ships a redacted event fire-and-forget.
 func (e Engine) mailbox() Mailbox {
-	mb := Mailbox{Store: e.Store, CanaryEnabled: e.CanaryEnabled, deferBlocker: e.BlockerDeferrer, RuntimeDefaultModel: e.RuntimeDefaultModel}
+	mb := Mailbox{Store: e.Store, CanaryEnabled: e.CanaryEnabled, deferBlocker: e.BlockerDeferrer, RuntimeDefaultModel: e.RuntimeDefaultModel, routerContextEnabled: e.RouterContextEnabled}
 	// Wire the off-by-default memory hooks (#626). When e.Memory is nil (every
 	// non-enrolled path) both hooks stay nil, so Run's prompt assembly and terminal
 	// path are byte-identical. The hooks themselves also no-op when the executor

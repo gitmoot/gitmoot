@@ -7988,4 +7988,39 @@ CREATE TABLE preset_session_state (
 	PRIMARY KEY (runtime, session_id, preset_id, preset_commit)
 );
 	`,
+	// #530 execution-grounded routing telemetry: one row per job terminal
+	// transition capturing which (action, runtime, model, template) combination ran
+	// and how it turned out (state/decision/approval + coarse tests-run + duration +
+	// tokens). Pure additive append (CREATE TABLE/INDEX only): the table stays empty
+	// until a job finishes AFTER this migration, so every existing DB reads
+	// identically, and the row write is best-effort/fail-safe (a telemetry error
+	// never fails a job). Consumed read-only by `gitmoot router summary` and the
+	// optional (off-by-default) coordinator context block; NOTHING reads it back to
+	// change routing behavior in v1 — it is advisory only. The two indexes back the
+	// summary's repo/action filters and the --since lower bound.
+	`
+CREATE TABLE routing_telemetry (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	job_id TEXT NOT NULL DEFAULT '',
+	repo TEXT NOT NULL DEFAULT '',
+	action TEXT NOT NULL DEFAULT '',
+	phase TEXT NOT NULL DEFAULT '',
+	runtime TEXT NOT NULL DEFAULT '',
+	model TEXT NOT NULL DEFAULT '',
+	agent TEXT NOT NULL DEFAULT '',
+	template_id TEXT NOT NULL DEFAULT '',
+	template_commit TEXT NOT NULL DEFAULT '',
+	job_state TEXT NOT NULL DEFAULT '',
+	decision TEXT NOT NULL DEFAULT '',
+	approved INTEGER NOT NULL DEFAULT 0,
+	tests_run INTEGER NOT NULL DEFAULT 0,
+	duration_ms INTEGER NOT NULL DEFAULT 0,
+	input_tokens INTEGER NOT NULL DEFAULT 0,
+	output_tokens INTEGER NOT NULL DEFAULT 0,
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_routing_telemetry_repo_action ON routing_telemetry(repo, action);
+CREATE INDEX idx_routing_telemetry_created ON routing_telemetry(created_at);
+	`,
 }

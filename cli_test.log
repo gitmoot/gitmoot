@@ -1,0 +1,4 @@
+ok  	github.com/jerryfane/gitmoot/internal/cli	226.757s
+ok  	github.com/jerryfane/gitmoot/internal/cli/style	0.003s
+ok  	github.com/jerryfane/gitmoot/internal/cli/tui	0.486s
+CLI_EXIT=0
