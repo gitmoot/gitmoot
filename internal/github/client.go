@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -603,7 +604,14 @@ func (c *GhClient) GetPullRequest(ctx context.Context, repo Repository, number i
 }
 
 func (c *GhClient) CreatePullRequest(ctx context.Context, input CreatePullRequestInput) (PullRequest, error) {
-	args := []string{"pr", "create", "--repo", input.Repo.FullName(), "--title", input.Title, "--body", input.Body, "--head", input.Head, "--base", input.Base}
+	bodyArgs, cleanup, err := bodyFlagArgs(input.Body)
+	if err != nil {
+		return PullRequest{}, err
+	}
+	defer cleanup()
+	args := []string{"pr", "create", "--repo", input.Repo.FullName(), "--title", input.Title}
+	args = append(args, bodyArgs...)
+	args = append(args, "--head", input.Head, "--base", input.Base)
 	if input.Draft {
 		args = append(args, "--draft")
 	}
@@ -756,7 +764,13 @@ func (c *GhClient) ListRepoIssueComments(ctx context.Context, repo Repository, s
 
 func (c *GhClient) PostIssueComment(ctx context.Context, repo Repository, issueNumber int64, body string) (IssueComment, error) {
 	var comment IssueComment
-	err := c.apiJSON(ctx, true, &comment, endpoint(repo, "issues", issueNumber, "comments"), "-f", "body="+body)
+	bodyArgs, cleanup, err := apiBodyFieldArgs(body)
+	if err != nil {
+		return IssueComment{}, err
+	}
+	defer cleanup()
+	args := append([]string{endpoint(repo, "issues", issueNumber, "comments")}, bodyArgs...)
+	err = c.apiJSON(ctx, true, &comment, args...)
 	return comment, err
 }
 
@@ -778,10 +792,14 @@ func (c *GhClient) SearchOpenIssues(ctx context.Context, repo Repository, text s
 
 func (c *GhClient) CreateIssue(ctx context.Context, input CreateIssueInput) (Issue, error) {
 	var issue Issue
-	err := c.apiJSON(ctx, true, &issue,
-		endpoint(input.Repo, "issues"),
-		"-f", "title="+input.Title,
-		"-f", "body="+input.Body)
+	bodyArgs, cleanup, err := apiBodyFieldArgs(input.Body)
+	if err != nil {
+		return Issue{}, err
+	}
+	defer cleanup()
+	args := []string{endpoint(input.Repo, "issues"), "-f", "title=" + input.Title}
+	args = append(args, bodyArgs...)
+	err = c.apiJSON(ctx, true, &issue, args...)
 	if err != nil {
 		return Issue{}, err
 	}
@@ -880,7 +898,12 @@ func (c *GhClient) MergePullRequest(ctx context.Context, input MergePullRequestI
 		args = append(args, "--subject", input.Subject)
 	}
 	if input.Body != "" {
-		args = append(args, "--body", input.Body)
+		bodyArgs, cleanup, err := bodyFlagArgs(input.Body)
+		if err != nil {
+			return MergeResult{}, err
+		}
+		defer cleanup()
+		args = append(args, bodyArgs...)
 	}
 	if input.MatchHeadCommit != "" {
 		args = append(args, "--match-head-commit", input.MatchHeadCommit)
@@ -1290,6 +1313,74 @@ func commandError(result subprocess.Result, err error) error {
 		return err
 	}
 	return fmt.Errorf("%s: %w", detail, err)
+}
+
+// bodyFileThreshold is the byte size above which a GitHub body (issue/PR/comment)
+// is handed to gh via a temp file instead of a single argv argument. The OS caps
+// a single argv element (and the whole argv+env block) at roughly 128KB
+// (MAX_ARG_STRLEN); passing a larger body inline makes fork/exec fail with
+// "argument list too long" before gh ever runs (#734). 100KB leaves headroom for
+// the surrounding flags while staying byte-identical to the old inline behavior
+// for every ordinary body.
+const bodyFileThreshold = 100 * 1024
+
+// writeGhBodyTempFile writes body to a fresh temp file and returns its path plus
+// a cleanup func that removes it. The caller MUST defer cleanup so the file is
+// removed after the gh invocation (including all internal retries) completes.
+func writeGhBodyTempFile(body string) (string, func(), error) {
+	f, err := os.CreateTemp("", "gitmoot-gh-body-*.md")
+	if err != nil {
+		return "", func() {}, err
+	}
+	name := f.Name()
+	cleanup := func() { _ = os.Remove(name) }
+	if _, err := f.WriteString(body); err != nil {
+		_ = f.Close()
+		cleanup()
+		return "", func() {}, err
+	}
+	if err := f.Close(); err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	return name, cleanup, nil
+}
+
+// bodyFlagArgs returns the gh arguments that supply body to a gh verb that
+// accepts `--body`/`--body-file` (e.g. `gh pr create`, `gh pr merge`). A body at
+// or below bodyFileThreshold is passed inline as `--body <body>` — byte-identical
+// to the historical behavior — while a larger one is written to a temp file and
+// passed as `--body-file <path>` to stay under ARG_MAX (#734). The returned
+// cleanup removes any temp file and must be deferred by the caller.
+func bodyFlagArgs(body string) (args []string, cleanup func(), err error) {
+	if len(body) <= bodyFileThreshold {
+		return []string{"--body", body}, func() {}, nil
+	}
+	path, cleanup, err := writeGhBodyTempFile(body)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	return []string{"--body-file", path}, cleanup, nil
+}
+
+// apiBodyFieldArgs returns the `gh api` field arguments that supply the "body"
+// parameter. A body at or below bodyFileThreshold is passed inline as
+// `-f body=<body>` — byte-identical to the historical behavior — while a larger
+// one is written to a temp file and passed as `-F body=@<path>`, which tells
+// `gh api` to read the field value from that file instead of taking it as a
+// single argv argument that would blow ARG_MAX (#734). gh's `-F/--field` `@file`
+// magic reads the file content verbatim as the string value; the file-read path
+// bypasses the true/false/number type coercion, so a body is never re-typed. The
+// returned cleanup removes any temp file and must be deferred by the caller.
+func apiBodyFieldArgs(body string) (args []string, cleanup func(), err error) {
+	if len(body) <= bodyFileThreshold {
+		return []string{"-f", "body=" + body}, func() {}, nil
+	}
+	path, cleanup, err := writeGhBodyTempFile(body)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	return []string{"-F", "body=@" + path}, cleanup, nil
 }
 
 func isRateLimit(result subprocess.Result) bool {

@@ -14,6 +14,7 @@ import (
 	"io"
 	neturl "net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -6188,6 +6189,7 @@ func publishSkillOptTrainReview(ctx context.Context, paths config.Paths, store *
 		Body:  body,
 	})
 	if err != nil {
+		downgradeReviewMarkerOnLaunchFailure(paths, session, iteration, postingMetadata, err)
 		return skillOptTrainReviewPublishResult{}, err
 	}
 	published := feedback.GitHubPublishResult{Repo: repo, IssueNumber: issue.Number, URL: issue.URL, Mode: "issue"}
@@ -6319,6 +6321,44 @@ func skillOptTrainReviewWatch(ctx context.Context, store *db.Store, iteration db
 		StaleThresholdSeconds: int64(skillOptReviewWatchDefaultStaleThreshold.Seconds()),
 		MetadataJSON:          string(metadataJSON),
 	}, nil
+}
+
+// isExecLaunchFailure reports whether err is a failure to even launch the gh
+// subprocess — a missing binary (exec.ErrNotFound) or a failed fork/exec such as
+// ARG_MAX "argument list too long" (#734). In every such case the child process
+// never started, so no GitHub request left this machine.
+func isExecLaunchFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, exec.ErrNotFound) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "fork/exec") ||
+		strings.Contains(msg, "argument list too long")
+}
+
+// downgradeReviewMarkerOnLaunchFailure clears the conservative posting_external
+// latch when the gh publish call failed to launch (fork/exec / ARG_MAX / missing
+// binary). Because the external GitHub post never started, no duplicate issue can
+// exist, so leaving the posting_external marker — which recover treats as "the
+// post may have happened, a human must inspect before retrying" — would wedge the
+// session behind a phantom duplicate. It rewrites the marker as failed_pre_exec,
+// which recover treats as "no external post occurred", so the next attempt
+// proceeds fresh. For every other error class (a timeout, a kill mid-flight) the
+// request may have reached GitHub, so the latch is deliberately left intact.
+func downgradeReviewMarkerOnLaunchFailure(paths config.Paths, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, postingMetadata map[string]any, err error) {
+	if !isExecLaunchFailure(err) {
+		return
+	}
+	failed := make(map[string]any, len(postingMetadata)+2)
+	for key, value := range postingMetadata {
+		failed[key] = value
+	}
+	failed["status"] = "failed_pre_exec"
+	failed["failed_pre_exec_at"] = time.Now().UTC().Format(time.RFC3339Nano)
+	_ = writeSkillOptTrainReviewRecovery(paths, session, iteration, failed)
 }
 
 func writeSkillOptTrainReviewRecovery(paths config.Paths, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, metadata map[string]any) error {
