@@ -53,6 +53,16 @@ type Agent struct {
 	// per-job cost. Never set for long-lived registered agents, whose sessions
 	// span many jobs. In-memory only; not persisted on the agents table.
 	SingleUseSession bool
+	// WorkingDir is the resolved filesystem checkout directory the runtime
+	// adapter should chdir into for a delivery. It is DISTINCT from RepoScope,
+	// which stays in "owner/repo" form (and is validated as such). Callers that
+	// need a real subprocess to run inside a repo checkout (e.g. the SkillOpt
+	// synth loop) resolve the repo's registered db.Repo.CheckoutPath and set it
+	// here; the delivery seam prefers this over RepoScope when picking the
+	// adapter Dir. In-memory only; not persisted on the agents table and never
+	// marshaled to the wire. Empty means "fall back to RepoScope" (unchanged
+	// legacy behavior for callers that never set it).
+	WorkingDir string
 }
 
 type Job struct {

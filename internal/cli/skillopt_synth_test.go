@@ -313,6 +313,47 @@ func TestRunSkillOptSynthRejectGate(t *testing.T) {
 
 // TestRunSkillOptSynthMissingFlags proves required-flag validation and that an
 // unknown agent errors cleanly.
+// TestResolveSynthAgentResolvesCheckoutPath proves the review fix for #535: a
+// resolved agent carries the registered repo's filesystem CheckoutPath in
+// WorkingDir (so a real, non-stubbed delivery chdirs into an existing directory)
+// while RepoScope stays in "owner/repo" form. When the repo is not registered,
+// WorkingDir stays empty so the delivery seam falls back to RepoScope.
+func TestResolveSynthAgentResolvesCheckoutPath(t *testing.T) {
+	home, store := synthTestHome(t, "weak-bot")
+	_ = home
+	ctx := context.Background()
+	checkout := t.TempDir()
+	if err := store.UpsertRepo(ctx, db.Repo{
+		Owner:         "acme",
+		Name:          "widgets",
+		DefaultBranch: "main",
+		CheckoutPath:  checkout,
+		Enabled:       true,
+	}); err != nil {
+		t.Fatalf("UpsertRepo: %v", err)
+	}
+
+	agent, err := resolveSynthAgent(ctx, store, "weak-bot", "acme/widgets")
+	if err != nil {
+		t.Fatalf("resolveSynthAgent: %v", err)
+	}
+	if agent.RepoScope != "acme/widgets" {
+		t.Fatalf("RepoScope = %q, want acme/widgets (must stay owner/repo form)", agent.RepoScope)
+	}
+	if agent.WorkingDir != checkout {
+		t.Fatalf("WorkingDir = %q, want resolved checkout %q", agent.WorkingDir, checkout)
+	}
+
+	// Unregistered repo: WorkingDir stays empty so the seam falls back to RepoScope.
+	other, err := resolveSynthAgent(ctx, store, "weak-bot", "acme/unregistered")
+	if err != nil {
+		t.Fatalf("resolveSynthAgent (unregistered): %v", err)
+	}
+	if other.WorkingDir != "" {
+		t.Fatalf("WorkingDir = %q, want empty for unregistered repo", other.WorkingDir)
+	}
+}
+
 func TestRunSkillOptSynthMissingFlags(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer

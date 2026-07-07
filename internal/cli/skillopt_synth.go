@@ -472,6 +472,18 @@ func resolveSynthAgent(ctx context.Context, store *db.Store, name, repo string) 
 	if strings.TrimSpace(agent.RepoScope) == "" {
 		agent.RepoScope = repo
 	}
+	// Resolve the repo scope to its registered checkout directory so a real
+	// (non-stubbed) delivery chdirs into an existing path instead of the bogus
+	// relative "owner/repo" RepoScope form. RepoScope itself stays in owner/repo
+	// form (it is validated as such by the adapter). When the repo is not
+	// registered or carries no checkout, WorkingDir stays empty and the delivery
+	// seam falls back to RepoScope — unit tests stub the seam, so this lookup is
+	// best-effort and never fails the run.
+	if scope := strings.TrimSpace(agent.RepoScope); scope != "" {
+		if record, repoErr := store.GetRepo(ctx, scope); repoErr == nil {
+			agent.WorkingDir = strings.TrimSpace(record.CheckoutPath)
+		}
+	}
 	return agent, nil
 }
 
