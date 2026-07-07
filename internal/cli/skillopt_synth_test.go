@@ -5,12 +5,14 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/runtime"
+	"github.com/jerryfane/gitmoot/internal/subprocess"
 )
 
 // TestClassifySynthItem exhaustively covers the pure accept/reject decision and
@@ -172,6 +174,60 @@ func withScriptedSynthDeliver(t *testing.T, challenger, weak, strong, judge stri
 		default:
 			return "", nil
 		}
+	}
+}
+
+// envelopeClaudeRunner is a subprocess.Runner that returns a fixed claude
+// --output-format json envelope for every invocation, mirroring the real claude
+// CLI's Start output so a real ClaudeAdapter runs end-to-end with no LLM.
+type envelopeClaudeRunner struct{ stdout string }
+
+func (r envelopeClaudeRunner) Run(context.Context, string, string, ...string) (subprocess.Result, error) {
+	return subprocess.Result{Stdout: r.stdout}, nil
+}
+
+func (r envelopeClaudeRunner) LookPath(file string) (string, error) { return "/usr/bin/" + file, nil }
+
+// TestRealSkillOptABDeliverUnwrapsClaudeEnvelopeForSynth is the #721 consumer
+// regression. It drives the REAL delivery seam (realSkillOptABDeliver) with a
+// forked-session claude agent (empty RuntimeRef → adapter.Start, the synth
+// challenger path) wired to a real ClaudeAdapter over a fake runner that returns
+// a claude CLI JSON envelope. The delivered answer must be the envelope's inner
+// "result" text — NOT the whole envelope — so parseSynthGeneratedItem finds the
+// context/question/rubric. Before the fix Start leaked the envelope as Raw and
+// this parse returned "synth item missing context, question, or rubric"
+// (bad_rubric, the live failure).
+func TestRealSkillOptABDeliverUnwrapsClaudeEnvelopeForSynth(t *testing.T) {
+	inner := `{"context":"A legacy monolith with no tests.","question":"Outline a safe migration.","rubric":"Rewards incremental strangler-fig steps."}`
+	envelope := `{"type":"result","subtype":"success","is_error":false,` +
+		`"session_id":"550e8400-e29b-41d4-a716-446655440010",` +
+		`"result":` + strconv.Quote(inner) + `,` +
+		`"usage":{"input_tokens":10,"output_tokens":20}}`
+
+	restore := replaceRuntimeFactory(runtime.Factory{Runner: envelopeClaudeRunner{stdout: envelope}})
+	t.Cleanup(restore)
+
+	// Empty RuntimeRef routes realSkillOptABDeliver through adapter.Start (a fresh
+	// throwaway session) — the exact skillopt synth challenger delivery path.
+	answer, err := realSkillOptABDeliver(context.Background(), runtime.Agent{
+		Name:       "challenger-bot",
+		Role:       "reviewer",
+		Runtime:    runtime.ClaudeRuntime,
+		RepoScope:  "acme/widgets",
+		RuntimeRef: "",
+	}, synthChallengerPrompt("", ""))
+	if err != nil {
+		t.Fatalf("realSkillOptABDeliver: %v", err)
+	}
+	if answer != inner {
+		t.Fatalf("delivered answer = %q, want the unwrapped inner result %q", answer, inner)
+	}
+	item, err := parseSynthGeneratedItem(answer)
+	if err != nil {
+		t.Fatalf("parseSynthGeneratedItem on the delivered answer failed (the #721 bad_rubric bug): %v (answer=%q)", err, answer)
+	}
+	if item.Context == "" || item.Question == "" || item.Rubric == "" {
+		t.Fatalf("parsed synth item missing fields: %+v", item)
 	}
 }
 

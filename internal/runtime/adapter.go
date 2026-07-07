@@ -639,7 +639,18 @@ func (a ClaudeAdapter) Start(ctx context.Context, request StartRequest) (StartRe
 	if err != nil {
 		return StartResult{Raw: result.Stdout + result.Stderr}, claudeCommandError(result, err)
 	}
-	return StartResult{RuntimeRef: runtimeRef, Raw: result.Stdout}, nil
+	// Unwrap the --output-format json result envelope so forked-session
+	// consumers (skillopt synth/ab) that parse Raw as the assistant's answer see
+	// the answer text, not the CLI envelope (#721). Reuses the same helper the
+	// Deliver path uses to build Summary. Fail-open: fall back to the raw stdout
+	// when stdout is not the envelope or carries no "result" field (e.g. an older
+	// CLI's plain-text --output-format fallback), so Raw always surfaces the
+	// underlying text and unwrap never errors.
+	raw := result.Stdout
+	if summary, _, _ := parseClaudeJSONResult(result.Stdout); summary != "" {
+		raw = summary
+	}
+	return StartResult{RuntimeRef: runtimeRef, Raw: raw}, nil
 }
 
 func (a ClaudeAdapter) Validate(_ context.Context, agent Agent) error {

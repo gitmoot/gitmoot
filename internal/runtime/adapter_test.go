@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -614,6 +615,56 @@ func TestClaudeStartCommandUsesGeneratedSessionID(t *testing.T) {
 		t.Fatalf("runtime ref = %q", result.RuntimeRef)
 	}
 	runner.want(t, 0, "claude", "--session-id", "550e8400-e29b-41d4-a716-446655440010", "-p", "--output-format", "json", "--", "initialize")
+}
+
+// TestClaudeStartUnwrapsJSONEnvelope pins the #721 fix: Start must surface the
+// envelope's inner "result" text as Raw (not the whole CLI JSON envelope) so
+// forked-session consumers that parse Raw as JSON (skillopt synth/ab) see the
+// assistant's actual answer, while corrupt/non-JSON/empty envelopes fail-open to
+// the raw stdout.
+func TestClaudeStartUnwrapsJSONEnvelope(t *testing.T) {
+	// A realistic claude --output-format json envelope whose inner result is
+	// itself a JSON object (the shape skillopt synth's challenger returns).
+	inner := `{"context":"...","question":"2+2?","rubric":"exact match"}`
+	envelope := `{"type":"result","subtype":"success","is_error":false,` +
+		`"session_id":"550e8400-e29b-41d4-a716-446655440010",` +
+		`"result":` + strconv.Quote(inner) + `,` +
+		`"usage":{"input_tokens":12,"output_tokens":34}}`
+
+	for _, tt := range []struct {
+		name    string
+		stdout  string
+		wantRaw string
+	}{
+		{name: "unwraps inner result", stdout: envelope, wantRaw: inner},
+		{name: "plain answer envelope", stdout: `{"type":"result","result":"the answer"}`, wantRaw: "the answer"},
+		{name: "non-json falls back to stdout", stdout: "not json at all", wantRaw: "not json at all"},
+		{name: "empty result field falls back to stdout", stdout: `{"type":"result","result":""}`, wantRaw: `{"type":"result","result":""}`},
+		{name: "envelope without result field falls back", stdout: `{"type":"result","subtype":"error"}`, wantRaw: `{"type":"result","subtype":"error"}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &fakeRunner{results: []subprocess.Result{{Stdout: tt.stdout}}}
+			adapter := ClaudeAdapter{
+				Runner: runner,
+				NewRuntimeRef: func() (string, error) {
+					return "550e8400-e29b-41d4-a716-446655440010", nil
+				},
+			}
+			agent := Agent{Name: "challenger", Role: "reviewer", Runtime: ClaudeRuntime, RepoScope: "jerryfane/gitmoot"}
+
+			result, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "generate"})
+			if err != nil {
+				t.Fatalf("Start returned error: %v", err)
+			}
+			if result.Raw != tt.wantRaw {
+				t.Fatalf("Raw = %q, want %q", result.Raw, tt.wantRaw)
+			}
+			// RuntimeRef behavior stays identical regardless of unwrap outcome.
+			if result.RuntimeRef != "550e8400-e29b-41d4-a716-446655440010" {
+				t.Fatalf("RuntimeRef = %q, want the generated ref", result.RuntimeRef)
+			}
+		})
+	}
 }
 
 func TestClaudeStartCommandAppliesAutonomyPolicy(t *testing.T) {
