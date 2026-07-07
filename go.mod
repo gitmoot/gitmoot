@@ -8,18 +8,11 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/ansi v0.11.6
 	github.com/creachadair/tomledit v0.0.29
-	github.com/jerryfane/gitmoot-dashboard v0.0.0-20260706031317-289f7880d1de
+	github.com/jerryfane/gitmoot-dashboard v0.0.0-20260707054513-bd25d33910ee
 	github.com/muesli/termenv v0.16.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.50.1
 )
-
-// DEV WIRING (#704): the Pipelines DataSource methods depend on the gitmoot-dashboard
-// Pipelines/PipelineRun contract, which is not yet published. Point at the local Stage A
-// worktree until the dashboard PR (dashboard#37) merges; the lead swaps this for the
-// real pseudo-version (go get github.com/jerryfane/gitmoot-dashboard@<newrev>) before
-// this PR opens for merge. TEMPORARY — must not merge with the replace in place.
-replace github.com/jerryfane/gitmoot-dashboard => /root/gitmoot-dashboard-wt/pipelines
 
 require (
 	github.com/atotto/clipboard v0.1.4 // indirect
