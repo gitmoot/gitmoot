@@ -25,6 +25,13 @@ type AgentType struct {
 	// the per-agent switch for both the READ path (inject prior learnings) and the
 	// Phase-1 SHADOW writes (log returned learnings to memory_observations).
 	Memory bool
+	// ChatAutoRespond enrolls this agent in the chat auto-respond sweep (#534
+	// V1.5). Default false (off) — an agent that never sets it behaves
+	// byte-identically. It is the per-agent opt-in that pairs with the global
+	// [chat].auto_respond switch: BOTH must be true before the daemon sweep will
+	// auto-enqueue a bounded read-only ask when this agent is @mentioned in a chat
+	// message. Wired exactly like Memory above.
+	ChatAutoRespond bool
 }
 
 func LoadAgentTypes(paths Paths) (map[string]AgentType, error) {
@@ -188,6 +195,13 @@ func applyAgentTypeField(entry *AgentType, key string, value string) error {
 		}
 		entry.Memory = parsed
 		return nil
+	case "chat_autorespond":
+		parsed, err := parseConfigBool(value)
+		if err != nil {
+			return err
+		}
+		entry.ChatAutoRespond = parsed
+		return nil
 	default:
 		return nil
 	}
@@ -341,6 +355,11 @@ func writeAgentTypeBlock(builder *strings.Builder, entry AgentType) {
 	// touched memory stays byte-identical to before this field existed.
 	if entry.Memory {
 		builder.WriteString("memory = true\n")
+	}
+	// Same discipline for chat auto-respond enrollment (#534 V1.5): only emit when
+	// opted in, so an agent that never touched it round-trips byte-identically.
+	if entry.ChatAutoRespond {
+		builder.WriteString("chat_autorespond = true\n")
 	}
 }
 

@@ -832,6 +832,124 @@ func (s *Store) ListChatThreadParticipantsForThread(ctx context.Context, threadI
 	return out, rows.Err()
 }
 
+// ChatAutoRespondCandidate is one (thread, agent) pair the auto-respond sweep may
+// act on (#534 V1.5): an OPEN thread carrying at least one resolved+unread mention
+// of the agent on a kind='chat' message. LastMessageID/LastTsMs identify the NEWEST
+// such triggering message — used to render the reply context and to back-link the
+// enqueued job's result via reply_to. It is deliberately kind-scoped to 'chat':
+// job_result / system / promotion_request messages NEVER produce a candidate, which
+// is the structural (not prose) anti-ping-pong guarantee.
+type ChatAutoRespondCandidate struct {
+	ThreadID      string
+	ThreadSlug    string
+	Repo          string
+	Agent         string
+	LastMessageID string
+	LastTsMs      int64
+}
+
+// ListChatAutoRespondCandidates returns one candidate per (thread, agent) with an
+// unread, resolved mention on a kind='chat' message in an OPEN thread, scoped to
+// this DB's home_id (agent_origin) — the same "no read path assumes origin==self"
+// discipline the inbox uses. The join to chat_messages with kind='chat' is what
+// makes the trigger STRUCTURALLY impossible to fire from a job_result/system/
+// promotion_request message. Rows arrive grouped by (thread, agent) with the newest
+// triggering message first, so the caller keeps the first row per group. The caller
+// (the sweep) further filters to config-enrolled agents; this query is generic.
+func (s *Store) ListChatAutoRespondCandidates(ctx context.Context) ([]ChatAutoRespondCandidate, error) {
+	origin, err := s.HomeID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	const query = `SELECT t.id, t.slug, t.repo, mn.agent, m.id, m.ts_ms
+		FROM chat_mentions mn
+		JOIN chat_messages m ON m.id = mn.message_id
+		JOIN chat_threads t ON t.id = mn.thread_id
+		WHERE mn.agent_origin = ? AND mn.resolved = 1 AND mn.unread = 1
+			AND m.kind = ? AND t.state = ?
+		ORDER BY t.id, mn.agent, m.ts_ms DESC, m.id DESC`
+	rows, err := s.db.QueryContext(ctx, query, origin, ChatKindChat, ChatThreadStateOpen)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ChatAutoRespondCandidate
+	var lastKey string
+	for rows.Next() {
+		var c ChatAutoRespondCandidate
+		if err := rows.Scan(&c.ThreadID, &c.ThreadSlug, &c.Repo, &c.Agent, &c.LastMessageID, &c.LastTsMs); err != nil {
+			return nil, err
+		}
+		key := c.ThreadID + "\x00" + c.Agent
+		if key == lastKey {
+			// A later (older) mention in the same (thread, agent) group — the newest
+			// already captured it, so skip.
+			continue
+		}
+		lastKey = key
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// CountChatAgentAutoResponses returns how many auto-respond replies the agent has
+// already posted into the thread, plus the ts_ms of the most recent one (0 when
+// none) — the cap and cooldown inputs for the sweep (#534 V1.5). An auto-respond
+// reply is the agent-authored kind='job_result' message the daemon back-links via
+// postChatThreadResult, so counting the agent's job_result rows in the thread is the
+// count of its prior auto-responses. (A human-initiated `chat task` result in the
+// same thread also lands as an agent job_result; folding it in only makes the cap
+// MORE conservative — it can never let an agent exceed the cap — so the bound stays
+// safe.) Scoped by (thread, author_name, author_kind=agent, kind=job_result).
+func (s *Store) CountChatAgentAutoResponses(ctx context.Context, threadID, agent string) (int, int64, error) {
+	var count int
+	var lastTs sql.NullInt64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(1), COALESCE(MAX(ts_ms), 0) FROM chat_messages
+			WHERE thread_id = ? AND author_kind = ? AND author_name = ? AND kind = ?`,
+		strings.TrimSpace(threadID), ChatAuthorKindAgent, strings.TrimSpace(agent), ChatKindJobResult).Scan(&count, &lastTs); err != nil {
+		return 0, 0, err
+	}
+	return count, lastTs.Int64, nil
+}
+
+// ChatSystemMessageExists reports whether a system message with the exact body
+// already exists in the thread — the idempotency check the sweep uses to post the
+// "cap reached" park message at most once (#534 V1.5). Matching the full body is
+// sufficient because the cap message embeds the agent name, so it is unique per
+// (thread, agent).
+func (s *Store) ChatSystemMessageExists(ctx context.Context, threadID, body string) (bool, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM chat_messages WHERE thread_id = ? AND kind = ? AND body = ?`,
+		strings.TrimSpace(threadID), ChatKindSystem, body).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// MarkChatChatMentionsRead clears the unread flag on the agent's resolved mentions
+// in a thread that sit on a kind='chat' message — the precise trigger set the
+// auto-respond sweep consumes (#534 V1.5). It is deliberately kind-scoped so it
+// never clears an ask-gate `system`-message mention (that is the human-answer
+// channel and must stay in the inbox). Scoped to this DB's home_id (agent_origin).
+// Returns the number of mentions cleared.
+func (s *Store) MarkChatChatMentionsRead(ctx context.Context, agent, threadID string) (int64, error) {
+	origin, err := s.HomeID(ctx)
+	if err != nil {
+		return 0, err
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE chat_mentions SET unread = 0
+			WHERE agent = ? AND agent_origin = ? AND thread_id = ? AND resolved = 1 AND unread = 1
+			AND message_id IN (SELECT id FROM chat_messages WHERE thread_id = ? AND kind = ?)`,
+		strings.TrimSpace(agent), origin, strings.TrimSpace(threadID), strings.TrimSpace(threadID), ChatKindChat)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // ---- helpers ---------------------------------------------------------------
 
 const chatThreadSelect = `SELECT id, slug, name, repo, origin, state, created_by, created_at, updated_at FROM chat_threads`

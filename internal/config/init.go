@@ -393,6 +393,32 @@ path = ""
 # models = ["gpt-5.5-codex", "gpt-5.4-codex"]
 # capabilities = ["review", "implement", "ask"]
 
+# [chat] is the OFF-BY-DEFAULT native-chat auto-respond policy (#534 V1.5). With no
+# [chat] section — or with no agent enrolled — behavior is byte-identical: the daemon
+# tick never touches the chat tables and no agent is ever auto-summoned. auto_respond
+# is the global kill switch (default false = OFF): only when true does the sweep run.
+# Enrollment is PER AGENT — add chat_autorespond = true to an [agents.<name>] block
+# (see [agents.builder] below) to opt that agent in; BOTH the global switch and the
+# per-agent flag must be true. When enrolled, each daemon tick looks for OPEN chat
+# threads with an unread @mention of the agent on a kind='chat' message (job_result /
+# system / promotion_request messages NEVER trigger) and enqueues ONE bounded
+# read-only ask through the normal dispatch gate; its reply is posted back as a
+# non-promotable job_result, so it can never itself re-trigger (structural
+# anti-ping-pong). auto_respond_cap (default 4) is the HARD cap on auto-responses per
+# (thread, agent): on the cap the thread HARD-STOPS — no auto-extension — and a
+# VISIBLE "needs a human" system message is posted into the thread. auto_respond_cooldown
+# (default "2m", a Go duration) is the minimum spacing between an agent's auto-responses
+# in a thread; a trigger seen inside the window is deferred, never dropped. cap must be
+# >= 0 and cooldown >= 0.
+# [chat]
+# auto_respond = false
+# auto_respond_cap = 4
+# auto_respond_cooldown = "2m"
+#
+# Enroll a specific agent (per-agent opt-in; omit for byte-identical default):
+# [agents.builder]
+# chat_autorespond = true
+
 # [merge_gate] tunes how the native merge gate handles a PR head that reports NO
 # external CI (issue #596). By default (no section) the gate defers concluding
 # "no CI" until a SECOND consecutive zero-external observation at the same head,
