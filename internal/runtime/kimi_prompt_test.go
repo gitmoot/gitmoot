@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -66,13 +67,16 @@ func kimiTestAgent() Agent {
 // and stages no temp file.
 func TestKimiPromptDeliveryShortPromptIsVerbatim(t *testing.T) {
 	prompt := "review this small change"
-	arg, cleanup, err := kimiPromptDelivery(prompt)
+	arg, extraArgs, cleanup, err := kimiPromptDelivery(prompt)
 	if err != nil {
 		t.Fatalf("kimiPromptDelivery: %v", err)
 	}
 	defer cleanup()
 	if arg != prompt {
 		t.Fatalf("short prompt not passed verbatim: got %q want %q", arg, prompt)
+	}
+	if len(extraArgs) != 0 {
+		t.Fatalf("short prompt should add no argv flags, got %v", extraArgs)
 	}
 	if kimiTempPromptPathRE.MatchString(arg) {
 		t.Fatalf("short prompt unexpectedly staged a temp file: %q", arg)
@@ -83,13 +87,16 @@ func TestKimiPromptDeliveryShortPromptIsVerbatim(t *testing.T) {
 // threshold must still go through argv unchanged.
 func TestKimiPromptDeliveryBoundaryJustBelowThreshold(t *testing.T) {
 	prompt := strings.Repeat("x", kimiMaxArgvPromptBytes-1)
-	arg, cleanup, err := kimiPromptDelivery(prompt)
+	arg, extraArgs, cleanup, err := kimiPromptDelivery(prompt)
 	if err != nil {
 		t.Fatalf("kimiPromptDelivery: %v", err)
 	}
 	defer cleanup()
 	if arg != prompt {
 		t.Fatalf("prompt at threshold-1 should be verbatim argv; got len=%d staged=%v", len(arg), kimiTempPromptPathRE.MatchString(arg))
+	}
+	if len(extraArgs) != 0 {
+		t.Fatalf("prompt at threshold-1 should add no argv flags, got %v", extraArgs)
 	}
 }
 
@@ -98,7 +105,7 @@ func TestKimiPromptDeliveryBoundaryJustBelowThreshold(t *testing.T) {
 // the returned arg is the argv-safe wrapper (much shorter than the prompt).
 func TestKimiPromptDeliveryBoundaryAtThreshold(t *testing.T) {
 	prompt := strings.Repeat("y", kimiMaxArgvPromptBytes)
-	arg, cleanup, err := kimiPromptDelivery(prompt)
+	arg, extraArgs, cleanup, err := kimiPromptDelivery(prompt)
 	if err != nil {
 		t.Fatalf("kimiPromptDelivery: %v", err)
 	}
@@ -109,6 +116,15 @@ func TestKimiPromptDeliveryBoundaryAtThreshold(t *testing.T) {
 	}
 	if len(arg) >= kimiMaxArgvPromptBytes {
 		t.Fatalf("wrapper arg is not argv-safe: len=%d (>= threshold %d)", len(arg), kimiMaxArgvPromptBytes)
+	}
+	// The staged directory MUST be granted to kimi via --add-dir, else kimi's
+	// workspace-scoped file-read tool cannot open the staged prompt (#723 review).
+	grant := kimiAddDirValue(extraArgs)
+	if grant == "" {
+		t.Fatalf("oversize prompt did not grant --add-dir; extraArgs=%v", extraArgs)
+	}
+	if filepath.Dir(path) != grant {
+		t.Fatalf("--add-dir %q does not contain staged prompt file %q", grant, path)
 	}
 	body, err := os.ReadFile(path)
 	if err != nil {
@@ -121,6 +137,21 @@ func TestKimiPromptDeliveryBoundaryAtThreshold(t *testing.T) {
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("cleanup did not remove temp file %s (err=%v)", path, err)
 	}
+	if _, err := os.Stat(grant); !os.IsNotExist(err) {
+		t.Fatalf("cleanup did not remove staged dir %s (err=%v)", grant, err)
+	}
+}
+
+// kimiAddDirValue returns the value passed to the last --add-dir flag in args, or
+// "" if none is present.
+func kimiAddDirValue(args []string) string {
+	dir := ""
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--add-dir" {
+			dir = args[i+1]
+		}
+	}
+	return dir
 }
 
 // TestKimiDeliverShortPromptUnchanged is the no-LLM E2E: a normal prompt drives
@@ -169,6 +200,15 @@ func TestKimiDeliverLongPromptUsesTempFile(t *testing.T) {
 	if len(runner.promptArg) >= kimiMaxArgvPromptBytes {
 		t.Fatalf("wrapper -p arg is not argv-safe: len=%d", len(runner.promptArg))
 	}
+	// The staged dir must be granted to kimi via --add-dir so its workspace-scoped
+	// file-read tool can open the staged prompt (#723 review).
+	grant := kimiAddDirValue(runner.lastArgs)
+	if grant == "" {
+		t.Fatalf("Deliver did not grant --add-dir for oversize prompt; argv=%v", runner.lastArgs)
+	}
+	if filepath.Dir(runner.stagedPath) != grant {
+		t.Fatalf("--add-dir %q does not contain staged prompt %q", grant, runner.stagedPath)
+	}
 	// The huge prompt must NOT appear in the argv anywhere.
 	if strings.Contains(strings.Join(runner.lastArgs, ""), prompt) {
 		t.Fatal("raw oversize prompt leaked into argv despite temp-file delivery")
@@ -192,6 +232,9 @@ func TestKimiStartLongPromptUsesTempFile(t *testing.T) {
 	if !runner.stagedRead || runner.stagedBody != prompt {
 		t.Fatalf("Start did not stage the oversize prompt intact (read=%v)", runner.stagedRead)
 	}
+	if grant := kimiAddDirValue(runner.lastArgs); grant == "" || filepath.Dir(runner.stagedPath) != grant {
+		t.Fatalf("Start did not grant --add-dir for staged prompt %q; argv=%v", runner.stagedPath, runner.lastArgs)
+	}
 	if _, err := os.Stat(runner.stagedPath); !os.IsNotExist(err) {
 		t.Fatalf("Start left temp file %s behind", runner.stagedPath)
 	}
@@ -214,6 +257,9 @@ func TestKimiCLILongPromptUsesTempFile(t *testing.T) {
 	joined := strings.Join(runner.lastArgs, "\x00")
 	if !strings.Contains(joined, "--print") {
 		t.Fatalf("legacy kimi-cli dropped --print: %v", runner.lastArgs)
+	}
+	if grant := kimiAddDirValue(runner.lastArgs); grant == "" || filepath.Dir(runner.stagedPath) != grant {
+		t.Fatalf("legacy kimi-cli did not grant --add-dir for staged prompt %q; argv=%v", runner.stagedPath, runner.lastArgs)
 	}
 	if strings.Contains(strings.Join(runner.lastArgs, ""), prompt) {
 		t.Fatal("raw oversize prompt leaked into legacy kimi-cli argv")

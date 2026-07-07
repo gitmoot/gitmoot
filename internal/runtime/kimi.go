@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/subprocess"
@@ -29,36 +30,40 @@ const (
 	kimiMaxArgvPromptBytes = 100 * 1024
 )
 
-// kimiPromptDelivery returns the string to pass as kimi's `-p` value plus a
-// cleanup func the caller MUST defer. For a normal prompt (below
-// kimiMaxArgvPromptBytes) it returns the prompt VERBATIM — byte-identical to the
-// historical argv path — and a no-op cleanup. For an oversize prompt it writes
-// the prompt to a temp file and returns a short wrapper instruction telling the
-// agent that the file is its full task, keeping the argv small enough to clear
-// MAX_ARG_STRLEN (see kimiMaxArgvPromptBytes). The temp file lives in the system
-// temp dir (not the job worktree) so it never pollutes or gets committed by an
-// implement job; kimi's default file-read tool can read it there.
-func kimiPromptDelivery(prompt string) (promptArg string, cleanup func(), err error) {
+// kimiPromptDelivery returns the string to pass as kimi's `-p` value, any extra
+// argv flags the caller MUST append BEFORE `-p`, and a cleanup func the caller
+// MUST defer. For a normal prompt (below kimiMaxArgvPromptBytes) it returns the
+// prompt VERBATIM — byte-identical to the historical argv path — no extra args,
+// and a no-op cleanup. For an oversize prompt it writes the prompt to a file in a
+// dedicated temp DIRECTORY and returns a short wrapper instruction naming that
+// file, keeping the argv small enough to clear MAX_ARG_STRLEN (see
+// kimiMaxArgvPromptBytes).
+//
+// CRITICAL (#723 review): kimi-code's file-read tool is scoped to the session's
+// workspace directories, so a file in the system temp dir is NOT readable by
+// default — the wrapper would name a path the agent cannot open and the real
+// prompt would be silently lost. We therefore grant the staged directory as an
+// additional workspace via `--add-dir <dir>` (a kimi-code 0.19.x flag: "Add an
+// additional workspace directory for this session"), which is returned in
+// extraArgs. Staging into a dedicated temp dir (not the job worktree) keeps the
+// file out of any implement job's `git add`, and RemoveAll on cleanup leaves
+// nothing behind.
+func kimiPromptDelivery(prompt string) (promptArg string, extraArgs []string, cleanup func(), err error) {
 	noop := func() {}
 	if len(prompt) < kimiMaxArgvPromptBytes {
-		return prompt, noop, nil
+		return prompt, nil, noop, nil
 	}
-	f, err := os.CreateTemp("", "gitmoot-kimi-prompt-*.txt")
+	dir, err := os.MkdirTemp("", "gitmoot-kimi-prompt-*")
 	if err != nil {
-		return "", noop, fmt.Errorf("stage oversize kimi prompt: %w", err)
+		return "", nil, noop, fmt.Errorf("stage oversize kimi prompt: %w", err)
 	}
-	path := f.Name()
-	remove := func() { _ = os.Remove(path) }
-	if _, err := f.WriteString(prompt); err != nil {
-		_ = f.Close()
+	remove := func() { _ = os.RemoveAll(dir) }
+	path := filepath.Join(dir, "prompt.txt")
+	if err := os.WriteFile(path, []byte(prompt), 0o600); err != nil {
 		remove()
-		return "", noop, fmt.Errorf("write oversize kimi prompt: %w", err)
+		return "", nil, noop, fmt.Errorf("write oversize kimi prompt: %w", err)
 	}
-	if err := f.Close(); err != nil {
-		remove()
-		return "", noop, fmt.Errorf("close oversize kimi prompt file: %w", err)
-	}
-	return kimiOversizePromptWrapper(path), remove, nil
+	return kimiOversizePromptWrapper(path), []string{"--add-dir", dir}, remove, nil
 }
 
 // kimiOversizePromptWrapper is the small argv-safe instruction that stands in for
@@ -98,11 +103,12 @@ func (a KimiAdapter) Start(ctx context.Context, request StartRequest) (StartResu
 	if request.Agent.Model != "" {
 		args = append(args, "--model", request.Agent.Model)
 	}
-	promptArg, cleanup, err := kimiPromptDelivery(request.Prompt)
+	promptArg, extraArgs, cleanup, err := kimiPromptDelivery(request.Prompt)
 	if err != nil {
 		return StartResult{}, err
 	}
 	defer cleanup()
+	args = append(args, extraArgs...)
 	args = append(args, "-p", promptArg, "--output-format", "stream-json")
 	result, err := a.runner().Run(ctx, a.Dir, "kimi", args...)
 	if err != nil {
@@ -144,11 +150,12 @@ func (a KimiAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result,
 	// and keeps Kimi a native runtime seat. agent.RuntimeRef stays validated but is not
 	// used to resume across directories.
 	_ = agent.RuntimeRef
-	promptArg, cleanup, err := kimiPromptDelivery(job.Prompt)
+	promptArg, extraArgs, cleanup, err := kimiPromptDelivery(job.Prompt)
 	if err != nil {
 		return Result{}, err
 	}
 	defer cleanup()
+	args = append(args, extraArgs...)
 	args = append(args, "-p", promptArg, "--output-format", "stream-json")
 	result, err := a.runner().Run(ctx, a.Dir, "kimi", args...)
 	if err != nil {
@@ -206,12 +213,12 @@ func (a KimiCLIAdapter) Start(ctx context.Context, request StartRequest) (StartR
 	if err != nil {
 		return StartResult{}, err
 	}
-	promptArg, cleanup, err := kimiPromptDelivery(request.Prompt)
+	promptArg, extraArgs, cleanup, err := kimiPromptDelivery(request.Prompt)
 	if err != nil {
 		return StartResult{}, err
 	}
 	defer cleanup()
-	args := kimiCLIPromptArgs(request.Agent, request.Agent.Model, promptArg)
+	args := kimiCLIPromptArgs(request.Agent, request.Agent.Model, promptArg, extraArgs)
 	result, err := a.runner().Run(ctx, a.Dir, "kimi", args...)
 	if err != nil {
 		return StartResult{Raw: result.Stdout + result.Stderr}, kimiCommandError(result, err)
@@ -241,12 +248,12 @@ func (a KimiCLIAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Resu
 		return Result{}, err
 	}
 	_ = agent.RuntimeRef
-	promptArg, cleanup, err := kimiPromptDelivery(job.Prompt)
+	promptArg, extraArgs, cleanup, err := kimiPromptDelivery(job.Prompt)
 	if err != nil {
 		return Result{}, err
 	}
 	defer cleanup()
-	result, err := a.runner().Run(ctx, a.Dir, "kimi", kimiCLIPromptArgs(agent, effectiveModel(agent, job), promptArg)...)
+	result, err := a.runner().Run(ctx, a.Dir, "kimi", kimiCLIPromptArgs(agent, effectiveModel(agent, job), promptArg, extraArgs)...)
 	if err != nil {
 		return Result{Raw: result.Stdout + result.Stderr}, kimiCommandError(result, err)
 	}
@@ -284,14 +291,17 @@ func (a KimiCLIAdapter) newRuntimeRef() (string, error) {
 }
 
 // kimiCLIPromptArgs builds the legacy kimi-cli `--print -p` argument vector.
-// promptArg is the value already produced by kimiPromptDelivery (the verbatim
-// prompt for normal sizes, or the argv-safe temp-file wrapper for oversize
-// prompts), so this runtime shares the #723 MAX_ARG_STRLEN protection.
-func kimiCLIPromptArgs(agent Agent, model string, promptArg string) []string {
+// promptArg and extraArgs are the values already produced by kimiPromptDelivery
+// (the verbatim prompt with no extra args for normal sizes, or the argv-safe
+// temp-file wrapper plus the `--add-dir <dir>` workspace grant for oversize
+// prompts), so this runtime shares the #723 MAX_ARG_STRLEN protection AND the
+// workspace grant that makes the staged prompt file readable.
+func kimiCLIPromptArgs(agent Agent, model string, promptArg string, extraArgs []string) []string {
 	args := kimiPermissionArgs(agent)
 	if model != "" {
 		args = append(args, "--model", model)
 	}
+	args = append(args, extraArgs...)
 	return append(args, "--print", "-p", promptArg, "--output-format", "stream-json")
 }
 
