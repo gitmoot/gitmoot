@@ -296,6 +296,86 @@ func TestRunSkillOptSynthAcceptAndApprove(t *testing.T) {
 	}
 }
 
+// TestRunSkillOptSynthDeliversInScratchNotCheckout is the #725 deterministic no-LLM
+// E2E: even with the target repo registered to a real filesystem checkout, EVERY
+// delivery (challenger/weak/strong/judge) must be handed a fresh per-item temp
+// scratch dir as its adapter working dir — never the live checkout or the
+// "owner/repo" RepoScope — and those scratch dirs must be cleaned up after the run.
+func TestRunSkillOptSynthDeliversInScratchNotCheckout(t *testing.T) {
+	home, store := synthTestHome(t, "weak-bot", "strong-bot", "judge-bot")
+	ctx := context.Background()
+	// Register the repo with a real checkout — the pre-#725 resolveSynthAgent would
+	// have handed THIS directory to every delivery.
+	checkout := t.TempDir()
+	if err := store.UpsertRepo(ctx, db.Repo{
+		Owner: "acme", Name: "widgets", DefaultBranch: "main",
+		CheckoutPath: checkout, Enabled: true,
+	}); err != nil {
+		t.Fatalf("UpsertRepo: %v", err)
+	}
+
+	// Capturing seam: records the working dir of every delivered agent, then returns
+	// scripted answers so the accept path runs to completion with no LLM.
+	prev := skillOptSynthDeliver
+	t.Cleanup(func() { skillOptSynthDeliver = prev })
+	var deliveredDirs []string
+	skillOptSynthDeliver = func(_ context.Context, agent runtime.Agent, prompt string) (string, error) {
+		deliveredDirs = append(deliveredDirs, agent.WorkingDir)
+		switch {
+		case strings.Contains(prompt, "generating a synthetic review item"):
+			return `{"context":"A legacy monolith.","question":"Outline a safe migration.","rubric":"Rewards incremental steps."}`, nil
+		case strings.Contains(prompt, "Score two answers against a rubric"):
+			return `{"weak_score":0.2,"strong_score":0.9,"well_formed":true,"diagnostic":""}`, nil
+		case strings.Contains(prompt, "Answer the following question"):
+			if agent.Name == "weak-bot" {
+				return "rewrite it all at once", nil
+			}
+			return "wrap and migrate incrementally behind a facade", nil
+		default:
+			return "", nil
+		}
+	}
+
+	outDir := filepath.Join(t.TempDir(), "synth-out")
+	var stdout, stderr bytes.Buffer
+	code := runSkillOptSynth([]string{
+		"--template", "planner", "--repo", "acme/widgets",
+		"--weak", "weak-bot", "--strong", "strong-bot", "--judge", "judge-bot",
+		"--max-items", "1", "--out", outDir, "--home", home,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("synth exit = %d, stderr: %s", code, stderr.String())
+	}
+	if len(deliveredDirs) < 4 {
+		t.Fatalf("expected >=4 deliveries (challenger/weak/strong/judge), got %d", len(deliveredDirs))
+	}
+	var scratchDir string
+	for i, dir := range deliveredDirs {
+		if strings.TrimSpace(dir) == "" {
+			t.Fatalf("delivery %d had an empty working dir — the sandbox did not force a scratch dir", i)
+		}
+		if dir == checkout {
+			t.Fatalf("delivery %d ran in the live checkout %q (the #725 bug)", i, checkout)
+		}
+		if dir == "acme/widgets" {
+			t.Fatalf("delivery %d ran in the RepoScope %q, not a scratch dir", i, dir)
+		}
+		if !strings.HasPrefix(filepath.Base(dir), "gitmoot-synth-item-") {
+			t.Fatalf("delivery %d dir %q is not a per-item synth scratch dir", i, dir)
+		}
+		// All deliveries for one item share the same per-item scratch dir.
+		if scratchDir == "" {
+			scratchDir = dir
+		} else if dir != scratchDir {
+			t.Fatalf("delivery %d used a different scratch dir %q, want the shared per-item %q", i, dir, scratchDir)
+		}
+	}
+	// Cleanup: the per-item scratch dir must be gone after the run.
+	if _, err := os.Stat(scratchDir); !os.IsNotExist(err) {
+		t.Fatalf("scratch dir %q was not cleaned up after the item (stat err=%v)", scratchDir, err)
+	}
+}
+
 // TestRunSkillOptSynthRejectsTooEasyAndExhaustsRounds proves a non-discriminating
 // item is skipped with a too_easy diagnostic, no DB row is written, and the round
 // cap is honored.
@@ -369,12 +449,14 @@ func TestRunSkillOptSynthRejectGate(t *testing.T) {
 
 // TestRunSkillOptSynthMissingFlags proves required-flag validation and that an
 // unknown agent errors cleanly.
-// TestResolveSynthAgentResolvesCheckoutPath proves the review fix for #535: a
-// resolved agent carries the registered repo's filesystem CheckoutPath in
-// WorkingDir (so a real, non-stubbed delivery chdirs into an existing directory)
-// while RepoScope stays in "owner/repo" form. When the repo is not registered,
-// WorkingDir stays empty so the delivery seam falls back to RepoScope.
-func TestResolveSynthAgentResolvesCheckoutPath(t *testing.T) {
+// TestResolveSynthAgentNeverCarriesCheckout proves the #725 hard guarantee at the
+// resolve layer: even when the repo IS registered with a real filesystem checkout,
+// a resolved synth agent must NOT carry that checkout in WorkingDir. Every synth
+// delivery runs in a fresh per-item temp scratch dir instead (see
+// sandboxSynthAgent), so nothing in the synth path may hand an agentic CLI a live
+// checkout to write into. RepoScope still stays in "owner/repo" form for adapter
+// family resolution.
+func TestResolveSynthAgentNeverCarriesCheckout(t *testing.T) {
 	home, store := synthTestHome(t, "weak-bot")
 	_ = home
 	ctx := context.Background()
@@ -396,17 +478,52 @@ func TestResolveSynthAgentResolvesCheckoutPath(t *testing.T) {
 	if agent.RepoScope != "acme/widgets" {
 		t.Fatalf("RepoScope = %q, want acme/widgets (must stay owner/repo form)", agent.RepoScope)
 	}
-	if agent.WorkingDir != checkout {
-		t.Fatalf("WorkingDir = %q, want resolved checkout %q", agent.WorkingDir, checkout)
+	if agent.WorkingDir != "" {
+		t.Fatalf("WorkingDir = %q, want empty — synth agents must never carry the live checkout %q (#725)", agent.WorkingDir, checkout)
 	}
+}
 
-	// Unregistered repo: WorkingDir stays empty so the seam falls back to RepoScope.
-	other, err := resolveSynthAgent(ctx, store, "weak-bot", "acme/unregistered")
-	if err != nil {
-		t.Fatalf("resolveSynthAgent (unregistered): %v", err)
+// TestSandboxSynthAgentForcesScratchDir proves sandboxSynthAgent overrides the
+// adapter working dir to the scratch dir regardless of what the agent otherwise
+// carries, and leaves RepoScope intact for family resolution.
+func TestSandboxSynthAgentForcesScratchDir(t *testing.T) {
+	scratch := t.TempDir()
+	agent := runtime.Agent{
+		Name:       "weak-bot",
+		Runtime:    runtime.CodexRuntime,
+		RepoScope:  "acme/widgets",
+		WorkingDir: "/root/gitmoot", // a live checkout — must be overridden
 	}
-	if other.WorkingDir != "" {
-		t.Fatalf("WorkingDir = %q, want empty for unregistered repo", other.WorkingDir)
+	got := sandboxSynthAgent(agent, scratch)
+	if got.WorkingDir != scratch {
+		t.Fatalf("WorkingDir = %q, want scratch %q", got.WorkingDir, scratch)
+	}
+	if got.RepoScope != "acme/widgets" {
+		t.Fatalf("RepoScope = %q, want acme/widgets preserved", got.RepoScope)
+	}
+	// The original agent is not mutated (value copy).
+	if agent.WorkingDir != "/root/gitmoot" {
+		t.Fatalf("original agent mutated: WorkingDir = %q", agent.WorkingDir)
+	}
+}
+
+// TestSynthPromptsCarryEvalOnlyPreamble proves the #725 soft complement: the
+// challenger, attempt, and judge prompts all lead with the answer-only preamble
+// that tells an agentic CLI not to create files or run commands.
+func TestSynthPromptsCarryEvalOnlyPreamble(t *testing.T) {
+	item := synthGeneratedItem{Context: "ctx", Question: "q", Rubric: "r"}
+	prompts := map[string]string{
+		"challenger": synthChallengerPrompt("guidance", ""),
+		"attempt":    synthAttemptPrompt(item),
+		"judge":      synthJudgePrompt(item, "weak", "strong"),
+	}
+	for name, p := range prompts {
+		if !strings.HasPrefix(p, synthEvalOnlyPreamble) {
+			t.Fatalf("%s prompt does not lead with the eval-only preamble:\n%s", name, p)
+		}
+		if !strings.Contains(p, "Do NOT create files, run commands, start servers") {
+			t.Fatalf("%s prompt missing the do-not-execute instruction", name)
+		}
 	}
 }
 
