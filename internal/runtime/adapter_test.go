@@ -295,6 +295,63 @@ func TestCodexStartRejectsMissingThreadID(t *testing.T) {
 	runner.want(t, 0, "codex", "exec", "--json", "--", "initialize")
 }
 
+// TestCodexStartUnwrapsJSONTranscript pins the #724 fix: codex Start runs `codex
+// exec --json` (banner + thread.started + turn events + agent_message JSONL) and
+// must surface the agent_message .text as Raw — NOT the whole transcript — so
+// forked-session consumers that parse Raw as JSON (skillopt synth/ab) see the
+// assistant's actual answer. Streams with no agent_message (older CLI, plain-text
+// fallback) fail-open to the full stdout. RuntimeRef stays the parsed thread id
+// in every case.
+func TestCodexStartUnwrapsJSONTranscript(t *testing.T) {
+	const threadID = "019f3041-cfed-7e82-8766-b5ca75cf92da"
+	started := `{"type":"thread.started","thread_id":"` + threadID + `"}`
+	// The assistant's final message is itself a JSON object — the shape skillopt
+	// synth's challenger returns.
+	inner := `{"context":"...","question":"2+2?","rubric":"exact match"}`
+	// A realistic codex exec --json transcript: thread banner, turn start,
+	// reasoning noise, the agent_message, and the turn.completed usage line.
+	transcript := started + "\n" +
+		`{"type":"turn.started"}` + "\n" +
+		`{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"thinking hard about arithmetic"}}` + "\n" +
+		`{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":` + strconv.Quote(inner) + `}}` + "\n" +
+		`{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":34}}`
+
+	// A transcript that never emits an agent_message (only the thread.started the
+	// thread-id parser needs) must fail-open to the full stdout.
+	noMessage := started + "\n" + `{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}`
+
+	for _, tt := range []struct {
+		name    string
+		stdout  string
+		wantRaw string
+	}{
+		{name: "unwraps agent_message text", stdout: transcript, wantRaw: inner},
+		{name: "joins multiple agent_messages", stdout: started + "\n" +
+			`{"type":"item.completed","item":{"type":"agent_message","text":"first"}}` + "\n" +
+			`{"type":"item.completed","item":{"type":"agent_message","text":"second"}}`,
+			wantRaw: "first\n\nsecond"},
+		{name: "no agent_message falls back to stdout", stdout: noMessage, wantRaw: noMessage},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &fakeRunner{results: []subprocess.Result{{Stdout: tt.stdout}}}
+			adapter := CodexAdapter{Runner: runner}
+			agent := Agent{Name: "challenger", Role: "reviewer", Runtime: CodexRuntime, RepoScope: "jerryfane/gitmoot"}
+
+			result, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "generate"})
+			if err != nil {
+				t.Fatalf("Start returned error: %v", err)
+			}
+			if result.Raw != tt.wantRaw {
+				t.Fatalf("Raw = %q, want %q", result.Raw, tt.wantRaw)
+			}
+			// The unwrap never disturbs the parsed thread id.
+			if result.RuntimeRef != threadID {
+				t.Fatalf("RuntimeRef = %q, want %q", result.RuntimeRef, threadID)
+			}
+		})
+	}
+}
+
 func TestCodexDeliverLastSessionCommand(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "done"}}}
 	adapter := CodexAdapter{Runner: runner}

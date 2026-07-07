@@ -386,7 +386,19 @@ func (a CodexAdapter) Start(ctx context.Context, request StartRequest) (StartRes
 	if err != nil {
 		return StartResult{Raw: result.Stdout}, err
 	}
-	return StartResult{RuntimeRef: threadID, Raw: result.Stdout}, nil
+	// Unwrap the `codex exec --json` JSONL stream so forked-session consumers
+	// (skillopt synth/ab) that parse Raw as the assistant's answer see the
+	// agent_message text, not the whole transcript (banner, thread.started,
+	// turn events) — the codex flavor of #722. Reuses the same parser the
+	// Deliver path uses to build Summary. Fail-open: fall back to the raw stdout
+	// when the stream carries no agent_message (older CLI, plain-text fallback,
+	// or an unexpected shape), so Raw always surfaces the underlying text and
+	// unwrap never errors. RuntimeRef is untouched.
+	raw := result.Stdout
+	if msg, _, _, ok := parseCodexJSONResult(result.Stdout); ok {
+		raw = msg
+	}
+	return StartResult{RuntimeRef: threadID, Raw: raw}, nil
 }
 
 func (a CodexAdapter) Validate(_ context.Context, agent Agent) error {
@@ -429,6 +441,13 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 // we place it. jsonOutput=false is the older-CLI fallback (see runCodex): it
 // reproduces the pre-#658 plain-text command exactly. A fresh ref (#531) always
 // starts a brand-new exec session and never resumes.
+//
+// ARG_MAX exposure (#723): like kimi, codex passes the prompt as a trailing argv
+// arg, so a prompt above the kernel's MAX_ARG_STRLEN (~128 KiB per single arg)
+// would fork/exec with E2BIG. codex, unlike kimi, has a native escape hatch —
+// `codex exec` reads the prompt from stdin when the positional is `-` or omitted
+// ("instructions are read from stdin"). Routing oversize prompts through stdin is
+// deferred to a follow-up; #723 fixes kimi, which offers no stdin/file channel.
 func codexDeliverArgs(agent Agent, prompt, model string, jsonOutput bool) []string {
 	args := append([]string{"exec"}, codexSandboxArgs(agent)...)
 	if jsonOutput {
@@ -1302,6 +1321,15 @@ func newUUID() (string, error) {
 	return fmt.Sprintf("%s-%s-%s-%s-%s", encoded[0:8], encoded[8:12], encoded[12:16], encoded[16:20], encoded[20:32]), nil
 }
 
+// claudeArgs builds the `claude` argument vector; the prompt is the trailing
+// positional after `--`.
+//
+// ARG_MAX exposure (#723): like kimi, claude passes the prompt as a trailing argv
+// arg, so a prompt above the kernel's MAX_ARG_STRLEN (~128 KiB per single arg)
+// would fork/exec with E2BIG. claude, unlike kimi, has a native escape hatch — its
+// `-p/--print` non-interactive mode reads the prompt from stdin when no positional
+// is supplied. Routing oversize prompts through stdin is deferred to a follow-up;
+// #723 fixes kimi, which offers no stdin/file channel.
 func claudeArgs(agent Agent, prompt string, jsonOutput bool, model string) []string {
 	args := claudePermissionArgs(agent)
 	if model != "" {

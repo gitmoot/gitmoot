@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	mrand "math/rand/v2"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -308,10 +310,28 @@ func (s *Store) SetChatThreadState(ctx context.Context, id, state string) error 
 }
 
 // maxSeqAssignRetries bounds the AddChatMessage seq-assignment retry loop (see
-// below). A handful of retries is ample: a per-thread seq collision only occurs
-// when two SEPARATE processes (e.g. the daemon back-link + a human `chat send`)
-// race to append to the same thread, which is rare and self-limiting.
-const maxSeqAssignRetries = 8
+// below). A per-thread seq collision occurs when SEPARATE processes (e.g. the
+// daemon back-link + a human `chat send`, or several moot seat subprocesses)
+// race to append to the same thread. Raised from 8 to 16 to cover a wide moot
+// (many seats sending near-simultaneously) alongside the jittered backoff below.
+const maxSeqAssignRetries = 16
+
+// seqConflictBackoff sleeps a short JITTERED interval between AddChatMessage retry
+// attempts. Without it, a cross-process read->write upgrade deadlock
+// (SQLITE_BUSY / SQLITE_BUSY_SNAPSHOT — which busy_timeout returns immediately
+// rather than waiting out) livelocks: two symmetric processes both re-run their
+// MAX(seq) read and collide again on the very next tick. The randomized backoff
+// breaks that symmetry so contending writers drain instead of exhausting the
+// retry budget in lockstep. Growth is capped so the worst case stays bounded.
+func seqConflictBackoff(attempt int) {
+	const capMs = 40
+	ms := 1 << attempt // 1,2,4,8,16,32,...
+	if ms > capMs {
+		ms = capMs
+	}
+	// Full jitter in [0, ms] milliseconds.
+	time.Sleep(time.Duration(mrand.IntN(ms+1)) * time.Millisecond)
+}
 
 // AddChatMessage appends a message to a thread. It assigns the per-thread seq as
 // SELECT COALESCE(MAX(seq),0)+1 inside the insert transaction and inserts against
@@ -443,6 +463,12 @@ func (s *Store) AddChatMessage(ctx context.Context, msg ChatMessage) (ChatMessag
 		}
 		if isRetryableSeqConflict(commitErr) {
 			lastConflict = commitErr
+			// Jittered backoff breaks the cross-process upgrade-deadlock symmetry so
+			// the retry actually resolves instead of colliding again immediately. Skip
+			// the sleep after the final attempt (about to return the error).
+			if attempt < maxSeqAssignRetries-1 {
+				seqConflictBackoff(attempt)
+			}
 			continue
 		}
 		return ChatMessage{}, commitErr
@@ -830,6 +856,258 @@ func (s *Store) ListChatThreadParticipantsForThread(ctx context.Context, threadI
 		out = append(out, name)
 	}
 	return out, rows.Err()
+}
+
+// ChatAutoRespondCandidate is one (thread, agent) pair the auto-respond sweep may
+// act on (#534 V1.5): an OPEN thread carrying at least one resolved+unread mention
+// of the agent on a kind='chat' message. LastMessageID/LastTsMs identify the NEWEST
+// such triggering message — used to render the reply context and to back-link the
+// enqueued job's result via reply_to. It is deliberately kind-scoped to 'chat':
+// job_result / system / promotion_request messages NEVER produce a candidate, which
+// is the structural (not prose) anti-ping-pong guarantee.
+type ChatAutoRespondCandidate struct {
+	ThreadID      string
+	ThreadSlug    string
+	Repo          string
+	Agent         string
+	LastMessageID string
+	LastTsMs      int64
+}
+
+// ListChatAutoRespondCandidates returns one candidate per (thread, agent) with an
+// unread, resolved mention on a kind='chat' message in an OPEN thread, scoped to
+// this DB's home_id (agent_origin) — the same "no read path assumes origin==self"
+// discipline the inbox uses. The join to chat_messages with kind='chat' is what
+// makes the trigger STRUCTURALLY impossible to fire from a job_result/system/
+// promotion_request message. Rows arrive grouped by (thread, agent) with the newest
+// triggering message first, so the caller keeps the first row per group. The caller
+// (the sweep) further filters to config-enrolled agents; this query is generic.
+func (s *Store) ListChatAutoRespondCandidates(ctx context.Context) ([]ChatAutoRespondCandidate, error) {
+	origin, err := s.HomeID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// A MOOT thread is excluded: its seats already carry the conversation as
+	// dedicated jobs, and #534's "compose, not double-drive" decision means a seat's
+	// @mention of a peer must NOT also spawn a separate auto-respond ask on top of
+	// that peer's seat job. The NOT EXISTS check on the moot marker keeps moot and
+	// auto-respond structurally mutually exclusive.
+	const query = `SELECT t.id, t.slug, t.repo, mn.agent, m.id, m.ts_ms
+		FROM chat_mentions mn
+		JOIN chat_messages m ON m.id = mn.message_id
+		JOIN chat_threads t ON t.id = mn.thread_id
+		WHERE mn.agent_origin = ? AND mn.resolved = 1 AND mn.unread = 1
+			AND m.kind = ? AND t.state = ?
+			AND NOT EXISTS (
+				SELECT 1 FROM chat_thread_meta cm
+				WHERE cm.thread_id = t.id AND cm.key = ? AND cm.value = '1')
+		ORDER BY t.id, mn.agent, m.ts_ms DESC, m.id DESC`
+	rows, err := s.db.QueryContext(ctx, query, origin, ChatKindChat, ChatThreadStateOpen, chatThreadMetaMoot)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ChatAutoRespondCandidate
+	var lastKey string
+	for rows.Next() {
+		var c ChatAutoRespondCandidate
+		if err := rows.Scan(&c.ThreadID, &c.ThreadSlug, &c.Repo, &c.Agent, &c.LastMessageID, &c.LastTsMs); err != nil {
+			return nil, err
+		}
+		key := c.ThreadID + "\x00" + c.Agent
+		if key == lastKey {
+			// A later (older) mention in the same (thread, agent) group — the newest
+			// already captured it, so skip.
+			continue
+		}
+		lastKey = key
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// CountChatAgentAutoResponses returns how many auto-respond replies the agent has
+// already posted into the thread, plus the ts_ms of the most recent one (0 when
+// none) — the cap and cooldown inputs for the sweep (#534 V1.5). An auto-respond
+// reply is the agent-authored kind='job_result' message the daemon back-links via
+// postChatThreadResult, so counting the agent's job_result rows in the thread is the
+// count of its prior auto-responses. (A human-initiated `chat task` result in the
+// same thread also lands as an agent job_result; folding it in only makes the cap
+// MORE conservative — it can never let an agent exceed the cap — so the bound stays
+// safe.) Scoped by (thread, author_name, author_kind=agent, kind=job_result).
+func (s *Store) CountChatAgentAutoResponses(ctx context.Context, threadID, agent string) (int, int64, error) {
+	var count int
+	var lastTs sql.NullInt64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(1), COALESCE(MAX(ts_ms), 0) FROM chat_messages
+			WHERE thread_id = ? AND author_kind = ? AND author_name = ? AND kind = ?`,
+		strings.TrimSpace(threadID), ChatAuthorKindAgent, strings.TrimSpace(agent), ChatKindJobResult).Scan(&count, &lastTs); err != nil {
+		return 0, 0, err
+	}
+	return count, lastTs.Int64, nil
+}
+
+// CountInFlightChatThreadJobs counts the agent's not-yet-terminal jobs (state
+// 'queued' or 'running') whose serialized payload links them to the given chat
+// thread — the REAL-TIME in-flight gate the auto-respond sweep uses so the cap
+// counts asks still executing, not only completed job_result rows (#534 V1.5).
+//
+// Why it is needed: CountChatAgentAutoResponses only sees COMPLETED replies (an
+// auto-respond becomes a job_result only when the ask DELIVERS, which can take a
+// minute+). Under a burst of @mentions arriving before the first reply lands, the
+// completed count stays 0 and neither the cap nor the cooldown would throttle. By
+// refusing to dispatch a new auto-respond while any prior ask for this (thread,
+// agent) is still in flight, the sweep bounds total auto-responses to the cap and
+// makes a failed mark-read non-duplicating (the in-flight job blocks a re-fire).
+//
+// Matching the JobPayload's "thread_id" JSON field via a LIKE fragment is exact
+// enough: thread ids are opaque, collision-free tokens. Folding in a human-promoted
+// `chat task` ask on the same thread only makes the gate MORE conservative — it can
+// never let an agent exceed the cap.
+func (s *Store) CountInFlightChatThreadJobs(ctx context.Context, threadID, agent string) (int, error) {
+	threadID = strings.TrimSpace(threadID)
+	agent = strings.TrimSpace(agent)
+	if threadID == "" || agent == "" {
+		return 0, nil
+	}
+	fragment := `%"thread_id":"` + threadID + `"%`
+	var count int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM jobs
+			WHERE agent = ? AND state IN ('queued', 'running') AND payload LIKE ?`,
+		agent, fragment).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// ChatSystemMessageExists reports whether a system message with the exact body
+// already exists in the thread — the idempotency check the sweep uses to post the
+// "cap reached" park message at most once (#534 V1.5). Matching the full body is
+// sufficient because the cap message embeds the agent name, so it is unique per
+// (thread, agent).
+func (s *Store) ChatSystemMessageExists(ctx context.Context, threadID, body string) (bool, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM chat_messages WHERE thread_id = ? AND kind = ? AND body = ?`,
+		strings.TrimSpace(threadID), ChatKindSystem, body).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// MarkChatChatMentionsRead clears the unread flag on the agent's resolved mentions
+// in a thread that sit on a kind='chat' message — the precise trigger set the
+// auto-respond sweep consumes (#534 V1.5). It is deliberately kind-scoped so it
+// never clears an ask-gate `system`-message mention (that is the human-answer
+// channel and must stay in the inbox). Scoped to this DB's home_id (agent_origin).
+// Returns the number of mentions cleared.
+func (s *Store) MarkChatChatMentionsRead(ctx context.Context, agent, threadID string) (int64, error) {
+	origin, err := s.HomeID(ctx)
+	if err != nil {
+		return 0, err
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE chat_mentions SET unread = 0
+			WHERE agent = ? AND agent_origin = ? AND thread_id = ? AND resolved = 1 AND unread = 1
+			AND message_id IN (SELECT id FROM chat_messages WHERE thread_id = ? AND kind = ?)`,
+		strings.TrimSpace(agent), origin, strings.TrimSpace(threadID), strings.TrimSpace(threadID), ChatKindChat)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ---- moot metadata (#534 V1.5) --------------------------------------------
+
+// Per-thread chat_thread_meta keys for `gitmoot moot`.
+const (
+	chatThreadMetaMoot           = "moot"
+	chatThreadMetaMootMessageCap = "moot_message_cap"
+)
+
+// SetChatThreadMeta upserts one per-thread metadata key (chat_thread_meta), the
+// chat_meta-style side-table that carries moot state without an ALTER of the V1
+// chat_threads table.
+func (s *Store) SetChatThreadMeta(ctx context.Context, threadID, key, value string) error {
+	threadID = strings.TrimSpace(threadID)
+	key = strings.TrimSpace(key)
+	if threadID == "" || key == "" {
+		return errors.New("chat thread meta requires a thread id and key")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO chat_thread_meta(thread_id, key, value, updated_at)
+			VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+			ON CONFLICT(thread_id, key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP`,
+		threadID, key, value)
+	return err
+}
+
+// GetChatThreadMeta reads one per-thread metadata value. ok is false (no error)
+// when the key is absent.
+func (s *Store) GetChatThreadMeta(ctx context.Context, threadID, key string) (value string, ok bool, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT value FROM chat_thread_meta WHERE thread_id = ? AND key = ?`,
+		strings.TrimSpace(threadID), strings.TrimSpace(key)).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return value, true, nil
+}
+
+// MarkChatThreadMoot stamps a thread as a moot with the given HARD agent-message
+// cap (#534 V1.5). Idempotent: re-convening the same thread overwrites the cap.
+// The cap must be >= 1 (a moot always allows at least one turn).
+func (s *Store) MarkChatThreadMoot(ctx context.Context, threadID string, messageCap int) error {
+	if messageCap < 1 {
+		return fmt.Errorf("moot message cap must be >= 1, got %d", messageCap)
+	}
+	if err := s.SetChatThreadMeta(ctx, threadID, chatThreadMetaMoot, "1"); err != nil {
+		return err
+	}
+	return s.SetChatThreadMeta(ctx, threadID, chatThreadMetaMootMessageCap, strconv.Itoa(messageCap))
+}
+
+// ChatThreadMoot reports whether a thread was convened as a moot and, if so, its
+// HARD agent-message cap (#534 V1.5). A non-moot thread returns (false, 0). A moot
+// row with a missing/unparsable cap returns (true, 0) — the caller treats a
+// non-positive cap as "no cap enforced" so a malformed row never wedges sends.
+func (s *Store) ChatThreadMoot(ctx context.Context, threadID string) (isMoot bool, messageCap int, err error) {
+	flag, ok, err := s.GetChatThreadMeta(ctx, threadID, chatThreadMetaMoot)
+	if err != nil {
+		return false, 0, err
+	}
+	if !ok || strings.TrimSpace(flag) != "1" {
+		return false, 0, nil
+	}
+	capStr, ok, err := s.GetChatThreadMeta(ctx, threadID, chatThreadMetaMootMessageCap)
+	if err != nil {
+		return true, 0, err
+	}
+	if !ok {
+		return true, 0, nil
+	}
+	parsed, perr := strconv.Atoi(strings.TrimSpace(capStr))
+	if perr != nil {
+		return true, 0, nil
+	}
+	return true, parsed, nil
+}
+
+// CountChatMootMessages counts the agent-authored conversation turns in a thread —
+// kind='chat' AND author_kind='agent' (#534 V1.5). This is the moot cap metric: it
+// counts SEAT turns only, so human nudges (author_kind='human'), the system
+// announcement/overrun messages (kind='system'), and the seats' final job_result
+// conclusions (kind='job_result', which the cap never blocks) are all excluded.
+func (s *Store) CountChatMootMessages(ctx context.Context, threadID string) (int, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM chat_messages WHERE thread_id = ? AND kind = ? AND author_kind = ?`,
+		strings.TrimSpace(threadID), ChatKindChat, ChatAuthorKindAgent).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 // ---- helpers ---------------------------------------------------------------

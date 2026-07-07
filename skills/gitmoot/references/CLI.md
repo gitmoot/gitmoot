@@ -1178,6 +1178,7 @@ gitmoot skillopt gate run --candidate <version-id> [--corpus path] [--replay-com
 gitmoot skillopt gate history --candidate <version-id> [--json]
 gitmoot skillopt binary run --set <file> --run <run-id> --source <file> [--deterministic] [--reviewer runtime] [--home path] [--json]
 gitmoot skillopt binary show --run <run-id> [--home path] [--json]
+gitmoot skillopt binary lessons --template <id> [--set <file>] [--run <run-id> ...] [--no-passes] [--apply] [--home path] [--json]
 gitmoot skillopt synth --template <id> --repo owner/repo --weak <agent> --strong <agent> [--judge <agent>] [--challenger <agent>] [--max-items N] [--max-rounds-per-item M] [--gap F] [--out dir] [--json]
 gitmoot skillopt synth list [--status pending_human_approval|approved|rejected] [--json]
 gitmoot skillopt synth approve <item-id>
@@ -1342,6 +1343,29 @@ packets are byte-identical). The per-dimension scores map onto the existing
 runs unless a `skillopt binary` command is invoked — every existing SkillOpt
 review/optimize flow is byte-identical when it is unused.
 
+`skillopt binary lessons --template <id>` turns the per-question verdicts already
+recorded for a template into **optimizer-consumable prompt-update lessons**
+(`#527`, BINEVAL §3.3/§3.4). It compares verdicts across every run of the
+template — candidate-vs-champion (different versions) **and** repeated runs of one
+version (instability) — and classifies each question: a verdict that **flips**
+across runs is an unstable, targeted improvement signal; a **stable NO** is a
+concrete failure lesson; a **stable YES** is a trait to preserve. It **previews by
+default and writes nothing**. With `--apply` it projects the lessons onto
+`RankedFeedbackEvent` rows via the existing store API (`source=binary-disagreement`;
+negative lessons → `required_improvements`, stable-pass traits → `useful_traits`)
+so the **existing** optimizer + `skillopt rubric induce` consume them with **zero
+contract change**. `--set <file>` supplies the question set so lessons recover the
+question wording (the verdicts table stores only ids); `--run <id>` (repeatable)
+restricts to specific runs; `--no-passes` drops the stable-pass traits. There is
+**no daemon or automatic path** — writes are CLI-explicit only, mirroring the
+`skillopt synth` approval gate, and re-applying is idempotent: `--apply` is a
+**full replace** of a deterministic per-template synthetic run (its prior events
+are cleared and rewritten), so a shrinking lesson set — e.g. re-running with
+`--no-passes`, a narrower `--run` filter, or no lessons at all — removes the
+stale events rather than leaving them to feed the optimizer. The synthetic
+events carry no fabricated pairwise preference (neutral tie group, no winner):
+the lesson lives entirely in `required_improvements`/`useful_traits`.
+
 `skillopt pairwise import <packet-dir>` ingests a **blinded paired-review
 packet** produced by the gitmoot-skillopt fork (the `pairwise-review.json`
 packet plus its secret map and the reviewer's picks), de-blinds it, and stores
@@ -1362,7 +1386,12 @@ meaningfully beats the weak agent (score gap ≥ `--gap`, default 0.20) AND the
 judge confirms the item is well-formed; otherwise the round records a
 diagnostic (`too_easy`, `too_hard`, `strong_failed`, `bad_rubric`, or
 `context_leak`) and the Challenger regenerates with targeted feedback until
-accepted or `--max-rounds-per-item` (default 3) is exhausted. Accepted items are
+accepted or `--max-rounds-per-item` (default 3) is exhausted. Every
+challenger/weak/strong/judge delivery is **sandboxed** into a fresh per-item temp
+scratch dir (never a registered repo checkout) and framed with an answer-only
+preamble, so an agentic-CLI attempt can never write files, start servers, or
+modify a live checkout while "answering" the exercise (`#725`); the scratch dir
+is deleted when the item finishes. Accepted items are
 written to `--out` (default `<home>/evals/synth`) and stored in the DB with
 status `pending_human_approval`. They are **structurally isolated**: nothing in
 the promotion/training path reads the synth table, so a pending item can never
@@ -1737,3 +1766,88 @@ context_enabled = true   # inject the advisory table into top-level coordinator 
 The injected block carries the same "not a benchmark" disclaimer and is only added
 to top-level (coordinator) jobs — a delegation child inherits its coordinator's
 routing decision. Routing stays advisory: the block never forces a route.
+
+### V1.5 — auto-respond, `chat wait`, and `moot`
+
+V1.5 (#534) adds the **agent-to-agent** layer on top of the V1 ledger. Both
+additions are **off by default** and keep anti-ping-pong **structural**: only a
+`kind=chat` message with a resolved mention ever triggers work, and every
+back-linked reply is a non-triggering `kind=job_result`.
+
+**Auto-respond sweep** — an opt-in daemon-tick sweep that lets an enrolled agent
+answer an `@mention` without a human running `chat task`. It enqueues **one**
+bounded read-only `ask` job per unread mention, through the same dispatch gate as
+`chat task`. It is gated three ways and is a no-op (zero chat-table queries on the
+tick) unless **both** the global switch and a per-agent opt-in are set:
+
+- Global: `[chat] auto_respond = true` (default `false`).
+- Per agent: `[agents.<name>] chat_autorespond = true` (default `false`).
+
+Bounds (all in `[chat]`, warm-reloadable per tick / on SIGHUP):
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `auto_respond` | `false` | Global kill switch; `false` overrides every per-agent opt-in. |
+| `auto_respond_cap` | `4` | HARD cap on auto-responses per (thread, agent). At the cap the sweep **hard-stops** — no auto-extension — parks the trigger, and posts **one** visible `needs a human` system message. |
+| `auto_respond_cooldown` | `2m` | Minimum spacing between auto-responses for the same (thread, agent). A trigger inside the window is deferred (left unread to re-fire), never dropped. |
+
+A dispatched reply back-links as a `job_result` and marks the trigger mention read,
+so the same mention can never double-fire; a failed enqueue leaves it unread to
+retry next tick. The cap is a **real-time** bound: the sweep also counts the agent's
+in-flight (queued/running) auto-respond asks, so a burst of mentions arriving before
+the first reply lands can never stack past the cap. **Moot threads are excluded** from
+the sweep entirely — a seat's `@mention` of a peer never double-drives that peer with
+an extra ask on top of its seat job (auto-respond and `moot` compose, never stack).
+
+**`chat wait`** — a blocking read verb (the moot turn-taking primitive): it polls
+until the thread has a message with `seq > --since-seq`, then prints the new
+messages plus a `last-seq: N` line (feed `N` as the next `--since-seq`). On a capped
+moot thread it returns immediately with the wrap-up line instead of spinning to the
+timeout.
+
+```sh
+gitmoot chat wait <thread> [--since-seq N] [--timeout 90s] [--repo owner/repo] [--json]
+```
+
+**`gitmoot moot`** — convene N registered agents as **seats** in one bounded
+brainstorm. Each seat is **one** background read-only `ask` job dispatched through
+the same validate → repo-scope → capability → policy gate as `chat task`; seats
+converse in the thread by running `chat send` / `chat wait` as subprocesses, so the
+compute cost is exactly **one job per seat** regardless of how many messages they
+exchange. Messages are rows (free).
+
+```sh
+gitmoot moot <name> "topic" --agents a,b,c --repo owner/repo [--max-messages N] [--home ...] [--json]
+```
+
+- Roster validation is up front: every seat must be **registered**, **repo-scoped**,
+  and carry the **`ask`** capability, or the whole moot is rejected before any
+  thread is created or seat dispatched.
+- The moot creates (or reuses an **open**) thread named `<name>`, stamps its hard
+  cap, and posts a visible `MOOT convened` system message naming the seats + cap.
+- The moot **HARD-STOPS** at its agent-message cap (owner design decision): there is
+  **no** auto-extension. Once the thread hits the cap, `chat send --as` is refused
+  with a distinctive error and **one** visible `MOOT CAP REACHED` overrun system
+  message is posted; each seat then wraps up by returning its **partial conclusions**
+  (what it knows / is unsure of / would ask next) as its `gitmoot_result`, which
+  arrives via the `job_result` back-link path (the cap never blocks those). Human
+  sends and seat conclusions are never gated by the cap.
+- **Concurrency requirement**: seats are top-level read-only same-repo jobs, so they
+  converse concurrently **only** under the **pool scheduler with ≥2 workers** (start
+  the daemon with `--parallel N`, or set `[daemon] parallel = N`; a per-repo
+  `[repos."owner/repo"]` `max_parallel`/`scheduler` override also counts). Under the
+  **default** single-worker/barrier daemon the seats **serialize** on the shared
+  `repo:<repo>` checkout key: each seat's `chat wait` times out and the moot degrades
+  to sequential monologues. When it detects a serializing config, `gitmoot moot`
+  prints a **non-blocking** stderr warning naming the effective `workers`/`scheduler`
+  (it still dispatches every seat) — enable the pool scheduler so seats converse.
+
+Moot bounds (in `[chat]`, warm-reloadable):
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `moot_max_seats` | `6` | Max agents one moot may convene; a larger roster is rejected. |
+| `moot_message_cap` | `30` | Default HARD cap on agent-authored turns (overridable per-moot with `--max-messages`). |
+
+`[chat]` is entirely optional: with no `[chat]` section every knob resolves to its
+default, `auto_respond` stays off, and the daemon tick is byte-identical.

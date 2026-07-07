@@ -723,7 +723,9 @@ func ExportTrainingPackage(ctx context.Context, store *db.Store, runID string) (
 			artifactIDs[id] = struct{}{}
 		}
 		for _, option := range options {
-			artifactIDs[option.ArtifactID] = struct{}{}
+			if id := strings.TrimSpace(option.ArtifactID); id != "" {
+				artifactIDs[id] = struct{}{}
+			}
 		}
 	}
 	artifacts, err := loadArtifactRefs(ctx, store, artifactIDs)

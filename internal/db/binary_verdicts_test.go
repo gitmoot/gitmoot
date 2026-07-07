@@ -146,3 +146,53 @@ func TestListBinaryVerdictsEmpty(t *testing.T) {
 		t.Fatalf("empty run verdicts = %d, want 0", len(got))
 	}
 }
+
+func TestListBinaryVerdictsForTemplate(t *testing.T) {
+	ctx := context.Background()
+	store := openBinaryTestStore(t)
+
+	// Two runs of template "planner" (a candidate v2 and a champion v1) and one
+	// run of an unrelated template that must NOT bleed in.
+	for _, run := range []EvalRun{
+		{ID: "cand", TemplateID: "planner", TemplateVersionID: "planner@2", TargetRepo: "o/r", State: "ready"},
+		{ID: "champ", TemplateID: "planner", TemplateVersionID: "planner@1", TargetRepo: "o/r", State: "ready"},
+		{ID: "other", TemplateID: "builder", TemplateVersionID: "builder@1", TargetRepo: "o/r", State: "ready"},
+	} {
+		if err := store.UpsertEvalRun(ctx, run); err != nil {
+			t.Fatalf("UpsertEvalRun %s: %v", run.ID, err)
+		}
+	}
+	for _, v := range []BinaryVerdict{
+		{RunID: "cand", QuestionID: "q1", Dimension: "correctness", Verdict: "yes"},
+		{RunID: "champ", QuestionID: "q1", Dimension: "correctness", Verdict: "no"},
+		{RunID: "other", QuestionID: "q1", Dimension: "correctness", Verdict: "no"},
+	} {
+		if err := store.UpsertBinaryVerdict(ctx, v); err != nil {
+			t.Fatalf("UpsertBinaryVerdict: %v", err)
+		}
+	}
+
+	got, err := store.ListBinaryVerdictsForTemplate(ctx, "planner")
+	if err != nil {
+		t.Fatalf("ListBinaryVerdictsForTemplate: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("template verdicts = %d, want 2 (other template excluded): %+v", len(got), got)
+	}
+	// Ordered by run_id (cand < champ), each carries its version id.
+	if got[0].RunID != "cand" || got[0].TemplateVersionID != "planner@2" {
+		t.Fatalf("first row = %+v", got[0])
+	}
+	if got[1].RunID != "champ" || got[1].TemplateVersionID != "planner@1" {
+		t.Fatalf("second row = %+v", got[1])
+	}
+
+	// Empty/whitespace template id returns no rows without a query.
+	empty, err := store.ListBinaryVerdictsForTemplate(ctx, "   ")
+	if err != nil {
+		t.Fatalf("empty template: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("empty template rows = %d, want 0", len(empty))
+	}
+}

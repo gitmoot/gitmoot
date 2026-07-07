@@ -599,3 +599,65 @@ func TestChatThreadScopedRollups(t *testing.T) {
 		t.Fatalf("scoped participants = %v, want [codex-b jerry]", scoped)
 	}
 }
+
+// TestChatThreadMootMetadata proves the moot metadata round-trips (MarkChatThreadMoot
+// -> ChatThreadMoot), a non-moot thread reads (false, 0), and CountChatMootMessages
+// counts ONLY agent-authored chat turns — excluding system, job_result, and human
+// messages (the cap metric bounds seat turns only).
+func TestChatThreadMootMetadata(t *testing.T) {
+	ctx := context.Background()
+	store := openChatTestStore(t)
+
+	moot, err := store.CreateChatThread(ctx, ChatThread{Slug: "moot", Repo: "owner/repo", CreatedBy: ChatAuthorKindHuman})
+	if err != nil {
+		t.Fatalf("CreateChatThread: %v", err)
+	}
+	plain, err := store.CreateChatThread(ctx, ChatThread{Slug: "plain", Repo: "owner/repo", CreatedBy: ChatAuthorKindHuman})
+	if err != nil {
+		t.Fatalf("CreateChatThread: %v", err)
+	}
+
+	// A fresh thread is not a moot.
+	if isMoot, _, err := store.ChatThreadMoot(ctx, plain.ID); err != nil || isMoot {
+		t.Fatalf("plain ChatThreadMoot = (%v, err=%v), want (false, nil)", isMoot, err)
+	}
+	// A rejected cap.
+	if err := store.MarkChatThreadMoot(ctx, moot.ID, 0); err == nil {
+		t.Fatal("MarkChatThreadMoot cap=0 was accepted, want an error")
+	}
+	// Mark + read back.
+	if err := store.MarkChatThreadMoot(ctx, moot.ID, 7); err != nil {
+		t.Fatalf("MarkChatThreadMoot: %v", err)
+	}
+	isMoot, messageCap, err := store.ChatThreadMoot(ctx, moot.ID)
+	if err != nil || !isMoot || messageCap != 7 {
+		t.Fatalf("ChatThreadMoot = (%v, %d, err=%v), want (true, 7, nil)", isMoot, messageCap, err)
+	}
+	// Re-mark overwrites the cap (idempotent re-convene).
+	if err := store.MarkChatThreadMoot(ctx, moot.ID, 3); err != nil {
+		t.Fatalf("MarkChatThreadMoot re-mark: %v", err)
+	}
+	if _, messageCap, _ := store.ChatThreadMoot(ctx, moot.ID); messageCap != 3 {
+		t.Fatalf("re-marked cap = %d, want 3", messageCap)
+	}
+
+	// Counting: only agent-authored kind='chat' messages count.
+	add := func(kind, authorKind, name string) {
+		if _, err := store.AddChatMessage(ctx, ChatMessage{ThreadID: moot.ID, Kind: kind, AuthorKind: authorKind, AuthorName: name, Body: "x"}); err != nil {
+			t.Fatalf("AddChatMessage(%s/%s): %v", kind, authorKind, err)
+		}
+	}
+	add(ChatKindChat, ChatAuthorKindAgent, "alice")  // counts
+	add(ChatKindChat, ChatAuthorKindAgent, "bob")     // counts
+	add(ChatKindChat, ChatAuthorKindHuman, "human")   // excluded (human)
+	add(ChatKindSystem, ChatAuthorKindSystem, "system") // excluded (system)
+	add(ChatKindJobResult, ChatAuthorKindAgent, "alice") // excluded (job_result)
+
+	n, err := store.CountChatMootMessages(ctx, moot.ID)
+	if err != nil {
+		t.Fatalf("CountChatMootMessages: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("CountChatMootMessages = %d, want 2 (agent chat turns only)", n)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/mention"
@@ -36,6 +37,8 @@ func runChat(args []string, stdout, stderr io.Writer) int {
 		return runChatSend(args[1:], stdout, stderr)
 	case "inbox":
 		return runChatInbox(args[1:], stdout, stderr)
+	case "wait":
+		return runChatWait(args[1:], stdout, stderr)
 	case "task":
 		return runChatTask(args[1:], stdout, stderr)
 	case "answer":
@@ -62,6 +65,7 @@ func printChatUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot chat show <thread> [--repo owner/repo] [--limit N] [--json]")
 	fmt.Fprintln(w, "  gitmoot chat send <thread> \"message\" [--as agent] [--repo owner/repo] [--ref kind:value ...] [--json]")
 	fmt.Fprintln(w, "  gitmoot chat inbox <agent> [--unread] [--json]")
+	fmt.Fprintln(w, "  gitmoot chat wait <thread> [--since-seq N] [--timeout 90s] [--repo owner/repo] [--json]")
 	fmt.Fprintln(w, "  gitmoot chat task <thread> \"@agent message\" [--action ask|review|implement] [--repo owner/repo] [--json]")
 	fmt.Fprintln(w, "  gitmoot chat answer <thread> \"<question-id>: answer text\" [--repo owner/repo] [--json]")
 	fmt.Fprintln(w, "  gitmoot chat close|reopen <thread> [--repo owner/repo] [--json]")
@@ -361,6 +365,13 @@ func runChatSend(args []string, stdout, stderr io.Writer) int {
 				}
 				return err
 			}
+			// Moot cap HARD-STOP (#534 V1.5): once a moot thread has reached its
+			// agent-message cap, refuse further agent-authored turns and post ONE
+			// idempotent visible overrun message. Human sends and the seats' final
+			// job_result conclusions are never blocked by this gate.
+			if err := enforceMootSendCap(ctx, store, thread); err != nil {
+				return err
+			}
 		}
 		mentions := mention.Parse(body)
 		msg, err := store.AddChatMessage(ctx, db.ChatMessage{
@@ -472,6 +483,109 @@ func runChatInbox(args []string, stdout, stderr io.Writer) int {
 		}
 		writeLine(stdout, "%s %-24s #%d %s: %s", marker, e.ThreadSlug, e.Seq, e.AuthorName, e.Body)
 	}
+	return 0
+}
+
+// ---- wait (turn-taking poll) -----------------------------------------------
+
+// chatWaitPollInterval is how often `chat wait` re-polls the store for new
+// messages. A package var so tests can shrink it to keep the poll loop fast.
+var chatWaitPollInterval = 500 * time.Millisecond
+
+// chatMootCapWaitLine is the exact, machine-detectable line `chat wait` prints
+// when the thread's moot cap is reached — the seat's cue to wrap up (#534 V1.5).
+const chatMootCapWaitLine = "MOOT CAP REACHED — wrap up now"
+
+// runChatWait blocks polling the store until the thread has messages with seq >
+// --since-seq (or --timeout elapses), then prints them in the standard `chat show`
+// format plus a machine-parsable `last-seq: N` line (#534 V1.5). It is the seat
+// turn-taking primitive for `gitmoot moot`. When the thread's moot cap is reached
+// it prints chatMootCapWaitLine and returns immediately (even with no new message),
+// so a seat stops instead of spinning until timeout.
+func runChatWait(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("chat wait", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	repo := fs.String("repo", "", "repo scope to disambiguate a slug across repos")
+	sinceSeq := fs.Int64("since-seq", 0, "return only messages with seq greater than N (the last-seq you last saw)")
+	timeout := fs.Duration("timeout", 90*time.Second, "max time to block waiting for a new message")
+	jsonOut := fs.Bool("json", false, "print as JSON")
+	ref, code := parseChatThreadPositional(fs, args, stderr, "chat wait requires a <thread>")
+	if ref == "" {
+		return code
+	}
+
+	var (
+		newMsgs    []chatMessageOutput
+		lastSeq    = *sinceSeq
+		capReached bool
+	)
+	if err := withStore(*home, func(store *db.Store) error {
+		ctx := context.Background()
+		thread, err := resolveChatThread(ctx, store, ref, strings.TrimSpace(*repo))
+		if err != nil {
+			return err
+		}
+		deadline := time.Now().Add(*timeout)
+		for {
+			msgs, err := store.ListChatMessages(ctx, thread.ID, 0)
+			if err != nil {
+				return err
+			}
+			newMsgs = newMsgs[:0]
+			lastSeq = *sinceSeq
+			for _, m := range msgs {
+				if m.Seq > lastSeq {
+					lastSeq = m.Seq
+				}
+				if m.Seq > *sinceSeq {
+					newMsgs = append(newMsgs, chatMessageFromDB(m))
+				}
+			}
+			// Moot cap signalling is independent of new messages: a capped moot with
+			// no fresh turn still tells the seat to wrap up.
+			isMoot, messageCap, err := store.ChatThreadMoot(ctx, thread.ID)
+			if err != nil {
+				return err
+			}
+			capReached = false
+			if isMoot && messageCap > 0 {
+				count, err := store.CountChatMootMessages(ctx, thread.ID)
+				if err != nil {
+					return err
+				}
+				capReached = count >= messageCap
+			}
+			if len(newMsgs) > 0 || capReached || !time.Now().Before(deadline) {
+				return nil
+			}
+			time.Sleep(chatWaitPollInterval)
+		}
+	}); err != nil {
+		fmt.Fprintf(stderr, "chat wait: %v\n", err)
+		return 1
+	}
+	if *jsonOut {
+		_ = writeJSON(stdout, struct {
+			Messages   []chatMessageOutput `json:"messages"`
+			LastSeq    int64               `json:"last_seq"`
+			CapReached bool                `json:"cap_reached"`
+		}{Messages: newMsgs, LastSeq: lastSeq, CapReached: capReached})
+		return 0
+	}
+	for _, m := range newMsgs {
+		writeLine(stdout, "#%d [%s] %s: %s", m.Seq, m.Kind, m.AuthorName, m.Body)
+		if len(m.Mentions) > 0 {
+			writeLine(stdout, "    mentions: %s", strings.Join(m.Mentions, ", "))
+		}
+	}
+	if len(newMsgs) == 0 {
+		writeLine(stdout, "(no new messages)")
+	}
+	if capReached {
+		writeLine(stdout, chatMootCapWaitLine)
+	}
+	writeLine(stdout, "last-seq: %d", lastSeq)
 	return 0
 }
 

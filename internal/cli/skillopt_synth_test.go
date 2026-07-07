@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -231,6 +232,115 @@ func TestRealSkillOptABDeliverUnwrapsClaudeEnvelopeForSynth(t *testing.T) {
 	}
 }
 
+// transcriptCodexRunner is a subprocess.Runner that returns a fixed `codex exec
+// --json` JSONL transcript for every invocation, mirroring the real codex CLI's
+// Start output (banner + thread.started + turn events + agent_message) so a real
+// CodexAdapter runs end-to-end with no LLM.
+type transcriptCodexRunner struct{ stdout string }
+
+func (r transcriptCodexRunner) Run(context.Context, string, string, ...string) (subprocess.Result, error) {
+	return subprocess.Result{Stdout: r.stdout}, nil
+}
+
+func (r transcriptCodexRunner) LookPath(file string) (string, error) { return "/usr/bin/" + file, nil }
+
+// TestRealSkillOptABDeliverUnwrapsCodexTranscriptForSynth is the #724 consumer
+// regression, the codex flavor of TestRealSkillOptABDeliverUnwrapsClaudeEnvelope-
+// ForSynth. It drives the REAL delivery seam (realSkillOptABDeliver) with a
+// forked-session codex agent (empty RuntimeRef → adapter.Start, the synth
+// challenger path) wired to a real CodexAdapter over a fake runner that returns a
+// codex exec --json transcript. The delivered answer must be the agent_message
+// text — NOT the whole transcript (banner/thread.started/reasoning/turn events) —
+// so parseSynthGeneratedItem finds the context/question/rubric. Before the fix
+// Start leaked the whole transcript as Raw and this parse returned the wrong
+// object (the thread.started event, not the challenger item).
+func TestRealSkillOptABDeliverUnwrapsCodexTranscriptForSynth(t *testing.T) {
+	inner := `{"context":"A legacy monolith with no tests.","question":"Outline a safe migration.","rubric":"Rewards incremental strangler-fig steps."}`
+	transcript := `{"type":"thread.started","thread_id":"019f3041-cfed-7e82-8766-b5ca75cf92da"}` + "\n" +
+		`{"type":"turn.started"}` + "\n" +
+		`{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"designing a discriminating item"}}` + "\n" +
+		`{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":` + strconv.Quote(inner) + `}}` + "\n" +
+		`{"type":"turn.completed","usage":{"input_tokens":16504,"output_tokens":20}}`
+
+	restore := replaceRuntimeFactory(runtime.Factory{Runner: transcriptCodexRunner{stdout: transcript}})
+	t.Cleanup(restore)
+
+	// Empty RuntimeRef routes realSkillOptABDeliver through adapter.Start (a fresh
+	// throwaway session) — the exact skillopt synth challenger delivery path.
+	answer, err := realSkillOptABDeliver(context.Background(), runtime.Agent{
+		Name:       "challenger-bot",
+		Role:       "reviewer",
+		Runtime:    runtime.CodexRuntime,
+		RepoScope:  "acme/widgets",
+		RuntimeRef: "",
+	}, synthChallengerPrompt("", ""))
+	if err != nil {
+		t.Fatalf("realSkillOptABDeliver: %v", err)
+	}
+	if answer != inner {
+		t.Fatalf("delivered answer = %q, want the unwrapped agent_message %q", answer, inner)
+	}
+	item, err := parseSynthGeneratedItem(answer)
+	if err != nil {
+		t.Fatalf("parseSynthGeneratedItem on the delivered answer failed (the #724 codex-bloat bug): %v (answer=%q)", err, answer)
+	}
+	if item.Context == "" || item.Question == "" || item.Rubric == "" {
+		t.Fatalf("parsed synth item missing fields: %+v", item)
+	}
+}
+
+// TestSynthJudgePromptCapsAnswers pins the second half of #724: synthJudgePrompt
+// caps each embedded weak/strong answer so a verbose runtime answer cannot bloat
+// (or, combined, blow ARG_MAX on) the judge exec, while under-limit answers are
+// embedded byte-identical with no marker.
+func TestSynthJudgePromptCapsAnswers(t *testing.T) {
+	item := synthGeneratedItem{Context: "ctx", Question: "q?", Rubric: "rewards X"}
+
+	t.Run("short answers embedded verbatim, no marker", func(t *testing.T) {
+		weak, strong := "a short weak answer", "a short strong answer"
+		got := synthJudgePrompt(item, weak, strong)
+		if !strings.Contains(got, weak) || !strings.Contains(got, strong) {
+			t.Fatalf("short answers must be embedded verbatim; prompt=%q", got)
+		}
+		if strings.Contains(got, "[truncated") {
+			t.Fatalf("short answers must not carry a truncation marker; prompt=%q", got)
+		}
+	})
+
+	t.Run("oversized answers capped with byte-accurate marker", func(t *testing.T) {
+		oversize := 5000
+		weak := strings.Repeat("W", synthMaxAnswerBytes+oversize)
+		strong := strings.Repeat("S", synthMaxAnswerBytes+oversize)
+		got := synthJudgePrompt(item, weak, strong)
+
+		if strings.Contains(got, weak) {
+			t.Fatal("oversized weak answer must not be embedded verbatim")
+		}
+		wantMarker := fmt.Sprintf("[truncated %d bytes]", oversize)
+		if strings.Count(got, wantMarker) != 2 {
+			t.Fatalf("want the byte-accurate marker %q for both answers; prompt tail=%q", wantMarker, got[len(got)-200:])
+		}
+		// The retained prefix is exactly the cap; nothing beyond it survives.
+		if !strings.Contains(got, strings.Repeat("W", synthMaxAnswerBytes)) {
+			t.Fatal("capped weak answer must keep the first synthMaxAnswerBytes bytes")
+		}
+		if strings.Contains(got, strings.Repeat("W", synthMaxAnswerBytes+1)) {
+			t.Fatal("capped weak answer kept more than synthMaxAnswerBytes bytes")
+		}
+	})
+
+	t.Run("answer exactly at the limit is not truncated", func(t *testing.T) {
+		exact := strings.Repeat("E", synthMaxAnswerBytes)
+		got := synthJudgePrompt(item, exact, "short")
+		if strings.Contains(got, "[truncated") {
+			t.Fatalf("answer exactly at the limit must not be truncated; prompt=%q", got[len(got)-120:])
+		}
+		if !strings.Contains(got, exact) {
+			t.Fatal("at-limit answer must be embedded verbatim")
+		}
+	})
+}
+
 // TestRunSkillOptSynthAcceptAndApprove is the deterministic no-LLM E2E: a
 // challenger produces a valid item, the strong agent beats the weak agent, the
 // judge confirms it, the item is persisted pending_human_approval with a file,
@@ -293,6 +403,86 @@ func TestRunSkillOptSynthAcceptAndApprove(t *testing.T) {
 	var bout, berr bytes.Buffer
 	if code := runSkillOptSynth([]string{"approve", item.ID, "--home", home}, &bout, &berr); code == 0 {
 		t.Fatalf("second approve should fail (item no longer pending)")
+	}
+}
+
+// TestRunSkillOptSynthDeliversInScratchNotCheckout is the #725 deterministic no-LLM
+// E2E: even with the target repo registered to a real filesystem checkout, EVERY
+// delivery (challenger/weak/strong/judge) must be handed a fresh per-item temp
+// scratch dir as its adapter working dir — never the live checkout or the
+// "owner/repo" RepoScope — and those scratch dirs must be cleaned up after the run.
+func TestRunSkillOptSynthDeliversInScratchNotCheckout(t *testing.T) {
+	home, store := synthTestHome(t, "weak-bot", "strong-bot", "judge-bot")
+	ctx := context.Background()
+	// Register the repo with a real checkout — the pre-#725 resolveSynthAgent would
+	// have handed THIS directory to every delivery.
+	checkout := t.TempDir()
+	if err := store.UpsertRepo(ctx, db.Repo{
+		Owner: "acme", Name: "widgets", DefaultBranch: "main",
+		CheckoutPath: checkout, Enabled: true,
+	}); err != nil {
+		t.Fatalf("UpsertRepo: %v", err)
+	}
+
+	// Capturing seam: records the working dir of every delivered agent, then returns
+	// scripted answers so the accept path runs to completion with no LLM.
+	prev := skillOptSynthDeliver
+	t.Cleanup(func() { skillOptSynthDeliver = prev })
+	var deliveredDirs []string
+	skillOptSynthDeliver = func(_ context.Context, agent runtime.Agent, prompt string) (string, error) {
+		deliveredDirs = append(deliveredDirs, agent.WorkingDir)
+		switch {
+		case strings.Contains(prompt, "generating a synthetic review item"):
+			return `{"context":"A legacy monolith.","question":"Outline a safe migration.","rubric":"Rewards incremental steps."}`, nil
+		case strings.Contains(prompt, "Score two answers against a rubric"):
+			return `{"weak_score":0.2,"strong_score":0.9,"well_formed":true,"diagnostic":""}`, nil
+		case strings.Contains(prompt, "Answer the following question"):
+			if agent.Name == "weak-bot" {
+				return "rewrite it all at once", nil
+			}
+			return "wrap and migrate incrementally behind a facade", nil
+		default:
+			return "", nil
+		}
+	}
+
+	outDir := filepath.Join(t.TempDir(), "synth-out")
+	var stdout, stderr bytes.Buffer
+	code := runSkillOptSynth([]string{
+		"--template", "planner", "--repo", "acme/widgets",
+		"--weak", "weak-bot", "--strong", "strong-bot", "--judge", "judge-bot",
+		"--max-items", "1", "--out", outDir, "--home", home,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("synth exit = %d, stderr: %s", code, stderr.String())
+	}
+	if len(deliveredDirs) < 4 {
+		t.Fatalf("expected >=4 deliveries (challenger/weak/strong/judge), got %d", len(deliveredDirs))
+	}
+	var scratchDir string
+	for i, dir := range deliveredDirs {
+		if strings.TrimSpace(dir) == "" {
+			t.Fatalf("delivery %d had an empty working dir — the sandbox did not force a scratch dir", i)
+		}
+		if dir == checkout {
+			t.Fatalf("delivery %d ran in the live checkout %q (the #725 bug)", i, checkout)
+		}
+		if dir == "acme/widgets" {
+			t.Fatalf("delivery %d ran in the RepoScope %q, not a scratch dir", i, dir)
+		}
+		if !strings.HasPrefix(filepath.Base(dir), "gitmoot-synth-item-") {
+			t.Fatalf("delivery %d dir %q is not a per-item synth scratch dir", i, dir)
+		}
+		// All deliveries for one item share the same per-item scratch dir.
+		if scratchDir == "" {
+			scratchDir = dir
+		} else if dir != scratchDir {
+			t.Fatalf("delivery %d used a different scratch dir %q, want the shared per-item %q", i, dir, scratchDir)
+		}
+	}
+	// Cleanup: the per-item scratch dir must be gone after the run.
+	if _, err := os.Stat(scratchDir); !os.IsNotExist(err) {
+		t.Fatalf("scratch dir %q was not cleaned up after the item (stat err=%v)", scratchDir, err)
 	}
 }
 
@@ -369,12 +559,14 @@ func TestRunSkillOptSynthRejectGate(t *testing.T) {
 
 // TestRunSkillOptSynthMissingFlags proves required-flag validation and that an
 // unknown agent errors cleanly.
-// TestResolveSynthAgentResolvesCheckoutPath proves the review fix for #535: a
-// resolved agent carries the registered repo's filesystem CheckoutPath in
-// WorkingDir (so a real, non-stubbed delivery chdirs into an existing directory)
-// while RepoScope stays in "owner/repo" form. When the repo is not registered,
-// WorkingDir stays empty so the delivery seam falls back to RepoScope.
-func TestResolveSynthAgentResolvesCheckoutPath(t *testing.T) {
+// TestResolveSynthAgentNeverCarriesCheckout proves the #725 hard guarantee at the
+// resolve layer: even when the repo IS registered with a real filesystem checkout,
+// a resolved synth agent must NOT carry that checkout in WorkingDir. Every synth
+// delivery runs in a fresh per-item temp scratch dir instead (see
+// sandboxSynthAgent), so nothing in the synth path may hand an agentic CLI a live
+// checkout to write into. RepoScope still stays in "owner/repo" form for adapter
+// family resolution.
+func TestResolveSynthAgentNeverCarriesCheckout(t *testing.T) {
 	home, store := synthTestHome(t, "weak-bot")
 	_ = home
 	ctx := context.Background()
@@ -396,17 +588,62 @@ func TestResolveSynthAgentResolvesCheckoutPath(t *testing.T) {
 	if agent.RepoScope != "acme/widgets" {
 		t.Fatalf("RepoScope = %q, want acme/widgets (must stay owner/repo form)", agent.RepoScope)
 	}
-	if agent.WorkingDir != checkout {
-		t.Fatalf("WorkingDir = %q, want resolved checkout %q", agent.WorkingDir, checkout)
+	if agent.WorkingDir != "" {
+		t.Fatalf("WorkingDir = %q, want empty — synth agents must never carry the live checkout %q (#725)", agent.WorkingDir, checkout)
 	}
+}
 
-	// Unregistered repo: WorkingDir stays empty so the seam falls back to RepoScope.
-	other, err := resolveSynthAgent(ctx, store, "weak-bot", "acme/unregistered")
-	if err != nil {
-		t.Fatalf("resolveSynthAgent (unregistered): %v", err)
+// TestSandboxSynthAgentForcesScratchDir proves sandboxSynthAgent overrides the
+// adapter working dir to the scratch dir regardless of what the agent otherwise
+// carries, and leaves RepoScope intact for family resolution.
+func TestSandboxSynthAgentForcesScratchDir(t *testing.T) {
+	scratch := t.TempDir()
+	agent := runtime.Agent{
+		Name:           "weak-bot",
+		Runtime:        runtime.CodexRuntime,
+		RepoScope:      "acme/widgets",
+		WorkingDir:     "/root/gitmoot",                        // a live checkout — must be overridden
+		AutonomyPolicy: runtime.AutonomyPolicyDangerFullAccess, // a write grant — must be downgraded
 	}
-	if other.WorkingDir != "" {
-		t.Fatalf("WorkingDir = %q, want empty for unregistered repo", other.WorkingDir)
+	got := sandboxSynthAgent(agent, scratch)
+	if got.WorkingDir != scratch {
+		t.Fatalf("WorkingDir = %q, want scratch %q", got.WorkingDir, scratch)
+	}
+	if got.RepoScope != "acme/widgets" {
+		t.Fatalf("RepoScope = %q, want acme/widgets preserved", got.RepoScope)
+	}
+	// #725: the scratch cwd is not a hard guarantee unless the permission grant is
+	// also clamped — a write-permissioned agent could otherwise escape by absolute
+	// path. Every synth delivery must be forced to read-only.
+	if got.AutonomyPolicy != runtime.AutonomyPolicyReadOnly {
+		t.Fatalf("AutonomyPolicy = %q, want read-only downgrade", got.AutonomyPolicy)
+	}
+	// The original agent is not mutated (value copy).
+	if agent.WorkingDir != "/root/gitmoot" {
+		t.Fatalf("original agent mutated: WorkingDir = %q", agent.WorkingDir)
+	}
+	if agent.AutonomyPolicy != runtime.AutonomyPolicyDangerFullAccess {
+		t.Fatalf("original agent mutated: AutonomyPolicy = %q", agent.AutonomyPolicy)
+	}
+}
+
+// TestSynthPromptsCarryEvalOnlyPreamble proves the #725 soft complement: the
+// challenger, attempt, and judge prompts all lead with the answer-only preamble
+// that tells an agentic CLI not to create files or run commands.
+func TestSynthPromptsCarryEvalOnlyPreamble(t *testing.T) {
+	item := synthGeneratedItem{Context: "ctx", Question: "q", Rubric: "r"}
+	prompts := map[string]string{
+		"challenger": synthChallengerPrompt("guidance", ""),
+		"attempt":    synthAttemptPrompt(item),
+		"judge":      synthJudgePrompt(item, "weak", "strong"),
+	}
+	for name, p := range prompts {
+		if !strings.HasPrefix(p, synthEvalOnlyPreamble) {
+			t.Fatalf("%s prompt does not lead with the eval-only preamble:\n%s", name, p)
+		}
+		if !strings.Contains(p, "Do NOT create files, run commands, start servers") {
+			t.Fatalf("%s prompt missing the do-not-execute instruction", name)
+		}
 	}
 }
 

@@ -1503,3 +1503,59 @@ context_enabled = true   # inject the advisory table into top-level coordinator 
 
 The injected block carries the same "not a benchmark" disclaimer, is added only to
 top-level (coordinator) jobs, and never forces a route — routing stays advisory.
+
+### V1.5 — auto-respond, `chat wait`, and `moot`
+
+V1.5 (#534) adds the **agent-to-agent** layer. Both additions are **off by
+default** and keep anti-ping-pong **structural**: only a `kind=chat` message with a
+resolved mention triggers work, and every back-linked reply is a non-triggering
+`kind=job_result`.
+
+**Auto-respond sweep** — an opt-in daemon-tick sweep that lets an enrolled agent
+answer an `@mention` without a human running `chat task`, enqueueing **one** bounded
+read-only `ask` per unread mention through the same dispatch gate as `chat task`. It
+is a no-op (zero chat-table queries per tick) unless **both** the global switch and a
+per-agent opt-in are set: `[chat] auto_respond = true` and
+`[agents.<name>] chat_autorespond = true`.
+
+| `[chat]` knob | Default | Meaning |
+|---|---|---|
+| `auto_respond` | `false` | Global kill switch; `false` overrides every per-agent opt-in. |
+| `auto_respond_cap` | `4` | HARD cap on auto-responses per (thread, agent). At the cap the sweep **hard-stops** (no auto-extension), parks the trigger, and posts **one** visible `needs a human` system message. |
+| `auto_respond_cooldown` | `2m` | Minimum spacing per (thread, agent); a trigger inside the window is deferred (left unread to re-fire), never dropped. |
+
+**`chat wait`** — a blocking read verb for moot turn-taking: it polls until the
+thread has a message with `seq > --since-seq`, then prints the new messages plus a
+`last-seq: N` line (feed `N` back as the next `--since-seq`). On a capped moot thread
+it returns immediately with the wrap-up line instead of spinning to the timeout.
+
+```sh
+gitmoot chat wait <thread> [--since-seq N] [--timeout 90s] [--repo owner/repo] [--json]
+```
+
+**`gitmoot moot`** — convene N registered agents as **seats** in one bounded
+brainstorm. Each seat is **one** background read-only `ask` job through the same
+validate → repo-scope → capability → policy gate as `chat task`; seats converse via
+`chat send` / `chat wait`, so the cost is exactly one job per seat regardless of
+message count. Messages are rows (free).
+
+```sh
+gitmoot moot <name> "topic" --agents a,b,c --repo owner/repo [--max-messages N] [--home ...] [--json]
+```
+
+Every seat must be **registered**, **repo-scoped**, and carry the **`ask`**
+capability, or the moot is rejected before any thread or seat is created. The moot
+**HARD-STOPS** at its agent-message cap (no auto-extension): at the cap
+`chat send --as` is refused, **one** visible `MOOT CAP REACHED` overrun system
+message is posted, and each seat wraps up by returning its **partial conclusions**
+(what it knows / is unsure of / would ask next) as its `gitmoot_result`, which arrive
+via the `job_result` back-link path (the cap never blocks those). Human sends and
+seat conclusions are never gated by the cap.
+
+| `[chat]` knob | Default | Meaning |
+|---|---|---|
+| `moot_max_seats` | `6` | Max agents one moot may convene; a larger roster is rejected. |
+| `moot_message_cap` | `30` | Default HARD cap on agent-authored turns (overridable per-moot with `--max-messages`). |
+
+`[chat]` is optional: with no `[chat]` section every knob resolves to its default,
+`auto_respond` stays off, and the daemon tick is byte-identical.
