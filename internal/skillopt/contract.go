@@ -432,6 +432,11 @@ type TrainingPackage struct {
 	FeedbackContext      json.RawMessage       `json:"feedback_context,omitempty"`
 	EvaluatorConfig      json.RawMessage       `json:"evaluator_config,omitempty"`
 	EvaluatorProfile     *EvaluatorProfile     `json:"evaluator_profile,omitempty"`
+	// BinaryVerdicts is the OPTIONAL BINEVAL binary-evaluation section (#525):
+	// per-question yes/no verdicts for the run. omitempty keeps old packets (and
+	// runs with no binary verdicts) byte-identical; the field round-trips through
+	// export/import unchanged. No contract-version bump (additive field).
+	BinaryVerdicts []BinaryVerdict `json:"binary_verdicts,omitempty"`
 }
 
 type CandidateTemplate struct {
@@ -737,6 +742,10 @@ func ExportTrainingPackage(ctx context.Context, store *db.Store, runID string) (
 	if err != nil {
 		return TrainingPackage{}, err
 	}
+	binaryVerdicts, err := loadBinaryVerdicts(ctx, store, run.ID)
+	if err != nil {
+		return TrainingPackage{}, err
+	}
 	feedbackContext, err := buildTrainingFeedbackContext(run, feedbackEvents, rankedFeedbackEvents)
 	if err != nil {
 		return TrainingPackage{}, err
@@ -774,7 +783,32 @@ func ExportTrainingPackage(ctx context.Context, store *db.Store, runID string) (
 		FeedbackContext:      feedbackContext,
 		EvaluatorConfig:      evaluatorConfig,
 		EvaluatorProfile:     evaluatorProfile,
+		BinaryVerdicts:       binaryVerdicts,
 	}, nil
+}
+
+// loadBinaryVerdicts reads the run's persisted BINEVAL verdicts (#525) into the
+// packet's optional section. A run with none yields a nil slice (omitempty), so
+// the exported packet is byte-identical to the pre-#525 shape.
+func loadBinaryVerdicts(ctx context.Context, store *db.Store, runID string) ([]BinaryVerdict, error) {
+	rows, err := store.ListBinaryVerdicts(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	out := make([]BinaryVerdict, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, BinaryVerdict{
+			QuestionID:  r.QuestionID,
+			Dimension:   r.Dimension,
+			Verdict:     r.Verdict,
+			Explanation: r.Explanation,
+			CreatedAt:   r.CreatedAt,
+		})
+	}
+	return out, nil
 }
 
 func evaluatorConfigFromRunMetadata(metadata json.RawMessage) (json.RawMessage, error) {

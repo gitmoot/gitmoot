@@ -4860,6 +4860,64 @@ func (s *Store) UpsertFeedbackEvent(ctx context.Context, event FeedbackEvent) er
 	return err
 }
 
+// BinaryVerdict is one persisted BINEVAL binary-evaluation verdict (#525): a
+// yes/no answer + explanation for a single question of an eval run.
+type BinaryVerdict struct {
+	RunID       string
+	QuestionID  string
+	Dimension   string
+	Verdict     string
+	Explanation string
+	CreatedAt   string
+}
+
+// UpsertBinaryVerdict inserts or replaces one binary verdict keyed by
+// (run_id, question_id) so a re-run of the same question set against the same
+// run overwrites verdicts in place (stable row count).
+func (s *Store) UpsertBinaryVerdict(ctx context.Context, v BinaryVerdict) error {
+	if strings.TrimSpace(v.RunID) == "" {
+		return errors.New("binary verdict run id is required")
+	}
+	if strings.TrimSpace(v.QuestionID) == "" {
+		return errors.New("binary verdict question id is required")
+	}
+	if strings.TrimSpace(v.Verdict) == "" {
+		v.Verdict = "no"
+	}
+	if strings.TrimSpace(v.CreatedAt) == "" {
+		v.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO skillopt_binary_verdicts(run_id, question_id, dimension, verdict, explanation, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(run_id, question_id) DO UPDATE SET
+			dimension = excluded.dimension,
+			verdict = excluded.verdict,
+			explanation = excluded.explanation,
+			created_at = excluded.created_at`,
+		v.RunID, v.QuestionID, v.Dimension, v.Verdict, v.Explanation, v.CreatedAt)
+	return err
+}
+
+// ListBinaryVerdicts returns every binary verdict for a run, ordered by
+// (dimension, question_id) for a deterministic read.
+func (s *Store) ListBinaryVerdicts(ctx context.Context, runID string) ([]BinaryVerdict, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT run_id, question_id, dimension, verdict, explanation, created_at
+		FROM skillopt_binary_verdicts WHERE run_id = ? ORDER BY dimension, question_id`, strings.TrimSpace(runID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var verdicts []BinaryVerdict
+	for rows.Next() {
+		var v BinaryVerdict
+		if err := rows.Scan(&v.RunID, &v.QuestionID, &v.Dimension, &v.Verdict, &v.Explanation, &v.CreatedAt); err != nil {
+			return nil, err
+		}
+		verdicts = append(verdicts, v)
+	}
+	return verdicts, rows.Err()
+}
+
 func (s *Store) ListFeedbackEvents(ctx context.Context, runID string) ([]FeedbackEvent, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, item_id, choice, reasoning, reviewer, source, source_url, created_at
 		FROM feedback_events WHERE run_id = ? ORDER BY item_id, reviewer, source, source_url`, runID)
@@ -7828,5 +7886,25 @@ CREATE TABLE pipeline_run_stages (
 );
 
 CREATE INDEX idx_pipeline_run_stages_run_id ON pipeline_run_stages(run_id);
+	`,
+	// #525 BINEVAL binary evaluation: one row per (eval run, binary question)
+	// recording the yes/no verdict + explanation and the dimension the question
+	// belongs to. Keyed by (run_id, question_id) so re-running a question set
+	// against the same run upserts each verdict in place (stable row count,
+	// corrective overwrite). Pure additive append (CREATE TABLE/INDEX only, no
+	// ALTER/renumber of any prior migration): the table stays empty until
+	// `gitmoot skillopt binary run` executes, so every existing DB — and every
+	// existing SkillOpt review/optimize flow — reads byte-identically.
+	`
+CREATE TABLE skillopt_binary_verdicts (
+	run_id TEXT NOT NULL,
+	question_id TEXT NOT NULL,
+	dimension TEXT NOT NULL DEFAULT '',
+	verdict TEXT NOT NULL DEFAULT 'no',
+	explanation TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (run_id, question_id)
+);
+CREATE INDEX idx_skillopt_binary_verdicts_run ON skillopt_binary_verdicts(run_id);
 	`,
 }

@@ -1088,6 +1088,8 @@ gitmoot skillopt candidate promote <version-id>
 gitmoot skillopt candidate reject <version-id> [--reason text]
 gitmoot skillopt gate run --candidate <version-id> [--corpus path] [--replay-command cmd] [--config path] [--json]
 gitmoot skillopt gate history --candidate <version-id> [--json]
+gitmoot skillopt binary run --set <file> --run <run-id> --source <file> [--deterministic] [--reviewer runtime] [--home path] [--json]
+gitmoot skillopt binary show --run <run-id> [--home path] [--json]
 gitmoot skillopt ab <agent> "<prompt>" [--challenger <versionId>] [--pick a|b] [--seed N] [--judge] [--judge-only] [--home path]
 gitmoot skillopt pairwise import <packet-dir> [--packet path] [--secret-map path] [--picks path] [--reviewer name] [--json]
 gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>
@@ -1220,6 +1222,29 @@ applies, and a non-decisive or budget-exhausted stream **fails safe** to a
 `pace_blocked` notify (no promotion). Off (the default) it is never consulted —
 byte-identical. Knobs: `pace_alpha` (default `0.05` → threshold 20), `pace_lambda`
 (default `0.5`), `pace_max_pairs` (default `200`).
+
+`skillopt binary run --set <file> --run <run-id> --source <file>` runs the
+off-by-default, additive **BINEVAL-style binary evaluation** (`#525`): instead of
+one opaque scalar judge score, a rubric is decomposed into small, independent
+**yes/no questions**, each answered on its own with a verdict plus explanation,
+and the per-question verdicts aggregate into a per-dimension **weighted
+yes-fraction** and a weighted-mean **overall** score. The **question set** is a
+YAML or JSON file (`{version: 1, template_or_task_kind, dimensions: [{name,
+weight, questions: [{id, text, violation_example, weight}]}]}`); ids must be
+unique and weights default to `1`. `--deterministic` uses a **rule-based runner**
+(no LLM) that answers each question purely from optional
+`contains`/`not_contains`/`regex`/`not_regex` assertions on the question — the
+reproducible/test mode. Without `--deterministic`, `--reviewer <runtime>` selects
+an **opt-in LLM-backed runner** wired through the same cross-family judge plumbing
+as `skillopt ab --judge`, so each question is answered by a *different* family
+(never a self-preference), read-only. Verdicts persist to the additive
+`skillopt_binary_verdicts` table keyed by `(run_id, question_id)` and are re-read
+by `skillopt binary show --run <run-id>`; they also ride the training-package
+export as an **optional** `binary_verdicts` section (omitempty — verdict-less
+packets are byte-identical). The per-dimension scores map onto the existing
+`EvaluatorScore.DimensionScores` shape with **no contract change**. Nothing here
+runs unless a `skillopt binary` command is invoked — every existing SkillOpt
+review/optimize flow is byte-identical when it is unused.
 
 `skillopt pairwise import <packet-dir>` ingests a **blinded paired-review
 packet** produced by the gitmoot-skillopt fork (the `pairwise-review.json`
