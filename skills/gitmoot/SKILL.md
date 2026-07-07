@@ -207,7 +207,11 @@ continuing. For optimizer-phase recovery, use
 `gitmoot skillopt train recover --session <id> [--out-root path] [--json]`,
 which re-imports or repairs the optimizer candidate package and classifies the
 iteration; it does not release the generation lock or rebuild generation
-options.
+options. To improve the *judge's rubric* (not the model) from accumulated human
+feedback, run `gitmoot skillopt rubric induce --template <id>` — an offline,
+deterministic tool that induces a criterion-separated rubric from captured
+trait feedback, meta-evaluates it for coverage/redundancy, and writes a frozen
+JSON for human review; it never auto-injects.
 
 For complete command examples, read [CLI.md](references/CLI.md).
 For end-to-end workflows, read [WORKFLOWS.md](references/WORKFLOWS.md).

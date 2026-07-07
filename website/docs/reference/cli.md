@@ -1036,6 +1036,7 @@ gitmoot skillopt candidate promote <version-id>
 gitmoot skillopt candidate reject <version-id> [--reason text]
 gitmoot skillopt ab <agent> "<prompt>" [--challenger <versionId>] [--pick a|b] [--seed N] [--judge] [--judge-only] [--home path]
 gitmoot skillopt pairwise import <packet-dir> [--packet path] [--secret-map path] [--picks path] [--reviewer name] [--json]
+gitmoot skillopt rubric induce --template <id> [--out <dir>] [--holdout 0.2] [--min-events N] [--home path] [--json]
 gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>
 gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id> [--reviewer name]
 gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]
@@ -1191,6 +1192,43 @@ fixed `--seed` pinned the champion to one position), and a summary of the
 candidate-level judge outcomes above. Small samples get a loud warning —
 sample size is the limiter. `--json` emits the machine-readable report. It is
 read-only.
+
+`skillopt rubric induce` is the **offline, deterministic rubric-induction**
+tool (#344/#347, AutoLibra-style — 2505.02820). It reads the human feedback
+already captured for a template (the `useful_traits` / `rejected_traits` /
+`required_improvements` on ranked feedback events, across all of that
+template's runs) and **induces a criterion-separated rubric** from it, then
+freezes it as reviewed static JSON. The pipeline is fully offline — no LLM
+calls, so it is reproducible and testable: (1) **ground** each trait string
+into an aspect `{text, sign +/-, source_event_id}`; (2) **cluster** aspects by
+normalized token-overlap (Jaccard, greedy single-linkage, stable ordering)
+into up to six metrics, each `{name, definition, positive_examples,
+negative_examples, source_event_ids}`; (3) **meta-evaluate** on a held-out
+split — `coverage` (fraction of held-out aspects a metric matches) and
+`redundancy` (max inter-metric similarity, lower is better); (4) **write**
+`rubric.json` (the frozen rubric, `{version, template, metrics[...]}`),
+`report.json`, and a human-readable `report.txt` under `--out` (default
+`<home>/skillopt/rubrics/<template>`). Flags: `--template <id>` (required),
+`--holdout 0.2` (fraction reserved for coverage; `0` keeps in-sample),
+`--min-events N` (minimum usable feedback events, hard floor 3),
+`--home <path>`, and `--json` (emits the report plus the artifact paths). It
+errors with an actionable message and a non-zero exit when there are fewer than
+three usable feedback events or fewer than two separable metric clusters. The
+token-overlap clusterer is the deterministic v1; swapping in AutoLibra's LLM
+thematic clustering is a clearly-marked extension point that changes only the
+clustering step, leaving grounding, the held-out meta-eval, and the emitted
+contract identical.
+
+The tool is **read-only over the store and human-gated**: it only writes files
+and never injects anywhere. To adopt an induced rubric, a human reviews
+`rubric.json` and maps its metrics onto gitmoot-skillopt's
+`evaluator_config['rubric']` — one dimension per metric, using the metric
+`name` as the dimension key and its `definition` (plus the positive/negative
+examples) as the description, with a weight the reviewer chooses. Because the
+judge's `_compose_evaluator_rubric` already merges arbitrary
+`evaluator_config['rubric']` dimensions and `_normalize_dimension_list`
+accepts arbitrary names, adopting an induced rubric needs **zero judge-code
+change and no result-contract bump**.
 
 `skillopt judge promote` closes the judge-prompt optimization loop: it applies an
 **accepted** judge-prompt variant (from the judge-prompt optimizer's

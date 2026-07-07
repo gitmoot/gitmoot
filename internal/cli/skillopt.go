@@ -80,6 +80,8 @@ func runSkillOpt(args []string, stdout, stderr io.Writer) int {
 		return runSkillOptAB(args[1:], stdout, stderr)
 	case "pairwise":
 		return runSkillOptPairwise(args[1:], stdout, stderr)
+	case "rubric":
+		return runSkillOptRubric(args[1:], stdout, stderr)
 	case "gate":
 		return runSkillOptGate(args[1:], stdout, stderr)
 	default:
@@ -109,6 +111,7 @@ func printSkillOptUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)")
 	fmt.Fprintln(w, "  gitmoot skillopt ab <agent> \"<prompt>\" [--challenger <versionId>] [--pick a|b] [--seed N] [--judge] [--judge-only] [--home path]")
 	fmt.Fprintln(w, "  gitmoot skillopt pairwise import <packet-dir> [--packet path] [--secret-map path] [--picks path] [--reviewer name] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot skillopt rubric induce --template <id> [--out <dir>] [--holdout 0.2] [--min-events N] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot skillopt judge-report [--template id]")
 	fmt.Fprintln(w, "  gitmoot skillopt judge agreement [--template <id>] [--home <h>] [--json]")
 	fmt.Fprintln(w, "  gitmoot skillopt judge promote --template <id> --task-kind <kind> --file <pkg.json> [--home <h>] [--yes] [--json]")
