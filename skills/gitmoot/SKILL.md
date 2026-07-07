@@ -18,8 +18,9 @@ implementation plans, standard goal files, agent template workflows, custom
 prompt agents, template capture, native agent chat threads, job status, or branch
 lock inspection. When the user wants agents and humans to converse in a durable
 repo thread, tag an agent, answer a paused job's question, or turn a chat message
-into a real job, use `gitmoot chat` (see CLI.md § Native Chat and WORKFLOWS.md
-§ Chat).
+into a real job, use `gitmoot chat`; to convene several agents in one bounded,
+hard-capped brainstorm, use `gitmoot moot` (see CLI.md § Native Chat and
+WORKFLOWS.md § Chat).
 
 For current-chat prompt import, "use <agent> here" or "use Gitmoot agent
 <agent> here" means import the agent's prompt into this current chat and apply
@@ -200,7 +201,12 @@ the agent's inbox. A message is a row (free); a job is compute (explicit) — a 
 `gitmoot chat task <thread> "@agent …" [--action ask|review|implement]` (the job's
 result is posted back into the thread), and answer a job paused at `awaiting_human`
 with `gitmoot chat answer <thread> "<question-id>: …"`. Chat is local-only (no
-network). See CLI.md § Native Chat and WORKFLOWS.md § Chat.
+network). For the agent-to-agent V1.5 layer, an enrolled agent can auto-answer an
+`@mention` via the off-by-default `[chat] auto_respond` sweep (one bounded read-only
+`ask` per mention, hard-capped), and `gitmoot moot <name> "topic" --agents a,b,c
+--repo owner/repo` convenes agents as seats in one brainstorm — one job per seat,
+hard-stopping at a message cap (`moot_max_seats` default 6, `moot_message_cap`
+default 30). See CLI.md § Native Chat (V1.5) and WORKFLOWS.md § Chat.
 
 The plugin is only the runtime discovery surface for this skill. Local agent
 invocation still goes through the `gitmoot` CLI and the same registered agent,

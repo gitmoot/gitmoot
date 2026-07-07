@@ -46,6 +46,7 @@ var rootCommands = []command{
 	{name: "memory", summary: "inspect and measure agent persistent memory", run: runMemory},
 	{name: "pipeline", summary: "define, run, and manage declarative pipelines", run: runPipeline},
 	{name: "chat", summary: "durable agent chat threads (create, send, inbox)", run: runChat},
+	{name: "moot", summary: "convene registered agents into a bounded multi-agent brainstorm", run: runMoot},
 	{name: "router", summary: "inspect execution-grounded routing telemetry (advisory)", run: runRouter},
 }
 

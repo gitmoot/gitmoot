@@ -8137,4 +8137,20 @@ CREATE TABLE result_check_failures (
 );
 CREATE INDEX idx_result_check_failures_job ON result_check_failures(job_id);
 	`,
+	// #534 V1.5 — `gitmoot moot`. A per-thread key/value side-table (mirroring the
+	// chat_meta shape) carries moot metadata on a thread WITHOUT an ALTER of the V1
+	// chat_threads table: a thread convened as a moot records moot='1' and
+	// moot_message_cap='<N>' rows. It stays empty until `gitmoot moot` runs, so every
+	// existing DB reads byte-identically. Pure additive append (CREATE TABLE only, no
+	// ALTER/renumber of any prior migration).
+	`
+CREATE TABLE chat_thread_meta (
+	thread_id TEXT NOT NULL,
+	key TEXT NOT NULL,
+	value TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY(thread_id, key)
+);
+	`,
 }

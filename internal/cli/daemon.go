@@ -1961,6 +1961,12 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 				if err := runPipelineScanOnce(ctx, store, pipelineEnqueue, time.Now().UTC()); err != nil {
 					writeLine(stdout, "pipeline scan error: %s", err)
 				}
+				// Chat auto-respond sweep (#534 V1.5). Off-by-default: with
+				// [chat].auto_respond unset (or no agent enrolled) it returns before any
+				// chat-table query, so the tick hot path is byte-identical.
+				if err := runChatAutoRespondScanOnce(ctx, paths, home, store, dispatchLocalAgentJob, time.Now().UTC()); err != nil {
+					writeLine(stdout, "chat auto-respond scan error: %s", err)
+				}
 				// Decouple the pipeline-advance cadence from the repo-poll backoff
 				// (#697): `wait` is the poller's cadence, which grows to minutes when
 				// repo polling backs off, and it would otherwise throttle the pipeline
@@ -2062,6 +2068,12 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		if heartbeatPathsErr == nil {
 			if err := runHeartbeatScanOnce(ctx, heartbeatPaths, store, heartbeatEnqueue, time.Now().UTC()); err != nil {
 				writeLine(stdout, "heartbeat scan error: %s", err)
+			}
+			// Chat auto-respond sweep (#534 V1.5) needs the same resolved config paths
+			// as the heartbeat scan, so gate it on the same paths resolution.
+			// Off-by-default: returns before any chat-table query unless enabled.
+			if err := runChatAutoRespondScanOnce(ctx, heartbeatPaths, home, store, dispatchLocalAgentJob, time.Now().UTC()); err != nil {
+				writeLine(stdout, "chat auto-respond scan error: %s", err)
 			}
 		}
 		if err := runPipelineScanOnce(ctx, store, pipelineEnqueue, time.Now().UTC()); err != nil {
