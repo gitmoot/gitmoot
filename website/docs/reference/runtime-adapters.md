@@ -15,7 +15,17 @@ agent template and rendered job prompt before handing work to an adapter.
   -p '<prompt>' --output-format stream-json`, parsing the session id from the
   stream-json output. Select it with `gitmoot agent start <name> --runtime
   kimi`. Authenticate once with `kimi login`, then restart the Gitmoot daemon so
-  it inherits the session.
+  it inherits the session. **Very large prompts (≥100 KiB):** the Kimi CLI takes
+  the prompt only as a single `-p` argument, and any single process argument above
+  the kernel's `MAX_ARG_STRLEN` (~128 KiB) fails to launch with `fork/exec:
+  argument list too long`. When a rendered prompt reaches the 100 KiB safety
+  threshold, Gitmoot stages it to a file in a dedicated temporary directory,
+  grants that directory to the Kimi session with `--add-dir` (so Kimi's
+  workspace-scoped file-read tool can open it), and passes a short instruction
+  telling the agent to read that file as its full task, keeping the launch under
+  the limit. Normal-size prompts are passed verbatim as before, unchanged. (The
+  Claude and Codex adapters pass the prompt as an argv argument too, but their
+  CLIs can also read it from stdin, so they have a native escape hatch.)
 - **Kimi CLI (legacy)** is the opt-in `--runtime kimi-cli` adapter (#546) for
   the **older** Kimi CLI, which requires the `--print` command shape the
   current Kimi Code CLI does not support. It is intentionally separate from
