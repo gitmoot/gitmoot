@@ -150,6 +150,20 @@ func runMoot(args []string, stdout, stderr io.Writer) int {
 		messageCap = *maxMessages
 	}
 
+	// Preflight: warn (do NOT block) when the daemon that will run these seats is
+	// configured to run same-repo read-only jobs SEQUENTIALLY (#534 review #6). Moot
+	// seats are top-level read-only `ask` jobs sharing checkout key `repo:<repo>`;
+	// under the default single-worker/barrier scheduler they serialize (each seat's
+	// `chat wait` times out and the moot degrades to sequential monologues), whereas
+	// the pool scheduler with >=2 workers gives each contended read-only same-repo
+	// job its own detached worktree so seats converse CONCURRENTLY. This is a pure
+	// config read (no live auth probe), mirroring the off-hot-path contract of the
+	// daemon's #444 serialization preflight, and it reuses the daemon's own
+	// serializingConfig predicate so the moot's verdict matches the daemon's.
+	if warn := mootSerializationWarning(paths, repoName, len(agents)); warn != "" {
+		fmt.Fprintln(stderr, warn)
+	}
+
 	var out mootOutput
 	if err := withStore(*home, func(store *db.Store) error {
 		ctx := context.Background()
@@ -337,6 +351,64 @@ func postMootOverrunMessage(ctx context.Context, store *db.Store, threadID strin
 // it to exactly one row per thread.
 func chatMootOverrunMessage(messageCap int) string {
 	return fmt.Sprintf("MOOT CAP REACHED — this moot hit its %d-message cap and is hard-stopped (no auto-extension). Each seat: stop conversing and post your partial conclusions (what you know / are unsure of / would ask next) via your gitmoot_result.", messageCap)
+}
+
+// ---- serialization preflight (#534 review #6) ------------------------------
+
+// mootSerializationWarning reads the EFFECTIVE daemon scheduler/worker config for
+// this home + repo — the SAME warm-reloadable [daemon] section (LoadDaemonRuntime-
+// Config, defaults 1 worker / barrier) and per-repo [repos."owner/repo"] override
+// (#576) the daemon re-reads each tick — and returns a human warning when that
+// config cannot run >=2 same-repo read-only seats concurrently. It returns "" (say
+// nothing) when the config supports concurrency, when fewer than 2 seats are
+// convening (a solo seat never needs to converse), or on any load error (a
+// best-effort advisory must never break a dispatch).
+//
+// It is a PURE read: no live auth probe and no mutation, mirroring the off-hot-path
+// contract of the daemon's #444 serialization preflight. It reuses the daemon's own
+// parseSchedulerMode + serializingConfig predicates so the moot's verdict is exactly
+// the daemon's. NOTE: it deliberately does NOT apply the start-time autoSelect (a
+// bare `workers = 4` in [daemon] warm-reloads WITHOUT flipping to pool — the daemon
+// keeps barrier and still serializes same-repo jobs), so the warning tracks the
+// warm-reload semantics faithfully.
+func mootSerializationWarning(paths config.Paths, repo string, seats int) string {
+	if seats < 2 {
+		return ""
+	}
+	// Documented defaults with no [daemon] section: one worker, barrier scheduler.
+	workers := 1
+	scheduler := "barrier"
+	if cfg, err := config.LoadDaemonRuntimeConfig(paths); err == nil {
+		if cfg.WorkersSet {
+			workers = cfg.Workers
+		}
+		if cfg.SchedulerSet {
+			scheduler = cfg.Scheduler
+		}
+	}
+	// Honor a per-repo [repos."owner/repo"] override (#576): a max_parallel cap and/
+	// or a scheduler flip apply to THIS repo only.
+	if list, err := config.LoadRepoConcurrency(paths); err == nil {
+		if entry, ok := config.RepoConcurrencyFor(list, repo); ok {
+			if entry.MaxParallel > 0 {
+				workers = entry.MaxParallel
+			}
+			if entry.Scheduler != "" {
+				scheduler = entry.Scheduler
+			}
+		}
+	}
+	usePool, err := parseSchedulerMode(scheduler)
+	if err != nil {
+		// An invalid scheduler mode is the daemon's error to report at start, not
+		// something the moot should guess about — stay quiet.
+		return ""
+	}
+	if !serializingConfig(usePool, workers) {
+		return ""
+	}
+	return fmt.Sprintf("warning: this daemon runs seats sequentially (workers=%d, scheduler=%s); a %d-seat moot will exchange turns slowly and each 'chat wait' may time out. Enable the pool scheduler with >=2 workers ([daemon] parallel = %d, or start the daemon with --parallel %d) so seats converse concurrently.",
+		workers, scheduler, seats, seats, seats)
 }
 
 // ---- helpers ---------------------------------------------------------------

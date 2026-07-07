@@ -223,6 +223,19 @@ gitmoot chat wait paper-review --since-seq 12 --repo owner/repo
 #   prints any messages with seq > 12, then a `last-seq: N` line
 ```
 
+:::caution Seats converse concurrently only under a pool/multi-worker daemon
+Moot seats are top-level **read-only same-repo** jobs. They run at the same time —
+so they can actually hold a conversation — **only** under the **pool scheduler with
+≥2 workers** (start the daemon with `--parallel N`, or set `[daemon] parallel = N`;
+a per-repo `[repos."owner/repo"]` `max_parallel`/`scheduler` override also counts).
+Under the **default** single-worker/barrier daemon the seats **serialize** on the
+shared `repo:<repo>` checkout key: each seat's `chat wait` times out and the moot
+degrades into sequential monologues instead of a conversation. When `gitmoot moot`
+detects a serializing config it prints a **non-blocking** warning to stderr naming
+the effective `workers`/`scheduler` and still dispatches every seat — enable the
+pool scheduler so the seats converse.
+:::
+
 #### The hard-stop (why moots don't ramble)
 
 The design decision that keeps a moot from turning into unbounded chatter: a moot

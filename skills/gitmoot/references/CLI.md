@@ -1803,6 +1803,15 @@ gitmoot moot <name> "topic" --agents a,b,c --repo owner/repo [--max-messages N] 
   (what it knows / is unsure of / would ask next) as its `gitmoot_result`, which
   arrives via the `job_result` back-link path (the cap never blocks those). Human
   sends and seat conclusions are never gated by the cap.
+- **Concurrency requirement**: seats are top-level read-only same-repo jobs, so they
+  converse concurrently **only** under the **pool scheduler with ≥2 workers** (start
+  the daemon with `--parallel N`, or set `[daemon] parallel = N`; a per-repo
+  `[repos."owner/repo"]` `max_parallel`/`scheduler` override also counts). Under the
+  **default** single-worker/barrier daemon the seats **serialize** on the shared
+  `repo:<repo>` checkout key: each seat's `chat wait` times out and the moot degrades
+  to sequential monologues. When it detects a serializing config, `gitmoot moot`
+  prints a **non-blocking** stderr warning naming the effective `workers`/`scheduler`
+  (it still dispatches every seat) — enable the pool scheduler so seats converse.
 
 Moot bounds (in `[chat]`, warm-reloadable):
 

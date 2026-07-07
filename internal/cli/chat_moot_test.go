@@ -458,6 +458,82 @@ func TestMootSeatE2E(t *testing.T) {
 	}
 }
 
+// mootSerialWarnRun convenes a 2-seat moot on home with a recording dispatcher and
+// returns (stderr, dispatchedSeatCount) so the serialization-preflight tests can
+// assert BOTH the warning text and that the moot still dispatched.
+func mootSerialWarnRun(t *testing.T, body string) (string, int) {
+	t.Helper()
+	store, home := mootFixtureHome(t, body)
+	for _, a := range []string{"alice", "bob"} {
+		seedDaemonWorkerAgent(t, store, a, runtime.ShellRuntime, "", []string{"ask"}, "owner/repo")
+	}
+	seen := withRecordingMootDispatch(t)
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"moot", "room", "topic", "--agents", "alice,bob", "--repo", "owner/repo", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("moot exit = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	return stderr.String(), len(*seen)
+}
+
+// TestMootSerializationWarningDefaultDaemon proves the default daemon config
+// (single worker, barrier scheduler — no [daemon] section) makes moot WARN that a
+// 2-seat moot serializes, yet STILL dispatches both seats (advisory, non-blocking).
+func TestMootSerializationWarningDefaultDaemon(t *testing.T) {
+	stderr, dispatched := mootSerialWarnRun(t, "")
+	if !strings.Contains(stderr, "runs seats sequentially") || !strings.Contains(stderr, "workers=1") || !strings.Contains(stderr, "scheduler=barrier") {
+		t.Fatalf("stderr = %q, want a sequential-serialization warning naming workers=1/scheduler=barrier", stderr)
+	}
+	if dispatched != 2 {
+		t.Fatalf("default-daemon moot dispatched %d seats, want 2 (warning must not block)", dispatched)
+	}
+}
+
+// TestMootSerializationWarningPoolConcurrent proves a pool scheduler with >=2
+// workers ([daemon] parallel = 2) SUPPRESSES the warning (seats get distinct
+// worktrees and converse concurrently) and still dispatches both seats.
+func TestMootSerializationWarningPoolConcurrent(t *testing.T) {
+	stderr, dispatched := mootSerialWarnRun(t, "\n[daemon]\nparallel = 2\n")
+	if strings.Contains(stderr, "runs seats sequentially") {
+		t.Fatalf("stderr = %q, want NO serialization warning under pool+2 workers", stderr)
+	}
+	if dispatched != 2 {
+		t.Fatalf("pool moot dispatched %d seats, want 2", dispatched)
+	}
+}
+
+// TestMootSerializationWarningPerRepoOverride proves a per-repo [repos."owner/repo"]
+// override (#576) is honored: raising max_parallel with a pool scheduler for THIS
+// repo suppresses the warning even though the global config would serialize.
+func TestMootSerializationWarningPerRepoOverride(t *testing.T) {
+	body := "\n[repos.\"owner/repo\"]\nmax_parallel = 2\nscheduler = \"pool\"\n"
+	stderr, dispatched := mootSerialWarnRun(t, body)
+	if strings.Contains(stderr, "runs seats sequentially") {
+		t.Fatalf("stderr = %q, want NO warning under a per-repo pool/max_parallel override", stderr)
+	}
+	if dispatched != 2 {
+		t.Fatalf("per-repo-override moot dispatched %d seats, want 2", dispatched)
+	}
+}
+
+// TestMootSerializationWarningUnit exercises the predicate directly: a solo seat
+// never warns (no conversation needed), barrier/1-worker warns, pool/>=2 suppresses.
+func TestMootSerializationWarningUnit(t *testing.T) {
+	_, home := mootFixtureHome(t, "")
+	paths := config.PathsForHome(home)
+	if w := mootSerializationWarning(paths, "owner/repo", 1); w != "" {
+		t.Fatalf("solo seat warned: %q", w)
+	}
+	if w := mootSerializationWarning(paths, "owner/repo", 3); w == "" {
+		t.Fatal("default daemon (1/barrier) did not warn a 3-seat moot")
+	}
+	_, poolHome := mootFixtureHome(t, "\n[daemon]\nparallel = 2\n")
+	poolPaths := config.PathsForHome(poolHome)
+	if w := mootSerializationWarning(poolPaths, "owner/repo", 3); w != "" {
+		t.Fatalf("pool+2 workers warned: %q", w)
+	}
+}
+
 // TestLoadChatSettingsMootDefaults proves the [chat] moot knobs resolve to their
 // documented defaults and reject out-of-range values.
 func TestLoadChatSettingsMootDefaults(t *testing.T) {
