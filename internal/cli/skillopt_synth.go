@@ -366,12 +366,33 @@ func runSkillOptSynthWithStore(ctx context.Context, store *db.Store, opts synthO
 // An accepted item is persisted (file + pending_human_approval DB row). A skipped
 // item logs its final diagnostic. Never returns an error: a per-call runtime
 // failure is logged and treated as a skip so the bounded run continues.
+//
+// Sandbox (#725): every attempt/challenger/judge delivery is forced into a FRESH
+// per-item temp scratch dir (never a registered repo checkout) so an agentic CLI
+// that misreads the exercise as a real job can only ever write into a throwaway
+// directory that is deleted when the item finishes — it can never touch a live
+// checkout. This is the hard guarantee; the answer-only prompt preamble is the
+// soft complement that reduces wasted agent effort.
 func generateSynthItem(ctx context.Context, store *db.Store, opts synthOptions, guidance string, challengerAgent, weakAgent, strongAgent, judgeAgent runtime.Agent, index int, stderr io.Writer) synthItemSummary {
 	result := synthItemSummary{}
+	scratch, err := os.MkdirTemp("", "gitmoot-synth-item-")
+	if err != nil {
+		fmt.Fprintf(stderr, "skillopt synth: item %d: create scratch dir: %v\n", index+1, err)
+		result.Diagnostic = synthDiagBadRubric
+		return result
+	}
+	// Clean the scratch dir (and anything a misbehaving agent wrote into it) after
+	// the item, regardless of accept/reject/error.
+	defer os.RemoveAll(scratch)
+	// deliver sandboxes every synth delivery into the per-item scratch dir before
+	// handing it to the (test-overridable) delivery seam.
+	deliver := func(agent runtime.Agent, prompt string) (string, error) {
+		return skillOptSynthDeliver(ctx, sandboxSynthAgent(agent, scratch), prompt)
+	}
 	feedback := ""
 	for round := 1; round <= opts.maxRounds; round++ {
 		result.Rounds = round
-		challengerRaw, err := skillOptSynthDeliver(ctx, challengerAgent, synthChallengerPrompt(guidance, feedback))
+		challengerRaw, err := deliver(challengerAgent, synthChallengerPrompt(guidance, feedback))
 		if err != nil {
 			fmt.Fprintf(stderr, "skillopt synth: item %d round %d: challenger: %v\n", index+1, round, err)
 			result.Diagnostic = synthDiagBadRubric
@@ -383,19 +404,19 @@ func generateSynthItem(ctx context.Context, store *db.Store, opts synthOptions, 
 			feedback = synthFeedbackForDiagnostic(synthDiagBadRubric)
 			continue
 		}
-		weakAns, err := skillOptSynthDeliver(ctx, weakAgent, synthAttemptPrompt(item))
+		weakAns, err := deliver(weakAgent, synthAttemptPrompt(item))
 		if err != nil {
 			fmt.Fprintf(stderr, "skillopt synth: item %d round %d: weak: %v\n", index+1, round, err)
 			result.Diagnostic = synthDiagBadRubric
 			return result
 		}
-		strongAns, err := skillOptSynthDeliver(ctx, strongAgent, synthAttemptPrompt(item))
+		strongAns, err := deliver(strongAgent, synthAttemptPrompt(item))
 		if err != nil {
 			fmt.Fprintf(stderr, "skillopt synth: item %d round %d: strong: %v\n", index+1, round, err)
 			result.Diagnostic = synthDiagBadRubric
 			return result
 		}
-		judgeRaw, err := skillOptSynthDeliver(ctx, judgeAgent, synthJudgePrompt(item, weakAns, strongAns))
+		judgeRaw, err := deliver(judgeAgent, synthJudgePrompt(item, weakAns, strongAns))
 		if err != nil {
 			fmt.Fprintf(stderr, "skillopt synth: item %d round %d: judge: %v\n", index+1, round, err)
 			result.Diagnostic = synthDiagBadRubric
@@ -472,19 +493,39 @@ func resolveSynthAgent(ctx context.Context, store *db.Store, name, repo string) 
 	if strings.TrimSpace(agent.RepoScope) == "" {
 		agent.RepoScope = repo
 	}
-	// Resolve the repo scope to its registered checkout directory so a real
-	// (non-stubbed) delivery chdirs into an existing path instead of the bogus
-	// relative "owner/repo" RepoScope form. RepoScope itself stays in owner/repo
-	// form (it is validated as such by the adapter). When the repo is not
-	// registered or carries no checkout, WorkingDir stays empty and the delivery
-	// seam falls back to RepoScope — unit tests stub the seam, so this lookup is
-	// best-effort and never fails the run.
-	if scope := strings.TrimSpace(agent.RepoScope); scope != "" {
-		if record, repoErr := store.GetRepo(ctx, scope); repoErr == nil {
-			agent.WorkingDir = strings.TrimSpace(record.CheckoutPath)
-		}
-	}
+	// #725: DO NOT resolve the repo scope to its registered checkout directory.
+	// A synth attempt/challenger/judge is delivered to an agentic CLI that runs
+	// with full tool permissions; if its adapter Dir is a live checkout it will
+	// happily write files, start servers, and probe ports IN that checkout (the
+	// incident that motivated this fix). Every synth delivery is instead forced
+	// into a fresh per-item temp scratch dir by sandboxSynthAgent (see
+	// generateSynthItem), so WorkingDir is left empty here on purpose — nothing in
+	// the synth path may carry a real checkout path.
+	agent.WorkingDir = ""
 	return agent, nil
+}
+
+// sandboxSynthAgent returns a copy of agent whose adapter working dir is forced
+// to scratch — a fresh per-item temp directory (#725). Because
+// realSkillOptABDeliver derives the adapter Dir from WorkingDir (falling back to
+// RepoScope only when WorkingDir is empty), setting WorkingDir to the scratch dir
+// guarantees the delivery chdirs into the throwaway scratch and NEVER into a
+// registered repo checkout, no matter what the agent otherwise carries. RepoScope
+// is left intact so the adapter still resolves the correct runtime family.
+//
+// The stored AutonomyPolicy is ALSO forced to read-only. The scratch cwd alone is
+// not a hard guarantee: a synth agent registered with workspace-write or
+// danger-full-access would otherwise launch its adapter (codex --sandbox
+// danger-full-access / claude bypassPermissions) with a permission grant that is
+// not cwd-restricted, letting an agentic CLI that misreads the exercise write
+// files, start servers, and modify a live checkout by ABSOLUTE path — exactly the
+// #725 incident. Downgrading to read-only here (mirroring the hard-verifier
+// sandbox at skillopt_ab.go and cross_family_review.go) removes that escape hatch;
+// a synth delivery is answer-only and never needs write access.
+func sandboxSynthAgent(agent runtime.Agent, scratch string) runtime.Agent {
+	agent.WorkingDir = scratch
+	agent.AutonomyPolicy = runtime.AutonomyPolicyReadOnly
+	return agent
 }
 
 func synthItemID(template string, index int) string {
@@ -520,8 +561,15 @@ func writeSynthItemFile(path string, item db.SynthReviewItem) error {
 
 // --- prompt builders -------------------------------------------------------
 
+// synthEvalOnlyPreamble frames every synth delivery as an answer-only written
+// exercise (#725). The attempts run against agentic CLIs (not chat models); this
+// preamble is the soft complement to the hard scratch-dir sandbox — it tells the
+// agent NOT to treat the item as a real job to implement, cutting wasted effort.
+const synthEvalOnlyPreamble = "This is a written evaluation exercise. Do NOT create files, run commands, start servers, or modify any repository. Respond with text only.\n\n"
+
 func synthChallengerPrompt(guidance, feedback string) string {
 	var b strings.Builder
+	b.WriteString(synthEvalOnlyPreamble)
 	b.WriteString("You are generating a synthetic review item to evaluate an agent skill.\n")
 	if strings.TrimSpace(guidance) != "" {
 		b.WriteString("The skill being exercised:\n")
@@ -542,6 +590,7 @@ func synthChallengerPrompt(guidance, feedback string) string {
 
 func synthAttemptPrompt(item synthGeneratedItem) string {
 	var b strings.Builder
+	b.WriteString(synthEvalOnlyPreamble)
 	b.WriteString("Answer the following question using the given context.\n\n")
 	b.WriteString("Context:\n")
 	b.WriteString(item.Context)
@@ -575,6 +624,7 @@ func capSynthAnswer(s string) string {
 
 func synthJudgePrompt(item synthGeneratedItem, weakAnswer, strongAnswer string) string {
 	var b strings.Builder
+	b.WriteString(synthEvalOnlyPreamble)
 	b.WriteString("Score two answers against a rubric and judge the item's quality.\n\n")
 	b.WriteString("Context:\n")
 	b.WriteString(item.Context)

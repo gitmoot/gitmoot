@@ -1362,7 +1362,12 @@ meaningfully beats the weak agent (score gap ≥ `--gap`, default 0.20) AND the
 judge confirms the item is well-formed; otherwise the round records a
 diagnostic (`too_easy`, `too_hard`, `strong_failed`, `bad_rubric`, or
 `context_leak`) and the Challenger regenerates with targeted feedback until
-accepted or `--max-rounds-per-item` (default 3) is exhausted. Accepted items are
+accepted or `--max-rounds-per-item` (default 3) is exhausted. Every
+challenger/weak/strong/judge delivery is **sandboxed** into a fresh per-item temp
+scratch dir (never a registered repo checkout) and framed with an answer-only
+preamble, so an agentic-CLI attempt can never write files, start servers, or
+modify a live checkout while "answering" the exercise (`#725`); the scratch dir
+is deleted when the item finishes. Accepted items are
 written to `--out` (default `<home>/evals/synth`) and stored in the DB with
 status `pending_human_approval`. They are **structurally isolated**: nothing in
 the promotion/training path reads the synth table, so a pending item can never
