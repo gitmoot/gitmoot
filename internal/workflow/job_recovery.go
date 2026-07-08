@@ -2,11 +2,48 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 )
+
+// recordReadOnlyWorktreeReclaimOnAbort marks a job's dispatch-allocated read-only
+// worktree (#739) for daemon reclaim when the job is ABORTED (cancel / kill /
+// supersede) instead of running to a terminal AdvanceJob. On main, reactive
+// worktrees were allocated at RUN time, so a queued job carried none; #739 now
+// allocates the worktree at DISPATCH (before enqueue), so a queued read-only ask
+// owns a detached worktree on disk. An abort bypasses the engine's deferred
+// cleanupReadOnlyDelegationWorktree, and neither the advance-retry pass (no advance
+// marker) nor the reclaim pass (no cleanup marker) would otherwise dispose it — it
+// leaks permanently, accumulating one worktree per aborted ask.
+//
+// This is store-only and best-effort, exactly like the sibling branch-lock release
+// on the same abort paths: it writes the delegation_worktree_cleanup_skipped marker
+// the reclaim pass already keys on, so reclaimSkippedDelegationWorktrees disposes
+// the worktree on a later tick (the reclaim state gate accepts cancelled). It is
+// gated on the worktree still existing on disk so an already-cleaned job (e.g. a
+// blocked ask whose run already disposed it) is not turned into a permanent,
+// never-reconciled reclaim candidate.
+func recordReadOnlyWorktreeReclaimOnAbort(ctx context.Context, store *db.Store, job db.Job, payload JobPayload) {
+	if !isReadOnlyDelegationWorktree(job.Type, payload) {
+		return
+	}
+	path := strings.TrimSpace(payload.WorktreePath)
+	if path == "" {
+		return
+	}
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	_ = store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   job.ID,
+		Kind:    "delegation_worktree_cleanup_skipped",
+		Message: fmt.Sprintf("read-only worktree %s preserved for daemon reclaim: job aborted (%s) before its terminal cleanup ran (#739)", path, job.State),
+	})
+}
 
 const JobEventSupersededStaleHead = "superseded_stale_head"
 
@@ -321,6 +358,9 @@ func CancelJob(ctx context.Context, store *db.Store, jobID string) (db.Job, erro
 				Message: fmt.Sprintf("released delegation branch lock %s on cancel (#617)", strings.TrimSpace(payload.Branch)),
 			})
 		}
+		// Symmetric with the branch-lock release above: dispose a #739 dispatch-time
+		// read-only worktree that this cancel-before-run would otherwise leak.
+		recordReadOnlyWorktreeReclaimOnAbort(ctx, store, job, payload)
 	}
 	return store.GetJob(ctx, job.ID)
 }
@@ -359,6 +399,12 @@ func SupersedeStaleHeadJob(ctx context.Context, store *db.Store, jobID string, r
 			return db.Job{}, false, getErr
 		}
 		return latest, false, nil
+	}
+	// Defensive symmetry with CancelJob: a superseded job that carried a #739
+	// dispatch-time read-only worktree must not leak it (no-op for the review jobs
+	// this path targets today, which run in a per-PR task worktree, not a #739 seat).
+	if payload, perr := unmarshalPayload(job.Payload); perr == nil {
+		recordReadOnlyWorktreeReclaimOnAbort(ctx, store, job, payload)
 	}
 	updated, err := store.GetJob(ctx, job.ID)
 	return updated, true, err

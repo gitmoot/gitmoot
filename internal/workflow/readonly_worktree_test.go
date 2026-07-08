@@ -274,6 +274,90 @@ func TestCleanupReadOnlyDelegationWorktreeForceRemoves(t *testing.T) {
 	}
 }
 
+// TestReadOnlyCleanupFailureIsReclaimable pins the #739-review fix: when a
+// read-only worktree's terminal disposal FAILS transiently (force-remove error),
+// cleanup must emit the reclaim-eligible delegation_worktree_cleanup_skipped marker
+// — NOT a dead-end delegation_worktree_cleanup_failed that no pass ever re-selects —
+// so ReclaimTerminalDelegationWorktree re-fires the cleanup on a later daemon tick
+// instead of leaking the worktree permanently.
+func TestReadOnlyCleanupFailureIsReclaimable(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.DelegationCheckout = t.TempDir()
+	manager := &fakeWorktreeManager{removeErr: errors.New("worktree busy")}
+	engine.DelegationWorktrees = manager
+
+	wt := t.TempDir()
+	payload := JobPayload{WorktreePath: wt, ReadOnlyWorktree: true}
+	engine.cleanupReadOnlyDelegationWorktree(ctx, "local-ask-seat", "ask", payload)
+
+	if got := countJobEvents(t, store, "local-ask-seat", "delegation_worktree_cleanup_failed"); got != 0 {
+		t.Fatalf("a transient read-only cleanup failure must not emit a dead-end cleanup_failed, got %d", got)
+	}
+	if got := countJobEvents(t, store, "local-ask-seat", "delegation_worktree_cleanup_skipped"); got != 1 {
+		t.Fatalf("a transient read-only cleanup failure must emit a reclaimable _skipped marker, got %d", got)
+	}
+	if !engine.lastCleanupOutcomeIsSkip(ctx, "local-ask-seat") {
+		t.Fatal("latest cleanup outcome must be a skip so reclaimSkippedDelegationWorktrees re-fires it")
+	}
+
+	// Deduped: a second failing pass must not grow the event log without bound.
+	engine.cleanupReadOnlyDelegationWorktree(ctx, "local-ask-seat", "ask", payload)
+	if got := countJobEvents(t, store, "local-ask-seat", "delegation_worktree_cleanup_skipped"); got != 1 {
+		t.Fatalf("skip marker must be emitted at most once per preserve window, got %d", got)
+	}
+
+	// Once the removal succeeds, a re-fired cleanup disposes the worktree and closes
+	// the window (delegation_worktree_removed), so it drops out of the reclaim set.
+	manager.removeErr = nil
+	engine.cleanupReadOnlyDelegationWorktree(ctx, "local-ask-seat", "ask", payload)
+	if got := countJobEvents(t, store, "local-ask-seat", "delegation_worktree_removed"); got != 1 {
+		t.Fatalf("a later successful cleanup must emit delegation_worktree_removed, got %d", got)
+	}
+	if engine.lastCleanupOutcomeIsSkip(ctx, "local-ask-seat") {
+		t.Fatal("a successful removal must close the reclaim window")
+	}
+}
+
+// TestRecordReadOnlyWorktreeReclaimOnAbort pins the #739-review leak fix: a
+// read-only ask aborted (cancel/kill/supersede) before it ever runs must mark its
+// dispatch-allocated worktree for daemon reclaim, but only when the worktree is
+// still on disk (so an already-disposed job is not turned into a permanent,
+// never-reconciled reclaim candidate) and only for genuine read-only worktrees.
+func TestRecordReadOnlyWorktreeReclaimOnAbort(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+
+	// A queued read-only ask carrying a live dispatch worktree is marked for reclaim.
+	wt := t.TempDir()
+	recordReadOnlyWorktreeReclaimOnAbort(ctx, store,
+		db.Job{ID: "local-ask-live", Type: "ask", State: string(JobQueued)},
+		JobPayload{Repo: "owner/repo", WorktreePath: wt, ReadOnlyWorktree: true})
+	if got := countJobEvents(t, store, "local-ask-live", "delegation_worktree_cleanup_skipped"); got != 1 {
+		t.Fatalf("aborted read-only ask with a live worktree must be marked for reclaim, got %d", got)
+	}
+
+	// A worktree already gone from disk must NOT be marked (else it becomes a
+	// permanent candidate the reclaim pass can never reconcile).
+	gone := filepath.Join(t.TempDir(), "already-removed")
+	recordReadOnlyWorktreeReclaimOnAbort(ctx, store,
+		db.Job{ID: "local-ask-gone", Type: "ask", State: string(JobCancelled)},
+		JobPayload{Repo: "owner/repo", WorktreePath: gone, ReadOnlyWorktree: true})
+	if got := countJobEvents(t, store, "local-ask-gone", "delegation_worktree_cleanup_skipped"); got != 0 {
+		t.Fatalf("already-disposed worktree must not be marked for reclaim, got %d", got)
+	}
+
+	// An implement leg (Branch set, no read-only marker) is left to its own merge-gate
+	// cleanup and must not be touched by the read-only abort helper.
+	recordReadOnlyWorktreeReclaimOnAbort(ctx, store,
+		db.Job{ID: "impl-leg", Type: "implement", State: string(JobQueued)},
+		JobPayload{DelegationID: "d1", WorktreePath: t.TempDir(), Branch: "gitmoot-delegation-d1"})
+	if got := countJobEvents(t, store, "impl-leg", "delegation_worktree_cleanup_skipped"); got != 0 {
+		t.Fatalf("implement worktree must not be marked by the read-only abort helper, got %d", got)
+	}
+}
+
 func TestDispatchDelegationsTwoReadOnlySiblingsGetSeparateDetachedWorktrees(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

@@ -235,6 +235,15 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		ReadOnlyWorktree:       readOnlyWorktreePath != "",
 	})
 	if err != nil {
+		// #739: the read-only worktree is created on disk BEFORE Enqueue. If Enqueue
+		// fails there is no job row, so neither the terminal AdvanceJob cleanup nor the
+		// daemon reclaim pass will ever dispose it — roll it back here or it leaks a
+		// detached worktree (+ its .git/worktrees admin entry) with no owner. Detached
+		// from the (possibly cancelled) request context so removal still runs; the
+		// reactive pool-isolation path defends its own allocation the same way.
+		if readOnlyWorktreePath != "" {
+			_ = gitutil.Client{Dir: record.CheckoutPath}.RemoveWorktreeForce(context.WithoutCancel(ctx), readOnlyWorktreePath)
+		}
 		return localAgentJobOutput{}, err
 	}
 	if err := releaseReservation(ctx); err != nil {
@@ -1175,7 +1184,7 @@ func maybeAllocateDispatchReadOnlyWorktree(ctx context.Context, store *db.Store,
 	// always resolvable, avoiding the stale current-branch fragility the researchers
 	// flagged. The #654 context note points the job at the canonical checkout for
 	// uncommitted/gitignored paths.
-	return workflow.AllocateReadOnlyWorktree(ctx, store, paths.Home, repo, checkout, jobID, "readonly-seat", 0, "", gitutil.Client{Dir: checkout})
+	return workflow.AllocateReadOnlyWorktree(ctx, store, paths.Home, repo, checkout, jobID, "readonly-seat", 0, "", workflow.ReadOnlyWorktreeDispatchLockWaitBudget, gitutil.Client{Dir: checkout})
 }
 
 func printLocalAgentJobOutput(stdout io.Writer, output localAgentJobOutput) {

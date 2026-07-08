@@ -3731,7 +3731,7 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 		if err != nil {
 			return err
 		}
-		if !jobStateCanRetryAdvancement(job.State) || !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+		if !jobStateEligibleForWorktreeReclaim(job.State) || !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
 			continue
 		}
 		if checkoutHeld != nil {
@@ -3928,6 +3928,18 @@ func jobStateCanRetryAdvancement(state string) bool {
 	default:
 		return false
 	}
+}
+
+// jobStateEligibleForWorktreeReclaim gates the delegation/read-only worktree
+// reclaim pass. It is the advancement-retry set PLUS cancelled: a job aborted
+// (cancel / kill / supersede) before its terminal AdvanceJob leaves a
+// dispatch-allocated read-only worktree (#739) on disk with a
+// delegation_worktree_cleanup_skipped marker but a JobCancelled state, so the
+// reclaim pass must still dispose it. Cancelled is intentionally NOT added to
+// jobStateCanRetryAdvancement (a cancelled job must never RE-ADVANCE) — only its
+// worktree is reclaimed here, via the same idempotent, liveness-gated cleanup.
+func jobStateEligibleForWorktreeReclaim(state string) bool {
+	return jobStateCanRetryAdvancement(state) || state == string(workflow.JobCancelled)
 }
 
 // retryPendingJobComments re-posts the result comment for any terminal job whose
@@ -4633,8 +4645,11 @@ func (w jobWorker) allocatePoolIsolationWorktree(ctx context.Context, job db.Job
 	// checkout mutation lock, and returns errors LOUDLY. This keeps it behaviorally
 	// aligned with the read-only delegation fan-out and the dispatch-time allocation,
 	// and turns the previously-silent worktree-add failure into a returned error the
-	// caller emits as a pool_isolation_skipped event.
-	path, err := workflow.AllocateReadOnlyWorktree(ctx, w.Store, w.ConfigHome, payload.Repo, repoRecord.CheckoutPath, job.ID, "pool-isolation", 0, "", client)
+	// caller emits as a pool_isolation_skipped event. It runs SYNCHRONOUSLY on the
+	// per-repo dispatch loop, so it passes the short ReadOnlyWorktreeDispatchLockWaitBudget
+	// (not the 2-minute default) to fail open fast under merge-gate lock contention
+	// rather than freezing this repo's dispatch+reap loop.
+	path, err := workflow.AllocateReadOnlyWorktree(ctx, w.Store, w.ConfigHome, payload.Repo, repoRecord.CheckoutPath, job.ID, "pool-isolation", 0, "", workflow.ReadOnlyWorktreeDispatchLockWaitBudget, client)
 	if err != nil {
 		return poolIsolatedDispatch{}, false, err
 	}
