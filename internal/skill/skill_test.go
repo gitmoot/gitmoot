@@ -130,6 +130,78 @@ func TestCanonicalSkillDocumentsLocalAgentAsk(t *testing.T) {
 	}
 }
 
+func TestSkillDocumentsCurrentCLIFamilies(t *testing.T) {
+	canonical := readRepoFile(t, "skills", "gitmoot", "SKILL.md")
+	root := readRepoFile(t, "SKILL.md")
+	cli := readRepoFile(t, "skills", "gitmoot", "references", "CLI.md")
+	for _, check := range []struct {
+		name string
+		text string
+		want []string
+	}{
+		{
+			name: "canonical skill",
+			text: canonical,
+			want: []string{
+				"gitmoot --help",
+				"gitmoot runtime list",
+				"gitmoot memory list",
+				"gitmoot pipeline add <spec.yaml>",
+				"gitmoot chat create",
+				"gitmoot chat wait",
+				"gitmoot moot <name>",
+				"gitmoot router summary",
+				"gitmoot job gates <id>",
+				"gitmoot dashboard --web",
+				"gitmoot skillopt rubric induce",
+			},
+		},
+		{
+			name: "root skill",
+			text: root,
+			want: []string{
+				"gitmoot --help",
+				"gitmoot runtime list",
+				"gitmoot memory ingest",
+				"gitmoot memory observations",
+				"gitmoot memory confirm",
+				"gitmoot memory groom",
+				"gitmoot pipeline add",
+				"gitmoot chat wait",
+				"gitmoot moot <name>",
+				"gitmoot router summary",
+				"gitmoot job open",
+				"gitmoot job gates",
+				"gitmoot dashboard --web",
+				"gitmoot skillopt ab",
+				"gitmoot skillopt pairwise",
+				"gitmoot skillopt rubric",
+				"gitmoot skillopt judge",
+			},
+		},
+		{
+			name: "cli reference",
+			text: cli,
+			want: []string{
+				"gitmoot memory ingest",
+				"gitmoot memory observations",
+				"gitmoot memory confirm",
+				"gitmoot memory groom",
+				"gitmoot pipeline add",
+				"gitmoot chat wait",
+				"gitmoot moot <name>",
+				"gitmoot router summary",
+			},
+		},
+	} {
+		for _, want := range check.want {
+			if !strings.Contains(check.text, want) {
+				t.Fatalf("%s missing %q", check.name, want)
+			}
+		}
+	}
+}
+
 func TestCanonicalSkillDocumentsTemplateCapture(t *testing.T) {
 	text := readRepoFile(t, "skills", "gitmoot", "SKILL.md")
 	capture := readRepoFile(t, "skills", "gitmoot", "references", "TEMPLATE_CAPTURE.md")
