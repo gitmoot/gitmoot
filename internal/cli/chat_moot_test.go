@@ -481,8 +481,8 @@ func mootSerialWarnRun(t *testing.T, body string) (string, int) {
 // 2-seat moot serializes, yet STILL dispatches both seats (advisory, non-blocking).
 func TestMootSerializationWarningDefaultDaemon(t *testing.T) {
 	stderr, dispatched := mootSerialWarnRun(t, "")
-	if !strings.Contains(stderr, "runs seats sequentially") || !strings.Contains(stderr, "workers=1") || !strings.Contains(stderr, "scheduler=barrier") {
-		t.Fatalf("stderr = %q, want a sequential-serialization warning naming workers=1/scheduler=barrier", stderr)
+	if !strings.Contains(stderr, "runs a single worker") || !strings.Contains(stderr, "workers=1") {
+		t.Fatalf("stderr = %q, want a single-worker serialization warning naming workers=1", stderr)
 	}
 	if dispatched != 2 {
 		t.Fatalf("default-daemon moot dispatched %d seats, want 2 (warning must not block)", dispatched)
@@ -575,16 +575,24 @@ func TestMootSerializationWarningRunningPoolDaemon(t *testing.T) {
 	}
 }
 
-// TestMootSerializationWarningWarmReloadOverridesArgs proves a config.toml [daemon]
-// key warm-reloads OVER the daemon's recorded start args (SIGHUP semantics): a pool/6
-// start with a config.toml `scheduler = "barrier"` serializes (barrier ignores the
-// worker count) and must WARN, naming the effective workers=6/scheduler=barrier.
-func TestMootSerializationWarningWarmReloadOverridesArgs(t *testing.T) {
+// TestMootSerializationWarningBarrierMultiWorkerSuppressed pins the #739 behavior
+// change: the verdict is the WORKER COUNT alone, not the scheduler mode. A barrier
+// scheduler with >=2 workers no longer warns — since background read-only seats get
+// a dedicated detached worktree at dispatch, the barrier scheduler runs same-repo
+// seats with distinct checkout keys concurrently in one per-tick batch. It also
+// proves the warm-reload still resolves the effective worker count: a config.toml
+// [daemon] scheduler=barrier warm-reloads OVER a pool/6 start (SIGHUP semantics),
+// and workers=6 must SUPPRESS. A genuinely single-worker barrier daemon still warns.
+func TestMootSerializationWarningBarrierMultiWorkerSuppressed(t *testing.T) {
 	_, home := mootFixtureHome(t, "\n[daemon]\nscheduler = \"barrier\"\n")
 	writeMootDaemonRunMeta(t, home, []string{"daemon", "run", "--workers", "6", "--scheduler", "pool"})
-	w := mootSerializationWarning(config.PathsForHome(home), "owner/repo", 3)
-	if !strings.Contains(w, "workers=6") || !strings.Contains(w, "scheduler=barrier") {
-		t.Fatalf("warm-reload-override warning = %q, want workers=6/scheduler=barrier", w)
+	if w := mootSerializationWarning(config.PathsForHome(home), "owner/repo", 3); w != "" {
+		t.Fatalf("barrier/6-worker daemon warned: %q, want NO warning under #739 (worktrees parallelize seats under any scheduler)", w)
+	}
+	// A single-worker barrier daemon is the only remaining serializer and still warns.
+	_, serialHome := mootFixtureHome(t, "\n[daemon]\nscheduler = \"barrier\"\nparallel = 1\n")
+	if w := mootSerializationWarning(config.PathsForHome(serialHome), "owner/repo", 3); w == "" {
+		t.Fatal("barrier/1-worker daemon did not warn a 3-seat moot")
 	}
 }
 

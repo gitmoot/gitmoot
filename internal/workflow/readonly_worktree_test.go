@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -58,10 +59,103 @@ func TestIsReadOnlyDelegationWorktree(t *testing.T) {
 		t.Fatal("implement child must not be treated as a read-only worktree")
 	}
 	if isReadOnlyDelegationWorktree("ask", JobPayload{WorktreePath: "/wt/d1"}) {
-		t.Fatal("non-delegation job (no delegation id) must not match")
+		t.Fatal("non-delegation job with no marker must not match")
 	}
 	if isReadOnlyDelegationWorktree("ask", JobPayload{DelegationID: "d1"}) {
 		t.Fatal("delegation child without a worktree path must not match")
+	}
+
+	// #739: a TOP-LEVEL read-only (ask) worktree carries the explicit
+	// ReadOnlyWorktree marker and NO DelegationID — it must match so the terminal
+	// cleanup disposes it (it would otherwise be orphaned by the DelegationID gate).
+	topLevel := JobPayload{WorktreePath: "/wt/seat", ReadOnlyWorktree: true}
+	if !isReadOnlyDelegationWorktree("ask", topLevel) {
+		t.Fatal("top-level marked read-only worktree (no delegation id) not detected (#739)")
+	}
+	// The marker without a worktree path is still not disposable (nothing to remove).
+	if isReadOnlyDelegationWorktree("ask", JobPayload{ReadOnlyWorktree: true}) {
+		t.Fatal("marker without a worktree path must not match")
+	}
+	// An implement/task worktree (Branch set, marker false) must NEVER match, even
+	// under a DelegationID — it is torn down through the merge gate, not here.
+	if isReadOnlyDelegationWorktree("implement", JobPayload{DelegationID: "d1", WorktreePath: "/wt/d1", Branch: "gitmoot-delegation-d1"}) {
+		t.Fatal("implement delegation worktree must not match the read-only predicate")
+	}
+}
+
+// TestCleanupDisposesTopLevelReadOnlyWorktree proves the #739 terminal disposal: a
+// TOP-LEVEL read-only (ask) worktree — allocated at dispatch, carrying the explicit
+// ReadOnlyWorktree marker and NO DelegationID — is force-removed by the existing
+// cleanupReadOnlyDelegationWorktree once its job is terminal, and an implement
+// worktree in the same call is left untouched.
+func TestCleanupDisposesTopLevelReadOnlyWorktree(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	manager := &fakeWorktreeManager{}
+	engine.DelegationCheckout = t.TempDir()
+	engine.DelegationWorktrees = manager
+
+	wt := t.TempDir()
+	engine.cleanupReadOnlyDelegationWorktree(ctx, "local-ask-seat", "ask", JobPayload{WorktreePath: wt, ReadOnlyWorktree: true})
+	if len(manager.removedForce) != 1 || manager.removedForce[0] != wt {
+		t.Fatalf("removedForce = %+v, want one force-remove of the top-level worktree %q", manager.removedForce, wt)
+	}
+	if got := countJobEvents(t, store, "local-ask-seat", "delegation_worktree_removed"); got != 1 {
+		t.Fatalf("delegation_worktree_removed count = %d, want 1", got)
+	}
+
+	// An implement worktree (marker false, Branch set) is NOT a read-only worktree.
+	manager.removedForce = nil
+	engine.cleanupReadOnlyDelegationWorktree(ctx, "impl", "implement", JobPayload{DelegationID: "d1", WorktreePath: t.TempDir(), Branch: "b"})
+	if len(manager.removedForce) != 0 {
+		t.Fatalf("implement worktree must not be disposed by the read-only cleanup: %+v", manager.removedForce)
+	}
+}
+
+// TestReclaimReadOnlyWorktree proves ReclaimTerminalDelegationWorktree (the daemon's
+// restart/lock-expiry reclaim path) now also reclaims an orphaned TOP-LEVEL
+// read-only worktree (#739) whose deferred cleanup never ran (crash between terminal
+// advance and the defer), while still reclaiming an implement worktree.
+func TestReclaimReadOnlyWorktree(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	manager := &fakeWorktreeManager{}
+	engine.DelegationCheckout = t.TempDir()
+	engine.DelegationWorktrees = manager
+
+	// A terminal top-level read-only ask job whose worktree still exists on disk.
+	roWT := t.TempDir()
+	roPayload, err := json.Marshal(JobPayload{WorktreePath: roWT, ReadOnlyWorktree: true})
+	if err != nil {
+		t.Fatalf("marshal read-only payload: %v", err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "local-ask-seat", Agent: "responder", Type: "ask", State: string(JobSucceeded), Payload: string(roPayload)}); err != nil {
+		t.Fatalf("CreateJob read-only: %v", err)
+	}
+	if err := engine.ReclaimTerminalDelegationWorktree(ctx, "local-ask-seat"); err != nil {
+		t.Fatalf("ReclaimTerminalDelegationWorktree (read-only) returned error: %v", err)
+	}
+	if len(manager.removedForce) != 1 || manager.removedForce[0] != roWT {
+		t.Fatalf("removedForce = %+v, want the orphaned read-only worktree %q reclaimed", manager.removedForce, roWT)
+	}
+
+	// An implement delegation worktree is still reclaimed by the same path.
+	manager.removedForce = nil
+	implWT := t.TempDir()
+	implPayload, err := json.Marshal(JobPayload{DelegationID: "d1", WorktreePath: implWT, Branch: "gitmoot-delegation-d1"})
+	if err != nil {
+		t.Fatalf("marshal implement payload: %v", err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "parent/delegation/d1", Agent: "impl", Type: "implement", State: string(JobFailed), Payload: string(implPayload)}); err != nil {
+		t.Fatalf("CreateJob implement: %v", err)
+	}
+	if err := engine.ReclaimTerminalDelegationWorktree(ctx, "parent/delegation/d1"); err != nil {
+		t.Fatalf("ReclaimTerminalDelegationWorktree (implement) returned error: %v", err)
+	}
+	if len(manager.removedForce) != 1 || manager.removedForce[0] != implWT {
+		t.Fatalf("removedForce = %+v, want the implement worktree %q reclaimed", manager.removedForce, implWT)
 	}
 }
 

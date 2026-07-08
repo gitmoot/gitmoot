@@ -476,12 +476,27 @@ func ReadOnlyWorktreeContextNote(baseCheckout string) string {
 }
 
 // isReadOnlyDelegationWorktree reports whether a job ran in a detached read-only
-// delegation worktree that must be disposed. Only read-only delegation children
-// allocate one; implement children carry a branch and are cleaned through the
-// merge gate, so they are excluded.
+// worktree that the terminal cleanup must dispose. Two disjoint shapes qualify:
+//
+//  1. A TOP-LEVEL read-only (ask) worktree allocated at DISPATCH time (#739),
+//     flagged by the explicit payload.ReadOnlyWorktree marker. It carries NO
+//     DelegationID, so without the marker the delegation-gated branch below would
+//     orphan it. The marker is set ONLY at the dispatch allocation site and ONLY
+//     for ask/review, so it can never be an implement/task worktree.
+//  2. A read-only DELEGATION child: a read-only action under a DelegationID with a
+//     WorktreePath. implement children carry a Branch and are cleaned through the
+//     merge gate (isImplementDelegationWorktree), so they are excluded here.
+//
+// Preferring the explicit marker over an implicit heuristic keeps implement/task
+// worktrees (marker false, Branch set) from ever matching.
 func isReadOnlyDelegationWorktree(jobType string, payload JobPayload) bool {
+	if strings.TrimSpace(payload.WorktreePath) == "" {
+		return false
+	}
+	if payload.ReadOnlyWorktree {
+		return true
+	}
 	return strings.TrimSpace(payload.DelegationID) != "" &&
-		strings.TrimSpace(payload.WorktreePath) != "" &&
 		readOnlyDelegationAction(jobType)
 }
 
@@ -750,15 +765,21 @@ func (e Engine) lastCleanupOutcomeIsSkip(ctx context.Context, jobID string) bool
 	return false
 }
 
-// ReclaimTerminalDelegationWorktree re-attempts the terminal implement-delegation
-// worktree+branch cleanup for an already-terminal child whose earlier terminal
-// advance PRESERVED it because a foreign runtime owner was still active (it emitted
-// delegation_worktree_cleanup_skipped). It is the daemon's lock-expiry-driven
-// reclamation (#536): once that foreign owner releases its lock or its lease
-// expires, the worktree is no longer owned and must be torn down rather than
-// leaked. It simply re-runs the same idempotent, liveness-gated cleanup, so it is a
-// no-op when the owner is still active, when the worktree is already gone, or for a
-// non-implement / non-delegation job.
+// ReclaimTerminalDelegationWorktree re-attempts the terminal worktree cleanup for
+// an already-terminal job whose earlier terminal advance did not dispose its
+// worktree — either an implement child PRESERVED because a foreign runtime owner
+// was still active (delegation_worktree_cleanup_skipped), or a read-only worktree
+// (top-level ask #739, or a read-only delegation child) whose terminal advance was
+// interrupted by a daemon crash/restart before the deferred cleanup ran. It is the
+// daemon's lock-expiry-/restart-driven reclamation (#536): once the owner is gone
+// the worktree must be torn down rather than leaked. It re-runs BOTH idempotent,
+// liveness-gated cleanups, so it is a no-op when the owner is still active, when
+// the worktree is already gone, or for a job that allocated no worktree.
+//
+// Generalizing beyond implement also closes the pre-existing restart gap for
+// read-only DELEGATION worktrees: they were only ever disposed by the deferred
+// AdvanceJob cleanup, so a crash between terminal-advance and that defer leaked
+// them until now.
 func (e Engine) ReclaimTerminalDelegationWorktree(ctx context.Context, jobID string) error {
 	if err := e.validate(); err != nil {
 		return err
@@ -768,6 +789,7 @@ func (e Engine) ReclaimTerminalDelegationWorktree(ctx context.Context, jobID str
 		return err
 	}
 	e.cleanupImplementDelegationWorktree(ctx, jobID, job.Type, payload)
+	e.cleanupReadOnlyDelegationWorktree(ctx, jobID, job.Type, payload)
 	return nil
 }
 
