@@ -56,12 +56,16 @@ func SplitFrontmatter(content string) (frontmatter, body string) {
 	return "", normalized
 }
 
-// ChunkMarkdown splits a markdown body into ingestible chunks. When the whole
-// body estimates at or under maxTokens it is a single chunk (empty Heading).
-// Over budget, it splits on lines beginning with '## ': content before the first
-// heading becomes a preamble chunk (empty Heading), and each heading starts a new
-// chunk whose Text retains the heading line. Chunks whose text is blank after
-// trimming are dropped. A blank body yields no chunks.
+// ChunkMarkdown splits a markdown body into ingestible chunks each estimating at
+// or under maxTokens. When the whole body fits it is a single chunk (empty
+// Heading). Over budget, it splits on lines beginning with '## ': content before
+// the first heading becomes a preamble chunk (empty Heading), and each heading
+// starts a new chunk whose Text retains the heading line. A heading-less body (or
+// a single section still over budget) is further sub-split by paragraph/line/rune
+// windows so NO emitted chunk can exceed maxTokens — an oversized confirmed
+// memory would otherwise be force-injected wholesale by RenderBlock (its
+// always-emit-the-first-entry guarantee) and blow the injection budget. Chunks
+// whose text is blank after trimming are dropped. A blank body yields no chunks.
 func ChunkMarkdown(body string, maxTokens int) []Chunk {
 	body = strings.ReplaceAll(body, "\r\n", "\n")
 	if strings.TrimSpace(body) == "" {
@@ -76,10 +80,15 @@ func ChunkMarkdown(body string, maxTokens int) []Chunk {
 	var cur []string
 	flush := func() {
 		text := strings.TrimSpace(strings.Join(cur, "\n"))
-		if text != "" {
-			chunks = append(chunks, Chunk{Heading: curHeading, Text: text})
-		}
 		cur = nil
+		if text == "" {
+			return
+		}
+		// Bound every section to the budget; a heading-less body or a single
+		// oversized section still fans out into <=maxTokens pieces here.
+		for _, piece := range splitToBudget(text, maxTokens) {
+			chunks = append(chunks, Chunk{Heading: curHeading, Text: piece})
+		}
 	}
 	for _, ln := range strings.Split(body, "\n") {
 		if strings.HasPrefix(ln, "## ") {
@@ -92,6 +101,91 @@ func ChunkMarkdown(body string, maxTokens int) []Chunk {
 	}
 	flush()
 	return chunks
+}
+
+// splitToBudget breaks text into pieces each estimating at or under maxTokens,
+// preferring paragraph, then line, then hard rune-window boundaries so an
+// ingested chunk can never exceed the injection budget once confirmed. Every
+// returned piece is trimmed and non-empty. Text already under budget is returned
+// unchanged (single element).
+func splitToBudget(text string, maxTokens int) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	if maxTokens <= 0 || EstimateTokens(text) <= maxTokens {
+		return []string{text}
+	}
+	var out []string
+	var cur string
+	for _, unit := range atomicUnits(text, maxTokens) {
+		switch {
+		case cur == "":
+			cur = unit
+		case EstimateTokens(cur+"\n"+unit) <= maxTokens:
+			cur = cur + "\n" + unit
+		default:
+			out = append(out, cur)
+			cur = unit
+		}
+	}
+	if strings.TrimSpace(cur) != "" {
+		out = append(out, cur)
+	}
+	return out
+}
+
+// atomicUnits breaks text into ordered fragments each estimating at or under
+// maxTokens, descending through paragraph (blank-line), then line, then hard
+// rune-window boundaries. Blank fragments are dropped.
+func atomicUnits(text string, maxTokens int) []string {
+	var out []string
+	for _, para := range strings.Split(text, "\n\n") {
+		para = strings.TrimSpace(para)
+		if para == "" {
+			continue
+		}
+		if EstimateTokens(para) <= maxTokens {
+			out = append(out, para)
+			continue
+		}
+		for _, line := range strings.Split(para, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if EstimateTokens(line) <= maxTokens {
+				out = append(out, line)
+				continue
+			}
+			out = append(out, hardWindows(line, maxTokens)...)
+		}
+	}
+	return out
+}
+
+// hardWindows chops a single over-budget line into consecutive rune windows each
+// small enough that EstimateTokens stays at or under maxTokens (EstimateTokens is
+// (bytes+3)/4, so a window of 4*maxTokens-3 bytes is the ceiling). Rune-aligned so
+// multibyte characters are never split.
+func hardWindows(s string, maxTokens int) []string {
+	maxBytes := 4*maxTokens - 3
+	if maxBytes < 1 {
+		maxBytes = 1
+	}
+	var out []string
+	var b strings.Builder
+	for _, r := range s {
+		if b.Len() > 0 && b.Len()+len(string(r)) > maxBytes {
+			out = append(out, b.String())
+			b.Reset()
+		}
+		b.WriteRune(r)
+	}
+	if b.Len() > 0 {
+		out = append(out, b.String())
+	}
+	return out
 }
 
 // ContentHash is the deterministic full hex SHA-256 of a chunk's content, used

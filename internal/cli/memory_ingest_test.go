@@ -93,6 +93,58 @@ func TestMemoryIngestPreFilterAccountingAndDedup(t *testing.T) {
 	}
 }
 
+// TestMemoryIngestSameContentDifferentRepoStagesBoth proves identical text
+// ingested under a SECOND repo is not silently deduped away — repo-scoped memory
+// injects only for its own repo, so both repos must stage the note. Regression
+// guard for the owner-only content-hash dedup.
+func TestMemoryIngestSameContentDifferentRepoStagesBoth(t *testing.T) {
+	home, _ := memoryTestHome(t)
+	src := t.TempDir()
+	writeFixture(t, src, "note.md",
+		"The release tag must be pushed before the workflow uploads the binaries.\n")
+
+	if code, _, errOut := runMemoryCapture(t, "ingest", src, "--home", home,
+		"--agent", "lead", "--repo", "org/a"); code != 0 {
+		t.Fatalf("ingest org/a exit %d: %s", code, errOut)
+	}
+	// Same content, a different repo: must still insert (not dedup).
+	code, out, errOut := runMemoryCapture(t, "ingest", src, "--home", home,
+		"--agent", "lead", "--repo", "org/b", "--json")
+	if code != 0 {
+		t.Fatalf("ingest org/b exit %d: %s", code, errOut)
+	}
+	var res memoryIngestResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("parse result: %v (%s)", err, out)
+	}
+	if res.Inserted != 1 || res.Deduped != 0 {
+		t.Fatalf("second repo must stage the note, got inserted=%d deduped=%d", res.Inserted, res.Deduped)
+	}
+
+	// Both repos now carry the observation.
+	obs := listObservations(t, home)
+	repos := map[string]bool{}
+	for _, o := range obs {
+		repos[o.Repo] = true
+	}
+	if !repos["org/a"] || !repos["org/b"] {
+		t.Fatalf("expected the note staged under both repos, got repos=%v", repos)
+	}
+
+	// Re-ingesting under org/a again is still a dedup (same domain).
+	code, out, errOut = runMemoryCapture(t, "ingest", src, "--home", home,
+		"--agent", "lead", "--repo", "org/a", "--json")
+	if code != 0 {
+		t.Fatalf("re-ingest org/a exit %d: %s", code, errOut)
+	}
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("parse re-ingest: %v", err)
+	}
+	if res.Inserted != 0 || res.Deduped != 1 {
+		t.Fatalf("same-domain re-ingest should dedup, got inserted=%d deduped=%d", res.Inserted, res.Deduped)
+	}
+}
+
 // TestMemoryIngestConfirmExportRoundTrip is the P3 end-to-end: ingest → the note
 // is a pending observation → confirm --provenance-prefix promotes it (idempotently)
 // → it becomes retrievable via QueryConfirmedMemories AND appears in the vault export.

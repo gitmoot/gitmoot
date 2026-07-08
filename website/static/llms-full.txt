@@ -9603,11 +9603,16 @@ gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--yes
 `memory ingest` walks `*.md` (recursively for a directory), strips a leading YAML
 frontmatter block when present, and — only when a file's body exceeds ~512
 estimated tokens — chunks it on `## ` headings (smaller files stay one
-observation). Every chunk passes the same deterministic **PreFilter** as agent
-learnings (rejecting directive-phrased, secret-shaped, executable, or — for
-`--tier general` — non-repo-agnostic content), with a per-reason rejection count
-in the summary. Chunks whose exact content already exists (as an observation or a
-confirmed row) are **deduped**, so re-ingesting the same source inserts nothing.
+observation); any section still over budget is sub-split on paragraph/line
+boundaries so no chunk exceeds the token budget (an oversized memory would
+otherwise be force-injected wholesale by the injection block). Every chunk passes
+the same deterministic **PreFilter** as agent learnings (rejecting
+directive-phrased, secret-shaped, executable, or — for `--tier general` —
+non-repo-agnostic content), with a per-reason rejection count in the summary.
+Chunks whose exact content already exists **in the same visibility domain** (same
+scope and repo, as an observation or a confirmed row) are **deduped**, so
+re-ingesting the same source inserts nothing — but the same note ingested under a
+second repo still stages, since repo-scoped memory injects only for its own repo.
 Surviving chunks land in `memory_observations` with `provenance = ingest:<relpath>`
 and, crucially, **`trust_mark = low`** — see the trust note below. `--tier` defaults
 to `repo`; `general` is only ever chosen with the explicit flag. `--dry-run`

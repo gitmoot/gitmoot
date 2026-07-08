@@ -117,7 +117,7 @@ func runMemoryIngest(args []string, stdout, stderr io.Writer) int {
 
 	err = withStore(*home, func(store *db.Store) error {
 		ctx := context.Background()
-		seen, err := store.ObservationContentHashes(ctx, *agent)
+		seen, err := store.ObservationDedupKeys(ctx, *agent)
 		if err != nil {
 			return err
 		}
@@ -140,12 +140,15 @@ func runMemoryIngest(args []string, stdout, stderr io.Writer) int {
 					result.RejectedBy[reason]++
 					continue
 				}
-				hash := memory.ContentHash(chunk.Text)
-				if _, dup := seen[hash]; dup {
+				// Dedup within the target visibility domain only: identical text
+				// under a different repo must still stage (repo-scoped memory
+				// injects only for its own repo), so key by (scope, repo, hash).
+				dkey := db.MemoryDedupKey(scope, result.Repo, memory.ContentHash(chunk.Text))
+				if _, dup := seen[dkey]; dup {
 					result.Deduped++
 					continue
 				}
-				seen[hash] = struct{}{}
+				seen[dkey] = struct{}{}
 				key := memory.IngestKey(fileStem, chunk.Heading, chunk.Text)
 				result.Inserted++
 				result.InsertedKeys = append(result.InsertedKeys, key)

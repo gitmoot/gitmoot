@@ -1366,10 +1366,12 @@ overwrite a non-empty directory that is not itself a prior gitmoot vault (one wi
 own notes; pass `--force` to override.
 
 `memory ingest` stages arbitrary Markdown as **pending observations**: it walks
-`*.md`, strips leading YAML frontmatter, chunks a file on `## ` headings only when
-its body exceeds ~512 estimated tokens, PreFilters every chunk (per-reason
-rejection counts in the summary), dedups by exact content against existing
-observations and confirmed rows, and inserts survivors with
+`*.md`, strips leading YAML frontmatter, chunks a file only when its body exceeds
+~512 estimated tokens (on `## ` headings, sub-splitting any still-oversized
+section on paragraph/line boundaries so no chunk exceeds the budget), PreFilters
+every chunk (per-reason rejection counts in the summary), dedups by exact content
+**within the same scope+repo visibility domain** (identical text under a second
+repo still stages), and inserts survivors with
 `provenance = ingest:<relpath>` and **`trust_mark = low`**. `--tier` defaults to
 `repo`; `general` is only chosen explicitly. `memory observations` lists pending
 observations, flagging which keys are already confirmed. `memory confirm` is the

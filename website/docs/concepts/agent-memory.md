@@ -127,13 +127,18 @@ gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--yes
 ```
 
 `memory ingest` walks `*.md`, strips a leading YAML frontmatter block when
-present, and chunks a file on `## ` headings only when its body exceeds ~512
-estimated tokens (smaller files stay one observation). Every chunk passes the
-same deterministic **PreFilter** that gates agent learnings (rejecting
-directive-phrased, secret-shaped, executable, or — for `--tier general` —
-non-repo-agnostic content), reported as per-reason rejection counts. A chunk
-whose exact content already exists (observation or confirmed) is **deduped**, so
-re-ingesting a source is a no-op. Survivors land in `memory_observations` with
+present, and chunks a file only when its body exceeds ~512 estimated tokens
+(smaller files stay one observation). Over budget it splits on `## ` headings,
+and any section still over budget is sub-split on paragraph/line boundaries so no
+single chunk exceeds the token budget (an oversized memory would otherwise be
+force-injected wholesale). Every chunk passes the same deterministic
+**PreFilter** that gates agent learnings (rejecting directive-phrased,
+secret-shaped, executable, or — for `--tier general` — non-repo-agnostic
+content), reported as per-reason rejection counts. A chunk whose exact content
+already exists **in the same visibility domain** (same scope and repo) is
+**deduped**, so re-ingesting a source is a no-op — but the same note ingested
+under a second repo still stages, because repo-scoped memory injects only for its
+own repo. Survivors land in `memory_observations` with
 `provenance = ingest:<relpath>` and `trust_mark = low`. `--dry-run` reports the
 plan without writing.
 

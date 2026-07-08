@@ -574,11 +574,23 @@ FROM memory_observations WHERE id = ?`, id).Scan(
 	return o, true, nil
 }
 
-// ObservationContentHashes returns the set of SHA-256 hex content hashes across
-// BOTH pending observations and confirmed rows for an owner ref (all repos and
-// scopes). Ingest uses it to dedup incoming chunks by exact content before
-// staging them. A blank ownerRef scans every owner.
-func (s *Store) ObservationContentHashes(ctx context.Context, ownerRef string) (map[string]struct{}, error) {
+// MemoryDedupKey combines the visibility domain (scope + nullable repo) with a
+// content hash so ingest dedup only collapses rows that would inject into the
+// SAME domain. Two rows with identical text but different repos are NOT
+// duplicates: repo-scoped confirmed memory injects only for its own repo (see
+// QueryConfirmedMemories: scope='general' OR repo=?), so a second repo must be
+// allowed to stage — and later inject — the same note. Repo is trimmed so a NULL
+// repo and an empty-string repo collapse to the same general-scope domain.
+func MemoryDedupKey(scope, repo, contentHash string) string {
+	return strings.TrimSpace(scope) + "\x00" + strings.TrimSpace(repo) + "\x00" + contentHash
+}
+
+// ObservationDedupKeys returns the set of (scope, repo, content-hash) dedup keys
+// across BOTH pending observations and confirmed rows for an owner ref. Ingest
+// uses it to drop an incoming chunk only when the SAME content already exists in
+// the SAME visibility domain, so identical text under a second repo still stages.
+// A blank ownerRef scans every owner. Build the lookup key with MemoryDedupKey.
+func (s *Store) ObservationDedupKeys(ctx context.Context, ownerRef string) (map[string]struct{}, error) {
 	out := make(map[string]struct{})
 	collect := func(query string) error {
 		var rows *sql.Rows
@@ -593,18 +605,19 @@ func (s *Store) ObservationContentHashes(ctx context.Context, ownerRef string) (
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var content string
-			if err := rows.Scan(&content); err != nil {
+			var content, scope string
+			var repoNull sql.NullString
+			if err := rows.Scan(&content, &repoNull, &scope); err != nil {
 				return err
 			}
-			out[sha256HexOf(content)] = struct{}{}
+			out[MemoryDedupKey(scope, repoNull.String, sha256HexOf(content))] = struct{}{}
 		}
 		return rows.Err()
 	}
-	if err := collect(`SELECT content FROM memory_observations`); err != nil {
+	if err := collect(`SELECT content, repo, scope FROM memory_observations`); err != nil {
 		return nil, fmt.Errorf("scan observation contents: %w", err)
 	}
-	if err := collect(`SELECT content FROM confirmed_memories`); err != nil {
+	if err := collect(`SELECT content, repo, scope FROM confirmed_memories`); err != nil {
 		return nil, fmt.Errorf("scan confirmed contents: %w", err)
 	}
 	return out, nil

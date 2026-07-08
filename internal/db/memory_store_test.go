@@ -209,9 +209,10 @@ func mustUpsert(t *testing.T, store *Store, cm ConfirmedMemory) int64 {
 	return id
 }
 
-// TestObservationContentHashesSpansBothTiers proves ingest dedup sees content in
-// BOTH memory_observations and confirmed_memories for an owner.
-func TestObservationContentHashesSpansBothTiers(t *testing.T) {
+// TestObservationDedupKeysSpansBothTiers proves ingest dedup sees content in
+// BOTH memory_observations and confirmed_memories for an owner, keyed by the
+// (scope, repo, content-hash) visibility domain.
+func TestObservationDedupKeysSpansBothTiers(t *testing.T) {
 	ctx := context.Background()
 	store := openMemTestStore(t)
 	owner := agentOwner("lead")
@@ -229,19 +230,49 @@ func TestObservationContentHashesSpansBothTiers(t *testing.T) {
 		t.Fatalf("upsert confirmed: %v", err)
 	}
 
-	hashes, err := store.ObservationContentHashes(ctx, "lead")
+	keys, err := store.ObservationDedupKeys(ctx, "lead")
 	if err != nil {
-		t.Fatalf("hashes: %v", err)
+		t.Fatalf("keys: %v", err)
 	}
-	if _, ok := hashes[sha256HexOf("the deploy host is the CI box")]; !ok {
-		t.Fatal("observation content hash missing")
+	if _, ok := keys[MemoryDedupKey("repo", "acme/widget", sha256HexOf("the deploy host is the CI box"))]; !ok {
+		t.Fatal("observation dedup key missing")
 	}
-	if _, ok := hashes[sha256HexOf("arm64 runners are slow")]; !ok {
-		t.Fatal("confirmed content hash missing")
+	if _, ok := keys[MemoryDedupKey("repo", "acme/widget", sha256HexOf("arm64 runners are slow"))]; !ok {
+		t.Fatal("confirmed dedup key missing")
 	}
 	// A different owner's content is not in this owner's set.
-	if _, ok := hashes[sha256HexOf("unrelated content")]; ok {
-		t.Fatal("unexpected hash present")
+	if _, ok := keys[MemoryDedupKey("repo", "acme/widget", sha256HexOf("unrelated content"))]; ok {
+		t.Fatal("unexpected key present")
+	}
+}
+
+// TestObservationDedupKeysDomainScoped proves identical content under a DIFFERENT
+// repo is NOT treated as a duplicate: repo-scoped memory injects only for its own
+// repo, so the second repo must be able to stage the same note. Regression guard
+// for the owner-only dedup that silently dropped cross-repo re-ingests.
+func TestObservationDedupKeysDomainScoped(t *testing.T) {
+	ctx := context.Background()
+	store := openMemTestStore(t)
+	owner := agentOwner("lead")
+	const content = "the deploy host is the CI box"
+
+	if _, err := store.InsertMemoryObservation(ctx, MemoryObservation{
+		Owner: owner, Repo: "org/a", Scope: "repo", Key: "obs-a",
+		Content: content, TrustMark: "low",
+	}); err != nil {
+		t.Fatalf("insert obs: %v", err)
+	}
+
+	keys, err := store.ObservationDedupKeys(ctx, "lead")
+	if err != nil {
+		t.Fatalf("keys: %v", err)
+	}
+	if _, ok := keys[MemoryDedupKey("repo", "org/a", sha256HexOf(content))]; !ok {
+		t.Fatal("org/a dedup key missing")
+	}
+	// Same content, second repo: must NOT collide, so ingest still stages it.
+	if _, ok := keys[MemoryDedupKey("repo", "org/b", sha256HexOf(content))]; ok {
+		t.Fatal("org/b must not be deduped against org/a for identical content")
 	}
 }
 
