@@ -424,6 +424,143 @@ esac`, promptFile, changesResult, memoryLifecyclePlainResult)
 	}
 }
 
+// distillEnrolledConfig enrolls `audit` in memory AND turns on the deterministic
+// distill-at-terminal producers (#737 P4.1). Distill is master-off by default, so
+// this is the explicit opt-in the live daemon reads per tick.
+const distillEnrolledConfig = `
+[memory]
+token_budget = 1500
+max_entries = 15
+distill_at_terminal = true
+
+[agents.audit]
+runtime = "shell"
+memory = true
+`
+
+// TestMemoryDistillAtTerminalE2E is the #737 P4.1 full-chain proof. It drives a
+// job to a BLOCKED terminal (a distill decision) carrying a failing test AND a
+// named error through the REAL daemon worker with distill enabled via config, and
+// pins the OUTPUT DISCIPLINE + RECURRENCE gate at the true terminal seam:
+//
+//   - Job 1 (first sighting): distill records only low-trust WITNESSES — nothing
+//     is STAGED, so a one-off failure never becomes a pending memory.
+//   - Job 2 (recurrence): the failing-test and named-error observations STAGE as
+//     PENDING rows, trust_mark=low, provenance "distill:<job>" — NEVER confirmed.
+//   - The named-error key is normalized (the volatile 0x address stripped), so the
+//     two jobs' differing summaries collapse to the same recurrence key.
+func TestMemoryDistillAtTerminalE2E(t *testing.T) {
+	ctx := context.Background()
+	home, _, store := memoryLifecycleHome(t, distillEnrolledConfig)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+
+	// A BLOCKED terminal (settled, dispatch returns cleanly) carrying a failing
+	// test and a panic in the summary. The 0x address differs per job so the
+	// named-error NORMALIZATION is exercised: both must map to the same key.
+	blockedJob1 := `{"gitmoot_result":{"decision":"blocked","summary":"panic: nil pointer dereference at 0xdeadbeef\n--- FAIL: TestPaymentFlow (0.01s)","findings":[],"changes_made":[],"tests_run":["TestPaymentFlow"],"needs":[],"delegations":[]}}`
+	blockedJob2 := `{"gitmoot_result":{"decision":"blocked","summary":"panic: nil pointer dereference at 0xcafef00d\n--- FAIL: TestPaymentFlow (0.02s)","findings":[],"changes_made":[],"tests_run":["TestPaymentFlow"],"needs":[],"delegations":[]}}`
+	script := fmt.Sprintf(`case "$1" in
+  *SECOND*) printf '%%s' '%s' ;;
+  *) printf '%%s' '%s' ;;
+esac`, blockedJob2, blockedJob1)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, script, []string{"ask"}, "owner/repo")
+	worker := memoryLifecycleWorker(store, home, checkout)
+
+	// --- Job 1: first sighting → witnesses only.
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "distill-1", Agent: "audit", Action: "ask", Repo: "owner/repo",
+		Branch: "main", PullRequest: 1, Instructions: "attempt the payment migration",
+	})
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
+		t.Fatalf("dispatch job 1: %v", err)
+	}
+	if st := memoryLifecycleJobState(t, store, "distill-1"); st != string(workflow.JobBlocked) {
+		t.Fatalf("job 1 state = %q, want blocked", st)
+	}
+	obs1, err := store.ListMemoryObservations(ctx, "audit", "owner/repo")
+	if err != nil {
+		t.Fatalf("ListMemoryObservations after job 1: %v", err)
+	}
+	// The witness is INTERNAL bookkeeping and is excluded from the pending list
+	// surface, so a first sighting shows NOTHING on `memory list`: no staged rows
+	// AND no visible witness rows. A one-off failure never becomes a pending memory.
+	if len(obs1) != 0 {
+		t.Fatalf("first sighting must show nothing on the pending list, got %+v", obs1)
+	}
+	// But the witness WAS recorded (recurrence is armed): the keyed count is 1.
+	auditOwner := db.MemoryOwner{Kind: "agent", Ref: "audit"}
+	if n, err := store.CountMemoryObservationsForKey(ctx, auditOwner, "owner/repo", "distill-test:testpaymentflow"); err != nil || n != 1 {
+		t.Fatalf("first sighting must record the failing-test witness, n=%d err=%v", n, err)
+	}
+
+	// --- Job 2: recurrence → observations stage as PENDING low-trust rows.
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "distill-2", Agent: "audit", Action: "ask", Repo: "owner/repo",
+		Branch: "main", PullRequest: 2, Instructions: "attempt the payment migration SECOND",
+	})
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
+		t.Fatalf("dispatch job 2: %v", err)
+	}
+	obs2, err := store.ListMemoryObservations(ctx, "audit", "owner/repo")
+	if err != nil {
+		t.Fatalf("ListMemoryObservations after job 2: %v", err)
+	}
+	var stagedKeys []string
+	for _, o := range obs2 {
+		if !strings.HasPrefix(o.Provenance, "distill:") {
+			continue
+		}
+		stagedKeys = append(stagedKeys, o.Key)
+		if o.TrustMark != "low" {
+			t.Fatalf("staged distilled observation trust = %q, want low: %+v", o.TrustMark, o)
+		}
+		if o.SourceJob != "distill-2" {
+			t.Fatalf("staged observation source_job = %q, want distill-2", o.SourceJob)
+		}
+	}
+	if !memContainsStr(stagedKeys, "distill-test:testpaymentflow") {
+		t.Fatalf("failing-test observation did not stage on recurrence; staged keys=%v", stagedKeys)
+	}
+	hasError := false
+	for _, k := range stagedKeys {
+		if strings.HasPrefix(k, "distill-error:") {
+			hasError = true
+			if strings.Contains(k, "deadbeef") || strings.Contains(k, "cafef00d") {
+				t.Fatalf("named-error key retained a volatile address: %q", k)
+			}
+		}
+	}
+	if !hasError {
+		t.Fatalf("named-error observation did not stage on recurrence; staged keys=%v", stagedKeys)
+	}
+
+	// --- OUTPUT DISCIPLINE: distill NEVER writes confirmed memory.
+	confirmed, err := store.ListConfirmedMemories(ctx, "audit", "owner/repo")
+	if err != nil {
+		t.Fatalf("ListConfirmedMemories: %v", err)
+	}
+	for _, c := range confirmed {
+		if strings.HasPrefix(c.Provenance, "distill") {
+			t.Fatalf("distill leaked into the confirmed tier: %+v", c)
+		}
+	}
+	// `gitmoot memory list --pending` surfaces the staged rows.
+	pending := memoryListJSON(t, home, "--pending")
+	if len(pending) == 0 {
+		t.Fatalf("memory list --pending should surface the distilled observations")
+	}
+}
+
+func memContainsStr(haystack []string, needle string) bool {
+	for _, h := range haystack {
+		if h == needle {
+			return true
+		}
+	}
+	return false
+}
+
 // memoryListJSON runs the REAL `gitmoot memory list` CLI (through Run, the top-
 // level dispatcher) with the given tier flag and decodes its JSON.
 func memoryListJSON(t *testing.T, home, tierFlag string) []memoryListEntry {

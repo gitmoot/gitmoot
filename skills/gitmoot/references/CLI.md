@@ -1558,6 +1558,33 @@ a small fixed allowlist (a delegation's free-form action buckets to a generic
 token). So repeated jobs UPSERT the same row rather than growing the pool, and
 every fact passes the same deterministic write filters as agent learnings.
 
+**Distill-at-terminal (#737 P4.1)** is an optional, config-gated producer
+(`distill_at_terminal`, off by default). On an *anomalous* terminal
+(`failed`/`blocked`/`changes_requested`) it mines the job's own result for two
+closed-category signals and stages them as **pending observations** — trust
+`low`, provenance `distill:<job-id>`, and **never confirmed memory** (the
+`memory confirm` gate stays the only promotion path):
+
+- **Failing tests** — one normalized key per test whose failure is **explicit** in
+  the job output (a `--- FAIL:` marker), not merely present in `tests_run` (which
+  records only that a test was *run*, not that it failed).
+- **Named errors** — stable error tokens pulled from the result summary (and the
+  tail of the raw output), normalized to a closed category by stripping hashes,
+  paths, addresses, line numbers, and timestamps.
+
+Distill is bounded on every axis: each candidate passes the same **PreFilter** as
+learnings, content-hash **dedup** blocks a repeat from staging twice, and
+`distill_max_per_job` caps writes per job. A **recurrence gate** prevents a
+one-off failure from ever becoming a pending memory: the first sighting of a
+normalized key records only a low-trust *witness* (provenance
+`distill-seen:<job-id>`); the observation stages only when the same key recurs in
+a later job. A witness is internal recurrence bookkeeping — it is **never** shown
+by `memory list` and can **never** be promoted by `memory confirm` (both the list
+and confirm surfaces exclude the `distill-seen:` provenance), so a one-off failure
+stays invisible until it recurs. By default distill follows enrollment; set `distill_all_jobs = true`
+to harvest failure signal box-wide (the read path and confirmed producers stay
+enrolled-only).
+
 Enrollment is per agent, plus optional global knobs:
 
 ```toml
@@ -1566,10 +1593,16 @@ runtime = "codex"
 memory = true          # enroll this agent (default off)
 
 [memory]
-disabled = false       # global kill switch (overrides every enrollment)
-token_budget = 1500    # cap on injected block size (estimated tokens)
-max_entries = 15       # cap on confirmed rows considered for injection
+disabled = false            # global kill switch (overrides every enrollment)
+token_budget = 1500         # cap on injected block size (estimated tokens)
+max_entries = 15            # cap on confirmed rows considered for injection
+distill_at_terminal = false # stage deterministic failure signal at job terminal (#737 P4.1)
+distill_max_per_job = 3     # hard cap on distilled observations per job
+distill_all_jobs = false    # when true, distill runs for every job, not only enrolled agents
 ```
+
+All `[memory]` keys are read **per tick** — flipping `distill_at_terminal`
+(or any knob) takes effect on the next job with **no daemon restart**.
 
 An agent returns durable facts via the optional top-level `learnings` field in
 `gitmoot_result` — each entry is `{key, scope ("repo"|"general"), content}`.

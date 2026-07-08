@@ -660,11 +660,24 @@ FROM confirmed_memories`
 	return scanConfirmedMemories(rows)
 }
 
+// MemoryDistillWitnessProvenancePrefix marks a recurrence-WITNESS observation row
+// written by distill-at-terminal (#737 P4.1). Witness rows are internal recurrence
+// bookkeeping — NOT human-reviewable observations — so the pending list surface
+// (ListMemoryObservations / ListMemoryObservationsWithConfirmation) and the confirm
+// getter (GetMemoryObservationByID) exclude this provenance. A one-off failure's
+// sentinel witness is therefore never shown in `memory list` and can never be
+// promoted by `memory confirm`. The prefix is carried unchanged into
+// memory_observations, so this is a read-time filter with no schema change. The
+// exclusion is a no-op when distill is off (no witness rows exist).
+const MemoryDistillWitnessProvenancePrefix = "distill-seen:"
+
 // ListMemoryObservations returns pending observation rows for the audit CLI,
-// filtered optionally by owner ref and repo.
+// filtered optionally by owner ref and repo. Recurrence witnesses (see
+// MemoryDistillWitnessProvenancePrefix) are always excluded — they are internal
+// bookkeeping, never a human-reviewable pending observation.
 func (s *Store) ListMemoryObservations(ctx context.Context, ownerRef, repo string) ([]MemoryObservation, error) {
-	var where []string
-	var args []any
+	where := []string{"provenance NOT LIKE ? ESCAPE '\\'"}
+	args := []any{likePrefix(MemoryDistillWitnessProvenancePrefix)}
 	if strings.TrimSpace(ownerRef) != "" {
 		where = append(where, "owner_ref = ?")
 		args = append(args, ownerRef)
@@ -735,8 +748,11 @@ type ObservationWithConfirmation struct {
 // used by the audit surface; it mutates nothing. A blank ownerRef matches all
 // owners and a blank provenancePrefix matches all provenances.
 func (s *Store) ListMemoryObservationsWithConfirmation(ctx context.Context, ownerRef, provenancePrefix string) ([]ObservationWithConfirmation, error) {
-	var where []string
-	var args []any
+	// Recurrence witnesses are never human-reviewable, so they are excluded even
+	// when the caller passes a provenancePrefix — `--prefix distill-seen:` must
+	// select nothing rather than expose the sentinel witnesses for confirmation.
+	where := []string{"o.provenance NOT LIKE ? ESCAPE '\\'"}
+	args := []any{likePrefix(MemoryDistillWitnessProvenancePrefix)}
 	if strings.TrimSpace(ownerRef) != "" {
 		where = append(where, "o.owner_ref = ?")
 		args = append(args, ownerRef)
@@ -786,10 +802,14 @@ FROM memory_observations o`
 func (s *Store) GetMemoryObservationByID(ctx context.Context, id int64) (MemoryObservation, bool, error) {
 	var o MemoryObservation
 	var repoNull sql.NullString
+	// A recurrence witness is not a confirmable observation: exclude it here so
+	// `memory confirm <witness-id>` resolves to "no observation with id N" rather
+	// than promoting the fixed sentinel string into confirmed memory.
 	err := s.db.QueryRowContext(ctx, `
 SELECT id, owner_kind, owner_ref, owner_version, repo, scope, key, content,
 	provenance, trust_mark, source_job, created_at
-FROM memory_observations WHERE id = ?`, id).Scan(
+FROM memory_observations WHERE id = ? AND provenance NOT LIKE ? ESCAPE '\'`,
+		id, likePrefix(MemoryDistillWitnessProvenancePrefix)).Scan(
 		&o.ID, &o.Owner.Kind, &o.Owner.Ref, &o.Owner.Version, &repoNull,
 		&o.Scope, &o.Key, &o.Content, &o.Provenance, &o.TrustMark, &o.SourceJob, &o.CreatedAt)
 	if err == sql.ErrNoRows {

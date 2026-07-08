@@ -113,13 +113,23 @@ path = ""
 # true overrides every per-agent memory=true, turning the whole feature off box-wide
 # without editing each agent block. token_budget caps the injected block's estimated
 # tokens (default 1500); max_entries caps how many confirmed rows are considered for
-# injection (default 15); both must be >= 0. Inspect the store read-only with
-# gitmoot memory list; see the "Agent Persistent Memory" concepts page and CLI.md
-# for the full model.
+# injection (default 15); both must be >= 0. distill_at_terminal (default false) is
+# the master switch for #737 P4.1 deterministic distill-at-terminal: on an anomalous
+# terminal (failed/blocked/changes_requested) Gitmoot stages bounded PENDING
+# observations (failing tests + named errors) at trust_mark=low, provenance
+# distill:<job-id> — NEVER confirmed memory (the memory confirm gate stays the only
+# promotion path). distill_max_per_job (default 3, >= 0) caps distilled rows per job;
+# distill_all_jobs (default false) widens distill past enrolled agents to every job.
+# All [memory] keys are read PER TICK — no daemon restart is needed to flip them.
+# Inspect the store read-only with gitmoot memory list; see the "Agent Persistent
+# Memory" concepts page and CLI.md for the full model.
 # [memory]
 # disabled = false
 # token_budget = 1500
 # max_entries = 15
+# distill_at_terminal = false
+# distill_max_per_job = 3
+# distill_all_jobs = false
 #
 # Enroll a specific agent (per-agent opt-in; omit for byte-identical default):
 # [agents.builder]

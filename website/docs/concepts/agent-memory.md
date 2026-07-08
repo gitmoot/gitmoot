@@ -62,10 +62,40 @@ runtime = "codex"
 memory = true          # enroll this agent (default off)
 
 [memory]
-disabled = false       # global kill switch (overrides every enrollment)
-token_budget = 1500    # cap on injected block size (estimated tokens)
-max_entries = 15       # cap on confirmed rows considered for injection
+disabled = false            # global kill switch (overrides every enrollment)
+token_budget = 1500         # cap on injected block size (estimated tokens)
+max_entries = 15            # cap on confirmed rows considered for injection
+distill_at_terminal = false # stage deterministic failure signal at terminal (P4.1)
+distill_max_per_job = 3     # hard cap on distilled observations per job
+distill_all_jobs = false    # true → distill every job, not only enrolled agents
 ```
+
+Every `[memory]` key is read **per tick**, so flipping `distill_at_terminal`
+(or any knob) takes effect on the next job with **no daemon restart**.
+
+### Distill-at-terminal
+
+`distill_at_terminal` (off by default) enables a deterministic producer that,
+on an *anomalous* terminal (`failed`/`blocked`/`changes_requested`), mines the
+job's own result for two closed-category signals — **failing tests** (test names
+from explicit `--- FAIL:` markers in the job output, *not* mere presence in
+`tests_run`, which only records that a test was **run**) and **named errors**
+(stable tokens from the summary and the tail of the raw output, normalized by
+stripping hashes, paths, addresses, line numbers, and timestamps). Unlike the mechanical facts above, distilled rows are written as
+**pending observations** at trust `low` with provenance `distill:<job-id>` — they
+are **never** confirmed memory, so the human `memory confirm` gate stays the only
+promotion path.
+
+Distill is bounded on every axis: each candidate passes the same PreFilter, a
+content-hash dedup blocks a repeat from staging twice, and `distill_max_per_job`
+caps writes per job. A **recurrence gate** stops a one-off failure from ever
+becoming a pending memory — the first sighting of a normalized key records only a
+low-trust *witness* (`distill-seen:<job-id>`), and the observation stages only
+when the same key recurs across a later job. A witness is internal recurrence
+bookkeeping: it is **never** shown in `memory list` and can **never** be promoted
+by `memory confirm`, so a one-off failure is invisible until it recurs. By default distill follows
+enrollment; `distill_all_jobs = true` harvests failure signal box-wide while the
+read path and confirmed producers stay enrolled-only.
 
 An agent records a durable fact via the optional top-level `learnings` field in
 `gitmoot_result` — each entry is `{key, scope, content}` where `scope` is

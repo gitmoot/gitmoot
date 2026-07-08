@@ -22,6 +22,51 @@ func TestLoadMemorySettingsDefaults(t *testing.T) {
 	if settings.TokenBudget != DefaultMemoryTokenBudget || settings.MaxEntries != DefaultMemoryMaxEntries {
 		t.Fatalf("defaults = %+v", settings)
 	}
+	// Distill is off by default with a bounded per-job cap.
+	if settings.DistillAtTerminal || settings.DistillAllJobs {
+		t.Fatalf("distill must be off by default, got %+v", settings)
+	}
+	if settings.DistillMaxPerJob != DefaultMemoryDistillMaxPerJob {
+		t.Fatalf("distill_max_per_job default = %d, want %d", settings.DistillMaxPerJob, DefaultMemoryDistillMaxPerJob)
+	}
+}
+
+func TestLoadMemorySettingsParsesDistillKnobs(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[memory]
+distill_at_terminal = true
+distill_max_per_job = 5
+distill_all_jobs = true
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	settings, err := LoadMemorySettings(paths)
+	if err != nil {
+		t.Fatalf("LoadMemorySettings: %v", err)
+	}
+	if !settings.DistillAtTerminal || !settings.DistillAllJobs || settings.DistillMaxPerJob != 5 {
+		t.Fatalf("parsed distill knobs = %+v", settings)
+	}
+}
+
+func TestLoadMemorySettingsRejectsNegativeDistillCap(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[memory]
+distill_max_per_job = -1
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if _, err := LoadMemorySettings(paths); err == nil {
+		t.Fatalf("expected negative distill_max_per_job to be rejected")
+	}
 }
 
 func TestLoadMemorySettingsParsesKnobs(t *testing.T) {
