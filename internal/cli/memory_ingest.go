@@ -132,7 +132,7 @@ func runMemoryIngest(args []string, stdout, stderr io.Writer) int {
 			}
 			rel = filepath.ToSlash(rel)
 			fileStem := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-			_, body := memory.SplitFrontmatter(string(raw))
+			_, body := memory.StripFrontmatter(string(raw))
 			for _, chunk := range memory.ChunkMarkdown(body, memory.IngestMaxChunkTokens) {
 				result.Chunks++
 				if ok, reason := memory.PreFilter(chunk.Text, scope); !ok {

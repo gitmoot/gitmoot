@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-func TestSplitFrontmatterStripsWhenPresent(t *testing.T) {
+func TestStripFrontmatterStripsWhenPresent(t *testing.T) {
 	in := "---\ntitle: Notes\ntags: [a, b]\n---\n# Body\n\nreal content\n"
-	fm, body := SplitFrontmatter(in)
+	fm, body := StripFrontmatter(in)
 	if !strings.Contains(fm, "title: Notes") {
 		t.Fatalf("frontmatter not captured: %q", fm)
 	}
@@ -19,9 +19,9 @@ func TestSplitFrontmatterStripsWhenPresent(t *testing.T) {
 	}
 }
 
-func TestSplitFrontmatterPassthroughWhenAbsent(t *testing.T) {
+func TestStripFrontmatterPassthroughWhenAbsent(t *testing.T) {
 	in := "# Just markdown\n\nno frontmatter here\n"
-	fm, body := SplitFrontmatter(in)
+	fm, body := StripFrontmatter(in)
 	if fm != "" {
 		t.Fatalf("expected no frontmatter, got %q", fm)
 	}
@@ -30,9 +30,9 @@ func TestSplitFrontmatterPassthroughWhenAbsent(t *testing.T) {
 	}
 }
 
-func TestSplitFrontmatterUnclosedFenceKeepsContent(t *testing.T) {
+func TestStripFrontmatterUnclosedFenceKeepsContent(t *testing.T) {
 	in := "---\nlooks like frontmatter but never closes\nmore text\n"
-	fm, body := SplitFrontmatter(in)
+	fm, body := StripFrontmatter(in)
 	if fm != "" {
 		t.Fatalf("unclosed fence must not be treated as frontmatter, got %q", fm)
 	}

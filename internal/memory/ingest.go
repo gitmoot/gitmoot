@@ -32,13 +32,13 @@ type Chunk struct {
 	Text    string
 }
 
-// SplitFrontmatter strips a leading YAML frontmatter block ("---\n … \n---")
+// StripFrontmatter strips a leading YAML frontmatter block ("---\n … \n---")
 // when present and returns it alongside the remaining markdown body. When no
 // frontmatter is present (or the opening fence has no closing fence) it returns
 // an empty frontmatter and the content unchanged. Unlike the agenttemplate
 // parser it never errors: for ingest, frontmatter is optional metadata to
 // discard, never a hard requirement. CRLF endings are normalized to LF first.
-func SplitFrontmatter(content string) (frontmatter, body string) {
+func StripFrontmatter(content string) (frontmatter, body string) {
 	normalized := strings.ReplaceAll(content, "\r\n", "\n")
 	trimmedLeading := strings.TrimLeft(normalized, "\n")
 	lines := strings.Split(trimmedLeading, "\n")
