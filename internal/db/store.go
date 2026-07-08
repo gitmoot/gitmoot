@@ -8262,4 +8262,29 @@ CREATE TABLE chat_thread_meta (
 ALTER TABLE confirmed_memories ADD COLUMN retired_at TEXT NOT NULL DEFAULT '';
 ALTER TABLE confirmed_memories ADD COLUMN retired_reason TEXT NOT NULL DEFAULT '';
 	`,
+	// #763 Track A — emergent memory clusters. Two side-tables persist the
+	// deterministic community detection over the fact-similarity graph so the CLI
+	// and the dashboard bridge read a stable clustering without recomputing it on
+	// every request. memory_clusters holds one row per detected community (plus the
+	// reserved cluster_id 0 'unclustered' bucket): label is the computed
+	// distinctive-term label, label_override is the owner's `memory cluster rename`
+	// (override wins when non-empty), medoid_id anchors the label for stability.
+	// memory_cluster_members maps each active confirmed fact to exactly one cluster
+	// (memory_id PK ⇒ a fact is in at most one cluster). Pure additive append
+	// (CREATE TABLE/INDEX only, no ALTER/renumber of any prior migration): both
+	// tables stay empty until `gitmoot memory clusters recompute` runs, so every
+	// existing DB reads byte-identically and the feature is inert when unused.
+	`
+CREATE TABLE memory_clusters (
+	cluster_id INTEGER PRIMARY KEY,
+	label TEXT NOT NULL DEFAULT '',
+	label_override TEXT NOT NULL DEFAULT '',
+	medoid_id INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE memory_cluster_members (
+	memory_id INTEGER PRIMARY KEY,
+	cluster_id INTEGER NOT NULL
+);
+CREATE INDEX idx_memory_cluster_members_cluster ON memory_cluster_members(cluster_id);
+	`,
 }

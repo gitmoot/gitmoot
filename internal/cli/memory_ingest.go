@@ -364,7 +364,7 @@ func runMemoryConfirm(args []string, stdout, stderr io.Writer) int {
 			if !*yes {
 				continue
 			}
-			if _, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+			newID, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
 				Owner:      obs.Owner,
 				Repo:       obs.Repo,
 				Scope:      obs.Scope,
@@ -372,10 +372,18 @@ func runMemoryConfirm(args []string, stdout, stderr io.Writer) int {
 				Content:    obs.Content,
 				Provenance: obs.Provenance,
 				SourceJob:  obs.SourceJob,
-			}); err != nil {
+			})
+			if err != nil {
 				return fmt.Errorf("confirm observation %d: %w", obs.ID, err)
 			}
 			result.Confirmed++
+			// Incremental cluster attach (#763 Track A): a newly confirmed fact joins
+			// the cluster of its nearest similarity neighbor. Best-effort and
+			// fail-safe — a clustering error must never block the confirmation.
+			attachConfirmedFactToCluster(ctx, store, db.ConfirmedMemory{
+				ID: newID, Owner: obs.Owner, Repo: obs.Repo, Scope: obs.Scope,
+				Key: obs.Key, Content: obs.Content,
+			})
 		}
 		return nil
 	})

@@ -626,6 +626,20 @@ LIMIT ?`,
 // non-empty agentRef narrows the export to a single agent owner (owner_kind
 // 'agent', owner_ref = agentRef). Plain read, no FTS, zero writes.
 func (s *Store) ListConfirmedMemoriesForVault(ctx context.Context, agentRef string) ([]ConfirmedMemory, error) {
+	return listConfirmedMemoriesForVault(ctx, s.db, agentRef)
+}
+
+// rowsQuerier is the QueryContext shape shared by *sql.DB and *sql.Tx, so the
+// vault read can run on a plain connection or INSIDE a transaction (the atomic
+// cluster recompute re-reads the anchor rows within its own tx).
+type rowsQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// listConfirmedMemoriesForVault is the shared body of ListConfirmedMemoriesForVault
+// so the exact active-fact projection/ordering can be reused inside a transaction
+// (via a *sql.Tx) without duplicating the query.
+func listConfirmedMemoriesForVault(ctx context.Context, q rowsQuerier, agentRef string) ([]ConfirmedMemory, error) {
 	query := `
 SELECT id, owner_kind, owner_ref, owner_version, repo, scope, key, content,
 	provenance, source_job, first_confirmed_at, updated_at, COALESCE(superseded_by, 0)
@@ -637,7 +651,7 @@ WHERE superseded_by IS NULL AND retired_at = ''`
 		args = append(args, agentRef)
 	}
 	query += "\nORDER BY id"
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list confirmed memories for vault: %w", err)
 	}

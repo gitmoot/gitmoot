@@ -42,6 +42,14 @@ func runMemory(args []string, stdout, stderr io.Writer) int {
 		return runMemoryConfirm(args[1:], stdout, stderr)
 	case "groom":
 		return runMemoryGroom(args[1:], stdout, stderr)
+	case "clusters":
+		return runMemoryClusters(args[1:], stdout, stderr)
+	case "cluster":
+		if len(args) >= 2 && args[1] == "rename" {
+			return runMemoryClusterRename(args[2:], stdout, stderr)
+		}
+		fmt.Fprintln(stderr, "usage: gitmoot memory cluster rename <cluster-id> <label>")
+		return 2
 	default:
 		fmt.Fprintf(stderr, "unknown memory command %q\n\n", args[0])
 		printMemoryUsage(stderr)
@@ -61,6 +69,9 @@ func printMemoryUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]")
 	fmt.Fprintln(w, "  gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--yes] [--json]")
 	fmt.Fprintln(w, "  gitmoot memory groom --propose [--out PLAN.json] [--json] | --yes --plan PLAN.json [--json]")
+	fmt.Fprintln(w, "  gitmoot memory clusters [--json]")
+	fmt.Fprintln(w, "  gitmoot memory clusters recompute --propose [--out PLAN.json] [--json] | --apply [--plan PLAN.json] [--json]")
+	fmt.Fprintln(w, "  gitmoot memory cluster rename <cluster-id> <label>")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "  list          show stored memories (confirmed and/or pending observations)")
 	fmt.Fprintln(w, "  replay        offline A/B: render recent real jobs' prompts with vs without the")
@@ -71,6 +82,8 @@ func printMemoryUsage(w io.Writer) {
 	fmt.Fprintln(w, "  observations  list pending observations, flagging which keys are already confirmed")
 	fmt.Fprintln(w, "  confirm       human-gated promotion of pending observations into confirmed memory")
 	fmt.Fprintln(w, "  groom         deterministically propose stale-memory retirements, apply on confirmation")
+	fmt.Fprintln(w, "  clusters      list emergent memory clusters; recompute them via a propose/apply plan")
+	fmt.Fprintln(w, "  cluster       rename a cluster (owner label override)")
 }
 
 // ---- memory list ----------------------------------------------------------
