@@ -458,8 +458,8 @@ func TestMemoryDistillAtTerminalE2E(t *testing.T) {
 	// A BLOCKED terminal (settled, dispatch returns cleanly) carrying a failing
 	// test and a panic in the summary. The 0x address differs per job so the
 	// named-error NORMALIZATION is exercised: both must map to the same key.
-	blockedJob1 := `{"gitmoot_result":{"decision":"blocked","summary":"panic: nil pointer dereference at 0xdeadbeef","findings":[],"changes_made":[],"tests_run":["TestPaymentFlow"],"needs":[],"delegations":[]}}`
-	blockedJob2 := `{"gitmoot_result":{"decision":"blocked","summary":"panic: nil pointer dereference at 0xcafef00d","findings":[],"changes_made":[],"tests_run":["TestPaymentFlow"],"needs":[],"delegations":[]}}`
+	blockedJob1 := `{"gitmoot_result":{"decision":"blocked","summary":"panic: nil pointer dereference at 0xdeadbeef\n--- FAIL: TestPaymentFlow (0.01s)","findings":[],"changes_made":[],"tests_run":["TestPaymentFlow"],"needs":[],"delegations":[]}}`
+	blockedJob2 := `{"gitmoot_result":{"decision":"blocked","summary":"panic: nil pointer dereference at 0xcafef00d\n--- FAIL: TestPaymentFlow (0.02s)","findings":[],"changes_made":[],"tests_run":["TestPaymentFlow"],"needs":[],"delegations":[]}}`
 	script := fmt.Sprintf(`case "$1" in
   *SECOND*) printf '%%s' '%s' ;;
   *) printf '%%s' '%s' ;;
@@ -482,24 +482,16 @@ esac`, blockedJob2, blockedJob1)
 	if err != nil {
 		t.Fatalf("ListMemoryObservations after job 1: %v", err)
 	}
-	stagedCount := 0
-	witnessCount := 0
-	for _, o := range obs1 {
-		switch {
-		case strings.HasPrefix(o.Provenance, "distill:"):
-			stagedCount++
-		case strings.HasPrefix(o.Provenance, "distill-seen:"):
-			witnessCount++
-			if o.TrustMark != "low" {
-				t.Fatalf("witness trust = %q, want low", o.TrustMark)
-			}
-		}
+	// The witness is INTERNAL bookkeeping and is excluded from the pending list
+	// surface, so a first sighting shows NOTHING on `memory list`: no staged rows
+	// AND no visible witness rows. A one-off failure never becomes a pending memory.
+	if len(obs1) != 0 {
+		t.Fatalf("first sighting must show nothing on the pending list, got %+v", obs1)
 	}
-	if stagedCount != 0 {
-		t.Fatalf("first sighting must stage nothing, staged=%d: %+v", stagedCount, obs1)
-	}
-	if witnessCount == 0 {
-		t.Fatalf("first sighting must record witnesses, got none: %+v", obs1)
+	// But the witness WAS recorded (recurrence is armed): the keyed count is 1.
+	auditOwner := db.MemoryOwner{Kind: "agent", Ref: "audit"}
+	if n, err := store.CountMemoryObservationsForKey(ctx, auditOwner, "owner/repo", "distill-test:testpaymentflow"); err != nil || n != 1 {
+		t.Fatalf("first sighting must record the failing-test witness, n=%d err=%v", n, err)
 	}
 
 	// --- Job 2: recurrence → observations stage as PENDING low-trust rows.

@@ -1565,7 +1565,9 @@ closed-category signals and stages them as **pending observations** — trust
 `low`, provenance `distill:<job-id>`, and **never confirmed memory** (the
 `memory confirm` gate stays the only promotion path):
 
-- **Failing tests** — one normalized key per entry in `tests_run`.
+- **Failing tests** — one normalized key per test whose failure is **explicit** in
+  the job output (a `--- FAIL:` marker), not merely present in `tests_run` (which
+  records only that a test was *run*, not that it failed).
 - **Named errors** — stable error tokens pulled from the result summary (and the
   tail of the raw output), normalized to a closed category by stripping hashes,
   paths, addresses, line numbers, and timestamps.
@@ -1576,7 +1578,10 @@ learnings, content-hash **dedup** blocks a repeat from staging twice, and
 one-off failure from ever becoming a pending memory: the first sighting of a
 normalized key records only a low-trust *witness* (provenance
 `distill-seen:<job-id>`); the observation stages only when the same key recurs in
-a later job. By default distill follows enrollment; set `distill_all_jobs = true`
+a later job. A witness is internal recurrence bookkeeping — it is **never** shown
+by `memory list` and can **never** be promoted by `memory confirm` (both the list
+and confirm surfaces exclude the `distill-seen:` provenance), so a one-off failure
+stays invisible until it recurs. By default distill follows enrollment; set `distill_all_jobs = true`
 to harvest failure signal box-wide (the read path and confirmed producers stay
 enrolled-only).
 

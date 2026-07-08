@@ -620,3 +620,72 @@ func TestListMemoryObservationsWithConfirmationFlagsConfirmedKeys(t *testing.T) 
 		t.Fatalf("literal %%-prefix should match no rows, got %d", len(none))
 	}
 }
+
+// TestDistillWitnessExcludedFromListAndConfirm proves the #737 P4.1 recurrence
+// witness is INTERNAL bookkeeping: a distill-seen: row is invisible on every
+// human-reviewable surface (ListMemoryObservations, ListMemoryObservationsWithConfirmation)
+// and is un-fetchable by GetMemoryObservationByID, so it can never be shown by
+// `memory list` nor promoted to confirmed memory by `memory confirm`. A genuine
+// staged distill: row alongside it stays fully visible/confirmable.
+func TestDistillWitnessExcludedFromListAndConfirm(t *testing.T) {
+	ctx := context.Background()
+	store := openMemTestStore(t)
+	owner := agentOwner("audit")
+
+	witnessID, err := store.InsertMemoryObservation(ctx, MemoryObservation{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "distill-test:testx",
+		Content: "A failure signal was observed once in this repository and is held pending recurrence before it is recorded.",
+		Provenance: MemoryDistillWitnessProvenancePrefix + "job-1", TrustMark: "low",
+	})
+	if err != nil {
+		t.Fatalf("insert witness: %v", err)
+	}
+	stagedID, err := store.InsertMemoryObservation(ctx, MemoryObservation{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "distill-test:testy",
+		Content: "Test testy FAILED in a implement job in this repository.",
+		Provenance: "distill:job-2", TrustMark: "low",
+	})
+	if err != nil {
+		t.Fatalf("insert staged: %v", err)
+	}
+
+	// ListMemoryObservations: only the staged row is visible.
+	pending, err := store.ListMemoryObservations(ctx, "audit", "acme/widget")
+	if err != nil {
+		t.Fatalf("list observations: %v", err)
+	}
+	if len(pending) != 1 || pending[0].ID != stagedID {
+		t.Fatalf("pending list should show only the staged row, got %+v", pending)
+	}
+
+	// ListMemoryObservationsWithConfirmation: witness hidden even with no prefix.
+	rows, err := store.ListMemoryObservationsWithConfirmation(ctx, "audit", "")
+	if err != nil {
+		t.Fatalf("list w/ confirmation: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ID != stagedID {
+		t.Fatalf("confirm surface should show only the staged row, got %+v", rows)
+	}
+
+	// A caller cannot target witnesses by their own provenance prefix.
+	byPrefix, err := store.ListMemoryObservationsWithConfirmation(ctx, "audit", MemoryDistillWitnessProvenancePrefix)
+	if err != nil {
+		t.Fatalf("list by witness prefix: %v", err)
+	}
+	if len(byPrefix) != 0 {
+		t.Fatalf("--prefix distill-seen: must select nothing, got %+v", byPrefix)
+	}
+
+	// GetMemoryObservationByID: a witness id resolves to (not found); a staged id resolves.
+	if _, ok, err := store.GetMemoryObservationByID(ctx, witnessID); err != nil || ok {
+		t.Fatalf("witness id must be un-confirmable (not found), ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := store.GetMemoryObservationByID(ctx, stagedID); err != nil || !ok {
+		t.Fatalf("staged id must remain confirmable, ok=%v err=%v", ok, err)
+	}
+
+	// The witness DID persist (recurrence counting still sees it).
+	if n, err := store.CountMemoryObservationsForKey(ctx, owner, "acme/widget", "distill-test:testx"); err != nil || n != 1 {
+		t.Fatalf("witness must persist for recurrence counting, n=%d err=%v", n, err)
+	}
+}

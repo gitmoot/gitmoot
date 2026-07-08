@@ -15,8 +15,10 @@ import (
 // This file implements #737 P4.1: deterministic DISTILL-AT-TERMINAL. It is a
 // config-gated WRITE producer, separate from the Phase-1 enrolled write path,
 // that mines a terminal job's OWN result for two closed-category signals —
-// FAILING TESTS (from result.TestsRun) and NAMED ERRORS (from result.Summary and
-// the tail of payload.RawOutputs) — and stages them as PENDING observations.
+// FAILING TESTS (test names from explicit `--- FAIL:` markers in result.Summary /
+// the tail of payload.RawOutputs, NOT mere presence in result.TestsRun, which only
+// records that a test was RUN) and NAMED ERRORS (from the same sources) — and
+// stages them as PENDING observations.
 //
 // OUTPUT DISCIPLINE (differs from the confirmed mechanical producers): distill
 // NEVER writes confirmed_memories. It only ever InsertMemoryObservation()s rows
@@ -40,9 +42,13 @@ import (
 
 const (
 	// distillWitnessProvenancePrefix marks the first-sighting recurrence witness.
-	// It is DISTINCT from the staged provenance so a confirm/list surface can tell
-	// a bookkeeping sentinel apart from a real distilled candidate.
-	distillWitnessProvenancePrefix = "distill-seen:"
+	// It is DISTINCT from the staged provenance so the list/confirm surface can tell
+	// a bookkeeping sentinel apart from a real distilled candidate: the pending-list
+	// reads and the confirm getter (db.ListMemoryObservations,
+	// ListMemoryObservationsWithConfirmation, GetMemoryObservationByID) EXCLUDE this
+	// provenance, so a witness is never shown in `memory list` nor confirmable. The
+	// canonical value lives in the db package (the layer that filters on it).
+	distillWitnessProvenancePrefix = db.MemoryDistillWitnessProvenancePrefix
 	// distillStagedProvenancePrefix marks a genuinely staged distilled observation.
 	distillStagedProvenancePrefix = "distill:"
 	// distillWitnessSentinel is the FIXED, PreFilter-safe content stored on a
@@ -179,7 +185,7 @@ func distillCandidates(action string, payload JobPayload, result AgentResult) []
 		seenKey[o.Key] = struct{}{}
 		out = append(out, o)
 	}
-	for _, o := range failingTestCandidates(action, result) {
+	for _, o := range failingTestCandidates(action, payload, result) {
 		add(o)
 	}
 	for _, o := range namedErrorCandidates(payload, result) {
@@ -188,33 +194,48 @@ func distillCandidates(action string, payload JobPayload, result AgentResult) []
 	return out
 }
 
-// failingTestCandidates derives one closed-category candidate per test named in
-// result.TestsRun. On a distill terminal (failed/blocked/changes_requested) those
-// are the tests the failing job exercised; the normalized test name is the key,
-// and the content is a stable reference sentence (NO volatile per-job text, so
-// dedup is deterministic).
-func failingTestCandidates(action string, result AgentResult) []distillObs {
+// failingTestCandidates derives one closed-category candidate per test that
+// ACTUALLY FAILED. The result contract's tests_run means "tests/commands the job
+// RAN", not "tests that failed" — an anomalous terminal (very commonly the routine
+// review outcome changes_requested) frequently carries a fully-passing tests_run —
+// so mere presence in tests_run is NOT failure evidence. Instead this mines the
+// explicit `--- FAIL: <name>` markers the test harness emits in the job output
+// (result.Summary and the tail of the last raw output). A passing suite emits no
+// such marker and therefore stages no test candidate. The failed test name is the
+// key; content is a stable reference sentence (NO volatile per-job text, so dedup
+// is deterministic).
+func failingTestCandidates(action string, payload JobPayload, result AgentResult) []distillObs {
 	act := memoryActionToken(action)
-	out := make([]distillObs, 0, len(result.TestsRun))
-	for _, raw := range result.TestsRun {
-		norm := normalizeTestName(raw)
-		if norm == "" {
-			continue
+	out := make([]distillObs, 0, 4)
+	seen := make(map[string]struct{})
+	scanned := 0
+	for _, src := range distillScanSources(payload, result) {
+		for _, m := range distillFailedTestRe.FindAllStringSubmatch(src, -1) {
+			if scanned >= distillMaxScanLines {
+				return out
+			}
+			scanned++
+			norm := normalizeTestName(m[1])
+			if norm == "" {
+				continue
+			}
+			if _, dup := seen[norm]; dup {
+				continue
+			}
+			seen[norm] = struct{}{}
+			out = append(out, distillObs{
+				Key:     "distill-test:" + norm,
+				Content: fmt.Sprintf("Test %s FAILED in a %s job in this repository.", norm, act),
+			})
 		}
-		out = append(out, distillObs{
-			Key:     "distill-test:" + norm,
-			Content: fmt.Sprintf("Test %s was exercised in a %s job that did not complete cleanly in this repository.", norm, act),
-		})
 	}
 	return out
 }
 
-// namedErrorCandidates extracts stable error tokens from result.Summary and the
-// tail of the last raw output. Each error line is normalized to a closed-category
-// signature (lowercased, with hashes/paths/addresses/line-numbers/timestamps
-// stripped) so distinct incidental values collapse to one key. Content is the
-// cleaned line itself (stable), prefixed with a neutral reference frame.
-func namedErrorCandidates(payload JobPayload, result AgentResult) []distillObs {
+// distillScanSources returns the bounded text sources both deterministic producers
+// mine: the result summary plus the tail of the last raw output (capped at
+// distillRawOutputTailBytes so a huge transcript can never balloon the scan).
+func distillScanSources(payload JobPayload, result AgentResult) []string {
 	sources := []string{result.Summary}
 	if n := len(payload.RawOutputs); n > 0 {
 		tail := payload.RawOutputs[n-1]
@@ -223,19 +244,37 @@ func namedErrorCandidates(payload JobPayload, result AgentResult) []distillObs {
 		}
 		sources = append(sources, tail)
 	}
+	return sources
+}
+
+// distillFailedTestRe matches the per-test failure marker a Go-style test harness
+// emits ("    --- FAIL: TestName (0.00s)"), capturing the test identifier. It is
+// the authoritative per-test FAILURE signal — distinct from mere presence in
+// tests_run, which only records that a test was RUN.
+var distillFailedTestRe = regexp.MustCompile(`(?m)^\s*--- FAIL:\s+(\S+)`)
+
+// namedErrorCandidates extracts stable error tokens from result.Summary and the
+// tail of the last raw output. Each error line is normalized to a closed-category
+// signature (lowercased, with hashes/paths/addresses/line-numbers/timestamps
+// stripped) so distinct incidental values collapse to one key. Content is the
+// cleaned line itself (stable), prefixed with a neutral reference frame.
+func namedErrorCandidates(payload JobPayload, result AgentResult) []distillObs {
 	out := make([]distillObs, 0, 4)
 	scanned := 0
-	for _, src := range sources {
+	for _, src := range distillScanSources(payload, result) {
 		for _, line := range strings.Split(src, "\n") {
 			if scanned >= distillMaxScanLines {
 				return out
 			}
 			scanned++
 			line = strings.TrimSpace(line)
-			// Skip blanks, over-long lines, and the structured result envelope
-			// (raw outputs carry the gitmoot_result JSON) so distill mines genuine
+			// Skip blanks, over-long lines, the structured result envelope (raw
+			// outputs carry the gitmoot_result JSON), and per-test `--- FAIL:`
+			// markers (claimed by failingTestCandidates, so the same line is never
+			// double-mined as a generic named error) so distill mines genuine
 			// human-readable error lines, never a minified JSON brick.
-			if line == "" || len(line) > distillMaxErrorLineLen || strings.Contains(line, "gitmoot_result") {
+			if line == "" || len(line) > distillMaxErrorLineLen ||
+				strings.Contains(line, "gitmoot_result") || strings.Contains(line, "--- FAIL:") {
 				continue
 			}
 			if !errorLineRe.MatchString(line) {

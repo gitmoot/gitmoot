@@ -47,14 +47,18 @@ func staged(obs []db.MemoryObservation) []db.MemoryObservation {
 	return out
 }
 
-func witnesses(obs []db.MemoryObservation) []db.MemoryObservation {
-	var out []db.MemoryObservation
-	for _, o := range obs {
-		if strings.HasPrefix(o.Provenance, "distill-seen:") {
-			out = append(out, o)
-		}
+// recCount returns how many distill observation rows (witness + staged) exist for
+// a key — the exact recurrence counter. Witnesses are EXCLUDED from the pending
+// list surface (ListMemoryObservations), so a first-sighting witness is invisible
+// to distillObsFor; this keyed count is how a test proves the witness was recorded.
+func recCount(t *testing.T, store *db.Store, repo, key string) int {
+	t.Helper()
+	owner := ownerForJob(memAgent(), JobPayload{Repo: repo})
+	n, err := store.CountMemoryObservationsForKey(context.Background(), owner, repo, key)
+	if err != nil {
+		t.Fatalf("CountMemoryObservationsForKey: %v", err)
 	}
-	return out
+	return n
 }
 
 // TestDistillOffByDefaultNoRows proves that with distill OFF (the default) a
@@ -86,7 +90,8 @@ func TestDistillNeverConfirmedAlwaysLowTrust(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 	ctrl := distillController(store, 3, false, "audit")
-	res := AgentResult{Decision: "failed", Summary: "", TestsRun: []string{"TestPaymentFlow"}}
+	// tests_run alone is NOT failure evidence; an explicit `--- FAIL:` marker is.
+	res := AgentResult{Decision: "failed", Summary: "--- FAIL: TestPaymentFlow (0.01s)", TestsRun: []string{"TestPaymentFlow"}}
 	ctrl.record(ctx, "job-1", memAgent(), "implement", JobPayload{Repo: "acme/widget"}, res)
 	ctrl.record(ctx, "job-2", memAgent(), "implement", JobPayload{Repo: "acme/widget"}, res)
 
@@ -118,7 +123,7 @@ func TestDistillRecurrenceGate(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 	ctrl := distillController(store, 3, false, "audit")
-	res := AgentResult{Decision: "failed", TestsRun: []string{"TestCheckoutRetry"}}
+	res := AgentResult{Decision: "failed", Summary: "--- FAIL: TestCheckoutRetry (0.02s)", TestsRun: []string{"TestCheckoutRetry"}}
 
 	// --- Job 1: FIRST sighting → witness only, nothing staged.
 	ctrl.record(ctx, "job-1", memAgent(), "implement", JobPayload{Repo: "acme/widget"}, res)
@@ -126,15 +131,14 @@ func TestDistillRecurrenceGate(t *testing.T) {
 	if len(staged(obs)) != 0 {
 		t.Fatalf("first sighting must stage nothing, got %+v", staged(obs))
 	}
-	w := witnesses(obs)
-	if len(w) != 1 {
-		t.Fatalf("first sighting must record exactly one witness, got %+v", w)
+	// The witness is NOT visible on the pending list surface (it is internal
+	// recurrence bookkeeping) — distillObsFor returns nothing for a first sighting.
+	if len(obs) != 0 {
+		t.Fatalf("first-sighting witness must be absent from the pending list, got %+v", obs)
 	}
-	if w[0].TrustMark != "low" || w[0].Provenance != "distill-seen:job-1" {
-		t.Fatalf("witness trust/provenance = %q/%q, want low/distill-seen:job-1", w[0].TrustMark, w[0].Provenance)
-	}
-	if w[0].Content == "" || strings.Contains(w[0].Content, "TestCheckoutRetry") {
-		t.Fatalf("witness content should be the fixed sentinel, got %q", w[0].Content)
+	// But it WAS recorded, so recurrence is armed: the keyed count is exactly 1.
+	if n := recCount(t, store, "acme/widget", "distill-test:testcheckoutretry"); n != 1 {
+		t.Fatalf("first sighting must record exactly one witness row, keyed count = %d", n)
 	}
 
 	// --- Job 2: recurrence → the real observation stages.
@@ -154,7 +158,7 @@ func TestDistillDedupOnRepeat(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 	ctrl := distillController(store, 3, false, "audit")
-	res := AgentResult{Decision: "failed", TestsRun: []string{"TestCheckoutRetry"}}
+	res := AgentResult{Decision: "failed", Summary: "--- FAIL: TestCheckoutRetry (0.02s)", TestsRun: []string{"TestCheckoutRetry"}}
 	for _, jobID := range []string{"job-1", "job-2", "job-3", "job-4"} {
 		ctrl.record(ctx, jobID, memAgent(), "implement", JobPayload{Repo: "acme/widget"}, res)
 	}
@@ -162,8 +166,13 @@ func TestDistillDedupOnRepeat(t *testing.T) {
 	if got := len(staged(obs)); got != 1 {
 		t.Fatalf("dedup should keep exactly one staged row across repeats, got %d: %+v", got, staged(obs))
 	}
-	if got := len(witnesses(obs)); got != 1 {
-		t.Fatalf("exactly one witness should ever exist per key, got %d", got)
+	// The pending list shows only the single staged row — witnesses stay hidden.
+	if len(obs) != 1 {
+		t.Fatalf("pending list should show exactly the one staged row, got %+v", obs)
+	}
+	// Exactly one witness + one staged row ever exist per key (keyed count = 2).
+	if got := recCount(t, store, "acme/widget", "distill-test:testcheckoutretry"); got != 2 {
+		t.Fatalf("exactly one witness + one staged row should exist per key, keyed count = %d", got)
 	}
 }
 
@@ -246,10 +255,17 @@ func TestDistillPerJobCap(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 	ctrl := distillController(store, 2, false, "audit")
-	res := AgentResult{Decision: "failed", TestsRun: []string{"TestA", "TestB", "TestC", "TestD"}}
+	// Four distinct FAILED tests → four candidates; the per-job cap bounds WRITES.
+	res := AgentResult{Decision: "failed", Summary: "--- FAIL: TestA (0s)\n--- FAIL: TestB (0s)\n--- FAIL: TestC (0s)\n--- FAIL: TestD (0s)"}
 	ctrl.record(ctx, "job-1", memAgent(), "implement", JobPayload{Repo: "acme/widget"}, res)
-	if got := len(distillObsFor(t, store, "acme/widget")); got != 2 {
-		t.Fatalf("per-job cap=2 should bound distill to 2 rows, got %d", got)
+	// First sighting writes only witnesses (hidden from the list surface), so the
+	// cap is verified via the keyed recurrence count: exactly 2 of the 4 written.
+	total := 0
+	for _, name := range []string{"testa", "testb", "testc", "testd"} {
+		total += recCount(t, store, "acme/widget", "distill-test:"+name)
+	}
+	if total != 2 {
+		t.Fatalf("per-job cap=2 should bound distill to 2 written rows, got %d", total)
 	}
 }
 
@@ -258,23 +274,22 @@ func TestDistillPerJobCap(t *testing.T) {
 // un-enrolled agent distills box-wide.
 func TestDistillEnrolledOnlyVsAllJobs(t *testing.T) {
 	ctx := context.Background()
-	res := AgentResult{Decision: "failed", TestsRun: []string{"TestPaymentFlow"}}
+	res := AgentResult{Decision: "failed", Summary: "--- FAIL: TestPaymentFlow (0s)"}
 
 	// distill_all_jobs=false, nobody enrolled → no distill.
 	storeA := openTestStore(t)
 	ctrlA := distillController(storeA, 3, false /* nobody enrolled */)
 	ctrlA.record(ctx, "job-1", memAgent(), "implement", JobPayload{Repo: "acme/widget"}, res)
-	if obs := distillObsFor(t, storeA, "acme/widget"); len(obs) != 0 {
-		t.Fatalf("un-enrolled agent with distill_all_jobs=false must distill nothing, got %+v", obs)
+	if n := recCount(t, storeA, "acme/widget", "distill-test:testpaymentflow"); n != 0 {
+		t.Fatalf("un-enrolled agent with distill_all_jobs=false must distill nothing, keyed count = %d", n)
 	}
 
 	// distill_all_jobs=true, still nobody enrolled → distill fires (witness).
 	storeB := openTestStore(t)
 	ctrlB := distillController(storeB, 3, true /* nobody enrolled, allJobs */)
 	ctrlB.record(ctx, "job-1", memAgent(), "implement", JobPayload{Repo: "acme/widget"}, res)
-	obs := distillObsFor(t, storeB, "acme/widget")
-	if len(witnesses(obs)) != 1 {
-		t.Fatalf("distill_all_jobs=true must distill for an un-enrolled agent, got %+v", obs)
+	if n := recCount(t, storeB, "acme/widget", "distill-test:testpaymentflow"); n != 1 {
+		t.Fatalf("distill_all_jobs=true must distill (witness) for an un-enrolled agent, keyed count = %d", n)
 	}
 }
 
@@ -297,8 +312,10 @@ func TestDistillOnlyOnNotableDecisions(t *testing.T) {
 			store := openTestStore(t)
 			ctrl := distillController(store, 3, false, "audit")
 			ctrl.record(ctx, "job-1", memAgent(), "implement", JobPayload{Repo: "acme/widget"},
-				AgentResult{Decision: tc.decision, TestsRun: []string{"TestPaymentFlow"}})
-			if got := len(distillObsFor(t, store, "acme/widget")); got != tc.want {
+				AgentResult{Decision: tc.decision, Summary: "--- FAIL: TestPaymentFlow (0s)"})
+			// First sighting writes only a (hidden) witness, so assert via the keyed
+			// recurrence count rather than the pending list surface.
+			if got := recCount(t, store, "acme/widget", "distill-test:testpaymentflow"); got != tc.want {
 				t.Fatalf("decision %q: distill rows = %d, want %d", tc.decision, got, tc.want)
 			}
 		})
