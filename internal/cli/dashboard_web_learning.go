@@ -184,13 +184,18 @@ func agentsByTemplateID(ctx context.Context, store *db.Store) map[string][]strin
 	return out
 }
 
-// categoryEdgeCap bounds the number of fact->category-hub edges the brain graph
-// emits. There is one category edge per categorizable fact, so the count grows
-// with the fact pool; it is capped to keep the payload (and the client
-// force-graph) bounded in a large unattended deployment. The truncation is
-// deterministic: facts are walked in their stable sorted order and category edges
-// stop being appended once the cap is reached.
-const categoryEdgeCap = 2000
+// clusterEdgeCap bounds the number of fact->cluster-hub edges the brain graph
+// emits. There is one cluster edge per clustered fact, so the count grows with the
+// fact pool; it is capped to keep the payload (and the client force-graph) bounded
+// in a large unattended deployment. The truncation is deterministic: facts are
+// walked in their stable sorted order and cluster edges stop being appended once
+// the cap is reached.
+const clusterEdgeCap = 2000
+
+// unclusteredHubID is the stable hub node id for facts in the reserved
+// 'unclustered' bucket (cluster 0). Namespaced under "cluster:" so the UI groups
+// them alongside real cluster hubs without colliding with a fact or agent id.
+const unclusteredHubID = "cluster:unclustered"
 
 // witnessKey identifies a fact's observation pool for the witness tally: the
 // owning agent ref, the repo (as stored, "" == general/NULL), and the memory key.
@@ -259,8 +264,19 @@ func (d *webDataSource) Knowledge(ctx context.Context) (dashboard.Knowledge, err
 			return out.Facts[i].ID < out.Facts[j].ID
 		})
 
+		// Persisted emergent-cluster membership (rowid -> cluster id), retiring the
+		// old key-prefix category hack (#763). Fail-open: a query error (or an
+		// un-recomputed store) leaves membership empty and the graph simply emits no
+		// cluster/repo-tier edges rather than failing the endpoint.
+		membByRow := map[int64]int64{}
+		if members, merr := store.ListMemoryClusterMembers(ctx); merr == nil {
+			for _, m := range members {
+				membByRow[m.MemoryID] = m.ClusterID
+			}
+		}
+
 		out.Agents = knowledgeAgents(ctx, store, paths, out.Facts)
-		out.Edges = knowledgeEdges(rows, out.Facts, idByRow)
+		out.Edges = knowledgeEdges(rows, out.Facts, idByRow, membByRow)
 		return nil
 	})
 	if err != nil {
@@ -307,11 +323,18 @@ func knowledgeAgents(ctx context.Context, store *db.Store, paths config.Paths, f
 	return out
 }
 
-// knowledgeEdges builds the brain graph's edges from the facts (owner + category)
-// and the raw confirmed rows (supersede). The final set is sorted by (kind,
-// source, target) exactly like the fake feed, so a signature-skip poll is stable.
-func knowledgeEdges(rows []db.ConfirmedMemory, facts []dashboard.KnowledgeFact, idByRow map[int64]string) []dashboard.KnowledgeEdge {
-	edges := make([]dashboard.KnowledgeEdge, 0, len(facts)*2+len(rows))
+// knowledgeEdges builds the brain graph's edges: owner (fact->agent), cluster
+// (fact->emergent-cluster hub), repo (cluster->repo hub, the top tier of the
+// repo->cluster->fact hierarchy), and supersede (newer->older). The final set is
+// sorted by (kind, source, target) exactly like the fake feed, so a
+// signature-skip poll is stable.
+//
+// membByRow is the persisted emergent-cluster membership (confirmed_memories.id
+// -> cluster id) from `memory clusters recompute`. It REPLACES the retired
+// key-prefix category hack: hubs are now the deterministic communities over the
+// fact-similarity graph (#763), not the leading colon-delimited key dimension.
+func knowledgeEdges(rows []db.ConfirmedMemory, facts []dashboard.KnowledgeFact, idByRow map[int64]string, membByRow map[int64]int64) []dashboard.KnowledgeEdge {
+	edges := make([]dashboard.KnowledgeEdge, 0, len(facts)*3+len(rows))
 
 	// owner: every fact -> its owning agent hub.
 	for _, f := range facts {
@@ -321,25 +344,42 @@ func knowledgeEdges(rows []db.ConfirmedMemory, facts []dashboard.KnowledgeFact, 
 		edges = append(edges, dashboard.KnowledgeEdge{Source: f.ID, Target: f.Owner, Kind: "owner"})
 	}
 
-	// category: every categorizable fact -> its category hub, derived from the fact
-	// key's LEADING colon-delimited dimension (the mechanical family the memory
-	// writers key on, e.g. `outcome`/`fix-rounds`); facts sharing that dimension
-	// share the hub. NOTE this derives the hub from the KEY per the design, which
-	// differs from the fake feed's use of the fact's repo/scope as the hub — the
-	// real key format carries the category dimension, the fake keys do not. Capped
-	// at categoryEdgeCap with a deterministic truncation: facts are walked in their
-	// already-sorted order and category edges stop once the cap is reached.
-	categoryEdges := 0
+	// cluster + repo tier: every clustered fact -> its emergent-cluster hub, and
+	// each (cluster, repo) pair among the members -> the repo hub, forming the
+	// repo->cluster->fact hierarchy. Membership is looked up by the fact's stored
+	// rowid (idByRow maps rowid->"fact:<id>"). rowidByFactID inverts idByRow so we
+	// can resolve a KnowledgeFact back to its rowid for the membership lookup.
+	// Capped at clusterEdgeCap with a deterministic truncation (facts walked in
+	// their already-sorted order). repoByCluster dedupes the cluster->repo edges.
+	rowidByFactID := make(map[string]int64, len(idByRow))
+	for rowid, fid := range idByRow {
+		rowidByFactID[fid] = rowid
+	}
+	repoByCluster := map[string]struct{}{}
+	clusterEdges := 0
 	for _, f := range facts {
-		if categoryEdges >= categoryEdgeCap {
+		if clusterEdges >= clusterEdgeCap {
 			break
 		}
-		cat := knowledgeCategory(f.Key)
-		if cat == "" {
+		rowid, ok := rowidByFactID[f.ID]
+		if !ok {
 			continue
 		}
-		edges = append(edges, dashboard.KnowledgeEdge{Source: f.ID, Target: cat, Kind: "category"})
-		categoryEdges++
+		cid, ok := membByRow[rowid]
+		if !ok {
+			continue // fact not yet clustered (no recompute run, or attach pending)
+		}
+		hub := clusterHubID(cid)
+		edges = append(edges, dashboard.KnowledgeEdge{Source: f.ID, Target: hub, Kind: "cluster"})
+		clusterEdges++
+		// repo tier: link this cluster to the repo the fact belongs to (general
+		// scope -> the "general" repo hub) once per (cluster, repo).
+		repoHub := knowledgeRepoHub(f.Repo)
+		key := hub + "\x00" + repoHub
+		if _, seen := repoByCluster[key]; !seen {
+			repoByCluster[key] = struct{}{}
+			edges = append(edges, dashboard.KnowledgeEdge{Source: hub, Target: repoHub, Kind: "repo"})
+		}
 	}
 
 	// supersede: the newer fact -> the older fact it replaced. confirmed_memories
@@ -372,23 +412,24 @@ func knowledgeEdges(rows []db.ConfirmedMemory, facts []dashboard.KnowledgeFact, 
 	return edges
 }
 
-// knowledgeCategory derives a fact's category-hub id from its memory key. The
-// confirmed-memory writers key facts by a colon-delimited, closed-category form
-// (`fix-rounds:<decision>`, `outcome:<action>:<decision>`), so the LEADING
-// dimension is the category family. The hub id is namespaced `cat:<family>` so it
-// never collides with a fact id ("fact:<n>") or an agent name. An empty/keyless
-// fact yields "" (no category edge).
-func knowledgeCategory(key string) string {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return ""
+// clusterHubID is the stable hub node id for an emergent cluster. It is
+// namespaced "cluster:<id>" so it never collides with a fact id ("fact:<n>") or an
+// agent name. The reserved unclustered bucket (id 0) maps to the fixed
+// unclusteredHubID so those facts group together.
+func clusterHubID(clusterID int64) string {
+	if clusterID == memory.UnclusteredID {
+		return unclusteredHubID
 	}
-	family := key
-	if i := strings.Index(key, ":"); i >= 0 {
-		family = strings.TrimSpace(key[:i])
+	return "cluster:" + strconv.FormatInt(clusterID, 10)
+}
+
+// knowledgeRepoHub is the top-tier repo hub node id. A general-scope fact (empty
+// repo) maps to the fixed "repo:general" hub. Namespaced "repo:" so it never
+// collides with a fact, agent, or cluster id.
+func knowledgeRepoHub(repo string) string {
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return "repo:general"
 	}
-	if family == "" {
-		return ""
-	}
-	return "cat:" + family
+	return "repo:" + repo
 }

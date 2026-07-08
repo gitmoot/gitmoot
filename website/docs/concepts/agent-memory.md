@@ -252,6 +252,42 @@ A ready-to-register nightly proposal pipeline (propose + notify-on-nonempty, app
 held behind the owner) lives in
 [`docs/examples/memory-groom-nightly`](https://github.com/jerryfane/gitmoot/tree/main/docs/examples/memory-groom-nightly).
 
+## Emergent clusters
+
+`memory clusters` groups confirmed facts into **emergent communities** detected over
+the fact-similarity graph — the **same** bm25 + id-tiebreak signal the vault
+`[[links]]` use. They replace the dashboard's old fixed key-prefix "category" hubs:
+clusters are discovered from what facts actually say, not how their keys are namespaced.
+
+```sh
+gitmoot memory clusters [--json]
+gitmoot memory clusters recompute --propose [--out PLAN.json] [--json]
+gitmoot memory clusters recompute --apply [--plan PLAN.json] [--json]
+gitmoot memory cluster rename <cluster-id> <label>
+```
+
+- **Deterministic by construction.** The community detection is **id-ordered label
+  propagation** with **lowest-label tie-breaks** over a fixed graph (sorted-id visit
+  order, id-valued initial labels, summed neighbor influence). No map order,
+  randomness, or wall clock enters, so the **same store yields byte-identical
+  clusters, labels, medoids, and cluster ids** — matching the vault byte-identity rule.
+- **Labels** are up to three distinctive terms (term frequency inside the cluster
+  weighted against corpus document frequency), joined with `-` and anchored to the
+  cluster **medoid** (the member with the highest total intra-cluster similarity) for
+  stability. Facts with no neighbors fall into the reserved cluster **0 `unclustered`**.
+- **`recompute`** is a human-gated **propose → review → apply** round-trip like
+  `memory groom`: `--propose` writes a reviewable plan of the moves/merges plus a
+  **staleness anchor** over every active fact's `(id, updated_at)`; `--apply --plan`
+  re-checks the anchor, **aborts as stale** if the store moved, then rewrites the
+  whole clustering in one transaction. On **first run** (no clusters yet) a bare
+  `recompute --apply` is allowed since there is nothing to protect.
+- **Incremental attach:** confirming a new fact best-effort joins it to the cluster
+  of its nearest neighbor without a full recompute; nothing is re-shelved silently.
+- `memory cluster rename` sets an **owner label override** that wins over the computed
+  label and survives recomputes (anchored to the medoid).
+
+The dashboard Knowledge view renders this as a **repo → cluster → fact** hierarchy.
+
 ## Phases
 
 - **Phase 0** — typed `learnings` in the result contract; the two-table schema

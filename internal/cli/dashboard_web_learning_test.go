@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/memory"
 )
 
 // reviewScoreSeed pins a candidate-review score (the nullable REAL column, carried
@@ -320,22 +322,19 @@ func TestWebDataSourceKnowledge(t *testing.T) {
 		t.Fatalf("F3 must be general-scope (empty repo), got %q", byContent["F3"].Repo)
 	}
 
-	// Edges by kind.
-	var owner, category, supersede int
+	// Edges by kind. seedKnowledge does not run a cluster recompute, so with no
+	// persisted membership the graph emits NO cluster/repo edges (fail-open) — the
+	// repo->cluster->fact hierarchy is exercised in TestKnowledgeClusterHierarchy.
+	var owner, cluster, repo, supersede int
 	var superEdge dashboard.KnowledgeEdge
-	catTarget := map[string]int{}
 	for _, e := range k.Edges {
 		switch e.Kind {
 		case "owner":
 			owner++
-		case "category":
-			category++
-			if e.Source == byContent["F1"].ID {
-				catTarget["F1"] = 1
-				if e.Target != "cat:outcome" {
-					t.Fatalf("F1 category target = %q, want cat:outcome (leading key dimension)", e.Target)
-				}
-			}
+		case "cluster":
+			cluster++
+		case "repo":
+			repo++
 		case "supersede":
 			supersede++
 			superEdge = e
@@ -343,17 +342,14 @@ func TestWebDataSourceKnowledge(t *testing.T) {
 			t.Fatalf("unexpected edge kind %q", e.Kind)
 		}
 	}
-	if owner != 7 || category != 7 || supersede != 1 {
-		t.Fatalf("edges = owner%d category%d supersede%d, want 7/7/1", owner, category, supersede)
+	if owner != 7 || cluster != 0 || repo != 0 || supersede != 1 {
+		t.Fatalf("edges = owner%d cluster%d repo%d supersede%d, want 7/0/0/1", owner, cluster, repo, supersede)
 	}
 	// Supersede direction: newer fact -> older fact.
 	wantNew := fmt.Sprintf("fact:%d", newID)
 	wantOld := fmt.Sprintf("fact:%d", oldID)
 	if superEdge.Source != wantNew || superEdge.Target != wantOld {
 		t.Fatalf("supersede edge = %s->%s, want %s->%s (newer->older)", superEdge.Source, superEdge.Target, wantNew, wantOld)
-	}
-	if catTarget["F1"] != 1 {
-		t.Fatalf("F1 must have a category edge")
 	}
 
 	// Determinism: a second call is byte-identical.
@@ -366,48 +362,122 @@ func TestWebDataSourceKnowledge(t *testing.T) {
 	}
 }
 
-// TestKnowledgeCategory covers the key -> category-hub derivation.
-func TestKnowledgeCategory(t *testing.T) {
-	cases := map[string]string{
-		"outcome:review:changes_requested": "cat:outcome",
-		"fix-rounds:approved":              "cat:fix-rounds",
-		"release-policy":                   "cat:release-policy",
-		"":                                 "",
-		":x":                               "",
-		"   ":                              "",
+// TestKnowledgeClusterHierarchy seeds a store, recomputes the emergent clusters,
+// and asserts the Knowledge bridge emits the repo->cluster->fact hierarchy: every
+// clustered fact has a fact->cluster edge, and each cluster links up to its
+// members' repo hub.
+func TestKnowledgeClusterHierarchy(t *testing.T) {
+	home := dashboardTestHome(t)
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("open: %v", err)
 	}
-	for key, want := range cases {
-		if got := knowledgeCategory(key); got != want {
-			t.Fatalf("knowledgeCategory(%q) = %q, want %q", key, got, want)
+	dbIDs, netIDs := seedClusterCorpus(t, store)
+	store.Close()
+
+	// Build the clustering via the CLI (first-run apply).
+	var b bytes.Buffer
+	if code := runMemory([]string{"clusters", "recompute", "--apply", "--home", home}, &b, &b); code != 0 {
+		t.Fatalf("recompute apply exit %d: %s", code, b.String())
+	}
+
+	ds := &webDataSource{home: home}
+	k, err := ds.Knowledge(context.Background())
+	if err != nil {
+		t.Fatalf("Knowledge: %v", err)
+	}
+
+	// Index edges.
+	clusterOfFact := map[string]string{} // fact id -> cluster hub
+	repoOfCluster := map[string]string{} // cluster hub -> repo hub
+	var clusterEdges, repoEdges int
+	for _, e := range k.Edges {
+		switch e.Kind {
+		case "cluster":
+			clusterOfFact[e.Source] = e.Target
+			clusterEdges++
+		case "repo":
+			repoOfCluster[e.Source] = e.Target
+			repoEdges++
 		}
+	}
+	if clusterEdges != len(dbIDs)+len(netIDs) {
+		t.Fatalf("cluster edges = %d, want %d (one per fact)", clusterEdges, len(dbIDs)+len(netIDs))
+	}
+	if repoEdges == 0 {
+		t.Fatalf("expected cluster->repo edges for the repo tier, got none")
+	}
+
+	// All db facts share one cluster hub; all net facts share another; the hubs
+	// differ and each links to the acme/widget repo hub.
+	dbHub := clusterOfFact["fact:"+itoaTest(dbIDs[0])]
+	for _, id := range dbIDs {
+		if got := clusterOfFact["fact:"+itoaTest(id)]; got != dbHub {
+			t.Fatalf("db fact %d -> %q, want %q", id, got, dbHub)
+		}
+	}
+	netHub := clusterOfFact["fact:"+itoaTest(netIDs[0])]
+	if dbHub == "" || netHub == "" || dbHub == netHub {
+		t.Fatalf("db/net hubs must be distinct and non-empty: %q %q", dbHub, netHub)
+	}
+	if repoOfCluster[dbHub] != "repo:acme/widget" {
+		t.Fatalf("db cluster repo hub = %q, want repo:acme/widget", repoOfCluster[dbHub])
+	}
+
+	// Determinism: a second bridge call is byte-identical.
+	k2, err := ds.Knowledge(context.Background())
+	if err != nil {
+		t.Fatalf("Knowledge (2nd): %v", err)
+	}
+	if fmt.Sprintf("%+v", k) != fmt.Sprintf("%+v", k2) {
+		t.Fatalf("Knowledge not deterministic across calls")
 	}
 }
 
-// TestKnowledgeEdgesCategoryCap asserts the category-edge cap truncates
-// deterministically while owner edges stay uncapped.
-func TestKnowledgeEdgesCategoryCap(t *testing.T) {
-	const n = categoryEdgeCap + 100
-	facts := make([]dashboard.KnowledgeFact, 0, n)
-	for i := 0; i < n; i++ {
-		facts = append(facts, dashboard.KnowledgeFact{
-			ID: fmt.Sprintf("fact:%d", i), Owner: "researcher", Key: fmt.Sprintf("outcome:%d", i),
-		})
+// TestClusterHubID covers the cluster/repo hub-id derivation.
+func TestClusterHubID(t *testing.T) {
+	if got := clusterHubID(3); got != "cluster:3" {
+		t.Fatalf("clusterHubID(3) = %q, want cluster:3", got)
 	}
-	edges := knowledgeEdges(nil, facts, map[int64]string{})
+	if got := clusterHubID(memory.UnclusteredID); got != unclusteredHubID {
+		t.Fatalf("clusterHubID(0) = %q, want %q", got, unclusteredHubID)
+	}
+	if got := knowledgeRepoHub(""); got != "repo:general" {
+		t.Fatalf("knowledgeRepoHub(\"\") = %q, want repo:general", got)
+	}
+	if got := knowledgeRepoHub("acme/widget"); got != "repo:acme/widget" {
+		t.Fatalf("knowledgeRepoHub = %q, want repo:acme/widget", got)
+	}
+}
 
-	var owner, category int
+// TestKnowledgeEdgesClusterCap asserts the cluster-edge cap truncates
+// deterministically while owner edges stay uncapped.
+func TestKnowledgeEdgesClusterCap(t *testing.T) {
+	const n = clusterEdgeCap + 100
+	facts := make([]dashboard.KnowledgeFact, 0, n)
+	idByRow := make(map[int64]string, n)
+	membByRow := make(map[int64]int64, n)
+	for i := 0; i < n; i++ {
+		fid := fmt.Sprintf("fact:%d", i)
+		facts = append(facts, dashboard.KnowledgeFact{ID: fid, Owner: "researcher"})
+		idByRow[int64(i)] = fid
+		membByRow[int64(i)] = 1 // all in one cluster
+	}
+	edges := knowledgeEdges(nil, facts, idByRow, membByRow)
+
+	var owner, cluster int
 	for _, e := range edges {
 		switch e.Kind {
 		case "owner":
 			owner++
-		case "category":
-			category++
+		case "cluster":
+			cluster++
 		}
 	}
 	if owner != n {
 		t.Fatalf("owner edges = %d, want %d (uncapped)", owner, n)
 	}
-	if category != categoryEdgeCap {
-		t.Fatalf("category edges = %d, want %d (capped)", category, categoryEdgeCap)
+	if cluster != clusterEdgeCap {
+		t.Fatalf("cluster edges = %d, want %d (capped)", cluster, clusterEdgeCap)
 	}
 }
