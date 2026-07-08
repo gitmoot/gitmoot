@@ -26,10 +26,16 @@ const vaultLinkK = 5
 
 // vaultManifest is the vault's staleness anchor, written as manifest.json at the
 // vault root. snapshot_hash is memory.VaultSnapshotHash over the exported notes;
-// P2's import regenerates a fresh export and aborts if the hashes disagree.
+// P2's import regenerates a fresh export and aborts if the hashes disagree. Agent
+// records the export's --agent scope (empty == all owners) so import can regenerate
+// the fresh export with the SAME scope — otherwise a filtered `export --agent alice`
+// vault would always compare its alice-only hash against an all-owners rebuild and
+// abort as stale whenever any other owner has memories. omitempty keeps the common
+// all-owners manifest byte-identical to prior builds (no "agent" key emitted).
 type vaultManifest struct {
 	SchemaVersion int    `json:"schema_version"`
 	SnapshotHash  string `json:"snapshot_hash"`
+	Agent         string `json:"agent,omitempty"`
 }
 
 // vaultExportResult is the --json summary of an export run.
@@ -52,6 +58,8 @@ func runMemoryVault(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "export":
 		return runMemoryVaultExport(args[1:], stdout, stderr)
+	case "import":
+		return runMemoryVaultImport(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown memory vault command %q\n\n", args[0])
 		printMemoryVaultUsage(stderr)
@@ -64,6 +72,7 @@ func printMemoryVaultUsage(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot memory vault export [--out DIR] [--agent NAME] [--force] [--json]")
+	fmt.Fprintln(w, "  gitmoot memory vault import <DIR> [--dry-run|--yes] [--json]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "  export  regenerate a deterministic vault (one note per confirmed memory,")
 	fmt.Fprintln(w, "          per-owner index notes, and a manifest). The vault is a DERIVED VIEW:")
@@ -74,6 +83,13 @@ func printMemoryVaultUsage(w io.Writer) {
 	fmt.Fprintln(w, "          export refuses to overwrite a non-empty --out that is not itself a")
 	fmt.Fprintln(w, "          gitmoot vault, so it can never delete your own notes; pass --force to")
 	fmt.Fprintln(w, "          override.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "  import  the human curation gate: diff an edited vault DIR against a FRESH")
+	fmt.Fprintln(w, "          export and apply only on confirmation. Edited notes update the source")
+	fmt.Fprintln(w, "          memory (CAS on updated_at), deleted notes retire their memory, and new")
+	fmt.Fprintln(w, "          .md files stage as pending observations. --dry-run (DEFAULT) prints the")
+	fmt.Fprintln(w, "          diff and writes NOTHING; --yes applies everything in one transaction.")
+	fmt.Fprintln(w, "          Aborts if the store changed since the vault was exported (stale).")
 }
 
 // vaultNote is one rendered memory note held in memory before the atomic commit.
@@ -114,7 +130,7 @@ func runMemoryVaultExport(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
-		if err := commitVault(outDir, notes, indexes, snapshotHash, *force); err != nil {
+		if err := commitVault(outDir, notes, indexes, snapshotHash, *agent, *force); err != nil {
 			return err
 		}
 		result = vaultExportResult{
@@ -250,7 +266,7 @@ func vaultLinksFor(ctx context.Context, store *db.Store, src db.ConfirmedMemory)
 // replace itself moves any prior vault aside, renames the fresh tree into place,
 // then deletes the displaced tree — so an interruption never leaves --out
 // missing entirely (the old vault is restored on a failed rename).
-func commitVault(outDir string, notes []vaultNote, indexes []vaultIndexFile, snapshotHash string, force bool) error {
+func commitVault(outDir string, notes []vaultNote, indexes []vaultIndexFile, snapshotHash, agent string, force bool) error {
 	if !force {
 		ok, err := vaultTargetOverwritable(outDir)
 		if err != nil {
@@ -287,7 +303,7 @@ func commitVault(outDir string, notes []vaultNote, indexes []vaultIndexFile, sna
 			return fmt.Errorf("write index %s: %w", idx.filename, err)
 		}
 	}
-	manifestBytes, err := json.MarshalIndent(vaultManifest{SchemaVersion: vaultSchemaVersion, SnapshotHash: snapshotHash}, "", "  ")
+	manifestBytes, err := json.MarshalIndent(vaultManifest{SchemaVersion: vaultSchemaVersion, SnapshotHash: snapshotHash, Agent: agent}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal manifest: %w", err)
 	}

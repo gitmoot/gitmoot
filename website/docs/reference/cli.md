@@ -1339,6 +1339,7 @@ gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo] [
 gitmoot memory replay [--agent NAME] [--repo owner/repo] [--limit N] [--json]
 gitmoot memory eval --fixtures fixtures.json [--k N] [--json]
 gitmoot memory vault export [--out DIR] [--agent NAME] [--force] [--json]
+gitmoot memory vault import <DIR> [--dry-run|--yes] [--json]
 ```
 
 `memory list` shows confirmed memories and/or pending observations. `memory
@@ -1360,6 +1361,24 @@ single agent owner. Because the export **replaces `--out` wholesale**, it refuse
 overwrite a non-empty directory that is not itself a prior gitmoot vault (one with a
 `manifest.json`), so an accidental `--out ~/my-obsidian-vault` can never delete your
 own notes; pass `--force` to override.
+
+`memory vault import <DIR>` is the **human curation gate**: export a vault, edit it in
+any editor, then `import` **diffs the folder against a fresh export** and applies only
+on confirmation. It regenerates a fresh export first and **aborts as stale** if the
+store moved since the vault was written (manifest `snapshot_hash` mismatch). An
+**edited** note updates its source memory's content via an optimistic **CAS on
+`updated_at`** (exact-row, never key-based; resyncs FTS); a **deleted** note
+**retires** its memory (additive `retired_at`/`retired_reason` + FTS removal — kept
+for audit, never hard-deleted, and excluded from injection and future exports); a
+**new** `.md` file (no `memory_id`) stages a **pending observation**
+(`provenance=vault-import:<file>`, trust `normal`) behind the confirmation gate.
+Frontmatter identity edits (key/scope/owner) are out of scope — detected, warned, and
+skipped. `--dry-run` is the **default** (prints the diff, writes nothing); `--yes`
+applies edits, retirements, and new observations in **one transaction**. If any note
+fails to parse (e.g. broken YAML frontmatter), `--yes` **refuses to apply** so a
+malformed note is never misread as a deletion. A vault produced by `export --agent
+NAME` stays importable even when other owners have memories. The `<DIR>` positional
+may sit before or after the flags.
 
 ## Pipelines
 

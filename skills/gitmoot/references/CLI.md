@@ -1584,6 +1584,7 @@ gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo] [
 gitmoot memory replay [--agent NAME] [--repo owner/repo] [--limit N] [--json]
 gitmoot memory eval --fixtures fixtures.json [--k N] [--json]
 gitmoot memory vault export [--out DIR] [--agent NAME] [--force] [--json]
+gitmoot memory vault import <DIR> [--dry-run|--yes] [--json]
 ```
 
 `memory list` shows confirmed memories and/or pending observations. `memory
@@ -1608,8 +1609,32 @@ evals area). `--agent NAME` narrows the export to one agent owner. Because the
 export **replaces `--out` wholesale**, it refuses to overwrite a non-empty directory
 that is not itself a prior gitmoot vault (one carrying a `manifest.json`) so an
 accidental `--out ~/my-obsidian-vault` can never delete your own notes; pass
-`--force` to override. This is P1 of the two-way memory bridge; `vault import` /
-`memory ingest` land in later phases.
+`--force` to override. This is P1 of the two-way memory bridge.
+
+`memory vault import <DIR>` (#737 P2) is the **human curation gate** as an explicit
+round-trip over the P1 export: you export a vault, edit/delete/add notes in Obsidian
+(or any editor), then `import` **diffs the directory against a fresh export** and
+applies only what you confirm. It first regenerates a fresh export in memory and
+**aborts as stale** if the store changed since the vault was written (the manifest
+`snapshot_hash` no longer matches), so a stale diff can never clobber newer facts.
+Then, per note: an **edited** note updates its source memory's content (an
+optimistic **CAS on `updated_at`** targets the exact row — never key-based — and
+resyncs the FTS index); a **deleted** note **retires** its memory (additive
+`retired_at`/`retired_reason` columns + FTS removal, so it stops being injected and
+stops exporting — the audit row is preserved, never hard-deleted); a **new** `.md`
+file with no `memory_id` stages a **pending observation** (`provenance=vault-import:<file>`,
+trust `normal` — owner-authored) behind the existing confirmation gate. Frontmatter
+identity edits (key/scope/owner) are **out of scope**: they are detected, warned,
+and skipped (only the content edit applies). `--dry-run` is the **default** — it
+prints the full diff and writes **nothing**; `--yes` applies edits, retirements, and
+new observations in **one transaction** (all-or-nothing). If any note fails to parse
+(e.g. broken YAML frontmatter), `--yes` **refuses to apply** — a malformed note could
+otherwise be misread as a deletion and silently retire a live memory; fix the
+frontmatter (or delete the file to intentionally retire it) and re-export. A vault
+produced by `export --agent NAME` stays importable even when other owners have
+memories (import rebuilds the fresh export with the manifest's recorded scope). The
+`<DIR>` positional may appear before or after the flags. `memory ingest` (P3) lands in
+a later phase.
 
 ## Pipelines
 

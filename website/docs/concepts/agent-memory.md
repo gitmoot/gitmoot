@@ -92,6 +92,7 @@ recall/precision@K of retrieval over a labeled fixtures file.
 
 ```sh
 gitmoot memory vault export [--out DIR] [--agent NAME] [--force] [--json]
+gitmoot memory vault import <DIR> [--dry-run|--yes] [--json]
 ```
 
 `memory vault export` renders confirmed memory as an Obsidian-compatible vault:
@@ -104,7 +105,7 @@ so the export never becomes a second store to keep in sync. It is regenerated
 from scratch on every run, is safe to delete, and is fully **deterministic** —
 the same store produces byte-identical files (there is deliberately no
 `exported_at`, and filenames are stable `NNNNNNNNN-<slug>.md` derived from the
-memory id). That determinism is what lets a later `vault import` diff hand-edits
+memory id). That determinism is what lets `vault import` (below) diff hand-edits
 against a fresh export. The export is read-only (zero writes to any table) and
 atomic (it writes a temp directory and renames it over `--out`, which defaults to
 a `vault/` directory under the home's evals area). Since the export **replaces
@@ -112,6 +113,33 @@ a `vault/` directory under the home's evals area). Since the export **replaces
 itself a prior gitmoot vault (one carrying a `manifest.json`), so pointing it at
 an existing Obsidian vault such as `--out ~/my-vault` can never silently delete
 your own notes; pass `--force` to override.
+
+`memory vault import <DIR>` closes the loop as the **human curation gate**: export a
+vault, edit/delete/add notes in any editor, then `import` **diffs the folder against
+a fresh export** and applies only on confirmation. The diff is the audit trail. It
+regenerates a fresh export first and **aborts as stale** if the store moved since the
+vault was written (the manifest `snapshot_hash` mismatches), so a stale edit can
+never clobber newer facts. Then:
+
+- an **edited** note rewrites its source memory's content — an optimistic
+  **compare-and-set on `updated_at`** targets the exact row (never key-based, so it
+  can't clobber a different fact) and resyncs the FTS index;
+- a **deleted** note **retires** its memory: additive `retired_at`/`retired_reason`
+  columns plus FTS removal stop it being injected or exported, while the row is kept
+  for audit (retirement is distinct from `superseded_by` replacement and never
+  hard-deletes);
+- a **new** `.md` file (no `memory_id`) stages a **pending observation**
+  (`provenance=vault-import:<file>`, trust `normal` — it is owner-authored) behind
+  the usual confirmation gate; it is never auto-confirmed.
+
+Frontmatter identity edits (key/scope/owner) are out of scope — detected, warned,
+and skipped (only the content edit lands). `--dry-run` is the **default**: it prints
+the diff and writes nothing. `--yes` applies edits, retirements, and new
+observations in **one transaction** (all-or-nothing). If any note fails to parse
+(e.g. broken YAML frontmatter) `--yes` **refuses to apply** — a malformed note could
+otherwise be misread as a deletion and silently retire a live memory. A vault
+produced by `export --agent NAME` stays importable even when other owners have
+memories, because import rebuilds the fresh export with the manifest's recorded scope.
 
 ## Phases
 

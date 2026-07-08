@@ -8250,4 +8250,16 @@ CREATE TABLE chat_thread_meta (
 	PRIMARY KEY(thread_id, key)
 );
 	`,
+	// #737 P2 `memory vault import` — retirement columns for a confirmed memory
+	// whose note the owner deleted from an exported vault (deletions ⇒ retirements).
+	// Pure additive append: both columns carry a constant '' default, so SQLite
+	// backfills every existing row to non-retired and the read paths that now filter
+	// `retired_at = ''` (vault export lister + the injection query) are byte-identical
+	// on any pre-migration DB. ALTER ADD COLUMN only — no renumber/ALTER of a prior
+	// migration — mirroring the head_sha precedent above. superseded_by stays
+	// RESERVED (still zero writers); retirement is a distinct, additive concept.
+	`
+ALTER TABLE confirmed_memories ADD COLUMN retired_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE confirmed_memories ADD COLUMN retired_reason TEXT NOT NULL DEFAULT '';
+	`,
 }
