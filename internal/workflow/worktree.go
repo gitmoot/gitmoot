@@ -272,6 +272,60 @@ func (e Engine) AllocateDelegationWorktree(ctx context.Context, request Delegati
 	return DelegationWorktreeResult{Path: path, Branch: branch}, nil
 }
 
+// AllocateReadOnlyWorktree is the shared, package-level primitive that creates a
+// detached, branch-lock-free git worktree at the deterministic
+// DelegationWorktreePath(home, repo, pathParent, pathSegment, retryAttempt),
+// holding the checkout mutation lock (a detached `git worktree add` mutates the
+// shared .git) but taking NO branch lock and creating NO branch: a read-only
+// worker owns nothing to merge. The ref defaults to baseBranch, else HEAD (always
+// resolvable), and every failure is returned LOUDLY. It is the single source of
+// truth for both the read-only delegation fan-out
+// (AllocateReadOnlyDelegationWorktree) and the top-level dispatch-time read-only
+// isolation (#739), so the two paths stay behaviorally aligned. It takes an
+// explicit *db.Store rather than an Engine so the cli dispatch layer can call it
+// without an import cycle. The lock key mirrors the delegation path
+// ("worktree:<pathParent>/<pathSegment>") so distinct owners never collide.
+func AllocateReadOnlyWorktree(ctx context.Context, store *db.Store, home string, repo string, checkout string, pathParent string, pathSegment string, retryAttempt int, baseBranch string, manager ReadOnlyWorktreeManager) (string, error) {
+	if store == nil {
+		return "", errors.New("read-only worktree store is required")
+	}
+	if manager == nil {
+		return "", errors.New("read-only worktree manager is required")
+	}
+	if strings.TrimSpace(pathParent) == "" {
+		return "", errors.New("read-only worktree path parent is required")
+	}
+	if strings.TrimSpace(pathSegment) == "" {
+		return "", errors.New("read-only worktree path segment is required")
+	}
+	path, err := DelegationWorktreePath(home, repo, pathParent, pathSegment, retryAttempt)
+	if err != nil {
+		return "", err
+	}
+	ref := strings.TrimSpace(baseBranch)
+	if ref == "" {
+		ref = "HEAD"
+	}
+	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(ctx, store, checkout, "worktree:"+strings.TrimSpace(pathParent)+"/"+strings.TrimSpace(pathSegment), time.Now().UTC())
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if releaseCheckoutLock != nil {
+			_ = releaseCheckoutLock(context.Background())
+		}
+	}()
+	// Ensure the parent chain exists before `git worktree add` (matches the reactive
+	// pool-isolation path); the leaf is created by git itself.
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	if err := manager.AddDetachedWorktree(ctx, path, ref); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
 // AllocateReadOnlyDelegationWorktree creates a detached, branch-lock-free git
 // worktree for a read-only (ask/review) delegation child so it does not
 // serialize with its same-repo siblings on the shared repo checkout key. It
@@ -279,7 +333,9 @@ func (e Engine) AllocateDelegationWorktree(ctx context.Context, request Delegati
 // (a detached `git worktree add` mutates the shared .git) but takes no branch
 // lock and creates no branch: a read-only child owns nothing to merge. The
 // worktree is disposed by cleanupReadOnlyDelegationWorktree once the child job
-// reaches a terminal state.
+// reaches a terminal state. It is a thin Engine wrapper over the shared
+// AllocateReadOnlyWorktree primitive: the delegation-specific validation (a
+// present parent+delegation id) is kept here so its error messages are unchanged.
 func (e Engine) AllocateReadOnlyDelegationWorktree(ctx context.Context, request DelegationWorktreeRequest, manager ReadOnlyWorktreeManager) (string, error) {
 	if err := e.validate(); err != nil {
 		return "", err
@@ -293,27 +349,7 @@ func (e Engine) AllocateReadOnlyDelegationWorktree(ctx context.Context, request 
 	if strings.TrimSpace(request.DelegationID) == "" {
 		return "", errors.New("delegation worktree delegation id is required")
 	}
-	path, err := DelegationWorktreePath(request.Home, request.Repo, request.ParentJobID, request.DelegationID, request.RetryAttempt)
-	if err != nil {
-		return "", err
-	}
-	ref := strings.TrimSpace(request.BaseBranch)
-	if ref == "" {
-		ref = "HEAD"
-	}
-	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(ctx, e.Store, request.Checkout, "worktree:"+request.ParentJobID+"/"+request.DelegationID, time.Now().UTC())
-	if err != nil {
-		return "", err
-	}
-	defer func() {
-		if releaseCheckoutLock != nil {
-			_ = releaseCheckoutLock(context.Background())
-		}
-	}()
-	if err := manager.AddDetachedWorktree(ctx, path, ref); err != nil {
-		return "", err
-	}
-	return path, nil
+	return AllocateReadOnlyWorktree(ctx, e.Store, request.Home, request.Repo, request.Checkout, request.ParentJobID, request.DelegationID, request.RetryAttempt, request.BaseBranch, manager)
 }
 
 // AllocateIntegrationWorktree creates a detached worktree off the parent base

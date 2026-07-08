@@ -183,8 +183,31 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		}
 		recipeTemplate = &tmpl
 	}
+	// #739: give a BACKGROUND read-only (ask) job its own detached committed-tip
+	// worktree BEFORE enqueue — the proven read-only delegation fan-out shape — so
+	// its checkout key is worktree:<path> (queuedJobCheckoutKey) and same-repo
+	// seats (moot, chat-task, autorespond, `agent ask --background`) run
+	// concurrently instead of serializing on the shared repo:<repo> key. Foreground
+	// asks run inline and never serialize, so they are left untouched. Review is
+	// excluded because it already carries a per-PR task worktree (TaskID set) that
+	// keys it off its own worktree. FAIL-OPEN: on any allocation failure the job is
+	// enqueued unchanged (shared checkout, serialized) with a loud skip event —
+	// dispatch never fails for a lost-parallelism optimization.
+	jobID := localAgentJobID(request.Action, agent.Name)
+	readOnlyWorktreePath, readOnlyWorktreeErr := maybeAllocateDispatchReadOnlyWorktree(ctx, store, request, repo.FullName(), record.CheckoutPath, jobID)
+	if readOnlyWorktreePath != "" {
+		// The detached worktree is the committed tip of the checkout HEAD, which may
+		// have advanced past any inherited HeadSHA. Clear it so the job validates
+		// against its own fresh worktree HEAD (matching the delegation path). The
+		// worktree omits gitignored (repos/**) and uncommitted working-tree files, so
+		// point the job at the canonical base checkout for those (#654).
+		request.HeadSHA = ""
+		if note := workflow.ReadOnlyWorktreeContextNote(record.CheckoutPath); note != "" {
+			request.Instructions += note
+		}
+	}
 	job, err := (workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(request.Home)}).Enqueue(ctx, workflow.JobRequest{
-		ID:                     localAgentJobID(request.Action, agent.Name),
+		ID:                     jobID,
 		Agent:                  agent.Name,
 		Action:                 request.Action,
 		Repo:                   repo.FullName(),
@@ -208,6 +231,8 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		ThreadID:               request.ThreadID,
 		ChatMessageID:          request.ChatMessageID,
 		MootSeat:               request.MootSeat,
+		WorktreePath:           readOnlyWorktreePath,
+		ReadOnlyWorktree:       readOnlyWorktreePath != "",
 	})
 	if err != nil {
 		return localAgentJobOutput{}, err
@@ -217,6 +242,14 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "route_selected", Message: routeSelectedMessage(request)}); err != nil {
 		return localAgentJobOutput{}, err
+	}
+	// Emit the #739 read-only isolation outcome now that the job row exists (job
+	// events carry a JobID FK). Allocated → observable worktree:<path> key; a
+	// fail-open skip → loud event so a lost-parallelism serialize is never silent.
+	if readOnlyWorktreePath != "" {
+		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "readonly_worktree_allocated", Message: fmt.Sprintf("read-only worktree %s allocated at dispatch (#739); job keyed worktree:<path> to run beside same-repo seats", readOnlyWorktreePath)})
+	} else if readOnlyWorktreeErr != nil {
+		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "readonly_worktree_skipped", Message: fmt.Sprintf("read-only worktree isolation skipped (#739); job runs serialized in the shared checkout: %v", readOnlyWorktreeErr)})
 	}
 	if overrideRuntime == "" {
 		effectiveAgent = scopeRegisteredFreshRefForJob(effectiveAgent, job.ID)
@@ -1096,6 +1129,53 @@ func ensureLocalAgentAccess(ctx context.Context, store *db.Store, agent db.Agent
 
 func localAgentJobID(action string, agent string) string {
 	return fmt.Sprintf("local-%s-%s-%x", action, agent, time.Now().UTC().UnixNano())
+}
+
+// dispatchReadOnlyWorktreeEligible reports whether a dispatch should allocate a
+// dedicated detached committed-tip worktree for read-only isolation (#739). It is
+// true ONLY for a BACKGROUND read-only (ask/review) job that does not already
+// carry a task worktree: a foreground ask runs inline and never serializes, and a
+// job with a TaskID (every `agent review`, which prepares a per-PR worktree
+// upstream) is already keyed off its own worktree. Mirrors poolIsolationEligible.
+func dispatchReadOnlyWorktreeEligible(request localAgentDispatchRequest) bool {
+	if !request.Background {
+		return false
+	}
+	switch strings.TrimSpace(request.Action) {
+	case "ask", "review":
+	default:
+		return false
+	}
+	return strings.TrimSpace(request.TaskID) == ""
+}
+
+// maybeAllocateDispatchReadOnlyWorktree allocates a throwaway detached
+// committed-tip worktree for an eligible background read-only job so it is born
+// with a distinct worktree:<path> checkout key (#739). It resolves the ref to the
+// checkout HEAD (always resolvable — the researchers' diagnostic showed the
+// stale-branch ref is a red herring; the real trigger was the reactive path being
+// headroom-gated and silent) via the shared workflow.AllocateReadOnlyWorktree
+// primitive, holding the checkout mutation lock. It is FAIL-OPEN: it returns
+// ("", nil) when the job is ineligible or the checkout is unknown, and ("", err)
+// on a genuine allocation failure so the caller enqueues unchanged and emits a
+// loud skip event. The manager is the checkout-bound gitutil.Client, exactly as
+// the reactive pool-isolation path builds it.
+func maybeAllocateDispatchReadOnlyWorktree(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string, checkout string, jobID string) (string, error) {
+	if !dispatchReadOnlyWorktreeEligible(request) {
+		return "", nil
+	}
+	if strings.TrimSpace(checkout) == "" {
+		return "", nil
+	}
+	paths, err := pathsFromFlag(request.Home)
+	if err != nil {
+		return "", err
+	}
+	// Ref defaults to HEAD (baseBranch left empty): a committed-tip worktree that is
+	// always resolvable, avoiding the stale current-branch fragility the researchers
+	// flagged. The #654 context note points the job at the canonical checkout for
+	// uncommitted/gitignored paths.
+	return workflow.AllocateReadOnlyWorktree(ctx, store, paths.Home, repo, checkout, jobID, "readonly-seat", 0, "", gitutil.Client{Dir: checkout})
 }
 
 func printLocalAgentJobOutput(stdout io.Writer, output localAgentJobOutput) {
