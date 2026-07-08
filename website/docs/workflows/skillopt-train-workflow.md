@@ -1051,7 +1051,6 @@ its output never enters any training or review pool automatically.
 gitmoot skillopt synth \
   --template planner \
   --repo owner/repo \
-  --weak planner-default \
   --strong planner-deep \
   --judge cross-family-judge \
   --max-items 3 \
@@ -1060,13 +1059,27 @@ gitmoot skillopt synth \
   --out .gitmoot/skillopt/synth
 ```
 
+`--strong` is required; **`--weak` is optional**. When you omit `--weak` (as
+above) it **defaults to the target template's current champion version** (#741):
+the weak attempt runs as an ephemeral agent pinned to exactly that version, with
+the champion's own template instructions injected as its role frame (reusing the
+same template-content seam ephemeral/temp workers use). This is the point of the
+default — because the incumbent champion is the weak side, an accepted item (weak
+struggles, strong solves) is by construction a **documented champion weakness**,
+so the derived feedback targets the champion's own failures rather than, e.g., a
+cross-family weak agent's, which is exactly the non-redundant signal the
+optimizer needs to clear its anti-regression gate. The default weak runtime is
+the template's first declared `runtime_compatibility` entry (falling back to
+`codex`). Pass `--weak <agent>` to keep the explicit-agent behavior unchanged.
+
 For each item slot (up to `--max-items`, default 3) the command runs a bounded
 loop through the same runtime-adapter invocation path the manual A/B command
 uses:
 
 1. A **Challenger** (`--challenger`, default the strong agent) writes a
    `{context, question, rubric}` triple designed to be hard for a weaker agent.
-2. The `--weak` and `--strong` agents each attempt the item.
+2. The weak (the champion by default) and `--strong` agents each attempt the
+   item.
 3. The `--judge` (default the strong agent) scores both answers against the
    rubric and reports whether the item is well-formed.
 

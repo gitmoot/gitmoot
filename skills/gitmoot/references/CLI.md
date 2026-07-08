@@ -1179,7 +1179,7 @@ gitmoot skillopt gate history --candidate <version-id> [--json]
 gitmoot skillopt binary run --set <file> --run <run-id> --source <file> [--deterministic] [--reviewer runtime] [--home path] [--json]
 gitmoot skillopt binary show --run <run-id> [--home path] [--json]
 gitmoot skillopt binary lessons --template <id> [--set <file>] [--run <run-id> ...] [--no-passes] [--apply] [--home path] [--json]
-gitmoot skillopt synth --template <id> --repo owner/repo --weak <agent> --strong <agent> [--judge <agent>] [--challenger <agent>] [--max-items N] [--max-rounds-per-item M] [--gap F] [--out dir] [--json]
+gitmoot skillopt synth --template <id> --repo owner/repo --strong <agent> [--weak <agent>] [--judge <agent>] [--challenger <agent>] [--max-items N] [--max-rounds-per-item M] [--gap F] [--out dir] [--json]
 gitmoot skillopt synth list [--status pending_human_approval|approved|rejected] [--json]
 gitmoot skillopt synth approve <item-id>
 gitmoot skillopt synth reject <item-id>
@@ -1373,13 +1373,24 @@ the pairwise-preference feedback events — the import path for Mode B's
 paired-review evidence. The daemon can also import review-issue feedback
 automatically when started with `--watch-skillopt-reviews`.
 
-`skillopt synth --template <id> --repo owner/repo --weak <agent> --strong
-<agent>` is the off-by-default, **explicit opt-in** Autodata-style synthetic
-review-item generator (`#535`). There is NO daemon/auto integration — nothing
-runs it but you. For each of up to `--max-items` (default 3) items it runs a
-loop through the SAME runtime-adapter path the A/B path uses: a **Challenger**
-(the `--challenger` agent, default the strong agent) writes a `{context,
-question, rubric}`; the `--weak` and `--strong` agents each attempt it; a
+`skillopt synth --template <id> --repo owner/repo --strong <agent>` is the
+off-by-default, **explicit opt-in** Autodata-style synthetic review-item
+generator (`#535`). There is NO daemon/auto integration — nothing runs it but
+you. `--strong` is required; **`--weak` is optional** and defaults to the target
+template's **current champion version** (`#741`): omit it and the weak attempt
+runs as an ephemeral agent pinned to exactly that version, delivered with the
+champion's own template instructions injected as its role frame (the same
+template-content seam temp/ephemeral workers use). The point is that an accepted
+item — weak struggles, strong solves — is then by construction a documented
+**champion weakness**: the loop targets the champion's own failures rather than,
+say, a cross-family weak agent's, which is what the optimizer needs to clear its
+anti-regression gate. The default weak runtime is the template's first declared
+`runtime_compatibility` entry (falling back to `codex`). Pass `--weak <agent>`
+to keep the explicit-agent behavior unchanged. For each of up to `--max-items`
+(default 3) items it runs a loop through the SAME runtime-adapter path the A/B
+path uses: a **Challenger** (the `--challenger` agent, default the strong agent)
+writes a `{context, question, rubric}`; the weak (champion by default) and
+`--strong` agents each attempt it; a
 `--judge` (default the strong agent) scores both answers against the rubric and
 flags well-formedness. An item is **accepted** only when the strong agent
 meaningfully beats the weak agent (score gap ≥ `--gap`, default 0.20) AND the

@@ -242,8 +242,10 @@ deterministic tool that induces a criterion-separated rubric from captured
 trait feedback, meta-evaluates it for coverage/redundancy, and writes a frozen
 JSON for human review; it never auto-injects. To generate Autodata-style
 synthetic review items, use the explicit, off-by-default `gitmoot skillopt synth
---template <id> --repo owner/repo --weak <agent> --strong <agent> [--judge
-<agent>]`: it keeps only items a strong agent beats a weak agent on and a judge
+--template <id> --repo owner/repo --strong <agent> [--weak <agent>] [--judge
+<agent>]`: `--weak` is optional and defaults to the template's current champion
+version (#741), so accepted items are by construction champion weaknesses. It
+keeps only items a strong agent beats the weak agent on and a judge
 deems well-formed, stores them `pending_human_approval`, and requires
 `gitmoot skillopt synth approve <item-id>` before an item may be used — nothing
 runs it automatically.
