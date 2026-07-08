@@ -13,6 +13,10 @@ import (
 const (
 	DefaultMemoryTokenBudget = 1500
 	DefaultMemoryMaxEntries  = 15
+	// DefaultMemoryDistillMaxPerJob caps how many pending observations the
+	// deterministic distill-at-terminal producers (#737 P4.1) may stage per job.
+	// It is only consulted when distill_at_terminal is enabled.
+	DefaultMemoryDistillMaxPerJob = 3
 )
 
 // MemorySettings is the resolved, off-by-default global knob set for agent
@@ -33,14 +37,35 @@ type MemorySettings struct {
 	TokenBudget int
 	// MaxEntries caps how many confirmed memories are considered for injection.
 	MaxEntries int
+	// DistillAtTerminal is the master switch for the deterministic
+	// distill-at-terminal WRITE producers (#737 P4.1). Default false: with it off
+	// the terminal path is byte-identical (no observation rows staged from job
+	// outcomes). When true, at each terminal Gitmoot stages a bounded number of
+	// PENDING observations (trust_mark=low, provenance "distill:<job-id>") derived
+	// deterministically from the result — never confirmed memory (the owner's
+	// `memory confirm` gate stays the only promotion path).
+	DistillAtTerminal bool
+	// DistillMaxPerJob is the hard per-job cap on distill writes (default 3). Only
+	// consulted when DistillAtTerminal is true; a value <= 0 falls back to the
+	// default so the producers can never write an unbounded number of rows.
+	DistillMaxPerJob int
+	// DistillAllJobs widens distill to EVERY job, not only memory-enrolled agents.
+	// Default false: distill (like the rest of memory) runs only for agents with
+	// [agents.<name>].memory = true. When true it also runs for un-enrolled agents
+	// — useful to harvest failure signal box-wide — while the READ/injection and
+	// the confirmed mechanical producers stay enrolled-only.
+	DistillAllJobs bool
 }
 
 // DefaultMemorySettings returns the off-by-default resolved settings.
 func DefaultMemorySettings() MemorySettings {
 	return MemorySettings{
-		Disabled:    false,
-		TokenBudget: DefaultMemoryTokenBudget,
-		MaxEntries:  DefaultMemoryMaxEntries,
+		Disabled:          false,
+		TokenBudget:       DefaultMemoryTokenBudget,
+		MaxEntries:        DefaultMemoryMaxEntries,
+		DistillAtTerminal: false,
+		DistillMaxPerJob:  DefaultMemoryDistillMaxPerJob,
+		DistillAllJobs:    false,
 	}
 }
 
@@ -94,6 +119,24 @@ func LoadMemorySettings(paths Paths) (MemorySettings, error) {
 				return MemorySettings{}, fmt.Errorf("parse [memory].max_entries: %w", err)
 			}
 			settings.MaxEntries = parsed
+		case "distill_at_terminal":
+			parsed, err := parseConfigBool(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].distill_at_terminal: %w", err)
+			}
+			settings.DistillAtTerminal = parsed
+		case "distill_max_per_job":
+			parsed, err := strconv.Atoi(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].distill_max_per_job: %w", err)
+			}
+			settings.DistillMaxPerJob = parsed
+		case "distill_all_jobs":
+			parsed, err := parseConfigBool(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].distill_all_jobs: %w", err)
+			}
+			settings.DistillAllJobs = parsed
 		}
 	}
 	if err := validateMemorySettings(settings); err != nil {
@@ -108,6 +151,9 @@ func validateMemorySettings(s MemorySettings) error {
 	}
 	if s.MaxEntries < 0 {
 		return fmt.Errorf("memory.max_entries must be >= 0, got %d", s.MaxEntries)
+	}
+	if s.DistillMaxPerJob < 0 {
+		return fmt.Errorf("memory.distill_max_per_job must be >= 0, got %d", s.DistillMaxPerJob)
 	}
 	return nil
 }

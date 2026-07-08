@@ -42,6 +42,16 @@ type MemoryController struct {
 	TokenBudget int
 	// MaxEntries caps how many confirmed rows are considered for injection.
 	MaxEntries int
+	// DistillAtTerminal enables the deterministic distill-at-terminal WRITE
+	// producers (#737 P4.1). Default false: with it off, record() runs exactly the
+	// Phase-1 write path and the terminal is byte-identical (no distilled rows).
+	DistillAtTerminal bool
+	// DistillMaxPerJob is the hard per-job cap on distill writes; <= 0 falls back
+	// to config.DefaultMemoryDistillMaxPerJob so the producers are always bounded.
+	DistillMaxPerJob int
+	// DistillAllJobs widens distill past the memory-enrolled set to every job. When
+	// false (default) distill runs only for enrolled agents, via enabledFor.
+	DistillAllJobs bool
 }
 
 // enabledFor reports whether memory is active for the given executor agent.
@@ -50,6 +60,22 @@ func (c *MemoryController) enabledFor(agentName string) bool {
 		return false
 	}
 	return c.Enabled(agentName)
+}
+
+// distillEnabledFor reports whether the deterministic distill-at-terminal WRITE
+// producers (#737 P4.1) are active for the given executor agent. It is a SEPARATE
+// gate from enabledFor: distill runs only when the master switch DistillAtTerminal
+// is set, and — unlike the read path and the confirmed mechanical producers — it
+// can run for UN-enrolled agents when DistillAllJobs is set (box-wide failure
+// harvesting). When DistillAllJobs is false it falls back to the enrolled set.
+func (c *MemoryController) distillEnabledFor(agentName string) bool {
+	if c == nil || c.Store == nil || !c.DistillAtTerminal {
+		return false
+	}
+	if c.DistillAllJobs {
+		return true
+	}
+	return c.enabledFor(agentName)
 }
 
 // ownerForJob derives the structured memory owner for a job's executor. Phase 1
@@ -131,17 +157,35 @@ func (c *MemoryController) PreviewBlock(ctx context.Context, agentName, repo, in
 	return rendered, n, memory.EstimateTokens(rendered)
 }
 
-// record is the Phase-1 WRITE path, run at job terminal. It (a) SHADOW-logs the
-// agent's returned learnings to memory_observations after the deterministic
-// pre-filters, and (b) writes any gitmoot-authored mechanical facts to
-// confirmed_memories (the ONLY Phase-1 confirmed producers — deterministic, no
-// LLM). It takes the job action so the mechanical producers can key facts by
+// record is the WRITE path, run at job terminal. The ENROLLED-ONLY Phase-1 body
+// (recordEnrolled) (a) SHADOW-logs the agent's returned learnings to
+// memory_observations after the deterministic pre-filters, and (b) writes any
+// gitmoot-authored mechanical facts to confirmed_memories (the ONLY confirmed
+// producers — deterministic, no LLM). On top of that, (c) the #737 P4.1
+// distill-at-terminal producer stages deterministic PENDING observations behind
+// its own config gate. It takes the job action so the producers can key facts by
 // (action, outcome). Every write is best-effort: a failure is swallowed so
 // memory can never fail an otherwise-successful job.
 func (c *MemoryController) record(ctx context.Context, jobID string, agent runtime.Agent, action string, payload JobPayload, result AgentResult) {
-	if !c.enabledFor(agent.Name) {
-		return
+	// The Phase-1 write path (learnings shadow-log + confirmed mechanical facts)
+	// is ENROLLED-ONLY and unchanged. When the agent is not enrolled this whole
+	// block is skipped exactly as the prior early-return did, so with distill off
+	// (the default) the terminal path is byte-identical.
+	if c.enabledFor(agent.Name) {
+		c.recordEnrolled(ctx, jobID, agent, action, payload, result)
 	}
+	// (c) #737 P4.1 distill-at-terminal — a SEPARATE, config-gated producer that
+	// stages PENDING observations only. It has its own gate (distillEnabledFor),
+	// so it is a no-op unless DistillAtTerminal is set, and it can run for
+	// un-enrolled agents when DistillAllJobs is set. Fail-safe: any error inside is
+	// swallowed and can never affect the job outcome.
+	c.distillAtTerminal(ctx, jobID, agent, action, payload, result)
+}
+
+// recordEnrolled is the Phase-1 ENROLLED-ONLY write path: shadow-log the agent's
+// returned learnings and write gitmoot-authored mechanical confirmed facts. It is
+// exactly the body record() ran before #737 P4.1 split out the distill producer.
+func (c *MemoryController) recordEnrolled(ctx context.Context, jobID string, agent runtime.Agent, action string, payload JobPayload, result AgentResult) {
 	owner := ownerForJob(agent, payload)
 
 	// (a) Shadow-log agent-returned learnings — observations ONLY, with the

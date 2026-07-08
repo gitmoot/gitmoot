@@ -1330,7 +1330,9 @@ validation for final promotion decisions on fresh items.
 
 Agent persistent memory is **off by default** and enrolled per agent
 (`[agents.<name>].memory = true`), with optional `[memory]` knobs (`disabled`,
-`token_budget`, `max_entries`). See
+`token_budget`, `max_entries`, and the distill-at-terminal knobs
+`distill_at_terminal`, `distill_max_per_job`, `distill_all_jobs` — all read per
+tick, no restart). See
 [Agent Persistent Memory](../concepts/agent-memory.md) for the full model. The
 inspection commands are read-only; `ingest` and `confirm` write behind a human
 gate:
