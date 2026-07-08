@@ -246,6 +246,34 @@ func TestGroomAlreadyRetiredIdsSkipped(t *testing.T) {
 	}
 }
 
+func TestGroomProposeDoesNotRetireCrossScopeDuplicates(t *testing.T) {
+	home, store := memoryTestHome(t)
+	const body = "identical duplicate content body about arm64 retries"
+	alice := db.MemoryOwner{Kind: "agent", Ref: "alice"}
+	bob := db.MemoryOwner{Kind: "agent", Ref: "bob"}
+	// Same content, different owners AND different repos: each copy is the only one
+	// visible in its own retrieval scope, so neither may be proposed for retirement.
+	seedConfirmed(t, store, alice, "acme/widget", "repo", "a", body)
+	seedConfirmed(t, store, bob, "acme/gadget", "repo", "b", body)
+
+	planPath := filepath.Join(t.TempDir(), "plan.json")
+	if code, _, stderr := runGroom(t, "--home", home, "--propose", "--out", planPath); code != 0 {
+		t.Fatalf("propose exit %d: %s", code, stderr)
+	}
+	plan, err := readGroomPlan(planPath)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	for _, r := range plan.ProposedRetirements {
+		if r.Reason == memory.GroomReasonDuplicate {
+			t.Fatalf("cross-scope duplicate wrongly proposed for retirement: %+v", r)
+		}
+	}
+	if plan.Stats.ByReason[memory.GroomReasonDuplicate] != 0 {
+		t.Fatalf("duplicate proposals across scopes: %+v", plan.Stats.ByReason)
+	}
+}
+
 func TestGroomProposeEmptyStore(t *testing.T) {
 	home, _ := memoryTestHome(t)
 	planPath := filepath.Join(t.TempDir(), "plan.json")

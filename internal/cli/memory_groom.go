@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/memory"
@@ -38,6 +39,9 @@ type groomPlanRetirement struct {
 	Key       string `json:"key"`
 	Reason    string `json:"reason"`
 	FirstLine string `json:"first_line"`
+	Owner     string `json:"owner,omitempty"`
+	Repo      string `json:"repo,omitempty"`
+	Scope     string `json:"scope,omitempty"`
 }
 
 // groomPlanRewriteFlag flags an over-long memory for a later rewrite pass (P4.2
@@ -117,9 +121,14 @@ func runMemoryGroomPropose(home, out string, jsonOut bool, stdout, stderr io.Wri
 		cands := make([]memory.GroomCandidate, 0, len(notes))
 		for _, n := range notes {
 			cands = append(cands, memory.GroomCandidate{
-				ID:      n.memRecord.ID,
-				Key:     n.memRecord.Key,
-				Content: n.memRecord.Content,
+				ID:           n.memRecord.ID,
+				Key:          n.memRecord.Key,
+				Content:      n.memRecord.Content,
+				OwnerKind:    n.memRecord.OwnerKind,
+				OwnerRef:     n.memRecord.OwnerRef,
+				OwnerVersion: n.memRecord.OwnerVersion,
+				Repo:         n.memRecord.Repo,
+				Scope:        n.memRecord.Scope,
 			})
 		}
 		proposal := memory.DetectGroomActions(cands)
@@ -133,6 +142,7 @@ func runMemoryGroomPropose(home, out string, jsonOut bool, stdout, stderr io.Wri
 		for _, r := range proposal.Retirements {
 			plan.ProposedRetirements = append(plan.ProposedRetirements, groomPlanRetirement{
 				ID: r.ID, Key: r.Key, Reason: r.Reason, FirstLine: r.FirstLine,
+				Owner: r.Owner, Repo: r.Repo, Scope: r.Scope,
 			})
 		}
 		for _, f := range proposal.RewriteFlags {
@@ -260,6 +270,27 @@ func readGroomPlan(path string) (groomPlan, error) {
 	return plan, nil
 }
 
+// groomScopeLabel renders a retirement's owner/repo/scope as a compact,
+// trailing-space-terminated prefix (e.g. "agent:lead repo:acme/widget ") so the
+// owner can tell a same-scope duplicate from a cross-scope keeper at a glance.
+// Returns "" when no scope fields are present (older plans), keeping output tidy.
+func groomScopeLabel(r groomPlanRetirement) string {
+	parts := make([]string, 0, 3)
+	if r.Owner != "" {
+		parts = append(parts, r.Owner)
+	}
+	switch {
+	case r.Repo != "":
+		parts = append(parts, "repo:"+r.Repo)
+	case r.Scope != "":
+		parts = append(parts, r.Scope)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, " ") + " "
+}
+
 func printGroomProposal(w io.Writer, plan groomPlan, outPath string) {
 	fmt.Fprintf(w, "groom proposal (snapshot %s)\n", plan.SnapshotHash)
 	fmt.Fprintf(w, "  %d of %d memory(ies) proposed for retirement; %d flagged for rewrite\n",
@@ -279,7 +310,7 @@ func printGroomProposal(w io.Writer, plan groomPlan, outPath string) {
 	if len(plan.ProposedRetirements) > 0 {
 		fmt.Fprintln(w, "\nProposed retirements:")
 		for _, r := range plan.ProposedRetirements {
-			fmt.Fprintf(w, "  - memory %d [%s] (%s) %s\n", r.ID, r.Key, r.Reason, r.FirstLine)
+			fmt.Fprintf(w, "  - memory %d [%s] (%s) %s%s\n", r.ID, r.Key, r.Reason, groomScopeLabel(r), r.FirstLine)
 		}
 	}
 	if len(plan.RewriteFlags) > 0 {

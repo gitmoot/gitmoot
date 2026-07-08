@@ -203,9 +203,12 @@ touches nothing in the store. The detectors flag:
 
 - **status/changelog/ToC snapshots** — notes dominated by `STATUS:` markers,
   `SHIPPED`/`merged & deployed` phrases, ISO-date-led lines, or Markdown link-list
-  index entries;
+  index entries (short notes under 3 lines also need a strong `STATUS:`/`… & deployed`
+  marker, so a lone date-led or `SHIPPED`-mentioning keeper is not retired);
 - **bare to-do lists** — content whose every non-blank line is a checkbox item;
-- **exact duplicates** — the lowest id is kept and the rest proposed for retirement;
+- **exact duplicates** — identical content **within the same owner/repo/scope**; the
+  lowest id is kept and the rest proposed. Copies across owners/repos/scopes are kept
+  (each is the only one its scope can see);
 - **over-long "bricks"** (> ~1200 chars) are **flagged for rewrite, not retired** —
   P4.2 only lists them for the owner (LLM rewriting is the follow-up P4.3).
 

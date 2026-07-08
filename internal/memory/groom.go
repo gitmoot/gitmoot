@@ -43,19 +43,32 @@ const groomFirstLineMax = 160
 
 // GroomCandidate is the DB-free projection of one active confirmed memory the
 // detectors consider. It mirrors the fields the vault snapshot already exposes.
+// Owner/Repo/Scope are carried so exact-duplicate detection can be scoped to the
+// SAME retrieval scope: two byte-identical facts held by different owners, repos,
+// or scopes surface in DIFFERENT prompt-assembly scopes, so they are not true
+// duplicates and retiring one would silently drop the fact from that scope.
 type GroomCandidate struct {
-	ID      int64
-	Key     string
-	Content string
+	ID           int64
+	Key          string
+	Content      string
+	OwnerKind    string
+	OwnerRef     string
+	OwnerVersion string
+	Repo         string // "" == general scope
+	Scope        string
 }
 
 // GroomRetirement is one proposed retirement: the memory id, its key, the detector
-// that flagged it, and a first-line preview so the owner can eyeball the plan.
+// that flagged it, a first-line preview, and the owner/repo/scope so the owner can
+// eyeball the plan and tell a same-scope duplicate from a (kept) cross-scope one.
 type GroomRetirement struct {
 	ID        int64
 	Key       string
 	Reason    string
 	FirstLine string
+	Owner     string // "kind:ref@version" label
+	Repo      string
+	Scope     string
 }
 
 // GroomRewriteFlag flags an over-long memory for owner review. P4.2 does not
@@ -103,25 +116,30 @@ func DetectGroomActions(cands []GroomCandidate) GroomProposal {
 			Key:       c.Key,
 			Reason:    reason,
 			FirstLine: groomFirstLine(c.Content),
+			Owner:     groomOwnerLabel(c),
+			Repo:      c.Repo,
+			Scope:     c.Scope,
 		})
 	}
 
-	// (d) Exact-duplicate content: group by sha256(content), keep the lowest id in
-	// each group, propose retiring the rest. sorted is id-ascending so group[0] is
-	// always the lowest id; hashOrder preserves first-seen order for deterministic
-	// output.
-	byHash := make(map[string][]GroomCandidate, len(sorted))
-	var hashOrder []string
+	// (d) Exact-duplicate content: group by (owner tuple, repo, scope, sha256(content)),
+	// keep the lowest id in each group, propose retiring the rest. Scoping the group
+	// key to the retrieval scope (owner/repo/scope) — not content alone — means a fact
+	// duplicated across owners or repos is NOT deduped: each copy is the only one
+	// visible in its own prompt-assembly scope, so retiring it would silently lose the
+	// fact there. sorted is id-ascending so group[0] is always the lowest id; keyOrder
+	// preserves first-seen order for deterministic output.
+	byKey := make(map[string][]GroomCandidate, len(sorted))
+	var keyOrder []string
 	for _, c := range sorted {
-		sum := sha256.Sum256([]byte(c.Content))
-		h := hex.EncodeToString(sum[:])
-		if _, seen := byHash[h]; !seen {
-			hashOrder = append(hashOrder, h)
+		k := groomDedupKey(c)
+		if _, seen := byKey[k]; !seen {
+			keyOrder = append(keyOrder, k)
 		}
-		byHash[h] = append(byHash[h], c)
+		byKey[k] = append(byKey[k], c)
 	}
-	for _, h := range hashOrder {
-		group := byHash[h]
+	for _, k := range keyOrder {
+		group := byKey[k]
 		if len(group) < 2 {
 			continue
 		}
@@ -170,6 +188,29 @@ func DetectGroomActions(cands []GroomCandidate) GroomProposal {
 	}
 }
 
+// groomOwnerLabel renders a candidate's owner as a stable "kind:ref@version" label
+// (version omitted when empty) for the plan's human-readable output.
+func groomOwnerLabel(c GroomCandidate) string {
+	label := c.OwnerKind + ":" + c.OwnerRef
+	if c.OwnerVersion != "" {
+		label += "@" + c.OwnerVersion
+	}
+	return label
+}
+
+// groomDedupKey is the exact-duplicate grouping key: the owner tuple, repo, and
+// scope joined with a NUL delimiter (never present in any component) followed by the
+// content hash. Two candidates share a key only when they are TRUE duplicates —
+// identical content held by the same owner in the same repo and scope — so a fact
+// duplicated across retrieval scopes is never proposed for retirement.
+func groomDedupKey(c GroomCandidate) string {
+	sum := sha256.Sum256([]byte(c.Content))
+	return strings.Join([]string{
+		c.OwnerKind, c.OwnerRef, c.OwnerVersion, c.Repo, c.Scope,
+		hex.EncodeToString(sum[:]),
+	}, "\x00")
+}
+
 // groomFirstLine returns the first non-blank line of content, trimmed and capped,
 // for the plan's human-readable preview.
 func groomFirstLine(content string) string {
@@ -203,6 +244,32 @@ var groomDateLed = regexp.MustCompile(`^[-*]?\s*\[?\d{4}-\d{2}-\d{2}`)
 // isTaskLine reports whether a single line is a Markdown checkbox item.
 func isTaskLine(line string) bool {
 	return groomTaskLine.MatchString(strings.TrimSpace(line))
+}
+
+// isStrongStatusLine reports whether a single line is an UNAMBIGUOUS status-snapshot
+// marker on its own: an explicit "STATUS:" header or a "…& deployed" changelog
+// phrase. These name a status note even as a lone line. The WEAK markers a
+// status/changelog line can also carry — a leading ISO date, a stray "SHIPPED"
+// mention, or a bracketed-ref/ToC list item — are common in substantive one-line
+// keepers, so they only indicate a changelog when they DOMINATE a multi-line note
+// (see detectStatusChangelog's minimum-line guard).
+func isStrongStatusLine(line string) bool {
+	t := strings.TrimSpace(line)
+	if t == "" {
+		return false
+	}
+	upper := strings.ToUpper(t)
+	lower := strings.ToLower(t)
+	switch {
+	case strings.HasPrefix(upper, "STATUS:"):
+		return true
+	case strings.Contains(lower, "merged & deployed"),
+		strings.Contains(lower, "merged and deployed"),
+		strings.Contains(lower, "shipped & deployed"),
+		strings.Contains(lower, "shipped and deployed"):
+		return true
+	}
+	return false
 }
 
 // isStatusChangelogLine reports whether a single line looks like a status,
@@ -272,19 +339,41 @@ func detectTaskListOnly(content string) bool {
 // ARE a changelog/index get flagged.
 const groomStatusDominance = 0.8
 
+// groomStatusMinLines is the minimum non-blank line count at which the WEAK
+// changelog markers (a leading ISO date, a stray "SHIPPED", a bracketed-ref/ToC
+// list item) are trusted to prove a note IS a changelog/index. Below it, only a
+// STRONG marker (an explicit "STATUS:" header or a "…& deployed" phrase) retires,
+// so a lone high-value fact that merely leads with a date or mentions SHIPPED — the
+// RFC's #1 use case: the lead's date-led one-line ingested notes — is kept, not
+// retired. The dominance guard alone is vacuous at n=1 (a single matching line is
+// trivially 100% of the note).
+const groomStatusMinLines = 3
+
 // detectStatusChangelog reports whether content is predominantly a status,
-// changelog, or table-of-contents snapshot: at least one non-blank line and at
-// least groomStatusDominance of them are status/changelog/ToC lines.
+// changelog, or table-of-contents snapshot: at least groomStatusDominance of the
+// non-blank lines are status/changelog/ToC lines. For short notes (fewer than
+// groomStatusMinLines non-blank lines) the weak markers are not enough on their own
+// — at least one line must be a STRONG status marker — so a single substantive
+// keeper is never retired just for leading with a date or containing "SHIPPED".
 func detectStatusChangelog(content string) bool {
 	lines := nonBlankLines(content)
 	if len(lines) == 0 {
 		return false
 	}
-	matching := 0
+	matching, strong := 0, 0
 	for _, line := range lines {
 		if isStatusChangelogLine(line) {
 			matching++
 		}
+		if isStrongStatusLine(line) {
+			strong++
+		}
 	}
-	return float64(matching) >= groomStatusDominance*float64(len(lines))
+	if float64(matching) < groomStatusDominance*float64(len(lines)) {
+		return false
+	}
+	if len(lines) < groomStatusMinLines {
+		return strong >= 1
+	}
+	return true
 }

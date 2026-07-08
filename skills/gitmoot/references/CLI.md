@@ -1704,11 +1704,17 @@ use), runs deterministic detectors, and writes a reviewable plan artifact
 
 - **status/changelog/ToC snapshots** — notes dominated (≥80% of non-blank lines) by
   `STATUS:` markers, `SHIPPED`/`merged & deployed` changelog phrases, ISO-date-led
-  lines, or Markdown link-list (`- [ …]`) index entries;
+  lines, or Markdown link-list (`- [ …]`) index entries. Short notes (fewer than 3
+  non-blank lines) additionally require a **strong** marker (`STATUS:`/`… & deployed`),
+  so a single high-value fact that merely leads with a date or mentions `SHIPPED`
+  once is **kept**, not retired;
 - **bare to-do lists** — content whose every non-blank line is a `- [ ]`/`- [x]`
   checkbox;
-- **exact duplicates** — memories sharing identical content; the lowest id is kept
-  and the rest proposed for retirement;
+- **exact duplicates** — memories with identical content **in the same
+  owner/repo/scope**; the lowest id is kept and the rest proposed for retirement. A
+  fact duplicated across owners, repos, or scopes is **not** deduped — each copy is
+  the only one visible in its own retrieval scope (owner/repo/scope is shown on each
+  proposed retirement so you can tell them apart);
 - **over-long "bricks"** (content > ~1200 chars) are **flagged for rewrite**, never
   retired — P4.2 only lists them for the owner (LLM rewriting is the follow-up
   P4.3).

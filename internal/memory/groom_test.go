@@ -24,6 +24,32 @@ func TestDetectStatusChangelog(t *testing.T) {
 			want:    true,
 		},
 		{
+			// A single dense fact that merely LEADS with a date is a keeper: the weak
+			// date marker must not retire the RFC's #1 use case (date-led one-liners).
+			name:    "date-led single-line keeper",
+			content: "2026-07-08 root-caused #487: rare claude-CLI transient 401 under sustained concurrency; fix = retry-on-transient.",
+			want:    false,
+		},
+		{
+			// One substantive prose line that happens to contain SHIPPED is a keeper.
+			name:    "shipped-mention single-line keeper",
+			content: "Validated when #754 SHIPPED, but the arm64 flake predates it and needs retry-on-transient.",
+			want:    false,
+		},
+		{
+			// A single bracketed-ref line (ToC-shaped) is a keeper on its own.
+			name:    "bracketed-ref single-line keeper",
+			content: "- [#487] rare claude-CLI transient under concurrency; retry-on-transient",
+			want:    false,
+		},
+		{
+			// Two date-led lines are still below the min-line dominance floor, so a
+			// short weak-marker note is kept rather than retired.
+			name:    "two date-led lines below min-lines",
+			content: "2026-07-08 shipped X\n2026-07-07 shipped Y",
+			want:    false,
+		},
+		{
 			name: "shipped-and-deployed changelog",
 			content: "SHIPPED #717 squash-merged (main 4953994)\n" +
 				"shipped and deployed live: rubric-induce, binary-eval, synth\n" +
@@ -162,6 +188,64 @@ func TestDetectGroomActionsPrecedenceAndDuplicates(t *testing.T) {
 	if got.Stats.ByReason[GroomReasonDuplicate] != 1 || got.Stats.ByReason[GroomReasonStatusChangelog] != 1 || got.Stats.ByReason[GroomReasonTaskList] != 1 {
 		t.Fatalf("by-reason = %+v", got.Stats.ByReason)
 	}
+}
+
+func TestDetectGroomActionsDuplicateScoping(t *testing.T) {
+	const body = "identical duplicate content body about arm64 retries"
+	t.Run("same scope dedups (lowest id kept)", func(t *testing.T) {
+		cands := []GroomCandidate{
+			{ID: 1, Key: "a", Content: body, OwnerKind: "agent", OwnerRef: "lead", Repo: "acme/widget", Scope: "repo"},
+			{ID: 2, Key: "b", Content: body, OwnerKind: "agent", OwnerRef: "lead", Repo: "acme/widget", Scope: "repo"},
+		}
+		got := DetectGroomActions(cands)
+		if len(got.Retirements) != 1 || got.Retirements[0].ID != 2 || got.Retirements[0].Reason != GroomReasonDuplicate {
+			t.Fatalf("same-scope duplicate not deduped as expected: %+v", got.Retirements)
+		}
+	})
+	t.Run("cross-owner identical content is NOT retired", func(t *testing.T) {
+		cands := []GroomCandidate{
+			{ID: 1, Key: "a", Content: body, OwnerKind: "agent", OwnerRef: "alice", Repo: "acme/widget", Scope: "repo"},
+			{ID: 2, Key: "b", Content: body, OwnerKind: "agent", OwnerRef: "bob", Repo: "acme/widget", Scope: "repo"},
+		}
+		got := DetectGroomActions(cands)
+		if len(got.Retirements) != 0 {
+			t.Fatalf("cross-owner duplicate wrongly retired: %+v", got.Retirements)
+		}
+	})
+	t.Run("cross-repo identical content is NOT retired", func(t *testing.T) {
+		cands := []GroomCandidate{
+			{ID: 1, Key: "a", Content: body, OwnerKind: "agent", OwnerRef: "lead", Repo: "acme/widget", Scope: "repo"},
+			{ID: 2, Key: "b", Content: body, OwnerKind: "agent", OwnerRef: "lead", Repo: "acme/gadget", Scope: "repo"},
+		}
+		got := DetectGroomActions(cands)
+		if len(got.Retirements) != 0 {
+			t.Fatalf("cross-repo duplicate wrongly retired: %+v", got.Retirements)
+		}
+	})
+	t.Run("cross-scope (repo vs general) identical content is NOT retired", func(t *testing.T) {
+		cands := []GroomCandidate{
+			{ID: 1, Key: "a", Content: body, OwnerKind: "agent", OwnerRef: "lead", Repo: "acme/widget", Scope: "repo"},
+			{ID: 2, Key: "b", Content: body, OwnerKind: "agent", OwnerRef: "lead", Repo: "", Scope: "general"},
+		}
+		got := DetectGroomActions(cands)
+		if len(got.Retirements) != 0 {
+			t.Fatalf("cross-scope duplicate wrongly retired: %+v", got.Retirements)
+		}
+	})
+	t.Run("owner/repo/scope surfaced on the retirement", func(t *testing.T) {
+		cands := []GroomCandidate{
+			{ID: 1, Key: "a", Content: body, OwnerKind: "agent", OwnerRef: "lead", OwnerVersion: "v2", Repo: "acme/widget", Scope: "repo"},
+			{ID: 2, Key: "b", Content: body, OwnerKind: "agent", OwnerRef: "lead", OwnerVersion: "v2", Repo: "acme/widget", Scope: "repo"},
+		}
+		got := DetectGroomActions(cands)
+		if len(got.Retirements) != 1 {
+			t.Fatalf("want 1 retirement, got %+v", got.Retirements)
+		}
+		r := got.Retirements[0]
+		if r.Owner != "agent:lead@v2" || r.Repo != "acme/widget" || r.Scope != "repo" {
+			t.Fatalf("owner/repo/scope not surfaced: %+v", r)
+		}
+	})
 }
 
 func TestDetectGroomActionsDeterministicOrder(t *testing.T) {

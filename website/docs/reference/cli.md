@@ -1404,8 +1404,9 @@ boundary and nothing reads `trust_mark` for a decision yet.
 `memory groom` retires stale, low-signal confirmed memories as a **propose →
 review → apply** round-trip. `--propose` reads active confirmed memory, computes
 the current vault `snapshot_hash`, runs deterministic detectors
-(status/changelog/ToC snapshots, bare to-do lists, exact duplicates; over-long
-"bricks" are flagged for rewrite, not retired), and writes a reviewable plan
+(status/changelog/ToC snapshots — short notes need a strong `STATUS:`/`… & deployed`
+marker; bare to-do lists; exact duplicates scoped to the same owner/repo/scope;
+over-long "bricks" are flagged for rewrite, not retired), and writes a reviewable plan
 artifact — it touches nothing in the store. `--yes --plan` recomputes the
 `snapshot_hash`, **aborts as stale** if the store changed since the proposal, then
 retires exactly the planned ids in one transaction (reason `groom:<detector>`). It
