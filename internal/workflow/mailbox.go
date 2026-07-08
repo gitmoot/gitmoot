@@ -143,6 +143,14 @@ type JobRequest struct {
 	SynthesisRule          string
 	DelegationArtifactDir  string
 	WorktreePath           string
+	// ReadOnlyWorktree marks a job whose WorktreePath is a throwaway detached
+	// committed-tip worktree allocated for read-only (ask) isolation at DISPATCH
+	// time (#739) — as opposed to a delegation child's fan-out worktree (which
+	// carries a DelegationID) or an implement/task worktree (which carries a
+	// Branch). It is the explicit signal the terminal cleanup uses to dispose a
+	// TOP-LEVEL read-only worktree that has no DelegationID. Additive/omitempty:
+	// false leaves the enqueued payload byte-identical.
+	ReadOnlyWorktree       bool
 	OriginalAgent          string
 	DelegatedAgent         string
 	DelegationReason       string
@@ -218,6 +226,13 @@ type JobPayload struct {
 	SynthesisRule          string         `json:"synthesis_rule,omitempty"`
 	DelegationArtifactDir  string         `json:"delegation_artifact_dir,omitempty"`
 	WorktreePath           string         `json:"worktree_path,omitempty"`
+	// ReadOnlyWorktree marks a top-level read-only (ask) worktree allocated at
+	// dispatch time (#739): its WorktreePath is a throwaway detached committed-tip
+	// worktree with no DelegationID and no Branch. Additive/omitempty so a payload
+	// without it serializes byte-identically. The terminal cleanup keys off it to
+	// dispose top-level read-only worktrees that the DelegationID-gated read-only
+	// delegation cleanup would otherwise orphan.
+	ReadOnlyWorktree       bool           `json:"read_only_worktree,omitempty"`
 	TemplateID             string         `json:"template_id,omitempty"`
 	TemplateResolvedCommit string         `json:"template_resolved_commit,omitempty"`
 	TemplateContent        string         `json:"template_content,omitempty"`
@@ -339,6 +354,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		SynthesisRule:          strings.TrimSpace(request.SynthesisRule),
 		DelegationArtifactDir:  request.DelegationArtifactDir,
 		WorktreePath:           request.WorktreePath,
+		ReadOnlyWorktree:       request.ReadOnlyWorktree,
 		TemplateID:             snapshot.ID,
 		TemplateResolvedCommit: snapshot.ResolvedCommit,
 		TemplateContent:        snapshot.Content,

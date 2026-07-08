@@ -359,33 +359,40 @@ func chatMootOverrunMessage(messageCap int) string {
 
 // ---- serialization preflight (#534 review #6) ------------------------------
 
-// mootSerializationWarning resolves the EFFECTIVE daemon scheduler/worker config that
-// will actually run these seats for this home + repo, and returns a human warning when
-// that config cannot run >=2 same-repo read-only seats concurrently. It returns "" (say
-// nothing) when the config supports concurrency, when fewer than 2 seats are convening
-// (a solo seat never needs to converse), or on any read error (a best-effort advisory
-// must never break a dispatch).
+// mootSerializationWarning resolves the EFFECTIVE daemon worker config that will
+// actually run these seats for this home + repo, and returns a human warning when
+// that config cannot run >=2 same-repo read-only seats concurrently. It returns ""
+// (say nothing) when the config supports concurrency, when fewer than 2 seats are
+// convening (a solo seat never needs to converse), or on any read error (a
+// best-effort advisory must never break a dispatch).
+//
+// #739: the decision is now the WORKER COUNT alone, NOT the scheduler mode. Since
+// background read-only (ask) seats get a dedicated detached committed-tip worktree
+// at dispatch, they are born keyed worktree:<path> and no longer serialize on the
+// shared repo:<repo> checkout key under EITHER scheduler — the barrier scheduler
+// selects same-repo jobs with distinct checkout keys into one concurrent per-tick
+// batch (selectRunnableQueuedJobs), and the pool scheduler runs them continuously.
+// So the only remaining serializer is a single worker (effective parallelism <2);
+// a pool-vs-barrier verdict would now false-warn a healthy multi-worker barrier
+// daemon.
 //
 // It is a PURE read: no live auth probe and no mutation, mirroring the off-hot-path
-// contract of the daemon's #444 serialization preflight. It reuses the daemon's own
-// parseSchedulerMode + serializingConfig predicates so the moot's verdict is exactly
-// the daemon's.
+// contract of the daemon's #444 serialization preflight. It keeps parseSchedulerMode
+// only as a stay-quiet guard on an invalid scheduler mode (the daemon's error to
+// report at start, not the moot's to guess about).
 func mootSerializationWarning(paths config.Paths, repo string, seats int) string {
 	if seats < 2 {
 		return ""
 	}
 	workers, scheduler := mootEffectiveScheduler(paths, repo)
-	usePool, err := parseSchedulerMode(scheduler)
-	if err != nil {
-		// An invalid scheduler mode is the daemon's error to report at start, not
-		// something the moot should guess about — stay quiet.
+	if _, err := parseSchedulerMode(scheduler); err != nil {
 		return ""
 	}
-	if !serializingConfig(usePool, workers) {
+	if workers >= 2 {
 		return ""
 	}
-	return fmt.Sprintf("warning: this daemon runs seats sequentially (workers=%d, scheduler=%s); a %d-seat moot will exchange turns slowly and each 'chat wait' may time out. Enable the pool scheduler with >=2 workers ([daemon] parallel = %d, or start the daemon with --parallel %d) so seats converse concurrently.",
-		workers, scheduler, seats, seats, seats)
+	return fmt.Sprintf("warning: this daemon runs a single worker (workers=%d); a %d-seat moot will exchange turns slowly and each 'chat wait' may time out. Give the daemon >=2 workers ([daemon] parallel = %d, or start the daemon with --parallel %d) so seats converse concurrently.",
+		workers, seats, seats, seats)
 }
 
 // mootEffectiveScheduler resolves the worker count + scheduler mode the daemon that

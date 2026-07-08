@@ -272,6 +272,84 @@ func (e Engine) AllocateDelegationWorktree(ctx context.Context, request Delegati
 	return DelegationWorktreeResult{Path: path, Branch: branch}, nil
 }
 
+// ReadOnlyWorktreeDispatchLockWaitBudget bounds how long the SCHEDULER-LOOP
+// read-only worktree allocators (#739 dispatch-time isolation and the reactive
+// pool-isolation dispatcher) wait for the checkout mutation lock before failing
+// open. They run synchronously on the per-repo dispatch/poll loop, so the full
+// checkoutMutationWaitTimeout (2m) would stall that repo's dispatch AND reap for up
+// to two minutes whenever a same-repo merge gate holds the lock. Isolation is a
+// throughput optimization, not correctness: a miss just serializes the seat (which
+// the next tick retries), so a short, bounded wait is the right trade.
+const ReadOnlyWorktreeDispatchLockWaitBudget = 5 * time.Second
+
+// AllocateReadOnlyWorktree is the shared, package-level primitive that creates a
+// detached, branch-lock-free git worktree at the deterministic
+// DelegationWorktreePath(home, repo, pathParent, pathSegment, retryAttempt),
+// holding the checkout mutation lock (a detached `git worktree add` mutates the
+// shared .git) but taking NO branch lock and creating NO branch: a read-only
+// worker owns nothing to merge. The ref defaults to baseBranch, else HEAD (always
+// resolvable), and every failure is returned LOUDLY. It is the single source of
+// truth for both the read-only delegation fan-out
+// (AllocateReadOnlyDelegationWorktree) and the top-level dispatch-time read-only
+// isolation (#739), so the two paths stay behaviorally aligned. It takes an
+// explicit *db.Store rather than an Engine so the cli dispatch layer can call it
+// without an import cycle. The lock key mirrors the delegation path
+// ("worktree:<pathParent>/<pathSegment>") so distinct owners never collide.
+//
+// lockWaitBudget bounds how long it waits for the checkout mutation lock before
+// returning a BlockedError. The read-only DELEGATION fan-out passes the full
+// checkoutMutationWaitTimeout (it runs inside an already-dispatched worker, off
+// any scheduler loop). The two HOT-PATH callers — the #739 dispatch-time
+// allocation and the reactive pool-isolation dispatcher — run SYNCHRONOUSLY on the
+// per-repo dispatch/poll loop, so they pass the much shorter
+// ReadOnlyWorktreeDispatchLockWaitBudget: under merge-gate lock contention the full
+// 2-minute wait would freeze that repo's whole dispatch+reap loop, and isolation is
+// a fail-open throughput optimization (a miss just serializes the seat, which the
+// next tick retries) — never worth stalling the scheduler.
+func AllocateReadOnlyWorktree(ctx context.Context, store *db.Store, home string, repo string, checkout string, pathParent string, pathSegment string, retryAttempt int, baseBranch string, lockWaitBudget time.Duration, manager ReadOnlyWorktreeManager) (string, error) {
+	if store == nil {
+		return "", errors.New("read-only worktree store is required")
+	}
+	if manager == nil {
+		return "", errors.New("read-only worktree manager is required")
+	}
+	if strings.TrimSpace(pathParent) == "" {
+		return "", errors.New("read-only worktree path parent is required")
+	}
+	if strings.TrimSpace(pathSegment) == "" {
+		return "", errors.New("read-only worktree path segment is required")
+	}
+	path, err := DelegationWorktreePath(home, repo, pathParent, pathSegment, retryAttempt)
+	if err != nil {
+		return "", err
+	}
+	ref := strings.TrimSpace(baseBranch)
+	if ref == "" {
+		ref = "HEAD"
+	}
+	if lockWaitBudget <= 0 {
+		lockWaitBudget = checkoutMutationWaitTimeout
+	}
+	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWaitBudget(ctx, store, checkout, "worktree:"+strings.TrimSpace(pathParent)+"/"+strings.TrimSpace(pathSegment), time.Now().UTC(), lockWaitBudget, checkoutMutationWaitBackoff)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if releaseCheckoutLock != nil {
+			_ = releaseCheckoutLock(context.Background())
+		}
+	}()
+	// Ensure the parent chain exists before `git worktree add` (matches the reactive
+	// pool-isolation path); the leaf is created by git itself.
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	if err := manager.AddDetachedWorktree(ctx, path, ref); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
 // AllocateReadOnlyDelegationWorktree creates a detached, branch-lock-free git
 // worktree for a read-only (ask/review) delegation child so it does not
 // serialize with its same-repo siblings on the shared repo checkout key. It
@@ -279,7 +357,9 @@ func (e Engine) AllocateDelegationWorktree(ctx context.Context, request Delegati
 // (a detached `git worktree add` mutates the shared .git) but takes no branch
 // lock and creates no branch: a read-only child owns nothing to merge. The
 // worktree is disposed by cleanupReadOnlyDelegationWorktree once the child job
-// reaches a terminal state.
+// reaches a terminal state. It is a thin Engine wrapper over the shared
+// AllocateReadOnlyWorktree primitive: the delegation-specific validation (a
+// present parent+delegation id) is kept here so its error messages are unchanged.
 func (e Engine) AllocateReadOnlyDelegationWorktree(ctx context.Context, request DelegationWorktreeRequest, manager ReadOnlyWorktreeManager) (string, error) {
 	if err := e.validate(); err != nil {
 		return "", err
@@ -293,27 +373,7 @@ func (e Engine) AllocateReadOnlyDelegationWorktree(ctx context.Context, request 
 	if strings.TrimSpace(request.DelegationID) == "" {
 		return "", errors.New("delegation worktree delegation id is required")
 	}
-	path, err := DelegationWorktreePath(request.Home, request.Repo, request.ParentJobID, request.DelegationID, request.RetryAttempt)
-	if err != nil {
-		return "", err
-	}
-	ref := strings.TrimSpace(request.BaseBranch)
-	if ref == "" {
-		ref = "HEAD"
-	}
-	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(ctx, e.Store, request.Checkout, "worktree:"+request.ParentJobID+"/"+request.DelegationID, time.Now().UTC())
-	if err != nil {
-		return "", err
-	}
-	defer func() {
-		if releaseCheckoutLock != nil {
-			_ = releaseCheckoutLock(context.Background())
-		}
-	}()
-	if err := manager.AddDetachedWorktree(ctx, path, ref); err != nil {
-		return "", err
-	}
-	return path, nil
+	return AllocateReadOnlyWorktree(ctx, e.Store, request.Home, request.Repo, request.Checkout, request.ParentJobID, request.DelegationID, request.RetryAttempt, request.BaseBranch, checkoutMutationWaitTimeout, manager)
 }
 
 // AllocateIntegrationWorktree creates a detached worktree off the parent base
@@ -440,12 +500,27 @@ func ReadOnlyWorktreeContextNote(baseCheckout string) string {
 }
 
 // isReadOnlyDelegationWorktree reports whether a job ran in a detached read-only
-// delegation worktree that must be disposed. Only read-only delegation children
-// allocate one; implement children carry a branch and are cleaned through the
-// merge gate, so they are excluded.
+// worktree that the terminal cleanup must dispose. Two disjoint shapes qualify:
+//
+//  1. A TOP-LEVEL read-only (ask) worktree allocated at DISPATCH time (#739),
+//     flagged by the explicit payload.ReadOnlyWorktree marker. It carries NO
+//     DelegationID, so without the marker the delegation-gated branch below would
+//     orphan it. The marker is set ONLY at the dispatch allocation site and ONLY
+//     for ask/review, so it can never be an implement/task worktree.
+//  2. A read-only DELEGATION child: a read-only action under a DelegationID with a
+//     WorktreePath. implement children carry a Branch and are cleaned through the
+//     merge gate (isImplementDelegationWorktree), so they are excluded here.
+//
+// Preferring the explicit marker over an implicit heuristic keeps implement/task
+// worktrees (marker false, Branch set) from ever matching.
 func isReadOnlyDelegationWorktree(jobType string, payload JobPayload) bool {
+	if strings.TrimSpace(payload.WorktreePath) == "" {
+		return false
+	}
+	if payload.ReadOnlyWorktree {
+		return true
+	}
 	return strings.TrimSpace(payload.DelegationID) != "" &&
-		strings.TrimSpace(payload.WorktreePath) != "" &&
 		readOnlyDelegationAction(jobType)
 }
 
@@ -476,7 +551,13 @@ func (e Engine) cleanupReadOnlyDelegationWorktree(ctx context.Context, jobID str
 	}
 	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(opCtx, e.Store, e.DelegationCheckout, "worktree-cleanup:"+jobID, time.Now().UTC())
 	if err != nil {
-		_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_cleanup_failed", Message: fmt.Sprintf("read-only worktree %s cleanup could not lock checkout: %v", path, err)})
+		// A transient failure (lock contention) must NOT be terminal: emit the same
+		// reclaim marker the daemon's reclaimSkippedDelegationWorktrees pass keys on,
+		// so ReclaimTerminalDelegationWorktree re-fires this cleanup on a later tick
+		// rather than leaking the worktree. A bare delegation_worktree_cleanup_failed
+		// is never re-selected by any pass (it is not the latest advance marker, and
+		// the reclaim SQL only picks _skipped), so it would leak permanently (#739 review).
+		e.recordReadOnlyCleanupSkippedOnce(opCtx, jobID, path, fmt.Sprintf("could not lock checkout: %v", err))
 		return
 	}
 	defer func() {
@@ -485,7 +566,7 @@ func (e Engine) cleanupReadOnlyDelegationWorktree(ctx context.Context, jobID str
 		}
 	}()
 	if err := manager.RemoveWorktreeForce(opCtx, path); err != nil {
-		_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_cleanup_failed", Message: fmt.Sprintf("read-only worktree %s force-remove failed: %v", path, err)})
+		e.recordReadOnlyCleanupSkippedOnce(opCtx, jobID, path, fmt.Sprintf("force-remove failed: %v", err))
 		return
 	}
 	_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_removed", Message: fmt.Sprintf("read-only worktree %s removed", path)})
@@ -694,6 +775,26 @@ func (e Engine) recordCleanupSkippedOnce(ctx context.Context, jobID string, payl
 	})
 }
 
+// recordReadOnlyCleanupSkippedOnce emits the reclaim-eligible
+// delegation_worktree_cleanup_skipped marker for a read-only worktree whose
+// terminal disposal FAILED transiently (lock contention / force-remove error). It
+// is the read-only twin of recordCleanupSkippedOnce: without it a bare
+// delegation_worktree_cleanup_failed is never re-selected (the reclaim SQL keys on
+// _skipped, and the advance-retry pass keys on advance markers), so the worktree
+// would leak. Deduped by lastCleanupOutcomeIsSkip so a persistently-failing removal
+// does not grow the event log without bound; a later delegation_worktree_removed
+// closes the window.
+func (e Engine) recordReadOnlyCleanupSkippedOnce(ctx context.Context, jobID string, path string, reason string) {
+	if e.lastCleanupOutcomeIsSkip(ctx, jobID) {
+		return
+	}
+	_ = e.Store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{
+		JobID:   jobID,
+		Kind:    "delegation_worktree_cleanup_skipped",
+		Message: fmt.Sprintf("read-only worktree %s cleanup skipped: %s", strings.TrimSpace(path), reason),
+	})
+}
+
 // lastCleanupOutcomeIsSkip reports whether the most recent terminal-cleanup outcome
 // event for jobID is a skip (preserve) not yet followed by a removal — i.e. another
 // skip would be redundant. Order matters (a worktree can be preserved, then later
@@ -714,15 +815,26 @@ func (e Engine) lastCleanupOutcomeIsSkip(ctx context.Context, jobID string) bool
 	return false
 }
 
-// ReclaimTerminalDelegationWorktree re-attempts the terminal implement-delegation
-// worktree+branch cleanup for an already-terminal child whose earlier terminal
-// advance PRESERVED it because a foreign runtime owner was still active (it emitted
-// delegation_worktree_cleanup_skipped). It is the daemon's lock-expiry-driven
-// reclamation (#536): once that foreign owner releases its lock or its lease
-// expires, the worktree is no longer owned and must be torn down rather than
-// leaked. It simply re-runs the same idempotent, liveness-gated cleanup, so it is a
-// no-op when the owner is still active, when the worktree is already gone, or for a
-// non-implement / non-delegation job.
+// ReclaimTerminalDelegationWorktree re-attempts the terminal worktree cleanup for
+// a job whose earlier disposal was DEFERRED, keyed by a
+// delegation_worktree_cleanup_skipped marker that the daemon's
+// reclaimSkippedDelegationWorktrees pass selects on. Two shapes reach here:
+//
+//   - an implement child PRESERVED because a foreign runtime owner was still active
+//     (#536): reclaimed once the owner's lock releases or its lease expires;
+//   - a read-only worktree (top-level ask #739, or a read-only delegation child)
+//     whose disposal was deferred — either its terminal cleanup hit transient lock
+//     contention / a force-remove error (cleanupReadOnlyDelegationWorktree now
+//     records a _skipped marker on failure instead of a dead-end _cleanup_failed),
+//     or the job was ABORTED (cancel/kill/supersede) before it ever ran and
+//     recordReadOnlyWorktreeReclaimOnAbort marked its dispatch-allocated worktree.
+//
+// It re-runs BOTH idempotent, liveness-gated cleanups, so it is a no-op when the
+// owner is still active, when the worktree is already gone, or for a job that
+// allocated no worktree. Reachability is via the _skipped marker only: a pure crash
+// in the sub-millisecond window between advance_completed and the deferred cleanup
+// is NOT covered (that residual is shared with the implement path and unchanged by
+// #739).
 func (e Engine) ReclaimTerminalDelegationWorktree(ctx context.Context, jobID string) error {
 	if err := e.validate(); err != nil {
 		return err
@@ -732,6 +844,7 @@ func (e Engine) ReclaimTerminalDelegationWorktree(ctx context.Context, jobID str
 		return err
 	}
 	e.cleanupImplementDelegationWorktree(ctx, jobID, job.Type, payload)
+	e.cleanupReadOnlyDelegationWorktree(ctx, jobID, job.Type, payload)
 	return nil
 }
 

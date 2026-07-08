@@ -531,6 +531,12 @@ func TestTrackedPoolIsolationHonorsSamePassRuntimeSibling(t *testing.T) {
 	if payload, err = daemonJobPayload(job); err != nil || payload.WorktreePath == "" {
 		t.Fatalf("job-iso final payload worktree = %q err=%v, want an isolation worktree (must have run beside the held shared checkout)", payload.WorktreePath, err)
 	}
+	// #739: the reactive isolation success is now OBSERVABLE — a
+	// pool_isolation_worktree_allocated event was emitted when job-iso was
+	// dispatched into its worktree (it used to be silent both ways).
+	if n := countCLIJobEvents(t, store, "job-iso", "pool_isolation_worktree_allocated"); n != 1 {
+		t.Fatalf("pool_isolation_worktree_allocated event count = %d, want 1 (#739 observability)", n)
+	}
 	select {
 	case err := <-errCh:
 		if err != nil {
@@ -639,4 +645,20 @@ func TestTrackedTickMaintenanceNotStarvedByInFlightJobs(t *testing.T) {
 	if !hasEvent("job-adv-repo", "advance_retried") {
 		t.Fatalf("job-adv-repo still not advanced after the shared checkout freed")
 	}
+}
+
+// countCLIJobEvents returns how many events of the given kind exist for jobID.
+func countCLIJobEvents(t *testing.T, store *db.Store, jobID, kind string) int {
+	t.Helper()
+	events, err := store.ListJobEvents(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents(%s): %v", jobID, err)
+	}
+	n := 0
+	for _, e := range events {
+		if e.Kind == kind {
+			n++
+		}
+	}
+	return n
 }

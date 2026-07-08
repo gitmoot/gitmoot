@@ -7010,6 +7010,29 @@ func TestWarnSerializedParallelJobsSilentBelowTwo(t *testing.T) {
 	}
 }
 
+// TestJobStateEligibleForWorktreeReclaim pins the #739-review fix that the
+// worktree reclaim pass also disposes a CANCELLED job's dispatch-allocated
+// read-only worktree, while keeping cancelled OUT of advancement re-run.
+func TestJobStateEligibleForWorktreeReclaim(t *testing.T) {
+	for _, s := range []string{
+		string(workflow.JobSucceeded), string(workflow.JobFailed),
+		string(workflow.JobBlocked), string(workflow.JobCancelled),
+	} {
+		if !jobStateEligibleForWorktreeReclaim(s) {
+			t.Fatalf("state %q must be worktree-reclaim eligible", s)
+		}
+	}
+	for _, s := range []string{string(workflow.JobQueued), string(workflow.JobRunning)} {
+		if jobStateEligibleForWorktreeReclaim(s) {
+			t.Fatalf("state %q must not be worktree-reclaim eligible", s)
+		}
+	}
+	// A cancelled job's worktree is reclaimed, but the job must never RE-ADVANCE.
+	if jobStateCanRetryAdvancement(string(workflow.JobCancelled)) {
+		t.Fatal("cancelled must never be advancement-retry eligible")
+	}
+}
+
 func TestSerializingConfig(t *testing.T) {
 	cases := []struct {
 		usePool bool

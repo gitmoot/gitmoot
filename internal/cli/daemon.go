@@ -3731,7 +3731,7 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 		if err != nil {
 			return err
 		}
-		if !jobStateCanRetryAdvancement(job.State) || !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+		if !jobStateEligibleForWorktreeReclaim(job.State) || !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
 			continue
 		}
 		if checkoutHeld != nil {
@@ -3928,6 +3928,18 @@ func jobStateCanRetryAdvancement(state string) bool {
 	default:
 		return false
 	}
+}
+
+// jobStateEligibleForWorktreeReclaim gates the delegation/read-only worktree
+// reclaim pass. It is the advancement-retry set PLUS cancelled: a job aborted
+// (cancel / kill / supersede) before its terminal AdvanceJob leaves a
+// dispatch-allocated read-only worktree (#739) on disk with a
+// delegation_worktree_cleanup_skipped marker but a JobCancelled state, so the
+// reclaim pass must still dispose it. Cancelled is intentionally NOT added to
+// jobStateCanRetryAdvancement (a cancelled job must never RE-ADVANCE) — only its
+// worktree is reclaimed here, via the same idempotent, liveness-gated cleanup.
+func jobStateEligibleForWorktreeReclaim(state string) bool {
+	return jobStateCanRetryAdvancement(state) || state == string(workflow.JobCancelled)
 }
 
 // retryPendingJobComments re-posts the result comment for any terminal job whose
@@ -4516,9 +4528,18 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 						continue
 					}
 					payloadBeforeIsolation := job.Payload
-					iso, ok := worker.allocatePoolIsolationWorktree(ctx, job, payload)
+					iso, ok, allocErr := worker.allocatePoolIsolationWorktree(ctx, job, payload)
 					if !ok {
 						worker.Admission.Release(job.ID)
+						// #739: the reactive isolation was silent on failure — the exact
+						// reason #739 was hard to diagnose (a seat went queued→running with no
+						// worktree event and serialized on the shared checkout). Emit a loud
+						// skip event so a lost-parallelism serialize is observable. A nil
+						// allocErr means the job was simply not isolable (no home/checkout) —
+						// not a failure — so stay quiet there.
+						if allocErr != nil {
+							_ = worker.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "pool_isolation_skipped", Message: fmt.Sprintf("pool read-only isolation skipped (#739); job stays serialized in the shared checkout: %v", allocErr)})
+						}
 						continue
 					}
 					if !tracker.beginWithin(hostCap, iso.job.ID, repoFilter, iso.checkoutKey, iso.runtimeKey) {
@@ -4535,6 +4556,12 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					if iso.runtimeKey != "" {
 						inflightRuntimes[iso.runtimeKey] = true
 					}
+					// #739: make the reactive isolation observable on SUCCESS too (it was
+					// silent both ways). Emitted only past the host-cap/double-dispatch gate
+					// above, so the event means the job is truly dispatched in its own
+					// worktree:<path> key — running beside the same-repo checkout holder,
+					// not serialized behind it.
+					_ = worker.Store.AddJobEvent(ctx, db.JobEvent{JobID: iso.job.ID, Kind: "pool_isolation_worktree_allocated", Message: fmt.Sprintf("read-only pool-isolation worktree %s allocated (#739); job keyed %s to run beside the same-repo checkout holder", iso.worktreePath, iso.checkoutKey)})
 					running++
 					dispatched++
 					go func() {
@@ -4603,25 +4630,31 @@ type poolIsolatedDispatch struct {
 // means the job is not isolable or the worktree could not be created — the caller
 // then leaves it queued to serialize as before (graceful, no deadlock-for-safety
 // trade). Runs on the dispatcher goroutine under the tick's per-repo lock.
-func (w jobWorker) allocatePoolIsolationWorktree(ctx context.Context, job db.Job, payload workflow.JobPayload) (poolIsolatedDispatch, bool) {
+func (w jobWorker) allocatePoolIsolationWorktree(ctx context.Context, job db.Job, payload workflow.JobPayload) (poolIsolatedDispatch, bool, error) {
 	if strings.TrimSpace(w.ConfigHome) == "" {
-		return poolIsolatedDispatch{}, false
+		return poolIsolatedDispatch{}, false, nil
 	}
 	repoRecord, err := w.Store.GetRepo(ctx, payload.Repo)
 	if err != nil || strings.TrimSpace(repoRecord.CheckoutPath) == "" {
-		return poolIsolatedDispatch{}, false
+		return poolIsolatedDispatch{}, false, err
 	}
-	path, err := workflow.DelegationWorktreePath(w.ConfigHome, payload.Repo, job.ID, "pool-isolation", 0)
-	if err != nil || strings.TrimSpace(path) == "" {
-		return poolIsolatedDispatch{}, false
-	}
-	ref := firstNonEmpty(strings.TrimSpace(payload.HeadSHA), strings.TrimSpace(payload.Branch), "HEAD")
 	client := gitutil.Client{Dir: repoRecord.CheckoutPath}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return poolIsolatedDispatch{}, false
+	// #739: route through the shared read-only allocator so this reactive top-level
+	// isolation path resolves the ref to HEAD (a committed tip that is always
+	// resolvable — NOT the stale current branch the researchers flagged), holds the
+	// checkout mutation lock, and returns errors LOUDLY. This keeps it behaviorally
+	// aligned with the read-only delegation fan-out and the dispatch-time allocation,
+	// and turns the previously-silent worktree-add failure into a returned error the
+	// caller emits as a pool_isolation_skipped event. It runs SYNCHRONOUSLY on the
+	// per-repo dispatch loop, so it passes the short ReadOnlyWorktreeDispatchLockWaitBudget
+	// (not the 2-minute default) to fail open fast under merge-gate lock contention
+	// rather than freezing this repo's dispatch+reap loop.
+	path, err := workflow.AllocateReadOnlyWorktree(ctx, w.Store, w.ConfigHome, payload.Repo, repoRecord.CheckoutPath, job.ID, "pool-isolation", 0, "", workflow.ReadOnlyWorktreeDispatchLockWaitBudget, client)
+	if err != nil {
+		return poolIsolatedDispatch{}, false, err
 	}
-	if err := client.AddDetachedWorktree(ctx, path, ref); err != nil {
-		return poolIsolatedDispatch{}, false
+	if strings.TrimSpace(path) == "" {
+		return poolIsolatedDispatch{}, false, nil
 	}
 	payload.WorktreePath = path
 	// The detached worktree is the COMMITTED TIP of the base ref, so it omits
@@ -4638,11 +4671,11 @@ func (w jobWorker) allocatePoolIsolationWorktree(ctx context.Context, job db.Job
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		_ = client.RemoveWorktreeForce(context.WithoutCancel(ctx), path)
-		return poolIsolatedDispatch{}, false
+		return poolIsolatedDispatch{}, false, err
 	}
 	if err := w.Store.UpdateJobPayload(ctx, job.ID, string(encoded)); err != nil {
 		_ = client.RemoveWorktreeForce(context.WithoutCancel(ctx), path)
-		return poolIsolatedDispatch{}, false
+		return poolIsolatedDispatch{}, false, err
 	}
 	job.Payload = string(encoded)
 	return poolIsolatedDispatch{
@@ -4651,7 +4684,7 @@ func (w jobWorker) allocatePoolIsolationWorktree(ctx context.Context, job db.Job
 		runtimeKey:   queuedJobRuntimeResourceKey(ctx, w.Store, job),
 		worktreePath: path,
 		repoCheckout: repoRecord.CheckoutPath,
-	}, true
+	}, true, nil
 }
 
 type queuedJobResourceSelector struct {

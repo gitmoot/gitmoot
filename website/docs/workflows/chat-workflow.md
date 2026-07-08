@@ -233,17 +233,26 @@ gitmoot chat wait paper-review --since-seq 12 --repo owner/repo
 #   prints any messages with seq > 12, then a `last-seq: N` line
 ```
 
-:::caution Seats converse concurrently only under a pool/multi-worker daemon
-Moot seats are top-level **read-only same-repo** jobs. They run at the same time —
-so they can actually hold a conversation — **only** under the **pool scheduler with
-≥2 workers** (start the daemon with `--parallel N`, or set `[daemon] parallel = N`;
-a per-repo `[repos."owner/repo"]` `max_parallel`/`scheduler` override also counts).
-Under the **default** single-worker/barrier daemon the seats **serialize** on the
-shared `repo:<repo>` checkout key: each seat's `chat wait` times out and the moot
-degrades into sequential monologues instead of a conversation. When `gitmoot moot`
-detects a serializing config it prints a **non-blocking** warning to stderr naming
-the effective `workers`/`scheduler` and still dispatches every seat — enable the
-pool scheduler so the seats converse.
+:::caution Seats converse concurrently under any scheduler with ≥2 workers
+Moot seats are top-level **read-only same-repo** jobs. Each seat is allocated its
+own detached committed-tip **worktree at dispatch**, so it is keyed off
+`worktree:<path>` — **not** the shared `repo:<repo>` checkout key — and same-repo
+seats run at the same time (so they can actually hold a conversation) under
+**either scheduler** as long as the daemon has **≥2 workers** (#739). Give the
+daemon parallelism with `--parallel N`, `[daemon] parallel = N`, or a per-repo
+`[repos."owner/repo"]` `max_parallel` override. The scheduler mode no longer
+matters: a barrier daemon selects the distinct-keyed seats into one concurrent
+per-tick batch, and the pool daemon runs them continuously. The **only** remaining
+serializer is a genuinely **single-worker** daemon (`parallel = 1`), where each
+seat's `chat wait` may time out and the moot degrades to sequential monologues.
+When `gitmoot moot` detects a single-worker daemon it prints a **non-blocking**
+warning to stderr and still dispatches every seat — give the daemon ≥2 workers so
+the seats converse.
+
+(Because each seat runs in a detached committed-tip worktree, a seat sees the
+repo's last **committed** state, not uncommitted working-tree edits; its prompt
+carries a note pointing at the canonical checkout for those. This is the same
+isolation model read-only delegation children already use.)
 :::
 
 #### The hard-stop (why moots don't ramble)
