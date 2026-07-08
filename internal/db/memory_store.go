@@ -2,7 +2,9 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
@@ -711,4 +713,155 @@ func scanConfirmedMemories(rows *sql.Rows) ([]ConfirmedMemory, error) {
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// ---- #737 P3 (markdown ingest + human-gated confirm) ----------------------
+// The functions below back `gitmoot memory ingest`, `memory observations`, and
+// `memory confirm`. They are additive reads plus the existing observation-insert
+// and confirmed-upsert paths — no schema changes, no new mutation of prior rows.
+
+// ObservationWithConfirmation is one pending observation annotated with whether
+// an owner+repo+key match already exists in confirmed_memories. It backs
+// `memory observations`, which flags which ingested notes have crossed the human
+// confirm gate.
+type ObservationWithConfirmation struct {
+	MemoryObservation
+	Confirmed bool
+}
+
+// ListMemoryObservationsWithConfirmation returns pending observations (optionally
+// narrowed to an owner ref and/or a provenance prefix), each flagged with whether
+// a confirmed row already exists for its owner+repo+key. It is a read-only join
+// used by the audit surface; it mutates nothing. A blank ownerRef matches all
+// owners and a blank provenancePrefix matches all provenances.
+func (s *Store) ListMemoryObservationsWithConfirmation(ctx context.Context, ownerRef, provenancePrefix string) ([]ObservationWithConfirmation, error) {
+	var where []string
+	var args []any
+	if strings.TrimSpace(ownerRef) != "" {
+		where = append(where, "o.owner_ref = ?")
+		args = append(args, ownerRef)
+	}
+	if strings.TrimSpace(provenancePrefix) != "" {
+		where = append(where, "o.provenance LIKE ? ESCAPE '\\'")
+		args = append(args, likePrefix(provenancePrefix))
+	}
+	query := `
+SELECT o.id, o.owner_kind, o.owner_ref, o.owner_version, o.repo, o.scope, o.key,
+	o.content, o.provenance, o.trust_mark, o.source_job, o.created_at,
+	EXISTS(
+		SELECT 1 FROM confirmed_memories c
+		WHERE c.owner_kind = o.owner_kind AND c.owner_ref = o.owner_ref
+			AND c.owner_version = o.owner_version
+			AND ((o.repo IS NULL AND c.repo IS NULL) OR c.repo = o.repo)
+			AND c.key = o.key
+	) AS confirmed
+FROM memory_observations o`
+	if len(where) > 0 {
+		query += "\nWHERE " + strings.Join(where, " AND ")
+	}
+	query += "\nORDER BY o.created_at DESC, o.id DESC"
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list observations with confirmation: %w", err)
+	}
+	defer rows.Close()
+	var out []ObservationWithConfirmation
+	for rows.Next() {
+		var o ObservationWithConfirmation
+		var repoNull sql.NullString
+		var confirmed int
+		if err := rows.Scan(&o.ID, &o.Owner.Kind, &o.Owner.Ref, &o.Owner.Version, &repoNull,
+			&o.Scope, &o.Key, &o.Content, &o.Provenance, &o.TrustMark, &o.SourceJob, &o.CreatedAt, &confirmed); err != nil {
+			return nil, err
+		}
+		o.Repo = repoNull.String
+		o.Confirmed = confirmed != 0
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// GetMemoryObservationByID returns a single pending observation by its row id,
+// or (zero, false, nil) when no such row exists. It backs `memory confirm <id>`.
+func (s *Store) GetMemoryObservationByID(ctx context.Context, id int64) (MemoryObservation, bool, error) {
+	var o MemoryObservation
+	var repoNull sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+SELECT id, owner_kind, owner_ref, owner_version, repo, scope, key, content,
+	provenance, trust_mark, source_job, created_at
+FROM memory_observations WHERE id = ?`, id).Scan(
+		&o.ID, &o.Owner.Kind, &o.Owner.Ref, &o.Owner.Version, &repoNull,
+		&o.Scope, &o.Key, &o.Content, &o.Provenance, &o.TrustMark, &o.SourceJob, &o.CreatedAt)
+	if err == sql.ErrNoRows {
+		return MemoryObservation{}, false, nil
+	}
+	if err != nil {
+		return MemoryObservation{}, false, fmt.Errorf("get memory observation %d: %w", id, err)
+	}
+	o.Repo = repoNull.String
+	return o, true, nil
+}
+
+// MemoryDedupKey combines the visibility domain (scope + nullable repo) with a
+// content hash so ingest dedup only collapses rows that would inject into the
+// SAME domain. Two rows with identical text but different repos are NOT
+// duplicates: repo-scoped confirmed memory injects only for its own repo (see
+// QueryConfirmedMemories: scope='general' OR repo=?), so a second repo must be
+// allowed to stage — and later inject — the same note. Repo is trimmed so a NULL
+// repo and an empty-string repo collapse to the same general-scope domain.
+func MemoryDedupKey(scope, repo, contentHash string) string {
+	return strings.TrimSpace(scope) + "\x00" + strings.TrimSpace(repo) + "\x00" + contentHash
+}
+
+// ObservationDedupKeys returns the set of (scope, repo, content-hash) dedup keys
+// across BOTH pending observations and confirmed rows for an owner ref. Ingest
+// uses it to drop an incoming chunk only when the SAME content already exists in
+// the SAME visibility domain, so identical text under a second repo still stages.
+// A blank ownerRef scans every owner. Build the lookup key with MemoryDedupKey.
+func (s *Store) ObservationDedupKeys(ctx context.Context, ownerRef string) (map[string]struct{}, error) {
+	out := make(map[string]struct{})
+	collect := func(query string) error {
+		var rows *sql.Rows
+		var err error
+		if strings.TrimSpace(ownerRef) != "" {
+			rows, err = s.db.QueryContext(ctx, query+" WHERE owner_ref = ?", ownerRef)
+		} else {
+			rows, err = s.db.QueryContext(ctx, query)
+		}
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var content, scope string
+			var repoNull sql.NullString
+			if err := rows.Scan(&content, &repoNull, &scope); err != nil {
+				return err
+			}
+			out[MemoryDedupKey(scope, repoNull.String, sha256HexOf(content))] = struct{}{}
+		}
+		return rows.Err()
+	}
+	if err := collect(`SELECT content, repo, scope FROM memory_observations`); err != nil {
+		return nil, fmt.Errorf("scan observation contents: %w", err)
+	}
+	if err := collect(`SELECT content, repo, scope FROM confirmed_memories`); err != nil {
+		return nil, fmt.Errorf("scan confirmed contents: %w", err)
+	}
+	return out, nil
+}
+
+// sha256HexOf mirrors memory.ContentHash without importing the memory package
+// into the db layer (the store carries no dependency on internal/memory).
+func sha256HexOf(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
+
+// likePrefix builds a LIKE pattern that matches a literal prefix followed by
+// anything, escaping the LIKE metacharacters (%, _, and the \ escape char) in
+// the prefix so a provenance like "ingest:%" cannot smuggle wildcards.
+func likePrefix(prefix string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(prefix) + "%"
 }

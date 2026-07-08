@@ -140,6 +140,49 @@ observations in **one transaction** (all-or-nothing). If any note fails to parse
 otherwise be misread as a deletion and silently retire a live memory. A vault
 produced by `export --agent NAME` stays importable even when other owners have
 memories, because import rebuilds the fresh export with the manifest's recorded scope.
+## Markdown ingest and the human confirm gate
+
+The vault export is the bridge's *outlet*; `memory ingest` is its *mouth*. It
+reads arbitrary Markdown (session notes, runbooks, incident writeups) and stages
+it as **pending observations** behind the existing confirmation gate — it never
+writes injectable memory directly.
+
+```sh
+gitmoot memory ingest <path|dir> --agent NAME [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
+gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]
+gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--yes] [--json]
+```
+
+`memory ingest` walks `*.md`, strips a leading YAML frontmatter block when
+present, and chunks a file only when its body exceeds ~512 estimated tokens
+(smaller files stay one observation). Over budget it splits on `## ` headings,
+and any section still over budget is sub-split on paragraph/line boundaries so no
+single chunk exceeds the token budget (an oversized memory would otherwise be
+force-injected wholesale). Every chunk passes the same deterministic
+**PreFilter** that gates agent learnings (rejecting directive-phrased,
+secret-shaped, executable, or — for `--tier general` — non-repo-agnostic
+content), reported as per-reason rejection counts. A chunk whose exact content
+already exists **in the same visibility domain** (same scope and repo) is
+**deduped**, so re-ingesting a source is a no-op — but the same note ingested
+under a second repo still stages, because repo-scoped memory injects only for its
+own repo. Survivors land in `memory_observations` with
+`provenance = ingest:<relpath>` and `trust_mark = low`. `--dry-run` reports the
+plan without writing.
+
+`memory observations` lists pending observations, flagging which have already
+been confirmed. `memory confirm` is the **human-gated promotion**: it copies
+selected observations (by id, or every one matching a `--provenance-prefix`) into
+confirmed memory, carrying provenance through. Without `--yes` it prints the plan
+and writes nothing; with `--yes` it promotes idempotently. It is **CLI-explicit
+only** — no daemon path, no auto-confirm.
+
+:::warning Ingested Markdown is untrusted
+Ingested Markdown is an **indirect-prompt-injection vector**. Ingest stamps
+`trust_mark = low` on every observation, and observations are inert (never
+injected) until a human runs `memory confirm`. That confirm step **is** the trust
+boundary. Trust-aware injection — having the read path weigh `trust_mark` — is
+future work; nothing reads `trust_mark` for a decision yet.
+:::
 
 ## Phases
 

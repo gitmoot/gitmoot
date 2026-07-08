@@ -1332,7 +1332,8 @@ Agent persistent memory is **off by default** and enrolled per agent
 (`[agents.<name>].memory = true`), with optional `[memory]` knobs (`disabled`,
 `token_budget`, `max_entries`). See
 [Agent Persistent Memory](../concepts/agent-memory.md) for the full model. The
-CLI is read-only:
+inspection commands are read-only; `ingest` and `confirm` write behind a human
+gate:
 
 ```sh
 gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo] [--json]
@@ -1340,6 +1341,9 @@ gitmoot memory replay [--agent NAME] [--repo owner/repo] [--limit N] [--json]
 gitmoot memory eval --fixtures fixtures.json [--k N] [--json]
 gitmoot memory vault export [--out DIR] [--agent NAME] [--force] [--json]
 gitmoot memory vault import <DIR> [--dry-run|--yes] [--json]
+gitmoot memory ingest <path|dir> --agent NAME [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
+gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]
+gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--yes] [--json]
 ```
 
 `memory list` shows confirmed memories and/or pending observations. `memory
@@ -1379,6 +1383,21 @@ fails to parse (e.g. broken YAML frontmatter), `--yes` **refuses to apply** so a
 malformed note is never misread as a deletion. A vault produced by `export --agent
 NAME` stays importable even when other owners have memories. The `<DIR>` positional
 may sit before or after the flags.
+`memory ingest` stages arbitrary Markdown as **pending observations**: it walks
+`*.md`, strips leading YAML frontmatter, chunks a file only when its body exceeds
+~512 estimated tokens (on `## ` headings, sub-splitting any still-oversized
+section on paragraph/line boundaries so no chunk exceeds the budget), PreFilters
+every chunk (per-reason rejection counts in the summary), dedups by exact content
+**within the same scope+repo visibility domain** (identical text under a second
+repo still stages), and inserts survivors with
+`provenance = ingest:<relpath>` and **`trust_mark = low`**. `--tier` defaults to
+`repo`; `general` is only chosen explicitly. `memory observations` lists pending
+observations, flagging which keys are already confirmed. `memory confirm` is the
+**human-gated promotion** — by id or `--provenance-prefix`, it copies observations
+into confirmed memory (idempotently), and without `--yes` only prints the plan.
+Ingested Markdown is an indirect-prompt-injection vector, so it stays inert at
+`trust_mark = low` until a human confirms it; that confirm gate is the trust
+boundary and nothing reads `trust_mark` for a decision yet.
 
 ## Pipelines
 
