@@ -36,8 +36,10 @@ go build ./...
 go generate ./... && git diff --exit-code   # gitmoot_result contract is single-sourced + regenerated; stale artifact fails CI
 go vet ./...
 go test ./...
-# Race gate is scoped (not ./...) with a 20m timeout — matches CI exactly:
-go test -race -timeout 20m ./internal/workflow/ ./internal/cli/ ./internal/db/ ./internal/daemon/
+# Race gate is scoped (not ./...). CI splits it across two parallel jobs (#733):
+# `build / vet / test` runs workflow+db+daemon at 20m, `race (internal/cli)` runs
+# the mega-package on its own at 35m. Locally you can run all four at once:
+go test -race -timeout 35m ./internal/workflow/ ./internal/cli/ ./internal/db/ ./internal/daemon/
 ```
 
 The CLI entrypoint lives under `cmd/gitmoot/`. The CI gate is Go-only — it does

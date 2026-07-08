@@ -49,21 +49,46 @@ jobs:
       - name: Test
         run: go test ./...
 
-      - name: Test (race detector, workflow engine + cli + db + daemon)
-        # internal/cli is race-tested too because the #484 canary auto-rollback
-        # decorator (canary_daemon.go) carries a concurrency contract — the daemon
-        # runs jobs in a parallel worker pool, so two same-template harvests can
-        # race to roll back the same canary and `candidate.rolled_back` must still
-        # fire exactly once. TestCanaryLifecycleE2E's concurrent subtest asserts
-        # that dedup, so it belongs under the detector.
-        #
+      - name: Test (race detector, workflow engine + db + daemon)
         # internal/db and internal/daemon are race-tested because the #536 stale-
         # recovery / worktree-cleanup fix adds concurrency-sensitive resource_locks
         # reads (JobRuntimeLockLiveness, DeleteExpiredResourceLocks) that the daemon
         # worker pool exercises from multiple goroutines.
         #
-        # -timeout 20m: internal/cli is a large suite and the race detector runs
-        # it ~10x slower, so it sits right on Go's default 10m/package deadline —
-        # adding a handful of new tests intermittently tips it over (a timeout, not
-        # a real race). The explicit bound gives headroom without masking a hang.
-        run: go test -race -timeout 20m ./internal/workflow/ ./internal/cli/ ./internal/db/ ./internal/daemon/
+        # internal/cli is race-tested too, but it has outgrown the shared 20m bound
+        # (#733): under -race it alone takes ~17-21m and intermittently timed out
+        # here (a timeout goroutine dump, not a real race). It now runs in its own
+        # parallel `race-cli` job below with a 35m timeout, so a slow runner can no
+        # longer fail green code and total wall-time stays ≈ max(jobs), not the sum.
+        #
+        # -timeout 20m: these three suites are comfortably under Go's default
+        # 10m/package deadline even under the ~10x race slowdown; the explicit
+        # bound gives headroom without masking a hang.
+        run: go test -race -timeout 20m ./internal/workflow/ ./internal/db/ ./internal/daemon/
+
+  race-cli:
+    name: race (internal/cli)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test (race detector, internal/cli)
+        # internal/cli is the mega-package: the #484 canary auto-rollback decorator
+        # (canary_daemon.go) carries a concurrency contract — the daemon runs jobs
+        # in a parallel worker pool, so two same-template harvests can race to roll
+        # back the same canary and `candidate.rolled_back` must still fire exactly
+        # once. TestCanaryLifecycleE2E's concurrent subtest asserts that dedup, so
+        # it belongs under the detector.
+        #
+        # Split into its own job (#733) because every wave adds tests here and the
+        # suite under -race runs ~17-21m — it repeatedly tipped the shared 20m step
+        # over on loaded runners (a timeout, not a data race). -timeout 35m gives
+        # ample headroom while still surfacing a genuine hang.
+        run: go test -race -timeout 35m ./internal/cli/

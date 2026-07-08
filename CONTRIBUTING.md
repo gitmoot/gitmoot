@@ -66,10 +66,16 @@ build/vet/test gate on every push to `main` and every pull request. The
 go build ./...
 go vet ./...
 go test ./...
-go test -race ./internal/workflow/
+go test -race -timeout 20m ./internal/workflow/ ./internal/db/ ./internal/daemon/
 ```
 
-The race detector covers the workflow engine. CI does not run the live
+A second parallel job, `race (internal/cli)`, runs the `internal/cli` race suite
+on its own with a 35m timeout — it has outgrown the shared 20m bound (#733), so
+splitting it keeps a slow runner from failing green code while total wall-time
+stays roughly the max of the two jobs rather than their sum.
+
+The race detector covers the workflow engine and the concurrency-sensitive
+core packages. CI does not run the live
 multi-runtime (codex/claude/kimi) E2E — that needs runtime auth and stays a
 manual step.
 
