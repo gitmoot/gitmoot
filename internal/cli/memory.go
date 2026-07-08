@@ -32,6 +32,8 @@ func runMemory(args []string, stdout, stderr io.Writer) int {
 		return runMemoryReplay(args[1:], stdout, stderr)
 	case "eval":
 		return runMemoryEval(args[1:], stdout, stderr)
+	case "vault":
+		return runMemoryVault(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown memory command %q\n\n", args[0])
 		printMemoryUsage(stderr)
@@ -46,11 +48,13 @@ func printMemoryUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo R] [--json]")
 	fmt.Fprintln(w, "  gitmoot memory replay [--agent NAME] [--repo R] [--limit N] [--json]")
 	fmt.Fprintln(w, "  gitmoot memory eval --fixtures FILE [--k N] [--json]")
+	fmt.Fprintln(w, "  gitmoot memory vault export [--out DIR] [--agent NAME] [--json]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "  list    show stored memories (confirmed and/or pending observations)")
 	fmt.Fprintln(w, "  replay  offline A/B: render recent real jobs' prompts with vs without the")
 	fmt.Fprintln(w, "          learnings block and report the injection delta (tokens, entries)")
 	fmt.Fprintln(w, "  eval    recall/precision@K of retrieval over a labeled fixtures file")
+	fmt.Fprintln(w, "  vault   render memory as a disposable Obsidian-compatible vault view")
 }
 
 // ---- memory list ----------------------------------------------------------

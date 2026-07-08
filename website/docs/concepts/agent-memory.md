@@ -88,6 +88,31 @@ learnings block and reports the injection delta (added tokens, entries injected)
 — it measures injection *mechanics*, not outcome quality. `memory eval` computes
 recall/precision@K of retrieval over a labeled fixtures file.
 
+## Vault view (a derived, disposable Obsidian view)
+
+```sh
+gitmoot memory vault export [--out DIR] [--agent NAME] [--force] [--json]
+```
+
+`memory vault export` renders confirmed memory as an Obsidian-compatible vault:
+one Markdown note per confirmed memory (sorted-key YAML frontmatter, the content
+verbatim, and a `## Links` section of FTS co-occurrence `[[wikilinks]]`), a
+per-owner index note, and a `manifest.json` staleness anchor.
+
+The vault is a **view, not a replica**: SQLite stays the *only* source of truth,
+so the export never becomes a second store to keep in sync. It is regenerated
+from scratch on every run, is safe to delete, and is fully **deterministic** —
+the same store produces byte-identical files (there is deliberately no
+`exported_at`, and filenames are stable `NNNNNNNNN-<slug>.md` derived from the
+memory id). That determinism is what lets a later `vault import` diff hand-edits
+against a fresh export. The export is read-only (zero writes to any table) and
+atomic (it writes a temp directory and renames it over `--out`, which defaults to
+a `vault/` directory under the home's evals area). Since the export **replaces
+`--out` wholesale**, it refuses to overwrite a non-empty directory that is not
+itself a prior gitmoot vault (one carrying a `manifest.json`), so pointing it at
+an existing Obsidian vault such as `--out ~/my-vault` can never silently delete
+your own notes; pass `--force` to override.
+
 ## Phases
 
 - **Phase 0** — typed `learnings` in the result contract; the two-table schema

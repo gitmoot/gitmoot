@@ -1568,6 +1568,7 @@ Inspect and measure the store (all read-only):
 gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo] [--json]
 gitmoot memory replay [--agent NAME] [--repo owner/repo] [--limit N] [--json]
 gitmoot memory eval --fixtures fixtures.json [--k N] [--json]
+gitmoot memory vault export [--out DIR] [--agent NAME] [--force] [--json]
 ```
 
 `memory list` shows confirmed memories and/or pending observations. `memory
@@ -1577,6 +1578,23 @@ entries injected) — it measures injection *mechanics*, not outcome quality
 (running real agents twice is a later-phase gate). `memory eval` computes
 recall/precision@K of retrieval over a labeled fixtures file whose cases are
 `{agent, repo, instructions, expected_keys}`.
+
+`memory vault export` renders confirmed memory as a **disposable, Obsidian-compatible
+vault view** (#737): one Markdown note per confirmed memory (sorted-key YAML
+frontmatter + the content verbatim + a `## Links` section of FTS co-occurrence
+`[[wikilinks]]`), a per-owner index note, and a `manifest.json` staleness anchor.
+It is a **view, not a replica**: the SQLite store stays the only source of truth,
+so the vault is regenerated from scratch on every export, is safe to delete, and
+is **deterministic** — the same store produces byte-identical files (there is no
+`exported_at`; filenames are stable `NNNNNNNNN-<slug>.md` from the memory id). The
+export is **read-only** (zero writes to any table) and writes to a temp dir then
+atomically renames over `--out` (default: a `vault/` directory under the home's
+evals area). `--agent NAME` narrows the export to one agent owner. Because the
+export **replaces `--out` wholesale**, it refuses to overwrite a non-empty directory
+that is not itself a prior gitmoot vault (one carrying a `manifest.json`) so an
+accidental `--out ~/my-obsidian-vault` can never delete your own notes; pass
+`--force` to override. This is P1 of the two-way memory bridge; `vault import` /
+`memory ingest` land in later phases.
 
 ## Pipelines
 

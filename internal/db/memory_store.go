@@ -327,6 +327,79 @@ LIMIT ?`,
 	return scanConfirmedMemories(rows)
 }
 
+// ListConfirmedMemoriesForVault returns every NON-superseded confirmed row for
+// the deterministic `memory vault export` (#737 P1), across all owner kinds,
+// repos, and scopes, ordered by id for a stable traversal. superseded_by is
+// COALESCEd (0 == not superseded) but rows carrying a supersede pointer are
+// filtered out here — the vault is a view of the injectable/current set. A
+// non-empty agentRef narrows the export to a single agent owner (owner_kind
+// 'agent', owner_ref = agentRef). Plain read, no FTS, zero writes.
+func (s *Store) ListConfirmedMemoriesForVault(ctx context.Context, agentRef string) ([]ConfirmedMemory, error) {
+	query := `
+SELECT id, owner_kind, owner_ref, owner_version, repo, scope, key, content,
+	provenance, source_job, first_confirmed_at, updated_at, COALESCE(superseded_by, 0)
+FROM confirmed_memories
+WHERE superseded_by IS NULL`
+	var args []any
+	if strings.TrimSpace(agentRef) != "" {
+		query += "\n\tAND owner_kind = 'agent' AND owner_ref = ?"
+		args = append(args, agentRef)
+	}
+	query += "\nORDER BY id"
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list confirmed memories for vault: %w", err)
+	}
+	defer rows.Close()
+	var out []ConfirmedMemory
+	for rows.Next() {
+		var c ConfirmedMemory
+		var repoNull sql.NullString
+		if err := rows.Scan(&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &repoNull,
+			&c.Scope, &c.Key, &c.Content, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt, &c.UpdatedAt, &c.SupersededBy); err != nil {
+			return nil, err
+		}
+		c.Repo = repoNull.String
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// QueryConfirmedMemoryVaultLinks is the VAULT-LOCAL co-occurrence link helper for
+// `memory vault export` (#737 P1). It runs the SAME owner/repo visibility policy
+// and superseded filter as QueryConfirmedMemories, but orders bm25 THEN id
+// ascending — a deterministic tie-break the injection path deliberately lacks
+// (its updated_at-DESC secondary sort is fine for a prompt but would make the
+// vault non-reproducible under bm25 ties). It exists ONLY to serve the
+// deterministic export; do NOT route job-prompt injection through it. The caller
+// excludes self and caps at K. matchQuery MUST be a sanitized MATCH string
+// (memory.SanitizeFTSQuery) — never raw text.
+func (s *Store) QueryConfirmedMemoryVaultLinks(ctx context.Context, owner MemoryOwner, repo, matchQuery string, limit int) ([]ConfirmedMemory, error) {
+	if strings.TrimSpace(matchQuery) == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 6
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.repo, c.scope, c.key, c.content,
+	c.provenance, c.source_job, c.first_confirmed_at, c.updated_at
+FROM confirmed_memories_fts f
+JOIN confirmed_memories c ON c.id = f.rowid
+WHERE f.confirmed_memories_fts MATCH ?
+	AND c.owner_kind = ? AND c.owner_ref = ? AND c.owner_version = ?
+	AND (c.scope = 'general' OR c.repo = ?)
+	AND c.superseded_by IS NULL
+ORDER BY bm25(f.confirmed_memories_fts), c.id
+LIMIT ?`,
+		matchQuery, owner.Kind, owner.Ref, owner.Version, repo, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query confirmed memory vault links: %w", err)
+	}
+	defer rows.Close()
+	return scanConfirmedMemories(rows)
+}
+
 // ListConfirmedMemories returns confirmed rows for the audit CLI, filtered
 // optionally by owner ref and repo. A blank ownerRef matches all owners; a blank
 // repo matches all repos (both repo-scoped and general).
