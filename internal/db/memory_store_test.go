@@ -208,3 +208,94 @@ func mustUpsert(t *testing.T, store *Store, cm ConfirmedMemory) int64 {
 	}
 	return id
 }
+
+// TestObservationContentHashesSpansBothTiers proves ingest dedup sees content in
+// BOTH memory_observations and confirmed_memories for an owner.
+func TestObservationContentHashesSpansBothTiers(t *testing.T) {
+	ctx := context.Background()
+	store := openMemTestStore(t)
+	owner := agentOwner("lead")
+
+	if _, err := store.InsertMemoryObservation(ctx, MemoryObservation{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "obs-a",
+		Content: "the deploy host is the CI box", TrustMark: "low",
+	}); err != nil {
+		t.Fatalf("insert obs: %v", err)
+	}
+	if _, err := store.UpsertConfirmedMemory(ctx, ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "conf-b",
+		Content: "arm64 runners are slow", Provenance: "test",
+	}); err != nil {
+		t.Fatalf("upsert confirmed: %v", err)
+	}
+
+	hashes, err := store.ObservationContentHashes(ctx, "lead")
+	if err != nil {
+		t.Fatalf("hashes: %v", err)
+	}
+	if _, ok := hashes[sha256HexOf("the deploy host is the CI box")]; !ok {
+		t.Fatal("observation content hash missing")
+	}
+	if _, ok := hashes[sha256HexOf("arm64 runners are slow")]; !ok {
+		t.Fatal("confirmed content hash missing")
+	}
+	// A different owner's content is not in this owner's set.
+	if _, ok := hashes[sha256HexOf("unrelated content")]; ok {
+		t.Fatal("unexpected hash present")
+	}
+}
+
+// TestListMemoryObservationsWithConfirmationFlagsConfirmedKeys proves the join
+// flags exactly the observations whose owner+repo+key already exists confirmed,
+// and that the provenance-prefix filter is a literal (wildcard-safe) prefix.
+func TestListMemoryObservationsWithConfirmationFlagsConfirmedKeys(t *testing.T) {
+	ctx := context.Background()
+	store := openMemTestStore(t)
+	owner := agentOwner("lead")
+
+	if _, err := store.InsertMemoryObservation(ctx, MemoryObservation{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "k-confirmed",
+		Content: "already promoted", Provenance: "ingest:notes/a.md", TrustMark: "low",
+	}); err != nil {
+		t.Fatalf("insert obs a: %v", err)
+	}
+	if _, err := store.InsertMemoryObservation(ctx, MemoryObservation{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "k-pending",
+		Content: "still pending", Provenance: "ingest:notes/b.md", TrustMark: "low",
+	}); err != nil {
+		t.Fatalf("insert obs b: %v", err)
+	}
+	if _, err := store.UpsertConfirmedMemory(ctx, ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "k-confirmed",
+		Content: "already promoted", Provenance: "ingest:notes/a.md",
+	}); err != nil {
+		t.Fatalf("confirm a: %v", err)
+	}
+
+	rows, err := store.ListMemoryObservationsWithConfirmation(ctx, "lead", "ingest:")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 ingest observations, got %d", len(rows))
+	}
+	got := map[string]bool{}
+	for _, r := range rows {
+		got[r.Key] = r.Confirmed
+	}
+	if !got["k-confirmed"] {
+		t.Fatal("k-confirmed should be flagged confirmed")
+	}
+	if got["k-pending"] {
+		t.Fatal("k-pending should NOT be flagged confirmed")
+	}
+
+	// Prefix with a LIKE metacharacter matches nothing (escaped literal).
+	none, err := store.ListMemoryObservationsWithConfirmation(ctx, "lead", "ingest:%")
+	if err != nil {
+		t.Fatalf("list escaped: %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("literal %%-prefix should match no rows, got %d", len(none))
+	}
+}
