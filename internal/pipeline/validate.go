@@ -21,15 +21,25 @@ func (s *Spec) normalize() {
 	for i := range s.Stages {
 		s.Stages[i].ID = strings.TrimSpace(s.Stages[i].ID)
 		s.Stages[i].Cmd = strings.TrimSpace(s.Stages[i].Cmd)
+		s.Stages[i].Agent = strings.TrimSpace(s.Stages[i].Agent)
+		s.Stages[i].Prompt = strings.TrimSpace(s.Stages[i].Prompt)
+		s.Stages[i].Action = strings.TrimSpace(s.Stages[i].Action)
 		s.Stages[i].Timeout = strings.TrimSpace(s.Stages[i].Timeout)
 		s.Stages[i].Needs = trimAll(s.Stages[i].Needs)
 		s.Stages[i].SuccessDecisions = trimAll(s.Stages[i].SuccessDecisions)
+		// An agent stage defaults to the read-only "ask" verb when action is unset.
+		// A shell stage never carries an action, so this only touches agent stages.
+		if s.Stages[i].Agent != "" && s.Stages[i].Action == "" {
+			s.Stages[i].Action = DefaultAgentStageAction
+		}
 	}
 }
 
 // Validate enforces the structural invariants of a pipeline spec: a name-safe
-// pipeline name, at least one stage, unique name-safe stage ids, a required cmd
-// per stage, needs that reference known sibling ids (never the stage itself),
+// pipeline name, at least one stage, unique name-safe stage ids, exactly one of
+// cmd or agent per stage (an agent stage requiring a prompt and a read-only
+// ask/review action), needs that reference known sibling ids (never the stage
+// itself),
 // a needs graph with no cycle, parseable positive timeouts, non-negative retry,
 // a valid schedule, and success_decisions drawn from SuccessDecisionCandidates.
 // It mirrors the shape of the delegation graph validator (workflow/result.go):
@@ -66,8 +76,8 @@ func (s Spec) Validate() error {
 		known[stage.ID] = struct{}{}
 	}
 	for _, stage := range s.Stages {
-		if stage.Cmd == "" {
-			return fmt.Errorf("pipeline %q stage %q has no cmd", s.Name, stage.ID)
+		if err := validateStageExecutor(s.Name, stage); err != nil {
+			return err
 		}
 		if stage.Retry < 0 {
 			return fmt.Errorf("pipeline %q stage %q retry must be >= 0", s.Name, stage.ID)
@@ -177,6 +187,56 @@ func (s Spec) detectCycle() error {
 		}
 	}
 	return nil
+}
+
+// validateStageExecutor enforces the EXACTLY-ONE-OF cmd|agent contract (#757). A
+// shell stage (cmd set, agent empty) is unchanged. An agent stage (agent set, cmd
+// empty) must carry a non-empty prompt and a read-only action (ask/review, never
+// implement); normalize() already defaulted an empty action to "ask", so a blank
+// action here means the stage set neither cmd nor agent. Setting both, or neither,
+// is an error.
+func validateStageExecutor(pipelineName string, stage Stage) error {
+	hasCmd := stage.Cmd != ""
+	hasAgent := stage.Agent != ""
+	switch {
+	case hasCmd && hasAgent:
+		return fmt.Errorf("pipeline %q stage %q sets both cmd and agent; a stage is exactly one of a shell cmd or an agent", pipelineName, stage.ID)
+	case !hasCmd && !hasAgent:
+		return fmt.Errorf("pipeline %q stage %q has neither cmd nor agent; a stage needs exactly one", pipelineName, stage.ID)
+	case hasCmd:
+		// A shell stage carries no agent-only fields; a stray prompt/action is a
+		// mis-declared stage (very likely a forgotten agent: key), so reject it.
+		if stage.Prompt != "" {
+			return fmt.Errorf("pipeline %q stage %q sets prompt but is a shell (cmd) stage; prompt is only for agent stages", pipelineName, stage.ID)
+		}
+		if stage.Action != "" {
+			return fmt.Errorf("pipeline %q stage %q sets action but is a shell (cmd) stage; action is only for agent stages", pipelineName, stage.ID)
+		}
+		return nil
+	default: // hasAgent
+		if !validToken(stage.Agent) {
+			return fmt.Errorf("pipeline %q stage %q agent %q must be a name-safe token (letters, digits, '-', '_')", pipelineName, stage.ID, stage.Agent)
+		}
+		if stage.Prompt == "" {
+			return fmt.Errorf("pipeline %q stage %q agent stage requires a non-empty prompt", pipelineName, stage.ID)
+		}
+		if stage.Action == "implement" {
+			return fmt.Errorf("pipeline %q stage %q agent stage action %q is not allowed; an agent stage is a read-only leaf (use one of: %s)", pipelineName, stage.ID, stage.Action, strings.Join(AgentStageActionCandidates, ", "))
+		}
+		if !containsToken(AgentStageActionCandidates, stage.Action) {
+			return fmt.Errorf("pipeline %q stage %q agent stage action %q is invalid; use one of: %s", pipelineName, stage.ID, stage.Action, strings.Join(AgentStageActionCandidates, ", "))
+		}
+		return nil
+	}
+}
+
+func containsToken(candidates []string, value string) bool {
+	for _, c := range candidates {
+		if c == value {
+			return true
+		}
+	}
+	return false
 }
 
 // validateDecisions rejects any success_decisions value outside

@@ -31,6 +31,15 @@ var DefaultSuccessDecisions = []string{"approved", "implemented"}
 // either as a success would contradict the advance semantics.
 var SuccessDecisionCandidates = []string{"approved", "implemented", "changes_requested"}
 
+// DefaultAgentStageAction is the read-only agent verb an agent stage runs when
+// action is unset (#757). Agent stages are leaves, so the default is "ask".
+const DefaultAgentStageAction = "ask"
+
+// AgentStageActionCandidates are the read-only verbs an agent stage MAY set in
+// action (#757). Both are read-only; "implement" is deliberately excluded — an
+// agent stage must never write, fan out, or leave the read-only leaf contract.
+var AgentStageActionCandidates = []string{"ask", "review"}
+
 // Spec is the parsed, validated declaration of a pipeline.
 type Spec struct {
 	// Name is the pipeline's stable identifier (the DB primary key and the stem of
@@ -59,13 +68,30 @@ type Schedule struct {
 	Jitter string `yaml:"jitter,omitempty"`
 }
 
-// Stage is one shell step in the pipeline DAG.
+// Stage is one step in the pipeline DAG. A stage is EITHER a shell step (cmd) or
+// an agent step (agent) — exactly one of the two (see Validate). An agent stage
+// runs a named managed gitmoot agent as a LEAF (#757): it may only ask/review
+// (read-only), never fan out, and its result folds by decision just like a shell
+// stage.
 type Stage struct {
 	// ID is the stage's unique, name-safe identifier. It appears verbatim in the
 	// stage job fingerprint and deterministic job id, so it must be a safe token.
 	ID string `yaml:"id"`
-	// Cmd is the shell command run verbatim via `sh -c` (required).
-	Cmd string `yaml:"cmd"`
+	// Cmd is the shell command run verbatim via `sh -c`. Exactly one of Cmd or
+	// Agent must be set per stage (#757); a cmd stage's behavior is unchanged.
+	Cmd string `yaml:"cmd,omitempty"`
+	// Agent, when set, runs the named managed gitmoot agent for this stage instead
+	// of a shell command (#757). The agent runs as a LEAF: it may only ask/review
+	// (read-only) and its delegations are stripped. Mutually exclusive with Cmd.
+	Agent string `yaml:"agent,omitempty"`
+	// Prompt is the instruction handed to an agent stage's agent (required when
+	// Agent is set; ignored for a shell stage). Builder 2 prepends upstream
+	// needs-context; for now the runtime prompt is Prompt verbatim.
+	Prompt string `yaml:"prompt,omitempty"`
+	// Action is the read-only agent verb for an agent stage: "ask" (default) or
+	// "review". "implement" is rejected — an agent stage must stay a read-only
+	// leaf. Ignored for a shell stage.
+	Action string `yaml:"action,omitempty"`
 	// Needs lists the ids of stages that must succeed before this stage is enqueued.
 	Needs []string `yaml:"needs,omitempty"`
 	// Timeout optionally bounds the stage job (a positive Go duration when set).

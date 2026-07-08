@@ -49,6 +49,47 @@ func TestLoadValidSpec(t *testing.T) {
 	}
 }
 
+// TestLoadValidAgentSpec exercises the #757 agent-stage schema: an agent stage
+// with no explicit action defaults to "ask", an explicit review action is kept,
+// and shell + agent stages coexist in one DAG.
+func TestLoadValidAgentSpec(t *testing.T) {
+	const agentSpec = `
+name: mixed-flow
+repo: jerryfane/gitmoot
+stages:
+  - id: build
+    cmd: make build
+  - id: review
+    agent: reviewer
+    prompt: Review the build output.
+    needs: [build]
+  - id: audit
+    agent: auditor
+    prompt: Audit dependencies.
+    action: review
+    needs: [build]
+`
+	spec, err := Load([]byte(agentSpec))
+	if err != nil {
+		t.Fatalf("Load valid agent spec: %v", err)
+	}
+	if spec.Stages[0].Cmd != "make build" || spec.Stages[0].Agent != "" {
+		t.Fatalf("unexpected shell stage: %+v", spec.Stages[0])
+	}
+	if spec.Stages[1].Agent != "reviewer" || spec.Stages[1].Cmd != "" {
+		t.Fatalf("unexpected agent stage: %+v", spec.Stages[1])
+	}
+	if spec.Stages[1].Action != DefaultAgentStageAction {
+		t.Fatalf("stage review action = %q, want default %q", spec.Stages[1].Action, DefaultAgentStageAction)
+	}
+	if spec.Stages[1].Prompt != "Review the build output." {
+		t.Fatalf("stage review prompt = %q", spec.Stages[1].Prompt)
+	}
+	if spec.Stages[2].Action != "review" {
+		t.Fatalf("stage audit action = %q, want review", spec.Stages[2].Action)
+	}
+}
+
 func TestLoadValidationErrors(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -76,9 +117,34 @@ func TestLoadValidationErrors(t *testing.T) {
 			wantSub: `stage id "a" is not unique`,
 		},
 		{
-			name:    "missing cmd",
+			name:    "neither cmd nor agent",
 			spec:    "name: p\nstages:\n  - {id: a, cmd: \"\"}\n",
-			wantSub: `stage "a" has no cmd`,
+			wantSub: `stage "a" has neither cmd nor agent`,
+		},
+		{
+			name:    "both cmd and agent",
+			spec:    "name: p\nstages:\n  - {id: a, cmd: echo, agent: rev, prompt: hi}\n",
+			wantSub: `stage "a" sets both cmd and agent`,
+		},
+		{
+			name:    "agent without prompt",
+			spec:    "name: p\nstages:\n  - {id: a, agent: rev}\n",
+			wantSub: `stage "a" agent stage requires a non-empty prompt`,
+		},
+		{
+			name:    "agent implement rejected",
+			spec:    "name: p\nstages:\n  - {id: a, agent: rev, prompt: hi, action: implement}\n",
+			wantSub: `action "implement" is not allowed`,
+		},
+		{
+			name:    "agent bad action",
+			spec:    "name: p\nstages:\n  - {id: a, agent: rev, prompt: hi, action: deploy}\n",
+			wantSub: `action "deploy" is invalid`,
+		},
+		{
+			name:    "shell stage with prompt",
+			spec:    "name: p\nstages:\n  - {id: a, cmd: echo, prompt: hi}\n",
+			wantSub: `stage "a" sets prompt but is a shell (cmd) stage`,
 		},
 		{
 			name:    "unknown need",

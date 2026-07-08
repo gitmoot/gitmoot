@@ -149,6 +149,23 @@ func runPipelineAdd(args []string, stdout, stderr io.Writer) int {
 		if existing, err := store.GetAgent(context.Background(), runnerName); err == nil && existing.Runtime != runtime.ShellRuntime {
 			return fmt.Errorf("runner agent name %q collides with an existing %s agent", runnerName, existing.Runtime)
 		}
+		// Agent stages (#757) run a NAMED managed agent, not the hidden shell runner.
+		// Validate every referenced agent exists at add time so a typo'd or missing
+		// agent surfaces here rather than as a stage job the worker can never resolve.
+		// Each distinct name is checked once.
+		checkedAgents := make(map[string]struct{}, len(spec.Stages))
+		for _, stage := range spec.Stages {
+			if stage.Agent == "" {
+				continue
+			}
+			if _, ok := checkedAgents[stage.Agent]; ok {
+				continue
+			}
+			checkedAgents[stage.Agent] = struct{}{}
+			if _, err := store.GetAgent(context.Background(), stage.Agent); err != nil {
+				return fmt.Errorf("stage %q references agent %q which does not exist; create it first (gitmoot agent ...)", stage.ID, stage.Agent)
+			}
+		}
 		if err := store.CreateOrUpdatePipeline(context.Background(), record); err != nil {
 			return err
 		}
@@ -196,7 +213,10 @@ func pipelineRunnerAgent(name, repo string) db.Agent {
 
 type pipelineStageJSON struct {
 	ID               string   `json:"id"`
-	Cmd              string   `json:"cmd"`
+	Cmd              string   `json:"cmd,omitempty"`
+	Agent            string   `json:"agent,omitempty"`
+	Prompt           string   `json:"prompt,omitempty"`
+	Action           string   `json:"action,omitempty"`
 	Needs            []string `json:"needs,omitempty"`
 	Timeout          string   `json:"timeout,omitempty"`
 	Retry            int      `json:"retry,omitempty"`
@@ -434,6 +454,9 @@ func pipelineToJSON(record db.Pipeline, withStages bool) pipelineJSON {
 				out.Stages = append(out.Stages, pipelineStageJSON{
 					ID:               stage.ID,
 					Cmd:              stage.Cmd,
+					Agent:            stage.Agent,
+					Prompt:           stage.Prompt,
+					Action:           stage.Action,
 					Needs:            stage.Needs,
 					Timeout:          stage.Timeout,
 					Retry:            stage.Retry,
@@ -466,6 +489,10 @@ func printPipeline(stdout io.Writer, record db.Pipeline) {
 		needs := "-"
 		if len(stage.Needs) > 0 {
 			needs = strings.Join(stage.Needs, ",")
+		}
+		if stage.Agent != "" {
+			writeLine(stdout, "  %s\tneeds=%s\tagent=%s\taction=%s", stage.ID, needs, stage.Agent, stage.Action)
+			continue
 		}
 		writeLine(stdout, "  %s\tneeds=%s\tcmd=%s", stage.ID, needs, stage.Cmd)
 	}

@@ -69,6 +69,30 @@ func pipelineStageFingerprint(pipelineName, runID, stageID string, attempt int) 
 // id so all of a run's stage jobs share a root. The per-stage timeout is plumbed
 // as JobTimeout.
 func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.PipelineRun, attempt int) workflow.JobRequest {
+	// AGENT stage (#757): bind the job to the named managed agent and let IT run on
+	// its OWN registered runtime — no RuntimeOverride, so the agent's real
+	// claude/codex runtime and session are used. The stage.Prompt is the runtime
+	// instruction (carried in Instructions, exactly as `agent ask`/`agent review`
+	// plumb their message; builder 2 will PREPEND upstream needs-context here). It
+	// stays a LEAF: Sender=PipelineJobSender (the mailbox strips its delegations),
+	// empty ParentJobID (never enters delegation advancement), RootJobID=run.ID. The
+	// action is the validated read-only ask/review. Everything else (fingerprint,
+	// timeout, root) matches the shell path so the advancer folds it identically.
+	if stage.Agent != "" {
+		return workflow.JobRequest{
+			ID:           pipelineStageJobID(run.ID, stage.ID, attempt),
+			Agent:        stage.Agent,
+			Action:       stage.Action,
+			Repo:         rec.Repo,
+			Sender:       workflow.PipelineJobSender,
+			Instructions: stage.Prompt,
+			Fingerprint:  pipelineStageFingerprint(rec.Name, run.ID, stage.ID, attempt),
+			RootJobID:    run.ID,
+			JobTimeout:   stage.Timeout,
+		}
+	}
+	// SHELL stage: byte-identical to before — the runner agent runs stage.Cmd via a
+	// per-job shell runtime override.
 	return workflow.JobRequest{
 		ID:                 pipelineStageJobID(run.ID, stage.ID, attempt),
 		Agent:              pipelineRunnerAgentName(rec.Name),
