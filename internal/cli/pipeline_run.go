@@ -2,12 +2,16 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
 	gitutil "github.com/jerryfane/gitmoot/internal/git"
 	"github.com/jerryfane/gitmoot/internal/pipeline"
@@ -51,6 +55,18 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 		// rather than stalling the pipeline scan loop. Shell stages carry a
 		// RuntimeOverride and are excluded, so their request is byte-identical.
 		request, worktreePath, worktreeErr := allocatePipelineStageReadOnlyWorktree(ctx, store, home, request)
+		// #768: a MUTATING implement stage takes the WRITABLE task-worktree path
+		// instead of the read-only committed-tip worktree — it must commit + push. Unlike
+		// the read-only allocator (fail-OPEN), this one is fail-CLOSED: on an active
+		// implement job / live process / uncommitted changes it errors and the stage is
+		// NOT enqueued, so a retry can never duplicate or clobber a branch/PR (`gitmoot
+		// task recover` is the operator escape hatch). The two allocators are mutually
+		// exclusive — read-only eligibility excludes the implement action.
+		var writableErr error
+		request, writableErr = allocatePipelineStageWritableWorktree(ctx, store, home, request)
+		if writableErr != nil {
+			return db.Job{}, writableErr
+		}
 		job, err := mailbox.Enqueue(ctx, request)
 		if err != nil {
 			// The worktree is created on disk BEFORE Enqueue; a failed Enqueue leaves
@@ -162,6 +178,116 @@ func pipelineStageCheckoutPath(ctx context.Context, store *db.Store, repo string
 	return strings.TrimSpace(record.CheckoutPath)
 }
 
+// pipelineStageImplementWorktreeEligible reports whether a stage job request is a
+// repo-bound MUTATING implement stage (#768) that needs a WRITABLE task-worktree.
+// True only for a pipeline-sender implement job bound to a named agent, running
+// against a repo, that carries NO runtime override (the shell runner sets one) and NO
+// worktree yet. Every read-only agent stage (ask/review) and every shell stage is
+// excluded — the read-only allocator (which itself excludes non-ask/review) owns those.
+func pipelineStageImplementWorktreeEligible(request workflow.JobRequest) bool {
+	if request.Sender != workflow.PipelineJobSender {
+		return false
+	}
+	if strings.TrimSpace(request.RuntimeOverride) != "" {
+		return false
+	}
+	if strings.TrimSpace(request.Agent) == "" {
+		return false
+	}
+	if strings.TrimSpace(request.Action) != "implement" {
+		return false
+	}
+	if strings.TrimSpace(request.Repo) == "" {
+		return false
+	}
+	return strings.TrimSpace(request.WorktreePath) == ""
+}
+
+// allocatePipelineStageWritableWorktree gives a MUTATING implement stage (#768) a real
+// WRITABLE task-worktree on its DETERMINISTIC branch by REUSING the existing implement
+// dispatch preparation (prepareLocalImplementDispatchRequest): its GetTaskByRepoBranch
+// reuse lands a retry in the SAME branch/worktree (never a duplicate PR), and its
+// fail-closed guards (an active implement job, a live process still inside the
+// worktree, or uncommitted changes) reject a retry that would clobber or duplicate
+// work. Unlike the read-only allocator it is FAIL-CLOSED: any error propagates so the
+// stage is NOT enqueued. An ineligible request (every non-implement stage) returns
+// unchanged with a nil error. On success the request carries the task worktree path +
+// the resolved deterministic branch/task/head, so the enqueued job keys worktree:<path>
+// (mutating same-repo stages parallelize; the only serialization is the brief
+// checkout-mutation lock during allocation). ReadOnlyWorktree is deliberately left
+// false — the task worktree is durable (disposed by the task lifecycle, not the #739
+// read-only cleanup).
+func allocatePipelineStageWritableWorktree(ctx context.Context, store *db.Store, home string, request workflow.JobRequest) (workflow.JobRequest, error) {
+	if !pipelineStageImplementWorktreeEligible(request) {
+		return request, nil
+	}
+	record, err := store.GetRepo(ctx, request.Repo)
+	if err != nil {
+		return request, fmt.Errorf("resolve repo %q for implement stage: %w", request.Repo, err)
+	}
+	repo, err := daemon.ParseRepository(request.Repo)
+	if err != nil {
+		return request, err
+	}
+	// Ensure the DETERMINISTIC task row exists so prepareLocalImplementDispatchRequest's
+	// BRANCH-reuse path adopts THIS run+stage's task id — and, crucially, so its
+	// fail-closed guards (active job / live process / uncommitted changes) run on EVERY
+	// attempt. We therefore hand it an EMPTY TaskID (which routes through that guarded
+	// branch-reuse block) plus the deterministic Branch; passing a non-empty TaskID would
+	// skip the guards entirely. Idempotent: created once (Planned), reused thereafter.
+	if _, gerr := store.GetTask(ctx, request.TaskID); gerr != nil {
+		if !errors.Is(gerr, sql.ErrNoRows) {
+			return request, gerr
+		}
+		if uerr := store.UpsertTask(ctx, db.Task{
+			ID:           request.TaskID,
+			RepoFullName: request.Repo,
+			GoalID:       firstNonEmpty(request.GoalID, "pipeline"),
+			Title:        firstNonEmpty(request.TaskTitle, request.TaskID),
+			State:        string(workflow.TaskPlanned),
+			Branch:       request.Branch,
+		}); uerr != nil {
+			return request, uerr
+		}
+	}
+	dispatch := localAgentDispatchRequest{
+		Home:         home,
+		Agent:        request.Agent,
+		Action:       "implement",
+		Instructions: request.Instructions,
+		Branch:       request.Branch,
+		GoalID:       request.GoalID,
+		TaskTitle:    request.TaskTitle,
+		RepoFlag:     request.Repo,
+	}
+	task, dispatch, err := prepareLocalImplementDispatchRequest(ctx, store, record, repo, dispatch)
+	if err != nil {
+		return request, err
+	}
+	request.WorktreePath = task.WorktreePath
+	request.Branch = dispatch.Branch
+	request.TaskID = dispatch.TaskID
+	request.HeadSHA = dispatch.HeadSHA
+	request.GoalID = firstNonEmpty(request.GoalID, dispatch.GoalID)
+	request.TaskTitle = firstNonEmpty(request.TaskTitle, dispatch.TaskTitle)
+	request.LeadAgent = firstNonEmpty(request.LeadAgent, dispatch.LeadAgent)
+	return request, nil
+}
+
+// pipelineStageImplementTaskID / pipelineStageImplementBranch derive the DETERMINISTIC,
+// attempt-INDEPENDENT task id and branch a mutating implement stage (#768) reuses across
+// retries: `pipe-<runID>-<stageID>` and `gitmoot/pipe-<runID>-<stageID>`. Excluding the
+// attempt is what makes attempt N+1 land in the SAME branch/worktree (via
+// GetTaskByRepoBranch reuse) rather than opening a duplicate PR; branches are RUN-scoped,
+// so distinct runs of a scheduled pipeline are distinct logical changes.
+func pipelineStageImplementTaskID(runID, stageID string) string {
+	return fmt.Sprintf("pipe-%s-%s", runID, stageID)
+}
+
+func pipelineStageImplementBranch(runID, stageID string) string {
+	return "gitmoot/" + pipelineStageImplementTaskID(runID, stageID)
+}
+
 // pipelineRunID derives a deterministic-per-invocation run id: a recognizable
 // "prun-" marker, the pipeline name (a validated name-safe token), and the
 // nanosecond clock so distinct runs never collide. The marker also lets
@@ -201,6 +327,11 @@ func pipelineStageFingerprint(pipelineName, runID, stageID string, attempt int) 
 // builder: an implement kind #768 appends its writable-worktree/branch branch there).
 func pipelineStageMintsJob(stage pipeline.Stage) bool {
 	switch stage.Kind() {
+	case pipeline.StageKindGate:
+		// A JOBLESS gate (#768 Phase 2) has no worker/runtime session: the ENQUEUE pass
+		// marks it in-flight (queued) WITHOUT minting a job, and the settle seam folds it
+		// on its external predicate (pr_merged) instead of on a job's terminal state.
+		return false
 	default:
 		return true
 	}
@@ -218,6 +349,29 @@ func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.Pipel
 	// advancement), RootJobID=run.ID. The action is the validated read-only
 	// ask/review. Everything else (fingerprint, timeout, root) matches the shell path
 	// so the advancer folds it identically.
+	// #768 MUTATING implement stage: bind to the named agent running its OWN runtime,
+	// but — unlike a read-only agent stage — carry a DETERMINISTIC, attempt-INDEPENDENT
+	// Branch/TaskID so a retry lands in the SAME branch/worktree (never a duplicate PR).
+	// The writable task-worktree itself is allocated at the enqueue seam
+	// (allocatePipelineStageWritableWorktree), which reuses the existing implement
+	// dispatch's GetTaskByRepoBranch reuse + fail-closed guards. Still a LEAF
+	// (Sender=pipeline strips delegations/human_questions) and the pipeline never merges
+	// its PR. This is an APPEND above the read-only agent branch, which stays byte-identical.
+	if stage.Kind() == pipeline.StageKindAgentImplement {
+		return workflow.JobRequest{
+			ID:           pipelineStageJobID(run.ID, stage.ID, attempt),
+			Agent:        stage.Agent,
+			Action:       "implement",
+			Repo:         rec.Repo,
+			Branch:       pipelineStageImplementBranch(run.ID, stage.ID),
+			TaskID:       pipelineStageImplementTaskID(run.ID, stage.ID),
+			Sender:       workflow.PipelineJobSender,
+			Instructions: upstreamContext + stage.Prompt,
+			Fingerprint:  pipelineStageFingerprint(rec.Name, run.ID, stage.ID, attempt),
+			RootJobID:    run.ID,
+			JobTimeout:   stage.Timeout,
+		}
+	}
 	if stage.Agent != "" {
 		return workflow.JobRequest{
 			ID:           pipelineStageJobID(run.ID, stage.ID, attempt),
@@ -578,12 +732,14 @@ func advancePipelineRun(ctx context.Context, store *db.Store, enqueue pipelineSt
 			continue
 		}
 		if !pipelineStageMintsJob(stage) {
-			// A JOBLESS kind (future gate #768 Phase 2) becomes in-flight WITHOUT a
-			// worker job; the settle seam (which owns the JobID guard) then drives it
-			// on its external predicate. No kind today is jobless, so this branch is
-			// never taken and the enqueue path below is byte-identical. Kept here so a
-			// gate is a pure append (`case StageKindGate: return false` in
-			// pipelineStageMintsJob), not an edit to this shared enqueue loop.
+			// A JOBLESS kind becomes in-flight WITHOUT a worker job; the settle seam
+			// (which owns the JobID guard) then drives it on its external predicate. The
+			// #768 Phase 2 gate stage is jobless (pipelineStageMintsJob returns false for
+			// StageKindGate), so it TAKES this branch: the row goes queued with StartedAt
+			// set here but no JobID — and that StartedAt is exactly what pipelineGateTimedOut
+			// measures the gate's wait from. This stays a pure append (`case StageKindGate:
+			// return false` in pipelineStageMintsJob), not an edit to the shared enqueue loop
+			// below, which remains byte-identical for job-minting kinds.
 			row.State = pipeline.StageQueued
 			row.StartedAt = now
 			if err := persistPipelineStage(ctx, store, byID[stage.ID], row); err != nil {
@@ -751,9 +907,21 @@ type pipelineStageSettleDeps struct {
 // terminal, all unchanged. Future kinds branch here on stage.Kind() using deps.
 func stageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec pipeline.Spec, stage pipeline.Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
 	switch stage.Kind() {
+	case pipeline.StageKindAgentImplement:
+		// #768 MUTATING implement stage (Model A: fold-on-PR-opened). It settles like
+		// the default job-decision path but holds a SUCCESS fold back until the job
+		// payload carries an opened PR — closing the race where the implement job reaches
+		// terminal success a beat before the finalizer stamps the PR.
+		return implementStageSettleOutcome(ctx, deps, spec, stage, stageRow)
+	case pipeline.StageKindGate:
+		// #768 Phase 2 JOBLESS gate: it has no worker job, so it NEVER calls GetJob. It
+		// folds success once its external predicate (pr_merged on the upstream source
+		// stage's PR) holds, or parks the run on the stage timeout. The predicate reads
+		// only the store (upstream stage row + the polled PR state), is non-blocking and
+		// ctx-bounded, and fails OPEN (settled=false while the merge has not landed / the
+		// PR is not yet recorded); a genuine store error surfaces via err.
+		return gateStageSettleOutcome(ctx, deps, spec, stage, stageRow)
 	// A future kind adds its case here, e.g.:
-	//   case pipeline.StageKindGate:       // jobless: never calls GetJob
-	//       return gateStageSettleOutcome(ctx, deps, spec, stage, stageRow)
 	//   case pipeline.StageKindOrchestrate: // re-points nextRow.JobID, stays unsettled
 	//       return orchestrateStageSettleOutcome(ctx, deps, spec, stage, stageRow)
 	default:
@@ -785,6 +953,244 @@ func stageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec 
 		state, summary, needs = foldPipelineStageOutcome(spec.EffectiveSuccessDecisions(stage), job)
 		return true, state, summary, needs, nil, nil
 	}
+}
+
+// implementStageSettleOutcome is the #768 MUTATING implement stage's per-kind settle
+// predicate (Model A: fold-on-PR-opened). Like the default job-decision path it settles
+// only once the stage job is TERMINAL and folds by decision (implemented is already a
+// DefaultSuccessDecision) — with ONE added guard: a SUCCESS fold is held back until the
+// job payload carries an opened PullRequest (> 0). That closes the race where the
+// implement job reaches its terminal success state a beat before the
+// ImplementationFinalizer stamps the opened PR onto the payload; without it a downstream
+// stage could advance believing a PR exists when it does not yet. A blocked/failed
+// decision folds IMMEDIATELY (there is no PR to wait on), and a stage whose job times out
+// folds failed via the same decision path — so the PR guard can never wedge a run. On a
+// successful fold the opened PR number is appended to the stage summary so it flows to
+// downstream stages through the #757 upstream-context injection (which renders the stage
+// summary). It reproduces the default kind's JobID guard + queued->running funnel reflect
+// byte-for-byte for the not-terminal path.
+func implementStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec pipeline.Spec, stage pipeline.Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
+	if strings.TrimSpace(stageRow.JobID) == "" {
+		return false, "", "", nil, nil, nil
+	}
+	job, err := deps.store.GetJob(ctx, stageRow.JobID)
+	if err != nil {
+		return false, "", "", nil, nil, err
+	}
+	if !workflow.IsSettledJobState(job.State) {
+		if job.State == string(workflow.JobRunning) && stageRow.State == pipeline.StageQueued {
+			next := stageRow
+			next.State = pipeline.StageRunning
+			return false, "", "", nil, &next, nil
+		}
+		return false, "", "", nil, nil, nil
+	}
+	state, summary, needs = foldPipelineStageOutcome(spec.EffectiveSuccessDecisions(stage), job)
+	if state == pipeline.StageSucceeded {
+		pr := 0
+		if payload, perr := workflow.ParseJobPayload(job.Payload); perr == nil {
+			pr = payload.PullRequest
+		}
+		if pr <= 0 {
+			// The job settled successfully but no PR is stamped on the payload. Two cases,
+			// disambiguated by the engine's terminal "advance_skipped_no_pr" job event:
+			//   1. FINALIZER RACE (event absent): the implement job reached its terminal
+			//      success state a beat before the ImplementationFinalizer stamped the
+			//      opened PR — WAIT (fold-on-PR-opened); a later scan re-checks once it lands.
+			//   2. TERMINAL NO-OP (event present): the agent produced no diff
+			//      (idempotent/no-op change), so the engine finalized, found nothing pushed,
+			//      recorded "advance_skipped_no_pr" and settled the job for good
+			//      (engine.go). No PR will EVER land, so waiting would wedge the run
+			//      forever ([implement] -> [gate] -> [deploy] never advances). This is a
+			//      legitimate SUCCESS of the implement stage — fold it succeeded with no PR
+			//      marker (a downstream pr_merged gate then bounds its own wait via timeout).
+			skipped, eerr := implementJobSettledNoPR(ctx, deps.store, job.ID)
+			if eerr != nil {
+				return false, "", "", nil, nil, eerr
+			}
+			if !skipped {
+				return false, "", "", nil, nil, nil
+			}
+			return true, state, summary, needs, nil, nil
+		}
+		summary = appendPipelineImplementPR(summary, pr)
+	}
+	return true, state, summary, needs, nil, nil
+}
+
+// implementJobSettledNoPR reports whether the engine has recorded the terminal
+// "advance_skipped_no_pr" marker for an implement job — its definitive signal that the
+// job settled successfully, the finalizer ran (or was not needed), and NO pull request
+// was produced (a no-op/idempotent change with nothing pushed, engine.go). Its presence
+// distinguishes a permanent no-PR success (fold succeeded, never wedge the run) from the
+// transient finalizer race where a PR is a beat away from being stamped (keep waiting).
+func implementJobSettledNoPR(ctx context.Context, store *db.Store, jobID string) (bool, error) {
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	for _, ev := range events {
+		if ev.Kind == "advance_skipped_no_pr" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// appendPipelineImplementPR annotates a mutating implement stage's SUCCESS summary with
+// the opened PR number so downstream stages see it via the #757 upstream-context
+// injection. Deterministic + idempotent: it appends the marker only when a positive PR
+// is present and not already referenced, so a re-derivation is byte-identical.
+func appendPipelineImplementPR(summary string, pr int) string {
+	summary = strings.TrimSpace(summary)
+	marker := fmt.Sprintf("(opened PR #%d)", pr)
+	if strings.Contains(summary, marker) {
+		return summary
+	}
+	if summary == "" {
+		return marker
+	}
+	return summary + " " + marker
+}
+
+// gateStageSettleOutcome is the #768 Phase 2 JOBLESS gate stage's per-kind settle
+// predicate. A gate mints no worker job (pipelineStageMintsJob is false), so it enters
+// the settle pass in the StageQueued state with no JobID and NEVER calls GetJob. It
+// evaluates its external predicate once per advance scan and folds when the predicate
+// holds:
+//
+//   - pr_merged: the PR opened by the upstream SOURCE (implement) stage has MERGED.
+//     The PR number is recovered from the source stage row's summary (where
+//     implementStageSettleOutcome stamped "(opened PR #<n>)"), and merge is read from
+//     the polled pull_requests state (deps.store) — the same store row the daemon's PR
+//     poller / merge-gate keeps current, so this needs no live GitHub call. On merged:
+//     settled=true, state=success. This is the STORE/state path the design prefers; a
+//     bounded GitHub poll would be threaded into pipelineStageSettleDeps as the fallback.
+//
+// It is non-blocking + ctx-bounded and FAILS OPEN: while the PR is not yet recorded or
+// not yet merged it stays in flight (settled=false), never a hung poll. A genuine store
+// error (not sql.ErrNoRows) surfaces via err so the advancer can retry the scan. The
+// wait is bounded by the stage timeout measured from the gate's StartedAt (set when the
+// ENQUEUE pass marked it in-flight): on expiry it parks the run BLOCKED (a gate is a
+// wait, not a mutation — parking blocked, never failed, keeps the retry budget from
+// re-arming the timer). A gate with no timeout waits indefinitely (cheaply — no job).
+// While in flight it reflects the one-time queued->running funnel transition via nextRow.
+func gateStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec pipeline.Spec, stage pipeline.Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
+	// Recover the PR the upstream source stage opened (parsed from its folded summary,
+	// where the implement stage stamped "(opened PR #<n>)"). A missing source row or an
+	// unparseable PR keeps the gate waiting (fail-open) until the timeout parks it.
+	pr := 0
+	if source := strings.TrimSpace(stage.Source); source != "" {
+		if srcRow, ok, gerr := deps.store.GetPipelineRunStage(ctx, deps.run.ID, source); gerr != nil {
+			return false, "", "", nil, nil, gerr
+		} else if ok {
+			pr = parsePipelineImplementPR(srcRow.Summary)
+		}
+	}
+
+	merged := false
+	closedUnmerged := false
+	if pr > 0 {
+		prRow, gerr := deps.store.GetPullRequest(ctx, deps.rec.Repo, int64(pr))
+		if gerr != nil {
+			if !errors.Is(gerr, sql.ErrNoRows) {
+				return false, "", "", nil, nil, gerr
+			}
+			// The PR is not recorded in the store yet — not merged; keep waiting (fail-open).
+		} else {
+			switch strings.ToLower(strings.TrimSpace(prRow.State)) {
+			case "merged":
+				merged = true
+			case "closed":
+				closedUnmerged = true
+			}
+		}
+	}
+	if merged {
+		return true, pipeline.StageSucceeded, fmt.Sprintf("gate %s satisfied: PR #%d merged", stage.Gate, pr), nil, nil, nil
+	}
+	// The upstream PR was CLOSED without merging: pr_merged can NEVER hold now, so the
+	// gate is terminal — waiting would hang the run forever (esp. with no stage timeout).
+	// Park the run BLOCKED (a gate is a wait, not a mutation, so blocked — never failed —
+	// keeps the retry budget from re-arming the timer), naming the terminal reason.
+	if closedUnmerged {
+		want := fmt.Sprintf("PR #%d merged (it was closed without merging)", pr)
+		return true, pipeline.StageBlocked, fmt.Sprintf("gate %s cannot pass: PR #%d was closed without merging", stage.Gate, pr), []string{want}, nil, nil
+	}
+
+	// Not merged yet. Bound the wait against the stage timeout (measured from StartedAt),
+	// parking the run BLOCKED on expiry with a needs entry naming what it waited on.
+	if timedOut, waited := pipelineGateTimedOut(stage, stageRow, deps.now); timedOut {
+		want := pipelineGateWaitDescription(stage.Gate, pr)
+		return true, pipeline.StageBlocked, fmt.Sprintf("gate %s timed out after %s waiting for %s", stage.Gate, waited, want), []string{want}, nil, nil
+	}
+
+	// Still waiting: reflect the one-time queued->running funnel transition so the gate
+	// shows as actively watching, then stay in flight (settled=false).
+	if stageRow.State == pipeline.StageQueued {
+		next := stageRow
+		next.State = pipeline.StageRunning
+		return false, "", "", nil, &next, nil
+	}
+	return false, "", "", nil, nil, nil
+}
+
+// pipelineGateTimedOut reports whether a gate stage's wait has exceeded its stage
+// timeout, measured from the row's StartedAt (set when the ENQUEUE pass marked the
+// jobless gate in-flight) to now. A gate with no timeout (or a not-yet-started row)
+// never times out — it waits indefinitely, cheaply. The elapsed duration is returned
+// for the park summary. Validation already guarantees a set timeout parses positive.
+func pipelineGateTimedOut(stage pipeline.Stage, stageRow db.PipelineRunStage, now time.Time) (bool, time.Duration) {
+	to := strings.TrimSpace(stage.Timeout)
+	if to == "" || stageRow.StartedAt.IsZero() {
+		return false, 0
+	}
+	limit, err := time.ParseDuration(to)
+	if err != nil || limit <= 0 {
+		return false, 0
+	}
+	elapsed := now.Sub(stageRow.StartedAt)
+	return elapsed >= limit, elapsed
+}
+
+// pipelineGateWaitDescription names, for a park summary / needs entry, the external
+// thing a gate is waiting on — the merge of a specific PR when one is known, else the
+// upstream PR generically (it has not been recorded yet).
+func pipelineGateWaitDescription(predicate string, pr int) string {
+	if pr > 0 {
+		return fmt.Sprintf("PR #%d merged", pr)
+	}
+	return fmt.Sprintf("the upstream %s predicate to hold", predicate)
+}
+
+// parsePipelineImplementPR recovers the PR number an implement stage stamped onto its
+// summary via appendPipelineImplementPR ("(opened PR #<n>)"). It returns 0 when no such
+// marker is present or the number is not a positive int — the inverse of the stamping so
+// a gate can read the structured PR back out of the upstream stage row's summary (Phase 1
+// deliberately added no schema column). Deterministic and allocation-light.
+//
+// It matches the LAST occurrence of the marker, not the first: appendPipelineImplementPR
+// always APPENDS the trusted "(opened PR #<n>)" at the very END of the summary, while the
+// leading text is the agent's untrusted free-text decision summary — which could itself
+// contain a literal "(opened PR #<k>)" naming an unrelated PR. Reading the last match
+// binds the gate to the marker gitmoot stamped, never to a number the agent spoofed into
+// its prose.
+func parsePipelineImplementPR(summary string) int {
+	const prefix = "(opened PR #"
+	idx := strings.LastIndex(summary, prefix)
+	if idx < 0 {
+		return 0
+	}
+	rest := summary[idx+len(prefix):]
+	end := strings.IndexByte(rest, ')')
+	if end < 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(rest[:end]))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 // foldPipelineStageOutcome maps a settled stage job to a stage outcome BY DECISION

@@ -24,6 +24,8 @@ func (s *Spec) normalize() {
 		s.Stages[i].Agent = strings.TrimSpace(s.Stages[i].Agent)
 		s.Stages[i].Prompt = strings.TrimSpace(s.Stages[i].Prompt)
 		s.Stages[i].Action = strings.TrimSpace(s.Stages[i].Action)
+		s.Stages[i].Gate = strings.TrimSpace(s.Stages[i].Gate)
+		s.Stages[i].Source = strings.TrimSpace(s.Stages[i].Source)
 		s.Stages[i].Timeout = strings.TrimSpace(s.Stages[i].Timeout)
 		s.Stages[i].Needs = trimAll(s.Stages[i].Needs)
 		s.Stages[i].SuccessDecisions = trimAll(s.Stages[i].SuccessDecisions)
@@ -63,6 +65,7 @@ func (s Spec) Validate() error {
 	}
 
 	known := make(map[string]struct{}, len(s.Stages))
+	stageByID := make(map[string]Stage, len(s.Stages))
 	for _, stage := range s.Stages {
 		if stage.ID == "" {
 			return fmt.Errorf("pipeline %q has a stage with no id", s.Name)
@@ -74,10 +77,27 @@ func (s Spec) Validate() error {
 			return fmt.Errorf("pipeline %q stage id %q is not unique", s.Name, stage.ID)
 		}
 		known[stage.ID] = struct{}{}
+		stageByID[stage.ID] = stage
 	}
 	for _, stage := range s.Stages {
 		if err := validateStageExecutor(s.Name, stage); err != nil {
 			return err
+		}
+		// #768 mutating-implement safety model (spec double-key + scheduled-write gate).
+		// Kept out of validateStageExecutor because it spans stage AND spec context (the
+		// schedule block); an APPEND that leaves every read-only kind's validator intact.
+		if err := s.validateMutatingStage(stage); err != nil {
+			return err
+		}
+		// A gate's source must be a mutating implement stage: the pr_merged predicate reads
+		// the "(opened PR #<n>)" marker only an implement stage stamps onto its summary, so
+		// a gate pointed at a shell/ask/review source would find no PR and wait/time out
+		// silently instead of failing fast. Checked here (not in validateGateStage) because
+		// it needs the SOURCE stage's kind — spec-level context the per-stage validator lacks.
+		if stage.Kind() == StageKindGate {
+			if src, ok := stageByID[stage.Source]; ok && src.Kind() != StageKindAgentImplement {
+				return fmt.Errorf("pipeline %q stage %q gate source %q must be a mutating implement stage (action: implement) so the gate has a PR to watch", s.Name, stage.ID, stage.Source)
+			}
 		}
 		if stage.Retry < 0 {
 			return fmt.Errorf("pipeline %q stage %q retry must be >= 0", s.Name, stage.ID)
@@ -198,18 +218,25 @@ func (s Spec) detectCycle() error {
 func validateStageExecutor(pipelineName string, stage Stage) error {
 	hasCmd := stage.Cmd != ""
 	hasAgent := stage.Agent != ""
-	// The exactly-one-of cmd|agent guard is shared across kinds: it must run before
+	hasGate := stage.Gate != ""
+	// The exactly-one-of executor guard is shared across kinds: it must run before
 	// Stage.Kind() (which is only meaningful once exactly one executor is set). A
 	// future kind that lives on the EXISTING axes (e.g. implement = agent + an
-	// implement action) is a pure append below; a future kind that introduces a NEW
-	// executor field (a jobless gate: predicate) additionally widens this count to
-	// exactly-one-of {cmd, agent, gate}. That count widening is inherent to adding an
+	// implement action) is a pure append below; the jobless gate (#768 Phase 2)
+	// introduces a NEW executor field (gate: predicate), which is why this count widens
+	// to exactly-one-of {cmd, agent, gate}. That count widening is inherent to adding an
 	// executor axis, not a per-kind settle-logic edit — the seams the foundation
 	// guarantees (validateStageExecutor's dispatch, stageSettleOutcome) stay append-only.
+	// The cmd+agent and neither messages stay BYTE-IDENTICAL (the neither case only
+	// gains the && !hasGate term so a pure gate stage is not mis-rejected as "neither").
 	switch {
 	case hasCmd && hasAgent:
 		return fmt.Errorf("pipeline %q stage %q sets both cmd and agent; a stage is exactly one of a shell cmd or an agent", pipelineName, stage.ID)
-	case !hasCmd && !hasAgent:
+	case hasGate && hasCmd:
+		return fmt.Errorf("pipeline %q stage %q sets both gate and cmd; a stage is exactly one of a shell cmd, an agent, or a gate", pipelineName, stage.ID)
+	case hasGate && hasAgent:
+		return fmt.Errorf("pipeline %q stage %q sets both gate and agent; a stage is exactly one of a shell cmd, an agent, or a gate", pipelineName, stage.ID)
+	case !hasCmd && !hasAgent && !hasGate:
 		return fmt.Errorf("pipeline %q stage %q has neither cmd nor agent; a stage needs exactly one", pipelineName, stage.ID)
 	}
 	// Exactly one executor is set; dispatch the per-kind rules by Stage.Kind(). A
@@ -220,6 +247,10 @@ func validateStageExecutor(pipelineName string, stage Stage) error {
 		return validateShellStage(pipelineName, stage)
 	case StageKindAgentAsk, StageKindAgentReview:
 		return validateAgentStage(pipelineName, stage)
+	case StageKindAgentImplement:
+		return validateImplementStage(pipelineName, stage)
+	case StageKindGate:
+		return validateGateStage(pipelineName, stage)
 	default:
 		// StageKindUnknown past the exactly-one-of guard = an agent stage (Agent
 		// set, Cmd empty) with an unrecognized action; validateAgentStage produces
@@ -256,6 +287,79 @@ func validateAgentStage(pipelineName string, stage Stage) error {
 	}
 	if !containsToken(AgentStageActionCandidates, stage.Action) {
 		return fmt.Errorf("pipeline %q stage %q agent stage action %q is invalid; use one of: %s", pipelineName, stage.ID, stage.Action, strings.Join(AgentStageActionCandidates, ", "))
+	}
+	return nil
+}
+
+// validateImplementStage validates a MUTATING implement agent stage (#768): a
+// name-safe agent token and a non-empty prompt — exactly like a read-only agent
+// stage, but WITHOUT validateAgentStage's read-only-leaf rejection, since a validated
+// implement stage is allowed. The write: true acknowledgement and the scheduled-write
+// gate live in Spec.validateMutatingStage (they need spec-level context). The token /
+// prompt messages are byte-identical to validateAgentStage so a mis-typed implement
+// stage fails with the same wording an ask stage would.
+func validateImplementStage(pipelineName string, stage Stage) error {
+	if !validToken(stage.Agent) {
+		return fmt.Errorf("pipeline %q stage %q agent %q must be a name-safe token (letters, digits, '-', '_')", pipelineName, stage.ID, stage.Agent)
+	}
+	if stage.Prompt == "" {
+		return fmt.Errorf("pipeline %q stage %q agent stage requires a non-empty prompt", pipelineName, stage.ID)
+	}
+	return nil
+}
+
+// validateGateStage validates a JOBLESS GATE stage (#768 Phase 2): a recognized
+// predicate token (only pr_merged today) plus a Source that names an upstream stage
+// this gate depends on. Requiring Source to be one of the gate's own Needs is what
+// makes "an existing upstream needs stage" fall out for free — Validate separately
+// rejects any need that does not reference a known stage, so a source-in-needs also
+// references a known stage. A gate carries no prompt/action (those are agent-only), so
+// a stray one is a mis-declared stage (very likely a forgotten agent: key).
+func validateGateStage(pipelineName string, stage Stage) error {
+	if !containsToken(GatePredicateCandidates, stage.Gate) {
+		return fmt.Errorf("pipeline %q stage %q gate predicate %q is invalid; use one of: %s", pipelineName, stage.ID, stage.Gate, strings.Join(GatePredicateCandidates, ", "))
+	}
+	if stage.Prompt != "" {
+		return fmt.Errorf("pipeline %q stage %q sets prompt but is a gate stage; prompt is only for agent stages", pipelineName, stage.ID)
+	}
+	if stage.Action != "" {
+		return fmt.Errorf("pipeline %q stage %q sets action but is a gate stage; action is only for agent stages", pipelineName, stage.ID)
+	}
+	if stage.Source == "" {
+		return fmt.Errorf("pipeline %q stage %q gate stage requires a source (the upstream stage whose PR to watch)", pipelineName, stage.ID)
+	}
+	if stage.Source == stage.ID {
+		return fmt.Errorf("pipeline %q stage %q gate source cannot be the stage itself", pipelineName, stage.ID)
+	}
+	if !containsToken(stage.Needs, stage.Source) {
+		return fmt.Errorf("pipeline %q stage %q gate source %q must be one of the stage's needs (a gate watches an upstream stage it depends on)", pipelineName, stage.ID, stage.Source)
+	}
+	return nil
+}
+
+// validateMutatingStage enforces the #768 mutating-implement SAFETY MODEL, which
+// spans stage-level AND spec-level context (so it is a Spec method, not part of the
+// per-kind executor dispatch):
+//   - Spec double-key: `action: implement` REQUIRES `write: true` and, conversely,
+//     `write: true` is valid ONLY on an implement stage — so neither a prompt injection
+//     nor a template typo can flip a read-only pipeline into a writing one.
+//   - Schedule gate: a MUTATING stage on a SCHEDULED pipeline (a schedule: block) is
+//     rejected unless the pipeline sets `allow_scheduled_writes: true`, so an unattended
+//     nightly writing code is always a deliberate, spelled-twice choice. A manual-only
+//     pipeline (no schedule) needs only the per-stage write: true.
+//
+// It reads stage.Action / stage.Write directly (not Stage.Kind()) so it also catches
+// write: true on a NON-implement stage, which Kind() classifies as its base kind.
+func (s Spec) validateMutatingStage(stage Stage) error {
+	isImplement := stage.Agent != "" && stage.Action == "implement"
+	if stage.Write && !isImplement {
+		return fmt.Errorf("pipeline %q stage %q sets write: true but is not a mutating implement stage; write: true is only valid with action: implement", s.Name, stage.ID)
+	}
+	if isImplement && !stage.Write {
+		return fmt.Errorf("pipeline %q stage %q sets action \"implement\" without write: true; a mutating implement stage must acknowledge writes with write: true", s.Name, stage.ID)
+	}
+	if isImplement && s.Schedule != nil && !s.AllowScheduledWrites {
+		return fmt.Errorf("pipeline %q stage %q is a mutating implement stage on a scheduled pipeline; set allow_scheduled_writes: true to permit unattended writes", s.Name, stage.ID)
 	}
 	return nil
 }

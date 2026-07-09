@@ -40,6 +40,18 @@ const DefaultAgentStageAction = "ask"
 // agent stage must never write, fan out, or leave the read-only leaf contract.
 var AgentStageActionCandidates = []string{"ask", "review"}
 
+// GatePredicatePRMerged is the only gate predicate today (#768 Phase 2): a jobless
+// gate stage carrying `gate: pr_merged` folds success once the PR opened by its
+// upstream source (implement) stage has MERGED. The pipeline never merges the PR
+// itself — merge stays with humans/CI — so the gate is the composable wait a
+// pipeline uses to express `[implement] -> [gate: pr_merged] -> [deploy]`.
+const GatePredicatePRMerged = "pr_merged"
+
+// GatePredicateCandidates are the predicate tokens a gate stage's `gate:` MAY set
+// (#768 Phase 2). It starts deliberately small — just pr_merged — so the vocab is a
+// pure append when a future external-gate predicate (e.g. #758 subtree_settled) lands.
+var GatePredicateCandidates = []string{GatePredicatePRMerged}
+
 // Spec is the parsed, validated declaration of a pipeline.
 type Spec struct {
 	// Name is the pipeline's stable identifier (the DB primary key and the stem of
@@ -51,6 +63,13 @@ type Spec struct {
 	// Schedule, when present, drives interval-based auto-runs (heartbeat idiom: an
 	// interval plus optional jitter; no cron in v1).
 	Schedule *Schedule `yaml:"schedule,omitempty"`
+	// AllowScheduledWrites, when true, permits MUTATING (implement) stages on a
+	// SCHEDULED pipeline (one carrying a schedule: block) (#768 safety layer 2).
+	// Absent (the default), a scheduled pipeline REJECTS any mutating stage at
+	// validation, so an unattended nightly can never write code + open a PR without a
+	// deliberate, spelled-twice opt-in. Irrelevant to a manual-only pipeline (no
+	// schedule), which a mutating stage enters with only its per-stage write: true.
+	AllowScheduledWrites bool `yaml:"allow_scheduled_writes,omitempty"`
 	// SuccessDecisions overrides DefaultSuccessDecisions for every stage that does
 	// not set its own. Empty means DefaultSuccessDecisions.
 	SuccessDecisions []string `yaml:"success_decisions,omitempty"`
@@ -88,10 +107,27 @@ type Stage struct {
 	// Agent is set; ignored for a shell stage). Builder 2 prepends upstream
 	// needs-context; for now the runtime prompt is Prompt verbatim.
 	Prompt string `yaml:"prompt,omitempty"`
-	// Action is the read-only agent verb for an agent stage: "ask" (default) or
-	// "review". "implement" is rejected — an agent stage must stay a read-only
-	// leaf. Ignored for a shell stage.
+	// Action is the agent verb for an agent stage: "ask" (default) or "review"
+	// (read-only leaves), or "implement" (a MUTATING stage, #768) which additionally
+	// requires Write. Ignored for a shell stage.
 	Action string `yaml:"action,omitempty"`
+	// Write, when true, ACKNOWLEDGES that this stage MUTATES the repo (#768). It is
+	// REQUIRED for — and valid ONLY on — an `action: implement` stage: the spec
+	// double-key that stops a prompt injection or a template typo from silently
+	// flipping a read-only pipeline into a writing one. Rejected on any other stage.
+	Write bool `yaml:"write,omitempty"`
+	// Gate, when set, declares a JOBLESS GATE stage (#768 Phase 2): it runs NEITHER a
+	// shell cmd NOR an agent — it WAITS on an external predicate and folds only once
+	// the predicate holds. The value is the predicate token (today only "pr_merged";
+	// see GatePredicateCandidates). A gate mints no worker job, no runtime session; the
+	// advancer's settle pass evaluates its predicate per scan. Mutually exclusive with
+	// Cmd and Agent (exactly one of the three executors). Pairs with Source.
+	Gate string `yaml:"gate,omitempty"`
+	// Source is the id of the upstream stage a gate stage watches (required for — and
+	// valid ONLY on — a gate stage): the implement stage whose opened PR the gate's
+	// predicate observes. It must be one of the gate's own Needs, so the gate only
+	// begins watching once that upstream stage has succeeded (and stamped its PR).
+	Source string `yaml:"source,omitempty"`
 	// Needs lists the ids of stages that must succeed before this stage is enqueued.
 	Needs []string `yaml:"needs,omitempty"`
 	// Timeout optionally bounds the stage job (a positive Go duration when set).
@@ -130,6 +166,21 @@ const (
 	// verb. Same leaf contract as ask; kept distinct so a future kind is appended as
 	// a sibling case rather than by editing a shared agent branch.
 	StageKindAgentReview
+	// StageKindAgentImplement is a MUTATING agent stage (#768 Model A): Agent set,
+	// action "implement", plus the required Write acknowledgement. Unlike the
+	// read-only ask/review kinds it takes a WRITABLE task-worktree, commits + pushes +
+	// opens a PR, and folds success only once a PR exists (fold-on-PR-opened). It is
+	// still a LEAF — it may mutate but never fan out (delegations/human_questions are
+	// stripped) — and the pipeline NEVER merges its own PR.
+	StageKindAgentImplement
+	// StageKindGate is a JOBLESS GATE stage (#768 Phase 2): Gate set, neither Cmd nor
+	// Agent. It mints NO worker job — the ENQUEUE pass marks it in-flight without a job
+	// and the advancer's SETTLE pass folds it when its external predicate holds
+	// (pr_merged: the PR opened by the upstream Source implement stage has merged),
+	// parking the run on the stage timeout if it never does. Its executor is a NEW axis
+	// (Gate) alongside cmd|agent, which is why validateStageExecutor's exactly-one-of
+	// guard widens to {cmd, agent, gate}.
+	StageKindGate
 )
 
 // Kind classifies the stage. A shell stage (Cmd set) is StageKindShell; an agent
@@ -152,7 +203,14 @@ func (s Stage) Kind() StageKind {
 			return StageKindAgentAsk
 		case "review":
 			return StageKindAgentReview
+		case "implement":
+			return StageKindAgentImplement
 		}
+	case s.Gate != "":
+		// A jobless gate (#768 Phase 2): no cmd, no agent, a gate predicate instead.
+		// Reached only after validateStageExecutor's widened exactly-one-of guard has
+		// confirmed gate is the SOLE executor set.
+		return StageKindGate
 	}
 	return StageKindUnknown
 }
