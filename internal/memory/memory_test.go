@@ -160,6 +160,9 @@ func TestRenderBlockTagsAndBudget(t *testing.T) {
 	if !strings.Contains(block, "[general] race suites need a long timeout") {
 		t.Errorf("block missing general-tagged entry: %q", block)
 	}
+	if linked := RenderBullet(Entry{Scope: ScopeRepo, Content: "linked neighbor", Linked: true}); !strings.Contains(linked, "[this repo] [linked] linked neighbor") {
+		t.Errorf("linked bullet missing linked tag: %q", linked)
+	}
 }
 
 func TestRenderBlockBudgetCaps(t *testing.T) {

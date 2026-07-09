@@ -1339,7 +1339,7 @@ gate:
 
 ```sh
 gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo] [--json]
-gitmoot memory recall "<query>" [--repo owner/repo] [--agent NAME|--shared] [--limit N] [--json]
+gitmoot memory recall "<query>" [--repo owner/repo] [--agent NAME|--shared] [--limit N] [--expand] [--json]
 gitmoot memory replay [--agent NAME] [--repo owner/repo] [--limit N] [--json]
 gitmoot memory eval --fixtures fixtures.json [--k N] [--json]
 gitmoot memory vault export [--out DIR] [--agent NAME] [--force] [--json]
@@ -1367,8 +1367,16 @@ inspect only shared facts. Private matches outrank shared matches on equal BM25
 scores, and a floor guard keeps a private match visible when shared rows would
 otherwise fill the limit. Without `--repo`, recall searches every repo and
 general-scope facts. `--repo owner/repo` narrows repo-scoped facts to that repo while still including
-general-scope facts. `--json` returns raw rows for scripts, including
-`author_ref` for shared facts that preserve a different author. `memory replay`
+general-scope facts. `--expand` follows one hop of persisted memory links from
+direct matches, appending visible linked facts after all direct matches and
+marking their bullets with `[linked]`. `--json` returns raw rows for scripts,
+including `author_ref` for shared facts that preserve a different author and
+`linked_from` when a row came from link expansion. Prompt injection applies the
+same link expansion automatically for enrolled agents, within the entry limit
+and token budget, and non-empty memory blocks include a footer pointing the
+agent at `gitmoot memory recall "<query>" --agent <agent-name>` for on-demand
+search. Semantic or embedding search is future work; current retrieval stays
+SQLite FTS5 plus persisted links. `memory replay`
 re-renders recent real jobs' prompts with and without the injected
 learnings block and reports the token/entry delta. `memory eval` computes
 recall/precision@K of retrieval over a labeled `{agent, repo, instructions,

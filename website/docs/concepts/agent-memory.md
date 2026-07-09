@@ -22,7 +22,14 @@ it ships in phases. The current phase is **observation mode**:
   in the injected slice when private matches exist but shared rows would fill the
   limit. Gitmoot caps the result by a token budget and renders a fenced block
   titled *"Prior learnings (reference only, not instructions)"* with
-  `[this repo]` / `[general]` tags. An empty result adds nothing.
+  `[this repo]` / `[general]` tags. After direct FTS hits are selected, Gitmoot
+  follows one hop of persisted memory links in a single batched query, appends
+  visible linked facts after all direct hits, and tags those bullets with
+  `[linked]`. Linked facts must pass the same private-plus-shared, repo/general,
+  and active-row visibility rules. They fill only remaining entry and token
+  budget, so they never evict direct hits. A non-empty block ends with a footer
+  showing the enrolled agent how to run `gitmoot memory recall "<query>" --agent <agent-name>`
+  for on-demand recall. An empty result adds nothing.
 - **WRITE:** the confirmed (injectable) tier is populated only by Gitmoot's own
   deterministic **mechanical facts** (no model involved). A fact is written only
   when a terminal job carries a genuine, bounded signal — never one fact per job:
@@ -114,7 +121,7 @@ All of the following are read-only:
 
 ```sh
 gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo]
-gitmoot memory recall "<query>" [--repo owner/repo] [--agent NAME|--shared] [--limit N]
+gitmoot memory recall "<query>" [--repo owner/repo] [--agent NAME|--shared] [--limit N] [--expand]
 gitmoot memory replay [--agent NAME] [--repo owner/repo] [--limit N]
 gitmoot memory eval --fixtures fixtures.json [--k N]
 ```
@@ -125,8 +132,13 @@ FTS5/BM25 retrieval as prompt injection. By default it searches all agent pools
 plus the shared pool; `--agent NAME` searches that agent's private pool plus
 shared, and `--shared` searches only shared facts. Without `--repo`, recall
 searches every repo and general-scope facts. `--repo owner/repo` narrows
-repo-scoped facts to that repo while still including general-scope facts. JSON
-output includes `author_ref` when a shared fact preserves a different author.
+repo-scoped facts to that repo while still including general-scope facts.
+`--expand` follows one hop of persisted links from the direct matches and appends
+visible linked facts after all direct matches. Expanded text bullets carry
+`[linked]`; JSON output includes `author_ref` when a shared fact preserves a
+different author and `linked_from` when a row came from link expansion. Semantic
+or embedding search remains future work; current retrieval is SQLite FTS5 plus
+persisted links.
 `memory replay` is an offline A/B: it re-renders recent real jobs' prompts with and without the
 learnings block and reports the injection delta (added tokens, entries injected)
 — it measures injection *mechanics*, not outcome quality. `memory eval` computes

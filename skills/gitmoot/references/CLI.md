@@ -1614,7 +1614,7 @@ Inspect, curate, and measure the store:
 
 ```sh
 gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo] [--json]
-gitmoot memory recall "<query>" [--repo owner/repo] [--agent NAME|--shared] [--limit N] [--json]
+gitmoot memory recall "<query>" [--repo owner/repo] [--agent NAME|--shared] [--limit N] [--expand] [--json]
 gitmoot memory replay [--agent NAME] [--repo owner/repo] [--limit N] [--json]
 gitmoot memory eval --fixtures fixtures.json [--k N] [--json]
 gitmoot memory vault export [--out DIR] [--agent NAME] [--force] [--json]
@@ -1630,8 +1630,12 @@ injection and prints the matching facts in injection bullet format. Without
 `--agent NAME` to inspect that agent's private pool plus shared, or `--shared`
 to inspect only shared facts. Without `--repo`, recall searches every repo and
 general-scope facts. `--repo owner/repo` narrows repo-scoped facts to that repo
-while still including general-scope facts. `--json` returns raw rows for scripts,
-including `author_ref` when a shared fact preserves a different author. `memory replay` is an offline A/B:
+while still including general-scope facts. `--expand` follows one hop of
+persisted memory links from the direct matches, appending visible linked facts
+after every direct match and marking their bullets with `[linked]`. `--json`
+returns raw rows for scripts, including `author_ref` when a shared fact preserves
+a different author and `linked_from` when a row came from link expansion.
+`memory replay` is an offline A/B:
 it re-renders recent real jobs' prompts with and
 without the learnings block and reports the injection delta (added tokens,
 entries injected) — it measures injection *mechanics*, not outcome quality
@@ -1644,7 +1648,15 @@ the reserved shared pool (`owner_kind=shared`, `owner_ref=shared`). BM25 relevan
 still ranks first. On an equal BM25 score, the agent's private facts outrank
 shared facts, then `updated_at DESC` breaks ties. A small floor guard keeps a
 matching private fact from being completely starved by a tight limit full of
-shared rows. Entry into shared is always explicit and human-driven: use
+shared rows. After direct FTS hits are selected, prompt injection follows one
+hop of persisted memory links in a single batched query. Linked facts must pass
+the same owner, shared-pool, repo/general, and active-row visibility rules, rank
+after all direct hits, and render with a `[linked]` tag. They fill only remaining
+entry and token budget, so they never evict direct hits. Non-empty injected
+blocks end with a footer reminding the agent that it can run
+`gitmoot memory recall "<query>" --agent <agent-name>` for on-demand recall.
+Semantic or embedding search is future work; current retrieval stays SQLite FTS5
+plus persisted links. Entry into shared is always explicit and human-driven: use
 `memory promote --to-shared`, `memory ingest --shared`, or
 `memory confirm --to-shared`; daemon producers never auto-share facts.
 

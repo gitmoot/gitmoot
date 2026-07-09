@@ -109,7 +109,7 @@ func (c *MemoryController) injectBlock(ctx context.Context, agent runtime.Agent,
 	if len(entries) == 0 {
 		return ""
 	}
-	block, _ := memory.RenderBlock(entries, c.TokenBudget)
+	block, _ := renderMemoryInjectionBlock(entries, c.TokenBudget, agent.Name)
 	return block
 }
 
@@ -133,14 +133,28 @@ func (c *MemoryController) retrieve(ctx context.Context, owner db.MemoryOwner, r
 	if err != nil || len(rows) == 0 {
 		return nil
 	}
-	entries := make([]memory.Entry, 0, len(rows))
+	entries := make([]memory.Entry, 0, limit)
+	seen := make(map[int64]struct{}, len(rows))
+	srcIDs := make([]int64, 0, len(rows))
 	for _, r := range rows {
-		entries = append(entries, memory.Entry{
-			Scope:     r.Scope,
-			Key:       r.Key,
-			Content:   r.Content,
-			UpdatedAt: r.UpdatedAt,
-		})
+		entries = append(entries, memoryEntryFromConfirmed(r, false))
+		seen[r.ID] = struct{}{}
+		srcIDs = append(srcIDs, r.ID)
+	}
+	if len(entries) < limit {
+		linked, err := c.Store.ListMemoryLinksForSourcesVisibleToOwner(ctx, owner, repo, srcIDs)
+		if err == nil {
+			for _, l := range linked {
+				if _, dup := seen[l.Memory.ID]; dup {
+					continue
+				}
+				seen[l.Memory.ID] = struct{}{}
+				entries = append(entries, memoryEntryFromConfirmed(l.Memory, true))
+				if len(entries) >= limit {
+					break
+				}
+			}
+		}
 	}
 	return entries
 }
@@ -161,8 +175,34 @@ func (c *MemoryController) PreviewEntries(ctx context.Context, agentName, repo, 
 // ungated, for the harness), returning the block text, the entries injected, and
 // the block's estimated token cost.
 func (c *MemoryController) PreviewBlock(ctx context.Context, agentName, repo, instructions string) (block string, entries int, tokens int) {
-	rendered, n := memory.RenderBlock(c.PreviewEntries(ctx, agentName, repo, instructions, 0), c.TokenBudget)
+	rendered, n := renderMemoryInjectionBlock(c.PreviewEntries(ctx, agentName, repo, instructions, 0), c.TokenBudget, agentName)
 	return rendered, n, memory.EstimateTokens(rendered)
+}
+
+func memoryEntryFromConfirmed(r db.ConfirmedMemory, linked bool) memory.Entry {
+	return memory.Entry{
+		Scope:     r.Scope,
+		Key:       r.Key,
+		Content:   r.Content,
+		UpdatedAt: r.UpdatedAt,
+		Linked:    linked,
+	}
+}
+
+func renderMemoryInjectionBlock(entries []memory.Entry, budget int, agentName string) (string, int) {
+	block, n := memory.RenderBlock(entries, budget)
+	if block == "" {
+		return "", 0
+	}
+	name := strings.TrimSpace(agentName)
+	if name == "" {
+		name = "<agent-name>"
+	}
+	if !strings.HasSuffix(block, "\n") {
+		block += "\n"
+	}
+	block += fmt.Sprintf("More project memory is searchable: run `gitmoot memory recall \"<query>\" --agent %s`.\n", name)
+	return block, n
 }
 
 // record is the WRITE path, run at job terminal. The ENROLLED-ONLY Phase-1 body

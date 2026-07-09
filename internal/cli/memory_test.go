@@ -285,6 +285,62 @@ func TestMemoryRecallSharedParity(t *testing.T) {
 	}
 }
 
+func TestMemoryRecallExpandAddsLinkedFromJSON(t *testing.T) {
+	home, store := memoryTestHome(t)
+	ctx := context.Background()
+	owner := db.MemoryOwner{Kind: "agent", Ref: "lead"}
+	if _, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "linked-neighbor",
+		Content: "aurora quartz vector hidden neighbor", Provenance: "seed",
+	}); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+	srcID, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "direct-source",
+		Content: "aurora quartz vector source instructions", Provenance: "seed",
+	})
+	if err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := runMemory([]string{"recall", "instructions", "--home", home, "--repo", "acme/widget", "--agent", "lead", "--limit", "2", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("memory recall without expand exit %d: %s", code, stderr.String())
+	}
+	var directOnly []memoryRecallEntry
+	if err := json.Unmarshal(stdout.Bytes(), &directOnly); err != nil {
+		t.Fatalf("parse direct recall: %v (%s)", err, stdout.String())
+	}
+	if len(directOnly) != 1 || directOnly[0].Key != "direct-source" || directOnly[0].LinkedFrom != 0 {
+		t.Fatalf("without --expand should return only direct source without linked_from, got %+v", directOnly)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runMemory([]string{"recall", "instructions", "--home", home, "--repo", "acme/widget", "--agent", "lead", "--limit", "2", "--expand", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("memory recall --expand exit %d: %s", code, stderr.String())
+	}
+	var expanded []memoryRecallEntry
+	if err := json.Unmarshal(stdout.Bytes(), &expanded); err != nil {
+		t.Fatalf("parse expanded recall: %v (%s)", err, stdout.String())
+	}
+	if len(expanded) != 2 || expanded[0].Key != "direct-source" || expanded[1].Key != "linked-neighbor" {
+		t.Fatalf("--expand should append linked neighbor after direct hit, got %+v", expanded)
+	}
+	if expanded[0].LinkedFrom != 0 || expanded[1].LinkedFrom != srcID {
+		t.Fatalf("linked_from JSON mismatch, source=%d rows=%+v", srcID, expanded)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runMemory([]string{"recall", "instructions", "--home", home, "--repo", "acme/widget", "--agent", "lead", "--limit", "2", "--expand"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("memory recall --expand text exit %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "- [this repo] [linked] aurora quartz vector hidden neighbor") {
+		t.Fatalf("text --expand should mark linked bullet, got:\n%s", stdout.String())
+	}
+}
+
 func recallHasKey(rows []memoryRecallEntry, key string) bool {
 	for _, r := range rows {
 		if r.Key == key {

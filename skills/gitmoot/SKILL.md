@@ -70,6 +70,9 @@ For agent persistent memory, phrases like "give this agent persistent memory",
 agent learned" map to Gitmoot's off-by-default agent memory feature (#626): an
 enrolled agent gets a repo-filtered pool of durable facts injected into its job
 prompt as a read-only "Prior learnings" reference block (never instructions).
+The block can include `[linked]` facts reached from persisted memory links, and
+non-empty blocks end with a footer pointing the agent to
+`gitmoot memory recall "<query>" --agent <agent-name>` for on-demand recall.
 Enrollment is per agent via `[agents.<name>].memory = true` plus an optional
 `[memory]` section; inspect the store read-only with `gitmoot memory list`. See
 CLI.md § Agent Memory and the "Agent Persistent Memory" concepts page for depth.

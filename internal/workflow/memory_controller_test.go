@@ -167,6 +167,150 @@ func TestMemoryTokenBudgetEnforced(t *testing.T) {
 	}
 }
 
+func TestMemoryReadPathExpandsLinkedNeighborsAfterDirectHits(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	owner := db.MemoryOwner{Kind: "agent", Ref: "audit"}
+	if _, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "linked-neighbor",
+		Content: "aurora quartz vector hidden neighbor",
+	}); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+	if _, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "direct-source",
+		Content: "aurora quartz vector source instructions",
+	}); err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+
+	ctrl := memController(store, 1500, 2, "audit")
+	entries := ctrl.PreviewEntries(ctx, "audit", "acme/widget", "instructions", 2)
+	if len(entries) != 2 {
+		t.Fatalf("want direct hit plus linked neighbor, got %+v", entries)
+	}
+	if entries[0].Key != "direct-source" || entries[0].Linked {
+		t.Fatalf("first entry must be the direct hit, got %+v", entries[0])
+	}
+	if entries[1].Key != "linked-neighbor" || !entries[1].Linked {
+		t.Fatalf("second entry must be linked neighbor, got %+v", entries[1])
+	}
+	block, injected, _ := ctrl.PreviewBlock(ctx, "audit", "acme/widget", "instructions")
+	if injected != 2 || !strings.Contains(block, "[this repo] [linked] aurora quartz vector hidden neighbor") {
+		t.Fatalf("rendered block should include linked tag, injected=%d block=\n%s", injected, block)
+	}
+}
+
+func TestMemoryLinkExpansionDoesNotEvictDirectHitsAtLimit(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	owner := db.MemoryOwner{Kind: "agent", Ref: "audit"}
+	if _, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "linked-neighbor",
+		Content: "aurora quartz vector hidden neighbor",
+	}); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+	if _, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "direct-a",
+		Content: "needle aurora quartz vector source",
+	}); err != nil {
+		t.Fatalf("seed direct a: %v", err)
+	}
+	if _, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "direct-b",
+		Content: "needle direct second fact",
+	}); err != nil {
+		t.Fatalf("seed direct b: %v", err)
+	}
+
+	ctrl := memController(store, 1500, 2, "audit")
+	entries := ctrl.PreviewEntries(ctx, "audit", "acme/widget", "needle", 2)
+	if len(entries) != 2 {
+		t.Fatalf("want exactly the direct-hit limit, got %+v", entries)
+	}
+	for _, e := range entries {
+		if e.Linked {
+			t.Fatalf("linked expansion must not evict direct hits at the entry limit, got %+v", entries)
+		}
+	}
+}
+
+func TestMemoryLinkExpansionKeepsSharedNeighbor(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	owner := db.MemoryOwner{Kind: "agent", Ref: "audit"}
+	shared := db.MemoryOwner{Kind: memory.OwnerKindShared, Ref: memory.SharedOwnerRef}
+	if _, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+		Owner: shared, AuthorRef: "lead", Repo: "acme/widget", Scope: "repo", Key: "shared-neighbor",
+		Content: "aurora quartz vector shared neighbor",
+	}); err != nil {
+		t.Fatalf("seed shared target: %v", err)
+	}
+	if _, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "direct-source",
+		Content: "needle aurora quartz vector source",
+	}); err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+
+	ctrl := memController(store, 1500, 3, "audit")
+	entries := ctrl.PreviewEntries(ctx, "audit", "acme/widget", "needle", 3)
+	if len(entries) != 2 || entries[1].Key != "shared-neighbor" || !entries[1].Linked {
+		t.Fatalf("shared neighbor should be visible through expansion, got %+v", entries)
+	}
+}
+
+func TestMemoryLinkExpansionRespectsRenderBudget(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	owner := db.MemoryOwner{Kind: "agent", Ref: "audit"}
+	if _, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "linked-neighbor",
+		Content: "aurora quartz vector " + strings.Repeat("linked ", 80),
+	}); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+	if _, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "direct-source",
+		Content: "needle aurora quartz vector source",
+	}); err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+
+	ctrl := memController(store, 30, 2, "audit")
+	block, injected, _ := ctrl.PreviewBlock(ctx, "audit", "acme/widget", "needle")
+	if injected != 1 {
+		t.Fatalf("budget should inject only the direct hit, got %d block=\n%s", injected, block)
+	}
+	if strings.Contains(block, "[linked]") {
+		t.Fatalf("linked expansion should not fit after direct hit under tight budget:\n%s", block)
+	}
+	if !strings.Contains(block, "needle aurora quartz vector source") {
+		t.Fatalf("direct hit should remain injected under tight budget:\n%s", block)
+	}
+}
+
+func TestMemoryInjectionFooterOnlyOnNonEmptyBlock(t *testing.T) {
+	store := openTestStore(t)
+	prompt := runMemJob(t, store, memController(store, 1500, 15, "audit"), memTestOutput, "zzznomatch")
+	if strings.Contains(prompt, "More project memory is searchable") {
+		t.Fatalf("footer must not appear without a memory block:\n%s", prompt)
+	}
+
+	store = openTestStore(t)
+	if _, err := store.UpsertConfirmedMemory(context.Background(), db.ConfirmedMemory{
+		Owner: db.MemoryOwner{Kind: "agent", Ref: "audit"}, Repo: "acme/widget", Scope: "repo",
+		Key: "ci-flake", Content: "arm64 CI is flaky",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	prompt = runMemJob(t, store, memController(store, 1500, 15, "audit"), memTestOutput, "arm64")
+	if !strings.Contains(prompt, "More project memory is searchable: run `gitmoot memory recall \"<query>\" --agent audit`.") {
+		t.Fatalf("footer missing from non-empty memory block:\n%s", prompt)
+	}
+}
+
 // TestMemoryShadowWriteAppliesFilters proves agent-returned learnings are
 // shadow-logged to memory_observations ONLY (never confirmed) with the
 // deterministic pre-filters applied: a plain fact lands, a directive-phrased one
