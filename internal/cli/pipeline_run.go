@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -233,6 +235,12 @@ func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.Pipel
 	//       keeps sibling stages from sharing one tree budget. Run linkage still
 	//       lives in pipeline_run_stages.job_id, not RootJobID.
 	// ParentJobID stays EMPTY (the coordinator is the root, not a delegation child).
+	// Retry defaults to 0 (the Stage.Retry zero value): a sub-tree is expensive and a
+	// half-complete tree must never be resumed. A stage retry:>0 re-attempt is handled
+	// by the shared FOLD-pass retry branch, which only fires once the chain has folded
+	// a terminal TAIL (the old tree is fully terminal by then) and mints a FRESH stage
+	// job under attempt+1 — a new deterministic id, hence a new RootJobID and a brand-
+	// new tree — never a resume into a partial sub-tree.
 	if stage.Orchestrate {
 		id := pipelineStageJobID(run.ID, stage.ID, attempt)
 		return workflow.JobRequest{
@@ -781,11 +789,16 @@ type pipelineStageSettleDeps struct {
 // terminal, all unchanged. Future kinds branch here on stage.Kind() using deps.
 func stageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec pipeline.Spec, stage pipeline.Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
 	switch stage.Kind() {
+	case pipeline.StageKindOrchestrate:
+		// #758: the stage job is a bounded agent SUB-TREE root. It settles by walking
+		// the deterministic <jobID>/continuation chain to its terminal tail (re-pointing
+		// nextRow.JobID forward and staying unsettled until the tail appears), NOT by the
+		// stage job reaching a terminal state — the coordinator settles the instant it
+		// returns delegations while its sub-tree is still running.
+		return orchestrateStageSettleOutcome(ctx, deps, spec, stage, stageRow)
 	// A future kind adds its case here, e.g.:
 	//   case pipeline.StageKindGate:       // jobless: never calls GetJob
 	//       return gateStageSettleOutcome(ctx, deps, spec, stage, stageRow)
-	//   case pipeline.StageKindOrchestrate: // re-points nextRow.JobID, stays unsettled
-	//       return orchestrateStageSettleOutcome(ctx, deps, spec, stage, stageRow)
 	default:
 		// StageKindShell, StageKindAgentAsk, StageKindAgentReview (and the
 		// never-validated StageKindUnknown): a jobful stage that settles on its stage
@@ -815,6 +828,139 @@ func stageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec 
 		state, summary, needs = foldPipelineStageOutcome(spec.EffectiveSuccessDecisions(stage), job)
 		return true, state, summary, needs, nil, nil
 	}
+}
+
+// orchestrateStageSettleOutcome is the #758 SETTLE PREDICATE for an orchestrate
+// stage: the stage job is a bounded agent SUB-TREE root, so it does NOT settle when
+// its own job reaches a terminal state. A coordinator settles the INSTANT it returns
+// delegations (stateForDecision("approved") == succeeded) while its children are
+// still running, so the stage row cannot watch a single job id. Instead it follows
+// the deterministic continuation chain minted by the engine — every generation lives
+// at workflow.DelegationContinuationID(previousJobID) — from the stage row's CURRENT
+// job to the chain's terminal TAIL, and folds the TAIL's decision (never the
+// coordinator's). This is a pure, idempotent DB walk over rows the engine already
+// persists: there is no new job state and no in-memory waiter, so a daemon restart
+// re-derives the entire wait from stageRow.JobID (wherever the last scan re-pointed
+// it) with zero extra state — the deterministic continuation id is the checkpoint.
+//
+// Per scan, starting from the stage row's CURRENT job:
+//   - No job id yet / a transient missing row: fail OPEN (unsettled), like the default
+//     seam's `if row.JobID == ""` guard — a later scan retries.
+//   - The current job is still in flight (queued/running): stay unsettled, reflecting
+//     a queued->running funnel transition so the stage tracks the live frontier.
+//   - The current job is SETTLED and a continuation row exists at DelegationContinuationID:
+//     the chain advanced, so re-point nextRow.JobID at the continuation and keep waiting
+//     (settled=false). This is exactly what the foundation added the nextRow channel for.
+//   - The current job is SETTLED, has NO continuation slot, and is a TAIL — a finalize
+//     continuation (DelegationFinalize, whose returned delegations the engine ignores) or
+//     a synthesis result carrying ZERO delegations: FOLD it via foldPipelineStageOutcome.
+//   - The current job is SETTLED, has NO continuation slot, but STILL carries live
+//     delegations (children queued/running, the continuation not yet minted): stay
+//     unsettled — the continuation row will appear on a later scan and be walked then.
+//     This guard is what stops the walk from folding a mid-flight coordinator round.
+//
+// Timeout: the whole sub-tree is bounded by the stage timeout, mapped onto the sub-
+// tree's per-root wall-clock bound. On expiry the scan trips the #341 kill switch on
+// the sub-tree root (the stage job's own id), which routes the frontier's next
+// dispatch to the #305 finalize continuation — so the chain still ends in a foldable
+// tail. The kill is set once (idempotent) and the walk keeps waiting for that tail.
+//
+// Retry: an orchestrate stage defaults to retry:0 (documented in
+// pipelineStageJobRequest). A retry never resumes into half a tree — the FOLD pass
+// only reaches here with a settled TAIL, at which point the old tree is terminal, and
+// the shared retry branch mints a FRESH stage job under attempt+1 (a new deterministic
+// id => a new RootJobID => a brand-new tree).
+func orchestrateStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec pipeline.Spec, stage pipeline.Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
+	if strings.TrimSpace(stageRow.JobID) == "" {
+		// The stage's coordinator has not been enqueued yet: leave it in flight,
+		// byte-identical to the default seam's empty-JobID guard.
+		return false, "", "", nil, nil, nil
+	}
+	job, err := deps.store.GetJob(ctx, stageRow.JobID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Fail OPEN on a transient missing row (e.g. a re-point that raced a not-yet
+			// visible continuation write): stay unsettled and retry next scan.
+			return false, "", "", nil, nil, nil
+		}
+		return false, "", "", nil, nil, err
+	}
+
+	// The sub-tree root is the stage job's OWN id; the whole chain carries it as
+	// RootJobID. Resolve it from the current job so the timeout kill and the
+	// already-killed guard key on the true root regardless of how far the walk has
+	// advanced.
+	rootJobID := stageRow.JobID
+	if payload, perr := workflow.ParseJobPayload(job.Payload); perr == nil {
+		if r := strings.TrimSpace(payload.RootJobID); r != "" {
+			rootJobID = r
+		}
+	}
+
+	// Stage-timeout bound → sub-tree per-root wall-clock. On expiry trip the #341 kill
+	// switch on the root ONCE; the killed frontier routes its next dispatch to the #305
+	// finalize continuation, so the walk below still terminates in a foldable tail. The
+	// kill is graceful (in-flight children finish); we do not fold here — we keep
+	// walking until that finalize tail appears.
+	if timeout, perr := orchestrateStageTimeout(stage); perr == nil && timeout > 0 && !stageRow.StartedAt.IsZero() {
+		if deps.now.Sub(stageRow.StartedAt.UTC()) > timeout {
+			if killed, kerr := deps.store.IsRootJobKilled(ctx, rootJobID); kerr == nil && !killed {
+				if _, kerr := workflow.KillDelegationTree(ctx, deps.store, rootJobID); kerr != nil {
+					return false, "", "", nil, nil, kerr
+				}
+			}
+		}
+	}
+
+	if !workflow.IsSettledJobState(job.State) {
+		// The current frontier job is still running: reflect a queued->running funnel
+		// transition so the stage tracks the live frontier, otherwise leave it in flight.
+		if job.State == string(workflow.JobRunning) && stageRow.State == pipeline.StageQueued {
+			next := stageRow
+			next.State = pipeline.StageRunning
+			return false, "", "", nil, &next, nil
+		}
+		return false, "", "", nil, nil, nil
+	}
+
+	// The frontier job is settled. If the engine minted a continuation for it, the
+	// chain advanced: re-point the stage row's JobID at that continuation and keep
+	// waiting. This is the walk's one hop per scan.
+	contID := workflow.DelegationContinuationID(job.ID)
+	if _, cerr := deps.store.GetJob(ctx, contID); cerr == nil {
+		next := stageRow
+		next.JobID = contID
+		// The continuation is the live frontier now; keep the stage RUNNING so a later
+		// scan re-enters this walk rather than treating the row as freshly queued.
+		next.State = pipeline.StageRunning
+		return false, "", "", nil, &next, nil
+	} else if !errors.Is(cerr, sql.ErrNoRows) {
+		return false, "", "", nil, nil, cerr
+	}
+
+	// No continuation slot. Decide whether this settled job is the chain TAIL. A
+	// finalize continuation is ALWAYS terminal (the engine ignores any delegations it
+	// returns), so treat DelegationFinalize as a tail even if its stored Result still
+	// carries ignored delegations. Otherwise a settled coordinator that STILL carries
+	// live delegations is mid-flight (its children ran, the continuation is not yet
+	// minted) and must NOT fold — stay unsettled until the continuation row appears.
+	payload, perr := workflow.ParseJobPayload(job.Payload)
+	if perr == nil && payload.Result != nil && len(payload.Result.Delegations) > 0 && !payload.DelegationFinalize {
+		return false, "", "", nil, nil, nil
+	}
+	state, summary, needs = foldPipelineStageOutcome(spec.EffectiveSuccessDecisions(stage), job)
+	return true, state, summary, needs, nil, nil
+}
+
+// orchestrateStageTimeout parses the stage's optional timeout into the sub-tree's
+// per-root wall-clock bound. A blank timeout is no bound (0); a malformed one — which
+// Validate already rejects at add time — surfaces the parse error so the seam never
+// silently ignores an intended bound.
+func orchestrateStageTimeout(stage pipeline.Stage) (time.Duration, error) {
+	if strings.TrimSpace(stage.Timeout) == "" {
+		return 0, nil
+	}
+	return time.ParseDuration(stage.Timeout)
 }
 
 // foldPipelineStageOutcome maps a settled stage job to a stage outcome BY DECISION

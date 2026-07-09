@@ -3240,7 +3240,16 @@ func (e Engine) advanceDelegations(ctx context.Context, parentJob db.Job, parent
 			if continuationAlreadyEnqueued {
 				continue
 			}
-			return e.block(ctx, ref, fmt.Sprintf("delegation %q failed (failure_policy block_parent): %s", d.ID, childFailureReason(child)))
+			reason := fmt.Sprintf("delegation %q failed (failure_policy block_parent): %s", d.ID, childFailureReason(child))
+			// #758 engine edge: a pipeline-orchestrate root has no task, so e.block
+			// would set no task state and return a BlockedError that mints NO
+			// continuation — stranding the stage's chain with no foldable tail. Route
+			// it through the #305 graceful finalize continuation so the chain always
+			// ends in a settled, delegation-less tail the pipeline advancer folds.
+			if e.isPipelineOrchestrateRoot(ctx, parentJob, parentPayload) {
+				return e.enqueueFinalizeContinuation(ctx, parentJob, parentPayload, reason)
+			}
+			return e.block(ctx, ref, reason)
 		}
 	}
 
@@ -3370,7 +3379,14 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 	// succeeded. The default ("" / "summary") concatenates child summaries into
 	// the continuation prompt below.
 	if delegationSynthesisRequiresVote(parentResult.Delegations) && !delegationVoteSatisfied(parentResult.Delegations, children, childPayloads) {
-		return e.block(ctx, ref, fmt.Sprintf("delegation synthesis_rule vote failed: not all delegated children for %s were approved/succeeded", parentJob.ID))
+		reason := fmt.Sprintf("delegation synthesis_rule vote failed: not all delegated children for %s were approved/succeeded", parentJob.ID)
+		// #758: a pipeline-orchestrate root has no task; a synthesis-gate block would
+		// strand its chain with no foldable tail. Route to the finalize continuation
+		// so the tail is always foldable (byte-identical e.block for every other tree).
+		if e.isPipelineOrchestrateRoot(ctx, parentJob, parentPayload) {
+			return e.enqueueFinalizeContinuation(ctx, parentJob, parentPayload, reason)
+		}
+		return e.block(ctx, ref, reason)
 	}
 
 	// synthesis_rule "quorum": block the parent unless at least K children
@@ -3378,7 +3394,11 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 	if delegationSynthesisRequiresQuorum(parentResult.Delegations) {
 		k := delegationQuorumThreshold(parentResult.Delegations)
 		if !delegationQuorumSatisfied(parentResult.Delegations, children, childPayloads, k) {
-			return e.block(ctx, ref, fmt.Sprintf("delegation synthesis_rule quorum failed: fewer than %d delegated children for %s were approved/succeeded", k, parentJob.ID))
+			reason := fmt.Sprintf("delegation synthesis_rule quorum failed: fewer than %d delegated children for %s were approved/succeeded", k, parentJob.ID)
+			if e.isPipelineOrchestrateRoot(ctx, parentJob, parentPayload) {
+				return e.enqueueFinalizeContinuation(ctx, parentJob, parentPayload, reason)
+			}
+			return e.block(ctx, ref, reason)
 		}
 	}
 
@@ -3992,6 +4012,48 @@ func continuationEnqueued(events []db.JobEvent) bool {
 
 func delegationContinuationID(parentJobID string) string {
 	return parentJobID + "/continuation"
+}
+
+// DelegationContinuationID is the exported view of the deterministic continuation
+// id used across a coordinator's continuation chain. The #758 pipeline advancer
+// (internal/cli) follows this chain from an orchestrate stage job to its terminal
+// tail purely from DB rows — it must derive the very same id the engine mints, so
+// the two stay in lockstep by construction rather than by a duplicated string.
+func DelegationContinuationID(parentJobID string) string {
+	return delegationContinuationID(parentJobID)
+}
+
+// isPipelineOrchestrateRoot reports whether parentJob belongs to a #758 pipeline
+// orchestrate stage sub-tree — i.e. the tree ROOT is a pipeline stage job carrying
+// the OrchestrateStage flag. Such a root has NO task (a pipeline orchestrate stage
+// request sets no TaskID, so its taskRef is empty), which means the tree-terminal
+// paths that normally e.block(ref) would set no task state AND mint no continuation,
+// stranding the stage's continuation chain with no foldable tail. The caller routes
+// those paths to enqueueFinalizeContinuation instead so the chain always ends in a
+// settled, delegation-less tail the pipeline advancer can fold.
+//
+// The first generation (the stage job itself) carries OrchestrateStage directly; a
+// later continuation generation does not copy the flag onto its payload, so resolve
+// the tree root and read the flag there. Best-effort: any lookup/parse failure
+// returns false, keeping the e.block path byte-identical for every non-orchestrate
+// tree (the overwhelming default).
+func (e Engine) isPipelineOrchestrateRoot(ctx context.Context, parentJob db.Job, parentPayload JobPayload) bool {
+	if parentPayload.OrchestrateStage {
+		return true
+	}
+	rootID := e.rootJobID(parentJob, parentPayload)
+	if strings.TrimSpace(rootID) == "" || rootID == parentJob.ID {
+		return false
+	}
+	root, err := e.Store.GetJob(ctx, rootID)
+	if err != nil {
+		return false
+	}
+	rootPayload, err := unmarshalPayload(root.Payload)
+	if err != nil {
+		return false
+	}
+	return rootPayload.OrchestrateStage
 }
 
 // buildContinuationPrompt inlines each finished child's job id, agent, decision,
