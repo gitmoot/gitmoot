@@ -241,7 +241,13 @@ func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.Pipel
 	// a terminal TAIL (the old tree is fully terminal by then) and mints a FRESH stage
 	// job under attempt+1 — a new deterministic id, hence a new RootJobID and a brand-
 	// new tree — never a resume into a partial sub-tree.
-	if stage.Orchestrate {
+	// The dispatch is gated STRICTLY on the spec-validated orchestrate CLASSIFICATION
+	// (Kind()==StageKindOrchestrate), not the raw stage.Orchestrate flag: a stage that
+	// carries orchestrate:true but that Validate classified as a shell/agent leaf (e.g.
+	// a cmd stage that also set the flag) must NOT set OrchestrateStage and relax the
+	// pipeline-sender delegations strip — the leaf-strip relaxation stays keyed to the
+	// exact shape the validator accepted as an orchestrate coordinator.
+	if stage.Kind() == pipeline.StageKindOrchestrate {
 		id := pipelineStageJobID(run.ID, stage.ID, attempt)
 		return workflow.JobRequest{
 			ID:               id,

@@ -2428,7 +2428,10 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 	// root or no delegation requested artifacts.
 	artifactDir, err := writeDelegationArtifacts(e.ArtifactRoot, job.ID, payload.Result)
 	if err != nil {
-		return e.block(ctx, ref, fmt.Sprintf("write delegation artifacts: %v", err))
+		// #758 dispatch-path edge: an orchestrate root has no task, so e.block would
+		// strand the chain — route to a foldable finalize tail (byte-identical e.block
+		// for every other tree).
+		return e.finalizeOrBlockDispatch(ctx, job, payload, e.block(ctx, ref, fmt.Sprintf("write delegation artifacts: %v", err)))
 	}
 	if artifactDir != "" {
 		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
@@ -2450,7 +2453,9 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 		// dep-free leg has no upstream deps to inject, and a deps-bearing leg is
 		// deferred to advanceDelegations (which injects #419 upstream results).
 		if err := e.enqueueDelegation(ctx, job, payload, d, artifactDir, "", ref); err != nil {
-			return err
+			// A worktree/branch-lock allocation block on an orchestrate root routes to a
+			// foldable finalize tail (and stops the loop) instead of stranding the chain.
+			return e.finalizeOrBlockDispatch(ctx, job, payload, err)
 		}
 	}
 	return nil
@@ -3289,7 +3294,9 @@ func (e Engine) advanceDelegations(ctx context.Context, parentJob db.Job, parent
 			// a late refusal here would strand a deferred leg whose refused
 			// sibling deps can never satisfy.
 			if err := e.enqueueDelegation(ctx, parentJob, parentPayload, d, artifactDir, upstreamContext, ref); err != nil {
-				return err
+				// A deferred-dependent dispatch block on an orchestrate root routes to a
+				// foldable finalize tail (and stops the loop) instead of stranding the chain.
+				return e.finalizeOrBlockDispatch(ctx, parentJob, parentPayload, err)
 			}
 			// Re-read children AND events so a second satisfied dependent in the
 			// same pass is not mistaken for still-pending, and a delegation
@@ -4054,6 +4061,37 @@ func (e Engine) isPipelineOrchestrateRoot(ctx context.Context, parentJob db.Job,
 		return false
 	}
 	return rootPayload.OrchestrateStage
+}
+
+// finalizeOrBlockDispatch converts a DISPATCH-path BlockedError into a foldable
+// finalize tail for a #758 pipeline-orchestrate root, mirroring how the
+// child-completion terminal sites (block_parent, vote/quorum synthesis gates)
+// route to enqueueFinalizeContinuation. A pipeline orchestrate stage job carries
+// no task (empty taskRef), so the one-shot dispatch-path blocks — write delegation
+// artifacts, and every worktree/branch-lock allocation BlockedError bubbling up
+// from allocateAndEnqueueDelegation (implement worktree, unresolved implement deps,
+// integration worktree, read-only fan-out worktree, shared-checkout branch lock) —
+// would e.block(empty ref): set NO task state and mint NO continuation, stranding
+// the stage's chain with no foldable tail (the coordinator stays succeeded with
+// delegations>0 and orchestrateStageSettleOutcome never settles). Routing them to a
+// finalize continuation guarantees the chain always ends in a settled, delegation-
+// less tail the pipeline advancer folds. Returning it (nil on success) also STOPS
+// the dispatch loop exactly like the original BlockedError did, so no further child
+// is enqueued after the tail is minted.
+//
+// Byte-identical for every other tree: a nil err returns nil, and a non-orchestrate
+// root (isPipelineOrchestrateRoot false) returns the BlockedError unchanged — the
+// gate only ever fires for a root whose empty ref made e.block a pure no-op-state
+// BlockedError with nothing durable to preserve.
+func (e Engine) finalizeOrBlockDispatch(ctx context.Context, job db.Job, payload JobPayload, err error) error {
+	if err == nil {
+		return nil
+	}
+	var blocked BlockedError
+	if errors.As(err, &blocked) && e.isPipelineOrchestrateRoot(ctx, job, payload) {
+		return e.enqueueFinalizeContinuation(ctx, job, payload, blocked.Reason)
+	}
+	return err
 }
 
 // buildContinuationPrompt inlines each finished child's job id, agent, decision,

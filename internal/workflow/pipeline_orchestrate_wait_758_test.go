@@ -186,3 +186,72 @@ func TestPipelineOrchestrateRootVoteGateFinalizesInsteadOfBlocking(t *testing.T)
 		t.Fatalf("orchestrate-root vote-gate tail must carry DelegationFinalize: %+v", cont)
 	}
 }
+
+// TestPipelineOrchestrateRootDispatchBlockFinalizesInsteadOfBlocking proves the
+// DISPATCH-side terminal e.block sites are routed too: a coordinator that fans out
+// an implement child whose worktree/branch-lock allocation blocks at dispatch time
+// must mint a foldable finalize tail, not a bare BlockedError. Here the engine has no
+// worktree manager (shared-checkout fallback) and the coordinator carries no branch,
+// so allocateAndEnqueueDelegation's ensureBranchLock blocks ("branch is required") —
+// exactly the one-shot dispatch path that, on an orchestrate root's empty taskRef,
+// would strand the stage's chain with no continuation for the advancer to fold.
+func TestPipelineOrchestrateRootDispatchBlockFinalizesInsteadOfBlocking(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "jerryfane/gitmoot")
+	seedAgent(t, store, "impl", []string{"implement"}, "jerryfane/gitmoot")
+	engine := testEngine(store)
+
+	// The stage job IS the sub-tree root (OrchestrateStage, RootJobID = own id, NO
+	// TaskID and NO branch), fanning out a single implement child. With no
+	// DelegationWorktrees manager the child takes the shared-checkout branch-lock path,
+	// which blocks on the empty branch — a dispatch-time BlockedError on an empty ref.
+	insertCompletedJob(t, store, db.Job{ID: "stage-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:             "jerryfane/gitmoot",
+		Sender:           "coord",
+		RootJobID:        "stage-job",
+		OrchestrateStage: true,
+		Result: &AgentResult{
+			Decision:    "approved",
+			Summary:     "fan out an implement leg",
+			Delegations: []Delegation{{ID: "impl", Agent: "impl", Action: "implement", Prompt: "ship it"}},
+		},
+	})
+
+	// The dispatch-path block must NOT return a BlockedError for an orchestrate root: it
+	// routes to the finalize continuation and returns nil.
+	if err := engine.AdvanceJob(ctx, "stage-job"); err != nil {
+		var blocked BlockedError
+		if errors.As(err, &blocked) {
+			t.Fatalf("orchestrate-root dispatch block returned BlockedError %v — it must route to a foldable finalize tail instead", err)
+		}
+		t.Fatalf("AdvanceJob(stage-job) returned error: %v", err)
+	}
+
+	// A foldable tail exists at the deterministic continuation slot, carrying
+	// DelegationFinalize (terminal), and no implement child was enqueued (all-or-nothing:
+	// the loop stopped at the block).
+	cont, err := unmarshalPayload(mustJob(t, store, delegationContinuationID("stage-job")).Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(finalize tail): %v", err)
+	}
+	if !cont.DelegationFinalize {
+		t.Fatalf("orchestrate-root dispatch-block tail must carry DelegationFinalize: %+v", cont)
+	}
+	if jobExists(t, store, "stage-job/delegation/impl") {
+		t.Fatalf("no implement child should be enqueued after the dispatch block minted the finalize tail")
+	}
+	if got := countJobEvents(t, store, "stage-job", "delegation_finalize_enqueued"); got != 1 {
+		t.Fatalf("delegation_finalize_enqueued events = %d, want 1", got)
+	}
+	// Idempotent: re-advancing the coordinator never double-mints the finalize tail.
+	if err := engine.AdvanceJob(ctx, "stage-job"); err != nil {
+		var blocked BlockedError
+		if errors.As(err, &blocked) {
+			t.Fatalf("re-advance of an orchestrate-root dispatch block returned BlockedError: %v", err)
+		}
+	}
+	if got := countJobEvents(t, store, "stage-job", "delegation_finalize_enqueued"); got != 1 {
+		t.Fatalf("after re-advance: delegation_finalize_enqueued events = %d, want 1 (idempotent)", got)
+	}
+}
