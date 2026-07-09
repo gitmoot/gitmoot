@@ -1347,6 +1347,8 @@ gitmoot memory vault import <DIR> [--dry-run|--yes] [--json]
 gitmoot memory ingest <path|dir> --agent NAME [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
 gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]
 gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--yes] [--json]
+gitmoot memory links backfill [--dry-run] [--json]
+gitmoot memory links list <id> [--json]
 gitmoot memory groom --propose [--out PLAN.json] [--json]
 gitmoot memory groom --yes --plan PLAN.json [--json]
 gitmoot memory clusters [--json]
@@ -1369,9 +1371,9 @@ expected_keys}` fixtures file.
 
 `memory vault export` renders confirmed memory as a **disposable, Obsidian-compatible
 vault view**: one Markdown note per confirmed memory (sorted-key YAML frontmatter,
-the content verbatim, and a `## Links` section of FTS co-occurrence `[[wikilinks]]`),
-a per-owner index note, and a `manifest.json` staleness anchor. The vault is a **view,
-not a replica** — the SQLite store stays the only source of truth, so it is
+the content verbatim, and a `## Links` section of FTS co-occurrence plus persisted
+`[[wikilinks]]`), a per-owner index note, and a `manifest.json` staleness anchor.
+The vault is a **view, not a replica**: the SQLite store stays the only source of truth, so it is
 regenerated from scratch on every export, safe to delete, and **deterministic**: the
 same store yields byte-identical files (no `exported_at`; stable id-derived
 filenames). The export is read-only and atomic (temp dir then rename over `--out`,
@@ -1413,6 +1415,15 @@ into confirmed memory (idempotently), and without `--yes` only prints the plan.
 Ingested Markdown is an indirect-prompt-injection vector, so it stays inert at
 `trust_mark = low` until a human confirms it; that confirm gate is the trust
 boundary and nothing reads `trust_mark` for a decision yet.
+
+Confirming a fact also records up to three deterministic persisted links from that
+confirmed row to active related confirmed memories. Links live in `memory_links`
+with BM25-derived scores and do not rewrite fact content. `memory links backfill`
+runs the same pass over the active confirmed pool in id order; `--dry-run` reports
+what would be created, and repeat runs create nothing new. `memory links list <id>`
+shows one fact's outgoing persisted links. Vault export merges these persisted
+links with content-derived links and dedupes by target in each note's `## Links`
+section.
 
 `memory groom` retires stale, low-signal confirmed memories as a **propose →
 review → apply** round-trip. `--propose` reads active confirmed memory, computes

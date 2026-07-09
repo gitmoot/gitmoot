@@ -1610,7 +1610,7 @@ Most jobs return none. Returned learnings are shadow-logged only (never injected
 in this phase) and pass deterministic pre-filters that reject directive-phrased,
 executable, secret-shaped, or non-repo-agnostic content.
 
-Inspect and measure the store (all read-only):
+Inspect, curate, and measure the store:
 
 ```sh
 gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo] [--json]
@@ -1619,6 +1619,8 @@ gitmoot memory replay [--agent NAME] [--repo owner/repo] [--limit N] [--json]
 gitmoot memory eval --fixtures fixtures.json [--k N] [--json]
 gitmoot memory vault export [--out DIR] [--agent NAME] [--force] [--json]
 gitmoot memory vault import <DIR> [--dry-run|--yes] [--json]
+gitmoot memory links backfill [--dry-run] [--json]
+gitmoot memory links list <id> [--json]
 ```
 
 `memory list` shows confirmed memories and/or pending observations. `memory
@@ -1638,7 +1640,8 @@ recall/precision@K of retrieval over a labeled fixtures file whose cases are
 `memory vault export` renders confirmed memory as a **disposable, Obsidian-compatible
 vault view** (#737): one Markdown note per confirmed memory (sorted-key YAML
 frontmatter + the content verbatim + a `## Links` section of FTS co-occurrence
-`[[wikilinks]]`), a per-owner index note, and a `manifest.json` staleness anchor.
+and persisted `[[wikilinks]]`), a per-owner index note, and a `manifest.json`
+staleness anchor.
 It is a **view, not a replica**: the SQLite store stays the only source of truth,
 so the vault is regenerated from scratch on every export, is safe to delete, and
 is **deterministic** — the same store produces byte-identical files (there is no
@@ -1689,6 +1692,8 @@ observations** behind the existing confirmation gate. It never writes confirmed
 gitmoot memory ingest <path|dir> --agent NAME [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
 gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]
 gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--yes] [--json]
+gitmoot memory links backfill [--dry-run] [--json]
+gitmoot memory links list <id> [--json]
 ```
 
 `memory ingest` walks `*.md` (recursively for a directory), strips a leading YAML
@@ -1717,6 +1722,15 @@ selected observations (by id, or every observation matching a
 Without `--yes` it prints the plan and writes nothing; with `--yes` it promotes
 (idempotently — re-confirming the same key upserts the one row). This is
 **CLI-explicit only**: there is no daemon path and nothing auto-confirms.
+
+Confirming a fact also writes up to three deterministic auto-links from that new
+confirmed row to active related confirmed memories. The links are stored in the
+`memory_links` side table with BM25-derived scores and never rewrite the fact
+content. `memory links backfill` applies the same link pass to the existing active
+confirmed pool in id order; `--dry-run` reports the links it would create without
+writing, and repeat runs are idempotent. `memory links list <id>` shows one fact's
+persisted outgoing links. Vault export merges these persisted links with the
+content-derived links in each note's `## Links` section and dedupes by target.
 
 > **Trust boundary.** Ingested Markdown is untrusted input — an
 > **indirect-prompt-injection vector**. Ingest records `trust_mark = low` on every

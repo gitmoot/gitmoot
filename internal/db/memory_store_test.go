@@ -27,7 +27,7 @@ func agentOwner(ref string) MemoryOwner {
 func TestMemoryMigrationCreatesTables(t *testing.T) {
 	ctx := context.Background()
 	store := openMemTestStore(t)
-	for _, name := range []string{"memory_observations", "confirmed_memories", "confirmed_memories_fts"} {
+	for _, name := range []string{"memory_observations", "confirmed_memories", "confirmed_memories_fts", "memory_links"} {
 		exists, err := store.tableExists(ctx, name)
 		if err != nil {
 			t.Fatalf("tableExists(%q): %v", name, err)
@@ -68,6 +68,58 @@ func TestConfirmedMemoryFTSRoundTrip(t *testing.T) {
 	}
 	if got[0].Key != "ci-flake" {
 		t.Fatalf("want key ci-flake, got %q", got[0].Key)
+	}
+}
+
+func TestConfirmedMemoryAutoLinksSimilarExistingFacts(t *testing.T) {
+	ctx := context.Background()
+	store := openMemTestStore(t)
+	owner := agentOwner("builder")
+
+	nearOne := mustUpsert(t, store, ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo",
+		Key: "near-one", Content: "aurora quartz vector hnsw planner spill runbook",
+	})
+	nearTwo := mustUpsert(t, store, ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo",
+		Key: "near-two", Content: "aurora quartz vector hnsw planner calibration checklist",
+	})
+	weak := mustUpsert(t, store, ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo",
+		Key: "weak", Content: "aurora deployment handbook unrelated release notes",
+	})
+	src := mustUpsert(t, store, ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo",
+		Key: "source", Content: "aurora quartz vector hnsw planner spill calibration",
+	})
+
+	links, err := store.ListMemoryLinks(ctx, src)
+	if err != nil {
+		t.Fatalf("list links: %v", err)
+	}
+	if len(links) != 2 {
+		t.Fatalf("want exactly two strong links, got %+v", links)
+	}
+	want := map[int64]bool{nearOne: true, nearTwo: true}
+	for _, l := range links {
+		if l.SrcID != src {
+			t.Fatalf("link source = %d, want %d", l.SrcID, src)
+		}
+		if l.DstID == src {
+			t.Fatalf("self-link created: %+v", l)
+		}
+		if l.DstID == weak {
+			t.Fatalf("weak one-token match crossed threshold: %+v", l)
+		}
+		if !want[l.DstID] {
+			t.Fatalf("unexpected target link: %+v", l)
+		}
+		if l.Score < memoryAutoLinkMinScore {
+			t.Fatalf("score %.12f below threshold %.12f", l.Score, memoryAutoLinkMinScore)
+		}
+		if l.Origin != "auto" {
+			t.Fatalf("origin = %q, want auto", l.Origin)
+		}
 	}
 }
 
@@ -634,7 +686,7 @@ func TestDistillWitnessExcludedFromListAndConfirm(t *testing.T) {
 
 	witnessID, err := store.InsertMemoryObservation(ctx, MemoryObservation{
 		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "distill-test:testx",
-		Content: "A failure signal was observed once in this repository and is held pending recurrence before it is recorded.",
+		Content:    "A failure signal was observed once in this repository and is held pending recurrence before it is recorded.",
 		Provenance: MemoryDistillWitnessProvenancePrefix + "job-1", TrustMark: "low",
 	})
 	if err != nil {
@@ -642,7 +694,7 @@ func TestDistillWitnessExcludedFromListAndConfirm(t *testing.T) {
 	}
 	stagedID, err := store.InsertMemoryObservation(ctx, MemoryObservation{
 		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "distill-test:testy",
-		Content: "Test testy FAILED in a implement job in this repository.",
+		Content:    "Test testy FAILED in a implement job in this repository.",
 		Provenance: "distill:job-2", TrustMark: "low",
 	})
 	if err != nil {

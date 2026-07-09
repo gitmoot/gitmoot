@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -56,6 +57,33 @@ type ConfirmedMemory struct {
 	UpdatedAt        string
 	SupersededBy     int64 // 0 == not superseded
 }
+
+// MemoryLink is one persisted, derived edge from a source confirmed memory to a
+// related target confirmed memory. It never mutates fact content; vault export and
+// inspection commands opt into this side table explicitly.
+type MemoryLink struct {
+	SrcID     int64
+	DstID     int64
+	DstKey    string
+	Score     float64
+	Origin    string
+	CreatedAt string
+}
+
+// MemoryLinkEnrichment reports what the auto-link pass created or skipped for one
+// source memory. Created contains rows that were written, or rows that WOULD be
+// written when the caller requested a dry run.
+type MemoryLinkEnrichment struct {
+	SrcID           int64
+	Created         []MemoryLink
+	SkippedExisting int
+	SkippedWeak     int
+}
+
+const (
+	memoryAutoLinkK        = 3
+	memoryAutoLinkMinScore = 0.000002
+)
 
 // nullableRepo maps an empty repo string to SQL NULL (a general-scope fact) and
 // a non-empty repo to itself, matching the NULLABLE repo column semantics the
@@ -319,10 +347,208 @@ WHERE id = ?`,
 	if _, err := tx.ExecContext(ctx, `INSERT INTO confirmed_memories_fts(rowid, content, key) VALUES (?, ?, ?)`, id, cm.Content, cm.Key); err != nil {
 		return 0, fmt.Errorf("sync confirmed memory fts (insert): %w", err)
 	}
+	if _, err := enrichConfirmedMemoryLinksTx(ctx, tx, id, false); err != nil {
+		return 0, fmt.Errorf("auto-link confirmed memory: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return id, nil
+}
+
+// EnrichConfirmedMemoryLinks computes the deterministic top-K similarity links
+// for one active confirmed memory and inserts any missing edges. When dryRun is
+// true it returns the rows that would be inserted without writing anything.
+func (s *Store) EnrichConfirmedMemoryLinks(ctx context.Context, srcID int64, dryRun bool) (MemoryLinkEnrichment, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return MemoryLinkEnrichment{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := enrichConfirmedMemoryLinksTx(ctx, tx, srcID, dryRun)
+	if err != nil {
+		return MemoryLinkEnrichment{}, err
+	}
+	if dryRun {
+		return result, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return MemoryLinkEnrichment{}, err
+	}
+	return result, nil
+}
+
+// ListMemoryLinks returns active target links for one source memory, ordered by
+// target id for deterministic CLI and vault rendering. Retired/superseded targets
+// are hidden so stale side-table rows never reappear in derived views.
+func (s *Store) ListMemoryLinks(ctx context.Context, srcID int64) ([]MemoryLink, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT ml.src_id, ml.dst_id, d.key, ml.score, ml.origin, ml.created_at
+FROM memory_links ml
+JOIN confirmed_memories d ON d.id = ml.dst_id
+WHERE ml.src_id = ?
+	AND d.superseded_by IS NULL
+	AND d.retired_at = ''
+ORDER BY ml.dst_id`, srcID)
+	if err != nil {
+		return nil, fmt.Errorf("list memory links: %w", err)
+	}
+	defer rows.Close()
+	var out []MemoryLink
+	for rows.Next() {
+		var l MemoryLink
+		if err := rows.Scan(&l.SrcID, &l.DstID, &l.DstKey, &l.Score, &l.Origin, &l.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+func enrichConfirmedMemoryLinksTx(ctx context.Context, tx *sql.Tx, srcID int64, dryRun bool) (MemoryLinkEnrichment, error) {
+	result := MemoryLinkEnrichment{SrcID: srcID}
+	src, ok, err := confirmedMemoryForLinkingTx(ctx, tx, srcID)
+	if err != nil || !ok {
+		return result, err
+	}
+	matchQuery := memoryLinkMatchQuery(src.Content)
+	if strings.TrimSpace(matchQuery) == "" {
+		return result, nil
+	}
+	candidates, err := queryMemoryLinkCandidatesTx(ctx, tx, src, matchQuery, memoryAutoLinkK)
+	if err != nil {
+		return MemoryLinkEnrichment{}, err
+	}
+	now := nowRFC3339()
+	for _, c := range candidates {
+		c.SrcID = srcID
+		c.CreatedAt = now
+		if c.Score < memoryAutoLinkMinScore {
+			result.SkippedWeak++
+			continue
+		}
+		if c.Origin == "existing" {
+			result.SkippedExisting++
+			continue
+		}
+		c.Origin = "auto"
+		if dryRun {
+			result.Created = append(result.Created, c)
+			continue
+		}
+		res, err := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO memory_links (src_id, dst_id, score, origin, created_at)
+VALUES (?, ?, ?, 'auto', ?)`, srcID, c.DstID, c.Score, now)
+		if err != nil {
+			return MemoryLinkEnrichment{}, fmt.Errorf("insert memory link %d -> %d: %w", srcID, c.DstID, err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return MemoryLinkEnrichment{}, err
+		}
+		if affected == 0 {
+			result.SkippedExisting++
+			continue
+		}
+		result.Created = append(result.Created, c)
+	}
+	return result, nil
+}
+
+func confirmedMemoryForLinkingTx(ctx context.Context, tx *sql.Tx, id int64) (ConfirmedMemory, bool, error) {
+	var c ConfirmedMemory
+	var repoNull sql.NullString
+	err := tx.QueryRowContext(ctx, `
+SELECT id, owner_kind, owner_ref, owner_version, repo, scope, key, content,
+	provenance, source_job, first_confirmed_at, updated_at
+FROM confirmed_memories
+WHERE id = ? AND superseded_by IS NULL AND retired_at = ''`, id).Scan(
+		&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &repoNull,
+		&c.Scope, &c.Key, &c.Content, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt, &c.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return ConfirmedMemory{}, false, nil
+	}
+	if err != nil {
+		return ConfirmedMemory{}, false, fmt.Errorf("read confirmed memory %d for linking: %w", id, err)
+	}
+	c.Repo = repoNull.String
+	return c, true, nil
+}
+
+func queryMemoryLinkCandidatesTx(ctx context.Context, tx *sql.Tx, src ConfirmedMemory, matchQuery string, limit int) ([]MemoryLink, error) {
+	if limit <= 0 {
+		limit = memoryAutoLinkK
+	}
+	rows, err := tx.QueryContext(ctx, `
+SELECT c.id, c.key, -bm25(f.confirmed_memories_fts) AS score,
+	EXISTS(SELECT 1 FROM memory_links ml WHERE ml.src_id = ? AND ml.dst_id = c.id) AS already_linked
+FROM confirmed_memories_fts f
+JOIN confirmed_memories c ON c.id = f.rowid
+WHERE f.confirmed_memories_fts MATCH ?
+	AND c.owner_kind = ? AND c.owner_ref = ? AND c.owner_version = ?
+	AND (c.scope = 'general' OR c.repo = ?)
+	AND c.superseded_by IS NULL
+	AND c.retired_at = ''
+	AND c.id <> ?
+ORDER BY bm25(f.confirmed_memories_fts), c.id
+LIMIT ?`,
+		src.ID, matchQuery, src.Owner.Kind, src.Owner.Ref, src.Owner.Version, src.Repo, src.ID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query memory link candidates: %w", err)
+	}
+	defer rows.Close()
+	var out []MemoryLink
+	for rows.Next() {
+		var l MemoryLink
+		var already int
+		if err := rows.Scan(&l.DstID, &l.DstKey, &l.Score, &already); err != nil {
+			return nil, err
+		}
+		if already != 0 {
+			l.Origin = "existing"
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+var memoryLinkWordRun = regexp.MustCompile(`[A-Za-z0-9]+`)
+
+var memoryLinkFTSKeywords = map[string]struct{}{
+	"and": {}, "or": {}, "not": {}, "near": {},
+}
+
+var memoryLinkStopwords = map[string]struct{}{
+	"the": {}, "and": {}, "for": {}, "with": {}, "that": {}, "this": {},
+	"you": {}, "your": {}, "are": {}, "was": {}, "will": {}, "have": {},
+	"from": {}, "into": {}, "should": {}, "would": {}, "could": {},
+}
+
+func memoryLinkMatchQuery(content string) string {
+	const maxTokens = 24
+	seen := make(map[string]struct{}, maxTokens)
+	tokens := make([]string, 0, maxTokens)
+	for _, raw := range memoryLinkWordRun.FindAllString(content, -1) {
+		tok := strings.ToLower(raw)
+		if len(tok) < 3 {
+			continue
+		}
+		if _, ok := memoryLinkFTSKeywords[tok]; ok {
+			continue
+		}
+		if _, ok := memoryLinkStopwords[tok]; ok {
+			continue
+		}
+		if _, dup := seen[tok]; dup {
+			continue
+		}
+		seen[tok] = struct{}{}
+		tokens = append(tokens, `"`+tok+`"`)
+		if len(tokens) >= maxTokens {
+			break
+		}
+	}
+	return strings.Join(tokens, " OR ")
 }
 
 // UpdateConfirmedMemoryByID applies an owner-curated content edit to ONE confirmed

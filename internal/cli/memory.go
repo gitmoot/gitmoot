@@ -43,6 +43,8 @@ func runMemory(args []string, stdout, stderr io.Writer) int {
 		return runMemoryObservations(args[1:], stdout, stderr)
 	case "confirm":
 		return runMemoryConfirm(args[1:], stdout, stderr)
+	case "links":
+		return runMemoryLinks(args[1:], stdout, stderr)
 	case "groom":
 		return runMemoryGroom(args[1:], stdout, stderr)
 	case "clusters":
@@ -72,6 +74,8 @@ func printMemoryUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot memory ingest <path|dir> --agent NAME [--repo R] [--tier repo|general] [--dry-run] [--json]")
 	fmt.Fprintln(w, "  gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]")
 	fmt.Fprintln(w, "  gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--yes] [--json]")
+	fmt.Fprintln(w, "  gitmoot memory links backfill [--dry-run] [--json]")
+	fmt.Fprintln(w, "  gitmoot memory links list <id> [--json]")
 	fmt.Fprintln(w, "  gitmoot memory groom --propose [--out PLAN.json] [--json] | --yes --plan PLAN.json [--json]")
 	fmt.Fprintln(w, "  gitmoot memory clusters [--json]")
 	fmt.Fprintln(w, "  gitmoot memory clusters recompute --propose [--out PLAN.json] [--json] | --apply [--plan PLAN.json] [--json]")
@@ -86,6 +90,7 @@ func printMemoryUsage(w io.Writer) {
 	fmt.Fprintln(w, "  ingest        stage markdown as trust_mark=low pending observations (PreFilter-gated)")
 	fmt.Fprintln(w, "  observations  list pending observations, flagging which keys are already confirmed")
 	fmt.Fprintln(w, "  confirm       human-gated promotion of pending observations into confirmed memory")
+	fmt.Fprintln(w, "  links         inspect persisted memory links; backfill links for existing facts")
 	fmt.Fprintln(w, "  groom         deterministically propose stale-memory retirements, apply on confirmation")
 	fmt.Fprintln(w, "  clusters      list emergent memory clusters; recompute them via a propose/apply plan")
 	fmt.Fprintln(w, "  cluster       rename a cluster (owner label override)")
