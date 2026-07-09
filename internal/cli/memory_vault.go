@@ -182,7 +182,7 @@ func buildVault(ctx context.Context, store *db.Store, agent string) ([]vaultNote
 
 	for _, r := range rows {
 		m := toVaultMemory(r)
-		links, err := vaultLinksFor(ctx, store, r)
+		links, err := vaultLinksForExport(ctx, store, r)
 		if err != nil {
 			return nil, nil, "", nil, err
 		}
@@ -221,6 +221,43 @@ func buildVault(ctx context.Context, store *db.Store, agent string) ([]vaultNote
 	}
 
 	return notes, indexes, snapshotHash, owners, nil
+}
+
+// vaultLinksForExport merges the existing derived bm25 links with persisted
+// memory_links rows. The table links are a side-table view of confirmed memory,
+// so they appear in the derived vault without changing the source note content.
+// Duplicates collapse by target id; RenderVaultNote applies the final id sort.
+func vaultLinksForExport(ctx context.Context, store *db.Store, src db.ConfirmedMemory) ([]memory.VaultLink, error) {
+	derived, err := vaultLinksFor(ctx, store, src)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[int64]memory.VaultLink, len(derived))
+	for _, l := range derived {
+		byID[l.TargetID] = l
+	}
+	persisted, err := store.ListMemoryLinks(ctx, src.ID)
+	if err != nil {
+		return nil, err
+	}
+	for _, l := range persisted {
+		if l.DstID == src.ID {
+			continue
+		}
+		if _, seen := byID[l.DstID]; seen {
+			continue
+		}
+		byID[l.DstID] = memory.VaultLink{
+			TargetID: l.DstID,
+			Stem:     memory.VaultStem(l.DstID, l.DstKey),
+			Key:      l.DstKey,
+		}
+	}
+	out := make([]memory.VaultLink, 0, len(byID))
+	for _, l := range byID {
+		out = append(out, l)
+	}
+	return out, nil
 }
 
 // vaultLinksFor computes the deterministic top-K co-occurrence links for one

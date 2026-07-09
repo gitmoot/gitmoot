@@ -133,8 +133,8 @@ gitmoot memory vault import <DIR> [--dry-run|--yes] [--json]
 
 `memory vault export` renders confirmed memory as an Obsidian-compatible vault:
 one Markdown note per confirmed memory (sorted-key YAML frontmatter, the content
-verbatim, and a `## Links` section of FTS co-occurrence `[[wikilinks]]`), a
-per-owner index note, and a `manifest.json` staleness anchor.
+verbatim, and a `## Links` section of FTS co-occurrence plus persisted
+`[[wikilinks]]`), a per-owner index note, and a `manifest.json` staleness anchor.
 
 The vault is a **view, not a replica**: SQLite stays the *only* source of truth,
 so the export never becomes a second store to keep in sync. It is regenerated
@@ -187,6 +187,8 @@ writes injectable memory directly.
 gitmoot memory ingest <path|dir> --agent NAME [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
 gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]
 gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--yes] [--json]
+gitmoot memory links backfill [--dry-run] [--json]
+gitmoot memory links list <id> [--json]
 ```
 
 `memory ingest` walks `*.md`, strips a leading YAML frontmatter block when
@@ -211,6 +213,15 @@ selected observations (by id, or every one matching a `--provenance-prefix`) int
 confirmed memory, carrying provenance through. Without `--yes` it prints the plan
 and writes nothing; with `--yes` it promotes idempotently. It is **CLI-explicit
 only** — no daemon path, no auto-confirm.
+
+When a fact is confirmed, Gitmoot also records up to three deterministic outgoing
+links from that confirmed row to active related confirmed memories. These links
+live in the `memory_links` side table with BM25-derived scores. They do not rewrite
+the memory's content. `memory links backfill` runs the same pass over all active
+confirmed memories in id order; `--dry-run` reports what would be created, and
+repeat runs create nothing new. `memory links list <id>` inspects a fact's
+persisted outgoing links. Vault export merges persisted links with content-derived
+links in each note's `## Links` section and removes duplicates by target.
 
 :::warning Ingested Markdown is untrusted
 Ingested Markdown is an **indirect-prompt-injection vector**. Ingest stamps

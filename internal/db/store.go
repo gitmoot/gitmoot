@@ -8287,4 +8287,22 @@ CREATE TABLE memory_cluster_members (
 );
 CREATE INDEX idx_memory_cluster_members_cluster ON memory_cluster_members(cluster_id);
 	`,
+	// #784 auto cross-link confirmed memories. Links are stored in a dedicated side
+	// table rather than mutating owner-authored fact content: the confirmed memory
+	// row remains the source of truth for the fact, while this table records a
+	// deterministic, capped similarity edge from one active fact to another. Pure
+	// additive append (CREATE TABLE/INDEX only): the table stays empty until a
+	// memory is confirmed or `gitmoot memory links backfill` runs, so every
+	// existing read path is byte-identical unless it explicitly opts into links.
+	`
+CREATE TABLE memory_links (
+	src_id INTEGER NOT NULL,
+	dst_id INTEGER NOT NULL,
+	score REAL NOT NULL,
+	origin TEXT NOT NULL DEFAULT 'auto',
+	created_at TEXT NOT NULL,
+	UNIQUE(src_id, dst_id)
+);
+CREATE INDEX idx_memory_links_dst ON memory_links(dst_id);
+	`,
 }

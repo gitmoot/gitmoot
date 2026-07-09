@@ -206,6 +206,42 @@ func TestVaultExportDeterministicLinksUnderBM25Ties(t *testing.T) {
 	}
 }
 
+func TestVaultExportIncludesPersistedMemoryLinks(t *testing.T) {
+	home, store := memoryTestHome(t)
+	owner := db.MemoryOwner{Kind: "agent", Ref: "builder"}
+	srcID := seedConfirmed(t, store, owner, "acme/widget", "repo", "source", "alpha-only operational note")
+	dstID := seedConfirmed(t, store, owner, "acme/widget", "repo", "target", "zulu-only release note")
+	clearMemoryLinks(t, home)
+
+	raw, err := sql.Open("sqlite", config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if _, err := raw.ExecContext(context.Background(), `
+INSERT INTO memory_links (src_id, dst_id, score, origin, created_at)
+VALUES (?, ?, 0.42, 'auto', '2026-07-09T00:00:00Z')`, srcID, dstID); err != nil {
+		t.Fatalf("insert persisted link: %v", err)
+	}
+	raw.Close()
+
+	out := filepath.Join(t.TempDir(), "v")
+	exportVault(t, home, out, "")
+	tree := readVaultTree(t, out)
+	var source string
+	for name, body := range tree {
+		if strings.HasSuffix(name, "-source.md") {
+			source = string(body)
+		}
+	}
+	if source == "" {
+		t.Fatal("source note not found")
+	}
+	want := "[[" + memory.VaultStem(dstID, "target") + "|target]]"
+	if !strings.Contains(source, want) {
+		t.Fatalf("vault note missing persisted link %s:\n%s", want, source)
+	}
+}
+
 func TestVaultExportEmptyDB(t *testing.T) {
 	home, _ := memoryTestHome(t)
 	out := filepath.Join(t.TempDir(), "v")
