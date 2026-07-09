@@ -8285,7 +8285,7 @@ CREATE TABLE memory_cluster_members (
 	memory_id INTEGER PRIMARY KEY,
 	cluster_id INTEGER NOT NULL
 );
-	CREATE INDEX idx_memory_cluster_members_cluster ON memory_cluster_members(cluster_id);
+CREATE INDEX idx_memory_cluster_members_cluster ON memory_cluster_members(cluster_id);
 	`,
 	// #784 auto cross-link confirmed memories. Links are stored in a dedicated side
 	// table rather than mutating owner-authored fact content: the confirmed memory

@@ -81,8 +81,16 @@ type MemoryLinkEnrichment struct {
 }
 
 const (
-	memoryAutoLinkK        = 3
-	memoryAutoLinkMinScore = 0.000002
+	memoryAutoLinkK = 3
+	// memoryAutoLinkMinScore is a tiny absolute floor guarding degenerate
+	// near-zero bm25 matches. The REAL weak-link guard is relative:
+	// memoryAutoLinkMinRelative drops any candidate scoring below that
+	// fraction of the best candidate for the same source fact, which stays
+	// meaningful as the corpus grows (absolute bm25 magnitudes are
+	// corpus-dependent; a live probe on 95 facts showed scores 1.25-45.6,
+	// so any fixed absolute cutoff is either dead code or brittle).
+	memoryAutoLinkMinScore    = 0.000002
+	memoryAutoLinkMinRelative = 0.30
 )
 
 // nullableRepo maps an empty repo string to SQL NULL (a general-scope fact) and
@@ -420,10 +428,16 @@ func enrichConfirmedMemoryLinksTx(ctx context.Context, tx *sql.Tx, srcID int64, 
 		return MemoryLinkEnrichment{}, err
 	}
 	now := nowRFC3339()
+	// Candidates arrive best-first; the top score anchors the relative
+	// weak-link cutoff for this source fact.
+	var topScore float64
+	if len(candidates) > 0 {
+		topScore = candidates[0].Score
+	}
 	for _, c := range candidates {
 		c.SrcID = srcID
 		c.CreatedAt = now
-		if c.Score < memoryAutoLinkMinScore {
+		if c.Score < memoryAutoLinkMinScore || c.Score < topScore*memoryAutoLinkMinRelative {
 			result.SkippedWeak++
 			continue
 		}
