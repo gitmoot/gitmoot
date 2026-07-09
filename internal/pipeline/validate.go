@@ -220,6 +220,8 @@ func validateStageExecutor(pipelineName string, stage Stage) error {
 		return validateShellStage(pipelineName, stage)
 	case StageKindAgentAsk, StageKindAgentReview:
 		return validateAgentStage(pipelineName, stage)
+	case StageKindOrchestrate:
+		return validateOrchestrateStage(pipelineName, stage)
 	default:
 		// StageKindUnknown past the exactly-one-of guard = an agent stage (Agent
 		// set, Cmd empty) with an unrecognized action; validateAgentStage produces
@@ -256,6 +258,28 @@ func validateAgentStage(pipelineName string, stage Stage) error {
 	}
 	if !containsToken(AgentStageActionCandidates, stage.Action) {
 		return fmt.Errorf("pipeline %q stage %q agent stage action %q is invalid; use one of: %s", pipelineName, stage.ID, stage.Action, strings.Join(AgentStageActionCandidates, ", "))
+	}
+	return nil
+}
+
+// validateOrchestrateStage validates an orchestrate agent stage (#758): a
+// name-safe agent token, a non-empty coordinator prompt, and the read-only "ask"
+// verb. An orchestrate coordinator ASKS and fans out a bounded sub-tree; review
+// and implement are rejected (review does not fan out; implement is not a
+// read-only entry verb). normalize() already defaults an empty action to "ask",
+// so the only way action != "ask" here is an explicit review/implement (or another
+// token) the author set. The Orchestrate flag itself is guaranteed true by
+// Stage.Kind() before this is reached, so it is not re-checked. This is a pure
+// APPEND: the shell and #757 agent validators are byte-identical.
+func validateOrchestrateStage(pipelineName string, stage Stage) error {
+	if !validToken(stage.Agent) {
+		return fmt.Errorf("pipeline %q stage %q agent %q must be a name-safe token (letters, digits, '-', '_')", pipelineName, stage.ID, stage.Agent)
+	}
+	if stage.Prompt == "" {
+		return fmt.Errorf("pipeline %q stage %q orchestrate stage requires a non-empty coordinator prompt", pipelineName, stage.ID)
+	}
+	if stage.Action != DefaultAgentStageAction {
+		return fmt.Errorf("pipeline %q stage %q orchestrate stage action %q is not allowed; an orchestrate coordinator runs the read-only %q verb and fans out a bounded sub-tree", pipelineName, stage.ID, stage.Action, DefaultAgentStageAction)
 	}
 	return nil
 }

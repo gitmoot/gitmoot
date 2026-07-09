@@ -218,6 +218,36 @@ func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.Pipel
 	// advancement), RootJobID=run.ID. The action is the validated read-only
 	// ask/review. Everything else (fingerprint, timeout, root) matches the shell path
 	// so the advancer folds it identically.
+	// ORCHESTRATE stage (#758): the stage job is a bounded agent SUB-TREE root. It
+	// dispatches like a #757 agent stage (bound to the named agent on its own
+	// runtime, upstream needs-context prepended to the coordinator prompt, the
+	// validated read-only "ask" verb) with exactly TWO deliberate deviations:
+	//   (a) OrchestrateStage is set from the VALIDATED spec so Mailbox.Run relaxes
+	//       the pipeline-sender delegations strip — the coordinator's delegations[]
+	//       survive and dispatchDelegations fans them out as children whose
+	//       ParentJobID is THIS stage job (owned, never orphaned).
+	//   (b) RootJobID is the stage job's OWN id (NOT run.ID like #757). Every
+	//       per-root mechanism (countRootDelegationJobs, rootWallClockExceeded,
+	//       IsRootJobKilled) keys on RootJobID, so making the stage job a true tree
+	//       root gives the sub-tree its OWN job-budget / wall-clock / kill scope and
+	//       keeps sibling stages from sharing one tree budget. Run linkage still
+	//       lives in pipeline_run_stages.job_id, not RootJobID.
+	// ParentJobID stays EMPTY (the coordinator is the root, not a delegation child).
+	if stage.Orchestrate {
+		id := pipelineStageJobID(run.ID, stage.ID, attempt)
+		return workflow.JobRequest{
+			ID:               id,
+			Agent:            stage.Agent,
+			Action:           stage.Action,
+			Repo:             rec.Repo,
+			Sender:           workflow.PipelineJobSender,
+			Instructions:     upstreamContext + stage.Prompt,
+			Fingerprint:      pipelineStageFingerprint(rec.Name, run.ID, stage.ID, attempt),
+			RootJobID:        id,
+			JobTimeout:       stage.Timeout,
+			OrchestrateStage: true,
+		}
+	}
 	if stage.Agent != "" {
 		return workflow.JobRequest{
 			ID:           pipelineStageJobID(run.ID, stage.ID, attempt),

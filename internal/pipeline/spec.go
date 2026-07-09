@@ -100,6 +100,14 @@ type Stage struct {
 	Retry int `yaml:"retry,omitempty"`
 	// SuccessDecisions optionally overrides the pipeline default for this stage.
 	SuccessDecisions []string `yaml:"success_decisions,omitempty"`
+	// Orchestrate, when true on an agent stage, promotes the stage from a read-only
+	// LEAF (#757) to a bounded agent SUB-TREE root (#758): the stage's agent runs as
+	// a coordinator whose delegations[] are NOT stripped but fan out as children
+	// OWNED by the stage job (ParentJobID = the stage job, RootJobID = the stage
+	// job's own id). It requires Agent + Prompt and the read-only "ask" verb; it is
+	// mutually exclusive with Cmd. Opt-in per stage so the cheap, reproducible shell
+	// line stays the default (the #758 "when in doubt, use a #757 leaf" rule).
+	Orchestrate bool `yaml:"orchestrate,omitempty"`
 }
 
 // StageKind classifies a stage by its declared fields. It is the SINGLE place a
@@ -130,6 +138,13 @@ const (
 	// verb. Same leaf contract as ask; kept distinct so a future kind is appended as
 	// a sibling case rather than by editing a shared agent branch.
 	StageKindAgentReview
+	// StageKindOrchestrate is an agent stage carrying orchestrate:true (#758): the
+	// stage's agent runs as a bounded sub-tree COORDINATOR. Unlike the agent-leaf
+	// kinds its delegations[] are NOT stripped — they fan out as children owned by
+	// the stage job. It is classified by the Orchestrate flag BEFORE the plain agent
+	// action switch below, so an orchestrate stage is never mistaken for a leaf
+	// ask/review. Appended as a sibling kind; the existing cases are untouched.
+	StageKindOrchestrate
 )
 
 // Kind classifies the stage. A shell stage (Cmd set) is StageKindShell; an agent
@@ -142,6 +157,13 @@ const (
 // guard so that here exactly one executor is set.
 func (s Stage) Kind() StageKind {
 	switch {
+	case s.Orchestrate && s.Cmd == "" && s.Agent != "":
+		// #758: an agent stage with orchestrate:true is a sub-tree coordinator,
+		// classified here BEFORE the plain agent action switch so it is never folded
+		// as a read-only leaf. Its action rules (ask only) live in
+		// validateOrchestrateStage; a Cmd set alongside falls through to the
+		// both-executors StageKindUnknown rejection like any other malformed stage.
+		return StageKindOrchestrate
 	case s.Cmd != "" && s.Agent != "":
 		return StageKindUnknown
 	case s.Cmd != "":
