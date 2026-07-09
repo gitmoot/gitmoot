@@ -197,6 +197,14 @@ type JobRequest struct {
 	// inheriting it for back-linking) but which must NOT trigger seat elevation. Set
 	// only by the moot dispatch; never inherited by continuations/children.
 	MootSeat bool
+	// OrchestrateStage marks a #758 pipeline orchestrate stage job: the stage's agent
+	// runs as a bounded sub-tree COORDINATOR, so its delegations[] are NOT stripped by
+	// the pipeline-sender leaf strip (they fan out as children owned by this stage
+	// job). It is set ONLY from the validated orchestrate spec by the pipeline
+	// dispatch, never inferred by sender-sniffing, so every other pipeline-sender job
+	// (shell, #757 agent leaf) keeps the delegations strip byte-identically.
+	// Additive/omitempty: false leaves the enqueued payload byte-identical.
+	OrchestrateStage bool
 }
 
 type JobPayload struct {
@@ -265,6 +273,12 @@ type JobPayload struct {
 	// including chat-task promotions and continuations that carry ThreadID — is
 	// byte-identical. Never inherited by delegation children or continuations.
 	MootSeat bool `json:"moot_seat,omitempty"`
+	// OrchestrateStage marks a #758 pipeline orchestrate stage job whose delegations[]
+	// survive the pipeline-sender leaf strip (they fan out as children owned by this
+	// stage job, whose own id is the sub-tree RootJobID). Set only from the validated
+	// orchestrate spec, never by sender-sniffing. Additive/omitempty so every other
+	// pipeline-sender payload — shell + #757 agent leaf — serializes byte-identically.
+	OrchestrateStage bool `json:"orchestrate_stage,omitempty"`
 	RawOutputs    []string     `json:"raw_outputs,omitempty"`
 	Result        *AgentResult `json:"result,omitempty"`
 	// ResultChecks, when non-empty, carries the deterministic binary-checklist
@@ -381,6 +395,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		ThreadID:               strings.TrimSpace(request.ThreadID),
 		ChatMessageID:          strings.TrimSpace(request.ChatMessageID),
 		MootSeat:               request.MootSeat,
+		OrchestrateStage:       request.OrchestrateStage,
 	})
 	if err != nil {
 		return db.Job{}, err
@@ -772,7 +787,17 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	// advancer already ignores stage delegations, and this makes stages-as-leaves
 	// hold at the engine seam too. Cheap and byte-identical for every other sender.
 	if payload.Sender == PipelineJobSender {
-		result.Delegations = nil
+		// #758: an orchestrate stage IS a bounded sub-tree ROOT — it is explicitly
+		// AUTHORIZED to fan out, so its delegations[] survive here and the engine's
+		// dispatchDelegations gives every child ParentJobID = this stage job (owned,
+		// not orphaned). The relaxation is gated STRICTLY on the OrchestrateStage
+		// payload flag, which the pipeline dispatch sets only from the validated
+		// orchestrate:true spec — NEVER by sender-sniffing — so every other
+		// pipeline-sender job (shell + #757 agent leaf) keeps the delegations strip
+		// byte-identically and can never spawn phantom children.
+		if !payload.OrchestrateStage {
+			result.Delegations = nil
+		}
 		// Same leaf enforcement for human_questions[] (#757): a healthy agent-stage
 		// result with an empty ParentJobID would otherwise drive the TOP-LEVEL
 		// ask-gate (AdvanceJob, engine.go), opening an escalation / needs-attention
@@ -783,6 +808,13 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		// pause a human than it can spawn a child; strip it so the stage folds
 		// purely on its decision (a stage that must halt returns decision
 		// "blocked", which the advancer parks the whole run on with needs).
+		//
+		// This strip stays unconditional for EVERY pipeline-sender stage job — the
+		// #758 orchestrate coordinator included: the coordinator's own ParentJobID is
+		// empty, so its human_questions would hit the same unresolvable top-level
+		// ask-gate. Per the #758 design a CHILD's ask-gate is what pauses the tree,
+		// and a child is a non-pipeline-sender job (Sender = the coordinator agent,
+		// ParentJobID = this stage job), so this strip never touches it.
 		result.HumanQuestions = nil
 	}
 	payload.Result = &result

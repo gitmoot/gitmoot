@@ -361,6 +361,16 @@ func TestPipelineStageKind(t *testing.T) {
 		{"agent implement", Stage{ID: "a", Agent: "impl", Prompt: "q", Action: "implement", Write: true}, StageKindAgentImplement},
 		{"agent implement no write still a kind", Stage{ID: "a", Agent: "impl", Prompt: "q", Action: "implement"}, StageKindAgentImplement},
 		{"agent bad action", Stage{ID: "a", Agent: "x", Prompt: "q", Action: "deploy"}, StageKindUnknown},
+		// #758: orchestrate:true on an agent stage classifies as StageKindOrchestrate,
+		// checked BEFORE the plain agent action switch (so an orchestrate stage is
+		// never mistaken for a leaf), even when the (to-be-rejected) action is review.
+		{"orchestrate default action", Stage{ID: "a", Agent: "coord", Prompt: "q", Action: DefaultAgentStageAction, Orchestrate: true}, StageKindOrchestrate},
+		{"orchestrate empty action", Stage{ID: "a", Agent: "coord", Prompt: "q", Orchestrate: true}, StageKindOrchestrate},
+		{"orchestrate review action", Stage{ID: "a", Agent: "coord", Prompt: "q", Action: "review", Orchestrate: true}, StageKindOrchestrate},
+		// orchestrate:true with a cmd set is still the both-executors malformed shape.
+		{"orchestrate with cmd", Stage{ID: "a", Cmd: "echo", Agent: "coord", Prompt: "q", Orchestrate: true}, StageKindUnknown},
+		// orchestrate:true with no agent is not an orchestrate coordinator (nothing to run).
+		{"orchestrate no agent", Stage{ID: "a", Prompt: "q", Orchestrate: true}, StageKindUnknown},
 		{"gate pr_merged", Stage{ID: "g", Gate: "pr_merged", Source: "impl", Needs: []string{"impl"}}, StageKindGate},
 	}
 	for _, tc := range cases {
@@ -399,6 +409,76 @@ stages:
 		if got := stage.Kind(); got != want[i] {
 			t.Fatalf("stage %q Kind() = %d, want %d", stage.ID, got, want[i])
 		}
+	}
+}
+
+// TestPipelineOrchestrateStageValidation pins the #758 orchestrate stage spec
+// contract end-to-end through Load: a valid orchestrate stage (agent + prompt +
+// orchestrate:true, default/explicit ask verb) loads and classifies as
+// StageKindOrchestrate, while the malformed shapes are rejected at add time.
+func TestPipelineOrchestrateStageValidation(t *testing.T) {
+	const validSpec = `name: orch
+repo: jerryfane/gitmoot
+stages:
+  - id: extract
+    cmd: echo facts
+  - id: decompose
+    agent: coordinator
+    prompt: Decompose the work and fan out reviewers.
+    orchestrate: true
+    needs: [extract]
+`
+	spec, err := Load([]byte(validSpec))
+	if err != nil {
+		t.Fatalf("Load valid orchestrate spec: %v", err)
+	}
+	orch := spec.Stages[1]
+	if !orch.Orchestrate {
+		t.Fatalf("orchestrate flag not parsed: %+v", orch)
+	}
+	if orch.Action != DefaultAgentStageAction {
+		t.Fatalf("orchestrate action = %q, want defaulted to %q", orch.Action, DefaultAgentStageAction)
+	}
+	if orch.Kind() != StageKindOrchestrate {
+		t.Fatalf("orchestrate stage Kind() = %d, want StageKindOrchestrate", orch.Kind())
+	}
+
+	errCases := []struct {
+		name    string
+		spec    string
+		wantSub string
+	}{
+		{
+			name:    "orchestrate without prompt",
+			spec:    "name: p\nstages:\n  - {id: a, agent: coord, orchestrate: true}\n",
+			wantSub: "orchestrate stage requires a non-empty coordinator prompt",
+		},
+		{
+			name:    "orchestrate review action rejected",
+			spec:    "name: p\nstages:\n  - {id: a, agent: coord, prompt: hi, orchestrate: true, action: review}\n",
+			wantSub: `orchestrate stage action "review" is not allowed`,
+		},
+		{
+			name:    "orchestrate implement action rejected",
+			spec:    "name: p\nstages:\n  - {id: a, agent: coord, prompt: hi, orchestrate: true, action: implement}\n",
+			wantSub: `orchestrate stage action "implement" is not allowed`,
+		},
+		{
+			name:    "orchestrate with cmd is both executors",
+			spec:    "name: p\nstages:\n  - {id: a, cmd: echo, agent: coord, prompt: hi, orchestrate: true}\n",
+			wantSub: `stage "a" sets both cmd and agent`,
+		},
+	}
+	for _, tc := range errCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load([]byte(tc.spec))
+			if err == nil {
+				t.Fatalf("expected error for %s", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("error %q does not contain %q", err.Error(), tc.wantSub)
+			}
+		})
 	}
 }
 
