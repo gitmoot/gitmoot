@@ -61,11 +61,16 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 | `schedule.interval`         | pipeline     | cond.    | Required when a `schedule:` block is present. A positive Go duration (`24h`, `1h30m`). |
 | `schedule.jitter`           | pipeline     | no       | Random `[0, jitter]` added to each `next_due` to de-thunder (`>= 0`). |
 | `success_decisions`         | pipeline     | no       | Decisions that mark a stage succeeded. Default `["approved","implemented"]`. Any value must be one of `approved`, `implemented`, `changes_requested` — `blocked`/`failed` are park states and are rejected. |
+| `allow_scheduled_writes`    | pipeline     | no       | Safety flag (#768). A **mutating** `implement` stage on a **scheduled** pipeline (a `schedule:` block) is rejected at add time unless this is `true` — so an unattended nightly pipeline can never write code / open a PR by accident. Manual-run pipelines don't need it. Default `false`. |
 | `stages[].id`               | stage        | yes      | Unique, name-safe stage id. Appears verbatim in the stage job's fingerprint and deterministic id. |
-| `stages[].cmd`              | stage        | cond.    | Shell command run verbatim via `sh -c` (see the stage contract below). **Exactly one** of `cmd` or `agent` per stage. |
-| `stages[].agent`            | stage        | cond.    | Name of a managed gitmoot agent to run this stage as a read-only leaf (#757), instead of a shell `cmd`. Must be a name-safe token; `pipeline add` warns (does not block) if the agent does not exist yet, but it must exist before the stage runs. Mutually exclusive with `cmd`. See [Agent stages](#agent-stages). |
-| `stages[].prompt`           | stage        | cond.    | Instruction handed to an agent stage's agent. **Required** for an agent stage; rejected for a shell stage. Prepended with the upstream `needs` stages' result summaries at enqueue. |
-| `stages[].action`           | stage        | no       | Read-only verb for an agent stage: `ask` (default) or `review`. `implement` is rejected — an agent stage is a read-only leaf. Rejected for a shell stage. |
+| `stages[].cmd`              | stage        | cond.    | Shell command run verbatim via `sh -c` (see the stage contract below). A stage is **exactly one** of `cmd`, `agent`, or `gate`. |
+| `stages[].agent`            | stage        | cond.    | Name of a managed gitmoot agent to run this stage (instead of a shell `cmd`). Must be a name-safe token; `pipeline add` warns (does not block) if the agent does not exist yet, but it must exist before the stage runs. Mutually exclusive with `cmd`/`gate`. The stage kind depends on `action`/`write`/`orchestrate` — see [Agent stages](#agent-stages). |
+| `stages[].prompt`           | stage        | cond.    | Instruction handed to an agent stage's agent. **Required** for an agent stage; rejected for a shell/gate stage. Prepended with the upstream `needs` stages' result summaries at enqueue. |
+| `stages[].action`           | stage        | no       | Verb for an agent stage: `ask` (default), `review`, or `implement` (#768). `ask`/`review` are read-only leaves; `implement` mutates the repo + opens a PR (requires `write: true`). Rejected for a shell/gate stage. |
+| `stages[].write`            | stage        | cond.    | Acknowledges that an `implement` stage **mutates** the repo (#768). Required with `action: implement`, and valid **only** there — a double-key so a typo/injection can't turn a read-only pipeline into a writing one. |
+| `stages[].orchestrate`      | stage        | no       | `true` makes an agent stage a **sub-tree coordinator** (#758): its `delegations[]` fan out as owned children and the stage waits for the whole tree, then folds the synthesis. Agent stage only; `action` must be `ask`. |
+| `stages[].gate`             | stage        | cond.    | Makes this a **jobless gate stage** (#768): it runs no worker and folds when an external predicate holds. Only `pr_merged` today. Exclusive with `cmd`/`agent`. Requires `source`. |
+| `stages[].source`           | stage        | cond.    | For a `gate` stage: the id of the upstream `implement` stage whose PR to watch. Must be one of the gate's own `needs`. |
 | `stages[].needs`            | stage        | no       | Ids of sibling stages that must **succeed** before this stage is enqueued. Must reference known stages, never the stage itself, and form no cycle. |
 | `stages[].timeout`          | stage        | no       | Per-stage job timeout (positive Go duration). |
 | `stages[].retry`            | stage        | no       | How many times a **failed** stage may be re-attempted (`>= 0`, default `0`). |
@@ -73,17 +78,29 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 
 `gitmoot pipeline add` validates the whole spec **at add time** — unknown keys, a
 non-name-safe name/id, a duplicate stage id, a stage that is not **exactly one** of
-`cmd` or `agent` (and, for an agent stage, a missing `prompt`, a non-existent agent,
-or a non-read-only `action`), an unknown/self/cyclic `needs`, an invalid
+`cmd`, `agent`, or `gate` (and, per kind: an agent stage's missing `prompt`, an
+invalid `action`, `implement` without `write: true` or `write: true` off an
+implement stage, a mutating stage on a scheduled pipeline without
+`allow_scheduled_writes`, a gate's invalid predicate or a `source` that is not an
+upstream implement stage in `needs`), an unknown/self/cyclic `needs`, an invalid
 timeout/interval/jitter, a negative retry, or a `success_decisions` value outside the
 allowed set — so a structural mistake surfaces as a clear error at registration
 rather than a stuck run later.
 
 ### Agent stages
 
-A stage may run a **named managed gitmoot agent** as a read-only leaf instead of a
-shell command (#757). Set `agent` + `prompt` (and optionally `action`) in place of
-`cmd`:
+A stage may run a **named managed gitmoot agent** instead of a shell command. There
+are four agent-stage kinds, all sharing the mechanics in this section:
+
+| Kind | Declared by | What it does |
+| ---- | ----------- | ------------ |
+| **ask** / **review** (#757) | `agent` + `action: ask\|review` | Read-only leaf: looks + decides, never mutates. |
+| **implement** (#768) | `agent` + `action: implement` + `write: true` | Mutates the repo + opens a PR (fold-on-PR-opened). See [Implement stages](#implement-stages). |
+| **orchestrate** (#758) | `agent` + `orchestrate: true` | Sub-tree coordinator: fans out owned children, waits for the tree, folds the synthesis. See [Orchestrate stages](#orchestrate-stages). |
+| **gate** (#768) | `gate:` (no `agent`) | Jobless waiter: folds when an external predicate holds (e.g. a PR merges). See [Gate stages](#gate-stages). |
+
+The basic read-only form (#757) sets `agent` + `prompt` (and optionally `action`) in
+place of `cmd`:
 
 ```yaml
 stages:
@@ -100,9 +117,10 @@ stages:
   hidden per-pipeline shell runner via a per-job runtime override), an agent stage
   binds the stage job to the named agent and runs it on **its own** registered runtime
   (claude / codex) and session — no runtime override.
-- **Read-only leaf.** `action` is `ask` or `review` only; `implement` is rejected. The
-  stage is a leaf: its `delegations[]` are stripped (Sender is the pipeline sender),
-  so an agent stage can never fan out.
+- **Leaf by default.** An `ask`/`review`/`implement` stage is a **leaf**: its
+  `delegations[]` and `human_questions[]` are stripped (Sender is the pipeline sender),
+  so it can neither fan out nor pause a human. (An `orchestrate` stage is the one
+  exception — it is a coordinator, not a leaf; see [Orchestrate stages](#orchestrate-stages).)
 - **Agent existence is warned at add time.** `pipeline add` checks every referenced
   agent and prints a warning for any that does not exist yet, but does **not** block —
   a spec may legitimately be added before its agents are provisioned (bundled or
@@ -132,6 +150,95 @@ stages:
   not via accumulated agent memory.
 
 Agent stages fold by `decision` and advance/park exactly like shell stages.
+
+### Implement stages
+
+An `implement` agent stage (#768) **mutates the repo and opens a pull request**, then
+the pipeline advances the moment the PR is opened (**fold-on-PR-opened**):
+
+```yaml
+stages:
+  - id: fix
+    agent: fixer
+    action: implement
+    write: true                       # required acknowledgement (see Safety)
+    prompt: "Apply the change described in the ticket."
+  - id: verify
+    agent: reviewer
+    action: review
+    needs: [fix]
+```
+
+- **Writable worktree + deterministic branch reuse.** Unlike a read-only stage, an
+  implement stage runs in a **writable** task-worktree on a deterministic,
+  attempt-independent branch `gitmoot/pipe-<run>-<stage>` (reusing the implement
+  dispatch's fail-closed guards). A **retry** lands in the *same* branch/PR — never a
+  duplicate — and fails closed if that worktree is dirty or has a live process.
+- **Folds on PR-opened.** A `success` decision folds only once the job carries an
+  opened PR; a legitimate **no-op** implement (nothing to change) folds succeeded too
+  (it can't wedge the run). The opened PR number is appended to the stage summary so a
+  downstream stage sees it via upstream-context injection.
+- **Never auto-merges.** The pipeline **opens** the PR; a human or your CI does the
+  merge. See [Gate stages](#gate-stages) to make a later stage wait for that merge.
+- Still a **leaf** — it may mutate but never fan out.
+
+### Gate stages
+
+A `gate` stage (#768) runs **no worker job** — it is a patient waiter that folds when an
+external predicate holds. It is the composable way to express *wait-for-merge* without
+making the implement stage itself block:
+
+```yaml
+stages:
+  - id: fix
+    agent: fixer
+    action: implement
+    write: true
+    prompt: "Apply the change."
+  - id: wait
+    gate: pr_merged                   # only predicate today
+    source: fix                       # the upstream implement stage whose PR to watch
+    needs: [fix]
+  - id: deploy
+    cmd: "./deploy.sh"
+    needs: [wait]
+```
+
+- **`pr_merged`** watches the PR opened by the `source` implement stage and folds
+  **succeeded** once it merges. It reads the store's PR state (kept current by the
+  daemon's PR poller), so it needs no live GitHub call, is **non-blocking** and
+  **fails open** (keeps waiting while unmerged), and is bounded by the stage `timeout`.
+- A PR that is **closed without merging**, or a **timeout**, parks the run `blocked`
+  (a gate is a wait, not a failure — so a retry budget can't re-arm the timer).
+
+### Orchestrate stages
+
+An `orchestrate` agent stage (#758) is a **bounded sub-tree coordinator**: instead of
+doing the work itself, its agent returns `delegations[]` that fan out as **children it
+owns**, and the stage waits for the whole tree, then folds the synthesis:
+
+```yaml
+stages:
+  - id: investigate
+    agent: coordinator
+    orchestrate: true
+    prompt: "Decompose the incident and delegate the sub-investigations."
+  - id: report
+    cmd: "./publish.sh"
+    needs: [investigate]
+```
+
+- **The stage job is the sub-tree root.** Children inherit the full delegation bounds
+  ladder (depth cap, job-budget admission, wall-clock / token / cost budgets, loop
+  detection, graceful finalize, root kill). The stage `timeout` bounds the whole tree.
+- **Not a leaf.** The delegations strip is relaxed **only** for a validated orchestrate
+  stage — a stage that merely sets `orchestrate: true` but validates as something else
+  cannot fan out.
+- **Waits, then folds the synthesis.** The pipeline follows the coordinator's
+  continuation chain to the terminal tail and folds *that* result — a pure, restartable
+  DB walk (a daemon restart re-derives the wait, never restarting the sub-tree).
+- **`retry: 0` recommended** — a retry mints a fresh tree only after the old one is
+  terminal, never resuming a half-finished tree.
 
 ### The stage contract
 
@@ -318,6 +425,14 @@ verbatim (raw bytes), so treat a spec containing private hostnames, paths, or re
 names the same as any other private-repo data. See `SAFETY.md → Pipeline stages run
 with daemon permissions`.
 
+**Mutating (`implement`) stages** carry an extra safety model (#768): `action:
+implement` requires an explicit `write: true` double-key (and `write: true` is valid
+only on an implement stage), so a typo or prompt injection cannot flip a read-only
+pipeline into a writing one; a mutating stage on a **scheduled** pipeline is rejected
+unless the pipeline sets `allow_scheduled_writes: true`; the bound agent's own
+capability/policy still applies; and the pipeline **never merges its own PR** — it
+opens the PR and leaves the merge to a human or CI.
+
 ## Not yet supported (deferred)
 
 These are intentionally out of scope for v1 and tracked as follow-ups:
@@ -326,8 +441,10 @@ These are intentionally out of scope for v1 and tracked as follow-ups:
 - Approval gates / secret stores / an approval UI for a blocked stage (#682) — v1
   ships the manual `pipeline resume` seam.
 - Auto-filing a bug for a failed stage (`show` prints the command; you run it).
-- LLM stages, upstream stage output flowing into a downstream stage's prompt, and
-  per-stage env/workdir.
+- Per-stage env/workdir. (Agent stages and upstream stage output flowing into a
+  downstream stage's prompt **are** supported — see [Agent stages](#agent-stages).)
+- Gate predicates beyond `pr_merged`, and a `gate` folding on PR-**merged** built into
+  the implement stage itself (use a separate `gate` stage).
 - Matrix / dynamic stages, more than one concurrent run per pipeline, pipelines
   defined from the dashboard, a web funnel view, and a foreground `--watch`.
 </content>

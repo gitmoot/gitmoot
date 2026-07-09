@@ -1490,11 +1490,15 @@ gitmoot pipeline remove nightly-sync
 snapshot, so editing the file later never mutates an in-flight run. It also
 auto-creates one hidden shell runner agent (`pipeline-<name>-runner`) that owns the
 **shell** stage jobs — hidden from `agent list` and disposed by `pipeline remove`. A
-stage may instead set `agent` + `prompt` (#757) to run a named managed agent on its
-own runtime as a read-only leaf (`ask`/`review`, never `implement`); the agent must
-already exist, its `needs` stages' result summaries are prepended to its prompt, and
-a repo-bound agent stage runs in its own detached read-only worktree so same-repo
-agent stages parallelize without touching the live checkout.
+stage may instead set `agent` + `prompt` to run a named managed agent on its own
+runtime. Four agent-stage kinds: **ask**/**review** (#757, read-only leaves);
+**implement** (#768, `action: implement` + `write: true` — mutates the repo + opens a
+PR, never auto-merges); **orchestrate** (#758, `orchestrate: true` — a sub-tree
+coordinator that fans out owned children and folds the synthesis); and **gate** (#768,
+`gate: pr_merged` + `source:`, no `agent` — a jobless waiter that folds when the source
+implement stage's PR merges). A read-only stage's `needs` result summaries are prepended
+to its prompt, and a repo-bound read-only agent stage runs in its own detached
+read-only worktree so same-repo stages parallelize without touching the live checkout.
 
 A stage signals its outcome by printing a `gitmoot_result` blob to stdout; the
 advancer folds by the **decision**, never the job's exit state (`changes_requested`

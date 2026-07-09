@@ -981,15 +981,24 @@ printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"synced"}}'
 printf '%s' '{"gitmoot_result":{"decision":"blocked","summary":"secret missing","needs":["R2 token"]}}'
 ```
 
-### Agent stages (#757)
+### Agent stages (#757 / #768 / #758)
 
-A stage may run a **named managed agent** instead of a shell command — set `agent`
-(and a `prompt`) in place of `cmd`. Exactly one of `cmd` or `agent` is required per
-stage. An agent stage runs the agent on its **own** registered runtime (claude /
-codex), as a read-only **leaf**: `action` is `ask` (default) or `review` — never
-`implement` — and its `delegations[]` are stripped like any stage. Use it to put a
-model judgement inline in an otherwise-deterministic flow (e.g. an extract shell
-stage feeding a triage agent stage).
+A stage may run a **named managed agent** instead of a shell command — a stage is
+exactly one of `cmd`, `agent`, or `gate`. An agent stage runs on its **own** registered
+runtime (claude / codex). Four kinds:
+
+- **ask / review** (#757) — read-only **leaf** (`action: ask|review`); `delegations[]`
+  and `human_questions[]` stripped. Model judgement inline in a deterministic flow.
+- **implement** (#768) — `action: implement` + `write: true`. MUTATES the repo + opens a
+  PR on a deterministic `gitmoot/pipe-<run>-<stage>` branch (retry reuses it, never
+  duplicates), folds **on PR-opened**, **never auto-merges**. Scheduled pipelines also
+  need pipeline-level `allow_scheduled_writes: true`.
+- **orchestrate** (#758) — `orchestrate: true`. Sub-tree **coordinator** (the one
+  non-leaf): fans out owned children (full delegation bounds ladder), waits via the
+  continuation chain, folds the tail. `retry: 0`.
+- **gate** (#768) — `gate: pr_merged` + `source: <upstream implement stage>`, no
+  `agent`. Jobless waiter: folds succeeded when the source PR merges; parks `blocked`
+  on close-unmerged or timeout. The composable *wait-for-merge*.
 
 ```yaml
 stages:
@@ -997,9 +1006,19 @@ stages:
     cmd: "python extract.py > out.json"
   - id: triage
     agent: reply-triager        # create it before the pipeline runs: gitmoot agent create …
-    action: ask                 # ask (default) | review — read-only only
+    action: ask                 # ask (default) | review | implement (+ write: true)
     prompt: "Triage the extracted replies and flag anything urgent."
     needs: [extract]
+  - id: fix
+    agent: fixer                # MUTATING implement stage → opens a real PR
+    action: implement
+    write: true
+    prompt: "Apply the approved change."
+    needs: [triage]
+  - id: wait
+    gate: pr_merged             # jobless gate: waits for fix's PR to merge
+    source: fix
+    needs: [fix]
 ```
 
 `pipeline add` warns (does not block) when an agent stage names an agent that does

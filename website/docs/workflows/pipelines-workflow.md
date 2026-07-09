@@ -54,9 +54,11 @@ gitmoot pipeline show "$RUN"
 ```
 
 `pipeline add` validates the whole spec at add time — unknown keys, a non-name-safe
-name/id, a duplicate stage id, a stage that is not exactly one of `cmd` or `agent`
-(and, for an agent stage, a missing `prompt`, a non-existent agent, or a non-read-only
-`action`), an unknown/self/cyclic `needs`, an invalid duration, a negative retry, or a
+name/id, a duplicate stage id, a stage that is not exactly one of `cmd`, `agent`, or
+`gate` (and, per kind: an agent stage's missing `prompt` or invalid `action`,
+`implement` without `write: true`, a mutating stage on a scheduled pipeline without
+`allow_scheduled_writes`, a gate's bad predicate/`source`), an unknown/self/cyclic
+`needs`, an invalid duration, a negative retry, or a
 `success_decisions` value outside `approved`/`implemented`/`changes_requested` — so a
 structural mistake is a clear error at registration, not a stuck run later. It stores the raw YAML **verbatim**
 plus a content hash; each run snapshots the hash and executes its snapshot, so
@@ -111,9 +113,15 @@ succeeded — a stage folds on the decision, not the job state. List it in
 
 ## Agent stages
 
-A stage can run a **named managed gitmoot agent** instead of a shell command. Set
-`agent` (and a `prompt`) in place of `cmd` — **exactly one** of `cmd` or `agent` is
-required per stage:
+A stage can run a **named managed gitmoot agent** instead of a shell command — a stage
+is **exactly one** of `cmd`, `agent`, or `gate`. There are four agent-stage kinds:
+
+| Kind | Declared by | What it does |
+| ---- | ----------- | ------------ |
+| **ask / review** (#757) | `action: ask\|review` | Read-only leaf — looks + decides, never mutates. |
+| **implement** (#768) | `action: implement` + `write: true` | Mutates the repo + opens a PR (fold-on-PR-opened); never auto-merges. |
+| **orchestrate** (#758) | `orchestrate: true` | Sub-tree coordinator — fans out owned children, waits, folds the synthesis. |
+| **gate** (#768) | `gate: pr_merged` + `source:` (no `agent`) | Jobless waiter — folds when an upstream implement stage's PR merges. |
 
 ```yaml
 stages:
@@ -121,17 +129,31 @@ stages:
     cmd: "python fetch_replies.py > replies.json"
   - id: triage
     agent: reply-triager        # managed agent — create it before the pipeline runs
-    action: ask                 # ask (default) | review — read-only ONLY
+    action: ask                 # ask (default) | review | implement (+ write: true)
     prompt: "Triage the fetched replies and flag anything that needs a human."
     needs: [extract]
+  - id: fix
+    agent: fixer                # a MUTATING implement stage: opens a real PR
+    action: implement
+    write: true                 # required double-key; scheduled pipelines also need allow_scheduled_writes
+    prompt: "Apply the approved change."
+    needs: [triage]
+  - id: wait
+    gate: pr_merged             # jobless gate: waits for the fix stage's PR to merge
+    source: fix
+    needs: [fix]
 ```
 
 An agent stage runs the named agent on **its own registered runtime** (claude /
-codex — no per-job shell override), as a read-only **leaf**:
+codex — no per-job shell override):
 
-- **read-only only** — `action` is `ask` (the default) or `review`; `implement` is
-  rejected at add time. An agent stage may never write, and its `delegations[]` are
-  stripped exactly as a shell stage's are (it never fans out).
+- **kinds** — `ask`/`review` are read-only **leaves** (`delegations[]` and
+  `human_questions[]` are stripped, so no fan-out and no human-pause). `implement`
+  mutates + opens a PR on a deterministic `gitmoot/pipe-<run>-<stage>` branch (retry
+  reuses it), requires `write: true`, and never auto-merges. `orchestrate` is a
+  coordinator (the one non-leaf): it fans out owned children, waits for the sub-tree
+  via the continuation chain, then folds the tail. `gate` runs no job and folds when
+  `pr_merged` holds on its `source` PR (parks `blocked` on close-unmerged / timeout).
 - **agent existence is warned, not blocked** — `pipeline add` warns for any referenced
   agent that does not exist yet but still adds the pipeline (so a spec can be bundled
   ahead of provisioning its agents); create the agent (`gitmoot agent …`) before the

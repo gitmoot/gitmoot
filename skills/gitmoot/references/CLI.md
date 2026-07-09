@@ -1834,11 +1834,15 @@ stages:                     # the DAG, keyed by unique id and wired by needs
   - id: score
     cmd: "python score.py data.json"
     needs: [source]         # runs only after every listed stage SUCCEEDS
-  - id: triage              # #757: an AGENT stage instead of a shell cmd
-    agent: reply-triager    #   an existing managed agent (exactly one of cmd|agent)
-    action: ask             #   ask (default) | review — read-only ONLY (no implement)
+  - id: triage              # an AGENT stage instead of a shell cmd (exactly one of cmd|agent|gate)
+    agent: reply-triager    #   #757 read-only leaf
+    action: ask             #   ask (default) | review | implement (+ write: true, #768)
     prompt: "Triage the scored data; block if a human is needed."
     needs: [score]          #   upstream results are prepended to the prompt
+  # other agent-stage kinds:
+  #   implement (#768): action: implement + write: true → mutates repo + opens a PR (never auto-merges)
+  #   orchestrate (#758): orchestrate: true → sub-tree coordinator (fans out owned children, folds synthesis)
+  #   gate (#768): gate: pr_merged + source: <impl stage> (no agent) → jobless, folds when that PR merges
   - id: deploy
     cmd: "rclone copy out/ r2:bucket"
     needs: [triage]
@@ -1859,9 +1863,10 @@ gitmoot pipeline remove nightly-sync
 ```
 
 `pipeline add` validates the whole spec at add time (unknown keys, duplicate/self/
-cyclic `needs`, a stage that is not exactly one of `cmd` or `agent`, an agent stage
-missing a `prompt` / naming a non-existent agent / with a non-read-only `action`,
-invalid durations, a `success_decisions` outside
+cyclic `needs`, a stage that is not exactly one of `cmd`/`agent`/`gate`, an agent stage
+missing a `prompt` / invalid `action` / `implement` without `write: true` / a mutating
+stage on a scheduled pipeline without `allow_scheduled_writes` / a gate's bad
+predicate or `source`, invalid durations, a `success_decisions` outside
 `approved`/`implemented`/`changes_requested`) so a mistake is a clear error, not a
 stuck run. It stores the raw YAML **verbatim** plus a content hash; each run
 snapshots that hash and executes its snapshot, so editing the file later never
