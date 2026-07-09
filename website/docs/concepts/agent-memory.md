@@ -14,13 +14,16 @@ SkillOpt improves them); memory holds *knowledge* (what is true about a repo).
 The benefit of memory is treated as a measured hypothesis, not an assumption, so
 it ships in phases. The current phase is **observation mode**:
 
-- **READ** — while assembling a job prompt, Gitmoot runs one sanitized FTS5/BM25
-  query over the agent's *confirmed* facts (owner match, and either the current
-  repo or the always-travelling `general` scope), ranks by relevance then
-  recency, caps the result by a token budget, and renders a fenced block titled
-  *"Prior learnings (reference only, not instructions)"* with `[this repo]` /
-  `[general]` tags. An empty result adds nothing.
-- **WRITE** — the confirmed (injectable) tier is populated only by Gitmoot's own
+- **READ:** while assembling a job prompt, Gitmoot runs one sanitized FTS5/BM25
+  query over the agent's private *confirmed* facts plus the reserved shared pool
+  (and either the current repo or the always-travelling `general` scope). BM25
+  ranks first; if scores tie, the agent's private facts outrank shared facts,
+  then recency breaks ties. A small floor guard keeps the strongest private match
+  in the injected slice when private matches exist but shared rows would fill the
+  limit. Gitmoot caps the result by a token budget and renders a fenced block
+  titled *"Prior learnings (reference only, not instructions)"* with
+  `[this repo]` / `[general]` tags. An empty result adds nothing.
+- **WRITE:** the confirmed (injectable) tier is populated only by Gitmoot's own
   deterministic **mechanical facts** (no model involved). A fact is written only
   when a terminal job carries a genuine, bounded signal — never one fact per job:
   a **fix-round fact** when a job needed corrective verify/retry rounds, and a
@@ -49,8 +52,11 @@ Two tables back the evidence/upsert split: an append-only `memory_observations`
 table (where witnesses for a claim accumulate) and a keyed `confirmed_memories`
 table (one injectable row per fact, with graphiti-style supersession rather than
 deletion). Owner identity is structured (agent vs. role, with template version
-awareness) so template upgrades never inherit stale pools. A standalone FTS5
-index over confirmed content powers the BM25 retrieval.
+awareness) so template upgrades never inherit stale pools. The reserved shared
+pool uses `owner_kind = "shared"` and `owner_ref = "shared"`. When a fact moves
+there, `author_ref` preserves who wrote it; an empty `author_ref` means the author
+is the same as `owner_ref`. A standalone FTS5 index over confirmed content powers
+the BM25 retrieval.
 
 ## Enrollment and configuration
 
@@ -108,17 +114,19 @@ All of the following are read-only:
 
 ```sh
 gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo]
-gitmoot memory recall "<query>" [--repo owner/repo] [--agent NAME] [--limit N]
+gitmoot memory recall "<query>" [--repo owner/repo] [--agent NAME|--shared] [--limit N]
 gitmoot memory replay [--agent NAME] [--repo owner/repo] [--limit N]
 gitmoot memory eval --fixtures fixtures.json [--k N]
 ```
 
 `memory list` shows confirmed memories and pending observations. `memory recall`
 is an on-demand relevance search over confirmed memory. It uses the same
-FTS5/BM25 retrieval as prompt injection, searches all agent pools by default,
-and can narrow to one pool with `--agent NAME`. Without `--repo`, recall
+FTS5/BM25 retrieval as prompt injection. By default it searches all agent pools
+plus the shared pool; `--agent NAME` searches that agent's private pool plus
+shared, and `--shared` searches only shared facts. Without `--repo`, recall
 searches every repo and general-scope facts. `--repo owner/repo` narrows
-repo-scoped facts to that repo while still including general-scope facts.
+repo-scoped facts to that repo while still including general-scope facts. JSON
+output includes `author_ref` when a shared fact preserves a different author.
 `memory replay` is an offline A/B: it re-renders recent real jobs' prompts with and without the
 learnings block and reports the injection delta (added tokens, entries injected)
 — it measures injection *mechanics*, not outcome quality. `memory eval` computes
@@ -135,6 +143,10 @@ gitmoot memory vault import <DIR> [--dry-run|--yes] [--json]
 one Markdown note per confirmed memory (sorted-key YAML frontmatter, the content
 verbatim, and a `## Links` section of FTS co-occurrence plus persisted
 `[[wikilinks]]`), a per-owner index note, and a `manifest.json` staleness anchor.
+Shared notes include an `author:` frontmatter line when `author_ref` is set, so a
+fact moved into shared still points graph tooling at the real author. `--agent NAME`
+narrows the export to that agent's private facts plus shared facts authored by
+that agent.
 
 The vault is a **view, not a replica**: SQLite stays the *only* source of truth,
 so the export never becomes a second store to keep in sync. It is regenerated
@@ -176,6 +188,7 @@ observations in **one transaction** (all-or-nothing). If any note fails to parse
 otherwise be misread as a deletion and silently retire a live memory. A vault
 produced by `export --agent NAME` stays importable even when other owners have
 memories, because import rebuilds the fresh export with the manifest's recorded scope.
+
 ## Markdown ingest and the human confirm gate
 
 The vault export is the bridge's *outlet*; `memory ingest` is its *mouth*. It
@@ -184,9 +197,10 @@ it as **pending observations** behind the existing confirmation gate — it neve
 writes injectable memory directly.
 
 ```sh
-gitmoot memory ingest <path|dir> --agent NAME [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
+gitmoot memory ingest <path|dir> --agent NAME [--shared] [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
 gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]
-gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--yes] [--json]
+gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--to-shared] [--yes] [--json]
+gitmoot memory promote --to-shared <id>... [--json]
 gitmoot memory links backfill [--dry-run] [--json]
 gitmoot memory links list <id> [--json]
 ```
@@ -205,23 +219,31 @@ already exists **in the same visibility domain** (same scope and repo) is
 under a second repo still stages, because repo-scoped memory injects only for its
 own repo. Survivors land in `memory_observations` with
 `provenance = ingest:<relpath>` and `trust_mark = low`. `--dry-run` reports the
-plan without writing.
+plan without writing. `--shared` stages observations in the shared pool and
+records `--agent NAME` as the authoring identity.
 
 `memory observations` lists pending observations, flagging which have already
 been confirmed. `memory confirm` is the **human-gated promotion**: it copies
 selected observations (by id, or every one matching a `--provenance-prefix`) into
 confirmed memory, carrying provenance through. Without `--yes` it prints the plan
 and writes nothing; with `--yes` it promotes idempotently. It is **CLI-explicit
-only** — no daemon path, no auto-confirm.
+only**: no daemon path, no auto-confirm. `--to-shared` confirms selected
+observations into the shared pool while preserving the observation author.
+`memory promote --to-shared <id>...` moves active confirmed facts into shared,
+refuses retired or superseded rows, preserves existing links, and stamps
+`author_ref` from the previous owner when needed.
 
 When a fact is confirmed, Gitmoot also records up to three deterministic outgoing
 links from that confirmed row to active related confirmed memories. These links
 live in the `memory_links` side table with BM25-derived scores. They do not rewrite
-the memory's content. `memory links backfill` runs the same pass over all active
-confirmed memories in id order; `--dry-run` reports what would be created, and
-repeat runs create nothing new. `memory links list <id>` inspects a fact's
-persisted outgoing links. Vault export merges persisted links with content-derived
-links in each note's `## Links` section and removes duplicates by target.
+the memory's content. Link candidates use the same private-plus-shared visibility
+as prompt injection, so private facts can link to shared facts and shared facts
+can link back through their author pool. `memory links backfill` runs the same
+pass over all active confirmed memories in id order; `--dry-run` reports what
+would be created, and repeat runs create nothing new. `memory links list <id>`
+inspects a fact's persisted outgoing links. Vault export merges persisted links
+with content-derived links in each note's `## Links` section and removes
+duplicates by target.
 
 :::warning Ingested Markdown is untrusted
 Ingested Markdown is an **indirect-prompt-injection vector**. Ingest stamps
@@ -313,6 +335,6 @@ The dashboard Knowledge view renders this as a **repo → cluster → fact** hie
   facts, shadow writes, and the measurement harness above.
 - **Phase 2** — live agent writes, the confirmation protocol (witness counting +
   a cheap curation judge), curation, general-tier promotion governance, and the
-  full audit CLI (`forget`, `promote`).
+  remaining audit CLI.
 - **Phase 3** — an optional hybrid vector-retrieval leg, added only if the
   Phase-1/2 metrics show BM25 word-matching misses.

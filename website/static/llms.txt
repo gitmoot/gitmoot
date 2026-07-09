@@ -32,7 +32,7 @@ full expanded context.
 
 - [Local-First Coordination](https://gitmoot.io/docs/concepts/local-first-coordination): Why state lives in local SQLite and GitHub stays the audit surface.
 - [Agents, Agent Templates, Jobs, And Locks](https://gitmoot.io/docs/concepts/agents-templates-jobs-locks): The core object model — agent identities, template snapshots, job lifecycle, and the three lock kinds.
-- [Agent Persistent Memory](https://gitmoot.io/docs/concepts/agent-memory): Off-by-default repo-filtered fact memory (SQLite + FTS5); observation-mode read/write model, enrollment, auto cross-links for confirmed facts (`memory links backfill|list`), and the memory CLI, including `memory recall "<query>"` for read-only FTS5/BM25 lookup across all agent pools by default.
+- [Agent Persistent Memory](https://gitmoot.io/docs/concepts/agent-memory): Off-by-default repo-filtered fact memory (SQLite + FTS5); observation-mode read/write model, enrollment, the explicit shared pool with author preservation, private-plus-shared prompt injection and auto-links, and the memory CLI, including `memory recall "<query>"` for read-only FTS5/BM25 lookup across all agent pools plus shared by default.
 
 ## Dashboard
 
@@ -41,7 +41,7 @@ full expanded context.
 
 ## References
 
-- [CLI Reference](https://gitmoot.io/docs/reference/cli): Commands for install, home/config, daemon operations (restart, SIGHUP reload, runtime-auth persistence), watched repos, dashboard/TUI/web, agents (incl. heartbeats and template publish/pull), orchestrate, pipelines, jobs (incl. resumable `job gates`/`gates clear` for blocked `needs` with auto-resume on last clear, and session jobs `job open/close/record`), review head-SHA re-sync, memory recall, bug reports, locks, goals, interactive prompts, and SkillOpt.
+- [CLI Reference](https://gitmoot.io/docs/reference/cli): Commands for install, home/config, daemon operations (restart, SIGHUP reload, runtime-auth persistence), watched repos, dashboard/TUI/web, agents (incl. heartbeats and template publish/pull), orchestrate, pipelines, jobs (incl. resumable `job gates`/`gates clear` for blocked `needs` with auto-resume on last clear, and session jobs `job open/close/record`), review head-SHA re-sync, memory recall and shared-pool curation, bug reports, locks, goals, interactive prompts, and SkillOpt.
 - [Runtime Adapters](https://gitmoot.io/docs/reference/runtime-adapters): Codex, Claude Code, Kimi Code, legacy kimi-cli, shell, and future runtimes; the config-driven metadata registry (`gitmoot runtime list`, `[runtimes.<name>]` overrides).
 - [Result Contract](https://gitmoot.io/docs/reference/result-contract): gitmoot_result shape, the delegations DAG (Orchestration), continuation, and termination bounds.
 - [Event Stream](https://gitmoot.io/docs/reference/event-stream): The `[events]` webhook contract — job.finished/failed/blocked/needs_attention/deferred and candidate.* events, schema_version 1, best-effort delivery.

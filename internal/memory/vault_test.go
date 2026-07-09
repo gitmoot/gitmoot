@@ -7,14 +7,14 @@ import (
 
 func TestSlugIsLowercaseAndFilesystemSafe(t *testing.T) {
 	cases := map[string]string{
-		"CI Flake":                 "ci-flake",
-		"arm64/CI is flaky!":       "arm64-ci-is-flaky",
-		"   spaced   out   ":       "spaced-out",
-		"":                         "untitled",
-		"!!!":                      "untitled",
-		"Already-Slugged":          "already-slugged",
-		"weird__under..scores":     "weird-under-scores",
-		"CI-FLAKE":                 "ci-flake", // same slug as "CI Flake" — id prefix disambiguates
+		"CI Flake":             "ci-flake",
+		"arm64/CI is flaky!":   "arm64-ci-is-flaky",
+		"   spaced   out   ":   "spaced-out",
+		"":                     "untitled",
+		"!!!":                  "untitled",
+		"Already-Slugged":      "already-slugged",
+		"weird__under..scores": "weird-under-scores",
+		"CI-FLAKE":             "ci-flake", // same slug as "CI Flake" — id prefix disambiguates
 	}
 	for in, want := range cases {
 		if got := Slug(in); got != want {
@@ -82,6 +82,28 @@ func TestRenderVaultNoteRoleOwnerHasNoAgentField(t *testing.T) {
 	got := RenderVaultNote(m, nil)
 	if strings.Contains(got, "agent:") {
 		t.Fatalf("role owner must not emit an agent field:\n%s", got)
+	}
+}
+
+func TestRenderVaultNoteIncludesAuthorWhenPreserved(t *testing.T) {
+	m := VaultMemory{
+		ID: 2, OwnerKind: OwnerKindShared, OwnerRef: SharedOwnerRef, AuthorRef: "lead",
+		Scope: ScopeRepo, Repo: "acme/widget", Key: "shared-fact", Content: "shared content",
+		UpdatedAt: "t",
+	}
+	got := RenderVaultNote(m, nil)
+	if !strings.Contains(got, "author: \"lead\"") {
+		t.Fatalf("shared note must include preserved author frontmatter:\n%s", got)
+	}
+	if strings.Contains(got, "agent:") {
+		t.Fatalf("shared owner must not emit agent frontmatter:\n%s", got)
+	}
+	parsed, err := ParseVaultNote(got)
+	if err != nil {
+		t.Fatalf("parse rendered note: %v", err)
+	}
+	if parsed.VaultMemory().AuthorRef != "lead" {
+		t.Fatalf("parsed author = %q, want lead", parsed.VaultMemory().AuthorRef)
 	}
 }
 

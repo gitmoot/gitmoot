@@ -29,6 +29,7 @@ import (
 // memoryIngestResult is the summary of an ingest run (and the --json shape).
 type memoryIngestResult struct {
 	Agent        string         `json:"agent"`
+	Shared       bool           `json:"shared,omitempty"`
 	Scope        string         `json:"scope"`
 	Repo         string         `json:"repo,omitempty"`
 	DryRun       bool           `json:"dry_run"`
@@ -46,6 +47,7 @@ func runMemoryIngest(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	agent := fs.String("agent", "", "owner agent name for the ingested observations (required)")
+	shared := fs.Bool("shared", false, "stage observations in the shared pool with --agent as author")
 	repo := fs.String("repo", "", "repo (owner/repo) for repo-scoped observations")
 	tier := fs.String("tier", "repo", "scope tier: repo|general (general only with this explicit flag)")
 	dryRun := fs.Bool("dry-run", false, "report what would be ingested without writing")
@@ -107,6 +109,7 @@ func runMemoryIngest(args []string, stdout, stderr io.Writer) int {
 
 	result := memoryIngestResult{
 		Agent:      *agent,
+		Shared:     *shared,
 		Scope:      scope,
 		Repo:       strings.TrimSpace(*repo),
 		DryRun:     *dryRun,
@@ -114,10 +117,15 @@ func runMemoryIngest(args []string, stdout, stderr io.Writer) int {
 		RejectedBy: map[string]int{},
 	}
 	owner := db.MemoryOwner{Kind: memory.OwnerKindAgent, Ref: *agent}
+	authorRef := ""
+	if *shared {
+		owner = db.MemoryOwner{Kind: memory.OwnerKindShared, Ref: memory.SharedOwnerRef}
+		authorRef = strings.TrimSpace(*agent)
+	}
 
 	err = withStore(*home, func(store *db.Store) error {
 		ctx := context.Background()
-		seen, err := store.ObservationDedupKeys(ctx, *agent)
+		seen, err := store.ObservationDedupKeys(ctx, owner.Ref)
 		if err != nil {
 			return err
 		}
@@ -157,6 +165,7 @@ func runMemoryIngest(args []string, stdout, stderr io.Writer) int {
 				}
 				if _, err := store.InsertMemoryObservation(ctx, db.MemoryObservation{
 					Owner:      owner,
+					AuthorRef:  authorRef,
 					Repo:       result.Repo,
 					Scope:      scope,
 					Key:        key,
@@ -250,6 +259,7 @@ func sortedReasonKeys(m map[string]int) []string {
 type memoryObservationEntry struct {
 	ID         int64  `json:"id"`
 	OwnerRef   string `json:"owner_ref"`
+	AuthorRef  string `json:"author_ref,omitempty"`
 	Repo       string `json:"repo,omitempty"`
 	Scope      string `json:"scope"`
 	Key        string `json:"key"`
@@ -280,7 +290,8 @@ func runMemoryObservations(args []string, stdout, stderr io.Writer) int {
 		for _, r := range rows {
 			entries = append(entries, memoryObservationEntry{
 				ID: r.ID, OwnerRef: r.Owner.Ref, Repo: r.Repo, Scope: r.Scope, Key: r.Key,
-				Content: r.Content, Provenance: r.Provenance, TrustMark: r.TrustMark,
+				AuthorRef: r.AuthorRef,
+				Content:   r.Content, Provenance: r.Provenance, TrustMark: r.TrustMark,
 				Confirmed: r.Confirmed, CreatedAt: r.CreatedAt,
 			})
 		}
@@ -319,6 +330,7 @@ func runMemoryObservations(args []string, stdout, stderr io.Writer) int {
 
 type memoryConfirmResult struct {
 	DryRun    bool     `json:"dry_run"`
+	ToShared  bool     `json:"to_shared,omitempty"`
 	Selected  int      `json:"selected"`
 	Confirmed int      `json:"confirmed"`
 	Keys      []string `json:"keys,omitempty"`
@@ -330,6 +342,7 @@ func runMemoryConfirm(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	agent := fs.String("agent", "", "owner agent name (scopes --provenance-prefix selection)")
 	prefix := fs.String("provenance-prefix", "", "confirm every pending observation whose provenance starts with this prefix")
+	toShared := fs.Bool("to-shared", false, "confirm selected observations into the shared pool")
 	yes := fs.Bool("yes", false, "actually promote (without it, prints the plan and makes no writes)")
 	jsonOut := fs.Bool("json", false, "print the confirm summary as JSON")
 	if err := parseMemoryFlags(fs, args); err != nil {
@@ -351,7 +364,7 @@ func runMemoryConfirm(args []string, stdout, stderr io.Writer) int {
 		ids = append(ids, id)
 	}
 
-	result := memoryConfirmResult{DryRun: !*yes}
+	result := memoryConfirmResult{DryRun: !*yes, ToShared: *toShared}
 	err := withStore(*home, func(store *db.Store) error {
 		ctx := context.Background()
 		selected, err := selectObservationsToConfirm(ctx, store, ids, *agent, *prefix)
@@ -364,8 +377,17 @@ func runMemoryConfirm(args []string, stdout, stderr io.Writer) int {
 			if !*yes {
 				continue
 			}
+			owner := obs.Owner
+			authorRef := observationAuthorRef(obs)
+			if !*toShared && owner.Kind == memory.OwnerKindAgent && owner.Ref == authorRef {
+				authorRef = ""
+			}
+			if *toShared {
+				owner = db.MemoryOwner{Kind: memory.OwnerKindShared, Ref: memory.SharedOwnerRef}
+			}
 			newID, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
-				Owner:      obs.Owner,
+				Owner:      owner,
+				AuthorRef:  authorRef,
 				Repo:       obs.Repo,
 				Scope:      obs.Scope,
 				Key:        obs.Key,
@@ -381,7 +403,7 @@ func runMemoryConfirm(args []string, stdout, stderr io.Writer) int {
 			// the cluster of its nearest similarity neighbor. Best-effort and
 			// fail-safe — a clustering error must never block the confirmation.
 			attachConfirmedFactToCluster(ctx, store, db.ConfirmedMemory{
-				ID: newID, Owner: obs.Owner, Repo: obs.Repo, Scope: obs.Scope,
+				ID: newID, Owner: owner, AuthorRef: authorRef, Repo: obs.Repo, Scope: obs.Scope,
 				Key: obs.Key, Content: obs.Content,
 			})
 		}
@@ -413,6 +435,13 @@ func runMemoryConfirm(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "confirmed %d observation(s) into confirmed memory\n", result.Confirmed)
 	return 0
+}
+
+func observationAuthorRef(obs db.MemoryObservation) string {
+	if author := strings.TrimSpace(obs.AuthorRef); author != "" {
+		return author
+	}
+	return strings.TrimSpace(obs.Owner.Ref)
 }
 
 // selectObservationsToConfirm resolves the explicit id list and/or the

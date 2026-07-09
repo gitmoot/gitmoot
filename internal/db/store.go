@@ -8305,4 +8305,15 @@ CREATE TABLE memory_links (
 );
 CREATE INDEX idx_memory_links_dst ON memory_links(dst_id);
 	`,
+	// #777 shared memory pool author preservation. Moving a confirmed fact into
+	// the reserved shared pool changes owner_kind/owner_ref, but the dashboard and
+	// vault still need to know who wrote the fact. author_ref is empty for legacy
+	// and private rows, where author == owner_ref, and is populated only when the
+	// author differs from the current pool owner. Observations get the same column
+	// so `memory ingest --shared` can stage shared observations while preserving the
+	// authoring agent. ALTER ADD COLUMN only; existing rows read byte-identically.
+	`
+ALTER TABLE confirmed_memories ADD COLUMN author_ref TEXT NOT NULL DEFAULT '';
+ALTER TABLE memory_observations ADD COLUMN author_ref TEXT NOT NULL DEFAULT '';
+	`,
 }

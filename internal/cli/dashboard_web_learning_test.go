@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"net/http/httptest"
 	"testing"
 
 	dashboard "github.com/jerryfane/gitmoot-dashboard"
@@ -376,6 +378,72 @@ func TestWebDataSourceKnowledge(t *testing.T) {
 	if fmt.Sprintf("%+v", k) != fmt.Sprintf("%+v", k2) {
 		t.Fatalf("Knowledge not deterministic across calls")
 	}
+}
+
+func TestKnowledgeSharedFactsUseAuthorAndExposeMarker(t *testing.T) {
+	home := dashboardTestHome(t)
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ctx := context.Background()
+	id, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+		Owner:     db.MemoryOwner{Kind: memory.OwnerKindShared, Ref: memory.SharedOwnerRef},
+		AuthorRef: "researcher",
+		Repo:      "jerryfane/noted",
+		Scope:     memory.ScopeRepo,
+		Key:       "shared-runbook",
+		Content:   "Shared deployment facts keep their original author.",
+	})
+	if err != nil {
+		t.Fatalf("Upsert shared memory: %v", err)
+	}
+	store.Close()
+
+	ds := &webDataSource{home: home}
+	k, err := ds.Knowledge(ctx)
+	if err != nil {
+		t.Fatalf("Knowledge: %v", err)
+	}
+	factID := fmt.Sprintf("fact:%d", id)
+	found := false
+	for _, f := range k.Facts {
+		if f.ID == factID {
+			found = true
+			if f.Owner != "researcher" {
+				t.Fatalf("shared fact owner = %q, want author researcher", f.Owner)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("shared fact %s missing from Knowledge facts: %+v", factID, k.Facts)
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/learning/knowledge", nil)
+	ds.handleLearningKnowledge(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("knowledge handler status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var payload struct {
+		Facts []struct {
+			ID     string `json:"id"`
+			Owner  string `json:"owner"`
+			Shared bool   `json:"shared"`
+		} `json:"facts"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("parse knowledge payload: %v (%s)", err, rr.Body.String())
+	}
+	for _, f := range payload.Facts {
+		if f.ID == factID {
+			if f.Owner != "researcher" || !f.Shared {
+				t.Fatalf("shared payload fact = %+v, want owner researcher shared=true", f)
+			}
+			return
+		}
+	}
+	t.Fatalf("shared fact %s missing from HTTP payload: %+v", factID, payload.Facts)
 }
 
 // TestKnowledgeClusterHierarchy seeds a store, recomputes the emergent clusters,

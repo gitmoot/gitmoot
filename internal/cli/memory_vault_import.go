@@ -341,6 +341,7 @@ func vaultObservationFromNewFile(dn diskNote) (db.MemoryObservation, bool, strin
 	}
 	return db.MemoryObservation{
 		Owner:      db.MemoryOwner{Kind: ownerKind, Ref: ownerRef, Version: f.String("owner_version")},
+		AuthorRef:  f.String("author"),
 		Repo:       f.String("repo"),
 		Scope:      f.String("scope"),
 		Key:        key,

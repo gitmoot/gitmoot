@@ -124,6 +124,7 @@ func (f VaultNoteFile) VaultMemory() VaultMemory {
 		OwnerKind:    f.String("owner_kind"),
 		OwnerRef:     f.String("owner_ref"),
 		OwnerVersion: f.String("owner_version"),
+		AuthorRef:    f.String("author"),
 		Repo:         f.String("repo"),
 		Scope:        f.String("scope"),
 		Key:          f.String("key"),

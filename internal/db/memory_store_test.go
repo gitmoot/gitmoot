@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -210,6 +211,183 @@ func TestQueryConfirmedTierFilterExcludesOtherRepo(t *testing.T) {
 	if !keys["kg"] {
 		t.Fatalf("want general fact kg to travel into repo-A retrieval, got %v", keys)
 	}
+}
+
+func TestQueryConfirmedIncludesSharedWithOwnTieBreakAndPrivateIsolation(t *testing.T) {
+	ctx := context.Background()
+	store := openMemTestStore(t)
+	lead := agentOwner("lead")
+	audit := agentOwner("audit")
+	shared := MemoryOwner{Kind: memoryOwnerKindShared, Ref: memorySharedOwnerRef}
+
+	mustUpsert(t, store, ConfirmedMemory{
+		Owner: lead, Repo: "acme/widget", Scope: "repo", Key: "lead-private",
+		Content: "aurora tie token", UpdatedAt: "2026-01-01T00:00:00Z",
+	})
+	mustUpsert(t, store, ConfirmedMemory{
+		Owner: shared, AuthorRef: "lead", Repo: "acme/widget", Scope: "repo", Key: "shared-fact",
+		Content: "aurora tie token",
+	})
+	mustUpsert(t, store, ConfirmedMemory{
+		Owner: audit, Repo: "acme/widget", Scope: "repo", Key: "audit-private",
+		Content: "aurora tie token",
+	})
+
+	leadRows, err := store.QueryConfirmedMemories(ctx, lead, "acme/widget", `"aurora" OR "token"`, 10)
+	if err != nil {
+		t.Fatalf("query lead: %v", err)
+	}
+	keys := keysOf(leadRows)
+	if len(leadRows) < 2 || leadRows[0].Key != "lead-private" {
+		t.Fatalf("own row must outrank shared on equal BM25, got keys %v", keys)
+	}
+	if !containsKey(leadRows, "shared-fact") {
+		t.Fatalf("lead should see shared fact, got %v", keys)
+	}
+	if containsKey(leadRows, "audit-private") {
+		t.Fatalf("lead must not see audit private fact, got %v", keys)
+	}
+
+	auditRows, err := store.QueryConfirmedMemories(ctx, audit, "acme/widget", `"aurora" OR "token"`, 10)
+	if err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	if !containsKey(auditRows, "audit-private") || !containsKey(auditRows, "shared-fact") {
+		t.Fatalf("audit should see its private fact plus shared, got %v", keysOf(auditRows))
+	}
+	if containsKey(auditRows, "lead-private") {
+		t.Fatalf("audit must not see lead private fact, got %v", keysOf(auditRows))
+	}
+}
+
+func TestQueryConfirmedOwnFloorSwapsWeakestShared(t *testing.T) {
+	ctx := context.Background()
+	store := openMemTestStore(t)
+	lead := agentOwner("lead")
+	shared := MemoryOwner{Kind: memoryOwnerKindShared, Ref: memorySharedOwnerRef}
+
+	for i := 0; i < 3; i++ {
+		mustUpsert(t, store, ConfirmedMemory{
+			Owner: shared, AuthorRef: "lead", Repo: "acme/widget", Scope: "repo",
+			Key:     fmt.Sprintf("shared-%d", i),
+			Content: "quasar quasar quasar quasar vector",
+		})
+	}
+	mustUpsert(t, store, ConfirmedMemory{
+		Owner: lead, Repo: "acme/widget", Scope: "repo", Key: "lead-floor",
+		Content: "quasar vector",
+	})
+
+	got, err := store.QueryConfirmedMemories(ctx, lead, "acme/widget", `"quasar" OR "vector"`, 1)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(got) != 1 || got[0].Key != "lead-floor" {
+		t.Fatalf("own-floor should return the strongest private row at limit=1, got %+v", got)
+	}
+}
+
+func TestPromoteConfirmedMemoryToSharedPreservesLinksAndAuthor(t *testing.T) {
+	ctx := context.Background()
+	store := openMemTestStore(t)
+	owner := agentOwner("lead")
+
+	target := mustUpsert(t, store, ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo",
+		Key: "target", Content: "aurora quartz vector hnsw planner calibration checklist",
+	})
+	src := mustUpsert(t, store, ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo",
+		Key: "source", Content: "aurora quartz vector hnsw planner calibration",
+	})
+	before, err := store.ListMemoryLinks(ctx, src)
+	if err != nil {
+		t.Fatalf("links before: %v", err)
+	}
+	if len(before) == 0 || before[0].DstID != target {
+		t.Fatalf("expected source to auto-link to target before promote, got %+v", before)
+	}
+
+	rows, err := store.PromoteConfirmedMemoriesToShared(ctx, []int64{src})
+	if err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Owner.Kind != memoryOwnerKindShared || rows[0].Owner.Ref != memorySharedOwnerRef || rows[0].AuthorRef != "lead" {
+		t.Fatalf("promoted row did not preserve author/shared owner: %+v", rows)
+	}
+	after, err := store.ListMemoryLinks(ctx, src)
+	if err != nil {
+		t.Fatalf("links after: %v", err)
+	}
+	if len(after) != len(before) || after[0].DstID != target {
+		t.Fatalf("promote must preserve memory_links rows, before=%+v after=%+v", before, after)
+	}
+}
+
+func TestMemoryAuthorRefMigrationAppliesToPopulatedDB(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "pre777.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql open: %v", err)
+	}
+	raw.SetMaxOpenConns(1)
+	raw.SetMaxIdleConns(1)
+	if err := configureWritableSQLite(ctx, raw); err != nil {
+		t.Fatalf("configure sqlite: %v", err)
+	}
+	store := &Store{db: raw}
+	t.Cleanup(func() { _ = store.Close() })
+
+	for i := 0; i < len(migrations)-1; i++ {
+		if err := store.applyMigration(ctx, i+1, migrations[i]); err != nil {
+			t.Fatalf("apply pre-777 migration %d: %v", i+1, err)
+		}
+	}
+	if _, err := raw.ExecContext(ctx, `
+INSERT INTO confirmed_memories (owner_kind, owner_ref, owner_version, repo, scope, key, content, provenance, source_job)
+VALUES ('agent', 'lead', '', 'acme/widget', 'repo', 'k', 'legacy populated fact', 'seed', 'job-1');
+INSERT INTO confirmed_memories_fts(rowid, content, key) VALUES (last_insert_rowid(), 'legacy populated fact', 'k');
+INSERT INTO memory_observations (owner_kind, owner_ref, owner_version, repo, scope, key, content, provenance, trust_mark, source_job)
+VALUES ('agent', 'lead', '', 'acme/widget', 'repo', 'o', 'legacy populated observation', 'seed', 'normal', 'job-1');
+`); err != nil {
+		t.Fatalf("seed legacy memory rows: %v", err)
+	}
+
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("migrate latest: %v", err)
+	}
+	rows, err := store.QueryConfirmedMemories(ctx, agentOwner("lead"), "acme/widget", `"legacy"`, 5)
+	if err != nil {
+		t.Fatalf("query migrated confirmed: %v", err)
+	}
+	if len(rows) != 1 || rows[0].AuthorRef != "" {
+		t.Fatalf("legacy confirmed author_ref should default empty, got %+v", rows)
+	}
+	obs, err := store.ListMemoryObservations(ctx, "lead", "acme/widget")
+	if err != nil {
+		t.Fatalf("list migrated observations: %v", err)
+	}
+	if len(obs) != 1 || obs[0].AuthorRef != "" {
+		t.Fatalf("legacy observation author_ref should default empty, got %+v", obs)
+	}
+}
+
+func keysOf(rows []ConfirmedMemory) []string {
+	keys := make([]string, 0, len(rows))
+	for _, r := range rows {
+		keys = append(keys, r.Key)
+	}
+	return keys
+}
+
+func containsKey(rows []ConfirmedMemory, key string) bool {
+	for _, r := range rows {
+		if r.Key == key {
+			return true
+		}
+	}
+	return false
 }
 
 // TestObservationsAppendNotUpsert proves repeated observations of the same key

@@ -226,6 +226,67 @@ func TestMemoryIngestConfirmExportRoundTrip(t *testing.T) {
 	}
 }
 
+func TestMemoryIngestSharedAndConfirmToSharedAuthorStamping(t *testing.T) {
+	home, store := memoryTestHome(t)
+	src := t.TempDir()
+	writeFixture(t, src, "shared.md",
+		"The release checklist lives in the shared memory pool after human review.\n")
+
+	code, out, errOut := runMemoryCapture(t, "ingest", src, "--home", home,
+		"--agent", "lead", "--repo", "acme/widget", "--shared", "--json")
+	if code != 0 {
+		t.Fatalf("shared ingest exit %d: %s", code, errOut)
+	}
+	var ingest memoryIngestResult
+	if err := json.Unmarshal([]byte(out), &ingest); err != nil {
+		t.Fatalf("parse ingest: %v (%s)", err, out)
+	}
+	if !ingest.Shared || ingest.Agent != "lead" || ingest.Inserted != 1 {
+		t.Fatalf("shared ingest result wrong: %+v", ingest)
+	}
+
+	obs := listObservations(t, home)
+	if len(obs) != 1 {
+		t.Fatalf("expected one observation, got %+v", obs)
+	}
+	if obs[0].Owner.Kind != memory.OwnerKindShared || obs[0].Owner.Ref != memory.SharedOwnerRef || obs[0].AuthorRef != "lead" {
+		t.Fatalf("shared observation should preserve author lead, got %+v", obs[0])
+	}
+
+	code, out, errOut = runMemoryCapture(t, "list", "--home", home, "--pending", "--agent", "lead", "--json")
+	if code != 0 {
+		t.Fatalf("list shared pending by author exit %d: %s", code, errOut)
+	}
+	var pending []memoryListEntry
+	if err := json.Unmarshal([]byte(out), &pending); err != nil {
+		t.Fatalf("parse pending list: %v (%s)", err, out)
+	}
+	if len(pending) != 1 || pending[0].OwnerKind != memory.OwnerKindShared || pending[0].AuthorRef != "lead" {
+		t.Fatalf("--agent lead should include shared pending rows authored by lead, got %+v", pending)
+	}
+
+	code, out, errOut = runMemoryCapture(t, "confirm", "--home", home,
+		"--provenance-prefix", "ingest:", "--agent", "lead", "--to-shared", "--yes", "--json")
+	if code != 0 {
+		t.Fatalf("confirm --to-shared exit %d: %s", code, errOut)
+	}
+	var confirm memoryConfirmResult
+	if err := json.Unmarshal([]byte(out), &confirm); err != nil {
+		t.Fatalf("parse confirm: %v (%s)", err, out)
+	}
+	if !confirm.ToShared || confirm.Confirmed != 1 {
+		t.Fatalf("confirm to shared result wrong: %+v", confirm)
+	}
+
+	rows, err := store.QueryConfirmedMemoriesForShared(context.Background(), "acme/widget", `"shared" OR "memory"`, 5)
+	if err != nil {
+		t.Fatalf("query shared: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Owner.Kind != memory.OwnerKindShared || rows[0].AuthorRef != "lead" {
+		t.Fatalf("confirmed shared row should preserve author lead, got %+v", rows)
+	}
+}
+
 func listObservations(t *testing.T, home string) []db.MemoryObservation {
 	t.Helper()
 	var out []db.MemoryObservation

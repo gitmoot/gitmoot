@@ -45,7 +45,10 @@ func runDashboardWeb(home, addr string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "dashboard: %v\n", err)
 		return 1
 	}
-	srv := &http.Server{Handler: dashboard.Serve(ds)}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/learning/knowledge", ds.handleLearningKnowledge)
+	mux.Handle("/", dashboard.Serve(ds))
+	srv := &http.Server{Handler: mux}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

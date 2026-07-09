@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/memory"
@@ -270,7 +271,13 @@ func vaultLinksFor(ctx context.Context, store *db.Store, src db.ConfirmedMemory)
 		return nil, nil
 	}
 	// Fetch one extra so excluding self still leaves up to K candidates.
-	related, err := store.QueryConfirmedMemoryVaultLinks(ctx, src.Owner, src.Repo, matchQuery, vaultLinkK+1)
+	owner := src.Owner
+	if src.Owner.Kind == memory.OwnerKindShared && src.Owner.Ref == memory.SharedOwnerRef {
+		if author := strings.TrimSpace(src.AuthorRef); author != "" {
+			owner = db.MemoryOwner{Kind: memory.OwnerKindAgent, Ref: author}
+		}
+	}
+	related, err := store.QueryConfirmedMemoryVaultLinks(ctx, owner, src.Repo, matchQuery, vaultLinkK+1)
 	if err != nil {
 		return nil, err
 	}
@@ -431,6 +438,7 @@ func toVaultMemory(c db.ConfirmedMemory) memory.VaultMemory {
 		OwnerKind:    c.Owner.Kind,
 		OwnerRef:     c.Owner.Ref,
 		OwnerVersion: c.Owner.Version,
+		AuthorRef:    c.AuthorRef,
 		Repo:         c.Repo,
 		Scope:        c.Scope,
 		Key:          c.Key,

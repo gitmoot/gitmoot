@@ -1339,14 +1339,15 @@ gate:
 
 ```sh
 gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo] [--json]
-gitmoot memory recall "<query>" [--repo owner/repo] [--agent NAME] [--limit N] [--json]
+gitmoot memory recall "<query>" [--repo owner/repo] [--agent NAME|--shared] [--limit N] [--json]
 gitmoot memory replay [--agent NAME] [--repo owner/repo] [--limit N] [--json]
 gitmoot memory eval --fixtures fixtures.json [--k N] [--json]
 gitmoot memory vault export [--out DIR] [--agent NAME] [--force] [--json]
 gitmoot memory vault import <DIR> [--dry-run|--yes] [--json]
-gitmoot memory ingest <path|dir> --agent NAME [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
+gitmoot memory ingest <path|dir> --agent NAME [--shared] [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
 gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]
-gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--yes] [--json]
+gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--to-shared] [--yes] [--json]
+gitmoot memory promote --to-shared <id>... [--json]
 gitmoot memory links backfill [--dry-run] [--json]
 gitmoot memory links list <id> [--json]
 gitmoot memory groom --propose [--out PLAN.json] [--json]
@@ -1360,10 +1361,14 @@ gitmoot memory cluster rename <cluster-id> <label>
 `memory list` shows confirmed memories and/or pending observations. `memory
 recall` runs the same FTS5/BM25 confirmed-memory retrieval used for prompt
 injection and prints the matching facts in injection bullet format. Without
-`--agent`, recall searches all agent owner pools; pass `--agent NAME` to inspect
-one pool. Without `--repo`, recall searches every repo and general-scope facts.
-`--repo owner/repo` narrows repo-scoped facts to that repo while still including
-general-scope facts. `--json` returns raw rows for scripts. `memory replay`
+`--agent`, recall searches all agent owner pools plus the shared pool; pass
+`--agent NAME` to inspect that agent's private pool plus shared, or `--shared` to
+inspect only shared facts. Private matches outrank shared matches on equal BM25
+scores, and a floor guard keeps a private match visible when shared rows would
+otherwise fill the limit. Without `--repo`, recall searches every repo and
+general-scope facts. `--repo owner/repo` narrows repo-scoped facts to that repo while still including
+general-scope facts. `--json` returns raw rows for scripts, including
+`author_ref` for shared facts that preserve a different author. `memory replay`
 re-renders recent real jobs' prompts with and without the injected
 learnings block and reports the token/entry delta. `memory eval` computes
 recall/precision@K of retrieval over a labeled `{agent, repo, instructions,
@@ -1378,7 +1383,9 @@ regenerated from scratch on every export, safe to delete, and **deterministic**:
 same store yields byte-identical files (no `exported_at`; stable id-derived
 filenames). The export is read-only and atomic (temp dir then rename over `--out`,
 default a `vault/` directory under the home's evals area); `--agent` narrows it to a
-single agent owner. Because the export **replaces `--out` wholesale**, it refuses to
+single agent owner plus shared facts authored by that agent. Shared notes include
+an `author:` frontmatter line when `author_ref` is set, so graph views still
+attribute moved facts to the real author. Because the export **replaces `--out` wholesale**, it refuses to
 overwrite a non-empty directory that is not itself a prior gitmoot vault (one with a
 `manifest.json`), so an accidental `--out ~/my-obsidian-vault` can never delete your
 own notes; pass `--force` to override.
@@ -1400,6 +1407,7 @@ fails to parse (e.g. broken YAML frontmatter), `--yes` **refuses to apply** so a
 malformed note is never misread as a deletion. A vault produced by `export --agent
 NAME` stays importable even when other owners have memories. The `<DIR>` positional
 may sit before or after the flags.
+
 `memory ingest` stages arbitrary Markdown as **pending observations**: it walks
 `*.md`, strips leading YAML frontmatter, chunks a file only when its body exceeds
 ~512 estimated tokens (on `## ` headings, sub-splitting any still-oversized
@@ -1408,22 +1416,30 @@ every chunk (per-reason rejection counts in the summary), dedups by exact conten
 **within the same scope+repo visibility domain** (identical text under a second
 repo still stages), and inserts survivors with
 `provenance = ingest:<relpath>` and **`trust_mark = low`**. `--tier` defaults to
-`repo`; `general` is only chosen explicitly. `memory observations` lists pending
-observations, flagging which keys are already confirmed. `memory confirm` is the
-**human-gated promotion** — by id or `--provenance-prefix`, it copies observations
+`repo`; `general` is only chosen explicitly. `--shared` stages observations in the
+shared pool while recording `--agent NAME` as the authoring identity.
+`memory observations` lists pending observations, flagging which keys are already
+confirmed. `memory confirm` is the **human-gated promotion**: by id or
+`--provenance-prefix`, it copies observations
 into confirmed memory (idempotently), and without `--yes` only prints the plan.
+`--to-shared` confirms selected observations into the shared pool while preserving
+the observation author. `memory promote --to-shared <id>...` moves active
+confirmed facts into shared, refuses retired or superseded rows, preserves
+existing links, and stamps `author_ref` from the previous owner when needed.
 Ingested Markdown is an indirect-prompt-injection vector, so it stays inert at
 `trust_mark = low` until a human confirms it; that confirm gate is the trust
 boundary and nothing reads `trust_mark` for a decision yet.
 
 Confirming a fact also records up to three deterministic persisted links from that
 confirmed row to active related confirmed memories. Links live in `memory_links`
-with BM25-derived scores and do not rewrite fact content. `memory links backfill`
-runs the same pass over the active confirmed pool in id order; `--dry-run` reports
-what would be created, and repeat runs create nothing new. `memory links list <id>`
-shows one fact's outgoing persisted links. Vault export merges these persisted
-links with content-derived links and dedupes by target in each note's `## Links`
-section.
+with BM25-derived scores and do not rewrite fact content. Link candidates use the
+same private-plus-shared visibility as prompt injection, so private facts can link
+to shared facts and shared facts can link back through their author pool.
+`memory links backfill` runs the same pass over the active confirmed pool in id
+order; `--dry-run` reports what would be created, and repeat runs create nothing
+new. `memory links list <id>` shows one fact's outgoing persisted links. Vault
+export merges these persisted links with content-derived links and dedupes by
+target in each note's `## Links` section.
 
 `memory groom` retires stale, low-signal confirmed memories as a **propose →
 review → apply** round-trip. `--propose` reads active confirmed memory, computes

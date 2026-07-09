@@ -11,6 +11,7 @@ import (
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/memory"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
@@ -215,6 +216,82 @@ func TestMemoryRecallRanksAndFiltersConfirmedMemories(t *testing.T) {
 	if len(none) != 0 {
 		t.Fatalf("empty recall JSON returned rows: %+v", none)
 	}
+}
+
+func TestMemoryRecallSharedParity(t *testing.T) {
+	home, store := memoryTestHome(t)
+	ctx := context.Background()
+	for _, cm := range []db.ConfirmedMemory{
+		{
+			Owner: db.MemoryOwner{Kind: "agent", Ref: "lead"}, Repo: "acme/widget", Scope: "repo", Key: "lead-private",
+			Content: "atlas runner private lead fact", Provenance: "seed",
+		},
+		{
+			Owner: db.MemoryOwner{Kind: "agent", Ref: "audit"}, Repo: "acme/widget", Scope: "repo", Key: "audit-private",
+			Content: "atlas runner private audit fact", Provenance: "seed",
+		},
+		{
+			Owner: db.MemoryOwner{Kind: memory.OwnerKindShared, Ref: memory.SharedOwnerRef}, AuthorRef: "lead",
+			Repo: "acme/widget", Scope: "repo", Key: "shared-atlas",
+			Content: "atlas runner shared fact", Provenance: "seed",
+		},
+	} {
+		if _, err := store.UpsertConfirmedMemory(ctx, cm); err != nil {
+			t.Fatalf("seed %s: %v", cm.Key, err)
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := runMemory([]string{"recall", "atlas runner", "--home", home, "--repo", "acme/widget", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("default recall exit %d: %s", code, stderr.String())
+	}
+	var all []memoryRecallEntry
+	if err := json.Unmarshal(stdout.Bytes(), &all); err != nil {
+		t.Fatalf("parse all recall: %v (%s)", err, stdout.String())
+	}
+	if !recallHasKey(all, "lead-private") || !recallHasKey(all, "audit-private") || !recallHasKey(all, "shared-atlas") {
+		t.Fatalf("default recall should include all agent pools plus shared, got %+v", all)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runMemory([]string{"recall", "atlas runner", "--home", home, "--repo", "acme/widget", "--agent", "lead", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent recall exit %d: %s", code, stderr.String())
+	}
+	var lead []memoryRecallEntry
+	if err := json.Unmarshal(stdout.Bytes(), &lead); err != nil {
+		t.Fatalf("parse lead recall: %v (%s)", err, stdout.String())
+	}
+	if !recallHasKey(lead, "lead-private") || !recallHasKey(lead, "shared-atlas") || recallHasKey(lead, "audit-private") {
+		t.Fatalf("--agent lead should include lead private plus shared only, got %+v", lead)
+	}
+	for _, e := range lead {
+		if e.Key == "shared-atlas" && e.AuthorRef != "lead" {
+			t.Fatalf("shared recall JSON should expose author_ref lead, got %+v", e)
+		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runMemory([]string{"recall", "atlas runner", "--home", home, "--repo", "acme/widget", "--shared", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("shared recall exit %d: %s", code, stderr.String())
+	}
+	var sharedOnly []memoryRecallEntry
+	if err := json.Unmarshal(stdout.Bytes(), &sharedOnly); err != nil {
+		t.Fatalf("parse shared recall: %v (%s)", err, stdout.String())
+	}
+	if len(sharedOnly) != 1 || sharedOnly[0].Key != "shared-atlas" {
+		t.Fatalf("--shared should return only shared rows, got %+v", sharedOnly)
+	}
+}
+
+func recallHasKey(rows []memoryRecallEntry, key string) bool {
+	for _, r := range rows {
+		if r.Key == key {
+			return true
+		}
+	}
+	return false
 }
 
 func TestMemoryReplayReportsInjectionDelta(t *testing.T) {

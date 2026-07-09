@@ -31,6 +31,7 @@ type MemoryOwner struct {
 type MemoryObservation struct {
 	ID         int64
 	Owner      MemoryOwner
+	AuthorRef  string // "" == author is Owner.Ref; set when a shared row preserves the writer
 	Repo       string // "" == general (scope carries the authoritative meaning)
 	Scope      string
 	Key        string
@@ -47,6 +48,7 @@ type MemoryObservation struct {
 type ConfirmedMemory struct {
 	ID               int64
 	Owner            MemoryOwner
+	AuthorRef        string // "" == author is Owner.Ref; set when owner changes to the shared pool
 	Repo             string // "" == general scope (stored as SQL NULL)
 	Scope            string
 	Key              string
@@ -81,6 +83,10 @@ type MemoryLinkEnrichment struct {
 }
 
 const (
+	memoryOwnerKindAgent  = "agent"
+	memoryOwnerKindShared = "shared"
+	memorySharedOwnerRef  = "shared"
+
 	memoryAutoLinkK = 3
 	// memoryAutoLinkMinScore is a tiny absolute floor guarding degenerate
 	// near-zero bm25 matches. The REAL weak-link guard is relative:
@@ -145,9 +151,9 @@ func insertMemoryObservationTx(ctx context.Context, tx *sql.Tx, obs MemoryObserv
 	}
 	res, err := tx.ExecContext(ctx, `
 INSERT INTO memory_observations
-	(owner_kind, owner_ref, owner_version, repo, scope, key, content, provenance, trust_mark, source_job, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		obs.Owner.Kind, obs.Owner.Ref, obs.Owner.Version, nullableRepo(obs.Repo), scope,
+	(owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, provenance, trust_mark, source_job, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		obs.Owner.Kind, obs.Owner.Ref, obs.Owner.Version, strings.TrimSpace(obs.AuthorRef), nullableRepo(obs.Repo), scope,
 		obs.Key, obs.Content, obs.Provenance, obs.TrustMark, obs.SourceJob, created)
 	if err != nil {
 		return 0, fmt.Errorf("insert memory observation: %w", err)
@@ -172,19 +178,29 @@ WHERE owner_kind = ? AND owner_ref = ? AND owner_version = ?
 	return n, nil
 }
 
-// CountConfirmedMemoriesForOwner returns how many confirmed_memories rows an
-// owner owns, across ALL owner versions and every repo/scope (owner_version is
+// CountConfirmedMemoriesForOwner returns how many active confirmed rows an
+// owner owns or, for agent owners, authored after a row moved to the shared pool.
+// It scans across ALL owner versions and every repo/scope (owner_version is
 // deliberately not filtered — an agent owner always writes owner_version=”), so
-// it answers "how many injectable facts does this agent own". It backs the
+// it answers "how many injectable facts belong to this agent". It backs the
 // dashboard's per-agent memory count and is a plain read (no FTS). Superseded AND
 // retired rows are excluded (superseded_by IS NULL AND retired_at = ”) so the
 // count stays exactly equal to the injectable set surfaced by
 // QueryConfirmedMemories (which applies the same two filters).
 func (s *Store) CountConfirmedMemoriesForOwner(ctx context.Context, ownerKind, ownerRef string) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `
+	query := `
 SELECT COUNT(*) FROM confirmed_memories
-WHERE owner_kind = ? AND owner_ref = ? AND superseded_by IS NULL AND retired_at = ''`, ownerKind, ownerRef).Scan(&n)
+WHERE owner_kind = ? AND owner_ref = ? AND superseded_by IS NULL AND retired_at = ''`
+	args := []any{ownerKind, ownerRef}
+	if ownerKind == memoryOwnerKindAgent {
+		query = `
+SELECT COUNT(*) FROM confirmed_memories
+WHERE ((owner_kind = ? AND owner_ref = ?) OR (owner_kind = ? AND owner_ref = ? AND author_ref = ?))
+	AND superseded_by IS NULL AND retired_at = ''`
+		args = []any{memoryOwnerKindAgent, ownerRef, memoryOwnerKindShared, memorySharedOwnerRef, ownerRef}
+	}
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("count confirmed memories for owner: %w", err)
 	}
@@ -192,14 +208,23 @@ WHERE owner_kind = ? AND owner_ref = ? AND superseded_by IS NULL AND retired_at 
 }
 
 // CountMemoryObservationsForOwner returns how many memory_observations rows an
-// owner owns, across ALL owner versions and every repo/scope/key. Observations
+// owner owns or, for agent owners, authored after a row staged directly in the
+// shared pool, across ALL owner versions and every repo/scope/key. Observations
 // are append-only, so this is the raw sighting-report volume for the owner. It
 // backs the dashboard's per-agent observation count.
 func (s *Store) CountMemoryObservationsForOwner(ctx context.Context, ownerKind, ownerRef string) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `
+	query := `
 SELECT COUNT(*) FROM memory_observations
-WHERE owner_kind = ? AND owner_ref = ?`, ownerKind, ownerRef).Scan(&n)
+WHERE owner_kind = ? AND owner_ref = ?`
+	args := []any{ownerKind, ownerRef}
+	if ownerKind == memoryOwnerKindAgent {
+		query = `
+SELECT COUNT(*) FROM memory_observations
+WHERE (owner_kind = ? AND owner_ref = ?) OR (owner_kind = ? AND owner_ref = ? AND author_ref = ?)`
+		args = []any{memoryOwnerKindAgent, ownerRef, memoryOwnerKindShared, memorySharedOwnerRef, ownerRef}
+	}
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("count memory observations for owner: %w", err)
 	}
@@ -221,7 +246,7 @@ WHERE owner_kind = ? AND owner_ref = ?`, ownerKind, ownerRef).Scan(&n)
 // Rows come back ordered by id for a stable, deterministic traversal. Plain read, no FTS.
 func (s *Store) ListConfirmedMemoriesByOwnerKind(ctx context.Context, ownerKind string) ([]ConfirmedMemory, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, owner_kind, owner_ref, owner_version, repo, scope, key, content,
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
 	provenance, source_job, first_confirmed_at, updated_at, COALESCE(superseded_by, 0)
 FROM confirmed_memories
 WHERE owner_kind = ? AND retired_at = ''
@@ -234,7 +259,37 @@ ORDER BY id`, ownerKind)
 	for rows.Next() {
 		var c ConfirmedMemory
 		var repoNull sql.NullString
-		if err := rows.Scan(&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &repoNull,
+		if err := rows.Scan(&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &c.AuthorRef, &repoNull,
+			&c.Scope, &c.Key, &c.Content, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt, &c.UpdatedAt, &c.SupersededBy); err != nil {
+			return nil, err
+		}
+		c.Repo = repoNull.String
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ListConfirmedMemoriesForKnowledge returns every non-retired fact the dashboard
+// Knowledge graph should render: private agent facts plus the reserved shared
+// pool. Superseded rows stay included as graph ghosts, matching
+// ListConfirmedMemoriesByOwnerKind.
+func (s *Store) ListConfirmedMemoriesForKnowledge(ctx context.Context) ([]ConfirmedMemory, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
+	provenance, source_job, first_confirmed_at, updated_at, COALESCE(superseded_by, 0)
+FROM confirmed_memories
+WHERE (owner_kind = 'agent' OR (owner_kind = 'shared' AND owner_ref = 'shared'))
+	AND retired_at = ''
+ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("list confirmed memories for knowledge: %w", err)
+	}
+	defer rows.Close()
+	var out []ConfirmedMemory
+	for rows.Next() {
+		var c ConfirmedMemory
+		var repoNull sql.NullString
+		if err := rows.Scan(&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &c.AuthorRef, &repoNull,
 			&c.Scope, &c.Key, &c.Content, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt, &c.UpdatedAt, &c.SupersededBy); err != nil {
 			return nil, err
 		}
@@ -260,11 +315,18 @@ type ObservationKeyWitnesses struct {
 // pass, so the brain graph can attach a witness count to every fact without an N+1
 // per-fact query. A NULL repo (general scope) is normalized to "".
 func (s *Store) CountObservationWitnessesByKey(ctx context.Context, ownerKind string) ([]ObservationKeyWitnesses, error) {
+	where := "owner_kind = ?"
+	args := []any{ownerKind}
+	if ownerKind == memoryOwnerKindAgent {
+		where = "(owner_kind = ? OR owner_kind = ?)"
+		args = []any{memoryOwnerKindAgent, memoryOwnerKindShared}
+	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT owner_ref, repo, key, COUNT(*)
+SELECT CASE WHEN author_ref <> '' THEN author_ref ELSE owner_ref END AS witness_owner_ref,
+	repo, key, COUNT(*)
 FROM memory_observations
-WHERE owner_kind = ?
-GROUP BY owner_ref, repo, key`, ownerKind)
+WHERE `+where+`
+GROUP BY witness_owner_ref, repo, key`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("count observation witnesses by key: %w", err)
 	}
@@ -320,9 +382,9 @@ WHERE owner_kind = ? AND owner_ref = ? AND owner_version = ?
 	case err == sql.ErrNoRows:
 		res, insErr := tx.ExecContext(ctx, `
 INSERT INTO confirmed_memories
-	(owner_kind, owner_ref, owner_version, repo, scope, key, content, provenance, source_job, first_confirmed_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			cm.Owner.Kind, cm.Owner.Ref, cm.Owner.Version, nullableRepo(cm.Repo), scope,
+	(owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, provenance, source_job, first_confirmed_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			cm.Owner.Kind, cm.Owner.Ref, cm.Owner.Version, strings.TrimSpace(cm.AuthorRef), nullableRepo(cm.Repo), scope,
 			cm.Key, cm.Content, cm.Provenance, cm.SourceJob, now, now)
 		if insErr != nil {
 			return 0, fmt.Errorf("insert confirmed memory: %w", insErr)
@@ -341,9 +403,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		// the already-empty retirement columns untouched.
 		if _, upErr := tx.ExecContext(ctx, `
 UPDATE confirmed_memories
-SET content = ?, provenance = ?, source_job = ?, updated_at = ?, retired_at = '', retired_reason = ''
+SET author_ref = ?, content = ?, provenance = ?, source_job = ?, updated_at = ?, retired_at = '', retired_reason = ''
 WHERE id = ?`,
-			cm.Content, cm.Provenance, cm.SourceJob, now, id); upErr != nil {
+			strings.TrimSpace(cm.AuthorRef), cm.Content, cm.Provenance, cm.SourceJob, now, id); upErr != nil {
 			return 0, fmt.Errorf("update confirmed memory: %w", upErr)
 		}
 	}
@@ -362,6 +424,85 @@ WHERE id = ?`,
 		return 0, err
 	}
 	return id, nil
+}
+
+// PromoteConfirmedMemoriesToShared moves active confirmed rows into the reserved
+// shared pool without changing their primary keys, content, keys, or FTS rows.
+// Existing memory_links survive because they key on confirmed_memories.id. When
+// a row has no author_ref, the previous owner_ref is recorded as its author
+// before owner_kind/owner_ref change to shared/shared. Retired or superseded rows
+// are refused so stale facts cannot be widened to every agent.
+func (s *Store) PromoteConfirmedMemoriesToShared(ctx context.Context, ids []int64) ([]ConfirmedMemory, error) {
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("at least one confirmed memory id is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := nowRFC3339()
+	out := make([]ConfirmedMemory, 0, len(ids))
+	seen := map[int64]struct{}{}
+	for _, id := range ids {
+		if id <= 0 {
+			return nil, fmt.Errorf("invalid confirmed memory id %d", id)
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+
+		var c ConfirmedMemory
+		var repoNull sql.NullString
+		var retiredAt string
+		err := tx.QueryRowContext(ctx, `
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
+	provenance, source_job, first_confirmed_at, updated_at, COALESCE(superseded_by, 0), retired_at
+FROM confirmed_memories
+WHERE id = ?`, id).Scan(
+			&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &c.AuthorRef, &repoNull,
+			&c.Scope, &c.Key, &c.Content, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt,
+			&c.UpdatedAt, &c.SupersededBy, &retiredAt)
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("confirmed memory %d not found", id)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read confirmed memory %d: %w", id, err)
+		}
+		c.Repo = repoNull.String
+		if c.SupersededBy != 0 {
+			return nil, fmt.Errorf("confirmed memory %d is superseded", id)
+		}
+		if retiredAt != "" {
+			return nil, fmt.Errorf("confirmed memory %d is retired", id)
+		}
+
+		if c.Owner.Kind == memoryOwnerKindShared && c.Owner.Ref == memorySharedOwnerRef {
+			out = append(out, c)
+			continue
+		}
+		author := strings.TrimSpace(c.AuthorRef)
+		if author == "" {
+			author = c.Owner.Ref
+		}
+		if _, err := tx.ExecContext(ctx, `
+UPDATE confirmed_memories
+SET owner_kind = ?, owner_ref = ?, owner_version = '', author_ref = ?, updated_at = ?
+WHERE id = ?`,
+			memoryOwnerKindShared, memorySharedOwnerRef, author, now, id); err != nil {
+			return nil, fmt.Errorf("promote confirmed memory %d to shared: %w", id, err)
+		}
+		c.Owner = MemoryOwner{Kind: memoryOwnerKindShared, Ref: memorySharedOwnerRef}
+		c.AuthorRef = author
+		c.UpdatedAt = now
+		out = append(out, c)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // EnrichConfirmedMemoryLinks computes the deterministic top-K similarity links
@@ -473,11 +614,11 @@ func confirmedMemoryForLinkingTx(ctx context.Context, tx *sql.Tx, id int64) (Con
 	var c ConfirmedMemory
 	var repoNull sql.NullString
 	err := tx.QueryRowContext(ctx, `
-SELECT id, owner_kind, owner_ref, owner_version, repo, scope, key, content,
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
 	provenance, source_job, first_confirmed_at, updated_at
 FROM confirmed_memories
 WHERE id = ? AND superseded_by IS NULL AND retired_at = ''`, id).Scan(
-		&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &repoNull,
+		&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &c.AuthorRef, &repoNull,
 		&c.Scope, &c.Key, &c.Content, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt, &c.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return ConfirmedMemory{}, false, nil
@@ -493,20 +634,29 @@ func queryMemoryLinkCandidatesTx(ctx context.Context, tx *sql.Tx, src ConfirmedM
 	if limit <= 0 {
 		limit = memoryAutoLinkK
 	}
+	own := src.Owner
+	if src.Owner.Kind == memoryOwnerKindShared && src.Owner.Ref == memorySharedOwnerRef {
+		if author := strings.TrimSpace(src.AuthorRef); author != "" {
+			own = MemoryOwner{Kind: memoryOwnerKindAgent, Ref: author}
+		}
+	}
 	rows, err := tx.QueryContext(ctx, `
 SELECT c.id, c.key, -bm25(f.confirmed_memories_fts) AS score,
 	EXISTS(SELECT 1 FROM memory_links ml WHERE ml.src_id = ? AND ml.dst_id = c.id) AS already_linked
 FROM confirmed_memories_fts f
 JOIN confirmed_memories c ON c.id = f.rowid
 WHERE f.confirmed_memories_fts MATCH ?
-	AND c.owner_kind = ? AND c.owner_ref = ? AND c.owner_version = ?
+	AND ((c.owner_kind = ? AND c.owner_ref = ? AND c.owner_version = ?) OR (c.owner_kind = ? AND c.owner_ref = ?))
 	AND (c.scope = 'general' OR c.repo = ?)
 	AND c.superseded_by IS NULL
 	AND c.retired_at = ''
 	AND c.id <> ?
-ORDER BY bm25(f.confirmed_memories_fts), c.id
+ORDER BY bm25(f.confirmed_memories_fts),
+	CASE WHEN c.owner_kind = ? AND c.owner_ref = ? AND c.owner_version = ? THEN 0 ELSE 1 END,
+	c.id
 LIMIT ?`,
-		src.ID, matchQuery, src.Owner.Kind, src.Owner.Ref, src.Owner.Version, src.Repo, src.ID, limit)
+		src.ID, matchQuery, own.Kind, own.Ref, own.Version, memoryOwnerKindShared, memorySharedOwnerRef,
+		src.Repo, src.ID, own.Kind, own.Ref, own.Version, limit)
 	if err != nil {
 		return nil, fmt.Errorf("query memory link candidates: %w", err)
 	}
@@ -825,12 +975,16 @@ WHERE id = ? AND retired_at = ''`, now, it.Reason, it.ID)
 }
 
 // QueryConfirmedMemories is the READ path for job-prompt assembly. It runs one
-// FTS5/BM25 query over confirmed content, filtered by the retrieval default
-// (owner match AND (repo = current OR scope = general)), confirmed tier only,
-// and excludes superseded rows. matchQuery MUST be a sanitized MATCH string
-// (see internal/memory.SanitizeFTSQuery) — never raw job text. Results are
-// ranked by BM25 (ascending; lower is more relevant) then recency, capped by
-// limit. An empty matchQuery returns no rows (no block).
+// FTS5/BM25 query over confirmed content, filtered by the retrieval default:
+// the running agent's private pool UNION the reserved shared pool, then
+// (repo = current OR scope = general), confirmed tier only, and active rows
+// only. matchQuery MUST be a sanitized MATCH string (see
+// internal/memory.SanitizeFTSQuery) — never raw job text. Results are ranked by
+// BM25 (ascending; lower is more relevant), then private facts before shared on
+// an equal BM25 score, then recency, capped by limit. After SQL ranking, a
+// deterministic floor protects private memory: if private matches exist but the
+// limit slice contains only shared rows, the weakest shared row is swapped for
+// the strongest private row.
 func (s *Store) QueryConfirmedMemories(ctx context.Context, owner MemoryOwner, repo, matchQuery string, limit int) ([]ConfirmedMemory, error) {
 	if strings.TrimSpace(matchQuery) == "" {
 		return nil, nil
@@ -839,23 +993,30 @@ func (s *Store) QueryConfirmedMemories(ctx context.Context, owner MemoryOwner, r
 		limit = 15
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.repo, c.scope, c.key, c.content,
+SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.author_ref, c.repo, c.scope, c.key, c.content,
 	c.provenance, c.source_job, c.first_confirmed_at, c.updated_at
 FROM confirmed_memories_fts f
 JOIN confirmed_memories c ON c.id = f.rowid
 WHERE f.confirmed_memories_fts MATCH ?
-	AND c.owner_kind = ? AND c.owner_ref = ? AND c.owner_version = ?
+	AND ((c.owner_kind = ? AND c.owner_ref = ? AND c.owner_version = ?) OR (c.owner_kind = ? AND c.owner_ref = ?))
 	AND (c.scope = 'general' OR c.repo = ?)
 	AND c.superseded_by IS NULL
 	AND c.retired_at = ''
-ORDER BY bm25(f.confirmed_memories_fts), c.updated_at DESC
+ORDER BY bm25(f.confirmed_memories_fts),
+	CASE WHEN c.owner_kind = ? AND c.owner_ref = ? AND c.owner_version = ? THEN 0 ELSE 1 END,
+	c.updated_at DESC, c.id DESC
 LIMIT ?`,
-		matchQuery, owner.Kind, owner.Ref, owner.Version, repo, limit)
+		matchQuery, owner.Kind, owner.Ref, owner.Version, memoryOwnerKindShared, memorySharedOwnerRef, repo,
+		owner.Kind, owner.Ref, owner.Version, limit)
 	if err != nil {
 		return nil, fmt.Errorf("query confirmed memories: %w", err)
 	}
 	defer rows.Close()
-	return scanConfirmedMemories(rows)
+	out, err := scanConfirmedMemories(rows)
+	if err != nil {
+		return nil, err
+	}
+	return s.ensureOwnMemoryFloor(ctx, owner, repo, matchQuery, limit, true, out)
 }
 
 // QueryConfirmedMemoriesForOwnerAllRepos is the recall variant for a single
@@ -870,28 +1031,97 @@ func (s *Store) QueryConfirmedMemoriesForOwnerAllRepos(ctx context.Context, owne
 		limit = 15
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.repo, c.scope, c.key, c.content,
+SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.author_ref, c.repo, c.scope, c.key, c.content,
+	c.provenance, c.source_job, c.first_confirmed_at, c.updated_at
+FROM confirmed_memories_fts f
+JOIN confirmed_memories c ON c.id = f.rowid
+WHERE f.confirmed_memories_fts MATCH ?
+	AND ((c.owner_kind = ? AND c.owner_ref = ? AND c.owner_version = ?) OR (c.owner_kind = ? AND c.owner_ref = ?))
+	AND c.superseded_by IS NULL
+	AND c.retired_at = ''
+ORDER BY bm25(f.confirmed_memories_fts),
+	CASE WHEN c.owner_kind = ? AND c.owner_ref = ? AND c.owner_version = ? THEN 0 ELSE 1 END,
+	c.updated_at DESC, c.id DESC
+LIMIT ?`,
+		matchQuery, owner.Kind, owner.Ref, owner.Version, memoryOwnerKindShared, memorySharedOwnerRef,
+		owner.Kind, owner.Ref, owner.Version, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query confirmed memories for owner all repos: %w", err)
+	}
+	defer rows.Close()
+	out, err := scanConfirmedMemories(rows)
+	if err != nil {
+		return nil, err
+	}
+	return s.ensureOwnMemoryFloor(ctx, owner, "", matchQuery, limit, false, out)
+}
+
+func (s *Store) ensureOwnMemoryFloor(ctx context.Context, owner MemoryOwner, repo, matchQuery string, limit int, filterRepo bool, rows []ConfirmedMemory) ([]ConfirmedMemory, error) {
+	if len(rows) == 0 || limit <= 0 {
+		return rows, nil
+	}
+	hasOwn := false
+	weakestShared := -1
+	for i, r := range rows {
+		if r.Owner.Kind == owner.Kind && r.Owner.Ref == owner.Ref && r.Owner.Version == owner.Version {
+			hasOwn = true
+			break
+		}
+		if r.Owner.Kind == memoryOwnerKindShared {
+			weakestShared = i
+		}
+	}
+	if hasOwn || weakestShared < 0 {
+		return rows, nil
+	}
+	own, ok, err := s.queryStrongestOwnMemory(ctx, owner, repo, matchQuery, filterRepo)
+	if err != nil || !ok {
+		return rows, err
+	}
+	if len(rows) < limit {
+		return append(rows, own), nil
+	}
+	rows[weakestShared] = own
+	return rows, nil
+}
+
+func (s *Store) queryStrongestOwnMemory(ctx context.Context, owner MemoryOwner, repo, matchQuery string, filterRepo bool) (ConfirmedMemory, bool, error) {
+	query := `
+SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.author_ref, c.repo, c.scope, c.key, c.content,
 	c.provenance, c.source_job, c.first_confirmed_at, c.updated_at
 FROM confirmed_memories_fts f
 JOIN confirmed_memories c ON c.id = f.rowid
 WHERE f.confirmed_memories_fts MATCH ?
 	AND c.owner_kind = ? AND c.owner_ref = ? AND c.owner_version = ?
 	AND c.superseded_by IS NULL
-	AND c.retired_at = ''
-ORDER BY bm25(f.confirmed_memories_fts), c.updated_at DESC
-LIMIT ?`,
-		matchQuery, owner.Kind, owner.Ref, owner.Version, limit)
+	AND c.retired_at = ''`
+	args := []any{matchQuery, owner.Kind, owner.Ref, owner.Version}
+	if filterRepo {
+		query += "\n\tAND (c.scope = 'general' OR c.repo = ?)"
+		args = append(args, repo)
+	}
+	query += `
+ORDER BY bm25(f.confirmed_memories_fts), c.updated_at DESC, c.id DESC
+LIMIT 1`
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("query confirmed memories for owner all repos: %w", err)
+		return ConfirmedMemory{}, false, fmt.Errorf("query strongest own memory: %w", err)
 	}
 	defer rows.Close()
-	return scanConfirmedMemories(rows)
+	matches, err := scanConfirmedMemories(rows)
+	if err != nil {
+		return ConfirmedMemory{}, false, err
+	}
+	if len(matches) == 0 {
+		return ConfirmedMemory{}, false, nil
+	}
+	return matches[0], true, nil
 }
 
 // QueryConfirmedMemoriesForAllAgents is the read-only recall path for sessions
 // that are not running as a specific Gitmoot agent. It uses the same FTS5/BM25
-// ranking as QueryConfirmedMemories, but searches every agent owner pool instead
-// of one owner_ref. A non-empty repo applies the same repo/general visibility
+// ranking as QueryConfirmedMemories, but searches every agent owner pool plus
+// the shared pool. A non-empty repo applies the same repo/general visibility
 // filter as injection; an empty repo searches every repo and general facts. Role
 // pools remain excluded.
 func (s *Store) QueryConfirmedMemoriesForAllAgents(ctx context.Context, repo, matchQuery string, limit int) ([]ConfirmedMemory, error) {
@@ -902,15 +1132,15 @@ func (s *Store) QueryConfirmedMemoriesForAllAgents(ctx context.Context, repo, ma
 		limit = 15
 	}
 	query := `
-SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.repo, c.scope, c.key, c.content,
+SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.author_ref, c.repo, c.scope, c.key, c.content,
 	c.provenance, c.source_job, c.first_confirmed_at, c.updated_at
 FROM confirmed_memories_fts f
 JOIN confirmed_memories c ON c.id = f.rowid
 WHERE f.confirmed_memories_fts MATCH ?
-	AND c.owner_kind = 'agent'
+	AND (c.owner_kind = 'agent' OR (c.owner_kind = 'shared' AND c.owner_ref = 'shared'))
 	AND c.superseded_by IS NULL
 	AND c.retired_at = ''
-ORDER BY bm25(f.confirmed_memories_fts), c.updated_at DESC
+ORDER BY bm25(f.confirmed_memories_fts), c.updated_at DESC, c.id DESC
 LIMIT ?`
 	args := []any{matchQuery}
 	if strings.TrimSpace(repo) != "" {
@@ -921,6 +1151,40 @@ LIMIT ?`
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query confirmed memories for all agents: %w", err)
+	}
+	defer rows.Close()
+	return scanConfirmedMemories(rows)
+}
+
+// QueryConfirmedMemoriesForShared returns active confirmed rows from only the
+// reserved shared pool. It backs `memory recall --shared`.
+func (s *Store) QueryConfirmedMemoriesForShared(ctx context.Context, repo, matchQuery string, limit int) ([]ConfirmedMemory, error) {
+	if strings.TrimSpace(matchQuery) == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 15
+	}
+	query := `
+SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.author_ref, c.repo, c.scope, c.key, c.content,
+	c.provenance, c.source_job, c.first_confirmed_at, c.updated_at
+FROM confirmed_memories_fts f
+JOIN confirmed_memories c ON c.id = f.rowid
+WHERE f.confirmed_memories_fts MATCH ?
+	AND c.owner_kind = 'shared' AND c.owner_ref = 'shared'
+	AND c.superseded_by IS NULL
+	AND c.retired_at = ''
+ORDER BY bm25(f.confirmed_memories_fts), c.updated_at DESC, c.id DESC
+LIMIT ?`
+	args := []any{matchQuery}
+	if strings.TrimSpace(repo) != "" {
+		query = strings.Replace(query, "\n\tAND c.superseded_by IS NULL", "\n\tAND (c.scope = 'general' OR c.repo = ?)\n\tAND c.superseded_by IS NULL", 1)
+		args = append(args, strings.TrimSpace(repo))
+	}
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query confirmed memories for shared: %w", err)
 	}
 	defer rows.Close()
 	return scanConfirmedMemories(rows)
@@ -949,14 +1213,14 @@ type rowsQuerier interface {
 // (via a *sql.Tx) without duplicating the query.
 func listConfirmedMemoriesForVault(ctx context.Context, q rowsQuerier, agentRef string) ([]ConfirmedMemory, error) {
 	query := `
-SELECT id, owner_kind, owner_ref, owner_version, repo, scope, key, content,
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
 	provenance, source_job, first_confirmed_at, updated_at, COALESCE(superseded_by, 0)
 FROM confirmed_memories
 WHERE superseded_by IS NULL AND retired_at = ''`
 	var args []any
 	if strings.TrimSpace(agentRef) != "" {
-		query += "\n\tAND owner_kind = 'agent' AND owner_ref = ?"
-		args = append(args, agentRef)
+		query += "\n\tAND ((owner_kind = 'agent' AND owner_ref = ?) OR (owner_kind = 'shared' AND owner_ref = 'shared' AND author_ref = ?))"
+		args = append(args, agentRef, agentRef)
 	}
 	query += "\nORDER BY id"
 	rows, err := q.QueryContext(ctx, query, args...)
@@ -968,7 +1232,7 @@ WHERE superseded_by IS NULL AND retired_at = ''`
 	for rows.Next() {
 		var c ConfirmedMemory
 		var repoNull sql.NullString
-		if err := rows.Scan(&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &repoNull,
+		if err := rows.Scan(&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &c.AuthorRef, &repoNull,
 			&c.Scope, &c.Key, &c.Content, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt, &c.UpdatedAt, &c.SupersededBy); err != nil {
 			return nil, err
 		}
@@ -995,17 +1259,21 @@ func (s *Store) QueryConfirmedMemoryVaultLinks(ctx context.Context, owner Memory
 		limit = 6
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.repo, c.scope, c.key, c.content,
+SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.author_ref, c.repo, c.scope, c.key, c.content,
 	c.provenance, c.source_job, c.first_confirmed_at, c.updated_at
 FROM confirmed_memories_fts f
 JOIN confirmed_memories c ON c.id = f.rowid
 WHERE f.confirmed_memories_fts MATCH ?
-	AND c.owner_kind = ? AND c.owner_ref = ? AND c.owner_version = ?
+	AND ((c.owner_kind = ? AND c.owner_ref = ? AND c.owner_version = ?) OR (c.owner_kind = ? AND c.owner_ref = ?))
 	AND (c.scope = 'general' OR c.repo = ?)
 	AND c.superseded_by IS NULL
-ORDER BY bm25(f.confirmed_memories_fts), c.id
+	AND c.retired_at = ''
+ORDER BY bm25(f.confirmed_memories_fts),
+	CASE WHEN c.owner_kind = ? AND c.owner_ref = ? AND c.owner_version = ? THEN 0 ELSE 1 END,
+	c.id
 LIMIT ?`,
-		matchQuery, owner.Kind, owner.Ref, owner.Version, repo, limit)
+		matchQuery, owner.Kind, owner.Ref, owner.Version, memoryOwnerKindShared, memorySharedOwnerRef, repo,
+		owner.Kind, owner.Ref, owner.Version, limit)
 	if err != nil {
 		return nil, fmt.Errorf("query confirmed memory vault links: %w", err)
 	}
@@ -1020,15 +1288,15 @@ func (s *Store) ListConfirmedMemories(ctx context.Context, ownerRef, repo string
 	var where []string
 	var args []any
 	if strings.TrimSpace(ownerRef) != "" {
-		where = append(where, "owner_ref = ?")
-		args = append(args, ownerRef)
+		where = append(where, "(owner_ref = ? OR author_ref = ?)")
+		args = append(args, ownerRef, ownerRef)
 	}
 	if strings.TrimSpace(repo) != "" {
 		where = append(where, "(repo = ? OR scope = 'general')")
 		args = append(args, repo)
 	}
 	query := `
-SELECT id, owner_kind, owner_ref, owner_version, repo, scope, key, content,
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
 	provenance, source_job, first_confirmed_at, updated_at
 FROM confirmed_memories`
 	if len(where) > 0 {
@@ -1062,15 +1330,15 @@ func (s *Store) ListMemoryObservations(ctx context.Context, ownerRef, repo strin
 	where := []string{"provenance NOT LIKE ? ESCAPE '\\'"}
 	args := []any{likePrefix(MemoryDistillWitnessProvenancePrefix)}
 	if strings.TrimSpace(ownerRef) != "" {
-		where = append(where, "owner_ref = ?")
-		args = append(args, ownerRef)
+		where = append(where, "(owner_ref = ? OR author_ref = ?)")
+		args = append(args, ownerRef, ownerRef)
 	}
 	if strings.TrimSpace(repo) != "" {
 		where = append(where, "(repo = ? OR scope = 'general')")
 		args = append(args, repo)
 	}
 	query := `
-SELECT id, owner_kind, owner_ref, owner_version, repo, scope, key, content,
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
 	provenance, trust_mark, source_job, created_at
 FROM memory_observations`
 	if len(where) > 0 {
@@ -1086,7 +1354,7 @@ FROM memory_observations`
 	for rows.Next() {
 		var o MemoryObservation
 		var repoNull sql.NullString
-		if err := rows.Scan(&o.ID, &o.Owner.Kind, &o.Owner.Ref, &o.Owner.Version, &repoNull,
+		if err := rows.Scan(&o.ID, &o.Owner.Kind, &o.Owner.Ref, &o.Owner.Version, &o.AuthorRef, &repoNull,
 			&o.Scope, &o.Key, &o.Content, &o.Provenance, &o.TrustMark, &o.SourceJob, &o.CreatedAt); err != nil {
 			return nil, err
 		}
@@ -1101,7 +1369,7 @@ func scanConfirmedMemories(rows *sql.Rows) ([]ConfirmedMemory, error) {
 	for rows.Next() {
 		var c ConfirmedMemory
 		var repoNull sql.NullString
-		if err := rows.Scan(&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &repoNull,
+		if err := rows.Scan(&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &c.AuthorRef, &repoNull,
 			&c.Scope, &c.Key, &c.Content, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
@@ -1137,20 +1405,26 @@ func (s *Store) ListMemoryObservationsWithConfirmation(ctx context.Context, owne
 	where := []string{"o.provenance NOT LIKE ? ESCAPE '\\'"}
 	args := []any{likePrefix(MemoryDistillWitnessProvenancePrefix)}
 	if strings.TrimSpace(ownerRef) != "" {
-		where = append(where, "o.owner_ref = ?")
-		args = append(args, ownerRef)
+		where = append(where, "(o.owner_ref = ? OR o.author_ref = ?)")
+		args = append(args, ownerRef, ownerRef)
 	}
 	if strings.TrimSpace(provenancePrefix) != "" {
 		where = append(where, "o.provenance LIKE ? ESCAPE '\\'")
 		args = append(args, likePrefix(provenancePrefix))
 	}
 	query := `
-SELECT o.id, o.owner_kind, o.owner_ref, o.owner_version, o.repo, o.scope, o.key,
+SELECT o.id, o.owner_kind, o.owner_ref, o.owner_version, o.author_ref, o.repo, o.scope, o.key,
 	o.content, o.provenance, o.trust_mark, o.source_job, o.created_at,
 	EXISTS(
 		SELECT 1 FROM confirmed_memories c
-		WHERE c.owner_kind = o.owner_kind AND c.owner_ref = o.owner_ref
-			AND c.owner_version = o.owner_version
+		WHERE ((
+				c.owner_kind = o.owner_kind AND c.owner_ref = o.owner_ref
+					AND c.owner_version = o.owner_version
+			) OR (
+				c.owner_kind = 'shared'
+					AND (CASE WHEN c.author_ref <> '' THEN c.author_ref ELSE c.owner_ref END) =
+						(CASE WHEN o.author_ref <> '' THEN o.author_ref ELSE o.owner_ref END)
+			))
 			AND ((o.repo IS NULL AND c.repo IS NULL) OR c.repo = o.repo)
 			AND c.key = o.key
 	) AS confirmed
@@ -1169,7 +1443,7 @@ FROM memory_observations o`
 		var o ObservationWithConfirmation
 		var repoNull sql.NullString
 		var confirmed int
-		if err := rows.Scan(&o.ID, &o.Owner.Kind, &o.Owner.Ref, &o.Owner.Version, &repoNull,
+		if err := rows.Scan(&o.ID, &o.Owner.Kind, &o.Owner.Ref, &o.Owner.Version, &o.AuthorRef, &repoNull,
 			&o.Scope, &o.Key, &o.Content, &o.Provenance, &o.TrustMark, &o.SourceJob, &o.CreatedAt, &confirmed); err != nil {
 			return nil, err
 		}
@@ -1189,11 +1463,11 @@ func (s *Store) GetMemoryObservationByID(ctx context.Context, id int64) (MemoryO
 	// `memory confirm <witness-id>` resolves to "no observation with id N" rather
 	// than promoting the fixed sentinel string into confirmed memory.
 	err := s.db.QueryRowContext(ctx, `
-SELECT id, owner_kind, owner_ref, owner_version, repo, scope, key, content,
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
 	provenance, trust_mark, source_job, created_at
 FROM memory_observations WHERE id = ? AND provenance NOT LIKE ? ESCAPE '\'`,
 		id, likePrefix(MemoryDistillWitnessProvenancePrefix)).Scan(
-		&o.ID, &o.Owner.Kind, &o.Owner.Ref, &o.Owner.Version, &repoNull,
+		&o.ID, &o.Owner.Kind, &o.Owner.Ref, &o.Owner.Version, &o.AuthorRef, &repoNull,
 		&o.Scope, &o.Key, &o.Content, &o.Provenance, &o.TrustMark, &o.SourceJob, &o.CreatedAt)
 	if err == sql.ErrNoRows {
 		return MemoryObservation{}, false, nil

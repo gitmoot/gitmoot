@@ -24,9 +24,13 @@ const (
 
 // Owner kind values. An agent owner is a registered persistent agent; a role
 // owner is an ephemeral role pool keyed by template identity (Phase 2+ writers).
+// The shared owner is a reserved, explicit human-curated pool that every agent
+// can read alongside its own private pool.
 const (
-	OwnerKindAgent = "agent"
-	OwnerKindRole  = "role"
+	OwnerKindAgent  = "agent"
+	OwnerKindRole   = "role"
+	OwnerKindShared = "shared"
+	SharedOwnerRef  = "shared"
 )
 
 // Trust marks recorded on an observation at birth. A learning derived from

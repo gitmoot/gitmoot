@@ -30,6 +30,7 @@ type VaultMemory struct {
 	OwnerKind    string
 	OwnerRef     string
 	OwnerVersion string
+	AuthorRef    string
 	Repo         string // "" == general scope
 	Scope        string
 	Key          string
@@ -111,6 +112,9 @@ func RenderVaultNote(m VaultMemory, links []VaultLink) string {
 	fields := make([]field, 0, 13)
 	if m.OwnerKind == OwnerKindAgent {
 		fields = append(fields, field{"agent", yamlScalar(m.OwnerRef)})
+	}
+	if strings.TrimSpace(m.AuthorRef) != "" {
+		fields = append(fields, field{"author", yamlScalar(m.AuthorRef)})
 	}
 	fields = append(fields,
 		field{"created_at", yamlScalar(m.CreatedAt)},

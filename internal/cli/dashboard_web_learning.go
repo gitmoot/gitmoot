@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -221,15 +223,22 @@ type witnessKey struct {
 // supersede "ghosts". The per-agent count and the on-graph fact-node count for that
 // agent therefore differ by its superseded rows — this is intentional.
 func (d *webDataSource) Knowledge(ctx context.Context) (dashboard.Knowledge, error) {
+	out, _, err := d.knowledgeWithShared(ctx)
+	return out, err
+}
+
+func (d *webDataSource) knowledgeWithShared(ctx context.Context) (dashboard.Knowledge, map[string]bool, error) {
 	out := dashboard.Knowledge{
 		Agents:   []dashboard.KnowledgeAgent{},
 		Facts:    []dashboard.KnowledgeFact{},
 		Clusters: []dashboard.KnowledgeCluster{},
 		Edges:    []dashboard.KnowledgeEdge{},
 	}
+	sharedByFact := map[string]bool{}
 	err := withStoreAndPaths(d.home, func(paths config.Paths, store *db.Store) error {
-		// Confirmed facts (INCLUDING superseded ghosts) owned by any agent.
-		rows, err := store.ListConfirmedMemoriesByOwnerKind(ctx, memory.OwnerKindAgent)
+		// Confirmed facts (INCLUDING superseded ghosts) owned by any agent, plus
+		// shared facts attributed to their preserved author.
+		rows, err := store.ListConfirmedMemoriesForKnowledge(ctx)
 		if err != nil {
 			return err
 		}
@@ -276,17 +285,21 @@ func (d *webDataSource) Knowledge(ctx context.Context) (dashboard.Knowledge, err
 		// empty and file-less provenance leaves SourceFile empty.
 		out.Facts = make([]dashboard.KnowledgeFact, 0, len(rows))
 		for _, r := range rows {
+			owner := knowledgeFactOwner(r)
 			fact := dashboard.KnowledgeFact{
 				ID:         idByRow[r.ID],
 				Content:    r.Content,
 				Repo:       strings.TrimSpace(r.Repo),
 				Key:        strings.TrimSpace(r.Key),
-				Owner:      strings.TrimSpace(r.Owner.Ref),
-				Witnesses:  witnessByKey[witnessKey{r.Owner.Ref, r.Repo, r.Key}],
+				Owner:      owner,
+				Witnesses:  witnessByKey[witnessKey{owner, r.Repo, r.Key}],
 				FirstSeen:  parseJobTimeMillis(r.FirstConfirmedAt),
 				LastSeen:   parseJobTimeMillis(r.UpdatedAt),
 				Superseded: r.SupersededBy != 0,
 				Links:      knowledgeFactLinks(ctx, store, r, idByRow),
+			}
+			if r.Owner.Kind == memory.OwnerKindShared && r.Owner.Ref == memory.SharedOwnerRef {
+				sharedByFact[fact.ID] = true
 			}
 			// Cluster: only when the membership resolves to a known cluster row, so a
 			// fact's Cluster never dangles past the emitted Clusters slice.
@@ -319,9 +332,57 @@ func (d *webDataSource) Knowledge(ctx context.Context) (dashboard.Knowledge, err
 		return nil
 	})
 	if err != nil {
-		return dashboard.Knowledge{}, err
+		return dashboard.Knowledge{}, nil, err
 	}
-	return out, nil
+	return out, sharedByFact, nil
+}
+
+func knowledgeFactOwner(r db.ConfirmedMemory) string {
+	if author := strings.TrimSpace(r.AuthorRef); author != "" {
+		return author
+	}
+	return strings.TrimSpace(r.Owner.Ref)
+}
+
+type dashboardKnowledgeResponse struct {
+	Agents   []dashboard.KnowledgeAgent   `json:"agents"`
+	Facts    []dashboardKnowledgeFact     `json:"facts"`
+	Clusters []dashboard.KnowledgeCluster `json:"clusters"`
+	Edges    []dashboard.KnowledgeEdge    `json:"edges"`
+}
+
+type dashboardKnowledgeFact struct {
+	dashboard.KnowledgeFact
+	Shared bool `json:"shared,omitempty"`
+}
+
+func (d *webDataSource) handleLearningKnowledge(w http.ResponseWriter, r *http.Request) {
+	k, sharedByFact, err := d.knowledgeWithShared(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	resp := dashboardKnowledgeResponse{
+		Agents:   k.Agents,
+		Facts:    make([]dashboardKnowledgeFact, 0, len(k.Facts)),
+		Clusters: k.Clusters,
+		Edges:    k.Edges,
+	}
+	for _, f := range k.Facts {
+		resp.Facts = append(resp.Facts, dashboardKnowledgeFact{
+			KnowledgeFact: f,
+			Shared:        sharedByFact[f.ID],
+		})
+	}
+	buf, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		http.Error(w, "internal error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	buf = append(buf, '\n')
+	_, _ = w.Write(buf)
 }
 
 // factSourceFileMarkers are the Provenance prefixes the file-ingest write paths
