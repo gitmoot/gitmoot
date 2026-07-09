@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -549,6 +550,76 @@ func TestAdvancerIdempotentRescan(t *testing.T) {
 	}
 	if got := stageRow(t, store, run.ID, "b").JobID; got != bJob {
 		t.Fatalf("re-scan changed stage b job id: before=%q after=%q", bJob, got)
+	}
+}
+
+// TestPipelineStageSettleOutcomeDefaultMatchesFold pins the settle-predicate seam
+// (stageSettleOutcome) for today's kinds: (1) a non-terminal stage job is NOT
+// settled, so the FOLD pass leaves it in flight; (2) once the job settles, the seam
+// reports settled AND returns EXACTLY what foldPipelineStageOutcome returns for the
+// same job — for a shell stage AND a read-only agent stage, across a success and a
+// blocked/needs decision. This is the byte-identity contract a future gate/orchestrate
+// kind must not disturb for existing kinds.
+func TestPipelineStageSettleOutcomeDefaultMatchesFold(t *testing.T) {
+	const settleSpec = `name: settle
+repo: owner/repo
+stages:
+  - id: sh
+    cmd: echo hi
+  - id: ag
+    agent: asker
+    prompt: What changed?
+`
+	store := pipelineAdvanceStore(t)
+	enqueue := testStageEnqueuer(store)
+	rec, spec := newTestPipeline(t, store, "settle", settleSpec)
+	now := time.Date(2026, 7, 8, 9, 0, 0, 0, time.UTC)
+	run := startTestRun(t, store, rec, spec, enqueue, now)
+	ctx := context.Background()
+
+	specByID := make(map[string]pipeline.Stage, len(spec.Stages))
+	for _, s := range spec.Stages {
+		specByID[s.ID] = s
+	}
+
+	cases := []struct {
+		stageID, decision, summary string
+		needs                      []string
+	}{
+		{"sh", "approved", "shell landed", nil},
+		{"ag", "blocked", "needs a hint", []string{"which module?"}},
+	}
+	for _, tc := range cases {
+		row := stageRow(t, store, run.ID, tc.stageID)
+		if row.JobID == "" {
+			t.Fatalf("%s: stage not enqueued (job id empty)", tc.stageID)
+		}
+		stage := specByID[tc.stageID]
+
+		// (1) Before settling, the job is queued/running: the seam reports unsettled,
+		// matching the inline IsSettledJobState guard the FOLD pass used to run.
+		pending, err := store.GetJob(ctx, row.JobID)
+		if err != nil {
+			t.Fatalf("GetJob(%s): %v", tc.stageID, err)
+		}
+		if settled, _, _, _ := stageSettleOutcome(ctx, pipelineStageSettleDeps{}, spec, stage, row, pending); settled {
+			t.Fatalf("%s: seam settled a non-terminal job (state=%q)", tc.stageID, pending.State)
+		}
+
+		// (2) After settling, the seam must settle and return the identical fold.
+		settleStageJob(t, store, row.JobID, tc.decision, tc.summary, tc.needs)
+		job, err := store.GetJob(ctx, row.JobID)
+		if err != nil {
+			t.Fatalf("GetJob(%s) after settle: %v", tc.stageID, err)
+		}
+		wantState, wantSummary, wantNeeds := foldPipelineStageOutcome(spec.EffectiveSuccessDecisions(stage), job)
+		settled, gotState, gotSummary, gotNeeds := stageSettleOutcome(ctx, pipelineStageSettleDeps{}, spec, stage, row, job)
+		if !settled {
+			t.Fatalf("%s: seam did not settle a terminal job (state=%q)", tc.stageID, job.State)
+		}
+		if gotState != wantState || gotSummary != wantSummary || !reflect.DeepEqual(gotNeeds, wantNeeds) {
+			t.Fatalf("%s: seam (%q,%q,%v) != fold (%q,%q,%v)", tc.stageID, gotState, gotSummary, gotNeeds, wantState, wantSummary, wantNeeds)
+		}
 	}
 }
 

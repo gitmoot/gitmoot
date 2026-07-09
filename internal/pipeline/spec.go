@@ -102,6 +102,58 @@ type Stage struct {
 	SuccessDecisions []string `yaml:"success_decisions,omitempty"`
 }
 
+// StageKind classifies a stage by its declared fields. It is the SINGLE place a
+// stage's kind is decided: validation dispatches its per-kind rules on it
+// (validateStageExecutor) and the advancer's fold/settle pass dispatches the
+// per-kind settle predicate on it (stageSettleOutcome). Adding a future kind —
+// mutating implement (#768), an external gate (#768 Phase 2), or an orchestrate
+// sub-tree (#758) — is an APPEND here plus a new case at each dispatch point,
+// never an edit to an existing case.
+type StageKind int
+
+const (
+	// StageKindUnknown is the zero value: a structurally malformed stage (neither
+	// or both executors set, or an agent stage with an unrecognized action). A
+	// validated spec never yields it — Validate rejects such stages first.
+	StageKindUnknown StageKind = iota
+	// StageKindShell is a shell stage: Cmd set, Agent empty. Runs `sh -c` and folds
+	// by its gitmoot_result decision.
+	StageKindShell
+	// StageKindAgentAsk is a read-only agent stage (#757) running the "ask" verb
+	// (the default when action is unset). A leaf: reads + decides, never mutates or
+	// fans out.
+	StageKindAgentAsk
+	// StageKindAgentReview is a read-only agent stage (#757) running the "review"
+	// verb. Same leaf contract as ask; kept distinct so a future kind is appended as
+	// a sibling case rather than by editing a shared agent branch.
+	StageKindAgentReview
+)
+
+// Kind classifies the stage. A shell stage (Cmd set) is StageKindShell; an agent
+// stage (Agent set) is StageKindAgentAsk / StageKindAgentReview by its action (an
+// empty action defaults to ask, matching normalize()). Anything else — both
+// executors set, neither set, or an unrecognized agent action such as
+// "implement" — is StageKindUnknown, which Validate rejects. This method performs
+// NO validation; it only names the shape. Callers must have validated first, or be
+// validateStageExecutor itself, which classifies AFTER its shared exactly-one-of
+// guard so that here exactly one executor is set.
+func (s Stage) Kind() StageKind {
+	switch {
+	case s.Cmd != "" && s.Agent != "":
+		return StageKindUnknown
+	case s.Cmd != "":
+		return StageKindShell
+	case s.Agent != "":
+		switch s.Action {
+		case "", DefaultAgentStageAction: // "" defaults to ask (see normalize)
+			return StageKindAgentAsk
+		case "review":
+			return StageKindAgentReview
+		}
+	}
+	return StageKindUnknown
+}
+
 // Load parses raw YAML into a Spec, normalizes it, and validates it. Unknown
 // fields are rejected (KnownFields) so a typo'd key surfaces as an error at
 // `pipeline add` time rather than being silently ignored. The returned Spec is

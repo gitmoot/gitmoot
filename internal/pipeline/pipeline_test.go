@@ -210,6 +210,66 @@ func TestLoadValidationErrors(t *testing.T) {
 	}
 }
 
+// TestStageKind pins Stage.Kind() over every current stage shape — the SINGLE
+// place a stage kind is decided. It covers the well-formed kinds (shell, agent
+// ask via explicit + defaulted action, agent review) and the malformed shapes that
+// classify as StageKindUnknown (both executors, neither, an unrecognized/implement
+// action). A future kind adds rows here; existing rows must not change.
+func TestPipelineStageKind(t *testing.T) {
+	cases := []struct {
+		name  string
+		stage Stage
+		want  StageKind
+	}{
+		{"shell", Stage{ID: "a", Cmd: "echo hi"}, StageKindShell},
+		{"agent ask explicit", Stage{ID: "a", Agent: "asker", Prompt: "q", Action: "ask"}, StageKindAgentAsk},
+		{"agent ask defaulted", Stage{ID: "a", Agent: "asker", Prompt: "q", Action: DefaultAgentStageAction}, StageKindAgentAsk},
+		{"agent ask empty action", Stage{ID: "a", Agent: "asker", Prompt: "q"}, StageKindAgentAsk},
+		{"agent review", Stage{ID: "a", Agent: "rev", Prompt: "q", Action: "review"}, StageKindAgentReview},
+		{"both executors", Stage{ID: "a", Cmd: "echo", Agent: "rev", Prompt: "q"}, StageKindUnknown},
+		{"neither executor", Stage{ID: "a"}, StageKindUnknown},
+		{"agent implement", Stage{ID: "a", Agent: "impl", Prompt: "q", Action: "implement"}, StageKindUnknown},
+		{"agent bad action", Stage{ID: "a", Agent: "x", Prompt: "q", Action: "deploy"}, StageKindUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.stage.Kind(); got != tc.want {
+				t.Fatalf("Kind() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStageKindMatchesLoadedSpec cross-checks Kind() against real normalized specs
+// loaded through Load (so the defaulted-action path — normalize() setting a blank
+// agent action to "ask" — is exercised end to end, matching what the advancer sees).
+func TestPipelineStageKindMatchesLoadedSpec(t *testing.T) {
+	const spec = `name: kinds
+stages:
+  - id: build
+    cmd: make build
+  - id: ask
+    agent: asker
+    prompt: What changed?
+    needs: [build]
+  - id: review
+    agent: reviewer
+    prompt: Review it.
+    action: review
+    needs: [build]
+`
+	loaded, err := Load([]byte(spec))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []StageKind{StageKindShell, StageKindAgentAsk, StageKindAgentReview}
+	for i, stage := range loaded.Stages {
+		if got := stage.Kind(); got != want[i] {
+			t.Fatalf("stage %q Kind() = %d, want %d", stage.ID, got, want[i])
+		}
+	}
+}
+
 func TestHashDeterministicAndSensitive(t *testing.T) {
 	a := []byte("name: p\nstages:\n  - {id: a, cmd: echo}\n")
 	b := []byte("name: p\nstages:\n  - {id: a, cmd: echo}\n")

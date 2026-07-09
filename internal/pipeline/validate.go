@@ -198,36 +198,60 @@ func (s Spec) detectCycle() error {
 func validateStageExecutor(pipelineName string, stage Stage) error {
 	hasCmd := stage.Cmd != ""
 	hasAgent := stage.Agent != ""
+	// The exactly-one-of cmd|agent guard is shared across kinds: it must run before
+	// Stage.Kind() (which is only meaningful once exactly one executor is set).
 	switch {
 	case hasCmd && hasAgent:
 		return fmt.Errorf("pipeline %q stage %q sets both cmd and agent; a stage is exactly one of a shell cmd or an agent", pipelineName, stage.ID)
 	case !hasCmd && !hasAgent:
 		return fmt.Errorf("pipeline %q stage %q has neither cmd nor agent; a stage needs exactly one", pipelineName, stage.ID)
-	case hasCmd:
-		// A shell stage carries no agent-only fields; a stray prompt/action is a
-		// mis-declared stage (very likely a forgotten agent: key), so reject it.
-		if stage.Prompt != "" {
-			return fmt.Errorf("pipeline %q stage %q sets prompt but is a shell (cmd) stage; prompt is only for agent stages", pipelineName, stage.ID)
-		}
-		if stage.Action != "" {
-			return fmt.Errorf("pipeline %q stage %q sets action but is a shell (cmd) stage; action is only for agent stages", pipelineName, stage.ID)
-		}
-		return nil
-	default: // hasAgent
-		if !validToken(stage.Agent) {
-			return fmt.Errorf("pipeline %q stage %q agent %q must be a name-safe token (letters, digits, '-', '_')", pipelineName, stage.ID, stage.Agent)
-		}
-		if stage.Prompt == "" {
-			return fmt.Errorf("pipeline %q stage %q agent stage requires a non-empty prompt", pipelineName, stage.ID)
-		}
-		if stage.Action == "implement" {
-			return fmt.Errorf("pipeline %q stage %q agent stage action %q is not allowed; an agent stage is a read-only leaf (use one of: %s)", pipelineName, stage.ID, stage.Action, strings.Join(AgentStageActionCandidates, ", "))
-		}
-		if !containsToken(AgentStageActionCandidates, stage.Action) {
-			return fmt.Errorf("pipeline %q stage %q agent stage action %q is invalid; use one of: %s", pipelineName, stage.ID, stage.Action, strings.Join(AgentStageActionCandidates, ", "))
-		}
-		return nil
 	}
+	// Exactly one executor is set; dispatch the per-kind rules by Stage.Kind(). A
+	// NEW stage kind (implement/gate/orchestrate) adds a case here — it never edits
+	// another kind's validator.
+	switch stage.Kind() {
+	case StageKindShell:
+		return validateShellStage(pipelineName, stage)
+	case StageKindAgentAsk, StageKindAgentReview:
+		return validateAgentStage(pipelineName, stage)
+	default:
+		// StageKindUnknown past the exactly-one-of guard = an agent stage (Agent
+		// set, Cmd empty) with an unrecognized action; validateAgentStage produces
+		// the #757 read-only-leaf rejection (implement) or the invalid-action error.
+		return validateAgentStage(pipelineName, stage)
+	}
+}
+
+// validateShellStage validates a shell (cmd) stage: it carries no agent-only
+// fields, so a stray prompt/action is a mis-declared stage (very likely a
+// forgotten agent: key). Byte-identical to the pre-refactor shell branch.
+func validateShellStage(pipelineName string, stage Stage) error {
+	if stage.Prompt != "" {
+		return fmt.Errorf("pipeline %q stage %q sets prompt but is a shell (cmd) stage; prompt is only for agent stages", pipelineName, stage.ID)
+	}
+	if stage.Action != "" {
+		return fmt.Errorf("pipeline %q stage %q sets action but is a shell (cmd) stage; action is only for agent stages", pipelineName, stage.ID)
+	}
+	return nil
+}
+
+// validateAgentStage validates a read-only agent stage (#757): a name-safe agent
+// token, a non-empty prompt, and an ask/review action ("implement" is rejected as
+// a non-leaf verb). Byte-identical to the pre-refactor agent branch.
+func validateAgentStage(pipelineName string, stage Stage) error {
+	if !validToken(stage.Agent) {
+		return fmt.Errorf("pipeline %q stage %q agent %q must be a name-safe token (letters, digits, '-', '_')", pipelineName, stage.ID, stage.Agent)
+	}
+	if stage.Prompt == "" {
+		return fmt.Errorf("pipeline %q stage %q agent stage requires a non-empty prompt", pipelineName, stage.ID)
+	}
+	if stage.Action == "implement" {
+		return fmt.Errorf("pipeline %q stage %q agent stage action %q is not allowed; an agent stage is a read-only leaf (use one of: %s)", pipelineName, stage.ID, stage.Action, strings.Join(AgentStageActionCandidates, ", "))
+	}
+	if !containsToken(AgentStageActionCandidates, stage.Action) {
+		return fmt.Errorf("pipeline %q stage %q agent stage action %q is invalid; use one of: %s", pipelineName, stage.ID, stage.Action, strings.Join(AgentStageActionCandidates, ", "))
+	}
+	return nil
 }
 
 func containsToken(candidates []string, value string) bool {

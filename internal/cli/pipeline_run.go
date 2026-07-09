@@ -514,7 +514,9 @@ func advancePipelineRun(ctx context.Context, store *db.Store, enqueue pipelineSt
 		if err != nil {
 			return run, err
 		}
-		if !workflow.IsSettledJobState(job.State) {
+		deps := pipelineStageSettleDeps{store: store, rec: rec, run: run, now: now}
+		settled, state, summary, needs := stageSettleOutcome(ctx, deps, spec, stage, row, job)
+		if !settled {
 			// Not terminal yet: reflect a queued->running transition so the funnel
 			// tracks the live job, but otherwise leave it in flight.
 			if job.State == string(workflow.JobRunning) && row.State == pipeline.StageQueued {
@@ -526,7 +528,6 @@ func advancePipelineRun(ctx context.Context, store *db.Store, enqueue pipelineSt
 			}
 			continue
 		}
-		state, summary, needs := foldPipelineStageOutcome(spec.EffectiveSuccessDecisions(stage), job)
 		if state == pipeline.StageFailed && row.Attempt < stage.Retry {
 			// Retry budget remains: bump the attempt and reset to pending so the
 			// enqueue phase re-launches it under a fresh deterministic id/fingerprint.
@@ -660,6 +661,62 @@ func applyPipelineRunSettlement(ctx context.Context, store *db.Store, rec db.Pip
 		return run, err
 	}
 	return updated, nil
+}
+
+// pipelineStageSettleDeps carries the ambient capabilities the per-kind settle
+// predicate (stageSettleOutcome) may need. Today's kinds (shell, agent ask/review)
+// use only the already-loaded job, so every field goes unread — they are threaded
+// now so a future kind is a NEW case in the seam, NOT a widening of the advancer
+// signature or a re-plumb of the FOLD pass. Everything here is already in scope in
+// advancePipelineRun. What the deferred kinds want:
+//   - StageKindGate (#768 Phase 2): a gate has no job/worker; it settles when an
+//     external predicate holds (e.g. pr_merged on an upstream implement stage's
+//     PR). That reads the managed repo (rec) and upstream stage rows via store, and
+//     bounds the wait against the stage timeout using now. GitHub access would be
+//     threaded into this struct then (a client/poller field), not into the caller.
+//   - StageKindOrchestrate (#758): the stage job is a sub-tree root; it settles by
+//     walking the deterministic <jobID>/continuation chain (via store) to its
+//     terminal tail. ctx bounds those store reads.
+type pipelineStageSettleDeps struct {
+	store *db.Store
+	rec   db.Pipeline
+	run   db.PipelineRun
+	now   time.Time
+}
+
+// stageSettleOutcome is the per-stage-kind SETTLE PREDICATE seam. Given a stage
+// whose current job row has been loaded, it reports whether the stage has SETTLED
+// into a foldable outcome and, if so, the folded (state, summary, needs). It is the
+// single dispatch point the FOLD pass consults instead of inlining "is the stage
+// job terminal => foldPipelineStageOutcome"; a new stage kind adds a case here and
+// never edits the shared advancer. This is exactly the generalization #768 Phase 2
+// (gate: pr_merged) and #758 (orchestrate: continuation-chain-terminal) both build
+// on.
+//
+// Today every kind settles identically — a shell or read-only agent (#757) stage
+// settles the instant its job reaches a terminal state, folding by decision via
+// foldPipelineStageOutcome — so the default case reproduces the pre-seam inline
+// behavior BYTE-IDENTICALLY: `settled` is true exactly when the job is terminal,
+// and the folded outcome is identical. The unsettled path (the queued->running
+// funnel reflect) stays in the advancer, unchanged. Future kinds branch here on
+// stage.Kind() using deps (see pipelineStageSettleDeps).
+func stageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec pipeline.Spec, stage pipeline.Stage, stageRow db.PipelineRunStage, job db.Job) (settled bool, state, summary string, needs []string) {
+	switch stage.Kind() {
+	// A future kind adds its case here, e.g.:
+	//   case pipeline.StageKindGate:
+	//       return gateStageSettleOutcome(ctx, deps, spec, stage, stageRow)
+	//   case pipeline.StageKindOrchestrate:
+	//       return orchestrateStageSettleOutcome(ctx, deps, spec, stage, stageRow, job)
+	default:
+		// StageKindShell, StageKindAgentAsk, StageKindAgentReview (and the
+		// never-validated StageKindUnknown): settle on the stage job reaching a
+		// terminal state; fold by decision. Byte-identical to the pre-seam inline.
+		if !workflow.IsSettledJobState(job.State) {
+			return false, "", "", nil
+		}
+		state, summary, needs = foldPipelineStageOutcome(spec.EffectiveSuccessDecisions(stage), job)
+		return true, state, summary, needs
+	}
 }
 
 // foldPipelineStageOutcome maps a settled stage job to a stage outcome BY DECISION
