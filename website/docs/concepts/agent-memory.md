@@ -108,12 +108,18 @@ All of the following are read-only:
 
 ```sh
 gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo]
+gitmoot memory recall "<query>" [--repo owner/repo] [--agent NAME] [--limit N]
 gitmoot memory replay [--agent NAME] [--repo owner/repo] [--limit N]
 gitmoot memory eval --fixtures fixtures.json [--k N]
 ```
 
-`memory list` shows confirmed memories and pending observations. `memory replay`
-is an offline A/B: it re-renders recent real jobs' prompts with and without the
+`memory list` shows confirmed memories and pending observations. `memory recall`
+is an on-demand relevance search over confirmed memory. It uses the same
+FTS5/BM25 retrieval as prompt injection, searches all agent pools by default,
+and can narrow to one pool with `--agent NAME`. Without `--repo`, recall
+searches every repo and general-scope facts. `--repo owner/repo` narrows
+repo-scoped facts to that repo while still including general-scope facts.
+`memory replay` is an offline A/B: it re-renders recent real jobs' prompts with and without the
 learnings block and reports the injection delta (added tokens, entries injected)
 — it measures injection *mechanics*, not outcome quality. `memory eval` computes
 recall/precision@K of retrieval over a labeled fixtures file.

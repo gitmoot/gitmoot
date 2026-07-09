@@ -1339,6 +1339,7 @@ gate:
 
 ```sh
 gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo] [--json]
+gitmoot memory recall "<query>" [--repo owner/repo] [--agent NAME] [--limit N] [--json]
 gitmoot memory replay [--agent NAME] [--repo owner/repo] [--limit N] [--json]
 gitmoot memory eval --fixtures fixtures.json [--k N] [--json]
 gitmoot memory vault export [--out DIR] [--agent NAME] [--force] [--json]
@@ -1355,7 +1356,13 @@ gitmoot memory cluster rename <cluster-id> <label>
 ```
 
 `memory list` shows confirmed memories and/or pending observations. `memory
-replay` re-renders recent real jobs' prompts with and without the injected
+recall` runs the same FTS5/BM25 confirmed-memory retrieval used for prompt
+injection and prints the matching facts in injection bullet format. Without
+`--agent`, recall searches all agent owner pools; pass `--agent NAME` to inspect
+one pool. Without `--repo`, recall searches every repo and general-scope facts.
+`--repo owner/repo` narrows repo-scoped facts to that repo while still including
+general-scope facts. `--json` returns raw rows for scripts. `memory replay`
+re-renders recent real jobs' prompts with and without the injected
 learnings block and reports the token/entry delta. `memory eval` computes
 recall/precision@K of retrieval over a labeled `{agent, repo, instructions,
 expected_keys}` fixtures file.

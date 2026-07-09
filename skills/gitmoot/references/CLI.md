@@ -1614,6 +1614,7 @@ Inspect and measure the store (all read-only):
 
 ```sh
 gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo] [--json]
+gitmoot memory recall "<query>" [--repo owner/repo] [--agent NAME] [--limit N] [--json]
 gitmoot memory replay [--agent NAME] [--repo owner/repo] [--limit N] [--json]
 gitmoot memory eval --fixtures fixtures.json [--k N] [--json]
 gitmoot memory vault export [--out DIR] [--agent NAME] [--force] [--json]
@@ -1621,7 +1622,13 @@ gitmoot memory vault import <DIR> [--dry-run|--yes] [--json]
 ```
 
 `memory list` shows confirmed memories and/or pending observations. `memory
-replay` is an offline A/B: it re-renders recent real jobs' prompts with and
+recall` runs the same FTS5/BM25 confirmed-memory retrieval used for prompt
+injection and prints the matching facts in injection bullet format. Without
+`--agent`, recall searches all agent owner pools; pass `--agent NAME` to inspect
+one pool. Without `--repo`, recall searches every repo and general-scope facts.
+`--repo owner/repo` narrows repo-scoped facts to that repo while still including
+general-scope facts. `--json` returns raw rows for scripts. `memory replay` is an offline A/B:
+it re-renders recent real jobs' prompts with and
 without the learnings block and reports the injection delta (added tokens,
 entries injected) — it measures injection *mechanics*, not outcome quality
 (running real agents twice is a later-phase gate). `memory eval` computes

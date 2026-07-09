@@ -87,6 +87,14 @@ func ownerForJob(agent runtime.Agent, _ JobPayload) db.MemoryOwner {
 	return db.MemoryOwner{Kind: memory.OwnerKindAgent, Ref: agent.Name}
 }
 
+// BuildMemoryMatchQuery returns the sanitized FTS5 MATCH query used by the
+// memory read path. Callers outside workflow use this instead of reaching for
+// memory.SanitizeFTSQuery directly so recall surfaces and prompt injection stay
+// byte-for-byte aligned.
+func BuildMemoryMatchQuery(instructions string) string {
+	return memory.SanitizeFTSQuery(instructions)
+}
+
 // injectBlock is the READ path (job-prompt assembly). It builds a SANITIZED FTS
 // query from the job instructions (never raw text into MATCH), runs the tiered
 // confirmed-only retrieval, applies the token budget, and returns the rendered
@@ -114,7 +122,7 @@ func (c *MemoryController) retrieve(ctx context.Context, owner db.MemoryOwner, r
 	if c == nil || c.Store == nil {
 		return nil
 	}
-	query := memory.SanitizeFTSQuery(instructions)
+	query := BuildMemoryMatchQuery(instructions)
 	if query == "" {
 		return nil
 	}

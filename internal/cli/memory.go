@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
@@ -28,6 +29,8 @@ func runMemory(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "list":
 		return runMemoryList(args[1:], stdout, stderr)
+	case "recall":
+		return runMemoryRecall(args[1:], stdout, stderr)
 	case "replay":
 		return runMemoryReplay(args[1:], stdout, stderr)
 	case "eval":
@@ -62,6 +65,7 @@ func printMemoryUsage(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo R] [--json]")
+	fmt.Fprintln(w, "  gitmoot memory recall \"<query>\" [--repo R] [--agent NAME] [--limit N] [--json]")
 	fmt.Fprintln(w, "  gitmoot memory replay [--agent NAME] [--repo R] [--limit N] [--json]")
 	fmt.Fprintln(w, "  gitmoot memory eval --fixtures FILE [--k N] [--json]")
 	fmt.Fprintln(w, "  gitmoot memory vault export [--out DIR] [--agent NAME] [--json]")
@@ -74,6 +78,7 @@ func printMemoryUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot memory cluster rename <cluster-id> <label>")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "  list          show stored memories (confirmed and/or pending observations)")
+	fmt.Fprintln(w, "  recall        retrieve ranked confirmed memories; defaults to all agent pools")
 	fmt.Fprintln(w, "  replay        offline A/B: render recent real jobs' prompts with vs without the")
 	fmt.Fprintln(w, "                learnings block and report the injection delta (tokens, entries)")
 	fmt.Fprintln(w, "  eval          recall/precision@K of retrieval over a labeled fixtures file")
@@ -84,6 +89,150 @@ func printMemoryUsage(w io.Writer) {
 	fmt.Fprintln(w, "  groom         deterministically propose stale-memory retirements, apply on confirmation")
 	fmt.Fprintln(w, "  clusters      list emergent memory clusters; recompute them via a propose/apply plan")
 	fmt.Fprintln(w, "  cluster       rename a cluster (owner label override)")
+}
+
+// ---- memory recall --------------------------------------------------------
+
+type memoryRecallOwner struct {
+	Kind    string `json:"kind"`
+	Ref     string `json:"ref"`
+	Version string `json:"version,omitempty"`
+}
+
+type memoryRecallEntry struct {
+	ID         int64             `json:"id"`
+	Owner      memoryRecallOwner `json:"owner"`
+	Repo       string            `json:"repo"`
+	Scope      string            `json:"scope"`
+	Key        string            `json:"key"`
+	Content    string            `json:"content"`
+	Provenance string            `json:"provenance"`
+	UpdatedAt  string            `json:"updated_at"`
+}
+
+func runMemoryRecall(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("memory recall", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	agent := fs.String("agent", "", "filter to one agent owner pool; default searches all agent pools")
+	repo := fs.String("repo", "", "filter by repo (owner/repo); omitted searches all repos")
+	limit := fs.Int("limit", 15, "maximum number of matching memories to return")
+	jsonOut := fs.Bool("json", false, "print as JSON")
+	queryText, err := parseMemoryRecallArgs(fs, args)
+	if err != nil {
+		return memoryFlagExit(err)
+	}
+	if strings.TrimSpace(queryText) == "" {
+		fmt.Fprintln(stderr, "usage: gitmoot memory recall \"<query>\" [--repo owner/repo] [--agent NAME] [--limit N] [--json]")
+		return 2
+	}
+	query := workflow.BuildMemoryMatchQuery(queryText)
+
+	var rows []db.ConfirmedMemory
+	err = withReadOnlyStore(*home, func(store *db.Store) error {
+		var err error
+		ctx := context.Background()
+		if strings.TrimSpace(*agent) != "" {
+			owner := db.MemoryOwner{Kind: memory.OwnerKindAgent, Ref: strings.TrimSpace(*agent)}
+			if strings.TrimSpace(*repo) != "" {
+				rows, err = store.QueryConfirmedMemories(ctx, owner, strings.TrimSpace(*repo), query, *limit)
+			} else {
+				rows, err = store.QueryConfirmedMemoriesForOwnerAllRepos(ctx, owner, query, *limit)
+			}
+		} else {
+			rows, err = store.QueryConfirmedMemoriesForAllAgents(ctx, strings.TrimSpace(*repo), query, *limit)
+		}
+		return err
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "memory recall: %v\n", err)
+		return 1
+	}
+
+	if *jsonOut {
+		entries := make([]memoryRecallEntry, 0, len(rows))
+		for _, r := range rows {
+			entries = append(entries, memoryRecallJSONEntry(r))
+		}
+		if err := writeJSON(stdout, entries); err != nil {
+			fmt.Fprintf(stderr, "memory recall: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	if len(rows) == 0 {
+		fmt.Fprintln(stdout, "no matches")
+		return 0
+	}
+	for _, r := range rows {
+		fmt.Fprintf(stdout, "%s repo=%s scope=%s owner=%s:%s\n",
+			r.Key, memoryRecallDisplayRepo(r), r.Scope, r.Owner.Kind, r.Owner.Ref)
+		fmt.Fprintln(stdout, memory.RenderBullet(memory.Entry{
+			Scope:     r.Scope,
+			Key:       r.Key,
+			Content:   r.Content,
+			UpdatedAt: r.UpdatedAt,
+		}))
+	}
+	return 0
+}
+
+func parseMemoryRecallArgs(fs *flag.FlagSet, args []string) (string, error) {
+	var flagArgs []string
+	var queryParts []string
+	flagsWithValues := map[string]bool{
+		"-home": true, "--home": true,
+		"-agent": true, "--agent": true,
+		"-repo": true, "--repo": true,
+		"-limit": true, "--limit": true,
+	}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			queryParts = append(queryParts, args[i+1:]...)
+			break
+		}
+		if strings.HasPrefix(arg, "-") && arg != "-" {
+			flagArgs = append(flagArgs, arg)
+			if strings.Contains(arg, "=") {
+				continue
+			}
+			if flagsWithValues[arg] && i+1 < len(args) {
+				i++
+				flagArgs = append(flagArgs, args[i])
+			}
+			continue
+		}
+		queryParts = append(queryParts, arg)
+	}
+	if err := fs.Parse(flagArgs); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(strings.Join(queryParts, " ")), nil
+}
+
+func memoryRecallJSONEntry(r db.ConfirmedMemory) memoryRecallEntry {
+	return memoryRecallEntry{
+		ID: r.ID,
+		Owner: memoryRecallOwner{
+			Kind:    r.Owner.Kind,
+			Ref:     r.Owner.Ref,
+			Version: r.Owner.Version,
+		},
+		Repo:       r.Repo,
+		Scope:      r.Scope,
+		Key:        r.Key,
+		Content:    r.Content,
+		Provenance: r.Provenance,
+		UpdatedAt:  r.UpdatedAt,
+	}
+}
+
+func memoryRecallDisplayRepo(r db.ConfirmedMemory) string {
+	if strings.TrimSpace(r.Repo) != "" {
+		return r.Repo
+	}
+	return "(general)"
 }
 
 // ---- memory list ----------------------------------------------------------

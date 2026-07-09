@@ -618,6 +618,74 @@ LIMIT ?`,
 	return scanConfirmedMemories(rows)
 }
 
+// QueryConfirmedMemoriesForOwnerAllRepos is the recall variant for a single
+// agent pool when the caller does not provide a repo filter. It keeps the same
+// confirmed-only, active-row, FTS5/BM25 ranking as QueryConfirmedMemories, but
+// intentionally does not apply the repo/general visibility clause.
+func (s *Store) QueryConfirmedMemoriesForOwnerAllRepos(ctx context.Context, owner MemoryOwner, matchQuery string, limit int) ([]ConfirmedMemory, error) {
+	if strings.TrimSpace(matchQuery) == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 15
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.repo, c.scope, c.key, c.content,
+	c.provenance, c.source_job, c.first_confirmed_at, c.updated_at
+FROM confirmed_memories_fts f
+JOIN confirmed_memories c ON c.id = f.rowid
+WHERE f.confirmed_memories_fts MATCH ?
+	AND c.owner_kind = ? AND c.owner_ref = ? AND c.owner_version = ?
+	AND c.superseded_by IS NULL
+	AND c.retired_at = ''
+ORDER BY bm25(f.confirmed_memories_fts), c.updated_at DESC
+LIMIT ?`,
+		matchQuery, owner.Kind, owner.Ref, owner.Version, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query confirmed memories for owner all repos: %w", err)
+	}
+	defer rows.Close()
+	return scanConfirmedMemories(rows)
+}
+
+// QueryConfirmedMemoriesForAllAgents is the read-only recall path for sessions
+// that are not running as a specific Gitmoot agent. It uses the same FTS5/BM25
+// ranking as QueryConfirmedMemories, but searches every agent owner pool instead
+// of one owner_ref. A non-empty repo applies the same repo/general visibility
+// filter as injection; an empty repo searches every repo and general facts. Role
+// pools remain excluded.
+func (s *Store) QueryConfirmedMemoriesForAllAgents(ctx context.Context, repo, matchQuery string, limit int) ([]ConfirmedMemory, error) {
+	if strings.TrimSpace(matchQuery) == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 15
+	}
+	query := `
+SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.repo, c.scope, c.key, c.content,
+	c.provenance, c.source_job, c.first_confirmed_at, c.updated_at
+FROM confirmed_memories_fts f
+JOIN confirmed_memories c ON c.id = f.rowid
+WHERE f.confirmed_memories_fts MATCH ?
+	AND c.owner_kind = 'agent'
+	AND c.superseded_by IS NULL
+	AND c.retired_at = ''
+ORDER BY bm25(f.confirmed_memories_fts), c.updated_at DESC
+LIMIT ?`
+	args := []any{matchQuery}
+	if strings.TrimSpace(repo) != "" {
+		query = strings.Replace(query, "\n\tAND c.superseded_by IS NULL", "\n\tAND (c.scope = 'general' OR c.repo = ?)\n\tAND c.superseded_by IS NULL", 1)
+		args = append(args, strings.TrimSpace(repo))
+	}
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query confirmed memories for all agents: %w", err)
+	}
+	defer rows.Close()
+	return scanConfirmedMemories(rows)
+}
+
 // ListConfirmedMemoriesForVault returns every NON-superseded confirmed row for
 // the deterministic `memory vault export` (#737 P1), across all owner kinds,
 // repos, and scopes, ordered by id for a stable traversal. superseded_by is

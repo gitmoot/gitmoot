@@ -77,6 +77,146 @@ func TestMemoryListShowsBothTiers(t *testing.T) {
 	}
 }
 
+func TestMemoryRecallRanksAndFiltersConfirmedMemories(t *testing.T) {
+	home, store := memoryTestHome(t)
+	ctx := context.Background()
+	for _, cm := range []db.ConfirmedMemory{
+		{
+			Owner: db.MemoryOwner{Kind: "agent", Ref: "lead"}, Repo: "acme/widget", Scope: "repo", Key: "widget-flake",
+			Content: "arm64 runner flake arm64 runner flake in widget tests", Provenance: "seed",
+		},
+		{
+			Owner: db.MemoryOwner{Kind: "agent", Ref: "audit"}, Repo: "acme/widget", Scope: "repo", Key: "audit-runner",
+			Content: "arm64 runner policy differs for audit", Provenance: "seed",
+		},
+		{
+			Owner: db.MemoryOwner{Kind: "agent", Ref: "lead"}, Repo: "acme/api", Scope: "repo", Key: "api-arm64",
+			Content: "arm64 api migrations need a canary", Provenance: "seed",
+		},
+		{
+			Owner: db.MemoryOwner{Kind: "agent", Ref: "audit"}, Scope: "general", Key: "general-arm64",
+			Content: "arm64 runner facts apply across repositories", Provenance: "seed",
+		},
+		{
+			Owner: db.MemoryOwner{Kind: "role", Ref: "reviewer"}, Repo: "acme/widget", Scope: "repo", Key: "role-hidden",
+			Content: "arm64 runner flake from a role pool", Provenance: "seed",
+		},
+	} {
+		if _, err := store.UpsertConfirmedMemory(ctx, cm); err != nil {
+			t.Fatalf("seed %s: %v", cm.Key, err)
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := runMemory([]string{"recall", "arm64 runner flake", "--home", home, "--repo", "acme/widget", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("memory recall exit %d: %s", code, stderr.String())
+	}
+	var all []memoryRecallEntry
+	if err := json.Unmarshal(stdout.Bytes(), &all); err != nil {
+		t.Fatalf("parse recall json: %v (%s)", err, stdout.String())
+	}
+	if len(all) < 3 {
+		t.Fatalf("expected all-agent recall to include both owners and general memory, got %+v", all)
+	}
+	if all[0].Key != "widget-flake" {
+		t.Fatalf("ranking top key = %q, want widget-flake; rows=%+v", all[0].Key, all)
+	}
+	owners := map[string]bool{}
+	for _, e := range all {
+		owners[e.Owner.Ref] = true
+		if e.Owner.Kind != "agent" {
+			t.Fatalf("recall without --agent must search only agent pools, got %+v", e.Owner)
+		}
+	}
+	if !owners["lead"] || !owners["audit"] {
+		t.Fatalf("expected recall without --agent to search all agent pools, got owners %+v", owners)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runMemory([]string{"recall", "--home", home, "--agent", "lead", "--repo", "acme/widget", "--json", "arm64 runner flake"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("memory recall --agent exit %d: %s", code, stderr.String())
+	}
+	var leadOnly []memoryRecallEntry
+	if err := json.Unmarshal(stdout.Bytes(), &leadOnly); err != nil {
+		t.Fatalf("parse lead recall json: %v (%s)", err, stdout.String())
+	}
+	for _, e := range leadOnly {
+		if e.Owner.Ref != "lead" {
+			t.Fatalf("--agent lead returned owner %+v", e.Owner)
+		}
+	}
+	if len(leadOnly) == 0 || leadOnly[0].Owner.Kind != "agent" || leadOnly[0].Owner.Ref != "lead" || leadOnly[0].UpdatedAt == "" {
+		t.Fatalf("json shape missing expected owner/updated_at fields: %+v", leadOnly)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runMemory([]string{"recall", "--home", home, "--agent", "lead", "--json", "api migrations"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("memory recall no repo filter exit %d: %s", code, stderr.String())
+	}
+	var unfiltered []memoryRecallEntry
+	if err := json.Unmarshal(stdout.Bytes(), &unfiltered); err != nil {
+		t.Fatalf("parse unfiltered recall json: %v (%s)", err, stdout.String())
+	}
+	if len(unfiltered) == 0 || unfiltered[0].Key != "api-arm64" || unfiltered[0].Repo != "acme/api" {
+		t.Fatalf("omitted --repo should search all repos, got %+v", unfiltered)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runMemory([]string{"recall", "--home", home, "--repo", "acme/api", "--json", "arm64 runner"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("memory recall --repo exit %d: %s", code, stderr.String())
+	}
+	var apiRows []memoryRecallEntry
+	if err := json.Unmarshal(stdout.Bytes(), &apiRows); err != nil {
+		t.Fatalf("parse api recall json: %v (%s)", err, stdout.String())
+	}
+	keys := map[string]bool{}
+	for _, e := range apiRows {
+		keys[e.Key] = true
+		if e.Scope == "repo" && e.Repo != "acme/api" {
+			t.Fatalf("--repo acme/api returned repo-scoped row from %q: %+v", e.Repo, apiRows)
+		}
+	}
+	if !keys["api-arm64"] || !keys["general-arm64"] {
+		t.Fatalf("repo filter should include repo row and general row, got keys %+v", keys)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runMemory([]string{"recall", "--home", home, "--repo", "acme/widget", "arm64 runner flake"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("memory recall text exit %d: %s", code, stderr.String())
+	}
+	text := stdout.String()
+	if !strings.Contains(text, "widget-flake repo=acme/widget scope=repo owner=agent:lead") ||
+		!strings.Contains(text, "- [this repo] arm64 runner flake arm64 runner flake in widget tests") {
+		t.Fatalf("text recall did not render metadata plus injection bullet format:\n%s", text)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runMemory([]string{"recall", "--home", home, "zzznomatch"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("memory recall no-match exit %d: %s", code, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) != "no matches" {
+		t.Fatalf("no-match stdout = %q, want no matches", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runMemory([]string{"recall", "--home", home, "--json", "zzznomatch"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("memory recall no-match json exit %d: %s", code, stderr.String())
+	}
+	var none []memoryRecallEntry
+	if err := json.Unmarshal(stdout.Bytes(), &none); err != nil {
+		t.Fatalf("parse empty recall json: %v (%s)", err, stdout.String())
+	}
+	if len(none) != 0 {
+		t.Fatalf("empty recall JSON returned rows: %+v", none)
+	}
+}
+
 func TestMemoryReplayReportsInjectionDelta(t *testing.T) {
 	home, store := memoryTestHome(t)
 	ctx := context.Background()

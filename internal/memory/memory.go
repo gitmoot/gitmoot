@@ -195,7 +195,7 @@ func RenderBlock(entries []Entry, budgetTokens int) (string, int) {
 	used := baseTokens
 	injected := 0
 	for _, e := range entries {
-		line := "- " + scopeTag(e.Scope) + " " + strings.TrimSpace(e.Content)
+		line := RenderBullet(e)
 		cost := EstimateTokens(line)
 		if budgetTokens > 0 && injected > 0 && used+cost > budgetTokens {
 			break
@@ -212,6 +212,13 @@ func RenderBlock(entries []Entry, budgetTokens int) (string, int) {
 		return "", 0
 	}
 	return b.String(), injected
+}
+
+// RenderBullet renders one memory entry in the exact bullet format used inside
+// RenderBlock. CLI recall uses it so on-demand retrieval matches prompt
+// injection without duplicating the presentation rule.
+func RenderBullet(e Entry) string {
+	return "- " + scopeTag(e.Scope) + " " + strings.TrimSpace(e.Content)
 }
 
 // scopeTag renders the per-entry provenance tag used in the block.
