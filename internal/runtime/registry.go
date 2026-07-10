@@ -8,17 +8,18 @@ import (
 
 // RuntimeMetadata is the declarative, per-runtime metadata that Gitmoot has
 // historically hardcoded across the adapter switch and each adapter's methods:
-// which capabilities a runtime advertises, the model it defaults to, an ADVISORY
+// which capabilities a runtime advertises, its default model/effort, an ADVISORY
 // list of known-valid model ids, and a human-readable descriptor of where the
 // adapter reads token usage from the CLI's structured output.
 //
 // The adapter *behavior* — auth/token handling, sandbox policy, session resume,
 // stream parsing, transient-retry — stays in Go and is unaffected by this type.
 // The registry is a single source of truth consulted for runtime enumeration
-// (SupportedRuntimes) and surfaced by `gitmoot runtime list`. Exactly ONE field is
+// (SupportedRuntimes) and surfaced by `gitmoot runtime list`. Two fields are
 // behavioral: DefaultModel is consulted at delivery as the model fallback when
-// neither the agent nor the job pins a --model (#652). Every other field is
-// inspection-only, so seeding it (from the built-in defaults below or from
+// neither the agent nor the job pins a --model (#652), and DefaultEffort is the
+// analogous reasoning-effort fallback. Every other field is inspection-only, so
+// seeding it (from the built-in defaults below or from
 // operator config) is byte-identical at runtime. In particular Models is advisory:
 // Gitmoot never REJECTS a --model based on it, so populating it cannot change how a
 // job is delivered.
@@ -38,11 +39,15 @@ type RuntimeMetadata struct {
 	// `gitmoot runtime list` AND consulted at delivery (#652): when NEITHER the
 	// agent NOR the job pins a --model, a delivered job falls back to this value as
 	// the model passed to the runtime (resolution order: agent/job --model win, then
-	// this registry default, then the runtime CLI's own default). It is the ONLY
-	// metadata field that is behavioral — Models and Capabilities stay advisory.
+	// this registry default, then the runtime CLI's own default). Models and
+	// Capabilities stay advisory.
 	// Empty (the built-in default for every runtime) means "none recorded": nothing
 	// is forced, so delivery is byte-identical to before #652.
 	DefaultModel string
+	// DefaultEffort is the configured Codex reasoning effort consulted at delivery
+	// when neither the agent nor the job pins --effort. Other runtimes retain the
+	// value as metadata but do not emit a reasoning-effort argument.
+	DefaultEffort string
 	// Models is an ADVISORY list of known-valid model ids for the runtime. Empty
 	// (the default for every built-in) means "unrestricted": Gitmoot passes any
 	// --model through unchanged, exactly as today. It is informational only —
@@ -189,6 +194,10 @@ type MetadataOverride struct {
 	// DefaultModel overrides the runtime's default model when DefaultModelSet.
 	DefaultModel    string
 	DefaultModelSet bool
+	// DefaultEffort overrides the runtime's default reasoning effort when
+	// DefaultEffortSet.
+	DefaultEffort    string
+	DefaultEffortSet bool
 	// Models replaces the advisory model list when ModelsSet.
 	Models    []string
 	ModelsSet bool
@@ -224,6 +233,9 @@ func (r Registry) ApplyOverrides(overrides []MetadataOverride) (Registry, error)
 		}
 		if override.DefaultModelSet {
 			meta.DefaultModel = strings.TrimSpace(override.DefaultModel)
+		}
+		if override.DefaultEffortSet {
+			meta.DefaultEffort = strings.TrimSpace(override.DefaultEffort)
 		}
 		if override.ModelsSet {
 			meta.Models = append([]string(nil), override.Models...)

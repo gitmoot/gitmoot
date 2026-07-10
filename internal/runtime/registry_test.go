@@ -59,6 +59,9 @@ func TestBuiltinRegistryCapabilitiesMatchAdapters(t *testing.T) {
 		if strings.TrimSpace(meta.DefaultModel) != "" {
 			t.Fatalf("%q built-in DefaultModel must be empty (CLI default), got %q", name, meta.DefaultModel)
 		}
+		if strings.TrimSpace(meta.DefaultEffort) != "" {
+			t.Fatalf("%q built-in DefaultEffort must be empty (CLI default), got %q", name, meta.DefaultEffort)
+		}
 		if len(meta.Models) != 0 {
 			t.Fatalf("%q built-in Models must be empty (unrestricted), got %v", name, meta.Models)
 		}
@@ -83,11 +86,13 @@ func TestApplyOverridesNoOp(t *testing.T) {
 func TestApplyOverridesPartial(t *testing.T) {
 	base := BuiltinRuntimeRegistry()
 	got, err := base.ApplyOverrides([]MetadataOverride{{
-		Name:            CodexRuntime,
-		DefaultModel:    "gpt-5.5-codex",
-		DefaultModelSet: true,
-		Models:          []string{"gpt-5.5-codex", "gpt-5.4-codex"},
-		ModelsSet:       true,
+		Name:             CodexRuntime,
+		DefaultModel:     "gpt-5.5-codex",
+		DefaultModelSet:  true,
+		DefaultEffort:    "high",
+		DefaultEffortSet: true,
+		Models:           []string{"gpt-5.5-codex", "gpt-5.4-codex"},
+		ModelsSet:        true,
 	}})
 	if err != nil {
 		t.Fatalf("ApplyOverrides error: %v", err)
@@ -95,6 +100,9 @@ func TestApplyOverridesPartial(t *testing.T) {
 	codex, _ := got.Metadata(CodexRuntime)
 	if codex.DefaultModel != "gpt-5.5-codex" {
 		t.Fatalf("DefaultModel = %q", codex.DefaultModel)
+	}
+	if codex.DefaultEffort != "high" {
+		t.Fatalf("DefaultEffort = %q", codex.DefaultEffort)
 	}
 	if !reflect.DeepEqual(codex.Models, []string{"gpt-5.5-codex", "gpt-5.4-codex"}) {
 		t.Fatalf("Models = %v", codex.Models)
@@ -107,6 +115,9 @@ func TestApplyOverridesPartial(t *testing.T) {
 	baseCodex, _ := base.Metadata(CodexRuntime)
 	if baseCodex.DefaultModel != "" {
 		t.Fatalf("ApplyOverrides mutated the source registry: %q", baseCodex.DefaultModel)
+	}
+	if baseCodex.DefaultEffort != "" {
+		t.Fatalf("ApplyOverrides mutated the source registry effort: %q", baseCodex.DefaultEffort)
 	}
 }
 

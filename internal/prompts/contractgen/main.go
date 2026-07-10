@@ -50,14 +50,14 @@ type fieldAnnotation struct {
 // example values reproduce the battle-tested literal shape verbatim; changing
 // one here changes the shape agents copy, so treat them as load-bearing.
 var resultFieldAnnotations = map[string]fieldAnnotation{
-	"decision":      {example: enumExample(workflow.ResultDecisions)},
-	"summary":       {example: `"..."`},
-	"findings":      {example: "[]"},
-	"changes_made":  {example: "[]"},
-	"tests_run":     {example: "[]"},
-	"needs":         {example: "[]"},
-	"delegations":   {example: "[]"},
-	"artifact_body": {help: `top-level artifact_body (string) is required when any delegation requests artifacts.`},
+	"decision":        {example: enumExample(workflow.ResultDecisions)},
+	"summary":         {example: `"..."`},
+	"findings":        {example: "[]"},
+	"changes_made":    {example: "[]"},
+	"tests_run":       {example: "[]"},
+	"needs":           {example: "[]"},
+	"delegations":     {example: "[]"},
+	"artifact_body":   {help: `top-level artifact_body (string) is required when any delegation requests artifacts.`},
 	"human_questions": {help: `top-level human_questions (object[], optional): use SPARINGLY to pause for a specific human decision instead of guessing; each entry is {id (string, required, unique), prompt (string, required), choices (string[], optional)}. Returning it pauses the tree awaiting a human answer (no leg fails, no continuation runs); a human replies with /gitmoot resume <job> answer "<id>: ...". Leave it absent when you can proceed.`},
 	"learnings":       {help: `top-level learnings (object[], optional): use RARELY to record a durable, keyed FACT worth remembering next time (e.g. "this repo's arm64 CI is flaky"), NOT a directive and NOT for this job only. Each entry is {key (string, required, short stable handle), scope (string, optional: "repo" for a fact about this repository — the default — or "general" for a fact true everywhere), content (string, required, the fact itself)}. Most jobs return none; leave it absent unless you learned something that will help a future job.`},
 }
@@ -81,6 +81,7 @@ var delegationFieldAnnotations = map[string]fieldAnnotation{
 	"synthesis_rule": {help: `synthesis_rule (string, optional): one of ` + enumList(workflow.DelegationSynthesisRules) + `; how the coordinator combines child results.`},
 	"quorum":         {help: `quorum (integer, optional): K > 0, required when synthesis_rule is quorum; the continuation proceeds only if at least K children approve (K <= number of delegations).`},
 	"model":          {help: `model (string, optional): a free-form, runtime-scoped model string for the child; omit to use the agent's configured default.`},
+	"effort":         {help: `effort (string, optional): a free-form, runtime-scoped reasoning effort for the child; omit to inherit the agent/parent effort.`},
 	"phase":          {help: `phase (string, optional): a free-form pass-through label (metadata only; does not change routing).`},
 }
 
@@ -88,6 +89,7 @@ var delegationFieldAnnotations = map[string]fieldAnnotation{
 var ephemeralFieldAnnotations = map[string]fieldAnnotation{
 	"runtime":         {help: `runtime (required, one of ` + enumList(workflow.EphemeralRuntimes) + `)`},
 	"model":           {help: `model (optional)`},
+	"effort":          {help: `effort (optional)`},
 	"template":        {help: `template (optional)`},
 	"role":            {help: `role (optional)`},
 	"capabilities":    {help: `capabilities (string[], optional)`},

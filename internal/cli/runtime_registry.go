@@ -43,15 +43,17 @@ func runtimeMetadataOverrides(overrides []config.RuntimeOverride) []runtime.Meta
 	out := make([]runtime.MetadataOverride, 0, len(overrides))
 	for _, o := range overrides {
 		out = append(out, runtime.MetadataOverride{
-			Name:            o.Name,
-			DefaultModel:    o.DefaultModel,
-			DefaultModelSet: o.DefaultModelSet,
-			Models:          o.Models,
-			ModelsSet:       o.ModelsSet,
-			Capabilities:    o.Capabilities,
-			CapabilitiesSet: o.CapabilitiesSet,
-			UsageSource:     o.UsageSource,
-			UsageSourceSet:  o.UsageSourceSet,
+			Name:             o.Name,
+			DefaultModel:     o.DefaultModel,
+			DefaultModelSet:  o.DefaultModelSet,
+			DefaultEffort:    o.DefaultEffort,
+			DefaultEffortSet: o.DefaultEffortSet,
+			Models:           o.Models,
+			ModelsSet:        o.ModelsSet,
+			Capabilities:     o.Capabilities,
+			CapabilitiesSet:  o.CapabilitiesSet,
+			UsageSource:      o.UsageSource,
+			UsageSourceSet:   o.UsageSourceSet,
 		})
 	}
 	return out
@@ -63,8 +65,9 @@ func runtimeMetadataOverrides(overrides []config.RuntimeOverride) []runtime.Meta
 // [runtimes.codxe], or an invalid capability) is SKIPPED with a logged warning
 // naming the offending section instead of failing the whole config. Every VALID
 // [runtimes.<name>] section's overrides still take effect. This is the DELIVERY
-// path: it must never drop otherwise-valid default_model overrides just because one
-// unrelated section has a typo. A missing config file (fresh box), an empty home,
+// path: it must never drop otherwise-valid default_model/default_effort overrides
+// just because one unrelated section has a typo. A missing config file (fresh
+// box), an empty home,
 // or a file-level parse error yields the built-in registry unchanged (fail-safe:
 // nothing is forced). Overrides are applied one section at a time so a rejected
 // section cannot poison the accumulated valid ones.
@@ -73,14 +76,14 @@ func resolveRuntimeRegistryResilient(paths config.Paths) runtime.Registry {
 	overrides, err := config.LoadRuntimeOverrides(paths)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
-			log.Printf("runtime registry: ignoring config overrides for delivery model resolution: %v", err)
+			log.Printf("runtime registry: ignoring config overrides for delivery defaults resolution: %v", err)
 		}
 		return registry
 	}
 	for _, o := range overrides {
 		patched, err := registry.ApplyOverrides(runtimeMetadataOverrides([]config.RuntimeOverride{o}))
 		if err != nil {
-			log.Printf("runtime registry: skipping invalid [runtimes.%s] section for delivery model resolution: %v", o.Name, err)
+			log.Printf("runtime registry: skipping invalid [runtimes.%s] section for delivery defaults resolution: %v", o.Name, err)
 			continue
 		}
 		registry = patched
@@ -112,6 +115,21 @@ func runtimeDefaultModelResolver(home string) func(string) string {
 	}
 }
 
+// runtimeDefaultEffortResolver returns a HOME-AWARE resolver for a runtime's
+// configured registry default_effort. It mirrors runtimeDefaultModelResolver:
+// config is re-read on every call, malformed sibling sections are skipped, and
+// missing config or an unknown runtime resolves to empty (no effort override).
+func runtimeDefaultEffortResolver(home string) func(string) string {
+	return func(runtimeName string) string {
+		registry := resolveRuntimeRegistryResilient(config.Paths{ConfigFile: resolveConfigFile(home)})
+		meta, ok := registry.Metadata(strings.TrimSpace(runtimeName))
+		if !ok {
+			return ""
+		}
+		return strings.TrimSpace(meta.DefaultEffort)
+	}
+}
+
 func runRuntime(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		printRuntimeUsage(stdout)
@@ -132,19 +150,20 @@ func printRuntimeUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot runtime list [--json]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Shows the resolved metadata for each built-in runtime: capabilities, default")
-	fmt.Fprintln(w, "and known models, and where token usage is read from. Values come from the")
+	fmt.Fprintln(w, "model/effort, known models, and where token usage is read from. Values come from the")
 	fmt.Fprintln(w, "compiled built-in defaults, overlaid with any [runtimes.<name>] config overrides.")
 }
 
 // runtimeListEntry is the JSON shape for `gitmoot runtime list --json`.
 type runtimeListEntry struct {
-	Name         string   `json:"name"`
-	Dispatchable bool     `json:"dispatchable"`
-	Capabilities []string `json:"capabilities"`
-	DefaultModel string   `json:"default_model"`
-	Models       []string `json:"models"`
-	UsageSource  string   `json:"usage_source"`
-	Description  string   `json:"description"`
+	Name          string   `json:"name"`
+	Dispatchable  bool     `json:"dispatchable"`
+	Capabilities  []string `json:"capabilities"`
+	DefaultModel  string   `json:"default_model"`
+	DefaultEffort string   `json:"default_effort"`
+	Models        []string `json:"models"`
+	UsageSource   string   `json:"usage_source"`
+	Description   string   `json:"description"`
 }
 
 func runRuntimeList(args []string, stdout, stderr io.Writer) int {
@@ -177,13 +196,14 @@ func runRuntimeList(args []string, stdout, stderr io.Writer) int {
 		entries := make([]runtimeListEntry, 0, len(metas))
 		for _, m := range metas {
 			entries = append(entries, runtimeListEntry{
-				Name:         m.Name,
-				Dispatchable: m.Dispatchable,
-				Capabilities: m.Capabilities,
-				DefaultModel: m.DefaultModel,
-				Models:       m.Models,
-				UsageSource:  m.UsageSource,
-				Description:  m.Description,
+				Name:          m.Name,
+				Dispatchable:  m.Dispatchable,
+				Capabilities:  m.Capabilities,
+				DefaultModel:  m.DefaultModel,
+				DefaultEffort: m.DefaultEffort,
+				Models:        m.Models,
+				UsageSource:   m.UsageSource,
+				Description:   m.Description,
 			})
 		}
 		enc := json.NewEncoder(stdout)
@@ -195,12 +215,13 @@ func runRuntimeList(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	tw := tabwriter.NewWriter(stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "RUNTIME\tCAPABILITIES\tDEFAULT MODEL\tKNOWN MODELS\tUSAGE SOURCE")
+	fmt.Fprintln(tw, "RUNTIME\tCAPABILITIES\tDEFAULT MODEL\tDEFAULT EFFORT\tKNOWN MODELS\tUSAGE SOURCE")
 	for _, m := range metas {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
 			m.Name,
 			strings.Join(m.Capabilities, ","),
 			orDash(m.DefaultModel),
+			orDash(m.DefaultEffort),
 			orDash(strings.Join(m.Models, ",")),
 			orDash(m.UsageSource),
 		)

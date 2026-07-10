@@ -3291,6 +3291,30 @@ func TestParseAgentRunOptionsCapturesModel(t *testing.T) {
 	}
 }
 
+func TestParseAgentRunOptionsCapturesEffort(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "space form", args: []string{"planner", "do the work", "--effort", "high"}, want: "high"},
+		{name: "inline form", args: []string{"planner", "do the work", "--effort=xhigh"}, want: "xhigh"},
+		{name: "absent leaves empty", args: []string{"planner", "do the work"}, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			options, ok := parseAgentRunOptions("run", tt.args, &stderr)
+			if !ok {
+				t.Fatalf("parseAgentRunOptions failed: %q", stderr.String())
+			}
+			if options.effort != tt.want {
+				t.Fatalf("effort = %q, want %q", options.effort, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseAgentRunOptionsCapturesRecipe(t *testing.T) {
 	tests := []struct {
 		name string
@@ -3433,6 +3457,30 @@ func TestParseAgentAskOptionsCapturesModel(t *testing.T) {
 	}
 }
 
+func TestParseAgentAskOptionsCapturesEffort(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "space form", args: []string{"planner", "what is up", "--effort", "medium"}, want: "medium"},
+		{name: "inline form", args: []string{"planner", "what is up", "--effort=high"}, want: "high"},
+		{name: "absent leaves empty", args: []string{"planner", "what is up"}, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			options, ok := parseAgentAskOptions(tt.args, &stderr)
+			if !ok {
+				t.Fatalf("parseAgentAskOptions failed: %q", stderr.String())
+			}
+			if options.effort != tt.want {
+				t.Fatalf("effort = %q, want %q", options.effort, tt.want)
+			}
+		})
+	}
+}
+
 func TestDispatchAgentCommandMapsModelOntoRequest(t *testing.T) {
 	options := agentRunOptions{
 		agent:   "planner",
@@ -3456,12 +3504,21 @@ func TestDispatchAgentCommandMapsModelOntoRequest(t *testing.T) {
 	}
 }
 
+func TestDispatchAgentCommandMapsEffortOntoRequest(t *testing.T) {
+	options := agentRunOptions{agent: "planner", message: "do the work", effort: "high"}
+	request := localAgentDispatchRequest{Effort: options.effort}
+	if request.Effort != "high" {
+		t.Fatalf("request effort = %q, want high", request.Effort)
+	}
+}
+
 func TestAgentModelRoundTripsThroughStorageMapping(t *testing.T) {
 	original := runtime.Agent{
 		Name:           "planner",
 		Runtime:        runtime.ClaudeRuntime,
 		RepoScope:      "owner/repo",
 		Model:          "opus",
+		Effort:         "high",
 		Capabilities:   []string{"ask"},
 		AutonomyPolicy: "read-only",
 		HealthStatus:   "unknown",
@@ -3470,9 +3527,15 @@ func TestAgentModelRoundTripsThroughStorageMapping(t *testing.T) {
 	if stored.Model != "opus" {
 		t.Fatalf("dbAgent model = %q, want %q", stored.Model, "opus")
 	}
+	if stored.Effort != "high" {
+		t.Fatalf("dbAgent effort = %q, want high", stored.Effort)
+	}
 	roundTripped := runtimeAgent(stored)
 	if roundTripped.Model != "opus" {
 		t.Fatalf("runtimeAgent model = %q, want %q", roundTripped.Model, "opus")
+	}
+	if roundTripped.Effort != "high" {
+		t.Fatalf("runtimeAgent effort = %q, want high", roundTripped.Effort)
 	}
 }
 

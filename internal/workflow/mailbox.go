@@ -94,6 +94,10 @@ type Mailbox struct {
 	// default, and any error/empty result) forces nothing, so delivery is
 	// byte-identical to before #652.
 	RuntimeDefaultModel func(runtimeName string) string
+	// RuntimeDefaultEffort mirrors RuntimeDefaultModel for reasoning effort. It is
+	// consulted only as the final fallback after payload.Effort and agent.Effort;
+	// nil or empty forces no runtime argument.
+	RuntimeDefaultEffort func(runtimeName string) string
 	// routerContextEnabled gates the off-by-default #530 coordinator context block.
 	// When true, Run appends a bounded (<=12 line) observed-performance table to a
 	// TOP-LEVEL (coordinator) job's prompt. When false (the default, every
@@ -129,20 +133,20 @@ type JobRequest struct {
 	// for this job only (the agent's identity is unchanged). Used by the
 	// orchestrate/run --recipe flag to route a coordinator to a built-in recipe
 	// template's prompt without rebinding the agent.
-	TemplateOverride       *db.AgentTemplate
-	ParentJobID            string
-	DelegationID           string
-	DelegationDepth        int
-	DelegatedBy            string
-	RootJobID              string
-	Deps                   []string
-	JobTimeout             string
-	RetryCount             int
-	Fingerprint            string
-	FailurePolicy          string
-	SynthesisRule          string
-	DelegationArtifactDir  string
-	WorktreePath           string
+	TemplateOverride      *db.AgentTemplate
+	ParentJobID           string
+	DelegationID          string
+	DelegationDepth       int
+	DelegatedBy           string
+	RootJobID             string
+	Deps                  []string
+	JobTimeout            string
+	RetryCount            int
+	Fingerprint           string
+	FailurePolicy         string
+	SynthesisRule         string
+	DelegationArtifactDir string
+	WorktreePath          string
 	// ReadOnlyWorktree marks a job whose WorktreePath is a throwaway detached
 	// committed-tip worktree allocated for read-only (ask) isolation at DISPATCH
 	// time (#739) — as opposed to a delegation child's fan-out worktree (which
@@ -161,6 +165,7 @@ type JobRequest struct {
 	VerifyAttempt          int
 	DelegationFinalize     bool
 	Model                  string
+	Effort                 string
 	// RuntimeOverride, when non-empty, runs THIS job through the named runtime
 	// instead of the agent's registered default runtime (#531). The agent's
 	// stored runtime/session are untouched: the job runs on RuntimeOverrideRef
@@ -208,32 +213,32 @@ type JobRequest struct {
 }
 
 type JobPayload struct {
-	Repo                   string         `json:"repo"`
-	Branch                 string         `json:"branch"`
-	PullRequest            int            `json:"pull_request"`
-	HeadSHA                string         `json:"head_sha,omitempty"`
-	GoalID                 string         `json:"goal_id,omitempty"`
-	TaskID                 string         `json:"task_id"`
-	TaskTitle              string         `json:"task_title"`
-	LeadAgent              string         `json:"lead_agent,omitempty"`
-	Reviewers              []string       `json:"reviewers,omitempty"`
-	ReviewRound            string         `json:"review_round,omitempty"`
-	Sender                 string         `json:"sender"`
-	Instructions           string         `json:"instructions"`
-	Constraints            []string       `json:"constraints"`
-	ParentJobID            string         `json:"parent_job_id,omitempty"`
-	DelegationID           string         `json:"delegation_id,omitempty"`
-	DelegationDepth        int            `json:"delegation_depth,omitempty"`
-	DelegatedBy            string         `json:"delegated_by,omitempty"`
-	RootJobID              string         `json:"root_job_id,omitempty"`
-	Deps                   []string       `json:"deps,omitempty"`
-	JobTimeout             string         `json:"job_timeout,omitempty"`
-	RetryCount             int            `json:"retry_count,omitempty"`
-	Fingerprint            string         `json:"fingerprint,omitempty"`
-	FailurePolicy          string         `json:"failure_policy,omitempty"`
-	SynthesisRule          string         `json:"synthesis_rule,omitempty"`
-	DelegationArtifactDir  string         `json:"delegation_artifact_dir,omitempty"`
-	WorktreePath           string         `json:"worktree_path,omitempty"`
+	Repo                  string   `json:"repo"`
+	Branch                string   `json:"branch"`
+	PullRequest           int      `json:"pull_request"`
+	HeadSHA               string   `json:"head_sha,omitempty"`
+	GoalID                string   `json:"goal_id,omitempty"`
+	TaskID                string   `json:"task_id"`
+	TaskTitle             string   `json:"task_title"`
+	LeadAgent             string   `json:"lead_agent,omitempty"`
+	Reviewers             []string `json:"reviewers,omitempty"`
+	ReviewRound           string   `json:"review_round,omitempty"`
+	Sender                string   `json:"sender"`
+	Instructions          string   `json:"instructions"`
+	Constraints           []string `json:"constraints"`
+	ParentJobID           string   `json:"parent_job_id,omitempty"`
+	DelegationID          string   `json:"delegation_id,omitempty"`
+	DelegationDepth       int      `json:"delegation_depth,omitempty"`
+	DelegatedBy           string   `json:"delegated_by,omitempty"`
+	RootJobID             string   `json:"root_job_id,omitempty"`
+	Deps                  []string `json:"deps,omitempty"`
+	JobTimeout            string   `json:"job_timeout,omitempty"`
+	RetryCount            int      `json:"retry_count,omitempty"`
+	Fingerprint           string   `json:"fingerprint,omitempty"`
+	FailurePolicy         string   `json:"failure_policy,omitempty"`
+	SynthesisRule         string   `json:"synthesis_rule,omitempty"`
+	DelegationArtifactDir string   `json:"delegation_artifact_dir,omitempty"`
+	WorktreePath          string   `json:"worktree_path,omitempty"`
 	// ReadOnlyWorktree marks a top-level read-only (ask) worktree allocated at
 	// dispatch time (#739): its WorktreePath is a throwaway detached committed-tip
 	// worktree with no DelegationID and no Branch. Additive/omitempty so a payload
@@ -254,6 +259,7 @@ type JobPayload struct {
 	VerifyAttempt          int            `json:"verify_attempt,omitempty"`
 	DelegationFinalize     bool           `json:"delegation_finalize,omitempty"`
 	Model                  string         `json:"model,omitempty"`
+	Effort                 string         `json:"effort,omitempty"`
 	RuntimeOverride        string         `json:"runtime_override,omitempty"`
 	RuntimeOverrideRef     string         `json:"runtime_override_ref,omitempty"`
 	Phase                  string         `json:"phase,omitempty"`
@@ -265,8 +271,8 @@ type JobPayload struct {
 	HumanAnswer            string         `json:"human_answer,omitempty"`
 	// ThreadID / ChatMessageID back-link a chat-promoted job (#534) to its origin
 	// message. Additive/omitempty: a non-chat job serializes byte-identically.
-	ThreadID      string       `json:"thread_id,omitempty"`
-	ChatMessageID string       `json:"chat_message_id,omitempty"`
+	ThreadID      string `json:"thread_id,omitempty"`
+	ChatMessageID string `json:"chat_message_id,omitempty"`
 	// MootSeat marks a `gitmoot moot` conversing seat (#732): the daemon elevates
 	// ONLY these jobs (codex workspace-write+network to reach the relay socket) and
 	// injects the relay env into them. Additive/omitempty so every non-seat job —
@@ -278,9 +284,9 @@ type JobPayload struct {
 	// stage job, whose own id is the sub-tree RootJobID). Set only from the validated
 	// orchestrate spec, never by sender-sniffing. Additive/omitempty so every other
 	// pipeline-sender payload — shell + #757 agent leaf — serializes byte-identically.
-	OrchestrateStage bool `json:"orchestrate_stage,omitempty"`
-	RawOutputs    []string     `json:"raw_outputs,omitempty"`
-	Result        *AgentResult `json:"result,omitempty"`
+	OrchestrateStage bool         `json:"orchestrate_stage,omitempty"`
+	RawOutputs       []string     `json:"raw_outputs,omitempty"`
+	Result           *AgentResult `json:"result,omitempty"`
 	// ResultChecks, when non-empty, carries the deterministic binary-checklist
 	// audit FAILURES for this job's parsed result (#526). It is the job-detail
 	// surface the dashboard and `gitmoot job show --json` read. Fully additive
@@ -382,6 +388,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		VerifyAttempt:          request.VerifyAttempt,
 		DelegationFinalize:     request.DelegationFinalize,
 		Model:                  request.Model,
+		Effort:                 request.Effort,
 		RuntimeOverride:        strings.TrimSpace(request.RuntimeOverride),
 		RuntimeOverrideRef:     strings.TrimSpace(request.RuntimeOverrideRef),
 		Phase:                  request.Phase,
@@ -883,6 +890,7 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		Repository:  payload.Repo,
 		PullRequest: payload.PullRequest,
 		Model:       payload.Model,
+		Effort:      payload.Effort,
 	}
 	// #652: thread in the runtime's configured registry default_model as the FINAL
 	// model fallback. effectiveModel applies the precedence (job.Model > agent.Model
@@ -892,6 +900,9 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 	// runtime's default.
 	if m.RuntimeDefaultModel != nil {
 		delivery.RuntimeDefaultModel = m.RuntimeDefaultModel(agent.Runtime)
+	}
+	if m.RuntimeDefaultEffort != nil {
+		delivery.RuntimeDefaultEffort = m.RuntimeDefaultEffort(agent.Runtime)
 	}
 	result, err := adapter.Deliver(ctx, agent, delivery)
 	// Record best-effort runtime token usage so the per-root delegation token

@@ -162,7 +162,7 @@ func realSkillOptABDeliver(ctx context.Context, agent runtime.Agent, prompt stri
 		}
 		return strings.TrimSpace(started.Raw), nil
 	}
-	result, err := adapter.Deliver(ctx, agent, runtime.Job{AgentName: agent.Name, Action: "ask", Prompt: prompt, Model: agent.Model})
+	result, err := adapter.Deliver(ctx, agent, runtime.Job{AgentName: agent.Name, Action: "ask", Prompt: prompt, Model: agent.Model, Effort: agent.Effort})
 	if err != nil {
 		return "", err
 	}
@@ -335,6 +335,7 @@ func runSkillOptABWithStore(ctx context.Context, store *db.Store, paths config.P
 		Capabilities:   agent.Capabilities,
 		AutonomyPolicy: firstNonEmpty(agent.AutonomyPolicy, runtime.AutonomyPolicyReadOnly),
 		Model:          agent.Model,
+		Effort:         agent.Effort,
 	}
 
 	// Deliver BOTH variants, SERIALIZED (the second call only after the first

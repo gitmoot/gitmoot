@@ -223,6 +223,7 @@ func (d *crossFamilyReviewDispatcher) reviewerAgent(ctx context.Context, reviewe
 			Capabilities:   agent.Capabilities,
 			AutonomyPolicy: runtime.AutonomyPolicyReadOnly,
 			Model:          agent.Model,
+			Effort:         agent.Effort,
 		}, nil
 	}
 	// Ephemeral read-only reviewer.

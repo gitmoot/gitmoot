@@ -140,6 +140,12 @@ CREATE TABLE agents (
 	runtime_ref TEXT NOT NULL,
 	repo_scope TEXT NOT NULL
 );
+-- A minimal agent_instances table so later additive per-instance column
+-- migrations can run. The real table was created by an earlier migration that
+-- this fixture marks as applied.
+CREATE TABLE agent_instances (
+	name TEXT PRIMARY KEY
+);
 -- job_events as it existed at an earlier (here pre-seeded-as-applied) migration,
 -- so the #549 job_events index migration that runs in this pass has its table.
 CREATE TABLE job_events (

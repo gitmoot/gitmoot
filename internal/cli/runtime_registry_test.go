@@ -55,6 +55,7 @@ func TestResolveRuntimeRegistryOverride(t *testing.T) {
 	paths := writeCLIConfig(t, `
 [runtimes.codex]
 default_model = "gpt-5.5-codex"
+default_effort = "high"
 models = ["gpt-5.5-codex"]
 `)
 	got, err := resolveRuntimeRegistry(paths)
@@ -67,6 +68,9 @@ models = ["gpt-5.5-codex"]
 	}
 	if codex.DefaultModel != "gpt-5.5-codex" {
 		t.Fatalf("DefaultModel = %q", codex.DefaultModel)
+	}
+	if codex.DefaultEffort != "high" {
+		t.Fatalf("DefaultEffort = %q", codex.DefaultEffort)
 	}
 	if !reflect.DeepEqual(codex.Models, []string{"gpt-5.5-codex"}) {
 		t.Fatalf("Models = %v", codex.Models)
@@ -103,7 +107,7 @@ func TestRunRuntimeListText(t *testing.T) {
 
 // TestRunRuntimeListJSON covers the JSON output shape.
 func TestRunRuntimeListJSON(t *testing.T) {
-	paths := writeCLIConfig(t, "[paths]\ndatabase = \"x\"\n")
+	paths := writeCLIConfig(t, "[runtimes.codex]\ndefault_effort = \"high\"\n")
 	var stdout, stderr bytes.Buffer
 	code := runRuntimeList([]string{"--home", homeFromConfig(t, paths), "--json"}, &stdout, &stderr)
 	if code != 0 {
@@ -118,6 +122,9 @@ func TestRunRuntimeListJSON(t *testing.T) {
 	}
 	if entries[0].Name != runtime.CodexRuntime || !entries[0].Dispatchable {
 		t.Fatalf("first entry wrong: %+v", entries[0])
+	}
+	if entries[0].DefaultEffort != "high" {
+		t.Fatalf("codex default_effort = %q, want high", entries[0].DefaultEffort)
 	}
 }
 
@@ -148,6 +155,27 @@ func TestRuntimeDefaultModelResolverReadsConfig(t *testing.T) {
 	// A runtime with no override records no default: the hook forces nothing.
 	if got := resolve(runtime.ClaudeRuntime); got != "" {
 		t.Fatalf("resolve(claude) = %q, want empty (no override)", got)
+	}
+}
+
+func TestRuntimeDefaultEffortResolverReadsConfig(t *testing.T) {
+	src := writeCLIConfig(t, "[runtimes.codex]\ndefault_effort = \"high\"\n")
+	home := homeFromConfig(t, src)
+	resolve := runtimeDefaultEffortResolver(home)
+	if got := resolve(runtime.CodexRuntime); got != "high" {
+		t.Fatalf("resolve(codex) = %q, want high", got)
+	}
+	if got := resolve(runtime.ClaudeRuntime); got != "" {
+		t.Fatalf("resolve(claude) = %q, want empty (no override)", got)
+	}
+}
+
+func TestRuntimeDefaultEffortResolverAbsentConfig(t *testing.T) {
+	if got := runtimeDefaultEffortResolver(t.TempDir())(runtime.CodexRuntime); got != "" {
+		t.Fatalf("missing-config resolve(codex) = %q, want empty", got)
+	}
+	if got := runtimeDefaultEffortResolver("")(runtime.CodexRuntime); got != "" {
+		t.Fatalf("empty-home resolve(codex) = %q, want empty", got)
 	}
 }
 

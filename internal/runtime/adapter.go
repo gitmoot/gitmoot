@@ -44,6 +44,7 @@ type Agent struct {
 	AutonomyPolicy string
 	HealthStatus   string
 	Model          string
+	Effort         string
 	// PresetDelivery is the agent's prompt preset delivery mode (#33): full
 	// (default), referenced, or auto. Carried in-memory from the stored agents row
 	// so the delivery seam can decide whether to inline the whole preset or send a
@@ -91,6 +92,7 @@ type Job struct {
 	Repository  string
 	PullRequest int
 	Model       string
+	Effort      string
 	// RuntimeDefaultModel is the runtime's configured registry default_model
 	// (#652), threaded in by the dispatch layer from the HOME-AWARE resolved runtime
 	// registry (built-in defaults overlaid with [runtimes.<name>] config). It is the
@@ -100,6 +102,12 @@ type Job struct {
 	// sets it — means "no registry default", so delivery defers to the runtime CLI's
 	// own default exactly as before #652 (byte-identical).
 	RuntimeDefaultModel string
+	// RuntimeDefaultEffort is the runtime's configured registry default_effort,
+	// threaded in by the dispatch layer from the HOME-AWARE resolved runtime
+	// registry. It is the FINAL effort fallback: effectiveEffort uses it ONLY when
+	// neither the job (Effort) nor the agent (Agent.Effort) pins an effort, so an
+	// agent/job --effort always wins. Empty means no -c argument is emitted.
+	RuntimeDefaultEffort string
 }
 
 type Result struct {
@@ -389,6 +397,9 @@ func (a CodexAdapter) Start(ctx context.Context, request StartRequest) (StartRes
 	if request.Agent.Model != "" {
 		args = append(args, "--model", request.Agent.Model)
 	}
+	if request.Agent.Effort != "" {
+		args = append(args, "-c", "model_reasoning_effort="+request.Agent.Effort)
+	}
 	args = append(args, "--json", "--", request.Prompt)
 	result, err := a.runner().Run(ctx, a.Dir, "codex", args...)
 	if err != nil {
@@ -422,6 +433,7 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 		return Result{}, err
 	}
 	model := effectiveModel(agent, job)
+	effort := effectiveEffort(agent, job)
 	// A fresh ref (per-job --runtime override, #531) starts a brand-new exec
 	// session — never `resume` — so an overridden job cannot read or pollute any
 	// stored session's state. Every other ref resumes an existing session, which
@@ -431,7 +443,7 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 			return Result{}, err
 		}
 	}
-	result, err := a.runCodex(ctx, agent, job.Prompt, model)
+	result, err := a.runCodex(ctx, agent, job.Prompt, model, effort)
 	if err != nil {
 		return Result{Raw: result.Stdout + result.Stderr}, codexCommandError(result, err)
 	}
@@ -460,7 +472,7 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 // `codex exec` reads the prompt from stdin when the positional is `-` or omitted
 // ("instructions are read from stdin"). Routing oversize prompts through stdin is
 // deferred to a follow-up; #723 fixes kimi, which offers no stdin/file channel.
-func codexDeliverArgs(agent Agent, prompt, model string, jsonOutput bool) []string {
+func codexDeliverArgs(agent Agent, prompt, model string, effort string, jsonOutput bool) []string {
 	args := append([]string{"exec"}, codexSandboxArgs(agent)...)
 	if jsonOutput {
 		args = append(args, "--json")
@@ -469,11 +481,17 @@ func codexDeliverArgs(agent Agent, prompt, model string, jsonOutput bool) []stri
 		if model != "" {
 			args = append(args, "--model", model)
 		}
+		if effort != "" {
+			args = append(args, "-c", "model_reasoning_effort="+effort)
+		}
 		return append(args, "--", prompt)
 	}
 	args = append(args, "resume")
 	if model != "" {
 		args = append(args, "--model", model)
+	}
+	if effort != "" {
+		args = append(args, "-c", "model_reasoning_effort="+effort)
 	}
 	if agent.RuntimeRef == "last" {
 		args = append(args, "--last")
@@ -489,10 +507,10 @@ func codexDeliverArgs(agent Agent, prompt, model string, jsonOutput bool) []stri
 // pre-#658 semantics; codexDeliverResult then fails open on the non-JSONL stdout
 // and contributes 0 usage. Only the JSON re-run is retried — a genuine delivery
 // failure surfaces unchanged.
-func (a CodexAdapter) runCodex(ctx context.Context, agent Agent, prompt, model string) (subprocess.Result, error) {
-	result, err := a.runner().Run(ctx, a.Dir, "codex", codexDeliverArgs(agent, prompt, model, true)...)
+func (a CodexAdapter) runCodex(ctx context.Context, agent Agent, prompt, model string, effort string) (subprocess.Result, error) {
+	result, err := a.runner().Run(ctx, a.Dir, "codex", codexDeliverArgs(agent, prompt, model, effort, true)...)
 	if err != nil && isCodexJSONUnsupported(result) {
-		result, err = a.runner().Run(ctx, a.Dir, "codex", codexDeliverArgs(agent, prompt, model, false)...)
+		result, err = a.runner().Run(ctx, a.Dir, "codex", codexDeliverArgs(agent, prompt, model, effort, false)...)
 	}
 	return result, err
 }
@@ -609,6 +627,20 @@ func effectiveModel(agent Agent, job Job) string {
 		return agent.Model
 	}
 	return strings.TrimSpace(job.RuntimeDefaultModel)
+}
+
+// effectiveEffort resolves which reasoning effort a delivered job runs with.
+// Precedence mirrors effectiveModel exactly: the per-job override wins, then the
+// agent default, then the runtime registry default_effort. An empty result means
+// no `-c model_reasoning_effort=...` argument is emitted.
+func effectiveEffort(agent Agent, job Job) string {
+	if job.Effort != "" {
+		return job.Effort
+	}
+	if agent.Effort != "" {
+		return agent.Effort
+	}
+	return strings.TrimSpace(job.RuntimeDefaultEffort)
 }
 
 func codexSandboxArgs(agent Agent) []string {

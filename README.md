@@ -44,8 +44,12 @@ An agent is a named identity with a role, capabilities, a runtime, and a version
 ```sh
 gitmoot agent template draft frontend-reviewer --output agents/frontend-reviewer.md
 gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
-gitmoot agent start frontend-reviewer --runtime codex --repo owner/repo --template frontend-reviewer
+gitmoot agent start frontend-reviewer --runtime codex --repo owner/repo --template frontend-reviewer --effort high
 ```
+
+Codex agents can set a default reasoning effort with `--effort`, and individual
+jobs can override it with the same flag. Gitmoot forwards the free-form value as
+`-c model_reasoning_effort=<value>`; Claude and Kimi ignore it.
 
 ### Agents that evolve themselves with SkillOpt
 

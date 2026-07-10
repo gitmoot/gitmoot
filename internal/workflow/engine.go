@@ -315,6 +315,9 @@ type Engine struct {
 	// agent/job pin always wins. Nil (the default) forces nothing, so delivery is
 	// byte-identical to before #652.
 	RuntimeDefaultModel func(runtimeName string) string
+	// RuntimeDefaultEffort mirrors RuntimeDefaultModel for the runtime registry's
+	// default_effort fallback.
+	RuntimeDefaultEffort func(runtimeName string) string
 	// ResultCheckMode is the resolved [workflow] result_checks policy (#526): the
 	// deterministic binary-checklist audit run on a job's parsed gitmoot_result.
 	// It is copied onto every Mailbox the engine builds (mailbox()). The zero
@@ -470,7 +473,7 @@ func (e Engine) now() time.Time {
 // path is byte-identical. The hook maps the terminal JobState to the event_type,
 // resolves root_id from the payload, and ships a redacted event fire-and-forget.
 func (e Engine) mailbox() Mailbox {
-	mb := Mailbox{Store: e.Store, CanaryEnabled: e.CanaryEnabled, deferBlocker: e.BlockerDeferrer, RuntimeDefaultModel: e.RuntimeDefaultModel, routerContextEnabled: e.RouterContextEnabled, resultCheckMode: normalizeResultCheckMode(e.ResultCheckMode)}
+	mb := Mailbox{Store: e.Store, CanaryEnabled: e.CanaryEnabled, deferBlocker: e.BlockerDeferrer, RuntimeDefaultModel: e.RuntimeDefaultModel, RuntimeDefaultEffort: e.RuntimeDefaultEffort, routerContextEnabled: e.RouterContextEnabled, resultCheckMode: normalizeResultCheckMode(e.ResultCheckMode)}
 	// Wire the off-by-default memory hooks (#626). When e.Memory is nil (every
 	// non-enrolled path) both hooks stay nil, so Run's prompt assembly and terminal
 	// path are byte-identical. The hooks themselves also no-op when the executor
@@ -1935,6 +1938,7 @@ func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) 
 		FailurePolicy:   strings.TrimSpace(d.FailurePolicy),
 		SynthesisRule:   strings.TrimSpace(d.SynthesisRule),
 		Model:           strings.TrimSpace(d.Model),
+		Effort:          strings.TrimSpace(d.Effort),
 		Phase:           strings.TrimSpace(d.Phase),
 		// Inherit the coordinator's resolved risk tier (#650) so a high-risk lens
 		// child carries it for explainable escalation. Empty for every non-risk tree.
@@ -2046,11 +2050,11 @@ func canonicalDelegationSetHash(dels []Delegation) string {
 		deps := compactStrings(d.Deps)
 		sort.Strings(deps)
 		// For an ephemeral delegation, d.Agent is empty; fold the spec identity
-		// (runtime/model/template/role) into the hash so two distinct ephemeral
+		// (runtime/model/effort/template/role) into the hash so two distinct ephemeral
 		// specs are not mistaken for the same work by loop detection / dedup.
 		eph := ""
 		if d.Ephemeral != nil {
-			eph = strings.Join([]string{d.Ephemeral.Runtime, d.Ephemeral.Model, d.Ephemeral.Template, d.Ephemeral.Role}, "|")
+			eph = strings.Join([]string{d.Ephemeral.Runtime, d.Ephemeral.Model, d.Ephemeral.Effort, d.Ephemeral.Template, d.Ephemeral.Role}, "|")
 		}
 		fields := []string{d.ID, d.Agent, eph, d.Action, strings.TrimSpace(d.Prompt), strings.Join(deps, ",")}
 		builder.WriteString(strings.Join(fields, "\x1f"))
@@ -2522,6 +2526,7 @@ func (e Engine) handleDelegationLoop(ctx context.Context, job db.Job, payload Jo
 		Agent:  job.Agent,
 		Action: "ask",
 		Model:  payload.Model,
+		Effort: payload.Effort,
 		// Per-job runtime override (#531): a same-coordinator continuation stays on
 		// the override runtime/ref, like Model (see maybeEnqueueContinuation).
 		RuntimeOverride:    payload.RuntimeOverride,
@@ -2612,6 +2617,7 @@ func (e Engine) handleDelegationPreflightFailure(ctx context.Context, job db.Job
 		Agent:  job.Agent,
 		Action: "ask",
 		Model:  payload.Model,
+		Effort: payload.Effort,
 		// Per-job runtime override (#531): a same-coordinator continuation stays on
 		// the override runtime/ref, like Model (see maybeEnqueueContinuation).
 		RuntimeOverride:    payload.RuntimeOverride,
@@ -2684,6 +2690,7 @@ func (e Engine) enqueueFinalizeContinuation(ctx context.Context, job db.Job, pay
 		Agent:  job.Agent,
 		Action: "ask",
 		Model:  payload.Model,
+		Effort: payload.Effort,
 		// Per-job runtime override (#531): the finalize continuation stays on the
 		// override runtime/ref, like Model (see maybeEnqueueContinuation).
 		RuntimeOverride:    payload.RuntimeOverride,
@@ -3455,6 +3462,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 			Agent:  parentJob.Agent,
 			Action: "ask",
 			Model:  parentPayload.Model,
+			Effort: parentPayload.Effort,
 			// Per-job runtime override (#531): the corrective continuation stays on
 			// the override runtime/ref, like Model (see maybeEnqueueContinuation).
 			RuntimeOverride:    parentPayload.RuntimeOverride,
@@ -3553,6 +3561,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 			Agent:  parentJob.Agent,
 			Action: "ask",
 			Model:  parentPayload.Model,
+			Effort: parentPayload.Effort,
 			// Per-job runtime override (#531): the replan continuation stays on the
 			// override runtime/ref, like Model (see maybeEnqueueContinuation).
 			RuntimeOverride:    parentPayload.RuntimeOverride,
@@ -3613,6 +3622,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		Agent:  parentJob.Agent,
 		Action: "ask",
 		Model:  parentPayload.Model,
+		Effort: parentPayload.Effort,
 		// Per-job runtime override (#531): a continuation is the SAME logical
 		// coordinator run, so it must stay on the override runtime — dropping the
 		// override here would run the continuation as the default agent, resuming

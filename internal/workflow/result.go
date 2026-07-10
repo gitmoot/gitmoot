@@ -64,6 +64,7 @@ func allowedSet(values []string) map[string]struct{} {
 type EphemeralSpec struct {
 	Runtime        string   `json:"runtime"`
 	Model          string   `json:"model,omitempty"`
+	Effort         string   `json:"effort,omitempty"`
 	Template       string   `json:"template,omitempty"`
 	Role           string   `json:"role,omitempty"`
 	Capabilities   []string `json:"capabilities,omitempty"`
@@ -88,6 +89,7 @@ type Delegation struct {
 	SynthesisRule string         `json:"synthesis_rule,omitempty"`
 	Quorum        int            `json:"quorum,omitempty"`
 	Model         string         `json:"model,omitempty"`
+	Effort        string         `json:"effort,omitempty"`
 	Phase         string         `json:"phase,omitempty"`
 }
 

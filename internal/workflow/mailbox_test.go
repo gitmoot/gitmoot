@@ -103,7 +103,7 @@ func TestMailboxEnqueuePersistsEphemeralSpec(t *testing.T) {
 		Repo:         "jerryfane/gitmoot",
 		ParentJobID:  "job-parent",
 		DelegationID: "worker",
-		Ephemeral:    &EphemeralSpec{Runtime: "codex", Model: "gpt-5.4"},
+		Ephemeral:    &EphemeralSpec{Runtime: "codex", Model: "gpt-5.4", Effort: "high"},
 	}); err != nil {
 		t.Fatalf("Enqueue returned error: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestMailboxEnqueuePersistsEphemeralSpec(t *testing.T) {
 	if payload.Ephemeral == nil {
 		t.Fatalf("payload missing ephemeral spec: %+v", payload)
 	}
-	if payload.Ephemeral.Runtime != "codex" || payload.Ephemeral.Model != "gpt-5.4" {
+	if payload.Ephemeral.Runtime != "codex" || payload.Ephemeral.Model != "gpt-5.4" || payload.Ephemeral.Effort != "high" {
 		t.Fatalf("payload ephemeral spec = %+v", payload.Ephemeral)
 	}
 }
@@ -285,7 +285,7 @@ func TestMailboxEnqueueOmitsEmptyPhase(t *testing.T) {
 	}
 }
 
-func TestMailboxRunDeliversModelOverride(t *testing.T) {
+func TestMailboxRunDeliversModelAndEffortOverrides(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	mailbox := Mailbox{Store: store}
@@ -294,7 +294,7 @@ func TestMailboxRunDeliversModelOverride(t *testing.T) {
 		`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}}
 
-	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "implement", Repo: "jerryfane/gitmoot", Model: "opus"}); err != nil {
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "implement", Repo: "jerryfane/gitmoot", Model: "opus", Effort: "high"}); err != nil {
 		t.Fatalf("Enqueue returned error: %v", err)
 	}
 	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
@@ -302,6 +302,9 @@ func TestMailboxRunDeliversModelOverride(t *testing.T) {
 	}
 	if len(adapter.models) != 1 || adapter.models[0] != "opus" {
 		t.Fatalf("delivered runtime.Job models = %+v, want the payload model override [opus]", adapter.models)
+	}
+	if len(adapter.efforts) != 1 || adapter.efforts[0] != "high" {
+		t.Fatalf("delivered runtime.Job efforts = %+v, want the payload effort override [high]", adapter.efforts)
 	}
 }
 
@@ -335,6 +338,32 @@ func TestMailboxRunThreadsRuntimeDefaultModel(t *testing.T) {
 	}
 	if len(adapter.runtimeDefault) != 1 || adapter.runtimeDefault[0] != "gpt-5.5" {
 		t.Fatalf("delivered job.RuntimeDefaultModel = %+v, want [gpt-5.5]", adapter.runtimeDefault)
+	}
+}
+
+func TestMailboxRunThreadsRuntimeDefaultEffort(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store, RuntimeDefaultEffort: func(rt string) string {
+		if rt == runtime.CodexRuntime {
+			return "high"
+		}
+		return ""
+	}}
+	agent := runtime.Agent{Name: "audit", Runtime: runtime.CodexRuntime, RuntimeRef: "last", RepoScope: "jerryfane/gitmoot", Role: "reviewer"}
+	adapter := &fakeDelivery{outputs: []string{okDeliveryResult}}
+
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "implement", Repo: "jerryfane/gitmoot"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(adapter.efforts) != 1 || adapter.efforts[0] != "" {
+		t.Fatalf("delivered job.Effort = %+v, want no explicit pin", adapter.efforts)
+	}
+	if len(adapter.runtimeDefaultEfforts) != 1 || adapter.runtimeDefaultEfforts[0] != "high" {
+		t.Fatalf("delivered job.RuntimeDefaultEffort = %+v, want [high]", adapter.runtimeDefaultEfforts)
 	}
 }
 
@@ -1473,25 +1502,29 @@ func hasEvent(events []db.JobEvent, kind string) bool {
 }
 
 type fakeDelivery struct {
-	outputs       []string
-	summaries     []string
-	refreshedRefs []string
-	ephemeral     []bool
-	inputTokens   []int
-	outputTokens  []int
-	cumulative    []bool
-	prompts        []string
-	models         []string
-	runtimeDefault []string
-	agentRefs      []string
-	onDeliver      func()
-	err            error
+	outputs               []string
+	summaries             []string
+	refreshedRefs         []string
+	ephemeral             []bool
+	inputTokens           []int
+	outputTokens          []int
+	cumulative            []bool
+	prompts               []string
+	models                []string
+	efforts               []string
+	runtimeDefault        []string
+	runtimeDefaultEfforts []string
+	agentRefs             []string
+	onDeliver             func()
+	err                   error
 }
 
 func (f *fakeDelivery) Deliver(_ context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error) {
 	f.prompts = append(f.prompts, job.Prompt)
 	f.models = append(f.models, job.Model)
+	f.efforts = append(f.efforts, job.Effort)
 	f.runtimeDefault = append(f.runtimeDefault, job.RuntimeDefaultModel)
+	f.runtimeDefaultEfforts = append(f.runtimeDefaultEfforts, job.RuntimeDefaultEffort)
 	f.agentRefs = append(f.agentRefs, agent.RuntimeRef)
 	if f.onDeliver != nil {
 		f.onDeliver()

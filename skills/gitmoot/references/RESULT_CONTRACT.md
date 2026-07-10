@@ -246,6 +246,12 @@ Delegation fields:
   **Rule of thumb:** downshift `model` for cheap/mechanical legs; leave `model`
   empty for standard legs (so they take the runtime default); and reserve a deep
   model for genuinely hard or quorum-critical legs.
+- `effort` (optional): a free-form, runtime-scoped reasoning effort for the
+  child job. This job-level value overrides the delegated agent's default or
+  the ephemeral worker's `effort`; when omitted, effort falls back to that
+  agent/worker default and then `[runtimes.<name>].default_effort`. Gitmoot does
+  not apply an allow-list. Codex receives
+  `-c model_reasoning_effort=<value>`; Claude and Kimi ignore the setting.
 - `phase` (optional): a free-form per-delegation string. It is pass-through
   metadata — Gitmoot carries it through to the child job untouched and echoes it
   back in the coordinator continuation for each delegation that set a non-empty
@@ -268,6 +274,9 @@ Delegation fields:
     `claude`, or `kimi`. It is never `shell`.
   - `model` (optional): a runtime-scoped model string, as for the delegation
     `model` field above.
+  - `effort` (optional): the worker's default reasoning effort. A top-level
+    delegation `effort` overrides it; omit both to use the runtime registry
+    default (if configured).
   - `template` (optional): an agent-template id to seed the worker's prompt.
   - `role` (optional): a human-readable role label for the worker.
   - `capabilities` (optional): an array of capability strings advertised by the

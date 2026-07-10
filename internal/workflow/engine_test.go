@@ -2970,7 +2970,7 @@ func TestEngineDelegationWithoutTimeoutDefaultStaysUnbounded(t *testing.T) {
 	}
 }
 
-func TestEngineDelegationModelPlumbedToChildPayload(t *testing.T) {
+func TestEngineDelegationModelAndEffortPlumbedToChildPayload(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "audit", []string{"ask"}, "jerryfane/gitmoot")
@@ -2983,11 +2983,12 @@ func TestEngineDelegationModelPlumbedToChildPayload(t *testing.T) {
 		TaskID:    "task-5",
 		TaskTitle: "Parent",
 		Sender:    "audit",
+		Effort:    "low",
 		Result: &AgentResult{
 			Decision: "approved",
 			Summary:  "done",
 			Delegations: []Delegation{
-				{ID: "del-1", Agent: "helper", Action: "review", Prompt: "review this", Model: "  opus  "},
+				{ID: "del-1", Agent: "helper", Action: "review", Prompt: "review this", Model: "  opus  ", Effort: "  high  "},
 			},
 		},
 	})
@@ -3004,17 +3005,23 @@ func TestEngineDelegationModelPlumbedToChildPayload(t *testing.T) {
 	if payload.Model != "opus" {
 		t.Fatalf("child payload Model = %q, want trimmed %q", payload.Model, "opus")
 	}
+	if payload.Effort != "high" {
+		t.Fatalf("child payload Effort = %q, want delegation override %q", payload.Effort, "high")
+	}
 }
 
-func TestEngineDelegationRequestCopiesModel(t *testing.T) {
+func TestEngineDelegationRequestCopiesModelAndEffort(t *testing.T) {
 	engine := Engine{}
 	request := engine.delegationRequest(
 		db.Job{ID: "parent-job", Agent: "audit"},
-		JobPayload{Repo: "jerryfane/gitmoot"},
-		Delegation{ID: "del-1", Agent: "helper", Action: "review", Prompt: "go", Model: "opus"},
+		JobPayload{Repo: "jerryfane/gitmoot", Effort: "low"},
+		Delegation{ID: "del-1", Agent: "helper", Action: "review", Prompt: "go", Model: "opus", Effort: "high"},
 	)
 	if request.Model != "opus" {
 		t.Fatalf("request.Model = %q, want %q", request.Model, "opus")
+	}
+	if request.Effort != "high" {
+		t.Fatalf("request.Effort = %q, want delegation override %q", request.Effort, "high")
 	}
 }
 
@@ -3096,7 +3103,7 @@ func TestEngineDelegationRequestInheritsCockpit(t *testing.T) {
 
 func TestEngineDelegationRequestThreadsEphemeralSpec(t *testing.T) {
 	engine := Engine{}
-	spec := &EphemeralSpec{Runtime: runtime.CodexRuntime, Model: "gpt-5.4"}
+	spec := &EphemeralSpec{Runtime: runtime.CodexRuntime, Model: "gpt-5.4", Effort: "high"}
 	request := engine.delegationRequest(
 		db.Job{ID: "parent-job", Agent: "audit"},
 		JobPayload{Repo: "jerryfane/gitmoot"},
@@ -3147,7 +3154,7 @@ func TestEngineDispatchesEphemeralDelegationWithoutRegisteredAgent(t *testing.T)
 			Decision: "approved",
 			Summary:  "done",
 			Delegations: []Delegation{
-				{ID: "worker", Ephemeral: &EphemeralSpec{Runtime: runtime.CodexRuntime, Model: "gpt-5.4"}, Action: "review", Prompt: "hi"},
+				{ID: "worker", Ephemeral: &EphemeralSpec{Runtime: runtime.CodexRuntime, Model: "gpt-5.4", Effort: "high"}, Action: "review", Prompt: "hi"},
 			},
 		},
 	})
@@ -3167,7 +3174,7 @@ func TestEngineDispatchesEphemeralDelegationWithoutRegisteredAgent(t *testing.T)
 	if payload.Ephemeral == nil {
 		t.Fatalf("child payload missing ephemeral spec: %+v", payload)
 	}
-	if payload.Ephemeral.Runtime != runtime.CodexRuntime || payload.Ephemeral.Model != "gpt-5.4" {
+	if payload.Ephemeral.Runtime != runtime.CodexRuntime || payload.Ephemeral.Model != "gpt-5.4" || payload.Ephemeral.Effort != "high" {
 		t.Fatalf("child payload ephemeral spec = %+v", payload.Ephemeral)
 	}
 	// The stored payload JSON must carry the ephemeral key so downstream consumers
@@ -4510,6 +4517,18 @@ func TestCanonicalDelegationSetHashIgnoresPhase(t *testing.T) {
 	}
 	if canonicalDelegationSetHash(base) != canonicalDelegationSetHash(phased) {
 		t.Fatal("hash must ignore phase (metadata, excluded from loop detection)")
+	}
+}
+
+func TestCanonicalDelegationSetHashIncludesEphemeralEffort(t *testing.T) {
+	base := []Delegation{
+		{ID: "a", Ephemeral: &EphemeralSpec{Runtime: "codex", Model: "gpt-5.4", Effort: "low"}, Action: "review", Prompt: "step a"},
+	}
+	higherEffort := []Delegation{
+		{ID: "a", Ephemeral: &EphemeralSpec{Runtime: "codex", Model: "gpt-5.4", Effort: "high"}, Action: "review", Prompt: "step a"},
+	}
+	if canonicalDelegationSetHash(base) == canonicalDelegationSetHash(higherEffort) {
+		t.Fatal("hash must change when ephemeral effort changes, exactly like ephemeral model")
 	}
 }
 

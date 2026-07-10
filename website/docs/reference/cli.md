@@ -83,8 +83,8 @@ snippet with `--config-snippet`.
 
 Gitmoot drives four built-in runtimes (`codex`, `claude`, `kimi`, plus the
 subscribe-only `shell`; the legacy `kimi-cli` is also compiled in). Each carries
-declarative metadata — advertised capabilities, a default model, an advisory list
-of known-valid models, and a descriptor of where token usage is read from. Inspect
+declarative metadata — advertised capabilities, default model and effort values,
+an advisory list of known-valid models, and a descriptor of where token usage is read from. Inspect
 the resolved registry:
 
 ```sh
@@ -95,26 +95,29 @@ gitmoot runtime list --json
 The values come from the compiled built-in defaults, overlaid with any
 `[runtimes.<name>]` overrides in `config.toml`. Override a built-in runtime's
 recorded metadata **without recompiling** — for example to retarget its default
-model or record its known models:
+model/effort or record its known models:
 
 ```toml
 [runtimes.codex]
 default_model = "gpt-5.5-codex"
+default_effort = "high"
 models = ["gpt-5.5-codex", "gpt-5.4-codex"]
 capabilities = ["review", "implement", "ask"]
 usage_source = "codex exec --json turn.completed usage"
 ```
 
-Exactly one field is **behavioral**: `default_model` is consulted at job **delivery**
-as the model fallback when **neither the agent nor the job pins a `--model`** — so
-setting it **does** retarget the model those jobs run on. The resolution order is:
-the agent/job `--model` win, then this `default_model`, then the runtime CLI's own
-default. Every other field is **inspection-only**, surfaced by `gitmoot runtime list`
-but changing nothing at runtime: `models` is **advisory** (Gitmoot never rejects a
-`--model` based on it), and `capabilities` gates nothing at dispatch. Adapter
-behavior (auth, sandbox policy, session resume, stream parsing) always stays in Go.
-With no `[runtimes.*]` section — and with `default_model` unset — behavior is
-byte-identical: no model is forced.
+Two fields are **behavioral**. `default_model` is the model fallback when neither
+the agent nor the job pins `--model`: agent/job `--model`, then `default_model`,
+then the runtime CLI's own default. `default_effort` follows the same precedence
+after job/agent `--effort`; for Codex, Gitmoot emits
+`-c model_reasoning_effort=<value>`. Claude and Kimi do not expose a reasoning
+effort argument, so the resolved value is a no-op for those adapters. Every other
+field is **inspection-only**, surfaced by `gitmoot runtime list` but changing
+nothing at runtime: `models` is **advisory** (Gitmoot never rejects a `--model`
+based on it), and `capabilities` gates nothing at dispatch. Adapter behavior
+(auth, sandbox policy, session resume, stream parsing) always stays in Go. With
+no `[runtimes.*]` section, and with both defaults unset, no model or effort is
+forced.
 
 A `[runtimes.<name>]` section can only tweak a **built-in** runtime's metadata; it
 cannot add a new first-class runtime (that requires a code change). An unknown
@@ -352,6 +355,7 @@ gitmoot agent start reviewer \
   --capability ask \
   --capability review \
   --model gpt-5-codex \
+  --effort high \
   --start-daemon
 ```
 
@@ -362,6 +366,15 @@ with no allow-list; both `--model X` and `--model=X` are accepted. A per-job
 `--model` (or a delegation's `model` field) overrides this default, and an
 omitted model preserves the runtime's own default. The same default can be set
 in config under `[agents.<type>].model`.
+
+The same commands accept `--effort <value>` as the agent's default reasoning
+effort, and `agent run`, `ask`, `implement`, `review`, and `orchestrate` accept it
+as a per-job override. A delegation's `effort` field is the child-job override,
+while an ephemeral worker spec's `effort` is that worker's default. The
+resolution order mirrors model selection: job/delegation effort, agent/worker
+effort, `[runtimes.<runtime>].default_effort`, then no explicit override. Values
+are free-form pass-through strings. Codex receives
+`-c model_reasoning_effort=<value>`; Claude and Kimi ignore the setting.
 
 `agent start` and `agent subscribe` accept `--policy` (default `auto`). The policy
 maps to the runtime permission mode and decides what a headless job may do:
@@ -436,7 +449,8 @@ gitmoot agent subscribe reviewer \
   --role reviewer \
   --capability ask \
   --capability review \
-  --model gpt-5-codex
+  --model gpt-5-codex \
+  --effort high
 ```
 
 `agent subscribe` additionally accepts `--runtime shell`, the deterministic
@@ -475,6 +489,7 @@ gitmoot agent implement lead --repo owner/repo --task task-001 "Implement this t
 gitmoot agent ask project-planner --repo owner/repo "Return the plan status."
 gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
 gitmoot agent run lead --repo owner/repo --model gpt-5-codex "Implement this task."
+gitmoot agent run lead --repo owner/repo --effort xhigh "Implement this task."
 gitmoot job watch <job-id>
 ```
 
@@ -484,6 +499,10 @@ overriding the agent's configured default. It is a free-form, runtime-scoped
 string (a Codex, Claude Code, or Kimi Code model name) with no allow-list; an
 omitted `--model` leaves the agent's default model in effect. Both `--model X`
 and `--model=X` are accepted.
+
+`--effort <value>` and `--effort=<value>` select reasoning effort for one job
+with the same job-over-agent-over-registry precedence. Gitmoot does not validate
+an allow-list; Codex validates the forwarded value.
 
 The same commands accept an optional per-job `--runtime
 codex|claude|kimi|kimi-cli|shell` override: that ONE job runs through the named
@@ -498,7 +517,9 @@ override runtime so it cannot collide with the default session's lock. Model
 rule: `--model` combined with `--runtime` is interpreted for the OVERRIDE
 runtime; an override without `--model` uses the override runtime's default
 model — the agent's configured default model is never applied to a different
-runtime. An unknown
+runtime. The same rule applies to `--effort`: an explicit job value belongs to
+the override runtime, while the agent's default effort does not cross runtimes.
+An unknown
 `--runtime` fails before any job is enqueued, background (daemon) jobs honor
 the override identically to foreground, and a coordinator's delegation-tree
 continuations (synthesis, corrective, replan, finalize) inherit the override,
@@ -554,6 +575,7 @@ Start an orchestra of agents with `gitmoot orchestrate`:
 ```sh
 gitmoot orchestrate project-planner "Plan and split this work across agents." --repo owner/repo
 gitmoot orchestrate project-planner "Plan and split this work." --repo owner/repo --model gpt-5-codex
+gitmoot orchestrate project-planner "Plan and split this work." --repo owner/repo --effort high
 gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
 ```
 
@@ -586,11 +608,15 @@ gitmoot agent type list
 gitmoot agent type show planner
 gitmoot agent type set planner --runtime codex --template planner --max-background 2 --idle-timeout 20m
 gitmoot agent type set planner --model gpt-5-codex
+gitmoot agent type set planner --effort high
 gitmoot agent gc
 ```
 
 `agent type set --model <name>` (or `[agents.<type>].model` in config) sets the
 default runtime model for that managed agent type.
+
+`agent type set --effort <value>` (or `[agents.<type>].effort`) sets its default
+reasoning effort.
 
 Schedule recurring agent work (heartbeats, off by default):
 

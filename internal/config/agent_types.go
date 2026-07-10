@@ -14,6 +14,7 @@ type AgentType struct {
 	Runtime        string
 	Template       string
 	Model          string
+	Effort         string
 	Role           string
 	Capabilities   []string
 	AutonomyPolicy string
@@ -121,6 +122,7 @@ func applyAgentTypeDefaults(entry *AgentType) {
 	entry.Runtime = strings.TrimSpace(entry.Runtime)
 	entry.Template = strings.TrimSpace(entry.Template)
 	entry.Model = strings.TrimSpace(entry.Model)
+	entry.Effort = strings.TrimSpace(entry.Effort)
 	entry.Role = strings.TrimSpace(entry.Role)
 	if entry.Role == "" {
 		entry.Role = entry.Name
@@ -156,6 +158,10 @@ func applyAgentTypeField(entry *AgentType, key string, value string) error {
 	case "model":
 		parsed, err := parseConfigString(value)
 		entry.Model = parsed
+		return err
+	case "effort":
+		parsed, err := parseConfigString(value)
+		entry.Effort = parsed
 		return err
 	case "role":
 		parsed, err := parseConfigString(value)
@@ -331,6 +337,11 @@ func writeAgentTypeBlock(builder *strings.Builder, entry AgentType) {
 	if entry.Model != "" {
 		builder.WriteString("model = ")
 		builder.WriteString(strconv.Quote(entry.Model))
+		builder.WriteString("\n")
+	}
+	if entry.Effort != "" {
+		builder.WriteString("effort = ")
+		builder.WriteString(strconv.Quote(entry.Effort))
 		builder.WriteString("\n")
 	}
 	builder.WriteString("role = ")

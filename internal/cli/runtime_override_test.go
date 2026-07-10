@@ -87,13 +87,14 @@ func TestApplyJobRuntimeOverride(t *testing.T) {
 		Runtime:        runtime.CodexRuntime,
 		RuntimeRef:     "codex-session",
 		Model:          "gpt-5.5-codex",
+		Effort:         "high",
 		RepoScope:      "owner/repo",
 		Capabilities:   []string{"ask"},
 		AutonomyPolicy: runtime.AutonomyPolicyReadOnly,
 	}
 
 	unchanged := applyJobRuntimeOverride(agent, workflow.JobPayload{})
-	if unchanged.Runtime != agent.Runtime || unchanged.RuntimeRef != agent.RuntimeRef || unchanged.Model != agent.Model {
+	if unchanged.Runtime != agent.Runtime || unchanged.RuntimeRef != agent.RuntimeRef || unchanged.Model != agent.Model || unchanged.Effort != agent.Effort {
 		t.Fatalf("no override must be a no-op, got %+v", unchanged)
 	}
 
@@ -104,11 +105,14 @@ func TestApplyJobRuntimeOverride(t *testing.T) {
 	if effective.Model != "" {
 		t.Fatalf("the agent's default model must never leak onto the override runtime, got %q", effective.Model)
 	}
+	if effective.Effort != "" {
+		t.Fatalf("the agent's default effort must never leak onto the override runtime, got %q", effective.Effort)
+	}
 	if effective.Name != agent.Name || effective.Role != agent.Role || effective.AutonomyPolicy != agent.AutonomyPolicy {
 		t.Fatalf("override must preserve identity/policy: %+v", effective)
 	}
 	// The stored/default agent value is untouched (value semantics, no aliasing).
-	if agent.Runtime != runtime.CodexRuntime || agent.RuntimeRef != "codex-session" || agent.Model != "gpt-5.5-codex" {
+	if agent.Runtime != runtime.CodexRuntime || agent.RuntimeRef != "codex-session" || agent.Model != "gpt-5.5-codex" || agent.Effort != "high" {
 		t.Fatalf("input agent mutated: %+v", agent)
 	}
 }

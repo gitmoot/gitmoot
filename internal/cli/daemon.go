@@ -438,9 +438,10 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		engine := workflow.Engine{
 			Store:     store,
 			MergeGate: mergeGate,
-			// Registry default_model behavioral fallback (#652), home-aware and
-			// fail-open — see daemonWorkflowEngine. Empty by default => byte-identical.
-			RuntimeDefaultModel: runtimeDefaultModelResolver(*home),
+			// Registry default model/effort fallbacks, home-aware and fail-open — see
+			// daemonWorkflowEngine. Empty by default => byte-identical.
+			RuntimeDefaultModel:  runtimeDefaultModelResolver(*home),
+			RuntimeDefaultEffort: runtimeDefaultEffortResolver(*home),
 			// Result-check audit (#526), home-aware and fail-safe to the default warn.
 			ResultCheckMode: resultChecksMode(*home),
 		}
@@ -6017,6 +6018,7 @@ func (w jobWorker) queueTempWorkerMergeBack(ctx context.Context, completedJobID 
 		Agent:            original.Name,
 		Action:           "ask",
 		Model:            payload.Model,
+		Effort:           payload.Effort,
 		Repo:             payload.Repo,
 		Branch:           payload.Branch,
 		GoalID:           payload.GoalID,
@@ -6121,6 +6123,7 @@ func (w jobWorker) startTempWorker(ctx context.Context, job db.Job, payload work
 		Role:           tempAgent.Role,
 		TemplateID:     tempAgent.TemplateID,
 		Model:          tempAgent.Model,
+		Effort:         tempAgent.Effort,
 		Capabilities:   tempAgent.Capabilities,
 		AutonomyPolicy: tempAgent.AutonomyPolicy,
 		State:          "starting",
@@ -6192,6 +6195,7 @@ func (w jobWorker) startEphemeralWorker(ctx context.Context, job db.Job, payload
 		Role:           role,
 		Runtime:        spec.Runtime,
 		Model:          spec.Model,
+		Effort:         spec.Effort,
 		TemplateID:     spec.Template,
 		Capabilities:   capabilities,
 		AutonomyPolicy: policy,
@@ -6238,6 +6242,7 @@ func (w jobWorker) startEphemeralWorker(ctx context.Context, job db.Job, payload
 		Role:           ephemeralAgent.Role,
 		TemplateID:     ephemeralAgent.TemplateID,
 		Model:          ephemeralAgent.Model,
+		Effort:         ephemeralAgent.Effort,
 		Capabilities:   ephemeralAgent.Capabilities,
 		AutonomyPolicy: ephemeralAgent.AutonomyPolicy,
 		State:          "starting",
@@ -6769,13 +6774,13 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 		// the terminal path are byte-identical. Non-enrolled agents are never touched
 		// even when the controller is present.
 		Memory: daemonMemoryController(store, home),
-		// Registry default_model behavioral fallback (#652): when a delivered job
-		// pins no agent --model and no job --model, fall back to the runtime's
-		// configured default_model from the HOME-AWARE resolved runtime registry
+		// Registry default model/effort fallbacks: when a delivered job pins no
+		// agent/job override, fall back to the HOME-AWARE resolved runtime registry
 		// (built-in defaults overlaid with [runtimes.<name>] config). Fail-open and
-		// empty by default, so with no config NO model is forced and delivery is
-		// byte-identical; an agent/job --model always wins.
-		RuntimeDefaultModel: runtimeDefaultModelResolver(home),
+		// empty by default, so with no config no model or effort is forced; an
+		// agent/job override always wins.
+		RuntimeDefaultModel:  runtimeDefaultModelResolver(home),
+		RuntimeDefaultEffort: runtimeDefaultEffortResolver(home),
 		// Off-restores-byte-identical result-check audit (#526): the deterministic
 		// binary-checklist audit of a job's parsed gitmoot_result. resultChecksMode
 		// resolves the [workflow] result_checks knob (default warn) from the

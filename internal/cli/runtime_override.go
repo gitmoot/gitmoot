@@ -70,9 +70,9 @@ func resolveJobRuntimeOverride(overrideRuntime string, session string) (string, 
 
 // applyJobRuntimeOverride returns the EFFECTIVE runtime.Agent an overridden
 // job runs as: the override runtime + the job's own session ref, with the
-// agent's configured default model cleared (it belongs to the default runtime
-// and may be invalid on the override runtime; a per-job --model still flows
-// through job.Model and wins in effectiveModel). A payload with no override
+// agent's configured default model and effort cleared (they belong to the
+// default runtime and may be invalid on the override runtime; per-job --model
+// and --effort still flow through the job payload). A payload with no override
 // returns the agent unchanged. The stored agent row is never modified.
 func applyJobRuntimeOverride(agent runtime.Agent, payload workflow.JobPayload) runtime.Agent {
 	rt := strings.TrimSpace(payload.RuntimeOverride)
@@ -82,6 +82,7 @@ func applyJobRuntimeOverride(agent runtime.Agent, payload workflow.JobPayload) r
 	agent.Runtime = rt
 	agent.RuntimeRef = strings.TrimSpace(payload.RuntimeOverrideRef)
 	agent.Model = ""
+	agent.Effort = ""
 	return agent
 }
 

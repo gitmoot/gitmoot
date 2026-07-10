@@ -36,6 +36,7 @@ func TestLoadRuntimeOverridesParsesKeys(t *testing.T) {
 	paths := writeRuntimeRegistryConfig(t, `
 [runtimes.codex]
 default_model = "gpt-5.5-codex"
+default_effort = "high"
 models = ["gpt-5.5-codex", "gpt-5.4-codex"]
 
 [runtimes.claude]
@@ -56,6 +57,9 @@ usage_source = "custom"
 	if !codex.DefaultModelSet || codex.DefaultModel != "gpt-5.5-codex" {
 		t.Fatalf("default_model not parsed: %+v", codex)
 	}
+	if !codex.DefaultEffortSet || codex.DefaultEffort != "high" {
+		t.Fatalf("default_effort not parsed: %+v", codex)
+	}
 	if !codex.ModelsSet || !reflect.DeepEqual(codex.Models, []string{"gpt-5.5-codex", "gpt-5.4-codex"}) {
 		t.Fatalf("models not parsed: %+v", codex)
 	}
@@ -70,7 +74,7 @@ usage_source = "custom"
 	if !claude.UsageSourceSet || claude.UsageSource != "custom" {
 		t.Fatalf("usage_source not parsed: %+v", claude)
 	}
-	if claude.DefaultModelSet || claude.ModelsSet {
+	if claude.DefaultModelSet || claude.DefaultEffortSet || claude.ModelsSet {
 		t.Fatalf("unset keys must have *Set false: %+v", claude)
 	}
 }

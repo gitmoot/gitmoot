@@ -2094,14 +2094,14 @@ func TestRunQueuedJobsMaterializesAndDisposesEphemeralWorker(t *testing.T) {
 		Action:    "ask",
 		Repo:      "owner/repo",
 		Branch:    "main",
-		Ephemeral: &workflow.EphemeralSpec{Runtime: runtime.CodexRuntime, Model: "gpt-5.4"},
+		Ephemeral: &workflow.EphemeralSpec{Runtime: runtime.CodexRuntime, Model: "gpt-5.4", Effort: "high"},
 	})
 
 	startAdapter := &cliWorkerFakeAdapter{startRuntimeRef: "550e8400-e29b-41d4-a716-446655440555"}
 	deliveryAdapter := &cliWorkerFakeAdapter{
 		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}
-	var deliveredModel string
+	var deliveredModel, deliveredEffort string
 	startCheckouts := []string{}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
@@ -2113,6 +2113,7 @@ func TestRunQueuedJobsMaterializesAndDisposesEphemeralWorker(t *testing.T) {
 	}
 	worker.AdapterFactory = func(agent runtime.Agent, _ string) (workflow.DeliveryAdapter, error) {
 		deliveredModel = agent.Model
+		deliveredEffort = agent.Effort
 		return deliveryAdapter, nil
 	}
 	worker.WorkflowFactory = func(string) workflow.Engine {
@@ -2135,6 +2136,9 @@ func TestRunQueuedJobsMaterializesAndDisposesEphemeralWorker(t *testing.T) {
 	}
 	if deliveredModel != "gpt-5.4" {
 		t.Fatalf("delivered agent model = %q, want gpt-5.4", deliveredModel)
+	}
+	if deliveredEffort != "high" {
+		t.Fatalf("delivered agent effort = %q, want high", deliveredEffort)
 	}
 	if len(startCheckouts) != 1 || startCheckouts[0] != checkout {
 		t.Fatalf("start checkouts = %+v, want %q", startCheckouts, checkout)

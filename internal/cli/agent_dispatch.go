@@ -28,6 +28,7 @@ type localAgentDispatchRequest struct {
 	Background   bool
 	Type         string
 	Model        string
+	Effort       string
 	// Runtime, when non-empty, is the per-job runtime override (#531): this one
 	// job runs through the named runtime while the agent's registered default
 	// runtime (and its session) stays untouched. RuntimeSession optionally names
@@ -222,6 +223,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		Sender:                 "local",
 		Instructions:           request.Instructions,
 		Model:                  request.Model,
+		Effort:                 request.Effort,
 		RuntimeOverride:        overrideRuntime,
 		RuntimeOverrideRef:     overrideRef,
 		Cockpit:                request.Cockpit,
@@ -378,10 +380,10 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			}
 		}
 		if !handled {
-			// #652: wire the home-aware registry default_model fallback so a
-			// foreground ask with no agent/job --model honors [runtimes.<rt>].default_model
-			// too. Fail-open/empty by default => byte-identical; an agent/job pin wins.
-			mailbox := workflow.Mailbox{Store: store, RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home)}
+			// Wire the home-aware registry defaults so a foreground ask with no
+			// agent/job model or effort pin honors the runtime's defaults too.
+			// Fail-open/empty by default; an agent/job pin wins.
+			mailbox := workflow.Mailbox{Store: store, RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home), RuntimeDefaultEffort: runtimeDefaultEffortResolver(request.Home)}
 			if _, err := mailbox.Run(runCtx, job.ID, effectiveAgent, adapter); err != nil {
 				return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, err)
 			}
@@ -494,6 +496,7 @@ func enqueuePermissionBlockedLocalAgentJob(ctx context.Context, store *db.Store,
 		// agent's default runtime — resuming the default-runtime session the user's
 		// --runtime explicitly asked it to stay off.
 		Model:              request.Model,
+		Effort:             request.Effort,
 		RuntimeOverride:    overrideRuntime,
 		RuntimeOverrideRef: overrideRef,
 	})
@@ -949,6 +952,7 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 		Role:           instanceAgent.Role,
 		TemplateID:     instanceAgent.TemplateID,
 		Model:          instanceAgent.Model,
+		Effort:         instanceAgent.Effort,
 		Capabilities:   instanceAgent.Capabilities,
 		AutonomyPolicy: instanceAgent.AutonomyPolicy,
 		State:          "starting",
@@ -983,6 +987,7 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 		Role:           instanceAgent.Role,
 		TemplateID:     instanceAgent.TemplateID,
 		Model:          instanceAgent.Model,
+		Effort:         instanceAgent.Effort,
 		Capabilities:   instanceAgent.Capabilities,
 		AutonomyPolicy: instanceAgent.AutonomyPolicy,
 		State:          "starting",
@@ -1064,6 +1069,7 @@ func runtimeAgentFromType(agentType config.AgentType, repo string, name string) 
 		RepoScope:      repo,
 		TemplateID:     agentType.Template,
 		Model:          agentType.Model,
+		Effort:         agentType.Effort,
 		Capabilities:   agentType.Capabilities,
 		AutonomyPolicy: runtime.NormalizeStoredAutonomyPolicy(agentType.AutonomyPolicy),
 		HealthStatus:   "idle",

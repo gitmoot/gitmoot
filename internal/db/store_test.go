@@ -3181,7 +3181,7 @@ func TestListJobsByParent(t *testing.T) {
 	}
 }
 
-func TestUpsertAgentPersistsModel(t *testing.T) {
+func TestUpsertAgentPersistsModelAndEffort(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
@@ -3194,6 +3194,7 @@ func TestUpsertAgentPersistsModel(t *testing.T) {
 		Role:    "dev",
 		Runtime: "claude",
 		Model:   "claude-opus-4-1",
+		Effort:  "high",
 	}
 	if err := store.UpsertAgent(ctx, agent); err != nil {
 		t.Fatalf("UpsertAgent returned error: %v", err)
@@ -3206,6 +3207,9 @@ func TestUpsertAgentPersistsModel(t *testing.T) {
 	if got.Model != "claude-opus-4-1" {
 		t.Fatalf("GetAgent model = %q, want %q", got.Model, "claude-opus-4-1")
 	}
+	if got.Effort != "high" {
+		t.Fatalf("GetAgent effort = %q, want high", got.Effort)
+	}
 
 	agents, err := store.ListAgents(ctx)
 	if err != nil {
@@ -3217,6 +3221,9 @@ func TestUpsertAgentPersistsModel(t *testing.T) {
 			found = true
 			if a.Model != "claude-opus-4-1" {
 				t.Fatalf("ListAgents model = %q, want %q", a.Model, "claude-opus-4-1")
+			}
+			if a.Effort != "high" {
+				t.Fatalf("ListAgents effort = %q, want high", a.Effort)
 			}
 		}
 	}
@@ -3236,9 +3243,12 @@ func TestUpsertAgentPersistsModel(t *testing.T) {
 	if gotPlain.Model != "" {
 		t.Fatalf("GetAgent (plain) model = %q, want empty", gotPlain.Model)
 	}
+	if gotPlain.Effort != "" {
+		t.Fatalf("GetAgent (plain) effort = %q, want empty", gotPlain.Effort)
+	}
 }
 
-func TestUpsertAgentInstancePersistsModel(t *testing.T) {
+func TestUpsertAgentInstancePersistsModelAndEffort(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
@@ -3253,6 +3263,7 @@ func TestUpsertAgentInstancePersistsModel(t *testing.T) {
 		RepoFullName: "owner/repo",
 		Role:         "dev",
 		Model:        "claude-sonnet-4-5",
+		Effort:       "medium",
 		State:        "idle",
 	}
 	if err := store.UpsertAgentInstance(ctx, instance); err != nil {
@@ -3266,6 +3277,9 @@ func TestUpsertAgentInstancePersistsModel(t *testing.T) {
 	if got.Model != "claude-sonnet-4-5" {
 		t.Fatalf("GetAgentInstance model = %q, want %q", got.Model, "claude-sonnet-4-5")
 	}
+	if got.Effort != "medium" {
+		t.Fatalf("GetAgentInstance effort = %q, want medium", got.Effort)
+	}
 
 	// GetAgent falls back to the instance when no registered agent exists,
 	// and surfaces the instance's model.
@@ -3275,6 +3289,9 @@ func TestUpsertAgentInstancePersistsModel(t *testing.T) {
 	}
 	if agent.Model != "claude-sonnet-4-5" {
 		t.Fatalf("GetAgent (instance fallback) model = %q, want %q", agent.Model, "claude-sonnet-4-5")
+	}
+	if agent.Effort != "medium" {
+		t.Fatalf("GetAgent (instance fallback) effort = %q, want medium", agent.Effort)
 	}
 }
 

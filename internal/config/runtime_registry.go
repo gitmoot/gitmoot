@@ -21,6 +21,10 @@ type RuntimeOverride struct {
 	// default). DefaultModelSet reports the key was present.
 	DefaultModel    string
 	DefaultModelSet bool
+	// DefaultEffort overrides the runtime's default reasoning effort (empty = no
+	// explicit override). DefaultEffortSet reports the key was present.
+	DefaultEffort    string
+	DefaultEffortSet bool
 	// Models replaces the advisory known-valid model list. ModelsSet reports the
 	// key was present (an empty array is a valid, explicit "clear the list").
 	Models    []string
@@ -116,6 +120,14 @@ func applyRuntimeOverrideField(override *RuntimeOverride, key string, value stri
 		}
 		override.DefaultModel = strings.TrimSpace(parsed)
 		override.DefaultModelSet = true
+		return nil
+	case "default_effort":
+		parsed, err := parseConfigString(value)
+		if err != nil {
+			return err
+		}
+		override.DefaultEffort = strings.TrimSpace(parsed)
+		override.DefaultEffortSet = true
 		return nil
 	case "models":
 		parsed, err := parseConfigStringArray(value)

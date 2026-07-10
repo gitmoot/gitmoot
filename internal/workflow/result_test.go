@@ -337,7 +337,7 @@ func TestValidateAgentResultRejectsArtifactsWithoutBody(t *testing.T) {
 func TestValidateAgentResultAcceptsEphemeralDelegation(t *testing.T) {
 	output := `{"gitmoot_result":{"decision":"implemented","summary":"fan out",` +
 		`"delegations":[` +
-		`{"id":"worker","ephemeral":{"runtime":"codex","model":"gpt-5.4","autonomy_policy":"workspace-write"},"action":"implement","prompt":"hi"}` +
+		`{"id":"worker","ephemeral":{"runtime":"codex","model":"gpt-5.4","effort":"high","autonomy_policy":"workspace-write"},"action":"implement","prompt":"hi","effort":"xhigh"}` +
 		`]}}`
 
 	result, err := ExtractAgentResult(output)
@@ -351,8 +351,11 @@ func TestValidateAgentResultAcceptsEphemeralDelegation(t *testing.T) {
 	if spec == nil {
 		t.Fatalf("ephemeral spec was not parsed: %+v", result.Delegations[0])
 	}
-	if spec.Runtime != "codex" || spec.Model != "gpt-5.4" {
+	if spec.Runtime != "codex" || spec.Model != "gpt-5.4" || spec.Effort != "high" {
 		t.Fatalf("ephemeral spec = %+v", spec)
+	}
+	if result.Delegations[0].Effort != "xhigh" {
+		t.Fatalf("delegation effort = %q, want %q", result.Delegations[0].Effort, "xhigh")
 	}
 	if strings.TrimSpace(result.Delegations[0].Agent) != "" {
 		t.Fatalf("ephemeral delegation should not carry an agent: %q", result.Delegations[0].Agent)

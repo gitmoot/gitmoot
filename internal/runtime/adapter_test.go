@@ -234,6 +234,74 @@ func TestEffectiveModelResolutionOrder(t *testing.T) {
 	}
 }
 
+func TestEffectiveEffortResolutionOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		agentEffort string
+		jobEffort   string
+		rtDefault   string
+		want        string
+	}{
+		{"job wins over all", "medium", "xhigh", "low", "xhigh"},
+		{"agent wins over runtime default", "high", "", "low", "high"},
+		{"runtime default when neither pins", "", "", "medium", "medium"},
+		{"empty when nothing set", "", "", "", ""},
+		{"runtime default trimmed", "", "", "  high  ", "high"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := effectiveEffort(Agent{Effort: tc.agentEffort}, Job{Effort: tc.jobEffort, RuntimeDefaultEffort: tc.rtDefault})
+			if got != tc.want {
+				t.Fatalf("effectiveEffort(agent=%q, job=%q, rtDefault=%q) = %q, want %q", tc.agentEffort, tc.jobEffort, tc.rtDefault, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCodexDeliverArgsReasoningEffort(t *testing.T) {
+	freshRef, err := NewFreshRef()
+	if err != nil {
+		t.Fatalf("NewFreshRef: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		agent  Agent
+		model  string
+		effort string
+		want   []string
+	}{
+		{
+			name:   "fresh ref emits config before separator",
+			agent:  Agent{RuntimeRef: freshRef},
+			model:  "gpt-5.5-codex",
+			effort: "high",
+			want:   []string{"exec", "--json", "--model", "gpt-5.5-codex", "-c", "model_reasoning_effort=high", "--", "prompt"},
+		},
+		{
+			name:   "resume emits config before ref and separator",
+			agent:  Agent{RuntimeRef: "thread-1"},
+			model:  "gpt-5.5-codex",
+			effort: "xhigh",
+			want:   []string{"exec", "--json", "resume", "--model", "gpt-5.5-codex", "-c", "model_reasoning_effort=xhigh", "thread-1", "--", "prompt"},
+		},
+		{
+			name:  "empty fresh emits nothing",
+			agent: Agent{RuntimeRef: freshRef},
+			want:  []string{"exec", "--json", "--", "prompt"},
+		},
+		{
+			name:  "empty resume emits nothing",
+			agent: Agent{RuntimeRef: "thread-1"},
+			want:  []string{"exec", "--json", "resume", "thread-1", "--", "prompt"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := codexDeliverArgs(tc.agent, "prompt", tc.model, tc.effort, true); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("codexDeliverArgs() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCodexStartCommandUsesAgentModel(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440009"}` + "\n"}}}
 	adapter := CodexAdapter{Runner: runner}
@@ -243,6 +311,17 @@ func TestCodexStartCommandUsesAgentModel(t *testing.T) {
 		t.Fatalf("Start returned error: %v", err)
 	}
 	runner.want(t, 0, "codex", "exec", "--model", "opus", "--json", "--", "initialize")
+}
+
+func TestCodexStartCommandUsesAgentEffort(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440009"}` + "\n"}}}
+	adapter := CodexAdapter{Runner: runner}
+	agent := Agent{Name: "lead", Role: "implementer", Runtime: CodexRuntime, RepoScope: "jerryfane/gitmoot", Effort: "high"}
+
+	if _, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "initialize"}); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	runner.want(t, 0, "codex", "exec", "-c", "model_reasoning_effort=high", "--json", "--", "initialize")
 }
 
 func TestCodexStartCommandParsesThreadID(t *testing.T) {
@@ -512,6 +591,32 @@ func TestClaudeDeliverCommandFallsBackToAgentModel(t *testing.T) {
 		t.Fatalf("Deliver returned error: %v", err)
 	}
 	runner.want(t, 0, "claude", "--model", "sonnet", "--resume", "550e8400-e29b-41d4-a716-446655440002", "-p", "--output-format", "json", "--", "review")
+}
+
+func TestNonCodexDeliveriesNeverEmitReasoningEffort(t *testing.T) {
+	t.Run("claude", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"result":"done"}`}}}
+		adapter := ClaudeAdapter{Runner: runner}
+		agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "jerryfane/gitmoot", Effort: "high"}
+		if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review", Effort: "xhigh", RuntimeDefaultEffort: "low"}); err != nil {
+			t.Fatalf("Deliver returned error: %v", err)
+		}
+		if strings.Contains(strings.Join(runner.calls[0], " "), "model_reasoning_effort") {
+			t.Fatalf("claude args unexpectedly contain reasoning effort: %v", runner.calls[0])
+		}
+	})
+
+	t.Run("kimi", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"role":"assistant","content":"done"}` + "\n"}}}
+		adapter := KimiAdapter{Runner: runner}
+		agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: KimiRuntime, RuntimeRef: "session_1", RepoScope: "jerryfane/gitmoot", Effort: "high"}
+		if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review", Effort: "xhigh", RuntimeDefaultEffort: "low"}); err != nil {
+			t.Fatalf("Deliver returned error: %v", err)
+		}
+		if strings.Contains(strings.Join(runner.calls[0], " "), "model_reasoning_effort") {
+			t.Fatalf("kimi args unexpectedly contain reasoning effort: %v", runner.calls[0])
+		}
+	})
 }
 
 func TestIsClaudeSessionMissing(t *testing.T) {
