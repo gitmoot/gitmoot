@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jerryfane/gitmoot/internal/subprocess"
@@ -148,6 +150,83 @@ type Result struct {
 	// self-heal path (a genuinely dead pinned session, replaced permanently) leaves
 	// this false so its re-pin IS persisted.
 	SessionEphemeral bool
+	// SessionDiag carries process-level diagnostics for the runtime CLI run
+	// backing this delivery (#806). Adapters populate it best-effort on every
+	// Deliver return that actually ran a CLI process — success and failure alike —
+	// so the engine can persist bounded, redacted crash context when a job ends
+	// WITHOUT producing a gitmoot_result envelope. nil means no CLI process ran
+	// (e.g. a validation error), so there is nothing to diagnose.
+	SessionDiag *SessionDiag
+}
+
+// SessionDiag is the raw process-level evidence of how a runtime CLI run ended
+// (#806). It is UNREDACTED and UNBOUNDED here — the workflow engine redacts and
+// bounds the stderr before anything is persisted or surfaced.
+type SessionDiag struct {
+	// Stderr is the CLI process's captured stderr, kept separate from Result.Raw
+	// (which merges stdout+stderr on failure paths).
+	Stderr string
+	// StdoutSeen reports whether the CLI produced any stdout before it ended —
+	// the engine uses it to distinguish a crash before output (launched) from a
+	// crash mid-output (streaming).
+	StdoutSeen bool
+	// ExitCode is the process exit status when known; nil when the process was
+	// terminated by a signal or the run error was not a process exit at all
+	// (spawn failure, context cancellation).
+	ExitCode *int
+	// Signal is the signal name when the process was terminated by a signal.
+	Signal string
+	// SessionID is the concrete runtime session id in play when one was
+	// created/known; empty for runtimes without session ids (shell, kimi's
+	// unreported per-job sessions) and for non-concrete refs ("last", fresh:*).
+	SessionID string
+}
+
+// newSessionDiag builds the SessionDiag for one runner invocation: the captured
+// stderr, whether any stdout was produced, and the exit code/signal decoded from
+// the runner error (nil error means the process exited 0).
+func newSessionDiag(res subprocess.Result, runErr error, sessionID string) *SessionDiag {
+	code, signal := decodeProcessExit(runErr)
+	return &SessionDiag{
+		Stderr:     res.Stderr,
+		StdoutSeen: strings.TrimSpace(res.Stdout) != "",
+		ExitCode:   code,
+		Signal:     signal,
+		SessionID:  strings.TrimSpace(sessionID),
+	}
+}
+
+// decodeProcessExit extracts how a runner subprocess ended from its run error:
+// (code, "") for a plain exit — a nil error means exit 0 — (nil, signal) when
+// the process was terminated by a signal, and (nil, "") when the error is not a
+// process exit at all (spawn failure, context cancellation).
+func decodeProcessExit(err error) (*int, string) {
+	if err == nil {
+		code := 0
+		return &code, ""
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return nil, ""
+	}
+	if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		return nil, status.Signal().String()
+	}
+	if code := exitErr.ExitCode(); code >= 0 {
+		return &code, ""
+	}
+	return nil, ""
+}
+
+// concreteSessionRef returns the agent's runtime ref when it names a concrete
+// resumable session, and "" for the non-concrete forms ("last", fresh:*, empty)
+// that identify no specific session.
+func concreteSessionRef(agent Agent) string {
+	ref := strings.TrimSpace(agent.RuntimeRef)
+	if ref == "" || ref == LastRef || IsFreshRef(ref) {
+		return ""
+	}
+	return ref
 }
 
 type StartRequest struct {
@@ -432,8 +511,15 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 		}
 	}
 	result, err := a.runCodex(ctx, agent, job.Prompt, model)
+	// The session id in play: the pinned concrete thread on a resume, or the
+	// thread id codex printed for a fresh/`last` run (best-effort — the stream
+	// may not carry one when the run died early).
+	sessionID := concreteSessionRef(agent)
+	if sessionID == "" {
+		sessionID = parseCodexThreadID(result.Stdout)
+	}
 	if err != nil {
-		return Result{Raw: result.Stdout + result.Stderr}, codexCommandError(result, err)
+		return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, sessionID)}, codexCommandError(result, err)
 	}
 	// Usage is attributable to this job when the session belongs to it alone:
 	// a fresh ref (brand-new session, no resume) or a single-use session
@@ -443,6 +529,7 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 	if IsFreshRef(agent.RuntimeRef) {
 		parsed.RefreshedRuntimeRef = parseCodexThreadID(result.Stdout)
 	}
+	parsed.SessionDiag = newSessionDiag(result, nil, sessionID)
 	return parsed, nil
 }
 
@@ -818,6 +905,10 @@ func (a ClaudeAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Resul
 	// never masks an auth failure (a fresh start that fails for auth reasons
 	// still surfaces as auth below).
 	var refreshedRef string
+	// The session id this delivery is actually running on, for crash
+	// diagnostics (#806): the pinned concrete ref, replaced by the minted fresh
+	// id when the self-heal below takes over the delivery.
+	diagSessionRef := concreteSessionRef(agent)
 	if err != nil && agent.RuntimeRef != LastRef && ctx.Err() == nil {
 		sessionMissing := isClaudeSessionMissing(result)
 		transient := isTransientClaudeDeliveryError(result, err)
@@ -829,20 +920,21 @@ func (a ClaudeAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Resul
 				if sessionMissing {
 					refreshedRef = newRef
 				}
+				diagSessionRef = newRef
 				result, err = a.runner().Run(ctx, a.Dir, "claude", claudeFreshSessionArgs(agent, job.Prompt, model, newRef)...)
 				if err != nil {
 					if sessionMissing {
-						return Result{Raw: result.Stdout + result.Stderr}, a.claudeSessionMissingError(agent, result, err)
+						return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, diagSessionRef)}, a.claudeSessionMissingError(agent, result, err)
 					}
-					return Result{Raw: result.Stdout + result.Stderr}, claudeCommandError(result, err)
+					return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, diagSessionRef)}, claudeCommandError(result, err)
 				}
 			}
 		}
 	}
 	if err != nil {
-		return Result{Raw: result.Stdout + result.Stderr}, claudeCommandError(result, err)
+		return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, diagSessionRef)}, claudeCommandError(result, err)
 	}
-	parsed := Result{Raw: result.Stdout, RefreshedRuntimeRef: refreshedRef}
+	parsed := Result{Raw: result.Stdout, RefreshedRuntimeRef: refreshedRef, SessionDiag: newSessionDiag(result, nil, diagSessionRef)}
 	summary, inTok, outTok := parseClaudeJSONResult(result.Stdout)
 	if summary != "" {
 		parsed.Summary = summary
@@ -879,13 +971,13 @@ func (a ClaudeAdapter) deliverFresh(ctx context.Context, agent Agent, job Job, m
 		}
 	}
 	if err != nil {
-		return Result{Raw: result.Stdout + result.Stderr}, claudeCommandError(result, err)
+		return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, sessionID)}, claudeCommandError(result, err)
 	}
 	// SessionEphemeral marks this session as by-design per-job (fresh-ref #531 or
 	// last+template coordinator): the mailbox adopts sessionID in-memory for
 	// same-job repair but must NOT persist it onto the agent's stored ref, or the
 	// isolation would end after job 1.
-	parsed := Result{Raw: result.Stdout, RefreshedRuntimeRef: sessionID, SessionEphemeral: true}
+	parsed := Result{Raw: result.Stdout, RefreshedRuntimeRef: sessionID, SessionEphemeral: true, SessionDiag: newSessionDiag(result, nil, sessionID)}
 	summary, inTok, outTok := parseClaudeJSONResult(result.Stdout)
 	if summary != "" {
 		parsed.Summary = summary
@@ -1109,10 +1201,12 @@ func (a ShellAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 		return Result{}, errors.New("shell runtime cannot mint a fresh session; provide an explicit session command")
 	}
 	result, err := a.runner().Run(ctx, a.Dir, "sh", "-c", agent.RuntimeRef, "gitmoot", job.Prompt)
+	// A shell "session" is a command line, not a session id, so SessionID stays
+	// empty; the exit/stderr diagnostics still apply.
 	if err != nil {
-		return Result{Raw: result.Stdout + result.Stderr}, commandError(result, err)
+		return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, "")}, commandError(result, err)
 	}
-	return Result{Raw: result.Stdout, Summary: strings.TrimSpace(result.Stdout)}, nil
+	return Result{Raw: result.Stdout, Summary: strings.TrimSpace(result.Stdout), SessionDiag: newSessionDiag(result, nil, "")}, nil
 }
 
 func (a ShellAdapter) Health(ctx context.Context, agent Agent) error {

@@ -281,6 +281,14 @@ type JobPayload struct {
 	OrchestrateStage bool `json:"orchestrate_stage,omitempty"`
 	RawOutputs    []string     `json:"raw_outputs,omitempty"`
 	Result        *AgentResult `json:"result,omitempty"`
+	// FailureDiagnostics captures process-level crash context when the runtime
+	// session ended WITHOUT producing a gitmoot_result envelope (#806): a phase
+	// marker (launched | streaming | result-parse), the exit code or signal, a
+	// redacted stderr tail hard-capped at MaxStderrTailBytes, and the runtime
+	// session id when one is known. Additive/omitempty — a job that produced an
+	// envelope serializes byte-identically — and reset at the start of every run
+	// so a retried job never carries a previous run's crash report.
+	FailureDiagnostics *FailureDiagnostics `json:"failure_diagnostics,omitempty"`
 	// ResultChecks, when non-empty, carries the deterministic binary-checklist
 	// audit FAILURES for this job's parsed result (#526). It is the job-detail
 	// surface the dashboard and `gitmoot job show --json` read. Fully additive
@@ -596,6 +604,10 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	if err != nil {
 		return AgentResult{}, err
 	}
+	// A retried job must never carry a previous run's crash report (#806):
+	// reset before this run's deliveries so every payload persist below — a
+	// success terminal included — writes fresh diagnostics state.
+	payload.FailureDiagnostics = nil
 
 	if err := m.claim(ctx, job); err != nil {
 		return AgentResult{}, err
@@ -646,7 +658,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		// there are zero prior artifacts to reconcile — this is its first real run.
 		prompt = blockerRetryReconciliationNotice(payload.BlockerClass, payload.BlockerAttempts) + "\n\n" + prompt
 	}
-	firstRaw, firstRefreshedRef, firstEphemeral, firstErr := m.deliver(ctx, adapter, agent, job, payload, prompt)
+	firstRaw, firstRefreshedRef, firstEphemeral, firstDiag, firstErr := m.deliver(ctx, adapter, agent, job, payload, prompt)
 	if firstErr != nil {
 		deliveryErr := DeliveryError{Err: firstErr}
 		// PRE-TERMINAL operational-blocker classification (#532 slice E): consult the
@@ -658,6 +670,10 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		if m.tryDeferBlocker(ctx, job.ID, deliveryErr) {
 			return AgentResult{}, deferredError{cause: deliveryErr}
 		}
+		// Persist crash diagnostics (#806) before the terminal fail so `job show`
+		// and `report bug` can explain a session that died without an envelope.
+		// Best-effort: diagnostics must never change the failure path.
+		m.storeFailureDiagnostics(ctx, job.ID, &payload, firstDiag)
 		_ = m.fail(ctx, job.ID, fmt.Sprintf("delivery failed: %v", firstErr))
 		// Record an advisory failure observation (#530) so a runtime/model that
 		// repeatedly crashes at the ADAPTER level (never reaching a parsed decision)
@@ -713,6 +729,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		}
 
 		lastRaw := firstRaw
+		lastDiag := firstDiag
 		for attempt := 1; attempt <= maxRepairAttempts; attempt++ {
 			// Re-check cancellation before each repair delivery so a job cancelled
 			// during the repair window is not re-asked (preserves the cancellation
@@ -725,7 +742,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			}
 
 			repairPrompt := prompts.RenderRepairPrompt(lastRaw, parseErr)
-			repairRaw, repairRefreshedRef, repairEphemeral, repairErr := m.deliver(ctx, adapter, agent, job, payload, repairPrompt)
+			repairRaw, repairRefreshedRef, repairEphemeral, repairDiag, repairErr := m.deliver(ctx, adapter, agent, job, payload, repairPrompt)
 			if repairErr != nil {
 				deliveryErr := DeliveryError{Err: repairErr}
 				// Same pre-terminal seam as the first delivery, but the deferrer's
@@ -736,6 +753,9 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 				if m.tryDeferBlocker(ctx, job.ID, deliveryErr) {
 					return AgentResult{}, deferredError{cause: deliveryErr}
 				}
+				// Crash diagnostics (#806) for the repair delivery that died, mirroring
+				// the first-delivery terminal above. Best-effort.
+				m.storeFailureDiagnostics(ctx, job.ID, &payload, repairDiag)
 				_ = m.fail(ctx, job.ID, fmt.Sprintf("repair delivery failed: %v", repairErr))
 				// Advisory failure observation (#530): a hard adapter error during repair
 				// is still a runtime-level failure — count it so flaky runtimes are not
@@ -757,6 +777,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			}
 			payload.RawOutputs = append(payload.RawOutputs, repairRaw)
 			lastRaw = repairRaw
+			lastDiag = repairDiag
 
 			result, parseErr = ExtractAgentResult(repairRaw)
 			if parseErr == nil {
@@ -768,6 +789,16 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		}
 
 		if parseErr != nil {
+			// The session completed every delivery but never produced a valid
+			// envelope: record result-parse phase diagnostics (#806). The last
+			// delivery's process evidence (exit code 0, its stderr) is what
+			// explains the miss; synthesize a phase-only record when the adapter
+			// carried none (a delivery that succeeded proves a session ran).
+			if lastDiag == nil {
+				lastDiag = &FailureDiagnostics{}
+			}
+			lastDiag.Phase = FailurePhaseResultParse
+			m.storeFailureDiagnostics(ctx, job.ID, &payload, lastDiag)
 			_ = m.fail(ctx, job.ID, fmt.Sprintf("repair output malformed: %v", parseErr))
 			// Advisory failure observation (#530): output that stays malformed after all
 			// repair attempts is a runtime/model failure to honor the contract — count it
@@ -874,7 +905,10 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	return result, nil
 }
 
-func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent runtime.Agent, job db.Job, payload JobPayload, prompt string) (string, string, bool, error) {
+// deliver returns the delivery's raw text, refreshed runtime ref, ephemeral
+// flag, redacted crash-diagnostics snapshot (#806, nil when no CLI process
+// ran), and error.
+func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent runtime.Agent, job db.Job, payload JobPayload, prompt string) (string, string, bool, *FailureDiagnostics, error) {
 	delivery := runtime.Job{
 		ID:          job.ID,
 		AgentName:   agent.Name,
@@ -933,10 +967,23 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 			_ = m.Store.UpdateJobUsage(ctx, job.ID, inTok, outTok)
 		}
 	}
+	diag := failureDiagnosticsFromSession(result.SessionDiag)
 	if strings.TrimSpace(result.Summary) != "" {
-		return result.Summary, result.RefreshedRuntimeRef, result.SessionEphemeral, err
+		return result.Summary, result.RefreshedRuntimeRef, result.SessionEphemeral, diag, err
 	}
-	return result.Raw, result.RefreshedRuntimeRef, result.SessionEphemeral, err
+	return result.Raw, result.RefreshedRuntimeRef, result.SessionEphemeral, diag, err
+}
+
+// storeFailureDiagnostics persists crash diagnostics (#806) onto the job
+// payload just before a no-envelope terminal fail. Best-effort by design: a
+// nil diag (no CLI process ran) stores nothing, and a persist error never
+// changes the failure path.
+func (m Mailbox) storeFailureDiagnostics(ctx context.Context, jobID string, payload *JobPayload, diag *FailureDiagnostics) {
+	if diag == nil {
+		return
+	}
+	payload.FailureDiagnostics = diag
+	_ = m.savePayload(ctx, jobID, *payload)
 }
 
 // persistRefreshedRuntimeRef re-pins an agent that self-healed a dead session

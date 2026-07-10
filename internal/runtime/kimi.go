@@ -158,14 +158,16 @@ func (a KimiAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result,
 	args = append(args, extraArgs...)
 	args = append(args, "-p", promptArg, "--output-format", "stream-json")
 	result, err := a.runner().Run(ctx, a.Dir, "kimi", args...)
+	// The fresh per-job kimi session never reports its id, so SessionID stays
+	// empty; the exit/stderr diagnostics still apply.
 	if err != nil {
-		return Result{Raw: result.Stdout + result.Stderr}, kimiCommandError(result, err)
+		return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, "")}, kimiCommandError(result, err)
 	}
 	content, _, usage, parseErr := parseKimiStreamJSON(result.Stdout)
 	if parseErr != nil {
-		return Result{Raw: result.Stdout}, fmt.Errorf("parse kimi stream-json output: %w", parseErr)
+		return Result{Raw: result.Stdout, SessionDiag: newSessionDiag(result, nil, "")}, fmt.Errorf("parse kimi stream-json output: %w", parseErr)
 	}
-	return Result{Raw: content, Summary: strings.TrimSpace(content), InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens}, nil
+	return Result{Raw: content, Summary: strings.TrimSpace(content), InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens, SessionDiag: newSessionDiag(result, nil, "")}, nil
 }
 
 func (a KimiAdapter) Health(ctx context.Context, agent Agent) error {
@@ -255,13 +257,13 @@ func (a KimiCLIAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Resu
 	defer cleanup()
 	result, err := a.runner().Run(ctx, a.Dir, "kimi", kimiCLIPromptArgs(agent, effectiveModel(agent, job), promptArg, extraArgs)...)
 	if err != nil {
-		return Result{Raw: result.Stdout + result.Stderr}, kimiCommandError(result, err)
+		return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, "")}, kimiCommandError(result, err)
 	}
 	content, _, usage, parseErr := parseKimiStreamJSON(result.Stdout)
 	if parseErr != nil {
-		return Result{Raw: result.Stdout}, fmt.Errorf("parse kimi stream-json output: %w", parseErr)
+		return Result{Raw: result.Stdout, SessionDiag: newSessionDiag(result, nil, "")}, fmt.Errorf("parse kimi stream-json output: %w", parseErr)
 	}
-	return Result{Raw: content, Summary: strings.TrimSpace(content), InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens}, nil
+	return Result{Raw: content, Summary: strings.TrimSpace(content), InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens, SessionDiag: newSessionDiag(result, nil, "")}, nil
 }
 
 func (a KimiCLIAdapter) Health(ctx context.Context, agent Agent) error {

@@ -1106,6 +1106,20 @@ a retry. So a job that "failed then reappeared as queued" is the deferral
 working, not a bug. Product failures (the agent answered with a `gitmoot_result`,
 including `decision=failed`) are never auto-retried.
 
+When a runtime session ends **without** producing a `gitmoot_result` envelope —
+the CLI process crashed, exited non-zero, was signal-killed, or completed but
+never emitted a valid envelope even after repair attempts — the job records
+**failure diagnostics** (#806): a `phase` marker (`launched` = died before any
+stdout, `streaming` = died mid-output, `result-parse` = every delivery completed
+but no valid envelope was found), the process `exit_code` **or** terminating
+`signal`, a **redacted** stderr tail (hard-capped at 2 KB; redaction runs over
+the full text with the same token-redaction rules as job comments *before* the
+tail is cut, so a secret can never leak partially), and the runtime session id
+when one is known. `gitmoot job show` prints a `failure_diagnostics:` block,
+`job show --json` carries `payload.failure_diagnostics`, and `gitmoot report
+bug` includes a "Failure diagnostics" section. Successful jobs never store one,
+and a retried job clears the previous run's crash report.
+
 Jobs stuck in `running` are also backstopped: a running job with no lease
 progress past the staleness window (default 30m) is assumed orphaned by a dead
 worker and recovered/re-queued. The window is tunable via the

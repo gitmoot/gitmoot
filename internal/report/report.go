@@ -246,6 +246,26 @@ func renderMarkdown(report Report, data jobReportData) string {
 		writeList(&builder, "Delegations", delegationAgentNames(data.payload.Result.Delegations))
 	}
 
+	// Crash diagnostics for a session that ended without a gitmoot_result
+	// envelope (#806). The stderr tail was redacted and bounded at capture time;
+	// it goes through the standard sanitizers again here anyway.
+	if diag := data.payload.FailureDiagnostics; diag != nil {
+		builder.WriteString("\n## Failure diagnostics\n\n")
+		writeBullet(&builder, "Phase", diag.Phase)
+		if diag.ExitCode != nil {
+			writeBullet(&builder, "Exit code", strconv.Itoa(*diag.ExitCode))
+		}
+		writeBullet(&builder, "Signal", diag.Signal)
+		writeBullet(&builder, "Runtime session", diag.SessionID)
+		writeDetails(&builder, "Stderr tail (redacted)", func(details *strings.Builder) {
+			if strings.TrimSpace(diag.StderrTail) == "" {
+				return
+			}
+			details.WriteString(sanitizeBlock(diag.StderrTail))
+			details.WriteString("\n")
+		})
+	}
+
 	writeDetails(&builder, "Selected error details", func(details *strings.Builder) {
 		if strings.TrimSpace(report.SelectedErrorText) == "" || strings.TrimSpace(report.SelectedErrorText) == selectedErrorSummary {
 			return
