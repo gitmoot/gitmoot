@@ -124,6 +124,73 @@ func TestConfirmedMemoryAutoLinksSimilarExistingFacts(t *testing.T) {
 	}
 }
 
+func TestListMemoryLinksForSourcesBatchedOrderingAndActiveFilter(t *testing.T) {
+	ctx := context.Background()
+	store := openMemTestStore(t)
+	owner := agentOwner("builder")
+	srcA := mustUpsert(t, store, ConfirmedMemory{Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "src-a", Content: "source alpha"})
+	srcB := mustUpsert(t, store, ConfirmedMemory{Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "src-b", Content: "source beta"})
+	high := mustUpsert(t, store, ConfirmedMemory{Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "target-high", Content: "target high"})
+	tieA := mustUpsert(t, store, ConfirmedMemory{Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "target-tie-a", Content: "target tie a"})
+	tieB := mustUpsert(t, store, ConfirmedMemory{Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "target-tie-b", Content: "target tie b"})
+	retired := mustUpsert(t, store, ConfirmedMemory{Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "target-retired", Content: "target retired"})
+	superseded := mustUpsert(t, store, ConfirmedMemory{Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "target-superseded", Content: "target superseded"})
+
+	mustInsertMemoryLink(t, store, srcA, tieB, 0.5)
+	mustInsertMemoryLink(t, store, srcA, tieA, 0.5)
+	mustInsertMemoryLink(t, store, srcB, high, 0.9)
+	mustInsertMemoryLink(t, store, srcA, retired, 1.0)
+	mustInsertMemoryLink(t, store, srcA, superseded, 0.8)
+	if _, err := store.db.ExecContext(ctx, `UPDATE confirmed_memories SET retired_at = '2026-01-01T00:00:00Z' WHERE id = ?`, retired); err != nil {
+		t.Fatalf("retire target: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE confirmed_memories SET superseded_by = ? WHERE id = ?`, high, superseded); err != nil {
+		t.Fatalf("supersede target: %v", err)
+	}
+
+	got, err := store.ListMemoryLinksForSources(ctx, []int64{srcB, srcA, srcA, -1})
+	if err != nil {
+		t.Fatalf("list batched links: %v", err)
+	}
+	if keys := linkedKeys(got); strings.Join(keys, ",") != "target-high,target-tie-a,target-tie-b" {
+		t.Fatalf("links not score/id ordered or inactive-filtered: keys=%v rows=%+v", keys, got)
+	}
+	if got[0].SrcID != srcB || got[0].Score != 0.9 {
+		t.Fatalf("top link metadata mismatch: %+v", got[0])
+	}
+}
+
+func TestListMemoryLinksForSourcesVisibleToOwnerFiltersNeighbors(t *testing.T) {
+	ctx := context.Background()
+	store := openMemTestStore(t)
+	lead := agentOwner("lead")
+	audit := agentOwner("audit")
+	shared := MemoryOwner{Kind: memoryOwnerKindShared, Ref: memorySharedOwnerRef}
+
+	src := mustUpsert(t, store, ConfirmedMemory{Owner: lead, Repo: "acme/widget", Scope: "repo", Key: "source", Content: "source fact"})
+	leadPrivate := mustUpsert(t, store, ConfirmedMemory{Owner: lead, Repo: "acme/widget", Scope: "repo", Key: "lead-private", Content: "lead private neighbor"})
+	auditPrivate := mustUpsert(t, store, ConfirmedMemory{Owner: audit, Repo: "acme/widget", Scope: "repo", Key: "audit-private", Content: "audit private neighbor"})
+	sharedFact := mustUpsert(t, store, ConfirmedMemory{Owner: shared, AuthorRef: "audit", Repo: "acme/widget", Scope: "repo", Key: "shared-neighbor", Content: "shared neighbor"})
+	otherRepo := mustUpsert(t, store, ConfirmedMemory{Owner: lead, Repo: "acme/api", Scope: "repo", Key: "other-repo", Content: "other repo neighbor"})
+	general := mustUpsert(t, store, ConfirmedMemory{Owner: lead, Scope: "general", Key: "general-neighbor", Content: "general neighbor"})
+
+	for i, id := range []int64{leadPrivate, auditPrivate, sharedFact, otherRepo, general} {
+		mustInsertMemoryLink(t, store, src, id, 1.0-float64(i)*0.1)
+	}
+
+	got, err := store.ListMemoryLinksForSourcesVisibleToOwner(ctx, lead, "acme/widget", []int64{src})
+	if err != nil {
+		t.Fatalf("list visible links: %v", err)
+	}
+	keys := linkedKeySet(got)
+	if !keys["lead-private"] || !keys["shared-neighbor"] || !keys["general-neighbor"] {
+		t.Fatalf("visible private/shared/general neighbors missing: keys=%v rows=%+v", keys, got)
+	}
+	if keys["audit-private"] || keys["other-repo"] {
+		t.Fatalf("invisible neighbor leaked: keys=%v rows=%+v", keys, got)
+	}
+}
+
 // TestConfirmedMemoryUpsertKeyed proves the keyed row deduplicates: two upserts
 // on the same (owner, repo, key) leave one row with the latest content.
 func TestConfirmedMemoryUpsertKeyed(t *testing.T) {
@@ -388,6 +455,31 @@ func containsKey(rows []ConfirmedMemory, key string) bool {
 		}
 	}
 	return false
+}
+
+func linkedKeys(rows []LinkedConfirmedMemory) []string {
+	keys := make([]string, 0, len(rows))
+	for _, r := range rows {
+		keys = append(keys, r.Memory.Key)
+	}
+	return keys
+}
+
+func linkedKeySet(rows []LinkedConfirmedMemory) map[string]bool {
+	keys := map[string]bool{}
+	for _, r := range rows {
+		keys[r.Memory.Key] = true
+	}
+	return keys
+}
+
+func mustInsertMemoryLink(t *testing.T, store *Store, srcID, dstID int64, score float64) {
+	t.Helper()
+	if _, err := store.db.ExecContext(context.Background(), `
+INSERT OR REPLACE INTO memory_links (src_id, dst_id, score, origin, created_at)
+VALUES (?, ?, ?, 'test', '2026-01-01T00:00:00Z')`, srcID, dstID, score); err != nil {
+		t.Fatalf("insert memory link %d -> %d: %v", srcID, dstID, err)
+	}
 }
 
 // TestObservationsAppendNotUpsert proves repeated observations of the same key

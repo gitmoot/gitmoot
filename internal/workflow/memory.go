@@ -106,11 +106,31 @@ func (c *MemoryController) injectBlock(ctx context.Context, agent runtime.Agent,
 		return ""
 	}
 	entries := c.retrieve(ctx, ownerForJob(agent, payload), payload.Repo, payload.Instructions, c.MaxEntries)
+	// The mid-job recall affordance renders for EVERY enrolled agent, hits or
+	// not: agents need on-demand recall most when the startup push MISSED
+	// (panel-adjudicated #780 finding). It sits OUTSIDE the learnings block so
+	// the block stays reference-only data.
+	hint := memoryRecallHint(agent.Name)
 	if len(entries) == 0 {
-		return ""
+		return hint
 	}
 	block, _ := memory.RenderBlock(entries, c.TokenBudget)
-	return block
+	if block == "" {
+		return hint
+	}
+	if !strings.HasSuffix(block, "\n") {
+		block += "\n"
+	}
+	return block + "\n" + hint
+}
+
+// memoryRecallHint is the one-line, deterministic mid-job recall affordance.
+func memoryRecallHint(agentName string) string {
+	name := strings.TrimSpace(agentName)
+	if name == "" {
+		name = "<agent-name>"
+	}
+	return fmt.Sprintf("Project memory is searchable mid-job: run `gitmoot memory recall \"<query>\" --agent %s`.", name)
 }
 
 // retrieve runs the tiered, confirmed-only, sanitized-FTS retrieval and returns
@@ -133,14 +153,37 @@ func (c *MemoryController) retrieve(ctx context.Context, owner db.MemoryOwner, r
 	if err != nil || len(rows) == 0 {
 		return nil
 	}
-	entries := make([]memory.Entry, 0, len(rows))
+	entries := make([]memory.Entry, 0, limit)
+	seen := make(map[int64]struct{}, len(rows))
+	srcIDs := make([]int64, 0, len(rows))
 	for _, r := range rows {
-		entries = append(entries, memory.Entry{
-			Scope:     r.Scope,
-			Key:       r.Key,
-			Content:   r.Content,
-			UpdatedAt: r.UpdatedAt,
-		})
+		entries = append(entries, memoryEntryFromConfirmed(r, false))
+		seen[r.ID] = struct{}{}
+		srcIDs = append(srcIDs, r.ID)
+	}
+	if len(entries) < limit {
+		// Linked expansion fills spare capacity only, and is hard-capped at 3
+		// entries so bm25-derived neighbors can never dominate a sparse direct
+		// result (panel-adjudicated #780 finding).
+		maxExpand := limit - len(entries)
+		if maxExpand > 3 {
+			maxExpand = 3
+		}
+		added := 0
+		linked, err := c.Store.ListMemoryLinksForSourcesVisibleToOwner(ctx, owner, repo, srcIDs)
+		if err == nil {
+			for _, l := range linked {
+				if added >= maxExpand {
+					break
+				}
+				if _, dup := seen[l.Memory.ID]; dup {
+					continue
+				}
+				seen[l.Memory.ID] = struct{}{}
+				entries = append(entries, memoryEntryFromConfirmed(l.Memory, true))
+				added++
+			}
+		}
 	}
 	return entries
 }
@@ -161,9 +204,22 @@ func (c *MemoryController) PreviewEntries(ctx context.Context, agentName, repo, 
 // ungated, for the harness), returning the block text, the entries injected, and
 // the block's estimated token cost.
 func (c *MemoryController) PreviewBlock(ctx context.Context, agentName, repo, instructions string) (block string, entries int, tokens int) {
+	// The harness measures the learnings BLOCK alone; the mid-job recall hint is
+	// a constant-cost prompt line, not part of the measured injection delta.
 	rendered, n := memory.RenderBlock(c.PreviewEntries(ctx, agentName, repo, instructions, 0), c.TokenBudget)
 	return rendered, n, memory.EstimateTokens(rendered)
 }
+
+func memoryEntryFromConfirmed(r db.ConfirmedMemory, linked bool) memory.Entry {
+	return memory.Entry{
+		Scope:     r.Scope,
+		Key:       r.Key,
+		Content:   r.Content,
+		UpdatedAt: r.UpdatedAt,
+		Linked:    linked,
+	}
+}
+
 
 // record is the WRITE path, run at job terminal. The ENROLLED-ONLY Phase-1 body
 // (recordEnrolled) (a) SHADOW-logs the agent's returned learnings to

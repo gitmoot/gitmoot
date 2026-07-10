@@ -58,6 +58,7 @@ type Entry struct {
 	Key       string
 	Content   string
 	UpdatedAt string
+	Linked    bool // true when included via a 1-hop memory_links expansion
 }
 
 // blockHeader is the first line of the rendered learnings block. It is
@@ -222,7 +223,11 @@ func RenderBlock(entries []Entry, budgetTokens int) (string, int) {
 // RenderBlock. CLI recall uses it so on-demand retrieval matches prompt
 // injection without duplicating the presentation rule.
 func RenderBullet(e Entry) string {
-	return "- " + scopeTag(e.Scope) + " " + strings.TrimSpace(e.Content)
+	tags := []string{scopeTag(e.Scope)}
+	if e.Linked {
+		tags = append(tags, "[linked]")
+	}
+	return "- " + strings.Join(tags, " ") + " " + strings.TrimSpace(e.Content)
 }
 
 // scopeTag renders the per-entry provenance tag used in the block.

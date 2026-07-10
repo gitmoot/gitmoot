@@ -72,6 +72,15 @@ type MemoryLink struct {
 	CreatedAt string
 }
 
+// LinkedConfirmedMemory is one active memory_links edge plus the visible target
+// confirmed memory row. It backs retrieval expansion: direct FTS hits stay first,
+// then callers append these linked target facts in link-rank order.
+type LinkedConfirmedMemory struct {
+	SrcID  int64
+	Score  float64
+	Memory ConfirmedMemory
+}
+
 // MemoryLinkEnrichment reports what the auto-link pass created or skipped for one
 // source memory. Created contains rows that were written, or rows that WOULD be
 // written when the caller requested a dry run.
@@ -552,6 +561,125 @@ ORDER BY ml.dst_id`, srcID)
 		out = append(out, l)
 	}
 	return out, rows.Err()
+}
+
+// ListMemoryLinksForSources returns active linked target facts for a batch of
+// source ids. It applies only the universal active-row filter; callers that need
+// owner/repo visibility should use one of the visibility-specific variants
+// below. Rows are ordered by link score descending, target id ascending, then
+// source id ascending for deterministic expansion and dedupe.
+func (s *Store) ListMemoryLinksForSources(ctx context.Context, srcIDs []int64) ([]LinkedConfirmedMemory, error) {
+	return s.listMemoryLinksForSources(ctx, srcIDs, "", nil)
+}
+
+// ListMemoryLinksForSourcesVisibleToOwner applies the prompt-injection
+// visibility policy for one agent owner: private owner pool plus the reserved
+// shared pool, limited to the current repo plus general-scope facts.
+func (s *Store) ListMemoryLinksForSourcesVisibleToOwner(ctx context.Context, owner MemoryOwner, repo string, srcIDs []int64) ([]LinkedConfirmedMemory, error) {
+	return s.listMemoryLinksForSources(ctx, srcIDs,
+		`((d.owner_kind = ? AND d.owner_ref = ? AND d.owner_version = ?) OR (d.owner_kind = ? AND d.owner_ref = ?))
+	AND (d.scope = 'general' OR d.repo = ?)`,
+		[]any{owner.Kind, owner.Ref, owner.Version, memoryOwnerKindShared, memorySharedOwnerRef, strings.TrimSpace(repo)})
+}
+
+// ListMemoryLinksForSourcesVisibleToOwnerAllRepos is the single-agent recall
+// expansion policy when recall omits --repo: private owner pool plus shared,
+// without a repo/general restriction.
+func (s *Store) ListMemoryLinksForSourcesVisibleToOwnerAllRepos(ctx context.Context, owner MemoryOwner, srcIDs []int64) ([]LinkedConfirmedMemory, error) {
+	return s.listMemoryLinksForSources(ctx, srcIDs,
+		`((d.owner_kind = ? AND d.owner_ref = ? AND d.owner_version = ?) OR (d.owner_kind = ? AND d.owner_ref = ?))`,
+		[]any{owner.Kind, owner.Ref, owner.Version, memoryOwnerKindShared, memorySharedOwnerRef})
+}
+
+// ListMemoryLinksForSourcesVisibleToAllAgents is the default recall expansion
+// policy: every private agent pool plus the reserved shared pool. A non-empty
+// repo applies the same repo/general restriction as the direct recall query.
+func (s *Store) ListMemoryLinksForSourcesVisibleToAllAgents(ctx context.Context, repo string, srcIDs []int64) ([]LinkedConfirmedMemory, error) {
+	where := `(d.owner_kind = 'agent' OR (d.owner_kind = ? AND d.owner_ref = ?))`
+	args := []any{memoryOwnerKindShared, memorySharedOwnerRef}
+	if strings.TrimSpace(repo) != "" {
+		where += "\n\tAND (d.scope = 'general' OR d.repo = ?)"
+		args = append(args, strings.TrimSpace(repo))
+	}
+	return s.listMemoryLinksForSources(ctx, srcIDs, where, args)
+}
+
+// ListMemoryLinksForSourcesVisibleToShared is the shared-only recall expansion
+// policy. A non-empty repo applies the same repo/general restriction as the
+// direct shared recall query.
+func (s *Store) ListMemoryLinksForSourcesVisibleToShared(ctx context.Context, repo string, srcIDs []int64) ([]LinkedConfirmedMemory, error) {
+	where := `d.owner_kind = ? AND d.owner_ref = ?`
+	args := []any{memoryOwnerKindShared, memorySharedOwnerRef}
+	if strings.TrimSpace(repo) != "" {
+		where += "\n\tAND (d.scope = 'general' OR d.repo = ?)"
+		args = append(args, strings.TrimSpace(repo))
+	}
+	return s.listMemoryLinksForSources(ctx, srcIDs, where, args)
+}
+
+func (s *Store) listMemoryLinksForSources(ctx context.Context, srcIDs []int64, visibilityWhere string, visibilityArgs []any) ([]LinkedConfirmedMemory, error) {
+	ids := uniquePositiveInt64s(srcIDs)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, 0, len(ids)+len(visibilityArgs))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	query := `
+SELECT ml.src_id, ml.score,
+	d.id, d.owner_kind, d.owner_ref, d.owner_version, d.author_ref, d.repo, d.scope, d.key, d.content,
+	d.provenance, d.source_job, d.first_confirmed_at, d.updated_at
+FROM memory_links ml
+JOIN confirmed_memories d ON d.id = ml.dst_id
+WHERE ml.src_id IN (` + placeholders + `)
+	AND d.superseded_by IS NULL
+	AND d.retired_at = ''`
+	if strings.TrimSpace(visibilityWhere) != "" {
+		query += "\n\tAND " + visibilityWhere
+		args = append(args, visibilityArgs...)
+	}
+	query += `
+ORDER BY ml.score DESC, d.id ASC, ml.src_id ASC`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list memory links for sources: %w", err)
+	}
+	defer rows.Close()
+	var out []LinkedConfirmedMemory
+	for rows.Next() {
+		var l LinkedConfirmedMemory
+		var repoNull sql.NullString
+		if err := rows.Scan(&l.SrcID, &l.Score,
+			&l.Memory.ID, &l.Memory.Owner.Kind, &l.Memory.Owner.Ref, &l.Memory.Owner.Version, &l.Memory.AuthorRef,
+			&repoNull, &l.Memory.Scope, &l.Memory.Key, &l.Memory.Content, &l.Memory.Provenance,
+			&l.Memory.SourceJob, &l.Memory.FirstConfirmedAt, &l.Memory.UpdatedAt); err != nil {
+			return nil, err
+		}
+		l.Memory.Repo = repoNull.String
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+func uniquePositiveInt64s(ids []int64) []int64 {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[int64]struct{}, len(ids))
+	out := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
 }
 
 func enrichConfirmedMemoryLinksTx(ctx context.Context, tx *sql.Tx, srcID int64, dryRun bool) (MemoryLinkEnrichment, error) {
