@@ -3000,13 +3000,18 @@ type jobWorker struct {
 	// are side-effect-free (no config.Initialize), so even a mistaken resolved-root
 	// ConfigHome can never MkdirAll the phantom — but every construction site must
 	// still pass the raw --home so the config is actually found.
-	ConfigHome          string
-	ConfigHomeExplicit  bool
-	AdapterFactory      func(runtime.Agent, string) (workflow.DeliveryAdapter, error)
-	StartAdapterFactory func(string, string) (runtime.Adapter, error)
-	CheckoutValidator   func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error)
-	WorkflowFactory     func(string) workflow.Engine
-	CommenterFactory    func(string) github.Client
+	ConfigHome         string
+	ConfigHomeExplicit bool
+	AdapterFactory     func(runtime.Agent, string) (workflow.DeliveryAdapter, error)
+	// OutputAdapterFactory rebuilds a production runtime adapter around the one
+	// shared live-output writer used by pipeline progress and cockpit. Tests that
+	// inject an opaque fake AdapterFactory may leave this nil and still exercise
+	// elapsed-only progress without replacing their fake.
+	OutputAdapterFactory func(runtime.Agent, string, io.Writer) (workflow.DeliveryAdapter, error)
+	StartAdapterFactory  func(string, string) (runtime.Adapter, error)
+	CheckoutValidator    func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error)
+	WorkflowFactory      func(string) workflow.Engine
+	CommenterFactory     func(string) github.Client
 	// UsePool selects the opt-in continuous worker-pool scheduler (#394,
 	// --scheduler=pool) over the default per-tick wg.Wait() barrier.
 	UsePool bool
@@ -3038,6 +3043,11 @@ type jobWorker struct {
 	// inject a fake verdict; the daemon wires defaultAuthProbe (a bounded
 	// runtime.ClaudeLiveCheck for claude agents, Unknown for other runtimes).
 	AuthProbe func(context.Context, db.Job, workflow.JobPayload) authProbeVerdict
+	// Progress timing seams keep unit/E2E tests deterministic and short. Zero/nil
+	// values select the package defaults and real timer implementation.
+	ProgressThreshold  time.Duration
+	ProgressInterval   time.Duration
+	ProgressTickSource func(context.Context, time.Duration, time.Duration) <-chan time.Time
 }
 
 // eventSink resolves the best-effort outbound event Sink (#446) for the
@@ -3201,6 +3211,7 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 	worker := jobWorker{Store: store, Stdout: stdout, ConfigHome: configHome, ConfigHomeExplicit: configHomeExplicit}
 	worker.RelayServer = activeChatRelayServer()
 	worker.AdapterFactory = worker.defaultAdapter
+	worker.OutputAdapterFactory = worker.outputAdapter
 	worker.StartAdapterFactory = worker.defaultStartAdapter
 	worker.CheckoutValidator = worker.defaultCheckout
 	worker.WorkflowFactory = worker.defaultWorkflow
@@ -5110,7 +5121,17 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// MootSeat — not ThreadID — keeps chat-task promotions and ThreadID-carrying
 	// continuations/children byte-identical (unelevated, no relay env). The token is
 	// released on every exit path so it cannot be replayed after the seat ends.
-	adapter, relayToken, err := w.buildSeatAwareAdapter(&agent, checkout, payload)
+	var progressTracker *pipelineProgressLineTracker
+	if payload.Sender == workflow.PipelineJobSender {
+		progressTracker = &pipelineProgressLineTracker{}
+	}
+	var adapter workflow.DeliveryAdapter
+	var relayToken string
+	if progressTracker != nil {
+		adapter, relayToken, err = w.buildSeatAwareAdapter(&agent, checkout, payload, progressTracker)
+	} else {
+		adapter, relayToken, err = w.buildSeatAwareAdapter(&agent, checkout, payload)
+	}
 	if relayToken != "" {
 		defer w.RelayServer.ReleaseSeat(relayToken)
 	}
@@ -5239,7 +5260,14 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		// is opened O_APPEND and is NOT removed per job (it persists for the root's
 		// life and is torn down by FinalizeRoot).
 		if maybeWrapCockpitAvailable(cp, payload.Cockpit, userOptedOff) {
-			teeAdapter, logPath, logFile := w.cockpitLogAdapter(cp, agent, checkout, job.ID, meta.RootJobID, meta.PaneKey, seatMode)
+			var teeAdapter workflow.DeliveryAdapter
+			var logPath string
+			var logFile *os.File
+			if progressTracker != nil {
+				teeAdapter, logPath, logFile = w.cockpitLogAdapter(cp, agent, checkout, job.ID, meta.RootJobID, meta.PaneKey, seatMode, progressTracker)
+			} else {
+				teeAdapter, logPath, logFile = w.cockpitLogAdapter(cp, agent, checkout, job.ID, meta.RootJobID, meta.PaneKey, seatMode)
+			}
 			if logFile != nil {
 				defer func() {
 					if err := logFile.Close(); err != nil {
@@ -5305,7 +5333,34 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		runCtx, cancel = context.WithTimeout(runCtx, jobTimeout)
 		defer cancel()
 	}
+	stopProgress := func() {}
+	if progressTracker != nil {
+		progressCtx, cancelProgress := context.WithCancel(runCtx)
+		done := make(chan struct{})
+		threshold := w.ProgressThreshold
+		if threshold <= 0 {
+			threshold = pipelineProgressThreshold
+		}
+		interval := w.ProgressInterval
+		if interval <= 0 {
+			interval = pipelineProgressInterval
+		}
+		tickSource := w.ProgressTickSource
+		if tickSource == nil {
+			tickSource = pipelineProgressTicks
+		}
+		startedAt := time.Now().UTC()
+		go func() {
+			defer close(done)
+			emitPipelineProgress(progressCtx, w.Store, w.Stdout, job.ID, startedAt, progressTracker, tickSource(progressCtx, threshold, interval))
+		}()
+		stopProgress = func() {
+			cancelProgress()
+			<-done
+		}
+	}
 	_, err = engine.RunJob(runCtx, job.ID, agent, adapter)
+	stopProgress()
 	if err != nil {
 		// Operational-blocker deferral (#532 slice E): a run whose delivery failed on
 		// a classified OPERATIONAL blocker (runtime auth rejected, rate limit/quota,
@@ -5556,7 +5611,7 @@ func cockpitJobMeta(job db.Job, payload workflow.JobPayload, agent runtime.Agent
 // unsupported runtime) returns a nil *os.File so the caller skips teeing and the
 // pane falls back to the P0 `job watch` command. The returned *os.File is the
 // caller's to Close after the job runs; when nil the adapter/path are ignored.
-func (w jobWorker) cockpitTeeAdapter(agent runtime.Agent, checkout string, jobID string) (workflow.DeliveryAdapter, string, *os.File) {
+func (w jobWorker) cockpitTeeAdapter(agent runtime.Agent, checkout string, jobID string, additionalOutput ...io.Writer) (workflow.DeliveryAdapter, string, *os.File) {
 	paths, err := pathsFromFlag(w.ConfigHome)
 	if err != nil {
 		writeLine(w.Stdout, "job %s cockpit log path resolve failed: %v", jobID, err)
@@ -5578,15 +5633,16 @@ func (w jobWorker) cockpitTeeAdapter(agent runtime.Agent, checkout string, jobID
 		writeLine(w.Stdout, "job %s cockpit log create failed: %v", jobID, err)
 		return nil, "", nil
 	}
-	return w.cockpitTeeOnFile(agent, checkout, jobID, logPath, logFile)
+	return w.cockpitTeeOnFile(agent, checkout, jobID, logPath, logFile, additionalOutput...)
 }
 
 // cockpitTeeOnFile rebuilds the runtime adapter to tee the child's live
 // stdout/stderr into an already-open log file, shared by the per-job (truncate)
 // and per-seat (append) log paths. It is fail-open: an unsupported runtime closes
 // the file and returns nils so the caller falls back to the P0 pane.
-func (w jobWorker) cockpitTeeOnFile(agent runtime.Agent, checkout, jobID, logPath string, logFile *os.File) (workflow.DeliveryAdapter, string, *os.File) {
-	adapter, err := buildRuntimeAdapter(agent, checkout, subprocess.TeeRunner{Inner: subprocess.GroupRunner{}, Out: logFile})
+func (w jobWorker) cockpitTeeOnFile(agent runtime.Agent, checkout, jobID, logPath string, logFile *os.File, additionalOutput ...io.Writer) (workflow.DeliveryAdapter, string, *os.File) {
+	outputs := append([]io.Writer{logFile}, additionalOutput...)
+	adapter, err := buildRuntimeAdapter(agent, checkout, subprocess.TeeRunner{Inner: subprocess.GroupRunner{}, Out: runtimeOutputWriter(outputs...)})
 	if err != nil {
 		// Unsupported runtime: this should never happen (AdapterFactory already
 		// built one above), but stay fail-open rather than leak the open file.
@@ -5602,11 +5658,11 @@ func (w jobWorker) cockpitTeeOnFile(agent runtime.Agent, checkout, jobID, logPat
 // file across rounds; job mode keeps the per-job truncate log (byte-identical to
 // P1). It is called only on the wrapping path (herdr available); a nil *os.File
 // means fall back to the P0 pane.
-func (w jobWorker) cockpitLogAdapter(cp *cockpit.Cockpit, agent runtime.Agent, checkout, jobID, rootJobID, paneKey string, seatMode bool) (workflow.DeliveryAdapter, string, *os.File) {
+func (w jobWorker) cockpitLogAdapter(cp *cockpit.Cockpit, agent runtime.Agent, checkout, jobID, rootJobID, paneKey string, seatMode bool, additionalOutput ...io.Writer) (workflow.DeliveryAdapter, string, *os.File) {
 	if seatMode {
-		return w.cockpitSeatLogAdapter(cp, agent, checkout, jobID, rootJobID, paneKey)
+		return w.cockpitSeatLogAdapter(cp, agent, checkout, jobID, rootJobID, paneKey, additionalOutput...)
 	}
-	return w.cockpitTeeAdapter(agent, checkout, jobID)
+	return w.cockpitTeeAdapter(agent, checkout, jobID, additionalOutput...)
 }
 
 // cockpitSeatLogAdapter opens the stable per-seat append log the seat's one pane
@@ -5617,7 +5673,7 @@ func (w jobWorker) cockpitLogAdapter(cp *cockpit.Cockpit, agent runtime.Agent, c
 // root's life and is removed by FinalizeRoot. It is fail-open: any failure
 // (unresolved path, mkdir, create, unsupported runtime) returns nils so the caller
 // falls back to the P0 pane.
-func (w jobWorker) cockpitSeatLogAdapter(cp *cockpit.Cockpit, agent runtime.Agent, checkout, jobID, rootJobID, paneKey string) (workflow.DeliveryAdapter, string, *os.File) {
+func (w jobWorker) cockpitSeatLogAdapter(cp *cockpit.Cockpit, agent runtime.Agent, checkout, jobID, rootJobID, paneKey string, additionalOutput ...io.Writer) (workflow.DeliveryAdapter, string, *os.File) {
 	logPath := cp.SeatLogPath(rootJobID, paneKey)
 	if logPath == "" {
 		// Home unset (cockpit could not resolve GITMOOT_HOME): fall back to the P0
@@ -5633,7 +5689,7 @@ func (w jobWorker) cockpitSeatLogAdapter(cp *cockpit.Cockpit, agent runtime.Agen
 		writeLine(w.Stdout, "job %s cockpit seat log open failed: %v", jobID, err)
 		return nil, "", nil
 	}
-	return w.cockpitTeeOnFile(agent, checkout, jobID, logPath, logFile)
+	return w.cockpitTeeOnFile(agent, checkout, jobID, logPath, logFile, additionalOutput...)
 }
 
 // finalizeCockpitRootIfDone tears the root's cockpit down once the coordination
@@ -6546,6 +6602,10 @@ func (w jobWorker) defaultAdapter(agent runtime.Agent, checkout string) (workflo
 	return buildRuntimeAdapter(agent, checkout, nil)
 }
 
+func (w jobWorker) outputAdapter(agent runtime.Agent, checkout string, out io.Writer) (workflow.DeliveryAdapter, error) {
+	return buildRuntimeAdapter(agent, checkout, subprocess.TeeRunner{Inner: subprocess.GroupRunner{}, Out: runtimeOutputWriter(out)})
+}
+
 // buildSeatAwareAdapter builds the job's runtime adapter, injecting the #732 chat
 // relay env for a `gitmoot moot` SEAT (payload.MootSeat) when a relay is running.
 // For a seat that gets a working relay it mints a per-seat token bound to (agent,
@@ -6563,8 +6623,12 @@ func (w jobWorker) defaultAdapter(agent runtime.Agent, checkout string) (workflo
 // so the cockpit adapter-rebuild path in run() — which would replace this adapter
 // and drop the env runner — never fires for a seat. If that ever changes, thread
 // the relay env into the cockpit rebuild too.
-func (w jobWorker) buildSeatAwareAdapter(agent *runtime.Agent, checkout string, payload workflow.JobPayload) (workflow.DeliveryAdapter, string, error) {
+func (w jobWorker) buildSeatAwareAdapter(agent *runtime.Agent, checkout string, payload workflow.JobPayload, output ...io.Writer) (workflow.DeliveryAdapter, string, error) {
 	if w.RelayServer == nil || !payload.MootSeat || strings.TrimSpace(payload.ThreadID) == "" {
+		if len(output) > 0 && output[0] != nil && w.OutputAdapterFactory != nil {
+			adapter, err := w.OutputAdapterFactory(*agent, checkout, output[0])
+			return adapter, "", err
+		}
 		adapter, err := w.AdapterFactory(*agent, checkout)
 		return adapter, "", err
 	}

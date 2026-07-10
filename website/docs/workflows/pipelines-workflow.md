@@ -237,6 +237,16 @@ needs: R2 token
 source OK -> score BLOCKED (needs: R2 token) -> deploy SKIPPED
 ```
 
+Active runs also show queued/running stage details. The duration is labeled
+`enqueued` because the stage timestamp is recorded at enqueue, not worker claim.
+After a pipeline job has been delivering for 60 seconds, its worker updates one
+latest-only `progress` event about every 30 seconds; `pipeline show` renders the
+stored event's age and last sanitized activity line. The age keeps growing when
+updates stop, so stale progress never masquerades as liveness. An orchestrate
+stage can have no fresh per-stage event while its child sub-tree is active; this is
+reported as `(sub-tree running; no per-stage progress)`, not a failure. JSON stage
+objects add `started_at`, `finished_at`, and optional structured `progress` data.
+
 The operator provisions what the stage needs out of band (here, an R2 token), then
 resumes — which re-runs the halted stage and everything downstream of it, while the
 already-landed upstream stages are left untouched:

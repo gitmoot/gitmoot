@@ -3086,6 +3086,91 @@ func (s *Store) AddJobEvent(ctx context.Context, event JobEvent) error {
 	return err
 }
 
+// UpsertLatestJobEvent keeps one mutable latest-only row for a job/event kind.
+// The write is guarded by jobs.state='running' in the same transaction, so a
+// delayed best-effort progress tick that races terminalization becomes a no-op.
+// This intentionally touches only job_events: the stuck-running reaper keys on
+// the jobs row (including runner_boot_id), so progress cannot refresh or mask
+// job liveness and cannot perturb pipeline_run_stages advancement invariants.
+func (s *Store) UpsertLatestJobEvent(ctx context.Context, event JobEvent) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `UPDATE job_events
+		SET message = ?, created_at = CURRENT_TIMESTAMP
+		WHERE job_id = ? AND kind = ?
+		  AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND state = 'running')`,
+		event.Message, event.JobID, event.Kind, event.JobID)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated == 0 {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message)
+			SELECT ?, ?, ? WHERE EXISTS (
+				SELECT 1 FROM jobs WHERE id = ? AND state = 'running'
+			)`, event.JobID, event.Kind, event.Message, event.JobID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// GetLatestJobEventByKind returns the newest event of kind for jobID. The
+// idx_job_events_kind_job_id covering index serves the lookup.
+func (s *Store) GetLatestJobEventByKind(ctx context.Context, jobID, kind string) (JobEvent, bool, error) {
+	var event JobEvent
+	err := s.db.QueryRowContext(ctx, `SELECT job_id, kind, message, created_at
+		FROM job_events WHERE kind = ? AND job_id = ? ORDER BY id DESC LIMIT 1`,
+		kind, jobID).Scan(&event.JobID, &event.Kind, &event.Message, &event.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return JobEvent{}, false, nil
+	}
+	return event, err == nil, err
+}
+
+// GetLatestJobEventsByKind returns the newest event of kind for each requested
+// job in one indexed query. Empty input returns an initialized empty map.
+func (s *Store) GetLatestJobEventsByKind(ctx context.Context, jobIDs []string, kind string) (map[string]JobEvent, error) {
+	out := map[string]JobEvent{}
+	if len(jobIDs) == 0 {
+		return out, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(jobIDs)), ",")
+	args := make([]any, 0, 2*(len(jobIDs)+1))
+	args = append(args, kind)
+	for _, jobID := range jobIDs {
+		args = append(args, jobID)
+	}
+	args = append(args, kind)
+	for _, jobID := range jobIDs {
+		args = append(args, jobID)
+	}
+	query := `SELECT job_id, kind, message, created_at FROM job_events
+		WHERE kind = ? AND job_id IN (` + placeholders + `)
+		  AND id IN (SELECT MAX(id) FROM job_events
+			WHERE kind = ? AND job_id IN (` + placeholders + `) GROUP BY job_id)`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var event JobEvent
+		if err := rows.Scan(&event.JobID, &event.Kind, &event.Message, &event.CreatedAt); err != nil {
+			return nil, err
+		}
+		out[event.JobID] = event
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ListJobEvents(ctx context.Context, jobID string) ([]JobEvent, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT job_id, kind, message, created_at FROM job_events WHERE job_id = ? ORDER BY id`, jobID)
 	if err != nil {

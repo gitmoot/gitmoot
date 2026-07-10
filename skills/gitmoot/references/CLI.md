@@ -2173,6 +2173,15 @@ funnel** (`source OK -> score BLOCKED (needs: R2 token) -> deploy SKIPPED`) unde
 run header; a **failed** run also prints the exact `gitmoot report bug --job
 <stage-job>` command (gitmoot never auto-files it).
 
+While a stage is queued or running, the run view adds an honest
+`STATE; enqueued <elapsed> ago` detail (the stage timestamp is enqueue time, not
+claim time). Long-running pipeline jobs publish a latest-only `progress` event
+after one minute and about every 30 seconds thereafter. A running stage shows the
+event's real age and last sanitized activity line; the age continues increasing if
+the daemon dies. Orchestrate stages whose current coordinator has no fresh event
+show `(sub-tree running; no per-stage progress)`. JSON stage objects add
+`started_at`, `finished_at`, and an optional structured `progress` object.
+
 `pipeline resume` re-runs a **parked** (blocked/failed) run from its halted stage
 (or `--from <stage>`) plus its transitive dependents — bumping their attempt — while
 **never re-running a succeeded stage**; it refuses a non-parked run and a run whose

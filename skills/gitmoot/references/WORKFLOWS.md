@@ -1049,6 +1049,14 @@ obvious as a funnel:
 source OK -> score BLOCKED (needs: R2 token) -> deploy SKIPPED
 ```
 
+For an active run, `pipeline show` also lists each queued/running stage with the
+time since it was enqueued. After a pipeline job has run for a minute, its worker
+updates one latest-only `progress` event about every 30 seconds; the view prints
+the event age and its last sanitized output line. That age visibly grows when
+updates stop. An orchestrate stage can temporarily point at a settled coordinator
+while its children run, so absent or stale per-stage progress is informational and
+renders as `(sub-tree running; no per-stage progress)`, never as failure.
+
 The operator provisions what the stage needs out of band (here, an R2 token), then
 resumes — which re-runs the halted stage and everything downstream of it, while the
 already-landed upstream stages are left untouched:

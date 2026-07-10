@@ -325,6 +325,23 @@ needs: R2 token
 source OK -> score BLOCKED (needs: R2 token) -> deploy SKIPPED
 ```
 
+Queued and running stages also get detail lines such as:
+
+```
+  source: RUNNING; enqueued 2m14s ago
+    last activity 8s ago: downloading object 41
+```
+
+`enqueued` is deliberate: the stage `started_at` is written when the job is
+enqueued, not when a worker claims it. After 60 seconds of delivery, pipeline
+workers update one latest-only `progress` job event about every 30 seconds. Its
+age is computed from the stored event timestamp, so a stopped daemon never looks
+fresh. Activity is stripped of terminal controls, redacted, and length-capped
+before storage. Orchestrate stages may have no current per-stage event while their
+sub-tree runs; the view says `(sub-tree running; no per-stage progress)` and does
+not treat that absence as a failure. `--json` stage objects add `started_at`,
+`finished_at`, and optional `{elapsed, activity, updated_at}` progress data.
+
 Funnel labels are `OK` for a succeeded stage, `BLOCKED (needs: …)` for a parked
 stage, and the uppercased state otherwise (`PENDING`, `QUEUED`, `RUNNING`,
 `FAILED`, `SKIPPED`, `CANCELLED`). When a run **failed**, the view also prints the

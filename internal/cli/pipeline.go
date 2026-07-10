@@ -644,8 +644,10 @@ func runPipelineRunCmd(args []string, stdout, stderr io.Writer) int {
 // pipelineRunView is the resolved data behind `pipeline show <run-id>`: the run
 // row plus its stage rows ordered into spec/DAG order for the funnel.
 type pipelineRunView struct {
-	run    db.PipelineRun
-	stages []db.PipelineRunStage
+	run         db.PipelineRun
+	stages      []db.PipelineRunStage
+	progress    map[string]db.JobEvent
+	orchestrate map[string]bool
 }
 
 // loadPipelineRunView loads a run and its stages, ordered for display. A missing
@@ -659,7 +661,26 @@ func loadPipelineRunView(ctx context.Context, store *db.Store, id string) (pipel
 	if err != nil {
 		return pipelineRunView{}, false, err
 	}
-	return pipelineRunView{run: run, stages: orderPipelineRunStages(ctx, store, run, stages)}, true, nil
+	stages = orderPipelineRunStages(ctx, store, run, stages)
+	jobIDs := make([]string, 0, len(stages))
+	for _, stage := range stages {
+		if stage.JobID != "" && (stage.State == pipeline.StageQueued || stage.State == pipeline.StageRunning) {
+			jobIDs = append(jobIDs, stage.JobID)
+		}
+	}
+	progress, err := store.GetLatestJobEventsByKind(ctx, jobIDs, "progress")
+	if err != nil {
+		return pipelineRunView{}, false, err
+	}
+	orchestrate := map[string]bool{}
+	if rec, found, getErr := store.GetPipeline(ctx, run.Pipeline); getErr == nil && found && strings.TrimSpace(rec.SpecHash) == strings.TrimSpace(run.SpecHash) {
+		if spec, loadErr := pipeline.Load([]byte(rec.SpecYAML)); loadErr == nil {
+			for _, stage := range spec.Stages {
+				orchestrate[stage.ID] = stage.Kind() == pipeline.StageKindOrchestrate
+			}
+		}
+	}
+	return pipelineRunView{run: run, stages: stages, progress: progress, orchestrate: orchestrate}, true, nil
 }
 
 // orderPipelineRunStages reorders stage rows into spec (topological) order when the
@@ -700,6 +721,10 @@ func orderPipelineRunStages(ctx context.Context, store *db.Store, run db.Pipelin
 // header. A failed run surfaces the exact `gitmoot report bug --job <stage-job>`
 // command for the halted stage (NO auto-filing).
 func printPipelineRunFunnel(stdout io.Writer, view pipelineRunView) {
+	printPipelineRunFunnelAt(stdout, view, time.Now().UTC())
+}
+
+func printPipelineRunFunnelAt(stdout io.Writer, view pipelineRunView, now time.Time) {
 	run := view.run
 	writeLine(stdout, "run: %s", run.ID)
 	writeLine(stdout, "pipeline: %s", run.Pipeline)
@@ -718,6 +743,25 @@ func printPipelineRunFunnel(stdout io.Writer, view pipelineRunView) {
 	}
 	writeLine(stdout, "")
 	writeLine(stdout, "%s", pipelineFunnelLine(view.stages))
+	for _, stage := range view.stages {
+		if stage.State != pipeline.StageQueued && stage.State != pipeline.StageRunning {
+			continue
+		}
+		writeLine(stdout, "  %s: %s; enqueued %s ago", stage.StageID, strings.ToUpper(stage.State), pipelineElapsed(now, stage.StartedAt))
+		event, hasProgress := view.progress[stage.JobID]
+		progress, validProgress := decodePipelineProgress(event.Message)
+		if stage.State == pipeline.StageRunning && hasProgress && validProgress {
+			age := pipelineEventAge(now, event.CreatedAt)
+			if progress.Activity != "" {
+				writeLine(stdout, "    last activity %s ago: %s", age, progress.Activity)
+			} else {
+				writeLine(stdout, "    last activity %s ago: elapsed %s", age, progress.Elapsed)
+			}
+		}
+		if stage.State == pipeline.StageRunning && view.orchestrate[stage.StageID] && (!hasProgress || !validProgress || !pipelineProgressFresh(now, event.CreatedAt)) {
+			writeLine(stdout, "    (sub-tree running; no per-stage progress)")
+		}
+	}
 	if run.State == pipeline.RunFailed {
 		if jobID := haltStageJobID(view); jobID != "" {
 			writeLine(stdout, "")
@@ -725,6 +769,48 @@ func printPipelineRunFunnel(stdout io.Writer, view pipelineRunView) {
 			writeLine(stdout, "  gitmoot report bug --job %s", jobID)
 		}
 	}
+}
+
+func pipelineElapsed(now, started time.Time) string {
+	if started.IsZero() {
+		return "?"
+	}
+	d := now.Sub(started)
+	if d < 0 {
+		d = 0
+	}
+	return d.Round(time.Second).String()
+}
+
+func pipelineEventTime(value string) time.Time {
+	for _, layout := range []string{time.RFC3339Nano, "2006-01-02 15:04:05"} {
+		if parsed, err := time.Parse(layout, strings.TrimSpace(value)); err == nil {
+			return parsed.UTC()
+		}
+	}
+	return time.Time{}
+}
+
+func pipelineEventAge(now time.Time, createdAt string) string {
+	return pipelineElapsed(now, pipelineEventTime(createdAt))
+}
+
+func pipelineProgressFresh(now time.Time, createdAt string) bool {
+	created := pipelineEventTime(createdAt)
+	if created.IsZero() {
+		return false
+	}
+	age := now.Sub(created)
+	return age >= 0 && age <= 2*pipelineProgressInterval
+}
+
+func decodePipelineProgress(message string) (pipelineProgressEventPayload, bool) {
+	var payload pipelineProgressEventPayload
+	if err := json.Unmarshal([]byte(message), &payload); err != nil {
+		return pipelineProgressEventPayload{}, false
+	}
+	payload.Activity = sanitizePipelineProgressLine(payload.Activity)
+	return payload, strings.TrimSpace(payload.Elapsed) != "" || payload.Activity != ""
 }
 
 // pipelineFunnelLine joins each stage's `<id> <LABEL>` into the funnel line.
@@ -765,12 +851,25 @@ func haltStageJobID(view pipelineRunView) string {
 }
 
 type pipelineRunStageJSON struct {
-	ID      string   `json:"id"`
-	State   string   `json:"state"`
-	JobID   string   `json:"job_id,omitempty"`
-	Attempt int      `json:"attempt,omitempty"`
-	Needs   []string `json:"needs,omitempty"`
-	Summary string   `json:"summary,omitempty"`
+	ID         string                        `json:"id"`
+	State      string                        `json:"state"`
+	JobID      string                        `json:"job_id,omitempty"`
+	Attempt    int                           `json:"attempt,omitempty"`
+	Needs      []string                      `json:"needs,omitempty"`
+	Summary    string                        `json:"summary,omitempty"`
+	StartedAt  string                        `json:"started_at,omitempty"`
+	FinishedAt string                        `json:"finished_at,omitempty"`
+	Progress   *pipelineRunStageProgressJSON `json:"progress,omitempty"`
+}
+
+// The external gitmoot-dashboard repo can already derive elapsed time from
+// started_at. Teaching it the optional progress object is Phase 2 of #816; keep
+// this CLI JSON addition backward-compatible until that separate consumer moves.
+
+type pipelineRunStageProgressJSON struct {
+	Elapsed   string `json:"elapsed"`
+	Activity  string `json:"activity,omitempty"`
+	UpdatedAt string `json:"updated_at"`
 }
 
 type pipelineRunJSON struct {
@@ -805,14 +904,25 @@ func pipelineRunToJSON(view pipelineRunView) pipelineRunJSON {
 		Funnel:     pipelineFunnelLine(view.stages),
 	}
 	for _, stage := range view.stages {
-		out.Stages = append(out.Stages, pipelineRunStageJSON{
-			ID:      stage.StageID,
-			State:   stage.State,
-			JobID:   stage.JobID,
-			Attempt: stage.Attempt,
-			Needs:   decodePipelineNeeds(stage.NeedsJSON),
-			Summary: stage.Summary,
-		})
+		stageJSON := pipelineRunStageJSON{
+			ID:         stage.StageID,
+			State:      stage.State,
+			JobID:      stage.JobID,
+			Attempt:    stage.Attempt,
+			Needs:      decodePipelineNeeds(stage.NeedsJSON),
+			Summary:    stage.Summary,
+			StartedAt:  pipelineRunTimeJSON(stage.StartedAt),
+			FinishedAt: pipelineRunTimeJSON(stage.FinishedAt),
+		}
+		if event, ok := view.progress[stage.JobID]; ok {
+			if progress, valid := decodePipelineProgress(event.Message); valid {
+				stageJSON.Progress = &pipelineRunStageProgressJSON{
+					Elapsed: progress.Elapsed, Activity: progress.Activity,
+					UpdatedAt: pipelineRunTimeJSON(pipelineEventTime(event.CreatedAt)),
+				}
+			}
+		}
+		out.Stages = append(out.Stages, stageJSON)
 	}
 	return out
 }
