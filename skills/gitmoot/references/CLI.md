@@ -1620,6 +1620,7 @@ distill_at_terminal = false # stage deterministic failure signal at job terminal
 distill_successes = false   # stage deterministic success observations (#781)
 distill_max_per_job = 3     # hard cap on distilled observations per job
 distill_all_jobs = false    # when true, distill runs for every job, not only enrolled agents
+ingest_auto_confirm = false # when true, ingest/chat remember confirm to the authoring agent private pool only
 ```
 
 All `[memory]` keys are read **per tick**. Flipping `distill_at_terminal`,
@@ -1725,18 +1726,23 @@ produced by `export --agent NAME` stays importable even when other owners have
 memories (import rebuilds the fresh export with the manifest's recorded scope). The
 `<DIR>` positional may appear before or after the flags.
 
-### Markdown ingest and the human confirm gate (#737 P3)
+### Markdown ingest, private auto-confirm, and provenance retirement (#737 P3, #782 V1)
 
 `memory ingest` is the **mouth** of the bridge: it reads arbitrary Markdown
-(session notes, runbooks, incident writeups) and stages it as **pending
-observations** behind the existing confirmation gate. It never writes confirmed
-(injectable) memory directly.
+(session notes, runbooks, incident writeups) and stages it as observations behind
+the existing confirmation gate. By default those observations stay pending. If
+`[memory].ingest_auto_confirm = true`, `memory ingest`, `memory ingest sweep`,
+and `chat remember` immediately confirm the staged observation into the
+authoring agent's **private** pool only. They never auto-confirm into the shared
+pool. Shared memory stays explicit through `memory confirm --to-shared` or
+`memory promote --to-shared`.
 
 ```sh
 gitmoot memory ingest <path|dir> --agent NAME [--shared] [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
 gitmoot memory ingest sweep [--json]
 gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]
 gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--to-shared] [--yes] [--json]
+gitmoot memory retire --provenance-prefix P [--agent NAME] [--dry-run] [--yes] [--json]
 gitmoot memory promote --to-shared <id>... [--json]
 gitmoot memory links backfill [--dry-run] [--json]
 gitmoot memory links list <id> [--json]
@@ -1759,15 +1765,17 @@ Surviving chunks land in `memory_observations` with `provenance = ingest:<relpat
 and, crucially, **`trust_mark = low`** — see the trust note below. `--tier` defaults
 to `repo`; `general` is only ever chosen with the explicit flag. `--shared`
 stages the observations in the shared pool while preserving `--agent NAME` as
-their author. `--dry-run` reports what would be staged without writing.
+their author. With auto-confirm enabled, the confirmed write still goes to
+`--agent NAME`'s private pool, not shared. `--dry-run` reports what would be
+staged without writing.
 
 `memory ingest sweep` reads every configured `[[memory.ingest]]` source from the
 current config at run time and runs the same ingest logic in-process for each one.
 `--json` emits per-source entries with `path`, `agent`, `repo`, `tier`,
-`inserted`, `deduped`, `rejected`, and `error`, plus aggregate totals. One bad
-source does not stop the rest; the command exits non-zero only when the config is
-invalid or every configured source fails. With no sources it exits zero with a
-skipped note.
+`inserted`, `confirmed`, `skipped_retired`, `deduped`, `rejected`, and `error`,
+plus aggregate totals. One bad source does not stop the rest; the command exits
+non-zero only when the config is invalid or every configured source fails. With
+no sources it exits zero with a skipped note.
 
 `memory observations` lists pending observations (optionally narrowed by
 `--agent` or `--provenance-prefix`), flagging which keys already crossed the
@@ -1780,7 +1788,16 @@ confirms selected observations into the shared pool and records the observation
 author. `memory promote --to-shared <id>...` moves existing active confirmed
 facts into shared, refuses retired or superseded rows, preserves outgoing
 `memory_links`, and sets `author_ref` from the previous owner when needed. This is
-**CLI-explicit only**: there is no daemon path and nothing auto-confirms.
+**CLI-explicit only**.
+
+`memory retire --provenance-prefix P` is the blast-radius undo for any collector
+batch. It selects active confirmed rows whose provenance starts with `P`, scoped
+optionally by `--agent NAME`, and is a dry run unless `--yes` is passed. Applying
+the plan sets `retired_at` and `retired_reason` and removes the rows from FTS in
+the same transaction, so they stop being injected and exported while the audit
+rows remain. Retired keys are not resurrected by ingest or collectors on
+re-ingest; only explicit human-controlled confirmation paths may revive a retired
+key.
 
 The built-in `memory-ingest-sweep` pipeline calls
 `gitmoot memory ingest sweep --json` and then summarizes the run totals. Configure
@@ -2063,6 +2080,7 @@ gitmoot chat create <name> --repo owner/repo [--topic "title"] [--json]
 gitmoot chat list [--repo owner/repo] [--all] [--json]      # open threads; --all includes archived
 gitmoot chat show <thread> [--repo owner/repo] [--limit N] [--json]
 gitmoot chat send <thread> "message" [--as agent] [--repo owner/repo] [--ref kind:value ...] [--json]
+gitmoot chat remember <thread> <message-seq> [--repo owner/repo] [--tier repo|general] [--agent NAME] [--json]
 gitmoot chat inbox <agent> [--unread] [--json]
 gitmoot chat task <thread> "@agent message" [--action ask|review|implement] [--repo owner/repo] [--json]
 gitmoot chat answer <thread> "<question-id>: answer text" [--repo owner/repo] [--json]
@@ -2080,6 +2098,15 @@ gitmoot chat rename <thread> "new name" [--repo owner/repo] [--json]
   `--as <agent>` authors the message as a registered agent (default: the human);
   `--ref kind:value` attaches structured refs (e.g. `--ref pr:42`). Sending to an
   archived thread is refused until you `reopen` it.
+- **`remember`**: captures exactly one existing message by sequence as a memory
+  observation. It stores the message body verbatim with deterministic provenance
+  `chat:<thread-id>#<seq>`, applies the memory PreFilter, and dedups by content
+  hash within the target scope/repo. It does not scan for natural-language
+  prefixes, does not bulk-mine a thread, and does not self-trigger from agent
+  messages. `--agent` is the capturing agent identity (default `lead`); `--tier`
+  defaults to `repo`. If `[memory].ingest_auto_confirm = true`, the observation is
+  immediately confirmed into that agent's private pool only. Shared memory remains
+  explicit through `memory confirm --to-shared` or `memory promote --to-shared`.
 - **`inbox`** — an agent's mentions, newest first; `--unread` restricts to unread.
 - **`task`** — the one promotion verb. The body must name **exactly one**
   registered `@agent`; it records a `promotion_request` message, then dispatches a

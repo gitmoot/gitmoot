@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -683,10 +684,10 @@ func TestRetiredExcludedFromCountAndGraph(t *testing.T) {
 	_ = dropID
 }
 
-// TestReconfirmRetiredKeyReactivates proves a fresh confirmation of a key that was
-// previously retired clears retired_at, so the re-admitted fact is injectable and
-// exportable again instead of staying permanently hidden behind the stale retirement.
-func TestReconfirmRetiredKeyReactivates(t *testing.T) {
+// TestUpsertConfirmedMemoryRefusesRetiredKeyUnlessExplicit proves unattended
+// re-ingest cannot resurrect a row an operator already retired, while an explicit
+// human-controlled option can preserve the old re-confirm behavior.
+func TestUpsertConfirmedMemoryRefusesRetiredKeyUnlessExplicit(t *testing.T) {
 	ctx := context.Background()
 	store := openMemTestStore(t)
 	owner := agentOwner("builder")
@@ -700,31 +701,91 @@ func TestReconfirmRetiredKeyReactivates(t *testing.T) {
 		t.Fatalf("retire: %v", err)
 	}
 
-	// Re-confirm the same key (the confirmation gate re-admits the fact).
-	reID, err := store.UpsertConfirmedMemory(ctx, ConfirmedMemory{
+	_, err = store.UpsertConfirmedMemory(ctx, ConfirmedMemory{
 		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "ci-flake", Content: "arm64 CI flaky, rerun helps",
 	})
-	if err != nil {
-		t.Fatalf("re-confirm: %v", err)
-	}
-	if reID != id {
-		t.Fatalf("re-confirm must reuse the keyed row (%d), got %d", id, reID)
+	if !errors.Is(err, ErrConfirmedMemoryRetired) {
+		t.Fatalf("default re-upsert must refuse retired row, got: %v", err)
 	}
 
-	// It is injectable again (retired_at cleared) and re-exports.
+	// The refused upsert leaves the row hidden and unchanged.
 	got, err := store.QueryConfirmedMemories(ctx, owner, "acme/widget", `"arm64" OR "flaky"`, 15)
+	if err != nil {
+		t.Fatalf("query after refused upsert: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("refused re-upsert must not make the row injectable, got %+v", got)
+	}
+	vaultRows, err := store.ListConfirmedMemoriesForVault(ctx, "")
+	if err != nil {
+		t.Fatalf("vault list after refused upsert: %v", err)
+	}
+	if len(vaultRows) != 0 {
+		t.Fatalf("refused re-upsert must not re-export the row, got %+v", vaultRows)
+	}
+
+	reID, err := store.UpsertConfirmedMemory(ctx, ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "ci-flake", Content: "arm64 CI flaky, rerun helps",
+	}, AllowResurrectConfirmedMemory())
+	if err != nil {
+		t.Fatalf("explicit resurrect: %v", err)
+	}
+	if reID != id {
+		t.Fatalf("explicit resurrect must reuse the keyed row (%d), got %d", id, reID)
+	}
+
+	got, err = store.QueryConfirmedMemories(ctx, owner, "acme/widget", `"arm64" OR "flaky"`, 15)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
 	if len(got) != 1 || got[0].Content != "arm64 CI flaky, rerun helps" {
-		t.Fatalf("re-confirmed fact must be injectable with new content, got %+v", got)
+		t.Fatalf("resurrected fact must be injectable with new content, got %+v", got)
 	}
-	vaultRows, err := store.ListConfirmedMemoriesForVault(ctx, "")
+	vaultRows, err = store.ListConfirmedMemoriesForVault(ctx, "")
 	if err != nil {
 		t.Fatalf("vault list: %v", err)
 	}
 	if len(vaultRows) != 1 {
-		t.Fatalf("re-confirmed fact must re-export, got %d rows", len(vaultRows))
+		t.Fatalf("resurrected fact must re-export, got %d rows", len(vaultRows))
+	}
+}
+
+func TestApplyVaultImportStagesButDoesNotResurrectRetiredKey(t *testing.T) {
+	ctx := context.Background()
+	store := openMemTestStore(t)
+	owner := agentOwner("builder")
+	id, err := store.UpsertConfirmedMemory(ctx, ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "ci-flake", Content: "arm64 CI is flaky",
+	})
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if err := store.RetireConfirmedMemory(ctx, id, "vault-import: deleted by owner"); err != nil {
+		t.Fatalf("retire: %v", err)
+	}
+
+	plan := VaultImportPlan{
+		Observations: []MemoryObservation{{
+			Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "ci-flake",
+			Content: "arm64 CI flaky, rerun helps", Provenance: "vault-import:new.md", TrustMark: "normal",
+		}},
+	}
+	if err := store.ApplyVaultImport(ctx, plan); err != nil {
+		t.Fatalf("apply vault import: %v", err)
+	}
+	got, err := store.QueryConfirmedMemories(ctx, owner, "acme/widget", `"arm64" OR "flaky"`, 15)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("vault import observation must not resurrect retired confirmed memory, got %+v", got)
+	}
+	n, err := store.CountMemoryObservationsForKey(ctx, owner, "acme/widget", "ci-flake")
+	if err != nil {
+		t.Fatalf("count observations: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("vault import should still stage one observation, got %d", n)
 	}
 }
 

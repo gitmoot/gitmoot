@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -75,6 +76,88 @@ func TestMemoryListShowsBothTiers(t *testing.T) {
 		if e.Tier != "confirmed" {
 			t.Fatalf("--confirmed returned a %q entry", e.Tier)
 		}
+	}
+}
+
+func TestMemoryRetireByProvenancePrefixDryRunApplyAndFTS(t *testing.T) {
+	home, store := memoryTestHome(t)
+	ctx := context.Background()
+	lead := db.MemoryOwner{Kind: "agent", Ref: "lead"}
+	audit := db.MemoryOwner{Kind: "agent", Ref: "audit"}
+	chatID, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+		Owner: lead, Repo: "owner/repo", Scope: "repo", Key: "chat-decision",
+		Content: "The quasar rollout decision lives in the release room.", Provenance: "chat:thread-a#2",
+	})
+	if err != nil {
+		t.Fatalf("seed chat memory: %v", err)
+	}
+	if _, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+		Owner: lead, Repo: "owner/repo", Scope: "repo", Key: "ingest-note",
+		Content: "The quasar rollout runbook has a separate ingest note.", Provenance: "ingest:runbook.md",
+	}); err != nil {
+		t.Fatalf("seed ingest memory: %v", err)
+	}
+	if _, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+		Owner: audit, Repo: "owner/repo", Scope: "repo", Key: "audit-chat",
+		Content: "The audit room also mentions quasar cleanup.", Provenance: "chat:thread-b#1",
+	}); err != nil {
+		t.Fatalf("seed audit memory: %v", err)
+	}
+
+	code, out, errOut := runMemoryCapture(t, "retire", "--home", home,
+		"--provenance-prefix", "chat:", "--agent", "lead", "--json")
+	if code != 0 {
+		t.Fatalf("retire dry-run exit %d: %s", code, errOut)
+	}
+	var dry memoryRetireResult
+	if err := json.Unmarshal([]byte(out), &dry); err != nil {
+		t.Fatalf("parse dry-run result: %v (%s)", err, out)
+	}
+	if !dry.DryRun || dry.Selected != 1 || dry.Retired != 0 || len(dry.IDs) != 1 || dry.IDs[0] != chatID {
+		t.Fatalf("dry-run result wrong: %+v", dry)
+	}
+	before, err := store.QueryConfirmedMemories(ctx, lead, "owner/repo", `"quasar"`, 10)
+	if err != nil || len(before) == 0 {
+		t.Fatalf("dry-run must leave injection intact, rows=%+v err=%v", before, err)
+	}
+
+	code, out, errOut = runMemoryCapture(t, "retire", "--home", home,
+		"--provenance-prefix", "chat:", "--agent", "lead", "--yes", "--json")
+	if code != 0 {
+		t.Fatalf("retire apply exit %d: %s", code, errOut)
+	}
+	var applied memoryRetireResult
+	if err := json.Unmarshal([]byte(out), &applied); err != nil {
+		t.Fatalf("parse apply result: %v (%s)", err, out)
+	}
+	if applied.DryRun || applied.Selected != 1 || applied.Retired != 1 || len(applied.IDs) != 1 || applied.IDs[0] != chatID {
+		t.Fatalf("apply result wrong: %+v", applied)
+	}
+	after, err := store.QueryConfirmedMemories(ctx, lead, "owner/repo", `"decision" OR "quasar"`, 10)
+	if err != nil {
+		t.Fatalf("query after retire: %v", err)
+	}
+	for _, row := range after {
+		if row.ID == chatID {
+			t.Fatalf("retired row still appears in injection query: %+v", after)
+		}
+	}
+	remainingAudit, err := store.QueryConfirmedMemories(ctx, audit, "owner/repo", `"audit" OR "quasar"`, 10)
+	if err != nil || len(remainingAudit) != 1 {
+		t.Fatalf("--agent filter retired the wrong owner, rows=%+v err=%v", remainingAudit, err)
+	}
+
+	raw, err := sql.Open("sqlite", config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("open raw sqlite: %v", err)
+	}
+	defer raw.Close()
+	var ftsRows int
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM confirmed_memories_fts WHERE rowid = ?`, chatID).Scan(&ftsRows); err != nil {
+		t.Fatalf("count FTS rows: %v", err)
+	}
+	if ftsRows != 0 {
+		t.Fatalf("retired row still has %d FTS row(s)", ftsRows)
 	}
 }
 

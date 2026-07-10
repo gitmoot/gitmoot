@@ -44,6 +44,8 @@ func runMemory(args []string, stdout, stderr io.Writer) int {
 		return runMemoryObservations(args[1:], stdout, stderr)
 	case "confirm":
 		return runMemoryConfirm(args[1:], stdout, stderr)
+	case "retire":
+		return runMemoryRetire(args[1:], stdout, stderr)
 	case "promote":
 		return runMemoryPromote(args[1:], stdout, stderr)
 	case "links":
@@ -78,6 +80,7 @@ func printMemoryUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot memory ingest sweep [--json]")
 	fmt.Fprintln(w, "  gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]")
 	fmt.Fprintln(w, "  gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--to-shared] [--yes] [--json]")
+	fmt.Fprintln(w, "  gitmoot memory retire --provenance-prefix P [--agent NAME] [--dry-run] [--yes] [--json]")
 	fmt.Fprintln(w, "  gitmoot memory promote --to-shared <id>... [--json]")
 	fmt.Fprintln(w, "  gitmoot memory links backfill [--dry-run] [--json]")
 	fmt.Fprintln(w, "  gitmoot memory links list <id> [--json]")
@@ -95,6 +98,7 @@ func printMemoryUsage(w io.Writer) {
 	fmt.Fprintln(w, "  ingest        stage markdown as trust_mark=low pending observations, or sweep configured sources")
 	fmt.Fprintln(w, "  observations  list pending observations, flagging which keys are already confirmed")
 	fmt.Fprintln(w, "  confirm       human-gated promotion of pending observations into confirmed memory")
+	fmt.Fprintln(w, "  retire        bulk-retire active confirmed memory by provenance prefix")
 	fmt.Fprintln(w, "  promote       explicitly move active confirmed facts into the shared pool")
 	fmt.Fprintln(w, "  links         inspect persisted memory links; backfill links for existing facts")
 	fmt.Fprintln(w, "  groom         deterministically propose stale-memory retirements, apply on confirmation")

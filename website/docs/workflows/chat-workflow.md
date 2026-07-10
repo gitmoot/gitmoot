@@ -22,6 +22,9 @@ gitmoot chat create release-room --repo owner/repo --topic "Release coordination
 # Leave a durable, @-tagged message — lands in codex-b's inbox, starts nothing.
 gitmoot chat send release-room "@codex-b can you inspect the runtime adapter?"
 
+# Capture exactly one useful message as a memory observation.
+gitmoot chat remember release-room 1 --agent lead
+
 # codex-b (or you) checks its inbox.
 gitmoot chat inbox codex-b --unread
 
@@ -49,6 +52,27 @@ dispatch path — a single chokepoint. On top of that:
 - an identical `(thread, body)` promotion within a 60-second window is **refused**
   (fingerprint dedupe), so a double-run of the same `chat task` cannot fan out two
   jobs.
+
+## Remember one message as memory
+
+`chat remember <thread> <message-seq>` captures exactly that existing message's
+body as a memory observation. It stores deterministic provenance
+`chat:<thread-id>#<seq>`, applies the same memory PreFilter used by ingest and
+agent learnings, and dedups by content hash in the target scope/repo. It does not
+scan for "remember this" prefixes, does not bulk-mine a thread, and does not
+self-trigger from agent messages.
+
+```sh
+gitmoot chat remember release-room 7 --agent lead --tier repo
+gitmoot chat remember release-room 8 --agent lead --tier general
+```
+
+`--agent` is the capturing identity that owns the observation; it defaults to
+`lead`. `--tier` defaults to `repo`, using the thread repo unless `--tier general`
+is selected. If `[memory].ingest_auto_confirm = true`, the observation is
+confirmed immediately into the capturing agent's private pool only. Shared memory
+is always explicit through `memory confirm --to-shared` or
+`memory promote --to-shared`.
 
 ## Threads, slugs, and lifecycle
 

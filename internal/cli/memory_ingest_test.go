@@ -146,6 +146,57 @@ func TestMemoryIngestSameContentDifferentRepoStagesBoth(t *testing.T) {
 	}
 }
 
+func TestMemoryIngestAutoConfirmFlagPrivateOnly(t *testing.T) {
+	home, store := memoryTestHome(t)
+	src := t.TempDir()
+	writeFixture(t, src, "note.md",
+		"The release calendar uses the blue marker for the July cutoff.\n")
+
+	code, out, errOut := runMemoryCapture(t, "ingest", src, "--home", home,
+		"--agent", "lead", "--repo", "owner/repo", "--json")
+	if code != 0 {
+		t.Fatalf("default ingest exit %d: %s", code, errOut)
+	}
+	var off memoryIngestResult
+	if err := json.Unmarshal([]byte(out), &off); err != nil {
+		t.Fatalf("parse default ingest: %v (%s)", err, out)
+	}
+	if off.AutoConfirm || off.Confirmed != 0 || confirmedCount(t, store) != 0 {
+		t.Fatalf("auto-confirm off should leave pending only, result=%+v confirmed=%d", off, confirmedCount(t, store))
+	}
+
+	homeOn, storeOn := memoryTestHome(t)
+	paths := config.PathsForHome(homeOn)
+	writeMemoryPipelineConfig(t, paths, `
+[memory]
+ingest_auto_confirm = true
+`)
+	code, out, errOut = runMemoryCapture(t, "ingest", src, "--home", homeOn,
+		"--agent", "lead", "--repo", "owner/repo", "--json")
+	if code != 0 {
+		t.Fatalf("auto-confirm ingest exit %d: %s", code, errOut)
+	}
+	var on memoryIngestResult
+	if err := json.Unmarshal([]byte(out), &on); err != nil {
+		t.Fatalf("parse auto-confirm ingest: %v (%s)", err, out)
+	}
+	if !on.AutoConfirm || on.Inserted != 1 || on.Confirmed != 1 {
+		t.Fatalf("auto-confirm result wrong: %+v", on)
+	}
+	privateRows, err := storeOn.QueryConfirmedMemories(context.Background(),
+		db.MemoryOwner{Kind: memory.OwnerKindAgent, Ref: "lead"}, "owner/repo", `"calendar" OR "cutoff"`, 10)
+	if err != nil || len(privateRows) != 1 || privateRows[0].Owner.Kind != memory.OwnerKindAgent || privateRows[0].Owner.Ref != "lead" {
+		t.Fatalf("auto-confirm should write lead private memory, rows=%+v err=%v", privateRows, err)
+	}
+	sharedRows, err := storeOn.QueryConfirmedMemoriesForShared(context.Background(), "owner/repo", `"calendar" OR "cutoff"`, 10)
+	if err != nil {
+		t.Fatalf("query shared: %v", err)
+	}
+	if len(sharedRows) != 0 {
+		t.Fatalf("auto-confirm must not write shared memory, got %+v", sharedRows)
+	}
+}
+
 // TestMemoryIngestConfirmExportRoundTrip is the P3 end-to-end: ingest → the note
 // is a pending observation → confirm --provenance-prefix promotes it (idempotently)
 // → it becomes retrievable via QueryConfirmedMemories AND appears in the vault export.
@@ -335,6 +386,47 @@ tier = "repo"
 	}
 	if obs := listObservations(t, home); len(obs) != 2 {
 		t.Fatalf("observations = %d, want two successful-source inserts: %+v", len(obs), obs)
+	}
+}
+
+func TestMemoryIngestSweepAutoConfirmsConfiguredSources(t *testing.T) {
+	home, store := memoryTestHome(t)
+	paths := config.PathsForHome(home)
+	src := t.TempDir()
+	writeFixture(t, src, "sweep.md", "The sweep source records the violet release-board handoff.\n")
+	writeMemoryPipelineConfig(t, paths, `
+[memory]
+ingest_auto_confirm = true
+
+[[memory.ingest]]
+path = "`+filepath.ToSlash(src)+`"
+agent = "lead"
+repo = "owner/repo"
+tier = "repo"
+`)
+
+	code, out, errOut := runMemoryCapture(t, "ingest", "sweep", "--home", home, "--json")
+	if code != 0 {
+		t.Fatalf("auto-confirm sweep exit %d: %s", code, errOut)
+	}
+	var result memoryIngestSweepResult
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("parse sweep: %v (%s)", err, out)
+	}
+	if result.Totals.Inserted != 1 || result.Totals.Confirmed != 1 || result.Sources[0].Confirmed != 1 {
+		t.Fatalf("auto-confirm sweep result wrong: %+v", result)
+	}
+	privateRows, err := store.QueryConfirmedMemories(context.Background(),
+		db.MemoryOwner{Kind: memory.OwnerKindAgent, Ref: "lead"}, "owner/repo", `"violet" OR "handoff"`, 10)
+	if err != nil || len(privateRows) != 1 {
+		t.Fatalf("sweep should confirm into private memory, rows=%+v err=%v", privateRows, err)
+	}
+	sharedRows, err := store.QueryConfirmedMemoriesForShared(context.Background(), "owner/repo", `"violet" OR "handoff"`, 10)
+	if err != nil {
+		t.Fatalf("query shared: %v", err)
+	}
+	if len(sharedRows) != 0 {
+		t.Fatalf("sweep auto-confirm must not write shared memory, got %+v", sharedRows)
 	}
 }
 

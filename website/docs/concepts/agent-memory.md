@@ -84,6 +84,7 @@ distill_at_terminal = false # stage deterministic failure signal at terminal (P4
 distill_successes = false   # stage deterministic success observations
 distill_max_per_job = 3     # hard cap on distilled observations per job
 distill_all_jobs = false    # true → distill every job, not only enrolled agents
+ingest_auto_confirm = false # true → ingest/chat remember confirm to private only
 ```
 
 Every `[memory]` key is read **per tick**, so flipping `distill_at_terminal`, `distill_successes`
@@ -230,14 +231,19 @@ memories, because import rebuilds the fresh export with the manifest's recorded 
 
 The vault export is the bridge's *outlet*; `memory ingest` is its *mouth*. It
 reads arbitrary Markdown (session notes, runbooks, incident writeups) and stages
-it as **pending observations** behind the existing confirmation gate — it never
-writes injectable memory directly.
+it as observations behind the existing confirmation gate. By default those
+observations stay pending. If `[memory].ingest_auto_confirm = true`, `memory
+ingest`, `memory ingest sweep`, and `chat remember` immediately confirm the
+staged observation into the authoring agent's **private** pool only. They never
+auto-confirm into the shared pool. Shared memory stays explicit through `memory
+confirm --to-shared` or `memory promote --to-shared`.
 
 ```sh
 gitmoot memory ingest <path|dir> --agent NAME [--shared] [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
 gitmoot memory ingest sweep [--json]
 gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]
 gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--to-shared] [--yes] [--json]
+gitmoot memory retire --provenance-prefix P [--agent NAME] [--dry-run] [--yes] [--json]
 gitmoot memory promote --to-shared <id>... [--json]
 gitmoot memory links backfill [--dry-run] [--json]
 gitmoot memory links list <id> [--json]
@@ -258,25 +264,35 @@ under a second repo still stages, because repo-scoped memory injects only for it
 own repo. Survivors land in `memory_observations` with
 `provenance = ingest:<relpath>` and `trust_mark = low`. `--dry-run` reports the
 plan without writing. `--shared` stages observations in the shared pool and
-records `--agent NAME` as the authoring identity.
+records `--agent NAME` as the authoring identity. With auto-confirm enabled, the
+confirmed write still goes to `--agent NAME`'s private pool, not shared.
 
 `memory observations` lists pending observations, flagging which have already
 been confirmed. `memory confirm` is the **human-gated promotion**: it copies
 selected observations (by id, or every one matching a `--provenance-prefix`) into
 confirmed memory, carrying provenance through. Without `--yes` it prints the plan
-and writes nothing; with `--yes` it promotes idempotently. It is **CLI-explicit
-only**: no daemon path, no auto-confirm. `--to-shared` confirms selected
-observations into the shared pool while preserving the observation author.
+and writes nothing; with `--yes` it promotes idempotently. `--to-shared` confirms
+selected observations into the shared pool while preserving the observation author.
 `memory promote --to-shared <id>...` moves active confirmed facts into shared,
 refuses retired or superseded rows, preserves existing links, and stamps
 `author_ref` from the previous owner when needed.
 
+`memory retire --provenance-prefix P` is the blast-radius undo for a collector
+batch. It selects active confirmed rows whose provenance starts with `P`, scoped
+optionally by `--agent NAME`, and is a dry run unless `--yes` is passed. Applying
+the plan sets `retired_at` and `retired_reason` and removes the rows from FTS in
+the same transaction, so they stop being injected and exported while the audit
+rows remain. Retired keys are not resurrected by ingest or collectors on
+re-ingest; only explicit human-controlled confirmation paths may revive a retired
+key.
+
 `memory ingest sweep` reads the current `[[memory.ingest]]` source list from the
 config at run time and runs the same ingest logic in-process for each source.
 `--json` reports each source with `path`, `agent`, `repo`, `tier`, `inserted`,
-`deduped`, `rejected`, and `error`, plus totals. One bad source does not stop the
-rest. The command exits non-zero only when the config is invalid or every source
-fails; with no sources it exits zero with a skipped note.
+`confirmed`, `skipped_retired`, `deduped`, `rejected`, and `error`, plus totals.
+One bad source does not stop the rest. The command exits non-zero only when the
+config is invalid or every source fails; with no sources it exits zero with a
+skipped note.
 
 For unattended intake, Gitmoot ships an ordinary built-in pipeline named
 `memory-ingest-sweep`. The daemon and `gitmoot pipeline install-defaults` register
@@ -304,8 +320,8 @@ gitmoot pipeline run memory-ingest-sweep
 ```
 
 With no `[[memory.ingest]]` entries, the pipeline succeeds with a no-sources
-summary. It still stages observations only; nothing reaches confirmed memory
-without `memory confirm`.
+summary. It follows `[memory].ingest_auto_confirm`: default pending only, or
+private-pool confirmation when that switch is true.
 
 When a fact is confirmed, Gitmoot also records up to three deterministic outgoing
 links from that confirmed row to active related confirmed memories. These links

@@ -120,9 +120,12 @@ path = ""
 # distill:<job-id>, NEVER confirmed memory (the memory confirm gate stays the only
 # promotion path). distill_successes (default false) enables #781 deterministic
 # success producers: SkillOpt promotions and recovered-failure observations. They
-# also stage only trust_mark=low pending observations. distill_max_per_job (default
-# 3, >= 0) caps per-job distilled rows; distill_all_jobs (default false) widens
-# terminal distill past enrolled agents to every job.
+# also stage only trust_mark=low pending observations. ingest_auto_confirm (default
+# false) lets memory ingest and chat remember immediately confirm into the authoring
+# agent's private pool only; the shared pool is always explicit through confirm
+# --to-shared or promote --to-shared. distill_max_per_job (default 3, >= 0) caps
+# distilled rows per job; distill_all_jobs (default false) widens distill past
+# enrolled agents to every job.
 # All [memory] keys are read PER TICK; no daemon restart is needed to flip them.
 # Inspect the store read-only with gitmoot memory list; see the "Agent Persistent
 # Memory" concepts page and CLI.md for the full model.
@@ -134,6 +137,7 @@ path = ""
 # distill_successes = false
 # distill_max_per_job = 3
 # distill_all_jobs = false
+# ingest_auto_confirm = false
 #
 # Built-in memory pipeline inputs are optional. The daemon and
 # gitmoot pipeline install-defaults register memory-ingest-sweep and

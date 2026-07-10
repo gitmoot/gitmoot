@@ -29,6 +29,9 @@ func TestLoadMemorySettingsDefaults(t *testing.T) {
 	if settings.DistillMaxPerJob != DefaultMemoryDistillMaxPerJob {
 		t.Fatalf("distill_max_per_job default = %d, want %d", settings.DistillMaxPerJob, DefaultMemoryDistillMaxPerJob)
 	}
+	if settings.IngestAutoConfirm {
+		t.Fatalf("ingest_auto_confirm must default false")
+	}
 }
 
 func TestLoadMemorySettingsParsesDistillKnobs(t *testing.T) {
@@ -80,6 +83,7 @@ func TestLoadMemorySettingsParsesKnobs(t *testing.T) {
 disabled = true
 token_budget = 800
 max_entries = 7
+ingest_auto_confirm = true
 `), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -87,7 +91,7 @@ max_entries = 7
 	if err != nil {
 		t.Fatalf("LoadMemorySettings: %v", err)
 	}
-	if !settings.Disabled || settings.TokenBudget != 800 || settings.MaxEntries != 7 {
+	if !settings.Disabled || settings.TokenBudget != 800 || settings.MaxEntries != 7 || !settings.IngestAutoConfirm {
 		t.Fatalf("parsed = %+v", settings)
 	}
 }
