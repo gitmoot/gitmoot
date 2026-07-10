@@ -6,7 +6,7 @@ truthful, and tied to work that actually happened.
 ```json
 {
   "gitmoot_result": {
-    "decision": "approved|changes_requested|blocked|implemented|failed",
+    "decision": "approved|changes_requested|blocked|implemented|failed|skipped",
     "summary": "Brief outcome.",
     "findings": [],
     "changes_made": [],
@@ -516,6 +516,13 @@ The same capture also feeds the `$`-denominated
   live. See `internal/workflow` `IsSettledJobState` vs `IsFinalJobState` (#632).
 - `implemented`: the requested implementation work was completed.
 - `failed`: the attempted action errored or could not complete.
+- `skipped`: the task itself had no work to do. Do not use `skipped` in a PR
+  review to mean "nothing to flag"; reviewers use `approved`. A skipped result
+  cannot carry delegations. Outside pipelines it maps to a succeeded job state;
+  it is an abstention for quorum/verify, while vote counts that succeeded state.
+  Pipelines accept it as success by default and persist the existing succeeded
+  stage state, not the separate skipped state used for downstream stages that
+  never ran.
 
 ## Reporting Rules
 

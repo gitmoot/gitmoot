@@ -35,7 +35,7 @@ By DEFAULT, the "here" flow tracks the work: run
 `gitmoot agent prompt <agent> --record [--repo owner/repo]`, which opens a
 session job on import and returns the prompt with a header line naming its job
 id. Apply the prompt, do the work, then — this is REQUIRED — clock out with
-`gitmoot job close <id> --decision <approved|changes_requested|implemented|blocked|failed> --summary "..."`
+`gitmoot job close <id> --decision <approved|changes_requested|implemented|blocked|failed|skipped> --summary "..."`
 so the work shows in `job list`, the dashboard, and the event stream just like
 an engine-run job (no runtime is spawned; gitmoot is only the record-keeper).
 `--record` works for both a **registered agent** (repo defaults to its repo scope)

@@ -100,6 +100,7 @@ func RenderJob(prompt JobPrompt) string {
 	builder.WriteString("Use this shape:\n")
 	builder.WriteString(resultContractShape)
 	builder.WriteByte('\n')
+	builder.WriteString(resultDecisionHelp)
 	builder.WriteString(delegationSchemaHelp)
 	return builder.String()
 }
@@ -122,6 +123,7 @@ func RenderRepairPrompt(rawOutput string, parseError error) string {
 	builder.WriteString("\nReturn only one JSON object in this exact shape:\n")
 	builder.WriteString(resultContractShape)
 	builder.WriteString("\n")
+	builder.WriteString(resultDecisionHelp)
 	builder.WriteString(delegationSchemaHelp)
 	builder.WriteString("\nPrevious raw output:\n")
 	builder.WriteString(trimRawOutput(rawOutput, 12000))

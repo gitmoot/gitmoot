@@ -18,18 +18,20 @@ import (
 )
 
 // DefaultSuccessDecisions are the gitmoot_result decisions that, absent an
-// explicit override, mark a pipeline stage succeeded. They mirror the
-// gitmoot_result contract's "the work landed" terminal decisions. blocked and
+// explicit override, mark a pipeline stage succeeded. skipped is default-on
+// because an honest no-work result is a successful pipeline stage. blocked and
 // failed are deliberately NOT here: the advancer treats them as park states, so
 // they can never mean success (see SuccessDecisionCandidates).
-var DefaultSuccessDecisions = []string{"approved", "implemented"}
+var DefaultSuccessDecisions = []string{"approved", "implemented", "skipped"}
 
 // SuccessDecisionCandidates are the gitmoot_result decisions a spec MAY list in
 // success_decisions (top-level or per-stage). It is the subset of the contract's
 // ResultDecisions that can plausibly mean "this stage succeeded": blocked and
 // failed are excluded because the advancer treats them as park states, so listing
-// either as a success would contradict the advance semantics.
-var SuccessDecisionCandidates = []string{"approved", "implemented", "changes_requested"}
+// either as a success would contradict the advance semantics. An explicit list is
+// strict: if it omits skipped, a skipped result folds failed because the author
+// required real work.
+var SuccessDecisionCandidates = []string{"approved", "implemented", "changes_requested", "skipped"}
 
 // DefaultAgentStageAction is the read-only agent verb an agent stage runs when
 // action is unset (#757). Agent stages are leaves, so the default is "ask".

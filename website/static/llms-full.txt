@@ -54,8 +54,12 @@ An agent is a named identity with a role, capabilities, a runtime, and a version
 ```sh
 gitmoot agent template draft frontend-reviewer --output agents/frontend-reviewer.md
 gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
-gitmoot agent start frontend-reviewer --runtime codex --repo owner/repo --template frontend-reviewer
+gitmoot agent start frontend-reviewer --runtime codex --repo owner/repo --template frontend-reviewer --effort high
 ```
+
+Codex agents can set a default reasoning effort with `--effort`, and individual
+jobs can override it with the same flag. Gitmoot forwards the free-form value as
+`-c model_reasoning_effort=<value>`; Claude and Kimi ignore it.
 
 ### Agents that evolve themselves with SkillOpt
 
@@ -492,7 +496,7 @@ object:
 ```json
 {
   "gitmoot_result": {
-    "decision": "approved|changes_requested|blocked|implemented|failed",
+    "decision": "approved|changes_requested|blocked|implemented|failed|skipped",
     "summary": "Brief outcome.",
     "findings": [],
     "changes_made": [],
@@ -1087,7 +1091,8 @@ Agents must return exactly one JSON object containing `gitmoot_result`:
 ```
 
 Valid decisions are `approved`, `changes_requested`, `blocked`, `implemented`,
-and `failed`.
+`failed`, and `skipped`. Use `skipped` only when the task itself had no work to
+do, never as a PR-review synonym for `approved`, and never with delegations.
 
 ---
 
@@ -2593,6 +2598,7 @@ schedule:                   # optional; interval schedule (no cron in v1)
 success_decisions:          # optional top-level default (see below)
   - approved
   - implemented
+  - skipped
 stages:                     # the DAG, keyed by unique id and wired by needs
   - id: source
     cmd: "curl -sf https://example.com/data > data.json"
@@ -2616,7 +2622,7 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 | `repo`                      | pipeline     | no\*     | `owner/name` the stages run against. Optional to **register**, but **required to run** — stage jobs need a managed repo for the worker to claim them. |
 | `schedule.interval`         | pipeline     | cond.    | Required when a `schedule:` block is present. A positive Go duration (`24h`, `1h30m`). |
 | `schedule.jitter`           | pipeline     | no       | Random `[0, jitter]` added to each `next_due` to de-thunder (`>= 0`). |
-| `success_decisions`         | pipeline     | no       | Decisions that mark a stage succeeded. Default `["approved","implemented"]`. Any value must be one of `approved`, `implemented`, `changes_requested` — `blocked`/`failed` are park states and are rejected. |
+| `success_decisions`         | pipeline     | no       | Decisions that mark a stage succeeded. Default `["approved","implemented","skipped"]`. Any value must be one of `approved`, `implemented`, `changes_requested`, `skipped` - `blocked`/`failed` are park states and are rejected. An explicit list is strict: omitting `skipped` requires real work and makes a skipped result fail. |
 | `allow_scheduled_writes`    | pipeline     | no       | Safety flag (#768). A **mutating** `implement` stage on a **scheduled** pipeline (a `schedule:` block) is rejected at add time unless this is `true` — so an unattended nightly pipeline can never write code / open a PR by accident. Manual-run pipelines don't need it. Default `false`. |
 | `stages[].id`               | stage        | yes      | Unique, name-safe stage id. Appears verbatim in the stage job's fingerprint and deterministic id. |
 | `stages[].cmd`              | stage        | cond.    | Shell command run verbatim via `sh -c` (see the stage contract below). A stage is **exactly one** of `cmd`, `agent`, or `gate`. |
@@ -2731,8 +2737,8 @@ stages:
   dispatch's fail-closed guards). A **retry** lands in the *same* branch/PR — never a
   duplicate — and fails closed if that worktree is dirty or has a live process.
 - **Folds on PR-opened.** A `success` decision folds only once the job carries an
-  opened PR; a legitimate **no-op** implement (nothing to change) folds succeeded too
-  (it can't wedge the run). The opened PR number is appended to the stage summary so a
+  opened PR. The first-class `skipped` decision bypasses that wait because there is
+  no work to turn into a PR. The opened PR number is appended to the stage summary so a
   downstream stage sees it via upstream-context injection.
 - **Never auto-merges.** The pipeline **opens** the PR; a human or your CI does the
   merge. See [Gate stages](#gate-stages) to make a later stage wait for that merge.
@@ -2766,6 +2772,8 @@ stages:
   **fails open** (keeps waiting while unmerged), and is bounded by the stage `timeout`.
 - A PR that is **closed without merging**, or a **timeout**, parks the run `blocked`
   (a gate is a wait, not a failure — so a retry budget can't re-arm the timer).
+- A source stage that succeeded via `skipped` also parks the gate `blocked`
+  immediately: no PR will exist for that run.
 
 ### Orchestrate stages
 
@@ -2807,6 +2815,9 @@ the stage by that result's **`decision`**, never by the job's exit state:
 # A stage that succeeds:
 printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"synced"}}'
 
+# A stage whose task had no work:
+printf '%s' '{"gitmoot_result":{"decision":"skipped","summary":"no new replies today"}}'
+
 # A stage that parks the run awaiting a human, listing what it needs:
 printf '%s' '{"gitmoot_result":{"decision":"blocked","summary":"secret missing","needs":["R2 token"]}}'
 ```
@@ -2827,6 +2838,13 @@ The decision drives advancement:
 job succeeded — because a stage folds on the decision, not the job state, and a
 review that asked for changes is not "this step landed." List it in a stage's (or
 the pipeline's) `success_decisions` to treat it as success instead.
+
+`skipped` is a stage **success by default**. Gitmoot prefixes its persisted summary
+with `[skipped: no work]`, and downstream agent stages receive that honest note in
+their upstream context. An explicit `success_decisions` list is strict: if it omits
+`skipped`, the stage fails because the author required real work. A skipped result
+uses the existing succeeded stage state; the `SKIPPED` funnel state still means a
+downstream stage never ran after the pipeline halted.
 
 ## CLI
 
@@ -7750,7 +7768,7 @@ By DEFAULT, the "here" flow tracks the work: run
 `gitmoot agent prompt <agent> --record [--repo owner/repo]`, which opens a
 session job on import and returns the prompt with a header line naming its job
 id. Apply the prompt, do the work, then — this is REQUIRED — clock out with
-`gitmoot job close <id> --decision <approved|changes_requested|implemented|blocked|failed> --summary "..."`
+`gitmoot job close <id> --decision <approved|changes_requested|implemented|blocked|failed|skipped> --summary "..."`
 so the work shows in `job list`, the dashboard, and the event stream just like
 an engine-run job (no runtime is spawned; gitmoot is only the record-keeper).
 `--record` works for both a **registered agent** (repo defaults to its repo scope)
@@ -7883,12 +7901,18 @@ self-evaluation; see the `verifier` and `decompose-and-verify` recipes and the
 individual job or delegation (via `--model` on run/ask/review/implement or the
 delegation `model` field) can pin a runtime model, with the per-job/delegation
 value overriding the agent default. When neither pins one, a job falls back to the
-runtime's configured `[runtimes.<name>].default_model` (the one behavioral registry
-field), then the runtime CLI's own default. Use `gitmoot runtime list` to inspect
-each built-in runtime's resolved metadata (capabilities, default/known models, and
-where token usage is read from); operators can override a built-in runtime's
+runtime's configured `[runtimes.<name>].default_model`, then the runtime CLI's own
+default. Codex agents, jobs, delegations, and ephemeral worker specs can likewise
+set reasoning effort with `--effort` or the `effort` field. Job/delegation effort
+overrides agent/worker effort, then `[runtimes.codex].default_effort`, and Gitmoot
+forwards the free-form value as `-c model_reasoning_effort=<value>`. Claude and
+Kimi ignore effort. Use
+`gitmoot runtime list` to inspect each built-in runtime's resolved metadata:
+capabilities, default model/effort, known models, and the token-usage source.
+Operators can override a built-in runtime's
 metadata without recompiling via a `[runtimes.<name>]` config section — `default_model`
-retargets delivery, `models`/`capabilities` stay advisory (see CLI.md
+retargets delivery and `default_effort` selects Codex effort, while
+`models`/`capabilities` stay advisory (see CLI.md
 § Runtime Metadata Registry). Use
 `gitmoot plugin doctor` when checking whether Codex, Claude Code, or Kimi Code
 can discover Gitmoot through an installed runtime plugin. Use
@@ -8242,26 +8266,29 @@ gitmoot runtime list --json
 The values come from the compiled built-in defaults, overlaid with any
 `[runtimes.<name>]` overrides in the config file. Override a built-in runtime's
 recorded metadata **without recompiling** — for example to retarget its default
-model or record its known models:
+model/effort or record its known models:
 
 ```toml
 [runtimes.codex]
 default_model = "gpt-5.5-codex"
+default_effort = "high"
 models = ["gpt-5.5-codex", "gpt-5.4-codex"]
 capabilities = ["review", "implement", "ask"]
 usage_source = "codex exec --json turn.completed usage"
 ```
 
-Exactly one field is **behavioral**: `default_model` is consulted at job **delivery**
-as the model fallback when **neither the agent nor the job pins a `--model`** — so
-setting it **does** retarget the model those jobs run on. The resolution order is:
-the agent/job `--model` win, then this `default_model`, then the runtime CLI's own
-default. Every other field is **inspection-only**, surfaced by `gitmoot runtime list`
+Two fields are **behavioral**. `default_model` is the model fallback when neither
+the agent nor the job pins `--model`: agent/job `--model`, then `default_model`,
+then the runtime CLI's own default. `default_effort` follows the same precedence
+after job/agent `--effort`; for Codex, Gitmoot emits
+`-c model_reasoning_effort=<value>`. Claude and Kimi do not expose a reasoning
+effort argument, so the resolved value is a no-op for those adapters. Every other
+field is **inspection-only**, surfaced by `gitmoot runtime list`
 but changing nothing at runtime: `models` is **advisory** (Gitmoot never rejects a
 `--model` based on it), and `capabilities` gates nothing at dispatch. Adapter
 behavior (auth, sandbox policy, session resume, stream parsing) always stays in Go.
-With no `[runtimes.*]` section — and with `default_model` unset — behavior is
-byte-identical: no model is forced.
+With no `[runtimes.*]` section, and with both defaults unset, no model or effort is
+forced.
 
 A `[runtimes.<name>]` section can only tweak a **built-in** runtime's metadata; it
 cannot add a new first-class runtime (that requires a code change). An unknown
@@ -8582,6 +8609,7 @@ gitmoot agent start reviewer \
   --capability ask \
   --capability review \
   --model gpt-5-codex \
+  --effort high \
   --start-daemon
 ```
 
@@ -8602,6 +8630,13 @@ with no allow-list; both `--model X` and `--model=X` are accepted. A per-job
 omitted model preserves the runtime's own default. The same default can be set
 in config under `[agents.<type>].model`.
 
+The same commands accept `--effort <value>` as the agent's default reasoning
+effort, and `agent run`, `ask`, `implement`, `review`, and `orchestrate` accept it
+as a per-job override. The resolution order mirrors model selection: job effort,
+agent effort, `[runtimes.<runtime>].default_effort`, then no explicit override.
+Values are free-form pass-through strings. Codex receives
+`-c model_reasoning_effort=<value>`; Claude and Kimi ignore the setting.
+
 `agent start` and `agent subscribe` accept `--policy` (default `auto`). The policy
 maps to the runtime permission mode and decides what a headless job may do:
 
@@ -8619,6 +8654,18 @@ subscribe`, and at implement-job dispatch with an actionable message. Set
 `--policy danger-full-access` for full headless implementation (file writes plus
 `go`/`git`/`gh`), or `--policy workspace-write` for edits-only (Bash stays
 blocked). See `references/SAFETY.md` for the full mapping and rationale.
+
+Implement jobs own the commit contract: Gitmoot commits and delivers the
+worktree's changes after the job finishes, and every rendered implement prompt
+carries one deterministic sentence telling the worker not to run `git commit`
+or `git push`. Ask and review prompts are unchanged. On the Codex runtime, a
+`workspace-write` job whose checkout is a linked `git worktree` also gets the
+worktree's resolved git directory (`<main-repo>/.git/worktrees/<name>`) added
+to the sandbox writable roots via `--add-dir`, so routine git metadata writes
+(an index refresh from `git status`, or `git add`) work inside the sandbox.
+The grant is additive and leaves operator-configured `writable_roots` intact;
+read-only and danger-full-access sandboxes and primary (non-worktree)
+checkouts are unchanged.
 
 `agent subscribe` accepts `--preset-delivery full|referenced|auto` (default
 `full`) and `agent update <name> --preset-delivery <mode>` flips it in place on
@@ -8651,7 +8698,8 @@ gitmoot agent subscribe reviewer \
   --role reviewer \
   --capability ask \
   --capability review \
-  --model gpt-5-codex
+  --model gpt-5-codex \
+  --effort high
 
 # Deterministic shell runtime: the session is a command, not a session id.
 gitmoot agent subscribe stub-agent \
@@ -8688,11 +8736,34 @@ gitmoot agent run lead --repo owner/repo --task task-001 --background "Implement
 gitmoot agent run reviewer --repo owner/repo --pr 12 --background "Review this PR."
 gitmoot agent review reviewer --repo owner/repo --pr 12 "Review this PR."
 gitmoot agent implement lead --repo owner/repo --task task-001 "Implement this task."
+gitmoot agent implement lead --repo owner/repo --task task-002 --base origin/main "Implement from current origin/main."
 gitmoot agent ask project-planner --repo owner/repo "Return the plan status."
 gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
 gitmoot agent run lead --repo owner/repo --model gpt-5-codex "Implement this task."
+gitmoot agent run lead --repo owner/repo --effort xhigh "Implement this task."
 gitmoot job watch <job-id>
 ```
+
+For `agent implement`, `--base <ref>` selects the commit used to create a new
+branch worktree. `agent run` accepts the same flag when it routes to implement.
+An `origin/*` ref is fetched before it is resolved, and an unknown ref fails
+before a job is enqueued. `--base HEAD` explicitly follows the registered
+checkout's current commit. On implement, `--head-sha <sha>` is a compatibility
+alias for `--base <sha>`; passing both with different values is an error.
+
+Set a default for implement dispatches in `config.toml`:
+
+```toml
+[workflow]
+implement_base = "origin/main"
+```
+
+The flag wins over the config value. The config value `"HEAD"` keeps
+checkout-following behavior. With no flag and no config value, Gitmoot still
+uses checkout HEAD, but refuses when the checkout is on a non-default branch
+that is behind `origin/<default>`. The error reports the branch and behind
+count and offers both explicit choices: `--base origin/<default>` or
+`--base HEAD`.
 
 `gitmoot agent run`, `ask`, `implement`, and `review` (and `orchestrate`) accept
 an optional `--model <name>` flag that pins the runtime model for that one job,
@@ -8700,6 +8771,10 @@ overriding the agent's configured default. It is a free-form, runtime-scoped
 string (a Codex, Claude Code, or Kimi Code model name) with no allow-list; an
 omitted `--model` leaves the agent's default model in effect. Both `--model X`
 and `--model=X` are accepted.
+
+`--effort <value>` and `--effort=<value>` select reasoning effort for one job
+with the same job-over-agent-over-registry precedence. Gitmoot does not validate
+an allow-list; Codex validates the forwarded value.
 
 The same commands accept an optional per-job `--runtime
 codex|claude|kimi|kimi-cli|shell` override: that ONE job runs through the named
@@ -8714,8 +8789,9 @@ override runtime so it cannot collide with the default session's lock. Model
 rule: `--model` combined with `--runtime` is interpreted for the OVERRIDE
 runtime; an override without `--model` uses the override runtime's default
 model — the agent's configured default model is never applied to a different
-runtime. An unknown
-`--runtime` fails before any job is enqueued, background (daemon) jobs honor
+runtime. The same rule applies to `--effort`: an explicit job value belongs to
+the override runtime, while the agent's default effort does not cross runtimes.
+An unknown `--runtime` fails before any job is enqueued, background (daemon) jobs honor
 the override identically to foreground, and a coordinator's delegation-tree
 continuations (synthesis, corrective, replan, finalize) inherit the override,
 so an `orchestrate --runtime` tree stays on the override runtime across
@@ -8770,6 +8846,7 @@ Start an orchestra of agents with `gitmoot orchestrate`:
 ```sh
 gitmoot orchestrate project-planner "Plan and split this work across agents." --repo owner/repo
 gitmoot orchestrate project-planner "Plan and split this work." --repo owner/repo --model gpt-5-codex
+gitmoot orchestrate project-planner "Plan and split this work." --repo owner/repo --effort high
 ```
 
 The built-in coordinator recipes `review-panel`, `decompose-and-verify`, and
@@ -8817,11 +8894,15 @@ gitmoot agent type list
 gitmoot agent type show planner
 gitmoot agent type set planner --runtime codex --template planner --max-background 2 --idle-timeout 20m
 gitmoot agent type set planner --model gpt-5-codex
+gitmoot agent type set planner --effort high
 gitmoot agent gc
 ```
 
 `agent type set --model <name>` (or `[agents.<type>].model` in config) sets the
 default runtime model for that managed agent type.
+
+`agent type set --effort <value>` (or `[agents.<type>].effort`) sets its default
+reasoning effort.
 
 Schedule recurring agent work (heartbeats, off by default):
 
@@ -8921,7 +9002,7 @@ once you clock out:
 ```sh
 gitmoot agent prompt frontend-reviewer --record [--repo owner/repo] [--type ask|review|implement] [--json]
 # prints:  [gitmoot session job <id> — when this work is complete, run:
-#           gitmoot job close <id> --decision <approved|changes_requested|implemented|blocked|failed> --summary "..."]
+#           gitmoot job close <id> --decision <approved|changes_requested|implemented|blocked|failed|skipped> --summary "..."]
 # followed by the prompt body.
 ```
 
@@ -9157,7 +9238,7 @@ gitmoot job open --agent <name> --repo owner/repo --type ask|review|implement \
                  [--title "..."] [--task <id>] [--pr <n>] [--json]
 
 # Clock out: apply the result and move the job to its terminal state.
-gitmoot job close <id> --decision approved|changes_requested|blocked|implemented|failed \
+gitmoot job close <id> --decision approved|changes_requested|blocked|implemented|failed|skipped \
                  [--summary "..."] [--pr <n>] [--branch <name>] [--json]
 
 # One-shot post-hoc: create an already-terminal job (open + close in one).
@@ -9171,8 +9252,8 @@ the daemon never claims or Delivers it — no runtime subprocess, no runtime-ses
 or checkout lock) and the stuck-`running` reaper **skips** it, so a session may
 hold it open for as long as the work takes. `close` reuses the exact result path an
 engine-run job uses: `--decision` maps to the same terminal state
-(`approved`/`changes_requested`/`implemented` → succeeded, `blocked` → blocked,
-`failed` → failed) and emits the same finished/failed/blocked event, so a recorded
+(`approved`/`changes_requested`/`implemented`/`skipped` -> succeeded, `blocked` -> blocked,
+`failed` -> failed) and emits the same finished/failed/blocked event, so a recorded
 job is indistinguishable from an engine-run one in the dashboard and events. A job
 can be closed **once** (it must be a running session job); an orphaned open job
 stays `running` (reaper-exempt) until you `job close --decision failed` or `job
@@ -9226,6 +9307,20 @@ credential probe passes; the probe failing just extends the hold without spendin
 a retry. So a job that "failed then reappeared as queued" is the deferral
 working, not a bug. Product failures (the agent answered with a `gitmoot_result`,
 including `decision=failed`) are never auto-retried.
+
+When a runtime session ends **without** producing a `gitmoot_result` envelope —
+the CLI process crashed, exited non-zero, was signal-killed, or completed but
+never emitted a valid envelope even after repair attempts — the job records
+**failure diagnostics** (#806): a `phase` marker (`launched` = died before any
+stdout, `streaming` = died mid-output, `result-parse` = every delivery completed
+but no valid envelope was found), the process `exit_code` **or** terminating
+`signal`, a **redacted** stderr tail (hard-capped at 2 KB; redaction runs over
+the full text with the same token-redaction rules as job comments *before* the
+tail is cut, so a secret can never leak partially), and the runtime session id
+when one is known. `gitmoot job show` prints a `failure_diagnostics:` block,
+`job show --json` carries `payload.failure_diagnostics`, and `gitmoot report
+bug` includes a "Failure diagnostics" section. Successful jobs never store one,
+and a retried job clears the previous run's crash report.
 
 Jobs stuck in `running` are also backstopped: a running job with no lease
 progress past the staleness window (default 30m) is assumed orphaned by a dead
@@ -9775,6 +9870,7 @@ distill_at_terminal = false # stage deterministic failure signal at job terminal
 distill_successes = false   # stage deterministic success observations (#781)
 distill_max_per_job = 3     # hard cap on distilled observations per job
 distill_all_jobs = false    # when true, distill runs for every job, not only enrolled agents
+ingest_auto_confirm = false # when true, ingest/chat remember confirm to the authoring agent private pool only
 ```
 
 All `[memory]` keys are read **per tick**. Flipping `distill_at_terminal`,
@@ -9880,18 +9976,23 @@ produced by `export --agent NAME` stays importable even when other owners have
 memories (import rebuilds the fresh export with the manifest's recorded scope). The
 `<DIR>` positional may appear before or after the flags.
 
-### Markdown ingest and the human confirm gate (#737 P3)
+### Markdown ingest, private auto-confirm, and provenance retirement (#737 P3, #782 V1)
 
 `memory ingest` is the **mouth** of the bridge: it reads arbitrary Markdown
-(session notes, runbooks, incident writeups) and stages it as **pending
-observations** behind the existing confirmation gate. It never writes confirmed
-(injectable) memory directly.
+(session notes, runbooks, incident writeups) and stages it as observations behind
+the existing confirmation gate. By default those observations stay pending. If
+`[memory].ingest_auto_confirm = true`, `memory ingest`, `memory ingest sweep`,
+and `chat remember` immediately confirm the staged observation into the
+authoring agent's **private** pool only. They never auto-confirm into the shared
+pool. Shared memory stays explicit through `memory confirm --to-shared` or
+`memory promote --to-shared`.
 
 ```sh
 gitmoot memory ingest <path|dir> --agent NAME [--shared] [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
 gitmoot memory ingest sweep [--json]
 gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]
 gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--to-shared] [--yes] [--json]
+gitmoot memory retire --provenance-prefix P [--agent NAME] [--dry-run] [--yes] [--json]
 gitmoot memory promote --to-shared <id>... [--json]
 gitmoot memory links backfill [--dry-run] [--json]
 gitmoot memory links list <id> [--json]
@@ -9914,15 +10015,30 @@ Surviving chunks land in `memory_observations` with `provenance = ingest:<relpat
 and, crucially, **`trust_mark = low`** — see the trust note below. `--tier` defaults
 to `repo`; `general` is only ever chosen with the explicit flag. `--shared`
 stages the observations in the shared pool while preserving `--agent NAME` as
-their author. `--dry-run` reports what would be staged without writing.
+their author. With auto-confirm enabled, the confirmed write still goes to
+`--agent NAME`'s private pool, not shared. `--dry-run` reports what would be
+staged without writing.
+
+Chunk keys are **stable**: `slug(file)-slug(heading)`, with an ordinal suffix
+(`-2`, `-3`) only when a file/heading pair repeats within one sweep. The content
+hash participates only in dedup, never in the key, so a re-swept **edited** note
+lands on the same key as its earlier edition and, under auto-confirm, updates
+the existing confirmed fact **in place**. Auto-confirmed key-matched updates
+(ingest auto-confirm and `chat remember`) are **supersede-preserving**: the
+prior edition is archived first as a `superseded_by` row (out of FTS, out of the
+vault; `memory_links` stay on the unchanged live row id) so a bad edit never
+destroys the last reviewed edition. Manual paths (vault import CAS edits,
+`memory confirm --yes`) keep plain overwrite semantics. Keys minted before this
+scheme end in an 8-hex content-hash suffix; the groom **rekey** detector
+migrates them (below).
 
 `memory ingest sweep` reads every configured `[[memory.ingest]]` source from the
 current config at run time and runs the same ingest logic in-process for each one.
 `--json` emits per-source entries with `path`, `agent`, `repo`, `tier`,
-`inserted`, `deduped`, `rejected`, and `error`, plus aggregate totals. One bad
-source does not stop the rest; the command exits non-zero only when the config is
-invalid or every configured source fails. With no sources it exits zero with a
-skipped note.
+`inserted`, `confirmed`, `skipped_retired`, `deduped`, `rejected`, and `error`,
+plus aggregate totals. One bad source does not stop the rest; the command exits
+non-zero only when the config is invalid or every configured source fails. With
+no sources it exits zero with a skipped note.
 
 `memory observations` lists pending observations (optionally narrowed by
 `--agent` or `--provenance-prefix`), flagging which keys already crossed the
@@ -9935,7 +10051,16 @@ confirms selected observations into the shared pool and records the observation
 author. `memory promote --to-shared <id>...` moves existing active confirmed
 facts into shared, refuses retired or superseded rows, preserves outgoing
 `memory_links`, and sets `author_ref` from the previous owner when needed. This is
-**CLI-explicit only**: there is no daemon path and nothing auto-confirms.
+**CLI-explicit only**.
+
+`memory retire --provenance-prefix P` is the blast-radius undo for any collector
+batch. It selects active confirmed rows whose provenance starts with `P`, scoped
+optionally by `--agent NAME`, and is a dry run unless `--yes` is passed. Applying
+the plan sets `retired_at` and `retired_reason` and removes the rows from FTS in
+the same transaction, so they stop being injected and exported while the audit
+rows remain. Retired keys are not resurrected by ingest or collectors on
+re-ingest; only explicit human-controlled confirmation paths may revive a retired
+key.
 
 The built-in `memory-ingest-sweep` pipeline calls
 `gitmoot memory ingest sweep --json` and then summarizes the run totals. Configure
@@ -9995,8 +10120,8 @@ gitmoot memory groom --yes --plan PLAN.json [--json]
 `--propose` reads every **active** confirmed memory (retired rows excluded),
 computes the current vault `snapshot_hash` (the same anchor `vault export`/`import`
 use), runs deterministic detectors, and writes a reviewable plan artifact
-(`{schema_version, snapshot_hash, proposed_retirements, rewrite_flags, stats}`). It
-**touches nothing** in the store. The detectors are:
+(`{schema_version, snapshot_hash, proposed_retirements, rewrite_flags, rekeys,
+cross_pool, stats}`). It **touches nothing** in the store. The detectors are:
 
 - **status/changelog/ToC snapshots** — notes dominated (≥80% of non-blank lines) by
   `STATUS:` markers, `SHIPPED`/`merged & deployed` changelog phrases, ISO-date-led
@@ -10013,14 +10138,31 @@ use), runs deterministic detectors, and writes a reviewable plan artifact
   proposed retirement so you can tell them apart);
 - **over-long "bricks"** (content > ~1200 chars) are **flagged for rewrite**, never
   retired — P4.2 only lists them for the owner (LLM rewriting is the follow-up
-  P4.3).
+  P4.3);
+- **legacy-key rekeys** (#804): active rows whose key still ends in the
+  pre-stable-key 8-hex content-hash suffix (`…-a1b2c3d4`) are grouped per
+  owner/repo/scope by their stripped stable key. Organic sweeps can never fix
+  them (content dedup skips unchanged notes; the first edit would spawn a
+  stable-keyed third sibling), so the plan keeps the current edition (the row
+  already holding the stable key when one exists, otherwise the newest by
+  `updated_at`), rewrites its key to the stable form, and retires the older
+  siblings with reason `rekey: superseded edition`;
+- **cross-pool stale shared editions** (#804): a shared-pool fact gets a
+  **promote-and-retire pair** when a strictly newer private fact matches it in
+  the same repo and scope, by stable-key equality (primary, deterministic) or
+  by a strong BM25 top-match that also shares a `memory_links` edge (composite
+  secondary evidence; BM25 alone never proposes). Applying promotes the newer
+  private edition to the shared pool (author preserved) and retires the stale
+  shared edition with reason `cross-pool: superseded by promoted edition`.
 
 `--yes --plan` recomputes the `snapshot_hash` and **aborts as stale** if it differs
 from the plan's (a vault edit between propose and apply invalidates it), then
-retires exactly the planned ids in **one transaction** (reason `groom:<detector>`,
-FTS index cleared in the same tx). It is **retire-only** — no content is edited or
-rewritten — and idempotent: an already-retired or missing id in the plan is skipped
-gracefully rather than aborting the batch.
+applies the whole plan in **one transaction**: retirements (reason
+`groom:<detector>`, FTS index cleared in the same tx), rekey groups (FTS key
+column re-synced in the same tx), and cross-pool pairs. **No content is edited or
+rewritten**, and applying is idempotent: an already-retired or missing id is
+skipped gracefully, and a rekey group or cross-pool pair whose rows changed state
+since the proposal is skipped whole rather than half-applied.
 
 The built-in `memory-groom-propose` pipeline runs only the proposal half:
 `gitmoot memory groom --propose --out <run-scoped-plan> --json`, then summarizes
@@ -10161,7 +10303,7 @@ cyclic `needs`, a stage that is not exactly one of `cmd`/`agent`/`gate`, an agen
 missing a `prompt` / invalid `action` / `implement` without `write: true` / a mutating
 stage on a scheduled pipeline without `allow_scheduled_writes` / a gate's bad
 predicate or `source`, invalid durations, a `success_decisions` outside
-`approved`/`implemented`/`changes_requested`) so a mistake is a clear error, not a
+`approved`/`implemented`/`changes_requested`/`skipped`) so a mistake is a clear error, not a
 stuck run. It stores the raw YAML **verbatim** plus a content hash; each run
 snapshots that hash and executes its snapshot, so editing the file later never
 mutates an in-flight run. `pipeline add` also auto-creates one hidden shell runner
@@ -10191,12 +10333,17 @@ printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"synced"}}'
 printf '%s' '{"gitmoot_result":{"decision":"blocked","summary":"secret missing","needs":["R2 token"]}}'
 ```
 
-- a decision in the stage's `success_decisions` (default `approved`/`implemented`) →
+- a decision in the stage's `success_decisions` (default `approved`/`implemented`/`skipped`) ->
   **succeeded**, dependents enqueue;
 - `blocked` → the stage blocks, its `needs` persist at the stage **and** run level,
   the run **parks blocked** (downstream never enqueues, zero compute while parked);
 - `failed` / any other decision / a cancelled job / no `gitmoot_result` → the stage
   **fails** (retried if budget remains), else the run **parks failed**.
+
+`skipped` means the stage itself had no work and advances by default with a
+`[skipped: no work]` summary marker. An explicit `success_decisions` list is
+strict: omitting `skipped` makes it fail. A `pr_merged` gate whose source skipped
+parks blocked because no PR can exist for that run.
 
 `pipeline run` prints only the run id (script-stable: `RUN=$(gitmoot pipeline run
 nightly-sync)`); a manual run ignores `enabled` but still needs a `repo` and refuses
@@ -10232,6 +10379,7 @@ gitmoot chat create <name> --repo owner/repo [--topic "title"] [--json]
 gitmoot chat list [--repo owner/repo] [--all] [--json]      # open threads; --all includes archived
 gitmoot chat show <thread> [--repo owner/repo] [--limit N] [--json]
 gitmoot chat send <thread> "message" [--as agent] [--repo owner/repo] [--ref kind:value ...] [--json]
+gitmoot chat remember <thread> <message-seq> [--repo owner/repo] [--tier repo|general] [--agent NAME] [--json]
 gitmoot chat inbox <agent> [--unread] [--json]
 gitmoot chat task <thread> "@agent message" [--action ask|review|implement] [--repo owner/repo] [--json]
 gitmoot chat answer <thread> "<question-id>: answer text" [--repo owner/repo] [--json]
@@ -10249,6 +10397,15 @@ gitmoot chat rename <thread> "new name" [--repo owner/repo] [--json]
   `--as <agent>` authors the message as a registered agent (default: the human);
   `--ref kind:value` attaches structured refs (e.g. `--ref pr:42`). Sending to an
   archived thread is refused until you `reopen` it.
+- **`remember`**: captures exactly one existing message by sequence as a memory
+  observation. It stores the message body verbatim with deterministic provenance
+  `chat:<thread-id>#<seq>`, applies the memory PreFilter, and dedups by content
+  hash within the target scope/repo. It does not scan for natural-language
+  prefixes, does not bulk-mine a thread, and does not self-trigger from agent
+  messages. `--agent` is the capturing agent identity (default `lead`); `--tier`
+  defaults to `repo`. If `[memory].ingest_auto_confirm = true`, the observation is
+  immediately confirmed into that agent's private pool only. Shared memory remains
+  explicit through `memory confirm --to-shared` or `memory promote --to-shared`.
 - **`inbox`** — an agent's mentions, newest first; `--unread` restricts to unread.
 - **`task`** — the one promotion verb. The body must name **exactly one**
   registered `@agent`; it records a `promotion_request` message, then dispatches a
@@ -10413,6 +10570,22 @@ Moot bounds (in `[chat]`, warm-reloadable):
 
 `[chat]` is entirely optional: with no `[chat]` section every knob resolves to its
 default, `auto_respond` stays off, and the daemon tick is byte-identical.
+
+## Bridge (localhost HTTP for external automation)
+
+```bash
+gitmoot bridge serve [--addr 127.0.0.1:8791]   # localhost-only unless --allow-remote (dangerous)
+gitmoot bridge token [--rotate]                 # prints the token FILE PATH, never the token
+```
+
+The bridge exposes a small authenticated HTTP surface over the same internal
+seams the CLI uses (no new authority): POST /v1/pipelines/{name}/run,
+GET /v1/runs/{id}, POST /v1/memory/recall, GET /v1/jobs/{id},
+POST /v1/agents/{name}/ask. Every request needs
+`Authorization: Bearer $(cat ~/.gitmoot/bridge.token)`. Requests are
+rate-limited (30/min) and body-capped (1MB). Containers reach the host
+bridge at http://host.docker.internal:8791 (or the docker bridge IP on
+Linux). Built for the Activepieces piece seam (issue #785).
 
 ---
 
@@ -11398,8 +11571,17 @@ advancer folds by that **decision**, never the job's exit state:
 
 ```sh
 printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"synced"}}'
+printf '%s' '{"gitmoot_result":{"decision":"skipped","summary":"no new replies today"}}'
 printf '%s' '{"gitmoot_result":{"decision":"blocked","summary":"secret missing","needs":["R2 token"]}}'
 ```
+
+`skipped` is the default-on success decision for a stage whose task had no work.
+The persisted summary is prefixed with `[skipped: no work]`, so downstream agent
+stages receive the honest outcome. An explicit `success_decisions` list that
+omits `skipped` is strict and folds it failed. If an implement source skips, a
+downstream `pr_merged` gate parks blocked instead of waiting for a PR that cannot
+exist. The result still uses the existing succeeded stage state; the `SKIPPED`
+funnel state remains reserved for downstream stages that never ran.
 
 ### Agent stages (#757 / #768 / #758)
 
@@ -11877,7 +12059,7 @@ truthful, and tied to work that actually happened.
 ```json
 {
   "gitmoot_result": {
-    "decision": "approved|changes_requested|blocked|implemented|failed",
+    "decision": "approved|changes_requested|blocked|implemented|failed|skipped",
     "summary": "Brief outcome.",
     "findings": [],
     "changes_made": [],
@@ -12117,6 +12299,12 @@ Delegation fields:
   **Rule of thumb:** downshift `model` for cheap/mechanical legs; leave `model`
   empty for standard legs (so they take the runtime default); and reserve a deep
   model for genuinely hard or quorum-critical legs.
+- `effort` (optional): a free-form, runtime-scoped reasoning effort for the
+  child job. This job-level value overrides the delegated agent's default or
+  the ephemeral worker's `effort`; when omitted, effort falls back to that
+  agent/worker default and then `[runtimes.<name>].default_effort`. Gitmoot does
+  not apply an allow-list. Codex receives
+  `-c model_reasoning_effort=<value>`; Claude and Kimi ignore the setting.
 - `phase` (optional): a free-form per-delegation string. It is pass-through
   metadata — Gitmoot carries it through to the child job untouched and echoes it
   back in the coordinator continuation for each delegation that set a non-empty
@@ -12139,6 +12327,9 @@ Delegation fields:
     `claude`, or `kimi`. It is never `shell`.
   - `model` (optional): a runtime-scoped model string, as for the delegation
     `model` field above.
+  - `effort` (optional): the worker's default reasoning effort. A top-level
+    delegation `effort` overrides it; omit both to use the runtime registry
+    default (if configured).
   - `template` (optional): an agent-template id to seed the worker's prompt.
   - `role` (optional): a human-readable role label for the worker.
   - `capabilities` (optional): an array of capability strings advertised by the
@@ -12378,6 +12569,13 @@ The same capture also feeds the `$`-denominated
   live. See `internal/workflow` `IsSettledJobState` vs `IsFinalJobState` (#632).
 - `implemented`: the requested implementation work was completed.
 - `failed`: the attempted action errored or could not complete.
+- `skipped`: the task itself had no work to do. Do not use `skipped` in a PR
+  review to mean "nothing to flag"; reviewers use `approved`. A skipped result
+  cannot carry delegations. Outside pipelines it maps to a succeeded job state;
+  it is an abstention for quorum/verify, while vote counts that succeeded state.
+  Pipelines accept it as success by default and persist the existing succeeded
+  stage state, not the separate skipped state used for downstream stages that
+  never ran.
 
 ## Reporting Rules
 

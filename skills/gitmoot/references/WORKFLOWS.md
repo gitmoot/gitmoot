@@ -978,8 +978,17 @@ advancer folds by that **decision**, never the job's exit state:
 
 ```sh
 printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"synced"}}'
+printf '%s' '{"gitmoot_result":{"decision":"skipped","summary":"no new replies today"}}'
 printf '%s' '{"gitmoot_result":{"decision":"blocked","summary":"secret missing","needs":["R2 token"]}}'
 ```
+
+`skipped` is the default-on success decision for a stage whose task had no work.
+The persisted summary is prefixed with `[skipped: no work]`, so downstream agent
+stages receive the honest outcome. An explicit `success_decisions` list that
+omits `skipped` is strict and folds it failed. If an implement source skips, a
+downstream `pr_merged` gate parks blocked instead of waiting for a PR that cannot
+exist. The result still uses the existing succeeded stage state; the `SKIPPED`
+funnel state remains reserved for downstream stages that never ran.
 
 ### Agent stages (#757 / #768 / #758)
 

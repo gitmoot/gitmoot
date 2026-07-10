@@ -258,7 +258,7 @@ func daemonStartCmd(deps Deps) tea.Cmd {
 }
 
 // jobDecisionColor colors a gitmoot_result decision: blocked/failed red,
-// changes_requested neutral, everything else (approved/implemented) green.
+// approved/implemented green, and changes_requested/skipped neutral.
 func jobDecisionColor(decision string) string {
 	switch decision {
 	case "blocked", "failed":

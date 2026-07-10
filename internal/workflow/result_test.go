@@ -64,6 +64,30 @@ func TestExtractAgentResultRejectsUnsupportedDecision(t *testing.T) {
 	}
 }
 
+func TestExtractAgentResultAcceptsSkipped(t *testing.T) {
+	output := `{"gitmoot_result":{"decision":"skipped","summary":"no new replies","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+
+	result, err := ExtractAgentResult(output)
+	if err != nil {
+		t.Fatalf("ExtractAgentResult returned error: %v", err)
+	}
+	if result.Decision != "skipped" || result.Summary != "no new replies" {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestExtractAgentResultRejectsSkippedWithDelegations(t *testing.T) {
+	output := `{"gitmoot_result":{"decision":"skipped","summary":"nothing to do","delegations":[{"id":"child","agent":"impl","action":"ask","prompt":"check anyway"}]}}`
+
+	_, err := ExtractAgentResult(output)
+	if err == nil {
+		t.Fatal("ExtractAgentResult accepted skipped with delegations")
+	}
+	if !strings.Contains(err.Error(), "decision skipped cannot be used with delegations") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestExtractAgentResultRejectsUnsupportedField(t *testing.T) {
 	output := `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[],"unexpected_field":[]}}`
 

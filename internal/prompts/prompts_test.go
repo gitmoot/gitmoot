@@ -34,7 +34,7 @@ func TestRenderJobIncludesContextAndContract(t *testing.T) {
 		"Requested action: review",
 		"- Preserve existing behavior",
 		"gitmoot_result",
-		`"decision":"approved|changes_requested|blocked|implemented|failed"`,
+		`"decision":"approved|changes_requested|blocked|implemented|failed|skipped"`,
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)

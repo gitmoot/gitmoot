@@ -311,7 +311,7 @@ object:
 ```json
 {
   "gitmoot_result": {
-    "decision": "approved|changes_requested|blocked|implemented|failed",
+    "decision": "approved|changes_requested|blocked|implemented|failed|skipped",
     "summary": "Brief outcome.",
     "findings": [],
     "changes_made": [],

@@ -69,6 +69,7 @@ func TestCloseExternalJobAppliesDecision(t *testing.T) {
 		{"approved", JobSucceeded, events.EventJobFinished},
 		{"implemented", JobSucceeded, events.EventJobFinished},
 		{"changes_requested", JobSucceeded, events.EventJobFinished},
+		{"skipped", JobSucceeded, events.EventJobFinished},
 		{"blocked", JobBlocked, events.EventJobBlocked},
 		{"failed", JobFailed, events.EventJobFailed},
 	}

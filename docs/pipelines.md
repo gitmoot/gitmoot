@@ -37,6 +37,7 @@ schedule:                   # optional; interval schedule (no cron in v1)
 success_decisions:          # optional top-level default (see below)
   - approved
   - implemented
+  - skipped
 stages:                     # the DAG, keyed by unique id and wired by needs
   - id: source
     cmd: "curl -sf https://example.com/data > data.json"
@@ -60,7 +61,7 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 | `repo`                      | pipeline     | no\*     | `owner/name` the stages run against. Optional to **register**, but **required to run** — stage jobs need a managed repo for the worker to claim them. |
 | `schedule.interval`         | pipeline     | cond.    | Required when a `schedule:` block is present. A positive Go duration (`24h`, `1h30m`). |
 | `schedule.jitter`           | pipeline     | no       | Random `[0, jitter]` added to each `next_due` to de-thunder (`>= 0`). |
-| `success_decisions`         | pipeline     | no       | Decisions that mark a stage succeeded. Default `["approved","implemented"]`. Any value must be one of `approved`, `implemented`, `changes_requested` — `blocked`/`failed` are park states and are rejected. |
+| `success_decisions`         | pipeline     | no       | Decisions that mark a stage succeeded. Default `["approved","implemented","skipped"]`. Any value must be one of `approved`, `implemented`, `changes_requested`, `skipped` - `blocked`/`failed` are park states and are rejected. An explicit list is strict: omitting `skipped` requires real work and makes a skipped result fail. |
 | `allow_scheduled_writes`    | pipeline     | no       | Safety flag (#768). A **mutating** `implement` stage on a **scheduled** pipeline (a `schedule:` block) is rejected at add time unless this is `true` — so an unattended nightly pipeline can never write code / open a PR by accident. Manual-run pipelines don't need it. Default `false`. |
 | `stages[].id`               | stage        | yes      | Unique, name-safe stage id. Appears verbatim in the stage job's fingerprint and deterministic id. |
 | `stages[].cmd`              | stage        | cond.    | Shell command run verbatim via `sh -c` (see the stage contract below). A stage is **exactly one** of `cmd`, `agent`, or `gate`. |
@@ -175,8 +176,8 @@ stages:
   dispatch's fail-closed guards). A **retry** lands in the *same* branch/PR — never a
   duplicate — and fails closed if that worktree is dirty or has a live process.
 - **Folds on PR-opened.** A `success` decision folds only once the job carries an
-  opened PR; a legitimate **no-op** implement (nothing to change) folds succeeded too
-  (it can't wedge the run). The opened PR number is appended to the stage summary so a
+  opened PR. The first-class `skipped` decision bypasses that wait because there is
+  no work to turn into a PR. The opened PR number is appended to the stage summary so a
   downstream stage sees it via upstream-context injection.
 - **Never auto-merges.** The pipeline **opens** the PR; a human or your CI does the
   merge. See [Gate stages](#gate-stages) to make a later stage wait for that merge.
@@ -210,6 +211,8 @@ stages:
   **fails open** (keeps waiting while unmerged), and is bounded by the stage `timeout`.
 - A PR that is **closed without merging**, or a **timeout**, parks the run `blocked`
   (a gate is a wait, not a failure — so a retry budget can't re-arm the timer).
+- A source stage that succeeded via `skipped` also parks the gate `blocked`
+  immediately: no PR will exist for that run.
 
 ### Orchestrate stages
 
@@ -251,6 +254,9 @@ the stage by that result's **`decision`**, never by the job's exit state:
 # A stage that succeeds:
 printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"synced"}}'
 
+# A stage whose task had no work:
+printf '%s' '{"gitmoot_result":{"decision":"skipped","summary":"no new replies today"}}'
+
 # A stage that parks the run awaiting a human, listing what it needs:
 printf '%s' '{"gitmoot_result":{"decision":"blocked","summary":"secret missing","needs":["R2 token"]}}'
 ```
@@ -271,6 +277,13 @@ The decision drives advancement:
 job succeeded — because a stage folds on the decision, not the job state, and a
 review that asked for changes is not "this step landed." List it in a stage's (or
 the pipeline's) `success_decisions` to treat it as success instead.
+
+`skipped` is a stage **success by default**. Gitmoot prefixes its persisted summary
+with `[skipped: no work]`, and downstream agent stages receive that honest note in
+their upstream context. An explicit `success_decisions` list is strict: if it omits
+`skipped`, the stage fails because the author required real work. A skipped result
+uses the existing succeeded stage state; the `SKIPPED` funnel state still means a
+downstream stage never ran after the pipeline halted.
 
 ## CLI
 

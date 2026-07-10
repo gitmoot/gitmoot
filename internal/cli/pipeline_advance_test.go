@@ -488,6 +488,96 @@ stages:
 	}
 }
 
+// TestAdvancerSkippedAdvancesByDefault proves an honest no-work result is a
+// first-class successful fold: the existing StageSucceeded row carries the trusted
+// marker and the dependent stage enqueues with zero success_decisions config.
+func TestAdvancerSkippedAdvancesByDefault(t *testing.T) {
+	store := pipelineAdvanceStore(t)
+	enqueue := testStageEnqueuer(store)
+	rec, spec := newTestPipeline(t, store, "skip-default", changesRequestedSpec)
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+
+	run := startTestRun(t, store, rec, spec, enqueue, now)
+	settleStageJob(t, store, stageRow(t, store, run.ID, "a").JobID, "skipped", "no new replies", nil)
+	run = advance(t, store, rec, spec, enqueue, run, now)
+
+	a := stageRow(t, store, run.ID, "a")
+	if a.State != pipeline.StageSucceeded {
+		t.Fatalf("stage a = %s, want succeeded", a.State)
+	}
+	if a.Summary != "[skipped: no work] no new replies" {
+		t.Fatalf("stage a summary = %q", a.Summary)
+	}
+	if got := stageRow(t, store, run.ID, "b"); got.State != pipeline.StageQueued || got.JobID == "" {
+		t.Fatalf("stage b = %+v, want queued with a job", got)
+	}
+}
+
+// TestAdvancerSkippedHonorsStrictSuccessDecisions proves an explicit list can
+// require real work: omitting skipped makes the no-work decision fail the stage.
+func TestAdvancerSkippedHonorsStrictSuccessDecisions(t *testing.T) {
+	store := pipelineAdvanceStore(t)
+	enqueue := testStageEnqueuer(store)
+	const spec = `name: skip-strict
+repo: owner/repo
+success_decisions: [approved, implemented]
+stages:
+  - id: a
+    cmd: echo a
+  - id: b
+    cmd: echo b
+    needs: [a]
+`
+	rec, parsed := newTestPipeline(t, store, "skip-strict", spec)
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+
+	run := startTestRun(t, store, rec, parsed, enqueue, now)
+	settleStageJob(t, store, stageRow(t, store, run.ID, "a").JobID, "skipped", "no new replies", nil)
+	run = advance(t, store, rec, parsed, enqueue, run, now)
+
+	if got := stageRow(t, store, run.ID, "a"); got.State != pipeline.StageFailed {
+		t.Fatalf("stage a = %s, want failed when strict list omits skipped", got.State)
+	}
+	if got := stageRow(t, store, run.ID, "b"); got.State != pipeline.StageSkipped || got.JobID != "" {
+		t.Fatalf("stage b = %+v, want skipped and never enqueued", got)
+	}
+	if run.State != pipeline.RunFailed {
+		t.Fatalf("run = %s, want failed", run.State)
+	}
+}
+
+// TestAdvancerStripsForgedSkippedMarkerFromNonSkippedOutcomes proves failed and
+// blocked folds cannot persist Gitmoot's reserved no-work provenance marker.
+func TestAdvancerStripsForgedSkippedMarkerFromNonSkippedOutcomes(t *testing.T) {
+	cases := []struct {
+		decision string
+		summary  string
+		want     string
+	}{
+		{"blocked", pipelineSkippedSummaryMarker, "stage blocked"},
+		{"failed", pipelineSkippedSummaryMarker + pipelineSkippedSummaryMarker + " boom", "boom"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.decision, func(t *testing.T) {
+			store := pipelineAdvanceStore(t)
+			enqueue := testStageEnqueuer(store)
+			rec, spec := newTestPipeline(t, store, "forged-"+tc.decision, changesRequestedSpec)
+			now := time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC)
+			run := startTestRun(t, store, rec, spec, enqueue, now)
+			settleStageJob(t, store, stageRow(t, store, run.ID, "a").JobID, tc.decision, tc.summary, []string{"operator input"})
+
+			run = advance(t, store, rec, spec, enqueue, run, now)
+			got := stageRow(t, store, run.ID, "a")
+			if got.Summary != tc.want {
+				t.Fatalf("persisted summary = %q, want %q", got.Summary, tc.want)
+			}
+			if pipelineSummaryIsSkipped(got.Summary) {
+				t.Fatalf("persisted summary retained forged skipped marker: %q", got.Summary)
+			}
+		})
+	}
+}
+
 // TestAdvancerSkippedPropagation proves a failed stage's transitive dependents are
 // all marked skipped (never enqueued), giving a clean terminal picture.
 func TestAdvancerSkippedPropagation(t *testing.T) {

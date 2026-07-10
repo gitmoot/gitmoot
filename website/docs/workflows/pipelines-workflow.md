@@ -59,7 +59,7 @@ name/id, a duplicate stage id, a stage that is not exactly one of `cmd`, `agent`
 `implement` without `write: true`, a mutating stage on a scheduled pipeline without
 `allow_scheduled_writes`, a gate's bad predicate/`source`), an unknown/self/cyclic
 `needs`, an invalid duration, a negative retry, or a
-`success_decisions` value outside `approved`/`implemented`/`changes_requested` — so a
+`success_decisions` value outside `approved`/`implemented`/`changes_requested`/`skipped` - so a
 structural mistake is a clear error at registration, not a stuck run later. It stores the raw YAML **verbatim**
 plus a content hash; each run snapshots the hash and executes its snapshot, so
 editing the file later never mutates an in-flight run.
@@ -132,11 +132,12 @@ that result's **`decision`**, never by the job's exit state:
 ```sh
 # succeeds:
 printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"synced"}}'
+printf '%s' '{"gitmoot_result":{"decision":"skipped","summary":"no new replies today"}}'
 # parks the run awaiting a human, listing what it needs:
 printf '%s' '{"gitmoot_result":{"decision":"blocked","summary":"secret missing","needs":["R2 token"]}}'
 ```
 
-- a decision in the stage's `success_decisions` (default `["approved","implemented"]`)
+- a decision in the stage's `success_decisions` (default `["approved","implemented","skipped"]`)
   → the stage **succeeded**; stages whose `needs` have all now succeeded are enqueued;
 - `blocked` → the stage **blocks**; its `needs` are persisted at the stage and run
   level and the run **parks blocked** (downstream stages never enqueue, zero compute
@@ -148,6 +149,13 @@ printf '%s' '{"gitmoot_result":{"decision":"blocked","summary":"secret missing",
 `changes_requested` is a stage **failure by default** even though the underlying job
 succeeded — a stage folds on the decision, not the job state. List it in
 `success_decisions` (per-stage or top-level) to treat it as success instead.
+
+`skipped` is a stage **success by default** for a task that had no work. Gitmoot
+prefixes the persisted summary with `[skipped: no work]`, which downstream agent
+stages receive as upstream context. An explicit `success_decisions` list is strict:
+if it omits `skipped`, the stage fails because the author required real work. A
+skipped result uses the existing succeeded stage state; the `SKIPPED` funnel state
+still means a downstream stage never ran after the pipeline halted.
 
 ## Agent stages
 
@@ -191,7 +199,8 @@ codex — no per-job shell override):
   reuses it), requires `write: true`, and never auto-merges. `orchestrate` is a
   coordinator (the one non-leaf): it fans out owned children, waits for the sub-tree
   via the continuation chain, then folds the tail. `gate` runs no job and folds when
-  `pr_merged` holds on its `source` PR (parks `blocked` on close-unmerged / timeout).
+  `pr_merged` holds on its `source` PR (parks `blocked` on close-unmerged, timeout,
+  or a source that succeeded via `skipped` because no PR can exist).
 - **agent existence is warned, not blocked** — `pipeline add` warns for any referenced
   agent that does not exist yet but still adds the pipeline (so a spec can be bundled
   ahead of provisioning its agents); create the agent (`gitmoot agent …`) before the

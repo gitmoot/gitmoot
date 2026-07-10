@@ -111,7 +111,7 @@ func TestEnumValuesCoveredInJobPrompt(t *testing.T) {
 // literal. Agents copy this verbatim, so it must never change shape; the
 // generator reproduces it from the struct field set.
 func TestExampleShapeIsByteIdentical(t *testing.T) {
-	const want = `{"gitmoot_result":{"decision":"approved|changes_requested|blocked|implemented|failed","summary":"...","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+	const want = `{"gitmoot_result":{"decision":"approved|changes_requested|blocked|implemented|failed|skipped","summary":"...","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
 
 	for name, prompt := range map[string]string{
 		"job":    renderedJob(),
@@ -119,6 +119,24 @@ func TestExampleShapeIsByteIdentical(t *testing.T) {
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("%s prompt missing byte-identical example shape\nwant: %s\n--- prompt ---\n%s", name, want, prompt)
+		}
+	}
+}
+
+func TestSkippedDecisionSemanticsAreRendered(t *testing.T) {
+	for name, prompt := range map[string]string{
+		"job":    renderedJob(),
+		"repair": prompts.RenderRepairPrompt("garbage", nil),
+	} {
+		for _, want := range []string{
+			"task itself had no work to do",
+			"Do not use skipped in a PR review",
+			"skipped must not be returned with delegations",
+			"skipped is an abstention for quorum and verify",
+		} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("%s prompt missing %q\n--- prompt ---\n%s", name, want, prompt)
+			}
 		}
 	}
 }

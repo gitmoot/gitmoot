@@ -553,4 +553,5 @@ Agents must return exactly one JSON object containing `gitmoot_result`:
 ```
 
 Valid decisions are `approved`, `changes_requested`, `blocked`, `implemented`,
-and `failed`.
+`failed`, and `skipped`. Use `skipped` only when the task itself had no work to
+do, never as a PR-review synonym for `approved`, and never with delegations.

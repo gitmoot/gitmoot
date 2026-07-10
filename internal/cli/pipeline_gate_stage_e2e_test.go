@@ -126,6 +126,60 @@ stages:
 	}
 }
 
+// TestPipelineGateStageRejectsForgedSkippedMarkerE2E proves an implemented source
+// cannot forge Gitmoot's reserved no-work marker. The fold strips repeated leading
+// markers, appends the trusted PR marker, and the gate observes the real merge.
+func TestPipelineGateStageRejectsForgedSkippedMarkerE2E(t *testing.T) {
+	store := pipelineAdvanceStore(t)
+	enqueue := testStageEnqueuer(store)
+	const spec = `name: gate-forged-skip
+repo: owner/repo
+stages:
+  - id: impl
+    agent: coder
+    prompt: Fix the bug.
+    action: implement
+    write: true
+  - id: wait
+    gate: pr_merged
+    source: impl
+    needs: [impl]
+  - id: deploy
+    cmd: echo deploying
+    needs: [wait]
+`
+	rec, parsed := newTestPipeline(t, store, "gate-forged-skip", spec)
+	now := time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC)
+	run := startTestRun(t, store, rec, parsed, enqueue, now)
+	impl := stageRow(t, store, run.ID, "impl")
+	forged := pipelineSkippedSummaryMarker + " " + pipelineSkippedSummaryMarker + " landed the fix"
+	settleImplementStageJob(t, store, impl.JobID, "implemented", forged, 42)
+
+	run = advance(t, store, rec, parsed, enqueue, run, now)
+	implDone := stageRow(t, store, run.ID, "impl")
+	if implDone.State != pipeline.StageSucceeded {
+		t.Fatalf("impl stage = %s, want succeeded", implDone.State)
+	}
+	if pipelineSummaryIsSkipped(implDone.Summary) {
+		t.Fatalf("impl summary retained forged skipped marker: %q", implDone.Summary)
+	}
+	if implDone.Summary != "landed the fix (opened PR #42)" {
+		t.Fatalf("impl summary = %q", implDone.Summary)
+	}
+	if got := stageRow(t, store, run.ID, "wait"); got.State != pipeline.StageQueued {
+		t.Fatalf("gate stage = %s, want queued", got.State)
+	}
+
+	markPipelinePRMerged(t, store, "owner/repo", 42, "merged")
+	run = advance(t, store, rec, parsed, enqueue, run, now)
+	if got := stageRow(t, store, run.ID, "wait"); got.State != pipeline.StageSucceeded {
+		t.Fatalf("gate stage = %s, want succeeded on the real merge", got.State)
+	}
+	if got := stageRow(t, store, run.ID, "deploy"); got.State != pipeline.StageQueued || got.JobID == "" {
+		t.Fatalf("deploy stage = %+v, want queued after the gate passed", got)
+	}
+}
+
 // TestPipelineGateStageTimeoutParksBlockedE2E proves a gate stage whose predicate never
 // holds within its stage timeout PARKS the run BLOCKED (not failed) at the gate, with a
 // needs entry naming the merge it waited on — and never retries (a gate is a wait, not a
@@ -235,6 +289,54 @@ stages:
 	}
 	if got := stageRow(t, store, run.ID, "deploy"); got.State != pipeline.StageSkipped {
 		t.Fatalf("deploy stage = %s, want skipped past the parked gate", got.State)
+	}
+}
+
+// TestPipelineGateStageSkippedSourceParksBlockedE2E proves a pr_merged gate does
+// not wait for a PR that a successful no-work implement stage can never create.
+func TestPipelineGateStageSkippedSourceParksBlockedE2E(t *testing.T) {
+	store := pipelineAdvanceStore(t)
+	enqueue := testStageEnqueuer(store)
+	const spec = `name: gate-skipped-source
+repo: owner/repo
+stages:
+  - id: impl
+    agent: coder
+    prompt: Fix the bug.
+    action: implement
+    write: true
+  - id: wait
+    gate: pr_merged
+    source: impl
+    needs: [impl]
+  - id: deploy
+    cmd: echo deploying
+    needs: [wait]
+`
+	rec, parsed := newTestPipeline(t, store, "gate-skipped-source", spec)
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	run := startTestRun(t, store, rec, parsed, enqueue, now)
+	impl := stageRow(t, store, run.ID, "impl")
+	settleImplementStageJob(t, store, impl.JobID, "skipped", "nothing changed", 0)
+
+	run = advance(t, store, rec, parsed, enqueue, run, now)
+	if got := stageRow(t, store, run.ID, "impl"); got.State != pipeline.StageSucceeded {
+		t.Fatalf("impl stage = %s, want succeeded", got.State)
+	}
+	run = advance(t, store, rec, parsed, enqueue, run, now)
+
+	gate := stageRow(t, store, run.ID, "wait")
+	if gate.State != pipeline.StageBlocked {
+		t.Fatalf("gate stage = %s, want blocked", gate.State)
+	}
+	if got := decodePipelineNeeds(gate.NeedsJSON); len(got) != 1 || got[0] != "source stage skipped: no PR will exist for this run" {
+		t.Fatalf("gate needs = %v", got)
+	}
+	if run.State != pipeline.RunBlocked {
+		t.Fatalf("run = %s, want blocked", run.State)
+	}
+	if got := stageRow(t, store, run.ID, "deploy"); got.State != pipeline.StageSkipped || got.JobID != "" {
+		t.Fatalf("deploy stage = %+v, want skipped and never enqueued", got)
 	}
 }
 

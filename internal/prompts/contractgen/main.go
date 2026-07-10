@@ -96,6 +96,8 @@ var ephemeralFieldAnnotations = map[string]fieldAnnotation{
 	"autonomy_policy": {help: `autonomy_policy (optional)`},
 }
 
+const resultDecisionHelp = "\nDecision semantics:\n- Use decision skipped only when the task itself had no work to do. Do not use skipped in a PR review to mean nothing to flag; use approved. skipped must not be returned with delegations.\n- Outside pipelines, skipped is an abstention for quorum and verify. Vote still counts the skipped child's succeeded job state.\n"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "contractgen:", err)
@@ -270,6 +272,9 @@ func renderFile(shape, help string) string {
 	b.WriteString("// resultContractShape is the byte-identical {\"gitmoot_result\":{…}} example\n")
 	b.WriteString("// literal that RenderJob and RenderRepairPrompt both emit. Agents copy it.\n")
 	b.WriteString("const resultContractShape = " + goQuote(shape) + "\n\n")
+	b.WriteString("// resultDecisionHelp documents semantic constraints that the decision enum alone\n")
+	b.WriteString("// cannot express. It is emitted beside the shape in job and repair prompts.\n")
+	b.WriteString("const resultDecisionHelp = " + goQuote(resultDecisionHelp) + "\n\n")
 	b.WriteString("// delegationSchemaHelp documents the full delegations[] object shape inside\n")
 	b.WriteString("// the rendered prompt. Runtime agents only receive this prompt, not the\n")
 	b.WriteString("// gitmoot skill docs, so without it they guess field names (e.g. \"to\"\n")

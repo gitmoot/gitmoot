@@ -7,7 +7,11 @@ package prompts
 
 // resultContractShape is the byte-identical {"gitmoot_result":{…}} example
 // literal that RenderJob and RenderRepairPrompt both emit. Agents copy it.
-const resultContractShape = "{\"gitmoot_result\":{\"decision\":\"approved|changes_requested|blocked|implemented|failed\",\"summary\":\"...\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"delegations\":[]}}"
+const resultContractShape = "{\"gitmoot_result\":{\"decision\":\"approved|changes_requested|blocked|implemented|failed|skipped\",\"summary\":\"...\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"delegations\":[]}}"
+
+// resultDecisionHelp documents semantic constraints that the decision enum alone
+// cannot express. It is emitted beside the shape in job and repair prompts.
+const resultDecisionHelp = "\nDecision semantics:\n- Use decision skipped only when the task itself had no work to do. Do not use skipped in a PR review to mean nothing to flag; use approved. skipped must not be returned with delegations.\n- Outside pipelines, skipped is an abstention for quorum and verify. Vote still counts the skipped child's succeeded job state.\n"
 
 // delegationSchemaHelp documents the full delegations[] object shape inside
 // the rendered prompt. Runtime agents only receive this prompt, not the

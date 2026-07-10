@@ -243,6 +243,96 @@ stages:
 	}
 }
 
+// TestPipelineImplementStageSkippedBypassesPRWaitE2E proves a first-class skipped
+// implement result folds immediately without a PR or the legacy no-PR event. Its
+// trusted no-work summary then reaches the dependent agent prompt automatically.
+func TestPipelineImplementStageSkippedBypassesPRWaitE2E(t *testing.T) {
+	ctx := context.Background()
+	store := pipelineAdvanceStore(t)
+	enqueue := testStageEnqueuer(store)
+	const spec = `name: skipped-impl
+repo: owner/repo
+stages:
+  - id: impl
+    agent: coder
+    prompt: Fix the bug.
+    action: implement
+    write: true
+  - id: notify
+    agent: rev
+    prompt: Announce.
+    needs: [impl]
+`
+	rec, parsed := newTestPipeline(t, store, "skipped-impl", spec)
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	run := startTestRun(t, store, rec, parsed, enqueue, now)
+	impl := stageRow(t, store, run.ID, "impl")
+
+	settleImplementStageJob(t, store, impl.JobID, "skipped", "repository already matches", 0)
+	run = advance(t, store, rec, parsed, enqueue, run, now)
+
+	implDone := stageRow(t, store, run.ID, "impl")
+	if implDone.State != pipeline.StageSucceeded {
+		t.Fatalf("impl stage = %s, want succeeded without waiting for a PR", implDone.State)
+	}
+	if implDone.Summary != "[skipped: no work] repository already matches" {
+		t.Fatalf("impl summary = %q", implDone.Summary)
+	}
+	notify := stageRow(t, store, run.ID, "notify")
+	if notify.State != pipeline.StageQueued || notify.JobID == "" {
+		t.Fatalf("notify stage = %+v, want queued with a job", notify)
+	}
+	notifyJob, err := store.GetJob(ctx, notify.JobID)
+	if err != nil {
+		t.Fatalf("GetJob(notify): %v", err)
+	}
+	payload, err := workflow.ParseJobPayload(notifyJob.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload(notify): %v", err)
+	}
+	if !strings.Contains(payload.Instructions, "[skipped: no work] repository already matches") {
+		t.Fatalf("notify prompt missing skipped upstream summary:\n%s", payload.Instructions)
+	}
+}
+
+// TestPipelineImplementStageSkippedHonorsStrictSuccessDecisionsE2E proves a
+// strict implement stage that omits skipped folds failed immediately with no PR,
+// rather than entering the fold-on-PR-opened wait.
+func TestPipelineImplementStageSkippedHonorsStrictSuccessDecisionsE2E(t *testing.T) {
+	store := pipelineAdvanceStore(t)
+	enqueue := testStageEnqueuer(store)
+	const spec = `name: skipped-impl-strict
+repo: owner/repo
+stages:
+  - id: impl
+    agent: coder
+    prompt: Fix the bug.
+    action: implement
+    write: true
+    success_decisions: [approved, implemented]
+  - id: notify
+    cmd: echo notify
+    needs: [impl]
+`
+	rec, parsed := newTestPipeline(t, store, "skipped-impl-strict", spec)
+	now := time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC)
+	run := startTestRun(t, store, rec, parsed, enqueue, now)
+	impl := stageRow(t, store, run.ID, "impl")
+	settleImplementStageJob(t, store, impl.JobID, "skipped", "nothing to change", 0)
+
+	run = advance(t, store, rec, parsed, enqueue, run, now)
+	implDone := stageRow(t, store, run.ID, "impl")
+	if implDone.State != pipeline.StageFailed {
+		t.Fatalf("impl stage = %s, want failed immediately", implDone.State)
+	}
+	if run.State != pipeline.RunFailed {
+		t.Fatalf("run = %s, want failed", run.State)
+	}
+	if got := stageRow(t, store, run.ID, "notify"); got.State != pipeline.StageSkipped || got.JobID != "" {
+		t.Fatalf("notify stage = %+v, want skipped and never enqueued", got)
+	}
+}
+
 // TestPipelineImplementStageWritableWorktreeReuseE2E proves the WRITABLE-worktree
 // dispatch (#768): a mutating implement stage takes the real task-worktree path (not
 // the read-only committed-tip worktree), is born on its DETERMINISTIC run-scoped branch,

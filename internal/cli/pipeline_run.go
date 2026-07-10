@@ -29,6 +29,8 @@ import (
 // wiring of runPipelineScanOnce lands in a later step — here it is driven by
 // `pipeline run` and the tests.
 
+const pipelineSkippedSummaryMarker = "[skipped: no work]"
+
 // pipelineStageEnqueuer enqueues one pipeline stage job. In production it wraps
 // workflow.Mailbox.Enqueue (matching newHeartbeatEnqueuer); tests inject a fake to
 // assert the request shape without a real worker.
@@ -1141,9 +1143,9 @@ func orchestrateStageTimeout(stage pipeline.Stage) (time.Duration, error) {
 // job payload carries an opened PullRequest (> 0). That closes the race where the
 // implement job reaches its terminal success state a beat before the
 // ImplementationFinalizer stamps the opened PR onto the payload; without it a downstream
-// stage could advance believing a PR exists when it does not yet. A blocked/failed
-// decision folds IMMEDIATELY (there is no PR to wait on), and a stage whose job times out
-// folds failed via the same decision path — so the PR guard can never wedge a run. On a
+// stage could advance believing a PR exists when it does not yet. A skipped decision
+// folds IMMEDIATELY because no work means no PR can exist; blocked/failed decisions do
+// the same, and a stage whose job times out folds failed via the same decision path. On a
 // successful fold the opened PR number is appended to the stage summary so it flows to
 // downstream stages through the #757 upstream-context injection (which renders the stage
 // summary). It reproduces the default kind's JobID guard + queued->running funnel reflect
@@ -1165,6 +1167,13 @@ func implementStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDe
 		return false, "", "", nil, nil, nil
 	}
 	state, summary, needs = foldPipelineStageOutcome(spec.EffectiveSuccessDecisions(stage), job)
+	if payload, perr := workflow.ParseJobPayload(job.Payload); perr == nil && payload.Result != nil && strings.TrimSpace(payload.Result.Decision) == "skipped" {
+		// A skipped implement job promises that there was no work to turn into a PR.
+		// Fold immediately instead of entering the fold-on-PR-opened wait. This is
+		// intentionally decision-specific; other successful decisions retain the
+		// existing PR gate (including the separately tracked approved case, #817).
+		return true, state, summary, needs, nil, nil
+	}
 	if state == pipeline.StageSucceeded {
 		pr := 0
 		if payload, perr := workflow.ParseJobPayload(job.Payload); perr == nil {
@@ -1263,6 +1272,10 @@ func gateStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, s
 		if srcRow, ok, gerr := deps.store.GetPipelineRunStage(ctx, deps.run.ID, source); gerr != nil {
 			return false, "", "", nil, nil, gerr
 		} else if ok {
+			if srcRow.State == pipeline.StageSucceeded && pipelineSummaryIsSkipped(srcRow.Summary) {
+				need := "source stage skipped: no PR will exist for this run"
+				return true, pipeline.StageBlocked, fmt.Sprintf("gate %s cannot pass: source stage %q skipped", stage.Gate, source), []string{need}, nil, nil
+			}
 			pr = parsePipelineImplementPR(srcRow.Summary)
 		}
 	}
@@ -1386,9 +1399,16 @@ func foldPipelineStageOutcome(successDecisions []string, job db.Job) (state, sum
 		return pipeline.StageFailed, "stage job produced no gitmoot_result", nil
 	}
 	decision := strings.TrimSpace(payload.Result.Decision)
-	summary = strings.TrimSpace(payload.Result.Summary)
+	// The skipped marker is reserved for Gitmoot-authored fold metadata. Strip every
+	// leading agent-authored occurrence before deciding the outcome; only a genuine
+	// successful skipped decision may reapply exactly one marker below. This keeps
+	// downstream context honest and makes the gate's marker-first check trustworthy.
+	summary = stripPipelineSkippedSummaryMarker(payload.Result.Summary)
 	switch {
 	case containsPipelineDecision(successDecisions, decision):
+		if decision == "skipped" {
+			summary = prependPipelineSkippedSummary(summary)
+		}
 		return pipeline.StageSucceeded, summary, nil
 	case decision == "blocked":
 		if summary == "" {
@@ -1401,6 +1421,33 @@ func foldPipelineStageOutcome(successDecisions []string, job db.Job) (state, sum
 		}
 		return pipeline.StageFailed, summary, nil
 	}
+}
+
+// stripPipelineSkippedSummaryMarker removes every leading occurrence of Gitmoot's
+// reserved no-work marker, with or without whitespace or trailing summary text.
+// Agent prose after the markers is preserved and trimmed.
+func stripPipelineSkippedSummaryMarker(summary string) string {
+	summary = strings.TrimSpace(summary)
+	for strings.HasPrefix(summary, pipelineSkippedSummaryMarker) {
+		summary = strings.TrimSpace(strings.TrimPrefix(summary, pipelineSkippedSummaryMarker))
+	}
+	return summary
+}
+
+// prependPipelineSkippedSummary stamps the trusted no-work marker onto a successful
+// skipped fold. The marker lives on the persisted stage row, so downstream context
+// and jobless gates can distinguish a no-work success without a new stage state.
+func prependPipelineSkippedSummary(summary string) string {
+	summary = strings.TrimSpace(summary)
+	if summary == "" {
+		return pipelineSkippedSummaryMarker
+	}
+	return pipelineSkippedSummaryMarker + " " + summary
+}
+
+func pipelineSummaryIsSkipped(summary string) bool {
+	summary = strings.TrimSpace(summary)
+	return summary == pipelineSkippedSummaryMarker || strings.HasPrefix(summary, pipelineSkippedSummaryMarker+" ")
 }
 
 // pipelineStageDepsSucceeded reports whether every stage this one needs has

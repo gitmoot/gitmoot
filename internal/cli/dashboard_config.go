@@ -240,7 +240,7 @@ Describe this agent's role and how it should approach jobs here.
 
 Always end every job with a concise, truthful gitmoot_result JSON object, e.g.:
   {"decision": "implemented", "summary": "what you did"}
-Decisions: approved | changes_requested | blocked | implemented | failed.
+Decisions: approved | changes_requested | blocked | implemented | failed | skipped.
 Use "blocked" when you need human input or external state, and "failed" when an
 attempted action errored.
 `

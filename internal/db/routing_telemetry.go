@@ -31,7 +31,7 @@ type RoutingTelemetry struct {
 	// JobState is the terminal job state: succeeded | failed | blocked.
 	JobState string
 	// Decision is the agent result decision (approved/implemented/changes_requested/
-	// blocked/failed) when the job carried a parseable result; empty otherwise.
+	// blocked/failed/skipped) when the job carried a parseable result; empty otherwise.
 	Decision string
 	// Approved mirrors the engine's approving-outcome test (approved|implemented|
 	// succeeded) so the summary can report an approval rate without re-deriving it.

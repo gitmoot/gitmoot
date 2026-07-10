@@ -31,7 +31,7 @@ const PipelineJobSender = "pipeline"
 // the same order.
 
 // ResultDecisions are the allowed values of AgentResult.Decision.
-var ResultDecisions = []string{"approved", "changes_requested", "blocked", "implemented", "failed"}
+var ResultDecisions = []string{"approved", "changes_requested", "blocked", "implemented", "failed", "skipped"}
 
 // DelegationFailurePolicies are the allowed values of Delegation.FailurePolicy
 // (the empty string falls back to the default and is accepted separately).
@@ -244,6 +244,9 @@ func validateAgentResult(result AgentResult) error {
 	}
 	if strings.TrimSpace(result.Summary) == "" {
 		return errors.New("gitmoot_result summary is required")
+	}
+	if result.Decision == "skipped" && len(result.Delegations) > 0 {
+		return errors.New("gitmoot_result decision skipped cannot be used with delegations")
 	}
 	if err := validateHumanQuestions(result.HumanQuestions); err != nil {
 		return err

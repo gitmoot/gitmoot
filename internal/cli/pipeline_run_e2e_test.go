@@ -147,6 +147,67 @@ func TestPipelineBlockedParkE2E(t *testing.T) {
 	}
 }
 
+// TestPipelineSkippedAdvancesE2E drives the real shell worker and pipeline scan
+// through a no-work stage. skipped folds to the existing succeeded stage state,
+// carries the trusted marker, and allows the downstream shell stage to run.
+func TestPipelineSkippedAdvancesE2E(t *testing.T) {
+	ctx := context.Background()
+	home, _, store := heartbeatLoopE2EHome(t)
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+
+	scan := pipelineStageResultCmd("skipped", "no new replies today", nil)
+	notify := pipelineStageResultCmd("approved", "downstream ran", nil)
+	specYAML := "name: skipped-flow\nrepo: owner/repo\nstages:\n" +
+		pipelineE2EStage("scan", scan, "") +
+		pipelineE2EStage("notify", notify, "scan")
+	specFile := writeSpec(t, specYAML)
+
+	var out, errBuf bytes.Buffer
+	if code := Run([]string{"pipeline", "add", specFile, "--home", home}, &out, &errBuf); code != 0 {
+		t.Fatalf("pipeline add exit=%d stderr=%s", code, errBuf.String())
+	}
+	out.Reset()
+	errBuf.Reset()
+	if code := Run([]string{"pipeline", "run", "skipped-flow", "--home", home}, &out, &errBuf); code != 0 {
+		t.Fatalf("pipeline run exit=%d stderr=%s", code, errBuf.String())
+	}
+	runID := strings.TrimSpace(out.String())
+
+	enqueue := newPipelineStageEnqueuer(store, home)
+	worker := defaultJobWorker(store, io.Discard, home)
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 8; i++ {
+		if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now); err != nil {
+			t.Fatalf("worker tick %d: %v", i, err)
+		}
+		if err := runPipelineScanOnce(ctx, store, enqueue, now); err != nil {
+			t.Fatalf("pipeline scan %d: %v", i, err)
+		}
+		run, _, err := store.GetPipelineRun(ctx, runID)
+		if err != nil {
+			t.Fatalf("GetPipelineRun: %v", err)
+		}
+		if run.State != pipeline.RunRunning {
+			break
+		}
+	}
+
+	run, ok, err := store.GetPipelineRun(ctx, runID)
+	if err != nil || !ok {
+		t.Fatalf("GetPipelineRun(%s): ok=%v err=%v", runID, ok, err)
+	}
+	if run.State != pipeline.RunSucceeded {
+		t.Fatalf("run = %s, want succeeded", run.State)
+	}
+	if got := stageRow(t, store, runID, "scan"); got.State != pipeline.StageSucceeded || got.Summary != "[skipped: no work] no new replies today" {
+		t.Fatalf("scan stage = %+v", got)
+	}
+	if got := stageRow(t, store, runID, "notify"); got.State != pipeline.StageSucceeded || got.Summary != "downstream ran" {
+		t.Fatalf("notify stage = %+v", got)
+	}
+}
+
 // pipelineE2EStage renders one stage block with the shell cmd as a literal YAML
 // block scalar (so the JSON-bearing single-quoted command survives YAML parsing).
 func pipelineE2EStage(id, cmd, needs string) string {

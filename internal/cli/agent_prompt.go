@@ -97,7 +97,7 @@ func runAgentPrompt(args []string, stdout, stderr io.Writer) int {
 // the importing agent knows the session job id it must close when the here-method
 // work is done (#657). The decision list mirrors workflow.ResultDecisions.
 func sessionCloseHint(jobID string) string {
-	return fmt.Sprintf(`[gitmoot session job %s — when this work is complete, run: gitmoot job close %s --decision <approved|changes_requested|implemented|blocked|failed> --summary "..."]`, jobID, jobID)
+	return fmt.Sprintf("[gitmoot session job %s \u2014 when this work is complete, run: gitmoot job close %s --decision <approved|changes_requested|implemented|blocked|failed|skipped> --summary \"...\"]", jobID, jobID)
 }
 
 // runAgentPromptRecord implements `agent prompt <id> --record`: it opens a session

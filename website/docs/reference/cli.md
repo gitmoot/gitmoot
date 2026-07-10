@@ -727,7 +727,7 @@ once you clock out:
 ```sh
 gitmoot agent prompt frontend-reviewer --record [--repo owner/repo] [--type ask|review|implement] [--json]
 # prints:  [gitmoot session job <id> — when this work is complete, run:
-#           gitmoot job close <id> --decision <approved|changes_requested|implemented|blocked|failed> --summary "..."]
+#           gitmoot job close <id> --decision <approved|changes_requested|implemented|blocked|failed|skipped> --summary "..."]
 # followed by the prompt body.
 ```
 
@@ -965,7 +965,7 @@ gitmoot job open --agent <name> --repo owner/repo --type ask|review|implement \
                  [--title "..."] [--task <id>] [--pr <n>] [--json]
 
 # Clock out: apply the result and move the job to its terminal state.
-gitmoot job close <id> --decision approved|changes_requested|blocked|implemented|failed \
+gitmoot job close <id> --decision approved|changes_requested|blocked|implemented|failed|skipped \
                  [--summary "..."] [--pr <n>] [--branch <name>] [--json]
 
 # One-shot post-hoc: create an already-terminal job (open + close in one).
@@ -979,8 +979,8 @@ the daemon never claims or Delivers it — no runtime subprocess, no runtime-ses
 or checkout lock) and the stuck-`running` reaper **skips** it, so a session may
 hold it open for as long as the work takes. `close` reuses the exact result path an
 engine-run job uses: `--decision` maps to the same terminal state
-(`approved`/`changes_requested`/`implemented` → succeeded, `blocked` → blocked,
-`failed` → failed) and emits the same finished/failed/blocked event, so a recorded
+(`approved`/`changes_requested`/`implemented`/`skipped` -> succeeded, `blocked` -> blocked,
+`failed` -> failed) and emits the same finished/failed/blocked event, so a recorded
 job is indistinguishable from an engine-run one in the dashboard and events. A job
 can be closed **once** (it must be a running session job); an orphaned open job
 stays `running` (reaper-exempt) until you `job close --decision failed` or `job
@@ -1666,12 +1666,17 @@ A stage signals its outcome by printing a `gitmoot_result` blob to stdout; the
 advancer folds by the **decision**, never the job's exit state (`changes_requested`
 is a succeeded job but folds as a stage **failure** by default):
 
-- a decision in the stage's `success_decisions` (default `approved`/`implemented`) →
+- a decision in the stage's `success_decisions` (default `approved`/`implemented`/`skipped`) ->
   **succeeded**, dependents enqueue;
 - `blocked` → the stage blocks, its `needs` persist, the run **parks blocked**
   (downstream never enqueues, zero compute while parked);
 - `failed` / any other decision / a cancelled job / no `gitmoot_result` → the stage
   **fails** (retried if budget remains), else the run **parks failed**.
+
+`skipped` means the stage itself had no work and advances by default with a
+`[skipped: no work]` summary marker. An explicit `success_decisions` list is
+strict: omitting `skipped` makes it fail. A `pr_merged` gate whose source skipped
+parks blocked because no PR can exist for that run.
 
 `pipeline run` prints only the run id (script-stable), ignores the `enabled` flag but
 still needs a `repo` and refuses to start while a run is active. `pipeline show
