@@ -106,10 +106,12 @@ func TestPipelineRunProgressRenderingAndJSON(t *testing.T) {
 			"job-tree": {JobID: "job-tree", Kind: "progress", Message: `{"elapsed":"30s","activity":"delegating"}`, CreatedAt: now.Add(-2 * time.Minute).Format(time.RFC3339Nano)},
 		},
 		orchestrate: map[string]bool{"tree": true},
+		tokens:      123,
+		stageTokens: map[string]pipelineStageTokens{"work": {input: 100, output: 23}},
 	}
 	var out bytes.Buffer
 	printPipelineRunFunnelAt(&out, view, now)
-	for _, want := range []string{"work: RUNNING; enqueued 2m0s ago", "last activity 5s ago: testing", "gate: QUEUED; enqueued 1m0s ago", "last activity 2m0s ago: delegating", "(sub-tree running; no per-stage progress)"} {
+	for _, want := range []string{"tokens: 123 (best-effort)", "work: RUNNING; enqueued 2m0s ago", "last activity 5s ago: testing", "gate: QUEUED; enqueued 1m0s ago", "last activity 2m0s ago: delegating", "(sub-tree running; no per-stage progress)"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("output missing %q:\n%s", want, out.String())
 		}
@@ -118,8 +120,45 @@ func TestPipelineRunProgressRenderingAndJSON(t *testing.T) {
 	if jsonView.Stages[0].StartedAt == "" || jsonView.Stages[0].Progress == nil || jsonView.Stages[0].Progress.Activity != "testing" {
 		t.Fatalf("JSON stage = %+v", jsonView.Stages[0])
 	}
+	if jsonView.Tokens != 123 || jsonView.Stages[0].InputTokens == nil || *jsonView.Stages[0].InputTokens != 100 || jsonView.Stages[0].OutputTokens == nil || *jsonView.Stages[0].OutputTokens != 23 {
+		t.Fatalf("JSON tokens = run %d stage %v/%v", jsonView.Tokens, jsonView.Stages[0].InputTokens, jsonView.Stages[0].OutputTokens)
+	}
 	if jsonView.Stages[3].FinishedAt == "" {
 		t.Fatalf("finished JSON stage = %+v", jsonView.Stages[3])
+	}
+}
+
+func TestSumPipelineRunTokensIncludesOrchestrateTreesWithoutDoubleCounting(t *testing.T) {
+	ctx := context.Background()
+	store := pipelineAdvanceStore(t)
+	runID := "prun-token-test"
+	create := func(id, root string, input, output int) {
+		t.Helper()
+		payload := `{"root_job_id":"` + root + `"}`
+		if err := store.CreateJob(ctx, db.Job{ID: id, Agent: "a", Type: "ask", State: "succeeded", Payload: payload}); err != nil {
+			t.Fatalf("CreateJob(%s): %v", id, err)
+		}
+		if err := store.UpdateJobUsage(ctx, id, input, output); err != nil {
+			t.Fatalf("UpdateJobUsage(%s): %v", id, err)
+		}
+	}
+	create("ordinary", runID, 7, 3)
+	orch0 := pipelineStageJobID(runID, "tree", 0)
+	orch1 := pipelineStageJobID(runID, "tree", 1)
+	create(orch0, orch0, 11, 1)
+	create(orch0+"/child", orch0, 13, 2)
+	create(orch1, orch1, 17, 4)
+
+	base, err := store.SumJobTokensByRoot(ctx, runID)
+	if err != nil || base != 10 {
+		t.Fatalf("run-rooted base = %d, err=%v; orchestrate trees must be disjoint", base, err)
+	}
+	total, err := sumPipelineRunTokens(ctx, store, runID, []db.PipelineRunStage{{StageID: "ordinary", JobID: "ordinary"}, {StageID: "tree", JobID: orch1, Attempt: 1}}, map[string]bool{"tree": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 58 {
+		t.Fatalf("total tokens = %d, want 58 (10 ordinary + 27 tree attempt 0 + 21 tree attempt 1)", total)
 	}
 }
 

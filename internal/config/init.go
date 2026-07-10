@@ -429,7 +429,7 @@ path = ""
 # runtime's metadata — it cannot add a new first-class runtime (that is a code
 # change); an unknown runtime name here is an error. default_model/default_effort
 # are surfaced by 'runtime list' AND used as delivery fallbacks; models is the
-# advisory known-valid list; capabilities is a subset of review/implement/ask;
+# advisory known-valid list; capabilities is a subset of review/implement/ask/produce;
 # usage_source is a human-readable descriptor.
 # [runtimes.codex]
 # default_model = "gpt-5.5-codex"

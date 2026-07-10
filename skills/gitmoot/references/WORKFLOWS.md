@@ -940,8 +940,9 @@ unavailable. See `../../../docs/cockpit-orchestrate.md` for the full reference.
 
 When the work is a **fixed, repeatable sequence of shell steps** with explicit
 dependencies — not a decomposition an LLM should reason about — declare a pipeline
-(#681) instead of orchestrating. A pipeline is a declared DAG of shell stages; each
-stage is an ordinary queued job run through the shell runtime, and a scan-based
+(#681) instead of orchestrating. A pipeline is a declared DAG of shell or
+managed-agent stages; each stage is an ordinary queued job (shell commands use
+the shell runtime; agent stages use their registered runtime), and a scan-based
 advancer folds each stage's `gitmoot_result` decision and enqueues the stages whose
 `needs` have all succeeded. Pipelines are off by default and reuse the same job
 queue and (heartbeat-style) scheduling as everything else.
@@ -1003,6 +1004,13 @@ runtime (claude / codex). Four kinds:
   PR on a deterministic `gitmoot/pipe-<run>-<stage>` branch (retry reuses it, never
   duplicates), folds **on PR-opened**, **never auto-merges**. Scheduled pipelines also
   need pipeline-level `allow_scheduled_writes: true`.
+- **produce** (#814) — `action: produce` + `write: true` + absolute cleaned
+  `writes:`. Codex-only data writer; never branch/task/PR state. Optional
+  `network: true`, `check`, and bounded same-session `check_retries`. Declared paths
+  are additive grants (workdir, `/tmp`, and `$TMPDIR` remain writable), protected
+  Gitmoot/checkouts are rejected after symlink resolution at add and delivery time,
+  retries must be
+  idempotent, and Gitmoot never cleans operator-owned data directories.
 - **orchestrate** (#758) — `orchestrate: true`. Sub-tree **coordinator** (the one
   non-leaf): fans out owned children (full delegation bounds ladder), waits via the
   continuation chain, folds the tail. `retry: 0`.
@@ -1064,6 +1072,11 @@ stages** — a clearly-delimited, bounded "Upstream stage results" block — so 
 downstream agent stage acts on upstream output as real dataflow. A repo-bound
 ask/review agent stage runs in its own detached read-only worktree (#739), so
 same-repo agent stages parallelize and never touch the live checkout.
+
+Produce batches use the existing result decisions: `implemented` = complete,
+`changes_requested` = partial (only advances when opted into `success_decisions`),
+`blocked` = needs a human, and `skipped` = no work. `pipeline show` reports a
+best-effort run token total and per-stage input/output usage in JSON.
 
 ### Park and resume
 

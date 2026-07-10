@@ -1,8 +1,9 @@
 # Run A Fixed Multi-Step Flow (Pipelines)
 
-Pipelines let the gitmoot daemon run a **declared DAG of shell stages** — a fixed,
+Pipelines let the gitmoot daemon run a **declared DAG of shell and agent stages** — a fixed,
 repeatable multi-step flow with explicit dependencies — on demand or on an interval
-schedule. Each stage is an ordinary queued job run through the **shell runtime**: the
+schedule. Each stage is an ordinary queued job (shell commands use the shell runtime;
+agent stages use their registered runtime): the
 existing worker tick claims and runs it, and a scan-based **advancer** folds each
 stage's `gitmoot_result` decision and enqueues the stages whose dependencies have all
 succeeded. Pipelines reuse the same job queue, result contract, and scheduling idiom
@@ -160,12 +161,13 @@ still means a downstream stage never ran after the pipeline halted.
 ## Agent stages
 
 A stage can run a **named managed gitmoot agent** instead of a shell command — a stage
-is **exactly one** of `cmd`, `agent`, or `gate`. There are four agent-stage kinds:
+is **exactly one** of `cmd`, `agent`, or `gate`. There are five agent-stage kinds:
 
 | Kind | Declared by | What it does |
 | ---- | ----------- | ------------ |
 | **ask / review** (#757/#813) | `action: ask\|review` (review may add `source:`) | Read-only leaf; optionally reviews one upstream implement PR at its exact head. |
 | **implement** (#768) | `action: implement` + `write: true` | Mutates the repo + opens a PR (fold-on-PR-opened); never auto-merges. |
+| **produce** (#814) | `action: produce` + `write: true` + `writes:` | Codex-only data writer; never creates repo/branch/task/PR state. |
 | **orchestrate** (#758) | `orchestrate: true` | Sub-tree coordinator — fans out owned children, waits, folds the synthesis. |
 | **gate** (#768) | `gate: pr_merged` + `source:` (no `agent`) | Jobless waiter — folds when an upstream implement stage's PR merges. |
 
@@ -248,6 +250,49 @@ Agent stages fold by `gitmoot_result` `decision` and park/advance exactly like s
 stages — an `approved`/`implemented` review advances dependents, a `blocked` result
 parks the run with its `needs`, `changes_requested` is a failure by default.
 
+## Produce data without changing the repo
+
+Use `produce` when the agent should write a dataset, report bundle, object-store
+payload, or other operator-owned data rather than code:
+
+```yaml
+  - id: export
+    agent: dataset-writer
+    action: produce
+    write: true
+    writes: [/srv/datasets/nightly]
+    network: true
+    check: test -s /srv/datasets/nightly/index.json
+    check_retries: 2
+    prompt: Reconcile and atomically replace tonight's export.
+```
+
+This MVP is **Codex-only**. Dispatch refuses Claude, Kimi, Kimi CLI, and shell,
+and also refuses read-only/auto agents. Each `writes:` entry must be absolute and
+cleaned. At `pipeline add`, Gitmoot resolves symlinks and rejects `/`, its home,
+every managed checkout, and paths containing any of those protected roots.
+The worker repeats the same check immediately before delivery, so retargeting a
+previously-safe symlink fails before the runtime starts.
+
+The paths become Codex `--add-dir` arguments. They are **additive grants, not an
+exhaustive allowlist**: workspace-write's workdir, `/tmp`, and `$TMPDIR` remain
+writable. Produce runs from a disposable detached worktree and carries no branch,
+task, or PR fields. Allocation fails closed instead of falling back to the managed
+checkout. A danger-full-access agent is allowed, but receives no
+add-dir/network arguments because that sandbox is already unrestricted.
+
+After a valid result, `check` runs as trusted operator configuration in the stage
+cwd with the daemon environment. On failure, redacted output capped at 8 KiB is
+sent back to the same session for up to `check_retries` correction turns. Their
+tokens are counted. Exhaustion fails the stage; ordinary stage retry can then
+start a new attempt. Because earlier attempts may have written partial data,
+produce work **must be idempotent** and reconcile or atomically overwrite. Gitmoot
+never deletes declared data directories; it only cleans its disposable cwd.
+
+Batch decisions keep the standard contract: `implemented` = complete,
+`changes_requested` = partial (opt in via `success_decisions`), `blocked` = human
+input required, and `skipped` = no work.
+
 ## Park and resume
 
 The central story is **park-then-resume**. A run that hits a `blocked` stage parks
@@ -259,6 +304,7 @@ run: prun-nightly-sync-18bfa02e9afb86ed
 pipeline: nightly-sync
 trigger: manual
 state: blocked
+tokens: 12345 (best-effort)
 halt_stage: score
 halt_reason: secret missing
 needs: R2 token
@@ -275,6 +321,9 @@ updates stop, so stale progress never masquerades as liveness. An orchestrate
 stage can have no fresh per-stage event while its child sub-tree is active; this is
 reported as `(sub-tree running; no per-stage progress)`, not a failure. JSON stage
 objects add `started_at`, `finished_at`, and optional structured `progress` data.
+The run token total is best-effort. JSON also carries run `tokens` and per-stage
+`input_tokens`/`output_tokens` when captured; resumed-session edge cases and
+runtimes without usage events contribute zero.
 
 The operator provisions what the stage needs out of band (here, an R2 token), then
 resumes — which re-runs the halted stage and everything downstream of it, while the

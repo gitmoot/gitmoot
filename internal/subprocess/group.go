@@ -20,9 +20,16 @@ const groupKillGrace = 10 * time.Second
 // orphans grandchildren — runtime CLIs like codex/claude spawn helpers that
 // must die with the job. Used by the runtime adapters; short-lived tool calls
 // (gh, git) keep the plain ExecRunner.
-type GroupRunner struct{}
+type GroupRunner struct {
+	// MaxOutputBytes, when positive, retains only the tail of stdout and stderr
+	// independently. Zero preserves the historical unbounded capture behavior.
+	MaxOutputBytes int
+}
 
-func (GroupRunner) Run(ctx context.Context, dir string, command string, args ...string) (Result, error) {
+func (r GroupRunner) Run(ctx context.Context, dir string, command string, args ...string) (Result, error) {
+	if r.MaxOutputBytes > 0 {
+		return RunGroupEnvBounded(ctx, dir, nil, r.MaxOutputBytes, command, args...)
+	}
 	return RunGroup(ctx, dir, command, args...)
 }
 
@@ -31,7 +38,11 @@ func (GroupRunner) Run(ctx context.Context, dir string, command string, args ...
 // the #732 chat relay uses to inject a moot seat's GITMOOT_CHAT_RELAY[_AUTH] into
 // the runtime subprocess without losing whole-tree cancellation. A nil/empty env
 // is byte-identical to Run.
-func (GroupRunner) RunEnv(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error) {
+
+func (r GroupRunner) RunEnv(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error) {
+	if r.MaxOutputBytes > 0 {
+		return RunGroupEnvBounded(ctx, dir, env, r.MaxOutputBytes, command, args...)
+	}
 	return RunGroupEnv(ctx, dir, env, command, args...)
 }
 
@@ -78,6 +89,42 @@ func RunGroupEnv(ctx context.Context, dir string, extraEnv []string, command str
 		Stderr:  stderr.String(),
 	}, err
 }
+
+// RunGroupEnvBounded is RunGroupEnv with bounded tail capture for stdout and
+// stderr. It preserves the same process-group cancellation, WaitDelay, and final
+// SIGKILL sweep while preventing a noisy child from growing memory without bound.
+func RunGroupEnvBounded(ctx context.Context, dir string, extraEnv []string, maxOutputBytes int, command string, args ...string) (Result, error) {
+	cmd, sweep := newGroupCmd(ctx, dir, command, args)
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
+	stdout := tailBuffer{max: maxOutputBytes}
+	stderr := tailBuffer{max: maxOutputBytes}
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	sweep()
+	return Result{Command: command, Args: args, Stdout: stdout.String(), Stderr: stderr.String()}, err
+}
+
+type tailBuffer struct {
+	max  int
+	data []byte
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	if b.max <= 0 {
+		return n, nil
+	}
+	b.data = append(b.data, p...)
+	if len(b.data) > b.max {
+		b.data = append(b.data[:0], b.data[len(b.data)-b.max:]...)
+	}
+	return n, nil
+}
+
+func (b *tailBuffer) String() string { return string(b.data) }
 
 // RunGroupStream is RunGroup that additionally streams the child's stdout and
 // stderr to out, line by line, as they are produced — the buffered Result is

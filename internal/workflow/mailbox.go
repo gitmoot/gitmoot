@@ -15,6 +15,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/prompts"
 	"github.com/jerryfane/gitmoot/internal/runtime"
+	"github.com/jerryfane/gitmoot/internal/subprocess"
 )
 
 // maxRepairAttempts bounds how many times a malformed (missing gitmoot_result
@@ -110,6 +111,12 @@ type Mailbox struct {
 	// foreground path — is byte-identical. The daemon resolves the real mode
 	// (default warn) from config and wires it through Engine.ResultCheckMode.
 	resultCheckMode ResultCheckMode
+	// produceCheckDir is the resolved stage checkout used as cwd for trusted
+	// operator checks when the payload has no explicit disposable worktree.
+	produceCheckDir string
+	// produceCheckTimeout bounds each trusted check command. Zero uses the
+	// production default; tests may inject a short timeout.
+	produceCheckTimeout time.Duration
 }
 
 type JobRequest struct {
@@ -210,6 +217,10 @@ type JobRequest struct {
 	// (shell, #757 agent leaf) keeps the delegations strip byte-identically.
 	// Additive/omitempty: false leaves the enqueued payload byte-identical.
 	OrchestrateStage bool
+	WritablePaths    []string
+	Network          bool
+	Check            string
+	CheckRetries     int
 }
 
 type JobPayload struct {
@@ -285,6 +296,10 @@ type JobPayload struct {
 	// orchestrate spec, never by sender-sniffing. Additive/omitempty so every other
 	// pipeline-sender payload — shell + #757 agent leaf — serializes byte-identically.
 	OrchestrateStage bool         `json:"orchestrate_stage,omitempty"`
+	WritablePaths    []string     `json:"writable_paths,omitempty"`
+	Network          bool         `json:"network,omitempty"`
+	Check            string       `json:"check,omitempty"`
+	CheckRetries     int          `json:"check_retries,omitempty"`
 	RawOutputs       []string     `json:"raw_outputs,omitempty"`
 	Result           *AgentResult `json:"result,omitempty"`
 	// FailureDiagnostics captures process-level crash context when the runtime
@@ -411,6 +426,10 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		ChatMessageID:          strings.TrimSpace(request.ChatMessageID),
 		MootSeat:               request.MootSeat,
 		OrchestrateStage:       request.OrchestrateStage,
+		WritablePaths:          compactStrings(request.WritablePaths),
+		Network:                request.Network,
+		Check:                  strings.TrimSpace(request.Check),
+		CheckRetries:           request.CheckRetries,
 	})
 	if err != nil {
 		return db.Job{}, err
@@ -815,6 +834,66 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		}
 	}
 
+	// A produce stage may declare a trusted deterministic check. Run it only after
+	// a valid envelope and before terminal persistence. Failures re-deliver to the
+	// SAME in-memory runtime session; m.deliver records every correction turn's
+	// token usage on the same job row.
+	if job.Type == "produce" && strings.TrimSpace(payload.Check) != "" {
+		for correction := 0; ; correction++ {
+			checkOutput, checkErr := runProduceCheck(ctx, payload, m.produceCheckDir, m.produceCheckTimeout)
+			if checkErr == nil {
+				break
+			}
+			if correction >= payload.CheckRetries {
+				message := fmt.Sprintf("produce check failed after %d correction attempt(s): %v", correction, checkErr)
+				if strings.TrimSpace(checkOutput) != "" {
+					message += ": " + checkOutput
+				}
+				payload.Result = &AgentResult{Decision: "failed", Summary: message}
+				if err := m.savePayload(ctx, job.ID, payload); err != nil {
+					return AgentResult{}, err
+				}
+				_ = m.addEvent(ctx, job.ID, "produce_check_failed", message)
+				if err := m.fail(ctx, job.ID, message); err != nil {
+					return AgentResult{}, err
+				}
+				return AgentResult{}, errors.New(message)
+			}
+			if err := m.ensureRunning(ctx, job.ID); err != nil {
+				return AgentResult{}, err
+			}
+			if err := m.addEvent(ctx, job.ID, "produce_check_retry", fmt.Sprintf("retrying after deterministic check failure (attempt %d of %d)", correction+1, payload.CheckRetries)); err != nil {
+				return AgentResult{}, err
+			}
+			correctionRaw, refreshedRef, ephemeral, diag, deliveryErr := m.deliver(ctx, adapter, agent, job, payload, produceCheckCorrectionPrompt(checkOutput))
+			if deliveryErr != nil {
+				m.storeFailureDiagnostics(ctx, job.ID, &payload, diag)
+				_ = m.fail(ctx, job.ID, fmt.Sprintf("produce correction delivery failed: %v", deliveryErr))
+				return AgentResult{}, DeliveryError{Err: deliveryErr}
+			}
+			if payload.RuntimeOverride == "" && !registeredFreshRef && !ephemeral {
+				m.persistRefreshedRuntimeRef(ctx, job.ID, agent, refreshedRef)
+			}
+			if refreshedRef != "" {
+				agent.RuntimeRef = refreshedRef
+			}
+			payload.RawOutputs = append(payload.RawOutputs, correctionRaw)
+			result, parseErr = ExtractAgentResult(correctionRaw)
+			if parseErr != nil {
+				message := fmt.Sprintf("produce correction output malformed: %v", parseErr)
+				payload.Result = &AgentResult{Decision: "failed", Summary: message}
+				if err := m.savePayload(ctx, job.ID, payload); err != nil {
+					return AgentResult{}, err
+				}
+				_ = m.fail(ctx, job.ID, message)
+				return AgentResult{}, parseErr
+			}
+			if err := m.savePayload(ctx, job.ID, payload); err != nil {
+				return AgentResult{}, err
+			}
+		}
+	}
+
 	if err := m.ensureRunning(ctx, job.ID); err != nil {
 		return AgentResult{}, err
 	}
@@ -910,6 +989,34 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	// write can never turn a successfully-finished job into a failure.
 	m.recordRoutingTelemetry(ctx, job, agent, payload, result, state, time.Since(runStart))
 	return result, nil
+}
+
+const maxProduceCheckOutputBytes = 8 * 1024
+const defaultProduceCheckTimeout = 2 * time.Minute
+
+func runProduceCheck(ctx context.Context, payload JobPayload, fallbackDir string, timeout time.Duration) (string, error) {
+	dir := strings.TrimSpace(payload.WorktreePath)
+	if dir == "" {
+		dir = strings.TrimSpace(fallbackDir)
+	}
+	if timeout <= 0 {
+		timeout = defaultProduceCheckTimeout
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	result, err := (subprocess.GroupRunner{MaxOutputBytes: 2 * maxProduceCheckOutputBytes}).Run(checkCtx, dir, "sh", "-c", payload.Check)
+	return sanitizeProduceCheckOutput(result.Stdout + result.Stderr), err
+}
+
+func sanitizeProduceCheckOutput(output string) string {
+	return strings.TrimSpace(tailBytes(RedactCommentText(output), maxProduceCheckOutputBytes))
+}
+
+func produceCheckCorrectionPrompt(output string) string {
+	if strings.TrimSpace(output) == "" {
+		output = "(check exited non-zero with no output)"
+	}
+	return "Your produce output failed the deterministic check. Fix and return a fresh gitmoot_result. Check output:\n\n~~~text\n" + output + "\n~~~"
 }
 
 // deliver returns the delivery's raw text, refreshed runtime ref, ephemeral
@@ -1190,6 +1297,7 @@ func (p JobPayload) prompt(action string) prompts.JobPrompt {
 }
 
 func validateJobRequest(request JobRequest) error {
+	action := strings.TrimSpace(request.Action)
 	switch {
 	case strings.TrimSpace(request.ID) == "":
 		return errors.New("job id is required")
@@ -1199,6 +1307,20 @@ func validateJobRequest(request JobRequest) error {
 		return errors.New("job action is required")
 	case strings.TrimSpace(request.Repo) == "":
 		return errors.New("job repo is required")
+	case action == "produce" && request.Sender != PipelineJobSender:
+		return errors.New("job action produce is reserved for pipeline stages")
+	case action == "produce" && len(compactStrings(request.WritablePaths)) == 0:
+		return errors.New("job action produce requires at least one writable path")
+	case action != "produce" && len(compactStrings(request.WritablePaths)) > 0:
+		return errors.New("job writable_paths are only valid for action produce")
+	case action != "produce" && request.Network:
+		return errors.New("job network access is only valid for action produce")
+	case action != "produce" && strings.TrimSpace(request.Check) != "":
+		return errors.New("job check is only valid for action produce")
+	case action != "produce" && request.CheckRetries > 0:
+		return errors.New("job check_retries are only valid for action produce")
+	case request.CheckRetries < 0:
+		return errors.New("job check_retries must be >= 0")
 	}
 	return validateJobRuntimeOverrideRequest(request)
 }

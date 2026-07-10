@@ -1,9 +1,10 @@
 # Pipelines
 
-Pipelines (#681) let the gitmoot daemon run a **declared DAG of shell stages** —
-a small, durable multi-step flow — on demand or on an interval schedule. Each
-stage is an ordinary queued job run through the **shell runtime**: the normal
-worker tick claims and runs it, and a scan-based **advancer** folds each stage's
+Pipelines (#681) let the gitmoot daemon run a **declared DAG of shell and agent
+stages** — a small, durable multi-step flow — on demand or on an interval schedule.
+Each stage is an ordinary queued job: shell commands use the shell runtime, while
+agent stages use their registered runtime. The normal worker tick claims and runs
+it, and a scan-based **advancer** folds each stage's
 `gitmoot_result` decision and enqueues the stages whose dependencies have all
 succeeded. Pipelines reuse the same job queue, result contract, and scheduling
 idiom as heartbeats — there is no separate runner.
@@ -62,13 +63,17 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 | `schedule.interval`         | pipeline     | cond.    | Required when a `schedule:` block is present. A positive Go duration (`24h`, `1h30m`). |
 | `schedule.jitter`           | pipeline     | no       | Random `[0, jitter]` added to each `next_due` to de-thunder (`>= 0`). |
 | `success_decisions`         | pipeline     | no       | Decisions that mark a stage succeeded. Default `["approved","implemented","skipped"]`. Any value must be one of `approved`, `implemented`, `changes_requested`, `skipped` - `blocked`/`failed` are park states and are rejected. An explicit list is strict: omitting `skipped` requires real work and makes a skipped result fail. |
-| `allow_scheduled_writes`    | pipeline     | no       | Safety flag (#768). A **mutating** `implement` stage on a **scheduled** pipeline (a `schedule:` block) is rejected at add time unless this is `true` — so an unattended nightly pipeline can never write code / open a PR by accident. Manual-run pipelines don't need it. Default `false`. |
+| `allow_scheduled_writes`    | pipeline     | no       | Safety flag. A **mutating** `implement` or `produce` stage on a **scheduled** pipeline is rejected unless this is `true`. Manual runs do not need it. Default `false`. |
 | `stages[].id`               | stage        | yes      | Unique, name-safe stage id. Appears verbatim in the stage job's fingerprint and deterministic id. |
 | `stages[].cmd`              | stage        | cond.    | Shell command run verbatim via `sh -c` (see the stage contract below). A stage is **exactly one** of `cmd`, `agent`, or `gate`. |
 | `stages[].agent`            | stage        | cond.    | Name of a managed gitmoot agent to run this stage (instead of a shell `cmd`). Must be a name-safe token; `pipeline add` warns (does not block) if the agent does not exist yet, but it must exist before the stage runs. Mutually exclusive with `cmd`/`gate`. The stage kind depends on `action`/`write`/`orchestrate` — see [Agent stages](#agent-stages). |
 | `stages[].prompt`           | stage        | cond.    | Instruction handed to an agent stage's agent. **Required** for an agent stage; rejected for a shell/gate stage. Prepended with the upstream `needs` stages' result summaries at enqueue. |
-| `stages[].action`           | stage        | no       | Verb for an agent stage: `ask` (default), `review`, or `implement` (#768). `ask`/`review` are read-only leaves; `implement` mutates the repo + opens a PR (requires `write: true`). Rejected for a shell/gate stage. |
-| `stages[].write`            | stage        | cond.    | Acknowledges that an `implement` stage **mutates** the repo (#768). Required with `action: implement`, and valid **only** there — a double-key so a typo/injection can't turn a read-only pipeline into a writing one. |
+| `stages[].action`           | stage        | no       | `ask` (default), `review`, `implement`, or `produce`. Produce writes operator-owned data but never the repo or a PR. |
+| `stages[].write`            | stage        | cond.    | Required acknowledgement for both mutating actions: `implement` and `produce`; rejected elsewhere. |
+| `stages[].writes`           | stage        | cond.    | Required non-empty list for `produce`. Paths must be absolute and cleaned. At add time symlinks are resolved and overlap with `/`, the Gitmoot home, or any managed checkout is rejected in either direction. Rejected elsewhere. |
+| `stages[].network`          | stage        | no       | Produce-only opt-in to Codex workspace-write network access. Default `false`. |
+| `stages[].check`            | stage        | no       | Produce-only trusted operator command run with `sh -c` after a valid result, in the stage cwd with the daemon environment. |
+| `stages[].check_retries`    | stage        | no       | Produce-only count of same-session correction turns after a non-zero `check` (`>= 0`, default `0`). |
 | `stages[].orchestrate`      | stage        | no       | `true` makes an agent stage a **sub-tree coordinator** (#758): its `delegations[]` fan out as owned children and the stage waits for the whole tree, then folds the synthesis. Agent stage only; `action` must be `ask`. |
 | `stages[].gate`             | stage        | cond.    | Makes this a **jobless gate stage** (#768): it runs no worker and folds when an external predicate holds. Only `pr_merged` today. Exclusive with `cmd`/`agent`. Requires `source`. |
 | `stages[].source`           | stage        | cond.    | The upstream `implement` stage whose PR to bind. Required on a `gate`; optional on `action: review`; rejected on shell/ask/implement/orchestrate stages. It must be one of the stage's own `needs`. |
@@ -97,6 +102,7 @@ are four agent-stage kinds, all sharing the mechanics in this section:
 | ---- | ----------- | ------------ |
 | **ask** / **review** (#757) | `agent` + `action: ask\|review` | Read-only leaf: looks + decides, never mutates. |
 | **implement** (#768) | `agent` + `action: implement` + `write: true` | Mutates the repo + opens a PR (fold-on-PR-opened). See [Implement stages](#implement-stages). |
+| **produce** (#814) | `agent` + `action: produce` + `write: true` + `writes:` | Codex-only leaf that writes data outside protected Gitmoot/repo paths; never creates a branch, task, commit, or PR. |
 | **orchestrate** (#758) | `agent` + `orchestrate: true` | Sub-tree coordinator: fans out owned children, waits for the tree, folds the synthesis. See [Orchestrate stages](#orchestrate-stages). |
 | **gate** (#768) | `gate:` (no `agent`) | Jobless waiter: folds when an external predicate holds (e.g. a PR merges). See [Gate stages](#gate-stages). |
 
@@ -118,7 +124,7 @@ stages:
   hidden per-pipeline shell runner via a per-job runtime override), an agent stage
   binds the stage job to the named agent and runs it on **its own** registered runtime
   (claude / codex) and session — no runtime override.
-- **Leaf by default.** An `ask`/`review`/`implement` stage is a **leaf**: its
+- **Leaf by default.** An `ask`/`review`/`implement`/`produce` stage is a **leaf**: its
   `delegations[]` and `human_questions[]` are stripped (Sender is the pipeline sender),
   so it can neither fan out nor pause a human. (An `orchestrate` stage is the one
   exception — it is a coordinator, not a leaf; see [Orchestrate stages](#orchestrate-stages).)
@@ -154,6 +160,54 @@ stages:
   not via accumulated agent memory.
 
 Agent stages fold by `decision` and advance/park exactly like shell stages.
+
+### Produce stages
+
+`action: produce` is the data-writing agent stage. It is deliberately **Codex-only**
+in this MVP: dispatch refuses Claude, Kimi, Kimi CLI, and shell with an error naming
+the runtime. The bound agent must advertise the `produce` capability and use a
+`workspace-write` or `danger-full-access` policy; read-only/auto agents are refused.
+
+```yaml
+  - id: publish-dataset
+    agent: dataset-writer
+    action: produce
+    write: true
+    writes:
+      - /srv/datasets/nightly
+    network: true
+    check: test -s /srv/datasets/nightly/index.json
+    check_retries: 2
+    prompt: Reconcile and atomically replace tonight's dataset export.
+```
+
+Each declared path becomes a Codex `--add-dir` grant. These grants are
+**additive, not an exhaustive allowlist**: Codex workspace-write's default writable
+roots (the workdir, `/tmp`, and `$TMPDIR`) remain writable. A produce stage runs from
+a disposable detached worktree so accidental repo writes land in throwaway state;
+its request never carries branch/task/PR fields and Gitmoot never pushes that cwd.
+Unlike read-only ask/review isolation, produce worktree allocation fails closed and
+records a failed stage job rather than falling back to the managed checkout.
+Danger-full-access agents are allowed, but receive no add-dir/network arguments
+because that sandbox is already unrestricted.
+
+The worker repeats the same symlink resolution and protected-root containment check
+immediately before delivery. If a path was retargeted after `pipeline add`, the job
+fails before any runtime command starts.
+
+After every valid result, `check` runs deterministically. A failure sends the
+redacted, 8 KiB-capped output back to the same runtime session and asks for a fresh
+result, up to `check_retries`; every correction turn contributes tokens. Exhaustion
+fails the stage, after which ordinary stage `retry` may re-run it. Stage retries warn
+that partial data may already exist. Produce commands therefore **must be idempotent**:
+reconcile or atomically overwrite instead of appending duplicates. Declared data
+directories are operator-owned and Gitmoot never deletes or cleans them; only its
+disposable cwd follows normal cleanup.
+
+Batch decision convention: `implemented` means the batch is complete;
+`changes_requested` means partial output (opt in through `success_decisions` if that
+should advance); `blocked` means human input is required and parks with `needs`;
+`skipped` means there was no work.
 
 ### Implement stages
 
@@ -356,6 +410,11 @@ needs: R2 token
 
 source OK -> score BLOCKED (needs: R2 token) -> deploy SKIPPED
 ```
+
+The run header also prints `tokens: N (best-effort)`. JSON includes run `tokens`
+and each stage job's `input_tokens`/`output_tokens` when captured. Codex resumed
+session edge cases and runtimes without usage reporting contribute `0`, so this is
+honest accounting rather than a billing guarantee.
 
 Queued and running stages also get detail lines such as:
 

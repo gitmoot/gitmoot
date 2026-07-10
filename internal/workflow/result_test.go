@@ -191,6 +191,7 @@ func TestValidateAgentResultRejectsDelegationMissingFields(t *testing.T) {
 		{"missing id", Delegation{Agent: "impl", Action: "implement", Prompt: "do"}, `delegations[0] (id "<missing>"): id is required`},
 		{"missing agent", Delegation{ID: "a", Action: "implement", Prompt: "do"}, `delegation "a" must set exactly one of agent or ephemeral`},
 		{"missing action", Delegation{ID: "a", Agent: "impl", Prompt: "do"}, `delegations[0] (id "a"): action is required`},
+		{"unsupported action", Delegation{ID: "a", Agent: "impl", Action: "produce", Prompt: "do"}, `delegations[0] (id "a"): action must be one of ask, review, implement`},
 		{"missing prompt", Delegation{ID: "a", Agent: "impl", Action: "implement"}, `delegations[0] (id "a"): prompt is required`},
 	}
 	for _, tc := range cases {

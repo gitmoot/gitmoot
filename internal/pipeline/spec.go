@@ -147,6 +147,19 @@ type Stage struct {
 	// mutually exclusive with Cmd. Opt-in per stage so the cheap, reproducible shell
 	// line stays the default (the #758 "when in doubt, use a #757 leaf" rule).
 	Orchestrate bool `yaml:"orchestrate,omitempty"`
+	// Writes declares the absolute operator-owned data paths an action: produce
+	// stage may write. These are additive Codex workspace-write grants; they do not
+	// replace Codex's default writable roots. Required on produce and rejected on
+	// every other stage kind.
+	Writes []string `yaml:"writes,omitempty"`
+	// Network opts a produce stage into Codex workspace-write network access.
+	Network bool `yaml:"network,omitempty"`
+	// Check is a trusted operator command run after each valid produce result. A
+	// non-zero exit re-asks the same runtime session up to CheckRetries times.
+	Check string `yaml:"check,omitempty"`
+	// CheckRetries is a pointer so validation can distinguish an omitted default
+	// from an explicitly declared check_retries: 0 on a non-produce stage.
+	CheckRetries *int `yaml:"check_retries,omitempty"`
 }
 
 // StageKind classifies a stage by its declared fields. It is the SINGLE place a
@@ -199,6 +212,9 @@ const (
 	// action switch below, so an orchestrate stage is never mistaken for a leaf
 	// ask/review. Appended as a sibling kind; the existing cases are untouched.
 	StageKindOrchestrate
+	// StageKindAgentProduce is a data-writing, Codex-only agent leaf. It receives
+	// additive writable-path grants, never a branch/task/PR, and folds by decision.
+	StageKindAgentProduce
 )
 
 // Kind classifies the stage. A shell stage (Cmd set) is StageKindShell; an agent
@@ -230,6 +246,8 @@ func (s Stage) Kind() StageKind {
 			return StageKindAgentReview
 		case "implement":
 			return StageKindAgentImplement
+		case "produce":
+			return StageKindAgentProduce
 		}
 	case s.Gate != "":
 		// A jobless gate (#768 Phase 2): no cmd, no agent, a gate predicate instead.

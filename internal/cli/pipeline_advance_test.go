@@ -659,6 +659,12 @@ stages:
   - id: ag
     agent: asker
     prompt: What changed?
+  - id: data
+    agent: producer
+    action: produce
+    prompt: Write data.
+    write: true
+    writes: [/tmp/gitmoot-produce-test]
 `
 	store := pipelineAdvanceStore(t)
 	enqueue := testStageEnqueuer(store)
@@ -678,6 +684,7 @@ stages:
 	}{
 		{"sh", "approved", "shell landed", nil},
 		{"ag", "blocked", "needs a hint", []string{"which module?"}},
+		{"data", "skipped", "no batch", nil},
 	}
 	for _, tc := range cases {
 		row := stageRow(t, store, run.ID, tc.stageID)

@@ -1864,7 +1864,7 @@ func firstInstructionLine(instructions string) string {
 // review") are deliberately absent, so their ids fall through to the root job's
 // Type/Agent columns instead of being mis-split (kind="skillopt", agent absorbs
 // the rest).
-var knownRunKinds = map[string]bool{"ask": true, "review": true, "implement": true, "orchestrate": true, "goal": true}
+var knownRunKinds = map[string]bool{"ask": true, "review": true, "implement": true, "produce": true, "orchestrate": true, "goal": true}
 
 func parseRunKindAgent(rootID string, root db.Job) (kind, agent string) {
 	parts := strings.Split(strings.TrimSpace(rootID), "-")

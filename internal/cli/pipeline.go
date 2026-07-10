@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -193,6 +194,9 @@ func runPipelineAdd(args []string, stdout, stderr io.Writer) int {
 	runnerName := pipelineRunnerAgentName(spec.Name)
 	var finalEnabled bool
 	if err := withStore(*home, func(store *db.Store) error {
+		if err := validatePipelineProducePaths(context.Background(), store, *home, spec); err != nil {
+			return err
+		}
 		// Refuse to clobber a real managed agent that happens to occupy the runner
 		// name: a pre-existing non-shell agent by that name is a naming collision, not
 		// this pipeline's runner. A pre-existing shell agent (this pipeline's own
@@ -248,6 +252,108 @@ func runPipelineAdd(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// validatePipelineProducePaths resolves every declared produce write target at
+// add time and rejects overlap in either direction with Gitmoot-owned state or a
+// managed checkout. Symlink resolution is applied to the deepest existing
+// ancestor so a not-yet-created final directory is still checked safely.
+func validatePipelineProducePaths(ctx context.Context, store *db.Store, homeFlag string, spec pipeline.Spec) error {
+	for _, stage := range spec.Stages {
+		if stage.Kind() != pipeline.StageKindAgentProduce {
+			continue
+		}
+		if _, err := canonicalizePipelineProducePaths(ctx, store, homeFlag, fmt.Sprintf("stage %q", stage.ID), stage.Writes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// canonicalizePipelineProducePaths is the single filesystem safety check used
+// both at pipeline-add time and immediately before a produce delivery. It returns
+// resolved canonical targets so the runtime grant cannot follow a symlink that
+// changed after validation.
+func canonicalizePipelineProducePaths(ctx context.Context, store *db.Store, homeFlag, subject string, writes []string) ([]string, error) {
+	if store == nil {
+		return nil, errors.New("produce path validation requires a store")
+	}
+	paths, err := pathsFromFlag(homeFlag)
+	if err != nil {
+		return nil, err
+	}
+	protected := []struct {
+		label string
+		path  string
+	}{{label: "gitmoot home", path: paths.Home}}
+	repos, err := store.ListRepos(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, repo := range repos {
+		if strings.TrimSpace(repo.CheckoutPath) != "" {
+			protected = append(protected, struct {
+				label string
+				path  string
+			}{label: "managed checkout " + repo.Owner + "/" + repo.Name, path: repo.CheckoutPath})
+		}
+	}
+	resolvedWrites := make([]string, 0, len(writes))
+	for _, declared := range writes {
+		resolved, err := resolveProduceSafetyPath(declared)
+		if err != nil {
+			return nil, fmt.Errorf("%s writes path %q: %w", subject, declared, err)
+		}
+		if resolved == string(filepath.Separator) {
+			return nil, fmt.Errorf("%s writes path %q resolves to filesystem root, which is not allowed", subject, declared)
+		}
+		for _, item := range protected {
+			protectedPath, err := resolveProduceSafetyPath(item.path)
+			if err != nil {
+				return nil, fmt.Errorf("resolve %s %q: %w", item.label, item.path, err)
+			}
+			if pathsOverlap(resolved, protectedPath) {
+				return nil, fmt.Errorf("%s writes path %q resolves to %q and overlaps %s %q", subject, declared, resolved, item.label, protectedPath)
+			}
+		}
+		resolvedWrites = append(resolvedWrites, resolved)
+	}
+	return resolvedWrites, nil
+}
+
+func resolveProduceSafetyPath(path string) (string, error) {
+	path = filepath.Clean(path)
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("path must be absolute")
+	}
+	probe := path
+	var suffix []string
+	for {
+		resolved, err := filepath.EvalSymlinks(probe)
+		if err == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return "", err
+		}
+		suffix = append(suffix, filepath.Base(probe))
+		probe = parent
+	}
+}
+
+func pathsOverlap(left, right string) bool {
+	contains := func(parent, child string) bool {
+		rel, err := filepath.Rel(parent, child)
+		return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	}
+	return contains(left, right) || contains(right, left)
+}
+
 // pipelineRunnerAgent builds the hidden shell agent that owns a pipeline's stage
 // jobs. The stage command travels per-job (via the stage job's runtime-override
 // ref), NOT on this agent's runtime_ref, so one runner serves every stage. It is
@@ -276,6 +382,11 @@ type pipelineStageJSON struct {
 	Timeout          string   `json:"timeout,omitempty"`
 	Retry            int      `json:"retry,omitempty"`
 	SuccessDecisions []string `json:"success_decisions,omitempty"`
+	Write            bool     `json:"write,omitempty"`
+	Writes           []string `json:"writes,omitempty"`
+	Network          bool     `json:"network,omitempty"`
+	Check            string   `json:"check,omitempty"`
+	CheckRetries     *int     `json:"check_retries,omitempty"`
 }
 
 type pipelineJSON struct {
@@ -516,6 +627,11 @@ func pipelineToJSON(record db.Pipeline, withStages bool) pipelineJSON {
 					Timeout:          stage.Timeout,
 					Retry:            stage.Retry,
 					SuccessDecisions: stage.SuccessDecisions,
+					Write:            stage.Write,
+					Writes:           stage.Writes,
+					Network:          stage.Network,
+					Check:            stage.Check,
+					CheckRetries:     stage.CheckRetries,
 				})
 			}
 		}
@@ -648,6 +764,13 @@ type pipelineRunView struct {
 	stages      []db.PipelineRunStage
 	progress    map[string]db.JobEvent
 	orchestrate map[string]bool
+	tokens      int
+	stageTokens map[string]pipelineStageTokens
+}
+
+type pipelineStageTokens struct {
+	input  int
+	output int
 }
 
 // loadPipelineRunView loads a run and its stages, ordered for display. A missing
@@ -680,7 +803,44 @@ func loadPipelineRunView(ctx context.Context, store *db.Store, id string) (pipel
 			}
 		}
 	}
-	return pipelineRunView{run: run, stages: stages, progress: progress, orchestrate: orchestrate}, true, nil
+	stageTokens := make(map[string]pipelineStageTokens, len(stages))
+	for _, stage := range stages {
+		if strings.TrimSpace(stage.JobID) == "" {
+			continue
+		}
+		if job, getErr := store.GetJob(ctx, stage.JobID); getErr == nil {
+			stageTokens[stage.StageID] = pipelineStageTokens{input: job.InputTokens, output: job.OutputTokens}
+		}
+	}
+	tokens, err := sumPipelineRunTokens(ctx, store, run.ID, stages, orchestrate)
+	if err != nil {
+		return pipelineRunView{}, false, err
+	}
+	return pipelineRunView{run: run, stages: stages, progress: progress, orchestrate: orchestrate, tokens: tokens, stageTokens: stageTokens}, true, nil
+}
+
+// sumPipelineRunTokens combines the run-rooted jobs (every ordinary stage) with
+// each orchestrate attempt's self-rooted coordination tree. The sets are disjoint:
+// pipelineStageJobRequest deliberately self-roots orchestrate stages, while every
+// other stage uses runID, so this cannot double-count.
+func sumPipelineRunTokens(ctx context.Context, store *db.Store, runID string, stages []db.PipelineRunStage, orchestrate map[string]bool) (int, error) {
+	total, err := store.SumJobTokensByRoot(ctx, runID)
+	if err != nil {
+		return 0, err
+	}
+	for _, stage := range stages {
+		if !orchestrate[stage.StageID] || strings.TrimSpace(stage.JobID) == "" {
+			continue
+		}
+		for attempt := 0; attempt <= stage.Attempt; attempt++ {
+			stageTotal, err := store.SumJobTokensByRoot(ctx, pipelineStageJobID(runID, stage.StageID, attempt))
+			if err != nil {
+				return 0, err
+			}
+			total += stageTotal
+		}
+	}
+	return total, nil
 }
 
 // orderPipelineRunStages reorders stage rows into spec (topological) order when the
@@ -732,6 +892,7 @@ func printPipelineRunFunnelAt(stdout io.Writer, view pipelineRunView, now time.T
 	writeLine(stdout, "state: %s", run.State)
 	writeLine(stdout, "started: %s", heartbeatTimeForStatus(run.StartedAt))
 	writeLine(stdout, "finished: %s", heartbeatTimeForStatus(run.FinishedAt))
+	writeLine(stdout, "tokens: %d (best-effort)", view.tokens)
 	if strings.TrimSpace(run.HaltStage) != "" {
 		writeLine(stdout, "halt_stage: %s", run.HaltStage)
 	}
@@ -851,15 +1012,17 @@ func haltStageJobID(view pipelineRunView) string {
 }
 
 type pipelineRunStageJSON struct {
-	ID         string                        `json:"id"`
-	State      string                        `json:"state"`
-	JobID      string                        `json:"job_id,omitempty"`
-	Attempt    int                           `json:"attempt,omitempty"`
-	Needs      []string                      `json:"needs,omitempty"`
-	Summary    string                        `json:"summary,omitempty"`
-	StartedAt  string                        `json:"started_at,omitempty"`
-	FinishedAt string                        `json:"finished_at,omitempty"`
-	Progress   *pipelineRunStageProgressJSON `json:"progress,omitempty"`
+	ID           string                        `json:"id"`
+	State        string                        `json:"state"`
+	JobID        string                        `json:"job_id,omitempty"`
+	Attempt      int                           `json:"attempt,omitempty"`
+	Needs        []string                      `json:"needs,omitempty"`
+	Summary      string                        `json:"summary,omitempty"`
+	StartedAt    string                        `json:"started_at,omitempty"`
+	FinishedAt   string                        `json:"finished_at,omitempty"`
+	Progress     *pipelineRunStageProgressJSON `json:"progress,omitempty"`
+	InputTokens  *int                          `json:"input_tokens,omitempty"`
+	OutputTokens *int                          `json:"output_tokens,omitempty"`
 }
 
 // The external gitmoot-dashboard repo can already derive elapsed time from
@@ -885,6 +1048,7 @@ type pipelineRunJSON struct {
 	FinishedAt string                 `json:"finished_at,omitempty"`
 	Funnel     string                 `json:"funnel"`
 	Stages     []pipelineRunStageJSON `json:"stages,omitempty"`
+	Tokens     int                    `json:"tokens"`
 }
 
 // pipelineRunToJSON projects a run view into its script-stable JSON shape.
@@ -902,6 +1066,7 @@ func pipelineRunToJSON(view pipelineRunView) pipelineRunJSON {
 		StartedAt:  pipelineRunTimeJSON(run.StartedAt),
 		FinishedAt: pipelineRunTimeJSON(run.FinishedAt),
 		Funnel:     pipelineFunnelLine(view.stages),
+		Tokens:     view.tokens,
 	}
 	for _, stage := range view.stages {
 		stageJSON := pipelineRunStageJSON{
@@ -913,6 +1078,10 @@ func pipelineRunToJSON(view pipelineRunView) pipelineRunJSON {
 			Summary:    stage.Summary,
 			StartedAt:  pipelineRunTimeJSON(stage.StartedAt),
 			FinishedAt: pipelineRunTimeJSON(stage.FinishedAt),
+		}
+		if usage, ok := view.stageTokens[stage.StageID]; ok {
+			stageJSON.InputTokens = &usage.input
+			stageJSON.OutputTokens = &usage.output
 		}
 		if event, ok := view.progress[stage.JobID]; ok {
 			if progress, valid := decodePipelineProgress(event.Message); valid {

@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -27,6 +28,8 @@ func (s *Spec) normalize() {
 		s.Stages[i].Gate = strings.TrimSpace(s.Stages[i].Gate)
 		s.Stages[i].Source = strings.TrimSpace(s.Stages[i].Source)
 		s.Stages[i].Timeout = strings.TrimSpace(s.Stages[i].Timeout)
+		s.Stages[i].Check = strings.TrimSpace(s.Stages[i].Check)
+		s.Stages[i].Writes = trimAll(s.Stages[i].Writes)
 		s.Stages[i].Needs = trimAll(s.Stages[i].Needs)
 		s.Stages[i].SuccessDecisions = trimAll(s.Stages[i].SuccessDecisions)
 		// An agent stage defaults to the read-only "ask" verb when action is unset.
@@ -282,6 +285,8 @@ func validateStageExecutor(pipelineName string, stage Stage) error {
 		return validateOrchestrateStage(pipelineName, stage)
 	case StageKindAgentImplement:
 		return validateImplementStage(pipelineName, stage)
+	case StageKindAgentProduce:
+		return validateProduceStage(pipelineName, stage)
 	case StageKindGate:
 		return validateGateStage(pipelineName, stage)
 	default:
@@ -363,6 +368,38 @@ func validateImplementStage(pipelineName string, stage Stage) error {
 	return nil
 }
 
+// validateProduceStage validates the pure spec half of a Codex data-producing
+// stage. Filesystem overlap and symlink checks require store/home context and run
+// separately at `pipeline add` preflight.
+func validateProduceStage(pipelineName string, stage Stage) error {
+	if !validToken(stage.Agent) {
+		return fmt.Errorf("pipeline %q stage %q agent %q must be a name-safe token (letters, digits, '-', '_')", pipelineName, stage.ID, stage.Agent)
+	}
+	if stage.Prompt == "" {
+		return fmt.Errorf("pipeline %q stage %q produce stage requires a non-empty prompt", pipelineName, stage.ID)
+	}
+	if len(stage.Writes) == 0 {
+		return fmt.Errorf("pipeline %q stage %q produce stage requires at least one writes path", pipelineName, stage.ID)
+	}
+	for _, path := range stage.Writes {
+		if !filepath.IsAbs(path) {
+			return fmt.Errorf("pipeline %q stage %q writes path %q must be absolute", pipelineName, stage.ID, path)
+		}
+		if filepath.Clean(path) != path {
+			return fmt.Errorf("pipeline %q stage %q writes path %q must be cleaned (use %q)", pipelineName, stage.ID, path, filepath.Clean(path))
+		}
+	}
+	if stage.CheckRetries != nil {
+		if *stage.CheckRetries < 0 {
+			return fmt.Errorf("pipeline %q stage %q check_retries must be >= 0", pipelineName, stage.ID)
+		}
+		if stage.Check == "" {
+			return fmt.Errorf("pipeline %q stage %q sets check_retries without a check command", pipelineName, stage.ID)
+		}
+	}
+	return nil
+}
+
 // validateGateStage validates a JOBLESS GATE stage (#768 Phase 2): a recognized
 // predicate token (only pr_merged today) plus a Source that names an upstream stage
 // this gate depends on. Requiring Source to be one of the gate's own Needs is what
@@ -407,14 +444,30 @@ func validateGateStage(pipelineName string, stage Stage) error {
 // write: true on a NON-implement stage, which Kind() classifies as its base kind.
 func (s Spec) validateMutatingStage(stage Stage) error {
 	isImplement := stage.Agent != "" && stage.Action == "implement"
-	if stage.Write && !isImplement {
-		return fmt.Errorf("pipeline %q stage %q sets write: true but is not a mutating implement stage; write: true is only valid with action: implement", s.Name, stage.ID)
+	isProduce := stage.Agent != "" && stage.Action == "produce"
+	isMutating := isImplement || isProduce
+	if stage.Write && !isMutating {
+		return fmt.Errorf("pipeline %q stage %q sets write: true but is not a mutating stage; write: true is only valid with action: implement or action: produce", s.Name, stage.ID)
 	}
-	if isImplement && !stage.Write {
-		return fmt.Errorf("pipeline %q stage %q sets action \"implement\" without write: true; a mutating implement stage must acknowledge writes with write: true", s.Name, stage.ID)
+	if isMutating && !stage.Write {
+		return fmt.Errorf("pipeline %q stage %q sets action %q without write: true; a mutating stage must acknowledge writes with write: true", s.Name, stage.ID, stage.Action)
 	}
-	if isImplement && s.Schedule != nil && !s.AllowScheduledWrites {
-		return fmt.Errorf("pipeline %q stage %q is a mutating implement stage on a scheduled pipeline; set allow_scheduled_writes: true to permit unattended writes", s.Name, stage.ID)
+	if isMutating && s.Schedule != nil && !s.AllowScheduledWrites {
+		return fmt.Errorf("pipeline %q stage %q is a mutating %s stage on a scheduled pipeline; set allow_scheduled_writes: true to permit unattended writes", s.Name, stage.ID, stage.Action)
+	}
+	if !isProduce {
+		if len(stage.Writes) > 0 {
+			return fmt.Errorf("pipeline %q stage %q sets writes but is not an action: produce stage", s.Name, stage.ID)
+		}
+		if stage.Network {
+			return fmt.Errorf("pipeline %q stage %q sets network: true but is not an action: produce stage", s.Name, stage.ID)
+		}
+		if stage.Check != "" {
+			return fmt.Errorf("pipeline %q stage %q sets check but is not an action: produce stage", s.Name, stage.ID)
+		}
+		if stage.CheckRetries != nil {
+			return fmt.Errorf("pipeline %q stage %q sets check_retries but is not an action: produce stage", s.Name, stage.ID)
+		}
 	}
 	return nil
 }

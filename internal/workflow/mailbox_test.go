@@ -3,9 +3,13 @@ package workflow
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/agenttemplate"
 	"github.com/jerryfane/gitmoot/internal/db"
@@ -49,6 +53,154 @@ func TestMailboxEnqueueCreatesQueuedJobAndEvent(t *testing.T) {
 	}
 	if len(events) != 1 || events[0].Kind != "queued" {
 		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestMailboxProduceCheckRetriesSameSessionAndRecordsTokens(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	dir := t.TempDir()
+	mailbox := Mailbox{Store: store}
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID: "produce-1", Agent: "producer", Action: "produce", Repo: "owner/repo",
+		Sender: PipelineJobSender, WorktreePath: dir, WritablePaths: []string{dir}, Check: "test -s artifact.json || { echo ghp_abcdefghijklmnopqrstuvwxyz0123456789; exit 1; }", CheckRetries: 1,
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	deliveries := 0
+	adapter := &fakeDelivery{
+		outputs: []string{
+			`{"gitmoot_result":{"decision":"implemented","summary":"first","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+			`{"gitmoot_result":{"decision":"implemented","summary":"fixed","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		},
+		refreshedRefs: []string{"session-produce"},
+		inputTokens:   []int{10, 20},
+		outputTokens:  []int{2, 3},
+		onDeliver: func() {
+			deliveries++
+			if deliveries == 2 {
+				if err := os.WriteFile(filepath.Join(dir, "artifact.json"), []byte("{}"), 0o600); err != nil {
+					t.Fatalf("write artifact: %v", err)
+				}
+			}
+		},
+	}
+	result, err := mailbox.Run(ctx, "produce-1", runtime.Agent{Name: "producer", Runtime: runtime.CodexRuntime, RuntimeRef: "fresh:produce"}, adapter)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Summary != "fixed" || len(adapter.prompts) != 2 {
+		t.Fatalf("result/prompts = %+v / %d", result, len(adapter.prompts))
+	}
+	if !strings.Contains(adapter.prompts[1], "failed the deterministic check") || adapter.agentRefs[1] != "session-produce" {
+		t.Fatalf("correction prompt/ref = %q / %q", adapter.prompts[1], adapter.agentRefs[1])
+	}
+	if strings.Contains(adapter.prompts[1], "ghp_abcdefghijklmnopqrstuvwxyz0123456789") || !strings.Contains(adapter.prompts[1], "[REDACTED]") {
+		t.Fatalf("correction prompt was not redacted: %q", adapter.prompts[1])
+	}
+	job, err := store.GetJob(ctx, "produce-1")
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if job.InputTokens != 30 || job.OutputTokens != 5 {
+		t.Fatalf("tokens = %d/%d, want 30/5", job.InputTokens, job.OutputTokens)
+	}
+}
+
+func TestMailboxProduceCheckExhaustionFails(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+	dir := t.TempDir()
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "produce-fail", Agent: "producer", Action: "produce", Repo: "owner/repo", Sender: PipelineJobSender, WorktreePath: dir, WritablePaths: []string{dir}, Check: "echo nope >&2; exit 1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	adapter := &fakeDelivery{outputs: []string{`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}}
+	if _, err := mailbox.Run(ctx, "produce-fail", runtime.Agent{Name: "producer", Runtime: runtime.CodexRuntime}, adapter); err == nil {
+		t.Fatal("Run succeeded despite exhausted check")
+	}
+	job, _ := store.GetJob(ctx, "produce-fail")
+	payload, _ := ParseJobPayload(job.Payload)
+	if job.State != string(JobFailed) || payload.Result == nil || payload.Result.Decision != "failed" || len(adapter.prompts) != 1 {
+		t.Fatalf("exhausted job = %+v payload=%+v prompts=%d", job, payload.Result, len(adapter.prompts))
+	}
+}
+
+func TestProduceCheckOutputIsRedactedAndCapped(t *testing.T) {
+	secret := "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+	got := sanitizeProduceCheckOutput(secret + strings.Repeat("x", 3*maxProduceCheckOutputBytes))
+	if len(got) > maxProduceCheckOutputBytes {
+		t.Fatalf("output len = %d, want <= %d", len(got), maxProduceCheckOutputBytes)
+	}
+	if strings.Contains(got, secret) {
+		t.Fatalf("output leaked secret: %q", got)
+	}
+}
+
+func TestProduceCheckGroupKillsChildOnTimeout(t *testing.T) {
+	dir := t.TempDir()
+	started := time.Now()
+	_, err := runProduceCheck(context.Background(), JobPayload{
+		WorktreePath: dir,
+		Check:        "sleep 30 & child=$!; echo $child > child.pid; wait $child",
+	}, "", 100*time.Millisecond)
+	if err == nil {
+		t.Fatal("runProduceCheck succeeded despite timeout")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("runProduceCheck returned after %s, want prompt group teardown", elapsed)
+	}
+	rawPID, readErr := os.ReadFile(filepath.Join(dir, "child.pid"))
+	if readErr != nil {
+		t.Fatalf("read child pid: %v", readErr)
+	}
+	pid, parseErr := strconv.Atoi(strings.TrimSpace(string(rawPID)))
+	if parseErr != nil {
+		t.Fatalf("parse child pid: %v", parseErr)
+	}
+	defer syscall.Kill(pid, syscall.SIGKILL)
+	deadline := time.Now().Add(time.Second)
+	for {
+		err := syscall.Kill(pid, 0)
+		if err == syscall.ESRCH {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("check child pid %d still exists after group cancellation (kill probe: %v)", pid, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestMailboxRejectsProduceOutsidePipelineSender(t *testing.T) {
+	mailbox := Mailbox{Store: openTestStore(t)}
+	_, err := mailbox.Enqueue(context.Background(), JobRequest{ID: "bad-produce", Agent: "p", Action: "produce", Repo: "owner/repo", Sender: "user"})
+	if err == nil || !strings.Contains(err.Error(), "reserved for pipeline stages") {
+		t.Fatalf("Enqueue error = %v", err)
+	}
+}
+
+func TestMailboxRejectsProduceGrantsOnNonProduceRequests(t *testing.T) {
+	mailbox := Mailbox{Store: openTestStore(t)}
+	cases := []struct {
+		name string
+		req  JobRequest
+		want string
+	}{
+		{"paths", JobRequest{WritablePaths: []string{"/data"}}, "writable_paths"},
+		{"network", JobRequest{Network: true}, "network access"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.req.ID = "bad-" + tc.name
+			tc.req.Agent = "a"
+			tc.req.Action = "ask"
+			tc.req.Repo = "owner/repo"
+			_, err := mailbox.Enqueue(context.Background(), tc.req)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Enqueue error = %v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 
@@ -134,7 +286,7 @@ func TestMailboxEnqueuePersistsEphemeralSpec(t *testing.T) {
 // "same-boot" to the current boot (never requeued) but "foreign" to a different
 // boot id (requeued) — which can only hold if claim recorded a concrete, non-empty
 // runner_boot_id. On the unpatched claim (plain TransitionJobStateWithEvent)
-// runner_boot_id stays '' and the foreign-boot requeue matches nothing, so this
+// runner_boot_id stays empty and the foreign-boot requeue matches nothing, so this
 // test fails without the fix.
 func TestMailboxClaimStampsRunnerBootID(t *testing.T) {
 	if db.BootID() == "" {

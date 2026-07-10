@@ -84,6 +84,11 @@ type Agent struct {
 	// marshaled to the wire. Empty means "fall back to RepoScope" (unchanged
 	// legacy behavior for callers that never set it).
 	WorkingDir string
+	// WritablePaths are additive Codex workspace-write grants for an action:
+	// produce pipeline stage. They never replace Codex's default writable roots.
+	WritablePaths []string
+	// ProduceNetwork opts that produce delivery into workspace-write network access.
+	ProduceNetwork bool
 }
 
 type Job struct {
@@ -666,7 +671,7 @@ func (a CodexAdapter) Health(ctx context.Context, agent Agent) error {
 }
 
 func (a CodexAdapter) Capabilities(context.Context) ([]string, error) {
-	return []string{"review", "implement", "ask"}, nil
+	return []string{"review", "implement", "ask", "produce"}, nil
 }
 
 func (a CodexAdapter) runner() subprocess.Runner {
@@ -763,12 +768,38 @@ func codexSandboxArgs(agent Agent, workdir string) []string {
 		if gitdir := linkedWorktreeGitDir(workdir); gitdir != "" {
 			args = append(args, "--add-dir", gitdir)
 		}
+		for _, path := range agent.WritablePaths {
+			if path = strings.TrimSpace(path); path != "" {
+				args = append(args, "--add-dir", path)
+			}
+		}
+		if agent.ProduceNetwork {
+			args = append(args, "-c", "sandbox_workspace_write.network_access=true")
+		}
 		return args
 	case AutonomyPolicyDangerFullAccess:
+		// Full access is already unrestricted. Produce-only workspace grants and
+		// network configuration must not leak into this policy's argv.
 		return []string{"--sandbox", "danger-full-access"}
 	default:
 		return nil
 	}
+}
+
+// ProduceDispatchError enforces the produce MVP at the dispatch boundary.
+// Produce is Codex-only until the separate OS-level sandbox follow-up lands, and
+// a non-writable policy is refused rather than silently producing no data.
+func ProduceDispatchError(action string, agent Agent) error {
+	if strings.TrimSpace(action) != "produce" {
+		return nil
+	}
+	if agent.Runtime != CodexRuntime {
+		return fmt.Errorf("produce stages require the codex runtime; agent %q uses runtime %q", agent.Name, agent.Runtime)
+	}
+	if !PolicyGrantsImplementWrite(agent.AutonomyPolicy) {
+		return fmt.Errorf("produce stages require a writable autonomy policy; agent %q uses %q", agent.Name, NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy))
+	}
+	return nil
 }
 
 // linkedWorktreeGitDir resolves the per-worktree git metadata directory of a

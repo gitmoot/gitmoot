@@ -236,7 +236,7 @@ func manualRetryShouldClearReadOnlyWorktree(job db.Job, payload JobPayload) bool
 		return false
 	}
 	switch strings.TrimSpace(job.Type) {
-	case "ask", "review":
+	case "ask", "review", "produce":
 		return true
 	default:
 		return false

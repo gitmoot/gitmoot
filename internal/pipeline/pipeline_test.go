@@ -416,6 +416,7 @@ func TestPipelineStageKind(t *testing.T) {
 		{"neither executor", Stage{ID: "a"}, StageKindUnknown},
 		{"agent implement", Stage{ID: "a", Agent: "impl", Prompt: "q", Action: "implement", Write: true}, StageKindAgentImplement},
 		{"agent implement no write still a kind", Stage{ID: "a", Agent: "impl", Prompt: "q", Action: "implement"}, StageKindAgentImplement},
+		{"agent produce", Stage{ID: "a", Agent: "producer", Prompt: "q", Action: "produce", Write: true, Writes: []string{"/data"}}, StageKindAgentProduce},
 		{"agent bad action", Stage{ID: "a", Agent: "x", Prompt: "q", Action: "deploy"}, StageKindUnknown},
 		// #758: orchestrate:true on an agent stage classifies as StageKindOrchestrate,
 		// checked BEFORE the plain agent action switch (so an orchestrate stage is
@@ -433,6 +434,54 @@ func TestPipelineStageKind(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.stage.Kind(); got != tc.want {
 				t.Fatalf("Kind() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProduceStageValidation(t *testing.T) {
+	valid := `name: produce
+repo: owner/repo
+stages:
+  - id: export
+    agent: worker
+    action: produce
+    prompt: Write the export.
+    write: true
+    writes: [/var/lib/example-data]
+    network: true
+    check: test -s /var/lib/example-data/out.json
+    check_retries: 2
+`
+	loaded, err := Load([]byte(valid))
+	if err != nil {
+		t.Fatalf("Load valid produce stage: %v", err)
+	}
+	if loaded.Stages[0].Kind() != StageKindAgentProduce || loaded.Stages[0].CheckRetries == nil || *loaded.Stages[0].CheckRetries != 2 {
+		t.Fatalf("produce stage did not round-trip: %+v", loaded.Stages[0])
+	}
+
+	cases := []struct {
+		name string
+		spec string
+		want string
+	}{
+		{"requires write", "name: p\nstages:\n- {id: a, agent: w, action: produce, prompt: x, writes: [/data]}\n", "without write: true"},
+		{"requires writes", "name: p\nstages:\n- {id: a, agent: w, action: produce, prompt: x, write: true}\n", "requires at least one writes path"},
+		{"absolute writes", "name: p\nstages:\n- {id: a, agent: w, action: produce, prompt: x, write: true, writes: [data]}\n", "must be absolute"},
+		{"clean writes", "name: p\nstages:\n- {id: a, agent: w, action: produce, prompt: x, write: true, writes: [/data/../out]}\n", "must be cleaned"},
+		{"writes elsewhere", "name: p\nstages:\n- {id: a, cmd: echo, writes: [/data]}\n", "sets writes"},
+		{"network elsewhere", "name: p\nstages:\n- {id: a, agent: w, prompt: x, network: true}\n", "sets network: true"},
+		{"check elsewhere", "name: p\nstages:\n- {id: a, agent: w, prompt: x, check: true}\n", "sets check"},
+		{"check retries elsewhere", "name: p\nstages:\n- {id: a, agent: w, prompt: x, check_retries: 0}\n", "sets check_retries"},
+		{"negative check retries", "name: p\nstages:\n- {id: a, agent: w, action: produce, prompt: x, write: true, writes: [/data], check: true, check_retries: -1}\n", "check_retries must be >= 0"},
+		{"scheduled gate", "name: p\nschedule: {interval: 1h}\nstages:\n- {id: a, agent: w, action: produce, prompt: x, write: true, writes: [/data]}\n", "allow_scheduled_writes: true"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load([]byte(tc.spec))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Load error = %v, want substring %q", err, tc.want)
 			}
 		})
 	}

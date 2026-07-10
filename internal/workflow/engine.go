@@ -21,7 +21,10 @@ import (
 )
 
 type Engine struct {
-	Store                   *db.Store
+	Store *db.Store
+	// ProduceCheckDir is the resolved checkout cwd for trusted produce-stage
+	// deterministic checks when no disposable worktree path is present.
+	ProduceCheckDir         string
 	RequiredReviewers       []string
 	MergeGate               MergeGate
 	JobID                   func(JobRequest) string
@@ -473,7 +476,7 @@ func (e Engine) now() time.Time {
 // path is byte-identical. The hook maps the terminal JobState to the event_type,
 // resolves root_id from the payload, and ships a redacted event fire-and-forget.
 func (e Engine) mailbox() Mailbox {
-	mb := Mailbox{Store: e.Store, CanaryEnabled: e.CanaryEnabled, deferBlocker: e.BlockerDeferrer, RuntimeDefaultModel: e.RuntimeDefaultModel, RuntimeDefaultEffort: e.RuntimeDefaultEffort, routerContextEnabled: e.RouterContextEnabled, resultCheckMode: normalizeResultCheckMode(e.ResultCheckMode)}
+	mb := Mailbox{Store: e.Store, CanaryEnabled: e.CanaryEnabled, deferBlocker: e.BlockerDeferrer, RuntimeDefaultModel: e.RuntimeDefaultModel, RuntimeDefaultEffort: e.RuntimeDefaultEffort, routerContextEnabled: e.RouterContextEnabled, resultCheckMode: normalizeResultCheckMode(e.ResultCheckMode), produceCheckDir: e.ProduceCheckDir}
 	// Wire the off-by-default memory hooks (#626). When e.Memory is nil (every
 	// non-enrolled path) both hooks stay nil, so Run's prompt assembly and terminal
 	// path are byte-identical. The hooks themselves also no-op when the executor
@@ -5260,6 +5263,7 @@ func (e Engine) ensureJobExecutorAllowed(ctx context.Context, job db.Job, payloa
 		Agent:        authorizationAgent,
 		Action:       job.Type,
 		Repo:         payload.Repo,
+		Sender:       payload.Sender,
 		Branch:       payload.Branch,
 		DelegationID: payload.DelegationID,
 		// Carry the worker spec so an ephemeral child's executor check inherits the
@@ -5300,6 +5304,14 @@ func (e Engine) ensureAgentAllowedWithBranchOwner(ctx context.Context, request J
 	}
 	if !contains(agent.Capabilities, request.Action) && !allowMissingCapability {
 		return e.block(ctx, ref, fmt.Sprintf("agent %q lacks %q capability", agent.Name, request.Action))
+	}
+	if request.Action == "produce" {
+		if request.Sender != PipelineJobSender {
+			return e.block(ctx, ref, "job action produce is reserved for pipeline stages")
+		}
+		if err := runtime.ProduceDispatchError(request.Action, runtime.Agent{Name: agent.Name, Runtime: agent.Runtime, AutonomyPolicy: agent.AutonomyPolicy}); err != nil {
+			return e.block(ctx, ref, err.Error())
+		}
 	}
 	if request.Action == "implement" {
 		// Fail-closed: an implement job whose agent grants no headless write

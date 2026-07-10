@@ -2067,10 +2067,11 @@ carry leaf cluster ids, while parent hubs remain an aggregate view only.
 
 ## Pipelines
 
-A pipeline (#681) runs a **declared DAG of shell stages** — a fixed, repeatable
-multi-step flow — on demand or on an interval schedule. Each stage is an ordinary
-queued job run through the **shell runtime**: the normal worker tick claims and
-runs it, and a scan-based advancer folds each stage's `gitmoot_result` **decision**
+A pipeline (#681) runs a **declared DAG of shell and managed-agent stages** — a
+fixed, repeatable multi-step flow — on demand or on an interval schedule. Each
+stage is an ordinary queued job: shell commands use the shell runtime, while agent
+stages use their registered runtime. The normal worker tick claims and runs it,
+and a scan-based advancer folds each stage's `gitmoot_result` **decision**
 and enqueues the stages whose `needs` have all succeeded. Pipelines reuse the job
 queue, the result contract, and the heartbeat scheduling idiom (durable `next_due`,
 overlap guard, missed-ticks-coalesce). They are **off by default** (no pipelines ⇒
@@ -2136,6 +2137,19 @@ its `needs` stages' result summaries are prepended to the prompt, and a repo-bou
 agent stage runs in its own detached read-only worktree so same-repo agent stages
 parallelize without touching the live checkout.
 
+`action: produce` (#814) is a Codex-only pipeline leaf for writing operator-owned
+data, never repo/branch/task/PR state. It requires `write: true`, one or more absolute
+cleaned `writes:` paths, a `produce`-capable writable agent, and optionally
+`network: true`, `check: <cmd>`, and `check_retries: N`. `pipeline add` resolves
+symlinks and rejects targets overlapping `/`, the Gitmoot home, or a managed checkout.
+The worker repeats that same canonicalization immediately before delivery to close
+symlink-retargeting races. Declared paths are additive `--add-dir` grants: the
+workdir, `/tmp`, and `$TMPDIR` remain writable under Codex workspace-write. A
+danger-full-access agent receives no add-dir/network arguments because it is already
+unrestricted. Checks re-ask the same session with
+redacted/capped output; stage retries must reconcile partial data idempotently.
+Gitmoot cleans only the disposable cwd, never the declared data directories.
+
 An `action: review` stage may set `source: <implement-stage>` (also listed in its
 `needs`) to bind to that implement job's structured PR stamp. The review payload
 inherits the PR number, head SHA, branch, task, and lead agent; its detached worktree
@@ -2193,6 +2207,10 @@ event's real age and last sanitized activity line; the age continues increasing 
 the daemon dies. Orchestrate stages whose current coordinator has no fresh event
 show `(sub-tree running; no per-stage progress)`. JSON stage objects add
 `started_at`, `finished_at`, and an optional structured `progress` object.
+
+`pipeline show <run-id>` also reports best-effort total tokens; JSON carries run
+`tokens` plus per-stage `input_tokens` and `output_tokens` where captured. A zero
+can mean the runtime/session shape did not report usage.
 
 `pipeline resume` re-runs a **parked** (blocked/failed) run from its halted stage
 (or `--from <stage>`) plus its transitive dependents — bumping their attempt — while

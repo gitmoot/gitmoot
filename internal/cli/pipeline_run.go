@@ -51,12 +51,20 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 		// so they do not get the born-isolated #739 worktree that background asks do;
 		// the reactive pool-isolation would only kick in on contention and still
 		// leaves one seat on the live checkout. Allocating here closes that gap. The
-		// allocator is FAIL-OPEN (the #739 lesson): it waits at most
-		// ReadOnlyWorktreeDispatchLockWaitBudget for the checkout mutation lock, and
-		// any failure leaves the request unchanged (serialized on the shared checkout)
-		// rather than stalling the pipeline scan loop. Shell stages carry a
-		// RuntimeOverride and are excluded, so their request is byte-identical.
+		// The generic read-only allocator is FAIL-OPEN (the #739 lesson): it waits at
+		// most ReadOnlyWorktreeDispatchLockWaitBudget for the checkout mutation lock,
+		// and any failure leaves ask/review requests unchanged (serialized on the shared
+		// checkout) rather than stalling the pipeline scan loop. Produce is the explicit
+		// fail-closed exception below. Shell stages carry a RuntimeOverride and are
+		// excluded, so their request is byte-identical.
 		request, worktreePath, worktreeErr := allocatePipelineStageReadOnlyWorktree(ctx, store, home, request)
+		if strings.TrimSpace(request.Action) == "produce" && strings.TrimSpace(request.WorktreePath) == "" {
+			reason := "produce stage requires a disposable detached worktree; managed repo checkout is unavailable"
+			if worktreeErr != nil {
+				reason = fmt.Sprintf("produce stage requires a disposable detached worktree: %v", worktreeErr)
+			}
+			return createFailedPipelineProduceJob(ctx, store, request, reason)
+		}
 		// A source-bound review is pinned to the implement job's immutable PR head.
 		// Unlike a generic read-only stage, it must never fail open onto the shared
 		// checkout: that checkout may be on the default branch, which would review the
@@ -110,6 +118,38 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 	}
 }
 
+// createFailedPipelineProduceJob records a fail-closed produce allocation as a
+// real terminal stage job, including a loud event and result summary. The
+// advancer can therefore fold/retry it normally without ever exposing a queued
+// job whose cwd would resolve to the managed checkout.
+func createFailedPipelineProduceJob(ctx context.Context, store *db.Store, request workflow.JobRequest, reason string) (db.Job, error) {
+	payload := workflow.JobPayload{
+		Repo:          request.Repo,
+		Sender:        request.Sender,
+		Instructions:  request.Instructions,
+		RootJobID:     request.RootJobID,
+		JobTimeout:    request.JobTimeout,
+		Fingerprint:   request.Fingerprint,
+		WritablePaths: append([]string(nil), request.WritablePaths...),
+		Network:       request.Network,
+		Check:         request.Check,
+		CheckRetries:  request.CheckRetries,
+		Result:        &workflow.AgentResult{Decision: "failed", Summary: reason},
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return db.Job{}, err
+	}
+	job := db.Job{ID: request.ID, Agent: request.Agent, Type: request.Action, State: string(workflow.JobFailed), Payload: string(encoded)}
+	if err := store.CreateJobWithEvent(ctx, job, db.JobEvent{JobID: job.ID, Kind: "produce_worktree_failed", Message: reason}); err != nil {
+		if existing, getErr := store.GetJob(ctx, request.ID); getErr == nil {
+			return existing, nil
+		}
+		return db.Job{}, err
+	}
+	return job, nil
+}
+
 func pipelineStageSourceBoundReviewRequest(request workflow.JobRequest) bool {
 	return request.Sender == workflow.PipelineJobSender &&
 		strings.TrimSpace(request.Action) == "review" &&
@@ -133,7 +173,7 @@ func pipelineStageReadOnlyWorktreeEligible(request workflow.JobRequest) bool {
 		return false
 	}
 	switch strings.TrimSpace(request.Action) {
-	case "ask", "review":
+	case "ask", "review", "produce":
 	default:
 		return false
 	}
@@ -373,6 +413,14 @@ type pipelineStagePRBinding struct {
 }
 
 func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.PipelineRun, attempt int, upstreamContext string, binding pipelineStagePRBinding, skipNativeReviewFanout bool) workflow.JobRequest {
+	instructions := upstreamContext + stage.Prompt
+	if stage.Kind() == pipeline.StageKindAgentProduce && attempt > 0 {
+		instructions = "A previous attempt may have written partial data into your writable paths; reconcile/idempotently overwrite rather than duplicating.\n\n" + instructions
+	}
+	checkRetries := 0
+	if stage.CheckRetries != nil {
+		checkRetries = *stage.CheckRetries
+	}
 	// AGENT stage (#757): bind the job to the named managed agent and let IT run on
 	// its OWN registered runtime — no RuntimeOverride, so the agent's real
 	// claude/codex runtime and session are used. The runtime instruction is the
@@ -424,6 +472,23 @@ func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.Pipel
 			RootJobID:        id,
 			JobTimeout:       stage.Timeout,
 			OrchestrateStage: true,
+		}
+	}
+	if stage.Kind() == pipeline.StageKindAgentProduce {
+		return workflow.JobRequest{
+			ID:            pipelineStageJobID(run.ID, stage.ID, attempt),
+			Agent:         stage.Agent,
+			Action:        "produce",
+			Repo:          rec.Repo,
+			Sender:        workflow.PipelineJobSender,
+			Instructions:  instructions,
+			Fingerprint:   pipelineStageFingerprint(rec.Name, run.ID, stage.ID, attempt),
+			RootJobID:     run.ID,
+			JobTimeout:    stage.Timeout,
+			WritablePaths: append([]string(nil), stage.Writes...),
+			Network:       stage.Network,
+			Check:         stage.Check,
+			CheckRetries:  checkRetries,
 		}
 	}
 	// #768 MUTATING implement stage: bind to the named agent running its OWN runtime,
@@ -921,6 +986,25 @@ func advancePipelineRun(ctx context.Context, store *db.Store, enqueue pipelineSt
 		if err != nil {
 			return run, err
 		}
+		if stage.Kind() == pipeline.StageKindAgentProduce && workflow.IsSettledJobState(job.State) {
+			state, summary, needs := foldPipelineStageOutcome(spec.EffectiveSuccessDecisions(stage), job)
+			if state == pipeline.StageFailed && row.Attempt < stage.Retry {
+				row.Attempt++
+				row.State = pipeline.StagePending
+				row.Summary = summary
+			} else {
+				row.State = state
+				row.JobID = job.ID
+				row.Summary = summary
+				row.NeedsJSON = marshalPipelineNeeds(needs)
+				row.FinishedAt = now
+			}
+			if err := persistPipelineStage(ctx, store, byID[stage.ID], row); err != nil {
+				return run, err
+			}
+			byID[stage.ID] = row
+			continue
+		}
 		row.State = pipeline.StageQueued
 		row.JobID = job.ID
 		row.StartedAt = now
@@ -1093,35 +1177,38 @@ func stageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec 
 		// ctx-bounded, and fails OPEN (settled=false while the merge has not landed / the
 		// PR is not yet recorded); a genuine store error surfaces via err.
 		return gateStageSettleOutcome(ctx, deps, spec, stage, stageRow)
+	case pipeline.StageKindAgentProduce:
+		// A produce stage has no PR guard: once its leaf job is terminal it folds
+		// directly by gitmoot_result decision, just like a read-only agent stage.
+		return decisionStageSettleOutcome(ctx, deps, spec, stage, stageRow)
 	default:
 		// StageKindShell, StageKindAgentAsk, StageKindAgentReview (and the
 		// never-validated StageKindUnknown): a jobful stage that settles on its stage
 		// job reaching a terminal state; fold by decision. The JobID guard and the
 		// queued->running funnel reflect live HERE (not the shared advancer) so a
 		// future JOBLESS kind is reachable without moving them.
-		if strings.TrimSpace(stageRow.JobID) == "" {
-			// A jobful stage with no job yet: leave it in flight untouched —
-			// byte-identical to the pre-seam advancer's `if row.JobID == "" { continue }`.
-			return false, "", "", nil, nil, nil
-		}
-		job, err := deps.store.GetJob(ctx, stageRow.JobID)
-		if err != nil {
-			return false, "", "", nil, nil, err
-		}
-		if !workflow.IsSettledJobState(job.State) {
-			// Not terminal yet: reflect a queued->running transition so the funnel
-			// tracks the live job, but otherwise leave it in flight. Byte-identical to
-			// the advancer's former unsettled branch.
-			if job.State == string(workflow.JobRunning) && stageRow.State == pipeline.StageQueued {
-				next := stageRow
-				next.State = pipeline.StageRunning
-				return false, "", "", nil, &next, nil
-			}
-			return false, "", "", nil, nil, nil
-		}
-		state, summary, needs = foldPipelineStageOutcome(spec.EffectiveSuccessDecisions(stage), job)
-		return true, state, summary, needs, nil, nil
+		return decisionStageSettleOutcome(ctx, deps, spec, stage, stageRow)
 	}
+}
+
+func decisionStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec pipeline.Spec, stage pipeline.Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
+	if strings.TrimSpace(stageRow.JobID) == "" {
+		return false, "", "", nil, nil, nil
+	}
+	job, err := deps.store.GetJob(ctx, stageRow.JobID)
+	if err != nil {
+		return false, "", "", nil, nil, err
+	}
+	if !workflow.IsSettledJobState(job.State) {
+		if job.State == string(workflow.JobRunning) && stageRow.State == pipeline.StageQueued {
+			next := stageRow
+			next.State = pipeline.StageRunning
+			return false, "", "", nil, &next, nil
+		}
+		return false, "", "", nil, nil, nil
+	}
+	state, summary, needs = foldPipelineStageOutcome(spec.EffectiveSuccessDecisions(stage), job)
+	return true, state, summary, needs, nil, nil
 }
 
 // orchestrateStageSettleOutcome is the #758 SETTLE PREDICATE for an orchestrate

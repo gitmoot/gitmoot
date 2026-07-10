@@ -108,7 +108,7 @@ func TestApplyOverridesPartial(t *testing.T) {
 		t.Fatalf("Models = %v", codex.Models)
 	}
 	// Capabilities were NOT overridden — must keep the built-in value.
-	if !reflect.DeepEqual(codex.Capabilities, []string{"review", "implement", "ask"}) {
+	if !reflect.DeepEqual(codex.Capabilities, []string{"review", "implement", "ask", "produce"}) {
 		t.Fatalf("Capabilities changed unexpectedly: %v", codex.Capabilities)
 	}
 	// The built-in registry must be untouched (immutability).

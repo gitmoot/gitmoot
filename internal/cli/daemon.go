@@ -436,8 +436,9 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		mergeGate := newDaemonPolicyMergeGate(store, gh, checkout)
 		applyMergeGatePolicy(&mergeGate, *home, repo.FullName())
 		engine := workflow.Engine{
-			Store:     store,
-			MergeGate: mergeGate,
+			Store:           store,
+			ProduceCheckDir: checkout,
+			MergeGate:       mergeGate,
 			// Registry default model/effort fallbacks, home-aware and fail-open — see
 			// daemonWorkflowEngine. Empty by default => byte-identical.
 			RuntimeDefaultModel:  runtimeDefaultModelResolver(*home),
@@ -4628,7 +4629,7 @@ func runPoolJobRecovered(ctx context.Context, worker jobWorker, job db.Job) (err
 // (already keyed) or must not run detached without the finalize/merge wiring.
 func poolIsolationEligible(job db.Job, payload workflow.JobPayload) bool {
 	switch strings.TrimSpace(job.Type) {
-	case "ask", "review":
+	case "ask", "review", "produce":
 	default:
 		return false
 	}
@@ -5053,6 +5054,13 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if !overridden {
 		agent = scopeRegisteredFreshRefForJob(agent, job.ID)
 	}
+	if err := runtime.ProduceDispatchError(job.Type, agent); err != nil {
+		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobBlocked, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
+		return nil
+	}
 	if readOnlyImplementationBlocked(job.Type, agent) {
 		transitioned, err := markJobPermissionBlocked(ctx, w.Store, job.ID)
 		if err != nil {
@@ -5333,6 +5341,16 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		runCtx, cancel = context.WithTimeout(runCtx, jobTimeout)
 		defer cancel()
 	}
+	// This is the last filesystem authorization check before adapter delivery.
+	// Run it after checkout resolution and runtime-session admission so a symlink
+	// retargeted while the job waited cannot inherit stale grants.
+	if err := applyProduceRuntimeGrants(runCtx, w.Store, w.ConfigHome, job, payload, &agent); err != nil {
+		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
+		return nil
+	}
 	stopProgress := func() {}
 	if progressTracker != nil {
 		progressCtx, cancelProgress := context.WithCancel(runCtx)
@@ -5390,6 +5408,25 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	_ = w.postJobResultComment(ctx, job.ID, agent, checkout, nil)
 	writeLine(w.Stdout, "job %s completed", job.ID)
+	return nil
+}
+
+// applyProduceRuntimeGrants performs the final delivery-time path check and only
+// then copies produce-only grants onto the in-memory runtime agent. Non-produce
+// jobs remain byte-identical and can never inherit persisted produce fields.
+func applyProduceRuntimeGrants(ctx context.Context, store *db.Store, home string, job db.Job, payload workflow.JobPayload, agent *runtime.Agent) error {
+	if strings.TrimSpace(job.Type) != "produce" {
+		return nil
+	}
+	if agent == nil {
+		return errors.New("produce runtime agent is required")
+	}
+	resolved, err := canonicalizePipelineProducePaths(ctx, store, home, fmt.Sprintf("job %q", job.ID), payload.WritablePaths)
+	if err != nil {
+		return fmt.Errorf("produce writable path preflight failed: %w", err)
+	}
+	agent.WritablePaths = resolved
+	agent.ProduceNetwork = payload.Network
 	return nil
 }
 
@@ -6763,6 +6800,7 @@ var (
 func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, home string) workflow.Engine {
 	engine := workflow.Engine{
 		Store:                   store,
+		ProduceCheckDir:         checkout,
 		MergeGate:               daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout, Home: home},
 		ImplementationFinalizer: daemonImplementationFinalizer{Store: store, GitHub: gh, FallbackCheckout: checkout},
 		// escalate_human (#340): @-tag the human on the tree's PR/issue when a leg

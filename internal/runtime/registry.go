@@ -33,7 +33,8 @@ type RuntimeMetadata struct {
 	// so that invariant is explicit and testable rather than implied.
 	Dispatchable bool
 	// Capabilities are the job actions the runtime's adapter advertises. Every
-	// built-in advertises review/implement/ask today; the registry mirrors that.
+	// Codex additionally advertises produce; other runtimes remain
+	// review/implement/ask and are refused for produce at dispatch.
 	Capabilities []string
 	// DefaultModel is the runtime's configured default model, surfaced by
 	// `gitmoot runtime list` AND consulted at delivery (#652): when NEITHER the
@@ -129,7 +130,7 @@ func newBuiltinRegistry() Registry {
 		{
 			Name:         CodexRuntime,
 			Dispatchable: true,
-			Capabilities: []string{"review", "implement", "ask"},
+			Capabilities: []string{"review", "implement", "ask", "produce"},
 			UsageSource:  "codex `exec --json` turn.completed usage (session-cumulative on a resumed thread)",
 			Description:  "OpenAI Codex CLI (exec/resume, sandbox policy, session index)",
 		},
@@ -257,7 +258,7 @@ func (r Registry) ApplyOverrides(overrides []MetadataOverride) (Registry, error)
 // runtimeCapabilities is the closed set of job actions a runtime may advertise.
 // It matches the actions the dispatch layer understands; a config override that
 // names anything else is rejected so a typo cannot silently disable a capability.
-func runtimeCapabilities() []string { return []string{"review", "implement", "ask"} }
+func runtimeCapabilities() []string { return []string{"review", "implement", "ask", "produce"} }
 
 func validateRuntimeCapabilities(capabilities []string) error {
 	allowed := map[string]bool{}

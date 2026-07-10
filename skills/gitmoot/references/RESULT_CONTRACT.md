@@ -524,6 +524,12 @@ The same capture also feeds the `$`-denominated
   stage state, not the separate skipped state used for downstream stages that
   never ran.
 
+For a pipeline `produce` batch, use the same vocabulary without inventing a new
+token: `implemented` means the batch is complete; `changes_requested` means partial
+output (the pipeline must explicitly include it in `success_decisions` to advance);
+`blocked` means human input is required and should carry `needs`; `skipped` means no
+work was available. Produce remains a leaf, so its delegations are stripped.
+
 ## Reporting Rules
 
 - Do not claim tests were run unless they were actually run.

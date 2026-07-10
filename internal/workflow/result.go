@@ -267,8 +267,13 @@ func validateAgentResult(result AgentResult) error {
 		if err := validateDelegationTarget(d); err != nil {
 			errs = append(errs, err)
 		}
-		if strings.TrimSpace(d.Action) == "" {
+		action := strings.TrimSpace(d.Action)
+		if action == "" {
 			errs = append(errs, delegationFieldError(i, d, "action", "is required"))
+		} else if d.Action != action {
+			errs = append(errs, delegationFieldError(i, d, "action", "must not have leading or trailing whitespace"))
+		} else if action != "ask" && action != "review" && action != "implement" {
+			errs = append(errs, delegationFieldError(i, d, "action", "must be one of ask, review, implement"))
 		}
 		if strings.TrimSpace(d.Prompt) == "" {
 			errs = append(errs, delegationFieldError(i, d, "prompt", "is required"))

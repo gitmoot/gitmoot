@@ -750,6 +750,30 @@ func TestIsClaudeSessionMissing(t *testing.T) {
 	}
 }
 
+func TestCodexSandboxArgsProduceGrants(t *testing.T) {
+	agent := Agent{
+		AutonomyPolicy: AutonomyPolicyWorkspaceWrite,
+		WritablePaths:  []string{"/data/one", "/data/two"},
+		ProduceNetwork: true,
+	}
+	args := codexSandboxArgs(agent, "")
+	want := []string{"--sandbox", "workspace-write", "--add-dir", "/data/one", "--add-dir", "/data/two", "-c", "sandbox_workspace_write.network_access=true"}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("codexSandboxArgs = %v, want %v", args, want)
+	}
+	danger := agent
+	danger.AutonomyPolicy = AutonomyPolicyDangerFullAccess
+	if got := codexSandboxArgs(danger, ""); !reflect.DeepEqual(got, []string{"--sandbox", "danger-full-access"}) {
+		t.Fatalf("danger-full-access produce args = %v, want no leaked grants", got)
+	}
+	if err := ProduceDispatchError("produce", Agent{Name: "p", Runtime: ClaudeRuntime, AutonomyPolicy: AutonomyPolicyWorkspaceWrite}); err == nil || !strings.Contains(err.Error(), `runtime "claude"`) {
+		t.Fatalf("non-codex produce error = %v", err)
+	}
+	if err := ProduceDispatchError("produce", Agent{Name: "p", Runtime: CodexRuntime, AutonomyPolicy: AutonomyPolicyReadOnly}); err == nil || !strings.Contains(err.Error(), "writable autonomy policy") {
+		t.Fatalf("read-only produce error = %v", err)
+	}
+}
+
 func TestClaudeDeliverSelfHealsDeadSession(t *testing.T) {
 	runner := &fakeRunner{
 		results: []subprocess.Result{
