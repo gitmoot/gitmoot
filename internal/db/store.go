@@ -8316,4 +8316,11 @@ CREATE INDEX idx_memory_links_dst ON memory_links(dst_id);
 ALTER TABLE confirmed_memories ADD COLUMN author_ref TEXT NOT NULL DEFAULT '';
 ALTER TABLE memory_observations ADD COLUMN author_ref TEXT NOT NULL DEFAULT '';
 	`,
+	// #779 automatic memory-cluster hierarchy. parent_id=0 marks a top-level
+	// cluster; child rows point to their top-level parent. Existing flat clusters
+	// are therefore top-level after migration without a data rewrite. This is a
+	// byte-appended migration only: no earlier migration is changed or renumbered.
+	`
+ALTER TABLE memory_clusters ADD COLUMN parent_id INTEGER NOT NULL DEFAULT 0;
+	`,
 }

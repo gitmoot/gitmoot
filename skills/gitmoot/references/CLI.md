@@ -1902,9 +1902,9 @@ groom_propose = "nightly"
 gitmoot pipeline run memory-groom-propose
 ```
 
-### memory clusters (#763)
+### memory clusters (#763, #779)
 
-`memory clusters` surfaces **emergent memory clusters** — communities detected over
+`memory clusters` surfaces **emergent memory clusters**: communities detected over
 the fact-similarity graph, the **same** bm25 + id-tiebreak signal the vault
 `[[links]]` use. They replace the old fixed key-prefix "category" hubs on the
 dashboard Knowledge view: clusters are discovered from what the facts actually say,
@@ -1917,38 +1917,52 @@ gitmoot memory clusters recompute --apply [--plan PLAN.json] [--json]
 gitmoot memory cluster rename <cluster-id> <label>
 ```
 
-- `memory clusters` lists each cluster with its display label (the owner override
-  when set, else the computed label), member count, and medoid fact id. The
-  reserved cluster **0 `unclustered`** holds facts with no similarity neighbors.
+- `memory clusters` lists the hierarchy with child clusters indented. Every row
+  includes its display label (the owner override when set, else the computed
+  label), member count, and medoid fact id. A split parent's count is the sum of
+  its leaf children. The reserved cluster **0 `unclustered`** holds facts with no
+  similarity neighbors.
 - **Determinism is guaranteed.** The community detection is **id-ordered label
   propagation** with **lowest-label tie-breaks** over a fixed graph: node visit
   order is the sorted fact ids, initial labels are the ids themselves, neighbor
   influence is a weight *sum* (order-independent), and every tie resolves to the
   lowest label. There is no map-iteration order, randomness, or wall-clock input
   anywhere, so the **same store always yields byte-identical clusters, labels,
-  medoids, and cluster ids** — matching the vault byte-identity house rule.
+  medoids, cluster ids, and hierarchy**, matching the vault byte-identity house rule.
 - **Labels** are up to three **distinctive terms**, ranked by term frequency inside
   the cluster weighted against corpus document frequency (frequent-inside-yet-
   rare-across-clusters wins), joined with `-` and anchored to the **medoid** fact
   for stability. The **medoid** is the member with the highest total intra-cluster
-  similarity (lowest id breaks ties).
+  similarity (lowest id breaks ties). Child labels use tf-idf across their siblings,
+  so they describe what distinguishes each child inside its parent.
+- **Automatic hierarchy:** during recompute, a top-level cluster with at least 20
+  facts is clustered again on its internal subgraph. A split is accepted only when
+  it produces at least two children and every child has at least four facts. The
+  maximum depth is two levels. Existing splits remain while the parent has more
+  than 12 facts and every recomputed child still has at least four; otherwise the
+  split dissolves. Facts always attach to leaf clusters.
 - **`recompute`** is a human-gated **propose → review → apply** round-trip, mirroring
   `memory groom`. `--propose` rebuilds the clustering and writes a reviewable plan
-  (`{schema_version, anchor, clusters, moves, new_facts, dropped_facts, stats}`)
-  showing what would move, without touching the store. `--apply --plan` recomputes
+  (`{schema_version, anchor, clusters, moves, new_facts, dropped_facts, splits,
+  dissolves, stats}`) showing fact moves and automatic hierarchy changes without
+  touching the store. `--apply --plan` recomputes
   the **staleness anchor** (a hash over every active fact's `(id, updated_at)`),
   **aborts as stale** if the store changed since the proposal, then writes the whole
   clustering in **one transaction**. **First run:** when no clusters exist yet there
   is nothing to protect, so `recompute --apply` (no `--plan`) is allowed and builds
   them directly.
 - **Incremental attach:** confirming a **new** fact (`memory confirm`) best-effort
-  attaches it to the cluster of its nearest similarity neighbor (or the `unclustered`
-  bucket) without a full recompute; the attach never blocks a confirmation. Nothing
-  is ever re-shelved silently — wholesale re-clustering is always the explicit
+  attaches it to the leaf cluster of its nearest similarity neighbor (or the
+  `unclustered` bucket) without a full recompute; the attach never blocks a
+  confirmation. Nothing is ever re-shelved silently; wholesale re-clustering is the explicit
   `recompute` proposal.
 - `memory cluster rename` sets an **owner label override** that wins over the
-  computed label and is carried across recomputes by medoid identity (a blank label
-  clears it). The reserved `unclustered` bucket cannot be renamed.
+  computed label. A parent override survives a later split. A child override survives
+  while its stable child id persists and is removed when that split dissolves. The
+  reserved `unclustered` bucket cannot be renamed.
+
+The Knowledge payload adds `parent_id` to child cluster entries. Facts continue to
+carry leaf cluster ids, while parent hubs remain an aggregate view only.
 
 ## Pipelines
 

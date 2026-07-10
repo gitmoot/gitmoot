@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
@@ -585,6 +586,71 @@ func TestKnowledgeClusterHierarchy(t *testing.T) {
 	}
 	if fmt.Sprintf("%+v", k) != fmt.Sprintf("%+v", k2) {
 		t.Fatalf("Knowledge not deterministic across calls")
+	}
+}
+
+func TestKnowledgeClusterPayloadParentIDAndLeafFacts(t *testing.T) {
+	home := dashboardTestHome(t)
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	dbIDs, netIDs := seedClusterCorpus(t, store)
+	const (
+		parentID = int64(1)
+		childAID = int64(1<<52 + 51)
+		childBID = int64(1<<52 + 52)
+	)
+	assignment := db.MemoryClusterAssignment{Clusters: []db.MemoryCluster{
+		{ClusterID: parentID, Label: "systems", MedoidID: dbIDs[0]},
+		{ClusterID: childAID, ParentID: parentID, Label: "database", MedoidID: dbIDs[0]},
+		{ClusterID: childBID, ParentID: parentID, Label: "network", MedoidID: netIDs[0]},
+	}}
+	for _, id := range dbIDs {
+		assignment.Members = append(assignment.Members, db.MemoryClusterMember{MemoryID: id, ClusterID: childAID})
+	}
+	for _, id := range netIDs {
+		assignment.Members = append(assignment.Members, db.MemoryClusterMember{MemoryID: id, ClusterID: childBID})
+	}
+	if err := store.RecomputeMemoryClusters(context.Background(), assignment); err != nil {
+		t.Fatalf("seed hierarchy: %v", err)
+	}
+	store.Close()
+
+	ds := &webDataSource{home: home}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/learning/knowledge", nil)
+	ds.handleLearningKnowledge(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("knowledge HTTP status %d: %s", rr.Code, rr.Body.String())
+	}
+	var payload dashboardKnowledgeResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if len(payload.Clusters) != 3 {
+		t.Fatalf("payload clusters = %d, want parent + two children: %+v", len(payload.Clusters), payload.Clusters)
+	}
+	parentHub := clusterHubID(parentID)
+	childHubs := map[string]bool{clusterHubID(childAID): true, clusterHubID(childBID): true}
+	for _, c := range payload.Clusters {
+		if c.ID == parentHub {
+			if c.ParentID != "" || c.Count != 6 {
+				t.Fatalf("parent payload = %+v, want no parent_id and aggregate count 6", c)
+			}
+			continue
+		}
+		if !childHubs[c.ID] || c.ParentID != parentHub || c.Count != 3 {
+			t.Fatalf("child payload = %+v, want parent_id %q and count 3", c, parentHub)
+		}
+	}
+	for _, f := range payload.Facts {
+		if !childHubs[f.Cluster] {
+			t.Fatalf("fact %s cluster = %q, want a leaf child id", f.ID, f.Cluster)
+		}
+	}
+	if !bytes.Contains(rr.Body.Bytes(), []byte(`"parent_id": "cluster:1"`)) {
+		t.Fatalf("raw payload omitted parent_id: %s", rr.Body.String())
 	}
 }
 

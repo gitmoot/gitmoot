@@ -22,9 +22,11 @@ var ErrClusterPlanStale = errors.New("cluster plan is stale")
 
 // MemoryCluster is one persisted community. Label is the computed
 // distinctive-term label; LabelOverride is the owner's `memory cluster rename`
-// (it wins when non-empty). MedoidID anchors the label for stability.
+// (it wins when non-empty). MedoidID anchors the label for stability. ParentID is
+// zero for top-level clusters and points to the top-level parent for children.
 type MemoryCluster struct {
 	ClusterID     int64
+	ParentID      int64
 	Label         string
 	LabelOverride string
 	MedoidID      int64
@@ -58,7 +60,7 @@ type MemoryClusterAssignment struct {
 // in their stable numbering.
 func (s *Store) ListMemoryClusters(ctx context.Context) ([]MemoryCluster, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT cluster_id, label, label_override, medoid_id
+SELECT cluster_id, label, label_override, medoid_id, parent_id
 FROM memory_clusters
 ORDER BY cluster_id`)
 	if err != nil {
@@ -68,7 +70,7 @@ ORDER BY cluster_id`)
 	var out []MemoryCluster
 	for rows.Next() {
 		var c MemoryCluster
-		if err := rows.Scan(&c.ClusterID, &c.Label, &c.LabelOverride, &c.MedoidID); err != nil {
+		if err := rows.Scan(&c.ClusterID, &c.Label, &c.LabelOverride, &c.MedoidID, &c.ParentID); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -111,12 +113,10 @@ func (s *Store) CountMemoryClusters(ctx context.Context) (int, error) {
 
 // RecomputeMemoryClusters replaces the ENTIRE clustering in one transaction:
 // every memory_clusters and memory_cluster_members row is deleted and the new
-// assignment inserted. Owner label overrides are carried forward by MEDOID
-// identity — a new cluster whose medoid matches a prior cluster that carried an
-// override keeps that override (the medoid anchors owner intent across a
-// recompute, since cluster_id numbering itself is not stable across membership
-// changes). The whole swap is atomic: a reader never sees a half-written
-// clustering.
+// assignment inserted. Top-level owner label overrides are carried forward by
+// medoid identity. Child overrides are carried forward by their hierarchy-derived
+// cluster id and disappear when a split dissolves. The whole swap is atomic: a
+// reader never sees a half-written clustering.
 func (s *Store) RecomputeMemoryClusters(ctx context.Context, a MemoryClusterAssignment) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -164,11 +164,10 @@ func (s *Store) RecomputeMemoryClustersFresh(ctx context.Context, a MemoryCluste
 // recomputeMemoryClustersTx is the delete-all + reinsert core of a full clustering
 // rewrite, run inside the caller's transaction so it can be paired atomically with
 // a same-tx anchor re-read (RecomputeMemoryClustersFresh) or run standalone
-// (RecomputeMemoryClusters). Owner label overrides are carried forward by medoid
-// identity.
+// (RecomputeMemoryClusters). Top-level owner label overrides are carried forward
+// by medoid identity; child overrides are carried by stable child cluster id.
 func recomputeMemoryClustersTx(ctx context.Context, tx *sql.Tx, a MemoryClusterAssignment) error {
-	// Preserve overrides keyed by medoid id before wiping.
-	overrideByMedoid, err := overridesByMedoidTx(ctx, tx)
+	rootOverrideByMedoid, childOverrideByID, err := clusterOverridesTx(ctx, tx)
 	if err != nil {
 		return err
 	}
@@ -183,13 +182,17 @@ func recomputeMemoryClustersTx(ctx context.Context, tx *sql.Tx, a MemoryClusterA
 	for _, c := range a.Clusters {
 		override := c.LabelOverride
 		if override == "" {
-			if prev, ok := overrideByMedoid[c.MedoidID]; ok && c.MedoidID != 0 {
+			if c.ParentID == 0 {
+				if prev, ok := rootOverrideByMedoid[c.MedoidID]; ok && c.MedoidID != 0 {
+					override = prev
+				}
+			} else if prev, ok := childOverrideByID[c.ClusterID]; ok {
 				override = prev
 			}
 		}
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO memory_clusters (cluster_id, label, label_override, medoid_id)
-VALUES (?, ?, ?, ?)`, c.ClusterID, c.Label, override, c.MedoidID); err != nil {
+INSERT INTO memory_clusters (cluster_id, label, label_override, medoid_id, parent_id)
+VALUES (?, ?, ?, ?, ?)`, c.ClusterID, c.Label, override, c.MedoidID, c.ParentID); err != nil {
 			return fmt.Errorf("insert cluster %d: %w", c.ClusterID, err)
 		}
 	}
@@ -203,27 +206,38 @@ INSERT INTO memory_cluster_members (memory_id, cluster_id) VALUES (?, ?)`,
 	return nil
 }
 
-// overridesByMedoidTx reads the current (medoid_id -> non-empty override) map
-// inside a transaction. A zero medoid (the unclustered bucket) is skipped — its
-// label is fixed and never carries an owner override.
-func overridesByMedoidTx(ctx context.Context, tx *sql.Tx) (map[int64]string, error) {
+// clusterOverridesTx keeps root and child identity separate. A parent and one of
+// its children can legitimately share a medoid, so one medoid-keyed map would
+// let a child rename overwrite the parent's rename. Roots use their medoid anchor;
+// children use their hierarchy-derived cluster id and disappear on dissolve.
+func clusterOverridesTx(ctx context.Context, tx *sql.Tx) (map[int64]string, map[int64]string, error) {
 	rows, err := tx.QueryContext(ctx, `
-SELECT medoid_id, label_override FROM memory_clusters
-WHERE label_override <> '' AND medoid_id <> 0`)
+SELECT cluster_id, parent_id, medoid_id, label_override FROM memory_clusters
+WHERE label_override <> ''`)
 	if err != nil {
-		return nil, fmt.Errorf("read prior overrides: %w", err)
+		return nil, nil, fmt.Errorf("read prior overrides: %w", err)
 	}
 	defer rows.Close()
-	out := map[int64]string{}
+	roots := map[int64]string{}
+	children := map[int64]string{}
 	for rows.Next() {
-		var medoid int64
+		var clusterID, parentID, medoid int64
 		var override string
-		if err := rows.Scan(&medoid, &override); err != nil {
-			return nil, err
+		if err := rows.Scan(&clusterID, &parentID, &medoid, &override); err != nil {
+			return nil, nil, err
 		}
-		out[medoid] = override
+		if parentID == 0 {
+			if medoid != 0 {
+				roots[medoid] = override
+			}
+		} else {
+			children[clusterID] = override
+		}
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return roots, children, nil
 }
 
 // AssignMemoryToCluster incrementally attaches a single fact to a cluster
@@ -279,9 +293,9 @@ SELECT cluster_id FROM memory_cluster_members WHERE memory_id = ?`, memoryID).Sc
 	return cid, true, nil
 }
 
-// MemoryClusterCounts returns member counts keyed by cluster id, deterministically
-// (a plain read the caller can pair with ListMemoryClusters). Sorted keys are the
-// caller's job; this returns the map.
+// MemoryClusterCounts returns direct leaf counts and rolls every child count into
+// its parent. Split parents therefore report the sum of their leaf members while
+// children retain their own counts.
 func (s *Store) MemoryClusterCounts(ctx context.Context) (map[int64]int, error) {
 	members, err := s.ListMemoryClusterMembers(ctx)
 	if err != nil {
@@ -290,6 +304,15 @@ func (s *Store) MemoryClusterCounts(ctx context.Context) (map[int64]int, error) 
 	out := map[int64]int{}
 	for _, m := range members {
 		out[m.ClusterID]++
+	}
+	clusters, err := s.ListMemoryClusters(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range clusters {
+		if c.ParentID != 0 {
+			out[c.ParentID] += out[c.ClusterID]
+		}
 	}
 	return out, nil
 }
