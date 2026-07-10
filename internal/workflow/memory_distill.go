@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
@@ -51,6 +52,10 @@ const (
 	distillWitnessProvenancePrefix = db.MemoryDistillWitnessProvenancePrefix
 	// distillStagedProvenancePrefix marks a genuinely staged distilled observation.
 	distillStagedProvenancePrefix = "distill:"
+	// distillSuccessProvenancePrefix marks a success-side recovery observation. It
+	// intentionally does not start with "distill:" so confirmed recovery evidence is
+	// never re-read as a confirmed failure fact by the recovery producer.
+	distillSuccessProvenancePrefix = "distill-success:"
 	// distillWitnessSentinel is the FIXED, PreFilter-safe content stored on a
 	// recurrence witness. It is deliberately constant (never a candidate's content)
 	// so it can never false-collide with a real staged content in the dedup path.
@@ -77,6 +82,12 @@ var distillDecisions = map[string]bool{
 	"failed":            true,
 	"blocked":           true,
 	"changes_requested": true,
+}
+
+var distillSuccessDecisions = map[string]bool{
+	"approved":    true,
+	"implemented": true,
+	"succeeded":   true,
 }
 
 // distillObs is one deterministic distill candidate: a bounded closed-category
@@ -168,6 +179,102 @@ func (c *MemoryController) distillAtTerminal(ctx context.Context, jobID string, 
 		})
 		written++
 	}
+}
+
+// distillRecoveredFailuresAtSuccess is the #781 success-side producer. On an
+// approving terminal result, it finds active confirmed failure facts born from
+// distill ("distill:" provenance) whose source job belongs to the same task
+// lineage as this success, then appends low-trust pending recovery observations
+// on the SAME key. It never mutates or retires the confirmed failure fact.
+func (c *MemoryController) distillRecoveredFailuresAtSuccess(ctx context.Context, jobID string, agent runtime.Agent, payload JobPayload, result AgentResult) {
+	if !c.distillSuccessEnabledFor(agent.Name) {
+		return
+	}
+	if !distillSuccessDecisions[strings.TrimSpace(result.Decision)] {
+		return
+	}
+	repo := strings.TrimSpace(payload.Repo)
+	if repo == "" {
+		return
+	}
+	owner := ownerForJob(agent, payload)
+	perJobCap := c.DistillMaxPerJob
+	if perJobCap <= 0 {
+		perJobCap = config.DefaultMemoryDistillMaxPerJob
+	}
+	facts, err := c.Store.ListActiveConfirmedMemoriesByProvenancePrefix(ctx, owner, repo, distillStagedProvenancePrefix, 0)
+	if err != nil || len(facts) == 0 {
+		return
+	}
+	seen, err := c.Store.ObservationDedupKeys(ctx, owner.Ref)
+	if err != nil {
+		return
+	}
+	written := 0
+	for _, fact := range facts {
+		if written >= perJobCap {
+			return
+		}
+		if strings.TrimSpace(fact.SourceJob) == "" || strings.TrimSpace(fact.Key) == "" {
+			continue
+		}
+		sourceJob, err := c.Store.GetJob(ctx, fact.SourceJob)
+		if err != nil {
+			continue
+		}
+		sourcePayload, err := unmarshalPayload(sourceJob.Payload)
+		if err != nil {
+			continue
+		}
+		if !sameDistillRecoveryLineage(payload, sourcePayload) {
+			continue
+		}
+		content := recoveredFailureObservationContent(jobID, payload.Branch, fact.Key, time.Now().UTC())
+		if ok, _ := memory.PreFilter(content, memory.ScopeRepo); !ok {
+			continue
+		}
+		dkey := db.MemoryDedupKey(memory.ScopeRepo, repo, memory.ContentHash(content))
+		if _, dup := seen[dkey]; dup {
+			continue
+		}
+		seen[dkey] = struct{}{}
+		_, _ = c.Store.InsertMemoryObservation(ctx, db.MemoryObservation{
+			Owner:      owner,
+			Repo:       repo,
+			Scope:      memory.ScopeRepo,
+			Key:        fact.Key,
+			Content:    content,
+			Provenance: distillSuccessProvenancePrefix + jobID,
+			TrustMark:  memory.TrustLow,
+			SourceJob:  jobID,
+		})
+		written++
+	}
+}
+
+func sameDistillRecoveryLineage(success JobPayload, failure JobPayload) bool {
+	successRepo := strings.TrimSpace(success.Repo)
+	failureRepo := strings.TrimSpace(failure.Repo)
+	if successRepo == "" || failureRepo == "" || successRepo != failureRepo {
+		return false
+	}
+	successTask := strings.TrimSpace(success.TaskID)
+	failureTask := strings.TrimSpace(failure.TaskID)
+	if successTask != "" && failureTask != "" {
+		return successTask == failureTask
+	}
+	successBranch := strings.TrimSpace(success.Branch)
+	failureBranch := strings.TrimSpace(failure.Branch)
+	return successBranch != "" && failureBranch != "" && successBranch == failureBranch
+}
+
+func recoveredFailureObservationContent(jobID, branch, key string, now time.Time) string {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		branch = "unrecorded"
+	}
+	return fmt.Sprintf("Job %s succeeded on %s on branch %s, providing recovery evidence for the previously confirmed failure %s.",
+		strings.TrimSpace(jobID), now.UTC().Format("2006-01-02"), branch, strings.TrimSpace(key))
 }
 
 // distillCandidates assembles the deterministic candidate set for a terminal job,

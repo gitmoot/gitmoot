@@ -35,6 +35,7 @@ func daemonOutcomeHarvesterWithCanary(store *db.Store, gh github.Client, home st
 		inner:      base,
 		store:      store,
 		sink:       daemonEventSink(store, home),
+		home:       home,
 		minSamples: policy.AutoPromoteMinSamples,
 	}
 }
@@ -52,6 +53,7 @@ type canaryRegressionHarvester struct {
 	inner      workflow.OutcomeHarvester
 	store      *db.Store
 	sink       events.Sink
+	home       string
 	minSamples *int
 }
 
@@ -136,6 +138,7 @@ func (h *canaryRegressionHarvester) evaluate(ctx context.Context, payload workfl
 		if err != nil {
 			return
 		}
+		stageSkillOptPromotionObservationForHome(ctx, h.store, h.home, promoted)
 		emitCandidateEvent(ctx, h.sink, events.EventCandidateAutoPromoted, promoted, "auto_promoted", verdict.Reason)
 	default:
 		// CanaryContinue: keep sampling; no state change.

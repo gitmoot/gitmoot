@@ -93,7 +93,15 @@ func notifyAndMaybeAutoPromoteCandidate(ctx context.Context, store *db.Store, ho
 	sink := buildDaemonEventSink(store, home)
 	defer events.FlushSink(ctx, sink)
 	confidence, confidenceSamples, confidenceSummary, pairwiseWins, pairwiseLosses := resolveBanditConfidence(ctx, store, version)
-	return runCandidateNotify(ctx, store, sink, policy, candidate, version, feedbackEvents, feedbackUnavailable, confidence, confidenceSamples, confidenceSummary, pairwiseWins, pairwiseLosses)
+	if err := runCandidateNotify(ctx, store, sink, policy, candidate, version, feedbackEvents, feedbackUnavailable, confidence, confidenceSamples, confidenceSummary, pairwiseWins, pairwiseLosses); err != nil {
+		return err
+	}
+	if store != nil {
+		if promoted, err := store.GetAgentTemplateVersionByID(ctx, version.ID); err == nil && promoted.State == "current" && version.State != "current" {
+			stageSkillOptPromotionObservationForHome(ctx, store, home, promoted)
+		}
+	}
+	return nil
 }
 
 // resolveBanditConfidence looks up the #473 Mode B bandit confidence backing a

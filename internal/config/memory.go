@@ -15,7 +15,7 @@ const (
 	DefaultMemoryMaxEntries  = 15
 	// DefaultMemoryDistillMaxPerJob caps how many pending observations the
 	// deterministic distill-at-terminal producers (#737 P4.1) may stage per job.
-	// It is only consulted when distill_at_terminal is enabled.
+	// It is only consulted when distill_at_terminal or distill_successes is enabled.
 	DefaultMemoryDistillMaxPerJob = 3
 )
 
@@ -45,9 +45,15 @@ type MemorySettings struct {
 	// deterministically from the result — never confirmed memory (the owner's
 	// `memory confirm` gate stays the only promotion path).
 	DistillAtTerminal bool
+	// DistillSuccesses enables deterministic success-side memory producers (#781).
+	// Default false: no SkillOpt promotion observations and no recovered-failure
+	// observations are staged. When true, those producers still write only pending
+	// low-trust observations; they never confirm memory directly.
+	DistillSuccesses bool
 	// DistillMaxPerJob is the hard per-job cap on distill writes (default 3). Only
-	// consulted when DistillAtTerminal is true; a value <= 0 falls back to the
-	// default so the producers can never write an unbounded number of rows.
+	// consulted when DistillAtTerminal or DistillSuccesses is true; a value <= 0
+	// falls back to the default so the producers can never write an unbounded number
+	// of rows.
 	DistillMaxPerJob int
 	// DistillAllJobs widens distill to EVERY job, not only memory-enrolled agents.
 	// Default false: distill (like the rest of memory) runs only for agents with
@@ -64,6 +70,7 @@ func DefaultMemorySettings() MemorySettings {
 		TokenBudget:       DefaultMemoryTokenBudget,
 		MaxEntries:        DefaultMemoryMaxEntries,
 		DistillAtTerminal: false,
+		DistillSuccesses:  false,
 		DistillMaxPerJob:  DefaultMemoryDistillMaxPerJob,
 		DistillAllJobs:    false,
 	}
@@ -125,6 +132,12 @@ func LoadMemorySettings(paths Paths) (MemorySettings, error) {
 				return MemorySettings{}, fmt.Errorf("parse [memory].distill_at_terminal: %w", err)
 			}
 			settings.DistillAtTerminal = parsed
+		case "distill_successes":
+			parsed, err := parseConfigBool(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].distill_successes: %w", err)
+			}
+			settings.DistillSuccesses = parsed
 		case "distill_max_per_job":
 			parsed, err := strconv.Atoi(value)
 			if err != nil {

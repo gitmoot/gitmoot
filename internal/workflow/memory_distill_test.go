@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/memory"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
@@ -23,9 +24,16 @@ func distillController(store *db.Store, maxPerJob int, allJobs bool, enrolled ..
 		TokenBudget:       1500,
 		MaxEntries:        15,
 		DistillAtTerminal: true,
+		DistillSuccesses:  true,
 		DistillMaxPerJob:  maxPerJob,
 		DistillAllJobs:    allJobs,
 	}
+}
+
+func distillFailureOnlyController(store *db.Store, maxPerJob int, allJobs bool, enrolled ...string) *MemoryController {
+	ctrl := distillController(store, maxPerJob, allJobs, enrolled...)
+	ctrl.DistillSuccesses = false
+	return ctrl
 }
 
 func distillObsFor(t *testing.T, store *db.Store, repo string) []db.MemoryObservation {
@@ -319,6 +327,118 @@ func TestDistillOnlyOnNotableDecisions(t *testing.T) {
 				t.Fatalf("decision %q: distill rows = %d, want %d", tc.decision, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestDistillRecoveredFailureObservationUsesTaskLineage(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	seedDistillSourceJob(t, store, "fail-job", JobPayload{Repo: "acme/widget", TaskID: "task-1", Branch: "feat/fix"})
+	seedConfirmedDistillFact(t, store, "distill-error:nil-pointer", "fail-job")
+
+	ctrl := distillController(store, 3, false, "audit")
+	ctrl.record(ctx, "success-job", memAgent(), "implement",
+		JobPayload{Repo: "acme/widget", TaskID: "task-1", Branch: "feat/fix"},
+		AgentResult{Decision: "implemented", Summary: "fixed"})
+
+	obs := distillObsFor(t, store, "acme/widget")
+	if len(obs) != 1 {
+		t.Fatalf("same task success should stage one recovery observation, got %+v", obs)
+	}
+	got := obs[0]
+	if got.Key != "distill-error:nil-pointer" {
+		t.Fatalf("recovery observation key = %q", got.Key)
+	}
+	if got.TrustMark != memory.TrustLow || got.Provenance != "distill-success:success-job" || got.SourceJob != "success-job" {
+		t.Fatalf("recovery trust/provenance/source = %q/%q/%q", got.TrustMark, got.Provenance, got.SourceJob)
+	}
+	for _, want := range []string{"success-job", "feat/fix", "previously confirmed failure distill-error:nil-pointer"} {
+		if !strings.Contains(got.Content, want) {
+			t.Fatalf("recovery content missing %q:\n%s", want, got.Content)
+		}
+	}
+	confirmed, err := store.ListConfirmedMemories(ctx, "audit", "acme/widget")
+	if err != nil {
+		t.Fatalf("ListConfirmedMemories returned error: %v", err)
+	}
+	if len(confirmed) != 1 || confirmed[0].Content != "A job in this repository hit the error: nil pointer." {
+		t.Fatalf("confirmed failure fact must remain unchanged, got %+v", confirmed)
+	}
+}
+
+func TestDistillRecoveredFailureDifferentTaskStagesNothing(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	seedDistillSourceJob(t, store, "fail-job", JobPayload{Repo: "acme/widget", TaskID: "task-1", Branch: "feat/fix"})
+	seedConfirmedDistillFact(t, store, "distill-error:nil-pointer", "fail-job")
+
+	ctrl := distillController(store, 3, false, "audit")
+	ctrl.record(ctx, "success-job", memAgent(), "implement",
+		JobPayload{Repo: "acme/widget", TaskID: "task-2", Branch: "feat/fix"},
+		AgentResult{Decision: "implemented", Summary: "fixed elsewhere"})
+
+	if obs := distillObsFor(t, store, "acme/widget"); len(obs) != 0 {
+		t.Fatalf("different task must not stage recovery observations, got %+v", obs)
+	}
+}
+
+func TestDistillRecoveredFailureDefaultOffStagesNothing(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	seedDistillSourceJob(t, store, "fail-job", JobPayload{Repo: "acme/widget", TaskID: "task-1", Branch: "feat/fix"})
+	seedConfirmedDistillFact(t, store, "distill-error:nil-pointer", "fail-job")
+
+	ctrl := distillFailureOnlyController(store, 3, false, "audit")
+	ctrl.record(ctx, "success-job", memAgent(), "implement",
+		JobPayload{Repo: "acme/widget", TaskID: "task-1", Branch: "feat/fix"},
+		AgentResult{Decision: "implemented", Summary: "fixed"})
+
+	if obs := distillObsFor(t, store, "acme/widget"); len(obs) != 0 {
+		t.Fatalf("distill_successes=false must not stage recovery observations, got %+v", obs)
+	}
+}
+
+func TestDistillRecoveredFailureCap(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	seedDistillSourceJob(t, store, "fail-job", JobPayload{Repo: "acme/widget", TaskID: "task-1", Branch: "feat/fix"})
+	for _, key := range []string{"distill-error:a", "distill-error:b", "distill-error:c"} {
+		seedConfirmedDistillFact(t, store, key, "fail-job")
+	}
+
+	ctrl := distillController(store, 1, false, "audit")
+	ctrl.record(ctx, "success-job", memAgent(), "implement",
+		JobPayload{Repo: "acme/widget", TaskID: "task-1", Branch: "feat/fix"},
+		AgentResult{Decision: "implemented", Summary: "fixed"})
+
+	if obs := distillObsFor(t, store, "acme/widget"); len(obs) != 1 {
+		t.Fatalf("distill_max_per_job=1 should cap recovery observations to one, got %+v", obs)
+	}
+}
+
+func seedDistillSourceJob(t *testing.T, store *db.Store, id string, payload JobPayload) {
+	t.Helper()
+	encoded, err := marshalPayload(payload)
+	if err != nil {
+		t.Fatalf("marshalPayload returned error: %v", err)
+	}
+	if err := store.CreateJob(context.Background(), db.Job{ID: id, Agent: "audit", Type: "implement", State: string(JobFailed), Payload: encoded}); err != nil {
+		t.Fatalf("CreateJob(%s) returned error: %v", id, err)
+	}
+}
+
+func seedConfirmedDistillFact(t *testing.T, store *db.Store, key, sourceJob string) {
+	t.Helper()
+	if _, err := store.UpsertConfirmedMemory(context.Background(), db.ConfirmedMemory{
+		Owner:      ownerForJob(memAgent(), JobPayload{Repo: "acme/widget"}),
+		Repo:       "acme/widget",
+		Scope:      memory.ScopeRepo,
+		Key:        key,
+		Content:    "A job in this repository hit the error: nil pointer.",
+		Provenance: "distill:" + sourceJob,
+		SourceJob:  sourceJob,
+	}); err != nil {
+		t.Fatalf("UpsertConfirmedMemory(%s) returned error: %v", key, err)
 	}
 }
 

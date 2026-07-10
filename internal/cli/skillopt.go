@@ -2667,7 +2667,7 @@ func continueSkillOptTrain(ctx context.Context, paths config.Paths, store *db.St
 			return output, nil
 		}
 		if skillOptTrainDecisionRequested(request) && summary.CurrentPhase == skillopt.TrainStateCandidateReviewPublished {
-			return continueSkillOptTrainCandidateDecision(ctx, store, session, *iteration, counts, request)
+			return continueSkillOptTrainCandidateDecision(ctx, paths, store, session, *iteration, counts, request)
 		}
 		if summary.CurrentPhase != skillopt.TrainStateCandidateCreated {
 			output.Lines = []string{fmt.Sprintf("next: %s", summary.NextAction)}
@@ -2702,7 +2702,7 @@ func continueSkillOptTrain(ctx context.Context, paths config.Paths, store *db.St
 			if updatedIteration == nil {
 				return skillOptTrainContinueOutput{}, errors.New("train session has no recovered iteration to decide")
 			}
-			return continueSkillOptTrainCandidateDecision(ctx, store, updatedSession, *updatedIteration, updatedCounts, request)
+			return continueSkillOptTrainCandidateDecision(ctx, paths, store, updatedSession, *updatedIteration, updatedCounts, request)
 		}
 		result, err := publishSkillOptTrainCandidateReview(ctx, paths, store, session, *iteration, request.Home)
 		if err != nil {
@@ -2720,7 +2720,7 @@ func continueSkillOptTrain(ctx context.Context, paths config.Paths, store *db.St
 		}
 		return skillOptTrainContinueOutput{Summary: updatedSummary, Counts: updatedCounts, ContinueReady: true, Lines: lines}, nil
 	case skillopt.TrainStateCandidateReviewPublished:
-		return continueSkillOptTrainCandidateDecision(ctx, store, session, *iteration, counts, request)
+		return continueSkillOptTrainCandidateDecision(ctx, paths, store, session, *iteration, counts, request)
 	case skillopt.TrainStateCandidatePromoted, skillopt.TrainStateCandidateRejected:
 		if err := validateTerminalSkillOptTrainDecisionRequest(*iteration, request); err != nil {
 			return skillOptTrainContinueOutput{}, err
@@ -2754,10 +2754,10 @@ func continueSkillOptTrain(ctx context.Context, paths config.Paths, store *db.St
 	}
 }
 
-func continueSkillOptTrainCandidateDecision(ctx context.Context, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, counts skillopt.TrainStatusCounts, request skillOptTrainContinueRequest) (skillOptTrainContinueOutput, error) {
+func continueSkillOptTrainCandidateDecision(ctx context.Context, paths config.Paths, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, counts skillopt.TrainStatusCounts, request skillOptTrainContinueRequest) (skillOptTrainContinueOutput, error) {
 	summary := skillopt.BuildTrainStatusSummary(session, &iteration, counts)
 	output := skillOptTrainContinueOutput{Summary: summary, Counts: counts}
-	result, err := decideSkillOptTrainCandidate(ctx, store, session, iteration, request)
+	result, err := decideSkillOptTrainCandidate(ctx, paths, store, session, iteration, request)
 	if err != nil {
 		return skillOptTrainContinueOutput{}, err
 	}
@@ -4353,7 +4353,7 @@ func skillOptTrainStatusCommand(usesCustomHome bool, sessionID string) string {
 	return shellArgs(args)
 }
 
-func decideSkillOptTrainCandidate(ctx context.Context, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, request skillOptTrainContinueRequest) (skillOptTrainCandidateDecisionResult, error) {
+func decideSkillOptTrainCandidate(ctx context.Context, paths config.Paths, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, request skillOptTrainContinueRequest) (skillOptTrainCandidateDecisionResult, error) {
 	promote := strings.TrimSpace(request.PromoteCandidate)
 	reject := strings.TrimSpace(request.RejectCandidate)
 	if promote != "" && reject != "" {
@@ -4412,8 +4412,12 @@ func decideSkillOptTrainCandidate(ctx context.Context, store *db.Store, session 
 	}
 	session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "candidate_decision", metadata)
 	iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "candidate_decision", metadata)
-	if _, err := store.DecideSkillOptTrainCandidate(ctx, session, iteration, candidateID, decision); err != nil {
+	promoted, err := store.DecideSkillOptTrainCandidate(ctx, session, iteration, candidateID, decision)
+	if err != nil {
 		return skillOptTrainCandidateDecisionResult{}, err
+	}
+	if decision == "promoted" {
+		stageSkillOptPromotionObservation(ctx, store, paths, promoted)
 	}
 	return skillOptTrainCandidateDecisionResult{Decided: true, Decision: decision, CandidateVersionID: candidateID}, nil
 }
@@ -12013,9 +12017,12 @@ func runSkillOptCandidatePromote(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	var promoted db.AgentTemplateVersion
-	if err := withStore(*home, func(store *db.Store) error {
+	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
 		var err error
 		promoted, err = store.PromoteAgentTemplateVersion(context.Background(), fs.Arg(0))
+		if err == nil {
+			stageSkillOptPromotionObservation(context.Background(), store, paths, promoted)
+		}
 		return err
 	}); err != nil {
 		fmt.Fprintf(stderr, "skillopt candidate promote: %v\n", err)

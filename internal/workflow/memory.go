@@ -46,6 +46,9 @@ type MemoryController struct {
 	// producers (#737 P4.1). Default false: with it off, record() runs exactly the
 	// Phase-1 write path and the terminal is byte-identical (no distilled rows).
 	DistillAtTerminal bool
+	// DistillSuccesses enables deterministic success-side distill producers (#781).
+	// Default false: no success-side observation rows are staged.
+	DistillSuccesses bool
 	// DistillMaxPerJob is the hard per-job cap on distill writes; <= 0 falls back
 	// to config.DefaultMemoryDistillMaxPerJob so the producers are always bounded.
 	DistillMaxPerJob int
@@ -70,6 +73,19 @@ func (c *MemoryController) enabledFor(agentName string) bool {
 // harvesting). When DistillAllJobs is false it falls back to the enrolled set.
 func (c *MemoryController) distillEnabledFor(agentName string) bool {
 	if c == nil || c.Store == nil || !c.DistillAtTerminal {
+		return false
+	}
+	if c.DistillAllJobs {
+		return true
+	}
+	return c.enabledFor(agentName)
+}
+
+// distillSuccessEnabledFor mirrors distillEnabledFor for the success-side
+// producers (#781). It is separately gated so an operator can keep failure
+// distill enabled while success producers remain off.
+func (c *MemoryController) distillSuccessEnabledFor(agentName string) bool {
+	if c == nil || c.Store == nil || !c.DistillSuccesses {
 		return false
 	}
 	if c.DistillAllJobs {
@@ -220,7 +236,6 @@ func memoryEntryFromConfirmed(r db.ConfirmedMemory, linked bool) memory.Entry {
 	}
 }
 
-
 // record is the WRITE path, run at job terminal. The ENROLLED-ONLY Phase-1 body
 // (recordEnrolled) (a) SHADOW-logs the agent's returned learnings to
 // memory_observations after the deterministic pre-filters, and (b) writes any
@@ -244,6 +259,9 @@ func (c *MemoryController) record(ctx context.Context, jobID string, agent runti
 	// un-enrolled agents when DistillAllJobs is set. Fail-safe: any error inside is
 	// swallowed and can never affect the job outcome.
 	c.distillAtTerminal(ctx, jobID, agent, action, payload, result)
+	// (d) #781 success distill — also PENDING-only and low-trust. It is separately
+	// gated by [memory].distill_successes so the default terminal path stays inert.
+	c.distillRecoveredFailuresAtSuccess(ctx, jobID, agent, payload, result)
 }
 
 // recordEnrolled is the Phase-1 ENROLLED-ONLY write path: shadow-log the agent's

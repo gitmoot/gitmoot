@@ -1439,6 +1439,37 @@ FROM confirmed_memories`
 	return scanConfirmedMemories(rows)
 }
 
+// ListActiveConfirmedMemoriesByProvenancePrefix returns active confirmed rows for
+// one owner, repo, and provenance prefix. It is a targeted non-FTS read for
+// deterministic producers that need to reason over confirmed facts without
+// surfacing retired or superseded rows.
+func (s *Store) ListActiveConfirmedMemoriesByProvenancePrefix(ctx context.Context, owner MemoryOwner, repo, provenancePrefix string, limit int) ([]ConfirmedMemory, error) {
+	if strings.TrimSpace(owner.Kind) == "" || strings.TrimSpace(owner.Ref) == "" || strings.TrimSpace(provenancePrefix) == "" {
+		return nil, nil
+	}
+	query := `
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
+	provenance, source_job, first_confirmed_at, updated_at
+FROM confirmed_memories
+WHERE owner_kind = ? AND owner_ref = ? AND owner_version = ?
+	AND ((? IS NULL AND repo IS NULL) OR repo = ?)
+	AND provenance LIKE ? ESCAPE '\'
+	AND superseded_by IS NULL
+	AND retired_at = ''
+ORDER BY updated_at DESC, id DESC`
+	args := []any{owner.Kind, owner.Ref, owner.Version, nullableRepo(repo), nullableRepo(repo), likePrefix(provenancePrefix)}
+	if limit > 0 {
+		query += "\nLIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list active confirmed memories by provenance: %w", err)
+	}
+	defer rows.Close()
+	return scanConfirmedMemories(rows)
+}
+
 // MemoryDistillWitnessProvenancePrefix marks a recurrence-WITNESS observation row
 // written by distill-at-terminal (#737 P4.1). Witness rows are internal recurrence
 // bookkeeping — NOT human-reviewable observations — so the pending list surface

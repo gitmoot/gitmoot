@@ -23,7 +23,7 @@ func TestLoadMemorySettingsDefaults(t *testing.T) {
 		t.Fatalf("defaults = %+v", settings)
 	}
 	// Distill is off by default with a bounded per-job cap.
-	if settings.DistillAtTerminal || settings.DistillAllJobs {
+	if settings.DistillAtTerminal || settings.DistillSuccesses || settings.DistillAllJobs {
 		t.Fatalf("distill must be off by default, got %+v", settings)
 	}
 	if settings.DistillMaxPerJob != DefaultMemoryDistillMaxPerJob {
@@ -39,6 +39,7 @@ func TestLoadMemorySettingsParsesDistillKnobs(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
 [memory]
 distill_at_terminal = true
+distill_successes = true
 distill_max_per_job = 5
 distill_all_jobs = true
 `), 0o600); err != nil {
@@ -48,7 +49,7 @@ distill_all_jobs = true
 	if err != nil {
 		t.Fatalf("LoadMemorySettings: %v", err)
 	}
-	if !settings.DistillAtTerminal || !settings.DistillAllJobs || settings.DistillMaxPerJob != 5 {
+	if !settings.DistillAtTerminal || !settings.DistillSuccesses || !settings.DistillAllJobs || settings.DistillMaxPerJob != 5 {
 		t.Fatalf("parsed distill knobs = %+v", settings)
 	}
 }

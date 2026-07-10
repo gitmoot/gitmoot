@@ -1585,6 +1585,26 @@ stays invisible until it recurs. By default distill follows enrollment; set `dis
 to harvest failure signal box-wide (the read path and confirmed producers stay
 enrolled-only).
 
+**Success distill (#781)** is separately gated by `distill_successes` (off by
+default). It adds two deterministic, no-LLM producers, both pending-only with
+trust `low`:
+
+- **SkillOpt promotions** stage one observation when a candidate is promoted. The
+  key is bounded by template version and content hash, for example
+  `skillopt:<template>@vN-promoted:<hash>`. The content records which version was
+  promoted over which base, plus cheap local evidence such as review score,
+  replay-gate mean scores, and recorded weaknesses when present.
+- **Recovered failures** run when a later job succeeds. Gitmoot looks for active
+  confirmed failure facts with `distill:` provenance whose `source_job` belongs
+  to the same task lineage as the successful job, using matching `task_id` when
+  both jobs have one, otherwise the same repo plus branch. It appends a low-trust
+  pending observation on the same key that names the successful job, date, and
+  branch. It does not mutate, retire, or auto-upgrade the confirmed failure fact.
+
+Success distill uses the same PreFilter and observation dedup path as other
+memory observations. Recovered-failure writes share `distill_max_per_job`; SkillOpt
+promotion writes are one observation per promotion event.
+
 Enrollment is per agent, plus optional global knobs:
 
 ```toml
@@ -1597,12 +1617,13 @@ disabled = false            # global kill switch (overrides every enrollment)
 token_budget = 1500         # cap on injected block size (estimated tokens)
 max_entries = 15            # cap on confirmed rows considered for injection
 distill_at_terminal = false # stage deterministic failure signal at job terminal (#737 P4.1)
+distill_successes = false   # stage deterministic success observations (#781)
 distill_max_per_job = 3     # hard cap on distilled observations per job
 distill_all_jobs = false    # when true, distill runs for every job, not only enrolled agents
 ```
 
-All `[memory]` keys are read **per tick** — flipping `distill_at_terminal`
-(or any knob) takes effect on the next job with **no daemon restart**.
+All `[memory]` keys are read **per tick**. Flipping `distill_at_terminal`,
+`distill_successes` (or any knob) takes effect on the next job with **no daemon restart**.
 
 An agent returns durable facts via the optional top-level `learnings` field in
 `gitmoot_result` — each entry is `{key, scope ("repo"|"general"), content}`.

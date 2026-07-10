@@ -6612,7 +6612,7 @@ func TestSkillOptTrainCandidateReviewBodyMarksNoOpNotPromotable(t *testing.T) {
 	if strings.Contains(body, "--promote "+version.ID) {
 		t.Fatalf("candidate review body exposed promote command for no-op metadata:\n%s", body)
 	}
-	_, err = decideSkillOptTrainCandidate(context.Background(), store, session, db.SkillOptTrainIteration{
+	_, err = decideSkillOptTrainCandidate(context.Background(), config.Paths{}, store, session, db.SkillOptTrainIteration{
 		ID:                 "optimizer-train-001",
 		State:              skillopt.TrainStateCandidateReviewPublished,
 		CandidateVersionID: version.ID,

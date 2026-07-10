@@ -43,11 +43,12 @@ func daemonMemoryController(store *db.Store, home string) *workflow.MemoryContro
 		}
 	}
 	// With no enrolled agent there is normally nothing to read or write for, so the
-	// controller stays nil (byte-identical). The ONE exception is box-wide distill:
-	// distill_at_terminal + distill_all_jobs stages failure signal for EVERY job,
-	// so it needs a controller even when no agent opted into the read path. Both
-	// keys are off by default, so this widening is inert unless explicitly enabled.
-	if len(enrolled) == 0 && !(settings.DistillAtTerminal && settings.DistillAllJobs) {
+	// controller stays nil (byte-identical). The exceptions are box-wide distill
+	// producers: distill_at_terminal + distill_all_jobs stages failure signal for
+	// EVERY job, and distill_successes + distill_all_jobs stages recovered-failure
+	// success observations the same way. All keys are off by default, so this
+	// widening is inert unless explicitly enabled.
+	if len(enrolled) == 0 && !((settings.DistillAtTerminal || settings.DistillSuccesses) && settings.DistillAllJobs) {
 		return nil
 	}
 	return &workflow.MemoryController{
@@ -56,6 +57,7 @@ func daemonMemoryController(store *db.Store, home string) *workflow.MemoryContro
 		TokenBudget:       settings.TokenBudget,
 		MaxEntries:        settings.MaxEntries,
 		DistillAtTerminal: settings.DistillAtTerminal,
+		DistillSuccesses:  settings.DistillSuccesses,
 		DistillMaxPerJob:  settings.DistillMaxPerJob,
 		DistillAllJobs:    settings.DistillAllJobs,
 	}
