@@ -86,6 +86,15 @@ func RenderJob(prompt JobPrompt) string {
 		builder.WriteByte('\n')
 	}
 
+	if strings.TrimSpace(prompt.Action) == "implement" {
+		// #805: implement jobs must own the commit contract. The engine commits
+		// and delivers the worktree AFTER the job returns, so a worker that
+		// self-commits either races that settle or blocks on linked-worktree git
+		// metadata a sandboxed runtime cannot write. Keyed on the exact canonical
+		// action so ask/review prompts stay byte-identical.
+		builder.WriteString("\nGitmoot commits and delivers your changes after you finish; do not run git commit or git push.\n")
+	}
+
 	builder.WriteString("\nRequired output:\n")
 	builder.WriteString("Return exactly one JSON object containing a top-level gitmoot_result field.\n")
 	builder.WriteString("Use this shape:\n")

@@ -74,6 +74,33 @@ func TestRenderJobOmitsDelegationArtifactsWhenUnset(t *testing.T) {
 	}
 }
 
+// TestRenderJobCommitContractLine pins the #805 commit contract: an implement
+// prompt carries the one deterministic sentence telling the worker that Gitmoot
+// owns commit+delivery, and ask/review prompts never carry it (they stay
+// byte-identical to before #805 — the sentence is the only conditional write).
+func TestRenderJobCommitContractLine(t *testing.T) {
+	const contract = "Gitmoot commits and delivers your changes after you finish; do not run git commit or git push."
+	base := JobPrompt{
+		Repo:         "jerryfane/gitmoot",
+		Branch:       "task-005",
+		Instructions: "build the api",
+	}
+
+	implement := base
+	implement.Action = "implement"
+	if got := RenderJob(implement); !strings.Contains(got, contract) {
+		t.Fatalf("implement prompt missing commit contract line:\n%s", got)
+	}
+
+	for _, action := range []string{"ask", "review"} {
+		other := base
+		other.Action = action
+		if got := RenderJob(other); strings.Contains(got, contract) {
+			t.Fatalf("%s prompt unexpectedly carries the commit contract line:\n%s", action, got)
+		}
+	}
+}
+
 func TestRenderRepairPromptIncludesErrorAndRawOutput(t *testing.T) {
 	prompt := RenderRepairPrompt("not json", errors.New("missing gitmoot_result"))
 

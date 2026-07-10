@@ -385,7 +385,7 @@ func (a CodexAdapter) Start(ctx context.Context, request StartRequest) (StartRes
 	if err := validateStartRequest(request.Agent, a.Name(), request.Prompt); err != nil {
 		return StartResult{}, err
 	}
-	args := append([]string{"exec"}, codexSandboxArgs(request.Agent)...)
+	args := append([]string{"exec"}, codexSandboxArgs(request.Agent, a.Dir)...)
 	if request.Agent.Model != "" {
 		args = append(args, "--model", request.Agent.Model)
 	}
@@ -447,6 +447,9 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 }
 
 // codexDeliverArgs builds the `codex exec` argument vector for a Deliver call.
+// dir is the adapter's working directory (the job checkout); when it is a linked
+// git worktree and the sandbox is workspace-write, codexSandboxArgs grants the
+// worktree's resolved gitdir as an extra writable root (#805).
 // jsonOutput adds --json so codex streams JSONL events (thread/turn/item) on
 // stdout, which is what lets a delivery capture token usage (#658). --json is an
 // `exec` option that codex accepts before the `resume` subcommand, which is where
@@ -460,8 +463,8 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 // `codex exec` reads the prompt from stdin when the positional is `-` or omitted
 // ("instructions are read from stdin"). Routing oversize prompts through stdin is
 // deferred to a follow-up; #723 fixes kimi, which offers no stdin/file channel.
-func codexDeliverArgs(agent Agent, prompt, model string, jsonOutput bool) []string {
-	args := append([]string{"exec"}, codexSandboxArgs(agent)...)
+func codexDeliverArgs(agent Agent, dir, prompt, model string, jsonOutput bool) []string {
+	args := append([]string{"exec"}, codexSandboxArgs(agent, dir)...)
 	if jsonOutput {
 		args = append(args, "--json")
 	}
@@ -490,9 +493,9 @@ func codexDeliverArgs(agent Agent, prompt, model string, jsonOutput bool) []stri
 // and contributes 0 usage. Only the JSON re-run is retried — a genuine delivery
 // failure surfaces unchanged.
 func (a CodexAdapter) runCodex(ctx context.Context, agent Agent, prompt, model string) (subprocess.Result, error) {
-	result, err := a.runner().Run(ctx, a.Dir, "codex", codexDeliverArgs(agent, prompt, model, true)...)
+	result, err := a.runner().Run(ctx, a.Dir, "codex", codexDeliverArgs(agent, a.Dir, prompt, model, true)...)
 	if err != nil && isCodexJSONUnsupported(result) {
-		result, err = a.runner().Run(ctx, a.Dir, "codex", codexDeliverArgs(agent, prompt, model, false)...)
+		result, err = a.runner().Run(ctx, a.Dir, "codex", codexDeliverArgs(agent, a.Dir, prompt, model, false)...)
 	}
 	return result, err
 }
@@ -611,14 +614,15 @@ func effectiveModel(agent Agent, job Job) string {
 	return strings.TrimSpace(job.RuntimeDefaultModel)
 }
 
-func codexSandboxArgs(agent Agent) []string {
+func codexSandboxArgs(agent Agent, workdir string) []string {
 	// #732: a moot/chat seat must reach the daemon chat-relay unix socket, but a
 	// codex read-only sandbox blocks the connect() syscall itself (empirically
 	// probed on codex-cli 0.142.4 bubblewrap+seccomp). Dispatch the seat with
 	// workspace-write + network so it can connect; the gitmoot home is NOT in
 	// workspace-write's writable roots (workdir + /tmp + $TMPDIR), so the home stays
 	// read-only — the relay, not the seat, does the write. This is self-contained
-	// (does not depend on the operator's global ~/.codex/config.toml).
+	// (does not depend on the operator's global ~/.codex/config.toml). A seat's
+	// whole job is chat, not git, so it takes no #805 gitdir grant.
 	if agent.ChatSeat {
 		return []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"}
 	}
@@ -626,12 +630,59 @@ func codexSandboxArgs(agent Agent) []string {
 	case AutonomyPolicyReadOnly:
 		return []string{"--sandbox", "read-only"}
 	case AutonomyPolicyWorkspaceWrite:
-		return []string{"--sandbox", "workspace-write"}
+		args := []string{"--sandbox", "workspace-write"}
+		// #805: a linked-worktree checkout keeps its real git metadata under the
+		// main repo's .git/worktrees/<name>, OUTSIDE workspace-write's writable
+		// roots, so every metadata-writing git operation (status refresh, add,
+		// commit) fails on the index lock inside the sandbox. Grant exactly that
+		// resolved gitdir via --add-dir — additive, mirroring how `plugin
+		// codex-launch` grants the gitmoot home, and unlike a
+		// `-c sandbox_workspace_write.writable_roots=[...]` override it cannot
+		// clobber roots the operator's config.toml already grants. A primary
+		// checkout (or empty/unknown workdir) resolves to "" and the argv stays
+		// byte-identical.
+		if gitdir := linkedWorktreeGitDir(workdir); gitdir != "" {
+			args = append(args, "--add-dir", gitdir)
+		}
+		return args
 	case AutonomyPolicyDangerFullAccess:
 		return []string{"--sandbox", "danger-full-access"}
 	default:
 		return nil
 	}
+}
+
+// linkedWorktreeGitDir resolves the per-worktree git metadata directory of a
+// linked `git worktree` checkout (#805). In a linked worktree, <dir>/.git is a
+// FILE whose first line is "gitdir: <main-repo>/.git/worktrees/<name>"; that
+// resolved directory holds the worktree's index/HEAD and lives outside the
+// checkout. It returns "" — the fail-open "not applicable" answer — for a
+// primary checkout (.git is a directory), a missing or empty dir, or a
+// malformed .git file. A relative gitdir (git tolerates one) is resolved
+// against dir so the sandbox grant is always an absolute root.
+func linkedWorktreeGitDir(dir string) string {
+	if strings.TrimSpace(dir) == "" {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(dir, ".git"))
+	if err != nil {
+		// A primary checkout's .git is a directory (EISDIR) and a non-repo has
+		// none (ENOENT); both mean there is no linked gitdir to grant.
+		return ""
+	}
+	line, _, _ := strings.Cut(strings.TrimSpace(string(data)), "\n")
+	rest, ok := strings.CutPrefix(strings.TrimSpace(line), "gitdir:")
+	if !ok {
+		return ""
+	}
+	gitdir := strings.TrimSpace(rest)
+	if gitdir == "" {
+		return ""
+	}
+	if !filepath.IsAbs(gitdir) {
+		gitdir = filepath.Join(dir, gitdir)
+	}
+	return filepath.Clean(gitdir)
 }
 
 // defaultClaudeRetryBackoff is the base pause between Claude delivery attempts

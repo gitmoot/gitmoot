@@ -465,6 +465,18 @@ subscribe`, and at implement-job dispatch with an actionable message. Set
 `go`/`git`/`gh`), or `--policy workspace-write` for edits-only (Bash stays
 blocked). See `references/SAFETY.md` for the full mapping and rationale.
 
+Implement jobs own the commit contract: Gitmoot commits and delivers the
+worktree's changes after the job finishes, and every rendered implement prompt
+carries one deterministic sentence telling the worker not to run `git commit`
+or `git push`. Ask and review prompts are unchanged. On the Codex runtime, a
+`workspace-write` job whose checkout is a linked `git worktree` also gets the
+worktree's resolved git directory (`<main-repo>/.git/worktrees/<name>`) added
+to the sandbox writable roots via `--add-dir`, so routine git metadata writes
+(an index refresh from `git status`, or `git add`) work inside the sandbox.
+The grant is additive and leaves operator-configured `writable_roots` intact;
+read-only and danger-full-access sandboxes and primary (non-worktree)
+checkouts are unchanged.
+
 `agent subscribe` accepts `--preset-delivery full|referenced|auto` (default
 `full`) and `agent update <name> --preset-delivery <mode>` flips it in place on
 an already-registered agent. The mode is a sticky per-agent preference:
