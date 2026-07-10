@@ -116,7 +116,8 @@ const (
 var ErrConfirmedMemoryRetired = errors.New("confirmed memory is retired")
 
 type upsertConfirmedMemoryOptions struct {
-	allowResurrect bool
+	allowResurrect   bool
+	preserveEditions bool
 }
 
 // UpsertConfirmedMemoryOption tunes confirmed-memory upsert behavior.
@@ -127,6 +128,20 @@ type UpsertConfirmedMemoryOption func(*upsertConfirmedMemoryOptions)
 func AllowResurrectConfirmedMemory() UpsertConfirmedMemoryOption {
 	return func(o *upsertConfirmedMemoryOptions) {
 		o.allowResurrect = true
+	}
+}
+
+// PreserveSupersededEdition makes a key-matched in-place UPDATE archive the prior
+// edition first (#804): the old content is copied to a new row whose
+// superseded_by points at the live row, then the live row is overwritten.
+// AUTO-CONFIRMED writers (ingest auto-confirm, chat remember) pass this so a bad
+// or poisoned edit can never silently destroy the last human-reviewed edition —
+// the archived row stays inspectable by groom, the vault ghosts, and the brain
+// graph. Manual human-controlled paths (vault import CAS edits, `memory confirm
+// --yes`) keep their existing overwrite semantics and do NOT pass this option.
+func PreserveSupersededEdition() UpsertConfirmedMemoryOption {
+	return func(o *upsertConfirmedMemoryOptions) {
+		o.preserveEditions = true
 	}
 }
 
@@ -408,13 +423,20 @@ func (s *Store) UpsertConfirmedMemory(ctx context.Context, cm ConfirmedMemory, o
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Superseded archival editions never key-match. Since the #804 partial unique
+	// indexes cover only active rows, several retired rows may share a key: prefer
+	// the active row, then the newest retired one, so the match (and an explicit
+	// resurrection) stays deterministic.
 	var id int64
 	var retiredAt string
 	err = tx.QueryRowContext(ctx, `
 SELECT id, retired_at FROM confirmed_memories
 WHERE owner_kind = ? AND owner_ref = ? AND owner_version = ?
 	AND ((? IS NULL AND repo IS NULL) OR repo = ?)
-	AND key = ?`,
+	AND key = ?
+	AND superseded_by IS NULL
+ORDER BY CASE WHEN retired_at = '' THEN 0 ELSE 1 END, id DESC
+LIMIT 1`,
 		cm.Owner.Kind, cm.Owner.Ref, cm.Owner.Version, nullableRepo(cm.Repo), nullableRepo(cm.Repo), cm.Key).Scan(&id, &retiredAt)
 	switch {
 	case err == sql.ErrNoRows:
@@ -435,6 +457,11 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	default:
 		if retiredAt != "" && !options.allowResurrect {
 			return 0, fmt.Errorf("%w: confirmed memory %d key %q", ErrConfirmedMemoryRetired, id, cm.Key)
+		}
+		if options.preserveEditions {
+			if err := archiveSupersededEditionTx(ctx, tx, id, cm.Content); err != nil {
+				return 0, err
+			}
 		}
 		// Only explicit human-controlled paths pass AllowResurrectConfirmedMemory.
 		// When they do, a fresh confirmation of an existing key re-activates it by
@@ -465,6 +492,41 @@ WHERE id = ?`,
 	return id, nil
 }
 
+// archiveSupersededEditionTx copies confirmed row id's CURRENT edition to a new
+// row carrying superseded_by = id, so the history of an auto-confirmed in-place
+// update survives for groom, the brain graph, and audit (#804). The archival row
+// escapes the active-row partial unique indexes (superseded_by is set), is never
+// added to FTS, and carries no memory_links — links stay keyed on the live row
+// id, which does not change. A byte-identical update archives nothing: there is
+// no history to preserve.
+func archiveSupersededEditionTx(ctx context.Context, tx *sql.Tx, id int64, newContent string) error {
+	var prev ConfirmedMemory
+	var repoNull sql.NullString
+	err := tx.QueryRowContext(ctx, `
+SELECT owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
+	provenance, source_job, first_confirmed_at, updated_at
+FROM confirmed_memories WHERE id = ?`, id).Scan(
+		&prev.Owner.Kind, &prev.Owner.Ref, &prev.Owner.Version, &prev.AuthorRef, &repoNull,
+		&prev.Scope, &prev.Key, &prev.Content, &prev.Provenance, &prev.SourceJob,
+		&prev.FirstConfirmedAt, &prev.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("read confirmed memory %d for supersede archive: %w", id, err)
+	}
+	if prev.Content == newContent {
+		return nil
+	}
+	prev.Repo = repoNull.String
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO confirmed_memories
+	(owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, provenance, source_job, first_confirmed_at, updated_at, superseded_by)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		prev.Owner.Kind, prev.Owner.Ref, prev.Owner.Version, prev.AuthorRef, nullableRepo(prev.Repo), prev.Scope,
+		prev.Key, prev.Content, prev.Provenance, prev.SourceJob, prev.FirstConfirmedAt, prev.UpdatedAt, id); err != nil {
+		return fmt.Errorf("archive superseded edition of confirmed memory %d: %w", id, err)
+	}
+	return nil
+}
+
 // PromoteConfirmedMemoriesToShared moves active confirmed rows into the reserved
 // shared pool without changing their primary keys, content, keys, or FTS rows.
 // Existing memory_links survive because they key on confirmed_memories.id. When
@@ -492,56 +554,67 @@ func (s *Store) PromoteConfirmedMemoriesToShared(ctx context.Context, ids []int6
 			continue
 		}
 		seen[id] = struct{}{}
-
-		var c ConfirmedMemory
-		var repoNull sql.NullString
-		var retiredAt string
-		err := tx.QueryRowContext(ctx, `
-SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
-	provenance, source_job, first_confirmed_at, updated_at, COALESCE(superseded_by, 0), retired_at
-FROM confirmed_memories
-WHERE id = ?`, id).Scan(
-			&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &c.AuthorRef, &repoNull,
-			&c.Scope, &c.Key, &c.Content, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt,
-			&c.UpdatedAt, &c.SupersededBy, &retiredAt)
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("confirmed memory %d not found", id)
-		}
+		c, err := promoteConfirmedMemoryToSharedTx(ctx, tx, id, now)
 		if err != nil {
-			return nil, fmt.Errorf("read confirmed memory %d: %w", id, err)
+			return nil, err
 		}
-		c.Repo = repoNull.String
-		if c.SupersededBy != 0 {
-			return nil, fmt.Errorf("confirmed memory %d is superseded", id)
-		}
-		if retiredAt != "" {
-			return nil, fmt.Errorf("confirmed memory %d is retired", id)
-		}
-
-		if c.Owner.Kind == memoryOwnerKindShared && c.Owner.Ref == memorySharedOwnerRef {
-			out = append(out, c)
-			continue
-		}
-		author := strings.TrimSpace(c.AuthorRef)
-		if author == "" {
-			author = c.Owner.Ref
-		}
-		if _, err := tx.ExecContext(ctx, `
-UPDATE confirmed_memories
-SET owner_kind = ?, owner_ref = ?, owner_version = '', author_ref = ?, updated_at = ?
-WHERE id = ?`,
-			memoryOwnerKindShared, memorySharedOwnerRef, author, now, id); err != nil {
-			return nil, fmt.Errorf("promote confirmed memory %d to shared: %w", id, err)
-		}
-		c.Owner = MemoryOwner{Kind: memoryOwnerKindShared, Ref: memorySharedOwnerRef}
-		c.AuthorRef = author
-		c.UpdatedAt = now
 		out = append(out, c)
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// promoteConfirmedMemoryToSharedTx is the per-row transaction body shared by
+// PromoteConfirmedMemoriesToShared and the groom cross-pool apply. It moves ONE
+// active confirmed row into the reserved shared pool (a no-op returning the row
+// unchanged when it is already shared), preserving the author. Retired or
+// superseded rows are refused so stale facts cannot be widened to every agent.
+func promoteConfirmedMemoryToSharedTx(ctx context.Context, tx *sql.Tx, id int64, now string) (ConfirmedMemory, error) {
+	var c ConfirmedMemory
+	var repoNull sql.NullString
+	var retiredAt string
+	err := tx.QueryRowContext(ctx, `
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
+	provenance, source_job, first_confirmed_at, updated_at, COALESCE(superseded_by, 0), retired_at
+FROM confirmed_memories
+WHERE id = ?`, id).Scan(
+		&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &c.AuthorRef, &repoNull,
+		&c.Scope, &c.Key, &c.Content, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt,
+		&c.UpdatedAt, &c.SupersededBy, &retiredAt)
+	if err == sql.ErrNoRows {
+		return ConfirmedMemory{}, fmt.Errorf("confirmed memory %d not found", id)
+	}
+	if err != nil {
+		return ConfirmedMemory{}, fmt.Errorf("read confirmed memory %d: %w", id, err)
+	}
+	c.Repo = repoNull.String
+	if c.SupersededBy != 0 {
+		return ConfirmedMemory{}, fmt.Errorf("confirmed memory %d is superseded", id)
+	}
+	if retiredAt != "" {
+		return ConfirmedMemory{}, fmt.Errorf("confirmed memory %d is retired", id)
+	}
+
+	if c.Owner.Kind == memoryOwnerKindShared && c.Owner.Ref == memorySharedOwnerRef {
+		return c, nil
+	}
+	author := strings.TrimSpace(c.AuthorRef)
+	if author == "" {
+		author = c.Owner.Ref
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE confirmed_memories
+SET owner_kind = ?, owner_ref = ?, owner_version = '', author_ref = ?, updated_at = ?
+WHERE id = ?`,
+		memoryOwnerKindShared, memorySharedOwnerRef, author, now, id); err != nil {
+		return ConfirmedMemory{}, fmt.Errorf("promote confirmed memory %d to shared: %w", id, err)
+	}
+	c.Owner = MemoryOwner{Kind: memoryOwnerKindShared, Ref: memorySharedOwnerRef}
+	c.AuthorRef = author
+	c.UpdatedAt = now
+	return c, nil
 }
 
 // EnrichConfirmedMemoryLinks computes the deterministic top-K similarity links
@@ -1165,32 +1238,335 @@ func (s *Store) ApplyGroomRetirements(ctx context.Context, items []GroomRetire) 
 	defer func() { _ = tx.Rollback() }()
 	now := nowRFC3339()
 	for _, it := range items {
-		res, err := tx.ExecContext(ctx, `
-UPDATE confirmed_memories
-SET retired_at = ?, retired_reason = ?
-WHERE id = ? AND retired_at = ''`, now, it.Reason, it.ID)
-		if err != nil {
-			return GroomRetireResult{}, fmt.Errorf("groom retire %d: %w", it.ID, err)
-		}
-		affected, err := res.RowsAffected()
+		retired, err := groomRetireTx(ctx, tx, it.ID, it.Reason, now)
 		if err != nil {
 			return GroomRetireResult{}, err
 		}
-		if affected == 0 {
-			// Already retired within this batch (a duplicate id), already retired by a
-			// prior apply, or the row is gone — skip gracefully.
+		if retired {
+			result.Retired = append(result.Retired, it.ID)
+		} else {
 			result.Skipped = append(result.Skipped, it.ID)
-			continue
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM confirmed_memories_fts WHERE rowid = ?`, it.ID); err != nil {
-			return GroomRetireResult{}, fmt.Errorf("groom retire fts %d: %w", it.ID, err)
-		}
-		result.Retired = append(result.Retired, it.ID)
 	}
 	if err := tx.Commit(); err != nil {
 		return GroomRetireResult{}, err
 	}
 	return result, nil
+}
+
+// groomRetireTx retires one row for a groom-style plan apply, removing it from
+// FTS in the same transaction. Unlike retireConfirmedMemoryTx it SKIPS gracefully
+// (returns false, nil) when the row is already retired or missing: a plan may
+// carry duplicate ids and re-applying must stay idempotent.
+func groomRetireTx(ctx context.Context, tx *sql.Tx, id int64, reason, now string) (bool, error) {
+	res, err := tx.ExecContext(ctx, `
+UPDATE confirmed_memories
+SET retired_at = ?, retired_reason = ?
+WHERE id = ? AND retired_at = ''`, now, reason, id)
+	if err != nil {
+		return false, fmt.Errorf("groom retire %d: %w", id, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		// Already retired within this batch (a duplicate id), already retired by a
+		// prior apply, or the row is gone — skip gracefully.
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM confirmed_memories_fts WHERE rowid = ?`, id); err != nil {
+		return false, fmt.Errorf("groom retire fts %d: %w", id, err)
+	}
+	return true, nil
+}
+
+// GroomRekeyItem is one planned #804 rekey group: rewrite the keeper's key to
+// the stable form and retire its older sibling editions, stamping Reason as
+// their retired_reason.
+type GroomRekeyItem struct {
+	KeepID    int64
+	NewKey    string
+	RetireIDs []int64
+	Reason    string
+}
+
+// GroomCrossPoolItem is one planned #804 promote-and-retire pair: retire the
+// stale shared row (Reason as retired_reason) and promote the newer private row
+// into the shared pool, preserving its author.
+type GroomCrossPoolItem struct {
+	PrivateID int64
+	SharedID  int64
+	Reason    string
+}
+
+// GroomPlanApplyResult reports what one ApplyGroomPlan transaction did. Skipped
+// ids were already retired, missing, no longer active, or would have collided
+// with an active same-key row — every skip is graceful so re-applying stays
+// idempotent.
+type GroomPlanApplyResult struct {
+	Retired          []int64
+	RetireSkipped    []int64
+	Rekeyed          []int64 // keeper ids whose group applied
+	RekeySkipped     []int64 // keeper ids whose group was skipped whole
+	Promoted         []int64 // private ids promoted to the shared pool
+	CrossPoolSkipped []int64 // private ids whose pair was skipped
+}
+
+// ApplyGroomPlan applies a whole groom plan in ONE transaction, in a fixed
+// order: plain retirements first, then rekey groups, then cross-pool
+// promote-and-retire pairs. All-or-nothing on error; within the transaction each
+// action skips gracefully when its target rows are no longer in the expected
+// state (the caller's snapshot-hash staleness guard protects against a store
+// that moved between propose and apply — this method just executes the vetted
+// plan defensively).
+func (s *Store) ApplyGroomPlan(ctx context.Context, retirements []GroomRetire, rekeys []GroomRekeyItem, crossPool []GroomCrossPoolItem) (GroomPlanApplyResult, error) {
+	var result GroomPlanApplyResult
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return result, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := nowRFC3339()
+
+	for _, it := range retirements {
+		retired, err := groomRetireTx(ctx, tx, it.ID, it.Reason, now)
+		if err != nil {
+			return GroomPlanApplyResult{}, err
+		}
+		if retired {
+			result.Retired = append(result.Retired, it.ID)
+		} else {
+			result.RetireSkipped = append(result.RetireSkipped, it.ID)
+		}
+	}
+
+	for _, it := range rekeys {
+		applied, err := groomRekeyTx(ctx, tx, it, now)
+		if err != nil {
+			return GroomPlanApplyResult{}, err
+		}
+		if applied {
+			result.Rekeyed = append(result.Rekeyed, it.KeepID)
+		} else {
+			result.RekeySkipped = append(result.RekeySkipped, it.KeepID)
+		}
+	}
+
+	for _, it := range crossPool {
+		applied, err := groomCrossPoolTx(ctx, tx, it, now)
+		if err != nil {
+			return GroomPlanApplyResult{}, err
+		}
+		if applied {
+			result.Promoted = append(result.Promoted, it.PrivateID)
+		} else {
+			result.CrossPoolSkipped = append(result.CrossPoolSkipped, it.PrivateID)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return GroomPlanApplyResult{}, err
+	}
+	return result, nil
+}
+
+// groomRekeyTx applies one rekey group: verify the keeper is still active,
+// verify the stable key is not held by another active row in the same domain,
+// retire the sibling editions, rewrite the keeper's key, and re-sync its FTS row
+// (content unchanged, key column updated) — all inside the caller's transaction.
+// Returns (false, nil) to skip the WHOLE group when the keeper is gone/inactive
+// or the target key is occupied, so a plan raced by an earlier retirement never
+// half-applies a group.
+func groomRekeyTx(ctx context.Context, tx *sql.Tx, item GroomRekeyItem, now string) (bool, error) {
+	var keep ConfirmedMemory
+	var repoNull sql.NullString
+	var retiredAt string
+	err := tx.QueryRowContext(ctx, `
+SELECT owner_kind, owner_ref, owner_version, repo, key, content, retired_at
+FROM confirmed_memories
+WHERE id = ? AND superseded_by IS NULL`, item.KeepID).Scan(
+		&keep.Owner.Kind, &keep.Owner.Ref, &keep.Owner.Version, &repoNull, &keep.Key, &keep.Content, &retiredAt)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("groom rekey read keeper %d: %w", item.KeepID, err)
+	}
+	if retiredAt != "" {
+		return false, nil
+	}
+	keep.Repo = repoNull.String
+
+	if item.NewKey != keep.Key {
+		var occupied int
+		if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM confirmed_memories
+WHERE owner_kind = ? AND owner_ref = ? AND owner_version = ?
+	AND ((? IS NULL AND repo IS NULL) OR repo = ?)
+	AND key = ? AND superseded_by IS NULL AND retired_at = '' AND id <> ?`,
+			keep.Owner.Kind, keep.Owner.Ref, keep.Owner.Version,
+			nullableRepo(keep.Repo), nullableRepo(keep.Repo), item.NewKey, item.KeepID).Scan(&occupied); err != nil {
+			return false, fmt.Errorf("groom rekey occupancy check for %q: %w", item.NewKey, err)
+		}
+		if occupied > 0 {
+			return false, nil
+		}
+	}
+
+	for _, rid := range item.RetireIDs {
+		if _, err := groomRetireTx(ctx, tx, rid, item.Reason, now); err != nil {
+			return false, err
+		}
+	}
+
+	if item.NewKey != keep.Key {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE confirmed_memories SET key = ?, updated_at = ? WHERE id = ?`,
+			item.NewKey, now, item.KeepID); err != nil {
+			return false, fmt.Errorf("groom rekey %d to %q: %w", item.KeepID, item.NewKey, err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM confirmed_memories_fts WHERE rowid = ?`, item.KeepID); err != nil {
+			return false, fmt.Errorf("groom rekey fts delete %d: %w", item.KeepID, err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO confirmed_memories_fts(rowid, content, key) VALUES (?, ?, ?)`,
+			item.KeepID, keep.Content, item.NewKey); err != nil {
+			return false, fmt.Errorf("groom rekey fts insert %d: %w", item.KeepID, err)
+		}
+	}
+	return true, nil
+}
+
+// groomCrossPoolTx applies one promote-and-retire pair: retire the stale shared
+// row FIRST (freeing its slot in the active-row unique index for the equal-key
+// case), then promote the private row into the shared pool with its author
+// preserved. Skips gracefully when the private row is no longer active or when
+// promoting would collide with a different active shared row on the same key.
+func groomCrossPoolTx(ctx context.Context, tx *sql.Tx, item GroomCrossPoolItem, now string) (bool, error) {
+	var privateKey string
+	var repoNull sql.NullString
+	err := tx.QueryRowContext(ctx, `
+SELECT key, repo FROM confirmed_memories
+WHERE id = ? AND superseded_by IS NULL AND retired_at = ''`, item.PrivateID).Scan(&privateKey, &repoNull)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("groom cross-pool read private %d: %w", item.PrivateID, err)
+	}
+
+	// The stale shared edition may already be retired by an earlier plan section
+	// or a prior apply — that is fine, retiring is graceful.
+	if _, err := groomRetireTx(ctx, tx, item.SharedID, item.Reason, now); err != nil {
+		return false, err
+	}
+
+	var occupied int
+	if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM confirmed_memories
+WHERE owner_kind = ? AND owner_ref = ? AND owner_version = ''
+	AND ((? IS NULL AND repo IS NULL) OR repo = ?)
+	AND key = ? AND superseded_by IS NULL AND retired_at = '' AND id <> ?`,
+		memoryOwnerKindShared, memorySharedOwnerRef,
+		nullableRepo(repoNull.String), nullableRepo(repoNull.String), privateKey, item.PrivateID).Scan(&occupied); err != nil {
+		return false, fmt.Errorf("groom cross-pool occupancy check for %q: %w", privateKey, err)
+	}
+	if occupied > 0 {
+		return false, nil
+	}
+
+	if _, err := promoteConfirmedMemoryToSharedTx(ctx, tx, item.PrivateID, now); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// CrossPoolSharedMatch is the store-computed secondary-evidence tuple for the
+// groom cross-pool detector (#804): one active private agent fact, its TOP bm25
+// match among active shared-pool facts in the same repo/scope domain, and
+// whether a memory_links edge connects the two rows in either direction. Pure
+// read; zero writes.
+type CrossPoolSharedMatch struct {
+	PrivateID int64
+	SharedID  int64
+	Score     float64 // -bm25, higher is better
+	Linked    bool
+}
+
+// ListCrossPoolSharedMatches computes the cross-pool secondary signals: for
+// every active private agent fact, the single best bm25 shared-pool match in the
+// same repo/scope domain (built from the fact's own content, like auto-linking)
+// plus the linked flag. Private facts are collected FIRST and queried after —
+// the store runs on one connection, so nesting a query inside an open rows
+// iteration would deadlock.
+func (s *Store) ListCrossPoolSharedMatches(ctx context.Context) ([]CrossPoolSharedMatch, error) {
+	type privateFact struct {
+		id      int64
+		repo    string
+		scope   string
+		content string
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, repo, scope, content FROM confirmed_memories
+WHERE owner_kind = ? AND superseded_by IS NULL AND retired_at = ''
+ORDER BY id`, memoryOwnerKindAgent)
+	if err != nil {
+		return nil, fmt.Errorf("list private facts for cross-pool signals: %w", err)
+	}
+	var facts []privateFact
+	for rows.Next() {
+		var f privateFact
+		var repoNull sql.NullString
+		if err := rows.Scan(&f.id, &repoNull, &f.scope, &f.content); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		f.repo = repoNull.String
+		facts = append(facts, f)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	var out []CrossPoolSharedMatch
+	for _, f := range facts {
+		matchQuery := memoryLinkMatchQuery(f.content)
+		if strings.TrimSpace(matchQuery) == "" {
+			continue
+		}
+		var sharedID int64
+		var score float64
+		err := s.db.QueryRowContext(ctx, `
+SELECT c.id, -bm25(f.confirmed_memories_fts) AS score
+FROM confirmed_memories_fts f
+JOIN confirmed_memories c ON c.id = f.rowid
+WHERE f.confirmed_memories_fts MATCH ?
+	AND c.owner_kind = ? AND c.owner_ref = ?
+	AND ((? IS NULL AND c.repo IS NULL) OR c.repo = ?)
+	AND c.scope = ?
+	AND c.superseded_by IS NULL AND c.retired_at = ''
+ORDER BY bm25(f.confirmed_memories_fts), c.id
+LIMIT 1`,
+			matchQuery, memoryOwnerKindShared, memorySharedOwnerRef,
+			nullableRepo(f.repo), nullableRepo(f.repo), f.scope).Scan(&sharedID, &score)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("cross-pool shared match for %d: %w", f.id, err)
+		}
+		var linked int
+		if err := s.db.QueryRowContext(ctx, `
+SELECT EXISTS(SELECT 1 FROM memory_links
+WHERE (src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))`,
+			f.id, sharedID, sharedID, f.id).Scan(&linked); err != nil {
+			return nil, fmt.Errorf("cross-pool link check %d<->%d: %w", f.id, sharedID, err)
+		}
+		out = append(out, CrossPoolSharedMatch{PrivateID: f.id, SharedID: sharedID, Score: score, Linked: linked != 0})
+	}
+	return out, nil
 }
 
 // QueryConfirmedMemories is the READ path for job-prompt assembly. It runs one

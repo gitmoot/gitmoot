@@ -476,6 +476,18 @@ subscribe`, and at implement-job dispatch with an actionable message. Set
 `go`/`git`/`gh`), or `--policy workspace-write` for edits-only (Bash stays
 blocked). See `references/SAFETY.md` for the full mapping and rationale.
 
+Implement jobs own the commit contract: Gitmoot commits and delivers the
+worktree's changes after the job finishes, and every rendered implement prompt
+carries one deterministic sentence telling the worker not to run `git commit`
+or `git push`. Ask and review prompts are unchanged. On the Codex runtime, a
+`workspace-write` job whose checkout is a linked `git worktree` also gets the
+worktree's resolved git directory (`<main-repo>/.git/worktrees/<name>`) added
+to the sandbox writable roots via `--add-dir`, so routine git metadata writes
+(an index refresh from `git status`, or `git add`) work inside the sandbox.
+The grant is additive and leaves operator-configured `writable_roots` intact;
+read-only and danger-full-access sandboxes and primary (non-worktree)
+checkouts are unchanged.
+
 `agent subscribe` accepts `--preset-delivery full|referenced|auto` (default
 `full`) and `agent update <name> --preset-delivery <mode>` flips it in place on
 an already-registered agent. The mode is a sticky per-agent preference:
@@ -545,12 +557,34 @@ gitmoot agent run lead --repo owner/repo --task task-001 --background "Implement
 gitmoot agent run reviewer --repo owner/repo --pr 12 --background "Review this PR."
 gitmoot agent review reviewer --repo owner/repo --pr 12 "Review this PR."
 gitmoot agent implement lead --repo owner/repo --task task-001 "Implement this task."
+gitmoot agent implement lead --repo owner/repo --task task-002 --base origin/main "Implement from current origin/main."
 gitmoot agent ask project-planner --repo owner/repo "Return the plan status."
 gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
 gitmoot agent run lead --repo owner/repo --model gpt-5-codex "Implement this task."
 gitmoot agent run lead --repo owner/repo --effort xhigh "Implement this task."
 gitmoot job watch <job-id>
 ```
+
+For `agent implement`, `--base <ref>` selects the commit used to create a new
+branch worktree. `agent run` accepts the same flag when it routes to implement.
+An `origin/*` ref is fetched before it is resolved, and an unknown ref fails
+before a job is enqueued. `--base HEAD` explicitly follows the registered
+checkout's current commit. On implement, `--head-sha <sha>` is a compatibility
+alias for `--base <sha>`; passing both with different values is an error.
+
+Set a default for implement dispatches in `config.toml`:
+
+```toml
+[workflow]
+implement_base = "origin/main"
+```
+
+The flag wins over the config value. The config value `"HEAD"` keeps
+checkout-following behavior. With no flag and no config value, Gitmoot still
+uses checkout HEAD, but refuses when the checkout is on a non-default branch
+that is behind `origin/<default>`. The error reports the branch and behind
+count and offers both explicit choices: `--base origin/<default>` or
+`--base HEAD`.
 
 `gitmoot agent run`, `ask`, `implement`, and `review` (and `orchestrate`) accept
 an optional `--model <name>` flag that pins the runtime model for that one job,
@@ -1094,6 +1128,20 @@ credential probe passes; the probe failing just extends the hold without spendin
 a retry. So a job that "failed then reappeared as queued" is the deferral
 working, not a bug. Product failures (the agent answered with a `gitmoot_result`,
 including `decision=failed`) are never auto-retried.
+
+When a runtime session ends **without** producing a `gitmoot_result` envelope —
+the CLI process crashed, exited non-zero, was signal-killed, or completed but
+never emitted a valid envelope even after repair attempts — the job records
+**failure diagnostics** (#806): a `phase` marker (`launched` = died before any
+stdout, `streaming` = died mid-output, `result-parse` = every delivery completed
+but no valid envelope was found), the process `exit_code` **or** terminating
+`signal`, a **redacted** stderr tail (hard-capped at 2 KB; redaction runs over
+the full text with the same token-redaction rules as job comments *before* the
+tail is cut, so a secret can never leak partially), and the runtime session id
+when one is known. `gitmoot job show` prints a `failure_diagnostics:` block,
+`job show --json` carries `payload.failure_diagnostics`, and `gitmoot report
+bug` includes a "Failure diagnostics" section. Successful jobs never store one,
+and a retried job clears the previous run's crash report.
 
 Jobs stuck in `running` are also backstopped: a running job with no lease
 progress past the staleness window (default 30m) is assumed orphaned by a dead
@@ -1792,6 +1840,19 @@ their author. With auto-confirm enabled, the confirmed write still goes to
 `--agent NAME`'s private pool, not shared. `--dry-run` reports what would be
 staged without writing.
 
+Chunk keys are **stable**: `slug(file)-slug(heading)`, with an ordinal suffix
+(`-2`, `-3`) only when a file/heading pair repeats within one sweep. The content
+hash participates only in dedup, never in the key, so a re-swept **edited** note
+lands on the same key as its earlier edition and, under auto-confirm, updates
+the existing confirmed fact **in place**. Auto-confirmed key-matched updates
+(ingest auto-confirm and `chat remember`) are **supersede-preserving**: the
+prior edition is archived first as a `superseded_by` row (out of FTS, out of the
+vault; `memory_links` stay on the unchanged live row id) so a bad edit never
+destroys the last reviewed edition. Manual paths (vault import CAS edits,
+`memory confirm --yes`) keep plain overwrite semantics. Keys minted before this
+scheme end in an 8-hex content-hash suffix; the groom **rekey** detector
+migrates them (below).
+
 `memory ingest sweep` reads every configured `[[memory.ingest]]` source from the
 current config at run time and runs the same ingest logic in-process for each one.
 `--json` emits per-source entries with `path`, `agent`, `repo`, `tier`,
@@ -1880,8 +1941,8 @@ gitmoot memory groom --yes --plan PLAN.json [--json]
 `--propose` reads every **active** confirmed memory (retired rows excluded),
 computes the current vault `snapshot_hash` (the same anchor `vault export`/`import`
 use), runs deterministic detectors, and writes a reviewable plan artifact
-(`{schema_version, snapshot_hash, proposed_retirements, rewrite_flags, stats}`). It
-**touches nothing** in the store. The detectors are:
+(`{schema_version, snapshot_hash, proposed_retirements, rewrite_flags, rekeys,
+cross_pool, stats}`). It **touches nothing** in the store. The detectors are:
 
 - **status/changelog/ToC snapshots** — notes dominated (≥80% of non-blank lines) by
   `STATUS:` markers, `SHIPPED`/`merged & deployed` changelog phrases, ISO-date-led
@@ -1898,14 +1959,31 @@ use), runs deterministic detectors, and writes a reviewable plan artifact
   proposed retirement so you can tell them apart);
 - **over-long "bricks"** (content > ~1200 chars) are **flagged for rewrite**, never
   retired — P4.2 only lists them for the owner (LLM rewriting is the follow-up
-  P4.3).
+  P4.3);
+- **legacy-key rekeys** (#804): active rows whose key still ends in the
+  pre-stable-key 8-hex content-hash suffix (`…-a1b2c3d4`) are grouped per
+  owner/repo/scope by their stripped stable key. Organic sweeps can never fix
+  them (content dedup skips unchanged notes; the first edit would spawn a
+  stable-keyed third sibling), so the plan keeps the current edition (the row
+  already holding the stable key when one exists, otherwise the newest by
+  `updated_at`), rewrites its key to the stable form, and retires the older
+  siblings with reason `rekey: superseded edition`;
+- **cross-pool stale shared editions** (#804): a shared-pool fact gets a
+  **promote-and-retire pair** when a strictly newer private fact matches it in
+  the same repo and scope, by stable-key equality (primary, deterministic) or
+  by a strong BM25 top-match that also shares a `memory_links` edge (composite
+  secondary evidence; BM25 alone never proposes). Applying promotes the newer
+  private edition to the shared pool (author preserved) and retires the stale
+  shared edition with reason `cross-pool: superseded by promoted edition`.
 
 `--yes --plan` recomputes the `snapshot_hash` and **aborts as stale** if it differs
 from the plan's (a vault edit between propose and apply invalidates it), then
-retires exactly the planned ids in **one transaction** (reason `groom:<detector>`,
-FTS index cleared in the same tx). It is **retire-only** — no content is edited or
-rewritten — and idempotent: an already-retired or missing id in the plan is skipped
-gracefully rather than aborting the batch.
+applies the whole plan in **one transaction**: retirements (reason
+`groom:<detector>`, FTS index cleared in the same tx), rekey groups (FTS key
+column re-synced in the same tx), and cross-pool pairs. **No content is edited or
+rewritten**, and applying is idempotent: an already-retired or missing id is
+skipped gracefully, and a rekey group or cross-pool pair whose rows changed state
+since the proposal is skipped whole rather than half-applied.
 
 The built-in `memory-groom-propose` pipeline runs only the proposal half:
 `gitmoot memory groom --propose --out <run-scoped-plan> --json`, then summarizes
@@ -1925,9 +2003,9 @@ groom_propose = "nightly"
 gitmoot pipeline run memory-groom-propose
 ```
 
-### memory clusters (#763)
+### memory clusters (#763, #779)
 
-`memory clusters` surfaces **emergent memory clusters** — communities detected over
+`memory clusters` surfaces **emergent memory clusters**: communities detected over
 the fact-similarity graph, the **same** bm25 + id-tiebreak signal the vault
 `[[links]]` use. They replace the old fixed key-prefix "category" hubs on the
 dashboard Knowledge view: clusters are discovered from what the facts actually say,
@@ -1940,38 +2018,52 @@ gitmoot memory clusters recompute --apply [--plan PLAN.json] [--json]
 gitmoot memory cluster rename <cluster-id> <label>
 ```
 
-- `memory clusters` lists each cluster with its display label (the owner override
-  when set, else the computed label), member count, and medoid fact id. The
-  reserved cluster **0 `unclustered`** holds facts with no similarity neighbors.
+- `memory clusters` lists the hierarchy with child clusters indented. Every row
+  includes its display label (the owner override when set, else the computed
+  label), member count, and medoid fact id. A split parent's count is the sum of
+  its leaf children. The reserved cluster **0 `unclustered`** holds facts with no
+  similarity neighbors.
 - **Determinism is guaranteed.** The community detection is **id-ordered label
   propagation** with **lowest-label tie-breaks** over a fixed graph: node visit
   order is the sorted fact ids, initial labels are the ids themselves, neighbor
   influence is a weight *sum* (order-independent), and every tie resolves to the
   lowest label. There is no map-iteration order, randomness, or wall-clock input
   anywhere, so the **same store always yields byte-identical clusters, labels,
-  medoids, and cluster ids** — matching the vault byte-identity house rule.
+  medoids, cluster ids, and hierarchy**, matching the vault byte-identity house rule.
 - **Labels** are up to three **distinctive terms**, ranked by term frequency inside
   the cluster weighted against corpus document frequency (frequent-inside-yet-
   rare-across-clusters wins), joined with `-` and anchored to the **medoid** fact
   for stability. The **medoid** is the member with the highest total intra-cluster
-  similarity (lowest id breaks ties).
+  similarity (lowest id breaks ties). Child labels use tf-idf across their siblings,
+  so they describe what distinguishes each child inside its parent.
+- **Automatic hierarchy:** during recompute, a top-level cluster with at least 20
+  facts is clustered again on its internal subgraph. A split is accepted only when
+  it produces at least two children and every child has at least four facts. The
+  maximum depth is two levels. Existing splits remain while the parent has more
+  than 12 facts and every recomputed child still has at least four; otherwise the
+  split dissolves. Facts always attach to leaf clusters.
 - **`recompute`** is a human-gated **propose → review → apply** round-trip, mirroring
   `memory groom`. `--propose` rebuilds the clustering and writes a reviewable plan
-  (`{schema_version, anchor, clusters, moves, new_facts, dropped_facts, stats}`)
-  showing what would move, without touching the store. `--apply --plan` recomputes
+  (`{schema_version, anchor, clusters, moves, new_facts, dropped_facts, splits,
+  dissolves, stats}`) showing fact moves and automatic hierarchy changes without
+  touching the store. `--apply --plan` recomputes
   the **staleness anchor** (a hash over every active fact's `(id, updated_at)`),
   **aborts as stale** if the store changed since the proposal, then writes the whole
   clustering in **one transaction**. **First run:** when no clusters exist yet there
   is nothing to protect, so `recompute --apply` (no `--plan`) is allowed and builds
   them directly.
 - **Incremental attach:** confirming a **new** fact (`memory confirm`) best-effort
-  attaches it to the cluster of its nearest similarity neighbor (or the `unclustered`
-  bucket) without a full recompute; the attach never blocks a confirmation. Nothing
-  is ever re-shelved silently — wholesale re-clustering is always the explicit
+  attaches it to the leaf cluster of its nearest similarity neighbor (or the
+  `unclustered` bucket) without a full recompute; the attach never blocks a
+  confirmation. Nothing is ever re-shelved silently; wholesale re-clustering is the explicit
   `recompute` proposal.
 - `memory cluster rename` sets an **owner label override** that wins over the
-  computed label and is carried across recomputes by medoid identity (a blank label
-  clears it). The reserved `unclustered` bucket cannot be renamed.
+  computed label. A parent override survives a later split. A child override survives
+  while its stable child id persists and is removed when that split dissolves. The
+  reserved `unclustered` bucket cannot be renamed.
+
+The Knowledge payload adds `parent_id` to child cluster entries. Facts continue to
+carry leaf cluster ids, while parent hubs remain an aggregate view only.
 
 ## Pipelines
 
@@ -2294,3 +2386,20 @@ Moot bounds (in `[chat]`, warm-reloadable):
 
 `[chat]` is entirely optional: with no `[chat]` section every knob resolves to its
 default, `auto_respond` stays off, and the daemon tick is byte-identical.
+
+## Bridge (localhost HTTP for external automation)
+
+```bash
+gitmoot bridge serve [--addr 127.0.0.1:8791]   # localhost-only unless --allow-remote (dangerous)
+gitmoot bridge token [--rotate]                 # prints the token FILE PATH, never the token
+```
+
+The bridge exposes a small authenticated HTTP surface over the same internal
+seams the CLI uses (no new authority): POST /v1/pipelines/{name}/run,
+GET /v1/runs/{id}, POST /v1/memory/recall, GET /v1/jobs/{id},
+POST /v1/agents/{name}/ask. Every request needs
+`Authorization: Bearer $(cat ~/.gitmoot/bridge.token)`. Requests are
+rate-limited (30/min) and body-capped (1MB). Containers reach the host
+bridge at http://host.docker.internal:8791 (or the docker bridge IP on
+Linux). Built for the Activepieces piece seam (issue #785).
+

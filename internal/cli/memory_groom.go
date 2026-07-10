@@ -31,7 +31,9 @@ import (
 
 // groomSchemaVersion is the on-disk plan schema version. Bump on a breaking change
 // to the plan shape so a stale `--plan` file is rejected rather than misread.
-const groomSchemaVersion = 1
+// v2 (#804) added the rekey and cross-pool action sections; an older binary would
+// silently drop them, so the version check rejects cross-version plans outright.
+const groomSchemaVersion = 2
 
 // groomPlanRetirement is one proposed retirement in the plan artifact.
 type groomPlanRetirement struct {
@@ -52,22 +54,62 @@ type groomPlanRewriteFlag struct {
 	Chars int    `json:"chars"`
 }
 
+// groomPlanRekeyRetire is one older sibling edition retired by a rekey group.
+type groomPlanRekeyRetire struct {
+	ID        int64  `json:"id"`
+	Key       string `json:"key"`
+	FirstLine string `json:"first_line"`
+}
+
+// groomPlanRekey is one proposed legacy-key migration (#804): keep the current
+// edition under the stable key, retire the older hash-suffixed siblings.
+type groomPlanRekey struct {
+	KeepID    int64                  `json:"keep_id"`
+	KeepKey   string                 `json:"keep_key"`
+	NewKey    string                 `json:"new_key"`
+	Retire    []groomPlanRekeyRetire `json:"retire"`
+	Owner     string                 `json:"owner,omitempty"`
+	Repo      string                 `json:"repo,omitempty"`
+	Scope     string                 `json:"scope,omitempty"`
+	FirstLine string                 `json:"first_line,omitempty"`
+}
+
+// groomPlanCrossPool is one proposed promote-and-retire pair (#804): promote the
+// newer private edition to the shared pool, retire the stale shared edition.
+type groomPlanCrossPool struct {
+	PrivateID  int64  `json:"private_id"`
+	PrivateKey string `json:"private_key"`
+	Owner      string `json:"owner,omitempty"`
+	SharedID   int64  `json:"shared_id"`
+	SharedKey  string `json:"shared_key"`
+	Basis      string `json:"basis"`
+	Repo       string `json:"repo,omitempty"`
+	Scope      string `json:"scope,omitempty"`
+	FirstLine  string `json:"first_line,omitempty"`
+}
+
 // groomPlan is the reviewable artifact `--propose` writes and `--yes --plan` reads.
 type groomPlan struct {
 	SchemaVersion       int                    `json:"schema_version"`
 	SnapshotHash        string                 `json:"snapshot_hash"`
 	ProposedRetirements []groomPlanRetirement  `json:"proposed_retirements"`
 	RewriteFlags        []groomPlanRewriteFlag `json:"rewrite_flags"`
+	Rekeys              []groomPlanRekey       `json:"rekeys"`
+	CrossPool           []groomPlanCrossPool   `json:"cross_pool"`
 	Stats               memory.GroomStats      `json:"stats"`
 }
 
 // groomApplyResult is the --json summary of an apply run.
 type groomApplyResult struct {
-	Plan         string  `json:"plan"`
-	SnapshotHash string  `json:"snapshot_hash"`
-	Applied      bool    `json:"applied"`
-	Retired      []int64 `json:"retired"`
-	Skipped      []int64 `json:"skipped"`
+	Plan             string  `json:"plan"`
+	SnapshotHash     string  `json:"snapshot_hash"`
+	Applied          bool    `json:"applied"`
+	Retired          []int64 `json:"retired"`
+	Skipped          []int64 `json:"skipped"`
+	Rekeyed          []int64 `json:"rekeyed,omitempty"`
+	RekeySkipped     []int64 `json:"rekey_skipped,omitempty"`
+	Promoted         []int64 `json:"promoted,omitempty"`
+	CrossPoolSkipped []int64 `json:"cross_pool_skipped,omitempty"`
 }
 
 func runMemoryGroom(args []string, stdout, stderr io.Writer) int {
@@ -101,12 +143,14 @@ func printMemoryGroomUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot memory groom --yes --plan PLAN.json [--json]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "  --propose  read active confirmed memory, run the deterministic detectors")
-	fmt.Fprintln(w, "             (status/changelog/ToC snapshots, bare to-do lists, exact duplicates;")
-	fmt.Fprintln(w, "             over-long bricks are FLAGGED, not retired) and write a reviewable plan.")
+	fmt.Fprintln(w, "             (status/changelog/ToC snapshots, bare to-do lists, exact duplicates,")
+	fmt.Fprintln(w, "             legacy-key rekeys, cross-pool stale shared editions; over-long bricks")
+	fmt.Fprintln(w, "             are FLAGGED, not retired) and write a reviewable plan.")
 	fmt.Fprintln(w, "             The store is not touched.")
-	fmt.Fprintln(w, "  --yes      apply a plan's retirements in one transaction. Recomputes the vault")
+	fmt.Fprintln(w, "  --yes      apply a plan's actions in one transaction: retirements, legacy-key")
+	fmt.Fprintln(w, "             rekeys, and cross-pool promote-and-retire pairs. Recomputes the vault")
 	fmt.Fprintln(w, "             snapshot and ABORTS AS STALE if the store changed since --propose.")
-	fmt.Fprintln(w, "             Retire-only: no content is edited or rewritten.")
+	fmt.Fprintln(w, "             Content is never edited or rewritten.")
 }
 
 func runMemoryGroomPropose(home, out string, jsonOut bool, stdout, stderr io.Writer) int {
@@ -129,14 +173,59 @@ func runMemoryGroomPropose(home, out string, jsonOut bool, stdout, stderr io.Wri
 				OwnerVersion: n.memRecord.OwnerVersion,
 				Repo:         n.memRecord.Repo,
 				Scope:        n.memRecord.Scope,
+				UpdatedAt:    n.memRecord.UpdatedAt,
 			})
 		}
 		proposal := memory.DetectGroomActions(cands)
+
+		// #804 rekey + cross-pool detectors run over the candidates that SURVIVE
+		// the plain retirement proposals, so one plan never proposes to both
+		// retire a row and keep/promote it. Cross-pool additionally excludes
+		// rows a rekey group retires.
+		retiring := make(map[int64]bool, len(proposal.Retirements))
+		for _, r := range proposal.Retirements {
+			retiring[r.ID] = true
+		}
+		surviving := make([]memory.GroomCandidate, 0, len(cands))
+		for _, c := range cands {
+			if !retiring[c.ID] {
+				surviving = append(surviving, c)
+			}
+		}
+		rekeys := memory.DetectGroomRekeys(surviving)
+		rekeyRetiring := make(map[int64]bool)
+		for _, rk := range rekeys {
+			for _, r := range rk.Retire {
+				rekeyRetiring[r.ID] = true
+			}
+		}
+		crossCands := make([]memory.GroomCandidate, 0, len(surviving))
+		for _, c := range surviving {
+			if !rekeyRetiring[c.ID] {
+				crossCands = append(crossCands, c)
+			}
+		}
+		signals, err := store.ListCrossPoolSharedMatches(context.Background())
+		if err != nil {
+			return err
+		}
+		memSignals := make([]memory.GroomCrossPoolSignal, 0, len(signals))
+		for _, sig := range signals {
+			memSignals = append(memSignals, memory.GroomCrossPoolSignal{
+				PrivateID: sig.PrivateID, SharedID: sig.SharedID, Score: sig.Score, Linked: sig.Linked,
+			})
+		}
+		crossPool := memory.DetectCrossPoolStaleness(crossCands, memSignals)
+
+		proposal.Stats.Rekeys = len(rekeys)
+		proposal.Stats.CrossPool = len(crossPool)
 		plan = groomPlan{
 			SchemaVersion:       groomSchemaVersion,
 			SnapshotHash:        snapshotHash,
 			ProposedRetirements: make([]groomPlanRetirement, 0, len(proposal.Retirements)),
 			RewriteFlags:        make([]groomPlanRewriteFlag, 0, len(proposal.RewriteFlags)),
+			Rekeys:              make([]groomPlanRekey, 0, len(rekeys)),
+			CrossPool:           make([]groomPlanCrossPool, 0, len(crossPool)),
 			Stats:               proposal.Stats,
 		}
 		for _, r := range proposal.Retirements {
@@ -147,6 +236,24 @@ func runMemoryGroomPropose(home, out string, jsonOut bool, stdout, stderr io.Wri
 		}
 		for _, f := range proposal.RewriteFlags {
 			plan.RewriteFlags = append(plan.RewriteFlags, groomPlanRewriteFlag{ID: f.ID, Key: f.Key, Chars: f.Chars})
+		}
+		for _, rk := range rekeys {
+			entry := groomPlanRekey{
+				KeepID: rk.KeepID, KeepKey: rk.KeepKey, NewKey: rk.NewKey,
+				Retire: make([]groomPlanRekeyRetire, 0, len(rk.Retire)),
+				Owner:  rk.Owner, Repo: rk.Repo, Scope: rk.Scope, FirstLine: rk.FirstLine,
+			}
+			for _, r := range rk.Retire {
+				entry.Retire = append(entry.Retire, groomPlanRekeyRetire{ID: r.ID, Key: r.Key, FirstLine: r.FirstLine})
+			}
+			plan.Rekeys = append(plan.Rekeys, entry)
+		}
+		for _, cp := range crossPool {
+			plan.CrossPool = append(plan.CrossPool, groomPlanCrossPool{
+				PrivateID: cp.PrivateID, PrivateKey: cp.PrivateKey, Owner: cp.Owner,
+				SharedID: cp.SharedID, SharedKey: cp.SharedKey, Basis: cp.Basis,
+				Repo: cp.Repo, Scope: cp.Scope, FirstLine: cp.FirstLine,
+			})
 		}
 		return nil
 	})
@@ -225,12 +332,30 @@ func runMemoryGroomApply(home, planPath string, jsonOut bool, stdout, stderr io.
 		for _, r := range plan.ProposedRetirements {
 			items = append(items, db.GroomRetire{ID: r.ID, Reason: "groom:" + r.Reason})
 		}
-		res, err := store.ApplyGroomRetirements(ctx, items)
+		rekeys := make([]db.GroomRekeyItem, 0, len(plan.Rekeys))
+		for _, rk := range plan.Rekeys {
+			item := db.GroomRekeyItem{KeepID: rk.KeepID, NewKey: rk.NewKey, Reason: memory.GroomReasonRekeySuperseded}
+			for _, r := range rk.Retire {
+				item.RetireIDs = append(item.RetireIDs, r.ID)
+			}
+			rekeys = append(rekeys, item)
+		}
+		crossPool := make([]db.GroomCrossPoolItem, 0, len(plan.CrossPool))
+		for _, cp := range plan.CrossPool {
+			crossPool = append(crossPool, db.GroomCrossPoolItem{
+				PrivateID: cp.PrivateID, SharedID: cp.SharedID, Reason: memory.GroomReasonCrossPoolStale,
+			})
+		}
+		res, err := store.ApplyGroomPlan(ctx, items, rekeys, crossPool)
 		if err != nil {
 			return err
 		}
 		result.Retired = res.Retired
-		result.Skipped = res.Skipped
+		result.Skipped = res.RetireSkipped
+		result.Rekeyed = res.Rekeyed
+		result.RekeySkipped = res.RekeySkipped
+		result.Promoted = res.Promoted
+		result.CrossPoolSkipped = res.CrossPoolSkipped
 		result.Applied = true
 		return nil
 	})
@@ -248,6 +373,12 @@ func runMemoryGroomApply(home, planPath string, jsonOut bool, stdout, stderr io.
 	}
 	fmt.Fprintf(stdout, "applied groom plan %s (snapshot %s)\n", result.Plan, result.SnapshotHash)
 	fmt.Fprintf(stdout, "  retired %d memory(ies), skipped %d (already retired or missing)\n", len(result.Retired), len(result.Skipped))
+	if len(result.Rekeyed)+len(result.RekeySkipped) > 0 {
+		fmt.Fprintf(stdout, "  rekeyed %d memory(ies) to stable keys, skipped %d group(s)\n", len(result.Rekeyed), len(result.RekeySkipped))
+	}
+	if len(result.Promoted)+len(result.CrossPoolSkipped) > 0 {
+		fmt.Fprintf(stdout, "  promoted %d private memory(ies) over stale shared editions, skipped %d pair(s)\n", len(result.Promoted), len(result.CrossPoolSkipped))
+	}
 	return 0
 }
 
@@ -293,8 +424,8 @@ func groomScopeLabel(r groomPlanRetirement) string {
 
 func printGroomProposal(w io.Writer, plan groomPlan, outPath string) {
 	fmt.Fprintf(w, "groom proposal (snapshot %s)\n", plan.SnapshotHash)
-	fmt.Fprintf(w, "  %d of %d memory(ies) proposed for retirement; %d flagged for rewrite\n",
-		plan.Stats.ProposedRetirements, plan.Stats.TotalMemories, plan.Stats.RewriteFlags)
+	fmt.Fprintf(w, "  %d of %d memory(ies) proposed for retirement; %d flagged for rewrite; %d rekey group(s); %d cross-pool pair(s)\n",
+		plan.Stats.ProposedRetirements, plan.Stats.TotalMemories, plan.Stats.RewriteFlags, plan.Stats.Rekeys, plan.Stats.CrossPool)
 	if len(plan.Stats.ByReason) > 0 {
 		reasons := make([]string, 0, len(plan.Stats.ByReason))
 		for r := range plan.Stats.ByReason {
@@ -313,6 +444,23 @@ func printGroomProposal(w io.Writer, plan groomPlan, outPath string) {
 			fmt.Fprintf(w, "  - memory %d [%s] (%s) %s%s\n", r.ID, r.Key, r.Reason, groomScopeLabel(r), r.FirstLine)
 		}
 	}
+	if len(plan.Rekeys) > 0 {
+		fmt.Fprintln(w, "\nProposed legacy-key rekeys:")
+		for _, rk := range plan.Rekeys {
+			fmt.Fprintf(w, "  - memory %d [%s -> %s] %s%s\n", rk.KeepID, rk.KeepKey, rk.NewKey,
+				groomScopeLabel(groomPlanRetirement{Owner: rk.Owner, Repo: rk.Repo, Scope: rk.Scope}), rk.FirstLine)
+			for _, r := range rk.Retire {
+				fmt.Fprintf(w, "      retire %d [%s] %s\n", r.ID, r.Key, r.FirstLine)
+			}
+		}
+	}
+	if len(plan.CrossPool) > 0 {
+		fmt.Fprintln(w, "\nProposed cross-pool promote-and-retire pairs:")
+		for _, cp := range plan.CrossPool {
+			fmt.Fprintf(w, "  - promote %d [%s] (%s, %s) over stale shared %d [%s] %s\n",
+				cp.PrivateID, cp.PrivateKey, cp.Owner, cp.Basis, cp.SharedID, cp.SharedKey, cp.FirstLine)
+		}
+	}
 	if len(plan.RewriteFlags) > 0 {
 		fmt.Fprintln(w, "\nFlagged for rewrite (NOT retired — owner review):")
 		for _, f := range plan.RewriteFlags {
@@ -320,8 +468,8 @@ func printGroomProposal(w io.Writer, plan groomPlan, outPath string) {
 		}
 	}
 	fmt.Fprintf(w, "\nplan written to %s\n", outPath)
-	if plan.Stats.ProposedRetirements == 0 {
-		fmt.Fprintln(w, "nothing to retire.")
+	if plan.Stats.ProposedRetirements == 0 && plan.Stats.Rekeys == 0 && plan.Stats.CrossPool == 0 {
+		fmt.Fprintln(w, "nothing to do.")
 		return
 	}
 	fmt.Fprintf(w, "review it, then apply with: gitmoot memory groom --yes --plan %s\n", outPath)

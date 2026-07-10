@@ -35,6 +35,22 @@ agent template and rendered job prompt before handing work to an adapter.
 - **Shell** invokes a configured shell command and is mainly for smoke tests,
   demos, and adapter contract checks.
 
+## Implement Jobs and the Commit Contract
+
+Gitmoot owns the commit for implement jobs: it commits and delivers the
+worktree's changes after the job finishes. Every rendered implement prompt
+carries one deterministic sentence telling the worker not to run `git commit`
+or `git push`. Ask and review prompts are unchanged.
+
+For Codex, a workspace-write job whose checkout is a linked `git worktree`
+gets one extra sandbox grant: the worktree's resolved git directory
+(`<main-repo>/.git/worktrees/<name>`) is passed to the Codex CLI with
+`--add-dir`, so routine git operations that write metadata (an index refresh
+from `git status`, or `git add`) work inside the sandbox. The grant is
+additive; it does not replace any `writable_roots` configured in the
+operator's `~/.codex/config.toml`. Read-only and danger-full-access sandboxes
+are unchanged, and a primary (non-worktree) checkout gets no extra grant.
+
 ## Metadata Registry
 
 Each built-in runtime carries declarative metadata — advertised capabilities,

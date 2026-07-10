@@ -31,6 +31,18 @@ const (
 	GroomReasonTaskList        = "task-list"
 )
 
+// Retire reasons stamped VERBATIM (no "groom:" prefix) by the #804 plan actions,
+// so a retired row names the exact mechanism that replaced it.
+const (
+	// GroomReasonRekeySuperseded marks legacy sibling editions retired by a
+	// rekey action: the kept edition carries the stable key from now on.
+	GroomReasonRekeySuperseded = "rekey: superseded edition"
+	// GroomReasonCrossPoolStale marks a stale shared edition retired by a
+	// cross-pool promote-and-retire action: the newer private edition was
+	// promoted into the shared pool in its place.
+	GroomReasonCrossPoolStale = "cross-pool: superseded by promoted edition"
+)
+
 // GroomRewriteThreshold is the content length (in bytes) above which a memory is
 // flagged as a REWRITE candidate rather than retired. Multi-fact "bricks" carry
 // real signal that a blind retirement would lose, so P4.2 only lists them for the
@@ -56,6 +68,7 @@ type GroomCandidate struct {
 	OwnerVersion string
 	Repo         string // "" == general scope
 	Scope        string
+	UpdatedAt    string // RFC3339; lexicographic order == chronological order
 }
 
 // GroomRetirement is one proposed retirement: the memory id, its key, the detector
@@ -79,11 +92,15 @@ type GroomRewriteFlag struct {
 	Chars int
 }
 
-// GroomStats is the roll-up carried in the plan artifact.
+// GroomStats is the roll-up carried in the plan artifact. Rekeys and CrossPool
+// count the #804 plan actions; DetectGroomActions leaves them zero and the plan
+// builder fills them in after running the dedicated detectors.
 type GroomStats struct {
 	TotalMemories       int            `json:"total_memories"`
 	ProposedRetirements int            `json:"proposed_retirements"`
 	RewriteFlags        int            `json:"rewrite_flags"`
+	Rekeys              int            `json:"rekeys"`
+	CrossPool           int            `json:"cross_pool"`
 	ByReason            map[string]int `json:"by_reason"`
 }
 
@@ -348,6 +365,269 @@ const groomStatusDominance = 0.8
 // retired. The dominance guard alone is vacuous at n=1 (a single matching line is
 // trivially 100% of the note).
 const groomStatusMinLines = 3
+
+// ---- #804 legacy-key rekey detector ----------------------------------------
+
+// legacyIngestKeySuffix recognizes the pre-#804 ingest key shape: a trailing
+// "-<8 hex>" content-hash suffix appended by the old IngestKey.
+var legacyIngestKeySuffix = regexp.MustCompile(`-[0-9a-f]{8}$`)
+
+// StableKey returns the #804 stable form of an ingest key: the trailing legacy
+// content-hash suffix stripped when present, the key unchanged otherwise. It is
+// a deterministic HEURISTIC — a key whose final segment legitimately happens to
+// be 8 hex characters is treated as legacy — which is one reason rekey proposals
+// flow through the human-reviewed groom plan instead of applying silently. A key
+// that is NOTHING but a hash suffix is returned unchanged (stripping would leave
+// an empty key).
+func StableKey(key string) string {
+	stripped := legacyIngestKeySuffix.ReplaceAllString(key, "")
+	if stripped == "" {
+		return key
+	}
+	return stripped
+}
+
+// GroomRekeyRetire is one older sibling edition a rekey group retires.
+type GroomRekeyRetire struct {
+	ID        int64
+	Key       string
+	FirstLine string
+}
+
+// GroomRekeyAction is one proposed legacy-key migration (#804): keep the current
+// edition, rewrite its key to the stable form, retire the older sibling
+// editions. Organic sweeps can never fix legacy keys on their own — content-hash
+// dedup skips unchanged notes, and the first edit would spawn a stable-keyed
+// THIRD sibling — so groom is the only path that converges a legacy group.
+type GroomRekeyAction struct {
+	KeepID    int64
+	KeepKey   string // the keeper's current key
+	NewKey    string // the stable key; equals KeepKey when the keeper already carries it
+	Retire    []GroomRekeyRetire
+	Owner     string // "kind:ref@version" label
+	Repo      string
+	Scope     string
+	FirstLine string // keeper content preview
+}
+
+// DetectGroomRekeys groups active candidates per (owner, repo, scope) by their
+// STABLE key and proposes one rekey action for every group containing at least
+// one legacy-suffixed key. The keeper is the row already carrying the stable key
+// when one exists (under the post-#804 write path that row is the current
+// edition by construction); otherwise the newest edition by UpdatedAt (ties
+// break to the highest id). Every other group member is proposed for retirement
+// with GroomReasonRekeySuperseded. Output is deterministic and independent of
+// input order.
+func DetectGroomRekeys(cands []GroomCandidate) []GroomRekeyAction {
+	sorted := append([]GroomCandidate(nil), cands...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
+
+	groups := make(map[string][]GroomCandidate)
+	var order []string
+	for _, c := range sorted {
+		k := strings.Join([]string{
+			c.OwnerKind, c.OwnerRef, c.OwnerVersion, c.Repo, c.Scope, StableKey(c.Key),
+		}, "\x00")
+		if _, seen := groups[k]; !seen {
+			order = append(order, k)
+		}
+		groups[k] = append(groups[k], c)
+	}
+
+	var out []GroomRekeyAction
+	for _, gk := range order {
+		group := groups[gk]
+		stable := StableKey(group[0].Key)
+		hasLegacy := false
+		for _, c := range group {
+			if c.Key != stable {
+				hasLegacy = true
+				break
+			}
+		}
+		if !hasLegacy {
+			continue
+		}
+		keep := group[0]
+		haveStable := false
+		for _, c := range group {
+			if c.Key == stable {
+				keep = c
+				haveStable = true
+				break
+			}
+		}
+		if !haveStable {
+			for _, c := range group[1:] {
+				if c.UpdatedAt > keep.UpdatedAt || (c.UpdatedAt == keep.UpdatedAt && c.ID > keep.ID) {
+					keep = c
+				}
+			}
+		}
+		action := GroomRekeyAction{
+			KeepID:    keep.ID,
+			KeepKey:   keep.Key,
+			NewKey:    stable,
+			Owner:     groomOwnerLabel(keep),
+			Repo:      keep.Repo,
+			Scope:     keep.Scope,
+			FirstLine: groomFirstLine(keep.Content),
+		}
+		for _, c := range group {
+			if c.ID == keep.ID {
+				continue
+			}
+			action.Retire = append(action.Retire, GroomRekeyRetire{
+				ID:        c.ID,
+				Key:       c.Key,
+				FirstLine: groomFirstLine(c.Content),
+			})
+		}
+		out = append(out, action)
+	}
+	return out
+}
+
+// ---- #804 cross-pool staleness detector -------------------------------------
+
+// CrossPoolBM25Strong is the minimum bm25 relevance (as -bm25: higher is better)
+// at which a private fact's TOP shared-pool match counts as secondary evidence
+// of a cross-pool duplicate. bm25 magnitudes are corpus-dependent, so the bar is
+// deliberately high AND the signal additionally requires an existing
+// memory_links edge between the two rows — a strong bm25 score alone never
+// proposes anything.
+const CrossPoolBM25Strong = 15.0
+
+// GroomCrossPoolSignal is one store-computed secondary-evidence tuple for
+// DetectCrossPoolStaleness: a private fact's top bm25 match in the shared pool
+// and whether a memory_links edge connects the two rows in either direction.
+type GroomCrossPoolSignal struct {
+	PrivateID int64
+	SharedID  int64
+	Score     float64 // -bm25 relevance, higher is better
+	Linked    bool
+}
+
+// Cross-pool proposal bases: the deterministic primary signal (stable-key
+// equality) and the composite secondary signal (strong bm25 top-match plus a
+// memory_links edge).
+const (
+	CrossPoolBasisStableKey = "stable-key"
+	CrossPoolBasisBM25Link  = "bm25-link"
+)
+
+// GroomCrossPoolAction proposes one promote-and-retire pair (#804): promote the
+// newer private edition into the shared pool (author preserved) and retire the
+// stale shared edition it replaces.
+type GroomCrossPoolAction struct {
+	PrivateID  int64
+	PrivateKey string
+	Owner      string // private owner label
+	SharedID   int64
+	SharedKey  string
+	Basis      string // CrossPoolBasisStableKey | CrossPoolBasisBM25Link
+	Repo       string
+	Scope      string
+	FirstLine  string // the newer (private) edition's preview
+}
+
+// DetectCrossPoolStaleness finds shared-pool facts that a NEWER private-pool
+// edition has superseded. Primary, fully deterministic signal: a private agent
+// fact whose STABLE key equals a shared fact's stable key in the same repo and
+// scope. Secondary, composite signal: a store-computed bm25 top-match at or
+// above CrossPoolBM25Strong that ALSO shares a memory_links edge — bm25 alone is
+// never enough. Both require the private edition to be strictly newer
+// (UpdatedAt) than the shared one. At most one action is proposed per shared
+// row (the newest qualifying private edition wins; primary beats secondary).
+// Output is deterministic and independent of input order.
+func DetectCrossPoolStaleness(cands []GroomCandidate, signals []GroomCrossPoolSignal) []GroomCrossPoolAction {
+	sorted := append([]GroomCandidate(nil), cands...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
+	byID := make(map[int64]GroomCandidate, len(sorted))
+	var private, shared []GroomCandidate
+	for _, c := range sorted {
+		byID[c.ID] = c
+		switch {
+		case c.OwnerKind == OwnerKindAgent:
+			private = append(private, c)
+		case c.OwnerKind == OwnerKindShared && c.OwnerRef == SharedOwnerRef:
+			shared = append(shared, c)
+		}
+	}
+
+	claimed := make(map[int64]bool) // shared id -> already has an action
+	var out []GroomCrossPoolAction
+	propose := func(p, s GroomCandidate, basis string) {
+		claimed[s.ID] = true
+		out = append(out, GroomCrossPoolAction{
+			PrivateID:  p.ID,
+			PrivateKey: p.Key,
+			Owner:      groomOwnerLabel(p),
+			SharedID:   s.ID,
+			SharedKey:  s.Key,
+			Basis:      basis,
+			Repo:       s.Repo,
+			Scope:      s.Scope,
+			FirstLine:  groomFirstLine(p.Content),
+		})
+	}
+
+	// Primary: stable-key equality within the same repo/scope, private newer.
+	for _, s := range shared {
+		var best GroomCandidate
+		found := false
+		for _, p := range private {
+			if p.Repo != s.Repo || p.Scope != s.Scope {
+				continue
+			}
+			if StableKey(p.Key) != StableKey(s.Key) {
+				continue
+			}
+			if !(p.UpdatedAt > s.UpdatedAt) {
+				continue
+			}
+			if !found || p.UpdatedAt > best.UpdatedAt || (p.UpdatedAt == best.UpdatedAt && p.ID > best.ID) {
+				best, found = p, true
+			}
+		}
+		if found {
+			propose(best, s, CrossPoolBasisStableKey)
+		}
+	}
+
+	// Secondary: strong bm25 top-match plus a memory_links edge, private newer.
+	ordered := append([]GroomCrossPoolSignal(nil), signals...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].PrivateID != ordered[j].PrivateID {
+			return ordered[i].PrivateID < ordered[j].PrivateID
+		}
+		return ordered[i].SharedID < ordered[j].SharedID
+	})
+	for _, sig := range ordered {
+		if !sig.Linked || sig.Score < CrossPoolBM25Strong {
+			continue
+		}
+		if claimed[sig.SharedID] {
+			continue
+		}
+		p, okP := byID[sig.PrivateID]
+		s, okS := byID[sig.SharedID]
+		if !okP || !okS {
+			continue
+		}
+		if p.OwnerKind != OwnerKindAgent || s.OwnerKind != OwnerKindShared || s.OwnerRef != SharedOwnerRef {
+			continue
+		}
+		if p.Repo != s.Repo || p.Scope != s.Scope {
+			continue
+		}
+		if !(p.UpdatedAt > s.UpdatedAt) {
+			continue
+		}
+		propose(p, s, CrossPoolBasisBM25Link)
+	}
+	return out
+}
 
 // detectStatusChangelog reports whether content is predominantly a status,
 // changelog, or table-of-contents snapshot: at least groomStatusDominance of the

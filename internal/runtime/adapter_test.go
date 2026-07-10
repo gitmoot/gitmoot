@@ -295,7 +295,7 @@ func TestCodexDeliverArgsReasoningEffort(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := codexDeliverArgs(tc.agent, "prompt", tc.model, tc.effort, true); !reflect.DeepEqual(got, tc.want) {
+			if got := codexDeliverArgs(tc.agent, "", "prompt", tc.model, tc.effort, true); !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("codexDeliverArgs() = %v, want %v", got, tc.want)
 			}
 		})
@@ -394,6 +394,110 @@ func TestCodexDeliverNonSeatSandboxUnchanged(t *testing.T) {
 		t.Fatalf("Deliver returned error: %v", err)
 	}
 	runner.want(t, 0, "codex", "exec", "--sandbox", "read-only", "--json", "resume", "--last", "--", "converse")
+}
+
+// TestCodexDeliverWorkspaceWriteGrantsLinkedWorktreeGitDir pins the #805
+// sandbox grant: a workspace-write delivery whose working dir is a linked git
+// worktree passes the worktree's RESOLVED gitdir
+// (<main-repo>/.git/worktrees/<name>) as an extra writable root via --add-dir,
+// so metadata-writing git operations do not fail inside the sandbox. --add-dir
+// is additive, so operator-configured writable_roots are untouched.
+func TestCodexDeliverWorkspaceWriteGrantsLinkedWorktreeGitDir(t *testing.T) {
+	worktree := t.TempDir()
+	gitdir := filepath.Join(t.TempDir(), ".git", "worktrees", "adhoc-1")
+	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: "+gitdir+"\n"), 0o644); err != nil {
+		t.Fatalf("write .git file: %v", err)
+	}
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "ok"}}}
+	adapter := CodexAdapter{Runner: runner, Dir: worktree}
+	agent := Agent{
+		Name: "worker", Role: "implementer", Runtime: CodexRuntime, RepoScope: "jerryfane/gitmoot",
+		RuntimeRef: "last", AutonomyPolicy: AutonomyPolicyWorkspaceWrite,
+	}
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "implement"}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	runner.want(t, 0, "codex", "exec", "--sandbox", "workspace-write", "--add-dir", gitdir, "--json", "resume", "--last", "--", "implement")
+}
+
+// TestCodexDeliverPrimaryCheckoutOmitsGitDirGrant proves the #805 grant is a
+// no-op for a primary checkout: .git is a directory, no gitdir resolves, and
+// the workspace-write argv stays byte-identical to before the change.
+func TestCodexDeliverPrimaryCheckoutOmitsGitDirGrant(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "ok"}}}
+	adapter := CodexAdapter{Runner: runner, Dir: repo}
+	agent := Agent{
+		Name: "worker", Role: "implementer", Runtime: CodexRuntime, RepoScope: "jerryfane/gitmoot",
+		RuntimeRef: "last", AutonomyPolicy: AutonomyPolicyWorkspaceWrite,
+	}
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "implement"}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	runner.want(t, 0, "codex", "exec", "--sandbox", "workspace-write", "--json", "resume", "--last", "--", "implement")
+}
+
+// TestCodexDeliverReadOnlyLinkedWorktreeOmitsGitDirGrant proves the #805 grant
+// never widens a read-only sandbox: even in a linked worktree, a read-only
+// policy keeps its exact pre-#805 args.
+func TestCodexDeliverReadOnlyLinkedWorktreeOmitsGitDirGrant(t *testing.T) {
+	worktree := t.TempDir()
+	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: /main/.git/worktrees/adhoc-1\n"), 0o644); err != nil {
+		t.Fatalf("write .git file: %v", err)
+	}
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "ok"}}}
+	adapter := CodexAdapter{Runner: runner, Dir: worktree}
+	agent := Agent{
+		Name: "worker", Role: "reviewer", Runtime: CodexRuntime, RepoScope: "jerryfane/gitmoot",
+		RuntimeRef: "last", AutonomyPolicy: AutonomyPolicyReadOnly,
+	}
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	runner.want(t, 0, "codex", "exec", "--sandbox", "read-only", "--json", "resume", "--last", "--", "review")
+}
+
+// TestLinkedWorktreeGitDir covers the resolver's edge shapes directly: absolute
+// and relative gitdir pointers, and every "not applicable" input that must keep
+// the sandbox argv byte-identical.
+func TestLinkedWorktreeGitDir(t *testing.T) {
+	linked := t.TempDir()
+	if err := os.WriteFile(filepath.Join(linked, ".git"), []byte("gitdir: /main/.git/worktrees/wt-1\n"), 0o644); err != nil {
+		t.Fatalf("write .git file: %v", err)
+	}
+	relative := t.TempDir()
+	if err := os.WriteFile(filepath.Join(relative, ".git"), []byte("gitdir: ../main/.git/worktrees/wt-2\n"), 0o644); err != nil {
+		t.Fatalf("write .git file: %v", err)
+	}
+	malformed := t.TempDir()
+	if err := os.WriteFile(filepath.Join(malformed, ".git"), []byte("not a gitdir pointer\n"), 0o644); err != nil {
+		t.Fatalf("write .git file: %v", err)
+	}
+	primary := t.TempDir()
+	if err := os.Mkdir(filepath.Join(primary, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	for _, tt := range []struct {
+		name string
+		dir  string
+		want string
+	}{
+		{name: "linked_absolute", dir: linked, want: "/main/.git/worktrees/wt-1"},
+		{name: "linked_relative", dir: relative, want: filepath.Clean(filepath.Join(relative, "../main/.git/worktrees/wt-2"))},
+		{name: "malformed_pointer", dir: malformed, want: ""},
+		{name: "primary_checkout", dir: primary, want: ""},
+		{name: "no_repo", dir: t.TempDir(), want: ""},
+		{name: "empty_dir", dir: "", want: ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := linkedWorktreeGitDir(tt.dir); got != tt.want {
+				t.Fatalf("linkedWorktreeGitDir(%q) = %q, want %q", tt.dir, got, tt.want)
+			}
+		})
+	}
 }
 
 func TestCodexStartRejectsMissingThreadID(t *testing.T) {

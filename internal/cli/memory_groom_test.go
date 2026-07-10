@@ -281,8 +281,8 @@ func TestGroomProposeEmptyStore(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("propose exit %d: %s", code, stderr)
 	}
-	if !strings.Contains(stdout, "nothing to retire") {
-		t.Fatalf("stdout = %q, want nothing to retire", stdout)
+	if !strings.Contains(stdout, "nothing to do") {
+		t.Fatalf("stdout = %q, want nothing to do", stdout)
 	}
 	plan, err := readGroomPlan(planPath)
 	if err != nil {

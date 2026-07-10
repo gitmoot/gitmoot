@@ -356,6 +356,39 @@ func TestClientRevParseRejectsDashRev(t *testing.T) {
 	}
 }
 
+func TestClientFetchRemote(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{}}}
+	if err := (Client{Runner: runner, Dir: "/repo"}).FetchRemote(context.Background(), "origin"); err != nil {
+		t.Fatalf("FetchRemote returned error: %v", err)
+	}
+	runner.wantArgs(t, 0, "git", "fetch", "origin")
+	if err := (Client{}).FetchRemote(context.Background(), "-unsafe"); err == nil {
+		t.Fatal("FetchRemote accepted an unsafe remote")
+	}
+}
+
+func TestClientBehindCount(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "12\n"}}}
+	count, err := (Client{Runner: runner, Dir: "/repo"}).BehindCount(context.Background(), "origin/main")
+	if err != nil {
+		t.Fatalf("BehindCount returned error: %v", err)
+	}
+	if count != 12 {
+		t.Fatalf("behind count = %d, want 12", count)
+	}
+	runner.wantArgs(t, 0, "git", "rev-list", "--count", "HEAD..origin/main")
+}
+
+func TestClientBehindCountRejectsInvalidOutput(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "many\n"}}}
+	if _, err := (Client{Runner: runner, Dir: "/repo"}).BehindCount(context.Background(), "origin/main"); err == nil {
+		t.Fatal("BehindCount accepted non-numeric output")
+	}
+	if _, err := (Client{}).BehindCount(context.Background(), "-unsafe"); err == nil {
+		t.Fatal("BehindCount accepted an unsafe ref")
+	}
+}
+
 func TestClientCreateBranchSmoke(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")

@@ -1,6 +1,8 @@
 package memory
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"sort"
 	"strings"
 )
@@ -35,6 +37,18 @@ const clusterMaxLabelTerms = 3
 // this targets (~hundreds of facts) label propagation settles well within it.
 const clusterLabelRounds = 100
 
+// ClusterSplitThreshold is the number of facts at which an unsplit top-level
+// cluster becomes eligible for one deterministic child-clustering pass.
+const ClusterSplitThreshold = 20
+
+// ClusterSplitKeepThreshold is the strict lower hysteresis boundary for an
+// existing split. A parent with more than this many facts may keep a valid
+// split; at or below it the children dissolve.
+const ClusterSplitKeepThreshold = 12
+
+// ClusterMinChildFacts is the minimum size of every accepted child community.
+const ClusterMinChildFacts = 4
+
 // ClusterNode is one fact participating in the similarity graph. Text is the
 // concatenation the labeler tokenizes (key + content); the caller supplies it so
 // this package never re-derives the fact shape.
@@ -56,6 +70,7 @@ type ClusterEdge struct {
 // Cluster is one detected community.
 type Cluster struct {
 	ID       int64   // 1-based; UnclusteredID (0) for the degree-0 bucket
+	ParentID int64   // 0 for top-level clusters; children point at their top-level parent
 	Label    string  // computed distinctive-term label (override applied by the store, not here)
 	MedoidID int64   // member with the highest intra-cluster similarity (lowest id tie-break); 0 for unclustered
 	Members  []int64 // member fact ids, ascending
@@ -208,6 +223,134 @@ func BuildClusters(nodes []ClusterNode, edges []ClusterEdge) ClusterResult {
 		})
 	}
 	return result
+}
+
+// BuildClusterHierarchy builds the flat top-level communities, then gives every
+// eligible real community one more pass over its induced internal subgraph.
+// ExistingSplitParentMedoids identifies persisted parents that currently have
+// children; those parents use the lower hysteresis boundary instead of the split
+// trigger. The result has at most two levels. A split parent carries no direct
+// Members: its children are the leaves and facts attach only to leaves.
+//
+// Child labels come directly from BuildClusters over the sibling-only corpus, so
+// their tf-idf document frequency is contrastive within the parent. Child IDs
+// are derived from the stable parent medoid plus the ordered sibling medoids.
+// The same graph and existing-split state therefore yield the same tree.
+func BuildClusterHierarchy(nodes []ClusterNode, edges []ClusterEdge, existingSplitParentMedoids map[int64]bool) ClusterResult {
+	top := BuildClusters(nodes, edges)
+	return buildClusterHierarchy(top, nodes, edges, existingSplitParentMedoids)
+}
+
+func buildClusterHierarchy(top ClusterResult, nodes []ClusterNode, edges []ClusterEdge, existingSplitParentMedoids map[int64]bool) ClusterResult {
+	nodeByID := make(map[int64]ClusterNode, len(nodes))
+	for _, n := range nodes {
+		if _, seen := nodeByID[n.ID]; !seen {
+			nodeByID[n.ID] = n
+		}
+	}
+
+	usedIDs := make(map[int64]bool, len(top.Clusters))
+	for _, c := range top.Clusters {
+		usedIDs[c.ID] = true
+	}
+
+	out := ClusterResult{Clusters: make([]Cluster, 0, len(top.Clusters))}
+	for _, parent := range top.Clusters {
+		parent.ParentID = 0
+		if parent.ID == UnclusteredID || !splitSizeEligible(len(parent.Members), existingSplitParentMedoids[parent.MedoidID]) {
+			out.Clusters = append(out.Clusters, parent)
+			continue
+		}
+
+		members := make(map[int64]bool, len(parent.Members))
+		subNodes := make([]ClusterNode, 0, len(parent.Members))
+		for _, id := range parent.Members {
+			members[id] = true
+			if n, ok := nodeByID[id]; ok {
+				subNodes = append(subNodes, n)
+			}
+		}
+		subEdges := make([]ClusterEdge, 0, len(edges))
+		for _, e := range edges {
+			if members[e.A] && members[e.B] {
+				subEdges = append(subEdges, e)
+			}
+		}
+
+		children := BuildClusters(subNodes, subEdges).Clusters
+		if !validChildSplit(children, len(parent.Members)) {
+			out.Clusters = append(out.Clusters, parent)
+			continue
+		}
+
+		medoids := make([]int64, len(children))
+		for i := range children {
+			medoids[i] = children[i].MedoidID
+		}
+		parent.Members = nil
+		out.Clusters = append(out.Clusters, parent)
+		for i := range children {
+			children[i].ID = nextChildClusterID(parent.MedoidID, medoids, children[i].MedoidID, usedIDs)
+			children[i].ParentID = parent.ID
+			usedIDs[children[i].ID] = true
+			out.Clusters = append(out.Clusters, children[i])
+		}
+	}
+	return out
+}
+
+func splitSizeEligible(size int, existing bool) bool {
+	if existing {
+		return size > ClusterSplitKeepThreshold
+	}
+	return size >= ClusterSplitThreshold
+}
+
+// validChildSplit accepts only a complete partition into at least two real
+// communities, each meeting the minimum size. The total guard also rejects a
+// malformed result that omitted or duplicated a parent member.
+func validChildSplit(children []Cluster, parentSize int) bool {
+	if len(children) < 2 {
+		return false
+	}
+	total := 0
+	for _, child := range children {
+		if child.ID == UnclusteredID || child.MedoidID == 0 || len(child.Members) < ClusterMinChildFacts {
+			return false
+		}
+		total += len(child.Members)
+	}
+	return total == parentSize
+}
+
+// nextChildClusterID places children in the high positive JSON-safe integer
+// range, keeping them disjoint from the compact 1-based top-level IDs. The hash
+// input is the hierarchy identity tuple: parent medoid, ordered sibling medoids,
+// and this child's medoid. Collision probing is deterministic because parents
+// and children are traversed in deterministic medoid order.
+func nextChildClusterID(parentMedoid int64, orderedSiblingMedoids []int64, childMedoid int64, used map[int64]bool) int64 {
+	h := sha256.New()
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(parentMedoid))
+	_, _ = h.Write(buf[:])
+	for _, medoid := range orderedSiblingMedoids {
+		binary.BigEndian.PutUint64(buf[:], uint64(medoid))
+		_, _ = h.Write(buf[:])
+	}
+	binary.BigEndian.PutUint64(buf[:], uint64(childMedoid))
+	_, _ = h.Write(buf[:])
+	sum := h.Sum(nil)
+	const childIDBase = int64(1) << 52
+	const childIDMask = childIDBase - 1
+	id := childIDBase | int64(binary.BigEndian.Uint64(sum[:8])&uint64(childIDMask))
+	for used[id] {
+		if id == childIDBase|childIDMask {
+			id = childIDBase
+		} else {
+			id++
+		}
+	}
+	return id
 }
 
 // dominantLabel returns the neighbor label with the greatest summed edge weight,

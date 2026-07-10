@@ -143,18 +143,46 @@ func TestChunkMarkdownEmptyBody(t *testing.T) {
 	}
 }
 
-func TestIngestKeyStableAndContentSensitive(t *testing.T) {
-	k1 := IngestKey("runbook.md", "Deploy", "content A")
-	k2 := IngestKey("runbook.md", "Deploy", "content A")
-	k3 := IngestKey("runbook.md", "Deploy", "content B")
+// TestIngestKeyStableAcrossContentEdits is the #804 key contract: the key is a
+// pure function of (file, heading), so an edited chunk keeps its key and a
+// re-sweep can key-match the existing confirmed fact. Content participates only
+// in dedup (ContentHash), never in the key.
+func TestIngestKeyStableAcrossContentEdits(t *testing.T) {
+	k1 := IngestKey("runbook.md", "Deploy")
+	k2 := IngestKey("runbook.md", "Deploy")
 	if k1 != k2 {
 		t.Fatalf("key must be stable for identical inputs: %q vs %q", k1, k2)
 	}
-	if k1 == k3 {
-		t.Fatalf("changed content must change the key: %q", k1)
-	}
-	if !strings.HasPrefix(k1, "runbook-md-deploy-") {
+	if k1 != "runbook-md-deploy" {
 		t.Fatalf("key shape unexpected: %q", k1)
+	}
+	if IngestKey("runbook.md", "") != "runbook-md-untitled" {
+		t.Fatalf("empty heading should slug to untitled: %q", IngestKey("runbook.md", ""))
+	}
+}
+
+// TestIngestKeyAllocatorOrdinals proves repeated (file, heading) chunks within
+// one run get deterministic ordinal suffixes instead of colliding, and that an
+// ordinal can never collide with a heading whose slug already ends in "-<n>".
+func TestIngestKeyAllocatorOrdinals(t *testing.T) {
+	a := NewIngestKeyAllocator()
+	if got := a.Next("notes", "Setup"); got != "notes-setup" {
+		t.Fatalf("first occurrence must take the bare stable key, got %q", got)
+	}
+	if got := a.Next("notes", "Setup"); got != "notes-setup-2" {
+		t.Fatalf("second occurrence must take the -2 ordinal, got %q", got)
+	}
+	if got := a.Next("notes", "Setup 2"); got != "notes-setup-2-2" {
+		t.Fatalf("a heading slugging to an already-allocated key must re-probe, got %q", got)
+	}
+	if got := a.Next("notes", "Setup"); got != "notes-setup-3" {
+		t.Fatalf("third occurrence must take the -3 ordinal, got %q", got)
+	}
+	// A fresh allocator (a new sweep of the same document) hands out the same
+	// sequence, so keys stay aligned across sweeps.
+	b := NewIngestKeyAllocator()
+	if b.Next("notes", "Setup") != "notes-setup" || b.Next("notes", "Setup") != "notes-setup-2" {
+		t.Fatal("allocator must be deterministic across runs")
 	}
 }
 

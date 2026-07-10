@@ -93,9 +93,9 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude|kimi --repo owner/repo [--path .] [--template <template-id>] [--model model] [--effort effort] [--start-daemon]")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--model model] [--effort effort] [--runtime rt] [--session ref] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--background] [--type type] [--model model] [--effort effort] [--runtime rt] [--session ref] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--base ref] [--branch branch] [--background] [--type type] [--model model] [--effort effort] [--runtime rt] [--session ref] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background] [--type type] [--model model] [--effort effort] [--runtime rt] [--session ref] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--branch branch] [--background] [--type type] [--model model] [--effort effort] [--runtime rt] [--session ref] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--base ref] [--head-sha sha] [--branch branch] [--background] [--type type] [--model model] [--effort effort] [--runtime rt] [--session ref] [--home path] [--json]")
 	printAgentRuntimeOverrideHelp(w)
 	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
 	fmt.Fprintln(w, "  gitmoot agent heartbeat add|list|show|enable|disable|remove ...")
@@ -330,6 +330,7 @@ type agentRunOptions struct {
 	taskID                 string
 	prNumber               int
 	headSHA                string
+	base                   string
 	branch                 string
 	agent                  string
 	message                string
@@ -489,6 +490,10 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 	if executionPath == "orchestrate" {
 		errLabel = "orchestrate"
 	}
+	if err := normalizeAgentImplementBase(&options, action); err != nil {
+		fmt.Fprintf(stderr, "%s: %v\n", errLabel, err)
+		return localAgentJobOutput{}, 2
+	}
 	dispatchCtx := context.Background()
 	var stopSignals context.CancelFunc
 	if !options.background {
@@ -513,6 +518,7 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 			TaskID:                 options.taskID,
 			PullRequest:            options.prNumber,
 			HeadSHA:                options.headSHA,
+			ImplementBase:          options.base,
 			Branch:                 options.branch,
 			Cockpit:                options.cockpit,
 			CockpitSession:         options.cockpitSession,
@@ -585,7 +591,7 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.cockpit = true
 		case arg == "--skip-native-review-fanout":
 			options.skipNativeReviewFanout = true
-		case arg == "--type" || arg == "--model" || arg == "--effort" || arg == "--runtime" || arg == "--session" || arg == "--repo" || arg == "--home" || arg == "--task" || arg == "--pr" || arg == "--head-sha" || arg == "--branch" || arg == "--cockpit-session" || arg == "--recipe":
+		case arg == "--type" || arg == "--model" || arg == "--effort" || arg == "--runtime" || arg == "--session" || arg == "--repo" || arg == "--home" || arg == "--task" || arg == "--pr" || arg == "--head-sha" || arg == "--base" || arg == "--branch" || arg == "--cockpit-session" || arg == "--recipe":
 			if index+1 >= len(args) {
 				fmt.Fprintf(stderr, "%s requires a value for %s\n", label, arg)
 				return agentRunOptions{}, false
@@ -620,6 +626,8 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			}
 		case strings.HasPrefix(arg, "--head-sha="):
 			options.headSHA = strings.TrimPrefix(arg, "--head-sha=")
+		case strings.HasPrefix(arg, "--base="):
+			options.base = strings.TrimSpace(strings.TrimPrefix(arg, "--base="))
 		case strings.HasPrefix(arg, "--branch="):
 			options.branch = strings.TrimPrefix(arg, "--branch=")
 		case strings.HasPrefix(arg, "-") && len(positionals) >= 2:
@@ -690,6 +698,8 @@ func setAgentRunOption(options *agentRunOptions, flagName string, value string, 
 		options.taskID = value
 	case "--head-sha":
 		options.headSHA = value
+	case "--base":
+		options.base = value
 	case "--branch":
 		options.branch = value
 	case "--cockpit-session":
@@ -715,11 +725,41 @@ func printAgentRunUsage(w io.Writer, command string) {
 	case "review":
 		fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background] [--type type] [--model model] [--effort effort] [--runtime rt] [--session ref] [--home path] [--json]")
 	case "implement":
-		fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--branch branch] [--background] [--type type] [--model model] [--effort effort] [--runtime rt] [--session ref] [--skip-native-review-fanout] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--base ref] [--head-sha sha] [--branch branch] [--background] [--type type] [--model model] [--effort effort] [--runtime rt] [--session ref] [--skip-native-review-fanout] [--home path] [--json]")
 	default:
-		fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--background] [--type type] [--model model] [--effort effort] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--base ref] [--branch branch] [--background] [--type type] [--model model] [--effort effort] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
+	}
+	if command == "implement" || command == "run" {
+		fmt.Fprintln(w, "  --base <ref> selects the starting commit for implement worktrees; origin/* refs are fetched before resolution.")
+		fmt.Fprintln(w, "  On implement, --head-sha is a compatibility alias for --base. Different values are rejected.")
 	}
 	printAgentRuntimeOverrideHelp(w)
+}
+
+// normalizeAgentImplementBase applies the implement-only compatibility rule for
+// --head-sha. Review routing keeps its existing head-SHA semantics; once a
+// command has selected implement, --head-sha becomes an alias for --base.
+func normalizeAgentImplementBase(options *agentRunOptions, action string) error {
+	base := strings.TrimSpace(options.base)
+	headSHA := strings.TrimSpace(options.headSHA)
+	if action != "implement" {
+		if base != "" {
+			return errors.New("--base is only supported when agent implement or agent run routes to implement")
+		}
+		return nil
+	}
+	if base != "" && headSHA != "" && base != headSHA {
+		return fmt.Errorf("--base %q conflicts with --head-sha %q; pass only one value", base, headSHA)
+	}
+	if base == "" {
+		base = headSHA
+	}
+	options.base = base
+	// An implement job's HeadSHA is always replaced with the allocated worktree
+	// head. Clear the compatibility input so permission-blocked jobs do not store
+	// an unvalidated target SHA as if it were the task worktree head.
+	options.headSHA = ""
+	return nil
 }
 
 // recipeTemplateIDs is the allowlist of built-in coordinator recipes the

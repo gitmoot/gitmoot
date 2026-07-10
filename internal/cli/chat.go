@@ -517,7 +517,7 @@ func runChatRemember(args []string, stdout, stderr io.Writer) int {
 			out.Deduped = true
 			return nil
 		}
-		out.Key = memory.IngestKey("chat-"+thread.Slug, strconv.FormatInt(msg.Seq, 10), msg.Body)
+		out.Key = memory.IngestKey("chat-"+thread.Slug, strconv.FormatInt(msg.Seq, 10))
 		obs := db.MemoryObservation{
 			Owner:      db.MemoryOwner{Kind: memory.OwnerKindAgent, Ref: out.Agent},
 			Repo:       memoryRepo,

@@ -35,14 +35,19 @@ type localAgentDispatchRequest struct {
 	// the session on the OVERRIDE runtime (required for shell, whose sessions
 	// are commands); when empty a fresh per-job session ref is minted so the
 	// overridden job can never resume the agent's default-runtime session.
-	Runtime                string
-	RuntimeSession         string
-	Home                   string
-	AllowManagedSync       bool
-	JobTimeout             time.Duration
-	TaskID                 string
-	PullRequest            int
-	HeadSHA                string
+	Runtime          string
+	RuntimeSession   string
+	Home             string
+	AllowManagedSync bool
+	JobTimeout       time.Duration
+	TaskID           string
+	PullRequest      int
+	HeadSHA          string
+	// ImplementBase is the CLI/config worktree base for implement dispatches.
+	// Before the request can enqueue, it is resolved to a commit SHA and
+	// ImplementBaseResolved is set so allocation uses that exact commit.
+	ImplementBase          string
+	ImplementBaseResolved  bool
 	Branch                 string
 	GoalID                 string
 	TaskTitle              string
@@ -105,6 +110,30 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	repo, record, err := resolveLocalAgentRepo(ctx, store, request.RepoFlag)
 	if err != nil {
 		return localAgentJobOutput{}, err
+	}
+	if request.Action == "implement" {
+		paths, err := pathsFromFlag(request.Home)
+		if err != nil {
+			return localAgentJobOutput{}, err
+		}
+		// Resolve only an explicit CLI/config base at this early seam. Permission-
+		// blocked implement jobs never allocate a worktree, and historically they
+		// can be recorded even for an unborn checkout with no HEAD. Runnable jobs
+		// resolve the implicit HEAD and run the stale-checkout guard in prepare.
+		base := strings.TrimSpace(request.ImplementBase)
+		if base == "" {
+			base, err = config.LoadImplementBase(paths)
+			if err != nil {
+				return localAgentJobOutput{}, fmt.Errorf("load workflow implement_base: %w", err)
+			}
+		}
+		if base != "" {
+			request.ImplementBase, err = resolveLocalImplementBase(ctx, paths, record, base)
+			if err != nil {
+				return localAgentJobOutput{}, err
+			}
+			request.ImplementBaseResolved = true
+		}
 	}
 	if err := store.UpsertRepo(ctx, record); err != nil {
 		return localAgentJobOutput{}, err
@@ -630,6 +659,13 @@ func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, 
 	if err != nil {
 		return db.Task{}, localAgentDispatchRequest{}, err
 	}
+	baseSHA := strings.TrimSpace(request.ImplementBase)
+	if !request.ImplementBaseResolved {
+		baseSHA, err = resolveLocalImplementBase(ctx, paths, record, baseSHA)
+		if err != nil {
+			return db.Task{}, localAgentDispatchRequest{}, err
+		}
+	}
 	taskID := strings.TrimSpace(request.TaskID)
 	taskTitle := strings.TrimSpace(request.TaskTitle)
 	goalID := strings.TrimSpace(request.GoalID)
@@ -705,7 +741,7 @@ func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, 
 		TaskID:     task.ID,
 		TaskTitle:  task.Title,
 		Branch:     branch,
-		BaseBranch: record.DefaultBranch,
+		BaseBranch: baseSHA,
 		Owner:      owner,
 		Checkout:   record.CheckoutPath,
 	}, gitutil.Client{Dir: record.CheckoutPath})
@@ -723,6 +759,69 @@ func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, 
 	request.HeadSHA = headSHA
 	request.LeadAgent = owner
 	return started, request, nil
+}
+
+// resolveLocalImplementBase returns the exact commit an implement worktree must
+// start from. A CLI value wins over [workflow].implement_base. With neither set,
+// HEAD preserves checkout-following behavior after the stale-feature guard.
+func resolveLocalImplementBase(ctx context.Context, paths config.Paths, record db.Repo, requested string) (string, error) {
+	base := strings.TrimSpace(requested)
+	if base == "" {
+		configured, err := config.LoadImplementBase(paths)
+		if err != nil {
+			return "", fmt.Errorf("load workflow implement_base: %w", err)
+		}
+		base = strings.TrimSpace(configured)
+	}
+	git := gitutil.Client{Dir: record.CheckoutPath}
+	if base == "" {
+		if err := guardImplicitImplementBase(ctx, git, record.DefaultBranch); err != nil {
+			return "", err
+		}
+		base = "HEAD"
+	}
+	if strings.HasPrefix(base, "origin/") {
+		if err := git.FetchRemote(ctx, "origin"); err != nil {
+			return "", fmt.Errorf("fetch origin for implement base %q: %w", base, err)
+		}
+	}
+	sha, err := git.RevParse(ctx, base+"^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("unknown implement base ref %q: %w", base, err)
+	}
+	return sha, nil
+}
+
+func guardImplicitImplementBase(ctx context.Context, git gitutil.Client, defaultBranch string) error {
+	defaultBranch = strings.TrimSpace(defaultBranch)
+	if defaultBranch == "" {
+		return nil
+	}
+	branch, err := git.CurrentBranch(ctx)
+	if err != nil {
+		// Detached HEAD has no branch to compare or name. Preserve the existing
+		// checkout-HEAD behavior rather than turning a detached checkout into a new
+		// refusal mode.
+		if strings.Contains(err.Error(), "current git branch is empty") {
+			return nil
+		}
+		return fmt.Errorf("inspect checkout branch before implement: %w", err)
+	}
+	if branch == defaultBranch {
+		return nil
+	}
+	upstream := "origin/" + defaultBranch
+	if err := git.FetchRemote(ctx, "origin"); err != nil {
+		return fmt.Errorf("check whether checkout branch %s is behind %s: fetch origin: %w; pass --base HEAD to use checkout HEAD", branch, upstream, err)
+	}
+	behind, err := git.BehindCount(ctx, upstream)
+	if err != nil {
+		return fmt.Errorf("check whether checkout branch %s is behind %s: %w; pass --base HEAD to use checkout HEAD", branch, upstream, err)
+	}
+	if behind > 0 {
+		return fmt.Errorf("checkout is on %s, %d behind %s; pass --base %s or --base HEAD", branch, behind, upstream, upstream)
+	}
+	return nil
 }
 
 func shortTaskTitle(message string) string {
@@ -1100,6 +1199,12 @@ func resolveLocalAgentRepo(ctx context.Context, store *db.Store, repoFlag string
 		record, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: existing.CheckoutPath})
 		if err != nil {
 			return github.Repository{}, db.Repo{}, err
+		}
+		// repoRecordForCheckout reports the checkout's current branch. For a
+		// registered repo, keep the stored default branch so an old feature checkout
+		// cannot redefine the base branch during dispatch.
+		if strings.TrimSpace(existing.DefaultBranch) != "" {
+			record.DefaultBranch = existing.DefaultBranch
 		}
 		record.PollInterval = existing.PollInterval
 		return repo, record, nil

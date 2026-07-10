@@ -544,3 +544,44 @@ func mustJobPayload(t *testing.T, payload workflow.JobPayload) string {
 	}
 	return string(encoded)
 }
+
+func TestPrintJobRendersFailureDiagnosticsBlock(t *testing.T) {
+	var buf bytes.Buffer
+	exitCode := 7
+	payload := workflow.JobPayload{
+		Repo: "owner/repo",
+		FailureDiagnostics: &workflow.FailureDiagnostics{
+			Phase:      workflow.FailurePhaseLaunched,
+			ExitCode:   &exitCode,
+			StderrTail: "first crash line\nsecond crash line",
+			SessionID:  "sess-1234",
+		},
+	}
+
+	printJob(&buf, db.Job{ID: "job-x", State: "failed", Type: "review", Agent: "audit"}, payload, stuckReason{})
+
+	out := buf.String()
+	for _, want := range []string{
+		"failure_diagnostics:",
+		"  phase: launched",
+		"  exit_code: 7",
+		"  runtime_session: sess-1234",
+		"  stderr_tail:",
+		"    first crash line",
+		"    second crash line",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("job show output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestPrintJobOmitsFailureDiagnosticsWhenAbsent(t *testing.T) {
+	var buf bytes.Buffer
+
+	printJob(&buf, db.Job{ID: "job-y", State: "succeeded", Type: "review", Agent: "audit"}, workflow.JobPayload{Repo: "owner/repo"}, stuckReason{})
+
+	if strings.Contains(buf.String(), "failure_diagnostics:") {
+		t.Fatalf("job show output has a failure diagnostics block for a healthy job:\n%s", buf.String())
+	}
+}

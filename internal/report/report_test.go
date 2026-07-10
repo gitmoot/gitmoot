@@ -482,6 +482,68 @@ func TestBuildJobReportUsesRecentEventsLimit(t *testing.T) {
 	}
 }
 
+func TestBuildJobReportIncludesFailureDiagnostics(t *testing.T) {
+	ctx := context.Background()
+	store := openReportStore(t)
+	defer store.Close()
+	exitCode := 7
+	payload := workflow.JobPayload{
+		Repo: "owner/repo",
+		FailureDiagnostics: &workflow.FailureDiagnostics{
+			Phase:      "launched",
+			ExitCode:   &exitCode,
+			StderrTail: "runtime crashed hard",
+			SessionID:  "sess-42",
+		},
+	}
+	seedReportJob(t, store, db.Job{
+		ID:      "job-diag",
+		Agent:   "audit",
+		Type:    "ask",
+		State:   string(workflow.JobFailed),
+		Payload: mustReportPayload(t, payload),
+	}, "delivery failed: exit status 7")
+
+	report, err := BuildJobReport(ctx, store, "job-diag", JobOptions{})
+	if err != nil {
+		t.Fatalf("BuildJobReport returned error: %v", err)
+	}
+
+	for _, want := range []string{
+		"## Failure diagnostics",
+		"- **Phase:** launched",
+		"- **Exit code:** 7",
+		"- **Runtime session:** sess-42",
+		"Stderr tail (redacted)",
+		"runtime crashed hard",
+	} {
+		if !strings.Contains(report.Body, want) {
+			t.Fatalf("report missing %q:\n%s", want, report.Body)
+		}
+	}
+}
+
+func TestBuildJobReportOmitsFailureDiagnosticsWhenAbsent(t *testing.T) {
+	ctx := context.Background()
+	store := openReportStore(t)
+	defer store.Close()
+	seedReportJob(t, store, db.Job{
+		ID:      "job-clean",
+		Agent:   "audit",
+		Type:    "ask",
+		State:   string(workflow.JobSucceeded),
+		Payload: mustReportPayload(t, workflow.JobPayload{Repo: "owner/repo"}),
+	}, "job succeeded")
+
+	report, err := BuildJobReport(ctx, store, "job-clean", JobOptions{})
+	if err != nil {
+		t.Fatalf("BuildJobReport returned error: %v", err)
+	}
+	if strings.Contains(report.Body, "## Failure diagnostics") {
+		t.Fatalf("report has a failure diagnostics section for a healthy job:\n%s", report.Body)
+	}
+}
+
 func openReportStore(t *testing.T) *db.Store {
 	t.Helper()
 	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))

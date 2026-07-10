@@ -151,3 +151,117 @@ func TestMedoidHighestIntraSimilarity(t *testing.T) {
 		t.Fatalf("medoid = %d, want 2 (the hub)", res.Clusters[0].MedoidID)
 	}
 }
+
+// TestBuildClusterHierarchyDeterministic uses a graph whose full pass produces
+// a 22-fact parent and whose induced second pass produces valid 18/4 children.
+// Repeating the same seed must preserve the complete tree, including hashed ids.
+func TestBuildClusterHierarchyDeterministic(t *testing.T) {
+	nodes := make([]ClusterNode, 28)
+	for i := range nodes {
+		nodes[i] = ClusterNode{ID: int64(i + 1), Text: "hierarchy deterministic fact"}
+	}
+	raw := [][3]int{
+		{0, 11, 4}, {1, 8, 5}, {1, 17, 5}, {1, 20, 1}, {2, 4, 4}, {2, 9, 2},
+		{2, 14, 1}, {2, 15, 4}, {2, 18, 2}, {2, 22, 2}, {3, 12, 3}, {3, 23, 4},
+		{3, 26, 1}, {4, 14, 1}, {4, 20, 5}, {4, 23, 3}, {4, 24, 4}, {5, 16, 3},
+		{5, 18, 5}, {5, 22, 1}, {5, 25, 3}, {6, 9, 3}, {6, 14, 2}, {6, 27, 1},
+		{7, 14, 4}, {7, 21, 3}, {7, 27, 4}, {9, 16, 4}, {10, 14, 2}, {10, 15, 4},
+		{11, 13, 3}, {11, 24, 2}, {12, 15, 1}, {13, 20, 1}, {14, 22, 1}, {15, 16, 4},
+		{15, 17, 5}, {15, 18, 4}, {15, 20, 5}, {15, 21, 2}, {15, 23, 4}, {15, 25, 5},
+		{15, 27, 3}, {16, 19, 5}, {16, 24, 1}, {18, 22, 2}, {18, 27, 5}, {19, 27, 1},
+		{20, 22, 3}, {20, 23, 2}, {20, 25, 5}, {21, 26, 3}, {23, 25, 3}, {24, 27, 1},
+		{26, 27, 3},
+	}
+	edges := make([]ClusterEdge, 0, len(raw))
+	for _, e := range raw {
+		edges = append(edges, ClusterEdge{A: int64(e[0] + 1), B: int64(e[1] + 1), Weight: e[2]})
+	}
+
+	first := BuildClusterHierarchy(nodes, edges, nil)
+	second := BuildClusterHierarchy(nodes, edges, nil)
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("hierarchy not deterministic:\nfirst=%+v\nsecond=%+v", first, second)
+	}
+	parents, children := hierarchyShape(first)
+	if parents != 3 || children != 2 {
+		t.Fatalf("hierarchy shape = %d parents/%d children, want 3/2: %+v", parents, children, first)
+	}
+}
+
+func TestClusterHierarchyThresholdAndMinChild(t *testing.T) {
+	if got := manualSplitResult(9, 10, false); childCount(got) != 0 {
+		t.Fatalf("19 facts split below trigger: %+v", got)
+	}
+	if got := manualSplitResult(10, 10, false); childCount(got) != 2 {
+		t.Fatalf("20 facts did not split into valid children: %+v", got)
+	} else if got.Clusters[0].Label != "parent" || got.Clusters[1].Label == got.Clusters[2].Label {
+		t.Fatalf("parent label or sibling-contrastive child labels were not preserved: %+v", got)
+	}
+	if got := manualSplitResult(3, 17, false); childCount(got) != 0 {
+		t.Fatalf("split with a 3-fact child must be rejected: %+v", got)
+	}
+}
+
+func TestClusterHierarchyHysteresis(t *testing.T) {
+	initial := manualSplitResult(10, 11, false)
+	if childCount(initial) != 2 {
+		t.Fatalf("21-fact parent did not split: %+v", initial)
+	}
+	preserved := manualSplitResult(6, 7, true)
+	if childCount(preserved) != 2 {
+		t.Fatalf("13-fact existing split was not preserved: %+v", preserved)
+	}
+	dissolved := manualSplitResult(5, 6, true)
+	if childCount(dissolved) != 0 || len(dissolved.Clusters) != 1 || len(dissolved.Clusters[0].Members) != 11 {
+		t.Fatalf("11-fact split did not dissolve to its parent: %+v", dissolved)
+	}
+}
+
+func manualSplitResult(left, right int, existing bool) ClusterResult {
+	total := left + right
+	nodes := make([]ClusterNode, 0, total)
+	for i := 1; i <= total; i++ {
+		word := "alpha storage"
+		if i > left {
+			word = "beta network"
+		}
+		nodes = append(nodes, ClusterNode{ID: int64(i), Text: word})
+	}
+	edges := append(cliqueClusterEdges(1, left), cliqueClusterEdges(left+1, total)...)
+	members := make([]int64, total)
+	for i := range members {
+		members[i] = int64(i + 1)
+	}
+	top := ClusterResult{Clusters: []Cluster{{ID: 1, Label: "parent", MedoidID: 1, Members: members}}}
+	state := map[int64]bool{}
+	if existing {
+		state[1] = true
+	}
+	return buildClusterHierarchy(top, nodes, edges, state)
+}
+
+func cliqueClusterEdges(first, last int) []ClusterEdge {
+	var edges []ClusterEdge
+	for i := first; i <= last; i++ {
+		for j := i + 1; j <= last; j++ {
+			edges = append(edges, ClusterEdge{A: int64(i), B: int64(j), Weight: 1})
+		}
+	}
+	return edges
+}
+
+func hierarchyShape(result ClusterResult) (parents, children int) {
+	for _, c := range result.Clusters {
+		if c.ParentID == 0 {
+			parents++
+		} else {
+			children++
+		}
+	}
+	return parents, children
+}
+
+func childCount(result ClusterResult) int {
+	_, children := hierarchyShape(result)
+	return children
+}

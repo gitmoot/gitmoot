@@ -15,6 +15,7 @@ package memory
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"strings"
 )
 
@@ -195,12 +196,46 @@ func ContentHash(content string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// IngestKey derives a stable observation key from the source file stem, the
-// chunk heading, and the chunk content: slug(file)-slug(heading)-<8 hex of the
-// content hash>. The 8-hex content suffix keeps re-ingesting an unchanged chunk
-// idempotent at the key level while still distinguishing edited content. An
-// empty heading slugs to "untitled" (see Slug), which is fine — the hash suffix
-// carries the uniqueness.
-func IngestKey(fileStem, heading, content string) string {
-	return Slug(fileStem) + "-" + Slug(heading) + "-" + ContentHash(content)[:8]
+// IngestKey derives the STABLE observation key for a chunk from the source file
+// stem and heading alone: slug(file)-slug(heading). The content hash is
+// deliberately NOT part of the key (#804) — it participates only in exact-match
+// dedup (ContentHash / db.MemoryDedupKey) — so a re-swept EDITED chunk keeps the
+// key of its earlier edition and auto-confirm key-matches the existing confirmed
+// fact, updating it in place instead of spawning a hash-suffixed sibling. An
+// empty heading slugs to "untitled" (see Slug).
+func IngestKey(fileStem, heading string) string {
+	return Slug(fileStem) + "-" + Slug(heading)
+}
+
+// IngestKeyAllocator hands out ingest keys for ONE sweep. Without the content
+// hash, chunks that share a (file, heading) — an over-budget section split into
+// pieces, or a repeated heading — would collide on the same stable key and, under
+// auto-confirm, clobber each other within a single run. The allocator gives the
+// first occurrence the bare stable key and later occurrences a "-2", "-3", …
+// ordinal in document order. Allocate for EVERY chunk the chunker emits (before
+// pre-filter/dedup drops) so ordinals mirror document structure and stay aligned
+// across sweeps of an unchanged file set.
+type IngestKeyAllocator struct {
+	used map[string]struct{}
+}
+
+// NewIngestKeyAllocator returns an empty allocator for one ingest run.
+func NewIngestKeyAllocator() *IngestKeyAllocator {
+	return &IngestKeyAllocator{used: make(map[string]struct{})}
+}
+
+// Next returns the key for the next chunk of (fileStem, heading). It re-probes
+// against every key already handed out this run, so an ordinal suffix can never
+// collide with another heading whose slug happens to end in "-<n>".
+func (a *IngestKeyAllocator) Next(fileStem, heading string) string {
+	base := IngestKey(fileStem, heading)
+	key := base
+	for n := 2; ; n++ {
+		if _, taken := a.used[key]; !taken {
+			break
+		}
+		key = fmt.Sprintf("%s-%d", base, n)
+	}
+	a.used[key] = struct{}{}
+	return key
 }

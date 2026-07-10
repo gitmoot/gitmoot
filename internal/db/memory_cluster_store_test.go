@@ -2,8 +2,10 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -102,5 +104,105 @@ func TestRecomputeMemoryClustersFreshAnchorGuard(t *testing.T) {
 		if m.ClusterID != 1 {
 			t.Fatalf("stale apply changed membership: memory %d now in cluster %d", m.MemoryID, m.ClusterID)
 		}
+	}
+}
+
+func TestMemoryClusterHierarchyMigrationOnPopulatedStore(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "pre-hierarchy.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql open: %v", err)
+	}
+	raw.SetMaxOpenConns(1)
+	raw.SetMaxIdleConns(1)
+	if err := configureWritableSQLite(ctx, raw); err != nil {
+		t.Fatalf("configure sqlite: %v", err)
+	}
+	store := &Store{db: raw}
+	t.Cleanup(func() { _ = store.Close() })
+
+	hierarchyMigration := -1
+	for i, migration := range migrations {
+		if strings.Contains(migration, "ADD COLUMN parent_id") {
+			hierarchyMigration = i
+			break
+		}
+	}
+	if hierarchyMigration < 0 {
+		t.Fatal("parent_id migration not found")
+	}
+	for i := 0; i < hierarchyMigration; i++ {
+		if err := store.applyMigration(ctx, i+1, migrations[i]); err != nil {
+			t.Fatalf("apply pre-hierarchy migration %d: %v", i+1, err)
+		}
+	}
+	if _, err := raw.ExecContext(ctx, `
+INSERT INTO memory_clusters (cluster_id, label, label_override, medoid_id)
+VALUES (7, 'legacy', 'owner-label', 42)`); err != nil {
+		t.Fatalf("seed legacy cluster: %v", err)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("migrate latest: %v", err)
+	}
+	clusters, err := store.ListMemoryClusters(ctx)
+	if err != nil {
+		t.Fatalf("list migrated clusters: %v", err)
+	}
+	if len(clusters) != 1 || clusters[0].ParentID != 0 || clusters[0].LabelOverride != "owner-label" {
+		t.Fatalf("migrated legacy cluster = %+v, want top-level with preserved data", clusters)
+	}
+}
+
+func TestMemoryClusterHierarchyOverrideIdentity(t *testing.T) {
+	ctx := context.Background()
+	store := openMemTestStore(t)
+	const (
+		parentID = int64(1)
+		childAID = int64(1<<52 + 101)
+		childBID = int64(1<<52 + 202)
+	)
+	split := MemoryClusterAssignment{Clusters: []MemoryCluster{
+		{ClusterID: parentID, Label: "parent", MedoidID: 10},
+		{ClusterID: childAID, ParentID: parentID, Label: "alpha", MedoidID: 10},
+		{ClusterID: childBID, ParentID: parentID, Label: "beta", MedoidID: 20},
+	}}
+	flat := MemoryClusterAssignment{Clusters: []MemoryCluster{{ClusterID: parentID, Label: "parent", MedoidID: 10}}}
+	if err := store.RecomputeMemoryClusters(ctx, flat); err != nil {
+		t.Fatalf("seed flat parent: %v", err)
+	}
+	if err := store.RenameMemoryCluster(ctx, parentID, "owner-parent"); err != nil {
+		t.Fatalf("rename parent: %v", err)
+	}
+	if err := store.RecomputeMemoryClusters(ctx, split); err != nil {
+		t.Fatalf("split renamed parent: %v", err)
+	}
+	if err := store.RenameMemoryCluster(ctx, childAID, "owner-child"); err != nil {
+		t.Fatalf("rename child: %v", err)
+	}
+	if err := store.RecomputeMemoryClusters(ctx, split); err != nil {
+		t.Fatalf("recompute split: %v", err)
+	}
+	clusters, err := store.ListMemoryClusters(ctx)
+	if err != nil {
+		t.Fatalf("list recomputed split: %v", err)
+	}
+	byID := map[int64]MemoryCluster{}
+	for _, c := range clusters {
+		byID[c.ClusterID] = c
+	}
+	if byID[parentID].LabelOverride != "owner-parent" || byID[childAID].LabelOverride != "owner-child" {
+		t.Fatalf("overrides collided or were lost: %+v", clusters)
+	}
+
+	if err := store.RecomputeMemoryClusters(ctx, flat); err != nil {
+		t.Fatalf("dissolve split: %v", err)
+	}
+	clusters, err = store.ListMemoryClusters(ctx)
+	if err != nil {
+		t.Fatalf("list dissolved split: %v", err)
+	}
+	if len(clusters) != 1 || clusters[0].LabelOverride != "owner-parent" {
+		t.Fatalf("dissolve did not preserve only parent override: %+v", clusters)
 	}
 }

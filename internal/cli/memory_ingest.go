@@ -212,6 +212,11 @@ func ingestMemorySource(ctx context.Context, store *db.Store, options memoryInge
 	if err != nil {
 		return result, err
 	}
+	// One allocator per run: stable slug(file)-slug(heading) keys, with ordinal
+	// suffixes only when a (file, heading) repeats (split pieces, duplicate
+	// headings). Keys are allocated for every chunk — before the pre-filter and
+	// dedup drops — so ordinals track document order across sweeps.
+	keys := memory.NewIngestKeyAllocator()
 	for _, path := range files {
 		raw, err := os.ReadFile(path)
 		if err != nil {
@@ -226,6 +231,7 @@ func ingestMemorySource(ctx context.Context, store *db.Store, options memoryInge
 		_, body := memory.StripFrontmatter(string(raw))
 		for _, chunk := range memory.ChunkMarkdown(body, memory.IngestMaxChunkTokens) {
 			result.Chunks++
+			key := keys.Next(fileStem, chunk.Heading)
 			if ok, reason := memory.PreFilter(chunk.Text, result.Scope); !ok {
 				result.RejectedN++
 				result.RejectedBy[reason]++
@@ -240,7 +246,6 @@ func ingestMemorySource(ctx context.Context, store *db.Store, options memoryInge
 				continue
 			}
 			seen[dkey] = struct{}{}
-			key := memory.IngestKey(fileStem, chunk.Heading, chunk.Text)
 			result.Inserted++
 			result.InsertedKeys = append(result.InsertedKeys, key)
 			if options.DryRun {
@@ -283,6 +288,10 @@ func autoConfirmObservationIfEnabled(ctx context.Context, store *db.Store, obs d
 		return false, false, fmt.Errorf("authoring agent is required")
 	}
 	owner := db.MemoryOwner{Kind: memory.OwnerKindAgent, Ref: author}
+	// Auto-confirm is an AUTOMATED writer, so a key-matched in-place update
+	// archives the prior edition as a superseded row first (#804): a bad or
+	// poisoned note edit can never silently destroy the last edition. Manual
+	// confirm paths keep plain overwrite semantics.
 	id, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
 		Owner:      owner,
 		Repo:       obs.Repo,
@@ -291,7 +300,7 @@ func autoConfirmObservationIfEnabled(ctx context.Context, store *db.Store, obs d
 		Content:    obs.Content,
 		Provenance: obs.Provenance,
 		SourceJob:  obs.SourceJob,
-	})
+	}, db.PreserveSupersededEdition())
 	if err != nil {
 		if errors.Is(err, db.ErrConfirmedMemoryRetired) {
 			return false, true, nil
