@@ -12,7 +12,9 @@ and enqueue agent asks.
 ## Security model
 
 - Localhost-only by default. A non-loopback `--addr` requires `--allow-remote`,
-  which is dangerous and should be paired with your own network controls.
+  which is dangerous: the bridge speaks plain HTTP, so a remote bind sends the
+  bearer token in cleartext. Use it only behind your own network controls
+  (firewall, private interface, or a TLS-terminating reverse proxy).
 - Single bearer token, generated on first serve into `bridge.token` (0600) in
   the Gitmoot home. `gitmoot bridge token` prints the file path (never the
   token); `--rotate` regenerates it.

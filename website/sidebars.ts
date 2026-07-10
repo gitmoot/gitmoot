@@ -57,6 +57,7 @@ const sidebars: SidebarsConfig = {
       label: 'Reference',
       items: [
         'reference/cli',
+        'reference/bridge',
         'reference/runtime-adapters',
         'reference/result-contract',
         'reference/event-stream',
