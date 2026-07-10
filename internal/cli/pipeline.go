@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/pipeline"
@@ -29,6 +30,8 @@ func runPipeline(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "add":
 		return runPipelineAdd(args[1:], stdout, stderr)
+	case "install-defaults":
+		return runPipelineInstallDefaults(args[1:], stdout, stderr)
 	case "list":
 		return runPipelineList(args[1:], stdout, stderr)
 	case "run":
@@ -55,6 +58,7 @@ func runPipeline(args []string, stdout, stderr io.Writer) int {
 func printPipelineUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot pipeline add <spec.yaml> [--enable]")
+	fmt.Fprintln(w, "  gitmoot pipeline install-defaults")
 	fmt.Fprintln(w, "  gitmoot pipeline list [--json]")
 	fmt.Fprintln(w, "  gitmoot pipeline run <name>")
 	fmt.Fprintln(w, "  gitmoot pipeline show <name|run-id> [--json]")
@@ -63,6 +67,53 @@ func printPipelineUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot pipeline enable <name>")
 	fmt.Fprintln(w, "  gitmoot pipeline disable <name>")
 	fmt.Fprintln(w, "  gitmoot pipeline remove <name>")
+}
+
+func runPipelineInstallDefaults(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("pipeline install-defaults", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "pipeline install-defaults does not accept positional arguments")
+		return 2
+	}
+	var result defaultPipelineInstallResult
+	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
+		var err error
+		result, err = installDefaultMemoryPipelines(context.Background(), store, paths, *home)
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "pipeline install-defaults: %v\n", err)
+		return 1
+	}
+	for _, name := range result.Installed {
+		status := "manual-only"
+		if rec, ok, err := loadPipelineForInstallStatus(*home, name); err == nil && ok {
+			status = installDefaultsEnabledLabel(rec.Enabled)
+		}
+		writeLine(stdout, "installed default pipeline %s (%s)", name, status)
+	}
+	for _, name := range result.Skipped {
+		writeLine(stdout, "skipped existing default pipeline %s", name)
+	}
+	return 0
+}
+
+func loadPipelineForInstallStatus(home string, name string) (db.Pipeline, bool, error) {
+	var rec db.Pipeline
+	var ok bool
+	err := withStore(home, func(store *db.Store) error {
+		var err error
+		rec, ok, err = store.GetPipeline(context.Background(), name)
+		return err
+	})
+	return rec, ok, err
 }
 
 // pipelineRunnerAgentName derives the hidden shell runner agent name for a

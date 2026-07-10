@@ -131,6 +131,21 @@ path = ""
 # distill_max_per_job = 3
 # distill_all_jobs = false
 #
+# Built-in memory pipeline inputs are optional. The daemon and
+# gitmoot pipeline install-defaults register memory-ingest-sweep and
+# memory-groom-propose as ordinary pipelines, but schedules stay disabled unless
+# you set an interval here. "nightly" is accepted as 24h.
+# [[memory.ingest]]
+# path = "/path/to/markdown-notes"
+# agent = "builder"
+# repo = "owner/repo"
+# tier = "repo"
+#
+# [memory.pipelines]
+# repo = "owner/repo"
+# ingest_sweep = "nightly"
+# groom_propose = "nightly"
+#
 # Enroll a specific agent (per-agent opt-in; omit for byte-identical default):
 # [agents.builder]
 # memory = true

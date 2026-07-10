@@ -247,6 +247,31 @@ observations into the shared pool while preserving the observation author.
 refuses retired or superseded rows, preserves existing links, and stamps
 `author_ref` from the previous owner when needed.
 
+For unattended intake, Gitmoot ships an ordinary built-in pipeline named
+`memory-ingest-sweep`. The daemon and `gitmoot pipeline install-defaults` register
+it idempotently and skip an existing row with that name, preserving local edits.
+Configure one or more sources, then either run it manually or enable an interval:
+
+```toml
+[[memory.ingest]]
+path = "/path/to/markdown-notes"
+agent = "lead"
+repo = "owner/repo"
+tier = "repo"
+
+[memory.pipelines]
+repo = "owner/repo"
+ingest_sweep = "nightly"
+```
+
+```sh
+gitmoot pipeline run memory-ingest-sweep
+```
+
+With no `[[memory.ingest]]` entries, the pipeline succeeds with a no-sources
+summary. It still stages observations only; nothing reaches confirmed memory
+without `memory confirm`.
+
 When a fact is confirmed, Gitmoot also records up to three deterministic outgoing
 links from that confirmed row to active related confirmed memories. These links
 live in the `memory_links` side table with BM25-derived scores. They do not rewrite
@@ -301,9 +326,23 @@ retires exactly the planned ids in one transaction (reason `groom:<detector>`,
 clearing each from the FTS index). It is retire-only and idempotent — an
 already-retired or missing id is skipped gracefully.
 
-A ready-to-register nightly proposal pipeline (propose + notify-on-nonempty, apply
-held behind the owner) lives in
-[`docs/examples/memory-groom-nightly`](https://github.com/jerryfane/gitmoot/tree/main/docs/examples/memory-groom-nightly).
+Gitmoot also ships a built-in `memory-groom-propose` pipeline. It writes the
+proposal plan under the current run's gitmoot home, summarizes retirement and
+rewrite counts into the pipeline result, and never applies the plan. Configure an
+interval or run it on demand:
+
+```toml
+[memory.pipelines]
+repo = "owner/repo"
+groom_propose = "nightly"
+```
+
+```sh
+gitmoot pipeline run memory-groom-propose
+```
+
+`gitmoot pipeline install-defaults` and daemon startup install it idempotently,
+skipping an existing row named `memory-groom-propose`.
 
 ## Emergent clusters
 

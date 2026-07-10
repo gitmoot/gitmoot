@@ -1973,6 +1973,9 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 		// (no pipelines => an empty list before any state touch) and skipped under
 		// --dry-run for the same reason.
 		pipelineEnqueue := newPipelineStageEnqueuer(store, home)
+		if !dryRun {
+			installDefaultMemoryPipelinesForDaemon(ctx, store, paths, home, stdout)
+		}
 		for {
 			if err := receiveSupervisorWorkerError(workerErr); err != nil {
 				return err
@@ -2068,6 +2071,11 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	// heartbeat scan it needs no config paths (it reads the DB), so a paths failure
 	// does not disable it.
 	pipelineEnqueue := newPipelineStageEnqueuer(store, home)
+	if heartbeatPathsErr == nil {
+		installDefaultMemoryPipelinesForDaemon(ctx, store, heartbeatPaths, home, stdout)
+	} else {
+		writeLine(stdout, "default memory pipeline install disabled: %s", heartbeatPathsErr)
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err

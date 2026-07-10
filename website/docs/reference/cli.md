@@ -1517,6 +1517,7 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 
 ```sh
 gitmoot pipeline add nightly-sync.yaml --enable   # validate + store; omit --enable to add disabled
+gitmoot pipeline install-defaults                 # install built-in memory pipelines, skipping existing names
 gitmoot pipeline list [--json]
 gitmoot pipeline show nightly-sync [--json]        # registry view for a name
 gitmoot pipeline run nightly-sync                  # start a manual run; prints the run id
@@ -1541,6 +1542,15 @@ coordinator that fans out owned children and folds the synthesis); and **gate** 
 implement stage's PR merges). A read-only stage's `needs` result summaries are prepended
 to its prompt, and a repo-bound read-only agent stage runs in its own detached
 read-only worktree so same-repo stages parallelize without touching the live checkout.
+
+`pipeline install-defaults` installs the built-in `memory-ingest-sweep` and
+`memory-groom-propose` pipelines. The daemon also runs this installer at startup.
+It is idempotent: an existing pipeline with either name is skipped without
+overwriting user-edited YAML, enabled state, or schedule. Empty memory pipeline
+config installs manual-only definitions. Configure sources with `[[memory.ingest]]`
+and intervals with `[memory.pipelines]`, or run them on demand with
+`gitmoot pipeline run memory-ingest-sweep` and
+`gitmoot pipeline run memory-groom-propose`.
 
 A stage signals its outcome by printing a `gitmoot_result` blob to stdout; the
 advancer folds by the **decision**, never the job's exit state (`changes_requested`
