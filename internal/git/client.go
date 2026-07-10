@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/subprocess"
@@ -254,6 +255,21 @@ func (c Client) FetchPullRequest(ctx context.Context, remote string, number int)
 	return err
 }
 
+// FetchRemote refreshes every advertised ref from a named remote. Implement
+// base resolution uses it before resolving origin/* so a queued job cannot be
+// based on a stale remote-tracking ref.
+func (c Client) FetchRemote(ctx context.Context, remote string) error {
+	remote = strings.TrimSpace(remote)
+	if remote == "" {
+		remote = "origin"
+	}
+	if strings.HasPrefix(remote, "-") || strings.ContainsAny(remote, " \t\r\n") {
+		return fmt.Errorf("remote %q is invalid", remote)
+	}
+	_, err := c.run(ctx, "fetch", remote)
+	return err
+}
+
 func (c Client) Root(ctx context.Context) (string, error) {
 	result, err := c.run(ctx, "rev-parse", "--show-toplevel")
 	if err != nil {
@@ -338,6 +354,24 @@ func (c Client) RevParse(ctx context.Context, rev string) (string, error) {
 		return "", errors.New("git revision SHA is empty")
 	}
 	return sha, nil
+}
+
+// BehindCount reports how many commits upstream has that HEAD does not. It is
+// the checkout-side equivalent of `git rev-list --count HEAD..<upstream>`.
+func (c Client) BehindCount(ctx context.Context, upstream string) (int, error) {
+	upstream = strings.TrimSpace(upstream)
+	if err := validateRef(upstream); err != nil {
+		return 0, err
+	}
+	result, err := c.run(ctx, "rev-list", "--count", "HEAD.."+upstream)
+	if err != nil {
+		return 0, err
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(result.Stdout))
+	if err != nil || count < 0 {
+		return 0, fmt.Errorf("invalid git behind count %q", strings.TrimSpace(result.Stdout))
+	}
+	return count, nil
 }
 
 func (c Client) UpdateBase(ctx context.Context, remote string, branch string) error {

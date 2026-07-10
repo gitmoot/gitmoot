@@ -37,6 +37,16 @@ workspaces = %q
 evals = %q
 artifact_blobs = %q
 
+# [workflow] controls job-level workflow defaults. implement_base is optional:
+# when set, agent implement and agent run jobs that route to implement create a
+# new-branch worktree from that ref. Use "origin/main" for a remote-tracking
+# default, or "HEAD" to follow the registered checkout. With no value, implement
+# follows checkout HEAD and guards stale non-default checkouts. result_checks is
+# off | warn | block and defaults to warn when omitted.
+# [workflow]
+# implement_base = "origin/main"
+# result_checks = "warn"
+
 # [daemon] is the OPTIONAL warm-reloadable runtime config (issue #577). CLI flags to
 # "daemon start" / "daemon run" remain the initial value; a key here is applied only
 # where the matching flag was NOT passed (flag = override). Its real purpose is WARM

@@ -472,11 +472,33 @@ gitmoot agent run lead --repo owner/repo --task task-001 --background "Implement
 gitmoot agent run reviewer --repo owner/repo --pr 12 --background "Review this PR."
 gitmoot agent review reviewer --repo owner/repo --pr 12 "Review this PR."
 gitmoot agent implement lead --repo owner/repo --task task-001 "Implement this task."
+gitmoot agent implement lead --repo owner/repo --task task-002 --base origin/main "Implement from current origin/main."
 gitmoot agent ask project-planner --repo owner/repo "Return the plan status."
 gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
 gitmoot agent run lead --repo owner/repo --model gpt-5-codex "Implement this task."
 gitmoot job watch <job-id>
 ```
+
+For `agent implement`, `--base <ref>` selects the commit used to create a new
+branch worktree. `agent run` accepts the same flag when it routes to implement.
+An `origin/*` ref is fetched before it is resolved, and an unknown ref fails
+before a job is enqueued. `--base HEAD` explicitly follows the registered
+checkout's current commit. On implement, `--head-sha <sha>` is a compatibility
+alias for `--base <sha>`; passing both with different values is an error.
+
+Set a default for implement dispatches in `config.toml`:
+
+```toml
+[workflow]
+implement_base = "origin/main"
+```
+
+The flag wins over the config value. The config value `"HEAD"` keeps
+checkout-following behavior. With no flag and no config value, Gitmoot still
+uses checkout HEAD, but refuses when the checkout is on a non-default branch
+that is behind `origin/<default>`. The error reports the branch and behind
+count and offers both explicit choices: `--base origin/<default>` or
+`--base HEAD`.
 
 `gitmoot agent run`, `ask`, `implement`, and `review` (and `orchestrate`) accept
 an optional `--model <name>` flag that pins the runtime model for that one job,
