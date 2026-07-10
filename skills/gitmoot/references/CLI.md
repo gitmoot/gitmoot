@@ -2307,3 +2307,20 @@ Moot bounds (in `[chat]`, warm-reloadable):
 
 `[chat]` is entirely optional: with no `[chat]` section every knob resolves to its
 default, `auto_respond` stays off, and the daemon tick is byte-identical.
+
+## Bridge (localhost HTTP for external automation)
+
+```bash
+gitmoot bridge serve [--addr 127.0.0.1:8791]   # localhost-only unless --allow-remote (dangerous)
+gitmoot bridge token [--rotate]                 # prints the token FILE PATH, never the token
+```
+
+The bridge exposes a small authenticated HTTP surface over the same internal
+seams the CLI uses (no new authority): POST /v1/pipelines/{name}/run,
+GET /v1/runs/{id}, POST /v1/memory/recall, GET /v1/jobs/{id},
+POST /v1/agents/{name}/ask. Every request needs
+`Authorization: Bearer $(cat ~/.gitmoot/bridge.token)`. Requests are
+rate-limited (30/min) and body-capped (1MB). Containers reach the host
+bridge at http://host.docker.internal:8791 (or the docker bridge IP on
+Linux). Built for the Activepieces piece seam (issue #785).
+
