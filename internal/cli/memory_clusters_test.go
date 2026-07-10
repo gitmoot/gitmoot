@@ -265,6 +265,120 @@ func TestClustersIncrementalAttach(t *testing.T) {
 	}
 }
 
+func TestClustersListHierarchyAndAggregateCounts(t *testing.T) {
+	home, store := memoryTestHome(t)
+	dbIDs, netIDs := seedClusterCorpus(t, store)
+	ctx := context.Background()
+	const (
+		parentID = int64(1)
+		childAID = int64(1<<52 + 11)
+		childBID = int64(1<<52 + 22)
+	)
+	assignment := db.MemoryClusterAssignment{Clusters: []db.MemoryCluster{
+		{ClusterID: parentID, Label: "storage", MedoidID: dbIDs[0]},
+		{ClusterID: childAID, ParentID: parentID, Label: "database", MedoidID: dbIDs[0]},
+		{ClusterID: childBID, ParentID: parentID, Label: "network", MedoidID: netIDs[0]},
+	}}
+	for _, id := range dbIDs {
+		assignment.Members = append(assignment.Members, db.MemoryClusterMember{MemoryID: id, ClusterID: childAID})
+	}
+	for _, id := range netIDs {
+		assignment.Members = append(assignment.Members, db.MemoryClusterMember{MemoryID: id, ClusterID: childBID})
+	}
+	if err := store.RecomputeMemoryClusters(ctx, assignment); err != nil {
+		t.Fatalf("seed hierarchy: %v", err)
+	}
+
+	entries := clustersJSON(t, home)
+	if len(entries) != 3 || entries[0].ClusterID != parentID || entries[1].ParentID != parentID || entries[2].ParentID != parentID {
+		t.Fatalf("hierarchy list order/parents = %+v", entries)
+	}
+	if entries[0].Count != 6 || entries[1].Count != 3 || entries[2].Count != 3 {
+		t.Fatalf("hierarchy counts = %+v, want parent 6 and children 3/3", entries)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := runMemory([]string{"clusters", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("text list exit %d: %s", code, stderr.String())
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte("\n  "+itoaTest(childAID))) || !bytes.Contains(stdout.Bytes(), []byte("\n  "+itoaTest(childBID))) {
+		t.Fatalf("child rows are not indented:\n%s", stdout.String())
+	}
+}
+
+func TestClusterPlanIncludesSplitsAndDissolves(t *testing.T) {
+	const (
+		parentID = int64(1)
+		childAID = int64(1<<52 + 31)
+		childBID = int64(1<<52 + 32)
+	)
+	flat := []db.MemoryCluster{{ClusterID: parentID, Label: "parent", MedoidID: 7}}
+	split := []db.MemoryCluster{
+		{ClusterID: parentID, Label: "parent", MedoidID: 7},
+		{ClusterID: childAID, ParentID: parentID, Label: "alpha", MedoidID: 7},
+		{ClusterID: childBID, ParentID: parentID, Label: "beta", MedoidID: 9},
+	}
+	built := builtClustering{
+		previousClusters: flat,
+		assignment:       db.MemoryClusterAssignment{Clusters: split},
+		realClusters:     1,
+		subclusters:      2,
+	}
+	plan := makeClusterPlan(built, "anchor", nil)
+	if len(plan.Splits) != 1 || len(plan.Dissolves) != 0 || !equalInt64s(plan.Splits[0].ChildIDs, []int64{childAID, childBID}) {
+		t.Fatalf("split plan changes = splits %+v dissolves %+v", plan.Splits, plan.Dissolves)
+	}
+
+	built.previousClusters = split
+	built.assignment.Clusters = flat
+	built.subclusters = 0
+	plan = makeClusterPlan(built, "anchor", nil)
+	if len(plan.Splits) != 0 || len(plan.Dissolves) != 1 || !equalInt64s(plan.Dissolves[0].ChildIDs, []int64{childAID, childBID}) {
+		t.Fatalf("dissolve plan changes = splits %+v dissolves %+v", plan.Splits, plan.Dissolves)
+	}
+}
+
+func TestClustersIncrementalAttachTargetsLeaf(t *testing.T) {
+	home, store := memoryTestHome(t)
+	dbIDs, netIDs := seedClusterCorpus(t, store)
+	ctx := context.Background()
+	const (
+		parentID = int64(1)
+		childID  = int64(1<<52 + 41)
+	)
+	assignment := db.MemoryClusterAssignment{Clusters: []db.MemoryCluster{
+		{ClusterID: parentID, Label: "storage", MedoidID: dbIDs[0]},
+		{ClusterID: childID, ParentID: parentID, Label: "database", MedoidID: dbIDs[0]},
+		{ClusterID: 2, Label: "network", MedoidID: netIDs[0]},
+	}}
+	for _, id := range dbIDs {
+		assignment.Members = append(assignment.Members, db.MemoryClusterMember{MemoryID: id, ClusterID: childID})
+	}
+	for _, id := range netIDs {
+		assignment.Members = append(assignment.Members, db.MemoryClusterMember{MemoryID: id, ClusterID: 2})
+	}
+	if err := store.RecomputeMemoryClusters(ctx, assignment); err != nil {
+		t.Fatalf("seed hierarchy: %v", err)
+	}
+
+	obsID, err := store.InsertMemoryObservation(ctx, db.MemoryObservation{
+		Owner: db.MemoryOwner{Kind: memory.OwnerKindAgent, Ref: "researcher"},
+		Repo:  "acme/widget", Scope: "repo", Key: "db-partition",
+		Content: "database partitioning splits the query index across storage nodes", TrustMark: "normal",
+	})
+	if err != nil {
+		t.Fatalf("insert observation: %v", err)
+	}
+	var b bytes.Buffer
+	if code := runMemory([]string{"confirm", "--yes", "--home", home, itoaTest(obsID)}, &b, &b); code != 0 {
+		t.Fatalf("confirm exit %d: %s", code, b.String())
+	}
+	newID := confirmedIDForKey(t, store, ctx, "db-partition")
+	if got := clusterOf(t, store, ctx, newID); got != childID {
+		t.Fatalf("new fact attached to %d, want leaf %d", got, childID)
+	}
+}
+
 // ---- small test helpers ----
 
 func clusterOf(t *testing.T, store *db.Store, ctx context.Context, id int64) int64 {

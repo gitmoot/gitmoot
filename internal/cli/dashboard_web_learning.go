@@ -223,11 +223,11 @@ type witnessKey struct {
 // supersede "ghosts". The per-agent count and the on-graph fact-node count for that
 // agent therefore differ by its superseded rows — this is intentional.
 func (d *webDataSource) Knowledge(ctx context.Context) (dashboard.Knowledge, error) {
-	out, _, err := d.knowledgeWithShared(ctx)
+	out, _, _, err := d.knowledgeWithShared(ctx)
 	return out, err
 }
 
-func (d *webDataSource) knowledgeWithShared(ctx context.Context) (dashboard.Knowledge, map[string]bool, error) {
+func (d *webDataSource) knowledgeWithShared(ctx context.Context) (dashboard.Knowledge, map[string]bool, map[string]string, error) {
 	out := dashboard.Knowledge{
 		Agents:   []dashboard.KnowledgeAgent{},
 		Facts:    []dashboard.KnowledgeFact{},
@@ -235,6 +235,7 @@ func (d *webDataSource) knowledgeWithShared(ctx context.Context) (dashboard.Know
 		Edges:    []dashboard.KnowledgeEdge{},
 	}
 	sharedByFact := map[string]bool{}
+	parentByCluster := map[string]string{}
 	err := withStoreAndPaths(d.home, func(paths config.Paths, store *db.Store) error {
 		// Confirmed facts (INCLUDING superseded ghosts) owned by any agent, plus
 		// shared facts attributed to their preserved author.
@@ -326,15 +327,15 @@ func (d *webDataSource) knowledgeWithShared(ctx context.Context) (dashboard.Know
 			return out.Facts[i].ID < out.Facts[j].ID
 		})
 
-		out.Clusters = knowledgeClusters(clusterByID, out.Facts, idByRow)
+		out.Clusters, parentByCluster = knowledgeClusters(clusterByID, out.Facts)
 		out.Agents = knowledgeAgents(ctx, store, paths, out.Facts)
 		out.Edges = knowledgeEdges(rows, out.Facts, idByRow, membByRow)
 		return nil
 	})
 	if err != nil {
-		return dashboard.Knowledge{}, nil, err
+		return dashboard.Knowledge{}, nil, nil, err
 	}
-	return out, sharedByFact, nil
+	return out, sharedByFact, parentByCluster, nil
 }
 
 func knowledgeFactOwner(r db.ConfirmedMemory) string {
@@ -345,10 +346,10 @@ func knowledgeFactOwner(r db.ConfirmedMemory) string {
 }
 
 type dashboardKnowledgeResponse struct {
-	Agents   []dashboard.KnowledgeAgent   `json:"agents"`
-	Facts    []dashboardKnowledgeFact     `json:"facts"`
-	Clusters []dashboard.KnowledgeCluster `json:"clusters"`
-	Edges    []dashboard.KnowledgeEdge    `json:"edges"`
+	Agents   []dashboard.KnowledgeAgent  `json:"agents"`
+	Facts    []dashboardKnowledgeFact    `json:"facts"`
+	Clusters []dashboardKnowledgeCluster `json:"clusters"`
+	Edges    []dashboard.KnowledgeEdge   `json:"edges"`
 }
 
 type dashboardKnowledgeFact struct {
@@ -356,8 +357,17 @@ type dashboardKnowledgeFact struct {
 	Shared bool `json:"shared,omitempty"`
 }
 
+// dashboardKnowledgeCluster extends the currently pinned dashboard module's
+// additive cluster payload without requiring the UI dependency to land first.
+// Older dashboard clients ignore parent_id; newer clients use it for the
+// subcluster column.
+type dashboardKnowledgeCluster struct {
+	dashboard.KnowledgeCluster
+	ParentID string `json:"parent_id,omitempty"`
+}
+
 func (d *webDataSource) handleLearningKnowledge(w http.ResponseWriter, r *http.Request) {
-	k, sharedByFact, err := d.knowledgeWithShared(r.Context())
+	k, sharedByFact, parentByCluster, err := d.knowledgeWithShared(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -365,13 +375,19 @@ func (d *webDataSource) handleLearningKnowledge(w http.ResponseWriter, r *http.R
 	resp := dashboardKnowledgeResponse{
 		Agents:   k.Agents,
 		Facts:    make([]dashboardKnowledgeFact, 0, len(k.Facts)),
-		Clusters: k.Clusters,
+		Clusters: make([]dashboardKnowledgeCluster, 0, len(k.Clusters)),
 		Edges:    k.Edges,
 	}
 	for _, f := range k.Facts {
 		resp.Facts = append(resp.Facts, dashboardKnowledgeFact{
 			KnowledgeFact: f,
 			Shared:        sharedByFact[f.ID],
+		})
+	}
+	for _, c := range k.Clusters {
+		resp.Clusters = append(resp.Clusters, dashboardKnowledgeCluster{
+			KnowledgeCluster: c,
+			ParentID:         parentByCluster[c.ID],
 		})
 	}
 	buf, err := json.MarshalIndent(resp, "", "  ")
@@ -439,31 +455,47 @@ func knowledgeFactLinks(ctx context.Context, store *db.Store, src db.ConfirmedMe
 }
 
 // knowledgeClusters builds the emergent-cluster hubs behind the Knowledge view's
-// repo->cluster->fact hierarchy (#763): one dashboard.KnowledgeCluster per
-// persisted community that has at least one EMITTED member fact. Label is the
+// repo->cluster->fact hierarchy (#763, #779): one dashboard.KnowledgeCluster per
+// persisted community that has at least one emitted member fact in its leaf
+// descendants. Label is the
 // display label — an owner `memory cluster rename` override wins, resolved by the
 // store's DisplayLabel, so the client renders it verbatim. Count is the
-// emitted-member tally (so it matches the members the client can list), Repo is the
-// dominant repo scope among those members ("" = general/mixed) for the nesting, and
-// Medoid is the anchor fact but only when it is itself an emitted member of this
-// hub. Sorted by hub id for a stable, signature-skippable payload. Fail-open
+// emitted leaf-member tally, rolled into each parent. Repo is the dominant repo
+// scope among those members ("" = general/mixed) for the nesting, and Medoid is
+// the anchor fact but only when it is itself an emitted descendant of this hub.
+// Parent ids are returned separately because the pinned dashboard module predates
+// the additive field; the custom HTTP payload merges them back in. Sorted by hub
+// id for a stable, signature-skippable payload. Fail-open
 // upstream: an empty cluster set yields an empty slice and the client falls back to
 // its pre-cluster scope/category view.
-func knowledgeClusters(clusterByID map[int64]db.MemoryCluster, facts []dashboard.KnowledgeFact, idByRow map[int64]string) []dashboard.KnowledgeCluster {
-	// Roll up the emitted facts by their cluster hub: member count, per-repo tally,
-	// and the fact->hub index used to confirm a medoid is a member of its own hub.
+func knowledgeClusters(clusterByID map[int64]db.MemoryCluster, facts []dashboard.KnowledgeFact) ([]dashboard.KnowledgeCluster, map[string]string) {
+	// Roll up the emitted facts by leaf hub and, for split facts, by parent hub.
+	// hubOfFact confirms that a medoid is a member or descendant of its hub.
 	countByHub := map[string]int{}
 	reposByHub := map[string]map[string]int{}
 	hubOfFact := map[string]string{}
+	parentByHub := map[string]string{}
+	for cid, c := range clusterByID {
+		hub := clusterHubID(cid)
+		if c.ParentID != 0 {
+			parentByHub[hub] = clusterHubID(c.ParentID)
+		}
+	}
 	for _, f := range facts {
 		if f.Cluster == "" {
 			continue
 		}
-		countByHub[f.Cluster]++
-		if reposByHub[f.Cluster] == nil {
-			reposByHub[f.Cluster] = map[string]int{}
+		hubs := []string{f.Cluster}
+		if parent := parentByHub[f.Cluster]; parent != "" {
+			hubs = append(hubs, parent)
 		}
-		reposByHub[f.Cluster][f.Repo]++
+		for _, hub := range hubs {
+			countByHub[hub]++
+			if reposByHub[hub] == nil {
+				reposByHub[hub] = map[string]int{}
+			}
+			reposByHub[hub][f.Repo]++
+		}
 		hubOfFact[f.ID] = f.Cluster
 	}
 
@@ -481,14 +513,14 @@ func knowledgeClusters(clusterByID map[int64]db.MemoryCluster, facts []dashboard
 			Repo:  dominantRepo(reposByHub[hub]),
 		}
 		if c.MedoidID != 0 {
-			if mid := fmt.Sprintf("fact:%d", c.MedoidID); hubOfFact[mid] == hub {
+			if mid := fmt.Sprintf("fact:%d", c.MedoidID); hubOfFact[mid] == hub || parentByHub[hubOfFact[mid]] == hub {
 				kc.Medoid = mid
 			}
 		}
 		out = append(out, kc)
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out
+	return out, parentByHub
 }
 
 // dominantRepo returns the most common repo scope among a cluster's member facts

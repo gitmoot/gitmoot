@@ -1486,19 +1486,24 @@ nightly proposal pipeline lives under
 `memory clusters` groups confirmed facts into **emergent communities** over the
 fact-similarity graph (the same bm25 + id-tiebreak signal the vault `[[links]]` use),
 retiring the dashboard's old fixed key-prefix "category" hubs. The community detection
-is **id-ordered label propagation with lowest-label tie-breaks** — a pure function of
+is **id-ordered label propagation with lowest-label tie-breaks**, a pure function of
 the graph, so the **same store yields byte-identical clusters, labels, medoids, and
-ids**. Labels are up to three distinctive terms (cluster term frequency weighted
+ids**. A top-level cluster splits automatically at 20 facts when a second pass over
+its internal graph yields at least two children of four or more facts. An existing
+split remains above 12 parent facts while every child stays at least four; otherwise
+it dissolves. Depth is capped at two levels. Labels are up to three distinctive terms (cluster term frequency weighted
 against corpus document frequency), anchored to the cluster **medoid**; facts with no
 neighbors fall into the reserved cluster **0 `unclustered`**. `recompute` is a
 human-gated **propose → apply** round-trip: `--propose` writes a plan with a staleness
-**anchor** over each active fact's `(id, updated_at)`; `--apply --plan` re-checks the
+**anchor** over each active fact's `(id, updated_at)` and explicit planned splits or
+dissolves; `--apply --plan` re-checks the
 anchor, **aborts as stale** on drift, then rewrites the whole clustering in one
 transaction (a bare `--apply` is allowed only on first run, when nothing exists to
-protect). Confirming a new fact best-effort attaches it to the nearest neighbor's
+protect). Confirming a new fact best-effort attaches it to the nearest neighbor's leaf
 cluster; `memory cluster rename` sets an owner label override that wins over the
-computed label and survives recomputes. The Knowledge view renders a **repo → cluster
-→ fact** hierarchy.
+computed label and survives while that parent or child identity persists. The
+Knowledge payload adds optional child `parent_id` values and renders a **repo →
+cluster → subcluster → fact** hierarchy. Parent hubs are view-only aggregates.
 
 ## Pipelines
 

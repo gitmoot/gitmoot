@@ -29,7 +29,7 @@ import (
 // yields byte-identical clusters, labels, medoids, and ids.
 
 // clusterPlanSchemaVersion is the on-disk recompute-plan schema version.
-const clusterPlanSchemaVersion = 1
+const clusterPlanSchemaVersion = 2
 
 // clusterLinkK is the k-NN degree per fact — the same neighbor count the vault
 // links render (vaultLinkK), so clusters emerge from the exact same signal.
@@ -39,9 +39,17 @@ const clusterLinkK = vaultLinkK
 // these verbatim). Members are ascending fact ids.
 type clusterPlanCluster struct {
 	ClusterID int64   `json:"cluster_id"`
+	ParentID  int64   `json:"parent_id,omitempty"`
 	Label     string  `json:"label"`
 	MedoidID  int64   `json:"medoid_id"`
 	Members   []int64 `json:"members"`
+}
+
+// clusterPlanHierarchyChange makes automatic hierarchy changes explicit in a
+// recompute proposal. ChildIDs are sorted for deterministic plans.
+type clusterPlanHierarchyChange struct {
+	ParentID int64   `json:"parent_id"`
+	ChildIDs []int64 `json:"child_ids"`
 }
 
 // clusterPlanMove is one fact that lands in a different cluster than it currently
@@ -56,18 +64,21 @@ type clusterPlanMove struct {
 // `recompute --apply --plan` reads. Anchor is the staleness guard over the active
 // facts' (id, updated_at); a mismatch at apply aborts as stale.
 type clusterPlan struct {
-	SchemaVersion int                  `json:"schema_version"`
-	Anchor        string               `json:"anchor"`
-	Clusters      []clusterPlanCluster `json:"clusters"`
-	Moves         []clusterPlanMove    `json:"moves"`
-	NewFacts      []int64              `json:"new_facts,omitempty"`     // facts not previously in any cluster
-	DroppedFacts  []int64              `json:"dropped_facts,omitempty"` // previously-clustered facts now gone/retired
-	Stats         clusterPlanStats     `json:"stats"`
+	SchemaVersion int                          `json:"schema_version"`
+	Anchor        string                       `json:"anchor"`
+	Clusters      []clusterPlanCluster         `json:"clusters"`
+	Moves         []clusterPlanMove            `json:"moves"`
+	NewFacts      []int64                      `json:"new_facts,omitempty"`     // facts not previously in any cluster
+	DroppedFacts  []int64                      `json:"dropped_facts,omitempty"` // previously-clustered facts now gone/retired
+	Splits        []clusterPlanHierarchyChange `json:"splits"`
+	Dissolves     []clusterPlanHierarchyChange `json:"dissolves"`
+	Stats         clusterPlanStats             `json:"stats"`
 }
 
 type clusterPlanStats struct {
 	Facts       int `json:"facts"`
-	Clusters    int `json:"clusters"`    // real communities (excludes the unclustered bucket)
+	Clusters    int `json:"clusters"` // top-level real communities (excludes the unclustered bucket)
+	Subclusters int `json:"subclusters"`
 	Unclustered int `json:"unclustered"` // facts in the reserved bucket
 	Moves       int `json:"moves"`
 }
@@ -85,6 +96,7 @@ func runMemoryClusters(args []string, stdout, stderr io.Writer) int {
 
 type clusterListEntry struct {
 	ClusterID int64  `json:"cluster_id"`
+	ParentID  int64  `json:"parent_id,omitempty"`
 	Label     string `json:"label"`
 	Override  string `json:"label_override,omitempty"`
 	MedoidID  int64  `json:"medoid_id"`
@@ -112,9 +124,9 @@ func runMemoryClustersList(args []string, stdout, stderr io.Writer) int {
 			return err
 		}
 		entries = make([]clusterListEntry, 0, len(clusters))
-		for _, c := range clusters {
+		for _, c := range hierarchyOrderedClusters(clusters) {
 			entries = append(entries, clusterListEntry{
-				ClusterID: c.ClusterID, Label: c.DisplayLabel(), Override: c.LabelOverride,
+				ClusterID: c.ClusterID, ParentID: c.ParentID, Label: c.DisplayLabel(), Override: c.LabelOverride,
 				MedoidID: c.MedoidID, Count: counts[c.ClusterID],
 			})
 		}
@@ -136,7 +148,11 @@ func runMemoryClustersList(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	for _, e := range entries {
-		fmt.Fprintf(stdout, "%-4d %-32s %5d facts (medoid %d)\n", e.ClusterID, e.Label, e.Count, e.MedoidID)
+		indent := ""
+		if e.ParentID != 0 {
+			indent = "  "
+		}
+		fmt.Fprintf(stdout, "%s%-4d %-32s %5d facts (medoid %d)\n", indent, e.ClusterID, e.Label, e.Count, e.MedoidID)
 	}
 	return 0
 }
@@ -228,6 +244,7 @@ func runMemoryClustersApply(home, planPath string, jsonOut bool, stdout, stderr 
 		Applied     bool   `json:"applied"`
 		FirstRun    bool   `json:"first_run"`
 		Clusters    int    `json:"clusters"`
+		Subclusters int    `json:"subclusters"`
 		Unclustered int    `json:"unclustered"`
 		Facts       int    `json:"facts"`
 	}
@@ -254,7 +271,8 @@ func runMemoryClustersApply(home, planPath string, jsonOut bool, stdout, stderr 
 				return err
 			}
 			result = applyResult{Anchor: anchor, Applied: true, FirstRun: true,
-				Clusters: built.realClusters, Unclustered: built.unclustered, Facts: built.facts}
+				Clusters: built.realClusters, Subclusters: built.subclusters,
+				Unclustered: built.unclustered, Facts: built.facts}
 			return nil
 		}
 
@@ -276,9 +294,9 @@ func runMemoryClustersApply(home, planPath string, jsonOut bool, stdout, stderr 
 			}
 			return err
 		}
-		real, unc := countPlanBuckets(plan)
+		real, subclusters, unc := countPlanBuckets(plan)
 		result = applyResult{Anchor: plan.Anchor, Applied: true, Clusters: real,
-			Unclustered: unc, Facts: len(plan.members())}
+			Subclusters: subclusters, Unclustered: unc, Facts: len(plan.members())}
 		return nil
 	})
 	if err != nil {
@@ -297,8 +315,8 @@ func runMemoryClustersApply(home, planPath string, jsonOut bool, stdout, stderr 
 	if result.FirstRun {
 		kind = "applied (first run)"
 	}
-	fmt.Fprintf(stdout, "%s: %d cluster(s), %d unclustered fact(s) across %d fact(s) (anchor %s)\n",
-		kind, result.Clusters, result.Unclustered, result.Facts, result.Anchor)
+	fmt.Fprintf(stdout, "%s: %d top-level cluster(s), %d subcluster(s), %d unclustered fact(s) across %d fact(s) (anchor %s)\n",
+		kind, result.Clusters, result.Subclusters, result.Unclustered, result.Facts, result.Anchor)
 	return 0
 }
 
@@ -353,10 +371,12 @@ func runMemoryClusterRename(args []string, stdout, stderr io.Writer) int {
 // builtClustering bundles the pure clustering result mapped into a store
 // assignment plus a few counts for reporting.
 type builtClustering struct {
-	assignment   db.MemoryClusterAssignment
-	realClusters int
-	unclustered  int
-	facts        int
+	assignment       db.MemoryClusterAssignment
+	previousClusters []db.MemoryCluster
+	realClusters     int
+	subclusters      int
+	unclustered      int
+	facts            int
 }
 
 // buildClusterAssignment reads every active confirmed fact, builds the undirected
@@ -394,24 +414,59 @@ func buildClusterAssignment(ctx context.Context, store *db.Store) (builtClusteri
 		}
 	}
 
-	res := memory.BuildClusters(nodes, edges)
-	built := builtClustering{facts: len(rows)}
+	previous, err := store.ListMemoryClusters(ctx)
+	if err != nil {
+		return builtClustering{}, "", err
+	}
+	existingSplits := existingSplitParentMedoids(previous)
+	res := memory.BuildClusterHierarchy(nodes, edges, existingSplits)
+	built := builtClustering{facts: len(rows), previousClusters: previous}
+	childrenByParent := map[int64]bool{}
+	for _, c := range res.Clusters {
+		if c.ParentID != 0 {
+			childrenByParent[c.ParentID] = true
+		}
+	}
 	for _, c := range res.Clusters {
 		built.assignment.Clusters = append(built.assignment.Clusters, db.MemoryCluster{
-			ClusterID: c.ID, Label: c.Label, MedoidID: c.MedoidID,
+			ClusterID: c.ID, ParentID: c.ParentID, Label: c.Label, MedoidID: c.MedoidID,
 		})
-		for _, m := range c.Members {
-			built.assignment.Members = append(built.assignment.Members, db.MemoryClusterMember{
-				MemoryID: m, ClusterID: c.ID,
-			})
+		if !childrenByParent[c.ID] {
+			for _, m := range c.Members {
+				built.assignment.Members = append(built.assignment.Members, db.MemoryClusterMember{
+					MemoryID: m, ClusterID: c.ID,
+				})
+			}
 		}
 		if c.ID == memory.UnclusteredID {
 			built.unclustered = len(c.Members)
+		} else if c.ParentID != 0 {
+			built.subclusters++
 		} else {
 			built.realClusters++
 		}
 	}
 	return built, clusterAnchor(rows), nil
+}
+
+// existingSplitParentMedoids maps persisted child rows back to their parent's
+// stable medoid identity. Parent cluster numbers can shift as top-level
+// communities change, while the medoid is the existing recompute identity.
+func existingSplitParentMedoids(clusters []db.MemoryCluster) map[int64]bool {
+	byID := make(map[int64]db.MemoryCluster, len(clusters))
+	for _, c := range clusters {
+		byID[c.ClusterID] = c
+	}
+	out := map[int64]bool{}
+	for _, c := range clusters {
+		if c.ParentID == 0 {
+			continue
+		}
+		if parent, ok := byID[c.ParentID]; ok && parent.MedoidID != 0 {
+			out[parent.MedoidID] = true
+		}
+	}
+	return out
 }
 
 // clusterAnchor is the deterministic staleness anchor: sha256 over the active
@@ -443,7 +498,12 @@ func currentMembership(ctx context.Context, store *db.Store) (map[int64]int64, e
 // makeClusterPlan builds the reviewable plan from the freshly built clustering
 // and the current persisted membership (for the moves/new/dropped diff).
 func makeClusterPlan(built builtClustering, anchor string, current map[int64]int64) clusterPlan {
-	plan := clusterPlan{SchemaVersion: clusterPlanSchemaVersion, Anchor: anchor}
+	plan := clusterPlan{
+		SchemaVersion: clusterPlanSchemaVersion,
+		Anchor:        anchor,
+		Splits:        []clusterPlanHierarchyChange{},
+		Dissolves:     []clusterPlanHierarchyChange{},
+	}
 	byCluster := map[int64][]int64{}
 	for _, m := range built.assignment.Members {
 		byCluster[m.ClusterID] = append(byCluster[m.ClusterID], m.MemoryID)
@@ -452,9 +512,10 @@ func makeClusterPlan(built builtClustering, anchor string, current map[int64]int
 		members := append([]int64(nil), byCluster[c.ClusterID]...)
 		sort.Slice(members, func(i, j int) bool { return members[i] < members[j] })
 		plan.Clusters = append(plan.Clusters, clusterPlanCluster{
-			ClusterID: c.ClusterID, Label: c.Label, MedoidID: c.MedoidID, Members: members,
+			ClusterID: c.ClusterID, ParentID: c.ParentID, Label: c.Label, MedoidID: c.MedoidID, Members: members,
 		})
 	}
+	plan.Splits, plan.Dissolves = hierarchyPlanChanges(built.previousClusters, built.assignment.Clusters)
 	// Diff: moves (fact changed cluster), new facts (not previously clustered),
 	// dropped facts (previously clustered, now absent).
 	proposed := map[int64]int64{}
@@ -478,7 +539,7 @@ func makeClusterPlan(built builtClustering, anchor string, current map[int64]int
 		}
 	}
 	plan.Stats = clusterPlanStats{
-		Facts: built.facts, Clusters: built.realClusters, Unclustered: built.unclustered,
+		Facts: built.facts, Clusters: built.realClusters, Subclusters: built.subclusters, Unclustered: built.unclustered,
 		Moves: len(plan.Moves),
 	}
 	return plan
@@ -498,7 +559,7 @@ func planAssignment(p clusterPlan) db.MemoryClusterAssignment {
 	var a db.MemoryClusterAssignment
 	for _, c := range p.Clusters {
 		a.Clusters = append(a.Clusters, db.MemoryCluster{
-			ClusterID: c.ClusterID, Label: c.Label, MedoidID: c.MedoidID,
+			ClusterID: c.ClusterID, ParentID: c.ParentID, Label: c.Label, MedoidID: c.MedoidID,
 		})
 		for _, m := range c.Members {
 			a.Members = append(a.Members, db.MemoryClusterMember{MemoryID: m, ClusterID: c.ClusterID})
@@ -507,15 +568,17 @@ func planAssignment(p clusterPlan) db.MemoryClusterAssignment {
 	return a
 }
 
-func countPlanBuckets(p clusterPlan) (real, unclustered int) {
+func countPlanBuckets(p clusterPlan) (real, subclusters, unclustered int) {
 	for _, c := range p.Clusters {
 		if c.ClusterID == memory.UnclusteredID {
 			unclustered = len(c.Members)
+		} else if c.ParentID != 0 {
+			subclusters++
 		} else {
 			real++
 		}
 	}
-	return real, unclustered
+	return real, subclusters, unclustered
 }
 
 func readClusterPlan(path string) (clusterPlan, error) {
@@ -538,14 +601,33 @@ func readClusterPlan(path string) (clusterPlan, error) {
 
 func printClusterProposal(w io.Writer, plan clusterPlan, outPath string) {
 	fmt.Fprintf(w, "cluster proposal (anchor %s)\n", plan.Anchor)
-	fmt.Fprintf(w, "  %d fact(s) -> %d cluster(s), %d unclustered; %d move(s), %d new, %d dropped\n",
-		plan.Stats.Facts, plan.Stats.Clusters, plan.Stats.Unclustered,
+	fmt.Fprintf(w, "  %d fact(s) -> %d top-level cluster(s), %d subcluster(s), %d unclustered; %d move(s), %d new, %d dropped\n",
+		plan.Stats.Facts, plan.Stats.Clusters, plan.Stats.Subclusters, plan.Stats.Unclustered,
 		len(plan.Moves), len(plan.NewFacts), len(plan.DroppedFacts))
-	for _, c := range plan.Clusters {
+	for _, c := range hierarchyOrderedPlanClusters(plan.Clusters) {
 		if c.ClusterID == memory.UnclusteredID {
 			continue
 		}
-		fmt.Fprintf(w, "  cluster %d [%s] %d fact(s) (medoid %d)\n", c.ClusterID, c.Label, len(c.Members), c.MedoidID)
+		indent := ""
+		count := len(c.Members)
+		if c.ParentID != 0 {
+			indent = "  "
+		} else {
+			count = planClusterCount(plan.Clusters, c.ClusterID)
+		}
+		fmt.Fprintf(w, "  %scluster %d [%s] %d fact(s) (medoid %d)\n", indent, c.ClusterID, c.Label, count, c.MedoidID)
+	}
+	if len(plan.Splits) > 0 {
+		fmt.Fprintln(w, "\nPlanned splits:")
+		for _, change := range plan.Splits {
+			fmt.Fprintf(w, "  - cluster %d -> children %v\n", change.ParentID, change.ChildIDs)
+		}
+	}
+	if len(plan.Dissolves) > 0 {
+		fmt.Fprintln(w, "\nPlanned dissolves:")
+		for _, change := range plan.Dissolves {
+			fmt.Fprintf(w, "  - cluster %d removes children %v\n", change.ParentID, change.ChildIDs)
+		}
 	}
 	if len(plan.Moves) > 0 {
 		fmt.Fprintln(w, "\nMoves:")
@@ -604,6 +686,140 @@ func bucketExists(ctx context.Context, store *db.Store) bool {
 		}
 	}
 	return false
+}
+
+func hierarchyOrderedClusters(clusters []db.MemoryCluster) []db.MemoryCluster {
+	children := map[int64][]db.MemoryCluster{}
+	var roots []db.MemoryCluster
+	for _, c := range clusters {
+		if c.ParentID == 0 {
+			roots = append(roots, c)
+		} else {
+			children[c.ParentID] = append(children[c.ParentID], c)
+		}
+	}
+	sort.Slice(roots, func(i, j int) bool { return roots[i].ClusterID < roots[j].ClusterID })
+	for parentID := range children {
+		sort.Slice(children[parentID], func(i, j int) bool {
+			if children[parentID][i].MedoidID != children[parentID][j].MedoidID {
+				return children[parentID][i].MedoidID < children[parentID][j].MedoidID
+			}
+			return children[parentID][i].ClusterID < children[parentID][j].ClusterID
+		})
+	}
+	out := make([]db.MemoryCluster, 0, len(clusters))
+	for _, root := range roots {
+		out = append(out, root)
+		out = append(out, children[root.ClusterID]...)
+	}
+	return out
+}
+
+func hierarchyOrderedPlanClusters(clusters []clusterPlanCluster) []clusterPlanCluster {
+	children := map[int64][]clusterPlanCluster{}
+	var roots []clusterPlanCluster
+	for _, c := range clusters {
+		if c.ParentID == 0 {
+			roots = append(roots, c)
+		} else {
+			children[c.ParentID] = append(children[c.ParentID], c)
+		}
+	}
+	sort.Slice(roots, func(i, j int) bool { return roots[i].ClusterID < roots[j].ClusterID })
+	for parentID := range children {
+		sort.Slice(children[parentID], func(i, j int) bool {
+			if children[parentID][i].MedoidID != children[parentID][j].MedoidID {
+				return children[parentID][i].MedoidID < children[parentID][j].MedoidID
+			}
+			return children[parentID][i].ClusterID < children[parentID][j].ClusterID
+		})
+	}
+	out := make([]clusterPlanCluster, 0, len(clusters))
+	for _, root := range roots {
+		out = append(out, root)
+		out = append(out, children[root.ClusterID]...)
+	}
+	return out
+}
+
+func planClusterCount(clusters []clusterPlanCluster, clusterID int64) int {
+	total := 0
+	for _, c := range clusters {
+		if c.ClusterID == clusterID || c.ParentID == clusterID {
+			total += len(c.Members)
+		}
+	}
+	return total
+}
+
+type clusterHierarchyState struct {
+	ParentID int64
+	Children []int64
+}
+
+// hierarchyPlanChanges compares trees by stable parent medoid, not by compact
+// top-level numbering. A changed child identity set is shown as one dissolve and
+// one split, making the destructive and constructive halves reviewable.
+func hierarchyPlanChanges(current, proposed []db.MemoryCluster) (splits, dissolves []clusterPlanHierarchyChange) {
+	old := clusterHierarchyByParentMedoid(current)
+	next := clusterHierarchyByParentMedoid(proposed)
+	medoids := map[int64]bool{}
+	for medoid := range old {
+		medoids[medoid] = true
+	}
+	for medoid := range next {
+		medoids[medoid] = true
+	}
+	for _, medoid := range sortedInt64Keys(medoids) {
+		before, hadBefore := old[medoid]
+		after, hasAfter := next[medoid]
+		if hadBefore && (!hasAfter || !equalInt64s(before.Children, after.Children)) {
+			dissolves = append(dissolves, clusterPlanHierarchyChange{
+				ParentID: before.ParentID,
+				ChildIDs: append([]int64(nil), before.Children...),
+			})
+		}
+		if hasAfter && (!hadBefore || !equalInt64s(before.Children, after.Children)) {
+			splits = append(splits, clusterPlanHierarchyChange{
+				ParentID: after.ParentID,
+				ChildIDs: append([]int64(nil), after.Children...),
+			})
+		}
+	}
+	return splits, dissolves
+}
+
+func clusterHierarchyByParentMedoid(clusters []db.MemoryCluster) map[int64]clusterHierarchyState {
+	byID := make(map[int64]db.MemoryCluster, len(clusters))
+	children := map[int64][]int64{}
+	for _, c := range clusters {
+		byID[c.ClusterID] = c
+		if c.ParentID != 0 {
+			children[c.ParentID] = append(children[c.ParentID], c.ClusterID)
+		}
+	}
+	out := map[int64]clusterHierarchyState{}
+	for parentID, childIDs := range children {
+		parent, ok := byID[parentID]
+		if !ok || parent.MedoidID == 0 {
+			continue
+		}
+		sort.Slice(childIDs, func(i, j int) bool { return childIDs[i] < childIDs[j] })
+		out[parent.MedoidID] = clusterHierarchyState{ParentID: parentID, Children: childIDs}
+	}
+	return out
+}
+
+func equalInt64s(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // sortedInt64Keys returns the ascending keys of an int64-keyed map (deterministic

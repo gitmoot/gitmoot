@@ -398,7 +398,7 @@ skipping an existing row named `memory-groom-propose`.
 ## Emergent clusters
 
 `memory clusters` groups confirmed facts into **emergent communities** detected over
-the fact-similarity graph — the **same** bm25 + id-tiebreak signal the vault
+the fact-similarity graph, using the **same** bm25 + id-tiebreak signal the vault
 `[[links]]` use. They replace the dashboard's old fixed key-prefix "category" hubs:
 clusters are discovered from what facts actually say, not how their keys are namespaced.
 
@@ -413,23 +413,36 @@ gitmoot memory cluster rename <cluster-id> <label>
   propagation** with **lowest-label tie-breaks** over a fixed graph (sorted-id visit
   order, id-valued initial labels, summed neighbor influence). No map order,
   randomness, or wall clock enters, so the **same store yields byte-identical
-  clusters, labels, medoids, and cluster ids** — matching the vault byte-identity rule.
+  clusters, labels, medoids, cluster ids, and hierarchy**, matching the vault
+  byte-identity rule.
 - **Labels** are up to three distinctive terms (term frequency inside the cluster
   weighted against corpus document frequency), joined with `-` and anchored to the
   cluster **medoid** (the member with the highest total intra-cluster similarity) for
-  stability. Facts with no neighbors fall into the reserved cluster **0 `unclustered`**.
+  stability. Child labels compare term frequency across siblings, making them
+  contrastive within the parent. Facts with no neighbors fall into the reserved
+  cluster **0 `unclustered`**.
+- **Automatic hierarchy:** a top-level cluster splits at 20 facts when a second
+  deterministic pass over its internal subgraph yields at least two children of at
+  least four facts each. Existing splits stay active above 12 parent facts while
+  every child remains at least four facts. At 12 or fewer facts, or when a child
+  falls below four, the children dissolve. The maximum depth is two levels, and
+  facts always belong to leaf clusters.
 - **`recompute`** is a human-gated **propose → review → apply** round-trip like
-  `memory groom`: `--propose` writes a reviewable plan of the moves/merges plus a
-  **staleness anchor** over every active fact's `(id, updated_at)`; `--apply --plan`
+  `memory groom`: `--propose` writes a reviewable plan of fact moves plus planned
+  splits and dissolves, along with a **staleness anchor** over every active fact's
+  `(id, updated_at)`; `--apply --plan`
   re-checks the anchor, **aborts as stale** if the store moved, then rewrites the
   whole clustering in one transaction. On **first run** (no clusters yet) a bare
   `recompute --apply` is allowed since there is nothing to protect.
-- **Incremental attach:** confirming a new fact best-effort joins it to the cluster
+- **Incremental attach:** confirming a new fact best-effort joins it to the leaf cluster
   of its nearest neighbor without a full recompute; nothing is re-shelved silently.
 - `memory cluster rename` sets an **owner label override** that wins over the computed
-  label and survives recomputes (anchored to the medoid).
+  label. Parent overrides survive later splits. Child overrides survive while the
+  stable child id persists and are removed when the split dissolves.
 
-The dashboard Knowledge view renders this as a **repo → cluster → fact** hierarchy.
+The Knowledge payload gives child entries an optional `parent_id`; facts retain leaf
+cluster ids. The dashboard can render **repo → cluster → subcluster → fact**, while
+parent hubs remain an aggregate view and do not change memory injection or retrieval.
 
 ## Phases
 
