@@ -291,13 +291,21 @@ func TestMemoryLinkExpansionRespectsRenderBudget(t *testing.T) {
 	}
 }
 
-func TestMemoryInjectionFooterOnlyOnNonEmptyBlock(t *testing.T) {
+func TestMemoryRecallHintRendersForEnrolledAgentsRegardlessOfHits(t *testing.T) {
+	hint := "Project memory is searchable mid-job: run `gitmoot memory recall \"<query>\" --agent audit`."
+
+	// Enrolled agent with ZERO retrieval hits still gets the hint: agents need
+	// on-demand recall most when the startup push missed.
 	store := openTestStore(t)
 	prompt := runMemJob(t, store, memController(store, 1500, 15, "audit"), memTestOutput, "zzznomatch")
-	if strings.Contains(prompt, "More project memory is searchable") {
-		t.Fatalf("footer must not appear without a memory block:\n%s", prompt)
+	if !strings.Contains(prompt, hint) {
+		t.Fatalf("recall hint must render for enrolled agents even with no hits:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "Prior learnings") {
+		t.Fatalf("no learnings block expected on a retrieval miss:\n%s", prompt)
 	}
 
+	// With hits, the hint renders AFTER the learnings block, outside its bullets.
 	store = openTestStore(t)
 	if _, err := store.UpsertConfirmedMemory(context.Background(), db.ConfirmedMemory{
 		Owner: db.MemoryOwner{Kind: "agent", Ref: "audit"}, Repo: "acme/widget", Scope: "repo",
@@ -306,8 +314,17 @@ func TestMemoryInjectionFooterOnlyOnNonEmptyBlock(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	prompt = runMemJob(t, store, memController(store, 1500, 15, "audit"), memTestOutput, "arm64")
-	if !strings.Contains(prompt, "More project memory is searchable: run `gitmoot memory recall \"<query>\" --agent audit`.") {
-		t.Fatalf("footer missing from non-empty memory block:\n%s", prompt)
+	blockIdx := strings.Index(prompt, "arm64 CI is flaky")
+	hintIdx := strings.Index(prompt, hint)
+	if blockIdx < 0 || hintIdx < 0 || hintIdx < blockIdx {
+		t.Fatalf("hint must render after the learnings block:\n%s", prompt)
+	}
+
+	// Non-enrolled agent: no hint, prompt byte-identical to pre-memory behavior.
+	store = openTestStore(t)
+	prompt = runMemJob(t, store, memController(store, 1500, 15, "someone-else"), memTestOutput, "arm64")
+	if strings.Contains(prompt, "Project memory is searchable mid-job") {
+		t.Fatalf("hint must not render for non-enrolled agents:\n%s", prompt)
 	}
 }
 

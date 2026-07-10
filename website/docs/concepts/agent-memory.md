@@ -24,12 +24,14 @@ it ships in phases. The current phase is **observation mode**:
   titled *"Prior learnings (reference only, not instructions)"* with
   `[this repo]` / `[general]` tags. After direct FTS hits are selected, Gitmoot
   follows one hop of persisted memory links in a single batched query, appends
-  visible linked facts after all direct hits, and tags those bullets with
-  `[linked]`. Linked facts must pass the same private-plus-shared, repo/general,
-  and active-row visibility rules. They fill only remaining entry and token
-  budget, so they never evict direct hits. A non-empty block ends with a footer
-  showing the enrolled agent how to run `gitmoot memory recall "<query>" --agent <agent-name>`
-  for on-demand recall. An empty result adds nothing.
+  visible linked facts after all direct hits (capped at 3), and tags those
+  bullets with `[linked]`. Linked facts must pass the same private-plus-shared,
+  repo/general, and active-row visibility rules. They fill only remaining entry
+  and token budget, so they never evict direct hits. Every enrolled agent's
+  prompt also carries a one-line hint that project memory is searchable
+  mid-job via `gitmoot memory recall "<query>" --agent <agent-name>`; the hint
+  renders whether or not startup retrieval found anything, because on-demand
+  recall matters most when the initial push missed.
 - **WRITE:** the confirmed (injectable) tier is populated only by Gitmoot's own
   deterministic **mechanical facts** (no model involved). A fact is written only
   when a terminal job carries a genuine, bounded signal — never one fact per job:

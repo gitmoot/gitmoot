@@ -106,11 +106,31 @@ func (c *MemoryController) injectBlock(ctx context.Context, agent runtime.Agent,
 		return ""
 	}
 	entries := c.retrieve(ctx, ownerForJob(agent, payload), payload.Repo, payload.Instructions, c.MaxEntries)
+	// The mid-job recall affordance renders for EVERY enrolled agent, hits or
+	// not: agents need on-demand recall most when the startup push MISSED
+	// (panel-adjudicated #780 finding). It sits OUTSIDE the learnings block so
+	// the block stays reference-only data.
+	hint := memoryRecallHint(agent.Name)
 	if len(entries) == 0 {
-		return ""
+		return hint
 	}
-	block, _ := renderMemoryInjectionBlock(entries, c.TokenBudget, agent.Name)
-	return block
+	block, _ := memory.RenderBlock(entries, c.TokenBudget)
+	if block == "" {
+		return hint
+	}
+	if !strings.HasSuffix(block, "\n") {
+		block += "\n"
+	}
+	return block + "\n" + hint
+}
+
+// memoryRecallHint is the one-line, deterministic mid-job recall affordance.
+func memoryRecallHint(agentName string) string {
+	name := strings.TrimSpace(agentName)
+	if name == "" {
+		name = "<agent-name>"
+	}
+	return fmt.Sprintf("Project memory is searchable mid-job: run `gitmoot memory recall \"<query>\" --agent %s`.", name)
 }
 
 // retrieve runs the tiered, confirmed-only, sanitized-FTS retrieval and returns
@@ -142,17 +162,26 @@ func (c *MemoryController) retrieve(ctx context.Context, owner db.MemoryOwner, r
 		srcIDs = append(srcIDs, r.ID)
 	}
 	if len(entries) < limit {
+		// Linked expansion fills spare capacity only, and is hard-capped at 3
+		// entries so bm25-derived neighbors can never dominate a sparse direct
+		// result (panel-adjudicated #780 finding).
+		maxExpand := limit - len(entries)
+		if maxExpand > 3 {
+			maxExpand = 3
+		}
+		added := 0
 		linked, err := c.Store.ListMemoryLinksForSourcesVisibleToOwner(ctx, owner, repo, srcIDs)
 		if err == nil {
 			for _, l := range linked {
+				if added >= maxExpand {
+					break
+				}
 				if _, dup := seen[l.Memory.ID]; dup {
 					continue
 				}
 				seen[l.Memory.ID] = struct{}{}
 				entries = append(entries, memoryEntryFromConfirmed(l.Memory, true))
-				if len(entries) >= limit {
-					break
-				}
+				added++
 			}
 		}
 	}
@@ -175,7 +204,9 @@ func (c *MemoryController) PreviewEntries(ctx context.Context, agentName, repo, 
 // ungated, for the harness), returning the block text, the entries injected, and
 // the block's estimated token cost.
 func (c *MemoryController) PreviewBlock(ctx context.Context, agentName, repo, instructions string) (block string, entries int, tokens int) {
-	rendered, n := renderMemoryInjectionBlock(c.PreviewEntries(ctx, agentName, repo, instructions, 0), c.TokenBudget, agentName)
+	// The harness measures the learnings BLOCK alone; the mid-job recall hint is
+	// a constant-cost prompt line, not part of the measured injection delta.
+	rendered, n := memory.RenderBlock(c.PreviewEntries(ctx, agentName, repo, instructions, 0), c.TokenBudget)
 	return rendered, n, memory.EstimateTokens(rendered)
 }
 
@@ -189,21 +220,6 @@ func memoryEntryFromConfirmed(r db.ConfirmedMemory, linked bool) memory.Entry {
 	}
 }
 
-func renderMemoryInjectionBlock(entries []memory.Entry, budget int, agentName string) (string, int) {
-	block, n := memory.RenderBlock(entries, budget)
-	if block == "" {
-		return "", 0
-	}
-	name := strings.TrimSpace(agentName)
-	if name == "" {
-		name = "<agent-name>"
-	}
-	if !strings.HasSuffix(block, "\n") {
-		block += "\n"
-	}
-	block += fmt.Sprintf("More project memory is searchable: run `gitmoot memory recall \"<query>\" --agent %s`.\n", name)
-	return block, n
-}
 
 // record is the WRITE path, run at job terminal. The ENROLLED-ONLY Phase-1 body
 // (recordEnrolled) (a) SHADOW-logs the agent's returned learnings to
