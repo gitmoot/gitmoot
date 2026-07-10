@@ -1713,6 +1713,7 @@ observations** behind the existing confirmation gate. It never writes confirmed
 
 ```sh
 gitmoot memory ingest <path|dir> --agent NAME [--shared] [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
+gitmoot memory ingest sweep [--json]
 gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]
 gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--to-shared] [--yes] [--json]
 gitmoot memory promote --to-shared <id>... [--json]
@@ -1739,6 +1740,14 @@ to `repo`; `general` is only ever chosen with the explicit flag. `--shared`
 stages the observations in the shared pool while preserving `--agent NAME` as
 their author. `--dry-run` reports what would be staged without writing.
 
+`memory ingest sweep` reads every configured `[[memory.ingest]]` source from the
+current config at run time and runs the same ingest logic in-process for each one.
+`--json` emits per-source entries with `path`, `agent`, `repo`, `tier`,
+`inserted`, `deduped`, `rejected`, and `error`, plus aggregate totals. One bad
+source does not stop the rest; the command exits non-zero only when the config is
+invalid or every configured source fails. With no sources it exits zero with a
+skipped note.
+
 `memory observations` lists pending observations (optionally narrowed by
 `--agent` or `--provenance-prefix`), flagging which keys already crossed the
 confirm gate. `memory confirm` is the **human-gated promotion** step: it copies
@@ -1752,8 +1761,9 @@ facts into shared, refuses retired or superseded rows, preserves outgoing
 `memory_links`, and sets `author_ref` from the previous owner when needed. This is
 **CLI-explicit only**: there is no daemon path and nothing auto-confirms.
 
-The built-in `memory-ingest-sweep` pipeline turns configured note directories into
-ordinary pipeline stages. Configure sources under `[[memory.ingest]]`:
+The built-in `memory-ingest-sweep` pipeline calls
+`gitmoot memory ingest sweep --json` and then summarizes the run totals. Configure
+sources under `[[memory.ingest]]`:
 
 ```toml
 [[memory.ingest]]
@@ -1765,7 +1775,11 @@ tier = "repo"
 
 The daemon and `gitmoot pipeline install-defaults` register the pipeline
 idempotently and skip an existing row named `memory-ingest-sweep`, preserving
-local edits. With no sources, the pipeline succeeds with a no-sources summary.
+local edits. The installed spec does not freeze the source list; changes to
+`[[memory.ingest]]` apply on the next scheduled or manual run without reinstalling
+defaults. Per-source errors are written into the run output, and the stage fails
+visibly when the sweep command exits non-zero. With no sources, the pipeline
+succeeds with a no-sources summary.
 It is manual-only unless `[memory.pipelines].ingest_sweep` is set to a positive Go
 duration such as `"24h"` or the alias `"nightly"`. A manual run is:
 

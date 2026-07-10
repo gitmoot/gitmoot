@@ -115,6 +115,14 @@ gitmoot pipeline run memory-ingest-sweep
 gitmoot pipeline run memory-groom-propose
 ```
 
+The installed `memory-ingest-sweep` spec has a fixed two-stage shape: `sweep`
+calls `gitmoot memory ingest sweep --json`, then `summarize` reports the totals.
+The source list is loaded from `[[memory.ingest]]` at run time, so config edits
+apply on the next scheduled or manual run without reinstalling defaults. A bad
+source is reported in the sweep JSON and does not stop other sources. The stage
+fails visibly only when the config is invalid or every configured source fails.
+With no sources, the run succeeds with a skipped summary.
+
 ## The stage contract
 
 A stage command runs as `sh -c '<cmd>' gitmoot '<prompt>'`. It signals its outcome by

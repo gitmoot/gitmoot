@@ -126,25 +126,13 @@ func defaultMemoryPipelineRepo(ctx context.Context, store *db.Store, settings co
 }
 
 func renderMemoryIngestSweepPipeline(settings config.MemoryPipelineSettings, paths config.Paths, rawHome string, repo string) defaultPipelineDefinition {
-	stages := make([]pipeline.Stage, 0, len(settings.IngestSources)+1)
-	needs := make([]string, 0, len(settings.IngestSources))
-	for i, source := range settings.IngestSources {
-		id := fmt.Sprintf("ingest-%d", i+1)
-		stages = append(stages, pipeline.Stage{
-			ID:  id,
-			Cmd: memoryIngestStageCommand(paths, rawHome, source, i+1),
-		})
-		needs = append(needs, id)
-	}
-	stages = append(stages, pipeline.Stage{
-		ID:    "summarize",
-		Cmd:   memoryIngestSummaryStageCommand(paths, len(settings.IngestSources)),
-		Needs: needs,
-	})
 	spec := pipeline.Spec{
-		Name:   defaultMemoryIngestSweepPipeline,
-		Repo:   repo,
-		Stages: stages,
+		Name: defaultMemoryIngestSweepPipeline,
+		Repo: repo,
+		Stages: []pipeline.Stage{
+			{ID: "sweep", Cmd: memoryIngestSweepStageCommand(paths, rawHome)},
+			{ID: "summarize", Cmd: memoryIngestSummaryStageCommand(paths), Needs: []string{"sweep"}},
+		},
 	}
 	enabled := settings.IngestSweepInterval != ""
 	if enabled {
@@ -169,54 +157,57 @@ func renderMemoryGroomProposePipeline(settings config.MemoryPipelineSettings, pa
 	return defaultPipelineDefinition{name: spec.Name, spec: spec, enabled: enabled}
 }
 
-func memoryIngestStageCommand(paths config.Paths, rawHome string, source config.MemoryIngestSource, index int) string {
+func memoryIngestSweepStageCommand(paths config.Paths, rawHome string) string {
 	homeArgs := memoryPipelineHomeArgs(rawHome)
-	repoArgs := ""
-	if strings.TrimSpace(source.Repo) != "" {
-		repoArgs = " --repo " + memoryPipelineShellQuote(source.Repo)
-	}
 	return strings.Join([]string{
 		"set -eu",
 		memoryPipelineRunDirScript(paths),
-		"out_file=\"$run_dir/ingest-" + fmt.Sprint(index) + ".json\"",
-		"err_file=\"$run_dir/ingest-" + fmt.Sprint(index) + ".err\"",
-		"if " + memoryPipelineShellQuote(defaultPipelineGitmootBinary()) + " memory ingest" + homeArgs + " --agent " + memoryPipelineShellQuote(source.Agent) + " --tier " + memoryPipelineShellQuote(source.Tier) + repoArgs + " --json " + memoryPipelineShellQuote(source.Path) + " > \"$out_file\" 2> \"$err_file\"; then",
+		"out_file=\"$run_dir/ingest-sweep.json\"",
+		"err_file=\"$run_dir/ingest-sweep.err\"",
+		"if " + memoryPipelineShellQuote(defaultPipelineGitmootBinary()) + " memory ingest sweep" + homeArgs + " --json > \"$out_file\" 2> \"$err_file\"; then",
+		"  cat \"$out_file\"",
+		"  sources=$(json_num \"$out_file\" sources)",
 		"  inserted=$(json_num \"$out_file\" inserted)",
-		"  inserted=${inserted:-0}",
-		"  printf '%s' '{\"gitmoot_result\":{\"decision\":\"implemented\",\"summary\":\"memory ingest source " + fmt.Sprint(index) + " staged '\"$inserted\"' observation(s)\",\"findings\":[],\"changes_made\":[\"wrote run-scoped ingest summary\"],\"tests_run\":[\"gitmoot memory ingest --json\"],\"needs\":[],\"delegations\":[]}}'",
+		"  deduped=$(json_num \"$out_file\" deduped)",
+		"  rejected=$(json_num \"$out_file\" rejected)",
+		"  failed=$(json_num \"$out_file\" failed)",
+		"  if [ \"$sources\" -eq 0 ]; then",
+		"    summary=\"memory ingest sweep skipped: no sources configured\"",
+		"  else",
+		"    summary=\"memory ingest sweep staged ${inserted} observation(s) from ${sources} source(s); deduped=${deduped} rejected=${rejected} failed_sources=${failed}\"",
+		"  fi",
+		"  printf '\\n%s' '{\"gitmoot_result\":{\"decision\":\"implemented\",\"summary\":\"'\"$summary\"'\",\"findings\":[],\"changes_made\":[\"wrote run-scoped ingest sweep JSON\"],\"tests_run\":[\"gitmoot memory ingest sweep --json\"],\"needs\":[],\"delegations\":[]}}'",
 		"else",
-		"  printf '%s' '{\"gitmoot_result\":{\"decision\":\"failed\",\"summary\":\"memory ingest source " + fmt.Sprint(index) + " failed; see run-scoped stderr\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"gitmoot memory ingest --json\"],\"needs\":[],\"delegations\":[]}}'",
+		"  if [ -s \"$out_file\" ]; then cat \"$out_file\"; fi",
+		"  if [ -s \"$err_file\" ]; then cat \"$err_file\"; fi",
+		"  sources=$(json_num \"$out_file\" sources)",
+		"  inserted=$(json_num \"$out_file\" inserted)",
+		"  failed=$(json_num \"$out_file\" failed)",
+		"  printf '\\n%s' '{\"gitmoot_result\":{\"decision\":\"failed\",\"summary\":\"memory ingest sweep failed; sources='\"$sources\"' failed_sources='\"$failed\"' inserted='\"$inserted\"'; see run-scoped JSON/stderr\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"gitmoot memory ingest sweep --json\"],\"needs\":[],\"delegations\":[]}}'",
 		"fi",
 	}, "\n")
 }
 
-func memoryIngestSummaryStageCommand(paths config.Paths, sources int) string {
-	if sources == 0 {
-		return strings.Join([]string{
-			"set -eu",
-			memoryPipelineRunDirScript(paths),
-			"printf '%s' '{\"gitmoot_result\":{\"decision\":\"implemented\",\"summary\":\"memory ingest sweep skipped: no sources configured\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"delegations\":[]}}'",
-		}, "\n")
-	}
+func memoryIngestSummaryStageCommand(paths config.Paths) string {
 	return strings.Join([]string{
 		"set -eu",
 		memoryPipelineRunDirScript(paths),
-		"files=0",
-		"chunks=0",
-		"inserted=0",
-		"deduped=0",
-		"rejected=0",
-		"seen=0",
-		"for f in \"$run_dir\"/ingest-*.json; do",
-		"  [ -f \"$f\" ] || continue",
-		"  seen=$((seen + 1))",
-		"  files=$((files + $(json_num \"$f\" files)))",
-		"  chunks=$((chunks + $(json_num \"$f\" chunks)))",
-		"  inserted=$((inserted + $(json_num \"$f\" inserted)))",
-		"  deduped=$((deduped + $(json_num \"$f\" deduped)))",
-		"  rejected=$((rejected + $(json_num \"$f\" rejected)))",
-		"done",
-		"printf '%s' '{\"gitmoot_result\":{\"decision\":\"implemented\",\"summary\":\"memory ingest sweep staged '\"$inserted\"' observation(s) from '\"$seen\"' source(s), '\"$files\"' file(s), '\"$chunks\"' chunk(s); deduped='\"$deduped\"' rejected='\"$rejected\"'\",\"findings\":[],\"changes_made\":[\"aggregated memory ingest sweep counts\"],\"tests_run\":[\"gitmoot memory ingest --json\"],\"needs\":[],\"delegations\":[]}}'",
+		"summary_file=\"$run_dir/ingest-sweep.json\"",
+		"if [ -s \"$summary_file\" ]; then cat \"$summary_file\"; fi",
+		"sources=$(json_num \"$summary_file\" sources)",
+		"succeeded=$(json_num \"$summary_file\" succeeded)",
+		"failed=$(json_num \"$summary_file\" failed)",
+		"files=$(json_num \"$summary_file\" files)",
+		"chunks=$(json_num \"$summary_file\" chunks)",
+		"inserted=$(json_num \"$summary_file\" inserted)",
+		"deduped=$(json_num \"$summary_file\" deduped)",
+		"rejected=$(json_num \"$summary_file\" rejected)",
+		"if [ \"$sources\" -eq 0 ]; then",
+		"  summary=\"memory ingest sweep skipped: no sources configured\"",
+		"else",
+		"  summary=\"memory ingest sweep staged ${inserted} observation(s) from ${succeeded}/${sources} successful source(s), ${files} file(s), ${chunks} chunk(s); deduped=${deduped} rejected=${rejected} failed_sources=${failed}\"",
+		"fi",
+		"printf '\\n%s' '{\"gitmoot_result\":{\"decision\":\"implemented\",\"summary\":\"'\"$summary\"'\",\"findings\":[],\"changes_made\":[\"aggregated memory ingest sweep counts\"],\"tests_run\":[\"gitmoot memory ingest sweep --json\"],\"needs\":[],\"delegations\":[]}}'",
 	}, "\n")
 }
 
@@ -231,7 +222,8 @@ func memoryGroomProposeStageCommand(paths config.Paths, rawHome string) string {
 		"if " + memoryPipelineShellQuote(defaultPipelineGitmootBinary()) + " memory groom" + homeArgs + " --propose --out \"$plan_file\" --json > \"$summary_file\" 2> \"$err_file\"; then",
 		"  printf '%s' '{\"gitmoot_result\":{\"decision\":\"implemented\",\"summary\":\"memory groom proposal written\",\"findings\":[],\"changes_made\":[\"wrote run-scoped groom proposal\"],\"tests_run\":[\"gitmoot memory groom --propose --json\"],\"needs\":[],\"delegations\":[]}}'",
 		"else",
-		"  printf '%s' '{\"gitmoot_result\":{\"decision\":\"failed\",\"summary\":\"memory groom proposal failed; see run-scoped stderr\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"gitmoot memory groom --propose --json\"],\"needs\":[],\"delegations\":[]}}'",
+		"  if [ -s \"$err_file\" ]; then cat \"$err_file\"; fi",
+		"  printf '\\n%s' '{\"gitmoot_result\":{\"decision\":\"failed\",\"summary\":\"memory groom proposal failed; see run-scoped stderr\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"gitmoot memory groom --propose --json\"],\"needs\":[],\"delegations\":[]}}'",
 		"fi",
 	}, "\n")
 }
@@ -254,8 +246,8 @@ func memoryGroomSummaryStageCommand(paths config.Paths) string {
 
 func memoryPipelineRunDirScript(paths config.Paths) string {
 	return strings.Join([]string{
-		"json_num() { awk -v key=\"\\\"$2\\\"\" 'index($0,key) { value=$0; sub(/^.*: */, \"\", value); sub(/,.*/, \"\", value); gsub(/[^0-9-]/, \"\", value); found=1; print value; exit } END { if (!found) print 0 }' \"$1\"; }",
-		"json_stat() { awk -v key=\"\\\"$2\\\"\" '/\"stats\"[[:space:]]*:/ { in_stats=1; next } in_stats && /}/ { exit } in_stats && index($0,key) { value=$0; sub(/^.*: */, \"\", value); sub(/,.*/, \"\", value); gsub(/[^0-9-]/, \"\", value); found=1; print value; exit } END { if (!found) print 0 }' \"$1\"; }",
+		"json_num() { if [ ! -f \"$1\" ]; then printf '0\\n'; return 0; fi; awk -v key=\"\\\"$2\\\"\" 'index($0,key) { value=$0; sub(/^.*: */, \"\", value); sub(/,.*/, \"\", value); gsub(/[^0-9-]/, \"\", value); found=1; print value; exit } END { if (!found) print 0 }' \"$1\"; }",
+		"json_stat() { if [ ! -f \"$1\" ]; then printf '0\\n'; return 0; fi; awk -v key=\"\\\"$2\\\"\" '/\"stats\"[[:space:]]*:/ { in_stats=1; next } in_stats && /}/ { exit } in_stats && index($0,key) { value=$0; sub(/^.*: */, \"\", value); sub(/,.*/, \"\", value); gsub(/[^0-9-]/, \"\", value); found=1; print value; exit } END { if (!found) print 0 }' \"$1\"; }",
 		"prompt=${1:-}",
 		"run_id=$(printf '%s\\n' \"$prompt\" | sed -n 's/.*pipeline [^[:space:]]* run \\([^[:space:]]*\\) stage .*/\\1/p' | head -n 1)",
 		"if [ -z \"$run_id\" ]; then run_id=manual; fi",

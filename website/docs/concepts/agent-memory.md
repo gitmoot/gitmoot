@@ -212,6 +212,7 @@ writes injectable memory directly.
 
 ```sh
 gitmoot memory ingest <path|dir> --agent NAME [--shared] [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
+gitmoot memory ingest sweep [--json]
 gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]
 gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--to-shared] [--yes] [--json]
 gitmoot memory promote --to-shared <id>... [--json]
@@ -247,10 +248,21 @@ observations into the shared pool while preserving the observation author.
 refuses retired or superseded rows, preserves existing links, and stamps
 `author_ref` from the previous owner when needed.
 
+`memory ingest sweep` reads the current `[[memory.ingest]]` source list from the
+config at run time and runs the same ingest logic in-process for each source.
+`--json` reports each source with `path`, `agent`, `repo`, `tier`, `inserted`,
+`deduped`, `rejected`, and `error`, plus totals. One bad source does not stop the
+rest. The command exits non-zero only when the config is invalid or every source
+fails; with no sources it exits zero with a skipped note.
+
 For unattended intake, Gitmoot ships an ordinary built-in pipeline named
 `memory-ingest-sweep`. The daemon and `gitmoot pipeline install-defaults` register
 it idempotently and skip an existing row with that name, preserving local edits.
-Configure one or more sources, then either run it manually or enable an interval:
+The installed pipeline calls `gitmoot memory ingest sweep --json`, so edits to
+`[[memory.ingest]]` apply on the next manual or scheduled run without reinstalling
+defaults. Per-source errors are included in the run output, and an all-source sweep
+failure marks the stage failed. Configure one or more sources, then either run it
+manually or enable an interval:
 
 ```toml
 [[memory.ingest]]

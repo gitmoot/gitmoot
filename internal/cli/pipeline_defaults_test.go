@@ -14,6 +14,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/pipeline"
+	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
 func TestPipelineInstallDefaultsIdempotentAndPreservesUserEdits(t *testing.T) {
@@ -49,19 +50,54 @@ func TestPipelineInstallDefaultsIdempotentAndPreservesUserEdits(t *testing.T) {
 	}
 }
 
+func TestPipelineInstallDefaultsSchedulesFromMemoryPipelineSettings(t *testing.T) {
+	home, paths, store := heartbeatLoopE2EHome(t)
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	appendConfig(t, paths, `
+[memory.pipelines]
+repo = "owner/repo"
+ingest_sweep = "2h"
+ingest_sweep_jitter = "10m"
+groom_propose = "off"
+`)
+
+	runInstallDefaults(t, home)
+
+	ingest, ok, err := store.GetPipeline(context.Background(), "memory-ingest-sweep")
+	if err != nil || !ok {
+		t.Fatalf("GetPipeline ingest: ok=%v err=%v", ok, err)
+	}
+	if !ingest.Enabled || ingest.Interval != "2h" || ingest.Jitter != "10m" {
+		t.Fatalf("ingest schedule = enabled=%v interval=%q jitter=%q, want enabled 2h/10m", ingest.Enabled, ingest.Interval, ingest.Jitter)
+	}
+	groom, ok, err := store.GetPipeline(context.Background(), "memory-groom-propose")
+	if err != nil || !ok {
+		t.Fatalf("GetPipeline groom: ok=%v err=%v", ok, err)
+	}
+	if groom.Enabled || groom.Interval != "" || groom.Jitter != "" {
+		t.Fatalf("groom schedule = enabled=%v interval=%q jitter=%q, want unscheduled manual-only", groom.Enabled, groom.Interval, groom.Jitter)
+	}
+}
+
 func TestDefaultMemoryIngestSweepNoSourcesSkip(t *testing.T) {
 	home, _, store := heartbeatLoopE2EHome(t)
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	t.Setenv(defaultMemoryPipelineBinEnv, buildGitmootTestBinary(t))
 	runInstallDefaults(t, home)
 
 	run := runDefaultPipelineToTerminal(t, home, store, "memory-ingest-sweep")
 	if run.State != pipeline.RunSucceeded {
 		t.Fatalf("run state = %s, want succeeded (halt=%s)", run.State, run.HaltReason)
 	}
-	stage := stageRow(t, store, run.ID, "summarize")
-	if stage.State != pipeline.StageSucceeded || !strings.Contains(stage.Summary, "no sources configured") {
-		t.Fatalf("summary stage = %+v, want no-sources success", stage)
+	sweep := stageRow(t, store, run.ID, "sweep")
+	if sweep.State != pipeline.StageSucceeded || !strings.Contains(sweep.Summary, "no sources configured") {
+		t.Fatalf("sweep stage = %+v, want no-sources success", sweep)
+	}
+	summarize := stageRow(t, store, run.ID, "summarize")
+	if summarize.State != pipeline.StageSucceeded || !strings.Contains(summarize.Summary, "no sources configured") {
+		t.Fatalf("summary stage = %+v, want no-sources success", summarize)
 	}
 }
 
@@ -70,6 +106,8 @@ func TestDefaultMemoryIngestSweepTwoSourcesE2E(t *testing.T) {
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	t.Setenv(defaultMemoryPipelineBinEnv, buildGitmootTestBinary(t))
+	runInstallDefaults(t, home)
+	assertDefaultIngestPipelineShape(t, store)
 
 	srcA := t.TempDir()
 	srcB := t.TempDir()
@@ -92,11 +130,14 @@ agent = "lead"
 repo = "owner/repo"
 tier = "repo"
 `)
-	runInstallDefaults(t, home)
 
 	run := runDefaultPipelineToTerminal(t, home, store, "memory-ingest-sweep")
 	if run.State != pipeline.RunSucceeded {
 		t.Fatalf("run state = %s, want succeeded (halt=%s)", run.State, run.HaltReason)
+	}
+	sweep := stageRow(t, store, run.ID, "sweep")
+	if sweep.State != pipeline.StageSucceeded || !strings.Contains(sweep.Summary, "failed_sources=0") {
+		t.Fatalf("sweep stage = %+v, want succeeded with zero failed sources", sweep)
 	}
 	stage := stageRow(t, store, run.ID, "summarize")
 	if !strings.Contains(stage.Summary, "staged 2 observation(s)") {
@@ -108,6 +149,46 @@ tier = "repo"
 	}
 	if len(obs) != 2 {
 		t.Fatalf("observations = %d, want 2: %+v", len(obs), obs)
+	}
+}
+
+func TestDefaultMemoryIngestSweepAllSourcesFailIsLoud(t *testing.T) {
+	home, paths, store := heartbeatLoopE2EHome(t)
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	t.Setenv(defaultMemoryPipelineBinEnv, buildGitmootTestBinary(t))
+	missing := filepath.Join(t.TempDir(), "missing")
+	appendConfig(t, paths, `
+[[memory.ingest]]
+path = "`+filepath.ToSlash(missing)+`"
+agent = "lead"
+repo = "owner/repo"
+tier = "repo"
+`)
+	runInstallDefaults(t, home)
+
+	run := runDefaultPipelineToTerminal(t, home, store, "memory-ingest-sweep")
+	if run.State != pipeline.RunFailed || run.HaltStage != "sweep" {
+		t.Fatalf("run = state %s halt %q reason %q, want failed at sweep", run.State, run.HaltStage, run.HaltReason)
+	}
+	sweep := stageRow(t, store, run.ID, "sweep")
+	if sweep.State != pipeline.StageFailed || !strings.Contains(sweep.Summary, "memory ingest sweep failed") {
+		t.Fatalf("sweep stage = %+v, want loud failure", sweep)
+	}
+	summarize := stageRow(t, store, run.ID, "summarize")
+	if summarize.State != pipeline.StageSkipped {
+		t.Fatalf("summarize stage = %+v, want skipped after sweep failure", summarize)
+	}
+	job, err := store.GetJob(context.Background(), sweep.JobID)
+	if err != nil {
+		t.Fatalf("GetJob(%s): %v", sweep.JobID, err)
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload: %v", err)
+	}
+	if len(payload.RawOutputs) == 0 || !strings.Contains(payload.RawOutputs[0], missing) || !strings.Contains(payload.RawOutputs[0], `"error"`) {
+		t.Fatalf("sweep raw output should include per-source error for %s:\n%v", missing, payload.RawOutputs)
 	}
 }
 
@@ -134,6 +215,27 @@ repo = "owner/repo"
 	plan := filepath.Join(paths.Home, "evals", "memory-pipelines", run.ID, "groom-plan.json")
 	if _, err := readGroomPlan(plan); err != nil {
 		t.Fatalf("read groom plan: %v\nfiles: %v", err, listRelativeFiles(t, filepath.Join(paths.Home, "evals", "memory-pipelines")))
+	}
+}
+
+func assertDefaultIngestPipelineShape(t *testing.T, store *db.Store) {
+	t.Helper()
+	rec, ok, err := store.GetPipeline(context.Background(), "memory-ingest-sweep")
+	if err != nil || !ok {
+		t.Fatalf("GetPipeline memory-ingest-sweep: ok=%v err=%v", ok, err)
+	}
+	spec, err := pipeline.Load([]byte(rec.SpecYAML))
+	if err != nil {
+		t.Fatalf("load default ingest spec: %v", err)
+	}
+	if len(spec.Stages) != 2 || spec.Stages[0].ID != "sweep" || spec.Stages[1].ID != "summarize" {
+		t.Fatalf("default ingest stages = %+v, want sweep -> summarize", spec.Stages)
+	}
+	if len(spec.Stages[1].Needs) != 1 || spec.Stages[1].Needs[0] != "sweep" {
+		t.Fatalf("summary needs = %+v, want [sweep]", spec.Stages[1].Needs)
+	}
+	if strings.Contains(rec.SpecYAML, "ingest-1") || strings.Contains(rec.SpecYAML, "memory ingest --agent") {
+		t.Fatalf("default ingest spec still freezes configured sources:\n%s", rec.SpecYAML)
 	}
 }
 
