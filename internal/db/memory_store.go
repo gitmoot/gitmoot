@@ -961,11 +961,11 @@ func (s *Store) RetireConfirmedMemory(ctx context.Context, id int64, reason stri
 	return tx.Commit()
 }
 
-// ListActiveConfirmedMemoriesByProvenancePrefix returns active confirmed rows
-// whose provenance starts with prefix. A non-empty agentRef narrows to rows
-// owned by or authored by that agent. It is the dry-run half of
+// ListActiveConfirmedMemoriesForRetire returns active confirmed rows whose
+// provenance starts with prefix. A non-empty agentRef narrows to rows owned by
+// or authored by that agent. It is the dry-run half of
 // `memory retire --provenance-prefix`.
-func (s *Store) ListActiveConfirmedMemoriesByProvenancePrefix(ctx context.Context, prefix, agentRef string) ([]ConfirmedMemory, error) {
+func (s *Store) ListActiveConfirmedMemoriesForRetire(ctx context.Context, prefix, agentRef string) ([]ConfirmedMemory, error) {
 	rows, err := listActiveConfirmedMemoriesByProvenancePrefix(ctx, s.db, prefix, agentRef)
 	if err != nil {
 		return nil, err

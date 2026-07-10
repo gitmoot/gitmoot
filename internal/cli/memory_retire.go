@@ -63,7 +63,7 @@ func runMemoryRetire(args []string, stdout, stderr io.Writer) int {
 
 	if result.DryRun {
 		err := withReadOnlyStore(*home, func(store *db.Store) error {
-			rows, err := store.ListActiveConfirmedMemoriesByProvenancePrefix(context.Background(), result.ProvenancePrefix, result.Agent)
+			rows, err := store.ListActiveConfirmedMemoriesForRetire(context.Background(), result.ProvenancePrefix, result.Agent)
 			if err != nil {
 				return err
 			}
