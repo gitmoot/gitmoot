@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -20,38 +21,43 @@ import (
 // pending observations, trust_mark=low, PreFilter-gated) plus the minimal
 // human-gated promotion slice — `memory observations` and `memory confirm` —
 // because Phase-2 promotion did not exist at all, so without it ingested notes
-// would sit inert. Everything here is CLI-EXPLICIT: no daemon path, no
-// auto-confirm, and nothing reads trust_mark for decisions yet. Ingested
-// markdown is UNTRUSTED (an indirect-prompt-injection vector); the human confirm
-// gate is the trust boundary.
+// would sit inert. Everything here is CLI-EXPLICIT: no daemon path, and nothing
+// reads trust_mark for decisions yet. Ingested markdown is UNTRUSTED (an
+// indirect-prompt-injection vector); by default the human confirm gate is the
+// trust boundary. When [memory].ingest_auto_confirm is enabled, confirmation is
+// still private-pool only and never writes shared memory.
 
 // ---- memory ingest --------------------------------------------------------
 
 // memoryIngestResult is the summary of an ingest run (and the --json shape).
 type memoryIngestResult struct {
-	Agent        string         `json:"agent"`
-	Shared       bool           `json:"shared,omitempty"`
-	Scope        string         `json:"scope"`
-	Repo         string         `json:"repo,omitempty"`
-	DryRun       bool           `json:"dry_run"`
-	Files        int            `json:"files"`
-	Chunks       int            `json:"chunks"`
-	Inserted     int            `json:"inserted"`
-	Deduped      int            `json:"deduped"`
-	RejectedN    int            `json:"rejected"`
-	RejectedBy   map[string]int `json:"rejected_by,omitempty"`
-	InsertedKeys []string       `json:"inserted_keys,omitempty"`
+	Agent          string         `json:"agent"`
+	Shared         bool           `json:"shared,omitempty"`
+	Scope          string         `json:"scope"`
+	Repo           string         `json:"repo,omitempty"`
+	DryRun         bool           `json:"dry_run"`
+	AutoConfirm    bool           `json:"auto_confirm,omitempty"`
+	Files          int            `json:"files"`
+	Chunks         int            `json:"chunks"`
+	Inserted       int            `json:"inserted"`
+	Confirmed      int            `json:"confirmed,omitempty"`
+	SkippedRetired int            `json:"skipped_retired,omitempty"`
+	Deduped        int            `json:"deduped"`
+	RejectedN      int            `json:"rejected"`
+	RejectedBy     map[string]int `json:"rejected_by,omitempty"`
+	InsertedKeys   []string       `json:"inserted_keys,omitempty"`
 }
 
 type memoryIngestOptions struct {
-	Home   string
-	Path   string
-	Agent  string
-	Shared bool
-	Repo   string
-	Tier   string
-	DryRun bool
-	JSON   bool
+	Home        string
+	Path        string
+	Agent       string
+	Shared      bool
+	Repo        string
+	Tier        string
+	DryRun      bool
+	JSON        bool
+	AutoConfirm bool
 }
 
 func runMemoryIngest(args []string, stdout, stderr io.Writer) int {
@@ -64,7 +70,12 @@ func runMemoryIngest(args []string, stdout, stderr io.Writer) int {
 	}
 
 	var result memoryIngestResult
-	err := withStore(options.Home, func(store *db.Store) error {
+	err := withStoreAndPaths(options.Home, func(paths config.Paths, store *db.Store) error {
+		settings, err := config.LoadMemorySettings(paths)
+		if err != nil {
+			return err
+		}
+		options.AutoConfirm = settings.IngestAutoConfirm
 		var ingestErr error
 		result, ingestErr = ingestMemorySource(context.Background(), store, options)
 		return ingestErr
@@ -88,12 +99,16 @@ func runMemoryIngest(args []string, stdout, stderr io.Writer) int {
 	if options.DryRun {
 		verb = "would ingest"
 	}
-	fmt.Fprintf(stdout, "%s %d observation(s) from %d file(s), %d chunk(s): inserted=%d deduped=%d rejected=%d\n",
-		verb, result.Inserted, result.Files, result.Chunks, result.Inserted, result.Deduped, result.RejectedN)
+	fmt.Fprintf(stdout, "%s %d observation(s) from %d file(s), %d chunk(s): inserted=%d confirmed=%d deduped=%d rejected=%d skipped_retired=%d\n",
+		verb, result.Inserted, result.Files, result.Chunks, result.Inserted, result.Confirmed, result.Deduped, result.RejectedN, result.SkippedRetired)
 	for _, reason := range sortedReasonKeys(result.RejectedBy) {
 		fmt.Fprintf(stdout, "  rejected[%s]=%d\n", reason, result.RejectedBy[reason])
 	}
-	fmt.Fprintln(stdout, "(ingested notes are trust_mark=low pending observations; run `gitmoot memory confirm` to promote)")
+	if result.AutoConfirm {
+		fmt.Fprintln(stdout, "(auto-confirm enabled: observations were confirmed into the authoring agent's private pool only)")
+	} else {
+		fmt.Fprintln(stdout, "(ingested notes are trust_mark=low pending observations; run `gitmoot memory confirm` to promote)")
+	}
 	return 0
 }
 
@@ -173,13 +188,14 @@ func ingestMemorySource(ctx context.Context, store *db.Store, options memoryInge
 	}
 
 	result := memoryIngestResult{
-		Agent:      options.Agent,
-		Shared:     options.Shared,
-		Scope:      options.Tier,
-		Repo:       strings.TrimSpace(options.Repo),
-		DryRun:     options.DryRun,
-		Files:      len(files),
-		RejectedBy: map[string]int{},
+		Agent:       options.Agent,
+		Shared:      options.Shared,
+		Scope:       options.Tier,
+		Repo:        strings.TrimSpace(options.Repo),
+		DryRun:      options.DryRun,
+		AutoConfirm: options.AutoConfirm,
+		Files:       len(files),
+		RejectedBy:  map[string]int{},
 	}
 	owner := db.MemoryOwner{Kind: memory.OwnerKindAgent, Ref: options.Agent}
 	authorRef := ""
@@ -188,7 +204,11 @@ func ingestMemorySource(ctx context.Context, store *db.Store, options memoryInge
 		authorRef = strings.TrimSpace(options.Agent)
 	}
 
-	seen, err := store.ObservationDedupKeys(ctx, owner.Ref)
+	dedupOwner := owner.Ref
+	if options.AutoConfirm {
+		dedupOwner = strings.TrimSpace(options.Agent)
+	}
+	seen, err := store.ObservationDedupKeys(ctx, dedupOwner)
 	if err != nil {
 		return result, err
 	}
@@ -226,7 +246,7 @@ func ingestMemorySource(ctx context.Context, store *db.Store, options memoryInge
 			if options.DryRun {
 				continue
 			}
-			if _, err := store.InsertMemoryObservation(ctx, db.MemoryObservation{
+			obs := db.MemoryObservation{
 				Owner:      owner,
 				AuthorRef:  authorRef,
 				Repo:       result.Repo,
@@ -235,36 +255,81 @@ func ingestMemorySource(ctx context.Context, store *db.Store, options memoryInge
 				Content:    chunk.Text,
 				Provenance: "ingest:" + rel,
 				TrustMark:  memory.TrustLow,
-			}); err != nil {
+			}
+			if _, err := store.InsertMemoryObservation(ctx, obs); err != nil {
 				return result, fmt.Errorf("insert observation for %s: %w", rel, err)
+			}
+			confirmed, skipped, err := autoConfirmObservationIfEnabled(ctx, store, obs, options.AutoConfirm)
+			if err != nil {
+				return result, fmt.Errorf("auto-confirm observation for %s: %w", rel, err)
+			}
+			if confirmed {
+				result.Confirmed++
+			}
+			if skipped {
+				result.SkippedRetired++
 			}
 		}
 	}
 	return result, nil
 }
 
+func autoConfirmObservationIfEnabled(ctx context.Context, store *db.Store, obs db.MemoryObservation, enabled bool) (confirmed bool, skippedRetired bool, err error) {
+	if !enabled {
+		return false, false, nil
+	}
+	author := observationAuthorRef(obs)
+	if strings.TrimSpace(author) == "" {
+		return false, false, fmt.Errorf("authoring agent is required")
+	}
+	owner := db.MemoryOwner{Kind: memory.OwnerKindAgent, Ref: author}
+	id, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+		Owner:      owner,
+		Repo:       obs.Repo,
+		Scope:      obs.Scope,
+		Key:        obs.Key,
+		Content:    obs.Content,
+		Provenance: obs.Provenance,
+		SourceJob:  obs.SourceJob,
+	})
+	if err != nil {
+		if errors.Is(err, db.ErrConfirmedMemoryRetired) {
+			return false, true, nil
+		}
+		return false, false, err
+	}
+	attachConfirmedFactToCluster(ctx, store, db.ConfirmedMemory{
+		ID: id, Owner: owner, Repo: obs.Repo, Scope: obs.Scope, Key: obs.Key, Content: obs.Content,
+	})
+	return true, false, nil
+}
+
 type memoryIngestSweepSourceResult struct {
-	Path     string `json:"path"`
-	Agent    string `json:"agent"`
-	Repo     string `json:"repo"`
-	Tier     string `json:"tier"`
-	Files    int    `json:"files"`
-	Chunks   int    `json:"chunks"`
-	Inserted int    `json:"inserted"`
-	Deduped  int    `json:"deduped"`
-	Rejected int    `json:"rejected"`
-	Error    string `json:"error"`
+	Path           string `json:"path"`
+	Agent          string `json:"agent"`
+	Repo           string `json:"repo"`
+	Tier           string `json:"tier"`
+	Files          int    `json:"files"`
+	Chunks         int    `json:"chunks"`
+	Inserted       int    `json:"inserted"`
+	Confirmed      int    `json:"confirmed,omitempty"`
+	SkippedRetired int    `json:"skipped_retired,omitempty"`
+	Deduped        int    `json:"deduped"`
+	Rejected       int    `json:"rejected"`
+	Error          string `json:"error"`
 }
 
 type memoryIngestSweepTotals struct {
-	Sources   int `json:"sources"`
-	Succeeded int `json:"succeeded"`
-	Failed    int `json:"failed"`
-	Files     int `json:"files"`
-	Chunks    int `json:"chunks"`
-	Inserted  int `json:"inserted"`
-	Deduped   int `json:"deduped"`
-	Rejected  int `json:"rejected"`
+	Sources        int `json:"sources"`
+	Succeeded      int `json:"succeeded"`
+	Failed         int `json:"failed"`
+	Files          int `json:"files"`
+	Chunks         int `json:"chunks"`
+	Inserted       int `json:"inserted"`
+	Confirmed      int `json:"confirmed"`
+	SkippedRetired int `json:"skipped_retired"`
+	Deduped        int `json:"deduped"`
+	Rejected       int `json:"rejected"`
 }
 
 type memoryIngestSweepResult struct {
@@ -292,7 +357,11 @@ func runMemoryIngestSweep(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
-		result = runConfiguredMemoryIngestSweep(context.Background(), store, settings.IngestSources)
+		memorySettings, err := config.LoadMemorySettings(paths)
+		if err != nil {
+			return err
+		}
+		result = runConfiguredMemoryIngestSweep(context.Background(), store, settings.IngestSources, memorySettings.IngestAutoConfirm)
 		return nil
 	})
 	if err != nil {
@@ -314,7 +383,7 @@ func runMemoryIngestSweep(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func runConfiguredMemoryIngestSweep(ctx context.Context, store *db.Store, sources []config.MemoryIngestSource) memoryIngestSweepResult {
+func runConfiguredMemoryIngestSweep(ctx context.Context, store *db.Store, sources []config.MemoryIngestSource, autoConfirm bool) memoryIngestSweepResult {
 	result := memoryIngestSweepResult{Sources: []memoryIngestSweepSourceResult{}}
 	if len(sources) == 0 {
 		result.Skipped = "no memory.ingest sources configured"
@@ -322,21 +391,24 @@ func runConfiguredMemoryIngestSweep(ctx context.Context, store *db.Store, source
 	}
 	for _, source := range sources {
 		ingest, err := ingestMemorySource(ctx, store, memoryIngestOptions{
-			Path:  source.Path,
-			Agent: source.Agent,
-			Repo:  source.Repo,
-			Tier:  source.Tier,
+			Path:        source.Path,
+			Agent:       source.Agent,
+			Repo:        source.Repo,
+			Tier:        source.Tier,
+			AutoConfirm: autoConfirm,
 		})
 		entry := memoryIngestSweepSourceResult{
-			Path:     source.Path,
-			Agent:    source.Agent,
-			Repo:     source.Repo,
-			Tier:     source.Tier,
-			Files:    ingest.Files,
-			Chunks:   ingest.Chunks,
-			Inserted: ingest.Inserted,
-			Deduped:  ingest.Deduped,
-			Rejected: ingest.RejectedN,
+			Path:           source.Path,
+			Agent:          source.Agent,
+			Repo:           source.Repo,
+			Tier:           source.Tier,
+			Files:          ingest.Files,
+			Chunks:         ingest.Chunks,
+			Inserted:       ingest.Inserted,
+			Confirmed:      ingest.Confirmed,
+			SkippedRetired: ingest.SkippedRetired,
+			Deduped:        ingest.Deduped,
+			Rejected:       ingest.RejectedN,
 		}
 		if err != nil {
 			entry.Error = err.Error()
@@ -348,6 +420,8 @@ func runConfiguredMemoryIngestSweep(ctx context.Context, store *db.Store, source
 		result.Totals.Files += entry.Files
 		result.Totals.Chunks += entry.Chunks
 		result.Totals.Inserted += entry.Inserted
+		result.Totals.Confirmed += entry.Confirmed
+		result.Totals.SkippedRetired += entry.SkippedRetired
 		result.Totals.Deduped += entry.Deduped
 		result.Totals.Rejected += entry.Rejected
 		result.Sources = append(result.Sources, entry)
@@ -360,16 +434,16 @@ func printMemoryIngestSweepResult(stdout io.Writer, result memoryIngestSweepResu
 		fmt.Fprintln(stdout, "memory ingest sweep skipped: no sources configured")
 		return
 	}
-	fmt.Fprintf(stdout, "memory ingest sweep: sources=%d succeeded=%d failed=%d inserted=%d deduped=%d rejected=%d files=%d chunks=%d\n",
+	fmt.Fprintf(stdout, "memory ingest sweep: sources=%d succeeded=%d failed=%d inserted=%d confirmed=%d deduped=%d rejected=%d skipped_retired=%d files=%d chunks=%d\n",
 		result.Totals.Sources, result.Totals.Succeeded, result.Totals.Failed, result.Totals.Inserted,
-		result.Totals.Deduped, result.Totals.Rejected, result.Totals.Files, result.Totals.Chunks)
+		result.Totals.Confirmed, result.Totals.Deduped, result.Totals.Rejected, result.Totals.SkippedRetired, result.Totals.Files, result.Totals.Chunks)
 	for _, source := range result.Sources {
 		repo := source.Repo
 		if repo == "" {
 			repo = "-"
 		}
-		fmt.Fprintf(stdout, "  %s agent=%s repo=%s tier=%s inserted=%d deduped=%d rejected=%d",
-			source.Path, source.Agent, repo, source.Tier, source.Inserted, source.Deduped, source.Rejected)
+		fmt.Fprintf(stdout, "  %s agent=%s repo=%s tier=%s inserted=%d confirmed=%d deduped=%d rejected=%d skipped_retired=%d",
+			source.Path, source.Agent, repo, source.Tier, source.Inserted, source.Confirmed, source.Deduped, source.Rejected, source.SkippedRetired)
 		if source.Error != "" {
 			fmt.Fprintf(stdout, " error=%q", source.Error)
 		}
@@ -555,6 +629,9 @@ func runMemoryConfirm(args []string, stdout, stderr io.Writer) int {
 			if *toShared {
 				owner = db.MemoryOwner{Kind: memory.OwnerKindShared, Ref: memory.SharedOwnerRef}
 			}
+			// Manual `memory confirm --yes` is an explicit human intervention, so it
+			// preserves the pre-existing behavior that can revive a retired keyed row.
+			// Automated collectors and ingest auto-confirm do not pass this option.
 			newID, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
 				Owner:      owner,
 				AuthorRef:  authorRef,
@@ -564,7 +641,7 @@ func runMemoryConfirm(args []string, stdout, stderr io.Writer) int {
 				Content:    obs.Content,
 				Provenance: obs.Provenance,
 				SourceJob:  obs.SourceJob,
-			})
+			}, db.AllowResurrectConfirmedMemory())
 			if err != nil {
 				return fmt.Errorf("confirm observation %d: %w", obs.ID, err)
 			}

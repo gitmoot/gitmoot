@@ -61,6 +61,11 @@ type MemorySettings struct {
 	// — useful to harvest failure signal box-wide — while the READ/injection and
 	// the confirmed mechanical producers stay enrolled-only.
 	DistillAllJobs bool
+	// IngestAutoConfirm immediately promotes memory ingest and chat remember
+	// observations into the authoring agent's private pool. Default false keeps the
+	// pending human gate. Shared memory remains explicit through confirm/promote
+	// commands even when this is enabled.
+	IngestAutoConfirm bool
 }
 
 // DefaultMemorySettings returns the off-by-default resolved settings.
@@ -73,6 +78,7 @@ func DefaultMemorySettings() MemorySettings {
 		DistillSuccesses:  false,
 		DistillMaxPerJob:  DefaultMemoryDistillMaxPerJob,
 		DistillAllJobs:    false,
+		IngestAutoConfirm: false,
 	}
 }
 
@@ -150,6 +156,12 @@ func LoadMemorySettings(paths Paths) (MemorySettings, error) {
 				return MemorySettings{}, fmt.Errorf("parse [memory].distill_all_jobs: %w", err)
 			}
 			settings.DistillAllJobs = parsed
+		case "ingest_auto_confirm":
+			parsed, err := parseConfigBool(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].ingest_auto_confirm: %w", err)
+			}
+			settings.IngestAutoConfirm = parsed
 		}
 	}
 	if err := validateMemorySettings(settings); err != nil {

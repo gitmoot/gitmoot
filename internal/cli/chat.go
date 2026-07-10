@@ -9,10 +9,13 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/memory"
 	"github.com/jerryfane/gitmoot/internal/mention"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
@@ -36,6 +39,8 @@ func runChat(args []string, stdout, stderr io.Writer) int {
 		return runChatShow(args[1:], stdout, stderr)
 	case "send":
 		return runChatSend(args[1:], stdout, stderr)
+	case "remember":
+		return runChatRemember(args[1:], stdout, stderr)
 	case "inbox":
 		return runChatInbox(args[1:], stdout, stderr)
 	case "wait":
@@ -65,6 +70,7 @@ func printChatUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot chat list [--repo owner/repo] [--all] [--json]")
 	fmt.Fprintln(w, "  gitmoot chat show <thread> [--repo owner/repo] [--limit N] [--json]")
 	fmt.Fprintln(w, "  gitmoot chat send <thread> \"message\" [--as agent] [--repo owner/repo] [--ref kind:value ...] [--json]")
+	fmt.Fprintln(w, "  gitmoot chat remember <thread> <message-seq> [--repo owner/repo] [--tier repo|general] [--agent NAME] [--json]")
 	fmt.Fprintln(w, "  gitmoot chat inbox <agent> [--unread] [--json]")
 	fmt.Fprintln(w, "  gitmoot chat wait <thread> [--since-seq N] [--timeout 90s] [--repo owner/repo] [--json]")
 	fmt.Fprintln(w, "  gitmoot chat task <thread> \"@agent message\" [--action ask|review|implement] [--repo owner/repo] [--json]")
@@ -392,6 +398,181 @@ func runChatSend(args []string, stdout, stderr io.Writer) int {
 		writeLine(stdout, "mentions: %s", strings.Join(out.Mentions, ", "))
 	}
 	return 0
+}
+
+// ---- remember --------------------------------------------------------------
+
+type chatRememberOutput struct {
+	ThreadID       string `json:"thread_id"`
+	ThreadSlug     string `json:"thread_slug"`
+	Seq            int64  `json:"seq"`
+	Agent          string `json:"agent"`
+	Scope          string `json:"scope"`
+	Repo           string `json:"repo,omitempty"`
+	Provenance     string `json:"provenance,omitempty"`
+	Key            string `json:"key,omitempty"`
+	Inserted       bool   `json:"inserted"`
+	Deduped        bool   `json:"deduped"`
+	Rejected       bool   `json:"rejected"`
+	RejectedReason string `json:"rejected_reason,omitempty"`
+	AutoConfirm    bool   `json:"auto_confirm,omitempty"`
+	Confirmed      bool   `json:"confirmed,omitempty"`
+	SkippedRetired bool   `json:"skipped_retired,omitempty"`
+}
+
+func runChatRemember(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("chat remember", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	repo := fs.String("repo", "", "repo scope to disambiguate a slug across repos")
+	tier := fs.String("tier", memory.ScopeRepo, "scope tier: repo|general")
+	agent := fs.String("agent", "lead", "capturing agent identity that owns the memory")
+	jsonOut := fs.Bool("json", false, "print the remember summary as JSON")
+	if len(args) < 2 || args[0] == "-h" || args[0] == "--help" {
+		if len(args) >= 1 && (args[0] == "-h" || args[0] == "--help") {
+			return 0
+		}
+		fmt.Fprintln(stderr, "chat remember requires a <thread> and <message-seq>")
+		return 2
+	}
+	ref := strings.TrimSpace(args[0])
+	if ref == "" || strings.HasPrefix(ref, "-") {
+		fmt.Fprintln(stderr, "chat remember requires a <thread> as the first argument")
+		return 2
+	}
+	seq, err := strconv.ParseInt(strings.TrimSpace(args[1]), 10, 64)
+	if err != nil || seq <= 0 {
+		fmt.Fprintf(stderr, "chat remember: invalid message sequence %q\n", args[1])
+		return 2
+	}
+	if err := fs.Parse(args[2:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "chat remember accepts exactly one <thread> and one <message-seq>")
+		return 2
+	}
+	scope := strings.TrimSpace(*tier)
+	switch scope {
+	case memory.ScopeRepo, memory.ScopeGeneral:
+	default:
+		fmt.Fprintf(stderr, "chat remember: invalid --tier %q (want repo|general)\n", *tier)
+		return 2
+	}
+	if scope == memory.ScopeGeneral && strings.TrimSpace(*repo) != "" {
+		fmt.Fprintln(stderr, "chat remember: --tier general cannot be combined with --repo")
+		return 2
+	}
+	if strings.TrimSpace(*agent) == "" {
+		fmt.Fprintln(stderr, "chat remember: --agent cannot be empty")
+		return 2
+	}
+
+	var out chatRememberOutput
+	err = withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
+		settings, err := config.LoadMemorySettings(paths)
+		if err != nil {
+			return err
+		}
+		ctx := context.Background()
+		thread, err := resolveChatThread(ctx, store, ref, strings.TrimSpace(*repo))
+		if err != nil {
+			return err
+		}
+		msg, ok, err := chatMessageBySeq(ctx, store, thread.ID, seq)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("no message #%d in thread %q", seq, thread.Slug)
+		}
+		memoryRepo := thread.Repo
+		if scope == memory.ScopeGeneral {
+			memoryRepo = ""
+		}
+		out = chatRememberOutput{
+			ThreadID:    thread.ID,
+			ThreadSlug:  thread.Slug,
+			Seq:         msg.Seq,
+			Agent:       strings.TrimSpace(*agent),
+			Scope:       scope,
+			Repo:        memoryRepo,
+			Provenance:  fmt.Sprintf("chat:%s#%d", thread.ID, msg.Seq),
+			AutoConfirm: settings.IngestAutoConfirm,
+		}
+		if ok, reason := memory.PreFilter(msg.Body, scope); !ok {
+			out.Rejected = true
+			out.RejectedReason = reason
+			return nil
+		}
+		seen, err := store.ObservationDedupKeys(ctx, out.Agent)
+		if err != nil {
+			return err
+		}
+		dkey := db.MemoryDedupKey(scope, memoryRepo, memory.ContentHash(msg.Body))
+		if _, dup := seen[dkey]; dup {
+			out.Deduped = true
+			return nil
+		}
+		out.Key = memory.IngestKey("chat-"+thread.Slug, strconv.FormatInt(msg.Seq, 10), msg.Body)
+		obs := db.MemoryObservation{
+			Owner:      db.MemoryOwner{Kind: memory.OwnerKindAgent, Ref: out.Agent},
+			Repo:       memoryRepo,
+			Scope:      scope,
+			Key:        out.Key,
+			Content:    msg.Body,
+			Provenance: out.Provenance,
+			TrustMark:  memory.TrustLow,
+		}
+		if _, err := store.InsertMemoryObservation(ctx, obs); err != nil {
+			return err
+		}
+		out.Inserted = true
+		confirmed, skipped, err := autoConfirmObservationIfEnabled(ctx, store, obs, settings.IngestAutoConfirm)
+		if err != nil {
+			return err
+		}
+		out.Confirmed = confirmed
+		out.SkippedRetired = skipped
+		return nil
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "chat remember: %v\n", err)
+		return 1
+	}
+	if *jsonOut {
+		_ = writeJSON(stdout, out)
+		return 0
+	}
+	switch {
+	case out.Rejected:
+		writeLine(stdout, "message #%d rejected for memory: %s", out.Seq, out.RejectedReason)
+	case out.Deduped:
+		writeLine(stdout, "message #%d already remembered", out.Seq)
+	case out.Confirmed:
+		writeLine(stdout, "remembered message #%d and confirmed it into %s's private memory", out.Seq, out.Agent)
+	case out.SkippedRetired:
+		writeLine(stdout, "remembered message #%d as an observation; confirmed key is retired", out.Seq)
+	default:
+		writeLine(stdout, "remembered message #%d as a pending observation", out.Seq)
+	}
+	return 0
+}
+
+func chatMessageBySeq(ctx context.Context, store *db.Store, threadID string, seq int64) (db.ChatMessage, bool, error) {
+	msgs, err := store.ListChatMessages(ctx, threadID, 0)
+	if err != nil {
+		return db.ChatMessage{}, false, err
+	}
+	for _, msg := range msgs {
+		if msg.Seq == seq {
+			return msg, true, nil
+		}
+	}
+	return db.ChatMessage{}, false, nil
 }
 
 // ---- inbox -----------------------------------------------------------------

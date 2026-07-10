@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -107,6 +108,27 @@ const (
 	memoryAutoLinkMinScore    = 0.000002
 	memoryAutoLinkMinRelative = 0.30
 )
+
+// ErrConfirmedMemoryRetired is returned when a keyed confirmed-memory upsert
+// matches a retired row and the caller did not explicitly opt into resurrection.
+// Collector and automatic ingestion paths count this as skipped-retired rather
+// than reviving content an operator already pulled from circulation.
+var ErrConfirmedMemoryRetired = errors.New("confirmed memory is retired")
+
+type upsertConfirmedMemoryOptions struct {
+	allowResurrect bool
+}
+
+// UpsertConfirmedMemoryOption tunes confirmed-memory upsert behavior.
+type UpsertConfirmedMemoryOption func(*upsertConfirmedMemoryOptions)
+
+// AllowResurrectConfirmedMemory lets a deliberate human-controlled path revive a
+// retired keyed row. Automated collectors must not pass this option.
+func AllowResurrectConfirmedMemory() UpsertConfirmedMemoryOption {
+	return func(o *upsertConfirmedMemoryOptions) {
+		o.allowResurrect = true
+	}
+}
 
 // nullableRepo maps an empty repo string to SQL NULL (a general-scope fact) and
 // a non-empty repo to itself, matching the NULLABLE repo column semantics the
@@ -358,12 +380,18 @@ GROUP BY witness_owner_ref, repo, key`, args...)
 // serialized by the store (MaxOpenConns=1) so a manual select-then-insert/update
 // is race-free; it avoids the fragility of ON CONFLICT inference against the
 // partial unique indexes. Returns the confirmed row id.
-func (s *Store) UpsertConfirmedMemory(ctx context.Context, cm ConfirmedMemory) (int64, error) {
+func (s *Store) UpsertConfirmedMemory(ctx context.Context, cm ConfirmedMemory, opts ...UpsertConfirmedMemoryOption) (int64, error) {
 	if strings.TrimSpace(cm.Owner.Kind) == "" || strings.TrimSpace(cm.Owner.Ref) == "" {
 		return 0, fmt.Errorf("confirmed memory requires an owner kind and ref")
 	}
 	if strings.TrimSpace(cm.Key) == "" || strings.TrimSpace(cm.Content) == "" {
 		return 0, fmt.Errorf("confirmed memory requires a key and content")
+	}
+	var options upsertConfirmedMemoryOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&options)
+		}
 	}
 	scope := cm.Scope
 	if strings.TrimSpace(scope) == "" {
@@ -381,12 +409,13 @@ func (s *Store) UpsertConfirmedMemory(ctx context.Context, cm ConfirmedMemory) (
 	defer func() { _ = tx.Rollback() }()
 
 	var id int64
+	var retiredAt string
 	err = tx.QueryRowContext(ctx, `
-SELECT id FROM confirmed_memories
+SELECT id, retired_at FROM confirmed_memories
 WHERE owner_kind = ? AND owner_ref = ? AND owner_version = ?
 	AND ((? IS NULL AND repo IS NULL) OR repo = ?)
 	AND key = ?`,
-		cm.Owner.Kind, cm.Owner.Ref, cm.Owner.Version, nullableRepo(cm.Repo), nullableRepo(cm.Repo), cm.Key).Scan(&id)
+		cm.Owner.Kind, cm.Owner.Ref, cm.Owner.Version, nullableRepo(cm.Repo), nullableRepo(cm.Repo), cm.Key).Scan(&id, &retiredAt)
 	switch {
 	case err == sql.ErrNoRows:
 		res, insErr := tx.ExecContext(ctx, `
@@ -404,12 +433,13 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	case err != nil:
 		return 0, fmt.Errorf("lookup confirmed memory: %w", err)
 	default:
-		// A fresh confirmation of an existing key re-activates it: clear any
-		// retirement so a previously-retired fact that the confirmation gate re-admits
-		// is injectable/exportable again (otherwise the newly confirmed content would
-		// stay permanently hidden behind the stale retired_at, since the lookup above
-		// matches by key regardless of retirement). Re-confirming an active row leaves
-		// the already-empty retirement columns untouched.
+		if retiredAt != "" && !options.allowResurrect {
+			return 0, fmt.Errorf("%w: confirmed memory %d key %q", ErrConfirmedMemoryRetired, id, cm.Key)
+		}
+		// Only explicit human-controlled paths pass AllowResurrectConfirmedMemory.
+		// When they do, a fresh confirmation of an existing key re-activates it by
+		// clearing retired_at/retired_reason. Automated collectors use the default
+		// refusal above so re-ingest cannot undo a bulk-retire cleanup.
 		if _, upErr := tx.ExecContext(ctx, `
 UPDATE confirmed_memories
 SET author_ref = ?, content = ?, provenance = ?, source_job = ?, updated_at = ?, retired_at = '', retired_reason = ''
@@ -929,6 +959,67 @@ func (s *Store) RetireConfirmedMemory(ctx context.Context, id int64, reason stri
 		return err
 	}
 	return tx.Commit()
+}
+
+// ListActiveConfirmedMemoriesByProvenancePrefix returns active confirmed rows
+// whose provenance starts with prefix. A non-empty agentRef narrows to rows
+// owned by or authored by that agent. It is the dry-run half of
+// `memory retire --provenance-prefix`.
+func (s *Store) ListActiveConfirmedMemoriesByProvenancePrefix(ctx context.Context, prefix, agentRef string) ([]ConfirmedMemory, error) {
+	rows, err := listActiveConfirmedMemoriesByProvenancePrefix(ctx, s.db, prefix, agentRef)
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// RetireConfirmedMemoriesByProvenancePrefix retires every active confirmed row
+// whose provenance starts with prefix, removing each row from FTS in the same
+// transaction. It returns the rows selected before retirement so callers can
+// report the blast radius.
+func (s *Store) RetireConfirmedMemoriesByProvenancePrefix(ctx context.Context, prefix, agentRef, reason string) ([]ConfirmedMemory, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := listActiveConfirmedMemoriesByProvenancePrefix(ctx, tx, prefix, agentRef)
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		if err := retireConfirmedMemoryTx(ctx, tx, row.ID, "", reason); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func listActiveConfirmedMemoriesByProvenancePrefix(ctx context.Context, q rowsQuerier, prefix, agentRef string) ([]ConfirmedMemory, error) {
+	if strings.TrimSpace(prefix) == "" {
+		return nil, fmt.Errorf("provenance prefix is required")
+	}
+	where := []string{"provenance LIKE ? ESCAPE '\\'", "superseded_by IS NULL", "retired_at = ''"}
+	args := []any{likePrefix(prefix)}
+	if strings.TrimSpace(agentRef) != "" {
+		where = append(where, "(owner_ref = ? OR author_ref = ?)")
+		args = append(args, strings.TrimSpace(agentRef), strings.TrimSpace(agentRef))
+	}
+	query := `
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
+	provenance, source_job, first_confirmed_at, updated_at
+FROM confirmed_memories
+WHERE ` + strings.Join(where, " AND ") + `
+ORDER BY updated_at DESC, id DESC`
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list confirmed memories by provenance prefix: %w", err)
+	}
+	defer rows.Close()
+	return scanConfirmedMemories(rows)
 }
 
 // retireConfirmedMemoryTx is the transaction body shared by the single-op public
