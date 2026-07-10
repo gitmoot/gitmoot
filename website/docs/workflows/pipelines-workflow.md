@@ -70,6 +70,7 @@ editing the file later never mutates an in-flight run.
 gitmoot pipeline list [--json]
 gitmoot pipeline show <name> [--json]        # registry view for a pipeline name
 gitmoot pipeline show <run-id> [--json]      # run funnel for a "prun-…" run id
+gitmoot pipeline install-defaults            # install built-in memory pipelines
 gitmoot pipeline run <name>                  # start a manual run; prints the run id
 gitmoot pipeline resume <run-id> [--from <stage>]
 gitmoot pipeline cancel <run-id>
@@ -84,6 +85,43 @@ already has an active run (one active run per pipeline). `pipeline add` also
 auto-creates one hidden shell runner agent per pipeline (`pipeline-<name>-runner`)
 that owns the stage jobs; it is filtered out of `gitmoot agent list` and disposed by
 `pipeline remove`.
+
+`pipeline install-defaults` installs Gitmoot's built-in memory pipelines:
+`memory-ingest-sweep` and `memory-groom-propose`. The daemon also runs that
+installer at startup. The installer is idempotent; if either name already exists,
+Gitmoot skips it and preserves the user's stored YAML, hash, enabled flag, and
+schedule. With empty config, the definitions are installed manual-only. Add
+`[[memory.ingest]]` sources and optional `[memory.pipelines]` intervals to make
+them useful:
+
+```toml
+[[memory.ingest]]
+path = "/path/to/markdown-notes"
+agent = "lead"
+repo = "owner/repo"
+tier = "repo"
+
+[memory.pipelines]
+repo = "owner/repo"
+ingest_sweep = "nightly"
+groom_propose = "nightly"
+```
+
+`nightly` is accepted as `24h`; any positive Go duration such as `"12h"` also
+works. If schedules are unset, run them on demand:
+
+```sh
+gitmoot pipeline run memory-ingest-sweep
+gitmoot pipeline run memory-groom-propose
+```
+
+The installed `memory-ingest-sweep` spec has a fixed two-stage shape: `sweep`
+calls `gitmoot memory ingest sweep --json`, then `summarize` reports the totals.
+The source list is loaded from `[[memory.ingest]]` at run time, so config edits
+apply on the next scheduled or manual run without reinstalling defaults. A bad
+source is reported in the sweep JSON and does not stop other sources. The stage
+fails visibly only when the config is invalid or every configured source fails.
+With no sources, the run succeeds with a skipped summary.
 
 ## The stage contract
 

@@ -107,6 +107,121 @@ token_budget = -5
 	}
 }
 
+func TestLoadMemoryPipelineSettingsDefaults(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	settings, err := LoadMemoryPipelineSettings(paths)
+	if err != nil {
+		t.Fatalf("LoadMemoryPipelineSettings: %v", err)
+	}
+	if len(settings.IngestSources) != 0 || settings.IngestSweepInterval != "" || settings.GroomProposeInterval != "" {
+		t.Fatalf("default memory pipeline settings should be inert, got %+v", settings)
+	}
+}
+
+func TestLoadMemoryPipelineSettingsParsesSourcesAndSchedules(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[[memory.ingest]]
+path = "/notes/a"
+agent = "lead"
+repo = "owner/repo"
+tier = "repo"
+
+[[memory.ingest]]
+path = "/notes/global"
+agent = "lead"
+tier = "general"
+
+[memory.pipelines]
+repo = "owner/repo"
+ingest_sweep = "nightly"
+ingest_sweep_jitter = "15m"
+groom_propose = "48h"
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	settings, err := LoadMemoryPipelineSettings(paths)
+	if err != nil {
+		t.Fatalf("LoadMemoryPipelineSettings: %v", err)
+	}
+	if len(settings.IngestSources) != 2 {
+		t.Fatalf("sources = %+v", settings.IngestSources)
+	}
+	if settings.IngestSources[0].Repo != "owner/repo" || settings.IngestSources[1].Tier != "general" {
+		t.Fatalf("parsed sources = %+v", settings.IngestSources)
+	}
+	if settings.Repo != "owner/repo" || settings.IngestSweepInterval != "24h" || settings.IngestSweepJitter != "15m" || settings.GroomProposeInterval != "48h" {
+		t.Fatalf("parsed pipeline settings = %+v", settings)
+	}
+}
+
+func TestLoadMemoryPipelineSettingsRejectsInvalidValues(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "missing source path",
+			body: `
+[[memory.ingest]]
+agent = "lead"
+`,
+			want: "path is required",
+		},
+		{
+			name: "bad tier",
+			body: `
+[[memory.ingest]]
+path = "/notes"
+agent = "lead"
+tier = "team"
+`,
+			want: "tier must be repo or general",
+		},
+		{
+			name: "bad interval",
+			body: `
+[memory.pipelines]
+ingest_sweep = "every night"
+`,
+			want: "expected a Go duration",
+		},
+		{
+			name: "general with repo",
+			body: `
+[[memory.ingest]]
+path = "/notes"
+agent = "lead"
+repo = "owner/repo"
+tier = "general"
+`,
+			want: "tier general cannot set repo",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			paths := PathsForHome(t.TempDir())
+			if err := Initialize(paths); err != nil {
+				t.Fatalf("Initialize: %v", err)
+			}
+			if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+tc.body), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			_, err := LoadMemoryPipelineSettings(paths)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadMemoryPipelineSettings error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestAgentTypeMemoryFlagRoundTrip(t *testing.T) {
 	paths := PathsForHome(t.TempDir())
 	if err := Initialize(paths); err != nil {

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/memory"
 )
@@ -284,6 +285,104 @@ func TestMemoryIngestSharedAndConfirmToSharedAuthorStamping(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].Owner.Kind != memory.OwnerKindShared || rows[0].AuthorRef != "lead" {
 		t.Fatalf("confirmed shared row should preserve author lead, got %+v", rows)
+	}
+}
+
+func TestMemoryIngestSweepPartialFailureStillExitsZero(t *testing.T) {
+	home, _ := memoryTestHome(t)
+	paths := config.PathsForHome(home)
+	srcA := t.TempDir()
+	srcB := t.TempDir()
+	writeFixture(t, srcA, "alpha.md", "The alpha memory sweep source records release notes for the owner repo.\n")
+	writeFixture(t, srcB, "beta.md", "The beta memory sweep source records verification notes for the owner repo.\n")
+	missing := filepath.Join(t.TempDir(), "missing")
+	writeMemoryPipelineConfig(t, paths, `
+[[memory.ingest]]
+path = "`+filepath.ToSlash(srcA)+`"
+agent = "lead"
+repo = "owner/repo"
+tier = "repo"
+
+[[memory.ingest]]
+path = "`+filepath.ToSlash(missing)+`"
+agent = "lead"
+repo = "owner/repo"
+tier = "repo"
+
+[[memory.ingest]]
+path = "`+filepath.ToSlash(srcB)+`"
+agent = "lead"
+repo = "owner/repo"
+tier = "repo"
+`)
+
+	code, out, errOut := runMemoryCapture(t, "ingest", "sweep", "--home", home, "--json")
+	if code != 0 {
+		t.Fatalf("partial sweep exit %d, want 0: %s", code, errOut)
+	}
+	var result memoryIngestSweepResult
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("parse sweep: %v (%s)", err, out)
+	}
+	if result.Totals.Sources != 3 || result.Totals.Succeeded != 2 || result.Totals.Failed != 1 {
+		t.Fatalf("totals = %+v, want 3 sources / 2 succeeded / 1 failed", result.Totals)
+	}
+	if result.Totals.Inserted != 2 || result.Totals.Deduped != 0 || result.Totals.Rejected != 0 {
+		t.Fatalf("counts = %+v, want inserted=2 deduped=0 rejected=0", result.Totals)
+	}
+	if len(result.Sources) != 3 || result.Sources[1].Path != missing || result.Sources[1].Error == "" {
+		t.Fatalf("source errors not reported per source: %+v", result.Sources)
+	}
+	if obs := listObservations(t, home); len(obs) != 2 {
+		t.Fatalf("observations = %d, want two successful-source inserts: %+v", len(obs), obs)
+	}
+}
+
+func TestMemoryIngestSweepAllSourcesFailExitsNonZero(t *testing.T) {
+	home, _ := memoryTestHome(t)
+	paths := config.PathsForHome(home)
+	missing := filepath.Join(t.TempDir(), "missing")
+	writeMemoryPipelineConfig(t, paths, `
+[[memory.ingest]]
+path = "`+filepath.ToSlash(missing)+`"
+agent = "lead"
+repo = "owner/repo"
+tier = "repo"
+`)
+
+	code, out, _ := runMemoryCapture(t, "ingest", "sweep", "--home", home, "--json")
+	if code != 1 {
+		t.Fatalf("all-failed sweep exit %d, want 1 (out=%s)", code, out)
+	}
+	var result memoryIngestSweepResult
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("parse sweep: %v (%s)", err, out)
+	}
+	if result.Totals.Sources != 1 || result.Totals.Failed != 1 || len(result.Sources) != 1 || result.Sources[0].Error == "" {
+		t.Fatalf("all-failed result = %+v", result)
+	}
+}
+
+func TestMemoryIngestSweepEmptyConfigSkips(t *testing.T) {
+	home, _ := memoryTestHome(t)
+
+	code, out, errOut := runMemoryCapture(t, "ingest", "sweep", "--home", home, "--json")
+	if code != 0 {
+		t.Fatalf("empty sweep exit %d, want 0: %s", code, errOut)
+	}
+	var result memoryIngestSweepResult
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("parse sweep: %v (%s)", err, out)
+	}
+	if result.Totals.Sources != 0 || result.Skipped == "" || len(result.Sources) != 0 {
+		t.Fatalf("empty sweep result = %+v", result)
+	}
+}
+
+func writeMemoryPipelineConfig(t *testing.T, paths config.Paths, body string) {
+	t.Helper()
+	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
 	}
 }
 

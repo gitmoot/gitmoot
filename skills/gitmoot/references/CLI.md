@@ -1713,6 +1713,7 @@ observations** behind the existing confirmation gate. It never writes confirmed
 
 ```sh
 gitmoot memory ingest <path|dir> --agent NAME [--shared] [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
+gitmoot memory ingest sweep [--json]
 gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]
 gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--to-shared] [--yes] [--json]
 gitmoot memory promote --to-shared <id>... [--json]
@@ -1739,6 +1740,14 @@ to `repo`; `general` is only ever chosen with the explicit flag. `--shared`
 stages the observations in the shared pool while preserving `--agent NAME` as
 their author. `--dry-run` reports what would be staged without writing.
 
+`memory ingest sweep` reads every configured `[[memory.ingest]]` source from the
+current config at run time and runs the same ingest logic in-process for each one.
+`--json` emits per-source entries with `path`, `agent`, `repo`, `tier`,
+`inserted`, `deduped`, `rejected`, and `error`, plus aggregate totals. One bad
+source does not stop the rest; the command exits non-zero only when the config is
+invalid or every configured source fails. With no sources it exits zero with a
+skipped note.
+
 `memory observations` lists pending observations (optionally narrowed by
 `--agent` or `--provenance-prefix`), flagging which keys already crossed the
 confirm gate. `memory confirm` is the **human-gated promotion** step: it copies
@@ -1751,6 +1760,32 @@ author. `memory promote --to-shared <id>...` moves existing active confirmed
 facts into shared, refuses retired or superseded rows, preserves outgoing
 `memory_links`, and sets `author_ref` from the previous owner when needed. This is
 **CLI-explicit only**: there is no daemon path and nothing auto-confirms.
+
+The built-in `memory-ingest-sweep` pipeline calls
+`gitmoot memory ingest sweep --json` and then summarizes the run totals. Configure
+sources under `[[memory.ingest]]`:
+
+```toml
+[[memory.ingest]]
+path = "/path/to/markdown-notes"
+agent = "lead"
+repo = "owner/repo"
+tier = "repo"
+```
+
+The daemon and `gitmoot pipeline install-defaults` register the pipeline
+idempotently and skip an existing row named `memory-ingest-sweep`, preserving
+local edits. The installed spec does not freeze the source list; changes to
+`[[memory.ingest]]` apply on the next scheduled or manual run without reinstalling
+defaults. Per-source errors are written into the run output, and the stage fails
+visibly when the sweep command exits non-zero. With no sources, the pipeline
+succeeds with a no-sources summary.
+It is manual-only unless `[memory.pipelines].ingest_sweep` is set to a positive Go
+duration such as `"24h"` or the alias `"nightly"`. A manual run is:
+
+```sh
+gitmoot pipeline run memory-ingest-sweep
+```
 
 Confirming a fact also writes up to three deterministic auto-links from that new
 confirmed row to active related confirmed memories. The links are stored in the
@@ -1809,9 +1844,25 @@ from the plan's (a vault edit between propose and apply invalidates it), then
 retires exactly the planned ids in **one transaction** (reason `groom:<detector>`,
 FTS index cleared in the same tx). It is **retire-only** — no content is edited or
 rewritten — and idempotent: an already-retired or missing id in the plan is skipped
-gracefully rather than aborting the batch. See
-[`docs/examples/memory-groom-nightly`](../../../docs/examples/memory-groom-nightly/README.md)
-for a ready-to-register nightly proposal pipeline.
+gracefully rather than aborting the batch.
+
+The built-in `memory-groom-propose` pipeline runs only the proposal half:
+`gitmoot memory groom --propose --out <run-scoped-plan> --json`, then summarizes
+the proposal counts into the pipeline result. It never applies a plan. The daemon
+and `gitmoot pipeline install-defaults` register it idempotently and skip an
+existing row named `memory-groom-propose`, preserving local edits. It is
+manual-only unless `[memory.pipelines].groom_propose` is set:
+
+```toml
+[memory.pipelines]
+repo = "owner/repo"
+ingest_sweep = "nightly"
+groom_propose = "nightly"
+```
+
+```sh
+gitmoot pipeline run memory-groom-propose
+```
 
 ### memory clusters (#763)
 
@@ -1904,6 +1955,7 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 
 ```sh
 gitmoot pipeline add nightly-sync.yaml --enable   # validate + store; omit --enable to add disabled
+gitmoot pipeline install-defaults                 # install built-in memory pipelines, skipping existing names
 gitmoot pipeline list [--json]
 gitmoot pipeline show nightly-sync [--json]        # registry view for a name
 gitmoot pipeline run nightly-sync                  # start a manual run; prints the run id
@@ -1929,6 +1981,15 @@ runs a named managed agent on its own runtime as a read-only leaf (`ask`/`review
 its `needs` stages' result summaries are prepended to the prompt, and a repo-bound
 agent stage runs in its own detached read-only worktree so same-repo agent stages
 parallelize without touching the live checkout.
+
+`pipeline install-defaults` installs the built-in memory pipelines
+`memory-ingest-sweep` and `memory-groom-propose`. The daemon also runs this
+installer at startup. Installation is idempotent: if either pipeline name already
+exists, Gitmoot skips it and does not overwrite the stored YAML, hash, enabled
+flag, or schedule. Empty memory pipeline config still installs manual-only
+definitions, but they are inert until a manual run or an enabled interval
+schedule. Configure sources with `[[memory.ingest]]` and schedules with
+`[memory.pipelines]`; see the memory section above.
 
 A stage signals its outcome by printing a `gitmoot_result` blob to stdout; the
 advancer folds by the **decision**, never the job's exit state (`changes_requested`

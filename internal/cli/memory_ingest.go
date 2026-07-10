@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/memory"
 )
@@ -42,7 +43,61 @@ type memoryIngestResult struct {
 	InsertedKeys []string       `json:"inserted_keys,omitempty"`
 }
 
+type memoryIngestOptions struct {
+	Home   string
+	Path   string
+	Agent  string
+	Shared bool
+	Repo   string
+	Tier   string
+	DryRun bool
+	JSON   bool
+}
+
 func runMemoryIngest(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "sweep" {
+		return runMemoryIngestSweep(args[1:], stdout, stderr)
+	}
+	options, code := parseMemoryIngestOptions(args, stderr)
+	if code != 0 {
+		return code
+	}
+
+	var result memoryIngestResult
+	err := withStore(options.Home, func(store *db.Store) error {
+		var ingestErr error
+		result, ingestErr = ingestMemorySource(context.Background(), store, options)
+		return ingestErr
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "memory ingest: %v\n", err)
+		return 1
+	}
+	if len(result.RejectedBy) == 0 {
+		result.RejectedBy = nil
+	}
+
+	if options.JSON {
+		if err := writeJSON(stdout, result); err != nil {
+			fmt.Fprintf(stderr, "memory ingest: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	verb := "ingested"
+	if options.DryRun {
+		verb = "would ingest"
+	}
+	fmt.Fprintf(stdout, "%s %d observation(s) from %d file(s), %d chunk(s): inserted=%d deduped=%d rejected=%d\n",
+		verb, result.Inserted, result.Files, result.Chunks, result.Inserted, result.Deduped, result.RejectedN)
+	for _, reason := range sortedReasonKeys(result.RejectedBy) {
+		fmt.Fprintf(stdout, "  rejected[%s]=%d\n", reason, result.RejectedBy[reason])
+	}
+	fmt.Fprintln(stdout, "(ingested notes are trust_mark=low pending observations; run `gitmoot memory confirm` to promote)")
+	return 0
+}
+
+func parseMemoryIngestOptions(args []string, stderr io.Writer) (memoryIngestOptions, int) {
 	fs := flag.NewFlagSet("memory ingest", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
@@ -62,7 +117,7 @@ func runMemoryIngest(args []string, stdout, stderr io.Writer) int {
 		args = args[1:]
 	}
 	if err := parseMemoryFlags(fs, args); err != nil {
-		return memoryFlagExit(err)
+		return memoryIngestOptions{}, memoryFlagExit(err)
 	}
 	if pathArg == "" {
 		switch fs.NArg() {
@@ -70,18 +125,18 @@ func runMemoryIngest(args []string, stdout, stderr io.Writer) int {
 			pathArg = fs.Arg(0)
 		case 0:
 			fmt.Fprintln(stderr, "memory ingest: a <path|dir> argument is required")
-			return 2
+			return memoryIngestOptions{}, 2
 		default:
 			fmt.Fprintln(stderr, "memory ingest: exactly one <path|dir> argument is required")
-			return 2
+			return memoryIngestOptions{}, 2
 		}
 	} else if fs.NArg() != 0 {
 		fmt.Fprintln(stderr, "memory ingest: exactly one <path|dir> argument is required")
-		return 2
+		return memoryIngestOptions{}, 2
 	}
 	if strings.TrimSpace(*agent) == "" {
 		fmt.Fprintln(stderr, "memory ingest: --agent is required")
-		return 2
+		return memoryIngestOptions{}, 2
 	}
 	scope := strings.TrimSpace(*tier)
 	switch scope {
@@ -90,121 +145,236 @@ func runMemoryIngest(args []string, stdout, stderr io.Writer) int {
 	case memory.ScopeGeneral:
 		if strings.TrimSpace(*repo) != "" {
 			fmt.Fprintln(stderr, "memory ingest: --tier general cannot be combined with --repo")
-			return 2
+			return memoryIngestOptions{}, 2
 		}
 	default:
 		fmt.Fprintf(stderr, "memory ingest: invalid --tier %q (want repo|general)\n", *tier)
-		return 2
+		return memoryIngestOptions{}, 2
 	}
+	return memoryIngestOptions{
+		Home:   *home,
+		Path:   pathArg,
+		Agent:  *agent,
+		Shared: *shared,
+		Repo:   *repo,
+		Tier:   scope,
+		DryRun: *dryRun,
+		JSON:   *jsonOut,
+	}, 0
+}
 
-	files, root, err := collectMarkdownFiles(pathArg)
+func ingestMemorySource(ctx context.Context, store *db.Store, options memoryIngestOptions) (memoryIngestResult, error) {
+	files, root, err := collectMarkdownFiles(options.Path)
 	if err != nil {
-		fmt.Fprintf(stderr, "memory ingest: %v\n", err)
-		return 1
+		return memoryIngestResult{}, err
 	}
 	if len(files) == 0 {
-		fmt.Fprintf(stderr, "memory ingest: no .md files under %s\n", pathArg)
-		return 1
+		return memoryIngestResult{}, fmt.Errorf("no .md files under %s", options.Path)
 	}
 
 	result := memoryIngestResult{
-		Agent:      *agent,
-		Shared:     *shared,
-		Scope:      scope,
-		Repo:       strings.TrimSpace(*repo),
-		DryRun:     *dryRun,
+		Agent:      options.Agent,
+		Shared:     options.Shared,
+		Scope:      options.Tier,
+		Repo:       strings.TrimSpace(options.Repo),
+		DryRun:     options.DryRun,
 		Files:      len(files),
 		RejectedBy: map[string]int{},
 	}
-	owner := db.MemoryOwner{Kind: memory.OwnerKindAgent, Ref: *agent}
+	owner := db.MemoryOwner{Kind: memory.OwnerKindAgent, Ref: options.Agent}
 	authorRef := ""
-	if *shared {
+	if options.Shared {
 		owner = db.MemoryOwner{Kind: memory.OwnerKindShared, Ref: memory.SharedOwnerRef}
-		authorRef = strings.TrimSpace(*agent)
+		authorRef = strings.TrimSpace(options.Agent)
 	}
 
-	err = withStore(*home, func(store *db.Store) error {
-		ctx := context.Background()
-		seen, err := store.ObservationDedupKeys(ctx, owner.Ref)
+	seen, err := store.ObservationDedupKeys(ctx, owner.Ref)
+	if err != nil {
+		return result, err
+	}
+	for _, path := range files {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return result, fmt.Errorf("read %s: %w", path, err)
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			rel = filepath.Base(path)
+		}
+		rel = filepath.ToSlash(rel)
+		fileStem := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		_, body := memory.StripFrontmatter(string(raw))
+		for _, chunk := range memory.ChunkMarkdown(body, memory.IngestMaxChunkTokens) {
+			result.Chunks++
+			if ok, reason := memory.PreFilter(chunk.Text, result.Scope); !ok {
+				result.RejectedN++
+				result.RejectedBy[reason]++
+				continue
+			}
+			// Dedup within the target visibility domain only: identical text
+			// under a different repo must still stage (repo-scoped memory
+			// injects only for its own repo), so key by (scope, repo, hash).
+			dkey := db.MemoryDedupKey(result.Scope, result.Repo, memory.ContentHash(chunk.Text))
+			if _, dup := seen[dkey]; dup {
+				result.Deduped++
+				continue
+			}
+			seen[dkey] = struct{}{}
+			key := memory.IngestKey(fileStem, chunk.Heading, chunk.Text)
+			result.Inserted++
+			result.InsertedKeys = append(result.InsertedKeys, key)
+			if options.DryRun {
+				continue
+			}
+			if _, err := store.InsertMemoryObservation(ctx, db.MemoryObservation{
+				Owner:      owner,
+				AuthorRef:  authorRef,
+				Repo:       result.Repo,
+				Scope:      result.Scope,
+				Key:        key,
+				Content:    chunk.Text,
+				Provenance: "ingest:" + rel,
+				TrustMark:  memory.TrustLow,
+			}); err != nil {
+				return result, fmt.Errorf("insert observation for %s: %w", rel, err)
+			}
+		}
+	}
+	return result, nil
+}
+
+type memoryIngestSweepSourceResult struct {
+	Path     string `json:"path"`
+	Agent    string `json:"agent"`
+	Repo     string `json:"repo"`
+	Tier     string `json:"tier"`
+	Files    int    `json:"files"`
+	Chunks   int    `json:"chunks"`
+	Inserted int    `json:"inserted"`
+	Deduped  int    `json:"deduped"`
+	Rejected int    `json:"rejected"`
+	Error    string `json:"error"`
+}
+
+type memoryIngestSweepTotals struct {
+	Sources   int `json:"sources"`
+	Succeeded int `json:"succeeded"`
+	Failed    int `json:"failed"`
+	Files     int `json:"files"`
+	Chunks    int `json:"chunks"`
+	Inserted  int `json:"inserted"`
+	Deduped   int `json:"deduped"`
+	Rejected  int `json:"rejected"`
+}
+
+type memoryIngestSweepResult struct {
+	Totals  memoryIngestSweepTotals         `json:"totals"`
+	Sources []memoryIngestSweepSourceResult `json:"sources"`
+	Skipped string                          `json:"skipped,omitempty"`
+}
+
+func runMemoryIngestSweep(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("memory ingest sweep", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	jsonOut := fs.Bool("json", false, "print the sweep summary as JSON")
+	if err := parseMemoryFlags(fs, args); err != nil {
+		return memoryFlagExit(err)
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "memory ingest sweep: accepts no positional arguments")
+		return 2
+	}
+
+	var result memoryIngestSweepResult
+	err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
+		settings, err := config.LoadMemoryPipelineSettings(paths)
 		if err != nil {
 			return err
 		}
-		for _, path := range files {
-			raw, err := os.ReadFile(path)
-			if err != nil {
-				return fmt.Errorf("read %s: %w", path, err)
-			}
-			rel, err := filepath.Rel(root, path)
-			if err != nil {
-				rel = filepath.Base(path)
-			}
-			rel = filepath.ToSlash(rel)
-			fileStem := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-			_, body := memory.StripFrontmatter(string(raw))
-			for _, chunk := range memory.ChunkMarkdown(body, memory.IngestMaxChunkTokens) {
-				result.Chunks++
-				if ok, reason := memory.PreFilter(chunk.Text, scope); !ok {
-					result.RejectedN++
-					result.RejectedBy[reason]++
-					continue
-				}
-				// Dedup within the target visibility domain only: identical text
-				// under a different repo must still stage (repo-scoped memory
-				// injects only for its own repo), so key by (scope, repo, hash).
-				dkey := db.MemoryDedupKey(scope, result.Repo, memory.ContentHash(chunk.Text))
-				if _, dup := seen[dkey]; dup {
-					result.Deduped++
-					continue
-				}
-				seen[dkey] = struct{}{}
-				key := memory.IngestKey(fileStem, chunk.Heading, chunk.Text)
-				result.Inserted++
-				result.InsertedKeys = append(result.InsertedKeys, key)
-				if *dryRun {
-					continue
-				}
-				if _, err := store.InsertMemoryObservation(ctx, db.MemoryObservation{
-					Owner:      owner,
-					AuthorRef:  authorRef,
-					Repo:       result.Repo,
-					Scope:      scope,
-					Key:        key,
-					Content:    chunk.Text,
-					Provenance: "ingest:" + rel,
-					TrustMark:  memory.TrustLow,
-				}); err != nil {
-					return fmt.Errorf("insert observation for %s: %w", rel, err)
-				}
-			}
-		}
+		result = runConfiguredMemoryIngestSweep(context.Background(), store, settings.IngestSources)
 		return nil
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "memory ingest: %v\n", err)
+		fmt.Fprintf(stderr, "memory ingest sweep: %v\n", err)
 		return 1
-	}
-	if len(result.RejectedBy) == 0 {
-		result.RejectedBy = nil
 	}
 
 	if *jsonOut {
 		if err := writeJSON(stdout, result); err != nil {
-			fmt.Fprintf(stderr, "memory ingest: %v\n", err)
+			fmt.Fprintf(stderr, "memory ingest sweep: %v\n", err)
 			return 1
 		}
-		return 0
+	} else {
+		printMemoryIngestSweepResult(stdout, result)
 	}
-	verb := "ingested"
-	if *dryRun {
-		verb = "would ingest"
+	if result.Totals.Sources > 0 && result.Totals.Failed == result.Totals.Sources {
+		return 1
 	}
-	fmt.Fprintf(stdout, "%s %d observation(s) from %d file(s), %d chunk(s): inserted=%d deduped=%d rejected=%d\n",
-		verb, result.Inserted, result.Files, result.Chunks, result.Inserted, result.Deduped, result.RejectedN)
-	for _, reason := range sortedReasonKeys(result.RejectedBy) {
-		fmt.Fprintf(stdout, "  rejected[%s]=%d\n", reason, result.RejectedBy[reason])
-	}
-	fmt.Fprintln(stdout, "(ingested notes are trust_mark=low pending observations; run `gitmoot memory confirm` to promote)")
 	return 0
+}
+
+func runConfiguredMemoryIngestSweep(ctx context.Context, store *db.Store, sources []config.MemoryIngestSource) memoryIngestSweepResult {
+	result := memoryIngestSweepResult{Sources: []memoryIngestSweepSourceResult{}}
+	if len(sources) == 0 {
+		result.Skipped = "no memory.ingest sources configured"
+		return result
+	}
+	for _, source := range sources {
+		ingest, err := ingestMemorySource(ctx, store, memoryIngestOptions{
+			Path:  source.Path,
+			Agent: source.Agent,
+			Repo:  source.Repo,
+			Tier:  source.Tier,
+		})
+		entry := memoryIngestSweepSourceResult{
+			Path:     source.Path,
+			Agent:    source.Agent,
+			Repo:     source.Repo,
+			Tier:     source.Tier,
+			Files:    ingest.Files,
+			Chunks:   ingest.Chunks,
+			Inserted: ingest.Inserted,
+			Deduped:  ingest.Deduped,
+			Rejected: ingest.RejectedN,
+		}
+		if err != nil {
+			entry.Error = err.Error()
+			result.Totals.Failed++
+		} else {
+			result.Totals.Succeeded++
+		}
+		result.Totals.Sources++
+		result.Totals.Files += entry.Files
+		result.Totals.Chunks += entry.Chunks
+		result.Totals.Inserted += entry.Inserted
+		result.Totals.Deduped += entry.Deduped
+		result.Totals.Rejected += entry.Rejected
+		result.Sources = append(result.Sources, entry)
+	}
+	return result
+}
+
+func printMemoryIngestSweepResult(stdout io.Writer, result memoryIngestSweepResult) {
+	if result.Skipped != "" {
+		fmt.Fprintln(stdout, "memory ingest sweep skipped: no sources configured")
+		return
+	}
+	fmt.Fprintf(stdout, "memory ingest sweep: sources=%d succeeded=%d failed=%d inserted=%d deduped=%d rejected=%d files=%d chunks=%d\n",
+		result.Totals.Sources, result.Totals.Succeeded, result.Totals.Failed, result.Totals.Inserted,
+		result.Totals.Deduped, result.Totals.Rejected, result.Totals.Files, result.Totals.Chunks)
+	for _, source := range result.Sources {
+		repo := source.Repo
+		if repo == "" {
+			repo = "-"
+		}
+		fmt.Fprintf(stdout, "  %s agent=%s repo=%s tier=%s inserted=%d deduped=%d rejected=%d",
+			source.Path, source.Agent, repo, source.Tier, source.Inserted, source.Deduped, source.Rejected)
+		if source.Error != "" {
+			fmt.Fprintf(stdout, " error=%q", source.Error)
+		}
+		fmt.Fprintln(stdout)
+	}
 }
 
 // collectMarkdownFiles returns the sorted set of *.md files at target (a single

@@ -1345,6 +1345,7 @@ gitmoot memory eval --fixtures fixtures.json [--k N] [--json]
 gitmoot memory vault export [--out DIR] [--agent NAME] [--force] [--json]
 gitmoot memory vault import <DIR> [--dry-run|--yes] [--json]
 gitmoot memory ingest <path|dir> --agent NAME [--shared] [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
+gitmoot memory ingest sweep [--json]
 gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]
 gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--to-shared] [--yes] [--json]
 gitmoot memory promote --to-shared <id>... [--json]
@@ -1426,6 +1427,12 @@ repo still stages), and inserts survivors with
 `provenance = ingest:<relpath>` and **`trust_mark = low`**. `--tier` defaults to
 `repo`; `general` is only chosen explicitly. `--shared` stages observations in the
 shared pool while recording `--agent NAME` as the authoring identity.
+`memory ingest sweep` reads every configured `[[memory.ingest]]` source from the
+current config at run time and runs the same ingest logic in-process for each one.
+`--json` reports per-source `path`, `agent`, `repo`, `tier`, `inserted`, `deduped`,
+`rejected`, and `error`, plus aggregate totals. One bad source does not stop the
+rest; it exits non-zero only when the config is invalid or every source fails. With
+no sources it exits zero with a skipped note.
 `memory observations` lists pending observations, flagging which keys are already
 confirmed. `memory confirm` is the **human-gated promotion**: by id or
 `--provenance-prefix`, it copies observations
@@ -1517,6 +1524,7 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 
 ```sh
 gitmoot pipeline add nightly-sync.yaml --enable   # validate + store; omit --enable to add disabled
+gitmoot pipeline install-defaults                 # install built-in memory pipelines, skipping existing names
 gitmoot pipeline list [--json]
 gitmoot pipeline show nightly-sync [--json]        # registry view for a name
 gitmoot pipeline run nightly-sync                  # start a manual run; prints the run id
@@ -1541,6 +1549,18 @@ coordinator that fans out owned children and folds the synthesis); and **gate** 
 implement stage's PR merges). A read-only stage's `needs` result summaries are prepended
 to its prompt, and a repo-bound read-only agent stage runs in its own detached
 read-only worktree so same-repo stages parallelize without touching the live checkout.
+
+`pipeline install-defaults` installs the built-in `memory-ingest-sweep` and
+`memory-groom-propose` pipelines. The daemon also runs this installer at startup.
+It is idempotent: an existing pipeline with either name is skipped without
+overwriting user-edited YAML, enabled state, or schedule. Empty memory pipeline
+config installs manual-only definitions. Configure sources with `[[memory.ingest]]`
+and intervals with `[memory.pipelines]`, or run them on demand with
+`gitmoot pipeline run memory-ingest-sweep` and
+`gitmoot pipeline run memory-groom-propose`. The installed ingest sweep has a fixed
+two-stage shape that calls `gitmoot memory ingest sweep --json`, then summarizes the
+totals. It reads `[[memory.ingest]]` at run time, so config edits apply on the next
+manual or scheduled run without reinstalling defaults.
 
 A stage signals its outcome by printing a `gitmoot_result` blob to stdout; the
 advancer folds by the **decision**, never the job's exit state (`changes_requested`
