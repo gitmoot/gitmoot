@@ -126,11 +126,20 @@ learning. **Skills** is the SkillOpt evolution overview — one row per agent
 template with its version history as an inline score-trend sparkline, the
 current version, any active canary, and pending candidates (each expandable to
 a copy-paste `gitmoot skillopt candidate promote` command). Clicking a row
-jumps to that agent's detail panel. **Knowledge** is the memory brain graph —
-enrolled agents as wells, their remembered facts as nodes sized by how often
-they were reinforced, and owner/category/supersede edges between them; clicking
-a fact or agent opens its detail panel. Both tabs are read-only and poll every
-12 seconds.
+jumps to that agent's detail panel. **Knowledge** is the memory fact galaxy —
+one lane per repo scope, each lane holding its facts as a wiki-link
+constellation, cluster and sub-cluster hub columns, and enrolled agents as
+wells on the right; clicking a fact, cluster, or agent opens its detail panel.
+Deep cluster trees stay scannable through progressive disclosure: a `+n` badge
+on a hub reveals hidden intermediate levels, and Escape (or clicking empty sky)
+collapses back. Three header toggles control density: **fact links** (wiki
+links between facts), **cross-repo links** (links whose endpoints live in
+different repo lanes render as dashed stubs at the lane border; hovering or
+selecting a fact draws its full dashed curve to the partner), and **history**
+(off by default — superseded ghost facts and their red supersede edges are
+hidden; toggle on to see how facts were replaced over time, e.g. by the
+automatic brick splitter). Unclustered facts sit in their own repo's lane.
+Both tabs are read-only and poll every 12 seconds.
 
 ## Agents
 
@@ -234,3 +243,26 @@ compact human-action status to post into a thread. Two read-only endpoints expos
 them for bridge consumers: `GET /api/job/{id}/checks` (a job's failed result checks
 + policy mode) and `GET /api/run/{id}/verdicts` (a SkillOpt run's per-question
 binary verdicts with pass/fail counts).
+
+## Config
+
+Route: `/config`
+
+The read-only effective-configuration viewer. Every known knob is listed by
+config section with its current value, its default, and a `default` /
+`overridden` badge (overridden values stand out); boolean feature flags render
+as ON/OFF chips, and the off-by-default feature flags (memory distillation,
+`groom_split_llm`, SkillOpt auto-promote, chat auto-respond, …) are gathered
+into a highlighted section at the top so you can see at a glance what is
+enabled on this install. Below the knobs, a per-agent table shows each
+registered or configured agent's runtime, model, capabilities, autonomy
+policy, memory enrollment, chat auto-respond flag, and background-job cap. A
+filter box narrows by key, section, or value, and every knob carries a
+click-to-copy `key = value` snippet for pasting into `config.toml`, whose path
+and last-modified time are shown in the footer.
+
+Values come from a strict server-side allowlist: only known, registered
+settings are ever serialized, so secrets and tokens can never appear. Keys
+present in `config.toml` that the allowlist does not recognize are listed by
+name only, without values. The page never edits anything — configuration
+changes happen in `config.toml` on the box.
