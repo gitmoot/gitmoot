@@ -3269,6 +3269,372 @@ These are intentionally out of scope for v1 and tracked as follow-ups:
 
 ---
 
+# Source: docs/activepieces.md
+
+# Activepieces bootstrap
+
+`gitmoot activepieces setup` creates a local Activepieces installation and wires
+it to the authenticated Gitmoot bridge. The resulting workflow builder can run
+Gitmoot pipelines and enqueue agent jobs without giving Activepieces direct
+access to the Gitmoot database or daemon internals.
+
+## Quick start
+
+Docker with the Compose plugin must be available. Then run:
+
+```sh
+gitmoot activepieces setup --yes
+```
+
+The command performs the complete local bootstrap:
+
+1. Creates or reuses `~/.gitmoot/bridge.token`.
+2. Starts `gitmoot bridge serve` in the background if the selected bridge
+   address is not already listening.
+3. Writes an Activepieces Compose stack under
+   `~/.gitmoot/activepieces/` and starts Activepieces 0.82.0, Postgres 16, and
+   Redis 7. Redis queue mode is required for reliable container-to-host calls.
+4. Waits for Activepieces to become healthy.
+5. Creates the local admin account, or signs into an existing account.
+6. Installs `@gitmoot/piece-gitmoot` from public npm.
+7. Creates the project-scoped `gitmoot-bridge` custom-auth connection.
+8. Imports the starter flows unless `--no-templates` is set.
+
+Open `http://localhost:8080` when setup finishes. When setup generates an admin
+password, it prints it once and saves it in
+`~/.gitmoot/activepieces/ADMIN_CREDENTIALS.txt` with mode `0600`.
+
+The generated `.env` is also mode `0600`. Re-running setup preserves
+`AP_ENCRYPTION_KEY`, `AP_JWT_SECRET`, and the Postgres password because changing
+those values would make existing encrypted connections unreadable. Only the
+port and frontend URL are updated.
+
+## Bridge architecture
+
+The Gitmoot bridge is intentionally local. On Linux, setup binds it to the
+Docker bridge gateway at `172.17.0.1:8791` and enables the bridge's explicit
+non-loopback guard. On macOS and Windows with Docker Desktop, it binds to
+`127.0.0.1:8791`. In both cases, the Activepieces container calls:
+
+```text
+http://host.docker.internal:8791
+```
+
+The Compose stack maps `host.docker.internal` to the host gateway. A cloud
+Activepieces deployment cannot reach this local bridge. `--url` is therefore
+for an existing local Activepieces instance, or an instance with a separately
+secured network path back to this machine.
+
+The Linux bridge address is reachable from local containers, so keep the host
+firewall in place and do not expose port 8791 publicly. Override the bind and
+container-facing URL together when the Docker network uses a different gateway:
+
+```sh
+gitmoot activepieces setup \
+  --bridge-addr 192.168.65.1:8791 \
+  --bridge-url http://host.docker.internal:8791
+```
+
+Use `--no-bridge-spawn` when another supervisor already runs the bridge. Setup
+then requires the configured address to be listening and never launches a
+duplicate process.
+
+## Setup flags
+
+```text
+--home path                Gitmoot home parent directory
+--url URL                  existing local Activepieces URL; skip Docker
+--port 8080                local Activepieces port
+--piece-version version    npm version; latest is resolved when omitted
+--email address            admin email (admin@gitmoot.local)
+--password value           admin password; generated when omitted
+--bridge-addr host:port    bridge bind selected for the current OS
+--bridge-url URL            URL used inside Activepieces
+--no-bridge-spawn          require an already-running bridge
+--recreate-connection      replace the gitmoot-bridge connection
+--compose-project name     Docker Compose project name
+--no-templates             skip starter flow import
+--yes                      accept setup prompts
+```
+
+If npm version lookup is temporarily unavailable, setup omits the version and
+lets Activepieces resolve the latest registry release. Pass `--piece-version`
+for a fully pinned bootstrap.
+
+## Starter templates
+
+List the embedded templates without contacting Activepieces:
+
+```sh
+gitmoot activepieces templates list
+```
+
+Import all templates into the default local instance:
+
+```sh
+gitmoot activepieces templates import
+```
+
+Import selected IDs, with flags before the IDs:
+
+```sh
+gitmoot activepieces templates import \
+  --url http://localhost:8080 \
+  webhook-run-pipeline gmail-imap-ask-agent
+```
+
+The importer lists existing flows first and skips a template when its display
+name already exists.
+
+### `webhook-run-pipeline`
+
+This flow receives an unauthenticated Activepieces webhook and calls the
+Gitmoot piece's `run_pipeline` action. Edit the `<your-pipeline>` placeholder
+before publishing the flow. Add webhook authentication or an upstream access
+control when the endpoint is not confined to a trusted network.
+
+### `gmail-imap-ask-agent`
+
+This flow uses the official IMAP `new_email` trigger, calls `ask_agent`, and
+sends an acknowledgement through the official SMTP `send-email` action. Fill
+in the IMAP and SMTP connections, `<agent>`, `<owner/repo>`, and sender address.
+The repo value is required; the bridge rejects an empty repo.
+
+`ask_agent` is asynchronous and returns only a `job_id`. The supplied SMTP
+reply therefore acknowledges that the job was queued. Returning the agent's
+full answer requires a future polling or callback flow.
+
+For Gmail mailbox credentials and app authorization, continue with
+[Gmail setup](gmail.md). The OAuth-native Gmail template is intentionally
+deferred until that connection flow can be shipped without a broken placeholder.
+
+## Stop or remove the local stack
+
+Stop the containers while preserving Postgres and Redis data:
+
+```sh
+gitmoot activepieces down
+```
+
+Also remove the named data volumes:
+
+```sh
+gitmoot activepieces down --volumes
+```
+
+Removing volumes deletes local Activepieces accounts, flows, connections, and
+execution state. The files under `~/.gitmoot/activepieces/` remain available for
+a later setup.
+
+---
+
+# Source: docs/gmail.md
+
+# Connect Gmail To A Pipeline (Activepieces)
+
+## How it fits together
+
+The flow is:
+
+```text
+Gmail -> Activepieces in Docker -> gitmoot piece action -> gitmoot bridge serve -> pipeline or agent run
+```
+
+Activepieces holds **all Gmail, IMAP, SMTP, OAuth, or service-account
+credentials**. The gitmoot piece holds only the bridge URL and bridge token.
+Activepieces listens for mail and forwards selected fields. The pipeline or
+agent does the analysis, routing, and other intelligent work inside gitmoot.
+
+`gitmoot bridge serve` exposes bearer-token HTTP on localhost. Activepieces
+therefore has to run on the **same box** as the bridge. A container reaches the
+host at `http://host.docker.internal:8791` or, on Linux, a Docker bridge address
+such as `http://172.17.0.1:8791`. Linux Compose usually also needs:
+
+```yaml
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+```
+
+Activepieces Cloud cannot reach a bridge on your local machine. See the
+[bridge reference](../website/docs/reference/bridge.md) for its security model.
+
+## Why there is no plain "Sign in with Google" button
+
+A "Sign in with Google" button is backed by a pre-registered OAuth application.
+Google checks that the callback URL exactly matches an authorized redirect URI
+on that application. A bare self-hosted Activepieces instance at your own domain
+does not automatically have an OAuth application registered for that domain.
+
+A hosted or preconfigured provider can supply such an application. Otherwise,
+choose one of these paths: use an app password, register your own OAuth
+application, or use a Google Workspace service account.
+
+## Choose a path
+
+| Path | Needs | Browser consent | Best for |
+| --- | --- | --- | --- |
+| **IMAP + SMTP app password (default)** | Google account with 2-Step Verification and app passwords allowed | No OAuth consent | The quickest self-hosted and headless setup |
+| **Your own OAuth app** | Google Cloud project, Gmail API, OAuth client, reachable Activepieces URL | Once, then again if a Testing token expires | Teams that require OAuth or cannot use app passwords |
+| **Workspace service account** | Google Workspace super admin, service account, domain-wide delegation | No | Fully headless organization-managed mailboxes |
+
+## Default: IMAP + SMTP with an app password
+
+This path needs no Google Cloud project and no OAuth browser-consent flow.
+
+1. Turn on 2-Step Verification for the Gmail or Workspace account.
+2. Open [Google App Passwords](https://myaccount.google.com/apppasswords) and
+   generate a 16-character app password for Activepieces.
+3. In Activepieces, create the IMAP trigger connection:
+   - Host: `imap.gmail.com`
+   - Port: `993`
+   - Security: SSL
+   - Username: the full Gmail or Workspace address
+   - Password: the app password, not the normal account password
+4. Create the SMTP action connection:
+   - Host: `smtp.gmail.com`
+   - Port: `465`
+   - Security: SSL
+   - Username: the full Gmail or Workspace address
+   - Password: the same app password
+
+Port `587` with STARTTLS also works for SMTP. Google's
+[IMAP and SMTP reference](https://developers.google.com/workspace/gmail/imap/imap-smtp)
+lists the hosts, ports, and transport requirements.
+
+On a headless server, tunnel the Activepieces UI to your workstation and do the
+setup there:
+
+```sh
+ssh -L 8080:127.0.0.1:8080 user@your-host
+```
+
+Then open `http://localhost:8080` locally. This is only UI access. It does not
+add an OAuth consent step to the app-password path.
+
+Google removed legacy basic-password access for Workspace IMAP and SMTP in
+2025. App passwords are a separate feature and remain an explicit exception,
+unless a Workspace administrator or account security policy disables them. See
+Google's [Workspace transition notice](https://support.google.com/a/answer/14114704),
+[app-password requirements](https://support.google.com/mail/answer/185833), and
+[Gmail client setup guidance](https://support.google.com/mail/answer/7126229).
+
+## OAuth: bring your own Google app
+
+Use this path when policy requires OAuth or app passwords are unavailable.
+
+1. Create or select a Google Cloud project.
+2. Enable the Gmail API.
+3. Configure the OAuth consent screen as **External** and add your Gmail address
+   as a test user.
+4. Create an OAuth client with application type **Web application**.
+5. Add `https://<your-ap>/redirect` as an authorized redirect URI. Activepieces
+   derives this callback from `AP_FRONTEND_URL`. Copy the exact redirect URL
+   shown in the Activepieces connection dialog instead of reconstructing it by
+   hand.
+6. Paste the client ID and client secret into the Activepieces Gmail connection.
+7. Click **Connect** and complete the Google consent flow once. An "unverified
+   app" interstitial is expected for your own test application.
+
+For a headless box, use `ssh -L` to open the Activepieces UI from a workstation
+with a browser. The redirect still has to match the externally configured
+`AP_FRONTEND_URL`; the tunnel is only how you operate the UI. Activepieces
+[documents `AP_FRONTEND_URL`](https://www.activepieces.com/docs/install/reference/environment-variables)
+as the public base used to build redirect and webhook URLs.
+
+**Testing-mode expiry:** an External OAuth application whose publishing status
+is **Testing** receives refresh tokens that expire after 7 days when Gmail
+scopes are requested. Publish the application or reconnect and consent again
+each week. See Google's
+[refresh-token expiration rules](https://developers.google.com/identity/protocols/oauth2#expiration).
+
+## Google Workspace: service account (fully headless)
+
+This path is only for Google Workspace. It has no per-user browser-consent step.
+
+1. Enable the Gmail API in a Google Cloud project, create a service account,
+   and enable domain-wide delegation.
+2. Record its numeric client ID and keep its private key in a secret store.
+3. In the Google Admin console, go to **Security > Access and data control > API
+   controls > Manage Domain Wide Delegation**.
+4. Add the service account client ID and grant the Gmail scopes used by the
+   Activepieces Gmail connection:
+   - `https://www.googleapis.com/auth/gmail.send`
+   - `https://www.googleapis.com/auth/gmail.readonly`
+   - `https://www.googleapis.com/auth/gmail.compose`
+5. In Activepieces, choose **Service Account (Advanced)** for the Gmail
+   connection. Paste the service-account JSON key and set **User Email** to the
+   Workspace mailbox to impersonate.
+
+Domain-wide delegation lets the service account act as a specific Workspace
+user within the scopes the administrator granted. It does not apply to personal
+`@gmail.com` accounts. Follow Google's
+[service-account delegation guide](https://developers.google.com/identity/protocols/oauth2/service-account#delegatingauthority)
+and [Workspace admin procedure](https://support.google.com/a/answer/162106).
+
+## Wire the flow
+
+First follow [Set Up Activepieces](./activepieces.md) to place Activepieces next
+to the bridge. Install the published `@gitmoot/piece-gitmoot` package using the
+[gitmoot-pieces README](https://github.com/jerryfane/gitmoot-pieces#building-and-publishing).
+The target pipeline must already be registered with gitmoot. See
+[Pipelines](./pipelines.md).
+
+In the Activepieces flow:
+
+1. Add a Gmail **New Email** trigger, or an IMAP new-message trigger for the
+   app-password path.
+2. Add the gitmoot **Run Pipeline** action, `run_pipeline`, and set
+   `pipeline_name` to the registered pipeline name.
+3. Create the gitmoot custom-auth connection with:
+   - `bridge_url`: `http://host.docker.internal:8791`, or the same-host bridge
+     address that works from the container
+   - `bridge_token`: the bearer token created by `gitmoot bridge serve`
+4. Map only the email fields the pipeline needs into the action input.
+
+To ask a managed agent directly instead, use `ask_agent` with `agent`, `message`,
+and `repo`. The bridge requires `repo`; use the full `owner/repo` value.
+
+If the flow prepares a response, default to **Create Draft**. Never add an
+automatic send step unless the operator explicitly opts in. Where the selected
+mail connector cannot create drafts, stop after producing the proposed response
+instead of adding an SMTP send action.
+
+## Troubleshooting
+
+### The app-password option is missing
+
+Turn on 2-Step Verification first. The option can also be unavailable because of
+a Workspace administrator policy, security-key-only 2-Step Verification, or
+Advanced Protection. Ask the Workspace administrator whether app passwords are
+allowed.
+
+### Google shows an unverified-app screen
+
+That is expected for your own External test application. Confirm that you created
+the application and that the signed-in account is listed as a test user before
+continuing.
+
+### OAuth works for a week, then stops
+
+The OAuth consent screen is probably External with publishing status **Testing**.
+Its Gmail refresh token expires after 7 days. Publish the application or reconnect
+and consent again.
+
+### The Activepieces container cannot reach the bridge
+
+Activepieces must run on the same box as gitmoot. Use
+`http://host.docker.internal:8791` or the Linux bridge address such as
+`http://172.17.0.1:8791`. For Linux Compose, add:
+
+```yaml
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+```
+
+Activepieces Cloud cannot reach the localhost bridge.
+
+---
+
 # Source: docs/parallel-jobs.md
 
 # Run Jobs In Parallel On A Repo
@@ -7977,7 +8343,7 @@ his PRs (#555, #560), co-authored.
 
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, pipelines, routing telemetry, event webhooks, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, or Kimi Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, pipelines, email/Activepieces pipeline triggers via the localhost bridge, routing telemetry, event webhooks, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, or Kimi Code runtime workflows.
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
@@ -10973,7 +11339,28 @@ POST /v1/agents/{name}/ask. Every request needs
 `Authorization: Bearer $(cat ~/.gitmoot/bridge.token)`. Requests are
 rate-limited (30/min) and body-capped (1MB). Containers reach the host
 bridge at http://host.docker.internal:8791 (or the docker bridge IP on
-Linux). Built for the Activepieces piece seam (issue #785).
+Linux). Built for the Activepieces piece seam (issue #785); to connect Gmail as a pipeline trigger see WORKFLOWS.md -> Gmail -> Pipeline (Activepieces).
+
+## Activepieces
+
+```bash
+gitmoot activepieces setup [--port 8080] [--url http://localhost:8080] [--yes]
+gitmoot activepieces down [--volumes]
+gitmoot activepieces templates list
+gitmoot activepieces templates import [flags] [id...]
+```
+
+`activepieces setup` bootstraps a local Activepieces 0.82.0, Postgres, and Redis
+Compose stack, starts the Gitmoot bridge when needed, installs the public
+`@gitmoot/piece-gitmoot`, creates the `gitmoot-bridge` connection, and imports
+starter webhook and IMAP/SMTP flows. `--url` skips Docker for an existing local
+Activepieces instance. Cloud Activepieces cannot reach the local bridge without
+a separately secured path back to the host.
+
+`activepieces down` preserves data volumes unless `--volumes` is set.
+`templates import` skips flow display names that already exist. The email flow
+requires a non-empty repo and sends only a queued-job acknowledgement because
+`ask_agent` is asynchronous.
 
 ---
 
@@ -12126,6 +12513,49 @@ pipeline stage job, so a pipeline can never fan out into a delegation tree. Reac
 for an orchestra (a coordinator returning `delegations[]`) when you want dynamic,
 model-driven decomposition; reach for a pipeline when the steps and their wiring are
 known up front. See `../../../docs/pipelines.md` for the full reference.
+
+## Gmail -> Pipeline (Activepieces)
+
+Activepieces holds all Gmail credentials and forwards mail into the published
+gitmoot piece. The piece calls `gitmoot bridge serve`, which is a local,
+bearer-token HTTP seam. Activepieces must run on the same box as the bridge;
+Activepieces Cloud cannot reach it. From Docker use
+`http://host.docker.internal:8791` or a Linux bridge address such as
+`http://172.17.0.1:8791`. Linux Compose needs
+`extra_hosts: ["host.docker.internal:host-gateway"]`.
+
+| Path | Needs | Browser consent | Best for |
+|---|---|---|---|
+| App password (default) | 2-Step Verification and app passwords allowed | No OAuth consent | Simple self-hosted or headless setup |
+| Own OAuth app | Google Cloud project, Gmail API, OAuth client | Once; Testing tokens expire after 7 days | OAuth-required accounts |
+| Workspace service account | Workspace admin and domain-wide delegation | No | Fully headless managed mailboxes |
+
+For the default path, enable 2-Step Verification, generate the 16-character app
+password at `https://myaccount.google.com/apppasswords`, and create these
+Activepieces connections using the full email address as the username and the
+app password as the password:
+
+- IMAP trigger: `imap.gmail.com:993`, SSL
+- SMTP action: `smtp.gmail.com:465`, SSL (`587` with STARTTLS also works)
+
+This needs no Google Cloud project and no OAuth consent. For your own OAuth app,
+enable the Gmail API, create an External consent screen and Web-application
+client, then authorize `https://<your-ap>/redirect`. The value derives from
+`AP_FRONTEND_URL`; copy the exact redirect shown by Activepieces. For Workspace
+service accounts, enable domain-wide delegation and have a super administrator
+grant `https://www.googleapis.com/auth/gmail.send`,
+`https://www.googleapis.com/auth/gmail.readonly`, and
+`https://www.googleapis.com/auth/gmail.compose`. In Activepieces choose
+**Service Account (Advanced)**, paste the JSON key, and set **User Email** to
+the Workspace mailbox to impersonate.
+
+Wire the Gmail or IMAP new-email trigger to `run_pipeline` with
+`pipeline_name`, or use `ask_agent` with `agent`, `message`, and the required
+`repo`. Configure the piece's CustomAuth with `bridge_url` and `bridge_token`.
+If the flow prepares a reply, default to **Create Draft** and never auto-send
+without explicit operator opt-in.
+
+See `../../../docs/gmail.md` for the full setup and troubleshooting guide.
 
 ---
 

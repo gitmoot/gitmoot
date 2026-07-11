@@ -2540,7 +2540,7 @@ POST /v1/agents/{name}/ask. Every request needs
 `Authorization: Bearer $(cat ~/.gitmoot/bridge.token)`. Requests are
 rate-limited (30/min) and body-capped (1MB). Containers reach the host
 bridge at http://host.docker.internal:8791 (or the docker bridge IP on
-Linux). Built for the Activepieces piece seam (issue #785).
+Linux). Built for the Activepieces piece seam (issue #785); to connect Gmail as a pipeline trigger see WORKFLOWS.md -> Gmail -> Pipeline (Activepieces).
 
 ## Activepieces
 

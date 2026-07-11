@@ -36,4 +36,5 @@ and enqueue agent asks.
 
 Use `http://host.docker.internal:8791` (Docker Desktop) or the docker bridge
 IP such as `http://172.17.0.1:8791` on Linux, passing the token from
-`bridge.token`. This is the seam the planned Activepieces integration uses.
+`bridge.token`. This is the seam the gitmoot Activepieces piece uses - see
+[Connect Gmail To A Pipeline](../workflows/gmail-pipeline-workflow.md).

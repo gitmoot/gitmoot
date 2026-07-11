@@ -17,6 +17,7 @@ const sources = [
   'docs/heartbeats.md',
   'docs/pipelines.md',
   'docs/activepieces.md',
+  'docs/gmail.md',
   'docs/parallel-jobs.md',
   'docs/cockpit-orchestrate.md',
   'docs/skillopt-train-workflow.md',
