@@ -1,0 +1,37 @@
+{
+  "displayName": "Gitmoot: Webhook to Pipeline",
+  "schemaVersion": "20",
+  "trigger": {
+    "name": "trigger",
+    "valid": true,
+    "displayName": "Receive webhook",
+    "type": "PIECE_TRIGGER",
+    "lastUpdatedDate": "2026-01-01T00:00:00.000Z",
+    "settings": {
+      "pieceName": "@activepieces/piece-webhook",
+      "pieceVersion": "~0.1.33",
+      "triggerName": "catch_webhook",
+      "input": {
+        "authType": "none"
+      },
+      "propertySettings": {}
+    },
+    "nextAction": {
+      "name": "step_1",
+      "valid": true,
+      "displayName": "Run Gitmoot pipeline",
+      "type": "PIECE",
+      "settings": {
+        "pieceName": "@gitmoot/piece-gitmoot",
+        "pieceVersion": "~0.1.2",
+        "actionName": "run_pipeline",
+        "input": {
+          "pipeline_name": "<your-pipeline>",
+          "auth": "{{connections['gitmoot-bridge']}}"
+        },
+        "propertySettings": {},
+        "errorHandlingOptions": {}
+      }
+    }
+  }
+}

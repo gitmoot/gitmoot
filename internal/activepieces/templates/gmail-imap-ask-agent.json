@@ -1,0 +1,64 @@
+{
+  "displayName": "Gitmoot: Email to Agent Acknowledgement",
+  "schemaVersion": "20",
+  "trigger": {
+    "name": "trigger",
+    "valid": true,
+    "displayName": "Receive email over IMAP",
+    "type": "PIECE_TRIGGER",
+    "lastUpdatedDate": "2026-01-01T00:00:00.000Z",
+    "settings": {
+      "pieceName": "@activepieces/piece-imap",
+      "pieceVersion": "~0.4.4",
+      "triggerName": "new_email",
+      "input": {
+        "auth": "",
+        "mailbox": "INBOX"
+      },
+      "propertySettings": {}
+    },
+    "nextAction": {
+      "name": "step_1",
+      "valid": true,
+      "displayName": "Ask Gitmoot agent",
+      "type": "PIECE",
+      "settings": {
+        "pieceName": "@gitmoot/piece-gitmoot",
+        "pieceVersion": "~0.1.2",
+        "actionName": "ask_agent",
+        "input": {
+          "agent": "<agent>",
+          "message": "{{trigger['text']}}",
+          "repo": "<owner/repo>",
+          "auth": "{{connections['gitmoot-bridge']}}"
+        },
+        "propertySettings": {},
+        "errorHandlingOptions": {}
+      },
+      "nextAction": {
+        "name": "step_2",
+        "valid": true,
+        "displayName": "Send queued acknowledgement",
+        "type": "PIECE",
+        "settings": {
+          "pieceName": "@activepieces/piece-smtp",
+          "pieceVersion": "~0.4.1",
+          "actionName": "send-email",
+          "input": {
+            "auth": "",
+            "from": "<automation@example.com>",
+            "to": [
+              "{{trigger['from']['value'][0]['address']}}"
+            ],
+            "subject": "Re: {{trigger['subject']}}",
+            "body_type": "plain_text",
+            "body": "Received. Gitmoot job {{step_1['job_id']}} was queued. A synchronous agent reply is planned for a future version.",
+            "attachments": []
+          },
+          "propertySettings": {},
+          "errorHandlingOptions": {}
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,60 @@
+services:
+  activepieces:
+    image: activepieces/activepieces:0.82.0
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${AP_PORT}:80"
+    environment:
+      AP_ENVIRONMENT: prod
+      AP_FRONTEND_URL: ${AP_FRONTEND_URL}
+      AP_ENCRYPTION_KEY: ${AP_ENCRYPTION_KEY}
+      AP_JWT_SECRET: ${AP_JWT_SECRET}
+      AP_EXECUTION_MODE: UNSANDBOXED
+      AP_TELEMETRY_ENABLED: "false"
+      AP_DB_TYPE: POSTGRES
+      AP_POSTGRES_HOST: postgres
+      AP_POSTGRES_PORT: "5432"
+      AP_POSTGRES_DATABASE: ${AP_POSTGRES_DATABASE}
+      AP_POSTGRES_USERNAME: ${AP_POSTGRES_USERNAME}
+      AP_POSTGRES_PASSWORD: ${AP_POSTGRES_PASSWORD}
+      AP_QUEUE_MODE: REDIS
+      AP_REDIS_HOST: redis
+      AP_REDIS_PORT: "6379"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [ap-internal]
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${AP_POSTGRES_DATABASE}
+      POSTGRES_USER: ${AP_POSTGRES_USERNAME}
+      POSTGRES_PASSWORD: ${AP_POSTGRES_PASSWORD}
+    volumes: ["ap_postgres:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AP_POSTGRES_USERNAME} -d ${AP_POSTGRES_DATABASE}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [ap-internal]
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes: ["ap_redis:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [ap-internal]
+volumes:
+  ap_postgres:
+  ap_redis:
+networks:
+  ap-internal:
+    driver: bridge

@@ -2541,3 +2541,24 @@ POST /v1/agents/{name}/ask. Every request needs
 rate-limited (30/min) and body-capped (1MB). Containers reach the host
 bridge at http://host.docker.internal:8791 (or the docker bridge IP on
 Linux). Built for the Activepieces piece seam (issue #785).
+
+## Activepieces
+
+```bash
+gitmoot activepieces setup [--port 8080] [--url http://localhost:8080] [--yes]
+gitmoot activepieces down [--volumes]
+gitmoot activepieces templates list
+gitmoot activepieces templates import [flags] [id...]
+```
+
+`activepieces setup` bootstraps a local Activepieces 0.82.0, Postgres, and Redis
+Compose stack, starts the Gitmoot bridge when needed, installs the public
+`@gitmoot/piece-gitmoot`, creates the `gitmoot-bridge` connection, and imports
+starter webhook and IMAP/SMTP flows. `--url` skips Docker for an existing local
+Activepieces instance. Cloud Activepieces cannot reach the local bridge without
+a separately secured path back to the host.
+
+`activepieces down` preserves data volumes unless `--volumes` is set.
+`templates import` skips flow display names that already exist. The email flow
+requires a non-empty repo and sends only a queued-job acknowledgement because
+`ask_agent` is asynchronous.
