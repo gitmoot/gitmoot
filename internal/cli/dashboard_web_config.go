@@ -107,8 +107,15 @@ func (d *webDataSource) Config(ctx context.Context) (dashboard.ConfigSnapshot, e
 			return fmt.Errorf("list agents: %w", err)
 		}
 		out.Agents = projectDashboardConfigAgents(agents, agentTypes)
-		out.UnknownKeys, err = dashboardUnknownConfigKeys(paths.ConfigFile)
-		return err
+		// Unknown-key discovery re-parses the file with a strict TOML reader,
+		// which can reject values gitmoot's lenient loader accepts (e.g. the
+		// live box's bare-word list `deterministic_checkers = diff_size,...`).
+		// The names are decoration, never worth failing the snapshot: degrade
+		// to an empty list on any parse error.
+		if unknown, unknownErr := dashboardUnknownConfigKeys(paths.ConfigFile); unknownErr == nil {
+			out.UnknownKeys = unknown
+		}
+		return nil
 	})
 	if err != nil {
 		return dashboard.ConfigSnapshot{}, err
