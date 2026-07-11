@@ -40,6 +40,7 @@ func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Jo
 		TaskTitle:              request.TaskTitle,
 		Sender:                 firstNonEmptyString(request.Sender, "session"),
 		Instructions:           request.Instructions,
+		WorkflowID:             strings.TrimSpace(request.WorkflowID),
 		TemplateID:             snapshot.ID,
 		TemplateResolvedCommit: snapshot.ResolvedCommit,
 		TemplateContent:        snapshot.Content,

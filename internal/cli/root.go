@@ -41,6 +41,7 @@ var rootCommands = []command{
 	{name: "goal", summary: "import or inspect goals", run: runGoal},
 	{name: "task", summary: "run or inspect tasks", run: runTask},
 	{name: "job", summary: "inspect and recover jobs", run: runJob},
+	{name: "workflow", summary: "inspect external-coordinator workflow groups and notes", run: runWorkflowJournal},
 	{name: "report", summary: "build and file bug reports", run: runReport},
 	{name: "lock", summary: "inspect and release branch locks", run: runLock},
 	{name: "interactive", summary: "inspect and answer interactive prompts", run: runInteractive},

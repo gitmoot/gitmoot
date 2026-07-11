@@ -152,6 +152,7 @@ func TestSkillDocumentsCurrentCLIFamilies(t *testing.T) {
 				"gitmoot moot <name>",
 				"gitmoot router summary",
 				"gitmoot job gates <id>",
+				"gitmoot workflow list",
 				"gitmoot dashboard --web",
 				"gitmoot skillopt rubric induce",
 			},
@@ -172,6 +173,7 @@ func TestSkillDocumentsCurrentCLIFamilies(t *testing.T) {
 				"gitmoot router summary",
 				"gitmoot job open",
 				"gitmoot job gates",
+				"gitmoot workflow list",
 				"gitmoot dashboard --web",
 				"gitmoot skillopt ab",
 				"gitmoot skillopt pairwise",
@@ -191,6 +193,7 @@ func TestSkillDocumentsCurrentCLIFamilies(t *testing.T) {
 				"gitmoot chat wait",
 				"gitmoot moot <name>",
 				"gitmoot router summary",
+				"gitmoot workflow list",
 			},
 		},
 	} {

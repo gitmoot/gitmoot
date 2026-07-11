@@ -937,6 +937,36 @@ configured, those commands require an explicit `--repo`. **Caution: templates
 are stored and published VERBATIM (prompt body + metadata) — point the remote
 at a PRIVATE repo unless the prompts are meant to be public.**
 
+## External-coordinator workflow groups
+
+Attach a global workflow label to work started outside Gitmoot's own goal/task
+coordinator. Labels are lowercase slugs up to 64 characters. The label is
+accepted by `agent ask`, `agent run`, `agent review`, `agent implement`,
+`orchestrate`, and `job open`; delegation children and every coordinator
+continuation inherit it.
+
+```sh
+gitmoot orchestrate planner "Coordinate the release." --repo owner/repo --workflow release-42
+gitmoot job list --workflow release-42
+gitmoot workflow list
+gitmoot workflow show release-42 --limit 100
+gitmoot workflow note release-42 "The staging rollout completed." --author operator
+```
+
+`workflow list` reports per-state counts, note count, first/last activity, and
+best-effort token totals. `workflow show` merges jobs and notes chronologically.
+Labels may be reused; timestamps expose the reuse. `workflow note` stores body
+and author verbatim (10 KiB and 128-byte limits) and rejects labels with no jobs.
+`workflow show --json` returns those verbatim bytes; plain-text output strips
+terminal escape sequences, maps control characters to spaces (except tabs), and
+caps each rendered field to one bounded line.
+
+Add `--remember` to stage low-trust repo memory. The default pool is shared;
+`--agent NAME` opts into that registered agent's private pool. Exactly one repo
+is inferred from group jobs; zero or multiple repos require `--repo`. Note and
+observation commit atomically. Prefilter rejection reports the reason and writes
+neither. Existing `[memory].ingest_auto_confirm` behavior is honored.
+
 ## Goals
 
 Print the standard Gitmoot goal prompt template:

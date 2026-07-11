@@ -29,6 +29,7 @@ type localAgentDispatchRequest struct {
 	Type         string
 	Model        string
 	Effort       string
+	WorkflowID   string
 	// Runtime, when non-empty, is the per-job runtime override (#531): this one
 	// job runs through the named runtime while the agent's registered default
 	// runtime (and its session) stays untouched. RuntimeSession optionally names
@@ -253,6 +254,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		Instructions:           request.Instructions,
 		Model:                  request.Model,
 		Effort:                 request.Effort,
+		WorkflowID:             request.WorkflowID,
 		RuntimeOverride:        overrideRuntime,
 		RuntimeOverrideRef:     overrideRef,
 		Cockpit:                request.Cockpit,
@@ -526,6 +528,7 @@ func enqueuePermissionBlockedLocalAgentJob(ctx context.Context, store *db.Store,
 		// --runtime explicitly asked it to stay off.
 		Model:              request.Model,
 		Effort:             request.Effort,
+		WorkflowID:         request.WorkflowID,
 		RuntimeOverride:    overrideRuntime,
 		RuntimeOverrideRef: overrideRef,
 	})

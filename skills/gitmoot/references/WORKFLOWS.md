@@ -1,5 +1,26 @@
 # Gitmoot Workflows
 
+## External-coordinator workflows
+
+Use `--workflow <label>` when an external coordinator needs one durable group
+across Gitmoot jobs without lifecycle state. The flag works on agent
+ask/run/review/implement, `orchestrate`, and `job open`; orchestration children
+and continuations inherit it.
+
+```sh
+gitmoot orchestrate planner "Run release checks." --repo owner/repo --workflow release-42
+gitmoot workflow note release-42 "Canary passed." --author operator --remember
+gitmoot workflow show release-42
+```
+
+The append-only journal stores text and authors verbatim. JSON show output keeps
+them verbatim; terminal text output sanitizes escapes/control bytes and caps each
+field to one line. `--remember` uses the
+normal low-trust prefilter/dedup path, defaults to the shared pool, and accepts
+`--agent NAME` for a registered agent's private pool. A single repo is inferred;
+otherwise `--repo` is required. Rejection writes no note, and note plus
+observation are atomic. V1 has no group lifecycle controls and allows reuse.
+
 ## First Repo Setup
 
 The supported one-liner is `gitmoot setup`, which registers the repo and an

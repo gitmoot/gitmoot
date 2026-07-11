@@ -46,6 +46,7 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 	title := fs.String("title", "", "optional human title for the job")
 	task := fs.String("task", "", "optional task id to associate")
 	pr := fs.Int("pr", 0, "optional pull request number")
+	workflowID := fs.String("workflow", "", "external-coordinator workflow label")
 	jsonOutput := fs.Bool("json", false, "print the created job as JSON")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -65,6 +66,14 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "job open requires --agent and --repo")
 		return 2
 	}
+	if flagWasSupplied(fs, "workflow") && strings.TrimSpace(*workflowID) == "" {
+		fmt.Fprintln(stderr, "job open: --workflow requires a non-blank value")
+		return 2
+	}
+	if err := workflow.ValidateWorkflowID(*workflowID); err != nil {
+		fmt.Fprintf(stderr, "job open: %v\n", err)
+		return 2
+	}
 
 	var out jobSessionOutput
 	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
@@ -82,6 +91,7 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 			TaskTitle:   strings.TrimSpace(*title),
 			PullRequest: *pr,
 			Sender:      "session",
+			WorkflowID:  strings.TrimSpace(*workflowID),
 		})
 		if err != nil {
 			return err
