@@ -71,6 +71,9 @@ type Spec struct {
 	// Schedule, when present, drives interval-based auto-runs (heartbeat idiom: an
 	// interval plus optional jitter; no cron in v1).
 	Schedule *Schedule `yaml:"schedule,omitempty"`
+	// Trigger, when present, declares an external event source materialized by
+	// Gitmoot. The MVP supports email through an owned Activepieces flow.
+	Trigger *Trigger `yaml:"trigger,omitempty"`
 	// AllowScheduledWrites, when true, permits MUTATING (implement) stages on a
 	// SCHEDULED pipeline (one carrying a schedule: block) (#768 safety layer 2).
 	// Absent (the default), a scheduled pipeline REJECTS any mutating stage at
@@ -98,6 +101,16 @@ type Schedule struct {
 	// Jitter is an optional random delay added to each interval (e.g. "15m"); must
 	// parse as a non-negative duration when set.
 	Jitter string `yaml:"jitter,omitempty"`
+}
+
+// Trigger is an external event source for a pipeline. Map is intentionally
+// decoded so validation can return the #863-specific error instead of treating
+// it as an unrelated unknown YAML field; no payload mapping is supported yet.
+type Trigger struct {
+	Kind       string            `yaml:"kind"`
+	Connection string            `yaml:"connection,omitempty"`
+	Mailbox    string            `yaml:"mailbox,omitempty"`
+	Map        map[string]string `yaml:"map,omitempty"`
 }
 
 // Stage is one step in the pipeline DAG. A stage is EITHER a shell step (cmd) or

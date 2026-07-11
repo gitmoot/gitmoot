@@ -2674,6 +2674,10 @@ repo: owner/repo            # optional to register; REQUIRED to actually run
 schedule:                   # optional; interval schedule (no cron in v1)
   interval: 24h             #   required when a schedule block is present (positive Go duration)
   jitter: 15m               #   optional random [0, jitter] added to each next_due (>= 0)
+trigger:                    # optional; generated Activepieces event source (requires repo:)
+  kind: email               #   only email in this release
+  connection: gmail-imap    #   optional; default gmail-imap
+  mailbox: INBOX            #   optional; default INBOX
 success_decisions:          # optional top-level default (see below)
   - approved
   - implemented
@@ -2701,6 +2705,9 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 | `repo`                      | pipeline     | no\*     | `owner/name` the stages run against. Optional to **register**, but **required to run** — stage jobs need a managed repo for the worker to claim them. |
 | `schedule.interval`         | pipeline     | cond.    | Required when a `schedule:` block is present. A positive Go duration (`24h`, `1h30m`). |
 | `schedule.jitter`           | pipeline     | no       | Random `[0, jitter]` added to each `next_due` to de-thunder (`>= 0`). |
+| `trigger.kind`              | pipeline     | cond.    | Required with `trigger:`. Only `email` is supported; it generates an owned Activepieces IMAP flow. |
+| `trigger.connection`        | pipeline     | no       | Activepieces connection external id; default `gmail-imap`. Must match `[A-Za-z0-9][A-Za-z0-9_-]*`. |
+| `trigger.mailbox`           | pipeline     | no       | IMAP mailbox; default `INBOX`. |
 | `success_decisions`         | pipeline     | no       | Decisions that mark a stage succeeded. Default `["approved","implemented","skipped"]`. Any value must be one of `approved`, `implemented`, `changes_requested`, `skipped` - `blocked`/`failed` are park states and are rejected. An explicit list is strict: omitting `skipped` requires real work and makes a skipped result fail. |
 | `allow_scheduled_writes`    | pipeline     | no       | Safety flag. A **mutating** `implement` or `produce` stage on a **scheduled** pipeline is rejected unless this is `true`. Manual runs do not need it. Default `false`. |
 | `allow_auto_merge`          | pipeline     | no       | Pipeline-level half of the auto-merge double key. Required with a gate's `merge: auto`; default `false`. It does not replace `allow_scheduled_writes` on scheduled pipelines. |
@@ -2733,6 +2740,14 @@ stage in `needs`, or `source` on another stage kind), an unknown/self/cyclic `ne
 timeout/interval/jitter, a negative retry, or a `success_decisions` value outside the
 allowed set — so a structural mistake surfaces as a clear error at registration
 rather than a stuck run later.
+
+`trigger.map` is deliberately rejected: generated flows do not pass an event
+payload into the pipeline yet ([#863](https://github.com/jerryfane/gitmoot/issues/863)).
+On `pipeline add --enable`, Gitmoot publishes the owned flow. An unavailable
+Activepieces instance leaves a pending binding; run
+`gitmoot pipeline bind-trigger <name>` to retry. Disable is local-first: the
+bridge rejects event-triggered runs even when Activepieces is unreachable.
+Rebinding recreates the owned flow if it was deleted in Activepieces.
 
 ### Agent stages
 
@@ -3090,6 +3105,7 @@ gitmoot pipeline add nightly-sync.yaml --enable
 gitmoot pipeline list [--json]
 gitmoot pipeline show <name> [--json]        # registry view for a pipeline name
 gitmoot pipeline show <run-id> [--json]      # run funnel for a "prun-…" run id
+gitmoot pipeline bind-trigger <name>         # create/re-sync the owned AP flow
 
 gitmoot pipeline run <name>                  # start a manual run; prints the run id
 gitmoot pipeline resume <run-id> [--from <stage>]
@@ -3229,7 +3245,7 @@ of `gitmoot agent list`**; `pipeline remove` disposes them.
 
 ## Observability
 
-- `gitmoot pipeline list` shows each pipeline's enabled state, interval, repo, and
+- `gitmoot pipeline list` shows each pipeline's enabled state, interval, repo, trigger binding, and
   last run status.
 - `gitmoot pipeline show <name>` shows the registry view (spec hash, schedule,
   last/next run bookkeeping, and the stage DAG).
@@ -3323,6 +3339,19 @@ The generated `.env` is also mode `0600`. Re-running setup preserves
 those values would make existing encrypted connections unreadable. Only the
 port and frontend URL are updated.
 
+For a headless declarative Gmail trigger, continue with:
+
+```sh
+gitmoot activepieces connect gmail
+gitmoot pipeline add triage-email.yaml --enable
+```
+
+`connect gmail` creates and live-validates `gmail-imap`. Add `--with-smtp` only
+for a manually built send flow; generated receive flows use IMAP only. A
+`trigger: {kind: email}` pipeline is materialized on enabled add, and
+`gitmoot pipeline bind-trigger <name>` explicitly repairs or re-syncs it,
+recreating the owned flow when its recorded Activepieces flow was deleted.
+
 ## Bridge architecture
 
 The Gitmoot bridge is intentionally local. On Linux, setup binds it to the
@@ -3405,7 +3434,8 @@ name already exists.
 This flow receives an unauthenticated Activepieces webhook and calls the
 Gitmoot piece's `run_pipeline` action. Edit the `<your-pipeline>` placeholder
 before publishing the flow. Add webhook authentication or an upstream access
-control when the endpoint is not confined to a trusted network.
+control when the endpoint is not confined to a trusted network. The target
+pipeline must be enabled; the bridge rejects runs for disabled pipelines.
 
 ### `gmail-imap-ask-agent`
 
@@ -3487,29 +3517,28 @@ application, or use a Google Workspace service account.
 
 | Path | Needs | Browser consent | Best for |
 | --- | --- | --- | --- |
-| **IMAP + SMTP app password (default)** | Google account with 2-Step Verification and app passwords allowed | No OAuth consent | The quickest self-hosted and headless setup |
+| **IMAP app password (default)** | Google account with 2-Step Verification and app passwords allowed | No OAuth consent | The quickest self-hosted and headless setup; SMTP is optional |
 | **Your own OAuth app** | Google Cloud project, Gmail API, OAuth client, reachable Activepieces URL | Once, then again if a Testing token expires | Teams that require OAuth or cannot use app passwords |
 | **Workspace service account** | Google Workspace super admin, service account, domain-wide delegation | No | Fully headless organization-managed mailboxes |
 
-## Default: IMAP + SMTP with an app password
+## Default: IMAP with an app password
 
 This path needs no Google Cloud project and no OAuth browser-consent flow.
 
 1. Turn on 2-Step Verification for the Gmail or Workspace account.
 2. Open [Google App Passwords](https://myaccount.google.com/apppasswords) and
    generate a 16-character app password for Activepieces.
-3. In Activepieces, create the IMAP trigger connection:
-   - Host: `imap.gmail.com`
-   - Port: `993`
-   - Security: SSL
-   - Username: the full Gmail or Workspace address
-   - Password: the app password, not the normal account password
-4. Create the SMTP action connection:
-   - Host: `smtp.gmail.com`
-   - Port: `465`
-   - Security: SSL
-   - Username: the full Gmail or Workspace address
-   - Password: the same app password
+3. Create and live-validate the IMAP connection from the CLI:
+
+   ```sh
+   gitmoot activepieces connect gmail
+   ```
+
+   The command prompts for the address and app password. For automation, pass
+   `--address` and `--password` (discouraged on shared command lines). It creates
+   `gmail-imap` at `imap.gmail.com:993` with TLS. Add `--with-smtp` only when a
+   manually built flow needs the optional `gmail-smtp` connection. Use
+   `--recreate` when replacing existing credentials.
 
 Port `587` with STARTTLS also works for SMTP. Google's
 [IMAP and SMTP reference](https://developers.google.com/workspace/gmail/imap/imap-smtp)
@@ -3585,25 +3614,44 @@ user within the scopes the administrator granted. It does not apply to personal
 [service-account delegation guide](https://developers.google.com/identity/protocols/oauth2/service-account#delegatingauthority)
 and [Workspace admin procedure](https://support.google.com/a/answer/162106).
 
-## Wire the flow
+## Declare and bind the flow
 
-First follow [Set Up Activepieces](./activepieces.md) to place Activepieces next
-to the bridge. Install the published `@gitmoot/piece-gitmoot` package using the
-[gitmoot-pieces README](https://github.com/jerryfane/gitmoot-pieces#building-and-publishing).
-The target pipeline must already be registered with gitmoot. See
-[Pipelines](./pipelines.md).
+First follow [Set Up Activepieces](./activepieces.md), then declare the trigger:
 
-In the Activepieces flow:
+```yaml
+name: triage-email
+repo: owner/repo
+trigger:
+  kind: email
+  connection: gmail-imap
+  mailbox: INBOX
+stages:
+  - id: triage
+    agent: reply-triager
+    prompt: Triage the new-mail event.
+```
 
-1. Add a Gmail **New Email** trigger, or an IMAP new-message trigger for the
-   app-password path.
-2. Add the gitmoot **Run Pipeline** action, `run_pipeline`, and set
-   `pipeline_name` to the registered pipeline name.
-3. Create the gitmoot custom-auth connection with:
-   - `bridge_url`: `http://host.docker.internal:8791`, or the same-host bridge
-     address that works from the container
-   - `bridge_token`: the bearer token created by `gitmoot bridge serve`
-4. Map only the email fields the pipeline needs into the action input.
+```sh
+gitmoot activepieces connect gmail
+gitmoot pipeline add triage-email.yaml --enable
+```
+
+The enabled add creates and publishes an owned `gitmoot: triage-email` flow. If
+Activepieces is unavailable, the pipeline remains registered with a pending
+binding; retry with `gitmoot pipeline bind-trigger triage-email`. Rebinding
+recreates the owned flow when its recorded flow was deleted in Activepieces.
+
+Payload mapping is not supported yet ([#863](https://github.com/jerryfane/gitmoot/issues/863));
+the generated action sends only `pipeline_name`. IMAP polling starts at enable
+time, so old mail is not replayed. Only one run may be active per pipeline; an
+overlapping second email is rejected rather than queued.
+
+### Manual wiring escape hatch
+
+For a custom, non-generated flow, add an IMAP/Gmail trigger and Gitmoot
+`run_pipeline` action in the UI. The target pipeline must be **enabled**; the
+bridge rejects `run_pipeline` requests for disabled pipelines. Generated-flow
+edits are overwritten by the next `pipeline bind-trigger`.
 
 To ask a managed agent directly instead, use `ask_agent` with `agent`, `message`,
 and `repo`. The bridge requires `repo`; use the full `owner/repo` value.
@@ -11095,6 +11143,10 @@ repo: owner/repo            # optional to register; REQUIRED to run
 schedule:                   # optional interval schedule (no cron in v1)
   interval: 24h             #   positive Go duration (required with a schedule block)
   jitter: 15m               #   optional random [0, jitter] added to next_due
+trigger:                    # optional generated Activepieces event source
+  kind: email               #   only supported kind
+  connection: gmail-imap    #   default gmail-imap
+  mailbox: INBOX            #   default INBOX
 stages:                     # the DAG, keyed by unique id and wired by needs
   - id: source
     cmd: "curl -sf https://example.com/data > data.json"
@@ -11124,6 +11176,7 @@ gitmoot pipeline add nightly-sync.yaml --enable   # validate + store; omit --ena
 gitmoot pipeline install-defaults                 # install built-in memory pipelines, skipping existing names
 gitmoot pipeline list [--json]
 gitmoot pipeline show nightly-sync [--json]        # registry view for a name
+gitmoot pipeline bind-trigger nightly-sync         # create/re-sync owned AP flow
 gitmoot pipeline run nightly-sync                  # start a manual run; prints the run id
 gitmoot pipeline show <run-id> [--json]            # run funnel for a "prun-…" id
 gitmoot pipeline resume <run-id> [--from <stage>]
@@ -11131,6 +11184,13 @@ gitmoot pipeline cancel <run-id>
 gitmoot pipeline enable|disable nightly-sync
 gitmoot pipeline remove nightly-sync
 ```
+
+An enabled `trigger.kind: email` pipeline auto-binds. If Activepieces is down,
+registration succeeds with a pending binding; `bind-trigger` retries it and
+recreates an owned flow deleted in Activepieces. Trigger
+payload `map:` is rejected until #863. Provision the default IMAP connection with
+`gitmoot activepieces connect gmail` (`--with-smtp` is optional and unused by the
+generated receive flow).
 
 `pipeline add` validates the whole spec at add time (unknown keys, duplicate/self/
 cyclic `needs`, a stage that is not exactly one of `cmd`/`agent`/`gate`, an agent stage
@@ -11486,6 +11546,7 @@ Linux). Built for the Activepieces piece seam (issue #785); to connect Gmail as 
 ```bash
 gitmoot activepieces setup [--port 8080] [--url http://localhost:8080] [--yes]
 gitmoot activepieces down [--volumes]
+gitmoot activepieces connect gmail [--address user@example.com] [--password app-password] [--with-smtp]
 gitmoot activepieces templates list
 gitmoot activepieces templates import [flags] [id...]
 ```
@@ -11496,6 +11557,11 @@ Compose stack, starts the Gitmoot bridge when needed, installs the public
 starter webhook and IMAP/SMTP flows. `--url` skips Docker for an existing local
 Activepieces instance. Cloud Activepieces cannot reach the local bridge without
 a separately secured path back to the host.
+
+`activepieces connect gmail` creates and live-validates the `gmail-imap`
+CUSTOM_AUTH connection. It prompts on a terminal; non-interactive use requires
+`--address` and `--password`. `--with-smtp` additionally creates `gmail-smtp`;
+the declarative receive-only trigger does not need it.
 
 `activepieces down` preserves data volumes unless `--volumes` is set.
 `templates import` skips flow display names that already exist. The email flow
@@ -12716,7 +12782,8 @@ the Workspace mailbox to impersonate.
 
 Wire the Gmail or IMAP new-email trigger to `run_pipeline` with
 `pipeline_name`, or use `ask_agent` with `agent`, `message`, and the required
-`repo`. Configure the piece's CustomAuth with `bridge_url` and `bridge_token`.
+`repo`. The target pipeline must be enabled; the bridge rejects `run_pipeline`
+for disabled pipelines. Configure the piece's CustomAuth with `bridge_url` and `bridge_token`.
 If the flow prepares a reply, default to **Create Draft** and never auto-send
 without explicit operator opt-in.
 

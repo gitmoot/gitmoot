@@ -56,6 +56,12 @@ func TestPipelineFreshCRUD(t *testing.T) {
 	if got.CreatedAt.IsZero() || got.UpdatedAt.IsZero() {
 		t.Fatalf("timestamps not populated: %+v", got)
 	}
+	if err := store.SetPipelineTriggerBinding(ctx, "deploy-flow", `{"state":"pending"}`); err != nil {
+		t.Fatalf("SetPipelineTriggerBinding: %v", err)
+	}
+	if got, _, _ := store.GetPipeline(ctx, "deploy-flow"); got.TriggerBinding != `{"state":"pending"}` {
+		t.Fatalf("trigger binding = %q", got.TriggerBinding)
+	}
 
 	list, err := store.ListPipelines(ctx)
 	if err != nil || len(list) != 1 || list[0].Name != "deploy-flow" {
@@ -206,5 +212,66 @@ func TestMigrateAddsPipelinesToUpgradedDB(t *testing.T) {
 	}
 	if _, ok, err := upgraded.GetPipeline(ctx, "deploy-flow"); err != nil || !ok {
 		t.Fatalf("GetPipeline on upgraded DB: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestMigrateAddsTriggerBindingToExistingPipeline(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gitmoot.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &Store{db: raw}
+	bindingIdx := -1
+	for i, migration := range migrations {
+		if strings.Contains(migration, "ADD COLUMN trigger_binding") {
+			bindingIdx = i
+			break
+		}
+	}
+	if bindingIdx < 0 {
+		t.Fatal("trigger binding migration not found")
+	}
+	for version, migration := range migrations[:bindingIdx] {
+		if err := store.applyMigration(ctx, version+1, migration); err != nil {
+			t.Fatalf("applyMigration(%d): %v", version+1, err)
+		}
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO pipelines(name, spec_yaml, spec_hash) VALUES ('legacy-trigger', 'name: legacy-trigger', 'old')`); err != nil {
+		t.Fatalf("seed pipeline: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	upgraded, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open upgraded DB: %v", err)
+	}
+	defer upgraded.Close()
+	columns, err := upgraded.db.QueryContext(ctx, `PRAGMA table_info(pipelines)`)
+	if err != nil {
+		t.Fatalf("PRAGMA table_info(pipelines): %v", err)
+	}
+	foundBinding := false
+	for columns.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := columns.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			columns.Close()
+			t.Fatal(err)
+		}
+		if name == "trigger_binding" {
+			foundBinding = notNull == 1 && defaultValue.Valid && defaultValue.String == "''"
+		}
+	}
+	columns.Close()
+	if !foundBinding {
+		t.Fatal("trigger_binding is missing NOT NULL DEFAULT '' in PRAGMA table_info(pipelines)")
+	}
+	rec, ok, err := upgraded.GetPipeline(ctx, "legacy-trigger")
+	if err != nil || !ok || rec.TriggerBinding != "" {
+		t.Fatalf("upgraded pipeline = %+v ok=%v err=%v", rec, ok, err)
 	}
 }

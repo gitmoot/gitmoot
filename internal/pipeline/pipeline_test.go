@@ -49,6 +49,34 @@ func TestLoadValidSpec(t *testing.T) {
 	}
 }
 
+func TestLoadEmailTriggerDefaultsAndValidation(t *testing.T) {
+	loaded, err := Load([]byte("name: mail\nrepo: jerryfane/gitmoot\ntrigger:\n  kind: email\nstages:\n  - {id: run, cmd: echo}\n"))
+	if err != nil {
+		t.Fatalf("Load email trigger: %v", err)
+	}
+	if loaded.Trigger == nil || loaded.Trigger.Connection != "gmail-imap" || loaded.Trigger.Mailbox != "INBOX" {
+		t.Fatalf("trigger defaults = %+v", loaded.Trigger)
+	}
+
+	cases := []struct{ name, trigger, want string }{
+		{"missing kind", "{}", "supported kinds: email"},
+		{"unknown kind", "{kind: webhook}", "supported kinds: email"},
+		{"unsafe connection", "{kind: email, connection: \"x']}}\"}", "must match"},
+		{"leading dash connection", "{kind: email, connection: -gmail}", "must match"},
+		{"leading underscore connection", "{kind: email, connection: _gmail}", "must match"},
+		{"mailbox expression", "{kind: email, mailbox: \"{{danger}}\"}", "must not contain"},
+		{"mapping", "{kind: email, map: {subject: '{{trigger.subject}}'}}", "issue #863"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load([]byte("name: mail\nrepo: jerryfane/gitmoot\ntrigger: " + tc.trigger + "\nstages:\n  - {id: run, cmd: echo}\n"))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Load error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 // TestLoadValidAgentSpec exercises the #757 agent-stage schema: an agent stage
 // with no explicit action defaults to "ask", an explicit review action is kept,
 // and shell + agent stages coexist in one DAG.
@@ -702,5 +730,14 @@ func TestEffectiveSuccessDecisions(t *testing.T) {
 	got[0] = "mutated"
 	if DefaultSuccessDecisions[0] == "mutated" {
 		t.Fatalf("EffectiveSuccessDecisions leaked the shared default slice")
+	}
+}
+
+// A trigger-bound pipeline without a repo would make the bridge 400 on every
+// email; validation refuses it at add time instead.
+func TestLoadEmailTriggerRequiresRepo(t *testing.T) {
+	_, err := Load([]byte("name: mail\ntrigger:\n  kind: email\nstages:\n  - {id: run, cmd: echo}\n"))
+	if err == nil || !strings.Contains(err.Error(), "declares a trigger but no repo") {
+		t.Fatalf("Load error = %v, want repo-required error", err)
 	}
 }

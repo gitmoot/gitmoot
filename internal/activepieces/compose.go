@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -167,6 +168,17 @@ func parseEnv(raw []byte) map[string]string {
 	return values
 }
 
+// StackFrontendURL returns the frontend URL recorded by WriteStack. A missing
+// or unreadable stack environment is the empty string so callers can fall back
+// to their normal default without making local setup discovery mandatory.
+func StackFrontendURL(stackDir string) string {
+	raw, err := os.ReadFile(filepath.Join(stackDir, ".env"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(parseEnv(raw)["AP_FRONTEND_URL"])
+}
+
 func writeSecretFile(path string, body []byte) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".activepieces-env-*")
 	if err != nil {
@@ -248,7 +260,18 @@ func runDockerCompose(ctx context.Context, args []string) error {
 }
 
 func ResolveLatestPieceVersion(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pieceRegistryURL, nil)
+	return ResolveLatestNpmVersion(ctx, "@gitmoot/piece-gitmoot")
+}
+
+// ResolveLatestNpmVersion returns the npm dist-tags "latest" version of any
+// package. Community pieces (IMAP, SMTP) install from npm the same way the
+// gitmoot piece does, so connection helpers resolve their exact version here.
+func ResolveLatestNpmVersion(ctx context.Context, packageName string) (string, error) {
+	registryURL := "https://registry.npmjs.org/-/package/" + url.PathEscape(packageName) + "/dist-tags"
+	if packageName == "@gitmoot/piece-gitmoot" {
+		registryURL = pieceRegistryURL
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, registryURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrLatestPieceVersionUnavailable, err)
 	}

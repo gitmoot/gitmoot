@@ -12,6 +12,13 @@ services:
     environment:
       AP_ENVIRONMENT: prod
       AP_FRONTEND_URL: ${AP_FRONTEND_URL}
+      # Engine/worker self-calls (run progress + log uploads) must resolve
+      # inside the container; the published host port does not exist there.
+      # Without this every flow run dies with INTERNAL_ERROR on a local stack.
+      AP_INTERNAL_URL: http://localhost:80
+      # Poll cadence for polling triggers (minutes); AP's default is 5.
+      # Overridable from .env so live tests can shorten the wait.
+      AP_TRIGGER_DEFAULT_POLL_INTERVAL: ${AP_TRIGGER_DEFAULT_POLL_INTERVAL:-5}
       AP_ENCRYPTION_KEY: ${AP_ENCRYPTION_KEY}
       AP_JWT_SECRET: ${AP_JWT_SECRET}
       AP_EXECUTION_MODE: UNSANDBOXED

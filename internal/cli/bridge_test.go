@@ -118,7 +118,7 @@ func TestBridgeEndpointsWithSeededHome(t *testing.T) {
 		pipelineE2EStage("source", pipelineStageResultCmd("approved", "source ok", nil), "")
 	specFile := writeSpec(t, specYAML)
 	var out, errBuf bytes.Buffer
-	if code := Run([]string{"pipeline", "add", specFile, "--home", home}, &out, &errBuf); code != 0 {
+	if code := Run([]string{"pipeline", "add", specFile, "--enable", "--home", home}, &out, &errBuf); code != 0 {
 		t.Fatalf("pipeline add exit=%d stderr=%s", code, errBuf.String())
 	}
 
@@ -195,7 +195,7 @@ func TestBridgePipelineOverlapReturnsConflict(t *testing.T) {
 		pipelineE2EStage("source", pipelineStageResultCmd("approved", "source ok", nil), "")
 	specFile := writeSpec(t, specYAML)
 	var out, errBuf bytes.Buffer
-	if code := Run([]string{"pipeline", "add", specFile, "--home", home}, &out, &errBuf); code != 0 {
+	if code := Run([]string{"pipeline", "add", specFile, "--enable", "--home", home}, &out, &errBuf); code != 0 {
 		t.Fatalf("pipeline add exit=%d stderr=%s", code, errBuf.String())
 	}
 	first := bridgeDo(t, handler, bridgeRequest(http.MethodPost, "/v1/pipelines/bridge-flow/run", strings.NewReader(`{}`)))
@@ -205,6 +205,27 @@ func TestBridgePipelineOverlapReturnsConflict(t *testing.T) {
 	second := bridgeDo(t, handler, bridgeRequest(http.MethodPost, "/v1/pipelines/bridge-flow/run", strings.NewReader(`{}`)))
 	if second.Code != http.StatusConflict {
 		t.Fatalf("second run status=%d, want 409 body=%s", second.Code, second.Body.String())
+	}
+}
+
+func TestBridgePipelineRejectsDisabledPipeline(t *testing.T) {
+	home, _, store := heartbeatLoopE2EHome(t)
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	handler := newBridgeHandler(home, store, bridgeTestToken, nil)
+	specYAML := "name: disabled-flow\nrepo: owner/repo\nstages:\n" +
+		pipelineE2EStage("source", pipelineStageResultCmd("approved", "source ok", nil), "")
+	specFile := writeSpec(t, specYAML)
+	var out, errBuf bytes.Buffer
+	if code := Run([]string{"pipeline", "add", specFile, "--home", home}, &out, &errBuf); code != 0 {
+		t.Fatalf("pipeline add exit=%d stderr=%s", code, errBuf.String())
+	}
+	resp := bridgeDo(t, handler, bridgeRequest(http.MethodPost, "/v1/pipelines/disabled-flow/run", strings.NewReader(`{}`)))
+	if resp.Code == http.StatusOK || !strings.Contains(resp.Body.String(), "disabled") {
+		t.Fatalf("disabled run status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if _, ok, err := store.ActivePipelineRun(context.Background(), "disabled-flow"); err != nil || ok {
+		t.Fatalf("disabled pipeline created a run: ok=%v err=%v", ok, err)
 	}
 }
 

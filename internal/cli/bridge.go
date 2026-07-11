@@ -346,6 +346,9 @@ func runBridgePipeline(ctx context.Context, store *db.Store, rawHome, name strin
 	if !ok {
 		return "", sql.ErrNoRows
 	}
+	if !rec.Enabled {
+		return "", fmt.Errorf("pipeline %s is disabled", name)
+	}
 	if strings.TrimSpace(rec.Repo) == "" {
 		return "", fmt.Errorf("pipeline %s has no repo; stages need a managed repo to run", name)
 	}

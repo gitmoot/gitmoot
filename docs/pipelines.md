@@ -35,6 +35,10 @@ repo: owner/repo            # optional to register; REQUIRED to actually run
 schedule:                   # optional; interval schedule (no cron in v1)
   interval: 24h             #   required when a schedule block is present (positive Go duration)
   jitter: 15m               #   optional random [0, jitter] added to each next_due (>= 0)
+trigger:                    # optional; generated Activepieces event source (requires repo:)
+  kind: email               #   only email in this release
+  connection: gmail-imap    #   optional; default gmail-imap
+  mailbox: INBOX            #   optional; default INBOX
 success_decisions:          # optional top-level default (see below)
   - approved
   - implemented
@@ -62,6 +66,9 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 | `repo`                      | pipeline     | no\*     | `owner/name` the stages run against. Optional to **register**, but **required to run** — stage jobs need a managed repo for the worker to claim them. |
 | `schedule.interval`         | pipeline     | cond.    | Required when a `schedule:` block is present. A positive Go duration (`24h`, `1h30m`). |
 | `schedule.jitter`           | pipeline     | no       | Random `[0, jitter]` added to each `next_due` to de-thunder (`>= 0`). |
+| `trigger.kind`              | pipeline     | cond.    | Required with `trigger:`. Only `email` is supported; it generates an owned Activepieces IMAP flow. |
+| `trigger.connection`        | pipeline     | no       | Activepieces connection external id; default `gmail-imap`. Must match `[A-Za-z0-9][A-Za-z0-9_-]*`. |
+| `trigger.mailbox`           | pipeline     | no       | IMAP mailbox; default `INBOX`. |
 | `success_decisions`         | pipeline     | no       | Decisions that mark a stage succeeded. Default `["approved","implemented","skipped"]`. Any value must be one of `approved`, `implemented`, `changes_requested`, `skipped` - `blocked`/`failed` are park states and are rejected. An explicit list is strict: omitting `skipped` requires real work and makes a skipped result fail. |
 | `allow_scheduled_writes`    | pipeline     | no       | Safety flag. A **mutating** `implement` or `produce` stage on a **scheduled** pipeline is rejected unless this is `true`. Manual runs do not need it. Default `false`. |
 | `allow_auto_merge`          | pipeline     | no       | Pipeline-level half of the auto-merge double key. Required with a gate's `merge: auto`; default `false`. It does not replace `allow_scheduled_writes` on scheduled pipelines. |
@@ -94,6 +101,14 @@ stage in `needs`, or `source` on another stage kind), an unknown/self/cyclic `ne
 timeout/interval/jitter, a negative retry, or a `success_decisions` value outside the
 allowed set — so a structural mistake surfaces as a clear error at registration
 rather than a stuck run later.
+
+`trigger.map` is deliberately rejected: generated flows do not pass an event
+payload into the pipeline yet ([#863](https://github.com/jerryfane/gitmoot/issues/863)).
+On `pipeline add --enable`, Gitmoot publishes the owned flow. An unavailable
+Activepieces instance leaves a pending binding; run
+`gitmoot pipeline bind-trigger <name>` to retry. Disable is local-first: the
+bridge rejects event-triggered runs even when Activepieces is unreachable.
+Rebinding recreates the owned flow if it was deleted in Activepieces.
 
 ### Agent stages
 
@@ -451,6 +466,7 @@ gitmoot pipeline add nightly-sync.yaml --enable
 gitmoot pipeline list [--json]
 gitmoot pipeline show <name> [--json]        # registry view for a pipeline name
 gitmoot pipeline show <run-id> [--json]      # run funnel for a "prun-…" run id
+gitmoot pipeline bind-trigger <name>         # create/re-sync the owned AP flow
 
 gitmoot pipeline run <name>                  # start a manual run; prints the run id
 gitmoot pipeline resume <run-id> [--from <stage>]
@@ -590,7 +606,7 @@ of `gitmoot agent list`**; `pipeline remove` disposes them.
 
 ## Observability
 
-- `gitmoot pipeline list` shows each pipeline's enabled state, interval, repo, and
+- `gitmoot pipeline list` shows each pipeline's enabled state, interval, repo, trigger binding, and
   last run status.
 - `gitmoot pipeline show <name>` shows the registry view (spec hash, schedule,
   last/next run bookkeeping, and the stage DAG).

@@ -41,29 +41,28 @@ application, or use a Google Workspace service account.
 
 | Path | Needs | Browser consent | Best for |
 | --- | --- | --- | --- |
-| **IMAP + SMTP app password (default)** | Google account with 2-Step Verification and app passwords allowed | No OAuth consent | The quickest self-hosted and headless setup |
+| **IMAP app password (default)** | Google account with 2-Step Verification and app passwords allowed | No OAuth consent | The quickest self-hosted and headless setup; SMTP is optional |
 | **Your own OAuth app** | Google Cloud project, Gmail API, OAuth client, reachable Activepieces URL | Once, then again if a Testing token expires | Teams that require OAuth or cannot use app passwords |
 | **Workspace service account** | Google Workspace super admin, service account, domain-wide delegation | No | Fully headless organization-managed mailboxes |
 
-## Default: IMAP + SMTP with an app password
+## Default: IMAP with an app password
 
 This path needs no Google Cloud project and no OAuth browser-consent flow.
 
 1. Turn on 2-Step Verification for the Gmail or Workspace account.
 2. Open [Google App Passwords](https://myaccount.google.com/apppasswords) and
    generate a 16-character app password for Activepieces.
-3. In Activepieces, create the IMAP trigger connection:
-   - Host: `imap.gmail.com`
-   - Port: `993`
-   - Security: SSL
-   - Username: the full Gmail or Workspace address
-   - Password: the app password, not the normal account password
-4. Create the SMTP action connection:
-   - Host: `smtp.gmail.com`
-   - Port: `465`
-   - Security: SSL
-   - Username: the full Gmail or Workspace address
-   - Password: the same app password
+3. Create and live-validate the IMAP connection from the CLI:
+
+   ```sh
+   gitmoot activepieces connect gmail
+   ```
+
+   The command prompts for the address and app password. For automation, pass
+   `--address` and `--password` (discouraged on shared command lines). It creates
+   `gmail-imap` at `imap.gmail.com:993` with TLS. Add `--with-smtp` only when a
+   manually built flow needs the optional `gmail-smtp` connection. Use
+   `--recreate` when replacing existing credentials.
 
 Port `587` with STARTTLS also works for SMTP. Google's
 [IMAP and SMTP reference](https://developers.google.com/workspace/gmail/imap/imap-smtp)
@@ -139,25 +138,44 @@ user within the scopes the administrator granted. It does not apply to personal
 [service-account delegation guide](https://developers.google.com/identity/protocols/oauth2/service-account#delegatingauthority)
 and [Workspace admin procedure](https://support.google.com/a/answer/162106).
 
-## Wire the flow
+## Declare and bind the flow
 
-First follow [Set Up Activepieces](./activepieces.md) to place Activepieces next
-to the bridge. Install the published `@gitmoot/piece-gitmoot` package using the
-[gitmoot-pieces README](https://github.com/jerryfane/gitmoot-pieces#building-and-publishing).
-The target pipeline must already be registered with gitmoot. See
-[Pipelines](./pipelines.md).
+First follow [Set Up Activepieces](./activepieces.md), then declare the trigger:
 
-In the Activepieces flow:
+```yaml
+name: triage-email
+repo: owner/repo
+trigger:
+  kind: email
+  connection: gmail-imap
+  mailbox: INBOX
+stages:
+  - id: triage
+    agent: reply-triager
+    prompt: Triage the new-mail event.
+```
 
-1. Add a Gmail **New Email** trigger, or an IMAP new-message trigger for the
-   app-password path.
-2. Add the gitmoot **Run Pipeline** action, `run_pipeline`, and set
-   `pipeline_name` to the registered pipeline name.
-3. Create the gitmoot custom-auth connection with:
-   - `bridge_url`: `http://host.docker.internal:8791`, or the same-host bridge
-     address that works from the container
-   - `bridge_token`: the bearer token created by `gitmoot bridge serve`
-4. Map only the email fields the pipeline needs into the action input.
+```sh
+gitmoot activepieces connect gmail
+gitmoot pipeline add triage-email.yaml --enable
+```
+
+The enabled add creates and publishes an owned `gitmoot: triage-email` flow. If
+Activepieces is unavailable, the pipeline remains registered with a pending
+binding; retry with `gitmoot pipeline bind-trigger triage-email`. Rebinding
+recreates the owned flow when its recorded flow was deleted in Activepieces.
+
+Payload mapping is not supported yet ([#863](https://github.com/jerryfane/gitmoot/issues/863));
+the generated action sends only `pipeline_name`. IMAP polling starts at enable
+time, so old mail is not replayed. Only one run may be active per pipeline; an
+overlapping second email is rejected rather than queued.
+
+### Manual wiring escape hatch
+
+For a custom, non-generated flow, add an IMAP/Gmail trigger and Gitmoot
+`run_pipeline` action in the UI. The target pipeline must be **enabled**; the
+bridge rejects `run_pipeline` requests for disabled pipelines. Generated-flow
+edits are overwritten by the next `pipeline bind-trigger`.
 
 To ask a managed agent directly instead, use `ask_agent` with `agent`, `message`,
 and `repo`. The bridge requires `repo`; use the full `owner/repo` value.

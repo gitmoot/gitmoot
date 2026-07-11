@@ -28,6 +28,10 @@ repo: owner/repo            # optional to register; REQUIRED to run
 schedule:                   # optional; auto-runs every interval once enabled
   interval: 24h             #   positive Go duration (required with a schedule block)
   jitter: 15m               #   optional random [0, jitter] added to each next_due
+trigger:                    # optional; generated Activepieces event source (requires repo:)
+  kind: email               #   only email in this release
+  connection: gmail-imap    #   optional; default gmail-imap
+  mailbox: INBOX            #   optional; default INBOX
 stages:                     # the DAG, keyed by unique id and wired by needs
   - id: source
     cmd: "curl -sf https://example.com/data > data.json"
@@ -71,6 +75,7 @@ editing the file later never mutates an in-flight run.
 gitmoot pipeline list [--json]
 gitmoot pipeline show <name> [--json]        # registry view for a pipeline name
 gitmoot pipeline show <run-id> [--json]      # run funnel for a "prun-…" run id
+gitmoot pipeline bind-trigger <name>         # create/re-sync the owned AP flow
 gitmoot pipeline install-defaults            # install built-in memory pipelines
 gitmoot pipeline run <name>                  # start a manual run; prints the run id
 gitmoot pipeline resume <run-id> [--from <stage>]
@@ -86,6 +91,16 @@ already has an active run (one active run per pipeline). `pipeline add` also
 auto-creates one hidden shell runner agent per pipeline (`pipeline-<name>-runner`)
 that owns the stage jobs; it is filtered out of `gitmoot agent list` and disposed by
 `pipeline remove`.
+
+An enabled pipeline with `trigger.kind: email` auto-binds an owned Activepieces
+flow. If Activepieces is unavailable, local registration succeeds with a
+pending binding and prints the `pipeline bind-trigger` repair command. The
+connection id must be name-safe because it is embedded in an Activepieces
+expression. A `map:` block is rejected: payload mapping is reserved for
+[#863](https://github.com/jerryfane/gitmoot/issues/863). `pipeline disable`
+updates the local registry first, so bridge-triggered runs fail closed even if
+Activepieces cannot be reached to disable its listener. Rebinding recreates the
+owned flow if it was deleted in Activepieces.
 
 `pipeline install-defaults` installs Gitmoot's built-in memory pipelines:
 `memory-ingest-sweep` and `memory-groom-propose`. The daemon also runs that

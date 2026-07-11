@@ -39,6 +39,8 @@ func runPipeline(args []string, stdout, stderr io.Writer) int {
 		return runPipelineRunCmd(args[1:], stdout, stderr)
 	case "show":
 		return runPipelineShow(args[1:], stdout, stderr)
+	case "bind-trigger":
+		return runPipelineBindTrigger(args[1:], stdout, stderr)
 	case "resume":
 		return runPipelineResume(args[1:], stdout, stderr)
 	case "cancel":
@@ -63,6 +65,7 @@ func printPipelineUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot pipeline list [--json]")
 	fmt.Fprintln(w, "  gitmoot pipeline run <name>")
 	fmt.Fprintln(w, "  gitmoot pipeline show <name|run-id> [--json]")
+	fmt.Fprintln(w, "  gitmoot pipeline bind-trigger <name>")
 	fmt.Fprintln(w, "  gitmoot pipeline resume <run-id> [--from <stage>]")
 	fmt.Fprintln(w, "  gitmoot pipeline cancel <run-id>")
 	fmt.Fprintln(w, "  gitmoot pipeline enable <name>")
@@ -194,6 +197,7 @@ func runPipelineAdd(args []string, stdout, stderr io.Writer) int {
 	runnerName := pipelineRunnerAgentName(spec.Name)
 	var finalEnabled bool
 	if err := withStore(*home, func(store *db.Store) error {
+		ctx := context.Background()
 		if err := validatePipelineProducePaths(context.Background(), store, *home, spec); err != nil {
 			return err
 		}
@@ -225,24 +229,40 @@ func runPipelineAdd(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintf(stderr, "warning: stage %q references agent %q which does not exist yet; create it before the pipeline runs (gitmoot agent ...)\n", stage.ID, stage.Agent)
 			}
 		}
-		if err := store.CreateOrUpdatePipeline(context.Background(), record); err != nil {
+		previous, previousFound, err := store.GetPipeline(ctx, spec.Name)
+		if err != nil {
 			return err
 		}
-		if err := store.UpsertAgent(context.Background(), pipelineRunnerAgent(runnerName, repo)); err != nil {
+		if err := store.CreateOrUpdatePipeline(ctx, record); err != nil {
+			return err
+		}
+		if err := store.UpsertAgent(ctx, pipelineRunnerAgent(runnerName, repo)); err != nil {
 			return err
 		}
 		if *enable {
-			if err := store.SetPipelineEnabled(context.Background(), spec.Name, true); err != nil {
+			if err := store.SetPipelineEnabled(ctx, spec.Name, true); err != nil {
 				return err
 			}
 		}
 		// Report the RESULTING enabled state, not just this invocation's --enable:
 		// re-adding an edited spec preserves an already-enabled pipeline.
-		saved, _, err := store.GetPipeline(context.Background(), spec.Name)
+		saved, _, err := store.GetPipeline(ctx, spec.Name)
 		if err != nil {
 			return err
 		}
 		finalEnabled = saved.Enabled
+		if finalEnabled && spec.Trigger != nil {
+			if _, bindErr := bindPipelineTrigger(ctx, store, saved, activepiecesAuthOptions{Home: *home}, triggerBindingPending); bindErr != nil {
+				fmt.Fprintf(stderr, "warning: pipeline %s was registered but its trigger is pending: %v; retry with `gitmoot pipeline bind-trigger %s`\n", spec.Name, bindErr, spec.Name)
+			}
+		}
+		if spec.Trigger == nil && previousFound && strings.TrimSpace(previous.TriggerBinding) != "" {
+			if cleanupErr := cleanupPipelineTrigger(ctx, store, previous, activepiecesAuthOptions{Home: *home}); cleanupErr != nil {
+				fmt.Fprintf(stderr, "warning: pipeline %s no longer declares a trigger, but its stale Activepieces flow could not be removed: %v; retry cleanup with `gitmoot pipeline bind-trigger %s`\n", spec.Name, cleanupErr, spec.Name)
+			} else {
+				writeLine(stdout, "cleaned up stale trigger flow for pipeline %s", spec.Name)
+			}
+		}
 		return nil
 	}); err != nil {
 		fmt.Fprintf(stderr, "pipeline add: %v\n", err)
@@ -390,17 +410,18 @@ type pipelineStageJSON struct {
 }
 
 type pipelineJSON struct {
-	Name       string              `json:"name"`
-	Repo       string              `json:"repo,omitempty"`
-	Enabled    bool                `json:"enabled"`
-	Interval   string              `json:"interval,omitempty"`
-	Jitter     string              `json:"jitter,omitempty"`
-	SpecHash   string              `json:"spec_hash"`
-	Stages     []pipelineStageJSON `json:"stages,omitempty"`
-	LastRunAt  string              `json:"last_run_at,omitempty"`
-	NextDueAt  string              `json:"next_due_at,omitempty"`
-	LastRunID  string              `json:"last_run_id,omitempty"`
-	LastStatus string              `json:"last_status,omitempty"`
+	Name                string              `json:"name"`
+	Repo                string              `json:"repo,omitempty"`
+	Enabled             bool                `json:"enabled"`
+	Interval            string              `json:"interval,omitempty"`
+	Jitter              string              `json:"jitter,omitempty"`
+	SpecHash            string              `json:"spec_hash"`
+	Stages              []pipelineStageJSON `json:"stages,omitempty"`
+	LastRunAt           string              `json:"last_run_at,omitempty"`
+	NextDueAt           string              `json:"next_due_at,omitempty"`
+	LastRunID           string              `json:"last_run_id,omitempty"`
+	LastStatus          string              `json:"last_status,omitempty"`
+	TriggerBindingState string              `json:"trigger_binding_state,omitempty"`
 }
 
 func runPipelineList(args []string, stdout, stderr io.Writer) int {
@@ -435,7 +456,7 @@ func runPipelineList(args []string, stdout, stderr io.Writer) int {
 		return encodePipelineJSON(stdout, stderr, out)
 	}
 	for _, p := range pipelines {
-		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\n", p.Name, enabledLabel(p.Enabled), firstNonEmpty(p.Interval, "-"), firstNonEmpty(p.Repo, "-"), firstNonEmpty(p.LastStatus, "-"))
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%s\n", p.Name, enabledLabel(p.Enabled), firstNonEmpty(p.Interval, "-"), firstNonEmpty(p.Repo, "-"), firstNonEmpty(p.LastStatus, "-"), firstNonEmpty(triggerBindingState(p.TriggerBinding), "-"))
 	}
 	return 0
 }
@@ -515,6 +536,10 @@ func runPipelineSetEnabled(args []string, enabled bool, stdout, stderr io.Writer
 	fs := flag.NewFlagSet("pipeline "+verb, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	apURL := fs.String("url", "", "Activepieces URL")
+	port := fs.Int("port", defaultActivepiecesPort, "local Activepieces port")
+	email := fs.String("email", defaultActivepiecesEmail, "Activepieces admin email")
+	password := fs.String("password", "", "Activepieces admin password (uses saved credentials when omitted)")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		printPipelineUsage(stderr)
 		if len(args) == 0 {
@@ -523,19 +548,58 @@ func runPipelineSetEnabled(args []string, enabled bool, stdout, stderr io.Writer
 		}
 		return 0
 	}
-	name := strings.TrimSpace(args[0])
-	if err := fs.Parse(args[1:]); err != nil {
+	parsed, reorderErr := reorderFlagArgs(args, map[string]struct{}{"home": {}, "url": {}, "port": {}, "email": {}, "password": {}}, nil)
+	if reorderErr != nil {
+		fmt.Fprintf(stderr, "pipeline %s: %v\n", verb, reorderErr)
+		return 2
+	}
+	if err := fs.Parse(parsed); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 2
 	}
-	if fs.NArg() != 0 {
+	if fs.NArg() != 1 {
 		fmt.Fprintf(stderr, "pipeline %s accepts exactly one name\n", verb)
 		return 2
 	}
+	name := strings.TrimSpace(fs.Arg(0))
 	if err := withStore(*home, func(store *db.Store) error {
-		return store.SetPipelineEnabled(context.Background(), name, enabled)
+		ctx := context.Background()
+		rec, ok, err := store.GetPipeline(ctx, name)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("pipeline %s not found", name)
+		}
+		auth := activepiecesAuthOptions{Home: *home, URL: *apURL, Port: *port, Email: *email, Password: *password}
+		if !enabled {
+			// Fail closed: the local bridge rejects runs immediately even if AP is
+			// unreachable and cannot be switched off.
+			if err := store.SetPipelineEnabled(ctx, name, false); err != nil {
+				return err
+			}
+			if strings.TrimSpace(rec.TriggerBinding) != "" {
+				if err := disablePipelineTrigger(ctx, store, rec, auth); err != nil {
+					fmt.Fprintf(stderr, "warning: pipeline %s is disabled locally, but Activepieces flow disable failed: %v\n", name, err)
+				}
+			}
+			return nil
+		}
+		spec, loadErr := pipeline.Load([]byte(rec.SpecYAML))
+		if loadErr != nil {
+			if strings.TrimSpace(rec.TriggerBinding) == "" {
+				return store.SetPipelineEnabled(ctx, name, true)
+			}
+			return loadErr
+		}
+		if spec.Trigger != nil {
+			if _, err := bindPipelineTrigger(ctx, store, rec, auth, triggerBindingError); err != nil {
+				return err
+			}
+		}
+		return store.SetPipelineEnabled(ctx, name, true)
 	}); err != nil {
 		fmt.Fprintf(stderr, "pipeline %s: %v\n", verb, err)
 		return 1
@@ -548,6 +612,10 @@ func runPipelineRemove(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("pipeline remove", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	apURL := fs.String("url", "", "Activepieces URL")
+	port := fs.Int("port", defaultActivepiecesPort, "local Activepieces port")
+	email := fs.String("email", defaultActivepiecesEmail, "Activepieces admin email")
+	password := fs.String("password", "", "Activepieces admin password (uses saved credentials when omitted)")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		printPipelineUsage(stderr)
 		if len(args) == 0 {
@@ -556,20 +624,30 @@ func runPipelineRemove(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	name := strings.TrimSpace(args[0])
-	if err := fs.Parse(args[1:]); err != nil {
+	parsed, reorderErr := reorderFlagArgs(args, map[string]struct{}{"home": {}, "url": {}, "port": {}, "email": {}, "password": {}}, nil)
+	if reorderErr != nil {
+		fmt.Fprintf(stderr, "pipeline remove: %v\n", reorderErr)
+		return 2
+	}
+	if err := fs.Parse(parsed); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 2
 	}
-	if fs.NArg() != 0 {
+	if fs.NArg() != 1 {
 		fmt.Fprintln(stderr, "pipeline remove accepts exactly one name")
 		return 2
 	}
+	name := strings.TrimSpace(fs.Arg(0))
 	var removed bool
+	var removedRecord db.Pipeline
 	if err := withStore(*home, func(store *db.Store) error {
 		var err error
+		removedRecord, _, err = store.GetPipeline(context.Background(), name)
+		if err != nil {
+			return err
+		}
 		removed, err = store.DeletePipeline(context.Background(), name)
 		if err != nil {
 			return err
@@ -578,6 +656,13 @@ func runPipelineRemove(args []string, stdout, stderr io.Writer) int {
 		// leak it. Ignore the outcome — the pipeline row is what `remove` is about, and
 		// leaving an orphan runner is harmless (run/job cleanup lands in the run step).
 		_, _ = store.RemoveAgent(context.Background(), pipelineRunnerAgentName(name))
+		if removed && strings.TrimSpace(removedRecord.TriggerBinding) != "" {
+			auth := activepiecesAuthOptions{Home: *home, URL: *apURL, Port: *port, Email: *email, Password: *password}
+			if cleanupErr := deletePipelineTrigger(context.Background(), removedRecord, auth); cleanupErr != nil {
+				binding, _ := decodeTriggerBinding(removedRecord.TriggerBinding)
+				fmt.Fprintf(stderr, "warning: removed pipeline %s locally, but Activepieces flow %s needs manual cleanup: %v\n", name, binding.FlowID, cleanupErr)
+			}
+		}
 		return nil
 	}); err != nil {
 		fmt.Fprintf(stderr, "pipeline remove: %v\n", err)
@@ -597,16 +682,17 @@ func runPipelineRemove(args []string, stdout, stderr io.Writer) int {
 // failing the command.
 func pipelineToJSON(record db.Pipeline, withStages bool) pipelineJSON {
 	out := pipelineJSON{
-		Name:       record.Name,
-		Repo:       record.Repo,
-		Enabled:    record.Enabled,
-		Interval:   record.Interval,
-		Jitter:     record.Jitter,
-		SpecHash:   record.SpecHash,
-		LastRunAt:  heartbeatTimeForStatus(record.LastRunAt),
-		NextDueAt:  heartbeatTimeForStatus(record.NextDueAt),
-		LastRunID:  record.LastRunID,
-		LastStatus: record.LastStatus,
+		Name:                record.Name,
+		Repo:                record.Repo,
+		Enabled:             record.Enabled,
+		Interval:            record.Interval,
+		Jitter:              record.Jitter,
+		SpecHash:            record.SpecHash,
+		LastRunAt:           heartbeatTimeForStatus(record.LastRunAt),
+		NextDueAt:           heartbeatTimeForStatus(record.NextDueAt),
+		LastRunID:           record.LastRunID,
+		LastStatus:          record.LastStatus,
+		TriggerBindingState: triggerBindingState(record.TriggerBinding),
 	}
 	if out.LastRunAt == "-" {
 		out.LastRunAt = ""
@@ -650,6 +736,7 @@ func printPipeline(stdout io.Writer, record db.Pipeline) {
 	writeLine(stdout, "next_due: %s", heartbeatTimeForStatus(record.NextDueAt))
 	writeLine(stdout, "last_status: %s", firstNonEmpty(record.LastStatus, "-"))
 	writeLine(stdout, "last_run_id: %s", firstNonEmpty(record.LastRunID, "-"))
+	writeLine(stdout, "trigger_binding: %s", firstNonEmpty(triggerBindingState(record.TriggerBinding), "-"))
 	writeLine(stdout, "stages:")
 	spec, err := pipeline.Load([]byte(record.SpecYAML))
 	if err != nil {

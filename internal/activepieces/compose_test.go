@@ -81,6 +81,19 @@ func TestWriteStackPreservesExistingSecrets(t *testing.T) {
 	}
 }
 
+func TestStackFrontendURL(t *testing.T) {
+	dir := t.TempDir()
+	if got := StackFrontendURL(dir); got != "" {
+		t.Fatalf("StackFrontendURL(missing) = %q, want empty", got)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("# stack\nAP_PORT=9090\nAP_FRONTEND_URL=http://localhost:9090\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := StackFrontendURL(dir); got != "http://localhost:9090" {
+		t.Fatalf("StackFrontendURL = %q", got)
+	}
+}
+
 func TestResolveLatestPieceVersion(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/dist-tags" {

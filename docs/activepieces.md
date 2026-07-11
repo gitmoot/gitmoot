@@ -36,6 +36,19 @@ The generated `.env` is also mode `0600`. Re-running setup preserves
 those values would make existing encrypted connections unreadable. Only the
 port and frontend URL are updated.
 
+For a headless declarative Gmail trigger, continue with:
+
+```sh
+gitmoot activepieces connect gmail
+gitmoot pipeline add triage-email.yaml --enable
+```
+
+`connect gmail` creates and live-validates `gmail-imap`. Add `--with-smtp` only
+for a manually built send flow; generated receive flows use IMAP only. A
+`trigger: {kind: email}` pipeline is materialized on enabled add, and
+`gitmoot pipeline bind-trigger <name>` explicitly repairs or re-syncs it,
+recreating the owned flow when its recorded Activepieces flow was deleted.
+
 ## Bridge architecture
 
 The Gitmoot bridge is intentionally local. On Linux, setup binds it to the
@@ -118,7 +131,8 @@ name already exists.
 This flow receives an unauthenticated Activepieces webhook and calls the
 Gitmoot piece's `run_pipeline` action. Edit the `<your-pipeline>` placeholder
 before publishing the flow. Add webhook authentication or an upstream access
-control when the endpoint is not confined to a trusted network.
+control when the endpoint is not confined to a trusted network. The target
+pipeline must be enabled; the bridge rejects runs for disabled pipelines.
 
 ### `gmail-imap-ask-agent`
 

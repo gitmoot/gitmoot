@@ -3,9 +3,12 @@ package pipeline
 import (
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
+
+var triggerConnectionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
 // normalize trims surrounding whitespace off every free-text field so validation
 // and storage see canonical values. It does NOT lowercase or otherwise rewrite
@@ -17,6 +20,17 @@ func (s *Spec) normalize() {
 	if s.Schedule != nil {
 		s.Schedule.Interval = strings.TrimSpace(s.Schedule.Interval)
 		s.Schedule.Jitter = strings.TrimSpace(s.Schedule.Jitter)
+	}
+	if s.Trigger != nil {
+		s.Trigger.Kind = strings.TrimSpace(s.Trigger.Kind)
+		s.Trigger.Connection = strings.TrimSpace(s.Trigger.Connection)
+		s.Trigger.Mailbox = strings.TrimSpace(s.Trigger.Mailbox)
+		if s.Trigger.Connection == "" {
+			s.Trigger.Connection = "gmail-imap"
+		}
+		if s.Trigger.Mailbox == "" {
+			s.Trigger.Mailbox = "INBOX"
+		}
 	}
 	s.SuccessDecisions = trimAll(s.SuccessDecisions)
 	for i := range s.Stages {
@@ -65,6 +79,9 @@ func (s Spec) Validate() error {
 		return err
 	}
 	if err := s.validateSchedule(); err != nil {
+		return err
+	}
+	if err := s.validateTrigger(); err != nil {
 		return err
 	}
 
@@ -217,6 +234,37 @@ func (s Spec) validateSchedule() error {
 		if jitter < 0 {
 			return fmt.Errorf("pipeline %q schedule jitter %q must be >= 0", s.Name, s.Schedule.Jitter)
 		}
+	}
+	return nil
+}
+
+// validateTrigger checks the deliberately narrow external-trigger MVP. The
+// connection token is embedded in a quoted Activepieces expression, so it uses
+// a stricter external-id pattern (including an alphanumeric first byte) as an
+// injection guard.
+func (s Spec) validateTrigger() error {
+	if s.Trigger == nil {
+		return nil
+	}
+	if s.Trigger.Kind == "" {
+		return fmt.Errorf("pipeline %q trigger kind is required; supported kinds: email", s.Name)
+	}
+	if s.Trigger.Kind != "email" {
+		return fmt.Errorf("pipeline %q trigger kind %q is not supported; supported kinds: email", s.Name, s.Trigger.Kind)
+	}
+	// The bridge rejects runs of repo-less pipelines, so a triggered flow would
+	// fire 400s forever; fail at add time instead of silently at every email.
+	if strings.TrimSpace(s.Repo) == "" {
+		return fmt.Errorf("pipeline %q declares a trigger but no repo; triggered runs need a managed repo (add `repo: owner/name`)", s.Name)
+	}
+	if !triggerConnectionPattern.MatchString(s.Trigger.Connection) {
+		return fmt.Errorf("pipeline %q trigger connection %q must match [A-Za-z0-9][A-Za-z0-9_-]*", s.Name, s.Trigger.Connection)
+	}
+	if strings.Contains(s.Trigger.Mailbox, "{{") {
+		return fmt.Errorf("pipeline %q trigger mailbox must not contain an Activepieces expression", s.Name)
+	}
+	if len(s.Trigger.Map) != 0 {
+		return fmt.Errorf("pipeline %q trigger payload mapping is not yet supported (see issue #863)", s.Name)
 	}
 	return nil
 }

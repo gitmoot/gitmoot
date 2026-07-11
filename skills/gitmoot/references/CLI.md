@@ -2244,6 +2244,10 @@ repo: owner/repo            # optional to register; REQUIRED to run
 schedule:                   # optional interval schedule (no cron in v1)
   interval: 24h             #   positive Go duration (required with a schedule block)
   jitter: 15m               #   optional random [0, jitter] added to next_due
+trigger:                    # optional generated Activepieces event source
+  kind: email               #   only supported kind
+  connection: gmail-imap    #   default gmail-imap
+  mailbox: INBOX            #   default INBOX
 stages:                     # the DAG, keyed by unique id and wired by needs
   - id: source
     cmd: "curl -sf https://example.com/data > data.json"
@@ -2273,6 +2277,7 @@ gitmoot pipeline add nightly-sync.yaml --enable   # validate + store; omit --ena
 gitmoot pipeline install-defaults                 # install built-in memory pipelines, skipping existing names
 gitmoot pipeline list [--json]
 gitmoot pipeline show nightly-sync [--json]        # registry view for a name
+gitmoot pipeline bind-trigger nightly-sync         # create/re-sync owned AP flow
 gitmoot pipeline run nightly-sync                  # start a manual run; prints the run id
 gitmoot pipeline show <run-id> [--json]            # run funnel for a "prun-…" id
 gitmoot pipeline resume <run-id> [--from <stage>]
@@ -2280,6 +2285,13 @@ gitmoot pipeline cancel <run-id>
 gitmoot pipeline enable|disable nightly-sync
 gitmoot pipeline remove nightly-sync
 ```
+
+An enabled `trigger.kind: email` pipeline auto-binds. If Activepieces is down,
+registration succeeds with a pending binding; `bind-trigger` retries it and
+recreates an owned flow deleted in Activepieces. Trigger
+payload `map:` is rejected until #863. Provision the default IMAP connection with
+`gitmoot activepieces connect gmail` (`--with-smtp` is optional and unused by the
+generated receive flow).
 
 `pipeline add` validates the whole spec at add time (unknown keys, duplicate/self/
 cyclic `needs`, a stage that is not exactly one of `cmd`/`agent`/`gate`, an agent stage
@@ -2635,6 +2647,7 @@ Linux). Built for the Activepieces piece seam (issue #785); to connect Gmail as 
 ```bash
 gitmoot activepieces setup [--port 8080] [--url http://localhost:8080] [--yes]
 gitmoot activepieces down [--volumes]
+gitmoot activepieces connect gmail [--address user@example.com] [--password app-password] [--with-smtp]
 gitmoot activepieces templates list
 gitmoot activepieces templates import [flags] [id...]
 ```
@@ -2645,6 +2658,11 @@ Compose stack, starts the Gitmoot bridge when needed, installs the public
 starter webhook and IMAP/SMTP flows. `--url` skips Docker for an existing local
 Activepieces instance. Cloud Activepieces cannot reach the local bridge without
 a separately secured path back to the host.
+
+`activepieces connect gmail` creates and live-validates the `gmail-imap`
+CUSTOM_AUTH connection. It prompts on a terminal; non-interactive use requires
+`--address` and `--password`. `--with-smtp` additionally creates `gmail-smtp`;
+the declarative receive-only trigger does not need it.
 
 `activepieces down` preserves data volumes unless `--volumes` is set.
 `templates import` skips flow display names that already exist. The email flow

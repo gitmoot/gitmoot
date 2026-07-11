@@ -44,6 +44,8 @@ func runActivepieces(args []string, stdout, stderr io.Writer) int {
 		return runActivepiecesSetup(args[1:], stdout, stderr)
 	case "down":
 		return runActivepiecesDown(args[1:], stdout, stderr)
+	case "connect":
+		return runActivepiecesConnect(args[1:], stdout, stderr)
 	case "templates":
 		return runActivepiecesTemplates(args[1:], stdout, stderr)
 	default:
@@ -57,6 +59,7 @@ func printActivepiecesUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot activepieces setup [flags]")
 	fmt.Fprintln(w, "  gitmoot activepieces down [--volumes] [--stop-bridge] [flags]")
+	fmt.Fprintln(w, "  gitmoot activepieces connect gmail [flags]")
 	fmt.Fprintln(w, "  gitmoot activepieces templates list")
 	fmt.Fprintln(w, "  gitmoot activepieces templates import [flags] [id...]")
 }
@@ -671,49 +674,157 @@ func runActivepiecesTemplatesImport(args []string, stdout, stderr io.Writer) int
 		fmt.Fprintln(stderr, "activepieces templates import: --port must be between 1 and 65535")
 		return 2
 	}
-	paths, err := pathsFromFlag(*home)
-	if err != nil {
-		fmt.Fprintf(stderr, "activepieces templates import: resolve paths: %v\n", err)
-		return 1
-	}
-	adminPassword := *password
-	if adminPassword == "" {
-		credentialsPath := filepath.Join(paths.Home, "activepieces", "ADMIN_CREDENTIALS.txt")
-		raw, err := os.ReadFile(credentialsPath)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				fmt.Fprintln(stderr, "activepieces templates import: --password is required when no saved admin credentials exist")
-				return 2
-			}
-			fmt.Fprintf(stderr, "activepieces templates import: read saved admin credentials: %v\n", err)
-			return 1
-		}
-		values := parseCredentialFile(raw)
-		if values["Email"] != strings.TrimSpace(*email) || values["Password"] == "" {
-			fmt.Fprintln(stderr, "activepieces templates import: saved credentials do not match --email; pass --password")
-			return 2
-		}
-		adminPassword = values["Password"]
-	}
-	targetURL := strings.TrimRight(strings.TrimSpace(*apURL), "/")
-	if targetURL == "" {
-		targetURL = "http://localhost:" + strconv.Itoa(*port)
-	}
-	client, err := activepieces.NewClient(targetURL, &http.Client{Timeout: 30 * time.Second})
+	session, err := openActivepiecesSession(context.Background(), activepiecesAuthOptions{Home: *home, URL: *apURL, Port: *port, Email: *email, Password: *password})
 	if err != nil {
 		fmt.Fprintf(stderr, "activepieces templates import: %v\n", err)
 		return 1
 	}
-	token, projectID, _, err := client.SignUpOrIn(context.Background(), strings.TrimSpace(*email), adminPassword)
-	if err != nil {
-		fmt.Fprintf(stderr, "activepieces templates import: %v\n", err)
-		return 1
-	}
-	if _, err := importActivepiecesTemplates(context.Background(), client, token, projectID, fs.Args(), stdout); err != nil {
+	if _, err := importActivepiecesTemplates(context.Background(), session.Client, session.Token, session.ProjectID, fs.Args(), stdout); err != nil {
 		fmt.Fprintf(stderr, "activepieces templates import: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+func runActivepiecesConnect(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fmt.Fprintln(stdout, "Usage:")
+		fmt.Fprintln(stdout, "  gitmoot activepieces connect gmail [flags]")
+		return 0
+	}
+	if args[0] != "gmail" {
+		fmt.Fprintf(stderr, "unknown activepieces connection %q (supported: gmail)\n", args[0])
+		return 2
+	}
+	return runActivepiecesConnectGmail(args[1:], stdout, stderr)
+}
+
+func runActivepiecesConnectGmail(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("activepieces connect gmail", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	apURL := fs.String("url", "", "Activepieces URL")
+	port := fs.Int("port", defaultActivepiecesPort, "local Activepieces port")
+	adminEmail := fs.String("admin-email", defaultActivepiecesEmail, "Activepieces admin email")
+	adminPassword := fs.String("admin-password", "", "Activepieces admin password (uses saved credentials when omitted)")
+	connection := fs.String("connection", "gmail", "connection prefix (creates <prefix>-imap and optionally <prefix>-smtp)")
+	address := fs.String("address", "", "Gmail address (required for non-interactive use)")
+	password := fs.String("password", "", "Gmail app password; discouraged on shared command lines")
+	imapHost := fs.String("imap-host", "imap.gmail.com", "IMAP host")
+	imapPort := fs.Int("imap-port", 993, "IMAP port")
+	smtpHost := fs.String("smtp-host", "smtp.gmail.com", "SMTP host")
+	smtpPort := fs.Int("smtp-port", 465, "SMTP port")
+	noTLS := fs.Bool("no-tls", false, "disable TLS and certificate validation (local test servers only)")
+	withSMTP := fs.Bool("with-smtp", false, "also create the optional SMTP connection")
+	recreate := fs.Bool("recreate", false, "replace existing connections and revalidate credentials")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "activepieces connect gmail does not accept positional arguments")
+		return 2
+	}
+	if *imapPort < 1 || *imapPort > 65535 || *smtpPort < 1 || *smtpPort > 65535 {
+		fmt.Fprintln(stderr, "activepieces connect gmail: IMAP and SMTP ports must be between 1 and 65535")
+		return 2
+	}
+	if !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`).MatchString(strings.TrimSpace(*connection)) {
+		fmt.Fprintln(stderr, "activepieces connect gmail: --connection must match [A-Za-z0-9][A-Za-z0-9_-]*")
+		return 2
+	}
+	interactive := style.IsTerminal(os.Stdin)
+	reader := bufio.NewReader(os.Stdin)
+	if strings.TrimSpace(*address) == "" {
+		if !interactive {
+			fmt.Fprintln(stderr, "activepieces connect gmail: --address is required in non-interactive mode")
+			return 2
+		}
+		fmt.Fprint(stdout, "Gmail address: ")
+		line, _ := reader.ReadString('\n')
+		*address = strings.TrimSpace(line)
+	}
+	if *password == "" {
+		if !interactive {
+			fmt.Fprintln(stderr, "activepieces connect gmail: --password is required in non-interactive mode (use a Google app password)")
+			return 2
+		}
+		// This repo has no hidden-input helper. Be explicit rather than pretending
+		// the terminal input is masked.
+		fmt.Fprint(stdout, "Gmail app password (input is visible): ")
+		line, _ := reader.ReadString('\n')
+		*password = strings.TrimSpace(line)
+	}
+	if strings.TrimSpace(*address) == "" || *password == "" {
+		fmt.Fprintln(stderr, "activepieces connect gmail: address and app password are required")
+		return 2
+	}
+	session, err := openActivepiecesSession(context.Background(), activepiecesAuthOptions{Home: *home, URL: *apURL, Port: *port, Email: *adminEmail, Password: *adminPassword})
+	if err != nil {
+		fmt.Fprintf(stderr, "activepieces connect gmail: %v\n", err)
+		return 1
+	}
+	prefix := strings.TrimSpace(*connection)
+	tlsEnabled := !*noTLS
+	// Setup only installs the gitmoot piece; a connection upsert 404s with
+	// piece_metadata_not_found unless the mail piece is installed first.
+	if _, err := ensureActivepiecesPieceInstalled(context.Background(), session, "@activepieces/piece-imap"); err != nil {
+		fmt.Fprintf(stderr, "activepieces connect gmail: install IMAP piece: %v\n", err)
+		return 1
+	}
+	imapProps := map[string]any{
+		"host": strings.TrimSpace(*imapHost), "username": strings.TrimSpace(*address), "password": *password,
+		"port": *imapPort, "tls": tlsEnabled, "validateCertificates": tlsEnabled,
+	}
+	if err := session.Client.UpsertPieceConnection(context.Background(), session.Token, session.ProjectID, prefix+"-imap", "Gmail IMAP", "@activepieces/piece-imap", imapProps, *recreate); err != nil {
+		fmt.Fprintf(stderr, "activepieces connect gmail: IMAP validation failed: %s. Verify IMAP access and use a Google app password.\n", redactActivepiecesSecrets(err.Error(), *password))
+		return 1
+	}
+	writeLine(stdout, "connected Gmail IMAP as %s-imap", prefix)
+	if *withSMTP {
+		if _, err := ensureActivepiecesPieceInstalled(context.Background(), session, "@activepieces/piece-smtp"); err != nil {
+			fmt.Fprintf(stderr, "activepieces connect gmail: install SMTP piece: %v\n", err)
+			return 1
+		}
+		smtpProps := map[string]any{
+			"host": strings.TrimSpace(*smtpHost), "email": strings.TrimSpace(*address), "password": *password,
+			"port": *smtpPort, "TLS": tlsEnabled,
+		}
+		if err := session.Client.UpsertPieceConnection(context.Background(), session.Token, session.ProjectID, prefix+"-smtp", "Gmail SMTP", "@activepieces/piece-smtp", smtpProps, *recreate); err != nil {
+			fmt.Fprintf(stderr, "activepieces connect gmail: SMTP validation failed: %s. Verify SMTP access and use a Google app password.\n", redactActivepiecesSecrets(err.Error(), *password))
+			return 1
+		}
+		writeLine(stdout, "connected Gmail SMTP as %s-smtp", prefix)
+	}
+	return 0
+}
+
+// ensureActivepiecesPieceInstalled makes a community piece available for
+// connections and generated flows: reuse the installed version when Activepieces
+// already has it, otherwise install the latest npm release.
+func ensureActivepiecesPieceInstalled(ctx context.Context, session activepiecesSession, pieceName string) (string, error) {
+	if version, err := session.Client.ResolvePieceVersion(ctx, session.Token, session.ProjectID, pieceName, ""); err == nil {
+		return version, nil
+	}
+	version, err := activepieces.ResolveLatestNpmVersion(ctx, pieceName)
+	if err != nil {
+		return "", err
+	}
+	if err := session.Client.InstallPiece(ctx, session.Token, pieceName, version); err != nil {
+		return "", err
+	}
+	return version, nil
+}
+
+func redactActivepiecesSecrets(message string, secrets ...string) string {
+	for _, secret := range secrets {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "[redacted]")
+		}
+	}
+	return message
 }
 
 type importedActivepiecesFlow struct {

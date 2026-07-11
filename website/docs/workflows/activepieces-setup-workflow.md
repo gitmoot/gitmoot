@@ -20,6 +20,17 @@ Open `http://localhost:8080` after setup. A generated password is shown once
 and stored in `~/.gitmoot/activepieces/ADMIN_CREDENTIALS.txt` with mode `0600`.
 Re-running setup preserves the encryption key and database credentials.
 
+For a declarative email-triggered pipeline, the next step is headless:
+
+```sh
+gitmoot activepieces connect gmail
+gitmoot pipeline add triage-email.yaml --enable
+```
+
+`connect gmail` creates and live-validates `gmail-imap`; `--with-smtp` adds an
+optional `gmail-smtp` connection for manual send flows. Generated receive flows
+use IMAP only. See [Connect Gmail to a pipeline](./gmail-pipeline-workflow.md).
+
 Use another port or an existing local Activepieces instance when needed:
 
 ```sh
@@ -43,7 +54,13 @@ the internet. Use `--bridge-addr` and `--bridge-url` together for a nonstandard
 local Docker network, or `--no-bridge-spawn` when a supervisor already runs the
 bridge.
 
-## Use the starter flows
+## Declarative pipeline triggers and starter flows
+
+A pipeline `trigger: {kind: email}` is materialized into an owned Activepieces
+flow on `pipeline add --enable`. Use `gitmoot pipeline bind-trigger <name>` for
+an explicit or repaired sync; it recreates an owned flow deleted in
+Activepieces. This is the preferred receive-only Gmail path;
+starter flows remain examples and escape hatches.
 
 List the embedded flows without making a network request:
 
@@ -63,7 +80,8 @@ The importer skips an existing flow with the same display name.
 
 `webhook-run-pipeline` accepts a webhook and runs the pipeline named in its
 `<your-pipeline>` placeholder. Edit the placeholder and protect the webhook
-before publishing it. See the [pipelines workflow](/docs/workflows/pipelines-workflow)
+before publishing it. The target pipeline must be enabled because the bridge
+rejects disabled pipelines. See the [pipelines workflow](/docs/workflows/pipelines-workflow)
 for pipeline setup.
 
 `gmail-imap-ask-agent` listens for mail with the official IMAP piece, enqueues

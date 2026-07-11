@@ -1208,7 +1208,8 @@ the Workspace mailbox to impersonate.
 
 Wire the Gmail or IMAP new-email trigger to `run_pipeline` with
 `pipeline_name`, or use `ask_agent` with `agent`, `message`, and the required
-`repo`. Configure the piece's CustomAuth with `bridge_url` and `bridge_token`.
+`repo`. The target pipeline must be enabled; the bridge rejects `run_pipeline`
+for disabled pipelines. Configure the piece's CustomAuth with `bridge_url` and `bridge_token`.
 If the flow prepares a reply, default to **Create Draft** and never auto-send
 without explicit operator opt-in.
 

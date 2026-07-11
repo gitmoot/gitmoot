@@ -25,8 +25,10 @@ type Pipeline struct {
 	NextDueAt  time.Time
 	LastRunID  string
 	LastStatus string
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// TriggerBinding is the JSON ownership record for an Activepieces flow.
+	TriggerBinding string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // PipelineScheduleState is the durable schedule state of one pipeline, mirroring
@@ -79,7 +81,7 @@ func (s *Store) GetPipeline(ctx context.Context, name string) (Pipeline, bool, e
 		return Pipeline{}, false, errors.New("pipeline name is required")
 	}
 	row := s.db.QueryRowContext(ctx, `SELECT name, repo, spec_yaml, spec_hash, enabled, interval, jitter,
-		last_run_at, next_due_at, last_run_id, last_status, created_at, updated_at
+		last_run_at, next_due_at, last_run_id, last_status, trigger_binding, created_at, updated_at
 		FROM pipelines WHERE name = ?`, name)
 	pipeline, err := scanPipeline(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -94,7 +96,7 @@ func (s *Store) GetPipeline(ctx context.Context, name string) (Pipeline, bool, e
 // ListPipelines returns every registered pipeline ordered by name.
 func (s *Store) ListPipelines(ctx context.Context) ([]Pipeline, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT name, repo, spec_yaml, spec_hash, enabled, interval, jitter,
-		last_run_at, next_due_at, last_run_id, last_status, created_at, updated_at
+		last_run_at, next_due_at, last_run_id, last_status, trigger_binding, created_at, updated_at
 		FROM pipelines ORDER BY name`)
 	if err != nil {
 		return nil, err
@@ -125,6 +127,28 @@ func (s *Store) SetPipelineEnabled(ctx context.Context, name string, enabled boo
 	}
 	result, err := s.db.ExecContext(ctx,
 		`UPDATE pipelines SET enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?`, flag, name)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return errors.New("pipeline " + name + " not found")
+	}
+	return nil
+}
+
+// SetPipelineTriggerBinding persists the complete JSON binding record. Keeping
+// this as one opaque column makes ownership state atomic and forward-extensible.
+func (s *Store) SetPipelineTriggerBinding(ctx context.Context, name, binding string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("pipeline name is required")
+	}
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE pipelines SET trigger_binding = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?`, strings.TrimSpace(binding), name)
 	if err != nil {
 		return err
 	}
@@ -226,7 +250,7 @@ func scanPipeline(row interface{ Scan(...any) error }) (Pipeline, error) {
 	)
 	if err := row.Scan(&pipeline.Name, &pipeline.Repo, &pipeline.SpecYAML, &pipeline.SpecHash, &enabled,
 		&pipeline.Interval, &pipeline.Jitter, &lastRun, &nextDue, &pipeline.LastRunID, &pipeline.LastStatus,
-		&createdAt, &updatedAt); err != nil {
+		&pipeline.TriggerBinding, &createdAt, &updatedAt); err != nil {
 		return Pipeline{}, err
 	}
 	pipeline.Enabled = enabled != 0

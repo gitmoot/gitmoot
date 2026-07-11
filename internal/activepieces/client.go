@@ -23,6 +23,14 @@ type FlowSummary struct {
 	DisplayName string `json:"displayName"`
 }
 
+// Flow is the ownership-relevant projection returned by GetFlow.
+type Flow struct {
+	ID          string         `json:"id"`
+	DisplayName string         `json:"displayName"`
+	Status      string         `json:"status"`
+	Metadata    map[string]any `json:"metadata,omitempty"`
+}
+
 type HTTPError struct {
 	Method     string
 	Path       string
@@ -117,7 +125,10 @@ func accountAlreadyExists(err error) bool {
 		return false
 	}
 	body := normalizedErrorBody(httpErr.Body)
-	return httpErr.StatusCode == http.StatusConflict || strings.Contains(body, "already exist") || strings.Contains(body, "user exist")
+	// Activepieces 0.82 rejects sign-up on an already-provisioned platform with
+	// 403 INVITATION_ONLY_SIGN_UP (not 409), so treat it as "account exists" and
+	// fall through to sign-in — every post-setup session hits this path.
+	return httpErr.StatusCode == http.StatusConflict || strings.Contains(body, "already exist") || strings.Contains(body, "user exist") || strings.Contains(body, "invitation only sign up")
 }
 
 func (c *Client) InstallPiece(ctx context.Context, token, pieceName, pieceVersion string) error {
@@ -160,42 +171,45 @@ func (c *Client) UpsertBridgeConnection(ctx context.Context, token, projectID, e
 	if strings.TrimSpace(externalID) == "" {
 		externalID = "gitmoot-bridge"
 	}
+	err := c.UpsertPieceConnection(ctx, token, projectID, externalID, "Gitmoot Bridge", "@gitmoot/piece-gitmoot", map[string]any{
+		"bridge_url": bridgeURL, "bridge_token": bridgeToken,
+	}, recreate)
+	if err != nil {
+		return fmt.Errorf("create Activepieces bridge connection: %w", err)
+	}
+	return nil
+}
+
+// UpsertPieceConnection creates a project-scoped CUSTOM_AUTH connection. When
+// recreate is true, an external-id conflict is resolved by deleting the exact
+// matching connection and creating it again (which re-runs piece validation).
+func (c *Client) UpsertPieceConnection(ctx context.Context, token, projectID, externalID, displayName, pieceName string, props map[string]any, recreate bool) error {
 	body := map[string]any{
-		"externalId":  externalID,
-		"displayName": "Gitmoot Bridge",
-		"projectId":   projectID,
-		"scope":       "PROJECT",
-		"pieceName":   "@gitmoot/piece-gitmoot",
-		"type":        "CUSTOM_AUTH",
-		"value": map[string]any{
-			"type": "CUSTOM_AUTH",
-			"props": map[string]string{
-				"bridge_url":   bridgeURL,
-				"bridge_token": bridgeToken,
-			},
-		},
+		"externalId": externalID, "displayName": displayName, "projectId": projectID,
+		"scope": "PROJECT", "pieceName": pieceName, "type": "CUSTOM_AUTH",
+		"value": map[string]any{"type": "CUSTOM_AUTH", "props": props},
 	}
 	path := "/api/v1/app-connections"
 	if err := c.doJSON(ctx, http.MethodPost, path, token, body, nil); err != nil {
 		if !resourceAlreadyExists(err) {
-			return fmt.Errorf("create Activepieces bridge connection: %w", err)
+			return err
 		}
 		if !recreate {
 			return nil
 		}
 		connectionID, findErr := c.findConnectionID(ctx, token, projectID, externalID)
 		if findErr != nil {
-			return fmt.Errorf("find existing Activepieces bridge connection: %w", findErr)
+			return fmt.Errorf("find existing Activepieces connection: %w", findErr)
 		}
 		if connectionID == "" {
-			return errors.New("Activepieces reported an existing bridge connection but did not return it from the connection list")
+			return errors.New("Activepieces reported an existing connection but did not return it from the connection list")
 		}
 		deletePath := "/api/v1/app-connections/" + url.PathEscape(connectionID)
 		if err := c.doJSON(ctx, http.MethodDelete, deletePath, token, nil, nil); err != nil {
-			return fmt.Errorf("delete Activepieces bridge connection: %w", err)
+			return fmt.Errorf("delete Activepieces connection: %w", err)
 		}
 		if err := c.doJSON(ctx, http.MethodPost, path, token, body, nil); err != nil {
-			return fmt.Errorf("recreate Activepieces bridge connection: %w", err)
+			return fmt.Errorf("recreate Activepieces connection: %w", err)
 		}
 	}
 	return nil
@@ -282,6 +296,95 @@ func (c *Client) ImportFlow(ctx context.Context, token, flowID string, flow json
 		return fmt.Errorf("import Activepieces flow: %w", err)
 	}
 	return nil
+}
+
+func (c *Client) PublishFlow(ctx context.Context, token, flowID string) error {
+	return c.flowOperation(ctx, token, flowID, "LOCK_AND_PUBLISH", map[string]any{})
+}
+
+func (c *Client) SetFlowStatus(ctx context.Context, token, flowID string, enabled bool) error {
+	status := "DISABLED"
+	if enabled {
+		status = "ENABLED"
+	}
+	return c.flowOperation(ctx, token, flowID, "CHANGE_STATUS", map[string]any{"status": status})
+}
+
+func (c *Client) UpdateFlowMetadata(ctx context.Context, token, flowID string, metadata map[string]any) error {
+	return c.flowOperation(ctx, token, flowID, "UPDATE_METADATA", map[string]any{"metadata": metadata})
+}
+
+func (c *Client) flowOperation(ctx context.Context, token, flowID, operation string, request map[string]any) error {
+	body := map[string]any{"type": operation, "request": request}
+	path := "/api/v1/flows/" + url.PathEscape(flowID)
+	if err := c.doJSON(ctx, http.MethodPost, path, token, body, nil); err != nil {
+		return fmt.Errorf("Activepieces flow operation %s: %w", operation, err)
+	}
+	return nil
+}
+
+func (c *Client) GetFlow(ctx context.Context, token, flowID string) (Flow, error) {
+	path := "/api/v1/flows/" + url.PathEscape(flowID)
+	var response struct {
+		ID          string         `json:"id"`
+		DisplayName string         `json:"displayName"`
+		Status      string         `json:"status"`
+		Metadata    map[string]any `json:"metadata"`
+		Version     struct {
+			DisplayName string         `json:"displayName"`
+			Metadata    map[string]any `json:"metadata"`
+		} `json:"version"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, path, token, nil, &response); err != nil {
+		return Flow{}, fmt.Errorf("get Activepieces flow: %w", err)
+	}
+	metadata := response.Metadata
+	if metadata == nil {
+		metadata = response.Version.Metadata
+	}
+	// AP 0.82 serves the display name nested under version.displayName on GET
+	// /v1/flows/{id}; a top-level displayName is not part of that response.
+	displayName := strings.TrimSpace(response.DisplayName)
+	if displayName == "" {
+		displayName = strings.TrimSpace(response.Version.DisplayName)
+	}
+	return Flow{ID: response.ID, DisplayName: displayName, Status: response.Status, Metadata: metadata}, nil
+}
+
+// ResolvePieceVersion asks Activepieces for the installed metadata matching the
+// requested range. AP 0.82 exposes this as GET /api/v1/pieces/:pieceName with
+// version and projectId query parameters.
+func (c *Client) ResolvePieceVersion(ctx context.Context, token, projectID, pieceName, requestedVersion string) (string, error) {
+	query := url.Values{"projectId": {projectID}}
+	if strings.TrimSpace(requestedVersion) != "" {
+		query.Set("version", requestedVersion)
+	}
+	path := pieceMetadataPath(pieceName) + "?" + query.Encode()
+	var response struct {
+		Version      string `json:"version"`
+		PieceVersion string `json:"pieceVersion"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, path, token, nil, &response); err != nil {
+		return "", fmt.Errorf("resolve Activepieces piece %s: %w", pieceName, err)
+	}
+	version := strings.TrimSpace(response.Version)
+	if version == "" {
+		version = strings.TrimSpace(response.PieceVersion)
+	}
+	if version == "" {
+		return "", fmt.Errorf("resolve Activepieces piece %s: response is missing version", pieceName)
+	}
+	return strings.TrimLeft(version, "~^"), nil
+}
+
+func pieceMetadataPath(pieceName string) string {
+	pieceName = strings.TrimSpace(pieceName)
+	if scope, name, ok := strings.Cut(pieceName, "/"); ok {
+		// AP 0.82 has a distinct /:scope/:name route for scoped pieces; escaping
+		// the slash as part of one parameter does not match that route.
+		return "/api/v1/pieces/" + url.PathEscape(scope) + "/" + url.PathEscape(name)
+	}
+	return "/api/v1/pieces/" + url.PathEscape(pieceName)
 }
 
 func (c *Client) DeleteFlow(ctx context.Context, token, flowID string) error {

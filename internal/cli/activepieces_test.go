@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -254,5 +255,56 @@ func TestImportActivepiecesTemplatesDeletesFlowAfterImportFailure(t *testing.T) 
 	}
 	if !deleted {
 		t.Fatal("created flow was not deleted after import failure")
+	}
+}
+
+func TestActivepiecesConnectGmailCreatesExactAuthProps(t *testing.T) {
+	var connectionBodies []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/authentication/sign-up":
+			_, _ = w.Write([]byte(`{"token":"test-token","projectId":"project-1"}`))
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/pieces/"):
+			// The mail pieces read as already installed, so connect skips the
+			// npm resolve + install path in tests.
+			_, _ = w.Write([]byte(`{"version":"9.9.9"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/app-connections":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			connectionBodies = append(connectionBodies, body)
+			w.WriteHeader(http.StatusCreated)
+		default:
+			http.Error(w, "unexpected request", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	var stdout, stderr bytes.Buffer
+	code := runActivepieces([]string{"connect", "gmail", "--url", server.URL, "--admin-password", "admin-secret", "--address", "user@example.com", "--password", "app-secret", "--with-smtp", "--no-tls"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), "app-secret") || strings.Contains(stderr.String(), "app-secret") {
+		t.Fatal("app password was echoed")
+	}
+	if len(connectionBodies) != 2 {
+		t.Fatalf("connections = %+v", connectionBodies)
+	}
+	imap := connectionBodies[0]
+	imapProps := imap["value"].(map[string]any)["props"].(map[string]any)
+	if imap["externalId"] != "gmail-imap" || imap["pieceName"] != "@activepieces/piece-imap" || imapProps["username"] != "user@example.com" || imapProps["tls"] != false || imapProps["validateCertificates"] != false {
+		t.Fatalf("IMAP body = %+v", imap)
+	}
+	smtp := connectionBodies[1]
+	smtpProps := smtp["value"].(map[string]any)["props"].(map[string]any)
+	if smtp["externalId"] != "gmail-smtp" || smtp["pieceName"] != "@activepieces/piece-smtp" || smtpProps["email"] != "user@example.com" || smtpProps["TLS"] != false || smtpProps["username"] != nil {
+		t.Fatalf("SMTP body = %+v", smtp)
+	}
+}
+
+func TestRedactActivepiecesSecrets(t *testing.T) {
+	got := redactActivepiecesSecrets("validation echoed app-secret", "app-secret")
+	if strings.Contains(got, "app-secret") || !strings.Contains(got, "[redacted]") {
+		t.Fatalf("redacted message = %q", got)
 	}
 }

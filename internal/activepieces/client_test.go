@@ -187,3 +187,141 @@ func TestClientErrorsIncludeResponseBody(t *testing.T) {
 		t.Fatalf("error = %v, want response body", err)
 	}
 }
+
+func TestClientFlowOperationsAndGet(t *testing.T) {
+	type call struct {
+		method string
+		path   string
+		body   map[string]any
+	}
+	var calls []call
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if r.Body != nil {
+			_ = json.NewDecoder(r.Body).Decode(&body)
+		}
+		calls = append(calls, call{r.Method, r.URL.EscapedPath(), body})
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"id":"flow/1","displayName":"gitmoot: mail","status":"ENABLED","version":{"metadata":{"gitmoot":{"binding_id":"bind-1"}}}}`))
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := client.PublishFlow(ctx, "token", "flow/1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetFlowStatus(ctx, "token", "flow/1", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.UpdateFlowMetadata(ctx, "token", "flow/1", map[string]any{"gitmoot": map[string]any{"binding_id": "bind-1"}}); err != nil {
+		t.Fatal(err)
+	}
+	flow, err := client.GetFlow(ctx, "token", "flow/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flow.ID != "flow/1" || flow.DisplayName != "gitmoot: mail" || flow.Status != "ENABLED" || flow.Metadata["gitmoot"] == nil {
+		t.Fatalf("flow = %+v", flow)
+	}
+	if len(calls) != 4 {
+		t.Fatalf("calls = %+v", calls)
+	}
+	wants := []struct{ method, op string }{{http.MethodPost, "LOCK_AND_PUBLISH"}, {http.MethodPost, "CHANGE_STATUS"}, {http.MethodPost, "UPDATE_METADATA"}, {http.MethodGet, ""}}
+	for i, want := range wants {
+		if calls[i].method != want.method || calls[i].path != "/api/v1/flows/flow%2F1" {
+			t.Fatalf("call %d = %+v", i, calls[i])
+		}
+		if want.op != "" && calls[i].body["type"] != want.op {
+			t.Fatalf("call %d type = %v, want %s", i, calls[i].body["type"], want.op)
+		}
+	}
+	if request := calls[0].body["request"].(map[string]any); len(request) != 0 {
+		t.Fatalf("publish request = %+v, want empty object", request)
+	}
+	if got := calls[1].body["request"].(map[string]any)["status"]; got != "DISABLED" {
+		t.Fatalf("status = %v", got)
+	}
+	metadata := calls[2].body["request"].(map[string]any)["metadata"].(map[string]any)
+	gitmoot := metadata["gitmoot"].(map[string]any)
+	if gitmoot["binding_id"] != "bind-1" {
+		t.Fatalf("metadata request = %+v", metadata)
+	}
+}
+
+func TestUpsertPieceConnectionAndResolveVersion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodPost:
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["externalId"] != "gmail-imap" || body["pieceName"] != "@activepieces/piece-imap" {
+				t.Errorf("connection body = %+v", body)
+			}
+			props := body["value"].(map[string]any)["props"].(map[string]any)
+			if props["username"] != "user@example.com" {
+				t.Errorf("props = %+v", props)
+			}
+			w.WriteHeader(http.StatusCreated)
+		case http.MethodGet:
+			if r.URL.Path != "/api/v1/pieces/@activepieces/piece-imap" {
+				t.Errorf("piece path = %s", r.URL.Path)
+			}
+			if r.URL.Query().Get("projectId") != "project-1" || r.URL.Query().Get("version") != "~0.4.4" {
+				t.Errorf("query = %s", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`{"version":"0.4.3"}`))
+		}
+	}))
+	defer server.Close()
+	client, _ := NewClient(server.URL, server.Client())
+	if err := client.UpsertPieceConnection(context.Background(), "token", "project-1", "gmail-imap", "Gmail IMAP", "@activepieces/piece-imap", map[string]any{"username": "user@example.com"}, false); err != nil {
+		t.Fatal(err)
+	}
+	version, err := client.ResolvePieceVersion(context.Background(), "token", "project-1", "@activepieces/piece-imap", "~0.4.4")
+	if err != nil || version != "0.4.3" {
+		t.Fatalf("ResolvePieceVersion = %q, %v", version, err)
+	}
+}
+
+// Activepieces 0.82 rejects sign-up on an already-provisioned platform with
+// 403 INVITATION_ONLY_SIGN_UP; SignUpOrIn must treat that as "account exists"
+// and fall back to sign-in, or every post-setup session (connect, bind) fails.
+func TestSignUpOrInFallsBackOnInvitationOnly(t *testing.T) {
+	var signIns int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/authentication/sign-up":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"code":"INVITATION_ONLY_SIGN_UP","params":{"message":"User is not invited to the platform"}}`))
+		case "/api/v1/authentication/sign-in":
+			signIns++
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "tok", "projectId": "proj"})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, projectID, created, err := client.SignUpOrIn(context.Background(), "admin@gitmoot.local", "pw")
+	if err != nil {
+		t.Fatalf("SignUpOrIn: %v", err)
+	}
+	if token != "tok" || projectID != "proj" || created {
+		t.Fatalf("got token=%q project=%q created=%v", token, projectID, created)
+	}
+	if signIns != 1 {
+		t.Fatalf("sign-in calls = %d, want 1", signIns)
+	}
+}

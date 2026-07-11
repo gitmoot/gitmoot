@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,35 @@ import (
 
 	"github.com/jerryfane/gitmoot/internal/db"
 )
+
+func TestPipelineAddEnabledTriggerPersistsPendingBinding(t *testing.T) {
+	home := t.TempDir()
+	specFile := writeSpec(t, "name: mail-flow\nrepo: owner/repo\ntrigger:\n  kind: email\nstages:\n  - {id: run, cmd: echo ok}\n")
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"pipeline", "add", specFile, "--enable", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("pipeline add exit=%d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "pipeline bind-trigger mail-flow") {
+		t.Fatalf("missing actionable pending warning: %s", stderr.String())
+	}
+	if err := withStore(home, func(store *db.Store) error {
+		rec, ok, err := store.GetPipeline(context.Background(), "mail-flow")
+		if err != nil || !ok {
+			return fmt.Errorf("GetPipeline: ok=%v err=%v", ok, err)
+		}
+		binding, err := decodeTriggerBinding(rec.TriggerBinding)
+		if err != nil {
+			return err
+		}
+		if !rec.Enabled || binding.State != triggerBindingPending || binding.BindingID == "" {
+			return fmt.Errorf("record=%+v binding=%+v", rec, binding)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 const testPipelineSpec = `name: deploy-flow
 repo: jerryfane/gitmoot

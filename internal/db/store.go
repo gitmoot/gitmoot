@@ -8684,4 +8684,10 @@ CREATE TABLE groom_stale_verdicts (
 	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 	`,
+	// #861 durable ownership of generated Activepieces trigger flows. Empty is
+	// the exact legacy state; the JSON envelope is written only after a pipeline
+	// declares a trigger. Additive ALTER only, preserving all existing rows.
+	`
+ALTER TABLE pipelines ADD COLUMN trigger_binding TEXT NOT NULL DEFAULT '';
+	`,
 }
