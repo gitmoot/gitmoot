@@ -146,6 +146,22 @@ CREATE TABLE agents (
 CREATE TABLE agent_instances (
 	name TEXT PRIMARY KEY
 );
+-- A minimal repos table (as it existed at the input_tokens migration point) so
+-- the later #831 primary_checkout_path ALTER ADD COLUMN that runs in this pass
+-- has its table; the real table was created by an earlier (here pre-seeded-as-
+-- applied) migration.
+CREATE TABLE repos (
+	owner TEXT NOT NULL,
+	name TEXT NOT NULL,
+	full_name TEXT NOT NULL,
+	default_branch TEXT NOT NULL DEFAULT 'main',
+	remote_url TEXT NOT NULL DEFAULT '',
+	checkout_path TEXT NOT NULL DEFAULT '',
+	enabled INTEGER NOT NULL DEFAULT 1,
+	poll_interval TEXT NOT NULL DEFAULT '',
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (owner, name)
+);
 -- job_events as it existed at an earlier (here pre-seeded-as-applied) migration,
 -- so the #549 job_events index migration that runs in this pass has its table.
 CREATE TABLE job_events (

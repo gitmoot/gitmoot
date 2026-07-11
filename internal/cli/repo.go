@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/jerryfane/gitmoot/internal/daemon"
@@ -65,7 +66,7 @@ func parseRepoPositional(fs *flag.FlagSet, command string, args []string, string
 
 func printRepoUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot repo add owner/repo --path <path> [--poll 30s]")
+	fmt.Fprintln(w, "  gitmoot repo add owner/repo --path <path> [--poll 30s] [--force]")
 	fmt.Fprintln(w, "  gitmoot repo list")
 	fmt.Fprintln(w, "  gitmoot repo remove owner/repo")
 	fmt.Fprintln(w, "  gitmoot repo doctor owner/repo")
@@ -79,6 +80,7 @@ func runRepoAdd(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	path := fs.String("path", ".", "local checkout path")
 	poll := fs.Duration("poll", 30*time.Second, "poll interval")
+	force := fs.Bool("force", false, "allow a linked worktree to replace the registered checkout")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fs.Usage()
 		if len(args) == 0 {
@@ -105,8 +107,27 @@ func runRepoAdd(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "repo add: %v\n", err)
 		return 1
 	}
+	client := gitutil.Client{Dir: record.CheckoutPath}
+	primary, err := client.PrimaryWorktree(context.Background())
+	if err != nil {
+		fmt.Fprintf(stderr, "repo add: resolve primary worktree: %v\n", err)
+		return 1
+	}
+	record.PrimaryCheckoutPath = primary
+	linked, err := client.IsLinkedWorktree(context.Background())
+	if err != nil {
+		fmt.Fprintf(stderr, "repo add: detect linked worktree: %v\n", err)
+		return 1
+	}
+	if linked && !*force {
+		fmt.Fprintf(stderr, "repo add: %s is a linked worktree; register the primary checkout at %s instead (use --force to override)\n", record.CheckoutPath, primary)
+		return 1
+	}
 	record.PollInterval = poll.String()
 	if err := withStore(*home, func(store *db.Store) error {
+		if *force {
+			return store.UpsertRepoForce(context.Background(), record)
+		}
 		return store.UpsertRepo(context.Background(), record)
 	}); err != nil {
 		fmt.Fprintf(stderr, "repo add: %v\n", err)
@@ -221,18 +242,74 @@ func runRepoDoctor(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "repo doctor: %v\n", err)
 		return 1
 	}
+	primary, linked, checkoutErr := inspectRegisteredRepoCheckout(context.Background(), nil, record)
+	if checkoutErr != nil {
+		writeLine(stdout, "repo: %s warn", repo.FullName())
+		writeLine(stdout, "path: %s", checkoutErr)
+		if strings.TrimSpace(record.PrimaryCheckoutPath) != "" {
+			writeLine(stdout, "primary: %s", record.PrimaryCheckoutPath)
+		}
+		return 1
+	}
+	if strings.TrimSpace(record.PrimaryCheckoutPath) == "" {
+		if err := withStore(*home, func(store *db.Store) error {
+			_, err := store.HealRepoCheckout(context.Background(), record.FullName(), record.CheckoutPath, record.CheckoutPath, primary)
+			return err
+		}); err != nil {
+			fmt.Fprintf(stderr, "repo doctor: backfill primary checkout: %v\n", err)
+			return 1
+		}
+	}
 	validated, err := repoRecordFromPath(context.Background(), repo, record.CheckoutPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "repo doctor: %v\n", err)
 		return 1
 	}
+	if linked {
+		writeLine(stdout, "repo: %s warn", repo.FullName())
+		writeLine(stdout, "path: %s is a linked worktree", validated.CheckoutPath)
+		writeLine(stdout, "primary: %s", primary)
+		return 1
+	}
 	writeLine(stdout, "repo: %s ok", repo.FullName())
 	writeLine(stdout, "path: %s", validated.CheckoutPath)
+	writeLine(stdout, "primary: %s", primary)
 	writeLine(stdout, "remote: %s", validated.RemoteURL)
 	if validated.DefaultBranch != "" {
 		writeLine(stdout, "branch: %s", validated.DefaultBranch)
 	}
 	return 0
+}
+
+func inspectRegisteredRepoCheckout(ctx context.Context, store *db.Store, record db.Repo) (string, bool, error) {
+	checkout := strings.TrimSpace(record.CheckoutPath)
+	if checkout == "" {
+		return "", false, fmt.Errorf("registered checkout is empty")
+	}
+	if _, err := os.Stat(checkout); err != nil {
+		if os.IsNotExist(err) {
+			return "", false, fmt.Errorf("registered checkout %s is missing", checkout)
+		}
+		return "", false, fmt.Errorf("inspect registered checkout %s: %w", checkout, err)
+	}
+	client := gitutil.Client{Dir: checkout}
+	linked, err := client.IsLinkedWorktree(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	primary := strings.TrimSpace(record.PrimaryCheckoutPath)
+	if primary == "" {
+		primary, err = client.PrimaryWorktree(ctx)
+		if err != nil {
+			return "", false, err
+		}
+		if store != nil {
+			if _, err := store.HealRepoCheckout(ctx, record.FullName(), checkout, checkout, primary); err != nil {
+				return "", false, err
+			}
+		}
+	}
+	return primary, linked, nil
 }
 
 func repoRecordFromPath(ctx context.Context, repo github.Repository, path string) (db.Repo, error) {

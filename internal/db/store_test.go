@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math/rand"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -2065,14 +2066,14 @@ func TestRepositoryMethods(t *testing.T) {
 	}
 	defer store.Close()
 
-	if err := store.UpsertRepo(ctx, Repo{Owner: "jerryfane", Name: "gitmoot", DefaultBranch: "main", RemoteURL: "https://github.com/jerryfane/gitmoot.git", CheckoutPath: "/repo/gitmoot"}); err != nil {
+	if err := store.UpsertRepo(ctx, Repo{Owner: "jerryfane", Name: "gitmoot", DefaultBranch: "main", RemoteURL: "https://github.com/jerryfane/gitmoot.git", CheckoutPath: "/repo/gitmoot", PrimaryCheckoutPath: "/repo/gitmoot"}); err != nil {
 		t.Fatalf("UpsertRepo returned error: %v", err)
 	}
 	repo, err := store.GetRepo(ctx, "jerryfane/gitmoot")
 	if err != nil {
 		t.Fatalf("GetRepo returned error: %v", err)
 	}
-	if repo.FullName() != "jerryfane/gitmoot" || repo.DefaultBranch != "main" || repo.RemoteURL == "" || repo.CheckoutPath != "/repo/gitmoot" || !repo.Enabled || repo.PollInterval != "30s" {
+	if repo.FullName() != "jerryfane/gitmoot" || repo.DefaultBranch != "main" || repo.RemoteURL == "" || repo.CheckoutPath != "/repo/gitmoot" || repo.PrimaryCheckoutPath != "/repo/gitmoot" || !repo.Enabled || repo.PollInterval != "30s" {
 		t.Fatalf("repo = %+v", repo)
 	}
 	if err := store.UpsertRepo(ctx, Repo{Owner: "jerryfane", Name: "gitmoot", PollInterval: "1m"}); err != nil {
@@ -2658,6 +2659,89 @@ func TestRepositoryMethods(t *testing.T) {
 	}
 	if removed {
 		t.Fatal("second RemoveAgent removed missing agent")
+	}
+}
+
+func TestHealRepoCheckoutRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.UpsertRepoForce(ctx, Repo{Owner: "owner", Name: "repo", CheckoutPath: "/tmp/deleted-linked", PrimaryCheckoutPath: "/repo/primary"}); err != nil {
+		t.Fatalf("UpsertRepoForce returned error: %v", err)
+	}
+	healed, err := store.HealRepoCheckout(ctx, "owner/repo", "/tmp/deleted-linked", "/repo/primary", "/repo/primary")
+	if err != nil {
+		t.Fatalf("HealRepoCheckout returned error: %v", err)
+	}
+	if !healed {
+		t.Fatal("HealRepoCheckout reported no update")
+	}
+	repo, err := store.GetRepo(ctx, "owner/repo")
+	if err != nil {
+		t.Fatalf("GetRepo returned error: %v", err)
+	}
+	if repo.CheckoutPath != "/repo/primary" || repo.PrimaryCheckoutPath != "/repo/primary" {
+		t.Fatalf("repo after heal = %+v", repo)
+	}
+	healed, err = store.HealRepoCheckout(ctx, "owner/repo", "/tmp/deleted-linked", "/wrong", "/wrong")
+	if err != nil {
+		t.Fatalf("stale HealRepoCheckout returned error: %v", err)
+	}
+	if healed {
+		t.Fatal("stale HealRepoCheckout overwrote a changed checkout")
+	}
+}
+
+func TestUpsertRepoProtectsPrimaryCheckoutFromLinkedWorktree(t *testing.T) {
+	ctx := context.Background()
+	primary := t.TempDir()
+	runStoreGit(t, primary, "init", "-b", "main")
+	runStoreGit(t, primary, "config", "user.email", "gitmoot@example.com")
+	runStoreGit(t, primary, "config", "user.name", "Gitmoot")
+	runStoreGit(t, primary, "commit", "--allow-empty", "-m", "init")
+	linked := filepath.Join(t.TempDir(), "linked")
+	runStoreGit(t, primary, "worktree", "add", "-b", "task", linked)
+
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	base := Repo{Owner: "owner", Name: "repo", CheckoutPath: primary, PrimaryCheckoutPath: primary}
+	if err := store.UpsertRepo(ctx, base); err != nil {
+		t.Fatalf("UpsertRepo primary returned error: %v", err)
+	}
+	if err := store.UpsertRepo(ctx, Repo{Owner: "owner", Name: "repo", CheckoutPath: linked, PrimaryCheckoutPath: "/wrong-primary"}); err != nil {
+		t.Fatalf("UpsertRepo linked returned error: %v", err)
+	}
+	repo, err := store.GetRepo(ctx, "owner/repo")
+	if err != nil {
+		t.Fatalf("GetRepo returned error: %v", err)
+	}
+	if repo.CheckoutPath != primary || repo.PrimaryCheckoutPath != primary {
+		t.Fatalf("guarded repo = %+v, want checkout and primary %q", repo, primary)
+	}
+	if err := store.UpsertRepoForce(ctx, Repo{Owner: "owner", Name: "repo", CheckoutPath: linked, PrimaryCheckoutPath: primary}); err != nil {
+		t.Fatalf("UpsertRepoForce linked returned error: %v", err)
+	}
+	repo, err = store.GetRepo(ctx, "owner/repo")
+	if err != nil {
+		t.Fatalf("GetRepo after force returned error: %v", err)
+	}
+	if repo.CheckoutPath != linked {
+		t.Fatalf("forced checkout = %q, want linked %q", repo.CheckoutPath, linked)
+	}
+}
+
+func runStoreGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, output)
 	}
 }
 

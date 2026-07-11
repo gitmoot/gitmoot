@@ -7694,6 +7694,10 @@ func (w jobWorker) resolveJobCheckout(ctx context.Context, job db.Job, payload w
 	if err != nil {
 		return "", err
 	}
+	checkout, err = w.healRegisteredRepoCheckout(ctx, job, repo, repoRecord)
+	if err != nil {
+		return "", err
+	}
 	if err := preflightDaemonRepoCheckout(ctx, repo, checkout); err != nil {
 		return "", err
 	}
@@ -7708,6 +7712,58 @@ func (w jobWorker) resolveJobCheckout(ctx context.Context, job db.Job, payload w
 		}
 	}
 	return checkout, nil
+}
+
+func (w jobWorker) healRegisteredRepoCheckout(ctx context.Context, job db.Job, repo github.Repository, record db.Repo) (string, error) {
+	checkout := strings.TrimSpace(record.CheckoutPath)
+	if _, err := os.Stat(checkout); err == nil {
+		if strings.TrimSpace(record.PrimaryCheckoutPath) == "" {
+			if primary, primaryErr := (gitutil.Client{Dir: checkout}).PrimaryWorktree(ctx); primaryErr == nil {
+				if _, healErr := w.Store.HealRepoCheckout(ctx, record.FullName(), checkout, checkout, primary); healErr != nil {
+					return "", healErr
+				}
+			}
+		}
+		return checkout, nil
+	} else if !os.IsNotExist(err) {
+		return checkout, nil
+	}
+
+	primary := strings.TrimSpace(record.PrimaryCheckoutPath)
+	if primary == "" || sameCheckoutPath(primary, checkout) {
+		return checkout, nil
+	}
+	if _, err := os.Stat(primary); err != nil {
+		return checkout, nil
+	}
+	verified, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: primary})
+	if err != nil {
+		return "", fmt.Errorf("verify primary checkout for %s: %w", repo.FullName(), err)
+	}
+	healedPath := strings.TrimSpace(verified.CheckoutPath)
+	healed, err := w.Store.HealRepoCheckout(ctx, repo.FullName(), checkout, healedPath, healedPath)
+	if err != nil {
+		return "", err
+	}
+	if !healed {
+		current, err := w.Store.GetRepo(ctx, repo.FullName())
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(current.CheckoutPath), nil
+	}
+	message := fmt.Sprintf("repo %s checkout self-healed from %s to %s", repo.FullName(), checkout, healedPath)
+	if err := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "repo_checkout_self_healed", Message: message}); err != nil {
+		return "", err
+	}
+	if w.Stdout != nil {
+		writeLine(w.Stdout, "WARN: %s", message)
+	}
+	return healedPath, nil
+}
+
+func sameCheckoutPath(a, b string) bool {
+	return filepath.Clean(strings.TrimSpace(a)) == filepath.Clean(strings.TrimSpace(b))
 }
 
 func (w jobWorker) taskWorktreeCheckout(ctx context.Context, payload workflow.JobPayload) (string, bool, error) {

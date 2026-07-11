@@ -7014,6 +7014,48 @@ func TestWarnSerializedParallelJobsSilentBelowTwo(t *testing.T) {
 	}
 }
 
+func TestResolveJobCheckoutSelfHealsDanglingLinkedWorktree(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	primary, linked := setupLinkedWorktreeRepo(t)
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepoForce(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: linked, PrimaryCheckoutPath: primary}); err != nil {
+		t.Fatalf("UpsertRepoForce returned error: %v", err)
+	}
+	job := db.Job{ID: "job-checkout-heal", Agent: "audit", Type: "ask", State: string(workflow.JobQueued), Payload: `{"repo":"owner/repo"}`}
+	if err := store.CreateJobWithEvent(ctx, job, db.JobEvent{Kind: string(workflow.JobQueued), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	runGit(t, primary, "worktree", "remove", "--force", linked)
+	var output bytes.Buffer
+	worker := jobWorker{Store: store, Stdout: &output}
+	checkout, err := worker.resolveJobCheckout(ctx, job, workflow.JobPayload{Repo: "owner/repo"})
+	if err != nil {
+		t.Fatalf("resolveJobCheckout returned error: %v", err)
+	}
+	if checkout != primary {
+		t.Fatalf("checkout = %q, want healed primary %q", checkout, primary)
+	}
+	record, err := store.GetRepo(ctx, "owner/repo")
+	if err != nil {
+		t.Fatalf("GetRepo returned error: %v", err)
+	}
+	if record.CheckoutPath != primary || record.PrimaryCheckoutPath != primary {
+		t.Fatalf("healed record = %+v", record)
+	}
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !daemonWorkerHasEvent(events, "repo_checkout_self_healed") {
+		t.Fatalf("events = %+v, want repo_checkout_self_healed", events)
+	}
+	if !strings.Contains(output.String(), "WARN:") || !strings.Contains(output.String(), linked) || !strings.Contains(output.String(), primary) {
+		t.Fatalf("warning output = %q", output.String())
+	}
+}
+
 // TestJobStateEligibleForWorktreeReclaim pins the #739-review fix that the
 // worktree reclaim pass also disposes a CANCELLED job's dispatch-allocated
 // read-only worktree, while keeping cancelled OUT of advancement re-run.
