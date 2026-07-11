@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -173,6 +174,10 @@ type JobRequest struct {
 	DelegationFinalize     bool
 	Model                  string
 	Effort                 string
+	// WorkflowID groups jobs started by an external coordinator. Empty preserves
+	// the legacy payload byte-for-byte; non-empty values are inherited by every
+	// delegation child and continuation in the coordination tree.
+	WorkflowID string
 	// RuntimeOverride, when non-empty, runs THIS job through the named runtime
 	// instead of the agent's registered default runtime (#531). The agent's
 	// stored runtime/session are untouched: the job runs on RuntimeOverrideRef
@@ -271,6 +276,7 @@ type JobPayload struct {
 	DelegationFinalize     bool           `json:"delegation_finalize,omitempty"`
 	Model                  string         `json:"model,omitempty"`
 	Effort                 string         `json:"effort,omitempty"`
+	WorkflowID             string         `json:"workflow_id,omitempty"`
 	RuntimeOverride        string         `json:"runtime_override,omitempty"`
 	RuntimeOverrideRef     string         `json:"runtime_override_ref,omitempty"`
 	Phase                  string         `json:"phase,omitempty"`
@@ -412,6 +418,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		DelegationFinalize:     request.DelegationFinalize,
 		Model:                  request.Model,
 		Effort:                 request.Effort,
+		WorkflowID:             strings.TrimSpace(request.WorkflowID),
 		RuntimeOverride:        strings.TrimSpace(request.RuntimeOverride),
 		RuntimeOverrideRef:     strings.TrimSpace(request.RuntimeOverrideRef),
 		Phase:                  request.Phase,
@@ -1322,7 +1329,28 @@ func validateJobRequest(request JobRequest) error {
 	case request.CheckRetries < 0:
 		return errors.New("job check_retries must be >= 0")
 	}
+	if err := ValidateWorkflowID(request.WorkflowID); err != nil {
+		return err
+	}
 	return validateJobRuntimeOverrideRequest(request)
+}
+
+var workflowIDRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
+// ValidateWorkflowID applies the global external-workflow label contract.
+// Empty means the job is ungrouped and is always accepted.
+func ValidateWorkflowID(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	if len(value) > 64 {
+		return errors.New("workflow id must be at most 64 characters")
+	}
+	if !workflowIDRe.MatchString(value) {
+		return fmt.Errorf("invalid workflow id %q: use lowercase letters, digits, and single hyphens", value)
+	}
+	return nil
 }
 
 // validateJobRuntimeOverrideRequest rejects an invalid per-job runtime

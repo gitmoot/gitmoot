@@ -1,5 +1,24 @@
 # Coordinator Recipes Workflow
 
+## Grouping work driven by an external coordinator
+
+Add `--workflow <label>` when a coordinator outside Gitmoot needs to group
+several jobs. It works on agent ask/run/review/implement, `orchestrate`, and
+`job open`; every delegation child and continuation inherits it.
+
+```sh
+gitmoot orchestrate planner "Run release checks." --repo owner/repo --workflow release-42
+gitmoot workflow note release-42 "Canary passed." --author operator --remember
+gitmoot workflow show release-42
+```
+
+Journal text and authors are stored verbatim. JSON keeps them verbatim, while
+terminal text output sanitizes escapes/control bytes and caps each field to one
+line. `--remember` uses low-trust prefiltering,
+defaults to shared memory, and accepts `--agent NAME` for a private pool. A
+single repo is inferred; otherwise pass `--repo`. Rejection writes no note, and
+note plus observation commit atomically. V1 has no lifecycle controls.
+
 Coordinator recipes are built-in agent templates that turn the
 [Orchestra pattern](../reference/result-contract.md#delegations-orchestration)
 into one-command workflows. Each recipe is a coordinator prompt that emits a

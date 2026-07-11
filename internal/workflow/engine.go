@@ -1973,6 +1973,7 @@ func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) 
 		DelegationDepth: payload.DelegationDepth + 1,
 		DelegatedBy:     job.Agent,
 		RootJobID:       rootID,
+		WorkflowID:      payload.WorkflowID,
 		Deps:            compactStrings(d.Deps),
 		JobTimeout:      effectiveDelegationTimeout(d, e.DelegationTimeoutDefaults),
 		Fingerprint:     strings.TrimSpace(d.Fingerprint),
@@ -2589,6 +2590,7 @@ func (e Engine) handleDelegationLoop(ctx context.Context, job db.Job, payload Jo
 		DelegationDepth:    payload.DelegationDepth + 1,
 		DelegatedBy:        job.Agent,
 		RootJobID:          e.rootJobID(job, payload),
+		WorkflowID:         payload.WorkflowID,
 		// Carry the window forward (now including this repeat) and mark that a
 		// corrective nudge has fired, so if the next generation repeats again the
 		// detector escalates to delegation_loop_detected.
@@ -2680,6 +2682,7 @@ func (e Engine) handleDelegationPreflightFailure(ctx context.Context, job db.Job
 		DelegationDepth:    payload.DelegationDepth + 1,
 		DelegatedBy:        job.Agent,
 		RootJobID:          e.rootJobID(job, payload),
+		WorkflowID:         payload.WorkflowID,
 		// Carry the window forward and mark that a corrective nudge has fired, and
 		// thread the streak forward, so a coordinator that keeps naming bad agents
 		// escalates to a graceful finalize.
@@ -2753,6 +2756,7 @@ func (e Engine) enqueueFinalizeContinuation(ctx context.Context, job db.Job, pay
 		DelegationDepth:    payload.DelegationDepth + 1,
 		DelegatedBy:        job.Agent,
 		RootJobID:          e.rootJobID(job, payload),
+		WorkflowID:         payload.WorkflowID,
 		DelegationFinalize: true,
 		ThreadID:           payload.ThreadID,
 		ChatMessageID:      payload.ChatMessageID,
@@ -3529,6 +3533,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 			DelegationDepth: parentPayload.DelegationDepth + 1,
 			DelegatedBy:     parentJob.Agent,
 			RootJobID:       e.rootJobID(parentJob, parentPayload),
+			WorkflowID:      parentPayload.WorkflowID,
 			ThreadID:        parentPayload.ThreadID,
 			ChatMessageID:   parentPayload.ChatMessageID,
 			// Carry the window forward and mark that a corrective nudge has fired so a
@@ -3628,6 +3633,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 			DelegationDepth: parentPayload.DelegationDepth + 1,
 			DelegatedBy:     parentJob.Agent,
 			RootJobID:       e.rootJobID(parentJob, parentPayload),
+			WorkflowID:      parentPayload.WorkflowID,
 			// Consume one verify attempt so a still-failing verdict next generation
 			// climbs toward the cap and eventually finalizes.
 			VerifyAttempt: attempt,
@@ -3714,7 +3720,8 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		DelegatedBy:     parentJob.Agent,
 		// Share the originating coordinator's root so the whole continuation
 		// chain counts against one per-root budget and is visible to loop detection.
-		RootJobID: e.rootJobID(parentJob, parentPayload),
+		RootJobID:  e.rootJobID(parentJob, parentPayload),
+		WorkflowID: parentPayload.WorkflowID,
 		// Record the delegation set that was actually dispatched in the sliding
 		// window so the next generation can detect a non-progress repeat. A real
 		// dispatch happened => progress, so reset the repeat counter; the
@@ -5217,6 +5224,7 @@ func payloadMatchesRequest(payload JobPayload, request JobRequest) bool {
 		payload.ReviewRound == request.ReviewRound &&
 		payload.Sender == request.Sender &&
 		payload.Instructions == request.Instructions &&
+		payload.WorkflowID == request.WorkflowID &&
 		payload.WorktreePath == request.WorktreePath &&
 		payloadDelegationMatchesRequest(payload, request) &&
 		equalStrings(payload.Reviewers, compactStrings(request.Reviewers)) &&

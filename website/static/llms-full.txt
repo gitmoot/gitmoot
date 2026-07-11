@@ -435,6 +435,11 @@ Use `gitmoot runtime list` to inspect runtime metadata and
 `gitmoot router summary` for local observed routing telemetry. Router telemetry
 is advisory only and not a benchmark.
 
+Use `gitmoot workflow list`, `gitmoot workflow show`, and `gitmoot workflow note`
+for external-coordinator workflow groups.
+Attach `--workflow <label>` to agent ask/run/review/implement, orchestrate, or
+`job open`; orchestration descendants inherit the label automatically.
+
 Use `gitmoot report bug --job <job-id> --preview` when a failed, blocked, or
 cancelled Gitmoot job needs a user-shareable bug report. Preview first by
 default. Create with `--create --yes` only when the user explicitly asks or the
@@ -601,6 +606,15 @@ skill text.
 # Source: docs/local-workflow.md
 
 # Local Workflow
+
+## External coordinator grouping
+
+Attach `--workflow <lowercase-slug>` to agent ask/run/review/implement,
+`orchestrate`, or `job open`. Use `gitmoot workflow list`, `show`, and `note` for
+the indexed group and append-only journal. Orchestration descendants inherit the
+label. `workflow note --remember` stages low-trust memory in the shared pool by
+default, infers one repo (or requires `--repo`), and atomically writes the note
+and observation after prefiltering.
 
 Gitmoot V1 runs on one machine. The GitHub repository is the visible audit
 trail, while local SQLite state is the workflow source of truth. The local
@@ -8537,6 +8551,12 @@ can discover Gitmoot through an installed runtime plugin. Use
 adds the resolved `.gitmoot` home to the sandbox on Linux, macOS, and Windows.
 Use `gitmoot goal template` when
 writing a standard task-by-task goal file. Use
+`gitmoot workflow list`, `gitmoot workflow show`, and `gitmoot workflow note`
+to inspect external-coordinator workflow
+groups, add verbatim journal entries, and optionally stage a note in persistent
+memory. Jobs join a group through `--workflow <label>` on agent
+ask/run/review/implement, orchestrate, or `job open`; orchestration descendants
+inherit the label automatically. Use
 `gitmoot report bug --job <job-id> --preview` to inspect a redacted GitHub issue
 draft for failed, blocked, or cancelled jobs; use
 `gitmoot report bug --job <job-id> --create --yes` only when the user
@@ -9735,6 +9755,36 @@ defaults to `templates`) so publish/pull/add can omit `--repo`; with no remote
 configured, those commands require an explicit `--repo`. **Caution: templates
 are stored and published VERBATIM (prompt body + metadata) — point the remote
 at a PRIVATE repo unless the prompts are meant to be public.**
+
+## External-coordinator workflow groups
+
+Attach a global workflow label to work started outside Gitmoot's own goal/task
+coordinator. Labels are lowercase slugs up to 64 characters. The label is
+accepted by `agent ask`, `agent run`, `agent review`, `agent implement`,
+`orchestrate`, and `job open`; delegation children and every coordinator
+continuation inherit it.
+
+```sh
+gitmoot orchestrate planner "Coordinate the release." --repo owner/repo --workflow release-42
+gitmoot job list --workflow release-42
+gitmoot workflow list
+gitmoot workflow show release-42 --limit 100
+gitmoot workflow note release-42 "The staging rollout completed." --author operator
+```
+
+`workflow list` reports per-state counts, note count, first/last activity, and
+best-effort token totals. `workflow show` merges jobs and notes chronologically.
+Labels may be reused; timestamps expose the reuse. `workflow note` stores body
+and author verbatim (10 KiB and 128-byte limits) and rejects labels with no jobs.
+`workflow show --json` returns those verbatim bytes; plain-text output strips
+terminal escape sequences, maps control characters to spaces (except tabs), and
+caps each rendered field to one bounded line.
+
+Add `--remember` to stage low-trust repo memory. The default pool is shared;
+`--agent NAME` opts into that registered agent's private pool. Exactly one repo
+is inferred from group jobs; zero or multiple repos require `--repo`. Note and
+observation commit atomically. Prefilter rejection reports the reason and writes
+neither. Existing `[memory].ingest_auto_confirm` behavior is honored.
 
 ## Goals
 
@@ -11367,6 +11417,27 @@ requires a non-empty repo and sends only a queued-job acknowledgement because
 # Source: skills/gitmoot/references/WORKFLOWS.md
 
 # Gitmoot Workflows
+
+## External-coordinator workflows
+
+Use `--workflow <label>` when an external coordinator needs one durable group
+across Gitmoot jobs without lifecycle state. The flag works on agent
+ask/run/review/implement, `orchestrate`, and `job open`; orchestration children
+and continuations inherit it.
+
+```sh
+gitmoot orchestrate planner "Run release checks." --repo owner/repo --workflow release-42
+gitmoot workflow note release-42 "Canary passed." --author operator --remember
+gitmoot workflow show release-42
+```
+
+The append-only journal stores text and authors verbatim. JSON show output keeps
+them verbatim; terminal text output sanitizes escapes/control bytes and caps each
+field to one line. `--remember` uses the
+normal low-trust prefilter/dedup path, defaults to the shared pool, and accepts
+`--agent NAME` for a registered agent's private pool. A single repo is inferred;
+otherwise `--repo` is required. Rejection writes no note, and note plus
+observation are atomic. V1 has no group lifecycle controls and allows reuse.
 
 ## First Repo Setup
 

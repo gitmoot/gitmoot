@@ -90,6 +90,9 @@ func deriveStuckReason(job db.Job, reasonEvent db.JobEvent, hasReasonEvent bool,
 		if payload, err := daemonJobPayload(job); err == nil {
 			next = strings.TrimSpace(payload.BlockerRetryAt)
 			action = strings.TrimSpace(payload.BlockerSuggestedAction)
+		} else if job.Payload == "" {
+			next = strings.TrimSpace(job.BlockerRetryAt)
+			action = strings.TrimSpace(job.BlockerSuggestedAction)
 		}
 		return stuckReason{Reason: withDetail("blocked-operational", msg), NextRetryAt: next, SuggestedAction: action}
 	case "runtime_lock_wait":

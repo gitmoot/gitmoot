@@ -843,6 +843,28 @@ at a PRIVATE repo unless the prompts are meant to be public.** See the
 [template capture workflow](../workflows/template-capture-workflow.md#back-up-and-share-templates-via-github)
 for the full flow.
 
+## External-coordinator workflow groups
+
+Pass `--workflow <label>` to `agent ask`, `agent run`, `agent review`, `agent
+implement`, `orchestrate`, or `job open`. Labels are global lowercase slugs up
+to 64 characters; orchestration children and continuations inherit the label.
+
+```sh
+gitmoot orchestrate planner "Coordinate the release." --repo owner/repo --workflow release-42
+gitmoot job list --workflow release-42
+gitmoot workflow list
+gitmoot workflow show release-42 --limit 100
+gitmoot workflow note release-42 "The staging rollout completed." --author operator
+```
+
+List/show include state counts, notes, first/last activity, and best-effort token
+totals. Notes store bodies and authors verbatim. `--remember` stages low-trust
+memory in the shared pool by default; `--agent NAME` selects a registered
+agent's private pool. A single repo is inferred, otherwise `--repo` is required.
+The note and observation are atomic, and prefilter rejection writes neither.
+JSON returns note bytes verbatim; plain-text show output strips terminal escape
+sequences, maps control characters to spaces except tabs, and caps each field.
+
 ## Goals
 
 Print the standard Gitmoot goal prompt template:

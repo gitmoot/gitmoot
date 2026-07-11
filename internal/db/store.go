@@ -253,6 +253,15 @@ type Job struct {
 	// truth; this column is a write-time denormalized index. It is populated by
 	// the ListJobsByRoot projection (other readers may leave it empty).
 	RootID string
+	// WorkflowID is the externally assigned global workflow label, denormalized
+	// from payload.workflow_id for indexed grouping and filtering.
+	WorkflowID string `json:"workflow_id,omitempty"`
+	// Repo/PullRequest are lightweight workflow-list projections. General job
+	// readers leave them empty because their payload already carries these values.
+	Repo                   string `json:"repo,omitempty"`
+	PullRequest            int    `json:"pull_request,omitempty"`
+	BlockerRetryAt         string `json:"blocker_retry_at,omitempty"`
+	BlockerSuggestedAction string `json:"blocker_suggested_action,omitempty"`
 	// RootKilled is the operator kill-switch flag (#341). When true, the
 	// delegation tree rooted at this job has been killed: the engine's next
 	// dispatch routes through the graceful finalize continuation instead of
@@ -2487,16 +2496,34 @@ func rootIDFromPayload(payload string) string {
 	return p.RootJobID
 }
 
+type jobPayloadProjection struct {
+	WorkflowID             string `json:"workflow_id"`
+	Repo                   string `json:"repo"`
+	PullRequest            int    `json:"pull_request"`
+	BlockerRetryAt         string `json:"blocker_retry_at"`
+	BlockerSuggestedAction string `json:"blocker_suggested_action"`
+}
+
+func jobProjectionFromPayload(payload string) jobPayloadProjection {
+	var p jobPayloadProjection
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		return jobPayloadProjection{}
+	}
+	return p
+}
+
 func (s *Store) CreateJob(ctx context.Context, job Job) error {
 	// root_id is a denormalized index of the engine's rootJobID() rule (#420):
 	// bind the SAME COALESCE(NULLIF(?,''), ?) to (payload.RootJobID, job.ID) so
 	// the invariant — payload root when set, else self-root — holds regardless of
 	// caller. payload.RootJobID stays the value source of truth.
-	_, err := s.db.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), CURRENT_TIMESTAMP)`,
+	projection := jobProjectionFromPayload(job.Payload)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
 		job.ID, job.Agent, job.Type, job.State, job.Payload,
 		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy,
-		rootIDFromPayload(job.Payload), job.ID)
+		rootIDFromPayload(job.Payload), job.ID, projection.WorkflowID, projection.Repo, projection.PullRequest,
+		projection.BlockerRetryAt, projection.BlockerSuggestedAction)
 	return err
 }
 
@@ -2509,11 +2536,13 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent)
 
 	// See CreateJob: same COALESCE(NULLIF(?,''), ?) bound to (payload.RootJobID,
 	// job.ID) denormalizes the rootJobID() rule onto the indexed root_id column.
-	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), CURRENT_TIMESTAMP)`,
+	projection := jobProjectionFromPayload(job.Payload)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
 		job.ID, job.Agent, job.Type, job.State, job.Payload,
 		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy,
-		rootIDFromPayload(job.Payload), job.ID); err != nil {
+		rootIDFromPayload(job.Payload), job.ID, projection.WorkflowID, projection.Repo, projection.PullRequest,
+		projection.BlockerRetryAt, projection.BlockerSuggestedAction); err != nil {
 		return err
 	}
 	if event.JobID == "" {
@@ -2540,11 +2569,13 @@ func (s *Store) CreateExternallyDrivenJobWithEvent(ctx context.Context, job Job,
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, externally_driven, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), 1, CURRENT_TIMESTAMP)`,
+	projection := jobProjectionFromPayload(job.Payload)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, externally_driven, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)`,
 		job.ID, job.Agent, job.Type, job.State, job.Payload,
 		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy,
-		rootIDFromPayload(job.Payload), job.ID); err != nil {
+		rootIDFromPayload(job.Payload), job.ID, projection.WorkflowID, projection.Repo, projection.PullRequest,
+		projection.BlockerRetryAt, projection.BlockerSuggestedAction); err != nil {
 		return err
 	}
 	if event.JobID == "" {
@@ -2594,18 +2625,18 @@ func (s *Store) IsRootJobKilled(ctx context.Context, rootID string) (bool, error
 }
 
 func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven FROM jobs WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, workflow_id, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven FROM jobs WHERE id = ?`, id)
 	var job Job
-	if err := row.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ExternallyDriven); err != nil {
+	if err := row.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.WorkflowID, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ExternallyDriven); err != nil {
 		return Job{}, err
 	}
 	return job, nil
 }
 
-// jobColumns is the 15-column projection ListJobs and ListJobsByType both read (the
-// full jobs row except root_id), kept as one const so their SELECT lists — and the
-// scanJobs scan order below — can never drift apart.
-const jobColumns = `id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven`
+// jobColumns is the shared core projection ListJobs and ListJobsByType both
+// read, kept as one const so their SELECT lists and scanJobs order cannot drift.
+// Workflow-only scalar projections are selected by ListJobsByWorkflow.
+const jobColumns = `id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, workflow_id, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven`
 
 // scanJobs reads every row of a *sql.Rows produced by a `SELECT `+jobColumns+`
 // FROM jobs …` query into Jobs, in jobColumns order, and closes rows. Shared by
@@ -2615,7 +2646,7 @@ func scanJobs(rows *sql.Rows) ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ExternallyDriven); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.WorkflowID, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ExternallyDriven); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -3015,7 +3046,10 @@ func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id strin
 	}
 	defer tx.Rollback()
 
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, payload, id, from)
+	projection := jobProjectionFromPayload(payload)
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
+		to, payload, projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+		projection.BlockerSuggestedAction, id, from, projection.WorkflowID)
 	if err != nil {
 		return false, err
 	}
@@ -3024,6 +3058,9 @@ func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id strin
 		return false, err
 	}
 	if affected == 0 {
+		if err := rejectWorkflowIDMismatch(ctx, tx, id, projection.WorkflowID); err != nil {
+			return false, err
+		}
 		return false, tx.Commit()
 	}
 	if event.JobID == "" {
@@ -3055,8 +3092,10 @@ func (s *Store) DelegateQueuedJob(ctx context.Context, id string, fromAgent stri
 	// in the same coordination tree, so its root_id (set at insert from the
 	// original payload's RootJobID) remains correct. A re-delegation never carries
 	// a new RootJobID, so re-binding the COALESCE would only re-derive the same id.
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET agent = ?, payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND agent = ? AND state = ?`,
-		strings.TrimSpace(toAgent), payload, id, strings.TrimSpace(fromAgent), "queued")
+	projection := jobProjectionFromPayload(payload)
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET agent = ?, payload = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND agent = ? AND state = ? AND workflow_id = ?`,
+		strings.TrimSpace(toAgent), payload, projection.Repo, projection.PullRequest,
+		projection.BlockerRetryAt, projection.BlockerSuggestedAction, id, strings.TrimSpace(fromAgent), "queued", projection.WorkflowID)
 	if err != nil {
 		return false, err
 	}
@@ -3065,6 +3104,9 @@ func (s *Store) DelegateQueuedJob(ctx context.Context, id string, fromAgent stri
 		return false, err
 	}
 	if affected == 0 {
+		if err := rejectWorkflowIDMismatch(ctx, tx, id, projection.WorkflowID); err != nil {
+			return false, err
+		}
 		return false, tx.Commit()
 	}
 	if event.JobID == "" {
@@ -3077,11 +3119,48 @@ func (s *Store) DelegateQueuedJob(ctx context.Context, id string, fromAgent stri
 }
 
 func (s *Store) UpdateJobPayload(ctx context.Context, id string, payload string) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, payload, id)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	return requireAffected(result, "job", id)
+	defer tx.Rollback()
+	projection := jobProjectionFromPayload(payload)
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET payload = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND workflow_id = ?`,
+		payload, projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+		projection.BlockerSuggestedAction, id, projection.WorkflowID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		if err := rejectWorkflowIDMismatch(ctx, tx, id, projection.WorkflowID); err != nil {
+			return err
+		}
+		return requireAffected(result, "job", id)
+	}
+	return tx.Commit()
+}
+
+type queryRower interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func rejectWorkflowIDMismatch(ctx context.Context, q queryRower, id, incoming string) error {
+	var stored string
+	err := q.QueryRowContext(ctx, `SELECT workflow_id FROM jobs WHERE id = ?`, id).Scan(&stored)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if stored != incoming {
+		return fmt.Errorf("job %q workflow id is immutable: stored %q, incoming %q", id, stored, incoming)
+	}
+	return nil
 }
 
 // UpdateJobUsage records the runtime token usage for a job (best-effort capture
@@ -8571,5 +8650,27 @@ CREATE TABLE groom_llm_verdicts (
 	model TEXT NOT NULL DEFAULT '',
 	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+	`,
+	// #843 external-coordinator workflow grouping and journal. workflow_id is
+	// denormalized from the payload at every insert path; the partial index has no
+	// write cost for legacy/unlabelled jobs. Notes are append-only journal entries.
+	`
+ALTER TABLE jobs ADD COLUMN workflow_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN repo TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN pull_request INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN blocker_retry_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN blocker_suggested_action TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_jobs_workflow_id ON jobs(workflow_id) WHERE workflow_id != '';
+
+CREATE TABLE workflow_notes (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	workflow_id TEXT NOT NULL,
+	author TEXT NOT NULL DEFAULT '',
+	body TEXT NOT NULL,
+	repo TEXT NOT NULL DEFAULT '',
+	memory_observation_id INTEGER NOT NULL DEFAULT 0,
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_workflow_notes_wid ON workflow_notes(workflow_id, created_at, id);
 	`,
 }

@@ -1,5 +1,14 @@
 # Local Workflow
 
+## External coordinator grouping
+
+Attach `--workflow <lowercase-slug>` to agent ask/run/review/implement,
+`orchestrate`, or `job open`. Use `gitmoot workflow list`, `show`, and `note` for
+the indexed group and append-only journal. Orchestration descendants inherit the
+label. `workflow note --remember` stages low-trust memory in the shared pool by
+default, infers one repo (or requires `--repo`), and atomically writes the note
+and observation after prefiltering.
+
 Gitmoot V1 runs on one machine. The GitHub repository is the visible audit
 trail, while local SQLite state is the workflow source of truth. The local
 daemon polls GitHub PRs and comments, routes jobs to registered agents, resumes

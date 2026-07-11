@@ -250,6 +250,11 @@ Use `gitmoot runtime list` to inspect runtime metadata and
 `gitmoot router summary` for local observed routing telemetry. Router telemetry
 is advisory only and not a benchmark.
 
+Use `gitmoot workflow list`, `gitmoot workflow show`, and `gitmoot workflow note`
+for external-coordinator workflow groups.
+Attach `--workflow <label>` to agent ask/run/review/implement, orchestrate, or
+`job open`; orchestration descendants inherit the label automatically.
+
 Use `gitmoot report bug --job <job-id> --preview` when a failed, blocked, or
 cancelled Gitmoot job needs a user-shareable bug report. Preview first by
 default. Create with `--create --yes` only when the user explicitly asks or the

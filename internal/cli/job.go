@@ -56,7 +56,7 @@ func runJob(args []string, stdout, stderr io.Writer) int {
 
 func printJobUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot job list [--repo owner/repo] [--state state] [--json]")
+	fmt.Fprintln(w, "  gitmoot job list [--repo owner/repo] [--state state] [--workflow label] [--json]")
 	fmt.Fprintln(w, "  gitmoot job show <id> [--json]")
 	fmt.Fprintln(w, "  gitmoot job events <id>")
 	fmt.Fprintln(w, "  gitmoot job watch <id> [--poll 1s] [--json]")
@@ -67,7 +67,7 @@ func printJobUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot job cancel <id>")
 	fmt.Fprintln(w, "  gitmoot job cancel --state blocked [--older-than 168h|7d] [--repo owner/repo] [--agent name] [--yes]")
 	fmt.Fprintln(w, "  gitmoot job kill <root-job-id>")
-	fmt.Fprintln(w, "  gitmoot job open --agent name --repo owner/repo --type ask|review|implement [--title ...] [--task id] [--pr n] [--json]")
+	fmt.Fprintln(w, "  gitmoot job open --agent name --repo owner/repo --type ask|review|implement [--title ...] [--task id] [--pr n] [--workflow label] [--json]")
 	fmt.Fprintln(w, "  gitmoot job close <id> --decision approved|changes_requested|blocked|implemented|failed|skipped [--summary ...] [--pr n] [--branch name] [--json]")
 	fmt.Fprintln(w, "  gitmoot job record --agent name --repo owner/repo --type ask|review|implement --decision ... [--title ...] [--summary ...] [--task id] [--pr n] [--branch name] [--json]")
 }
@@ -78,6 +78,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	repo := fs.String("repo", "", "repo scope as owner/repo")
 	state := fs.String("state", "", "job state filter")
+	workflowID := fs.String("workflow", "", "external-coordinator workflow label")
 	jsonOutput := fs.Bool("json", false, "print jobs (with why-stuck detail) as JSON")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -87,6 +88,14 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 	}
 	if fs.NArg() != 0 {
 		fmt.Fprintln(stderr, "job list does not accept positional arguments")
+		return 2
+	}
+	if flagWasSupplied(fs, "workflow") && strings.TrimSpace(*workflowID) == "" {
+		fmt.Fprintln(stderr, "job list: --workflow requires a non-blank value")
+		return 2
+	}
+	if err := workflow.ValidateWorkflowID(*workflowID); err != nil {
+		fmt.Fprintf(stderr, "job list: %v\n", err)
 		return 2
 	}
 	var jobs []db.Job
@@ -104,7 +113,11 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 	var locks []db.ResourceLock
 	if err := withStore(*home, func(store *db.Store) error {
 		var err error
-		jobs, err = store.ListJobs(context.Background())
+		if strings.TrimSpace(*workflowID) != "" {
+			jobs, err = store.ListJobsByWorkflow(context.Background(), strings.TrimSpace(*workflowID), 0)
+		} else {
+			jobs, err = store.ListJobs(context.Background())
+		}
 		if err != nil {
 			return err
 		}
@@ -120,7 +133,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 	if *jsonOutput {
 		entries := make([]jobListEntry, 0, len(filtered))
 		for _, job := range filtered {
-			payload, _ := daemonJobPayload(job)
+			payload, _ := jobListPayload(job)
 			ev, ok := reasonEvents[job.ID]
 			reason := deriveStuckReason(job, ev, ok, locks)
 			entries = append(entries, jobListEntry{
@@ -130,6 +143,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 				Agent:           job.Agent,
 				Repo:            payload.Repo,
 				PullRequest:     payload.PullRequest,
+				WorkflowID:      job.WorkflowID,
 				PreflightFailed: strings.TrimSpace(preflightFailed[job.ID]),
 				WhyStuck:        reason.Reason,
 				NextRetryAt:     reason.NextRetryAt,
@@ -143,8 +157,11 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	for _, job := range filtered {
-		payload, _ := daemonJobPayload(job)
+		payload, _ := jobListPayload(job)
 		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t#%d", job.ID, job.State, job.Type, job.Agent, payload.Repo, payload.PullRequest)
+		if job.WorkflowID != "" {
+			fmt.Fprintf(stdout, "\tworkflow=%s", job.WorkflowID)
+		}
 		if reason, ok := preflightFailed[job.ID]; ok && strings.TrimSpace(reason) != "" {
 			fmt.Fprintf(stdout, "\tPREFLIGHT_FAILED: %s", reason)
 		}
@@ -163,6 +180,16 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+func flagWasSupplied(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
 // jobListEntry is the JSON shape for `job list --json`: the existing table
 // columns plus the additive why-stuck fields (#552). The stuck fields are omitted
 // when empty so a healthy job's JSON is not bloated.
@@ -173,6 +200,7 @@ type jobListEntry struct {
 	Agent           string `json:"agent"`
 	Repo            string `json:"repo"`
 	PullRequest     int    `json:"pull_request"`
+	WorkflowID      string `json:"workflow_id,omitempty"`
 	PreflightFailed string `json:"preflight_failed,omitempty"`
 	WhyStuck        string `json:"why_stuck,omitempty"`
 	NextRetryAt     string `json:"next_retry_at,omitempty"`
@@ -737,7 +765,7 @@ func filterJobs(jobs []db.Job, repoFilter string, stateFilter string) []db.Job {
 			continue
 		}
 		if repoFilter != "" {
-			payload, err := daemonJobPayload(job)
+			payload, err := jobListPayload(job)
 			if err != nil || payload.Repo != repoFilter {
 				continue
 			}
@@ -748,6 +776,17 @@ func filterJobs(jobs []db.Job, repoFilter string, stateFilter string) []db.Job {
 		return filtered[i].ID < filtered[j].ID
 	})
 	return filtered
+}
+
+func jobListPayload(job db.Job) (workflow.JobPayload, error) {
+	if job.Payload == "" {
+		return workflow.JobPayload{
+			Repo:        job.Repo,
+			PullRequest: job.PullRequest,
+			WorkflowID:  job.WorkflowID,
+		}, nil
+	}
+	return daemonJobPayload(job)
 }
 
 func printJob(stdout io.Writer, job db.Job, payload workflow.JobPayload, reason stuckReason) {
@@ -764,6 +803,9 @@ func printJob(stdout io.Writer, job db.Job, payload workflow.JobPayload, reason 
 	}
 	fmt.Fprintf(stdout, "type: %s\n", job.Type)
 	fmt.Fprintf(stdout, "agent: %s\n", job.Agent)
+	if payload.WorkflowID != "" {
+		fmt.Fprintf(stdout, "workflow: %s\n", payload.WorkflowID)
+	}
 	fmt.Fprintf(stdout, "repo: %s\n", payload.Repo)
 	fmt.Fprintf(stdout, "branch: %s\n", payload.Branch)
 	fmt.Fprintf(stdout, "pull_request: %d\n", payload.PullRequest)
