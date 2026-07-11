@@ -98,7 +98,26 @@ func TestClientWritesPieceConnectionAndFlowRequests(t *testing.T) {
 	}
 }
 
-func TestInstallPieceOmitsEmptyVersion(t *testing.T) {
+func TestInstallPieceRejectsEmptyVersion(t *testing.T) {
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.InstallPiece(context.Background(), "token", "@gitmoot/piece-gitmoot", ""); err == nil {
+		t.Fatal("expected an error when the piece version is empty")
+	}
+	if called {
+		t.Fatal("Activepieces should not be called with an empty piece version")
+	}
+}
+
+func TestInstallPieceSendsVersion(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -106,9 +125,9 @@ func TestInstallPieceOmitsEmptyVersion(t *testing.T) {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		if _, ok := body["pieceVersion"]; ok {
-			t.Errorf("pieceVersion should be omitted: %+v", body)
-			http.Error(w, "pieceVersion present", http.StatusBadRequest)
+		if body["pieceVersion"] != "0.1.2" {
+			t.Errorf("pieceVersion = %v, want 0.1.2", body["pieceVersion"])
+			http.Error(w, "wrong version", http.StatusBadRequest)
 			return
 		}
 		w.WriteHeader(http.StatusCreated)
@@ -118,7 +137,7 @@ func TestInstallPieceOmitsEmptyVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := client.InstallPiece(context.Background(), "token", "@gitmoot/piece-gitmoot", ""); err != nil {
+	if err := client.InstallPiece(context.Background(), "token", "@gitmoot/piece-gitmoot", "0.1.2"); err != nil {
 		t.Fatal(err)
 	}
 }

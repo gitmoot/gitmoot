@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -161,7 +162,9 @@ func runActivepiecesSetup(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 	}
-	client, err := activepieces.NewClient(targetURL, nil)
+	// The piece install is synchronous (npm tarball download + engine metadata
+	// extraction) and can exceed the default 30s, so give the client room.
+	client, err := activepieces.NewClient(targetURL, &http.Client{Timeout: 180 * time.Second})
 	if err != nil {
 		fmt.Fprintf(stderr, "activepieces setup: %v\n", err)
 		return 1
@@ -205,9 +208,15 @@ func runActivepiecesSetup(args []string, stdout, stderr io.Writer) int {
 	if resolvedPieceVersion == "" {
 		resolvedPieceVersion, err = activepieces.ResolveLatestPieceVersion(context.Background())
 		if err != nil {
-			fmt.Fprintf(stderr, "activepieces setup: warning: %v; Activepieces will resolve the latest piece version\n", err)
-			resolvedPieceVersion = ""
+			// Activepieces 0.82 requires an exact pieceVersion, so there is no
+			// safe empty fallback: ask the user to pin one.
+			fmt.Fprintf(stderr, "activepieces setup: could not resolve the latest @gitmoot/piece-gitmoot version from npm (%v); re-run with --piece-version X.Y.Z\n", err)
+			return 1
 		}
+	}
+	if !isExactPieceVersion(resolvedPieceVersion) {
+		fmt.Fprintf(stderr, "activepieces setup: piece version %q must be exact like 0.1.2 (no ~ or ^)\n", resolvedPieceVersion)
+		return 2
 	}
 	if err := client.InstallPiece(context.Background(), token, "@gitmoot/piece-gitmoot", resolvedPieceVersion); err != nil {
 		fmt.Fprintf(stderr, "activepieces setup: %v\n", err)
@@ -233,11 +242,7 @@ func runActivepiecesSetup(args []string, stdout, stderr io.Writer) int {
 	if createdAccount && !printedCredentials {
 		fmt.Fprintf(stdout, "  Admin: %s (credentials saved at %s)\n", strings.TrimSpace(*email), credentialsPath)
 	}
-	if resolvedPieceVersion == "" {
-		fmt.Fprintln(stdout, "  Piece: @gitmoot/piece-gitmoot (latest)")
-	} else {
-		fmt.Fprintf(stdout, "  Piece: @gitmoot/piece-gitmoot@%s\n", resolvedPieceVersion)
-	}
+	fmt.Fprintf(stdout, "  Piece: @gitmoot/piece-gitmoot@%s\n", resolvedPieceVersion)
 	fmt.Fprintf(stdout, "  Connection: %s -> %s\n", activepiecesConnectionID, strings.TrimRight(*bridgeURL, "/"))
 	if len(imported) > 0 {
 		fmt.Fprintln(stdout, "  Starter flows:")
@@ -247,6 +252,14 @@ func runActivepiecesSetup(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stdout, "  Next: authorize Gmail or another mailbox provider. See docs/gmail.md.")
 	return 0
+}
+
+// exactPieceVersionPattern matches Activepieces' ExactVersionType for a
+// REGISTRY install: a bare semver with no range prefix.
+var exactPieceVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+
+func isExactPieceVersion(v string) bool {
+	return exactPieceVersionPattern.MatchString(strings.TrimSpace(v))
 }
 
 func activepiecesFlagWasSet(fs *flag.FlagSet, name string) bool {

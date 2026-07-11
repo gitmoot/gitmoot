@@ -121,13 +121,17 @@ func accountAlreadyExists(err error) bool {
 }
 
 func (c *Client) InstallPiece(ctx context.Context, token, pieceName, pieceVersion string) error {
-	body := map[string]any{
-		"pieceName":   pieceName,
-		"scope":       "PLATFORM",
-		"packageType": "REGISTRY",
+	pieceVersion = strings.TrimSpace(pieceVersion)
+	if pieceVersion == "" {
+		// Activepieces 0.82 requires an exact pieceVersion for a REGISTRY
+		// install; an empty value is rejected with an opaque 400.
+		return errors.New("install Activepieces piece: an exact piece version is required")
 	}
-	if strings.TrimSpace(pieceVersion) != "" {
-		body["pieceVersion"] = strings.TrimSpace(pieceVersion)
+	body := map[string]any{
+		"pieceName":    pieceName,
+		"pieceVersion": pieceVersion,
+		"scope":        "PLATFORM",
+		"packageType":  "REGISTRY",
 	}
 	if err := c.doJSON(ctx, http.MethodPost, "/api/v1/pieces", token, body, nil); err != nil {
 		if resourceAlreadyExists(err) {

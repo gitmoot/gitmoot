@@ -30,6 +30,21 @@ func TestResolveBridgeBind(t *testing.T) {
 	}
 }
 
+func TestIsExactPieceVersion(t *testing.T) {
+	exact := []string{"0.1.2", "1.0.0", "12.34.56"}
+	for _, v := range exact {
+		if !isExactPieceVersion(v) {
+			t.Errorf("isExactPieceVersion(%q) = false, want true", v)
+		}
+	}
+	ranged := []string{"", "~0.1.2", "^0.1.0", "0.1", "latest", "0.1.2-beta", "v0.1.2"}
+	for _, v := range ranged {
+		if isExactPieceVersion(v) {
+			t.Errorf("isExactPieceVersion(%q) = true, want false", v)
+		}
+	}
+}
+
 func TestActivepiecesTemplatesList(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := runActivepieces([]string{"templates", "list"}, &stdout, &stderr)
