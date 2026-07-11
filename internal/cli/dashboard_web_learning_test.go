@@ -787,6 +787,65 @@ func TestKnowledgeClusterPayloadParentIDAndLeafFacts(t *testing.T) {
 	}
 }
 
+func TestKnowledgeClusterPayloadRollsUpArbitraryDepth(t *testing.T) {
+	home := dashboardTestHome(t)
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	dbIDs, netIDs := seedClusterCorpus(t, store)
+	const (
+		rootID  = int64(1<<51 + 81)
+		midID   = int64(1<<51 + 82)
+		leafAID = int64(1<<52 + 83)
+		leafBID = int64(1<<52 + 84)
+	)
+	assignment := db.MemoryClusterAssignment{Clusters: []db.MemoryCluster{
+		{ClusterID: rootID, Label: "systems", MedoidID: dbIDs[0]},
+		{ClusterID: midID, ParentID: rootID, Label: "runtime", MedoidID: dbIDs[0]},
+		{ClusterID: leafAID, ParentID: midID, Label: "database", MedoidID: dbIDs[0]},
+		{ClusterID: leafBID, ParentID: midID, Label: "network", MedoidID: netIDs[0]},
+	}}
+	for _, id := range dbIDs {
+		assignment.Members = append(assignment.Members, db.MemoryClusterMember{MemoryID: id, ClusterID: leafAID})
+	}
+	for _, id := range netIDs {
+		assignment.Members = append(assignment.Members, db.MemoryClusterMember{MemoryID: id, ClusterID: leafBID})
+	}
+	if err := store.RecomputeMemoryClusters(context.Background(), assignment); err != nil {
+		t.Fatalf("seed deep hierarchy: %v", err)
+	}
+	store.Close()
+
+	ds := &webDataSource{home: home}
+	rr := httptest.NewRecorder()
+	ds.handleLearningKnowledge(rr, httptest.NewRequest("GET", "/api/learning/knowledge", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("knowledge HTTP status %d: %s", rr.Code, rr.Body.String())
+	}
+	var payload dashboardKnowledgeResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	byID := map[string]dashboardKnowledgeCluster{}
+	for _, cluster := range payload.Clusters {
+		byID[cluster.ID] = cluster
+	}
+	root, middle := byID[clusterHubID(rootID)], byID[clusterHubID(midID)]
+	if root.Count != 6 || root.ParentID != "" || root.Medoid != fmt.Sprintf("fact:%d", dbIDs[0]) {
+		t.Fatalf("deep root payload = %+v", root)
+	}
+	if middle.Count != 6 || middle.ParentID != clusterHubID(rootID) {
+		t.Fatalf("deep middle payload = %+v", middle)
+	}
+	for _, leafID := range []int64{leafAID, leafBID} {
+		leaf := byID[clusterHubID(leafID)]
+		if leaf.Count != 3 || leaf.ParentID != clusterHubID(midID) {
+			t.Fatalf("deep leaf payload = %+v", leaf)
+		}
+	}
+}
+
 // TestClusterHubID covers the cluster/repo hub-id derivation.
 func TestClusterHubID(t *testing.T) {
 	if got := clusterHubID(3); got != "cluster:3" {

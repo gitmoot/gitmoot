@@ -653,8 +653,8 @@ pace_lambda = 0
 // max_pairs are hard config errors.
 func TestLoadSkillOptPolicyRejectsBadPace(t *testing.T) {
 	cases := map[string]string{
-		"alpha too high": "pace_alpha = 1.0",
-		"alpha zero":     "pace_alpha = 0",
+		"alpha too high":  "pace_alpha = 1.0",
+		"alpha zero":      "pace_alpha = 0",
 		"lambda too high": "pace_lambda = 1.5",
 		"lambda negative": "pace_lambda = -0.1",
 		"max_pairs zero":  "pace_max_pairs = 0",

@@ -2,6 +2,7 @@ package memory
 
 import (
 	"reflect"
+	"sort"
 	"testing"
 )
 
@@ -215,6 +216,254 @@ func TestClusterHierarchyHysteresis(t *testing.T) {
 	if childCount(dissolved) != 0 || len(dissolved.Clusters) != 1 || len(dissolved.Clusters[0].Members) != 11 {
 		t.Fatalf("11-fact split did not dissolve to its parent: %+v", dissolved)
 	}
+}
+
+func TestClusterHierarchyFanoutDeterministicAndHysteretic(t *testing.T) {
+	top13, nodes13, edges13 := crowdedTopLevelFixture(13, "acme/repo")
+	options := ClusterHierarchyOptions{Fanout: 12, FanoutKeep: 9, DepthCap: 4}
+	first := buildClusterHierarchyWithOptions(top13, nodes13, edges13, options)
+	if maxChildren(first) > 12 {
+		t.Fatalf("fanout = %d, want <= 12: %+v", maxChildren(first), first)
+	}
+	state := topSyntheticState(first, "acme/repo")
+	options.Existing = state
+	second := buildClusterHierarchyWithOptions(top13, nodes13, edges13, options)
+	third := buildClusterHierarchyWithOptions(top13, nodes13, edges13, options)
+	if !reflect.DeepEqual(second, third) {
+		t.Fatalf("unchanged hierarchy with persisted state is not deterministic:\nsecond=%+v\nthird=%+v", second, third)
+	}
+
+	top11, nodes11, edges11 := crowdedTopLevelFixture(11, "acme/repo")
+	shrunk := buildClusterHierarchyWithOptions(top11, nodes11, edges11, options)
+	if syntheticCount(shrunk) == 0 {
+		t.Fatalf("13->11 boundary dissolved existing grouping above keep=9: %+v", shrunk)
+	}
+	oldIDs := syntheticIDs(first)
+	for id := range syntheticIDs(shrunk) {
+		if oldIDs[id] {
+			return
+		}
+	}
+	t.Fatalf("13->11 boundary retained no synthetic parent identity: first=%+v shrunk=%+v", first, shrunk)
+}
+
+func TestClusterHierarchyCrowdingIsPerRepoScope(t *testing.T) {
+	topA, nodesA, edgesA := crowdedTopLevelFixture(13, "acme/a")
+	topB, nodesB, edgesB := crowdedTopLevelFixtureOffset(8, 100, "acme/b")
+	top := ClusterResult{Clusters: append(topA.Clusters, topB.Clusters...)}
+	nodes := append(nodesA, nodesB...)
+	edges := append(edgesA, edgesB...)
+	result := buildClusterHierarchyWithOptions(top, nodes, edges, ClusterHierarchyOptions{Fanout: 12, FanoutKeep: 9, DepthCap: 4})
+	byID := map[int64]Cluster{}
+	for _, cluster := range result.Clusters {
+		byID[cluster.ID] = cluster
+	}
+	for _, cluster := range result.Clusters {
+		if cluster.BaseCommunity && cluster.MedoidID >= 101 && cluster.ParentID != 0 {
+			t.Fatalf("uncrowded repo B cluster was grouped: %+v", cluster)
+		}
+	}
+	if syntheticCount(result) == 0 {
+		t.Fatalf("crowded repo A was not grouped: %+v", result)
+	}
+	_ = byID
+}
+
+func TestClusterHierarchyFanoutUsesMultipleLevelsWithinDepthCap(t *testing.T) {
+	top, nodes, edges := crowdedTopLevelFixture(145, "acme/repo")
+	options := ClusterHierarchyOptions{Fanout: 12, FanoutKeep: 9, DepthCap: 4}
+	result := buildClusterHierarchyWithOptions(top, nodes, edges, options)
+	if roots := hierarchyRootCount(result); roots > 12 {
+		t.Fatalf("root fanout = %d, want <= 12", roots)
+	}
+	if children := maxChildren(result); children > 12 {
+		t.Fatalf("child fanout = %d, want <= 12", children)
+	}
+	if depth := hierarchyMaxDepth(result); depth > 4 {
+		t.Fatalf("depth = %d, want <= 4", depth)
+	}
+	options.Existing = hierarchyStateForScope(result, "acme/repo")
+	rebuilt := buildClusterHierarchyWithOptions(top, nodes, edges, options)
+	if !reflect.DeepEqual(result, rebuilt) {
+		t.Fatalf("multi-level hierarchy changed with persisted medoid-path state:\nfirst=%+v\nrebuilt=%+v", result, rebuilt)
+	}
+}
+
+func TestClusterHierarchyRecursesOversizedChildAndHonorsDepthCap(t *testing.T) {
+	nodes := make([]ClusterNode, 0, 24)
+	for i := 1; i <= 24; i++ {
+		nodes = append(nodes, ClusterNode{ID: int64(i), Text: "alpha storage", Repo: "acme/repo"})
+	}
+	edges := append(cliqueClusterEdges(1, 12), cliqueClusterEdges(13, 24)...)
+	nodeByID := map[int64]ClusterNode{}
+	for _, node := range nodes {
+		nodeByID[node.ID] = node
+	}
+	childMembers := make([]int64, 24)
+	for i := range childMembers {
+		childMembers[i] = int64(i + 1)
+	}
+	makeRoot := func() *hierarchyNode {
+		child := &hierarchyNode{cluster: Cluster{ID: 2, MedoidID: 1, Members: append([]int64(nil), childMembers...)}, scope: "acme/repo"}
+		return &hierarchyNode{cluster: Cluster{ID: 1, MedoidID: 1}, children: []*hierarchyNode{child}, scope: "acme/repo"}
+	}
+	used := map[int64]bool{1: true, 2: true}
+	root := makeRoot()
+	expandHierarchyNode(root, 1, []int64{1}, nodeByID, edges, hierarchyAdjacency(nodes, edges), hierarchyStateIndex{}, ClusterHierarchyOptions{Fanout: 12, FanoutKeep: 9, DepthCap: 4}, used)
+	if len(root.children) != 1 || len(root.children[0].children) != 2 {
+		t.Fatalf("oversized child did not recursively split: %+v", root)
+	}
+
+	root = makeRoot()
+	used = map[int64]bool{1: true, 2: true}
+	expandHierarchyNode(root, 1, []int64{1}, nodeByID, edges, hierarchyAdjacency(nodes, edges), hierarchyStateIndex{}, ClusterHierarchyOptions{Fanout: 12, FanoutKeep: 9, DepthCap: 2}, used)
+	if len(root.children[0].children) != 0 {
+		t.Fatalf("depth cap 2 allowed grandchildren: %+v", root)
+	}
+}
+
+func crowdedTopLevelFixture(count int, repo string) (ClusterResult, []ClusterNode, []ClusterEdge) {
+	return crowdedTopLevelFixtureOffset(count, 0, repo)
+}
+
+func crowdedTopLevelFixtureOffset(count int, offset int64, repo string) (ClusterResult, []ClusterNode, []ClusterEdge) {
+	var top ClusterResult
+	var nodes []ClusterNode
+	var edges []ClusterEdge
+	for i := 1; i <= count; i++ {
+		id := offset + int64(i)
+		nodes = append(nodes, ClusterNode{ID: id, Text: "topic " + itoa(id), Repo: repo})
+		top.Clusters = append(top.Clusters, Cluster{ID: id, Label: "topic-" + itoa(id), MedoidID: id, Members: []int64{id}, BaseCommunity: true})
+		if i > 1 {
+			edges = append(edges, ClusterEdge{A: id - 1, B: id, Weight: count - i + 1})
+		}
+	}
+	return top, nodes, edges
+}
+
+func topSyntheticState(result ClusterResult, scope string) []ClusterHierarchyState {
+	children := map[int64][]Cluster{}
+	byID := map[int64]Cluster{}
+	for _, cluster := range result.Clusters {
+		byID[cluster.ID] = cluster
+		children[cluster.ParentID] = append(children[cluster.ParentID], cluster)
+	}
+	var out []ClusterHierarchyState
+	for _, cluster := range result.Clusters {
+		if cluster.ParentID != 0 || !IsSyntheticClusterID(cluster.ID) {
+			continue
+		}
+		state := ClusterHierarchyState{Level: 1, MedoidPath: []int64{cluster.MedoidID}, ClusterID: cluster.ID, Scope: scope, Synthetic: true}
+		for _, child := range children[cluster.ID] {
+			state.ChildMedoids = append(state.ChildMedoids, child.MedoidID)
+			state.ChildIDs = append(state.ChildIDs, child.ID)
+		}
+		out = append(out, state)
+	}
+	return out
+}
+
+func hierarchyStateForScope(result ClusterResult, scope string) []ClusterHierarchyState {
+	children := map[int64][]Cluster{}
+	var roots []Cluster
+	for _, cluster := range result.Clusters {
+		if cluster.ParentID == 0 {
+			if cluster.ID != UnclusteredID {
+				roots = append(roots, cluster)
+			}
+		} else {
+			children[cluster.ParentID] = append(children[cluster.ParentID], cluster)
+		}
+	}
+	for parentID := range children {
+		sort.Slice(children[parentID], func(i, j int) bool {
+			if children[parentID][i].MedoidID != children[parentID][j].MedoidID {
+				return children[parentID][i].MedoidID < children[parentID][j].MedoidID
+			}
+			return children[parentID][i].ID < children[parentID][j].ID
+		})
+	}
+	var out []ClusterHierarchyState
+	var walk func(Cluster, int, []int64)
+	walk = func(cluster Cluster, level int, path []int64) {
+		path = append(append([]int64(nil), path...), cluster.MedoidID)
+		kids := children[cluster.ID]
+		if len(kids) > 0 {
+			state := ClusterHierarchyState{Level: level, MedoidPath: path, ClusterID: cluster.ID, Scope: scope, Synthetic: IsSyntheticClusterID(cluster.ID)}
+			for _, child := range kids {
+				state.ChildMedoids = append(state.ChildMedoids, child.MedoidID)
+				state.ChildIDs = append(state.ChildIDs, child.ID)
+			}
+			out = append(out, state)
+		}
+		for _, child := range kids {
+			walk(child, level+1, path)
+		}
+	}
+	for _, root := range roots {
+		walk(root, 1, nil)
+	}
+	return out
+}
+
+func maxChildren(result ClusterResult) int {
+	counts := map[int64]int{}
+	for _, cluster := range result.Clusters {
+		if cluster.ParentID != 0 {
+			counts[cluster.ParentID]++
+		}
+	}
+	max := 0
+	for _, count := range counts {
+		if count > max {
+			max = count
+		}
+	}
+	return max
+}
+
+func syntheticCount(result ClusterResult) int {
+	return len(syntheticIDs(result))
+}
+
+func syntheticIDs(result ClusterResult) map[int64]bool {
+	out := map[int64]bool{}
+	for _, cluster := range result.Clusters {
+		if IsSyntheticClusterID(cluster.ID) {
+			out[cluster.ID] = true
+		}
+	}
+	return out
+}
+
+func hierarchyRootCount(result ClusterResult) int {
+	count := 0
+	for _, cluster := range result.Clusters {
+		if cluster.ID != UnclusteredID && cluster.ParentID == 0 {
+			count++
+		}
+	}
+	return count
+}
+
+func hierarchyMaxDepth(result ClusterResult) int {
+	parent := map[int64]int64{}
+	for _, cluster := range result.Clusters {
+		parent[cluster.ID] = cluster.ParentID
+	}
+	max := 0
+	for _, cluster := range result.Clusters {
+		depth := 1
+		seen := map[int64]bool{cluster.ID: true}
+		for p := parent[cluster.ID]; p != 0 && !seen[p]; p = parent[p] {
+			seen[p] = true
+			depth++
+		}
+		if depth > max {
+			max = depth
+		}
+	}
+	return max
 }
 
 func manualSplitResult(left, right int, existing bool) ClusterResult {

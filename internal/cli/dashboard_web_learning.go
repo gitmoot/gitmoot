@@ -480,7 +480,7 @@ func knowledgeFactLinks(ctx context.Context, store *db.Store, src db.ConfirmedMe
 // upstream: an empty cluster set yields an empty slice and the client falls back to
 // its pre-cluster scope/category view.
 func knowledgeClusters(clusterByID map[int64]db.MemoryCluster, facts []dashboard.KnowledgeFact) ([]dashboard.KnowledgeCluster, map[string]string) {
-	// Roll up the emitted facts by leaf hub and, for split facts, by parent hub.
+	// Roll up each emitted fact through its complete leaf-to-root ancestor chain.
 	// hubOfFact confirms that a medoid is a member or descendant of its hub.
 	countByHub := map[string]int{}
 	reposByHub := map[string]map[string]int{}
@@ -496,16 +496,16 @@ func knowledgeClusters(clusterByID map[int64]db.MemoryCluster, facts []dashboard
 		if f.Cluster == "" {
 			continue
 		}
-		hubs := []string{f.Cluster}
-		if parent := parentByHub[f.Cluster]; parent != "" {
-			hubs = append(hubs, parent)
-		}
-		for _, hub := range hubs {
+		hub := f.Cluster
+		seen := map[string]bool{}
+		for hub != "" && !seen[hub] {
+			seen[hub] = true
 			countByHub[hub]++
 			if reposByHub[hub] == nil {
 				reposByHub[hub] = map[string]int{}
 			}
 			reposByHub[hub][f.Repo]++
+			hub = parentByHub[hub]
 		}
 		hubOfFact[f.ID] = f.Cluster
 	}
@@ -524,7 +524,7 @@ func knowledgeClusters(clusterByID map[int64]db.MemoryCluster, facts []dashboard
 			Repo:  dominantRepo(reposByHub[hub]),
 		}
 		if c.MedoidID != 0 {
-			if mid := fmt.Sprintf("fact:%d", c.MedoidID); hubOfFact[mid] == hub || parentByHub[hubOfFact[mid]] == hub {
+			if mid := fmt.Sprintf("fact:%d", c.MedoidID); clusterHubContains(hub, hubOfFact[mid], parentByHub) {
 				kc.Medoid = mid
 			}
 		}
@@ -532,6 +532,18 @@ func knowledgeClusters(clusterByID map[int64]db.MemoryCluster, facts []dashboard
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, parentByHub
+}
+
+func clusterHubContains(ancestor, descendant string, parentByHub map[string]string) bool {
+	seen := map[string]bool{}
+	for descendant != "" && !seen[descendant] {
+		if descendant == ancestor {
+			return true
+		}
+		seen[descendant] = true
+		descendant = parentByHub[descendant]
+	}
+	return false
 }
 
 // dominantRepo returns the most common repo scope among a cluster's member facts
