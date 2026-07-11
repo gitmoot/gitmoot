@@ -11,8 +11,12 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
+
+	gitutil "github.com/jerryfane/gitmoot/internal/git"
 
 	_ "modernc.org/sqlite"
 )
@@ -27,10 +31,14 @@ type Repo struct {
 	DefaultBranch string
 	RemoteURL     string
 	CheckoutPath  string
-	Enabled       bool
-	PollInterval  string
-	LastPollAt    string
-	LastError     string
+	// PrimaryCheckoutPath is the durable first non-bare checkout reported by
+	// `git worktree list --porcelain`. It lets dispatch recover when a mistakenly
+	// registered linked worktree has been removed.
+	PrimaryCheckoutPath string
+	Enabled             bool
+	PollInterval        string
+	LastPollAt          string
+	LastError           string
 }
 
 type Agent struct {
@@ -737,32 +745,76 @@ func (s *Store) applyMigration(ctx context.Context, version int, migration strin
 }
 
 func (s *Store) UpsertRepo(ctx context.Context, repo Repo) error {
+	return s.upsertRepo(ctx, repo, false)
+}
+
+// UpsertRepoForce deliberately bypasses linked-worktree overwrite protection.
+// It is reserved for the explicit `repo add --force` operator path.
+func (s *Store) UpsertRepoForce(ctx context.Context, repo Repo) error {
+	return s.upsertRepo(ctx, repo, true)
+}
+
+func (s *Store) upsertRepo(ctx context.Context, repo Repo, force bool) error {
 	fullName := repo.Owner + "/" + repo.Name
+	if strings.TrimSpace(repo.CheckoutPath) != "" && strings.TrimSpace(repo.PrimaryCheckoutPath) == "" {
+		if primary, err := (gitutil.Client{Dir: repo.CheckoutPath}).PrimaryWorktree(ctx); err == nil {
+			repo.PrimaryCheckoutPath = primary
+		}
+	}
+	if !force && strings.TrimSpace(repo.CheckoutPath) != "" {
+		if existing, err := s.GetRepo(ctx, fullName); err == nil && shouldProtectRepoCheckout(existing, repo.CheckoutPath) {
+			if linked, linkErr := (gitutil.Client{Dir: repo.CheckoutPath}).IsLinkedWorktree(ctx); linkErr == nil && linked {
+				log.Printf("WARNING: keeping registered checkout for %s at %s; refusing linked worktree %s (use gitmoot repo add --force to override)", fullName, existing.CheckoutPath, repo.CheckoutPath)
+				repo.CheckoutPath = ""
+				repo.PrimaryCheckoutPath = ""
+			}
+		}
+	}
 	updatePollInterval := repo.PollInterval
 	insertPollInterval := repo.PollInterval
 	if strings.TrimSpace(insertPollInterval) == "" {
 		insertPollInterval = "30s"
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO repos(owner, name, full_name, default_branch, remote_url, checkout_path, enabled, poll_interval, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, 1, ?, CURRENT_TIMESTAMP)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO repos(owner, name, full_name, default_branch, remote_url, checkout_path, primary_checkout_path, enabled, poll_interval, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(full_name) DO UPDATE SET
 			default_branch = CASE WHEN excluded.default_branch <> '' THEN excluded.default_branch ELSE repos.default_branch END,
 			remote_url = CASE WHEN excluded.remote_url <> '' THEN excluded.remote_url ELSE repos.remote_url END,
 			checkout_path = CASE WHEN excluded.checkout_path <> '' THEN excluded.checkout_path ELSE repos.checkout_path END,
+			primary_checkout_path = CASE WHEN excluded.primary_checkout_path <> '' THEN excluded.primary_checkout_path ELSE repos.primary_checkout_path END,
 			poll_interval = CASE WHEN ? <> '' THEN excluded.poll_interval ELSE repos.poll_interval END,
 			updated_at = CURRENT_TIMESTAMP`,
-		repo.Owner, repo.Name, fullName, repo.DefaultBranch, repo.RemoteURL, repo.CheckoutPath, insertPollInterval, updatePollInterval)
+		repo.Owner, repo.Name, fullName, repo.DefaultBranch, repo.RemoteURL, repo.CheckoutPath, repo.PrimaryCheckoutPath, insertPollInterval, updatePollInterval)
 	return err
 }
 
+func shouldProtectRepoCheckout(existing Repo, incoming string) bool {
+	if sameRepoCheckoutPath(existing.CheckoutPath, incoming) {
+		return false
+	}
+	if info, err := os.Stat(strings.TrimSpace(existing.CheckoutPath)); err == nil && info.IsDir() {
+		return true
+	}
+	return strings.TrimSpace(existing.PrimaryCheckoutPath) != "" && sameRepoCheckoutPath(existing.CheckoutPath, existing.PrimaryCheckoutPath)
+}
+
+func sameRepoCheckoutPath(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return false
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
+}
+
 func (s *Store) GetRepo(ctx context.Context, fullName string) (Repo, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT owner, name, default_branch, remote_url, checkout_path, enabled, poll_interval, last_poll_at, last_error
+	row := s.db.QueryRowContext(ctx, `SELECT owner, name, default_branch, remote_url, checkout_path, primary_checkout_path, enabled, poll_interval, last_poll_at, last_error
 		FROM repos WHERE full_name = ?`, fullName)
 	return scanRepo(row)
 }
 
 func (s *Store) ListRepos(ctx context.Context) ([]Repo, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT owner, name, default_branch, remote_url, checkout_path, enabled, poll_interval, last_poll_at, last_error
+	rows, err := s.db.QueryContext(ctx, `SELECT owner, name, default_branch, remote_url, checkout_path, primary_checkout_path, enabled, poll_interval, last_poll_at, last_error
 		FROM repos ORDER BY full_name`)
 	if err != nil {
 		return nil, err
@@ -777,6 +829,24 @@ func (s *Store) ListRepos(ctx context.Context) ([]Repo, error) {
 		repos = append(repos, repo)
 	}
 	return repos, rows.Err()
+}
+
+// HealRepoCheckout atomically replaces a repo checkout only when it still has
+// the path the caller observed. The compare guard prevents a concurrent,
+// deliberate re-registration from being overwritten by a stale healer.
+func (s *Store) HealRepoCheckout(ctx context.Context, fullName, expectedCheckoutPath, checkoutPath, primaryCheckoutPath string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE repos
+		SET checkout_path = ?, primary_checkout_path = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE full_name = ? AND checkout_path = ?`,
+		strings.TrimSpace(checkoutPath), strings.TrimSpace(primaryCheckoutPath), strings.TrimSpace(fullName), strings.TrimSpace(expectedCheckoutPath))
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
 }
 
 func (s *Store) SetRepoEnabled(ctx context.Context, fullName string, enabled bool) error {
@@ -814,7 +884,7 @@ func (s *Store) RemoveRepo(ctx context.Context, fullName string) (bool, error) {
 func scanRepo(row interface{ Scan(dest ...any) error }) (Repo, error) {
 	var repo Repo
 	var enabled int
-	if err := row.Scan(&repo.Owner, &repo.Name, &repo.DefaultBranch, &repo.RemoteURL, &repo.CheckoutPath, &enabled, &repo.PollInterval, &repo.LastPollAt, &repo.LastError); err != nil {
+	if err := row.Scan(&repo.Owner, &repo.Name, &repo.DefaultBranch, &repo.RemoteURL, &repo.CheckoutPath, &repo.PrimaryCheckoutPath, &enabled, &repo.PollInterval, &repo.LastPollAt, &repo.LastError); err != nil {
 		return Repo{}, err
 	}
 	repo.Enabled = enabled != 0
@@ -8449,5 +8519,10 @@ CREATE UNIQUE INDEX idx_confirmed_general_key ON confirmed_memories(owner_kind, 
 	`
 ALTER TABLE agents ADD COLUMN effort TEXT NOT NULL DEFAULT '';
 ALTER TABLE agent_instances ADD COLUMN effort TEXT NOT NULL DEFAULT '';
+	`,
+	// #831 durable repo checkout recovery. Existing rows lazily backfill this on
+	// their next healthy registration, doctor pass, or dispatch touch.
+	`
+ALTER TABLE repos ADD COLUMN primary_checkout_path TEXT NOT NULL DEFAULT '';
 	`,
 }

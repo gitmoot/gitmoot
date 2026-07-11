@@ -7,6 +7,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
+	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
@@ -150,6 +152,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	if check, ok := blockedBacklogDoctorCheck(paths); ok {
 		checks = append(checks, check)
 	}
+	checks = append(checks, repoCheckoutDoctorChecks(paths)...)
 	if *jsonOutput {
 		type checkJSON struct {
 			Name     string `json:"name"`
@@ -197,6 +200,49 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// repoCheckoutDoctorChecks is the store-aware aggregate sweep for `gitmoot
+// doctor`. It stays in the CLI layer so the doctor package remains store-less.
+func repoCheckoutDoctorChecks(paths config.Paths) []doctor.Check {
+	if strings.TrimSpace(paths.Database) == "" {
+		return nil
+	}
+	if _, err := os.Stat(paths.Database); err != nil {
+		return nil
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		return nil
+	}
+	defer store.Close()
+	repos, err := store.ListRepos(context.Background())
+	if err != nil {
+		return nil
+	}
+	checks := make([]doctor.Check, 0, len(repos))
+	for _, repo := range repos {
+		primary, linked, err := inspectRegisteredRepoCheckout(context.Background(), store, repo)
+		check := doctor.Check{Name: "repo checkout", Required: false}
+		switch {
+		case err != nil:
+			check.Detail = fmt.Sprintf("%s: %v", repo.FullName(), err)
+			if recorded := strings.TrimSpace(repo.PrimaryCheckoutPath); recorded != "" {
+				if _, statErr := os.Stat(recorded); statErr == nil {
+					check.Detail += fmt.Sprintf("; primary checkout %s is available", recorded)
+				} else {
+					check.Detail += fmt.Sprintf("; primary checkout %s is unavailable", recorded)
+				}
+			}
+		case linked:
+			check.Detail = fmt.Sprintf("%s: registered checkout %s is a linked worktree; use primary checkout %s", repo.FullName(), repo.CheckoutPath, primary)
+		default:
+			check.OK = true
+			check.Detail = fmt.Sprintf("%s: registered checkout %s is primary", repo.FullName(), repo.CheckoutPath)
+		}
+		checks = append(checks, check)
+	}
+	return checks
 }
 
 func pathsFromFlag(home string) (config.Paths, error) {
