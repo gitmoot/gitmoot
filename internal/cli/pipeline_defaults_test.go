@@ -200,17 +200,44 @@ func TestDefaultMemoryGroomProposeE2E(t *testing.T) {
 	appendConfig(t, paths, `
 [memory.pipelines]
 repo = "owner/repo"
-`)
+	`)
 	groomSeed(t, store)
+	parentID := seedConfirmed(t, store, db.MemoryOwner{Kind: "agent", Ref: "lead"}, "owner/repo", "repo", "pipeline-brick",
+		"**First pipeline story**\nThe first pipeline story has substantive implementation detail.\n\n**Second pipeline story**\nThe second pipeline story has substantive implementation detail.")
 	runInstallDefaults(t, home)
+	rec, ok, err := store.GetPipeline(context.Background(), "memory-groom-propose")
+	if err != nil || !ok {
+		t.Fatalf("GetPipeline memory-groom-propose: ok=%v err=%v", ok, err)
+	}
+	spec, err := pipeline.Load([]byte(rec.SpecYAML))
+	if err != nil {
+		t.Fatalf("load groom pipeline: %v", err)
+	}
+	if len(spec.Stages) != 3 || spec.Stages[0].ID != "split" || spec.Stages[1].ID != "propose" || spec.Stages[2].ID != "summarize" ||
+		len(spec.Stages[1].Needs) != 1 || spec.Stages[1].Needs[0] != "split" {
+		t.Fatalf("groom stages = %+v, want split -> propose -> summarize", spec.Stages)
+	}
 
 	run := runDefaultPipelineToTerminal(t, home, store, "memory-groom-propose")
 	if run.State != pipeline.RunSucceeded {
 		t.Fatalf("run state = %s, want succeeded (halt=%s)", run.State, run.HaltReason)
 	}
 	stage := stageRow(t, store, run.ID, "summarize")
-	if !strings.Contains(stage.Summary, "proposed 3 retirement(s)") || !strings.Contains(stage.Summary, "1 rewrite flag") {
+	if !strings.Contains(stage.Summary, "split 1 brick(s)") || !strings.Contains(stage.Summary, "proposed 3 retirement(s)") || !strings.Contains(stage.Summary, "1 rewrite flag") {
 		t.Fatalf("summary = %q, want groom proposal counts", stage.Summary)
+	}
+	splitStage := stageRow(t, store, run.ID, "split")
+	if splitStage.State != pipeline.StageSucceeded || !strings.Contains(splitStage.Summary, "split 1 brick(s)") {
+		t.Fatalf("split stage = %+v", splitStage)
+	}
+	active, err := store.ListConfirmedMemoriesForVault(context.Background(), "")
+	if err != nil {
+		t.Fatalf("list active after pipeline: %v", err)
+	}
+	for _, row := range active {
+		if row.ID == parentID {
+			t.Fatal("pipeline proposal ran without first superseding the split parent")
+		}
 	}
 	plan := filepath.Join(paths.Home, "evals", "memory-pipelines", run.ID, "groom-plan.json")
 	if _, err := readGroomPlan(plan); err != nil {

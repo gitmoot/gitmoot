@@ -2799,10 +2799,11 @@ stages:
   attempt-independent branch `gitmoot/pipe-<run>-<stage>` (reusing the implement
   dispatch's fail-closed guards). A **retry** lands in the *same* branch/PR — never a
   duplicate — and fails closed if that worktree is dirty or has a live process.
-- **Folds on PR-opened.** A `success` decision folds only once the job carries an
-  opened PR. The first-class `skipped` decision bypasses that wait because there is
-  no work to turn into a PR. The opened PR number is appended to the stage summary so a
-  downstream stage sees it via upstream-context injection.
+- **`implemented` folds on PR-opened.** Only `implemented` promises a PR, so that
+  decision waits until the job carries the opened PR stamp (or the engine confirms a
+  terminal no-PR no-op). Other configured success decisions, including `approved` and
+  `skipped`, settle immediately without a PR. The stage summary records the opened PR
+  number or the terminal no-PR outcome for downstream context.
 - **Never auto-merges.** The pipeline **opens** the PR; a human or your CI does the
   merge. See [Gate stages](#gate-stages) to make a later stage wait for that merge.
 - **Declared review suppresses native fan-out.** When an implement stage has a
@@ -2826,8 +2827,8 @@ the implement stage just opened. `source` must also appear in the review stage's
   still posted as a PR comment and folded by the pipeline's `success_decisions`, but
   `changes_requested` does not dispatch a native fix job and `approved` does not run
   the native merge gate. Human merge remains the default.
-- If the succeeded implement stage produced no PR (a permanent no-op or a first-class
-  `skipped` result), the review stage immediately folds `blocked` with
+- If the succeeded implement stage produced no PR (a permanent no-op or any successful
+  non-`implemented` decision), the review stage immediately folds `blocked` with
   `source stage produced no PR; nothing to review`; no unbound review job is sent.
 
 ### Gate stages
@@ -2858,8 +2859,9 @@ stages:
   **fails open** (keeps waiting while unmerged), and is bounded by the stage `timeout`.
 - A PR that is **closed without merging**, or a **timeout**, parks the run `blocked`
   (a gate is a wait, not a failure — so a retry budget can't re-arm the timer).
-- A source stage that succeeded via `skipped` also parks the gate `blocked`
-  immediately: no PR will exist for that run.
+- A source stage that succeeds without opening a PR also parks the gate `blocked`
+  immediately with `source stage succeeded without opening a PR; nothing to wait for`.
+  Only `implemented` promises the PR that this gate can watch.
 
 ### Orchestrate stages
 
@@ -10214,7 +10216,7 @@ content-derived links in each note's `## Links` section and dedupes by target.
 > boundary. Trust-aware injection (having the read path weigh `trust_mark`) is
 > future work; nothing reads `trust_mark` for a decision yet.
 
-### Grooming: deterministic propose/apply (#737 P4.2)
+### Grooming: automatic brick splits + deterministic propose/apply (#737 P4.2, #832)
 
 `memory groom` mechanizes the periodic curation pass that retires stale,
 low-signal confirmed memories, as an explicit **propose → review → apply**
@@ -10223,7 +10225,22 @@ round-trip:
 ```sh
 gitmoot memory groom --propose [--out PLAN.json] [--json]
 gitmoot memory groom --yes --plan PLAN.json [--json]
+gitmoot memory groom --split [--dry-run] [--json]
 ```
+
+`--split` is the automatic, approval-free lossless pass. It partitions a brick
+at byte offsets on strong story seams (bold story headers, date-led lines, and
+PR markers) or, for over-threshold content, blank-line paragraph groups. A
+candidate needs at least two substantive segments and either two strong seams
+or content over `GroomRewriteThreshold`. Children are exact parent substrings in
+deterministic order and must concatenate to the parent's trimmed coverage; any
+invariant failure falls back to a rewrite flag without writing. Child keys use
+`<parent-key>-<seam-slug>` with deterministic ordinals, provenance is
+`groom-split:<parent-id>`, and owner/author/repo/scope are inherited. Apply is one
+CAS-guarded transaction: children and FTS rows are inserted, the parent leaves
+FTS and is set `superseded_by = <first-child-id>`, and children replace the
+parent in its cluster. Links are left for normal enrichment. `--dry-run` prints
+the same split plan without changing the store; a repeat run is a no-op.
 
 `--propose` reads every **active** confirmed memory (retired rows excluded),
 computes the current vault `snapshot_hash` (the same anchor `vault export`/`import`
@@ -10244,9 +10261,10 @@ cross_pool, stats}`). It **touches nothing** in the store. The detectors are:
   fact duplicated across owners, repos, or scopes is **not** deduped — each copy is
   the only one visible in its own retrieval scope (owner/repo/scope is shown on each
   proposed retirement so you can tell them apart);
-- **over-long "bricks"** (content > ~1200 chars) are **flagged for rewrite**, never
-  retired — P4.2 only lists them for the owner (LLM rewriting is the follow-up
-  P4.3);
+- **brick rewrite flags** include over-long content (> ~1200 chars) and
+  under-threshold multi-story content with at least two strong seams. The
+  automatic lossless `--split` pass handles qualifying bricks; seam-poor long
+  prose remains flag-only for a later LLM atomizer;
 - **legacy-key rekeys** (#804): active rows whose key still ends in the
   pre-stable-key 8-hex content-hash suffix (`…-a1b2c3d4`) are grouped per
   owner/repo/scope by their stripped stable key. Organic sweeps can never fix
@@ -10272,9 +10290,11 @@ rewritten**, and applying is idempotent: an already-retired or missing id is
 skipped gracefully, and a rekey group or cross-pool pair whose rows changed state
 since the proposal is skipped whole rather than half-applied.
 
-The built-in `memory-groom-propose` pipeline runs only the proposal half:
-`gitmoot memory groom --propose --out <run-scoped-plan> --json`, then summarizes
-the proposal counts into the pipeline result. It never applies a plan. The daemon
+The built-in `memory-groom-propose` pipeline first auto-runs
+`gitmoot memory groom --split --json`, then runs the proposal half with
+`gitmoot memory groom --propose --out <run-scoped-plan> --json` and summarizes
+both counts. Only lossless splits auto-apply; retirement, rekey, and cross-pool
+proposals still require owner review and `--yes --plan`. The daemon
 and `gitmoot pipeline install-defaults` register it idempotently and skip an
 existing row named `memory-groom-propose`, preserving local edits. It is
 manual-only unless `[memory.pipelines].groom_propose` is set:
@@ -10285,6 +10305,9 @@ repo = "owner/repo"
 ingest_sweep = "nightly"
 groom_propose = "nightly"
 ```
+
+`[memory].groom_split_llm = false` is parsed as the default-off Phase 2 gate;
+this release does not implement the lossy LLM atomizer path.
 
 ```sh
 gitmoot pipeline run memory-groom-propose
@@ -11726,24 +11749,26 @@ printf '%s' '{"gitmoot_result":{"decision":"blocked","summary":"secret missing",
 `skipped` is the default-on success decision for a stage whose task had no work.
 The persisted summary is prefixed with `[skipped: no work]`, so downstream agent
 stages receive the honest outcome. An explicit `success_decisions` list that
-omits `skipped` is strict and folds it failed. If an implement source skips, a
-downstream `pr_merged` gate parks blocked instead of waiting for a PR that cannot
-exist. The result still uses the existing succeeded stage state; the `SKIPPED`
+omits `skipped` is strict and folds it failed. Only `implemented` promises a PR from
+an implement stage; other configured success decisions settle immediately. If an
+implement source succeeds without a PR, a downstream `pr_merged` gate parks blocked
+instead of waiting forever. The result still uses the existing succeeded stage state; the `SKIPPED`
 funnel state remains reserved for downstream stages that never ran.
 
 ### Agent stages (#757 / #768 / #758)
 
-A stage may run a **named managed agent** instead of a shell command — a stage is
+A stage may run a **named managed agent** instead of a shell command; a stage is
 exactly one of `cmd`, `agent`, or `gate`. An agent stage runs on its **own** registered
 runtime (claude / codex). Four kinds:
 
 - **ask / review** (#757) — read-only **leaf** (`action: ask|review`); `delegations[]`
   and `human_questions[]` stripped. A review may add `source: <implement stage>`
   (#813) to bind to that stage's PR and exact head SHA.
-- **implement** (#768) — `action: implement` + `write: true`. MUTATES the repo + opens a
-  PR on a deterministic `gitmoot/pipe-<run>-<stage>` branch (retry reuses it, never
-  duplicates), folds **on PR-opened**, **never auto-merges**. Scheduled pipelines also
-  need pipeline-level `allow_scheduled_writes: true`.
+- **implement** (#768): `action: implement` + `write: true`. MUTATES the repo on a
+  deterministic `gitmoot/pipe-<run>-<stage>` branch (retry reuses it, never duplicates).
+  The `implemented` decision folds **on PR-opened**; other configured success decisions
+  settle immediately without promising a PR. It **never auto-merges**. Scheduled
+  pipelines also need pipeline-level `allow_scheduled_writes: true`.
 - **produce** (#814) — `action: produce` + `write: true` + absolute cleaned
   `writes:`. Codex-only data writer; never branch/task/PR state. Optional
   `network: true`, `check`, and bounded same-session `check_retries`. Declared paths
@@ -11801,8 +11826,8 @@ succeeded implement job and runs in a detached worktree pinned to that head. It 
 report-only: the verdict is posted to the PR and folded by the pipeline, but it does
 not dispatch a native fix job or run the native merge gate. The declared binding
 also sets `SkipNativeReviewFanout` on `fix`, preventing duplicate reviewer fan-out;
-pipelines without the declaration keep native behavior. A permanent no-PR source
-(no-op or `skipped`) blocks the review immediately with `source stage produced no
+pipelines without the declaration keep native behavior. Any terminal succeeded no-PR
+source (a no-op or a non-`implemented` success decision) blocks the review immediately with `source stage produced no
 PR; nothing to review` instead of dispatching an unbound job or waiting.
 
 `pipeline add` warns (does not block) when an agent stage names an agent that does

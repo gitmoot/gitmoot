@@ -13,6 +13,9 @@ import (
 const (
 	DefaultMemoryTokenBudget = 1500
 	DefaultMemoryMaxEntries  = 15
+	// DefaultMemoryGroomSplitLLM gates the lossy Phase-2 atomizer. Phase 1 only
+	// parses this default-off switch; no LLM rewrite path is implemented yet.
+	DefaultMemoryGroomSplitLLM = false
 	// DefaultMemoryDistillMaxPerJob caps how many pending observations the
 	// deterministic distill-at-terminal producers (#737 P4.1) may stage per job.
 	// It is only consulted when distill_at_terminal or distill_successes is enabled.
@@ -66,6 +69,9 @@ type MemorySettings struct {
 	// pending human gate. Shared memory remains explicit through confirm/promote
 	// commands even when this is enabled.
 	IngestAutoConfirm bool
+	// GroomSplitLLM is the parsed Phase-2 gate for an eventual lossy LLM
+	// atomizer. Deterministic lossless splitting does not consult this flag.
+	GroomSplitLLM bool
 }
 
 // DefaultMemorySettings returns the off-by-default resolved settings.
@@ -79,6 +85,7 @@ func DefaultMemorySettings() MemorySettings {
 		DistillMaxPerJob:  DefaultMemoryDistillMaxPerJob,
 		DistillAllJobs:    false,
 		IngestAutoConfirm: false,
+		GroomSplitLLM:     DefaultMemoryGroomSplitLLM,
 	}
 }
 
@@ -162,6 +169,12 @@ func LoadMemorySettings(paths Paths) (MemorySettings, error) {
 				return MemorySettings{}, fmt.Errorf("parse [memory].ingest_auto_confirm: %w", err)
 			}
 			settings.IngestAutoConfirm = parsed
+		case "groom_split_llm":
+			parsed, err := parseConfigBool(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].groom_split_llm: %w", err)
+			}
+			settings.GroomSplitLLM = parsed
 		}
 	}
 	if err := validateMemorySettings(settings); err != nil {

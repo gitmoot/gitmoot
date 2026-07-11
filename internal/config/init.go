@@ -148,6 +148,7 @@ path = ""
 # distill_max_per_job = 3
 # distill_all_jobs = false
 # ingest_auto_confirm = false
+# groom_split_llm = false # Phase 2 gate only; the LLM atomizer is not implemented yet.
 #
 # Built-in memory pipeline inputs are optional. The daemon and
 # gitmoot pipeline install-defaults register memory-ingest-sweep and

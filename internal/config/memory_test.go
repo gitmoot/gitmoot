@@ -32,6 +32,9 @@ func TestLoadMemorySettingsDefaults(t *testing.T) {
 	if settings.IngestAutoConfirm {
 		t.Fatalf("ingest_auto_confirm must default false")
 	}
+	if settings.GroomSplitLLM != DefaultMemoryGroomSplitLLM {
+		t.Fatalf("groom_split_llm default = %v", settings.GroomSplitLLM)
+	}
 }
 
 func TestLoadMemorySettingsParsesDistillKnobs(t *testing.T) {
@@ -84,6 +87,7 @@ disabled = true
 token_budget = 800
 max_entries = 7
 ingest_auto_confirm = true
+groom_split_llm = true
 `), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -91,7 +95,7 @@ ingest_auto_confirm = true
 	if err != nil {
 		t.Fatalf("LoadMemorySettings: %v", err)
 	}
-	if !settings.Disabled || settings.TokenBudget != 800 || settings.MaxEntries != 7 || !settings.IngestAutoConfirm {
+	if !settings.Disabled || settings.TokenBudget != 800 || settings.MaxEntries != 7 || !settings.IngestAutoConfirm || !settings.GroomSplitLLM {
 		t.Fatalf("parsed = %+v", settings)
 	}
 }

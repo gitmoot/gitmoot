@@ -146,7 +146,8 @@ func renderMemoryGroomProposePipeline(settings config.MemoryPipelineSettings, pa
 		Name: defaultMemoryGroomProposePipeline,
 		Repo: repo,
 		Stages: []pipeline.Stage{
-			{ID: "propose", Cmd: memoryGroomProposeStageCommand(paths, rawHome)},
+			{ID: "split", Cmd: memoryGroomSplitStageCommand(paths, rawHome)},
+			{ID: "propose", Cmd: memoryGroomProposeStageCommand(paths, rawHome), Needs: []string{"split"}},
 			{ID: "summarize", Cmd: memoryGroomSummaryStageCommand(paths), Needs: []string{"propose"}},
 		},
 	}
@@ -155,6 +156,23 @@ func renderMemoryGroomProposePipeline(settings config.MemoryPipelineSettings, pa
 		spec.Schedule = &pipeline.Schedule{Interval: settings.GroomProposeInterval, Jitter: settings.GroomProposeJitter}
 	}
 	return defaultPipelineDefinition{name: spec.Name, spec: spec, enabled: enabled}
+}
+
+func memoryGroomSplitStageCommand(paths config.Paths, rawHome string) string {
+	homeArgs := memoryPipelineHomeArgs(rawHome)
+	return strings.Join([]string{
+		"set -eu",
+		memoryPipelineRunDirScript(paths),
+		"summary_file=\"$run_dir/groom-split.json\"",
+		"err_file=\"$run_dir/groom-split.err\"",
+		"if " + memoryPipelineShellQuote(defaultPipelineGitmootBinary()) + " memory groom" + homeArgs + " --split --json > \"$summary_file\" 2> \"$err_file\"; then",
+		"  applied=$(json_num \"$summary_file\" applied)",
+		"  printf '%s' '{\"gitmoot_result\":{\"decision\":\"implemented\",\"summary\":\"memory groom split '" + "\"$applied\"" + "' brick(s)\",\"findings\":[],\"changes_made\":[\"auto-applied lossless memory splits\"],\"tests_run\":[\"gitmoot memory groom --split --json\"],\"needs\":[],\"delegations\":[]}}'",
+		"else",
+		"  if [ -s \"$err_file\" ]; then cat \"$err_file\"; fi",
+		"  printf '\\n%s' '{\"gitmoot_result\":{\"decision\":\"failed\",\"summary\":\"memory groom split failed; see run-scoped stderr\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"gitmoot memory groom --split --json\"],\"needs\":[],\"delegations\":[]}}'",
+		"fi",
+	}, "\n")
 }
 
 func memoryIngestSweepStageCommand(paths config.Paths, rawHome string) string {
@@ -233,14 +251,17 @@ func memoryGroomSummaryStageCommand(paths config.Paths) string {
 		"set -eu",
 		memoryPipelineRunDirScript(paths),
 		"summary_file=\"$run_dir/groom-propose.json\"",
+		"split_file=\"$run_dir/groom-split.json\"",
 		"plan_file=\"$run_dir/groom-plan.json\"",
+		"splits=$(json_num \"$split_file\" applied)",
 		"proposals=$(json_stat \"$summary_file\" proposed_retirements)",
 		"rewrites=$(json_stat \"$summary_file\" rewrite_flags)",
 		"total=$(json_stat \"$summary_file\" total_memories)",
+		"splits=${splits:-0}",
 		"proposals=${proposals:-0}",
 		"rewrites=${rewrites:-0}",
 		"total=${total:-0}",
-		"printf '%s' '{\"gitmoot_result\":{\"decision\":\"implemented\",\"summary\":\"memory groom proposed '\"$proposals\"' retirement(s) and '\"$rewrites\"' rewrite flag(s) across '\"$total\"' confirmed memory item(s)\",\"findings\":[],\"changes_made\":[\"review plan at '\"$plan_file\"'\"],\"tests_run\":[\"gitmoot memory groom --propose --json\"],\"needs\":[],\"delegations\":[]}}'",
+		"printf '%s' '{\"gitmoot_result\":{\"decision\":\"implemented\",\"summary\":\"memory groom split '\"$splits\"' brick(s), then proposed '\"$proposals\"' retirement(s) and '\"$rewrites\"' rewrite flag(s) across '\"$total\"' confirmed memory item(s)\",\"findings\":[],\"changes_made\":[\"review plan at '\"$plan_file\"'\"],\"tests_run\":[\"gitmoot memory groom --split --json\",\"gitmoot memory groom --propose --json\"],\"needs\":[],\"delegations\":[]}}'",
 	}, "\n")
 }
 

@@ -367,14 +367,24 @@ future work; nothing reads `trust_mark` for a decision yet.
 
 ## Grooming stale memory
 
-`memory groom` mechanizes the periodic pass that retires stale, low-signal
-confirmed memories, as an explicit **propose → review → apply** round-trip that
-never mutates memory without an owner `--yes`:
+`memory groom` combines an automatic lossless brick splitter with an explicit
+**propose → review → apply** round-trip for retirement and other curated actions:
 
 ```sh
 gitmoot memory groom --propose [--out PLAN.json] [--json]
 gitmoot memory groom --yes --plan PLAN.json [--json]
+gitmoot memory groom --split [--dry-run] [--json]
 ```
+
+`--split` partitions qualifying multi-story bricks at deterministic byte offsets.
+Strong seams are bold story headers, date-led lines, and PR markers; over-threshold
+content may also split on blank-line paragraph groups. Children are exact parent
+substrings and must concatenate to the parent's trimmed coverage, otherwise the
+operation fails closed to a rewrite flag. The transaction inserts and indexes the
+children, sets the parent `superseded_by` to the first child, removes the parent
+from FTS and cluster membership, and attaches children to the parent's cluster.
+Ownership, author, repo, and scope are inherited; links are enriched later.
+`--dry-run` writes nothing, and subsequent runs are no-ops.
 
 `--propose` reads every **active** confirmed memory (retired rows excluded),
 computes the current vault `snapshot_hash` (the same anchor `vault export`/`import`
@@ -390,8 +400,9 @@ cross_pool, stats}`). It touches nothing in the store. The detectors flag:
 - **exact duplicates** — identical content **within the same owner/repo/scope**; the
   lowest id is kept and the rest proposed. Copies across owners/repos/scopes are kept
   (each is the only one its scope can see);
-- **over-long "bricks"** (> ~1200 chars) are **flagged for rewrite, not retired** —
-  P4.2 only lists them for the owner (LLM rewriting is the follow-up P4.3);
+- **brick rewrite flags** cover over-long content and shorter multi-story notes
+  with at least two strong seams. Qualifying bricks are handled by the automatic
+  lossless split; seam-poor long prose stays flag-only for Phase 2;
 - **legacy-key rekeys**: keys minted before the stable-key scheme end in an
   8-hex content-hash suffix (for example `runbook-deploy-a1b2c3d4`). Organic
   sweeps can never converge them, because content dedup skips unchanged notes
@@ -419,16 +430,20 @@ cross-pool pairs. Content is never edited or rewritten, and applying is
 idempotent: an already-retired or missing id is skipped gracefully, and a rekey
 group or cross-pool pair whose target rows changed state is skipped whole.
 
-Gitmoot also ships a built-in `memory-groom-propose` pipeline. It writes the
-proposal plan under the current run's gitmoot home, summarizes retirement and
-rewrite counts into the pipeline result, and never applies the plan. Configure an
-interval or run it on demand:
+Gitmoot also ships a built-in `memory-groom-propose` pipeline. It auto-applies
+lossless splits first, then writes the owner-gated proposal plan under the current
+run's gitmoot home and summarizes split, retirement, and rewrite counts. It never
+auto-applies retirement, rekey, or cross-pool proposals. Configure an interval or
+run it on demand:
 
 ```toml
 [memory.pipelines]
 repo = "owner/repo"
 groom_propose = "nightly"
 ```
+
+`[memory].groom_split_llm = false` is the parsed default-off Phase 2 gate. The
+lossy LLM atomizer itself is not implemented yet.
 
 ```sh
 gitmoot pipeline run memory-groom-propose

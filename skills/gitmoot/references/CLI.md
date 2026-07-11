@@ -1927,7 +1927,7 @@ content-derived links in each note's `## Links` section and dedupes by target.
 > boundary. Trust-aware injection (having the read path weigh `trust_mark`) is
 > future work; nothing reads `trust_mark` for a decision yet.
 
-### Grooming: deterministic propose/apply (#737 P4.2)
+### Grooming: automatic brick splits + deterministic propose/apply (#737 P4.2, #832)
 
 `memory groom` mechanizes the periodic curation pass that retires stale,
 low-signal confirmed memories, as an explicit **propose → review → apply**
@@ -1936,7 +1936,22 @@ round-trip:
 ```sh
 gitmoot memory groom --propose [--out PLAN.json] [--json]
 gitmoot memory groom --yes --plan PLAN.json [--json]
+gitmoot memory groom --split [--dry-run] [--json]
 ```
+
+`--split` is the automatic, approval-free lossless pass. It partitions a brick
+at byte offsets on strong story seams (bold story headers, date-led lines, and
+PR markers) or, for over-threshold content, blank-line paragraph groups. A
+candidate needs at least two substantive segments and either two strong seams
+or content over `GroomRewriteThreshold`. Children are exact parent substrings in
+deterministic order and must concatenate to the parent's trimmed coverage; any
+invariant failure falls back to a rewrite flag without writing. Child keys use
+`<parent-key>-<seam-slug>` with deterministic ordinals, provenance is
+`groom-split:<parent-id>`, and owner/author/repo/scope are inherited. Apply is one
+CAS-guarded transaction: children and FTS rows are inserted, the parent leaves
+FTS and is set `superseded_by = <first-child-id>`, and children replace the
+parent in its cluster. Links are left for normal enrichment. `--dry-run` prints
+the same split plan without changing the store; a repeat run is a no-op.
 
 `--propose` reads every **active** confirmed memory (retired rows excluded),
 computes the current vault `snapshot_hash` (the same anchor `vault export`/`import`
@@ -1957,9 +1972,10 @@ cross_pool, stats}`). It **touches nothing** in the store. The detectors are:
   fact duplicated across owners, repos, or scopes is **not** deduped — each copy is
   the only one visible in its own retrieval scope (owner/repo/scope is shown on each
   proposed retirement so you can tell them apart);
-- **over-long "bricks"** (content > ~1200 chars) are **flagged for rewrite**, never
-  retired — P4.2 only lists them for the owner (LLM rewriting is the follow-up
-  P4.3);
+- **brick rewrite flags** include over-long content (> ~1200 chars) and
+  under-threshold multi-story content with at least two strong seams. The
+  automatic lossless `--split` pass handles qualifying bricks; seam-poor long
+  prose remains flag-only for a later LLM atomizer;
 - **legacy-key rekeys** (#804): active rows whose key still ends in the
   pre-stable-key 8-hex content-hash suffix (`…-a1b2c3d4`) are grouped per
   owner/repo/scope by their stripped stable key. Organic sweeps can never fix
@@ -1985,9 +2001,11 @@ rewritten**, and applying is idempotent: an already-retired or missing id is
 skipped gracefully, and a rekey group or cross-pool pair whose rows changed state
 since the proposal is skipped whole rather than half-applied.
 
-The built-in `memory-groom-propose` pipeline runs only the proposal half:
-`gitmoot memory groom --propose --out <run-scoped-plan> --json`, then summarizes
-the proposal counts into the pipeline result. It never applies a plan. The daemon
+The built-in `memory-groom-propose` pipeline first auto-runs
+`gitmoot memory groom --split --json`, then runs the proposal half with
+`gitmoot memory groom --propose --out <run-scoped-plan> --json` and summarizes
+both counts. Only lossless splits auto-apply; retirement, rekey, and cross-pool
+proposals still require owner review and `--yes --plan`. The daemon
 and `gitmoot pipeline install-defaults` register it idempotently and skip an
 existing row named `memory-groom-propose`, preserving local edits. It is
 manual-only unless `[memory.pipelines].groom_propose` is set:
@@ -1998,6 +2016,9 @@ repo = "owner/repo"
 ingest_sweep = "nightly"
 groom_propose = "nightly"
 ```
+
+`[memory].groom_split_llm = false` is parsed as the default-off Phase 2 gate;
+this release does not implement the lossy LLM atomizer path.
 
 ```sh
 gitmoot pipeline run memory-groom-propose
