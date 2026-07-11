@@ -4,7 +4,7 @@ description: Use Gitmoot for local-first AI agent coordination across repositori
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
-  gitmoot-version: "0.8.1"
+  gitmoot-version: "0.8.8"
   source: "jerryfane/gitmoot"
 ---
 
@@ -74,8 +74,12 @@ The block can include `[linked]` facts reached from persisted memory links, and
 non-empty blocks end with a footer pointing the agent to
 `gitmoot memory recall "<query>" --agent <agent-name>` for on-demand recall.
 Enrollment is per agent via `[agents.<name>].memory = true` plus an optional
-`[memory]` section; inspect the store read-only with `gitmoot memory list`. See
-CLI.md § Agent Memory and the "Agent Persistent Memory" concepts page for depth.
+`[memory]` section; inspect the store read-only with `gitmoot memory list`. For
+owner-curated memory, `gitmoot memory ingest` stages Markdown as pending
+observations, `gitmoot memory observations` lists them, `gitmoot memory confirm`
+promotes selected observations, and `gitmoot memory groom` proposes or applies
+deterministic retirements. See CLI.md § Agent Memory and the "Agent Persistent
+Memory" concepts page for depth.
 
 For routing telemetry, phrases like "which runtime/model works best here",
 "show observed routing performance", or "should I route Go tasks to Codex" map to
@@ -127,6 +131,9 @@ templates, or release locks unless the user asks for that action.
 5. Prefer the SessionStart snapshot and read-only status commands, then answer
    directly before mutating Gitmoot state or pointing the user to live
    monitoring.
+6. If the user names a Gitmoot concept or command that is version-sensitive or
+   missing from this skill, verify the live surface with `gitmoot --help` and
+   the relevant `gitmoot <command> --help` before answering or acting.
 
 ## Common Commands
 
@@ -212,8 +219,9 @@ result is posted back into the thread), and answer a job paused at `awaiting_hum
 with `gitmoot chat answer <thread> "<question-id>: …"`. Chat is local-only (no
 network). For the agent-to-agent V1.5 layer, an enrolled agent can auto-answer an
 `@mention` via the off-by-default `[chat] auto_respond` sweep (one bounded read-only
-`ask` per mention, hard-capped), and `gitmoot moot <name> "topic" --agents a,b,c
---repo owner/repo` convenes agents as seats in one brainstorm — one job per seat,
+`ask` per mention, hard-capped). Use `gitmoot chat wait <thread>` for turn-taking
+in agent conversations, and `gitmoot moot <name> "topic" --agents a,b,c --repo
+owner/repo` to convene agents as seats in one brainstorm — one job per seat,
 hard-stopping at a message cap (`moot_max_seats` default 6, `moot_message_cap`
 default 30). See CLI.md § Native Chat (V1.5) and WORKFLOWS.md § Chat.
 
@@ -288,4 +296,6 @@ For detailed safety and lock rules, read [SAFETY.md](references/SAFETY.md).
 ## When Unsure
 
 Reread this `SKILL.md`, then inspect `/gitmoot help`, `gitmoot status`, and the
-relevant job events before acting.
+relevant job events before acting. If this skill disagrees with the installed
+binary, trust the live `gitmoot --help` / subcommand help output and treat the
+skill as stale documentation that should be refreshed.

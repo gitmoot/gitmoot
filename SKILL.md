@@ -1,11 +1,11 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, PR comments, daemon jobs, stuck jobs, branch locks, agent templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, event webhooks, the web dashboard, and Codex, Claude Code, or Kimi Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, daemon jobs, stuck jobs, branch locks, agent templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, pipelines, native chat and moots, memory curation, routing telemetry, event webhooks, the web dashboard, runtime metadata, and Codex, Claude Code, or Kimi Code runtime workflows.
 version: 0.1.0
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
 metadata:
-  gitmoot-version: "0.8.1"
+  gitmoot-version: "0.8.8"
   source: "jerryfane/gitmoot"
   openclaw:
     requires:
@@ -30,7 +30,15 @@ goals, reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, Codex, Claude Code, or Kimi Code agent startup,
 structured implementation plans, standard goal files, agent template workflows,
-template capture, custom prompt agents, job status, or branch lock inspection.
+template capture, custom prompt agents, job status, branch lock inspection,
+declarative pipelines, native agent chat threads, bounded moots, agent memory,
+routing telemetry, or runtime metadata.
+
+Gitmoot's CLI evolves quickly. If the user names a Gitmoot feature or command
+that is not covered here, verify the live surface with `gitmoot --help` and the
+relevant `gitmoot <command> --help` before answering. If this compatibility
+entrypoint disagrees with the live binary, trust the live help and treat the
+skill text as stale documentation that should be refreshed.
 
 For current-chat prompt import, "use <agent> here" means run
 `gitmoot agent prompt <agent>` and apply the returned prompt content in this
@@ -86,6 +94,9 @@ asks for that action.
    clearly requires it.
 5. Prefer read-only status commands and answer directly before mutating Gitmoot
    state or pointing the user to live monitoring.
+6. Use `gitmoot --help` and subcommand help for version-sensitive features such
+   as `pipeline`, `chat`, `moot`, `memory`, `router`, `runtime`, dashboard web,
+   session jobs, heartbeats, and SkillOpt exchange commands.
 
 ## Install And Update
 
@@ -138,9 +149,13 @@ gitmoot daemon start
 gitmoot daemon status
 gitmoot daemon restart
 gitmoot daemon stop [--forget-runtime-auth]
+gitmoot dashboard --json
+gitmoot dashboard --web [--addr 127.0.0.1:8080]
 gitmoot plugin doctor
+gitmoot runtime list [--json]
 gitmoot agent list
 gitmoot agent doctor <agent>
+gitmoot agent heartbeat list [--agent <agent>]
 gitmoot agent prompt <agent-or-template>
 gitmoot agent run <agent> --repo owner/repo "question, review, or implementation request"
 gitmoot agent review <agent> --repo owner/repo --pr <number> "review request"
@@ -149,12 +164,40 @@ gitmoot agent ask <agent> --repo owner/repo "question or instructions"
 gitmoot job list --repo owner/repo
 gitmoot job show <job-id>
 gitmoot job events <job-id>
+gitmoot job gates <job-id>
+gitmoot job gates clear <job-id> --need "<text>"|--all
+gitmoot job open --agent <name> --repo owner/repo --type ask|review|implement [--title "..."]
+gitmoot job close <job-id> --decision approved|changes_requested|blocked|implemented|failed [--summary "..."]
+gitmoot job record --agent <name> --repo owner/repo --type ask|review|implement --decision implemented [--summary "..."]
 gitmoot report bug --job <job-id> --preview
 gitmoot report bug --job <job-id> --create --yes
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
+gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo] [--json]
+gitmoot memory ingest <path|dir> --agent NAME [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
+gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]
+gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--yes] [--json]
+gitmoot memory groom --propose [--out PLAN.json] [--json]
+gitmoot pipeline add <spec.yaml> [--enable]
+gitmoot pipeline list [--json]
+gitmoot pipeline run <name>
+gitmoot pipeline show <name|run-id> [--json]
+gitmoot pipeline resume <run-id> [--from <stage>]
+gitmoot pipeline cancel <run-id>
+gitmoot pipeline enable|disable <name>
+gitmoot pipeline remove <name>
+gitmoot chat create <name> --repo owner/repo [--topic "title"] [--json]
+gitmoot chat send <thread> "message" [--as agent] [--repo owner/repo] [--json]
+gitmoot chat task <thread> "@agent message" [--action ask|review|implement] [--repo owner/repo] [--json]
+gitmoot chat wait <thread> [--since-seq N] [--timeout 90s] [--repo owner/repo] [--json]
+gitmoot moot <name> "topic" --agents a,b,c --repo owner/repo [--max-messages N] [--json]
+gitmoot router summary [--repo owner/repo] [--action ask|review|implement] [--since 30d] [--json]
 gitmoot skillopt export --run <run-id> [--output training.json]
 gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]
+gitmoot skillopt ab <agent> "<prompt>" [--challenger <versionId>] [--pick a|b] [--judge]
+gitmoot skillopt pairwise import <packet-dir> [--json]
+gitmoot skillopt rubric induce --template <id> [--json]
+gitmoot skillopt judge agreement [--template <id>] [--json]
 gitmoot skillopt candidate list [--template id]
 gitmoot skillopt candidate show <version-id>
 gitmoot skillopt candidate promote <version-id>
@@ -187,6 +230,25 @@ or questions. Add `--background` only when the user wants a queued background
 job. This is the same agent registry and runtime adapter path used by PR-comment
 jobs; the plugin only helps the runtime discover this skill and does not replace
 the `gitmoot` CLI.
+
+Use `gitmoot pipeline` when the workflow is a fixed, repeatable DAG declared in
+YAML rather than a model-driven decomposition. `pipeline add` validates and
+stores the spec, stage commands must emit `gitmoot_result`, `blocked` parks the
+run, and `pipeline resume` reruns the halted stage plus dependents.
+
+Use `gitmoot chat` for durable local repo-aware threads. A plain `chat send`
+records a message and never starts work; only `chat task` promotes a message
+into a real job. Use `gitmoot chat wait` and `gitmoot moot` for bounded
+agent-to-agent brainstorms.
+
+Use `gitmoot memory` to inspect or curate persistent agent memory. `memory
+ingest` stages Markdown as pending observations, `memory confirm` is the human
+promotion gate, and `memory groom` proposes or applies deterministic retirement
+plans. Do not treat ingested Markdown as trusted until it has been confirmed.
+
+Use `gitmoot runtime list` to inspect runtime metadata and
+`gitmoot router summary` for local observed routing telemetry. Router telemetry
+is advisory only and not a benchmark.
 
 Use `gitmoot report bug --job <job-id> --preview` when a failed, blocked, or
 cancelled Gitmoot job needs a user-shareable bug report. Preview first by
@@ -345,4 +407,6 @@ command output.
 ## When Unsure
 
 Reread this `SKILL.md`, then inspect `/gitmoot help`, `gitmoot status`, and the
-relevant job events before acting.
+relevant job events before acting. For CLI command questions, prefer
+`gitmoot --help` and the relevant `gitmoot <command> --help` over remembered
+skill text.
