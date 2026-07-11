@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
 	gitutil "github.com/jerryfane/gitmoot/internal/git"
+	"github.com/jerryfane/gitmoot/internal/github"
 	"github.com/jerryfane/gitmoot/internal/pipeline"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 	"github.com/jerryfane/gitmoot/internal/workflow"
@@ -35,6 +37,14 @@ const pipelineSkippedSummaryMarker = "[skipped: no work]"
 // workflow.Mailbox.Enqueue (matching newHeartbeatEnqueuer); tests inject a fake to
 // assert the request shape without a real worker.
 type pipelineStageEnqueuer func(ctx context.Context, request workflow.JobRequest) (db.Job, error)
+
+// pipelineAutoMergeExecutor is the narrow write seam for merge: auto gates.
+// Tests inject a deterministic stub; production adapts the existing workflow
+// merge-gate checks and shared GitHub merge call.
+type pipelineAutoMergeExecutor interface {
+	Evaluate(context.Context, workflow.PipelineAutoMergeRequest) (workflow.PipelineAutoMergeReadiness, error)
+	Merge(context.Context, workflow.PipelineAutoMergeRequest) (workflow.PipelineAutoMergeResult, error)
+}
 
 // newPipelineStageEnqueuer builds the production enqueuer: a Mailbox bound to the
 // store and the daemon's canary-routing policy, so a pipeline stage job is
@@ -497,8 +507,9 @@ func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.Pipel
 	// The writable task-worktree itself is allocated at the enqueue seam
 	// (allocatePipelineStageWritableWorktree), which reuses the existing implement
 	// dispatch's GetTaskByRepoBranch reuse + fail-closed guards. Still a LEAF
-	// (Sender=pipeline strips delegations/human_questions) and the pipeline never merges
-	// its PR. This is an APPEND above the read-only agent branch, which stays byte-identical.
+	// (Sender=pipeline strips delegations/human_questions), and this implement job never
+	// merges its PR; only a separately authorized gate may. This is an APPEND above the
+	// read-only agent branch, which stays byte-identical.
 	if stage.Kind() == pipeline.StageKindAgentImplement {
 		return workflow.JobRequest{
 			ID:           pipelineStageJobID(run.ID, stage.ID, attempt),
@@ -853,6 +864,30 @@ func advancePipelineRuns(ctx context.Context, store *db.Store, enqueue pipelineS
 // no writes and no enqueues. It assumes run.State == running; a parked/terminal run
 // is a no-op. The updated run is returned for callers/tests.
 func advancePipelineRun(ctx context.Context, store *db.Store, enqueue pipelineStageEnqueuer, rec db.Pipeline, spec pipeline.Spec, run db.PipelineRun, now time.Time) (db.PipelineRun, error) {
+	var autoMerge pipelineAutoMergeExecutor
+	for _, stage := range spec.Stages {
+		if strings.TrimSpace(stage.Merge) == pipeline.GateMergeAuto {
+			autoMerge = newPipelineAutoMerger(ctx, store, rec.Repo)
+			break
+		}
+	}
+	return advancePipelineRunWithAutoMerge(ctx, store, enqueue, rec, spec, run, now, autoMerge)
+}
+
+func newPipelineAutoMerger(ctx context.Context, store *db.Store, repo string) workflow.PipelineAutoMerger {
+	checkout := pipelineStageCheckoutPath(ctx, store, repo)
+	merger := workflow.PipelineAutoMerger{Store: store, GitHub: github.NewClient(checkout)}
+	home := ""
+	if databasePath := strings.TrimSpace(store.DatabasePath()); databasePath != "" {
+		home = filepath.Dir(databasePath)
+	}
+	applyPipelineAutoMergePolicy(&merger, home, repo)
+	return merger
+}
+
+// advancePipelineRunWithAutoMerge is the testable advancer core. The executor is
+// threaded only into the per-stage settle deps; human-default gates never call it.
+func advancePipelineRunWithAutoMerge(ctx context.Context, store *db.Store, enqueue pipelineStageEnqueuer, rec db.Pipeline, spec pipeline.Spec, run db.PipelineRun, now time.Time, autoMerge pipelineAutoMergeExecutor) (db.PipelineRun, error) {
 	now = now.UTC()
 	if run.State != pipeline.RunRunning {
 		return run, nil
@@ -884,7 +919,7 @@ func advancePipelineRun(ctx context.Context, store *db.Store, enqueue pipelineSt
 		// reflect. That is deliberate — a future JOBLESS kind (gate) is reachable here
 		// without moving a guard out of a shared loop, and an unsettled kind can hand
 		// back a row mutation (nextRow) to persist while it keeps waiting.
-		deps := pipelineStageSettleDeps{store: store, rec: rec, run: run, now: now}
+		deps := pipelineStageSettleDeps{store: store, rec: rec, run: run, now: now, autoMerge: autoMerge}
 		settled, state, summary, needs, nextRow, err := stageSettleOutcome(ctx, deps, spec, stage, row)
 		if err != nil {
 			return run, err
@@ -1101,18 +1136,17 @@ func applyPipelineRunSettlement(ctx context.Context, store *db.Store, rec db.Pip
 
 // pipelineStageSettleDeps carries the ambient capabilities the per-kind settle
 // predicate (stageSettleOutcome) may need. The seam loads the stage's job ITSELF via
-// store (today's shell + read-only agent kinds), so a future JOBLESS kind is not
-// forced to fabricate one. Today's kinds read only store; rec/run/now are threaded
-// now so a future kind is a NEW case in the seam, NOT a widening of the advancer
-// signature or a re-plumb of the FOLD pass. Everything here is already in scope in
-// advancePipelineRun. What the deferred kinds want:
+// store (shell + agent kinds), so a JOBLESS kind is not forced to fabricate one.
+// rec/run/now and the narrow auto-merge executor are threaded here rather than
+// widening the shared fold loop. Everything is already in scope in
+// advancePipelineRun. Current specializations:
 //   - StageKindGate (#768 Phase 2): a gate has no job/worker; it settles when an
 //     external predicate holds (e.g. pr_merged on an upstream implement stage's
 //     PR). Because the seam — not the advancer — owns the "does this stage have a
 //     job" question, a gate case simply never calls store.GetJob; it reads the
 //     managed repo (rec) and upstream stage rows via store, and bounds the wait
-//     against the stage timeout using now. GitHub access would be threaded into this
-//     struct then (a client/poller field), not into the caller. Such a predicate
+//     against the stage timeout using now. The opt-in merge:auto variant alone uses
+//     autoMerge for live readiness and the single audited write. Such a predicate
 //     MUST be non-blocking and ctx-bounded and MUST fail OPEN (return settled=false,
 //     never a hung poll) — the FOLD pass runs it synchronously across every in-flight
 //     run, and a settle error is propagated (err), never swallowed.
@@ -1122,10 +1156,11 @@ func applyPipelineRunSettlement(ctx context.Context, store *db.Store, rec db.Pip
 //     current continuation and stays unsettled by returning that row as nextRow. ctx
 //     bounds those store reads.
 type pipelineStageSettleDeps struct {
-	store *db.Store
-	rec   db.Pipeline
-	run   db.PipelineRun
-	now   time.Time
+	store     *db.Store
+	rec       db.Pipeline
+	run       db.PipelineRun
+	now       time.Time
+	autoMerge pipelineAutoMergeExecutor
 }
 
 // stageSettleOutcome is the per-stage-kind SETTLE PREDICATE seam. Given an in-flight
@@ -1529,6 +1564,9 @@ func pipelineSourceStagePR(ctx context.Context, store *db.Store, source db.Pipel
 // re-arming the timer). A gate with no timeout waits indefinitely (cheaply — no job).
 // While in flight it reflects the one-time queued->running funnel transition via nextRow.
 func gateStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec pipeline.Spec, stage pipeline.Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
+	if strings.TrimSpace(stage.Merge) == pipeline.GateMergeAuto {
+		return autoMergeGateStageSettleOutcome(ctx, deps, spec, stage, stageRow)
+	}
 	// Classify the upstream source from its structured job payload first. Summary text
 	// is only a compatibility fallback when the source job row has been deleted/GC'd.
 	pr := 0
@@ -1593,6 +1631,185 @@ func gateStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, s
 		return false, "", "", nil, &next, nil
 	}
 	return false, "", "", nil, nil, nil
+}
+
+// autoMergeGateStageSettleOutcome is the only pipeline-owned merge authority.
+// It requires the spec double key, a stamped source payload, every source-bound
+// review folded approved at that exact head, and a green live GitHub observation.
+// It records intent before its single squash attempt and blocks terminally on any
+// merge failure, so an unchanged scan can never retry-spam the API.
+func autoMergeGateStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec pipeline.Spec, stage pipeline.Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
+	block := func(reason string) (bool, string, string, []string, *db.PipelineRunStage, error) {
+		return true, pipeline.StageBlocked, "gate auto-merge blocked: " + reason, []string{reason}, nil, nil
+	}
+	if !spec.AllowAutoMerge {
+		return block("allow_auto_merge: true is required")
+	}
+	if deps.autoMerge == nil {
+		return block("pipeline auto-merge executor is unavailable")
+	}
+
+	sourceID := strings.TrimSpace(stage.Source)
+	sourceRow, ok, gerr := deps.store.GetPipelineRunStage(ctx, deps.run.ID, sourceID)
+	if gerr != nil {
+		return false, "", "", nil, nil, gerr
+	}
+	if !ok || sourceRow.State != pipeline.StageSucceeded {
+		return autoMergeGateWaiting(stage, stageRow, deps.now, 0)
+	}
+	sourceJobID := strings.TrimSpace(sourceRow.JobID)
+	if sourceJobID == "" {
+		return block(fmt.Sprintf("source stage %q has no stamped job payload", sourceID))
+	}
+	sourceJob, gerr := deps.store.GetJob(ctx, sourceJobID)
+	if gerr != nil {
+		return false, "", "", nil, nil, gerr
+	}
+	payload, gerr := workflow.ParseJobPayload(sourceJob.Payload)
+	if gerr != nil {
+		return block(fmt.Sprintf("source stage %q payload is invalid: %v", sourceID, gerr))
+	}
+	if payload.PullRequest <= 0 {
+		return block(fmt.Sprintf("source stage %q succeeded without a stamped PR", sourceID))
+	}
+	reviewedHead := strings.TrimSpace(payload.HeadSHA)
+	if reviewedHead == "" {
+		return block(fmt.Sprintf("source stage %q PR #%d has no stamped head SHA", sourceID, payload.PullRequest))
+	}
+
+	reviewCount := 0
+	for _, reviewStage := range spec.Stages {
+		if reviewStage.Kind() != pipeline.StageKindAgentReview || strings.TrimSpace(reviewStage.Source) != sourceID {
+			continue
+		}
+		reviewCount++
+		reviewRow, found, rerr := deps.store.GetPipelineRunStage(ctx, deps.run.ID, reviewStage.ID)
+		if rerr != nil {
+			return false, "", "", nil, nil, rerr
+		}
+		if !found || reviewRow.State == pipeline.StagePending || reviewRow.State == pipeline.StageQueued || reviewRow.State == pipeline.StageRunning {
+			return autoMergeGateWaiting(stage, stageRow, deps.now, payload.PullRequest)
+		}
+		if reviewRow.State != pipeline.StageSucceeded {
+			return block(fmt.Sprintf("source-bound review stage %q has not approved", reviewStage.ID))
+		}
+		reviewJobID := strings.TrimSpace(reviewRow.JobID)
+		if reviewJobID == "" {
+			return block(fmt.Sprintf("source-bound review stage %q has no result job", reviewStage.ID))
+		}
+		reviewJob, rerr := deps.store.GetJob(ctx, reviewJobID)
+		if rerr != nil {
+			return false, "", "", nil, nil, rerr
+		}
+		reviewPayload, rerr := workflow.ParseJobPayload(reviewJob.Payload)
+		if rerr != nil || reviewPayload.Result == nil {
+			return block(fmt.Sprintf("source-bound review stage %q produced no valid result", reviewStage.ID))
+		}
+		decision := strings.TrimSpace(reviewPayload.Result.Decision)
+		if decision != "approved" {
+			return block(fmt.Sprintf("source-bound review stage %q returned decision %q, not approved", reviewStage.ID, decision))
+		}
+		if head := strings.TrimSpace(reviewPayload.HeadSHA); head != reviewedHead {
+			return block(fmt.Sprintf("source-bound review stage %q reviewed head %s, expected %s", reviewStage.ID, shortPipelineSHA(head), shortPipelineSHA(reviewedHead)))
+		}
+	}
+	if reviewCount == 0 {
+		return block(fmt.Sprintf("source stage %q has no source-bound review stage", sourceID))
+	}
+
+	request := workflow.PipelineAutoMergeRequest{
+		Repo:        deps.rec.Repo,
+		PullRequest: payload.PullRequest,
+		HeadSHA:     reviewedHead,
+		Pipeline:    deps.rec.Name,
+		RunID:       deps.run.ID,
+		StageID:     stage.ID,
+	}
+	readiness, evalErr := deps.autoMerge.Evaluate(ctx, request)
+	if evalErr != nil {
+		return block("GitHub readiness evaluation failed: " + evalErr.Error())
+	}
+	if readiness.Merged {
+		return true, pipeline.StageSucceeded, fmt.Sprintf("gate %s satisfied: PR #%d already merged", stage.Gate, payload.PullRequest), nil, nil, nil
+	}
+	currentHead := strings.TrimSpace(readiness.CurrentHeadSHA)
+	if currentHead == "" {
+		return block(fmt.Sprintf("GitHub did not report a current head SHA for PR #%d", payload.PullRequest))
+	}
+	if currentHead != reviewedHead {
+		return block(fmt.Sprintf("pull request head drifted after review: reviewed %s, current %s", shortPipelineSHA(reviewedHead), shortPipelineSHA(currentHead)))
+	}
+	if readiness.Blocked {
+		return block(readiness.Reason)
+	}
+	if !readiness.Ready {
+		return autoMergeGateWaiting(stage, stageRow, deps.now, payload.PullRequest)
+	}
+
+	claim, marshalErr := json.Marshal(map[string]any{
+		"phase": "claim", "pipeline": deps.rec.Name, "run_id": deps.run.ID,
+		"stage_id": stage.ID, "pull_request": payload.PullRequest, "head_sha": reviewedHead,
+	})
+	if marshalErr != nil {
+		return false, "", "", nil, nil, marshalErr
+	}
+	claimed, claimErr := deps.store.ClaimJobEvent(ctx, db.JobEvent{JobID: sourceJobID, Kind: "pipeline_auto_merge_claim", Message: string(claim)})
+	if claimErr != nil {
+		return false, "", "", nil, nil, claimErr
+	}
+	if !claimed {
+		// Another scan owns this exact run/stage/PR/head write. Do not call Merge;
+		// the next scan observes either the merged PR or the winner's blocked fold.
+		return autoMergeGateWaiting(stage, stageRow, deps.now, payload.PullRequest)
+	}
+
+	result, mergeErr := deps.autoMerge.Merge(ctx, request)
+	if mergeErr != nil {
+		return block("merge API failed; retry stopped: " + mergeErr.Error())
+	}
+	if !result.Merged {
+		reason := strings.TrimSpace(result.Reason)
+		if reason == "" {
+			reason = "GitHub did not confirm the merge"
+		}
+		return block(reason + "; retry stopped")
+	}
+	confirmation, marshalErr := json.Marshal(map[string]any{
+		"phase": "confirmed", "pipeline": deps.rec.Name, "run_id": deps.run.ID,
+		"stage_id": stage.ID, "pull_request": payload.PullRequest, "head_sha": reviewedHead,
+		"merge_commit_sha": result.MergeCommitSHA,
+	})
+	if marshalErr != nil {
+		return false, "", "", nil, nil, marshalErr
+	}
+	if eventErr := deps.store.AddJobEvent(ctx, db.JobEvent{JobID: sourceJobID, Kind: "pipeline_auto_merge_confirmed", Message: string(confirmation)}); eventErr != nil {
+		return false, "", "", nil, nil, eventErr
+	}
+	return true, pipeline.StageSucceeded, fmt.Sprintf("gate %s auto-merged PR #%d at %s", stage.Gate, payload.PullRequest, shortPipelineSHA(reviewedHead)), nil, nil, nil
+}
+
+func autoMergeGateWaiting(stage pipeline.Stage, stageRow db.PipelineRunStage, now time.Time, pr int) (bool, string, string, []string, *db.PipelineRunStage, error) {
+	if timedOut, waited := pipelineGateTimedOut(stage, stageRow, now); timedOut {
+		want := pipelineGateWaitDescription(stage.Gate, pr)
+		return true, pipeline.StageBlocked, fmt.Sprintf("gate %s timed out after %s waiting for auto-merge readiness for %s", stage.Gate, waited, want), []string{want}, nil, nil
+	}
+	if stageRow.State == pipeline.StageQueued {
+		next := stageRow
+		next.State = pipeline.StageRunning
+		return false, "", "", nil, &next, nil
+	}
+	return false, "", "", nil, nil, nil
+}
+
+func shortPipelineSHA(sha string) string {
+	sha = strings.TrimSpace(sha)
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	if sha == "" {
+		return "<missing>"
+	}
+	return sha
 }
 
 // pipelineGateTimedOut reports whether a gate stage's wait has exceeded its stage

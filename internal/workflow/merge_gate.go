@@ -224,7 +224,7 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	}); err != nil {
 		return MergeDecision{}, err
 	}
-	result, err := g.GitHub.MergePullRequest(ctx, github.MergePullRequestInput{
+	result, err := executePullRequestMerge(ctx, g.GitHub, github.MergePullRequestInput{
 		Repo:            repo,
 		Number:          int64(request.PullRequest),
 		Method:          mergeMethod(g.MergeMethod),
@@ -244,6 +244,14 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 		return g.pending(ctx, request, headSHA, reason)
 	}
 	return g.finishMerged(ctx, request, pr, strings.TrimSpace(result.SHA))
+}
+
+// executePullRequestMerge is the single low-level GitHub merge path shared by
+// the native policy merge gate and the opt-in pipeline auto-merge gate.
+func executePullRequestMerge(ctx context.Context, client interface {
+	MergePullRequest(context.Context, github.MergePullRequestInput) (github.MergeResult, error)
+}, input github.MergePullRequestInput) (github.MergeResult, error) {
+	return client.MergePullRequest(ctx, input)
 }
 
 func (g PolicyMergeGate) finishMerged(ctx context.Context, request MergeRequest, pr github.PullRequest, mergeSHA string) (MergeDecision, error) {
@@ -546,9 +554,24 @@ func isIntegrationWorktreeReview(payload JobPayload) bool {
 }
 
 func (g PolicyMergeGate) ensureStatuses(ctx context.Context, repo github.Repository, pullRequest int64, headSHA string) error {
-	status, err := g.GitHub.GetCombinedStatus(ctx, repo, headSHA)
+	externalCount, err := g.evaluateStatuses(ctx, repo, pullRequest, headSHA)
 	if err != nil {
 		return err
+	}
+	if externalCount == 0 {
+		return g.concludeNoExternalCI(ctx, repo, pullRequest, headSHA)
+	}
+	return nil
+}
+
+// evaluateStatuses applies the native merge gate's explicit state semantics and
+// returns the total external status/check count. A caller chooses its zero-signal
+// policy: the native gate uses its bounded no-CI machinery, while unattended
+// pipeline auto-merge fails closed immediately.
+func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repository, pullRequest int64, headSHA string) (int, error) {
+	status, err := g.GitHub.GetCombinedStatus(ctx, repo, headSHA)
+	if err != nil {
+		return 0, err
 	}
 	externalStatusCount := 0
 	for _, item := range status.Statuses {
@@ -557,25 +580,25 @@ func (g PolicyMergeGate) ensureStatuses(ctx context.Context, repo github.Reposit
 				continue
 			}
 			if statusPending(item.State) {
-				return mergePending{reason: fmt.Sprintf("gitmoot status %q is pending", item.Context)}
+				return 0, mergePending{reason: fmt.Sprintf("gitmoot status %q is pending", item.Context)}
 			}
 			if item.State != "success" {
-				return mergeBlocked{reason: fmt.Sprintf("gitmoot status %q is %s", item.Context, item.State)}
+				return 0, mergeBlocked{reason: fmt.Sprintf("gitmoot status %q is %s", item.Context, item.State)}
 			}
 			continue
 		}
 		externalStatusCount++
 		if statusPending(item.State) {
-			return mergePending{reason: "external commit status " + item.Context + " is pending"}
+			return 0, mergePending{reason: "external commit status " + item.Context + " is pending"}
 		}
 		if item.State != "success" {
-			return mergeBlocked{reason: "external commit status " + item.Context + " is not successful"}
+			return 0, mergeBlocked{reason: "external commit status " + item.Context + " is not successful"}
 		}
 	}
 
 	checks, err := g.GitHub.ListPullRequestChecks(ctx, repo, pullRequest)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	externalCheckCount := 0
 	for _, check := range checks {
@@ -588,19 +611,16 @@ func (g PolicyMergeGate) ensureStatuses(ctx context.Context, repo github.Reposit
 			if name == "" {
 				name = "unnamed check"
 			}
-			return mergePending{reason: fmt.Sprintf("external CI check %q is pending", name)}
+			return 0, mergePending{reason: fmt.Sprintf("external CI check %q is pending", name)}
 		}
 		if !checkPassed(check) {
 			if name == "" {
 				name = "unnamed check"
 			}
-			return mergeBlocked{reason: fmt.Sprintf("external CI check %q is not successful", name)}
+			return 0, mergeBlocked{reason: fmt.Sprintf("external CI check %q is not successful", name)}
 		}
 	}
-	if externalCheckCount == 0 && externalStatusCount == 0 {
-		return g.concludeNoExternalCI(ctx, repo, pullRequest, headSHA)
-	}
-	return nil
+	return externalCheckCount + externalStatusCount, nil
 }
 
 // concludeNoExternalCI is the layered defense for the #596 no-CI race. When a

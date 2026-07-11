@@ -175,6 +175,20 @@ stages:
 	}
 }
 
+func TestHumanMergeGateDefaultsRemainByteIdentical(t *testing.T) {
+	const raw = "name: human-default\nrepo: owner/repo\nstages:\n  - id: impl\n    agent: coder\n    prompt: Fix it.\n    action: implement\n    write: true\n  - id: wait\n    gate: pr_merged\n    source: impl\n    needs: [impl]\n"
+	loaded, err := Load([]byte(raw))
+	if err != nil {
+		t.Fatalf("Load human-default gate: %v", err)
+	}
+	if loaded.AllowAutoMerge || loaded.Stages[1].Merge != "" {
+		t.Fatalf("human-default auto-merge fields = allow:%v merge:%q", loaded.AllowAutoMerge, loaded.Stages[1].Merge)
+	}
+	if got, want := Hash([]byte(raw)), "e7c662207566643a01b2e2dbcf2b7cee11f380409a7decf4de70e670fecc4485"; got != want {
+		t.Fatalf("human-default raw spec hash = %s, want %s", got, want)
+	}
+}
+
 func TestLoadValidSourceBoundReviewSpec(t *testing.T) {
 	const spec = `name: review-flow
 repo: owner/repo
@@ -198,6 +212,41 @@ stages:
 	review := loaded.Stages[1]
 	if review.Kind() != StageKindAgentReview || review.Source != "impl" {
 		t.Fatalf("review stage = %+v, want action: review source: impl", review)
+	}
+}
+
+func TestLoadValidAutoMergeGateSpec(t *testing.T) {
+	const spec = `name: auto-merge-flow
+repo: owner/repo
+schedule:
+  interval: 24h
+allow_scheduled_writes: true
+allow_auto_merge: true
+stages:
+  - id: impl
+    agent: coder
+    prompt: Fix the bug.
+    action: implement
+    write: true
+  - id: review
+    agent: reviewer
+    prompt: Review the implementation PR.
+    action: review
+    source: impl
+    needs: [impl]
+    success_decisions: [approved]
+  - id: merge
+    gate: pr_merged
+    merge: auto
+    source: impl
+    needs: [impl, review]
+`
+	loaded, err := Load([]byte(spec))
+	if err != nil {
+		t.Fatalf("Load valid auto-merge spec: %v", err)
+	}
+	if !loaded.AllowScheduledWrites || !loaded.AllowAutoMerge || loaded.Stages[2].Merge != GateMergeAuto {
+		t.Fatalf("auto-merge keys did not parse: %+v", loaded)
 	}
 }
 
@@ -296,6 +345,36 @@ func TestLoadValidationErrors(t *testing.T) {
 			name:    "gate with agent rejected",
 			spec:    "name: p\nstages:\n  - {id: a, cmd: echo}\n  - {id: g, gate: pr_merged, source: a, needs: [a], agent: rev, prompt: hi}\n",
 			wantSub: `stage "g" sets both gate and agent`,
+		},
+		{
+			name:    "auto merge without pipeline allow rejected",
+			spec:    "name: p\nstages:\n  - {id: impl, agent: coder, prompt: fix, action: implement, write: true}\n  - {id: review, agent: rev, prompt: inspect, action: review, source: impl, needs: [impl]}\n  - {id: g, gate: pr_merged, merge: auto, source: impl, needs: [impl, review]}\n",
+			wantSub: "merge: auto without allow_auto_merge: true",
+		},
+		{
+			name:    "merge mode on non-gate rejected",
+			spec:    "name: p\nallow_auto_merge: true\nstages:\n  - {id: shell, cmd: echo, merge: auto}\n",
+			wantSub: "merge is only valid on gate stages",
+		},
+		{
+			name:    "invalid gate merge mode rejected",
+			spec:    "name: p\nallow_auto_merge: true\nstages:\n  - {id: impl, agent: coder, prompt: fix, action: implement, write: true}\n  - {id: review, agent: rev, prompt: inspect, action: review, source: impl, needs: [impl]}\n  - {id: g, gate: pr_merged, merge: human, source: impl, needs: [impl, review]}\n",
+			wantSub: `merge mode "human" is invalid`,
+		},
+		{
+			name:    "auto merge without source-bound review rejected",
+			spec:    "name: p\nallow_auto_merge: true\nstages:\n  - {id: impl, agent: coder, prompt: fix, action: implement, write: true}\n  - {id: g, gate: pr_merged, merge: auto, source: impl, needs: [impl]}\n",
+			wantSub: "has no source-bound review stage",
+		},
+		{
+			name:    "scheduled auto merge still needs scheduled writes allow",
+			spec:    "name: p\nschedule: {interval: 24h}\nallow_auto_merge: true\nstages:\n  - {id: impl, agent: coder, prompt: fix, action: implement, write: true}\n  - {id: review, agent: rev, prompt: inspect, action: review, source: impl, needs: [impl]}\n  - {id: g, gate: pr_merged, merge: auto, source: impl, needs: [impl, review]}\n",
+			wantSub: "set allow_scheduled_writes: true",
+		},
+		{
+			name:    "scheduled auto merge still needs auto merge allow",
+			spec:    "name: p\nschedule: {interval: 24h}\nallow_scheduled_writes: true\nstages:\n  - {id: impl, agent: coder, prompt: fix, action: implement, write: true}\n  - {id: review, agent: rev, prompt: inspect, action: review, source: impl, needs: [impl]}\n  - {id: g, gate: pr_merged, merge: auto, source: impl, needs: [impl, review]}\n",
+			wantSub: "merge: auto without allow_auto_merge: true",
 		},
 		{
 			name:    "review source not in needs",

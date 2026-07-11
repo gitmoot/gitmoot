@@ -766,11 +766,37 @@ func TestCodexSandboxArgsProduceGrants(t *testing.T) {
 	if got := codexSandboxArgs(danger, ""); !reflect.DeepEqual(got, []string{"--sandbox", "danger-full-access"}) {
 		t.Fatalf("danger-full-access produce args = %v, want no leaked grants", got)
 	}
-	if err := ProduceDispatchError("produce", Agent{Name: "p", Runtime: ClaudeRuntime, AutonomyPolicy: AutonomyPolicyWorkspaceWrite}); err == nil || !strings.Contains(err.Error(), `runtime "claude"`) {
-		t.Fatalf("non-codex produce error = %v", err)
+	for _, runtimeName := range []string{CodexRuntime, ClaudeRuntime, KimiRuntime} {
+		if err := ProduceDispatchError("produce", Agent{Name: "p", Runtime: runtimeName, AutonomyPolicy: AutonomyPolicyWorkspaceWrite}); err != nil {
+			t.Fatalf("%s produce dispatch error = %v", runtimeName, err)
+		}
+	}
+	if err := ProduceDispatchError("produce", Agent{Name: "p", Runtime: KimiCLIRuntime, AutonomyPolicy: AutonomyPolicyWorkspaceWrite}); err == nil || !strings.Contains(err.Error(), `runtime "kimi-cli"`) {
+		t.Fatalf("legacy kimi produce error = %v", err)
 	}
 	if err := ProduceDispatchError("produce", Agent{Name: "p", Runtime: CodexRuntime, AutonomyPolicy: AutonomyPolicyReadOnly}); err == nil || !strings.Contains(err.Error(), "writable autonomy policy") {
 		t.Fatalf("read-only produce error = %v", err)
+	}
+}
+
+func TestClaudeKimiProducePermissionArgs(t *testing.T) {
+	agent := Agent{
+		AutonomyPolicy: AutonomyPolicyWorkspaceWrite,
+		WritablePaths:  []string{"/data/one", " ", "/data/two"},
+	}
+	if got, want := claudePermissionArgs(agent), []string{"--permission-mode", "acceptEdits", "--add-dir", "/data/one", "--add-dir", "/data/two"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("claudePermissionArgs = %v, want %v", got, want)
+	}
+	if got, want := kimiPermissionArgs(agent), []string{"--add-dir", "/data/one", "--add-dir", "/data/two"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("kimiPermissionArgs = %v, want %v", got, want)
+	}
+	withoutPaths := agent
+	withoutPaths.WritablePaths = nil
+	if got, want := claudePermissionArgs(withoutPaths), []string{"--permission-mode", "acceptEdits"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("non-produce Claude args = %v, want %v", got, want)
+	}
+	if got := kimiPermissionArgs(withoutPaths); got != nil {
+		t.Fatalf("non-produce Kimi args = %v, want nil", got)
 	}
 }
 

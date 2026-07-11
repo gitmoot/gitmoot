@@ -115,6 +115,24 @@ A `[runtimes.<name>]` section can only tweak a **built-in** runtime's metadata; 
 cannot add a new first-class runtime (that requires a code change). An unknown
 runtime name is a config error surfaced by `gitmoot runtime list`.
 
+## Runtime Launch Sandbox
+
+```sh
+gitmoot sandbox probe
+```
+
+`sandbox probe` prints whether this Linux host can enforce Gitmoot's strict
+Landlock launch sandbox and includes the detected ABI. The probe runs the real
+hidden re-exec shim and verifies both an allowed write and a denied outside write;
+unsupported kernels return non-zero. Claude/Kimi `produce` pipeline stages require
+this probe to pass and otherwise retain the explicit Codex-only refusal. Codex
+produce remains on its own native sandbox. Landlock confines filesystem writes but
+does not govern network access; network policy remains the runtime CLI's. Wrapped
+Claude may write its runtime-owned `$HOME/.claude` state and
+`$XDG_CACHE_HOME/claude-cli-nodejs` cache; wrapped Kimi may write its runtime-owned
+`$HOME/.kimi-code` state. Apart from runtime state/cache and standard device nodes,
+only declared data paths, the disposable workdir, and temp roots are writable.
+
 ## Repo And Daemon Status
 
 ```sh
@@ -2118,10 +2136,11 @@ stages:                     # the DAG, keyed by unique id and wired by needs
     prompt: "Triage the scored data; block if a human is needed."
     needs: [score]          #   upstream results are prepended to the prompt
   # other agent-stage kinds:
-  #   implement (#768): action: implement + write: true → mutates repo + opens a PR (never auto-merges)
+  #   implement (#768): action: implement + write: true → mutates repo + opens a PR
   #   bound review (#813): action: review + source: <impl stage> -> reviews that PR/head, report-only
   #   orchestrate (#758): orchestrate: true → sub-tree coordinator (fans out owned children, folds synthesis)
-  #   gate (#768): gate: pr_merged + source: <impl stage> (no agent) → jobless, folds when that PR merges
+  #   gate (#768): gate: pr_merged + source: <impl stage> (no agent) → jobless; human merge is default
+  #   auto-merge gate: add merge: auto plus top-level allow_auto_merge: true; requires source-bound review
   - id: deploy
     cmd: "rclone copy out/ r2:bucket"
     needs: [triage]
@@ -2158,16 +2177,25 @@ its `needs` stages' result summaries are prepended to the prompt, and a repo-bou
 agent stage runs in its own detached read-only worktree so same-repo agent stages
 parallelize without touching the live checkout.
 
-`action: produce` (#814) is a Codex-only pipeline leaf for writing operator-owned
-data, never repo/branch/task/PR state. It requires `write: true`, one or more absolute
+`action: produce` (#814/#825) is a sandboxed pipeline leaf for writing operator-owned
+data, never repo/branch/task/PR state. Codex uses its native sandbox; Claude and
+modern Kimi require a successful `gitmoot sandbox probe` and are re-execed under
+strict Landlock. Non-Linux/unsupported hosts keep the Codex-only refusal. It requires
+`write: true`, one or more absolute
 cleaned `writes:` paths, a `produce`-capable writable agent, and optionally
 `network: true`, `check: <cmd>`, and `check_retries: N`. `pipeline add` resolves
 symlinks and rejects targets overlapping `/`, the Gitmoot home, or a managed checkout.
 The worker repeats that same canonicalization immediately before delivery to close
-symlink-retargeting races. Declared paths are additive `--add-dir` grants: the
-workdir, `/tmp`, and `$TMPDIR` remain writable under Codex workspace-write. A
-danger-full-access agent receives no add-dir/network arguments because it is already
-unrestricted. Checks re-ask the same session with
+symlink-retargeting races. Declared paths are additive `--add-dir` grants. For
+Claude/Kimi, Landlock limits writes to those existing directories plus the workdir,
+temp roots, standard device nodes, and runtime-owned state: `$HOME/.claude` plus
+`$XDG_CACHE_HOME/claude-cli-nodejs` for Claude, and `$HOME/.kimi-code` for Kimi.
+Gitmoot sets `CLAUDE_CONFIG_DIR=$HOME/.claude` so Claude's mutable config stays inside
+that state grant. Apart from runtime state/cache and device nodes, declared data paths,
+the disposable workdir, and temp roots are the only writable locations. Codex behavior
+is unchanged. Landlock does not govern network access.
+A Codex danger-full-access agent receives no add-dir/network arguments because it is
+already unrestricted. Checks re-ask the same session with
 redacted/capped output; stage retries must reconcile partial data idempotently.
 Gitmoot cleans only the disposable cwd, never the declared data directories.
 
@@ -2181,6 +2209,20 @@ fix job and never run the native merge gate. Declaring this review also sets
 reviewer jobs. If the source permanently produces no PR (no-op or `skipped`), the
 review folds blocked immediately with `source stage produced no PR; nothing to
 review` and no unbound review is dispatched.
+
+The `pr_merged` gate remains a human-merge waiter by default. Opt-in
+`merge: auto` is gate-only and also requires top-level `allow_auto_merge: true`
+plus at least one review stage bound to the same implement source. The advancer,
+not the report-only review job, performs one squash attempt only after every bound
+review folded `approved`, the live PR head still equals the reviewed payload
+`HeadSHA`, GitHub reports mergeable, and checks pass. Pending checks keep waiting;
+head drift, conflicts/unmergeability, or a merge API error fold the gate blocked.
+Merge errors are not retried. Scheduled pipelines need both `allow_auto_merge` and
+the existing `allow_scheduled_writes` key. Omitting `merge` preserves human merge.
+Pending checks wait; skipped/neutral check-runs pass; failures block; and zero
+external statuses/checks always block regardless of `require_external_ci`. The
+source job atomically records `pipeline_auto_merge_claim` before the write and
+`pipeline_auto_merge_confirmed` after GitHub confirms it.
 
 `pipeline install-defaults` installs the built-in memory pipelines
 `memory-ingest-sweep` and `memory-groom-propose`. The daemon also runs this

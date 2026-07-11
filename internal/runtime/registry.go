@@ -33,8 +33,8 @@ type RuntimeMetadata struct {
 	// so that invariant is explicit and testable rather than implied.
 	Dispatchable bool
 	// Capabilities are the job actions the runtime's adapter advertises. Every
-	// Codex additionally advertises produce; other runtimes remain
-	// review/implement/ask and are refused for produce at dispatch.
+	// Codex, Claude, and Kimi advertise produce. Claude/Kimi dispatch remains
+	// fail-closed unless Gitmoot's native Landlock launch sandbox probes healthy.
 	Capabilities []string
 	// DefaultModel is the runtime's configured default model, surfaced by
 	// `gitmoot runtime list` AND consulted at delivery (#652): when NEITHER the
@@ -137,14 +137,14 @@ func newBuiltinRegistry() Registry {
 		{
 			Name:         ClaudeRuntime,
 			Dispatchable: true,
-			Capabilities: []string{"review", "implement", "ask"},
+			Capabilities: []string{"review", "implement", "ask", "produce"},
 			UsageSource:  "claude `--output-format json` result envelope usage object",
 			Description:  "Anthropic Claude Code CLI (session-id/resume, permission modes, transient-retry)",
 		},
 		{
 			Name:         KimiRuntime,
 			Dispatchable: true,
-			Capabilities: []string{"review", "implement", "ask"},
+			Capabilities: []string{"review", "implement", "ask", "produce"},
 			UsageSource:  "kimi `--output-format stream-json` usage event (kimi-code 0.19.2 emits none -> 0)",
 			Description:  "Kimi Code CLI (prompt mode, stream-json, per-job fresh session)",
 		},

@@ -11,6 +11,7 @@ import (
 // with name/status/ok/required/detail) instead of erroring with
 // "flag provided but not defined: -json".
 func TestDoctorJSONOutput(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	var stdout, stderr bytes.Buffer
 	// --repo at a temp dir keeps the run local; individual checks may warn/fail (no
 	// git remote, etc.) but the JSON shape is what this test asserts.

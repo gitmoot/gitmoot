@@ -55,6 +55,10 @@ func (GroupRunner) RunStream(ctx context.Context, dir string, out io.Writer, com
 	return RunGroupStream(ctx, dir, out, command, args...)
 }
 
+func (GroupRunner) RunEnvStream(ctx context.Context, dir string, env []string, out io.Writer, command string, args ...string) (Result, error) {
+	return RunGroupEnvStream(ctx, dir, env, out, command, args...)
+}
+
 func (GroupRunner) LookPath(file string) (string, error) {
 	return exec.LookPath(file)
 }
@@ -131,10 +135,19 @@ func (b *tailBuffer) String() string { return string(b.data) }
 // byte-identical to RunGroup's, so the tee is purely additive. A nil out
 // degrades to RunGroup. The whole-group cancellation/sweep is identical.
 func RunGroupStream(ctx context.Context, dir string, out io.Writer, command string, args ...string) (Result, error) {
+	return RunGroupEnvStream(ctx, dir, nil, out, command, args...)
+}
+
+// RunGroupEnvStream combines RunGroupEnv's environment injection with
+// RunGroupStream's live tee and the same whole-process-group cancellation.
+func RunGroupEnvStream(ctx context.Context, dir string, extraEnv []string, out io.Writer, command string, args ...string) (Result, error) {
 	if out == nil {
-		return RunGroup(ctx, dir, command, args...)
+		return RunGroupEnv(ctx, dir, extraEnv, command, args...)
 	}
 	cmd, sweep := newGroupCmd(ctx, dir, command, args)
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	result, err := runStreamingCmd(cmd, out, command, args)
 	sweep()
 	return result, err

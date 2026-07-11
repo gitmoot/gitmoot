@@ -41,6 +41,14 @@ type StreamRunner interface {
 	RunStream(ctx context.Context, dir string, out io.Writer, command string, args ...string) (Result, error)
 }
 
+// EnvStreamRunner combines the optional environment and streaming capabilities.
+// Wrappers that must inject environment without dropping live output use this
+// seam when their inner runner provides it.
+type EnvStreamRunner interface {
+	StreamRunner
+	RunEnvStream(ctx context.Context, dir string, env []string, out io.Writer, command string, args ...string) (Result, error)
+}
+
 type ExecRunner struct{}
 
 func (ExecRunner) Run(ctx context.Context, dir string, command string, args ...string) (Result, error) {

@@ -12,16 +12,35 @@ import (
 // required, built-in grace/max windows) rather than erroring the daemon —
 // mirroring how loadEventsPolicy / resolveEscalationTTL degrade to defaults.
 func applyMergeGatePolicy(gate *workflow.PolicyMergeGate, home string, repo string) {
-	cfg := resolveConfigFile(home)
-	if cfg == "" {
+	policy, ok := resolvedMergeGatePolicy(home, repo)
+	if !ok {
 		return
 	}
-	loaded, err := config.LoadMergeGatePolicy(config.Paths{ConfigFile: cfg})
-	if err != nil {
-		return
-	}
-	policy := loaded.For(repo)
 	gate.RequireExternalCI = policy.RequireExternalCI
 	gate.MinCIWait = policy.MinCIWait
 	gate.MaxCIWait = policy.MaxCIWait
+}
+
+func applyPipelineAutoMergePolicy(merger *workflow.PipelineAutoMerger, home string, repo string) {
+	policy, ok := resolvedMergeGatePolicy(home, repo)
+	if !ok {
+		return
+	}
+	merger.RequireExternalCI = policy.RequireExternalCI
+	merger.MinCIWait = policy.MinCIWait
+	merger.MaxCIWait = policy.MaxCIWait
+}
+
+// resolvedMergeGatePolicy is the single config path for the native merge gate
+// and pipeline auto-merge executor, including per-repo overrides.
+func resolvedMergeGatePolicy(home string, repo string) (config.MergeGatePolicy, bool) {
+	cfg := resolveConfigFile(home)
+	if cfg == "" {
+		return config.MergeGatePolicy{}, false
+	}
+	loaded, err := config.LoadMergeGatePolicy(config.Paths{ConfigFile: cfg})
+	if err != nil {
+		return config.MergeGatePolicy{}, false
+	}
+	return loaded.For(repo), true
 }
