@@ -44,10 +44,16 @@ var AgentStageActionCandidates = []string{"ask", "review"}
 
 // GatePredicatePRMerged is the only gate predicate today (#768 Phase 2): a jobless
 // gate stage carrying `gate: pr_merged` folds success once the PR opened by its
-// upstream source (implement) stage has MERGED. The pipeline never merges the PR
-// itself — merge stays with humans/CI — so the gate is the composable wait a
-// pipeline uses to express `[implement] -> [gate: pr_merged] -> [deploy]`.
+// upstream source (implement) stage has MERGED. Human merge is the default; the
+// separately double-keyed merge:auto mode lets the advancer satisfy the same
+// composable wait after bound review approval and green checks.
 const GatePredicatePRMerged = "pr_merged"
+
+// GateMergeAuto is the sole opt-in gate merge mode. When selected on a
+// pr_merged gate, the pipeline advancer may squash-merge the source PR after all
+// source-bound review rungs approve the stamped head and GitHub reports it ready.
+// An absent merge field keeps the historical human-merge wait unchanged.
+const GateMergeAuto = "auto"
 
 // GatePredicateCandidates are the predicate tokens a gate stage's `gate:` MAY set
 // (#768 Phase 2). It starts deliberately small — just pr_merged — so the vocab is a
@@ -72,6 +78,11 @@ type Spec struct {
 	// deliberate, spelled-twice opt-in. Irrelevant to a manual-only pipeline (no
 	// schedule), which a mutating stage enters with only its per-stage write: true.
 	AllowScheduledWrites bool `yaml:"allow_scheduled_writes,omitempty"`
+	// AllowAutoMerge is the pipeline-level half of the auto-merge double key.
+	// A gate that declares merge: auto is rejected unless this is explicitly true.
+	// It does not authorize scheduled writes; a scheduled pipeline still needs
+	// allow_scheduled_writes for its source implement stage.
+	AllowAutoMerge bool `yaml:"allow_auto_merge,omitempty"`
 	// SuccessDecisions overrides DefaultSuccessDecisions for every stage that does
 	// not set its own. Empty means DefaultSuccessDecisions.
 	SuccessDecisions []string `yaml:"success_decisions,omitempty"`
@@ -125,6 +136,11 @@ type Stage struct {
 	// advancer's settle pass evaluates its predicate per scan. Mutually exclusive with
 	// Cmd and Agent (exactly one of the three executors). Pairs with Source.
 	Gate string `yaml:"gate,omitempty"`
+	// Merge optionally selects who satisfies a pr_merged gate. Empty preserves the
+	// default human-merge wait. The only accepted value is "auto", valid only on a
+	// gate and protected by the top-level allow_auto_merge double key plus at least
+	// one source-bound review rung.
+	Merge string `yaml:"merge,omitempty"`
 	// Source is the id of the upstream implement stage whose opened PR this stage
 	// binds to. It is required on a gate stage and optional on an action: review
 	// agent stage; it is rejected on every other stage kind. Source must be one of
@@ -195,7 +211,8 @@ const (
 	// read-only ask/review kinds it takes a WRITABLE task-worktree, commits + pushes +
 	// opens a PR, and folds success only once a PR exists (fold-on-PR-opened). It is
 	// still a LEAF — it may mutate but never fan out (delegations/human_questions are
-	// stripped) — and the pipeline NEVER merges its own PR.
+	// stripped). The implement job never merges its own PR; only an explicitly
+	// authorized downstream auto-merge gate may do so.
 	StageKindAgentImplement
 	// StageKindGate is a JOBLESS GATE stage (#768 Phase 2): Gate set, neither Cmd nor
 	// Agent. It mints NO worker job — the ENQUEUE pass marks it in-flight without a job
@@ -212,7 +229,7 @@ const (
 	// action switch below, so an orchestrate stage is never mistaken for a leaf
 	// ask/review. Appended as a sibling kind; the existing cases are untouched.
 	StageKindOrchestrate
-	// StageKindAgentProduce is a data-writing, Codex-only agent leaf. It receives
+	// StageKindAgentProduce is a data-writing, sandboxed agent leaf. It receives
 	// additive writable-path grants, never a branch/task/PR, and folds by decision.
 	StageKindAgentProduce
 )

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -111,6 +112,16 @@ func (d *webDataSource) PipelineRun(ctx context.Context, id string) (dashboard.P
 			}
 		}
 		ordered, specOK := orderRunStages(spec, specParsed, specHash, run.SpecHash, stageRows)
+		jobIDs := make([]string, 0, len(ordered))
+		for _, row := range ordered {
+			if row.JobID != "" {
+				jobIDs = append(jobIDs, row.JobID)
+			}
+		}
+		progressByJobID, err := store.GetLatestJobEventsByKind(ctx, jobIDs, "progress")
+		if err != nil {
+			return err
+		}
 		var specByID map[string]pipeline.Stage
 		if specOK {
 			specByID = make(map[string]pipeline.Stage, len(spec.Stages))
@@ -149,6 +160,15 @@ func (d *webDataSource) PipelineRun(ctx context.Context, id string) (dashboard.P
 				stage.Retry = spec.Retry
 				if len(spec.Needs) > 0 {
 					stage.Deps = append([]string(nil), spec.Needs...)
+				}
+			}
+			if row.State == pipeline.StageRunning {
+				if event, ok := progressByJobID[row.JobID]; ok {
+					var payload pipelineProgressEventPayload
+					if json.Unmarshal([]byte(event.Message), &payload) == nil {
+						stage.ProgressActivity = payload.Activity
+						stage.ProgressAt = parseJobTimeMillis(event.CreatedAt)
+					}
 				}
 			}
 			out.Stages = append(out.Stages, stage)

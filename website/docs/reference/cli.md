@@ -123,6 +123,24 @@ A `[runtimes.<name>]` section can only tweak a **built-in** runtime's metadata; 
 cannot add a new first-class runtime (that requires a code change). An unknown
 runtime name is a config error surfaced by `gitmoot runtime list`.
 
+## Runtime Launch Sandbox
+
+```sh
+gitmoot sandbox probe
+```
+
+`sandbox probe` prints whether this Linux host can enforce Gitmoot's strict
+Landlock launch sandbox and includes the detected ABI. It runs the real hidden
+re-exec shim and verifies both an allowed write and a denied outside write;
+unsupported kernels return non-zero. Claude/Kimi `produce` pipeline stages require
+this probe to pass and otherwise retain the explicit Codex-only refusal. Codex
+produce remains on its native sandbox. Landlock confines filesystem writes but does
+not govern network access; network policy remains the runtime CLI's. Wrapped Claude
+may write its runtime-owned `$HOME/.claude` state and
+`$XDG_CACHE_HOME/claude-cli-nodejs` cache; wrapped Kimi may write its runtime-owned
+`$HOME/.kimi-code` state. Apart from runtime state/cache and standard device nodes,
+only declared data paths, the disposable workdir, and temp roots are writable.
+
 ## Repo And Daemon Status
 
 ```sh
@@ -1416,6 +1434,7 @@ gitmoot memory links backfill [--dry-run] [--json]
 gitmoot memory links list <id> [--json]
 gitmoot memory groom --propose [--out PLAN.json] [--json]
 gitmoot memory groom --yes --plan PLAN.json [--json]
+gitmoot memory groom --split [--dry-run] [--json]
 gitmoot memory clusters [--json]
 gitmoot memory clusters recompute --propose [--out PLAN.json] [--json]
 gitmoot memory clusters recompute --apply [--plan PLAN.json] [--json]
@@ -1541,12 +1560,16 @@ new. `memory links list <id>` shows one fact's outgoing persisted links. Vault
 export merges these persisted links with content-derived links and dedupes by
 target in each note's `## Links` section.
 
-`memory groom` curates confirmed memory as a **propose → review → apply**
-round-trip. `--propose` reads active confirmed memory, computes the current
+`memory groom --split [--dry-run]` automatically partitions qualifying bricks at
+deterministic byte-offset seams into exact-substring children, supersedes and
+de-indexes the parent, and carries its cluster membership to the children in one
+CAS-guarded transaction. `memory groom` keeps all other curation as a
+**propose → review → apply** round-trip. `--propose` reads active confirmed memory, computes the current
 vault `snapshot_hash`, runs deterministic detectors
 (status/changelog/ToC snapshots — short notes need a strong `STATUS:`/`… & deployed`
 marker; bare to-do lists; exact duplicates scoped to the same owner/repo/scope;
-over-long "bricks" are flagged for rewrite, not retired; **legacy-key rekeys**
+over-long or strong-seam multi-story bricks are flagged when not already split;
+seam-poor long prose remains flag-only; **legacy-key rekeys**
 that migrate pre-stable-key rows ending in an 8-hex hash suffix, keeping the
 newest edition under the stable key and retiring older siblings with reason
 `rekey: superseded edition`; **cross-pool stale shared editions**, where a
@@ -1662,6 +1685,9 @@ and intervals with `[memory.pipelines]`, or run them on demand with
 two-stage shape that calls `gitmoot memory ingest sweep --json`, then summarizes the
 totals. It reads `[[memory.ingest]]` at run time, so config edits apply on the next
 manual or scheduled run without reinstalling defaults.
+The installed groom pipeline has a fixed `split -> propose -> summarize` shape:
+only the lossless split auto-applies, while the generated retirement/rekey/
+cross-pool plan remains owner-gated.
 
 A stage signals its outcome by printing a `gitmoot_result` blob to stdout; the
 advancer folds by the **decision**, never the job's exit state (`changes_requested`

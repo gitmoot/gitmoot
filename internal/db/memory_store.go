@@ -1213,6 +1213,168 @@ type VaultImportPlan struct {
 	Observations []MemoryObservation
 }
 
+// GroomSplitChild is one exact-substring child to insert for a brick parent.
+type GroomSplitChild struct {
+	Key     string
+	Content string
+}
+
+// GroomSplitItem is one lossless brick split. ExpectedUpdatedAt is the
+// detector's active-row revision and guards the parent mutation with a CAS.
+type GroomSplitItem struct {
+	ParentID          int64
+	ExpectedUpdatedAt string
+	Children          []GroomSplitChild
+}
+
+// GroomSplitApplied records the child ids created for one superseded parent.
+type GroomSplitApplied struct {
+	ParentID int64
+	ChildIDs []int64
+}
+
+// GroomSplitResult reports applied parent splits and parents skipped because
+// they were missing, changed, retired, or already superseded.
+type GroomSplitResult struct {
+	Applied []GroomSplitApplied
+	Skipped []int64
+}
+
+// ApplyGroomSplits applies every deterministic split in one transaction. Each
+// parent is CAS-guarded against the detector's active revision. Children inherit
+// ownership, author, repo, scope, and source lineage; every child FTS row, the
+// parent's FTS removal, superseded_by pointer, and cluster membership replacement
+// commit atomically. memory_links are intentionally left for normal enrichment.
+func (s *Store) ApplyGroomSplits(ctx context.Context, items []GroomSplitItem) (GroomSplitResult, error) {
+	var result GroomSplitResult
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return result, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	for _, item := range items {
+		applied, ok, err := applyGroomSplitTx(ctx, tx, item)
+		if err != nil {
+			return GroomSplitResult{}, err
+		}
+		if !ok {
+			result.Skipped = append(result.Skipped, item.ParentID)
+			continue
+		}
+		result.Applied = append(result.Applied, applied)
+	}
+	if err := tx.Commit(); err != nil {
+		return GroomSplitResult{}, err
+	}
+	return result, nil
+}
+
+func applyGroomSplitTx(ctx context.Context, tx *sql.Tx, item GroomSplitItem) (GroomSplitApplied, bool, error) {
+	if item.ParentID <= 0 || len(item.Children) < 2 {
+		return GroomSplitApplied{}, false, fmt.Errorf("groom split parent %d requires at least two children", item.ParentID)
+	}
+	var parent ConfirmedMemory
+	var repoNull sql.NullString
+	err := tx.QueryRowContext(ctx, `
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
+	provenance, source_job, first_confirmed_at, updated_at
+FROM confirmed_memories
+WHERE id = ? AND updated_at = ? AND superseded_by IS NULL AND retired_at = ''`,
+		item.ParentID, item.ExpectedUpdatedAt).Scan(
+		&parent.ID, &parent.Owner.Kind, &parent.Owner.Ref, &parent.Owner.Version, &parent.AuthorRef, &repoNull,
+		&parent.Scope, &parent.Key, &parent.Content, &parent.Provenance, &parent.SourceJob,
+		&parent.FirstConfirmedAt, &parent.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return GroomSplitApplied{}, false, nil
+	}
+	if err != nil {
+		return GroomSplitApplied{}, false, fmt.Errorf("read groom split parent %d: %w", item.ParentID, err)
+	}
+	parent.Repo = repoNull.String
+
+	var covered strings.Builder
+	seenKeys := make(map[string]struct{}, len(item.Children))
+	for _, child := range item.Children {
+		if strings.TrimSpace(child.Key) == "" || strings.TrimSpace(child.Content) == "" {
+			return GroomSplitApplied{}, false, fmt.Errorf("groom split parent %d has an empty child key or content", item.ParentID)
+		}
+		if !strings.HasPrefix(child.Key, parent.Key+"-") {
+			return GroomSplitApplied{}, false, fmt.Errorf("groom split parent %d child key %q is outside parent key %q", item.ParentID, child.Key, parent.Key)
+		}
+		if _, duplicate := seenKeys[child.Key]; duplicate {
+			return GroomSplitApplied{}, false, fmt.Errorf("groom split parent %d repeats child key %q", item.ParentID, child.Key)
+		}
+		seenKeys[child.Key] = struct{}{}
+		covered.WriteString(child.Content)
+	}
+	if covered.String() != strings.TrimSpace(parent.Content) {
+		return GroomSplitApplied{}, false, fmt.Errorf("groom split parent %d violates lossless coverage invariant", item.ParentID)
+	}
+
+	var clusterID int64
+	hasCluster := true
+	if err := tx.QueryRowContext(ctx, `SELECT cluster_id FROM memory_cluster_members WHERE memory_id = ?`, parent.ID).Scan(&clusterID); err == sql.ErrNoRows {
+		hasCluster = false
+	} else if err != nil {
+		return GroomSplitApplied{}, false, fmt.Errorf("read groom split parent cluster %d: %w", parent.ID, err)
+	}
+
+	now := nowRFC3339()
+	applied := GroomSplitApplied{ParentID: parent.ID, ChildIDs: make([]int64, 0, len(item.Children))}
+	for _, child := range item.Children {
+		res, err := tx.ExecContext(ctx, `
+INSERT INTO confirmed_memories
+	(owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, provenance, source_job, first_confirmed_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			parent.Owner.Kind, parent.Owner.Ref, parent.Owner.Version, parent.AuthorRef, nullableRepo(parent.Repo), parent.Scope,
+			child.Key, child.Content, fmt.Sprintf("groom-split:%d", parent.ID), parent.SourceJob, parent.FirstConfirmedAt, now)
+		if err != nil {
+			return GroomSplitApplied{}, false, fmt.Errorf("insert groom split child for parent %d: %w", parent.ID, err)
+		}
+		childID, err := res.LastInsertId()
+		if err != nil {
+			return GroomSplitApplied{}, false, err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO confirmed_memories_fts(rowid, content, key) VALUES (?, ?, ?)`, childID, child.Content, child.Key); err != nil {
+			return GroomSplitApplied{}, false, fmt.Errorf("sync groom split child fts %d: %w", childID, err)
+		}
+		if hasCluster {
+			if _, err := tx.ExecContext(ctx, `
+INSERT INTO memory_cluster_members (memory_id, cluster_id) VALUES (?, ?)
+ON CONFLICT(memory_id) DO UPDATE SET cluster_id = excluded.cluster_id`, childID, clusterID); err != nil {
+				return GroomSplitApplied{}, false, fmt.Errorf("attach groom split child %d to cluster %d: %w", childID, clusterID, err)
+			}
+		}
+		applied.ChildIDs = append(applied.ChildIDs, childID)
+	}
+
+	res, err := tx.ExecContext(ctx, `
+UPDATE confirmed_memories SET superseded_by = ?
+WHERE id = ? AND updated_at = ? AND superseded_by IS NULL AND retired_at = ''`,
+		applied.ChildIDs[0], parent.ID, item.ExpectedUpdatedAt)
+	if err != nil {
+		return GroomSplitApplied{}, false, fmt.Errorf("supersede groom split parent %d: %w", parent.ID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return GroomSplitApplied{}, false, err
+	}
+	if affected != 1 {
+		return GroomSplitApplied{}, false, fmt.Errorf("groom split parent %d changed during apply", parent.ID)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM confirmed_memories_fts WHERE rowid = ?`, parent.ID); err != nil {
+		return GroomSplitApplied{}, false, fmt.Errorf("sync groom split parent fts %d: %w", parent.ID, err)
+	}
+	if hasCluster {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM memory_cluster_members WHERE memory_id = ?`, parent.ID); err != nil {
+			return GroomSplitApplied{}, false, fmt.Errorf("detach groom split parent %d from cluster: %w", parent.ID, err)
+		}
+	}
+	return applied, true, nil
+}
+
 // ApplyVaultImport applies a whole import plan in ONE transaction so a partial
 // curation can never land: edits, retirements, and new-note observations either all
 // commit or none do. Edits and retirements resync/clear the FTS index in the same

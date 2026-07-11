@@ -190,6 +190,105 @@ func TestDetectGroomActionsPrecedenceAndDuplicates(t *testing.T) {
 	}
 }
 
+func TestSplitBrickLosslessFact80Shape(t *testing.T) {
+	storyA := "The waveform speaker split shipped in PR #812. " + strings.Repeat("The implementation kept frame timing stable while assigning speakers deterministically. ", 10)
+	storyB := "The goal-set workflow shipped in PR #819. " + strings.Repeat("The implementation preserved owner review and made continuation state explicit. ", 10)
+	content := "**Waveform speaker split**\n" + storyA + "\n\n**Goal-set workflow**\n" + storyB
+	if tokens := EstimateTokens(content); tokens < 400 || tokens > IngestMaxChunkTokens {
+		t.Fatalf("fixture tokens = %d, want fact-80-shaped 400..%d", tokens, IngestMaxChunkTokens)
+	}
+
+	children := SplitBrick("editor-waveform-speakersplit-goalset", content)
+	if len(children) != 2 {
+		t.Fatalf("children = %+v, want 2", children)
+	}
+	if children[0].Key != "editor-waveform-speakersplit-goalset-waveform-speaker-split" ||
+		children[1].Key != "editor-waveform-speakersplit-goalset-goal-set-workflow" {
+		t.Fatalf("child keys = %q, %q", children[0].Key, children[1].Key)
+	}
+	if got := concatGroomSplitChildren(children); got != strings.TrimSpace(content) {
+		t.Fatalf("lossless invariant failed:\ngot  %q\nwant %q", got, strings.TrimSpace(content))
+	}
+	for _, child := range children {
+		if !strings.Contains(content, child.Content) {
+			t.Fatalf("child is not an exact parent substring: %q", child.Content)
+		}
+		if nested := SplitBrick(child.Key, child.Content); len(nested) != 0 {
+			t.Fatalf("split child qualifies again: %+v", nested)
+		}
+	}
+}
+
+func TestSplitBrickStrongSeamsBelowRewriteThreshold(t *testing.T) {
+	content := "**First shipped story**\nThe cache invalidation path now preserves live sessions.\n\n**Second shipped story**\nThe retry path now records its durable terminal reason."
+	if len(content) >= GroomRewriteThreshold {
+		t.Fatal("fixture must exercise seam qualification below the length threshold")
+	}
+	children := SplitBrick("session-note", content)
+	if len(children) != 2 {
+		t.Fatalf("children = %+v, want 2", children)
+	}
+	proposal := DetectGroomActions([]GroomCandidate{{ID: 7, Key: "session-note", Content: content}})
+	if len(proposal.RewriteFlags) != 1 || proposal.RewriteFlags[0].ID != 7 {
+		t.Fatalf("multi-story brick should be flagged even below threshold: %+v", proposal.RewriteFlags)
+	}
+}
+
+func TestSplitBrickDateAndPRMarkerLines(t *testing.T) {
+	content := "2026-07-10\nThe deployment story includes enough substantive detail.\nPR #832\nThe groom split story includes enough substantive detail."
+	children := SplitBrick("dated-stories", content)
+	if len(children) != 2 || !strings.HasSuffix(children[0].Key, "2026-07-10") || !strings.HasSuffix(children[1].Key, "pr-832") {
+		t.Fatalf("date/PR seams = %+v", children)
+	}
+	if concatGroomSplitChildren(children) != content {
+		t.Fatal("date/PR split lost parent bytes")
+	}
+}
+
+func TestSplitBrickSeamPoorLongProseFallsBackToFlagOnly(t *testing.T) {
+	content := strings.Repeat("This is one continuous substantive narrative without a safe paragraph seam. ", 30)
+	if len(content) <= GroomRewriteThreshold {
+		t.Fatal("fixture must exceed GroomRewriteThreshold")
+	}
+	if got := SplitBrick("long-prose", content); len(got) != 0 {
+		t.Fatalf("seam-poor prose must not split: %+v", got)
+	}
+	proposal := DetectGroomActions([]GroomCandidate{{ID: 8, Key: "long-prose", Content: content}})
+	if len(proposal.RewriteFlags) != 1 || proposal.RewriteFlags[0].ID != 8 {
+		t.Fatalf("seam-poor prose must remain flag-only: %+v", proposal)
+	}
+}
+
+func TestDetectGroomSplitsDeterministicAndRejectsNonSubstantiveSegments(t *testing.T) {
+	good := "**Alpha**\nA substantive first implementation story.\n\n**Beta**\nA substantive second implementation story."
+	bad := "**Alpha**\nA substantive implementation story.\n\n**Beta**\nx"
+	cands := []GroomCandidate{
+		{ID: 20, Key: "bad", Content: bad, UpdatedAt: "u20"},
+		{ID: 10, Key: "good", Content: good, UpdatedAt: "u10"},
+	}
+	got := DetectGroomSplits(cands)
+	if len(got) != 1 || got[0].ParentID != 10 || got[0].ExpectedUpdatedAt != "u10" {
+		t.Fatalf("splits = %+v", got)
+	}
+	reversed := DetectGroomSplits([]GroomCandidate{cands[1], cands[0]})
+	if len(reversed) != 1 || reversed[0].ParentID != got[0].ParentID ||
+		concatGroomSplitChildren(reversed[0].Children) != concatGroomSplitChildren(got[0].Children) {
+		t.Fatalf("split output changed with input order: first=%+v reversed=%+v", got, reversed)
+	}
+}
+
+func TestDetectGroomSplitsAllocatesAroundExistingScopeKeys(t *testing.T) {
+	content := "**Alpha story**\nA substantive first implementation story.\n\n**Beta story**\nA substantive second implementation story."
+	cands := []GroomCandidate{
+		{ID: 1, Key: "parent", Content: content, OwnerKind: "agent", OwnerRef: "lead", Repo: "acme/widget", Scope: "repo"},
+		{ID: 2, Key: "parent-alpha-story", Content: "an existing fact", OwnerKind: "agent", OwnerRef: "lead", Repo: "acme/widget", Scope: "repo"},
+	}
+	got := DetectGroomSplits(cands)
+	if len(got) != 1 || got[0].Children[0].Key != "parent-alpha-story-2" || got[0].Children[1].Key != "parent-beta-story" {
+		t.Fatalf("collision-safe keys = %+v", got)
+	}
+}
+
 func TestDetectGroomActionsDuplicateScoping(t *testing.T) {
 	const body = "identical duplicate content body about arm64 retries"
 	t.Run("same scope dedups (lowest id kept)", func(t *testing.T) {
@@ -284,5 +383,25 @@ func TestGroomFirstLine(t *testing.T) {
 	}
 	if got := groomFirstLine("   \n  "); got != "" {
 		t.Fatalf("blank content first line = %q, want empty", got)
+	}
+}
+
+// TestSplitBrickBoldLeadInlineSeams covers the fact-80 shape that motivated
+// #832: two stories whose bold headers LEAD their lines with prose continuing
+// on the same line, and NO blank line between the stories. The headers carry
+// date/PR evidence so they are story seams; sub-field leads like "**Why:**"
+// must NOT cut.
+func TestSplitBrickBoldLeadInlineSeams(t *testing.T) {
+	content := "**Waveform refinement (2026-06-19, PR #241, main x):** fixed blocky zoom\nmore detail line\n**Per-tile focus bug fixed (2026-06-21, PR #242):** assigning a person\n**Why:** the event was overloaded\ntrailing line"
+	children := SplitBrick("editor-goalset", content)
+	if len(children) != 2 {
+		t.Fatalf("children = %d, want 2 (one per dated bold-lead story; **Why:** must not cut): %+v", len(children), children)
+	}
+	joined := children[0].Content + "\n" + children[1].Content
+	if strings.TrimSpace(joined) == "" || !strings.Contains(children[0].Content, "Waveform refinement") || !strings.Contains(children[1].Content, "Per-tile focus bug") {
+		t.Fatalf("unexpected partition: %+v", children)
+	}
+	if !strings.Contains(children[1].Content, "**Why:**") {
+		t.Fatalf("sub-field lead should stay inside story 2: %q", children[1].Content)
 	}
 }

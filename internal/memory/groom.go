@@ -10,17 +10,18 @@ package memory
 // run. The db-coupled orchestration (reading the vault snapshot, writing the plan
 // artifact, applying retirements in one transaction) lives in the cli package.
 //
-// P4.2 is PROPOSE + retire-only: the detectors emit a reviewable plan the owner
-// applies explicitly. Over-long "brick" memories are only FLAGGED for a later,
-// human/LLM rewrite pass (P4.3) — this track never rewrites content, only
-// proposes retirements the owner confirms.
+// P4.2 retirement/rekey/cross-pool actions remain owner-gated proposals. P4.3
+// adds one automatic operation: a deterministic, lossless brick split whose
+// children are exact source substrings. Lossy LLM rewriting remains deferred.
 
 import (
 	"crypto/sha256"
 	"encoding/hex"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"unicode"
 )
 
 // Groom detector reason tokens. They name WHY a memory was proposed for
@@ -90,6 +91,23 @@ type GroomRewriteFlag struct {
 	ID    int64
 	Key   string
 	Chars int
+}
+
+// GroomSplitChild is one lossless child of a brick memory. Content is an exact,
+// contiguous substring of the parent's trimmed coverage; children remain in
+// byte order and concatenate back to that coverage exactly.
+type GroomSplitChild struct {
+	Key     string
+	Content string
+}
+
+// GroomSplit is one deterministic split action over an active parent. UpdatedAt
+// is carried to the store as the optimistic-concurrency guard.
+type GroomSplit struct {
+	ParentID          int64
+	ParentKey         string
+	ExpectedUpdatedAt string
+	Children          []GroomSplitChild
 }
 
 // GroomStats is the roll-up carried in the plan artifact. Rekeys and CrossPool
@@ -184,7 +202,7 @@ func DetectGroomActions(cands []GroomCandidate) GroomProposal {
 		if retired[c.ID] {
 			continue
 		}
-		if len(c.Content) > GroomRewriteThreshold {
+		if len(c.Content) > GroomRewriteThreshold || len(SplitBrick(c.Key, c.Content)) > 0 {
 			flags = append(flags, GroomRewriteFlag{ID: c.ID, Key: c.Key, Chars: len(c.Content)})
 		}
 	}
@@ -203,6 +221,285 @@ func DetectGroomActions(cands []GroomCandidate) GroomProposal {
 			ByReason:            byReason,
 		},
 	}
+}
+
+// DetectGroomSplits returns every active-candidate brick that can be split
+// losslessly. The caller supplies only active rows; sorting by parent id makes
+// output independent of query/input order.
+func DetectGroomSplits(cands []GroomCandidate) []GroomSplit {
+	sorted := append([]GroomCandidate(nil), cands...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
+	usedByDomain := make(map[string]map[string]struct{})
+	for _, c := range sorted {
+		domain := groomSplitDomain(c)
+		if usedByDomain[domain] == nil {
+			usedByDomain[domain] = make(map[string]struct{})
+		}
+		usedByDomain[domain][c.Key] = struct{}{}
+	}
+	var out []GroomSplit
+	for _, c := range sorted {
+		children := SplitBrick(c.Key, c.Content)
+		if len(children) == 0 {
+			continue
+		}
+		used := usedByDomain[groomSplitDomain(c)]
+		for i := range children {
+			base := children[i].Key
+			key := base
+			for n := 2; ; n++ {
+				if _, exists := used[key]; !exists {
+					break
+				}
+				key = base + "-" + strconv.Itoa(n)
+			}
+			children[i].Key = key
+			used[key] = struct{}{}
+		}
+		out = append(out, GroomSplit{
+			ParentID: c.ID, ParentKey: c.Key, ExpectedUpdatedAt: c.UpdatedAt, Children: children,
+		})
+	}
+	return out
+}
+
+func groomSplitDomain(c GroomCandidate) string {
+	return strings.Join([]string{c.OwnerKind, c.OwnerRef, c.OwnerVersion, c.Repo, c.Scope}, "\x00")
+}
+
+// groomBoldHeader matches the house-style story seam used by ingested session
+// notes: a whole line wrapped in Markdown bold markers.
+var groomBoldHeader = regexp.MustCompile(`^\s*\*\*[^*\r\n].*\*\*\s*:?[ \t]*$`)
+
+// groomBoldLead matches the OTHER house seam shape: a line that STARTS with a
+// bold header but continues with prose on the same line
+// ("**Waveform refinement (2026-06-19, PR #241):** fixed ..."). To avoid
+// over-fragmenting at sub-field leads like "**Why:**" / "**How to apply:**",
+// a bold-lead only counts as a story seam when the bold span itself carries
+// dated/PR evidence (groomSeamEvidence) — story headers do, sub-fields don't.
+var groomBoldLead = regexp.MustCompile(`^\s*\*\*([^*\r\n]+)\*\*`)
+
+// groomSeamEvidence is the date/PR signature that promotes a bold-lead line to
+// a story seam.
+var groomSeamEvidence = regexp.MustCompile(`(?i)\d{4}-\d{2}-\d{2}|PR\s*#?\d+|#\d+`)
+
+// groomPRMarker recognizes stand-alone PR/story markers that commonly lead a
+// shipped-work paragraph. Date-led lines reuse groomDateLed below.
+var groomPRMarker = regexp.MustCompile(`(?i)^\s*(?:[-*]\s*)?(?:PR\s*#?\d+\b|#\d+\b|(?:SHIPPED|MERGED|DEPLOYED)\b[^\r\n]*#\d+\b)`)
+
+type groomTextUnit struct {
+	start int
+	end   int
+}
+
+// SplitBrick partitions one parent at byte offsets only. Under-threshold bricks
+// require at least two strong story seams. Over-threshold bricks may use the
+// same blank-line paragraph units as atomicUnits. In every case at least two
+// substantive segments are required, and any coverage mismatch fails closed by
+// returning nil so the existing rewrite flag remains the only action.
+func SplitBrick(parentKey, content string) []GroomSplitChild {
+	coverage := strings.TrimSpace(content)
+	if coverage == "" {
+		return nil
+	}
+	units := groomParagraphUnits(coverage)
+	strong := groomStrongSeams(coverage)
+	strongCount := len(strong)
+	if strongCount < 2 && len(content) <= GroomRewriteThreshold {
+		return nil
+	}
+	if strongCount < 2 && len(units) < 2 {
+		return nil
+	}
+
+	cutStarts := []int{0}
+	if strongCount >= 2 {
+		for _, seam := range strong {
+			if seam.start > 0 {
+				cutStarts = append(cutStarts, seam.start)
+			}
+		}
+	}
+	if len(content) > GroomRewriteThreshold {
+		for _, unit := range units[1:] {
+			cutStarts = append(cutStarts, unit.start)
+		}
+	}
+	cutStarts = uniqueSortedOffsets(cutStarts, len(coverage))
+	if len(cutStarts) < 2 {
+		return nil
+	}
+
+	children := make([]GroomSplitChild, 0, len(cutStarts))
+	usedKeys := make(map[string]struct{}, len(cutStarts))
+	substantive := 0
+	for i, start := range cutStarts {
+		end := len(coverage)
+		if i+1 < len(cutStarts) {
+			end = cutStarts[i+1]
+		}
+		if start < 0 || start >= end || end > len(coverage) {
+			return nil
+		}
+		text := coverage[start:end]
+		if strings.TrimSpace(text) == "" {
+			return nil
+		}
+		if groomSubstantive(text) {
+			substantive++
+		}
+		label := groomFirstNonBlankLine(groomTextUnit{start: start, end: end}, coverage)
+		base := parentKey + "-" + Slug(groomSeamLabel(label))
+		key := base
+		for n := 2; ; n++ {
+			if _, exists := usedKeys[key]; !exists {
+				break
+			}
+			key = base + "-" + strconv.Itoa(n)
+		}
+		usedKeys[key] = struct{}{}
+		children = append(children, GroomSplitChild{Key: key, Content: text})
+	}
+	if substantive < 2 || concatGroomSplitChildren(children) != coverage {
+		return nil
+	}
+	return children
+}
+
+func groomStrongSeams(content string) []groomTextUnit {
+	var out []groomTextUnit
+	offset := 0
+	for _, withNewline := range strings.SplitAfter(content, "\n") {
+		line := strings.TrimSuffix(withNewline, "\n")
+		trimmed := strings.TrimSpace(line)
+		if isGroomStrongSeam(trimmed) {
+			out = append(out, groomTextUnit{start: offset, end: offset + len(withNewline)})
+		}
+		offset += len(withNewline)
+	}
+	return out
+}
+
+// groomParagraphUnits mirrors atomicUnits' first boundary: non-empty paragraph
+// groups separated by one or more blank lines, while retaining byte offsets.
+func groomParagraphUnits(content string) []groomTextUnit {
+	blankLine := regexp.MustCompile(`\r?\n[ \t]*\r?\n(?:[ \t]*\r?\n)*`)
+	locs := blankLine.FindAllStringIndex(content, -1)
+	starts := []int{0}
+	for _, loc := range locs {
+		if loc[1] < len(content) {
+			starts = append(starts, loc[1])
+		}
+	}
+	starts = uniqueSortedOffsets(starts, len(content))
+	out := make([]groomTextUnit, 0, len(starts))
+	for i, start := range starts {
+		end := len(content)
+		if i+1 < len(starts) {
+			end = starts[i+1]
+		}
+		if strings.TrimSpace(content[start:end]) != "" {
+			out = append(out, groomTextUnit{start: start, end: end})
+		}
+	}
+	return out
+}
+
+func groomFirstNonBlankLine(unit groomTextUnit, content string) string {
+	if unit.start < 0 || unit.end > len(content) || unit.start >= unit.end {
+		return ""
+	}
+	part := content[unit.start:unit.end]
+	for _, line := range strings.SplitAfter(part, "\n") {
+		trimmed := strings.TrimSpace(strings.TrimSuffix(line, "\n"))
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func isGroomStrongSeam(line string) bool {
+	if groomBoldHeader.MatchString(line) || groomDateLed.MatchString(line) || groomPRMarker.MatchString(line) {
+		return true
+	}
+	if m := groomBoldLead.FindStringSubmatch(line); m != nil && groomSeamEvidence.MatchString(m[1]) {
+		return true
+	}
+	return false
+}
+
+func groomSeamLabel(line string) string {
+	label := strings.TrimSpace(line)
+	label = strings.TrimSuffix(label, ":")
+	if strings.HasPrefix(label, "**") && strings.HasSuffix(label, "**") && len(label) >= 4 {
+		label = strings.TrimSpace(label[2 : len(label)-2])
+	} else if m := groomBoldLead.FindStringSubmatch(label); m != nil {
+		// Bold-lead seam ("**Header:** prose..."): the header span is the label,
+		// not the whole line.
+		label = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(m[1]), ":"))
+	}
+	return label
+}
+
+func groomSubstantive(content string) bool {
+	count := 0
+	seenContent := false
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if !seenContent && isGroomStrongSeam(trimmed) {
+			seenContent = true
+			trimmed = groomStrongSeamPayload(trimmed)
+			if trimmed == "" {
+				continue
+			}
+		}
+		seenContent = true
+		for _, r := range trimmed {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) {
+				count++
+			}
+		}
+	}
+	return count >= 8
+}
+
+func groomStrongSeamPayload(line string) string {
+	if groomBoldHeader.MatchString(line) {
+		return ""
+	}
+	if loc := groomDateLed.FindStringIndex(line); loc != nil && loc[0] == 0 {
+		return strings.TrimSpace(line[loc[1]:])
+	}
+	if loc := groomPRMarker.FindStringIndex(line); loc != nil && loc[0] == 0 {
+		return strings.TrimSpace(line[loc[1]:])
+	}
+	return line
+}
+
+func uniqueSortedOffsets(offsets []int, max int) []int {
+	sort.Ints(offsets)
+	out := offsets[:0]
+	last := -1
+	for _, offset := range offsets {
+		if offset < 0 || offset >= max || offset == last {
+			continue
+		}
+		out = append(out, offset)
+		last = offset
+	}
+	return out
+}
+
+func concatGroomSplitChildren(children []GroomSplitChild) string {
+	var b strings.Builder
+	for _, child := range children {
+		b.WriteString(child.Content)
+	}
+	return b.String()
 }
 
 // groomOwnerLabel renders a candidate's owner as a stable "kind:ref@version" label

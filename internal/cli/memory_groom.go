@@ -15,7 +15,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/memory"
 )
 
-// memory groom (#737 P4.2) — the deterministic grooming pass as an explicit,
+// memory groom (#737 P4.2, #832) — automatic lossless brick splitting plus the
 // human-gated propose→apply round-trip over confirmed memory.
 //
 // `groom --propose` reads every ACTIVE confirmed memory (the vault lister path,
@@ -25,9 +25,8 @@ import (
 //
 // `groom --yes --plan <file>` recomputes the snapshot_hash, ABORTS AS STALE if it
 // differs from the plan's (a vault edit between propose and apply invalidates the
-// plan), and applies the plan's retirements in ONE transaction. P4.2 is
-// retire-only: no content is edited or rewritten; over-long "bricks" are only
-// FLAGGED for a later owner/LLM pass (P4.3).
+// plan), and applies the owner-gated plan in ONE transaction. `groom --split`
+// separately auto-applies only the deterministic exact-substring transform.
 
 // groomSchemaVersion is the on-disk plan schema version. Bump on a breaking change
 // to the plan shape so a stale `--plan` file is rejected rather than misread.
@@ -112,35 +111,72 @@ type groomApplyResult struct {
 	CrossPoolSkipped []int64 `json:"cross_pool_skipped,omitempty"`
 }
 
+type groomSplitChildSummary struct {
+	ID    int64  `json:"id,omitempty"`
+	Key   string `json:"key"`
+	Chars int    `json:"chars"`
+}
+
+type groomSplitSummary struct {
+	ParentID  int64                    `json:"parent_id"`
+	ParentKey string                   `json:"parent_key"`
+	Children  []groomSplitChildSummary `json:"children"`
+}
+
+type groomSplitOutput struct {
+	DryRun   bool                `json:"dry_run"`
+	Detected int                 `json:"detected"`
+	Applied  int                 `json:"applied"`
+	Skipped  []int64             `json:"skipped"`
+	Splits   []groomSplitSummary `json:"splits"`
+}
+
 func runMemoryGroom(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("memory groom", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	propose := fs.Bool("propose", false, "read confirmed memory, run the detectors, and write a reviewable plan (writes nothing to the store)")
 	yes := fs.Bool("yes", false, "apply a plan's retirements (requires --plan)")
+	split := fs.Bool("split", false, "automatically split qualifying brick memories into lossless children")
+	dryRun := fs.Bool("dry-run", false, "with --split, print qualifying splits without writing")
 	plan := fs.String("plan", "", "path to a plan artifact produced by --propose (required with --yes)")
 	out := fs.String("out", "", "where --propose writes the plan (default: <home>/evals/groom/groom-<snapshot>.json)")
 	jsonOut := fs.Bool("json", false, "print the summary as JSON")
 	if err := parseMemoryFlags(fs, args); err != nil {
 		return memoryFlagExit(err)
 	}
-	if *propose == *yes {
-		fmt.Fprintln(stderr, "memory groom: pass exactly one of --propose or --yes")
+	modes := 0
+	for _, enabled := range []bool{*propose, *yes, *split} {
+		if enabled {
+			modes++
+		}
+	}
+	if modes != 1 {
+		fmt.Fprintln(stderr, "memory groom: pass exactly one of --propose, --yes, or --split")
+		printMemoryGroomUsage(stderr)
+		return 2
+	}
+	if *dryRun && !*split {
+		fmt.Fprintln(stderr, "memory groom: --dry-run requires --split")
 		printMemoryGroomUsage(stderr)
 		return 2
 	}
 	if *propose {
 		return runMemoryGroomPropose(*home, *out, *jsonOut, stdout, stderr)
 	}
+	if *split {
+		return runMemoryGroomSplit(*home, *dryRun, *jsonOut, stdout, stderr)
+	}
 	return runMemoryGroomApply(*home, *plan, *jsonOut, stdout, stderr)
 }
 
 func printMemoryGroomUsage(w io.Writer) {
-	fmt.Fprintln(w, "Deterministically groom confirmed memory (#737 P4.2): propose retirements, apply on confirmation.")
+	fmt.Fprintln(w, "Deterministically groom confirmed memory: auto-split bricks; propose other actions for owner approval.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot memory groom --propose [--out PLAN.json] [--json]")
 	fmt.Fprintln(w, "  gitmoot memory groom --yes --plan PLAN.json [--json]")
+	fmt.Fprintln(w, "  gitmoot memory groom --split [--dry-run] [--json]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "  --propose  read active confirmed memory, run the deterministic detectors")
 	fmt.Fprintln(w, "             (status/changelog/ToC snapshots, bare to-do lists, exact duplicates,")
@@ -151,6 +187,102 @@ func printMemoryGroomUsage(w io.Writer) {
 	fmt.Fprintln(w, "             rekeys, and cross-pool promote-and-retire pairs. Recomputes the vault")
 	fmt.Fprintln(w, "             snapshot and ABORTS AS STALE if the store changed since --propose.")
 	fmt.Fprintln(w, "             Content is never edited or rewritten.")
+	fmt.Fprintln(w, "  --split    automatically split qualifying multi-story bricks at deterministic")
+	fmt.Fprintln(w, "             seams. Children are exact substrings; the parent is superseded.")
+	fmt.Fprintln(w, "  --dry-run  with --split, print what would split without touching the store.")
+}
+
+func runMemoryGroomSplit(home string, dryRun, jsonOut bool, stdout, stderr io.Writer) int {
+	ctx := context.Background()
+	var splits []memory.GroomSplit
+	var applied db.GroomSplitResult
+	run := func(store *db.Store) error {
+		rows, err := store.ListConfirmedMemoriesForVault(ctx, "")
+		if err != nil {
+			return err
+		}
+		cands := make([]memory.GroomCandidate, 0, len(rows))
+		for _, row := range rows {
+			cands = append(cands, memory.GroomCandidate{
+				ID: row.ID, Key: row.Key, Content: row.Content, OwnerKind: row.Owner.Kind,
+				OwnerRef: row.Owner.Ref, OwnerVersion: row.Owner.Version, Repo: row.Repo,
+				Scope: row.Scope, UpdatedAt: row.UpdatedAt,
+			})
+		}
+		splits = memory.DetectGroomSplits(cands)
+		if dryRun || len(splits) == 0 {
+			return nil
+		}
+		items := make([]db.GroomSplitItem, 0, len(splits))
+		for _, split := range splits {
+			item := db.GroomSplitItem{ParentID: split.ParentID, ExpectedUpdatedAt: split.ExpectedUpdatedAt}
+			for _, child := range split.Children {
+				item.Children = append(item.Children, db.GroomSplitChild{Key: child.Key, Content: child.Content})
+			}
+			items = append(items, item)
+		}
+		applied, err = store.ApplyGroomSplits(ctx, items)
+		return err
+	}
+	var err error
+	if dryRun {
+		err = withReadOnlyStore(home, run)
+	} else {
+		err = withStore(home, run)
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "memory groom: split: %v\n", err)
+		return 1
+	}
+
+	idsByParent := make(map[int64][]int64, len(applied.Applied))
+	for _, item := range applied.Applied {
+		idsByParent[item.ParentID] = item.ChildIDs
+	}
+	out := groomSplitOutput{
+		DryRun: dryRun, Detected: len(splits), Applied: len(applied.Applied), Skipped: applied.Skipped,
+		Splits: make([]groomSplitSummary, 0, len(splits)),
+	}
+	for _, split := range splits {
+		summary := groomSplitSummary{ParentID: split.ParentID, ParentKey: split.ParentKey}
+		childIDs := idsByParent[split.ParentID]
+		for i, child := range split.Children {
+			entry := groomSplitChildSummary{Key: child.Key, Chars: len(child.Content)}
+			if i < len(childIDs) {
+				entry.ID = childIDs[i]
+			}
+			summary.Children = append(summary.Children, entry)
+		}
+		out.Splits = append(out.Splits, summary)
+	}
+	if jsonOut {
+		if err := writeJSON(stdout, out); err != nil {
+			fmt.Fprintf(stderr, "memory groom: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	verb := "split"
+	if dryRun {
+		verb = "would split"
+	}
+	fmt.Fprintf(stdout, "%s %d brick memory(ies)", verb, len(splits))
+	if !dryRun {
+		fmt.Fprintf(stdout, "; applied %d, skipped %d", len(applied.Applied), len(applied.Skipped))
+	}
+	fmt.Fprintln(stdout)
+	for _, split := range out.Splits {
+		fmt.Fprintf(stdout, "  parent %d %s ->", split.ParentID, split.ParentKey)
+		for _, child := range split.Children {
+			if child.ID > 0 {
+				fmt.Fprintf(stdout, " %d:%s", child.ID, child.Key)
+			} else {
+				fmt.Fprintf(stdout, " %s", child.Key)
+			}
+		}
+		fmt.Fprintln(stdout)
+	}
+	return 0
 }
 
 func runMemoryGroomPropose(home, out string, jsonOut bool, stdout, stderr io.Writer) int {

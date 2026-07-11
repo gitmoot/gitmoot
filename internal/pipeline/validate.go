@@ -26,6 +26,7 @@ func (s *Spec) normalize() {
 		s.Stages[i].Prompt = strings.TrimSpace(s.Stages[i].Prompt)
 		s.Stages[i].Action = strings.TrimSpace(s.Stages[i].Action)
 		s.Stages[i].Gate = strings.TrimSpace(s.Stages[i].Gate)
+		s.Stages[i].Merge = strings.TrimSpace(s.Stages[i].Merge)
 		s.Stages[i].Source = strings.TrimSpace(s.Stages[i].Source)
 		s.Stages[i].Timeout = strings.TrimSpace(s.Stages[i].Timeout)
 		s.Stages[i].Check = strings.TrimSpace(s.Stages[i].Check)
@@ -99,6 +100,9 @@ func (s Spec) Validate() error {
 		if err := validateStageSource(s.Name, stage, stageByID); err != nil {
 			return err
 		}
+		if err := s.validateGateMerge(stage); err != nil {
+			return err
+		}
 		if stage.Retry < 0 {
 			return fmt.Errorf("pipeline %q stage %q retry must be >= 0", s.Name, stage.ID)
 		}
@@ -127,6 +131,32 @@ func (s Spec) Validate() error {
 		}
 	}
 	return s.detectCycle()
+}
+
+// validateGateMerge enforces the auto-merge double key and robot-review rung.
+// The stage-level merge: auto opt-in is valid only on gates; the pipeline-level
+// allow_auto_merge key must independently authorize it. At least one review
+// stage must bind to the same implement source so auto-ship is never unreviewed.
+func (s Spec) validateGateMerge(stage Stage) error {
+	merge := strings.TrimSpace(stage.Merge)
+	if merge == "" {
+		return nil
+	}
+	if stage.Kind() != StageKindGate {
+		return fmt.Errorf("pipeline %q stage %q sets merge %q but is not a gate stage; merge is only valid on gate stages", s.Name, stage.ID, merge)
+	}
+	if merge != GateMergeAuto {
+		return fmt.Errorf("pipeline %q stage %q merge mode %q is invalid; use %q or omit merge for the human-merge default", s.Name, stage.ID, merge, GateMergeAuto)
+	}
+	if !s.AllowAutoMerge {
+		return fmt.Errorf("pipeline %q stage %q sets merge: auto without allow_auto_merge: true", s.Name, stage.ID)
+	}
+	for _, candidate := range s.Stages {
+		if candidate.Kind() == StageKindAgentReview && strings.TrimSpace(candidate.Source) == strings.TrimSpace(stage.Source) {
+			return nil
+		}
+	}
+	return fmt.Errorf("pipeline %q stage %q sets merge: auto but source %q has no source-bound review stage; auto-merge requires at least one action: review stage with the same source", s.Name, stage.ID, stage.Source)
 }
 
 // validateStageSource applies the spec-level half of source binding. Gate-local

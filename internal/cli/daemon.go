@@ -31,6 +31,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/github"
 	"github.com/jerryfane/gitmoot/internal/presence"
 	"github.com/jerryfane/gitmoot/internal/runtime"
+	"github.com/jerryfane/gitmoot/internal/sandbox"
 	"github.com/jerryfane/gitmoot/internal/subprocess"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
@@ -3044,6 +3045,10 @@ type jobWorker struct {
 	// inject a fake verdict; the daemon wires defaultAuthProbe (a bounded
 	// runtime.ClaudeLiveCheck for claude agents, Unknown for other runtimes).
 	AuthProbe func(context.Context, db.Job, workflow.JobPayload) authProbeVerdict
+	// SandboxProbe is the cached host capability check used only for Claude/Kimi
+	// produce stages. nil selects sandbox.SandboxProbe; tests inject deterministic
+	// supported/unsupported results without depending on the test binary's argv.
+	SandboxProbe func() sandbox.ProbeResult
 	// Progress timing seams keep unit/E2E tests deterministic and short. Zero/nil
 	// values select the package defaults and real timer implementation.
 	ProgressThreshold  time.Duration
@@ -5054,7 +5059,8 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if !overridden {
 		agent = scopeRegisteredFreshRefForJob(agent, job.ID)
 	}
-	if err := runtime.ProduceDispatchError(job.Type, agent); err != nil {
+	if err := w.produceDispatchError(job.Type, agent); err != nil {
+		w.recordProduceSandboxDiagnostic(ctx, job.ID, job.Type, agent)
 		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobBlocked, err); finishErr != nil {
 			return finishErr
 		}
@@ -5236,6 +5242,25 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			writeLine(w.Stdout, "job %s runtime_override event failed: %v", job.ID, eventErr)
 		}
 	}
+	// This is the last filesystem authorization check before adapter delivery.
+	// It runs after runtime-session admission so a symlink retargeted while the job
+	// waited cannot inherit stale grants. The adapter is then rebuilt in-place with
+	// sandbox-exec as the innermost runner for Claude/Kimi produce only.
+	if err := applyProduceRuntimeGrants(ctx, w.Store, w.ConfigHome, job, payload, &agent); err != nil {
+		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
+		return nil
+	}
+	adapter, err = wrapProduceSandboxAdapter(job.Type, agent, adapter)
+	if err != nil {
+		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
+		return nil
+	}
 	// Cockpit wrapping happens AFTER the runtime-session lock + checkout
 	// resolution so at most one live pane exists per held runtime session and the
 	// pane's CWD is the resolved worktree. It is strictly opt-in and best-effort:
@@ -5341,16 +5366,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		runCtx, cancel = context.WithTimeout(runCtx, jobTimeout)
 		defer cancel()
 	}
-	// This is the last filesystem authorization check before adapter delivery.
-	// Run it after checkout resolution and runtime-session admission so a symlink
-	// retargeted while the job waited cannot inherit stale grants.
-	if err := applyProduceRuntimeGrants(runCtx, w.Store, w.ConfigHome, job, payload, &agent); err != nil {
-		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
-			return finishErr
-		}
-		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
-		return nil
-	}
 	stopProgress := func() {}
 	if progressTracker != nil {
 		progressCtx, cancelProgress := context.WithCancel(runCtx)
@@ -5428,6 +5443,171 @@ func applyProduceRuntimeGrants(ctx context.Context, store *db.Store, home string
 	agent.WritablePaths = resolved
 	agent.ProduceNetwork = payload.Network
 	return nil
+}
+
+func (w jobWorker) produceDispatchError(action string, agent runtime.Agent) error {
+	if err := runtime.ProduceDispatchError(action, agent); err != nil {
+		return err
+	}
+	if strings.TrimSpace(action) != "produce" || agent.Runtime == runtime.CodexRuntime {
+		return nil
+	}
+	if agent.Runtime != runtime.ClaudeRuntime && agent.Runtime != runtime.KimiRuntime {
+		return nil
+	}
+	result, _ := w.produceSandboxProbe(action, agent)
+	if result.Supported {
+		return nil
+	}
+	return fmt.Errorf("produce stages require the codex runtime; agent %q uses runtime %q", agent.Name, agent.Runtime)
+}
+
+func (w jobWorker) produceSandboxProbe(action string, agent runtime.Agent) (sandbox.ProbeResult, bool) {
+	if strings.TrimSpace(action) != "produce" || (agent.Runtime != runtime.ClaudeRuntime && agent.Runtime != runtime.KimiRuntime) {
+		return sandbox.ProbeResult{}, false
+	}
+	probe := w.SandboxProbe
+	if probe == nil {
+		probe = sandbox.SandboxProbe
+	}
+	return probe(), true
+}
+
+func (w jobWorker) recordProduceSandboxDiagnostic(ctx context.Context, jobID, action string, agent runtime.Agent) {
+	// Only annotate the probe-gated refusal. Capability/policy/runtime validation
+	// errors from the legacy preflight keep their existing event surface.
+	if err := runtime.ProduceDispatchError(action, agent); err != nil {
+		return
+	}
+	result, applicable := w.produceSandboxProbe(action, agent)
+	if !applicable || result.Supported || w.Store == nil {
+		return
+	}
+	detail := "Landlock enforcement self-test failed"
+	if result.Err != nil {
+		detail = result.Err.Error()
+	}
+	if result.ABI > 0 {
+		detail = fmt.Sprintf("Landlock ABI v%d: %s", result.ABI, detail)
+	}
+	message := fmt.Sprintf("Gitmoot Landlock sandbox unavailable for %s produce: %s; run gitmoot sandbox probe", agent.Runtime, detail)
+	if err := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "produce_sandbox_unsupported", Message: message}); err != nil {
+		writeLine(w.Stdout, "job %s produce_sandbox_unsupported event failed: %v", jobID, err)
+	}
+}
+
+// wrapProduceSandboxAdapter rewrites only Claude/Kimi produce adapters. Codex
+// keeps its existing native sandbox and every non-produce adapter is returned
+// byte-for-byte unchanged.
+func wrapProduceSandboxAdapter(action string, agent runtime.Agent, adapter workflow.DeliveryAdapter) (workflow.DeliveryAdapter, error) {
+	if strings.TrimSpace(action) != "produce" || agent.Runtime == runtime.CodexRuntime {
+		return adapter, nil
+	}
+	if agent.Runtime != runtime.ClaudeRuntime && agent.Runtime != runtime.KimiRuntime {
+		return adapter, nil
+	}
+	paths, env, err := produceRuntimeSandboxGrants(agent.Runtime, agent.WritablePaths)
+	if err != nil {
+		return nil, err
+	}
+	switch a := adapter.(type) {
+	case runtime.ClaudeAdapter:
+		a.Runner = landlockProduceRunner(a.Runner, paths, env)
+		return a, nil
+	case *runtime.ClaudeAdapter:
+		a.Runner = landlockProduceRunner(a.Runner, paths, env)
+		return a, nil
+	case runtime.KimiAdapter:
+		a.Runner = landlockProduceRunner(a.Runner, paths, env)
+		return a, nil
+	case *runtime.KimiAdapter:
+		a.Runner = landlockProduceRunner(a.Runner, paths, env)
+		return a, nil
+	default:
+		return nil, fmt.Errorf("produce Landlock sandbox cannot wrap %s adapter %T", agent.Runtime, adapter)
+	}
+}
+
+func produceRuntimeSandboxGrants(runtimeName string, declared []string) ([]string, []string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve runtime state home: %w", err)
+	}
+	home = filepath.Clean(home)
+	var statePaths []string
+	var env []string
+	switch runtimeName {
+	case runtime.ClaudeRuntime:
+		stateDir := filepath.Join(home, ".claude")
+		cacheRoot, err := os.UserCacheDir()
+		if err != nil {
+			return nil, nil, fmt.Errorf("resolve Claude cache root: %w", err)
+		}
+		cacheDir := filepath.Join(cacheRoot, "claude-cli-nodejs")
+		statePaths = []string{stateDir, cacheDir}
+		env = []string{"CLAUDE_CONFIG_DIR=" + stateDir}
+	case runtime.KimiRuntime:
+		statePaths = []string{filepath.Join(home, ".kimi-code")}
+	default:
+		return append([]string(nil), declared...), nil, nil
+	}
+	for _, path := range statePaths {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return nil, nil, fmt.Errorf("create %s runtime state directory %q: %w", runtimeName, path, err)
+		}
+	}
+	paths := compactCleanPaths(append(append([]string(nil), declared...), statePaths...))
+	return paths, env, nil
+}
+
+func compactCleanPaths(paths []string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		path = filepath.Clean(path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		out = append(out, path)
+	}
+	return out
+}
+
+func landlockProduceRunner(runner subprocess.Runner, paths, env []string) subprocess.Runner {
+	writable := append([]string(nil), paths...)
+	runtimeEnv := append([]string(nil), env...)
+	if tee, ok := runner.(subprocess.TeeRunner); ok {
+		inner := tee.Inner
+		if inner == nil {
+			inner = subprocess.GroupRunner{}
+		}
+		if _, wrapped := inner.(subprocess.WrappingRunner); !wrapped {
+			tee.Inner = subprocess.WrappingRunner{Inner: inner, WritablePaths: writable, Env: runtimeEnv}
+		}
+		return tee
+	}
+	if tee, ok := runner.(*subprocess.TeeRunner); ok {
+		inner := tee.Inner
+		if inner == nil {
+			inner = subprocess.GroupRunner{}
+		}
+		if _, wrapped := inner.(subprocess.WrappingRunner); !wrapped {
+			tee.Inner = subprocess.WrappingRunner{Inner: inner, WritablePaths: writable, Env: runtimeEnv}
+		}
+		return tee
+	}
+	if runner == nil {
+		runner = subprocess.GroupRunner{}
+	}
+	if _, wrapped := runner.(subprocess.WrappingRunner); wrapped {
+		return runner
+	}
+	return subprocess.WrappingRunner{Inner: runner, WritablePaths: writable, Env: runtimeEnv}
 }
 
 // configPaths resolves this worker's config.Paths for READ-ONLY policy loading
@@ -6046,6 +6226,24 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	// See runQueuedJob: thread the owner token so terminal cleanup recognizes this
 	// run's own still-held lock and does not refuse the healthy-path cleanup (#536).
 	ctx = workflow.WithRuntimeSelfOwnerToken(ctx, ownerToken)
+	// Produce temp workers use the same post-admission filesystem authorization
+	// and Landlock adapter wrapping as the primary worker path. Without this seam,
+	// runtime-session contention could route Claude/Kimi around the launch sandbox.
+	if err := applyProduceRuntimeGrants(ctx, w.Store, w.ConfigHome, delegatedJob, payload, &started.Agent); err != nil {
+		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
+		return nil
+	}
+	adapter, err = wrapProduceSandboxAdapter(delegatedJob.Type, started.Agent, adapter)
+	if err != nil {
+		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
+		return nil
+	}
 	if err := w.Store.MarkAgentInstanceRunning(ctx, started.Agent.Name, time.Now().UTC(), started.JobTimeout); err != nil {
 		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -6704,6 +6902,13 @@ func (w jobWorker) buildSeatAwareAdapter(agent *runtime.Agent, checkout string, 
 // tails; the tee preserves group-kill (its inner is GroupRunner{}) and returns
 // the same buffered Result, so result capture, locks, and signals are unchanged.
 func buildRuntimeAdapter(agent runtime.Agent, checkout string, runner subprocess.Runner) (workflow.DeliveryAdapter, error) {
+	if len(agent.WritablePaths) > 0 && (agent.Runtime == runtime.ClaudeRuntime || agent.Runtime == runtime.KimiRuntime) {
+		paths, env, err := produceRuntimeSandboxGrants(agent.Runtime, agent.WritablePaths)
+		if err != nil {
+			return nil, err
+		}
+		runner = landlockProduceRunner(runner, paths, env)
+	}
 	switch agent.Runtime {
 	case runtime.CodexRuntime:
 		return runtime.CodexAdapter{Dir: checkout, Runner: runner}, nil
@@ -7489,6 +7694,10 @@ func (w jobWorker) resolveJobCheckout(ctx context.Context, job db.Job, payload w
 	if err != nil {
 		return "", err
 	}
+	checkout, err = w.healRegisteredRepoCheckout(ctx, job, repo, repoRecord)
+	if err != nil {
+		return "", err
+	}
 	if err := preflightDaemonRepoCheckout(ctx, repo, checkout); err != nil {
 		return "", err
 	}
@@ -7503,6 +7712,58 @@ func (w jobWorker) resolveJobCheckout(ctx context.Context, job db.Job, payload w
 		}
 	}
 	return checkout, nil
+}
+
+func (w jobWorker) healRegisteredRepoCheckout(ctx context.Context, job db.Job, repo github.Repository, record db.Repo) (string, error) {
+	checkout := strings.TrimSpace(record.CheckoutPath)
+	if _, err := os.Stat(checkout); err == nil {
+		if strings.TrimSpace(record.PrimaryCheckoutPath) == "" {
+			if primary, primaryErr := (gitutil.Client{Dir: checkout}).PrimaryWorktree(ctx); primaryErr == nil {
+				if _, healErr := w.Store.HealRepoCheckout(ctx, record.FullName(), checkout, checkout, primary); healErr != nil {
+					return "", healErr
+				}
+			}
+		}
+		return checkout, nil
+	} else if !os.IsNotExist(err) {
+		return checkout, nil
+	}
+
+	primary := strings.TrimSpace(record.PrimaryCheckoutPath)
+	if primary == "" || sameCheckoutPath(primary, checkout) {
+		return checkout, nil
+	}
+	if _, err := os.Stat(primary); err != nil {
+		return checkout, nil
+	}
+	verified, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: primary})
+	if err != nil {
+		return "", fmt.Errorf("verify primary checkout for %s: %w", repo.FullName(), err)
+	}
+	healedPath := strings.TrimSpace(verified.CheckoutPath)
+	healed, err := w.Store.HealRepoCheckout(ctx, repo.FullName(), checkout, healedPath, healedPath)
+	if err != nil {
+		return "", err
+	}
+	if !healed {
+		current, err := w.Store.GetRepo(ctx, repo.FullName())
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(current.CheckoutPath), nil
+	}
+	message := fmt.Sprintf("repo %s checkout self-healed from %s to %s", repo.FullName(), checkout, healedPath)
+	if err := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "repo_checkout_self_healed", Message: message}); err != nil {
+		return "", err
+	}
+	if w.Stdout != nil {
+		writeLine(w.Stdout, "WARN: %s", message)
+	}
+	return healedPath, nil
+}
+
+func sameCheckoutPath(a, b string) bool {
+	return filepath.Clean(strings.TrimSpace(a)) == filepath.Clean(strings.TrimSpace(b))
 }
 
 func (w jobWorker) taskWorktreeCheckout(ctx context.Context, payload workflow.JobPayload) (string, bool, error) {

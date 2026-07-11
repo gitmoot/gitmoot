@@ -84,8 +84,9 @@ type Agent struct {
 	// marshaled to the wire. Empty means "fall back to RepoScope" (unchanged
 	// legacy behavior for callers that never set it).
 	WorkingDir string
-	// WritablePaths are additive Codex workspace-write grants for an action:
-	// produce pipeline stage. They never replace Codex's default writable roots.
+	// WritablePaths are additive runtime workspace grants for an action: produce
+	// pipeline stage. Codex enforces them itself; Claude/Kimi receive matching
+	// --add-dir hints while Gitmoot's Landlock wrapper provides hard enforcement.
 	WritablePaths []string
 	// ProduceNetwork opts that produce delivery into workspace-write network access.
 	ProduceNetwork bool
@@ -786,14 +787,15 @@ func codexSandboxArgs(agent Agent, workdir string) []string {
 	}
 }
 
-// ProduceDispatchError enforces the produce MVP at the dispatch boundary.
-// Produce is Codex-only until the separate OS-level sandbox follow-up lands, and
-// a non-writable policy is refused rather than silently producing no data.
+// ProduceDispatchError enforces the runtime/policy portion of produce dispatch.
+// The daemon separately requires a successful Landlock probe before Claude or
+// Kimi delivery; keeping that host capability check at the launch boundary lets
+// the workflow engine validate jobs without pretending it enforced a sandbox.
 func ProduceDispatchError(action string, agent Agent) error {
 	if strings.TrimSpace(action) != "produce" {
 		return nil
 	}
-	if agent.Runtime != CodexRuntime {
+	if agent.Runtime != CodexRuntime && agent.Runtime != ClaudeRuntime && agent.Runtime != KimiRuntime {
 		return fmt.Errorf("produce stages require the codex runtime; agent %q uses runtime %q", agent.Name, agent.Runtime)
 	}
 	if !PolicyGrantsImplementWrite(agent.AutonomyPolicy) {
@@ -1216,7 +1218,7 @@ func (a ClaudeAdapter) Health(ctx context.Context, agent Agent) error {
 }
 
 func (a ClaudeAdapter) Capabilities(context.Context) ([]string, error) {
-	return []string{"review", "implement", "ask"}, nil
+	return []string{"review", "implement", "ask", "produce"}, nil
 }
 
 func (a ClaudeAdapter) runner() subprocess.Runner {
@@ -1578,16 +1580,21 @@ func claudeArgs(agent Agent, prompt string, jsonOutput bool, model string) []str
 }
 
 func claudePermissionArgs(agent Agent) []string {
+	var args []string
 	switch NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
 	case AutonomyPolicyReadOnly:
-		return []string{"--permission-mode", "plan"}
+		args = []string{"--permission-mode", "plan"}
 	case AutonomyPolicyWorkspaceWrite:
-		return []string{"--permission-mode", "acceptEdits"}
+		args = []string{"--permission-mode", "acceptEdits"}
 	case AutonomyPolicyDangerFullAccess:
-		return []string{"--permission-mode", "bypassPermissions"}
-	default:
-		return nil
+		args = []string{"--permission-mode", "bypassPermissions"}
 	}
+	for _, path := range agent.WritablePaths {
+		if path = strings.TrimSpace(path); path != "" {
+			args = append(args, "--add-dir", path)
+		}
+	}
+	return args
 }
 
 func isClaudeJSONUnsupported(result subprocess.Result) bool {

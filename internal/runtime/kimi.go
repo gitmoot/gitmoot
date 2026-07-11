@@ -179,7 +179,7 @@ func (a KimiAdapter) Health(ctx context.Context, agent Agent) error {
 }
 
 func (a KimiAdapter) Capabilities(context.Context) ([]string, error) {
-	return []string{"review", "implement", "ask"}, nil
+	return []string{"review", "implement", "ask", "produce"}, nil
 }
 
 func (a KimiAdapter) runner() subprocess.Runner {
@@ -309,11 +309,16 @@ func kimiCLIPromptArgs(agent Agent, model string, promptArg string, extraArgs []
 
 func kimiPermissionArgs(agent Agent) []string {
 	// Kimi's prompt mode already runs non-interactively. The --yolo and --auto
-	// flags cannot be combined with -p, so we pass no extra permission flags.
-	// Read-only enforcement is handled by the agent's capabilities and Gitmoot's
-	// dispatch/lock logic.
-	_ = agent
-	return nil
+	// flags cannot be combined with -p. Produce paths are still passed as
+	// cooperative workspace hints; Gitmoot's Landlock wrapper is the enforcement
+	// boundary and the flags only let Kimi's own file layer see the same roots.
+	var args []string
+	for _, path := range agent.WritablePaths {
+		if path = strings.TrimSpace(path); path != "" {
+			args = append(args, "--add-dir", path)
+		}
+	}
+	return args
 }
 
 type kimiStreamEvent struct {

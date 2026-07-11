@@ -32,6 +32,9 @@ func TestLoadMemorySettingsDefaults(t *testing.T) {
 	if settings.IngestAutoConfirm {
 		t.Fatalf("ingest_auto_confirm must default false")
 	}
+	if settings.GroomSplitLLM != DefaultMemoryGroomSplitLLM {
+		t.Fatalf("groom_split_llm default = %v", settings.GroomSplitLLM)
+	}
 	if settings.ClusterFanout != 12 || settings.ClusterFanoutKeep != 9 || settings.ClusterDepthCap != 4 {
 		t.Fatalf("cluster hierarchy defaults = %+v", settings)
 	}
@@ -87,6 +90,7 @@ disabled = true
 token_budget = 800
 max_entries = 7
 ingest_auto_confirm = true
+groom_split_llm = true
 cluster_fanout = 10
 cluster_fanout_keep = 7
 cluster_depth_cap = 3
@@ -97,7 +101,7 @@ cluster_depth_cap = 3
 	if err != nil {
 		t.Fatalf("LoadMemorySettings: %v", err)
 	}
-	if !settings.Disabled || settings.TokenBudget != 800 || settings.MaxEntries != 7 || !settings.IngestAutoConfirm || settings.ClusterFanout != 10 || settings.ClusterFanoutKeep != 7 || settings.ClusterDepthCap != 3 {
+	if !settings.Disabled || settings.TokenBudget != 800 || settings.MaxEntries != 7 || !settings.IngestAutoConfirm || !settings.GroomSplitLLM || settings.ClusterFanout != 10 || settings.ClusterFanoutKeep != 7 || settings.ClusterDepthCap != 3 {
 		t.Fatalf("parsed = %+v", settings)
 	}
 }

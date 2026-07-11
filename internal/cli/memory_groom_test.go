@@ -299,6 +299,62 @@ func TestGroomProposeEmptyStore(t *testing.T) {
 	}
 }
 
+func TestGroomSplitDryRunApplyAndRerun(t *testing.T) {
+	home, store := memoryTestHome(t)
+	owner := db.MemoryOwner{Kind: "agent", Ref: "lead"}
+	content := "**First shipped story**\nThe first implementation preserved stable daemon sessions.\n\n**Second shipped story**\nThe second implementation preserved explicit owner review."
+	parentID := seedConfirmed(t, store, owner, "acme/widget", "repo", "session-brick", content)
+	ctx := context.Background()
+
+	code, stdout, stderr := runGroom(t, "--home", home, "--split", "--dry-run", "--json")
+	if code != 0 {
+		t.Fatalf("split dry-run exit %d: %s", code, stderr)
+	}
+	var dry groomSplitOutput
+	if err := json.Unmarshal([]byte(stdout), &dry); err != nil {
+		t.Fatalf("parse dry-run JSON: %v (%s)", err, stdout)
+	}
+	if !dry.DryRun || dry.Detected != 1 || dry.Applied != 0 || len(dry.Splits) != 1 || len(dry.Splits[0].Children) != 2 {
+		t.Fatalf("dry-run output = %+v", dry)
+	}
+	rows, err := store.ListConfirmedMemoriesForVault(ctx, "")
+	if err != nil {
+		t.Fatalf("read active rows after dry-run: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ID != parentID {
+		t.Fatalf("dry-run changed active rows: %+v", rows)
+	}
+
+	code, stdout, stderr = runGroom(t, "--home", home, "--split", "--json")
+	if code != 0 {
+		t.Fatalf("split apply exit %d: %s", code, stderr)
+	}
+	var applied groomSplitOutput
+	if err := json.Unmarshal([]byte(stdout), &applied); err != nil {
+		t.Fatalf("parse apply JSON: %v (%s)", err, stdout)
+	}
+	if applied.DryRun || applied.Detected != 1 || applied.Applied != 1 || len(applied.Splits[0].Children) != 2 {
+		t.Fatalf("apply output = %+v", applied)
+	}
+	for _, child := range applied.Splits[0].Children {
+		if child.ID == 0 || child.Key == "" {
+			t.Fatalf("applied child missing id/key: %+v", child)
+		}
+	}
+
+	code, stdout, stderr = runGroom(t, "--home", home, "--split", "--json")
+	if code != 0 {
+		t.Fatalf("split rerun exit %d: %s", code, stderr)
+	}
+	var rerun groomSplitOutput
+	if err := json.Unmarshal([]byte(stdout), &rerun); err != nil {
+		t.Fatalf("parse rerun JSON: %v (%s)", err, stdout)
+	}
+	if rerun.Detected != 0 || rerun.Applied != 0 || len(rerun.Splits) != 0 {
+		t.Fatalf("rerun must be no-op: %+v", rerun)
+	}
+}
+
 func TestGroomRejectsAmbiguousFlags(t *testing.T) {
 	home, _ := memoryTestHome(t)
 	if code, _, _ := runGroom(t, "--home", home); code != 2 {
@@ -306,6 +362,12 @@ func TestGroomRejectsAmbiguousFlags(t *testing.T) {
 	}
 	if code, _, _ := runGroom(t, "--home", home, "--propose", "--yes"); code != 2 {
 		t.Fatalf("both modes should exit 2, got %d", code)
+	}
+	if code, _, _ := runGroom(t, "--home", home, "--propose", "--split"); code != 2 {
+		t.Fatalf("two modes should exit 2, got %d", code)
+	}
+	if code, _, _ := runGroom(t, "--home", home, "--propose", "--dry-run"); code != 2 {
+		t.Fatalf("--dry-run without --split should exit 2, got %d", code)
 	}
 	if code, _, stderr := runGroom(t, "--home", home, "--yes"); code != 2 || !strings.Contains(stderr, "--plan") {
 		t.Fatalf("--yes without --plan should exit 2 asking for --plan, got %d %q", code, stderr)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -280,6 +281,81 @@ func (c Client) Root(ctx context.Context) (string, error) {
 		return "", errors.New("git root is empty")
 	}
 	return root, nil
+}
+
+// IsLinkedWorktree reports whether c.Dir is a linked worktree rather than the
+// primary checkout. Git 2.31 added --path-format=absolute; older versions fall
+// back to resolving git-dir/common-dir relative to the client directory.
+func (c Client) IsLinkedWorktree(ctx context.Context) (bool, error) {
+	result, err := c.run(ctx, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir")
+	if err != nil {
+		result, err = c.run(ctx, "rev-parse", "--git-dir", "--git-common-dir")
+		if err != nil {
+			return false, err
+		}
+	}
+	paths := strings.Split(strings.TrimSpace(result.Stdout), "\n")
+	if len(paths) != 2 {
+		return false, fmt.Errorf("git rev-parse returned %d paths, want 2", len(paths))
+	}
+	gitDir, err := c.absoluteGitPath(paths[0])
+	if err != nil {
+		return false, err
+	}
+	commonDir, err := c.absoluteGitPath(paths[1])
+	if err != nil {
+		return false, err
+	}
+	return gitDir != commonDir, nil
+}
+
+// PrimaryWorktree returns the first non-bare record from git's porcelain
+// worktree list. Git writes the primary checkout first. A worktree-only repo
+// with no non-bare record falls back to the current checkout.
+func (c Client) PrimaryWorktree(ctx context.Context) (string, error) {
+	result, err := c.run(ctx, "worktree", "list", "--porcelain")
+	if err != nil {
+		return "", err
+	}
+	for _, record := range strings.Split(strings.TrimSpace(result.Stdout), "\n\n") {
+		var worktree string
+		bare := false
+		for _, line := range strings.Split(record, "\n") {
+			switch {
+			case strings.HasPrefix(line, "worktree "):
+				worktree = strings.TrimSpace(strings.TrimPrefix(line, "worktree "))
+			case strings.TrimSpace(line) == "bare":
+				bare = true
+			}
+		}
+		if worktree != "" && !bare {
+			absolute, err := c.absoluteGitPath(worktree)
+			if err != nil {
+				return "", err
+			}
+			return absolute, nil
+		}
+	}
+	return c.Root(ctx)
+}
+
+func (c Client) absoluteGitPath(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", errors.New("git path is empty")
+	}
+	if !filepath.IsAbs(path) {
+		base := strings.TrimSpace(c.Dir)
+		if base == "" {
+			base = "."
+		}
+		path = filepath.Join(base, path)
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(absolute), nil
 }
 
 func (c Client) OriginRemote(ctx context.Context) (string, error) {

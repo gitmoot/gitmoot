@@ -66,6 +66,82 @@ func TestClientUsesSharedSubprocessRunner(t *testing.T) {
 	runner.wantArgs(t, 8, "git", "pull", "--ff-only", "origin", "main")
 }
 
+func TestClientIsLinkedWorktree(t *testing.T) {
+	tests := []struct {
+		name       string
+		results    []subprocess.Result
+		errs       []error
+		wantLinked bool
+		wantCalls  [][]string
+	}{
+		{
+			name:       "primary absolute paths match",
+			results:    []subprocess.Result{{Stdout: "/repo/.git\n/repo/.git\n"}},
+			wantLinked: false,
+			wantCalls:  [][]string{{"git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"}},
+		},
+		{
+			name:       "linked absolute paths differ",
+			results:    []subprocess.Result{{Stdout: "/repo/.git/worktrees/task\n/repo/.git\n"}},
+			wantLinked: true,
+			wantCalls:  [][]string{{"git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"}},
+		},
+		{
+			name:       "old git fallback resolves relative paths",
+			results:    []subprocess.Result{{}, {Stdout: ".git\n.git\n"}},
+			errs:       []error{errors.New("unknown option"), nil},
+			wantLinked: false,
+			wantCalls: [][]string{
+				{"git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"},
+				{"git", "rev-parse", "--git-dir", "--git-common-dir"},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &fakeRunner{results: tc.results, errs: tc.errs}
+			linked, err := (Client{Runner: runner, Dir: "/repo"}).IsLinkedWorktree(context.Background())
+			if err != nil {
+				t.Fatalf("IsLinkedWorktree returned error: %v", err)
+			}
+			if linked != tc.wantLinked {
+				t.Fatalf("linked = %t, want %t", linked, tc.wantLinked)
+			}
+			for i, call := range tc.wantCalls {
+				runner.wantArgs(t, i, call...)
+			}
+		})
+	}
+}
+
+func TestClientPrimaryWorktree(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\nworktree /repo-linked\nHEAD def\nbranch refs/heads/task\n"}}}
+	primary, err := (Client{Runner: runner, Dir: "/repo-linked"}).PrimaryWorktree(context.Background())
+	if err != nil {
+		t.Fatalf("PrimaryWorktree returned error: %v", err)
+	}
+	if primary != "/repo" {
+		t.Fatalf("primary = %q, want /repo", primary)
+	}
+	runner.wantArgs(t, 0, "git", "worktree", "list", "--porcelain")
+}
+
+func TestClientPrimaryWorktreeSkipsBareAndFallsBackToSelf(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{
+		{Stdout: "worktree /repo.git\nbare\n"},
+		{Stdout: "/repo-linked\n"},
+	}}
+	primary, err := (Client{Runner: runner, Dir: "/repo-linked"}).PrimaryWorktree(context.Background())
+	if err != nil {
+		t.Fatalf("PrimaryWorktree returned error: %v", err)
+	}
+	if primary != "/repo-linked" {
+		t.Fatalf("primary = %q, want /repo-linked", primary)
+	}
+	runner.wantArgs(t, 0, "git", "worktree", "list", "--porcelain")
+	runner.wantArgs(t, 1, "git", "rev-parse", "--show-toplevel")
+}
+
 func TestClientRejectsUnsafeBranchNames(t *testing.T) {
 	for _, branch := range []string{"", " task", "task ", "-bad", "bad branch", "bad..branch", "bad.lock", "HEAD:main", "bad~branch", "bad^branch", "bad?branch", "bad[branch", "bad\\branch", "bad@{branch", "/bad", "bad/", "bad//branch"} {
 		t.Run(branch, func(t *testing.T) {

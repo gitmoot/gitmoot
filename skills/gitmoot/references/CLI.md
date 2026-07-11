@@ -115,6 +115,24 @@ A `[runtimes.<name>]` section can only tweak a **built-in** runtime's metadata; 
 cannot add a new first-class runtime (that requires a code change). An unknown
 runtime name is a config error surfaced by `gitmoot runtime list`.
 
+## Runtime Launch Sandbox
+
+```sh
+gitmoot sandbox probe
+```
+
+`sandbox probe` prints whether this Linux host can enforce Gitmoot's strict
+Landlock launch sandbox and includes the detected ABI. The probe runs the real
+hidden re-exec shim and verifies both an allowed write and a denied outside write;
+unsupported kernels return non-zero. Claude/Kimi `produce` pipeline stages require
+this probe to pass and otherwise retain the explicit Codex-only refusal. Codex
+produce remains on its own native sandbox. Landlock confines filesystem writes but
+does not govern network access; network policy remains the runtime CLI's. Wrapped
+Claude may write its runtime-owned `$HOME/.claude` state and
+`$XDG_CACHE_HOME/claude-cli-nodejs` cache; wrapped Kimi may write its runtime-owned
+`$HOME/.kimi-code` state. Apart from runtime state/cache and standard device nodes,
+only declared data paths, the disposable workdir, and temp roots are writable.
+
 ## Repo And Daemon Status
 
 ```sh
@@ -1927,7 +1945,7 @@ content-derived links in each note's `## Links` section and dedupes by target.
 > boundary. Trust-aware injection (having the read path weigh `trust_mark`) is
 > future work; nothing reads `trust_mark` for a decision yet.
 
-### Grooming: deterministic propose/apply (#737 P4.2)
+### Grooming: automatic brick splits + deterministic propose/apply (#737 P4.2, #832)
 
 `memory groom` mechanizes the periodic curation pass that retires stale,
 low-signal confirmed memories, as an explicit **propose → review → apply**
@@ -1936,7 +1954,22 @@ round-trip:
 ```sh
 gitmoot memory groom --propose [--out PLAN.json] [--json]
 gitmoot memory groom --yes --plan PLAN.json [--json]
+gitmoot memory groom --split [--dry-run] [--json]
 ```
+
+`--split` is the automatic, approval-free lossless pass. It partitions a brick
+at byte offsets on strong story seams (bold story headers, date-led lines, and
+PR markers) or, for over-threshold content, blank-line paragraph groups. A
+candidate needs at least two substantive segments and either two strong seams
+or content over `GroomRewriteThreshold`. Children are exact parent substrings in
+deterministic order and must concatenate to the parent's trimmed coverage; any
+invariant failure falls back to a rewrite flag without writing. Child keys use
+`<parent-key>-<seam-slug>` with deterministic ordinals, provenance is
+`groom-split:<parent-id>`, and owner/author/repo/scope are inherited. Apply is one
+CAS-guarded transaction: children and FTS rows are inserted, the parent leaves
+FTS and is set `superseded_by = <first-child-id>`, and children replace the
+parent in its cluster. Links are left for normal enrichment. `--dry-run` prints
+the same split plan without changing the store; a repeat run is a no-op.
 
 `--propose` reads every **active** confirmed memory (retired rows excluded),
 computes the current vault `snapshot_hash` (the same anchor `vault export`/`import`
@@ -1957,9 +1990,10 @@ cross_pool, stats}`). It **touches nothing** in the store. The detectors are:
   fact duplicated across owners, repos, or scopes is **not** deduped — each copy is
   the only one visible in its own retrieval scope (owner/repo/scope is shown on each
   proposed retirement so you can tell them apart);
-- **over-long "bricks"** (content > ~1200 chars) are **flagged for rewrite**, never
-  retired — P4.2 only lists them for the owner (LLM rewriting is the follow-up
-  P4.3);
+- **brick rewrite flags** include over-long content (> ~1200 chars) and
+  under-threshold multi-story content with at least two strong seams. The
+  automatic lossless `--split` pass handles qualifying bricks; seam-poor long
+  prose remains flag-only for a later LLM atomizer;
 - **legacy-key rekeys** (#804): active rows whose key still ends in the
   pre-stable-key 8-hex content-hash suffix (`…-a1b2c3d4`) are grouped per
   owner/repo/scope by their stripped stable key. Organic sweeps can never fix
@@ -1985,9 +2019,11 @@ rewritten**, and applying is idempotent: an already-retired or missing id is
 skipped gracefully, and a rekey group or cross-pool pair whose rows changed state
 since the proposal is skipped whole rather than half-applied.
 
-The built-in `memory-groom-propose` pipeline runs only the proposal half:
-`gitmoot memory groom --propose --out <run-scoped-plan> --json`, then summarizes
-the proposal counts into the pipeline result. It never applies a plan. The daemon
+The built-in `memory-groom-propose` pipeline first auto-runs
+`gitmoot memory groom --split --json`, then runs the proposal half with
+`gitmoot memory groom --propose --out <run-scoped-plan> --json` and summarizes
+both counts. Only lossless splits auto-apply; retirement, rekey, and cross-pool
+proposals still require owner review and `--yes --plan`. The daemon
 and `gitmoot pipeline install-defaults` register it idempotently and skip an
 existing row named `memory-groom-propose`, preserving local edits. It is
 manual-only unless `[memory.pipelines].groom_propose` is set:
@@ -1998,6 +2034,9 @@ repo = "owner/repo"
 ingest_sweep = "nightly"
 groom_propose = "nightly"
 ```
+
+`[memory].groom_split_llm = false` is parsed as the default-off Phase 2 gate;
+this release does not implement the lossy LLM atomizer path.
 
 ```sh
 gitmoot pipeline run memory-groom-propose
@@ -2097,10 +2136,11 @@ stages:                     # the DAG, keyed by unique id and wired by needs
     prompt: "Triage the scored data; block if a human is needed."
     needs: [score]          #   upstream results are prepended to the prompt
   # other agent-stage kinds:
-  #   implement (#768): action: implement + write: true → mutates repo + opens a PR (never auto-merges)
+  #   implement (#768): action: implement + write: true → mutates repo + opens a PR
   #   bound review (#813): action: review + source: <impl stage> -> reviews that PR/head, report-only
   #   orchestrate (#758): orchestrate: true → sub-tree coordinator (fans out owned children, folds synthesis)
-  #   gate (#768): gate: pr_merged + source: <impl stage> (no agent) → jobless, folds when that PR merges
+  #   gate (#768): gate: pr_merged + source: <impl stage> (no agent) → jobless; human merge is default
+  #   auto-merge gate: add merge: auto plus top-level allow_auto_merge: true; requires source-bound review
   - id: deploy
     cmd: "rclone copy out/ r2:bucket"
     needs: [triage]
@@ -2137,16 +2177,25 @@ its `needs` stages' result summaries are prepended to the prompt, and a repo-bou
 agent stage runs in its own detached read-only worktree so same-repo agent stages
 parallelize without touching the live checkout.
 
-`action: produce` (#814) is a Codex-only pipeline leaf for writing operator-owned
-data, never repo/branch/task/PR state. It requires `write: true`, one or more absolute
+`action: produce` (#814/#825) is a sandboxed pipeline leaf for writing operator-owned
+data, never repo/branch/task/PR state. Codex uses its native sandbox; Claude and
+modern Kimi require a successful `gitmoot sandbox probe` and are re-execed under
+strict Landlock. Non-Linux/unsupported hosts keep the Codex-only refusal. It requires
+`write: true`, one or more absolute
 cleaned `writes:` paths, a `produce`-capable writable agent, and optionally
 `network: true`, `check: <cmd>`, and `check_retries: N`. `pipeline add` resolves
 symlinks and rejects targets overlapping `/`, the Gitmoot home, or a managed checkout.
 The worker repeats that same canonicalization immediately before delivery to close
-symlink-retargeting races. Declared paths are additive `--add-dir` grants: the
-workdir, `/tmp`, and `$TMPDIR` remain writable under Codex workspace-write. A
-danger-full-access agent receives no add-dir/network arguments because it is already
-unrestricted. Checks re-ask the same session with
+symlink-retargeting races. Declared paths are additive `--add-dir` grants. For
+Claude/Kimi, Landlock limits writes to those existing directories plus the workdir,
+temp roots, standard device nodes, and runtime-owned state: `$HOME/.claude` plus
+`$XDG_CACHE_HOME/claude-cli-nodejs` for Claude, and `$HOME/.kimi-code` for Kimi.
+Gitmoot sets `CLAUDE_CONFIG_DIR=$HOME/.claude` so Claude's mutable config stays inside
+that state grant. Apart from runtime state/cache and device nodes, declared data paths,
+the disposable workdir, and temp roots are the only writable locations. Codex behavior
+is unchanged. Landlock does not govern network access.
+A Codex danger-full-access agent receives no add-dir/network arguments because it is
+already unrestricted. Checks re-ask the same session with
 redacted/capped output; stage retries must reconcile partial data idempotently.
 Gitmoot cleans only the disposable cwd, never the declared data directories.
 
@@ -2160,6 +2209,20 @@ fix job and never run the native merge gate. Declaring this review also sets
 reviewer jobs. If the source permanently produces no PR (no-op or `skipped`), the
 review folds blocked immediately with `source stage produced no PR; nothing to
 review` and no unbound review is dispatched.
+
+The `pr_merged` gate remains a human-merge waiter by default. Opt-in
+`merge: auto` is gate-only and also requires top-level `allow_auto_merge: true`
+plus at least one review stage bound to the same implement source. The advancer,
+not the report-only review job, performs one squash attempt only after every bound
+review folded `approved`, the live PR head still equals the reviewed payload
+`HeadSHA`, GitHub reports mergeable, and checks pass. Pending checks keep waiting;
+head drift, conflicts/unmergeability, or a merge API error fold the gate blocked.
+Merge errors are not retried. Scheduled pipelines need both `allow_auto_merge` and
+the existing `allow_scheduled_writes` key. Omitting `merge` preserves human merge.
+Pending checks wait; skipped/neutral check-runs pass; failures block; and zero
+external statuses/checks always block regardless of `require_external_ci`. The
+source job atomically records `pipeline_auto_merge_claim` before the write and
+`pipeline_auto_merge_confirmed` after GitHub confirms it.
 
 `pipeline install-defaults` installs the built-in memory pipelines
 `memory-ingest-sweep` and `memory-groom-propose`. The daemon also runs this

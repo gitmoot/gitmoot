@@ -148,6 +148,7 @@ path = ""
 # distill_max_per_job = 3
 # distill_all_jobs = false
 # ingest_auto_confirm = false
+# groom_split_llm = false # Phase 2 gate only; the LLM atomizer is not implemented yet.
 # cluster_fanout = 12
 # cluster_fanout_keep = 9
 # cluster_depth_cap = 4

@@ -11,8 +11,11 @@ import (
 // and max-entries cap are the initial values from the RFC body; they are meant
 // to be calibrated empirically by the Phase-1 measurement harness.
 const (
-	DefaultMemoryTokenBudget       = 1500
-	DefaultMemoryMaxEntries        = 15
+	DefaultMemoryTokenBudget = 1500
+	DefaultMemoryMaxEntries  = 15
+	// DefaultMemoryGroomSplitLLM gates the lossy Phase-2 atomizer. Phase 1 only
+	// parses this default-off switch; no LLM rewrite path is implemented yet.
+	DefaultMemoryGroomSplitLLM     = false
 	DefaultMemoryClusterFanout     = 12
 	DefaultMemoryClusterFanoutKeep = 9
 	DefaultMemoryClusterDepthCap   = 4
@@ -69,6 +72,9 @@ type MemorySettings struct {
 	// pending human gate. Shared memory remains explicit through confirm/promote
 	// commands even when this is enabled.
 	IngestAutoConfirm bool
+	// GroomSplitLLM is the parsed Phase-2 gate for an eventual lossy LLM
+	// atomizer. Deterministic lossless splitting does not consult this flag.
+	GroomSplitLLM bool
 	// ClusterFanout bounds rendered sibling entries per repo scope. FanoutKeep is
 	// the strict hysteresis boundary below which a prior grouping dissolves, and
 	// ClusterDepthCap bounds recursive grouping/splitting.
@@ -88,6 +94,7 @@ func DefaultMemorySettings() MemorySettings {
 		DistillMaxPerJob:  DefaultMemoryDistillMaxPerJob,
 		DistillAllJobs:    false,
 		IngestAutoConfirm: false,
+		GroomSplitLLM:     DefaultMemoryGroomSplitLLM,
 		ClusterFanout:     DefaultMemoryClusterFanout,
 		ClusterFanoutKeep: DefaultMemoryClusterFanoutKeep,
 		ClusterDepthCap:   DefaultMemoryClusterDepthCap,
@@ -174,6 +181,12 @@ func LoadMemorySettings(paths Paths) (MemorySettings, error) {
 				return MemorySettings{}, fmt.Errorf("parse [memory].ingest_auto_confirm: %w", err)
 			}
 			settings.IngestAutoConfirm = parsed
+		case "groom_split_llm":
+			parsed, err := parseConfigBool(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].groom_split_llm: %w", err)
+			}
+			settings.GroomSplitLLM = parsed
 		case "cluster_fanout":
 			parsed, err := strconv.Atoi(value)
 			if err != nil {
