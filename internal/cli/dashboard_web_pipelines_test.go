@@ -289,6 +289,76 @@ func TestWebDataSourcePipelineRunBlockedDiamond(t *testing.T) {
 	}
 }
 
+// TestWebDataSourcePipelineRunProgress pins the #822 bridge contract: one bulk
+// latest-event read maps valid progress onto running stages only. Missing and
+// malformed events fail open, and terminal stages never retain stale progress.
+func TestWebDataSourcePipelineRunProgress(t *testing.T) {
+	home := dashboardTestHome(t)
+	store := openPipelineTestStore(t, home)
+	started := time.UnixMilli(1_751_000_000_000).UTC()
+	seedTestRun(t, store, db.PipelineRun{
+		ID: "prun-progress-0001", Pipeline: "progress-test", Trigger: "manual",
+		State: pipeline.RunRunning, StartedAt: started,
+	}, []db.PipelineRunStage{
+		{StageID: "mapped", State: pipeline.StageRunning, JobID: "job-progress-mapped"},
+		{StageID: "absent", State: pipeline.StageRunning, JobID: "job-progress-absent"},
+		{StageID: "malformed", State: pipeline.StageRunning, JobID: "job-progress-malformed"},
+		{StageID: "terminal", State: pipeline.StageSucceeded, JobID: "job-progress-terminal"},
+	})
+	ctx := context.Background()
+	for _, event := range []db.JobEvent{
+		{JobID: "job-progress-mapped", Kind: "progress", Message: `{"elapsed":"1m0s","activity":"compiled package 42/100"}`},
+		{JobID: "job-progress-malformed", Kind: "progress", Message: `{"elapsed":`},
+		{JobID: "job-progress-terminal", Kind: "progress", Message: `{"elapsed":"2m0s","activity":"stale terminal output"}`},
+	} {
+		if err := store.AddJobEvent(ctx, event); err != nil {
+			store.Close()
+			t.Fatalf("AddJobEvent(%s): %v", event.JobID, err)
+		}
+	}
+	mappedEvent, ok, err := store.GetLatestJobEventByKind(ctx, "job-progress-mapped", "progress")
+	if err != nil || !ok {
+		store.Close()
+		t.Fatalf("GetLatestJobEventByKind(mapped): ok=%v err=%v", ok, err)
+	}
+	wantProgressAt := parseJobTimeMillis(mappedEvent.CreatedAt)
+	store.Close()
+
+	run, err := (&webDataSource{home: home}).PipelineRun(ctx, "prun-progress-0001")
+	if err != nil {
+		t.Fatalf("PipelineRun: %v", err)
+	}
+	byID := map[string]dashboard.PipelineStage{}
+	for _, stage := range run.Stages {
+		byID[stage.ID] = stage
+	}
+
+	t.Run("maps running progress activity and event millis", func(t *testing.T) {
+		got := byID["mapped"]
+		if got.ProgressActivity != "compiled package 42/100" || got.ProgressAt != wantProgressAt || got.ProgressAt == 0 {
+			t.Fatalf("mapped progress = %q/%d, want activity/%d", got.ProgressActivity, got.ProgressAt, wantProgressAt)
+		}
+	})
+	t.Run("absent event stays zero", func(t *testing.T) {
+		got := byID["absent"]
+		if got.ProgressActivity != "" || got.ProgressAt != 0 {
+			t.Fatalf("absent progress = %q/%d, want zero values", got.ProgressActivity, got.ProgressAt)
+		}
+	})
+	t.Run("malformed event stays zero without error", func(t *testing.T) {
+		got := byID["malformed"]
+		if got.ProgressActivity != "" || got.ProgressAt != 0 {
+			t.Fatalf("malformed progress = %q/%d, want zero values", got.ProgressActivity, got.ProgressAt)
+		}
+	})
+	t.Run("terminal stage never carries progress", func(t *testing.T) {
+		got := byID["terminal"]
+		if got.ProgressActivity != "" || got.ProgressAt != 0 {
+			t.Fatalf("terminal progress = %q/%d, want zero values", got.ProgressActivity, got.ProgressAt)
+		}
+	})
+}
+
 // TestWebDataSourcePipelineRunNotFound pins the unknown-id sentinel: !ok from the
 // store maps to dashboard.ErrPipelineRunNotFound (the API layer serves 404), NOT an
 // empty 200.
