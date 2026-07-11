@@ -33,6 +33,7 @@ const sidebars: SidebarsConfig = {
         'workflows/parallel-jobs-workflow',
         'workflows/heartbeat-schedules-workflow',
         'workflows/pipelines-workflow',
+        'workflows/activepieces-setup-workflow',
         'workflows/chat-workflow',
         'workflows/skillopt-train-workflow',
       ],
