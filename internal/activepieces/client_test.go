@@ -117,6 +117,37 @@ func TestInstallPieceRejectsEmptyVersion(t *testing.T) {
 	}
 }
 
+func TestClientDeletesFlow(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodDelete {
+			t.Errorf("method = %s, want DELETE", r.Method)
+		}
+		if r.URL.EscapedPath() != "/api/v1/flows/flow%2F1" {
+			t.Errorf("path = %s, want /api/v1/flows/flow%%2F1", r.URL.EscapedPath())
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Errorf("Authorization = %q, want bearer token", got)
+		}
+		if requests == 2 {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := client.DeleteFlow(context.Background(), "test-token", "flow/1"); err != nil {
+			t.Fatalf("DeleteFlow call %d: %v", i+1, err)
+		}
+	}
+}
+
 func TestInstallPieceSendsVersion(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any

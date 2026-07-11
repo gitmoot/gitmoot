@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -30,6 +31,7 @@ const (
 	defaultActivepiecesEmail   = "admin@gitmoot.local"
 	defaultActivepiecesProject = "gitmoot-activepieces"
 	activepiecesConnectionID   = "gitmoot-bridge"
+	activepiecesBridgePIDFile  = "bridge.pid"
 )
 
 func runActivepieces(args []string, stdout, stderr io.Writer) int {
@@ -54,7 +56,7 @@ func runActivepieces(args []string, stdout, stderr io.Writer) int {
 func printActivepiecesUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot activepieces setup [flags]")
-	fmt.Fprintln(w, "  gitmoot activepieces down [--volumes] [flags]")
+	fmt.Fprintln(w, "  gitmoot activepieces down [--volumes] [--stop-bridge] [flags]")
 	fmt.Fprintln(w, "  gitmoot activepieces templates list")
 	fmt.Fprintln(w, "  gitmoot activepieces templates import [flags] [id...]")
 }
@@ -143,6 +145,9 @@ func runActivepiecesSetup(args []string, stdout, stderr io.Writer) int {
 	if err := ensureActivepiecesBridge(*home, stackDir, *bridgeAddr, allowRemote, *noBridgeSpawn); err != nil {
 		fmt.Fprintf(stderr, "activepieces setup: %v\n", err)
 		return 1
+	}
+	if allowRemote {
+		fmt.Fprintf(stdout, "Bridge is reachable by local containers on %s (bearer-token protected).\n", *bridgeAddr)
 	}
 
 	targetURL := strings.TrimRight(strings.TrimSpace(*apURL), "/")
@@ -314,7 +319,15 @@ func ensureActivepiecesBridge(home, stackDir, addr string, allowRemote, noSpawn 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start Gitmoot bridge: %w", err)
 	}
+	if err := writeActivepiecesBridgePID(stackDir, cmd.Process.Pid, addr); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return fmt.Errorf("write Gitmoot bridge pid file: %w", err)
+	}
 	if err := cmd.Process.Release(); err != nil {
+		_ = os.Remove(filepath.Join(stackDir, activepiecesBridgePIDFile))
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return fmt.Errorf("release Gitmoot bridge process: %w", err)
 	}
 	deadline := time.Now().Add(15 * time.Second)
@@ -325,6 +338,149 @@ func ensureActivepiecesBridge(home, stackDir, addr string, allowRemote, noSpawn 
 		time.Sleep(200 * time.Millisecond)
 	}
 	return fmt.Errorf("Gitmoot bridge did not start on %s; inspect %s", addr, filepath.Join(stackDir, "bridge.log"))
+}
+
+type activepiecesBridgePID struct {
+	PID  int    `json:"pid"`
+	Addr string `json:"addr"`
+}
+
+func writeActivepiecesBridgePID(stackDir string, pid int, addr string) error {
+	if pid <= 0 || strings.TrimSpace(addr) == "" {
+		return errors.New("invalid Gitmoot bridge process metadata")
+	}
+	body, err := json.Marshal(activepiecesBridgePID{PID: pid, Addr: strings.TrimSpace(addr)})
+	if err != nil {
+		return err
+	}
+	body = append(body, '\n')
+	tmp, err := os.CreateTemp(stackDir, ".bridge-pid-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(body); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	path := filepath.Join(stackDir, activepiecesBridgePIDFile)
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
+}
+
+func readActivepiecesBridgePID(stackDir string) (activepiecesBridgePID, error) {
+	raw, err := os.ReadFile(filepath.Join(stackDir, activepiecesBridgePIDFile))
+	if err != nil {
+		return activepiecesBridgePID{}, err
+	}
+	var process activepiecesBridgePID
+	if err := json.Unmarshal(raw, &process); err != nil {
+		return activepiecesBridgePID{}, err
+	}
+	process.Addr = strings.TrimSpace(process.Addr)
+	if process.PID <= 0 || process.Addr == "" {
+		return activepiecesBridgePID{}, errors.New("invalid Gitmoot bridge process metadata")
+	}
+	return process, nil
+}
+
+func inspectActivepiecesBridgePID(pid int) (alive, verified bool) {
+	if pid <= 0 {
+		return false, false
+	}
+	if err := syscall.Kill(pid, 0); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return false, false
+		}
+		return true, false
+	}
+	raw, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
+	if err != nil {
+		return true, false
+	}
+	return true, isGitmootBridgeCmdline(raw)
+}
+
+func isGitmootBridgeCmdline(raw []byte) bool {
+	cmdline := strings.Join(strings.Fields(strings.ReplaceAll(string(raw), "\x00", " ")), " ")
+	return strings.Contains(cmdline, "bridge serve")
+}
+
+func stopActivepiecesBridgePID(pid int) error {
+	return syscall.Kill(pid, syscall.SIGTERM)
+}
+
+func reconcileActivepiecesBridgePID(
+	stackDir string,
+	stop bool,
+	stdout io.Writer,
+	inspect func(int) (alive, verified bool),
+	terminate func(int) error,
+) error {
+	path := filepath.Join(stackDir, activepiecesBridgePIDFile)
+	process, err := readActivepiecesBridgePID(stackDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			if stop {
+				fmt.Fprintln(stdout, "There was nothing to stop: no verified gitmoot bridge started by setup was found.")
+			}
+			return nil
+		}
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return fmt.Errorf("remove stale Gitmoot bridge pid file: %w", removeErr)
+		}
+		if stop {
+			fmt.Fprintln(stdout, "There was nothing to stop: no verified gitmoot bridge started by setup was found.")
+		}
+		return nil
+	}
+	alive, verified := inspect(process.PID)
+	if !alive {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove stale Gitmoot bridge pid file: %w", err)
+		}
+		if stop {
+			fmt.Fprintln(stdout, "There was nothing to stop: no verified gitmoot bridge started by setup was found.")
+		}
+		return nil
+	}
+	if !verified {
+		if !stop {
+			return nil
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove unverified Gitmoot bridge pid file: %w", err)
+		}
+		fmt.Fprintln(stdout, "There was nothing to stop: no verified gitmoot bridge started by setup was found.")
+		return nil
+	}
+	if !stop {
+		fmt.Fprintf(stdout, "The gitmoot bridge that setup started is still running (pid %d on %s). Stop it with: gitmoot activepieces down --stop-bridge\n", process.PID, process.Addr)
+		return nil
+	}
+	if err := terminate(process.PID); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			_ = os.Remove(path)
+			fmt.Fprintln(stdout, "There was nothing to stop: no verified gitmoot bridge started by setup was found.")
+			return nil
+		}
+		return fmt.Errorf("stop Gitmoot bridge pid %d: %w", process.PID, err)
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove Gitmoot bridge pid file: %w", err)
+	}
+	fmt.Fprintf(stdout, "Stopped the gitmoot bridge that setup started (pid %d on %s).\n", process.PID, process.Addr)
+	return nil
 }
 
 func bridgeTCPReady(addr string, timeout time.Duration) bool {
@@ -392,7 +548,7 @@ func writeAdminCredentialsOnce(path, email, password string) (bool, error) {
 }
 
 func confirmStarterTemplates(stdout io.Writer, yes bool) bool {
-	if yes || !style.IsTerminal(stdout) {
+	if yes || !style.IsTerminal(stdout) || !style.IsTerminal(os.Stdin) {
 		return true
 	}
 	fmt.Fprint(stdout, "Import starter templates? [Y/n] ")
@@ -410,6 +566,7 @@ func runActivepiecesDown(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	composeProject := fs.String("compose-project", defaultActivepiecesProject, "Docker Compose project name")
 	volumes := fs.Bool("volumes", false, "also remove Activepieces data volumes")
+	stopBridge := fs.Bool("stop-bridge", false, "also stop the Gitmoot bridge started by setup")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -434,6 +591,10 @@ func runActivepiecesDown(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "Activepieces stopped and its local data volumes were removed.")
 	} else {
 		fmt.Fprintln(stdout, "Activepieces stopped. Local data volumes were preserved.")
+	}
+	if err := reconcileActivepiecesBridgePID(stackDir, *stopBridge, stdout, inspectActivepiecesBridgePID, stopActivepiecesBridgePID); err != nil {
+		fmt.Fprintf(stderr, "activepieces down: %v\n", err)
+		return 1
 	}
 	return 0
 }
@@ -493,7 +654,14 @@ func runActivepiecesTemplatesImport(args []string, stdout, stderr io.Writer) int
 	port := fs.Int("port", defaultActivepiecesPort, "local Activepieces port")
 	email := fs.String("email", defaultActivepiecesEmail, "Activepieces admin email")
 	password := fs.String("password", "", "Activepieces admin password")
-	if err := fs.Parse(args); err != nil {
+	parsedArgs, err := reorderFlagArgs(args, map[string]struct{}{
+		"home": {}, "url": {}, "port": {}, "email": {}, "password": {},
+	}, nil)
+	if err != nil {
+		fmt.Fprintf(stderr, "activepieces templates import: %v\n", err)
+		return 2
+	}
+	if err := fs.Parse(parsedArgs); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
@@ -577,6 +745,7 @@ func importActivepiecesTemplates(ctx context.Context, client *activepieces.Clien
 			return imported, fmt.Errorf("import template %s: %w", template.ID, err)
 		}
 		if err := client.ImportFlow(ctx, token, flowID, template.Flow); err != nil {
+			_ = client.DeleteFlow(ctx, token, flowID)
 			return imported, fmt.Errorf("import template %s: %w", template.ID, err)
 		}
 		flowURL := fmt.Sprintf("%s/projects/%s/flows/%s", client.BaseURL(), projectID, flowID)

@@ -284,6 +284,18 @@ func (c *Client) ImportFlow(ctx context.Context, token, flowID string, flow json
 	return nil
 }
 
+func (c *Client) DeleteFlow(ctx context.Context, token, flowID string) error {
+	path := "/api/v1/flows/" + url.PathEscape(flowID)
+	if err := c.doJSON(ctx, http.MethodDelete, path, token, nil, nil); err != nil {
+		var httpErr *HTTPError
+		if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
+			return nil
+		}
+		return fmt.Errorf("delete Activepieces flow: %w", err)
+	}
+	return nil
+}
+
 func (c *Client) ListFlows(ctx context.Context, token, projectID string) ([]FlowSummary, error) {
 	query := url.Values{"projectId": {projectID}}
 	path := "/api/v1/flows?" + query.Encode()
