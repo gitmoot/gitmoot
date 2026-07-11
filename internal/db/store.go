@@ -8556,4 +8556,9 @@ ALTER TABLE agent_instances ADD COLUMN effort TEXT NOT NULL DEFAULT '';
 	`
 ALTER TABLE repos ADD COLUMN primary_checkout_path TEXT NOT NULL DEFAULT '';
 	`,
+	// #842 split-child subject inheritance. Empty context preserves every legacy
+	// confirmed memory byte-for-byte; groom splits populate it with the parent key.
+	`
+ALTER TABLE confirmed_memories ADD COLUMN context TEXT NOT NULL DEFAULT '';
+	`,
 }

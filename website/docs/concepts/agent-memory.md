@@ -374,17 +374,29 @@ future work; nothing reads `trust_mark` for a decision yet.
 gitmoot memory groom --propose [--out PLAN.json] [--json]
 gitmoot memory groom --yes --plan PLAN.json [--json]
 gitmoot memory groom --split [--dry-run] [--json]
+gitmoot memory groom --split-revert [--dry-run] [--parent N]... [--since RFC3339] [--json]
 ```
 
 `--split` partitions qualifying multi-story bricks at deterministic byte offsets.
-Strong seams are bold story headers, date-led lines, and PR markers; over-threshold
-content may also split on blank-line paragraph groups. Children are exact parent
-substrings and must concatenate to the parent's trimmed coverage, otherwise the
-operation fails closed to a rewrite flag. The transaction inserts and indexes the
-children, sets the parent `superseded_by` to the first child, removes the parent
-from FTS and cluster membership, and attaches children to the parent's cluster.
-Ownership, author, repo, and scope are inherited; links are enriched later.
-`--dry-run` writes nothing, and subsequent runs are no-ops.
+Strong seams are bold story headers, date-led lines, and PR markers. List items,
+`Why`, and `How to apply` sub-fields are excluded; length alone never creates a
+cut, and status/changelog content is not split. Segments below 200 trimmed bytes
+merge into a neighbor until stable. Children are exact parent substrings and must
+concatenate to the parent's trimmed coverage, otherwise the operation fails closed
+to a rewrite flag. The transaction inserts and indexes the children, sets the
+parent `superseded_by` to the first child, removes the parent from FTS and cluster
+membership, and attaches children to the parent's cluster. Ownership, author,
+repo, and scope are inherited, and rendered children carry `(split from:
+<parent-key>)` context; links are enriched later. `--dry-run` writes nothing, and
+subsequent runs are no-ops.
+
+`--split-revert` defaults to every active groom split; `--parent N` is repeatable
+and `--since RFC3339` filters recent splits. Each parent is restored only when its
+active children in id order still reconstruct the trimmed original exactly.
+Valid children are retired, never deleted, with reason
+`groom-split-revert:<parent-id>`; the parent returns to FTS and inherits the
+lowest-id child's current cluster when one exists. Changed groups are skipped
+whole, repeated runs are no-ops, and `--dry-run` only reports candidates.
 
 `--propose` reads every **active** confirmed memory (retired rows excluded),
 computes the current vault `snapshot_hash` (the same anchor `vault export`/`import`

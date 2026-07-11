@@ -163,6 +163,9 @@ func TestRenderBlockTagsAndBudget(t *testing.T) {
 	if linked := RenderBullet(Entry{Scope: ScopeRepo, Content: "linked neighbor", Linked: true}); !strings.Contains(linked, "[this repo] [linked] linked neighbor") {
 		t.Errorf("linked bullet missing linked tag: %q", linked)
 	}
+	if split := RenderBullet(Entry{Scope: ScopeRepo, Context: "parent-subject", Content: "child detail"}); split != "- [this repo] (split from: parent-subject) child detail" {
+		t.Errorf("split context bullet = %q", split)
+	}
 }
 
 func TestRenderBlockBudgetCaps(t *testing.T) {

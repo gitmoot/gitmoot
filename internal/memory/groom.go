@@ -50,6 +50,10 @@ const (
 // owner; the actual rewrite is deferred to the opt-in LLM pass (P4.3).
 const GroomRewriteThreshold = 1200
 
+// GroomMinChildBytes is the minimum trimmed size of a split child. Smaller
+// segments are merged into a neighbor before labels and keys are derived.
+const GroomMinChildBytes = 200
+
 // groomFirstLineMax caps the first_line preview carried in the plan so a brick's
 // opening paragraph can't bloat the artifact.
 const groomFirstLineMax = 160
@@ -287,52 +291,43 @@ var groomSeamEvidence = regexp.MustCompile(`(?i)\d{4}-\d{2}-\d{2}|PR\s*#?\d+|#\d
 // shipped-work paragraph. Date-led lines reuse groomDateLed below.
 var groomPRMarker = regexp.MustCompile(`(?i)^\s*(?:[-*]\s*)?(?:PR\s*#?\d+\b|#\d+\b|(?:SHIPPED|MERGED|DEPLOYED)\b[^\r\n]*#\d+\b)`)
 
+// groomListItem rejects every Markdown list item before the broader date and PR
+// seam recognizers run. List entries are details within a story, not new stories.
+var groomListItem = regexp.MustCompile(`^\s*(?:[-*+]|\d+[.)])\s`)
+
 type groomTextUnit struct {
 	start int
 	end   int
 }
 
-// SplitBrick partitions one parent at byte offsets only. Under-threshold bricks
-// require at least two strong story seams. Over-threshold bricks may use the
-// same blank-line paragraph units as atomicUnits. In every case at least two
-// substantive segments are required, and any coverage mismatch fails closed by
-// returning nil so the existing rewrite flag remains the only action.
+// SplitBrick partitions one parent at strong-story-seam byte offsets only. In
+// every case at least two substantive segments are required, and any coverage
+// mismatch fails closed by returning nil so the existing rewrite flag remains
+// the only action.
 func SplitBrick(parentKey, content string) []GroomSplitChild {
 	coverage := strings.TrimSpace(content)
 	if coverage == "" {
 		return nil
 	}
-	units := groomParagraphUnits(coverage)
-	strong := groomStrongSeams(coverage)
-	strongCount := len(strong)
-	if strongCount < 2 && len(content) <= GroomRewriteThreshold {
+	if detectStatusChangelog(coverage) {
 		return nil
 	}
-	if strongCount < 2 && len(units) < 2 {
+	strong := groomStrongSeams(coverage)
+	if len(strong) < 2 {
 		return nil
 	}
 
 	cutStarts := []int{0}
-	if strongCount >= 2 {
-		for _, seam := range strong {
-			if seam.start > 0 {
-				cutStarts = append(cutStarts, seam.start)
-			}
-		}
-	}
-	if len(content) > GroomRewriteThreshold {
-		for _, unit := range units[1:] {
-			cutStarts = append(cutStarts, unit.start)
+	for _, seam := range strong {
+		if seam.start > 0 {
+			cutStarts = append(cutStarts, seam.start)
 		}
 	}
 	cutStarts = uniqueSortedOffsets(cutStarts, len(coverage))
 	if len(cutStarts) < 2 {
 		return nil
 	}
-
-	children := make([]GroomSplitChild, 0, len(cutStarts))
-	usedKeys := make(map[string]struct{}, len(cutStarts))
-	substantive := 0
+	segments := make([]groomTextUnit, 0, len(cutStarts))
 	for i, start := range cutStarts {
 		end := len(coverage)
 		if i+1 < len(cutStarts) {
@@ -341,14 +336,25 @@ func SplitBrick(parentKey, content string) []GroomSplitChild {
 		if start < 0 || start >= end || end > len(coverage) {
 			return nil
 		}
-		text := coverage[start:end]
+		segments = append(segments, groomTextUnit{start: start, end: end})
+	}
+	segments = mergeGroomRunts(segments, coverage)
+	if len(segments) < 2 {
+		return nil
+	}
+
+	children := make([]GroomSplitChild, 0, len(segments))
+	usedKeys := make(map[string]struct{}, len(segments))
+	substantive := 0
+	for _, segment := range segments {
+		text := coverage[segment.start:segment.end]
 		if strings.TrimSpace(text) == "" {
 			return nil
 		}
 		if groomSubstantive(text) {
 			substantive++
 		}
-		label := groomFirstNonBlankLine(groomTextUnit{start: start, end: end}, coverage)
+		label := groomFirstNonBlankLine(segment, coverage)
 		base := parentKey + "-" + Slug(groomSeamLabel(label))
 		key := base
 		for n := 2; ; n++ {
@@ -364,6 +370,31 @@ func SplitBrick(parentKey, content string) []GroomSplitChild {
 		return nil
 	}
 	return children
+}
+
+func mergeGroomRunts(segments []groomTextUnit, content string) []groomTextUnit {
+	segments = append([]groomTextUnit(nil), segments...)
+	for len(segments) > 1 {
+		merged := false
+		for i, segment := range segments {
+			if len(strings.TrimSpace(content[segment.start:segment.end])) >= GroomMinChildBytes {
+				continue
+			}
+			if i == 0 {
+				segments[1].start = segment.start
+				segments = segments[1:]
+			} else {
+				segments[i-1].end = segment.end
+				segments = append(segments[:i], segments[i+1:]...)
+			}
+			merged = true
+			break
+		}
+		if !merged {
+			break
+		}
+	}
+	return segments
 }
 
 func groomStrongSeams(content string) []groomTextUnit {
@@ -420,6 +451,13 @@ func groomFirstNonBlankLine(unit groomTextUnit, content string) string {
 }
 
 func isGroomStrongSeam(line string) bool {
+	if groomListItem.MatchString(line) {
+		return false
+	}
+	label := strings.ToLower(groomSeamLabel(line))
+	if label == "why" || label == "how to apply" {
+		return false
+	}
 	if groomBoldHeader.MatchString(line) || groomDateLed.MatchString(line) || groomPRMarker.MatchString(line) {
 		return true
 	}
@@ -439,7 +477,7 @@ func groomSeamLabel(line string) string {
 		// not the whole line.
 		label = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(m[1]), ":"))
 	}
-	return label
+	return strings.TrimSpace(strings.TrimSuffix(label, ":"))
 }
 
 func groomSubstantive(content string) bool {

@@ -3,12 +3,15 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/memory"
 )
@@ -302,8 +305,17 @@ func TestGroomProposeEmptyStore(t *testing.T) {
 func TestGroomSplitDryRunApplyAndRerun(t *testing.T) {
 	home, store := memoryTestHome(t)
 	owner := db.MemoryOwner{Kind: "agent", Ref: "lead"}
-	content := "**First shipped story**\nThe first implementation preserved stable daemon sessions.\n\n**Second shipped story**\nThe second implementation preserved explicit owner review."
+	fixture := func(id string) string {
+		t.Helper()
+		body, err := os.ReadFile(filepath.Join("..", "memory", "testdata", "groom", id+".md"))
+		if err != nil {
+			t.Fatalf("read groom fixture %s: %v", id, err)
+		}
+		return strings.TrimSuffix(string(body), "\n")
+	}
+	content := fixture("80")
 	parentID := seedConfirmed(t, store, owner, "acme/widget", "repo", "session-brick", content)
+	structuredID := seedConfirmed(t, store, owner, "acme/widget", "repo", "structured-round", fixture("152"))
 	ctx := context.Background()
 
 	code, stdout, stderr := runGroom(t, "--home", home, "--split", "--dry-run", "--json")
@@ -321,7 +333,7 @@ func TestGroomSplitDryRunApplyAndRerun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read active rows after dry-run: %v", err)
 	}
-	if len(rows) != 1 || rows[0].ID != parentID {
+	if len(rows) != 2 {
 		t.Fatalf("dry-run changed active rows: %+v", rows)
 	}
 
@@ -341,18 +353,80 @@ func TestGroomSplitDryRunApplyAndRerun(t *testing.T) {
 			t.Fatalf("applied child missing id/key: %+v", child)
 		}
 	}
+	firstKeys := []string{applied.Splits[0].Children[0].Key, applied.Splits[0].Children[1].Key}
+	firstIDs := []int64{applied.Splits[0].Children[0].ID, applied.Splits[0].Children[1].ID}
+
+	code, stdout, stderr = runGroom(t, "--home", home, "--split-revert", "--parent", strconv.FormatInt(parentID, 10), "--dry-run", "--json")
+	if code != 0 {
+		t.Fatalf("split-revert dry-run exit %d: %s", code, stderr)
+	}
+	var revertDry groomSplitRevertOutput
+	if err := json.Unmarshal([]byte(stdout), &revertDry); err != nil {
+		t.Fatalf("parse revert dry-run JSON: %v (%s)", err, stdout)
+	}
+	if !revertDry.DryRun || revertDry.Matched != 1 || len(revertDry.Reverted) != 1 || revertDry.Reverted[0].ParentID != parentID {
+		t.Fatalf("revert dry-run output = %+v", revertDry)
+	}
+
+	code, stdout, stderr = runGroom(t, "--home", home, "--split-revert", "--parent", strconv.FormatInt(parentID, 10), "--json")
+	if code != 0 {
+		t.Fatalf("split-revert exit %d: %s", code, stderr)
+	}
+	var reverted groomSplitRevertOutput
+	if err := json.Unmarshal([]byte(stdout), &reverted); err != nil {
+		t.Fatalf("parse revert JSON: %v (%s)", err, stdout)
+	}
+	if reverted.DryRun || len(reverted.Reverted) != 1 || len(reverted.Skipped) != 0 {
+		t.Fatalf("revert output = %+v", reverted)
+	}
+	matches, err := store.QueryConfirmedMemories(ctx, owner, "acme/widget", `"waveform"`, 10)
+	if err != nil {
+		t.Fatalf("query restored parent: %v", err)
+	}
+	if len(matches) == 0 || matches[0].ID != parentID {
+		t.Fatalf("restored parent is not FTS-searchable: %+v", matches)
+	}
+	raw, err := sql.Open("sqlite", config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("open raw store: %v", err)
+	}
+	defer raw.Close()
+	for _, childID := range firstIDs {
+		var retiredAt, reason string
+		if err := raw.QueryRowContext(ctx, `SELECT retired_at, retired_reason FROM confirmed_memories WHERE id = ?`, childID).Scan(&retiredAt, &reason); err != nil {
+			t.Fatalf("read reverted child %d: %v", childID, err)
+		}
+		if retiredAt == "" || reason != "groom-split-revert:"+strconv.FormatInt(parentID, 10) {
+			t.Fatalf("child %d not retired: retired=%q reason=%q", childID, retiredAt, reason)
+		}
+	}
 
 	code, stdout, stderr = runGroom(t, "--home", home, "--split", "--json")
 	if code != 0 {
 		t.Fatalf("split rerun exit %d: %s", code, stderr)
 	}
-	var rerun groomSplitOutput
-	if err := json.Unmarshal([]byte(stdout), &rerun); err != nil {
-		t.Fatalf("parse rerun JSON: %v (%s)", err, stdout)
+	var resplit groomSplitOutput
+	if err := json.Unmarshal([]byte(stdout), &resplit); err != nil {
+		t.Fatalf("parse re-split JSON: %v (%s)", err, stdout)
 	}
-	if rerun.Detected != 0 || rerun.Applied != 0 || len(rerun.Splits) != 0 {
-		t.Fatalf("rerun must be no-op: %+v", rerun)
+	if resplit.Detected != 1 || resplit.Applied != 1 || len(resplit.Splits) != 1 {
+		t.Fatalf("re-split output = %+v", resplit)
 	}
+	for i, child := range resplit.Splits[0].Children {
+		if child.Key != firstKeys[i] || child.ID == firstIDs[i] {
+			t.Fatalf("re-split child %d = %+v, want key %q and new id", i, child, firstKeys[i])
+		}
+	}
+	active, err := store.ListConfirmedMemoriesForVault(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range active {
+		if row.ID == structuredID {
+			return
+		}
+	}
+	t.Fatalf("structured fact %d was incorrectly split or retired", structuredID)
 }
 
 func TestGroomRejectsAmbiguousFlags(t *testing.T) {
@@ -368,6 +442,12 @@ func TestGroomRejectsAmbiguousFlags(t *testing.T) {
 	}
 	if code, _, _ := runGroom(t, "--home", home, "--propose", "--dry-run"); code != 2 {
 		t.Fatalf("--dry-run without --split should exit 2, got %d", code)
+	}
+	if code, _, _ := runGroom(t, "--home", home, "--split", "--parent", "1"); code != 2 {
+		t.Fatalf("--parent without --split-revert should exit 2, got %d", code)
+	}
+	if code, _, _ := runGroom(t, "--home", home, "--split-revert", "--since", "yesterday"); code != 2 {
+		t.Fatalf("invalid --since should exit 2, got %d", code)
 	}
 	if code, _, stderr := runGroom(t, "--home", home, "--yes"); code != 2 || !strings.Contains(stderr, "--plan") {
 		t.Fatalf("--yes without --plan should exit 2 asking for --plan, got %d %q", code, stderr)

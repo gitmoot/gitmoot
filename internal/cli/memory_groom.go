@@ -9,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/memory"
@@ -131,6 +133,32 @@ type groomSplitOutput struct {
 	Splits   []groomSplitSummary `json:"splits"`
 }
 
+type groomSplitRevertOutput struct {
+	DryRun   bool                         `json:"dry_run"`
+	Matched  int                          `json:"matched"`
+	Reverted []db.GroomSplitReverted      `json:"reverted"`
+	Skipped  []db.GroomSplitRevertSkipped `json:"skipped"`
+}
+
+type groomParentIDs []int64
+
+func (ids *groomParentIDs) String() string {
+	parts := make([]string, 0, len(*ids))
+	for _, id := range *ids {
+		parts = append(parts, strconv.FormatInt(id, 10))
+	}
+	return strings.Join(parts, ",")
+}
+
+func (ids *groomParentIDs) Set(value string) error {
+	id, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil || id <= 0 {
+		return fmt.Errorf("parent must be a positive memory id: %q", value)
+	}
+	*ids = append(*ids, id)
+	return nil
+}
+
 func runMemoryGroom(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("memory groom", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -138,7 +166,11 @@ func runMemoryGroom(args []string, stdout, stderr io.Writer) int {
 	propose := fs.Bool("propose", false, "read confirmed memory, run the detectors, and write a reviewable plan (writes nothing to the store)")
 	yes := fs.Bool("yes", false, "apply a plan's retirements (requires --plan)")
 	split := fs.Bool("split", false, "automatically split qualifying brick memories into lossless children")
-	dryRun := fs.Bool("dry-run", false, "with --split, print qualifying splits without writing")
+	splitRevert := fs.Bool("split-revert", false, "restore parents from active lossless groom-split children")
+	dryRun := fs.Bool("dry-run", false, "with --split or --split-revert, print changes without writing")
+	var parentIDs groomParentIDs
+	fs.Var(&parentIDs, "parent", "with --split-revert, restore only this parent memory id (repeatable)")
+	since := fs.String("since", "", "with --split-revert, restore splits created at or after this RFC3339 timestamp")
 	plan := fs.String("plan", "", "path to a plan artifact produced by --propose (required with --yes)")
 	out := fs.String("out", "", "where --propose writes the plan (default: <home>/evals/groom/groom-<snapshot>.json)")
 	jsonOut := fs.Bool("json", false, "print the summary as JSON")
@@ -146,26 +178,40 @@ func runMemoryGroom(args []string, stdout, stderr io.Writer) int {
 		return memoryFlagExit(err)
 	}
 	modes := 0
-	for _, enabled := range []bool{*propose, *yes, *split} {
+	for _, enabled := range []bool{*propose, *yes, *split, *splitRevert} {
 		if enabled {
 			modes++
 		}
 	}
 	if modes != 1 {
-		fmt.Fprintln(stderr, "memory groom: pass exactly one of --propose, --yes, or --split")
+		fmt.Fprintln(stderr, "memory groom: pass exactly one of --propose, --yes, --split, or --split-revert")
 		printMemoryGroomUsage(stderr)
 		return 2
 	}
-	if *dryRun && !*split {
-		fmt.Fprintln(stderr, "memory groom: --dry-run requires --split")
+	if *dryRun && !*split && !*splitRevert {
+		fmt.Fprintln(stderr, "memory groom: --dry-run requires --split or --split-revert")
 		printMemoryGroomUsage(stderr)
 		return 2
+	}
+	if (len(parentIDs) > 0 || strings.TrimSpace(*since) != "") && !*splitRevert {
+		fmt.Fprintln(stderr, "memory groom: --parent and --since require --split-revert")
+		printMemoryGroomUsage(stderr)
+		return 2
+	}
+	if value := strings.TrimSpace(*since); value != "" {
+		if _, err := time.Parse(time.RFC3339, value); err != nil {
+			fmt.Fprintf(stderr, "memory groom: --since must be RFC3339: %v\n", err)
+			return 2
+		}
 	}
 	if *propose {
 		return runMemoryGroomPropose(*home, *out, *jsonOut, stdout, stderr)
 	}
 	if *split {
 		return runMemoryGroomSplit(*home, *dryRun, *jsonOut, stdout, stderr)
+	}
+	if *splitRevert {
+		return runMemoryGroomSplitRevert(*home, []int64(parentIDs), strings.TrimSpace(*since), *dryRun, *jsonOut, stdout, stderr)
 	}
 	return runMemoryGroomApply(*home, *plan, *jsonOut, stdout, stderr)
 }
@@ -177,6 +223,7 @@ func printMemoryGroomUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot memory groom --propose [--out PLAN.json] [--json]")
 	fmt.Fprintln(w, "  gitmoot memory groom --yes --plan PLAN.json [--json]")
 	fmt.Fprintln(w, "  gitmoot memory groom --split [--dry-run] [--json]")
+	fmt.Fprintln(w, "  gitmoot memory groom --split-revert [--dry-run] [--parent N]... [--since RFC3339] [--json]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "  --propose  read active confirmed memory, run the deterministic detectors")
 	fmt.Fprintln(w, "             (status/changelog/ToC snapshots, bare to-do lists, exact duplicates,")
@@ -189,7 +236,9 @@ func printMemoryGroomUsage(w io.Writer) {
 	fmt.Fprintln(w, "             Content is never edited or rewritten.")
 	fmt.Fprintln(w, "  --split    automatically split qualifying multi-story bricks at deterministic")
 	fmt.Fprintln(w, "             seams. Children are exact substrings; the parent is superseded.")
-	fmt.Fprintln(w, "  --dry-run  with --split, print what would split without touching the store.")
+	fmt.Fprintln(w, "  --split-revert  retire intact split children and restore their superseded parent.")
+	fmt.Fprintln(w, "                  Defaults to all active groom splits; --parent and --since filter.")
+	fmt.Fprintln(w, "  --dry-run  with --split or --split-revert, print changes without touching the store.")
 }
 
 func runMemoryGroomSplit(home string, dryRun, jsonOut bool, stdout, stderr io.Writer) int {
@@ -281,6 +330,57 @@ func runMemoryGroomSplit(home string, dryRun, jsonOut bool, stdout, stderr io.Wr
 			}
 		}
 		fmt.Fprintln(stdout)
+	}
+	return 0
+}
+
+func runMemoryGroomSplitRevert(home string, parentIDs []int64, since string, dryRun, jsonOut bool, stdout, stderr io.Writer) int {
+	ctx := context.Background()
+	var result db.GroomSplitRevertResult
+	run := func(store *db.Store) error {
+		var err error
+		result, err = store.RevertGroomSplits(ctx, db.GroomSplitRevertOptions{
+			ParentIDs: parentIDs,
+			Since:     since,
+			DryRun:    dryRun,
+		})
+		return err
+	}
+	var err error
+	if dryRun {
+		err = withReadOnlyStore(home, run)
+	} else {
+		err = withStore(home, run)
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "memory groom: split-revert: %v\n", err)
+		return 1
+	}
+	output := groomSplitRevertOutput{
+		DryRun: dryRun, Matched: len(result.Reverted) + len(result.Skipped),
+		Reverted: result.Reverted, Skipped: result.Skipped,
+	}
+	if jsonOut {
+		if err := writeJSON(stdout, output); err != nil {
+			fmt.Fprintf(stderr, "memory groom: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	verb := "reverted"
+	if dryRun {
+		verb = "would revert"
+	}
+	fmt.Fprintf(stdout, "%s %d groom split(s); skipped %d\n", verb, len(result.Reverted), len(result.Skipped))
+	for _, item := range result.Reverted {
+		fmt.Fprintf(stdout, "  parent %d <- children", item.ParentID)
+		for _, childID := range item.ChildIDs {
+			fmt.Fprintf(stdout, " %d", childID)
+		}
+		fmt.Fprintln(stdout)
+	}
+	for _, item := range result.Skipped {
+		fmt.Fprintf(stdout, "  skipped parent %d: %s\n", item.ParentID, item.Reason)
 	}
 	return 0
 }
