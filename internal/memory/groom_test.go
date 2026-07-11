@@ -522,3 +522,66 @@ func TestSplitBrickLiveRegressionFixtures(t *testing.T) {
 		}
 	}
 }
+
+func TestDetectGroomLLMCandidatesLargestFirst(t *testing.T) {
+	long := func(word string, n int) string { return strings.Repeat(word+" continuous prose. ", n) }
+	cands := []GroomCandidate{
+		{ID: 4, Key: "short", Content: "short keeper"},
+		{ID: 3, Key: "medium", Content: long("medium", 75)},
+		{ID: 2, Key: "largest", Content: long("largest", 100)},
+		{ID: 1, Key: "same-size-lower-id", Content: long("largest", 100)},
+		{ID: 5, Key: "deterministic", Content: "**First story (PR #1)**\n" + long("first", 40) + "\n**Second story (PR #2)**\n" + long("second", 40)},
+		{ID: 6, Key: "status", Content: "2026-07-11 shipped " + long("status", 25) + "\n2026-07-10 shipped " + long("status", 25) + "\n2026-07-09 shipped " + long("status", 25)},
+	}
+	got := DetectGroomLLMCandidates(cands)
+	if len(got) != 3 || got[0].ID != 1 || got[1].ID != 2 || got[2].ID != 3 {
+		t.Fatalf("LLM candidates = %+v, want ids 1,2,3 largest-first with id tie-break", got)
+	}
+	for _, candidate := range got {
+		if candidate.ContentHash != GroomContentHash(candidate.Content) || candidate.Bytes != len(strings.TrimSpace(candidate.Content)) {
+			t.Fatalf("candidate metadata = %+v", candidate)
+		}
+	}
+	if GroomContentHash("  same body\n") != GroomContentHash("same body") {
+		t.Fatal("content hash must use trimmed coverage")
+	}
+}
+
+func TestEnumerateGroomLLMBoundariesExcludesFencesAndLists(t *testing.T) {
+	content := "Intro paragraph.\n\nSecond paragraph starts here.\nPR #842 evidence line.\n\n- list item is not safe\n\n```go\ninside fence\n\nPR #999 not safe\n```\n\nFinal paragraph starts here."
+	menu := EnumerateGroomLLMBoundaries(content)
+	want := []struct {
+		id     string
+		offset int
+		text   string
+	}{
+		{id: "c001", offset: strings.Index(content, "Second paragraph"), text: "Second paragraph starts here."},
+		{id: "c002", offset: strings.Index(content, "PR #842"), text: "PR #842 evidence line."},
+		{id: "c003", offset: strings.Index(content, "Final paragraph"), text: "Final paragraph starts here."},
+	}
+	if len(menu) != len(want) {
+		t.Fatalf("menu = %+v, want %+v", menu, want)
+	}
+	for i := range want {
+		if menu[i].ID != want[i].id || menu[i].Offset != want[i].offset || menu[i].Text != want[i].text {
+			t.Fatalf("menu[%d] = %+v, want %+v", i, menu[i], want[i])
+		}
+		if content[menu[i].Offset:menu[i].Offset+len(menu[i].Text)] != menu[i].Text {
+			t.Fatalf("menu[%d] offset does not map to echoed text", i)
+		}
+	}
+}
+
+func TestBuildGroomSplitFromOffsetsUsesDeterministicTail(t *testing.T) {
+	first := strings.Repeat("first substantive segment. ", 12)
+	second := strings.Repeat("second substantive segment. ", 12)
+	content := first + "\n\nSecond subject\n" + second
+	offset := strings.Index(content, "Second subject")
+	children := BuildGroomSplitFromOffsets("parent", content, []int{offset})
+	if len(children) != 2 || concatGroomSplitChildren(children) != strings.TrimSpace(content) {
+		t.Fatalf("offset split = %+v", children)
+	}
+	if got := BuildGroomSplitFromOffsets("parent", content, []int{1}); got != nil {
+		t.Fatalf("runt-only cut should merge to one segment: %+v", got)
+	}
+}

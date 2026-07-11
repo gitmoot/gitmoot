@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -13,8 +14,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/memory"
+	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
 // memory groom (#737 P4.2, #832) — automatic lossless brick splitting plus the
@@ -126,12 +129,37 @@ type groomSplitSummary struct {
 }
 
 type groomSplitOutput struct {
-	DryRun   bool                `json:"dry_run"`
-	Detected int                 `json:"detected"`
-	Applied  int                 `json:"applied"`
-	Skipped  []int64             `json:"skipped"`
-	Splits   []groomSplitSummary `json:"splits"`
+	DryRun   bool                 `json:"dry_run"`
+	Detected int                  `json:"detected"`
+	Applied  int                  `json:"applied"`
+	Skipped  []int64              `json:"skipped"`
+	Splits   []groomSplitSummary  `json:"splits"`
+	LLM      []groomSplitLLMEntry `json:"llm,omitempty"`
 }
+
+type groomSplitLLMEntry struct {
+	ParentID       int64    `json:"parent_id"`
+	ContentHash    string   `json:"content_hash"`
+	Model          string   `json:"model"`
+	Decision       string   `json:"decision"`
+	CutIDs         []string `json:"cut_ids"`
+	FallbackReason string   `json:"fallback_reason"`
+	Cached         bool     `json:"cached"`
+}
+
+type groomLLMCut struct {
+	ID   string `json:"id"`
+	Text string `json:"text"`
+}
+
+type groomLLMReply struct {
+	Split bool          `json:"split"`
+	Cuts  []groomLLMCut `json:"cuts"`
+}
+
+type groomLLMDeliverFunc func(context.Context, runtime.Agent, string) (string, error)
+
+var memoryGroomLLMDeliver groomLLMDeliverFunc = deliverOneShotRuntimePrompt
 
 type groomSplitRevertOutput struct {
 	DryRun   bool                         `json:"dry_run"`
@@ -235,7 +263,8 @@ func printMemoryGroomUsage(w io.Writer) {
 	fmt.Fprintln(w, "             snapshot and ABORTS AS STALE if the store changed since --propose.")
 	fmt.Fprintln(w, "             Content is never edited or rewritten.")
 	fmt.Fprintln(w, "  --split    automatically split qualifying multi-story bricks at deterministic")
-	fmt.Fprintln(w, "             seams. Children are exact substrings; the parent is superseded.")
+	fmt.Fprintln(w, "             seams, then optional host-bounded LLM cuts. Children remain exact")
+	fmt.Fprintln(w, "             substrings; the parent is superseded.")
 	fmt.Fprintln(w, "  --split-revert  retire intact split children and restore their superseded parent.")
 	fmt.Fprintln(w, "                  Defaults to all active groom splits; --parent and --since filter.")
 	fmt.Fprintln(w, "  --dry-run  with --split or --split-revert, print changes without touching the store.")
@@ -245,7 +274,12 @@ func runMemoryGroomSplit(home string, dryRun, jsonOut bool, stdout, stderr io.Wr
 	ctx := context.Background()
 	var splits []memory.GroomSplit
 	var applied db.GroomSplitResult
-	run := func(store *db.Store) error {
+	var llmEntries []groomSplitLLMEntry
+	run := func(paths config.Paths, store *db.Store) error {
+		settings, err := config.LoadMemorySettings(paths)
+		if err != nil {
+			return err
+		}
 		rows, err := store.ListConfirmedMemoriesForVault(ctx, "")
 		if err != nil {
 			return err
@@ -259,6 +293,14 @@ func runMemoryGroomSplit(home string, dryRun, jsonOut bool, stdout, stderr io.Wr
 			})
 		}
 		splits = memory.DetectGroomSplits(cands)
+		if settings.GroomSplitLLM {
+			llmSplits, entries, err := runMemoryGroomLLMSplits(ctx, store, settings, cands, splits, dryRun)
+			if err != nil {
+				return err
+			}
+			splits = append(splits, llmSplits...)
+			llmEntries = entries
+		}
 		if dryRun || len(splits) == 0 {
 			return nil
 		}
@@ -275,9 +317,13 @@ func runMemoryGroomSplit(home string, dryRun, jsonOut bool, stdout, stderr io.Wr
 	}
 	var err error
 	if dryRun {
-		err = withReadOnlyStore(home, run)
+		var paths config.Paths
+		paths, err = pathsFromFlag(home)
+		if err == nil {
+			err = withReadOnlyStore(home, func(store *db.Store) error { return run(paths, store) })
+		}
 	} else {
-		err = withStore(home, run)
+		err = withStoreAndPaths(home, run)
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "memory groom: split: %v\n", err)
@@ -290,7 +336,7 @@ func runMemoryGroomSplit(home string, dryRun, jsonOut bool, stdout, stderr io.Wr
 	}
 	out := groomSplitOutput{
 		DryRun: dryRun, Detected: len(splits), Applied: len(applied.Applied), Skipped: applied.Skipped,
-		Splits: make([]groomSplitSummary, 0, len(splits)),
+		Splits: make([]groomSplitSummary, 0, len(splits)), LLM: llmEntries,
 	}
 	for _, split := range splits {
 		summary := groomSplitSummary{ParentID: split.ParentID, ParentKey: split.ParentKey}
@@ -332,6 +378,308 @@ func runMemoryGroomSplit(home string, dryRun, jsonOut bool, stdout, stderr io.Wr
 		fmt.Fprintln(stdout)
 	}
 	return 0
+}
+
+func runMemoryGroomLLMSplits(ctx context.Context, store *db.Store, settings config.MemorySettings, cands []memory.GroomCandidate, deterministic []memory.GroomSplit, dryRun bool) ([]memory.GroomSplit, []groomSplitLLMEntry, error) {
+	candidates := memory.DetectGroomLLMCandidates(cands)
+	modelLabel := groomLLMModelLabel(settings.GroomSplitLLMRuntime, settings.GroomSplitLLMModel)
+	var splits []memory.GroomSplit
+	var entries []groomSplitLLMEntry
+	calls := 0
+	for _, candidate := range candidates {
+		cached, found, err := store.GetGroomLLMVerdict(ctx, candidate.ContentHash)
+		if err != nil {
+			return nil, nil, err
+		}
+		if found {
+			entry := groomSplitLLMEntry{
+				ParentID: candidate.ID, ContentHash: candidate.ContentHash, Model: cached.Model,
+				Decision: cached.Verdict, CutIDs: []string{}, Cached: true,
+			}
+			if cached.Verdict == "no_split" {
+				entries = append(entries, entry)
+				continue
+			}
+			menu := memory.EnumerateGroomLLMBoundaries(candidate.Content)
+			cuts, err := decodeGroomLLMCuts(cached.CutsJSON)
+			if err != nil {
+				entry.Decision = "fallback"
+				entry.FallbackReason = "cached cuts: " + err.Error()
+				entries = append(entries, entry)
+				continue
+			}
+			cutIDs, offsets, err := validateGroomLLMReply(groomLLMReply{Split: true, Cuts: cuts}, menu)
+			if err != nil {
+				entry.Decision = "fallback"
+				entry.FallbackReason = "cached cuts: " + err.Error()
+				entries = append(entries, entry)
+				continue
+			}
+			children := memory.BuildGroomSplitFromOffsets(candidate.Key, candidate.Content, offsets)
+			if len(children) < 2 {
+				entry.Decision = "fallback"
+				entry.FallbackReason = "cached cuts failed lossless split validation"
+				entries = append(entries, entry)
+				continue
+			}
+			reserved := append(append([]memory.GroomSplit(nil), deterministic...), splits...)
+			children = memory.AllocateGroomSplitChildKeys(cands, reserved, candidate.GroomCandidate, children)
+			splits = append(splits, memory.GroomSplit{
+				ParentID: candidate.ID, ParentKey: candidate.Key, ExpectedUpdatedAt: candidate.UpdatedAt, Children: children,
+			})
+			entry.CutIDs = cutIDs
+			entries = append(entries, entry)
+			continue
+		}
+
+		if calls >= settings.GroomSplitLLMMaxPerRun {
+			continue
+		}
+		entry := groomSplitLLMEntry{
+			ParentID: candidate.ID, ContentHash: candidate.ContentHash, Model: modelLabel, CutIDs: []string{}, Cached: false,
+		}
+		if candidate.Bytes > memory.GroomLLMMaxContentBytes {
+			entry.Decision = "skipped"
+			entry.FallbackReason = fmt.Sprintf("content exceeds %d-byte limit", memory.GroomLLMMaxContentBytes)
+			entries = append(entries, entry)
+			continue
+		}
+		menu := memory.EnumerateGroomLLMBoundaries(candidate.Content)
+		if len(menu) == 0 {
+			entry.Decision = "fallback"
+			entry.FallbackReason = "no safe candidate boundaries"
+			entries = append(entries, entry)
+			continue
+		}
+		calls++
+		agent := groomLLMRuntimeAgent(ctx, store, settings, candidate.GroomCandidate)
+		callCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		raw, deliverErr := memoryGroomLLMDeliver(callCtx, agent, groomLLMPrompt(candidate.Key, candidate.Content, menu))
+		cancel()
+		if deliverErr != nil {
+			entry.Decision = "fallback"
+			entry.FallbackReason = "runtime delivery: " + deliverErr.Error()
+			entries = append(entries, entry)
+			continue
+		}
+		reply, err := parseGroomLLMReply(raw)
+		if err != nil {
+			entry.Decision = "fallback"
+			entry.FallbackReason = "invalid reply: " + err.Error()
+			entries = append(entries, entry)
+			continue
+		}
+		cutIDs, offsets, err := validateGroomLLMReply(reply, menu)
+		if err != nil {
+			entry.Decision = "fallback"
+			entry.FallbackReason = "invalid cuts: " + err.Error()
+			entries = append(entries, entry)
+			continue
+		}
+		if !reply.Split {
+			entry.Decision = "no_split"
+			if !dryRun {
+				if err := store.StoreGroomLLMVerdict(ctx, db.GroomLLMVerdict{
+					ContentHash: candidate.ContentHash, Verdict: "no_split", Model: modelLabel,
+				}); err != nil {
+					return nil, nil, err
+				}
+			}
+			entries = append(entries, entry)
+			continue
+		}
+		children := memory.BuildGroomSplitFromOffsets(candidate.Key, candidate.Content, offsets)
+		if len(children) < 2 {
+			entry.Decision = "fallback"
+			entry.FallbackReason = "selected cuts failed lossless split validation"
+			entries = append(entries, entry)
+			continue
+		}
+		reserved := append(append([]memory.GroomSplit(nil), deterministic...), splits...)
+		children = memory.AllocateGroomSplitChildKeys(cands, reserved, candidate.GroomCandidate, children)
+		if !dryRun {
+			cutsJSON, err := json.Marshal(reply.Cuts)
+			if err != nil {
+				return nil, nil, err
+			}
+			if err := store.StoreGroomLLMVerdict(ctx, db.GroomLLMVerdict{
+				ContentHash: candidate.ContentHash, Verdict: "split", CutsJSON: string(cutsJSON), Model: modelLabel,
+			}); err != nil {
+				return nil, nil, err
+			}
+		}
+		splits = append(splits, memory.GroomSplit{
+			ParentID: candidate.ID, ParentKey: candidate.Key, ExpectedUpdatedAt: candidate.UpdatedAt, Children: children,
+		})
+		entry.Decision = "split"
+		entry.CutIDs = cutIDs
+		entries = append(entries, entry)
+	}
+	return splits, entries, nil
+}
+
+func groomLLMRuntimeAgent(ctx context.Context, store *db.Store, settings config.MemorySettings, candidate memory.GroomCandidate) runtime.Agent {
+	workingDir, _ := os.Getwd()
+	if strings.TrimSpace(candidate.Repo) != "" {
+		if repo, err := store.GetRepo(ctx, candidate.Repo); err == nil && strings.TrimSpace(repo.CheckoutPath) != "" {
+			workingDir = repo.CheckoutPath
+		}
+	}
+	return runtime.Agent{
+		Name: "memory-groom-llm-" + strconv.FormatInt(candidate.ID, 10), Role: "ask",
+		Runtime: settings.GroomSplitLLMRuntime, RuntimeRef: "", RepoScope: candidate.Repo,
+		WorkingDir: workingDir, Capabilities: []string{"ask"}, AutonomyPolicy: runtime.AutonomyPolicyReadOnly,
+		Model: settings.GroomSplitLLMModel, SingleUseSession: true,
+	}
+}
+
+func groomLLMModelLabel(runtimeName, model string) string {
+	if strings.TrimSpace(model) == "" {
+		return strings.TrimSpace(runtimeName)
+	}
+	return strings.TrimSpace(runtimeName) + "/" + strings.TrimSpace(model)
+}
+
+func groomLLMPrompt(key, content string, menu []memory.GroomLLMBoundary) string {
+	var b strings.Builder
+	b.WriteString("Choose whether this memory contains independent stories that should be split.\n")
+	b.WriteString("Return exactly one JSON object with no markdown: {\"split\":bool,\"cuts\":[{\"id\":\"cNNN\",\"text\":\"exact echoed line\"}]}.\n")
+	b.WriteString("For keep, return split=false and cuts=[]. For split, choose only ids from the host menu and echo each line exactly. Never rewrite content.\n\n")
+	b.WriteString("Memory key: ")
+	b.WriteString(key)
+	b.WriteString("\nCandidate boundaries:\n")
+	for _, boundary := range menu {
+		b.WriteString(boundary.ID)
+		b.WriteString(" ")
+		b.WriteString(strconv.Quote(boundary.Text))
+		b.WriteByte('\n')
+	}
+	b.WriteString("\nContent (verbatim):\n<content>\n")
+	b.WriteString(content)
+	b.WriteString("\n</content>")
+	return b.String()
+}
+
+func parseGroomLLMReply(raw string) (groomLLMReply, error) {
+	object, err := firstJSONObject(raw)
+	if err != nil {
+		return groomLLMReply{}, err
+	}
+	var wire struct {
+		Split *bool          `json:"split"`
+		Cuts  *[]groomLLMCut `json:"cuts"`
+	}
+	decoder := json.NewDecoder(bytes.NewBufferString(object))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return groomLLMReply{}, err
+	}
+	if wire.Split == nil || wire.Cuts == nil {
+		return groomLLMReply{}, fmt.Errorf("reply must include split and cuts")
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return groomLLMReply{}, fmt.Errorf("reply contains trailing JSON values")
+	}
+	return groomLLMReply{Split: *wire.Split, Cuts: *wire.Cuts}, nil
+}
+
+func decodeGroomLLMCuts(raw string) ([]groomLLMCut, error) {
+	var cuts []groomLLMCut
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&cuts); err != nil {
+		return nil, err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("cuts contain trailing JSON values")
+	}
+	return cuts, nil
+}
+
+func firstJSONObject(raw string) (string, error) {
+	start := -1
+	depth := 0
+	inString := false
+	escaped := false
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if start < 0 {
+			if ch == '{' {
+				start = i
+				depth = 1
+			}
+			continue
+		}
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+			} else if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return raw[start : i+1], nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no complete JSON object found")
+}
+
+func validateGroomLLMReply(reply groomLLMReply, menu []memory.GroomLLMBoundary) ([]string, []int, error) {
+	if !reply.Split {
+		if len(reply.Cuts) != 0 {
+			return nil, nil, fmt.Errorf("split=false requires empty cuts")
+		}
+		return nil, nil, nil
+	}
+	if len(reply.Cuts) == 0 {
+		return nil, nil, fmt.Errorf("split=true requires at least one cut")
+	}
+	byID := make(map[string]memory.GroomLLMBoundary, len(menu))
+	for _, boundary := range menu {
+		byID[boundary.ID] = boundary
+	}
+	type selected struct {
+		id     string
+		offset int
+	}
+	chosen := make([]selected, 0, len(reply.Cuts))
+	seen := make(map[string]struct{}, len(reply.Cuts))
+	for _, cut := range reply.Cuts {
+		boundary, ok := byID[cut.ID]
+		if !ok {
+			return nil, nil, fmt.Errorf("unknown cut id %q", cut.ID)
+		}
+		if _, duplicate := seen[cut.ID]; duplicate {
+			return nil, nil, fmt.Errorf("duplicate cut id %q", cut.ID)
+		}
+		seen[cut.ID] = struct{}{}
+		if cut.Text != boundary.Text {
+			return nil, nil, fmt.Errorf("cut %s echoed %q, want %q", cut.ID, cut.Text, boundary.Text)
+		}
+		chosen = append(chosen, selected{id: cut.ID, offset: boundary.Offset})
+	}
+	sort.Slice(chosen, func(i, j int) bool { return chosen[i].offset < chosen[j].offset })
+	ids := make([]string, len(chosen))
+	offsets := make([]int, len(chosen))
+	for i, cut := range chosen {
+		ids[i], offsets[i] = cut.id, cut.offset
+	}
+	return ids, offsets, nil
 }
 
 func runMemoryGroomSplitRevert(home string, parentIDs []int64, since string, dryRun, jsonOut bool, stdout, stderr io.Writer) int {

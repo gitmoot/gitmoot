@@ -1710,6 +1710,10 @@ distill_successes = false   # stage deterministic success observations (#781)
 distill_max_per_job = 3     # hard cap on distilled observations per job
 distill_all_jobs = false    # when true, distill runs for every job, not only enrolled agents
 ingest_auto_confirm = false # when true, ingest/chat remember confirm to the authoring agent private pool only
+groom_split_llm = false     # default-off LLM boundary chooser after deterministic splitting
+groom_split_llm_runtime = "codex"
+groom_split_llm_model = "" # empty uses the runtime default
+groom_split_llm_max_per_run = 5
 ```
 
 All `[memory]` keys are read **per tick**. Flipping `distill_at_terminal`,
@@ -2048,8 +2052,23 @@ ingest_sweep = "nightly"
 groom_propose = "nightly"
 ```
 
-`[memory].groom_split_llm = false` is parsed as the default-off Phase 2 gate;
-this release does not implement the lossy LLM atomizer path.
+`[memory].groom_split_llm = false` is the sole Phase 2 enable gate. When enabled,
+`memory groom --split` sends only over-threshold bricks left unsplit by the
+deterministic pass to isolated one-shot runtime sessions. The host supplies a
+closed menu of blank-line/strong-seam boundaries outside lists and fenced code;
+the model can only choose menu ids or keep the brick. Gitmoot validates strict
+JSON plus exact echoed lines, maps ids back to host byte offsets, and runs the
+same runt merge, substantive-child, coverage, store re-check, and CAS path as
+deterministic splits. The model never rewrites content.
+
+`groom_split_llm_runtime` defaults to `codex` (`codex`, `claude`, or `kimi`),
+`groom_split_llm_model = ""` uses that runtime's default model, and
+`groom_split_llm_max_per_run = 5` caps one-shot calls. Bricks over 8192 bytes are
+reported and skipped, never truncated. Valid split and no-split verdicts are
+cached by SHA-256 of trimmed content, so unchanged bricks are not billed again;
+cached split cuts are revalidated through the full lossless tail. The existing
+pipeline artifact `groom-split.json` includes per-brick decision, cut ids, model,
+cache status, and any fail-closed fallback reason.
 
 ```sh
 gitmoot pipeline run memory-groom-propose

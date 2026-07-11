@@ -127,7 +127,12 @@ func TestSaveHeartbeatClearsRuntimeOnResaveWithoutOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read config: %v", err)
 	}
-	if strings.Contains(string(raw), "runtime =") {
+	text := string(raw)
+	section := strings.Index(text, "[agents.builder.heartbeats.nightly]")
+	if section < 0 {
+		t.Fatalf("saved heartbeat section missing:\n%s", text)
+	}
+	if strings.Contains(text[section:], "runtime =") {
 		t.Fatalf("re-save without --runtime must clear the prior override, got:\n%s", string(raw))
 	}
 	got, err := LoadHeartbeats(paths)

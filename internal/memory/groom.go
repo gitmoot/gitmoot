@@ -11,12 +11,14 @@ package memory
 // artifact, applying retirements in one transaction) lives in the cli package.
 //
 // P4.2 retirement/rekey/cross-pool actions remain owner-gated proposals. P4.3
-// adds one automatic operation: a deterministic, lossless brick split whose
-// children are exact source substrings. Lossy LLM rewriting remains deferred.
+// adds automatic lossless brick splitting: deterministic seams first, then an
+// optional LLM choosing only from host-enumerated byte boundaries. Children are
+// always exact source substrings; model-authored rewriting remains deferred.
 
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"regexp"
 	"sort"
 	"strconv"
@@ -53,6 +55,10 @@ const GroomRewriteThreshold = 1200
 // GroomMinChildBytes is the minimum trimmed size of a split child. Smaller
 // segments are merged into a neighbor before labels and keys are derived.
 const GroomMinChildBytes = 200
+
+// GroomLLMMaxContentBytes is the hard host-side limit for one Phase-2 prompt.
+// Oversize bricks are reported and skipped, never truncated.
+const GroomLLMMaxContentBytes = 8192
 
 // groomFirstLineMax caps the first_line preview carried in the plan so a brick's
 // opening paragraph can't bloat the artifact.
@@ -112,6 +118,22 @@ type GroomSplit struct {
 	ParentKey         string
 	ExpectedUpdatedAt string
 	Children          []GroomSplitChild
+}
+
+// GroomLLMCandidate is one active, over-threshold brick left unsplit by the
+// deterministic pass. Candidates are ordered largest-first, then by parent id.
+type GroomLLMCandidate struct {
+	GroomCandidate
+	ContentHash string
+	Bytes       int
+}
+
+// GroomLLMBoundary is one host-approved cut location. Text is the exact source
+// line without its line ending and is echoed back by the model contract.
+type GroomLLMBoundary struct {
+	ID     string `json:"id"`
+	Offset int    `json:"-"`
+	Text   string `json:"text"`
 }
 
 // GroomStats is the roll-up carried in the plan artifact. Rekeys and CrossPool
@@ -267,6 +289,41 @@ func DetectGroomSplits(cands []GroomCandidate) []GroomSplit {
 	return out
 }
 
+// DetectGroomLLMCandidates returns the active bricks eligible for Phase 2 before
+// cache filtering and the per-run cap. Deterministically splittable bricks and
+// status/changelog content never enter the LLM pool.
+func DetectGroomLLMCandidates(cands []GroomCandidate) []GroomLLMCandidate {
+	var out []GroomLLMCandidate
+	for _, candidate := range cands {
+		coverage := strings.TrimSpace(candidate.Content)
+		if len(coverage) <= GroomRewriteThreshold || detectStatusChangelog(coverage) {
+			continue
+		}
+		if len(SplitBrick(candidate.Key, candidate.Content)) != 0 {
+			continue
+		}
+		out = append(out, GroomLLMCandidate{
+			GroomCandidate: candidate,
+			ContentHash:    GroomContentHash(candidate.Content),
+			Bytes:          len(coverage),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Bytes != out[j].Bytes {
+			return out[i].Bytes > out[j].Bytes
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+// GroomContentHash is the verdict-cache key: sha256 of the exact trimmed
+// coverage used by both split validation layers.
+func GroomContentHash(content string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(content)))
+	return hex.EncodeToString(sum[:])
+}
+
 func groomSplitDomain(c GroomCandidate) string {
 	return strings.Join([]string{c.OwnerKind, c.OwnerRef, c.OwnerVersion, c.Repo, c.Scope}, "\x00")
 }
@@ -323,6 +380,21 @@ func SplitBrick(parentKey, content string) []GroomSplitChild {
 			cutStarts = append(cutStarts, seam.start)
 		}
 	}
+	return buildGroomSplitChildren(parentKey, coverage, cutStarts)
+}
+
+// BuildGroomSplitFromOffsets runs the same lossless validation tail as
+// SplitBrick over host-precomputed cut offsets selected by the LLM contract.
+func BuildGroomSplitFromOffsets(parentKey, content string, offsets []int) []GroomSplitChild {
+	coverage := strings.TrimSpace(content)
+	if coverage == "" {
+		return nil
+	}
+	cutStarts := append([]int{0}, offsets...)
+	return buildGroomSplitChildren(parentKey, coverage, cutStarts)
+}
+
+func buildGroomSplitChildren(parentKey, coverage string, cutStarts []int) []GroomSplitChild {
 	cutStarts = uniqueSortedOffsets(cutStarts, len(coverage))
 	if len(cutStarts) < 2 {
 		return nil
@@ -370,6 +442,106 @@ func SplitBrick(parentKey, content string) []GroomSplitChild {
 		return nil
 	}
 	return children
+}
+
+// AllocateGroomSplitChildKeys reserves collision-safe keys for one LLM split
+// after the deterministic plans. It uses the same owner/repo/scope domain and
+// ordinal policy as DetectGroomSplits.
+func AllocateGroomSplitChildKeys(cands []GroomCandidate, deterministic []GroomSplit, candidate GroomCandidate, children []GroomSplitChild) []GroomSplitChild {
+	used := make(map[string]struct{})
+	byID := make(map[int64]GroomCandidate, len(cands))
+	domain := groomSplitDomain(candidate)
+	for _, row := range cands {
+		byID[row.ID] = row
+		if groomSplitDomain(row) == domain {
+			used[row.Key] = struct{}{}
+		}
+	}
+	for _, split := range deterministic {
+		if parent, ok := byID[split.ParentID]; ok && groomSplitDomain(parent) == domain {
+			for _, child := range split.Children {
+				used[child.Key] = struct{}{}
+			}
+		}
+	}
+	out := append([]GroomSplitChild(nil), children...)
+	for i := range out {
+		base := out[i].Key
+		key := base
+		for n := 2; ; n++ {
+			if _, exists := used[key]; !exists {
+				break
+			}
+			key = base + "-" + strconv.Itoa(n)
+		}
+		out[i].Key = key
+		used[key] = struct{}{}
+	}
+	return out
+}
+
+// EnumerateGroomLLMBoundaries builds the closed cut menu from blank-line
+// paragraph starts plus strong-seam line starts. Offset zero, fenced-code lines,
+// and Markdown list-item lines are excluded.
+func EnumerateGroomLLMBoundaries(content string) []GroomLLMBoundary {
+	coverage := strings.TrimSpace(content)
+	if coverage == "" {
+		return nil
+	}
+	offsets := make([]int, 0)
+	for _, unit := range groomParagraphUnits(coverage) {
+		if unit.start > 0 {
+			offsets = append(offsets, unit.start)
+		}
+	}
+	for _, seam := range groomStrongSeams(coverage) {
+		if seam.start > 0 {
+			offsets = append(offsets, seam.start)
+		}
+	}
+	offsets = uniqueSortedOffsets(offsets, len(coverage))
+
+	type lineInfo struct {
+		text   string
+		fenced bool
+	}
+	lines := make(map[int]lineInfo)
+	offset := 0
+	fence := byte(0)
+	for _, withNewline := range strings.SplitAfter(coverage, "\n") {
+		line := strings.TrimSuffix(withNewline, "\n")
+		line = strings.TrimSuffix(line, "\r")
+		trimmed := strings.TrimSpace(line)
+		marker := byte(0)
+		if strings.HasPrefix(trimmed, "```") {
+			marker = '`'
+		} else if strings.HasPrefix(trimmed, "~~~") {
+			marker = '~'
+		}
+		lines[offset] = lineInfo{text: line, fenced: fence != 0 || marker != 0}
+		if marker != 0 {
+			if fence == 0 {
+				fence = marker
+			} else if fence == marker {
+				fence = 0
+			}
+		}
+		offset += len(withNewline)
+	}
+
+	out := make([]GroomLLMBoundary, 0, len(offsets))
+	for _, candidateOffset := range offsets {
+		line, ok := lines[candidateOffset]
+		if !ok || line.fenced || groomListItem.MatchString(line.text) {
+			continue
+		}
+		out = append(out, GroomLLMBoundary{
+			ID:     fmt.Sprintf("c%03d", len(out)+1),
+			Offset: candidateOffset,
+			Text:   line.text,
+		})
+	}
+	return out
 }
 
 func mergeGroomRunts(segments []groomTextUnit, content string) []groomTextUnit {

@@ -8561,4 +8561,15 @@ ALTER TABLE repos ADD COLUMN primary_checkout_path TEXT NOT NULL DEFAULT '';
 	`
 ALTER TABLE confirmed_memories ADD COLUMN context TEXT NOT NULL DEFAULT '';
 	`,
+	// #842 Phase 2 LLM split verdict cache. Content hashes pin the exact trimmed
+	// byte map, so both keep and split decisions replay without another model call.
+	`
+CREATE TABLE groom_llm_verdicts (
+	content_hash TEXT PRIMARY KEY,
+	verdict TEXT NOT NULL,
+	cuts_json TEXT NOT NULL DEFAULT '',
+	model TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+	`,
 }

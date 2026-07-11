@@ -139,6 +139,9 @@ var skillOptABJudgeAuthedRuntimes = func(repoScope string) reviewAuthedRuntimes 
 // its resume_hint) untouched. A non-empty ref (the manual `skillopt ab` path)
 // keeps its existing resume behavior unchanged.
 func realSkillOptABDeliver(ctx context.Context, agent runtime.Agent, prompt string) (string, error) {
+	if strings.TrimSpace(agent.RuntimeRef) == "" {
+		return deliverOneShotRuntimePrompt(ctx, agent, prompt)
+	}
 	// Adapter Dir must be a real filesystem checkout, NOT the "owner/repo"
 	// RepoScope form. Callers that resolved the repo to its registered
 	// db.Repo.CheckoutPath set agent.WorkingDir; prefer it so real (non-stubbed)
@@ -152,15 +155,6 @@ func realSkillOptABDeliver(ctx context.Context, agent runtime.Agent, prompt stri
 	adapter, err := runtimeStartAdapterFor(newRuntimeFactory(), agent.Runtime, adapterDir)
 	if err != nil {
 		return "", err
-	}
-	if strings.TrimSpace(agent.RuntimeRef) == "" {
-		// Forked/throwaway session: Start opens a fresh conversation and answers the
-		// prompt in one shot, never touching the agent's live session.
-		started, startErr := adapter.Start(ctx, runtime.StartRequest{Agent: agent, Prompt: prompt})
-		if startErr != nil {
-			return "", startErr
-		}
-		return strings.TrimSpace(started.Raw), nil
 	}
 	result, err := adapter.Deliver(ctx, agent, runtime.Job{AgentName: agent.Name, Action: "ask", Prompt: prompt, Model: agent.Model, Effort: agent.Effort})
 	if err != nil {

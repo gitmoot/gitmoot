@@ -1242,6 +1242,56 @@ type GroomSplitResult struct {
 	Skipped []int64
 }
 
+// GroomLLMVerdict is one immutable Phase-2 content-hash decision. Verdict is
+// "split" or "no_split"; CutsJSON stores the validated closed-enum cut list.
+type GroomLLMVerdict struct {
+	ContentHash string
+	Verdict     string
+	CutsJSON    string
+	Model       string
+	CreatedAt   string
+}
+
+// GetGroomLLMVerdict returns the cached decision for one trimmed-content hash.
+func (s *Store) GetGroomLLMVerdict(ctx context.Context, contentHash string) (GroomLLMVerdict, bool, error) {
+	var verdict GroomLLMVerdict
+	err := s.db.QueryRowContext(ctx, `
+SELECT content_hash, verdict, cuts_json, model, created_at
+FROM groom_llm_verdicts WHERE content_hash = ?`, strings.TrimSpace(contentHash)).Scan(
+		&verdict.ContentHash, &verdict.Verdict, &verdict.CutsJSON, &verdict.Model, &verdict.CreatedAt)
+	if err == sql.ErrNoRows {
+		return GroomLLMVerdict{}, false, nil
+	}
+	if err != nil {
+		return GroomLLMVerdict{}, false, fmt.Errorf("get groom LLM verdict: %w", err)
+	}
+	return verdict, true, nil
+}
+
+// StoreGroomLLMVerdict records the first valid decision for a content hash.
+// Concurrent/repeated writers never replace it; callers re-read to replay.
+func (s *Store) StoreGroomLLMVerdict(ctx context.Context, verdict GroomLLMVerdict) error {
+	verdict.ContentHash = strings.TrimSpace(verdict.ContentHash)
+	verdict.Verdict = strings.TrimSpace(verdict.Verdict)
+	if verdict.ContentHash == "" {
+		return fmt.Errorf("groom LLM verdict content hash is required")
+	}
+	if verdict.Verdict != "split" && verdict.Verdict != "no_split" {
+		return fmt.Errorf("groom LLM verdict must be split or no_split, got %q", verdict.Verdict)
+	}
+	if verdict.Verdict == "split" && strings.TrimSpace(verdict.CutsJSON) == "" {
+		return fmt.Errorf("groom LLM split verdict requires cuts_json")
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO groom_llm_verdicts(content_hash, verdict, cuts_json, model)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(content_hash) DO NOTHING`, verdict.ContentHash, verdict.Verdict, verdict.CutsJSON, strings.TrimSpace(verdict.Model))
+	if err != nil {
+		return fmt.Errorf("store groom LLM verdict: %w", err)
+	}
+	return nil
+}
+
 // ApplyGroomSplits applies every deterministic split in one transaction. Each
 // parent is CAS-guarded against the detector's active revision. Children inherit
 // ownership, author, repo, scope, and source lineage; every child FTS row, the

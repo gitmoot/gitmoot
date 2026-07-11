@@ -5,6 +5,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
 // Default read-path knobs for agent persistent memory (#626). The token budget
@@ -13,12 +15,15 @@ import (
 const (
 	DefaultMemoryTokenBudget = 1500
 	DefaultMemoryMaxEntries  = 15
-	// DefaultMemoryGroomSplitLLM gates the lossy Phase-2 atomizer. Phase 1 only
-	// parses this default-off switch; no LLM rewrite path is implemented yet.
-	DefaultMemoryGroomSplitLLM     = false
-	DefaultMemoryClusterFanout     = 12
-	DefaultMemoryClusterFanoutKeep = 9
-	DefaultMemoryClusterDepthCap   = 4
+	// DefaultMemoryGroomSplitLLM gates the Phase-2 LLM boundary chooser. Content
+	// remains host-sliced and lossless when enabled.
+	DefaultMemoryGroomSplitLLM          = false
+	DefaultMemoryGroomSplitLLMRuntime   = runtime.CodexRuntime
+	DefaultMemoryGroomSplitLLMModel     = ""
+	DefaultMemoryGroomSplitLLMMaxPerRun = 5
+	DefaultMemoryClusterFanout          = 12
+	DefaultMemoryClusterFanoutKeep      = 9
+	DefaultMemoryClusterDepthCap        = 4
 	// DefaultMemoryDistillMaxPerJob caps how many pending observations the
 	// deterministic distill-at-terminal producers (#737 P4.1) may stage per job.
 	// It is only consulted when distill_at_terminal or distill_successes is enabled.
@@ -72,9 +77,13 @@ type MemorySettings struct {
 	// pending human gate. Shared memory remains explicit through confirm/promote
 	// commands even when this is enabled.
 	IngestAutoConfirm bool
-	// GroomSplitLLM is the parsed Phase-2 gate for an eventual lossy LLM
-	// atomizer. Deterministic lossless splitting does not consult this flag.
-	GroomSplitLLM bool
+	// GroomSplitLLM enables the Phase-2 one-shot LLM boundary chooser after the
+	// deterministic lossless pass. Runtime/model select the isolated one-shot
+	// adapter; MaxPerRun caps billable candidate calls.
+	GroomSplitLLM          bool
+	GroomSplitLLMRuntime   string
+	GroomSplitLLMModel     string
+	GroomSplitLLMMaxPerRun int
 	// ClusterFanout bounds rendered sibling entries per repo scope. FanoutKeep is
 	// the strict hysteresis boundary below which a prior grouping dissolves, and
 	// ClusterDepthCap bounds recursive grouping/splitting.
@@ -86,18 +95,21 @@ type MemorySettings struct {
 // DefaultMemorySettings returns the off-by-default resolved settings.
 func DefaultMemorySettings() MemorySettings {
 	return MemorySettings{
-		Disabled:          false,
-		TokenBudget:       DefaultMemoryTokenBudget,
-		MaxEntries:        DefaultMemoryMaxEntries,
-		DistillAtTerminal: false,
-		DistillSuccesses:  false,
-		DistillMaxPerJob:  DefaultMemoryDistillMaxPerJob,
-		DistillAllJobs:    false,
-		IngestAutoConfirm: false,
-		GroomSplitLLM:     DefaultMemoryGroomSplitLLM,
-		ClusterFanout:     DefaultMemoryClusterFanout,
-		ClusterFanoutKeep: DefaultMemoryClusterFanoutKeep,
-		ClusterDepthCap:   DefaultMemoryClusterDepthCap,
+		Disabled:               false,
+		TokenBudget:            DefaultMemoryTokenBudget,
+		MaxEntries:             DefaultMemoryMaxEntries,
+		DistillAtTerminal:      false,
+		DistillSuccesses:       false,
+		DistillMaxPerJob:       DefaultMemoryDistillMaxPerJob,
+		DistillAllJobs:         false,
+		IngestAutoConfirm:      false,
+		GroomSplitLLM:          DefaultMemoryGroomSplitLLM,
+		GroomSplitLLMRuntime:   DefaultMemoryGroomSplitLLMRuntime,
+		GroomSplitLLMModel:     DefaultMemoryGroomSplitLLMModel,
+		GroomSplitLLMMaxPerRun: DefaultMemoryGroomSplitLLMMaxPerRun,
+		ClusterFanout:          DefaultMemoryClusterFanout,
+		ClusterFanoutKeep:      DefaultMemoryClusterFanoutKeep,
+		ClusterDepthCap:        DefaultMemoryClusterDepthCap,
 	}
 }
 
@@ -187,6 +199,24 @@ func LoadMemorySettings(paths Paths) (MemorySettings, error) {
 				return MemorySettings{}, fmt.Errorf("parse [memory].groom_split_llm: %w", err)
 			}
 			settings.GroomSplitLLM = parsed
+		case "groom_split_llm_runtime":
+			parsed, err := parseConfigString(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].groom_split_llm_runtime: %w", err)
+			}
+			settings.GroomSplitLLMRuntime = strings.TrimSpace(parsed)
+		case "groom_split_llm_model":
+			parsed, err := parseConfigString(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].groom_split_llm_model: %w", err)
+			}
+			settings.GroomSplitLLMModel = strings.TrimSpace(parsed)
+		case "groom_split_llm_max_per_run":
+			parsed, err := strconv.Atoi(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].groom_split_llm_max_per_run: %w", err)
+			}
+			settings.GroomSplitLLMMaxPerRun = parsed
 		case "cluster_fanout":
 			parsed, err := strconv.Atoi(value)
 			if err != nil {
@@ -223,6 +253,12 @@ func validateMemorySettings(s MemorySettings) error {
 	if s.DistillMaxPerJob < 0 {
 		return fmt.Errorf("memory.distill_max_per_job must be >= 0, got %d", s.DistillMaxPerJob)
 	}
+	if !configMemoryLLMRuntimeSupported(s.GroomSplitLLMRuntime) {
+		return fmt.Errorf("memory.groom_split_llm_runtime must be one of codex, claude, kimi, got %q", s.GroomSplitLLMRuntime)
+	}
+	if s.GroomSplitLLMMaxPerRun < 1 {
+		return fmt.Errorf("memory.groom_split_llm_max_per_run must be >= 1, got %d", s.GroomSplitLLMMaxPerRun)
+	}
 	if s.ClusterFanout < 2 {
 		return fmt.Errorf("memory.cluster_fanout must be >= 2, got %d", s.ClusterFanout)
 	}
@@ -233,4 +269,13 @@ func validateMemorySettings(s MemorySettings) error {
 		return fmt.Errorf("memory.cluster_depth_cap must be between 1 and %d, got %d", DefaultMemoryClusterDepthCap, s.ClusterDepthCap)
 	}
 	return nil
+}
+
+func configMemoryLLMRuntimeSupported(name string) bool {
+	for _, supported := range []string{runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime} {
+		if name == supported {
+			return true
+		}
+	}
+	return false
 }

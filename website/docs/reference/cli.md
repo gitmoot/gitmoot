@@ -1412,7 +1412,9 @@ Agent persistent memory is **off by default** and enrolled per agent
 (`[agents.<name>].memory = true`), with optional `[memory]` knobs (`disabled`,
 `token_budget`, `max_entries`, and the distill-at-terminal knobs
 `distill_at_terminal`, `distill_successes`, `distill_max_per_job`,
-`distill_all_jobs`. All are read per tick, with no restart. See
+`distill_all_jobs`, plus the default-off groom LLM knobs
+`groom_split_llm`, `groom_split_llm_runtime`, `groom_split_llm_model`, and
+`groom_split_llm_max_per_run`. All are read per tick, with no restart. See
 [Agent Persistent Memory](../concepts/agent-memory.md) for the full model. The
 inspection commands are read-only; `ingest` and `confirm` write behind a human
 gate:
@@ -1568,6 +1570,17 @@ status/changelog content is excluded, and segments below 200 trimmed bytes merge
 into a neighbor. The split supersedes and de-indexes the parent, carries its
 cluster membership to the children, and gives each rendered child `(split from:
 <parent-key>)` context in one CAS-guarded transaction.
+With `[memory].groom_split_llm = true`, over-threshold bricks left intact by the
+deterministic pass are offered to fresh one-shot runtime sessions. The host
+enumerates blank-line and strong-seam boundaries outside lists and fenced code;
+the model returns strict JSON choosing only those ids or keeping the brick.
+Gitmoot verifies exact echoed lines and runs selected offsets through the same
+runt merge, substantive-child, byte-coverage, store re-check, and CAS path. It
+never accepts model-written content. Runtime defaults to `codex`, empty model
+means runtime default, max calls defaults to 5, calls time out after 90 seconds,
+and content over 8192 bytes is skipped without truncation. Split and no-split
+verdicts cache by trimmed-content SHA-256; `--json` reports model, decision, cut
+ids, cache status, and fail-closed fallback reasons per considered brick.
 `memory groom --split-revert [--dry-run] [--parent N]... [--since RFC3339]`
 restores all active split parents by default. It retires, never deletes, children
 only when their id-ordered content still reconstructs the original parent, then

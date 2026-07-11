@@ -454,6 +454,238 @@ func TestGroomRejectsAmbiguousFlags(t *testing.T) {
 	}
 }
 
+func TestGroomLLMContractValidation(t *testing.T) {
+	menu := []memory.GroomLLMBoundary{
+		{ID: "c001", Offset: 100, Text: "Second story"},
+		{ID: "c002", Offset: 200, Text: "Third story"},
+	}
+	tests := []struct {
+		name    string
+		raw     string
+		wantErr string
+	}{
+		{name: "valid with surrounding prose", raw: `answer: {"split":true,"cuts":[{"id":"c002","text":"Third story"},{"id":"c001","text":"Second story"}]} done`},
+		{name: "unknown id", raw: `{"split":true,"cuts":[{"id":"c999","text":"Second story"}]}`, wantErr: "unknown cut id"},
+		{name: "wrong echo", raw: `{"split":true,"cuts":[{"id":"c001","text":"wrong"}]}`, wantErr: "echoed"},
+		{name: "duplicate id", raw: `{"split":true,"cuts":[{"id":"c001","text":"Second story"},{"id":"c001","text":"Second story"}]}`, wantErr: "duplicate cut id"},
+		{name: "split without cuts", raw: `{"split":true,"cuts":[]}`, wantErr: "at least one cut"},
+		{name: "keep with cuts", raw: `{"split":false,"cuts":[{"id":"c001","text":"Second story"}]}`, wantErr: "requires empty cuts"},
+		{name: "unknown field", raw: `{"split":false,"cuts":[],"reason":"no"}`, wantErr: "unknown field"},
+		{name: "garbage JSON", raw: `not JSON`, wantErr: "no complete JSON object"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reply, err := parseGroomLLMReply(tc.raw)
+			if err == nil {
+				var ids []string
+				ids, _, err = validateGroomLLMReply(reply, menu)
+				if tc.wantErr == "" && (len(ids) != 2 || ids[0] != "c001" || ids[1] != "c002") {
+					t.Fatalf("sorted cut ids = %v", ids)
+				}
+			}
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestGroomLLMPathStubSplitsBrick(t *testing.T) {
+	home, store := memoryTestHome(t)
+	writeGroomLLMConfig(t, home, true)
+	content := groomLLMTestBrick()
+	parentID := seedConfirmed(t, store, db.MemoryOwner{Kind: "agent", Ref: "lead"}, "acme/widget", "repo", "llm-brick", content)
+	logPath := installGroomCodexStub(t, `{"split":true,"cuts":[{"id":"c001","text":"Second independent story"}]}`)
+
+	code, stdout, stderr := runGroom(t, "--home", home, "--split", "--json")
+	if code != 0 {
+		t.Fatalf("LLM split exit %d: %s", code, stderr)
+	}
+	var output groomSplitOutput
+	if err := json.Unmarshal([]byte(stdout), &output); err != nil {
+		t.Fatalf("parse LLM split output: %v (%s)", err, stdout)
+	}
+	if output.Applied != 1 || output.Detected != 1 || len(output.LLM) != 1 || output.LLM[0].ParentID != parentID || output.LLM[0].Decision != "split" || output.LLM[0].Cached || len(output.LLM[0].CutIDs) != 1 || output.LLM[0].CutIDs[0] != "c001" {
+		t.Fatalf("LLM split output = %+v", output)
+	}
+	if calls := groomStubCalls(t, logPath); calls != 1 {
+		t.Fatalf("stub calls = %d, want 1", calls)
+	}
+	if len(output.Splits) != 1 || len(output.Splits[0].Children) != 2 {
+		t.Fatalf("split children = %+v", output.Splits)
+	}
+}
+
+func TestGroomLLMPathStubGarbageFallsBack(t *testing.T) {
+	home, store := memoryTestHome(t)
+	writeGroomLLMConfig(t, home, true)
+	seedConfirmed(t, store, db.MemoryOwner{Kind: "agent", Ref: "lead"}, "acme/widget", "repo", "llm-garbage", groomLLMTestBrick())
+	logPath := installGroomCodexStub(t, `garbage response`)
+
+	code, stdout, stderr := runGroom(t, "--home", home, "--split", "--json")
+	if code != 0 {
+		t.Fatalf("garbage fallback exit %d: %s", code, stderr)
+	}
+	var output groomSplitOutput
+	if err := json.Unmarshal([]byte(stdout), &output); err != nil {
+		t.Fatalf("parse garbage output: %v (%s)", err, stdout)
+	}
+	if output.Applied != 0 || len(output.LLM) != 1 || output.LLM[0].Decision != "fallback" || !strings.Contains(output.LLM[0].FallbackReason, "no complete JSON object") {
+		t.Fatalf("garbage fallback output = %+v", output)
+	}
+	if calls := groomStubCalls(t, logPath); calls != 1 {
+		t.Fatalf("stub calls = %d, want 1", calls)
+	}
+}
+
+func TestGroomLLMNoSplitCacheAvoidsSecondCall(t *testing.T) {
+	home, store := memoryTestHome(t)
+	writeGroomLLMConfig(t, home, true)
+	seedConfirmed(t, store, db.MemoryOwner{Kind: "agent", Ref: "lead"}, "acme/widget", "repo", "llm-keep", groomLLMTestBrick())
+	logPath := installGroomCodexStub(t, `{"split":false,"cuts":[]}`)
+
+	for run := 1; run <= 2; run++ {
+		code, stdout, stderr := runGroom(t, "--home", home, "--split", "--json")
+		if code != 0 {
+			t.Fatalf("no-split run %d exit %d: %s", run, code, stderr)
+		}
+		var output groomSplitOutput
+		if err := json.Unmarshal([]byte(stdout), &output); err != nil {
+			t.Fatalf("parse no-split run %d: %v (%s)", run, err, stdout)
+		}
+		if output.Applied != 0 || len(output.LLM) != 1 || output.LLM[0].Decision != "no_split" || output.LLM[0].Cached != (run == 2) {
+			t.Fatalf("no-split run %d output = %+v", run, output)
+		}
+	}
+	if calls := groomStubCalls(t, logPath); calls != 1 {
+		t.Fatalf("stub calls after cached rerun = %d, want 1", calls)
+	}
+}
+
+func TestGroomLLMSplitCacheReplaysForIdenticalContent(t *testing.T) {
+	home, store := memoryTestHome(t)
+	writeGroomLLMConfig(t, home, true)
+	content := groomLLMTestBrick()
+	owner := db.MemoryOwner{Kind: "agent", Ref: "lead"}
+	seedConfirmed(t, store, owner, "acme/widget", "repo", "llm-split-a", content)
+	seedConfirmed(t, store, owner, "acme/widget", "repo", "llm-split-b", content)
+	logPath := installGroomCodexStub(t, `{"split":true,"cuts":[{"id":"c001","text":"Second independent story"}]}`)
+
+	code, stdout, stderr := runGroom(t, "--home", home, "--split", "--json")
+	if code != 0 {
+		t.Fatalf("cached split replay exit %d: %s", code, stderr)
+	}
+	var output groomSplitOutput
+	if err := json.Unmarshal([]byte(stdout), &output); err != nil {
+		t.Fatalf("parse cached split replay: %v (%s)", err, stdout)
+	}
+	if output.Applied != 2 || len(output.LLM) != 2 || output.LLM[0].Cached || !output.LLM[1].Cached || output.LLM[0].Decision != "split" || output.LLM[1].Decision != "split" {
+		t.Fatalf("cached split replay output = %+v", output)
+	}
+	if calls := groomStubCalls(t, logPath); calls != 1 {
+		t.Fatalf("identical split content stub calls = %d, want 1", calls)
+	}
+}
+
+func TestGroomLLMOversizeSkipsWithoutCall(t *testing.T) {
+	home, store := memoryTestHome(t)
+	writeGroomLLMConfig(t, home, true)
+	content := strings.Repeat("oversize continuous narrative content. ", 260)
+	if len(strings.TrimSpace(content)) <= memory.GroomLLMMaxContentBytes {
+		t.Fatal("oversize fixture is not over the hard limit")
+	}
+	seedConfirmed(t, store, db.MemoryOwner{Kind: "agent", Ref: "lead"}, "acme/widget", "repo", "llm-oversize", content)
+	logPath := installGroomCodexStub(t, `{"split":false,"cuts":[]}`)
+
+	code, stdout, stderr := runGroom(t, "--home", home, "--split", "--json")
+	if code != 0 {
+		t.Fatalf("oversize split exit %d: %s", code, stderr)
+	}
+	var output groomSplitOutput
+	if err := json.Unmarshal([]byte(stdout), &output); err != nil {
+		t.Fatalf("parse oversize output: %v (%s)", err, stdout)
+	}
+	if len(output.LLM) != 1 || output.LLM[0].Decision != "skipped" || !strings.Contains(output.LLM[0].FallbackReason, "8192-byte") {
+		t.Fatalf("oversize output = %+v", output)
+	}
+	if calls := groomStubCalls(t, logPath); calls != 0 {
+		t.Fatalf("oversize stub calls = %d, want 0", calls)
+	}
+}
+
+func TestGroomLLMFlagOffMakesZeroCalls(t *testing.T) {
+	home, store := memoryTestHome(t)
+	writeGroomLLMConfig(t, home, false)
+	seedConfirmed(t, store, db.MemoryOwner{Kind: "agent", Ref: "lead"}, "acme/widget", "repo", "llm-off", groomLLMTestBrick())
+	logPath := installGroomCodexStub(t, `{"split":false,"cuts":[]}`)
+
+	code, stdout, stderr := runGroom(t, "--home", home, "--split", "--json")
+	if code != 0 {
+		t.Fatalf("flag-off split exit %d: %s", code, stderr)
+	}
+	var output map[string]any
+	if err := json.Unmarshal([]byte(stdout), &output); err != nil {
+		t.Fatalf("parse flag-off output: %v", err)
+	}
+	if _, present := output["llm"]; present {
+		t.Fatalf("flag-off output changed shape: %s", stdout)
+	}
+	if calls := groomStubCalls(t, logPath); calls != 0 {
+		t.Fatalf("flag-off stub calls = %d, want 0", calls)
+	}
+}
+
+func groomLLMTestBrick() string {
+	first := strings.Repeat("The first independent narrative preserves detailed operational context. ", 12)
+	second := strings.Repeat("The second independent narrative records a separate durable outcome. ", 12)
+	return "First subject\n" + first + "\n\nSecond independent story\n" + second
+}
+
+func writeGroomLLMConfig(t *testing.T, home string, enabled bool) {
+	t.Helper()
+	appendConfig(t, config.PathsForHome(home), "\n[memory]\n"+
+		"groom_split_llm = "+strconv.FormatBool(enabled)+"\n"+
+		"groom_split_llm_runtime = \"codex\"\n"+
+		"groom_split_llm_model = \"\"\n"+
+		"groom_split_llm_max_per_run = 5\n")
+}
+
+func installGroomCodexStub(t *testing.T, answer string) string {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	t.Setenv("GROOM_LLM_STUB_LOG", logPath)
+	threadID := "019f3041-cfed-7e82-8766-b5ca75cf92da"
+	transcript := `{"type":"thread.started","thread_id":"` + threadID + `"}` + "\n" +
+		`{"type":"item.completed","item":{"type":"agent_message","text":` + strconv.Quote(answer) + `}}` + "\n" +
+		`{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`
+	script := "#!/bin/sh\nprintf 'call\\n' >> \"$GROOM_LLM_STUB_LOG\"\ncat <<'GROOM_EOF'\n" + transcript + "\nGROOM_EOF\n"
+	path := filepath.Join(dir, "codex")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write codex stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return logPath
+}
+
+func groomStubCalls(t *testing.T, path string) int {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		t.Fatalf("read stub log: %v", err)
+	}
+	return len(strings.Fields(string(body)))
+}
+
 func TestGroomApplyBadPlanFile(t *testing.T) {
 	home, _ := memoryTestHome(t)
 	bad := filepath.Join(t.TempDir(), "bad.json")
