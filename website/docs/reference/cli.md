@@ -1435,6 +1435,7 @@ gitmoot memory links list <id> [--json]
 gitmoot memory groom --propose [--out PLAN.json] [--json]
 gitmoot memory groom --yes --plan PLAN.json [--json]
 gitmoot memory groom --split [--dry-run] [--json]
+gitmoot memory groom --split-revert [--dry-run] [--parent N]... [--since RFC3339] [--json]
 gitmoot memory clusters [--json]
 gitmoot memory clusters recompute --propose [--out PLAN.json] [--json]
 gitmoot memory clusters recompute --apply [--plan PLAN.json] [--json]
@@ -1561,9 +1562,17 @@ export merges these persisted links with content-derived links and dedupes by
 target in each note's `## Links` section.
 
 `memory groom --split [--dry-run]` automatically partitions qualifying bricks at
-deterministic byte-offset seams into exact-substring children, supersedes and
-de-indexes the parent, and carries its cluster membership to the children in one
-CAS-guarded transaction. `memory groom` keeps all other curation as a
+deterministic byte-offset story seams into exact-substring children. List items,
+`Why`, and `How to apply` sub-fields are not seams; length alone never cuts,
+status/changelog content is excluded, and segments below 200 trimmed bytes merge
+into a neighbor. The split supersedes and de-indexes the parent, carries its
+cluster membership to the children, and gives each rendered child `(split from:
+<parent-key>)` context in one CAS-guarded transaction.
+`memory groom --split-revert [--dry-run] [--parent N]... [--since RFC3339]`
+restores all active split parents by default. It retires, never deletes, children
+only when their id-ordered content still reconstructs the original parent, then
+restores parent FTS and the lowest-id child's current cluster. Changed groups skip
+whole and repeat runs are no-ops. `memory groom` keeps all other curation as a
 **propose → review → apply** round-trip. `--propose` reads active confirmed memory, computes the current
 vault `snapshot_hash`, runs deterministic detectors
 (status/changelog/ToC snapshots — short notes need a strong `STATUS:`/`… & deployed`

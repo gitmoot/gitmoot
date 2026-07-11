@@ -1955,21 +1955,34 @@ round-trip:
 gitmoot memory groom --propose [--out PLAN.json] [--json]
 gitmoot memory groom --yes --plan PLAN.json [--json]
 gitmoot memory groom --split [--dry-run] [--json]
+gitmoot memory groom --split-revert [--dry-run] [--parent N]... [--since RFC3339] [--json]
 ```
 
 `--split` is the automatic, approval-free lossless pass. It partitions a brick
 at byte offsets on strong story seams (bold story headers, date-led lines, and
-PR markers) or, for over-threshold content, blank-line paragraph groups. A
-candidate needs at least two substantive segments and either two strong seams
-or content over `GroomRewriteThreshold`. Children are exact parent substrings in
-deterministic order and must concatenate to the parent's trimmed coverage; any
-invariant failure falls back to a rewrite flag without writing. Child keys use
+PR markers). List items, `Why`, and `How to apply` sub-fields are never seams;
+length alone never cuts, and status/changelog content is excluded. A candidate
+needs at least two strong seams and two substantive children after repeatedly
+merging trimmed segments smaller than 200 bytes into a neighbor. Children are
+exact parent substrings in deterministic order and must concatenate to the
+parent's trimmed coverage; any invariant failure falls back to a rewrite flag
+without writing. Child keys use
 `<parent-key>-<seam-slug>` with deterministic ordinals, provenance is
-`groom-split:<parent-id>`, and owner/author/repo/scope are inherited. Apply is one
-CAS-guarded transaction: children and FTS rows are inserted, the parent leaves
-FTS and is set `superseded_by = <first-child-id>`, and children replace the
-parent in its cluster. Links are left for normal enrichment. `--dry-run` prints
-the same split plan without changing the store; a repeat run is a no-op.
+`groom-split:<parent-id>`, owner/author/repo/scope are inherited, and each child
+renders with `(split from: <parent-key>)` subject context. Apply is one CAS-guarded
+transaction: children and FTS rows are inserted, the parent leaves FTS and is set
+`superseded_by = <first-child-id>`, and children replace the parent in its cluster.
+Links are left for normal enrichment. `--dry-run` prints the same split plan
+without changing the store; a repeat run is a no-op.
+
+`--split-revert` restores all currently active groom-split parents by default;
+repeat `--parent N` to select parent ids or pass `--since RFC3339` to select recent
+splits. It first verifies that the active children in id order reconstruct the
+trimmed parent exactly. A mismatched parent is skipped whole. Valid children are
+retired with reason `groom-split-revert:<parent-id>` and removed from clusters,
+the parent is restored to FTS, and its cluster is restored from the lowest-id
+child's current cluster when available. The operation is idempotent, and
+`--dry-run` lists the same groups without writing.
 
 `--propose` reads every **active** confirmed memory (retired rows excluded),
 computes the current vault `snapshot_hash` (the same anchor `vault export`/`import`

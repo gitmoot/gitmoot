@@ -171,6 +171,22 @@ CREATE TABLE job_events (
 	message TEXT NOT NULL,
 	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+-- Minimal memory tables at the pre-#842 shape. The original memory base-table
+-- migration is marked applied below, while later additive migrations still run;
+-- this makes the new confirmed_memories.context ALTER exercise a pre-existing
+-- table instead of relying on a fresh-schema create in this old-schema fixture.
+CREATE TABLE confirmed_memories (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	owner_kind TEXT NOT NULL,
+	owner_ref TEXT NOT NULL,
+	owner_version TEXT NOT NULL DEFAULT '',
+	repo TEXT,
+	key TEXT NOT NULL,
+	superseded_by INTEGER
+);
+CREATE UNIQUE INDEX idx_confirmed_repo_key ON confirmed_memories(owner_kind, owner_ref, owner_version, repo, key) WHERE repo IS NOT NULL;
+CREATE UNIQUE INDEX idx_confirmed_general_key ON confirmed_memories(owner_kind, owner_ref, owner_version, key) WHERE repo IS NULL;
+CREATE TABLE memory_observations (id INTEGER PRIMARY KEY AUTOINCREMENT);
 -- A minimal resource_locks table (created by an earlier, here pre-seeded-as-
 -- applied migration) so the #651 owner_boot_id ALTER ADD COLUMN that runs in this
 -- pass has its table.
@@ -194,18 +210,29 @@ INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'su
 	// We locate the token migration by CONTENT rather than position so appending
 	// new migrations never breaks this pin.
 	tokenMigrationVersion := -1
+	confirmedMemoryBaseVersion := -1
 	for i, m := range migrations {
-		if strings.Contains(m, "input_tokens") {
+		if tokenMigrationVersion < 0 && strings.Contains(m, "input_tokens") {
 			tokenMigrationVersion = i + 1 // migration versions are 1-indexed
-			break
+		}
+		if strings.Contains(m, "CREATE TABLE confirmed_memories") {
+			confirmedMemoryBaseVersion = i + 1
 		}
 	}
 	if tokenMigrationVersion < 1 {
 		t.Fatalf("could not locate the input_tokens migration")
 	}
+	if confirmedMemoryBaseVersion < 1 {
+		t.Fatalf("could not locate the confirmed-memory base migration")
+	}
 	for v := 1; v < tokenMigrationVersion; v++ {
 		if _, err := raw.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, 'seed')`, v); err != nil {
 			t.Fatalf("seed schema_migrations v%d returned error: %v", v, err)
+		}
+	}
+	if confirmedMemoryBaseVersion >= tokenMigrationVersion {
+		if _, err := raw.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, 'seed')`, confirmedMemoryBaseVersion); err != nil {
+			t.Fatalf("seed confirmed-memory base migration v%d returned error: %v", confirmedMemoryBaseVersion, err)
 		}
 	}
 	if err := raw.Close(); err != nil {

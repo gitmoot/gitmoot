@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -53,6 +54,7 @@ type ConfirmedMemory struct {
 	Repo             string // "" == general scope (stored as SQL NULL)
 	Scope            string
 	Key              string
+	Context          string // optional subject inherited from a groom-split parent
 	Content          string
 	Provenance       string
 	SourceJob        string
@@ -292,7 +294,7 @@ WHERE (owner_kind = ? AND owner_ref = ?) OR (owner_kind = ? AND owner_ref = ? AN
 // Rows come back ordered by id for a stable, deterministic traversal. Plain read, no FTS.
 func (s *Store) ListConfirmedMemoriesByOwnerKind(ctx context.Context, ownerKind string) ([]ConfirmedMemory, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, context,
 	provenance, source_job, first_confirmed_at, updated_at, COALESCE(superseded_by, 0)
 FROM confirmed_memories
 WHERE owner_kind = ? AND retired_at = ''
@@ -306,7 +308,7 @@ ORDER BY id`, ownerKind)
 		var c ConfirmedMemory
 		var repoNull sql.NullString
 		if err := rows.Scan(&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &c.AuthorRef, &repoNull,
-			&c.Scope, &c.Key, &c.Content, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt, &c.UpdatedAt, &c.SupersededBy); err != nil {
+			&c.Scope, &c.Key, &c.Content, &c.Context, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt, &c.UpdatedAt, &c.SupersededBy); err != nil {
 			return nil, err
 		}
 		c.Repo = repoNull.String
@@ -321,7 +323,7 @@ ORDER BY id`, ownerKind)
 // ListConfirmedMemoriesByOwnerKind.
 func (s *Store) ListConfirmedMemoriesForKnowledge(ctx context.Context) ([]ConfirmedMemory, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, context,
 	provenance, source_job, first_confirmed_at, updated_at, COALESCE(superseded_by, 0)
 FROM confirmed_memories
 WHERE (owner_kind = 'agent' OR (owner_kind = 'shared' AND owner_ref = 'shared'))
@@ -336,7 +338,7 @@ ORDER BY id`)
 		var c ConfirmedMemory
 		var repoNull sql.NullString
 		if err := rows.Scan(&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &c.AuthorRef, &repoNull,
-			&c.Scope, &c.Key, &c.Content, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt, &c.UpdatedAt, &c.SupersededBy); err != nil {
+			&c.Scope, &c.Key, &c.Content, &c.Context, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt, &c.UpdatedAt, &c.SupersededBy); err != nil {
 			return nil, err
 		}
 		c.Repo = repoNull.String
@@ -442,10 +444,10 @@ LIMIT 1`,
 	case err == sql.ErrNoRows:
 		res, insErr := tx.ExecContext(ctx, `
 INSERT INTO confirmed_memories
-	(owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, provenance, source_job, first_confirmed_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	(owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, context, provenance, source_job, first_confirmed_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			cm.Owner.Kind, cm.Owner.Ref, cm.Owner.Version, strings.TrimSpace(cm.AuthorRef), nullableRepo(cm.Repo), scope,
-			cm.Key, cm.Content, cm.Provenance, cm.SourceJob, now, now)
+			cm.Key, cm.Content, strings.TrimSpace(cm.Context), cm.Provenance, cm.SourceJob, now, now)
 		if insErr != nil {
 			return 0, fmt.Errorf("insert confirmed memory: %w", insErr)
 		}
@@ -469,9 +471,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		// refusal above so re-ingest cannot undo a bulk-retire cleanup.
 		if _, upErr := tx.ExecContext(ctx, `
 UPDATE confirmed_memories
-SET author_ref = ?, content = ?, provenance = ?, source_job = ?, updated_at = ?, retired_at = '', retired_reason = ''
+SET author_ref = ?, content = ?, context = ?, provenance = ?, source_job = ?, updated_at = ?, retired_at = '', retired_reason = ''
 WHERE id = ?`,
-			strings.TrimSpace(cm.AuthorRef), cm.Content, cm.Provenance, cm.SourceJob, now, id); upErr != nil {
+			strings.TrimSpace(cm.AuthorRef), cm.Content, strings.TrimSpace(cm.Context), cm.Provenance, cm.SourceJob, now, id); upErr != nil {
 			return 0, fmt.Errorf("update confirmed memory: %w", upErr)
 		}
 	}
@@ -503,11 +505,11 @@ func archiveSupersededEditionTx(ctx context.Context, tx *sql.Tx, id int64, newCo
 	var prev ConfirmedMemory
 	var repoNull sql.NullString
 	err := tx.QueryRowContext(ctx, `
-SELECT owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
+SELECT owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, context,
 	provenance, source_job, first_confirmed_at, updated_at
 FROM confirmed_memories WHERE id = ?`, id).Scan(
 		&prev.Owner.Kind, &prev.Owner.Ref, &prev.Owner.Version, &prev.AuthorRef, &repoNull,
-		&prev.Scope, &prev.Key, &prev.Content, &prev.Provenance, &prev.SourceJob,
+		&prev.Scope, &prev.Key, &prev.Content, &prev.Context, &prev.Provenance, &prev.SourceJob,
 		&prev.FirstConfirmedAt, &prev.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("read confirmed memory %d for supersede archive: %w", id, err)
@@ -518,10 +520,10 @@ FROM confirmed_memories WHERE id = ?`, id).Scan(
 	prev.Repo = repoNull.String
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO confirmed_memories
-	(owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, provenance, source_job, first_confirmed_at, updated_at, superseded_by)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	(owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, context, provenance, source_job, first_confirmed_at, updated_at, superseded_by)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		prev.Owner.Kind, prev.Owner.Ref, prev.Owner.Version, prev.AuthorRef, nullableRepo(prev.Repo), prev.Scope,
-		prev.Key, prev.Content, prev.Provenance, prev.SourceJob, prev.FirstConfirmedAt, prev.UpdatedAt, id); err != nil {
+		prev.Key, prev.Content, prev.Context, prev.Provenance, prev.SourceJob, prev.FirstConfirmedAt, prev.UpdatedAt, id); err != nil {
 		return fmt.Errorf("archive superseded edition of confirmed memory %d: %w", id, err)
 	}
 	return nil
@@ -576,12 +578,12 @@ func promoteConfirmedMemoryToSharedTx(ctx context.Context, tx *sql.Tx, id int64,
 	var repoNull sql.NullString
 	var retiredAt string
 	err := tx.QueryRowContext(ctx, `
-SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, context,
 	provenance, source_job, first_confirmed_at, updated_at, COALESCE(superseded_by, 0), retired_at
 FROM confirmed_memories
 WHERE id = ?`, id).Scan(
 		&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &c.AuthorRef, &repoNull,
-		&c.Scope, &c.Key, &c.Content, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt,
+		&c.Scope, &c.Key, &c.Content, &c.Context, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt,
 		&c.UpdatedAt, &c.SupersededBy, &retiredAt)
 	if err == sql.ErrNoRows {
 		return ConfirmedMemory{}, fmt.Errorf("confirmed memory %d not found", id)
@@ -881,12 +883,12 @@ func confirmedMemoryForLinkingTx(ctx context.Context, tx *sql.Tx, id int64) (Con
 	var c ConfirmedMemory
 	var repoNull sql.NullString
 	err := tx.QueryRowContext(ctx, `
-SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, context,
 	provenance, source_job, first_confirmed_at, updated_at
 FROM confirmed_memories
 WHERE id = ? AND superseded_by IS NULL AND retired_at = ''`, id).Scan(
 		&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &c.AuthorRef, &repoNull,
-		&c.Scope, &c.Key, &c.Content, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt, &c.UpdatedAt)
+		&c.Scope, &c.Key, &c.Content, &c.Context, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt, &c.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return ConfirmedMemory{}, false, nil
 	}
@@ -1118,7 +1120,7 @@ func listActiveConfirmedMemoriesByProvenancePrefix(ctx context.Context, q rowsQu
 		args = append(args, strings.TrimSpace(agentRef), strings.TrimSpace(agentRef))
 	}
 	query := `
-SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, context,
 	provenance, source_job, first_confirmed_at, updated_at
 FROM confirmed_memories
 WHERE ` + strings.Join(where, " AND ") + `
@@ -1277,13 +1279,13 @@ func applyGroomSplitTx(ctx context.Context, tx *sql.Tx, item GroomSplitItem) (Gr
 	var parent ConfirmedMemory
 	var repoNull sql.NullString
 	err := tx.QueryRowContext(ctx, `
-SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, context,
 	provenance, source_job, first_confirmed_at, updated_at
 FROM confirmed_memories
 WHERE id = ? AND updated_at = ? AND superseded_by IS NULL AND retired_at = ''`,
 		item.ParentID, item.ExpectedUpdatedAt).Scan(
 		&parent.ID, &parent.Owner.Kind, &parent.Owner.Ref, &parent.Owner.Version, &parent.AuthorRef, &repoNull,
-		&parent.Scope, &parent.Key, &parent.Content, &parent.Provenance, &parent.SourceJob,
+		&parent.Scope, &parent.Key, &parent.Content, &parent.Context, &parent.Provenance, &parent.SourceJob,
 		&parent.FirstConfirmedAt, &parent.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return GroomSplitApplied{}, false, nil
@@ -1325,10 +1327,10 @@ WHERE id = ? AND updated_at = ? AND superseded_by IS NULL AND retired_at = ''`,
 	for _, child := range item.Children {
 		res, err := tx.ExecContext(ctx, `
 INSERT INTO confirmed_memories
-	(owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, provenance, source_job, first_confirmed_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	(owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, context, provenance, source_job, first_confirmed_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			parent.Owner.Kind, parent.Owner.Ref, parent.Owner.Version, parent.AuthorRef, nullableRepo(parent.Repo), parent.Scope,
-			child.Key, child.Content, fmt.Sprintf("groom-split:%d", parent.ID), parent.SourceJob, parent.FirstConfirmedAt, now)
+			child.Key, child.Content, parent.Key, fmt.Sprintf("groom-split:%d", parent.ID), parent.SourceJob, parent.FirstConfirmedAt, now)
 		if err != nil {
 			return GroomSplitApplied{}, false, fmt.Errorf("insert groom split child for parent %d: %w", parent.ID, err)
 		}
@@ -1373,6 +1375,227 @@ WHERE id = ? AND updated_at = ? AND superseded_by IS NULL AND retired_at = ''`,
 		}
 	}
 	return applied, true, nil
+}
+
+// GroomSplitRevertOptions selects active groom splits to restore. Empty
+// ParentIDs and Since select every currently active split.
+type GroomSplitRevertOptions struct {
+	ParentIDs []int64
+	Since     string
+	DryRun    bool
+}
+
+// GroomSplitReverted records one parent and the direct children that were, or
+// in dry-run mode would be, retired to restore it.
+type GroomSplitReverted struct {
+	ParentID int64   `json:"parent_id"`
+	ChildIDs []int64 `json:"child_ids"`
+}
+
+// GroomSplitRevertSkipped is one selected parent that failed a reverse coverage
+// or active-split invariant and was left untouched.
+type GroomSplitRevertSkipped struct {
+	ParentID int64  `json:"parent_id"`
+	Reason   string `json:"reason"`
+}
+
+// GroomSplitRevertResult reports restored and fail-closed parent groups.
+type GroomSplitRevertResult struct {
+	Reverted []GroomSplitReverted      `json:"reverted"`
+	Skipped  []GroomSplitRevertSkipped `json:"skipped"`
+}
+
+// RevertGroomSplits restores active parents superseded by direct groom-split
+// children. Validation is per-parent and happens before any mutation for that
+// group; an edited, retired, or recursively split child therefore skips only its
+// parent. All successful groups commit atomically.
+func (s *Store) RevertGroomSplits(ctx context.Context, options GroomSplitRevertOptions) (GroomSplitRevertResult, error) {
+	var result GroomSplitRevertResult
+	if strings.TrimSpace(options.Since) != "" {
+		if _, err := time.Parse(time.RFC3339, options.Since); err != nil {
+			return result, fmt.Errorf("invalid groom split revert since timestamp %q: %w", options.Since, err)
+		}
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return result, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	parentIDs, err := selectActiveGroomSplitParents(ctx, tx, options)
+	if err != nil {
+		return result, err
+	}
+	for _, parentID := range parentIDs {
+		reverted, ok, reason, err := revertGroomSplitTx(ctx, tx, parentID, options.DryRun)
+		if err != nil {
+			return GroomSplitRevertResult{}, err
+		}
+		if !ok {
+			result.Skipped = append(result.Skipped, GroomSplitRevertSkipped{ParentID: parentID, Reason: reason})
+			continue
+		}
+		result.Reverted = append(result.Reverted, reverted)
+	}
+	if err := tx.Commit(); err != nil {
+		return GroomSplitRevertResult{}, err
+	}
+	return result, nil
+}
+
+func selectActiveGroomSplitParents(ctx context.Context, tx *sql.Tx, options GroomSplitRevertOptions) ([]int64, error) {
+	query := `
+SELECT DISTINCT p.id
+FROM confirmed_memories p
+JOIN confirmed_memories c ON c.provenance = 'groom-split:' || p.id
+WHERE p.superseded_by IS NOT NULL AND p.retired_at = ''
+	AND c.superseded_by IS NULL AND c.retired_at = ''`
+	var args []any
+	if len(options.ParentIDs) > 0 {
+		seen := make(map[int64]struct{}, len(options.ParentIDs))
+		ids := make([]int64, 0, len(options.ParentIDs))
+		for _, id := range options.ParentIDs {
+			if id <= 0 {
+				return nil, fmt.Errorf("invalid groom split parent id %d", id)
+			}
+			if _, duplicate := seen[id]; duplicate {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		placeholders := make([]string, len(ids))
+		for i, id := range ids {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		query += "\n\tAND p.id IN (" + strings.Join(placeholders, ",") + ")"
+	}
+	if since := strings.TrimSpace(options.Since); since != "" {
+		query += "\n\tAND c.updated_at >= ?"
+		args = append(args, since)
+	}
+	query += "\nORDER BY p.id"
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("select active groom split parents: %w", err)
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+func revertGroomSplitTx(ctx context.Context, tx *sql.Tx, parentID int64, dryRun bool) (GroomSplitReverted, bool, string, error) {
+	var parentKey, parentContent string
+	var expectedChildID int64
+	err := tx.QueryRowContext(ctx, `
+SELECT key, content, COALESCE(superseded_by, 0)
+FROM confirmed_memories
+WHERE id = ? AND retired_at = ''`, parentID).Scan(&parentKey, &parentContent, &expectedChildID)
+	if err == sql.ErrNoRows {
+		return GroomSplitReverted{}, false, "parent is missing or retired", nil
+	}
+	if err != nil {
+		return GroomSplitReverted{}, false, "", fmt.Errorf("read groom split parent %d for revert: %w", parentID, err)
+	}
+
+	type childRow struct {
+		id        int64
+		content   string
+		clusterID sql.NullInt64
+	}
+	rows, err := tx.QueryContext(ctx, `
+SELECT c.id, c.content, m.cluster_id
+FROM confirmed_memories c
+LEFT JOIN memory_cluster_members m ON m.memory_id = c.id
+WHERE c.provenance = ? AND c.superseded_by IS NULL AND c.retired_at = ''
+ORDER BY c.id`, fmt.Sprintf("groom-split:%d", parentID))
+	if err != nil {
+		return GroomSplitReverted{}, false, "", fmt.Errorf("list groom split children for parent %d: %w", parentID, err)
+	}
+	var children []childRow
+	for rows.Next() {
+		var child childRow
+		if err := rows.Scan(&child.id, &child.content, &child.clusterID); err != nil {
+			rows.Close()
+			return GroomSplitReverted{}, false, "", err
+		}
+		children = append(children, child)
+	}
+	if err := rows.Close(); err != nil {
+		return GroomSplitReverted{}, false, "", err
+	}
+	if len(children) < 2 {
+		return GroomSplitReverted{}, false, "fewer than two active split children", nil
+	}
+	if expectedChildID != children[0].id {
+		return GroomSplitReverted{}, false, "parent superseded pointer does not match the lowest active child", nil
+	}
+	var coverage strings.Builder
+	childIDs := make([]int64, 0, len(children))
+	for _, child := range children {
+		coverage.WriteString(child.content)
+		childIDs = append(childIDs, child.id)
+	}
+	if coverage.String() != strings.TrimSpace(parentContent) {
+		return GroomSplitReverted{}, false, "active children no longer reconstruct the parent", nil
+	}
+
+	reverted := GroomSplitReverted{ParentID: parentID, ChildIDs: childIDs}
+	if dryRun {
+		return reverted, true, "", nil
+	}
+	for _, child := range children {
+		if err := retireConfirmedMemoryTx(ctx, tx, child.id, "", fmt.Sprintf("groom-split-revert:%d", parentID)); err != nil {
+			return GroomSplitReverted{}, false, "", fmt.Errorf("retire groom split child %d: %w", child.id, err)
+		}
+	}
+	placeholders := make([]string, len(childIDs))
+	args := make([]any, 0, len(childIDs))
+	for i, id := range childIDs {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM memory_cluster_members WHERE memory_id IN (`+strings.Join(placeholders, ",")+`)`, args...); err != nil {
+		return GroomSplitReverted{}, false, "", fmt.Errorf("detach groom split children for parent %d: %w", parentID, err)
+	}
+	now := nowRFC3339()
+	res, err := tx.ExecContext(ctx, `
+UPDATE confirmed_memories SET superseded_by = NULL, updated_at = ?
+WHERE id = ? AND superseded_by = ? AND retired_at = ''`, now, parentID, expectedChildID)
+	if err != nil {
+		return GroomSplitReverted{}, false, "", fmt.Errorf("restore groom split parent %d: %w", parentID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return GroomSplitReverted{}, false, "", err
+	}
+	if affected != 1 {
+		return GroomSplitReverted{}, false, "", fmt.Errorf("groom split parent %d changed during revert", parentID)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM confirmed_memories_fts WHERE rowid = ?`, parentID); err != nil {
+		return GroomSplitReverted{}, false, "", fmt.Errorf("clear restored parent FTS %d: %w", parentID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO confirmed_memories_fts(rowid, content, key) VALUES (?, ?, ?)`, parentID, parentContent, parentKey); err != nil {
+		return GroomSplitReverted{}, false, "", fmt.Errorf("restore parent FTS %d: %w", parentID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM memory_cluster_members WHERE memory_id = ?`, parentID); err != nil {
+		return GroomSplitReverted{}, false, "", fmt.Errorf("clear restored parent cluster %d: %w", parentID, err)
+	}
+	if children[0].clusterID.Valid {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO memory_cluster_members(memory_id, cluster_id) VALUES (?, ?)`, parentID, children[0].clusterID.Int64); err != nil {
+			return GroomSplitReverted{}, false, "", fmt.Errorf("restore parent %d cluster: %w", parentID, err)
+		}
+	}
+	return reverted, true, "", nil
 }
 
 // ApplyVaultImport applies a whole import plan in ONE transaction so a partial
@@ -1786,7 +2009,7 @@ func (s *Store) QueryConfirmedMemories(ctx context.Context, owner MemoryOwner, r
 		limit = 15
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.author_ref, c.repo, c.scope, c.key, c.content,
+SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.author_ref, c.repo, c.scope, c.key, c.content, c.context,
 	c.provenance, c.source_job, c.first_confirmed_at, c.updated_at
 FROM confirmed_memories_fts f
 JOIN confirmed_memories c ON c.id = f.rowid
@@ -1824,7 +2047,7 @@ func (s *Store) QueryConfirmedMemoriesForOwnerAllRepos(ctx context.Context, owne
 		limit = 15
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.author_ref, c.repo, c.scope, c.key, c.content,
+SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.author_ref, c.repo, c.scope, c.key, c.content, c.context,
 	c.provenance, c.source_job, c.first_confirmed_at, c.updated_at
 FROM confirmed_memories_fts f
 JOIN confirmed_memories c ON c.id = f.rowid
@@ -1880,7 +2103,7 @@ func (s *Store) ensureOwnMemoryFloor(ctx context.Context, owner MemoryOwner, rep
 
 func (s *Store) queryStrongestOwnMemory(ctx context.Context, owner MemoryOwner, repo, matchQuery string, filterRepo bool) (ConfirmedMemory, bool, error) {
 	query := `
-SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.author_ref, c.repo, c.scope, c.key, c.content,
+SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.author_ref, c.repo, c.scope, c.key, c.content, c.context,
 	c.provenance, c.source_job, c.first_confirmed_at, c.updated_at
 FROM confirmed_memories_fts f
 JOIN confirmed_memories c ON c.id = f.rowid
@@ -1925,7 +2148,7 @@ func (s *Store) QueryConfirmedMemoriesForAllAgents(ctx context.Context, repo, ma
 		limit = 15
 	}
 	query := `
-SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.author_ref, c.repo, c.scope, c.key, c.content,
+SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.author_ref, c.repo, c.scope, c.key, c.content, c.context,
 	c.provenance, c.source_job, c.first_confirmed_at, c.updated_at
 FROM confirmed_memories_fts f
 JOIN confirmed_memories c ON c.id = f.rowid
@@ -1959,7 +2182,7 @@ func (s *Store) QueryConfirmedMemoriesForShared(ctx context.Context, repo, match
 		limit = 15
 	}
 	query := `
-SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.author_ref, c.repo, c.scope, c.key, c.content,
+SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.author_ref, c.repo, c.scope, c.key, c.content, c.context,
 	c.provenance, c.source_job, c.first_confirmed_at, c.updated_at
 FROM confirmed_memories_fts f
 JOIN confirmed_memories c ON c.id = f.rowid
@@ -2006,7 +2229,7 @@ type rowsQuerier interface {
 // (via a *sql.Tx) without duplicating the query.
 func listConfirmedMemoriesForVault(ctx context.Context, q rowsQuerier, agentRef string) ([]ConfirmedMemory, error) {
 	query := `
-SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, context,
 	provenance, source_job, first_confirmed_at, updated_at, COALESCE(superseded_by, 0)
 FROM confirmed_memories
 WHERE superseded_by IS NULL AND retired_at = ''`
@@ -2026,7 +2249,7 @@ WHERE superseded_by IS NULL AND retired_at = ''`
 		var c ConfirmedMemory
 		var repoNull sql.NullString
 		if err := rows.Scan(&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &c.AuthorRef, &repoNull,
-			&c.Scope, &c.Key, &c.Content, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt, &c.UpdatedAt, &c.SupersededBy); err != nil {
+			&c.Scope, &c.Key, &c.Content, &c.Context, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt, &c.UpdatedAt, &c.SupersededBy); err != nil {
 			return nil, err
 		}
 		c.Repo = repoNull.String
@@ -2052,7 +2275,7 @@ func (s *Store) QueryConfirmedMemoryVaultLinks(ctx context.Context, owner Memory
 		limit = 6
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.author_ref, c.repo, c.scope, c.key, c.content,
+SELECT c.id, c.owner_kind, c.owner_ref, c.owner_version, c.author_ref, c.repo, c.scope, c.key, c.content, c.context,
 	c.provenance, c.source_job, c.first_confirmed_at, c.updated_at
 FROM confirmed_memories_fts f
 JOIN confirmed_memories c ON c.id = f.rowid
@@ -2089,7 +2312,7 @@ func (s *Store) ListConfirmedMemories(ctx context.Context, ownerRef, repo string
 		args = append(args, repo)
 	}
 	query := `
-SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, context,
 	provenance, source_job, first_confirmed_at, updated_at
 FROM confirmed_memories`
 	if len(where) > 0 {
@@ -2113,7 +2336,7 @@ func (s *Store) ListActiveConfirmedMemoriesByProvenancePrefix(ctx context.Contex
 		return nil, nil
 	}
 	query := `
-SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, context,
 	provenance, source_job, first_confirmed_at, updated_at
 FROM confirmed_memories
 WHERE owner_kind = ? AND owner_ref = ? AND owner_version = ?
@@ -2194,7 +2417,7 @@ func scanConfirmedMemories(rows *sql.Rows) ([]ConfirmedMemory, error) {
 		var c ConfirmedMemory
 		var repoNull sql.NullString
 		if err := rows.Scan(&c.ID, &c.Owner.Kind, &c.Owner.Ref, &c.Owner.Version, &c.AuthorRef, &repoNull,
-			&c.Scope, &c.Key, &c.Content, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt, &c.UpdatedAt); err != nil {
+			&c.Scope, &c.Key, &c.Content, &c.Context, &c.Provenance, &c.SourceJob, &c.FirstConfirmedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		c.Repo = repoNull.String

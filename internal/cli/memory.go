@@ -84,7 +84,7 @@ func printMemoryUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot memory promote --to-shared <id>... [--json]")
 	fmt.Fprintln(w, "  gitmoot memory links backfill [--dry-run] [--json]")
 	fmt.Fprintln(w, "  gitmoot memory links list <id> [--json]")
-	fmt.Fprintln(w, "  gitmoot memory groom --propose [--out PLAN.json] [--json] | --yes --plan PLAN.json [--json]")
+	fmt.Fprintln(w, "  gitmoot memory groom --propose | --yes --plan PLAN.json | --split | --split-revert [options]")
 	fmt.Fprintln(w, "  gitmoot memory clusters [--json]")
 	fmt.Fprintln(w, "  gitmoot memory clusters recompute --propose [--out PLAN.json] [--json] | --apply [--plan PLAN.json] [--json]")
 	fmt.Fprintln(w, "  gitmoot memory cluster rename <cluster-id> <label>")
@@ -122,6 +122,7 @@ type memoryRecallEntry struct {
 	Repo       string            `json:"repo"`
 	Scope      string            `json:"scope"`
 	Key        string            `json:"key"`
+	Context    string            `json:"context,omitempty"`
 	Content    string            `json:"content"`
 	Provenance string            `json:"provenance"`
 	UpdatedAt  string            `json:"updated_at"`
@@ -208,6 +209,7 @@ func runMemoryRecall(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, memory.RenderBullet(memory.Entry{
 			Scope:     r.Scope,
 			Key:       r.Key,
+			Context:   r.Context,
 			Content:   r.Content,
 			UpdatedAt: r.UpdatedAt,
 			Linked:    linkedFrom[r.ID] != 0,
@@ -308,6 +310,7 @@ func memoryRecallJSONEntry(r db.ConfirmedMemory, linkedFrom int64) memoryRecallE
 		Repo:       r.Repo,
 		Scope:      r.Scope,
 		Key:        r.Key,
+		Context:    r.Context,
 		Content:    r.Content,
 		Provenance: r.Provenance,
 		UpdatedAt:  r.UpdatedAt,

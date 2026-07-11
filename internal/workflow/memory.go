@@ -230,6 +230,7 @@ func memoryEntryFromConfirmed(r db.ConfirmedMemory, linked bool) memory.Entry {
 	return memory.Entry{
 		Scope:     r.Scope,
 		Key:       r.Key,
+		Context:   r.Context,
 		Content:   r.Content,
 		UpdatedAt: r.UpdatedAt,
 		Linked:    linked,

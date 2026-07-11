@@ -203,7 +203,8 @@ repo = "owner/repo"
 	`)
 	groomSeed(t, store)
 	parentID := seedConfirmed(t, store, db.MemoryOwner{Kind: "agent", Ref: "lead"}, "owner/repo", "repo", "pipeline-brick",
-		"**First pipeline story**\nThe first pipeline story has substantive implementation detail.\n\n**Second pipeline story**\nThe second pipeline story has substantive implementation detail.")
+		"**First pipeline story**\n"+strings.Repeat("The first pipeline story has substantive implementation detail. ", 5)+
+			"\n\n**Second pipeline story**\n"+strings.Repeat("The second pipeline story has substantive implementation detail. ", 5))
 	runInstallDefaults(t, home)
 	rec, ok, err := store.GetPipeline(context.Background(), "memory-groom-propose")
 	if err != nil || !ok {

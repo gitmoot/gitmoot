@@ -56,6 +56,7 @@ type Owner struct {
 type Entry struct {
 	Scope     string // ScopeRepo | ScopeGeneral
 	Key       string
+	Context   string // optional subject inherited from a split parent
 	Content   string
 	UpdatedAt string
 	Linked    bool // true when included via a 1-hop memory_links expansion
@@ -226,6 +227,9 @@ func RenderBullet(e Entry) string {
 	tags := []string{scopeTag(e.Scope)}
 	if e.Linked {
 		tags = append(tags, "[linked]")
+	}
+	if context := strings.TrimSpace(e.Context); context != "" {
+		tags = append(tags, "(split from: "+context+")")
 	}
 	return "- " + strings.Join(tags, " ") + " " + strings.TrimSpace(e.Content)
 }

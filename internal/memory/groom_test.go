@@ -1,6 +1,8 @@
 package memory
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -220,7 +222,8 @@ func TestSplitBrickLosslessFact80Shape(t *testing.T) {
 }
 
 func TestSplitBrickStrongSeamsBelowRewriteThreshold(t *testing.T) {
-	content := "**First shipped story**\nThe cache invalidation path now preserves live sessions.\n\n**Second shipped story**\nThe retry path now records its durable terminal reason."
+	content := "**First shipped story**\n" + strings.Repeat("The cache invalidation path now preserves live sessions. ", 5) +
+		"\n\n**Second shipped story**\n" + strings.Repeat("The retry path now records its durable terminal reason. ", 5)
 	if len(content) >= GroomRewriteThreshold {
 		t.Fatal("fixture must exercise seam qualification below the length threshold")
 	}
@@ -235,12 +238,13 @@ func TestSplitBrickStrongSeamsBelowRewriteThreshold(t *testing.T) {
 }
 
 func TestSplitBrickDateAndPRMarkerLines(t *testing.T) {
-	content := "2026-07-10\nThe deployment story includes enough substantive detail.\nPR #832\nThe groom split story includes enough substantive detail."
+	content := "2026-07-10\n" + strings.Repeat("The deployment story includes enough substantive detail. ", 5) +
+		"\nPR #832\n" + strings.Repeat("The groom split story includes enough substantive detail. ", 5)
 	children := SplitBrick("dated-stories", content)
 	if len(children) != 2 || !strings.HasSuffix(children[0].Key, "2026-07-10") || !strings.HasSuffix(children[1].Key, "pr-832") {
 		t.Fatalf("date/PR seams = %+v", children)
 	}
-	if concatGroomSplitChildren(children) != content {
+	if concatGroomSplitChildren(children) != strings.TrimSpace(content) {
 		t.Fatal("date/PR split lost parent bytes")
 	}
 }
@@ -260,8 +264,9 @@ func TestSplitBrickSeamPoorLongProseFallsBackToFlagOnly(t *testing.T) {
 }
 
 func TestDetectGroomSplitsDeterministicAndRejectsNonSubstantiveSegments(t *testing.T) {
-	good := "**Alpha**\nA substantive first implementation story.\n\n**Beta**\nA substantive second implementation story."
-	bad := "**Alpha**\nA substantive implementation story.\n\n**Beta**\nx"
+	good := "**Alpha**\n" + strings.Repeat("A substantive first implementation story remains stable. ", 5) +
+		"\n\n**Beta**\n" + strings.Repeat("A substantive second implementation story remains stable. ", 5)
+	bad := "**Alpha**\n" + strings.Repeat("A substantive implementation story remains stable. ", 5) + "\n\n**Beta**\nx"
 	cands := []GroomCandidate{
 		{ID: 20, Key: "bad", Content: bad, UpdatedAt: "u20"},
 		{ID: 10, Key: "good", Content: good, UpdatedAt: "u10"},
@@ -278,7 +283,8 @@ func TestDetectGroomSplitsDeterministicAndRejectsNonSubstantiveSegments(t *testi
 }
 
 func TestDetectGroomSplitsAllocatesAroundExistingScopeKeys(t *testing.T) {
-	content := "**Alpha story**\nA substantive first implementation story.\n\n**Beta story**\nA substantive second implementation story."
+	content := "**Alpha story**\n" + strings.Repeat("A substantive first implementation story remains stable. ", 5) +
+		"\n\n**Beta story**\n" + strings.Repeat("A substantive second implementation story remains stable. ", 5)
 	cands := []GroomCandidate{
 		{ID: 1, Key: "parent", Content: content, OwnerKind: "agent", OwnerRef: "lead", Repo: "acme/widget", Scope: "repo"},
 		{ID: 2, Key: "parent-alpha-story", Content: "an existing fact", OwnerKind: "agent", OwnerRef: "lead", Repo: "acme/widget", Scope: "repo"},
@@ -392,7 +398,10 @@ func TestGroomFirstLine(t *testing.T) {
 // date/PR evidence so they are story seams; sub-field leads like "**Why:**"
 // must NOT cut.
 func TestSplitBrickBoldLeadInlineSeams(t *testing.T) {
-	content := "**Waveform refinement (2026-06-19, PR #241, main x):** fixed blocky zoom\nmore detail line\n**Per-tile focus bug fixed (2026-06-21, PR #242):** assigning a person\n**Why:** the event was overloaded\ntrailing line"
+	content := "**Waveform refinement (2026-06-19, PR #241, main x):** fixed blocky zoom\n" +
+		strings.Repeat("The waveform path preserves exact source timing and stable redraw behavior. ", 4) +
+		"\n**Per-tile focus bug fixed (2026-06-21, PR #242):** assigning a person\n**Why:** the event was overloaded\n" +
+		strings.Repeat("The tile path preserves the split while updating only the selected track. ", 4)
 	children := SplitBrick("editor-goalset", content)
 	if len(children) != 2 {
 		t.Fatalf("children = %d, want 2 (one per dated bold-lead story; **Why:** must not cut): %+v", len(children), children)
@@ -403,5 +412,113 @@ func TestSplitBrickBoldLeadInlineSeams(t *testing.T) {
 	}
 	if !strings.Contains(children[1].Content, "**Why:**") {
 		t.Fatalf("sub-field lead should stay inside story 2: %q", children[1].Content)
+	}
+}
+
+func TestGroomStrongSeamGuards(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{name: "plain PR marker", line: "PR #842", want: true},
+		{name: "dash list PR", line: "- #147 phrasing perturbation", want: false},
+		{name: "asterisk list PR", line: "* PR #147 phrasing perturbation", want: false},
+		{name: "plus list date", line: "+ 2026-07-11 shipped", want: false},
+		{name: "number-dot list date", line: "1. 2026-07-11 shipped", want: false},
+		{name: "number-paren list PR", line: "2) PR #147 shipped", want: false},
+		{name: "why sub-field", line: "**Why:**", want: false},
+		{name: "how-to-apply sub-field", line: "**How to apply:**", want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isGroomStrongSeam(tc.line); got != tc.want {
+				t.Fatalf("isGroomStrongSeam(%q) = %v, want %v", tc.line, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMergeGroomRunts(t *testing.T) {
+	tests := []struct {
+		name     string
+		lengths  []int
+		wantEnds []int
+	}{
+		{name: "first runt merges forward", lengths: []int{100, 250, 250}, wantEnds: []int{350, 600}},
+		{name: "middle runt merges backward", lengths: []int{250, 100, 250}, wantEnds: []int{350, 600}},
+		{name: "last runt merges backward", lengths: []int{250, 250, 100}, wantEnds: []int{250, 600}},
+		{name: "repeat until one remains", lengths: []int{100, 100, 100}, wantEnds: []int{300}},
+		{name: "exact threshold survives", lengths: []int{200, 200}, wantEnds: []int{200, 400}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var content strings.Builder
+			segments := make([]groomTextUnit, 0, len(tc.lengths))
+			start := 0
+			for i, n := range tc.lengths {
+				content.WriteString(strings.Repeat(string(rune('a'+i)), n))
+				segments = append(segments, groomTextUnit{start: start, end: start + n})
+				start += n
+			}
+			got := mergeGroomRunts(segments, content.String())
+			if len(got) != len(tc.wantEnds) {
+				t.Fatalf("segments = %+v, want ends %v", got, tc.wantEnds)
+			}
+			for i, wantEnd := range tc.wantEnds {
+				if got[i].end != wantEnd {
+					t.Fatalf("segment %d end = %d, want %d (%+v)", i, got[i].end, wantEnd, got)
+				}
+			}
+		})
+	}
+}
+
+func TestSplitBrickRejectsStatusChangelog(t *testing.T) {
+	line := strings.Repeat(" release status detail", 14)
+	content := "2026-07-11" + line + "\n2026-07-10" + line + "\n2026-07-09" + line
+	if !detectStatusChangelog(content) {
+		t.Fatal("fixture must be detected as a status changelog")
+	}
+	if got := SplitBrick("release-status", content); got != nil {
+		t.Fatalf("status changelog split = %+v, want nil", got)
+	}
+}
+
+func TestSplitBrickLiveRegressionFixtures(t *testing.T) {
+	read := func(id string) string {
+		t.Helper()
+		body, err := os.ReadFile(filepath.Join("testdata", "groom", id+".md"))
+		if err != nil {
+			t.Fatalf("read fixture %s: %v", id, err)
+		}
+		return strings.TrimSuffix(string(body), "\n")
+	}
+
+	children := SplitBrick("editor-waveform-speakersplit-goalset", read("80"))
+	if len(children) != 2 {
+		t.Fatalf("fact 80 children = %+v, want exactly 2", children)
+	}
+	if !strings.HasPrefix(children[0].Content, "**Waveform refinement (2026-06-19, PR #241") ||
+		!strings.HasPrefix(children[1].Content, "**Per-tile speaker-focus bug fixed (2026-06-21, PR #242") {
+		t.Fatalf("fact 80 story heads = %q / %q", groomFirstLine(children[0].Content), groomFirstLine(children[1].Content))
+	}
+	wantLabels := []string{
+		"Waveform refinement (2026-06-19, PR #241, main `40b92f0`)",
+		"Per-tile speaker-focus bug fixed (2026-06-21, PR #242, main `f249a12`)",
+	}
+	for i, child := range children {
+		if label := groomSeamLabel(groomFirstNonBlankLine(groomTextUnit{start: 0, end: len(child.Content)}, child.Content)); label != wantLabels[i] {
+			t.Fatalf("fact 80 child %d label = %q, want %q", i, label, wantLabels[i])
+		}
+	}
+	if concatGroomSplitChildren(children) != read("80") {
+		t.Fatal("fact 80 split lost coverage")
+	}
+
+	for _, id := range []string{"152", "204", "264"} {
+		if got := SplitBrick("live-fact-"+id, read(id)); got != nil {
+			t.Fatalf("fact %s split = %+v, want nil", id, got)
+		}
 	}
 }
