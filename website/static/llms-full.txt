@@ -11574,6 +11574,25 @@ requires a non-empty repo and sends only a queued-job acknowledgement because
 
 # Gitmoot Workflows
 
+## Orchestrate vs. workflow: who is the manager?
+
+Two ways to run multi-job efforts, answering one question differently: who
+decides the next step? `gitmoot orchestrate` makes GITMOOT the manager — a
+coordinator agent JOB returns `delegations[]` and the engine executes the tree
+with its guardrails (dependency ordering, retries, timeouts, failure policies,
+synthesis, tree token budgets, kill scope). `--workflow <label>` makes an
+EXTERNAL coordinator the manager — a Claude/Codex session, a script, or a human
+drives independent jobs, judging results between steps; the label plus the
+`workflow note` journal make that project visible (workflow list/show, Galaxy
+hubs, `/workflows/<label>`) and `--remember` distills its insight into shared
+memory. Use `orchestrate` when the plan fits a declarable tree run unattended
+(parallel fan-out, bounded autonomous work, pipeline orchestrate stages); use
+an external coordinator with `--workflow` when judgment between steps is the
+point (build-review-fix loops, test-and-decide sequences, git/PR ownership).
+They compose: `orchestrate --workflow x` labels the whole tree, so a workflow
+can contain orchestrations. `--workflow` is visibility-only by design — never
+scheduling, locking, budgets, or lifecycle.
+
 ## External-coordinator workflows
 
 Use `--workflow <label>` when an external coordinator needs one durable group
