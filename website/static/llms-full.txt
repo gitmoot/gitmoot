@@ -6421,7 +6421,8 @@ learning. **Skills** is the SkillOpt evolution overview — one row per agent
 template with its version history as an inline score-trend sparkline, the
 current version, any active canary, and pending candidates (each expandable to
 a copy-paste `gitmoot skillopt candidate promote` command). Clicking a row
-jumps to that agent's detail panel. **Knowledge** is the memory fact galaxy —
+jumps to that agent's detail panel. The memory fact galaxy that used to live
+here as a second tab is now the top-level **Brain** view (below) —
 one lane per repo scope, each lane holding its facts as a wiki-link
 constellation, cluster and sub-cluster hub columns, and enrolled agents as
 wells on the right; clicking a fact, cluster, or agent opens its detail panel.
@@ -6435,6 +6436,43 @@ selecting a fact draws its full dashed curve to the partner), and **history**
 hidden; toggle on to see how facts were replaced over time, e.g. by the
 automatic brick splitter). Unclustered facts sit in their own repo's lane.
 Both tabs are read-only and poll every 12 seconds.
+
+## Workflows
+
+Route: `/workflows` (index) and `/workflows/{label}` (mission log)
+
+Workflows are labeled campaigns of related work driven by a coordinator: jobs
+dispatched with `--workflow <label>` plus the journal written with
+`gitmoot workflow note`. Labels may carry one namespace slash
+(`fable/dashboard-redesign`) — by convention the coordinator's herdr pane name
+namespaces the campaign; unattended sources use reserved namespaces.
+
+The **index** groups every known workflow by derived lifecycle: **stalled**
+pinned on top ("needs a look"), then **active**, then recently **settled**.
+A workflow is stalled only when a failure has gone **unacknowledged** — nothing
+is running, the goal was not reached, and no journal note has been written
+since the last failure (a failure alone is not an alarm; the silence after it
+is). Stalled entries age into settled history after a day of silence.
+
+The **detail page** reads as a mission log: journal notes and run trees
+interleaved in reverse-chronological order — the coordinator's intent next to
+the runs it produced. Run blocks expand inline to their child jobs; a
+"view as graph" link opens the classic per-run node graph as a drill-down.
+The header carries the coordinator identity (author, herdr pane, session id),
+and a stalled workflow shows a go-here card with the pane, the session id, and
+a copyable resume command — the dashboard tells you where to intervene; it
+never intervenes itself.
+
+## Brain
+
+Route: `/brain` (the old `/learning/knowledge` route redirects)
+
+The memory fact galaxy, promoted from Learning's second tab to a first-class
+view: one lane per repo scope, facts as wiki-link constellations, cluster and
+sub-cluster hub columns, enrolled agents as wells, progressive disclosure for
+deep cluster trees, and the fact-links / cross-repo / history header toggles.
+See the Learning section above for how facts are produced; Brain is where you
+read them.
 
 ## Agents
 
