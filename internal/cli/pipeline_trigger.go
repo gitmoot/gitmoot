@@ -22,11 +22,12 @@ import (
 )
 
 const (
-	triggerBindingBound   = "bound"
-	triggerBindingPending = "pending"
-	triggerBindingError   = "error"
-	defaultIMAPVersion    = "~0.4.4"
-	defaultGitmootVersion = "~0.1.3"
+	triggerBindingBound              = "bound"
+	triggerBindingPending            = "pending"
+	triggerBindingError              = "error"
+	defaultIMAPVersion               = "~0.4.4"
+	defaultGitmootVersion            = "~0.1.3"
+	minimumMappedGitmootPieceVersion = "0.1.4"
 )
 
 type pipelineTriggerBinding struct {
@@ -200,8 +201,24 @@ func bindPipelineTrigger(ctx context.Context, store *db.Store, rec db.Pipeline, 
 	} else {
 		versions["imap"] = version
 	}
-	if version, resolveErr := session.Client.ResolvePieceVersion(ctx, session.Token, session.ProjectID, "@gitmoot/piece-gitmoot", defaultGitmootVersion); resolveErr == nil {
+	gitmootVersionRange := defaultGitmootVersion
+	mapped := len(spec.Trigger.Map) > 0
+	if mapped {
+		// Resolve WITHOUT a range and gate with pieceVersionAtLeast below: a
+		// tilde range like ~0.1.4 would wrongly reject a future 0.2.0 piece
+		// that pieceVersionAtLeast accepts.
+		gitmootVersionRange = ""
+	}
+	version, resolveErr := session.Client.ResolvePieceVersion(ctx, session.Token, session.ProjectID, "@gitmoot/piece-gitmoot", gitmootVersionRange)
+	if resolveErr != nil {
+		if mapped {
+			return failAs(fmt.Errorf("mapped trigger flows require @gitmoot/piece-gitmoot >= %s; resolve installed piece version: %w", minimumMappedGitmootPieceVersion, resolveErr), triggerBindingError)
+		}
+	} else {
 		versions["gitmoot"] = version
+		if mapped && !pieceVersionAtLeast(version, minimumMappedGitmootPieceVersion) {
+			return failAs(fmt.Errorf("mapped trigger flows require @gitmoot/piece-gitmoot >= %s; resolved %s", minimumMappedGitmootPieceVersion, version), triggerBindingError)
+		}
 	}
 	displayName, flow, err := activepieces.BuildTriggerFlow(spec.Name, *spec.Trigger, activepiecesConnectionID, versions["imap"], versions["gitmoot"])
 	if err != nil {
@@ -258,6 +275,41 @@ func bindPipelineTrigger(ctx context.Context, store *db.Store, rec db.Pipeline, 
 		return binding, err
 	}
 	return binding, nil
+}
+
+func pieceVersionAtLeast(version, minimum string) bool {
+	parse := func(value string) ([3]int, bool, bool) {
+		var parts [3]int
+		value = strings.TrimPrefix(strings.TrimSpace(value), "v")
+		value, _, _ = strings.Cut(value, "+")
+		core, prerelease, hasPrerelease := strings.Cut(value, "-")
+		fields := strings.Split(core, ".")
+		if len(fields) != len(parts) {
+			return parts, false, false
+		}
+		for i, field := range fields {
+			n, err := strconv.Atoi(field)
+			if err != nil || n < 0 {
+				return parts, false, false
+			}
+			parts[i] = n
+		}
+		return parts, hasPrerelease && prerelease != "", true
+	}
+	got, gotPrerelease, ok := parse(version)
+	if !ok {
+		return false
+	}
+	want, _, ok := parse(minimum)
+	if !ok {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return got[i] > want[i]
+		}
+	}
+	return !gotPrerelease
 }
 
 func triggerFlowOwned(flow activepieces.Flow, displayName, bindingID string) bool {

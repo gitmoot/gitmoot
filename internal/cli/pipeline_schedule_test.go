@@ -131,7 +131,7 @@ func TestSchedulePipelineOverlapGuard(t *testing.T) {
 	}
 	now := time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC)
 	// An already-running run exists (created earlier).
-	if _, err := createPipelineRun(ctx, store, rec, spec, "schedule", now.Add(-time.Hour)); err != nil {
+	if _, err := createPipelineRun(ctx, store, rec, spec, "schedule", "{}", now.Add(-time.Hour)); err != nil {
 		t.Fatalf("createPipelineRun: %v", err)
 	}
 

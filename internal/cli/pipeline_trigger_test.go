@@ -160,6 +160,79 @@ func TestBindPipelineTriggerPublishesAndRefusesOwnershipMismatch(t *testing.T) {
 	}
 }
 
+func TestBindMappedPipelineRequiresGitmootPiece014(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		version    string
+		resolveErr bool
+	}{
+		{name: "old version", version: "0.1.3"},
+		{name: "resolution failure", resolveErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			raw := []byte("name: mail-flow\nrepo: owner/repo\ntrigger:\n  kind: email\n  map: {subject: subject}\nstages:\n  - {id: run, cmd: echo ok}\n")
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == "/api/v1/authentication/sign-up":
+					_, _ = w.Write([]byte(`{"token":"token","projectId":"project-1"}`))
+				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "piece-imap"):
+					_, _ = w.Write([]byte(`{"version":"0.4.3"}`))
+				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "piece-gitmoot"):
+					if tc.resolveErr {
+						http.Error(w, "missing", http.StatusNotFound)
+						return
+					}
+					_, _ = w.Write([]byte(`{"version":"` + tc.version + `"}`))
+				default:
+					http.Error(w, "unexpected request", http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+
+			if err := withStore(home, func(store *db.Store) error {
+				ctx := context.Background()
+				if err := store.CreateOrUpdatePipeline(ctx, db.Pipeline{Name: "mail-flow", Repo: "owner/repo", SpecYAML: string(raw), SpecHash: pipeline.Hash(raw)}); err != nil {
+					return err
+				}
+				rec, _, err := store.GetPipeline(ctx, "mail-flow")
+				if err != nil {
+					return err
+				}
+				_, err = bindPipelineTrigger(ctx, store, rec, activepiecesAuthOptions{Home: home, URL: server.URL, Password: "admin"}, triggerBindingPending)
+				if err == nil || !strings.Contains(err.Error(), "@gitmoot/piece-gitmoot >= 0.1.4") {
+					t.Fatalf("bind error = %v", err)
+				}
+				updated, _, getErr := store.GetPipeline(ctx, "mail-flow")
+				if getErr != nil {
+					return getErr
+				}
+				binding, decodeErr := decodeTriggerBinding(updated.TriggerBinding)
+				if decodeErr != nil || binding.State != triggerBindingError || !strings.Contains(binding.LastError, "0.1.4") {
+					t.Fatalf("binding = %+v decodeErr=%v", binding, decodeErr)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestPieceVersionAtLeast(t *testing.T) {
+	for _, tc := range []struct {
+		version string
+		want    bool
+	}{
+		{"0.1.3", false}, {"0.1.4-beta.1", false}, {"0.1.4", true}, {"v0.1.4+build", true}, {"0.2.0-beta.1", true}, {"1.0.0", true}, {"bad", false},
+	} {
+		if got := pieceVersionAtLeast(tc.version, "0.1.4"); got != tc.want {
+			t.Errorf("pieceVersionAtLeast(%q)=%v want %v", tc.version, got, tc.want)
+		}
+	}
+}
+
 func TestPipelineDisableAndRemoveRemainLocalFirstWhenAPUnavailable(t *testing.T) {
 	for _, command := range []string{"disable", "remove"} {
 		t.Run(command, func(t *testing.T) {

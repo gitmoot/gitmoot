@@ -183,8 +183,11 @@ type JobRequest struct {
 	// stored runtime/session are untouched: the job runs on RuntimeOverrideRef
 	// (an explicit session on the override runtime, or a minted fresh ref), and
 	// the engine never persists a refreshed session ref for an overridden job.
-	RuntimeOverride        string
-	RuntimeOverrideRef     string
+	RuntimeOverride    string
+	RuntimeOverrideRef string
+	// ShellEnv carries pipeline trigger inputs as exact KEY=value entries to a
+	// shell runtime job. It is empty for every non-pipeline and non-shell job.
+	ShellEnv               []string
 	Phase                  string
 	Cockpit                bool
 	CockpitSession         string
@@ -279,6 +282,7 @@ type JobPayload struct {
 	WorkflowID             string         `json:"workflow_id,omitempty"`
 	RuntimeOverride        string         `json:"runtime_override,omitempty"`
 	RuntimeOverrideRef     string         `json:"runtime_override_ref,omitempty"`
+	ShellEnv               []string       `json:"shell_env,omitempty"`
 	Phase                  string         `json:"phase,omitempty"`
 	Cockpit                bool           `json:"cockpit,omitempty"`
 	CockpitSession         string         `json:"cockpit_session,omitempty"`
@@ -421,6 +425,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		WorkflowID:             strings.TrimSpace(request.WorkflowID),
 		RuntimeOverride:        strings.TrimSpace(request.RuntimeOverride),
 		RuntimeOverrideRef:     strings.TrimSpace(request.RuntimeOverrideRef),
+		ShellEnv:               append([]string(nil), request.ShellEnv...),
 		Phase:                  request.Phase,
 		Cockpit:                request.Cockpit,
 		CockpitSession:         strings.TrimSpace(request.CockpitSession),
@@ -1039,6 +1044,7 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		PullRequest: payload.PullRequest,
 		Model:       payload.Model,
 		Effort:      payload.Effort,
+		ShellEnv:    append([]string(nil), payload.ShellEnv...),
 	}
 	// #652: thread in the runtime's configured registry default_model as the FINAL
 	// model fallback. effectiveModel applies the precedence (job.Model > agent.Model

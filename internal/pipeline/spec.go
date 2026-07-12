@@ -81,6 +81,11 @@ type Spec struct {
 	// deliberate, spelled-twice opt-in. Irrelevant to a manual-only pipeline (no
 	// schedule), which a mutating stage enters with only its per-stage write: true.
 	AllowScheduledWrites bool `yaml:"allow_scheduled_writes,omitempty"`
+	// AllowTriggeredWrites, when true, permits MUTATING (implement or produce)
+	// stages on a pipeline carrying a trigger block. External event content is
+	// untrusted, so triggered writes require this explicit pipeline-level opt-in
+	// in addition to the stage's own write: true acknowledgement.
+	AllowTriggeredWrites bool `yaml:"allow_triggered_writes,omitempty"`
 	// AllowAutoMerge is the pipeline-level half of the auto-merge double key.
 	// A gate that declares merge: auto is rejected unless this is explicitly true.
 	// It does not authorize scheduled writes; a scheduled pipeline still needs
@@ -103,9 +108,8 @@ type Schedule struct {
 	Jitter string `yaml:"jitter,omitempty"`
 }
 
-// Trigger is an external event source for a pipeline. Map is intentionally
-// decoded so validation can return the #863-specific error instead of treating
-// it as an unrelated unknown YAML field; no payload mapping is supported yet.
+// Trigger is an external event source for a pipeline. Map names the bounded run
+// payload keys generated from a closed set of kind-specific event selectors.
 type Trigger struct {
 	Kind       string            `yaml:"kind"`
 	Connection string            `yaml:"connection,omitempty"`

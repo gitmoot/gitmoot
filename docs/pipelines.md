@@ -39,6 +39,9 @@ trigger:                    # optional; generated Activepieces event source (req
   kind: email               #   only email in this release
   connection: gmail-imap    #   optional; default gmail-imap
   mailbox: INBOX            #   optional; default INBOX
+  map:                      #   optional run payload outputs from closed email selectors
+    subject: subject
+    sender: from_address
 success_decisions:          # optional top-level default (see below)
   - approved
   - implemented
@@ -69,8 +72,10 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 | `trigger.kind`              | pipeline     | cond.    | Required with `trigger:`. Only `email` is supported; it generates an owned Activepieces IMAP flow. |
 | `trigger.connection`        | pipeline     | no       | Activepieces connection external id; default `gmail-imap`. Must match `[A-Za-z0-9][A-Za-z0-9_-]*`. |
 | `trigger.mailbox`           | pipeline     | no       | IMAP mailbox; default `INBOX`. |
+| `trigger.map`               | pipeline     | no       | Output name to email selector. Output names must match `^[a-z][a-z0-9_]*$` and be at most 64 bytes; an explicit empty map is rejected. See [Trigger payloads](#trigger-payloads). |
 | `success_decisions`         | pipeline     | no       | Decisions that mark a stage succeeded. Default `["approved","implemented","skipped"]`. Any value must be one of `approved`, `implemented`, `changes_requested`, `skipped` - `blocked`/`failed` are park states and are rejected. An explicit list is strict: omitting `skipped` requires real work and makes a skipped result fail. |
 | `allow_scheduled_writes`    | pipeline     | no       | Safety flag. A **mutating** `implement` or `produce` stage on a **scheduled** pipeline is rejected unless this is `true`. Manual runs do not need it. Default `false`. |
+| `allow_triggered_writes`    | pipeline     | no       | Safety flag. A **mutating** `implement` or `produce` stage on a pipeline with `trigger:` is rejected unless this is `true`. Default `false`. |
 | `allow_auto_merge`          | pipeline     | no       | Pipeline-level half of the auto-merge double key. Required with a gate's `merge: auto`; default `false`. It does not replace `allow_scheduled_writes` on scheduled pipelines. |
 | `stages[].id`               | stage        | yes      | Unique, name-safe stage id. Appears verbatim in the stage job's fingerprint and deterministic id. |
 | `stages[].cmd`              | stage        | cond.    | Shell command run verbatim via `sh -c` (see the stage contract below). A stage is **exactly one** of `cmd`, `agent`, or `gate`. |
@@ -96,19 +101,55 @@ non-name-safe name/id, a duplicate stage id, a stage that is not **exactly one**
 `cmd`, `agent`, or `gate` (and, per kind: an agent stage's missing `prompt`, an
 invalid `action`, `implement` without `write: true` or `write: true` off an
 implement stage, a mutating stage on a scheduled pipeline without
-`allow_scheduled_writes`, a gate/review `source` that is not an upstream implement
+`allow_scheduled_writes`, a mutating stage on a triggered pipeline without
+`allow_triggered_writes`, a gate/review `source` that is not an upstream implement
 stage in `needs`, or `source` on another stage kind), an unknown/self/cyclic `needs`, an invalid
 timeout/interval/jitter, a negative retry, or a `success_decisions` value outside the
 allowed set — so a structural mistake surfaces as a clear error at registration
 rather than a stuck run later.
 
-`trigger.map` is deliberately rejected: generated flows do not pass an event
-payload into the pipeline yet ([#863](https://github.com/jerryfane/gitmoot/issues/863)).
 On `pipeline add --enable`, Gitmoot publishes the owned flow. An unavailable
 Activepieces instance leaves a pending binding; run
 `gitmoot pipeline bind-trigger <name>` to retry. Disable is local-first: the
 bridge rejects event-triggered runs even when Activepieces is unreachable.
 Rebinding recreates the owned flow if it was deleted in Activepieces.
+
+### Trigger payloads
+
+`trigger.map` exposes only closed, kind-specific selectors; the spec never accepts
+raw Activepieces expressions. For email triggers:
+
+| Selector | Generated Activepieces expression | Meaning |
+| --- | --- | --- |
+| `subject` | `{{trigger['subject']}}` | Message subject. |
+| `from_address` | `{{trigger['from']['value'][0]['address']}}` | First parsed sender address. |
+| `text` | `{{trigger['text']}}` | Plain-text message content. |
+| `message_id` | `{{trigger['messageId']}}` | Message-ID value (data only; no deduplication yet). |
+| `date` | `{{trigger['date']}}` | Message date reported by the IMAP trigger. |
+
+Mapped generated flows require `@gitmoot/piece-gitmoot` 0.1.4 or newer. Binding
+fails closed with an error state when that installed version cannot be resolved.
+The bridge transport also accepts the same optional `{"payload":{"key":"value"}}`
+body for **any** enabled, repo-bound pipeline, even one without a `trigger:` block.
+
+Bridge payloads reject rather than truncate: the raw request is limited to 64 KiB;
+there may be at most 32 entries; keys are 1–64 bytes matching
+`^[a-z][a-z0-9_]*$`; each UTF-8 string value is at most 32 KiB and cannot contain
+U+0000; decoded keys plus values are limited to 48 KiB. There is no event
+idempotency or queueing in this release, and an overlapping run receives `409`.
+
+Every agent stage, including root stages, receives a bounded, dynamically fenced
+`Trigger payload (UNTRUSTED external data …)` block before upstream context and
+its own prompt. Values are data, never instructions; rendered values are capped at
+1500 bytes and the block at 6000 bytes with explicit truncation markers. Every
+shell stage receives exact exec environment entries named
+`GITMOOT_TRIGGER_<UPPERCASE_KEY>`; values are not interpolated into shell source,
+so UTF-8 and newlines remain data.
+
+The canonical full payload is retained in the pipeline run's SQLite row. Shell
+environment entries are also retained in the stage job payload, and agent prompt
+context is retained with normal job data. Treat mapped email content as stored
+Gitmoot data and apply the same database/log retention controls.
 
 ### Agent stages
 
@@ -637,7 +678,9 @@ with daemon permissions`.
 implement` requires an explicit `write: true` double-key (and `write: true` is valid
 only on an implement stage), so a typo or prompt injection cannot flip a read-only
 pipeline into a writing one; a mutating stage on a **scheduled** pipeline is rejected
-unless the pipeline sets `allow_scheduled_writes: true`; the bound agent's own
+unless the pipeline sets `allow_scheduled_writes: true`; a mutating stage on a
+**triggered** pipeline is rejected unless it sets `allow_triggered_writes: true`;
+the bound agent's own
 capability/policy still applies; and the implement job never merges its own PR. The
 default gate leaves merge to a human or CI; only the separately double-keyed,
 review-required `merge: auto` gate grants merge authority to the advancer.
@@ -650,7 +693,8 @@ These are intentionally out of scope for v1 and tracked as follow-ups:
 - Approval gates / secret stores / an approval UI for a blocked stage (#682) — v1
   ships the manual `pipeline resume` seam.
 - Auto-filing a bug for a failed stage (`show` prints the command; you run it).
-- Per-stage env/workdir. (Agent stages and upstream stage output flowing into a
+- Arbitrary per-stage env/workdir. (`GITMOOT_TRIGGER_*` inputs for shell stages,
+  agent trigger context, and upstream stage output flowing into a
   downstream stage's prompt **are** supported — see [Agent stages](#agent-stages).)
 - Gate predicates beyond `pr_merged`, and a `gate` folding on PR-**merged** built into
   the implement stage itself (use a separate `gate` stage).

@@ -1678,6 +1678,9 @@ trigger:                    # optional generated Activepieces event source
   kind: email
   connection: gmail-imap    # default
   mailbox: INBOX            # default
+  map:
+    subject: subject
+    sender: from_address
 stages:                     # the DAG, keyed by unique id and wired by needs
   - id: source
     cmd: "curl -sf https://example.com/data > data.json"
@@ -1712,8 +1715,10 @@ gitmoot pipeline remove nightly-sync
 
 An enabled `trigger.kind: email` pipeline auto-binds. If Activepieces is down,
 registration succeeds with a pending binding; `bind-trigger` retries it and
-recreates an owned flow deleted in Activepieces. Payload
-`map:` is not supported yet (#863). Create the default IMAP connection with
+recreates an owned flow deleted in Activepieces. Map output names are lowercase
+identifier keys up to 64 bytes; selectors are `subject`, `from_address`, `text`,
+`message_id`, and `date`. Mapped flows require `@gitmoot/piece-gitmoot` 0.1.4+.
+Create the default IMAP connection with
 `gitmoot activepieces connect gmail`; `--with-smtp` is optional.
 
 `pipeline add` validates the whole spec at add time and stores the raw YAML
@@ -1731,6 +1736,11 @@ coordinator that fans out owned children and folds the synthesis); and **gate** 
 implement stage's PR merges). A read-only stage's `needs` result summaries are prepended
 to its prompt, and a repo-bound read-only agent stage runs in its own detached
 read-only worktree so same-repo stages parallelize without touching the live checkout.
+Every agent stage receives a non-empty trigger payload as bounded, dynamically
+fenced `UNTRUSTED external data`; shell stages receive exact
+`GITMOOT_TRIGGER_<UPPERCASE_KEY>` environment entries. The full payload is retained
+in the SQLite run row and normal job data. Triggered mutating stages additionally
+require top-level `allow_triggered_writes: true`.
 
 `pipeline install-defaults` installs the built-in `memory-ingest-sweep` and
 `memory-groom-propose` pipelines. The daemon also runs this installer at startup.

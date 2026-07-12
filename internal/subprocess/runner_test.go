@@ -80,6 +80,21 @@ func TestTeeRunnerTeesAndReturnsResult(t *testing.T) {
 	}
 }
 
+func TestTeeRunnerRunEnvTeesAndInjects(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell command differs on windows")
+	}
+	var tee bytes.Buffer
+	runner := TeeRunner{Inner: GroupRunner{}, Out: &tee}
+	result, err := runner.RunEnv(context.Background(), "", []string{"GITMOOT_TRIGGER_BODY=first\n第二"}, "sh", "-c", `printf '%s' "$GITMOOT_TRIGGER_BODY"`)
+	if err != nil {
+		t.Fatalf("TeeRunner.RunEnv: %v", err)
+	}
+	if result.Stdout != "first\n第二" || !strings.Contains(tee.String(), "first\n第二") {
+		t.Fatalf("result=%+v tee=%q", result, tee.String())
+	}
+}
+
 // TestTeeRunnerNilOutDegradesToRun: a nil Out leaves behavior byte-identical to
 // the inner runner's plain Run — the tee is opt-in via a non-nil writer.
 func TestTeeRunnerNilOutDegradesToRun(t *testing.T) {

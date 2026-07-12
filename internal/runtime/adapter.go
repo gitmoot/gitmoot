@@ -101,6 +101,9 @@ type Job struct {
 	PullRequest int
 	Model       string
 	Effort      string
+	// ShellEnv is an exact list of KEY=value entries injected into shell-stage
+	// subprocesses. Other runtimes ignore it; ordinary shell jobs leave it empty.
+	ShellEnv []string
 	// RuntimeDefaultModel is the runtime's configured registry default_model
 	// (#652), threaded in by the dispatch layer from the HOME-AWARE resolved runtime
 	// registry (built-in defaults overlaid with [runtimes.<name>] config). It is the
@@ -1265,7 +1268,18 @@ func (a ShellAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 	if IsFreshRef(agent.RuntimeRef) {
 		return Result{}, errors.New("shell runtime cannot mint a fresh session; provide an explicit session command")
 	}
-	result, err := a.runner().Run(ctx, a.Dir, "sh", "-c", agent.RuntimeRef, "gitmoot", job.Prompt)
+	runner := a.runner()
+	var result subprocess.Result
+	var err error
+	if len(job.ShellEnv) > 0 {
+		envRunner, ok := runner.(subprocess.EnvRunner)
+		if !ok {
+			return Result{}, errors.New("shell runtime runner does not support environment injection")
+		}
+		result, err = envRunner.RunEnv(ctx, a.Dir, job.ShellEnv, "sh", "-c", agent.RuntimeRef, "gitmoot", job.Prompt)
+	} else {
+		result, err = runner.Run(ctx, a.Dir, "sh", "-c", agent.RuntimeRef, "gitmoot", job.Prompt)
+	}
 	// A shell "session" is a command line, not a session id, so SessionID stays
 	// empty; the exit/stderr diagnostics still apply.
 	if err != nil {

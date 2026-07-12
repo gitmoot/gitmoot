@@ -32,6 +32,9 @@ trigger:                    # optional; generated Activepieces event source (req
   kind: email               #   only email in this release
   connection: gmail-imap    #   optional; default gmail-imap
   mailbox: INBOX            #   optional; default INBOX
+  map:                      #   optional outputs from closed email selectors
+    subject: subject
+    sender: from_address
 stages:                     # the DAG, keyed by unique id and wired by needs
   - id: source
     cmd: "curl -sf https://example.com/data > data.json"
@@ -62,7 +65,8 @@ gitmoot pipeline show "$RUN"
 name/id, a duplicate stage id, a stage that is not exactly one of `cmd`, `agent`, or
 `gate` (and, per kind: an agent stage's missing `prompt` or invalid `action`,
 `implement` without `write: true`, a mutating stage on a scheduled pipeline without
-`allow_scheduled_writes`, a gate/review's bad `source`, or `source` on another kind), an unknown/self/cyclic
+`allow_scheduled_writes`, a mutating stage on a triggered pipeline without
+`allow_triggered_writes`, a gate/review's bad `source`, or `source` on another kind), an unknown/self/cyclic
 `needs`, an invalid duration, a negative retry, or a
 `success_decisions` value outside `approved`/`implemented`/`changes_requested`/`skipped` - so a
 structural mistake is a clear error at registration, not a stuck run later. It stores the raw YAML **verbatim**
@@ -96,11 +100,44 @@ An enabled pipeline with `trigger.kind: email` auto-binds an owned Activepieces
 flow. If Activepieces is unavailable, local registration succeeds with a
 pending binding and prints the `pipeline bind-trigger` repair command. The
 connection id must be name-safe because it is embedded in an Activepieces
-expression. A `map:` block is rejected: payload mapping is reserved for
-[#863](https://github.com/jerryfane/gitmoot/issues/863). `pipeline disable`
-updates the local registry first, so bridge-triggered runs fail closed even if
+expression. `pipeline disable` updates the local registry first, so bridge-triggered runs fail closed even if
 Activepieces cannot be reached to disable its listener. Rebinding recreates the
 owned flow if it was deleted in Activepieces.
+
+### Trigger payloads
+
+`trigger.map` compiles closed email selectors; raw Activepieces expressions are
+never accepted in a pipeline spec.
+
+| Selector | Generated expression | Meaning |
+| --- | --- | --- |
+| `subject` | `{{trigger['subject']}}` | Message subject. |
+| `from_address` | `{{trigger['from']['value'][0]['address']}}` | First parsed sender address. |
+| `text` | `{{trigger['text']}}` | Plain-text content. |
+| `message_id` | `{{trigger['messageId']}}` | Message-ID (data only; no dedupe yet). |
+| `date` | `{{trigger['date']}}` | Message date. |
+
+Map output names must be 1–64 bytes and match `^[a-z][a-z0-9_]*$`; an explicit
+empty map is rejected. Mapped flows require `@gitmoot/piece-gitmoot` 0.1.4 or
+newer, and binding fails closed if that installed version cannot be resolved.
+
+The bridge accepts optional `{"payload":{"key":"value"}}` input for any enabled,
+repo-bound pipeline, whether or not its spec declares a trigger. It rejects a raw
+body over 64 KiB, more than 32 entries, a value over 32 KiB, U+0000, or more than
+48 KiB of decoded keys and values. Keys use the same trigger-map rule. Overlapping
+runs still receive `409`; idempotency and queueing are deferred.
+
+Every agent stage receives the input before upstream context in a dynamically
+fenced block labeled `UNTRUSTED external data`; each rendered value is capped at
+1500 bytes and the whole block at 6000 bytes with explicit truncation markers.
+Every shell stage receives exact `GITMOOT_TRIGGER_<UPPERCASE_KEY>` exec environment
+entries. Values are never interpolated into shell source, so newlines and UTF-8
+remain data. The full canonical payload lives in the SQLite run row; shell env and
+agent prompt projections also live in normal job data.
+
+A triggered pipeline containing an `implement` or `produce` stage must set
+`allow_triggered_writes: true`, in addition to each stage's `write: true`. This is
+independent of `allow_scheduled_writes` when a pipeline has both trigger and schedule.
 
 `pipeline install-defaults` installs Gitmoot's built-in memory pipelines:
 `memory-ingest-sweep` and `memory-groom-propose`. The daemon also runs that
@@ -297,7 +334,8 @@ codex — no per-job shell override):
   clearly-delimited **"Upstream stage results"** block carrying the result summary of
   each stage in its `needs`, so a downstream agent stage acts on upstream output as
   real dataflow (an over-long upstream summary is truncated with a `[truncated]`
-  marker). A root agent stage (no `needs`) gets the bare prompt.
+  marker). Trigger payload context is injected separately for every agent stage,
+  including roots; a root with no trigger payload still gets the bare prompt.
 - **isolated read-only worktree** — a repo-bound ask/review agent stage runs in its
   own detached, committed-tip read-only worktree (#739), so same-repo agent stages
   parallelize and never touch the live checkout; the worktree is disposed when the

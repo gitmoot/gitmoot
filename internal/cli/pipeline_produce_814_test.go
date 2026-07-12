@@ -28,6 +28,11 @@ func TestPipelineProduceStageJobRequestShapeAndRetryNote(t *testing.T) {
 	if !strings.Contains(req.Instructions, "previous attempt may have written partial data") {
 		t.Fatalf("retry instructions missing reconciliation note: %q", req.Instructions)
 	}
+	// Byte-exact pre-#863 ordering when no trigger payload is present: the
+	// reconcile note keeps top-of-prompt salience AHEAD of upstream context.
+	if want := "A previous attempt may have written partial data into your writable paths; reconcile/idempotently overwrite rather than duplicating.\n\nUPSTREAM\nWrite data."; req.Instructions != want {
+		t.Fatalf("retry instructions ordering = %q, want %q", req.Instructions, want)
+	}
 	if !pipelineStageReadOnlyWorktreeEligible(req) {
 		t.Fatal("produce request should use a disposable detached worktree cwd")
 	}

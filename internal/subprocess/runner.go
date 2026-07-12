@@ -3,6 +3,7 @@ package subprocess
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -89,6 +90,22 @@ func (t TeeRunner) inner() StreamRunner {
 
 func (t TeeRunner) Run(ctx context.Context, dir string, command string, args ...string) (Result, error) {
 	return t.inner().RunStream(ctx, dir, t.Out, command, args...)
+}
+
+// RunEnv preserves TeeRunner's live-output semantics while forwarding exact
+// extra environment entries to an env+stream-capable inner runner. The default
+// GroupRunner implements that combined seam.
+func (t TeeRunner) RunEnv(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error) {
+	inner := t.inner()
+	if envStream, ok := inner.(EnvStreamRunner); ok {
+		return envStream.RunEnvStream(ctx, dir, env, t.Out, command, args...)
+	}
+	if t.Out == nil {
+		if envRunner, ok := inner.(EnvRunner); ok {
+			return envRunner.RunEnv(ctx, dir, env, command, args...)
+		}
+	}
+	return Result{}, errors.New("tee runner inner does not support environment streaming")
 }
 
 func (t TeeRunner) LookPath(file string) (string, error) {

@@ -2248,6 +2248,9 @@ trigger:                    # optional generated Activepieces event source
   kind: email               #   only supported kind
   connection: gmail-imap    #   default gmail-imap
   mailbox: INBOX            #   default INBOX
+  map:                      #   optional output name -> closed email selector
+    subject: subject
+    sender: from_address
 stages:                     # the DAG, keyed by unique id and wired by needs
   - id: source
     cmd: "curl -sf https://example.com/data > data.json"
@@ -2288,15 +2291,18 @@ gitmoot pipeline remove nightly-sync
 
 An enabled `trigger.kind: email` pipeline auto-binds. If Activepieces is down,
 registration succeeds with a pending binding; `bind-trigger` retries it and
-recreates an owned flow deleted in Activepieces. Trigger
-payload `map:` is rejected until #863. Provision the default IMAP connection with
+recreates an owned flow deleted in Activepieces. Trigger `map:` output names match
+`^[a-z][a-z0-9_]*$` (1–64 bytes); selectors are `subject`, `from_address`, `text`,
+`message_id`, and `date`. Mapped flows require `@gitmoot/piece-gitmoot` 0.1.4+.
+Provision the default IMAP connection with
 `gitmoot activepieces connect gmail` (`--with-smtp` is optional and unused by the
 generated receive flow).
 
 `pipeline add` validates the whole spec at add time (unknown keys, duplicate/self/
 cyclic `needs`, a stage that is not exactly one of `cmd`/`agent`/`gate`, an agent stage
 missing a `prompt` / invalid `action` / `implement` without `write: true` / a mutating
-stage on a scheduled pipeline without `allow_scheduled_writes` / a gate or review's
+stage on a scheduled pipeline without `allow_scheduled_writes` / a mutating stage on
+a triggered pipeline without `allow_triggered_writes` / a gate or review's
 bad `source` / `source` on another stage kind, invalid durations, a `success_decisions` outside
 `approved`/`implemented`/`changes_requested`/`skipped`) so a mistake is a clear error, not a
 stuck run. It stores the raw YAML **verbatim** plus a content hash; each run
@@ -2308,6 +2314,13 @@ runs a named managed agent on its own runtime as a read-only leaf (`ask`/`review
 its `needs` stages' result summaries are prepended to the prompt, and a repo-bound
 agent stage runs in its own detached read-only worktree so same-repo agent stages
 parallelize without touching the live checkout.
+
+For a non-empty run payload, every agent stage (including roots) receives a
+dynamically fenced, 6000-byte-bounded `UNTRUSTED external data` block before
+upstream context; each rendered value is capped at 1500 bytes. Shell stages receive
+exact `GITMOOT_TRIGGER_<UPPERCASE_KEY>` exec environment entries, never shell-source
+interpolation. The full canonical payload is retained in the SQLite run row; job
+env/prompt projections follow normal job-data retention.
 
 `action: produce` (#814/#825) is a sandboxed pipeline leaf for writing operator-owned
 data, never repo/branch/task/PR state. Codex uses its native sandbox; Claude and
@@ -2638,7 +2651,12 @@ seams the CLI uses (no new authority): POST /v1/pipelines/{name}/run,
 GET /v1/runs/{id}, POST /v1/memory/recall, GET /v1/jobs/{id},
 POST /v1/agents/{name}/ask. Every request needs
 `Authorization: Bearer $(cat ~/.gitmoot/bridge.token)`. Requests are
-rate-limited (30/min) and body-capped (1MB). Containers reach the host
+rate-limited (30/min) and generally body-capped at 1 MiB. Pipeline run accepts no
+body, `{}`, or `{"payload":{"key":"value"}}` for any enabled repo-bound pipeline.
+Its raw body cap is 64 KiB: at most 32 entries, 1–64 byte lowercase identifier
+keys, 32 KiB UTF-8 values without U+0000, and 48 KiB decoded keys+values. Invalid
+payloads return 400, oversize 413, missing pipelines 404, and overlapping runs 409.
+Containers reach the host
 bridge at http://host.docker.internal:8791 (or the docker bridge IP on
 Linux). Built for the Activepieces piece seam (issue #785); to connect Gmail as a pipeline trigger see WORKFLOWS.md -> Gmail -> Pipeline (Activepieces).
 

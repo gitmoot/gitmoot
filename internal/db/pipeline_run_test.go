@@ -2,18 +2,22 @@ package db
 
 import (
 	"context"
+	"database/sql"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
 func sampleRun(id string) PipelineRun {
 	return PipelineRun{
-		ID:        id,
-		Pipeline:  "deploy-flow",
-		Trigger:   "manual",
-		SpecHash:  "hash-1",
-		State:     "running",
-		StartedAt: time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC),
+		ID:          id,
+		Pipeline:    "deploy-flow",
+		Trigger:     "manual",
+		PayloadJSON: `{"body":"first line\n第二行 ☃"}`,
+		SpecHash:    "hash-1",
+		State:       "running",
+		StartedAt:   time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC),
 	}
 }
 
@@ -39,7 +43,7 @@ func TestPipelineRunCRUD(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("GetPipelineRun: ok=%v err=%v", ok, err)
 	}
-	if got.Pipeline != "deploy-flow" || got.Trigger != "manual" || got.SpecHash != "hash-1" || got.State != "running" {
+	if got.Pipeline != "deploy-flow" || got.Trigger != "manual" || got.PayloadJSON != run.PayloadJSON || got.SpecHash != "hash-1" || got.State != "running" {
 		t.Fatalf("run roundtrip mismatch: %+v", got)
 	}
 	if !got.StartedAt.Equal(run.StartedAt) || !got.FinishedAt.IsZero() {
@@ -52,6 +56,7 @@ func TestPipelineRunCRUD(t *testing.T) {
 	got.HaltStage = "score"
 	got.HaltReason = "needs a secret"
 	got.NeedsJSON = `["R2 token"]`
+	got.PayloadJSON = `{"body":"must not replace snapshot"}`
 	got.FinishedAt = finished
 	if err := store.UpdatePipelineRun(ctx, got); err != nil {
 		t.Fatalf("UpdatePipelineRun: %v", err)
@@ -66,9 +71,58 @@ func TestPipelineRunCRUD(t *testing.T) {
 	if reloaded.Pipeline != "deploy-flow" || reloaded.SpecHash != "hash-1" || !reloaded.StartedAt.Equal(run.StartedAt) {
 		t.Fatalf("update disturbed run identity: %+v", reloaded)
 	}
+	if reloaded.PayloadJSON != run.PayloadJSON {
+		t.Fatalf("update disturbed immutable payload snapshot: %q", reloaded.PayloadJSON)
+	}
 
 	if err := store.UpdatePipelineRun(ctx, PipelineRun{ID: "prun-missing", State: "failed"}); err == nil {
 		t.Fatalf("expected UpdatePipelineRun on missing id to error")
+	}
+}
+
+func TestPipelineRunPayloadMigrationUpgrade(t *testing.T) {
+	ctx := context.Background()
+	payloadMigration := -1
+	for i, migration := range migrations {
+		if strings.Contains(migration, "ADD COLUMN payload_json") {
+			payloadMigration = i
+			break
+		}
+	}
+	if payloadMigration < 0 {
+		t.Fatal("payload_json migration not found")
+	}
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &Store{db: raw, path: path}
+	t.Cleanup(func() { _ = raw.Close() })
+	for version, migration := range migrations[:payloadMigration] {
+		if err := store.applyMigration(ctx, version+1, migration); err != nil {
+			t.Fatalf("apply pre-payload migration %d: %v", version+1, err)
+		}
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO pipeline_runs(id, pipeline, trigger, spec_hash, state) VALUES ('prun-legacy', 'mail', 'manual', 'hash', 'running')`); err != nil {
+		t.Fatalf("insert legacy run: %v", err)
+	}
+	if err := store.applyMigration(ctx, payloadMigration+1, migrations[payloadMigration]); err != nil {
+		t.Fatalf("apply payload migration: %v", err)
+	}
+	legacy, ok, err := store.GetPipelineRun(ctx, "prun-legacy")
+	if err != nil || !ok || legacy.PayloadJSON != "{}" {
+		t.Fatalf("legacy payload = %q ok=%v err=%v", legacy.PayloadJSON, ok, err)
+	}
+	mapped := sampleRun("prun-mapped")
+	mapped.Pipeline = "mail"
+	mapped.PayloadJSON = `{"body":"hello\n世界","subject":"☃ status"}`
+	if err := store.CreatePipelineRun(ctx, mapped); err != nil {
+		t.Fatalf("create upgraded mapped run: %v", err)
+	}
+	got, ok, err := store.GetPipelineRun(ctx, mapped.ID)
+	if err != nil || !ok || got.PayloadJSON != mapped.PayloadJSON {
+		t.Fatalf("upgraded mapped payload = %q ok=%v err=%v", got.PayloadJSON, ok, err)
 	}
 }
 
@@ -84,8 +138,10 @@ func TestPipelineRunListingAndActive(t *testing.T) {
 	older.State = "succeeded"
 	newer := sampleRun("prun-new")
 	newer.StartedAt = time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC)
+	newer.PayloadJSON = `{"which":"new"}`
 	other := sampleRun("prun-other")
 	other.Pipeline = "other-flow"
+	other.PayloadJSON = `{"which":"other"}`
 	for _, r := range []PipelineRun{older, newer, other} {
 		if err := store.CreatePipelineRun(ctx, r); err != nil {
 			t.Fatalf("CreatePipelineRun(%s): %v", r.ID, err)
@@ -96,18 +152,23 @@ func TestPipelineRunListingAndActive(t *testing.T) {
 	if err != nil || len(runs) != 2 {
 		t.Fatalf("ListPipelineRuns = %+v err=%v", runs, err)
 	}
-	if runs[0].ID != "prun-new" {
+	if runs[0].ID != "prun-new" || runs[0].PayloadJSON != newer.PayloadJSON {
 		t.Fatalf("ListPipelineRuns not newest-first: %+v", runs)
 	}
 
 	active, ok, err := store.ActivePipelineRun(ctx, "deploy-flow")
-	if err != nil || !ok || active.ID != "prun-new" {
+	if err != nil || !ok || active.ID != "prun-new" || active.PayloadJSON != newer.PayloadJSON {
 		t.Fatalf("ActivePipelineRun = %+v ok=%v err=%v (want prun-new)", active, ok, err)
 	}
 
 	all, err := store.ListActivePipelineRuns(ctx)
 	if err != nil || len(all) != 2 {
 		t.Fatalf("ListActivePipelineRuns = %+v err=%v (want the 2 running runs)", all, err)
+	}
+	for _, run := range all {
+		if run.ID == other.ID && run.PayloadJSON != other.PayloadJSON {
+			t.Fatalf("ListActivePipelineRuns lost payload snapshot: %+v", run)
+		}
 	}
 
 	// Once the running run settles, the overlap guard clears.

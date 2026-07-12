@@ -4,11 +4,22 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
 
 var triggerConnectionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
+var triggerPayloadKeyPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
+var triggerMapSelectors = []string{"subject", "from_address", "text", "message_id", "date"}
+
+// ValidTriggerPayloadKey reports whether key is legal in both trigger.map and
+// the bridge payload transport. Length is a byte bound because the bridge's
+// decoded-size limits are byte budgets.
+func ValidTriggerPayloadKey(key string) bool {
+	return len(key) >= 1 && len(key) <= 64 && triggerPayloadKeyPattern.MatchString(key)
+}
 
 // normalize trims surrounding whitespace off every free-text field so validation
 // and storage see canonical values. It does NOT lowercase or otherwise rewrite
@@ -263,8 +274,22 @@ func (s Spec) validateTrigger() error {
 	if strings.Contains(s.Trigger.Mailbox, "{{") {
 		return fmt.Errorf("pipeline %q trigger mailbox must not contain an Activepieces expression", s.Name)
 	}
-	if len(s.Trigger.Map) != 0 {
-		return fmt.Errorf("pipeline %q trigger payload mapping is not yet supported (see issue #863)", s.Name)
+	if s.Trigger.Map != nil && len(s.Trigger.Map) == 0 {
+		return fmt.Errorf("pipeline %q trigger map is explicitly empty; omit map or declare at least one output", s.Name)
+	}
+	keys := make([]string, 0, len(s.Trigger.Map))
+	for key := range s.Trigger.Map {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if !ValidTriggerPayloadKey(key) {
+			return fmt.Errorf("pipeline %q trigger map output %q must be 1-64 bytes and match ^[a-z][a-z0-9_]*$", s.Name, key)
+		}
+		selector := s.Trigger.Map[key]
+		if !containsToken(triggerMapSelectors, selector) {
+			return fmt.Errorf("pipeline %q trigger map output %q selector %q is invalid; use one of: %s", s.Name, key, selector, strings.Join(triggerMapSelectors, ", "))
+		}
 	}
 	return nil
 }
@@ -532,6 +557,9 @@ func (s Spec) validateMutatingStage(stage Stage) error {
 	}
 	if isMutating && s.Schedule != nil && !s.AllowScheduledWrites {
 		return fmt.Errorf("pipeline %q stage %q is a mutating %s stage on a scheduled pipeline; set allow_scheduled_writes: true to permit unattended writes", s.Name, stage.ID, stage.Action)
+	}
+	if isMutating && s.Trigger != nil && !s.AllowTriggeredWrites {
+		return fmt.Errorf("pipeline %q stage %q is a mutating %s stage on a triggered pipeline; set allow_triggered_writes: true to permit externally triggered writes", s.Name, stage.ID, stage.Action)
 	}
 	if !isProduce {
 		if len(stage.Writes) > 0 {

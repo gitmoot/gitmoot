@@ -1590,6 +1590,21 @@ func TestShellDeliverCommand(t *testing.T) {
 	runner.want(t, 0, "sh", "-c", "printf ok", "gitmoot", "hello")
 }
 
+func TestShellDeliverInjectsJobEnvironment(t *testing.T) {
+	runner := &envFakeRunner{fakeRunner: fakeRunner{results: []subprocess.Result{{Stdout: "ok\n"}}}}
+	adapter := ShellAdapter{Runner: runner}
+	agent := Agent{Name: "custom", Role: "reviewer", Runtime: ShellRuntime, RuntimeRef: "printf ok", RepoScope: "jerryfane/gitmoot"}
+	env := []string{"GITMOOT_TRIGGER_BODY=first\n第二", "GITMOOT_TRIGGER_SUBJECT=Snowman ☃"}
+
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "hello", ShellEnv: env}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	if !reflect.DeepEqual(runner.gotEnv, env) {
+		t.Fatalf("RunEnv environment = %#v, want %#v", runner.gotEnv, env)
+	}
+	runner.want(t, 0, "sh", "-c", "printf ok", "gitmoot", "hello")
+}
+
 func TestShellStartUnsupported(t *testing.T) {
 	adapter := ShellAdapter{}
 	agent := Agent{Name: "custom", Role: "reviewer", Runtime: ShellRuntime, RepoScope: "jerryfane/gitmoot"}

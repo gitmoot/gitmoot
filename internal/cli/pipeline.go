@@ -826,7 +826,7 @@ func runPipelineRunCmd(args []string, stdout, stderr io.Writer) int {
 			return fmt.Errorf("stored spec is invalid: %w", err)
 		}
 		now := time.Now().UTC()
-		run, err := createPipelineRun(ctx, store, rec, spec, "manual", now)
+		run, err := createPipelineRun(ctx, store, rec, spec, "manual", "{}", now)
 		if err != nil {
 			return err
 		}

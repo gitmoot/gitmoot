@@ -57,6 +57,13 @@ func TestLoadEmailTriggerDefaultsAndValidation(t *testing.T) {
 	if loaded.Trigger == nil || loaded.Trigger.Connection != "gmail-imap" || loaded.Trigger.Mailbox != "INBOX" {
 		t.Fatalf("trigger defaults = %+v", loaded.Trigger)
 	}
+	mapped, err := Load([]byte("name: mail\nrepo: jerryfane/gitmoot\ntrigger:\n  kind: email\n  map:\n    sender: from_address\n    subject: subject\n    received_at: date\nstages:\n  - {id: run, cmd: echo}\n"))
+	if err != nil {
+		t.Fatalf("Load mapped email trigger: %v", err)
+	}
+	if !reflect.DeepEqual(mapped.Trigger.Map, map[string]string{"received_at": "date", "sender": "from_address", "subject": "subject"}) {
+		t.Fatalf("trigger map = %+v", mapped.Trigger.Map)
+	}
 
 	cases := []struct{ name, trigger, want string }{
 		{"missing kind", "{}", "supported kinds: email"},
@@ -65,7 +72,9 @@ func TestLoadEmailTriggerDefaultsAndValidation(t *testing.T) {
 		{"leading dash connection", "{kind: email, connection: -gmail}", "must match"},
 		{"leading underscore connection", "{kind: email, connection: _gmail}", "must match"},
 		{"mailbox expression", "{kind: email, mailbox: \"{{danger}}\"}", "must not contain"},
-		{"mapping", "{kind: email, map: {subject: '{{trigger.subject}}'}}", "issue #863"},
+		{"empty mapping", "{kind: email, map: {}}", "explicitly empty"},
+		{"invalid output", "{kind: email, map: {Bad-Key: subject}}", "must be 1-64 bytes"},
+		{"invalid selector", "{kind: email, map: {subject: '{{trigger.subject}}'}}", "use one of: subject, from_address, text, message_id, date"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -149,6 +158,29 @@ stages:
 	}
 	if st.Kind() != StageKindAgentImplement {
 		t.Fatalf("Kind() = %d, want StageKindAgentImplement", st.Kind())
+	}
+}
+
+func TestLoadValidTriggeredImplementSpec(t *testing.T) {
+	const spec = `name: mail-fix
+repo: owner/repo
+trigger:
+  kind: email
+  map: {subject: subject}
+allow_triggered_writes: true
+stages:
+  - id: fix
+    agent: coder
+    prompt: Fix the reported bug.
+    action: implement
+    write: true
+`
+	loaded, err := Load([]byte(spec))
+	if err != nil {
+		t.Fatalf("Load valid triggered implement spec: %v", err)
+	}
+	if !loaded.AllowTriggeredWrites || loaded.Stages[0].Kind() != StageKindAgentImplement {
+		t.Fatalf("triggered implement did not round-trip: %+v", loaded)
 	}
 }
 
@@ -333,6 +365,11 @@ func TestLoadValidationErrors(t *testing.T) {
 			name:    "scheduled implement without allow rejected",
 			spec:    "name: p\nschedule:\n  interval: 24h\nstages:\n  - {id: a, agent: rev, prompt: hi, action: implement, write: true}\n",
 			wantSub: "set allow_scheduled_writes: true",
+		},
+		{
+			name:    "triggered implement without allow rejected",
+			spec:    "name: p\nrepo: owner/repo\ntrigger: {kind: email}\nstages:\n  - {id: a, agent: rev, prompt: hi, action: implement, write: true}\n",
+			wantSub: "set allow_triggered_writes: true",
 		},
 		{
 			name:    "agent bad action",
@@ -583,6 +620,7 @@ stages:
 		{"check retries elsewhere", "name: p\nstages:\n- {id: a, agent: w, prompt: x, check_retries: 0}\n", "sets check_retries"},
 		{"negative check retries", "name: p\nstages:\n- {id: a, agent: w, action: produce, prompt: x, write: true, writes: [/data], check: true, check_retries: -1}\n", "check_retries must be >= 0"},
 		{"scheduled gate", "name: p\nschedule: {interval: 1h}\nstages:\n- {id: a, agent: w, action: produce, prompt: x, write: true, writes: [/data]}\n", "allow_scheduled_writes: true"},
+		{"triggered gate", "name: p\nrepo: owner/repo\ntrigger: {kind: email}\nstages:\n- {id: a, agent: w, action: produce, prompt: x, write: true, writes: [/data]}\n", "allow_triggered_writes: true"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

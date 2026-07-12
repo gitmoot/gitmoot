@@ -8690,4 +8690,9 @@ CREATE TABLE groom_stale_verdicts (
 	`
 ALTER TABLE pipelines ADD COLUMN trigger_binding TEXT NOT NULL DEFAULT '';
 	`,
+	// #863 immutable external-input snapshot for pipeline runs. Existing and
+	// non-bridge rows read as the canonical empty object.
+	`
+ALTER TABLE pipeline_runs ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}';
+	`,
 }

@@ -3,6 +3,7 @@ package activepieces
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/pipeline"
@@ -37,7 +38,9 @@ type triggerFlowSettings struct {
 }
 
 // BuildTriggerFlow materializes the minimal receive-only email glue flow:
-// official IMAP new_email -> gitmoot run_pipeline. No trigger payload is passed.
+// official IMAP new_email -> gitmoot run_pipeline. A declared map is compiled
+// from closed selectors into Activepieces expressions; raw expressions never
+// enter the pipeline spec.
 func BuildTriggerFlow(pipelineName string, t pipeline.Trigger, bridgeConnectionExternalID, imapPieceVersion, gitmootPieceVersion string) (string, json.RawMessage, error) {
 	pipelineName = strings.TrimSpace(pipelineName)
 	if pipelineName == "" {
@@ -58,6 +61,22 @@ func BuildTriggerFlow(pipelineName string, t pipeline.Trigger, bridgeConnectionE
 			PropertySettings: map[string]any{}, ErrorHandlingOptions: &struct{}{},
 		},
 	}
+	if len(t.Map) > 0 {
+		payload := make(map[string]string, len(t.Map))
+		keys := make([]string, 0, len(t.Map))
+		for key := range t.Map {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			expression, err := triggerSelectorExpression(t.Map[key])
+			if err != nil {
+				return "", nil, fmt.Errorf("trigger map output %q: %w", key, err)
+			}
+			payload[key] = expression
+		}
+		action.Settings.Input["payload"] = payload
+	}
 	flow := triggerFlow{
 		DisplayName: displayName, SchemaVersion: "20",
 		Trigger: triggerFlowAction{
@@ -75,6 +94,23 @@ func BuildTriggerFlow(pipelineName string, t pipeline.Trigger, bridgeConnectionE
 		return "", nil, fmt.Errorf("marshal Activepieces trigger flow: %w", err)
 	}
 	return displayName, raw, nil
+}
+
+func triggerSelectorExpression(selector string) (string, error) {
+	switch selector {
+	case "subject":
+		return "{{trigger['subject']}}", nil
+	case "from_address":
+		return "{{trigger['from']['value'][0]['address']}}", nil
+	case "text":
+		return "{{trigger['text']}}", nil
+	case "message_id":
+		return "{{trigger['messageId']}}", nil
+	case "date":
+		return "{{trigger['date']}}", nil
+	default:
+		return "", fmt.Errorf("unsupported selector %q", selector)
+	}
 }
 
 func connectionExpression(externalID string) string {

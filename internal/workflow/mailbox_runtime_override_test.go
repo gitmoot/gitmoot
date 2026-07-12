@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -88,6 +89,7 @@ func TestMailboxEnqueuePersistsRuntimeOverride(t *testing.T) {
 		Repo:               "jerryfane/gitmoot",
 		RuntimeOverride:    runtime.ShellRuntime,
 		RuntimeOverrideRef: "printf ok",
+		ShellEnv:           []string{"GITMOOT_TRIGGER_BODY=first\n第二"},
 	})
 	if err != nil {
 		t.Fatalf("Enqueue returned error: %v", err)
@@ -98,6 +100,27 @@ func TestMailboxEnqueuePersistsRuntimeOverride(t *testing.T) {
 	}
 	if payload.RuntimeOverride != runtime.ShellRuntime || payload.RuntimeOverrideRef != "printf ok" {
 		t.Fatalf("payload override = %q/%q", payload.RuntimeOverride, payload.RuntimeOverrideRef)
+	}
+	if !reflect.DeepEqual(payload.ShellEnv, []string{"GITMOOT_TRIGGER_BODY=first\n第二"}) {
+		t.Fatalf("payload shell_env = %#v", payload.ShellEnv)
+	}
+}
+
+func TestMailboxRunThreadsShellEnvironment(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+	env := []string{"GITMOOT_TRIGGER_BODY=first\n第二", "GITMOOT_TRIGGER_SUBJECT=Snowman ☃"}
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-shell-env", Agent: "runner", Action: "ask", Repo: "owner/repo", RuntimeOverride: runtime.ShellRuntime, RuntimeOverrideRef: "printf ok", ShellEnv: env}); err != nil {
+		t.Fatal(err)
+	}
+	adapter := &fakeDelivery{outputs: []string{`{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}}
+	agent := runtime.Agent{Name: "runner", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "owner/repo", Role: "runner"}
+	if _, err := mailbox.Run(ctx, "job-shell-env", agent, adapter); err != nil {
+		t.Fatal(err)
+	}
+	if len(adapter.shellEnvs) != 1 || !reflect.DeepEqual(adapter.shellEnvs[0], env) {
+		t.Fatalf("delivered shell env = %#v", adapter.shellEnvs)
 	}
 }
 

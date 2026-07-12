@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -18,10 +19,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
@@ -31,9 +34,13 @@ import (
 )
 
 const (
-	defaultBridgeAddr = "127.0.0.1:8791"
-	bridgeTokenName   = "bridge.token"
-	bridgeBodyLimit   = 1 << 20
+	defaultBridgeAddr                 = "127.0.0.1:8791"
+	bridgeTokenName                   = "bridge.token"
+	bridgeBodyLimit                   = 1 << 20
+	bridgePipelineRunBodyLimit        = 64 << 10
+	bridgePipelinePayloadMaxEntries   = 32
+	bridgePipelinePayloadValueLimit   = 32 << 10
+	bridgePipelinePayloadDecodedLimit = 48 << 10
 )
 
 var errBridgeConflict = errors.New("bridge conflict")
@@ -322,11 +329,13 @@ func (s *bridgeServer) route(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *bridgeServer) handlePipelineRun(w http.ResponseWriter, r *http.Request, name string) {
-	if err := decodeOptionalBridgeJSON(r, &struct{}{}); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, bridgePipelineRunBodyLimit)
+	payloadJSON, err := decodeBridgePipelineRunPayload(r)
+	if err != nil {
 		writeBridgeDecodeError(w, err)
 		return
 	}
-	runID, err := runBridgePipeline(r.Context(), s.store, s.rawHome, name)
+	runID, err := runBridgePipeline(r.Context(), s.store, s.rawHome, name, payloadJSON)
 	if err != nil {
 		writeBridgeMappedError(w, err)
 		return
@@ -334,7 +343,7 @@ func (s *bridgeServer) handlePipelineRun(w http.ResponseWriter, r *http.Request,
 	writeBridgeJSON(w, http.StatusOK, map[string]string{"run_id": runID})
 }
 
-func runBridgePipeline(ctx context.Context, store *db.Store, rawHome, name string) (string, error) {
+func runBridgePipeline(ctx context.Context, store *db.Store, rawHome, name, payloadJSON string) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return "", errors.New("pipeline name is required")
@@ -362,7 +371,7 @@ func runBridgePipeline(ctx context.Context, store *db.Store, rawHome, name strin
 		return "", fmt.Errorf("stored spec is invalid: %w", err)
 	}
 	now := time.Now().UTC()
-	run, err := createPipelineRun(ctx, store, rec, spec, "manual", now)
+	run, err := createPipelineRun(ctx, store, rec, spec, "bridge", payloadJSON, now)
 	if err != nil {
 		return "", err
 	}
@@ -371,6 +380,140 @@ func runBridgePipeline(ctx context.Context, store *db.Store, rawHome, name strin
 		return "", err
 	}
 	return run.ID, nil
+}
+
+type bridgePipelineRunRequest struct {
+	Payload json.RawMessage `json:"payload"`
+}
+
+// rejectDuplicateJSONKeys walks every object in the document and rejects
+// repeated member names. encoding/json silently keeps the LAST duplicate,
+// which is a parser-differential vector: an upstream validator can approve
+// value A while the bridge stores value B on the immutable run snapshot that
+// feeds agent prompts and shell env.
+func rejectDuplicateJSONKeys(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var walk func() error
+	walk = func() error {
+		token, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		delim, ok := token.(json.Delim)
+		if !ok {
+			return nil // scalar
+		}
+		switch delim {
+		case '{':
+			seen := make(map[string]struct{})
+			for dec.More() {
+				keyToken, err := dec.Token()
+				if err != nil {
+					return err
+				}
+				key, _ := keyToken.(string)
+				if _, dup := seen[key]; dup {
+					return fmt.Errorf("duplicate JSON key %q", key)
+				}
+				seen[key] = struct{}{}
+				if err := walk(); err != nil {
+					return err
+				}
+			}
+			_, err = dec.Token() // consume '}'
+			return err
+		case '[':
+			for dec.More() {
+				if err := walk(); err != nil {
+					return err
+				}
+			}
+			_, err = dec.Token() // consume ']'
+			return err
+		}
+		return nil
+	}
+	return walk()
+}
+
+func decodeBridgePipelineRunPayload(r *http.Request) (string, error) {
+	var raw json.RawMessage
+	if r.Body == nil || r.ContentLength == 0 {
+		raw = json.RawMessage(`{}`)
+	} else {
+		dec := json.NewDecoder(r.Body)
+		if err := dec.Decode(&raw); err != nil {
+			return "", err
+		}
+		if err := dec.Decode(&struct{}{}); err != io.EOF {
+			if err == nil {
+				return "", errors.New("request body must contain a single JSON object")
+			}
+			return "", err
+		}
+	}
+	trimmed := bytes.TrimSpace(raw)
+	// A literal null body was accepted by the pre-#863 decoder (a no-op);
+	// keep that compatibility by treating it as an empty request.
+	if bytes.Equal(trimmed, []byte("null")) {
+		trimmed = []byte(`{}`)
+	}
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return "", errors.New("request body must be a JSON object")
+	}
+	if !utf8.Valid(trimmed) {
+		return "", errors.New("request body must be valid UTF-8 JSON")
+	}
+	if err := rejectDuplicateJSONKeys(trimmed); err != nil {
+		return "", err
+	}
+	var req bridgePipelineRunRequest
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		return "", err
+	}
+	payload := make(map[string]string)
+	if len(req.Payload) > 0 {
+		payloadRaw := bytes.TrimSpace(req.Payload)
+		if len(payloadRaw) == 0 || payloadRaw[0] != '{' {
+			return "", errors.New("payload must be a JSON object with string values")
+		}
+		if err := json.Unmarshal(payloadRaw, &payload); err != nil {
+			return "", fmt.Errorf("payload must be a JSON object with string values: %w", err)
+		}
+	}
+	if len(payload) > bridgePipelinePayloadMaxEntries {
+		return "", fmt.Errorf("payload has %d entries; maximum is %d", len(payload), bridgePipelinePayloadMaxEntries)
+	}
+	keys := make([]string, 0, len(payload))
+	for key := range payload {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	total := 0
+	for _, key := range keys {
+		value := payload[key]
+		if !pipeline.ValidTriggerPayloadKey(key) {
+			return "", fmt.Errorf("payload key %q must be 1-64 bytes and match ^[a-z][a-z0-9_]*$", key)
+		}
+		if len(value) > bridgePipelinePayloadValueLimit {
+			return "", fmt.Errorf("payload value for key %q exceeds the 32 KiB limit", key)
+		}
+		if strings.ContainsRune(value, '\x00') {
+			return "", fmt.Errorf("payload value for key %q must not contain U+0000", key)
+		}
+		total += len(key) + len(value)
+		if total > bridgePipelinePayloadDecodedLimit {
+			return "", fmt.Errorf("payload decoded key/value total exceeds the 48 KiB limit (at key %q)", key)
+		}
+	}
+	canonical, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal validated payload: %w", err)
+	}
+	return string(canonical), nil
 }
 
 func (s *bridgeServer) handleRunGet(w http.ResponseWriter, r *http.Request, id string) {

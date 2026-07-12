@@ -1,6 +1,7 @@
 package activepieces
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
 
@@ -66,5 +67,56 @@ func TestBuildTriggerFlow(t *testing.T) {
 		if settings[key] != templateSettings[key] {
 			t.Fatalf("settings %s = %v, template = %v", key, settings[key], templateSettings[key])
 		}
+	}
+}
+
+func TestBuildTriggerFlowGoldenWithAndWithoutMap(t *testing.T) {
+	cases := []struct {
+		name    string
+		trigger pipeline.Trigger
+		version string
+		want    string
+	}{
+		{
+			name:    "without map",
+			trigger: pipeline.Trigger{Kind: "email", Connection: "gmail-imap", Mailbox: "Alerts"},
+			version: "0.1.3",
+			want: `{
+  "displayName":"gitmoot: mail-triage","schemaVersion":"20",
+  "trigger":{"name":"trigger","valid":true,"displayName":"Receive email over IMAP","type":"PIECE_TRIGGER","lastUpdatedDate":"2026-01-01T00:00:00.000Z",
+    "settings":{"pieceName":"@activepieces/piece-imap","pieceVersion":"0.4.3","triggerName":"new_email","input":{"auth":"{{connections['gmail-imap']}}","mailbox":"Alerts"},"propertySettings":{}},
+    "nextAction":{"name":"step_1","valid":true,"displayName":"Run Gitmoot pipeline","type":"PIECE","settings":{"pieceName":"@gitmoot/piece-gitmoot","pieceVersion":"0.1.3","actionName":"run_pipeline","input":{"auth":"{{connections['gitmoot-bridge']}}","pipeline_name":"mail-triage"},"propertySettings":{},"errorHandlingOptions":{}}}
+  }
+}`,
+		},
+		{
+			name: "with map",
+			trigger: pipeline.Trigger{Kind: "email", Connection: "gmail-imap", Mailbox: "Alerts", Map: map[string]string{
+				"subject": "subject", "sender": "from_address", "body": "text", "message_id": "message_id", "received_at": "date",
+			}},
+			version: "0.1.4",
+			want: `{
+  "displayName":"gitmoot: mail-triage","schemaVersion":"20",
+  "trigger":{"name":"trigger","valid":true,"displayName":"Receive email over IMAP","type":"PIECE_TRIGGER","lastUpdatedDate":"2026-01-01T00:00:00.000Z",
+    "settings":{"pieceName":"@activepieces/piece-imap","pieceVersion":"0.4.3","triggerName":"new_email","input":{"auth":"{{connections['gmail-imap']}}","mailbox":"Alerts"},"propertySettings":{}},
+    "nextAction":{"name":"step_1","valid":true,"displayName":"Run Gitmoot pipeline","type":"PIECE","settings":{"pieceName":"@gitmoot/piece-gitmoot","pieceVersion":"0.1.4","actionName":"run_pipeline","input":{"auth":"{{connections['gitmoot-bridge']}}","payload":{"body":"{{trigger['text']}}","message_id":"{{trigger['messageId']}}","received_at":"{{trigger['date']}}","sender":"{{trigger['from']['value'][0]['address']}}","subject":"{{trigger['subject']}}"},"pipeline_name":"mail-triage"},"propertySettings":{},"errorHandlingOptions":{}}}
+  }
+}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, got, err := BuildTriggerFlow("mail-triage", tc.trigger, "gitmoot-bridge", "0.4.3", tc.version)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var want bytes.Buffer
+			if err := json.Compact(&want, []byte(tc.want)); err != nil {
+				t.Fatalf("compact golden: %v", err)
+			}
+			if string(got) != want.String() {
+				t.Fatalf("generated flow mismatch\n got: %s\nwant: %s", got, want.String())
+			}
+		})
 	}
 }

@@ -1667,6 +1667,7 @@ type fakeDelivery struct {
 	runtimeDefault        []string
 	runtimeDefaultEfforts []string
 	agentRefs             []string
+	shellEnvs             [][]string
 	onDeliver             func()
 	err                   error
 }
@@ -1678,6 +1679,7 @@ func (f *fakeDelivery) Deliver(_ context.Context, agent runtime.Agent, job runti
 	f.runtimeDefault = append(f.runtimeDefault, job.RuntimeDefaultModel)
 	f.runtimeDefaultEfforts = append(f.runtimeDefaultEfforts, job.RuntimeDefaultEffort)
 	f.agentRefs = append(f.agentRefs, agent.RuntimeRef)
+	f.shellEnvs = append(f.shellEnvs, append([]string(nil), job.ShellEnv...))
 	if f.onDeliver != nil {
 		f.onDeliver()
 	}

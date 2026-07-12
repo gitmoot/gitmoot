@@ -110,7 +110,7 @@ func stageRow(t *testing.T, store *db.Store, runID, stageID string) db.PipelineR
 
 func startTestRun(t *testing.T, store *db.Store, rec db.Pipeline, spec pipeline.Spec, enqueue pipelineStageEnqueuer, now time.Time) db.PipelineRun {
 	t.Helper()
-	run, err := createPipelineRun(context.Background(), store, rec, spec, "manual", now)
+	run, err := createPipelineRun(context.Background(), store, rec, spec, "manual", "{}", now)
 	if err != nil {
 		t.Fatalf("createPipelineRun: %v", err)
 	}

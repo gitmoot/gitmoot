@@ -16,16 +16,17 @@ import (
 // the aggregated blocked needs verbatim. Times are RFC3339Nano UTC (zero == empty
 // text), mirroring the pipelines/heartbeat_state schedule columns.
 type PipelineRun struct {
-	ID         string
-	Pipeline   string
-	Trigger    string
-	SpecHash   string
-	State      string
-	HaltStage  string
-	HaltReason string
-	NeedsJSON  string
-	StartedAt  time.Time
-	FinishedAt time.Time
+	ID          string
+	Pipeline    string
+	Trigger     string
+	PayloadJSON string
+	SpecHash    string
+	State       string
+	HaltStage   string
+	HaltReason  string
+	NeedsJSON   string
+	StartedAt   time.Time
+	FinishedAt  time.Time
 }
 
 // PipelineRunStage is one row of pipeline_run_stages (#681): the advancement state
@@ -64,9 +65,12 @@ func (s *Store) CreatePipelineRun(ctx context.Context, run PipelineRun) error {
 	if strings.TrimSpace(run.Trigger) == "" {
 		run.Trigger = "manual"
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO pipeline_runs(id, pipeline, trigger, spec_hash, state, halt_stage, halt_reason, needs_json, started_at, finished_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		run.ID, run.Pipeline, strings.TrimSpace(run.Trigger), strings.TrimSpace(run.SpecHash),
+	if strings.TrimSpace(run.PayloadJSON) == "" {
+		run.PayloadJSON = "{}"
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO pipeline_runs(id, pipeline, trigger, payload_json, spec_hash, state, halt_stage, halt_reason, needs_json, started_at, finished_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		run.ID, run.Pipeline, strings.TrimSpace(run.Trigger), run.PayloadJSON, strings.TrimSpace(run.SpecHash),
 		strings.TrimSpace(run.State), strings.TrimSpace(run.HaltStage), run.HaltReason, run.NeedsJSON,
 		formatHeartbeatTime(run.StartedAt), formatHeartbeatTime(run.FinishedAt))
 	return err
@@ -79,7 +83,7 @@ func (s *Store) GetPipelineRun(ctx context.Context, id string) (PipelineRun, boo
 	if id == "" {
 		return PipelineRun{}, false, errors.New("pipeline run id is required")
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT id, pipeline, trigger, spec_hash, state, halt_stage, halt_reason, needs_json, started_at, finished_at
+	row := s.db.QueryRowContext(ctx, `SELECT id, pipeline, trigger, payload_json, spec_hash, state, halt_stage, halt_reason, needs_json, started_at, finished_at
 		FROM pipeline_runs WHERE id = ?`, id)
 	run, err := scanPipelineRun(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -98,7 +102,7 @@ func (s *Store) ListPipelineRuns(ctx context.Context, pipeline string) ([]Pipeli
 	if pipeline == "" {
 		return nil, errors.New("pipeline name is required")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, pipeline, trigger, spec_hash, state, halt_stage, halt_reason, needs_json, started_at, finished_at
+	rows, err := s.db.QueryContext(ctx, `SELECT id, pipeline, trigger, payload_json, spec_hash, state, halt_stage, halt_reason, needs_json, started_at, finished_at
 		FROM pipeline_runs WHERE pipeline = ? ORDER BY started_at DESC, id DESC`, pipeline)
 	if err != nil {
 		return nil, err
@@ -124,7 +128,7 @@ func (s *Store) ActivePipelineRun(ctx context.Context, pipeline string) (Pipelin
 	if pipeline == "" {
 		return PipelineRun{}, false, errors.New("pipeline name is required")
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT id, pipeline, trigger, spec_hash, state, halt_stage, halt_reason, needs_json, started_at, finished_at
+	row := s.db.QueryRowContext(ctx, `SELECT id, pipeline, trigger, payload_json, spec_hash, state, halt_stage, halt_reason, needs_json, started_at, finished_at
 		FROM pipeline_runs WHERE pipeline = ? AND state = 'running' ORDER BY started_at DESC, id DESC LIMIT 1`, pipeline)
 	run, err := scanPipelineRun(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -141,7 +145,7 @@ func (s *Store) ActivePipelineRun(ctx context.Context, pipeline string) (Pipelin
 // advanced, so a parked (blocked/failed) or terminal run consumes zero compute
 // until it is resumed.
 func (s *Store) ListActivePipelineRuns(ctx context.Context) ([]PipelineRun, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, pipeline, trigger, spec_hash, state, halt_stage, halt_reason, needs_json, started_at, finished_at
+	rows, err := s.db.QueryContext(ctx, `SELECT id, pipeline, trigger, payload_json, spec_hash, state, halt_stage, halt_reason, needs_json, started_at, finished_at
 		FROM pipeline_runs WHERE state = 'running' ORDER BY started_at, id`)
 	if err != nil {
 		return nil, err
@@ -301,10 +305,10 @@ func (s *Store) UpdatePipelineLastRun(ctx context.Context, name, runID, status s
 
 func scanPipelineRun(row interface{ Scan(...any) error }) (PipelineRun, error) {
 	var (
-		run                PipelineRun
+		run                 PipelineRun
 		startedAt, finished string
 	)
-	if err := row.Scan(&run.ID, &run.Pipeline, &run.Trigger, &run.SpecHash, &run.State,
+	if err := row.Scan(&run.ID, &run.Pipeline, &run.Trigger, &run.PayloadJSON, &run.SpecHash, &run.State,
 		&run.HaltStage, &run.HaltReason, &run.NeedsJSON, &startedAt, &finished); err != nil {
 		return PipelineRun{}, err
 	}

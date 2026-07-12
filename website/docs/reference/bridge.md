@@ -20,7 +20,8 @@ and enqueue agent asks.
   token); `--rotate` regenerates it.
 - The bridge adds no new authority: every endpoint calls the same internal
   functions the CLI commands use, so all existing gates apply.
-- 30 requests/minute, 1MB request bodies, one audit log line per call.
+- 30 requests/minute, a 1 MiB general request-body cap, one audit log line per
+  call. Pipeline-run requests have a stricter 64 KiB cap.
 
 ## Endpoints
 
@@ -31,6 +32,45 @@ and enqueue agent asks.
 | POST | `/v1/memory/recall` | ranked confirmed-memory lookup (`{query, repo?, agent?, shared?, limit?}`) |
 | GET | `/v1/jobs/{id}` | job state and result payload |
 | POST | `/v1/agents/{name}/ask` | enqueue a background ask (`{message, repo, model?, runtime?}`) |
+
+## Start a pipeline with input
+
+`POST /v1/pipelines/{name}/run` accepts no body, `{}`, or:
+
+```json
+{
+  "payload": {
+    "subject": "Build failed",
+    "sender": "alerts@example.com"
+  }
+}
+```
+
+`payload` is strictly a JSON object of string values. Unknown top-level fields,
+non-object payloads, and non-string values are rejected. Payload transport is
+available to every enabled, repo-bound pipeline; the pipeline does not need a
+`trigger:` block.
+
+Limits reject the request rather than truncating it:
+
+- raw request body: 64 KiB;
+- entries: at most 32;
+- key: 1–64 bytes matching `^[a-z][a-z0-9_]*$`;
+- value: at most 32 KiB of valid UTF-8 and no U+0000;
+- decoded keys plus values: at most 48 KiB.
+
+The successful response remains `200 {"run_id":"prun-…"}`. Errors are:
+
+| Status | Meaning |
+| --- | --- |
+| `400` | Invalid schema or payload rule; disabled pipeline; pipeline has no repo. |
+| `404` | Pipeline not found. |
+| `409` | The pipeline already has an active run. Requests are not queued or deduplicated. |
+| `413` | The 64 KiB pipeline-run body cap was exceeded (`{"error":"request body too large"}`). |
+
+The validated map is stored canonically in the pipeline run's SQLite row. Shell
+stage environment entries and agent-stage prompt projections are retained with
+normal job data; treat external content as stored Gitmoot data.
 
 ## Reaching the bridge from a container
 
