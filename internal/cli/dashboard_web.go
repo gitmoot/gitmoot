@@ -237,6 +237,8 @@ func (d *webDataSource) Workflow(ctx context.Context, label string, q dashboard.
 		out.State, out.StalledForS = deriveDashboardWorkflowState(now, dashboardWorkflowActivity{
 			Queued: summary.Queued, Running: summary.Running, Failed: summary.Failed,
 			Blocked: summary.Blocked, LastActivity: workflowMillisTime(out.Summary.LastAt),
+			LastFailure: workflowMillisTime(parseJobTimeMillis(summary.LastFailureAt)),
+			LastNote:    workflowMillisTime(parseJobTimeMillis(summary.LastNoteAt)),
 		})
 		meta, metaErr := store.GetWorkflowMeta(ctx, label)
 		if metaErr != nil && !errors.Is(metaErr, sql.ErrNoRows) {

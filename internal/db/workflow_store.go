@@ -48,6 +48,10 @@ type WorkflowSummary struct {
 	LastAt       string `json:"last_activity"`
 	LastNote     string `json:"last_note,omitempty"`
 	LastAuthor   string `json:"last_author,omitempty"`
+	// LastFailureAt/LastNoteAt let the dashboard's stalled derivation apply the
+	// acknowledgment rule: a failure with a LATER journal note is not an alarm.
+	LastFailureAt string `json:"last_failure_at,omitempty"`
+	LastNoteAt    string `json:"last_note_at,omitempty"`
 }
 
 // Exported query constants keep production SQL and EXPLAIN regression tests on
@@ -68,7 +72,8 @@ const workflowSummarySelectSQL = `WITH job_summary AS (
 		COALESCE(SUM(j.input_tokens), 0) AS input_tokens,
 		COALESCE(SUM(j.output_tokens), 0) AS output_tokens,
 		MIN(j.created_at) AS first_at,
-		MAX(j.updated_at) AS last_at
+		MAX(j.updated_at) AS last_at,
+		MAX(CASE WHEN j.state IN ('failed','blocked') THEN j.updated_at END) AS last_failure_at
 	FROM jobs j INDEXED BY idx_jobs_workflow_id
 	WHERE j.workflow_id != ''
 	GROUP BY j.workflow_id
@@ -105,7 +110,8 @@ SELECT labels.workflow_id,
 		WHEN n.last_at IS NULL THEN j.last_at
 		WHEN j.last_at >= n.last_at THEN j.last_at ELSE n.last_at
 	END AS last_at,
-	COALESCE(n.last_note, ''), COALESCE(n.last_author, '')
+	COALESCE(n.last_note, ''), COALESCE(n.last_author, ''),
+	COALESCE(j.last_failure_at, ''), COALESCE(n.last_at, '')
 FROM labels
 LEFT JOIN job_summary j ON j.workflow_id = labels.workflow_id
 LEFT JOIN note_summary n ON n.workflow_id = labels.workflow_id`
@@ -330,7 +336,7 @@ func (s *Store) ListWorkflowSummaries(ctx context.Context) ([]WorkflowSummary, e
 		if err := rows.Scan(&item.WorkflowID, &item.JobCount, &item.Queued, &item.Running,
 			&item.Succeeded, &item.Failed, &item.Blocked, &item.Cancelled,
 			&item.InputTokens, &item.OutputTokens, &item.NoteCount, &item.FirstAt, &item.LastAt,
-			&item.LastNote, &item.LastAuthor); err != nil {
+			&item.LastNote, &item.LastAuthor, &item.LastFailureAt, &item.LastNoteAt); err != nil {
 			return nil, err
 		}
 		out = append(out, item)
@@ -425,7 +431,8 @@ func (s *Store) WorkflowSummary(ctx context.Context, workflowID string) (Workflo
 	err := s.db.QueryRowContext(ctx, WorkflowSummarySQL, workflowID).Scan(
 		&item.WorkflowID, &item.JobCount, &item.Queued, &item.Running, &item.Succeeded,
 		&item.Failed, &item.Blocked, &item.Cancelled, &item.InputTokens,
-		&item.OutputTokens, &item.NoteCount, &firstAt, &lastAt, &item.LastNote, &item.LastAuthor)
+		&item.OutputTokens, &item.NoteCount, &firstAt, &lastAt, &item.LastNote, &item.LastAuthor,
+		&item.LastFailureAt, &item.LastNoteAt)
 	if err != nil {
 		return WorkflowSummary{}, err
 	}

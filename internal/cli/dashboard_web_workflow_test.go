@@ -28,10 +28,13 @@ func TestDeriveDashboardWorkflowState(t *testing.T) {
 		{name: "running stays active", activity: dashboardWorkflowActivity{Running: 1, LastActivity: now.Add(-48 * time.Hour)}, state: "active"},
 		{name: "queued stays active", activity: dashboardWorkflowActivity{Queued: 1, LastActivity: now.Add(-48 * time.Hour)}, state: "active"},
 		{name: "recent terminal is active", activity: dashboardWorkflowActivity{LastActivity: now.Add(-30 * time.Minute)}, state: "active"},
-		{name: "failed quiet is stalled", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-31 * time.Minute)}, state: "stalled", stalled: 31 * 60},
-		{name: "blocked quiet is stalled", activity: dashboardWorkflowActivity{Blocked: 1, LastActivity: now.Add(-23 * time.Hour)}, state: "stalled", stalled: 23 * 60 * 60},
+		{name: "unacknowledged failure is stalled", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-31 * time.Minute), LastFailure: now.Add(-31 * time.Minute)}, state: "stalled", stalled: 31 * 60},
+		{name: "unacknowledged block is stalled", activity: dashboardWorkflowActivity{Blocked: 1, LastActivity: now.Add(-23 * time.Hour), LastFailure: now.Add(-23 * time.Hour)}, state: "stalled", stalled: 23 * 60 * 60},
+		{name: "note before failure does not acknowledge", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-40 * time.Minute), LastFailure: now.Add(-40 * time.Minute), LastNote: now.Add(-2 * time.Hour)}, state: "stalled", stalled: 40 * 60},
+		{name: "acknowledged failure is settled", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-31 * time.Minute), LastFailure: now.Add(-1 * time.Hour), LastNote: now.Add(-31 * time.Minute)}, state: "settled"},
+		{name: "failure without timestamp is settled", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-31 * time.Minute)}, state: "settled"},
 		{name: "successful quiet is settled", activity: dashboardWorkflowActivity{LastActivity: now.Add(-31 * time.Minute)}, state: "settled"},
-		{name: "stalled ages out at horizon", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-24 * time.Hour)}, state: "settled"},
+		{name: "stalled ages out at horizon", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-24 * time.Hour), LastFailure: now.Add(-24 * time.Hour)}, state: "settled"},
 		{name: "missing activity is settled", activity: dashboardWorkflowActivity{Failed: 1}, state: "settled"},
 	}
 	for _, test := range tests {
@@ -351,7 +354,9 @@ func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testin
 	defer raw.Close()
 	for id, stamp := range map[int64]string{
 		activeNote.ID:  format(now.Add(-10 * time.Minute)),
-		stalledNote.ID: format(now.Add(-90 * time.Minute)),
+		// The stalled note predates the failure: an unacknowledged failure is what
+		// makes a workflow stalled (a note AFTER the failure would settle it).
+		stalledNote.ID: format(now.Add(-3 * time.Hour)),
 		settledNote.ID: format(now.Add(-2 * time.Hour)),
 		archiveNote.ID: format(now.Add(-48 * time.Hour)),
 	} {
@@ -372,7 +377,7 @@ func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testin
 		t.Fatalf("state ordering = %+v", entries)
 	}
 	stalled := entries[0]
-	if stalled.StalledForS < 90*60 || stalled.StalledForS > 90*60+5 || stalled.Counts.Failed != 1 || stalled.Counts.Notes != 1 || stalled.Coordinator.Pane != "ops-pane" {
+	if stalled.StalledForS < 2*60*60 || stalled.StalledForS > 2*60*60+5 || stalled.Counts.Failed != 1 || stalled.Counts.Notes != 1 || stalled.Coordinator.Pane != "ops-pane" {
 		t.Fatalf("stalled entry = %+v", stalled)
 	}
 	active := entries[1]

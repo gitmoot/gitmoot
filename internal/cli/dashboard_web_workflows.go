@@ -23,6 +23,11 @@ const (
 type dashboardWorkflowActivity struct {
 	Queued, Running, Failed, Blocked int
 	LastActivity                     time.Time
+	// LastFailure/LastNote drive the acknowledgment rule: a failure is only an
+	// alarm while no journal note has been written AFTER it ("a failure alone is
+	// not an alarm — the silence after it is").
+	LastFailure time.Time
+	LastNote    time.Time
 }
 
 // deriveDashboardWorkflowState is the single lifecycle definition shared by
@@ -32,7 +37,10 @@ func deriveDashboardWorkflowState(now time.Time, activity dashboardWorkflowActiv
 	if activity.Queued > 0 || activity.Running > 0 || (!activity.LastActivity.IsZero() && age <= dashboardWorkflowActiveWindow) {
 		return "active", 0
 	}
-	if (activity.Failed > 0 || activity.Blocked > 0) && age > dashboardWorkflowActiveWindow && age < dashboardWorkflowStalledHorizon {
+	failureUnacknowledged := !activity.LastFailure.IsZero() &&
+		(activity.LastNote.IsZero() || activity.LastNote.Before(activity.LastFailure))
+	if (activity.Failed > 0 || activity.Blocked > 0) && failureUnacknowledged &&
+		age > dashboardWorkflowActiveWindow && age < dashboardWorkflowStalledHorizon {
 		return "stalled", max(0, int64(age/time.Second))
 	}
 	return "settled", 0
@@ -66,6 +74,8 @@ func (d *webDataSource) Workflows(ctx context.Context) ([]dashboard.WorkflowInde
 			state, stalledFor := deriveDashboardWorkflowState(now, dashboardWorkflowActivity{
 				Queued: summary.Queued, Running: summary.Running, Failed: summary.Failed,
 				Blocked: summary.Blocked, LastActivity: workflowMillisTime(lastAt),
+				LastFailure: workflowMillisTime(parseJobTimeMillis(summary.LastFailureAt)),
+				LastNote:    workflowMillisTime(parseJobTimeMillis(summary.LastNoteAt)),
 			})
 			meta := metaByWorkflow[summary.WorkflowID]
 			author := strings.TrimSpace(meta.Author)
