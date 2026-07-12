@@ -112,27 +112,47 @@ func (t TeeRunner) LookPath(file string) (string, error) {
 	return t.inner().LookPath(file)
 }
 
-// EnvInjectingRunner wraps GroupRunner to always append Env (KEY=VALUE entries)
+// EnvInjectingRunner wraps a runner to always append Env (KEY=VALUE entries)
 // to the runtime subprocess environment while preserving process-group kill. The
 // #732 daemon dispatches a moot seat's runtime adapter with one of these so the
 // seat's GITMOOT_CHAT_RELAY[_AUTH] reaches its `gitmoot chat send/wait` subprocess
-// — ONLY for moot seats; a normal job's adapter keeps a nil runner (plain
-// GroupRunner) and is byte-identical. Env is applied on every Run/RunEnv call.
+// - ONLY for moot seats. Inner defaults to GroupRunner, preserving the historical
+// behavior when credential curation is off. Env is applied on every Run/RunEnv call.
 type EnvInjectingRunner struct {
-	Env []string
+	Inner Runner
+	Env   []string
+}
+
+func (r EnvInjectingRunner) inner() Runner {
+	if r.Inner != nil {
+		return r.Inner
+	}
+	return GroupRunner{}
 }
 
 func (r EnvInjectingRunner) Run(ctx context.Context, dir string, command string, args ...string) (Result, error) {
-	return RunGroupEnv(ctx, dir, r.Env, command, args...)
+	if inner, ok := r.inner().(EnvRunner); ok {
+		return inner.RunEnv(ctx, dir, r.Env, command, args...)
+	}
+	if len(r.Env) == 0 {
+		return r.inner().Run(ctx, dir, command, args...)
+	}
+	return Result{}, errors.New("environment-injecting runner inner does not support environment injection")
 }
 
 func (r EnvInjectingRunner) RunEnv(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error) {
 	merged := append(append([]string{}, r.Env...), env...)
-	return RunGroupEnv(ctx, dir, merged, command, args...)
+	if inner, ok := r.inner().(EnvRunner); ok {
+		return inner.RunEnv(ctx, dir, merged, command, args...)
+	}
+	if len(merged) == 0 {
+		return r.inner().Run(ctx, dir, command, args...)
+	}
+	return Result{}, errors.New("environment-injecting runner inner does not support environment injection")
 }
 
 func (r EnvInjectingRunner) LookPath(file string) (string, error) {
-	return exec.LookPath(file)
+	return r.inner().LookPath(file)
 }
 
 // SyncWriter serializes writes to w. Stream tees and any sibling writers

@@ -94,6 +94,31 @@ func TestWrappingRunnerStateEnvWinsCallerOverride(t *testing.T) {
 	}
 }
 
+func TestWrappingRunnerEnvIsLastOverCuratedBase(t *testing.T) {
+	dir := t.TempDir()
+	shim := filepath.Join(dir, "shim.sh")
+	if err := os.WriteFile(shim, []byte(`#!/bin/sh
+shift
+while test "$1" != --; do shift 2; done
+shift
+exec "$@"
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := WrappingRunner{
+		Inner:      CuratedGroupRunner{BaseEnv: []string{"PATH=" + os.Getenv("PATH"), "WRAPPER_ORDER=base"}},
+		Executable: shim,
+		Env:        []string{"WRAPPER_ORDER=wrapper"},
+	}
+	result, err := runner.Run(context.Background(), dir, "sh", "-c", `printf '%s' "$WRAPPER_ORDER"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Stdout != "wrapper" {
+		t.Fatalf("wrapper order = %q, want wrapper", result.Stdout)
+	}
+}
+
 func TestWrappingRunnerComposesWithGroupRunnerAndKillsChildTree(t *testing.T) {
 	dir := t.TempDir()
 	shim := filepath.Join(dir, "shim.sh")

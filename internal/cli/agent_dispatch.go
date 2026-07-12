@@ -379,7 +379,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	ctx = workflow.WithRuntimeSelfOwnerToken(ctx, ownerToken)
 	// Adapter selection uses the EFFECTIVE runtime: this is the seam that makes
 	// a --runtime override actually deliver through the override adapter (#531).
-	adapter, err := runtimeStartAdapter(newRuntimeFactory(), effectiveAgent.Runtime, checkoutPath)
+	adapter, err := runtimeAdapterFor(request.Home, effectiveAgent.Runtime, checkoutPath)
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
@@ -1182,7 +1182,7 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 			return db.Agent{}, noopAgentReservationRelease, err
 		}
 	}
-	adapter, err := runtimeStartAdapter(newRuntimeFactory(), instanceAgent.Runtime, record.CheckoutPath)
+	adapter, err := runtimeAdapterFor(home, instanceAgent.Runtime, record.CheckoutPath)
 	if err != nil {
 		return db.Agent{}, noopAgentReservationRelease, err
 	}

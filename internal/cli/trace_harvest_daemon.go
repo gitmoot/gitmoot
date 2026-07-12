@@ -94,11 +94,13 @@ func daemonReviewLegDispatcher(store *db.Store, gh github.Client, checkout strin
 		return nil
 	}
 	return &crossFamilyReviewDispatcher{
-		store:        store,
-		diff:         gh,
-		buildAdapter: buildRuntimeAdapter,
-		authed:       daemonAuthedRuntimes(checkout),
-		checkout:     checkout,
+		store: store,
+		diff:  gh,
+		buildAdapter: func(agent runtime.Agent, checkout string, runner subprocess.Runner) (workflow.DeliveryAdapter, error) {
+			return buildRuntimeAdapter(home, agent, checkout, runner)
+		},
+		authed:   daemonAuthedRuntimes(checkout),
+		checkout: checkout,
 	}
 }
 
