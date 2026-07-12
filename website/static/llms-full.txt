@@ -8640,11 +8640,17 @@ needed. Do not use nonexistent commands such as `gitmoot status --json` or
 agent prompt into the current chat. Use
 `gitmoot agent run <agent> --repo owner/repo "..."` for coordinator delegation
 so Gitmoot can route to ask, review, or implement and own worktrees, branch
-locks, commits, pushes, PRs, and workflow advancement. Use
+locks, commits, pushes, PRs, and workflow advancement. Add `--action
+ask|review|implement` when that job action must be explicit; `--type` is
+independent and selects a managed agent type, not an action. Use
 `gitmoot agent ask <agent> --repo owner/repo "..."` only for
 analysis, planning, or questions. Use `gitmoot agent review <agent> --repo
 owner/repo --pr <number> "..."` for PR review decisions and `gitmoot agent
 implement <agent> --repo owner/repo --task <task-id> "..."` for file changes.
+For a fix pass on an existing open PR, use `agent implement --pr <number>` (or
+`agent run --action implement --pr <number>`); Gitmoot validates that the PR is
+open, belongs to the same repository, and matches the existing task branch
+before reusing its task worktree and PR.
 Add `--background` only when the user wants a queued background job.
 
 Orchestrate (Orchestra): when the user says "orchestrate …" or "spin up an
@@ -9526,8 +9532,10 @@ Delegate to a registered agent from the current local chat:
 gitmoot agent run project-planner --repo owner/repo "Return the plan status."
 gitmoot agent run lead --repo owner/repo --task task-001 --background "Implement this task."
 gitmoot agent run reviewer --repo owner/repo --pr 12 --background "Review this PR."
+gitmoot agent run lead --repo owner/repo --action implement --pr 12 "Fix findings on the existing PR."
 gitmoot agent review reviewer --repo owner/repo --pr 12 "Review this PR."
 gitmoot agent implement lead --repo owner/repo --task task-001 "Implement this task."
+gitmoot agent implement lead --repo owner/repo --pr 12 "Fix findings on the existing PR."
 gitmoot agent implement lead --repo owner/repo --task task-002 --base origin/main "Implement from current origin/main."
 gitmoot agent ask project-planner --repo owner/repo "Return the plan status."
 gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
@@ -9535,6 +9543,24 @@ gitmoot agent run lead --repo owner/repo --model gpt-5-codex "Implement this tas
 gitmoot agent run lead --repo owner/repo --effort xhigh "Implement this task."
 gitmoot job watch <job-id>
 ```
+
+`agent run --action ask|review|implement` explicitly selects the job action and
+wins before the usual inference order (`--task` -> implement, then
+`--pr`/review `--head-sha` -> review, then message heuristics). `--type <name>`
+has a separate meaning: it selects a managed agent type. The flags can be used
+together. Invalid actions and contradictions are rejected before enqueue;
+notably, `--action review` requires `--pr`, while `--action implement --pr` is
+the explicit existing-PR fix-pass route.
+
+For `agent implement --pr <number>` (or the equivalent `agent run --action
+implement --pr <number>`), Gitmoot resolves the PR and reuses its existing task
+and worktree only when the PR is open, its head is in the same repository, and
+its head branch matches that task. This is the only route that lets a `pr_open`
+task re-enter implementation; `changes_requested` remains reusable as before.
+`reviewing` and `ready_to_merge`, closed/merged PRs, fork or unrelated heads,
+branch mismatches, active implement jobs, live processes, dirty worktrees, and
+foreign branch locks are refused. The existing PR number stays on the job
+payload so finalization adopts that PR instead of creating a second task or PR.
 
 For `agent implement`, `--base <ref>` selects the commit used to create a new
 branch worktree. `agent run` accepts the same flag when it routes to implement.
@@ -12335,6 +12361,18 @@ over a dirty worktree with no active job (so nothing is discarded) and point at
 worktree state (`git add -A`, incl. untracked non-ignored files), pushes the
 branch, and opens or adopts the PR. `--repo` is optional (falls back to the
 task's repo). Recovery refuses while a live process is still inside the worktree.
+
+**PR-bound fix pass:** use `gitmoot agent implement <agent> --repo owner/repo
+--pr <number> "..."` or `gitmoot agent run <agent> --repo owner/repo --action
+implement --pr <number> "..."` to send an existing open PR back through its
+implementation task. `--action` chooses ask/review/implement; `--type` instead
+chooses a managed agent type, so the two flags are independent. Before reuse,
+Gitmoot proves the PR is open, same-repository, and bound to the existing task's
+head branch. That validated door permits `pr_open` to re-enter implementation
+without widening the predicate shared by `task recover`; review/merge states,
+branch mismatches, dirty/live worktrees, active implement jobs, and foreign
+branch locks still fail closed. The job keeps the PR number so finalization
+adopts the existing PR.
 
 The daemon default is `--workers 1`. Users can raise it when jobs target
 different runtime sessions, managed agent types with `max_background` greater

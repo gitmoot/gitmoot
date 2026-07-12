@@ -87,13 +87,17 @@ type PullRequest struct {
 	// detection reads it for a GitHub Revert-button body (`Reverts owner/repo#NN`)
 	// to map a revert back to the original PR. It defaults to "" so every existing
 	// caller that ignores it is byte-identical.
-	Body      string `json:"body"`
-	HeadRef   string
-	BaseRef   string
-	BaseSHA   string
-	HeadSHA   string
-	MergeSHA  string
-	Mergeable *bool `json:"mergeable"`
+	Body    string `json:"body"`
+	HeadRef string
+	// HeadRepoFullName identifies the repository that owns the PR head branch.
+	// GitHub permits fork PRs whose HeadRef text matches a local branch, so callers
+	// that mutate an existing branch must validate this separately from HeadRef.
+	HeadRepoFullName string
+	BaseRef          string
+	BaseSHA          string
+	HeadSHA          string
+	MergeSHA         string
+	Mergeable        *bool `json:"mergeable"`
 	// Labels carries the PR's GitHub labels (parsed from the list/get JSON, no
 	// extra API call). It is additive (#650): existing callers that ignore it are
 	// byte-identical; the opt-in risk classifier reads label names from it.
@@ -129,8 +133,11 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 		Mergeable *bool  `json:"mergeable"`
 		MergeSHA  string `json:"merge_commit_sha"`
 		Head      struct {
-			Ref string `json:"ref"`
-			SHA string `json:"sha"`
+			Ref  string `json:"ref"`
+			SHA  string `json:"sha"`
+			Repo *struct {
+				FullName string `json:"full_name"`
+			} `json:"repo"`
 		} `json:"head"`
 		Base struct {
 			Ref string `json:"ref"`
@@ -151,6 +158,10 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 	p.Body = decoded.Body
 	p.Mergeable = decoded.Mergeable
 	p.HeadRef = decoded.Head.Ref
+	p.HeadRepoFullName = ""
+	if decoded.Head.Repo != nil {
+		p.HeadRepoFullName = decoded.Head.Repo.FullName
+	}
 	p.HeadSHA = decoded.Head.SHA
 	p.MergeSHA = decoded.MergeSHA
 	p.BaseRef = decoded.Base.Ref

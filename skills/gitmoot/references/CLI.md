@@ -573,8 +573,10 @@ Delegate to a registered agent from the current local chat:
 gitmoot agent run project-planner --repo owner/repo "Return the plan status."
 gitmoot agent run lead --repo owner/repo --task task-001 --background "Implement this task."
 gitmoot agent run reviewer --repo owner/repo --pr 12 --background "Review this PR."
+gitmoot agent run lead --repo owner/repo --action implement --pr 12 "Fix findings on the existing PR."
 gitmoot agent review reviewer --repo owner/repo --pr 12 "Review this PR."
 gitmoot agent implement lead --repo owner/repo --task task-001 "Implement this task."
+gitmoot agent implement lead --repo owner/repo --pr 12 "Fix findings on the existing PR."
 gitmoot agent implement lead --repo owner/repo --task task-002 --base origin/main "Implement from current origin/main."
 gitmoot agent ask project-planner --repo owner/repo "Return the plan status."
 gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
@@ -582,6 +584,24 @@ gitmoot agent run lead --repo owner/repo --model gpt-5-codex "Implement this tas
 gitmoot agent run lead --repo owner/repo --effort xhigh "Implement this task."
 gitmoot job watch <job-id>
 ```
+
+`agent run --action ask|review|implement` explicitly selects the job action and
+wins before the usual inference order (`--task` -> implement, then
+`--pr`/review `--head-sha` -> review, then message heuristics). `--type <name>`
+has a separate meaning: it selects a managed agent type. The flags can be used
+together. Invalid actions and contradictions are rejected before enqueue;
+notably, `--action review` requires `--pr`, while `--action implement --pr` is
+the explicit existing-PR fix-pass route.
+
+For `agent implement --pr <number>` (or the equivalent `agent run --action
+implement --pr <number>`), Gitmoot resolves the PR and reuses its existing task
+and worktree only when the PR is open, its head is in the same repository, and
+its head branch matches that task. This is the only route that lets a `pr_open`
+task re-enter implementation; `changes_requested` remains reusable as before.
+`reviewing` and `ready_to_merge`, closed/merged PRs, fork or unrelated heads,
+branch mismatches, active implement jobs, live processes, dirty worktrees, and
+foreign branch locks are refused. The existing PR number stays on the job
+payload so finalization adopts that PR instead of creating a second task or PR.
 
 For `agent implement`, `--base <ref>` selects the commit used to create a new
 branch worktree. `agent run` accepts the same flag when it routes to implement.

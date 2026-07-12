@@ -129,7 +129,12 @@ gitmoot events --repo owner/repo
 ```
 
 Use `gitmoot agent run` for coordinator delegation that may route to ask,
-review, or implement. Use `gitmoot agent ask` for analysis and planning only.
+review, or implement. Add `--action ask|review|implement` when the route must be
+explicit; `--type` independently selects a managed agent type. Use `gitmoot
+agent ask` for analysis and planning only. To fix an existing open PR without
+minting another task or PR, use `gitmoot agent implement <agent> --repo
+owner/repo --pr <number> "..."` (or `agent run --action implement --pr`): the PR
+must be open, same-repository, and bound to the existing task branch.
 
 On a real terminal, `gitmoot dashboard` launches an interactive TUI cockpit with
 pages for Attention, Activity (live orchestras), Trains, Agents, Workers, Jobs,

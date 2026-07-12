@@ -149,11 +149,17 @@ needed. Do not use nonexistent commands such as `gitmoot status --json` or
 agent prompt into the current chat. Use
 `gitmoot agent run <agent> --repo owner/repo "..."` for coordinator delegation
 so Gitmoot can route to ask, review, or implement and own worktrees, branch
-locks, commits, pushes, PRs, and workflow advancement. Use
+locks, commits, pushes, PRs, and workflow advancement. Add `--action
+ask|review|implement` when that job action must be explicit; `--type` is
+independent and selects a managed agent type, not an action. Use
 `gitmoot agent ask <agent> --repo owner/repo "..."` only for
 analysis, planning, or questions. Use `gitmoot agent review <agent> --repo
 owner/repo --pr <number> "..."` for PR review decisions and `gitmoot agent
 implement <agent> --repo owner/repo --task <task-id> "..."` for file changes.
+For a fix pass on an existing open PR, use `agent implement --pr <number>` (or
+`agent run --action implement --pr <number>`); Gitmoot validates that the PR is
+open, belongs to the same repository, and matches the existing task branch
+before reusing its task worktree and PR.
 Add `--background` only when the user wants a queued background job.
 
 Orchestrate (Orchestra): when the user says "orchestrate …" or "spin up an

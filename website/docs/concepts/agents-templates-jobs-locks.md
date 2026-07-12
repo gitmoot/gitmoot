@@ -120,6 +120,12 @@ runtime session lock. To run the *same* agent on several tasks at once, dispatch
   `gitmoot agent run <type> --type <type> --background …` and the daemon reuses an
   idle instance or spins a new one, up to `N`.
 
+`--type` selects this managed pool; it never selects the job action. On `agent
+run`, use the independent `--action ask|review|implement` override when routing
+must be explicit. For example, `--type fixer --action implement --pr 42`
+dispatches an implement fix pass through the `fixer` pool after Gitmoot validates
+that PR 42 is open, same-repository, and bound to the existing task branch.
+
 Both need daemon **job slots** to run at the same time: `max_background` and temp
 sessions are session slots, but the daemon still executes at most `--workers`
 jobs at once (default `1`; raise it, e.g. `--workers 6`).
