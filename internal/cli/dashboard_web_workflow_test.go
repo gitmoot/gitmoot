@@ -2,11 +2,13 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	dashboard "github.com/jerryfane/gitmoot-dashboard"
 
@@ -14,6 +16,33 @@ import (
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
+
+func TestDeriveDashboardWorkflowState(t *testing.T) {
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name     string
+		activity dashboardWorkflowActivity
+		state    string
+		stalled  int64
+	}{
+		{name: "running stays active", activity: dashboardWorkflowActivity{Running: 1, LastActivity: now.Add(-48 * time.Hour)}, state: "active"},
+		{name: "queued stays active", activity: dashboardWorkflowActivity{Queued: 1, LastActivity: now.Add(-48 * time.Hour)}, state: "active"},
+		{name: "recent terminal is active", activity: dashboardWorkflowActivity{LastActivity: now.Add(-30 * time.Minute)}, state: "active"},
+		{name: "failed quiet is stalled", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-31 * time.Minute)}, state: "stalled", stalled: 31 * 60},
+		{name: "blocked quiet is stalled", activity: dashboardWorkflowActivity{Blocked: 1, LastActivity: now.Add(-23 * time.Hour)}, state: "stalled", stalled: 23 * 60 * 60},
+		{name: "successful quiet is settled", activity: dashboardWorkflowActivity{LastActivity: now.Add(-31 * time.Minute)}, state: "settled"},
+		{name: "stalled ages out at horizon", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-24 * time.Hour)}, state: "settled"},
+		{name: "missing activity is settled", activity: dashboardWorkflowActivity{Failed: 1}, state: "settled"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state, stalled := deriveDashboardWorkflowState(now, test.activity)
+			if state != test.state || stalled != test.stalled {
+				t.Fatalf("derive = (%q, %d), want (%q, %d)", state, stalled, test.state, test.stalled)
+			}
+		})
+	}
+}
 
 func TestWebDataSourceStateCarriesRootWorkflowOnly(t *testing.T) {
 	unlabelledHome := dashboardTestHome(t)
@@ -267,6 +296,125 @@ func TestWebDataSourceWorkflowNotFound(t *testing.T) {
 	if _, err := ds.Workflow(context.Background(), "missing", dashboard.WorkflowQuery{}); !errors.Is(err, dashboard.ErrWorkflowNotFound) {
 		t.Fatalf("Workflow(missing) err = %v, want ErrWorkflowNotFound", err)
 	}
+}
+
+func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testing.T) {
+	home := dashboardTestHome(t)
+	paths := config.PathsForHome(home)
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	format := func(value time.Time) string { return value.UTC().Format("2006-01-02 15:04:05") }
+	seedJob := func(id, label, state, repo string, age time.Duration, in, out int) {
+		t.Helper()
+		payload := workflow.JobPayload{WorkflowID: label, Repo: repo, TaskTitle: id}
+		mustCreateJob(t, store, db.Job{ID: id, Agent: "worker", Type: "ask", State: state, Payload: mustJSON(t, payload)}, "", "")
+		if err := store.UpdateJobUsage(ctx, id, in, out); err != nil {
+			t.Fatalf("UpdateJobUsage(%s): %v", id, err)
+		}
+		stamp := format(now.Add(-age))
+		setJobTimes(t, home, id, stamp, stamp)
+	}
+	seedJob("active-job", "fable/dashboard-redesign", "running", "acme/dashboard", 2*time.Hour, 11, 13)
+	seedJob("stalled-job", "ops/stalled", "failed", "acme/ops", 2*time.Hour, 17, 19)
+	seedJob("settled-job", "release/complete", "succeeded", "acme/release", 3*time.Hour, 23, 29)
+
+	activeNote, err := store.InsertWorkflowNoteWithMeta(ctx,
+		db.WorkflowNote{WorkflowID: "fable/dashboard-redesign", Author: "fable", Body: "  live\n coordinator   handoff  "},
+		db.WorkflowMeta{Author: "fable", Pane: "wave-2", SessionID: "session-123", WorkDir: "/work/dashboard"})
+	if err != nil {
+		t.Fatalf("Insert active note: %v", err)
+	}
+	stalledNote, err := store.InsertWorkflowNoteWithMeta(ctx,
+		db.WorkflowNote{WorkflowID: "ops/stalled", Author: "operator", Body: "needs attention"},
+		db.WorkflowMeta{Author: "operator", Pane: "ops-pane", SessionID: "ops-session", WorkDir: "/work/ops"})
+	if err != nil {
+		t.Fatalf("Insert stalled note: %v", err)
+	}
+	settledNote, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{WorkflowID: "release/complete", Author: "release-coord", Body: "release complete"})
+	if err != nil {
+		t.Fatalf("Insert settled note: %v", err)
+	}
+	archiveNote, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{WorkflowID: "journal/archive", Author: "archivist", Body: "note-only history"})
+	if err != nil {
+		t.Fatalf("Insert archive note: %v", err)
+	}
+	store.Close()
+
+	raw, err := sql.Open("sqlite", paths.Database)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer raw.Close()
+	for id, stamp := range map[int64]string{
+		activeNote.ID:  format(now.Add(-10 * time.Minute)),
+		stalledNote.ID: format(now.Add(-90 * time.Minute)),
+		settledNote.ID: format(now.Add(-2 * time.Hour)),
+		archiveNote.ID: format(now.Add(-48 * time.Hour)),
+	} {
+		if _, err := raw.Exec(`UPDATE workflow_notes SET created_at = ? WHERE id = ?`, stamp, id); err != nil {
+			t.Fatalf("UPDATE workflow note %d: %v", id, err)
+		}
+	}
+
+	ds := &webDataSource{home: home}
+	entries, err := ds.Workflows(ctx)
+	if err != nil {
+		t.Fatalf("Workflows: %v", err)
+	}
+	if len(entries) != 4 {
+		t.Fatalf("entries = %d, want 4: %+v", len(entries), entries)
+	}
+	if entries[0].Label != "ops/stalled" || entries[0].State != "stalled" || entries[1].Label != "fable/dashboard-redesign" || entries[1].State != "active" {
+		t.Fatalf("state ordering = %+v", entries)
+	}
+	stalled := entries[0]
+	if stalled.StalledForS < 90*60 || stalled.StalledForS > 90*60+5 || stalled.Counts.Failed != 1 || stalled.Counts.Notes != 1 || stalled.Coordinator.Pane != "ops-pane" {
+		t.Fatalf("stalled entry = %+v", stalled)
+	}
+	active := entries[1]
+	if active.Namespace != "fable" || active.Campaign != "dashboard-redesign" || active.Auto || active.Counts.Jobs != 1 || active.Counts.Running != 1 || active.TokensIn != 11 || active.TokensOut != 13 || active.LastNote != "live coordinator handoff" || active.Coordinator.Author != "fable" || active.Coordinator.SessionID != "session-123" {
+		t.Fatalf("active entry = %+v", active)
+	}
+	if len(active.Repos) != 1 || active.Repos[0] != "acme/dashboard" {
+		t.Fatalf("active repos = %v", active.Repos)
+	}
+	settled := workflowIndexEntryByLabel(t, entries, "release/complete")
+	if settled.State != "settled" || settled.Coordinator.Author != "release-coord" {
+		t.Fatalf("settled entry = %+v", settled)
+	}
+	archive := workflowIndexEntryByLabel(t, entries, "journal/archive")
+	if archive.Counts.Jobs != 0 || archive.Counts.Notes != 1 || archive.State != "settled" {
+		t.Fatalf("note-only entry = %+v", archive)
+	}
+
+	handler := dashboard.Serve(ds)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/workflow/fable%2Fdashboard-redesign", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("encoded slash detail status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var detail dashboard.WorkflowView
+	if err := json.Unmarshal(recorder.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if detail.Summary.Label != "fable/dashboard-redesign" || detail.State != "active" || detail.Coordinator.Pane != "wave-2" || detail.Coordinator.SessionID != "session-123" || detail.WorkDir != "/work/dashboard" || len(detail.Runs) != 1 || detail.Runs[0].Agent != "worker" || detail.Runs[0].Repo != "acme/dashboard" {
+		t.Fatalf("namespaced detail = %+v", detail)
+	}
+}
+
+func workflowIndexEntryByLabel(t *testing.T, entries []dashboard.WorkflowIndexEntry, label string) dashboard.WorkflowIndexEntry {
+	t.Helper()
+	for _, entry := range entries {
+		if entry.Label == label {
+			return entry
+		}
+	}
+	t.Fatalf("missing workflow index entry %q", label)
+	return dashboard.WorkflowIndexEntry{}
 }
 
 func TestCappedWorkflowLimitDefaultsAndCaps(t *testing.T) {

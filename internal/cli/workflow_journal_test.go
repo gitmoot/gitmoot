@@ -157,6 +157,32 @@ func TestWorkflowNotePrivateAgentMustBeRegistered(t *testing.T) {
 	}
 }
 
+func TestWorkflowNotePersistsNamespacedCoordinatorMetadata(t *testing.T) {
+	home, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	if err := store.CreateJob(ctx, db.Job{ID: "job-1", Agent: "coord", Type: "ask", State: "running", Payload: `{"repo":"acme/widget","workflow_id":"fable/dashboard-redesign"}`}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := runWorkflowJournal([]string{
+		"note", "fable/dashboard-redesign", "Coordinator handoff.",
+		"--author", "fable", "--pane", "wave-2", "--session", "session-123",
+		"--workdir", "/work/dashboard", "--home", home,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("workflow note exit=%d stderr=%q", code, stderr.String())
+	}
+	meta, err := store.GetWorkflowMeta(ctx, "fable/dashboard-redesign")
+	if err != nil || meta.Author != "fable" || meta.Pane != "wave-2" || meta.SessionID != "session-123" || meta.WorkDir != "/work/dashboard" {
+		t.Fatalf("metadata = %+v, err=%v", meta, err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := runWorkflowShow([]string{"fable/dashboard-redesign", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("namespaced workflow show exit=%d stderr=%q", code, stderr.String())
+	}
+}
+
 func TestJobListWorkflowFilterUsesGroupMembership(t *testing.T) {
 	home, store := workflowJournalTestHome(t)
 	ctx := context.Background()

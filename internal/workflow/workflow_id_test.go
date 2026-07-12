@@ -24,14 +24,33 @@ func TestWorkflowIDOmittedPayloadIsByteIdentical(t *testing.T) {
 }
 
 func TestValidateWorkflowID(t *testing.T) {
-	for _, valid := range []string{"", "release", "release-42", strings.Repeat("a", 64)} {
-		if err := ValidateWorkflowID(valid); err != nil {
-			t.Errorf("ValidateWorkflowID(%q): %v", valid, err)
-		}
+	tests := []struct {
+		label string
+		valid bool
+	}{
+		{label: "", valid: true},
+		{label: "release", valid: true},
+		{label: "release-42", valid: true},
+		{label: "fable/dashboard-redesign", valid: true},
+		{label: strings.Repeat("a", 64), valid: true},
+		{label: "Release"},
+		{label: "release_42"},
+		{label: "-release"},
+		{label: "release-"},
+		{label: "release--42"},
+		{label: "/x"},
+		{label: "x/"},
+		{label: "a//b"},
+		{label: "a/b/c"},
+		{label: strings.Repeat("a", 65)},
 	}
-	for _, invalid := range []string{"Release", "release_42", "-release", "release-", "release--42", strings.Repeat("a", 65)} {
-		if err := ValidateWorkflowID(invalid); err == nil {
-			t.Errorf("ValidateWorkflowID(%q) accepted invalid label", invalid)
+	for _, test := range tests {
+		err := ValidateWorkflowID(test.label)
+		if test.valid && err != nil {
+			t.Errorf("ValidateWorkflowID(%q): %v", test.label, err)
+		}
+		if !test.valid && err == nil {
+			t.Errorf("ValidateWorkflowID(%q) accepted invalid label", test.label)
 		}
 	}
 }

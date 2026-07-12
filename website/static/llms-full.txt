@@ -9958,24 +9958,29 @@ at a PRIVATE repo unless the prompts are meant to be public.**
 ## External-coordinator workflow groups
 
 Attach a global workflow label to work started outside Gitmoot's own goal/task
-coordinator. Labels are lowercase slugs up to 64 characters. The label is
+coordinator. Labels are lowercase slugs up to 64 characters. They may contain
+one `/` to split a namespace from a campaign; each side uses lowercase letters,
+digits, and single hyphens with no leading or trailing hyphen. The label is
 accepted by `agent ask`, `agent run`, `agent review`, `agent implement`,
 `orchestrate`, and `job open`; delegation children and every coordinator
 continuation inherit it.
 
 ```sh
-gitmoot orchestrate planner "Coordinate the release." --repo owner/repo --workflow release-42
-gitmoot job list --workflow release-42
+gitmoot orchestrate planner "Coordinate the dashboard wave." --repo owner/repo --workflow fable/dashboard-redesign
+gitmoot job list --workflow fable/dashboard-redesign
 gitmoot workflow list
-gitmoot workflow show release-42 --limit 100
-gitmoot workflow note release-42 "The staging rollout completed." --author operator
+gitmoot workflow show fable/dashboard-redesign --limit 100
+gitmoot workflow note fable/dashboard-redesign "The staging rollout completed." --author operator --pane wave-2 --session <session-id> --workdir /work/dashboard
 ```
 
 `workflow list` reports per-state counts, note count, first/last activity, and
 best-effort token totals. `workflow show` merges jobs and notes chronologically.
-The read-only web dashboard shows labels as Galaxy hubs, adds a workflow link
-to labeled run strips, and serves complete run trees plus notes at
-`/workflows/<label>`.
+The read-only web dashboard shows labels as Galaxy hubs and provides a Workflows
+index plus a mission-log detail at `/workflows/<label>`. Workflows are `active`
+while queued/running or touched within 30 minutes, `stalled` when failed/blocked
+and quiet for 30 minutes to 24 hours, and `settled` otherwise. The optional
+`--pane`, `--session`, and `--workdir` note flags persist the latest coordinator
+handoff shown on that page; author defaults to the newest note author.
 Labels may be reused; timestamps expose the reuse. `workflow note` stores body
 and author verbatim (10 KiB and 128-byte limits) and rejects labels with no jobs.
 `workflow show --json` returns those verbatim bytes; plain-text output strips

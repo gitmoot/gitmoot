@@ -8695,4 +8695,17 @@ ALTER TABLE pipelines ADD COLUMN trigger_binding TEXT NOT NULL DEFAULT '';
 	`
 ALTER TABLE pipeline_runs ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}';
 	`,
+	// Dashboard redesign Wave 2 coordinator handoff metadata. This side table is
+	// last-write-wins per explicit workflow label and leaves all existing workflow
+	// jobs and notes untouched. A missing row is the canonical all-empty value.
+	`
+CREATE TABLE workflow_meta (
+	workflow_id TEXT PRIMARY KEY,
+	author TEXT NOT NULL DEFAULT '',
+	pane TEXT NOT NULL DEFAULT '',
+	session_id TEXT NOT NULL DEFAULT '',
+	workdir TEXT NOT NULL DEFAULT '',
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+	`,
 }

@@ -867,20 +867,26 @@ for the full flow.
 
 Pass `--workflow <label>` to `agent ask`, `agent run`, `agent review`, `agent
 implement`, `orchestrate`, or `job open`. Labels are global lowercase slugs up
-to 64 characters; orchestration children and continuations inherit the label.
+to 64 characters. One `/` may separate a namespace and campaign; both sides use
+lowercase letters, digits, and single hyphens without leading/trailing hyphens.
+Orchestration children and continuations inherit the label.
 
 ```sh
-gitmoot orchestrate planner "Coordinate the release." --repo owner/repo --workflow release-42
-gitmoot job list --workflow release-42
+gitmoot orchestrate planner "Coordinate the dashboard wave." --repo owner/repo --workflow fable/dashboard-redesign
+gitmoot job list --workflow fable/dashboard-redesign
 gitmoot workflow list
-gitmoot workflow show release-42 --limit 100
-gitmoot workflow note release-42 "The staging rollout completed." --author operator
+gitmoot workflow show fable/dashboard-redesign --limit 100
+gitmoot workflow note fable/dashboard-redesign "The staging rollout completed." --author operator --pane wave-2 --session <session-id> --workdir /work/dashboard
 ```
 
 List/show include state counts, notes, first/last activity, and best-effort token
 totals. Notes store bodies and authors verbatim. The read-only web dashboard
-also renders labels as Galaxy hubs and links labeled runs to
-`/workflows/<label>` for their complete run forest, rollups, and journal.
+also renders labels as Galaxy hubs and provides a Workflows index plus mission
+log at `/workflows/<label>`. `active` means queued/running or touched within 30
+minutes; failed/blocked workflows quiet for 30 minutes to 24 hours are
+`stalled`; everything else is `settled`. The optional `--pane`, `--session`, and
+`--workdir` note flags persist the latest coordinator handoff. If coordinator
+author metadata is empty, the newest note author is used.
 `--remember` stages low-trust memory in the shared pool by default; `--agent
 NAME` selects a registered agent's private pool. A single repo is inferred,
 otherwise `--repo` is required.

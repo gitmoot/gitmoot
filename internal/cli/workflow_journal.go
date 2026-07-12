@@ -47,7 +47,7 @@ func printWorkflowJournalUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot workflow list [--json]")
 	fmt.Fprintln(w, "  gitmoot workflow show <label> [--json] [--limit N]")
-	fmt.Fprintln(w, "  gitmoot workflow note <label> \"<body>\" [--author A] [--remember [--agent NAME] [--repo R]]")
+	fmt.Fprintln(w, "  gitmoot workflow note <label> \"<body>\" [--author A] [--pane P] [--session ID] [--workdir PATH] [--remember [--agent NAME] [--repo R]]")
 }
 
 func runWorkflowList(args []string, stdout, stderr io.Writer) int {
@@ -277,6 +277,9 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	author := fs.String("author", "", "verbatim journal author")
+	pane := fs.String("pane", "", "coordinator pane name")
+	sessionID := fs.String("session", "", "coordinator runtime session id")
+	workdir := fs.String("workdir", "", "coordinator working directory")
 	remember := fs.Bool("remember", false, "also stage the note as persistent memory")
 	agent := fs.String("agent", "", "registered agent whose private pool receives memory")
 	repo := fs.String("repo", "", "repo binding for memory when it cannot be inferred")
@@ -322,8 +325,15 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 			return fmt.Errorf("workflow %q has no jobs; refusing note to guard against a typo", label)
 		}
 		note := db.WorkflowNote{WorkflowID: label, Author: *author, Body: body}
+		meta := db.WorkflowMeta{
+			WorkflowID: label,
+			Author:     *author,
+			Pane:       strings.TrimSpace(*pane),
+			SessionID:  strings.TrimSpace(*sessionID),
+			WorkDir:    strings.TrimSpace(*workdir),
+		}
 		if !*remember {
-			out.Note, err = store.InsertWorkflowNote(ctx, note)
+			out.Note, err = store.InsertWorkflowNoteWithMeta(ctx, note, meta)
 			return err
 		}
 		settings, err := config.LoadMemorySettings(paths)
@@ -360,13 +370,13 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 			return err
 		}
 		if _, duplicate := seen[db.MemoryDedupKey(memory.ScopeRepo, memoryRepo, memory.ContentHash(body))]; duplicate {
-			out.Note, err = store.InsertWorkflowNote(ctx, note)
+			out.Note, err = store.InsertWorkflowNoteWithMeta(ctx, note, meta)
 			out.Deduped = err == nil
 			return err
 		}
 		obs := db.MemoryObservation{Owner: owner, AuthorRef: *author, Repo: memoryRepo,
 			Scope: memory.ScopeRepo, Content: body, TrustMark: memory.TrustLow}
-		out.Note, obs, err = store.InsertWorkflowNoteWithObservation(ctx, note, obs)
+		out.Note, obs, err = store.InsertWorkflowNoteWithObservationAndMeta(ctx, note, obs, meta)
 		if err != nil {
 			return err
 		}
