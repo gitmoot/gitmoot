@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -394,9 +395,13 @@ func pipelineRunnerAgent(name, repo string) db.Agent {
 
 type pipelineStageJSON struct {
 	ID               string   `json:"id"`
+	Kind             string   `json:"kind"`
 	Cmd              string   `json:"cmd,omitempty"`
+	CmdPreview       string   `json:"cmd_preview,omitempty"`
 	Agent            string   `json:"agent,omitempty"`
+	AgentRuntime     string   `json:"agent_runtime,omitempty"`
 	Prompt           string   `json:"prompt,omitempty"`
+	PromptPreview    string   `json:"prompt_preview,omitempty"`
 	Action           string   `json:"action,omitempty"`
 	Needs            []string `json:"needs,omitempty"`
 	Timeout          string   `json:"timeout,omitempty"`
@@ -413,6 +418,7 @@ type pipelineJSON struct {
 	Name                string              `json:"name"`
 	Repo                string              `json:"repo,omitempty"`
 	Enabled             bool                `json:"enabled"`
+	Mode                string              `json:"mode"`
 	Interval            string              `json:"interval,omitempty"`
 	Jitter              string              `json:"jitter,omitempty"`
 	SpecHash            string              `json:"spec_hash"`
@@ -451,12 +457,12 @@ func runPipelineList(args []string, stdout, stderr io.Writer) int {
 	if *jsonOut {
 		out := make([]pipelineJSON, 0, len(pipelines))
 		for _, p := range pipelines {
-			out = append(out, pipelineToJSON(p, false))
+			out = append(out, pipelineToJSON(p, false, nil))
 		}
 		return encodePipelineJSON(stdout, stderr, out)
 	}
 	for _, p := range pipelines {
-		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%s\n", p.Name, enabledLabel(p.Enabled), firstNonEmpty(p.Interval, "-"), firstNonEmpty(p.Repo, "-"), firstNonEmpty(p.LastStatus, "-"), firstNonEmpty(triggerBindingState(p.TriggerBinding), "-"))
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%s\n", p.Name, enabledLabel(p.Enabled), pipelineListInterval(p), firstNonEmpty(p.Repo, "-"), firstNonEmpty(p.LastStatus, "-"), firstNonEmpty(triggerBindingState(p.TriggerBinding), "-"))
 	}
 	return 0
 }
@@ -487,6 +493,7 @@ func runPipelineShow(args []string, stdout, stderr io.Writer) int {
 	}
 	var (
 		record   db.Pipeline
+		agents   map[string]db.Agent
 		found    bool
 		runView  pipelineRunView
 		runFound bool
@@ -502,6 +509,7 @@ func runPipelineShow(args []string, stdout, stderr io.Writer) int {
 			return err
 		}
 		if found {
+			agents = pipelineStageAgents(ctx, store, record)
 			return nil
 		}
 		runView, runFound, err = loadPipelineRunView(ctx, store, name)
@@ -512,9 +520,9 @@ func runPipelineShow(args []string, stdout, stderr io.Writer) int {
 	}
 	if found {
 		if *jsonOut {
-			return encodePipelineJSON(stdout, stderr, pipelineToJSON(record, true))
+			return encodePipelineJSON(stdout, stderr, pipelineToJSON(record, true, agents))
 		}
-		printPipeline(stdout, record)
+		printPipeline(stdout, record, agents)
 		return 0
 	}
 	if runFound {
@@ -680,11 +688,12 @@ func runPipelineRemove(args []string, stdout, stderr io.Writer) int {
 // shape. When withStages is set it parses the stored (already-validated) spec to
 // enumerate the stage DAG; a parse failure degrades to no stages rather than
 // failing the command.
-func pipelineToJSON(record db.Pipeline, withStages bool) pipelineJSON {
+func pipelineToJSON(record db.Pipeline, withStages bool, agents map[string]db.Agent) pipelineJSON {
 	out := pipelineJSON{
 		Name:                record.Name,
 		Repo:                record.Repo,
 		Enabled:             record.Enabled,
+		Mode:                pipelineDisplayMode(record),
 		Interval:            record.Interval,
 		Jitter:              record.Jitter,
 		SpecHash:            record.SpecHash,
@@ -703,11 +712,19 @@ func pipelineToJSON(record db.Pipeline, withStages bool) pipelineJSON {
 	if withStages {
 		if spec, err := pipeline.Load([]byte(record.SpecYAML)); err == nil {
 			for _, stage := range spec.Stages {
+				agentRuntime := ""
+				if agent, ok := agents[stage.Agent]; ok {
+					agentRuntime = strings.TrimSpace(agent.Runtime)
+				}
 				out.Stages = append(out.Stages, pipelineStageJSON{
 					ID:               stage.ID,
+					Kind:             pipelineStageKindName(stage),
 					Cmd:              stage.Cmd,
+					CmdPreview:       pipelineCmdPreview(stage.Cmd),
 					Agent:            stage.Agent,
+					AgentRuntime:     agentRuntime,
 					Prompt:           stage.Prompt,
+					PromptPreview:    pipelinePromptPreview(stage.Prompt),
 					Action:           stage.Action,
 					Needs:            stage.Needs,
 					Timeout:          stage.Timeout,
@@ -725,10 +742,151 @@ func pipelineToJSON(record db.Pipeline, withStages bool) pipelineJSON {
 	return out
 }
 
-func printPipeline(stdout io.Writer, record db.Pipeline) {
+func pipelineDisplayMode(record db.Pipeline) string {
+	spec, err := pipeline.Load([]byte(record.SpecYAML))
+	if err == nil && spec.Trigger != nil {
+		state := triggerBindingState(record.TriggerBinding)
+		if state == "" {
+			// No binding record exists yet (never bound, e.g. added disabled):
+			// say so instead of asserting a lifecycle that has not started.
+			state = "unbound"
+		}
+		mode := fmt.Sprintf("email-triggered (%s)", state)
+		// A trigger+schedule hybrid is legal and the scheduler still fires it;
+		// show both so neither start source is hidden.
+		if spec.Schedule != nil {
+			mode += ", scheduled " + spec.Schedule.Interval
+		}
+		return mode
+	}
+	if err == nil && spec.Schedule != nil {
+		return "scheduled " + spec.Schedule.Interval
+	}
+	if strings.TrimSpace(record.Interval) != "" {
+		return "scheduled " + strings.TrimSpace(record.Interval)
+	}
+	return "manual"
+}
+
+func pipelineListInterval(record db.Pipeline) string {
+	spec, err := pipeline.Load([]byte(record.SpecYAML))
+	if err == nil && spec.Trigger != nil {
+		// Hybrids keep their live interval visible: the scheduler fires them too.
+		if interval := strings.TrimSpace(record.Interval); interval != "" {
+			return "email+" + interval
+		}
+		return "email"
+	}
+	return firstNonEmpty(record.Interval, "-")
+}
+
+func pipelineStageAgents(ctx context.Context, store *db.Store, record db.Pipeline) map[string]db.Agent {
+	agents := make(map[string]db.Agent)
+	spec, err := pipeline.Load([]byte(record.SpecYAML))
+	if err != nil {
+		return agents
+	}
+	for _, stage := range spec.Stages {
+		name := strings.TrimSpace(stage.Agent)
+		if name == "" {
+			continue
+		}
+		agent, err := store.GetAgent(ctx, name)
+		if err == nil {
+			agents[name] = agent
+		}
+	}
+	return agents
+}
+
+func pipelineStageKindName(stage pipeline.Stage) string {
+	switch stage.Kind() {
+	case pipeline.StageKindShell:
+		return "shell"
+	case pipeline.StageKindAgentAsk:
+		return "agent_ask"
+	case pipeline.StageKindAgentReview:
+		return "agent_review"
+	case pipeline.StageKindAgentImplement:
+		return "agent_implement"
+	case pipeline.StageKindAgentProduce:
+		return "produce"
+	case pipeline.StageKindGate:
+		return "gate"
+	case pipeline.StageKindOrchestrate:
+		return "orchestrate"
+	default:
+		return "unknown"
+	}
+}
+
+func pipelineStageBadge(stage pipeline.Stage) string {
+	switch stage.Kind() {
+	case pipeline.StageKindShell:
+		return "[SHELL]"
+	case pipeline.StageKindAgentAsk:
+		return "[AGENT ask]"
+	case pipeline.StageKindAgentReview:
+		return "[AGENT review]"
+	case pipeline.StageKindAgentImplement:
+		return "[AGENT implement]"
+	case pipeline.StageKindAgentProduce:
+		return "[PRODUCE]"
+	case pipeline.StageKindGate:
+		return fmt.Sprintf("[GATE %s]", stage.Gate)
+	case pipeline.StageKindOrchestrate:
+		return "[ORCHESTRATE]"
+	default:
+		return "[UNKNOWN]"
+	}
+}
+
+func pipelineAgentLabel(name string, agents map[string]db.Agent) string {
+	agent, ok := agents[name]
+	if !ok || strings.TrimSpace(agent.Runtime) == "" {
+		return fmt.Sprintf("%s (unregistered)", name)
+	}
+	identity := strings.TrimSpace(agent.Runtime)
+	if model := strings.TrimSpace(agent.Model); model != "" {
+		identity += "/" + model
+	}
+	if effort := strings.TrimSpace(agent.Effort); effort != "" {
+		identity += " effort=" + effort
+	}
+	return fmt.Sprintf("%s (%s)", name, identity)
+}
+
+func pipelinePreview(value, newlineReplacement string, limit int) string {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	value = strings.ReplaceAll(value, "\r", "\n")
+	value = strings.ReplaceAll(value, "\n", newlineReplacement)
+	value = strings.Join(strings.Fields(value), " ")
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit]) + "…"
+}
+
+func pipelineCmdPreview(cmd string) string {
+	if strings.TrimSpace(cmd) == "" {
+		return ""
+	}
+	return pipelinePreview(cmd, "; ", 80)
+}
+
+func pipelinePromptPreview(prompt string) string {
+	if strings.TrimSpace(prompt) == "" {
+		return ""
+	}
+	return pipelinePreview(prompt, " ", 100)
+}
+
+func printPipeline(stdout io.Writer, record db.Pipeline, agents map[string]db.Agent) {
 	writeLine(stdout, "name: %s", record.Name)
 	writeLine(stdout, "repo: %s", firstNonEmpty(record.Repo, "-"))
 	writeLine(stdout, "enabled: %t", record.Enabled)
+	writeLine(stdout, "mode: %s", pipelineDisplayMode(record))
 	writeLine(stdout, "interval: %s", firstNonEmpty(record.Interval, "-"))
 	writeLine(stdout, "jitter: %s", firstNonEmpty(record.Jitter, "-"))
 	writeLine(stdout, "spec_hash: %s", record.SpecHash)
@@ -748,11 +906,28 @@ func printPipeline(stdout io.Writer, record db.Pipeline) {
 		if len(stage.Needs) > 0 {
 			needs = strings.Join(stage.Needs, ",")
 		}
-		if stage.Agent != "" {
-			writeLine(stdout, "  %s\tneeds=%s\tagent=%s\taction=%s", stage.ID, needs, stage.Agent, stage.Action)
-			continue
+		fields := []string{"  " + stage.ID, pipelineStageBadge(stage)}
+		switch stage.Kind() {
+		case pipeline.StageKindShell:
+			fields = append(fields, "cmd: "+pipelineCmdPreview(stage.Cmd))
+		case pipeline.StageKindAgentAsk, pipeline.StageKindAgentReview, pipeline.StageKindAgentImplement, pipeline.StageKindAgentProduce, pipeline.StageKindOrchestrate:
+			fields = append(fields, pipelineAgentLabel(stage.Agent, agents))
+		case pipeline.StageKindGate:
+			if stage.Source != "" {
+				fields = append(fields, "source="+stage.Source)
+			}
 		}
-		writeLine(stdout, "  %s\tneeds=%s\tcmd=%s", stage.ID, needs, stage.Cmd)
+		if stage.Timeout != "" {
+			fields = append(fields, "timeout="+stage.Timeout)
+		}
+		if stage.Retry > 0 {
+			fields = append(fields, fmt.Sprintf("retry=%d", stage.Retry))
+		}
+		fields = append(fields, "needs="+needs)
+		writeLine(stdout, "%s", strings.Join(fields, "\t"))
+		if preview := pipelinePromptPreview(stage.Prompt); preview != "" {
+			writeLine(stdout, "          prompt: %s", strconv.Quote(preview))
+		}
 	}
 }
 

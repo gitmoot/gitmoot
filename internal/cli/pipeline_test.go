@@ -9,8 +9,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/pipeline"
 )
 
 func TestPipelineAddEnabledTriggerPersistsPendingBinding(t *testing.T) {
@@ -91,7 +93,8 @@ func TestPipelineAddListShowEnableDisableRemove(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("list exit=%d stderr=%s", code, errOut)
 	}
-	if !strings.Contains(out, "deploy-flow") || !strings.Contains(out, "enabled") || !strings.Contains(out, "24h") {
+	columns := strings.Split(strings.TrimSpace(out), "\t")
+	if len(columns) != 6 || columns[0] != "deploy-flow" || columns[1] != "enabled" || columns[2] != "24h" {
 		t.Fatalf("list stdout=%q", out)
 	}
 
@@ -100,7 +103,8 @@ func TestPipelineAddListShowEnableDisableRemove(t *testing.T) {
 		t.Fatalf("show exit=%d stderr=%s", code, errOut)
 	}
 	if !strings.Contains(out, "enabled: true") || !strings.Contains(out, "interval: 24h") ||
-		!strings.Contains(out, "score\tneeds=source") || !strings.Contains(out, "cmd=./deploy.sh") {
+		!strings.Contains(out, "score\t[SHELL]\tcmd: ./score.sh\tneeds=source") ||
+		!strings.Contains(out, "deploy\t[SHELL]\tcmd: ./deploy.sh\tneeds=score") {
 		t.Fatalf("show stdout=%q", out)
 	}
 
@@ -134,6 +138,153 @@ func TestPipelineAddListShowEnableDisableRemove(t *testing.T) {
 	// Removing the pipeline also disposes the runner agent (best-effort).
 	if _, _, code = run("agent", "show", "pipeline-deploy-flow-runner"); code == 0 {
 		t.Fatalf("runner agent should be removed with the pipeline")
+	}
+}
+
+func TestPipelineDisplayMode(t *testing.T) {
+	triggerSpec := "name: mail\nrepo: owner/repo\ntrigger: {kind: email}\nstages:\n  - {id: run, cmd: echo}\n"
+	scheduledSpec := "name: nightly\nschedule: {interval: 24h}\nstages:\n  - {id: run, cmd: echo}\n"
+	manualSpec := "name: manual\nstages:\n  - {id: run, cmd: echo}\n"
+	tests := []struct {
+		name   string
+		record db.Pipeline
+		want   string
+	}{
+		{name: "trigger bound", record: db.Pipeline{SpecYAML: triggerSpec, TriggerBinding: `{"state":"bound"}`}, want: "email-triggered (bound)"},
+		{name: "trigger pending", record: db.Pipeline{SpecYAML: triggerSpec, TriggerBinding: `{"state":"pending"}`}, want: "email-triggered (pending)"},
+		{name: "trigger never bound", record: db.Pipeline{SpecYAML: triggerSpec}, want: "email-triggered (unbound)"},
+		{name: "trigger plus schedule hybrid", record: db.Pipeline{SpecYAML: "name: both\nrepo: owner/repo\ntrigger: {kind: email}\nschedule: {interval: 6h}\nstages:\n  - {id: run, cmd: echo}\n", TriggerBinding: `{"state":"bound"}`, Interval: "6h"}, want: "email-triggered (bound), scheduled 6h"},
+		{name: "schedule", record: db.Pipeline{SpecYAML: scheduledSpec, Interval: "24h"}, want: "scheduled 24h"},
+		{name: "neither", record: db.Pipeline{SpecYAML: manualSpec}, want: "manual"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pipelineDisplayMode(tt.record); got != tt.want {
+				t.Fatalf("pipelineDisplayMode() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPipelineShowSelfDescribingStagesAndTriggerListInterval(t *testing.T) {
+	home := t.TempDir()
+	if err := withStore(home, func(store *db.Store) error {
+		return store.UpsertAgent(context.Background(), db.Agent{
+			Name: "display-agent", Runtime: "codex", Model: "gpt-test", Effort: "high",
+			Capabilities: []string{"ask", "implement"}, AutonomyPolicy: "workspace-write", HealthStatus: "ok",
+		})
+	}); err != nil {
+		t.Fatalf("seed display agent: %v", err)
+	}
+
+	displaySpec := writeSpec(t, `name: display-flow
+repo: owner/repo
+stages:
+  - id: shell
+    cmd: |
+      echo first
+      echo this-command-is-deliberately-long-so-the-display-preview-has-to-truncate-with-an-ellipsis-marker
+  - id: registered
+    agent: display-agent
+    action: ask
+    prompt: |
+      Review "quoted" input on one line.
+      This prompt is deliberately long so its preview is truncated while the complete prompt remains available in JSON.
+    needs: [shell]
+    timeout: 10m
+    retry: 2
+  - id: missing
+    agent: ghost-agent
+    action: review
+    prompt: Inspect the registered stage result.
+    needs: [shell]
+  - id: implement
+    agent: display-agent
+    action: implement
+    prompt: Implement the approved result.
+    write: true
+    needs: [registered, missing]
+  - id: merged
+    gate: pr_merged
+    source: implement
+    needs: [implement]
+    timeout: 1h
+`)
+	if code := Run([]string{"pipeline", "add", displaySpec, "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
+		t.Fatalf("add display pipeline exit=%d", code)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"pipeline", "show", "display-flow", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("show exit=%d stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"mode: manual",
+		"shell\t[SHELL]\tcmd: echo first; echo this-command-is-deliberately-long",
+		"registered\t[AGENT ask]\tdisplay-agent (codex/gpt-test effort=high)\ttimeout=10m\tretry=2\tneeds=shell",
+		`prompt: "Review \"quoted\" input on one line. This prompt is deliberately long`,
+		"missing\t[AGENT review]\tghost-agent (unregistered)\tneeds=shell",
+		"merged\t[GATE pr_merged]\tsource=implement\ttimeout=1h\tneeds=implement",
+		"…",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("show output missing %q:\n%s", want, out)
+		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"pipeline", "show", "display-flow", "--json", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("show --json exit=%d stderr=%s", code, stderr.String())
+	}
+	var decoded pipelineJSON
+	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
+		t.Fatalf("decode show json: %v (%s)", err, stdout.String())
+	}
+	if decoded.Mode != "manual" || len(decoded.Stages) != 5 {
+		t.Fatalf("unexpected display JSON header/stages: %+v", decoded)
+	}
+	if got := decoded.Stages[0]; got.Kind != "shell" || got.CmdPreview == "" || got.Cmd == got.CmdPreview {
+		t.Fatalf("unexpected shell JSON: %+v", got)
+	}
+	if got := decoded.Stages[1]; got.Kind != "agent_ask" || got.AgentRuntime != "codex" || got.PromptPreview == "" || got.Prompt == got.PromptPreview {
+		t.Fatalf("unexpected registered agent JSON: %+v", got)
+	}
+	if got := decoded.Stages[2]; got.Kind != "agent_review" || got.AgentRuntime != "" {
+		t.Fatalf("unexpected unregistered agent JSON: %+v", got)
+	}
+	if got := decoded.Stages[4]; got.Kind != "gate" {
+		t.Fatalf("unexpected gate JSON: %+v", got)
+	}
+
+	triggerSpec := writeSpec(t, "name: mail-flow\nrepo: owner/repo\ntrigger: {kind: email}\nstages:\n  - {id: run, cmd: echo}\n")
+	if code := Run([]string{"pipeline", "add", triggerSpec, "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
+		t.Fatalf("add trigger pipeline exit=%d", code)
+	}
+	stdout.Reset()
+	if code := Run([]string{"pipeline", "list", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("list exit=%d stderr=%s", code, stderr.String())
+	}
+	rows := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	foundTrigger := false
+	for _, row := range rows {
+		columns := strings.Split(row, "\t")
+		if len(columns) != 6 {
+			t.Fatalf("pipeline list changed column count: row=%q", row)
+		}
+		if columns[0] == "mail-flow" {
+			foundTrigger = true
+			if columns[2] != "email" {
+				t.Fatalf("trigger pipeline interval column = %q, want email", columns[2])
+			}
+		}
+		if columns[0] == "display-flow" && columns[2] != "-" {
+			t.Fatalf("manual pipeline interval column = %q, want -", columns[2])
+		}
+	}
+	if !foundTrigger {
+		t.Fatalf("trigger pipeline missing from list: %s", stdout.String())
 	}
 }
 
@@ -245,5 +396,43 @@ func TestPipelineRunnerNameCollisionRefused(t *testing.T) {
 	// The pipeline row must not have been created.
 	if code := Run([]string{"pipeline", "show", "clash", "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code == 0 {
 		t.Fatalf("pipeline should not exist after refused add")
+	}
+}
+
+// Reviewer-required pins: hybrid list value, multibyte-safe previews, and the
+// orchestrate/produce badges (previously untested).
+func TestPipelineListIntervalHybridKeepsInterval(t *testing.T) {
+	hybrid := db.Pipeline{SpecYAML: "name: both\nrepo: owner/repo\ntrigger: {kind: email}\nschedule: {interval: 6h}\nstages:\n  - {id: run, cmd: echo}\n", Interval: "6h"}
+	if got := pipelineListInterval(hybrid); got != "email+6h" {
+		t.Fatalf("hybrid list interval = %q, want %q", got, "email+6h")
+	}
+	triggerOnly := db.Pipeline{SpecYAML: "name: mail\nrepo: owner/repo\ntrigger: {kind: email}\nstages:\n  - {id: run, cmd: echo}\n"}
+	if got := pipelineListInterval(triggerOnly); got != "email" {
+		t.Fatalf("trigger-only list interval = %q, want %q", got, "email")
+	}
+}
+
+func TestPipelinePreviewMultibyteSafe(t *testing.T) {
+	prompt := strings.Repeat("\u65e5\u672c\u8a9e\U0001f680", 60) // 240 runes of multibyte text
+	preview := pipelinePromptPreview(prompt)
+	if !utf8.ValidString(preview) {
+		t.Fatalf("prompt preview is not valid UTF-8: %q", preview)
+	}
+	if got := len([]rune(preview)); got > 101 {
+		t.Fatalf("prompt preview rune length = %d, want <= 101", got)
+	}
+	if !strings.HasSuffix(preview, "\u2026") {
+		t.Fatalf("truncated preview should end with ellipsis: %q", preview)
+	}
+}
+
+func TestPipelineStageBadgesOrchestrateAndProduce(t *testing.T) {
+	orchestrate := pipeline.Stage{ID: "coord", Agent: "lead", Action: "ask", Prompt: "run the tree", Orchestrate: true}
+	if got := pipelineStageBadge(orchestrate); !strings.Contains(got, "ORCHESTRATE") {
+		t.Fatalf("orchestrate badge = %q", got)
+	}
+	produce := pipeline.Stage{ID: "export", Agent: "producer", Action: "produce", Prompt: "write data", Write: true, Writes: []string{"/data"}}
+	if got := pipelineStageBadge(produce); !strings.Contains(got, "PRODUCE") {
+		t.Fatalf("produce badge = %q", got)
 	}
 }

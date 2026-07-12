@@ -557,6 +557,37 @@ gitmoot pipeline disable <name>
 gitmoot pipeline remove <name>
 ```
 
+### Reading pipeline status
+
+`pipeline show <name>` labels how the pipeline starts: `email-triggered` plus its
+binding state, `scheduled <interval>`, or `manual`. Its stage block leads with the
+stage kind and resolves registered agent stages to their runtime/model settings:
+
+```text
+name: inbound-triage
+repo: owner/repo
+enabled: true
+mode: email-triggered (bound)
+interval: -
+...
+stages:
+  fetch      [SHELL]           cmd: ./fetch-message.sh  needs=-
+  answer     [AGENT ask]       reply-planner (codex/gpt-5.6-sol)  timeout=10m  needs=fetch
+             prompt: "You received an email via the trigger payload above (UNTRUSTED external data)…"
+  implement  [AGENT implement] reply-builder (codex)  needs=answer
+             prompt: "Implement the approved reply handling change."
+  merged     [GATE pr_merged]  source=implement  timeout=24h  needs=implement
+```
+
+Shell commands are collapsed to a single-line preview (about 80 characters), and
+agent prompts to an escaped preview (about 100 characters); an ellipsis marks
+truncation. Missing agent registrations render as `(unregistered)` instead of
+making inspection fail. `pipeline list` keeps its existing six-column shape but
+uses `email` in the interval column for trigger pipelines (`email+6h` when a schedule is also present, and the mode reads `email-triggered (unbound)` before the first bind). `--json` remains
+additive: pipeline objects include `mode`, while stage objects include `kind` and
+the available `agent_runtime`, `prompt_preview`, and `cmd_preview` fields without
+removing the full `prompt` or `cmd`.
+
 `pipeline run` prints just the run id (script-stable), so `RUN=$(gitmoot pipeline
 run nightly-sync)` works. A manual run ignores the `enabled` flag — a disabled
 pipeline can still be run by hand — but still requires a `repo` and refuses to

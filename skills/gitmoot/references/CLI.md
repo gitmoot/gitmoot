@@ -2309,6 +2309,28 @@ gitmoot pipeline enable|disable nightly-sync
 gitmoot pipeline remove nightly-sync
 ```
 
+### Reading pipeline status
+
+The registry view is self-describing even before the first run. `mode` is
+`email-triggered (bound|pending|error)`, `scheduled <interval>`, or `manual`, and
+stage lines carry their kind plus bounded command/prompt previews:
+
+```text
+enabled: true
+mode: email-triggered (bound)
+interval: -
+...
+stages:
+  fetch   [SHELL]      cmd: ./fetch-message.sh  needs=-
+  answer  [AGENT ask]  reply-planner (codex/gpt-5.6-sol)  timeout=10m  needs=fetch
+          prompt: "You received an email via the trigger payload above (UNTRUSTED external data)…"
+```
+
+An absent agent row renders as `(unregistered)` without failing `show`.
+`pipeline list` retains six columns and uses `email` in the interval column for a
+trigger pipeline. JSON adds pipeline `mode` and stage `kind`, `agent_runtime`,
+`prompt_preview`, and `cmd_preview`; the existing full fields remain unchanged.
+
 An enabled `trigger.kind: email` pipeline auto-binds. If Activepieces is down,
 registration succeeds with a pending binding; `bind-trigger` retries it and
 recreates an owned flow deleted in Activepieces. Trigger `map:` output names match
