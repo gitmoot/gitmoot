@@ -1,0 +1,10 @@
+{"type":"thread.started","thread_id":"thread_sanitized"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Running the requested shell command, then I'll create `fx.txt` with `done` and return the exact completion string."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc 'echo transcript-fixture-123'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc 'echo transcript-fixture-123'","aggregated_output":"transcript-fixture-123\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"The command ran. I'm creating `fx.txt` now."}}
+{"type":"item.started","item":{"id":"item_3","type":"file_change","changes":[{"path":"/tmp/example/fx.txt","kind":"add"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_3","type":"file_change","changes":[{"path":"/tmp/example/fx.txt","kind":"add"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_4","type":"agent_message","text":"FIXTURE COMPLETE"}}
+{"type":"turn.completed","usage":{"input_tokens":46938,"cached_input_tokens":35968,"output_tokens":343,"reasoning_output_tokens":214}}

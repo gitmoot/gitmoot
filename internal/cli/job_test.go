@@ -312,6 +312,12 @@ func TestResolveTranscriptRuntimeOrder(t *testing.T) {
 	if err != nil || got != runtime.ClaudeRuntime {
 		t.Fatalf("agent runtime = %q, err=%v", got, err)
 	}
+	ephJob := db.Job{ID: "ephemeral-runtime", Agent: "unregistered-ephemeral"}
+	ephPayload := workflow.JobPayload{Ephemeral: &workflow.EphemeralSpec{Runtime: runtime.KimiRuntime}}
+	got, err = resolveTranscriptRuntime(context.Background(), store, ephJob, ephPayload, "")
+	if err != nil || got != runtime.KimiRuntime {
+		t.Fatalf("ephemeral runtime = %q, err=%v", got, err)
+	}
 }
 
 func TestJobWatchTranscriptShellNoLLME2E(t *testing.T) {

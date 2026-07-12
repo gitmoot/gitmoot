@@ -1017,6 +1017,12 @@ completion; shell output passes through as redacted raw lines. Usage is labeled
 Malformed or unknown lines degrade individually to redacted capped raw output
 without stopping later lines.
 
+Verified Codex command/file-change events and Kimi function tool calls/results
+render as typed compact lines; unrecognized shapes keep the generic/raw
+fail-open path. Render-time redaction is a per-line best-effort defense in depth:
+a secret split across physical lines may be only partially masked, and the raw
+cockpit log plus the external `tail -F` fallback remain unredacted.
+
 ### Resumable gates (make `blocked` + `needs` actionable)
 
 When a stage returns `blocked` with a `needs` list (e.g. `needs: ["Maps API key"]`),

@@ -16,13 +16,36 @@ type StreamUsage struct {
 // deliberately retains the complete item object so consumers can render
 // unverified item types generically without inventing field schemas.
 type CodexStreamEvent struct {
-	Type         string
-	ItemType     string
-	Text         string
-	ItemRaw      json.RawMessage
-	Usage        StreamUsage
-	Message      string
-	ErrorMessage string
+	Type             string
+	ItemType         string
+	Text             string
+	ItemRaw          json.RawMessage
+	CommandExecution *CodexCommandExecution
+	FileChange       *CodexFileChange
+	Usage            StreamUsage
+	Message          string
+	ErrorMessage     string
+}
+
+// CodexCommandExecution is the command_execution item shape verified by the
+// captured codex --json fixture.
+type CodexCommandExecution struct {
+	Command          string `json:"command"`
+	AggregatedOutput string `json:"aggregated_output"`
+	ExitCode         *int   `json:"exit_code"`
+	Status           string `json:"status"`
+}
+
+// CodexFileChange is the file_change item shape verified by the captured codex
+// --json fixture.
+type CodexFileChange struct {
+	Changes []CodexFileChangeEntry `json:"changes"`
+	Status  string                 `json:"status"`
+}
+
+type CodexFileChangeEntry struct {
+	Path string `json:"path"`
+	Kind string `json:"kind"`
 }
 
 // ExtractCodexStreamEvent owns the codex JSONL wire-format knowledge shared by
@@ -55,6 +78,18 @@ func ExtractCodexStreamEvent(line string) (CodexStreamEvent, error) {
 		if err := json.Unmarshal(wire.Item, &item); err == nil {
 			event.ItemType = item.Type
 			event.Text = item.Text
+			switch item.Type {
+			case "command_execution":
+				var command CodexCommandExecution
+				if err := json.Unmarshal(wire.Item, &command); err == nil {
+					event.CommandExecution = &command
+				}
+			case "file_change":
+				var change CodexFileChange
+				if err := json.Unmarshal(wire.Item, &change); err == nil {
+					event.FileChange = &change
+				}
+			}
 		}
 	}
 	return event, nil
@@ -63,6 +98,7 @@ func ExtractCodexStreamEvent(line string) (CodexStreamEvent, error) {
 // ClaudeResultEnvelope is the verified subset of Claude Code's single final
 // --output-format json envelope.
 type ClaudeResultEnvelope struct {
+	Type   string
 	Result string
 	Usage  StreamUsage
 }
@@ -70,13 +106,14 @@ type ClaudeResultEnvelope struct {
 // ExtractClaudeResultEnvelope owns Claude's final-envelope wire format.
 func ExtractClaudeResultEnvelope(stdout string) (ClaudeResultEnvelope, error) {
 	var wire struct {
+		Type   string      `json:"type"`
 		Result string      `json:"result"`
 		Usage  StreamUsage `json:"usage"`
 	}
 	if err := json.Unmarshal([]byte(stdout), &wire); err != nil {
 		return ClaudeResultEnvelope{}, err
 	}
-	return ClaudeResultEnvelope{Result: wire.Result, Usage: wire.Usage}, nil
+	return ClaudeResultEnvelope{Type: wire.Type, Result: wire.Result, Usage: wire.Usage}, nil
 }
 
 // KimiStreamEvent is the verified subset of one Kimi stream-json line.
@@ -86,17 +123,32 @@ type KimiStreamEvent struct {
 	ContentText string
 	SessionID   string
 	Usage       *StreamUsage
+	ToolCalls   []KimiToolCall
+	ToolCallID  string
+}
+
+type KimiToolCall struct {
+	Type     string           `json:"type"`
+	ID       string           `json:"id"`
+	Function KimiFunctionCall `json:"function"`
+}
+
+type KimiFunctionCall struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 // ExtractKimiStreamEvent owns Kimi's stream-json wire format, including its
 // two observed content encodings (a string and an array of text parts).
 func ExtractKimiStreamEvent(line string) (KimiStreamEvent, error) {
 	var wire struct {
-		Role      string          `json:"role"`
-		Type      string          `json:"type"`
-		Content   json.RawMessage `json:"content"`
-		SessionID string          `json:"session_id"`
-		Usage     *StreamUsage    `json:"usage"`
+		Role       string          `json:"role"`
+		Type       string          `json:"type"`
+		Content    json.RawMessage `json:"content"`
+		SessionID  string          `json:"session_id"`
+		Usage      *StreamUsage    `json:"usage"`
+		ToolCalls  []KimiToolCall  `json:"tool_calls"`
+		ToolCallID string          `json:"tool_call_id"`
 	}
 	if err := json.Unmarshal([]byte(line), &wire); err != nil {
 		return KimiStreamEvent{}, err
@@ -107,6 +159,8 @@ func ExtractKimiStreamEvent(line string) (KimiStreamEvent, error) {
 		ContentText: extractKimiContentText(wire.Content),
 		SessionID:   wire.SessionID,
 		Usage:       wire.Usage,
+		ToolCalls:   wire.ToolCalls,
+		ToolCallID:  wire.ToolCallID,
 	}, nil
 }
 

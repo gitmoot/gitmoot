@@ -474,11 +474,18 @@ func resolveTranscriptRuntime(ctx context.Context, store *db.Store, job db.Job, 
 		return runtimeName, nil
 	}
 	agent, err := store.GetAgent(ctx, job.Agent)
+	if err == nil {
+		if runtimeName := strings.TrimSpace(agent.Runtime); runtimeName != "" {
+			return runtimeName, nil
+		}
+	}
+	if payload.Ephemeral != nil {
+		if runtimeName := strings.TrimSpace(payload.Ephemeral.Runtime); runtimeName != "" {
+			return runtimeName, nil
+		}
+	}
 	if err != nil {
 		return "", fmt.Errorf("resolve runtime for agent %q: %w", job.Agent, err)
-	}
-	if runtimeName := strings.TrimSpace(agent.Runtime); runtimeName != "" {
-		return runtimeName, nil
 	}
 	return "", fmt.Errorf("resolve runtime for agent %q: runtime is empty", job.Agent)
 }

@@ -527,15 +527,15 @@ func (a *paneAdapter) workspaceRoot() string {
 func (a *paneAdapter) watchCommand() string {
 	if a.meta.LogPath != "" {
 		path := shellQuote(a.meta.LogPath)
-		cmd := fmt.Sprintf("%s job watch %s --transcript --log-path %s --runtime %s", a.cockpit.gitmootBin, a.meta.JobID, path, a.meta.Runtime)
+		cmd := fmt.Sprintf("%s job watch %s --transcript --log-path %s --runtime %s", a.cockpit.gitmootBin, shellQuote(a.meta.JobID), path, shellQuote(a.meta.Runtime))
 		if a.cockpit.home != "" {
-			cmd += fmt.Sprintf(" --home %s", a.cockpit.home)
+			cmd += fmt.Sprintf(" --home %s", shellQuote(a.cockpit.home))
 		}
 		return cmd + fmt.Sprintf(" || exec tail -n +1 -F %s", path)
 	}
-	cmd := fmt.Sprintf("%s job watch %s", a.cockpit.gitmootBin, a.meta.JobID)
+	cmd := fmt.Sprintf("%s job watch %s", a.cockpit.gitmootBin, shellQuote(a.meta.JobID))
 	if a.cockpit.home != "" {
-		cmd += fmt.Sprintf(" --home %s", a.cockpit.home)
+		cmd += fmt.Sprintf(" --home %s", shellQuote(a.cockpit.home))
 	}
 	return cmd
 }

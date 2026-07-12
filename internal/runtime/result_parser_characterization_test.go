@@ -39,4 +39,30 @@ func TestResultParsersCharacterization(t *testing.T) {
 			t.Fatalf("parseClaudeJSONResult = (%q, %d, %d)", summary, in, out)
 		}
 	})
+
+	t.Run("codex_real_tool_run_preserves_result_and_usage", func(t *testing.T) {
+		raw, in, out, ok := parseCodexJSONResult(readTranscriptFixture(t, "codex_tool_run.jsonl"))
+		want := "Running the requested shell command, then I'll create `fx.txt` with `done` and return the exact completion string.\n\n" +
+			"The command ran. I'm creating `fx.txt` now.\n\nFIXTURE COMPLETE"
+		if !ok || raw != want || in != 46938 || out != 343 {
+			t.Fatalf("parseCodexJSONResult(real tool run) = (%q, %d, %d, %v)", raw, in, out, ok)
+		}
+	})
+
+	t.Run("kimi_real_tool_run_preserves_result_resume_and_usage", func(t *testing.T) {
+		content, sessionID, usage, err := parseKimiStreamJSON(readTranscriptFixture(t, "kimi_tool_run.jsonl"))
+		if err != nil {
+			t.Fatalf("parseKimiStreamJSON(real tool run): %v", err)
+		}
+		if content != "KIMI FIXTURE COMPLETE" || sessionID != "session_sanitized" || usage != (kimiUsage{}) {
+			t.Fatalf("parseKimiStreamJSON(real tool run) = (%q, %q, %+v)", content, sessionID, usage)
+		}
+	})
+
+	t.Run("claude_real_envelope_preserves_result_and_usage", func(t *testing.T) {
+		summary, in, out := parseClaudeJSONResult(readTranscriptFixture(t, "claude_envelope_real.json"))
+		if summary != "CLAUDE FIXTURE COMPLETE" || in != 2 || out != 52 {
+			t.Fatalf("parseClaudeJSONResult(real envelope) = (%q, %d, %d)", summary, in, out)
+		}
+	})
 }

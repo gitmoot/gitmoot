@@ -43,7 +43,7 @@ func (r *Renderer) render(event Event) error {
 		}
 	case KindToolResult:
 		line = "\u25c2 " + cleanField(event.Status, renderDigestLimit)
-		if digest := cleanField(event.OutputDigest, renderDigestLimit); digest != "" {
+		if digest := cleanTailField(event.OutputDigest, renderDigestLimit); digest != "" {
 			line += " " + digest
 		}
 	case KindUsage:
@@ -60,6 +60,21 @@ func (r *Renderer) render(event Event) error {
 	}
 	_, err := fmt.Fprintln(r.w, line)
 	return err
+}
+
+func cleanTailField(value string, limit int) string {
+	value = workflow.RedactCommentText(value)
+	value = strings.ReplaceAll(value, "\r", " ")
+	value = strings.ReplaceAll(value, "\n", " ")
+	value = strings.TrimSpace(value)
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	value = value[len(value)-limit:]
+	for !utf8.ValidString(value) {
+		value = value[1:]
+	}
+	return value
 }
 
 // cleanField redacts before truncating so a secret that begins before the cap

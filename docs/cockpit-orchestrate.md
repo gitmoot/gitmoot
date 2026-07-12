@@ -31,6 +31,12 @@ degrade individually to redacted bounded raw output; a fatal renderer exit or
 panic falls back externally to `tail -F`. The tee bytes, runtime result parsing,
 and pipeline progress stream are unchanged.
 
+Verified Codex command/file-change events and Kimi function tool calls/results
+use typed compact lines; other shapes retain the generic/raw path. Render-time
+redaction is per-line best-effort defense in depth: a secret split across
+physical lines may be only partially masked, and the raw log plus external tail
+fallback remain unredacted.
+
 **Auto-detect:** running `gitmoot orchestrate` from inside a Herdr session
 (`HERDR_ENV` set) turns the cockpit on automatically — no `--cockpit` needed. An
 explicit flag works anywhere; `[orchestrate] cockpit_mode = off` is the host-level

@@ -49,7 +49,7 @@ func Follow(ctx context.Context, path string, opts FollowOptions, onLine func(st
 			return err
 		}
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	buffer := newLineBuffer(MaxLogicalLineBytes, onLine)
 	chunk := make([]byte, 32*1024)
@@ -65,6 +65,23 @@ func Follow(ctx context.Context, path string, opts FollowOptions, onLine func(st
 		}
 		if n > 0 {
 			continue
+		}
+		changed, changeErr := followFileChanged(file, path)
+		if changeErr != nil {
+			return changeErr
+		}
+		if changed {
+			reopened, openErr := os.Open(path)
+			if openErr != nil {
+				if !errors.Is(openErr, os.ErrNotExist) {
+					return fmt.Errorf("reopen log: %w", openErr)
+				}
+			} else {
+				_ = file.Close()
+				file = reopened
+				buffer.Reset()
+				continue
+			}
 		}
 
 		settled, settleErr := opts.Settled(ctx)
@@ -93,6 +110,27 @@ func Follow(ctx context.Context, path string, opts FollowOptions, onLine func(st
 			return err
 		}
 	}
+}
+
+// followFileChanged detects both path replacement (the path now names a
+// different file) and in-place truncation behind the current read offset.
+func followFileChanged(file *os.File, path string) (bool, error) {
+	pathInfo, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat log: %w", err)
+	}
+	openInfo, err := file.Stat()
+	if err != nil {
+		return false, fmt.Errorf("stat open log: %w", err)
+	}
+	offset, err := file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return false, fmt.Errorf("read log offset: %w", err)
+	}
+	return !os.SameFile(openInfo, pathInfo) || pathInfo.Size() < offset, nil
 }
 
 func waitPoll(ctx context.Context, interval time.Duration) error {
@@ -144,4 +182,9 @@ func (b *lineBuffer) Flush() error {
 	b.line = b.line[:0]
 	b.drop = false
 	return err
+}
+
+func (b *lineBuffer) Reset() {
+	b.line = b.line[:0]
+	b.drop = false
 }

@@ -1,0 +1,10 @@
+• thread: started
+• turn: started
+● Running the requested shell command, then I'll create `fx.txt` with `done` and return the exact completion string.
+▸ bash /bin/bash -lc 'echo transcript-fixture-123'
+◂ completed (exit 0) transcript-fixture-123
+● The command ran. I'm creating `fx.txt` now.
+▸ file_change add /tmp/example/fx.txt
+◂ completed add /tmp/example/fx.txt
+● FIXTURE COMPLETE
+usage (latest reported usage): in=46938 out=343

@@ -961,6 +961,11 @@ kimi-code 0.19.2 emits no usage). Claude currently emits one final JSON envelope
 so its pane remains quiet until completion and then shows final text and usage.
 Shell output is redacted raw passthrough. Unknown or malformed lines fail open
 one line at a time; a fatal renderer exit falls back externally to `tail -F`.
+Verified Codex command/file-change events and Kimi function tool calls/results
+use typed compact lines; other shapes retain the generic/raw path. Render-time
+redaction is per-line best-effort defense in depth: a secret split across
+physical lines may be only partially masked, and the raw log plus external tail
+fallback remain unredacted.
 
 A cockpit pane is a **view, not the job**: closing a pane (in the terminal or
 from Telegram) tears down the visible surface but does NOT cancel the underlying
