@@ -86,7 +86,7 @@ func TestWorkflowProductionQueriesUseIndexes(t *testing.T) {
 		index string
 	}{
 		{"list", ListWorkflowSummariesSQL, nil, "idx_jobs_workflow_id"},
-		{"show-summary", WorkflowSummarySQL, []any{"release-42", "release-42", "release-42"}, "idx_jobs_workflow_id"},
+		{"show-summary", WorkflowSummarySQL, []any{"release-42"}, "idx_jobs_workflow_id"},
 		{"show-jobs", ListJobsByWorkflowSQL, []any{"release-42", 100}, "idx_jobs_workflow_id"},
 		{"dashboard-graph-jobs", ListWorkflowGraphJobsSQL, []any{"release-42"}, "idx_jobs_workflow_id"},
 		{"show-notes", ListWorkflowNotesSQL, []any{"release-42", 100}, "idx_workflow_notes_wid"},
@@ -297,6 +297,72 @@ func TestWorkflowNoteAndObservationAreAtomic(t *testing.T) {
 	id := strconv.FormatInt(note.ID, 10)
 	if note.MemoryObservationID != obs.ID || obs.Key != "workflow-release-42-"+id || obs.Provenance != "workflow:release-42#"+id {
 		t.Fatalf("note=%+v obs=%+v", note, obs)
+	}
+}
+
+func TestWorkflowMetaLastWriteWinsAndObservationFailureRollsBack(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	first, err := store.InsertWorkflowNoteWithMeta(ctx,
+		WorkflowNote{WorkflowID: "fable/dashboard-redesign", Author: "fable", Body: "started"},
+		WorkflowMeta{Author: "fable", Pane: "pane-1", SessionID: "session-1", WorkDir: "/work/one"})
+	if err != nil || first.ID == 0 {
+		t.Fatalf("InsertWorkflowNoteWithMeta = (%+v, %v)", first, err)
+	}
+	second, err := store.InsertWorkflowNoteWithMeta(ctx,
+		WorkflowNote{WorkflowID: "fable/dashboard-redesign", Author: "operator", Body: "handoff"},
+		WorkflowMeta{Author: "operator", Pane: "pane-2", SessionID: "session-2", WorkDir: "/work/two"})
+	if err != nil || second.ID <= first.ID {
+		t.Fatalf("second InsertWorkflowNoteWithMeta = (%+v, %v)", second, err)
+	}
+	meta, err := store.GetWorkflowMeta(ctx, "fable/dashboard-redesign")
+	if err != nil || meta.Author != "operator" || meta.Pane != "pane-2" || meta.SessionID != "session-2" || meta.WorkDir != "/work/two" {
+		t.Fatalf("metadata = %+v, err=%v", meta, err)
+	}
+	third, err := store.InsertWorkflowNoteWithMeta(ctx,
+		WorkflowNote{WorkflowID: "fable/dashboard-redesign", Author: "reviewer", Body: "no handoff change"},
+		WorkflowMeta{Author: "reviewer"})
+	if err != nil || third.ID <= second.ID {
+		t.Fatalf("third InsertWorkflowNoteWithMeta = (%+v, %v)", third, err)
+	}
+	meta, err = store.GetWorkflowMeta(ctx, "fable/dashboard-redesign")
+	if err != nil || meta.Author != "reviewer" || meta.Pane != "pane-2" || meta.SessionID != "session-2" || meta.WorkDir != "/work/two" {
+		t.Fatalf("metadata after omitted optional flags = %+v, err=%v", meta, err)
+	}
+
+	_, _, err = store.InsertWorkflowNoteWithObservationAndMeta(ctx,
+		WorkflowNote{WorkflowID: "fable/dashboard-redesign", Author: "bad", Body: "must roll back"},
+		MemoryObservation{Content: "missing owner"},
+		WorkflowMeta{Author: "bad", Pane: "bad", SessionID: "bad", WorkDir: "/bad"})
+	if err == nil {
+		t.Fatal("expected invalid observation to roll back note and metadata")
+	}
+	meta, err = store.GetWorkflowMeta(ctx, "fable/dashboard-redesign")
+	if err != nil || meta.Author != "reviewer" || meta.Pane != "pane-2" || meta.SessionID != "session-2" || meta.WorkDir != "/work/two" {
+		t.Fatalf("metadata changed after rollback: %+v, err=%v", meta, err)
+	}
+	notes, err := store.ListWorkflowNotes(ctx, "fable/dashboard-redesign", 0)
+	if err != nil || len(notes) != 3 {
+		t.Fatalf("notes after rollback = %+v, err=%v", notes, err)
+	}
+}
+
+func TestWorkflowSummariesIncludeNoteOnlyLabelsAndNoteActivity(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: "notes/only", Author: "coord", Body: "latest status"}); err != nil {
+		t.Fatalf("InsertWorkflowNote: %v", err)
+	}
+	summaries, err := store.ListWorkflowSummaries(ctx)
+	if err != nil {
+		t.Fatalf("ListWorkflowSummaries: %v", err)
+	}
+	if len(summaries) != 1 || summaries[0].WorkflowID != "notes/only" || summaries[0].JobCount != 0 || summaries[0].NoteCount != 1 || summaries[0].LastNote != "latest status" || summaries[0].LastAuthor != "coord" || summaries[0].FirstAt == "" || summaries[0].LastAt == "" {
+		t.Fatalf("note-only summaries = %+v", summaries)
+	}
+	summary, err := store.WorkflowSummary(ctx, "notes/only")
+	if err != nil || summary.NoteCount != 1 || summary.JobCount != 0 {
+		t.Fatalf("WorkflowSummary(note-only) = %+v, err=%v", summary, err)
 	}
 }
 

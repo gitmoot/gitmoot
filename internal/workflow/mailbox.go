@@ -1353,7 +1353,9 @@ func validateJobRequest(request JobRequest) error {
 	return validateJobRuntimeOverrideRequest(request)
 }
 
-var workflowIDRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+const workflowIDSegmentPattern = `[a-z0-9]+(-[a-z0-9]+)*`
+
+var workflowIDRe = regexp.MustCompile(`^` + workflowIDSegmentPattern + `(/` + workflowIDSegmentPattern + `)?$`)
 
 // ValidateWorkflowID applies the global external-workflow label contract.
 // Empty means the job is ungrouped and is always accepted.
@@ -1366,7 +1368,7 @@ func ValidateWorkflowID(value string) error {
 		return errors.New("workflow id must be at most 64 characters")
 	}
 	if !workflowIDRe.MatchString(value) {
-		return fmt.Errorf("invalid workflow id %q: use lowercase letters, digits, and single hyphens", value)
+		return fmt.Errorf("invalid workflow id %q: use lowercase letters, digits, and single hyphens, with at most one slash between namespace and campaign", value)
 	}
 	return nil
 }

@@ -7,15 +7,18 @@ several jobs. It works on agent ask/run/review/implement, `orchestrate`, and
 `job open`; every delegation child and continuation inherits it.
 
 ```sh
-gitmoot orchestrate planner "Run release checks." --repo owner/repo --workflow release-42
-gitmoot workflow note release-42 "Canary passed." --author operator --remember
-gitmoot workflow show release-42
+gitmoot orchestrate planner "Run release checks." --repo owner/repo --workflow fable/release-42
+gitmoot workflow note fable/release-42 "Canary passed." --author operator --pane release --session <session-id> --workdir /work/release --remember
+gitmoot workflow show fable/release-42
 ```
 
 The read-only web dashboard clusters labeled jobs around workflow hubs in
-Galaxy. Labeled run strips and hubs open `/workflows/<label>`, which combines
-complete run trees, state totals, best-effort token totals, and the shared note
-journal.
+Galaxy. The Workflows index and `/workflows/<label>` mission log combine
+complete run trees, derived active/stalled/settled state, best-effort token
+totals, the shared note journal, and the latest coordinator handoff. Labels may
+use one namespace slash; each side remains a lowercase alphanumeric/single-hyphen
+slug. `--pane`, `--session`, and `--workdir` on `workflow note` update the
+handoff used by the dashboard's resume card.
 
 Journal text and authors are stored verbatim. JSON keeps them verbatim, while
 terminal text output sanitizes escapes/control bytes and caps each field to one

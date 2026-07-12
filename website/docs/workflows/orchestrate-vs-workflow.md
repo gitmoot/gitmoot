@@ -46,6 +46,13 @@ memory that future agents recall.
 `--workflow` is deliberately **visibility-only**: it never adds scheduling,
 locking, budgets, or lifecycle behavior to the labeled jobs.
 
+Use a plain slug such as `release-42`, or one namespace slash such as
+`fable/dashboard-redesign`. Each side follows the same lowercase alphanumeric
+and single-hyphen slug rule. The dashboard derives presentation state without
+controlling execution: recently touched or queued/running workflows are active;
+failed/blocked workflows quiet for 30 minutes to 24 hours are stalled; older or
+otherwise terminal workflows are settled.
+
 ## They compose
 
 `orchestrate --workflow release-42` labels the **whole delegation tree** —

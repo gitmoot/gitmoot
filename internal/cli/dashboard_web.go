@@ -209,6 +209,7 @@ func (d *webDataSource) Workflow(ctx context.Context, label string, q dashboard.
 	q.MaxNotes = cappedWorkflowLimit(q.MaxNotes, dashboardWorkflowMaxNotes)
 
 	err := withStore(d.home, func(store *db.Store) error {
+		now := time.Now().UTC()
 		summary, err := store.WorkflowSummary(ctx, label)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -233,8 +234,26 @@ func (d *webDataSource) Workflow(ctx context.Context, label string, q dashboard.
 			TokensIn: summary.InputTokens, TokensOut: summary.OutputTokens,
 			FirstAt: parseJobTimeMillis(summary.FirstAt), LastAt: parseJobTimeMillis(summary.LastAt),
 		}
+		out.State, out.StalledForS = deriveDashboardWorkflowState(now, dashboardWorkflowActivity{
+			Queued: summary.Queued, Running: summary.Running, Failed: summary.Failed,
+			Blocked: summary.Blocked, LastActivity: workflowMillisTime(out.Summary.LastAt),
+			LastFailure: workflowMillisTime(parseJobTimeMillis(summary.LastFailureAt)),
+			LastNote:    workflowMillisTime(parseJobTimeMillis(summary.LastNoteAt)),
+		})
+		meta, metaErr := store.GetWorkflowMeta(ctx, label)
+		if metaErr != nil && !errors.Is(metaErr, sql.ErrNoRows) {
+			return metaErr
+		}
+		author := strings.TrimSpace(meta.Author)
+		if author == "" {
+			author = strings.TrimSpace(summary.LastAuthor)
+		}
+		out.Coordinator = dashboard.WorkflowCoordinator{
+			Author: author, Pane: strings.TrimSpace(meta.Pane), SessionID: strings.TrimSpace(meta.SessionID),
+		}
+		out.WorkDir = strings.TrimSpace(meta.WorkDir)
 
-		runs := buildDashboardWorkflowRuns(jobs, agentRuntimeMap(ctx, store))
+		runs := buildDashboardWorkflowRuns(jobs, agentRuntimeMap(ctx, store), now)
 		runStart := workflowRunCursorStart(runs, strings.TrimSpace(q.RunCursor))
 		runEnd := runStart + q.MaxRuns
 		if runEnd > len(runs) {
@@ -306,7 +325,7 @@ func workflowNoteCursorStart(notes []dashboard.WorkflowNoteView, cursor string) 
 // denormalized root_id and maps each row into the compact, event-free dashboard
 // contract. The input query is ordered by created_at,id, so run and node order
 // remain deterministic without another store read.
-func buildDashboardWorkflowRuns(jobs []db.Job, runtimeByAgent map[string]string) []dashboard.WorkflowRun {
+func buildDashboardWorkflowRuns(jobs []db.Job, runtimeByAgent map[string]string, now time.Time) []dashboard.WorkflowRun {
 	if len(jobs) == 0 {
 		return []dashboard.WorkflowRun{}
 	}
@@ -345,6 +364,9 @@ func buildDashboardWorkflowRuns(jobs []db.Job, runtimeByAgent map[string]string)
 		}
 		states := make([]string, 0, len(tree))
 		nodes := make([]dashboard.WorkflowNode, 0, len(tree))
+		children := make([]dashboard.WorkflowChild, 0, max(0, len(tree)-1))
+		var startedAt, endedAt int64
+		rootRepo := strings.TrimSpace(payloadByID[root.ID].Repo)
 		for _, job := range tree {
 			payload := payloadByID[job.ID]
 			deps, action := resolveDelegationEdges(job, payloadByID, childrenByParent)
@@ -369,13 +391,50 @@ func buildDashboardWorkflowRuns(jobs []db.Job, runtimeByAgent map[string]string)
 			}
 			nodes = append(nodes, node)
 			states = append(states, job.State)
+			if node.StartedAt > 0 && (startedAt == 0 || node.StartedAt < startedAt) {
+				startedAt = node.StartedAt
+			}
+			updatedAt := parseJobTimeMillis(job.UpdatedAt)
+			if updatedAt > endedAt {
+				endedAt = updatedAt
+			}
+			if rootRepo == "" {
+				rootRepo = strings.TrimSpace(payload.Repo)
+			}
+			if job.ID != root.ID {
+				childAction := strings.TrimSpace(action)
+				if childAction == "" {
+					childAction = node.Title
+				}
+				children = append(children, dashboard.WorkflowChild{
+					ID: job.ID, Action: childAction, Agent: job.Agent, Runtime: node.Runtime,
+					State: node.State, ElapsedS: dashboardWorkflowElapsedSeconds(node.StartedAt, node.EndedAt, now),
+				})
+			}
+		}
+		runState := aggregateRunState(states)
+		if runState == "running" || runState == "queued" {
+			endedAt = 0
 		}
 		runs = append(runs, dashboard.WorkflowRun{
 			RunID: rootID, Title: runTitle(payloadByID[root.ID], root),
-			State: aggregateRunState(states), Nodes: nodes,
+			Agent: strings.TrimSpace(root.Agent), Runtime: resolveJobRuntime(root, payloadByID[root.ID], runtimeByAgent),
+			Repo: rootRepo, State: runState, StartedAt: startedAt, EndedAt: endedAt,
+			ElapsedS: dashboardWorkflowElapsedSeconds(startedAt, endedAt, now),
+			Children: children, Nodes: nodes,
 		})
 	}
 	return runs
+}
+
+func dashboardWorkflowElapsedSeconds(startedAt, endedAt int64, now time.Time) int64 {
+	if startedAt <= 0 {
+		return 0
+	}
+	if endedAt <= 0 {
+		endedAt = now.UnixMilli()
+	}
+	return max(0, (endedAt-startedAt)/1000)
 }
 
 func resolveWorkflowPayloadDeps(job db.Job, payload workflow.JobPayload, childrenByParent map[string][]db.Job) []string {
