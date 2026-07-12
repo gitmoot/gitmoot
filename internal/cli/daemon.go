@@ -7286,6 +7286,10 @@ func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Contex
 	if branch != task.Branch {
 		return payload, workflow.BlockedError{Reason: fmt.Sprintf("implemented task worktree is on branch %s, not %s", branch, task.Branch)}
 	}
+	validatedPR, hasValidatedPR, err := f.revalidateImplementationPullRequest(ctx, payload, task)
+	if err != nil {
+		return payload, err
+	}
 	// Write-ahead the skip-native-review-fanout flag onto the branch lock as soon
 	// as the branch is confirmed — before EVERY downstream path that proceeds with
 	// a PR: the no-changes-but-PR-exists early return below, the adopt path, and
@@ -7311,6 +7315,9 @@ func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Contex
 			return payload, fmt.Errorf("resolve clean implementation head: %w", err)
 		}
 		if strings.TrimSpace(payload.HeadSHA) == "" || head == payload.HeadSHA {
+			if hasValidatedPR {
+				return f.adoptValidatedImplementationPullRequest(ctx, payload, task, validatedPR, head)
+			}
 			if payload.PullRequest > 0 && head == payload.HeadSHA {
 				payload.Branch = task.Branch
 				return payload, nil
@@ -7329,6 +7336,9 @@ func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Contex
 	}
 	if err := git.PushBranch(ctx, "origin", task.Branch); err != nil {
 		return payload, workflow.BlockedError{Reason: "push implementation branch failed: " + err.Error()}
+	}
+	if hasValidatedPR {
+		return f.adoptValidatedImplementationPullRequest(ctx, payload, task, validatedPR, head)
 	}
 	repo, err := daemon.ParseRepository(payload.Repo)
 	if err != nil {
@@ -7406,6 +7416,62 @@ func (f daemonImplementationFinalizer) githubClient(checkout string) github.Clie
 		return github.NewClient(checkout)
 	}
 	return f.GitHub
+}
+
+func (f daemonImplementationFinalizer) revalidateImplementationPullRequest(ctx context.Context, payload workflow.JobPayload, task db.Task) (github.PullRequest, bool, error) {
+	if !payload.ValidatedPullRequest {
+		return github.PullRequest{}, false, nil
+	}
+	if payload.PullRequest <= 0 {
+		return github.PullRequest{}, false, workflow.BlockedError{Reason: "validated implementation payload has no pull request number"}
+	}
+	repo, err := daemon.ParseRepository(payload.Repo)
+	if err != nil {
+		return github.PullRequest{}, false, err
+	}
+	pr, err := f.githubClient(task.WorktreePath).GetPullRequest(ctx, repo, int64(payload.PullRequest))
+	if err != nil {
+		return github.PullRequest{}, false, fmt.Errorf("revalidate fix-pass pull request #%d: %w", payload.PullRequest, err)
+	}
+	if pr.Number != int64(payload.PullRequest) {
+		return github.PullRequest{}, false, workflow.BlockedError{Reason: fmt.Sprintf("fix-pass pull request revalidation returned #%d, want #%d", pr.Number, payload.PullRequest)}
+	}
+	if pr.Merged || strings.TrimSpace(pr.MergedAt) != "" || !strings.EqualFold(strings.TrimSpace(pr.State), "open") {
+		return github.PullRequest{}, false, workflow.BlockedError{Reason: fmt.Sprintf("fix-pass pull request #%d is no longer open", payload.PullRequest)}
+	}
+	if strings.TrimSpace(pr.HeadRef) != task.Branch {
+		return github.PullRequest{}, false, workflow.BlockedError{Reason: fmt.Sprintf("fix-pass pull request #%d now targets head branch %s, not task branch %s", payload.PullRequest, firstNonEmpty(pr.HeadRef, "<missing>"), task.Branch)}
+	}
+	if headRepo := strings.TrimSpace(pr.HeadRepoFullName); headRepo != "" && !strings.EqualFold(headRepo, payload.Repo) {
+		return github.PullRequest{}, false, workflow.BlockedError{Reason: fmt.Sprintf("fix-pass pull request #%d head belongs to %s, not %s", payload.PullRequest, headRepo, payload.Repo)}
+	}
+	return pr, true, nil
+}
+
+func (f daemonImplementationFinalizer) adoptValidatedImplementationPullRequest(ctx context.Context, payload workflow.JobPayload, task db.Task, pr github.PullRequest, head string) (workflow.JobPayload, error) {
+	base := strings.TrimSpace(pr.BaseRef)
+	if base == "" {
+		record, err := f.Store.GetRepo(ctx, payload.Repo)
+		if err != nil {
+			return payload, err
+		}
+		base = firstNonEmpty(strings.TrimSpace(record.DefaultBranch), "main")
+	}
+	payload.PullRequest = int(pr.Number)
+	payload.Branch = task.Branch
+	payload.HeadSHA = head
+	if err := f.Store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: payload.Repo,
+		Number:       pr.Number,
+		URL:          pr.URL,
+		HeadBranch:   task.Branch,
+		BaseBranch:   base,
+		HeadSHA:      head,
+		State:        "open",
+	}); err != nil {
+		return payload, err
+	}
+	return payload, nil
 }
 
 func existingBranchPullRequest(ctx context.Context, store *db.Store, repo string, branch string) (db.PullRequest, bool, error) {

@@ -199,6 +199,7 @@ type JobRequest struct {
 	CockpitSession         string
 	CockpitPaneKey         string
 	SkipNativeReviewFanout bool
+	ValidatedPullRequest   bool
 	Ephemeral              *EphemeralSpec
 	// HumanAnswer carries the rendered ask-gate answer block (#445) into the
 	// coordinator continuation enqueued by the `answer` resume verb. Empty for
@@ -295,6 +296,7 @@ type JobPayload struct {
 	CockpitSession         string         `json:"cockpit_session,omitempty"`
 	CockpitPaneKey         string         `json:"cockpit_pane_key,omitempty"`
 	SkipNativeReviewFanout bool           `json:"skip_native_review_fanout,omitempty"`
+	ValidatedPullRequest   bool           `json:"validated_pull_request,omitempty"`
 	Ephemeral              *EphemeralSpec `json:"ephemeral,omitempty"`
 	HumanAnswer            string         `json:"human_answer,omitempty"`
 	// ThreadID / ChatMessageID back-link a chat-promoted job (#534) to its origin
@@ -439,6 +441,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		CockpitSession:         strings.TrimSpace(request.CockpitSession),
 		CockpitPaneKey:         strings.TrimSpace(request.CockpitPaneKey),
 		SkipNativeReviewFanout: request.SkipNativeReviewFanout,
+		ValidatedPullRequest:   request.ValidatedPullRequest,
 		Ephemeral:              request.Ephemeral,
 		HumanAnswer:            request.HumanAnswer,
 		RiskTier:               strings.TrimSpace(request.RiskTier),

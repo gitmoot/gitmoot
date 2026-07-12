@@ -530,6 +530,23 @@ func TestGetPullRequestDecodesBaseSHA(t *testing.T) {
 	runner.wantArgs(t, 0, "api", "repos/jerryfane/gitmoot/pulls/2")
 }
 
+func TestGetPullRequestDecodesHeadRepository(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{
+			Stdout: `{"number": 2, "state": "open", "head": {"ref": "task", "sha": "head123", "repo": {"full_name": "jerryfane/gitmoot"}}, "base": {"ref": "main"}}`,
+		}},
+	}
+	client := GhClient{Runner: runner}
+
+	pr, err := client.GetPullRequest(context.Background(), Repository{Owner: "jerryfane", Name: "gitmoot"}, 2)
+	if err != nil {
+		t.Fatalf("GetPullRequest returned error: %v", err)
+	}
+	if pr.HeadRepoFullName != "jerryfane/gitmoot" {
+		t.Fatalf("head repository = %q, want jerryfane/gitmoot", pr.HeadRepoFullName)
+	}
+}
+
 // TestGetPullRequestDecodesBody proves PullRequest.UnmarshalJSON decodes the wire
 // `body` field into the additive PullRequest.Body (#467) so the daemon's revert
 // detection can read a GitHub Revert-button body (`Reverts owner/repo#NN`).

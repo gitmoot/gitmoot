@@ -690,6 +690,18 @@ worktree state (`git add -A`, incl. untracked non-ignored files), pushes the
 branch, and opens or adopts the PR. `--repo` is optional (falls back to the
 task's repo). Recovery refuses while a live process is still inside the worktree.
 
+**PR-bound fix pass:** use `gitmoot agent implement <agent> --repo owner/repo
+--pr <number> "..."` or `gitmoot agent run <agent> --repo owner/repo --action
+implement --pr <number> "..."` to send an existing open PR back through its
+implementation task. `--action` chooses ask/review/implement; `--type` instead
+chooses a managed agent type, so the two flags are independent. Before reuse,
+Gitmoot proves the PR is open, same-repository, and bound to the existing task's
+head branch. That validated door permits `pr_open` to re-enter implementation
+without widening the predicate shared by `task recover`; review/merge states,
+branch mismatches, dirty/live worktrees, active implement jobs, and foreign
+branch locks still fail closed. The job keeps the PR number so finalization
+adopts the existing PR.
+
 The daemon default is `--workers 1`. Users can raise it when jobs target
 different runtime sessions, managed agent types with `max_background` greater
 than one, or forkable temporary workers. By default `[parallel_sessions]` uses
