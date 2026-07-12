@@ -42,6 +42,7 @@ func (d *webDataSource) Pipelines(ctx context.Context) ([]dashboard.PipelineSumm
 				Name:       p.Name,
 				Repo:       p.Repo,
 				Enabled:    p.Enabled,
+				Mode:       pipelineDisplayMode(p),
 				Interval:   p.Interval,
 				Jitter:     p.Jitter,
 				StageCount: pipelineStageCount(p.SpecYAML),
@@ -160,6 +161,14 @@ func (d *webDataSource) PipelineRun(ctx context.Context, id string) (dashboard.P
 				stage.Retry = spec.Retry
 				if len(spec.Needs) > 0 {
 					stage.Deps = append([]string(nil), spec.Needs...)
+				}
+				// #873 display metadata, under the same spec gate as cmd/deps: the
+				// stage kind badge and (when the agent is registered) its runtime.
+				stage.Kind = pipelineStageKindName(spec)
+				if name := strings.TrimSpace(spec.Agent); name != "" {
+					if agent, aerr := store.GetAgent(ctx, name); aerr == nil {
+						stage.AgentRuntime = strings.TrimSpace(agent.Runtime)
+					}
 				}
 			}
 			if row.State == pipeline.StageRunning {
