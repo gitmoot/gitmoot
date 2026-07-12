@@ -16,8 +16,33 @@ import (
 
 const (
 	dashboardTaskMergedWindow = 7 * 24 * time.Hour
+	// Open work older than this is stale backlog, not a board card: the live
+	// store carries months of dormant planned/blocked tasks that would drown
+	// the Tasks board and the needs-you strip.
+	dashboardTaskActiveWindow = 30 * 24 * time.Hour
 	dashboardTodayWindow      = 24 * time.Hour
+	// Bounded blocks: the strip and the needs-you list must stay glanceable on
+	// a store with years of history.
+	dashboardFleetCap        = 16
+	dashboardNeedsYouKindCap = 8
 )
+
+// capDashboardNeedsYou bounds each needs-you kind after sorting so one noisy
+// kind can never drown the others.
+func capDashboardNeedsYou(out *dashboard.Overview) {
+	perKind := map[string]int{}
+	kept := out.NeedsYou[:0]
+	for _, item := range out.NeedsYou {
+		if perKind[item.Kind] >= dashboardNeedsYouKindCap {
+			continue
+		}
+		perKind[item.Kind]++
+		kept = append(kept, item)
+	}
+	out.NeedsYou = kept
+}
+
+const ()
 
 // Tasks projects Gitmoot's richer internal task lifecycle onto the five
 // dashboard columns. CI remains empty because no current CI conclusion is
@@ -39,9 +64,13 @@ func dashboardTasks(ctx context.Context, store *db.Store, now time.Time) ([]dash
 		return nil, err
 	}
 	out := make([]dashboard.TaskSummary, 0, len(rows))
+	activeCutoff := now.Add(-dashboardTaskActiveWindow)
 	for _, row := range rows {
 		state, blockedReason := dashboardTaskState(row.State)
 		updatedAt := parseJobTimeMillis(row.UpdatedAt)
+		if state != "merged" && workflowMillisTime(updatedAt).Before(activeCutoff) {
+			continue
+		}
 		item := dashboard.TaskSummary{
 			ID: row.ID, Title: row.Title, Repo: row.Repo, State: state, Agent: row.Agent,
 			BlockedReason: blockedReason, UpdatedAt: updatedAt,
@@ -226,12 +255,21 @@ func dashboardOverview(ctx context.Context, store *db.Store, now time.Time) (das
 	}
 	for _, agent := range agents {
 		count := countByAgent[agent.Name]
+		// The strip is "fleet at a glance", not a registry dump: only agents
+		// that ran something today (or are running now) earn a card.
+		if count.JobsToday == 0 && count.Running == 0 {
+			continue
+		}
 		out.Fleet = append(out.Fleet, dashboard.OverviewFleet{
 			Agent: agent.Name, Runtime: agent.Runtime, Running: count.Running > 0, JobsToday: count.JobsToday,
 		})
 	}
 
 	sortDashboardOverview(&out)
+	if len(out.Fleet) > dashboardFleetCap {
+		out.Fleet = out.Fleet[:dashboardFleetCap]
+	}
+	capDashboardNeedsYou(&out)
 	return out, nil
 }
 

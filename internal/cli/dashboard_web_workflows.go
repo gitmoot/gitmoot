@@ -97,6 +97,13 @@ func dashboardWorkflowEntry(now time.Time, summary db.WorkflowSummary, meta db.W
 		LastFailure: workflowMillisTime(parseJobTimeMillis(summary.LastFailureAt)),
 		LastNote:    workflowMillisTime(parseJobTimeMillis(summary.LastNoteAt)),
 	})
+	if auto && state == "stalled" {
+		// Auto-synthesized groups have no coordinator and no journal, so a
+		// failure can never be acknowledged and there is nobody to "go to" —
+		// stalled is a coordinated-workflow concept. Their failures surface
+		// through blocked-job / needs-a-human paths instead.
+		state, stalledFor = "settled", 0
+	}
 	author := strings.TrimSpace(meta.Author)
 	if author == "" {
 		author = strings.TrimSpace(summary.LastAuthor)
