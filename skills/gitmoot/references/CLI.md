@@ -1025,7 +1025,7 @@ gitmoot orchestrate planner "Coordinate the dashboard wave." --repo owner/repo -
 gitmoot job list --workflow fable/dashboard-redesign
 gitmoot workflow list
 gitmoot workflow show fable/dashboard-redesign --limit 100
-gitmoot workflow note fable/dashboard-redesign "The staging rollout completed." --author operator --pane wave-2 --session <session-id> --workdir /work/dashboard
+gitmoot workflow note fable/dashboard-redesign "Kickoff." --author operator --pane wave-2 --session <session-id> --workdir /work/dashboard --summary "Coordinate and ship the dashboard redesign."
 ```
 
 `workflow list` reports per-state counts, note count, first/last activity, and
@@ -1036,6 +1036,10 @@ while queued/running or touched within 30 minutes, `stalled` when failed/blocked
 and quiet for 30 minutes to 24 hours, and `settled` otherwise. The optional
 `--pane`, `--session`, and `--workdir` note flags persist the latest coordinator
 handoff shown on that page; author defaults to the newest note author.
+Coordinators should set a one-line human summary at kickoff with `--summary`.
+Omitting that flag preserves the stored summary, a non-empty value replaces it,
+and `--summary ""` clears it. Summary input is stored verbatim and limited to
+300 bytes.
 Labels may be reused; timestamps expose the reuse. `workflow note` stores body
 and author verbatim (10 KiB and 128-byte limits) and rejects labels with no jobs.
 `workflow show --json` returns those verbatim bytes; plain-text output strips

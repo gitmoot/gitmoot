@@ -206,7 +206,7 @@ func TestDashboardOverviewTasksAndAutoWorkflows(t *testing.T) {
 		t.Fatalf("pipeline stage was re-bucketed as adhoc/alpha: %+v", workflows)
 	}
 	adhocGroup := workflowByLabel["adhoc/beta"]
-	if !adhocGroup.Auto || adhocGroup.State != "active" || adhocGroup.Counts.Running != 1 {
+	if !adhocGroup.Auto || adhocGroup.Summary != "" || adhocGroup.State != "active" || adhocGroup.Counts.Running != 1 {
 		t.Fatalf("adhoc auto group = %+v", adhocGroup)
 	}
 	explicitPipeline := workflowByLabel["pipeline/manual"]

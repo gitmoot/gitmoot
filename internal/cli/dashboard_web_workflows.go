@@ -111,6 +111,7 @@ func dashboardWorkflowEntry(now time.Time, summary db.WorkflowSummary, meta db.W
 	namespace, campaign := splitDashboardWorkflowLabel(summary.WorkflowID)
 	return dashboard.WorkflowIndexEntry{
 		Label: summary.WorkflowID, Namespace: namespace, Campaign: campaign, Auto: auto,
+		Summary: meta.Summary,
 		Coordinator: dashboard.WorkflowCoordinator{
 			Author: author, Pane: strings.TrimSpace(meta.Pane), SessionID: strings.TrimSpace(meta.SessionID),
 		},

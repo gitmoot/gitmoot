@@ -20,6 +20,7 @@ import (
 const (
 	workflowNoteBodyMax   = 10 * 1024
 	workflowNoteAuthorMax = 128
+	workflowSummaryMax    = 300
 )
 
 func runWorkflowJournal(args []string, stdout, stderr io.Writer) int {
@@ -47,7 +48,7 @@ func printWorkflowJournalUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot workflow list [--json]")
 	fmt.Fprintln(w, "  gitmoot workflow show <label> [--json] [--limit N]")
-	fmt.Fprintln(w, "  gitmoot workflow note <label> \"<body>\" [--author A] [--pane P] [--session ID] [--workdir PATH] [--remember [--remember-status] [--agent NAME] [--repo R]]")
+	fmt.Fprintln(w, "  gitmoot workflow note <label> \"<body>\" [--author A] [--pane P] [--session ID] [--workdir PATH] [--summary S] [--remember [--remember-status] [--agent NAME] [--repo R]]")
 }
 
 func runWorkflowList(args []string, stdout, stderr io.Writer) int {
@@ -145,6 +146,7 @@ func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	var summary db.WorkflowSummary
+	var meta db.WorkflowMeta
 	var jobs []db.Job
 	var notes []db.WorkflowNote
 	if err := withStore(*home, func(store *db.Store) error {
@@ -162,6 +164,13 @@ func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 			return err
 		}
 		notes, err = store.ListWorkflowNotes(ctx, label, *limit)
+		if err != nil {
+			return err
+		}
+		meta, err = store.GetWorkflowMeta(ctx, label)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
 		return err
 	}); err != nil {
 		fmt.Fprintf(stderr, "workflow show: %v\n", err)
@@ -179,8 +188,12 @@ func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	fmt.Fprintf(stdout, "workflow: %s\njobs: %d\nnotes: %d\ntokens(best-effort): input=%d output=%d\nfirst: %s\nlast: %s\n",
-		summary.WorkflowID, summary.JobCount, summary.NoteCount, summary.InputTokens,
+	fmt.Fprintf(stdout, "workflow: %s\n", summary.WorkflowID)
+	if meta.Summary != "" {
+		fmt.Fprintf(stdout, "summary: %s\n", terminalSafeWorkflowText(meta.Summary))
+	}
+	fmt.Fprintf(stdout, "jobs: %d\nnotes: %d\ntokens(best-effort): input=%d output=%d\nfirst: %s\nlast: %s\n",
+		summary.JobCount, summary.NoteCount, summary.InputTokens,
 		summary.OutputTokens, summary.FirstAt, summary.LastAt)
 	for _, entry := range entries {
 		if entry.Job != nil {
@@ -280,6 +293,7 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 	pane := fs.String("pane", "", "coordinator pane name")
 	sessionID := fs.String("session", "", "coordinator runtime session id")
 	workdir := fs.String("workdir", "", "coordinator working directory")
+	summary := fs.String("summary", "", "one-line human workflow summary")
 	remember := fs.Bool("remember", false, "also stage the note as persistent memory")
 	rememberStatus := fs.Bool("remember-status", false, "explicitly allow a shipping-status-shaped note into memory")
 	agent := fs.String("agent", "", "registered agent whose private pool receives memory")
@@ -311,6 +325,16 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "workflow note accepts one label and body; author must be at most %d bytes\n", workflowNoteAuthorMax)
 		return 2
 	}
+	summarySet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "summary" {
+			summarySet = true
+		}
+	})
+	if len(*summary) > workflowSummaryMax {
+		fmt.Fprintf(stderr, "workflow note summary must be at most %d bytes\n", workflowSummaryMax)
+		return 2
+	}
 	if !*remember && (strings.TrimSpace(*agent) != "" || strings.TrimSpace(*repo) != "" || *rememberStatus) {
 		fmt.Fprintln(stderr, "workflow note: --agent, --repo, and --remember-status require --remember")
 		return 2
@@ -337,6 +361,8 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 			Pane:       strings.TrimSpace(*pane),
 			SessionID:  strings.TrimSpace(*sessionID),
 			WorkDir:    strings.TrimSpace(*workdir),
+			Summary:    *summary,
+			SummarySet: summarySet,
 		}
 		if !*remember {
 			out.Note, err = store.InsertWorkflowNoteWithMeta(ctx, note, meta)

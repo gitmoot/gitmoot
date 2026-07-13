@@ -27,6 +27,10 @@ type WorkflowMeta struct {
 	Pane       string `json:"pane,omitempty"`
 	SessionID  string `json:"session_id,omitempty"`
 	WorkDir    string `json:"workdir,omitempty"`
+	Summary    string `json:"summary,omitempty"`
+	// SummarySet distinguishes an omitted --summary flag from an explicit empty
+	// value, which clears the stored summary.
+	SummarySet bool   `json:"-"`
 	UpdatedAt  string `json:"updated_at,omitempty"`
 }
 
@@ -175,7 +179,7 @@ VALUES (?, ?, ?, ?, ?)`, note.WorkflowID, note.Author, note.Body, note.Repo, not
 	return s.getWorkflowNote(ctx, id)
 }
 
-// InsertWorkflowNoteWithMeta atomically appends a note and replaces the
+// InsertWorkflowNoteWithMeta atomically appends a note and updates the
 // workflow's coordinator handoff metadata with the values from this note.
 func (s *Store) InsertWorkflowNoteWithMeta(ctx context.Context, note WorkflowNote, meta WorkflowMeta) (WorkflowNote, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -259,29 +263,30 @@ VALUES (?, ?, ?, ?, ?)`, note.WorkflowID, note.Author, note.Body, note.Repo, not
 }
 
 func upsertWorkflowMetaTx(ctx context.Context, tx *sql.Tx, meta WorkflowMeta) error {
-	_, err := tx.ExecContext(ctx, `INSERT INTO workflow_meta(workflow_id, author, pane, session_id, workdir, updated_at)
-VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	_, err := tx.ExecContext(ctx, `INSERT INTO workflow_meta(workflow_id, author, pane, session_id, workdir, summary, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 ON CONFLICT(workflow_id) DO UPDATE SET
 	author = excluded.author,
 	pane = CASE WHEN excluded.pane != '' THEN excluded.pane ELSE workflow_meta.pane END,
 	session_id = CASE WHEN excluded.session_id != '' THEN excluded.session_id ELSE workflow_meta.session_id END,
 	workdir = CASE WHEN excluded.workdir != '' THEN excluded.workdir ELSE workflow_meta.workdir END,
-	updated_at = CURRENT_TIMESTAMP`, meta.WorkflowID, meta.Author, meta.Pane, meta.SessionID, meta.WorkDir)
+	summary = CASE WHEN ? THEN excluded.summary ELSE workflow_meta.summary END,
+	updated_at = CURRENT_TIMESTAMP`, meta.WorkflowID, meta.Author, meta.Pane, meta.SessionID, meta.WorkDir, meta.Summary, meta.SummarySet)
 	return err
 }
 
 // GetWorkflowMeta returns one workflow's latest coordinator handoff metadata.
 func (s *Store) GetWorkflowMeta(ctx context.Context, workflowID string) (WorkflowMeta, error) {
 	var meta WorkflowMeta
-	err := s.db.QueryRowContext(ctx, `SELECT workflow_id, author, pane, session_id, workdir, updated_at
+	err := s.db.QueryRowContext(ctx, `SELECT workflow_id, author, pane, session_id, workdir, summary, updated_at
 FROM workflow_meta WHERE workflow_id = ?`, strings.TrimSpace(workflowID)).Scan(
-		&meta.WorkflowID, &meta.Author, &meta.Pane, &meta.SessionID, &meta.WorkDir, &meta.UpdatedAt)
+		&meta.WorkflowID, &meta.Author, &meta.Pane, &meta.SessionID, &meta.WorkDir, &meta.Summary, &meta.UpdatedAt)
 	return meta, err
 }
 
 // ListWorkflowMeta returns all coordinator metadata keyed by workflow id.
 func (s *Store) ListWorkflowMeta(ctx context.Context) (map[string]WorkflowMeta, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT workflow_id, author, pane, session_id, workdir, updated_at FROM workflow_meta ORDER BY workflow_id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT workflow_id, author, pane, session_id, workdir, summary, updated_at FROM workflow_meta ORDER BY workflow_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -289,7 +294,7 @@ func (s *Store) ListWorkflowMeta(ctx context.Context) (map[string]WorkflowMeta, 
 	out := map[string]WorkflowMeta{}
 	for rows.Next() {
 		var meta WorkflowMeta
-		if err := rows.Scan(&meta.WorkflowID, &meta.Author, &meta.Pane, &meta.SessionID, &meta.WorkDir, &meta.UpdatedAt); err != nil {
+		if err := rows.Scan(&meta.WorkflowID, &meta.Author, &meta.Pane, &meta.SessionID, &meta.WorkDir, &meta.Summary, &meta.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out[meta.WorkflowID] = meta

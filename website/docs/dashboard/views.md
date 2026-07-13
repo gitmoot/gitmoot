@@ -198,6 +198,8 @@ workflow still appears here even when its label begins with `pipeline/`.
 
 The **index** groups every known workflow by derived lifecycle: **stalled**
 pinned on top ("needs a look"), then **active**, then recently **settled**.
+A coordinator-provided one-line summary identifies the campaign beside its
+journal activity; synthetic `adhoc/<agent>` rows have no summary.
 A workflow is stalled only when a failure has gone **unacknowledged** — nothing
 is running, the goal was not reached, and no journal note has been written
 since the last failure (a failure alone is not an alarm; the silence after it
@@ -207,10 +209,11 @@ The **detail page** reads as a mission log: journal notes and run trees
 interleaved in reverse-chronological order — the coordinator's intent next to
 the runs it produced. Run blocks expand inline to their child jobs; a
 "view as graph" link opens the classic per-run node graph as a drill-down.
-The header carries the coordinator identity (author, herdr pane, session id),
-and a stalled workflow shows a go-here card with the pane, the session id, and
-a copyable resume command — the dashboard tells you where to intervene; it
-never intervenes itself.
+The header carries the human summary and coordinator identity (author, herdr
+pane, session id), and a stalled workflow shows a go-here card with the pane,
+the session id, and a copyable resume command — the dashboard tells you where
+to intervene; it never intervenes itself. Coordinators should set the summary
+at kickoff with `gitmoot workflow note ... --summary "<one sentence>"`.
 
 ## Brain
 

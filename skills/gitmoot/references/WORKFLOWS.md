@@ -28,9 +28,16 @@ and continuations inherit it.
 
 ```sh
 gitmoot orchestrate planner "Run release checks." --repo owner/repo --workflow release-42
+gitmoot workflow note release-42 "Kickoff." --author operator --summary "Validate and ship release 42."
 gitmoot workflow note release-42 "Canary passed." --author operator --remember
 gitmoot workflow show release-42
 ```
+
+At kickoff, coordinators should set a short human-readable summary with
+`--summary`. The latest summary appears beside the journal in the dashboard's
+workflow index and detail views. Omitting the flag preserves it; a new non-empty
+value replaces it; `--summary ""` clears it. Summaries are stored verbatim with
+a 300-byte limit.
 
 In `gitmoot dashboard --web`, labeled jobs cluster around workflow hubs in
 Galaxy; a labeled run links to `/workflows/<label>`, which shows the complete
