@@ -53,6 +53,17 @@ controlling execution: recently touched or queued/running workflows are active;
 failed/blocked workflows quiet for 30 minutes to 24 hours are stalled; older or
 otherwise terminal workflows are settled.
 
+At kickoff, give the campaign a human-readable one-line summary alongside its
+journal:
+
+```sh
+gitmoot workflow note fable/dashboard-redesign "Kickoff." \
+  --author coordinator --summary "Coordinate and ship the dashboard redesign."
+```
+
+Later notes can omit `--summary` without erasing it. Passing another value
+replaces the summary, while `--summary ""` clears it.
+
 ## They compose
 
 `orchestrate --workflow release-42` labels the **whole delegation tree** —

@@ -6509,6 +6509,8 @@ workflow still appears here even when its label begins with `pipeline/`.
 
 The **index** groups every known workflow by derived lifecycle: **stalled**
 pinned on top ("needs a look"), then **active**, then recently **settled**.
+A coordinator-provided one-line summary identifies the campaign beside its
+journal activity; synthetic `adhoc/<agent>` rows have no summary.
 A workflow is stalled only when a failure has gone **unacknowledged** — nothing
 is running, the goal was not reached, and no journal note has been written
 since the last failure (a failure alone is not an alarm; the silence after it
@@ -6518,10 +6520,11 @@ The **detail page** reads as a mission log: journal notes and run trees
 interleaved in reverse-chronological order — the coordinator's intent next to
 the runs it produced. Run blocks expand inline to their child jobs; a
 "view as graph" link opens the classic per-run node graph as a drill-down.
-The header carries the coordinator identity (author, herdr pane, session id),
-and a stalled workflow shows a go-here card with the pane, the session id, and
-a copyable resume command — the dashboard tells you where to intervene; it
-never intervenes itself.
+The header carries the human summary and coordinator identity (author, herdr
+pane, session id), and a stalled workflow shows a go-here card with the pane,
+the session id, and a copyable resume command — the dashboard tells you where
+to intervene; it never intervenes itself. Coordinators should set the summary
+at kickoff with `gitmoot workflow note ... --summary "<one sentence>"`.
 
 ## Brain
 
@@ -10152,7 +10155,7 @@ gitmoot orchestrate planner "Coordinate the dashboard wave." --repo owner/repo -
 gitmoot job list --workflow fable/dashboard-redesign
 gitmoot workflow list
 gitmoot workflow show fable/dashboard-redesign --limit 100
-gitmoot workflow note fable/dashboard-redesign "The staging rollout completed." --author operator --pane wave-2 --session <session-id> --workdir /work/dashboard
+gitmoot workflow note fable/dashboard-redesign "Kickoff." --author operator --pane wave-2 --session <session-id> --workdir /work/dashboard --summary "Coordinate and ship the dashboard redesign."
 ```
 
 `workflow list` reports per-state counts, note count, first/last activity, and
@@ -10163,6 +10166,10 @@ while queued/running or touched within 30 minutes, `stalled` when failed/blocked
 and quiet for 30 minutes to 24 hours, and `settled` otherwise. The optional
 `--pane`, `--session`, and `--workdir` note flags persist the latest coordinator
 handoff shown on that page; author defaults to the newest note author.
+Coordinators should set a one-line human summary at kickoff with `--summary`.
+Omitting that flag preserves the stored summary, a non-empty value replaces it,
+and `--summary ""` clears it. Summary input is stored verbatim and limited to
+300 bytes.
 Labels may be reused; timestamps expose the reuse. `workflow note` stores body
 and author verbatim (10 KiB and 128-byte limits) and rejects labels with no jobs.
 `workflow show --json` returns those verbatim bytes; plain-text output strips
@@ -12047,9 +12054,16 @@ and continuations inherit it.
 
 ```sh
 gitmoot orchestrate planner "Run release checks." --repo owner/repo --workflow release-42
+gitmoot workflow note release-42 "Kickoff." --author operator --summary "Validate and ship release 42."
 gitmoot workflow note release-42 "Canary passed." --author operator --remember
 gitmoot workflow show release-42
 ```
+
+At kickoff, coordinators should set a short human-readable summary with
+`--summary`. The latest summary appears beside the journal in the dashboard's
+workflow index and detail views. Omitting the flag preserves it; a new non-empty
+value replaces it; `--summary ""` clears it. Summaries are stored verbatim with
+a 300-byte limit.
 
 In `gitmoot dashboard --web`, labeled jobs cluster around workflow hubs in
 Galaxy; a labeled run links to `/workflows/<label>`, which shows the complete

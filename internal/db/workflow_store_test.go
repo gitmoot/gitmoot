@@ -347,6 +347,59 @@ func TestWorkflowMetaLastWriteWinsAndObservationFailureRollsBack(t *testing.T) {
 	}
 }
 
+func TestWorkflowMetaSummarySetPreserveAndClear(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	workflowID := "fable/dashboard-redesign"
+	write := func(body string, meta WorkflowMeta) {
+		t.Helper()
+		if _, err := store.InsertWorkflowNoteWithMeta(ctx,
+			WorkflowNote{WorkflowID: workflowID, Author: "coord", Body: body}, meta); err != nil {
+			t.Fatalf("InsertWorkflowNoteWithMeta(%q): %v", body, err)
+		}
+	}
+
+	write("kickoff", WorkflowMeta{Author: "coord", Summary: "Ship the dashboard redesign.", SummarySet: true})
+	write("progress", WorkflowMeta{Author: "coord"})
+	meta, err := store.GetWorkflowMeta(ctx, workflowID)
+	if err != nil || meta.Summary != "Ship the dashboard redesign." {
+		t.Fatalf("summary after omitted update = %q, err=%v", meta.Summary, err)
+	}
+
+	write("clear", WorkflowMeta{Author: "coord", SummarySet: true})
+	meta, err = store.GetWorkflowMeta(ctx, workflowID)
+	if err != nil || meta.Summary != "" {
+		t.Fatalf("summary after explicit clear = %q, err=%v", meta.Summary, err)
+	}
+}
+
+func TestWorkflowMetaSummaryMigration(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	rows, err := store.db.QueryContext(context.Background(), `PRAGMA table_info(workflow_meta)`)
+	if err != nil {
+		t.Fatalf("PRAGMA table_info(workflow_meta): %v", err)
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		if name == "summary" {
+			found = columnType == "TEXT" && notNull == 1 && defaultValue.Valid && defaultValue.String == "''"
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("summary is missing TEXT NOT NULL DEFAULT '' in PRAGMA table_info(workflow_meta)")
+	}
+}
+
 func TestWorkflowSummariesIncludeNoteOnlyLabelsAndNoteActivity(t *testing.T) {
 	store := openWorkflowTestStore(t)
 	ctx := context.Background()

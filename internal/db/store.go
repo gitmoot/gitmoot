@@ -8773,4 +8773,9 @@ CREATE TABLE groom_quality_verdicts (
 	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 	`,
+	// #896 one-line human summary for externally coordinated workflows. Empty is
+	// the legacy/default state; note writes preserve it unless --summary is set.
+	`
+ALTER TABLE workflow_meta ADD COLUMN summary TEXT NOT NULL DEFAULT '';
+	`,
 }

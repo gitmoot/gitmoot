@@ -212,6 +212,60 @@ func TestWorkflowNotePersistsNamespacedCoordinatorMetadata(t *testing.T) {
 	}
 }
 
+func TestWorkflowNoteSummarySetPreserveClearAndLimit(t *testing.T) {
+	home, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	const workflowID = "fable/dashboard-redesign"
+	if err := store.CreateJob(ctx, db.Job{ID: "summary-job", Agent: "coord", Type: "ask", State: "running", Payload: `{"repo":"acme/widget","workflow_id":"fable/dashboard-redesign"}`}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	runNote := func(body string, extra ...string) int {
+		t.Helper()
+		args := []string{"note", workflowID, body, "--author", "coord", "--home", home}
+		args = append(args, extra...)
+		var stdout, stderr bytes.Buffer
+		code := runWorkflowJournal(args, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("workflow note %q exit=%d stderr=%q", body, code, stderr.String())
+		}
+		return code
+	}
+
+	runNote("kickoff", "--summary", "Ship the dashboard redesign.")
+	meta, err := store.GetWorkflowMeta(ctx, workflowID)
+	if err != nil || meta.Summary != "Ship the dashboard redesign." {
+		t.Fatalf("summary after set = %q, err=%v", meta.Summary, err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := runWorkflowShow([]string{workflowID, "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("workflow show exit=%d stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "summary: Ship the dashboard redesign.\n") {
+		t.Fatalf("workflow show missing summary header: %q", stdout.String())
+	}
+
+	runNote("progress")
+	meta, err = store.GetWorkflowMeta(ctx, workflowID)
+	if err != nil || meta.Summary != "Ship the dashboard redesign." {
+		t.Fatalf("summary after absent flag = %q, err=%v", meta.Summary, err)
+	}
+
+	runNote("clear", "--summary", "")
+	meta, err = store.GetWorkflowMeta(ctx, workflowID)
+	if err != nil || meta.Summary != "" {
+		t.Fatalf("summary after clear = %q, err=%v", meta.Summary, err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code := runWorkflowJournal([]string{
+		"note", workflowID, "too long", "--summary", strings.Repeat("x", workflowSummaryMax+1), "--home", home,
+	}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "workflow note summary must be at most 300 bytes") {
+		t.Fatalf("over-length summary exit=%d stderr=%q", code, stderr.String())
+	}
+}
+
 func TestJobListWorkflowFilterUsesGroupMembership(t *testing.T) {
 	home, store := workflowJournalTestHome(t)
 	ctx := context.Background()

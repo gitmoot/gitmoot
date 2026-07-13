@@ -247,6 +247,7 @@ func (d *webDataSource) Workflow(ctx context.Context, label string, q dashboard.
 		if metaErr != nil && !errors.Is(metaErr, sql.ErrNoRows) {
 			return metaErr
 		}
+		out.Summary.Summary = meta.Summary
 		author := strings.TrimSpace(meta.Author)
 		if author == "" {
 			author = strings.TrimSpace(summary.LastAuthor)

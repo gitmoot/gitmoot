@@ -883,7 +883,7 @@ gitmoot orchestrate planner "Coordinate the dashboard wave." --repo owner/repo -
 gitmoot job list --workflow fable/dashboard-redesign
 gitmoot workflow list
 gitmoot workflow show fable/dashboard-redesign --limit 100
-gitmoot workflow note fable/dashboard-redesign "The staging rollout completed." --author operator --pane wave-2 --session <session-id> --workdir /work/dashboard
+gitmoot workflow note fable/dashboard-redesign "Kickoff." --author operator --pane wave-2 --session <session-id> --workdir /work/dashboard --summary "Coordinate and ship the dashboard redesign."
 ```
 
 List/show include state counts, notes, first/last activity, and best-effort token
@@ -894,6 +894,10 @@ minutes; failed/blocked workflows quiet for 30 minutes to 24 hours are
 `stalled`; everything else is `settled`. The optional `--pane`, `--session`, and
 `--workdir` note flags persist the latest coordinator handoff. If coordinator
 author metadata is empty, the newest note author is used.
+Coordinators should set a one-line human summary at kickoff with `--summary`.
+Omitting that flag preserves the stored summary, a non-empty value replaces it,
+and `--summary ""` clears it. Summary input is stored verbatim and limited to
+300 bytes.
 `--remember` stages low-trust memory in the shared pool by default; `--agent
 NAME` selects a registered agent's private pool. A single repo is inferred,
 otherwise `--repo` is required.
