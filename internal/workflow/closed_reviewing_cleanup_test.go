@@ -129,3 +129,150 @@ func TestHandleReviewPullRequestClosedMergedReleasesLockAndWorktree(t *testing.T
 		})
 	}
 }
+
+func TestHandleReviewPullRequestClosedMergedLifecycleStates(t *testing.T) {
+	states := []TaskState{
+		TaskPullRequestOpen,
+		TaskReviewing,
+		TaskChangesRequested,
+		TaskReadyToMerge,
+	}
+	for _, state := range states {
+		t.Run(string(state), func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			if err := store.UpsertTask(ctx, db.Task{
+				ID:           "task-893",
+				RepoFullName: "owner/repo",
+				Title:        "Reconcile external merge",
+				State:        string(state),
+				Branch:       "feature/893",
+			}); err != nil {
+				t.Fatalf("UpsertTask: %v", err)
+			}
+			if err := store.UpsertPullRequest(ctx, db.PullRequest{
+				RepoFullName: "owner/repo",
+				Number:       893,
+				HeadBranch:   "feature/893",
+				State:        "open",
+			}); err != nil {
+				t.Fatalf("UpsertPullRequest: %v", err)
+			}
+
+			engine := Engine{Store: store}
+			if err := engine.HandleReviewPullRequestClosed(ctx, PullRequestEvent{
+				Repo:        "owner/repo",
+				Branch:      "feature/893",
+				PullRequest: 893,
+				TaskID:      "task-893",
+				TaskTitle:   "Reconcile external merge",
+				LeadAgent:   "github",
+				Sender:      "github",
+			}, true); err != nil {
+				t.Fatalf("HandleReviewPullRequestClosed: %v", err)
+			}
+
+			task, err := store.GetTask(ctx, "task-893")
+			if err != nil || task.State != string(TaskMerged) {
+				t.Fatalf("task = %+v, err=%v; want merged", task, err)
+			}
+			pr, err := store.GetPullRequest(ctx, "owner/repo", 893)
+			if err != nil || pr.State != "merged" {
+				t.Fatalf("pull request = %+v, err=%v; want merged", pr, err)
+			}
+		})
+	}
+}
+
+func TestHandleReviewPullRequestClosedUnmergedLeavesNonReviewingStatesUnchanged(t *testing.T) {
+	states := []TaskState{TaskPullRequestOpen, TaskChangesRequested}
+	for _, state := range states {
+		t.Run(string(state), func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			if err := store.UpsertTask(ctx, db.Task{
+				ID:           "task-893",
+				RepoFullName: "owner/repo",
+				Title:        "Conservative close handling",
+				State:        string(state),
+				Branch:       "feature/893",
+			}); err != nil {
+				t.Fatalf("UpsertTask: %v", err)
+			}
+			if err := store.UpsertPullRequest(ctx, db.PullRequest{
+				RepoFullName: "owner/repo",
+				Number:       893,
+				HeadBranch:   "feature/893",
+				State:        "open",
+			}); err != nil {
+				t.Fatalf("UpsertPullRequest: %v", err)
+			}
+
+			engine := Engine{Store: store}
+			if err := engine.HandleReviewPullRequestClosed(ctx, PullRequestEvent{
+				Repo:        "owner/repo",
+				Branch:      "feature/893",
+				PullRequest: 893,
+				TaskID:      "task-893",
+				TaskTitle:   "Conservative close handling",
+				LeadAgent:   "github",
+				Sender:      "github",
+			}, false); err != nil {
+				t.Fatalf("HandleReviewPullRequestClosed: %v", err)
+			}
+
+			task, err := store.GetTask(ctx, "task-893")
+			if err != nil || task.State != string(state) {
+				t.Fatalf("task = %+v, err=%v; want %s", task, err, state)
+			}
+			pr, err := store.GetPullRequest(ctx, "owner/repo", 893)
+			if err != nil || pr.State != "open" {
+				t.Fatalf("pull request = %+v, err=%v; want open", pr, err)
+			}
+		})
+	}
+}
+
+func TestHandleReviewPullRequestClosedEmptyBranchDoesNotAdvanceCanonicalTask(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "implement-11",
+		RepoFullName: "owner/repo",
+		Title:        "Canonical implementation",
+		State:        string(TaskImplementing),
+		Branch:       "feature/eleven",
+	}); err != nil {
+		t.Fatalf("Upsert implement task: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "review-pr-11-44cd8322",
+		RepoFullName: "owner/repo",
+		Title:        "Review PR #11",
+		State:        string(TaskReviewing),
+	}); err != nil {
+		t.Fatalf("Upsert review task: %v", err)
+	}
+
+	engine := Engine{Store: store}
+	if err := engine.HandleReviewPullRequestClosed(ctx, PullRequestEvent{
+		Repo:        "owner/repo",
+		Branch:      "feature/eleven",
+		PullRequest: 11,
+		TaskID:      "review-pr-11-44cd8322",
+		TaskTitle:   "Review PR #11",
+		LeadAgent:   "github",
+		Sender:      "github",
+	}, true); err != nil {
+		t.Fatalf("HandleReviewPullRequestClosed: %v", err)
+	}
+
+	reviewTask, err := store.GetTask(ctx, "review-pr-11-44cd8322")
+	if err != nil || reviewTask.State != string(TaskMerged) || reviewTask.Branch != "" {
+		t.Fatalf("review task = %+v, err=%v; want merged with empty branch", reviewTask, err)
+	}
+	implementTask, err := store.GetTask(ctx, "implement-11")
+	if err != nil || implementTask.State != string(TaskImplementing) || implementTask.Branch != "feature/eleven" {
+		t.Fatalf("implement task changed = %+v, err=%v", implementTask, err)
+	}
+}

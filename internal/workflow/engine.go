@@ -1123,22 +1123,16 @@ func (e Engine) HandlePullRequestReadyToMerge(ctx context.Context, event PullReq
 	return err
 }
 
-// HandleReviewPullRequestClosed reconciles a task wedged in `reviewing` whose
-// pull request is no longer open on GitHub (#543). The daemon poll loop only
-// lists OPEN pull requests, so once a reviewing task's PR is closed — most often
-// a duplicate/superseded PR that a cleanup job closed on GitHub — nothing
-// re-routes the task and it stays in `reviewing` pointing at a stale `open`
-// local PR row forever.
+// HandleReviewPullRequestClosed reconciles a PR lifecycle task whose pull
+// request is no longer open on GitHub (#543, #893). The daemon poll loop only
+// lists OPEN pull requests, so an externally merged PR otherwise disappears
+// while its task and local PR mirror remain stale.
 //
-// It is idempotent and narrowly scoped: it acts ONLY when the task is still in
-// `reviewing`, so any already-advanced task (a genuinely-open PR still under
-// review, or one already merged/blocked) is left untouched and the healthy
-// merge/open paths are never regressed. It transitions the task out of
-// `reviewing` and rewrites the stale local PR row to its true state: a merged PR
-// resolves the task to `merged`; a closed-unmerged PR resolves it to the
-// terminal `blocked` state (there is no open PR left to review or merge, so it
-// surfaces to a human). Existing PR row fields (url/base/merge SHA) are
-// preserved — only the state (and, when merged, head SHA) is reconciled.
+// Merged PRs resolve any of pr_open/reviewing/changes_requested/ready_to_merge;
+// an already-merged task is accepted only to repair its stale PR mirror.
+// Closed-unmerged behavior remains deliberately narrower: only reviewing uses
+// the existing transition to blocked; the other lifecycle states are untouched.
+// Existing PR row fields (url/base/merge SHA) are preserved.
 func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullRequestEvent, merged bool) error {
 	if err := e.validate(); err != nil {
 		return err
@@ -1154,17 +1148,39 @@ func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullReq
 		}
 		return err
 	}
-	if task.State != string(TaskReviewing) {
+	taskState := TaskState(task.State)
+	alreadyMerged := false
+	if merged {
+		switch taskState {
+		case TaskPullRequestOpen, TaskReviewing, TaskChangesRequested, TaskReadyToMerge:
+		case TaskMerged:
+			// Keep the task terminal while repairing a stale local PR mirror after
+			// another path (notably the ready-to-merge gate) completed first.
+			alreadyMerged = true
+		default:
+			return nil
+		}
+	} else if taskState != TaskReviewing {
 		return nil
 	}
 	prState := "closed"
-	taskState := TaskBlocked
+	nextTaskState := TaskBlocked
 	if merged {
 		prState = "merged"
-		taskState = TaskMerged
+		nextTaskState = TaskMerged
 	}
-	if err := e.setTaskState(ctx, ref, taskState); err != nil {
-		return err
+	if !alreadyMerged {
+		stateRef := ref
+		if strings.TrimSpace(task.Branch) == "" {
+			// Legacy/local review-pr tasks intentionally have no branch because the
+			// canonical implement task may already own (repo, head branch). Keeping the
+			// ref empty advances the review task itself instead of setTaskState's branch
+			// collision fallback advancing the implement task.
+			stateRef.Branch = ""
+		}
+		if err := e.setTaskState(ctx, stateRef, nextTaskState); err != nil {
+			return err
+		}
 	}
 	pr := db.PullRequest{
 		RepoFullName: event.Repo,
@@ -1186,7 +1202,7 @@ func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullReq
 	if err := e.Store.UpsertPullRequest(ctx, pr); err != nil {
 		return err
 	}
-	if merged {
+	if merged && !alreadyMerged {
 		// An externally-merged PR detected by the reconciler must release the branch
 		// lock and remove the task worktree, exactly as the canonical merge path
 		// (PolicyMergeGate.finishMerged) does. Without this the reconcile method

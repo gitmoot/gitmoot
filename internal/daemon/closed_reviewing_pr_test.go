@@ -23,6 +23,7 @@ func TestPollOnceReconcilesClosedReviewingPullRequest(t *testing.T) {
 		// openPulls / closedPulls are what GitHub reports for each list state.
 		openPulls   []github.PullRequest
 		closedPulls []github.PullRequest
+		pinnedPull  *github.PullRequest
 		wantTask    workflow.TaskState
 		wantPRState string
 	}{
@@ -60,6 +61,7 @@ func TestPollOnceReconcilesClosedReviewingPullRequest(t *testing.T) {
 			name:        "non-matching closed PR number is ignored",
 			openPulls:   nil,
 			closedPulls: []github.PullRequest{{Number: 9, State: "closed", HeadRef: branch, BaseRef: "main", HeadSHA: "other"}},
+			pinnedPull:  &github.PullRequest{Number: 6, State: "closed", HeadRef: branch, BaseRef: "main", HeadSHA: headSHA},
 			wantTask:    workflow.TaskReviewing,
 			wantPRState: "open",
 		},
@@ -101,6 +103,9 @@ func TestPollOnceReconcilesClosedReviewingPullRequest(t *testing.T) {
 					"closed": tc.closedPulls,
 				},
 				comments: comments,
+			}
+			if tc.pinnedPull != nil {
+				client.pullsByNumber = map[int64]github.PullRequest{tc.pinnedPull.Number: *tc.pinnedPull}
 			}
 			engine := workflow.Engine{Store: store}
 			daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}

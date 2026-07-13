@@ -17,7 +17,13 @@ import (
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
 
-const defaultPollInterval = 30 * time.Second
+const (
+	defaultPollInterval = 30 * time.Second
+	// externalMergeReconcileLookupLimit bounds targeted GitHub reads per repo poll.
+	// A stale backlog drains over successive ticks without walking paginated closed
+	// PR history or allowing old task rows to dominate the daemon's API budget.
+	externalMergeReconcileLookupLimit = 20
+)
 
 // issueCommentPollOverlap is subtracted from the persisted last-seen cursor when
 // computing the `since` bound for the repo-wide issue-comment fetch (#566). It
@@ -89,6 +95,7 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 		return err
 	}
 	openBranches := map[string]struct{}{}
+	openPullNumbers := map[int64]struct{}{}
 	// Fetch the repo's review-job list AT MOST ONCE for this whole poll and share the
 	// snapshot across every open PR's review-job consumers, instead of re-running
 	// ListJobsByType("review") up to ~2× per PR (#619). Lazy: computed on the first
@@ -96,6 +103,7 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	reviewMemo := newReviewJobsMemo(d.Store)
 	for _, pull := range pulls {
 		openBranches[pull.HeadRef] = struct{}{}
+		openPullNumbers[pull.Number] = struct{}{}
 		changed, err := d.pullRequestChanged(ctx, pull, reviewMemo)
 		if err != nil {
 			return err
@@ -154,6 +162,9 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 			firstErr = err
 		}
 	}
+	if err := d.reconcileExternallyMergedTasks(ctx, openPullNumbers); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if err := d.retryClosedReadyToMerge(ctx, openBranches); err != nil && firstErr == nil {
 		firstErr = err
 	}
@@ -174,6 +185,152 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 		}
 	}
 	return firstErr
+}
+
+// reconcileExternallyMergedTasks advances PR lifecycle tasks whose PR was
+// merged outside Gitmoot. It uses targeted single-PR reads rather than a closed
+// list, so old wedged tasks are not hidden by GitHub pagination. Empty-branch
+// local review tasks are keyed by their durable review-pr-<number>-<hash> id.
+// Closed-unmerged responses are deliberately ignored here; the existing
+// reviewing/ready-to-merge paths retain their current semantics.
+func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumbers map[int64]struct{}) error {
+	if d.Workflow == nil {
+		return nil
+	}
+	tasks, err := d.Store.ListTasksByRepo(ctx, d.Repo.FullName())
+	if err != nil {
+		return err
+	}
+	type candidateGroup struct {
+		number int64
+		tasks  []db.Task
+	}
+	groups := make([]candidateGroup, 0)
+	groupByNumber := make(map[int64]int)
+	for _, task := range tasks {
+		if !externalMergeCandidateState(task.State) {
+			continue
+		}
+		branch := strings.TrimSpace(task.Branch)
+		var number int64
+		if branch == "" {
+			var ok bool
+			number, ok = reviewTaskPullRequestNumber(task.ID)
+			if !ok {
+				continue
+			}
+		} else {
+			stored, err := d.Store.GetPullRequestByRepoBranch(ctx, d.Repo.FullName(), branch)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					continue
+				}
+				return err
+			}
+			number = stored.Number
+		}
+		if number <= 0 {
+			continue
+		}
+		if _, open := openPullNumbers[number]; open {
+			continue
+		}
+		if index, ok := groupByNumber[number]; ok {
+			groups[index].tasks = append(groups[index].tasks, task)
+			continue
+		}
+		groupByNumber[number] = len(groups)
+		groups = append(groups, candidateGroup{number: number, tasks: []db.Task{task}})
+	}
+
+	var firstErr error
+	if len(groups) > externalMergeReconcileLookupLimit {
+		groups = groups[:externalMergeReconcileLookupLimit]
+	}
+	for _, group := range groups {
+		pull, err := d.GitHub.GetPullRequest(ctx, d.Repo, group.number)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if !pullRequestListedAsMerged(pull) {
+			continue
+		}
+		for _, task := range group.tasks {
+			branch := strings.TrimSpace(pull.HeadRef)
+			if branch == "" {
+				branch = strings.TrimSpace(task.Branch)
+			}
+			if branch == "" {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("reconcile externally merged PR #%d: head branch is empty", pull.Number)
+				}
+				continue
+			}
+			leadAgent := "github"
+			if lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), branch); err == nil {
+				if owner := strings.TrimSpace(lock.Owner); owner != "" {
+					leadAgent = owner
+				}
+			} else if !errors.Is(err, sql.ErrNoRows) {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			event := workflow.PullRequestEvent{
+				Repo:        d.Repo.FullName(),
+				Branch:      branch,
+				PullRequest: int(group.number),
+				HeadSHA:     pull.HeadSHA,
+				GoalID:      task.GoalID,
+				TaskID:      task.ID,
+				TaskTitle:   task.Title,
+				LeadAgent:   leadAgent,
+				Sender:      "github",
+			}
+			// Preserve the existing ready-to-merge path's merge-gate cleanup and
+			// outcome side effects. The closure handler below remains the durable
+			// backstop and also updates the local PR mirror for custom test gates.
+			if task.State == string(workflow.TaskReadyToMerge) && strings.TrimSpace(task.Branch) != "" && d.Workflow.MergeGate != nil {
+				if err := d.handleReadyToMergeWorkflow(ctx, pull); err != nil {
+					if firstErr == nil {
+						firstErr = err
+					}
+					continue
+				}
+			}
+			if err := d.Workflow.HandleReviewPullRequestClosed(ctx, event, true); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+func externalMergeCandidateState(state string) bool {
+	switch workflow.TaskState(strings.TrimSpace(state)) {
+	case workflow.TaskPullRequestOpen, workflow.TaskReviewing, workflow.TaskChangesRequested, workflow.TaskReadyToMerge:
+		return true
+	default:
+		return false
+	}
+}
+
+func reviewTaskPullRequestNumber(taskID string) (int64, bool) {
+	const prefix = "review-pr-"
+	remainder, ok := strings.CutPrefix(strings.TrimSpace(taskID), prefix)
+	if !ok {
+		return 0, false
+	}
+	numberText, suffix, ok := strings.Cut(remainder, "-")
+	if !ok || strings.TrimSpace(suffix) == "" {
+		return 0, false
+	}
+	number, err := strconv.ParseInt(numberText, 10, 64)
+	return number, err == nil && number > 0
 }
 
 // PollIssuesOnce is the opt-in issue-comment workflow (#389, bounded by #566). It

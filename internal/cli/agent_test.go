@@ -735,6 +735,12 @@ func TestPrepareLocalReviewDispatchRequestCreatesReviewWorktree(t *testing.T) {
 
 	store := openCLIJobStore(t, home)
 	defer store.Close()
+	// An implement task may already own the PR head branch. Review task creation
+	// must keep its branch empty rather than violate tasks(repo,branch)'s partial
+	// unique index or overwrite the canonical implement task.
+	if err := store.UpsertTask(ctx, db.Task{ID: "implement-12", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Implement PR #12", State: string(workflow.TaskImplementing), Branch: "feature/review"}); err != nil {
+		t.Fatalf("UpsertTask(implement): %v", err)
+	}
 	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir}
 	request, checkout, err := prepareLocalReviewDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
 		Home:         home,
@@ -771,6 +777,13 @@ func TestPrepareLocalReviewDispatchRequestCreatesReviewWorktree(t *testing.T) {
 	}
 	if task.WorktreePath != checkout || task.State != string(workflow.TaskReviewing) {
 		t.Fatalf("task = %+v, checkout=%q", task, checkout)
+	}
+	if task.ID == "implement-12" || task.Branch != "" {
+		t.Fatalf("review task = %+v, want distinct branchless review-pr task", task)
+	}
+	implementTask, err := store.GetTask(ctx, "implement-12")
+	if err != nil || implementTask.State != string(workflow.TaskImplementing) || implementTask.Branch != "feature/review" {
+		t.Fatalf("implement task changed = %+v, err=%v", implementTask, err)
 	}
 }
 
