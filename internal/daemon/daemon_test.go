@@ -1057,6 +1057,10 @@ func TestPollOnceRetriesClosedReadyToMergePullRequest(t *testing.T) {
 	if len(gate.requests) != 1 || gate.requests[0].PullRequest != 7 || gate.requests[0].HeadSHA != "abc123" {
 		t.Fatalf("merge gate requests = %+v", gate.requests)
 	}
+	stored, err := store.GetPullRequest(ctx, repo.FullName(), 7)
+	if err != nil || stored.State != "merged" {
+		t.Fatalf("stored pull request = %+v, err=%v; want merged", stored, err)
+	}
 }
 
 func TestPollOnceDoesNotOverwriteNoReviewerAutoMerge(t *testing.T) {
@@ -2549,6 +2553,7 @@ type fakeGitHub struct {
 	listPullRequestsErrs   []error
 	listIssuesCalls        int
 	recentClosedCalls      int
+	getPullRequestCalls    []int64
 }
 
 type postedComment struct {
@@ -2706,8 +2711,22 @@ func (f *fakeGitHub) UpdatePullRequestBranch(context.Context, github.UpdatePullR
 }
 
 func (f *fakeGitHub) GetPullRequest(_ context.Context, _ github.Repository, number int64) (github.PullRequest, error) {
+	f.getPullRequestCalls = append(f.getPullRequestCalls, number)
 	if f.pullsByNumber != nil {
 		if pull, ok := f.pullsByNumber[number]; ok {
+			return pull, nil
+		}
+	}
+	for _, state := range []string{"open", "closed"} {
+		pulls := f.pullsByState[state]
+		for _, pull := range pulls {
+			if pull.Number == number {
+				return pull, nil
+			}
+		}
+	}
+	for _, pull := range f.pulls {
+		if pull.Number == number {
 			return pull, nil
 		}
 	}
