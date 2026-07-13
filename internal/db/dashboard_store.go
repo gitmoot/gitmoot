@@ -50,8 +50,9 @@ type DashboardTerminalBucket struct {
 	OutputTokens int
 }
 
-// DashboardAutoWorkflow is one synthetic workflow group built from scalar job
-// columns. Repos is already sorted and de-duplicated by the SQL projection.
+// DashboardAutoWorkflow is one synthetic adhoc workflow group built from
+// scalar columns on unlabeled, non-pipeline jobs. Repos is already sorted and
+// de-duplicated by the SQL projection.
 type DashboardAutoWorkflow struct {
 	Summary WorkflowSummary
 	Repos   []string
@@ -201,8 +202,8 @@ func (s *Store) ListDashboardFleetCounts(ctx context.Context, since string) ([]D
 	return out, rows.Err()
 }
 
-// ListDashboardAutoWorkflows aggregates unlabeled jobs without reading payloads.
-// Pipeline stage membership wins; all other rows group under the assigned agent.
+// ListDashboardAutoWorkflows groups unlabeled, non-pipeline jobs by assigned
+// agent without reading payloads. Pipeline stage jobs are excluded entirely.
 func (s *Store) ListDashboardAutoWorkflows(ctx context.Context) ([]DashboardAutoWorkflow, error) {
 	rows, err := s.db.QueryContext(ctx, `WITH pipeline_jobs AS (
 		SELECT prs.job_id, MIN(pr.pipeline) AS pipeline
@@ -211,14 +212,11 @@ func (s *Store) ListDashboardAutoWorkflows(ctx context.Context) ([]DashboardAuto
 		WHERE prs.job_id != '' AND pr.pipeline != ''
 		GROUP BY prs.job_id
 	), auto_jobs AS (
-		SELECT CASE
-			WHEN pj.pipeline IS NOT NULL THEN 'pipeline/' || pj.pipeline
-			ELSE 'adhoc/' || j.agent
-		END AS workflow_id,
+		SELECT 'adhoc/' || j.agent AS workflow_id,
 		j.state, j.input_tokens, j.output_tokens, j.created_at, j.updated_at, j.repo
 		FROM jobs j
 		LEFT JOIN pipeline_jobs pj ON pj.job_id = j.id
-		WHERE j.workflow_id = '' AND (pj.pipeline IS NOT NULL OR j.agent != '')
+		WHERE j.workflow_id = '' AND pj.pipeline IS NULL AND j.agent != ''
 	)
 	SELECT workflow_id,
 		COUNT(*),

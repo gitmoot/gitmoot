@@ -92,6 +92,7 @@ func TestDashboardOverviewTasksAndAutoWorkflows(t *testing.T) {
 	seedJob("finished-cancelled", "beta", "cancelled", "release/cancelled", "acme/app", "Cancelled experiment", 4*time.Hour, 3*time.Hour, 19, 23)
 	seedJob("finished-old", "alpha", "succeeded", "archive/old", "acme/app", "Old completion", 26*time.Hour, 25*time.Hour, 101, 103)
 	seedJob("pipeline-job", "alpha", "succeeded", "", "acme/data", "Nightly ingest", 2*time.Hour, 90*time.Minute, 29, 31)
+	seedJob("explicit-pipeline-label", "alpha", "succeeded", "pipeline/manual", "acme/manual", "Manually labeled campaign", 28*time.Hour, 27*time.Hour, 37, 41)
 
 	blockedPayload := workflow.JobPayload{WorkflowID: "ops/recent", Repo: "acme/ops", TaskTitle: "Provision credentials"}
 	if err := store.CreateJobWithEvent(ctx,
@@ -192,13 +193,23 @@ func TestDashboardOverviewTasksAndAutoWorkflows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dashboardWorkflowEntries: %v", err)
 	}
-	pipelineGroup := workflowIndexEntryByLabel(t, workflows, "pipeline/nightly")
-	if !pipelineGroup.Auto || pipelineGroup.Counts.Jobs != 1 || pipelineGroup.Counts.Succeeded != 1 || !reflect.DeepEqual(pipelineGroup.Repos, []string{"acme/data"}) {
-		t.Fatalf("pipeline auto group = %+v", pipelineGroup)
+	workflowByLabel := make(map[string]dashboard.WorkflowIndexEntry, len(workflows))
+	for _, entry := range workflows {
+		workflowByLabel[entry.Label] = entry
 	}
-	adhocGroup := workflowIndexEntryByLabel(t, workflows, "adhoc/beta")
+	if _, ok := workflowByLabel["pipeline/nightly"]; ok {
+		t.Fatalf("pipeline stage leaked into pipeline auto group: %+v", workflows)
+	}
+	if _, ok := workflowByLabel["adhoc/alpha"]; ok {
+		t.Fatalf("pipeline stage was re-bucketed as adhoc/alpha: %+v", workflows)
+	}
+	adhocGroup := workflowByLabel["adhoc/beta"]
 	if !adhocGroup.Auto || adhocGroup.State != "active" || adhocGroup.Counts.Running != 1 {
 		t.Fatalf("adhoc auto group = %+v", adhocGroup)
+	}
+	explicitPipeline := workflowByLabel["pipeline/manual"]
+	if explicitPipeline.Auto || explicitPipeline.Counts.Jobs != 1 || explicitPipeline.Counts.Succeeded != 1 || !reflect.DeepEqual(explicitPipeline.Repos, []string{"acme/manual"}) {
+		t.Fatalf("explicit pipeline label = %+v", explicitPipeline)
 	}
 
 	second, err := dashboardOverview(ctx, store, now)

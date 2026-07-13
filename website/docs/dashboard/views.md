@@ -190,9 +190,10 @@ Workflows are labeled campaigns of related work driven by a coordinator: jobs
 dispatched with `--workflow <label>` plus the journal written with
 `gitmoot workflow note`. Labels may carry one namespace slash
 (`fable/dashboard-redesign`) — by convention the coordinator's herdr pane name
-namespaces the campaign. Unlabeled pipeline stages and other runs are also
-summarized without payload scans as synthetic `pipeline/<name>` and
-`adhoc/<agent>` entries; these are marked unattended in the index.
+namespaces the campaign. Unlabeled non-pipeline runs are summarized without
+payload scans as synthetic `adhoc/<agent>` entries and marked unattended in the
+index. Pipeline stage jobs stay on the Pipelines page; an explicitly labeled
+workflow still appears here even when its label begins with `pipeline/`.
 
 The **index** groups every known workflow by derived lifecycle: **stalled**
 pinned on top ("needs a look"), then **active**, then recently **settled**.

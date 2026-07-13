@@ -47,8 +47,8 @@ func deriveDashboardWorkflowState(now time.Time, activity dashboardWorkflowActiv
 }
 
 // Workflows returns one deterministic index row for every explicit workflow
-// label plus scalar-only pipeline/<name> and adhoc/<agent> groups for unlabeled
-// runs. Auto groups never decode the global job payload corpus.
+// label plus scalar-only adhoc/<agent> groups for unlabeled non-pipeline runs.
+// Auto groups never decode the global job payload corpus.
 func (d *webDataSource) Workflows(ctx context.Context) ([]dashboard.WorkflowIndexEntry, error) {
 	out := []dashboard.WorkflowIndexEntry{}
 	now := time.Now().UTC()
