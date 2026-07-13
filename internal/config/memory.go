@@ -27,6 +27,11 @@ const (
 	DefaultMemoryClusterFanout          = 12
 	DefaultMemoryClusterFanoutKeep      = 9
 	DefaultMemoryClusterDepthCap        = 4
+	DefaultMemoryHarvestRuntime         = runtime.CodexRuntime
+	DefaultMemoryHarvestModel           = ""
+	DefaultMemoryHarvestEffort          = "low"
+	DefaultMemoryHarvestMaxPerJob       = 2
+	DefaultMemoryHarvestMaxJobsPerSweep = 5
 	// DefaultMemoryDistillMaxPerJob caps how many pending observations the
 	// deterministic distill-at-terminal producers (#737 P4.1) may stage per job.
 	// It is only consulted when distill_at_terminal or distill_successes is enabled.
@@ -47,6 +52,11 @@ type MemorySettings struct {
 	// governs; an operator can flip this to turn the feature off box-wide without
 	// editing every agent block.
 	Disabled bool
+	// DefaultEnroll makes manual `agent start` enroll newly-created agents unless
+	// the command explicitly supplies --memory=false. It never affects managed,
+	// pipeline, or ephemeral construction paths because they do not call agent
+	// start. Default false preserves the existing opt-in behavior.
+	DefaultEnroll bool
 	// TokenBudget caps the total estimated tokens of the injected learnings block.
 	TokenBudget int
 	// MaxEntries caps how many confirmed memories are considered for injection.
@@ -80,6 +90,14 @@ type MemorySettings struct {
 	// pending human gate. Shared memory remains explicit through confirm/promote
 	// commands even when this is enabled.
 	IngestAutoConfirm bool
+	// HarvestEnabled gates the daemon-owned post-terminal insight sweep. Harvest
+	// stages low-trust shared observations only; it never confirms memory.
+	HarvestEnabled         bool
+	HarvestRuntime         string
+	HarvestModel           string
+	HarvestEffort          string
+	HarvestMaxPerJob       int
+	HarvestMaxJobsPerSweep int
 	// GroomSplitLLM enables the Phase-2 one-shot LLM boundary chooser after the
 	// deterministic lossless pass. Runtime/model select the isolated one-shot
 	// adapter; MaxPerRun caps billable candidate calls.
@@ -104,6 +122,7 @@ type MemorySettings struct {
 func DefaultMemorySettings() MemorySettings {
 	return MemorySettings{
 		Disabled:               false,
+		DefaultEnroll:          false,
 		TokenBudget:            DefaultMemoryTokenBudget,
 		MaxEntries:             DefaultMemoryMaxEntries,
 		DistillAtTerminal:      false,
@@ -111,6 +130,12 @@ func DefaultMemorySettings() MemorySettings {
 		DistillMaxPerJob:       DefaultMemoryDistillMaxPerJob,
 		DistillAllJobs:         false,
 		IngestAutoConfirm:      false,
+		HarvestEnabled:         false,
+		HarvestRuntime:         DefaultMemoryHarvestRuntime,
+		HarvestModel:           DefaultMemoryHarvestModel,
+		HarvestEffort:          DefaultMemoryHarvestEffort,
+		HarvestMaxPerJob:       DefaultMemoryHarvestMaxPerJob,
+		HarvestMaxJobsPerSweep: DefaultMemoryHarvestMaxJobsPerSweep,
 		GroomSplitLLM:          DefaultMemoryGroomSplitLLM,
 		GroomSplitLLMRuntime:   DefaultMemoryGroomSplitLLMRuntime,
 		GroomSplitLLMModel:     DefaultMemoryGroomSplitLLMModel,
@@ -161,6 +186,12 @@ func LoadMemorySettings(paths Paths) (MemorySettings, error) {
 				return MemorySettings{}, fmt.Errorf("parse [memory].disabled: %w", err)
 			}
 			settings.Disabled = parsed
+		case "default_enroll":
+			parsed, err := parseConfigBool(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].default_enroll: %w", err)
+			}
+			settings.DefaultEnroll = parsed
 		case "token_budget":
 			parsed, err := strconv.Atoi(value)
 			if err != nil {
@@ -203,6 +234,42 @@ func LoadMemorySettings(paths Paths) (MemorySettings, error) {
 				return MemorySettings{}, fmt.Errorf("parse [memory].ingest_auto_confirm: %w", err)
 			}
 			settings.IngestAutoConfirm = parsed
+		case "harvest_enabled":
+			parsed, err := parseConfigBool(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].harvest_enabled: %w", err)
+			}
+			settings.HarvestEnabled = parsed
+		case "harvest_runtime":
+			parsed, err := parseConfigString(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].harvest_runtime: %w", err)
+			}
+			settings.HarvestRuntime = strings.TrimSpace(parsed)
+		case "harvest_model":
+			parsed, err := parseConfigString(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].harvest_model: %w", err)
+			}
+			settings.HarvestModel = strings.TrimSpace(parsed)
+		case "harvest_effort":
+			parsed, err := parseConfigString(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].harvest_effort: %w", err)
+			}
+			settings.HarvestEffort = strings.TrimSpace(parsed)
+		case "harvest_max_per_job":
+			parsed, err := strconv.Atoi(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].harvest_max_per_job: %w", err)
+			}
+			settings.HarvestMaxPerJob = parsed
+		case "harvest_max_jobs_per_sweep":
+			parsed, err := strconv.Atoi(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].harvest_max_jobs_per_sweep: %w", err)
+			}
+			settings.HarvestMaxJobsPerSweep = parsed
 		case "groom_split_llm":
 			parsed, err := parseConfigBool(value)
 			if err != nil {
@@ -277,6 +344,18 @@ func validateMemorySettings(s MemorySettings) error {
 	}
 	if s.DistillMaxPerJob < 0 {
 		return fmt.Errorf("memory.distill_max_per_job must be >= 0, got %d", s.DistillMaxPerJob)
+	}
+	if !configMemoryLLMRuntimeSupported(s.HarvestRuntime) {
+		return fmt.Errorf("memory.harvest_runtime must be one of codex, claude, kimi, got %q", s.HarvestRuntime)
+	}
+	if strings.TrimSpace(s.HarvestEffort) == "" {
+		return fmt.Errorf("memory.harvest_effort must not be empty")
+	}
+	if s.HarvestMaxPerJob < 1 {
+		return fmt.Errorf("memory.harvest_max_per_job must be >= 1, got %d", s.HarvestMaxPerJob)
+	}
+	if s.HarvestMaxJobsPerSweep < 1 {
+		return fmt.Errorf("memory.harvest_max_jobs_per_sweep must be >= 1, got %d", s.HarvestMaxJobsPerSweep)
 	}
 	if !configMemoryLLMRuntimeSupported(s.GroomSplitLLMRuntime) {
 		return fmt.Errorf("memory.groom_split_llm_runtime must be one of codex, claude, kimi, got %q", s.GroomSplitLLMRuntime)

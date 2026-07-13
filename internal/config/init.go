@@ -145,12 +145,18 @@ path = ""
 # agent's private pool only; the shared pool is always explicit through confirm
 # --to-shared or promote --to-shared. distill_max_per_job (default 3, >= 0) caps
 # distilled rows per job; distill_all_jobs (default false) widens distill past
-# enrolled agents to every job.
-# All [memory] keys are read PER TICK; no daemon restart is needed to flip them.
+# enrolled agents to every job. default_enroll (default false) makes manual
+# agent start enroll new config-safe agents unless --memory=false is explicit.
+# harvest_enabled (default false) runs a durable one-minute post-terminal sweep:
+# it stages bounded low-trust shared/repo observations for human review, never
+# confirmed memory, and never honors ingest_auto_confirm.
+# Daemon-consumed [memory] keys are hot-read without restart; default_enroll is
+# read on each manual agent start.
 # Inspect the store read-only with gitmoot memory list; see the "Agent Persistent
 # Memory" concepts page and CLI.md for the full model.
 # [memory]
 # disabled = false
+# default_enroll = false
 # token_budget = 1500
 # max_entries = 15
 # distill_at_terminal = false
@@ -158,6 +164,12 @@ path = ""
 # distill_max_per_job = 3
 # distill_all_jobs = false
 # ingest_auto_confirm = false
+# harvest_enabled = false
+# harvest_runtime = "codex"
+# harvest_model = "" # empty uses the runtime default
+# harvest_effort = "low"
+# harvest_max_per_job = 2
+# harvest_max_jobs_per_sweep = 5
 # groom_split_llm = false
 # groom_split_llm_runtime = "codex"
 # groom_split_llm_model = "" # empty uses the runtime default

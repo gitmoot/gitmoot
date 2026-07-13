@@ -78,6 +78,7 @@ memory = true          # enroll this agent (default off)
 
 [memory]
 disabled = false            # global kill switch (overrides every enrollment)
+default_enroll = false      # enroll agents created by manual agent start unless explicitly overridden
 token_budget = 1500         # cap on injected block size (estimated tokens)
 max_entries = 15            # cap on confirmed rows considered for injection
 distill_at_terminal = false # stage deterministic failure signal at terminal (P4.1)
@@ -85,6 +86,12 @@ distill_successes = false   # stage deterministic success observations
 distill_max_per_job = 3     # hard cap on distilled observations per job
 distill_all_jobs = false    # true → distill every job, not only enrolled agents
 ingest_auto_confirm = false # true → ingest/chat remember confirm to private only
+harvest_enabled = false     # sweep new terminal results for durable insights
+harvest_runtime = "codex"   # fresh read-only one-shot classifier runtime
+harvest_model = ""          # empty uses the runtime default
+harvest_effort = "low"
+harvest_max_per_job = 2
+harvest_max_jobs_per_sweep = 5
 groom_split_llm = false     # default-off LLM boundary chooser after deterministic splitting
 groom_split_llm_runtime = "codex"
 groom_split_llm_model = "" # empty uses the runtime default
@@ -93,8 +100,33 @@ groom_stale = true          # detect expired operational-status batons
 groom_stale_age = "336h"   # newest content date must be older than 14d
 ```
 
-Every `[memory]` key is read **per tick**, so flipping `distill_at_terminal`, `distill_successes`
-(or any knob) takes effect on the next job with **no daemon restart**.
+Daemon-consumed `[memory]` keys are hot-read with **no daemon restart**;
+`default_enroll` is read on each manual `agent start`. Flipping
+`distill_at_terminal` or `distill_successes` takes effect on the next job.
+
+`gitmoot agent start NAME --memory[=true|false]` explicitly chooses enrollment
+for a newly started agent. If the flag is omitted, `default_enroll` supplies the
+choice; explicit false overrides a true default. The default applies only to
+manual agent starts, not hidden pipeline runners or ephemeral workers. Every
+successful start prints the effective memory state, including when enrollment
+is on but the global `disabled` switch prevents use.
+
+### Insight harvest
+
+Insight harvest is an opt-in, durable daemon sweep over newly persisted terminal
+job results. The first enable records the current high-water mark rather than
+silently backfilling old history. Cheap safety filters and exact-fingerprint
+dedup run before any model call. Explicit result `learnings` bypass the
+classifier but still pass the same safety and dedup checks; otherwise only the
+result summary and findings are presented as untrusted data to a fresh read-only
+one-shot classifier.
+
+Candidates are staged as low-trust, repo-scoped observations in the shared pool,
+with the executing agent retained as author and the source job recorded. They
+remain human-gated pending observations: `harvest:` provenance is never eligible
+for auto-confirmation, even when `ingest_auto_confirm = true`. Durable receipts
+prevent repeats; an attempt with an unknowable provider outcome is marked
+uncertain and surfaced in daemon status rather than retried automatically.
 
 ### Distill-at-terminal
 

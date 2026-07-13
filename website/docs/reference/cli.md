@@ -377,6 +377,13 @@ gitmoot agent start reviewer \
   --start-daemon
 ```
 
+`agent start` accepts `--memory[=true|false]`. When omitted,
+`[memory].default_enroll` controls enrollment; explicit `--memory=false`
+overrides a true default. This applies only to agents created by manual
+`agent start`. A successful start always prints `memory: on`, `memory: off
+(enable with --memory)`, or `memory: enrolled but globally disabled by
+[memory].disabled`.
+
 `agent start`, `agent subscribe`, and `agent type set` accept an optional
 `--model <name>` flag that sets the agent's default runtime model. It is a
 free-form, runtime-scoped string (a Codex, Claude Code, or Kimi Code model name)
@@ -1485,11 +1492,16 @@ validation for final promotion decisions on fresh items.
 
 Agent persistent memory is **off by default** and enrolled per agent
 (`[agents.<name>].memory = true`), with optional `[memory]` knobs (`disabled`,
+`default_enroll`,
 `token_budget`, `max_entries`, and the distill-at-terminal knobs
 `distill_at_terminal`, `distill_successes`, `distill_max_per_job`,
 `distill_all_jobs`, plus the default-off groom LLM knobs
 `groom_split_llm`, `groom_split_llm_runtime`, `groom_split_llm_model`, and
-`groom_split_llm_max_per_run`. All are read per tick, with no restart. See
+`groom_split_llm_max_per_run`, and the default-off insight-harvest knobs
+`harvest_enabled`, `harvest_runtime`, `harvest_model`, `harvest_effort`,
+`harvest_max_per_job`, and `harvest_max_jobs_per_sweep`. Daemon-consumed knobs
+are hot-read with no restart; `default_enroll` is read by each manual
+`agent start`. See
 [Agent Persistent Memory](../concepts/agent-memory.md) for the full model. The
 inspection commands are read-only; `ingest` and `confirm` write behind a human
 gate:

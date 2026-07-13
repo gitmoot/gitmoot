@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -2497,11 +2498,12 @@ func rootIDFromPayload(payload string) string {
 }
 
 type jobPayloadProjection struct {
-	WorkflowID             string `json:"workflow_id"`
-	Repo                   string `json:"repo"`
-	PullRequest            int    `json:"pull_request"`
-	BlockerRetryAt         string `json:"blocker_retry_at"`
-	BlockerSuggestedAction string `json:"blocker_suggested_action"`
+	WorkflowID             string          `json:"workflow_id"`
+	Repo                   string          `json:"repo"`
+	PullRequest            int             `json:"pull_request"`
+	BlockerRetryAt         string          `json:"blocker_retry_at"`
+	BlockerSuggestedAction string          `json:"blocker_suggested_action"`
+	Result                 json.RawMessage `json:"result"`
 }
 
 func jobProjectionFromPayload(payload string) jobPayloadProjection {
@@ -2512,15 +2514,30 @@ func jobProjectionFromPayload(payload string) jobPayloadProjection {
 	return p
 }
 
+func jobResultHashFromPayload(payload string) string {
+	projection := jobProjectionFromPayload(payload)
+	raw := bytes.TrimSpace(projection.Result)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return ""
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, raw); err == nil {
+		raw = compact.Bytes()
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
 func (s *Store) CreateJob(ctx context.Context, job Job) error {
 	// root_id is a denormalized index of the engine's rootJobID() rule (#420):
 	// bind the SAME COALESCE(NULLIF(?,''), ?) to (payload.RootJobID, job.ID) so
 	// the invariant — payload root when set, else self-root — holds regardless of
 	// caller. payload.RootJobID stays the value source of truth.
 	projection := jobProjectionFromPayload(job.Payload)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+	_, err := s.db.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
 		job.ID, job.Agent, job.Type, job.State, job.Payload,
+		jobResultHashFromPayload(job.Payload),
 		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy,
 		rootIDFromPayload(job.Payload), job.ID, projection.WorkflowID, projection.Repo, projection.PullRequest,
 		projection.BlockerRetryAt, projection.BlockerSuggestedAction)
@@ -2537,9 +2554,10 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent)
 	// See CreateJob: same COALESCE(NULLIF(?,''), ?) bound to (payload.RootJobID,
 	// job.ID) denormalizes the rootJobID() rule onto the indexed root_id column.
 	projection := jobProjectionFromPayload(job.Payload)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
 		job.ID, job.Agent, job.Type, job.State, job.Payload,
+		jobResultHashFromPayload(job.Payload),
 		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy,
 		rootIDFromPayload(job.Payload), job.ID, projection.WorkflowID, projection.Repo, projection.PullRequest,
 		projection.BlockerRetryAt, projection.BlockerSuggestedAction); err != nil {
@@ -2570,9 +2588,10 @@ func (s *Store) CreateExternallyDrivenJobWithEvent(ctx context.Context, job Job,
 	defer tx.Rollback()
 
 	projection := jobProjectionFromPayload(job.Payload)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, externally_driven, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)`,
+	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, externally_driven, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)`,
 		job.ID, job.Agent, job.Type, job.State, job.Payload,
+		jobResultHashFromPayload(job.Payload),
 		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy,
 		rootIDFromPayload(job.Payload), job.ID, projection.WorkflowID, projection.Repo, projection.PullRequest,
 		projection.BlockerRetryAt, projection.BlockerSuggestedAction); err != nil {
@@ -3047,8 +3066,8 @@ func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id strin
 	defer tx.Rollback()
 
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
-		to, payload, projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
+		to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
 		projection.BlockerSuggestedAction, id, from, projection.WorkflowID)
 	if err != nil {
 		return false, err
@@ -3093,8 +3112,8 @@ func (s *Store) DelegateQueuedJob(ctx context.Context, id string, fromAgent stri
 	// original payload's RootJobID) remains correct. A re-delegation never carries
 	// a new RootJobID, so re-binding the COALESCE would only re-derive the same id.
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET agent = ?, payload = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND agent = ? AND state = ? AND workflow_id = ?`,
-		strings.TrimSpace(toAgent), payload, projection.Repo, projection.PullRequest,
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET agent = ?, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND agent = ? AND state = ? AND workflow_id = ?`,
+		strings.TrimSpace(toAgent), payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest,
 		projection.BlockerRetryAt, projection.BlockerSuggestedAction, id, strings.TrimSpace(fromAgent), "queued", projection.WorkflowID)
 	if err != nil {
 		return false, err
@@ -3125,8 +3144,8 @@ func (s *Store) UpdateJobPayload(ctx context.Context, id string, payload string)
 	}
 	defer tx.Rollback()
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET payload = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND workflow_id = ?`,
-		payload, projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND workflow_id = ?`,
+		payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
 		projection.BlockerSuggestedAction, id, projection.WorkflowID)
 	if err != nil {
 		return err
@@ -8706,6 +8725,40 @@ CREATE TABLE workflow_meta (
 	session_id TEXT NOT NULL DEFAULT '',
 	workdir TEXT NOT NULL DEFAULT '',
 	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+	`,
+	// #884 durable post-terminal insight harvest. result_hash denormalizes the
+	// persisted payload.result fingerprint so the home-scoped daemon sweep can use
+	// a limited receipt anti-join instead of ListJobs. The partial index contains
+	// only settled states (blocked included; it may later produce a new result hash
+	// on resume). Existing rows keep result_hash='' and the first enabled sweep
+	// records the current row/time high-water mark, so enabling never backfills old
+	// history silently. Receipts are append-only by (job_id,result_hash); state
+	// transitions update only their processing metadata.
+	`
+ALTER TABLE jobs ADD COLUMN result_hash TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_jobs_memory_harvest_terminal ON jobs(updated_at, id)
+	WHERE state IN ('succeeded', 'failed', 'blocked', 'cancelled');
+
+CREATE TABLE memory_harvest_runs (
+	job_id TEXT NOT NULL,
+	result_hash TEXT NOT NULL,
+	state TEXT NOT NULL CHECK(state IN ('claimed', 'started', 'done', 'skipped', 'uncertain')),
+	claimed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	started_at TEXT NOT NULL DEFAULT '',
+	finished_at TEXT NOT NULL DEFAULT '',
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	candidate_count INTEGER NOT NULL DEFAULT 0,
+	detail TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY(job_id, result_hash)
+);
+CREATE INDEX idx_memory_harvest_runs_state_updated ON memory_harvest_runs(state, updated_at);
+
+CREATE TABLE memory_harvest_state (
+	singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+	high_water_rowid INTEGER NOT NULL DEFAULT 0,
+	high_water_updated_at TEXT NOT NULL DEFAULT '',
+	initialized_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 	`,
 }

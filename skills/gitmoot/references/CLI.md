@@ -497,6 +497,14 @@ gitmoot agent start reviewer \
   --start-daemon
 ```
 
+`agent start` also accepts the tri-state `--memory[=true|false]` flag. When the
+flag is omitted, `[memory].default_enroll` decides whether the newly registered
+agent is enrolled; explicit `--memory=false` overrides a true default. This
+default applies only to manual `agent start` construction, not hidden pipeline
+runners or ephemeral workers. Every successful start prints one memory status
+line: `memory: on`, `memory: off (enable with --memory)`, or `memory: enrolled
+but globally disabled by [memory].disabled`.
+
 `--runtime` accepts `codex`, `claude`, `kimi`, or `kimi-cli`. `kimi` is the
 current Kimi Code CLI (the default choice); `kimi-cli` is the opt-in legacy
 Kimi CLI adapter (#546) — the two are the same runtime *family* for
@@ -1830,6 +1838,7 @@ memory = true          # enroll this agent (default off)
 
 [memory]
 disabled = false            # global kill switch (overrides every enrollment)
+default_enroll = false      # enroll agents created by manual agent start unless explicitly overridden
 token_budget = 1500         # cap on injected block size (estimated tokens)
 max_entries = 15            # cap on confirmed rows considered for injection
 distill_at_terminal = false # stage deterministic failure signal at job terminal (#737 P4.1)
@@ -1837,6 +1846,12 @@ distill_successes = false   # stage deterministic success observations (#781)
 distill_max_per_job = 3     # hard cap on distilled observations per job
 distill_all_jobs = false    # when true, distill runs for every job, not only enrolled agents
 ingest_auto_confirm = false # when true, ingest/chat remember confirm to the authoring agent private pool only
+harvest_enabled = false     # sweep new terminal results for durable insights
+harvest_runtime = "codex"   # read-only one-shot classifier runtime
+harvest_model = ""          # empty uses the runtime default
+harvest_effort = "low"
+harvest_max_per_job = 2     # maximum pending observations staged from one job
+harvest_max_jobs_per_sweep = 5 # maximum jobs classified per one-minute sweep
 groom_split_llm = false     # default-off LLM boundary chooser after deterministic splitting
 groom_split_llm_runtime = "codex"
 groom_split_llm_model = "" # empty uses the runtime default
@@ -1845,8 +1860,27 @@ groom_stale = true          # detect expired operational-status batons
 groom_stale_age = "336h"   # newest content date must be older than 14d
 ```
 
-All `[memory]` keys are read **per tick**. Flipping `distill_at_terminal`,
-`distill_successes` (or any knob) takes effect on the next job with **no daemon restart**.
+Daemon-consumed `[memory]` keys are hot-read without restart; `default_enroll`
+is read on each manual `agent start`. Flipping `distill_at_terminal` or
+`distill_successes` takes effect on the next job.
+
+### Insight harvest
+
+`harvest_enabled` starts a durable daemon sweep over newly persisted terminal
+job results. Enabling it initializes a high-water mark at the current job
+history, so it does not silently backfill older results. Cheap filters and
+exact-fingerprint dedup run before any model call; explicit result `learnings`
+pass through the same safety filters without classification. Other eligible
+results are projected to summary and findings only, then sent as untrusted data
+to a fresh read-only one-shot classifier.
+
+Harvested insights are staged as low-trust, repo-scoped observations in the
+shared owner pool, with the executing agent retained as author. They remain
+pending for human review through `memory confirm`; harvest provenance is never
+eligible for automatic confirmation, even when `ingest_auto_confirm = true`.
+Receipts make completed and skipped jobs idempotent. A classifier attempt whose
+outcome cannot be proved is marked uncertain and surfaced in daemon status
+instead of being retried automatically.
 
 An agent returns durable facts via the optional top-level `learnings` field in
 `gitmoot_result` — each entry is `{key, scope ("repo"|"general"), content}`.

@@ -13,6 +13,7 @@ import (
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
+	"github.com/jerryfane/gitmoot/internal/memory"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
@@ -79,6 +80,20 @@ disabled = true
 [agents.audit]
 runtime = "shell"
 memory = true
+`
+
+const harvestMemoryConfig = `
+[memory]
+harvest_enabled = true
+harvest_runtime = "codex"
+harvest_model = ""
+harvest_effort = "low"
+harvest_max_per_job = 2
+harvest_max_jobs_per_sweep = 5
+ingest_auto_confirm = true
+
+[agents.audit]
+runtime = "shell"
 `
 
 // memoryLifecycleResult is a plain approved gitmoot_result the shell fixture emits
@@ -295,6 +310,107 @@ func TestMemoryObservationLifecycleFullChainE2E(t *testing.T) {
 	pendingList := memoryListJSON(t, home, "--pending")
 	if len(pendingList) != 1 || pendingList[0].Tier != "pending" || pendingList[0].Key != "integration-speed" {
 		t.Fatalf("memory list --pending = %+v, want exactly the integration-speed observation", pendingList)
+	}
+}
+
+// TestMemoryInsightHarvestLifecycleE2E drives a shell job through the real
+// daemon worker, then runs the daemon-owned durable sweep with a deterministic
+// one-shot classifier. It pins the shared/pending firewall, receipt idempotency,
+// and the no-classifier learnings pass-through path.
+func TestMemoryInsightHarvestLifecycleE2E(t *testing.T) {
+	ctx := context.Background()
+	home, paths, store := memoryLifecycleHome(t, harvestMemoryConfig)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	initialized, err := store.InitializeMemoryHarvestState(ctx)
+	if err != nil || !initialized {
+		t.Fatalf("initialize harvest high-water = %v err=%v", initialized, err)
+	}
+
+	classifiedResult := `{"gitmoot_result":{"decision":"approved","summary":"completed package-import investigation","findings":["The importer normalizes dependency version prefixes before comparing packages."],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+	learningsResult := `{"gitmoot_result":{"decision":"approved","summary":"captured a durable runtime fact","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[],"learnings":[{"key":"shell-env","scope":"repo","content":"Shell adapter jobs receive trigger inputs as exact KEY=value environment entries."}]}}`
+	script := fmt.Sprintf(`case "$1" in
+  *LEARNING*) printf '%%s' '%s' ;;
+  *) printf '%%s' '%s' ;;
+esac`, learningsResult, classifiedResult)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, script, []string{"ask"}, "owner/repo")
+	worker := memoryLifecycleWorker(store, home, checkout)
+
+	previousDeliver := memoryHarvestLLMDeliver
+	classifierCalls := 0
+	memoryHarvestLLMDeliver = func(_ context.Context, agent runtime.Agent, prompt string) (string, error) {
+		classifierCalls++
+		if !agent.SingleUseSession || agent.RuntimeRef != "" || agent.AutonomyPolicy != runtime.AutonomyPolicyReadOnly {
+			t.Fatalf("classifier agent is not fresh/read-only: %+v", agent)
+		}
+		if !strings.Contains(prompt, "UNTRUSTED DATA") || !strings.Contains(prompt, "<untrusted_job_result>") {
+			t.Fatalf("classifier prompt missing untrusted-data fence:\n%s", prompt)
+		}
+		return `{"candidates":[{"content":"Activepieces imports remove tilde and caret semver prefixes before package comparison."}]}`, nil
+	}
+	t.Cleanup(func() { memoryHarvestLLMDeliver = previousDeliver })
+	settings, err := config.LoadMemorySettings(paths)
+	if err != nil {
+		t.Fatalf("LoadMemorySettings: %v", err)
+	}
+
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "harvest-classified", Agent: "audit", Action: "ask", Repo: "owner/repo",
+		Branch: "main", Instructions: "investigate package import normalization",
+	})
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
+		t.Fatalf("dispatch classified job: %v", err)
+	}
+	result, err := sweepMemoryHarvest(ctx, home, store, settings, io.Discard)
+	if err != nil || result.Staged != 1 || classifierCalls != 1 {
+		t.Fatalf("first sweep = %+v calls=%d err=%v", result, classifierCalls, err)
+	}
+	observations, err := store.ListMemoryObservations(ctx, "", "owner/repo")
+	if err != nil || len(observations) != 1 {
+		t.Fatalf("harvest observations = %+v err=%v", observations, err)
+	}
+	obs := observations[0]
+	if obs.Owner.Kind != memory.OwnerKindShared || obs.Owner.Ref != memory.SharedOwnerRef || obs.AuthorRef != "audit" ||
+		obs.Scope != memory.ScopeRepo || obs.Repo != "owner/repo" || obs.TrustMark != memory.TrustLow ||
+		!strings.HasPrefix(obs.Provenance, "harvest:") || obs.SourceJob != "harvest-classified" {
+		t.Fatalf("harvest observation metadata = %+v", obs)
+	}
+	confirmed, err := store.ListConfirmedMemories(ctx, "", "")
+	if err != nil || len(confirmed) != 0 {
+		t.Fatalf("harvest crossed auto-confirm firewall: %+v err=%v", confirmed, err)
+	}
+
+	// Receipt anti-join: an immediate second sweep sees no work and spends no
+	// classifier call or observation row.
+	second, err := sweepMemoryHarvest(ctx, home, store, settings, io.Discard)
+	if err != nil || second.Staged != 0 || classifierCalls != 1 {
+		t.Fatalf("second sweep = %+v calls=%d err=%v", second, classifierCalls, err)
+	}
+	observations, _ = store.ListMemoryObservations(ctx, "", "owner/repo")
+	if len(observations) != 1 {
+		t.Fatalf("second sweep duplicated rows: %+v", observations)
+	}
+
+	// Returned learnings bypass the classifier but still pass prefilter, exact
+	// dedup, shared staging, and the same receipt transaction.
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "harvest-learning", Agent: "audit", Action: "ask", Repo: "owner/repo",
+		Branch: "main", Instructions: "record the runtime behavior LEARNING",
+	})
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
+		t.Fatalf("dispatch learnings job: %v", err)
+	}
+	third, err := sweepMemoryHarvest(ctx, home, store, settings, io.Discard)
+	if err != nil || third.Staged != 1 || third.LearningsJobs != 1 || classifierCalls != 1 {
+		t.Fatalf("learnings sweep = %+v calls=%d err=%v", third, classifierCalls, err)
+	}
+	observations, _ = store.ListMemoryObservations(ctx, "", "owner/repo")
+	if len(observations) != 2 {
+		t.Fatalf("learnings pass-through rows = %+v", observations)
+	}
+	confirmed, _ = store.ListConfirmedMemories(ctx, "", "")
+	if len(confirmed) != 0 {
+		t.Fatalf("learnings harvest auto-confirmed rows: %+v", confirmed)
 	}
 }
 

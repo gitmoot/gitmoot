@@ -280,7 +280,7 @@ func ingestMemorySource(ctx context.Context, store *db.Store, options memoryInge
 }
 
 func autoConfirmObservationIfEnabled(ctx context.Context, store *db.Store, obs db.MemoryObservation, enabled bool) (confirmed bool, skippedRetired bool, err error) {
-	if !enabled {
+	if !enabled || !autoConfirmEligibleProvenance(obs.Provenance) {
 		return false, false, nil
 	}
 	author := observationAuthorRef(obs)
@@ -311,6 +311,19 @@ func autoConfirmObservationIfEnabled(ctx context.Context, store *db.Store, obs d
 		ID: id, Owner: owner, Repo: obs.Repo, Scope: obs.Scope, Key: obs.Key, Content: obs.Content,
 	})
 	return true, false, nil
+}
+
+// autoConfirmEligibleProvenance is deliberately fail-closed. Only the three
+// existing human/operator-authored ingestion families may cross the optional
+// auto-confirm boundary; harvest, distill, and every future producer remain
+// pending until this allowlist is explicitly extended.
+func autoConfirmEligibleProvenance(provenance string) bool {
+	for _, prefix := range []string{"ingest:", "chat:", "workflow:"} {
+		if strings.HasPrefix(strings.TrimSpace(provenance), prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 type memoryIngestSweepSourceResult struct {

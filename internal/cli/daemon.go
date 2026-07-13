@@ -720,10 +720,43 @@ func runDaemonStatus(args []string, stdout, stderr io.Writer) int {
 	writeLine(stdout, "%s", daemonAdmissionLine(paths))
 	writeLine(stdout, "%s", daemonGitHubLimiterLine(paths))
 	writeLine(stdout, "%s", daemonPreflightFailureLine(*home))
+	if line := daemonMemoryHarvestLine(paths, *home); line != "" {
+		writeLine(stdout, "%s", line)
+	}
 	for _, line := range daemonHeartbeatLines(paths, *home) {
 		writeLine(stdout, "%s", line)
 	}
 	return 0
+}
+
+// daemonMemoryHarvestLine surfaces the fail-closed uncertain-receipt count. It
+// stays absent for installations that never enable harvest and have no uncertain
+// history, preserving the default status surface.
+func daemonMemoryHarvestLine(paths config.Paths, home string) string {
+	settings, err := config.LoadMemorySettings(paths)
+	if err != nil {
+		return "memory harvest: unavailable"
+	}
+	uncertain := 0
+	active := settings.HarvestEnabled && !settings.Disabled
+	if err := withStore(home, func(store *db.Store) error {
+		var err error
+		uncertain, err = store.CountMemoryHarvestRunsByState(context.Background(), db.MemoryHarvestUncertain)
+		return err
+	}); err != nil {
+		if active {
+			return "memory harvest: unavailable"
+		}
+		return ""
+	}
+	if !active && uncertain == 0 {
+		return ""
+	}
+	state := "off"
+	if active {
+		state = "enabled"
+	}
+	return fmt.Sprintf("memory harvest: %s, uncertain receipts: %d", state, uncertain)
 }
 
 // daemonHeartbeatLines surfaces the configured heartbeat schedules and their
@@ -1965,6 +1998,10 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 				w.UsePool = usePool
 				return runEnabledRepoWorkerTicksTracked(ctx, store, w, workers, rootFilter, stdout, now, checkoutLocks, tracker)
 			})
+			// #884 home-scoped post-terminal insight harvest. This owns one
+			// sequential classifier lane for the daemon process and is deliberately
+			// outside daemonWorkflowEngine, which is rebuilt per repo/tick.
+			startMemoryHarvestLoop(ctx, paths, home, store, stdout)
 			startCockpitReconcileLoop(ctx, store, paths.Home, stdout)
 		}
 		// Heartbeat schedules (#533) reuse the normal job queue. Off-by-default: with
@@ -2068,6 +2105,11 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		writeLine(stdout, "heartbeat scan disabled: %s", heartbeatPathsErr)
 	}
 	heartbeatEnqueue := newHeartbeatEnqueuer(store, home)
+	if heartbeatPathsErr == nil {
+		// The single-repo daemon gets the same one-per-home sweep owner as the
+		// registered-repo supervisor; it is not attached to the per-tick engine.
+		startMemoryHarvestLoop(ctx, heartbeatPaths, home, store, stdout)
+	}
 	// Pipeline schedules (#681) fire in the single-repo daemon too, or a single-repo
 	// daemon would silently never advance/schedule pipelines. Off-by-default: with no
 	// pipelines the scan returns an empty list before any state touch. Unlike the
