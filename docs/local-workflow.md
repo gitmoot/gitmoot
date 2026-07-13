@@ -48,6 +48,8 @@ gitmoot agent doctor <name>
 gitmoot goal import --file GOAL.md --repo owner/repo
 gitmoot task run task-001 --repo owner/repo --owner lead --base main
 gitmoot task recover task-001 --owner lead   # finalize a dead implement's dirty worktree
+gitmoot task dismiss task-001 --reason "abandoned experiment"
+gitmoot task events task-001 --json
 gitmoot task list --repo owner/repo
 gitmoot job list
 gitmoot job show <job-id>
@@ -79,6 +81,21 @@ the task's PR — the finalize steps the dead implementer never reached. `--repo
 is optional (it falls back to the task's stored repo). Recovery refuses while a
 live process is still inside the task worktree; wait for it to exit or stop the
 orphaned implementer first.
+
+`task dismiss` is the explicit terminal action for an abandoned
+`implementing` or `blocked` task. It refuses while a matching job or worktree
+process is live, preserves the branch and worktree, releases the branch lock
+best-effort, and records `task_dismissed_manual`. The daemon can record
+`task_dismissed_auto` for stale candidates using `updated_at` as a conservative
+activity proxy. Configure `[workflow].stale_task_ttl = "168h"` (the default), or
+set it to `"0"` to disable this poll leg. Candidates with an open PR, a remote
+branch, a live job, or an uncertain remote check are not dismissed.
+
+Dismissed tasks never return to implementation through ordinary task run,
+allocation, or late workflow advancement. `task recover` is the explicit path:
+preserved branch/worktree artifacts move through `implementing` to `pr_open`,
+while a branchless task returns to `planned` with task-run guidance. Inspect the
+full audit trail with `task events`.
 
 ## Runtime Plugin Setup
 

@@ -217,6 +217,28 @@ type Task struct {
 	WorktreePath string
 }
 
+// TaskEvent is one append-only task lifecycle transition. FromState and
+// ToState are empty only for informational events that do not move the task.
+type TaskEvent struct {
+	ID        int64  `json:"id"`
+	TaskID    string `json:"task_id"`
+	Kind      string `json:"kind"`
+	FromState string `json:"from_state"`
+	ToState   string `json:"to_state"`
+	Reason    string `json:"reason"`
+	CreatedAt string `json:"created_at"`
+}
+
+// StaleTaskCandidate is the narrow age-aware task projection used by the
+// daemon reconciler. Keeping UpdatedAt here avoids widening every Task reader.
+type StaleTaskCandidate struct {
+	ID           string
+	RepoFullName string
+	State        string
+	Branch       string
+	UpdatedAt    string
+}
+
 type PullRequest struct {
 	RepoFullName   string
 	Number         int64
@@ -2394,6 +2416,110 @@ func (s *Store) ListTasksByRepoState(ctx context.Context, repoFullName string, s
 	return tasks, rows.Err()
 }
 
+// ListStaleTaskCandidates returns the oldest tasks in one repo whose state is
+// in states and whose conservative updated_at activity proxy predates before.
+func (s *Store) ListStaleTaskCandidates(ctx context.Context, repoFullName string, states []string, before time.Time, limit int) ([]StaleTaskCandidate, error) {
+	if len(states) == 0 || limit <= 0 {
+		return []StaleTaskCandidate{}, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(states)), ",")
+	args := make([]any, 0, len(states)+3)
+	args = append(args, strings.TrimSpace(repoFullName))
+	for _, state := range states {
+		args = append(args, strings.TrimSpace(state))
+	}
+	args = append(args, before.UTC().Format("2006-01-02 15:04:05"), limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, repo_full_name, state, branch, updated_at
+		FROM tasks
+		WHERE repo_full_name = ? AND state IN (`+placeholders+`) AND updated_at < ?
+		ORDER BY updated_at, id LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []StaleTaskCandidate{}
+	for rows.Next() {
+		var candidate StaleTaskCandidate
+		if err := rows.Scan(&candidate.ID, &candidate.RepoFullName, &candidate.State, &candidate.Branch, &candidate.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, candidate)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) AddTaskEvent(ctx context.Context, event TaskEvent) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO task_events(task_id, kind, from_state, to_state, reason)
+		VALUES (?, ?, ?, ?, ?)`, event.TaskID, event.Kind, event.FromState, event.ToState, event.Reason)
+	return err
+}
+
+func (s *Store) ListTaskEvents(ctx context.Context, taskID string) ([]TaskEvent, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, task_id, kind, from_state, to_state, reason, created_at
+		FROM task_events WHERE task_id = ? ORDER BY id`, strings.TrimSpace(taskID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []TaskEvent{}
+	for rows.Next() {
+		var event TaskEvent
+		if err := rows.Scan(&event.ID, &event.TaskID, &event.Kind, &event.FromState, &event.ToState, &event.Reason, &event.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, event)
+	}
+	return out, rows.Err()
+}
+
+// TransitionTaskStateWithEvent atomically compares and moves a task state and
+// appends its audit event. A failed comparison writes no event and returns the
+// current state so callers can distinguish idempotence from a conflicting move.
+func (s *Store) TransitionTaskStateWithEvent(ctx context.Context, taskID string, fromStates []string, to string, kind string, reason string) (changed bool, currentState string, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, "", err
+	}
+	defer tx.Rollback()
+
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM tasks WHERE id = ?`, strings.TrimSpace(taskID)).Scan(&currentState); err != nil {
+		return false, "", err
+	}
+	allowed := false
+	for _, state := range fromStates {
+		if currentState == strings.TrimSpace(state) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return false, currentState, tx.Commit()
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE tasks SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`,
+		strings.TrimSpace(to), strings.TrimSpace(taskID), currentState)
+	if err != nil {
+		return false, "", err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, "", err
+	}
+	if affected == 0 {
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM tasks WHERE id = ?`, strings.TrimSpace(taskID)).Scan(&currentState); err != nil {
+			return false, "", err
+		}
+		return false, currentState, tx.Commit()
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO task_events(task_id, kind, from_state, to_state, reason)
+		VALUES (?, ?, ?, ?, ?)`, strings.TrimSpace(taskID), strings.TrimSpace(kind), currentState, strings.TrimSpace(to), strings.TrimSpace(reason)); err != nil {
+		return false, "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, "", err
+	}
+	return true, strings.TrimSpace(to), nil
+}
+
 func scanTask(row interface{ Scan(dest ...any) error }) (Task, error) {
 	var task Task
 	if err := row.Scan(&task.ID, &task.RepoFullName, &task.GoalID, &task.Title, &task.State, &task.Branch, &task.WorktreePath); err != nil {
@@ -3112,6 +3238,63 @@ func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id strin
 		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, extra.JobID, extra.Kind, extra.Message); err != nil {
 			return false, err
 		}
+	}
+	return true, tx.Commit()
+}
+
+// TransitionJobStatePayloadWithEventAndTaskTransition is the retry path's
+// cross-row transaction: a dismissed task is explicitly recovered before its
+// job is re-queued, and either both lifecycle events commit or neither does.
+func (s *Store) TransitionJobStatePayloadWithEventAndTaskTransition(ctx context.Context, id string, from string, to string, payload string, event JobEvent, taskID string, taskFrom string, taskTo string, taskKind string, taskReason string) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	taskResult, err := tx.ExecContext(ctx, `UPDATE tasks SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`,
+		taskTo, taskID, taskFrom)
+	if err != nil {
+		return false, err
+	}
+	taskAffected, err := taskResult.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if taskAffected != 1 {
+		var current string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM tasks WHERE id = ?`, taskID).Scan(&current); err != nil {
+			return false, err
+		}
+		return false, fmt.Errorf("task %s is %s; retry requires explicit recovery from %s", taskID, current, taskFrom)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO task_events(task_id, kind, from_state, to_state, reason)
+		VALUES (?, ?, ?, ?, ?)`, taskID, taskKind, taskFrom, taskTo, taskReason); err != nil {
+		return false, err
+	}
+
+	projection := jobProjectionFromPayload(payload)
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
+		to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+		projection.BlockerSuggestedAction, id, from, projection.WorkflowID)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		if err := rejectWorkflowIDMismatch(ctx, tx, id, projection.WorkflowID); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if event.JobID == "" {
+		event.JobID = id
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+		return false, err
 	}
 	return true, tx.Commit()
 }
@@ -8800,5 +8983,19 @@ ALTER TABLE workflow_meta ADD COLUMN summary TEXT NOT NULL DEFAULT '';
 	// non-default intervals, including the production 3m0s values, survive.
 	`
 UPDATE repos SET poll_interval = '' WHERE poll_interval = '30s';
+	// #913 task dismissal lifecycle audit. Task state is already unconstrained
+	// TEXT, so the state itself needs no column migration; this append-only table
+	// records every explicit manual, automatic, and recovery transition.
+	`
+CREATE TABLE task_events (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	task_id TEXT NOT NULL,
+	kind TEXT NOT NULL,
+	from_state TEXT NOT NULL DEFAULT '',
+	to_state TEXT NOT NULL DEFAULT '',
+	reason TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_task_events_task_id_id ON task_events(task_id, id);
 	`,
 }

@@ -6825,6 +6825,26 @@ func TestTaskWorktreeCheckoutPrefersDelegationPayloadWorktree(t *testing.T) {
 	}
 }
 
+func TestPermissionBlockedJobCannotResurrectDismissedTask(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", State: string(workflow.TaskDismissed), Branch: "feature/one"}); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(workflow.JobPayload{TaskID: "task-1", Repo: "owner/repo", Branch: "feature/one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = blockTaskForPermissionBlockedJob(ctx, store, db.Job{ID: "job-1", Payload: string(payload)})
+	if err == nil || !strings.Contains(err.Error(), "dismissed") {
+		t.Fatalf("blockTaskForPermissionBlockedJob error = %v", err)
+	}
+	task, _ := store.GetTask(ctx, "task-1")
+	if task.State != string(workflow.TaskDismissed) {
+		t.Fatalf("task resurrected to %s", task.State)
+	}
+}
+
 func TestRunQueuedJobsFansOutDelegationsAndEnqueuesContinuation(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)

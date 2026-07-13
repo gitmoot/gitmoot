@@ -437,10 +437,38 @@ func TestTaskRecoverPredicateStillRejectsPullRequestOpen(t *testing.T) {
 	if taskBranchReusableForImplement(string(workflow.TaskPullRequestOpen)) {
 		t.Fatal("shared task recover/implement predicate was widened to pr_open")
 	}
+	if taskBranchReusableForImplement(string(workflow.TaskDismissed)) {
+		t.Fatal("shared implement branch-reuse predicate was widened to dismissed")
+	}
 	fixture := newFixPassFixture(t, workflow.TaskPullRequestOpen)
 	_, err := recoverTaskImplementation(context.Background(), fixture.store, fixture.task.ID, fixture.repo.FullName(), fixture.owner, false, github.NoopClient{})
 	if err == nil || !strings.Contains(err.Error(), "task recover only supports active implementation states") {
 		t.Fatalf("task recover error = %v, want unchanged pr_open refusal", err)
+	}
+}
+
+func TestTaskRecoverableStateIncludesDismissedWithoutWideningImplementReuse(t *testing.T) {
+	tests := []struct {
+		state string
+		want  bool
+	}{
+		{state: "", want: true},
+		{state: string(workflow.TaskPlanned), want: true},
+		{state: string(workflow.TaskImplementing), want: true},
+		{state: string(workflow.TaskChangesRequested), want: true},
+		{state: string(workflow.TaskBlocked), want: true},
+		{state: string(workflow.TaskAwaitingHuman), want: true},
+		{state: string(workflow.TaskDismissed), want: true},
+		{state: string(workflow.TaskPullRequestOpen)},
+		{state: string(workflow.TaskReviewing)},
+		{state: string(workflow.TaskReadyToMerge)},
+		{state: string(workflow.TaskMerged)},
+		{state: "future"},
+	}
+	for _, test := range tests {
+		if got := taskRecoverableState(test.state); got != test.want {
+			t.Fatalf("taskRecoverableState(%q) = %v, want %v", test.state, got, test.want)
+		}
 	}
 }
 

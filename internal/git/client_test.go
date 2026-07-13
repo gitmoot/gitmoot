@@ -395,6 +395,21 @@ func TestClientBranchExistsReturnsFalseForMissingBranch(t *testing.T) {
 	runner.wantArgs(t, 0, "git", "show-ref", "--verify", "--quiet", "refs/heads/missing")
 }
 
+func TestClientRemoteBranchesBatchesExactRefs(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "abc\trefs/heads/feature/one\ndef\trefs/heads/unrequested\n"}}}
+	branches, err := (Client{Runner: runner, Dir: "/repo"}).RemoteBranches(context.Background(), []string{"feature/one", "feature/two"})
+	if err != nil {
+		t.Fatalf("RemoteBranches: %v", err)
+	}
+	if _, ok := branches["feature/one"]; !ok || len(branches) != 1 {
+		t.Fatalf("branches = %v", branches)
+	}
+	runner.wantArgs(t, 0, "git", "ls-remote", "--heads", "origin", "refs/heads/feature/one", "refs/heads/feature/two")
+	if _, err := (Client{}).RemoteBranches(context.Background(), []string{"bad branch"}); err == nil {
+		t.Fatal("RemoteBranches accepted unsafe branch")
+	}
+}
+
 func TestClientHeadSHA(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "abc123\n"}}}
 	sha, err := (Client{Runner: runner, Dir: "/repo"}).HeadSHA(context.Background())

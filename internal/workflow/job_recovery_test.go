@@ -138,6 +138,58 @@ func TestRetryJobPreservesTaskWorktreePath(t *testing.T) {
 	}
 }
 
+func TestRetryJobRecoversDismissedTaskAtomically(t *testing.T) {
+	tests := []struct {
+		name      string
+		jobType   string
+		payload   string
+		wantState TaskState
+	}{
+		{name: "implement artifacts", jobType: "implement", payload: `{"repo":"owner/repo","branch":"feature","task_id":"task-1","worktree_path":"/tmp/task-1"}`, wantState: TaskImplementing},
+		{name: "non implement", jobType: "review", payload: `{"repo":"owner/repo","branch":"feature","task_id":"task-1"}`, wantState: TaskPlanned},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openTestStore(t)
+			if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", State: string(TaskDismissed), Branch: "feature", WorktreePath: "/tmp/task-1"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-1", Type: test.jobType, State: string(JobFailed), Payload: test.payload}, db.JobEvent{Kind: string(JobFailed)}); err != nil {
+				t.Fatal(err)
+			}
+			job, err := RetryJob(ctx, store, "job-1")
+			if err != nil || job.State != string(JobQueued) {
+				t.Fatalf("RetryJob job=%+v err=%v", job, err)
+			}
+			task, _ := store.GetTask(ctx, "task-1")
+			events, _ := store.ListTaskEvents(ctx, "task-1")
+			if task.State != string(test.wantState) || len(events) != 1 || events[0].Kind != "task_recovered_job_retry" || events[0].FromState != string(TaskDismissed) || events[0].ToState != string(test.wantState) {
+				t.Fatalf("task=%+v events=%+v", task, events)
+			}
+		})
+	}
+}
+
+func TestRetryJobRefusalLeavesDismissedTaskUntouched(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", State: string(TaskDismissed), Branch: "feature"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-1", Type: "implement", State: string(JobCancelled), Payload: `{"repo":"owner/repo","branch":"feature","task_id":"task-1","worktree_path":"/tmp/task-1"}`}, db.JobEvent{Kind: string(JobCancelled), Message: "cancel requested from running"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RetryJob(ctx, store, "job-1"); err == nil {
+		t.Fatal("RetryJob accepted unsettled running cancellation")
+	}
+	task, _ := store.GetTask(ctx, "task-1")
+	events, _ := store.ListTaskEvents(ctx, "task-1")
+	if task.State != string(TaskDismissed) || len(events) != 0 {
+		t.Fatalf("task=%+v events=%+v", task, events)
+	}
+}
+
 func TestRetryJobRejectsNonTerminalJob(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)

@@ -115,6 +115,22 @@ func TestEngineAllocateTaskWorktreeAddsGitWorktreeAndStoresPath(t *testing.T) {
 	}
 }
 
+func TestEngineAllocateTaskWorktreeRejectsDismissedTask(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-dismissed", RepoFullName: "owner/repo", State: string(TaskDismissed), Branch: "feature/dismissed", WorktreePath: "/tmp/preserved"}); err != nil {
+		t.Fatal(err)
+	}
+	manager := &fakeWorktreeManager{}
+	_, err := testEngine(store).AllocateTaskWorktree(ctx, TaskWorktreeRequest{Home: t.TempDir(), Repo: "owner/repo", TaskID: "task-dismissed", Branch: "feature/dismissed", Owner: "lead"}, manager)
+	if err == nil || !strings.Contains(err.Error(), "dismissed") {
+		t.Fatalf("AllocateTaskWorktree error = %v", err)
+	}
+	if len(manager.calls) != 0 {
+		t.Fatalf("manager calls = %+v", manager.calls)
+	}
+}
+
 func TestEngineAllocateTaskWorktreeWaitsForCheckoutMutationLock(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

@@ -49,14 +49,15 @@ type DashboardTerminalBucket struct {
 
 const dashboardChangeCursorSQL = `SELECT
 	COALESCE((SELECT MAX(id) FROM job_events), 0),
-	COALESCE((SELECT MAX(id) FROM workflow_notes), 0)`
+	COALESCE((SELECT MAX(id) FROM workflow_notes), 0),
+	COALESCE((SELECT MAX(id) FROM task_events), 0)`
 
-// DashboardChangeCursor returns the two monotonic row ids that invalidate
-// dashboard views. Both maxima are read in one statement so a poll is one cheap
-// SQLite round trip and an empty store has the stable cursor components 0, 0.
-func (s *Store) DashboardChangeCursor(ctx context.Context) (jobEventID, workflowNoteID int64, err error) {
-	err = s.db.QueryRowContext(ctx, dashboardChangeCursorSQL).Scan(&jobEventID, &workflowNoteID)
-	return jobEventID, workflowNoteID, err
+// DashboardChangeCursor returns the three monotonic row ids that invalidate
+// dashboard views. All maxima are read in one statement so a poll is one cheap
+// SQLite round trip and an empty store has the stable cursor 0, 0, 0.
+func (s *Store) DashboardChangeCursor(ctx context.Context) (jobEventID, workflowNoteID, taskEventID int64, err error) {
+	err = s.db.QueryRowContext(ctx, dashboardChangeCursorSQL).Scan(&jobEventID, &workflowNoteID, &taskEventID)
+	return jobEventID, workflowNoteID, taskEventID, err
 }
 
 func (s *Store) ListDashboardTasks(ctx context.Context, mergedSince string) ([]DashboardTaskRow, error) {
@@ -68,7 +69,8 @@ func (s *Store) ListDashboardTasks(ctx context.Context, mergedSince string) ([]D
 			ORDER BY pr.number DESC LIMIT 1), 0),
 		t.updated_at
 	FROM tasks t
-	WHERE t.state != 'merged' OR julianday(t.updated_at) >= julianday(?)
+	WHERE t.state != 'dismissed'
+		AND (t.state != 'merged' OR julianday(t.updated_at) >= julianday(?))
 	ORDER BY t.id`, mergedSince)
 	if err != nil {
 		return nil, err

@@ -39,6 +39,13 @@ func (e Engine) StartTaskBranch(ctx context.Context, request TaskBranchRequest, 
 	if err := validateTaskBranchRequest(request); err != nil {
 		return db.Task{}, err
 	}
+	if task, err := e.Store.GetTask(ctx, request.TaskID); err == nil {
+		if task.State == string(TaskDismissed) {
+			return db.Task{}, fmt.Errorf("task %s is dismissed; recover it explicitly before starting a branch", request.TaskID)
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return db.Task{}, err
+	}
 	existing, err := e.Store.GetTaskByRepoBranch(ctx, request.Repo, request.Branch)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return db.Task{}, err

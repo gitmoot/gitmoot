@@ -697,6 +697,24 @@ worktree state (`git add -A`, incl. untracked non-ignored files), pushes the
 branch, and opens or adopts the PR. `--repo` is optional (falls back to the
 task's repo). Recovery refuses while a live process is still inside the worktree.
 
+**Task dismissal and stale reconciliation:** `dismissed` is a terminal task
+state for implicit workflow transitions. An operator can run `gitmoot task
+dismiss <id> [--reason ...]` only from `implementing` or `blocked`; Gitmoot
+refuses while any matching job is live or a process remains in the task
+worktree. The branch and worktree are preserved, while the branch lock is
+released best-effort. Manual and daemon transitions are audited as
+`task_dismissed_manual` and `task_dismissed_auto` in `gitmoot task events <id>`.
+
+Each repo poll also considers up to 20 oldest `implementing`/`blocked` tasks
+whose `updated_at` predates `[workflow].stale_task_ttl` (default `168h`; `"0"`
+disables the leg). `updated_at` is deliberately a conservative activity proxy,
+not proof of abandonment. A candidate is skipped for a live job, an open-PR
+branch, or an exact branch still present on `origin`; remote lookup uncertainty
+skips mutation. A branchless candidate needs no remote lookup. Explicit `task
+recover` restores preserved artifacts through `implementing` to `pr_open`, or
+restores a branchless task to `planned`; job retry records its own recovery
+event. The server-side task board omits dismissed rows immediately.
+
 **PR-bound fix pass:** use `gitmoot agent implement <agent> --repo owner/repo
 --pr <number> "..."` or `gitmoot agent run <agent> --repo owner/repo --action
 implement --pr <number> "..."` to send an existing open PR back through its

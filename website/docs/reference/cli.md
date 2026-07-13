@@ -956,11 +956,21 @@ Start a task in its dedicated branch worktree and inspect task state:
 gitmoot task run task-001 --repo owner/repo --owner lead --base main
 gitmoot task list --repo owner/repo
 gitmoot task list --repo owner/repo --state implementing --json
+gitmoot task dismiss task-001 --reason "abandoned experiment"
+gitmoot task events task-001 --json
 ```
 
 `task run` stores the deterministic task worktree path under
 `$GITMOOT_HOME/worktrees/<owner>--<repo>/<task-id>/` and leaves the registered
 checkout on its current branch.
+
+`task dismiss` is an explicit terminal action for stale `implementing` or
+`blocked` tasks. It refuses states owned by planning, PR/review/merge, or human
+resume machinery, and refuses while a matching job or worktree process remains
+live. It preserves branch and worktree, releases the branch lock best-effort,
+and records `task_dismissed_manual`; an already-dismissed task is an exit-0
+no-op (`changed:false` in JSON). `task events <id>` lists the append-only trail,
+including daemon `task_dismissed_auto` and explicit recovery events.
 
 ### Recover a dead implement
 
@@ -986,6 +996,18 @@ untracked non-ignored files), pushes the task branch, and opens or adopts the
 task's PR — the finalize steps the dead implementer never reached. When the
 worktree is already clean it recovers the commit already ahead of the base, and
 refuses when there is nothing ahead to recover.
+
+`task recover` is also the only task-level recovery from `dismissed`. Preserved
+branch/worktree artifacts move through `implementing` to `pr_open`; a branchless
+task returns to `planned` with guidance to use `task run`. Ordinary allocation
+and workflow advancement cannot resurrect the task. Retrying one of its jobs
+restores it explicitly and records `task_recovered_job_retry`.
+
+The daemon scans up to 20 oldest stale `implementing`/`blocked` tasks per repo
+poll. `[workflow].stale_task_ttl = "168h"` is the default and `"0"` disables the
+leg. `updated_at` is a conservative activity proxy. Live jobs, open-PR branches,
+branches still present on `origin`, and remote-check uncertainty all prevent
+automatic dismissal; successful transitions record `task_dismissed_auto`.
 
 Two refusals guard recovery (and the `task run` / `agent implement` restart that
 points to it):

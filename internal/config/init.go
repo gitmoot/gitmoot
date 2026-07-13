@@ -42,10 +42,13 @@ artifact_blobs = %q
 # new-branch worktree from that ref. Use "origin/main" for a remote-tracking
 # default, or "HEAD" to follow the registered checkout. With no value, implement
 # follows checkout HEAD and guards stale non-default checkouts. result_checks is
-# off | warn | block and defaults to warn when omitted.
+# off | warn | block and defaults to warn when omitted. stale_task_ttl is the
+# conservative updated_at age after which abandoned implementing/blocked tasks
+# may be auto-dismissed; it defaults to 168h and "0" disables the reconciler.
 # [workflow]
 # implement_base = "origin/main"
 # result_checks = "warn"
+# stale_task_ttl = "168h"
 
 # [daemon] is the OPTIONAL warm-reloadable runtime config (issue #577). CLI flags to
 # "daemon start" / "daemon run" remain the initial value; a key here is applied only

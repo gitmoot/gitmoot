@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -101,11 +102,26 @@ func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error
 	if err != nil {
 		return db.Job{}, err
 	}
-	transitioned, err := store.TransitionJobStatePayloadWithEvent(ctx, job.ID, job.State, string(JobQueued), encoded, db.JobEvent{
+	retryEvent := db.JobEvent{
 		JobID:   job.ID,
 		Kind:    "retry_queued",
 		Message: fmt.Sprintf("retry requested from %s", job.State),
-	})
+	}
+	transitioned := false
+	if task, ok, err := dismissedTaskForJob(ctx, store, payload); err != nil {
+		return db.Job{}, err
+	} else if ok {
+		taskState := string(TaskPlanned)
+		if job.Type == "implement" && strings.TrimSpace(payload.Branch) != "" && strings.TrimSpace(payload.WorktreePath) != "" {
+			taskState = string(TaskImplementing)
+		}
+		transitioned, err = store.TransitionJobStatePayloadWithEventAndTaskTransition(ctx,
+			job.ID, job.State, string(JobQueued), encoded, retryEvent,
+			task.ID, string(TaskDismissed), taskState, "task_recovered_job_retry",
+			fmt.Sprintf("restored dismissed task before retrying job %s", job.ID))
+	} else {
+		transitioned, err = store.TransitionJobStatePayloadWithEvent(ctx, job.ID, job.State, string(JobQueued), encoded, retryEvent)
+	}
 	if err != nil {
 		return db.Job{}, err
 	}
@@ -117,6 +133,29 @@ func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error
 		return db.Job{}, fmt.Errorf("job %s is %s; retry requires failed, blocked, or cancelled", latest.ID, latest.State)
 	}
 	return store.GetJob(ctx, job.ID)
+}
+
+func dismissedTaskForJob(ctx context.Context, store *db.Store, payload JobPayload) (db.Task, bool, error) {
+	if taskID := strings.TrimSpace(payload.TaskID); taskID != "" {
+		task, err := store.GetTask(ctx, taskID)
+		if err == nil && task.State == string(TaskDismissed) {
+			return task, true, nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return db.Task{}, false, err
+		}
+	}
+	if strings.TrimSpace(payload.Repo) == "" || strings.TrimSpace(payload.Branch) == "" {
+		return db.Task{}, false, nil
+	}
+	task, err := store.GetTaskByRepoBranch(ctx, payload.Repo, payload.Branch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return db.Task{}, false, nil
+	}
+	if err != nil {
+		return db.Task{}, false, err
+	}
+	return task, task.State == string(TaskDismissed), nil
 }
 
 // GateResumeOutcome is the result of MaybeResumeOnGatesCleared (#682): whether the

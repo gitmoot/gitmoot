@@ -264,6 +264,7 @@ func TestDashboardTaskStateFiltersUnsupportedStates(t *testing.T) {
 		ok                      bool
 	}{
 		{internal: "planned"},
+		{internal: "dismissed"},
 		{internal: "future_state"},
 		{internal: "implementing", state: "implementing", ok: true},
 		{internal: "pr_open", state: "pr_open", ok: true},

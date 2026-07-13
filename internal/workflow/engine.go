@@ -6783,6 +6783,9 @@ func (e Engine) setTaskState(ctx context.Context, ref taskRef, state TaskState) 
 		return err
 	}
 	if err == nil {
+		if existing.State == string(TaskDismissed) && state != TaskDismissed {
+			return fmt.Errorf("task %s is dismissed; workflow advancement cannot move it to %s", existing.ID, state)
+		}
 		if task.GoalID == "" {
 			task.GoalID = existing.GoalID
 		}
@@ -6809,6 +6812,9 @@ func (e Engine) setTaskState(ctx context.Context, ref taskRef, state TaskState) 
 			return berr
 		}
 		if berr == nil && byBranch.ID != task.ID {
+			if byBranch.State == string(TaskDismissed) && state != TaskDismissed {
+				return fmt.Errorf("task %s is dismissed; workflow advancement cannot move it to %s", byBranch.ID, state)
+			}
 			byBranch.State = string(state)
 			return e.Store.UpsertTask(ctx, byBranch)
 		}

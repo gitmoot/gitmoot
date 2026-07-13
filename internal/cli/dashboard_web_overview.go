@@ -98,7 +98,7 @@ func dashboardTasks(ctx context.Context, store *db.Store, now time.Time) ([]dash
 
 func dashboardTaskState(state string) (stateName, blockedReason string, ok bool) {
 	switch strings.TrimSpace(state) {
-	case "planned":
+	case "planned", "dismissed":
 		return "", "", false
 	case "implementing":
 		return "implementing", "", true

@@ -45,6 +45,22 @@ func TestEngineStartTaskBranchCreatesBranchAndLock(t *testing.T) {
 	}
 }
 
+func TestEngineStartTaskBranchRejectsDismissedTask(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-dismissed", RepoFullName: "owner/repo", State: string(TaskDismissed), Branch: "feature/dismissed"}); err != nil {
+		t.Fatal(err)
+	}
+	brancher := &fakeBranchCreator{}
+	_, err := testEngine(store).StartTaskBranch(ctx, TaskBranchRequest{Repo: "owner/repo", TaskID: "task-dismissed", Branch: "feature/dismissed", Owner: "lead"}, brancher)
+	if err == nil || !strings.Contains(err.Error(), "dismissed") {
+		t.Fatalf("StartTaskBranch error = %v", err)
+	}
+	if len(brancher.calls) != 0 {
+		t.Fatalf("brancher calls = %+v", brancher.calls)
+	}
+}
+
 func TestEngineStartTaskBranchAcquiresCheckoutMutationLockBeforeBranchSetup(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

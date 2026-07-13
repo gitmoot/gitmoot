@@ -23,8 +23,8 @@ func TestWebDataSourceChangeCursor(t *testing.T) {
 			t.Fatalf("ChangeCursor = %q, want %q", got, want)
 		}
 	}
-	assertCursor("0.0")
-	assertCursor("0.0")
+	assertCursor("0.0.0")
+	assertCursor("0.0.0")
 
 	store, err := db.Open(config.PathsForHome(home).Database)
 	if err != nil {
@@ -37,7 +37,7 @@ func TestWebDataSourceChangeCursor(t *testing.T) {
 		t.Fatalf("CreateJobWithEvent: %v", err)
 	}
 	store.Close()
-	assertCursor("1.0")
+	assertCursor("1.0.0")
 
 	store, err = db.Open(config.PathsForHome(home).Database)
 	if err != nil {
@@ -48,6 +48,21 @@ func TestWebDataSourceChangeCursor(t *testing.T) {
 		t.Fatalf("InsertWorkflowNote: %v", err)
 	}
 	store.Close()
-	assertCursor("1.1")
-	assertCursor("1.1")
+	assertCursor("1.1.0")
+
+	store, err = db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("reopen for task event: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", State: "implementing"}); err != nil {
+		store.Close()
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	if err := store.AddTaskEvent(ctx, db.TaskEvent{TaskID: "task-1", Kind: "task_dismissed_manual"}); err != nil {
+		store.Close()
+		t.Fatalf("AddTaskEvent: %v", err)
+	}
+	store.Close()
+	assertCursor("1.1.1")
+	assertCursor("1.1.1")
 }

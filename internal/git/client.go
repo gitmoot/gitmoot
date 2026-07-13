@@ -131,6 +131,41 @@ func (c Client) BranchExists(ctx context.Context, branch string) (bool, error) {
 	return true, nil
 }
 
+// RemoteBranches returns the requested branches that exist on origin using one
+// exact-ref ls-remote call. Callers batch a bounded candidate set so stale-task
+// reconciliation never performs one subprocess/network round trip per task.
+func (c Client) RemoteBranches(ctx context.Context, branches []string) (map[string]struct{}, error) {
+	out := map[string]struct{}{}
+	if len(branches) == 0 {
+		return out, nil
+	}
+	args := []string{"ls-remote", "--heads", "origin"}
+	requested := make(map[string]string, len(branches))
+	for _, branch := range branches {
+		branch = strings.TrimSpace(branch)
+		if err := validateBranch(branch); err != nil {
+			return nil, err
+		}
+		ref := "refs/heads/" + branch
+		args = append(args, ref)
+		requested[ref] = branch
+	}
+	result, err := c.run(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		if branch, ok := requested[fields[1]]; ok {
+			out[branch] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
 func (c Client) RemoveWorktree(ctx context.Context, path string) error {
 	path, err := validateWorktreePath(path)
 	if err != nil {

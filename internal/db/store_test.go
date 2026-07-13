@@ -34,6 +34,7 @@ func TestOpenMigratesSchema(t *testing.T) {
 		"seen_comments",
 		"jobs",
 		"job_events",
+		"task_events",
 		"branch_locks",
 		"lock_events",
 		"resource_locks",

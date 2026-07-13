@@ -254,6 +254,10 @@ func runTask(args []string, stdout, stderr io.Writer) int {
 		return runTaskList(args[1:], stdout, stderr)
 	case "recover":
 		return runTaskRecover(args[1:], stdout, stderr)
+	case "dismiss":
+		return runTaskDismiss(args[1:], stdout, stderr)
+	case "events":
+		return runTaskEvents(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown task command %q\n\n", args[0])
 		printTaskUsage(stderr)
@@ -265,6 +269,8 @@ func printTaskUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot task run <id> --repo owner/repo --owner <agent> [--branch <branch>] [--base <branch>]")
 	fmt.Fprintln(w, "  gitmoot task recover <id> --owner <agent> [--repo owner/repo] [--skip-native-review-fanout] [--json]")
+	fmt.Fprintln(w, "  gitmoot task dismiss <id> [--reason text] [--json]")
+	fmt.Fprintln(w, "  gitmoot task events <id> [--json]")
 	fmt.Fprintln(w, "  gitmoot task list [--repo owner/repo] [--state state] [--json]")
 }
 
@@ -386,6 +392,9 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 			}
 			return err
 		}
+		if task.State == string(workflow.TaskDismissed) {
+			return fmt.Errorf("task %s is dismissed; use gitmoot task recover before task run", task.ID)
+		}
 		requestRepo, err := resolveTaskRepoFlag(*repo, task.RepoFullName, "task run")
 		if err != nil {
 			return err
@@ -486,10 +495,193 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+type taskDismissOutput struct {
+	TaskID        string `json:"task_id"`
+	PreviousState string `json:"previous_state"`
+	State         string `json:"state"`
+	Source        string `json:"source"`
+	Reason        string `json:"reason"`
+	Changed       bool   `json:"changed"`
+}
+
+func runTaskDismiss(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("task dismiss", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	reasonFlag := fs.String("reason", "", "operator reason recorded in the task event trail")
+	jsonOutput := fs.Bool("json", false, "print dismissal result as JSON")
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fs.Usage()
+		if len(args) == 0 {
+			fmt.Fprintln(stderr, "task dismiss requires exactly one id")
+			return 2
+		}
+		return 0
+	}
+	taskID := strings.TrimSpace(args[0])
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 || taskID == "" {
+		fmt.Fprintln(stderr, "task dismiss requires exactly one id")
+		return 2
+	}
+	reason := strings.TrimSpace(*reasonFlag)
+	if reason == "" {
+		reason = "dismissed by operator"
+	}
+	output := taskDismissOutput{TaskID: taskID, State: string(workflow.TaskDismissed), Source: "manual", Reason: reason}
+	err := withStore(*home, func(store *db.Store) error {
+		task, err := store.GetTask(context.Background(), taskID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("task %q not found", taskID)
+			}
+			return err
+		}
+		output.PreviousState = task.State
+		if task.State == string(workflow.TaskDismissed) {
+			return nil
+		}
+		if !taskDismissibleState(task.State) {
+			return taskDismissRefusal(task)
+		}
+		if live, ok, err := workflow.FindLiveTaskJob(context.Background(), store, task); err != nil {
+			return err
+		} else if ok {
+			return fmt.Errorf("task %s still has live job %s (%s); wait for it to settle or cancel it before dismissing", task.ID, live.ID, live.State)
+		}
+		if strings.TrimSpace(task.WorktreePath) != "" && taskWorktreeHasLiveProcess(task.WorktreePath) {
+			return fmt.Errorf("task %s worktree %s still has a live process; wait for it to exit or stop it before dismissing", task.ID, task.WorktreePath)
+		}
+		changed, current, err := store.TransitionTaskStateWithEvent(context.Background(), task.ID,
+			[]string{string(workflow.TaskImplementing), string(workflow.TaskBlocked)},
+			string(workflow.TaskDismissed), "task_dismissed_manual", reason)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			if current == string(workflow.TaskDismissed) {
+				output.PreviousState = current
+				return nil
+			}
+			return fmt.Errorf("task %s changed from %s to %s while dismissing; retry after inspecting it", task.ID, task.State, current)
+		}
+		output.Changed = true
+		if strings.TrimSpace(task.RepoFullName) != "" && strings.TrimSpace(task.Branch) != "" {
+			_, _, _ = store.ForceReleaseLockWithEvent(context.Background(), task.RepoFullName, task.Branch, db.BranchLockEvent{
+				Kind: "force_released", Message: "released after manual task dismissal (#913)",
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "dismiss task: %v\n", err)
+		return 1
+	}
+	if *jsonOutput {
+		if err := writeJSON(stdout, output); err != nil {
+			fmt.Fprintf(stderr, "dismiss task: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	if output.Changed {
+		fmt.Fprintf(stdout, "dismissed %s from %s: %s\n", output.TaskID, output.PreviousState, output.Reason)
+	} else {
+		fmt.Fprintf(stdout, "%s is already dismissed\n", output.TaskID)
+	}
+	return 0
+}
+
+func taskDismissibleState(state string) bool {
+	switch workflow.TaskState(strings.TrimSpace(state)) {
+	case workflow.TaskImplementing, workflow.TaskBlocked:
+		return true
+	default:
+		return false
+	}
+}
+
+func taskDismissRefusal(task db.Task) error {
+	state := strings.TrimSpace(task.State)
+	if state == "" {
+		state = "unknown"
+	}
+	owner := "other workflow machinery"
+	switch workflow.TaskState(state) {
+	case workflow.TaskPlanned:
+		owner = "task run/implement dispatch"
+	case workflow.TaskPullRequestOpen, workflow.TaskReviewing, workflow.TaskChangesRequested, workflow.TaskReadyToMerge:
+		owner = "pull-request review and merge machinery"
+	case workflow.TaskMerged:
+		owner = "the terminal merge record"
+	case workflow.TaskAwaitingHuman:
+		owner = "the explicit human-resume machinery"
+	}
+	return fmt.Errorf("task %s is in state %s; task dismiss only supports implementing or blocked tasks because this state is owned by %s", task.ID, state, owner)
+}
+
+func runTaskEvents(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("task events", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	jsonOutput := fs.Bool("json", false, "print task events as JSON")
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fs.Usage()
+		if len(args) == 0 {
+			fmt.Fprintln(stderr, "task events requires exactly one id")
+			return 2
+		}
+		return 0
+	}
+	taskID := strings.TrimSpace(args[0])
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 || taskID == "" {
+		fmt.Fprintln(stderr, "task events requires exactly one id")
+		return 2
+	}
+	var events []db.TaskEvent
+	if err := withStore(*home, func(store *db.Store) error {
+		if _, err := store.GetTask(context.Background(), taskID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("task %q not found", taskID)
+			}
+			return err
+		}
+		var err error
+		events, err = store.ListTaskEvents(context.Background(), taskID)
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "task events: %v\n", err)
+		return 1
+	}
+	if *jsonOutput {
+		if err := writeJSON(stdout, events); err != nil {
+			fmt.Fprintf(stderr, "task events: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	for _, event := range events {
+		fmt.Fprintf(stdout, "%d\t%s\t%s\t%s\t%s\t%s\n", event.ID, event.CreatedAt, event.Kind, event.FromState, event.ToState, event.Reason)
+	}
+	return 0
+}
+
 type taskRecoverOutput struct {
 	TaskID      string `json:"task_id"`
 	Repo        string `json:"repo"`
 	Branch      string `json:"branch"`
+	State       string `json:"state"`
 	PullRequest int    `json:"pull_request"`
 	HeadSHA     string `json:"head_sha"`
 	Summary     string `json:"summary"`
@@ -536,9 +728,14 @@ func runTaskRecover(args []string, stdout, stderr io.Writer) int {
 			TaskID:      payload.TaskID,
 			Repo:        payload.Repo,
 			Branch:      payload.Branch,
+			State:       string(workflow.TaskPullRequestOpen),
 			PullRequest: payload.PullRequest,
 			HeadSHA:     payload.HeadSHA,
 			Summary:     "recovered implementation worktree and opened/adopted PR",
+		}
+		if strings.TrimSpace(payload.Branch) == "" {
+			output.State = string(workflow.TaskPlanned)
+			output.Summary = "restored dismissed branchless task to planned; use task run to start it"
 		}
 		return nil
 	}); err != nil {
@@ -550,6 +747,10 @@ func runTaskRecover(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "recover task: %v\n", err)
 			return 1
 		}
+		return 0
+	}
+	if output.State == string(workflow.TaskPlanned) {
+		fmt.Fprintf(stdout, "restored %s to planned; next: gitmoot task run %s --repo owner/repo --owner agent\n", output.TaskID, output.TaskID)
 		return 0
 	}
 	fmt.Fprintf(stdout, "recovered %s on %s\n", output.TaskID, output.Branch)
@@ -570,8 +771,20 @@ func recoverTaskImplementation(ctx context.Context, store *db.Store, taskID stri
 		}
 		return workflow.JobPayload{}, err
 	}
-	if !taskBranchReusableForImplement(task.State) {
+	if !taskRecoverableState(task.State) {
 		return workflow.JobPayload{}, fmt.Errorf("task %s is in state %s; task recover only supports active implementation states", task.ID, task.State)
+	}
+	if task.State == string(workflow.TaskDismissed) && strings.TrimSpace(task.Branch) == "" {
+		changed, current, err := store.TransitionTaskStateWithEvent(ctx, task.ID,
+			[]string{string(workflow.TaskDismissed)}, string(workflow.TaskPlanned),
+			"task_recovered", "dismissed task without a branch restored to planned for task run")
+		if err != nil {
+			return workflow.JobPayload{}, err
+		}
+		if !changed {
+			return workflow.JobPayload{}, fmt.Errorf("task %s changed to %s while recovering; retry after inspecting it", task.ID, current)
+		}
+		return workflow.JobPayload{Repo: task.RepoFullName, GoalID: task.GoalID, TaskID: task.ID, TaskTitle: task.Title}, nil
 	}
 	requestRepo, err := resolveTaskRepoFlag(repoFlag, task.RepoFullName, "task recover")
 	if err != nil {
@@ -663,6 +876,17 @@ func recoverTaskImplementation(ctx context.Context, store *db.Store, taskID stri
 	if err != nil {
 		return workflow.JobPayload{}, err
 	}
+	if task.State == string(workflow.TaskDismissed) {
+		changed, current, err := store.TransitionTaskStateWithEvent(ctx, task.ID,
+			[]string{string(workflow.TaskDismissed)}, string(workflow.TaskImplementing),
+			"task_recovered", "dismissed task recovery started from preserved branch and worktree")
+		if err != nil {
+			return workflow.JobPayload{}, err
+		}
+		if !changed {
+			return workflow.JobPayload{}, fmt.Errorf("task %s changed to %s while recovery was starting", task.ID, current)
+		}
+	}
 	if err := store.CreateExternallyDrivenJobWithEvent(ctx, db.Job{
 		ID:      job.ID,
 		Agent:   job.Agent,
@@ -690,6 +914,14 @@ func recoverTaskImplementation(ctx context.Context, store *db.Store, taskID stri
 	if err := finishTaskRecoverJob(ctx, store, job.ID, string(workflow.JobSucceeded), finalized, "task recovery finalized implementation"); err != nil {
 		return workflow.JobPayload{}, err
 	}
+	changed, current, err := store.TransitionTaskStateWithEvent(ctx, task.ID, taskRecoveryActiveStates(),
+		string(workflow.TaskPullRequestOpen), "task_recovered", "task recovery finalized implementation and opened or adopted a pull request")
+	if err != nil {
+		return workflow.JobPayload{}, err
+	}
+	if !changed && current != string(workflow.TaskPullRequestOpen) {
+		return workflow.JobPayload{}, fmt.Errorf("task %s is %s after recovery finalization; expected pr_open", task.ID, current)
+	}
 	return finalized, nil
 }
 
@@ -710,6 +942,18 @@ func taskBranchReusableForImplement(state string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func taskRecoverableState(state string) bool {
+	return workflow.TaskState(strings.TrimSpace(state)) == workflow.TaskDismissed || taskBranchReusableForImplement(state)
+}
+
+func taskRecoveryActiveStates() []string {
+	return []string{
+		"", string(workflow.TaskPlanned), string(workflow.TaskImplementing),
+		string(workflow.TaskChangesRequested), string(workflow.TaskBlocked),
+		string(workflow.TaskAwaitingHuman),
 	}
 }
 

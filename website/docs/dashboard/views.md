@@ -37,8 +37,9 @@ Tasks is a read-only lifecycle board backed by Gitmoot's task registry. Internal
 states are projected into **implementing**, **PR open**, **blocked**, and
 **merged** columns; planned and unknown states are omitted, review,
 changes-requested, and ready-to-merge tasks remain in PR open, and awaiting-human
-tasks appear as blocked. Merged history is limited server-side to the last seven
-days.
+tasks appear as blocked. Dismissed tasks are excluded by the server-side query,
+and task-event cursor invalidation removes a newly dismissed card immediately.
+Merged history is limited server-side to the last seven days.
 
 Cards carry the task title, repository, assigned branch-lock owner when one is
 known, pull-request number, last-update age, and a blocked reason. The CI dot is

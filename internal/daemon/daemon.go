@@ -7,12 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"log"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
+	gitutil "github.com/jerryfane/gitmoot/internal/git"
 	"github.com/jerryfane/gitmoot/internal/github"
 	"github.com/jerryfane/gitmoot/internal/workflow"
 )
@@ -23,6 +27,7 @@ const (
 	// A stale backlog drains over successive ticks without walking paginated closed
 	// PR history or allowing old task rows to dominate the daemon's API budget.
 	externalMergeReconcileLookupLimit = 20
+	staleTaskReconcileLimit           = 20
 )
 
 // issueCommentPollOverlap is subtracted from the persisted last-seen cursor when
@@ -42,6 +47,12 @@ type Daemon struct {
 	// Now is an injectable clock (test seam). It defaults to time.Now and is used
 	// to seed/advance the #566 issue-comment `since` cursor deterministically.
 	Now func() time.Time
+	// RemoteBranches is the fakeable one-call seam used by stale-task
+	// reconciliation. Nil uses git ls-remote against the registered checkout.
+	RemoteBranches RemoteBranchChecker
+	// Logf receives one diagnostic for invalid config or an uncertain remote
+	// check. Nil uses the process logger.
+	Logf func(format string, args ...any)
 	// WatchIssues opts in to the issue-comment workflow (#389): when true,
 	// PollOnce also polls open non-PR issues and routes `@<agent> ask …`
 	// comments to jobs. Default false keeps the PR-only behavior unchanged.
@@ -59,6 +70,18 @@ type Daemon struct {
 	// Default false is a CHEAP SHORT-CIRCUIT: PollOnce parses NO PR body and fires
 	// nothing, so the off path is byte-identical (no new GitHub reads, no new work).
 	RevertDetectionEnabled bool
+}
+
+// RemoteBranchChecker returns the subset of exact branch names present on
+// origin. Implementations must batch the full bounded input into one check.
+type RemoteBranchChecker interface {
+	RemoteBranches(ctx context.Context, checkout string, branches []string) (map[string]struct{}, error)
+}
+
+type gitRemoteBranchChecker struct{}
+
+func (gitRemoteBranchChecker) RemoteBranches(ctx context.Context, checkout string, branches []string) (map[string]struct{}, error) {
+	return (gitutil.Client{Dir: checkout}).RemoteBranches(ctx, branches)
 }
 
 func (d Daemon) Run(ctx context.Context) error {
@@ -171,6 +194,9 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	if err := d.reconcileClosedReviewingTasks(ctx, openBranches); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	if err := d.reconcileStaleTasks(ctx, openBranches); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if d.WatchIssues {
 		if err := d.PollIssuesOnce(ctx); err != nil && firstErr == nil {
 			firstErr = err
@@ -185,6 +211,109 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 		}
 	}
 	return firstErr
+}
+
+func (d Daemon) reconcileStaleTasks(ctx context.Context, openBranches map[string]struct{}) error {
+	paths := config.Paths{ConfigFile: filepath.Join(filepath.Dir(d.Store.DatabasePath()), config.ConfigName)}
+	ttl, err := config.LoadStaleTaskTTL(paths)
+	if err != nil {
+		d.logf("stale task reconciler skipped for %s: %v", d.Repo.FullName(), err)
+		return nil
+	}
+	if ttl == 0 {
+		return nil
+	}
+	candidates, err := d.Store.ListStaleTaskCandidates(ctx, d.Repo.FullName(), []string{
+		string(workflow.TaskImplementing), string(workflow.TaskBlocked),
+	}, d.now().Add(-ttl), staleTaskReconcileLimit)
+	if err != nil {
+		return err
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	type readyCandidate struct {
+		candidate db.StaleTaskCandidate
+		task      db.Task
+	}
+	emptyBranch := []readyCandidate{}
+	remoteCandidates := []readyCandidate{}
+	branches := []string{}
+	for _, candidate := range candidates {
+		task := db.Task{ID: candidate.ID, RepoFullName: candidate.RepoFullName, State: candidate.State, Branch: candidate.Branch}
+		if _, live, err := workflow.FindLiveTaskJob(ctx, d.Store, task); err != nil {
+			return err
+		} else if live {
+			continue
+		}
+		branch := strings.TrimSpace(candidate.Branch)
+		if branch == "" {
+			emptyBranch = append(emptyBranch, readyCandidate{candidate: candidate, task: task})
+			continue
+		}
+		if _, open := openBranches[branch]; open {
+			continue
+		}
+		remoteCandidates = append(remoteCandidates, readyCandidate{candidate: candidate, task: task})
+		branches = append(branches, branch)
+	}
+
+	remotePresent := map[string]struct{}{}
+	remoteCertain := true
+	if len(branches) > 0 {
+		repo, err := d.Store.GetRepo(ctx, d.Repo.FullName())
+		if err != nil {
+			remoteCertain = false
+			d.logf("stale task reconciler remote check skipped for %s: %v", d.Repo.FullName(), err)
+		} else {
+			checker := d.RemoteBranches
+			if checker == nil {
+				checker = gitRemoteBranchChecker{}
+			}
+			remotePresent, err = checker.RemoteBranches(ctx, repo.CheckoutPath, branches)
+			if err != nil {
+				remoteCertain = false
+				d.logf("stale task reconciler remote check skipped for %s: %v", d.Repo.FullName(), err)
+			}
+		}
+	}
+
+	// A failed remote check makes the tick non-authoritative. Avoid even the
+	// otherwise-certain empty-branch writes so one poll never partially applies
+	// its bounded candidate batch.
+	if !remoteCertain {
+		return nil
+	}
+	for _, item := range emptyBranch {
+		reason := fmt.Sprintf("stale task auto-dismissed: empty branch; ttl=%s; updated_at=%s", ttl, item.candidate.UpdatedAt)
+		if _, _, err := d.Store.TransitionTaskStateWithEvent(ctx, item.task.ID,
+			[]string{string(workflow.TaskImplementing), string(workflow.TaskBlocked)},
+			string(workflow.TaskDismissed), "task_dismissed_auto", reason); err != nil {
+			return err
+		}
+	}
+	for _, item := range remoteCandidates {
+		branch := strings.TrimSpace(item.candidate.Branch)
+		if _, present := remotePresent[branch]; present {
+			continue
+		}
+		reason := fmt.Sprintf("stale task auto-dismissed: remote ref refs/heads/%s absent; ttl=%s; updated_at=%s", branch, ttl, item.candidate.UpdatedAt)
+		if _, _, err := d.Store.TransitionTaskStateWithEvent(ctx, item.task.ID,
+			[]string{string(workflow.TaskImplementing), string(workflow.TaskBlocked)},
+			string(workflow.TaskDismissed), "task_dismissed_auto", reason); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d Daemon) logf(format string, args ...any) {
+	if d.Logf != nil {
+		d.Logf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
 }
 
 // reconcileExternallyMergedTasks advances PR lifecycle tasks whose PR was

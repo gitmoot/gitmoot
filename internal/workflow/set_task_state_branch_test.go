@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jerryfane/gitmoot/internal/db"
@@ -57,5 +58,31 @@ func TestSetTaskStateBranchConflict(t *testing.T) {
 	}
 	if got, _ := store.GetTask(ctx, "task-a"); got.State != string(TaskBlocked) {
 		t.Errorf("same-id advance state = %q, want %q", got.State, string(TaskBlocked))
+	}
+}
+
+func TestSetTaskStateCannotResurrectDismissedTask(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	const repo, branch = "owner/repo", "feature/dismissed"
+	if err := store.UpsertTask(ctx, db.Task{ID: "canonical", RepoFullName: repo, State: string(TaskDismissed), Branch: branch}); err != nil {
+		t.Fatal(err)
+	}
+	engine := Engine{Store: store}
+	for _, ref := range []taskRef{
+		{ID: "canonical", Repo: repo, Branch: branch},
+		{ID: "late-review", Repo: repo, Branch: branch},
+	} {
+		if err := engine.setTaskState(ctx, ref, TaskReviewing); err == nil || !strings.Contains(err.Error(), "dismissed") {
+			t.Fatalf("setTaskState(%+v) error = %v", ref, err)
+		}
+	}
+	task, _ := store.GetTask(ctx, "canonical")
+	if task.State != string(TaskDismissed) {
+		t.Fatalf("task resurrected to %s", task.State)
 	}
 }
