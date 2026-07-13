@@ -34,10 +34,11 @@ artifact directories during a dashboard request.
 Route: `/tasks`
 
 Tasks is a read-only lifecycle board backed by Gitmoot's task registry. Internal
-states are projected into **planned**, **implementing**, **PR open**, **blocked**,
-and **merged** columns; review, changes-requested, and ready-to-merge tasks remain
-in PR open, while awaiting-human tasks appear as blocked. Merged history is
-limited server-side to the last seven days.
+states are projected into **implementing**, **PR open**, **blocked**, and
+**merged** columns; planned and unknown states are omitted, review,
+changes-requested, and ready-to-merge tasks remain in PR open, and awaiting-human
+tasks appear as blocked. Merged history is limited server-side to the last seven
+days.
 
 Cards carry the task title, repository, assigned branch-lock owner when one is
 known, pull-request number, last-update age, and a blocked reason. The CI dot is

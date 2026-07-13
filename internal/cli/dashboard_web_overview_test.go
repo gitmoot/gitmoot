@@ -57,6 +57,7 @@ func TestDashboardOverviewTasksAndAutoWorkflows(t *testing.T) {
 	}
 	for _, task := range []db.Task{
 		{ID: "task-plan", RepoFullName: "acme/app", Title: "Plan rollout", State: "planned", Branch: "plan"},
+		{ID: "task-unknown", RepoFullName: "acme/app", Title: "Future lifecycle", State: "future_state", Branch: "future"},
 		{ID: "task-pr", RepoFullName: "acme/app", Title: "Ship dashboard", State: "ready_to_merge", Branch: "ship-dashboard"},
 		{ID: "task-blocked", RepoFullName: "acme/ops", Title: "Rotate key", State: "awaiting_human", Branch: "rotate"},
 		{ID: "task-merged-recent", RepoFullName: "acme/app", Title: "Recent merge", State: "merged", Branch: "recent"},
@@ -130,6 +131,7 @@ func TestDashboardOverviewTasksAndAutoWorkflows(t *testing.T) {
 	defer raw.Close()
 	for id, updated := range map[string]string{
 		"task-plan":          stamp(2 * time.Hour),
+		"task-unknown":       stamp(15 * time.Minute),
 		"task-pr":            stamp(time.Hour),
 		"task-blocked":       stamp(30 * time.Minute),
 		"task-merged-recent": stamp(6 * 24 * time.Hour),
@@ -155,10 +157,10 @@ func TestDashboardOverviewTasksAndAutoWorkflows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dashboardTasks: %v", err)
 	}
-	if len(tasks) != 4 {
-		t.Fatalf("tasks len=%d want 4 (old merged excluded): %+v", len(tasks), tasks)
+	if len(tasks) != 3 {
+		t.Fatalf("tasks len=%d want 3 (planned, unknown, old merged excluded): %+v", len(tasks), tasks)
 	}
-	if tasks[0].ID != "task-plan" || tasks[1].ID != "task-pr" || tasks[1].State != "pr_open" || tasks[1].Agent != "alpha" || tasks[1].PRNumber != 42 || tasks[2].BlockedReason != "Awaiting human input" || tasks[3].ID != "task-merged-recent" {
+	if tasks[0].ID != "task-pr" || tasks[0].State != "pr_open" || tasks[0].Agent != "alpha" || tasks[0].PRNumber != 42 || tasks[1].ID != "task-blocked" || tasks[1].BlockedReason != "Awaiting human input" || tasks[2].ID != "task-merged-recent" {
 		t.Fatalf("task projection/order = %+v", tasks)
 	}
 
@@ -229,8 +231,14 @@ func TestWebDashboardTasksRoundTripAndMergedWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if err := store.UpsertTask(context.Background(), db.Task{ID: "task-1", RepoFullName: "acme/app", Title: "Implement", State: "implementing"}); err != nil {
-		t.Fatalf("UpsertTask: %v", err)
+	for _, task := range []db.Task{
+		{ID: "task-1", RepoFullName: "acme/app", Title: "Implement", State: "implementing"},
+		{ID: "task-planned", RepoFullName: "acme/app", Title: "Plan", State: "planned"},
+		{ID: "task-unknown", RepoFullName: "acme/app", Title: "Future", State: "future_state"},
+	} {
+		if err := store.UpsertTask(context.Background(), task); err != nil {
+			t.Fatalf("UpsertTask(%s): %v", task.ID, err)
+		}
 	}
 	store.Close()
 
@@ -245,5 +253,31 @@ func TestWebDashboardTasksRoundTripAndMergedWindow(t *testing.T) {
 	}
 	if len(tasks) != 1 || tasks[0].ID != "task-1" || tasks[0].State != "implementing" || tasks[0].UpdatedAt == 0 {
 		t.Fatalf("tasks round trip = %+v", tasks)
+	}
+}
+
+func TestDashboardTaskStateFiltersUnsupportedStates(t *testing.T) {
+	tests := []struct {
+		internal, state, reason string
+		ok                      bool
+	}{
+		{internal: "planned"},
+		{internal: "future_state"},
+		{internal: "implementing", state: "implementing", ok: true},
+		{internal: "pr_open", state: "pr_open", ok: true},
+		{internal: "reviewing", state: "pr_open", ok: true},
+		{internal: "changes_requested", state: "pr_open", ok: true},
+		{internal: "ready_to_merge", state: "pr_open", ok: true},
+		{internal: "blocked", state: "blocked", reason: "Task is blocked", ok: true},
+		{internal: "awaiting_human", state: "blocked", reason: "Awaiting human input", ok: true},
+		{internal: "merged", state: "merged", ok: true},
+	}
+	for _, test := range tests {
+		t.Run(test.internal, func(t *testing.T) {
+			state, reason, ok := dashboardTaskState(test.internal)
+			if state != test.state || reason != test.reason || ok != test.ok {
+				t.Fatalf("dashboardTaskState(%q) = (%q, %q, %v), want (%q, %q, %v)", test.internal, state, reason, ok, test.state, test.reason, test.ok)
+			}
+		})
 	}
 }
