@@ -333,7 +333,7 @@ gitmoot daemon start --session <root-job-id>
 gitmoot daemon start
 gitmoot daemon status
 gitmoot daemon restart
-gitmoot daemon stop [--forget-runtime-auth]
+gitmoot daemon stop
 gitmoot dashboard --json
 gitmoot dashboard --web [--addr 127.0.0.1:8080]
 gitmoot plugin doctor
@@ -400,9 +400,9 @@ only that repo's queued jobs. Omit `--repo` to supervise every enabled
 registered repo from one daemon (#581). Both `daemon run` and `daemon start` accept `--session <root-job-id>`
 (alias `--root`) to pin the worker to one orchestration run: it then runs only
 jobs whose `root_job_id` matches that value plus the root coordinator job
-itself. To restart the daemon without losing its persisted Claude token, use
-`gitmoot daemon restart` (not stop + start); `gitmoot daemon stop
---forget-runtime-auth` deletes the persisted token file.
+itself. Claude auth lives in `runtime-auth.env`; rotate it with `gitmoot auth
+set claude` and clear it with `gitmoot auth unset claude`. Adapter builds read
+the file per delivery, so no daemon restart is needed.
 
 Use `gitmoot agent prompt <agent-or-template>` when the user wants to reuse a
 Gitmoot agent prompt in the current chat. Use `gitmoot agent run` for
@@ -1945,13 +1945,11 @@ failure followed by a success):
   concurrency is retried with backoff without abandoning the session
   (#487/#509).
 
-Daemon restarts and Claude auth: the daemon persists its Claude token into an
-owner-only (0600) `daemon-runtime.env` file in the Gitmoot home (#578/#588).
-`gitmoot daemon restart` recovers that token even when the invoking shell lacks
-`CLAUDE_CODE_OAUTH_TOKEN`; a plain `stop` + `start` re-inherits the launching
-shell's environment (and warns loudly when that would come up auth-less). A
-recovered token may be stale — verify with `gitmoot doctor`. `gitmoot daemon
-stop --forget-runtime-auth` deletes the persisted file.
+Claude auth is read from owner-only (0600) `runtime-auth.env` for every adapter
+build. Rotate it with `gitmoot auth set claude`; no daemon restart is needed.
+Use `gitmoot auth status` for masked source details and `gitmoot auth probe
+claude` (or `gitmoot doctor`) for a live check. Clear it with `gitmoot auth
+unset claude`, not by deleting the file.
 
 ## Repo Remotes
 
@@ -3925,7 +3923,7 @@ Changing workers/scheduler/poll no longer needs a daemon restart (#577):
 environment re-inheritance (so the daemon's runtime auth is untouched). Values
 pinned by explicit launch flags win over the re-read config. When a full
 restart is genuinely needed, prefer `gitmoot daemon restart`, which recovers
-the persisted Claude token (#578).
+the per-delivery Claude auth file.
 
 ## Cap one repo's parallelism from config
 
@@ -8758,9 +8756,10 @@ same Codex, Claude, or Kimi session, and branch locks protect implementation
 ownership.
 The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
-To restart the daemon without losing its Claude token, use
-`gitmoot daemon restart` (not stop + start); see CLI.md § Repo And Daemon
-Status for the runtime-auth persistence model.
+Claude runtime auth lives in `runtime-auth.env`; rotate it with `gitmoot auth
+set claude` and clear it with `gitmoot auth unset claude`. Adapter builds read
+the file per delivery, so no daemon restart is needed. See CLI.md for the
+single-source model.
 
 When a job is **blocked** and the user asks to "resume a blocked job", "clear a
 blocker", or "what does this job need" (#682), route to
@@ -9150,9 +9149,9 @@ gh auth status
 ```
 
 `gitmoot doctor` is the environment preflight: it validates `gh auth` (with an
-actionable remediation hint) and the runtime credentials — including a
-daemon-aware live probe of the Claude token — so a bad credential is caught
-before jobs stall. Run it after install and before starting the daemon.
+actionable remediation hint) and live-probes the Claude credential selected by
+`runtime-auth.env`, so a bad credential is caught before jobs stall. Run it
+after install and before starting the daemon.
 
 One-shot onboarding: `gitmoot setup` registers the repo and an agent in one
 command (`--repo owner/repo --agent <name> --runtime codex|claude|shell
@@ -9247,6 +9246,30 @@ runtime name is a config error surfaced by `gitmoot runtime list`.
 
 ## Runtime Ambient Credential Hygiene
 
+Claude runtime auth has one authoritative source:
+`~/.gitmoot/runtime-auth.env` (mode `0600`). Manage it without putting secrets
+on argv:
+
+```sh
+claude setup-token
+gitmoot auth set claude             # reads the token from stdin
+gitmoot auth status                 # local, masked, no paid runtime call
+gitmoot auth probe claude           # paid fresh-session liveness check
+gitmoot auth unset claude           # writes an explicit empty file
+```
+
+`auth set claude --var ANTHROPIC_API_KEY` and `--var
+ANTHROPIC_AUTH_TOKEN` select another managed variable. `--from-env` atomically
+copies currently set managed variables. The file is re-read for every Claude
+adapter build, so rotation takes effect on the next foreground or daemon
+delivery without a restart. If the file selects any managed variable, Gitmoot
+injects all three names and explicitly blanks absent ones; this prevents an
+ambient API key from outranking a file-selected OAuth token. An explicitly
+empty file injects nothing and allows Claude's normal ambient/credential-store
+fallback. The first adapter build imports legacy `daemon-runtime.env` when the
+new file is absent, otherwise it seeds from ambient managed variables once;
+existing authoritative files are never overwritten.
+
 Runtime-child environment curation is off by default. Enable it in
 `config.toml`:
 
@@ -9265,11 +9288,11 @@ daemon environment exactly as before. With it enabled, the base allowlist is:
 `GOTOOLCHAIN`, `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`,
 `GIT_COMMITTER_EMAIL`, and `GITMOOT_HOME`.
 
-Codex additionally receives `CODEX_HOME`. Claude receives the transitional P1
-exceptions `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`,
-`ANTHROPIC_AUTH_TOKEN`, and `CLAUDE_CONFIG_DIR`. Kimi, legacy `kimi-cli`, and
-shell add nothing. Gitmoot-owned relay, shell-stage, pipeline, and upstream-file
-variables are appended after the base and remain available.
+Codex additionally receives `CODEX_HOME`. Claude receives `CLAUDE_CONFIG_DIR`;
+its three managed auth names are then resolved from `runtime-auth.env` at the
+adapter seam described above. Kimi, legacy `kimi-cli`, and shell add nothing.
+Gitmoot-owned relay, shell-stage, pipeline, and upstream-file variables are
+appended after the base and remain available.
 
 `env_passthrough` accepts exact names or a single trailing-`*` prefix glob.
 Names containing `=` or NUL and non-trailing `*` forms are invalid. The base
@@ -9323,7 +9346,7 @@ gitmoot daemon start
 gitmoot daemon status
 gitmoot daemon logs
 gitmoot daemon restart
-gitmoot daemon stop [--forget-runtime-auth]
+gitmoot daemon stop
 ```
 
 For structured local state, use `gitmoot dashboard --json` or
@@ -9391,15 +9414,11 @@ parallelism) live (#577) — no teardown, no dropped jobs, no environment
 re-inheritance. Values pinned by explicit launch flags win over the re-read
 config. Prefer SIGHUP over a restart when only tuning throughput.
 
-Runtime auth across restarts (#578/#588): the daemon persists its Claude token
-into an owner-only (0600) `daemon-runtime.env` file in the Gitmoot home.
-`gitmoot daemon restart` recovers that token even when the invoking shell lacks
-`CLAUDE_CODE_OAUTH_TOKEN`; a plain `daemon stop` + `daemon start` does **not**
-recover it (start re-inherits the launching shell's environment). A recovered
-token may be stale — verify with `gitmoot doctor`. A (re)start that would come
-up without Claude auth warns loudly on stderr (non-fatal). `gitmoot daemon stop
---forget-runtime-auth` deletes the persisted file so a later restart cannot
-recover the token.
+Claude runtime auth is independent of daemon restarts. Use `gitmoot auth set
+claude` to rotate the owner-only `runtime-auth.env`; the next delivery observes
+it. Use `gitmoot auth unset claude` to write the explicit-empty state. Do not
+delete the file to unset auth, because a missing file is eligible for one-time
+legacy/environment bootstrap.
 
 An opt-in, off-by-default `[admission]` config section adds a host-global
 concurrency budget the daemon applies **before** starting each agent session,
@@ -13556,6 +13575,15 @@ plan explicitly says they are intended tracked fixtures or release assets.
 
 Redact secrets from GitHub comments, job summaries, raw examples, and copied
 command output.
+
+Claude runtime credentials live only in the owner-readable (mode `0600`)
+`~/.gitmoot/runtime-auth.env`. Write them with `gitmoot auth set claude`, which
+reads stdin and replaces the file atomically; rotate without restarting the
+daemon. `gitmoot auth status` prints masked fingerprints only. To clear auth,
+use `gitmoot auth unset claude`: it writes an explicit empty file so bootstrap
+cannot resurrect a legacy or ambient token. When one managed variable is
+selected, Gitmoot injects all three Claude auth names and blanks the absent
+ones, preventing ambient API-key precedence from changing the selection.
 
 ### Runtime ambient credential hygiene
 

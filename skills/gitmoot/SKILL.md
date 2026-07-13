@@ -96,9 +96,10 @@ same Codex, Claude, or Kimi session, and branch locks protect implementation
 ownership.
 The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
-To restart the daemon without losing its Claude token, use
-`gitmoot daemon restart` (not stop + start); see CLI.md § Repo And Daemon
-Status for the runtime-auth persistence model.
+Claude runtime auth lives in `runtime-auth.env`; rotate it with `gitmoot auth
+set claude` and clear it with `gitmoot auth unset claude`. Adapter builds read
+the file per delivery, so no daemon restart is needed. See CLI.md for the
+single-source model.
 
 When a job is **blocked** and the user asks to "resume a blocked job", "clear a
 blocker", or "what does this job need" (#682), route to

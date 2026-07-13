@@ -40,8 +40,9 @@ var curatedBaseEnvNames = []string{
 
 var curatedRuntimeEnvNames = map[string][]string{
 	runtime.CodexRuntime: {"CODEX_HOME"},
-	// Transitional P1 exception: Claude still receives its ambient auth and
-	// config location. Moving state and removing ambient auth belong to P2/P3.
+	// Claude's ambient auth names remain available only for the explicit-empty
+	// authoritative-file fallback. A populated runtime-auth.env overlay is
+	// appended later and wins, including explicit blanks for absent names.
 	runtime.ClaudeRuntime:  {"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CONFIG_DIR"},
 	runtime.KimiRuntime:    {},
 	runtime.KimiCLIRuntime: {},
@@ -129,63 +130,109 @@ func matchesCredentialPassthrough(name string, patterns []string) bool {
 }
 
 func runtimeJobRunner(home string, runtimeName string, outer subprocess.Runner) (subprocess.Runner, error) {
-	curated, err := curatedJobRunner(home, runtimeName)
-	if err != nil || curated == nil {
-		return outer, err
+	runner, _, _, err := runtimeJobRunnerWithAuth(home, runtimeName, outer)
+	return runner, err
+}
+
+// runtimeJobRunnerWithAuth is runtimeJobRunner plus the resolved Claude auth
+// state/source used by `auth probe` and the one-shot doctor. Production adapter
+// construction uses runtimeJobRunner and therefore shares this exact path.
+func runtimeJobRunnerWithAuth(home string, runtimeName string, outer subprocess.Runner) (subprocess.Runner, runtimeAuthFile, string, error) {
+	var authState runtimeAuthFile
+	var authSource string
+	if runtimeName == runtime.ClaudeRuntime {
+		authSource = runtimeAuthFileName
+		paths, err := pathsFromFlag(home)
+		if err != nil {
+			return nil, authState, authSource, err
+		}
+		if _, err := bootstrapRuntimeAuth(paths.Home, runtimeAuthEnvLookup, runtimeAuthLogf); err != nil {
+			return nil, authState, authSource, fmt.Errorf("bootstrap Claude runtime auth: %w", err)
+		}
+		authState, err = loadRuntimeAuthFile(paths.Home)
+		if err != nil {
+			return nil, authState, authSource, err
+		}
+		authSource = runtimeAuthSource(authState, runtimeAuthEnvLookup)
+		warnRuntimeAuthConflicts(authState, runtimeAuthEnvLookup, runtimeAuthLogf)
 	}
+
+	curated, err := curatedJobRunner(home, runtimeName)
+	if err != nil {
+		return nil, authState, authSource, err
+	}
+	if runtimeName == runtime.ClaudeRuntime {
+		authEnv := runtimeAuthInjectionEnv(authState)
+		if curated != nil {
+			base := curated.(subprocess.CuratedGroupRunner)
+			base.BaseEnv = append(base.BaseEnv, authEnv...)
+			curated = base
+		} else if len(authEnv) > 0 {
+			baseEnv := append([]string{}, os.Environ()...)
+			baseEnv = append(baseEnv, authEnv...)
+			curated = subprocess.CuratedGroupRunner{BaseEnv: baseEnv}
+		}
+	}
+	if curated == nil {
+		return outer, authState, authSource, nil
+	}
+	return graftRuntimeBaseRunner(outer, curated), authState, authSource, nil
+}
+
+func graftRuntimeBaseRunner(outer subprocess.Runner, curated subprocess.Runner) subprocess.Runner {
 	if outer == nil {
-		return curated, nil
+		return curated
 	}
 	switch runner := outer.(type) {
 	case subprocess.GroupRunner:
-		return curated, nil
+		return curated
 	case *subprocess.GroupRunner:
-		return curated, nil
+		return curated
 	case subprocess.TeeRunner:
 		if runner.Inner == nil {
 			runner.Inner = curated.(subprocess.StreamRunner)
 		} else if _, ok := runner.Inner.(subprocess.GroupRunner); ok {
 			runner.Inner = curated.(subprocess.StreamRunner)
 		}
-		return runner, nil
+		return runner
 	case *subprocess.TeeRunner:
 		if runner.Inner == nil {
 			runner.Inner = curated.(subprocess.StreamRunner)
 		} else if _, ok := runner.Inner.(subprocess.GroupRunner); ok {
 			runner.Inner = curated.(subprocess.StreamRunner)
 		}
-		return runner, nil
+		return runner
 	case subprocess.EnvInjectingRunner:
 		if runner.Inner == nil {
 			runner.Inner = curated
 		} else if _, ok := runner.Inner.(subprocess.GroupRunner); ok {
 			runner.Inner = curated
 		}
-		return runner, nil
+		return runner
 	case *subprocess.EnvInjectingRunner:
 		if runner.Inner == nil {
 			runner.Inner = curated
 		} else if _, ok := runner.Inner.(subprocess.GroupRunner); ok {
 			runner.Inner = curated
 		}
-		return runner, nil
+		return runner
 	case subprocess.WrappingRunner:
 		if runner.Inner == nil {
 			runner.Inner = curated
 		} else if _, ok := runner.Inner.(subprocess.GroupRunner); ok {
 			runner.Inner = curated
 		}
-		return runner, nil
+		return runner
 	case *subprocess.WrappingRunner:
 		if runner.Inner == nil {
 			runner.Inner = curated
 		} else if _, ok := runner.Inner.(subprocess.GroupRunner); ok {
 			runner.Inner = curated
 		}
-		return runner, nil
+		return runner
 	default:
 		// Explicit custom/fake runners remain authoritative test and extension seams.
-		return outer, nil
+		return outer
 	}
 }
 

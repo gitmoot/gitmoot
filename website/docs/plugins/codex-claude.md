@@ -237,44 +237,31 @@ gitmoot job watch <job-id>
 The plugin is discovery and guidance. The `gitmoot` CLI is still the execution
 path.
 
-If Claude Code needs an OAuth token or other runtime credential, configure it
-through the Claude CLI or a user-owned environment file, then restart any
-Gitmoot daemon or runtime session that must inherit the new environment. Never
-paste tokens into PR comments, issue bodies, tracked files, generated plugin
-packages, or logs.
+If Claude Code needs an OAuth token or other runtime credential, create it with
+the Claude CLI and install it with `gitmoot auth set claude`. Gitmoot reads the
+owner-only credential file on each delivery, so no daemon restart is needed.
+Never paste tokens into PR comments, issue bodies, tracked files, generated
+plugin packages, or logs.
 
-### Claude background-auth: per-shell export vs. the daemon
+### Claude background auth
 
-Claude background jobs run **non-interactively** inside the daemon, so the
-daemon's environment must carry the token:
+Claude background jobs run **non-interactively**. Store their long-lived token
+in Gitmoot's authoritative owner-only file:
 
 ```sh
 claude setup-token
-export CLAUDE_CODE_OAUTH_TOKEN=<token>
+gitmoot auth set claude
+gitmoot auth status
+gitmoot auth probe claude
 ```
 
-`export` only affects the **current shell**, so restart the daemon **from that
-same shell** so it inherits the token. `gitmoot doctor` reports `claude auth`
-for the shell that ran it, labeled `current shell (not the daemon)`, and on
-Linux it also reports `claude auth (daemon)` read from the running daemon's
-environment. The daemon line is the one that matters; `gitmoot daemon status`
-prints it too. A shell-local warn in one terminal does not mean the daemon is
-broken.
-
-To make the token survive new terminals and daemon restarts:
-
-- Persist it in **`~/.bashrc`**, not `~/.profile`. Interactive non-login
-  terminals (desktop tabs, most SSH sessions) read `~/.bashrc`; `~/.profile` is
-  read only by login shells. On Debian / Raspberry Pi OS the default
-  `~/.profile` itself sources `~/.bashrc`, so `~/.bashrc` covers both:
-
-  ```sh
-  echo 'export CLAUDE_CODE_OAUTH_TOKEN=<token>' >> ~/.bashrc
-  ```
-
-- Most robust: run the daemon under **`systemd --user`** with an
-  `EnvironmentFile`, so daemon auth no longer depends on which shell launched
-  it. Keep that env file readable only by you (`chmod 600`) and never commit it.
+`auth set` reads stdin without echo on a TTY and atomically updates
+`~/.gitmoot/runtime-auth.env` (mode `0600`). Rotation is visible on the next
+delivery. `auth status` is local and masked; `auth probe` and `gitmoot doctor`
+perform fresh live checks. Clear credentials with `gitmoot auth unset claude`,
+which writes an explicit-empty file. For systemd deployments, keep only
+operational settings such as `PATH` in `daemon.env`; Claude secrets belong in
+`runtime-auth.env`.
 
 For fast current-chat planning, ask Claude Code to use the Gitmoot planner here
 instead of starting a background `gitmoot agent ask` job.

@@ -148,7 +148,7 @@ gitmoot daemon start --session <root-job-id>
 gitmoot daemon start
 gitmoot daemon status
 gitmoot daemon restart
-gitmoot daemon stop [--forget-runtime-auth]
+gitmoot daemon stop
 gitmoot dashboard --json
 gitmoot dashboard --web [--addr 127.0.0.1:8080]
 gitmoot plugin doctor
@@ -215,9 +215,9 @@ only that repo's queued jobs. Omit `--repo` to supervise every enabled
 registered repo from one daemon (#581). Both `daemon run` and `daemon start` accept `--session <root-job-id>`
 (alias `--root`) to pin the worker to one orchestration run: it then runs only
 jobs whose `root_job_id` matches that value plus the root coordinator job
-itself. To restart the daemon without losing its persisted Claude token, use
-`gitmoot daemon restart` (not stop + start); `gitmoot daemon stop
---forget-runtime-auth` deletes the persisted token file.
+itself. Claude auth lives in `runtime-auth.env`; rotate it with `gitmoot auth
+set claude` and clear it with `gitmoot auth unset claude`. Adapter builds read
+the file per delivery, so no daemon restart is needed.
 
 Use `gitmoot agent prompt <agent-or-template>` when the user wants to reuse a
 Gitmoot agent prompt in the current chat. Use `gitmoot agent run` for

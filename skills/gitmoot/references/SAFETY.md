@@ -115,6 +115,15 @@ plan explicitly says they are intended tracked fixtures or release assets.
 Redact secrets from GitHub comments, job summaries, raw examples, and copied
 command output.
 
+Claude runtime credentials live only in the owner-readable (mode `0600`)
+`~/.gitmoot/runtime-auth.env`. Write them with `gitmoot auth set claude`, which
+reads stdin and replaces the file atomically; rotate without restarting the
+daemon. `gitmoot auth status` prints masked fingerprints only. To clear auth,
+use `gitmoot auth unset claude`: it writes an explicit empty file so bootstrap
+cannot resurrect a legacy or ambient token. When one managed variable is
+selected, Gitmoot injects all three Claude auth names and blanks the absent
+ones, preventing ambient API-key precedence from changing the selection.
+
 ### Runtime ambient credential hygiene
 
 The optional `[credentials] env_curation = true` policy curates only runtime

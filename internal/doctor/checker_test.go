@@ -134,6 +134,30 @@ func TestClaudeAuthEnvLiveProbeOKFlipsWarnToOK(t *testing.T) {
 	}
 }
 
+func TestClaudeAuthEnvLiveProbeReportsResolvedSource(t *testing.T) {
+	runner := fakeRunner{
+		runs: map[string]subprocess.Result{claudeProbeKey: {Stdout: `{"result":"OK"}`}},
+	}
+	check := Checker{
+		Runner:            fakeRunner{},
+		LiveProbe:         true,
+		ClaudeProbeRunner: runner,
+		ClaudeAuthLookup: func(name string) (string, bool) {
+			if name == runtime.ClaudeOAuthTokenEnv {
+				return "secret-never-rendered", true
+			}
+			return "", false
+		},
+		ClaudeAuthSource: "runtime-auth.env",
+	}.claudeAuthEnv(context.Background())
+	if !check.OK || !strings.Contains(check.Detail, "runtime-auth.env") {
+		t.Fatalf("check = %+v", check)
+	}
+	if strings.Contains(check.Detail, "secret-never-rendered") {
+		t.Fatalf("detail leaked credential: %q", check.Detail)
+	}
+}
+
 func TestClaudeAuthEnvLiveProbeFailIsNotOK(t *testing.T) {
 	withClaudeAuthEnv(t, nil)
 	runner := fakeRunner{

@@ -2,281 +2,215 @@ package cli
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
-// secretToken is a distinctive value so tests can assert it NEVER leaks into
-// stdout/stderr/log while still confirming it lands in the 0600 file / child env.
-const secretToken = "sk-ant-oat01-SECRET-DO-NOT-LOG-abcdef0123456789"
+const (
+	testOAuthToken = "sk-ant-oat01-file-token-abcdefghijklmnopqrstuvwxyz"
+	testAPIKey     = "sk-ant-api03-ambient-token-abcdefghijklmnopqrstuvwxyz"
+	testAuthToken  = "sk-ant-auth-token-abcdefghijklmnopqrstuvwxyz"
+)
 
-func runtimeAuthFileFor(t *testing.T, home string) string {
-	t.Helper()
-	return daemonRuntimeAuthFilePath(config.PathsForHome(home).Home)
+func TestRuntimeAuthLoaderAndBlankOutRule(t *testing.T) {
+	home := t.TempDir()
+	if err := writeRuntimeAuthFile(runtimeAuthFilePath(home), map[string]string{
+		runtime.ClaudeOAuthTokenEnv: testOAuthToken,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadRuntimeAuthFile(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := state.Values[runtime.ClaudeOAuthTokenEnv]; got != testOAuthToken {
+		t.Fatalf("file OAuth = %q", got)
+	}
+	want := []string{
+		runtime.ClaudeOAuthTokenEnv + "=" + testOAuthToken,
+		runtime.AnthropicAPIKeyEnv + "=",
+		runtime.AnthropicAuthTokenEnv + "=",
+	}
+	got := runtimeAuthInjectionEnv(state)
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("injection = %q, want %q", got, want)
+	}
+	lookup := runtimeAuthEffectiveLookup(state, func(name string) (string, bool) {
+		if name == runtime.AnthropicAPIKeyEnv {
+			return testAPIKey, true
+		}
+		return "", false
+	})
+	if value, ok := lookup(runtime.AnthropicAPIKeyEnv); ok || value != "" {
+		t.Fatalf("ambient API key survived authoritative file: value=%q ok=%v", value, ok)
+	}
 }
 
-// TestDaemonStartPersistsRuntimeAuth_0600 — scenario (a): starting with a token
-// in the environment writes the owner-only file with mode 0600 whose contents
-// carry the token, and the token never appears on stdout/stderr.
-func TestDaemonStartPersistsRuntimeAuth_0600(t *testing.T) {
-	withStubbedDaemonChild(t)
-	withClaudeAuthLookup(t, map[string]string{runtime.ClaudeOAuthTokenEnv: secretToken})
-	home := t.TempDir()
+func TestRuntimeAuthLoaderEmptyMissingMalformedAndPermissions(t *testing.T) {
+	t.Run("explicit empty", func(t *testing.T) {
+		home := t.TempDir()
+		if err := writeRuntimeAuthFile(runtimeAuthFilePath(home), nil); err != nil {
+			t.Fatal(err)
+		}
+		state, err := loadRuntimeAuthFile(home)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !state.Exists || len(state.Values) != 0 || runtimeAuthInjectionEnv(state) != nil {
+			t.Fatalf("state = %+v, injection=%v", state, runtimeAuthInjectionEnv(state))
+		}
+	})
+	t.Run("missing", func(t *testing.T) {
+		state, err := loadRuntimeAuthFile(t.TempDir())
+		if err != nil || state.Exists || runtimeAuthInjectionEnv(state) != nil {
+			t.Fatalf("state=%+v err=%v", state, err)
+		}
+	})
+	t.Run("malformed", func(t *testing.T) {
+		home := t.TempDir()
+		path := runtimeAuthFilePath(home)
+		if err := os.WriteFile(path, []byte("NOT_MANAGED=secret\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := loadRuntimeAuthFile(home)
+		if err == nil || !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), "line 1") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("permissions", func(t *testing.T) {
+		home := t.TempDir()
+		path := runtimeAuthFilePath(home)
+		if err := os.WriteFile(path, []byte(runtime.ClaudeOAuthTokenEnv+"="+testOAuthToken+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, err := loadRuntimeAuthFile(home)
+		if err == nil || !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), "0644") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+}
 
+func TestRuntimeAuthBootstrapPrecedenceAndNoOverwrite(t *testing.T) {
+	lookup := func(name string) (string, bool) {
+		if name == runtime.AnthropicAPIKeyEnv {
+			return testAPIKey, true
+		}
+		return "", false
+	}
+	t.Run("legacy first", func(t *testing.T) {
+		home := t.TempDir()
+		legacy := runtime.ClaudeOAuthTokenEnv + "=" + testOAuthToken + "\n"
+		if err := os.WriteFile(legacyRuntimeAuthFilePath(home), []byte(legacy), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var logs []string
+		seeded, err := bootstrapRuntimeAuth(home, lookup, func(format string, args ...any) {
+			logs = append(logs, fmt.Sprintf(format, args...))
+		})
+		if err != nil || !seeded {
+			t.Fatalf("seeded=%v err=%v", seeded, err)
+		}
+		state, err := loadRuntimeAuthFile(home)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.Values[runtime.ClaudeOAuthTokenEnv] != testOAuthToken || state.Values[runtime.AnthropicAPIKeyEnv] != "" {
+			t.Fatalf("legacy did not win: %+v", state.Values)
+		}
+		if len(logs) != 1 || !strings.Contains(logs[0], legacyRuntimeAuthFileName) {
+			t.Fatalf("logs = %v", logs)
+		}
+	})
+	t.Run("ambient second", func(t *testing.T) {
+		home := t.TempDir()
+		seeded, err := bootstrapRuntimeAuth(home, lookup, nil)
+		if err != nil || !seeded {
+			t.Fatalf("seeded=%v err=%v", seeded, err)
+		}
+		state, err := loadRuntimeAuthFile(home)
+		if err != nil || state.Values[runtime.AnthropicAPIKeyEnv] != testAPIKey {
+			t.Fatalf("state=%+v err=%v", state, err)
+		}
+	})
+	t.Run("never overwrite", func(t *testing.T) {
+		home := t.TempDir()
+		if err := writeRuntimeAuthFile(runtimeAuthFilePath(home), map[string]string{runtime.AnthropicAuthTokenEnv: testAuthToken}); err != nil {
+			t.Fatal(err)
+		}
+		seeded, err := bootstrapRuntimeAuth(home, lookup, nil)
+		if err != nil || seeded {
+			t.Fatalf("seeded=%v err=%v", seeded, err)
+		}
+		state, _ := loadRuntimeAuthFile(home)
+		if state.Values[runtime.AnthropicAuthTokenEnv] != testAuthToken || len(state.Values) != 1 {
+			t.Fatalf("existing file changed: %+v", state.Values)
+		}
+	})
+}
+
+func TestRuntimeAuthConflictWarningMaskedOncePerBuild(t *testing.T) {
+	home := t.TempDir()
+	pathsHome := filepath.Join(home, ".gitmoot")
+	if err := os.MkdirAll(pathsHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeRuntimeAuthFile(runtimeAuthFilePath(pathsHome), map[string]string{
+		runtime.ClaudeOAuthTokenEnv: testOAuthToken,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	oldLookup, oldLogf := runtimeAuthEnvLookup, runtimeAuthLogf
+	runtimeAuthEnvLookup = func(name string) (string, bool) {
+		if name == runtime.ClaudeOAuthTokenEnv {
+			return "sk-ant-oat01-ambient-different-abcdefghijklmnopqrstuvwxyz", true
+		}
+		return "", false
+	}
+	var logs []string
+	runtimeAuthLogf = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
+	t.Cleanup(func() {
+		runtimeAuthEnvLookup = oldLookup
+		runtimeAuthLogf = oldLogf
+	})
+	if _, err := runtimeJobRunner(home, runtime.ClaudeRuntime, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || !strings.Contains(logs[0], "WARNING") || !strings.Contains(logs[0], "sk-ant-o...") {
+		t.Fatalf("logs = %q", logs)
+	}
+	if strings.Contains(logs[0], testOAuthToken) || strings.Contains(logs[0], "ambient-different") {
+		t.Fatalf("warning leaked token: %q", logs[0])
+	}
+}
+
+func TestDaemonStartBootstrapsRuntimeAuth(t *testing.T) {
+	home := t.TempDir()
+	oldLookup := runtimeAuthEnvLookup
+	runtimeAuthEnvLookup = func(name string) (string, bool) {
+		if name == runtime.ClaudeOAuthTokenEnv {
+			return testOAuthToken, true
+		}
+		return "", false
+	}
+	oldStart := startDaemonChildFn
+	startDaemonChildFn = func(home, poll string, workers int, watchSkillOptReviews, watchIssues bool, scheduler, repo, session string, state daemonState, workDir string) (daemonMeta, error) {
+		return daemonMeta{PID: 987654, LogFile: state.LogFile}, nil
+	}
+	t.Cleanup(func() {
+		runtimeAuthEnvLookup = oldLookup
+		startDaemonChildFn = oldStart
+	})
 	var stdout, stderr bytes.Buffer
 	if code := runDaemonStartWithWorkDirRestart([]string{"--home", home}, "", false, false, &stdout, &stderr); code != 0 {
-		t.Fatalf("start returned %d; stderr=%q", code, stderr.String())
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
-
-	path := runtimeAuthFileFor(t, home)
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("expected persisted runtime-auth file: %v", err)
+	state, err := loadRuntimeAuthFile(filepath.Join(home, ".gitmoot"))
+	if err != nil || state.Values[runtime.ClaudeOAuthTokenEnv] != testOAuthToken {
+		t.Fatalf("state=%+v err=%v", state, err)
 	}
-	if got := info.Mode().Perm(); got != daemonRuntimeAuthFilePerm {
-		t.Fatalf("runtime-auth file mode = %o, want %o (owner read/write only)", got, daemonRuntimeAuthFilePerm)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read persisted file: %v", err)
-	}
-	if !strings.Contains(string(data), runtime.ClaudeOAuthTokenEnv+"="+secretToken) {
-		t.Fatalf("persisted file should carry the token line; got %q", string(data))
-	}
-
-	// The token must NEVER reach the world-readable daemon.json meta.
-	if meta, err := os.ReadFile(filepath.Join(config.PathsForHome(home).Home, "daemon.json")); err == nil {
-		assertNoTokenLeak(t, string(meta))
-	}
-	assertNoTokenLeak(t, stdout.String(), stderr.String())
-}
-
-// TestDaemonStartRecoversRuntimeAuthIntoChildEnv — scenario (b): with the token
-// ABSENT from the launching environment but PRESENT in the persisted file, the
-// computed child environment (captured via the startDaemonChildFn seam) carries
-// the token, and it never appears on stdout/stderr.
-func TestDaemonStartRecoversRuntimeAuthIntoChildEnv(t *testing.T) {
-	home := t.TempDir()
-	// Seed a persisted token as if a prior token-bearing start had written it.
-	if err := os.MkdirAll(config.PathsForHome(home).Home, 0o700); err != nil {
-		t.Fatalf("mkdir home: %v", err)
-	}
-	if err := persistDaemonRuntimeAuth(config.PathsForHome(home).Home, func(k string) (string, bool) {
-		if k == runtime.ClaudeOAuthTokenEnv {
-			return secretToken, true
-		}
-		return "", false
-	}); err != nil {
-		t.Fatalf("seed persist: %v", err)
-	}
-
-	// Launching shell LACKS any runtime auth token.
-	withClaudeAuthLookup(t, map[string]string{})
-
-	var capturedEnv []string
-	prev := startDaemonChildFn
-	startDaemonChildFn = func(h, poll string, workers int, wsor, wi bool, scheduler, repo, session string, state daemonState, workDir string, extraEnv []string) (daemonMeta, error) {
-		capturedEnv = extraEnv
-		return daemonMeta{PID: 424242, LogFile: filepath.Join(h, "daemon.log")}, nil
-	}
-	t.Cleanup(func() { startDaemonChildFn = prev })
-
-	var stdout, stderr bytes.Buffer
-	if code := runDaemonStartWithWorkDirRestart([]string{"--home", home}, "", true, false, &stdout, &stderr); code != 0 {
-		t.Fatalf("start returned %d; stderr=%q", code, stderr.String())
-	}
-
-	want := runtime.ClaudeOAuthTokenEnv + "=" + secretToken
-	found := false
-	for _, e := range capturedEnv {
-		if e == want {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("child env should carry the recovered token entry %q; got %v (redacted)", runtime.ClaudeOAuthTokenEnv, redactEnvKeys(capturedEnv))
-	}
-	// Recovery replaces the #581 warning; the drop warning must NOT fire.
-	if strings.Contains(stderr.String(), "WARNING") {
-		t.Fatalf("recovered auth should suppress the drop warning; stderr=%q", stderr.String())
-	}
-	assertNoTokenLeak(t, stdout.String(), stderr.String())
-}
-
-// TestPersistDaemonRuntimeAuth_NeverOverwritesGoodTokenWithEmpty — invariant (3):
-// an environment with no runtime auth token must not clobber a previously
-// persisted good token.
-func TestPersistDaemonRuntimeAuth_NeverOverwritesGoodTokenWithEmpty(t *testing.T) {
-	dir := t.TempDir()
-	// First persist a good token.
-	if err := persistDaemonRuntimeAuth(dir, func(k string) (string, bool) {
-		if k == runtime.ClaudeOAuthTokenEnv {
-			return secretToken, true
-		}
-		return "", false
-	}); err != nil {
-		t.Fatalf("first persist: %v", err)
-	}
-	// Now persist with an empty env: the file must be untouched.
-	if err := persistDaemonRuntimeAuth(dir, func(string) (string, bool) { return "", false }); err != nil {
-		t.Fatalf("empty persist: %v", err)
-	}
-	got := loadDaemonRuntimeAuthFile(daemonRuntimeAuthFilePath(dir))
-	if got[runtime.ClaudeOAuthTokenEnv] != secretToken {
-		t.Fatalf("empty env clobbered the persisted token; got %v (redacted keys=%v)", got[runtime.ClaudeOAuthTokenEnv] != "", keysOf(got))
-	}
-}
-
-// TestPersistDaemonRuntimeAuth_PrefersLiveEnvOverFile — invariant (3): when a var
-// is set in both env and file, the live value wins.
-func TestPersistDaemonRuntimeAuth_PrefersLiveEnvOverFile(t *testing.T) {
-	dir := t.TempDir()
-	if err := persistDaemonRuntimeAuth(dir, func(k string) (string, bool) {
-		if k == runtime.ClaudeOAuthTokenEnv {
-			return "old-token", true
-		}
-		return "", false
-	}); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	if err := persistDaemonRuntimeAuth(dir, func(k string) (string, bool) {
-		if k == runtime.ClaudeOAuthTokenEnv {
-			return "new-token", true
-		}
-		return "", false
-	}); err != nil {
-		t.Fatalf("overwrite: %v", err)
-	}
-	got := loadDaemonRuntimeAuthFile(daemonRuntimeAuthFilePath(dir))
-	if got[runtime.ClaudeOAuthTokenEnv] != "new-token" {
-		t.Fatalf("live env should win over file; got %q", got[runtime.ClaudeOAuthTokenEnv])
-	}
-}
-
-// TestRecoverDaemonChildAuthEnv_PrefersLiveEnv — a var present in the live env is
-// NOT re-injected (the child inherits it), so recovery only fills genuine gaps.
-func TestRecoverDaemonChildAuthEnv_PrefersLiveEnv(t *testing.T) {
-	dir := t.TempDir()
-	if err := persistDaemonRuntimeAuth(dir, func(k string) (string, bool) {
-		if k == runtime.ClaudeOAuthTokenEnv {
-			return secretToken, true
-		}
-		return "", false
-	}); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	live := func(k string) (string, bool) {
-		if k == runtime.ClaudeOAuthTokenEnv {
-			return "live-value", true
-		}
-		return "", false
-	}
-	if got := recoverDaemonChildAuthEnv(dir, live); len(got) != 0 {
-		t.Fatalf("live-present var must not be re-injected; got %v (redacted)", redactEnvKeys(got))
-	}
-}
-
-// TestPersistDaemonRuntimeAuth_NoTokenNoFile — invariant (3): with no token the
-// file is not created at all.
-func TestPersistDaemonRuntimeAuth_NoTokenNoFile(t *testing.T) {
-	dir := t.TempDir()
-	if err := persistDaemonRuntimeAuth(dir, func(string) (string, bool) { return "", false }); err != nil {
-		t.Fatalf("persist: %v", err)
-	}
-	if _, err := os.Stat(daemonRuntimeAuthFilePath(dir)); !os.IsNotExist(err) {
-		t.Fatalf("no-token persist should not create the file; stat err=%v", err)
-	}
-}
-
-// TestRecoverDaemonChildAuthEnv_LiveAuthSuppressesStalePersisted — the
-// all-or-nothing recovery guard: when the live env already carries ANY runtime
-// auth, a DIFFERENT stale var still on disk must NOT be resurrected into the
-// child. Concretely, a stale ANTHROPIC_API_KEY (which overrides OAuth
-// billing/precedence) must not be injected alongside the operator's current
-// OAuth token after they migrated to OAuth-only.
-func TestRecoverDaemonChildAuthEnv_LiveAuthSuppressesStalePersisted(t *testing.T) {
-	dir := t.TempDir()
-	if err := writeDaemonRuntimeAuthFile(daemonRuntimeAuthFilePath(dir), map[string]string{
-		runtime.AnthropicAPIKeyEnv: "stale-api-key",
-	}); err != nil {
-		t.Fatalf("seed stale file: %v", err)
-	}
-	// Live env carries ONLY an OAuth token (operator migrated to OAuth-only).
-	live := func(k string) (string, bool) {
-		if k == runtime.ClaudeOAuthTokenEnv {
-			return secretToken, true
-		}
-		return "", false
-	}
-	if got := recoverDaemonChildAuthEnv(dir, live); len(got) != 0 {
-		t.Fatalf("live auth present: stale persisted vars must NOT be resurrected; got %v (redacted)", redactEnvKeys(got))
-	}
-}
-
-// TestPersistDaemonRuntimeAuth_PrunesRemovedVars — persistence is a full replace,
-// not a merge: a var present on an earlier start but REMOVED from the environment
-// by a later start must be pruned from the file so it can never be resurrected.
-func TestPersistDaemonRuntimeAuth_PrunesRemovedVars(t *testing.T) {
-	dir := t.TempDir()
-	// Day 1: only ANTHROPIC_API_KEY present.
-	if err := persistDaemonRuntimeAuth(dir, func(k string) (string, bool) {
-		if k == runtime.AnthropicAPIKeyEnv {
-			return "day1-api-key", true
-		}
-		return "", false
-	}); err != nil {
-		t.Fatalf("day1 persist: %v", err)
-	}
-	// Day 2: operator removed the API key and switched to OAuth-only.
-	if err := persistDaemonRuntimeAuth(dir, func(k string) (string, bool) {
-		if k == runtime.ClaudeOAuthTokenEnv {
-			return secretToken, true
-		}
-		return "", false
-	}); err != nil {
-		t.Fatalf("day2 persist: %v", err)
-	}
-	got := loadDaemonRuntimeAuthFile(daemonRuntimeAuthFilePath(dir))
-	if _, stale := got[runtime.AnthropicAPIKeyEnv]; stale {
-		t.Fatalf("removed ANTHROPIC_API_KEY must be pruned from the persisted file; got keys=%v", keysOf(got))
-	}
-	if got[runtime.ClaudeOAuthTokenEnv] != secretToken {
-		t.Fatalf("current OAuth token must be persisted; got keys=%v", keysOf(got))
-	}
-}
-
-// assertNoTokenLeak fails if the secret token appears in any captured diagnostic
-// stream — the SECURITY-CRITICAL non-leak requirement.
-func assertNoTokenLeak(t *testing.T, streams ...string) {
-	t.Helper()
-	for _, s := range streams {
-		if strings.Contains(s, secretToken) {
-			t.Fatalf("token leaked into diagnostic output: %q", s)
-		}
-	}
-}
-
-func redactEnvKeys(entries []string) []string {
-	out := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if k, _, ok := strings.Cut(e, "="); ok {
-			out = append(out, k+"=<redacted>")
-		} else {
-			out = append(out, "<redacted>")
-		}
-	}
-	return out
-}
-
-func keysOf(m map[string]string) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
 }
