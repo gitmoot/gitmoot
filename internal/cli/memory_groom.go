@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -109,6 +110,32 @@ type groomStaleEntry struct {
 	FallbackReason string                     `json:"fallback_reason"`
 }
 
+type groomQualityCandidateSummary struct {
+	ID             int64    `json:"id"`
+	Key            string   `json:"key"`
+	ContentHash    string   `json:"content_hash"`
+	Score          int      `json:"score"`
+	SignalFamilies []string `json:"signal_families"`
+}
+
+type groomQualityEntry struct {
+	Candidate      groomQualityCandidateSummary `json:"candidate"`
+	Verdict        string                       `json:"verdict"`
+	Confidence     float64                      `json:"confidence"`
+	Action         string                       `json:"action"`
+	Residue        string                       `json:"residue,omitempty"`
+	Model          string                       `json:"model,omitempty"`
+	Cached         bool                         `json:"cached"`
+	FallbackReason string                       `json:"fallback_reason,omitempty"`
+}
+
+type groomQualitySection struct {
+	Shadow     bool                `json:"shadow"`
+	Candidates []groomQualityEntry `json:"candidates"`
+	Retired    []int64             `json:"retired,omitempty"`
+	Skipped    []int64             `json:"skipped,omitempty"`
+}
+
 // groomPlan is the reviewable artifact `--propose` writes and `--yes --plan` reads.
 type groomPlan struct {
 	SchemaVersion       int                    `json:"schema_version"`
@@ -117,6 +144,7 @@ type groomPlan struct {
 	RewriteFlags        []groomPlanRewriteFlag `json:"rewrite_flags"`
 	Rekeys              []groomPlanRekey       `json:"rekeys"`
 	CrossPool           []groomPlanCrossPool   `json:"cross_pool"`
+	Quality             groomQualitySection    `json:"quality"`
 	Stale               []groomStaleEntry      `json:"stale"`
 	Stats               memory.GroomStats      `json:"stats"`
 }
@@ -153,6 +181,7 @@ type groomSplitOutput struct {
 	Skipped      []int64              `json:"skipped"`
 	Splits       []groomSplitSummary  `json:"splits"`
 	LLM          []groomSplitLLMEntry `json:"llm,omitempty"`
+	Quality      groomQualitySection  `json:"quality"`
 	Stale        []groomStaleEntry    `json:"stale,omitempty"`
 	StaleRetired []int64              `json:"stale_retired,omitempty"`
 	StaleSkipped []int64              `json:"stale_skipped,omitempty"`
@@ -181,6 +210,29 @@ type groomLLMReply struct {
 type groomStaleReply struct {
 	Verdict string `json:"verdict"`
 	Residue string `json:"residue"`
+}
+
+type groomQualityReply struct {
+	Verdict    string  `json:"verdict"`
+	Confidence float64 `json:"confidence"`
+	Residue    string  `json:"residue"`
+}
+
+type groomLLMBudget struct {
+	used int
+	max  int
+}
+
+func newGroomLLMBudget(max int) *groomLLMBudget {
+	return &groomLLMBudget{max: max}
+}
+
+func (b *groomLLMBudget) take() bool {
+	if b == nil || b.max <= 0 || b.used >= b.max {
+		return false
+	}
+	b.used++
+	return true
 }
 
 type groomLLMDeliverFunc func(context.Context, runtime.Agent, string) (string, error)
@@ -302,8 +354,10 @@ func runMemoryGroomSplit(home string, dryRun, jsonOut bool, stdout, stderr io.Wr
 	now := time.Now().UTC()
 	var splits []memory.GroomSplit
 	var applied db.GroomSplitResult
+	var qualityResult db.GroomRetireResult
 	var staleResult db.GroomRetireResult
 	var llmEntries []groomSplitLLMEntry
+	var qualitySection groomQualitySection
 	var staleEntries []groomStaleEntry
 	run := func(paths config.Paths, store *db.Store) error {
 		settings, err := config.LoadMemorySettings(paths)
@@ -317,15 +371,35 @@ func runMemoryGroomSplit(home string, dryRun, jsonOut bool, stdout, stderr io.Wr
 		cands := make([]memory.GroomCandidate, 0, len(rows))
 		for _, row := range rows {
 			cands = append(cands, memory.GroomCandidate{
-				ID: row.ID, Key: row.Key, Content: row.Content, OwnerKind: row.Owner.Kind,
+				ID: row.ID, Key: row.Key, Content: row.Content, Provenance: row.Provenance, OwnerKind: row.Owner.Kind,
 				OwnerRef: row.Owner.Ref, OwnerVersion: row.Owner.Version, Repo: row.Repo,
-				Scope: row.Scope, UpdatedAt: row.UpdatedAt,
+				Scope: row.Scope, FirstConfirmedAt: row.FirstConfirmedAt, UpdatedAt: row.UpdatedAt,
 			})
 		}
+		budget := newGroomLLMBudget(settings.GroomLLMTotalMaxPerRun)
 		splitCands := cands
+		var qualityRetirements []db.GroomRetire
+		qualitySection, qualityRetirements, err = runMemoryGroomQuality(ctx, store, settings, cands, now, true, dryRun, budget)
+		if err != nil {
+			return err
+		}
+		qualityIDs := make(map[int64]struct{})
+		for _, entry := range qualitySection.Candidates {
+			if entry.Action == "auto_retire" || entry.Action == "would_retire" {
+				qualityIDs[entry.Candidate.ID] = struct{}{}
+			}
+		}
+		if len(qualityIDs) > 0 {
+			splitCands = make([]memory.GroomCandidate, 0, len(cands)-len(qualityIDs))
+			for _, candidate := range cands {
+				if _, quality := qualityIDs[candidate.ID]; !quality {
+					splitCands = append(splitCands, candidate)
+				}
+			}
+		}
 		var staleRetirements []db.GroomRetire
 		if settings.GroomStale {
-			entries, retirements, err := runMemoryGroomStale(ctx, store, settings, cands, now, true, dryRun)
+			entries, retirements, err := runMemoryGroomStale(ctx, store, settings, splitCands, now, true, dryRun, budget)
 			if err != nil {
 				return err
 			}
@@ -334,16 +408,17 @@ func runMemoryGroomSplit(home string, dryRun, jsonOut bool, stdout, stderr io.Wr
 			for _, entry := range entries {
 				staleIDs[entry.Candidate.ID] = struct{}{}
 			}
-			splitCands = make([]memory.GroomCandidate, 0, len(cands)-len(staleIDs))
-			for _, candidate := range cands {
+			withoutStale := make([]memory.GroomCandidate, 0, len(splitCands)-len(staleIDs))
+			for _, candidate := range splitCands {
 				if _, stale := staleIDs[candidate.ID]; !stale {
-					splitCands = append(splitCands, candidate)
+					withoutStale = append(withoutStale, candidate)
 				}
 			}
+			splitCands = withoutStale
 		}
 		splits = memory.DetectGroomSplits(splitCands)
 		if settings.GroomSplitLLM {
-			llmSplits, entries, err := runMemoryGroomLLMSplits(ctx, store, settings, splitCands, splits, dryRun)
+			llmSplits, entries, err := runMemoryGroomLLMSplits(ctx, store, settings, splitCands, splits, dryRun, budget)
 			if err != nil {
 				return err
 			}
@@ -366,6 +441,14 @@ func runMemoryGroomSplit(home string, dryRun, jsonOut bool, stdout, stderr io.Wr
 			if err != nil {
 				return err
 			}
+		}
+		if len(qualityRetirements) > 0 {
+			qualityResult, err = store.ApplyGroomRetirements(ctx, qualityRetirements)
+			if err != nil {
+				return err
+			}
+			qualitySection.Retired = qualityResult.Retired
+			qualitySection.Skipped = qualityResult.Skipped
 		}
 		if len(staleRetirements) > 0 {
 			staleResult, err = store.ApplyGroomRetirements(ctx, staleRetirements)
@@ -394,7 +477,7 @@ func runMemoryGroomSplit(home string, dryRun, jsonOut bool, stdout, stderr io.Wr
 	}
 	out := groomSplitOutput{
 		DryRun: dryRun, Detected: len(splits), Applied: len(applied.Applied), Skipped: applied.Skipped,
-		Splits: make([]groomSplitSummary, 0, len(splits)), LLM: llmEntries, Stale: staleEntries,
+		Splits: make([]groomSplitSummary, 0, len(splits)), LLM: llmEntries, Quality: qualitySection, Stale: staleEntries,
 		StaleRetired: staleResult.Retired, StaleSkipped: staleResult.Skipped,
 	}
 	for _, split := range splits {
@@ -428,6 +511,9 @@ func runMemoryGroomSplit(home string, dryRun, jsonOut bool, stdout, stderr io.Wr
 	if len(staleEntries) > 0 {
 		fmt.Fprintf(stdout, "stale status candidates %d; retired %d, skipped %d\n", len(staleEntries), len(staleResult.Retired), len(staleResult.Skipped))
 	}
+	if len(qualitySection.Candidates) > 0 {
+		fmt.Fprintf(stdout, "quality candidates %d (shadow=%t); retired %d, skipped %d\n", len(qualitySection.Candidates), qualitySection.Shadow, len(qualitySection.Retired), len(qualitySection.Skipped))
+	}
 	for _, split := range out.Splits {
 		fmt.Fprintf(stdout, "  parent %d %s ->", split.ParentID, split.ParentKey)
 		for _, child := range split.Children {
@@ -442,7 +528,163 @@ func runMemoryGroomSplit(home string, dryRun, jsonOut bool, stdout, stderr io.Wr
 	return 0
 }
 
-func runMemoryGroomStale(ctx context.Context, store *db.Store, settings config.MemorySettings, cands []memory.GroomCandidate, now time.Time, autoRetire, dryRun bool) ([]groomStaleEntry, []db.GroomRetire, error) {
+func runMemoryGroomQuality(ctx context.Context, store *db.Store, settings config.MemorySettings, cands []memory.GroomCandidate, now time.Time, autoRetire, dryRun bool, budget *groomLLMBudget) (groomQualitySection, []db.GroomRetire, error) {
+	candidates := memory.DetectGroomQualityCandidates(cands, now, settings.GroomQualityMinAge)
+	section := groomQualitySection{Shadow: !settings.GroomQuality, Candidates: make([]groomQualityEntry, 0, len(candidates))}
+	modelLabel := groomLLMModelLabel(settings.GroomSplitLLMRuntime, settings.GroomSplitLLMModel)
+	var retirements []db.GroomRetire
+	calls := 0
+	for _, candidate := range candidates {
+		entry := groomQualityEntry{
+			Candidate: groomQualityCandidateSummary{
+				ID: candidate.ID, Key: candidate.Key, ContentHash: candidate.ContentHash,
+				Score: candidate.Score, SignalFamilies: candidate.SignalFamilies,
+			},
+			Verdict: "unknown", Action: "propose_review", Model: modelLabel,
+		}
+		cached, found, err := store.GetGroomQualityVerdict(ctx, candidate.ContentHash)
+		if err != nil {
+			return groomQualitySection{}, nil, err
+		}
+		var reply groomQualityReply
+		if found {
+			entry.Cached = true
+			entry.Model = cached.Model
+			reply = groomQualityReply{Verdict: cached.Verdict, Confidence: cached.Confidence, Residue: cached.Residue}
+			if err := validateGroomQualityReply(reply, candidate.Content); err != nil {
+				entry.FallbackReason = "cached verdict: " + err.Error()
+				section.Candidates = append(section.Candidates, entry)
+				continue
+			}
+		} else {
+			if calls >= settings.GroomQualityMaxPerRun {
+				entry.FallbackReason = "quality per-run LLM cap reached"
+				section.Candidates = append(section.Candidates, entry)
+				continue
+			}
+			if !budget.take() {
+				entry.FallbackReason = "shared per-run LLM cap reached"
+				section.Candidates = append(section.Candidates, entry)
+				continue
+			}
+			calls++
+			agent := groomLLMRuntimeAgent(ctx, store, settings, candidate.GroomCandidate)
+			callCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+			raw, deliverErr := memoryGroomLLMDeliver(callCtx, agent, groomQualityPrompt(candidate))
+			cancel()
+			if deliverErr != nil {
+				entry.FallbackReason = "runtime delivery: " + deliverErr.Error()
+				section.Candidates = append(section.Candidates, entry)
+				continue
+			}
+			reply, err = parseGroomQualityReply(raw)
+			if err != nil {
+				entry.FallbackReason = "invalid reply: " + err.Error()
+				section.Candidates = append(section.Candidates, entry)
+				continue
+			}
+			if err := validateGroomQualityReply(reply, candidate.Content); err != nil {
+				entry.FallbackReason = "invalid verdict: " + err.Error()
+				section.Candidates = append(section.Candidates, entry)
+				continue
+			}
+			if !dryRun {
+				if err := store.StoreGroomQualityVerdict(ctx, db.GroomQualityVerdict{
+					ContentHash: candidate.ContentHash, Verdict: reply.Verdict, Confidence: reply.Confidence,
+					Residue: reply.Residue, Model: modelLabel,
+				}); err != nil {
+					return groomQualitySection{}, nil, err
+				}
+			}
+		}
+
+		entry.Verdict = reply.Verdict
+		entry.Confidence = reply.Confidence
+		entry.Residue = reply.Residue
+		switch reply.Verdict {
+		case "useless":
+			if len(candidate.SignalFamilies) < 2 {
+				entry.Action = "propose_review"
+				entry.FallbackReason = "fewer than two corroborating signal families"
+			} else if !settings.GroomQuality {
+				entry.Action = "would_retire"
+			} else {
+				entry.Action = "auto_retire"
+				if autoRetire {
+					retirements = append(retirements, db.GroomRetire{ID: candidate.ID, Reason: "groom-quality:" + now.Format(time.DateOnly)})
+				}
+			}
+		case "useful":
+			entry.Action = "keep"
+		case "contains_durable_residue":
+			entry.Action = "propose_extract"
+		}
+		section.Candidates = append(section.Candidates, entry)
+	}
+	return section, retirements, nil
+}
+
+func groomQualityPrompt(candidate memory.GroomQualityCandidate) string {
+	return "Classify whether this confirmed memory carries durable, reusable information. Return exactly one JSON object with no markdown: " +
+		`{"verdict":"useless|useful|contains_durable_residue","confidence":0.0,"residue":""}. ` +
+		"Use useless only when the fact adds no durable value beyond transient/source-controlled history, malformed fragments, or generic observations. " +
+		"Use useful for a concrete reusable fact or lesson. Use contains_durable_residue when junk framing contains a timeless kernel; residue must then be one exact verbatim quote from the content. " +
+		"For the other verdicts residue must be empty. Confidence must be between 0 and 1.\n\nMemory key: " + candidate.Key +
+		"\nDeterministic risk score: " + strconv.Itoa(candidate.Score) +
+		"\nSignal families: " + strings.Join(candidate.SignalFamilies, ", ") +
+		"\nContent (verbatim):\n<content>\n" + candidate.Content + "\n</content>"
+}
+
+func parseGroomQualityReply(raw string) (groomQualityReply, error) {
+	object, err := firstJSONObject(raw)
+	if err != nil {
+		return groomQualityReply{}, err
+	}
+	var wire struct {
+		Verdict    *string  `json:"verdict"`
+		Confidence *float64 `json:"confidence"`
+		Residue    *string  `json:"residue"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(object))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return groomQualityReply{}, err
+	}
+	if wire.Verdict == nil || wire.Confidence == nil || wire.Residue == nil {
+		return groomQualityReply{}, fmt.Errorf("reply must include verdict, confidence, and residue")
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return groomQualityReply{}, fmt.Errorf("reply contains trailing JSON values")
+	}
+	return groomQualityReply{
+		Verdict: strings.TrimSpace(*wire.Verdict), Confidence: *wire.Confidence, Residue: strings.TrimSpace(*wire.Residue),
+	}, nil
+}
+
+func validateGroomQualityReply(reply groomQualityReply, content string) error {
+	if math.IsNaN(reply.Confidence) || math.IsInf(reply.Confidence, 0) || reply.Confidence < 0 || reply.Confidence > 1 {
+		return fmt.Errorf("confidence must be between 0 and 1")
+	}
+	switch reply.Verdict {
+	case "useless", "useful":
+		if reply.Residue != "" {
+			return fmt.Errorf("%s requires empty residue", reply.Verdict)
+		}
+	case "contains_durable_residue":
+		if reply.Residue == "" {
+			return fmt.Errorf("contains_durable_residue requires a residue quote")
+		}
+		if !strings.Contains(content, reply.Residue) {
+			return fmt.Errorf("residue is not an exact content quote")
+		}
+	default:
+		return fmt.Errorf("unknown verdict %q", reply.Verdict)
+	}
+	return nil
+}
+
+func runMemoryGroomStale(ctx context.Context, store *db.Store, settings config.MemorySettings, cands []memory.GroomCandidate, now time.Time, autoRetire, dryRun bool, budget *groomLLMBudget) ([]groomStaleEntry, []db.GroomRetire, error) {
 	candidates := memory.DetectStaleStatusCandidates(cands, now, settings.GroomStaleAge)
 	modelLabel := groomLLMModelLabel(settings.GroomSplitLLMRuntime, settings.GroomSplitLLMModel)
 	entries := make([]groomStaleEntry, 0, len(candidates))
@@ -475,6 +717,11 @@ func runMemoryGroomStale(ctx context.Context, store *db.Store, settings config.M
 			}
 			if calls >= settings.GroomSplitLLMMaxPerRun {
 				entry.FallbackReason = "per-run LLM cap reached"
+				entries = append(entries, entry)
+				continue
+			}
+			if !budget.take() {
+				entry.FallbackReason = "shared per-run LLM cap reached"
 				entries = append(entries, entry)
 				continue
 			}
@@ -578,7 +825,7 @@ func validateGroomStaleReply(reply groomStaleReply, content string) error {
 	return nil
 }
 
-func runMemoryGroomLLMSplits(ctx context.Context, store *db.Store, settings config.MemorySettings, cands []memory.GroomCandidate, deterministic []memory.GroomSplit, dryRun bool) ([]memory.GroomSplit, []groomSplitLLMEntry, error) {
+func runMemoryGroomLLMSplits(ctx context.Context, store *db.Store, settings config.MemorySettings, cands []memory.GroomCandidate, deterministic []memory.GroomSplit, dryRun bool, budget *groomLLMBudget) ([]memory.GroomSplit, []groomSplitLLMEntry, error) {
 	candidates := memory.DetectGroomLLMCandidates(cands)
 	modelLabel := groomLLMModelLabel(settings.GroomSplitLLMRuntime, settings.GroomSplitLLMModel)
 	var splits []memory.GroomSplit
@@ -646,6 +893,12 @@ func runMemoryGroomLLMSplits(ctx context.Context, store *db.Store, settings conf
 		if len(menu) == 0 {
 			entry.Decision = "fallback"
 			entry.FallbackReason = "no safe candidate boundaries"
+			entries = append(entries, entry)
+			continue
+		}
+		if !budget.take() {
+			entry.Decision = "skipped"
+			entry.FallbackReason = "shared per-run LLM cap reached"
 			entries = append(entries, entry)
 			continue
 		}
@@ -949,15 +1202,17 @@ func runMemoryGroomPropose(home, out string, jsonOut bool, stdout, stderr io.Wri
 		cands := make([]memory.GroomCandidate, 0, len(notes))
 		for _, n := range notes {
 			cands = append(cands, memory.GroomCandidate{
-				ID:           n.memRecord.ID,
-				Key:          n.memRecord.Key,
-				Content:      n.memRecord.Content,
-				OwnerKind:    n.memRecord.OwnerKind,
-				OwnerRef:     n.memRecord.OwnerRef,
-				OwnerVersion: n.memRecord.OwnerVersion,
-				Repo:         n.memRecord.Repo,
-				Scope:        n.memRecord.Scope,
-				UpdatedAt:    n.memRecord.UpdatedAt,
+				ID:               n.memRecord.ID,
+				Key:              n.memRecord.Key,
+				Content:          n.memRecord.Content,
+				Provenance:       n.memRecord.Provenance,
+				OwnerKind:        n.memRecord.OwnerKind,
+				OwnerRef:         n.memRecord.OwnerRef,
+				OwnerVersion:     n.memRecord.OwnerVersion,
+				Repo:             n.memRecord.Repo,
+				Scope:            n.memRecord.Scope,
+				FirstConfirmedAt: n.memRecord.CreatedAt,
+				UpdatedAt:        n.memRecord.UpdatedAt,
 			})
 		}
 		proposal := memory.DetectGroomActions(cands)
@@ -976,22 +1231,39 @@ func runMemoryGroomPropose(home, out string, jsonOut bool, stdout, stderr io.Wri
 				surviving = append(surviving, c)
 			}
 		}
+		budget := newGroomLLMBudget(settings.GroomLLMTotalMaxPerRun)
+		quality, _, err := runMemoryGroomQuality(ctx, store, settings, surviving, now, false, false, budget)
+		if err != nil {
+			return err
+		}
+		qualityRetiring := make(map[int64]bool)
+		for _, entry := range quality.Candidates {
+			if entry.Action == "auto_retire" || entry.Action == "would_retire" {
+				qualityRetiring[entry.Candidate.ID] = true
+			}
+		}
+		postQuality := make([]memory.GroomCandidate, 0, len(surviving)-len(qualityRetiring))
+		for _, candidate := range surviving {
+			if !qualityRetiring[candidate.ID] {
+				postQuality = append(postQuality, candidate)
+			}
+		}
 		stale := make([]groomStaleEntry, 0)
 		if settings.GroomStale {
-			stale, _, err = runMemoryGroomStale(ctx, store, settings, surviving, now, false, false)
+			stale, _, err = runMemoryGroomStale(ctx, store, settings, postQuality, now, false, false, budget)
 			if err != nil {
 				return err
 			}
 		}
-		rekeys := memory.DetectGroomRekeys(surviving)
+		rekeys := memory.DetectGroomRekeys(postQuality)
 		rekeyRetiring := make(map[int64]bool)
 		for _, rk := range rekeys {
 			for _, r := range rk.Retire {
 				rekeyRetiring[r.ID] = true
 			}
 		}
-		crossCands := make([]memory.GroomCandidate, 0, len(surviving))
-		for _, c := range surviving {
+		crossCands := make([]memory.GroomCandidate, 0, len(postQuality))
+		for _, c := range postQuality {
 			if !rekeyRetiring[c.ID] {
 				crossCands = append(crossCands, c)
 			}
@@ -1017,6 +1289,7 @@ func runMemoryGroomPropose(home, out string, jsonOut bool, stdout, stderr io.Wri
 			RewriteFlags:        make([]groomPlanRewriteFlag, 0, len(proposal.RewriteFlags)),
 			Rekeys:              make([]groomPlanRekey, 0, len(rekeys)),
 			CrossPool:           make([]groomPlanCrossPool, 0, len(crossPool)),
+			Quality:             quality,
 			Stale:               stale,
 			Stats:               proposal.Stats,
 		}
@@ -1216,8 +1489,8 @@ func groomScopeLabel(r groomPlanRetirement) string {
 
 func printGroomProposal(w io.Writer, plan groomPlan, outPath string) {
 	fmt.Fprintf(w, "groom proposal (snapshot %s)\n", plan.SnapshotHash)
-	fmt.Fprintf(w, "  %d of %d memory(ies) proposed for retirement; %d flagged for rewrite; %d rekey group(s); %d cross-pool pair(s); %d stale status candidate(s)\n",
-		plan.Stats.ProposedRetirements, plan.Stats.TotalMemories, plan.Stats.RewriteFlags, plan.Stats.Rekeys, plan.Stats.CrossPool, len(plan.Stale))
+	fmt.Fprintf(w, "  %d of %d memory(ies) proposed for retirement; %d flagged for rewrite; %d rekey group(s); %d cross-pool pair(s); %d quality candidate(s) (shadow=%t); %d stale status candidate(s)\n",
+		plan.Stats.ProposedRetirements, plan.Stats.TotalMemories, plan.Stats.RewriteFlags, plan.Stats.Rekeys, plan.Stats.CrossPool, len(plan.Quality.Candidates), plan.Quality.Shadow, len(plan.Stale))
 	if len(plan.Stats.ByReason) > 0 {
 		reasons := make([]string, 0, len(plan.Stats.ByReason))
 		for r := range plan.Stats.ByReason {
@@ -1259,6 +1532,21 @@ func printGroomProposal(w io.Writer, plan groomPlan, outPath string) {
 			fmt.Fprintf(w, "  - memory %d [%s] %d chars\n", f.ID, f.Key, f.Chars)
 		}
 	}
+	if len(plan.Quality.Candidates) > 0 {
+		fmt.Fprintf(w, "\nQuality candidates (shadow=%t):\n", plan.Quality.Shadow)
+		for _, entry := range plan.Quality.Candidates {
+			fmt.Fprintf(w, "  - memory %d [%s] score=%d signals=%s verdict=%s confidence=%.2f action=%s cached=%t",
+				entry.Candidate.ID, entry.Candidate.Key, entry.Candidate.Score, strings.Join(entry.Candidate.SignalFamilies, ","),
+				entry.Verdict, entry.Confidence, entry.Action, entry.Cached)
+			if entry.Residue != "" {
+				fmt.Fprintf(w, " residue=%q", entry.Residue)
+			}
+			if entry.FallbackReason != "" {
+				fmt.Fprintf(w, " fallback=%q", entry.FallbackReason)
+			}
+			fmt.Fprintln(w)
+		}
+	}
 	if len(plan.Stale) > 0 {
 		fmt.Fprintln(w, "\nStale operational-status candidates:")
 		for _, entry := range plan.Stale {
@@ -1274,7 +1562,7 @@ func printGroomProposal(w io.Writer, plan groomPlan, outPath string) {
 		}
 	}
 	fmt.Fprintf(w, "\nplan written to %s\n", outPath)
-	if plan.Stats.ProposedRetirements == 0 && plan.Stats.Rekeys == 0 && plan.Stats.CrossPool == 0 && len(plan.Stale) == 0 {
+	if plan.Stats.ProposedRetirements == 0 && plan.Stats.Rekeys == 0 && plan.Stats.CrossPool == 0 && len(plan.Quality.Candidates) == 0 && len(plan.Stale) == 0 {
 		fmt.Fprintln(w, "nothing to do.")
 		return
 	}

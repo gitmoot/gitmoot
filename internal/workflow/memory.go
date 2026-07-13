@@ -354,11 +354,17 @@ func mechanicalFacts(action string, payload JobPayload, result AgentResult) []me
 	// directive/secret/executable gates hold for every producer (constraint #3).
 	kept := candidates[:0]
 	for _, e := range candidates {
-		if ok, _ := memory.PreFilter(e.Content, e.Scope); ok {
-			kept = append(kept, e)
+		if mechanicalFactSubstantive(e.Content) {
+			if ok, _ := memory.PreFilter(e.Content, e.Scope); ok {
+				kept = append(kept, e)
+			}
 		}
 	}
 	return kept
+}
+
+func mechanicalFactSubstantive(content string) bool {
+	return memory.QualityHasSpecific(content)
 }
 
 // fixRoundsFact records the FIX-ROUND count when a job reached its terminal

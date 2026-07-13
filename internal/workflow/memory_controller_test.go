@@ -438,26 +438,17 @@ func TestMemoryNotEnrolledNoWrites(t *testing.T) {
 	}
 }
 
-// TestMemoryTerminalOutcomeProducerWritesForNotable proves the #645 fix at the
-// record() seam: an ORDINARY terminal job (VerifyAttempt=0, RetryCount=0 — the
-// shape agent ask/run/review enqueue, which fixRoundsFact never fires on) that
-// ends on the NOTABLE, non-anomalous decision (changes_requested) writes an
-// (action,outcome)-keyed confirmed fact. The SUCCESS decisions write nothing
-// (anti-flood), and — per the #645 review — the ANOMALOUS one-off outcomes
-// (failed, blocked) ALSO write nothing until a recurrence gate exists, so a single
-// flaky failure cannot become a durable repo fact. A free-form delegation action
-// collapses to the bounded generic "recent" bucket rather than leaking into the
-// key. Before the fix the confirmed pool stayed empty for the common usage shape.
-func TestMemoryTerminalOutcomeProducerWritesForNotable(t *testing.T) {
+// TestMemoryTerminalOutcomeProducerSuppressesContentFreeFacts proves the #888
+// write-time gate: ordinary terminal summaries without a concrete id, PR, error,
+// file, or count never become confirmed memory.
+func TestMemoryTerminalOutcomeProducerSuppressesContentFreeFacts(t *testing.T) {
 	cases := []struct {
 		action   string
 		decision string
 		wantKey  string // "" => no fact expected
 	}{
-		{"review", "changes_requested", "outcome:review:changes_requested"},
-		// Free-form, LLM-authored delegation action → generic "recent" bucket, so
-		// distinct phrasings can never bloat the key space (the bounded-key contract).
-		{"review the payment webhook retry logic", "changes_requested", "outcome:recent:changes_requested"},
+		{"review", "changes_requested", ""},
+		{"review the payment webhook retry logic", "changes_requested", ""},
 		{"ask", "blocked", ""},           // anomalous one-off → excluded until a recurrence gate
 		{"implement", "failed", ""},      // anomalous one-off → excluded until a recurrence gate
 		{"ask", "approved", ""},          // routine success → nothing
@@ -508,11 +499,15 @@ func TestMemoryTerminalOutcomeProducerWritesForNotable(t *testing.T) {
 	}
 }
 
-// TestMemoryOutcomeProducerUpsertsBoundedKey proves repeated notable jobs of the
-// same (action,decision) UPSERT the single keyed row rather than accumulating —
-// the bounded-cardinality contract (constraint #2). Two changes_requested review
-// jobs leave exactly one outcome row, refreshed to the latest source job.
-func TestMemoryOutcomeProducerUpsertsBoundedKey(t *testing.T) {
+func TestMemoryMechanicalSubstantivenessGate(t *testing.T) {
+	const vague = "Some ask jobs in this repository have concluded with changes requested rather than approval."
+	if mechanicalFactSubstantive(vague) {
+		t.Fatal("content-free live mechanical fact passed the substantiveness gate")
+	}
+	if !mechanicalFactSubstantive("Some ask jobs in this repository changed after PR #42.") {
+		t.Fatal("PR-bearing mechanical fact did not pass the substantiveness gate")
+	}
+
 	store := openTestStore(t)
 	ctx := context.Background()
 	ctrl := memController(store, 1500, 15, "audit")
@@ -525,19 +520,8 @@ func TestMemoryOutcomeProducerUpsertsBoundedKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list confirmed: %v", err)
 	}
-	count := 0
-	var row db.ConfirmedMemory
-	for _, c := range confirmed {
-		if c.Key == "outcome:review:changes_requested" {
-			count++
-			row = c
-		}
-	}
-	if count != 1 {
-		t.Fatalf("expected exactly one upserted outcome row, got %d: %+v", count, confirmed)
-	}
-	if row.SourceJob != "job-3" {
-		t.Fatalf("upsert should refresh source_job to the latest (job-3), got %q", row.SourceJob)
+	if len(confirmed) != 0 {
+		t.Fatalf("content-free mechanical producer wrote confirmed rows: %+v", confirmed)
 	}
 }
 

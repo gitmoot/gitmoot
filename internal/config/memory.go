@@ -22,6 +22,10 @@ const (
 	DefaultMemoryGroomSplitLLMRuntime   = runtime.CodexRuntime
 	DefaultMemoryGroomSplitLLMModel     = ""
 	DefaultMemoryGroomSplitLLMMaxPerRun = 5
+	DefaultMemoryGroomQuality           = false
+	DefaultMemoryGroomQualityMaxPerRun  = 8
+	DefaultMemoryGroomQualityMinAge     = 24 * time.Hour
+	DefaultMemoryGroomLLMTotalMaxPerRun = 10
 	DefaultMemoryGroomStale             = true
 	DefaultMemoryGroomStaleAge          = 14 * 24 * time.Hour
 	DefaultMemoryClusterFanout          = 12
@@ -105,6 +109,13 @@ type MemorySettings struct {
 	GroomSplitLLMRuntime   string
 	GroomSplitLLMModel     string
 	GroomSplitLLMMaxPerRun int
+	// GroomQuality controls mutation only: false runs the general audit in
+	// shadow mode, while true permits corroborated useless verdicts to retire.
+	// Runtime/model are shared with the split classifier.
+	GroomQuality           bool
+	GroomQualityMaxPerRun  int
+	GroomQualityMinAge     time.Duration
+	GroomLLMTotalMaxPerRun int
 	// GroomStale enables deterministic operational-status detection. Automatic
 	// retirement remains additionally gated by GroomSplitLLM; StaleAge is the
 	// minimum age of the newest in-content date.
@@ -140,6 +151,10 @@ func DefaultMemorySettings() MemorySettings {
 		GroomSplitLLMRuntime:   DefaultMemoryGroomSplitLLMRuntime,
 		GroomSplitLLMModel:     DefaultMemoryGroomSplitLLMModel,
 		GroomSplitLLMMaxPerRun: DefaultMemoryGroomSplitLLMMaxPerRun,
+		GroomQuality:           DefaultMemoryGroomQuality,
+		GroomQualityMaxPerRun:  DefaultMemoryGroomQualityMaxPerRun,
+		GroomQualityMinAge:     DefaultMemoryGroomQualityMinAge,
+		GroomLLMTotalMaxPerRun: DefaultMemoryGroomLLMTotalMaxPerRun,
 		GroomStale:             DefaultMemoryGroomStale,
 		GroomStaleAge:          DefaultMemoryGroomStaleAge,
 		ClusterFanout:          DefaultMemoryClusterFanout,
@@ -294,6 +309,33 @@ func LoadMemorySettings(paths Paths) (MemorySettings, error) {
 				return MemorySettings{}, fmt.Errorf("parse [memory].groom_split_llm_max_per_run: %w", err)
 			}
 			settings.GroomSplitLLMMaxPerRun = parsed
+		case "groom_quality":
+			parsed, err := parseConfigBool(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].groom_quality: %w", err)
+			}
+			settings.GroomQuality = parsed
+		case "groom_quality_max_per_run":
+			parsed, err := strconv.Atoi(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].groom_quality_max_per_run: %w", err)
+			}
+			settings.GroomQualityMaxPerRun = parsed
+		case "groom_quality_min_age":
+			parsed, err := parseConfigString(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].groom_quality_min_age: %w", err)
+			}
+			settings.GroomQualityMinAge, err = time.ParseDuration(strings.TrimSpace(parsed))
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].groom_quality_min_age: %w", err)
+			}
+		case "groom_llm_total_max_per_run":
+			parsed, err := strconv.Atoi(value)
+			if err != nil {
+				return MemorySettings{}, fmt.Errorf("parse [memory].groom_llm_total_max_per_run: %w", err)
+			}
+			settings.GroomLLMTotalMaxPerRun = parsed
 		case "groom_stale":
 			parsed, err := parseConfigBool(value)
 			if err != nil {
@@ -362,6 +404,15 @@ func validateMemorySettings(s MemorySettings) error {
 	}
 	if s.GroomSplitLLMMaxPerRun < 1 {
 		return fmt.Errorf("memory.groom_split_llm_max_per_run must be >= 1, got %d", s.GroomSplitLLMMaxPerRun)
+	}
+	if s.GroomQualityMaxPerRun < 1 {
+		return fmt.Errorf("memory.groom_quality_max_per_run must be >= 1, got %d", s.GroomQualityMaxPerRun)
+	}
+	if s.GroomQualityMinAge <= 0 {
+		return fmt.Errorf("memory.groom_quality_min_age must be > 0, got %s", s.GroomQualityMinAge)
+	}
+	if s.GroomLLMTotalMaxPerRun < 1 {
+		return fmt.Errorf("memory.groom_llm_total_max_per_run must be >= 1, got %d", s.GroomLLMTotalMaxPerRun)
 	}
 	if s.GroomStaleAge <= 0 {
 		return fmt.Errorf("memory.groom_stale_age must be > 0, got %s", s.GroomStaleAge)

@@ -46,6 +46,9 @@ func TestLoadMemorySettingsDefaults(t *testing.T) {
 	if settings.GroomSplitLLMRuntime != "codex" || settings.GroomSplitLLMModel != "" || settings.GroomSplitLLMMaxPerRun != 5 {
 		t.Fatalf("groom LLM defaults = %+v", settings)
 	}
+	if settings.GroomQuality || settings.GroomQualityMaxPerRun != 8 || settings.GroomQualityMinAge != 24*time.Hour || settings.GroomLLMTotalMaxPerRun != 10 {
+		t.Fatalf("groom quality defaults = %+v", settings)
+	}
 	if !settings.GroomStale || settings.GroomStaleAge != 14*24*time.Hour {
 		t.Fatalf("groom stale defaults = %+v", settings)
 	}
@@ -115,6 +118,10 @@ groom_split_llm = true
 groom_split_llm_runtime = "claude"
 groom_split_llm_model = "sonnet"
 groom_split_llm_max_per_run = 3
+groom_quality = true
+groom_quality_max_per_run = 6
+groom_quality_min_age = "48h"
+groom_llm_total_max_per_run = 9
 groom_stale = false
 groom_stale_age = "720h"
 cluster_fanout = 10
@@ -129,7 +136,7 @@ cluster_depth_cap = 3
 	}
 	if !settings.Disabled || !settings.DefaultEnroll || settings.TokenBudget != 800 || settings.MaxEntries != 7 || !settings.IngestAutoConfirm ||
 		!settings.HarvestEnabled || settings.HarvestRuntime != "kimi" || settings.HarvestModel != "kimi-large" || settings.HarvestEffort != "medium" || settings.HarvestMaxPerJob != 4 || settings.HarvestMaxJobsPerSweep != 7 ||
-		!settings.GroomSplitLLM || settings.GroomSplitLLMRuntime != "claude" || settings.GroomSplitLLMModel != "sonnet" || settings.GroomSplitLLMMaxPerRun != 3 || settings.GroomStale || settings.GroomStaleAge != 30*24*time.Hour || settings.ClusterFanout != 10 || settings.ClusterFanoutKeep != 7 || settings.ClusterDepthCap != 3 {
+		!settings.GroomSplitLLM || settings.GroomSplitLLMRuntime != "claude" || settings.GroomSplitLLMModel != "sonnet" || settings.GroomSplitLLMMaxPerRun != 3 || !settings.GroomQuality || settings.GroomQualityMaxPerRun != 6 || settings.GroomQualityMinAge != 48*time.Hour || settings.GroomLLMTotalMaxPerRun != 9 || settings.GroomStale || settings.GroomStaleAge != 30*24*time.Hour || settings.ClusterFanout != 10 || settings.ClusterFanoutKeep != 7 || settings.ClusterDepthCap != 3 {
 		t.Fatalf("parsed = %+v", settings)
 	}
 }
@@ -139,6 +146,8 @@ func TestLoadMemorySettingsRejectsInvalidGroomLLMKnobs(t *testing.T) {
 		"groom_split_llm_runtime = \"shell\"",
 		"groom_split_llm_runtime = \"unknown\"",
 		"groom_split_llm_max_per_run = 0",
+		"groom_quality_max_per_run = 0",
+		"groom_llm_total_max_per_run = 0",
 	}
 	for _, setting := range tests {
 		t.Run(setting, func(t *testing.T) {
@@ -181,6 +190,23 @@ func TestLoadMemorySettingsRejectsInvalidHarvestKnobs(t *testing.T) {
 
 func TestLoadMemorySettingsRejectsInvalidGroomStaleAge(t *testing.T) {
 	for _, setting := range []string{`groom_stale_age = "not-a-duration"`, `groom_stale_age = "0s"`, `groom_stale_age = "-1h"`} {
+		t.Run(setting, func(t *testing.T) {
+			paths := PathsForHome(t.TempDir())
+			if err := Initialize(paths); err != nil {
+				t.Fatalf("Initialize: %v", err)
+			}
+			if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+"\n[memory]\n"+setting+"\n"), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			if _, err := LoadMemorySettings(paths); err == nil {
+				t.Fatalf("expected %q to be rejected", setting)
+			}
+		})
+	}
+}
+
+func TestLoadMemorySettingsRejectsInvalidGroomQualityMinAge(t *testing.T) {
+	for _, setting := range []string{`groom_quality_min_age = "not-a-duration"`, `groom_quality_min_age = "0s"`, `groom_quality_min_age = "-1h"`} {
 		t.Run(setting, func(t *testing.T) {
 			paths := PathsForHome(t.TempDir())
 			if err := Initialize(paths); err != nil {

@@ -229,6 +229,11 @@ func ingestMemorySource(ctx context.Context, store *db.Store, options memoryInge
 		rel = filepath.ToSlash(rel)
 		fileStem := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 		_, body := memory.StripFrontmatter(string(raw))
+		if memory.IsMemoryIndex(body) {
+			result.RejectedN++
+			result.RejectedBy["index_file"]++
+			continue
+		}
 		for _, chunk := range memory.ChunkMarkdown(body, memory.IngestMaxChunkTokens) {
 			result.Chunks++
 			key := keys.Next(fileStem, chunk.Heading)

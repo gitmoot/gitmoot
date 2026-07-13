@@ -94,6 +94,34 @@ func TestMemoryIngestPreFilterAccountingAndDedup(t *testing.T) {
 	}
 }
 
+func TestMemoryIngestSkipsMemoryIndexLinkLists(t *testing.T) {
+	home, _ := memoryTestHome(t)
+	src := t.TempDir()
+	indexBody, err := os.ReadFile(filepath.Join("..", "memory", "testdata", "quality", "memory-index-165.md"))
+	if err != nil {
+		t.Fatalf("read live index fixture: %v", err)
+	}
+	writeFixture(t, src, "MEMORY.md", string(indexBody))
+	writeFixture(t, src, "keeper.md", "The arm64 runner uses a dedicated cache directory during release builds.\n")
+
+	code, out, errOut := runMemoryCapture(t, "ingest", src, "--home", home,
+		"--agent", "lead", "--repo", "acme/widget", "--json")
+	if code != 0 {
+		t.Fatalf("ingest exit %d: %s", code, errOut)
+	}
+	var result memoryIngestResult
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("parse ingest result: %v (%s)", err, out)
+	}
+	if result.Files != 2 || result.Chunks != 1 || result.Inserted != 1 || result.RejectedN != 1 || result.RejectedBy["index_file"] != 1 {
+		t.Fatalf("index skip accounting = %+v", result)
+	}
+	observations := listObservations(t, home)
+	if len(observations) != 1 || observations[0].Provenance != "ingest:keeper.md" {
+		t.Fatalf("index file was ingested: %+v", observations)
+	}
+}
+
 // TestMemoryIngestSameContentDifferentRepoStagesBoth proves identical text
 // ingested under a SECOND repo is not silently deduped away — repo-scoped memory
 // injects only for its own repo, so both repos must stage the note. Regression

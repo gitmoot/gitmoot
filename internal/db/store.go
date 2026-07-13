@@ -8761,4 +8761,16 @@ CREATE TABLE memory_harvest_state (
 	initialized_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 	`,
+	// #888 general quality-audit verdict cache. This is a plain additive table;
+	// content hashes pin classifications to the exact trimmed fact bytes.
+	`
+CREATE TABLE groom_quality_verdicts (
+	content_hash TEXT PRIMARY KEY,
+	verdict TEXT NOT NULL,
+	confidence REAL NOT NULL,
+	residue TEXT NOT NULL DEFAULT '',
+	model TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+	`,
 }

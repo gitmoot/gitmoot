@@ -533,6 +533,177 @@ func TestGroomStaleContractValidation(t *testing.T) {
 	}
 }
 
+func TestGroomQualityContractValidation(t *testing.T) {
+	content := "The original misparse error now explains itself."
+	tests := []struct {
+		name    string
+		raw     string
+		want    string
+		wantErr string
+	}{
+		{name: "useless", raw: `{"verdict":"useless","confidence":0.91,"residue":""}`, want: "useless"},
+		{name: "surrounding prose", raw: `result: {"verdict":"useful","confidence":0.75,"residue":""} done`, want: "useful"},
+		{name: "durable residue", raw: `{"verdict":"contains_durable_residue","confidence":0.8,"residue":"misparse error now explains itself"}`, want: "contains_durable_residue"},
+		{name: "unknown verdict", raw: `{"verdict":"maybe","confidence":0.5,"residue":""}`, wantErr: "unknown verdict"},
+		{name: "missing confidence", raw: `{"verdict":"useless","residue":""}`, wantErr: "must include"},
+		{name: "bad confidence", raw: `{"verdict":"useless","confidence":1.1,"residue":""}`, wantErr: "between 0 and 1"},
+		{name: "useless with residue", raw: `{"verdict":"useless","confidence":0.5,"residue":"keeper"}`, wantErr: "empty residue"},
+		{name: "invented residue", raw: `{"verdict":"contains_durable_residue","confidence":0.5,"residue":"invented"}`, wantErr: "exact content quote"},
+		{name: "unknown field", raw: `{"verdict":"useless","confidence":0.5,"residue":"","extra":1}`, wantErr: "unknown field"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reply, err := parseGroomQualityReply(tc.raw)
+			if err == nil {
+				err = validateGroomQualityReply(reply, content)
+			}
+			if tc.wantErr == "" {
+				if err != nil || reply.Verdict != tc.want {
+					t.Fatalf("reply=%+v err=%v, want %s", reply, err, tc.want)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error=%v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestGroomQualityShadowProposeAndCachedSplitDoNotRetire(t *testing.T) {
+	home, store := memoryTestHome(t)
+	writeGroomQualityConfig(t, home, false)
+	content := groomQualityFixture(t, "392")
+	id := seedConfirmed(t, store, db.MemoryOwner{Kind: "agent", Ref: "lead"}, "acme/widget", "repo", "shipping-status", content)
+	ageGroomFact(t, home, id)
+	logPath := installGroomCodexStub(t, `{"verdict":"useless","confidence":0.96,"residue":""}`)
+	planPath := filepath.Join(t.TempDir(), "quality-plan.json")
+
+	code, stdout, stderr := runGroom(t, "--home", home, "--propose", "--out", planPath, "--json")
+	if code != 0 {
+		t.Fatalf("quality propose exit %d: %s", code, stderr)
+	}
+	var summary struct {
+		groomPlan
+		Out string `json:"out"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &summary); err != nil {
+		t.Fatalf("parse quality proposal: %v (%s)", err, stdout)
+	}
+	if !summary.Quality.Shadow || len(summary.Quality.Candidates) != 1 || summary.Quality.Candidates[0].Candidate.ID != id || summary.Quality.Candidates[0].Action != "would_retire" || summary.Quality.Candidates[0].Verdict != "useless" {
+		t.Fatalf("shadow quality section = %+v", summary.Quality)
+	}
+	if calls := groomStubCalls(t, logPath); calls != 1 {
+		t.Fatalf("shadow quality calls = %d, want 1", calls)
+	}
+	active, _ := store.ListConfirmedMemoriesForVault(context.Background(), "")
+	if len(active) != 1 || active[0].ID != id {
+		t.Fatalf("shadow proposal mutated fact: %+v", active)
+	}
+
+	code, stdout, stderr = runGroom(t, "--home", home, "--split", "--json")
+	if code != 0 {
+		t.Fatalf("cached shadow split exit %d: %s", code, stderr)
+	}
+	var output groomSplitOutput
+	if err := json.Unmarshal([]byte(stdout), &output); err != nil || len(output.Quality.Candidates) != 1 || !output.Quality.Candidates[0].Cached || len(output.Quality.Retired) != 0 {
+		t.Fatalf("cached shadow quality output=%+v err=%v", output.Quality, err)
+	}
+	if calls := groomStubCalls(t, logPath); calls != 1 {
+		t.Fatalf("cached shadow verdict was billed again: %d", calls)
+	}
+}
+
+func TestGroomQualityEnabledUselessAutoRetiresThroughHousePath(t *testing.T) {
+	home, store := memoryTestHome(t)
+	writeGroomQualityConfig(t, home, true)
+	id := seedConfirmed(t, store, db.MemoryOwner{Kind: "agent", Ref: "lead"}, "acme/widget", "repo", "vacuous", groomQualityFixture(t, "171"))
+	ageGroomFact(t, home, id)
+	installGroomCodexStub(t, `{"verdict":"useless","confidence":0.99,"residue":""}`)
+
+	code, stdout, stderr := runGroom(t, "--home", home, "--split", "--json")
+	if code != 0 {
+		t.Fatalf("quality split exit %d: %s", code, stderr)
+	}
+	var output groomSplitOutput
+	if err := json.Unmarshal([]byte(stdout), &output); err != nil {
+		t.Fatalf("parse quality split: %v (%s)", err, stdout)
+	}
+	if output.Quality.Shadow || len(output.Quality.Candidates) != 1 || output.Quality.Candidates[0].Action != "auto_retire" || len(output.Quality.Retired) != 1 || output.Quality.Retired[0] != id {
+		t.Fatalf("quality retire output = %+v", output.Quality)
+	}
+	raw, err := sql.Open("sqlite", config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer raw.Close()
+	var reason string
+	if err := raw.QueryRow(`SELECT retired_reason FROM confirmed_memories WHERE id = ?`, id).Scan(&reason); err != nil || !strings.HasPrefix(reason, "groom-quality:") {
+		t.Fatalf("quality retired reason=%q err=%v", reason, err)
+	}
+}
+
+func TestGroomQualityResidueStaysOwnerGated(t *testing.T) {
+	home, store := memoryTestHome(t)
+	writeGroomQualityConfig(t, home, true)
+	content := groomQualityFixture(t, "396")
+	id := seedConfirmed(t, store, db.MemoryOwner{Kind: "agent", Ref: "lead"}, "acme/widget", "repo", "mixed-status", content)
+	ageGroomFact(t, home, id)
+	const residue = "the original misparse error now explains itself"
+	installGroomCodexStub(t, `{"verdict":"contains_durable_residue","confidence":0.88,"residue":"`+residue+`"}`)
+
+	code, stdout, stderr := runGroom(t, "--home", home, "--propose", "--out", filepath.Join(t.TempDir(), "plan.json"), "--json")
+	if code != 0 {
+		t.Fatalf("quality residue propose exit %d: %s", code, stderr)
+	}
+	var summary struct{ groomPlan }
+	if err := json.Unmarshal([]byte(stdout), &summary); err != nil || len(summary.Quality.Candidates) != 1 {
+		t.Fatalf("parse quality residue: section=%+v err=%v", summary.Quality, err)
+	}
+	entry := summary.Quality.Candidates[0]
+	if entry.Action != "propose_extract" || entry.Residue != residue {
+		t.Fatalf("quality residue entry = %+v", entry)
+	}
+	active, _ := store.ListConfirmedMemoriesForVault(context.Background(), "")
+	if len(active) != 1 || active[0].ID != id {
+		t.Fatalf("residue proposal mutated fact: %+v", active)
+	}
+}
+
+func TestGroomLLMTotalBudgetSharedAcrossQualityStaleAndSplit(t *testing.T) {
+	home, store := memoryTestHome(t)
+	appendConfig(t, config.PathsForHome(home), "\n[memory]\n"+
+		"groom_split_llm = true\n"+
+		"groom_split_llm_runtime = \"codex\"\n"+
+		"groom_split_llm_model = \"\"\n"+
+		"groom_split_llm_max_per_run = 5\n"+
+		"groom_llm_total_max_per_run = 1\n"+
+		"groom_quality_max_per_run = 8\n")
+	qualityID := seedConfirmed(t, store, db.MemoryOwner{Kind: "agent", Ref: "lead"}, "acme/widget", "repo", "quality-first", groomQualityFixture(t, "392"))
+	ageGroomFact(t, home, qualityID)
+	seedConfirmed(t, store, db.MemoryOwner{Kind: "agent", Ref: "lead"}, "acme/widget", "repo", "stale-second", groomStaleFixture(t, "154"))
+	seedConfirmed(t, store, db.MemoryOwner{Kind: "agent", Ref: "lead"}, "acme/widget", "repo", "split-third", groomLLMTestBrick())
+	logPath := installGroomCodexStub(t, `{"verdict":"useless","confidence":0.95,"residue":""}`)
+
+	code, stdout, stderr := runGroom(t, "--home", home, "--split", "--json")
+	if code != 0 {
+		t.Fatalf("shared-budget split exit %d: %s", code, stderr)
+	}
+	var output groomSplitOutput
+	if err := json.Unmarshal([]byte(stdout), &output); err != nil {
+		t.Fatalf("parse shared-budget output: %v (%s)", err, stdout)
+	}
+	if calls := groomStubCalls(t, logPath); calls != 1 {
+		t.Fatalf("shared budget made %d calls, want 1", calls)
+	}
+	if len(output.Stale) != 1 || !strings.Contains(output.Stale[0].FallbackReason, "shared") {
+		t.Fatalf("stale pass did not observe shared cap: %+v", output.Stale)
+	}
+	if len(output.LLM) != 1 || !strings.Contains(output.LLM[0].FallbackReason, "shared") {
+		t.Fatalf("split pass did not observe shared cap: %+v", output.LLM)
+	}
+}
+
 func TestGroomStaleExpiredStubAutoRetiresIdempotently(t *testing.T) {
 	home, store := memoryTestHome(t)
 	writeGroomLLMConfig(t, home, true)
@@ -851,6 +1022,37 @@ func writeGroomLLMConfig(t *testing.T, home string, enabled bool) {
 		"groom_split_llm_runtime = \"codex\"\n"+
 		"groom_split_llm_model = \"\"\n"+
 		"groom_split_llm_max_per_run = 5\n")
+}
+
+func writeGroomQualityConfig(t *testing.T, home string, enabled bool) {
+	t.Helper()
+	appendConfig(t, config.PathsForHome(home), "\n[memory]\n"+
+		"groom_quality = "+strconv.FormatBool(enabled)+"\n"+
+		"groom_quality_max_per_run = 8\n"+
+		"groom_quality_min_age = \"24h\"\n"+
+		"groom_llm_total_max_per_run = 10\n"+
+		"groom_stale = false\n")
+}
+
+func groomQualityFixture(t *testing.T, id string) string {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join("..", "memory", "testdata", "quality", id+".md"))
+	if err != nil {
+		t.Fatalf("read quality fixture %s: %v", id, err)
+	}
+	return strings.TrimSuffix(string(body), "\n")
+}
+
+func ageGroomFact(t *testing.T, home string, id int64) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`UPDATE confirmed_memories SET first_confirmed_at = datetime('now', '-48 hours') WHERE id = ?`, id); err != nil {
+		t.Fatalf("age groom fact %d: %v", id, err)
+	}
 }
 
 func installGroomCodexStub(t *testing.T, answer string) string {

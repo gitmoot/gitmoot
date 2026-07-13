@@ -35,14 +35,12 @@ it ships in phases. The current phase is **observation mode**:
 - **WRITE:** the confirmed (injectable) tier is populated only by Gitmoot's own
   deterministic **mechanical facts** (no model involved). A fact is written only
   when a terminal job carries a genuine, bounded signal — never one fact per job:
-  a **fix-round fact** when a job needed corrective verify/retry rounds, and a
-  **terminal-outcome fact** when an *ordinary* job (an `agent ask`/`run`/`review`
-  job with no verify/retry loop) ends on the **notable** decision
-  `changes_requested` — a normal, repeatable review conclusion. A routine
-  first-try success writes nothing, and the *anomalous* one-off terminals
-  (`failed`, `blocked`) are deliberately **not** auto-promoted: with no recurrence
-  threshold yet, a single flaky failure must not become a durable, injected repo
-  fact. Facts are keyed by low-cardinality **closed** categories — the outcome is
+  a **fix-round fact** when a job needed corrective verify/retry rounds.
+  Terminal-outcome candidates are also considered, but a substantiveness gate
+  requires a concrete job id, PR number, error string, file, or count. The generic
+  "some review jobs here concluded with changes requested" shape is suppressed.
+  Routine successes and anomalous one-off `failed`/`blocked` terminals write
+  nothing. Facts are keyed by low-cardinality **closed** categories — the outcome is
   a validated decision value and the action is collapsed to a small fixed
   allowlist (any free-form delegation action buckets to a generic token), never
   free-form content — so repeated jobs UPSERT the same row rather than growing the
@@ -96,6 +94,10 @@ groom_split_llm = false     # default-off LLM boundary chooser after determinist
 groom_split_llm_runtime = "codex"
 groom_split_llm_model = "" # empty uses the runtime default
 groom_split_llm_max_per_run = 5
+groom_quality = false       # shadow audit; true permits corroborated retirements
+groom_quality_max_per_run = 8
+groom_quality_min_age = "24h"
+groom_llm_total_max_per_run = 10 # shared across quality, stale, and split calls
 groom_stale = true          # detect expired operational-status batons
 groom_stale_age = "336h"   # newest content date must be older than 14d
 ```
@@ -290,6 +292,10 @@ staged observation into the authoring agent's **private** pool only. They never
 auto-confirm into the shared pool. Shared memory stays explicit through `memory
 confirm --to-shared` or `memory promote --to-shared`.
 
+`workflow note --remember` has an additional shipping-status gate. A leading
+`MERGED`, `SHIPPED`, `DEPLOYED`, or `CLOSED` phrase with a PR/CI reference stays
+in the workflow journal unless the caller explicitly adds `--remember-status`.
+
 ```sh
 gitmoot memory ingest <path|dir> --agent NAME [--shared] [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
 gitmoot memory ingest sweep [--json]
@@ -302,7 +308,8 @@ gitmoot memory links list <id> [--json]
 ```
 
 `memory ingest` walks `*.md`, strips a leading YAML frontmatter block when
-present, and chunks a file only when its body exceeds ~512 estimated tokens
+present, skips MEMORY.md-style index files whose body is only a Markdown link
+list to other `.md` notes, and chunks a file only when its body exceeds ~512 estimated tokens
 (smaller files stay one observation). Over budget it splits on `## ` headings,
 and any section still over budget is sub-split on paragraph/line boundaries so no
 single chunk exceeds the token budget (an oversized memory would otherwise be
@@ -471,8 +478,9 @@ whole, repeated runs are no-ops, and `--dry-run` only reports candidates.
 computes the current vault `snapshot_hash` (the same anchor `vault export`/`import`
 use), runs deterministic detectors, and writes a reviewable plan artifact
 (`{schema_version, snapshot_hash, proposed_retirements, rewrite_flags, rekeys,
-cross_pool, stale, stats}`). It never changes confirmed memories; an enabled
-staleness LLM pass may add immutable verdict-cache rows. The detectors flag:
+cross_pool, quality, stale, stats}`). It never changes confirmed memories;
+quality and enabled staleness passes may add immutable verdict-cache rows. The
+detectors flag:
 
 - **status/changelog/ToC snapshots** — notes dominated by `STATUS:` markers,
   `SHIPPED`/`merged & deployed` phrases, ISO-date-led lines, or Markdown link-list
@@ -503,11 +511,27 @@ staleness LLM pass may add immutable verdict-cache rows. The detectors flag:
   proposes). Applying promotes the newer private edition into the shared pool
   with its author preserved and retires the stale shared edition with reason
   `cross-pool: superseded by promoted edition`.
+- **general quality risk**: facts younger than `groom_quality_min_age` (default
+  `24h`) are excluded. Older facts score +3 for transient status/source-controlled
+  history, +3 for fragments, +3 for generic content without specifics, +2 for
+  near-duplicates, +1 for automated provenance, and +1 below 160 characters.
+  `**Why:**`, `**How to apply:**`, and concrete cause-to-consequence lessons
+  subtract 3 and are explicitly protected from candidacy. The threshold is 3.
 - **expired operational-status batons**: the default-on `groom_stale` detector
   requires an uppercase in-flight/status verb in a `##` or `STATUS:` header,
   tracker-id or dated-header corroboration, and a newest in-content ISO date
   older than `groom_stale_age` (default `336h`, 14 days). `**Why:**` and
   `**How to apply:**` lessons and status/changelog-routed notes are excluded.
+
+Quality candidates reuse the split runtime/model and have an immutable SHA-256
+verdict cache. Verdicts are `useless`, `useful`, or
+`contains_durable_residue` plus confidence in `[0,1]`; residue must be an exact
+content quote. Auto-retirement requires `useless` plus at least two independent
+positive signal families. Residue and every uncertain/error outcome stay
+owner-gated. With default `groom_quality = false`, the pass still runs in
+`--propose` and `--split`; `quality.shadow` is true and qualifying actions are
+reported as `would_retire`. Enabling it lets `--split` retire through the
+reversible house path with reason `groom-quality:<date>`.
 
 Stale candidates reuse the split LLM runtime, model, and per-run call cap. The
 strict verdict is `expired`, `still_relevant`, or `contains_durable_residue`;
@@ -531,7 +555,10 @@ group or cross-pool pair whose target rows changed state is skipped whole.
 
 Gitmoot also ships a built-in `memory-groom-propose` pipeline. It auto-applies
 lossless splits first and, when enabled, retires only deterministically stale
-status batons whose verdict is `expired`. It then writes the owner-gated proposal
+status batons whose verdict is `expired`, plus quality facts classified
+`useless` with at least two signal families. Quality, stale, and split calls share
+`groom_llm_total_max_per_run` (default 10), while quality itself is capped at 8.
+It then writes the owner-gated proposal
 plan. Ordinary retirement, rekey, cross-pool, residue, and fail-closed stale
 proposals are never auto-applied. Configure an interval or run it on demand:
 
@@ -541,9 +568,10 @@ repo = "owner/repo"
 groom_propose = "nightly"
 ```
 
-`[memory].groom_split_llm = false` keeps Phase 2 inert by default. Enable it with
-the runtime/model/cap settings documented above; deterministic splitting always
-runs first and does not consult the flag.
+`[memory].groom_split_llm = false` keeps LLM-guided splitting and stale verdict
+delivery inert by default. The quality classifier still runs in shadow mode and
+uses the configured runtime/model; deterministic splitting does not consult the
+flag.
 
 ```sh
 gitmoot pipeline run memory-groom-propose

@@ -75,12 +75,16 @@ type GroomCandidate struct {
 	ID           int64
 	Key          string
 	Content      string
+	Provenance   string
 	OwnerKind    string
 	OwnerRef     string
 	OwnerVersion string
 	Repo         string // "" == general scope
 	Scope        string
-	UpdatedAt    string // RFC3339; lexicographic order == chronological order
+	// FirstConfirmedAt is the fact's birth time. Quality grooming uses it for
+	// the minimum-age guard; UpdatedAt remains the optimistic concurrency token.
+	FirstConfirmedAt string
+	UpdatedAt        string // RFC3339; lexicographic order == chronological order
 }
 
 // GroomRetirement is one proposed retirement: the memory id, its key, the detector

@@ -157,6 +157,35 @@ func TestWorkflowNotePrivateAgentMustBeRegistered(t *testing.T) {
 	}
 }
 
+func TestWorkflowNoteShippingStatusRequiresExplicitMemoryOverride(t *testing.T) {
+	home, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	if err := store.CreateJob(ctx, db.Job{ID: "job-1", Agent: "coord", Type: "ask", State: "succeeded", Payload: `{"repo":"acme/widget","workflow_id":"release-42"}`}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	const body = "bridge MERGED (PR #866, all CI green) — #864 complete: both halves on both mains"
+	var stdout, stderr bytes.Buffer
+	code := runWorkflowJournal([]string{"note", "release-42", body, "--remember", "--home", home}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "warning:") || !strings.Contains(stderr.String(), "--remember-status") {
+		t.Fatalf("shipping gate exit=%d stderr=%q", code, stderr.String())
+	}
+	notes, err := store.ListWorkflowNotes(ctx, "release-42", 0)
+	if err != nil || len(notes) != 0 {
+		t.Fatalf("shipping gate wrote a note: %+v err=%v", notes, err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = runWorkflowJournal([]string{"note", "release-42", body, "--remember", "--remember-status", "--author", "operator", "--home", home, "--json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("shipping override exit=%d stderr=%q", code, stderr.String())
+	}
+	var out workflowNoteOutput
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil || !out.Remembered {
+		t.Fatalf("shipping override output=%+v err=%v raw=%s", out, err, stdout.String())
+	}
+}
+
 func TestWorkflowNotePersistsNamespacedCoordinatorMetadata(t *testing.T) {
 	home, store := workflowJournalTestHome(t)
 	ctx := context.Background()

@@ -10171,7 +10171,11 @@ Add `--remember` to stage low-trust repo memory. The default pool is shared;
 `--agent NAME` opts into that registered agent's private pool. Exactly one repo
 is inferred from group jobs; zero or multiple repos require `--repo`. Note and
 observation commit atomically. Prefilter rejection reports the reason and writes
-neither. Existing `[memory].ingest_auto_confirm` behavior is honored.
+neither. A leading shipping status (`MERGED`, `SHIPPED`, `DEPLOYED`, or
+`CLOSED`) with a PR/CI reference is journal history, not durable memory:
+`--remember` warns and refuses it unless the caller also passes the explicit
+`--remember-status` override. Existing `[memory].ingest_auto_confirm` behavior
+is honored.
 
 ## Goals
 
@@ -10898,14 +10902,11 @@ bounded signal — never one fact per job (#645):
 - **Fix-round facts** — when a job reached its decision only after one or more
   corrective verify/retry rounds ("recent implement jobs here needed up to N fix
   rounds"), keyed by decision.
-- **Terminal-outcome facts** — when an *ordinary* job (the shape `agent
-  ask`/`agent run`/`review`/`implement` enqueue, no verify/retry loop) ends on the
-  **notable**, non-anomalous decision `changes_requested` ("some review jobs here
-  concluded with changes requested") — keyed by `(action, outcome)`. A routine
-  first-try success (`approved`/`implemented`) writes nothing, and the *anomalous*
-  one-off terminals (`failed`, `blocked`) are **not** auto-promoted: without a
-  recurrence threshold, a single flaky failure must not become a durable, injected
-  repo fact.
+- **Terminal-outcome candidates** — ordinary `changes_requested` outcomes are
+  considered, but a substantiveness gate requires at least one concrete job id,
+  PR number, error string, file, or count. The generic "some review jobs here
+  concluded with changes requested" shape is suppressed. Routine successes and
+  anomalous one-off `failed`/`blocked` terminals also write nothing.
 
 Facts are keyed by low-cardinality **closed** categories, never free-form
 content: the outcome is a validated decision value and the action is collapsed to
@@ -10987,6 +10988,10 @@ groom_split_llm = false     # default-off LLM boundary chooser after determinist
 groom_split_llm_runtime = "codex"
 groom_split_llm_model = "" # empty uses the runtime default
 groom_split_llm_max_per_run = 5
+groom_quality = false       # shadow audit; true permits corroborated retirements
+groom_quality_max_per_run = 8
+groom_quality_min_age = "24h"
+groom_llm_total_max_per_run = 10 # shared across quality, stale, and split calls
 groom_stale = true          # detect expired operational-status batons
 groom_stale_age = "336h"   # newest content date must be older than 14d
 ```
@@ -11165,7 +11170,8 @@ gitmoot memory links list <id> [--json]
 ```
 
 `memory ingest` walks `*.md` (recursively for a directory), strips a leading YAML
-frontmatter block when present, and — only when a file's body exceeds ~512
+frontmatter block when present, skips MEMORY.md-style index files whose body is
+only a Markdown link list to other `.md` notes, and — only when a file's body exceeds ~512
 estimated tokens — chunks it on `## ` headings (smaller files stay one
 observation); any section still over budget is sub-split on paragraph/line
 boundaries so no chunk exceeds the token budget (an oversized memory would
@@ -11315,8 +11321,9 @@ child's current cluster when available. The operation is idempotent, and
 computes the current vault `snapshot_hash` (the same anchor `vault export`/`import`
 use), runs deterministic detectors, and writes a reviewable plan artifact
 (`{schema_version, snapshot_hash, proposed_retirements, rewrite_flags, rekeys,
-cross_pool, stale, stats}`). It never changes confirmed memories; an enabled
-staleness LLM pass may add immutable verdict-cache rows. The detectors are:
+cross_pool, quality, stale, stats}`). It never changes confirmed memories;
+quality and enabled staleness passes may add immutable verdict-cache rows. The
+detectors are:
 
 - **status/changelog/ToC snapshots** — notes dominated (≥80% of non-blank lines) by
   `STATUS:` markers, `SHIPPED`/`merged & deployed` changelog phrases, ISO-date-led
@@ -11350,12 +11357,30 @@ staleness LLM pass may add immutable verdict-cache rows. The detectors are:
   secondary evidence; BM25 alone never proposes). Applying promotes the newer
   private edition to the shared pool (author preserved) and retires the stale
   shared edition with reason `cross-pool: superseded by promoted edition`.
+- **general quality risk** (#888): facts younger than `groom_quality_min_age`
+  (default `24h`) are excluded. Older facts score +3 for transient
+  status/source-controlled history, +3 for fragments, +3 for generic content
+  without specifics, +2 for near-duplicates, +1 for automated provenance, and
+  +1 below 160 characters. Lesson shape (`**Why:**`, `**How to apply:**`, or a
+  concrete cause-to-consequence statement) subtracts 3 and is explicitly
+  protected from candidacy. The audit threshold is 3.
 - **expired operational-status batons** (#854): the default-on `groom_stale`
   detector requires an uppercase `AWAITING`, `PENDING`, `SUBMITTED`, `IN FLIGHT`,
   `CANCELLED`, or check-status verb in a `##`/`STATUS:` header, tracker-id or
   dated-header corroboration, and a newest in-content ISO date older than
   `groom_stale_age` (default `336h`, 14 days). `**Why:**` and
   `**How to apply:**` lessons and status/changelog-routed notes are excluded.
+
+Quality candidates use the split runtime/model knobs and an immutable SHA-256
+cache. The strict verdict is `useless`, `useful`, or
+`contains_durable_residue`, with confidence in `[0,1]`; residue must be an exact
+content quote. Auto-retirement requires both `useless` and at least two
+independent positive signal families. Residue stays an owner-gated extraction
+proposal and every delivery, parse, validation, or cache error fails closed.
+With default `groom_quality = false`, the pass still runs in `--propose` and
+`--split`, but the plan's `quality` section is marked `shadow: true` and reports
+`would_retire` without mutation. Enabling the knob lets `--split` use the
+reversible house path with reason `groom-quality:<date>`.
 
 Stale candidates use the existing `groom_split_llm_runtime`,
 `groom_split_llm_model`, and `groom_split_llm_max_per_run` settings. The strict
@@ -11385,7 +11410,10 @@ The built-in `memory-groom-propose` pipeline first auto-runs
 `gitmoot memory groom --propose --out <run-scoped-plan> --json` and summarizes
 both counts. Lossless splits auto-apply. The same `--split` run auto-retires a
 stale candidate only when both deterministic shape and a cached or fresh
-`expired` verdict agree, using reason `groom-stale:<date>` and clearing FTS.
+`expired` verdict agree, using reason `groom-stale:<date>` and clearing FTS. With
+quality enabled, the same run retires only `useless` facts corroborated by at
+least two signal families. Quality, stale, and split calls share
+`groom_llm_total_max_per_run` (default 10); individual caps cannot stack past it.
 Ordinary retirement, rekey, cross-pool, residue, and fail-closed stale proposals
 remain owner-gated. The daemon
 and `gitmoot pipeline install-defaults` register it idempotently and skip an
@@ -11399,8 +11427,10 @@ ingest_sweep = "nightly"
 groom_propose = "nightly"
 ```
 
-`[memory].groom_split_llm = false` is the sole Phase 2 enable gate. When enabled,
-`memory groom --split` sends only over-threshold bricks left unsplit by the
+`[memory].groom_split_llm = false` is the LLM split and stale-delivery gate. The
+quality classifier still runs in shadow mode and uses the configured
+runtime/model. When split LLM is enabled, `memory groom --split` sends only
+over-threshold bricks left unsplit by the
 deterministic pass to isolated one-shot runtime sessions. The host supplies a
 closed menu of blank-line/strong-seam boundaries outside lists and fenced code;
 the model can only choose menu ids or keep the brick. Gitmoot validates strict
@@ -11410,7 +11440,8 @@ deterministic splits. The model never rewrites content.
 
 `groom_split_llm_runtime` defaults to `codex` (`codex`, `claude`, or `kimi`),
 `groom_split_llm_model = ""` uses that runtime's default model, and
-`groom_split_llm_max_per_run = 5` caps one-shot calls. Bricks over 8192 bytes are
+`groom_split_llm_max_per_run = 5` caps split/stale calls while
+`groom_quality_max_per_run = 8` caps quality calls. Bricks over 8192 bytes are
 reported and skipped, never truncated. Valid split and no-split verdicts are
 cached by SHA-256 of trimmed content, so unchanged bricks are not billed again;
 cached split cuts are revalidated through the full lossless tail. The existing

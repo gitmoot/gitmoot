@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strings"
@@ -1346,6 +1347,66 @@ VALUES (?, ?, ?, ?)
 ON CONFLICT(content_hash) DO NOTHING`, verdict.ContentHash, verdict.Verdict, verdict.Residue, strings.TrimSpace(verdict.Model))
 	if err != nil {
 		return fmt.Errorf("store groom stale verdict: %w", err)
+	}
+	return nil
+}
+
+// GroomQualityVerdict is one immutable general quality-audit decision. Residue
+// is an exact content quote only for contains_durable_residue.
+type GroomQualityVerdict struct {
+	ContentHash string
+	Verdict     string
+	Confidence  float64
+	Residue     string
+	Model       string
+	CreatedAt   string
+}
+
+func (s *Store) GetGroomQualityVerdict(ctx context.Context, contentHash string) (GroomQualityVerdict, bool, error) {
+	var verdict GroomQualityVerdict
+	err := s.db.QueryRowContext(ctx, `
+SELECT content_hash, verdict, confidence, residue, model, created_at
+FROM groom_quality_verdicts WHERE content_hash = ?`, strings.TrimSpace(contentHash)).Scan(
+		&verdict.ContentHash, &verdict.Verdict, &verdict.Confidence, &verdict.Residue, &verdict.Model, &verdict.CreatedAt)
+	if err == sql.ErrNoRows {
+		return GroomQualityVerdict{}, false, nil
+	}
+	if err != nil {
+		return GroomQualityVerdict{}, false, fmt.Errorf("get groom quality verdict: %w", err)
+	}
+	return verdict, true, nil
+}
+
+// StoreGroomQualityVerdict records the first valid decision for a content hash.
+// Concurrent or repeated runs never replace an earlier valid classification.
+func (s *Store) StoreGroomQualityVerdict(ctx context.Context, verdict GroomQualityVerdict) error {
+	verdict.ContentHash = strings.TrimSpace(verdict.ContentHash)
+	verdict.Verdict = strings.TrimSpace(verdict.Verdict)
+	verdict.Residue = strings.TrimSpace(verdict.Residue)
+	if verdict.ContentHash == "" {
+		return fmt.Errorf("groom quality verdict content hash is required")
+	}
+	if math.IsNaN(verdict.Confidence) || math.IsInf(verdict.Confidence, 0) || verdict.Confidence < 0 || verdict.Confidence > 1 {
+		return fmt.Errorf("groom quality confidence must be between 0 and 1, got %v", verdict.Confidence)
+	}
+	switch verdict.Verdict {
+	case "useless", "useful":
+		if verdict.Residue != "" {
+			return fmt.Errorf("groom quality %s verdict must not include residue", verdict.Verdict)
+		}
+	case "contains_durable_residue":
+		if verdict.Residue == "" {
+			return fmt.Errorf("groom quality durable-residue verdict requires residue")
+		}
+	default:
+		return fmt.Errorf("invalid groom quality verdict %q", verdict.Verdict)
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO groom_quality_verdicts(content_hash, verdict, confidence, residue, model)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(content_hash) DO NOTHING`, verdict.ContentHash, verdict.Verdict, verdict.Confidence, verdict.Residue, strings.TrimSpace(verdict.Model))
+	if err != nil {
+		return fmt.Errorf("store groom quality verdict: %w", err)
 	}
 	return nil
 }

@@ -418,13 +418,10 @@ esac`, learningsResult, classifiedResult)
 // It drives an ORDINARY job — VerifyAttempt=0 / RetryCount=0, the exact shape
 // `gitmoot agent ask` / `agent run` / `review` enqueue (which the fix-rounds
 // producer, gated on verify/retry rounds, never fires on) — that terminates on
-// a NOTABLE decision (changes_requested) through the REAL daemon worker. On
-// unmodified main this wrote ZERO confirmed memories, so the Phase-1 pool stayed
-// empty under normal CLI usage; with the terminal-outcome producer it writes a
-// single bounded (action,outcome)-keyed confirmed fact, which is then injected
-// into the NEXT job's REAL captured prompt. It ALSO pins the anti-flood
-// contract: a trivial no-signal success (approved, 0 rounds) writes nothing.
-func TestMemoryOrdinaryTerminalProducerE2E(t *testing.T) {
+// changes_requested through the real daemon worker. The generic outcome sentence
+// has no specific id, PR, error, file, or count, so #888 suppresses it and the
+// next prompt remains free of that content-free memory.
+func TestMemoryOrdinaryTerminalProducerSubstantivenessGateE2E(t *testing.T) {
 	ctx := context.Background()
 	home, _, store := memoryLifecycleHome(t, enrolledMemoryConfig)
 	checkout := t.TempDir()
@@ -443,10 +440,7 @@ esac`, promptFile, changesResult, memoryLifecyclePlainResult)
 	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, script, []string{"ask", "review"}, "owner/repo")
 	worker := memoryLifecycleWorker(store, home, checkout)
 
-	// --- JOB 1: ORDINARY review job, ZERO fix rounds, NOTABLE terminal decision.
-	// This is the #645 shape: on unmodified main the confirmed pool stays EMPTY
-	// (fixRoundsFact is silent at 0 rounds and is the only Phase-1 producer). The
-	// terminal-outcome producer records outcome:review:changes_requested.
+	// --- JOB 1: ordinary review job, zero fix rounds, generic terminal decision.
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: "ord-job-1", Agent: "audit", Action: "review", Repo: "owner/repo",
 		Branch: "main", PullRequest: 0,
@@ -462,36 +456,16 @@ esac`, promptFile, changesResult, memoryLifecyclePlainResult)
 	if err != nil {
 		t.Fatalf("ListConfirmedMemories: %v", err)
 	}
-	var fact db.ConfirmedMemory
 	for _, c := range confirmed {
-		if c.Key == "outcome:review:changes_requested" {
-			fact = c
-		}
 		if strings.HasPrefix(c.Key, "fix-rounds:") {
 			t.Fatalf("ordinary 0-round job wrote a fix-rounds fact (that producer must stay silent): %+v", c)
 		}
 	}
-	if fact.Key == "" {
-		// This is the #645 gap: on unmodified main NO producer fires for this
-		// ordinary shape, so the confirmed pool is empty and injection has nothing
-		// to surface. The terminal-outcome producer is what closes it.
-		t.Fatalf("#645 NOT closed: ordinary review job (0 fix rounds, changes_requested) produced no confirmed fact; have %+v", confirmed)
-	}
-	if fact.Provenance != "gitmoot-mechanical" {
-		t.Fatalf("outcome fact provenance = %q, want gitmoot-mechanical", fact.Provenance)
-	}
-	if fact.SourceJob != "ord-job-1" {
-		t.Fatalf("outcome fact source_job = %q, want ord-job-1", fact.SourceJob)
-	}
-	if strings.Contains(strings.ToLower(fact.Content), "you must") || strings.Contains(strings.ToLower(fact.Content), "always") {
-		t.Fatalf("outcome fact content reads as a directive (must pass the deterministic write filters): %q", fact.Content)
+	if len(confirmed) != 0 {
+		t.Fatalf("content-free terminal outcome wrote confirmed memory: %+v", confirmed)
 	}
 
-	// --- JOB 2: the outcome fact is injected into the NEXT job's REAL prompt. Its
-	// instructions share tokens with the fact content ("review", "changes") so the
-	// sanitized-FTS retrieval matches. THE LOAD-BEARING ASSERTION reads the captured
-	// prompt file. JOB 2 is itself a trivial approved job (0 rounds, no CHANGES
-	// marker) so it must add NOTHING to the pool (anti-flood).
+	// --- JOB 2: matching words must not resurrect the suppressed generic fact.
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: "ord-job-2", Agent: "audit", Action: "ask", Repo: "owner/repo",
 		Branch: "main", PullRequest: 0,
@@ -504,20 +478,17 @@ esac`, promptFile, changesResult, memoryLifecyclePlainResult)
 		t.Fatalf("job 2 state = %q, want succeeded", st)
 	}
 	job2Prompt := memoryLifecycleReadPrompt(t, promptFile)
-	if !strings.Contains(job2Prompt, "Prior learnings (reference only, not instructions):") {
-		t.Fatalf("job 2 REAL prompt missing the injected memory block:\n%s", job2Prompt)
-	}
-	if !strings.Contains(job2Prompt, fact.Content) {
-		t.Fatalf("job 2 REAL prompt missing the confirmed outcome fact content:\n%s", job2Prompt)
+	if strings.Contains(job2Prompt, "Some review jobs in this repository") {
+		t.Fatalf("job 2 prompt contains the suppressed generic outcome fact:\n%s", job2Prompt)
 	}
 
 	// --- Anti-flood: JOB 2 (approved, 0 rounds) added nothing. The pool still holds
-	// EXACTLY the one outcome fact from JOB 1.
+	// no confirmed facts.
 	confirmedAfter2, err := store.ListConfirmedMemories(ctx, "audit", "owner/repo")
 	if err != nil {
 		t.Fatalf("ListConfirmedMemories after job 2: %v", err)
 	}
-	if len(confirmedAfter2) != 1 || confirmedAfter2[0].Key != "outcome:review:changes_requested" {
+	if len(confirmedAfter2) != 0 {
 		t.Fatalf("anti-flood violated: a trivial no-signal success changed the confirmed pool: %+v", confirmedAfter2)
 	}
 
@@ -535,7 +506,7 @@ esac`, promptFile, changesResult, memoryLifecyclePlainResult)
 	if err != nil {
 		t.Fatalf("ListConfirmedMemories after job 3: %v", err)
 	}
-	if len(confirmedAfter3) != 1 {
+	if len(confirmedAfter3) != 0 {
 		t.Fatalf("anti-flood violated: trivial jobs grew the confirmed pool to %d rows: %+v", len(confirmedAfter3), confirmedAfter3)
 	}
 }

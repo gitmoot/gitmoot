@@ -47,7 +47,7 @@ func printWorkflowJournalUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot workflow list [--json]")
 	fmt.Fprintln(w, "  gitmoot workflow show <label> [--json] [--limit N]")
-	fmt.Fprintln(w, "  gitmoot workflow note <label> \"<body>\" [--author A] [--pane P] [--session ID] [--workdir PATH] [--remember [--agent NAME] [--repo R]]")
+	fmt.Fprintln(w, "  gitmoot workflow note <label> \"<body>\" [--author A] [--pane P] [--session ID] [--workdir PATH] [--remember [--remember-status] [--agent NAME] [--repo R]]")
 }
 
 func runWorkflowList(args []string, stdout, stderr io.Writer) int {
@@ -281,6 +281,7 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 	sessionID := fs.String("session", "", "coordinator runtime session id")
 	workdir := fs.String("workdir", "", "coordinator working directory")
 	remember := fs.Bool("remember", false, "also stage the note as persistent memory")
+	rememberStatus := fs.Bool("remember-status", false, "explicitly allow a shipping-status-shaped note into memory")
 	agent := fs.String("agent", "", "registered agent whose private pool receives memory")
 	repo := fs.String("repo", "", "repo binding for memory when it cannot be inferred")
 	jsonOutput := fs.Bool("json", false, "print the stored note as JSON")
@@ -310,8 +311,13 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "workflow note accepts one label and body; author must be at most %d bytes\n", workflowNoteAuthorMax)
 		return 2
 	}
-	if !*remember && (strings.TrimSpace(*agent) != "" || strings.TrimSpace(*repo) != "") {
-		fmt.Fprintln(stderr, "workflow note: --agent and --repo require --remember")
+	if !*remember && (strings.TrimSpace(*agent) != "" || strings.TrimSpace(*repo) != "" || *rememberStatus) {
+		fmt.Fprintln(stderr, "workflow note: --agent, --repo, and --remember-status require --remember")
+		return 2
+	}
+	if *remember && memory.IsShippingStatus(body) && !*rememberStatus {
+		fmt.Fprintln(stderr, "warning: shipping statuses belong in the workflow journal, not durable memory")
+		fmt.Fprintln(stderr, "workflow note: pass --remember-status to explicitly override the shipping-status memory gate")
 		return 2
 	}
 	var out workflowNoteOutput
