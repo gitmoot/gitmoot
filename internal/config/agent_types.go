@@ -92,6 +92,20 @@ func LoadAgentTypes(paths Paths) (map[string]AgentType, error) {
 }
 
 func SaveAgentType(paths Paths, entry AgentType) error {
+	return saveAgentType(paths, entry, func(path string, content []byte) error {
+		return os.WriteFile(path, content, 0o600)
+	})
+}
+
+// SaveAgentTypeAtomic persists the complete agent-type registry through a
+// same-directory temporary file and rename. Manual `agent start` uses this only
+// after the runtime session and DB registration have succeeded, so a partial
+// config write can never leave a truncated [agents.<name>] enrollment block.
+func SaveAgentTypeAtomic(paths Paths, entry AgentType) error {
+	return saveAgentType(paths, entry, writeConfigAtomic)
+}
+
+func saveAgentType(paths Paths, entry AgentType, write func(string, []byte) error) error {
 	types, err := LoadAgentTypes(paths)
 	if err != nil {
 		return err
@@ -114,7 +128,7 @@ func SaveAgentType(paths Paths, entry AgentType) error {
 	for _, name := range names {
 		writeAgentTypeBlock(&builder, types[name])
 	}
-	return os.WriteFile(paths.ConfigFile, []byte(builder.String()), 0o600)
+	return write(paths.ConfigFile, []byte(builder.String()))
 }
 
 func applyAgentTypeDefaults(entry *AgentType) {

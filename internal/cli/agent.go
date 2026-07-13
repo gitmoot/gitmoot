@@ -1337,6 +1337,11 @@ func printAgentType(stdout io.Writer, entry config.AgentType) {
 	writeLine(stdout, "job_timeout: %s", entry.JobTimeout)
 }
 
+// agentStartAdapterFor is the runtime construction seam for manual agent start.
+// Production uses the real adapter; tests replace it so enrollment and notices
+// can be exercised without starting an LLM session.
+var agentStartAdapterFor = runtimeAdapterFor
+
 func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agent start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -1351,6 +1356,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	policy := fs.String("policy", "auto", "autonomy policy")
 	updateTemplate := fs.Bool("update-template", false, "install or refresh the agent template before starting")
 	startDaemon := fs.Bool("start-daemon", false, "start the background daemon after setup")
+	memoryFlag := fs.Bool("memory", false, "enroll this agent in persistent memory (use --memory=false to override memory.default_enroll)")
 	var capabilities repeatedFlag
 	fs.Var(&capabilities, "capability", "agent capability, repeatable")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
@@ -1372,6 +1378,16 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "agent start requires exactly one name")
 		return 2
 	}
+	memoryExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "memory" {
+			memoryExplicit = true
+		}
+	})
+	if !validAgentTypeName(name) {
+		fmt.Fprintf(stderr, "invalid agent name %q for config enrollment\n", name)
+		return 2
+	}
 	if strings.TrimSpace(*runtimeName) == "" {
 		fmt.Fprintln(stderr, "agent start requires --runtime")
 		return 2
@@ -1383,6 +1399,20 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	if *updateTemplate && strings.TrimSpace(*templateID) == "" {
 		fmt.Fprintln(stderr, "agent start --update-template requires --template")
 		return 2
+	}
+	paths, err := initializedPaths(*home)
+	if err != nil {
+		fmt.Fprintf(stderr, "agent start: %v\n", err)
+		return 1
+	}
+	memorySettings, err := config.LoadMemorySettings(paths)
+	if err != nil {
+		fmt.Fprintf(stderr, "agent start: %v\n", err)
+		return 1
+	}
+	memoryEnrolled := memorySettings.DefaultEnroll
+	if memoryExplicit {
+		memoryEnrolled = *memoryFlag
 	}
 	repo, err := daemon.ParseRepository(*repoFlag)
 	if err != nil {
@@ -1456,7 +1486,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	prompt := agentStartupPrompt(agent, cachedTemplate)
-	adapter, err := runtimeAdapterFor(*home, agent.Runtime, record.CheckoutPath)
+	adapter, err := agentStartAdapterFor(*home, agent.Runtime, record.CheckoutPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "load adapter: %v\n", err)
 		return 1
@@ -1480,9 +1510,49 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "agent start: %v\n", err)
 		return 1
 	}
+	// The config block is the daemon's enrollment authority. A pre-existing type
+	// is operator-owned configuration: preserve every field and even its current
+	// enrollment unless --memory was explicit. A genuinely new type records the
+	// complete started-agent shape with the tri-state/default enrollment result.
+	types, err := config.LoadAgentTypes(paths)
+	if err != nil {
+		fmt.Fprintf(stderr, "agent start: %v\n", err)
+		return 1
+	}
+	entry, exists := types[agent.Name]
+	persistType := !exists || memoryExplicit
+	if exists {
+		memoryEnrolled = entry.Memory
+		if memoryExplicit {
+			memoryEnrolled = *memoryFlag
+			entry.Memory = memoryEnrolled
+		}
+	} else {
+		entry = config.AgentType{
+			Name: agent.Name, Runtime: agent.Runtime, Template: agent.TemplateID,
+			Model: agent.Model, Effort: agent.Effort, Role: agent.Role,
+			Capabilities:   append([]string(nil), agent.Capabilities...),
+			AutonomyPolicy: runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy),
+			Memory:         memoryEnrolled,
+		}
+	}
+	if persistType {
+		if err := config.SaveAgentTypeAtomic(paths, entry); err != nil {
+			fmt.Fprintf(stderr, "agent start: persist memory enrollment: %v\n", err)
+			return 1
+		}
+	}
 	writeLine(stdout, "started %s (%s) for %s", agent.Name, agent.Runtime, repo.FullName())
 	writeLine(stdout, "session: %s", agent.RuntimeRef)
 	writeLine(stdout, "invoke: /gitmoot %s review", agent.Name)
+	switch {
+	case memoryEnrolled && memorySettings.Disabled:
+		writeLine(stdout, "memory: enrolled but globally disabled by [memory].disabled")
+	case memoryEnrolled:
+		writeLine(stdout, "memory: on")
+	default:
+		writeLine(stdout, "memory: off (enable with --memory)")
+	}
 	if *startDaemon {
 		writeLine(stdout, "step: start background daemon")
 		return runDaemonStartWithWorkDir([]string{"--home", *home, "--repo", repo.FullName()}, record.CheckoutPath, stdout, stderr)

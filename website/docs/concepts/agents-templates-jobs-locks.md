@@ -12,6 +12,13 @@ gitmoot agent start project-planner --runtime codex --repo owner/repo --template
 gitmoot agent subscribe reviewer --runtime codex --session <session-id> --repo owner/repo --capability review
 ```
 
+Manual `agent start` accepts `--memory[=true|false]`; when omitted,
+`[memory].default_enroll` decides whether the new registered agent gets
+`[agents.<name>].memory = true`. Explicit false overrides the default. Each
+successful start prints the effective memory state, including the globally
+disabled case. Hidden pipeline runners and ephemeral workers do not pass through
+this enrollment path.
+
 ## Agent Templates
 
 Agent Templates are reusable prompt/profile bundles. Gitmoot snapshots template content

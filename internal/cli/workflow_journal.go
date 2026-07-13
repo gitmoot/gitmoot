@@ -406,7 +406,7 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 }
 
 func autoConfirmWorkflowObservationIfEnabled(ctx context.Context, store *db.Store, obs db.MemoryObservation, enabled bool) (bool, bool, error) {
-	if !enabled {
+	if !enabled || !autoConfirmEligibleProvenance(obs.Provenance) {
 		return false, false, nil
 	}
 	id, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
