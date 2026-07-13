@@ -422,6 +422,9 @@ func runJobTranscriptWatch(jobID, home, requestedLogPath, requestedRuntime strin
 
 	var translator transcript.Translator
 	renderer := transcript.NewRenderer(stdout)
+	if transcriptStyleTerminal(stdout) {
+		renderer = transcript.NewStyledRenderer(stdout)
+	}
 	err := withStore(home, func(store *db.Store) error {
 		job, err := store.GetJob(context.Background(), jobID)
 		if err != nil {
@@ -954,4 +957,23 @@ func printFailureDiagnostics(stdout io.Writer, diag *workflow.FailureDiagnostics
 			fmt.Fprintf(stdout, "    %s\n", line)
 		}
 	}
+}
+
+// transcriptStyleTerminal reports whether transcript output is going straight
+// to an interactive terminal, in which case the styled renderer is safe. Pipes,
+// files, and test buffers stay on the byte-stable plain renderer, and NO_COLOR
+// (https://no-color.org) always wins.
+func transcriptStyleTerminal(w io.Writer) bool {
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }

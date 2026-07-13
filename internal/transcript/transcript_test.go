@@ -420,3 +420,63 @@ func waitForLine(t *testing.T, lines <-chan string, want string) {
 		t.Fatalf("timed out waiting for line %q", want)
 	}
 }
+
+func TestStyledRendererGolden(t *testing.T) {
+	translator, err := NewTranslator("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := readTestdata(t, "codex_tool_run.jsonl")
+	var got bytes.Buffer
+	renderer := NewStyledRenderer(&got)
+	scanner := bufio.NewScanner(strings.NewReader(input))
+	scanner.Buffer(make([]byte, 0, 64*1024), MaxLogicalLineBytes)
+	for scanner.Scan() {
+		if err := renderer.Render(translator.Translate(scanner.Text())...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderer.Render(translator.Flush()...); err != nil {
+		t.Fatal(err)
+	}
+	if want := readTestdata(t, "codex_tool_run_styled.golden"); got.String() != want {
+		t.Fatalf("styled transcript:\n%q\nwant:\n%q", got.String(), want)
+	}
+}
+
+func TestStyledRendererFailureIsRedAndTextKeepsLines(t *testing.T) {
+	var got bytes.Buffer
+	renderer := NewStyledRenderer(&got)
+	if err := renderer.Render(
+		Event{Kind: KindAgentText, Text: "first line\nsecond line"},
+		Event{Kind: KindToolResult, Status: "failed (exit 1)", OutputDigest: "boom"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	out := got.String()
+	if !strings.Contains(out, "● first line\n  second line\n") {
+		t.Fatalf("agent text lost its line break: %q", out)
+	}
+	if !strings.Contains(out, "\x1b[31m◂ failed (exit 1)") {
+		t.Fatalf("failed result not red: %q", out)
+	}
+	if !strings.Contains(out, "\x1b[90m  ↳ boom") {
+		t.Fatalf("output digest not dim/indented: %q", out)
+	}
+}
+
+func TestFormatTokens(t *testing.T) {
+	for _, tc := range []struct {
+		in   int
+		want string
+	}{
+		{812, "812"}, {1234, "1.2k"}, {42_500, "42k"}, {1_740_206, "1.7M"}, {12_345_678, "12M"},
+	} {
+		if got := formatTokens(tc.in); got != tc.want {
+			t.Fatalf("formatTokens(%d) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

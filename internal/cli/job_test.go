@@ -737,3 +737,21 @@ func TestPrintJobOmitsFailureDiagnosticsWhenAbsent(t *testing.T) {
 		t.Fatalf("job show output has a failure diagnostics block for a healthy job:\n%s", buf.String())
 	}
 }
+
+func TestTranscriptStyleTerminalStaysPlainOffTTY(t *testing.T) {
+	if transcriptStyleTerminal(&bytes.Buffer{}) {
+		t.Fatal("buffer writer must not be styled")
+	}
+	f, err := os.CreateTemp(t.TempDir(), "plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if transcriptStyleTerminal(f) {
+		t.Fatal("regular file must not be styled")
+	}
+	t.Setenv("NO_COLOR", "1")
+	if transcriptStyleTerminal(os.Stdout) {
+		t.Fatal("NO_COLOR must force plain output")
+	}
+}

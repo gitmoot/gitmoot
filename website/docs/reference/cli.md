@@ -1007,6 +1007,12 @@ gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
 
+When standard output is an interactive terminal (and `NO_COLOR` is unset),
+the transcript renders styled: agent turns get blank-line spacing and keep
+their line breaks, tool names are bold with dim argument digests, completed
+machinery and usage render dim, and failed tool results render red. Piped or
+redirected output always uses the plain byte-stable format.
+
 `job watch --transcript` follows a cockpit tee log from offset zero and renders
 redacted, bounded human-readable runtime output until the job settles, then
 drains the file to EOF. It is incompatible with `--json`. Without `--log-path`,
