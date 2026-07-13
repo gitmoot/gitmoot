@@ -17,7 +17,7 @@ import (
 const (
 	dashboardTaskMergedWindow = 7 * 24 * time.Hour
 	// Open work older than this is stale backlog, not a board card: the live
-	// store carries months of dormant planned/blocked tasks that would drown
+	// store carries months of dormant nonterminal tasks that would drown
 	// the Tasks board and the needs-you strip.
 	dashboardTaskActiveWindow = 30 * 24 * time.Hour
 	dashboardTodayWindow      = 24 * time.Hour
@@ -44,7 +44,7 @@ func capDashboardNeedsYou(out *dashboard.Overview) {
 
 const ()
 
-// Tasks projects Gitmoot's richer internal task lifecycle onto the five
+// Tasks projects Gitmoot's richer internal task lifecycle onto the four
 // dashboard columns. CI remains empty because no current CI conclusion is
 // persisted locally; dashboard requests never call GitHub.
 func (d *webDataSource) Tasks(ctx context.Context) ([]dashboard.TaskSummary, error) {
@@ -66,7 +66,10 @@ func dashboardTasks(ctx context.Context, store *db.Store, now time.Time) ([]dash
 	out := make([]dashboard.TaskSummary, 0, len(rows))
 	activeCutoff := now.Add(-dashboardTaskActiveWindow)
 	for _, row := range rows {
-		state, blockedReason := dashboardTaskState(row.State)
+		state, blockedReason, ok := dashboardTaskState(row.State)
+		if !ok {
+			continue
+		}
 		updatedAt := parseJobTimeMillis(row.UpdatedAt)
 		if state != "merged" && workflowMillisTime(updatedAt).Before(activeCutoff) {
 			continue
@@ -93,39 +96,37 @@ func dashboardTasks(ctx context.Context, store *db.Store, now time.Time) ([]dash
 	return out, nil
 }
 
-func dashboardTaskState(state string) (string, string) {
+func dashboardTaskState(state string) (stateName, blockedReason string, ok bool) {
 	switch strings.TrimSpace(state) {
 	case "planned":
-		return "planned", ""
+		return "", "", false
 	case "implementing":
-		return "implementing", ""
+		return "implementing", "", true
 	case "pr_open", "reviewing", "changes_requested", "ready_to_merge":
-		return "pr_open", ""
+		return "pr_open", "", true
 	case "blocked":
-		return "blocked", "Task is blocked"
+		return "blocked", "Task is blocked", true
 	case "awaiting_human":
-		return "blocked", "Awaiting human input"
+		return "blocked", "Awaiting human input", true
 	case "merged":
-		return "merged", ""
+		return "merged", "", true
 	default:
-		return "planned", ""
+		return "", "", false
 	}
 }
 
 func dashboardTaskStateRank(state string) int {
 	switch state {
-	case "planned":
-		return 0
 	case "implementing":
-		return 1
+		return 0
 	case "pr_open":
-		return 2
+		return 1
 	case "blocked":
-		return 3
+		return 2
 	case "merged":
-		return 4
+		return 3
 	default:
-		return 5
+		return 4
 	}
 }
 
